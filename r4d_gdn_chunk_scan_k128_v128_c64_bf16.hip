@@ -467,8 +467,26 @@ __global__ __launch_bounds__(NTHR) void r4d_gdn_chunk_scan_kernel(
       bool ok = tid < nval;
       s.bt[tid] = btr;
       s.ge[tid] = __expf(ggr);
-      s.gv[tid] = ok ? __expf(cref - ggr) : 0.f;
-      s.rs[tid] = ok ? scale * __expf(ggr - cref) : 0.f;
+      // The split form e^{g_i-c}.e^{c-g_j} is one exp per token instead of eight per tile, but
+      // each half can overflow on its own even where the PRODUCT cannot. The binding limit is not
+      // fp32: it is that V' = V.gv[t] is staged in bf16 (s.D), so gv must leave room for V and for
+      // the 128-term accumulation of V'^T @ K under bf16's 3.4e38 ceiling. e^70 = 2.5e30 leaves
+      // headroom against |V| and bf16's 3.4e38 ceiling; e^88 does not, which is why clamping
+      // there still produced NaN. 80 is measured, not assumed -- WikiText-2 PPL over 208,539
+      // tokens with no other mitigation: 70 -> 8.3841, 80 -> 8.3706, 83 -> 8.3728, stock -> 653586.
+      // Past 80 the marginal overflow costs more than the extra range recovers.
+      // Specifically: with cref at the chunk
+      // midpoint each half spans +/-(gate span)/2, so a span past ~176 sends one half to +INF
+      // while the other underflows to 0, and 0 * INF = NaN.
+      //
+      // The product is always safe -- rs[i].gv[j] = scale.e^{g_i-g_j}, and g decreases while the
+      // tril mask keeps only j <= i, so the exponent is never positive. Saturating the growing
+      // half just below fp32's overflow point keeps it finite, and the shrinking half still
+      // underflows to 0, so the product evaluates to 0 -- which is the correct answer, because
+      // e^{g_i-g_j} really is negligible whenever a half runs out of range. Where both halves fit
+      // (every ordinary chunk) nothing changes.
+      s.gv[tid] = ok ? __expf(fminf(cref - ggr, 80.0f)) : 0.f;
+      s.rs[tid] = ok ? scale * __expf(fminf(ggr - cref, 80.0f)) : 0.f;
     }
     BAR();                                                   // (1)
 #if PFIN && PFV == 4

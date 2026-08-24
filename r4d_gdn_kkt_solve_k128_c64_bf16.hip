@@ -207,8 +207,15 @@ void r4d_gdn_kkt_solve_kernel(const unsigned short* __restrict__ k,
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
           const int j = j0 + e;
-          // i > j means g_i <= g_j, so this exponent is never positive whatever the span is
-          const float d = (i > j && j < rows) ? (gi - s.gb[j]) : -INFINITY;
+          // i > j means g_i <= g_j, so this exponent is never positive whatever the span is --
+          // but ONLY for a live row. On a padding row (i >= rows) gi is forced to 0 above while
+          // gb[j] keeps its real, negative cumsum, so gi - gb[j] = -gb[j] is large POSITIVE,
+          // __expf overflows to +INF, and bi * INF = 0 * INF = NaN. Those NaNs sit in padding
+          // rows of the 64x64 tile, and the blocked inverse below merges the whole tile with
+          // WMMA, so they reach live rows and poison the chunk's output for the head.
+          // Measured on Qwen3.8-27B at TP2: 16 non-finite values in A, which chunk_scan then
+          // spreads to one entire head_v-wide head of the layer output.
+          const float d = (live && i > j && j < rows) ? (gi - s.gb[j]) : -INFINITY;
           vv[e] = bi * __expf(d) * P[t][e];
         }
         *(uint2*)(&s.A[i][j0])     = f2bf4(vv[0], vv[1], vv[2], vv[3]);

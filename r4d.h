@@ -36,7 +36,7 @@
 // Library version. The module exposes it as r4d.__version__, and the git tag it was built from is
 // expected to match -- which is what lets a consumer assert it linked the sources it pinned rather
 // than whatever a stale clone happened to hold.
-#define R4D_VERSION "0.4.0"
+#define R4D_VERSION "0.5.0"
 
 struct R4DArgs {
     const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16

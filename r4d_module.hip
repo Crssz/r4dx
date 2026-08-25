@@ -14,6 +14,9 @@
 //     gdn_conv_prep_w4_h128_bf16, gdn_conv_update_w4_h128_bf16,
 //     gdn_recurrent_update_k128_v128_bf16_fp32state
 //     ar_oneshot_2rank_exact         ar_oneshot_2rank_wht6
+//     ar_oneshot_4rank_exact         ar_oneshot_8rank_exact
+//     ar_twoshot_4rank_exact         ar_twoshot_8rank_exact
+//     ar_twoshot_4rank_ti8
 //     gemm_bf16_nt_m16
 //
 // `kernels()` returns the same set with the constraints spelled out, and the module constants
@@ -618,7 +621,7 @@ PYBIND11_MODULE(r4d, m) {
     m.attr("GDN_CHUNK")  = c;
   }
 
-  // ---- all-reduce (one-shot, 2 ranks, P2P) ----
+  // ---- all-reduce ----
   m.def("ar_ipc_alloc", &ar_ipc_alloc_py, py::arg("size"), py::arg("finegrained") = true);
   m.def("ar_ipc_open", &ar_ipc_open_py);
   m.def("ar_ipc_free", &r4d_ar_ipc_free);
@@ -626,6 +629,17 @@ PYBIND11_MODULE(r4d, m) {
   m.def("ar_ipc_enable_peer", &r4d_ar_ipc_enable_peer);
   m.def("ar_oneshot_2rank_exact", &r4d_ar_oneshot_2rank_exact);
   m.def("ar_oneshot_2rank_wht6", &r4d_ar_oneshot_2rank_wht6);
+  m.def("ar_oneshot_4rank_exact", &r4d_ar_oneshot_4rank_exact);
+  m.def("ar_oneshot_8rank_exact", &r4d_ar_oneshot_8rank_exact);
+  m.def("ar_twoshot_4rank_exact", &r4d_ar_twoshot_4rank_exact);
+  m.def("ar_twoshot_8rank_exact", &r4d_ar_twoshot_8rank_exact);
+  m.def("ar_twoshot_4rank_ti8", &r4d_ar_twoshot_4rank_ti8);
+  {
+    int group = 0, group_bytes = 0;
+    r4d_ar_ti8_dims(&group, &group_bytes);
+    m.attr("AR_TI8_GROUP")       = group;        // tiered-int8 wire group size
+    m.attr("AR_TI8_GROUP_BYTES") = group_bytes;  // wire bytes per group (layout in r4d_ar_ti8.h)
+  }
   {
     int group = 0, bits = 0, chunk_elems = 0;
     r4d_ar_wht6_dims(&group, &bits, &chunk_elems);
@@ -633,6 +647,13 @@ PYBIND11_MODULE(r4d, m) {
     m.attr("AR_WHT6_GROUP")       = group;
     m.attr("AR_WHT6_BITS")        = bits;
     m.attr("AR_WHT6_CHUNK_ELEMS") = chunk_elems;
+    int wmb = 0, wnb = 0, wmp = 0;
+    r4d_ar_wide_dims(&wmb, &wnb, &wmp);
+    m.attr("AR_WIDE_MAX_BLOCKS") = wmb;   // 4-rank and 8-rank; the 2-rank pair uses AR_MAX_BLOCKS
+    m.attr("AR_WIDE_NB_DESIGN")  = wnb;   // the block count they were tuned at
+    m.attr("AR_WIDE_MAX_PEERS")  = wmp;
+    // the two-shot ceiling, for the Python router's band gate
+    m.attr("AR_TWOSHOT_WIDE_MAX_ELEMS") = (long)R4D_AR_TWOSHOT_WIDE_MAX_ELEMS;
   }
 
   // ---- skinny GEMM ----

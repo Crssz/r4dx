@@ -187,8 +187,67 @@ void r4d_ar_oneshot_2rank_wht6(long peer_scratch, long my_scratch, long peer_fla
                                long seq_ctrs, long loc_pack, long slot_stride_bytes,
                                long scale_off_bytes, long inp, long out, long n_elem, long dtype,
                                long stream, long nblocks, long nthreads, long drain, long acq);
-int  r4d_ar_max_blocks(void);                                   // both kernels
+int  r4d_ar_max_blocks(void);                                   // the two 2-rank kernels
 void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit payload only
+
+// ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
+// The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). The peer arguments are ascending
+// global rank with the current rank removed. Scratch is 2*world size slots of slot_stride16 16B 
+// words parity x source rank, this rank's own slot unused); flags are max_blocks*ws words indexed 
+// [block][source rank]; seq_ctrs is one word per block.
+void r4d_ar_oneshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                long peer_flags0, long peer_flags1, long peer_flags2,
+                                long my_scratch, long my_flags, long seq_ctrs, long slot_stride16,
+                                long inp, long out, long n_elem, long dtype, long rank,
+                                long stream, long nblocks, long nthreads, long drain, long acq,
+                                long pub);
+void r4d_ar_oneshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                long peer_scratch3, long peer_scratch4, long peer_scratch5,
+                                long peer_scratch6, long peer_flags0, long peer_flags1,
+                                long peer_flags2, long peer_flags3, long peer_flags4,
+                                long peer_flags5, long peer_flags6, long my_scratch,
+                                long my_flags, long seq_ctrs, long slot_stride16, long inp,
+                                long out, long n_elem, long dtype, long rank, long stream,
+                                long nblocks, long nthreads, long drain, long acq, long pub);
+void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
+
+// ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
+// Reduce-scatter + all-gather on the same buffer trio and peer-argument order as the wide
+// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous 1/ws of the message, is
+// reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N bytes
+// per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
+// Regions A
+// and B at 0 and shard16, so the slot stride must hold 2*shard16. Above this bound the caller
+// falls back:
+enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
+void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                long peer_flags0, long peer_flags1, long peer_flags2,
+                                long my_scratch, long my_flags, long seq_ctrs,
+                                long slot_stride16, long inp, long out, long n_elem, long dtype,
+                                long rank, long stream, long nblocks, long nthreads, long drain,
+                                long acq, long pub);
+void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                                long peer_scratch3, long peer_scratch4, long peer_scratch5,
+                                long peer_scratch6, long peer_flags0, long peer_flags1,
+                                long peer_flags2, long peer_flags3, long peer_flags4,
+                                long peer_flags5, long peer_flags6, long my_scratch,
+                                long my_flags, long seq_ctrs, long slot_stride16, long inp,
+                                long out, long n_elem, long dtype, long rank, long stream,
+                                long nblocks, long nthreads, long drain, long acq, long pub);
+// The tiered int8 wire on both of the two-shot's hops (r4d_ar_twoshot_Nrank_ti8.hip; codec
+// in r4d_ar_ti8.h), 4 ranks only. The wire: int8 groups of 32 with an fp16 scale and a
+// per-group record (T1 plain, T2 top-1-exact, T3 wht32) 38 bytes/group, deterministic
+// tiering, bit-identical across ranks. Same peer-argument order and flag layout as the exact
+// pair; slot stride in bytes (the wire is not 16B-aligned), holding two wire images; the 
+// encoder writes its own slot too (no loc_pack). numel must tile 32-elem groups over the ws
+// shards (numel % 128).
+void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
+                              long peer_flags0, long peer_flags1, long peer_flags2,
+                              long my_scratch, long my_flags, long seq_ctrs,
+                              long slot_stride_bytes, long inp, long out, long n_elem,
+                              long dtype, long rank, long stream, long nblocks,
+                              long nthreads, long drain, long acq, long pub);
+void r4d_ar_ti8_dims(int* group, int* group_bytes);  // tiered-int8 wire only
 
 // ---- GEMM ----------------------------------------------------------------------------------
 // C[M,N] = A[M,K] @ W[N,K]^T, bf16 throughout: a torch Linear with the weight stored (N,K), which

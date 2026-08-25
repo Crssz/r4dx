@@ -112,6 +112,14 @@ int r4d_gdn_kkt_solve_k128_c64_bf16(const void* k, const void* beta, const void*
                                     const void* cu, int N, int T, int H, int Hg, int K, int bt,
                                     void* stream);
 
+// DFlash2's grouped dynamic depthwise convolution, fused into one pass. The reference builds it as
+// ~6 full [T, H] elementwise passes plus a materialised [T, taps, num_groups, group] coefficient
+// tensor, all consumed exactly once. delta is a SLICE of the [T, 2, taps, NG] kernel projection, so
+// dpitch is 2*taps*NG; out must not alias x. block_size must be a power of two.
+int r4d_dflash_conv_t2_g16_bf16(
+        const void* x, const void* delta, const void* base, void* out,
+        int T, int H, int dpitch, int NG, int taps, int group, int block_size, void* stream);
+
 // Everything between the qkv projection and the chunked scan, in one kernel: the depthwise causal
 // convolution (width 4, silu) with its state cache, the q/k/v split, the l2 norm on q and k, the
 // gate g = -exp(A_log).softplus(a + dt_bias) with its per-chunk cumsum, and beta = sigmoid(b).
@@ -190,6 +198,34 @@ void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit
 void r4d_gemm_bf16_nt_m16(long a, long w, long c, int M, int K, int N, int WV, int SK,
                           long stream);
 int  r4d_gemm_bf16_nt_m16_max_m(void);
+
+// Skinny bf16 GEMM for M up to 64: the same C[M,N] = A[M,K] @ W[N,K]^T, computed with
+// 16x16x16 WMMA so a 16-wide step of K costs ceil(M/16) activation fragments and one weight
+// fragment, instead of one weight load and M activation loads.
+void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, int SK, int MB,
+                          long stream);
+int  r4d_gemm_bf16_nt_m64_max_m(void);
+
+// Skinny GEMM with a 4-BIT weight: C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T, f16 A, bf16 C. The weight
+// is asymmetric per output channel per group of `group()` contiguous K -- w ~= scale * (q - zero),
+// q in 0..15, zero an integer -- and is pre-permuted offline into the WMMA fragment order, so the
+// kernel's whole weight path is one global_load_b128 per lane per four k steps. Wq is N*K/2 bytes;
+// Wsz is one dword per (row, group), the f16 scale in its low half and the f16 of -(1024 + zero)
+// in its high half. N must be a multiple of 16 and K divisible by SK * group().
+void r4d_gemm_w4a16_nt_m64(long a, long wq, long wsz, long c, int M, int K, int N,
+                           int WV, int SK, int MB, int NPW, int NT, long stream);
+int  r4d_gemm_w4a16_nt_m64_max_m(void);
+int  r4d_gemm_w4a16_nt_m64_group(void);
+
+// 4-bit weight, 8-bit activation. Signed 4-bit codes, per-row activation scale, int8 WMMA.
+void r4d_gemm_w4a8_nt_m64(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
+                          int WV, int SK, int MB, int NPW, int NT, long stream);
+int  r4d_gemm_w4a8_nt_m64_max_m(void);
+int  r4d_gemm_w4a8_nt_m64_group(void);
+int  r4d_gemm_w4a8_nt_m64_aperm(void);
+
+// Per-row symmetric int8 quantisation of a bf16 activation, in the A-fragment byte order.
+void r4d_quant_act_i8(long a, long q, long s, int M, int K, long stream);
 
 // ---- registry ------------------------------------------------------------------------------
 // Every kernel in the library, with the constraints its name encodes spelled out. A caller that

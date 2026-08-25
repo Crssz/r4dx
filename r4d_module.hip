@@ -165,6 +165,21 @@ static void gdn_kkt_solve(int64_t k, int64_t beta, int64_t g, int64_t A, int64_t
                              std::to_string(rc) + ")");
 }
 
+static void dflash_conv(int64_t x, int64_t delta, int64_t base, int64_t out, int num_tokens,
+                        int hidden_size, int delta_pitch, int num_groups, int taps, int group_size,
+                        int block_size, int64_t stream) {
+  int rc = r4d_dflash_conv_t2_g16_bf16((const void*)x, (const void*)delta, (const void*)base,
+                                       (void*)out, num_tokens, hidden_size, delta_pitch,
+                                       num_groups, taps, group_size, block_size, (void*)stream);
+  if (rc == -1)
+    throw std::runtime_error("r4d dflash_conv_t2_g16_bf16: this build is compiled for taps 2 and "
+                             "group size 16, needs hidden_size divisible by group_size*8, and "
+                             "needs a power-of-two block size");
+  if (rc != 0)
+    throw std::runtime_error("r4d dflash_conv_t2_g16_bf16: hip launch error (code " +
+                             std::to_string(rc) + ")");
+}
+
 static void gdn_conv_prep(int64_t x, int64_t xpitch, int64_t wgt, int64_t bias, int64_t cstate,
                           int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, int64_t cache_idx,
                           int64_t ci_stride, int64_t has_init, int64_t a, int64_t b,
@@ -590,6 +605,7 @@ PYBIND11_MODULE(r4d, m) {
   // ---- gated delta net ----
   m.def("gdn_chunk_scan_k128_v128_c64_bf16", &gdn_chunk_scan);
   m.def("gdn_kkt_solve_k128_c64_bf16", &gdn_kkt_solve);
+  m.def("dflash_conv_t2_g16_bf16", &dflash_conv);
   m.def("gdn_conv_prep_w4_h128_bf16", &gdn_conv_prep);
   m.def("gdn_conv_update_w4_h128_bf16", &gdn_conv_update);
   m.def("gdn_recurrent_update_k128_v128_bf16_fp32state", &gdn_recurrent_update);
@@ -623,6 +639,22 @@ PYBIND11_MODULE(r4d, m) {
   m.def("gemm_bf16_nt_m16", &r4d_gemm_bf16_nt_m16, py::arg("a"), py::arg("w"), py::arg("c"),
         py::arg("M"), py::arg("K"), py::arg("N"), py::arg("WV"), py::arg("SK"), py::arg("stream"));
   m.attr("GEMM_MAX_M") = r4d_gemm_bf16_nt_m16_max_m();
+  m.def("gemm_bf16_nt_m64", &r4d_gemm_bf16_nt_m64, py::arg("a"), py::arg("w"), py::arg("c"),
+        py::arg("M"), py::arg("K"), py::arg("N"), py::arg("WV"), py::arg("SK"), py::arg("MB"),
+        py::arg("stream"));
+  m.attr("GEMM64_MAX_M") = r4d_gemm_bf16_nt_m64_max_m();
+  m.def("gemm_w4a16_nt_m64", &r4d_gemm_w4a16_nt_m64, py::arg("a"), py::arg("wq"), py::arg("wsz"),
+        py::arg("c"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("WV"), py::arg("SK"),
+        py::arg("MB"), py::arg("NPW"), py::arg("NT"), py::arg("stream"));
+  m.attr("GEMM_W4_MAX_M") = r4d_gemm_w4a16_nt_m64_max_m();
+  m.attr("GEMM_W4_GROUP") = r4d_gemm_w4a16_nt_m64_group();
+  m.def("gemm_w4a8_nt_m64", &r4d_gemm_w4a8_nt_m64, py::arg("a"), py::arg("ascale"), py::arg("wq"),
+        py::arg("ws"), py::arg("c"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("WV"),
+        py::arg("SK"), py::arg("MB"), py::arg("NPW"), py::arg("NT"), py::arg("stream"));
+  m.attr("GEMM_W4A8_MAX_M") = r4d_gemm_w4a8_nt_m64_max_m();
+  m.attr("GEMM_W4A8_GROUP") = r4d_gemm_w4a8_nt_m64_group();
+  m.def("quant_act_i8", &r4d_quant_act_i8, py::arg("a"), py::arg("q"), py::arg("s"), py::arg("M"),
+        py::arg("K"), py::arg("stream"));
 
   // ---- what this build contains ----
   m.def("kernels", &kernels,

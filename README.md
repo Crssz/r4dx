@@ -37,7 +37,9 @@ constants and by `kernels()`.
 | `gdn_gated_rmsnorm_h128_bf16` | gated rms norm over a 128-channel row, `out = rms(x) . w . act(z)` |
 | `ar_oneshot_2rank_exact` | one-shot push all-reduce over P2P, exactly 2 ranks, exact bf16/fp16/fp32 |
 | `ar_oneshot_2rank_wht6` | the same handshake with a Walsh-Hadamard-rotated 6-bit wire payload (lossy) |
-| `gemm_bf16_nt_m16` | skinny bf16 GEMM, `C[M,N] = A[M,K] @ W[N,K]^T`, M ≤ 16, split-K |
+| `gemm_bf16_nt_m16` | skinny bf16 GEMM, `C[M,N] = A[M,K] @ W[N,K]^T`, M ≤ 16, split-K (superseded by the WMMA kernel below on every shape measured so far) |
+| `gemm_bf16_nt_m64` | the same GEMM for M ≤ 64, one 16x16x16 WMMA per row tile per 16 of K |
+| `gemm_w4a16_nt_m64` | the same GEMM with a **4-bit weight** — asymmetric scale and integer zero per 128 K, pre-permuted offline into WMMA fragment order so the weight path is one `global_load_b128` per lane per four k steps, f16 activations, bf16 out |
 
 ## Asking the library instead of remembering
 

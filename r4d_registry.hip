@@ -82,8 +82,29 @@ static const R4DConstraint cArWht6[] = {
 };
 
 // ---- GEMM --------------------------------------------------------------------------------------
+// DFlash2's grouped dynamic depthwise convolution. block_size is not listed as a predicate: the
+// body masks the position with block_size-1, so only powers of two are admissible, and that is a
+// property of the value rather than a bound select() can express. The entry point rejects it.
+static const R4DConstraint cDflashConv[] = {
+    C_EQ("taps", 2), C_EQ("group_size", 16), C_DIV("hidden_size", 128),
+    C_IN("dtype", "bf16"),
+};
+
 static const R4DConstraint cGemmNt[] = {
     C_LE("M", 16), C_DIV("K", 256), C_IN("dtype", "bf16"),
+};
+
+static const R4DConstraint cGemmNt64[] = {
+    C_LE("M", 64), C_DIV("K", 16), C_IN("dtype", "bf16"),
+};
+static const R4DConstraint cGemmNtW4[] = {
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a16"),
+};
+static const R4DConstraint cGemmNtW4A8[] = {
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8"),
+};
+static const R4DConstraint cQuantActI8[] = {
+    C_DIV("K", 16), C_IN("dtype", "bf16"),
 };
 
 #define ROW(arr) arr, (int)(sizeof(arr) / sizeof(arr[0]))
@@ -161,6 +182,39 @@ static const R4DKernelInfo kKernels[] = {
      "M <= 16; K divisible by SK and K/SK by 256; N, K otherwise runtime",
      "bf16 A / W / C, fp32 accumulate, deterministic reduction",
      ROW(cGemmNt)},
+    {"gemm_bf16_nt_m64", "gemm", "gemm_nt",
+     "skinny GEMM C[M,N] = A[M,K] @ W[N,K]^T with 16x16x16 WMMA, split-K reduced in LDS",
+     "M <= 64; K divisible by SK*16; N, K otherwise runtime",
+     "bf16 A / W / C, fp32 accumulate, deterministic reduction",
+     ROW(cGemmNt64)},
+    {"gemm_w4a16_nt_m64", "gemm", "gemm_nt",
+     "skinny GEMM C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with a 4-bit weight, 16x16x16 WMMA, "
+     "split-K reduced in LDS",
+     "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order",
+     "f16 A, 4-bit W with an f16 scale and integer zero per 128 K, bf16 C, fp32 accumulate",
+     ROW(cGemmNtW4)},
+    {"gemm_w4a8_nt_m64", "gemm", "gemm_nt",
+     "skinny GEMM C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with a 4-bit weight and an 8-bit "
+     "activation, 16x16x16 int8 WMMA, split-K reduced in LDS",
+     "M <= 64; N a multiple of 16; K divisible by SK*128; weight pre-permuted into fragment order "
+     "and SHARED byte for byte with gemm_w4a16_nt_m64; activation byte-shuffled inside each k step",
+     "int8 A with an f32 per-row scale, signed 4-bit W with an f16 scale per 128 K, bf16 C, "
+     "int32 accumulate per group",
+     ROW(cGemmNtW4A8)},
+    {"quant_act_i8", "quant", "quant_act",
+     "per-row symmetric int8 quantisation of a bf16 activation, written in the byte order "
+     "gemm_w4a8_nt_m64's A fragment reads",
+     "K a multiple of 16; one workgroup per row",
+     "bf16 in, int8 out with an f32 per-row scale",
+     ROW(cQuantActI8)},
+    {"dflash_conv_t2_g16_bf16", "dflash", "dflash_conv",
+     "DFlash2 grouped dynamic depthwise conv: coefficient add, both taps and the block-position "
+     "mask in one pass",
+     "taps 2, group_size 16, hidden_size divisible by group_size*8, block_size a power of two; "
+     "delta is a slice of the [T, 2, taps, NG] projection so its row pitch is 2*taps*NG; out must "
+     "not alias x",
+     "bf16 x / delta / base / out, fp32 accumulate",
+     ROW(cDflashConv)},
 };
 
 extern "C" int r4d_kernel_count(void) {

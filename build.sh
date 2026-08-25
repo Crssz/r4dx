@@ -46,6 +46,11 @@ UNITS=(
   "r4d_ar_oneshot_2rank_exact:"
   "r4d_ar_oneshot_2rank_wht6:"
   "r4d_gemm_bf16_nt_m16:"
+  "r4d_gemm_bf16_nt_m64:"
+  "r4d_gemm_w4a16_nt_m64:"
+  "r4d_gemm_w4a8_nt_m64:-DR4D_GEMM_W4A8_GROUP=128"
+  "r4d_quant_act_i8:"
+  "r4d_dflash_conv_t2_g16_bf16:"
   "r4d_registry:"
   "r4d_module:"
 )
@@ -65,8 +70,10 @@ for p in "${pids[@]}"; do wait "$p"; done
 echo "[hipcc] ${OUT} (link)"
 # hipcc emits a fatbin per object; no -fgpu-rdc is needed, because no device function is called
 # across translation units.
-$HIPCC -shared --offload-arch="${GFX_ARCH}" r4d_attn_paged_h256_gqa6.o r4d_attn_vit_h72_bf16.o r4d_gdn_chunk_scan_k128_v128_c64_bf16.o r4d_gdn_conv_w4_h128_bf16.o \
-  r4d_gdn_kkt_solve_k128_c64_bf16.o r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.o r4d_gdn_gated_rmsnorm_h128_bf16.o \
-  r4d_ar_oneshot_2rank_exact.o r4d_ar_oneshot_2rank_wht6.o \
-  r4d_gemm_bf16_nt_m16.o r4d_registry.o r4d_module.o -o "${OUT}"
+# Link exactly what UNITS compiled. This used to be a hand-written list, which silently drifted
+# when a unit was added: the object compiled, the module still referenced its entry point, and the
+# .so imported with an undefined symbol.
+objs=()
+for u in "${UNITS[@]}"; do objs+=("${u%%:*}.o"); done
+$HIPCC -shared --offload-arch="${GFX_ARCH}" "${objs[@]}" -o "${OUT}"
 echo "[build.sh] $(ls -la "${OUT}")"

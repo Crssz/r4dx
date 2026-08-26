@@ -120,6 +120,9 @@ static const R4DConstraint cGemmNtW4[] = {
 static const R4DConstraint cGemmNtW4A8[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_IN("dtype", "w4a8"),
 };
+static const R4DConstraint cGemmNtMxfp4A8[] = {
+    C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
+};
 static const R4DConstraint cQuantActI8[] = {
     C_DIV("K", 16), C_IN("dtype", "bf16"),
 };
@@ -256,6 +259,15 @@ static const R4DKernelInfo kKernels[] = {
      "int8 A with an f32 per-row scale, signed 4-bit W with an f16 scale per 128 K, bf16 C, "
      "int32 accumulate per group",
      ROW(cGemmNtW4A8)},
+    {"gemm_mxfp4a8_nt_m64", "gemm", "gemm_nt",
+     "skinny GEMM C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with an OCP-MXFP4 weight and an fp8 "
+     "activation, 16x16x16 fp8 WMMA, split-K reduced in LDS",
+     "M <= 64; N a multiple of 16; K divisible by SK*32; weight pre-permuted into fragment "
+     "order (32 lanes x uint32 per n-tile/k-step), one E8M0 exponent per 32 K in [K/32][N] "
+     "order, plus a per-row reference exponent",
+     "e4m3 A with an f32 per-row scale, e2m1 W with an E8M0 scale per 32 K folded into the "
+     "element against a per-row reference, bf16 C, fp32 accumulate",
+     ROW(cGemmNtMxfp4A8)},
     {"quant_act_i8", "quant", "quant_act",
      "per-row symmetric int8 quantisation of a bf16 activation, written in the byte order "
      "gemm_w4a8_nt_m64's A fragment reads",

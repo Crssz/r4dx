@@ -674,6 +674,12 @@ PYBIND11_MODULE(r4d, m) {
         py::arg("SK"), py::arg("MB"), py::arg("NPW"), py::arg("NT"), py::arg("stream"));
   m.attr("GEMM_W4A8_MAX_M") = r4d_gemm_w4a8_nt_m64_max_m();
   m.attr("GEMM_W4A8_GROUP") = r4d_gemm_w4a8_nt_m64_group();
+  m.def("gemm_mxfp4a8_nt_m64", &r4d_gemm_mxfp4a8_nt_m64, py::arg("a"), py::arg("ascale"),
+        py::arg("wq"), py::arg("ws"), py::arg("wref"), py::arg("c"), py::arg("M"), py::arg("K"),
+        py::arg("N"), py::arg("WV"), py::arg("SK"), py::arg("MB"), py::arg("NPW"),
+        py::arg("stream"));
+  m.attr("GEMM_MXFP4_MAX_M") = r4d_gemm_mxfp4a8_nt_m64_max_m();
+  m.attr("GEMM_MXFP4_GROUP") = r4d_gemm_mxfp4a8_nt_m64_group();
   m.def("quant_act_i8", &r4d_quant_act_i8, py::arg("a"), py::arg("q"), py::arg("s"), py::arg("M"),
         py::arg("K"), py::arg("stream"));
 

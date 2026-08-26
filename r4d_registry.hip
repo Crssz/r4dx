@@ -77,8 +77,25 @@ static const R4DConstraint cGdnGatedRmsNorm[] = {
 static const R4DConstraint cArExact[] = {
     C_EQ("world_size", 2), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
 };
+static const R4DConstraint cArExact4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+};
+static const R4DConstraint cArExact8[] = {
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+};
+static const R4DConstraint cArTsExact4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+};
+static const R4DConstraint cArTsExact8[] = {
+    C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
+    C_DIV("numel", 64), C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
+};
 static const R4DConstraint cArWht6[] = {
     C_EQ("world_size", 2), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 64),
+};
+static const R4DConstraint cArTi8Ts4[] = {
+    C_EQ("world_size", 4), C_EQ("exact", 0), C_IN("dtype", "bf16 fp16"), C_DIV("numel", 128),
 };
 
 // ---- GEMM --------------------------------------------------------------------------------------
@@ -177,6 +194,44 @@ static const R4DKernelInfo kKernels[] = {
      "exactly 2 ranks, peer-accessible; groups of 64 elements; cudagraph-safe",
      "bf16 / fp16 payload, 6 bits + bf16 scale per group on the wire, fp32 accumulate",
      ROW(cArWht6)},
+    {"ar_oneshot_4rank_exact", "ar", "allreduce",
+     "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
+     "exactly 4 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
+     "cudagraph-safe",
+     "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical "
+     "across ranks",
+     ROW(cArExact4)},
+    {"ar_oneshot_8rank_exact", "ar", "allreduce",
+     "all-reduce (sum), one-shot push over P2P IPC scratch, per-block handshake",
+     "exactly 8 ranks, all peer-accessible; one scratch slot per (parity, source rank); "
+     "cudagraph-safe",
+     "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical "
+     "across ranks",
+     ROW(cArExact8)},
+    {"ar_twoshot_4rank_exact", "ar", "allreduce",
+     "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block "
+     "pipelined handshake",
+     "exactly 4 ranks, all peer-accessible; two hops; shares the wide "
+     "family's flag/seq/scratch set; cudagraph-safe",
+     "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical "
+     "across ranks",
+     ROW(cArTsExact4)},
+    {"ar_twoshot_8rank_exact", "ar", "allreduce",
+     "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block "
+     "pipelined handshake",
+     "exactly 8 ranks, all peer-accessible; two hops; shares the wide "
+     "family's flag/seq/scratch set; cudagraph-safe",
+     "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical "
+     "across ranks",
+     ROW(cArTsExact8)},
+    {"ar_twoshot_4rank_ti8", "ar", "allreduce",
+     "all-reduce (sum), reduce-scatter + all-gather; both hops ride the tiered-int8 wire "
+     "(double quant, the owner storing the decode of its own words) -- lossy",
+     "exactly 4 ranks, all peer-accessible; groups of 32 per shard (numel tiles 128); "
+     "cudagraph-safe",
+     "bf16 / fp16 payload, int8 + fp16 scale + u32 record per group on the wire, fp32 "
+     "accumulate in ascending rank order, bit-identical across ranks",
+     ROW(cArTi8Ts4)},
     {"gemm_bf16_nt_m16", "gemm", "gemm_nt",
      "skinny GEMM C[M,N] = A[M,K] @ W[N,K]^T, split-K reduced in LDS",
      "M <= 16; K divisible by SK and K/SK by 256; N, K otherwise runtime",

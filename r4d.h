@@ -224,6 +224,13 @@ int  r4d_gemm_w4a8_nt_m64_max_m(void);
 int  r4d_gemm_w4a8_nt_m64_group(void);
 int  r4d_gemm_w4a8_nt_m64_aperm(void);
 
+// OCP-MXFP4 weight, fp8 activation. e2m1 elements with one E8M0 exponent per 32 K, folded
+// against a per-row reference exponent so the inner loop has no rescale; fp8 WMMA.
+void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
+                             int M, int K, int N, int WV, int SK, int MB, int NPW, long stream);
+int  r4d_gemm_mxfp4a8_nt_m64_max_m(void);
+int  r4d_gemm_mxfp4a8_nt_m64_group(void);
+
 // Per-row symmetric int8 quantisation of a bf16 activation, in the A-fragment byte order.
 void r4d_quant_act_i8(long a, long q, long s, int M, int K, long stream);
 

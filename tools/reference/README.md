@@ -143,8 +143,8 @@ C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\k
 ```
 
 Prototype of the static fp8 KV descale calibration from `docs/container-format.md` ("KV descale
-tables"). Tokenizes a built-in calibration paragraph (real tokenizer, via `AutoTokenizer` -- this
-only *uses* the tokenizer to build input ids, it doesn't touch anything under `src/tokenizer` or
+tables"). Tokenizes a calibration text (real tokenizer, via `AutoTokenizer` -- this only *uses*
+the tokenizer to build input ids, it doesn't touch anything under `src/tokenizer` or
 `tools/reference/tok_golden.py`, which belong to the tokenizer agent), gathers the calibration
 tokens' `text.embed_tokens` rows (real weights, row-gathered so the full `[248320, 5120]` table is
 never materialized), runs them through `--layer`'s `input_layernorm` + `self_attn` (real weights),
@@ -154,21 +154,44 @@ applied to V; captured via a forward hook on `v_proj`). `--layer` must be a `ful
 (0-indexed `3, 7, 11, ...`; the script asserts this and explains why if you pick a GDN layer --
 r4d's paged fp8 KV cache is attention-only).
 
+**Calibration corpus**: `--calib-text-file <path>` (default: `tools/reference/calib.txt` next to
+this script if present, else the old built-in `DEFAULT_CALIBRATION_TEXT` paragraph). `calib.txt` is
+a deliberately mixed English-prose / source-code / Thai-prose corpus (a few hundred tokens after
+repetition to `--num-tokens`) -- a single-register corpus (e.g. English news prose alone) tends to
+under-estimate the true per-head amax against the token distributions (code, Thai, mixed-script)
+this engine will actually see, which would make the calibrated descale too small and clip outlier
+activations at inference time. The output JSON records `calib_text_source` (which file was used)
+and `calib_text_sha256` for provenance.
+
 Output JSON: `{"<layer_idx>": {"k_amax": [4 floats], "v_amax": [4 floats], ...}}` plus provenance
-fields (`weights_source`, `embed_source`, `config_sha256`, `torch_dtype`, `device`, etc. --
-`torch_dtype`/`device` matter because `amax` is computed in bf16 on `--device cuda` and fp32 on
-`--device cpu`, materially different numbers) and two prose fields baked into every run's output:
-`"caveat"` (this is a **prototype** -- it feeds the calibration tokens' raw embeddings straight into
-one layer, skipping every preceding layer's transform, so the hidden-state distribution isn't what
-that layer truly sees mid-stack) and `"converter_consumption"` (exactly how `src/convert` should
-turn `k_amax`/`v_amax` into `text.layers.{i}.attn.k_descale`/`.v_descale`: `descale = amax / 448.0`
-(fp8 e4m3 max), replacing `docs/container-format.md`'s placeholder `1.0` -- and how the resulting
-per-layer `fp32[kv_heads]` vector must be broadcast to `r4d.h`'s runtime `(num_seqs, kv_heads)`
-shape, one identical row per sequence).
+fields (`weights_source`, `embed_source`, `config_sha256`, `torch_dtype`, `device`,
+`calib_text_source`, `calib_text_sha256`, etc. -- `torch_dtype`/`device` matter because `amax` is
+computed in bf16 on `--device cuda` and fp32 on `--device cpu`, materially different numbers) and
+two prose fields baked into every run's output: `"caveat"` (this is a **prototype** -- it feeds the
+calibration tokens' raw embeddings straight into one layer, skipping every preceding layer's
+transform, so the hidden-state distribution isn't what that layer truly sees mid-stack) and
+`"converter_consumption"` (exactly how `src/convert` turns `k_amax`/`v_amax` into
+`text.layers.{i}.attn.k_descale`/`.v_descale`).
+
+**Descale convention (exact)**: `descale = amax / 448.0`, where `448.0` is the OCP e4m3fn finite
+max magnitude and `amax` is the per-kv-head absolute-max over the calibration set (K: post-rope;
+V: raw `v_proj` output, no rope). This matches `src/kernels/src/r4dx_kernels.hip`'s
+`r4dx_kv_write_paged_fp8_hnd`, which writes `stored_fp8 = fp8e4m3(real_bf16_value / descale[head])`
+-- i.e. it *divides* by descale before the fp8 cast -- so the inverse, `dequant = fp8_value *
+descale[head]`, is exactly what the attention kernel must (and does) use to reconstruct the real
+value for QK^T / PV. `r4dx-convert --kv-calib <json>` (`src/convert/main.cpp`) applies this same
+`amax / 448.0` formula per kv head when it fills `text.layers.{i}.attn.k_descale` / `.v_descale`,
+replacing `docs/container-format.md`'s placeholder `1.0`; a layer missing from the calibration JSON
+(or with a `k_amax`/`v_amax` of the wrong length) falls back to `1.0` with a `WARNING` printed to
+stderr, not a hard error. The resulting per-layer `fp32[kv_heads]` vector must still be broadcast to
+`r4d.h`'s runtime `(num_seqs, kv_heads)` shape, one identical row per sequence, by whatever in
+`src/model` builds `R4DArgs.k_descale`/`.v_descale` -- calibration is not per-sequence.
 
 Running the script again with the same `--out` path **merges** the new layer's result into the
 existing file instead of overwriting it, so calibrating all 16 full-attention layers is a matter of
-running `--layer 3`, `--layer 7`, ... `--layer 63` in sequence against the same `--out`.
+running `--layer 3`, `--layer 7`, ... `--layer 63` in sequence against the same `--out`. A
+`--calib-text-file` argument (default `tools/reference/calib.txt`) picks the calibration corpus; see
+above.
 
 Runtime: ~10s on HIP device 1 (default `--num-tokens 256`); a few seconds on CPU.
 

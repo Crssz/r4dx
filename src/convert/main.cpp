@@ -5,6 +5,14 @@
 //   r4dx-convert --input <HF checkpoint dir> --output <container path>
 //                [--layouts mxfp4,w4a16,w4a8] [--lm-head 4bit+bf16]
 //                [--layers N] [--threads T] [--vision on|off] [--mtp on|off] [--no-bf16]
+//                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
+//
+// --kv-calib fills text.layers.{i}.attn.k_descale/.v_descale (full-attention layers only) from a
+// tools/reference/kv_calibrate.py merged JSON: descale[head] = k_amax|v_amax[head] / 448.0 (see
+// r4dx_convert::ResolveKvDescale, kv_calib.hpp). A layer absent from the JSON (or with a
+// missing/wrong-length amax array) falls back to descale=1.0 with a WARNING on stderr, not a hard
+// error -- omitting --kv-calib entirely also yields the 1.0 placeholder, silently (no calibration
+// was ever requested, so there is nothing to warn about).
 //
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts mxfp4,w4a16,w4a8] [--threads T]
@@ -30,6 +38,7 @@
 #include "r4d.h"  // r4d_gemm_{w4a16,w4a8,mxfp4a8}_nt_m64_group() -- cross-checked against this
                   // converter's own kInt4Group/kMxfp4Group at startup (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
+#include "r4dx_convert/kv_calib.hpp"
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
@@ -132,6 +141,7 @@ struct AppArgs {
   int vision = -1;  // -1 auto (on iff full run), 0 off, 1 on
   int mtp = -1;
   bool no_bf16 = false;  // drop the bf16 layout for body weights even if --layouts/--lm-head asked
+  std::string kv_calib;  // path to tools/reference/kv_calibrate.py's merged JSON; empty = no calib
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -164,6 +174,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--vision") a.vision = ParseOnOff(next(i), "--vision");
     else if (arg == "--mtp") a.mtp = ParseOnOff(next(i), "--mtp");
     else if (arg == "--no-bf16") a.no_bf16 = true;
+    else if (arg == "--kv-calib") a.kv_calib = next(i);
     else throw std::runtime_error("unknown argument: " + arg);
   }
   return a;
@@ -219,6 +230,14 @@ int RunConvert(const AppArgs& args) {
             << " threads=" << threads << " vision=" << (do_vision ? "on" : "off")
             << " mtp=" << (do_mtp ? "on" : "off") << "\n";
 
+  const bool have_kv_calib = !args.kv_calib.empty();
+  nlohmann::json kv_calib_json;
+  if (have_kv_calib) {
+    kv_calib_json = nlohmann::json::parse(ReadFile(args.kv_calib));
+    std::cout << "[r4dx-convert] kv-calib=" << args.kv_calib << " (" << kv_calib_json.size()
+              << " layer(s) in file)\n";
+  }
+
   ShardedModel model(args.input);
   ContainerWriter writer;
 
@@ -249,13 +268,22 @@ int RunConvert(const AppArgs& args) {
       writer.WriteTensor(container_name, bytes.data(), bytes.size());
     });
   };
-  auto add_descale = [&](std::string container_name, int n_kv) {
+  // `layer_idx` is the checkpoint's text-layer index (matches kv_calibrate.py's --layer);
+  // `calib_applicable` should be false for any layer kv_calibrate.py never covers by construction
+  // (the MTP layer has no calibration entry -- it isn't one of the 64 text-layer indices) so that
+  // case falls back to 1.0 silently instead of emitting a spurious "no entry for layer N" warning
+  // that would actually be about an unrelated text layer sharing the same numeric index.
+  auto add_descale = [&](std::string container_name, int n_kv, int layer_idx, const char* kind,
+                          bool calib_applicable) {
     plan_jobs.push_back([&writer, container_name, n_kv]() {
       writer.Plan(container_name, {n_kv, 4}, static_cast<uint64_t>(n_kv) * 4);
     });
-    emit_jobs.push_back([&writer, container_name, n_kv]() {
-      std::vector<float> ones(static_cast<size_t>(n_kv), 1.0f);  // calibration placeholder
-      auto bytes = r4dx_convert::EncodeFp32(ones);
+    emit_jobs.push_back([&writer, container_name, n_kv, layer_idx, kind, calib_applicable,
+                          have_kv_calib, &kv_calib_json]() {
+      auto result = r4dx_convert::ResolveKvDescale(
+          kv_calib_json, have_kv_calib && calib_applicable, layer_idx, n_kv, kind);
+      if (!result.warning.empty()) std::cerr << "[r4dx-convert] WARNING: " << result.warning << "\n";
+      auto bytes = r4dx_convert::EncodeFp32(result.values);
       writer.WriteTensor(container_name, bytes.data(), bytes.size());
     });
   };
@@ -301,8 +329,8 @@ int RunConvert(const AppArgs& args) {
       add_linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", layouts);
       add_bf16(hf + "self_attn.q_norm.weight", base + "attn.q_norm");
       add_bf16(hf + "self_attn.k_norm.weight", base + "attn.k_norm");
-      add_descale(base + "attn.k_descale", kv_heads);
-      add_descale(base + "attn.v_descale", kv_heads);
+      add_descale(base + "attn.k_descale", kv_heads, i, "k", /*calib_applicable=*/true);
+      add_descale(base + "attn.v_descale", kv_heads, i, "v", /*calib_applicable=*/true);
     } else {
       add_linear({hf + "linear_attn.in_proj_qkv.weight"}, base + "gdn.in_proj_qkv", layouts);
       add_bf16(hf + "linear_attn.in_proj_z.weight", base + "gdn.in_proj_z");
@@ -356,8 +384,10 @@ int RunConvert(const AppArgs& args) {
       add_linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", layouts);
       add_bf16(hf + "self_attn.q_norm.weight", base + "attn.q_norm");
       add_bf16(hf + "self_attn.k_norm.weight", base + "attn.k_norm");
-      add_descale(base + "attn.k_descale", kv_heads);
-      add_descale(base + "attn.v_descale", kv_heads);
+      // MTP's inner layer is not one of the 64 text-layer indices kv_calibrate.py calibrates --
+      // calib_applicable=false so this always falls back to descale=1.0, silently.
+      add_descale(base + "attn.k_descale", kv_heads, i, "k", /*calib_applicable=*/false);
+      add_descale(base + "attn.v_descale", kv_heads, i, "v", /*calib_applicable=*/false);
       add_linear({hf + "mlp.gate_proj.weight", hf + "mlp.up_proj.weight"}, base + "mlp.gate_up",
                   layouts);
       add_linear({hf + "mlp.down_proj.weight"}, base + "mlp.down", layouts);
@@ -407,6 +437,7 @@ int RunConvert(const AppArgs& args) {
       {"layouts", args.layouts_spec},
       {"lm_head", args.lm_head_spec},
       {"threads", threads},
+      {"kv_calib", have_kv_calib ? args.kv_calib : std::string("none (descale placeholder 1.0)")},
   };
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "

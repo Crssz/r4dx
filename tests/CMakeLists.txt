@@ -15,6 +15,14 @@ add_subdirectory(kernels)
 # tools/tok_ref/**); this add_subdirectory() line is the only touch it makes outside those paths.
 add_subdirectory(tokenizer)
 
+# tests/model/: owned by the model-core component (src/model/** except src/model/attention/**,
+# tests/model/** except tests/model/attention/**); this add_subdirectory() line is the only touch
+# it makes outside those paths.
+add_subdirectory(model)
+
+# tests/cli/: r4dx-cli argument-parsing unit test (src/cli/**).
+add_subdirectory(cli)
+
 # tools/reference's pure-Python golden-generator smoke test (CPU-only, no HIP device, no C++
 # build -- see tools/reference/README.md). Needs the reference venv's python.exe (torch +
 # transformers importable); test_manifest.py is a bare-assert script with no pytest dependency, so

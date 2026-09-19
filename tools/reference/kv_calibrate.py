@@ -42,11 +42,15 @@ from common import (  # noqa: E402
     load_text_config,
     resolve_device,
     set_seed,
+    sha256_bytes,
     sha256_file,
 )
 
 # A few hundred tokens of varied English prose (numbers, punctuation, code-ish tokens) so the
-# calibration set isn't degenerate. Repeated/truncated to --num-tokens after tokenization.
+# calibration set isn't degenerate. Repeated/truncated to --num-tokens after tokenization. This is
+# the fallback used only if --calib-text-file is omitted AND tools/reference/calib.txt (the real
+# calibration corpus -- mixed English prose, source code, and Thai prose, see that file's header)
+# is missing; the real 16-layer calibration run always uses calib.txt.
 DEFAULT_CALIBRATION_TEXT = """
 The gated delta network keeps a running state of shape [H, K, V] per sequence, updated one chunk
 at a time. Each of the 48 linear-attention layers repeats this recurrence, while every fourth
@@ -63,11 +67,24 @@ self.norm(hidden); q, k, v = self.qkv(x).chunk(3, dim=-1); return self.attn(q, k
 brown fox jumps over the lazy dog, 1234567890 times, while pi is approximately 3.14159265358979.
 """.strip()
 
+DEFAULT_CALIB_TEXT_FILE = Path(__file__).parent / "calib.txt"
 
-def build_calibration_ids(tokenizer, num_tokens: int) -> torch.Tensor:
+
+def load_calibration_text(calib_text_file: Path | None) -> str:
+    """Resolve the calibration corpus: an explicit --calib-text-file, else calib.txt next to this
+    script if it exists, else the built-in DEFAULT_CALIBRATION_TEXT (old prototype behavior)."""
+    path = calib_text_file if calib_text_file is not None else DEFAULT_CALIB_TEXT_FILE
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    if calib_text_file is not None:
+        raise FileNotFoundError(f"--calib-text-file {path} does not exist")
+    return DEFAULT_CALIBRATION_TEXT
+
+
+def build_calibration_ids(tokenizer, num_tokens: int, calib_text: str) -> torch.Tensor:
     ids: list[int] = []
     while len(ids) < num_tokens:
-        ids.extend(tokenizer(DEFAULT_CALIBRATION_TEXT, add_special_tokens=False)["input_ids"])
+        ids.extend(tokenizer(calib_text, add_special_tokens=False)["input_ids"])
     return torch.tensor(ids[:num_tokens], dtype=torch.long)
 
 
@@ -97,7 +114,15 @@ def mrope_position_ids(total_len: int, device) -> torch.Tensor:
     return idx.view(1, 1, total_len).expand(3, 1, total_len).clone()
 
 
-def run_calibration(model_dir: Path, layer_idx: int, device, dtype, seed: int, num_tokens: int):
+def run_calibration(
+    model_dir: Path,
+    layer_idx: int,
+    device,
+    dtype,
+    seed: int,
+    num_tokens: int,
+    calib_text_file: Path | None = None,
+):
     import transformers.models.qwen3_5.modeling_qwen3_5 as m
     from transformers import AutoTokenizer
 
@@ -110,8 +135,9 @@ def run_calibration(model_dir: Path, layer_idx: int, device, dtype, seed: int, n
         )
     index = ShardIndex.load(model_dir)
 
+    calib_text = load_calibration_text(calib_text_file)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-    calib_ids = build_calibration_ids(tokenizer, num_tokens)
+    calib_ids = build_calibration_ids(tokenizer, num_tokens, calib_text)
 
     hidden_size = text_config.hidden_size
     embed_name = "model.language_model.embed_tokens.weight"
@@ -195,13 +221,14 @@ def run_calibration(model_dir: Path, layer_idx: int, device, dtype, seed: int, n
             "contract; not good enough to ship as the real per-model calibration."
         ),
         "converter_consumption": (
-            "The converter's real calibration pass (full 64-layer stack, real prompts) writes "
+            "r4dx-convert --kv-calib <json> (src/convert/main.cpp) writes "
             "text.layers.{i}.attn.k_descale / .v_descale as fp32[kv_heads] = amax / fp8_e4m3_max "
             "(~448.0), one scalar per kv head, replacing docs/container-format.md's placeholder "
             "1.0 -- see r4d.h's R4DArgs.k_descale/.v_descale and docs/container-format.md 'KV "
-            "descale tables'. r4d_kv_write_paged_fp8_hnd (src/kernels, not yet implemented) divides "
-            "each K/V element by its head's descale before the fp8 cast on write; the attention "
-            "kernel multiplies back by the same descale when it dequantizes for the QK^T / PV "
+            "descale tables'. r4dx_kv_write_paged_fp8_hnd (src/kernels/src/r4dx_kernels.hip) "
+            "divides each K/V element by its head's descale before the fp8 cast on write "
+            "(stored_fp8 = fp8e4m3(value / descale[head])); the attention kernel's own dequant is "
+            "the inverse (value = fp8_value * descale[head]) when it reconstructs for the QK^T / PV "
             "matmuls. A too-small descale clips (saturates at +-448 with the amax outlier's tail "
             "cut off); a too-large one wastes fp8's few mantissa bits -- hence calibrating off "
             "amax rather than guessing a global constant. NOTE: r4d.h declares the *runtime* "
@@ -211,6 +238,12 @@ def run_calibration(model_dir: Path, layer_idx: int, device, dtype, seed: int, n
             "the loader builds that runtime array, not stored once and reused as a [kv_heads] "
             "buffer."
         ),
+        "calib_text_source": str(
+            calib_text_file if calib_text_file is not None else DEFAULT_CALIB_TEXT_FILE
+        )
+        if (calib_text_file or DEFAULT_CALIB_TEXT_FILE.exists())
+        else "built-in DEFAULT_CALIBRATION_TEXT",
+        "calib_text_sha256": sha256_bytes(calib_text.encode("utf-8")),
     }
 
 
@@ -222,12 +255,24 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--num-tokens", type=int, default=256)
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "kv_calibrate_out" / "kv_descale.json")
+    ap.add_argument(
+        "--calib-text-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the calibration corpus (plain text). Defaults to tools/reference/calib.txt "
+            "next to this script if it exists (mixed English/code/Thai, see that file's header), "
+            "else falls back to the old built-in DEFAULT_CALIBRATION_TEXT."
+        ),
+    )
     args = ap.parse_args()
 
     device = resolve_device(args.device)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    result = run_calibration(args.model_dir, args.layer, device, dtype, args.seed, args.num_tokens)
+    result = run_calibration(
+        args.model_dir, args.layer, device, dtype, args.seed, args.num_tokens, args.calib_text_file
+    )
 
     # Merge into any existing calibration file rather than overwriting it -- a real container
     # needs all 16 full-attention layers' descale tables, calibrated one `--layer` at a time.

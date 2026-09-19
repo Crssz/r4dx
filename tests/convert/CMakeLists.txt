@@ -22,3 +22,15 @@ add_test(NAME convert_pack_bytes COMMAND convert_pack_bytes)
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)
+
+# --kv-calib (task item 2): r4dx_convert::ResolveKvDescale's amax/448.0 convention, missing-layer/
+# missing-key/wrong-length fallback-to-1.0 warning paths, and the calib_applicable=false silent path.
+add_executable(convert_kv_calib test_kv_calib.cpp)
+target_link_libraries(convert_kv_calib PRIVATE r4dx_convert)
+add_test(NAME convert_kv_calib COMMAND convert_kv_calib)
+
+# bf16 linear-weight layout (task item 2: --layouts bf16 for all linear weights): plain row-major
+# on-disk bytes, no WMMA-fragment permutation, plan/emit byte-size agreement.
+add_executable(convert_bf16_layout test_bf16_layout.cpp)
+target_link_libraries(convert_bf16_layout PRIVATE r4dx_convert)
+add_test(NAME convert_bf16_layout COMMAND convert_bf16_layout)

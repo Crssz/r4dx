@@ -1,0 +1,101 @@
+r4dx KV-cache calibration corpus. Mixed English prose, source code, and Thai prose, so the
+per-kv-head amax statistics gathered here are not biased toward a single script or token
+distribution. Not derived from any single copyrighted source; written for this calibration pass.
+
+== English prose ==
+
+The gated delta network keeps a running state of shape [H, K, V] per sequence, updated one chunk
+at a time. Forty-eight of the sixty-four decoder layers run this linear-attention recurrence,
+while every fourth layer -- layers 3, 7, 11, and so on through 63 -- runs full multi-head
+attention instead, with head_dim=256 and only four key/value heads shared across twenty-four query
+heads via grouped-query attention. Positions are encoded with a partial rotary embedding: only the
+first quarter of each head's 256 dimensions rotate, following an interleaved multi-axis scheme
+(mrope) with sections [11, 11, 10] spread over temporal, height, and width position streams, and a
+base theta of 1e7. For pure text prompts all three position streams collapse to the plain token
+index, so the multi-axis machinery is present but degenerates to ordinary one-dimensional rope.
+
+Static per-kv-head fp8 e4m3 descale factors are computed once, offline, from a short calibration
+pass over a few hundred representative tokens, rather than being tracked dynamically at every
+decode step. That trades a small amount of numerical accuracy for a paged KV cache with zero
+per-token scale bookkeeping -- a good trade when the cache itself, not the scale metadata, is the
+memory bottleneck at long context lengths. The calibration text deliberately mixes English prose,
+source code fragments, and Thai prose in roughly equal measure, because a calibration corpus drawn
+from only one register (say, formal English news text) would under-estimate the true activation
+amax on the token distributions this engine will actually see at inference time -- code tokens and
+Thai tokens both produce different embedding-magnitude statistics than English prose alone. On a
+single Radeon AI PRO R9700, chasing double-digit-to-low-triple-digit tokens per second on a
+twenty-seven-billion-parameter model means every one of these engineering choices has to earn its
+keep in bandwidth saved, not merely in theoretical FLOPs.
+
+== Source code ==
+
+def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None):
+    residual = hidden_states
+    normed = self.input_layernorm(hidden_states)
+    if self.is_full_attention:
+        attn_out = self.self_attn(
+            hidden_states=normed,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+    else:
+        attn_out = self.linear_attn(hidden_states=normed, past_key_values=past_key_values)
+    hidden_states = residual + attn_out
+    residual = hidden_states
+    normed = self.post_attention_layernorm(hidden_states)
+    hidden_states = residual + self.mlp(normed)
+    return hidden_states
+
+
+class KvDescaleTable:
+    """fp32[kv_heads] per (layer, k|v) -- dequant(fp8_value) = fp8_value * descale."""
+
+    def __init__(self, kv_heads: int):
+        self.k_descale = [1.0] * kv_heads
+        self.v_descale = [1.0] * kv_heads
+
+    def calibrate(self, k_amax, v_amax, fp8_e4m3_max: float = 448.0) -> None:
+        self.k_descale = [a / fp8_e4m3_max for a in k_amax]
+        self.v_descale = [a / fp8_e4m3_max for a in v_amax]
+
+
+// r4dx_kv_write_paged_fp8_hnd: stored_fp8 = fp8e4m3(real_bf16_value / descale[head])
+// the attention kernel's dequant is the inverse: value = fp8_value * descale[head]
+for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    kv_cache[base + d] = FloatToFp8E4M3(__bfloat162float(kk[d]) * kd_inv);
+    kv_cache[base + head_dim + d] = FloatToFp8E4M3(__bfloat162float(vv[d]) * vd_inv);
+}
+
+SELECT layer_idx, kv_heads, k_amax, v_amax FROM kv_calibration WHERE layer_idx IN
+    (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63) ORDER BY layer_idx;
+
+== ข้อความภาษาไทย ==
+
+โครงการนี้สร้างเอนจินสำหรับรันโมเดลภาษาขนาดใหญ่บนการ์ดจอเอเอ็มดีเพียงใบเดียว โดยใช้เทคนิคการบีบอัด
+น้ำหนักแบบสี่บิตและแปดบิตเพื่อให้พอดีกับหน่วยความจำที่มีจำกัด ตัวโมเดลมีทั้งหมดหกสิบสี่ชั้น แบ่งเป็น
+สี่สิบแปดชั้นที่ใช้กลไกความสนใจเชิงเส้นแบบมีประตูควบคุม และสิบหกชั้นที่ใช้กลไกความสนใจแบบเต็มรูปแบบ
+สลับกันไปตามลำดับ ทุกๆ สี่ชั้นจะมีหนึ่งชั้นที่เป็นความสนใจแบบเต็มรูปแบบ ซึ่งเป็นชั้นเดียวที่ต้องใช้
+แคชคีย์และแวลูแบบแบ่งหน้า จึงต้องมีการปรับเทียบค่าสเกลการลดขนาดทศนิยมแปดบิตให้เหมาะสมกับข้อมูลจริง
+
+การปรับเทียบนี้ใช้ข้อความตัวอย่างที่ผสมทั้งภาษาอังกฤษ โค้ดโปรแกรม และภาษาไทยเข้าด้วยกัน เพื่อให้ค่า
+สูงสุดสัมบูรณ์ที่วัดได้จากแต่ละหัวความสนใจสะท้อนการกระจายตัวของข้อมูลจริงที่เอนจินจะพบเจอในระหว่าง
+การอนุมานผลลัพธ์ หากใช้ข้อความภาษาเดียวเพียงอย่างเดียว ค่าที่ได้อาจต่ำกว่าความเป็นจริงเมื่อพบโทเค็น
+จากภาษาอื่นหรือโค้ดโปรแกรม ทำให้เกิดการตัดค่าที่ปลายสเกลและสูญเสียความแม่นยำของโมเดลระหว่างการใช้งาน
+
+เป้าหมายของโครงการคือให้ได้ความเร็วในการสร้างโทเค็นที่ใช้งานได้จริงบนฮาร์ดแวร์เดียว โดยไม่ต้องพึ่งพา
+การ์ดจอหลายใบหรือเครื่องเซิร์ฟเวอร์ขนาดใหญ่ ทุกการตัดสินใจด้านวิศวกรรมจึงต้องคำนึงถึงแบนด์วิดท์หน่วย
+ความจำเป็นหลัก มากกว่าจำนวนการคำนวณจุดทศนิยมต่อวินาทีเพียงอย่างเดียว ตัวเลขเช่นหนึ่งร้อยยี่สิบโทเค็น
+ต่อวินาทีบนโมเดลขนาดยี่สิบเจ็ดพันล้านพารามิเตอร์จึงเป็นทั้งเป้าหมายและข้อจำกัดที่ต้องออกแบบให้สมดุล
+
+สวัสดีครับ วันนี้อากาศดีมาก ผมกำลังทดสอบระบบแคชหน่วยความจำแบบแปดบิตสำหรับโมเดลภาษาขนาดใหญ่
+ตัวเลขศูนย์ถึงเก้า: ๐ ๑ ๒ ๓ ๔ ๕ ๖ ๗ ๘ ๙ และเลขอารบิก 0123456789 ก็ปรากฏอยู่ในข้อความนี้ด้วยเช่นกัน
+
+== More English + numbers ==
+
+Layer indices calibrated in this pass: 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63
+(sixteen full-attention layers out of sixty-four total). Each layer has four key/value heads and a
+head dimension of 256, so each per-layer descale table has four floating-point entries for K and
+four for V, eight scalars total, replacing the placeholder value 1.0 that docs/container-format.md
+originally shipped with. pi is approximately 3.14159265358979, e is approximately 2.71828182846,
+and the quick brown fox jumps over the lazy dog 1234567890 times while ล้มลุกคลุกคลาน ๙๙๙ ครั้ง.

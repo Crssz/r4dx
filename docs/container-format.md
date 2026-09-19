@@ -58,8 +58,8 @@ text.layers.{i}.attn.v                          bf16  [kv_heads*head_dim, hidden
 text.layers.{i}.attn.o.{layout}                 [hidden, num_heads*head_dim]
 text.layers.{i}.attn.q_norm                     bf16  [head_dim]
 text.layers.{i}.attn.k_norm                     bf16  [head_dim]
-text.layers.{i}.attn.k_descale                  fp32  [kv_heads]           (placeholder 1.0)
-text.layers.{i}.attn.v_descale                  fp32  [kv_heads]           (placeholder 1.0)
+text.layers.{i}.attn.k_descale                  fp32  [kv_heads]           (per-head amax/448.0 when --kv-calib is given; 1.0 placeholder otherwise)
+text.layers.{i}.attn.v_descale                  fp32  [kv_heads]           (per-head amax/448.0 when --kv-calib is given; 1.0 placeholder otherwise)
 text.layers.{i}.gdn.in_proj_qkv.{layout}        [2*key_dim + value_dim, hidden]     (gdn layers only)
 text.layers.{i}.gdn.in_proj_z                   bf16  [value_dim, hidden]
 text.layers.{i}.gdn.in_proj_b                   bf16  [num_v_heads, hidden]
@@ -156,8 +156,13 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
 ## KV descale tables
 
 `text.layers.{i}.attn.k_descale` / `.v_descale`, `fp32[kv_heads]`, one scalar per KV head, feeding
-`R4DArgs.k_descale` / `.v_descale` (`r4d.h:49-50`). Placeholder `1.0` until the converter runs a
-calibration pass; the container format does not change when calibration lands, only the values.
+`R4DArgs.k_descale` / `.v_descale` (`r4d.h:49-50`). `r4dx-convert --kv-calib <json>` fills these from
+a `tools/reference/kv_calibrate.py` calibration run: `descale[head] = amax[head] / 448.0` (OCP e4m3fn
+max), per `r4dx_convert::ResolveKvDescale` (`src/convert/include/r4dx_convert/kv_calib.hpp`). A layer
+missing from the calibration JSON, or omitting `--kv-calib` entirely, falls back to the placeholder
+`1.0`; the container format does not change either way, only the values. The real 64-layer container
+(`D:\models\r4dx\qwen38-27b.r4dx`) was converted with `--kv-calib` covering all 16 full-attention
+layers.
 
 ## `vision.*` and `mtp.*`
 

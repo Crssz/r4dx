@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <iostream>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -11,6 +12,7 @@
 #include "final_lm_head.h"
 #include "gdn_layer.h"
 #include "mlp.h"
+#include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/kernels/kernels.h"
@@ -21,61 +23,46 @@ namespace r4dx::model {
 
 namespace {
 
-// Minimal hipEvent-pair span accumulator for Model::DecodeStepProfiled (tools/profile pass,
-// 2026-09-19). Spans are recorded async (no per-span sync -- that would serialize the pipeline and
-// skew exactly the numbers this is trying to measure); Finish() does ONE hipEventSynchronize at
-// the very end of the step, then reads back every pair's elapsedTime and accumulates it into the
-// named bucket (several calls under the same name, e.g. one per GDN layer, sum into one entry).
-class SpanAccumulator {
- public:
-  void Add(hipStream_t stream, const std::string& name,
-            const std::function<void()>& body) {
-    hipEvent_t start, end;
-    R4DX_HIP_CHECK(hipEventCreate(&start));
-    R4DX_HIP_CHECK(hipEventCreate(&end));
-    R4DX_HIP_CHECK(hipEventRecord(start, stream));
-    body();
-    R4DX_HIP_CHECK(hipEventRecord(end, stream));
-    pending_.push_back({name, start, end});
-  }
+// SpanAccumulator/SpanEntry moved to profile_span.h (Milestone 3 profiling pass, docs/r9700.md
+// R5/Q3/Q7, 2026-09-20) so GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward can record
+// per-kernel spans into the SAME accumulator this file's DecodeStepProfiled/PrefillProfiled own,
+// instead of this file only ever seeing one coarse per-block span. This local helper just converts
+// SpanAccumulator::Finish()'s SpanEntry list into Model::ProfileEntry (identical fields).
+std::vector<Model::ProfileEntry> ToProfileEntries(std::vector<SpanEntry> raw) {
+  std::vector<Model::ProfileEntry> out;
+  out.reserve(raw.size());
+  for (auto& e : raw) out.push_back({std::move(e.name), e.ms, e.count});
+  return out;
+}
 
-  std::vector<Model::ProfileEntry> Finish() {
-    if (!pending_.empty()) {
-      R4DX_HIP_CHECK(hipEventSynchronize(pending_.back().end));
-    }
-    std::vector<Model::ProfileEntry> out;
-    std::unordered_map<std::string, size_t> index;
-    for (auto& p : pending_) {
-      float ms = 0.0f;
-      R4DX_HIP_CHECK(hipEventElapsedTime(&ms, p.start, p.end));
-      static_cast<void>(hipEventDestroy(p.start));
-      static_cast<void>(hipEventDestroy(p.end));
-      auto it = index.find(p.name);
-      if (it == index.end()) {
-        index[p.name] = out.size();
-        out.push_back({p.name, static_cast<double>(ms), 1});
-      } else {
-        out[it->second].ms += ms;
-        out[it->second].count += 1;
-      }
-    }
-    pending_.clear();
-    return out;
-  }
+}  // namespace
 
- private:
-  struct Pending {
-    std::string name;
-    hipEvent_t start, end;
-  };
-  std::vector<Pending> pending_;
+namespace {
+
+// Q13/R14 (docs/r9700.md): "one hipMemGetInfo + per-tensor accounting dump at end of load" --
+// four snapshots bracketing Model::Load's three allocation phases (container weights, then
+// per-layer GDN state + paged KV cache, then everything else: arena/staging/logits/MTP scratch)
+// give a real weights/KV/arena/free breakdown from what the driver actually reports, rather than
+// from summing this codebase's own byte-size arithmetic (which is exactly what Q13 flagged as
+// insufficient to explain w4a8's "identical 15.75 GiB to w4a16 despite 0.35 GiB smaller weights").
+struct VramSnap {
+  size_t free_bytes = 0, total_bytes = 0;
+  bool ok = false;
 };
+VramSnap SnapVram() {
+  VramSnap s;
+  s.ok = (hipMemGetInfo(&s.free_bytes, &s.total_bytes) == hipSuccess);
+  return s;
+}
+double GiB(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0); }
 
 }  // namespace
 
 Model Model::Load(const ModelOptions& opts) {
   Model m;
+  const VramSnap vram0 = SnapVram();  // before any of this Load() call's own allocations
   m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit);
+  const VramSnap vram1 = SnapVram();  // after container weights are fully resident
   const ModelConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = m.container_.NumLoadedLayers();
@@ -96,6 +83,7 @@ Model Model::Load(const ModelOptions& opts) {
   m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
   m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
@@ -104,6 +92,7 @@ Model Model::Load(const ModelOptions& opts) {
   // activation-quant scratch): a few MB at T<=64 (see linear.h/gdn_layer.cpp's own buffer sizes).
   // 96MB gives headroom without materially affecting the ~15-35GB the weights themselves occupy.
   m.arena_.Reserve(96ull * 1024 * 1024);
+  const VramSnap vram2 = SnapVram();  // after activation scratch (buf_a_/b_/logits/arena/etc.)
 
   const auto adims = core::r4d::GetAttnDims();  // head_dim=256, gqa=6, block_size=16
 
@@ -133,7 +122,53 @@ Model Model::Load(const ModelOptions& opts) {
   }
 
   m.stream_.Synchronize();
+
+  // Q13/R14 VRAM breakdown (docs/r9700.md): weights (Container::Load's own footprint) / KV+GDN
+  // state (the per-layer paged-cache/recurrent-state loop above) / arena+activation scratch
+  // (buf_a_/b_/logits_dev_/arena_/MTP scratch) / free, all from what the driver actually reports
+  // at each phase boundary -- not from this codebase's own tensor-shape arithmetic (docs/r9700.md
+  // Q13's own point: that arithmetic could not explain why w4a8's 0.35 GiB-smaller weights still
+  // measured the identical 15.75 GiB as w4a16). Printed unconditionally (one line, stderr) rather
+  // than gated behind a flag -- cheap, and exactly the diagnostic R14 asks every load to carry.
+  const VramSnap vram3 = SnapVram();  // after KV/GDN state + MTP scratch: the final steady state
+  if (vram0.ok && vram1.ok && vram2.ok && vram3.ok) {
+    const int64_t weights_b = static_cast<int64_t>(vram0.free_bytes) - static_cast<int64_t>(vram1.free_bytes);
+    const int64_t arena_b = static_cast<int64_t>(vram1.free_bytes) - static_cast<int64_t>(vram2.free_bytes);
+    const int64_t kv_b = static_cast<int64_t>(vram2.free_bytes) - static_cast<int64_t>(vram3.free_bytes);
+    std::cerr << "[r4dx::model::Model] VRAM breakdown (layout=" << LayoutName(opts.layout)
+              << "): weights=" << GiB(weights_b) << " GiB, kv+gdn_state=" << GiB(kv_b)
+              << " GiB, arena+scratch=" << GiB(arena_b) << " GiB, free="
+              << GiB(static_cast<int64_t>(vram3.free_bytes)) << " GiB (of "
+              << GiB(static_cast<int64_t>(vram3.total_bytes)) << " GiB total)\n";
+  }
+
   return m;
+}
+
+void Model::Reset() {
+  // GDN's recurrent/conv state is read (not just overwritten) via has_init -- unlike the KV
+  // caches (see model.h's Reset() doc comment), it must be explicitly zeroed, exactly like Load()
+  // does the first time.
+  for (auto& gs : gdn_states_) {
+    if (gs) gs->ZeroAll(stream_);
+  }
+  // Block until the zeroing above has actually landed before returning -- Reset() is meant to be a
+  // synchronous "the model is fresh now" call (Engine measures and logs its own latency around
+  // this, docs/server.md), and the zeroing is tiny (a few MB at most), so this sync costs
+  // microseconds, not the milliseconds a real work item would.
+  stream_.Synchronize();
+
+  pos_ = 0;
+  started_ = false;
+
+  // MTP head state (model.h's own field comments): mtp_seed_hidden_'s bytes are stale but harmless
+  // -- mtp_seed_valid_==false means nothing will read them until the next RunChunk/
+  // DecodeStepMtpGreedy call overwrites it first. mtp_num_accepted_dev_ is the same story via
+  // mtp_num_accepted_valid_. MtpHead's own internal KV cache needs no explicit reset either, for
+  // the identical self-correcting-via-position-overwrite reason kv_caches_ doesn't (see above).
+  mtp_seed_valid_ = false;
+  mtp_num_accepted_valid_ = false;
+  mtp_last_hidden_ = nullptr;
 }
 
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
@@ -166,9 +201,16 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
+  // R3 fusion (docs/r9700.md): null for layer 0 (no previous Mlp to have fused its rmsnorm), then
+  // set to buf_normed_.data() by every layer's own Mlp::Forward call below for i+1 to consume.
+  const uint16_t* normed_in = nullptr;
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
+    const bool has_next_layer = (i + 1 < num_layers);
+    // Every GDN/attention layer in this architecture is immediately followed by its own Mlp, so
+    // the sub-block's fused epilogue always targets THIS layer's post_attention_layernorm.
+    const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
 
     if (cfg.IsGdnLayer(i)) {
       GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
@@ -190,7 +232,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
           (!is_prefill_path && mtp_ && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data()
                                                                   : nullptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
-                    T, p);
+                    T, p, normed_in, mlp_norm_weight, buf_normed_.data());
     } else {
       attention::AttnConfig acfg;
       acfg.hidden = static_cast<int>(hidden);
@@ -205,8 +247,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
       aw.qg = &lw.attn->qg;
-      aw.k_w = lw.attn->k.data();
-      aw.v_w = lw.attn->v.data();
+      aw.k = &lw.attn->k;
+      aw.v = &lw.attn->v;
       aw.o = &lw.attn->o;
       aw.q_norm = lw.attn->q_norm.data();
       aw.k_norm = lw.attn->k_norm.data();
@@ -215,12 +257,19 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
-                    attn_seqused_k_.data(), stream_.get());
+                    attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
+                    buf_normed_.data());
       std::swap(cur, other);
     }
 
     Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
-    mlp.Forward(stream_, arena_, cur, cur, T);
+    // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
+    // rmsnorm epilogue into it above); next_norm_weight is null for the last layer (Mlp falls
+    // back to a plain residual add, and FinalLmHead below applies its own final_norm separately).
+    mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
+                has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                has_next_layer ? buf_normed_.data() : nullptr);
+    normed_in = has_next_layer ? buf_normed_.data() : nullptr;
 
     arena_.Reset();
   }
@@ -360,6 +409,7 @@ int32_t Model::DecodeStepGreedy(int32_t token_id) {
 Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   using Clock = std::chrono::steady_clock;
   const auto wall_t0 = Clock::now();
+  r4dx_kernel_launch_counter_reset();  // docs/r9700.md P2/task item 4: count just this one step
 
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
@@ -381,53 +431,63 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
+  const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
+    const bool has_next_layer = (i + 1 < num_layers);
+    const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
 
+    // Milestone 3 profiling pass (docs/r9700.md R5/Q3): `&acc` is now threaded straight into
+    // GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward instead of this loop wrapping each
+    // call in one coarse "gdn_layers"/"attn_layers"/"mlp" span -- every kernel those methods launch
+    // now records its OWN named span (profile_span.h's "gemm:" prefix convention), aggregated by
+    // name across all num_layers calls into the same accumulator, so GDN's excess is attributable
+    // per kernel (rmsnorm/conv_update/recurrent_update/in_proj_*/out_proj/residual) rather than as
+    // one 88 us/layer lump. gpu_sum_ms is unaffected (same total, finer buckets).
     if (cfg.IsGdnLayer(i)) {
-      acc.Add(s, "gdn_layers (GDN kernels + in/out_proj GEMMs)", [&] {
-        GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
-        GdnLayerParams p;
-        p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
-        p.is_prefill = false;
-        p.has_init = has_init;
-        layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
-                      cur, 1, p);
-      });
+      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+      GdnLayerParams p;
+      p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
+      p.is_prefill = false;
+      p.has_init = has_init;
+      layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
+                    cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
     } else {
-      acc.Add(s, "attn_layers (attention kernels + qg/k/v/o GEMMs)", [&] {
-        attention::AttnConfig acfg;
-        acfg.hidden = static_cast<int>(hidden);
-        acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-        acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-        acfg.head_dim = static_cast<int>(cfg.head_dim);
-        acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-        acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-        acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-        attention::AttentionLayer layer(acfg);
+      attention::AttnConfig acfg;
+      acfg.hidden = static_cast<int>(hidden);
+      acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
+      acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
+      acfg.head_dim = static_cast<int>(cfg.head_dim);
+      acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
+      acfg.rope_theta = static_cast<float>(cfg.rope_theta);
+      acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
+      attention::AttentionLayer layer(acfg);
 
-        attention::AttnWeights aw;
-        aw.input_layernorm = lw.input_layernorm.data();
-        aw.qg = &lw.attn->qg;
-        aw.k_w = lw.attn->k.data();
-        aw.v_w = lw.attn->v.data();
-        aw.o = &lw.attn->o;
-        aw.q_norm = lw.attn->q_norm.data();
-        aw.k_norm = lw.attn->k_norm.data();
-        aw.k_descale = lw.attn->k_descale.data();
-        aw.v_descale = lw.attn->v_descale.data();
+      attention::AttnWeights aw;
+      aw.input_layernorm = lw.input_layernorm.data();
+      aw.qg = &lw.attn->qg;
+      aw.k = &lw.attn->k;
+      aw.v = &lw.attn->v;
+      aw.o = &lw.attn->o;
+      aw.q_norm = lw.attn->q_norm.data();
+      aw.k_norm = lw.attn->k_norm.data();
+      aw.k_descale = lw.attn->k_descale.data();
+      aw.v_descale = lw.attn->v_descale.data();
 
-        layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)], 1,
-                      static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s);
-      });
+      layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)], 1,
+                    static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s,
+                    normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
       std::swap(cur, other);
     }
 
-    acc.Add(s, "mlp (gate_up/down GEMMs + silu)", [&] {
+    {
       Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
-      mlp.Forward(stream_, arena_, cur, cur, 1);
-    });
+      mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
+                  has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                  has_next_layer ? buf_normed_.data() : nullptr, &acc);
+    }
+    normed_in = has_next_layer ? buf_normed_.data() : nullptr;
 
     arena_.Reset();
   }
@@ -450,7 +510,8 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   // see StepProfile's own comment (model.h) for why this must NOT be summed with `gpu_sum_ms`
   // (they measure overlapping time from two different clocks, not sequential costs).
   const auto enqueue_done_t = Clock::now();
-  std::vector<Model::ProfileEntry> entries = acc.Finish();  // blocks until the GPU is idle
+  std::vector<Model::ProfileEntry> entries =
+      ToProfileEntries(acc.Finish());  // blocks until the GPU is idle
   int32_t next = -1;
   argmax_dev_.CopyToHost(&next, 1);  // GPU already idle (Finish() above already waited) -- safe
   const auto finish_t = Clock::now();
@@ -462,9 +523,117 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   sp.host_enqueue_ms = std::chrono::duration<double, std::milli>(enqueue_done_t - wall_t0).count();
   sp.finish_wait_ms = std::chrono::duration<double, std::milli>(finish_t - enqueue_done_t).count();
   sp.wall_ms = std::chrono::duration<double, std::milli>(wall_t1 - wall_t0).count();
+  sp.r4dx_kernel_launches = r4dx_kernel_launch_counter_get();
 
   pos_ += 1;
   started_ = true;
+  return sp;
+}
+
+Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids) {
+  using Clock = std::chrono::steady_clock;
+  const auto wall_t0 = Clock::now();
+  if (token_ids.empty()) throw std::runtime_error("Model::PrefillProfiled: token_ids is empty");
+  r4dx_kernel_launch_counter_reset();
+
+  const ModelConfig& cfg = container_.Config();
+  const int64_t hidden = cfg.hidden_size;
+  const int64_t num_layers = container_.NumLoadedLayers();
+  const hipStream_t s = stream_.get();
+
+  SpanAccumulator acc;
+
+  for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
+    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+    const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
+                                      token_ids.begin() + static_cast<ptrdiff_t>(off + n));
+    const int64_t T = static_cast<int64_t>(chunk.size());
+    const bool has_init = started_;
+
+    acc.Add(s, "embed", [&] {
+      EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, chunk,
+                  embed_staging_, buf_a_);
+    });
+
+    std::vector<int32_t> positions_h(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) {
+      positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
+    }
+    attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
+    const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
+    attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+
+    uint16_t* cur = buf_a_.data();
+    uint16_t* other = buf_b_.data();
+    const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
+
+    for (int64_t i = 0; i < num_layers; ++i) {
+      const LayerWeights& lw = container_.Layer(i);
+      const bool has_next_layer = (i + 1 < num_layers);
+      const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
+
+      if (cfg.IsGdnLayer(i)) {
+        GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+        GdnLayerParams p;
+        p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
+        p.is_prefill = true;
+        p.has_init = has_init;
+        layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
+                      cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
+      } else {
+        attention::AttnConfig acfg;
+        acfg.hidden = static_cast<int>(hidden);
+        acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
+        acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
+        acfg.head_dim = static_cast<int>(cfg.head_dim);
+        acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
+        acfg.rope_theta = static_cast<float>(cfg.rope_theta);
+        acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
+        attention::AttentionLayer layer(acfg);
+
+        attention::AttnWeights aw;
+        aw.input_layernorm = lw.input_layernorm.data();
+        aw.qg = &lw.attn->qg;
+        aw.k = &lw.attn->k;
+        aw.v = &lw.attn->v;
+        aw.o = &lw.attn->o;
+        aw.q_norm = lw.attn->q_norm.data();
+        aw.k_norm = lw.attn->k_norm.data();
+        aw.k_descale = lw.attn->k_descale.data();
+        aw.v_descale = lw.attn->v_descale.data();
+
+        layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
+                      static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
+                      attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
+                      &acc);
+        std::swap(cur, other);
+      }
+
+      {
+        Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
+        mlp.Forward(stream_, arena_, cur, cur, T, normed_in,
+                    has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                    has_next_layer ? buf_normed_.data() : nullptr, &acc);
+      }
+      normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+
+      arena_.Reset();
+    }
+
+    // Diagnostic-only (see model.h's doc comment): no final_norm/lm_head, no MTP KV priming --
+    // still synchronize before the next chunk's positions/seqused_k upload, same hazard RunChunk's
+    // own comment describes (a plain hipMemcpy against a hipStreamNonBlocking stream's still-queued
+    // writers is a race without this).
+    stream_.Synchronize();
+    pos_ += T;
+    started_ = true;
+  }
+
+  StepProfile sp;
+  sp.entries = ToProfileEntries(acc.Finish());
+  for (const auto& e : sp.entries) sp.gpu_sum_ms += e.ms;
+  sp.wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - wall_t0).count();
+  sp.r4dx_kernel_launches = r4dx_kernel_launch_counter_get();
   return sp;
 }
 
@@ -503,9 +672,12 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
+  const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern above
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
+    const bool has_next_layer = (i + 1 < num_layers);
+    const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
 
     if (cfg.IsGdnLayer(i)) {
       GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
@@ -515,7 +687,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       p.has_init = has_init;
       p.num_accepted = num_accepted_ptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
-                    T, p);
+                    T, p, normed_in, mlp_norm_weight, buf_normed_.data());
     } else {
       attention::AttnConfig acfg;
       acfg.hidden = static_cast<int>(hidden);
@@ -530,8 +702,8 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
       aw.qg = &lw.attn->qg;
-      aw.k_w = lw.attn->k.data();
-      aw.v_w = lw.attn->v.data();
+      aw.k = &lw.attn->k;
+      aw.v = &lw.attn->v;
       aw.o = &lw.attn->o;
       aw.q_norm = lw.attn->q_norm.data();
       aw.k_norm = lw.attn->k_norm.data();
@@ -547,12 +719,16 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       // written, before anything could ever read it.
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
-                    attn_seqused_k_.data(), stream_.get());
+                    attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
+                    buf_normed_.data());
       std::swap(cur, other);
     }
 
     Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
-    mlp.Forward(stream_, arena_, cur, cur, T);
+    mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
+                has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                has_next_layer ? buf_normed_.data() : nullptr);
+    normed_in = has_next_layer ? buf_normed_.data() : nullptr;
 
     arena_.Reset();
   }

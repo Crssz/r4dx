@@ -28,10 +28,20 @@
   64, so this must be 4 for the default -Model. Pass -1 (or omit --layers entirely) for a real,
   full-size container.
 
+.PARAMETER Mtp
+  Passed to r4dx-server's --mtp (r4dx::model::ModelOptions::mtp_draft_k). 0 (default) disables MTP
+  entirely. >0 requires -Model to be an MTP-converted container (docs/mtp.md's mtp.* weights) --
+  e.g. D:\models\r4dx\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
+  container with -Mtp 3 (this stage's own required verification runs).
+
 .EXAMPLE
   .\tools\server\smoke.ps1
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b.r4dx -Layout w4a16 -Layers -1
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b.r4dx -Layout w4a16 -Layers -1 -Mtp 3
 #>
 [CmdletBinding()]
 param(
@@ -39,6 +49,7 @@ param(
     [string]$Layout = "w4a16",
     [int]$Port = 8091,
     [int]$Layers = 4,
+    [int]$Mtp = 0,
     [string]$Preset = "win-hip"
 )
 
@@ -63,15 +74,17 @@ function Check {
     }
 }
 
-Write-Output "[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port"
+Write-Output "[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp"
 $env:HIP_VISIBLE_DEVICES = "1"
+$ServerErrLog = "$env:TEMP\r4dx-server-smoke.err.log"
 $ServerArgList = @(
     "--model", $Model, "--layout", $Layout, "--host", "127.0.0.1", "--port", "$Port",
     "--max-ctx", "512", "--max-tokens-default", "16"
 )
 if ($Layers -ge 0) { $ServerArgList += @("--layers", "$Layers") }
+if ($Mtp -gt 0) { $ServerArgList += @("--mtp", "$Mtp") }
 $proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgList -PassThru `
-  -RedirectStandardError "$env:TEMP\r4dx-server-smoke.err.log" `
+  -RedirectStandardError $ServerErrLog `
   -RedirectStandardOutput "$env:TEMP\r4dx-server-smoke.out.log"
 
 try {
@@ -151,6 +164,44 @@ try {
         if ($null -ne $c.choices[0].finish_reason) { $sawFinishReason = $true }
     }
     Check $sawFinishReason "chat completion (streaming): some event carries a non-null finish_reason"
+
+    # ---- Two consecutive DIFFERENT-prompt requests must Reset(), never reload the container ------
+    # docs/server.md's "Reset cost": a prefix mismatch used to pay a full Model::Load() (~18.6s
+    # against the real container, and -- worse -- prints Model::Load()'s own "[r4dx::model::Model]
+    # VRAM breakdown" stderr line, which only Load() ever prints, never Model::Reset()). Two
+    # different-prompt requests in a row (the chat requests above already left a committed prefix
+    # behind) exercise exactly the mismatch path; this checks the server's own stderr log directly
+    # rather than trusting wall-clock timing alone (a loaded/quiet machine could make an 18s reload
+    # look deceptively fast, but it can never fake away a SECOND "VRAM breakdown" line).
+    $vramBreakdownBefore = @(Select-String -Path $ServerErrLog -Pattern "VRAM breakdown" -SimpleMatch -ErrorAction SilentlyContinue).Count
+
+    $promptABody = @{
+        messages = @(@{ role = "user"; content = "What color is the sky?" })
+        max_tokens = 8; temperature = 0; stream = $false
+    } | ConvertTo-Json -Depth 5
+    Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $promptABody -UseBasicParsing | Out-Null
+
+    $promptBBody = @{
+        messages = @(@{ role = "user"; content = "Name a fruit that is not an apple." })
+        max_tokens = 8; temperature = 0; stream = $false
+    } | ConvertTo-Json -Depth 5
+    $respB = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $promptBBody -UseBasicParsing
+    Check ($respB.StatusCode -eq 200) "second (different-prompt) request returns 200"
+
+    Start-Sleep -Milliseconds 500  # let the worker thread's one-line-per-request log land
+    $vramBreakdownAfter = @(Select-String -Path $ServerErrLog -Pattern "VRAM breakdown" -SimpleMatch -ErrorAction SilentlyContinue).Count
+    Check ($vramBreakdownAfter -eq $vramBreakdownBefore) `
+        "two different-prompt requests do not reload the container (VRAM breakdown lines: before=$vramBreakdownBefore after=$vramBreakdownAfter)"
+
+    $resetLines = @(Select-String -Path $ServerErrLog -Pattern "reset=" -SimpleMatch -ErrorAction SilentlyContinue)
+    Check ($resetLines.Count -ge 1) "at least one request log line shows a cheap Model::Reset() (reset=...ms), not a reload"
+
+    if ($Mtp -gt 0) {
+        $mtpLines = @(Select-String -Path $ServerErrLog -Pattern " mtp: " -SimpleMatch -ErrorAction SilentlyContinue)
+        Check ($mtpLines.Count -ge 1) "-Mtp ${Mtp}: at least one request log line shows the MTP path was taken"
+    }
 
     # ---- 400 on an unsupported (image) content part ----------------------------------------------
     $badBody = @{

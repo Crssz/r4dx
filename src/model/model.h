@@ -53,6 +53,28 @@ class Model {
  public:
   static Model Load(const ModelOptions& opts);
 
+  // Re-zeroes every piece of per-sequence state (GDN recurrent/conv state, KV/MTP-KV position
+  // bookkeeping, pos_/started_, MTP head state) WITHOUT touching any weight -- the cheap
+  // alternative to Model::Load() a caller (src/server's Engine) should use whenever a new
+  // request's prompt does not extend the currently-fed token prefix, instead of paying a full
+  // container reload (measured ~18.6s against the real 64-layer w4a16 container, docs/server.md's
+  // "Reset cost") just to get back to "nothing committed yet".
+  //
+  // What this does NOT need to touch, and why: the paged KV caches (kv_caches_, and MtpHead's own
+  // internal cache) have no separate "current length" bookkeeping of their own -- slot(t)==t
+  // (contiguous, single-sequence, see paged_kv_cache.hpp's file comment) and every write always
+  // happens at the CALLER-tracked position (pos_) BEFORE anything can read it, so a stale byte at
+  // position >= the new pos_==0 is unreachable: the same "self-correcting via position overwrite"
+  // property mtp_head.h's file comment already relies on for rejected speculative candidates.
+  // Resetting pos_/started_ to their post-construction values is therefore sufficient "KV
+  // bookkeeping" reset on its own. GDN state is different -- has_init reads the PREVIOUS token's
+  // recurrent/conv state rather than always overwriting position-indexed slots, so it genuinely
+  // needs to be re-zeroed (GdnStateManager::ZeroAll, matching Load()'s own initial zeroing).
+  // GdnControlCache/arena_/buf_a_/buf_b_/buf_normed_/embed_staging_/logits_dev_/argmax_dev_/
+  // attn_positions_/attn_seqused_k_ are all pure per-call scratch with no state that outlives one
+  // RunChunk/VerifyWindow call, so none of them need touching either.
+  void Reset();
+
   Model(Model&&) = default;
   Model& operator=(Model&&) = default;
   Model(const Model&) = delete;
@@ -119,6 +141,10 @@ class Model {
                                          // per token" cost, see NOTE above
     double wall_ms = 0.0;               // host wall-clock for the whole DecodeStepProfiled call
                                          // (~= host_enqueue_ms + finish_wait_ms)
+    int64_t r4dx_kernel_launches = 0;   // r4dx::kernels::r4dx_kernel_launch_counter_get() delta for
+                                         // just this one step (docs/r9700.md P2/task item 4) --
+                                         // r4dx-owned launches only, NOT third_party/libr4d's own
+                                         // r4d_gemm_*/r4d_gdn_*/r4d_attn_* launches; see kernels.h.
   };
 
   // Runs exactly one decode step (T=1) like DecodeStep, but wraps each kernel-family call in a
@@ -128,6 +154,24 @@ class Model {
   // per op adds real host-side overhead of its own, so this is diagnostic-only, invoked at most
   // once per r4dx-cli process via --profile (src/cli/main.cpp).
   StepProfile DecodeStepProfiled(int32_t token_id);
+
+  // Milestone 3 profiling pass (docs/r9700.md R5/Q7): prefill's analogue of DecodeStepProfiled --
+  // chunks `token_ids` through the same <=max_chunk_-row prefill path Prefill() uses (is_prefill
+  // GDN kernels, AttnPrefillFp8Kv once T exceeds the decode band), with `&acc` threaded into every
+  // GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward call so every kernel family's GPU time
+  // is summed by name ACROSS every chunk and every layer (e.g. "gemm:mlp.gate_up" accumulates one
+  // hipEvent pair per layer per chunk into one bucket) -- divide entries[*].ms by the number of
+  // chunks (callers know that: ceil(token_ids.size() / max_chunk) -- max_chunk is always 64 today,
+  // see docs/architecture.md) for a "per T=64 chunk" figure, matching docs/r9700.md Q7's ask.
+  // Diagnostic-only like DecodeStepProfiled: discards every chunk's logits (never computes
+  // final_norm/lm_head at all, matching Prefill()'s own non-final-chunk skip -- see RunChunk's
+  // want_logits comment) and skips MTP KV priming (out of this profiling pass's scope). Commits
+  // real pos_/GDN/KV state exactly like Prefill() -- not meant to be combined with a real
+  // generation afterward in the same process, same caveat as DecodeStepProfiled's own doc comment.
+  // host_enqueue_ms/finish_wait_ms are not meaningfully split here (each chunk's positions/seqused_k
+  // upload forces a stream_.Synchronize() before the next chunk, same hazard RunChunk's own comment
+  // describes) -- both are left at 0; use wall_ms and gpu_sum_ms.
+  StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids);
 
   // True iff this Model was Load()'d with mtp_draft_k > 0 (and the container had mtp.* weights).
   bool MtpEnabled() const { return static_cast<bool>(mtp_); }
@@ -183,6 +227,13 @@ class Model {
   core::Arena arena_;
   core::PinnedBuffer<uint16_t> embed_staging_;
   core::DeviceBuffer<uint16_t> buf_a_, buf_b_;  // ping-pong [max_chunk_, hidden] bf16 activations
+  // R3 fusion (docs/r9700.md P2/R3): persistent (NOT arena-allocated -- arena_.Reset() runs once
+  // per layer iteration, but this buffer's write (one layer's Gdn/Attn or Mlp epilogue) and read
+  // (the very next Forward call, same stream_, later in the same iteration or the next iteration)
+  // must survive across that Reset(); it is a plain [max_chunk_, hidden] scratch buffer reused
+  // (overwritten) at every fusion boundary in stream order, never read after being superseded, so
+  // one buffer suffices -- see RunChunk/DecodeStepGreedy/DecodeStepMtpGreedy's per-layer loops.
+  core::DeviceBuffer<uint16_t> buf_normed_;
   core::DeviceBuffer<float> logits_dev_;        // [vocab] fp32, one row at a time
   core::DeviceBuffer<int32_t> argmax_dev_;      // [1] -- DecodeStepGreedy's on-device argmax result
 

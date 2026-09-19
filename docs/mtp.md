@@ -248,14 +248,22 @@ the byte-identical-vs-`--mtp 0` finding). Container load ~9-22s depending on lay
   decode kernel path -- a longer generation or different prompt could still diverge from `--mtp 0`'s
   own output on some future run. Not believed to be a logic bug (verified correct via
   `CheckVerifyMatchesSequential`); flagged for awareness, not as an open defect.
-- **`--chat` multi-turn + MTP interaction not exercised**: if an MTP round stops mid-round (hits
-  `--max-tokens` or EOS partway through a round's own returned token vector), `Model`'s internal
-  `pos_`/GDN/MTP-KV state already reflects EVERY token that round committed, but `src/cli/main.cpp`'s
-  `fed_tokens` bookkeeping (used to compute what to re-prefill next turn) only counts the tokens
-  actually pushed into `result.generated_tokens` -- these can under-count relative to the real
-  committed state in that specific edge case, which could desync a LATER `--chat` turn's prefix
-  match. Not observed in this pass's (single-turn, `--prompt`) testing; consistent with
-  `docs/status.md`'s pre-existing "`--chat` multi-turn only lightly exercised" note.
+- **FIXED (server-catches-up-with-engine stage)**: ~~`--chat` multi-turn + MTP interaction not
+  exercised~~ -- an MTP round that stops mid-round (hits `--max-tokens` or EOS partway through a
+  round's own returned token vector) commits EVERY element of that round except its own last one
+  atomically (the last element is always the "corrected/bonus" token, analogous to `Prefill`'s own
+  returned-but-not-yet-fed `next` -- see `Model::DecodeStepMtpGreedy`'s doc comment), regardless of
+  where the caller's own per-token display loop decides to stop. `src/cli/main.cpp`'s `fed_tokens`
+  and `src/server/engine.cpp`'s `PrefixState` (`src/server/prefix_state.h`) now both track this via
+  a `committed_tokens` set built from the round's own atomicity guarantee (every element but the
+  round's last is pushed to `committed_tokens` unconditionally, before the emit/stop-check that
+  decides `generated_tokens`/display), not from `generated_tokens` alone -- see
+  `TurnResult::committed_tokens`'s comment (CLI) / `prefix_state.h`'s file comment (server) for the
+  full derivation. `--chat` multi-turn + MTP together is still only lightly exercised end to end
+  (no automated multi-turn-with-a-forced-mid-round-stop regression test exists for either binary --
+  constructing one needs a `--max-tokens`/container combination that reliably lands a stop exactly
+  mid-round, which is fiddly to force deterministically); flagged as a residual gap distinct from
+  the bookkeeping bug itself, which IS fixed and reasoned through above.
 - **Only greedy acceptance is implemented** (task's own stated scope: "typical/temperature
   acceptance later"). `Model::DecodeStepMtpGreedy`/`VerifyWindow` are greedy-only; a caller wanting
   temperature/top-k/top-p sampling with MTP would need a probabilistic acceptance rule (e.g.

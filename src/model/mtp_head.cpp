@@ -104,8 +104,8 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
     attention::AttnWeights aw;
     aw.input_layernorm = w.layer.input_layernorm.data();
     aw.qg = &w.layer.attn->qg;
-    aw.k_w = w.layer.attn->k.data();
-    aw.v_w = w.layer.attn->v.data();
+    aw.k = &w.layer.attn->k;
+    aw.v = &w.layer.attn->v;
     aw.o = &w.layer.attn->o;
     aw.q_norm = w.layer.attn->q_norm.data();
     aw.k_norm = w.layer.attn->k_norm.data();
@@ -198,8 +198,8 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
   attention::AttnWeights aw;
   aw.input_layernorm = w.layer.input_layernorm.data();
   aw.qg = &w.layer.attn->qg;
-  aw.k_w = w.layer.attn->k.data();
-  aw.v_w = w.layer.attn->v.data();
+  aw.k = &w.layer.attn->k;
+  aw.v = &w.layer.attn->v;
   aw.o = &w.layer.attn->o;
   aw.q_norm = w.layer.attn->q_norm.data();
   aw.k_norm = w.layer.attn->k_norm.data();

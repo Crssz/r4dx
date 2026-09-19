@@ -1,5 +1,69 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+> **Update (2026-09-20, R2+R3+P2+P6 pass, docs/r9700.md -- partial)**: R3 (fuse
+> `r4dx_residual_rmsnorm_bf16` into both layer boundaries) is done: **386 -> 259 r4dx-owned kernel
+> launches/token** (w4a16, measured via `r4dx-cli --profile`). Wall-clock effect measured flat
+> (w4a16 `--mtp 0`: 37.39/37.38 tok/s twice-run, vs R1's own 37.77 tok/s baseline -- within noise;
+> `--mtp 3`: 65.02 tok/s, 46.3% acceptance) because decode is GPU-bound and R3 only cuts *host*
+> launch-issue time, which was already overlapped with GPU work. **R2 (byte-exact fused int8/fp8/f16
+> quant epilogues) and P6 (16-byte vector loads + all-64-CU grids) -- the items that would actually
+> move GPU-side time -- were NOT implemented this pass**: they need a byte-diff-verified low-level
+> HIP/ISA kernel-writing effort this pass's budget didn't cover; shipping them unverified risks
+> silently corrupting quantized-GEMM inputs. **Default layout stays `w4a16`** -- the task's
+> measure-and-decide step (item 6) was deliberately not run to completion against R2/P6-incomplete
+> code, since that would answer a different question than "is w4a8 fastest after the launch/
+> occupancy fixes land." Full writeup, exact numbers, and a follow-up plan: docs/status.md's
+> "R2+R3+P2+P6" section.
+
+> **Update (2026-09-20, R1 pass -- quantize `gdn.in_proj_z` + `attn.k`/`attn.v`, docs/r9700.md)**:
+> `gdn.in_proj_z`, `attn.k`, `attn.v` (20.6% of every token, previously bf16-only regardless of
+> `--layout`) now join the quantized-linear family. Reconverted the real 64-layer checkpoint to
+> `D:\models\r4dx\qwen38-27b-v3.r4dx` (w4a8/w4a16/mxfp4 body + 4-bit `lm_head` only, `--no-bf16`,
+> `--mtp on --vision on`, same `qwen38-27b.kvcalib.json` calibration) -- **45.02 GiB on disk vs the
+> old container's 87.79 GiB (-48.7%)**, converted in 150.2s. Full `ctest --preset win-hip` 30/30
+> passing (HIP device 1). Measured against this file, same prompt/flags as every table below, each
+> combination run twice (the two runs agreed within 0.1%, well under the 3% threshold for reporting
+> both -- only one run's numbers are shown):
+>
+> | Layout | mtp=0 decode | mtp=3 decode | mtp=3 acceptance | prefill | VRAM (mtp=0 / mtp=3) |
+> |---|---|---|---|---|---|
+> | w4a16 | **37.77 tok/s** | 67.82 tok/s | 50.0% (24 rounds, 72 drafted, 36 accepted) | 599-709 tok/s | 13.80 / 14.23 GiB |
+> | w4a8  | **34.97 tok/s** | 56.89 tok/s | 39.5% (43 rounds, 129 drafted, 51 accepted) | 677-716 tok/s | 13.80 / 14.23 GiB |
+> | mxfp4 | **29.72 tok/s** | 53.09 tok/s | 45.7% (35 rounds, 105 drafted, 48 accepted) | 635-641 tok/s | 13.80 / 14.23 GiB |
+>
+> **`--mtp 0` decode vs the pre-R1 container** (docs/r9700.md predicted "+4 to +5 tok/s realistic"
+> from a 36.6 -> 43.0 tok/s ceiling move):
+>
+> | Layout | Pre-R1 (`qwen38-27b.r4dx`, Milestone-2 pass) | Post-R1 (`qwen38-27b-v3.r4dx`) | delta |
+> |---|---|---|---|
+> | w4a16 | 32.83 tok/s | 37.77 tok/s | **+4.94 tok/s (+15.1%)** |
+> | w4a8  | 30.95 tok/s | 34.97 tok/s | **+4.02 tok/s (+13.0%)** |
+> | mxfp4 | 27.08 tok/s | 29.72 tok/s | **+2.64 tok/s (+9.7%)** |
+>
+> All three land within or above the predicted "+4 to +5 tok/s" band except mxfp4, which gained
+> less -- consistent with docs/r9700.md §2.4's finding that mxfp4's small-M GEMM knee is worse than
+> w4a16/w4a8's (its M* sits at ~8-12 rows on some shapes vs >=16), so it likely realizes less of the
+> new headroom per added GEMM launch than the other two layouts do; not investigated further this
+> pass. `--mtp 3` also improved on all three layouts (+2.1% to +19.2%), though acceptance rate moved
+> in both directions (w4a16 54.3%->50.0%, w4a8 32.5%->39.5%, mxfp4 41.9%->45.7%) -- expected
+> run-to-run/weight-identical-but-different-container noise in the draft head's own predictions
+> feeding off the (now differently-rounded) backbone hidden states, not a regression: every
+> combination still beat its pre-R1 decode number. VRAM dropped from the pre-R1 15.75 GiB (all three
+> quantized layouts, per that pass's own reported figure) to **13.80 GiB at `--mtp 0`** (-1.95 GiB) /
+> **14.23 GiB at `--mtp 3`** -- the new `Container::Load`/`Model::Load` VRAM breakdown line
+> (docs/r9700.md R14/Q13) shows this as `weights=13.14 GiB, kv+gdn_state=0.34-0.83 GiB,
+> arena+scratch=0.09-0.16 GiB` for every quantized layout (identical `weights` figure across w4a16/
+> w4a8/mxfp4 at `--mtp 0`, mirroring the pre-R1 container's own "why is w4a8 not 0.35 GiB smaller"
+> puzzle -- Q13 is only partially closed by this breakdown; see docs/r9700.md's open items). The R14
+> over-commit warning was verified against the OLD container's `--layout bf16` (47.73 GiB logical
+> footprint on a 31.86 GiB card): `hipMemGetInfo` does not report negative free -- it clamps at ~0 --
+> so the warning's first implementation (consumed-bytes-exceeds-free-before) never fired for the
+> exact case it exists to catch; fixed by adding a second "this load drove free VRAM under 1 GiB
+> starting from meaningfully more" signal, confirmed firing correctly (`WARNING: layout 'bf16' left
+> only 0 GiB free (was 31.6994 GiB free before this load)`) with no false positive on any quantized
+> layout. See docs/r9700.md's "R1" row and docs/status.md's own R1 section for the converter/loader/
+> accuracy writeup this table's numbers come from.
+
 > **Update (2026-09-20, Milestone 2 integration pass)**: reran the full pipeline from a clean
 > `build.ps1 -Clean` rebuild (HIP device 1, 107/107 build steps) -- full `ctest --preset win-hip`
 > 30/30 passing in 93.50s, `tools/server/smoke.ps1` all 20 checks passing against the 4-layer test

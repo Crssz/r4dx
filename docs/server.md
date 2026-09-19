@@ -96,26 +96,85 @@ OpenAI chat client does (resend the whole growing `messages` array each turn), s
 conversation against this server reuses the KV cache the same way `--chat` does -- there is no
 separate "session id" concept.
 
-**Reset cost**: a mismatched-prefix reset calls `model_.reset()` before constructing the
-replacement `Model` (review finding, 2026-09-19 -- an earlier version assigned the new `Model`
-directly, which briefly held two complete containers' worth of VRAM at once: the new `Load()` fully
-constructs every weight `DeviceBuffer` before the assignment destroys the old `unique_ptr`, ~2x
-peak VRAM for the duration of the reload). This still pays a full container reload's latency on
-every non-extending request (measured ~18.6s against the real 64-layer w4a16 container) -- it
-fires on the first request of every new conversation once any request has been served. A cheaper
-fix (a `Model::Reset()` that re-zeroes state without re-reading weights from disk) is future work;
-`model_.reset()` only fixes the VRAM half.
-An exception mid-request (`Model::Prefill`/`DecodeStep` throwing partway through) also clears
-`fed_tokens_` in the `catch` block, forcing the next request down this same full-reset path rather
-than risking a stale prefix match against a model whose real state has silently diverged.
+**Reset cost (server-catches-up-with-engine stage)**: a mismatched-prefix reset now calls
+`model_->Reset()` (`r4dx::model::Model::Reset()`, `src/model/model.h`/`.cpp`) instead of a full
+`Model::Load()`. `Reset()` re-zeroes every piece of per-sequence state (GDN recurrent/conv state
+via `GdnStateManager::ZeroAll`, `pos_`/`started_`, MTP head bookkeeping) WITHOUT touching any
+weight `DeviceBuffer` or re-reading the container from disk -- see `model.h`'s `Reset()` doc
+comment for why the KV caches (backbone and MTP's own) need no explicit clearing (contiguous
+slot==position addressing, self-correcting via overwrite-before-read, same property
+`docs/mtp.md`'s rejected-candidate handling already relies on). Measured (this stage, real 64-layer
+w4a16 container, `HIP_VISIBLE_DEVICES=1`): **Reset() cost is sub-millisecond to a few
+milliseconds**, vs. the ~18.6s full-reload `model_.reset()`/fresh-`Load()` path this replaces --
+see the per-request log line's new `reset=X.XXms` field (`src/server/engine.cpp`) for the number
+from a live run. This also removes the earlier 2x-peak-VRAM-during-reload hazard entirely (no new
+`Model`/`Container` is ever constructed after startup, so there is nothing for the old
+`model_.reset()`-before-`Load()` ordering fix to protect against).
 
-### `Model` adapter note (for the Integrate stage)
+The prefix-reuse bookkeeping itself moved into its own header, `src/server/prefix_state.h`'s
+`PrefixState` (pure `std::vector<int32_t>` arithmetic, no HIP/`r4dx::model` dependency -- unit-
+tested in `tests/server/test_prefix_state.cpp`, since `Engine` itself cannot be CPU-tested). Its
+`Commit()` tracks **committed** tokens, not merely **displayed** ones -- see the MTP section below
+and `prefix_state.h`'s own file comment for the mid-round-stop edge case this distinction exists to
+handle. An exception mid-request (`Model::Prefill`/`DecodeStep*`/`Reset` throwing partway through)
+calls `prefix_.Invalidate()` in the `catch` block, forcing the next request down the full-reset
+path rather than risking a stale prefix match against a model whose real state has silently
+diverged (unchanged in spirit from the earlier `fed_tokens_.clear()`, just renamed).
 
-Per this task's own instructions, `src/server` does not modify `src/model`. "Reset" (the mismatched
--prefix fallback above) is implemented as a full `Model::Load(opts_.model_opts)` call, exactly like
-`src/cli/main.cpp`'s own fallback -- no new `Model` method was needed. No other adapter was
-required: `Model::Prefill`/`DecodeStep`/`Config()`/`GetContainer()` (for `ModelId()`) were
-sufficient as-is.
+### `Model` adapter note
+
+The previous stage's note ("`src/server` does not modify `src/model`") no longer applies: this
+stage's task item 1 explicitly asked for a real `Model::Reset()` method (the "cheap reset" above),
+so `src/model/model.h`/`.cpp` gained one. `Model::Prefill`/`DecodeStep`/`DecodeStepMtpGreedy`/
+`MtpEnabled`/`Config()`/`GetContainer()` needed no further changes for the server to drive MTP --
+see "MTP" below.
+
+## MTP (server-catches-up-with-engine stage)
+
+`--mtp N` (`server_args.h`, default 0, same semantics as `src/cli/cli_args.h`'s own `--mtp`) sets
+`ModelOptions::mtp_draft_k` for the one `Model` this server process loads at startup -- `N>0`
+requires `--model` to point at an MTP-converted container (`Container::HasMtp()`, `docs/mtp.md`),
+exactly like `r4dx-cli`.
+
+Per-request routing (`Engine::RunRequest`, `engine.cpp`): a request takes the MTP path
+(`Model::DecodeStepMtpGreedy`) iff `model_->MtpEnabled()` (the server was started with `--mtp N>0`
+against an MTP container) AND that specific request's own `sampling.temperature <= 0` (greedy) --
+every other request (non-greedy, or MTP disabled server-wide) takes the pre-existing plain-decode
+loop (`Model::DecodeStep`/`r4dx::kernels::Sample`), unchanged. This mirrors `r4dx-cli`'s own
+`greedy && args.mtp > 0` gate exactly, just evaluated per-request instead of once at process
+start-up -- MTP has no notion of probabilistic (non-greedy) acceptance yet (`docs/mtp.md`'s "Only
+greedy acceptance is implemented"), so a non-greedy request simply never sees it.
+
+**Streaming**: every token an MTP round actually confirms is pushed to the client as soon as it is
+committed -- the round's own per-candidate loop calls the same stop-string-aware
+`Engine::EmitToken` helper the plain-decode loop uses, once per accepted token, in order, exactly
+like the plain path (task's own "streaming must emit every accepted token of a round as it is
+committed"). Cancellation (`StreamingSink::Cancel()`/`IsCancelled()`) is checked once per ROUND
+(between `DecodeStepMtpGreedy` calls), not per token within a round -- a round is one atomic GPU
+call, so there is no earlier point at which the loop could observe cancellation mid-round.
+
+**Mid-round `fed`/`committed` bookkeeping fix** (`docs/mtp.md`'s "mid-round" gap, closed by this
+stage in both binaries): `Model::DecodeStepMtpGreedy` commits every element of its returned round
+except the LAST one atomically, regardless of where a caller's own display loop decides to stop
+(`--max-tokens` reached, or an EOS candidate that isn't the round's own last element). Both
+`src/cli/main.cpp`'s `TurnResult::committed_tokens` and `PrefixState::Commit()`'s
+`committed_tokens` argument now track this correctly -- see either file's own comment for the full
+derivation, and `tests/server/test_prefix_state.cpp`'s
+`TestCommitTracksCommittedNotDisplayedTokens` for a CPU-testable regression check of the
+bookkeeping contract (not the real MTP round mechanics themselves, which `tests/model/test_mtp.cpp`
+already covers against a real container).
+
+`--mtp-head-layout` was named in this stage's task description but does not correspond to any
+existing concept in this codebase: `Container`/`MtpWeights`/`MtpHead` (`src/model/container.h`,
+`src/model/mtp_head.h`) have no independent "head layout" knob separate from the body `--layout`
+argument -- `mtp.layer`'s own quantized linears (qg/o, and now k/v per R1) are loaded at whatever
+layout `Container::Load`'s single `layout` parameter says, exactly like every other layer; only
+`mtp.fc`/`mtp.norm`/`mtp.pre_fc_norm_*` are hardcoded bf16-only (`container.h`'s `MtpWeights`
+comment), with no alternative. Implementing an independently-selectable MTP head precision would be
+a `src/model`/`src/convert` container-format feature (a new per-tensor-group layout knob plus a
+converter change to actually emit it), not something `src/server` can plumb through to an API that
+does not exist -- **not implemented**, flagged here rather than adding a flag that would silently
+do nothing.
 
 ## CLI flags
 
@@ -124,8 +183,10 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N]
     [--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N]
     [--default-temperature F] [--default-top-p F] [--default-top-k N]
-    [--default-min-p F] [--log-level {debug|info|warn|error}]
+    [--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]
 ```
+
+`--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
 
 `--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B`, same as `r4dx-cli`. `--think` sets the
 server-wide default for the chat template's `enable_thinking` when a request's
@@ -142,16 +203,22 @@ quiet it down).
 `tests/server/**` (CPU-only, no HIP device, registered in `ctest`): `test_server_args` (CLI
 parsing), `test_openai_types` (request validation + response JSON shapes), `test_sse` (SSE chunk
 formatting), `test_response_sink` (`BufferingSink`/`StreamingSink`), `test_request_queue`
-(`BoundedQueue` capacity/FIFO/close/threaded producer-consumer). All pass as part of the normal
-`.\tests\run_tests.ps1` run (29/29 total as of this stage, the 24 pre-existing plus these 5).
+(`BoundedQueue` capacity/FIFO/close/threaded producer-consumer), `test_prefix_state`
+(`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping, see "MTP" above). All
+pass as part of the normal `.\tests\run_tests.ps1` run.
 
 `tools/server/smoke.ps1` is the GPU integration test: starts `r4dx-server` on HIP device 1 against
 the 4-layer test container (`--layout w4a16 --layers 4`, since that container's config.json still
 declares 64 layers -- see `--layers` above), hits `/v1/models`, a non-streaming and a streaming
-`/v1/chat/completions`, and a rejected-image-part request, checking JSON/SSE shapes and status
-codes (the 4-layer model's text is nonsense, so only shapes/counts are checked, never the text
-itself). Run it with `.\tools\server\smoke.ps1`; pass `-Model`/`-Layout`/`-Layers -1` to point it at
-a real container instead.
+`/v1/chat/completions`, two consecutive different-prompt requests (checking the server's own stderr
+log to confirm no container reload happened -- see "Reset cost" above), and a rejected-image-part
+request, checking JSON/SSE shapes and status codes (the 4-layer model's text is nonsense, so only
+shapes/counts are checked, never the text itself). Run it with `.\tools\server\smoke.ps1`; pass
+`-Model`/`-Layout`/`-Layers -1` to point it at a real container instead, and `-Mtp N` to exercise
+the MTP path against an MTP-converted container (`.\tools\server\smoke.ps1 -Model
+D:\models\r4dx\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3`, or `-Model
+D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -Mtp 3` against the real container) -- with `-Mtp N>0` an
+extra check confirms at least one request's log line shows the MTP path was taken.
 
 ### Real-answer smoke run (once, against the full 64-layer container)
 

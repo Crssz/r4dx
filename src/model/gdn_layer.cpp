@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "linear.h"
+#include "profile_span.h"
 #include "r4d.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
@@ -26,7 +27,9 @@ constexpr int kGdnActSilu = 0;  // r4d_gdn_gated_rmsnorm_h128_bf16 / recurrent_u
 
 void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager& states,
                         GdnControlCache& control, const uint16_t* x, uint16_t* x_out, int64_t T,
-                        const GdnLayerParams& p) {
+                        const GdnLayerParams& p, const uint16_t* x_normed_in,
+                        const uint16_t* next_norm_weight, uint16_t* x_normed_out,
+                        SpanAccumulator* prof) {
   const int64_t hidden = cfg_.hidden_size;
   const int Hg = static_cast<int>(cfg_.linear_num_key_heads);     // 16
   const int H = static_cast<int>(cfg_.linear_num_value_heads);    // 48
@@ -40,25 +43,44 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   const float eps = static_cast<float>(cfg_.rms_norm_eps);
 
   // ---- input rmsnorm --------------------------------------------------------------------------
-  uint16_t* x_normed = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
-  r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(input_layernorm_.data()),
-                     reinterpret_cast<int64_t>(x_normed), T, hidden, eps, reinterpret_cast<int64_t>(s));
+  // R3 (docs/r9700.md): skip this launch when the previous layer's Mlp already fused it.
+  const uint16_t* x_normed = x_normed_in;
+  uint16_t* x_normed_scratch = nullptr;
+  if (x_normed == nullptr) {
+    x_normed_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
+    ProfiledCall(prof, s, "gdn.rmsnorm", [&] {
+      r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(x),
+                         reinterpret_cast<int64_t>(input_layernorm_.data()),
+                         reinterpret_cast<int64_t>(x_normed_scratch), T, hidden, eps,
+                         reinterpret_cast<int64_t>(s));
+    });
+    x_normed = x_normed_scratch;
+  }
 
   // ---- in_proj_qkv / in_proj_z / in_proj_b / in_proj_a -----------------------------------------
   uint16_t* mixed_qkv = arena.Alloc<uint16_t>(static_cast<size_t>(T * conv_dim));
-  ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T);
+  ProfiledCall(prof, s, "gemm:gdn.in_proj_qkv", [&] {
+    ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T);
+  });
   uint16_t* a_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
-  // in_proj_a/in_proj_b/in_proj_z are plain bf16 linears (never quantized -- container-format.md
-  // lists only attn.qg|o / gdn.in_proj_qkv|out_proj / mlp.gate_up|down as multi-layout), so they
-  // go straight through the bf16 GEMM rather than through ApplyLinear's QuantLinear dispatch.
-  core::r4d::GemmBf16NtM64(x_normed, w_.in_proj_a.data(), a_buf, static_cast<int>(T),
-                            static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+  // in_proj_a/in_proj_b are plain bf16 linears (never quantized -- docs/r9700.md R1: "too small to
+  // matter, feed the decay path -- leave them bf16"), so they go straight through the bf16 GEMM
+  // rather than through ApplyLinear's QuantLinear dispatch.
+  ProfiledCall(prof, s, "gemm:gdn.in_proj_a", [&] {
+    core::r4d::GemmBf16NtM64(x_normed, w_.in_proj_a.data(), a_buf, static_cast<int>(T),
+                              static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+  });
   uint16_t* b_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
-  core::r4d::GemmBf16NtM64(x_normed, w_.in_proj_b.data(), b_buf, static_cast<int>(T),
-                            static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+  ProfiledCall(prof, s, "gemm:gdn.in_proj_b", [&] {
+    core::r4d::GemmBf16NtM64(x_normed, w_.in_proj_b.data(), b_buf, static_cast<int>(T),
+                              static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+  });
+  // in_proj_z (R1, docs/r9700.md): now dispatched through ApplyLinear like in_proj_qkv/out_proj --
+  // 3.02 GB/token of what used to be a forced-bf16 GEMM, now eligible for mxfp4/w4a16/w4a8.
   uint16_t* z_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * value_dim));
-  core::r4d::GemmBf16NtM64(x_normed, w_.in_proj_z.data(), z_buf, static_cast<int>(T),
-                            static_cast<int>(hidden), static_cast<int>(value_dim), 4, 4, 1, s);
+  ProfiledCall(prof, s, "gemm:gdn.in_proj_z", [&] {
+    ApplyLinear(stream, arena, w_.in_proj_z, x_normed, z_buf, T);
+  });
 
   // ---- control arrays ---------------------------------------------------------------------------
   // See GdnControlCache (gdn_state.h): these are pure functions of (T, p.slot), so every distinct
@@ -77,33 +99,41 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     float* beta_buf = arena.Alloc<float>(static_cast<size_t>(T * H));
     const uint8_t* has_init_dev = p.has_init ? control.HasInitTrue() : nullptr;
 
-    core::r4d::GdnConvPrep(mixed_qkv, conv_dim, w_.conv1d_weight.data(), /*bias=*/nullptr,
-                            states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
-                            states.ConvTokStride(), cache_idx_dev, /*ci_stride=*/1, has_init_dev,
-                            a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
-                            w_.dt_bias.data(), q_buf, k_buf, v_buf, g_buf, beta_buf, cu_dev,
-                            /*N=*/1, static_cast<int>(T), H, Hg, K, V, static_cast<int>(width),
-                            kSoftplusThr, s);
+    ProfiledCall(prof, s, "gdn.conv_prep", [&] {
+      core::r4d::GdnConvPrep(mixed_qkv, conv_dim, w_.conv1d_weight.data(), /*bias=*/nullptr,
+                              states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
+                              states.ConvTokStride(), cache_idx_dev, /*ci_stride=*/1, has_init_dev,
+                              a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
+                              w_.dt_bias.data(), q_buf, k_buf, v_buf, g_buf, beta_buf, cu_dev,
+                              /*N=*/1, static_cast<int>(T), H, Hg, K, V, static_cast<int>(width),
+                              kSoftplusThr, s);
+    });
 
     constexpr int64_t kChunk = 64;  // r4d_gdn_dims().chunk
     uint16_t* A_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H * kChunk));
-    core::r4d::GdnKktSolve(k_buf, beta_buf, g_buf, A_buf, cu_dev, /*N=*/1, static_cast<int>(T), H,
-                            Hg, K, static_cast<int>(kChunk), s);
+    ProfiledCall(prof, s, "gdn.kkt_solve", [&] {
+      core::r4d::GdnKktSolve(k_buf, beta_buf, g_buf, A_buf, cu_dev, /*N=*/1, static_cast<int>(T), H,
+                              Hg, K, static_cast<int>(kChunk), s);
+    });
 
     float* h0 = states.RecurrentSlotPtr(p.slot);
     float* ht_scratch = arena.Alloc<float>(static_cast<size_t>(H * V * K));
     uint16_t* o_core = arena.Alloc<uint16_t>(static_cast<size_t>(T * H * V));
-    core::r4d::GdnChunkScan(q_buf, k_buf, v_buf, A_buf, g_buf, beta_buf, h0, o_core, ht_scratch,
-                             cu_dev, /*N=*/1, H, Hg, K, V, static_cast<int>(kChunk), scale, s);
-    // Commit the scanned state back into the sequence's slot (see gdn_state.h): both pointers are
-    // persistent device buffers, so an async D2D copy on the same stream is safely ordered after
-    // the kernel above and before any later call that reads this slot.
-    R4DX_HIP_CHECK(hipMemcpyAsync(h0, ht_scratch, static_cast<size_t>(H * V * K) * sizeof(float),
-                                   hipMemcpyDeviceToDevice, s));
+    ProfiledCall(prof, s, "gdn.chunk_scan", [&] {
+      core::r4d::GdnChunkScan(q_buf, k_buf, v_buf, A_buf, g_buf, beta_buf, h0, o_core, ht_scratch,
+                               cu_dev, /*N=*/1, H, Hg, K, V, static_cast<int>(kChunk), scale, s);
+      // Commit the scanned state back into the sequence's slot (see gdn_state.h): both pointers
+      // are persistent device buffers, so an async D2D copy on the same stream is safely ordered
+      // after the kernel above and before any later call that reads this slot.
+      R4DX_HIP_CHECK(hipMemcpyAsync(h0, ht_scratch, static_cast<size_t>(H * V * K) * sizeof(float),
+                                     hipMemcpyDeviceToDevice, s));
+    });
 
-    core::r4d::GdnGatedRmsNorm(o_core, z_buf, w_.norm_weight.data(), out_core,
-                                /*rows=*/T * H, /*xrow=*/V, /*zrow=*/V, /*orow=*/V,
-                                /*width=*/static_cast<int>(V), eps, kGdnActSilu, s);
+    ProfiledCall(prof, s, "gdn.gated_rmsnorm", [&] {
+      core::r4d::GdnGatedRmsNorm(o_core, z_buf, w_.norm_weight.data(), out_core,
+                                  /*rows=*/T * H, /*xrow=*/V, /*zrow=*/V, /*orow=*/V,
+                                  /*width=*/static_cast<int>(V), eps, kGdnActSilu, s);
+    });
   } else {
     // max_query_len must be the WINDOW BOUND (GdnStateManager::MaxDecodeWindow()), not the actual
     // row count T (review finding, 2026-09-19): r4d_gdn_conv_w4_h128_bf16.hip derives
@@ -119,13 +149,15 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
       throw std::runtime_error(
           "GdnLayer::Forward: decode T exceeds GdnStateManager::MaxDecodeWindow()");
     }
-    core::r4d::GdnConvUpdate(mixed_qkv, conv_dim, w_.conv1d_weight.data(), /*bias=*/nullptr,
-                              states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
-                              states.ConvTokStride(), static_cast<int>(states.StateLenMax()),
-                              cache_idx_dev, /*ci_stride=*/1, p.num_accepted, q_buf,
-                              k_buf, v_buf, cu_dev, /*N=*/1, H, Hg, K, V,
-                              static_cast<int>(width),
-                              /*max_query_len=*/static_cast<int>(states.MaxDecodeWindow()), s);
+    ProfiledCall(prof, s, "gdn.conv_update", [&] {
+      core::r4d::GdnConvUpdate(mixed_qkv, conv_dim, w_.conv1d_weight.data(), /*bias=*/nullptr,
+                                states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
+                                states.ConvTokStride(), static_cast<int>(states.StateLenMax()),
+                                cache_idx_dev, /*ci_stride=*/1, p.num_accepted, q_buf,
+                                k_buf, v_buf, cu_dev, /*N=*/1, H, Hg, K, V,
+                                static_cast<int>(width),
+                                /*max_query_len=*/static_cast<int>(states.MaxDecodeWindow()), s);
+    });
 
     // Every candidate token writes its own state slot (r4d_gdn_recurrent_update_*'s "one state
     // write per candidate token"): sidx is the STABLE, ascending {window 0, window 1, ...} array
@@ -137,19 +169,34 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     const int64_t window = states.MaxDecodeWindow();
     const int32_t* sidx_dev = control.SidxBase(p.slot, window);
 
-    core::r4d::GdnRecurrentUpdate(
-        q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
-        w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
-        states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
-        /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
-        kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+    ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
+      core::r4d::GdnRecurrentUpdate(
+          q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
+          w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
+          states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
+          /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
+          kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+    });
   }
 
   // ---- out_proj + residual ----------------------------------------------------------------------
   uint16_t* gdn_out = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
-  ApplyLinear(stream, arena, w_.out_proj, out_core, gdn_out, T);
-  r4dx_residual_add_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(gdn_out),
-                          reinterpret_cast<int64_t>(x_out), T * hidden, reinterpret_cast<int64_t>(s));
+  ProfiledCall(prof, s, "gemm:gdn.out_proj", [&] {
+    ApplyLinear(stream, arena, w_.out_proj, out_core, gdn_out, T);
+  });
+  ProfiledCall(prof, s, "gdn.residual", [&] {
+    if (next_norm_weight != nullptr) {
+      r4dx_residual_rmsnorm_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(gdn_out),
+                                  reinterpret_cast<int64_t>(next_norm_weight),
+                                  reinterpret_cast<int64_t>(x_out),
+                                  reinterpret_cast<int64_t>(x_normed_out), T, hidden, eps,
+                                  reinterpret_cast<int64_t>(s));
+    } else {
+      r4dx_residual_add_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(gdn_out),
+                              reinterpret_cast<int64_t>(x_out), T * hidden,
+                              reinterpret_cast<int64_t>(s));
+    }
+  });
 }
 
 }  // namespace r4dx::model

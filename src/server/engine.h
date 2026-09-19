@@ -20,6 +20,7 @@
 #include "chat_template.h"
 #include "model.h"
 #include "openai_types.h"
+#include "prefix_state.h"
 #include "request_queue.h"
 #include "response_sink.h"
 #include "tokenizer.h"
@@ -94,6 +95,11 @@ class Engine {
   // worker thread and an uncaught exception here would take the whole server down.
   void RunRequest(PendingRequest& req);
 
+  // Shared stop-string-aware token emission (engine.cpp) used by both the plain-decode and MTP
+  // generation loops in RunRequest -- see that function's definition for the full contract.
+  static bool EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
+                         std::string& accumulated, int32_t tok);
+
   EngineOptions opts_;
   std::string model_id_;
 
@@ -107,8 +113,9 @@ class Engine {
   // fed tokens, continue from the cache ... otherwise reset and re-prefill") -- this server has no
   // separate notion of "session" beyond "the token sequence the last request left the model in",
   // which is exactly what a client resending a growing `messages` array (the normal OpenAI chat
-  // client pattern: resend the whole conversation each turn) produces.
-  std::vector<int32_t> fed_tokens_;
+  // client pattern: resend the whole conversation each turn) produces. See prefix_state.h for the
+  // MTP-aware Commit() contract (docs/mtp.md's "mid-round" gap, closed here).
+  PrefixState prefix_;
 
   BoundedQueue<std::shared_ptr<PendingRequest>> queue_;
   std::thread worker_;

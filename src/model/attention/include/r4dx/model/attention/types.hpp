@@ -37,22 +37,26 @@ struct AttnConfig {
 // supports num_seqs==1, where the two coincide (r4dx::core::r4d::AttnDecodeFp8Kv's doc comment in
 // r4d.hpp).
 //
-// qg/o (decode-perf pass, 2026-09-19): non-owning pointers at the caller's (Container-loaded)
-// r4dx::model::QuantLinear -- whichever on-disk layout was requested at load time (bf16/mxfp4/
-// w4a16/w4a8), dispatched through the shared r4dx::model::ApplyLinear (src/model/linear.h) the
-// same way GDN's in_proj_qkv/out_proj and MLP's gate_up/down already do. k_w/v_w stay raw bf16
-// pointers: docs/container-format.md's attn.k/v tensors have no quantized on-disk form.
+// qg/o (decode-perf pass, 2026-09-19) and k/v (R1, docs/r9700.md): non-owning pointers at the
+// caller's (Container-loaded) r4dx::model::QuantLinear -- whichever on-disk layout was requested
+// at load time (bf16/mxfp4/w4a16/w4a8), dispatched through the shared r4dx::model::ApplyLinear
+// (src/model/linear.h) the same way GDN's in_proj_qkv/out_proj and MLP's gate_up/down already do.
+// k/v used to be raw bf16 pointers (docs/container-format.md's attn.k/v tensors had no quantized
+// on-disk form) -- R1 gives them one; Container::Load falls back to bf16 (or the bare pre-R1
+// tensor form) when the requested layout is absent, so a QuantLinear here may still carry
+// layout==kBf16 in practice (e.g. mtp.attn.k/v, which stay bf16 by design).
 //
 // docs/container-format.md tensor names this maps to: input_layernorm ->
 // text.layers.{i}.input_layernorm; qg -> text.layers.{i}.attn.qg.{layout} (fused q_proj + output
-// gate, per-head-interleaved rows); k_w/v_w -> text.layers.{i}.attn.{k,v} (bf16-only, no
-// .{layout} suffix); o -> text.layers.{i}.attn.o.{layout}; q_norm/k_norm ->
-// text.layers.{i}.attn.{q,k}_norm; k_descale/v_descale -> text.layers.{i}.attn.{k,v}_descale.
+// gate, per-head-interleaved rows); k/v -> text.layers.{i}.attn.{k,v}.{layout} (or the bare,
+// layout-less pre-R1 form on an old container); o -> text.layers.{i}.attn.o.{layout}; q_norm/
+// k_norm -> text.layers.{i}.attn.{q,k}_norm; k_descale/v_descale ->
+// text.layers.{i}.attn.{k,v}_descale.
 struct AttnWeights {
   const uint16_t* input_layernorm = nullptr;  // [hidden] bf16
   const QuantLinear* qg = nullptr;            // [2*num_heads*head_dim, hidden], any layout
-  const uint16_t* k_w = nullptr;              // [kv_heads*head_dim, hidden] bf16
-  const uint16_t* v_w = nullptr;              // [kv_heads*head_dim, hidden] bf16
+  const QuantLinear* k = nullptr;             // [kv_heads*head_dim, hidden], any layout
+  const QuantLinear* v = nullptr;             // [kv_heads*head_dim, hidden], any layout
   const QuantLinear* o = nullptr;             // [hidden, num_heads*head_dim], any layout
   const uint16_t* q_norm = nullptr;           // [head_dim] bf16
   const uint16_t* k_norm = nullptr;           // [head_dim] bf16

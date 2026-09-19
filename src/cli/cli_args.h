@@ -31,6 +31,21 @@ struct CliArgs {
   // hipEvent-timed per op-family) right after the prompt's prefill, prints a table to stderr, then
   // continues generation as normal -- see main.cpp's RunTurn and docs/perf.md's profile table.
   bool profile = false;
+  // Milestone 3 profiling pass (docs/r9700.md R5/Q2): which GENERATED decode step (1-indexed) to
+  // profile when --profile is set. Default 32 -- Q2's own finding was that profiling the FIRST
+  // generated token overstates the step by a near-constant +5.4 +/- 0.5 ms of first-token/warmup
+  // effects vs the steady-state throughput-table step; main.cpp's RunTurn now runs
+  // (profile_token - 1) plain DecodeStepGreedy warmup steps before calling DecodeStepProfiled on
+  // step `profile_token`, so this flag lets a caller pick a different steady-state token if needed
+  // (e.g. --profile-token 1 reproduces the OLD, first-token behavior for comparison).
+  int64_t profile_token = 32;
+  // Milestone 3 profiling pass (docs/r9700.md R5/Q7): profile PREFILL instead of decode --
+  // Model::PrefillProfiled runs the whole prompt (chunked at max_chunk, today 64) with per-kernel
+  // hipEvent spans, prints the per-op-family table (same "gemm:" GEMM-share split as --profile) to
+  // stderr, and returns without generating anything, same "standalone diagnostic" contract as
+  // --profile. Combine with a long --prompt (docs/r9700.md Q7 asks for ~1024 tokens) to get a
+  // meaningful multi-chunk picture; mutually exclusive with --profile (checked below).
+  bool profile_prefill = false;
   // MTP self-speculative decode (docs/mtp.md): draft this many tokens per step via the container's
   // mtp.* head, verify them against the real model in one batched call. Defaults to 0 (disabled --
   // r4dx::model::Model::DecodeStepGreedy/DecodeStep, byte-for-byte unchanged from pre-MTP
@@ -55,7 +70,8 @@ inline std::string CliUsageText(const char* argv0) {
          " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16} "
          "(--prompt \"...\" | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
-         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--mtp N]";
+         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
+         "[--profile-prefill] [--mtp N]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -115,6 +131,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--max-ctx") a.max_ctx = ParseI64("--max-ctx", NextCliArg(argc, argv, i, "--max-ctx"));
     else if (arg == "--stats") a.stats = true;
     else if (arg == "--profile") a.profile = true;
+    else if (arg == "--profile-token") a.profile_token = ParseI64("--profile-token", NextCliArg(argc, argv, i, "--profile-token"));
+    else if (arg == "--profile-prefill") a.profile_prefill = true;
     else if (arg == "--mtp") a.mtp = ParseI64("--mtp", NextCliArg(argc, argv, i, "--mtp"));
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
@@ -130,6 +148,10 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
   if (a.mtp < 0) throw CliUsageError("--mtp must be >= 0");
+  if (a.profile_token < 1) throw CliUsageError("--profile-token must be >= 1");
+  if (a.profile && a.profile_prefill) {
+    throw CliUsageError("--profile and --profile-prefill are mutually exclusive");
+  }
   return a;
 }
 

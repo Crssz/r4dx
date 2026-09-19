@@ -65,25 +65,31 @@ smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- a
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b.r4dx `
-    --layouts mxfp4,w4a16,w4a8 --lm-head 4bit+bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib.json --threads 16
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v3.r4dx `
+    --layouts w4a8,w4a16,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib.json
 ```
 
 Produces a single container carrying every requested quantized GEMM layout (plus bf16 for
-embeddings/attention-gate-output/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B
-them against the same file. `--layers N` converts only the first `N` transformer layers (useful for
-a small smoke-test container); omit it to convert all 64. `--kv-calib` fills the fp8 KV cache's
-per-head descales from a `tools/reference/kv_calibrate.py` JSON (falls back to a `1.0` placeholder
-per-layer, with a stderr warning, if omitted or if a layer is missing from the JSON). See
-`docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s header comment for
-the full flag list, including `--selftest` for the byte-exact packer self-check.
+embeddings/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B them against the same
+file. `--layers N` converts only the first `N` transformer layers (useful for a small smoke-test
+container); omit it to convert all 64. `--kv-calib` fills the fp8 KV cache's per-head descales from
+a `tools/reference/kv_calibrate.py` JSON (falls back to a `1.0` placeholder per-layer, with a
+stderr warning, if omitted or if a layer is missing from the JSON). `--no-bf16` (docs/r9700.md R1)
+drops the full-model bf16 body layout and the bf16 `lm_head` variant entirely -- the current
+recommended real-model container, `D:\models\r4dx\qwen38-27b-v3.r4dx`, was converted this way
+(w4a8/w4a16/mxfp4 only, no bf16 anywhere except the small 4-layer test containers, which still pass
+`--layouts bf16,...` since bf16 is the numerical-reference layout rungs 1-3 of `docs/validation.md`
+need). The older `D:\models\r4dx\qwen38-27b.r4dx` (all four layouts including full bf16) is kept on
+disk for comparison -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of scope for
+performance work. See `docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s
+header comment for the full flag list, including `--selftest` for the byte-exact packer self-check.
 
 ### Generate text
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b.r4dx --layout mxfp4 `
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v3.r4dx --layout w4a16 `
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 128 --temperature 0 --stats
 ```
@@ -114,7 +120,7 @@ per layout.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b.r4dx --layout w4a16 `
+.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b-v3.r4dx --layout w4a16 `
     --host 127.0.0.1 --port 8080
 ```
 

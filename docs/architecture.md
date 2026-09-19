@@ -94,7 +94,10 @@ q, k = repeat_interleave(q, k, num_v_heads // num_k_heads)   -- 48/16 = 3x, GQA-
 b = gemm(x, gdn.in_proj_b);  a = gemm(x, gdn.in_proj_a)
 beta = sigmoid(b)
 g = -exp(A_log) * softplus(a + dt_bias)            -- per-(token, v_head) gate, cumsum'd per chunk
-z = gemm(x, gdn.in_proj_z)                          -- output gate, applied by the norm below
+z = gemm(x, gdn.in_proj_z.{layout})                 -- output gate, applied by the norm below
+                                                        (R1, docs/r9700.md: quantized like
+                                                        in_proj_qkv/out_proj since this pass;
+                                                        in_proj_a/in_proj_b above stay bf16)
 
 -- prefill / chunked prefill (chunk 64):
 A = r4d_gdn_kkt_solve_k128_c64_bf16(k, beta, g, cu, ...)     -- (I + strict_lower(diag(beta) K K^T

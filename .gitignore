@@ -1,0 +1,14 @@
+build/
+out/
+*.obj
+*.o
+.cache/
+*.r4dx
+*.safetensors
+CMakeUserPresets.json
+__pycache__/
+*.pyc
+
+# Committed test fixtures are an intentional exception to the blanket *.safetensors rule above
+# (they're tiny, hand-generated inputs the convert tests read at runtime, not model checkpoints).
+!tests/convert/fixtures/*.safetensors

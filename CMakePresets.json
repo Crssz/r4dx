@@ -1,0 +1,44 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "win-hip",
+      "displayName": "Windows / HIP gfx1201 (clang-cl, Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/win-hip",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "C:/opt/rocm/lib/llvm/bin/clang-cl.exe",
+        "CMAKE_LINKER": "C:/opt/rocm/lib/llvm/bin/lld-link.exe",
+        "R4D_ROCM_ROOT": "C:/opt/rocm",
+        "R4D_GFX_ARCH": "gfx1201",
+        "R4DX_BUILD_TESTS": "ON",
+        "R4DX_BUILD_SERVER": "ON",
+        "R4DX_BUILD_CONVERT": "ON"
+      },
+      "environment": {
+        "HIP_PATH": "C:/opt/rocm",
+        "ROCM_PATH": "C:/opt/rocm"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "win-hip",
+      "configurePreset": "win-hip",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "win-hip",
+      "configurePreset": "win-hip",
+      "configuration": "Release",
+      "environment": {
+        "HIP_VISIBLE_DEVICES": "1"
+      },
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

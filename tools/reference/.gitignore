@@ -1,0 +1,8 @@
+# Generated golden/calibration outputs -- regenerate with layer_golden.py / kv_calibrate.py,
+# don't commit them (they're multi-MB .safetensors dumps tied to a specific checkpoint + seed).
+golden_out/
+golden_out*/
+kv_calibrate_out/
+kv_timing/
+__pycache__/
+*.pyc

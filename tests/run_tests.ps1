@@ -1,0 +1,39 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+  Run r4dx's ctest suite on HIP device 1.
+
+.DESCRIPTION
+  Only HIP device 1 (of the two R9700s in this machine) may be used -- see the GPU rule in
+  README.md / docs/build-windows.md. Sets HIP_VISIBLE_DEVICES=1 (so device index 0 inside the
+  test process is physical device 1) and runs ctest against the 'win-hip' preset's build
+  directory with the venv's CMake.
+
+.PARAMETER Preset
+  CMake preset name. Default 'win-hip'.
+
+.EXAMPLE
+  .\tests\run_tests.ps1
+#>
+[CmdletBinding()]
+param(
+    [string]$Preset = "win-hip"
+)
+
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot\..
+
+$Cmake = "C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\cmake.exe"
+if (-not (Test-Path $Cmake)) { throw "required tool not found: $Cmake" }
+
+$env:HIP_VISIBLE_DEVICES = "1"
+
+Write-Output "[run_tests] ctest (preset $Preset), HIP_VISIBLE_DEVICES=$($env:HIP_VISIBLE_DEVICES)"
+& $Cmake --build --preset $Preset --target smoke_r4d
+if ($LASTEXITCODE -ne 0) { throw "build of smoke_r4d failed with exit code $LASTEXITCODE" }
+
+$Ctest = Join-Path (Split-Path $Cmake) "ctest.exe"
+& $Ctest --preset $Preset --output-on-failure
+if ($LASTEXITCODE -ne 0) { throw "ctest failed with exit code $LASTEXITCODE" }
+
+Write-Output "[run_tests] all tests passed"

@@ -1,12 +1,11 @@
 // r4dx::model::attention::Linear -- a minimal bf16 GEMM wrapper over r4d_gemm_bf16_nt_m64 for
-// this component's four linears (attn.qg, attn.k, attn.v, attn.o). Deliberately NOT the
-// model-core agent's Linear abstraction (task brief: "define your own small structs for weights
-// and take raw device pointers / Tensor views so the assembly stage can adapt" / "you may
-// duplicate a small amount of the model-core agent's linear logic rather than depend on it; the
-// Integrate stage will dedupe"). Only the bf16 layout is wired up here -- w4a16/w4a8/mxfp4 GEMM
-// dispatch for this layer's linears is out of scope for this pass (see
-// tests/model/attention/test_attn_layer.cpp's "quantized layouts reported" section and this
-// component's task note).
+// this component's attn.k / attn.v projections, which have no quantized on-disk form
+// (docs/container-format.md: "attn.k/v (bf16-only, no .{layout} suffix)") and so are always bf16
+// regardless of --layout. attn.qg/attn.o now dispatch through the shared r4dx::model::ApplyLinear
+// (src/model/linear.h, decode-perf pass 2026-09-19) instead -- see attention_layer.hpp -- since
+// those two DO have quantized on-disk forms and honoring `--layout` for them is the point of that
+// pass ("dedupe the duplicated linear logic between core and attention" per the task brief this
+// component's original scope anticipated).
 #pragma once
 
 #include <hip/hip_runtime.h>

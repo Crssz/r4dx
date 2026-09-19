@@ -12,23 +12,7 @@
 
 namespace r4dx::model {
 
-const char* LayoutName(Layout l) {
-  switch (l) {
-    case Layout::kBf16: return "bf16";
-    case Layout::kMxfp4: return "mxfp4";
-    case Layout::kW4a16: return "w4a16";
-    case Layout::kW4a8: return "w4a8";
-  }
-  return "?";
-}
-
-Layout LayoutFromName(const std::string& name) {
-  if (name == "bf16") return Layout::kBf16;
-  if (name == "mxfp4") return Layout::kMxfp4;
-  if (name == "w4a16") return Layout::kW4a16;
-  if (name == "w4a8") return Layout::kW4a8;
-  throw std::runtime_error("r4dx::model::LayoutFromName: unrecognized layout '" + name + "'");
-}
+// LayoutName/LayoutFromName now live in quant_linear.cpp (shared with r4dx_model_attention).
 
 namespace {
 
@@ -175,25 +159,6 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   const int64_t kv_heads = c.config_.num_key_value_heads;
   const int64_t attn_out = c.config_.num_attention_heads * c.config_.head_dim;
 
-  // attn.qg/o always load bf16 regardless of `layout` -- see the loop below's comment. Surface
-  // that at load time (not just in a source comment / docs/perf.md's "Known limitation" section
-  // far below its own numbers) so `--layout mxfp4` (etc.) doesn't silently run ~3GiB of attention
-  // projections at bf16 without the caller knowing why the VRAM/quality numbers don't fully match
-  // the requested layout.
-  if (layout != Layout::kBf16) {
-    int64_t num_attn_layers = 0;
-    for (int64_t i = 0; i < num_layers; ++i) {
-      if (!c.config_.IsGdnLayer(i)) ++num_attn_layers;
-    }
-    if (num_attn_layers > 0) {
-      std::fprintf(stderr,
-                    "note: attn.qg/o load as bf16 regardless of --layout=%s (%lld full-attention "
-                    "layer%s)\n",
-                    LayoutName(layout), static_cast<long long>(num_attn_layers),
-                    num_attn_layers == 1 ? "" : "s");
-    }
-  }
-
   c.layers_.reserve(static_cast<size_t>(num_layers));
   for (int64_t i = 0; i < num_layers; ++i) {
     const std::string base = "text.layers." + std::to_string(i) + ".";
@@ -216,20 +181,15 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       lw.gdn = std::move(g);
     } else {
       AttnWeights a;
-      // attn.qg/o are forced to bf16 regardless of the requested body `layout`: the assembly
-      // stage's AttentionLayer (src/model/attention/**) only implements a bf16 GEMM dispatch for
-      // these two linears (its own documented interim scope -- see
-      // src/model/attention/include/r4dx/model/attention/linear.hpp's file comment and this
-      // component's task open_issues). Every r4dx-convert run this project uses always emits the
-      // bf16 variant for attn.qg/o alongside whichever quantized layouts were requested (verified
-      // against the real D:\models\r4dx\qwen38-27b.r4dx container), so this is always loadable.
-      // GDN's in_proj_qkv/out_proj and MLP's gate_up/down still honor `layout` -- only these two
-      // attention linears (16 of 64 layers) stay bf16-precision until AttentionLayer gains
-      // quantized-layout dispatch (see docs/perf.md's notes for this run's measured impact).
-      a.qg = LoadQuantLinear(reader, base + "attn.qg", Layout::kBf16, attn_out * 2, hidden);
+      // attn.qg/o now honor the requested body `layout` the same way GDN's in_proj_qkv/out_proj
+      // and MLP's gate_up/down do (decode-perf pass, 2026-09-19): AttentionLayer dispatches both
+      // through the shared r4dx::model::ApplyLinear (src/model/linear.h), which every layout
+      // already supports. See docs/perf.md for the measured per-layout VRAM/throughput delta this
+      // unlocks (attn.qg/o account for 16 of 64 layers' full-attention projections).
+      a.qg = LoadQuantLinear(reader, base + "attn.qg", layout, attn_out * 2, hidden);
       a.k = UploadRawU16(reader, base + "attn.k");
       a.v = UploadRawU16(reader, base + "attn.v");
-      a.o = LoadQuantLinear(reader, base + "attn.o", Layout::kBf16, hidden, attn_out);
+      a.o = LoadQuantLinear(reader, base + "attn.o", layout, hidden, attn_out);
       a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
       a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
       a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
@@ -247,6 +207,39 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
 
   c.final_norm_ = UploadRawU16(reader, "text.final_norm");
   c.lm_head_ = LoadQuantLinear(reader, "lm_head", lm_head_layout, c.config_.vocab_size, hidden);
+
+  // mtp.* (docs/container-format.md, docs/mtp.md): present only when the container was converted
+  // with --mtp on -- probe with SafetensorsReader::Has rather than trusting __metadata__, so this
+  // works uniformly for the real checkpoint's container and any hand-built/selftest fixture.
+  // "mtp.norm" (add_bf16, src/convert/main.cpp) has no .{layout} suffix -- a bare bf16 passthrough
+  // tensor, same naming convention as "text.final_norm" (UploadRawU16 below, not LoadQuantLinear).
+  if (reader.Has("mtp.norm")) {
+    MtpWeights mw;
+    const std::string base = "mtp.";
+    LayerWeights lw;
+    lw.input_layernorm = UploadRawU16(reader, base + "input_layernorm");
+    lw.post_attention_layernorm = UploadRawU16(reader, base + "post_attention_layernorm");
+    AttnWeights a;
+    a.qg = LoadQuantLinear(reader, base + "attn.qg", layout, attn_out * 2, hidden);
+    a.k = UploadRawU16(reader, base + "attn.k");
+    a.v = UploadRawU16(reader, base + "attn.v");
+    a.o = LoadQuantLinear(reader, base + "attn.o", layout, hidden, attn_out);
+    a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
+    a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
+    a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
+    a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
+    lw.attn = std::move(a);
+    lw.mlp.gate_up = LoadQuantLinear(reader, base + "mlp.gate_up", layout,
+                                      2 * c.config_.intermediate_size, hidden);
+    lw.mlp.down = LoadQuantLinear(reader, base + "mlp.down", layout, hidden,
+                                   c.config_.intermediate_size);
+    mw.layer = std::move(lw);
+    mw.fc = UploadRawU16(reader, "mtp.fc");
+    mw.norm = UploadRawU16(reader, "mtp.norm");
+    mw.pre_fc_norm_hidden = UploadRawU16(reader, "mtp.pre_fc_norm_hidden");
+    mw.pre_fc_norm_embedding = UploadRawU16(reader, "mtp.pre_fc_norm_embedding");
+    c.mtp_ = std::move(mw);
+  }
 
   return c;
 }

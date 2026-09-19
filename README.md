@@ -41,18 +41,22 @@ exact toolchain versions, flags, and gotchas.
 .\tests\run_tests.ps1
 ```
 
-Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 24 tests
+Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 30 tests
 covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
 residual add, silu_mul, rope, fp8/int8 activation quant, kv cache write, mxfp4 GEMM, attention
 decode, GDN chunk scan, sampler), the converter's quantizer round-trip / byte-packer / kernel-decode
 / KV-calibration / bf16-layout tests, the tokenizer's golden-case suite, `src/model`'s per-layer
 tests (GDN layer, full-attention layer, final-norm+lm_head, assembled-`Model` forward-pass smoke
-including a prefill/decode state-handoff equivalence check), `src/cli`'s argument-parsing tests, and
-a CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). All 24 currently pass (~60s wall on HIP device 1). See `docs/status.md` for the
-full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
+including a prefill/decode state-handoff equivalence check, and MTP's verify/rejection-rewind
+tests), `src/cli`'s argument-parsing tests, `src/server`'s CPU-only tests (CLI args, OpenAI request/
+response JSON shapes, SSE framing, buffering/streaming sinks, the bounded request queue), and a
+CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
+`ctest` invocation). All 30 currently pass (~90-120s wall on HIP device 1). See `docs/status.md` for
+the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
 GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
-`ctest` -- see their READMEs for invocation.
+`ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration
+smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- also not part of
+`ctest`, since it needs a live HTTP server and a real container.
 
 ## Usage
 
@@ -85,8 +89,9 @@ $env:HIP_VISIBLE_DEVICES = '1'
 ```
 
 `--layout` selects which quantized (or `bf16`) body-weight variant baked into the container to run
-(`mxfp4` / `w4a16` / `w4a8` / `bf16`) -- attention's `qg`/`o` projections always run bf16 regardless
-of this flag (see `docs/perf.md`'s "Known limitation"). `--prompt "..."` renders one turn through
+(`mxfp4` / `w4a16` / `w4a8` / `bf16`) -- as of the Milestone 2 performance pass this now includes
+attention's `qg`/`o` projections too (they used to always run bf16 regardless of `--layout`; see
+`docs/perf.md`'s "Known limitation", now resolved). `--prompt "..."` renders one turn through
 the real chat template and generates once; `--chat` instead starts an interactive multi-turn REPL
 (re-rendering the whole conversation each turn, feeding only the new tail tokens to the model).
 `--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B` (where `tokenizer.json` /
@@ -94,8 +99,37 @@ the real chat template and generates once; `--chat` instead starts an interactiv
 template's `enable_thinking`; `--temperature 0` selects greedy argmax decoding, otherwise
 temperature/top-k/top-p/min-p sampling with `--seed` applies. `--max-ctx` bounds the KV cache and
 GDN state allocation (default 131072; the bf16 layout needs a much smaller value -- see
-`docs/perf.md`). `--stats` prints container-load time, prefill/decode tokens/s, and VRAM used. See
-`src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput per layout.
+`docs/perf.md`). `--stats` prints container-load time, prefill/decode tokens/s, and VRAM used, plus
+(when `--mtp K>0`) an MTP acceptance-rate line. `--mtp K` (default 0) enables MTP self-speculative
+decode: each decode round drafts up to `K` tokens via the checkpoint's own `mtp.*` weights, verifies
+them against the real model in one batched call, and commits the accepted prefix (plus one corrected/
+bonus token) -- greedy-only (`--mtp K` with `--temperature > 0` warns and forces `--mtp 0` for that
+run). See `docs/mtp.md` for the full design, the container requirement (the container must carry
+`mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
+per layout (roughly +55-100% decode throughput at each layout's best `K`, `--mtp 3` a reasonable
+default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput
+per layout.
+
+## Run the OpenAI-compatible server
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b.r4dx --layout w4a16 `
+    --host 127.0.0.1 --port 8080
+```
+
+Exposes `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming via `"stream":
+true` or non-streaming JSON), and `POST /v1/completions` (raw prompt, no chat template) -- a subset
+of the OpenAI chat/completions API, single model, single GPU, one request processed at a time by a
+dedicated worker thread (see `docs/server.md`'s "Concurrency model"). Multi-turn conversations reuse
+the KV/GDN cache across requests the same way `r4dx-cli --chat` does, by matching each request's
+full re-tokenized prompt against the tokens already committed to the model's state and re-prefilling
+only the new tail (or reloading from scratch on a prefix mismatch). `--mtp` is not yet exposed as a
+server flag (server-side MTP is future work); the server always runs plain decode. See `docs/
+server.md` for the full endpoint/field reference, deferred features (tool-call parsing, vision), and
+a captured real streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
+(`.\tools\server\smoke.ps1` against the small 4-layer test container by default; pass
+`-Model`/`-Layout`/`-Layers -1` to point it at a real container).
 
 ## Layout
 
@@ -106,8 +140,8 @@ src/kernels/    r4dx-owned HIP kernels (rmsnorm, rope, silu_mul, kv paging, samp
 src/model/      layer graph / forward pass
 src/tokenizer/  tokenizer
 src/convert/    weight converter (HF checkpoint -> r4dx container)
-src/server/     OpenAI-compatible chat API
-src/cli/        text-generation CLI
+src/server/     OpenAI-compatible chat API (r4dx-server)
+src/cli/        text-generation CLI (r4dx-cli)
 tests/          smoke + unit tests
 docs/           architecture, container format, build notes, status
 tools/          Python reference/validation tooling (read-only against the HF transformers venv)
@@ -116,5 +150,6 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 ## Status
 
 Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation)
-is complete and integrated -- see `docs/status.md` for what exists, what passes, known gaps, and the
-next milestone (OpenAI-compatible chat API + MTP self-speculation).
+and Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and
+MTP self-speculative decode) are both complete and integrated -- see `docs/status.md` for what
+exists, what passes, known gaps, and the next milestone (vision tower, then DFlash2 drafting).

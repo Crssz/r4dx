@@ -1,6 +1,22 @@
 # Status
 
-Last updated: 2026-09-19 (Milestone 1 integration pass).
+Last updated: 2026-09-20 (Milestone 2 integration pass).
+
+## Milestone 2: done
+
+`r4dx-server` (OpenAI-compatible `/v1/chat/completions` + `/v1/completions` + `/health` +
+`/v1/models`, streaming and non-streaming, single-worker-thread/single-GPU) and MTP
+self-speculative decode (`--mtp K`, greedy-only, real per-sequence KV cache built in lockstep with
+the backbone) are implemented, tested, and verified end-to-end on HIP device 1, on top of a decode/
+prefill performance pass (quantized attention `qg`/`o` projections, prefill-chunk waste removal, a
+measured `(N,K,M-band)` GEMM tuning table, device-side greedy argmax) that landed in the same
+integration window. See `docs/server.md` for the server's full API/concurrency-model writeup,
+`docs/mtp.md` for MTP's design/incident/measurement writeup, and `docs/perf.md` for the full
+before/after performance table spanning Milestone 1 through Milestone 2. This integration pass
+re-ran a clean `build.ps1 -Clean` rebuild, the full `ctest` suite, `tools/server/smoke.ps1`, and one
+`r4dx-cli` generation per quantized layout at both `--mtp 0` and `--mtp 3` against the real 64-layer
+container to confirm the milestone is reproducible end to end; see "What passes" below for the
+numbers.
 
 ## Milestone 1: done
 
@@ -39,9 +55,9 @@ to confirm the milestone is reproducible end to end; see "What passes" below for
   attention layer, final-norm/lm_head, MTP), KV descale calibration, converter cross-checks against
   the real `r4d_core` kernels, tokenizer golden generation. None of this touches the C++ engine
   directly; it produces ground truth for `src/model`'s future tests.
-- **Not yet implemented**: `src/model` (layer graph / forward pass), `src/server` (OpenAI chat API),
-  `src/cli` (text-generation CLI) -- all three currently expose only a placeholder INTERFACE CMake
-  target, per the Skeleton stage's design for later agents to fill in.
+- **`src/model`**, **`src/server`**, **`src/cli`** are now all implemented -- see the "Update"
+  sections below (Milestone 1: model graph, forward pass, CLI text generation) and `docs/server.md` /
+  `docs/mtp.md` (Milestone 2: OpenAI-compatible server, MTP self-speculative decode).
 
 ## What passes
 
@@ -126,14 +142,48 @@ All four generations were coherent, on-topic, and stopped on the model's own EOS
 the assembly/review-fix stages' own runs within noise -- confirming the milestone is reproducible
 from a clean rebuild. See `docs/perf.md` for the verbatim generated text and full narrative.
 
+## What passes (Milestone 2 integration pass, 2026-09-20)
+
+Clean `-Clean` rebuild (`build.ps1 -Clean`, HIP device 1, 107/107 build steps) plus full
+`ctest --preset win-hip` run (`tests\run_tests.ps1`):
+
+```
+100% tests passed out of 30
+Total Test time (real) = 93.50 sec
+```
+
+All 24 Milestone-1 tests plus `test_mtp` and the five `test_server_*` CPU-only tests (`test_server_args`,
+`test_openai_types`, `test_sse`, `test_response_sink`, `test_request_queue`) pass together in one run.
+
+`tools/server/smoke.ps1` (4-layer test container, `--layout w4a16 --layers 4`): all 20 shape/status
+checks passed -- `/v1/models`, non-streaming and streaming `/v1/chat/completions` (SSE framing,
+`[DONE]` terminator, per-event `chat.completion.chunk` shape), and a rejected-image-part `400`.
+
+One `r4dx-cli` generation per quantized body layout, `--mtp 0` vs `--mtp 3`, against the real,
+unmodified 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`), same prompt as `docs/perf.md`
+(`--temperature 0 --max-ctx 2048 --stats`, `--max-tokens 128` except bf16's `--max-tokens 32
+--max-ctx 512`):
+
+| Layout | mtp=0 decode | mtp=3 decode | mtp=3 acceptance | speedup |
+|---|---|---|---|---|
+| mxfp4 | 27.08 tok/s | 47.46 tok/s | 41.9% | +75.3% |
+| w4a16 | 32.83 tok/s | 66.42 tok/s | 54.3% | +102.3% |
+| w4a8  | 30.95 tok/s | 47.72 tok/s | 32.5% | +54.2% |
+| bf16  | 1.41 tok/s  | 2.21 tok/s  | 48.7% | +56.7% |
+
+All eight runs were coherent, on-topic, and (except the two 32-token-capped bf16 runs, which hit
+`--max-tokens` by design to keep the sweep's wall-clock bounded) stopped on the model's own EOS
+token, matching the FIX pass's own numbers within run-to-run noise -- confirming Milestone 2 is
+reproducible from a clean rebuild. See `docs/perf.md` and `docs/mtp.md` for the full per-layout
+tables (all five `--mtp` values, not just 0 and 3) and verbatim generated text.
+
 ## Known gaps
 
-- `src/server` is an unimplemented placeholder -- no OpenAI-compatible server yet.
 - `r4d_gdn_conv_prep_w4_h128_bf16` / `conv_update` both live in the single
   `r4d_gdn_conv_w4_h128_bf16` translation unit per `r4d.h`; no gap, just worth remembering when
   wiring `src/model`.
 - Vision tower weights are carried bf16-only for now (no quantized vision GEMM path yet); vision
-  tower forward pass itself is a post-MTP-self-speculation milestone.
+  tower forward pass itself is the next milestone (see "Next milestone" below).
 - fp8 KV descales are calibrated per-layer on demand via `kv_calibrate.py`
   (`tools/reference/kv_calibrate_out/kv_descale.json`, gitignored) but not yet wired into the
   converter -- `docs/container-format.md`'s descale table is still the placeholder `1.0` until
@@ -141,13 +191,21 @@ from a clean rebuild. See `docs/perf.md` for the verbatim generated text and ful
 - `tests/reference/test_manifest.py` is CPU-only and has no `pytest` dependency (the reference venv
   doesn't have `pytest` installed and is read-only) -- it's a plain script with bare asserts, run
   directly and also registered as the `reference_manifest` ctest test.
-- No prefill kernel yet beyond the interim 64-row skinny-GEMM chunking path described in the top-level
-  task decisions; a proper 4-bit WMMA prefill kernel is future work.
+- No prefill kernel yet beyond the interim 64-row skinny-GEMM chunking path, now backed by a
+  measured `(N,K,M-band)` GEMM tuning table (`docs/perf.md`'s "GEMM tuning sweep") rather than a
+  single hardcoded tuple, but still not a dedicated WMMA prefill kernel; that remains future work.
+- MTP acceptance (30-75%, best at low K) is well above the pre-fix 0-1.2% but still plausibly below
+  what a purpose-trained self-speculative head could achieve -- not investigated further; see
+  `docs/mtp.md`'s "Known gaps".
+- `r4dx-server`'s tool-call parsing and vision content parts are both deferred (`docs/server.md`'s
+  "Deferred / known gaps"); a mismatched-prefix conversation reset still pays a full container
+  reload's latency (no lightweight `Model::Reset()` yet).
+- `--chat` multi-turn only lightly exercised, now also true of `--chat` + MTP interaction together
+  (`docs/mtp.md`'s "Known gaps").
 
 ## Next milestone
 
-**Milestone 1** (container loader, GDN + attention layers, model forward, `r4dx-cli` text
-generation) is done -- see the "Milestone 1: done" section above, the "Update" sections, and
-`docs/perf.md`. Next up: `src/server` (OpenAI-compatible streaming chat API) and MTP
-self-speculation, followed by the vision tower, DFlash2, and prefix-caching milestones, per the
-top-level project decisions.
+**Milestone 2** (`r4dx-server` OpenAI-compatible chat API, decode/prefill performance pass, MTP
+self-speculative decode) is done -- see the "Milestone 2: done" section above, `docs/server.md`,
+`docs/mtp.md`, and `docs/perf.md`. Next up: the vision tower forward pass, then DFlash2 drafting,
+followed by prefix-caching, per the top-level project decisions.

@@ -8,6 +8,7 @@ set(R4DX_MODEL_TESTS
   test_gdn_layer
   test_final_lm_head
   test_forward_smoke
+  test_mtp
 )
 
 foreach(t ${R4DX_MODEL_TESTS})

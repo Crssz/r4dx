@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "linear.h"  // r4dx::model::ApplyLinear -- shared qg/o quantized-linear dispatch
 #include "r4d.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -95,9 +96,13 @@ class AttentionLayer {
                        reinterpret_cast<int64_t>(stream));
 
     // ---- fused q_proj + output gate, then split per-head-interleaved --------------------------
-    const Linear qg_lin{w.qg_w, 2 * H * D, hidden};
+    // Dispatched through the shared r4dx::model::ApplyLinear (decode-perf pass, 2026-09-19) --
+    // whichever layout Container::Load loaded `w.qg` as (bf16/mxfp4/w4a16/w4a8), same as GDN's
+    // in_proj_qkv/out_proj and MLP's gate_up/down. Replaces this component's own bf16-only Linear
+    // (attention/linear.hpp) for this weight -- that wrapper is still used below for k/v, which
+    // have no quantized on-disk form.
     uint16_t* qg_raw = arena.Alloc<uint16_t>(static_cast<size_t>(T) * 2 * H * D);
-    qg_lin.Gemm(normed, T, qg_raw, stream);
+    ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T);
 
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
     uint16_t* gate = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
@@ -183,9 +188,8 @@ class AttentionLayer {
                                    reinterpret_cast<int64_t>(stream));
 
     // ---- o_proj ----------------------------------------------------------------------------------
-    const Linear o_lin{w.o_w, hidden, H * D};
     uint16_t* o_out = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
-    o_lin.Gemm(gated, T, o_out, stream);
+    ApplyLinear(stream, arena, *w.o, gated, o_out, T);
 
     // ---- residual add ------------------------------------------------------------------------
     r4dx_residual_add_bf16(reinterpret_cast<int64_t>(hidden_in), reinterpret_cast<int64_t>(o_out),

@@ -54,17 +54,36 @@ add_library(r4dx_model_kernels STATIC "${R4DX_MODEL_KERNELS_OBJ}")
 set_target_properties(r4dx_model_kernels PROPERTIES LINKER_LANGUAGE CXX)
 target_link_libraries(r4dx_model_kernels PUBLIC r4dx_hip_runtime)
 
+# ---- r4dx_model_linear: Layout/QuantLinear (quant_linear.h/.cpp) + ApplyLinear (linear.h/.cpp) --
+# Split out (decode-perf pass, 2026-09-19) so r4dx_model_attention (AttentionLayer's qg/o linears,
+# see attention/CMakeLists.txt) can dispatch through the SAME ApplyLinear GDN/MLP/lm_head already
+# use, without linking the rest of r4dx_model (Container/GdnLayer/Mlp/Model) -- that would create a
+# link cycle, since r4dx_model itself links r4dx_model_attention (below).
+add_library(r4dx_model_linear STATIC
+  quant_linear.cpp
+  linear.cpp
+)
+target_include_directories(r4dx_model_linear PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_model_linear PUBLIC
+  r4dx_core
+  r4dx_kernels
+  r4d_core
+  r4dx_hip_runtime
+  r4dx_model_kernels
+)
+
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 add_library(r4dx_model STATIC
   container.cpp
-  linear.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp
+  mtp_head.cpp
   model.cpp
 )
 target_include_directories(r4dx_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_model PUBLIC
+  r4dx_model_linear
   r4dx_core
   r4dx_kernels
   r4d_core

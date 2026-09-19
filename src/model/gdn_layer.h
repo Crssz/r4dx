@@ -21,12 +21,21 @@
 namespace r4dx::model {
 
 struct GdnLayerParams {
-  int32_t slot = 1;        // GdnStateManager slot this sequence's state lives in (>= 1)
+  int32_t slot = 1;        // GdnStateManager::SlotForSeq(seq) -- this sequence's WINDOW INDEX 0
+                            // physical slot (>= 1); see GdnStateManager's file comment.
   bool is_prefill = true;  // true: conv_prep + kkt_solve + chunk_scan (chunked WY scan)
                             // false: conv_update + recurrent_update (sequential decode/verify)
   bool has_init = false;   // prefill only: does `slot` already hold valid conv/recurrent history
                             // from an earlier call (a continued prefill / chunked-prefill chunk)?
                             // false for a sequence's first-ever chunk.
+  // decode/verify only (ignored when is_prefill): device int32[1], or nullptr. nullptr (the
+  // default, and the only value any non-MTP caller ever passes) means "seed this call from window
+  // index 0" -- exactly today's plain-sequential-decode behavior. A real MTP verify round passes
+  // the PREVIOUS call's accepted-token count here (1..that call's own T) so this call's
+  // conv_update/recurrent_update seed from the state snapshot that call left at window index
+  // num_accepted-1 rather than window index 0 -- see GdnStateManager's file comment and
+  // Model::DecodeStepMtpGreedy (model.cpp) for the caller side of this contract.
+  const int32_t* num_accepted = nullptr;
 };
 
 class GdnLayer {

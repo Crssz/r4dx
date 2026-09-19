@@ -3,6 +3,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "linear.h"
@@ -104,25 +105,44 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
                                 /*rows=*/T * H, /*xrow=*/V, /*zrow=*/V, /*orow=*/V,
                                 /*width=*/static_cast<int>(V), eps, kGdnActSilu, s);
   } else {
+    // max_query_len must be the WINDOW BOUND (GdnStateManager::MaxDecodeWindow()), not the actual
+    // row count T (review finding, 2026-09-19): r4d_gdn_conv_w4_h128_bf16.hip derives
+    // slen_eff = state_len_max - (maxq - slen), and its cache-rewrite loop needs slen_eff-slen<=2
+    // (CP_ST==width-1==3's own history depth) -- that only holds for every legal T when maxq is
+    // pinned to the window this state was actually SIZED for (states.StateLenMax() ==
+    // width-2+MaxDecodeWindow(), see GdnStateManager's file comment), not to whatever T this one
+    // call happens to pass (T < MaxDecodeWindow() -- e.g. an MTP-enabled Model's plain decode step,
+    // T=1, with mtp_draft_k>0 widening MaxDecodeWindow() beyond 1 -- previously read/wrote past the
+    // kernel's fixed-size hist[]/x[] arrays; see gdn_state.h's own file comment for the identical
+    // bug class that manifested as a hang for the analogous sidx array).
+    if (T > states.MaxDecodeWindow()) {
+      throw std::runtime_error(
+          "GdnLayer::Forward: decode T exceeds GdnStateManager::MaxDecodeWindow()");
+    }
     core::r4d::GdnConvUpdate(mixed_qkv, conv_dim, w_.conv1d_weight.data(), /*bias=*/nullptr,
                               states.ConvBase(), states.ConvSeqStride(), states.ConvDimStride(),
                               states.ConvTokStride(), static_cast<int>(states.StateLenMax()),
-                              cache_idx_dev, /*ci_stride=*/1, /*num_accepted=*/nullptr, q_buf,
+                              cache_idx_dev, /*ci_stride=*/1, p.num_accepted, q_buf,
                               k_buf, v_buf, cu_dev, /*N=*/1, H, Hg, K, V,
-                              static_cast<int>(width), /*max_query_len=*/static_cast<int>(T), s);
+                              static_cast<int>(width),
+                              /*max_query_len=*/static_cast<int>(states.MaxDecodeWindow()), s);
 
     // Every candidate token writes its own state slot (r4d_gdn_recurrent_update_*'s "one state
-    // write per candidate token"); a plain sequential (non-speculative) decode of T tokens simply
-    // reuses the SAME slot for every position, so the loop's carried register state ends up
-    // committed there after the last token (see gdn_layer.h / gdn_state.h file comments).
-    const int32_t* sidx_dev = control.Sidx(T, p.slot);
+    // write per candidate token"): sidx is the STABLE, ascending {window 0, window 1, ...} array
+    // for this sequence (GdnControlCache::SidxBase / GdnStateManager's file comment), not a T-sized
+    // fresh array -- a plain sequential (non-speculative) decode (T==1, p.num_accepted==nullptr)
+    // only ever touches window index 0, identical to this class's pre-MTP behavior; an MTP verify
+    // call (T==draft_k+1) writes one snapshot per candidate into its own window slot, and
+    // p.num_accepted (carried from the PREVIOUS call) selects which slot THIS call seeds from.
+    const int64_t window = states.MaxDecodeWindow();
+    const int32_t* sidx_dev = control.SidxBase(p.slot, window);
 
     core::r4d::GdnRecurrentUpdate(
         q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
         w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
-        states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev, /*indices_stride=*/T,
-        /*num_accepted=*/nullptr, z_buf, w_.norm_weight.data(), eps, kGdnActSilu,
-        /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+        states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
+        /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
+        kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
   }
 
   // ---- out_proj + residual ----------------------------------------------------------------------

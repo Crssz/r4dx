@@ -55,6 +55,13 @@ struct TurnResult {
   int64_t prefill_tokens = 0;
   int64_t decode_tokens = 0;
   bool hit_eos = false;
+  // MTP acceptance stats (docs/mtp.md), zero/unset when --mtp 0. mtp_rounds: number of
+  // DecodeStepMtpGreedy calls. mtp_drafted: sum of args.mtp across those calls (tokens offered).
+  // mtp_accepted: sum of confirmed drafts (excludes the trailing correction/bonus token each round
+  // always contributes) -- mtp_accepted/mtp_drafted is the acceptance rate docs/mtp.md reports.
+  int64_t mtp_rounds = 0;
+  int64_t mtp_drafted = 0;
+  int64_t mtp_accepted = 0;
 };
 
 TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
@@ -66,6 +73,36 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
   std::vector<float> logits = model.Prefill(new_tokens);
   const auto t1 = Clock::now();
   result.prefill_seconds = Seconds(t0, t1);
+
+  // tools/profile pass (2026-09-19): --profile runs exactly one Model::DecodeStepProfiled call
+  // (hipEvent-timed per op-family, model.cpp) on the first generated token, prints the table to
+  // stderr, and returns WITHOUT running the normal generation loop below -- DecodeStepProfiled
+  // commits its token to the model's real KV/GDN state and advances pos_ exactly like a real
+  // DecodeStep (it needs to, to measure real kernel costs), so falling through into the ordinary
+  // sample-then-DecodeStep loop afterward would double-commit that same position from the stale
+  // pre-profile `logits` -- --profile is a standalone diagnostic invocation, not meant to be
+  // combined with getting correct generated text back (see docs/perf.md's profile table).
+  if (args.profile) {
+    const int32_t first = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+    const r4dx::model::Model::StepProfile prof = model.DecodeStepProfiled(first);
+    std::fprintf(stderr, "[profile] one decode step (T=1), layout=%s:\n", args.layout.c_str());
+    std::fprintf(stderr, "  %-55s %10s %8s %10s\n", "GPU op family (hipEvent, overlaps enqueue)",
+                 "ms", "calls", "% gpu_sum");
+    for (const auto& e : prof.entries) {
+      std::fprintf(stderr, "  %-55s %10.4f %8d %9.1f%%\n", e.name.c_str(), e.ms, e.count,
+                   100.0 * e.ms / prof.gpu_sum_ms);
+    }
+    std::fprintf(stderr, "  %-55s %10.4f\n", "(gpu_sum, NOT additive with wall/finish_wait)",
+                 prof.gpu_sum_ms);
+    std::fprintf(stderr, "\n  %-55s %10s %9s\n", "host-clock breakdown", "ms", "% of wall");
+    std::fprintf(stderr, "  %-55s %10.4f %9.1f%%\n", "host_enqueue (CPU work + async launch issue)",
+                 prof.host_enqueue_ms, 100.0 * prof.host_enqueue_ms / prof.wall_ms);
+    std::fprintf(stderr, "  %-55s %10.4f %9.1f%%\n",
+                 "finish_wait (sync GPU-blocked wait + 4B d2h readback)", prof.finish_wait_ms,
+                 100.0 * prof.finish_wait_ms / prof.wall_ms);
+    std::fprintf(stderr, "  %-55s %10.4f\n", "(wall = host_enqueue + finish_wait)", prof.wall_ms);
+    return result;
+  }
 
   r4dx::kernels::SampleParams sp;
   sp.temperature = args.temperature;
@@ -82,18 +119,88 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
     return false;
   };
 
+  // Greedy (--temperature 0, r4dx::kernels::Sample's own "temperature<=0 => Argmax" rule) skips
+  // the per-token vocab-sized logits D2H entirely: Model::DecodeStepGreedy argmaxes ON DEVICE and
+  // reads back a single int32 (host-overhead pass, 2026-09-19) instead of the ~1MB fp32 logits
+  // vector this loop would otherwise copy back every decode step just to re-scan it here on the
+  // CPU for the same answer. Only the non-greedy path (temperature>0, or any top-k/top-p/min-p
+  // sampling) needs the full distribution on the host.
+  const bool greedy = args.temperature <= 0.0f;
+
   const auto d0 = Clock::now();
-  for (int64_t step = 0; step < args.max_tokens; ++step) {
-    const int32_t next = r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()),
-                                                sp, rng);
-    if (is_eos(next)) { result.hit_eos = true; break; }
-    result.generated_tokens.push_back(next);
-    const std::string piece = decoder.push(next);
-    if (!piece.empty()) {
-      std::cout << piece << std::flush;
-      result.generated_text += piece;
+  if (greedy && args.mtp > 0) {
+    // MTP self-speculative decode (docs/mtp.md): each DecodeStepMtpGreedy call drafts up to
+    // args.mtp tokens and returns however many the real model actually confirmed (1..args.mtp+1,
+    // always at least the corrected/bonus token) -- emit them one at a time, exactly like the
+    // plain-greedy loop below, so stop-on-EOS and --max-tokens truncation behave identically
+    // regardless of how many tokens one round happened to produce.
+    //
+    // Model::DecodeStepMtpGreedy's `token_id` parameter is "the last ALREADY-ACCEPTED token" (same
+    // convention as DecodeStep/DecodeStepGreedy) -- it does not itself re-emit that token, only
+    // whatever comes after it. `next` below (Prefill's own argmax'd result) is the FIRST generated
+    // token and has not been emitted by anything yet (unlike every later round's seed, which was
+    // already pushed into result.generated_tokens by the round that produced it) -- push it here,
+    // exactly like the plain-greedy loop below does before its own first DecodeStepGreedy call, or
+    // the prompt's first generated token is silently dropped from the output (review finding: this
+    // is exactly what happened before this fix -- "Silicon" came out as "icon").
+    int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+    bool stopped = false;
+    if (is_eos(next)) {
+      result.hit_eos = true;
+      stopped = true;
+    } else {
+      result.generated_tokens.push_back(next);
+      const std::string piece0 = decoder.push(next);
+      if (!piece0.empty()) {
+        std::cout << piece0 << std::flush;
+        result.generated_text += piece0;
+      }
     }
-    logits = model.DecodeStep(next);
+    while (!stopped && static_cast<int64_t>(result.generated_tokens.size()) < args.max_tokens) {
+      const std::vector<int32_t> round = model.DecodeStepMtpGreedy(next, args.mtp);
+      result.mtp_rounds += 1;
+      result.mtp_drafted += args.mtp;
+      result.mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+      for (int32_t tok : round) {
+        if (is_eos(tok)) { result.hit_eos = true; stopped = true; break; }
+        if (static_cast<int64_t>(result.generated_tokens.size()) >= args.max_tokens) {
+          stopped = true;
+          break;
+        }
+        result.generated_tokens.push_back(tok);
+        const std::string piece = decoder.push(tok);
+        if (!piece.empty()) {
+          std::cout << piece << std::flush;
+          result.generated_text += piece;
+        }
+        next = tok;
+      }
+    }
+  } else if (greedy) {
+    int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+    for (int64_t step = 0; step < args.max_tokens; ++step) {
+      if (is_eos(next)) { result.hit_eos = true; break; }
+      result.generated_tokens.push_back(next);
+      const std::string piece = decoder.push(next);
+      if (!piece.empty()) {
+        std::cout << piece << std::flush;
+        result.generated_text += piece;
+      }
+      next = model.DecodeStepGreedy(next);
+    }
+  } else {
+    for (int64_t step = 0; step < args.max_tokens; ++step) {
+      const int32_t next = r4dx::kernels::Sample(
+          logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+      if (is_eos(next)) { result.hit_eos = true; break; }
+      result.generated_tokens.push_back(next);
+      const std::string piece = decoder.push(next);
+      if (!piece.empty()) {
+        std::cout << piece << std::flush;
+        result.generated_text += piece;
+      }
+      logits = model.DecodeStep(next);
+    }
   }
   const std::string tail = decoder.flush();
   if (!tail.empty()) { std::cout << tail << std::flush; result.generated_text += tail; }
@@ -123,6 +230,21 @@ int RunMain(int argc, char** argv) {
     return 2;
   }
   opts.max_ctx = args.max_ctx;
+  // --mtp K combined with --temperature > 0 previously did nothing useful: RunTurn's
+  // `greedy && args.mtp > 0` branch (below) is skipped whenever temperature>0, generation falls
+  // through to plain Model::DecodeStep, and no warning was printed -- while the Model was still
+  // loaded with mtp_draft_k=K, needlessly allocating MtpHead's own KV cache and widening every GDN
+  // layer's window bank (review finding, 2026-09-19; cli_args.h documents the restriction in a
+  // comment, but the runtime was silent about it). Warn and drop mtp_draft_k to 0 instead -- only
+  // greedy sampling is implemented for MTP (docs/mtp.md).
+  if (args.mtp > 0 && args.temperature > 0.0f) {
+    std::fprintf(stderr,
+                 "r4dx-cli: --mtp %lld has no effect with --temperature %.3g > 0 (MTP is "
+                 "greedy-only, docs/mtp.md) -- disabling MTP for this run\n",
+                 static_cast<long long>(args.mtp), static_cast<double>(args.temperature));
+    args.mtp = 0;
+  }
+  opts.mtp_draft_k = args.mtp;
 
   // allow_unimplemented_normalizer=true: Qwen3.8-27B's tokenizer.json declares normalizer.type=
   // NFC, which r4dx's tokenizer does not implement (tokenizer.h's file comment KNOWN GAP) --
@@ -195,6 +317,19 @@ int RunMain(int argc, char** argv) {
                    static_cast<long long>(r.prefill_tokens), r.prefill_seconds, pfx_tps,
                    static_cast<long long>(r.decode_tokens), r.decode_seconds, dec_tps,
                    r.hit_eos ? "yes" : "no (max-tokens)", VramUsedGiB());
+      if (args.mtp > 0) {
+        const double accept_rate =
+            r.mtp_drafted > 0 ? 100.0 * static_cast<double>(r.mtp_accepted) / static_cast<double>(r.mtp_drafted) : 0.0;
+        std::fprintf(stderr,
+                     "[stats] mtp: draft_k=%lld rounds=%lld drafted=%lld accepted=%lld "
+                     "(%.1f%% acceptance, %.2f tok/round avg)\n",
+                     static_cast<long long>(args.mtp), static_cast<long long>(r.mtp_rounds),
+                     static_cast<long long>(r.mtp_drafted), static_cast<long long>(r.mtp_accepted),
+                     accept_rate,
+                     r.mtp_rounds > 0
+                         ? static_cast<double>(r.decode_tokens) / static_cast<double>(r.mtp_rounds)
+                         : 0.0);
+      }
     }
   };
 

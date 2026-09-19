@@ -1,0 +1,4 @@
+Write a haiku about GPUs, then explain what a GPU is in two sentences.
+Write a short Python function that returns the nth Fibonacci number, then explain its time complexity in one sentence.
+Summarize the plot of Romeo and Juliet in three sentences.
+List the first five prime numbers and explain what makes a number prime.

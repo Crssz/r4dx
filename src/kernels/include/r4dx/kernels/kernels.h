@@ -114,4 +114,13 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                                   int64_t kv_block_stride, int64_t kv_head_stride,
                                   int64_t stream);
 
+// ---- device argmax (host-overhead pass, 2026-09-19) -------------------------------------------
+// out_idx[0] = argmax_i logits[i] (ties broken toward the lowest index, matching
+// r4dx::kernels::Argmax's CPU reference in sampler.hpp). One block only -- vocab (~250k floats,
+// ~1MB) comfortably fits one block's grid-stride loop, and this exists specifically so a
+// temperature==0 (greedy) decode caller can skip the vocab-sized logits D2H copy entirely and
+// read back a single int32 instead (Model::DecodeStepGreedy, model.cpp). logits: [vocab] fp32.
+// out_idx: device int32[1].
+void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream);
+
 }  // extern "C"

@@ -22,13 +22,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "quant_linear.h"
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/model/attention/attention_layer.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
@@ -41,6 +44,9 @@
 #endif
 
 using namespace r4dx::core;
+using r4dx::model::Layout;
+using r4dx::model::LayoutName;
+using r4dx::model::QuantLinear;
 using r4dx::model::attention::AttentionLayer;
 using r4dx::model::attention::AttnConfig;
 using r4dx::model::attention::AttnWeights;
@@ -162,9 +168,9 @@ std::vector<uint16_t> ExpectedResidualSum(const std::vector<uint16_t>& residual,
 void ReportQuantizedLayouts(const SafetensorsReader& container) {
   const char* bases[] = {"text.layers.3.attn.qg", "text.layers.3.attn.o"};
   const char* layouts[] = {"bf16.w", "mxfp4.wq", "w4a16.wq", "w4a8.wq"};
-  std::printf("quantized layouts present in %s (informational -- this test only exercises the "
-              "bf16 GEMM path; w4a16/w4a8/mxfp4 dispatch for this layer's linears is out of scope "
-              "for this pass, see linear.hpp's doc comment):\n",
+  std::printf("quantized layouts present in %s (informational; the quantized layouts below are "
+              "now actually dispatched through AttentionLayer/ApplyLinear and rel-err REPORTED, "
+              "not just gated bf16-tight -- see main()'s quantized pass):\n",
               R4DX_BF16_CONTAINER_PATH);
   for (const char* base : bases) {
     for (const char* layout : layouts) {
@@ -172,6 +178,133 @@ void ReportQuantizedLayouts(const SafetensorsReader& container) {
       std::printf("  %-32s %s\n", name.c_str(), container.Has(name) ? "present" : "MISSING");
     }
   }
+}
+
+// Small local mirror of container.cpp's (anonymous-namespace, not exported) LoadQuantLinear --
+// this test intentionally does not link all of r4dx_model (only r4dx_model_attention, which pulls
+// in r4dx_model_linear for QuantLinear/ApplyLinear -- see this directory's CMakeLists.txt comment),
+// so it cannot call Container::Load's private loader directly. Returns std::nullopt if any of this
+// layout's tensors are missing from `r` (e.g. a container that only carries bf16).
+std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const std::string& base,
+                                               Layout layout, int64_t N, int64_t K) {
+  auto upload_u8 = [&](const std::string& name) {
+    DeviceBuffer<uint8_t> d(static_cast<size_t>(r.Meta(name).ElemCount()));
+    d.CopyFromHost(reinterpret_cast<const uint8_t*>(r.Data(name)), d.size());
+    return d;
+  };
+  auto upload_i8 = [&](const std::string& name) {
+    DeviceBuffer<int8_t> d(static_cast<size_t>(r.Meta(name).ElemCount()));
+    d.CopyFromHost(reinterpret_cast<const int8_t*>(r.Data(name)), d.size());
+    return d;
+  };
+  auto upload_u32 = [&](const std::string& name) {
+    DeviceBuffer<uint32_t> d(static_cast<size_t>(r.Meta(name).ElemCount()));
+    d.CopyFromHost(reinterpret_cast<const uint32_t*>(r.Data(name)), d.size());
+    return d;
+  };
+
+  QuantLinear q;
+  q.layout = layout;
+  q.N = N;
+  q.K = K;
+  switch (layout) {
+    case Layout::kW4a16: {
+      const std::string wq = base + ".w4a16.wq", wsz = base + ".w4a16.wsz";
+      if (!r.Has(wq) || !r.Has(wsz)) return std::nullopt;
+      q.wq = upload_u8(wq);
+      q.w4a16_wsz = upload_u32(wsz);
+      break;
+    }
+    case Layout::kW4a8: {
+      const std::string wq = base + ".w4a8.wq", ws = base + ".w4a8.ws";
+      if (!r.Has(wq) || !r.Has(ws)) return std::nullopt;
+      q.wq = upload_u8(wq);
+      q.w4a8_ws = upload_u32(ws);
+      break;
+    }
+    case Layout::kMxfp4: {
+      const std::string wq = base + ".mxfp4.wq", ws = base + ".mxfp4.ws", wref = base + ".mxfp4.wref";
+      if (!r.Has(wq) || !r.Has(ws) || !r.Has(wref)) return std::nullopt;
+      q.mxfp4_wq = upload_u8(wq);
+      q.mxfp4_ws = upload_u8(ws);
+      q.mxfp4_wref = upload_i8(wref);
+      break;
+    }
+    case Layout::kBf16:
+      return std::nullopt;  // caller already has the bf16 path
+  }
+  return q;
+}
+
+// Runs AttentionLayer's prefill+decode pair (same golden activations as the bf16 pass above) with
+// qg/o loaded in `layout` instead, and gates PASS/FAIL against the same bf16-golden target at a
+// deliberately loose bound (see kQuantTol below) -- quantization error on qg/o alone, mixed with
+// everything else in the layer staying bf16-precision, is expected to land in the same
+// ~6.5e-2..8.5e-2 ballpark docs/perf.md already documents for GDN/MLP/lm_head's own quantized
+// linears (this component's own "bf16 layout tight; quantized layouts reported" scope, task
+// brief). Review finding, 2026-09-19: this function used to only PRINT the rel-err and return
+// void, so a regression in the w4a16/w4a8/mxfp4 dispatch through ApplyLinear would still print
+// PASS -- returns bool now, folded into main()'s own `ok`.
+bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfig& cfg,
+                              const AttnWeights& bf16_w, const std::vector<uint16_t>& prefill_hidden_h,
+                              const std::vector<uint16_t>& prefill_expected,
+                              const std::vector<uint16_t>& decode_hidden_h,
+                              const std::vector<uint16_t>& decode_expected, int T_prefill,
+                              int T_decode) {
+  // Deliberately loose but real bound -- roughly 2x the worst measured baseline (w4a16 prefill
+  // 7.1698e-02 / decode 6.5744e-02, w4a8 8.4888e-02 / 7.5489e-02, mxfp4 8.2541e-02 / 7.3365e-02, all
+  // measured on HIP device 1 against the real bf16 container during this pass) so today's numbers
+  // cannot silently drift without tripping this test, without being tight enough to false-positive
+  // on ordinary run-to-run quantization noise.
+  constexpr double kQuantTol = 1.5e-1;
+  bool ok = true;
+  const int hidden = cfg.hidden, H = cfg.num_heads, Hkv = cfg.kv_heads, D = cfg.head_dim;
+  const r4d::AttnDims dims = r4d::GetAttnDims();
+  for (Layout layout : {Layout::kW4a16, Layout::kW4a8, Layout::kMxfp4}) {
+    auto qg_ql = TryLoadQuantLinear(container, "text.layers.3.attn.qg", layout,
+                                     static_cast<int64_t>(2) * H * D, hidden);
+    auto o_ql = TryLoadQuantLinear(container, "text.layers.3.attn.o", layout, hidden,
+                                    static_cast<int64_t>(H) * D);
+    if (!qg_ql || !o_ql) {
+      std::printf("quantized layout %s: SKIPPED (tensors not present in %s)\n", LayoutName(layout),
+                  R4DX_BF16_CONTAINER_PATH);
+      continue;
+    }
+
+    AttnWeights w = bf16_w;
+    w.qg = &*qg_ql;
+    w.o = &*o_ql;
+
+    AttentionLayer layer(cfg);
+    PagedKvCache kv(Hkv, D, dims.block_size, /*max_context_tokens=*/128);
+    Arena arena(64ull << 20);
+
+    auto prefill_in_d = UploadBf16(prefill_hidden_h);
+    DeviceBuffer<uint16_t> prefill_out_d(static_cast<size_t>(T_prefill) * hidden);
+    auto prefill_pos_d = UploadPositions(0, T_prefill);
+    auto prefill_seqused_d = UploadSequsedK(0, T_prefill);
+    layer.Forward(arena, prefill_in_d.data(), prefill_out_d.data(), w, kv, T_prefill, 0,
+                  prefill_pos_d.data(), prefill_seqused_d.data(), nullptr);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    arena.Reset();
+
+    auto decode_in_d = UploadBf16(decode_hidden_h);
+    DeviceBuffer<uint16_t> decode_out_d(static_cast<size_t>(T_decode) * hidden);
+    auto decode_pos_d = UploadPositions(T_prefill, T_decode);
+    auto decode_seqused_d = UploadSequsedK(T_prefill, T_decode);
+    layer.Forward(arena, decode_in_d.data(), decode_out_d.data(), w, kv, T_decode, T_prefill,
+                  decode_pos_d.data(), decode_seqused_d.data(), nullptr);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    arena.Reset();
+
+    const double prefill_rel = NormRelErr(prefill_out_d.CopyToHost(), prefill_expected);
+    const double decode_rel = NormRelErr(decode_out_d.CopyToHost(), decode_expected);
+    const bool layout_ok = prefill_rel < kQuantTol && decode_rel < kQuantTol;
+    ok = ok && layout_ok;
+    std::printf("quantized layout %-6s: prefill norm rel err=%.4e, decode norm rel err=%.4e (%s)\n",
+                LayoutName(layout), prefill_rel, decode_rel, layout_ok ? "PASS" : "FAIL");
+  }
+  return ok;
 }
 
 }  // namespace
@@ -212,12 +345,24 @@ int main() {
   auto k_descale_d = UploadFp32(k_descale_h);
   auto v_descale_d = UploadFp32(v_descale_h);
 
+  QuantLinear qg_ql;
+  qg_ql.layout = Layout::kBf16;
+  qg_ql.N = static_cast<int64_t>(2) * H * D;
+  qg_ql.K = hidden;
+  qg_ql.bf16_w = std::move(qg_w_d);
+
+  QuantLinear o_ql;
+  o_ql.layout = Layout::kBf16;
+  o_ql.N = hidden;
+  o_ql.K = static_cast<int64_t>(H) * D;
+  o_ql.bf16_w = std::move(o_w_d);
+
   AttnWeights w{};
   w.input_layernorm = input_layernorm_d.data();
-  w.qg_w = qg_w_d.data();
+  w.qg = &qg_ql;
   w.k_w = k_w_d.data();
   w.v_w = v_w_d.data();
-  w.o_w = o_w_d.data();
+  w.o = &o_ql;
   w.q_norm = q_norm_d.data();
   w.k_norm = k_norm_d.data();
   w.k_descale = k_descale_d.data();
@@ -286,5 +431,14 @@ int main() {
   const double kTol = 2e-2;
   bool ok = prefill_rel < kTol && decode_rel < kTol;
   std::printf(ok ? "PASS\n" : "FAIL\n");
+
+  // Quantized qg/o layouts (decode-perf pass, 2026-09-19): now gated too (review finding,
+  // 2026-09-19) -- see RunQuantizedLayoutSmoke's own comment and this component's "bf16 layout
+  // tight; quantized layouts reported" scope.
+  const bool quant_ok = RunQuantizedLayoutSmoke(container, cfg, w, prefill_hidden_h,
+                                                 prefill_expected, decode_hidden_h, decode_expected,
+                                                 T_prefill, T_decode);
+  ok = ok && quant_ok;
+
   return ok ? 0 : 1;
 }

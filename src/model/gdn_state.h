@@ -25,13 +25,23 @@ class GdnStateManager {
   // H,V,K: r4d_gdn_dims() (48/128/128 -- value heads, head_v, head_k in this model).
   // conv_dim: 2*key_dim + value_dim (10240 in this model). conv_width: linear_conv_kernel_dim
   // (4). max_decode_window: the largest number of candidate tokens ApplyDecode will ever be asked
-  // to process in one call (a plain single-token decode needs 1; a speculative window needs
-  // however many draft tokens it verifies at once) -- the conv state's rolling buffer depth is
-  // conv_width-2 + max_decode_window (r4d_gdn_conv_w4_h128_bf16.hip's state_len_max: the kernel's
-  // decode-side rewrite loop is only self-consistent when `slen_eff == slen + width - 2`, i.e.
-  // `state_len_max == max_query_len + width - 2`, NOT width-1 -- verified against
-  // r4d_gdn_conv_update_kernel's slen_eff/VAL derivation, which needs a depth of exactly
-  // CP_ST==width-1 for a plain single-token decode (max_decode_window==1), not width).
+  // to process in one call (a plain single-token decode needs 1; an MTP speculative-verify window
+  // needs draft_k+1) -- the conv state's rolling buffer depth is conv_width-2 + max_decode_window
+  // (r4d_gdn_conv_w4_h128_bf16.hip's state_len_max: the kernel's decode-side rewrite loop is only
+  // self-consistent when `slen_eff == slen + width - 2`, i.e. `state_len_max == max_query_len +
+  // width - 2`, NOT width-1 -- verified against r4d_gdn_conv_update_kernel's slen_eff/VAL
+  // derivation, which needs a depth of exactly CP_ST==width-1 for a plain single-token decode
+  // (max_decode_window==1), not width). The recurrent state (MTP pass, 2026-09-19) additionally
+  // reserves `max_decode_window` PHYSICAL SLOTS per sequence rather than one: per
+  // r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip's kernel body, `sidx[t]` is the slot
+  // candidate token `t` of a call WRITES its post-token state snapshot into (never overwriting the
+  // slot a still-in-flight verification might need), and a later call's `num_accepted` device
+  // pointer (`naccept[n]`) selects which of THOSE slots (`sidx[naccept[n]-1]`) to seed the next
+  // call's initial state from -- see WindowSlot()/GdnControlCache::SidxBase() below for how this
+  // model threads that: `sidx` is always the SAME ascending {WindowSlot(seq,0)..
+  // WindowSlot(seq,max_decode_window-1)} array every call (indices beyond a short call's own T are
+  // simply never read/written that call), so a `num_accepted` carried from one call to the next
+  // indexes consistently across calls without any reallocation or renumbering.
   GdnStateManager(int64_t max_seqs, int64_t H, int64_t V, int64_t K, int64_t conv_dim,
                   int64_t conv_width, int64_t max_decode_window)
       : H_(H),
@@ -39,10 +49,16 @@ class GdnStateManager {
         K_(K),
         conv_dim_(conv_dim),
         state_len_max_(conv_width - 2 + max_decode_window),
-        recurrent_(static_cast<size_t>((max_seqs + 1) * H * V * K)),
+        max_decode_window_(max_decode_window < 1 ? 1 : max_decode_window),
+        recurrent_(static_cast<size_t>((max_seqs * max_decode_window_ + 1) * H * V * K)),
         conv_(static_cast<size_t>((max_seqs + 1) * conv_dim * state_len_max_)) {}
 
-  int32_t SlotForSeq(int32_t seq_id) const { return seq_id + 1; }  // seq_id is 0-based
+  // seq_id is 0-based. SlotForSeq is WindowSlot(seq_id, 0) -- the physical slot a plain
+  // (non-speculative, window index 0) decode step always reads and writes in place, unchanged from
+  // this class's pre-MTP behavior when max_decode_window==1.
+  int32_t SlotForSeq(int32_t seq_id) const { return 1 + seq_id * static_cast<int32_t>(max_decode_window_); }
+  int32_t WindowSlot(int32_t seq_id, int32_t window_idx) const { return SlotForSeq(seq_id) + window_idx; }
+  int64_t MaxDecodeWindow() const { return max_decode_window_; }
 
   int64_t RecurrentSlotStride() const { return H_ * V_ * K_; }
   int64_t RecurrentHeadStride() const { return V_ * K_; }
@@ -61,7 +77,7 @@ class GdnStateManager {
   }
 
  private:
-  int64_t H_, V_, K_, conv_dim_, state_len_max_;
+  int64_t H_, V_, K_, conv_dim_, state_len_max_, max_decode_window_;
   core::DeviceBuffer<float> recurrent_;
   core::DeviceBuffer<uint16_t> conv_;
 };
@@ -93,6 +109,30 @@ class GdnControlCache {
     return Get(sidx_, key,
                [T, slot] { return std::vector<int32_t>(static_cast<size_t>(T), slot); });
   }
+
+  // MTP verify pass (2026-09-19): the stable, ASCENDING {base_slot, base_slot+1, ...,
+  // base_slot+width-1} array recurrent_update's `sidx`/`indices_stride` and conv_update's
+  // `num_accepted`-driven seed read both need (see GdnStateManager's file comment) -- unlike
+  // Sidx() above (every entry the same physical slot, right for a plain non-speculative decode's
+  // T==1 call, wrong for a speculative window where each candidate token must land in its OWN
+  // slot). `width` must be >= the caller's GdnStateManager::MaxDecodeWindow() (the number of
+  // physical slots actually reserved for this base_slot's sequence -- gdn_layer.cpp always passes
+  // `states.MaxDecodeWindow()` here, deriving it from the SAME GdnStateManager instance the call's
+  // T is bounded by, rather than a separately-configured global that a caller could forget to set
+  // and silently under-size (review finding: an earlier version of this class stored its own
+  // Model-wide max_window_ set once via a since-removed SetMaxWindow(), which every NON-Model
+  // caller -- e.g. tests/model/test_gdn_layer.cpp's direct GdnLayer usage at T=4 -- had no reason
+  // to know it needed to call; the resulting 1-element array was read/written out of bounds at
+  // t=1..3, an illegal device memory access that manifested as a hang, not a clean crash). Cached
+  // by (base_slot, width).
+  const int32_t* SidxBase(int32_t base_slot, int64_t width) {
+    const int64_t key = (static_cast<int64_t>(base_slot) << 32) ^ width;
+    return Get(sidx_base_, key, [base_slot, width] {
+      std::vector<int32_t> v(static_cast<size_t>(width));
+      for (int64_t i = 0; i < width; ++i) v[static_cast<size_t>(i)] = base_slot + static_cast<int32_t>(i);
+      return v;
+    });
+  }
   const uint8_t* HasInitTrue() {
     if (has_init_true_.empty()) {
       has_init_true_ = core::DeviceBuffer<uint8_t>(1);
@@ -118,6 +158,7 @@ class GdnControlCache {
   std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> cu_;
   std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> cache_idx_;
   std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> sidx_;
+  std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> sidx_base_;
   core::DeviceBuffer<uint8_t> has_init_true_;
 };
 

@@ -229,6 +229,66 @@ __global__ void KvWritePagedFp8Kernel(const __hip_bfloat16* __restrict__ k_new,
   }
 }
 
+// ---- device argmax ------------------------------------------------------------------------
+// One block, grid-stride loop over `vocab` (kernels.h: ~1MB at this model's vocab, comfortably one
+// block's worth of work). Reduces (value, index) pairs together (not a separate max-then-search
+// pass) so ties resolve toward the lowest index the same way r4dx::kernels::Argmax (sampler.hpp,
+// CPU) does: a strict `>` comparison during the reduction only replaces the running best when a
+// later element is STRICTLY greater, so among equal values the earliest index seen (which, thanks
+// to the grid-stride loop and the deterministic warp-then-block shuffle-reduce order below, is
+// always the lowest index for a genuine tie) wins.
+// NOTE: indices are carried as int32_t throughout (not int64_t) -- this model's vocab (~250k) is
+// far under INT32_MAX, and __shfl_xor has no int64 overload, so int32 avoids a lossy cast at every
+// shuffle step.
+__global__ __launch_bounds__(kThreads) void ArgmaxKernel(const float* __restrict__ logits,
+                                                            int32_t* __restrict__ out_idx,
+                                                            int64_t vocab) {
+  float best_v = -INFINITY;
+  int32_t best_i = 0;
+  for (int64_t i = threadIdx.x; i < vocab; i += kThreads) {
+    const float v = logits[i];
+    if (v > best_v) {
+      best_v = v;
+      best_i = static_cast<int32_t>(i);
+    }
+  }
+
+  __shared__ float red_v[kThreads / 32];
+  __shared__ int32_t red_i[kThreads / 32];
+  for (int o = 16; o; o >>= 1) {
+    const float ov = __shfl_xor(best_v, o, 32);
+    const int32_t oi = __shfl_xor(best_i, o, 32);
+    if (ov > best_v || (ov == best_v && oi < best_i)) {
+      best_v = ov;
+      best_i = oi;
+    }
+  }
+  if ((threadIdx.x & 31) == 0) {
+    red_v[threadIdx.x >> 5] = best_v;
+    red_i[threadIdx.x >> 5] = best_i;
+  }
+  __syncthreads();
+
+  if (threadIdx.x < (blockDim.x + 31) / 32) {
+    best_v = red_v[threadIdx.x];
+    best_i = red_i[threadIdx.x];
+  } else {
+    best_v = -INFINITY;
+    best_i = 0;
+  }
+  if (threadIdx.x < 32) {
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor(best_v, o, 32);
+      const int32_t oi = __shfl_xor(best_i, o, 32);
+      if (ov > best_v || (ov == best_v && oi < best_i)) {
+        best_v = ov;
+        best_i = oi;
+      }
+    }
+  }
+  if (threadIdx.x == 0) out_idx[0] = best_i;
+}
+
 }  // namespace
 
 extern "C" {
@@ -303,6 +363,13 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                      (const __hip_bfloat16*)v_new, (const int32_t*)slot_mapping,
                      (const float*)k_descale, (const float*)v_descale, (uint8_t*)kv_cache,
                      kv_heads, head_dim, block_size, kv_block_stride, kv_head_stride);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
+  if (vocab <= 0) return;
+  hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
+                     (const float*)logits, (int32_t*)out_idx, vocab);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

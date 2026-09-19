@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "kernels/model_kernels.h"
 #include "r4d.h"
@@ -14,22 +15,20 @@ namespace {
 
 constexpr int64_t kMaxChunkM = 64;
 
-}  // namespace
-
-// Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16: group 16,
-// w4a16/w4a8: group 128, mxfp4: group 32) and N divisible by 16. This model's only K values are
-// hidden_size=5120, intermediate_size=17408, and value_dim=6144 (attn.o's K = num_heads*head_dim =
-// 6144 too) -- all three are multiples of 512 (5120/512=10, 17408/512=34, 6144/512=12), which is
-// the tightest of the three group requirements (SK=4 * group=128), so SK=4 clears every layout at
-// once. WV=4/SK=4 keeps the block at 512 threads (WV*SK*32, under the 1024 cap every kernel
-// enforces) and the LDS reduction buffer at 16 KiB (under the 64 KiB cap); MB=1 and NPW=1 are the
-// simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16 / {1,2,4,8} for
-// w4a8/mxfp4) and NT=1 takes the non-temporal weight-load path r4d_gemm_w4a16_nt_m64.hip's own
-// comment recommends for a weight that is read once per step and never reused. A real
-// (N,K,M-band)-keyed table that picks a faster WV/NPW per shape is future perf work (Known gaps);
-// this is the "sane defaults" the task explicitly allows, and it is correctness-neutral -- WV/SK/
-// MB/NPW/NT only choose how the same sum is tiled, never what it computes.
-LinearTuning PickTuning(Layout /*layout*/, int64_t N, int64_t K) {
+// Hand-derived fallback, legal for every (layout,N,K) shape this model has (used only when
+// gemm_tuning_table.inc has no row for the requested shape -- see PickTuning below and linear.h's
+// comment). Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16:
+// group 16, w4a16/w4a8: group 128, mxfp4: group 32) and N divisible by 16. This model's only K
+// values are hidden_size=5120, intermediate_size=17408, and value_dim=6144 (attn.o's K =
+// num_heads*head_dim = 6144 too) -- all three are multiples of 512 (5120/512=10, 17408/512=34,
+// 6144/512=12), which is the tightest of the three group requirements (SK=4 * group=128), so SK=4
+// clears every layout at once. WV=4/SK=4 keeps the block at 512 threads (WV*SK*32, under the 1024
+// cap every kernel enforces) and the LDS reduction buffer at 16 KiB (under the 64 KiB cap); MB=1
+// and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16 /
+// {1,2,4,8} for w4a8/mxfp4) and NT=1 takes the non-temporal weight-load path
+// r4d_gemm_w4a16_nt_m64.hip's own comment recommends for a weight that is read once per step and
+// never reused.
+LinearTuning FallbackTuning(Layout /*layout*/, int64_t N, int64_t K) {
   if (K % 512 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
                               " is not a multiple of 512 (SK=4 * w4a16/w4a8 group 128) -- this "
@@ -42,12 +41,51 @@ LinearTuning PickTuning(Layout /*layout*/, int64_t N, int64_t K) {
   return LinearTuning{/*WV=*/4, /*SK=*/4, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
 }
 
-void ApplyLinear(core::Stream& stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
+// tools/profile/tune_gemm.py's measured sweep, if it has been generated (src/model/CMakeLists.txt
+// treats a missing file as a build error -- see that file's comment -- so an empty table checked
+// into the tree, `{}`, is what a fresh checkout without having run the sweep gets; PickTuning below
+// falls back to FallbackTuning() row-by-row in that case, not a hard failure).
+#include "gemm_tuning_table.inc"
+
+}  // namespace
+
+// Internal linkage (not declared in linear.h) -- the actual table scan, now called only on a
+// PickTuning cache miss (see below).
+static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
+  const GemmTuningRow* best = nullptr;
+  for (const GemmTuningRow& row : kGemmTuningTable) {
+    if (row.layout != layout || row.N != N || row.K != K) continue;
+    if (row.M < M) continue;  // only ever round UP to a wider-or-equal measured M-band
+    if (best == nullptr || row.M < best->M) best = &row;
+  }
+  if (best != nullptr) return best->tuning;
+  return FallbackTuning(layout, N, K);
+}
+
+LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
+  // Cache the resolved LinearTuning per (layout,N,K,M) (review finding, 2026-09-19): PickTuning is
+  // called once per <=64-row sub-chunk of every GEMM -- roughly 6 GEMMs x 64 layers per decode
+  // token -- and a linear scan of kGemmTuningTable's ~196 rows on every one of those calls is
+  // ~75k row comparisons of pure host work per token on the exact hot path the host-overhead pass
+  // (2026-09-19) was trying to minimize. Model is single-sequence / single-worker-thread
+  // (model.h's own SCOPE comment; src/server also serializes all requests through one worker
+  // thread onto one Model), so a plain function-local static map needs no locking. N/K fit in 20
+  // bits (this model's widest is intermediate_size=17408 < 2^20), M in 8 bits (<=64), layout in 4
+  // bits -- packed key never collides for any shape this model has.
+  static std::unordered_map<int64_t, LinearTuning> cache;
+  const int64_t key = (static_cast<int64_t>(layout) << 48) | (N << 28) | (K << 8) | M;
+  auto it = cache.find(key);
+  if (it != cache.end()) return it->second;
+  const LinearTuning t = ResolveTuning(layout, N, K, M);
+  cache.emplace(key, t);
+  return t;
+}
+
+void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
                   uint16_t* y, int64_t M) {
   if (w.N <= 0 || w.K <= 0) throw std::runtime_error("r4dx::model::ApplyLinear: empty weight");
   const int64_t N = w.N, K = w.K;
-  const LinearTuning t = PickTuning(w.layout, N, K);
-  const hipStream_t s = stream.get();
+  const hipStream_t s = stream;
 
   // Per-chunk activation-quant scratch, sized for the largest chunk (<=64 rows) and reused across
   // every chunk this call makes -- one arena bump, not one per chunk.
@@ -76,6 +114,11 @@ void ApplyLinear(core::Stream& stream, core::Arena& arena, const QuantLinear& w,
     const int m = static_cast<int>(std::min(kMaxChunkM, M - m0));
     const uint16_t* xc = x + m0 * K;
     uint16_t* yc = y + m0 * N;
+    // Picked per sub-chunk (not once for the whole call): a decode call (M=1) and a prefill call
+    // (M up to 64, chunked here into <=64-row slices) want different WV/SK/MB/NPW even for the
+    // same (layout,N,K) -- PickTuning's table is keyed by the exact per-launch row count `m`, not
+    // the caller's total `M` (see linear.h's PickTuning comment on M-band rounding).
+    const LinearTuning t = PickTuning(w.layout, N, K, m);
 
     switch (w.layout) {
       case Layout::kBf16:

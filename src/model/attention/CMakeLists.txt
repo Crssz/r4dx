@@ -61,4 +61,8 @@ set_source_files_properties("${R4DX_MODEL_ATTN_OBJ}" PROPERTIES EXTERNAL_OBJECT 
 add_library(r4dx_model_attention STATIC "${R4DX_MODEL_ATTN_OBJ}")
 set_target_properties(r4dx_model_attention PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(r4dx_model_attention PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(r4dx_model_attention PUBLIC r4dx_core r4dx_kernels r4d_core)
+# r4dx_model_linear (../CMakeLists.txt, defined before this add_subdirectory() runs): gives
+# AttentionLayer the QuantLinear type + ApplyLinear for its qg/o linears (decode-perf pass,
+# 2026-09-19), and its PUBLIC include dir (src/model itself) so `#include "quant_linear.h"` and
+# `#include "linear.h"` resolve here without depending on the rest of r4dx_model (would cycle).
+target_link_libraries(r4dx_model_attention PUBLIC r4dx_core r4dx_kernels r4d_core r4dx_model_linear)

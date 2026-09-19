@@ -18,43 +18,15 @@
 #include <vector>
 
 #include "model_config.h"
+#include "quant_linear.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 
 namespace r4dx::model {
 
-enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8 };
-
-const char* LayoutName(Layout l);
-Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
-
-// One linear weight W[N,K], uploaded in exactly one of the four on-disk layouts
-// (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
-// thing that reads the layout-specific buffers below; Container's job stops at "the right bytes
-// are on the device in the container's documented byte order".
-struct QuantLinear {
-  Layout layout = Layout::kBf16;
-  int64_t N = 0, K = 0;  // W is [N, K]: N output features, K input features
-
-  // layout == kBf16: W itself, row-major [N, K], bf16.
-  core::DeviceBuffer<uint16_t> bf16_w;
-
-  // layout == kW4a16 or kW4a8: nibble-packed, WMMA-fragment-permuted weight, uint8[N*K/2].
-  // Byte-identical between the two layouts is NOT assumed here (src/convert's quant_int4.hpp
-  // quantizes w4a16 and w4a8 separately -- see its file comment) -- each QuantLinear holds only
-  // the one layout it was loaded as.
-  core::DeviceBuffer<uint8_t> wq;
-  // layout == kW4a16: uint32[N*K/128], low16 = f16 scale, high16 = f16(-(1024+zero)).
-  core::DeviceBuffer<uint32_t> w4a16_wsz;
-  // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused).
-  core::DeviceBuffer<uint32_t> w4a8_ws;
-
-  // layout == kMxfp4: OCP MXFP4 weight.
-  core::DeviceBuffer<uint8_t> mxfp4_wq;    // uint8[N*K/2], fragment-permuted e2m1 pairs
-  core::DeviceBuffer<uint8_t> mxfp4_ws;    // uint8[(K/32)*N], E8M0 exponent per (group, row)
-  core::DeviceBuffer<int8_t> mxfp4_wref;   // int8[N], per-row reference exponent
-};
+// Layout and QuantLinear live in quant_linear.h (shared with r4dx_model_attention -- see that
+// file's comment for why).
 
 // One decoder layer's weights (docs/container-format.md "Tensor naming"). Exactly one of
 // {attn, gdn} is populated, selected by ModelConfig::IsGdnLayer(layer_idx).
@@ -94,6 +66,24 @@ struct LayerWeights {
   MlpWeights mlp;
 };
 
+// MTP self-speculation head (docs/mtp.md, docs/container-format.md "mtp.*"): `layer` is the exact
+// tensor set of one text full-attention decoder layer (src/convert/main.cpp's converter comment:
+// "mtp.layers.0 is a COMPLETE full-attention decoder layer", verified against the real
+// checkpoint's shard header -- NOT a GDN layer, so `layer.gdn` is always empty here and `layer.attn`
+// always populated), plus the four tensors with no per-text-layer analogue: the hidden/embedding
+// pre-norms and the fc projection that combines them (modeling_qwen3_5.py's Qwen3_5MTPLayer,
+// cross-checked against the converter's own tensor-shape comment), and mtp's own final norm before
+// the SHARED (main-model) lm_head. `fc` is a plain bf16 linear (container-format.md lists it with
+// no `.{layout}` suffix, bf16-only) -- [hidden, 2*hidden], row-major, matching every other raw bf16
+// linear this codebase calls via core::r4d::GemmBf16NtM64 (gdn_layer.cpp's in_proj_a/b/z).
+struct MtpWeights {
+  LayerWeights layer;
+  core::DeviceBuffer<uint16_t> fc;                     // bf16 [hidden, 2*hidden]
+  core::DeviceBuffer<uint16_t> norm;                   // bf16 [hidden]
+  core::DeviceBuffer<uint16_t> pre_fc_norm_hidden;     // bf16 [hidden]
+  core::DeviceBuffer<uint16_t> pre_fc_norm_embedding;  // bf16 [hidden]
+};
+
 class Container {
  public:
   // Loads `path` onto the current HIP device (caller must have already selected device 1 per the
@@ -117,6 +107,13 @@ class Container {
   const core::DeviceBuffer<uint16_t>& FinalNorm() const { return final_norm_; }
   const QuantLinear& LmHead() const { return lm_head_; }
 
+  // True iff `path` was converted with --mtp on (docs/container-format.md "mtp.*") -- checked once
+  // at Load() time via SafetensorsReader::Has, not inferred from `__metadata__.r4dx_convert_run.mtp`
+  // (a JSON round-trip the loader would otherwise need just to answer this), so it stays correct
+  // even against a hand-built or metadata-stripped test container.
+  bool HasMtp() const { return mtp_.has_value(); }
+  const MtpWeights& Mtp() const { return mtp_.value(); }
+
  private:
   Container() = default;
   // Model (model.h/model.cpp) default-constructs a Model whose Container member is filled in by
@@ -130,6 +127,7 @@ class Container {
   std::vector<LayerWeights> layers_;
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;
+  std::optional<MtpWeights> mtp_;
 };
 
 }  // namespace r4dx::model

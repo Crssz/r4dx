@@ -27,6 +27,19 @@ struct CliArgs {
   uint64_t seed = 0;
   int64_t max_ctx = 131072;
   bool stats = false;
+  // tools/profile pass (2026-09-19): profiles exactly ONE decode step (Model::DecodeStepProfiled,
+  // hipEvent-timed per op-family) right after the prompt's prefill, prints a table to stderr, then
+  // continues generation as normal -- see main.cpp's RunTurn and docs/perf.md's profile table.
+  bool profile = false;
+  // MTP self-speculative decode (docs/mtp.md): draft this many tokens per step via the container's
+  // mtp.* head, verify them against the real model in one batched call. Defaults to 0 (disabled --
+  // r4dx::model::Model::DecodeStepGreedy/DecodeStep, byte-for-byte unchanged from pre-MTP
+  // behavior): most containers on disk (including every one Milestone 1/the perf pass produced)
+  // have no mtp.* weights, so a nonzero default would break --model pointed at any of them; the
+  // task's own "K default 3" is the recommended value to pass explicitly once a --model container
+  // was converted with --mtp on, not this flag's own default. Only used by --temperature 0
+  // (greedy) generation -- see main.cpp's RunTurn.
+  int64_t mtp = 0;
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -42,7 +55,7 @@ inline std::string CliUsageText(const char* argv0) {
          " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16} "
          "(--prompt \"...\" | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
-         "[--min-p F] [--seed N] [--max-ctx N] [--stats]";
+         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--mtp N]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -101,6 +114,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--seed") a.seed = ParseU64("--seed", NextCliArg(argc, argv, i, "--seed"));
     else if (arg == "--max-ctx") a.max_ctx = ParseI64("--max-ctx", NextCliArg(argc, argv, i, "--max-ctx"));
     else if (arg == "--stats") a.stats = true;
+    else if (arg == "--profile") a.profile = true;
+    else if (arg == "--mtp") a.mtp = ParseI64("--mtp", NextCliArg(argc, argv, i, "--mtp"));
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -114,6 +129,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
+  if (a.mtp < 0) throw CliUsageError("--mtp must be >= 0");
   return a;
 }
 

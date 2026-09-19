@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "quant_linear.h"
+
 namespace r4dx::model::attention {
 
 // Geometry for Qwen3_5ForConditionalGeneration's full-attention layers (docs/architecture.md,
@@ -35,17 +37,23 @@ struct AttnConfig {
 // supports num_seqs==1, where the two coincide (r4dx::core::r4d::AttnDecodeFp8Kv's doc comment in
 // r4d.hpp).
 //
-// docs/container-format.md tensor names this maps to (bf16 layout): input_layernorm ->
-// text.layers.{i}.input_layernorm; qg_w -> text.layers.{i}.attn.qg.bf16.w (fused q_proj + output
+// qg/o (decode-perf pass, 2026-09-19): non-owning pointers at the caller's (Container-loaded)
+// r4dx::model::QuantLinear -- whichever on-disk layout was requested at load time (bf16/mxfp4/
+// w4a16/w4a8), dispatched through the shared r4dx::model::ApplyLinear (src/model/linear.h) the
+// same way GDN's in_proj_qkv/out_proj and MLP's gate_up/down already do. k_w/v_w stay raw bf16
+// pointers: docs/container-format.md's attn.k/v tensors have no quantized on-disk form.
+//
+// docs/container-format.md tensor names this maps to: input_layernorm ->
+// text.layers.{i}.input_layernorm; qg -> text.layers.{i}.attn.qg.{layout} (fused q_proj + output
 // gate, per-head-interleaved rows); k_w/v_w -> text.layers.{i}.attn.{k,v} (bf16-only, no
-// .{layout} suffix); o_w -> text.layers.{i}.attn.o.bf16.w; q_norm/k_norm ->
+// .{layout} suffix); o -> text.layers.{i}.attn.o.{layout}; q_norm/k_norm ->
 // text.layers.{i}.attn.{q,k}_norm; k_descale/v_descale -> text.layers.{i}.attn.{k,v}_descale.
 struct AttnWeights {
   const uint16_t* input_layernorm = nullptr;  // [hidden] bf16
-  const uint16_t* qg_w = nullptr;             // [2*num_heads*head_dim, hidden] bf16
+  const QuantLinear* qg = nullptr;            // [2*num_heads*head_dim, hidden], any layout
   const uint16_t* k_w = nullptr;              // [kv_heads*head_dim, hidden] bf16
   const uint16_t* v_w = nullptr;              // [kv_heads*head_dim, hidden] bf16
-  const uint16_t* o_w = nullptr;              // [hidden, num_heads*head_dim] bf16
+  const QuantLinear* o = nullptr;             // [hidden, num_heads*head_dim], any layout
   const uint16_t* q_norm = nullptr;           // [head_dim] bf16
   const uint16_t* k_norm = nullptr;           // [head_dim] bf16
   const float* k_descale = nullptr;           // [kv_heads] fp32

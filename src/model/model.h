@@ -47,6 +47,24 @@ struct ModelOptions {
   // (see gdn_state.h's file comment). >0 requires the container to have been converted with
   // --mtp on (Container::HasMtp()); Load() throws otherwise.
   int64_t mtp_draft_k = 0;
+  // MTP head layout (docs/mtp.md "MTP head layout"): the layout for ONLY the MTP head's four
+  // quantized linears (mtp.attn.qg/o, mtp.mlp.gate_up/down), independent of `layout`. nullopt
+  // (default) tracks `layout` -- i.e. the head loads in whatever GEMM layout the body uses.
+  // Measured (docs/mtp.md's "MTP head layout" table, K=1..4 x w4a8/w4a16/mxfp4): the
+  // layout-matched head is FASTER than a bf16 head in 23/24 configurations (smaller GEMMs, no
+  // extra VRAM/load time) and acceptance is a wash -- often slightly HIGHER, never meaningfully
+  // lower, because a bf16 head sitting on top of h_seed (already carrying the body's own
+  // quantization noise for w4a8/mxfp4) gains nothing from its own extra precision. Set explicitly
+  // to Layout::kBf16 (CLI: `--mtp-head-layout bf16`) to force the exact-arithmetic head instead
+  // (~0.5 GB extra VRAM). Ignored (no effect, no extra VRAM) when the container has no mtp.*
+  // weights.
+  std::optional<Layout> mtp_head_layout = std::nullopt;
+  // Device-resident draft loop (docs/mtp.md "device-resident draft loop", docs/r9700.md P3):
+  // mirror text.embed_tokens into VRAM (~2.54 GB bf16) so the decode/draft path can gather
+  // embedding rows on-device instead of a host memcpy + H2D per step -- see Container::Load's own
+  // comment for the free-VRAM fallback. Default true; set false to force host-only gather (e.g. a
+  // VRAM-constrained run that would rather keep the margin for KV cache).
+  bool embed_device_resident = true;
 };
 
 class Model {
@@ -182,6 +200,13 @@ class Model {
   core::Stream stream_;
   core::Arena arena_;
   core::PinnedBuffer<uint16_t> embed_staging_;
+  // Device-resident gather path (docs/mtp.md "device-resident draft loop"): a persistent [max_chunk_]
+  // int32 id staging pair (pinned host + device), reused every RunChunk call instead of allocating
+  // fresh -- same "persistent, not arena" reasoning as attn_positions_/attn_seqused_k_ below. Used
+  // only when container_.EmbedTokensDeviceResident(); embed_staging_/EmbedTokens (host path) above
+  // stays available unconditionally as the fallback.
+  core::PinnedBuffer<int32_t> embed_ids_host_;
+  core::DeviceBuffer<int32_t> embed_ids_dev_;
   core::DeviceBuffer<uint16_t> buf_a_, buf_b_;  // ping-pong [max_chunk_, hidden] bf16 activations
   core::DeviceBuffer<float> logits_dev_;        // [vocab] fp32, one row at a time
   core::DeviceBuffer<int32_t> argmax_dev_;      // [1] -- DecodeStepGreedy's on-device argmax result

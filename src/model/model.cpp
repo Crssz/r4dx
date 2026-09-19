@@ -75,7 +75,9 @@ class SpanAccumulator {
 
 Model Model::Load(const ModelOptions& opts) {
   Model m;
-  m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit);
+  m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
+                                  opts.mtp_head_layout.value_or(opts.layout),
+                                  opts.embed_device_resident);
   const ModelConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = m.container_.NumLoadedLayers();
@@ -94,6 +96,8 @@ Model Model::Load(const ModelOptions& opts) {
 
   m.max_chunk_ = 64;
   m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  m.embed_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
+  m.embed_ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
   m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
@@ -148,8 +152,21 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const int64_t num_layers = container_.NumLoadedLayers();
   const bool has_init = started_;
 
-  EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, token_ids,
-              embed_staging_, buf_a_);
+  // Device-resident draft loop (docs/mtp.md "device-resident draft loop"): when the container's
+  // text.embed_tokens has a VRAM mirror (Container::EmbedTokensDeviceResident()), gather straight
+  // from it via a device kernel instead of a host memcpy + async H2D of the whole [T,hidden]
+  // staging buffer -- only a small [T] int32 id array needs to cross the H2D boundary. Falls back
+  // to the original host-gather path when the container was loaded with embed_device_resident=
+  // false or the free-VRAM heuristic decided the mirror would not fit (Container::Load's comment).
+  if (container_.EmbedTokensDeviceResident()) {
+    std::copy(token_ids.begin(), token_ids.end(), embed_ids_host_.begin());
+    embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
+    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
+                             T, buf_a_.data());
+  } else {
+    EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, token_ids,
+                embed_staging_, buf_a_);
+  }
 
   // Full-attention layers' positions/slot_mapping (== pos_+t, see model.h) and seqused_k (==
   // pos_+T) are identical for every attention layer in this chunk -- upload them once here rather
@@ -487,8 +504,17 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   const int64_t num_layers = container_.NumLoadedLayers();
   const bool has_init = started_;  // always true: VerifyWindow only ever runs after a Prefill
 
-  EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, candidates,
-              embed_staging_, buf_a_);
+  // Same device-resident gather as RunChunk (model.cpp's own comment above) -- VerifyWindow is the
+  // other hot-path caller (once per MTP round, docs/mtp.md).
+  if (container_.EmbedTokensDeviceResident()) {
+    std::copy(candidates.begin(), candidates.end(), embed_ids_host_.begin());
+    embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
+    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
+                             T, buf_a_.data());
+  } else {
+    EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, candidates,
+                embed_staging_, buf_a_);
+  }
 
   // Same reasoning/hazard as RunChunk's own upload (model.cpp's RunChunk comment): safe here
   // because the previous call (Prefill/DecodeStep*/VerifyWindow) always ends with
@@ -602,7 +628,10 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
     // exactly the ONE position PrimeKv would otherwise prime from (mtp_seed_hidden_, token_id) if
     // this call drafted nothing at all (see mtp_head.h's PrimeKv comment and model.cpp's RunChunk).
     drafts = mtp_->Draft(stream_, arena_, cfg, container_.Mtp(), mtp_seed_hidden_.data(), token_id,
-                          container_.EmbedTokensHost(), cfg.vocab_size, container_.LmHead(), k,
+                          container_.EmbedTokensHost(),
+                          container_.EmbedTokensDeviceResident() ? container_.EmbedTokensDevice()
+                                                                  : nullptr,
+                          cfg.vocab_size, container_.LmHead(), k,
                           /*base_pos=*/pos_ - 1);
     arena_.Reset();
   } else if (mtp_seed_valid_) {

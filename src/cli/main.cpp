@@ -245,6 +245,10 @@ int RunMain(int argc, char** argv) {
     args.mtp = 0;
   }
   opts.mtp_draft_k = args.mtp;
+  // nullopt (== "layout") tracks opts.layout -- measured default, docs/mtp.md "MTP head layout".
+  opts.mtp_head_layout = (args.mtp_head_layout == "bf16")
+                              ? std::make_optional(r4dx::model::Layout::kBf16)
+                              : std::nullopt;
 
   // allow_unimplemented_normalizer=true: Qwen3.8-27B's tokenizer.json declares normalizer.type=
   // NFC, which r4dx's tokenizer does not implement (tokenizer.h's file comment KNOWN GAP) --

@@ -8,6 +8,7 @@
 
 #include "nlohmann/json.hpp"
 #include "r4dx/core/dtype.hpp"
+#include "r4dx/core/error.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"  // SafetensorsReader, Utf8ToWide -- see file comment
 
 namespace r4dx::model {
@@ -128,7 +129,8 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const std::string& base,
 }  // namespace
 
 Container Container::Load(const std::string& path, Layout layout, Layout lm_head_layout,
-                           int64_t layer_limit) {
+                           int64_t layer_limit, Layout mtp_head_layout,
+                           bool embed_device_resident) {
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
   c.model_id_ = metadata.value("model_id", std::string());
@@ -151,6 +153,26 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     c.embed_tokens_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(n));
     std::memcpy(c.embed_tokens_.data(), reader.Data("text.embed_tokens"),
                 static_cast<size_t>(n) * 2);
+
+    // Device mirror (docs/mtp.md "device-resident draft loop") -- see Load()'s own comment for the
+    // free-VRAM heuristic and why this is a best-effort ADDITION, never a replacement for the host
+    // copy above.
+    if (embed_device_resident) {
+      size_t free_bytes = 0, total_bytes = 0;
+      R4DX_HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+      const size_t embed_bytes = static_cast<size_t>(n) * sizeof(uint16_t);
+      if (free_bytes > embed_bytes * 2) {
+        c.embed_tokens_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(n));
+        c.embed_tokens_dev_.CopyFromHost(c.embed_tokens_.data(), static_cast<size_t>(n));
+      } else {
+        std::fprintf(stderr,
+                      "r4dx: only %.2f GiB free VRAM (need ~%.2f GiB for text.embed_tokens plus "
+                      "headroom for the rest of the container) -- keeping embeddings host-only, "
+                      "gather will go through the host path\n",
+                      static_cast<double>(free_bytes) / (1024.0 * 1024 * 1024),
+                      static_cast<double>(embed_bytes) / (1024.0 * 1024 * 1024));
+      }
+    }
   }
 
   const int64_t hidden = c.config_.hidden_size;
@@ -219,19 +241,25 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     LayerWeights lw;
     lw.input_layernorm = UploadRawU16(reader, base + "input_layernorm");
     lw.post_attention_layernorm = UploadRawU16(reader, base + "post_attention_layernorm");
+    // mtp.attn.qg/o and mtp.mlp.gate_up/down load in `mtp_head_layout`, NOT the body `layout` --
+    // the draft head is a single decoder layer chained up to draft_k times, so its quantization
+    // error compounds across chained drafts far more than one body-layer's own error does (task
+    // rationale, docs/mtp.md "MTP head layout"). Every other mtp.* tensor (attn.k/v/q_norm/k_norm/
+    // descales, fc, norm, pre_fc_norm_*) has only one on-disk form regardless of layout, same as
+    // the body layers above.
     AttnWeights a;
-    a.qg = LoadQuantLinear(reader, base + "attn.qg", layout, attn_out * 2, hidden);
+    a.qg = LoadQuantLinear(reader, base + "attn.qg", mtp_head_layout, attn_out * 2, hidden);
     a.k = UploadRawU16(reader, base + "attn.k");
     a.v = UploadRawU16(reader, base + "attn.v");
-    a.o = LoadQuantLinear(reader, base + "attn.o", layout, hidden, attn_out);
+    a.o = LoadQuantLinear(reader, base + "attn.o", mtp_head_layout, hidden, attn_out);
     a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
     a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
     a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
     a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
     lw.attn = std::move(a);
-    lw.mlp.gate_up = LoadQuantLinear(reader, base + "mlp.gate_up", layout,
+    lw.mlp.gate_up = LoadQuantLinear(reader, base + "mlp.gate_up", mtp_head_layout,
                                       2 * c.config_.intermediate_size, hidden);
-    lw.mlp.down = LoadQuantLinear(reader, base + "mlp.down", layout, hidden,
+    lw.mlp.down = LoadQuantLinear(reader, base + "mlp.down", mtp_head_layout, hidden,
                                    c.config_.intermediate_size);
     mw.layer = std::move(lw);
     mw.fc = UploadRawU16(reader, "mtp.fc");

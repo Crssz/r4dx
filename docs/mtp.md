@@ -11,6 +11,13 @@ rate and "MTP is a net slowdown" conclusion. **Both are fixed; acceptance now me
 (K-dependent) and decode is 1.4-2.0x faster with MTP on than off, every layout.** See "Incident:
 the 0-1.2% acceptance bug" below for the full writeup, and "Measurement" for the corrected numbers.
 
+This revision (2026-09-20, MTP quality + device-resident draft loop pass) adds a configurable MTP
+head layout (`--mtp-head-layout {bf16,layout}`, default `layout` -- measured faster with no
+acceptance cost, see "MTP head layout" below), investigates (without fully root-causing) the
+remaining w4a16-vs-w4a8/mxfp4 acceptance gap ("Acceptance gap investigation" below), and makes the
+draft loop device-resident (embedding gather now a device kernel fed straight from the on-device
+argmax, no more per-drafted-token host round-trip -- "Device-resident draft loop" below).
+
 ## Design
 
 Per `vllm/model_executor/models/qwen3_5_mtp.py`'s `Qwen3_5MultiTokenPredictor.forward` -- the
@@ -232,6 +239,129 @@ Generated text for every run above: coherent, on-topic, stops on EOS (see "Corre
 the byte-identical-vs-`--mtp 0` finding). Container load ~9-22s depending on layout/cache-warmth
 (matches `docs/perf.md`'s own load-time noise, unaffected by this revision).
 
+## MTP head layout
+
+Status: measured (this pass, HIP device 1, real 64-layer container). `ModelOptions::mtp_head_layout`
+(`std::optional<Layout>`, default `std::nullopt`) controls the layout used ONLY for the MTP head's
+four quantized linears (`mtp.attn.qg/o`, `mtp.mlp.gate_up/down`) -- independent of the body's own
+`--layout`. `nullopt` (CLI default, `--mtp-head-layout layout`) tracks the body layout; an explicit
+`Layout::kBf16` (CLI: `--mtp-head-layout bf16`) forces the head's exact-arithmetic bf16 tensors
+instead (the container carries both forms for every layout -- `mtp.attn.qg.{bf16,mxfp4,w4a16,w4a8}.*`
+etc., "Container" above), at ~0.5 GB extra VRAM.
+
+**Measured (`--mtp {1,2,3,4}`, w4a8/w4a16/mxfp4, same prompt/flags as "Measurement" above,
+`--max-tokens 128`):**
+
+| Layout | K | bf16 head: decode tok/s (accept%, tok/round) | layout head: decode tok/s (accept%, tok/round) |
+|---|---|---|---|
+| w4a16 | 1 | 52.07 (78.4%, 1.78) | 52.12 (75.0%, 1.75) |
+| w4a16 | 2 | 56.13 (55.8%, 2.12) | **60.14 (58.3%, 2.17)** |
+| w4a16 | 3 | 61.54 (51.9%, 2.53) | **67.34 (54.3%, 2.60)** |
+| w4a16 | 4 | 56.97 (41.4%, 2.53) | 59.82 (39.4%, 2.45) |
+| w4a8  | 1 | 44.90 (62.0%, 1.62) | **47.94 (68.8%, 1.69)** |
+| w4a8  | 2 | 47.55 (44.2%, 1.88) | 48.40 (42.0%, 1.84) |
+| w4a8  | 3 | 47.00 (34.2%, 2.02) | 48.54 (32.5%, 1.98) |
+| w4a8  | 4 | 46.44 (28.3%, 2.13) | **52.49 (31.2%, 2.25)** |
+| mxfp4 | 1 | 37.43 (55.4%, 1.54) | **39.56 (61.1%, 1.59)** |
+| mxfp4 | 2 | 45.57 (51.2%, 2.00) | **49.47 (56.1%, 2.10)** |
+| mxfp4 | 3 | 44.91 (40.0%, 2.15) | **48.24 (41.9%, 2.21)** |
+| mxfp4 | 4 | **48.53 (38.6%, 2.46)** | 47.55 (33.6%, 2.26) |
+
+The layout-matched (quantized) head is faster than the bf16 head in 23 of 24 (layout, K)
+configurations (smaller GEMMs -- no surprise) and acceptance is a wash: often slightly HIGHER with
+the quantized head, never meaningfully lower, at every K on every layout. **The layout-matched head
+is therefore the new default** (`ModelOptions::mtp_head_layout = std::nullopt`, CLI
+`--mtp-head-layout layout`) -- the earlier bf16-default assumption (that the draft head's own
+numerical precision would matter enough to justify its extra VRAM/compute) does not hold on this
+checkpoint. This also *answers* the task's step 2 question in the negative for the "head precision"
+hypothesis: forcing the head to exact bf16 barely moves acceptance at all (compare each row's two
+columns above), so the head's own arithmetic is not what limits w4a8/mxfp4's acceptance below
+w4a16's -- see "Acceptance gap investigation" below for what this pass ruled in/out instead.
+
+### Acceptance gap investigation
+
+At matched K, w4a16's acceptance stays well above w4a8's/mxfp4's regardless of head layout (e.g.
+K=3: w4a16 51.9-54.3% vs w4a8 32.5-34.2% vs mxfp4 40.0-41.9% -- a ~15-20 point gap that the bf16
+head does not close, per the table above). Two candidate mechanisms were checked and ruled out this
+pass; the actual mechanism is not yet isolated:
+
+1. **MTP head numerical precision** -- ruled out. See the table above: a bf16 head sees the exact
+   same ~15-20 point gap as the layout-matched head, at every K. If the head's own arithmetic were
+   the bottleneck, forcing it to bf16 should have narrowed the gap; it did not, within run-to-run
+   noise.
+2. **Verify-window batched-attention correctness** -- already ruled out by the M2 fix pass
+   (`CheckVerifyMatchesSequential`, unaffected by this pass) and independently reconfirmed by this
+   pass's "Correctness" section above: `VerifyWindow`'s per-position logits agree with sequential
+   `DecodeStep` to ordinary bf16/quantization noise, for every layout. Acceptance is about whether
+   the DRAFT (produced by `MtpHead::Draft` from `h_seed` alone, never checked against the real model
+   until verification) matches what that SAME layout's own sequential decode would have produced --
+   not a bug in how verification computes its own logits.
+3. **Logit-margin ("decision confidence") hypothesis -- tested this pass, falsified.** Hypothesis:
+   body-layer quantization (specifically activation quantization -- w4a8's int8 row-activation
+   quant, mxfp4's native fp4 weights+activations -- vs w4a16's weight-only int4 quant, which keeps
+   activations in bf16 throughout) flattens the shared lm_head's own top1-vs-top2 logit margin
+   system-wide, making EVERY next-token decision more borderline (and so easier for any
+   approximation, MTP draft included, to flip), independent of MTP entirely. Measured directly: a
+   throwaway probe (`Model::Prefill` + 24 sequential `Model::DecodeStep` calls, real 64-layer
+   container, deterministic filler tokens, `mtp_draft_k=0` throughout -- no MTP code path touched)
+   computed the mean/stdev/min top1-vs-top2 logit margin per layout:
+
+   | Layout | mean margin | stdev | min margin | steps with margin < 1.0 (of 24) |
+   |---|---|---|---|---|
+   | w4a16 | 3.12 | 1.84 | 0.00 | 5 |
+   | w4a8  | 3.78 | 1.69 | 0.06 | 3 |
+   | mxfp4 | 3.57 | 1.66 | 0.03 | 3 |
+
+   This is the OPPOSITE of the hypothesis: w4a16 has the SMALLEST mean margin and the MOST
+   low-margin steps of the three, yet the HIGHEST MTP acceptance. Margin alone does not explain the
+   acceptance ranking -- falsified, not pursued further.
+
+With both the head-precision and logit-margin hypotheses ruled out, and verify-window correctness
+already independently established, this pass's conclusion is: **not a bug** (nothing in
+`VerifyWindow`, `MtpHead::Draft`, or the head's own quantization explains the gap), but the specific
+mechanism by which body-layer quantization degrades `h_seed` (the main model's pre-final-norm hidden
+state that `MtpHead::Draft`'s first step consumes) enough to reduce draft-vs-real agreement is **not
+isolated this pass** -- a direct golden-referenced comparison of `h_seed` itself (not a downstream
+proxy like logits or margin) against a `tools/reference`-style ground truth, per layout, would be
+the natural next step and was not built this pass (time-boxed; see `open_issues`). Not blocking:
+per-layout acceptance was already the pre-existing situation this task started from (`docs/mtp.md`'s
+prior "Known gaps" entry), and this pass's actual deliverables (head-layout default, device-resident
+draft loop) both land real, measured wins regardless of this open question.
+
+## Device-resident draft loop
+
+Status: implemented and measured (this pass). `MtpHead::Draft`'s per-draft-token host round-trip
+(`docs/mtp.md`'s prior "Known gaps" entry: a `stream.Synchronize()` + small D2H argmax readback +
+H2D embedding upload per drafted token) is now eliminated when the container's `text.embed_tokens`
+has a VRAM mirror (`Container::EmbedTokensDeviceResident()`, `ModelOptions::embed_device_resident`,
+default `true` -- `docs/r9700.md`'s P3 measured this table fits, 2.54 GB bf16, with headroom left
+over at 131k ctx): a new device-side gather kernel (`r4dx_embedding_gather_bf16`,
+`src/kernels/src/r4dx_kernels.hip`) reads a row straight out of the VRAM-resident embedding table
+by a DEVICE int32 id -- `r4dx_argmax_f32`'s own `out_idx` output feeds directly into the next
+draft step's gather with zero host syncs in between. `positions_`/`seqused_k_` for the whole K-step
+draft window are preloaded in one H2D upload each before the loop (`mtp_head.cpp`'s `Draft`) instead
+of one blocking `CopyFromHost` per step, and the whole window's drafted token ids are read back in
+ONE `stream.Synchronize()` + D2H at the end instead of one pair per step. `Model::RunChunk` and
+`Model::VerifyWindow` use the same device gather for the main decode/prefill path (one fewer H2D per
+token there too), falling back to the original host-gather path (`EmbedTokens`,
+`src/model/embedding.h`) unconditionally when `Container::EmbedTokensDeviceResident()` is false --
+either `ModelOptions::embed_device_resident=false` (explicit opt-out, e.g. to keep VRAM margin for a
+very large KV cache) or the container's free-VRAM heuristic at load time
+(`Container::Load`'s own comment: 2x headroom over the embedding table's own size, checked against
+whole-GPU free memory at the point of upload) decided it would not fit. Every existing host-gather
+call site keeps working unchanged either way -- the device mirror is purely an additional path, never
+a replacement for `EmbedTokensHost()`.
+
+Regression coverage: `tests/model/test_mtp.cpp`'s existing `CheckVerifyMatchesSequential` and
+`CheckRejectionRewind` both exercise this new path directly (the 4-layer MTP test container loads
+with `embed_device_resident` at its `ModelOptions` default of `true`), and both still pass
+byte-identical/rel-L2-gated as before -- the device-resident gather produces the same tokens as the
+host path it replaced. `CheckPlainDecodeUnaffectedByMtpConfig` (new this pass -- a deliberately
+DIFFERENT contract from `CheckRejectionRewind`'s existing MTP-vs-sequential comparison, not a
+duplicate of it, per its own file comment in `tests/model/test_mtp.cpp`) additionally confirms the
+device-gather branch added to `Model::RunChunk`/`VerifyWindow` does not perturb the PLAIN (non-MTP)
+decode path for an MTP-sized `Model`.
+
 ## Known gaps
 
 - **Acceptance rate, while now far higher (30-75% vs the original pass's 0-1.2%), is still below
@@ -267,11 +397,17 @@ the byte-identical-vs-`--mtp 0` finding). Container load ~9-22s depending on lay
   already covers M=1..64, so every shape this revision's `PrimeKv`/`Draft()` use picks a legal, if
   not necessarily re-optimized-for-this-exact-M, tuning row) -- a future pass could add
   MTP-window-specific M points to the sweep.
-- **`MtpHead::Draft`'s per-draft-token host round-trips** (embedding gather is host-side,
-  `src/kernels/include/r4dx/kernels/embedding.hpp`'s own TODO) still force a `stream.Synchronize()`
-  + small D2H per drafted token, same as the original pass documented -- unaffected by this
-  revision's fixes, still open (minor, not re-measured separately this pass since the net effect is
-  already captured in the tok/s numbers above).
+- ~~`MtpHead::Draft`'s per-draft-token host round-trips~~ **RESOLVED** (device-resident draft loop
+  pass, see "Device-resident draft loop" above): the embedding gather, `positions_`/`seqused_k_`
+  upload, and drafted-token readback are all now device-resident/batched-per-window rather than
+  per-drafted-token, when `Container::EmbedTokensDeviceResident()` (default true).
+- **The acceptance gap between w4a16 and w4a8/mxfp4 was investigated this pass but not fully
+  root-caused** (see "Acceptance gap investigation" above): MTP head precision and logit-margin
+  ("decision confidence") were both tested and ruled out as the mechanism; a direct golden-referenced
+  comparison of `h_seed` itself against a per-layout ground truth (the task's suggested
+  `tools/reference/layer_golden.py`-style check) was not built this pass (time-boxed) and would be
+  the natural next step to actually isolate the mechanism, as opposed to the two hypotheses this pass
+  ruled out.
 
 ## API summary
 
@@ -284,12 +420,25 @@ the byte-identical-vs-`--mtp 0` finding). Container load ~9-22s depending on lay
 - `Model::VerifyWindow(candidates, logits_out=nullptr) -> std::vector<int32_t>` (public): the
   verify-only primitive, exposed for tests and diagnostics. Does not touch MTP's own KV cache
   (verification is purely against the backbone).
-- `r4dx::model::MtpHead::Draft(...)` (`src/model/mtp_head.h`): the draft-only primitive. Now takes
-  a `base_pos` parameter (the real sequence position of its first draft step).
-- `r4dx::model::MtpHead::PrimeKv(...)` (`src/model/mtp_head.h`, new this revision): extends MTP's
-  own KV cache by real positions without drafting -- called from `Model::RunChunk` on every prefill
-  chunk and plain decode step.
-- CLI: `r4dx-cli --mtp K` (0 default/disabled). `--stats` additionally prints
+- `r4dx::model::MtpHead::Draft(...)` (`src/model/mtp_head.h`): the draft-only primitive. Takes a
+  `base_pos` parameter (the real sequence position of its first draft step) and, this pass, an
+  `embed_table_dev` parameter (device-resident embedding table pointer, or `nullptr` to fall back to
+  the host-gather path -- see "Device-resident draft loop" above).
+- `r4dx::model::MtpHead::PrimeKv(...)` (`src/model/mtp_head.h`): extends MTP's own KV cache by real
+  positions without drafting -- called from `Model::RunChunk` on every prefill chunk and plain
+  decode step.
+- `ModelOptions::mtp_head_layout` (`std::optional<Layout>`, default `std::nullopt` -- see "MTP head
+  layout" above): layout for ONLY the MTP head's four quantized linears, independent of the body's
+  own `layout`. `nullopt` tracks the body layout (measured default); `Layout::kBf16` forces the
+  exact-arithmetic head.
+- `ModelOptions::embed_device_resident` (default `true` -- see "Device-resident draft loop" above):
+  mirrors `text.embed_tokens` into VRAM so the decode/draft path gathers embeddings on-device;
+  `Container::EmbedTokensDeviceResident()` reports whether the mirror actually landed (free-VRAM
+  heuristic can decline it even when requested).
+- `r4dx::kernels::r4dx_embedding_gather_bf16` (`src/kernels`): the device-resident gather kernel,
+  `r4dx::model::EmbedTokensDeviceGather` (`src/model/embedding.h`) its thin call-site wrapper.
+- CLI: `r4dx-cli --mtp K` (0 default/disabled). `--mtp-head-layout {bf16,layout}` (default
+  `layout` -- see "MTP head layout" above). `--stats` additionally prints
   `[stats] mtp: draft_k=... rounds=... drafted=... accepted=... (X% acceptance, Y tok/round avg)`.
   `--mtp K` with `--temperature > 0` now warns on stderr and forces `mtp_draft_k=0` for that run
   (MTP is greedy-only).

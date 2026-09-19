@@ -12,6 +12,7 @@
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 #include "r4dx/kernels/embedding.hpp"
+#include "r4dx/kernels/kernels.h"
 
 namespace r4dx::model {
 
@@ -28,6 +29,20 @@ inline void EmbedTokens(core::Stream& stream, const uint16_t* table, int64_t voc
   }
   kernels::EmbeddingGatherHost(table, vocab, hidden, token_ids, staging.data());
   out.CopyFromHostAsync(staging.data(), n, stream);
+}
+
+// Device-resident counterpart (MTP device-residency pass, docs/mtp.md "device-resident draft
+// loop"): table_dev is a DEVICE [vocab, hidden] bf16 pointer (Container::EmbedTokensDevice(),
+// non-null only when the container was loaded with embed_device_resident and it fit in VRAM --
+// see Container::Load's own comment). ids_dev is a DEVICE int32[n] pointer -- may be
+// r4dx_argmax_f32's own out_idx output directly, with no host round trip at all. out_dev: caller-
+// owned device buffer, capacity >= n*hidden. Thin wrapper around r4dx_embedding_gather_bf16
+// (src/kernels) purely for call-site symmetry with EmbedTokens above.
+inline void EmbedTokensDeviceGather(core::Stream& stream, const uint16_t* table_dev, int64_t hidden,
+                                     const int32_t* ids_dev, int64_t n, uint16_t* out_dev) {
+  r4dx_embedding_gather_bf16(reinterpret_cast<int64_t>(table_dev), reinterpret_cast<int64_t>(ids_dev),
+                              reinterpret_cast<int64_t>(out_dev), n, hidden,
+                              reinterpret_cast<int64_t>(stream.get()));
 }
 
 }  // namespace r4dx::model

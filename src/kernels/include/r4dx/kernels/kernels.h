@@ -123,4 +123,17 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
 // out_idx: device int32[1].
 void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream);
 
+// ---- device-resident embedding gather (MTP device-residency pass, docs/mtp.md) -----------------
+// out[row,:] = table[ids[row],:], entirely on-device -- the device-resident counterpart of
+// r4dx::kernels::EmbeddingGatherHost (embedding.hpp) for a text.embed_tokens table that has been
+// uploaded to VRAM (Container::EmbedTokensDevice()). `ids` is a DEVICE int32 pointer, not host --
+// in particular r4dx_argmax_f32's own `out_idx` output can feed straight into this with zero host
+// syncs in between (MtpHead::Draft's chained per-draft-token loop, model.cpp), which is the whole
+// point of this entry point over the host gather. No bounds check on ids (trusts the caller, same
+// convention as every other kernel in this header) -- an id outside [0, vocab) reads out-of-bounds
+// device memory. table: [vocab, hidden] bf16 device pointer. ids: [n] int32 device pointer. out:
+// [n, hidden] bf16 device pointer.
+void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
+                                 int64_t stream);
+
 }  // extern "C"

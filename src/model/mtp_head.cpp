@@ -35,47 +35,84 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
           core::r4d::GetAttnDims().block_size, /*max_context_tokens=*/static_cast<int>(max_ctx)),
       embed_staging_host_(static_cast<size_t>(cfg.hidden_size)),
       embed_staging_dev_(static_cast<size_t>(cfg.hidden_size)),
-      positions_(1),
-      seqused_k_(1),
       logits_dev_(static_cast<size_t>(cfg.vocab_size)),
       argmax_dev_(1),
+      positions_dev_(static_cast<size_t>(max_draft)),
+      positions_host_(static_cast<size_t>(max_draft)),
+      seqused_dev_(static_cast<size_t>(max_draft)),
+      seqused_host_(static_cast<size_t>(max_draft)),
+      seed_token_dev_(1),
+      draft_ids_dev_(static_cast<size_t>(max_draft)),
+      draft_ids_host_(static_cast<size_t>(max_draft)),
+      max_draft_(max_draft),
       prime_positions_host_(static_cast<size_t>(kMaxPrime)),
       prime_positions_dev_(static_cast<size_t>(kMaxPrime)),
       prime_seqused_host_(1),
       prime_seqused_dev_(1),
       prime_embed_host_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
       prime_embed_dev_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)) {
-  (void)w;      // cfg/w size this object's buffers above; neither is stored -- see mtp_head.h
-  (void)max_draft;  // no longer sizes kv_ (kv_ is now sized to max_ctx) -- kept as a documented
-                     // upper bound on Draft()'s own `k` argument, enforced by Model, not here.
+  (void)w;  // cfg/w size this object's buffers above; neither is stored -- see mtp_head.h
 }
 
 std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
                                      const ModelConfig& cfg, const MtpWeights& w,
                                      const uint16_t* h_seed, int32_t seed_token,
-                                     const uint16_t* embed_table, int64_t vocab,
-                                     const QuantLinear& lm_head, int64_t k, int64_t base_pos) {
+                                     const uint16_t* embed_table, const uint16_t* embed_table_dev,
+                                     int64_t vocab, const QuantLinear& lm_head, int64_t k,
+                                     int64_t base_pos) {
   std::vector<int32_t> drafts;
   if (k <= 0) return drafts;
+  if (k > max_draft_) {
+    throw std::runtime_error(
+        "MtpHead::Draft: k exceeds max_draft this instance was constructed for");
+  }
   drafts.reserve(static_cast<size_t>(k));
 
   const int64_t hidden = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const hipStream_t s = stream.get();
+  const bool device_resident = (embed_table_dev != nullptr);
+
+  // Preload this WHOLE draft window's positions/seqused_k in one H2D upload each -- was one
+  // blocking CopyFromHost per step (device-resident draft loop, docs/mtp.md). Done unconditionally
+  // (even on the host-gather fallback path): this part of the fix is independent of embedding
+  // residency and benefits both.
+  for (int64_t step = 0; step < k; ++step) {
+    positions_host_[static_cast<size_t>(step)] = static_cast<int32_t>(base_pos + step);
+    seqused_host_[static_cast<size_t>(step)] = static_cast<int32_t>(base_pos + step + 1);
+  }
+  positions_dev_.CopyFromHostAsync(positions_host_.data(), static_cast<size_t>(k), stream);
+  seqused_dev_.CopyFromHostAsync(seqused_host_.data(), static_cast<size_t>(k), stream);
+
+  // Device-resident path's one remaining small H2D: the seed token (step 0's embedding gather
+  // input) is not yet known on-device -- every step AFTER 0 instead feeds straight from the
+  // PREVIOUS step's own argmax_dev_ output (r4dx_argmax_f32), no H2D at all.
+  const int32_t* cur_token_dev = nullptr;
+  if (device_resident) {
+    seed_token_dev_.CopyFromHostAsync(&seed_token, 1, stream);
+    cur_token_dev = seed_token_dev_.data();
+  }
 
   // cur_hidden: device bf16 [hidden], the (h_seed, cur_token) pair's "h_i" -- h_seed for the first
   // draft, this layer's own previous-step output for every draft after that (see file comment).
   const uint16_t* cur_hidden = h_seed;
-  uint16_t* prev_out = nullptr;  // owned scratch from a prior iteration, kept alive across the loop
-  int32_t cur_token = seed_token;
+  int32_t cur_token = seed_token;  // host-gather fallback path only
 
   for (int64_t step = 0; step < k; ++step) {
     // ---- concat(pre_fc_norm_embedding(embed(cur_token)), pre_fc_norm_hidden(cur_hidden)) -------
     // Embedding occupies fc's FIRST `hidden` input columns, hidden state the SECOND -- see
     // mtp_head.h's file comment for the reference this follows and the incident this corrects.
     uint16_t* concat_buf = arena.Alloc<uint16_t>(static_cast<size_t>(2 * hidden));
-    EmbedTokens(stream, embed_table, vocab, hidden, {cur_token}, embed_staging_host_,
-                embed_staging_dev_);
+    if (device_resident) {
+      // Entirely on-device: cur_token_dev is either seed_token_dev_ (step 0) or the PREVIOUS
+      // step's own argmax_dev_ (step>0, written by that step's own r4dx_argmax_f32 call below) --
+      // no host sync, D2H, or H2D between chained draft steps.
+      EmbedTokensDeviceGather(stream, embed_table_dev, hidden, cur_token_dev, /*n=*/1,
+                               embed_staging_dev_.data());
+    } else {
+      EmbedTokens(stream, embed_table, vocab, hidden, {cur_token}, embed_staging_host_,
+                  embed_staging_dev_);
+    }
     r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(embed_staging_dev_.data()),
                        reinterpret_cast<int64_t>(w.pre_fc_norm_embedding.data()),
                        reinterpret_cast<int64_t>(concat_buf), /*rows=*/1, hidden, eps,
@@ -96,10 +133,9 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
     // lockstep-primed KV cache -- see mtp_head.h's file comment) -- writes into REAL sequence
     // position base_pos+step, exactly the position Model::RunChunk's own PrimeKv would prime next
     // if this round drafted nothing at all (model.cpp's DecodeStepMtpGreedy derives base_pos).
+    // positions_dev_/seqused_dev_ were preloaded for the whole window above -- index into them by
+    // pointer arithmetic instead of a per-step upload.
     const int32_t pos_h = static_cast<int32_t>(base_pos + step);
-    positions_.CopyFromHost(&pos_h, 1);
-    const int32_t seqused_h = pos_h + 1;
-    seqused_k_.CopyFromHost(&seqused_h, 1);
 
     attention::AttnWeights aw;
     aw.input_layernorm = w.layer.input_layernorm.data();
@@ -114,31 +150,44 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
 
     uint16_t* attn_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
     attn_layer_.Forward(arena, fc_out, attn_out, aw, kv_, /*T=*/1, /*start_pos=*/pos_h,
-                         positions_.data(), seqused_k_.data(), s);
+                         positions_dev_.data() + step, seqused_dev_.data() + step, s);
 
     uint16_t* h_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
     Mlp mlp(cfg, w.layer.post_attention_layernorm, w.layer.mlp);
     mlp.Forward(stream, arena, attn_out, h_out, /*T=*/1);
 
-    // ---- mtp.norm -> shared lm_head -> greedy argmax (on device, one 4-byte D2H per draft step) --
+    // ---- mtp.norm -> shared lm_head -> greedy argmax (device) --------------------------------
     FinalLmHead head(cfg, w.norm, lm_head);
     head.Forward(stream, arena, h_out, logits_dev_.data(), /*T=*/1);
     r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
                      reinterpret_cast<int64_t>(argmax_dev_.data()), vocab,
                      reinterpret_cast<int64_t>(s));
-    // Every buffer above (positions_/seqused_k_ H2D upload for the NEXT iteration, and reading
-    // argmax_dev_ back) is a plain synchronous hipMemcpy against this hipStreamNonBlocking stream --
-    // must be preceded by an explicit wait, same class of hazard as model.cpp's RunChunk (see that
-    // file's comment).
-    stream.Synchronize();
-    int32_t next_token = -1;
-    argmax_dev_.CopyToHost(&next_token, 1);
 
-    drafts.push_back(next_token);
-    cur_token = next_token;
-    cur_hidden = h_out;
-    prev_out = h_out;
-    (void)prev_out;  // kept alive by the arena until Reset(); no separate ownership needed
+    if (device_resident) {
+      // D2D, not D2H -- stays entirely on-device, ordered after this step's own argmax write by
+      // HIP's own same-stream issue-order guarantee (no separate sync needed). Accumulates into
+      // draft_ids_dev_[step] for ONE batched D2H readback after the loop, instead of one per step.
+      R4DX_HIP_CHECK(hipMemcpyAsync(draft_ids_dev_.data() + step, argmax_dev_.data(),
+                                     sizeof(int32_t), hipMemcpyDeviceToDevice, s));
+      cur_token_dev = argmax_dev_.data();  // next step's gather input, zero syncs
+      cur_hidden = h_out;
+    } else {
+      // Host-gather fallback: unavoidable per-step sync (embed_table has no device mirror to
+      // gather from), same as the original implementation.
+      stream.Synchronize();
+      int32_t next_token = -1;
+      argmax_dev_.CopyToHost(&next_token, 1);
+      drafts.push_back(next_token);
+      cur_token = next_token;
+      cur_hidden = h_out;
+    }
+  }
+
+  if (device_resident) {
+    // The ONE sync + D2H for the whole k-step window, replacing what was previously k of each.
+    stream.Synchronize();
+    draft_ids_dev_.CopyToHost(draft_ids_host_.data(), static_cast<size_t>(k));
+    drafts.assign(draft_ids_host_.begin(), draft_ids_host_.begin() + k);
   }
   return drafts;
 }

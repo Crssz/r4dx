@@ -40,6 +40,13 @@ struct CliArgs {
   // was converted with --mtp on, not this flag's own default. Only used by --temperature 0
   // (greedy) generation -- see main.cpp's RunTurn.
   int64_t mtp = 0;
+  // MTP head layout (docs/mtp.md "MTP head layout"): "layout" (default, measured faster in 23/24
+  // K x layout configurations with no acceptance-rate cost -- see docs/mtp.md's table) loads the
+  // MTP head's four quantized linears (mtp.attn.qg/o, mtp.mlp.gate_up/down) in the same --layout
+  // as the body; "bf16" instead forces them from the container's bf16 tensors regardless of
+  // --layout (~0.5 GB extra VRAM, the exact-arithmetic form). No effect when --mtp is 0 or the
+  // container has no mtp.* weights.
+  std::string mtp_head_layout = "layout";
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -55,7 +62,8 @@ inline std::string CliUsageText(const char* argv0) {
          " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16} "
          "(--prompt \"...\" | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
-         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--mtp N]";
+         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--mtp N] "
+         "[--mtp-head-layout {bf16|layout}]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -116,6 +124,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--stats") a.stats = true;
     else if (arg == "--profile") a.profile = true;
     else if (arg == "--mtp") a.mtp = ParseI64("--mtp", NextCliArg(argc, argv, i, "--mtp"));
+    else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextCliArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -130,6 +139,9 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
   if (a.mtp < 0) throw CliUsageError("--mtp must be >= 0");
+  if (a.mtp_head_layout != "bf16" && a.mtp_head_layout != "layout") {
+    throw CliUsageError("--mtp-head-layout must be 'bf16' or 'layout'");
+  }
   return a;
 }
 

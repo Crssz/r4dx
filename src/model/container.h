@@ -90,9 +90,23 @@ class Container {
   // project's GPU rule), synchronously (Container::Load is a startup-path call, not a hot-path
   // one -- every upload below is a plain synchronous DeviceBuffer::CopyFromHost). `layer_limit`,
   // when >= 0, loads only layers [0, layer_limit) -- for the 4-layer test container -- and leaves
-  // Layers() sized to layer_limit rather than Config().num_hidden_layers.
+  // Layers() sized to layer_limit rather than Config().num_hidden_layers. `mtp_head_layout`
+  // (docs/mtp.md "MTP head layout"): the layout used ONLY for the MTP head's four quantized
+  // linears (mtp.attn.qg/o, mtp.mlp.gate_up/down) -- independent of `layout`, since the draft
+  // head's errors compound across chained draft steps (ModelOptions::mtp_head_layout's own
+  // comment). Ignored when the container has no mtp.* weights. `embed_device_resident` (docs/
+  // mtp.md "device-resident draft loop", r9700.md P3): if true (default), also mirrors
+  // text.embed_tokens into VRAM (~2.54 GB bf16) so RunChunk/MtpHead::Draft can gather embedding
+  // rows entirely on-device (EmbedTokensDevice() below) -- checked against free VRAM at the point
+  // this call uploads it (before any layer, i.e. against the WHOLE GPU's free memory, not the
+  // eventual steady-state footprint after every layer/KV cache is also loaded) with a conservative
+  // 2x-headroom heuristic; falls back to host-only (a stderr warning, EmbedTokensDevice() returns
+  // nullptr) if that heuristic says it would not fit. EmbedTokensHost() is always populated
+  // regardless of this flag -- device residency is purely an additional mirror, never a
+  // replacement, so every existing host-gather call site keeps working unchanged.
   static Container Load(const std::string& path, Layout layout, Layout lm_head_layout,
-                         int64_t layer_limit = -1);
+                         int64_t layer_limit = -1, Layout mtp_head_layout = Layout::kBf16,
+                         bool embed_device_resident = true);
 
   const ModelConfig& Config() const { return config_; }
   const std::string& ModelId() const { return model_id_; }
@@ -100,6 +114,13 @@ class Container {
 
   // text.embed_tokens: host-resident (docs/architecture.md), [vocab, hidden] bf16, row-major.
   const uint16_t* EmbedTokensHost() const { return embed_tokens_.data(); }
+
+  // text.embed_tokens' device mirror (docs/mtp.md "device-resident draft loop") -- nullptr when
+  // Load() was called with embed_device_resident=false, or when it was true but the free-VRAM
+  // heuristic decided it would not fit (see Load()'s own comment); check
+  // EmbedTokensDeviceResident() rather than relying on this being non-null implicitly.
+  const uint16_t* EmbedTokensDevice() const { return embed_tokens_dev_.data(); }
+  bool EmbedTokensDeviceResident() const { return !embed_tokens_dev_.empty(); }
 
   int64_t NumLoadedLayers() const { return static_cast<int64_t>(layers_.size()); }
   const LayerWeights& Layer(int64_t i) const { return layers_.at(static_cast<size_t>(i)); }
@@ -124,6 +145,8 @@ class Container {
   ModelConfig config_;
   std::string model_id_, config_sha256_;
   core::PinnedBuffer<uint16_t> embed_tokens_;
+  core::DeviceBuffer<uint16_t> embed_tokens_dev_;  // empty iff not device-resident (Load's own
+                                                    // comment) -- see EmbedTokensDeviceResident()
   std::vector<LayerWeights> layers_;
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;

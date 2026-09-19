@@ -89,10 +89,23 @@ class MtpHead {
   // DecodeStepMtpGreedy is called (see PrimeKv's comment for the derivation: this is exactly the
   // position PrimeKv would prime next if no drafting happened at all). Returns exactly `k`
   // greedily-drafted token ids (k==0 returns empty without touching any state).
+  //
+  // embed_table_dev (device-resident draft loop, docs/mtp.md): a DEVICE [vocab,hidden] bf16
+  // mirror of `embed_table` (Container::EmbedTokensDevice()), or nullptr to fall back to the
+  // original host-gather path. When non-null, every draft step after the first feeds THIS step's
+  // own on-device argmax result (r4dx_argmax_f32's out_idx) straight into the next step's
+  // embedding gather (r4dx_embedding_gather_bf16) with NO host sync/D2H/H2D in between -- only the
+  // seed token (step 0's input, already known on the host as `seed_token`) needs one small H2D
+  // upload, done ONCE before the loop starts, not once per step. The whole k-token draft result is
+  // read back in exactly ONE stream.Synchronize() + D2H at the very end, replacing what was
+  // previously k of each. positions_/seqused_k_ (this class's own per-step scratch) are likewise
+  // preloaded for the whole window in one H2D upload each before the loop, not one CopyFromHost
+  // (blocking) per step.
   std::vector<int32_t> Draft(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                               const MtpWeights& w, const uint16_t* h_seed, int32_t seed_token,
-                              const uint16_t* embed_table, int64_t vocab,
-                              const QuantLinear& lm_head, int64_t k, int64_t base_pos);
+                              const uint16_t* embed_table, const uint16_t* embed_table_dev,
+                              int64_t vocab, const QuantLinear& lm_head, int64_t k,
+                              int64_t base_pos);
 
   // Extends MTP's own KV cache (file comment) by `n` real positions [base_pos, base_pos+n), using
   // the REAL (h_i, t_{i+1}) pair at each position -- i.e. exactly Draft()'s own first-step
@@ -117,12 +130,30 @@ class MtpHead {
  private:
   attention::AttentionLayer attn_layer_;
   attention::PagedKvCache kv_;
-  core::PinnedBuffer<uint16_t> embed_staging_host_;  // [hidden] -- one token's embedding row
+  core::PinnedBuffer<uint16_t> embed_staging_host_;  // [hidden] -- one token's embedding row (host
+                                                      // gather fallback path only)
   core::DeviceBuffer<uint16_t> embed_staging_dev_;   // [hidden]
-  core::DeviceBuffer<int32_t> positions_;            // [1] -- this draft step's RoPE pos / KV slot
-  core::DeviceBuffer<int32_t> seqused_k_;            // [1]
   core::DeviceBuffer<float> logits_dev_;             // [vocab] fp32 -- FinalLmHead's output
-  core::DeviceBuffer<int32_t> argmax_dev_;           // [1]
+  core::DeviceBuffer<int32_t> argmax_dev_;           // [1] -- this step's own on-device argmax;
+                                                      // also feeds the next step's device gather
+                                                      // directly when embed_table_dev != nullptr
+
+  // Device-resident draft loop scratch (docs/mtp.md "device-resident draft loop"): positions_dev_/
+  // seqused_dev_ hold the WHOLE k-step window's RoPE-pos/KV-slot and seqused_k values, preloaded in
+  // one H2D upload each (Draft() before its loop) instead of one blocking CopyFromHost per step --
+  // step `i` of the loop reads element `i` (pointer arithmetic, not a fresh buffer). Sized to
+  // max_draft (the largest k this instance is ever asked to draft, ctor param). seed_token_dev_ is
+  // the one small H2D upload Draft() still needs (step 0's input token, not yet known on-device);
+  // draft_ids_dev_/draft_ids_host_ accumulate every step's own argmax result (D2D copy, no host
+  // sync) for exactly ONE batched D2H readback at the end of Draft(), replacing what was previously
+  // one stream.Synchronize()+D2H per drafted token.
+  core::DeviceBuffer<int32_t> positions_dev_;   // [max_draft]
+  core::PinnedBuffer<int32_t> positions_host_;  // [max_draft]
+  core::DeviceBuffer<int32_t> seqused_dev_;     // [max_draft]
+  core::PinnedBuffer<int32_t> seqused_host_;    // [max_draft]
+  core::DeviceBuffer<int32_t> seed_token_dev_;  // [1]
+  core::DeviceBuffer<int32_t> draft_ids_dev_;   // [max_draft]
+  core::PinnedBuffer<int32_t> draft_ids_host_;  // [max_draft]
 
   // PrimeKv's own scratch, sized for up to a 64-row chunk (Model::max_chunk_) so both the n=1
   // boundary call and the n<=63 within-chunk call reuse the same buffers -- safe without any extra
@@ -130,6 +161,8 @@ class MtpHead {
   // as the kernels that read it, so HIP's own stream-issue-order guarantee (not a host-side wait)
   // is what serializes a later call's upload against an earlier call's still-in-flight reads (see
   // PrimeKv's .cpp comment).
+  int64_t max_draft_ = 0;  // sizes positions_dev_/seqused_dev_/draft_ids_dev_ above
+
   static constexpr int64_t kMaxPrime = 64;
   core::PinnedBuffer<int32_t> prime_positions_host_;  // [kMaxPrime]
   core::DeviceBuffer<int32_t> prime_positions_dev_;   // [kMaxPrime]

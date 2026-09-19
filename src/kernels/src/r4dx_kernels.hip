@@ -289,6 +289,19 @@ __global__ __launch_bounds__(kThreads) void ArgmaxKernel(const float* __restrict
   if (threadIdx.x == 0) out_idx[0] = best_i;
 }
 
+// ---- device-resident embedding gather (MTP device-residency pass) -------------------------
+// One workgroup per output row: out[row,:] = table[ids[row],:]. See kernels.h for why `ids` must
+// be a device pointer (feeds directly from r4dx_argmax_f32's own output with no host round trip).
+__global__ __launch_bounds__(kThreads) void EmbeddingGatherKernel(
+    const __hip_bfloat16* __restrict__ table, const int32_t* __restrict__ ids,
+    __hip_bfloat16* __restrict__ out, int64_t hidden) {
+  const int64_t row = blockIdx.x;
+  const int32_t id = ids[row];
+  const __hip_bfloat16* src = table + static_cast<int64_t>(id) * hidden;
+  __hip_bfloat16* dst = out + row * hidden;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) dst[i] = src[i];
+}
+
 }  // namespace
 
 extern "C" {
@@ -370,6 +383,15 @@ void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t str
   if (vocab <= 0) return;
   hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
                      (const float*)logits, (int32_t*)out_idx, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
+                                 int64_t stream) {
+  if (n <= 0) return;
+  hipLaunchKernelGGL(EmbeddingGatherKernel, dim3(static_cast<unsigned>(n)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)ids,
+                     (__hip_bfloat16*)out, hidden);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

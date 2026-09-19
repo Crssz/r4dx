@@ -179,6 +179,60 @@ bool CheckRejectionRewind(const ModelOptions& base_opts, const std::vector<int32
   return true;
 }
 
+// Regression test (task's device-resident-draft-loop pass, step 4 -- "decodes T=1 through a Model
+// with mtp_draft_k=3 and compares against mtp_draft_k=0"; the M2 fix pass already covers the
+// VerifyWindow-vs-sequential comparison above (CheckVerifyMatchesSequential), so this check is
+// deliberately a DIFFERENT contract, not a duplicate: PLAIN Model::DecodeStep (never
+// DecodeStepMtpGreedy/VerifyWindow) must produce the same T=1 logits regardless of whether the
+// Model was Load()'d with mtp_draft_k=0 or mtp_draft_k>0 -- ModelOptions::mtp_draft_k's own doc
+// comment ("0 disables MTP entirely... every decode call degenerate EXACTLY to this Model's
+// pre-MTP behavior") is exactly this claim, and this pass's own changes (RunChunk/VerifyWindow now
+// branching on Container::EmbedTokensDeviceResident() for the embedding gather, GDN's window bank
+// widened to 1+mtp_draft_k slots) are precisely the kind of change that could silently break it for
+// an MTP-sized Model driven purely through the plain (non-MTP) decode path -- e.g. a caller like
+// r4dx-server that loads with --mtp for later use but issues ordinary requests through
+// DecodeStep/DecodeStepGreedy.
+bool CheckPlainDecodeUnaffectedByMtpConfig(const ModelOptions& base_opts,
+                                            const std::vector<int32_t>& prompt) {
+  ModelOptions ref_opts = base_opts;
+  ref_opts.mtp_draft_k = 0;
+  Model ref = Model::Load(ref_opts);
+  std::vector<float> ref_logits = ref.Prefill(prompt);
+
+  ModelOptions mtp_opts = base_opts;
+  mtp_opts.mtp_draft_k = kDraftK;
+  Model mtp = Model::Load(mtp_opts);
+  std::vector<float> mtp_logits = mtp.Prefill(prompt);
+
+  bool ok = true;
+  constexpr int kSteps = 8;  // several T=1 DecodeStep calls, never DecodeStepMtpGreedy
+  int32_t ref_tok = Argmax(ref_logits);
+  int32_t mtp_tok = Argmax(mtp_logits);
+  for (int step = -1; step < kSteps; ++step) {
+    const double rel = RelL2(ref_logits, mtp_logits);
+    std::fprintf(stderr, "[mtp] plain-decode-parity step %d rel L2=%.4e\n", step, rel);
+    if (!(rel <= 1e-2)) {
+      std::fprintf(stderr,
+                   "FAIL: plain DecodeStep diverges between mtp_draft_k=0 and mtp_draft_k=%lld "
+                   "Models at step %d (rel L2=%.4e)\n",
+                   static_cast<long long>(kDraftK), step, rel);
+      ok = false;
+    }
+    if (ref_tok != mtp_tok) {
+      std::fprintf(stderr, "FAIL: plain-decode argmax diverges at step %d: ref=%d mtp=%d\n", step,
+                   ref_tok, mtp_tok);
+      ok = false;
+    }
+    if (step + 1 == kSteps) break;
+    ref_logits = ref.DecodeStep(ref_tok);
+    mtp_logits = mtp.DecodeStep(mtp_tok);  // plain DecodeStep -- MTP's own draft/verify path never
+                                            // runs on the mtp_opts Model in this check
+    ref_tok = Argmax(ref_logits);
+    mtp_tok = Argmax(mtp_logits);
+  }
+  return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -208,6 +262,13 @@ int main() {
       return 1;
     }
     std::fprintf(stderr, "[PASS] layout=%s CheckRejectionRewind\n", LayoutName(layout));
+
+    if (!CheckPlainDecodeUnaffectedByMtpConfig(opts, prompt)) {
+      std::fprintf(stderr, "FAIL [%s]: CheckPlainDecodeUnaffectedByMtpConfig\n", LayoutName(layout));
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s CheckPlainDecodeUnaffectedByMtpConfig\n",
+                 LayoutName(layout));
     ++ran;
   }
 

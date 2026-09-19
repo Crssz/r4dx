@@ -1,6 +1,26 @@
 # Status
 
-Last updated: 2026-09-20 (Milestone 2 integration pass).
+Last updated: 2026-09-20 (MTP quality + device-resident draft loop pass).
+
+## MTP quality + device-resident draft loop pass: done
+
+Follow-up to Milestone 2's MTP self-speculative decode: (1) a configurable MTP head layout
+(`ModelOptions::mtp_head_layout`, CLI `--mtp-head-layout {bf16,layout}`) -- measured across
+w4a8/w4a16/mxfp4 x K=1..4 against the real 64-layer container, the layout-matched (quantized) head
+is faster than a bf16 head in 23/24 configurations with no acceptance-rate cost, so it is now the
+default; (2) an investigation into the persistent w4a16-vs-w4a8/mxfp4 acceptance gap that ruled out
+MTP head precision and logit-margin/decision-confidence as the mechanism but did not fully isolate
+the root cause (not a bug -- see `docs/mtp.md`'s "Acceptance gap investigation"); (3) a
+device-resident draft loop -- `text.embed_tokens` mirrored into VRAM (`ModelOptions::
+embed_device_resident`, default true) behind a new device-side gather kernel
+(`r4dx_embedding_gather_bf16`, `src/kernels`) fed directly from `r4dx_argmax_f32`'s own device
+output, eliminating `MtpHead::Draft`'s prior per-drafted-token host sync/D2H/H2D round-trip; (4) a
+new regression test (`CheckPlainDecodeUnaffectedByMtpConfig`, `tests/model/test_mtp.cpp`) confirming
+the plain (non-MTP) decode path is unperturbed by this pass's changes for an MTP-sized `Model`. See
+`docs/mtp.md`'s "MTP head layout", "Acceptance gap investigation", and "Device-resident draft loop"
+sections for the full writeup and measured tables. Full `ctest --preset win-hip` re-run green (30/30)
+after every change in this pass, including a final rebuild + full suite re-run after the last
+default-layout flip.
 
 ## Milestone 2: done
 

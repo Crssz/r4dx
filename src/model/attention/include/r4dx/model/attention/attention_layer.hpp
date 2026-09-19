@@ -26,7 +26,8 @@
 #include <cstdint>
 #include <stdexcept>
 
-#include "linear.h"  // r4dx::model::ApplyLinear -- shared qg/o quantized-linear dispatch
+#include "linear.h"  // r4dx::model::ApplyLinear -- shared qg/o/k/v quantized-linear dispatch
+#include "profile_span.h"  // r4dx::model::SpanAccumulator / ProfiledCall (Milestone 3 profiling)
 #include "r4d.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
@@ -34,7 +35,6 @@
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/model/attention/attn_kernels.h"
-#include "r4dx/model/attention/linear.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
 #include "r4dx/model/attention/types.hpp"
 
@@ -73,9 +73,18 @@ class AttentionLayer {
   // by a plain/async host upload into arena-reused bytes would race the still-in-flight kernels
   // from a previous layer's use of those same bytes (see gdn_layer.cpp's UploadArray comment for
   // the same hazard class); a caller-owned, non-arena buffer sidesteps that entirely.
+  // R3 fusion (docs/r9700.md P2/R3), mirrors Mlp::Forward/GdnLayer::Forward's trailing params:
+  // `x_normed_in` non-null skips this block's own input rmsnorm; `next_norm_weight` non-null
+  // replaces the final residual add with r4dx_residual_rmsnorm_bf16(...), additionally writing the
+  // normed sum into `x_normed_out` for this SAME layer's own Mlp to consume as its x_normed_in.
+  // `prof` (Milestone 3 profiling pass, docs/r9700.md R5/Q3/Q7): non-null only under r4dx-cli
+  // --profile -- see profile_span.h's file comment for the naming convention ("gemm:" prefix) and
+  // the zero-overhead guarantee when nullptr (every real decode/prefill call site).
   void Forward(core::Arena& arena, const uint16_t* hidden_in, uint16_t* out, const AttnWeights& w,
                PagedKvCache& kv, int T, int start_pos, const int32_t* positions,
-               const int32_t* seqused_k, hipStream_t stream) {
+               const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
+               const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
+               SpanAccumulator* prof = nullptr) {
     if (T < 1 || T > 64) {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
@@ -89,11 +98,19 @@ class AttentionLayer {
     const int gqa = cfg_.Gqa();
 
     // ---- input rmsnorm ------------------------------------------------------------------------
-    uint16_t* normed = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
-    r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(hidden_in),
-                       reinterpret_cast<int64_t>(w.input_layernorm),
-                       reinterpret_cast<int64_t>(normed), T, hidden, cfg_.rms_eps,
-                       reinterpret_cast<int64_t>(stream));
+    // R3 (docs/r9700.md): skip this launch when the previous layer's Mlp already fused it.
+    const uint16_t* normed = x_normed_in;
+    uint16_t* normed_scratch = nullptr;
+    if (normed == nullptr) {
+      normed_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
+      ProfiledCall(prof, stream, "attn.rmsnorm", [&] {
+        r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(hidden_in),
+                           reinterpret_cast<int64_t>(w.input_layernorm),
+                           reinterpret_cast<int64_t>(normed_scratch), T, hidden, cfg_.rms_eps,
+                           reinterpret_cast<int64_t>(stream));
+      });
+      normed = normed_scratch;
+    }
 
     // ---- fused q_proj + output gate, then split per-head-interleaved --------------------------
     // Dispatched through the shared r4dx::model::ApplyLinear (decode-perf pass, 2026-09-19) --
@@ -102,43 +119,55 @@ class AttentionLayer {
     // (attention/linear.hpp) for this weight -- that wrapper is still used below for k/v, which
     // have no quantized on-disk form.
     uint16_t* qg_raw = arena.Alloc<uint16_t>(static_cast<size_t>(T) * 2 * H * D);
-    ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T);
+    ProfiledCall(prof, stream, "gemm:attn.qg_proj", [&] {
+      ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T);
+    });
 
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
     uint16_t* gate = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
-    r4dx_model_attn_split_qg_bf16(reinterpret_cast<int64_t>(qg_raw), reinterpret_cast<int64_t>(q),
-                                   reinterpret_cast<int64_t>(gate), T, H, D,
-                                   reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.split_qg", [&] {
+      r4dx_model_attn_split_qg_bf16(reinterpret_cast<int64_t>(qg_raw), reinterpret_cast<int64_t>(q),
+                                     reinterpret_cast<int64_t>(gate), T, H, D,
+                                     reinterpret_cast<int64_t>(stream));
+    });
 
     // ---- k / v projections ---------------------------------------------------------------------
-    const Linear k_lin{w.k_w, Hkv * D, hidden};
-    const Linear v_lin{w.v_w, Hkv * D, hidden};
+    // Dispatched through the shared ApplyLinear (R1, docs/r9700.md), same as qg/o above -- k/v now
+    // honor `--layout` too (Container::Load falls back to bf16 when the requested layout's tensors
+    // are absent, e.g. mtp.attn.k/v, which are always bf16 by design). Replaces this component's
+    // own bf16-only Linear wrapper (attention/linear.hpp), which is now unused.
     uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
     uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
-    k_lin.Gemm(normed, T, k, stream);
-    v_lin.Gemm(normed, T, v, stream);
+    ProfiledCall(prof, stream, "gemm:attn.k_proj", [&] { ApplyLinear(stream, arena, *w.k, normed, k, T); });
+    ProfiledCall(prof, stream, "gemm:attn.v_proj", [&] { ApplyLinear(stream, arena, *w.v, normed, v, T); });
 
     // ---- per-head q_norm / k_norm (RMSNorm over head_dim, one shared weight per head) ----------
-    r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(w.q_norm),
-                       reinterpret_cast<int64_t>(q), static_cast<int64_t>(T) * H, D, cfg_.rms_eps,
-                       reinterpret_cast<int64_t>(stream));
-    r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(w.k_norm),
-                       reinterpret_cast<int64_t>(k), static_cast<int64_t>(T) * Hkv, D,
-                       cfg_.rms_eps, reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.qk_norm", [&] {
+      r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(w.q_norm),
+                         reinterpret_cast<int64_t>(q), static_cast<int64_t>(T) * H, D, cfg_.rms_eps,
+                         reinterpret_cast<int64_t>(stream));
+      r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(w.k_norm),
+                         reinterpret_cast<int64_t>(k), static_cast<int64_t>(T) * Hkv, D,
+                         cfg_.rms_eps, reinterpret_cast<int64_t>(stream));
+    });
 
     // ---- partial-rotary mrope (text-only: all three position streams == token position) --------
-    r4dx_rope_partial_mrope_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
-                                  reinterpret_cast<int64_t>(positions), T, H, Hkv, D,
-                                  cfg_.rotary_dim, cfg_.rope_theta,
-                                  reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.rope", [&] {
+      r4dx_rope_partial_mrope_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
+                                    reinterpret_cast<int64_t>(positions), T, H, Hkv, D,
+                                    cfg_.rotary_dim, cfg_.rope_theta,
+                                    reinterpret_cast<int64_t>(stream));
+    });
 
     // ---- fp8 paged KV cache write (post-rope K, per docs/architecture.md) -- BEFORE the attn call
     // `positions` doubles as the slot_mapping (contiguous block table: slot==pos, see above).
-    r4dx_kv_write_paged_fp8_hnd(
-        reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(v),
-        reinterpret_cast<int64_t>(positions), reinterpret_cast<int64_t>(w.k_descale),
-        reinterpret_cast<int64_t>(w.v_descale), reinterpret_cast<int64_t>(kv.Data()), T, Hkv, D,
-        kv.BlockSize(), kv.KvBlockStride(), kv.KvHeadStride(), reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.kv_write", [&] {
+      r4dx_kv_write_paged_fp8_hnd(
+          reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(v),
+          reinterpret_cast<int64_t>(positions), reinterpret_cast<int64_t>(w.k_descale),
+          reinterpret_cast<int64_t>(w.v_descale), reinterpret_cast<int64_t>(kv.Data()), T, Hkv, D,
+          kv.BlockSize(), kv.KvBlockStride(), kv.KvHeadStride(), reinterpret_cast<int64_t>(stream));
+    });
 
     // ---- r4d attention: prefill for q_len beyond the decode/verify-window band, decode otherwise
     // (r4d.h: decode/split-KV kernel serves q_len*gqa<=64) ---------------------------------------
@@ -173,28 +202,45 @@ class AttentionLayer {
       const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
       a.scratch = scratch_bytes > 0 ? arena.Alloc<uint8_t>(static_cast<size_t>(scratch_bytes))
                                      : nullptr;
-      r4dx::core::r4d::AttnDecodeFp8Kv(a, stream);
+      ProfiledCall(prof, stream, "attn.core_decode",
+                   [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
     } else {
       a.scratch = nullptr;
-      r4dx::core::r4d::AttnPrefillFp8Kv(a, stream);
+      ProfiledCall(prof, stream, "attn.core_prefill",
+                   [&] { r4dx::core::r4d::AttnPrefillFp8Kv(a, stream); });
     }
 
     // ---- output gate: attn_out * sigmoid(gate) --------------------------------------------------
     uint16_t* gated = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
-    r4dx_model_attn_gate_mul_bf16(reinterpret_cast<int64_t>(attn_out),
-                                   reinterpret_cast<int64_t>(gate),
-                                   reinterpret_cast<int64_t>(gated),
-                                   static_cast<int64_t>(T) * H * D,
-                                   reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.gate_mul", [&] {
+      r4dx_model_attn_gate_mul_bf16(reinterpret_cast<int64_t>(attn_out),
+                                     reinterpret_cast<int64_t>(gate),
+                                     reinterpret_cast<int64_t>(gated),
+                                     static_cast<int64_t>(T) * H * D,
+                                     reinterpret_cast<int64_t>(stream));
+    });
 
     // ---- o_proj ----------------------------------------------------------------------------------
     uint16_t* o_out = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
-    ApplyLinear(stream, arena, *w.o, gated, o_out, T);
+    ProfiledCall(prof, stream, "gemm:attn.o_proj", [&] {
+      ApplyLinear(stream, arena, *w.o, gated, o_out, T);
+    });
 
     // ---- residual add ------------------------------------------------------------------------
-    r4dx_residual_add_bf16(reinterpret_cast<int64_t>(hidden_in), reinterpret_cast<int64_t>(o_out),
-                            reinterpret_cast<int64_t>(out), static_cast<int64_t>(T) * hidden,
-                            reinterpret_cast<int64_t>(stream));
+    ProfiledCall(prof, stream, "attn.residual", [&] {
+      if (next_norm_weight != nullptr) {
+        r4dx_residual_rmsnorm_bf16(reinterpret_cast<int64_t>(hidden_in),
+                                    reinterpret_cast<int64_t>(o_out),
+                                    reinterpret_cast<int64_t>(next_norm_weight),
+                                    reinterpret_cast<int64_t>(out),
+                                    reinterpret_cast<int64_t>(x_normed_out), T, hidden, cfg_.rms_eps,
+                                    reinterpret_cast<int64_t>(stream));
+      } else {
+        r4dx_residual_add_bf16(reinterpret_cast<int64_t>(hidden_in), reinterpret_cast<int64_t>(o_out),
+                                reinterpret_cast<int64_t>(out), static_cast<int64_t>(T) * hidden,
+                                reinterpret_cast<int64_t>(stream));
+      }
+    });
   }
 
   const AttnConfig& Config() const { return cfg_; }

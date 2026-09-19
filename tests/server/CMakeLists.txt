@@ -10,6 +10,7 @@ set(R4DX_SERVER_TESTS
   test_sse
   test_response_sink
   test_request_queue
+  test_prefix_state
 )
 
 foreach(t ${R4DX_SERVER_TESTS})

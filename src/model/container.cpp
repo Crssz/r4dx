@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 
 #include "nlohmann/json.hpp"
@@ -126,11 +127,75 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const std::string& base,
   return q;
 }
 
+// True iff `r` carries every tensor `LoadQuantLinear(r, base, layout, ...)` would read.
+bool HasLayout(const SafetensorsReader& r, const std::string& base, Layout layout) {
+  switch (layout) {
+    case Layout::kBf16: return r.Has(base + ".bf16.w");
+    case Layout::kW4a16: return r.Has(base + ".w4a16.wq") && r.Has(base + ".w4a16.wsz");
+    case Layout::kW4a8: return r.Has(base + ".w4a8.wq") && r.Has(base + ".w4a8.ws");
+    case Layout::kMxfp4:
+      return r.Has(base + ".mxfp4.wq") && r.Has(base + ".mxfp4.ws") && r.Has(base + ".mxfp4.wref");
+  }
+  return false;
+}
+
+// R1 (docs/r9700.md): gdn.in_proj_z and attn.k/v join the quantized-linear family (previously
+// bf16-only, no `.{layout}` suffix at all). Three tiers, in order:
+//   1. `base` carries the requested `layout` -- load it normally (the common case for any
+//      container converted with the new converter and --layouts including this layout).
+//   2. `base` carries `.bf16.w` but not the requested layout (e.g. --layouts omitted this
+//      quantized form, or the requested layout is bf16 itself) -- fall back to bf16 rather than
+//      throwing, exactly like docs/container-format.md's other multi-layout linears already do
+//      when a caller requests a layout the container didn't bake in.
+//   3. `base` is a bare single tensor with no `.{layout}` suffix at all -- the OLD, pre-R1
+//      on-disk form these three tensors used to have exclusively (every container converted
+//      before this pass). Old containers keep working unmodified (task requirement).
+QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const std::string& base,
+                                         Layout requested, int64_t N, int64_t K) {
+  if (HasLayout(r, base, requested)) return LoadQuantLinear(r, base, requested, N, K);
+  if (HasLayout(r, base, Layout::kBf16)) return LoadQuantLinear(r, base, Layout::kBf16, N, K);
+  if (r.Has(base)) {
+    QuantLinear q;
+    q.layout = Layout::kBf16;
+    q.N = N;
+    q.K = K;
+    q.bf16_w = UploadRawU16(r, base);
+    return q;
+  }
+  throw std::runtime_error("r4dx::model::Container: no tensor found for '" + base +
+                            "' in any known on-disk form (requested layout, bf16, or bare)");
+}
+
+}  // namespace
+
+namespace {
+
+// R14/Q13 (docs/r9700.md): a `hipMemGetInfo` snapshot taken before any weight upload begins, so
+// Container::Load can tell whether the layout it is about to load will fit in what's currently
+// free -- the bf16 64-layer layout's 47.73 GiB against a fresh 31.86 GiB card is exactly the case
+// this catches (§2.1's "bf16 does not fit" finding): the driver does not fail an oversubscribing
+// hipMalloc outright, it silently pages the excess over PCIe (WDDM), so a loud stderr warning here
+// is the only signal a caller gets before decode throughput craters. `hipMemGetInfo` failures
+// (device not yet selected, etc.) are swallowed to 0/0 -- this diagnostic must never be why a load
+// fails.
+struct VramSnapshot {
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  bool ok = false;
+};
+VramSnapshot SnapshotVram() {
+  VramSnapshot s;
+  s.ok = (hipMemGetInfo(&s.free_bytes, &s.total_bytes) == hipSuccess);
+  return s;
+}
+double GiB(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0); }
+
 }  // namespace
 
 Container Container::Load(const std::string& path, Layout layout, Layout lm_head_layout,
                            int64_t layer_limit, Layout mtp_head_layout,
                            bool embed_device_resident) {
+  const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
   c.model_id_ = metadata.value("model_id", std::string());
@@ -192,7 +257,8 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       GdnWeights g;
       g.in_proj_qkv = LoadQuantLinear(reader, base + "gdn.in_proj_qkv", layout,
                                        2 * key_dim + value_dim, hidden);
-      g.in_proj_z = UploadRawU16(reader, base + "gdn.in_proj_z");
+      g.in_proj_z =
+          LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_z", layout, value_dim, hidden);
       g.in_proj_b = UploadRawU16(reader, base + "gdn.in_proj_b");
       g.in_proj_a = UploadRawU16(reader, base + "gdn.in_proj_a");
       g.conv1d_weight = UploadRawU16(reader, base + "gdn.conv1d_weight");
@@ -209,14 +275,15 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       // already supports. See docs/perf.md for the measured per-layout VRAM/throughput delta this
       // unlocks (attn.qg/o account for 16 of 64 layers' full-attention projections).
       a.qg = LoadQuantLinear(reader, base + "attn.qg", layout, attn_out * 2, hidden);
-      a.k = UploadRawU16(reader, base + "attn.k");
-      a.v = UploadRawU16(reader, base + "attn.v");
+      a.k = LoadQuantLinearWithFallback(reader, base + "attn.k", layout,
+                                         kv_heads * c.config_.head_dim, hidden);
+      a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", layout,
+                                         kv_heads * c.config_.head_dim, hidden);
       a.o = LoadQuantLinear(reader, base + "attn.o", layout, hidden, attn_out);
       a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
       a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
       a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
       a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
-      (void)kv_heads;
       lw.attn = std::move(a);
     }
 
@@ -249,8 +316,16 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     // the body layers above.
     AttnWeights a;
     a.qg = LoadQuantLinear(reader, base + "attn.qg", mtp_head_layout, attn_out * 2, hidden);
-    a.k = UploadRawU16(reader, base + "attn.k");
-    a.v = UploadRawU16(reader, base + "attn.v");
+    // mtp.attn.k/v stay bf16 regardless of the requested body/head layout (docs/r9700.md's R1
+    // task: "Keep mtp.* ... as they are") -- request Layout::kBf16 explicitly rather than
+    // `layout`/`mtp_head_layout`, so this never picks up a quantized form even if a future
+    // converter run ever quantized mtp.*. LoadQuantLinearWithFallback (not UploadRawU16) so this
+    // still works against the OLD bare-tensor on-disk form (pre-R1 containers) as well as any
+    // future `.bf16.w`-suffixed form -- see LoadQuantLinearWithFallback's own comment.
+    a.k = LoadQuantLinearWithFallback(reader, base + "attn.k", Layout::kBf16,
+                                       kv_heads * c.config_.head_dim, hidden);
+    a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", Layout::kBf16,
+                                       kv_heads * c.config_.head_dim, hidden);
     a.o = LoadQuantLinear(reader, base + "attn.o", mtp_head_layout, hidden, attn_out);
     a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
     a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
@@ -267,6 +342,42 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     mw.pre_fc_norm_hidden = UploadRawU16(reader, "mtp.pre_fc_norm_hidden");
     mw.pre_fc_norm_embedding = UploadRawU16(reader, "mtp.pre_fc_norm_embedding");
     c.mtp_ = std::move(mw);
+  }
+
+  // R14 (docs/r9700.md): warn, don't fail, if this load just consumed more VRAM than was free
+  // when it started -- the bf16-on-64-layer case (47.73 GiB of weights on a 31.86 GiB card) is
+  // exactly the scenario docs/r9700.md's §2.1 finding describes: hipMalloc does not error, WDDM
+  // silently pages the excess over PCIe, and the only symptom is a 20-30x decode slowdown with no
+  // diagnostic anywhere. Two conditions, either one fires the warning:
+  //   (a) consumed (vram_before.free_bytes - vram_after.free_bytes) exceeds what was free before
+  //       loading started -- the "textbook" over-commit signal, correct if hipMemGetInfo ever
+  //       reported a negative-implied free.
+  //   (b) it doesn't, in practice: measured against the real bf16 container on this card,
+  //       `hipMemGetInfo` instead CLAMPS free at ~0 rather than reporting the true 47.73 GiB
+  //       logical footprint against a 31.86 GiB card (WDDM's virtual/physical split hides the
+  //       over-commit from this API) -- so (a) alone never fires for the exact case R14 exists to
+  //       catch. (b) instead flags "this call drove free VRAM to near-zero starting from headroom
+  //       that was NOT already near-zero", which is what was actually observed.
+  if (vram_before.ok) {
+    const VramSnapshot vram_after = SnapshotVram();
+    if (vram_after.ok) {
+      constexpr uint64_t kNearZeroThreshold = 1ull << 30;  // 1 GiB
+      const bool over_committed_signal =
+          vram_after.free_bytes < vram_before.free_bytes &&
+          (vram_before.free_bytes - vram_after.free_bytes) > vram_before.free_bytes;
+      const bool clamped_near_zero_signal =
+          vram_after.free_bytes < kNearZeroThreshold && vram_before.free_bytes >= kNearZeroThreshold;
+      if (over_committed_signal || clamped_near_zero_signal) {
+        std::cerr << "[r4dx::model::Container] WARNING: layout '" << LayoutName(layout)
+                  << "' left only " << GiB(vram_after.free_bytes) << " GiB free (was "
+                  << GiB(vram_before.free_bytes) << " GiB free before this load) -- this looks like "
+                  << "an over-committed load (docs/r9700.md §2.1's bf16-on-64-layer finding: 47.73 "
+                  << "GiB of weights on a 31.86 GiB card). hipMalloc does not error on this; the "
+                  << "driver (WDDM) silently pages the excess over PCIe, and the only symptom is "
+                  << "decode throughput far below any quantized-layout number (\"bf16-layout "
+                  << "performance work\" is explicitly out of scope for this reason).\n";
+      }
+    }
   }
 
   return c;

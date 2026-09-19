@@ -17,6 +17,11 @@ namespace {
 
 constexpr int kThreads = 256;
 
+// Kernel launch counter (docs/r9700.md P2/task item 4) -- see kernels.h's doc comment. Plain
+// global, not atomic: Model is single-worker-thread (model.h's own SCOPE comment), matching
+// linear.cpp's PickTuning cache's identical no-lock reasoning.
+int64_t g_launch_count = 0;
+
 __device__ __forceinline__ float Sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ float BlockReduceSum(float v) {
@@ -309,6 +314,7 @@ extern "C" {
 void r4dx_rmsnorm_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
                         float eps, int64_t stream) {
   if (rows <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(RmsNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
                      (__hip_bfloat16*)out, hidden, eps);
@@ -319,6 +325,7 @@ void r4dx_residual_rmsnorm_bf16(int64_t x, int64_t residual, int64_t weight,
                                  int64_t out_residual, int64_t out_normed, int64_t rows,
                                  int64_t hidden, float eps, int64_t stream) {
   if (rows <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(ResidualRmsNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x,
                      (const __hip_bfloat16*)residual, (const __hip_bfloat16*)weight,
@@ -328,6 +335,7 @@ void r4dx_residual_rmsnorm_bf16(int64_t x, int64_t residual, int64_t weight,
 
 void r4dx_residual_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_t stream) {
   if (n <= 0) return;
+  ++g_launch_count;
   unsigned blocks = static_cast<unsigned>((n + kThreads - 1) / kThreads);
   hipLaunchKernelGGL(ResidualAddKernel, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
                      (const __hip_bfloat16*)a, (const __hip_bfloat16*)b, (__hip_bfloat16*)out, n);
@@ -337,6 +345,7 @@ void r4dx_residual_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_
 void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
                          int64_t in_row_stride, int64_t stream) {
   if (rows <= 0 || intermediate <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(SiluMulKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)gate_up, (__hip_bfloat16*)out,
                      intermediate, in_row_stride);
@@ -347,6 +356,7 @@ void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tok
                                    int heads_k, int head_dim, int rotary_dim, float theta,
                                    int64_t stream) {
   if (tokens <= 0) return;
+  ++g_launch_count;
   int threads = rotary_dim / 2;
   if (threads > 256) threads = 256;
   if (threads < 1) threads = 1;
@@ -359,6 +369,7 @@ void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tok
 void r4dx_quant_act_fp8e4m3_row(int64_t x, int64_t q, int64_t scale, int M, int K,
                                  int64_t stream) {
   if (M <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(QuantActFp8Kernel, dim3(static_cast<unsigned>(M)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (uint8_t*)q, (float*)scale, K);
   R4DX_HIP_CHECK(hipGetLastError());
@@ -370,6 +381,7 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                                   int64_t kv_block_stride, int64_t kv_head_stride,
                                   int64_t stream) {
   if (T <= 0 || kv_heads <= 0) return;
+  ++g_launch_count;
   int threads = head_dim < 256 ? head_dim : 256;
   hipLaunchKernelGGL(KvWritePagedFp8Kernel, dim3(static_cast<unsigned>(T), static_cast<unsigned>(kv_heads)),
                      dim3(threads), 0, (hipStream_t)stream, (const __hip_bfloat16*)k_new,
@@ -381,6 +393,7 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
 
 void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
   if (vocab <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
                      (const float*)logits, (int32_t*)out_idx, vocab);
   R4DX_HIP_CHECK(hipGetLastError());
@@ -389,10 +402,15 @@ void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t str
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
                                  int64_t stream) {
   if (n <= 0) return;
+  ++g_launch_count;
   hipLaunchKernelGGL(EmbeddingGatherKernel, dim3(static_cast<unsigned>(n)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)ids,
                      (__hip_bfloat16*)out, hidden);
   R4DX_HIP_CHECK(hipGetLastError());
 }
+
+void r4dx_kernel_launch_counter_reset() { g_launch_count = 0; }
+
+int64_t r4dx_kernel_launch_counter_get() { return g_launch_count; }
 
 }  // extern "C"

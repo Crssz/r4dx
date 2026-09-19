@@ -37,6 +37,13 @@ struct ServerArgs {
   float default_min_p = 0.0f;
 
   std::string log_level = "info";  // one of debug|info|warn|error
+
+  // MTP self-speculative decode (docs/mtp.md), same semantics/default as src/cli/cli_args.h's
+  // --mtp: 0 (disabled) unless the loaded --model container was converted with --mtp on. Only
+  // ever used by a request whose OWN sampling is greedy (temperature<=0, checked per-request in
+  // src/server/engine.cpp's RunRequest) -- non-greedy requests always take plain decode regardless
+  // of this flag, matching r4dx::model::Model::DecodeStepMtpGreedy's greedy-only contract.
+  int64_t mtp = 0;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -52,7 +59,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
-         "[--default-min-p F] [--log-level {debug|info|warn|error}]";
+         "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -103,6 +110,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--default-top-k") a.default_top_k = ServerParseInt("--default-top-k", NextServerArg(argc, argv, i, "--default-top-k"));
     else if (arg == "--default-min-p") a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p"));
     else if (arg == "--log-level") a.log_level = NextServerArg(argc, argv, i, "--log-level");
+    else if (arg == "--mtp") a.mtp = ServerParseI64("--mtp", NextServerArg(argc, argv, i, "--mtp"));
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -118,6 +126,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.log_level != "debug" && a.log_level != "info" && a.log_level != "warn" && a.log_level != "error") {
     throw ServerUsageError("--log-level must be one of debug|info|warn|error");
   }
+  if (a.mtp < 0) throw ServerUsageError("--mtp must be >= 0");
   return a;
 }
 

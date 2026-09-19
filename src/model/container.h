@@ -32,7 +32,14 @@ namespace r4dx::model {
 // {attn, gdn} is populated, selected by ModelConfig::IsGdnLayer(layer_idx).
 struct AttnWeights {
   QuantLinear qg;   // fused q_proj + output gate, [num_heads*head_dim*2, hidden]
-  core::DeviceBuffer<uint16_t> k, v;              // bf16 [kv_heads*head_dim, hidden]
+  // k/v (R1, docs/r9700.md): now QuantLinear like every other layout-eligible linear --
+  // text.layers.{i}.attn.{k,v} carry mxfp4/w4a16/w4a8/bf16 like attn.qg/o when the container was
+  // converted with the new converter; Container::Load falls back to bf16 (or, for the oldest
+  // pre-R1 containers, the bare single-tensor form) when the requested layout's tensors are
+  // absent -- see container.cpp's LoadQuantLinearWithFallback. mtp.attn.k/v are always loaded
+  // bf16 regardless of the requested body layout (docs/r9700.md R1 task: "mtp.* stay as they
+  // are"), reusing this same field type.
+  QuantLinear k, v;                               // [kv_heads*head_dim, hidden]
   QuantLinear o;                                  // [hidden, num_heads*head_dim]
   core::DeviceBuffer<uint16_t> q_norm, k_norm;    // bf16 [head_dim]
   core::DeviceBuffer<float> k_descale, v_descale;  // fp32 [kv_heads]
@@ -40,8 +47,13 @@ struct AttnWeights {
 
 struct GdnWeights {
   QuantLinear in_proj_qkv;                         // [2*key_dim+value_dim, hidden]
-  core::DeviceBuffer<uint16_t> in_proj_z;           // bf16 [value_dim, hidden]
-  core::DeviceBuffer<uint16_t> in_proj_b, in_proj_a;  // bf16 [num_v_heads, hidden]
+  // in_proj_z (R1, docs/r9700.md): now QuantLinear -- 3.02 GB/token of what used to be forced
+  // bf16, now eligible for mxfp4/w4a16/w4a8 like in_proj_qkv/out_proj. Same
+  // LoadQuantLinearWithFallback fallback chain as attn.k/v above.
+  QuantLinear in_proj_z;                            // [value_dim, hidden]
+  core::DeviceBuffer<uint16_t> in_proj_b, in_proj_a;  // bf16 [num_v_heads, hidden] -- deliberately
+                                                     // left bf16 (docs/r9700.md R1: "too small to
+                                                     // matter, feed the decay path")
   core::DeviceBuffer<uint16_t> conv1d_weight;       // bf16 [conv_dim, width] (container's
                                                      // trailing singleton axis dropped)
   core::DeviceBuffer<float> A_log, dt_bias;         // fp32 [num_v_heads]

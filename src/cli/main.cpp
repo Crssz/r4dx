@@ -49,6 +49,16 @@ double VramUsedGiB() {
 // (including a trailing eos id if one was hit) plus prefill/decode wall-clock seconds.
 struct TurnResult {
   std::vector<int32_t> generated_tokens;
+  // Tokens actually committed into the model's real KV/GDN state this turn -- NOT always the same
+  // set as generated_tokens (docs/mtp.md's "mid-round" gap): an MTP round
+  // (Model::DecodeStepMtpGreedy) commits every candidate up to (not including) its own returned
+  // vector's LAST element atomically, in one call, regardless of whether main()'s per-token loop
+  // below then stops mid-vector (--max-tokens reached, or an EOS candidate that isn't the last
+  // element). `fed_tokens` (main(), below) must track committed_tokens, not generated_tokens, or
+  // a LATER --chat turn's prefix match can silently desync from the model's real position. Equal
+  // to generated_tokens on every non-MTP path (see RunTurn's plain-greedy/sampling loops, which
+  // feed each token in the very same iteration it is generated, same as this field would compute).
+  std::vector<int32_t> committed_tokens;
   std::string generated_text;
   double prefill_seconds = 0.0;
   double decode_seconds = 0.0;
@@ -64,36 +74,84 @@ struct TurnResult {
   int64_t mtp_accepted = 0;
 };
 
+// Milestone 3 profiling pass (docs/r9700.md R5/Q7): prints a StepProfile's per-op-family table plus
+// the "gemm:"-prefix GEMM-vs-non-GEMM split (profile_span.h's naming convention) shared by both
+// --profile (decode) and --profile-prefill. `divisor` lets a caller show "per chunk" or "per layer"
+// averages without changing what was actually measured (PrefillProfiled sums every chunk's every
+// layer into one bucket per name -- see that method's own doc comment, model.h).
+void PrintProfileTable(const r4dx::model::Model::StepProfile& prof, double divisor,
+                        const char* divisor_label) {
+  std::fprintf(stderr, "  %-55s %10s %8s %10s %12s\n", "GPU op family (hipEvent, overlaps enqueue)",
+               "ms", "calls", "% gpu_sum", divisor_label);
+  double gemm_ms = 0.0, non_gemm_ms = 0.0;
+  for (const auto& e : prof.entries) {
+    std::fprintf(stderr, "  %-55s %10.4f %8d %9.1f%% %12.4f\n", e.name.c_str(), e.ms, e.count,
+                 100.0 * e.ms / prof.gpu_sum_ms, e.ms / divisor);
+    if (e.name.rfind("gemm:", 0) == 0) gemm_ms += e.ms; else non_gemm_ms += e.ms;
+  }
+  std::fprintf(stderr, "  %-55s %10.4f\n", "(gpu_sum, NOT additive with wall/finish_wait)",
+               prof.gpu_sum_ms);
+  std::fprintf(stderr, "\n  %-55s %10.4f %9.1f%%\n", "GEMM share (names prefixed \"gemm:\")", gemm_ms,
+               100.0 * gemm_ms / prof.gpu_sum_ms);
+  std::fprintf(stderr, "  %-55s %10.4f %9.1f%%\n", "non-GEMM share (norm/rope/state/elementwise/attn-core)",
+               non_gemm_ms, 100.0 * non_gemm_ms / prof.gpu_sum_ms);
+  std::fprintf(stderr, "\n  %-55s %10lld\n",
+               "r4dx-owned kernel launches (docs/r9700.md P2/R3)",
+               static_cast<long long>(prof.r4dx_kernel_launches));
+}
+
 TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
                     const std::vector<int32_t>& new_tokens, const CliArgs& args) {
   TurnResult result;
   result.prefill_tokens = static_cast<int64_t>(new_tokens.size());
+
+  // Milestone 3 profiling pass (docs/r9700.md R5/Q7): --profile-prefill profiles the WHOLE prefill
+  // (chunked, per-kernel hipEvent spans -- Model::PrefillProfiled, model.cpp) instead of calling the
+  // normal (uninstrumented) Model::Prefill -- prints the table to stderr and returns immediately,
+  // same "standalone diagnostic, no generated text" contract --profile has (see below).
+  if (args.profile_prefill) {
+    const auto t0 = Clock::now();
+    const r4dx::model::Model::StepProfile prof = model.PrefillProfiled(new_tokens);
+    const auto t1 = Clock::now();
+    const int64_t num_chunks = (static_cast<int64_t>(new_tokens.size()) + 63) / 64;  // max_chunk_=64
+    std::fprintf(stderr,
+                 "[profile-prefill] %zu prompt tokens, %lld chunks (T<=64 each), layout=%s:\n",
+                 new_tokens.size(), static_cast<long long>(num_chunks), args.layout.c_str());
+    PrintProfileTable(prof, static_cast<double>(num_chunks), "ms/chunk");
+    std::fprintf(stderr, "  %-55s %10.4f\n", "wall (host, whole prefill)", prof.wall_ms);
+    std::fprintf(stderr, "  %-55s %10.2f\n", "prefill tok/s (wall)",
+                 static_cast<double>(new_tokens.size()) / Seconds(t0, t1));
+    result.prefill_seconds = Seconds(t0, t1);
+    return result;
+  }
 
   const auto t0 = Clock::now();
   std::vector<float> logits = model.Prefill(new_tokens);
   const auto t1 = Clock::now();
   result.prefill_seconds = Seconds(t0, t1);
 
-  // tools/profile pass (2026-09-19): --profile runs exactly one Model::DecodeStepProfiled call
-  // (hipEvent-timed per op-family, model.cpp) on the first generated token, prints the table to
-  // stderr, and returns WITHOUT running the normal generation loop below -- DecodeStepProfiled
-  // commits its token to the model's real KV/GDN state and advances pos_ exactly like a real
-  // DecodeStep (it needs to, to measure real kernel costs), so falling through into the ordinary
-  // sample-then-DecodeStep loop afterward would double-commit that same position from the stale
-  // pre-profile `logits` -- --profile is a standalone diagnostic invocation, not meant to be
-  // combined with getting correct generated text back (see docs/perf.md's profile table).
+  // Milestone 3 profiling pass (docs/r9700.md R5/Q2): --profile now profiles a STEADY-STATE decode
+  // step (args.profile_token, default the 32nd generated token) instead of the first one -- Q2's own
+  // finding was that the first generated token's DecodeStepProfiled call runs ~5.4 +/- 0.5 ms hotter
+  // than the throughput table's steady-state step in every layout, a near-constant offset diagnosed
+  // as first-token/instrumentation-warmup effects, not a per-layout effect (docs/perf.md's
+  // "Milestone 3 profiling truth" section has the full before/after numbers). The
+  // (args.profile_token - 1) DecodeStepGreedy calls below are plain, uninstrumented decode steps
+  // that warm the step up to steady state before the one profiled call; DecodeStepProfiled still
+  // commits its own token to real KV/GDN state and advances pos_ exactly like a real DecodeStep, so
+  // falling through into the ordinary sample-then-DecodeStep loop afterward would double-commit that
+  // position -- --profile remains a standalone diagnostic invocation, not meant to be combined with
+  // getting correct generated text back.
   if (args.profile) {
-    const int32_t first = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
-    const r4dx::model::Model::StepProfile prof = model.DecodeStepProfiled(first);
-    std::fprintf(stderr, "[profile] one decode step (T=1), layout=%s:\n", args.layout.c_str());
-    std::fprintf(stderr, "  %-55s %10s %8s %10s\n", "GPU op family (hipEvent, overlaps enqueue)",
-                 "ms", "calls", "% gpu_sum");
-    for (const auto& e : prof.entries) {
-      std::fprintf(stderr, "  %-55s %10.4f %8d %9.1f%%\n", e.name.c_str(), e.ms, e.count,
-                   100.0 * e.ms / prof.gpu_sum_ms);
+    int32_t cur_tok = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+    for (int64_t i = 1; i < args.profile_token; ++i) {
+      cur_tok = model.DecodeStepGreedy(cur_tok);
     }
-    std::fprintf(stderr, "  %-55s %10.4f\n", "(gpu_sum, NOT additive with wall/finish_wait)",
-                 prof.gpu_sum_ms);
+    const r4dx::model::Model::StepProfile prof = model.DecodeStepProfiled(cur_tok);
+    std::fprintf(stderr,
+                 "[profile] decode step #%lld (1-indexed generated token, T=1), layout=%s:\n",
+                 static_cast<long long>(args.profile_token), args.layout.c_str());
+    PrintProfileTable(prof, 1.0, "ms");
     std::fprintf(stderr, "\n  %-55s %10s %9s\n", "host-clock breakdown", "ms", "% of wall");
     std::fprintf(stderr, "  %-55s %10.4f %9.1f%%\n", "host_enqueue (CPU work + async launch issue)",
                  prof.host_enqueue_ms, 100.0 * prof.host_enqueue_ms / prof.wall_ms);
@@ -161,7 +219,15 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
       result.mtp_rounds += 1;
       result.mtp_drafted += args.mtp;
       result.mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
-      for (int32_t tok : round) {
+      // `next` (this call's own token_id argument) is now committed by the call above; every
+      // element of `round` EXCEPT its last is ALSO unconditionally committed atomically by that
+      // same call, regardless of whether the loop below decides to stop before reaching it (see
+      // TurnResult::committed_tokens's own comment / docs/mtp.md's "mid-round" gap).
+      result.committed_tokens.push_back(next);
+      for (size_t ri = 0; ri < round.size(); ++ri) {
+        const int32_t tok = round[ri];
+        const bool is_last_in_round = (ri + 1 == round.size());
+        if (!is_last_in_round) result.committed_tokens.push_back(tok);
         if (is_eos(tok)) { result.hit_eos = true; stopped = true; break; }
         if (static_cast<int64_t>(result.generated_tokens.size()) >= args.max_tokens) {
           stopped = true;
@@ -186,6 +252,7 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
         std::cout << piece << std::flush;
         result.generated_text += piece;
       }
+      result.committed_tokens.push_back(next);  // fed by the DecodeStepGreedy call just above
       next = model.DecodeStepGreedy(next);
     }
   } else {
@@ -200,6 +267,7 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
         result.generated_text += piece;
       }
       logits = model.DecodeStep(next);
+      result.committed_tokens.push_back(next);  // fed by the DecodeStep call just above
     }
   }
   const std::string tail = decoder.flush();
@@ -308,8 +376,10 @@ int RunMain(int argc, char** argv) {
     const TurnResult r = RunTurn(model, tok, new_tokens, args);
     std::cout << std::endl;
 
+    // committed_tokens (not generated_tokens) is what's actually in the model's KV/GDN state --
+    // see TurnResult::committed_tokens's own comment / docs/mtp.md's "mid-round" gap (fixed here).
     fed_tokens = full_tokens;
-    fed_tokens.insert(fed_tokens.end(), r.generated_tokens.begin(), r.generated_tokens.end());
+    fed_tokens.insert(fed_tokens.end(), r.committed_tokens.begin(), r.committed_tokens.end());
     messages.push_back({{"role", "assistant"}, {"content", r.generated_text}});
 
     if (args.stats) {

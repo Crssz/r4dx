@@ -324,8 +324,12 @@ int RunConvert(const AppArgs& args) {
       // Qwen3_5Attention builds it as Linear(hidden, num_heads*head_dim*2)); attn.qg is a direct
       // copy/quantize of it, no fusion needed at convert time.
       add_linear({hf + "self_attn.q_proj.weight"}, base + "attn.qg", layouts);
-      add_bf16(hf + "self_attn.k_proj.weight", base + "attn.k");
-      add_bf16(hf + "self_attn.v_proj.weight", base + "attn.v");
+      // attn.k/v (R1, docs/r9700.md): join the quantized-linear family -- 1024x5120 x16 layers,
+      // 0.336 GB/token, previously forced bf16 regardless of --layout. Same LayoutSet as every
+      // other body linear, so a run without --layouts w4a16 (say) simply omits that variant here
+      // too, exactly like attn.qg/o already do.
+      add_linear({hf + "self_attn.k_proj.weight"}, base + "attn.k", layouts);
+      add_linear({hf + "self_attn.v_proj.weight"}, base + "attn.v", layouts);
       add_linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", layouts);
       add_bf16(hf + "self_attn.q_norm.weight", base + "attn.q_norm");
       add_bf16(hf + "self_attn.k_norm.weight", base + "attn.k_norm");
@@ -333,7 +337,11 @@ int RunConvert(const AppArgs& args) {
       add_descale(base + "attn.v_descale", kv_heads, i, "v", /*calib_applicable=*/true);
     } else {
       add_linear({hf + "linear_attn.in_proj_qkv.weight"}, base + "gdn.in_proj_qkv", layouts);
-      add_bf16(hf + "linear_attn.in_proj_z.weight", base + "gdn.in_proj_z");
+      // gdn.in_proj_z (R1, docs/r9700.md): joins the quantized-linear family -- 6144x5120 x48
+      // layers, 3.02 GB/token, the single largest bf16-only tensor in the model (more bytes/token
+      // than the entire quantized GDN weight set combined). in_proj_a/in_proj_b stay bf16 (too
+      // small to matter, feed the decay path).
+      add_linear({hf + "linear_attn.in_proj_z.weight"}, base + "gdn.in_proj_z", layouts);
       add_bf16(hf + "linear_attn.in_proj_b.weight", base + "gdn.in_proj_b");
       add_bf16(hf + "linear_attn.in_proj_a.weight", base + "gdn.in_proj_a");
       add_bf16(hf + "linear_attn.conv1d.weight", base + "gdn.conv1d_weight");
@@ -420,7 +428,13 @@ int RunConvert(const AppArgs& args) {
       // bf16 for attn.o and silently lose the 4-bit A/B the container exists to enable.
       {"text.layers.*.mlp.gate_up|down", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
       {"text.layers.*.attn.qg|o", "mxfp4|w4a16|w4a8|bf16 (all four present)"},
-      {"text.layers.*.attn.k|v", "bf16"},
+      // R1 (docs/r9700.md): attn.k/v and gdn.in_proj_z now join the quantized-linear family (were
+      // "bf16" unconditionally before this pass) -- old containers built before this change still
+      // have the bare, unsuffixed bf16-only tensor; src/model/container.cpp's
+      // LoadQuantLinearWithFallback handles both on-disk forms.
+      {"text.layers.*.attn.k|v", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
+      {"text.layers.*.gdn.in_proj_z", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
+      {"text.layers.*.gdn.in_proj_a|b", "bf16 (never quantized -- feeds the decay path)"},
       {"mtp.attn.qg|o", "mxfp4|w4a16|w4a8|bf16 (all four present, when --mtp on)"},
       {"mtp.attn.k|v", "bf16 (when --mtp on)"},
       {"mtp.mlp.gate_up|down", "mxfp4|w4a16|w4a8|bf16 (all four present, when --mtp on)"},

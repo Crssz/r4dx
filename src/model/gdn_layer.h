@@ -20,6 +20,9 @@
 
 namespace r4dx::model {
 
+class SpanAccumulator;  // profile_span.h -- forward-declared so this header does not need to
+                         // include it; only gdn_layer.cpp's implementation does.
+
 struct GdnLayerParams {
   int32_t slot = 1;        // GdnStateManager::SlotForSeq(seq) -- this sequence's WINDOW INDEX 0
                             // physical slot (>= 1); see GdnStateManager's file comment.
@@ -51,9 +54,22 @@ class GdnLayer {
   // supplies this call's tiny cu/cache_idx/has_init/sidx device arrays (see GdnControlCache);
   // typically one instance shared by every GDN layer in a Model since these arrays are pure
   // functions of (T, slot), not of the layer's own weights.
+  // R3 fusion (docs/r9700.md P2/R3), mirrors Mlp::Forward's trailing params: `x_normed_in`
+  // non-null skips this block's own input rmsnorm (the previous layer's Mlp already fused it).
+  // `next_norm_weight` non-null replaces the final residual add with
+  // r4dx_residual_rmsnorm_bf16(...), additionally writing this block's own Mlp-normed input into
+  // `x_normed_out` (always the SAME layer's Mlp -- every GDN layer in this architecture is
+  // immediately followed by its own Mlp, so a caller wiring this fusion passes that Mlp's
+  // post_attention_layernorm here unconditionally).
+  // `prof` (Milestone 3 profiling pass, docs/r9700.md R5/Q3): non-null only under r4dx-cli
+  // --profile (Model::DecodeStepProfiled/PrefillProfiled) -- wraps every kernel this call launches
+  // in its own named hipEvent span (see profile_span.h's file comment for the naming convention and
+  // the zero-overhead guarantee when this is nullptr, the case on every real decode/prefill path).
   void Forward(core::Stream& stream, core::Arena& arena, GdnStateManager& states,
                GdnControlCache& control, const uint16_t* x, uint16_t* x_out, int64_t T,
-               const GdnLayerParams& p);
+               const GdnLayerParams& p, const uint16_t* x_normed_in = nullptr,
+               const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
+               SpanAccumulator* prof = nullptr);
 
  private:
   const ModelConfig& cfg_;

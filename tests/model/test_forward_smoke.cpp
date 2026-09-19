@@ -81,6 +81,34 @@ double PrefillDecodeEquivRelErr(const ModelOptions& opts, const std::vector<int3
   return RelL2(logits_b, logits_a);
 }
 
+// Model::Reset() (src/server's cheap alternative to a full Model::Load() on a prefix mismatch,
+// docs/server.md "Reset cost") must be indistinguishable from a fresh Load() for everything this
+// test exercises: `reused` already carries state from an earlier prefill+decode run (unlike
+// PrefillDecodeEquivRelErr's two always-fresh Models above) -- Reset() it in place, replay the
+// exact same prompt+decode sequence, and diff against a genuinely fresh Model doing the same
+// thing. This is a much tighter bar than the "small measured kernel-noise error" the prefill/
+// decode equivalence check above tolerates: Reset()+replay and a fresh Load()+the same calls run
+// the IDENTICAL sequence of kernels over IDENTICAL state, so any gap here means Reset() left some
+// piece of state (GDN recurrent/conv, MTP seed/accept bookkeeping, pos_/started_) not truly
+// reset to its post-Load() value, not ordinary GPU reduction-order noise.
+double ResetMatchesFreshLoadRelErr(Model& reused, const ModelOptions& opts,
+                                    const std::vector<int32_t>& prompt, int32_t decode_tok) {
+  reused.Reset();
+  if (reused.PositionCount() != 0) {
+    std::fprintf(stderr, "FAIL: Model::Reset() left PositionCount()=%lld, expected 0\n",
+                 static_cast<long long>(reused.PositionCount()));
+    return 1e9;  // fail the caller's tolerance check unconditionally
+  }
+  std::vector<float> logits_reset = reused.Prefill(prompt);
+  for (int step = 0; step < 5; ++step) logits_reset = reused.DecodeStep(decode_tok);
+
+  Model fresh = Model::Load(opts);
+  std::vector<float> logits_fresh = fresh.Prefill(prompt);
+  for (int step = 0; step < 5; ++step) logits_fresh = fresh.DecodeStep(decode_tok);
+
+  return RelL2(logits_reset, logits_fresh);
+}
+
 }  // namespace
 
 int main() {
@@ -144,6 +172,20 @@ int main() {
                    prompt.size() + 5);
       return 1;
     }
+
+    // Model::Reset() must exactly reproduce a fresh Model::Load() (see helper's own comment) --
+    // `model` above already carries real prefill+decode state at this point, so this genuinely
+    // exercises Reset() clearing something, not a no-op on an already-clean Model.
+    const double reset_rel = ResetMatchesFreshLoadRelErr(model, opts, prompt, tok);
+    const double reset_tol = 1e-4;  // near-exact: identical kernels over identical state, not a
+                                     // cross-run/cross-path comparison like equiv_tol below
+    if (!(reset_rel < reset_tol)) {
+      std::fprintf(stderr, "FAIL [%s]: Model::Reset() vs fresh Load() rel L2=%.4e (tol=%.0e)\n",
+                   LayoutName(layout), reset_rel, reset_tol);
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s Model::Reset() matches fresh Load() rel L2=%.4e\n",
+                 LayoutName(layout), reset_rel);
 
     // Value-gated prefill/decode state-handoff equivalence (file header comment): Prefill(prompt)
     // vs Prefill(prompt[:-1]) + DecodeStep(prompt[-1]) must land on the same next-token logits.

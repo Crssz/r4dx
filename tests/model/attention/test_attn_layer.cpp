@@ -166,7 +166,8 @@ std::vector<uint16_t> ExpectedResidualSum(const std::vector<uint16_t>& residual,
 }
 
 void ReportQuantizedLayouts(const SafetensorsReader& container) {
-  const char* bases[] = {"text.layers.3.attn.qg", "text.layers.3.attn.o"};
+  const char* bases[] = {"text.layers.3.attn.qg", "text.layers.3.attn.o", "text.layers.3.attn.k",
+                          "text.layers.3.attn.v"};
   const char* layouts[] = {"bf16.w", "mxfp4.wq", "w4a16.wq", "w4a8.wq"};
   std::printf("quantized layouts present in %s (informational; the quantized layouts below are "
               "now actually dispatched through AttentionLayer/ApplyLinear and rel-err REPORTED, "
@@ -270,10 +271,22 @@ bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfi
                   R4DX_BF16_CONTAINER_PATH);
       continue;
     }
+    // k/v (R1, docs/r9700.md): optional -- a container converted before this pass carries qg/o in
+    // every quantized layout but k/v only bf16, so k_ql/v_ql legitimately come back nullopt on an
+    // old fixture; this loop still exercises qg/o's own quantized dispatch in that case (unchanged
+    // behavior), it just cannot also report k/v's accuracy until the fixture is regenerated.
+    auto k_ql = TryLoadQuantLinear(container, "text.layers.3.attn.k", layout,
+                                    static_cast<int64_t>(Hkv) * D, hidden);
+    auto v_ql = TryLoadQuantLinear(container, "text.layers.3.attn.v", layout,
+                                    static_cast<int64_t>(Hkv) * D, hidden);
 
     AttnWeights w = bf16_w;
     w.qg = &*qg_ql;
     w.o = &*o_ql;
+    if (k_ql) w.k = &*k_ql;
+    if (v_ql) w.v = &*v_ql;
+    std::printf("  (k/v at %-6s: %s)\n", LayoutName(layout),
+                (k_ql && v_ql) ? "quantized" : "bf16 fallback (container predates R1)");
 
     AttentionLayer layer(cfg);
     PagedKvCache kv(Hkv, D, dims.block_size, /*max_context_tokens=*/128);
@@ -324,10 +337,14 @@ int main() {
   auto input_layernorm_h = ReadContainerBf16(container, "text.layers.3.input_layernorm", hidden);
   auto qg_w_h = ReadContainerBf16(container, "text.layers.3.attn.qg.bf16.w",
                                    static_cast<int64_t>(2) * H * D * hidden);
-  auto k_w_h =
-      ReadContainerBf16(container, "text.layers.3.attn.k", static_cast<int64_t>(Hkv) * D * hidden);
-  auto v_w_h =
-      ReadContainerBf16(container, "text.layers.3.attn.v", static_cast<int64_t>(Hkv) * D * hidden);
+  // attn.k/v (R1, docs/r9700.md): now go through the same `.bf16.w`-suffixed multi-layout naming
+  // as qg/o (container.cpp's LoadQuantLinearWithFallback also accepts the old bare form for a
+  // pre-R1 container; this test reads directly via SafetensorsReader, not that fallback, so it
+  // must know which form the fixture container it's pointed at was actually built with).
+  auto k_w_h = ReadContainerBf16(container, "text.layers.3.attn.k.bf16.w",
+                                  static_cast<int64_t>(Hkv) * D * hidden);
+  auto v_w_h = ReadContainerBf16(container, "text.layers.3.attn.v.bf16.w",
+                                  static_cast<int64_t>(Hkv) * D * hidden);
   auto o_w_h = ReadContainerBf16(container, "text.layers.3.attn.o.bf16.w",
                                   static_cast<int64_t>(hidden) * H * D);
   auto q_norm_h = ReadContainerBf16(container, "text.layers.3.attn.q_norm", D);
@@ -351,6 +368,18 @@ int main() {
   qg_ql.K = hidden;
   qg_ql.bf16_w = std::move(qg_w_d);
 
+  QuantLinear k_ql;
+  k_ql.layout = Layout::kBf16;
+  k_ql.N = static_cast<int64_t>(Hkv) * D;
+  k_ql.K = hidden;
+  k_ql.bf16_w = std::move(k_w_d);
+
+  QuantLinear v_ql;
+  v_ql.layout = Layout::kBf16;
+  v_ql.N = static_cast<int64_t>(Hkv) * D;
+  v_ql.K = hidden;
+  v_ql.bf16_w = std::move(v_w_d);
+
   QuantLinear o_ql;
   o_ql.layout = Layout::kBf16;
   o_ql.N = hidden;
@@ -360,8 +389,8 @@ int main() {
   AttnWeights w{};
   w.input_layernorm = input_layernorm_d.data();
   w.qg = &qg_ql;
-  w.k_w = k_w_d.data();
-  w.v_w = v_w_d.data();
+  w.k = &k_ql;
+  w.v = &v_ql;
   w.o = &o_ql;
   w.q_norm = q_norm_d.data();
   w.k_norm = k_norm_d.data();

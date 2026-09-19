@@ -53,15 +53,15 @@ wrong RoPE base or head count.
 text.embed_tokens                              bf16, host-resident
 text.layers.{i}.input_layernorm                bf16  [hidden]
 text.layers.{i}.attn.qg.{layout}                see "Attention" below (full-attention layers only)
-text.layers.{i}.attn.k                          bf16  [kv_heads*head_dim, hidden]
-text.layers.{i}.attn.v                          bf16  [kv_heads*head_dim, hidden]
+text.layers.{i}.attn.k.{layout}                 [kv_heads*head_dim, hidden]  (full-attention layers only; R1)
+text.layers.{i}.attn.v.{layout}                 [kv_heads*head_dim, hidden]  (full-attention layers only; R1)
 text.layers.{i}.attn.o.{layout}                 [hidden, num_heads*head_dim]
 text.layers.{i}.attn.q_norm                     bf16  [head_dim]
 text.layers.{i}.attn.k_norm                     bf16  [head_dim]
 text.layers.{i}.attn.k_descale                  fp32  [kv_heads]           (per-head amax/448.0 when --kv-calib is given; 1.0 placeholder otherwise)
 text.layers.{i}.attn.v_descale                  fp32  [kv_heads]           (per-head amax/448.0 when --kv-calib is given; 1.0 placeholder otherwise)
 text.layers.{i}.gdn.in_proj_qkv.{layout}        [2*key_dim + value_dim, hidden]     (gdn layers only)
-text.layers.{i}.gdn.in_proj_z                   bf16  [value_dim, hidden]
+text.layers.{i}.gdn.in_proj_z.{layout}          [value_dim, hidden]  (R1)
 text.layers.{i}.gdn.in_proj_b                   bf16  [num_v_heads, hidden]
 text.layers.{i}.gdn.in_proj_a                   bf16  [num_v_heads, hidden]
 text.layers.{i}.gdn.conv1d_weight               bf16  [conv_dim, 1, kernel=4]
@@ -79,11 +79,20 @@ vision.*                                         bf16 passthrough, HF parameter 
 ```
 
 `{layout}` is one of `mxfp4`, `w4a16`, `w4a8`, `bf16`. Every linear that participates in the A/B
-(everything the milestone list benchmarks -- attention q/o, GDN in/out proj, MLP gate_up/down,
+(everything the milestone list benchmarks -- attention qg/k/v/o, GDN in/out proj, MLP gate_up/down,
 lm_head) is stored in **all three quantized layouts plus bf16**, so the server can switch layouts
 with a flag rather than a re-convert. `text.embed_tokens`, `text.*_norm`, `*.A_log`, `*.dt_bias`,
-`*_descale`, and everything under `vision.*` have exactly one layout (bf16 or fp32) and drop the
-`.{layout}` suffix.
+`*_descale`, `gdn.in_proj_a`/`gdn.in_proj_b`, `gdn.conv1d_weight`, and everything under `vision.*`
+have exactly one layout (bf16 or fp32) and drop the `.{layout}` suffix.
+
+**R1 (docs/r9700.md) note**: `attn.k`/`attn.v`/`gdn.in_proj_z` joined this multi-layout family in
+this pass -- they used to be single-layout bf16 tensors with no `.{layout}` suffix at all (3.4
+GB/token, 20.6% of every token, moved bf16 in every layout regardless of `--layout`). A container
+converted before this pass still has the OLD bare form (`text.layers.{i}.attn.k`, no suffix);
+`src/model/container.cpp`'s `LoadQuantLinearWithFallback` reads either form, falling back
+requested-layout -> bf16 -> bare in that order, so old containers keep loading unmodified.
+**`mtp.attn.k`/`mtp.attn.v` are deliberately NOT part of this change** and still write the old bare
+bf16 form -- the MTP head stays bf16-only per this pass's task brief.
 
 ### Fused projections
 

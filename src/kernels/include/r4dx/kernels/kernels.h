@@ -136,4 +136,16 @@ void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t str
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
                                  int64_t stream);
 
+// ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
+// A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per
+// model.h's own SCOPE comment, so this needs no atomic/lock any more than PickTuning's cache does)
+// incremented once per r4dx-owned kernel launch above (every r4dx_* entry point in this header,
+// AFTER its `rows/M/T <= 0` early-return check, so a no-op call does not count). Counts ONLY
+// r4dx-owned launches -- NOT the r4d_gemm_*/r4d_gdn_*/r4d_attn_* launches in third_party/libr4d,
+// which this project does not instrument (out of scope: a third_party submodule). Used by
+// Model::DecodeStepProfiled (model.cpp) to report "r4dx-owned kernel launches per token" before/
+// after the R3/P2 fusion pass -- see docs/mtp.md and docs/status.md for the measured before/after.
+void r4dx_kernel_launch_counter_reset();
+int64_t r4dx_kernel_launch_counter_get();
+
 }  // extern "C"

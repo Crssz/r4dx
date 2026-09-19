@@ -42,6 +42,7 @@ int main(int argc, char** argv) {
   }
   opts.model_opts.max_ctx = args.max_ctx;
   opts.model_opts.layer_limit = args.layers;
+  opts.model_opts.mtp_draft_k = args.mtp;
   opts.tokenizer_dir = args.tokenizer_dir;
   opts.max_tokens_default = args.max_tokens_default;
   opts.max_queue = args.max_queue;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <optional>
 #include <random>
 #include <stdexcept>
 
@@ -51,6 +52,30 @@ size_t FindEarliestStop(const std::string& text, const std::vector<std::string>&
 }
 
 }  // namespace
+
+// Decodes `tok` into text, applies --stop trimming (identical semantics/lookback window to
+// src/cli/main.cpp's own inline copy of this logic -- see docs/server.md's "--stop trimming
+// across token boundaries"), and pushes whatever survives to req.sink->OnToken (so every accepted
+// token -- plain-decode or MTP-round -- streams to the client as soon as it is committed, per this
+// stage's task point 2). Returns true iff a --stop string matched (the caller should stop
+// generating and report finish_reason="stop").
+bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
+                       std::string& accumulated, int32_t tok) {
+  const std::string piece = decoder.push(tok);
+  if (piece.empty()) return false;
+  const size_t already_emitted = accumulated.size();
+  accumulated += piece;
+  const size_t lookback = already_emitted > 0 ? std::min<size_t>(already_emitted, 63) : 0;
+  const size_t match = FindEarliestStop(accumulated, req.stop, already_emitted - lookback);
+  if (match != std::string::npos) {
+    const size_t emit_len = match > already_emitted ? match - already_emitted : 0;
+    const std::string trimmed = piece.substr(0, emit_len);
+    if (!trimmed.empty()) req.sink->OnToken(trimmed);
+    return true;
+  }
+  req.sink->OnToken(piece);
+  return false;
+}
 
 Engine::Engine(EngineOptions opts) : opts_(std::move(opts)), queue_(static_cast<size_t>(opts_.max_queue)) {}
 
@@ -127,32 +152,21 @@ void Engine::RunRequest(PendingRequest& req) {
     }
 
     // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens`
-    // extends what's already fed; otherwise reset (a fresh Model::Load, exactly like src/cli/
-    // main.cpp's chat-prefix-mismatch fallback) and re-prefill from scratch.
-    bool matches_prefix = full_tokens.size() >= fed_tokens_.size() &&
-                           std::equal(fed_tokens_.begin(), fed_tokens_.end(), full_tokens.begin());
-    std::vector<int32_t> new_tokens;
-    if (matches_prefix) {
-      new_tokens.assign(full_tokens.begin() + static_cast<ptrdiff_t>(fed_tokens_.size()),
-                         full_tokens.end());
-      if (new_tokens.empty()) {
-        // Nothing new to feed (e.g. a byte-identical repeated request) -- Model::Prefill throws
-        // on an empty vector, so degrade to a full re-prefill rather than special-casing "zero
-        // new tokens" as its own code path.
-        matches_prefix = false;
-      }
-    }
-    if (!matches_prefix) {
-      // Drop the OLD Model before constructing the replacement (review finding, 2026-09-19):
-      // `model_ = make_unique<Model>(Model::Load(...))` would otherwise fully construct the new
-      // Model (every weight DeviceBuffer) BEFORE the assignment destroys the old one, holding TWO
-      // complete containers' worth of VRAM at once (2x peak for however long Load() takes -- e.g.
-      // ~2x15.75 GiB for w4a16). This still pays a full container reload's latency (measured
-      // ~18.6s) on every non-extending request; see docs/server.md's "Prefix reuse" section.
-      model_.reset();
-      model_ = std::make_unique<r4dx::model::Model>(r4dx::model::Model::Load(opts_.model_opts));
-      fed_tokens_.clear();
-      new_tokens.assign(full_tokens.begin(), full_tokens.end());
+    // extends what's already fed; otherwise Model::Reset() (re-zero GDN/KV/MTP state in place,
+    // milliseconds -- NOT a full Model::Load(), see model.h's Reset() doc comment and this
+    // stage's own measurement below) and re-prefill from scratch.
+    std::vector<int32_t> new_tokens_i32;
+    double reset_ms = -1.0;  // -1 == no reset happened this request (prefix extended)
+    std::optional<std::vector<int32_t>> tail = prefix_.Extend(full_tokens);
+    if (tail) {
+      new_tokens_i32 = std::move(*tail);
+    } else {
+      const auto r0 = Clock::now();
+      model_->Reset();
+      const auto r1 = Clock::now();
+      reset_ms = Seconds(r0, r1) * 1000.0;
+      prefix_.Clear();
+      new_tokens_i32.assign(full_tokens.begin(), full_tokens.end());
     }
 
     int64_t max_tokens = req.max_tokens;
@@ -162,7 +176,7 @@ void Engine::RunRequest(PendingRequest& req) {
     req.sink->OnStart(static_cast<int64_t>(full_tokens.size()));
 
     const auto t0 = Clock::now();
-    std::vector<float> logits = model_->Prefill(new_tokens);
+    std::vector<float> logits = model_->Prefill(new_tokens_i32);
     const auto t1 = Clock::now();
     const double prefill_seconds = Seconds(t0, t1);
 
@@ -184,79 +198,145 @@ void Engine::RunRequest(PendingRequest& req) {
       return false;
     };
 
+    // generated_tokens: tokens actually shown to the client (usage.completion_tokens).
+    // committed_tokens: tokens actually fed into model_'s real KV/GDN state this turn -- see
+    // prefix_state.h's file comment for why these two can differ (MTP round stopping mid-vector).
     std::vector<int32_t> generated_tokens;
+    std::vector<int32_t> committed_tokens;
     std::string accumulated;
     std::string finish_reason = "length";
 
+    // Greedy MTP (task point 2): only a temperature<=0 request on a Model actually Load()'d with
+    // mtp_draft_k>0 takes the speculative path -- everything else (non-greedy, or MTP disabled at
+    // startup) is plain decode, byte-for-byte the pre-existing loop below. Mirrors src/cli/
+    // main.cpp's RunTurn `greedy && args.mtp > 0` gate exactly (MTP is greedy-only, docs/mtp.md --
+    // "probabilistic acceptance later" is still future work, per this stage's task).
+    const bool use_mtp = model_->MtpEnabled() && req.sampling.temperature <= 0.0f;
+    int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
+
     const auto d0 = Clock::now();
-    for (int64_t step = 0; step < max_tokens; ++step) {
-      if (req.sink->IsCancelled()) {
-        finish_reason = "cancelled";
-        break;
-      }
-      const int32_t next =
-          r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+    if (use_mtp) {
+      const int64_t draft_k = opts_.model_opts.mtp_draft_k;
+      int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+      bool stopped = false;
       if (is_eos(next)) {
         finish_reason = "stop";
-        break;
-      }
-      generated_tokens.push_back(next);
-      const std::string piece = decoder.push(next);
-      bool stop_hit = false;
-      if (!piece.empty()) {
-        const size_t already_emitted = accumulated.size();
-        accumulated += piece;
-        const size_t lookback = already_emitted > 0 ? std::min<size_t>(already_emitted, 63) : 0;
-        const size_t match = FindEarliestStop(accumulated, req.stop, already_emitted - lookback);
-        if (match != std::string::npos) {
-          const size_t emit_len = match > already_emitted ? match - already_emitted : 0;
-          const std::string trimmed = piece.substr(0, emit_len);
-          if (!trimmed.empty()) req.sink->OnToken(trimmed);
-          stop_hit = true;
-        } else {
-          req.sink->OnToken(piece);
+        stopped = true;
+      } else {
+        generated_tokens.push_back(next);
+        if (EmitToken(req, decoder, accumulated, next)) {
+          finish_reason = "stop";
+          stopped = true;
         }
       }
-      // Feed `next` into the model regardless of stop_hit, so fed_tokens_ below accurately
-      // reflects what the KV/GDN state actually holds (see PendingRequest/Engine's fed_tokens_
-      // doc comment) -- the token is real generated content, only its stop-marker tail text is
-      // withheld from the client.
-      logits = model_->DecodeStep(next);
-      if (stop_hit) {
-        finish_reason = "stop";
-        break;
+      while (!stopped && static_cast<int64_t>(generated_tokens.size()) < max_tokens) {
+        if (req.sink->IsCancelled()) {
+          finish_reason = "cancelled";
+          break;
+        }
+        const std::vector<int32_t> round = model_->DecodeStepMtpGreedy(next, draft_k);
+        ++mtp_rounds;
+        mtp_drafted += draft_k;
+        mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+        // `next` (this call's own token_id argument) is now committed -- see
+        // prefix_state.h/model.h's Reset() comment and Model::DecodeStepMtpGreedy's own doc
+        // comment for why every element of `round` EXCEPT its last is also unconditionally
+        // committed by the atomic call above, regardless of whether the loop below decides to
+        // display it (docs/mtp.md's "mid-round" gap, closed here).
+        committed_tokens.push_back(next);
+        for (size_t ri = 0; ri < round.size(); ++ri) {
+          const int32_t tok = round[ri];
+          const bool is_last_in_round = (ri + 1 == round.size());
+          if (!is_last_in_round) committed_tokens.push_back(tok);
+          if (is_eos(tok)) {
+            finish_reason = "stop";
+            stopped = true;
+            break;
+          }
+          if (static_cast<int64_t>(generated_tokens.size()) >= max_tokens) {
+            stopped = true;
+            break;
+          }
+          generated_tokens.push_back(tok);
+          if (EmitToken(req, decoder, accumulated, tok)) {
+            finish_reason = "stop";
+            stopped = true;
+            break;
+          }
+          next = tok;
+        }
+      }
+    } else {
+      for (int64_t step = 0; step < max_tokens; ++step) {
+        if (req.sink->IsCancelled()) {
+          finish_reason = "cancelled";
+          break;
+        }
+        const int32_t next =
+            r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+        if (is_eos(next)) {
+          finish_reason = "stop";
+          break;
+        }
+        generated_tokens.push_back(next);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, next);
+        // Feed `next` into the model regardless of stop_hit, so committed_tokens below accurately
+        // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
+        // token is real generated content, only its stop-marker tail text is withheld from the
+        // client.
+        logits = model_->DecodeStep(next);
+        committed_tokens.push_back(next);
+        if (stop_hit) {
+          finish_reason = "stop";
+          break;
+        }
       }
     }
-    const std::string tail = decoder.flush();
-    if (!tail.empty()) req.sink->OnToken(tail);
+    const std::string tail_text = decoder.flush();
+    if (!tail_text.empty()) req.sink->OnToken(tail_text);
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
-    fed_tokens_ = full_tokens;
-    fed_tokens_.insert(fed_tokens_.end(), generated_tokens.begin(), generated_tokens.end());
+    prefix_.Commit(full_tokens, committed_tokens);
 
     req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()));
 
-    const double prefill_tps = prefill_seconds > 0 ? new_tokens.size() / prefill_seconds : 0.0;
+    const double prefill_tps = prefill_seconds > 0 ? new_tokens_i32.size() / prefill_seconds : 0.0;
     const double decode_tps =
         decode_seconds > 0 ? static_cast<double>(generated_tokens.size()) / decode_seconds : 0.0;
-    char buf[320];
-    std::snprintf(buf, sizeof(buf),
-                  "request %s: prompt=%lld new=%lld generated=%lld finish=%s prefill=%.2f tok/s "
-                  "decode=%.2f tok/s",
-                  req.request_id.c_str(), static_cast<long long>(full_tokens.size()),
-                  static_cast<long long>(new_tokens.size()),
-                  static_cast<long long>(generated_tokens.size()), finish_reason.c_str(),
-                  prefill_tps, decode_tps);
+    char buf[448];
+    int n = std::snprintf(
+        buf, sizeof(buf),
+        "request %s: prompt=%lld new=%lld generated=%lld finish=%s prefill=%.2f tok/s "
+        "decode=%.2f tok/s",
+        req.request_id.c_str(), static_cast<long long>(full_tokens.size()),
+        static_cast<long long>(new_tokens_i32.size()),
+        static_cast<long long>(generated_tokens.size()), finish_reason.c_str(), prefill_tps,
+        decode_tps);
+    if (reset_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " reset=%.2fms", reset_ms);
+    }
+    if (use_mtp && mtp_rounds > 0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      const double accept_rate =
+          mtp_drafted > 0 ? 100.0 * static_cast<double>(mtp_accepted) / static_cast<double>(mtp_drafted)
+                          : 0.0;
+      std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                    " mtp: draft_k=%lld rounds=%lld drafted=%lld accepted=%lld (%.1f%% accept, "
+                    "%.2f tok/round)",
+                    static_cast<long long>(opts_.model_opts.mtp_draft_k),
+                    static_cast<long long>(mtp_rounds), static_cast<long long>(mtp_drafted),
+                    static_cast<long long>(mtp_accepted), accept_rate,
+                    static_cast<double>(generated_tokens.size()) / static_cast<double>(mtp_rounds));
+    }
     LogLine(opts_.log_level, "info", buf);
   } catch (const std::exception& e) {
-    // Invalidate the prefix-reuse fast path (review finding, 2026-09-19): if Model::Prefill or
-    // DecodeStep threw partway through, the model may have already consumed some tokens that
-    // fed_tokens_ (only updated on the success path above) does not record. Leaving fed_tokens_
-    // stale would let the NEXT request's matches_prefix check take the "extend" branch and feed
-    // only a tail onto a model whose real state has silently diverged from what fed_tokens_ claims
-    // -- clearing it forces the next request down the full-reset (fresh Model::Load) path instead.
-    fed_tokens_.clear();
+    // Invalidate the prefix-reuse fast path (review finding, 2026-09-19; unchanged by this stage):
+    // if Model::Prefill/DecodeStep*/Reset threw partway through, the model may have already
+    // consumed some tokens that prefix_ (only Commit()'d on the success path above) does not
+    // record. Leaving it stale would let the NEXT request's Extend() take the "matches, feed only
+    // the tail" branch against a model whose real state has silently diverged from what prefix_
+    // claims -- Invalidate() forces the next request down the full-reset path instead.
+    prefix_.Invalidate();
     LogLine(opts_.log_level, "error",
             "request " + req.request_id + ": " + std::string(e.what()));
     req.sink->OnError(500, e.what());

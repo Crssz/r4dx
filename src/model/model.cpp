@@ -11,6 +11,7 @@
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "gdn_layer.h"
+#include "linear.h"
 #include "mlp.h"
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
@@ -88,6 +89,17 @@ Model Model::Load(const ModelOptions& opts) {
   m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
   m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion (model.h's doc comment) --
+  // 2 bytes/element covers the widest epilogue format (f16); fp8/int8 use the same allocation's
+  // first half.
+  m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(m.max_chunk_ * hidden * 2));
+  m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(m.max_chunk_));
+  // R2/P2 (docs/r9700.md): EpilogueForLayout currently returns r4dx_epilogue_none for every
+  // layout (see its own doc comment in linear.cpp for why -- a real, reproducible, but
+  // undiagnosed full-model correctness issue), so this is always r4dx_epilogue_none today; kept
+  // as a real call (not a hardcoded 0) so every downstream Gdn/Attn/Mlp/ApplyLinear call site
+  // below stays wired and only needs EpilogueForLayout itself fixed, not rebuilt.
+  m.body_epilogue_ = EpilogueForLayout(opts.layout);
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
   m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
@@ -197,7 +209,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     std::copy(token_ids.begin(), token_ids.end(), embed_ids_host_.begin());
     embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
     EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
-                             T, buf_a_.data());
+                             T, cfg.vocab_size, buf_a_.data());
   } else {
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, token_ids,
                 embed_staging_, buf_a_);
@@ -221,6 +233,10 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // R3 fusion (docs/r9700.md): null for layer 0 (no previous Mlp to have fused its rmsnorm), then
   // set to buf_normed_.data() by every layer's own Mlp::Forward call below for i+1 to consume.
   const uint16_t* normed_in = nullptr;
+  // R2/P2 (docs/r9700.md): companion to normed_in above -- r4dx_epilogue_none for layer 0 (nothing
+  // to reuse yet), then body_epilogue_ once a Mlp::Forward call below has fused an epilogue into
+  // buf_normed_pre_ for layer i+1 to consume (mirrors normed_in's own carry-forward exactly).
+  int normed_in_epilogue = r4dx_epilogue_none;
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -249,7 +265,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
           (!is_prefill_path && mtp_ && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data()
                                                                   : nullptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
-                    T, p, normed_in, mlp_norm_weight, buf_normed_.data());
+                    T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
+                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
       attention::AttnConfig acfg;
       acfg.hidden = static_cast<int>(hidden);
@@ -275,7 +293,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
-                    buf_normed_.data());
+                    buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       std::swap(cur, other);
     }
 
@@ -283,10 +303,20 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
     // rmsnorm epilogue into it above); next_norm_weight is null for the last layer (Mlp falls
     // back to a plain residual add, and FinalLmHead below applies its own final_norm separately).
+    // R2/P2: normed_in_epilogue/buf_normed_pre_* is that SAME fused output's quant epilogue
+    // companion (always body_epilogue_ by this point, since the Gdn/Attn call above always
+    // requests it); next_epilogue/buf_normed_pre_* (output side) requests this Mlp's own
+    // residual+rmsnorm epilogue ALSO emit x_normed_out's fused quant epilogue, for layer i+1's
+    // Gdn/Attn sub-block to consume, unless this is the last layer.
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
-                has_next_layer ? buf_normed_.data() : nullptr);
+                has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
+                normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
+                has_next_layer ? buf_normed_pre_.data() : nullptr,
+                has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+    normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
   }
@@ -301,16 +331,23 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // The ONE position left dangling by the previous RunChunk/DecodeStepMtpGreedy call: h_i =
       // that call's own last-row hidden state (mtp_seed_hidden_), t_{i+1} = THIS call's own first
       // input token.
+      // host_staging_offset=0: this is the FIRST of up to two PrimeKv calls in this RunChunk
+      // invocation (see mtp_head.h's PrimeKv doc comment for why the two calls need disjoint
+      // offsets into MtpHead's own pinned host scratch).
       mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_ - 1, mtp_seed_hidden_.data(),
-                    {token_ids[0]}, container_.EmbedTokensHost(), cfg.vocab_size);
+                    {token_ids[0]}, container_.EmbedTokensHost(), cfg.vocab_size,
+                    /*host_staging_offset=*/0);
     }
     if (T > 1) {
       // Within-chunk pairs: h_i = this chunk's own rows 0..T-2 (`cur`, unmodified since the layer
       // loop above finished), t_{i+1} = this chunk's own token_ids[1..T-1]. Row T-1 is left
       // dangling for the NEXT call, exactly like the boundary case above.
+      // host_staging_offset=1: the SECOND of up to two calls this invocation -- the boundary call
+      // above (n=1) used offset 0, so offset 1 keeps this call's host source disjoint from it while
+      // it may still be in flight. 1 + (T-1) == T <= max_chunk_ == MtpHead::kMaxPrime always.
       const std::vector<int32_t> next_toks(token_ids.begin() + 1, token_ids.end());
       mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_, cur, next_toks,
-                    container_.EmbedTokensHost(), cfg.vocab_size);
+                    container_.EmbedTokensHost(), cfg.vocab_size, /*host_staging_offset=*/1);
     }
     R4DX_HIP_CHECK(hipMemcpyAsync(mtp_seed_hidden_.data(), cur + (T - 1) * hidden,
                                    static_cast<size_t>(hidden) * sizeof(uint16_t),
@@ -436,9 +473,20 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
 
   SpanAccumulator acc;
 
+  // Same device-resident-vs-host branch real decode takes (RunChunk's own comment) -- review
+  // finding, 2026-09-20: this used to always take the host path, so "259 r4dx-owned launches/
+  // token" undercounted real decode by one launch (the device gather this profile never exercised)
+  // whenever the container was loaded with embed_device_resident=true (the default).
   acc.Add(s, "embed", [&] {
-    EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, {token_id},
-                embed_staging_, buf_a_);
+    if (container_.EmbedTokensDeviceResident()) {
+      std::copy_n(&token_id, 1, embed_ids_host_.begin());
+      embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), 1, stream_);
+      EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden,
+                               embed_ids_dev_.data(), 1, cfg.vocab_size, buf_a_.data());
+    } else {
+      EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, {token_id},
+                  embed_staging_, buf_a_);
+    }
   });
 
   std::vector<int32_t> positions_h = {static_cast<int32_t>(pos_)};
@@ -449,6 +497,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
   const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
+  int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -468,8 +517,15 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
       p.is_prefill = false;
       p.has_init = has_init;
+      // Same plain-decode/MTP-desync guard RunChunk applies (that method's own comment) -- review
+      // finding, 2026-09-20: this was omitted here, so profiling a DecodeStepProfiled call on an
+      // MTP-enabled Model always seeded GDN from window index 0 regardless of the last verify
+      // round's real num_accepted, silently profiling the wrong GDN window.
+      p.num_accepted = (mtp_ && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data() : nullptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
-                    cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
+                    cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
+                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
       attention::AttnConfig acfg;
       acfg.hidden = static_cast<int>(hidden);
@@ -494,7 +550,9 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
 
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)], 1,
                     static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s,
-                    normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
+                    normed_in, mlp_norm_weight, buf_normed_.data(), &acc, normed_in_epilogue,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       std::swap(cur, other);
     }
 
@@ -502,9 +560,14 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
       mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
                   has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
-                  has_next_layer ? buf_normed_.data() : nullptr, &acc);
+                  has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
+                  buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                  has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
+                  has_next_layer ? buf_normed_pre_.data() : nullptr,
+                  has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
     }
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+    normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
   }
@@ -567,9 +630,18 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     const int64_t T = static_cast<int64_t>(chunk.size());
     const bool has_init = started_;
 
+    // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's
+    // identical fix above (review finding, 2026-09-20).
     acc.Add(s, "embed", [&] {
-      EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, chunk,
-                  embed_staging_, buf_a_);
+      if (container_.EmbedTokensDeviceResident()) {
+        std::copy(chunk.begin(), chunk.end(), embed_ids_host_.begin());
+        embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
+        EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden,
+                                 embed_ids_dev_.data(), T, cfg.vocab_size, buf_a_.data());
+      } else {
+        EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, chunk,
+                    embed_staging_, buf_a_);
+      }
     });
 
     std::vector<int32_t> positions_h(static_cast<size_t>(T));
@@ -583,6 +655,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     uint16_t* cur = buf_a_.data();
     uint16_t* other = buf_b_.data();
     const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
+    int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
 
     for (int64_t i = 0; i < num_layers; ++i) {
       const LayerWeights& lw = container_.Layer(i);
@@ -596,7 +669,9 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         p.is_prefill = true;
         p.has_init = has_init;
         layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
-                      cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc);
+                      cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
+                      normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                      body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       } else {
         attention::AttnConfig acfg;
         acfg.hidden = static_cast<int>(hidden);
@@ -622,17 +697,31 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                       static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                       attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
-                      &acc);
+                      &acc, normed_in_epilogue, buf_normed_pre_.data(),
+                      buf_normed_pre_scale_.data(), body_epilogue_, buf_normed_pre_.data(),
+                      buf_normed_pre_scale_.data());
         std::swap(cur, other);
       }
 
       {
+        // x_normed_in must be buf_normed_.data() (this layer's Gdn/Attn call above just fused its
+        // own rmsnorm epilogue into it, same as RunChunk's identical call), NOT `normed_in` (the
+        // carry-forward variable that is null for layer 0 of every chunk) -- review finding,
+        // 2026-09-20: this profiled a code path real prefill never runs (layer 0 of every chunk
+        // recomputed its own rmsnorm from scratch here instead of consuming the fused one,
+        // reporting a spurious "mlp.rmsnorm" launch --profile-prefill's own table showed once per
+        // chunk that RunChunk never issues).
         Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
-        mlp.Forward(stream_, arena_, cur, cur, T, normed_in,
+        mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                     has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
-                    has_next_layer ? buf_normed_.data() : nullptr, &acc);
+                    has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                    has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
+                    has_next_layer ? buf_normed_pre_.data() : nullptr,
+                    has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
       }
       normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+      normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
       arena_.Reset();
     }
@@ -668,6 +757,19 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
                               std::to_string(max_chunk_) + "]");
   }
+  // mtp_logits_dev_/mtp_argmax_dev_ are sized for exactly (mtp_draft_k_+1) candidates (this
+  // class's own field comment, model.h) -- the max_chunk_ (64) check above does NOT enforce that
+  // narrower bound, so a caller passing more than mtp_draft_k_+1 candidates (this method is public,
+  // per its own doc comment, specifically for callers like tests/model/test_mtp.cpp) would
+  // silently overflow those buffers (review finding, 2026-09-20: an 8-candidate call on a
+  // draft_k=3 model writes ~8 MB into mtp_logits_dev_'s 4 MB allocation). Today this is saved only
+  // by an unrelated guard in a different component (gdn_layer.cpp's own `T > MaxDecodeWindow()`
+  // throw, which happens to run first because layer 0 of the real container is a GDN layer) --
+  // enforce the real precondition here directly rather than relying on that coincidence.
+  if (T > mtp_draft_k_ + 1) {
+    throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
+                              std::to_string(mtp_draft_k_ + 1) + "] (mtp_draft_k_+1)");
+  }
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
@@ -679,7 +781,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     std::copy(candidates.begin(), candidates.end(), embed_ids_host_.begin());
     embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
     EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
-                             T, buf_a_.data());
+                             T, cfg.vocab_size, buf_a_.data());
   } else {
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, candidates,
                 embed_staging_, buf_a_);
@@ -699,6 +801,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
   const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern above
+  int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -713,7 +816,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       p.has_init = has_init;
       p.num_accepted = num_accepted_ptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
-                    T, p, normed_in, mlp_norm_weight, buf_normed_.data());
+                    T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
+                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
       attention::AttnConfig acfg;
       acfg.hidden = static_cast<int>(hidden);
@@ -746,15 +851,22 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
-                    buf_normed_.data());
+                    buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       std::swap(cur, other);
     }
 
     Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
-                has_next_layer ? buf_normed_.data() : nullptr);
+                has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
+                normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
+                has_next_layer ? buf_normed_pre_.data() : nullptr,
+                has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+    normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
   }

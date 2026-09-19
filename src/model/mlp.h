@@ -40,10 +40,20 @@ class Mlp {
   // caller that has not wired the fusion, in which case behavior is the pre-R3 plain residual add.
   // `prof` (Milestone 3 profiling pass, docs/r9700.md R5/Q7): see gdn_layer.h's identical
   // parameter comment.
+  // R2/P2 (docs/r9700.md), appended after `prof`, mirrors GdnLayer::Forward/AttentionLayer::
+  // Forward's identical trailing params: `x_normed_pre_epilogue`/`_data`/`_scale` reuse a fused
+  // quant epilogue the producer of `x_normed_in` already computed (this layer's own Gdn/Attn
+  // sub-block, matching w_.gate_up's layout -- skips this call's own gate_up quant launch when it
+  // matches); `next_epilogue`/`next_epilogue_out`/`next_epilogue_scale` request this call's own
+  // residual+rmsnorm epilogue also emit x_normed_out's fused quant epilogue, for the NEXT layer's
+  // Gdn/Attn sub-block to consume as ITS x_normed_pre.
   void Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, uint16_t* x_out,
                int64_t T, const uint16_t* x_normed_in = nullptr,
                const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
-               SpanAccumulator* prof = nullptr);
+               SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
+               const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
+               int next_epilogue = 0, void* next_epilogue_out = nullptr,
+               float* next_epilogue_scale = nullptr);
 
  private:
   const ModelConfig& cfg_;

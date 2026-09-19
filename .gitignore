@@ -12,3 +12,11 @@ __pycache__/
 # Committed test fixtures are an intentional exception to the blanket *.safetensors rule above
 # (they're tiny, hand-generated inputs the convert tests read at runtime, not model checkpoints).
 !tests/convert/fixtures/*.safetensors
+
+# tests/kernels/test_kernel_bandwidth.cpp's --capture golden (review finding, 2026-09-20): a
+# ~19 MB binary, fully regenerable by `test_kernel_bandwidth --capture <path>` against the pre-P6
+# kernel, and not meant to be a permanent artifact -- the repo now has a public remote (history was
+# scrubbed 2026-09-20), so anything staged here lands in that history forever. The test itself
+# SKIPs (CTest SKIPPED, not FAILED) with a regeneration hint when this file is absent, same
+# convention tests/model's golden-data tests already use.
+tests/kernels/golden/

@@ -22,6 +22,7 @@
 #include "chat_template.h"
 #include "cli_args.h"
 #include "model.h"
+#include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "tokenizer.h"
 
@@ -219,20 +220,17 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
       result.mtp_rounds += 1;
       result.mtp_drafted += args.mtp;
       result.mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
-      // `next` (this call's own token_id argument) is now committed by the call above; every
-      // element of `round` EXCEPT its last is ALSO unconditionally committed atomically by that
-      // same call, regardless of whether the loop below decides to stop before reaching it (see
-      // TurnResult::committed_tokens's own comment / docs/mtp.md's "mid-round" gap).
+      // `next` (this call's own token_id argument) is now committed by the call above; ProcessMtpRound
+      // (src/model/mtp_round.hpp) computes the rest of `round` that is ALSO unconditionally
+      // committed atomically by that same call, independent of how far the display loop below gets
+      // -- see that header's file comment for why this must be computed up front rather than
+      // incrementally inside a loop that can `break` early (docs/mtp.md's "mid-round" gap).
+      const r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(
+          round, is_eos, args.max_tokens - static_cast<int64_t>(result.generated_tokens.size()));
       result.committed_tokens.push_back(next);
-      for (size_t ri = 0; ri < round.size(); ++ri) {
-        const int32_t tok = round[ri];
-        const bool is_last_in_round = (ri + 1 == round.size());
-        if (!is_last_in_round) result.committed_tokens.push_back(tok);
-        if (is_eos(tok)) { result.hit_eos = true; stopped = true; break; }
-        if (static_cast<int64_t>(result.generated_tokens.size()) >= args.max_tokens) {
-          stopped = true;
-          break;
-        }
+      result.committed_tokens.insert(result.committed_tokens.end(), outcome.committed.begin(),
+                                      outcome.committed.end());
+      for (int32_t tok : outcome.displayed) {
         result.generated_tokens.push_back(tok);
         const std::string piece = decoder.push(tok);
         if (!piece.empty()) {
@@ -241,6 +239,8 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
         }
         next = tok;
       }
+      if (outcome.hit_eos) { result.hit_eos = true; stopped = true; }
+      if (outcome.hit_max_tokens) stopped = true;
     }
   } else if (greedy) {
     int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
@@ -317,6 +317,7 @@ int RunMain(int argc, char** argv) {
   opts.mtp_head_layout = (args.mtp_head_layout == "bf16")
                               ? std::make_optional(r4dx::model::Layout::kBf16)
                               : std::nullopt;
+  opts.embed_device_resident = (args.embed_device_resident != "off");
 
   // allow_unimplemented_normalizer=true: Qwen3.8-27B's tokenizer.json declares normalizer.type=
   // NFC, which r4dx's tokenizer does not implement (tokenizer.h's file comment KNOWN GAP) --

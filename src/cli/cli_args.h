@@ -62,6 +62,14 @@ struct CliArgs {
   // --layout (~0.5 GB extra VRAM, the exact-arithmetic form). No effect when --mtp is 0 or the
   // container has no mtp.* weights.
   std::string mtp_head_layout = "layout";
+  // Device-resident embedding gather (docs/mtp.md "device-resident draft loop", model.h's
+  // ModelOptions::embed_device_resident): mirrors text.embed_tokens into VRAM (~2.37-2.54 GiB
+  // depending on vocab/hidden) so decode/draft gathers on-device instead of a host memcpy+H2D per
+  // step. Default true (matches ModelOptions' own default). This flag is the escape hatch
+  // ModelOptions::embed_device_resident's own doc comment already promised but that no CLI/server
+  // flag actually implemented until this fix (review finding, 2026-09-20) -- set to "off" to force
+  // the host-gather path instead, e.g. to reclaim that VRAM for KV cache on a constrained run.
+  std::string embed_device_resident = "on";
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -78,7 +86,8 @@ inline std::string CliUsageText(const char* argv0) {
          "(--prompt \"...\" | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
-         "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}]";
+         "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
+         "[--embed-device-resident {on|off}]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -142,6 +151,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--profile-prefill") a.profile_prefill = true;
     else if (arg == "--mtp") a.mtp = ParseI64("--mtp", NextCliArg(argc, argv, i, "--mtp"));
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextCliArg(argc, argv, i, "--mtp-head-layout");
+    else if (arg == "--embed-device-resident") a.embed_device_resident = NextCliArg(argc, argv, i, "--embed-device-resident");
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -160,6 +170,9 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     throw CliUsageError("--mtp-head-layout must be 'bf16' or 'layout'");
   }
   if (a.profile_token < 1) throw CliUsageError("--profile-token must be >= 1");
+  if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
+    throw CliUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
   if (a.profile && a.profile_prefill) {
     throw CliUsageError("--profile and --profile-prefill are mutually exclusive");
   }

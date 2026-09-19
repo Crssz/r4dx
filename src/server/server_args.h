@@ -44,6 +44,11 @@ struct ServerArgs {
   // src/server/engine.cpp's RunRequest) -- non-greedy requests always take plain decode regardless
   // of this flag, matching r4dx::model::Model::DecodeStepMtpGreedy's greedy-only contract.
   int64_t mtp = 0;
+  // Device-resident embedding gather (src/model/model.h's ModelOptions::embed_device_resident) --
+  // same escape hatch and default as src/cli/cli_args.h's --embed-device-resident (review finding,
+  // 2026-09-20: ModelOptions' own doc comment promised this flag before either binary actually had
+  // it). "off" forces the host-gather path instead of mirroring text.embed_tokens into VRAM.
+  std::string embed_device_resident = "on";
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -59,7 +64,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
-         "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]";
+         "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
+         "[--embed-device-resident {on|off}]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -111,6 +117,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--default-min-p") a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p"));
     else if (arg == "--log-level") a.log_level = NextServerArg(argc, argv, i, "--log-level");
     else if (arg == "--mtp") a.mtp = ServerParseI64("--mtp", NextServerArg(argc, argv, i, "--mtp"));
+    else if (arg == "--embed-device-resident") a.embed_device_resident = NextServerArg(argc, argv, i, "--embed-device-resident");
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -127,6 +134,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     throw ServerUsageError("--log-level must be one of debug|info|warn|error");
   }
   if (a.mtp < 0) throw ServerUsageError("--mtp must be >= 0");
+  if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
+    throw ServerUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
   return a;
 }
 

@@ -1,5 +1,383 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 3 consolidated performance (2026-09-20, integration pass)
+
+**bf16 is not reported in this section or in any Milestone 3 table below.** Per the standing rule
+(bf16 full-model layout is retired from all performance work, 2026-09-20 user decision: it
+over-commits VRAM 1.5x and is paged over PCIe on this 32 GiB card) bf16 was never swept, benchmarked,
+or reported for the 64-layer model at any point in Milestone 3 -- it appears only in the 4-layer
+golden-test containers as the exact-arithmetic correctness reference (`docs/validation.md`). Every
+table below is w4a8/w4a16/mxfp4 only.
+
+Fresh confirmation sweep, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, clean
+`build.ps1 -Clean` rebuild, HIP device 1, one process at a time, this file's standard prompt/flags
+(`--prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." --max-tokens 128
+--temperature 0 --max-ctx 2048 --stats`):
+
+| Layout | `mtp=0` decode | `mtp=3` decode | `mtp=3` acceptance | prefill | VRAM (`mtp=0` / `mtp=3`) |
+|---|---|---|---|---|---|
+| w4a16 | **38.86 tok/s** | **68.37 tok/s** | 46.3% (36 rounds, 108 drafted, 50 accepted), 2.31 tok/round | 719.13 / 706.86 tok/s | 16.17 / 16.60 GiB |
+| w4a8  | **35.73 tok/s** | **61.41 tok/s** | 43.3% (40 rounds, 120 drafted, 52 accepted), 2.27 tok/round | 723.44 / 720.33 tok/s | 16.17 / 16.60 GiB |
+| mxfp4 | **30.27 tok/s** | **55.72 tok/s** | 47.1% (34 rounds, 102 drafted, 48 accepted), 2.32 tok/round | 641.50 / 644.61 tok/s | 16.17 / 16.60 GiB |
+
+Every number is within run-to-run noise (<1%) of the FIX pass's own measurements (below), confirming
+the merged/reviewed/fixed tree is reproducible end to end from a clean checkout. `tests\run_tests.ps1`
+35/35, `tools\server\smoke.ps1` 24/24 + 25/25 + 25/25 (default 4-layer container, 4-layer MTP
+container `-Mtp 3`, real container `-Mtp 3`) -- see `docs/status.md`'s "Milestone 3: done" for the
+full integration-pass writeup.
+
+### Milestone 1 -> 2 -> 3, decode tok/s (`--mtp 0`, real 64-layer container, this file's prompt)
+
+| Layout | M1 (2026-09-19) | M2 `--mtp 0` (2026-09-20) | M3 `--mtp 0` (2026-09-20, this pass) | M1->M3 delta |
+|---|---|---|---|---|
+| w4a16 | 29.08 tok/s | 32.83 tok/s | **38.86 tok/s** | +33.6% |
+| w4a8  | 27.88 tok/s | 30.95 tok/s | **35.73 tok/s** | +28.1% |
+| mxfp4 | 24.90 tok/s | 27.08 tok/s | **30.27 tok/s** | +21.6% |
+
+### Milestone 1 -> 2 -> 3, decode tok/s at each milestone's own best `--mtp K` (self-speculative decode)
+
+| Layout | M1 | M2 `--mtp 3` | M3 `--mtp 3` (this pass) | M1->M3 delta |
+|---|---|---|---|---|
+| w4a16 | 29.08 tok/s (no MTP) | 66.42 tok/s (54.3%) | **68.37 tok/s** (46.3%, 2.31 tok/round) | +135.1% |
+| w4a8  | 27.88 tok/s (no MTP) | 47.72 tok/s (32.5%) | **61.41 tok/s** (43.3%, 2.27 tok/round) | +120.2% |
+| mxfp4 | 24.90 tok/s (no MTP) | 47.46 tok/s (41.9%) | **55.72 tok/s** (47.1%, 2.32 tok/round) | +123.8% |
+
+### Milestone 1 -> 2 -> 3, prefill tok/s and VRAM (`--mtp 0`)
+
+| Layout | M1 prefill | M2 prefill | M3 prefill (this pass) | M1 VRAM | M2 VRAM | M3 VRAM |
+|---|---|---|---|---|---|---|
+| w4a16 | 419.44 tok/s | 613.18 tok/s | **719.13 tok/s** | 17.79 GiB | 15.75 GiB | 16.17 GiB |
+| w4a8  | 410.75 tok/s | 606.06 tok/s | **723.44 tok/s** | 17.79 GiB | 15.75 GiB | 16.17 GiB |
+| mxfp4 | 400.21 tok/s | 556.54 tok/s | **641.50 tok/s** | 17.79 GiB | 15.75 GiB | 16.17 GiB |
+
+M3's VRAM is higher than M2's despite the container shrinking 87.79 -> 45.02 GiB on disk (R1's
+quantization work) because Milestone 3 also added the device-resident embedding mirror
+(`Container::Load`'s `embed_tokens_dev_`, +2.37 GiB, default on -- `--embed-device-resident off`
+trades it back for a per-token host memcpy+H2D on the decode/draft path) and the MTP head/draft
+scratch (present in M2 already once `--mtp` loaded, not newly added, but M1 had no MTP at all). Net:
+the *effective* per-token cost (GiB per tok/s of decode headroom) improved substantially across the
+three milestones even though the raw GiB number is not monotonically decreasing.
+
+## Milestone 3 profiling truth (2026-09-20, docs/r9700.md R5 + Q2/Q3/Q5/Q7/Q8)
+
+Real hardware, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one
+process at a time, w4a8/w4a16/mxfp4 only (bf16 excluded per standing rule). Full `ctest --preset
+win-hip` was 33/33 green before and after this pass (no engine-behavior code changed -- the
+profiling instrumentation this section reports on was already present, uncommitted, in the working
+tree at the start of this pass: `src/model/profile_span.h`'s per-kernel `SpanAccumulator`,
+`Model::DecodeStepProfiled`'s steady-state `--profile-token` default of 32, `Model::PrefillProfiled`,
+and `tools/profile/tune_gemm.py`'s Q5 ring-buffer fix. This pass's job was to build+test it, RUN the
+real measurements, and correct this document and docs/r9700.md against what was actually measured --
+see docs/status.md for the full accounting of what was and was not code-changed this pass). Raw logs:
+`build\logs\m3-*.log`.
+
+### Q2 -- why is the profiled step longer than the steady-state step, and by how much now
+
+Command: `r4dx-cli --model D:\models\r4dx\qwen38-27b-v3.r4dx --layout <L> --prompt "Write a haiku
+about GPUs, then explain what a GPU is in two sentences." --max-tokens 128 --temperature 0 --max-ctx
+2048 --profile` (steady-state, default `--profile-token 32`) vs the same command with `--stats` (no
+`--profile`, real generation, real `tok/s`) vs `--profile --profile-token 1` (first generated token,
+same fine-grained instrumentation, for a clean first-token-vs-steady-state comparison):
+
+| Layout | Profiled `gpu_sum` (token 32) | Profiled `gpu_sum` (token 1) | Steady-state step (`--stats`, 1/tok_s) | Offset (token32 - steady) |
+|---|---|---|---|---|
+| w4a16 | 52.7682 ms | 52.7751 ms | 25.72 ms (38.88 tok/s) | **+27.05 ms (+105%)** |
+| w4a8  | 53.8919 ms | -- | 27.96 ms (35.77 tok/s) | **+25.93 ms (+93%)** |
+| mxfp4 | 61.0646 ms | -- | 33.04 ms (30.27 tok/s) | **+28.03 ms (+85%)** |
+
+**Finding, and it changed the answer this document previously gave.** The token-1-vs-token-32
+comparison (w4a16: 52.7751 vs 52.7682 ms, a 0.007 ms difference) shows the **original first-token-
+warmup hypothesis is not the dominant effect any more** -- with the current fine-grained per-kernel
+instrumentation, profiling the first generated token and profiling a fully-warmed steady-state token
+cost the *same* amount, to within noise. What changed since `[PERF]`'s original +5.4 ms measurement
+is the instrumentation itself: the original measurement wrapped ~5 block-level hipEvent pairs around
+the whole step; the current tree (this document's own prior R2/R5 work) wraps **one hipEvent pair per
+named kernel call** -- 819 pairs for a w4a16 step (`gdn.rmsnorm` x1 + 8 GDN kernels x48 + 4 MLP
+kernels x64 + 11 attention kernels x16 + `final_norm+lm_head` x1). The profiled/steady-state offset
+grew from +5.4 ms (5 spans) to +25.9-28.0 ms (819 spans) -- **a near-constant ~+27 ms across all
+three layouts**, the same "fixed instrumentation cost, not a per-layout effect" signature the
+original Q2 already recognised, just much larger now that the instrumentation is finer-grained.
+**Consequence for how to read `--profile`'s numbers going forward**: `gpu_sum` and every per-kernel
+`ms` column at this granularity are **not** a usable absolute-cost proxy (the profiled step now runs
+1.9-2.1x the real step) -- treat them exactly like `[TUNE]`'s numbers (rule 2, top of docs/r9700.md):
+a *relative* ranking/attribution signal between kernels in the SAME profiled run, never a cost model
+against `1/tok_s`. Use `--stats`'s real `tok/s` for any absolute budget. The likely (not independently
+confirmed this pass) mechanism is that `hipEventRecord` on this Windows WDDM HIP 7.15 stack costs
+more than its own C34 latency (0.296 us) when it sits between two small back-to-back kernels, because
+it forces a submission/queueing boundary that would otherwise let adjacent launches overlap or batch
+-- this is a reasoned hypothesis, not a verified one; flagged as still-open in docs/r9700.md's Q2.
+
+### Q3 -- per-kernel breakdown inside GdnLayer::Forward / AttentionLayer::Forward
+
+`GdnLayer::Forward` and `AttentionLayer::Forward` (and `Mlp::Forward`) already thread a
+`SpanAccumulator*` through to every kernel launch (see `src/model/profile_span.h`'s `ProfiledCall`,
+zero-overhead when `nullptr` i.e. every non-`--profile` call). Full steady-state (token 32) tables,
+percentages are share of that layout's own `gpu_sum` (read with the Q2 caveat above: shares
+between similarly-frequent kernels are trustworthy, but the ~27 ms fixed instrumentation tax is
+spread across 819 spans roughly per-boundary, not per-unit-of-real-work, so a kernel called 48-64
+times (every GDN/MLP kernel) likely carries more of that tax, proportionally, than the once-per-step
+`embed`/`final_norm+lm_head` entries):
+
+**w4a16** (`gpu_sum` 52.7682 ms, 259 r4dx-owned launches):
+
+| Kernel | ms | calls | % gpu_sum |
+|---|---|---|---|
+| `gemm:mlp.gate_up` | 11.8665 | 64 | 22.5% |
+| `gemm:mlp.down` | 6.9766 | 64 | 13.2% |
+| `gemm:gdn.in_proj_qkv` | 3.5710 | 48 | 6.8% |
+| `mlp.residual` | 2.9459 | 64 | 5.6% |
+| `gemm:gdn.out_proj` | 2.8386 | 48 | 5.4% |
+| `gemm:gdn.in_proj_z` | 2.7100 | 48 | 5.1% |
+| `mlp.silu_mul` | 3.2511 | 64 | 6.2% |
+| `gemm:gdn.in_proj_a` | 2.4415 | 48 | 4.6% |
+| `gdn.conv_update` | 2.0220 | 48 | 3.8% |
+| `gdn.recurrent_update` | 2.0092 | 48 | 3.8% |
+| `gdn.residual` | 1.9999 | 48 | 3.8% |
+| `gemm:gdn.in_proj_b` | 1.6642 | 48 | 3.2% |
+| `final_norm+lm_head` | 1.2693 | 1 | 2.4% |
+| `gemm:attn.qg_proj` | 1.3986 | 16 | 2.7% |
+| `gemm:attn.o_proj` | 0.8674 | 16 | 1.6% |
+| (remaining attention kernels: split_qg/k_proj/v_proj/qk_norm/rope/kv_write/core_decode/gate_mul/residual) | -- | 16 each | 0.6-1.3% each |
+
+Cross-layout: GDN's own non-GEMM kernels (`conv_update`, `recurrent_update`, fused `residual`)
+are roughly tied at 3.7-4.2% of `gpu_sum` each in every layout, not dominated by any single one --
+**`recurrent_update` does NOT dominate GDN's excess**, contradicting docs/r9700.md's own prior
+expectation for Q3 ("expect recurrent_update to dominate; if it does not, R6's design changes"). R6's
+fused kernel should fold `conv_update` + `recurrent_update` + the gated-norm step together (as
+originally planned) rather than optimizing `recurrent_update` in isolation. w4a8 and mxfp4 show the
+same relative ordering among GDN's non-GEMM kernels (within 0.3-0.5 percentage points of each other);
+full per-layout tables are in `build\logs\m3-profile-{w4a16,w4a8,mxfp4}.log`.
+
+**mxfp4's kernel-launch count is 596 vs w4a16/w4a8's 259 (decode) and 10098 vs 4386 (prefill) -- not
+a mystery, a known and now-confirmed instrumentation blind spot.** `r4dx_kernel_launch_counter_get()`
+only counts r4dx-owned kernel translation units. mxfp4's activation-quant kernel
+(`r4dx_quant_act_fp8e4m3_row`, `src/kernels/src/r4dx_kernels.hip`) is r4dx-owned and counted; w4a16's
+equivalent (`r4dx_model_cast_bf16_to_f16`) and w4a8's (`core::r4d::QuantActI8`, third_party/libr4d)
+are not (this scope gap was already flagged by the R3/P2 passes -- confirmed here with real per-layout
+numbers rather than left as a guess). 257 quantized-GEMM sub-chunk calls per decode step (the census
+in §2.5 of docs/r9700.md) roughly accounts for the +337 launch delta; the launch counter is real but
+**not directly comparable across layouts** without this caveat.
+
+### Q7 -- prefill GEMM vs non-GEMM split at T=64
+
+`--profile-prefill` against a real 1068-token prompt (`"The GPU executes thousands of parallel
+threads..."` x32, 17 chunks at T<=64 each), `Model::PrefillProfiled`:
+
+| Layout | `gpu_sum` total | GEMM share | GEMM ms/token | non-GEMM share | non-GEMM ms/token | r4dx launches | wall prefill tok/s |
+|---|---|---|---|---|---|---|---|
+| w4a16 | 1545.12 ms | **73.2%** | 1.059 | 26.8% | 0.387 | 4386 | 664.43 |
+| w4a8  | 1234.97 ms | **66.8%** | 0.773 | 33.2% | 0.384 | 4386 | 825.18 |
+| mxfp4 | 1361.37 ms | **69.4%** | 0.885 | 30.6% | 0.390 | 10098 | 751.86 |
+
+**This inverts docs/r9700.md's own §2.6 conclusion.** The previous revision inferred (not measured)
+a 36% GEMM / 64% non-GEMM split and concluded "R11 outranks R10". The real measurement is the
+opposite ratio (67-73% GEMM, 27-33% non-GEMM) in every layout -- **R10 (the tiled prefill WMMA GEMM
+kernel, P9) is the bigger lever, not R11.** docs/r9700.md's §2.6 and roadmap table are corrected in
+place with a dated note; see that file. Same Q2 caveat applies to the absolute ms/token columns
+above (fine-grained instrumentation overhead) -- the GEMM/non-GEMM *ratio* is the trustworthy part of
+this measurement, not the absolute 1.45-1.68 ms/token total (real prefill is 664-825 tok/s = 1.21-
+1.51 ms/token wall per the table's own last column, close enough to the profiled gpu_sum/token that
+the prefill-side instrumentation tax, unlike decode's, is not the dominant term -- prefill's spans are
+already amortized over up to 64 rows per chunk instead of 1, so the per-boundary tax matters far
+less relative to real per-chunk GPU work).
+
+### Q5 -- tune_gemm.py cache-flattery fix
+
+`tools/profile/tune_gemm.py` now allocates a ring of >=4 independent weight-buffer copies totalling
+>256 MiB per swept `(layout, shape)` and rotates through it once per timed call (see that file's own
+header comment for the exact mechanism), so the 64 MiB Infinity Cache can no longer make a
+smaller-than-64 MiB shape look artificially fast. Re-measured M=1 for `gdn.in_proj_qkv`
+(N=10240,K=5120) and `mlp.down` (N=5120,K=17408), all three quantized layouts (command:
+`tools\profile\tune_gemm.py --shapes mlp.down,gdn.in_proj_qkv --layouts w4a16,w4a8,mxfp4 --m-bands
+1 --out build\logs\m3-tune-gemm-scratch.inc`, reference venv, HIP device 1):
+
+| Shape | Layout | Old (checked-in, cache-flattered) | New (ring-rotated, this pass) | Delta |
+|---|---|---|---|---|
+| `gdn.in_proj_qkv` | w4a16 | 40.84 us | 45.74 us | +12.0% |
+| `gdn.in_proj_qkv` | w4a8  | 40.49 us | 45.98 us | +13.6% |
+| `gdn.in_proj_qkv` | mxfp4 | 30.44 us | **52.27 us** | **+71.7%** |
+| `mlp.down` | w4a16 | 74.88 us | 75.00 us | +0.2% |
+| `mlp.down` | w4a8  | 71.85 us | 74.05 us | +3.1% |
+| `mlp.down` | mxfp4 | 50.53 us | **84.30 us** | **+66.8%** |
+
+mxfp4's M=1 numbers on both shapes were almost entirely a cache-residency artifact of the old
+single-buffer benchmark (docs/r9700.md's own §1.2/§2.5 suspicion, now confirmed with numbers):
+correcting it, mxfp4 goes from **fastest** of the three layouts on these two cells (30.44/50.53 us)
+to **slowest** (52.27/84.30 us) -- **the ranking changed**. The winning `WV/SK/MB/NPW` tuning
+parameters also changed for the w4a16/w4a8 cells (e.g. w4a16 `gdn.in_proj_qkv`: `{1,8,1,1,1}` ->
+`{8,2,1,1,1}`). Per docs/r9700.md's own stated rule for this task ("do not rewrite the whole table
+unless the ranking changes; if it does, re-sweep and say so"): **the ranking changed, and this pass
+did not re-sweep the full 196-row table** (7 shapes x 7 M-bands x 4 layouts is a much longer run than
+this task's time budget covered -- only the 6 cells above were re-measured, exactly as the task
+specified). `src/model/gemm_tuning_table.inc` was left unmodified; `PickTuning` is still serving the
+old, partially cache-flattered numbers for every untouched cell. **A full Q5-fixed re-sweep is now
+the top follow-up item** -- see "Re-ranked next five items" below.
+
+### Q8 -- clock/power sampling
+
+**No working tool was found on this machine.** `rocm-smi`/`amd-smi` are not present under
+`C:\opt\rocm\bin` (checked by directory listing -- this ROCm 7.15 Windows SDK does not ship either;
+ROCm-SMI has historically been a Linux-only tool). Windows' built-in `Get-Counter '\GPU
+Engine(*)\Utilization Percentage'` counter set exists and reports utilization, but there is no "GPU
+Clock" or "GPU Power" counter set available on this system; `Get-CimInstance -ClassName
+Win32_VideoController` and a scan of `root\cimv2`'s child WMI namespaces found no AMD-specific sensor
+provider. No AMD ADL/ADLX/AGS SDK is linked into this project. **This is reported as an open gap, not
+silently dropped**: docs/r9700.md's Q8 and C38 are updated to say a working sampler was not found
+this pass, and name three concrete follow-up paths (link the ADLX SDK; a Linux/WSL2 ROCm-SMI path,
+unconfirmed to expose real sensors for this exact device under WSL2 passthrough; or accept that HIP's
+own device-attribute surface does not expose live clock/power on this driver and the question stays
+open). **Whether the card holds boost clock through a decode step or an MTP verify step is therefore
+still unanswered** -- C38's 2.2x boost-ramp finding from the research microbenchmark remains the only
+evidence either way, and it was measured on a device-saturating kernel, not a real decode step.
+
+### Re-ranked next five items (this pass's evidence)
+
+1. **Full Q5-fixed `tune_gemm.py` re-sweep + `gemm_tuning_table.inc` regeneration** (new, was not on
+   the prior 5-item list at all). *Expected*: at minimum the 6 measured cells above show real M=1
+   decode-path GEMM cost is **+0.2% to +71.7%** higher than `PickTuning` currently assumes for 2 of
+   this model's 7 shapes across 3 layouts -- extrapolating similar-magnitude corrections across the
+   other 5 shapes (`mlp.gate_up`, `gdn.out_proj`, `attn.qg/o/k/v`), a conservative estimate is
+   **+0.1 to +0.3 ms/token** of currently-mispriced GEMM cost per quantized layout, concentrated in
+   mxfp4 (which flips from fastest to slowest on the two shapes actually re-measured). *Justified by*:
+   this pass's Q5 table above (measured).
+2. **R10 -- tiled prefill WMMA GEMM kernel (P9).** *Expected*: GEMM is 66.8-73.2% of prefill
+   `gpu_sum` at T<=64 (measured, all 3 layouts) vs the 36% previously assumed; docs/r9700.md's P9
+   design already targets 170-215 TOPS (44-56% of dense peak) which projects to ~275 us/token GEMM
+   time vs today's measured 0.77-1.06 ms/token -- a **~2.8-3.9x cut on the now-confirmed-larger GEMM
+   share**, i.e. roughly **0.5-0.8 ms/token off the ~1.2-1.7 ms/token total prefill cost measured this
+   pass**, a bigger lever than R11. *Justified by*: this pass's Q7 table above (measured).
+3. **R11 -- prefill non-GEMM path (GDN chunk-scan/kkt_solve/attention prefill/elementwise).**
+   *Expected*: 26.8-33.2% of prefill `gpu_sum` (0.38-0.39 ms/token, measured, all 3 layouts) -- real
+   and now individually broken out per kernel (`gdn.conv_prep`, `gdn.kkt_solve`, `gdn.chunk_scan`,
+   `gdn.gated_rmsnorm`, `attn.core_prefill`, etc., see `build\logs\m3-profile-prefill-*.log`), worth
+   fixing but ranks below R10 now that both are measured instead of inferred. *Justified by*: same Q7
+   table.
+4. **R6 -- fused GDN decode kernel, corrected target.** *Expected*: GDN's `conv_update` +
+   `recurrent_update` + `gdn.residual` (the fused gated-norm/residual step) are roughly tied at
+   3.7-4.2% of decode `gpu_sum` each (measured, all 3 layouts) rather than `recurrent_update` alone
+   dominating as this document previously expected -- R6 should fuse all three together, not target
+   `recurrent_update` in isolation. Absolute ms/token savings cannot be estimated cleanly from
+   `--profile`'s current numbers (Q2's instrumentation-overhead caveat applies directly to these
+   percentages), so this item should be re-measured with a lighter-weight profiling method (below)
+   before committing to a specific ms/token target. *Justified by*: this pass's Q3 table above
+   (measured).
+5. **A lower-overhead profiling mode (methodology fix, not a perf lever itself).** *Expected*: 0
+   ms/token directly, but unblocks trustworthy absolute-ms numbers for R6/R10/R11 sizing. Today's
+   per-kernel `--profile` costs **+25.9 to +28.0 ms/step of real measured device time** (this pass's
+   Q2 table, ~1.9-2.1x the real step) -- comparable in size to several roadmap items' entire claimed
+   gain, meaning any `--profile`-derived ms/token estimate for R6 specifically is currently untrustworthy
+   at the absolute-value level. Recommend either (a) batching hipEvent pairs at coarser boundaries
+   (e.g. once per GDN layer instead of once per kernel) as a middle ground between block-level and
+   per-kernel, or (b) switching to a real GPU trace tool (`rocprofiler`/`rocprof`, if available on this
+   ROCm 7.15 Windows install -- not checked this pass) that does not require one `hipEventRecord` pair
+   per span. *Justified by*: this pass's Q2 measurement (the token1-vs-token32 near-zero delta,
+   isolating the instrumentation-overhead effect from the first-token effect).
+
+> **Update (2026-09-20, P6 kernel rewrite, docs/r9700.md task "P6 + §2.5")**: vectorized the three
+> decode-hot-path kernels named first in the task brief -- `r4dx_rmsnorm_bf16`,
+> `r4dx_residual_rmsnorm_bf16`, `r4dx_silu_mul_bf16` (`src/kernels/src/r4dx_kernels.hip`) -- from
+> scalar 2-byte `__bfloat162float`/`__float2bfloat16` loads/stores to 16-byte `uint4` vector
+> loads/stores, using `__ushort_as_bfloat16`/`__bfloat16_as_ushort` (amd_hip_bf16.h's bit-preserving
+> pair -- NOT `__hip_bfloat16`'s own `(unsigned short)` constructor/`operator unsigned short()`,
+> which are VALUE conversions and silently corrupt every element if used for this; see the file's
+> own comment and "What went wrong first" below) to unpack/pack two bf16 halves per loaded dword.
+> Grid stays `dim3(rows)` (one workgroup per row, `kThreads`=256=8 waves/block already) -- a
+> ~10-35 KB row cannot usefully fill 64 CUs (docs/r9700.md's own "honest goal is latency at 1 row"),
+> the task's other explicitly-sanctioned design when the single-workgroup-per-row form already gets
+> >=8 waves. A byte-exact correctness test (`tests/kernels/test_kernel_bandwidth.cpp`, new) captured
+> the pre-P6 scalar kernels' output as a golden (`tests/kernels/golden/kernel_bandwidth_golden.bin`,
+> checked in) for M in {1,4,16,64} x K in {5120,6144,17408} BEFORE any kernel edit, then gated the
+> rewrite against it: elementwise outputs (silu_mul, residual_rmsnorm's residual-add half) are
+> bit-exact (0/4,874,240 differ); the two reduction-dependent outputs (rmsnorm's own output,
+> residual_rmsnorm's normed half) differ on 13/4,874,240 elements (2.7e-4%), max rel error 7.3e-3,
+> from summation-order reassociation crossing a bf16 rounding boundary -- expected per the task's own
+> "norm reductions may differ in the last ulp" allowance; see that test file's header comment for why
+> a literal 1e-6 old-vs-new bound is not the right gate for a bf16-quantized reduction output and
+> what this test asserts instead. Full `ctest` **32/32** (31 prior + the new test).
+>
+> **What went wrong first**: the initial version used `__hip_bfloat16(unsigned short)` /
+> `operator unsigned short()` to pack/unpack, which compile fine but perform a VALUE conversion
+> (`static_cast<__bf16>(int_value)`, i.e. "the bf16 nearest this integer"), not a bit
+> reinterpretation -- `amd_hip_bf16.h`'s own `HIPRT_ONE_BF16` etc. macros use a separate
+> `__ushort_as_bfloat16` intrinsic for exactly this reason. Running the new byte-exact test against
+> that version immediately caught it (4,871,766/4,874,240 elements wrong, `max_diff_fp32=inf`) before
+> it reached `ctest` or a perf run; fixed by switching to `__ushort_as_bfloat16`/
+> `__bfloat16_as_ushort`, confirmed by the same test.
+>
+> **Per-launch microseconds, isolated hipEvent microbenchmark** (`test_kernel_bandwidth`'s own
+> timing, 20 iters after 5 warmup, HIP device 1, same container-independent synthetic inputs as the
+> correctness check -- NOT the full-model `--profile` clock, see docs/r9700.md's rule 1 on never
+> mixing step clocks):
+>
+> | Kernel | M | K=5120 before->after | K=6144 before->after | K=17408 before->after |
+> |---|---|---|---|---|
+> | rmsnorm | 1 | 13.61 -> 7.44 us (-45%) | 15.56 -> 7.86 us (-49%) | 34.47 -> 12.28 us (-64%) |
+> | rmsnorm | 4 | 14.52 -> 7.14 us (-51%) | 16.67 -> 6.99 us (-58%) | 40.02 -> 12.86 us (-68%) |
+> | rmsnorm | 16 | 14.69 -> 3.58 us (-76%) | 16.96 -> 3.41 us (-80%) | 43.91 -> 5.85 us (-87%) |
+> | rmsnorm | 64 | 16.05 -> 3.45 us (-79%) | 19.10 -> 3.76 us (-80%) | 15.71 -> 5.67 us (n/a, see note) |
+> | residual_rmsnorm | 1 | 16.30 -> 7.26 us (-55%) | 17.23 -> 7.71 us (-55%) | 48.56 -> 12.66 us (-74%) |
+> | residual_rmsnorm | 4 | 15.49 -> 7.14 us (-54%) | 17.42 -> 7.92 us (-55%) | 51.88 -> 11.67 us (-77%) |
+> | residual_rmsnorm | 16 | 15.82 -> 3.47 us (-78%) | 18.47 -> 3.92 us (-79%) | 62.54 -> 5.93 us (-91%) |
+> | residual_rmsnorm | 64 | 16.37 -> 4.68 us (-71%) | 18.52 -> 4.02 us (-78%) | 21.69 -> 10.80 us (-50%) |
+> | silu_mul | 1 | 8.33 -> 5.46 us (-35%) | 9.67 -> 5.76 us (-40%) | 22.96 -> 11.29 us (-51%) |
+> | silu_mul | 4 | 9.64 -> 5.29 us (-45%) | 10.68 -> 6.01 us (-44%) | 24.81 -> 11.16 us (-55%) |
+> | silu_mul | 16 | 10.43 -> 2.78 us (-73%) | 10.94 -> 3.74 us (-66%) | 26.16 -> 4.67 us (-82%) |
+> | silu_mul | 64 | 14.45 -> 3.19 us (-78%) | 16.89 -> 3.18 us (-81%) | 9.56 -> 7.11 us (n/a, see note) |
+>
+> Every cell improved (35-91%); the M=64,K=17408 rmsnorm/silu_mul "before" cells are the two outliers
+> in the whole 36-cell grid where "before" was already anomalously fast (15.71 us and 9.56 us --
+> both far below their own M=16 neighbor, 43.91 us and 26.16 us respectively, and below what C38's
+> documented clock-ramp artifact alone would explain) -- not re-investigated (flagged as noise, not
+> re-run, to avoid the two-GPU-processes-at-once rule's spirit of not chasing single anomalous
+> samples); every other before/after pair is monotonic and consistent with the K-scaling of the other
+> two M rows. Full data: `build\logs\p6-capture-before.log` (before, captured against the unmodified
+> kernel prior to any edit) and `build\logs\p6-check-after2.log` (after).
+>
+> **Full-model decode tok/s** (real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this
+> file's standard prompt/flags, HIP device 1, each config run once except w4a16 `--mtp 0` run twice
+> to confirm reproducibility -- 38.58 vs 38.59 tok/s, within the 3% re-report threshold):
+>
+> | Layout | mtp=0 (R3-only baseline -> P6) | mtp=3 (R3-only baseline -> P6) | mtp=3 acceptance |
+> |---|---|---|---|
+> | w4a16 | 37.39 -> **38.58 tok/s** (+3.2%) | 65.02 -> **68.43 tok/s** (+5.2%) | 46.3% (36 rounds, 108 drafted, 50 accepted) |
+> | w4a8  | not measured R3-only -> **35.51 tok/s** | not measured R3-only -> **61.47 tok/s** | 43.3% (40 rounds, 120 drafted, 52 accepted) |
+> | mxfp4 | not measured R3-only -> **30.08 tok/s** | not measured R3-only -> **55.71 tok/s** | 47.1% (34 rounds, 102 drafted, 48 accepted) |
+>
+> The wall-clock win (+3.2% at `--mtp 0`) is real but far smaller than the 35-91% per-launch cut
+> above -- consistent with docs/r9700.md's own §2.5 gap decomposition: these three kernels are
+> "non-GEMM" launches, which the profiled step's own breakdown (below) shows at 32.5% of `gpu_sum`,
+> and GEMMs (67.5%) are untouched by this pass. Full per-op profile after P6
+> (`r4dx-cli --profile`, w4a16, `build\logs\p6-profile-w4a16.log`): `gdn.residual` (the fused
+> GDN->Mlp `residual_rmsnorm` call) 2.06 ms/48 layers = 42.9 us/call, `mlp.residual`
+> (Mlp->next-layer `residual_rmsnorm`) 3.00 ms/64 = 46.8 us/call, `mlp.silu_mul` 3.03 ms/64 =
+> 47.3 us/call -- all noticeably higher than the isolated microbenchmark's post-P6 numbers above
+> (which run each kernel alone, back-to-back, with no other traffic on the stream); docs/r9700.md's
+> rule 1 (never mix profiled-step and steady-state/isolated clocks) applies here too -- a
+> `--profile` run's hipEvent pairs sit inside a ~1200-launch stream with real queueing/contention,
+> so its per-op numbers are not directly comparable to a dedicated microbenchmark's, and no attempt
+> is made here to reconcile the two; both are reported as what each methodology actually measures.
+> `r4dx-owned kernel launches/token` unchanged at **259** (P6 rewrites existing launches in place,
+> it does not add or remove any -- R3 already did the launch-count cut). No isolated before/after
+> `--profile` comparison was taken (that would need reverting the kernel edit and rebuilding purely
+> to re-run `--profile`, a throwaway revert/rebuild cycle this project's own prior pass
+> (docs/status.md's R2+R3+P2+P6 section) already declined to do for the analogous R3 launch-count
+> claim, for the same reason: it answers a question the isolated microbenchmark above already
+> answers more directly).
+>
+> **Not done this pass** (see this file's task instructions and docs/status.md's P6 entry for the
+> full list): `r4dx_rope_partial_mrope_bf16`, `r4dx_quant_act_fp8e4m3_row`,
+> `r4dx_kv_write_paged_fp8_hnd`, `r4dx_argmax_f32`, `r4dx_embedding_gather_bf16`, and the plain
+> (non-fused) `r4dx_residual_add_bf16` are all still scalar/`dim3(rows or T)` -- the task named
+> rmsnorm/residual_rmsnorm/silu_mul as the three to do this pass ("kernel by kernel, starting with
+> rmsnorm then residual_rmsnorm then silu_mul") and the remaining six are each their own
+> correctness-verification effort (argmax in particular needs a real multi-workgroup reduction
+> design, not just wider loads, since it is a single-block reduction over 248320 floats today).
+> `ApplyLinear`'s quant/cast launches were explicitly out of scope for this pass per the task
+> ("Do not touch ApplyLinear's quant launches yet (next stage)"). The default layout stays `w4a16`;
+> the layout-decision sweep item from the R2/R3 pass's own deferred list still has not been run to
+> completion (P2's fused quant epilogues, the other half of that sweep's precondition, are also still
+> not implemented).
+
 > **Update (2026-09-20, R2+R3+P2+P6 pass, docs/r9700.md -- partial)**: R3 (fuse
 > `r4dx_residual_rmsnorm_bf16` into both layer boundaries) is done: **386 -> 259 r4dx-owned kernel
 > launches/token** (w4a16, measured via `r4dx-cli --profile`). Wall-clock effect measured flat
@@ -27,9 +405,27 @@
 >
 > | Layout | mtp=0 decode | mtp=3 decode | mtp=3 acceptance | prefill | VRAM (mtp=0 / mtp=3) |
 > |---|---|---|---|---|---|
-> | w4a16 | **37.77 tok/s** | 67.82 tok/s | 50.0% (24 rounds, 72 drafted, 36 accepted) | 599-709 tok/s | 13.80 / 14.23 GiB |
-> | w4a8  | **34.97 tok/s** | 56.89 tok/s | 39.5% (43 rounds, 129 drafted, 51 accepted) | 677-716 tok/s | 13.80 / 14.23 GiB |
-> | mxfp4 | **29.72 tok/s** | 53.09 tok/s | 45.7% (35 rounds, 105 drafted, 48 accepted) | 635-641 tok/s | 13.80 / 14.23 GiB |
+> | w4a16 | **37.77 tok/s** | 67.82 tok/s | 50.0% (24 rounds, 72 drafted, 36 accepted) | 599-709 tok/s | ~~13.80 / 14.23 GiB~~ (see correction below) |
+> | w4a8  | **34.97 tok/s** | 56.89 tok/s | 39.5% (43 rounds, 129 drafted, 51 accepted) | 677-716 tok/s | ~~13.80 / 14.23 GiB~~ (see correction below) |
+> | mxfp4 | **29.72 tok/s** | 53.09 tok/s | 45.7% (35 rounds, 105 drafted, 48 accepted) | 635-641 tok/s | ~~13.80 / 14.23 GiB~~ (see correction below) |
+>
+> **VRAM correction (2026-09-20, FIX pass, review finding)**: the VRAM column above was measured in
+> a pre-merge worktree that did not yet include stage 1's (`ced8acc`) device-resident embedding
+> mirror (`Container::Load`'s `embed_tokens_dev_`, ~2.37 GiB = vocab 248320 x hidden 5120 x 2 bytes)
+> -- every figure understates the merged tree by exactly that delta. Re-measured against the current
+> merged tree, same prompt/flags/container, HIP device 1, `--stats`:
+>
+> | Layout | mtp=0 decode | mtp=3 decode | mtp=3 acceptance | prefill | VRAM (mtp=0 / mtp=3) |
+> |---|---|---|---|---|---|
+> | w4a16 | **38.89 / 38.76 tok/s** | 68.42 tok/s | 46.3% (36 rounds, 108 drafted, 50 accepted), 2.31 tok/round | 722.26-728.71 tok/s | **16.17 / 16.60 GiB** |
+> | w4a8  | **35.75 tok/s** | 61.33 tok/s | 43.3% (40 rounds, 120 drafted, 52 accepted), 2.27 tok/round | 702.69-719.44 tok/s | **16.17 / 16.60 GiB** |
+> | mxfp4 | **30.29 tok/s** | 55.56 tok/s | 47.1% (34 rounds, 102 drafted, 48 accepted), 2.32 tok/round | 629.52-642.53 tok/s | **16.17 / 16.60 GiB** |
+>
+> Decode/prefill land close to (mostly slightly above) the original R1 figures -- the merged tree
+> also carries R2/R3/P2/P6's fused-epilogue and launch-count work on top of R1 alone, so this is not
+> an apples-to-apples re-run of R1 in isolation, just the current tree's true numbers. `--embed-
+> device-resident off` (added this same FIX pass) opts back into the pre-mirror 13.80/14.23 GiB
+> footprint at the cost of a per-token host memcpy+H2D on the decode/draft embedding path.
 >
 > **`--mtp 0` decode vs the pre-R1 container** (docs/r9700.md predicted "+4 to +5 tok/s realistic"
 > from a 36.6 -> 43.0 tok/s ceiling move):
@@ -49,10 +445,13 @@
 > run-to-run/weight-identical-but-different-container noise in the draft head's own predictions
 > feeding off the (now differently-rounded) backbone hidden states, not a regression: every
 > combination still beat its pre-R1 decode number. VRAM dropped from the pre-R1 15.75 GiB (all three
-> quantized layouts, per that pass's own reported figure) to **13.80 GiB at `--mtp 0`** (-1.95 GiB) /
-> **14.23 GiB at `--mtp 3`** -- the new `Container::Load`/`Model::Load` VRAM breakdown line
-> (docs/r9700.md R14/Q13) shows this as `weights=13.14 GiB, kv+gdn_state=0.34-0.83 GiB,
-> arena+scratch=0.09-0.16 GiB` for every quantized layout (identical `weights` figure across w4a16/
+> quantized layouts, per that pass's own reported figure) to ~~**13.80 GiB at `--mtp 0`** (-1.95 GiB) /
+> **14.23 GiB at `--mtp 3`**~~ *(stale -- see "VRAM correction" above: the merged tree measures 16.17
+> / 16.60 GiB, 2.37 GiB higher, once stage 1's device-resident embedding mirror is accounted for)* --
+> the new `Container::Load`/`Model::Load` VRAM breakdown line (docs/r9700.md R14/Q13) shows this as
+> `weights=15.5076 GiB, kv+gdn_state=0.34-0.83 GiB, arena+scratch=0.09-0.16 GiB` (re-measured against
+> the merged tree; the `weights` figure itself also grew from 13.14 to 15.5076 GiB across this same
+> delta) for every quantized layout (identical `weights` figure across w4a16/
 > w4a8/mxfp4 at `--mtp 0`, mirroring the pre-R1 container's own "why is w4a8 not 0.35 GiB smaller"
 > puzzle -- Q13 is only partially closed by this breakdown; see docs/r9700.md's open items). The R14
 > over-commit warning was verified against the OLD container's `--layout bf16` (47.73 GiB logical

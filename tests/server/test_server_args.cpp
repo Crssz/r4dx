@@ -130,6 +130,36 @@ void TestUnparseableNumberThrowsServerUsageError() {
   CHECK(threw_usage_error);
 }
 
+// --embed-device-resident (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own flag --
+// defaults to "on", accepts "off", rejects anything else.
+void TestEmbedDeviceResidentFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.embed_device_resident == "on");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx",
+                                         "--embed-device-resident", "off"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.embed_device_resident == "off");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx",
+                                         "--embed-device-resident", "bogus"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -139,6 +169,7 @@ int main() {
   TestUnrecognizedFlagThrows();
   TestNonsensicalValuesThrow();
   TestUnparseableNumberThrowsServerUsageError();
+  TestEmbedDeviceResidentFlag();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

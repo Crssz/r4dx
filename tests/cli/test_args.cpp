@@ -173,6 +173,39 @@ void TestNonsensicalValuesThrow() {
   }
 }
 
+// --embed-device-resident (review finding, 2026-09-20): ModelOptions::embed_device_resident's own
+// doc comment promised a CLI escape hatch ("set false to force host-only gather") that no flag
+// actually implemented -- this checks the flag now exists, defaults to "on", and rejects anything
+// other than "on"/"off".
+void TestEmbedDeviceResidentFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.embed_device_resident == "on");  // default
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli",  "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt",  "hi",      "--embed-device-resident", "off"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.embed_device_resident == "off");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli",  "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt",  "hi",      "--embed-device-resident", "bogus"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::cli::CliUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -185,6 +218,7 @@ int main() {
   TestMissingValueThrows();
   TestUnparseableNumberThrowsCliUsageError();
   TestNonsensicalValuesThrow();
+  TestEmbedDeviceResidentFlag();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

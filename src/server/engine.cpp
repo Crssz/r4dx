@@ -7,6 +7,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
 
 namespace r4dx::server {
@@ -238,32 +239,34 @@ void Engine::RunRequest(PendingRequest& req) {
         ++mtp_rounds;
         mtp_drafted += draft_k;
         mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
-        // `next` (this call's own token_id argument) is now committed -- see
-        // prefix_state.h/model.h's Reset() comment and Model::DecodeStepMtpGreedy's own doc
-        // comment for why every element of `round` EXCEPT its last is also unconditionally
-        // committed by the atomic call above, regardless of whether the loop below decides to
-        // display it (docs/mtp.md's "mid-round" gap, closed here).
+        // `next` (this call's own token_id argument) is now committed -- see prefix_state.h/
+        // model.h's Reset() comment. ProcessMtpRound (src/model/mtp_round.hpp) computes the rest
+        // of `round` that is ALSO unconditionally committed by the atomic call above, independent
+        // of how far the display/EmitToken loop below gets (max-tokens, an EOS candidate that
+        // isn't round's own last element, or a --stop string match mid-round all end that loop
+        // early) -- see that header's file comment for why this must be computed up front rather
+        // than incrementally inside a loop that can `break` (docs/mtp.md's "mid-round" gap).
+        const r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(
+            round, is_eos, max_tokens - static_cast<int64_t>(generated_tokens.size()));
         committed_tokens.push_back(next);
-        for (size_t ri = 0; ri < round.size(); ++ri) {
-          const int32_t tok = round[ri];
-          const bool is_last_in_round = (ri + 1 == round.size());
-          if (!is_last_in_round) committed_tokens.push_back(tok);
-          if (is_eos(tok)) {
-            finish_reason = "stop";
-            stopped = true;
-            break;
-          }
-          if (static_cast<int64_t>(generated_tokens.size()) >= max_tokens) {
-            stopped = true;
-            break;
-          }
+        committed_tokens.insert(committed_tokens.end(), outcome.committed.begin(),
+                                 outcome.committed.end());
+        for (int32_t tok : outcome.displayed) {
           generated_tokens.push_back(tok);
+          next = tok;
           if (EmitToken(req, decoder, accumulated, tok)) {
             finish_reason = "stop";
             stopped = true;
             break;
           }
-          next = tok;
+        }
+        if (!stopped) {
+          if (outcome.hit_eos) {
+            finish_reason = "stop";
+            stopped = true;
+          } else if (outcome.hit_max_tokens) {
+            stopped = true;
+          }
         }
       }
     } else {

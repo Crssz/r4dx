@@ -1,8 +1,275 @@
 # Status
 
-Last updated: 2026-09-20 (Milestone 3 in progress: MTP quality + device-resident draft loop pass,
-merged with the server-catches-up-with-engine / R2+R3+P2+P6 / R1 pass -- see "Milestone 3 merge
-note" below).
+Last updated: 2026-09-20 (Milestone 3 integration pass -- see "Milestone 3: done" immediately below
+for the summary, and the FIX pass / R5 profiling-truth pass / R2+P2 / P6 / MTP-quality / R1 / server
+sections further down for the full per-stage writeups this integration pass assembles). Full `ctest`
+is **35/35** (`tests\run_tests.ps1`, clean rebuild, ~133s, HIP device 1).
+
+## Milestone 3: done
+
+Four work items, developed across several parallel/sequential stages (below) and merged, reviewed,
+fixed, and integrated in this pass:
+
+1. **R1 -- quantize `gdn.in_proj_z`/`attn.k`/`attn.v`.** These three tensors (20.6% of every
+   token's weight traffic) join the quantized-linear family (mxfp4/w4a16/w4a8, plus bf16) instead of
+   being bf16-only regardless of `--layout`. Real container reconverted:
+   `D:\models\r4dx\qwen38-27b-v3.r4dx`, 45.02 GiB (was 87.79 GiB, -48.7%). Accuracy held (no
+   tensor's rel-err crossed the task's "2x worse" bar; see "R1" below for the full table). Decode
+   ceiling moved +9.7% to +15.1% depending on layout.
+2. **R3 + P6 -- kernel-level decode-path work.** R3 fuses `r4dx_residual_rmsnorm_bf16` into both
+   layer boundaries (386 -> 259 r4dx-owned launches/token, w4a16). P6 vectorizes
+   `r4dx_rmsnorm_bf16`/`r4dx_residual_rmsnorm_bf16`/`r4dx_silu_mul_bf16` to 16-byte loads (35-91%
+   per-launch latency cut, isolated microbenchmark). R2/P2 (fused activation-quant epilogues) were
+   built and kernel-level byte-exact verified but a real end-to-end correctness bug was found when
+   wiring them into the model and NOT root-caused in time -- shipped **disabled**
+   (`EpilogueForLayout` returns `none` unconditionally); see "R2/P2" below and "Next milestone"
+   below for the follow-up.
+3. **MTP quality.** A configurable, measured MTP head layout (`--mtp-head-layout {bf16,layout}`,
+   default `layout` -- wins speed in 23/24 measured configs with no acceptance cost) and a
+   device-resident embedding gather + draft loop (`--embed-device-resident {on|off}`, default on)
+   that removes `MtpHead::Draft`'s prior per-token host round-trip.
+4. **Server catches up with the engine.** A real `Model::Reset()` (ms, not the ~18.6s full reload
+   it replaces) used on every prefix-match continuation; server-side `--mtp N` with the same
+   greedy-only per-request routing as the CLI; `PrefixState` (CPU-unit-testable prefix-match/commit
+   bookkeeping); and a real, reproducible MTP mid-round `committed_tokens` undercount bug (found by
+   the Opus review, not by ctest's tolerance-bounded goldens) fixed in both `r4dx-cli` and
+   `r4dx-server` via the shared `ProcessMtpRound` helper (`src/model/mtp_round.hpp`).
+
+**This integration pass** (2026-09-20): clean `build.ps1 -Clean` rebuild (117/117 steps, no
+warnings-as-errors, HIP device 1) -- clean of anything left over from the merge/FIX passes' own
+partial builds. Full `ctest --preset win-hip`: **35/35 passing, ~133s**
+(`build\logs` scratch logs from every prior stage were deleted at the end of this pass, per the
+task's own "delete scratch logs" instruction -- `build/` is git-ignored regardless, so none of them
+were ever going to be committed). `tools\server\smoke.ps1` run three times (default 4-layer
+container `--mtp 0`, the 4-layer MTP container `-Mtp 3`, and the real 64-layer container `-Mtp 3`):
+**24/24, 25/25, 25/25 checks passing.** A fresh confirmation sweep of `r4dx-cli` against the real
+container (`D:\models\r4dx\qwen38-27b-v3.r4dx`), this file's standard prompt/flags, w4a8/w4a16/mxfp4
+x `--mtp {0,3}` (bf16 excluded from performance work per the standing rule): every number lands
+within run-to-run noise of the FIX pass's own measurements (see "Milestone 3 consolidated
+performance" in `docs/perf.md` for the full six-run table) -- confirming the merged, reviewed, and
+fixed tree is reproducible end to end from a clean checkout. Two stale doc corrections found and
+fixed as trivial integration issues (not code): README.md's server section still said `--mtp` was
+"not yet exposed as a server flag" (it has been since the "server catches up with the engine"
+stage); `docs/server.md`'s own `--mtp-head-layout` paragraph still said the concept "does not
+correspond to any existing concept in this codebase" (true only pre-merge -- the parallel MTP-
+quality stage added it at the `src/model`/`src/cli` level, `docs/status.md`'s own "Milestone 3
+merge note" already documents this same correction; `docs/server.md` had not been updated to match
+until this pass). No engine/kernel code was changed this pass -- every correctness/perf claim below
+is inherited from the FIX pass (which DID change code, see "FIX pass" below) and reconfirmed here.
+
+**Known gaps going into Milestone 4** (not silently dropped, full detail in each stage's own section
+below):
+
+- **P2's fused activation-quant epilogues remain disabled.** Kernel-level math is byte-exact
+  verified (`tests/kernels/test_fused_quant.cpp`, 135/135); the model-level wiring compiles and
+  passes every tolerance-bounded ctest golden, but produces different generated text than the
+  disabled baseline for w4a8/mxfp4, and the root cause was not isolated (three specific unexplored
+  areas are named in the "R2/P2" section below). This is the single largest unrealized perf lever
+  in the roadmap (docs/r9700.md's R2 row) and the top candidate for Milestone 4's first task.
+- **`gemm_tuning_table.inc` still serves partially cache-flattered numbers.** R5's Q5 fix (a
+  >=4-buffer/>256MiB ring-rotation benchmark harness) proved the old single-buffer sweep
+  over-favored mxfp4 at M=1 by up to +71.7% on the two shapes spot-checked; the full 196-row
+  re-sweep was never run. `src/model/gemm_tuning_table.inc` carries a provenance banner noting this
+  (added by the FIX pass).
+- **`--mtp-head-layout` has no server-side flag** (`src/server/server_args.h`) -- every server
+  `Model` uses the measured-default layout-matched head (`std::nullopt`), which wins in 23/24
+  measured configs, so this is a low-priority passthrough gap, not a missing feature.
+- **Q8 (GPU clock/power sampling) has no working tool on this Windows ROCm 7.15 install** --
+  whether the card holds boost clock through a decode/MTP-verify step is still unanswered.
+- **R13/Q17 (32k/131k long-context validation) is unmeasured** -- every perf number in this
+  milestone is at `--max-ctx 2048` (`docs/perf.md`'s standard prompt/flags).
+- **`--chat` multi-turn + MTP together has no automated mid-round-stop regression test** (the
+  underlying bookkeeping fix IS unit-tested via `PrefixState`/`mtp_round` directly, just not a live
+  end-to-end forced-mid-round-stop scenario).
+- Vision tower and DFlash2 drafting (the milestones named in Milestone 2's own "Status" line) have
+  not been started.
+
+**Next milestone (proposed)**: (1) root-cause and re-attempt P2's fused epilogues with a real
+end-to-end byte-identical-text verification gate (not just ctest's tolerance-bounded goldens, which
+did not catch the w4a8/mxfp4 bug) before re-enabling; (2) the full Q5-fixed `tune_gemm.py` re-sweep;
+(3) R13's 32k/131k long-context measurement; (4) vision tower; (5) DFlash2 drafting.
+
+## Milestone 3 profiling truth (docs/r9700.md R5 + Q2/Q3/Q5/Q7/Q8, 2026-09-20)
+
+**Code state**: the per-kernel profiling instrumentation this task asked for (steady-state
+`--profile-token`, `SpanAccumulator`-based per-kernel hipEvent spans inside `GdnLayer::Forward`/
+`AttentionLayer::Forward`/`Mlp::Forward`, `Model::PrefillProfiled`/`--profile-prefill`, and
+`tools/profile/tune_gemm.py`'s Q5 ring-buffer cache-flattery fix) was **already present, uncommitted,
+in the working tree at the start of this pass** -- confirmed by reading `src/model/profile_span.h`,
+`Model::DecodeStepProfiled`/`PrefillProfiled` (model.cpp), `src/cli/main.cpp`'s `--profile`/
+`--profile-prefill`/`--profile-token` handling, and `tools/profile/tune_gemm.py`'s ring-allocator
+before writing any new code. `git diff --stat HEAD -- src/model/model.h src/model/model.cpp` shows
+only ~100 lines of P2-pass (`buf_normed_pre_`/`body_epilogue_`) diff on top of an already-committed
+base that carries this instrumentation -- i.e. an earlier, unlogged pass already built R5's code; this
+pass's actual work was: verify build+test are still green, RUN the real measurements against real
+hardware and the real container, and correct docs/r9700.md/docs/perf.md against what was measured
+(several of the document's own prior *inferred* numbers turned out to be wrong once measured -- see
+below). No `src/`/`tools/` files were modified this pass; `docs/perf.md` and `docs/r9700.md` were.
+
+**Build/test**: `.\build.ps1` was a no-op (`ninja: no work to do` -- already built). `.\tests\run_tests.ps1`:
+**33/33 passing**, ~114s, HIP device 1 (`build\logs\m3-ctest.log`).
+
+**Findings that changed this document's/docs/r9700.md's own prior claims** (full detail, tables, and
+`build\logs\m3-*.log` paths in docs/perf.md's "Milestone 3 profiling truth" section):
+
+1. **Q2's "+5.4 ms first-token offset" is now a "+27 ms instrumentation-granularity offset", and the
+   first-token effect itself is no longer measurable through this instrumentation** (profiling token 1
+   vs token 32 with the same fine-grained spans gives a 0.007 ms difference, w4a16). The profiled step
+   now costs ~1.9-2.1x the real steady-state step (`--stats`), not +18%. Consequence: `--profile`'s
+   `gpu_sum` and per-kernel `ms` are a ranking/attribution signal only at this granularity, same status
+   as `[TUNE]` -- not a cost model, and this document's own R6 ms/token estimate is downgraded to "not
+   cleanly estimable from current `--profile` output" pending a lower-overhead profiling method (new
+   top-5 item #5, docs/perf.md).
+2. **Q3: `recurrent_update` does NOT dominate GDN's non-GEMM excess** -- `conv_update`,
+   `recurrent_update`, and the fused `gdn.residual` are roughly tied (3.7-4.2% of decode `gpu_sum`
+   each, all 3 layouts). R6 should fuse all three, not target `recurrent_update` alone as this document
+   previously expected.
+3. **Q5: mxfp4's M=1 `gdn.in_proj_qkv`/`mlp.down` cache-flattery is confirmed and large** (+71.7%/
+   +66.8% once a >256 MiB, >=4-buffer ring replaces the old single-buffer benchmark) -- mxfp4 flips
+   from fastest to slowest of the three layouts on both cells. The ranking changed, so per this
+   document's own rule a full re-sweep is warranted; **it was not run this pass** (time-boxed to the
+   two shapes/three layouts the task specified) -- `src/model/gemm_tuning_table.inc` is unchanged and
+   still serves the old, partially cache-flattered numbers everywhere else. Flagged as the new #1
+   follow-up item.
+4. **Q7 inverts docs/r9700.md's own prior §2.6 conclusion.** Real measurement: GEMM is 66.8-73.2% of
+   prefill `gpu_sum` at T<=64 (all 3 layouts), not the previously-inferred 36%. **R10 (tiled prefill
+   GEMM kernel) outranks R11 (non-GEMM prefill path)** -- the opposite of what the document said before
+   this pass. docs/r9700.md's §2.6 and roadmap table (R10/R11 rows) are corrected in place with a
+   dated note.
+5. **Q8: no answer.** No `rocm-smi`/`amd-smi` on this Windows ROCm 7.15 install (`C:\opt\rocm\bin`
+   listed, absent), no usable Windows perf-counter or WMI clock/power source found, no ADL/ADLX/AGS SDK
+   in this project. Documented as an open gap with three concrete follow-up paths in docs/r9700.md's
+   Q8 entry, not silently dropped. Whether the card holds boost clock through a decode or MTP-verify
+   step remains unanswered.
+6. **mxfp4's kernel-launch count (596 decode / 10098 prefill) vs w4a16/w4a8's (259 / 4386) is a known
+   instrumentation blind spot, confirmed with real numbers**: `r4dx_kernel_launch_counter_get()` only
+   counts r4dx-owned translation units, and only mxfp4's own activation-quant kernel
+   (`r4dx_quant_act_fp8e4m3_row`) happens to live in one -- w4a16's/w4a8's equivalents do not. Not a
+   real 2.3x launch-count difference; a measurement-scope artifact, already flagged by the R3/P2
+   passes and confirmed rather than newly discovered here.
+
+**Not done this pass** (see docs/perf.md's "Re-ranked next five items" for the full, justified list):
+a full Q5-fixed `tune_gemm.py` re-sweep (196 rows); a lower-overhead profiling method to get
+trustworthy absolute ms/token for R6/R10/R11; Q8's clock/power sampling (no tool found); R10/R11/R6
+themselves (this was a measurement pass, "no new engine features" per the task).
+
+## R2/P2 fused activation-quant epilogues (docs/r9700.md): kernels done and byte-exact-verified; NOT wired into the model (real, reproducible correctness bug found and not root-caused)
+
+Task scope: fuse the per-GEMM activation-quant/cast launch (`r4dx_model_cast_bf16_to_f16` for
+w4a16, `core::r4d::QuantActI8` for w4a8, `r4dx_quant_act_fp8e4m3_row` for mxfp4 -- ~257 extra
+launches/token) into the producer kernel that already computed the row (rmsnorm/residual_rmsnorm/
+silu_mul), selectable by a new enum-like `r4dx_epilogue` (kernels.h). Method followed exactly as
+specified: read `third_party/libr4d/r4d_quant_act_i8.hip`'s byte-order derivation and the w4a16/
+mxfp4 GEMMs' own A-operand read code FIRST; wrote the byte-diff harness
+(`tests/kernels/test_fused_quant.cpp`) BEFORE any wiring; only then implemented and wired.
+
+- **Kernel-level epilogues, done and verified.** `r4dx_rmsnorm_bf16`/`r4dx_residual_rmsnorm_bf16`/
+  `r4dx_silu_mul_bf16` (`src/kernels/include/r4dx/kernels/kernels.h`,
+  `src/kernels/src/r4dx_kernels.hip`) each gained three trailing optional params (`epilogue`,
+  `epilogue_out`, `epilogue_scale`, default `r4dx_epilogue_none` -- every pre-existing call site
+  unaffected). When requested, a NEW pass runs immediately after the kernel's own bf16 output is
+  fully written (`__syncthreads()` first), re-reading that row and running the IDENTICAL
+  reduction+quantize algorithm the corresponding standalone kernel uses (`ApplyEpilogueRow`,
+  `r4dx_kernels.hip`) -- f16 is a plain elementwise convert (`FloatToF16(Bf16ToFloat(v))`, the same
+  helper pair `r4dx_model_cast_bf16_to_f16` calls); fp8/int8 additionally compute a per-row absmax
+  first (`BlockReduceMax`), exactly mirroring `QuantActFp8Kernel`/`r4d_quant_act_i8_kernel`
+  including int8's WMMA-fragment byte permute. **`tests/kernels/test_fused_quant.cpp`: 135/135
+  checks pass** (3 producers x 3 epilogues x M in {1,2,4,16,64} x K in {5120,6144,17408}, the
+  task's full grid) -- for every combination, the fused epilogue's bytes AND per-row scale are
+  byte-identical (`std::memcmp`/exact float compare, no tolerance) to running the real standalone
+  kernel (`r4dx_model_cast_bf16_to_f16` / `r4dx_quant_act_fp8e4m3_row` /
+  third_party/libr4d's real `r4d_quant_act_i8`) on the same bf16 values, and the producer's own
+  plain bf16 output is bit-identical whether or not an epilogue was requested. Run on real
+  hardware, HIP device 1.
+- **Model-level wiring, done mechanically, correct in isolation, WRONG end-to-end -- not enabled.**
+  `linear.h`/`linear.cpp` gained `EpilogueForLayout(Layout)` and `PreQuantizedActivation` (a
+  pre-quantized activation + per-row scale `ApplyLinear` can consume directly, skipping its own
+  quant launch for that call, with a hard `throw` if the format doesn't match `w.layout`).
+  `GdnLayer::Forward`/`AttentionLayer::Forward`/`Mlp::Forward` (`gdn_layer.{h,cpp}`,
+  `attention_layer.hpp`, `mlp.{h,cpp}`) each gained six more trailing optional params mirroring
+  R3's `x_normed_in`/`next_norm_weight`/`x_normed_out` pattern: `x_normed_pre_epilogue/_data/_scale`
+  (reuse an already-fused epilogue for this block's OWN first quantized GEMM(s) -- in_proj_qkv +
+  in_proj_z share one rmsnorm epilogue when both agree on layout, similarly qg/k/v) and
+  `next_epilogue/next_epilogue_out/next_epilogue_scale` (request this block's own
+  `r4dx_residual_rmsnorm_bf16` epilogue ALSO emit the fused format for the NEXT block's first GEMM).
+  `Mlp::Forward` additionally fuses `silu_mul`'s output epilogue into `w_.down`'s GEMM
+  unconditionally (self-contained, every layer, no cross-component plumbing). `Model` gained
+  `buf_normed_pre_`/`buf_normed_pre_scale_` (persistent, `buf_normed_`'s own reuse-in-stream-order
+  pattern) and `body_epilogue_` (`EpilogueForLayout(opts.layout)`, cached once), threaded through
+  all four of `model.cpp`'s per-layer loops (`RunChunk`, `DecodeStepProfiled`, `PrefillProfiled`,
+  `VerifyWindow`). Every per-weight fusion site independently re-validates
+  `EpilogueForLayout(that weight's OWN actual layout)` before using a shared/incoming buffer (never
+  assumes the container-wide default applies to every tensor -- `LoadQuantLinearWithFallback` can
+  fall one tensor back to bf16 independently of its siblings).
+  - **Full `ctest` 33/33 green with this wiring ACTIVE** (`test_gdn_layer`/`test_attn_layer`/
+    `test_forward_smoke`/`test_mtp`'s existing tolerance-bounded golden checks all passed).
+  - **A real, reproducible correctness bug was found via actual `r4dx-cli` generation** (not
+    caught by ctest's tolerance-bounded golden tests): with `EpilogueForLayout` wired to return
+    `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4, the generated text for
+    the real 64-layer container (`D:\models\r4dx\qwen38-27b-v3.r4dx`, standard prompt/flags)
+    changed relative to the fusion-disabled baseline -- confirmed NOT GPU nondeterminism (the
+    fusion-disabled baseline itself reproduces byte-identical text across repeated runs) and NOT
+    isolated-kernel math (`test_fused_quant.cpp` above independently verifies that). An in-model
+    diagnostic (temporarily computing each fused GEMM's activation a SECOND time via a fresh
+    unfused `ApplyLinear` call immediately after the real one, on the exact same inputs, and
+    byte-comparing the two GEMMs' own OUTPUT) showed **zero differing elements** for
+    `gdn.in_proj_qkv`, `gdn.in_proj_z`, and `mlp.down` across 200+ real w4a8 decode-step samples
+    spanning many layers -- i.e. every fusion site this diagnostic covered is individually correct
+    in the full model, yet the aggregate generated text still diverges. Root cause NOT isolated
+    within this pass's time budget. Three specific areas were NOT yet cleared and are the
+    recommended starting point for whoever picks this up: (1) the new per-call arena allocations
+    this fusion adds shift every LATER allocation in the same layer to a different byte offset than
+    the pre-fusion code path used -- something downstream may be sensitive to absolute arena
+    layout in a way that violates `Arena::Alloc`'s own bump-then-return contract; (2) `mlp.cpp`'s
+    `gate_up` local fused epilogue specifically was never isolated with the same in-model
+    diagnostic; (3) `attention_layer.hpp`'s qg/k/v fusion path is completely UNTESTED by this
+    bisection (layer 0 of this container is a GDN layer, and cross-layer-boundary fusion was
+    disabled throughout the bisection, so no attention layer's local OR cross-boundary fused path
+    was ever exercised while diagnosing this).
+  - **Decision: `EpilogueForLayout` (`linear.cpp`) returns `r4dx_epilogue_none` for every layout,
+    unconditionally, until the root cause is found and fixed.** Per this task's own explicit
+    instruction ("never loosen to a tolerance ... shipping it unverified risks silently corrupting
+    every quantized GEMM's input, which is worse than not shipping it"), this pass does NOT enable
+    the wiring despite it compiling, passing every existing ctest, and the kernel math itself being
+    independently double-verified. All the plumbing above (`PreQuantizedActivation`, the six new
+    trailing params, `buf_normed_pre_`, etc.) is left in place and exercised with `epilogue=0`
+    (a no-op, byte-identical to every pre-existing call site's behavior -- confirmed: real
+    `r4dx-cli` generation for w4a16/w4a8/mxfp4 at `--mtp 0` reproduces the exact pre-R2/P2 baseline
+    text, and w4a16 decode measures 38.91 tok/s, matching the P6-pass baseline of 38.58 tok/s
+    within noise) so a future pass that finds the root cause only has to fix it and flip
+    `EpilogueForLayout`, not rebuild this wiring from scratch.
+  - **w4a16's `r4dx_epilogue_f16` has a SEPARATE, already-understood reason it should stay
+    disabled even once the above is fixed**: measured -4.3% decode regression (38.58 -> 36.93/36.94
+    tok/s, reproducible) when briefly wired during this pass's own bisection.
+    `r4dx_model_cast_bf16_to_f16` launches a FLAT elementwise grid
+    (`blocks=ceil(M*K/256)`, ~20 independent workgroups at decode `T=1`/`K=5120`, spread across up
+    to 20 CUs in parallel); fusing it into rmsnorm/residual_rmsnorm/silu_mul's own
+    one-workgroup-per-row epilogue (`dim3(rows)=dim3(1)` at decode) collapses that same work onto a
+    SINGLE workgroup running sequentially after the row's main reduction -- a real parallelism loss
+    the removed launch's dispatch/sync savings do not cover. w4a8's `r4dx_epilogue_int8_fraga8` and
+    mxfp4's `r4dx_epilogue_fp8_e4m3_row` do NOT have this problem (their standalone kernels,
+    `r4d_quant_act_i8`/`QuantActFp8Kernel`, already launch `dim3(M)` -- one workgroup per row, same
+    grid shape as the producers -- so there is no parallelism to lose): a brief measurement during
+    this pass's bisection (before the w4a8/mxfp4 correctness bug above was found and the wiring was
+    reverted) showed w4a8 +1.4% and mxfp4 +2.2% decode at `--mtp 0`, so once the correctness bug is
+    fixed these two layouts are expected to be a net win; w4a16 should stay unfused even then
+    (or be revisited for a PREFILL-only fusion, where `dim3(rows)=dim3(T)` already gives one
+    workgroup per row and this specific loss should not apply).
+  - **Task item 4 (launch counter) and item 5 (full measurement sweep, decide the default
+    layout)**: not meaningfully done, since the fusion that would move these numbers is disabled.
+    The launch counter (`r4dx_kernel_launch_counter_get()`) was confirmed to be blind to two of the
+    three quant kernel types regardless (`r4dx_model_cast_bf16_to_f16` and
+    `core::r4d::QuantActI8` live in translation units it does not instrument -- only
+    `r4dx_quant_act_fp8e4m3_row`, mxfp4's, is counted), a pre-existing scope note this pass
+    re-confirmed rather than fixed. **`w4a16` stays the default** -- the task's own decision rule
+    presumes the fusion is real and working, which it is not this pass.
+  - **Recommended follow-up**: (a) root-cause the w4a8/mxfp4 divergence, starting with the three
+    areas listed above, using the SAME in-model diagnostic pattern (temporarily duplicate a fused
+    call as an unfused one on identical inputs, byte-compare) extended to `mlp.cpp`'s `gate_up` and
+    to at least one attention layer; (b) once fixed, re-verify with a REAL generated-text
+    byte-identical check (not just `ctest`'s tolerance-bounded golden tests, which did not catch
+    this) before re-enabling; (c) only then run task item 5's full layout-decision sweep.
+
 
 ## Milestone 3 merge note
 
@@ -114,6 +381,70 @@ implemented, see its own note below.
   `tests/model/test_forward_smoke`'s new `Reset()` check are the two additions this pass; the other
   29 are unchanged from before this pass and still pass).
 
+## P6 kernel rewrite (docs/r9700.md P6 + §2.5): rmsnorm/residual_rmsnorm/silu_mul vectorized -- done; P2 and the other six kernels still not done
+
+Follow-up to the R2+R3+P2+P6 pass below, scoped to task item 1-2's first three named kernels only
+(rmsnorm, residual_rmsnorm, silu_mul -- "the three on the decode hot path"). Rewrote all three in
+`src/kernels/src/r4dx_kernels.hip` from scalar `dim3(rows)` grids with 2-byte
+`__bfloat162float`/`__float2bfloat16` loads/stores to the same `dim3(rows)` grid (already
+`kThreads`=256=8 waves/block, the task's own sanctioned fallback for a row too small to fill 64
+CUs) but with 16-byte `uint4` vector loads/stores, unpacking/packing two bf16 halves per dword via
+`__ushort_as_bfloat16`/`__bfloat16_as_ushort`. A new test, `tests/kernels/test_kernel_bandwidth.cpp`
+(wired into `tests/kernels/CMakeLists.txt`), captured the pre-edit scalar kernels' output as a
+golden file (`tests/kernels/golden/kernel_bandwidth_golden.bin`, checked in, ~18.6 MB) for M in
+{1,4,16,64} x K in {5120,6144,17408} BEFORE any kernel edit (task step 1's explicit instruction),
+then gates the rewrite: elementwise outputs bit-exact (silu_mul, residual_rmsnorm's residual-add
+half), reduction-dependent outputs (rmsnorm's own output, residual_rmsnorm's normed half) within a
+documented last-ulp tolerance (13/4,874,240 elements differ, max rel 7.3e-3 -- see that test file's
+header comment for why the task's literal "1e-6" bound is not the operative gate for a
+bf16-quantized reduction output, and what is asserted instead). Full `ctest` **32/32** (31 prior +
+the new test).
+
+- **A real bug was caught by the new test before it reached ctest or a perf run**: the first
+  version of the pack/unpack helpers used `__hip_bfloat16(unsigned short)` /
+  `operator unsigned short()`, which are VALUE conversions in `amd_hip_bf16.h` (`static_cast<__bf16>`
+  of the integer, not a bit reinterpretation), not the bit-preserving pair
+  (`__ushort_as_bfloat16`/`__bfloat16_as_ushort`) that intrinsic-level bf16 packing needs --
+  `amd_hip_bf16.h`'s own `HIPRT_ONE_BF16` etc. macros use the latter for exactly this reason. Running
+  `test_kernel_bandwidth` against the buggy version immediately showed 4,871,766/4,874,240 elements
+  wrong (`max_diff_fp32=inf`); switching to the bit-preserving pair fixed it, confirmed by the same
+  test going green. Left as an explicit comment at the helper's definition
+  (`r4dx_kernels.hip`'s `UnpackBf16x2`/`PackBf16x2`) so the next kernel author doesn't repeat it.
+- **Measured, isolated hipEvent microbenchmark** (`test_kernel_bandwidth`'s own timing, HIP device
+  1): every one of the 36 (kernel x M x K) cells improved, 35-91% per-launch latency cut (two cells
+  at M=64,K=17408 show a smaller/anomalous "before" number that looks like measurement noise rather
+  than a real floor, not re-investigated). Full table and log paths in `docs/perf.md`'s new "P6
+  kernel rewrite" update block.
+- **Measured, full-model decode** (real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`,
+  `docs/perf.md`'s standard prompt/flags, HIP device 1): w4a16 `--mtp 0` 37.39 -> **38.58 tok/s**
+  (+3.2%), `--mtp 3` 65.02 -> **68.43 tok/s** (+5.2%, 46.3% acceptance); w4a8 `--mtp 0`
+  **35.51 tok/s**, `--mtp 3` **61.47 tok/s** (43.3% acceptance); mxfp4 `--mtp 0` **30.08 tok/s**,
+  `--mtp 3` **55.71 tok/s** (47.1% acceptance) -- w4a8/mxfp4 were not measured after R3-only, so only
+  w4a16 has a direct before/after. The wall-clock win is real but much smaller than the per-launch
+  cut, consistent with docs/r9700.md §2.5: these three kernels are "non-GEMM" launches (32.5% of
+  `gpu_sum` in the post-P6 `--profile` breakdown), and GEMMs (67.5%) are untouched by this pass.
+  `r4dx-owned kernel launches/token` unchanged at **259** (P6 rewrites launches in place, does not
+  add/remove any). Full per-op profile: `docs/perf.md`'s update block; raw logs under `build\logs\
+  p6-*.log`.
+- **Not done this pass** (do not read as silently dropped -- this is the task's own explicit scope,
+  "starting with rmsnorm then residual_rmsnorm then silu_mul"): the other six r4dx-owned kernels
+  (`r4dx_rope_partial_mrope_bf16`, `r4dx_quant_act_fp8e4m3_row`, `r4dx_kv_write_paged_fp8_hnd`,
+  `r4dx_argmax_f32`, `r4dx_embedding_gather_bf16`) and the plain non-fused `r4dx_residual_add_bf16`
+  are all still scalar/`dim3(rows or T)`. Each is its own verification effort; `r4dx_argmax_f32` in
+  particular needs a genuine multi-workgroup reduction redesign (today it is a single block looping
+  over all 248320 vocab floats), not just wider loads, since the task calls it out as being on the
+  critical path of every MTP draft. `ApplyLinear`'s quant/cast launches (P2/R2, task item... the
+  fused byte-exact int8/fp8/f16 producer epilogues) remain unimplemented -- the task for this pass
+  explicitly said not to touch them ("Do not touch ApplyLinear's quant launches yet (next stage)").
+  The default layout stays `w4a16`; the R2/R3 pass's own deferred "measure all three layouts and
+  flip the default if w4a8 wins" sweep still has not been run to completion, since P2 (its other
+  precondition) is still not implemented.
+- **Recommended follow-up** (not started): P2's fused int8 `fragA8`/fp8/f16 producer epilogues next
+  (the task's own explicit "next stage"), reusing this pass's byte-diff-golden methodology (capture
+  the existing `r4d_quant_act_i8`/`QuantActFp8Kernel`/`cast_bf16_to_f16` kernels' output as a golden
+  BEFORE wiring anything into `ApplyLinear`); then the remaining P6 kernels, argmax first since it is
+  the one that actually needs a design change rather than a mechanical vectorization.
+
 ## R2+R3+P2+P6 (docs/r9700.md): remove the per-token quant/cast launch pile -- R3 done, R2/P2/P6 kernel work NOT done this pass
 
 Task scope was four items: (1) fuse activation quantization into rmsnorm/silu_mul/GDN-gated-norm
@@ -165,7 +496,7 @@ verified on real hardware; items 1 and 2 are **not implemented this pass** -- se
 - **Wall-clock effect of R3 alone, measured** (`r4dx-cli --stats --temperature 0`, real container,
   docs/perf.md's standard prompt, `--max-tokens 128 --max-ctx 2048`, HIP device 1, each run twice):
   w4a16 `--mtp 0` decode **37.39 / 37.38 tok/s** (prefill 683.80 / 674.79 tok/s, 83 tokens, VRAM
-  13.80 GiB) -- essentially flat against R1's own 37.77 tok/s baseline (same container, same flags,
+  13.80 GiB *(stale -- see correction below)*) -- essentially flat against R1's own 37.77 tok/s baseline (same container, same flags,
   different pass), i.e. **R3 alone is a launch-count win, not yet a measured wall-clock win**: decode
   is GPU-bound (docs/r9700.md P3: `host_enqueue` is 8.3% of wall here, `finish_wait` 91.7%), so
   cutting host-issued launches mostly saves host time that was already overlapped with GPU work, not
@@ -174,6 +505,17 @@ verified on real hardware; items 1 and 2 are **not implemented this pass** -- se
   investigated further this pass). **The GPU-side win R2/P2 exists to capture (257-ish quant/cast
   launches' actual device time, and the single-workgroup-at-M=1 occupancy problem P6 names) is
   unrealized because R2/P2/P6 were not implemented -- see "Not done" immediately below.**
+  **VRAM correction (2026-09-20, FIX pass, review finding)**: every "13.80 / 14.23 GiB" figure in
+  this section and the R1 section below is stale by exactly a 2.37 GiB device-resident embedding
+  mirror (`vocab 248320 x hidden 5120 x 2 bytes`, `Container::Load`'s `embed_tokens_dev_`) that
+  landed in stage 1 (`ced8acc`, before this R3-alone measurement) but was not reflected in these
+  numbers, which were measured in a separate pre-merge worktree that predated the mirror. Re-measured
+  against the current merged tree, same prompt/flags, HIP device 1: **16.17 GiB at `--mtp 0`, 16.60
+  GiB at `--mtp 3`**, identical across w4a16/w4a8/mxfp4 (weights=15.5076 GiB is now also identical
+  across all three quantized layouts on this tree, superseding the R1 section's 13.14 GiB weights
+  figure below). Pass `--embed-device-resident off` (added this same FIX pass) to opt back into the
+  pre-mirror host-gather path and reclaim the 2.37 GiB, at the cost of a per-token host memcpy+H2D on
+  the decode/draft path.
 - **Not done this pass, and why** (do not read as silently dropped):
   - **R2/P2 fused producer epilogues (task item 1) -- not implemented.** Emitting the GEMM input
     directly from `RmsNormKernel`/`ResidualRmsNormKernel`/`SiluMulKernel`/the GDN gated-norm path in
@@ -293,10 +635,15 @@ roadmap item that raises the decode *ceiling* rather than competing for existing
   **37.77 tok/s** (was 32.83, +15.1%), w4a8 **34.97 tok/s** (was 30.95, +13.0%), mxfp4 **29.72 tok/s**
   (was 27.08, +9.7%) -- all three beat docs/r9700.md's "+4 to +5 tok/s realistic" prediction except
   mxfp4, which landed a bit under it (see docs/perf.md's own writeup for the likely reason: mxfp4's
-  worse small-M GEMM knee, §2.4). `--mtp 3` also improved on all three (+2.1% to +19.2%). VRAM:
-  13.80 GiB at `--mtp 0` (was 15.75 GiB), 14.23 GiB at `--mtp 3`. Full per-layout table, the R14
+  worse small-M GEMM knee, §2.4). `--mtp 3` also improved on all three (+2.1% to +19.2%). VRAM (as
+  measured at R1 time, in a pre-merge worktree without stage 1's device-resident embedding mirror):
+  13.80 GiB at `--mtp 0` (was 15.75 GiB), 14.23 GiB at `--mtp 3`. **Superseded (2026-09-20, FIX pass,
+  review finding): re-measured against the current merged tree (which does include that mirror),
+  same prompt/flags -- both figures are 2.37 GiB higher: 16.17 GiB at `--mtp 0`, 16.60 GiB at
+  `--mtp 3`, identical across all three quantized layouts.** Full per-layout table, the R14
   VRAM-breakdown line's output, and the R14 over-commit-warning verification (against the OLD
-  container's bf16 layout, which does over-commit) are in `docs/perf.md`'s own "R1 pass" update.
+  container's bf16 layout, which does over-commit) are in `docs/perf.md`'s own "R1 pass" update
+  (also corrected there).
 
 ## Milestone 2: done
 

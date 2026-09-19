@@ -348,26 +348,22 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   // when it started -- the bf16-on-64-layer case (47.73 GiB of weights on a 31.86 GiB card) is
   // exactly the scenario docs/r9700.md's §2.1 finding describes: hipMalloc does not error, WDDM
   // silently pages the excess over PCIe, and the only symptom is a 20-30x decode slowdown with no
-  // diagnostic anywhere. Two conditions, either one fires the warning:
-  //   (a) consumed (vram_before.free_bytes - vram_after.free_bytes) exceeds what was free before
-  //       loading started -- the "textbook" over-commit signal, correct if hipMemGetInfo ever
-  //       reported a negative-implied free.
-  //   (b) it doesn't, in practice: measured against the real bf16 container on this card,
-  //       `hipMemGetInfo` instead CLAMPS free at ~0 rather than reporting the true 47.73 GiB
-  //       logical footprint against a 31.86 GiB card (WDDM's virtual/physical split hides the
-  //       over-commit from this API) -- so (a) alone never fires for the exact case R14 exists to
-  //       catch. (b) instead flags "this call drove free VRAM to near-zero starting from headroom
-  //       that was NOT already near-zero", which is what was actually observed.
+  // diagnostic anywhere. Signal: measured against the real bf16 container on this card,
+  // `hipMemGetInfo` CLAMPS free at ~0 rather than reporting the true 47.73 GiB logical footprint
+  // against a 31.86 GiB card (WDDM's virtual/physical split hides the over-commit from this API),
+  // so this flags "this call drove free VRAM to near-zero starting from headroom that was NOT
+  // already near-zero", which is what was actually observed. (A "textbook" signal -- consumed
+  // bytes exceeding what was free before loading started -- was tried first and removed: with
+  // vram_after.free_bytes and vram_before.free_bytes both unsigned, `after < before` guarding
+  // `(before - after) > before` is unreachable for any valid free-byte pair, so it could never
+  // fire; see docs/status.md's R14 section for the removal note.)
   if (vram_before.ok) {
     const VramSnapshot vram_after = SnapshotVram();
     if (vram_after.ok) {
       constexpr uint64_t kNearZeroThreshold = 1ull << 30;  // 1 GiB
-      const bool over_committed_signal =
-          vram_after.free_bytes < vram_before.free_bytes &&
-          (vram_before.free_bytes - vram_after.free_bytes) > vram_before.free_bytes;
       const bool clamped_near_zero_signal =
           vram_after.free_bytes < kNearZeroThreshold && vram_before.free_bytes >= kNearZeroThreshold;
-      if (over_committed_signal || clamped_near_zero_signal) {
+      if (clamped_near_zero_signal) {
         std::cerr << "[r4dx::model::Container] WARNING: layout '" << LayoutName(layout)
                   << "' left only " << GiB(vram_after.free_bytes) << " GiB free (was "
                   << GiB(vram_before.free_bytes) << " GiB free before this load) -- this looks like "

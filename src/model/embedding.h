@@ -36,12 +36,15 @@ inline void EmbedTokens(core::Stream& stream, const uint16_t* table, int64_t voc
 // non-null only when the container was loaded with embed_device_resident and it fit in VRAM --
 // see Container::Load's own comment). ids_dev is a DEVICE int32[n] pointer -- may be
 // r4dx_argmax_f32's own out_idx output directly, with no host round trip at all. out_dev: caller-
-// owned device buffer, capacity >= n*hidden. Thin wrapper around r4dx_embedding_gather_bf16
-// (src/kernels) purely for call-site symmetry with EmbedTokens above.
+// owned device buffer, capacity >= n*hidden. vocab: table_dev's row count, threaded through to
+// r4dx_embedding_gather_bf16's in-kernel bounds guard (an id outside [0,vocab) clamps to row 0
+// instead of reading out-of-bounds device memory, review finding 2026-09-20). Thin wrapper around
+// r4dx_embedding_gather_bf16 (src/kernels) purely for call-site symmetry with EmbedTokens above.
 inline void EmbedTokensDeviceGather(core::Stream& stream, const uint16_t* table_dev, int64_t hidden,
-                                     const int32_t* ids_dev, int64_t n, uint16_t* out_dev) {
+                                     const int32_t* ids_dev, int64_t n, int64_t vocab,
+                                     uint16_t* out_dev) {
   r4dx_embedding_gather_bf16(reinterpret_cast<int64_t>(table_dev), reinterpret_cast<int64_t>(ids_dev),
-                              reinterpret_cast<int64_t>(out_dev), n, hidden,
+                              reinterpret_cast<int64_t>(out_dev), n, hidden, vocab,
                               reinterpret_cast<int64_t>(stream.get()));
 }
 

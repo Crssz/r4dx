@@ -18,6 +18,15 @@ remaining w4a16-vs-w4a8/mxfp4 acceptance gap ("Acceptance gap investigation" bel
 draft loop device-resident (embedding gather now a device kernel fed straight from the on-device
 argmax, no more per-drafted-token host round-trip -- "Device-resident draft loop" below).
 
+**Milestone 3 integration confirmation (2026-09-20)**: a clean `build.ps1 -Clean` rebuild + full
+`ctest` (35/35) + a fresh `r4dx-cli --mtp 3` run per layout against the real container reproduced
+this file's own numbers within run-to-run noise: w4a16 68.37 tok/s (46.3%, 2.31 tok/round), w4a8
+61.41 tok/s (43.3%, 2.27 tok/round), mxfp4 55.72 tok/s (47.1%, 2.32 tok/round). The mid-round
+`committed_tokens` bug fix (FIX pass, see "Known gaps" below) and the device-resident draft loop are
+both confirmed still in effect (`tools/server/smoke.ps1 -Mtp 3` against the real container passes
+25/25, including its MTP-path log-line check). See `docs/perf.md`'s "Milestone 3 consolidated
+performance" for the full six-run table this confirms.
+
 ## Design
 
 Per `vllm/model_executor/models/qwen3_5_mtp.py`'s `Qwen3_5MultiTokenPredictor.forward` -- the
@@ -194,9 +203,25 @@ path (see prior revision's writeup, preserved below) -- an effect that is still 
 in the kernel, but with acceptance now high (30-75% vs 0-1.2%), far FEWER verify rounds run for the
 same generation length (a K=3 round that accepts 3/3 drafts advances the sequence by 4 tokens in
 one verify call instead of 4 separate q_len=1 calls), so there are correspondingly fewer
-opportunities for the rounding-order effect to flip a near-tie argmax. Longer generations or
-different prompts could still diverge from this same floating-point-non-associativity mechanism;
-this is not a logic bug and was independently verified correct via `CheckVerifyMatchesSequential`.
+opportunities for the rounding-order effect to flip a near-tie argmax.
+>
+> **Scope correction (2026-09-20, FIX pass, review finding): the bolded "byte-identical" claim above
+> is a property of the ONE prompt/length pair actually measured, not a general guarantee, and this
+> section (and the summary bullet in "Known gaps"/the revision-history line below) previously read as
+> if it were the latter.** Review testing against different prompts/`--max-tokens` values on this
+> same w4a16 container found real, deterministic divergence between `--mtp` values -- not
+> nondeterminism (each configuration reproduces its own output exactly on repeated runs), but the
+> SAME batched-verify-vs-sequential floating-point non-associativity this section already names as
+> "structurally present," just not rare enough to avoid at every prompt length. Do not treat a
+> divergence between `--mtp 0` and `--mtp K` (or between different `K` values) on a prompt/length
+> this doc did not explicitly measure as evidence of a new regression by itself -- corroborate with
+> `CheckVerifyMatchesSequential`/`CheckRejectionRewind` (which check the actual verify-vs-sequential
+> and accept/reject-rewind CONTRACTS, not textual identity) before concluding something broke. This
+> is also why `docs/status.md`'s R2/P2 incident treats "generated text differs from baseline" as a
+> legitimate bug signal for the fused-epilogue work specifically: that comparison holds bf16 inputs
+> fixed and checks identical bytes in produce identical text out (no batched-vs-sequential
+> non-associativity in play), which is a different, stronger guarantee than what this section
+> measures.
 
 <details>
 <summary>Original pass's divergence measurement (superseded by the above, kept for the record)</summary>

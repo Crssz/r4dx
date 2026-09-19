@@ -80,11 +80,20 @@ class AttentionLayer {
   // `prof` (Milestone 3 profiling pass, docs/r9700.md R5/Q3/Q7): non-null only under r4dx-cli
   // --profile -- see profile_span.h's file comment for the naming convention ("gemm:" prefix) and
   // the zero-overhead guarantee when nullptr (every real decode/prefill call site).
+  // R2/P2 (docs/r9700.md), appended after `prof`, mirrors GdnLayer::Forward's identical trailing
+  // params: `x_normed_pre_epilogue`/`_data`/`_scale` reuse a fused quant epilogue the producer of
+  // `x_normed_in` already computed (skipping this call's own qg/k/v quant launches when the format
+  // matches, checked per-weight -- see k_shares_pre/v_shares_pre below); `next_epilogue`/
+  // `next_epilogue_out`/`next_epilogue_scale` request this call's own residual+rmsnorm epilogue
+  // also emit x_normed_out's fused quant epilogue for the immediately-following Mlp.
   void Forward(core::Arena& arena, const uint16_t* hidden_in, uint16_t* out, const AttnWeights& w,
                PagedKvCache& kv, int T, int start_pos, const int32_t* positions,
                const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
                const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
-               SpanAccumulator* prof = nullptr) {
+               SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
+               const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
+               int next_epilogue = 0, void* next_epilogue_out = nullptr,
+               float* next_epilogue_scale = nullptr) {
     if (T < 1 || T > 64) {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
@@ -99,18 +108,59 @@ class AttentionLayer {
 
     // ---- input rmsnorm ------------------------------------------------------------------------
     // R3 (docs/r9700.md): skip this launch when the previous layer's Mlp already fused it.
+    // R2/P2: when THIS call computes its own rmsnorm (x_normed_in==nullptr), it can fuse w.qg's
+    // quant epilogue into the same launch (self-contained, like GdnLayer/Mlp's identical comment)
+    // -- and since `normed` also feeds w.k/w.v below at the SAME K=hidden, the one fused buffer is
+    // reused for all three GEMMs whenever they agree on layout (checked per-weight below, not
+    // assumed, since Container::LoadQuantLinearWithFallback can fall an individual tensor back to
+    // bf16 independently of its siblings -- see gdn_layer.cpp's identical z_shares_pre comment).
     const uint16_t* normed = x_normed_in;
     uint16_t* normed_scratch = nullptr;
+    int qg_epilogue = x_normed_pre_epilogue;
+    const void* qg_pre_data = x_normed_pre_data;
+    const float* qg_pre_scale = x_normed_pre_scale;
+    // Cross-boundary reuse only valid if it matches THIS layer's own w.qg layout -- see
+    // gdn_layer.cpp's identical defensive comment.
+    if (normed != nullptr && qg_epilogue != EpilogueForLayout(w.qg->layout)) {
+      qg_epilogue = r4dx_epilogue_none;
+      qg_pre_data = nullptr;
+      qg_pre_scale = nullptr;
+    }
     if (normed == nullptr) {
+      qg_epilogue = EpilogueForLayout(w.qg->layout);
       normed_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
+      uint8_t* qg_pre_data_local = nullptr;
+      float* qg_pre_scale_local = nullptr;
+      if (qg_epilogue != r4dx_epilogue_none) {
+        const int elem_size = (qg_epilogue == r4dx_epilogue_f16) ? 2 : 1;
+        // 16-byte alignment (not uint8_t's default 1): the w4a8 GEMM's A-operand read is a
+        // global_load_b64 fragment read (r4d_quant_act_i8.hip's own file comment) -- the ORIGINAL
+        // i8_scratch (linear.cpp) happens to land 8-aligned because it is allocated immediately
+        // after arena.Reset(), but an epilogue buffer allocated later in a layer's own scratch
+        // sequence (after GdnLayer/AttentionLayer/Mlp's other T/H/K/V-shaped allocations, several
+        // of which are not multiples of 8 bytes) is not guaranteed to be -- an unaligned wide GPU
+        // load silently reads garbage rather than faulting. Found by a real generated-text
+        // divergence (docs/status.md's R2/P2 section), not by any tolerance-based golden test.
+        qg_pre_data_local =
+            arena.Alloc<uint8_t>(static_cast<size_t>(T) * hidden * elem_size, /*align_bytes=*/16);
+        if (qg_epilogue != r4dx_epilogue_f16) {
+          qg_pre_scale_local = arena.Alloc<float>(static_cast<size_t>(T));
+        }
+      }
       ProfiledCall(prof, stream, "attn.rmsnorm", [&] {
         r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(hidden_in),
                            reinterpret_cast<int64_t>(w.input_layernorm),
                            reinterpret_cast<int64_t>(normed_scratch), T, hidden, cfg_.rms_eps,
-                           reinterpret_cast<int64_t>(stream));
+                           reinterpret_cast<int64_t>(stream), qg_epilogue,
+                           reinterpret_cast<int64_t>(qg_pre_data_local),
+                           reinterpret_cast<int64_t>(qg_pre_scale_local));
       });
       normed = normed_scratch;
+      qg_pre_data = qg_pre_data_local;
+      qg_pre_scale = qg_pre_scale_local;
     }
+    const bool have_qg_pre = qg_epilogue != r4dx_epilogue_none;
+    PreQuantizedActivation normed_pre{qg_epilogue, qg_pre_data, qg_pre_scale};
 
     // ---- fused q_proj + output gate, then split per-head-interleaved --------------------------
     // Dispatched through the shared r4dx::model::ApplyLinear (decode-perf pass, 2026-09-19) --
@@ -120,7 +170,7 @@ class AttentionLayer {
     // have no quantized on-disk form.
     uint16_t* qg_raw = arena.Alloc<uint16_t>(static_cast<size_t>(T) * 2 * H * D);
     ProfiledCall(prof, stream, "gemm:attn.qg_proj", [&] {
-      ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T);
+      ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T, have_qg_pre ? &normed_pre : nullptr);
     });
 
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
@@ -138,8 +188,14 @@ class AttentionLayer {
     // own bf16-only Linear wrapper (attention/linear.hpp), which is now unused.
     uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
     uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
-    ProfiledCall(prof, stream, "gemm:attn.k_proj", [&] { ApplyLinear(stream, arena, *w.k, normed, k, T); });
-    ProfiledCall(prof, stream, "gemm:attn.v_proj", [&] { ApplyLinear(stream, arena, *w.v, normed, v, T); });
+    const bool k_shares_pre = have_qg_pre && (EpilogueForLayout(w.k->layout) == qg_epilogue);
+    const bool v_shares_pre = have_qg_pre && (EpilogueForLayout(w.v->layout) == qg_epilogue);
+    ProfiledCall(prof, stream, "gemm:attn.k_proj", [&] {
+      ApplyLinear(stream, arena, *w.k, normed, k, T, k_shares_pre ? &normed_pre : nullptr);
+    });
+    ProfiledCall(prof, stream, "gemm:attn.v_proj", [&] {
+      ApplyLinear(stream, arena, *w.v, normed, v, T, v_shares_pre ? &normed_pre : nullptr);
+    });
 
     // ---- per-head q_norm / k_norm (RMSNorm over head_dim, one shared weight per head) ----------
     ProfiledCall(prof, stream, "attn.qk_norm", [&] {
@@ -200,8 +256,16 @@ class AttentionLayer {
     const int max_decode_q_len = 64 / gqa;  // r4d.h A_MAX_DECODE_ROWS=64 (q_len*gqa)
     if (T <= max_decode_q_len) {
       const int64_t scratch_bytes = r4dx::core::r4d::AttnDecodeScratchBytes(a);
-      a.scratch = scratch_bytes > 0 ? arena.Alloc<uint8_t>(static_cast<size_t>(scratch_bytes))
-                                     : nullptr;
+      // align_bytes=16 (review finding, 2026-09-20): this feeds third_party/libr4d's own attention
+      // decode kernel, which reads it with wide (16-byte) vector loads -- same alignment the P2
+      // epilogue buffers above (line ~145) already pass explicitly. Every allocation preceding this
+      // one in a layer happens to land 16-aligned today (hidden/conv_dim/intermediate are all
+      // multiples of 16 at 2 bytes/element), so this worked by incidental arithmetic rather than
+      // any enforced guarantee; matching the epilogue buffers' explicit alignment removes that
+      // dependency.
+      a.scratch = scratch_bytes > 0
+                      ? arena.Alloc<uint8_t>(static_cast<size_t>(scratch_bytes), /*align_bytes=*/16)
+                      : nullptr;
       ProfiledCall(prof, stream, "attn.core_decode",
                    [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
     } else {
@@ -234,7 +298,9 @@ class AttentionLayer {
                                     reinterpret_cast<int64_t>(next_norm_weight),
                                     reinterpret_cast<int64_t>(out),
                                     reinterpret_cast<int64_t>(x_normed_out), T, hidden, cfg_.rms_eps,
-                                    reinterpret_cast<int64_t>(stream));
+                                    reinterpret_cast<int64_t>(stream), next_epilogue,
+                                    reinterpret_cast<int64_t>(next_epilogue_out),
+                                    reinterpret_cast<int64_t>(next_epilogue_scale));
       } else {
         r4dx_residual_add_bf16(reinterpret_cast<int64_t>(hidden_in), reinterpret_cast<int64_t>(o_out),
                                 reinterpret_cast<int64_t>(out), static_cast<int64_t>(T) * hidden,

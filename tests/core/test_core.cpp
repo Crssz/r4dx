@@ -3,6 +3,7 @@
 // path. Runs on HIP device 1 (HIP_VISIBLE_DEVICES=1, set by tests/run_tests.ps1, so device index
 // 0 here IS physical device 1, same convention as tests/smoke_r4d.cpp).
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -101,6 +102,27 @@ void TestArena() {
   Check(threw, "Arena throws bad_alloc when exhausted");
 }
 
+// Regression test for the arena-alignment finding (review, 2026-09-20): src/model/linear.cpp's
+// w4a8/mxfp4 quant scratch and src/model/attention/attention_layer.hpp's decode scratch pass an
+// explicit align_bytes=16 to Arena::Alloc because they feed wide (16-byte) GPU loads -- but every
+// PRECEDING allocation in a real layer happens to already be 16-aligned, so a regression in
+// Arena::Alloc's own align_bytes handling would not be caught by exercising those call sites
+// end to end. This test deliberately misaligns the arena's bump offset first (a 1-byte alloc),
+// then checks an explicit align_bytes request is still honored regardless.
+void TestArenaExplicitAlignment() {
+  Arena arena(1024);
+  uint8_t* odd = arena.Alloc<uint8_t>(1);  // misaligns offset_ to 1 (mod any power-of-two > 1)
+  (void)odd;
+  uint8_t* aligned16 = arena.Alloc<uint8_t>(64, /*align_bytes=*/16);
+  Check(reinterpret_cast<uintptr_t>(aligned16) % 16 == 0,
+        "Arena::Alloc honors an explicit align_bytes even when the bump offset is misaligned");
+  uint8_t* aligned8 = arena.Alloc<uint8_t>(3);  // misalign again
+  (void)aligned8;
+  uint8_t* aligned32 = arena.Alloc<uint8_t>(1, /*align_bytes=*/32);
+  Check(reinterpret_cast<uintptr_t>(aligned32) % 32 == 0,
+        "Arena::Alloc honors a wider explicit align_bytes (32) too");
+}
+
 void TestDeviceAndPinnedBuffers() {
   std::vector<float> host_in = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f};
   DeviceBuffer<float> dbuf(host_in.size());
@@ -165,6 +187,7 @@ int main() {
   TestTensorView();
   std::printf("-- Arena --\n");
   TestArena();
+  TestArenaExplicitAlignment();
   std::printf("-- DeviceBuffer / PinnedBuffer / Stream --\n");
   TestDeviceAndPinnedBuffers();
   std::printf("-- r4d.hpp geometry + error wrapping --\n");

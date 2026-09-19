@@ -233,6 +233,108 @@ bool CheckPlainDecodeUnaffectedByMtpConfig(const ModelOptions& base_opts,
   return ok;
 }
 
+// Regression test for the PrimeKv host-staging race (review finding, 2026-09-20): Model::RunChunk
+// calls MtpHead::PrimeKv TWICE per chunk with no intervening sync whenever mtp_seed_valid_ is
+// already true AND T>1 (the boundary n=1 call, then the within-chunk n=T-1 call) -- this only
+// happens starting with the SECOND prefill chunk of a prompt longer than max_chunk_ (64 tokens),
+// never the first (mtp_seed_valid_ is false for chunk 0's own boundary call). A prompt <=64 tokens
+// (every other check in this file uses MakePromptTokens(24)) never exercises this path at all.
+// Before the fix, the two calls' pinned host source buffers aliased, so the FIRST call's async H2D
+// upload could read data the SECOND call had already overwritten on the CPU by the time the GPU
+// got to it -- corrupting MTP's own KV cache at the chunk boundary position (wrong embedding row
+// and/or wrong RoPE position primed there), which silently degrades later acceptance/rejection
+// decisions without necessarily crashing. This check drives a multi-chunk prefill (100 tokens: a
+// full 64-token chunk plus a 36-token remainder) through real MTP self-speculative decode and
+// requires the result to exactly match a fully sequential reference -- same "must be
+// byte-identical to sequential DecodeStep" contract as CheckRejectionRewind above, just with a
+// prompt long enough to force the two-PrimeKv-calls-per-chunk code path at least once.
+bool CheckMultiChunkPrefillPrimeKvRace(const ModelOptions& base_opts) {
+  const std::vector<int32_t> prompt = MakePromptTokens(100);  // 100 > 64 == max_chunk_: 2 chunks
+
+  ModelOptions ref_opts = base_opts;
+  ref_opts.mtp_draft_k = 0;
+  Model ref = Model::Load(ref_opts);
+  std::vector<float> logits0 = ref.Prefill(prompt);
+  int32_t ref_tok = Argmax(logits0);
+
+  ModelOptions mtp_opts = base_opts;
+  mtp_opts.mtp_draft_k = kDraftK;
+  Model mtp = Model::Load(mtp_opts);
+  std::vector<float> mtp_logits0 = mtp.Prefill(prompt);  // exercises the 2-chunk PrimeKv pairing
+  int32_t mtp_tok = Argmax(mtp_logits0);
+
+  if (mtp_tok != ref_tok) {
+    std::fprintf(stderr,
+                 "FAIL: multi-chunk prefill argmax mismatch between mtp/ref Models (%d vs %d)\n",
+                 mtp_tok, ref_tok);
+    return false;
+  }
+
+  std::vector<int32_t> ref_seq, mtp_seq;
+  int32_t next_seed = mtp_tok;
+  for (int round = 0; round < kRejectionCheckRounds; ++round) {
+    const std::vector<int32_t> emitted = mtp.DecodeStepMtpGreedy(next_seed, kDraftK);
+    for (int32_t t : emitted) {
+      mtp_seq.push_back(t);
+      ref_seq.push_back(Argmax(ref.DecodeStep(ref_tok)));
+      ref_tok = ref_seq.back();
+    }
+    next_seed = emitted.back();
+  }
+
+  if (mtp_seq != ref_seq) {
+    std::fprintf(stderr,
+                 "FAIL: multi-chunk-prefill mtp-decoded sequence diverges from sequential "
+                 "reference (PrimeKv host-staging race regression)\n");
+    for (size_t i = 0; i < mtp_seq.size() && i < ref_seq.size(); ++i) {
+      if (mtp_seq[i] != ref_seq[i]) {
+        std::fprintf(stderr, "  first divergence at index %zu: mtp=%d ref=%d\n", i, mtp_seq[i],
+                     ref_seq[i]);
+        break;
+      }
+    }
+    return false;
+  }
+
+  std::fprintf(stderr,
+               "[mtp] multi-chunk-prefill PrimeKv-race check: %zu tokens over %d rounds after a "
+               "100-token (2-chunk) prefill, mtp sequence == sequential reference sequence\n",
+               mtp_seq.size(), kRejectionCheckRounds);
+  return true;
+}
+
+// Regression test for VerifyWindow's missing precondition check (review finding, 2026-09-20):
+// mtp_logits_dev_/mtp_argmax_dev_ are sized for exactly mtp_draft_k_+1 candidates, but the method
+// only used to check candidates.size() against max_chunk_ (64) -- a call with more than
+// mtp_draft_k_+1 candidates would silently overflow those buffers. VerifyWindow is public
+// specifically for tests like this one (its own doc comment says so), so a caller mistake here
+// must throw cleanly, not corrupt device memory.
+bool CheckVerifyWindowRejectsTooManyCandidates(const ModelOptions& base_opts) {
+  ModelOptions mtp_opts = base_opts;
+  mtp_opts.mtp_draft_k = kDraftK;  // 3 -- so candidates.size() must be in [1,4]
+  Model mtp = Model::Load(mtp_opts);
+  mtp.Prefill(MakePromptTokens(24));
+
+  // kDraftK+2 == 5 candidates: within max_chunk_ (64) but over mtp_draft_k_+1 (4).
+  std::vector<int32_t> too_many(static_cast<size_t>(kDraftK + 2), 100);
+  bool threw = false;
+  try {
+    mtp.VerifyWindow(too_many);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  if (!threw) {
+    std::fprintf(stderr,
+                 "FAIL: VerifyWindow accepted %zu candidates on a mtp_draft_k=%lld Model (expected "
+                 "a throw -- mtp_logits_dev_/mtp_argmax_dev_ are sized for mtp_draft_k_+1)\n",
+                 too_many.size(), static_cast<long long>(kDraftK));
+    return false;
+  }
+  std::fprintf(stderr, "[mtp] VerifyWindow correctly rejected %zu candidates (> mtp_draft_k_+1)\n",
+               too_many.size());
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -269,6 +371,18 @@ int main() {
     }
     std::fprintf(stderr, "[PASS] layout=%s CheckPlainDecodeUnaffectedByMtpConfig\n",
                  LayoutName(layout));
+
+    if (!CheckMultiChunkPrefillPrimeKvRace(opts)) {
+      std::fprintf(stderr, "FAIL [%s]: CheckMultiChunkPrefillPrimeKvRace\n", LayoutName(layout));
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s CheckMultiChunkPrefillPrimeKvRace\n", LayoutName(layout));
+
+    if (!CheckVerifyWindowRejectsTooManyCandidates(opts)) {
+      std::fprintf(stderr, "FAIL [%s]: CheckVerifyWindowRejectsTooManyCandidates\n", LayoutName(layout));
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s CheckVerifyWindowRejectsTooManyCandidates\n", LayoutName(layout));
     ++ran;
   }
 

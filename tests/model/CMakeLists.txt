@@ -21,6 +21,15 @@ foreach(t ${R4DX_MODEL_TESTS})
   )
 endforeach()
 
+# test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
+# device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),
+# same "plain add_test(), no ENVIRONMENT/SKIP_RETURN_CODE" pattern tests/server's HIP-free tests
+# use. Kept out of R4DX_MODEL_TESTS above so it never gets SKIPPED on a machine without a real
+# container -- it should always run.
+add_executable(test_mtp_round test_mtp_round.cpp)
+target_include_directories(test_mtp_round PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_mtp_round COMMAND test_mtp_round)
+
 # tests/model/attention/: golden test for r4dx::model::attention::AttentionLayer, created
 # standalone by that component before this file existed -- see its own CMakeLists.txt header note.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")

@@ -164,17 +164,19 @@ derivation, and `tests/server/test_prefix_state.cpp`'s
 bookkeeping contract (not the real MTP round mechanics themselves, which `tests/model/test_mtp.cpp`
 already covers against a real container).
 
-`--mtp-head-layout` was named in this stage's task description but does not correspond to any
-existing concept in this codebase: `Container`/`MtpWeights`/`MtpHead` (`src/model/container.h`,
-`src/model/mtp_head.h`) have no independent "head layout" knob separate from the body `--layout`
-argument -- `mtp.layer`'s own quantized linears (qg/o, and now k/v per R1) are loaded at whatever
-layout `Container::Load`'s single `layout` parameter says, exactly like every other layer; only
-`mtp.fc`/`mtp.norm`/`mtp.pre_fc_norm_*` are hardcoded bf16-only (`container.h`'s `MtpWeights`
-comment), with no alternative. Implementing an independently-selectable MTP head precision would be
-a `src/model`/`src/convert` container-format feature (a new per-tensor-group layout knob plus a
-converter change to actually emit it), not something `src/server` can plumb through to an API that
-does not exist -- **not implemented**, flagged here rather than adding a flag that would silently
-do nothing.
+**Correction (Milestone 3 integration pass, 2026-09-20)**: this section originally said
+`--mtp-head-layout` "does not correspond to any existing concept in this codebase" -- that was true
+only against the pre-merge "server catches up with the engine" tree in isolation. The parallel
+"MTP quality" stage (merged in the same milestone) added exactly that knob at the `src/model`
+level: `ModelOptions::mtp_head_layout` (`std::optional<Layout>`, default `std::nullopt` = track the
+body `--layout`) and `Container::Load`'s own `mtp_head_layout` parameter, which the measured
+head-layout sweep (`docs/mtp.md`'s "MTP head layout") showed wins on speed in 23/24 configurations
+with no acceptance cost -- see `docs/status.md`'s "Milestone 3 merge note" for the full correction.
+`src/cli/cli_args.h` exposes it as `--mtp-head-layout {bf16,layout}`. **`src/server/server_args.h`
+still does not expose an equivalent `--mtp-head-layout` flag** -- every server-started `Model` uses
+the measured-default `std::nullopt` (layout-matched head), which is the winning configuration in
+nearly every measured case, so this is a minor, low-priority gap (add a passthrough flag mirroring
+the CLI's) rather than a missing feature, and is left for a future pass.
 
 ## CLI flags
 

@@ -29,7 +29,9 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
                         GdnControlCache& control, const uint16_t* x, uint16_t* x_out, int64_t T,
                         const GdnLayerParams& p, const uint16_t* x_normed_in,
                         const uint16_t* next_norm_weight, uint16_t* x_normed_out,
-                        SpanAccumulator* prof) {
+                        SpanAccumulator* prof, int x_normed_pre_epilogue,
+                        const void* x_normed_pre_data, const float* x_normed_pre_scale,
+                        int next_epilogue, void* next_epilogue_out, float* next_epilogue_scale) {
   const int64_t hidden = cfg_.hidden_size;
   const int Hg = static_cast<int>(cfg_.linear_num_key_heads);     // 16
   const int H = static_cast<int>(cfg_.linear_num_value_heads);    // 48
@@ -44,23 +46,64 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
 
   // ---- input rmsnorm --------------------------------------------------------------------------
   // R3 (docs/r9700.md): skip this launch when the previous layer's Mlp already fused it.
+  // R2/P2: two ways x_normed's fused quant epilogue gets populated -- (a) x_normed_in==nullptr:
+  // this call computes its own rmsnorm, and knows w_.in_proj_qkv/w_.in_proj_z locally, both sharing
+  // ONE container-wide body layout (model.h's `layout` field), so ONE fused epilogue serves BOTH
+  // consumers below; (b) x_normed_in!=nullptr: the previous layer's Mlp already fused an epilogue
+  // (matching THIS Model's body layout) into x_normed_pre_epilogue/_data/_scale when it produced
+  // x_normed_in -- reused here directly, no local quant launch needed either way. Either way,
+  // in_proj_pre below is validated per-weight (z_shares_pre) before use, never assumed.
   const uint16_t* x_normed = x_normed_in;
   uint16_t* x_normed_scratch = nullptr;
+  int in_proj_epilogue = x_normed_pre_epilogue;
+  const void* in_proj_pre_data = x_normed_pre_data;
+  const float* in_proj_pre_scale = x_normed_pre_scale;
+  // Cross-boundary reuse is only valid if the producer's epilogue matches THIS layer's own
+  // in_proj_qkv layout (LoadQuantLinearWithFallback can fall an individual tensor back to bf16
+  // independently of its container-wide sibling layout -- do not assume Model.cpp's caller-side
+  // choice of next_epilogue already accounts for that; verify locally, same defensive pattern as
+  // z_shares_pre below).
+  if (x_normed != nullptr && in_proj_epilogue != EpilogueForLayout(w_.in_proj_qkv.layout)) {
+    in_proj_epilogue = r4dx_epilogue_none;
+    in_proj_pre_data = nullptr;
+    in_proj_pre_scale = nullptr;
+  }
   if (x_normed == nullptr) {
+    in_proj_epilogue = EpilogueForLayout(w_.in_proj_qkv.layout);
     x_normed_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
+    uint8_t* in_proj_pre_data_local = nullptr;
+    float* in_proj_pre_scale_local = nullptr;
+    if (in_proj_epilogue != r4dx_epilogue_none) {
+      const int elem_size = (in_proj_epilogue == r4dx_epilogue_f16) ? 2 : 1;
+      // 16-byte alignment: see attention_layer.hpp's identical comment (w4a8's GEMM does a
+      // global_load_b64 fragment read; uint8_t's default 1-byte arena alignment does not
+      // guarantee that for a buffer allocated this late in a layer's scratch sequence).
+      in_proj_pre_data_local =
+          arena.Alloc<uint8_t>(static_cast<size_t>(T * hidden * elem_size), /*align_bytes=*/16);
+      if (in_proj_epilogue != r4dx_epilogue_f16) {
+        in_proj_pre_scale_local = arena.Alloc<float>(static_cast<size_t>(T));
+      }
+    }
     ProfiledCall(prof, s, "gdn.rmsnorm", [&] {
       r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(x),
                          reinterpret_cast<int64_t>(input_layernorm_.data()),
                          reinterpret_cast<int64_t>(x_normed_scratch), T, hidden, eps,
-                         reinterpret_cast<int64_t>(s));
+                         reinterpret_cast<int64_t>(s), in_proj_epilogue,
+                         reinterpret_cast<int64_t>(in_proj_pre_data_local),
+                         reinterpret_cast<int64_t>(in_proj_pre_scale_local));
     });
     x_normed = x_normed_scratch;
+    in_proj_pre_data = in_proj_pre_data_local;
+    in_proj_pre_scale = in_proj_pre_scale_local;
   }
+  const bool have_in_proj_pre = in_proj_epilogue != r4dx_epilogue_none;
+  PreQuantizedActivation in_proj_pre{in_proj_epilogue, in_proj_pre_data, in_proj_pre_scale};
 
   // ---- in_proj_qkv / in_proj_z / in_proj_b / in_proj_a -----------------------------------------
   uint16_t* mixed_qkv = arena.Alloc<uint16_t>(static_cast<size_t>(T * conv_dim));
   ProfiledCall(prof, s, "gemm:gdn.in_proj_qkv", [&] {
-    ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T);
+    ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T,
+                have_in_proj_pre ? &in_proj_pre : nullptr);
   });
   uint16_t* a_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
   // in_proj_a/in_proj_b are plain bf16 linears (never quantized -- docs/r9700.md R1: "too small to
@@ -76,10 +119,19 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
                               static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
   });
   // in_proj_z (R1, docs/r9700.md): now dispatched through ApplyLinear like in_proj_qkv/out_proj --
-  // 3.02 GB/token of what used to be a forced-bf16 GEMM, now eligible for mxfp4/w4a16/w4a8.
+  // 3.02 GB/token of what used to be a forced-bf16 GEMM, now eligible for mxfp4/w4a16/w4a8. Reuses
+  // the SAME fused rmsnorm epilogue as in_proj_qkv above WHEN both weights agree on layout (the
+  // ordinary case: one container-wide body layout, model.h's `layout` field) -- but
+  // Container::LoadQuantLinearWithFallback (container.cpp) can fall a single tensor back to bf16
+  // independently of its sibling if an older container lacks that layout's rows for it (R1's own
+  // doc comment), so this does NOT assume the two always match; it only reuses the shared buffer
+  // when they genuinely do, falling back to in_proj_z's own separate quant launch otherwise.
   uint16_t* z_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * value_dim));
+  const bool z_shares_pre =
+      have_in_proj_pre && (EpilogueForLayout(w_.in_proj_z.layout) == in_proj_epilogue);
   ProfiledCall(prof, s, "gemm:gdn.in_proj_z", [&] {
-    ApplyLinear(stream, arena, w_.in_proj_z, x_normed, z_buf, T);
+    ApplyLinear(stream, arena, w_.in_proj_z, x_normed, z_buf, T,
+                z_shares_pre ? &in_proj_pre : nullptr);
   });
 
   // ---- control arrays ---------------------------------------------------------------------------
@@ -190,7 +242,9 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
                                   reinterpret_cast<int64_t>(next_norm_weight),
                                   reinterpret_cast<int64_t>(x_out),
                                   reinterpret_cast<int64_t>(x_normed_out), T, hidden, eps,
-                                  reinterpret_cast<int64_t>(s));
+                                  reinterpret_cast<int64_t>(s), next_epilogue,
+                                  reinterpret_cast<int64_t>(next_epilogue_out),
+                                  reinterpret_cast<int64_t>(next_epilogue_scale));
     } else {
       r4dx_residual_add_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(gdn_out),
                               reinterpret_cast<int64_t>(x_out), T * hidden,

@@ -13,6 +13,39 @@
 
 #include <cstdint>
 
+// ---- activation-quant epilogue selector (docs/r9700.md R2/P2, 2026-09-20) ---------------------
+// Selects an OPTIONAL fused quantization epilogue, applied by a producer kernel to a row it has
+// ALREADY fully computed and written as bf16 (rmsnorm's own `out`, residual_rmsnorm's `out_normed`,
+// silu_mul's `out`), producing exactly the bytes+scale the corresponding standalone quant kernel
+// would have produced from those same bf16 values -- byte-identical by construction, since the
+// epilogue re-reads the just-written bf16 row and runs the IDENTICAL reduction+quantize algorithm
+// as the kernel it stands in for (verified byte-exact by tests/kernels/test_fused_quant.cpp before
+// any call site was wired to use this):
+//   r4dx_epilogue_f16          vs r4dx_model_cast_bf16_to_f16 (src/model/kernels/model_kernels.hip)
+//   r4dx_epilogue_fp8_e4m3_row vs r4dx_quant_act_fp8e4m3_row (this header, below)
+//   r4dx_epilogue_int8_fraga8  vs third_party/libr4d's r4d_quant_act_i8 (same per-row
+//                              scale=max(1e-8,absmax)/127 and WMMA-fragment byte permute: dest
+//                              byte i of a 16-byte k-step s=i>>4 reads source column
+//                              src = (s<<4) + 8*((j&7)>>2) + 4*(j>>3) + (j&3), j=i&15)
+// r4dx_epilogue_none (0, the default on every entry point below) reproduces the exact pre-this-
+// pass behavior: no epilogue computed, `epilogue_out`/`epilogue_scale` ignored (may be 0/nullptr).
+// This is a genuine SEPARATE reduction pass over the row (re-reading the bf16 output the kernel
+// just wrote), not a single-pass fusion that would change the row's own bf16 rounding -- it exists
+// to fold what would otherwise be a SEPARATE kernel LAUNCH (and the standalone kernel's own read
+// of this same bf16 row from global memory, which the epilogue pays for here instead) into this
+// launch; see docs/status.md's "R2/P2" section for the measured launch-count effect. All three
+// epilogue kinds run as one uniform extra pass AFTER `out`/`out_normed` is fully written (re-reading
+// it from global memory, same as the standalone kernel they replace would have) -- f16 needs no
+// row reduction so this pass is a plain per-element convert; fp8/int8 additionally compute a
+// per-row absmax reduction first. epilogue_scale is unused (may be 0) for r4dx_epilogue_f16; for
+// the two per-row-scaled formats it is a [rows] fp32 device buffer, one scale written per row.
+enum r4dx_epilogue {
+  r4dx_epilogue_none = 0,
+  r4dx_epilogue_f16 = 1,
+  r4dx_epilogue_fp8_e4m3_row = 2,
+  r4dx_epilogue_int8_fraga8 = 3,
+};
+
 extern "C" {
 
 // ---- rmsnorm --------------------------------------------------------------------------------
@@ -20,15 +53,23 @@ extern "C" {
 // zero-centered weight convention -- the stored weight is w such that the effective scale is
 // 1+w, so an all-zero weight is the identity). fp32 accumulation, bf16 in/out. x: [rows, hidden]
 // bf16, row-major. weight: [hidden] bf16.
+// `epilogue`/`epilogue_out`/`epilogue_scale`: see the r4dx_epilogue doc above. epilogue_out is
+// [rows,hidden] in the selected format (f16 uint16_t*, fp8 uint8_t*, or int8 int8_t*);
+// epilogue_int8_fraga8 requires hidden % 16 == 0 (matches r4d_quant_act_i8's own precondition).
 void r4dx_rmsnorm_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
-                        float eps, int64_t stream);
+                        float eps, int64_t stream, int epilogue = r4dx_epilogue_none,
+                        int64_t epilogue_out = 0, int64_t epilogue_scale = 0);
 
 // Fused residual-add + rmsnorm: sum = x + residual (fp32 accumulate); out_residual = bf16(sum)
 // (the new residual carried into the next block); out_normed = rmsnorm(sum) * (1+weight). Saves
 // one read/write of [rows,hidden] versus calling r4dx_residual_add_bf16 then r4dx_rmsnorm_bf16.
+// `epilogue`/`epilogue_out`/`epilogue_scale`: applied to `out_normed` only (the value a caller
+// feeds into a quantized GEMM next -- `out_residual` never is), see r4dx_epilogue doc above.
 void r4dx_residual_rmsnorm_bf16(int64_t x, int64_t residual, int64_t weight,
                                  int64_t out_residual, int64_t out_normed, int64_t rows,
-                                 int64_t hidden, float eps, int64_t stream);
+                                 int64_t hidden, float eps, int64_t stream,
+                                 int epilogue = r4dx_epilogue_none, int64_t epilogue_out = 0,
+                                 int64_t epilogue_scale = 0);
 
 // ---- residual add -----------------------------------------------------------------------------
 // out[i] = bf16(fp32(a[i]) + fp32(b[i])), elementwise over `n` elements.
@@ -45,8 +86,11 @@ void r4dx_residual_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_
 // NOTE: a flat two-pointer (gate[], up[], n) form was tried first and dropped -- it has no row
 // concept, so for rows>1 (any chunked-prefill call) the natural gate=C/up=C+intermediate call a
 // src/model author would write from the fused layout silently read across row boundaries.
+// `epilogue`/`epilogue_out`/`epilogue_scale`: applied to `out`, see r4dx_epilogue doc above.
 void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
-                         int64_t in_row_stride, int64_t stream);
+                         int64_t in_row_stride, int64_t stream,
+                         int epilogue = r4dx_epilogue_none, int64_t epilogue_out = 0,
+                         int64_t epilogue_scale = 0);
 
 // ---- rope: partial rotary, text-only mrope ---------------------------------------------------
 // Rotates the first `rotary_dim` (64 = head_dim * partial_rotary_factor 0.25) dims of each head
@@ -129,12 +173,17 @@ void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t str
 // uploaded to VRAM (Container::EmbedTokensDevice()). `ids` is a DEVICE int32 pointer, not host --
 // in particular r4dx_argmax_f32's own `out_idx` output can feed straight into this with zero host
 // syncs in between (MtpHead::Draft's chained per-draft-token loop, model.cpp), which is the whole
-// point of this entry point over the host gather. No bounds check on ids (trusts the caller, same
-// convention as every other kernel in this header) -- an id outside [0, vocab) reads out-of-bounds
-// device memory. table: [vocab, hidden] bf16 device pointer. ids: [n] int32 device pointer. out:
-// [n, hidden] bf16 device pointer.
+// point of this entry point over the host gather. Bounds-checked (review finding, 2026-09-20,
+// fixed): an id outside [0, vocab) clamps to row 0 in-kernel instead of reading out-of-bounds
+// device memory -- unlike r4dx::kernels::EmbeddingGatherHost, which throws std::out_of_range for
+// the same condition, this path degrades to a wrong-but-safe embedding row rather than an
+// exception (a device fault mid-kernel would otherwise be unrecoverable, and this entry point's
+// callers include Model::RunChunk/VerifyWindow's ordinary caller-supplied prompt tokens whenever
+// ModelOptions::embed_device_resident is true, not just MtpHead::Draft's own argmax-fed ids, which
+// were already safe by construction). table: [vocab, hidden] bf16 device pointer. ids: [n] int32
+// device pointer. out: [n, hidden] bf16 device pointer. vocab: table's row count, for the guard.
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
-                                 int64_t stream);
+                                 int64_t vocab, int64_t stream);
 
 // ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
 // A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per

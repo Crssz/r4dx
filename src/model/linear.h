@@ -42,6 +42,25 @@ struct GemmTuningRow {
 // the fallback exists for robustness, not because it is expected to fire in production).
 LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M);
 
+// The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
+// r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for
+// kW4a16, r4dx_epilogue_int8_fraga8 for kW4a8, r4dx_epilogue_fp8_e4m3_row for kMxfp4. Shared by
+// every ApplyLinear caller that wants to pre-fuse its producer's quant epilogue (docs/r9700.md
+// R2/P2) so both sides of the wiring agree on the mapping in exactly one place.
+int EpilogueForLayout(Layout layout);
+
+// A producer's already-quantized activation (docs/r9700.md R2/P2's fused epilogue output,
+// kernels.h's r4dx_epilogue), ready to feed `w`'s GEMM directly. `epilogue` must equal
+// EpilogueForLayout(w.layout) exactly -- ApplyLinear throws otherwise, rather than silently
+// reinterpreting bytes in the wrong format. `data` is [M,K] contiguous in the format `epilogue`
+// selects (f16 uint16_t, fp8e4m3 uint8_t, or int8 fragA8-permuted int8_t); `scale` is [M] fp32,
+// unused (may be nullptr) for r4dx_epilogue_f16.
+struct PreQuantizedActivation {
+  int epilogue = 0;  // r4dx_epilogue_none means "no pre-quantized input provided"
+  const void* data = nullptr;
+  const float* scale = nullptr;
+};
+
 // x: device bf16 [M, K], row-major, CONTIGUOUS (row stride exactly K -- every r4d_gemm_*_nt_m64
 // entry point reads its A/C operands at a hardcoded stride of K/N respectively; there is no
 // strided-view form to call into). y: device bf16 [M, N], row-major, contiguous, disjoint from x.
@@ -56,7 +75,14 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M);
 // stream as a plain hipStream_t parameter) without pulling in core::Stream's RAII ownership --
 // r4dx::core::Stream converts implicitly (operator hipStream_t()), so every existing call site
 // that passes a core::Stream& is unaffected.
+// `pre`, when non-null and pre->epilogue != r4dx_epilogue_none, skips this call's own internal
+// quant/cast launch entirely and feeds `pre->data`/`pre->scale` (offset per <=64-row chunk exactly
+// like `x` is) straight to the GEMM -- see PreQuantizedActivation's doc above. `x` is still
+// required even when `pre` is given (kBf16 always reads it directly; a caller that only produced a
+// quantized epilogue for a NON-bf16 layout does not need to also keep the plain bf16 buffer alive
+// for THIS call, but ApplyLinear does not special-case that -- every existing caller already has
+// both).
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
-                  uint16_t* y, int64_t M);
+                  uint16_t* y, int64_t M, const PreQuantizedActivation* pre = nullptr);
 
 }  // namespace r4dx::model

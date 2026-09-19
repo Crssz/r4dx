@@ -8,6 +8,7 @@
 #include "final_lm_head.h"
 #include "linear.h"
 #include "r4dx/core/r4d.hpp"
+#include "r4dx/kernels/embedding.hpp"
 #include "r4dx/kernels/kernels.h"
 
 namespace r4dx::model {
@@ -47,7 +48,11 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
       max_draft_(max_draft),
       prime_positions_host_(static_cast<size_t>(kMaxPrime)),
       prime_positions_dev_(static_cast<size_t>(kMaxPrime)),
-      prime_seqused_host_(1),
+      // Sized to kMaxPrime (not 1) so host_staging_offset can address a disjoint scalar slot per
+      // back-to-back call (RunChunk's boundary + within-chunk pair) -- see PrimeKv's .h doc
+      // comment. prime_seqused_dev_ stays size 1: its destination is always offset 0 (device-side
+      // reuse across calls is safe via HIP's own stream-issue-order guarantee).
+      prime_seqused_host_(static_cast<size_t>(kMaxPrime)),
       prime_seqused_dev_(1),
       prime_embed_host_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
       prime_embed_dev_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)) {
@@ -107,7 +112,7 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
       // Entirely on-device: cur_token_dev is either seed_token_dev_ (step 0) or the PREVIOUS
       // step's own argmax_dev_ (step>0, written by that step's own r4dx_argmax_f32 call below) --
       // no host sync, D2H, or H2D between chained draft steps.
-      EmbedTokensDeviceGather(stream, embed_table_dev, hidden, cur_token_dev, /*n=*/1,
+      EmbedTokensDeviceGather(stream, embed_table_dev, hidden, cur_token_dev, /*n=*/1, vocab,
                                embed_staging_dev_.data());
     } else {
       EmbedTokens(stream, embed_table, vocab, hidden, {cur_token}, embed_staging_host_,
@@ -195,11 +200,16 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
 void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                       const MtpWeights& w, int64_t base_pos, const uint16_t* h_rows,
                       const std::vector<int32_t>& next_tokens, const uint16_t* embed_table,
-                      int64_t vocab) {
+                      int64_t vocab, int64_t host_staging_offset) {
   const int64_t n = static_cast<int64_t>(next_tokens.size());
   if (n <= 0) return;
   if (n > kMaxPrime) {
     throw std::runtime_error("MtpHead::PrimeKv: n must be <= " + std::to_string(kMaxPrime));
+  }
+  if (host_staging_offset < 0 || host_staging_offset + n > kMaxPrime) {
+    throw std::runtime_error(
+        "MtpHead::PrimeKv: host_staging_offset + n must be <= " + std::to_string(kMaxPrime) +
+        " (see PrimeKv's own .h doc comment: back-to-back calls must use disjoint offsets)");
   }
   const int64_t hidden = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
@@ -209,8 +219,18 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
   // strided-row GEMM/rmsnorm entry point exists in this codebase -- see linear.h's own comment),
   // so build the two halves into separate contiguous buffers, then splice them into concat_buf via
   // two strided D2D copies (hipMemcpy2DAsync) rather than a bespoke interleave kernel.
+  //
+  // Gather straight into this call's OWN slice of prime_embed_host_ (offset by
+  // host_staging_offset*hidden elements, not the buffer's start) and upload from that same slice --
+  // NOT r4dx::model::EmbedTokens' own buffer-start-relative helper -- so a back-to-back PrimeKv
+  // call from RunChunk cannot overwrite this call's still-in-flight H2D source before the GPU has
+  // actually read it (see this method's .h doc comment for the race this closes). The device
+  // destination (prime_embed_dev_.data(), unconditionally offset 0) is unaffected -- device-side
+  // reuse across calls is already safe via HIP's own stream-issue-order guarantee.
   uint16_t* embed_normed = arena.Alloc<uint16_t>(static_cast<size_t>(n * hidden));
-  EmbedTokens(stream, embed_table, vocab, hidden, next_tokens, prime_embed_host_, prime_embed_dev_);
+  uint16_t* const embed_host_slice = prime_embed_host_.data() + host_staging_offset * hidden;
+  kernels::EmbeddingGatherHost(embed_table, vocab, hidden, next_tokens, embed_host_slice);
+  prime_embed_dev_.CopyFromHostAsync(embed_host_slice, static_cast<size_t>(n * hidden), stream);
   r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(prime_embed_dev_.data()),
                      reinterpret_cast<int64_t>(w.pre_fc_norm_embedding.data()),
                      reinterpret_cast<int64_t>(embed_normed), n, hidden, eps,
@@ -236,13 +256,17 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
                             static_cast<int>(2 * hidden), static_cast<int>(hidden), kGemmWV,
                             kGemmSK, kGemmMB, s);
 
+  // Same host_staging_offset slicing as the embedding gather above, for the identical reason:
+  // prime_positions_host_/prime_seqused_host_ are this object's own pinned scratch, and a
+  // back-to-back call must not overwrite a slice a previous call's still-in-flight H2D hasn't read
+  // yet. Device destinations (prime_positions_dev_/prime_seqused_dev_) stay offset-0/fixed-size.
   std::vector<int32_t> positions_h(static_cast<size_t>(n));
   for (int64_t t = 0; t < n; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(base_pos + t);
-  std::copy(positions_h.begin(), positions_h.end(), prime_positions_host_.begin());
-  prime_positions_dev_.CopyFromHostAsync(prime_positions_host_.data(), static_cast<size_t>(n),
-                                          stream);
-  prime_seqused_host_[0] = static_cast<int32_t>(base_pos + n);
-  prime_seqused_dev_.CopyFromHostAsync(prime_seqused_host_.data(), 1, stream);
+  std::copy(positions_h.begin(), positions_h.end(), prime_positions_host_.begin() + host_staging_offset);
+  prime_positions_dev_.CopyFromHostAsync(prime_positions_host_.data() + host_staging_offset,
+                                          static_cast<size_t>(n), stream);
+  prime_seqused_host_[static_cast<size_t>(host_staging_offset)] = static_cast<int32_t>(base_pos + n);
+  prime_seqused_dev_.CopyFromHostAsync(prime_seqused_host_.data() + host_staging_offset, 1, stream);
 
   attention::AttnWeights aw;
   aw.input_layernorm = w.layer.input_layernorm.data();

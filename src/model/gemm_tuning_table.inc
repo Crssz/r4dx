@@ -2,6 +2,19 @@
 // Measured on HIP device 1, R9700 (gfx1201), this model's real (N,K) shapes.
 // Included by src/model/linear.cpp's PickTuning; see that file for the fallback
 // path when (layout,N,K,M) misses this table (an untuned shape/M combo).
+//
+// PROVENANCE NOTE (review finding, 2026-09-20): the original 196 rows in this table (every shape
+// except attn.k/attn.v/gdn.in_proj_z) were swept with a pre-fix tools/profile/tune_gemm.py that R5
+// itself measured as cache-flattering -- R5's own open issue records that the >=4-buffer/>256MiB
+// ring-rotation fix changes both absolute microseconds AND ranking for the two shapes it
+// re-checked (mxfp4 flips from fastest to slowest on both mlp.down and gdn.in_proj_qkv at M=1,
+// +67%/+72%), and the full 196-row re-sweep with the fixed methodology was never run. The 84 rows
+// R1 later appended for attn.k/attn.v/gdn.in_proj_z (N=1024/6144 at K=5120, all four layouts x
+// seven M-bands) came from the SAME unfixed sweep. This affects speed only, never correctness --
+// WV/SK/MB/NPW/NT pick tiling, not arithmetic -- but every per-layout perf ranking in docs/perf.md
+// rests on this table, so treat it as a RANKING signal from a known-imperfect sweep, not a cost
+// model, until a full re-sweep with the fixed tune_gemm.py replaces it (see docs/status.md's R5
+// section for the fix and the open re-sweep item).
 static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kBf16, 10240, 5120, 1, {1, 4, 1, 1, 1}},  // gdn.in_proj_qkv 159.47us
     {Layout::kBf16, 10240, 5120, 2, {1, 4, 1, 1, 1}},  // gdn.in_proj_qkv 160.66us

@@ -65,11 +65,27 @@ class GdnLayer {
   // --profile (Model::DecodeStepProfiled/PrefillProfiled) -- wraps every kernel this call launches
   // in its own named hipEvent span (see profile_span.h's file comment for the naming convention and
   // the zero-overhead guarantee when this is nullptr, the case on every real decode/prefill path).
+  // R2/P2 (docs/r9700.md), appended after `prof` so every pre-existing positional call site
+  // (which all end at `prof`) is unaffected: `x_normed_pre_epilogue`/`_data`/`_scale`, when
+  // `x_normed_in` is also non-null, is the SAME producer's fused quant epilogue for `x_normed_in`
+  // (kernels.h's r4dx_epilogue -- what the previous layer's Mlp emitted alongside its own
+  // x_normed_out) -- consumed directly by in_proj_qkv/in_proj_z's ApplyLinear calls in place of
+  // this call's own quant launch, WHEN it matches that weight's actual layout (checked per-weight,
+  // see gdn_layer.cpp's z_shares_pre comment; falls back to a local quant launch otherwise, exactly
+  // as if this had been left null). `next_epilogue`/`next_epilogue_out`/`next_epilogue_scale`,
+  // when `next_norm_weight` is also non-null, requests this call's own residual+rmsnorm epilogue
+  // (r4dx_residual_rmsnorm_bf16) ALSO emit x_normed_out's fused quant epilogue into
+  // `next_epilogue_out`/`next_epilogue_scale` (for the immediately-following Mlp's gate_up to
+  // consume as ITS x_normed_pre) -- ignored (no epilogue computed) when next_epilogue is
+  // r4dx_epilogue_none, the default.
   void Forward(core::Stream& stream, core::Arena& arena, GdnStateManager& states,
                GdnControlCache& control, const uint16_t* x, uint16_t* x_out, int64_t T,
                const GdnLayerParams& p, const uint16_t* x_normed_in = nullptr,
                const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
-               SpanAccumulator* prof = nullptr);
+               SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
+               const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
+               int next_epilogue = 0, void* next_epilogue_out = nullptr,
+               float* next_epilogue_scale = nullptr);
 
  private:
   const ModelConfig& cfg_;

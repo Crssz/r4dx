@@ -123,9 +123,28 @@ class MtpHead {
   // Model::mtp_seed_hidden_), then one n=T-1 call for the within-chunk positions (h_i = this
   // chunk's own rows 0..T-2, t_{i+1} = this chunk's own token_ids[1..T-1]) -- position T-1 is left
   // dangling for the NEXT call, same as the boundary case (see model.cpp's RunChunk comment).
+  //
+  // host_staging_offset (elements, not bytes; default 0): where in this object's OWN pinned host
+  // scratch (prime_positions_host_/prime_seqused_host_/prime_embed_host_) this call's data is
+  // written before the async H2D upload below. This matters because HIP's stream-issue-order
+  // guarantee serializes DEVICE-side reuse of a buffer, not the CPU's freedom to overwrite a
+  // pinned HOST source buffer that a previous CopyFromHostAsync from it has not actually finished
+  // reading yet (a real race found by review, 2026-09-20: RunChunk calls PrimeKv twice back to
+  // back with no intervening sync -- the boundary n=1 call, then the within-chunk n=T-1 call --
+  // and both calls' async H2D copies are stream-ordered behind ~64 layers of already-queued
+  // kernel work, so by the time the FIRST call's DMA actually runs, the CPU has long since
+  // overwritten the source buffers with the SECOND call's data). Giving each call in a back-to-back
+  // pair a DISJOINT host_staging_offset (RunChunk: 0 for the boundary call, 1 for the within-chunk
+  // call -- 1 + (T-1) == T <= kMaxPrime always, so this fits without enlarging any buffer) closes
+  // the race without an extra stream.Synchronize() between them. The device-side destination
+  // (prime_positions_dev_/prime_seqused_dev_/prime_embed_dev_) is NOT offset -- it is safely
+  // reused at a fixed address across calls because HIP's stream-order guarantee DOES apply there
+  // (each call's own kernels consume its device data before the next call's H2D can overwrite it).
+  // Caller must ensure host_staging_offset + n <= kMaxPrime; PrimeKv throws otherwise.
   void PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                const MtpWeights& w, int64_t base_pos, const uint16_t* h_rows,
-               const std::vector<int32_t>& next_tokens, const uint16_t* embed_table, int64_t vocab);
+               const std::vector<int32_t>& next_tokens, const uint16_t* embed_table, int64_t vocab,
+               int64_t host_staging_offset = 0);
 
  private:
   attention::AttentionLayer attn_layer_;
@@ -156,18 +175,22 @@ class MtpHead {
   core::PinnedBuffer<int32_t> draft_ids_host_;  // [max_draft]
 
   // PrimeKv's own scratch, sized for up to a 64-row chunk (Model::max_chunk_) so both the n=1
-  // boundary call and the n<=63 within-chunk call reuse the same buffers -- safe without any extra
-  // synchronization because every upload below goes through CopyFromHostAsync on the SAME stream
-  // as the kernels that read it, so HIP's own stream-issue-order guarantee (not a host-side wait)
-  // is what serializes a later call's upload against an earlier call's still-in-flight reads (see
-  // PrimeKv's .cpp comment).
+  // boundary call and the n<=63 within-chunk call reuse the same buffers. Device-side reuse across
+  // back-to-back calls IS safe purely from HIP's own stream-issue-order guarantee (each call's
+  // kernels always consume its device data before the next call's H2D can overwrite it). The HOST
+  // side is a different hazard class: a pinned host source buffer can be overwritten by the CPU as
+  // soon as the issuing call returns, regardless of whether the async H2D copy that reads it has
+  // actually run on the GPU yet -- stream order does not protect a host-side write the way it
+  // protects a device-side one. PrimeKv's own host_staging_offset parameter is what actually closes
+  // that gap (each back-to-back call in RunChunk uses a disjoint offset into these buffers); see
+  // PrimeKv's own .h doc comment above and its .cpp comment for the incident this fixed.
   int64_t max_draft_ = 0;  // sizes positions_dev_/seqused_dev_/draft_ids_dev_ above
 
   static constexpr int64_t kMaxPrime = 64;
-  core::PinnedBuffer<int32_t> prime_positions_host_;  // [kMaxPrime]
-  core::DeviceBuffer<int32_t> prime_positions_dev_;   // [kMaxPrime]
-  core::PinnedBuffer<int32_t> prime_seqused_host_;    // [1]
-  core::DeviceBuffer<int32_t> prime_seqused_dev_;     // [1]
+  core::PinnedBuffer<int32_t> prime_positions_host_;  // [kMaxPrime], sliced by host_staging_offset
+  core::DeviceBuffer<int32_t> prime_positions_dev_;   // [kMaxPrime], dest always offset 0
+  core::PinnedBuffer<int32_t> prime_seqused_host_;    // [kMaxPrime], sliced by host_staging_offset
+  core::DeviceBuffer<int32_t> prime_seqused_dev_;     // [1], dest always offset 0
   core::PinnedBuffer<uint16_t> prime_embed_host_;     // [kMaxPrime * hidden]
   core::DeviceBuffer<uint16_t> prime_embed_dev_;      // [kMaxPrime * hidden]
 };

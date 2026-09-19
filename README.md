@@ -41,17 +41,20 @@ exact toolchain versions, flags, and gotchas.
 .\tests\run_tests.ps1
 ```
 
-Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 30 tests
+Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 35 tests
 covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
 residual add, silu_mul, rope, fp8/int8 activation quant, kv cache write, mxfp4 GEMM, attention
-decode, GDN chunk scan, sampler), the converter's quantizer round-trip / byte-packer / kernel-decode
-/ KV-calibration / bf16-layout tests, the tokenizer's golden-case suite, `src/model`'s per-layer
-tests (GDN layer, full-attention layer, final-norm+lm_head, assembled-`Model` forward-pass smoke
-including a prefill/decode state-handoff equivalence check, and MTP's verify/rejection-rewind
-tests), `src/cli`'s argument-parsing tests, `src/server`'s CPU-only tests (CLI args, OpenAI request/
-response JSON shapes, SSE framing, buffering/streaming sinks, the bounded request queue), and a
+decode, GDN chunk scan, sampler, the P6 vectorized-kernel bandwidth golden, the P2 fused-quant-
+epilogue byte-diff harness, embedding-gather in-range/OOB-clamp), the converter's quantizer
+round-trip / byte-packer / kernel-decode / KV-calibration / bf16-layout tests, the tokenizer's
+golden-case suite, `src/model`'s per-layer tests (GDN layer, full-attention layer,
+final-norm+lm_head, assembled-`Model` forward-pass smoke including a prefill/decode state-handoff
+equivalence check and a `Model::Reset()` byte-identity check, MTP's verify/rejection-rewind/
+mid-round-commit tests, and the pure-CPU `mtp_round` commit-bookkeeping tests), `src/cli`'s
+argument-parsing tests, `src/server`'s CPU-only tests (CLI args, OpenAI request/response JSON
+shapes, SSE framing, buffering/streaming sinks, the bounded request queue, `PrefixState`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). All 30 currently pass (~90-120s wall on HIP device 1). See `docs/status.md` for
+`ctest` invocation). All 35 currently pass (~130s wall on HIP device 1). See `docs/status.md` for
 the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
 GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
 `ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration
@@ -130,12 +133,16 @@ of the OpenAI chat/completions API, single model, single GPU, one request proces
 dedicated worker thread (see `docs/server.md`'s "Concurrency model"). Multi-turn conversations reuse
 the KV/GDN cache across requests the same way `r4dx-cli --chat` does, by matching each request's
 full re-tokenized prompt against the tokens already committed to the model's state and re-prefilling
-only the new tail (or reloading from scratch on a prefix mismatch). `--mtp` is not yet exposed as a
-server flag (server-side MTP is future work); the server always runs plain decode. See `docs/
-server.md` for the full endpoint/field reference, deferred features (tool-call parsing, vision), and
-a captured real streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
+only the new tail (via a cheap `Model::Reset()`, not a full reload, on any state-handling boundary
+where the engine must catch up), or reloading from scratch only on a genuine prefix mismatch.
+`--mtp N` (Milestone 3) enables server-side MTP self-speculative decode identically to `r4dx-cli
+--mtp`: a request takes the MTP path iff the server was started with `--mtp N>0` against an
+MTP-converted container AND that request is greedy (`temperature <= 0`); every accepted token still
+streams as soon as it is committed. See `docs/server.md` for the full endpoint/field reference,
+deferred features (tool-call parsing, vision, `--mtp-head-layout` as a server-side flag), and a
+captured real streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
 (`.\tools\server\smoke.ps1` against the small 4-layer test container by default; pass
-`-Model`/`-Layout`/`-Layers -1` to point it at a real container).
+`-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it at a real container with MTP enabled).
 
 ## Layout
 
@@ -155,7 +162,14 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 
 ## Status
 
-Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation)
-and Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and
-MTP self-speculative decode) are both complete and integrated -- see `docs/status.md` for what
-exists, what passes, known gaps, and the next milestone (vision tower, then DFlash2 drafting).
+Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation),
+Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and MTP
+self-speculative decode), and Milestone 3 (quantized `gdn.in_proj_z`/`attn.k`/`attn.v` + a 45 GiB
+real container, fused residual+rmsnorm (R3), vectorized rmsnorm/residual_rmsnorm/silu_mul kernels
+(P6), a configurable/measured MTP head layout, a device-resident embedding gather + MTP draft loop,
+and server-side `Model::Reset()`/MTP/prefix-reuse hardening) are all complete and integrated -- see
+`docs/status.md` for what exists, what passes, known gaps, and the next milestone (fused
+activation-quant epilogues (P2) re-attempted with root-caused correctness, then the vision tower,
+then DFlash2 drafting). Headline decode throughput on the real 64-layer container (`--mtp 3`, HIP
+device 1): **w4a16 68.4 tok/s, w4a8 61.4 tok/s, mxfp4 55.7 tok/s** -- see `docs/perf.md`'s
+consolidated Milestone 1 -> 2 -> 3 table for the full progression.

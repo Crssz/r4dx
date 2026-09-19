@@ -60,10 +60,14 @@ struct ModelOptions {
   // weights.
   std::optional<Layout> mtp_head_layout = std::nullopt;
   // Device-resident draft loop (docs/mtp.md "device-resident draft loop", docs/r9700.md P3):
-  // mirror text.embed_tokens into VRAM (~2.54 GB bf16) so the decode/draft path can gather
-  // embedding rows on-device instead of a host memcpy + H2D per step -- see Container::Load's own
-  // comment for the free-VRAM fallback. Default true; set false to force host-only gather (e.g. a
-  // VRAM-constrained run that would rather keep the margin for KV cache).
+  // mirror text.embed_tokens into VRAM (~2.37-2.54 GiB bf16, depending on vocab/hidden -- see
+  // docs/status.md's VRAM correction note for the measured delta) so the decode/draft path can
+  // gather embedding rows on-device instead of a host memcpy + H2D per step -- see Container::
+  // Load's own comment for the free-VRAM fallback. Default true; set false to force host-only
+  // gather (e.g. a VRAM-constrained run that would rather keep the margin for KV cache). Exposed
+  // as `--embed-device-resident {on|off}` on both r4dx-cli (src/cli/cli_args.h) and r4dx-server
+  // (src/server/server_args.h) -- added 2026-09-20 (review finding: this doc comment promised the
+  // escape hatch before either binary actually implemented it).
   bool embed_device_resident = true;
 };
 
@@ -259,6 +263,20 @@ class Model {
   // (overwritten) at every fusion boundary in stream order, never read after being superseded, so
   // one buffer suffices -- see RunChunk/DecodeStepGreedy/DecodeStepMtpGreedy's per-layer loops.
   core::DeviceBuffer<uint16_t> buf_normed_;
+  // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion, same persistent
+  // (not-arena) reuse-in-stream-order lifetime as buf_normed_ itself -- whichever layer boundary
+  // most recently wrote buf_normed_ also writes its epilogue here (when body_epilogue_ !=
+  // r4dx_epilogue_none), for the very next Forward call to consume as its x_normed_pre. Sized for
+  // the widest epilogue format (f16, 2 bytes/element) at hidden width; a narrower format (fp8/int8,
+  // 1 byte/element) just uses the buffer's first half.
+  core::DeviceBuffer<uint8_t> buf_normed_pre_;        // [max_chunk_, hidden] bytes (f16-sized)
+  core::DeviceBuffer<float> buf_normed_pre_scale_;    // [max_chunk_]
+  // r4dx_epilogue (kernels.h) this Model's body layout wants every fused producer epilogue to
+  // emit -- r4dx_epilogue_none for a bf16 body. Computed once in Load() from ModelOptions::layout;
+  // every per-weight fusion site still independently verifies it against that specific weight's
+  // OWN actual layout before using it (LoadQuantLinearWithFallback can fall one tensor back to
+  // bf16 independently of this container-wide default -- see gdn_layer.cpp's defensive comment).
+  int body_epilogue_ = 0;
   core::DeviceBuffer<float> logits_dev_;        // [vocab] fp32, one row at a time
   core::DeviceBuffer<int32_t> argmax_dev_;      // [1] -- DecodeStepGreedy's on-device argmax result
 

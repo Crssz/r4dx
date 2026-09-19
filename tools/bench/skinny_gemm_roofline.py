@@ -13,10 +13,13 @@ was already done and checked in by the GEMM-tuning pass (docs/perf.md "GEMM tuni
 Usage (read-only reference venv, HIP device 1):
   C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\bench\\skinny_gemm_roofline.py
 """
+import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\user\dev\libr4d\build-win")
+# Derived from the environment; override with R4DX_LIBR4D_BUILD.
+sys.path.insert(0, os.environ.get("R4DX_LIBR4D_BUILD", str(Path.home() / "dev" / "libr4d" / "build-win")))
 import torch  # noqa: E402
 import r4d  # noqa: E402
 

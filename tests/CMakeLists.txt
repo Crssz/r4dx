@@ -1,3 +1,19 @@
+# Machine-specific locations, derived from the environment so that no local account name is
+# hardcoded into the repository. Override either at configure time (-DR4DX_REFERENCE_VENV=...) or
+# via the matching environment variable.
+if(NOT R4DX_REFERENCE_VENV)
+  if(DEFINED ENV{R4DX_REFERENCE_VENV})
+    file(TO_CMAKE_PATH "$ENV{R4DX_REFERENCE_VENV}" R4DX_REFERENCE_VENV)
+  else()
+    file(TO_CMAKE_PATH "$ENV{USERPROFILE}" _r4dx_home)
+    set(R4DX_REFERENCE_VENV "${_r4dx_home}/dev/vLLM_for_AMD/.venv-rocm10")
+  endif()
+endif()
+
+# Repo root, for the tests that read tools/reference/golden_out/** by absolute path. Must precede
+# the add_subdirectory() calls below so those targets inherit the definition.
+add_compile_definitions(R4DX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 add_executable(smoke_r4d smoke_r4d.cpp)
 target_link_libraries(smoke_r4d PRIVATE r4d_core r4dx_hip_runtime)
 add_test(NAME smoke_r4d COMMAND smoke_r4d)
@@ -35,6 +51,6 @@ add_subdirectory(server)
 # component makes outside tools/reference/**, tests/reference/**, and docs/validation.md.
 add_test(
     NAME reference_manifest
-    COMMAND "C:/Users/user/dev/vLLM_for_AMD/.venv-rocm10/Scripts/python.exe"
+    COMMAND "${R4DX_REFERENCE_VENV}/Scripts/python.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_manifest.py"
 )

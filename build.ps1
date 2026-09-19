@@ -28,7 +28,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$VenvScripts = "C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts"
+# Derived from the environment rather than hardcoded, so no local account name is baked into the
+# repo. Override with $env:R4DX_REFERENCE_VENV if the reference venv lives elsewhere.
+$VenvRoot = if ($env:R4DX_REFERENCE_VENV) { $env:R4DX_REFERENCE_VENV }
+            else { Join-Path $env:USERPROFILE "dev\vLLM_for_AMD\.venv-rocm10" }
+$VenvScripts = Join-Path $VenvRoot "Scripts"
 $Cmake = Join-Path $VenvScripts "cmake.exe"
 $Ninja = Join-Path $VenvScripts "ninja.exe"
 

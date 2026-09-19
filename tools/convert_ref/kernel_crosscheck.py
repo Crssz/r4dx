@@ -23,7 +23,10 @@ import sys
 os.environ.setdefault("HIP_VISIBLE_DEVICES", "1")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-sys.path.insert(0, r"C:\Users\user\dev\libr4d\build-win")
+# Derived from the environment; override with R4DX_LIBR4D_BUILD.
+sys.path.insert(
+    0, os.environ.get("R4DX_LIBR4D_BUILD", str(pathlib.Path.home() / "dev" / "libr4d" / "build-win"))
+)
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402

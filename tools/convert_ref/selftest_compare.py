@@ -23,7 +23,10 @@ import mxfp4_ref
 import w4_ref
 from gen_fixtures import bf16_u16_to_float, float_to_bf16_u16, write_bf16_safetensors
 
-DEFAULT_EXE = r"C:\Users\user\dev\r4dx\build\win-hip\src\convert\r4dx-convert.exe"
+# Resolved relative to this file's location in the repo, so the path holds for any checkout.
+DEFAULT_EXE = str(
+    pathlib.Path(__file__).resolve().parents[2] / "build" / "win-hip" / "src" / "convert" / "r4dx-convert.exe"
+)
 
 
 class ContainerReader:

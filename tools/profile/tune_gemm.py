@@ -55,10 +55,14 @@ nothing and would only slow the sweep down).
 import argparse
 import itertools
 import math
+import os
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, r"C:\Users\user\dev\libr4d\build-win")
+# Derived from the environment rather than hardcoded, so no local account name is baked into the
+# repo. Override with R4DX_LIBR4D_BUILD if libr4d's Python extension lives elsewhere.
+sys.path.insert(0, os.environ.get("R4DX_LIBR4D_BUILD", str(Path.home() / "dev" / "libr4d" / "build-win")))
 import torch  # noqa: E402  (must come from the reference venv's interpreter)
 import r4d  # noqa: E402
 

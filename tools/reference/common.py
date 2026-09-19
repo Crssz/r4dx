@@ -22,7 +22,9 @@ from typing import Any
 import torch
 
 DEFAULT_MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
-DEFAULT_REFERENCE_VENV = Path(r"C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10")
+DEFAULT_REFERENCE_VENV = Path(
+    os.environ.get("R4DX_REFERENCE_VENV", Path.home() / "dev" / "vLLM_for_AMD" / ".venv-rocm10")
+)
 
 
 def resolve_device(requested: str) -> torch.device:

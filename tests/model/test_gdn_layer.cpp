@@ -56,7 +56,8 @@ using r4dx::model::Mlp;
 
 namespace {
 const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
-const char* kGoldenPath = "C:/Users/user/dev/r4dx/tools/reference/golden_out/layer_000_gdn.safetensors";
+// R4DX_SOURCE_DIR is defined by tests/CMakeLists.txt from ${CMAKE_SOURCE_DIR}.
+const char* kGoldenPath = R4DX_SOURCE_DIR "/tools/reference/golden_out/layer_000_gdn.safetensors";
 
 struct LayoutCase {
   Layout layout;

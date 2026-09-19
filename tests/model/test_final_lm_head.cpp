@@ -42,8 +42,9 @@ using r4dx::model::QuantLinear;
 
 namespace {
 const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
+// R4DX_SOURCE_DIR is defined by tests/CMakeLists.txt from ${CMAKE_SOURCE_DIR}.
 const char* kGoldenPath =
-    "C:/Users/user/dev/r4dx/tools/reference/golden_out/final_norm_lm_head.safetensors";
+    R4DX_SOURCE_DIR "/tools/reference/golden_out/final_norm_lm_head.safetensors";
 constexpr int64_t kTinyVocab = 256;  // layer_golden.py's --tiny-vocab default
 
 // Only meaningful for the quantized layouts: reads out lm_head's N,K-independent per-layout

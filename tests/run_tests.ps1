@@ -23,7 +23,9 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 
-$Cmake = "C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\cmake.exe"
+$VenvRoot = if ($env:R4DX_REFERENCE_VENV) { $env:R4DX_REFERENCE_VENV }
+            else { Join-Path $env:USERPROFILE "dev\vLLM_for_AMD\.venv-rocm10" }
+$Cmake = Join-Path $VenvRoot "Scripts\cmake.exe"
 if (-not (Test-Path $Cmake)) { throw "required tool not found: $Cmake" }
 
 $env:HIP_VISIBLE_DEVICES = "1"

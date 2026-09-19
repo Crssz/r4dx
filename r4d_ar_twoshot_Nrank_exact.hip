@@ -90,30 +90,30 @@ __global__ void r4d_ar_twoshot_wide_exact_kernel(
 
 // --- host side ---
 template <int WS>
-static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, long my_scratch,
-                              long my_flags, long seq_ctrs, long slot_stride16, long inp,
-                              long out, long n_elem, long dtype, long rank, long stream_i,
-                              long nblocks, long nthreads, long drain, long acq, long pub) {
+static void ar_twoshot_launch(const int64_t* peer_scratch, const int64_t* peer_flags, int64_t my_scratch,
+                              int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16, int64_t inp,
+                              int64_t out, int64_t n_elem, int64_t dtype, int64_t rank, int64_t stream_i,
+                              int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq, int64_t pub) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("all_reduce: rank " + std::to_string(rank) +
                              " out of range for the " + std::to_string(WS) +
                              " ranks this entry point is compiled for");
   const int esize = (dtype == 2) ? 4 : 2;
-  const long nbytes = (long)n_elem * esize;
+  const int64_t nbytes = (int64_t)n_elem * esize;
   if (nbytes % 16 != 0) throw std::runtime_error("all_reduce: n_elem*esize not 16B-aligned");
   if (n_elem > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS)
     throw std::runtime_error("all_reduce: n_elem " + std::to_string(n_elem) +
                              " exceeds the twoshot band (" +
                              std::to_string(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) +
                              " elems); use the fallback path");
-  const long n16 = nbytes / 16;
+  const int64_t n16 = nbytes / 16;
   if (n16 % WS != 0)
     throw std::runtime_error("all_reduce: message (" + std::to_string(n16) +
                              " 16B words) does not shard evenly over " + std::to_string(WS) +
                              " ranks");
-  const long shard16 = n16 / WS;
-  if (2 * shard16 > (long)slot_stride16)
+  const int64_t shard16 = n16 / WS;
+  if (2 * shard16 > (int64_t)slot_stride16)
     throw std::runtime_error("all_reduce: shard (" + std::to_string(shard16) +
                              " 16B words) needs 2x inside the per-source slot stride (" +
                              std::to_string(slot_stride16) + ")");
@@ -138,11 +138,11 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
 
   // scratch must back 2*WS slots of the declared stride, flags one word per (block, source
   // rank), seq one word per block -- checked against the allocations, not the arguments.
-  const long slot_bytes = 2L * WS * (long)slot_stride16 * 16;
-  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  const int64_t slot_bytes = 2L * WS * (int64_t)slot_stride16 * 16;
+  const int64_t flag_bytes = (int64_t)nb * WS * (int64_t)sizeof(unsigned int);
   r4d_ar_check_extent(my_scratch, slot_bytes, "all_reduce", "my_scratch");
   r4d_ar_check_extent(my_flags, flag_bytes, "all_reduce", "my_flags");
-  r4d_ar_check_extent(seq_ctrs, (long)nb * (long)sizeof(unsigned int), "all_reduce", "seq_ctrs");
+  r4d_ar_check_extent(seq_ctrs, (int64_t)nb * (int64_t)sizeof(unsigned int), "all_reduce", "seq_ctrs");
   for (int i = 0; i < NPEERS; ++i) {
     r4d_ar_check_extent(peer_scratch[i], slot_bytes, "all_reduce", "peer scratch");
     r4d_ar_check_extent(peer_flags[i], flag_bytes, "all_reduce", "peer flags");
@@ -161,29 +161,29 @@ static void ar_twoshot_launch(const long* peer_scratch, const long* peer_flags, 
 #undef R4D_AR_TS_LAUNCH
 }
 
-void r4d_ar_twoshot_4rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
-                                long peer_flags0, long peer_flags1, long peer_flags2,
-                                long my_scratch, long my_flags, long seq_ctrs,
-                                long slot_stride16, long inp, long out, long n_elem, long dtype,
-                                long rank, long stream, long nblocks, long nthreads, long drain,
-                                long acq, long pub) {
-  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
-  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+void r4d_ar_twoshot_4rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
+                                int64_t peer_flags0, int64_t peer_flags1, int64_t peer_flags2,
+                                int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs,
+                                int64_t slot_stride16, int64_t inp, int64_t out, int64_t n_elem, int64_t dtype,
+                                int64_t rank, int64_t stream, int64_t nblocks, int64_t nthreads, int64_t drain,
+                                int64_t acq, int64_t pub) {
+  const int64_t ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const int64_t pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub);
 }
 
-void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long peer_scratch2,
-                                long peer_scratch3, long peer_scratch4, long peer_scratch5,
-                                long peer_scratch6, long peer_flags0, long peer_flags1,
-                                long peer_flags2, long peer_flags3, long peer_flags4,
-                                long peer_flags5, long peer_flags6, long my_scratch,
-                                long my_flags, long seq_ctrs, long slot_stride16, long inp,
-                                long out, long n_elem, long dtype, long rank, long stream,
-                                long nblocks, long nthreads, long drain, long acq, long pub) {
-  const long ps[7] = {peer_scratch0, peer_scratch1, peer_scratch2, peer_scratch3,
+void r4d_ar_twoshot_8rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
+                                int64_t peer_scratch3, int64_t peer_scratch4, int64_t peer_scratch5,
+                                int64_t peer_scratch6, int64_t peer_flags0, int64_t peer_flags1,
+                                int64_t peer_flags2, int64_t peer_flags3, int64_t peer_flags4,
+                                int64_t peer_flags5, int64_t peer_flags6, int64_t my_scratch,
+                                int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16, int64_t inp,
+                                int64_t out, int64_t n_elem, int64_t dtype, int64_t rank, int64_t stream,
+                                int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq, int64_t pub) {
+  const int64_t ps[7] = {peer_scratch0, peer_scratch1, peer_scratch2, peer_scratch3,
                       peer_scratch4, peer_scratch5, peer_scratch6};
-  const long pf[7] = {peer_flags0, peer_flags1, peer_flags2, peer_flags3,
+  const int64_t pf[7] = {peer_flags0, peer_flags1, peer_flags2, peer_flags3,
                       peer_flags4, peer_flags5, peer_flags6};
   ar_twoshot_launch<8>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, inp, out, n_elem,
                        dtype, rank, stream, nblocks, nthreads, drain, acq, pub);

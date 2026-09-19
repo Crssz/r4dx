@@ -126,7 +126,7 @@ __global__ void r4d_ar_oneshot_2rank_exact_kernel(
 // stays a C ABI; R4D_AR_HANDLE_BYTES is the fixed size the header promises.
 static_assert(sizeof(hipIpcMemHandle_t) <= R4D_AR_HANDLE_BYTES, "ipc handle larger than the ABI buffer");
 
-long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len) {
+int64_t r4d_ar_ipc_alloc(int64_t size, int finegrained, char* out_handle, int* out_len) {
   void* p = nullptr;
   if (finegrained) HIPOK(hipExtMallocWithFlags(&p, size, hipDeviceMallocFinegrained));
   else HIPOK(hipMalloc(&p, size));
@@ -135,35 +135,35 @@ long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len
   HIPOK(hipIpcGetMemHandle(&h, p));
   std::memcpy(out_handle, &h, sizeof(h));
   *out_len = (int)sizeof(h);
-  return (long)p;
+  return (int64_t)p;
 }
-long r4d_ar_ipc_open(const char* handle, int len) {
+int64_t r4d_ar_ipc_open(const char* handle, int len) {
   hipIpcMemHandle_t h;
   if (len != (int)sizeof(h)) throw std::runtime_error("bad ipc handle size");
   std::memcpy(&h, handle, sizeof(h));
   void* p = nullptr;
   HIPOK(hipIpcOpenMemHandle(&p, h, hipIpcMemLazyEnablePeerAccess));
-  return (long)p;
+  return (int64_t)p;
 }
-void r4d_ar_ipc_free(long p) { if (p) (void)hipFree((void*)p); }
-void r4d_ar_ipc_memzero(long p, long size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
+void r4d_ar_ipc_free(int64_t p) { if (p) (void)hipFree((void*)p); }
+void r4d_ar_ipc_memzero(int64_t p, int64_t size) { if (p) HIPOK(hipMemset((void*)p, 0, size)); }
 
 // single-process 2-GPU testing only: enable direct peer access (the runtime path uses IPC handles)
-void r4d_ar_ipc_enable_peer(long peer) {
+void r4d_ar_ipc_enable_peer(int64_t peer) {
   hipError_t e = hipDeviceEnablePeerAccess((int)peer, 0);
   if (e == hipErrorPeerAccessAlreadyEnabled) { (void)hipGetLastError(); return; }
   if (e != hipSuccess)
     throw std::runtime_error(std::string("enable_peer: ") + hipGetErrorString(e));
 }
 
-void r4d_ar_oneshot_2rank_exact(long peer_scratch, long my_scratch, long peer_flags,
-                            long my_flags, long seq_ctrs, long slot_stride16,
-                            long inp, long out, long n_elem, long dtype,
-                            long stream_i, long nblocks, long nthreads,
-                            long drain, long acq) {
+void r4d_ar_oneshot_2rank_exact(int64_t peer_scratch, int64_t my_scratch, int64_t peer_flags,
+                            int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16,
+                            int64_t inp, int64_t out, int64_t n_elem, int64_t dtype,
+                            int64_t stream_i, int64_t nblocks, int64_t nthreads,
+                            int64_t drain, int64_t acq) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
-  const long nbytes = (long)n_elem * esize;
+  const int64_t nbytes = (int64_t)n_elem * esize;
   if (nbytes % 16 != 0) throw std::runtime_error("all_reduce: n_elem*esize not 16B-aligned");
   const int n16 = (int)(nbytes / 16);
   int nb = (int)nblocks;

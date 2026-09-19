@@ -33,10 +33,10 @@ void r4d_gdn_gated_rmsnorm_kernel(const unsigned short* __restrict__ x,
                                   const unsigned short* __restrict__ z,
                                   const float* __restrict__ w,
                                   unsigned short* __restrict__ o,
-                                  long rows, long xrow, long zrow, long orow, float eps)
+                                  int64_t rows, int64_t xrow, int64_t zrow, int64_t orow, float eps)
 {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const long r = (long)blockIdx.x * GN_NW + warp;
+  const int64_t r = (int64_t)blockIdx.x * GN_NW + warp;
   if (r >= rows) return;
   const int d0 = lane * GN_DPL;
 
@@ -63,8 +63,8 @@ void r4d_gdn_gated_rmsnorm_kernel(const unsigned short* __restrict__ x,
 }
 
 extern "C" int r4d_gdn_gated_rmsnorm_h128_bf16(const void* x, const void* z, const void* w,
-                                               void* o, long rows, long xrow, long zrow,
-                                               long orow, int width, float eps, int act,
+                                               void* o, int64_t rows, int64_t xrow, int64_t zrow,
+                                               int64_t orow, int width, float eps, int act,
                                                void* stream)
 {
   if (width != GN_D) return -1;

@@ -148,8 +148,8 @@ __global__ __launch_bounds__(1024) void r4d_gemm_bf16_nt_m64_kernel(
 
 // grid = ceil(ceil(N/16)/WV) blocks; block = WV*SK waves. MT is compile-time so the accumulators
 // and the fragment loop are exactly the size M needs.
-void r4d_gemm_bf16_nt_m64(long a, long w, long c, int M, int K, int N, int WV, int SK, int MB,
-                          long stream) {
+void r4d_gemm_bf16_nt_m64(int64_t a, int64_t w, int64_t c, int M, int K, int N, int WV, int SK, int MB,
+                          int64_t stream) {
   if (M < 1 || M > R4D_GEMM64_MAX_M) throw std::runtime_error("r4d gemm_bf16_nt_m64: M must be 1..64");
   if (K % (SK * 16)) throw std::runtime_error("r4d gemm_bf16_nt_m64: K must be divisible by SK*16");
   if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_bf16_nt_m64: threads/block > 1024");

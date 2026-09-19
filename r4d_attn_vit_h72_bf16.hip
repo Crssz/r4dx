@@ -132,7 +132,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
     const int s0 = cu[seq], slen = cu[seq + 1] - s0;
     if (slen <= 0 || qb * ROWS >= slen) return;
 
-    const long hstride = (long)heads * HD;          // elements between consecutive tokens
+    const int64_t hstride = (int64_t)heads * HD;          // elements between consecutive tokens
     const float mul = scale * 1.44269504089f;
 
     // ---- the query fragments, held for the life of the workgroup -----------------------------
@@ -149,7 +149,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         qpos[b] = qb * ROWS + (warp * QB + b) * 16 + c;
         live[b] = qpos[b] < slen;
         const int qrow = live[b] ? qpos[b] : slen - 1;
-        const uint16_t* qp = gq + (long)(s0 + qrow) * hstride + (long)hd * HD;
+        const uint16_t* qp = gq + (int64_t)(s0 + qrow) * hstride + (int64_t)hd * HD;
         #pragma unroll
         for (int t = 0; t < NKS; ++t) {
             // The padded half of the last k-tile: dims 72..79 do not exist. Zeroing the query
@@ -192,7 +192,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
             if (KIA % NTHR == 0 || i < KIA) {
                 const int key = i >> 3, g = i & 7;
                 const int kk = (k0 + key < slen) ? (k0 + key) : (slen - 1);
-                kregA[p] = *(const uint4*)(gk + (long)(s0 + kk) * hstride + (long)hd * HD + g * 8);
+                kregA[p] = *(const uint4*)(gk + (int64_t)(s0 + kk) * hstride + (int64_t)hd * HD + g * 8);
             }
         }
         #pragma unroll
@@ -200,7 +200,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
             const int i = tid + p * NTHR;
             if (KIB % NTHR == 0 || i < KIB) {
                 const int kk = (k0 + i < slen) ? (k0 + i) : (slen - 1);
-                kregB[p] = *(const uint4*)(gk + (long)(s0 + kk) * hstride + (long)hd * HD + 64);
+                kregB[p] = *(const uint4*)(gk + (int64_t)(s0 + kk) * hstride + (int64_t)hd * HD + 64);
             }
         }
     };
@@ -240,7 +240,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
                 const int kk0 = k0 + kg * 8 + vj;
                 const int kk = (kk0 < slen) ? kk0 : (slen - 1);
                 vreg[r] = __builtin_bit_cast(uint4, load_tr_b128(
-                    gv + (long)(s0 + kk) * hstride + (long)hd * HD + dg * 8));
+                    gv + (int64_t)(s0 + kk) * hstride + (int64_t)hd * HD + dg * 8));
             }
         }
     };
@@ -398,7 +398,7 @@ void r4d_attn_vit_kernel(const uint16_t* __restrict__ gq, const uint16_t* __rest
         if (!live[b]) continue;
         const float ls = l_i[b] + swap16(l_i[b]);
         const float inv = (ls > 0.0f) ? (1.0f / ls) : 0.0f;
-        uint16_t* op = go + (long)(s0 + qpos[b]) * hstride + (long)hd * HD;
+        uint16_t* op = go + (int64_t)(s0 + qpos[b]) * hstride + (int64_t)hd * HD;
         #pragma unroll
         for (int dt = 0; dt < NKS; ++dt) {
             // The last tile covers dims 64..79; the h==1 half of it is padding and would store

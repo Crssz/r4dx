@@ -52,7 +52,7 @@ __global__ __launch_bounds__(R4D_QAI8_THREADS) void r4d_quant_act_i8_kernel(
   }
 }
 
-void r4d_quant_act_i8(long a, long q, long s, int M, int K, long stream) {
+void r4d_quant_act_i8(int64_t a, int64_t q, int64_t s, int M, int K, int64_t stream) {
   if (K % 16) throw std::runtime_error("r4d quant_act_i8: K must be a multiple of 16");
   if (M < 1) throw std::runtime_error("r4d quant_act_i8: M must be positive");
   hipLaunchKernelGGL(r4d_quant_act_i8_kernel, dim3(M), dim3(R4D_QAI8_THREADS), 0,

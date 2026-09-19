@@ -82,8 +82,8 @@ __global__ void r4d_gemm_bf16_nt_m16_kernel(const __hip_bfloat16* __restrict__ A
 }
 
 // grid = ceil(N/WV) blocks; block = WV*SK waves. Compile-time-M dispatch keeps exactly M accumulators.
-void r4d_gemm_bf16_nt_m16(long a, long w, long c, int M, int K, int N, int WV, int SK,
-                          long stream) {
+void r4d_gemm_bf16_nt_m16(int64_t a, int64_t w, int64_t c, int M, int K, int N, int WV, int SK,
+                          int64_t stream) {
   if (M > R4D_GEMM_MAX_M) throw std::runtime_error("r4d gemm_bf16_nt_m16: M must be <= 16");
   if (K % SK != 0 || (K / SK) % (WAVE * VEC) != 0) throw std::runtime_error("bad SK");
   if (WV * SK * WAVE > 1024) throw std::runtime_error("threads/block>1024");

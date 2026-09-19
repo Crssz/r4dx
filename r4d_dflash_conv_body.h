@@ -15,6 +15,7 @@
 
 typedef unsigned int   r4d_u32;
 typedef unsigned short r4d_u16;
+typedef long long      r4d_i64;
 typedef r4d_u32 r4d_u32x4 __attribute__((ext_vector_type(4)));
 
 // A 16-byte load addressed both ways. The subscript must come off a union member and never off a
@@ -66,9 +67,9 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
     const unsigned off = ((unsigned)hv & 0xFFFFFu) * 8u;
     const unsigned g   = off / (unsigned)GROUP;
 
-    const r4d_u16* __restrict__ xrow = x + (long)t * H;
-    r4d_u16*       __restrict__ orow = out + (long)t * H;
-    const r4d_u16* __restrict__ drow = delta + (long)t * dpitch;
+    const r4d_u16* __restrict__ xrow = x + (r4d_i64)t * H;
+    r4d_u16*       __restrict__ orow = out + (r4d_i64)t * H;
+    const r4d_u16* __restrict__ drow = delta + (r4d_i64)t * dpitch;
 
     R4dV8 x0; x0.v = *(const r4d_u32x4*)(xrow + off);
     R4dV8 b0; b0.v = *(const r4d_u32x4*)(base + off);
@@ -90,9 +91,9 @@ R4D_DEV void r4d_dflash_conv_body(const r4d_u16* __restrict__ x,
         // hoisted OUT of the predicate: they are scalar address arithmetic on a path the backend
         // will not fold into saddr from inside a branch, and an address that is merely formed and
         // never dereferenced costs nothing.
-        const r4d_u16* __restrict__ xprev = xrow - (long)tap * H;
-        const r4d_u16* __restrict__ btap  = base + (long)tap * H;
-        const r4d_u16* __restrict__ dtap  = drow + (long)tap * NG;
+        const r4d_u16* __restrict__ xprev = xrow - (r4d_i64)tap * H;
+        const r4d_u16* __restrict__ btap  = base + (r4d_i64)tap * H;
+        const r4d_u16* __restrict__ dtap  = drow + (r4d_i64)tap * NG;
         if ((t & blockmask) >= tap) {
             R4dV8 xs; xs.v = *(const r4d_u32x4*)(xprev + off);
             R4dV8 bt; bt.v = *(const r4d_u32x4*)(btap + off);

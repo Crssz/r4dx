@@ -100,7 +100,7 @@ __device__ __forceinline__ void r4d_ar_handshake(const R4DArWidePeers<S, NPEERS>
 // every scratch, flag, and seq pointer came from hipMalloc / hipIpcOpenMemHandle, so the
 // runtime can report the extent behind it. A pointer the runtime cannot size is refused
 // rather than assumed.
-inline void r4d_ar_check_extent(long p, long need, const char* prefix, const char* what) {
+inline void r4d_ar_check_extent(int64_t p, int64_t need, const char* prefix, const char* what) {
   hipDeviceptr_t base = nullptr;
   size_t sz = 0;
   hipError_t e = hipMemGetAddressRange(&base, &sz, (hipDeviceptr_t)(uintptr_t)p);
@@ -108,7 +108,7 @@ inline void r4d_ar_check_extent(long p, long need, const char* prefix, const cha
     throw std::runtime_error(std::string(prefix) + ": " + what +
                              " is not an allocation the runtime can size (" +
                              hipGetErrorString(e) + ")");
-  const long avail = (long)(((char*)base + sz) - (char*)(uintptr_t)p);
+  const int64_t avail = (int64_t)(((char*)base + sz) - (char*)(uintptr_t)p);
   if (avail < need)
     throw std::runtime_error(std::string(prefix) + ": " + what + " backs " +
                              std::to_string(avail) + " bytes from the given pointer, needs " +

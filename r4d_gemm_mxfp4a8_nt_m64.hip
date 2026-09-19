@@ -88,6 +88,7 @@
 // second read for nothing.  Rows past M are CLAMPED rather than masked -- a tile past M recomputes
 // the last valid row and the store discards it -- which keeps the inner loop branch-free.
 #include "r4d_common.h"
+#include "r4d.h"
 
 #include <hip/hip_bf16.h>
 #include <cstdint>
@@ -229,9 +230,9 @@ __global__ void r4d_gemm_mxfp4a8_nt_m64_kernel(
 extern "C" int r4d_gemm_mxfp4a8_nt_m64_max_m(void) { return R4D_GEMM_MXFP4_MAX_M; }
 extern "C" int r4d_gemm_mxfp4a8_nt_m64_group(void) { return R4D_GEMM_MXFP4_GROUP; }
 
-extern "C" void r4d_gemm_mxfp4a8_nt_m64(long a, long ascale, long wq, long ws, long wref, long c,
+extern "C" void r4d_gemm_mxfp4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t wref, int64_t c,
                                         int M, int K, int N, int WV, int SK, int MB, int NPW,
-                                        long stream) {
+                                        int64_t stream) {
   if (M < 1 || M > R4D_GEMM_MXFP4_MAX_M)
     throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: M must be 1..64");
   if (N % 16) throw std::runtime_error("r4d gemm_mxfp4a8_nt_m64: N must be a multiple of 16");

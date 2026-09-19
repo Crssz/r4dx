@@ -262,8 +262,8 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a8_nt_m64_kernel(
   }
 }
 
-void r4d_gemm_w4a8_nt_m64(long a, long ascale, long wq, long ws, long c, int M, int K, int N,
-                          int WV, int SK, int MB, int NPW, int NT, long stream) {
+void r4d_gemm_w4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t c, int M, int K, int N,
+                          int WV, int SK, int MB, int NPW, int NT, int64_t stream) {
   if (M < 1 || M > R4D_GEMM_W4A8_MAX_M)
     throw std::runtime_error("r4d gemm_w4a8_nt_m64: M must be 1..64");
   if (N % 16) throw std::runtime_error("r4d gemm_w4a8_nt_m64: N must be a multiple of 16");

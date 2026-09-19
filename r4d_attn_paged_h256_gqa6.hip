@@ -100,11 +100,11 @@ static int decode_splits(const R4DArgs* a) {
 
 // Same for both cache dtypes: the split law does not read the dtype, and the partials are f16
 // either way (opt bit 32).
-extern "C" long r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
+extern "C" int64_t r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a) {
     const int  splits = decode_splits(a);
-    const long rows   = (long)a->num_seqs * a->q_len * a->q_heads;
-    return (D_OPT & 32) ? rows * splits * (long)(a->head_dim * 2 + 8)       // f16 O/l + m + l
-                        : rows * splits * (long)(a->head_dim + 2) * 4L;     // f32 O partials + m + l
+    const int64_t rows = (int64_t)a->num_seqs * a->q_len * a->q_heads;
+    return (D_OPT & 32) ? rows * splits * (int64_t)(a->head_dim * 2 + 8)       // f16 O/l + m + l
+                        : rows * splits * (int64_t)(a->head_dim + 2) * 4L;     // f32 O partials + m + l
 }
 
 template <int KVP>

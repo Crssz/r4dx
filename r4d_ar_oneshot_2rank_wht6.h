@@ -103,7 +103,7 @@ template <typename T>
 __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
     const T* __restrict__ in, char* peer_scratch, const char* my_scratch, char* loc_pack,
     T* __restrict__ out, unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
-    int n_groups, int n_chunks, long slot_stride_bytes, long scale_off_bytes, int drain, int acq) {
+    int n_groups, int n_chunks, int64_t slot_stride_bytes, int64_t scale_off_bytes, int drain, int acq) {
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   const int lane = tid & (WAVE - 1), wid = tid / WAVE, nwarp = nt / WAVE;
   const int lig = lane & (LPG - 1), gw = lane / LPG;
@@ -136,7 +136,7 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
     for (int t = 0; t < ITERS; ++t) {
       const int g = c * CHUNK_GROUPS + t * GPW + gw;
       const bool live = (g < n_groups);                     // uniform across a group's lanes
-      const long off = (long)g * GROUP + (long)lig * EPL;
+      const int64_t off = (int64_t)g * GROUP + (int64_t)lig * EPL;
       float v[EPL];
 #pragma unroll
       for (int i = 0; i < EPL; ++i) v[i] = live ? rd_to_f(in[off + i]) : 0.f;
@@ -165,7 +165,7 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
 #pragma unroll
     for (int u = 0; u < NU4; ++u) {
       const uint4 q = make_uint4(acc[4 * u], acc[4 * u + 1], acc[4 * u + 2], acc[4 * u + 3]);
-      const long o = (long)c * U4PC + (long)u * WAVE + lane;
+      const int64_t o = (int64_t)c * U4PC + (int64_t)u * WAVE + lane;
       p_pay[o] = q;
       l_pay[o] = q;
     }
@@ -186,7 +186,7 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
     unsigned int pac[NWORD], lac[NWORD];
 #pragma unroll
     for (int u = 0; u < NU4; ++u) {
-      const long o = (long)c * U4PC + (long)u * WAVE + lane;
+      const int64_t o = (int64_t)c * U4PC + (int64_t)u * WAVE + lane;
       const uint4 pq = m_pay[o], lq = l_pay[o];
       pac[4 * u] = pq.x; pac[4 * u + 1] = pq.y; pac[4 * u + 2] = pq.z; pac[4 * u + 3] = pq.w;
       lac[4 * u] = lq.x; lac[4 * u + 1] = lq.y; lac[4 * u + 2] = lq.z; lac[4 * u + 3] = lq.w;
@@ -195,7 +195,7 @@ __global__ void r4d_ar_oneshot_2rank_wht6_kernel(
     for (int t = 0; t < ITERS; ++t) {
       const int g = c * CHUNK_GROUPS + t * GPW + gw;
       if (g >= n_groups) continue;                          // whole group: no shuffle is split
-      const long off = (long)g * GROUP + (long)lig * EPL;
+      const int64_t off = (int64_t)g * GROUP + (int64_t)lig * EPL;
       const float psc = __uint_as_float((unsigned int)m_sc[g] << 16);
       const float lsc = l_sc[g];
       float v[EPL];
@@ -238,7 +238,7 @@ static void r4d_ar_wht6_launch(int64_t peer_scratch, int64_t my_scratch, int64_t
 #define LF(T) r4d_ar_oneshot_2rank_wht6_kernel<T><<<nb, nt, 0, st>>>( \
     (const T*)inp, (char*)peer_scratch, (const char*)my_scratch, (char*)loc_pack, (T*)out, \
     (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n_groups, n_chunks, \
-    (long)slot_stride_bytes, (long)scale_off_bytes, (int)drain, (int)acq)
+    (int64_t)slot_stride_bytes, (int64_t)scale_off_bytes, (int)drain, (int)acq)
   if (dtype == 0) LF(__hip_bfloat16);
   else LF(__half);
 #undef LF

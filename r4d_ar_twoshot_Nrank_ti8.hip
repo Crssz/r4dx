@@ -20,8 +20,8 @@ template <typename T, int WS>
 __global__ void r4d_ar_twoshot_wide_ti8_kernel(
     const T* __restrict__ in, R4DArWidePeers<char, WS - 1> peers, char* __restrict__ my_base,
     unsigned int* __restrict__ my_flags, T* __restrict__ out,
-    unsigned int* __restrict__ seq_ctrs, int shard_elems, long slot_stride_bytes,
-    long b_off_bytes, int rank, int drain, int acq, int pub) {
+    unsigned int* __restrict__ seq_ctrs, int shard_elems, int64_t slot_stride_bytes,
+    int64_t b_off_bytes, int rank, int drain, int acq, int pub) {
   constexpr int NPEERS = WS - 1;
   const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
   __shared__ unsigned int s_seq;
@@ -128,23 +128,23 @@ __global__ void r4d_ar_twoshot_wide_ti8_kernel(
 
 // ---------------------------------------------------------------------------------- host side
 template <int WS>
-static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_flags,
-                                  long my_scratch, long my_flags, long seq_ctrs,
-                                  long slot_stride_bytes, long inp, long out, long n_elem,
-                                  long dtype, long rank, long stream_i, long nblocks,
-                                  long nthreads, long drain, long acq, long pub) {
+static void ar_twoshot_ti8_launch(const int64_t* peer_scratch, const int64_t* peer_flags,
+                                  int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs,
+                                  int64_t slot_stride_bytes, int64_t inp, int64_t out, int64_t n_elem,
+                                  int64_t dtype, int64_t rank, int64_t stream_i, int64_t nblocks,
+                                  int64_t nthreads, int64_t drain, int64_t acq, int64_t pub) {
   constexpr int NPEERS = WS - 1;
   if (rank < 0 || rank >= WS)
     throw std::runtime_error("ti8 ar: rank " + std::to_string(rank) +
                              " out of range for the " + std::to_string(WS) +
                              " ranks this entry point is compiled for");
   if (dtype != 0 && dtype != 1) throw std::runtime_error("ti8 ar: only bf16/fp16 payloads");
-  if (n_elem % ((long)TI8_GROUP * WS) != 0)
+  if (n_elem % ((int64_t)TI8_GROUP * WS) != 0)
     throw std::runtime_error("ti8 ar: n_elem must tile " + std::to_string(TI8_GROUP) +
                              "-elem groups over " + std::to_string(WS) + " shards");
   const int shard_elems = (int)(n_elem / WS);
   const int sg = shard_elems / TI8_GROUP;
-  const long b_off = ((long)TI8_GROUP_BYTES * sg + 15) / 16 * 16;  // one wire image, 16B-aligned
+  const int64_t b_off = ((int64_t)TI8_GROUP_BYTES * sg + 15) / 16 * 16;  // one wire image, 16B-aligned
   if (2 * b_off > slot_stride_bytes)
     throw std::runtime_error("ti8 ar: slot stride " + std::to_string(slot_stride_bytes) +
                              " too small for two wire images (needs " +
@@ -170,11 +170,11 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
 
   // scratch must back 2*WS slots of the declared stride, flags one word per (block, source
   // rank), seq one word per block -- checked against the allocations, not the arguments.
-  const long slot_bytes = 2L * WS * slot_stride_bytes;
-  const long flag_bytes = (long)nb * WS * (long)sizeof(unsigned int);
+  const int64_t slot_bytes = 2L * WS * slot_stride_bytes;
+  const int64_t flag_bytes = (int64_t)nb * WS * (int64_t)sizeof(unsigned int);
   r4d_ar_check_extent(my_scratch, slot_bytes, "ti8 ar", "my_scratch");
   r4d_ar_check_extent(my_flags, flag_bytes, "ti8 ar", "my_flags");
-  r4d_ar_check_extent(seq_ctrs, (long)nb * (long)sizeof(unsigned int), "ti8 ar", "seq_ctrs");
+  r4d_ar_check_extent(seq_ctrs, (int64_t)nb * (int64_t)sizeof(unsigned int), "ti8 ar", "seq_ctrs");
   for (int i = 0; i < NPEERS; ++i) {
     r4d_ar_check_extent(peer_scratch[i], slot_bytes, "ti8 ar", "peer scratch");
     r4d_ar_check_extent(peer_flags[i], flag_bytes, "ti8 ar", "peer flags");
@@ -184,21 +184,21 @@ static void ar_twoshot_ti8_launch(const long* peer_scratch, const long* peer_fla
 #define R4D_AR_TS8_LAUNCH(T)                                                            \
   r4d_ar_twoshot_wide_ti8_kernel<T, WS><<<nb, nt, 0, st>>>(                             \
       (const T*)inp, peers, (char*)my_scratch, (unsigned int*)my_flags, (T*)out,        \
-      (unsigned int*)seq_ctrs, shard_elems, (long)slot_stride_bytes, b_off, (int)rank,  \
+      (unsigned int*)seq_ctrs, shard_elems, (int64_t)slot_stride_bytes, b_off, (int)rank,  \
       (int)drain, (int)acq, (int)pub)
   if (dtype == 0) R4D_AR_TS8_LAUNCH(__hip_bfloat16);
   else R4D_AR_TS8_LAUNCH(__half);
 #undef R4D_AR_TS8_LAUNCH
 }
 
-void r4d_ar_twoshot_4rank_ti8(long peer_scratch0, long peer_scratch1, long peer_scratch2,
-                              long peer_flags0, long peer_flags1, long peer_flags2,
-                              long my_scratch, long my_flags, long seq_ctrs,
-                              long slot_stride_bytes, long inp, long out, long n_elem,
-                              long dtype, long rank, long stream, long nblocks,
-                              long nthreads, long drain, long acq, long pub) {
-  const long ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
-  const long pf[3] = {peer_flags0, peer_flags1, peer_flags2};
+void r4d_ar_twoshot_4rank_ti8(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
+                              int64_t peer_flags0, int64_t peer_flags1, int64_t peer_flags2,
+                              int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs,
+                              int64_t slot_stride_bytes, int64_t inp, int64_t out, int64_t n_elem,
+                              int64_t dtype, int64_t rank, int64_t stream, int64_t nblocks,
+                              int64_t nthreads, int64_t drain, int64_t acq, int64_t pub) {
+  const int64_t ps[3] = {peer_scratch0, peer_scratch1, peer_scratch2};
+  const int64_t pf[3] = {peer_flags0, peer_flags1, peer_flags2};
   ar_twoshot_ti8_launch<4>(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride_bytes, inp,
                            out, n_elem, dtype, rank, stream, nblocks, nthreads, drain,
                            acq, pub);

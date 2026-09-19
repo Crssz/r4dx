@@ -76,15 +76,15 @@ __device__ __forceinline__ float cp_ab(const void* p, size_t i) {
 
 template <int HPB, int ABF16>
 __global__ __launch_bounds__(HPB * 32)
-void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
+void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, int64_t xpitch,
                               const unsigned short* __restrict__ wgt,
                               const unsigned short* __restrict__ bias,
                               unsigned short* __restrict__ cstate,
-                              long cs_seq, long cs_dim, long cs_tok,
-                              const int* __restrict__ cache_idx, long ci_stride,
+                              int64_t cs_seq, int64_t cs_dim, int64_t cs_tok,
+                              const int* __restrict__ cache_idx, int64_t ci_stride,
                               const unsigned char* __restrict__ has_init,
                               const void* __restrict__ av, const void* __restrict__ bv,
-                              long ab_stride,
+                              int64_t ab_stride,
                               const float* __restrict__ A_log, const float* __restrict__ dt_bias,
                               unsigned short* __restrict__ q, unsigned short* __restrict__ k,
                               unsigned short* __restrict__ v,
@@ -247,10 +247,10 @@ void r4d_gdn_conv_prep_kernel(const unsigned short* __restrict__ x, long xpitch,
 }
 
 extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
-    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
-    long cs_seq, long cs_dim, long cs_tok, const void* cache_idx, long ci_stride,
+    const void* x, int64_t xpitch, const void* wgt, const void* bias, void* cstate,
+    int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, const void* cache_idx, int64_t ci_stride,
     const void* has_init,
-    const void* a, const void* b, long ab_stride, int ab_is_bf16, const void* A_log,
+    const void* a, const void* b, int64_t ab_stride, int ab_is_bf16, const void* A_log,
     const void* dt_bias, void* q, void* k, void* v, void* g, void* beta, const void* cu,
     int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr, void* stream)
 {
@@ -295,12 +295,12 @@ extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
 // ---------------------------------------------------------------------------------------------
 template <int HPB>
 __global__ __launch_bounds__(HPB * 32)
-void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitch,
+void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, int64_t xpitch,
                                 const unsigned short* __restrict__ wgt,
                                 const unsigned short* __restrict__ bias,
                                 unsigned short* __restrict__ cstate,
-                                long cs_seq, long cs_dim, long cs_tok, int state_len_max,
-                                const int* __restrict__ cache_idx, long ci_stride,
+                                int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, int state_len_max,
+                                const int* __restrict__ cache_idx, int64_t ci_stride,
                                 const int* __restrict__ naccept,
                                 unsigned short* __restrict__ q, unsigned short* __restrict__ k,
                                 unsigned short* __restrict__ v,
@@ -415,9 +415,9 @@ void r4d_gdn_conv_update_kernel(const unsigned short* __restrict__ x, long xpitc
 }
 
 extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
-    const void* x, long xpitch, const void* wgt, const void* bias, void* cstate,
-    long cs_seq, long cs_dim, long cs_tok, int state_len_max, const void* cache_idx,
-    long ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
+    const void* x, int64_t xpitch, const void* wgt, const void* bias, void* cstate,
+    int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, int state_len_max, const void* cache_idx,
+    int64_t ci_stride, const void* num_accepted, void* q, void* k, void* v, const void* cu,
     int N, int H, int Hg, int K, int V, int width, int max_query_len, void* stream)
 {
   if (K != CP_HD || V != CP_HD || width != CP_W) return -1;
@@ -427,7 +427,7 @@ extern "C" int r4d_gdn_conv_update_w4_h128_bf16(
   // A decode step is a handful of sequences, so the channel grouping is what decides whether the
   // grid covers the device: at 8 sequences and 8 heads per block this launches 40 workgroups for
   // 64 CUs. Narrow the block until there are enough of them.
-  while (hpb > 1 && (long)N * (units / hpb) < 256) hpb >>= 1;
+  while (hpb > 1 && (int64_t)N * (units / hpb) < 256) hpb >>= 1;
   dim3 grid(N, units / hpb), blk(hpb * 32);
 #define CU_LAUNCH(P)                                                                          \
   hipLaunchKernelGGL((r4d_gdn_conv_update_kernel<P>), grid, blk, 0, (hipStream_t)stream,      \

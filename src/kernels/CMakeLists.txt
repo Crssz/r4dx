@@ -29,6 +29,9 @@ set(R4DX_KERNELS_FLAGS
   -D_DLL -D_MT -Xclang --dependent-lib=msvcrt
   -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
   -I "${CMAKE_CURRENT_SOURCE_DIR}/../core/include"
+  # third_party/libr4d/r4d.h: r4dx_dflash_conv_bf16 is a thin address-arithmetic wrapper over
+  # r4d_dflash_conv_t2_g16_bf16 (docs/dflash2.md "Kernels"), so this TU needs that declaration.
+  -I "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d"
 )
 if(EXISTS "${R4DX_DEVICE_LIB_PATH}")
   list(APPEND R4DX_KERNELS_FLAGS --rocm-device-lib-path=${R4DX_DEVICE_LIB_PATH})
@@ -49,6 +52,7 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) r4dx_kernels.obj"
   VERBATIM
 )
@@ -57,4 +61,6 @@ set_source_files_properties("${R4DX_KERNELS_OBJ}" PROPERTIES EXTERNAL_OBJECT TRU
 add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}")
 set_target_properties(r4dx_kernels PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(r4dx_kernels PUBLIC r4dx_hip_runtime)
+# r4d_core: r4dx_dflash_conv_bf16 calls r4d_dflash_conv_t2_g16_bf16 (see the -I above). PUBLIC so
+# every consumer of r4dx_kernels resolves it without having to know about that dependency edge.
+target_link_libraries(r4dx_kernels PUBLIC r4dx_hip_runtime r4d_core)

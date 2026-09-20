@@ -538,6 +538,53 @@ class DraftRoundResult:
     intermediates: dict[str, np.ndarray]
 
 
+def selector_walk(
+    W_succ: np.ndarray,
+    W_pred: np.ndarray,
+    cand: np.ndarray,
+    unary: np.ndarray,
+    gate_vec: np.ndarray,
+    anchor_id: int,
+    block_size: int,
+    p_min: float,
+) -> tuple[list[int], dict[int, np.ndarray]]:
+    """docs/dflash2.md section 4.3's greedy lattice walk, lifted out of `draft_round` unchanged.
+
+    Extracted (2026-09-20, stage S2) so `--real` mode can also run it on a MIXTURE of this
+    reference's own tensors and a port's -- which is what attributes a chain divergence to the
+    lm_head (`cand`/`unary`) versus the drafter itself (`gate`). `draft_round` calls it with its own
+    three tensors, so every fixture it generates is bit-identical to before the extraction (gated by
+    dflash2_selftest.py).
+    """
+    tokens: list[int] = []
+    P = np.array([anchor_id], dtype=np.int64)
+    pred_idx = 0
+    score_matrices: dict[int, np.ndarray] = {}
+    for t in range(1, block_size):
+        cand_t = cand[t]
+        unary_t = unary[t]
+        gate_t = gate_vec[t]
+        succ = W_succ[cand_t]  # [top_k, rank]
+        pred = W_pred[P]  # [n_pred, rank]
+        cond = pred * gate_t[None, :]  # [n_pred, rank]
+        score = cond @ succ.T + unary_t[None, :]  # [n_pred, top_k] == score[a,b]
+        score_matrices[t] = score.copy()
+
+        scores_row = score[pred_idx]  # [top_k]
+        b = int(np.argmax(scores_row))
+
+        if p_min > 0.0:
+            smax = scores_row.max()
+            prob = 1.0 / np.sum(np.exp(scores_row - smax))
+            if prob < p_min:
+                break
+
+        tokens.append(int(cand_t[b]))
+        pred_idx = b
+        P = cand_t
+    return tokens, score_matrices
+
+
 def draft_round(
     weights: DFlash2Weights,
     target: TargetProvider,
@@ -572,6 +619,15 @@ def draft_round(
 
         q = rmsnorm(q, w.attn_q_norm, cfg.rms_eps)
         k = rmsnorm(k, w.attn_k_norm, cfg.rms_eps)
+        if capture_layer0 and il == 0:
+            # Pre-rope q/k (post q_norm/k_norm). Dumped so a port's standalone rope kernel has a
+            # real (input, position, output) triple from this reference to check against -- without
+            # it the only fixture-side rope anchor was a post-rope tensor whose own input was never
+            # saved, forcing a port to inverse-rotate the output with its own convention first
+            # (which can only ever prove the port is self-consistent). See docs/dflash2.md's
+            # "Kernels" subsection, r4dx_rope_neox_bf16.
+            inter["attn_q_prerope_l0"] = q.copy()
+            inter["attn_k_prerope_l0"] = k.copy()
         q = rope_neox(q, pos, cfg.rope_theta, cfg.head_dim)
         k = rope_neox(k, pos, cfg.rope_theta, cfg.head_dim)
 
@@ -584,11 +640,35 @@ def draft_round(
         scale = 1.0 / np.sqrt(cfg.head_dim)
         attn_out = attention_gqa(q, full_k, full_v, mask, scale)
         o = linear(attn_out, w.attn_output)
+        if capture_layer0 and il == 0:
+            inter["attn_o_preconv_l0"] = o.copy()
         o = dflash2_conv(o, dyn_attn, w.attn_conv_base, side=1, group_size=cfg.conv_group_size)
 
         if capture_layer0 and il == 0:
+            # NOTE on the two historical names: `attn_conv_in_l0` is the side-0 conv's OUTPUT
+            # (h_conv, i.e. the tensor going INTO attention) and `attn_conv_out_l0` is the side-1
+            # conv's OUTPUT. Neither is a conv INPUT, so neither alone lets a port drive the fused
+            # conv kernel. The four arrays added below close that gap: `attn_conv_x_l0` (side-0
+            # input), `attn_o_preconv_l0` (side-1 input, captured above), `attn_dyn_l0` (the shared
+            # dynamic projection both sides read) and `attn_conv_base_l0` (this layer's base
+            # weight) -- with them, side 0 is (attn_conv_x_l0, dyn, base) -> attn_conv_in_l0 and
+            # side 1 is (attn_o_preconv_l0, dyn, base) -> attn_conv_out_l0. The names of the two
+            # pre-existing arrays are deliberately NOT changed (they are asserted by name in
+            # dflash2_selftest.py and referenced by docs/dflash2.md section 9).
             inter["attn_conv_in_l0"] = h_conv.copy()
             inter["attn_conv_out_l0"] = o.copy()
+            inter["attn_conv_x_l0"] = h.copy()
+            inter["attn_dyn_l0"] = dyn_attn.copy()
+            inter["attn_conv_base_l0"] = w.attn_conv_base.copy()
+            # Post-rope block q/k and raw v, plus the pure attention output (pre-Wo). Together with
+            # `injected_k_l0`/`injected_v_l0` (the 40-position store) and `n_injected`, this is a
+            # complete, self-contained input/output pair for a standalone non-causal windowed GQA
+            # attention kernel -- see docs/dflash2.md's "Kernels" subsection,
+            # r4dx_dflash_attn_bf16.
+            inter["attn_q_l0"] = q.copy()
+            inter["attn_k_l0"] = k.copy()
+            inter["attn_v_l0"] = v.copy()
+            inter["attn_out_l0"] = attn_out.copy()
 
         x = x + o
         inter[f"x_post_attn_l{il}"] = x.copy()
@@ -621,32 +701,9 @@ def draft_round(
     W_succ = weights.selector_successor[:vocab]
     W_pred = weights.selector_predecessor[:vocab]
 
-    tokens: list[int] = []
-    P = np.array([anchor_id], dtype=np.int64)
-    pred_idx = 0
-    score_matrices: dict[int, np.ndarray] = {}
-    for t in range(1, block_size):
-        cand_t = cand[t]
-        unary_t = unary[t]
-        gate_t = gate_vec[t]
-        succ = W_succ[cand_t]  # [top_k, rank]
-        pred = W_pred[P]  # [n_pred, rank]
-        cond = pred * gate_t[None, :]  # [n_pred, rank]
-        score = cond @ succ.T + unary_t[None, :]  # [n_pred, top_k] == score[a,b]
-        score_matrices[t] = score.copy()
-
-        scores_row = score[pred_idx]  # [top_k]
-        b = int(np.argmax(scores_row))
-
-        if p_min > 0.0:
-            smax = scores_row.max()
-            prob = 1.0 / np.sum(np.exp(scores_row - smax))
-            if prob < p_min:
-                break
-
-        tokens.append(int(cand_t[b]))
-        pred_idx = b
-        P = cand_t
+    tokens, score_matrices = selector_walk(
+        W_succ, W_pred, cand, unary, gate_vec, anchor_id, block_size, p_min
+    )
 
     inter["score_matrices"] = score_matrices
     inter["drafted_tokens"] = np.array(tokens, dtype=np.int64)
@@ -756,6 +813,28 @@ def gen_fixture_a(weights: DFlash2Weights, out_root: Path, seed: int = 0) -> dic
     manifest["arrays"]["attn_conv_out_l0"] = _save_npy(
         out_dir, "attn_conv_out_l0", result.intermediates["attn_conv_out_l0"]
     )
+    # Layer-0 device-kernel drive arrays (docs/dflash2.md "Kernels"): the conv's own two INPUTS +
+    # dyn + base, the block's post-rope q/k/v and pre-rope q/k, the pure attention output, and the
+    # final output_norm weight. ~1 MB total, well inside this directory's 60 MB budget; each one
+    # exists so a standalone HIP kernel can be driven from this reference's real numbers instead of
+    # only from a CPU re-implementation of the same formulas.
+    for _name in (
+        "attn_conv_x_l0",
+        "attn_dyn_l0",
+        "attn_conv_base_l0",
+        "attn_o_preconv_l0",
+        "attn_q_prerope_l0",
+        "attn_k_prerope_l0",
+        "attn_q_l0",
+        "attn_k_l0",
+        "attn_v_l0",
+        "attn_out_l0",
+    ):
+        manifest["arrays"][_name] = _save_npy(out_dir, _name, result.intermediates[_name])
+    manifest["arrays"]["output_norm_w"] = _save_npy(out_dir, "output_norm_w", weights.output_norm)
+    manifest["x_final_normed_rms_eps"] = cfg.rms_eps
+    manifest["x_final_normed_source"] = "x_post_ffn_l4"
+    manifest["x_final_normed_weight"] = "output_norm_w"
     manifest["arrays"]["x_final_normed"] = _save_npy(out_dir, "x_final_normed", result.intermediates["x_final_normed"])
     manifest["arrays"]["logits"] = _save_npy(out_dir, "logits", result.intermediates["logits"])
     manifest["arrays"]["cand"] = _save_npy(out_dir, "cand", result.intermediates["cand"])
@@ -893,14 +972,52 @@ def gen_fixture_c(weights: DFlash2Weights, out_root: Path, seed: int = 0, p_min:
 # --------------------------------------------------------------------------------------------
 
 
+def _load_real_dump(path: Path) -> dict:
+    """Accepts EITHER form of a real-capture dump.
+
+    1. The `.npz` `docs/dflash2.md` section 8 documents (keys: features, anchor_id, optional
+       n_injected/positions) -- unchanged, for a Python producer.
+    2. A DIRECTORY (or the `manifest.json` inside one) written by
+       `tests/model/tool_dflash_probe.cpp`: `features.bin`, raw little-endian float32 in C order,
+       plus a `manifest.json` recording `features_shape`/`features_dtype`/`anchor_id`/`n_injected`
+       (schema `dflash2_real_dump_v1`). A C++ tool has no npz writer and adding one there would be a
+       zip implementation; a raw blob plus the shape is the whole difference.
+    """
+    if path.is_dir() or path.suffix == ".json":
+        man_path = (path / "manifest.json") if path.is_dir() else path
+        with open(man_path, "r", encoding="utf-8") as f:
+            man = json.load(f)
+        dtype = man.get("features_dtype", "float32")
+        if dtype != "float32":
+            raise ValueError(f"{man_path}: only float32 features are supported, got {dtype}")
+        shape = tuple(int(d) for d in man["features_shape"])
+        feats = np.fromfile(man_path.parent / man.get("features_file", "features.bin"),
+                            dtype=np.float32)
+        if feats.size != shape[0] * shape[1]:
+            raise ValueError(
+                f"{man_path}: features.bin holds {feats.size} floats, manifest says {shape}"
+            )
+        out = {"features": feats.reshape(shape), "anchor_id": int(man["anchor_id"])}
+        if "n_injected" in man:
+            out["n_injected"] = int(man["n_injected"])
+        if "positions" in man:
+            out["positions"] = np.asarray(man["positions"], dtype=np.int64)
+        return out
+    data = np.load(path)
+    return {k: data[k] for k in data.files}
+
+
 def run_real(weights: DFlash2Weights, npz_path: Path, target_dir: Path, p_min: float) -> None:
-    """docs/dflash2.md "npz schema" documents the expected keys."""
-    data = np.load(npz_path)
-    features = data["features"].astype(np.float32)
+    """docs/dflash2.md "npz schema" documents the expected keys; see _load_real_dump for the
+    equivalent raw-.bin + manifest.json directory form a C++ producer writes."""
+    data = _load_real_dump(npz_path)
+    features = np.asarray(data["features"]).astype(np.float32)
     anchor_id = int(data["anchor_id"])
     n_injected = int(data["n_injected"]) if "n_injected" in data else features.shape[0]
     positions = (
-        data["positions"].astype(np.int64) if "positions" in data else np.arange(n_injected, dtype=np.int64)
+        np.asarray(data["positions"]).astype(np.int64)
+        if "positions" in data
+        else np.arange(n_injected, dtype=np.int64)
     )
 
     target = RealTarget(target_dir)
@@ -913,6 +1030,89 @@ def run_real(weights: DFlash2Weights, npz_path: Path, target_dir: Path, p_min: f
     cand = result.intermediates["cand"]
     for t in range(weights.cfg.block_size):
         print(f"  block pos {t}: top-{weights.cfg.selector_top_k} = {cand[t].tolist()}")
+
+    if npz_path.is_dir():
+        _compare_with_port(weights, npz_path, result, anchor_id, p_min)
+
+
+def _rel_l2(got: np.ndarray, ref: np.ndarray) -> float:
+    got = np.asarray(got, dtype=np.float64).ravel()
+    ref = np.asarray(ref, dtype=np.float64).ravel()
+    return float(np.linalg.norm(got - ref) / max(1e-30, np.linalg.norm(ref)))
+
+
+def _compare_with_port(
+    weights: DFlash2Weights, dump_dir: Path, result: DraftRoundResult, anchor_id: int, p_min: float
+) -> None:
+    """Compare this reference's round against the port's own round over the SAME real features.
+
+    The port (`tests/model/tool_dflash_probe.cpp`) optionally writes its own `x_final_normed.bin`,
+    `gate.bin`, `cand.bin`, `unary.bin` and `drafted_tokens` beside the features it dumped. When
+    they are present this prints, in order: how far apart the two DRAFTERS are (`x_final_normed`,
+    `gate` -- these involve no lm_head at all, so they isolate everything docs/dflash2.md specifies);
+    how far apart the two TARGETS' lm_heads are (`cand`/`unary`, which the port computes through the
+    container's 4-bit lm_head while this reference uses the checkpoint's fp32 one); and then two
+    HYBRID walks that attribute any chain divergence to one side or the other.
+    """
+    with open(dump_dir / "manifest.json", "r", encoding="utf-8") as f:
+        man = json.load(f)
+    cfg = weights.cfg
+    B, topk, rank = cfg.block_size, cfg.selector_top_k, cfg.selector_rank
+
+    def load(name: str, dtype, shape):
+        p = dump_dir / name
+        if not p.exists():
+            return None
+        return np.fromfile(p, dtype=dtype).reshape(shape)
+
+    port_xf = load("x_final_normed.bin", np.float32, (B, cfg.n_embd))
+    port_gate = load("gate.bin", np.float32, (B, rank))
+    port_cand = load("cand.bin", np.int32, (B, topk))
+    port_unary = load("unary.bin", np.float32, (B, topk))
+    port_tokens = man.get("drafted_tokens")
+    if port_xf is None and port_gate is None and port_cand is None:
+        print("(no port-side tensors in this dump -- nothing to compare)")
+        return
+
+    print("\n--- port vs reference, same real features ---")
+    if port_xf is not None:
+        print(f"  x_final_normed RelL2 = {_rel_l2(port_xf, result.intermediates['x_final_normed']):.3e}"
+              "   [drafter only: no lm_head involved]")
+    if port_gate is not None:
+        print(f"  gate           RelL2 = {_rel_l2(port_gate, result.intermediates['gate']):.3e}"
+              "   [drafter only: x_final @ selector_hidden]")
+    if port_cand is not None:
+        ref_cand = result.intermediates["cand"]
+        exact = int((port_cand.astype(np.int64) == ref_cand).sum())
+        overlap = sum(int(np.isin(port_cand[t], ref_cand[t]).sum()) for t in range(B))
+        print(f"  cand  exact-position {exact}/{B * topk}, set-overlap {overlap}/{B * topk}"
+              "   [lm_head: port uses the container's 4-bit head, this uses the checkpoint's fp32 one]")
+    if port_unary is not None:
+        print(f"  unary          RelL2 = {_rel_l2(port_unary, result.intermediates['unary']):.3e}")
+
+    if port_tokens is not None:
+        same = list(port_tokens) == list(result.tokens)
+        print(f"  chain: port {list(port_tokens)}\n         ref  {list(result.tokens)}"
+              f"   -> {'IDENTICAL' if same else 'DIFFERENT'}")
+        if not same and port_cand is not None and port_gate is not None:
+            vocab = result.intermediates["logits"].shape[1]
+            W_succ = weights.selector_successor[:vocab]
+            W_pred = weights.selector_predecessor[:vocab]
+            hyb_lmhead, _ = selector_walk(
+                W_succ, W_pred, port_cand.astype(np.int64), port_unary,
+                result.intermediates["gate"], anchor_id, B, p_min
+            )
+            hyb_drafter, _ = selector_walk(
+                W_succ, W_pred, result.intermediates["cand"], result.intermediates["unary"],
+                port_gate, anchor_id, B, p_min
+            )
+            print(f"  attribution (which side moves the chain):")
+            print(f"    port's cand/unary + REFERENCE gate  -> {hyb_lmhead}"
+                  f"  {'== port' if hyb_lmhead == list(port_tokens) else ''}")
+            print(f"    reference cand/unary + PORT gate    -> {hyb_drafter}"
+                  f"  {'== reference' if hyb_drafter == list(result.tokens) else ''}")
+            print("    (a hybrid that reproduces the PORT's chain from the port's cand alone means "
+                  "the divergence is the lm_head's precision, not the drafter's.)")
 
 
 # --------------------------------------------------------------------------------------------
@@ -931,7 +1131,10 @@ def main() -> None:
     ap.add_argument("--anchor-id", type=int, default=1)
     ap.add_argument("--n-injected", type=int, default=40)
     ap.add_argument("--p-min", type=float, default=0.0)
-    ap.add_argument("--real", type=Path, default=None, help="npz of real captured target features")
+    ap.add_argument("--real", type=Path, default=None,
+                    help="real captured target features: either the .npz of docs/dflash2.md "
+                         "section 8, or a directory holding features.bin + manifest.json as "
+                         "tests/model/tool_dflash_probe.cpp writes")
     ap.add_argument("--target-dir", type=Path, default=DEFAULT_TARGET_DIR)
     args = ap.parse_args()
 

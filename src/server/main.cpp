@@ -48,6 +48,10 @@ int main(int argc, char** argv) {
                                          : std::nullopt;
   opts.model_opts.embed_device_resident = (args.embed_device_resident != "off");
   opts.model_opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
+  opts.model_opts.dflash_container = args.dflash;
+  opts.model_opts.dflash_draft_k = args.dflash.empty() ? 0 : args.dflash_k;
+  opts.dflash_p_min = args.dflash_p_min;
+  opts.dflash_n_min = args.dflash_n_min;
   opts.tokenizer_dir = args.tokenizer_dir;
   opts.max_tokens_default = args.max_tokens_default;
   opts.max_queue = args.max_queue;

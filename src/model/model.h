@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -23,6 +24,7 @@
 #include <memory>
 
 #include "container.h"
+#include "dflash_draft.h"
 #include "gdn_state.h"
 #include "model_config.h"
 #include "mtp_head.h"
@@ -72,11 +74,17 @@ struct ModelOptions {
   // lm_head regardless of this flag, so a draft the reduced head could not have produced (its own
   // subset omitted the correct token) is simply a rejected draft -- lower acceptance at high K,
   // never a wrong ACCEPTED token (see MtpHead::Draft's own doc comment for the full argument).
-  // Default true: use the reduced head whenever the container has one (Container::Mtp().
-  // HasDraftHead()); has zero effect on a container converted without --draft-vocab-ids. Set false
-  // (CLI/server: `--mtp-draft-head full`) to force the exact-full-vocab draft head for an A/B
-  // acceptance/tok-s comparison against the reduced head at matched K (docs/r9700.md task item 5).
-  bool mtp_draft_reduced_vocab = true;
+  // Default false (flipped 2026-09-20, Milestone 5 B2 item 8 + this review's fix -- was true):
+  // M4 measured the reduced head SLOWER at its own best K than the full head at ITS own best K
+  // (docs/mtp.md's "reduced-vocab draft head" K-sweep: 53.35 vs 65.02 tok/s) and this review's
+  // matched-K=3 re-measurement confirms it at fixed K too (docs/mtp.md's "Flag default flipped"
+  // note: 53.59/54.17 vs 68.20/68.64 tok/s, byte-identical generated text either way -- the flip
+  // changes only speed, never correctness). Use the reduced head only by explicitly setting this true
+  // (CLI/server: `--mtp-draft-head reduced`) once a higher-coverage calibration corpus (docs/mtp.md
+  // "Known gaps") is measured and shown to beat the full head; has zero effect on a container
+  // converted without --draft-vocab-ids, or (silently) when the container has no
+  // mtp.draft_head.* tensors (Container::Mtp().HasDraftHead()).
+  bool mtp_draft_reduced_vocab = false;
   // Device-resident draft loop (docs/mtp.md "device-resident draft loop", docs/r9700.md P3):
   // mirror text.embed_tokens into VRAM (~2.37-2.54 GiB bf16, depending on vocab/hidden -- see
   // docs/status.md's VRAM correction note for the measured delta) so the decode/draft path can
@@ -87,6 +95,29 @@ struct ModelOptions {
   // (src/server/server_args.h) -- added 2026-09-20 (review finding: this doc comment promised the
   // escape hatch before either binary actually implemented it).
   bool embed_device_resident = true;
+  // DFlash2 self-speculation (docs/dflash2.md): the largest number of DFlash2 draft tokens a
+  // caller will ever verify in one VerifyWindow() call on this Model. Purely a SIZING knob -- it
+  // allocates nothing of the drafter itself (that is r4dx::model::DflashDraft, a separate object
+  // loaded from its own container), it only tells this Model how wide a speculative verify window
+  // to size its GDN window bank and per-position logits/argmax scratch for, exactly as
+  // `mtp_draft_k` does for MTP. The two are independent: the actual window capacity is
+  // `1 + max(mtp_draft_k, dflash_draft_k)` (see Model::draft_window_), so a DFlash2 run needs no
+  // MTP head at all and an MTP run is byte-identical to before this field existed. DFlash2's block
+  // is 8 wide with the anchor at position 0, so the useful maximum here is 7.
+  int64_t dflash_draft_k = 0;
+  // Stage S3 (docs/dflash2.md section 7 item 5, "wire the drafter into generation"): path to a
+  // DFlash2 draft container (docs/container-format.md "DFlash2 draft container"). Empty (default)
+  // means no drafter -- Model behaves exactly as before this field existed. Non-empty requires
+  // `dflash_draft_k > 0` (there is no point loading a drafter this Model's own verify window can
+  // never accommodate) and `mtp_draft_k == 0` (docs/dflash2.md: DFlash2 and MTP are mutually
+  // exclusive self-speculation families -- CLI/server also reject the combination up front, but
+  // Model::Load re-checks it here so no caller can bypass the CLI/server layer and load both).
+  // The container's own packed layout (its `__metadata__.dflash2.layout` field) is read directly
+  // from the file and used to select which `<tensor>.{layout}.*` names to load -- this field does
+  // NOT need to match ModelOptions::layout (the TARGET body's layout): a w4a16 target may run
+  // against a bf16, w4a16, w4a8 or mxfp4 DFlash2 draft container, independently, exactly like the
+  // draft's own weights are a completely separate set of tensors from the target's.
+  std::string dflash_container;
 };
 
 class Model {
@@ -134,7 +165,23 @@ class Model {
   // Prefill/DecodeStep call on this same Model (chunked-prefill's has_init/start_pos bookkeeping
   // handles the boundary correctly either way). Returns fp32 logits[vocab] for the token that
   // follows the prompt's last token.
-  std::vector<float> Prefill(const std::vector<int32_t>& token_ids);
+  //
+  // `on_chunk_captured`, if non-null, is invoked once per internal RunChunk call (in chunk order),
+  // AFTER that chunk has run and BEFORE the next chunk's RunChunk call overwrites DflashFeatureBuffer
+  // / DflashFeatureRows() -- review finding, 2026-09-20: a capture attached via
+  // AttachDflashFeatureCapture() and left to a plain Prefill() call with no drain hook would only
+  // ever survive with the LAST <=64-token chunk's rows, silently discarding every earlier chunk's
+  // features, because dflash_features_dev_ is sized max_chunk_ rows (not max_ctx -- a max_ctx-sized
+  // capture buffer would cost gigabytes of VRAM per attached target layer, see
+  // AttachDflashFeatureCapture's own doc comment) and every RunChunk call rewrites it starting at
+  // row 0. A DFlash2 caller that needs every prefilled position's features (docs/dflash2.md) MUST
+  // pass this callback and drain DflashFeatureBuffer()/DflashFeatureRows() inside it (e.g. inject
+  // that chunk's rows into the draft's own KV store) before returning; a caller with no capture
+  // attached, or one that only cares about the tail chunk, may pass nullptr (the default) exactly as
+  // before -- zero cost, byte-identical to pre-this-fix behavior (a null std::function is a single
+  // pointer compare per chunk, never invoked).
+  std::vector<float> Prefill(const std::vector<int32_t>& token_ids,
+                              const std::function<void()>& on_chunk_captured = nullptr);
 
   // Feeds one more token through the model, continuing state from the previous Prefill/DecodeStep
   // call. Returns fp32 logits[vocab] for the token that follows `token_id`.
@@ -240,7 +287,21 @@ class Model {
   // DecodeStepGreedy instead, which is cheaper and untouched by any of this).
   std::vector<int32_t> DecodeStepMtpGreedy(int32_t token_id, int64_t k);
 
-  // Runs the real model over `candidates` (1..mtp_draft_k+1 tokens, is_prefill_path=false, the
+  // Largest speculative-verify window this Model was sized for: 1 + max(mtp_draft_k,
+  // dflash_draft_k) (ModelOptions). VerifyWindow accepts up to this many candidate rows.
+  int64_t DraftWindow() const { return draft_window_; }
+
+  // Commits `num_committed` (1..DraftWindow()) rows of the window the most recent VerifyWindow()
+  // call ran -- the piece DecodeStepMtpGreedy does inline for MTP, exposed for a drafter that owns
+  // its own round loop (DFlash2, docs/dflash2.md section 5 steps 4-5). Advances pos_ by exactly
+  // that many positions and threads the count into the NEXT GDN decode/verify call's window-bank
+  // seed (gdn_state.h's file comment), which is what keeps GDN state in step with the real
+  // committed sequence. Deliberately does NOT touch mtp_seed_hidden_: a DFlash2 driver has no MTP
+  // head, and a Model that has BOTH would be re-seeding MTP from a window this call knows nothing
+  // about. Must be called at most once per VerifyWindow() call.
+  void CommitVerifiedWindow(int64_t num_committed);
+
+  // Runs the real model over `candidates` (1..DraftWindow() tokens, is_prefill_path=false, the
   // same speculative-verify decode path DecodeStepMtpGreedy uses) and returns the greedy argmax
   // token predicted at EVERY position, WITHOUT committing any state: pos_ is not advanced and
   // mtp_num_accepted_dev_/mtp_seed_hidden_ are not updated (DecodeStepMtpGreedy does both once it
@@ -249,9 +310,13 @@ class Model {
   // per-position logits against sequential DecodeStep's own logits -- not just DecodeStepMtpGreedy's
   // argmax-only return value. `logits_out`, if non-null, is resized to
   // candidates.size()*Config().vocab_size and filled with this call's flat [T,vocab] fp32 logits
-  // (an extra D2H a normal (non-test) caller does not need -- nullptr skips it). Requires
-  // MtpEnabled() (the GDN state window bank and mtp_logits_dev_/mtp_argmax_dev_ scratch this needs
-  // are only sized when mtp_draft_k>0).
+  // (an extra D2H a normal (non-test) caller does not need -- nullptr skips it).
+  //
+  // Requires DraftWindow() > 1, i.e. this Model was Load()'d with mtp_draft_k > 0 OR
+  // dflash_draft_k > 0 -- the GDN state window bank and the verify_logits_dev_/verify_argmax_dev_
+  // scratch this needs are only sized then. An MTP head is NOT required (generalised for DFlash2,
+  // which verifies through this same path with no mtp.* weights anywhere in the container); MTP's
+  // own behaviour at a given mtp_draft_k is byte-identical to before that generalisation.
   std::vector<int32_t> VerifyWindow(const std::vector<int32_t>& candidates,
                                      std::vector<float>* logits_out = nullptr);
 
@@ -264,6 +329,118 @@ class Model {
   // bf16 values (10 KB), cheap enough to call after every Prefill/DecodeStep in a diagnostic tool
   // without perturbing anything it measures.
   std::vector<uint16_t> DebugSeedHiddenBf16() const;
+
+  // ---- DFlash2 target feature capture (docs/dflash2.md "Implementation", Milestone 5 B1 item 1)
+  // ------------------------------------------------------------------------------------------
+  // Attaches (or replaces) a DFlash2 feature-capture hook: every subsequent RunChunk (prefill
+  // chunk or plain decode step) and VerifyWindow call copies the residual stream AS IT ENTERS
+  // layer L, for every L in `target_layers` (0-based, sorted ascending, each < NumLoadedLayers()),
+  // into a device buffer laid out [rows][target_layers.size()*hidden] bf16, column order matching
+  // `target_layers`'s own order -- directly the DFlash2 encoder's expected input activation
+  // (docs/dflash2.md section on FEATURES). `target_layers` empty is equivalent to Detach().
+  // Cost when attached: exactly `target_layers.size()` hipMemcpy2DAsync device-to-device strided
+  // copies per call (no host sync, no new kernel launch -- so
+  // r4dx::kernels::r4dx_kernel_launch_counter_get() is unaffected either way). Cost when never
+  // attached (the default, and every existing caller/test): a single `.empty()` check per layer
+  // per call, no allocation, no copy, byte-identical to pre-B1 behavior.
+  //
+  // PRECONDITION (review finding, 2026-09-20): only call this (or DetachDflashFeatureCapture) when
+  // this Model's stream is idle -- i.e. right after construction/Reset(), or after a prior
+  // Prefill/DecodeStep*/VerifyWindow call has returned (every one of those already ends with a
+  // stream_.Synchronize() before returning, per their own comments), never from inside a
+  // Prefill on_chunk_captured callback or any other point where a RunChunk/VerifyWindow call could
+  // still have stream-ordered work in flight. Both methods resize/free dflash_features_dev_
+  // (core::DeviceBuffer::Resize -> hipFree, not stream-ordered), and any pointer previously returned
+  // by DflashFeatureBuffer() is invalidated by either call -- do not retain it across an
+  // Attach/Detach call.
+  void AttachDflashFeatureCapture(std::vector<int64_t> target_layers);
+  void DetachDflashFeatureCapture();
+  bool DflashFeatureCaptureAttached() const { return !dflash_target_layers_.empty(); }
+  // Valid until the NEXT RunChunk/VerifyWindow call overwrites it (same lifetime convention as
+  // mtp_last_hidden_ above). Rows == the T of whichever RunChunk/VerifyWindow call last ran
+  // (<=64 for a prefill chunk, <=mtp_draft_k_+1 for a verify window, 1 for plain decode).
+  // UNDEFINED (do not read) after Reset() and before the next RunChunk/VerifyWindow call of the new
+  // sequence: Reset() zeroes DflashFeatureRows() to 0 precisely so a caller cannot mistake the
+  // previous sequence's stale buffer contents for the new sequence's -- see Reset()'s own comment.
+  const uint16_t* DflashFeatureBuffer() const { return dflash_features_dev_.data(); }
+  // 0 immediately after Load()/Reset(), before this Model has run any RunChunk/VerifyWindow call
+  // for the current sequence.
+  int64_t DflashFeatureRows() const { return dflash_feature_rows_; }
+  int64_t DflashFeatureCols() const {
+    return static_cast<int64_t>(dflash_target_layers_.size()) * Config().hidden_size;
+  }
+  const std::vector<int64_t>& DflashTargetLayers() const { return dflash_target_layers_; }
+
+  // Per-RunChunk capture observer (review finding, 2026-09-20; generalises the narrower
+  // `Prefill(..., on_chunk_captured)` drain hook below). When a capture is attached AND an observer
+  // is set, it is invoked once at the end of EVERY RunChunk call -- every prefill chunk AND every
+  // plain decode step, in order, after that chunk's captured rows are complete on the device and
+  // BEFORE the next call overwrites `dflash_features_dev_` at row 0 again. Arguments: the capture
+  // buffer, the number of rows this call filled, and the ABSOLUTE sequence position of row 0.
+  //
+  // This is the hook a DFlash2 driver actually wants: `dflash_features_dev_` is sized `max_chunk_`
+  // rows, not `max_ctx` (a max_ctx-sized capture would cost gigabytes of VRAM per attached target
+  // layer), so without it a >64-token prompt silently loses every chunk's features but the last,
+  // and a plain decode step's single captured row is likewise lost before the next step.
+  // The observer may enqueue device work: RunChunk has already synchronised its own stream by the
+  // time it runs, so both a same-stream and a separate-stream consumer are safe.
+  //
+  // VerifyWindow deliberately does NOT invoke it. A verify window's rows are CANDIDATES, most of
+  // which may be rejected; only the accepted prefix may ever be injected into a drafter's store
+  // (docs/dflash2.md section 5 step 4), and only the driver knows how many that is -- so the driver
+  // reads DflashFeatureBuffer()/DflashFeatureRows() itself after VerifyWindow returns.
+  using DflashCaptureObserver =
+      std::function<void(const uint16_t* features, int64_t rows, int64_t start_pos)>;
+  void SetDflashCaptureObserver(DflashCaptureObserver observer) {
+    dflash_observer_ = std::move(observer);
+  }
+  void ClearDflashCaptureObserver() { dflash_observer_ = nullptr; }
+
+  // ---- DFlash2 self-speculative decode (docs/dflash2.md section 7 item 3) -----------------------
+  // True iff this Model was Load()'d with a non-empty ModelOptions::dflash_container (and therefore
+  // owns its own r4dx::model::DflashDraft, auto-fed by every RunChunk call -- see RunChunk's own
+  // comment for the internal-vs-external-observer split).
+  bool DflashEnabled() const { return dflash_.has_value(); }
+
+  // The DFlash2 analogue of DecodeStepMtpGreedy, returning the SAME round-vector contract (1..k+1
+  // committed tokens: 0..k accepted drafts followed by exactly one correction/bonus token) so
+  // mtp_round.hpp's ProcessMtpRound and the CLI/server round loops plug in unchanged -- see that
+  // header's file comment, which is already speculation-family-agnostic despite its name.
+  //
+  // Sequence (docs/dflash2.md section 5, section 7 item 3): DraftRound anchored at `token_id` ->
+  // candidates [token_id, d1..dm] (m = however many the walk actually produced, 0..k) ->
+  // VerifyWindow (<=8 rows) -> accepted `a` rows (the anchor is always accepted; a = 1 +
+  // (longest confirmed draft prefix)) -> InjectFeatures the accepted prefix's own just-captured
+  // target features (VerifyWindow's DflashFeatureBuffer()/DflashFeatureRows(), rows 0..a-1) at the
+  // drafter's current InjectedCount() -> CommitVerifiedWindow(a) (advances pos_, threads GDN
+  // acceptance exactly like MTP's own commit). The candidate block's own K/V is scratch inside
+  // DflashDraft (never written to its ring), so a rejected suffix needs no rollback there, and
+  // Model::VerifyWindow's own KV-rollback-via-position-overwrite already covers the target's KV/GDN
+  // state -- same guarantee DecodeStepMtpGreedy already relies on.
+  //
+  // `token_id`: the last already-accepted real token (same convention as DecodeStep/
+  // DecodeStepMtpGreedy). `k`: caps how many tokens DraftRound's walk may emit, 0..dflash_draft_k_
+  // (the value Load() was given). `p_min`/`n_min`: DflashDraft::DraftRound's own early-stop/discard
+  // gates (docs/dflash2.md section 4.3), <=0 disables either. Requires DflashEnabled().
+  // `walk_len_out`, if non-null, is set to this round's OWN DflashDraftResult::walk_len -- how many
+  // tokens the selector walk itself produced BEFORE verification (0..k), which unlike MTP's `k` is
+  // not a constant every round (p_min/n_min can stop it early) -- a caller computing an acceptance
+  // rate (accepted/offered) needs this per-round figure, not just `k`, to report it correctly. Does
+  // not change the returned round vector's own contract at all.
+  // `trace_out`, if non-null, is forwarded straight to the internal DflashDraft::DraftRound call
+  // (diagnostics only -- costs one extra D2H + sync per round, same as DraftRound's own `trace`
+  // param). `drafted_tokens_out`, if non-null, is set to DraftRound's own RAW drafted-token chain
+  // (BEFORE verification/acceptance) -- distinct from this method's own return value, which is the
+  // POST-verify committed round. Review finding (2026-09-21, item 5): these two are what let a
+  // diagnostic tool compare the WIRED drafter (this Model's own internal dflash_, fed by RunChunk's
+  // real capture hook) against the Python reference exactly the way
+  // tests/model/tool_dflash_probe.cpp's original (external-observer, separately-owned DflashDraft)
+  // mode already did -- dflash2_ref.py --real's `_compare_with_port` reads both the trace's tensors
+  // and the raw `drafted_tokens` from the dump it produces.
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min,
+                                                int64_t n_min, int64_t* walk_len_out = nullptr,
+                                                DflashRoundTrace* trace_out = nullptr,
+                                                std::vector<int32_t>* drafted_tokens_out = nullptr);
 
  private:
   Model() = default;
@@ -337,7 +514,12 @@ class Model {
   // ---- MTP self-speculation (docs/mtp.md), all empty/unused when mtp_draft_k==0 -----------------
   std::optional<MtpHead> mtp_;
   int64_t mtp_draft_k_ = 0;
-  bool mtp_draft_reduced_vocab_ = true;  // ModelOptions::mtp_draft_reduced_vocab, copied at Load()
+  int64_t dflash_draft_k_ = 0;  // ModelOptions::dflash_draft_k, copied at Load()
+  // 1 + max(mtp_draft_k_, dflash_draft_k_): the widest speculative-verify window this Model's GDN
+  // window bank and verify scratch were sized for, and the bound VerifyWindow enforces. 1 (no
+  // speculation) makes every decode path degenerate exactly to the pre-speculation behaviour.
+  int64_t draft_window_ = 1;
+  bool mtp_draft_reduced_vocab_ = false;  // ModelOptions::mtp_draft_reduced_vocab, copied at Load()
   // The main model's own pre-final-norm hidden state at the row that produced the CURRENT
   // "last-accepted-token"'s own logits -- exactly what MtpHead::Draft's h_seed needs (see that
   // class's file comment), AND exactly the "boundary" h_i MtpHead::PrimeKv needs to prime the ONE
@@ -355,10 +537,11 @@ class Model {
   // drafting.
   core::DeviceBuffer<int32_t> mtp_num_accepted_dev_;
   bool mtp_num_accepted_valid_ = false;
-  // Scratch for VerifyWindow (below): logits for up to (mtp_draft_k_+1) candidate positions at
-  // once, plus one argmax result per position.
-  core::DeviceBuffer<float> mtp_logits_dev_;      // [(draft_k+1) * vocab]
-  core::DeviceBuffer<int32_t> mtp_argmax_dev_;    // [draft_k+1]
+  // Scratch for VerifyWindow: logits for up to draft_window_ candidate positions at once, plus one
+  // argmax result per position. Shared by both speculation families (MTP and DFlash2) -- the verify
+  // pass is identical for either draft source (docs/dflash2.md section 7 item 5).
+  core::DeviceBuffer<float> verify_logits_dev_;    // [draft_window_ * vocab]
+  core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [draft_window_]
   // Non-owning: whichever of buf_a_/buf_b_ the most recent VerifyWindow() call left its final
   // per-position hidden states in (which one depends on how many full-attention layers ran, so it
   // is not knowable statically) -- valid only until the NEXT RunChunk/VerifyWindow call's own
@@ -366,6 +549,20 @@ class Model {
   // right after VerifyWindow returns, before anything else touches buf_a_/buf_b_.
   uint16_t* mtp_last_hidden_ = nullptr;
 
+  // ---- DFlash2 target feature capture (see AttachDflashFeatureCapture above) --------------------
+  std::vector<int64_t> dflash_target_layers_;       // empty == capture disabled (the default)
+  core::DeviceBuffer<uint16_t> dflash_features_dev_;  // [max_chunk_, target_layers_.size()*hidden]
+  int64_t dflash_feature_rows_ = 0;  // rows filled by the most recent RunChunk/VerifyWindow call
+  DflashCaptureObserver dflash_observer_ = nullptr;  // see SetDflashCaptureObserver
+
+  // Stage S3: the drafter this Model owns when Load()'d with a non-empty
+  // ModelOptions::dflash_container, nullopt otherwise (the overwhelming common case, byte-identical
+  // to before this field existed). Auto-fed by RunChunk (prefill chunks + plain decode steps) via a
+  // direct member call -- NOT via dflash_observer_ above, which is reserved for a caller that owns
+  // its OWN separate DflashDraft object (e.g. tests/model/tool_dflash_probe.cpp) and would otherwise
+  // have no way to drain a capture Model itself does not know how to consume. VerifyWindow never
+  // auto-injects into this (or any) drafter, by design -- see DecodeStepDflashGreedy.
+  std::optional<DflashDraft> dflash_;
 };
 
 }  // namespace r4dx::model

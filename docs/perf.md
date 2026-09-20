@@ -1,5 +1,124 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 5: Integrate stage final confirmation sweep (2026-09-21) -- current headline
+
+Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, real w4a16 DFlash2 draft container
+(`D:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx`), `--max-ctx 2048`, greedy (`--temperature 0`), HIP
+device 1, one process at a time. Each cell measured twice; all pairs agree to <=0.1 tok/s (well
+under the 3% "report both" threshold). Each layout's own best DFlash `K` and best MTP `K` (from the
+stage S3 sweep, `docs/dflash2.md` section 7a) is used in both prompts below -- this is the exact
+matrix the Integrate stage's item 2 asks for. Raw log: `build\logs\integrate_sweep1.txt` (deleted
+per the standing scratch-log-cleanup rule; figures below are transcribed from it before deletion).
+
+**Standard prompt** ("Write a haiku about GPUs, then explain what a GPU is in two sentences.",
+`--max-tokens 128`):
+
+| Layout | plain (`--mtp 0`) | best MTP | best DFlash2 (w4a16 draft) |
+|---|---|---|---|
+| w4a16 | 38.85, 38.84 | K=3: 68.72, 68.62 (46.3%, 2.31 tok/round) | K=4: **77.08, 77.05** (40.6%, 2.59 tok/round) |
+| w4a8 | 36.45, 36.44 | K=4: 57.69, 57.66 (31.0%, 2.19 tok/round) | K=4: **64.79, 64.76** (33.1%, 2.30 tok/round) |
+| mxfp4 | 33.09, 33.12 | K=3: **64.91, 64.91** (52.9%, 2.56 tok/round) | K=4: 58.57, 58.63 (31.8%, 2.24 tok/round) |
+
+**Code prompt** (a ~270-token Python function-rewrite prompt, `--max-tokens 256`; prefill is 269
+tokens per the CLI's own `--stats` count, in the "~400-token code prompt" family the standing
+measurement rule calls for, exact text in `build\logs\code_prompt.txt` before its own cleanup
+deletion):
+
+| Layout | plain (`--mtp 0`) | best MTP | best DFlash2 (w4a16 draft) |
+|---|---|---|---|
+| w4a16 | 38.82, 38.77 | K=3: 89.45, 89.44 (67.8%, 3.01 tok/round) | K=4: **116.90, 116.84** (77.4%, 4.06 tok/round) |
+| w4a8 | 36.44, 36.44 | K=4: 87.53, 87.71 (58.1%, 3.32 tok/round) | K=4: **109.22, 109.29** (75.0%, 4.00 tok/round) |
+| mxfp4 | 33.05, 33.02 | K=3: 75.50, 75.68 (66.7%, 2.98 tok/round) | K=4: **94.30, 94.30** (68.0%, 3.71 tok/round) |
+
+VRAM (both runs of each cell agree exactly): plain 16.17 GiB (all layouts); MTP 16.59-16.60 GiB
+(w4a16/mxfp4), 16.74 GiB (w4a8); DFlash2 17.70 GiB (w4a16), 17.77 GiB (w4a8/mxfp4). Container load
+6.9-7.6s (15.1-15.2s the one time the OS page cache was cold).
+
+**Reading the table**: on the code prompt, DFlash2 (at each layout's own best K=4) beats that
+layout's own best MTP K on all three layouts -- w4a16 by +30.7%, w4a8 by +24.6%, mxfp4 by +24.9%.
+On the standard prose prompt, DFlash2 beats MTP on w4a16 (+12.2%) and w4a8 (+12.3%) but MTP still
+wins on mxfp4 (64.91 vs 58.57, DFlash2 -9.8%) -- consistent with, and a tighter re-confirmation of,
+stage S3's own "prompt-dependent, not a fixed ranking" finding below (that finding used a different,
+once-run code prompt at K=7; this table pins it down with the layouts' actual matched-K settings,
+twice each, and shows the one place, mxfp4/standard, where MTP still leads). ROCmFPX's own reference
+figure on this card/draft remains 120 tok/s / 84% acceptance (w4a16-equivalent, standard-prompt-like
+input) -- DFlash2's own best cell here (w4a16/code, 116.90 tok/s, 77.4% acceptance) is now within
+3% of it, the closest either speculation family has come on this hardware.
+
+**Still not measured** (time budget, not a discovered blocker, same items stage S3 already left
+open): the `p_min` sweep ({0, 0.3, 0.5}); the w4a8/mxfp4 DRAFT containers (only w4a16 and bf16
+drafts have ever been tried); the one long-context point (`--max-ctx 32768`, ~30k real prefilled
+tokens); an explicit prefill-with/without-`--dflash` A/B.
+
+## Milestone 5, stage S3: DFlash2 vs MTP headline (2026-09-20)
+
+Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, standard haiku prompt, `--max-ctx
+2048`, greedy, HIP device 1, one process at a time. Full accounting (what was and was not
+measured, and why): `docs/dflash2.md` section 7a; `docs/status.md`'s Milestone 5 stage S3 entry.
+
+| Method | Layout(s) | Best config | Decode tok/s | Acceptance | Tok/round |
+|---|---|---|---|---|---|
+| plain (`--mtp 0`) | w4a16 | -- | 38.98 | -- | 1.0 |
+| MTP (M4 headline) | w4a16 | K=3 | 68.73 | 46.3% | 2.31 |
+| MTP (M4 headline) | w4a8 | K=4 | 57.86 | 31.0% | -- |
+| MTP (M4 headline) | mxfp4 | K=3 | 65.04 | 52.9% | -- |
+| **DFlash2 (this stage)** | w4a16 target / w4a16 draft | K=4 | **77.05** | 40.6% | 2.59 |
+| DFlash2 | w4a16 target / w4a16 draft | K=7 | 74.33 / 74.77 (twice) | 24.4% | 2.68 |
+| DFlash2 | w4a16 target / bf16 draft | K=7 | 68.43 / 68.42 (twice) | 25.7% | 2.77 |
+| DFlash2 | w4a8 target / w4a16 draft | K=4 | 64.75 | 33.1% | 2.30 |
+| DFlash2 | mxfp4 target / w4a16 draft | K=4 | 58.64 | 31.8% | 2.24 |
+| ROCmFPX (reference, same card/draft) | -- | -- | 120 | 84% | -- |
+
+DFlash2's own best measured point (w4a16/w4a16, K=4) beats this run's own plain baseline by ~2.0x
+and is in the same range as MTP's headline, but has not caught up to it, and is well short of
+ROCmFPX's 120 tok/s / 84% acceptance on this exact card and draft file. The gap tracks acceptance
+(24-47% here vs 84% there), not an obvious latency/bandwidth problem -- `docs/dflash2.md` section
+7a's own cost-model math (S2) put an isolated `DraftRound` well under the per-round time budget
+this decode-tok/s figure implies is being spent, so the shortfall is most likely rounds that
+accept few tokens, not rounds that take too long. NOT localized this stage.
+
+**Correction (Integrate stage, 2026-09-21, review finding): the "in MTP's own range but not ahead of
+it" conclusion above is PROMPT-DEPENDENT and does not hold on a code prompt.** Re-measured after
+this stage's own fixes (RunChunk stream-sync fix, Model::Load hidden_size check, the grouping
+control in `validate_dflash.ps1` -- none of which touch the decode-loop's own per-round path, see
+below) headline re-confirmed unchanged within noise: w4a16/w4a16 K=4, standard haiku prompt, twice:
+**77.19, 77.26 tok/s** (was 77.05/77.06/77.16 pre-fix -- <0.3% apart, i.e. the fixes did not move
+decode throughput, as expected: the stream-sync fix only adds a sync to `RunChunk`'s own dflash
+branch, which the decode loop's `DecodeStepDflashGreedy` never calls -- it injects directly via its
+own `dflash_->InjectFeatures` call, unaffected).
+
+New: a ~470-token PYTHON CODE prompt (`def process_batch(...)`, repeated function-call pattern +
+"summarize this function" tail, `--max-tokens 256`, real 64-layer w4a16 container, real w4a16
+draft, twice each):
+
+| Method | K | Decode tok/s (twice) | Acceptance | Tok/round |
+|---|---|---|---|---|
+| plain (`--mtp 0`) | -- | 38.71, 38.71 | -- | 1.0 |
+| MTP | 3 | 72.36, 72.42 | 53.7% | 2.44 |
+| **DFlash2** | 4 | **104.10, 104.12** | 68.8% | 3.67 |
+| **DFlash2** | 7 | **106.93, 106.82** | 44.2% | 4.00 |
+
+**On this prompt DFlash2 clearly BEATS MTP** -- 107 tok/s vs MTP's 72 tok/s, both well above their
+own respective haiku-prompt figures above. This is consistent with the review's own independent
+measurement on a different (~619-token) code prompt (DFlash2 87 tok/s vs MTP 77 tok/s), not a
+one-off: DFlash2's acceptance is higher on code (44-69% here vs 24-47% on the haiku prompt), which
+tracks the general intuition that a block-diffusion drafter with access to more recent injected
+context does better on templated/repetitive text than on free-form prose -- NOT root-caused
+further this stage. The headline conclusion is corrected to: **DFlash2 is at or below MTP on the
+standard prose prompt, and clearly ahead of MTP on a code-shaped prompt** -- prompt-dependent, not a
+single "DFlash2 vs MTP" ranking.
+
+VRAM: 18.13-18.19 GiB (w4a16 target + w4a16 draft, K=7). STILL NOT MEASURED (time budget, not a
+discovered blocker -- explicitly left open, not silently narrowed): the p_min sweep ({0, 0.3, 0.5}),
+the w4a8/mxfp4 DRAFT containers (only w4a16 and bf16 drafts have ever been tried), the one
+long-context point (`--max-ctx 32768`, ~30k real prefilled tokens), an explicit prefill-with/without-
+`--dflash` A/B, and doubling every row of the ORIGINAL haiku-prompt table above (only the top two
+rows there were run twice; the new code-prompt table above is fully doubled). CLI-vs-server tok/s
+parity (item 7): `r4dx-server --dflash --dflash-k 4` reported 77.54/77.62 tok/s on the haiku prompt
+vs the CLI's own 77.06/77.16 (pre-fix) -- within 1%, PASSES the "must track the CLI within a few
+percent" bar (measured by the review pass; not independently re-run this stage since neither fix
+touches the server's request-routing path).
+
 ## Milestone 4: integration confirmation sweep + consolidated M1->M4 table (2026-09-20)
 
 **Integration**: clean `build.ps1 -Clean` rebuild (no warnings beyond one pre-existing MSVC

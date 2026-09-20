@@ -35,6 +35,14 @@ struct EngineOptions {
   SamplingParams sampling_defaults;
   bool default_thinking = false;
   std::string log_level = "info";
+  // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): model_opts.dflash_draft_k already
+  // carries the per-round `k` (same dual sizing/per-call-cap role as model_opts.mtp_draft_k has for
+  // MTP -- see src/cli/cli_args.h's own comment on --mtp/--dflash-k). p_min/n_min are NOT sizing
+  // knobs (Model::Load/ModelOptions doesn't need them), only per-round DraftRound arguments, so they
+  // live here instead, mirroring how sampling_defaults above carries per-request-but-not-per-Load
+  // values.
+  float dflash_p_min = 0.0f;
+  int64_t dflash_n_min = 0;
 };
 
 enum class RequestKind { kChat, kCompletion };

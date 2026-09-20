@@ -65,18 +65,29 @@ struct ServerArgs {
   // the measured default.
   std::string mtp_head_layout = "layout";
   // Reduced-vocab draft head (docs/r9700.md R9), same flag/semantics/default as
-  // src/cli/cli_args.h's --mtp-draft-head: "reduced" (default) uses the container's OPTIONAL
-  // mtp.draft_head.* tensors to speed up drafting when present, "full" forces the exact pre-R9
-  // full-vocab draft head. Verification always stays full-vocab regardless of this flag (see
-  // model.h's ModelOptions::mtp_draft_reduced_vocab / MtpHead::Draft's own doc comments), so it can
-  // only affect drafting speed/acceptance, never generated output. No effect when --mtp is 0, the
+  // src/cli/cli_args.h's --mtp-draft-head: "reduced" uses the container's OPTIONAL
+  // mtp.draft_head.* tensors to speed up drafting when present, "full" (default, flipped
+  // 2026-09-20 per Milestone 5 B2 item 8; see src/cli/cli_args.h's own comment for the full
+  // measurement -- matched K=3 real-hardware re-measurement: full head 68.20/68.64 tok/s (46.3%
+  // acceptance) vs reduced head 53.59/54.17 tok/s (20.9% acceptance), byte-identical output)
+  // forces the exact pre-R9 full-vocab draft head.
+  // Verification always stays full-vocab regardless of this flag (see model.h's
+  // ModelOptions::mtp_draft_reduced_vocab / MtpHead::Draft's own doc comments), so it can only
+  // affect drafting speed/acceptance, never generated output. No effect when --mtp is 0, the
   // container has no mtp.* weights, or (silently, "reduced" only) no draft_head.* tensors.
-  std::string mtp_draft_head = "reduced";
+  std::string mtp_draft_head = "full";
   // Device-resident embedding gather (src/model/model.h's ModelOptions::embed_device_resident) --
   // same escape hatch and default as src/cli/cli_args.h's --embed-device-resident (review finding,
   // 2026-09-20: ModelOptions' own doc comment promised this flag before either binary actually had
   // it). "off" forces the host-gather path instead of mirroring text.embed_tokens into VRAM.
   std::string embed_device_resident = "on";
+  // DFlash2 self-speculative decode (docs/dflash2.md, stage S3), same flag/semantics/default as
+  // src/cli/cli_args.h's --dflash/--dflash-k/--dflash-p-min/--dflash-n-min: empty (default)
+  // disables it; mutually exclusive with --mtp > 0 (checked below -- Model::Load re-checks it too).
+  std::string dflash;
+  int64_t dflash_k = 7;
+  float dflash_p_min = 0.0f;
+  int64_t dflash_n_min = 0;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -94,7 +105,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
          "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
-         "[--embed-device-resident {on|off}]";
+         "[--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N] "
+         "[--dflash-p-min F] [--dflash-n-min N]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -149,6 +161,10 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextServerArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextServerArg(argc, argv, i, "--mtp-draft-head");
     else if (arg == "--embed-device-resident") a.embed_device_resident = NextServerArg(argc, argv, i, "--embed-device-resident");
+    else if (arg == "--dflash") a.dflash = NextServerArg(argc, argv, i, "--dflash");
+    else if (arg == "--dflash-k") a.dflash_k = ServerParseI64("--dflash-k", NextServerArg(argc, argv, i, "--dflash-k"));
+    else if (arg == "--dflash-p-min") a.dflash_p_min = ServerParseFloat("--dflash-p-min", NextServerArg(argc, argv, i, "--dflash-p-min"));
+    else if (arg == "--dflash-n-min") a.dflash_n_min = ServerParseI64("--dflash-n-min", NextServerArg(argc, argv, i, "--dflash-n-min"));
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -177,6 +193,14 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   }
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
     throw ServerUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
+  if (!a.dflash.empty() && a.mtp > 0) {
+    throw ServerUsageError("--dflash and --mtp are mutually exclusive (docs/dflash2.md: DFlash2 "
+                            "and MTP are separate self-speculation families, not combinable)");
+  }
+  if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
+    throw ServerUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up "
+                            "to block_size-1 drafted tokens)");
   }
   return a;
 }

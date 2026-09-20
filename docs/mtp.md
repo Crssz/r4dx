@@ -691,9 +691,50 @@ an implementation one, and is the clearly-scoped follow-up flagged in "Known gap
 topically diverse corpus (ideally including chat/instruction-style text closer to real serving
 traffic, not just Wikipedia prose) and re-measure this same K-sweep. Until that is done, **the
 recommended default remains the ORIGINAL full-vocab MTP head at its own previously-measured optimal
-K (w4a16 K=3, 67.34 tok/s per the "MTP head layout" table above)** -- `--mtp-draft-head full` (or
+K (w4a16 K=3: 68.20-68.64 tok/s, 46.3% acceptance -- see the matched-K re-measurement in "Flag
+default flipped" below)** -- `--mtp-draft-head full` (or
 simply not baking `--draft-vocab-ids` into a production container) is the safe choice until a
 higher-coverage subset is measured and shown to beat it.
+
+**Flag default flipped (2026-09-20, Milestone 5 B2 item 8)**: `--mtp-draft-head`'s own default in
+both `src/cli/cli_args.h` and `src/server/server_args.h` changed from `reduced` to `full`, matching
+this recommendation exactly -- a caller who does nothing now gets the measured-faster full-vocab
+head instead of the measured-slower reduced head.
+
+**Correction (review, 2026-09-20): the "65.02-67.34 tok/s at matched K" justification originally
+given here was not a matched-K comparison.** 65.02 tok/s above is w4a16 **K=4** (full head) and
+67.34 tok/s is w4a16 **K=3** from the *separate* "MTP head layout" sweep (a different knob --
+`mtp_head_layout`, both variants of which are already full-vocab -- and that sweep's own container/
+run, not this section's reduced-vs-full container/run); no K=3 full-vocab-draft-head datapoint
+existed in either table at the time this recommendation was written. Re-measured directly instead
+of citing across sweeps: real hardware, HIP device 1,
+`D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx`, w4a16, this file's standard prompt/flags, `--mtp 3`,
+two runs each, uncontended --
+
+| Draft head | Decode tok/s (run 1, run 2) | Acceptance | Tok/round | Generated text |
+|---|---|---|---|---|
+| full (default) | 68.20, 68.64 | 46.3% | 2.31 | byte-identical to reduced's |
+| reduced | 53.59, 54.17 | 20.9% | 1.63 | byte-identical to full's |
+
+**Independently re-confirmed (Milestone 5 stage S2, 2026-09-20)**, same container/prompt/flags, two
+fresh runs each on an otherwise idle device 1: full **68.63, 68.57** tok/s and reduced **54.09,
+54.03** tok/s, with acceptance and tok/round landing on the *identical* 46.3%/2.31 and 20.9%/1.63.
+The tok/s figures agree with the table above to within 1% (run-to-run noise on this card is ~1%,
+which is why `docs/perf.md` asks for two runs and a report of both when they differ by more than
+3%); the acceptance and tok/round figures are deterministic and match exactly. The table is left as
+originally measured rather than overwritten with a second, statistically indistinguishable sample.
+One operational note found while re-measuring: `--mtp-draft-head reduced` against a container with
+no `mtp.draft_head.*` tensors (e.g. `qwen38-27b-v3.r4dx`, as opposed to the `-draftvocab` one)
+silently uses the full head -- as documented and intended -- and the `[stats]` line correctly
+reports `draft_head=full`, which is the only way to tell from the outside. Read that field, not the
+flag you passed.
+
+Matched-K=3 confirms the same conclusion the (mismatched-K) sweep comparison already pointed to:
+the full head is faster at equal K, acceptance is more than double, and the flip is lossless
+(identical generated text either way -- `--mtp-draft-head` can only affect drafting speed/
+acceptance, never the accepted token, per `MtpHead::Draft`'s own doc comment). Pass
+`--mtp-draft-head reduced` explicitly to opt back into the reduced-vocab path (e.g. for an A/B run,
+or once a higher-coverage calibration corpus justifies it).
 
 ## DFlash2 assessment
 

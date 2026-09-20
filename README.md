@@ -130,6 +130,22 @@ per layout (roughly +75-165% decode throughput over `--mtp 0` at each layout's b
 default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput
 per layout.
 
+`--dflash <draft.r4dx>` (Milestone 5, docs/dflash2.md) enables DFlash2 block-diffusion
+self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, greedy-only, needs a
+separate DFlash2 draft container (`D:\models\r4dx\qwen38-27b-dflash2-{w4a16,w4a8,mxfp4,bf16}.r4dx`),
+independent of the target's own `--layout`. `--dflash-k N` (1..7, default 7), `--dflash-p-min F`
+and `--dflash-n-min N` tune the selector walk's early-stop/discard gates. Best measured so far
+(docs/perf.md's Integrate-stage final confirmation sweep, each layout's own best `--dflash-k`
+vs. best `--mtp K`, twice each): on a ~270-token code prompt, DFlash2 **beats MTP on all three
+layouts** -- w4a16 **116.90/116.84 tok/s** (77.4% acceptance) vs MTP's 89.45/89.44 (+30.7%), w4a8
+**109.22/109.29** vs 87.53/87.71 (+24.6%), mxfp4 **94.30/94.30** vs 75.50/75.68 (+24.9%). On the
+standard haiku prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.62, +12.2%) and w4a8
+(64.79/64.76 vs 57.69/57.66, +12.3%), but MTP still leads on mxfp4 (64.91/64.91 vs 58.57/58.63,
+-9.8%) -- prompt-dependent, not a fixed ranking. Best single cell (w4a16/code) is within 3% of the
+120 tok/s / 84% acceptance the reference ROCmFPX implementation reaches on this same card/draft. The
+`p_min` sweep, the w4a8/mxfp4 DRAFT containers, and the mxfp4/standard-prompt acceptance gap are
+still open (docs/dflash2.md section 7a, docs/perf.md's top section).
+
 ## Run the OpenAI-compatible server
 
 ```powershell
@@ -151,7 +167,10 @@ where the engine must catch up), or reloading from scratch only on a genuine pre
 MTP-converted container AND that request is greedy (`temperature <= 0`); every accepted token still
 streams as soon as it is committed. `--mtp-head-layout {bf16,layout}` is also a server-side flag now (mirrors the CLI), as is
 `--mtp-draft-head {reduced,full}` (docs/r9700.md R9, "reduced-vocab draft head" -- see docs/mtp.md
-for the design, measured coverage, and K-sweep). Tool calls (OpenAI `tools`/`tool_choice`/
+for the design, measured coverage, and K-sweep). `--dflash <draft.r4dx>` (Milestone 5,
+docs/dflash2.md) is the same server-side passthrough for DFlash2 as the CLI's own flag above,
+mutually exclusive with `--mtp`; `tools/server/smoke.ps1 -Dflash <path>` verified it end to end
+against the real container (streaming and tool-call mode both unaffected). Tool calls (OpenAI `tools`/`tool_choice`/
 `message.tool_calls`/`role: "tool"` multi-turn round trips) are fully supported -- `tools` are
 rendered into the prompt and a model-emitted `<tool_call>` is parsed back into a structured
 `message.tool_calls` response (JSON-encoded `arguments` string, stable generated `id`s,

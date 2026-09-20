@@ -283,9 +283,70 @@ void Engine::RunRequest(PendingRequest& req) {
     // "probabilistic acceptance later" is still future work, per this stage's task).
     const bool use_mtp = model_->MtpEnabled() && req.sampling.temperature <= 0.0f;
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
+    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): identical greedy-only gate as
+    // MTP above, mutually exclusive with it (--dflash/--mtp are rejected together at the arg-parse
+    // layer, so at most one of use_mtp/use_dflash is ever true). model_->DflashEnabled() is private
+    // to r4dx::model::Model in the CLI's own header, so this uses the same "was the drafter loaded"
+    // signal DecodeStepDflashGreedy itself throws on -- opts_.model_opts.dflash_draft_k > 0 is set
+    // if and only if Model::Load was given a non-empty dflash_container (cli_args.h/server_args.h's
+    // own mutual-exclusion + range checks already guarantee this pairing holds).
+    const bool use_dflash = !opts_.model_opts.dflash_container.empty() && req.sampling.temperature <= 0.0f;
+    int64_t dflash_rounds = 0, dflash_drafted = 0, dflash_accepted = 0;
 
     const auto d0 = Clock::now();
-    if (use_mtp) {
+    if (use_dflash) {
+      const int64_t draft_k = opts_.model_opts.dflash_draft_k;
+      int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+      bool stopped = false;
+      if (is_eos(next)) {
+        finish_reason = "stop";
+        stopped = true;
+      } else {
+        generated_tokens.push_back(next);
+        if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
+                      &stop_match_pos)) {
+          finish_reason = "stop";
+          stopped = true;
+        }
+      }
+      while (!stopped && static_cast<int64_t>(generated_tokens.size()) < max_tokens) {
+        if (req.sink->IsCancelled()) {
+          finish_reason = "cancelled";
+          break;
+        }
+        int64_t walk_len = 0;
+        const std::vector<int32_t> round = model_->DecodeStepDflashGreedy(
+            next, draft_k, opts_.dflash_p_min, opts_.dflash_n_min, &walk_len);
+        ++dflash_rounds;
+        dflash_drafted += walk_len;
+        dflash_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+        // Same "compute the commit decision up front, atomically" contract as the MTP branch below
+        // -- ProcessMtpRound is speculation-family-agnostic (mtp_round.hpp's own file comment).
+        const r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(
+            round, is_eos, max_tokens - static_cast<int64_t>(generated_tokens.size()));
+        committed_tokens.push_back(next);
+        committed_tokens.insert(committed_tokens.end(), outcome.committed.begin(),
+                                 outcome.committed.end());
+        for (int32_t tok : outcome.displayed) {
+          generated_tokens.push_back(tok);
+          next = tok;
+          if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
+                        &stop_match_pos)) {
+            finish_reason = "stop";
+            stopped = true;
+            break;
+          }
+        }
+        if (!stopped) {
+          if (outcome.hit_eos) {
+            finish_reason = "stop";
+            stopped = true;
+          } else if (outcome.hit_max_tokens) {
+            stopped = true;
+          }
+        }
+      }
+    } else if (use_mtp) {
       const int64_t draft_k = opts_.model_opts.mtp_draft_k;
       int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
       bool stopped = false;
@@ -451,6 +512,18 @@ void Engine::RunRequest(PendingRequest& req) {
                     static_cast<long long>(mtp_rounds), static_cast<long long>(mtp_drafted),
                     static_cast<long long>(mtp_accepted), accept_rate,
                     static_cast<double>(generated_tokens.size()) / static_cast<double>(mtp_rounds));
+    }
+    if (use_dflash && dflash_rounds > 0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      const double accept_rate = dflash_drafted > 0
+          ? 100.0 * static_cast<double>(dflash_accepted) / static_cast<double>(dflash_drafted)
+          : 0.0;
+      std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                    " dflash: k=%lld rounds=%lld drafted=%lld accepted=%lld (%.1f%% accept, "
+                    "%.2f tok/round)",
+                    static_cast<long long>(opts_.model_opts.dflash_draft_k),
+                    static_cast<long long>(dflash_rounds), static_cast<long long>(dflash_drafted),
+                    static_cast<long long>(dflash_accepted), accept_rate,
+                    static_cast<double>(generated_tokens.size()) / static_cast<double>(dflash_rounds));
     }
     LogLine(opts_.log_level, "info", buf);
   } catch (const std::exception& e) {

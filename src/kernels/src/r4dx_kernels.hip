@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "r4d.h"  // third_party/libr4d: r4d_dflash_conv_t2_g16_bf16 (the DFlash2 conv wrapper below)
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/kernels.h"
@@ -640,6 +641,313 @@ __global__ void GatherI32Kernel(const int32_t* __restrict__ table, const int32_t
   out[i] = table[id];
 }
 
+// ================ DFlash2 drafter device pieces (docs/dflash2.md "Kernels") ====================
+
+// ---- rope: full-width NeoX split-half ---------------------------------------------------------
+// One workgroup per row; `half` threads (capped at 256) each own one frequency bin and rotate that
+// bin's (i, i+half) pair across every head of q and of k. `q`/`k` may independently be null (with
+// the matching head count 0) -- the DFlash2 injection path ropes K only.
+__global__ void RopeNeoxKernel(__hip_bfloat16* __restrict__ q, __hip_bfloat16* __restrict__ k,
+                                const int32_t* __restrict__ pos_ids, int heads_q, int heads_k,
+                                int head_dim, float theta) {
+  const int64_t t = blockIdx.x;
+  const int half = head_dim / 2;
+  const float pos = static_cast<float>(pos_ids[t]);
+
+  for (int hd = threadIdx.x; hd < half; hd += blockDim.x) {
+    // Same expression order as RopePartialMropeKernel above (exp2f/log2f, then a float multiply,
+    // then an ACCURATE sincosf -- not __sincosf; see that kernel's comment for why).
+    const float inv_freq = exp2f(-(2.0f * hd) / static_cast<float>(head_dim) * log2f(theta));
+    const float angle = pos * inv_freq;
+    float c, s;
+    sincosf(angle, &s, &c);
+
+    if (heads_q > 0) {
+      __hip_bfloat16* qbase = q + t * static_cast<int64_t>(heads_q) * head_dim;
+      for (int h = 0; h < heads_q; ++h) {
+        __hip_bfloat16* row = qbase + static_cast<int64_t>(h) * head_dim;
+        const float x0 = __bfloat162float(row[hd]);
+        const float x1 = __bfloat162float(row[hd + half]);
+        row[hd] = __float2bfloat16(x0 * c - x1 * s);
+        row[hd + half] = __float2bfloat16(x1 * c + x0 * s);
+      }
+    }
+    if (heads_k > 0) {
+      __hip_bfloat16* kbase = k + t * static_cast<int64_t>(heads_k) * head_dim;
+      for (int h = 0; h < heads_k; ++h) {
+        __hip_bfloat16* row = kbase + static_cast<int64_t>(h) * head_dim;
+        const float x0 = __bfloat162float(row[hd]);
+        const float x1 = __bfloat162float(row[hd + half]);
+        row[hd] = __float2bfloat16(x0 * c - x1 * s);
+        row[hd + half] = __float2bfloat16(x1 * c + x0 * s);
+      }
+    }
+  }
+}
+
+// ---- per-row top-16 ---------------------------------------------------------------------------
+// The single total order this kernel sorts by, used identically by the per-thread insertion and by
+// the LDS merge so the result is the global top-16 under it, deterministically: higher value wins;
+// equal values break toward the LOWER id (kernels.h's stated contract, matching `ggml_top_k` as
+// the DFlash2 selector consumes it).
+__device__ __forceinline__ bool TopkBetter(float a_v, int32_t a_i, float b_v, int32_t b_i) {
+  return a_v > b_v || (a_v == b_v && a_i < b_i);
+}
+
+constexpr int kTopK = 16;
+
+__global__ __launch_bounds__(kThreads) void Topk16Kernel(const float* __restrict__ logits,
+                                                            int32_t* __restrict__ out_ids,
+                                                            float* __restrict__ out_vals,
+                                                            int64_t vocab) {
+  const int64_t row = blockIdx.x;
+  const float* __restrict__ lr = logits + row * vocab;
+  const int tid = threadIdx.x;
+
+  // Per-thread sorted-descending top-16, held in registers: every index below is a compile-time
+  // constant (the shift loop is fully unrolled), so this does not spill to scratch. The sentinel
+  // (-inf, INT32_MAX) loses to every real entry under TopkBetter, including a real -inf (tie
+  // broken by the lower id), so short slices need no separate count.
+  float bv[kTopK];
+  int32_t bi[kTopK];
+#pragma unroll
+  for (int j = 0; j < kTopK; ++j) {
+    bv[j] = -INFINITY;
+    bi[j] = INT32_MAX;
+  }
+  for (int64_t i = tid; i < vocab; i += kThreads) {
+    const float v = lr[i];
+    const int32_t idx = static_cast<int32_t>(i);
+    if (!TopkBetter(v, idx, bv[kTopK - 1], bi[kTopK - 1])) continue;
+    bv[kTopK - 1] = v;
+    bi[kTopK - 1] = idx;
+#pragma unroll
+    for (int s = kTopK - 1; s > 0; --s) {
+      if (TopkBetter(bv[s], bi[s], bv[s - 1], bi[s - 1])) {
+        const float tv = bv[s];
+        bv[s] = bv[s - 1];
+        bv[s - 1] = tv;
+        const int32_t ti = bi[s];
+        bi[s] = bi[s - 1];
+        bi[s - 1] = ti;
+      }
+    }
+  }
+
+  __shared__ float s_v[kThreads * kTopK];
+  __shared__ int32_t s_i[kThreads * kTopK];
+#pragma unroll
+  for (int j = 0; j < kTopK; ++j) {
+    s_v[tid * kTopK + j] = bv[j];
+    s_i[tid * kTopK + j] = bi[j];
+  }
+  __syncthreads();
+
+  // Pairwise tree merge of the 256 sorted-16 lists (8 rounds). In a round, only threads with
+  // tid < stride write, and each such thread writes ONLY its own slot after reading its own slot
+  // and slot tid+stride (which no active thread writes this round) into registers -- so one
+  // barrier per round, at the end, is sufficient.
+  for (int stride = kThreads / 2; stride >= 1; stride >>= 1) {
+    if (tid < stride) {
+      float mv[kTopK];
+      int32_t mi[kTopK];
+      int pa = 0, pb = 0;
+      const int base_a = tid * kTopK;
+      const int base_b = (tid + stride) * kTopK;
+#pragma unroll
+      for (int j = 0; j < kTopK; ++j) {
+        // pa/pb can each reach kTopK on the last step; clamp the READ (the guard below is what
+        // decides) so a clamped read never leaves this block's LDS allocation.
+        const int ra = pa < kTopK ? pa : kTopK - 1;
+        const int rb = pb < kTopK ? pb : kTopK - 1;
+        const float av = s_v[base_a + ra];
+        const int32_t ai = s_i[base_a + ra];
+        const float bvv = s_v[base_b + rb];
+        const int32_t bii = s_i[base_b + rb];
+        if (pa < kTopK && (pb >= kTopK || TopkBetter(av, ai, bvv, bii))) {
+          mv[j] = av;
+          mi[j] = ai;
+          ++pa;
+        } else {
+          mv[j] = bvv;
+          mi[j] = bii;
+          ++pb;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kTopK; ++j) {
+        s_v[base_a + j] = mv[j];
+        s_i[base_a + j] = mi[j];
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid < kTopK) {
+    out_vals[row * kTopK + tid] = s_v[tid];
+    out_ids[row * kTopK + tid] = s_i[tid];
+  }
+}
+
+// ---- DFlash2 draft-block attention: non-causal, windowed, GQA ---------------------------------
+// One workgroup per (block row t, kv-head), 128 threads, serving that kv-head's up to 4 q-heads
+// together so the K and V slices are each read exactly once per workgroup.
+//
+// Pass 1 (scores): one WAVE per key, 32 lanes x head_dim/32 dims each -> a fully coalesced
+//   256-byte load per key, then one wave shuffle-reduce per q-head. Scores land in LDS.
+// Pass 2a (softmax): wave r reduces q-head r's own score row (max, then exp-in-place and sum).
+// Pass 2b (output): thread d owns dim d and sweeps the keys once, reading V coalesced and
+//   accumulating all `ratio` q-heads' outputs in registers.
+//
+// This is a two-pass (materialise-then-normalise) softmax rather than a streaming online one: the
+// whole visible row is at most 2055 scores (window 2048 + an 8-wide block), which fits LDS
+// comfortably, and it is the numerically identical max-subtracted fp32 softmax with less state.
+constexpr int kAttnThreads = 128;
+constexpr int kAttnMaxKeys = 2056;   // (window - 1) + T <= 2047 + 8
+constexpr int kAttnMaxRatio = 4;     // heads_q / heads_kv
+constexpr int kAttnMaxHeadDim = 128;
+
+__global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
+    const __hip_bfloat16* __restrict__ q, const __hip_bfloat16* __restrict__ k_block,
+    const __hip_bfloat16* __restrict__ v_block, const __hip_bfloat16* __restrict__ k_store,
+    const __hip_bfloat16* __restrict__ v_store, __hip_bfloat16* __restrict__ out, int T,
+    int heads_q, int heads_kv, int head_dim, int n_injected, int window, int slots, float scale) {
+  const int t = blockIdx.x;
+  const int kvh = blockIdx.y;
+  const int ratio = heads_q / heads_kv;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wave = tid >> 5;
+  constexpr int kWaves = kAttnThreads / 32;
+  const int dpl = head_dim / 32;  // dims per lane
+
+  // Visible injected-store range for this query row: SWA says a key at position p is visible iff
+  // q_pos - p < window, and only positions already injected exist -- so p in [lo, n_injected-1].
+  const int q_pos = n_injected + t;
+  int lo = q_pos - window + 1;
+  if (lo < 0) lo = 0;
+  const int n_store = n_injected > lo ? n_injected - lo : 0;
+  const int total = n_store + T;  // + the block's own T keys, all unconditionally visible
+
+  __shared__ float s_q[kAttnMaxRatio][kAttnMaxHeadDim];
+  __shared__ float s_sc[kAttnMaxRatio][kAttnMaxKeys];
+  __shared__ float s_m[kAttnMaxRatio], s_l[kAttnMaxRatio];
+
+  if (tid < head_dim) {
+    for (int r = 0; r < ratio; ++r) {
+      const int hq = kvh * ratio + r;
+      s_q[r][tid] = __bfloat162float(
+          q[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + tid]);
+    }
+  }
+  __syncthreads();
+
+  for (int j = wave; j < total; j += kWaves) {
+    const __hip_bfloat16* kp;
+    if (j < n_store) {
+      const int slot = (lo + j) % slots;
+      kp = k_store + (static_cast<int64_t>(slot) * heads_kv + kvh) * head_dim;
+    } else {
+      kp = k_block + (static_cast<int64_t>(j - n_store) * heads_kv + kvh) * head_dim;
+    }
+    float acc[kAttnMaxRatio] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int u = 0; u < dpl; ++u) {
+      const int d = lane * dpl + u;
+      const float kval = __bfloat162float(kp[d]);
+#pragma unroll
+      for (int r = 0; r < kAttnMaxRatio; ++r) {
+        if (r < ratio) acc[r] += s_q[r][d] * kval;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < kAttnMaxRatio; ++r) {
+      for (int o = 16; o; o >>= 1) acc[r] += __shfl_xor(acc[r], o, 32);
+    }
+    if (lane == 0) {
+#pragma unroll
+      for (int r = 0; r < kAttnMaxRatio; ++r) {
+        if (r < ratio) s_sc[r][j] = acc[r] * scale;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (wave < ratio) {
+    float m = -INFINITY;
+    for (int j = lane; j < total; j += 32) m = fmaxf(m, s_sc[wave][j]);
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+    float l = 0.0f;
+    for (int j = lane; j < total; j += 32) {
+      const float e = expf(s_sc[wave][j] - m);
+      s_sc[wave][j] = e;
+      l += e;
+    }
+    for (int o = 16; o; o >>= 1) l += __shfl_xor(l, o, 32);
+    if (lane == 0) {
+      s_m[wave] = m;
+      s_l[wave] = l;
+    }
+  }
+  __syncthreads();
+
+  if (tid < head_dim) {
+    const int d = tid;
+    float acc[kAttnMaxRatio] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int j = 0; j < total; ++j) {
+      const __hip_bfloat16* vp;
+      if (j < n_store) {
+        const int slot = (lo + j) % slots;
+        vp = v_store + (static_cast<int64_t>(slot) * heads_kv + kvh) * head_dim;
+      } else {
+        vp = v_block + (static_cast<int64_t>(j - n_store) * heads_kv + kvh) * head_dim;
+      }
+      const float vv = __bfloat162float(vp[d]);
+#pragma unroll
+      for (int r = 0; r < kAttnMaxRatio; ++r) {
+        if (r < ratio) acc[r] += s_sc[r][j] * vv;
+      }
+    }
+    for (int r = 0; r < ratio; ++r) {
+      const int hq = kvh * ratio + r;
+      out[(static_cast<int64_t>(t) * heads_q + hq) * head_dim + d] =
+          __float2bfloat16(acc[r] / s_l[r]);
+    }
+  }
+}
+
+// ---- plain (non zero-centered) rmsnorm ---------------------------------------------------------
+// out = x * rsqrt(mean(x^2) + eps) * w -- NO (1+w). See kernels.h for why this is a separate entry
+// point from RmsNormKernel rather than a flag on it.
+// In-place (out == x, out_fp32 == 0) is safe for the same reason RmsNormKernel's in-place use is:
+// every thread's read of xr[i] in the sum-of-squares loop happens before BlockReduceSum's
+// __syncthreads(), which happens before any thread's write in the output loop.
+__global__ __launch_bounds__(kThreads) void RmsNormPlainKernel(
+    const __hip_bfloat16* __restrict__ x, const __hip_bfloat16* __restrict__ w, void* __restrict__ out,
+    int64_t hidden, float eps, int out_fp32) {
+  const int64_t row = blockIdx.x;
+  const __hip_bfloat16* xr = x + row * hidden;
+
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float v = __bfloat162float(xr[i]);
+    ss += v * v;
+  }
+  ss = BlockReduceSum(ss);
+  const float rstd = rsqrtf(ss / static_cast<float>(hidden) + eps);
+
+  if (out_fp32) {
+    float* outr = static_cast<float*>(out) + row * hidden;
+    for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+      outr[i] = __bfloat162float(xr[i]) * rstd * __bfloat162float(w[i]);
+    }
+  } else {
+    __hip_bfloat16* outr = static_cast<__hip_bfloat16*>(out) + row * hidden;
+    for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+      outr[i] = __float2bfloat16(__bfloat162float(xr[i]) * rstd * __bfloat162float(w[i]));
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" {
@@ -759,6 +1067,129 @@ void r4dx_gather_i32(int64_t table, int64_t idx, int64_t out, int64_t n, int64_t
   const unsigned blocks = static_cast<unsigned>((n + threads - 1) / threads);
   hipLaunchKernelGGL(GatherI32Kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
                      (const int32_t*)table, (const int32_t*)idx, (int32_t*)out, n, table_size);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+// ================ DFlash2 drafter device pieces (docs/dflash2.md "Kernels") ====================
+
+void r4dx_rope_neox_bf16(int64_t q, int64_t k, int64_t pos_ids, int rows, int heads_q, int heads_k,
+                          int head_dim, float theta, int64_t stream) {
+  if (rows <= 0 || (heads_q <= 0 && heads_k <= 0)) return;
+  if (head_dim <= 0 || (head_dim % 2) != 0) {
+    throw std::runtime_error("r4dx_rope_neox_bf16: head_dim must be positive and even, got " +
+                              std::to_string(head_dim));
+  }
+  ++g_launch_count;
+  int threads = head_dim / 2;
+  if (threads > 256) threads = 256;
+  hipLaunchKernelGGL(RopeNeoxKernel, dim3(static_cast<unsigned>(rows)), dim3(threads), 0,
+                     (hipStream_t)stream, (__hip_bfloat16*)q, (__hip_bfloat16*)k,
+                     (const int32_t*)pos_ids, heads_q > 0 ? heads_q : 0, heads_k > 0 ? heads_k : 0,
+                     head_dim, theta);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows, int64_t vocab,
+                      int64_t stream) {
+  if (rows <= 0) return;
+  if (vocab < kTopK) {
+    throw std::runtime_error("r4dx_topk16_f32: vocab must be >= 16, got " + std::to_string(vocab));
+  }
+  ++g_launch_count;
+  hipLaunchKernelGGL(Topk16Kernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const float*)logits, (int32_t*)out_ids,
+                     (float*)out_vals, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                            int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                            int head_dim, int n_injected, int window, int slots, float scale,
+                            int64_t stream) {
+  if (T <= 0 || heads_kv <= 0) return;
+  // Every one of these is a HARD precondition of the kernel's fixed LDS geometry: violating one
+  // would read/write outside s_q/s_sc rather than merely produce a slow answer.
+  if (T > 8) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: T must be <= 8 (the DFlash2 block size), got " +
+                              std::to_string(T));
+  }
+  if (head_dim <= 0 || head_dim > kAttnMaxHeadDim || (head_dim % 32) != 0) {
+    throw std::runtime_error(
+        "r4dx_dflash_attn_bf16: head_dim must be a positive multiple of 32 and <= 128, got " +
+        std::to_string(head_dim));
+  }
+  if (heads_q <= 0 || (heads_q % heads_kv) != 0 || (heads_q / heads_kv) > kAttnMaxRatio) {
+    throw std::runtime_error(
+        "r4dx_dflash_attn_bf16: heads_q must be a multiple of heads_kv with ratio <= 4, got " +
+        std::to_string(heads_q) + "/" + std::to_string(heads_kv));
+  }
+  if (window <= 0 || window > kAttnMaxKeys - 8) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: window must be in [1, 2048], got " +
+                              std::to_string(window));
+  }
+  if (slots < window) {
+    throw std::runtime_error(
+        "r4dx_dflash_attn_bf16: slots must be >= window (otherwise the visible store range aliases "
+        "itself in the ring), got slots=" +
+        std::to_string(slots) + " window=" + std::to_string(window));
+  }
+  if (n_injected < 0) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: n_injected must be >= 0, got " +
+                              std::to_string(n_injected));
+  }
+  ++g_launch_count;
+  hipLaunchKernelGGL(DflashAttnKernel,
+                     dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_kv)),
+                     dim3(kAttnThreads), 0, (hipStream_t)stream, (const __hip_bfloat16*)q,
+                     (const __hip_bfloat16*)k_block, (const __hip_bfloat16*)v_block,
+                     (const __hip_bfloat16*)k_store, (const __hip_bfloat16*)v_store,
+                     (__hip_bfloat16*)out, T, heads_q, heads_kv, head_dim, n_injected, window,
+                     slots, scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, int T, int H,
+                            int side, int block_size, int64_t stream) {
+  if (T <= 0 || H <= 0) return;
+  constexpr int kTaps = 2, kGroup = 16;  // r4d_dflash_conv_t2_g16_bf16's compiled-in geometry
+  if ((H % kGroup) != 0) {
+    throw std::runtime_error("r4dx_dflash_conv_bf16: H must be a multiple of 16, got " +
+                              std::to_string(H));
+  }
+  if (side != 0 && side != 1) {
+    throw std::runtime_error("r4dx_dflash_conv_bf16: side must be 0 or 1, got " +
+                              std::to_string(side));
+  }
+  if (block_size <= 0 || (block_size & (block_size - 1)) != 0 || block_size < T) {
+    throw std::runtime_error(
+        "r4dx_dflash_conv_bf16: block_size must be a power of two >= T, got " +
+        std::to_string(block_size) + " (T=" + std::to_string(T) + ")");
+  }
+  const int NG = H / kGroup;
+  const int dpitch = 2 * kTaps * NG;  // the FULL [T, 2, taps, NG] row pitch (r4d.h:118)
+  const auto* delta = reinterpret_cast<const uint16_t*>(dyn) +
+                       static_cast<int64_t>(side) * kTaps * NG;  // side-major slice
+  const auto* base_s = reinterpret_cast<const uint16_t*>(base) +
+                        static_cast<int64_t>(side) * kTaps * H;  // base is [2][taps][H]
+  // No ++g_launch_count: the launch below is libr4d's, and that counter counts r4dx-owned
+  // launches only (see its doc comment in kernels.h).
+  const int rc = r4d_dflash_conv_t2_g16_bf16((const void*)x, (const void*)delta, (const void*)base_s,
+                                              (void*)out, T, H, dpitch, NG, kTaps, kGroup,
+                                              block_size, (void*)stream);
+  if (rc != 0) {
+    throw std::runtime_error("r4dx_dflash_conv_bf16: r4d_dflash_conv_t2_g16_bf16 returned " +
+                              std::to_string(rc));
+  }
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
+                              float eps, int out_fp32, int64_t stream) {
+  if (rows <= 0 || hidden <= 0) return;
+  ++g_launch_count;
+  hipLaunchKernelGGL(RmsNormPlainKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
+                     (void*)out, hidden, eps, out_fp32);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

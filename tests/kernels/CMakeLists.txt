@@ -13,6 +13,13 @@ set(R4DX_KERNEL_TESTS
   test_fused_quant
   test_embedding_gather
   test_gather_i32
+  # DFlash2 drafter device pieces (docs/dflash2.md "Kernels", Milestone 5 S1). Every one of these
+  # ends with a fixture-A comparison and so declares SKIP_RETURN_CODE 77 below.
+  test_rope_neox
+  test_topk16
+  test_dflash_attn
+  test_dflash_conv
+  test_rmsnorm_plain
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -32,6 +39,36 @@ endforeach()
 # (review finding, 2026-09-20 -- a regenerable ~19 MB capture, not a committed fixture); the test
 # itself SKIPs (return 77) when it's absent, same convention tests/model's golden-data tests use.
 set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
+
+# The five DFlash2 kernel tests each run their CPU-reference checks unconditionally and then
+# compare against tools/reference/golden_out/dflash2/fixture_a, which is gitignored and
+# regenerable (docs/dflash2.md section 9 -- `python tools/reference/dflash2_ref.py --gen-fixtures
+# all --seed 0`). When it is absent they return 77 (CTest SKIPPED) AFTER the CPU-reference part
+# has passed, and 1 if that part failed -- so a skip never hides a real regression.
+set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
+                     test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
+
+# `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
+# to be able to CATCH anything at all.
+#
+# The whole project compiles with CMake's Windows default `/EHsc`, whose `c` means "assume every
+# extern \"C\" function is nothrow". Every kernel entry point in src/kernels is `extern "C"` and
+# several of them (13 throw sites as of Milestone 5, plus R4DX_HIP_CHECK) report a violated
+# precondition or a failed HIP call by throwing std::runtime_error. Under `/EHsc` the CALLER emits
+# no unwind edge for those calls, so a throw that really does happen unwinds into a frame marked
+# nothrow and the process is killed immediately -- exit code 0xC0000409, no message, and neither
+# `catch (const std::exception&)` nor `catch (...)` ever runs. Verified on this toolchain: the
+# kernels object itself emits the correct MSVC EH ABI (_CxxThrowException / __CxxFrameHandler3),
+# so the defect is purely the caller-side nothrow assumption.
+#
+# `/EHc-` turns that assumption off for these test targets only, which is the narrowest change
+# that makes the preconditions testable. NOTE that this does NOT fix the same exposure in
+# r4dx-cli / r4dx-server / src/model, which still call the identical entry points under `/EHsc`
+# and would still be killed rather than unwound by a HIP error raised inside src/kernels -- see
+# docs/dflash2.md's "Kernels" subsection, which records this as an open project-wide question
+# rather than something a kernel stage should decide unilaterally.
+set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp
+                            PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_fused_quant (docs/r9700.md R2/P2) additionally needs r4dx_model_kernels for
 # r4dx_model_cast_bf16_to_f16 (the "old" w4a16 cast path it byte-diffs the new fused f16 epilogue

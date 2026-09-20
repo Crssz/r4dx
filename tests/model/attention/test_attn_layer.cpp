@@ -35,6 +35,7 @@
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/model/attention/attention_layer.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
+#include "../test_common.h"  // r4dx_test::FileExists / SkipMissing (exit 77 = CTest SKIPPED)
 
 #ifndef R4DX_GOLDEN_ATTN_PATH
 #define R4DX_GOLDEN_ATTN_PATH "tools/reference/golden_out/layer_003_full_attention.safetensors"
@@ -320,9 +321,12 @@ bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfi
   return ok;
 }
 
-}  // namespace
-
-int main() {
+// The whole test body. Called from main() only after both input files were confirmed present, and
+// inside a try/catch: SafetensorsReader's constructor throws std::runtime_error on a missing or
+// malformed file, and an exception escaping main() on Windows goes std::terminate -> abort ->
+// __fastfail, which surfaces as STATUS_STACK_BUFFER_OVERRUN (0xC0000409) -- indistinguishable from
+// a real memory-safety bug and reported by CTest as a crash instead of SKIPPED.
+int Run() {
   R4DX_HIP_CHECK(hipSetDevice(0));
 
   SafetensorsReader golden(Utf8ToWide(R4DX_GOLDEN_ATTN_PATH));
@@ -470,4 +474,25 @@ int main() {
   ok = ok && quant_ok;
 
   return ok ? 0 : 1;
+}
+
+}  // namespace
+
+int main() {
+  // Same up-front presence checks every sibling in tests/model/ does (test_gdn_layer.cpp,
+  // test_final_lm_head.cpp): both inputs are real, non-vendored data (docs/validation.md), so a
+  // machine without them must SKIP (exit 77, tests/model/attention/CMakeLists.txt's
+  // SKIP_RETURN_CODE), never crash. Checked before any HIP call so the skip path touches no GPU.
+  if (!r4dx_test::FileExists(R4DX_BF16_CONTAINER_PATH)) {
+    return r4dx_test::SkipMissing(R4DX_BF16_CONTAINER_PATH);
+  }
+  if (!r4dx_test::FileExists(R4DX_GOLDEN_ATTN_PATH)) {
+    return r4dx_test::SkipMissing(R4DX_GOLDEN_ATTN_PATH);
+  }
+  try {
+    return Run();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "test_attn_layer: uncaught exception: %s\n", e.what());
+    return 1;
+  }
 }

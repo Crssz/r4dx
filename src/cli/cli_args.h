@@ -87,13 +87,23 @@ struct CliArgs {
   // container has no mtp.* weights.
   std::string mtp_head_layout = "layout";
   // Reduced-vocab draft head (docs/r9700.md R9, model.h's ModelOptions::mtp_draft_reduced_vocab):
-  // "reduced" (default) uses the container's OPTIONAL mtp.draft_head.* tensors (a smaller lm_head
-  // over a subset of the real vocabulary) to speed up drafting -- verification always stays
-  // full-vocab regardless, so this cannot change generated output, only speed/acceptance at wide K.
-  // "full" forces the exact pre-R9 full-vocab draft head, for an A/B comparison at matched K. No
-  // effect when --mtp is 0, the container has no mtp.* weights, or (silently) no draft_head.*
-  // tensors -- "reduced" degrades to the full-vocab behavior automatically in that last case.
-  std::string mtp_draft_head = "reduced";
+  // "reduced" uses the container's OPTIONAL mtp.draft_head.* tensors (a smaller lm_head over a
+  // subset of the real vocabulary) to speed up drafting -- verification always stays full-vocab
+  // regardless, so this cannot change generated output, only speed/acceptance at wide K.
+  // "full" (default, flipped 2026-09-20 per Milestone 5 B2 item 8) forces the exact pre-R9
+  // full-vocab draft head: M4's own K-sweep measured "reduced" SLOWER at its own best K than "full"
+  // at ITS own best K (53.35 vs 65.02 tok/s, different K values each -- docs/mtp.md's K-sweep
+  // table), and a later matched-K=3 re-measurement (review finding, 2026-09-20 -- the K-sweep
+  // comparison above was NOT apples-to-apples) confirms the same conclusion at FIXED K: real
+  // hardware, D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx, w4a16, docs/perf.md's standard
+  // prompt/flags, `--mtp 3`, two runs each -- full head 68.20/68.64 tok/s (46.3% acceptance, 2.31
+  // tok/round) vs reduced head 53.59/54.17 tok/s (20.9% acceptance, 1.63 tok/round), generated text
+  // byte-identical either way (confirms the flip changes only speed, never correctness). "reduced"
+  // is therefore not safe to default to until a larger/more diverse vocab-coverage calibration
+  // corpus is measured (docs/mtp.md "Known gaps"). No effect when --mtp is 0, the container has no
+  // mtp.* weights, or (silently) no draft_head.* tensors -- "reduced" degrades to the full-vocab
+  // behavior automatically in that last case.
+  std::string mtp_draft_head = "full";
   // Device-resident embedding gather (docs/mtp.md "device-resident draft loop", model.h's
   // ModelOptions::embed_device_resident): mirrors text.embed_tokens into VRAM (~2.37-2.54 GiB
   // depending on vocab/hidden) so decode/draft gathers on-device instead of a host memcpy+H2D per
@@ -102,6 +112,28 @@ struct CliArgs {
   // flag actually implemented until this fix (review finding, 2026-09-20) -- set to "off" to force
   // the host-gather path instead, e.g. to reclaim that VRAM for KV cache on a constrained run.
   std::string embed_device_resident = "on";
+  // DFlash2 self-speculative decode (docs/dflash2.md, stage S3 -- model.h's
+  // ModelOptions::dflash_container/dflash_draft_k): the block-diffusion self-speculation family,
+  // mutually exclusive with --mtp (checked below -- Model::Load re-checks it too, so a caller
+  // constructing ModelOptions directly cannot bypass either). Empty (default) disables DFlash2
+  // entirely, byte-identical to before this flag existed. --dflash-k mirrors --mtp's own dual role
+  // (both a Load()-time sizing knob via ModelOptions::dflash_draft_k and the per-round cap passed to
+  // every Model::DecodeStepDflashGreedy call, exactly like args.mtp is passed to every
+  // DecodeStepMtpGreedy call) -- see main.cpp's RunTurn.
+  std::string dflash;
+  // Ceiling 7: DFlash2's block is 8 wide with the anchor at position 0 (docs/dflash2.md), so the
+  // walk can produce at most block_size-1 = 7 tokens regardless of what a caller asks for --
+  // Model::Load also re-validates this against the ACTUAL container's own block_size (which every
+  // shipped DFlash2 container sets to 8, but Model::Load never assumes that from this constant
+  // alone).
+  int64_t dflash_k = 7;
+  // Selector-walk early-stop probability gate (docs/dflash2.md section 4.3): <=0 (default) disables
+  // it, so the walk always runs to `dflash_k` (or fewer if `dflash_n_min` discards it).
+  float dflash_p_min = 0.0f;
+  // Selector-walk minimum-accepted-length discard gate (docs/dflash2.md section 4.3): <=0 (default)
+  // disables it -- the whole draft is discarded (not just truncated) when the walk produced fewer
+  // than this many tokens.
+  int64_t dflash_n_min = 0;
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -119,7 +151,8 @@ inline std::string CliUsageText(const char* argv0) {
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
-         "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}]";
+         "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}] "
+         "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -185,6 +218,10 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextCliArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextCliArg(argc, argv, i, "--mtp-draft-head");
     else if (arg == "--embed-device-resident") a.embed_device_resident = NextCliArg(argc, argv, i, "--embed-device-resident");
+    else if (arg == "--dflash") a.dflash = NextCliArg(argc, argv, i, "--dflash");
+    else if (arg == "--dflash-k") a.dflash_k = ParseI64("--dflash-k", NextCliArg(argc, argv, i, "--dflash-k"));
+    else if (arg == "--dflash-p-min") a.dflash_p_min = ParseFloat("--dflash-p-min", NextCliArg(argc, argv, i, "--dflash-p-min"));
+    else if (arg == "--dflash-n-min") a.dflash_n_min = ParseI64("--dflash-n-min", NextCliArg(argc, argv, i, "--dflash-n-min"));
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -215,6 +252,26 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   }
   if (a.profile && a.profile_prefill) {
     throw CliUsageError("--profile and --profile-prefill are mutually exclusive");
+  }
+  if (!a.dflash.empty() && a.mtp > 0) {
+    throw CliUsageError("--dflash and --mtp are mutually exclusive (docs/dflash2.md: DFlash2 and "
+                         "MTP are separate self-speculation families, not combinable)");
+  }
+  if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
+    throw CliUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up to "
+                         "block_size-1 drafted tokens)");
+  }
+  // Review finding (2026-09-21): DecodeStepProfiled/PrefillProfiled do not call
+  // CaptureDflashLayerInput/DflashDraft::InjectFeatures, but both still advance Model::pos_ --
+  // with --dflash attached this desyncs pos_ from DflashDraft::InjectedCount(), and the very next
+  // real decode step throws "start_pos != InjectedCount()". Cheaper to reject the combination at
+  // parse time (matches --profile's existing "standalone diagnostic" framing) than to thread
+  // capture+inject into both profiled loops for a diagnostic that already doesn't measure the
+  // --mtp path's own drafter cost either.
+  if (!a.dflash.empty() && (a.profile || a.profile_prefill)) {
+    throw CliUsageError("--profile/--profile-prefill and --dflash are mutually exclusive "
+                         "(the profiled step/chunk loops do not feed the DFlash2 drafter, which "
+                         "would desync Model::pos_ from the drafter's own injected-row count)");
   }
   return a;
 }

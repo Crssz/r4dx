@@ -203,6 +203,126 @@ void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t
 void r4dx_gather_i32(int64_t table, int64_t idx, int64_t out, int64_t n, int64_t table_size,
                       int64_t stream);
 
+// ==== DFlash2 drafter device pieces (docs/dflash2.md "Kernels", Milestone 5 S1) ================
+// The five device-side primitives the DFlash2 draft forward needs that nothing in this repo or in
+// third_party/libr4d already provides. Every convention below (pairing, theta, norm form, SWA
+// visibility rule, conv delta/base layout, tie-break) is docs/dflash2.md's, not a guess; each one
+// has a ctest unit test under tests/kernels/ that checks it against a CPU reference AND against
+// the Python reference's fixture A (tools/reference/golden_out/dflash2/fixture_a).
+//
+// NOTE on shapes: these are purpose-built for the DFlash2 draft block, not general-purpose. Each
+// entry point states its preconditions and the host wrapper throws std::runtime_error (not a
+// silent wrong answer) when one is violated.
+
+// ---- rope: full-width NeoX split-half, per-row absolute positions -----------------------------
+// In-place rotation of ALL `head_dim` dims of each head (docs/dflash2.md section 3: n_rot == 128 ==
+// head_dim, so unlike r4dx_rope_partial_mrope_bf16 above there is no pass-through tail), NeoX
+// split-half pairing (element i pairs with i + head_dim/2), theta 1e7 for the real drafter. fp32
+// math, RTNE back to bf16.
+//
+//   half = head_dim/2;  angle[i] = pos * theta^(-2i/head_dim),  i in [0, half)
+//   out[i]      = x[i]*cos - x[i+half]*sin
+//   out[i+half] = x[i+half]*cos + x[i]*sin
+//
+// This is mathematically the `rotary_dim == head_dim` case of r4dx_rope_partial_mrope_bf16, and is
+// a separate entry point for two reasons: (a) the DFlash2 INJECTION path ropes K only (there is no
+// Wq in that path at all -- docs/dflash2.md section 4.1), which that kernel cannot express since it
+// unconditionally dereferences both q and k; (b) `theta`/`head_dim`/no-tail is this drafter's
+// contract, and mixing it into the target model's partial-rotary entry point would make a future
+// change to either silently affect the other.
+//
+// q: [rows, heads_q, head_dim] bf16, in place -- pass q=0 AND heads_q=0 to rope K only.
+// k: [rows, heads_k, head_dim] bf16, in place -- pass k=0 AND heads_k=0 to rope Q only.
+// pos_ids: [rows] int32 DEVICE pointer, the tokens' absolute sequence positions.
+// Precondition: head_dim even.
+void r4dx_rope_neox_bf16(int64_t q, int64_t k, int64_t pos_ids, int rows, int heads_q, int heads_k,
+                          int head_dim, float theta, int64_t stream);
+
+// ---- per-row top-16 -----------------------------------------------------------------------
+// out_ids[r, 0..15] / out_vals[r, 0..15] = the 16 largest entries of logits[r, 0..vocab), sorted
+// DESCENDING by value, ties broken deterministically toward the LOWER id (the total order is
+// "(v, i) beats (v', i') iff v > v' || (v == v' && i < i')"). This is `ggml_top_k`'s contract as
+// the DFlash2 selector consumes it (docs/dflash2.md section 4.2: `cand, unary = top16(logits)`).
+//
+// One workgroup per row; each thread keeps a register-resident sorted top-16 over its own
+// grid-strided slice, then the 256 per-thread lists are merged pairwise in LDS (8 rounds). The
+// merge uses the same total order, so the result is exactly the global top-16 under it --
+// deterministic run to run, independent of thread scheduling.
+//
+// logits: [rows, vocab] fp32 device pointer, rows contiguous (row stride == vocab).
+// out_ids: [rows, 16] int32. out_vals: [rows, 16] fp32.
+// Preconditions: 1 <= rows <= 8 (the DFlash2 block size; the kernel is correct for any rows but
+// the launch is sized for a handful of rows, see the wrapper), vocab >= 16.
+void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows, int64_t vocab,
+                      int64_t stream);
+
+// ---- DFlash2 draft-block attention: non-causal, windowed, GQA ---------------------------------
+// The draft block's own attention (docs/dflash2.md section 4.2 / the "SWA visibility rule" row of
+// section 2's table). For query row t (absolute position q_pos = n_injected + t) the visible key
+// set is:
+//   * injected-store positions p in [max(0, q_pos - window + 1), n_injected - 1]   (the SWA rule
+//     `q_pos - p < window`, plus "only already-injected positions"), read at slot p % slots;
+//   * ALL T of the block's own keys, unconditionally -- the block is non-causal, and a block key
+//     in the query's future is never masked (`attention.causal=false`; the SWA rule's
+//     `q_pos - p < window` is trivially true for a negative difference).
+// Softmax in fp32 (numerically stable two-pass: the visible row's scores are materialised in LDS,
+// then max-subtracted, exponentiated and normalised there), bf16 output. GQA: q-head h reads
+// kv-head h / (heads_q/heads_kv).
+//
+// q:        [T, heads_q,  head_dim] bf16 -- post-q_norm, post-rope.
+// k_block:  [T, heads_kv, head_dim] bf16 -- post-k_norm, post-rope. SCRATCH: never written to the
+// v_block:  [T, heads_kv, head_dim] bf16    store by this kernel (docs/dflash2.md section 5: the
+//                                           block's own K/V is discarded every round, which is why
+//                                           the ring needs no rollback).
+// k_store:  [slots, heads_kv, head_dim] bf16 -- the injected-feature ring, slot = position % slots.
+// v_store:  [slots, heads_kv, head_dim] bf16
+// out:      [T, heads_q, head_dim] bf16.
+// n_injected: number of positions already injected (== the block's start position).
+// Preconditions (throw, not silently wrong): 1 <= T <= 8; head_dim <= 128 and head_dim % 32 == 0;
+// heads_q % heads_kv == 0 and the ratio <= 4; 1 <= window <= 2048; window <= slots (so the visible
+// store range can never alias itself in the ring).
+void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                            int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                            int head_dim, int n_injected, int window, int slots, float scale,
+                            int64_t stream);
+
+// ---- DFlash2 grouped dynamic depthwise conv (thin wrapper over libr4d) -------------------------
+// out[t,c] = (base[side,0,c] + dyn[t, side*taps*NG + 0*NG + g]) * x[t,c]
+//          + (base[side,1,c] + dyn[t, side*taps*NG + 1*NG + g]) * x[t-1,c] * (t >= 1),  g = c/16
+// with taps = 2 and group = 16 (the only geometry libr4d compiles: r4d_dflash_conv_t2_g16_bf16).
+// This is NOT a new r4dx kernel -- it is the address arithmetic that turns the container's own
+// tensor layouts into that entry point's (x, delta, base, dpitch, NG) contract, which is the part
+// that is easy to get wrong and is what the unit test pins:
+//   delta = dyn + side*taps*NG        (the [T, 2, taps, NG] projection's side-major slice;
+//                                      dpitch stays the FULL 2*taps*NG row pitch, per r4d.h:118)
+//   base  = base + side*taps*H        (base is [2(side)][taps][H], channel fastest)
+//   NG    = H / group
+// `block_size` must be a power of two >= T; the caller passes ONE block starting at row 0, so
+// r4d_dflash_conv_body's `(t & blockmask) >= tap` degenerates to `t >= tap` (docs/dflash2.md's
+// "Shift-by-one / block-start masking" row). `out` must not alias `x` (libr4d's own precondition).
+//
+// x: [T, H] bf16. dyn: [T, 2*taps*NG] bf16. base: [2, taps, H] bf16. out: [T, H] bf16.
+// Deliberately does NOT increment r4dx_kernel_launch_counter: that counter's documented contract
+// (below) is "r4dx-owned launches only, never third_party/libr4d's", and the launch this makes is
+// libr4d's.
+void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, int T, int H,
+                            int side, int block_size, int64_t stream);
+
+// ---- plain (non zero-centered) rmsnorm ---------------------------------------------------------
+// out[row,:] = x[row,:] * rsqrt(mean(x[row,:]^2) + eps) * weight[:]
+// i.e. the PLAIN weight form, NOT r4dx_rmsnorm_bf16's `(1 + weight)` Qwen3_5RMSNorm convention at
+// the top of this header. DFlash2 is a llama.cpp-native checkpoint whose every norm site is ggml's
+// plain `ggml_rms_norm` + `ggml_mul` (docs/dflash2.md's "RMSNorm convention" row); feeding a
+// DFlash2 norm weight to r4dx_rmsnorm_bf16 would add a spurious +1 to every channel. Nothing in
+// this repo or in third_party/libr4d computed this form before (r4d_gdn_gated_rmsnorm_h128_bf16 is
+// the gated per-head variant, a different op), hence a new entry point rather than a flag.
+// fp32 accumulation. x: [rows, hidden] bf16. weight: [hidden] bf16.
+// out: [rows, hidden], bf16 when out_fp32 == 0, fp32 when out_fp32 != 0 (the encoder path wants
+// fp32 to feed a host-side check / a downstream fp32 consumer; the layer path wants bf16).
+// In-place (out == x, out_fp32 == 0) is supported -- see the kernel's own comment.
+void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
+                              float eps, int out_fp32, int64_t stream);
+
 // ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
 // A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per
 // model.h's own SCOPE comment, so this needs no atomic/lock any more than PickTuning's cache does)

@@ -163,20 +163,22 @@ void TestMtpHeadLayoutFlag() {
 }
 
 // --mtp-draft-head (docs/r9700.md R9, "reduced-vocab draft head"): mirrors src/cli/cli_args.h's own
-// flag -- defaults to "reduced", accepts "full", rejects anything else.
+// flag -- defaults to "full" (flipped 2026-09-20, Milestone 5 B2 item 8; matched-K=3 real-hardware
+// re-measurement, review fix pass: full 68.20/68.64 tok/s vs reduced 53.59/54.17 tok/s, see
+// src/cli/cli_args.h's own comment), accepts "reduced", rejects anything else.
 void TestMtpDraftHeadFlag() {
   {
     std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
     auto argv = ToArgv(storage);
     const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
-    CHECK(a.mtp_draft_head == "reduced");
+    CHECK(a.mtp_draft_head == "full");
   }
   {
     std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--mtp", "3",
-                                         "--mtp-draft-head", "full"};
+                                         "--mtp-draft-head", "reduced"};
     auto argv = ToArgv(storage);
     const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
-    CHECK(a.mtp_draft_head == "full");
+    CHECK(a.mtp_draft_head == "reduced");
   }
   {
     std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx",
@@ -245,6 +247,55 @@ void TestMtpUpperBound() {
   }
 }
 
+// --dflash/--dflash-k/--dflash-p-min/--dflash-n-min (docs/dflash2.md, stage S3 item 1): mirrors
+// src/cli/cli_args.h's own TestDflashFlags exactly.
+void TestDflashFlags() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.dflash.empty());
+    CHECK(a.dflash_k == 7);
+    CHECK(a.dflash_p_min == 0.0f);
+    CHECK(a.dflash_n_min == 0);
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server",    "--model",        "m.r4dx",
+                                         "--dflash",       "draft.r4dx",     "--dflash-k", "5",
+                                         "--dflash-p-min", "0.3",            "--dflash-n-min", "2"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.dflash == "draft.r4dx");
+    CHECK(a.dflash_k == 5);
+    CHECK(a.dflash_p_min > 0.29f && a.dflash_p_min < 0.31f);
+    CHECK(a.dflash_n_min == 2);
+  }
+  {  // --dflash with --mtp > 0 is an error
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--dflash",
+                                         "draft.r4dx",  "--mtp",   "3"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+  {  // --dflash-k out of [1,7] is an error, but only when --dflash is actually given
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--dflash",
+                                         "draft.r4dx",  "--dflash-k", "8"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -258,6 +309,7 @@ int main() {
   TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();
   TestMtpUpperBound();
+  TestDflashFlags();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

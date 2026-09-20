@@ -294,14 +294,51 @@ CLI's own conversion. Covered by `tests/server/test_server_args.cpp`'s `TestMtpH
 (defaults, `bf16` override, and rejection of an unrecognized value).
 
 **New (docs/r9700.md R9, "reduced-vocab draft head")**: `--mtp-draft-head {reduced,full}` (default
-`reduced`), mirroring `src/cli/cli_args.h`'s own flag, wired to `ModelOptions::
-mtp_draft_reduced_vocab` in `src/server/main.cpp` identically to the CLI. `reduced` uses the
+`full`, flipped from `reduced` 2026-09-20 per Milestone 5 B2 item 8 -- matched-K=3 real-hardware
+re-measurement: `full` 68.20/68.64 tok/s (46.3% acceptance) vs `reduced` 53.59/54.17 tok/s (20.9%
+acceptance), byte-identical generated text either way, see docs/mtp.md's "Flag default flipped"
+correction), mirroring `src/cli/cli_args.h`'s
+own flag, wired to `ModelOptions:: mtp_draft_reduced_vocab` in `src/server/main.cpp` identically to
+the CLI. `reduced` uses the
 container's OPTIONAL `mtp.draft_head.*` tensors (docs/container-format.md) to speed up drafting when
 present, degrading to the exact pre-R9 full-vocab behavior automatically when absent; `full` forces
 the full-vocab head unconditionally. Verification always stays full-vocab regardless of this flag,
 so it can only affect drafting speed/acceptance, never generated output (see docs/mtp.md's
 "Reduced-vocab draft head" section for the full argument and the measured K-sweep). Covered by
 `tests/server/test_server_args.cpp`'s `TestMtpDraftHeadFlag`.
+
+**New (Milestone 5 stage S3, docs/dflash2.md)**: `--dflash <draft.r4dx>` enables server-side DFlash2
+block-diffusion self-speculative decode, mirroring `src/cli/cli_args.h`'s own `--dflash` flag
+exactly -- same `--dflash-k`/`--dflash-p-min`/`--dflash-n-min` companions, same mutual exclusion
+with `--mtp > 0` (rejected at arg-parse time, both `ServerUsageError` and `Model::Load`'s own
+re-check), same greedy-only gate (`Engine::RunRequest`'s `use_dflash` mirrors `use_mtp` exactly).
+The DFlash2 draft container is independent of `--layout` (the TARGET body's layout) -- it carries
+its own packed layout in its own metadata. `tools/server/smoke.ps1` gained `-Dflash <path>` and a
+`" dflash: "` request-log check; run for real against the real 64-layer container + the real w4a16
+draft container, all 28 checks passed (streaming and tool-call mode both unaffected). Covered by
+`tests/server/test_server_args.cpp`'s `TestDflashFlags`.
+
+**Known tax on sampled (`temperature>0`) traffic (review finding, 2026-09-21, recorded rather than
+"fixed" -- see the reasoning below):** `--dflash` is a `Model`-wide, load-time flag, not a
+per-request one -- `Model::Load` attaches the drafter and `RunChunk` auto-feeds it
+(`DflashDraft::InjectFeatures`) on *every* prefill chunk and decode step for the life of the process,
+while `Engine::RunRequest`'s `use_dflash` gate only decides whether a given request's decode loop
+*reads* drafted tokens (greedy-only, mirroring `use_mtp`). A `temperature>0` request on a `--dflash`
+server therefore still pays the drafter's per-step encoder GEMM + 5-layer forward + KV-ring injection
+cost even though it will never call `DecodeStepDflashGreedy`. Measured on the real 64-layer w4a16
+container: a `temperature=0.8` request against a `--dflash`-enabled server reported 37.70 tok/s vs the
+CLI's own `--mtp 0` baseline of 38.90 tok/s on the same prompt (~3%), plus the drafter's ~0.95 GiB
+VRAM held regardless of whether any request ever uses it.
+`r4dx-cli` avoids this by clearing `args.dflash` outright at `temperature>0` before `Model::Load`
+(`src/cli/main.cpp`) -- a CLI process serves one request per invocation, so that is free. A server
+process serves many requests with a shared `Model` and a shared `DflashDraft` ring across turns, so
+the same trick cannot be applied per-request without desyncing `DflashDraft::InjectedCount()` from
+`Model::pos_` for a *later*, greedy request on the same session: `InjectFeatures` requires
+`start_pos == InjectedCount()` (append-only, docs/dflash2.md), so skipping injection on a sampled turn
+would make the very next greedy turn throw. Operators running a `--dflash` server for genuinely mixed
+greedy/sampled traffic should budget this ~3% tax on every request, not just the greedy ones that
+benefit from it; a per-request toggle that is actually safe would need `DflashDraft` to track and
+tolerate gaps in its own ring, which is out of scope for a documentation fix.
 
 ## CLI flags
 
@@ -312,10 +349,14 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--default-temperature F] [--default-top-p F] [--default-top-k N]
     [--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]
     [--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}]
-    [--embed-device-resident {on|off}]
+    [--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N]
+    [--dflash-p-min F] [--dflash-n-min N]
 ```
 
 `--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
+
+`--dflash <draft.r4dx>` (default empty, disabled): see the "New (Milestone 5 stage S3...)" note
+above -- mutually exclusive with `--mtp N>0`.
 
 `--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B`, same as `r4dx-cli`. `--think` sets the
 server-wide default for the chat template's `enable_thinking` when a request's

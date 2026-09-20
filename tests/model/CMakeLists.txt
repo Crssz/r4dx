@@ -9,6 +9,9 @@ set(R4DX_MODEL_TESTS
   test_final_lm_head
   test_forward_smoke
   test_mtp
+  test_dflash_feature_capture
+  test_dflash_draft
+  test_dflash_e2e
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -21,12 +24,24 @@ foreach(t ${R4DX_MODEL_TESTS})
   )
 endforeach()
 
+# test_dflash_draft (Milestone 5 stage S2, docs/dflash2.md "Implementation") reads the same
+# tools/reference/golden_out/dflash2/fixture_{a,b,c} .npy arrays the five S1 kernel tests do, so it
+# reuses their reader (tests/kernels/npy_fixture.hpp) rather than duplicating it -- an include dir
+# is the whole coupling; no tests/kernels target is linked, and nothing in that directory changes.
+# It also SKIPs (77) when the fixtures or the DFlash2 draft container are absent, exactly like those
+# tests; the foreach() above already sets SKIP_RETURN_CODE for every R4DX_MODEL_TESTS entry.
+target_include_directories(test_dflash_draft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels)
+
 # test_mtp's CheckChatMultiTurnMidRoundStop (docs/status.md Known-gaps: "no automated
 # multi-turn-with-a-forced-mid-round-stop regression test") drives the exact production
 # r4dx::server::PrefixState (src/server/prefix_state.h) -- header-only, no HIP/r4dx::model
 # dependency of its own, same reasoning tests/server/test_prefix_state.cpp relies on -- so it is
 # safe to include directly from this HIP-linked test binary without linking r4dx_server itself.
 target_include_directories(test_mtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/server)
+
+# test_dflash_e2e (Milestone 5 stage S3 item 3): the --dflash variant of test_mtp's own
+# CheckChatMultiTurnMidRoundStop above -- same PrefixState dependency, same reasoning.
+target_include_directories(test_dflash_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/server)
 
 # tool_hseed_drift: one-off diagnostic for docs/mtp.md's "Acceptance gap investigation" (h_seed
 # drift vs a bf16 reference, per layout) -- built here (same libs, same SKIP-if-missing-container
@@ -44,6 +59,15 @@ target_link_libraries(tool_hseed_drift PRIVATE r4dx_model r4dx_convert r4dx_core
 # tokenizer, unlike tool_hseed_drift.
 add_executable(tool_vocab_calib tool_vocab_calib.cpp)
 target_link_libraries(tool_vocab_calib PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core r4dx_tokenizer)
+
+# tool_dflash_probe: Milestone 5 stage S2 items 4 and 5 (docs/dflash2.md "Implementation") -- the
+# REAL-input anchor check (dump the target's captured features for a tokenized prompt, draft, and
+# hand the Python reference the same inputs) plus the isolated DraftRound/InjectFeatures cost.
+# Needs the full 27B container, a DFlash2 draft container AND the tokenizer, and prints numbers for
+# a human/doc rather than asserting a contract -- so the same "built, never add_test()'d"
+# convention as tool_hseed_drift/tool_vocab_calib above.
+add_executable(tool_dflash_probe tool_dflash_probe.cpp)
+target_link_libraries(tool_dflash_probe PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core r4dx_tokenizer)
 
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),

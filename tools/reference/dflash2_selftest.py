@@ -130,6 +130,24 @@ def test_fixture_a_determinism() -> None:
         )
     assert_bit_identical("attn_conv_in_l0", result.intermediates["attn_conv_in_l0"], fdir / "attn_conv_in_l0.npy")
     assert_bit_identical("attn_conv_out_l0", result.intermediates["attn_conv_out_l0"], fdir / "attn_conv_out_l0.npy")
+    # Layer-0 device-kernel drive arrays (docs/dflash2.md "Kernels"): same determinism gate as
+    # every other fixture-A intermediate, so a regenerated fixture that silently changed any of
+    # them (and therefore silently changed what tests/kernels/test_dflash_*.cpp compares against)
+    # fails here first.
+    for _name in (
+        "attn_conv_x_l0",
+        "attn_dyn_l0",
+        "attn_conv_base_l0",
+        "attn_o_preconv_l0",
+        "attn_q_prerope_l0",
+        "attn_k_prerope_l0",
+        "attn_q_l0",
+        "attn_k_l0",
+        "attn_v_l0",
+        "attn_out_l0",
+    ):
+        assert_bit_identical(_name, result.intermediates[_name], fdir / f"{_name}.npy")
+    assert_bit_identical("output_norm_w", weights.output_norm, fdir / "output_norm_w.npy")
     assert_bit_identical("x_final_normed", result.intermediates["x_final_normed"], fdir / "x_final_normed.npy")
     assert_bit_identical("logits", result.intermediates["logits"], fdir / "logits.npy")
     assert_bit_identical("cand", result.intermediates["cand"], fdir / "cand.npy")

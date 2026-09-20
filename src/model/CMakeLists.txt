@@ -79,6 +79,7 @@ add_library(r4dx_model STATIC
   mlp.cpp
   final_lm_head.cpp
   mtp_head.cpp
+  dflash_draft.cpp
   model.cpp
 )
 target_include_directories(r4dx_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

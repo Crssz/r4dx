@@ -34,6 +34,13 @@
   e.g. D:\models\r4dx\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
   container with -Mtp 3 (this stage's own required verification runs).
 
+.PARAMETER Dflash
+  Path to a DFlash2 draft container, passed to r4dx-server's --dflash (docs/dflash2.md, Milestone 5
+  stage S3 item 7). Empty (default) disables it. Mutually exclusive with -Mtp > 0 (server_args.h's
+  own check rejects both at once) -- needs -Model pointed at a container with enough layers to
+  cover the draft's own target_layers (the real 64-layer container for every shipped DFlash2
+  container, whose target_layers reach layer 62).
+
 .PARAMETER ToolRoundTrip
   Exercises a real tool call/result/answer multi-turn round trip (docs/server.md's "Tool calls"):
   offers a `get_current_weather` tool definition, sends the server's own parsed
@@ -60,6 +67,7 @@ param(
     [int]$Port = 8091,
     [int]$Layers = 4,
     [int]$Mtp = 0,
+    [string]$Dflash = "",
     [switch]$ToolRoundTrip,
     [string]$Preset = "win-hip"
 )
@@ -94,6 +102,7 @@ $ServerArgList = @(
 )
 if ($Layers -ge 0) { $ServerArgList += @("--layers", "$Layers") }
 if ($Mtp -gt 0) { $ServerArgList += @("--mtp", "$Mtp") }
+if ($Dflash -ne "") { $ServerArgList += @("--dflash", "$Dflash") }
 $proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgList -PassThru `
   -RedirectStandardError $ServerErrLog `
   -RedirectStandardOutput "$env:TEMP\r4dx-server-smoke.out.log"
@@ -212,6 +221,11 @@ try {
     if ($Mtp -gt 0) {
         $mtpLines = @(Select-String -Path $ServerErrLog -Pattern " mtp: " -SimpleMatch -ErrorAction SilentlyContinue)
         Check ($mtpLines.Count -ge 1) "-Mtp ${Mtp}: at least one request log line shows the MTP path was taken"
+    }
+
+    if ($Dflash -ne "") {
+        $dflashLines = @(Select-String -Path $ServerErrLog -Pattern " dflash: " -SimpleMatch -ErrorAction SilentlyContinue)
+        Check ($dflashLines.Count -ge 1) "-Dflash: at least one request log line shows the DFlash2 path was taken"
     }
 
     # ---- Real tool call / result / answer round trip (docs/server.md's "Tool calls") -------------

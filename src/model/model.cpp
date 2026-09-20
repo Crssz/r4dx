@@ -1,4 +1,4 @@
-#include "model.h"
+﻿#include "model.h"
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dflash_draft_weights.h"
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "gdn_layer.h"
@@ -36,7 +37,61 @@ std::vector<Model::ProfileEntry> ToProfileEntries(std::vector<SpanEntry> raw) {
   return out;
 }
 
+// DFlash2 target feature capture (docs/dflash2.md, Milestone 5 B1 item 1): called once per layer
+// iteration in both RunChunk's and VerifyWindow's layer loops, BEFORE that layer's Gdn/Attn
+// Forward call mutates `cur` -- `cur` at this point is exactly the residual stream as it enters
+// layer `layer_idx`, which is what target_layers[*] names (0-based layer INPUT index). A no-op
+// (single `.empty()` check, no allocation, no copy) when no drafter is attached, i.e. for every
+// caller before this pass and every ctest/CLI/server invocation that never calls
+// Model::AttachDflashFeatureCapture -- byte-identical behavior and r4dx-owned kernel launch count
+// to pre-B1 (this uses hipMemcpy2DAsync, the plain HIP runtime strided D2D copy, not a new r4dx-
+// owned kernel, so r4dx::kernels::r4dx_kernel_launch_counter_get() never counts it either way).
+void CaptureDflashLayerInput(core::Stream& stream, int64_t layer_idx, const uint16_t* cur,
+                              int64_t T, int64_t hidden,
+                              const std::vector<int64_t>& target_layers, uint16_t* dst) {
+  if (target_layers.empty()) return;
+  const auto it = std::find(target_layers.begin(), target_layers.end(), layer_idx);
+  if (it == target_layers.end()) return;
+  const int64_t col = static_cast<int64_t>(std::distance(target_layers.begin(), it));
+  const int64_t num_cols = static_cast<int64_t>(target_layers.size());
+  const size_t elem = sizeof(uint16_t);
+  R4DX_HIP_CHECK(hipMemcpy2DAsync(
+      /*dst=*/dst + col * hidden, /*dpitch=*/static_cast<size_t>(num_cols * hidden) * elem,
+      /*src=*/cur, /*spitch=*/static_cast<size_t>(hidden) * elem,
+      /*width=*/static_cast<size_t>(hidden) * elem, /*height=*/static_cast<size_t>(T),
+      hipMemcpyDeviceToDevice, stream.get()));
+}
+
 }  // namespace
+
+void Model::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
+  if (target_layers.empty()) {
+    DetachDflashFeatureCapture();
+    return;
+  }
+  const int64_t num_layers = container_.NumLoadedLayers();
+  for (size_t i = 0; i < target_layers.size(); ++i) {
+    if (target_layers[i] < 0 || target_layers[i] >= num_layers) {
+      throw std::out_of_range("Model::AttachDflashFeatureCapture: target layer index out of range");
+    }
+    if (i > 0 && target_layers[i] <= target_layers[i - 1]) {
+      throw std::invalid_argument(
+          "Model::AttachDflashFeatureCapture: target_layers must be sorted, strictly ascending");
+    }
+  }
+  dflash_target_layers_ = std::move(target_layers);
+  const int64_t hidden = container_.Config().hidden_size;
+  dflash_features_dev_.Resize(static_cast<size_t>(max_chunk_) *
+                               static_cast<size_t>(dflash_target_layers_.size()) *
+                               static_cast<size_t>(hidden));
+  dflash_feature_rows_ = 0;
+}
+
+void Model::DetachDflashFeatureCapture() {
+  dflash_target_layers_.clear();
+  dflash_features_dev_.Resize(0);
+  dflash_feature_rows_ = 0;
+}
 
 namespace {
 
@@ -75,13 +130,33 @@ Model Model::Load(const ModelOptions& opts) {
         "Model::Load: mtp_draft_k > 0 but the container has no mtp.* weights (convert with "
         "--mtp on)");
   }
+  if (opts.dflash_draft_k < 0) {
+    throw std::runtime_error("Model::Load: dflash_draft_k must be >= 0");
+  }
+  if (!opts.dflash_container.empty()) {
+    if (opts.dflash_draft_k <= 0) {
+      throw std::runtime_error(
+          "Model::Load: dflash_container is set but dflash_draft_k <= 0 (nothing would ever be "
+          "drafted -- Model::VerifyWindow's own window would never exceed 1 row)");
+    }
+    if (opts.mtp_draft_k > 0) {
+      throw std::runtime_error(
+          "Model::Load: dflash_container cannot be combined with mtp_draft_k > 0 -- DFlash2 and "
+          "MTP are mutually exclusive self-speculation families (docs/dflash2.md); the CLI/server "
+          "already reject --dflash with --mtp > 0, this is Model::Load's own re-check so no caller "
+          "can bypass that by constructing ModelOptions directly)");
+    }
+  }
   m.mtp_draft_k_ = opts.mtp_draft_k;
+  m.dflash_draft_k_ = opts.dflash_draft_k;
   m.mtp_draft_reduced_vocab_ = opts.mtp_draft_reduced_vocab;
   // GDN's per-sequence window bank (gdn_state.h's file comment) must be sized for the largest
-  // speculative-verify window this Model will ever run: mtp_draft_k drafts plus the seed token.
-  // ==1 (window index 0 only) when MTP is disabled -- every decode call then degenerates exactly
-  // to this class's pre-MTP behavior.
-  const int64_t max_decode_window = 1 + opts.mtp_draft_k;
+  // speculative-verify window this Model will ever run: the widest draft either speculation family
+  // can produce, plus the seed/anchor token. ==1 (window index 0 only) when neither is enabled --
+  // every decode call then degenerates exactly to this class's pre-speculation behavior, and a
+  // Model with only MTP enabled sizes identically to before dflash_draft_k existed.
+  m.draft_window_ = 1 + std::max(opts.mtp_draft_k, opts.dflash_draft_k);
+  const int64_t max_decode_window = m.draft_window_;
 
   m.max_chunk_ = 64;
   m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
@@ -136,11 +211,79 @@ Model Model::Load(const ModelOptions& opts) {
   if (opts.mtp_draft_k > 0) {
     m.mtp_.emplace(cfg, m.container_.Mtp(), opts.mtp_draft_k, opts.max_ctx);
     m.mtp_seed_hidden_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(hidden));
-    m.mtp_num_accepted_dev_ = core::DeviceBuffer<int32_t>(1);
-    m.mtp_logits_dev_ =
-        core::DeviceBuffer<float>(static_cast<size_t>((opts.mtp_draft_k + 1) * cfg.vocab_size));
-    m.mtp_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(opts.mtp_draft_k + 1));
   }
+  // Verify scratch + the GDN acceptance-count thread are shared by BOTH speculation families, so
+  // they are sized off draft_window_ rather than off mtp_draft_k alone -- a DFlash2-only Model
+  // (mtp_draft_k==0, dflash_draft_k>0) has no mtp.* weights anywhere but still verifies through
+  // Model::VerifyWindow, which needs exactly these.
+  if (m.draft_window_ > 1) {
+    m.mtp_num_accepted_dev_ = core::DeviceBuffer<int32_t>(1);
+    m.verify_logits_dev_ =
+        core::DeviceBuffer<float>(static_cast<size_t>(m.draft_window_ * cfg.vocab_size));
+    m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.draft_window_));
+  }
+
+  // Stage S3 (docs/dflash2.md section 7 item 1): load the DFlash2 drafter, if requested, as its own
+  // phase so its VRAM (weights + KV ring + draft-block scratch, all allocated inside
+  // DflashDraft::Load) can be reported as its own breakdown line rather than folded silently into
+  // the generic "kv+gdn_state" bucket above.
+  const VramSnap vram_dflash0 = SnapVram();
+  bool has_dflash = false;
+  if (!opts.dflash_container.empty()) {
+    // The container's own packed layout lives in its metadata (docs/container-format.md), NOT in
+    // ModelOptions -- a DFlash2 draft container is a completely separate tensor set from the
+    // target body and may be converted to a different layout independently (model.h's own doc
+    // comment on ModelOptions::dflash_container). Peek it with a throwaway DflashDraftWeights::Open
+    // (a second mmap of the same small file, freed immediately) rather than adding a layout
+    // parameter a caller would have to keep in sync with the file by hand.
+    const DflashDraftWeights peek = DflashDraftWeights::Open(opts.dflash_container);
+    const Dflash2Config& dcfg = peek.Config();
+    if (dcfg.layout.empty()) {
+      throw std::runtime_error("Model::Load: dflash container '" + opts.dflash_container +
+                               "' has no 'layout' field in its __metadata__.dflash2 block");
+    }
+    const Layout dflash_layout = LayoutFromName(dcfg.layout);  // throws on an unrecognized name --
+                                                                // this IS the "layout validated" step
+    if (opts.dflash_draft_k > dcfg.block_size - 1) {
+      throw std::runtime_error(
+          "Model::Load: dflash_draft_k (" + std::to_string(opts.dflash_draft_k) +
+          ") exceeds this container's own block_size-1 (" + std::to_string(dcfg.block_size - 1) +
+          ") -- the drafter can never produce more than block_size-1 tokens per round");
+    }
+    // Review finding (2026-09-21): the drafter's fc encoder input is sized as
+    // target_layers.size() * dcfg.hidden_size (DflashDraft::Load), while Model's own capture buffer
+    // is sized as target_layers.size() * cfg.hidden_size (DflashFeatureCols(), AttachDflashFeatureCapture
+    // below). A mismatched pair silently reads/writes past dflash_features_dev_ instead of throwing a
+    // clear error -- catch it here, at load time, naming both values.
+    if (dcfg.hidden_size != cfg.hidden_size) {
+      throw std::runtime_error(
+          "Model::Load: dflash container '" + opts.dflash_container + "' hidden_size (" +
+          std::to_string(dcfg.hidden_size) + ") does not match the target model's hidden_size (" +
+          std::to_string(cfg.hidden_size) + ") -- the drafter's feature encoder input width would not "
+          "match the target's captured residual-stream width");
+    }
+    DflashDraftOptions dopts;
+    dopts.container_path = opts.dflash_container;
+    dopts.layout = dflash_layout;
+    dopts.lm_head_vocab = cfg.vocab_size;  // the TARGET's own vocab (docs/dflash2.md: the drafter
+                                            // has no lm_head of its own, MakeTargetLmHeadProvider
+                                            // always runs the target's real head)
+    m.dflash_ = DflashDraft::Load(dopts);
+    // Auto-feed this Model-owned drafter from every RunChunk call (prefill chunk + plain decode
+    // step) -- see RunChunk's own comment for exactly where, and model.h's dflash_ field comment
+    // for why this is a direct member call rather than the external dflash_observer_ mechanism.
+    m.AttachDflashFeatureCapture(m.dflash_->Config().target_layers);
+    std::cerr << "[r4dx::model::Model] DFlash2 drafter loaded: " << opts.dflash_container
+              << " (layout=" << LayoutName(dflash_layout)
+              << ", block_size=" << dcfg.block_size << ", target_layers=[";
+    for (size_t i = 0; i < dcfg.target_layers.size(); ++i) {
+      std::cerr << (i ? "," : "") << dcfg.target_layers[i];
+    }
+    std::cerr << "], selector_rank=" << dcfg.selector_rank
+              << ", sliding_window=" << dcfg.attention.sliding_window << ")\n";
+    has_dflash = true;
+  }
+  const VramSnap vram_dflash1 = SnapVram();
 
   m.stream_.Synchronize();
 
@@ -151,7 +294,11 @@ Model Model::Load(const ModelOptions& opts) {
   // Q13's own point: that arithmetic could not explain why w4a8's 0.35 GiB-smaller weights still
   // measured the identical 15.75 GiB as w4a16). Printed unconditionally (one line, stderr) rather
   // than gated behind a flag -- cheap, and exactly the diagnostic R14 asks every load to carry.
-  const VramSnap vram3 = SnapVram();  // after KV/GDN state + MTP scratch: the final steady state
+  // Stage S3: the dflash_drafter figure below (weights+KV-ring+draft-block-scratch, all allocated by
+  // DflashDraft::Load above) is ALSO already included in kv_b's total (it was allocated between the
+  // vram2 and vram3 snapshots) -- broken out here as its own line per docs/dflash2.md section 7
+  // item 1's own ask, not double-counted in the reported total.
+  const VramSnap vram3 = SnapVram();  // after KV/GDN state + MTP scratch + dflash: final steady state
   if (vram0.ok && vram1.ok && vram2.ok && vram3.ok) {
     const int64_t weights_b = static_cast<int64_t>(vram0.free_bytes) - static_cast<int64_t>(vram1.free_bytes);
     const int64_t arena_b = static_cast<int64_t>(vram1.free_bytes) - static_cast<int64_t>(vram2.free_bytes);
@@ -161,6 +308,12 @@ Model Model::Load(const ModelOptions& opts) {
               << " GiB, arena+scratch=" << GiB(arena_b) << " GiB, free="
               << GiB(static_cast<int64_t>(vram3.free_bytes)) << " GiB (of "
               << GiB(static_cast<int64_t>(vram3.total_bytes)) << " GiB total)\n";
+    if (has_dflash && vram_dflash0.ok && vram_dflash1.ok) {
+      const int64_t dflash_b =
+          static_cast<int64_t>(vram_dflash0.free_bytes) - static_cast<int64_t>(vram_dflash1.free_bytes);
+      std::cerr << "[r4dx::model::Model] DFlash2 drafter VRAM: " << GiB(dflash_b)
+                << " GiB (weights+kv_ring+draft_scratch; already included in kv+gdn_state above)\n";
+    }
   }
 
   return m;
@@ -190,6 +343,17 @@ void Model::Reset() {
   mtp_seed_valid_ = false;
   mtp_num_accepted_valid_ = false;
   mtp_last_hidden_ = nullptr;
+
+  // DFlash2 target feature capture (review finding, 2026-09-20): dflash_features_dev_'s bytes are
+  // now stale (the previous sequence's residual stream) but harmless for the identical reason
+  // mtp_seed_hidden_'s bytes above are -- dflash_feature_rows_==0 means DflashFeatureRows() reports
+  // "nothing captured yet" until the next RunChunk/VerifyWindow overwrites both the buffer and this
+  // count together, so a caller cannot observe a stale row count pointing at stale data.
+  dflash_feature_rows_ = 0;
+  // DFlash2's own KV ring (stage S3): drop every injected position -- the ring's bytes are left
+  // alone (same self-correcting-via-position-overwrite argument DflashDraft::Reset()'s own comment
+  // makes), so this is a cheap host-only counter reset, not a device zero/sync.
+  if (dflash_.has_value()) dflash_->Reset();
 }
 
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
@@ -250,6 +414,12 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // the sub-block's fused epilogue always targets THIS layer's post_attention_layernorm.
     const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
 
+    // DFlash2 target feature capture (see CaptureDflashLayerInput's comment above): `cur` right
+    // here, before this iteration's Gdn/Attn Forward call, is exactly the residual stream entering
+    // layer `i` -- a no-op when no drafter is attached.
+    CaptureDflashLayerInput(stream_, i, cur, T, hidden, dflash_target_layers_,
+                             dflash_features_dev_.data());
+
     if (cfg.IsGdnLayer(i)) {
       GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
       GdnLayerParams p;
@@ -266,9 +436,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // mtp_num_accepted_dev_=1/mtp_num_accepted_valid_=true right after this call commits, so the
       // NEXT plain decode step (or the next MTP round) seeds correctly regardless of which kind of
       // step follows.
-      p.num_accepted =
-          (!is_prefill_path && mtp_ && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data()
-                                                                  : nullptr;
+      p.num_accepted = (!is_prefill_path && draft_window_ > 1 && mtp_num_accepted_valid_)
+                            ? mtp_num_accepted_dev_.data()
+                            : nullptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -325,6 +495,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
     arena_.Reset();
   }
+  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = T;
 
   // ---- MTP lockstep KV priming (docs/mtp.md, mtp_head.h's PrimeKv comment) ----------------------
   // Extends MtpHead's own KV cache by exactly the real positions THIS call just made knowable --
@@ -415,10 +586,57 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // above already waited for every kernel that read the PREVIOUS value of
   // mtp_num_accepted_dev_). Prefill never touches this: mtp_num_accepted_valid_ is reset by
   // Prefill() itself for the first verify round after a fresh prefill.
-  if (!is_prefill_path && mtp_) {
+  if (!is_prefill_path && draft_window_ > 1) {
     const int32_t one = 1;
     mtp_num_accepted_dev_.CopyFromHost(&one, 1);
     mtp_num_accepted_valid_ = true;
+  }
+
+  // DFlash2 per-chunk capture drain (model.h's SetDflashCaptureObserver): invoked once per
+  // RunChunk -- prefill chunk AND plain decode step alike -- after this call's captured rows are
+  // complete on the device (the stream_.Synchronize() above already waited for them) and before any
+  // later call can overwrite dflash_features_dev_ at row 0. `pos_` is still this chunk's own start
+  // position here, which is exactly the absolute position of captured row 0.
+  if (dflash_observer_ && !dflash_target_layers_.empty()) {
+    dflash_observer_(dflash_features_dev_.data(), T, pos_);
+  }
+  // Stage S3: when THIS Model owns its own drafter (ModelOptions::dflash_container), feed it
+  // directly -- a plain member call, not the external dflash_observer_ mechanism above (model.h's
+  // dflash_ field comment explains why: dflash_observer_ closures are for a caller-owned drafter
+  // object with its own, separately-managed lifetime; dflash_ is a member of this very Model, so a
+  // direct call needs no captured pointer that a future Model move could invalidate). `pos_` is
+  // still this chunk's own start position here, exactly InjectFeatures' own `start_pos` contract
+  // (append-only, must equal DflashDraft::InjectedCount() -- true here because Prefill/DecodeStep*
+  // never skip a chunk's worth of positions and this call always injects every one of them).
+  if (dflash_.has_value() && !dflash_target_layers_.empty()) {
+    dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_);
+    // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
+    // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
+    // arena_ in this codebase resets it when done -- InjectFeatures' own scratch allocations (the
+    // fc encoder GEMM etc.) are the ONE exception, because leaving them un-reset means the NEXT
+    // RunChunk call (the next prefill chunk, or the next plain decode step) starts ITS OWN layer
+    // loop from a non-zero, dirty arena offset instead of the clean one every other code path
+    // (including the `--mtp 0` baseline this must stay byte-identical to) always starts from.
+    // FOUND BY validate_dflash.ps1 (docs/dflash2.md section 7 item 4): a >64-token prompt (>1
+    // prefill chunk) diverged from `--mtp 0` on EVERY target layout including w4a16 (which has no
+    // known batched-verify reduction-order sensitivity, ruling that mechanism out), while a
+    // <=64-token (single-chunk) prompt matched exactly -- the single-chunk case only "worked" by
+    // accident, because DecodeStepDflashGreedy's own first arena_.Reset() (after its DraftRound
+    // call) wipes the leftover before anything reads it, which nothing does between two prefill
+    // chunks of the SAME Prefill() call.
+    arena_.Reset();
+    // Review finding (2026-09-21, blocker-adjacent major): InjectFeatures enqueues real kernels
+    // (the fc encoder GEMM, per-layer k/v projections, norms, rope, and the ring's D2D copies) on
+    // stream_ AFTER the stream_.Synchronize() above (this function's one and only sync point until
+    // now) -- so RunChunk was returning with the device NOT idle whenever a drafter is attached.
+    // That breaks the invariant the top-of-function comment on attn_positions_/attn_seqused_k_
+    // documents as load-bearing: "the previous RunChunk call (if any) ended with stream_.Synchronize()
+    // ... so the device is guaranteed idle here" backs a plain (blocking, null-stream) hipMemcpy that
+    // races an in-flight non-blocking-stream kernel if that invariant is false. No corruption was
+    // observed because InjectFeatures happens not to touch those two buffers, but the invariant
+    // itself was silently false with --dflash. Re-synchronize here so RunChunk keeps its documented
+    // "device idle on return" contract for every caller, dflash or not.
+    stream_.Synchronize();
   }
 
   pos_ += T;
@@ -426,7 +644,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   return logits;
 }
 
-std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids) {
+std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
+                                    const std::function<void()>& on_chunk_captured) {
   if (token_ids.empty()) throw std::runtime_error("Model::Prefill: token_ids is empty");
   // Prefill's chunked-scan GDN path always lands its result at window index 0 (GdnLayerParams::slot
   // == GdnStateManager::SlotForSeq, never a windowed verify slot -- see that class's file comment),
@@ -442,6 +661,11 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids) {
     const bool is_last_chunk = (off + n) == token_ids.size();
     std::vector<float> chunk_logits = RunChunk(chunk, /*is_prefill_path=*/true,
                                                 /*want_logits=*/is_last_chunk);
+    // DFlash2 target feature capture (review finding, 2026-09-20 -- see this method's own doc
+    // comment in model.h): drain THIS chunk's captured rows before the next iteration's RunChunk
+    // call overwrites dflash_features_dev_ starting at row 0 again. No-op cost when the caller
+    // passed nullptr (the default) or no capture is attached.
+    if (on_chunk_captured) on_chunk_captured();
     if (is_last_chunk) logits = std::move(chunk_logits);
   }
   return logits;
@@ -526,7 +750,8 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       // finding, 2026-09-20: this was omitted here, so profiling a DecodeStepProfiled call on an
       // MTP-enabled Model always seeded GDN from window index 0 regardless of the last verify
       // round's real num_accepted, silently profiling the wrong GDN window.
-      p.num_accepted = (mtp_ && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data() : nullptr;
+      p.num_accepted =
+          (draft_window_ > 1 && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data() : nullptr;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                     cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -752,28 +977,34 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
 
 std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                                           std::vector<float>* logits_out) {
-  if (!mtp_) {
+  // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
+  // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
+  // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
+  // draft_window_ > 1, i.e. for mtp_draft_k > 0 OR dflash_draft_k > 0. A DFlash2 container has no
+  // mtp.* weights at all and must still be able to verify here.
+  if (draft_window_ <= 1) {
     throw std::runtime_error(
-        "Model::VerifyWindow: MTP is not enabled on this Model (Load() with "
-        "ModelOptions::mtp_draft_k > 0 and a container that has mtp.* weights)");
+        "Model::VerifyWindow: this Model was not sized for speculative verification (Load() with "
+        "ModelOptions::mtp_draft_k > 0 -- plus a container that has mtp.* weights -- or with "
+        "ModelOptions::dflash_draft_k > 0)");
   }
   const int64_t T = static_cast<int64_t>(candidates.size());
   if (T < 1 || T > max_chunk_) {
     throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
                               std::to_string(max_chunk_) + "]");
   }
-  // mtp_logits_dev_/mtp_argmax_dev_ are sized for exactly (mtp_draft_k_+1) candidates (this
+  // verify_logits_dev_/verify_argmax_dev_ are sized for exactly draft_window_ candidates (this
   // class's own field comment, model.h) -- the max_chunk_ (64) check above does NOT enforce that
-  // narrower bound, so a caller passing more than mtp_draft_k_+1 candidates (this method is public,
+  // narrower bound, so a caller passing more than draft_window_ candidates (this method is public,
   // per its own doc comment, specifically for callers like tests/model/test_mtp.cpp) would
   // silently overflow those buffers (review finding, 2026-09-20: an 8-candidate call on a
-  // draft_k=3 model writes ~8 MB into mtp_logits_dev_'s 4 MB allocation). Today this is saved only
+  // draft_k=3 model writes ~8 MB into a 4 MB allocation). Today this is saved only
   // by an unrelated guard in a different component (gdn_layer.cpp's own `T > MaxDecodeWindow()`
   // throw, which happens to run first because layer 0 of the real container is a GDN layer) --
   // enforce the real precondition here directly rather than relying on that coincidence.
-  if (T > mtp_draft_k_ + 1) {
+  if (T > draft_window_) {
     throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
-                              std::to_string(mtp_draft_k_ + 1) + "] (mtp_draft_k_+1)");
+                              std::to_string(draft_window_) + "] (DraftWindow())");
   }
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
@@ -812,6 +1043,12 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
     const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
+
+    // DFlash2 target feature capture -- see RunChunk's identical call site/comment above. A verify
+    // window's `cur` right here is the residual stream entering layer `i` for these <=
+    // (mtp_draft_k_+1) candidate rows.
+    CaptureDflashLayerInput(stream_, i, cur, T, hidden, dflash_target_layers_,
+                             dflash_features_dev_.data());
 
     if (cfg.IsGdnLayer(i)) {
       GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
@@ -875,16 +1112,17 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 
     arena_.Reset();
   }
+  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = T;
 
   // Per-position logits + greedy argmax, for every one of the T candidate positions (not just the
   // last -- this is what distinguishes a verify window from Prefill/DecodeStep's own tail-only
   // want_logits path).
   FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
-  head.Forward(stream_, arena_, cur, mtp_logits_dev_.data(), T);
+  head.Forward(stream_, arena_, cur, verify_logits_dev_.data(), T);
   for (int64_t t = 0; t < T; ++t) {
     r4dx_argmax_f32(
-        reinterpret_cast<int64_t>(mtp_logits_dev_.data() + t * cfg.vocab_size),
-        reinterpret_cast<int64_t>(mtp_argmax_dev_.data() + t), cfg.vocab_size,
+        reinterpret_cast<int64_t>(verify_logits_dev_.data() + t * cfg.vocab_size),
+        reinterpret_cast<int64_t>(verify_argmax_dev_.data() + t), cfg.vocab_size,
         reinterpret_cast<int64_t>(stream_.get()));
   }
   arena_.Reset();
@@ -894,12 +1132,34 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   stream_.Synchronize();  // same hazard class as RunChunk's own D2H -- see that method's comment
 
   std::vector<int32_t> preds(static_cast<size_t>(T));
-  mtp_argmax_dev_.CopyToHost(preds.data(), preds.size());
+  verify_argmax_dev_.CopyToHost(preds.data(), preds.size());
   if (logits_out != nullptr) {
     logits_out->resize(static_cast<size_t>(T * cfg.vocab_size));
-    mtp_logits_dev_.CopyToHost(logits_out->data(), logits_out->size());
+    verify_logits_dev_.CopyToHost(logits_out->data(), logits_out->size());
   }
   return preds;
+}
+
+void Model::CommitVerifiedWindow(int64_t num_committed) {
+  if (draft_window_ <= 1) {
+    throw std::runtime_error(
+        "Model::CommitVerifiedWindow: this Model was not sized for speculative verification");
+  }
+  if (num_committed < 1 || num_committed > draft_window_) {
+    throw std::runtime_error("Model::CommitVerifiedWindow: num_committed must be in [1, " +
+                              std::to_string(draft_window_) + "]");
+  }
+  // Identical to DecodeStepMtpGreedy's own commit block (minus MTP's h_seed reseed, which a
+  // non-MTP drafter has nothing to do with): thread the acceptance count into the next GDN
+  // decode/verify call's window-bank seed and advance pos_ by exactly what was committed -- NOT by
+  // the window width, which would silently accept every candidate regardless of whether the real
+  // model agreed. Safe to write mtp_num_accepted_dev_ synchronously here: VerifyWindow ended with
+  // a stream_.Synchronize() before returning, so every kernel that read the previous value is done.
+  const int32_t n = static_cast<int32_t>(num_committed);
+  mtp_num_accepted_dev_.CopyFromHost(&n, 1);
+  mtp_num_accepted_valid_ = true;
+  pos_ += num_committed;
+  started_ = true;
 }
 
 std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
@@ -975,6 +1235,84 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   stream_.Synchronize();
 
   std::vector<int32_t> result(drafts.begin(), drafts.begin() + num_accepted_drafts);
+  result.push_back(corrected);
+  return result;
+}
+
+std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min,
+                                                    int64_t n_min, int64_t* walk_len_out,
+                                                    DflashRoundTrace* trace_out,
+                                                    std::vector<int32_t>* drafted_tokens_out) {
+  if (!dflash_.has_value()) {
+    throw std::runtime_error(
+        "Model::DecodeStepDflashGreedy: DFlash2 is not enabled on this Model (Load() with "
+        "ModelOptions::dflash_container set and dflash_draft_k > 0)");
+  }
+  if (k < 0 || k > dflash_draft_k_) {
+    throw std::runtime_error("Model::DecodeStepDflashGreedy: k must be in [0, " +
+                              std::to_string(dflash_draft_k_) + "]");
+  }
+
+  // Built fresh every call (docs/dflash2.md, dflash_draft.h's own doc comment on
+  // MakeTargetEmbeddingProvider/MakeTargetLmHeadProvider): both closures capture raw pointers into
+  // the LIVE container_, and must not be cached across a Model move/reload -- the construction cost
+  // (two std::function allocations) is negligible next to one draft round's own GEMMs.
+  const DflashEmbeddingProvider embed = MakeTargetEmbeddingProvider(container_);
+  const DflashLmHeadProvider lm_head_provider = MakeTargetLmHeadProvider(container_);
+
+  const DflashDraftResult draft = dflash_->DraftRound(stream_, arena_, token_id, k, p_min, n_min,
+                                                       embed, lm_head_provider, trace_out);
+  arena_.Reset();
+  if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
+  if (drafted_tokens_out != nullptr) *drafted_tokens_out = draft.tokens;
+
+  std::vector<int32_t> candidates;
+  candidates.reserve(draft.tokens.size() + 1);
+  candidates.push_back(token_id);
+  candidates.insert(candidates.end(), draft.tokens.begin(), draft.tokens.end());
+
+  // VerifyWindow also (as a side effect of running every layer's own capture hook, since
+  // AttachDflashFeatureCapture is attached whenever dflash_ is set) refills DflashFeatureBuffer()/
+  // DflashFeatureRows() with THIS window's own captured target features, one row per candidate --
+  // exactly what gets injected below for the accepted prefix. VerifyWindow itself never injects
+  // anything (model.h's own doc comment on SetDflashCaptureObserver) -- only this method does, once
+  // it knows how many rows were actually accepted.
+  const std::vector<int32_t> preds = VerifyWindow(candidates);  // size == candidates.size()
+
+  // Greedy acceptance: the longest prefix of drafts whose own predecessor's argmax matches it --
+  // identical logic to DecodeStepMtpGreedy above (docs/dflash2.md section 5: "a rows accepted, the
+  // anchor is always accepted").
+  int64_t num_accepted_drafts = 0;
+  while (num_accepted_drafts < static_cast<int64_t>(draft.tokens.size()) &&
+         preds[static_cast<size_t>(num_accepted_drafts)] ==
+             draft.tokens[static_cast<size_t>(num_accepted_drafts)]) {
+    ++num_accepted_drafts;
+  }
+  const int32_t corrected = preds[static_cast<size_t>(num_accepted_drafts)];
+  const int64_t num_committed = num_accepted_drafts + 1;  // +1 for token_id (the anchor) itself
+
+  // Inject the accepted prefix's own just-captured target features into the drafter's ring BEFORE
+  // CommitVerifiedWindow (which only moves this Model's pos_/GDN bookkeeping, never touches
+  // DflashFeatureBuffer()/dflash_->InjectedCount()) -- docs/dflash2.md section 5 step 4: "inject
+  // those a rows' captured features at positions n..n+a-1". Rows 0..num_committed-1 of the just-
+  // captured window are exactly the accepted prefix (row 0 == the anchor, which is always accepted)
+  // because VerifyWindow captures candidates in the same order they were verified.
+  if (DflashFeatureRows() < num_committed) {
+    throw std::runtime_error(
+        "Model::DecodeStepDflashGreedy: internal error -- VerifyWindow captured fewer rows (" +
+        std::to_string(DflashFeatureRows()) + ") than the accepted prefix (" +
+        std::to_string(num_committed) + ")");
+  }
+  dflash_->InjectFeatures(stream_, arena_, DflashFeatureBuffer(), num_committed,
+                          dflash_->InjectedCount());
+  arena_.Reset();
+
+  // Advances pos_ by exactly num_committed and threads the GDN acceptance count, identically to
+  // DecodeStepMtpGreedy's own commit block above (this is exactly what CommitVerifiedWindow factors
+  // out for a non-MTP drafter to call -- model.h's own doc comment on that method).
+  CommitVerifiedWindow(num_committed);
+
+  std::vector<int32_t> result(draft.tokens.begin(), draft.tokens.begin() + num_accepted_drafts);
   result.push_back(corrected);
   return result;
 }

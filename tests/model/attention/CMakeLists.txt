@@ -16,4 +16,10 @@ target_compile_definitions(test_attn_layer PRIVATE
   R4DX_BF16_CONTAINER_PATH="D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
 )
 add_test(NAME test_attn_layer COMMAND test_attn_layer)
-set_tests_properties(test_attn_layer PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+# SKIP_RETURN_CODE 77: the test exits 77 (CTest SKIPPED, not FAILED) when its golden safetensors or
+# its bf16 test container is absent -- the same convention tests/model/CMakeLists.txt applies to
+# every sibling golden test.
+set_tests_properties(test_attn_layer PROPERTIES
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+  SKIP_RETURN_CODE 77
+)

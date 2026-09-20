@@ -73,6 +73,13 @@ struct TurnResult {
   int64_t mtp_rounds = 0;
   int64_t mtp_drafted = 0;
   int64_t mtp_accepted = 0;
+  // DFlash2 acceptance stats (docs/dflash2.md), zero/unset when --dflash is not given. Same
+  // convention as the mtp_* fields above: dflash_drafted sums each round's OWN walk_len (not
+  // args.dflash_k -- DFlash2's walk can stop early via p_min/n_min, unlike MTP which always offers
+  // exactly args.mtp candidates), dflash_accepted excludes the trailing correction/bonus token.
+  int64_t dflash_rounds = 0;
+  int64_t dflash_drafted = 0;
+  int64_t dflash_accepted = 0;
 };
 
 // Milestone 3 profiling pass (docs/r9700.md R5/Q7): prints a StepProfile's per-op-family table plus
@@ -187,7 +194,51 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
   const bool greedy = args.temperature <= 0.0f;
 
   const auto d0 = Clock::now();
-  if (greedy && args.mtp > 0) {
+  if (greedy && !args.dflash.empty()) {
+    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): structurally identical to the
+    // MTP round loop directly below (same round-vector contract, same ProcessMtpRound reuse -- that
+    // header is speculation-family-agnostic despite its name, see its own file comment) --
+    // Model::DecodeStepDflashGreedy's `token_id` parameter is likewise "the last ALREADY-ACCEPTED
+    // token", so `next` (Prefill's own argmax'd result) must be pushed/emitted here exactly like the
+    // MTP branch does, or the prompt's first generated token is silently dropped.
+    int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+    bool stopped = false;
+    if (is_eos(next)) {
+      result.hit_eos = true;
+      stopped = true;
+    } else {
+      result.generated_tokens.push_back(next);
+      const std::string piece0 = decoder.push(next);
+      if (!piece0.empty()) {
+        std::cout << piece0 << std::flush;
+        result.generated_text += piece0;
+      }
+    }
+    while (!stopped && static_cast<int64_t>(result.generated_tokens.size()) < args.max_tokens) {
+      int64_t walk_len = 0;
+      const std::vector<int32_t> round = model.DecodeStepDflashGreedy(
+          next, args.dflash_k, args.dflash_p_min, args.dflash_n_min, &walk_len);
+      result.dflash_rounds += 1;
+      result.dflash_drafted += walk_len;
+      result.dflash_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+      const r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(
+          round, is_eos, args.max_tokens - static_cast<int64_t>(result.generated_tokens.size()));
+      result.committed_tokens.push_back(next);
+      result.committed_tokens.insert(result.committed_tokens.end(), outcome.committed.begin(),
+                                      outcome.committed.end());
+      for (int32_t tok : outcome.displayed) {
+        result.generated_tokens.push_back(tok);
+        const std::string piece = decoder.push(tok);
+        if (!piece.empty()) {
+          std::cout << piece << std::flush;
+          result.generated_text += piece;
+        }
+        next = tok;
+      }
+      if (outcome.hit_eos) { result.hit_eos = true; stopped = true; }
+      if (outcome.hit_max_tokens) stopped = true;
+    }
+  } else if (greedy && args.mtp > 0) {
     // MTP self-speculative decode (docs/mtp.md): each DecodeStepMtpGreedy call drafts up to
     // args.mtp tokens and returns however many the real model actually confirmed (1..args.mtp+1,
     // always at least the corrected/bonus token) -- emit them one at a time, exactly like the
@@ -312,7 +363,19 @@ int RunMain(int argc, char** argv) {
                  static_cast<long long>(args.mtp), static_cast<double>(args.temperature));
     args.mtp = 0;
   }
+  // DFlash2 is likewise greedy-only (Model::VerifyWindow's own argmax path, docs/dflash2.md) --
+  // same warn-and-disable pattern as --mtp above, rather than silently loading and never using a
+  // multi-GiB drafter.
+  if (!args.dflash.empty() && args.temperature > 0.0f) {
+    std::fprintf(stderr,
+                 "r4dx-cli: --dflash has no effect with --temperature %.3g > 0 (DFlash2 is "
+                 "greedy-only, docs/dflash2.md) -- disabling DFlash2 for this run\n",
+                 static_cast<double>(args.temperature));
+    args.dflash.clear();
+  }
   opts.mtp_draft_k = args.mtp;
+  opts.dflash_container = args.dflash;
+  opts.dflash_draft_k = args.dflash.empty() ? 0 : args.dflash_k;
   // nullopt (== "layout") tracks opts.layout -- measured default, docs/mtp.md "MTP head layout".
   opts.mtp_head_layout = (args.mtp_head_layout == "bf16")
                               ? std::make_optional(r4dx::model::Layout::kBf16)
@@ -409,6 +472,21 @@ int RunMain(int argc, char** argv) {
                      // "reduced" only if the container has one AND --mtp-draft-head didn't force
                      // "full" (Model::MtpUsingReducedVocabDraft's own two-condition check).
                      model.MtpUsingReducedVocabDraft() ? "reduced" : "full");
+      }
+      if (!args.dflash.empty()) {
+        const double accept_rate = r.dflash_drafted > 0
+            ? 100.0 * static_cast<double>(r.dflash_accepted) / static_cast<double>(r.dflash_drafted)
+            : 0.0;
+        std::fprintf(stderr,
+                     "[stats] dflash: k=%lld p_min=%.3g n_min=%lld rounds=%lld drafted=%lld "
+                     "accepted=%lld (%.1f%% acceptance, %.2f tok/round avg)\n",
+                     static_cast<long long>(args.dflash_k), static_cast<double>(args.dflash_p_min),
+                     static_cast<long long>(args.dflash_n_min),
+                     static_cast<long long>(r.dflash_rounds), static_cast<long long>(r.dflash_drafted),
+                     static_cast<long long>(r.dflash_accepted), accept_rate,
+                     r.dflash_rounds > 0
+                         ? static_cast<double>(r.decode_tokens) / static_cast<double>(r.dflash_rounds)
+                         : 0.0);
       }
     }
   };

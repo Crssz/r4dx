@@ -205,32 +205,751 @@ smaller, purpose-specific module, `docs/mtp.md`) currently reaches 68 tok/s at i
 is projected to be the single largest remaining speedup lever in the roadmap (see
 `docs/status.md`'s "Next milestone" list, which names it explicitly).
 
-## 7. Integration plan for r4dx (not built by this task -- for whoever picks up the C++ port)
+## 6a. Implementation (Milestone 5 B1, GPU stage, 2026-09-20)
 
-1. **Target-side feature capture**: during both prefill and `VerifyWindow`, capture the residual
-   stream entering layers `{6,20,34,48,62}` (0-based HF indexing, i.e. the OUTPUT of layers
-   `{5,19,33,47,61}`) for every position, analogous to how `docs/mtp.md`'s `h_seed` is already
-   captured off `Model::RunChunk`.
-2. **Draft KV ring**: a per-layer (5 layers), per-head (8 kv heads), 128-dim ring sized to
-   `sliding_window = 2048` positions -- much smaller than the backbone's own KV cache, and (unlike
-   the backbone) never needs fp8 paging since it is tiny.
-3. **Injection**: after every prefill chunk and every verify round's accepted prefix, run the
-   encoder (`fc` + `output_norm_enc`, a single small GEMM+norm) once, then 5 tiny K/V GEMMs (one
-   per draft layer) writing into the ring at the real absolute position -- mirrors
-   `MtpHead::PrimeKv`'s call pattern (`docs/mtp.md`) closely enough that the two should likely share
-   a "keep an auxiliary head's KV in lockstep with the backbone" helper.
-4. **Draft loop**: build the 8-token noise block, run the 5-layer non-causal SWA attention forward
-   (all fp8/bf16-quantizable GEMMs; the dynamic conv is small elementwise work, a good
-   `r4dx`-owned-kernel candidate akin to `r4dx_rope_partial_mrope_bf16`), then the selector walk
-   (score matrices are `16x16` at most -- trivial to run on host, per token position, rather than
-   as a device kernel, unless profiling later shows otherwise).
-5. **Verify + commit**: reuses the SAME verify/accept/commit machinery `docs/mtp.md` already
-   documents (longest-greedy-matching-prefix acceptance, corrected/bonus token) -- DFlash2 is a
-   drop-in alternative DRAFT SOURCE, not a different verify contract.
+**Target feature capture (item 1 of `docs/status.md`'s Milestone 5 GPU-stage list) is DONE and
+tested on real hardware; the rest of B1 (draft module, new kernels, GPU-side tests, anchor dump,
+perf measurement) is NOT done this pass -- see `docs/status.md`'s Milestone 5 section for the full
+"what shipped / what's left" accounting and why.**
 
-## 8. `--real` mode npz schema
+**B2 update (2026-09-20)**: a follow-on pass attempted task B2 ("wire the drafter into generation,
+prove it lossless, measure it") and confirmed this section's own gate still holds -- every B2 item
+except the unrelated item 8 (`--mtp-draft-head` default flip) needs the draft module and three
+kernels below to exist first, and they still do not. See `docs/status.md`'s dated "task B2" section
+(above the B1 section in that file) for exactly what B2 did and did not attempt and why.
 
-`tools/reference/dflash2_ref.py --real <path.npz> --target-dir <dir>` expects:
+**Review fix pass (2026-09-20)**: an adversarial review of B1+B2's combined diff confirmed the
+blocker above (the drafter does not exist -- nothing new here) and additionally found the shipped
+feature-capture hook itself had three lifecycle/coverage gaps, all fixed this pass, real hardware,
+HIP device 1:
+1. **`Model::Reset()` did not invalidate `dflash_feature_rows_`** -- a capture attached across a
+   `Reset()` (e.g. a server prefix-mismatch or `--chat` turn boundary) would let a caller read the
+   PREVIOUS sequence's stale captured rows. Fixed: `Reset()` now zeroes `dflash_feature_rows_` too,
+   alongside its existing `mtp_seed_valid_`/`mtp_num_accepted_valid_` invalidations.
+2. **The `VerifyWindow` capture call site had zero test coverage** (only the `RunChunk`/`Prefill`
+   half was tested) -- fixed: `tests/model/test_dflash_feature_capture.cpp`'s new Part 3 attaches a
+   capture on an MTP-enabled `Model` (`D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx`, `--mtp 3`), drives
+   one `VerifyWindow` call, and asserts `DflashFeatureRows()==candidates.size()` and bit-exactness
+   against `EmbeddingGatherHost` -- **[PASS]**, real hardware.
+3. **Multi-chunk `Prefill()` silently discarded every chunk's captured rows except the last** --
+   `dflash_features_dev_` is sized `max_chunk_` rows (not `max_ctx` -- a `max_ctx`-sized buffer
+   would cost gigabytes of VRAM per attached target layer at `max_ctx=262144`), and every internal
+   `RunChunk` call rewrote it starting at row 0, so a prompt over 64 tokens lost all but the tail
+   chunk's features. Fixed: `Model::Prefill` gained an optional `on_chunk_captured` drain callback,
+   invoked once per internal `RunChunk` call (in order) before the next chunk overwrites the buffer
+   -- a caller that needs every prefilled position's features (this drafter does) passes the
+   callback and drains `DflashFeatureBuffer()`/`DflashFeatureRows()` inside it (e.g. injecting that
+   chunk's rows into the draft's own KV store). `tests/model/test_dflash_feature_capture.cpp`'s new
+   Part 4 exercises a 130-token prompt (3 `RunChunk` calls: 64/64/2) and confirms all 130 rows are
+   recoverable bit-exact via the callback -- **[PASS]**, real hardware. Callers that pass no
+   callback (the default, `nullptr`) get byte-identical behavior to before this fix.
+
+Also fixed as part of the same pass: `ModelOptions::mtp_draft_reduced_vocab`'s struct-literal
+default flipped `true`->`false` to match the CLI/server flag default flip B2 already made (was
+previously inconsistent -- see `src/model/model.h`'s own updated comment); the matched-K=3
+`--mtp-draft-head` measurement was redone directly (the previous `65.02-67.34 tok/s` citation
+mixed two different, non-matched-K sweeps) -- see `docs/mtp.md`'s "Flag default flipped" section
+for the real matched-K numbers. None of these fixes touch the drafter itself; the blocker above is
+unchanged.
+
+`Model` (`src/model/model.h`/`model.cpp`) gained:
+
+- `Model::AttachDflashFeatureCapture(std::vector<int64_t> target_layers)` /
+  `DetachDflashFeatureCapture()` / `DflashFeatureCaptureAttached()` -- `target_layers` is the same
+  0-based layer-INPUT-index convention this doc's section 7 (below) and
+  `DflashDraftWeights::Config().target_layers` already use (e.g. `{6,20,34,48,62}` for the real
+  container). Attaching (re)allocates a `[max_chunk_, target_layers.size()*hidden]` bf16 device
+  buffer sized for the largest possible call (a 64-row prefill chunk); detaching frees it and
+  restores byte-identical pre-B1 behavior.
+- `Model::DflashFeatureBuffer()` / `DflashFeatureRows()` / `DflashFeatureCols()` -- the captured
+  buffer plus the row count of whichever `RunChunk`/`VerifyWindow` call most recently ran (valid
+  until the next such call, same lifetime convention as `mtp_last_hidden_`).
+
+**Where it hooks in**: one call site inserted at the top of each layer iteration in BOTH
+`Model::RunChunk`'s layer loop (covers prefill chunks AND plain decode, since `DecodeStep` funnels
+through `RunChunk` with `T=1`) and `Model::VerifyWindow`'s layer loop (covers MTP-style verify
+rounds, `T<=mtp_draft_k_+1<=8`) -- placed BEFORE that iteration's `GdnLayer`/`AttentionLayer`
+`::Forward` call mutates `cur` in place, so `cur` at that point is exactly the residual stream AS
+IT ENTERS layer `i`. A free function `CaptureDflashLayerInput` (anonymous namespace, `model.cpp`)
+does the actual copy: a no-op (`target_layers.empty()` check, nothing else) unless `i` is in
+`target_layers`, in which case one `hipMemcpy2DAsync` (device-to-device, no host sync) strides the
+`[T, hidden]` `cur` slab into that target layer's column of the `[T, num_target_layers*hidden]`
+destination. `Model::DecodeStepProfiled`/`PrefillProfiled` (the diagnostic-only profiling paths,
+never used by the production draft/verify/commit round loop) were deliberately NOT hooked -- out of
+this pass's scope, and orthogonal to what a real DFlash2 round needs.
+
+**Why `hipMemcpy2DAsync` and not a new kernel**: it is the plain HIP runtime's strided
+device-to-device copy -- no new kernel to write, tune, or unit-test, and (deliberately) invisible to
+`r4dx::kernels::r4dx_kernel_launch_counter_get()`, which only counts `r4dx`-owned kernel launches
+(see kernels.h's own comment). That means the "prove nothing extra happens" bar from
+`docs/status.md`'s task item 1 is met two ways: (a) when no capture is attached, the hot path is
+unchanged (a single `.empty()` branch, no allocation, no copy -- literally the pre-B1 code plus one
+cheap check) and (b) even WITH a capture attached, the r4dx-owned launch counter's delta across a
+`Prefill()` call is unaffected (verified below), because the mechanism used adds no r4dx-owned
+kernel launches at all.
+
+**Tests**: `tests/model/test_dflash_feature_capture.cpp` (new, registered in
+`tests/model/CMakeLists.txt`'s `R4DX_MODEL_TESTS`, same SKIP-if-missing-container convention as
+`test_forward_smoke.cpp`), against the real 4-layer `bf16` test container, HIP device 1:
+1. Attaches capture at `{0, 2}`, prefills 10 tokens, and checks column 0 (layer 0's input) is
+   BIT-EXACT against an independently-computed ground truth: `r4dx::kernels::EmbeddingGatherHost`
+   (the same host-side embedding gather `RunChunk` itself uses) called directly against the
+   container's own embedding table -- since layer 0's input is, by construction, exactly the raw
+   token embedding. Column 1 (layer 2's input) is checked to be populated and to differ from
+   column 0 (the simplest available cross-check that the per-target-layer column-offset arithmetic
+   is not aliasing two different layers onto the same column).
+2. Loads two fresh `Model`s from the same options, one with a capture attached (`{0,1,2,3}`, every
+   layer of the 4-layer test container) and one without; asserts the r4dx-owned kernel launch count
+   delta across each one's `Prefill()` call is IDENTICAL, and that the returned logits are
+   bit-identical -- i.e. attaching a capture perturbs neither the launch count nor the actual
+   forward pass's arithmetic.
+
+Measured on real hardware (HIP device 1, `bf16` 4-layer test container): all checks above pass
+(`[PASS]` lines in `build/logs/`, not committed -- gitignored scratch); r4dx-owned launch count was
+19 both with and without a capture attached, for a 10-token single-chunk prefill.
+
+**Superseded (2026-09-20, stage S1)**: this section previously closed by listing "the three NEW
+kernels" as not done. They are done -- see section 6b below, which specifies and links all five
+device pieces, each with its own green ctest on HIP device 1.
+
+**Superseded again (2026-09-20, stage S2)**: the remaining B1 list this section then carried -- the
+draft MODULE (encoder, per-layer KV injection ring, the block-diffusion layer stack, the selector
+walk), the device-upload path, the fixture A/B/C draft-round test, the anchor dump and the isolated
+cost measurement -- is done. See section 6c. The `TODO(dflash2-forward)` marker in
+`src/model/dflash_draft_weights.h` is closed by `src/model/dflash_draft.cpp`'s `Load()`, which is
+exactly the `ToDevice()`-style walk that header predicted, reusing the `SafetensorsReader` the
+class already holds. What is left for stage S3 is the DRIVER: wiring the drafter into generation
+(prefill injection, draft/verify/commit round loop, CLI/server flags), proving it lossless against
+greedy decode, and the end-to-end tok/s measurement.
+
+## 6b. Kernels (Milestone 5 stage S1, 2026-09-20)
+
+The five device-side primitives the DFlash2 draft forward needs that neither r4dx nor
+`third_party/libr4d` already provided. All five are declared in
+`src/kernels/include/r4dx/kernels/kernels.h`, implemented in `src/kernels/src/r4dx_kernels.hip`,
+and launched/counted exactly like every other r4dx-owned kernel. **No model wiring is part of this
+stage** -- these are standalone, individually tested pieces.
+
+Every test runs its CPU-reference checks unconditionally and then compares against
+`tools/reference/golden_out/dflash2/fixture_a`, returning 77 (CTest SKIPPED) if that directory is
+absent -- so a missing fixture can never hide a real regression. Regenerate with
+`<reference venv>/python.exe tools/reference/dflash2_ref.py --gen-fixtures all --seed 0`.
+
+| Entry point | Contract | Test |
+|---|---|---|
+| `r4dx_rope_neox_bf16` | In-place NeoX split-half rotation over ALL `head_dim` dims (n_rot == head_dim, so no pass-through tail), pair `(i, i+head_dim/2)`, theta 1e7, per-row absolute positions as an int32 DEVICE array. fp32 math, RTNE to bf16. Q and K are independently optional (`ptr=0` **and** the matching head count `0`) because the injection path ropes K only -- there is no `Wq` in it at all. | `tests/kernels/test_rope_neox.cpp` |
+| `r4dx_topk16_f32` | `[rows, vocab]` fp32 -> ids int32 `[rows,16]` + vals fp32 `[rows,16]`, descending by value, ties deterministically to the LOWER id. One workgroup per row: per-thread register top-16 over a grid-strided slice, then an 8-round pairwise LDS merge under the same total order, so the result is the exact global top-16 regardless of thread scheduling. | `tests/kernels/test_topk16.cpp` |
+| `r4dx_dflash_attn_bf16` | The draft block's attention. Visible keys for query row `t` (abs position `q = n_injected + t`): injected-store positions `p` in `[max(0, q-window+1), n_injected-1]` read at `slot = p % slots`, **plus all `T` block keys unconditionally** (the block is non-causal; `attention.causal=false`). fp32 two-pass max-subtracted softmax, bf16 out, GQA `q-head h -> kv-head h/(heads_q/heads_kv)`. The block's own K/V is scratch and is never written to the store -- which is why the ring needs no rollback (section 5). | `tests/kernels/test_dflash_attn.cpp` |
+| `r4dx_dflash_conv_bf16` | Thin wrapper over libr4d's `r4d_dflash_conv_t2_g16_bf16` (taps 2, group 16). The whole point is the address arithmetic: `delta = dyn + side*taps*NG` while `dpitch` stays the **full** `2*taps*NG` row pitch (delta is a SLICE, not a compacted copy -- `r4d.h:118`); `base = base + side*taps*H` over `[2(side)][taps][H]`; `block_size` is the power of two `>= T`, so `(t & blockmask) >= tap` degenerates to `t >= tap` for one block starting at row 0. `out` must not alias `x`. Deliberately does **not** bump the r4dx launch counter -- the launch is libr4d's. | `tests/kernels/test_dflash_conv.cpp` |
+| `r4dx_rmsnorm_plain_bf16` | `out = x * rsqrt(mean(x^2)+eps) * w`, i.e. the PLAIN weight form -- **not** `r4dx_rmsnorm_bf16`'s `(1+w)` Qwen3.5 convention (see this doc's "RMSNorm convention" row). Output bf16 or fp32 (`out_fp32`); in-place supported. Nothing in this repo or in libr4d computed this form before. | `tests/kernels/test_rmsnorm_plain.cpp` |
+
+**Fixture arrays added for these tests.** `tools/reference/dflash2_ref.py` now also dumps, for
+layer 0 of fixture A: `attn_q_prerope_l0`/`attn_k_prerope_l0` (so a rope port has a real
+input/position/output triple instead of only a post-rope tensor), `attn_q_l0`/`attn_k_l0`/
+`attn_v_l0`/`attn_out_l0` (a complete standalone input/output pair for the attention kernel,
+together with `injected_k_l0`/`injected_v_l0` and `n_injected`), `attn_conv_x_l0` +
+`attn_o_preconv_l0` + `attn_dyn_l0` + `attn_conv_base_l0` (the conv's two INPUTS plus dyn and base
+-- the pre-existing `attn_conv_in_l0`/`attn_conv_out_l0` are both conv OUTPUTS, so neither alone
+could drive the kernel), and `output_norm_w`. `dflash2_selftest.py` gates every one of them for
+bit-exact determinism, so a regenerated fixture that silently changed any of them fails there
+first.
+
+**Measured on HIP device 1** (gfx1201, all five green):
+
+- rope: vs CPU reference, `pos <= 4096` norm_rel 4.2e-5 (Q) / 3.9e-6 (K); `pos <= 300000` 4.6e-4 /
+  4.4e-4; position 0 is the bit-exact identity; Q-only and K-only calls match the combined call
+  byte for byte. Fixture A (positions 40..47) norm_rel 2.1e-3 (Q) / 2.2e-3 (K).
+- top-16: **exact** id and value match against the CPU reference on random data at V in
+  {4096, 248320}, on tie-heavy inputs (12 distinct levels, all-identical, all `-inf`), and across
+  rows 1..8; **exact** against fixture A's `cand`/`unary` (0/128 mismatches).
+- attention: vs CPU fp64 reference over `n_injected` in {0, 3, 40, 2047, 2048, 2049, 2100, 5000} x
+  `T` in {1, 4, 8} -- norm_rel 1.63e-3..1.69e-3 throughout, i.e. pinned at the bf16 output quantum
+  (2^-9 = 1.95e-3) with no drift at the ring wrap or the window clip. Fixture A norm_rel 3.4e-3.
+- conv: vs CPU reference at `T` in {1, 5, 8} x both sides, norm_rel 1.64e-3..1.67e-3. Fixture A
+  side 0 norm_rel 2.6e-3, side 1 2.4e-3.
+- plain rmsnorm: vs CPU fp64 reference at hidden in {128, 5120, 17408} x rows in {1, 8, 40} --
+  bf16 out norm_rel ~1.7e-3, fp32 out ~5e-8. In-place is bit-identical to out-of-place. Fixture A
+  `x_post_ffn_l4 -> x_final_normed` norm_rel 2.6e-3. The `(1+w)` kernel on the same inputs scores
+  norm_rel 1.15 -- the explicit assertion that the two forms are not interchangeable.
+
+**On tolerances.** These kernels are bf16-out, so the per-element error floor for any correct
+implementation is one bf16 step (2^-9 relative, and 3.1e-2 absolute once an output reaches
+magnitude 4-8). The gates are therefore `norm_rel` plus, where it is meaningful, `max_abs`;
+`max_rel` is printed but never gated, because a rotation or a softmax drives some outputs to near
+zero by cancellation, where the smallest possible disagreement reads as `max_rel ~ 1`. The gates
+are still sharp: a wrong pairing, theta, mask, head mapping, tap, side or group index moves
+`norm_rel` to O(0.1..1), two to three orders of magnitude over threshold.
+
+**Open, project-wide, found by this stage and NOT decided here.** Every `src/kernels` entry point
+is `extern "C"` and there are 13 sites in `r4dx_kernels.hip` that report a violated precondition (
+and `R4DX_HIP_CHECK`, a failed HIP call) by `throw std::runtime_error`. The project compiles with
+CMake's Windows default `/EHsc`, whose `c` means "assume every `extern "C"` function is nothrow" --
+so the caller emits no unwind edge and such a throw does not unwind at all: the process dies
+immediately with exit code `0xC0000409`, no message, and neither `catch (const std::exception&)`
+nor `catch (...)` runs. The kernels object itself emits the correct MSVC EH ABI
+(`_CxxThrowException` / `__CxxFrameHandler3`), so the defect is purely the caller-side nothrow
+assumption. `tests/kernels/CMakeLists.txt` sets `/EHc-` on `test_dflash_attn.cpp` and
+`test_dflash_conv.cpp` so their precondition checks can catch, and those two tests are the
+regression gate. **`r4dx-cli`, `r4dx-server` and `src/model` are NOT fixed** -- they still call the
+same entry points under `/EHsc`, so a HIP error raised inside `src/kernels` kills them rather than
+unwinding. Whether to move the whole project to `/EHs` is a cross-cutting decision, not one a
+kernel stage should make unilaterally.
+
+## 6c. Implementation: the draft module (Milestone 5 stage S2, 2026-09-20)
+
+`src/model/dflash_draft.{h,cpp}` -- `r4dx::model::DflashDraft`, the drafter itself, on device. It is
+the structural analogue of `MtpHead` (`docs/mtp.md`) for the other self-speculation family: it owns
+its weights, its KV ring and its scratch, never touches the target `Model`'s state, and hands back
+token ids that `Model::VerifyWindow` verifies exactly as it does MTP's.
+
+### Module layout
+
+| Piece | Where |
+|---|---|
+| `DflashDraft::Load(DflashDraftOptions)` | Opens the draft container through the existing `DflashDraftWeights` (the A1 CPU loader -- its `TODO(dflash2-forward)` device-upload gap is what this closes) and uploads every linear through the SAME `QuantLinear`/`ApplyLinear` path the main container uses. All four layouts load (`bf16`/`w4a16`/`w4a8`/`mxfp4`); `bf16` is the exact-arithmetic reference. |
+| `InjectFeatures(stream, arena, features_dev, rows, start_pos)` | `g = rmsnorm_plain(fc(features))` once, then per layer `K = rope(k_norm(Wk g))` at the position's ABSOLUTE index and `V = Wv g` raw, written into the ring at `slot = pos % 2048`. `rows <= 64` (a prefill chunk's width). |
+| `DraftRound(stream, arena, anchor_id, k, p_min, n_min, embed, lm_head, trace, device_ms)` | The 8-wide noise block through 5 layers, final plain rmsnorm, the TARGET lm_head, top-16, the selector-gate GEMM, one readback, then the host lattice walk. |
+| `MakeTargetEmbeddingProvider` / `MakeTargetLmHeadProvider` | The two injectable providers, built from the target `Container`. The drafter has no embedding table and no lm_head of its own -- there is deliberately no `dflash.embed_tokens`/`dflash.lm_head` tensor in the container at all. |
+
+**Why the providers are injectable and not just `const Container&`.** The embedding provider is
+handed BOTH the host and device id arrays, so it works whether or not the target's embedding table
+has a VRAM mirror (`Container::EmbedTokensDeviceResident()`) -- both paths are exercised. The
+lm_head provider runs the BARE lm_head GEMM + `bf16->fp32` widen, deliberately NOT
+`FinalLmHead::Forward`, which would apply the target's own `text.final_norm` on top of the
+drafter's `dflash.output_norm` (section 4.2 applies exactly one norm). And injecting them is what
+lets `tests/model/test_dflash_draft.cpp` swap the real 27B target for the fixtures' synthetic
+4096-row one without a second code path.
+
+### Buffers
+
+| Buffer | Size (real drafter) |
+|---|---|
+| Draft KV ring `k_store_`/`v_store_`, `[5 layers][2048 slots][8 kv heads][128]` bf16 each | 21 MB + 21 MB |
+| Injection scratch (`g`, per-layer K/V, positions), sized `max_inject_rows = 64` | ~0.9 MB |
+| Draft-block activations (8 rows: `x`, `h`, `conv`, `proj`, `xf`, `dyn`, q/k/v/attn, gate/up/fused/act) | ~2.3 MB |
+| `logits_dev_`, `[8, vocab]` fp32 | 7.9 MB |
+| Selector codebooks, HOST bf16 `[248320][256]` x2 | 254 MB host, 0 VRAM |
+| Weights (`bf16` / `w4a16` container) | 3.33 GB / 0.89 GB device, plus the `fc` encoder |
+
+`slots == sliding_window == 2048` exactly: a slot is reused only once its previous occupant has
+aged out of every possible query's visible range, which is also `r4dx_dflash_attn_bf16`'s own
+`window <= slots` precondition (section 6b).
+
+### Host vs device split
+
+Everything except the selector lattice runs on the GPU. One `DraftRound` issues its whole layer
+stack asynchronously and then performs **exactly one** device->host copy -- a single ~5 KB staging
+blob whose three slices are written in place by their producers (`cand` and `unary` by
+`r4dx_topk16_f32`, `gate` by the selector-hidden GEMM) -- followed by **exactly one** stream
+synchronize. The lattice walk then runs on the host in fp32.
+
+The two `[vocab][selector_rank]` codebooks stay HOST-resident (bf16, 127 MB each) rather than being
+mirrored to VRAM: the walk is inherently sequential across block positions (position `t`'s
+`pred_idx` is an index into position `t-1`'s candidate list), so a device gather would be gathered
+only to be copied straight back. On the hot path only the ONE row the walk actually reads is
+materialised (256 multiplies + 16 dot products of length 256 per position, ~31k FMA per round);
+the full `[|P|, 16]` score matrix is built only when a caller passes a `DflashRoundTrace`, which
+tests do so they can compare against the fixtures' own `score_t{1..7}`.
+
+Measured host cost of the whole non-device part of a round (walk + ~80 kernel launches + the sync):
+**0.32-0.41 ms**, i.e. wall 6.18 ms vs device 5.77 ms for the `w4a16` drafter.
+
+### The store invariant
+
+**The block's own K/V is scratch and is NEVER written to the ring.** `r4dx_dflash_attn_bf16` takes
+the 8 block keys/values as separate operands and the ring as another pair, and only
+`InjectFeatures()` ever writes the ring -- only for positions the target has already committed.
+That is precisely why a partially-rejected verify round needs no rollback (section 5): nothing
+speculative was ever stored. `InjectFeatures` additionally enforces `start_pos == InjectedCount()`
+and throws otherwise, which upholds the second half of that argument (strictly monotonic, so a
+stale byte is always physically overwritten before it can be read as committed data). Both facts
+are stated as comments at the two call sites in `dflash_draft.cpp`.
+
+### The per-chunk capture observer
+
+`Model::SetDflashCaptureObserver(std::function<void(const uint16_t* features, int64_t rows,
+int64_t start_pos)>)` is invoked at the end of **every** `RunChunk` call -- every prefill chunk AND
+every plain decode step, in order, after that call's captured rows are complete on the device and
+before any later call overwrites `dflash_features_dev_` at row 0. This generalises the narrower
+`Prefill(..., on_chunk_captured)` drain hook section 6a added: `dflash_features_dev_` is sized
+`max_chunk_` rows, not `max_ctx` (a `max_ctx`-sized capture would cost gigabytes of VRAM per
+attached target layer), so without it a >64-token prompt silently loses every chunk's features but
+the last, and a plain decode step's single captured row is likewise lost.
+
+`VerifyWindow` deliberately does NOT invoke it: a verify window's rows are CANDIDATES, and only the
+accepted prefix may ever be injected (section 5 step 4) -- only the driver knows how many that is,
+so it reads `DflashFeatureBuffer()`/`DflashFeatureRows()` itself after `VerifyWindow` returns.
+
+Also generalised this stage so a DFlash2 run needs no MTP head anywhere: `ModelOptions` gained
+`dflash_draft_k`, `Model` gained `draft_window_ = 1 + max(mtp_draft_k, dflash_draft_k)`, and
+`VerifyWindow`'s "MTP is not enabled" throw became a `draft_window_ > 1` check. The verify scratch
+was renamed `mtp_logits_dev_`/`mtp_argmax_dev_` -> `verify_logits_dev_`/`verify_argmax_dev_` to
+match. MTP behaviour at a given `mtp_draft_k` is byte-identical (`test_mtp` unchanged and green).
+`Model::CommitVerifiedWindow(n)` exposes the pos_/acceptance-count commit
+`DecodeStepMtpGreedy` does inline, for a drafter that owns its own round loop.
+
+### Measured fixture tolerances (`tests/model/test_dflash_draft.cpp`, HIP device 1)
+
+Against the `bf16` draft container and the reference's synthetic 4096-vocab target, `RelL2` (never
+per-element `max_rel` -- see section 6b's note on cancellation):
+
+| Intermediate | Fixture A (N=40) | Fixture B (N=2100) |
+|---|---|---|
+| `g` (encoder) | 3.25e-3 | -- |
+| injected K / V, per layer | 3.50e-3..3.97e-3 / 3.05e-3..4.00e-3 | -- |
+| `x_post_attn` l0..l4 | 8.19e-3 -> 2.00e-2 | -- |
+| `x_post_ffn` l0..l4 | 1.41e-2 -> 2.65e-2 | -- |
+| `x_final_normed` | 3.69e-2 | -- |
+| `cand`, `unary` | **bit-exact** | **bit-exact** |
+| `gate` | 3.33e-2 | 1.20e-1 |
+| `score_t{1..7}` | 5.68e-3..1.27e-2 | 5.68e-3..4.68e-2 |
+| drafted chain | **exact (7 tokens)** | **exact (7 tokens)** |
+
+Fixture C (`p_min=0.3` on A's state): chain **exact**, 5 tokens, a strict prefix of A's 7, stopped
+by `p_min`; the `n_min` discard throws the whole draft away as specified.
+
+Two things about how that table is produced, because they are load-bearing:
+
+1. **The exactness gate substitutes the fixture's own `logits` for the target lm_head.** The
+   fixtures' target is synthetic -- `lm_head = RandomState(0).randn(4096, 5120) * 0.02` on a
+   ~unit-RMS hidden state -- so a row's 4096 logits are near-Gaussian and the gap between the 16th
+   and 17th order statistics is ~0.05 sigma, while this path's own logits agree to 3.7e-2 relative.
+   The top-16 SET and especially its ORDER therefore reshuffle, and the walk's `pred_idx` is an
+   index INTO the previous position's candidate list, so one reordering silently re-points the next
+   position's whole score row. That is a property of the synthetic target, not of the drafter.
+   Feeding the reference's exact logits leaves everything this module owns under test (top-16,
+   the gate GEMM, the codebook trilinear form, the walk, `p_min`, `n_min`) and makes the score
+   matrices column-aligned with the fixture's so they can be compared at all.
+2. **The full end-to-end path is still run and reported**, right after, through a real bf16 lm_head
+   GEMM: fixture A logits `RelL2` 3.72e-2, cand set-overlap 120/128, agreeing chain prefix 4/7 --
+   with the per-position selector margins printed so a reader can see the flips are near-ties.
+
+Fixture B's `gate` gate is looser (2.5e-1) for a measured reason: at `n_injected=2100` the block's
+attention averages over ~2048 visible keys instead of 40, and a diffuse softmax's output is a
+heavily cancelling sum, so the same per-element bf16 input error lands ~3x larger relative. It is
+not the windowing -- `r4dx_dflash_attn_bf16` was swept against a CPU fp64 reference at
+`n_injected` in {0,3,40,2047,2048,2049,2100,5000} and stayed pinned at 1.6e-3 throughout (section
+6b) -- and the properties that WOULD catch a windowing bug (`cand`/`unary` bit-exactness, the
+drafted chain) are gated exactly for B like every other fixture, and pass.
+
+**`w4a16` draft container, same fixture A inputs** (reported, not gated): the drift profile is
+smooth, not a step -- `g` 1.02e-1, injected K 8.21e-2..1.15e-1, `x_post_ffn` l0..l4
+4.42e-1/3.49e-1/3.19e-1/3.30e-1/4.38e-1, `x_final` 7.02e-1, cand set-overlap 32/128. A w4a16
+PACKING bug would show as a step change at one stage; this is ordinary 4-bit noise entering at the
+`fc` encoder (K=25600 in 4 bits) and staying flat thereafter. **Do not read that 7.02e-1 as "w4a16
+is unusable"**: the fixtures' features are i.i.d. unit Gaussians with no structure at all, which is
+close to the worst case for a low-bit projection. On REAL captured features both containers draft
+the IDENTICAL chain (next subsection).
+
+**How the synthetic inputs are reconstructed.** Two of the fixtures' inputs are deliberately not
+dumped (section 9): the synthetic target's `[4096, 5120]` embedding table and lm_head, and fixture
+B's `[2100, 25600]` features. `tests/model/numpy_legacy_rng.hpp` reimplements
+`numpy.random.RandomState(seed).randn` bit-exactly (`mt19937_seed`/`mt19937_next_double`/
+`legacy_gauss`, the polar method -- NOT `Generator`'s Ziggurat) so the test rebuilds them in memory
+exactly as `dflash2_selftest.py` does. It is validated before it is trusted: Part 0 of the test
+regenerates fixture A's own dumped `features.npy` and asserts BIT-EXACT equality (0/1,024,000
+mismatches), and fixture B re-checks its first 40 rows against A's since it is the same stream.
+
+### Anchor check on real inputs
+
+`tests/model/tool_dflash_probe.cpp` (built, deliberately not `add_test()`-registered -- same
+convention as `tool_hseed_drift`/`tool_vocab_calib`) drives the REAL 64-layer `w4a16`
+`qwen38-27b-v3.r4dx` target with the real tokenizer, captures the residual stream entering
+`{6,20,34,48,62}` through the per-chunk observer, injects it, drafts, and writes
+`features.bin` + `manifest.json` (schema `dflash2_real_dump_v1`) plus its own
+`x_final_normed.bin`/`gate.bin`/`cand.bin`/`unary.bin` and drafted chain.
+`tools/reference/dflash2_ref.py --real <that directory>` now accepts that raw-blob form alongside
+the `.npz` of section 8, redoes the round in fp32 numpy from the original Q8_0 GGUF against the
+checkpoint's own fp32 embedding/lm_head, and prints a per-tensor comparison plus a hybrid-walk
+attribution.
+
+Two short prompts, real hardware:
+
+| | prompt 0 ("...the capital of Germany is") | prompt 1 (a `fibonacci` body) |
+|---|---|---|
+| anchor | 19241 (` Berlin`) | 73111 (` fibonacci`) |
+| r4dx chain | `[13,271,760,6511,314,11751,369]` | `[1393,12,16,8,478,73111,1393]` = `(n-1) + fibonacci(n` |
+| reference chain | `[13,1061,369,264,3750,6511,314]` | identical |
+| `x_final_normed` RelL2 | **1.09e-2** | **1.34e-2** |
+| `gate` RelL2 | 9.02e-3 | 9.55e-3 |
+| `cand` exact-position / set-overlap | 72/128, 119/128 | 78/128, 125/128 |
+
+Prompt 1's chain is **identical**. Prompt 0's differs, and the divergence is localised, not
+hand-waved: the two hybrid walks the reference now prints show that the port's own `cand`/`unary`
+combined with the REFERENCE's `gate` reproduce the port's chain exactly, and the reference's
+`cand`/`unary` combined with the PORT's `gate` reproduce the reference's chain exactly. The
+drafter's decision-relevant output is therefore equivalent on both sides; the whole difference is
+`cand`, which comes from the **target lm_head** -- r4dx reads the container's 4-bit `w4a16` head,
+the reference the checkpoint's fp32 one. `cand[2]`'s top two entries (`1061` and `271`) are simply
+swapped between them. There is nothing in the drafter to fix; a drafter output agreeing to ~1% on
+real activations is the anchor this check exists to establish.
+
+That both the `bf16` and the `w4a16` draft containers produce the IDENTICAL chain on both real
+prompts is the other half of the w4a16 story above: on structured, real features the 4-bit drafter
+tracks the bf16 one exactly, whatever the synthetic fixture's unstructured Gaussians suggest.
+
+### Isolated cost (HIP device 1, `n_injected=512`, 50 rounds, one process at a time)
+
+| Draft container | `DraftRound` device | `DraftRound` wall | `InjectFeatures(64 rows)` device / wall |
+|---|---|---|---|
+| `bf16` (3.58 GB) | **9.696 ms** (9.500-9.865) | **10.021 ms** (9.927-10.436) | 2.000 / 2.087 ms |
+| `w4a16` (1.13 GB) | **5.770 ms** (5.704-5.852) | **6.179 ms** (6.091-6.771) | 0.799 / 0.875 ms |
+
+Per-round weight traffic is 4.01 GB for `bf16` (5 x 665.9 MB of layer weights + the target's 676 MB
+4-bit lm_head) and 1.56 GB for `w4a16`. Fitting `t = c + bytes/BW` to the two device figures gives
+**BW = 622 GB/s** -- essentially this card's peak -- and **c = 3.26 ms** of launch-bound remainder
+over ~80 kernel launches at M=8 (~41 us each, the Windows/WDDM launch overhead `docs/r9700.md`'s
+host-overhead work already documents). So the memory-bound part is already running at the roof and
+the obvious S3 lever is launch count, not bandwidth. VRAM with the target loaded at `--max-ctx
+8192`: 20.83 GiB (`bf16` drafter) / 18.39 GiB (`w4a16`).
+
+Projecting against the cost model: a round is draft + verify(<=8 rows, ~26 ms) + inject(accepted
+rows only, well under the 64-row figure above), i.e. ~32.5 ms with the `w4a16` drafter -- so
+3.1 accepted tokens per round already clears 95 tok/s and 5.9 (the 84% ROCmFPX figure) would reach
+~180. Measuring that end to end is S3's job, not this stage's.
+
+**A measurement trap worth recording.** `hipEvent` timing of a `DraftRound` is only valid if the
+closing `hipEventRecord` precedes the round's final small async D2H into PINNED host memory: that
+copy can be serviced by the SDMA/blit engine rather than the compute queue, and an event recorded
+behind it carries that queue's timestamp instead. With the record one line later the same code
+reported 0.03-0.27 ms (with an occasional correct sample at exactly the wall figure) for a round
+whose wall clock is 6-10 ms and whose weight read alone is 1.5-4 GB -- an impossible 16-50 TB/s.
+The `device_ms` out-parameter on `DraftRound` exists so callers get this right by construction.
+
+## 7. Integration plan for r4dx (items 1-4 BUILT, see section 6c; item 5 is stage S3's)
+
+1. **Target-side feature capture -- DONE, see section 6a above** (`Model::AttachDflashFeatureCapture`,
+   2026-09-20). During both prefill/decode and `VerifyWindow`, the residual stream entering layers
+   `{6,20,34,48,62}` (0-based HF indexing, i.e. the OUTPUT of layers `{5,19,33,47,61}`) is captured
+   for every position, analogous to how `docs/mtp.md`'s `h_seed` is already captured off
+   `Model::RunChunk`.
+2. **Draft KV ring -- DONE, see section 6c** (`DflashDraft::k_store_`/`v_store_`): per-layer
+   (5 layers), per-head (8 kv heads), 128-dim, sized to `sliding_window = 2048` positions -- 21 MB
+   each, no fp8 paging needed.
+3. **Injection -- DONE, see section 6c** (`DflashDraft::InjectFeatures`, driven off
+   `Model::SetDflashCaptureObserver` for prefill/decode chunks and off the driver for a verify
+   round's accepted prefix). It did NOT end up sharing a helper with `MtpHead::PrimeKv` as this
+   item speculated: the two have different inputs (target FEATURES vs an `(h_i, t_{i+1})` pair),
+   different arithmetic (an encoder + K/V only, no attention at all vs a full decoder sublayer) and
+   different stores, so the only thing they would have shared is the word "prime".
+4. **Draft loop -- DONE, see section 6c** (`DflashDraft::DraftRound`). The selector walk did stay on
+   the host as predicted, and is measured at well under 0.4 ms including every kernel launch and the
+   round's one synchronize.
+5. **Verify + commit -- the verify half is ready, the driver is stage S3's.** `Model::VerifyWindow`
+   was generalised this stage so it no longer requires an MTP head (`ModelOptions::dflash_draft_k`,
+   `Model::DraftWindow()`), and `Model::CommitVerifiedWindow` exposes the pos_/acceptance-count
+   commit. What remains is the round loop itself: draft -> verify -> accept the longest greedy
+   prefix -> inject the accepted rows' captured features -> new anchor, plus the CLI/server flags
+   and the losslessness proof. DFlash2 remains a drop-in alternative DRAFT SOURCE, not a different
+   verify contract.
+
+## 7a. Stage S3: the driver, wired and measured (2026-09-20)
+
+**Item 1 (flags) -- DONE.** `--dflash <container>` / `--dflash-k N` (1..7, default 7) /
+`--dflash-p-min F` (default 0) / `--dflash-n-min N` (default 0) on both `r4dx-cli` and
+`r4dx-server` (`src/cli/cli_args.h`, `src/server/server_args.h`); `--dflash` with `--mtp > 0` is a
+`CliUsageError`/`ServerUsageError` at parse time. `ModelOptions` gained `dflash_container` (empty
+disables it, matching every other opt-in flag in this codebase); `Model::Load` peeks the
+container's own `__metadata__.dflash2.layout` field (NOT `ModelOptions::layout`, which is the
+TARGET body's layout -- the two are independent, docs/container-format.md), validates it via
+`LayoutFromName` (throws on garbage), checks `dflash_draft_k <= block_size-1`, and prints a load
+line (`[r4dx::model::Model] DFlash2 drafter loaded: <path> (layout=..., block_size=8,
+target_layers=[6,20,34,48,62], ...)`). The VRAM breakdown gained its own
+`DFlash2 drafter VRAM: X GiB (weights+kv_ring+draft_scratch; already included in kv+gdn_state
+above)` line -- measured 0.95-1.05 GiB depending on `--dflash-k` (w4a16 draft) or ~1.9-2.0 GiB
+(bf16 draft), bracketing `DflashDraft::Load` with its own `hipMemGetInfo` snapshot pair.
+
+**Item 2 (prefill injection) -- DONE, and turned out to need no new driver code at all.**
+`Model` now owns an `optional<DflashDraft> dflash_` internally when loaded with a non-empty
+`dflash_container`. `RunChunk` (which both `Prefill`'s per-chunk loop and every plain
+`DecodeStep`/`DecodeStepGreedy` call funnel through) calls `dflash_->InjectFeatures(...)` directly,
+once per call, right where `SetDflashCaptureObserver`'s external hook already fires for a
+caller-owned drafter -- this is a SEPARATE, simpler path from that external-observer mechanism
+(which stays exactly as section 6c documented it, for a driver that owns its OWN `DflashDraft`
+object, e.g. `tests/model/tool_dflash_probe.cpp`): a Model-owned drafter is fed via a plain member
+call, not a captured closure, specifically because a closure capturing `this`/`&m` inside
+`Model::Load`'s own local variable would dangle across the NRVO-not-guaranteed move on return.
+`VerifyWindow` deliberately still never auto-injects (its rows are unverified candidates); only
+`DecodeStepDflashGreedy` (item 3) injects the accepted prefix, explicitly, after it knows how many
+rows that is.
+
+**Item 3 (round loop) -- DONE.** `Model::DecodeStepDflashGreedy(token_id, k, p_min, n_min,
+walk_len_out=nullptr)` returns the exact same round-vector contract as `DecodeStepMtpGreedy`
+(`0..k` accepted drafts + one correction/bonus token), so `mtp_round.hpp`'s `ProcessMtpRound` (already
+speculation-family-agnostic) and `src/cli/main.cpp`'s/`src/server/engine.cpp`'s round loops plug in
+with the same shape as the MTP branch, just gated on `!args.dflash.empty()` /
+`!opts_.model_opts.dflash_container.empty()` instead of `args.mtp > 0`. Sequence: `DraftRound`
+anchored at `token_id` -> candidates `[token_id, d1..dm]` -> `VerifyWindow` (which, as a side effect
+of the SAME per-layer capture hook, also refills `DflashFeatureBuffer()`/`DflashFeatureRows()` with
+this window's own captured target features) -> greedy longest-accepted-prefix `a` (anchor always
+accepted) -> `InjectFeatures` the accepted prefix's own just-captured rows (`0..a-1`, contiguous,
+no offset needed) at the drafter's current `InjectedCount()` -> `CommitVerifiedWindow(a)` (advances
+`pos_`, threads the GDN acceptance count -- the exact non-MTP factoring `CommitVerifiedWindow`
+exists for). `Model::Reset()` also resets the drafter's own ring (`dflash_->Reset()`, a cheap
+host-only counter zero, same self-correcting-via-position-overwrite argument as everything else this
+project resets this way).
+
+**Server prefix-reuse decision (item 3's own ask, "pick one, justify"):** re-inject on every prefix
+hit, not a forced full re-prefill -- and this requires NO new server code, because it falls out of
+the design directly: `dflash_`'s `InjectedCount()` and `Model::pos_` are two counters on the SAME
+persistent `Model` object that ALWAYS advance together, by construction, on every code path that
+touches either (`RunChunk`'s inline auto-inject advances both by the same `T`; `DecodeStepDflashGreedy`
+advances both by the same `a`). The server's `PrefixState::Extend()` prefix-hit path does not call
+`Model::Reset()` at all, so neither counter is touched -- both simply stay exactly where they were,
+still in lockstep. A prefix MISS (not an extension) DOES call `Reset()`, which zeroes both together.
+There is therefore no window in which the ring could hold stale/mismatched injected positions
+relative to `pos_`. `tests/model/test_dflash_e2e.cpp`'s `CheckChatMultiTurnMidRoundStop` (below)
+is the concrete regression test for the surrounding "committed vs displayed" bookkeeping this
+reasoning depends on.
+
+**Bug found and fixed while validating item 4 (see below): a leaked, un-`Reset()` `arena_` after
+`RunChunk`'s own inline `InjectFeatures` call.** Every OTHER terminal user of `Model::arena_` resets
+it before returning; the new inline auto-inject call was the one exception, leaving the next
+`RunChunk` call's own per-layer loop starting from a non-zero, dirty offset instead of the clean one
+every other code path (including every `--mtp 0`/`--mtp N` baseline) always starts from. Fixed by
+adding one `arena_.Reset()` call. **This fix did NOT, on its own, explain the losslessness
+mismatches `validate_dflash.ps1` found** (same output hash before and after) -- see item 4's own
+finding below for the actual explanation. Kept anyway: leaving `arena_` dirty across calls is a
+real, if apparently latent, correctness hazard independent of whether THIS specific mismatch traced
+back to it.
+
+**Bug found in `tests/model/test_mtp.cpp` (out of this stage's own scope -- NOT fixed here, flagged
+as a background task): `CheckChatMultiTurnMidRoundStop`'s `stop_after = cumulative + round.size() -
+1` formula can mathematically never produce a genuine "committed > displayed" gap** (`ProcessMtpRound`'s
+`committed` is unconditionally `round.size()-1` elements; with `max_tokens_remaining ==
+round.size()-1`, `displayed` pushes exactly the same `round.size()-1` elements, so the two are
+always equal). This has apparently gone unnoticed because the 4-layer container that test runs
+against never returns a round with `size>=2` within its own first 8 rounds, so the function always
+takes its own (correct, non-failing) "cannot force a mid-round stop; skipping" early return instead
+of ever reaching the broken arithmetic. `tests/model/test_dflash_e2e.cpp`'s own copy of this check
+uses the corrected `cumulative + round.size() - 2` formula and DOES land a genuine mid-round stop
+(verified: "displayed=6 committed=8 (2 committed-but-undisplayed token(s))" on a real run).
+
+**Item 4 (lossless gate) -- `tools/validate_dflash.ps1`, run for real (2026-09-21, Integrate stage);
+result: PASSED WITH WARNINGS, exit 0, every cell now accounted for by evidence.** Modeled on
+`tools/validate_fusion.ps1`. For every (target layout, prompt) pair it also runs an `--mtp 7`
+CONTROL (no `--dflash` at all) against the same prompt, so a `--dflash` vs `--mtp 0` mismatch is
+checked against the pre-existing, dflash-uninvolved MTP path on the SAME prompt/layout rather than
+assumed to be "the known mechanism" from a layout name.
+
+**Correction (review finding, 2026-09-21, blocker): the previous revision of this section reported
+"4 of 9 cells mismatch" and called the gate's run "PASS" without noting it exited 1** (the script's
+own `--mtp 7`-only control had no way to close the mxfp4/long row, and a hard FAIL with no override
+cannot be called a pass). Both are fixed: `validate_dflash.ps1` gained a second, "grouping control"
+(a DIFFERENT draft container at the same target/layout/prompt -- see the script's own doc comment)
+for exactly the case where the `--mtp 7` control does not reproduce a mismatch, and a fresh run on
+this corrected tree found **5 of 9 cells mismatch** (not 4), all 5 now resolved to WARN (not a hard
+FAIL), so the script exits 0:
+
+| Layout | short (~20 tok) | medium (~250 tok, 4 prefill chunks) | long (~3500 tok, 55 chunks, exceeds the drafter's own 2048-token sliding window) |
+|---|---|---|---|
+| w4a16 | OK (byte-identical) | MISMATCH -- `--mtp 7` control diverges from `--mtp 0` with the EXACT SAME SHA-256 as `--dflash` (direct confirmation) | OK |
+| w4a8 | OK | MISMATCH -- control also diverges, but a DIFFERENT hash than `--dflash` (same mechanism class, argued not proven) | MISMATCH -- control diverges with the EXACT SAME SHA-256 as `--dflash` (direct confirmation) |
+| mxfp4 | OK | MISMATCH -- control also diverges, but a DIFFERENT hash than `--dflash` (same mechanism class, argued not proven) | MISMATCH -- `--mtp` at K=1..7 ALL match `--mtp 0` on this prompt (the `--mtp 7` control does NOT reproduce it), but the GROUPING control (`--dflash` against the mxfp4 draft container instead of w4a16, same target/layout/prompt) DOES match `--mtp 0` exactly -- resolved below, not by the primary control |
+
+Of the 5 mismatching cells, **2 (w4a16/medium, w4a8/long) are DIRECTLY confirmed** by an
+identical-SHA `--mtp 7` control; **2 (w4a8/medium, mxfp4/medium) are same-mechanism-class but NOT
+directly proven** (the control diverges from `--mtp 0` too, but not to the identical text `--dflash`
+produced); and **1 (mxfp4/long) is resolved by the new grouping control**, not the primary one --
+see below. This corrects the previous revision's "four of the five are DIRECTLY confirmed" claim,
+which counted the 2 same-class-but-unproven cells as direct confirmations; `docs/status.md`'s "3 of
+4" count is consistent with the 2-direct/2-class-only split once mxfp4/long (a 5th cell, then
+unresolved) is counted separately, as it is here.
+
+Every mismatch is a single coherent word/phrase substitution (e.g. "which states that" vs "which
+describes how", "repeated identically" vs "repeated verbatim") -- never a dropped/duplicated token,
+never garbage. Some are DIRECTLY confirmed (not merely argued) to be the documented
+batched-verify-reduction-order mechanism docs/mtp.md already describes for MTP, because the
+`--mtp 7` control reproduces the identical divergence (same SHA-256) on the same prompt/layout with
+ZERO DFlash2 code involved -- a finding this stage adds to that mechanism's own record: it is NOT
+mxfp4-specific (docs/mtp.md previously only documented it there), w4a16 and w4a8 show it too.
+
+**Correction (review finding, 2026-09-21): the previous paragraph here wrongly explained why
+DFlash2 diverges more often than MTP as "DFlash2's own verify batch size varies round-to-round ...
+while MTP's is fixed at `k+1` every round".** That is factually wrong at the shipped defaults
+(`--dflash-p-min 0`, `--dflash-n-min 0`): `SelectorWalk`'s loop (`src/model/dflash_draft.cpp`) only
+ever breaks on the `k` cap or on `p_min`, so with `p_min<=0` it always emits exactly
+`min(k, block_size-1)` tokens and the verify window is exactly `k+1` rows every single round --
+IDENTICAL to MTP's. The shipped per-request stats prove it directly: `drafted=128` over `rounds=32`
+at k=4 and `drafted=217` over `rounds=31` at k=7, i.e. exactly k tokens drafted per round, in every
+run made. The real differentiator between DFlash2 and MTP is WHICH tokens fill an identically-sized
+verify window, not the window's width -- DFlash2's selector walk and MTP's own head propose
+different candidate sequences from the same context, and a batched-GEMM reduction-order effect that
+is borderline for one candidate sequence need not be borderline for another. This is also why
+changing the DRAFT CONTAINER (a pure re-quantization of the encoder/layers that changes which
+tokens get drafted, not the verify mechanism or window width) can flip a specific mismatch from
+diverging to matching, and is the basis of `tools/validate_dflash.ps1`'s own "grouping control"
+(below).
+
+**The mxfp4/long cell -- RESOLVED (2026-09-21, Integrate stage), by experiment, not by falling back
+to the same explanation without evidence.** `--mtp` at every one of K=1,2,3,4,5,6,7 reproduces
+`--mtp 0` byte-for-byte on this exact prompt/layout (checked directly, not assumed), yet `--dflash`
+(w4a16 draft) diverges by one word ("identically" vs "verbatim") on the same prompt -- so the
+`--mtp 7` control experiment that confirmed the other four cells does NOT confirm this one. Localized
+with a battery of controls that each vary exactly one thing:
+- `--dflash-k` 1, 2, 3 all reproduce `--mtp 0` byte-for-byte; `--dflash-k` 4, 5, 6, 7 ALL flip the
+  same one word, deterministically across repeats -- i.e. the divergence appears at a specific verify
+  window WIDTH, not randomly.
+- `--dflash-p-min 0.5` and `--dflash-p-min 0.9` at k=7 (early-stopping the selector walk before it
+  reaches that width on this prompt) both go back to matching `--mtp 0` exactly.
+- The **mxfp4 draft container** at k=7 matches `--mtp 0` exactly, while the **w4a16 and bf16** draft
+  containers at k=7 both diverge -- re-quantizing the draft body (which changes WHICH tokens the
+  selector walk drafts, not the verify mechanism or the window's width) flips the result. A
+  bookkeeping/lifecycle bug cannot be switched off by changing the draft container's own numeric
+  precision; a verify-window grouping effect can, because a different draft container proposes a
+  different candidate sequence into the identical-width, identical-code verify window.
+- `tools/validate_dflash.ps1`'s own new "grouping control" (added this stage specifically for this
+  finding) automates exactly the third point: re-running `--dflash` with the mxfp4 draft container
+  in place of w4a16, same target/layout/prompt. It matches `--mtp 0` exactly, confirming the above.
+
+**Conclusion: this is the same verify-window-grouping mechanism as the other 4 mismatching cells,
+confirmed by a control the primary `--mtp 7` check cannot express** (varying `--dflash-k`/
+`--dflash-p-min`/the draft container all change which candidate tokens fill the verify window,
+without touching DFlash2's own bookkeeping) -- not a DFlash2-specific correctness bug. It is not
+"proven" in the identical-SHA sense the other two direct-confirmation cells have (there is no
+zero-DFlash-code control that reproduces this exact byte pattern, because MTP's own fixed-K
+schedule never happens to visit this precise window geometry), but the battery above rules out a
+bookkeeping/lifecycle explanation specifically, which is the failure mode item 4 exists to catch.
+
+**Item 5 (anchor check against real captured features) -- DONE (Integrate stage, 2026-09-21).**
+Stage S2 confirmed the drafter's own math against the Python reference on two real prompts using a
+SEPARATELY-owned `DflashDraft` fed via `SetDflashCaptureObserver` (an external-observer harness).
+This left the WIRED path -- `ModelOptions::dflash_container`, `Model`'s own internal `dflash_`,
+`Model::Prefill`'s auto-inject, `Model::DecodeStepDflashGreedy` -- never checked against the Python
+reference at all, which is the one path a real `r4dx-cli`/`r4dx-server` generation loop actually
+takes and the one thing that could catch "wired up but silently drafting from the wrong features".
+
+Closed by: (1) `Model::DecodeStepDflashGreedy` gained two optional out-params, `trace_out`
+(forwarded straight to `DflashDraft::DraftRound`'s own `trace`) and `drafted_tokens_out` (the raw
+pre-verify chain, distinct from the method's own post-verify return value) -- diagnostics-only,
+zero cost when null, existing call sites unaffected (both are trailing defaulted params); (2)
+`tests/model/tool_dflash_probe.cpp` gained a `--wired` mode that loads exactly one `Model` with
+`dflash_container` set (no separately-owned `DflashDraft`, so there is never a second ~GB-scale
+object competing for VRAM with the wired one), drains the model's own public
+`DflashFeatureBuffer()`/`DflashFeatureRows()` via `Prefill`'s `on_chunk_captured` callback for the
+dump, and calls `DecodeStepDflashGreedy` with both new out-params. Dumps to
+`build/logs/dflash_probe/wired_promptN`.
+
+**A real bug was found and fixed while building this: `RunWired`'s per-chunk callback dereferenced
+`Model::DflashFeatureBuffer()` directly from host code.** That pointer is a DEVICE pointer
+(`dflash_features_dev_` lives on the GPU) -- the original S2 harness always `hipMemcpy`'d it to a
+host staging buffer first; the new wired-mode callback initially skipped that copy and read GPU
+memory from the CPU, crashing with `STATUS_ACCESS_VIOLATION` (0xC0000005) partway through the first
+prompt. Found by running it (not by inspection) and fixed by adding the same D2H `hipMemcpy` the
+original harness already does.
+
+**Result, both real prompts, w4a16 draft container (matches the S3 driver's own default choice):**
+
+| Prompt | x_final_normed RelL2 | gate RelL2 | cand (exact/overlap of 128) | chain vs reference |
+|---|---|---|---|---|
+| "capital of France/Germany" | 1.568e-01 | 1.413e-01 | 50/117 | DIFFERENT -- attributed to the container's 4-bit lm_head precision (hybrid walk: port cand + reference gate reproduces the PORT's chain exactly) |
+| "def fibonacci(n)" | 2.057e-01 | 1.551e-01 | 50/113 | IDENTICAL |
+
+**Same check with the bf16 draft container (the S2 anchor check's own default), for direct
+comparability against the previously-recorded numbers:** x_final_normed RelL2 **1.094e-02** and
+**1.338e-02** on the two prompts -- these are the EXACT SAME figures the ROUND stage's own S3
+report already recorded from the UNWIRED (`SetDflashCaptureObserver`) harness ("the drafter's own
+x_final_normed agrees with the fp32 reference to 1.09e-2 and 1.34e-2 on the two prompts"), to 4
+significant figures. **This is the actual point of item 5's check**: the wired driver reproduces
+the previously-validated isolated harness's numbers exactly, on both draft containers, including
+the same divergence pattern (prompt 0 differs by lm_head precision only, prompt 1 is bit-exact) --
+i.e. the wiring itself introduced no drafting-from-the-wrong-features bug. The higher RelL2 with the
+w4a16 draft (0.157/0.206) vs bf16 (0.0109/0.0134) is the drafter's own known 4-bit-noise-at-the-fc-
+encoder effect (S2's own finding on synthetic fixtures, 7.02e-1), not a wiring defect -- and, as S2
+also found, it does not change the drafted chain on real features (both draft containers draft the
+IDENTICAL 7-token raw chain on both prompts: `[13,271,760,6511,314,11751,369]` and
+`[1393,12,16,8,478,73111,1393]`).
+
+**Item 6 (measurement matrix) -- PARTIAL, real numbers only, no fabricated rows.** Standard haiku
+prompt, `--max-ctx 2048`, greedy, HIP device 1, one process at a time:
+
+| Target layout | Draft layout | K | Decode tok/s (two runs) | Acceptance | Tok/round |
+|---|---|---|---|---|---|
+| w4a16 | w4a16 | 7 | 74.33, 74.77 | 24.4% | 2.68 |
+| w4a16 | bf16  | 7 | 68.43, 68.42 | 25.7% | 2.77 |
+| w4a16 | w4a16 | 3 | 71.57 (once) | 46.7% | 2.37 |
+| w4a16 | w4a16 | 4 | 77.05 (once) | 40.6% | 2.59 |
+| w4a16 | w4a16 | 5 | 75.63 (once) | 32.5% | 2.59 |
+| w4a16 | w4a16 | 6 | 73.92 (once) | 27.1% | 2.59 |
+| w4a8  | w4a16 | 4 | 64.75 (once) | 33.1% | 2.30 |
+| mxfp4 | w4a16 | 4 | 58.64 (once) | 31.8% | 2.24 |
+
+VRAM (w4a16 target + w4a16 draft, K=7): 18.13-18.19 GiB. Best observed on the standard prompt:
+**w4a16/w4a16 at K=4, 77.05 tok/s (40.6% acceptance, 2.59 tok/round)** -- beats the plain
+(`--mtp 0`) w4a16 baseline of 38.98 tok/s by ~2.0x, but is still below M4's own MTP headline
+(68.73 tok/s at its OWN best K) by comparison to THIS run's plain baseline multiplier, and well
+below ROCmFPX's 120 tok/s / 84% acceptance on this same card/draft.
+
+**Integrate stage (2026-09-21) additions -- headline re-confirmed, one real gap closed, several
+still open (review finding: this must be stated plainly, not narrowed silently).**
+- **Headline re-measured after this stage's own fixes** (RunChunk stream-sync, `Model::Load`
+  hidden_size check): w4a16/w4a16 K=4, standard prompt, twice: **77.19, 77.26 tok/s** -- <0.3% from
+  the pre-fix 77.05/77.06/77.16, confirming neither fix moved decode throughput (the stream-sync
+  fix only touches `RunChunk`'s dflash branch, which `DecodeStepDflashGreedy`'s own decode-loop
+  injection path never calls). See `docs/perf.md`'s Milestone 5 S3 section for the full writeup.
+- **NEW: the ~400-token code prompt, `--max-tokens 256`, real container, twice each --
+  `docs/perf.md` has the full table.** Headline: **DFlash2 K=7 reaches 106.93/106.82 tok/s (44.2%
+  acceptance) vs MTP K=3's 72.36/72.42 tok/s (53.7%) vs plain's 38.71** -- DFlash2 clearly BEATS MTP
+  on this prompt, the opposite ranking from the standard haiku prompt. This corrects the previous
+  revision of this section's implicit "DFlash2 is in MTP's range but behind it" framing to
+  **prompt-dependent, not a fixed ranking** -- see `docs/perf.md` for the corrected conclusion.
+- **Item 7's tok/s parity is CLOSED** (see below) -- moved out of "NOT measured".
+- **STILL NOT measured, same reason as before (time budget, not a discovered blocker)**: the
+  `p_min` sweep ({0, 0.3, 0.5}); the w4a8/mxfp4 DRAFT-container legs (only w4a16 and bf16 drafts
+  have ever been tried); an explicit prefill-with/without-`--dflash` A/B; the one long-context point
+  (`--max-ctx 32768`, ~30k real prefilled tokens); and doubling every row of the ORIGINAL haiku-
+  prompt table above (K=3/5/6 and the w4a8/mxfp4 target rows are each still a single run -- only
+  K=4/K=7/the new code-prompt table are doubled). The acceptance ceiling on the haiku prompt
+  (24-47% depending on K, well under ROCmFPX's 84%) is still the more likely place to look before
+  assuming a bandwidth/kernel-count problem, and the code-prompt result above (44-69% acceptance on
+  a more templated prompt) is consistent with that, but NEITHER was root-caused this stage either.
+
+**Item 7 (server passthrough + smoke) -- flags DONE, end-to-end verified, tok/s-parity CLOSED
+(Integrate stage, 2026-09-21).** `--dflash`/`--dflash-k`/`--dflash-p-min`/`--dflash-n-min` pass
+through `src/server/server_args.h` -> `EngineOptions` -> `Model::Load` exactly like the CLI;
+`engine.cpp`'s `RunRequest` gained a `use_dflash` branch structurally identical to its existing
+`use_mtp` one. `tools/server/smoke.ps1` gained `-Dflash <path>` and a `" dflash: "` log-line check.
+Run for real against the real 64-layer container + the real w4a16 draft: **all 28 checks passed**,
+including
+streaming, non-streaming, tool-call round trip readiness (`-ToolRoundTrip` not passed this run but
+the flag path is unchanged), the prefix-reuse-does-not-reload check, and the new dflash-path-taken
+check.
+
+**Tok/s parity -- CLOSED (Integrate stage, review's own measurement, recorded here rather than
+re-run since neither this stage's fix touches the server's request-routing path):**
+`r4dx-server --dflash --dflash-k 4` reported **77.54, 77.62 tok/s** on the standard prompt across
+two requests, vs the CLI's own **77.06, 77.16 tok/s** (pre-fix measurement; post-fix CLI is
+77.19/77.26, see item 6 above) -- within 1%, PASSING item 7's own "must track the CLI within a few
+percent" bar.
+
+**Build/test**: full `ctest` **49 registered (was 48), 45 passed, 4 skipped** (the same
+pre-existing missing-golden-data skips: `test_kernel_bandwidth`, `test_gdn_layer`,
+`test_final_lm_head`, `test_attn_layer`), 0 failed, ~293s, HIP device 1. New:
+`tests/model/test_dflash_e2e.cpp` (the mid-round-stop regression test above), `tests/cli/test_args.cpp`
+and `tests/server/test_server_args.cpp` both gained `TestDflashFlags`.
+
+**Integrate stage (2026-09-21) closing note on item 6.** The final confirmation sweep (each layout's
+own best DFlash `K` vs. its own best MTP `K`, standard + code prompt, twice each) is in
+`docs/perf.md`'s top section and `docs/status.md`'s "Milestone 5: done" entry, not repeated here.
+Headline: DFlash2 beats MTP on **all three layouts on the code prompt** (w4a16 +30.7%, w4a8 +24.6%,
+mxfp4 +24.9%) and on **w4a16/w4a8 on the standard prompt** (+12.2%/+12.3%); MTP still leads on
+**mxfp4/standard** (DFlash2 -9.8%) -- the one cell carried into Milestone 6 as an open, not
+root-caused, gap. The `p_min` sweep and the w4a8/mxfp4 DRAFT containers remain unmeasured.
+
+## 8. `--real` mode input schema
+
+`tools/reference/dflash2_ref.py --real <path> --target-dir <dir>` accepts EITHER of two forms.
+
+**Form 2 (added stage S2, what the C++ probe writes): a DIRECTORY** holding `features.bin` (raw
+little-endian float32, C order) plus a `manifest.json` with `schema: "dflash2_real_dump_v1"`,
+`features_file`, `features_dtype`, `features_shape`, `anchor_id`, `n_injected`, and optionally
+`positions`. A C++ producer has no npz writer and adding one there would mean implementing zip; a
+raw blob plus the shape is the whole difference. When the directory ALSO contains the port's own
+`x_final_normed.bin` / `gate.bin` / `cand.bin` / `unary.bin` and a `drafted_tokens` array in the
+manifest, `--real` additionally prints the per-tensor comparison and hybrid-walk attribution
+section 6c's "Anchor check on real inputs" describes.
+
+**Form 1 (original): an `.npz`** with:
 
 | Key | Shape | dtype | Meaning |
 |---|---|---|---|

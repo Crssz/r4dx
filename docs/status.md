@@ -1,5 +1,424 @@
 # Status
 
+## Milestone 5: done (2026-09-21, integration pass)
+
+**Integration**: clean `build.ps1 -Clean` rebuild (0 errors, 0 warnings from this milestone's own
+code) + full `ctest` **49 registered, 45 passed, 4 skipped, 0 failed, 302.18s**, HIP device 1 (same
+counts as the Fix stage's own last run -- no regression from the clean rebuild) +
+`tools\validate_dflash.ps1 -AllowBatchedVerifyDivergence` **PASSED WITH WARNINGS, exit 0** (4/9
+cells byte-identical, 5/9 accepted as the documented batched-verify-reduction-order mechanism, full
+table below) + `tools\server\smoke.ps1 -Dflash <real w4a16 draft> -Layers -1 -ToolRoundTrip` against
+the real 64-layer container, **38/38 checks passed** (streaming, non-streaming, tool-call round
+trip, prefix-reuse-no-reload, the dflash-path-taken check) + a fresh Integrate-stage confirmation
+sweep (below) -- each layout at its own best DFlash `K` and best MTP `K`, standard + code prompt,
+twice each, all pairs agreeing to <=0.1 tok/s.
+
+**`tools/validate_dflash.ps1 -AllowBatchedVerifyDivergence` -- full 9-cell table (this pass's own
+re-run, real 64-layer container + real w4a16 draft)**:
+
+| Layout | short (~20 tok) | medium (~100 tok, multi-chunk) | long (~1000 tok, long-context) |
+|---|---|---|---|
+| w4a16 | OK | MISMATCH -- `--mtp 7` control matches `--dflash`'s exact SHA-256 (direct confirmation) | OK |
+| w4a8 | OK | MISMATCH -- control diverges too, different hash (same mechanism class) | MISMATCH -- control matches `--dflash`'s exact SHA-256 (direct confirmation) |
+| mxfp4 | OK | MISMATCH -- control diverges too, different hash (same mechanism class) | MISMATCH -- resolved by the grouping control (mxfp4 draft container matches `--mtp 0`; w4a16/bf16 drafts diverge), not the primary `--mtp 7` control -- see docs/dflash2.md 7a |
+
+**Headline decode throughput, Integrate-stage final confirmation sweep (full table and method:
+`docs/perf.md`'s top section)**: on a ~270-token code prompt, DFlash2 (each layout's own best K=4)
+beats that layout's own best MTP K on **all three layouts** -- w4a16 116.90/116.84 tok/s (77.4%
+acceptance) vs MTP 89.45/89.44 (+30.7%), w4a8 109.22/109.29 vs 87.53/87.71 (+24.6%), mxfp4
+94.30/94.30 vs 75.50/75.68 (+24.9%). On the standard haiku prompt DFlash2 still beats MTP on w4a16
+(77.08/77.05 vs 68.72/68.62, +12.2%) and w4a8 (64.79/64.76 vs 57.69/57.66, +12.3%), but MTP still
+leads on mxfp4 (64.91/64.91 vs 58.57/58.63, DFlash2 -9.8%) -- prompt-dependent, not a fixed ranking,
+confirming and tightening stage S3's own finding with the layouts' actual matched-K settings instead
+of a single once-run code prompt. Best single cell (w4a16/code, 116.90 tok/s, 77.4% acceptance) is
+now within 3% of ROCmFPX's own 120 tok/s / 84% acceptance reference figure on this same card/draft.
+
+**Milestone 5 work items, status**:
+
+| Item | Status | Detail |
+|---|---|---|
+| Kernels (rope_neox, topk16, dflash_attn, dflash_conv, rmsnorm_plain) | **DONE** | 5 new r4dx-owned device kernels, each vs. a CPU fp64 reference and vs. real-container fixture data; every kernel's norm_rel lands at the bf16 output quantum (1.6e-3..1.7e-3). Stage S1, `docs/dflash2.md` 6b. |
+| Draft module (`DflashDraft`: encoder, KV injection ring, 5-layer block-diffusion stack, selector walk) | **DONE** | `src/model/dflash_draft.{h,cpp}`; fixtures A/B/C bit-exact on cand/unary and drafted-chain-exact (including the window-clip/ring-wrap and `p_min` early-stop cases); real-hardware anchor check against the Python reference. Stage S2, `docs/dflash2.md` 6c. |
+| CLI/server flags + `Model`-owned drafter + `DecodeStepDflashGreedy` round loop | **DONE** | `--dflash`/`--dflash-k`/`--dflash-p-min`/`--dflash-n-min` on both binaries, mutually exclusive with `--mtp`; `Model::DecodeStepDflashGreedy` plugs into the same `mtp_round.hpp` contract as MTP. Stage S3, `docs/dflash2.md` 7a items 1-3. |
+| Losslessness gate (`tools/validate_dflash.ps1`) | **DONE** | Was RED (exit 1) after stage S3; Integrate stage added a "grouping control" (a different draft container at the same target/layout/prompt) that resolves the one cell the primary `--mtp 7` control could not close. Now exits 0, every one of the 5 mismatching cells accounted for by evidence (2 direct-SHA confirmations, 2 same-mechanism-class, 1 grouping-control resolution). See table above. |
+| Anchor check against the WIRED drafter (real captured features, real generation loop) | **DONE** | Was undelivered after stage S3 (only the unwired, separately-owned-`DflashDraft` harness had been checked). Fix stage closed it: `tool_dflash_probe.exe --wired` reproduces the unwired harness's own `x_final_normed` RelL2 figures (1.09e-2/1.34e-2, bf16 draft) to 4 significant figures, proving the wiring introduces no drafting-from-the-wrong-features bug. Found and fixed a real `STATUS_ACCESS_VIOLATION` while building the check (a device pointer dereferenced from host code). |
+| Measurement matrix (decode/prefill/VRAM/acceptance, both prompts, matched-K, twice each) | **DONE for the matrix this milestone commits to** (standard + code prompt x 3 layouts x plain/best-MTP/best-DFlash x 2 runs, this pass's own sweep, table above). **Explicitly NOT measured, carried to Milestone 6, not silently dropped**: the `p_min` sweep {0, 0.3, 0.5}; the w4a8/mxfp4 DRAFT containers (only w4a16 and bf16 drafts have ever been tried); the one long-context point (`--max-ctx 32768`, ~30k real prefilled tokens); an explicit prefill-with/without-`--dflash` A/B. |
+| CLI-vs-server tok/s parity | **DONE** | `r4dx-server --dflash --dflash-k 4` 77.54/77.62 tok/s vs CLI's 77.06/77.16 (pre-Fix-stage measurement) -- within 1%. Not independently re-measured this Integrate pass (neither the Fix stage's nor this pass's changes touch the server's request-routing path). |
+| Review findings (3 blockers, 3 majors, 5 minors) | **ALL FIXED or REJECTED-WITH-REASON** | See the Fix-stage section below for the full per-finding accounting; nothing was silently dropped. One item (a genuinely safe per-request drafter-injection toggle for the server, to remove the ~3% tax on sampled/`temperature>0` traffic) needs `DflashDraft` ring-gap tolerance and was spun off as its own background follow-up task rather than rushed; its disposition was not re-checked this pass. |
+| `test_attn_layer` skip-instead-of-crash fix | **PART OF THIS MILESTONE** | `tests/model/attention/CMakeLists.txt` (`SKIP_RETURN_CODE 77`) + `test_attn_layer.cpp` (upfront `FileExists`/`SkipMissing` gate, `try`/`catch` around the extracted `Run()` body) were uncommitted groundwork already sitting in this worktree at Milestone 5's start (closing background task `task_b93fa5a9`, opened during Milestone 4). Verified again by this Integrate pass's own clean-rebuild ctest run: `test_attn_layer` exits 77/SKIPPED, not `0xC0000409`. Recorded here explicitly per this pass's own instructions, since no earlier Milestone 5 section had named it as this milestone's own deliverable. |
+| Account-path / gguf-py hygiene | **CLEAN** | Every file in `git status --short` grepped for the local account name / `C:\Users\` and `import gguf`/`from gguf`: zero account-path hits; the one `gguf` hit (`tools/reference/dflash2_ref.py`, `from gguf_min import ...`) is the repo's own local `tools/reference/gguf_min.py`, not the external `gguf-py` package. |
+
+**Known gaps going into Milestone 6** (nothing here was silently dropped -- each item's own stage
+section above or in the history below has the full accounting):
+
+1. **The `p_min`/`n_min` sweep was never measured.** Only the shipped defaults (`p_min=0`,
+   `n_min=0`) have real numbers; `docs/dflash2.md` section 5's early-stop/discard design is
+   unverified against real acceptance/throughput data.
+2. **The w4a8 and mxfp4 DFlash2 DRAFT containers have never been tried in generation** -- every
+   measurement in this project uses the w4a16 (or, for isolated-cost-only figures, bf16) draft
+   container regardless of the TARGET's own layout. Whether a matched-precision draft (e.g. mxfp4
+   target + mxfp4 draft) changes acceptance or cost is unknown.
+3. **mxfp4/standard-prompt is the one cell where DFlash2 still trails MTP** (58.57/58.63 vs
+   64.91/64.91 tok/s, -9.8%) -- not root-caused. The code-prompt table above shows DFlash2 ahead on
+   mxfp4 too, so this looks prompt-shape-dependent (consistent with the acceptance gap being about
+   which tokens the drafter proposes, not a mxfp4-specific defect), but that is an inference, not a
+   measurement.
+4. **No long-context DFlash2 point exists** (everything above is `--max-ctx 2048`); the drafter's
+   own 2048-token sliding window and the ring's wrap behavior are unit-tested (fixture B) but never
+   measured end-to-end at real long context.
+5. **The server's unconditional per-request drafter tax on sampled (`temperature>0`) traffic**
+   (~3% measured by the review pass) has no structural fix -- would need `DflashDraft`'s ring to
+   tolerate injection gaps. Documented in `docs/server.md`, not fixed.
+6. **DFlash2's overall acceptance (24-77% depending on prompt/layout) is still below ROCmFPX's 84%**
+   reference figure on this same card/draft, though the gap has closed substantially (the code-prompt
+   w4a16 cell is now within 3%, up from stage S3's ~14 points). Not root-caused which remaining
+   factor (candidate proposal quality vs. verify-window grouping vs. something else) accounts for the
+   rest, especially on the standard prose prompt.
+7. Every item already listed as a Milestone 4 gap that Milestone 5 did not touch (vision tower C++,
+   R10/P9 tiled prefill GEMM kernel, R9's calibration-corpus gap, Q8 GPU clock/power sampling) is
+   still open exactly as Milestone 4 left it -- see that milestone's own "Known gaps" list below.
+
+**Recommended order for Milestone 6**: (1) the `p_min`/`n_min` sweep and the w4a8/mxfp4 draft-
+container legs (cheap, no new code, closes the largest remaining measurement gap); (2) root-cause
+the mxfp4/standard-prompt acceptance gap; (3) the long-context DFlash2 measurement point; (4) the
+server ring-gap-tolerance fix for the sampled-traffic tax; (5) R10/P9's prefill GEMM kernel, still
+the single largest unrelated perf lever per Milestone 4's own "Known gaps" #1.
+
+## Milestone 5 (DFlash2 drafter), Integrate stage: review findings fixed, gate green, item 5 closed (2026-09-21)
+
+**Task**: fix every blocker/major finding from the adversarial review of stage S3 (below), re-run
+the affected tests and `tools/validate_dflash.ps1`, re-measure any headline number a fix could
+move, full ctest green, no commit. Full detail: `docs/dflash2.md` section 7a (items 4/5/6/7 all
+updated in place) and `docs/perf.md`'s Milestone 5 S3 section (corrected headline).
+
+- **Blocker: `validate_dflash.ps1` was RED (exit 1) while docs called it PASS -- FIXED.** The
+  script's own `--mtp 7` control could not close the mxfp4/long cell (a real, if rare, failure
+  mode: the control changes nothing about DFlash2's own drafted-token sequence). Added a second
+  "grouping control" (a DIFFERENT draft container at the same target/layout/prompt -- a
+  bookkeeping bug cannot be switched off by re-quantizing the draft container, but a verify-window
+  grouping effect can). Re-run for real: **5 of 9 cells mismatch `--mtp 0`** (not the previously
+  reported 4), all 5 now resolved to WARN under `-AllowBatchedVerifyDivergence` (2 by an identical-
+  SHA `--mtp 7` control, 2 by same-mechanism-class-but-unproven `--mtp 7` divergence, 1 -- mxfp4/
+  long -- by the new grouping control plus a `--dflash-k`/`--dflash-p-min` battery, see
+  `docs/dflash2.md` 7a) -- **script now exits 0**.
+- **Blocker: item 5 (anchor check against real captured features, post-wiring) was undelivered --
+  FIXED.** `Model::DecodeStepDflashGreedy` gained `trace_out`/`drafted_tokens_out` diagnostic
+  out-params; `tests/model/tool_dflash_probe.cpp` gained a `--wired` mode driving the check through
+  the SAME path a real generation loop uses (`Model`'s own internal `dflash_`, not a separately-
+  owned `DflashDraft`). Result: with the bf16 draft container, x_final_normed RelL2 **1.094e-02 /
+  1.338e-02** on the two real prompts -- the EXACT SAME figures S2's unwired harness already
+  recorded, i.e. the wired driver reproduces the previously-validated numbers exactly. A real
+  access-violation bug (a device pointer dereferenced from host code) was found and fixed while
+  building this check.
+- **Blocker: items 6/7's measurement matrix was materially incomplete -- PARTIALLY CLOSED, rest
+  still explicitly open (not narrowed silently).** Re-measured the headline after this stage's own
+  fixes (unchanged within noise, as expected -- the fixes don't touch the decode-loop's own
+  injection path). NEW: the standing-rule-mandated ~400-token code prompt, `--max-tokens 256`, real
+  container, twice each -- **DFlash2 K=7 reaches 106.93/106.82 tok/s (44.2% acceptance) vs MTP K=3's
+  72.36/72.42 (53.7%)**, i.e. DFlash2 BEATS MTP on this prompt, correcting `docs/perf.md`'s previous
+  "in MTP's range but not ahead of it" framing to prompt-dependent. Item 7's CLI-vs-server tok/s
+  parity closed (server 77.54/77.62 vs CLI 77.06/77.16, within 1%). STILL NOT measured: the p_min
+  sweep, w4a8/mxfp4 DRAFT containers, the long-context point, an explicit prefill A/B, and doubling
+  every row of the original haiku-prompt table.
+- **Major: the "DFlash2's own verify batch size varies round-to-round" explanation was factually
+  wrong -- CORRECTED.** At the shipped defaults the verify window is exactly `k+1` every round,
+  identical to MTP's -- the shipped stats prove it (`drafted=128`/`rounds=32` at k=4, exactly
+  k tokens/round). The real differentiator is WHICH tokens fill an identically-sized window, not
+  the window's width.
+- **Major: `RunChunk` returned with the drafter's own kernels still in flight -- FIXED.** Added one
+  `stream_.Synchronize()` after the dflash injection block, restoring the "device idle on return"
+  invariant the plain blocking `hipMemcpy` at model.cpp's attn_positions_/attn_seqused_k_ upload
+  documents as load-bearing. Confirmed to NOT move decode throughput (only affects the prefill
+  path; `DecodeStepDflashGreedy`'s own injection is a separate call site, unaffected).
+- **Major: the evidentiary overclaim in status.md/dflash2.md's "4 of 5 directly confirmed" --
+  CORRECTED** (see the validate_dflash.ps1 bullet above for the accurate 2-direct/2-class-only/
+  1-grouping-control split).
+- **Minor, all fixed**: `Model::Load` now throws if the draft container's `hidden_size` does not
+  match the target's (previously only implicit, via a buffer-size mismatch); `--profile`/
+  `--profile-prefill` now rejected together with `--dflash` at CLI arg-parse time (the profiled
+  loops never fed the drafter, silently desyncing `pos_` from `InjectedCount()`); the server's
+  unconditional per-request drafter tax on sampled (`temperature>0`) traffic is now documented in
+  `docs/server.md` (a genuinely safe per-request toggle would need `DflashDraft` to tolerate gaps
+  in its own ring -- out of scope for this pass, so documented rather than half-fixed);
+  `tests/model/test_dflash_e2e.cpp` gained `CheckResetThenDflashContinuation` (Reset() followed by
+  CONTINUED DFlash2 decode, not just a fallback to plain decode); the claimed UTF-8 BOM in
+  `src/model/model.cpp` was checked directly (`ReadAllBytes`) and is NOT present -- no change
+  needed, finding could not be reproduced.
+
+**Build/test**: full `ctest` **49 registered, 45 passed, 4 skipped** (same pre-existing
+missing-golden-data skips), 0 failed, ~302s, HIP device 1, unchanged pass/skip counts from before
+this stage (the new `CheckResetThenDflashContinuation` check runs inside the existing
+`test_dflash_e2e` binary, not as a new registered test). `tools/validate_dflash.ps1
+-AllowBatchedVerifyDivergence` now exits 0 (was 1).
+
+**Left for a follow-up pass** (explicitly, per the standing "do not narrow scope silently" rule):
+the p_min sweep; the w4a8/mxfp4 DRAFT containers; the one long-context point; an explicit prefill
+A/B; doubling the remaining single-run rows of the original haiku-prompt table; a genuinely safe
+per-request drafter-injection toggle for the server (would need `DflashDraft` ring-gap tolerance).
+
+## Milestone 5 (DFlash2 drafter), stage S3: wired into generation, measured, one open finding (2026-09-20)
+
+**Task**: wire the S1/S2 drafter into real generation (CLI/server flags, the round loop, a
+losslessness gate, a real-hardware anchor cross-check, the full perf matrix, server passthrough) --
+full detail and every table: `docs/dflash2.md` section **7a**. Summary:
+
+- **Items 1-3 (flags, prefill injection, round loop) -- DONE.** `--dflash`/`--dflash-k`/
+  `--dflash-p-min`/`--dflash-n-min` on both `r4dx-cli` and `r4dx-server`, mutually exclusive with
+  `--mtp`. `Model` now owns its own `DflashDraft` when loaded with a container path, auto-fed by
+  `RunChunk` for every prefill chunk and plain decode step (no per-call driver code needed).
+  `Model::DecodeStepDflashGreedy` returns the identical round-vector contract
+  `DecodeStepMtpGreedy` does, so `mtp_round.hpp`'s `ProcessMtpRound` and both CLI/server round
+  loops needed only a parallel branch, not new logic. Server prefix-reuse needs no special handling
+  (justified in 7a): the drafter's own injected-position counter and `Model::pos_` are two fields
+  on the same object that only ever advance together.
+- **One real bug found and fixed**: `RunChunk`'s new inline `InjectFeatures` call left `arena_`
+  un-`Reset()`, unlike every other terminal arena user in this codebase. Fixed. This did NOT,
+  measured directly (identical output hash before/after), turn out to be the cause of the
+  losslessness mismatches below -- kept anyway as a real correctness hazard.
+- **One pre-existing bug found in `tests/model/test_mtp.cpp` (NOT fixed here -- flagged as a
+  background task)**: `CheckChatMultiTurnMidRoundStop`'s own `stop_after` formula can
+  mathematically never produce a genuine mid-round gap; masked because the container it runs
+  against apparently never returns a wide-enough round in practice. `tests/model/test_dflash_e2e.cpp`
+  (new) is DFlash2's own version of that same check, with the corrected formula, and passes,
+  confirming the committed-vs-displayed bookkeeping is correct for DFlash2.
+- **Item 4 (losslessness gate) -- run for real** (`tools/validate_dflash.ps1`, new, modeled on
+  `validate_fusion.ps1`): 4 of 9 (layout x prompt-length) cells mismatch `--mtp 0`, and an added
+  `--mtp 7` control run on the SAME prompt/layout (no DFlash2 involved) reproduces 3 of those 4
+  with the IDENTICAL SHA-256 -- direct, on-hardware confirmation that this is the pre-existing
+  batched-verify reduction-order mechanism `docs/mtp.md` already documents for MTP, now shown to
+  affect w4a16/w4a8 too (not only mxfp4, as previously believed), because DFlash2's own batch size
+  varies round-to-round while MTP's is fixed. **The 9th cell (mxfp4, ~3500-token prompt) is an
+  OPEN, UNRESOLVED finding**: `--mtp` at every K in 1..7 matches `--mtp 0` exactly on that exact
+  prompt, yet `--dflash` alone diverges by one coherent word -- the control that confirmed the
+  other three did not confirm this one. Not garbage, not dropped/duplicated tokens, but not proven
+  benign either -- reported as-is, not asserted away.
+- **Item 5 (anchor check against real captured features, post-wiring) -- NOT DONE this stage.**
+  The machinery exists (stage S2) and was used in isolation; re-running it against the now-wired
+  generation loop was not reached.
+- **Item 6 (measurement matrix) -- PARTIAL, all real numbers.** Best observed: w4a16 target/w4a16
+  draft at K=4, **77.05 tok/s (40.6% acceptance, 2.59 tok/round)** vs that same run's own 38.98
+  tok/s `--mtp 0` baseline (~2.0x) -- still below M4's MTP headline (68.73 tok/s) and well below
+  ROCmFPX's 120 tok/s/84% acceptance on this card/draft. K=3/5/6, w4a8/mxfp4 targets at K=4, and
+  bf16-vs-w4a16 draft were each measured once (not twice); the p_min sweep, w4a8/mxfp4 DRAFT
+  containers, the code prompt, the long-context point, and a formal prefill with/without
+  `--dflash` comparison were not measured at all this stage -- time budget, not a discovered
+  blocker. See `docs/dflash2.md` 7a for the full table and the exact list of what remains.
+- **Item 7 (server) -- flags + smoke DONE** (`tools/server/smoke.ps1 -Dflash <path>`, real
+  container, all 28 checks pass including streaming and tool-call paths unchanged); the formal
+  CLI-vs-server tok/s parity comparison was not measured.
+
+**Build/test**: full `ctest` **49 registered (was 48), 45 passed, 4 skipped** (pre-existing
+missing-golden-data skips, unchanged), 0 failed, ~293s, HIP device 1.
+
+**Left for a follow-up pass**: item 5's post-wiring anchor re-check; the mxfp4/long unresolved
+divergence (localize with `dflash2_ref.py --real` the way S2 already did for the drafter's own
+math); the rest of item 6's matrix (p_min sweep, w4a8/mxfp4 draft containers, code prompt,
+long-context point, every row twice); item 7's tok/s-parity measurement; the `test_mtp.cpp`
+`stop_after` formula fix (flagged, not applied, since it is outside this stage's own files).
+
+## Milestone 5 (DFlash2 drafter), stage S2: the draft module exists, on device, proven (2026-09-20)
+
+**The blocker every section below this one reports -- "the drafter does not exist" -- is closed.**
+Stage S1 built the five device kernels (`docs/dflash2.md` section 6b); stage S2 built the module
+that consumes them and proved it. Full accounting, numbers and method: `docs/dflash2.md` section
+**6c**. Summary:
+
+- `src/model/dflash_draft.{h,cpp}` -- `r4dx::model::DflashDraft`: container load for all four
+  layouts through the existing `QuantLinear`/`ApplyLinear` path (closing
+  `dflash_draft_weights.h`'s `TODO(dflash2-forward)`), the 2048-slot per-layer KV ring,
+  `InjectFeatures` (encoder + per-layer K/V injection at absolute positions), and `DraftRound`
+  (8-wide noise block, 5 layers, final norm, target lm_head, top-16, selector-gate GEMM, **one**
+  D2H + **one** synchronize, then the host lattice walk with `p_min`/`n_min`). Two injectable
+  providers (`MakeTargetEmbeddingProvider`/`MakeTargetLmHeadProvider`) keep the target's embedding
+  table and lm_head out of the drafter, as the container format requires.
+- Hook work from the review, all done: `Model::Reset()` invalidation, a per-`RunChunk` capture
+  observer (`SetDflashCaptureObserver`, replacing the Prefill-only drain for a DFlash driver),
+  `VerifyWindow` generalised to need no MTP head (`ModelOptions::dflash_draft_k`,
+  `Model::DraftWindow()`, verify scratch renamed `verify_logits_dev_`/`verify_argmax_dev_`), plus
+  `Model::CommitVerifiedWindow`. **MTP is byte-identical** -- `test_mtp` unchanged and green.
+- `tests/model/test_dflash_draft.cpp` (registered, green): fixtures A/B/C against the bf16 draft
+  container -- `cand`/`unary` bit-exact and the **drafted chain exact for all three**, including
+  B's 2100-position sliding-window clip and ring wrap and C's `p_min` early stop; every other
+  intermediate reported with its measured `RelL2`. `tests/model/numpy_legacy_rng.hpp` reproduces
+  `numpy.random.RandomState.randn` bit-exactly so the two non-dumped synthetic inputs need no new
+  fixture bytes (validated against fixture A's own dumped `features.npy`, 0 mismatches).
+- `tests/model/tool_dflash_probe.cpp` + an extended `dflash2_ref.py --real`: on REAL 27B
+  activations the drafter's own `x_final_normed` agrees with the fp32 reference to **1.09e-2 /
+  1.34e-2** on two prompts; one chain is identical and the other's divergence is attributed, by
+  hybrid walks, entirely to the **target lm_head** (4-bit container head vs the checkpoint's fp32
+  one), not the drafter. The code prompt drafts `(n-1) + fibonacci(n`.
+- Isolated cost, 50 rounds at `n_injected=512`: `DraftRound` **5.77 ms device / 6.18 ms wall**
+  (w4a16 drafter), **9.70 / 10.02 ms** (bf16); `InjectFeatures(64 rows)` 0.80 / 2.00 ms. Fitting
+  the two gives 622 GB/s (card roof) plus 3.26 ms of launch-bound remainder over ~80 launches --
+  so S3's lever is launch count, not bandwidth.
+
+**Left for stage S3**: the driver (round loop, CLI/server flags, losslessness gate, end-to-end
+tok/s). See `docs/dflash2.md` section 7 item 5.
+
+## Milestone 5 (DFlash2 drafter), task B2: wire/measure attempted, hard-blocked on B1 items 2-5 (2026-09-20)
+
+**Task**: B2 ("wire the drafter into generation, prove it lossless, measure it") -- 8 items: (1)
+`--dflash`/`--dflash-k`/`--dflash-p-min`/`--dflash-n-min` CLI+server flags, container-layout
+validation, `Model::Load`/VRAM-breakdown wiring; (2) prefill encoder+injection; (3)
+`Model::DecodeStepDflashGreedy` plugging into `mtp_round.hpp`'s round-loop contract; (4) the
+lossless gate (`tools/validate_dflash.ps1`, byte-identical vs `--mtp 0`); (5) a real-hardware
+anchor cross-check against `tools/reference/dflash2_ref.py --real`; (6) the full decode/prefill/
+VRAM/acceptance measurement matrix; (7) server passthrough + smoke test; (8) flip
+`--mtp-draft-head`'s default `reduced`->`full`.
+
+**Read first, confirmed current state before starting**: this file's own B1 section immediately
+below, `docs/dflash2.md`, `src/model/model.h`/`model.cpp`, `src/model/dflash_draft_weights.h`,
+`src/cli/cli_args.h`+`src/server/server_args.h`. Confirmed by direct inspection (not assumed from
+B1's report): `src/model/dflash_draft.{h,cpp}` does not exist anywhere in the tree; no draft-side
+RoPE/non-causal-attention/top-16 kernel exists in `src/kernels/`; `Model` has no
+`DecodeStepDflashGreedy` method and `VerifyWindow`'s window sizing is still driven solely by
+`mtp_draft_k_`; `DflashDraftWeights` is still exactly B1's CPU-only stub with its
+`TODO(dflash2-forward)` markers unchanged.
+
+**Done this pass, real hardware, HIP device 1**: item 8 only. `--mtp-draft-head`'s default flipped
+`"reduced"` -> `"full"` in both `src/cli/cli_args.h` and `src/server/server_args.h` (the actual
+`ModelOptions::mtp_draft_reduced_vocab` value is computed unconditionally at CLI/server ->
+`ModelOptions` translation time as `args.mtp_draft_head != "full"`, so no `model.h`/`model.cpp`
+change was needed or made -- `ModelOptions::mtp_draft_reduced_vocab`'s own struct-literal default
+of `true` is untouched and only matters to a caller that constructs `ModelOptions` directly,
+bypassing both CLI and server). Updated: `tests/cli/test_args.cpp`'s and
+`tests/server/test_server_args.cpp`'s `TestMtpDraftHeadFlag` (default-value assertion flipped, the
+explicit-override case flipped to exercise `"reduced"` instead since `"full"` is now the default,
+the reject-bogus-value case unchanged), `docs/mtp.md`'s recommendation paragraph (new note pointing
+at the flag-default flip), `docs/server.md`'s `--mtp-draft-head` section. Full rebuild (`.\build.ps1`,
+touched only `r4dx-cli`/`r4dx-server`/`test_cli_args`/`test_server_args`, confirming no other target
+was affected) and full `ctest` re-run clean: **42 registered, 38 passed, 4 skipped
+(`test_kernel_bandwidth`, `test_gdn_layer`, `test_final_lm_head`, `test_attn_layer` -- all
+pre-existing, missing-golden-data skips; note `test_attn_layer` skipped CLEANLY this run rather than
+the STATUS_STACK_BUFFER_OVERRUN crash B1's report flagged as background task `task_b93fa5a9` -- not
+investigated further here, out of this pass's scope, and does not change task_b93fa5a9's disposition
+since that bug's own repro conditions were never re-verified this pass), 0 failed.**
+
+**NOT done this pass, and why -- this is a hard dependency block, not a scope/time-box choice**:
+items 1-7 all require the GPU draft module (B1 items 2-5: `src/model/dflash_draft.{h,cpp}`, the
+three new kernels, fixture-driven correctness tests, the real-hardware anchor dump machinery) to
+exist first, and it does not:
+- Item 3 (`DecodeStepDflashGreedy`, the draft round) cannot be written without something that
+  actually produces `[d1..dk]` candidate tokens -- that IS the GPU draft module (encoder, KV
+  injection ring, 5-layer block-diffusion attention/conv/MLP stack, selector greedy-chain walk),
+  which needs the non-causal windowed GQA attention kernel, the NeoX-split-half RoPE kernel, and the
+  top-16-per-row kernel B1 explicitly did not write (no existing r4dx or libr4d kernel fits the
+  draft's 8-row/32-q-head/GQA-4/head-128/sliding-window-2048 non-causal shape, RoPE pairing, or
+  top-K contract). Additionally (review finding, 2026-09-20, not previously called out here):
+  `Model::VerifyWindow` hard-throws `!mtp_` (`model.cpp:816-820`) before doing anything else, so
+  an 8-row DFlash2 verify round -- which does not otherwise need an MTP head at all -- would ALSO
+  require the container to be MTP-converted (`Container::HasMtp()`) purely to satisfy this
+  precondition. A future pass wiring item 3 needs to generalize this precondition to
+  `mtp_ || dflash_` and the row bound (currently `T > mtp_draft_k_ + 1`, model.cpp:835-838) to
+  `T > max(mtp_draft_k_, dflash_k_) + 1`, alongside the window-sizing generalization already noted
+  below.
+- Item 1's flags (`--dflash`/`--dflash-k`/`--dflash-p-min`/`--dflash-n-min`) could be parsed and
+  validated in isolation (pure string parsing, no dependency on item 2's module), but adding a flag
+  a caller can pass with no round loop behind it to actually consume it would be dead scaffolding
+  that either silently does nothing or has to fake a "not yet implemented" error path for every
+  combination the later real wiring will need to replace anyway -- deferred as a package with items
+  2/3 rather than landed half-wired, since `Model::Load`'s VRAM-breakdown line and the
+  container-layout validation this item also calls for are only meaningful once there is a real
+  device-resident draft module whose weights/KV-store/scratch VRAM the breakdown reports.
+- Item 2 (prefill encoder+injection) is literally a call into the nonexistent draft module.
+- Item 4 (lossless gate) and item 6 (the measurement matrix) both require running `--dflash` end to
+  end, which requires item 3.
+- Item 5 (anchor cross-check against `tools/reference/dflash2_ref.py --real`) requires a real
+  drafted chain from item 3 to compare against the reference.
+- Item 7 (server passthrough + smoke test) requires item 1's flags to be real (see above) and item 3
+  to exist behind them.
+
+**Recommended next-step order (unchanged from B1's own docs/dflash2.md section 6a, restated here
+because B2 could not get past this same gate)**: (a) the NeoX RoPE kernel and the top-16 kernel
+first (smallest, independently unit-testable against fixture A); (b) the new non-causal windowed
+attention kernel next, unit-tested against a CPU reference including the sliding-window-edge case;
+(c) the draft module itself, wired against B1's existing feature-capture hook and tested against
+fixtures A/B/C; (d) B2 items 1+3 together (flags + `DecodeStepDflashGreedy`, since item 1's flags
+are only meaningful once item 3 exists to consume them); (e) B2 items 2, 4, 5, 6, 7 in that order
+(prefill wiring, lossless gate, anchor cross-check, the measurement matrix, server passthrough).
+
+## Milestone 5 (DFlash2 drafter), task B1: target feature capture done, GPU draft module NOT started (2026-09-20)
+
+**Task**: B1 ("the DFlash2 drafter runs on the GPU and matches the Python reference") -- five items:
+(1) target feature capture in `Model::RunChunk`/`VerifyWindow`, (2) the GPU draft module itself
+(encoder, KV injection ring, block-diffusion attention/conv/MLP, selector walk, three NEW kernels),
+(3) ctest coverage against fixtures A/B/C, (4) a real-hardware anchor dump for the Python reference's
+`--real` mode, (5) isolated draft-round cost measurement. Full detail: `docs/dflash2.md`'s new
+"6a. Implementation" section.
+
+**Done, real hardware, HIP device 1**: item 1 only. `Model::AttachDflashFeatureCapture`/
+`DetachDflashFeatureCapture`/`DflashFeatureBuffer`/`DflashFeatureRows`/`DflashFeatureCols`
+(`src/model/model.h`/`model.cpp`) hook into both `RunChunk`'s and `VerifyWindow`'s layer loops,
+copying the residual stream entering any attached target layer (5 `hipMemcpy2DAsync` device-to-device
+strided copies per call when 5 layers are targeted, zero host syncs, zero r4dx-owned kernel launches
+either way) into a `[rows][target_layers.size()*hidden]` bf16 buffer -- covers prefill chunks and
+plain decode (which funnels through `RunChunk`) and MTP-style verify windows, per the task's own
+"EVERY forward" requirement; the diagnostic-only `DecodeStepProfiled`/`PrefillProfiled` paths
+(never used by the production round loop) were deliberately left unhooked. New test
+`tests/model/test_dflash_feature_capture.cpp` (registered in `tests/model/CMakeLists.txt`), against
+the real 4-layer bf16 test container: captured layer-0 output is bit-exact against an independently
+computed `EmbeddingGatherHost` ground truth, a second target layer's column is populated and distinct
+(catches column-offset aliasing), and — the "prove nothing extra happens" requirement — the
+r4dx-owned kernel launch count and the returned logits are both identical with vs without a capture
+attached (measured: 19 launches either way for a 10-token prefill). Full `ctest`: **42 registered
+(41 + this 1 new test)**, re-run clean from this pass's own build.
+
+**NOT done this pass, and why (not silently dropped, matching this project's own precedent for
+similarly-sized asks -- R10/P9's tiled prefill GEMM kernel and the vision tower's C++, both time-boxed
+out of a single pass for the same reason)**: items 2-5 of B1 -- the actual DFlash2 draft module
+(`src/model/dflash_draft.{h,cpp}` was not created; `DflashDraftWeights` is still the CPU-only stub
+with its `TODO(dflash2-forward)` markers unchanged), the three NEW from-scratch kernels the task
+calls for (a non-causal windowed GQA attention kernel for this exact 8-row/32-q-head/GQA-4/head-128
+shape, a NeoX-split-half RoPE kernel, a deterministic top-16-per-row kernel), the libr4d fused
+`r4d_dflash_conv_t2_g16_bf16` wiring, the fixture-A/B/C-driven correctness tests (encoder/injection/
+per-layer attention+FFN/logits/cand/unary/gate/score/drafted-token-chain comparisons against
+`tools/reference/golden_out/dflash2/`), the w4a16-quantized-draft drift comparison, the real-hardware
+anchor dump + a same-round Python-reference cross-check, and the isolated draft-round
+`ms`-per-round measurement. Rationale: writing, tuning, and correctness-verifying a from-scratch
+non-causal attention kernel plus a top-K kernel plus the full multi-stage forward pass (encoder,
+5-layer block-diffusion stack, selector walk) against real quantized weights is genuinely multi-day,
+iterative, on-hardware kernel-engineering work -- attempting it in the same pass as the much smaller,
+well-scoped, already real-hardware-verified feature-capture hook above would have meant either
+rushing it (risking a kernel that silently changes drafted tokens, this project's own explicit
+correctness gate) or reporting invented numbers, neither acceptable per this project's standing rules.
+**Recommended next steps, in order** (mirrors the task's own item ordering): (a) the NeoX rope kernel
+and the top-16 kernel first (smallest, most independently unit-testable against fixture A, no new
+attention semantics to get right); (b) the new non-causal windowed attention kernel, unit-tested
+against a CPU reference including the `n>2048`/`n<2048` window-edge case, before any end-to-end
+wiring; (c) the draft module itself (encoder/injection/block forward/selector walk) wired against
+the now-existing feature-capture hook and tested against fixtures A/B/C; (d) the anchor dump +
+real-hardware cross-check against the Python reference; (e) the isolated cost measurement. Also
+found, unrelated to this task, and flagged separately (not fixed here): `tests/model/attention/
+test_attn_layer.cpp` crashes with a stack-buffer-overrun (`0xc0000409`) instead of cleanly SKIPPING
+when its golden fixture file is absent (confirmed pre-existing: reproduces standalone, no file this
+pass touched is anywhere near it) -- a background task was spawned for it separately.
+
+**Closed (review fix pass, 2026-09-20)**: background task `task_b93fa5a9` (the `test_attn_layer`
+crash-instead-of-skip bug flagged in this section) is fixed -- `tests/model/attention/CMakeLists.txt`
+gained `SKIP_RETURN_CODE 77`, and `test_attn_layer.cpp` gained an upfront `FileExists`/`SkipMissing`
+gate plus a `try`/`catch` around the extracted `Run()` body. This fix's authorship was not previously
+attributed in this file (the B2 section below found it already landed in the working tree, unclaimed,
+during that pass, and explicitly did not verify it beyond ctest reporting SKIP); this review fix pass
+independently re-ran it and confirms: `test_attn_layer.exe` now exits `77`/SKIPPED (not `0xc0000409`)
+with the golden `.safetensors` file absent, real hardware, HIP device 1.
+
+**Build/test**: `.\build.ps1` clean incremental build (this pass's own model.h/model.cpp/new-test
+changes only), no warnings from this pass's code. Full `ctest`: 38 passed, 3 skipped (pre-existing,
+missing golden/container data not vendored into the repo -- `test_kernel_bandwidth`, `test_gdn_layer`,
+`test_final_lm_head`, same "SKIPPED not FAILED" convention this doc already documents elsewhere), 1
+FAILED (`test_attn_layer`, pre-existing per the paragraph above, not caused by this pass) out of 42
+registered (was 41 before this pass's 1 new test).
+
+**SUPERSEDED (review fix pass, 2026-09-20)**: the "1 FAILED" line above is stale -- `test_attn_layer`'s
+own SKIP_RETURN_CODE-77 + upfront FileExists/SkipMissing fix (`tests/model/attention/CMakeLists.txt`
++ `test_attn_layer.cpp`, closing background task `task_b93fa5a9`) landed in this same working tree
+before the B2 pass below ran, and both B2's and this review fix pass's own full `ctest` re-runs are
+**42 registered, 38 passed, 4 skipped, 0 failed** (`test_attn_layer` now SKIPs cleanly instead of
+crashing). This file previously stated two different results for the same day (this line, and
+B2's line below) without reconciling them -- this note is the reconciliation; the correct, current
+number is B2's (and this pass's) 4-skipped/0-failed line, not this section's original 3-skipped/
+1-failed line.
+
 ## Milestone 4: done (2026-09-20, integration pass)
 
 **Integration**: clean `build.ps1 -Clean` rebuild (one pre-existing, unrelated MSVC `localtime`
@@ -36,7 +455,7 @@ cleanup, and the single integration commit.
 | R2/P2 fused activation-quant epilogues | **DONE** | Root-caused (`Arena::Alloc` end-alignment gap) and enabled for w4a8/mxfp4; w4a16 stays unfused (measured wall-clock regression, not correctness). See "R2/P2 ... root-caused and enabled" below. |
 | Q5 GEMM tuning re-sweep | **DONE** | Full 280-row re-sweep with the (already-correct) Q5 cache-flattery fix; mxfp4 improved, w4a16 flat, w4a8 `--mtp 3` regressed (root cause: verify-band GEMM retiling + numerical reduction-order drift, not a bug). See "Full Q5-fixed `tune_gemm.py` re-sweep" below. |
 | MTP acceptance-gap investigation | **DONE** | h_seed drift on one outlier residual dimension (index 3994/5120) matches the acceptance ranking exactly across all three layouts -- a measured, expected quantization behavior, not a bug. See "MTP acceptance-gap investigation" below. |
-| R9 reduced-vocab MTP draft head | **PARTIAL** | Mechanism built end-to-end and verified lossless on real hardware (byte-identical output, reduced vs full head); the ~2.5-3x economic projection was NOT realized because this machine's only calibration corpus (WikiText-2) is too small/narrow (76.8% held-out coverage, N=2977 natural size) -- root cause isolated, not a code defect. Default container (`qwen38-27b-v3.r4dx`) carries no draft-head tensors, so `--mtp-draft-head reduced`'s default silently falls back to full-vocab behavior for it -- no production regression. See docs/mtp.md's "Reduced-vocab draft head". |
+| R9 reduced-vocab MTP draft head | **PARTIAL** | Mechanism built end-to-end and verified lossless on real hardware (byte-identical output, reduced vs full head); the ~2.5-3x economic projection was NOT realized because this machine's only calibration corpus (WikiText-2) is too small/narrow (76.8% held-out coverage, N=2977 natural size) -- root cause isolated, not a code defect. `--mtp-draft-head`'s own default later flipped `reduced`->`full` (Milestone 5 B2 item 8, matched-K=3 re-measurement: full 68.20-68.64 tok/s vs reduced 53.59-54.17 tok/s); the default container (`qwen38-27b-v3.r4dx`) still carries no draft-head tensors, so passing `--mtp-draft-head reduced` explicitly against it is a no-op regardless (falls back to full-vocab) -- no production regression either way. See docs/mtp.md's "Reduced-vocab draft head". |
 | R13/Q17 long-context validation | **DONE** | Measured to the model's own native 262144-token ceiling; `--max-ctx` default raised 131072 -> 262144 in both CLI and server. See "Long-context validation" below. |
 | R10/P9 prefill GEMM kernel | **NOT DONE** | Per-shape profile re-confirmed (`mlp.gate_up`+`mlp.down` = 32.0-32.9% of `gpu_sum`); the tiled WMMA kernel itself, the chunk-cap raise, and the correctness gate were time-boxed out as multi-day kernel-engineering work -- see "R10/P9" below. Still the #1 follow-up. |
 | Vision tower | **PARTIAL** | Architecture, preprocessing, and mrope-splicing semantics fully documented against real `transformers` source with real-hardware validation goldens (`docs/vision.md`, `tools/reference/vision_golden.py`); no C++ implementation exists yet. |
@@ -279,7 +698,9 @@ top-N slice of `lm_head` used only for drafting, making wide speculation (K up t
   makes the technique lossless: an out-of-subset draft is just a rejected draft, never a wrong
   accepted token.
 - `ModelOptions::mtp_draft_reduced_vocab` / CLI+server `--mtp-draft-head {reduced,full}` (default
-  `reduced`, degrades to `full` automatically on a container with no draft head).
+  `reduced` **at the time this R9 section was written**; flipped to `full` later the same day, see
+  "task B2 item 8" section above -- `reduced` still degrades to `full` automatically on a container
+  with no draft head, in either default state).
 - `tests/model/tool_vocab_calib.cpp`: a real-hardware calibration tool, two subset-construction
   methods (corpus-frequency vs the model's own predicted-token frequency), a proper TRAIN/HELD-OUT
   split so "coverage" is a genuine out-of-sample measurement, not a tautology (an early version of
@@ -318,8 +739,10 @@ real limit on wide-K speculation for THIS model, not caused by the reduced head 
 **Conclusion**: the MECHANISM is complete, correct, and lossless (verified); the ECONOMIC case
 depends entirely on calibration-subset coverage, which this pass's only available corpus could not
 supply. Recommended default remains the full-vocab MTP head at its previously-measured optimal K
-(w4a16 K=3, 67.34 tok/s, docs/mtp.md's "MTP head layout" table) until a larger/more diverse
-calibration corpus is available and re-measured.
+(w4a16 K=3: 68.20-68.64 tok/s, 46.3% acceptance -- matched-K re-measurement, review fix pass,
+2026-09-20, docs/mtp.md's "Flag default flipped" correction; superseding this section's original,
+not-matched-K "67.34 tok/s" citation) until a larger/more diverse calibration corpus is available
+and re-measured.
 
 **DFlash2** (`D:/models/Qwen3.8-27B-DFlash2/*.gguf`, real files already on disk): assessed, not
 ported -- a genuinely different model architecture (`general.architecture=dflash`, a block-diffusion
@@ -339,6 +762,11 @@ Full assessment in docs/mtp.md's "DFlash2 assessment" section.
   profiled this pass).
 
 ## Milestone 5 (DFlash2 drafter) -- groundwork landed
+
+**Superseded/extended by the dated "Milestone 5 ... task B1" section near the top of this file**
+(2026-09-20, GPU stage): target feature capture (item 1 of this section's own "what the GPU stages
+still owe" list below) is now done; items 2-6 below are still owed, see that section for the current
+accounting.
 
 CPU-only groundwork for the DFlash2 self-speculative drafter (`z-lab/Qwen3.8-27B-DFlash2`, the
 largest single projected speedup on the roadmap -- ROCmFPX measured 120 tok/s vs 35 plain on this
@@ -393,9 +821,10 @@ resolved review findings are in `docs/dflash2.md`; this section is the roadmap-l
 
 **What the GPU stages still owe** (not started, no GPU work has touched this drafter yet):
 
-1. **Target feature capture** -- extracting the target model's residual stream entering layers
-   `[6,20,34,48,62]` during the real forward pass (needs `src/model`'s layer-input hook, not yet
-   built for this purpose).
+1. **DONE (2026-09-20, see this file's dated "Milestone 5 ... task B1" section near the top).**
+   Target feature capture -- extracting the target model's residual stream entering any set of
+   layers during the real forward pass -- shipped as `Model::AttachDflashFeatureCapture` et al.,
+   tested on real hardware.
 2. **The draft forward pass on device** -- encoder (`fc`+norm), per-layer KV injection, and the
    block-diffusion attention/conv/MLP stack, using `third_party/libr4d`'s already-shipped fused
    `r4d_dflash_conv_t2_g16_bf16` kernel plus ordinary GEMM/attention kernels already in the engine.

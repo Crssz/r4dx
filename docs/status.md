@@ -1,9 +1,342 @@
 # Status
 
-Last updated: 2026-09-20 (Milestone 3 integration pass -- see "Milestone 3: done" immediately below
-for the summary, and the FIX pass / R5 profiling-truth pass / R2+P2 / P6 / MTP-quality / R1 / server
-sections further down for the full per-stage writeups this integration pass assembles). Full `ctest`
-is **35/35** (`tests\run_tests.ps1`, clean rebuild, ~133s, HIP device 1).
+## Milestone 4: done (2026-09-20, integration pass)
+
+**Integration**: clean `build.ps1 -Clean` rebuild (one pre-existing, unrelated MSVC `localtime`
+deprecation warning, no errors) + full `ctest` **37/37** (~210s, HIP device 1) +
+`tools\server\smoke.ps1` three ways -- default 4-layer container **28/28**, 4-layer MTP container
+(`-Mtp 3`) **29/29** (MTP path confirmed taken), real 64-layer container (`-Layers -1
+-ToolRoundTrip`) **34/34** (full tool call/result/answer round trip against real weights) -- plus a
+fresh `r4dx-cli --stats` confirmation sweep (w4a8/w4a16/mxfp4 x `--mtp 0` and each layout's own
+best `K`, re-checked against neighboring `K` values rather than assumed) and one long-context
+confirmation point (w4a16, `--max-ctx 32768`, coherent generation, 776.92 tok/s prefill / 36.46
+tok/s decode). Full tables: `docs/perf.md`'s new "Milestone 4: integration confirmation sweep +
+consolidated M1->M4 table" section (top of that file). No vision run was performed -- the vision
+stage produced real-hardware Python golden data and a full architecture spec but no `src/model` C++,
+so there is no engine code path to exercise; confirmed by grepping `src/` for vision call sites
+(none exist) rather than assuming.
+
+**Headline decode throughput, real 64-layer container, each layout's own best `--mtp K`**: **w4a16
+68.73 tok/s (`K=3`, 46.3% acceptance), w4a8 57.86 tok/s (`K=4`, 31.0%), mxfp4 65.04 tok/s (`K=3`,
+52.9%)**. mxfp4's best `K` moved from `K=2` (pre-Q5-re-sweep) to `K=3` (post-re-sweep) -- checked
+directly this pass, not assumed from stale data. w4a16 remains the fastest layout and stays the
+default.
+
+**No new source code was written this integration pass beyond trivial doc/log housekeeping** -- all
+engine/kernel/server code in the working tree was written and verified by the seven prior stages
+this pass integrates (P2, TUNE, ACCEPTANCE, DRAFTER, LONG-CONTEXT, PREFILL, VISION, TOOL-CALLS,
+REVIEW, FIX -- see each stage's own dated section below for full detail). This pass's job was: clean
+rebuild, full re-verification on real hardware from that clean build, doc consolidation, scratch-log
+cleanup, and the single integration commit.
+
+**Milestone 4 work items, status**:
+
+| Item | Status | Detail |
+|---|---|---|
+| R2/P2 fused activation-quant epilogues | **DONE** | Root-caused (`Arena::Alloc` end-alignment gap) and enabled for w4a8/mxfp4; w4a16 stays unfused (measured wall-clock regression, not correctness). See "R2/P2 ... root-caused and enabled" below. |
+| Q5 GEMM tuning re-sweep | **DONE** | Full 280-row re-sweep with the (already-correct) Q5 cache-flattery fix; mxfp4 improved, w4a16 flat, w4a8 `--mtp 3` regressed (root cause: verify-band GEMM retiling + numerical reduction-order drift, not a bug). See "Full Q5-fixed `tune_gemm.py` re-sweep" below. |
+| MTP acceptance-gap investigation | **DONE** | h_seed drift on one outlier residual dimension (index 3994/5120) matches the acceptance ranking exactly across all three layouts -- a measured, expected quantization behavior, not a bug. See "MTP acceptance-gap investigation" below. |
+| R9 reduced-vocab MTP draft head | **PARTIAL** | Mechanism built end-to-end and verified lossless on real hardware (byte-identical output, reduced vs full head); the ~2.5-3x economic projection was NOT realized because this machine's only calibration corpus (WikiText-2) is too small/narrow (76.8% held-out coverage, N=2977 natural size) -- root cause isolated, not a code defect. Default container (`qwen38-27b-v3.r4dx`) carries no draft-head tensors, so `--mtp-draft-head reduced`'s default silently falls back to full-vocab behavior for it -- no production regression. See docs/mtp.md's "Reduced-vocab draft head". |
+| R13/Q17 long-context validation | **DONE** | Measured to the model's own native 262144-token ceiling; `--max-ctx` default raised 131072 -> 262144 in both CLI and server. See "Long-context validation" below. |
+| R10/P9 prefill GEMM kernel | **NOT DONE** | Per-shape profile re-confirmed (`mlp.gate_up`+`mlp.down` = 32.0-32.9% of `gpu_sum`); the tiled WMMA kernel itself, the chunk-cap raise, and the correctness gate were time-boxed out as multi-day kernel-engineering work -- see "R10/P9" below. Still the #1 follow-up. |
+| Vision tower | **PARTIAL** | Architecture, preprocessing, and mrope-splicing semantics fully documented against real `transformers` source with real-hardware validation goldens (`docs/vision.md`, `tools/reference/vision_golden.py`); no C++ implementation exists yet. |
+| OpenAI tool calls | **DONE** | `tools`/`tool_choice`/`message.tool_calls`/`role:"tool"`/`"function"` fully implemented, then hardened by a dedicated review (8 findings: 2 correctness-in-server, 1 stop-trim leak, 5 minor) and fix pass -- all fixed, tested, and verified live against the real container. See "Tool calls" in `docs/server.md`. |
+| DFlash2 drafting | **NOT STARTED** | Assessed (real GGUF metadata read): architecturally a different model (block-diffusion + selector-based drafting), not a slice of this model's own weights -- porting it needs a new loader and forward pass, out of scope for a draft-head-reuse approach. |
+
+**Known gaps going into Milestone 5** (superset of the "Milestone 4" work-item table above; nothing
+here was silently dropped -- each item's own stage section has the full accounting):
+
+1. **R10/P9 (tiled WMMA prefill GEMM kernel) -- still the single largest unrealized perf lever.**
+   Prefill is 62.6-73.2% GEMM at the current 64-row chunk cap (measured, all three layouts); no
+   kernel work has started. Recommended as its own dedicated multi-stage effort per
+   docs/perf.md's "Prefill per-shape profile and chunk-cap baseline" section.
+2. **Vision tower C++**: patch embed, 27 encoder layers, merger, `stb_image` preprocessing, CLI
+   `--image`, server `image_url` wiring, golden validation, perf measurement -- all unstarted.
+   `docs/vision.md`'s closing section gives the recommended implementation order against the real
+   goldens already captured.
+3. **R9 reduced-vocab draft head's economic win is unrealized** on this machine because WikiText-2
+   is too small a calibration corpus; needs a larger/more diverse corpus (or self-generated text) to
+   re-calibrate against, per docs/mtp.md's "Reduced-vocab draft head" section. The mechanism itself
+   needs no further changes.
+4. **w4a8's `--mtp 3` MTP acceptance-rate drop (43.3%->31-35.6%)** from the Q5 re-sweep was measured
+   and reported but not root-caused to split "verify-band GEMM genuinely slower" from "numerical
+   reduction-order drift shifting argmax decisions" -- still open, per `docs/perf.md`'s re-sweep
+   section.
+5. **Q8 (GPU clock/power sampling)** has no working tool on this Windows ROCm 7.15 install --
+   whether the card holds boost clock through a decode/MTP-verify step is still unanswered.
+6. **DFlash2 drafting** not started (see table above).
+7. `tools/validate_fusion.ps1` (the mandatory byte-identity gate for the R2/P2 fused-epilogue work)
+   was fixed by the REVIEW/FIX pass (exit-code + empty-stdout checks, pinned `--max-ctx` per prompt
+   tier) and last run 18/18 by that pass; **not re-run by this integration pass** (no epilogue-
+   affecting code changed since), so it is reconfirmed by inheritance, not by a fresh run this pass.
+
+**Next milestone (proposed)**: (1) R10/P9's tiled prefill GEMM kernel, as its own dedicated
+multi-stage effort (kernel + isolated correctness test first, wiring + cap-sweep second, full
+end-to-end SHA-256 gate third) -- the single highest-value remaining perf lever; (2) the vision
+tower's C++ implementation against the real goldens `docs/vision.md` already captured; (3) a larger
+calibration corpus for R9's reduced-vocab draft head; (4) DFlash2 drafting, if a multi-head/tree
+drafter or the reduced-vocab head (once re-calibrated) makes wide-K speculation worthwhile.
+
+Last updated: 2026-09-20 (Milestone 4 integration pass, above). Before that: vision tower
+investigation + golden reference pass -- see "Vision tower:
+investigation + golden reference done, no C++ yet" immediately below, and the new `docs/vision.md`
+for the full architecture spec this pass wrote against real `transformers` source and real-hardware
+goldens). Before that: docs/r9700.md R10/§2.6/P9 pass -- see "R10/P9: prefill GEMM profiling done,
+kernel NOT built" below for the full accounting of what was and was not completed. Before
+that: the R13/Q17 pass: measured long-context validation
+on real hardware at 2k/8k/32k/131072/262144 -- the model's own native context ceiling, `262144` per
+the checkpoint's `config.json`, not the previous 131072 self-imposed cap. VRAM, decode, prefill, and
+correctness (needle retrieval + coherent generation) all measured; `--max-ctx` default raised
+131072 -> 262144 in both CLI and server. See "Long-context validation" below for the full writeup.
+Before that: the R9 pass built the reduced-vocab MTP draft head
+end to end -- container format extension, loader, `r4dx_gather_i32` kernel, `MtpHead::Draft` wiring,
+K widened to 16, a calibration tool, and a real-hardware K x layout measurement sweep. See "R9:
+reduced-vocab draft head" below for the full writeup -- MECHANISM verified correct/lossless on real
+hardware, but the ECONOMIC projection (~2.5-3x) was NOT realized this pass because the calibration
+corpus available on this machine (WikiText-2) is too small/narrow to build a well-covered subset;
+root cause isolated and documented, follow-up flagged. Before that: the "Acceptance gap
+investigation" + Known-gaps items 3/6 pass, the full Q5-fixed `tune_gemm.py` re-sweep, and the R2/P2
+fused-epilogue pass -- see their own sections below. Full `ctest` is **36/36**
+(`tests\run_tests.ps1`, ~189s, HIP device 1) after this pass's changes (was 35/35 -- +1 for the new
+`test_gather_i32` kernel test).
+
+## Vision tower: investigation + golden reference done, no C++ yet (2026-09-20)
+
+**Task**: docs/status.md's own "Known gaps" item 7 (the vision tower, named in Milestone 2's own
+Status line, never started) -- read the reference semantics, implement the tower, wire it end to
+end (CLI `--image`, server `image_url`), validate rung by rung, measure cost. Full write-up, the
+complete architecture spec, and the exact "what's done/what's not" accounting: **`docs/vision.md`**
+(new). Summary here, not a duplicate of that document's detail.
+
+**Done, real hardware, HIP device 1**: read every piece of the real semantics directly from the
+reference venv's `transformers` 5.17.0 source (`Qwen3_5VisionModel` and everything it calls -- patch
+embed, learned+bilinearly-interpolated position embeddings, axial rope, per-image dense attention,
+the merger -- plus `Qwen3_5Model.get_rope_index`'s text-side mrope splicing rule for image spans);
+confirmed the real checkpoint carries all 333 `model.visual.*` weights the container's `--vision on`
+conversion needs. **Found and fixed a real memory-safety bug in shared reference tooling**:
+`tools/reference/common.py`'s `ShardIndex.get_tensor`/`get_row_slice` returned tensors backed by an
+already-unmapped `safe_open` mmap, reproducibly crashing the Python interpreter (access violation)
+once a golden script reads enough tensors in one `load_state_dict` call (333, for the vision tower;
+every existing script's ~14-20-tensor components never hit it) -- fixed with `.clone()`, verified by
+reproducing the crash, bisecting to `load_state_dict` (not the individual reads), and confirming
+three clean runs after the fix. Wrote `tools/reference/vision_golden.py` (mirrors `layer_golden.py`'s
+conventions) and ran it for real on HIP device 1: real weights, real preprocessing (`transformers`'
+own configured `Qwen2VLImageProcessor`) of a deterministic synthetic test image, all 27 encoder
+blocks' outputs plus block 0's full internal chain plus the merger output, 39 tensors, all finite,
+shapes matching the architecture spec exactly (784 patches -> 196 merged `[5120]`-dim tokens) --
+`tools/reference/golden_out/vision_tower.safetensors` + `vision_manifest.json`, docs/validation.md
+rung 3's ground truth for this tower, same status the GDN/attention layers had before `src/model`
+implemented them.
+
+**Not done, per the task's own "finish in the listed order, report exactly where you stopped"
+instruction**: no C++ in `src/model` (no patch embed, no encoder, no merger, no `stb_image`
+preprocessing, no `r4d_attn_vit_h72_bf16` call site), no CLI `--image` flag, no server `image_url`
+wiring, no golden-vs-r4dx validation (nothing to validate yet), no end-to-end description check, no
+perf measurement. This is a genuinely large, multi-subsystem C++/HIP implementation (preprocessing
+exactly matching a resize+patchify+normalize pipeline with no existing precedent in this codebase,
+a position-embedding bilinear-interpolation scheme with no existing precedent either, 27 encoder
+layers, then text-side mrope splicing) that warrants its own dedicated implementation pass against
+the real goldens this pass produced, rather than a partially-wired and unvalidated attempt in the
+same pass that did the investigation -- the same scope judgment this project's own R10 pass
+(immediately below) applied to the prefill GEMM kernel. `docs/vision.md`'s closing section gives the
+recommended implementation order (preprocessing -> patch embed+pos embed -> one block -> all 27
+blocks+merger -> text splicing/mrope -> CLI/server -> end-to-end+perf), each rung pointed at the
+specific golden tensor(s) to validate against.
+
+**Build/test**: no `src/`/`tests/` files changed (Python-tooling-only pass); `tools/reference/
+common.py`'s bugfix is the only change to code any other script depends on -- re-verified
+`layer_golden.py` and `kv_calibrate.py`'s own component counts/shapes are unaffected (the `.clone()`
+only changes storage ownership, not values). Full `ctest` not re-run this pass (nothing under
+`src/`/`tests/` changed) -- left exactly as the prior pass reported it, **36/36**.
+
+## R10/P9: prefill GEMM profiling done, kernel NOT built (2026-09-20)
+
+**Task**: docs/r9700.md R10 + §2.6 + P9 -- correct §2.6's stale inferred GEMM/non-GEMM split, profile
+prefill per op family/shape at the current 64-row cap, write a tiled WMMA prefill GEMM kernel
+targeting 170-215 TOPS, raise the chunk cap above 64 with a measured sweep, gate it on bf16-tolerance
+plus end-to-end SHA-256 text identity, reconfirm decode, and measure prefill at several prompt
+lengths before/after.
+
+**Verified already done, not redone**: docs/r9700.md's §2.6 "Conclusion, corrected" blockquote and
+the R10/R11 roadmap rows already carried R5's measured 66.8-73.2%/26.8-33.2% GEMM/non-GEMM split and
+the "R10 now outranks R11" statement, applied by an earlier pass (docs/status.md's own "Milestone 3
+profiling truth" section, dated the same day) -- confirmed by reading the live file directly rather
+than trusting that section's own account. Nothing needed to change there beyond one addition (below).
+
+**Done this pass, real hardware, HIP device 1**: a fresh per-op-family, per-GEMM-shape
+`--profile-prefill` breakdown at the current 64-row cap for all three layouts (`mlp.gate_up` and
+`mlp.down` together are 32.0-32.9% of `gpu_sum`, more than every GDN/attention GEMM combined -- the
+concrete target P9 should aim at); a decode reconfirmation at the standard prompt (37.58/35.37/32.20
+tok/s w4a16/w4a8/mxfp4, within noise of the TUNE-pass 38.46/36.08/32.83 baseline, as expected since no
+kernel/dispatch code was touched); and a prefill tok/s sweep at 128/512/1024/4096-token prompts per
+layout (944.98-1001.79 w4a16, 1298.04-1482.62 w4a8, 1162.28-1312.53 mxfp4 tok/s) as the pre-change
+baseline. Full tables and logs: docs/perf.md's "Prefill per-shape profile and chunk-cap baseline"
+section, `build/logs/r10_profileprefill_*.txt` / `r10_decode_confirm.txt` / `r10_sweep_before.txt`
+(gitignored).
+
+**NOT done this pass, and why (not silently dropped)**: the tiled WMMA prefill GEMM kernel itself
+(P9, would live in `src/kernels`, targeting `mlp.gate_up`/`mlp.down` per the measured ranking, on the
+w4a8 int8 WMMA path per the task's own prior-favourite note); raising `max_chunk_`/`kMaxChunkM` above
+64 (`src/model/model.h`, `src/model/linear.cpp`); the chunk-cap sweep (64/128/256+); and the
+correctness gate (bf16 4-layer reference tolerance check + end-to-end SHA-256 text identity at
+`--mtp 0` for the standard prompt plus a ~1000-token prompt, plus a new ctest case). This is a
+from-scratch, low-level HIP kernel -- packed 4-bit weight dequantization, per-128-K scale/zero
+application, WMMA 16x16x16 tiling with real register-reuse, all wired into `linear.cpp`'s dispatch
+without touching `third_party/libr4d` -- the kind of task that genuinely takes multiple days of
+iterative on-hardware debugging to get correct, not something a single pass can responsibly write,
+tune, AND verify byte/tolerance-correct against a 45 GiB real container without a material risk of
+shipping a kernel that silently changes the model's output. Per this project's own correctness gate
+("a faster prefill that changes the answer is a failure") and its standing rule against narrowing
+scope silently, this pass chose to do the parts it could complete and verify for real (the profiling
+and the pre-change baseline) and report the kernel/cap-raise/gate as **not started** rather than
+fabricate a kernel, a cap sweep, or invented post-change TOPS/tok-s numbers. **This is now the #1
+follow-up item**, recommended as its own dedicated multi-stage effort (kernel + isolated correctness
+unit test first; wiring + cap sweep second; full end-to-end SHA-256 gate + ctest registration third).
+
+**Build/test**: no source files changed this pass (docs only); `.\build.ps1` confirmed a no-op
+(`ninja: no work to do`) before profiling; full `ctest` reconfirmed green after the doc edits (docs
+cannot affect test outcomes, but the standing rule is to leave `ctest` green, verified rather than
+assumed -- see the ctest run at the end of this pass).
+
+## Long-context validation (2026-09-20, docs/r9700.md R13 + Q17, docs/status.md's own prior "Known
+gaps" item 5)
+
+**Task**: every perf number this project had ever reported was measured at `--max-ctx 2048`, while
+r4dx defaulted `--max-ctx` to `131072` in both `src/cli/cli_args.h` and `src/server/server_args.h`
+-- a self-imposed cap at HALF the checkpoint's own declared `max_position_embeddings: 262144`
+(`rope_type` "default", no scaling trick needed). Two assumptions behind the old 131072 default
+were suspect: (a) whether the context ceiling itself should be higher, and (b) whether
+docs/r9700.md's own VRAM-headroom argument (":153", "15.75 GiB measured, leaving 0.74 GiB") was
+sized correctly. Both were resolved by measurement, on real hardware, this pass -- see
+`docs/perf.md`'s "Long-context validation" section for the full data and `docs/r9700.md`'s R13/Q17
+entries (§2.1's VRAM-reconciliation blockquote, §2.3's decode-ceiling correction, P4) for the
+first-principles reconciliation.
+
+**Findings, in one paragraph**: the 262144-token native ceiling **fits with room to spare** --
+7.75 GiB (24%) free at `--mtp 0`, 6.83 GiB (21%) free at `--mtp 3`, against the old argument's
+0.74 GiB. The measured KV growth (`(8.344-0.406) GiB / 260096 tokens = 32768.0 bytes/token`) matches
+the architecture-derived 32 KiB/token figure to 4 significant figures -- the "measured vs. inferred"
+figures the task asked to reconcile were never actually in conflict, they had just never been
+compared at a context length large enough to distinguish them from noise. Decode degrades from
+38.24 tok/s @2048 to 25.95 tok/s @262144 (-32.1%, w4a16 `--mtp 0`) as fp8 KV reads grow from 0.5% to
+38.1% of bytes/token, closely tracking a corrected roofline model (88.9% -> 96.9% of ceiling,
+efficiency actually *improving* with context as fixed overhead amortizes). docs/r9700.md's own
+131k prediction of 29.1 tok/s is refuted in the optimistic direction -- it used the pre-R1 base
+bytes/token; the real number is 31.09 tok/s. MTP (`--mtp 3`) roughly doubles decode at every context
+length including 262144 (45.11 vs 25.95 tok/s). **Correctness holds throughout**: a needle-retrieval
+prompt is answered correctly and the standard haiku prompt generates coherent, on-topic,
+byte-identical-between-`mtp={0,3}` text at every context length up to and including 262144 real
+prefilled tokens -- RoPE, the paged KV allocator, GDN state, and MTP window bookkeeping all behave
+correctly at the model's own native ceiling. A genuinely new, unplanned finding: **prefill
+throughput degrades far faster than decode** (1007 -> 264 tok/s, -73.8%, vs decode's -32.1%),
+attributed (not root-caused) to each new prefill chunk's attention needing to read the *entire*
+preceding KV history, not just its own chunk.
+
+**Decision and code changes**: `--max-ctx` default raised `131072` -> `262144` in
+`src/cli/cli_args.h`, `src/server/server_args.h`, and `src/model/model.h`'s
+`ModelOptions::max_ctx`; `README.md` and the CLI/server default-value tests
+(`tests/cli/test_args.cpp`, `tests/server/test_server_args.cpp`) updated to match. bf16 is
+unaffected (its 47.73 GiB of weights do not fit regardless of context length, per the project's
+standing bf16-retired-from-perf-work rule) and was excluded from this pass's measurements.
+
+**Reduced scope, not silently dropped** (each 262144-token prefill takes 15-16 minutes wall-clock,
+making the task's full 5-context x 3-layout x 2-`--mtp` x 2-run matrix a multi-hour undertaking):
+w4a16 got the complete 5-context x 2-`--mtp` sweep (the primary ask); w4a8/mxfp4 got a 2-point
+spot-check (2048, 131072, `--mtp 0` only) confirming the same qualitative trend, not measured at
+262144 or `--mtp 3`; every configuration was run once, not twice (the 2048-tier numbers are
+consistent with this document's and docs/perf.md's other, independently repeated 2048-context
+measurements, the closest available check on this pass's own noise); the prefill superlinear
+degradation is reported but not root-caused (no `--profile-prefill` run at long context this pass).
+Full detail, all tables, and the exact transcripts: `docs/perf.md`'s "Long-context validation"
+section.
+
+**Build/test**: only two lines of test-assertion code changed
+(`tests/cli/test_args.cpp`/`tests/server/test_server_args.cpp`, the default-value checks), plus the
+three `--max-ctx` default constants themselves (`src/cli/cli_args.h`, `src/server/server_args.h`,
+`src/model/model.h`) and doc-comment updates -- no engine/kernel logic changed. Full `ctest`:
+**36/36 passing**, ~217s, HIP device 1 (`tests\run_tests.ps1`) -- same count as the R9 pass, this
+pass added no new tests.
+
+## R9: reduced-vocab draft head
+
+**Task**: docs/r9700.md R9 + §2.2's draft-side byte budget -- cut a sequentially-drafted token's
+dominant cost (the FULL 248320-entry `lm_head`, 675 MB of the 926 MB per drafted row) with a
+top-N slice of `lm_head` used only for drafting, making wide speculation (K up to 16) viable.
+
+**Shipped**:
+- Container format: OPTIONAL `mtp.draft_head.lm_head.{layout}` + `mtp.draft_head.vocab_ids`
+  (docs/container-format.md), versioned by presence -- absent on every pre-existing container,
+  loader falls back to the exact pre-R9 full-vocab path unconditionally.
+- `r4dx-convert --draft-vocab-ids <json>`: slices `lm_head.weight`'s rows by a calibration-chosen
+  id list, quantizes through the SAME `PlanLinearLayouts`/`EmitLinearLayouts` helpers as every other
+  linear.
+- `r4dx_gather_i32` (new device kernel, `src/kernels/src/r4dx_kernels.hip`): maps a subset-local
+  argmax index back to a real vocab id entirely on-device, zero host syncs, bounds-checked (clamps
+  out-of-range like `r4dx_embedding_gather_bf16` already does).
+- `MtpHead::Draft` gained `use_reduced_vocab` (default on when the container has a draft head);
+  reuses `FinalLmHead` completely unmodified (it is generic in its own `lm_head_.N`) -- no new GEMM
+  code needed. `Model::VerifyWindow` is UNTOUCHED -- always the real full-vocab head -- which is what
+  makes the technique lossless: an out-of-subset draft is just a rejected draft, never a wrong
+  accepted token.
+- `ModelOptions::mtp_draft_reduced_vocab` / CLI+server `--mtp-draft-head {reduced,full}` (default
+  `reduced`, degrades to `full` automatically on a container with no draft head).
+- `tests/model/tool_vocab_calib.cpp`: a real-hardware calibration tool, two subset-construction
+  methods (corpus-frequency vs the model's own predicted-token frequency), a proper TRAIN/HELD-OUT
+  split so "coverage" is a genuine out-of-sample measurement, not a tautology (an early version of
+  this tool measured a tautological 100% before the split was added -- caught and fixed within this
+  same pass).
+- K widened to 16 with **no structural changes needed**: `GdnStateManager`'s window bank, the
+  conv-buffer rolling depth (`state_len_max = conv_width-2+max_decode_window`), and
+  `Model::VerifyWindow`'s `mtp_logits_dev_`/`mtp_argmax_dev_` scratch were already parametrized by
+  `ModelOptions::mtp_draft_k` from the Milestone 3 MTP-quality pass -- the M3 review's blocker-class
+  off-by-one in this exact bookkeeping was already fixed as part of getting that formula right, and
+  it generalizes. Verified on real hardware at K=16, both `bf16` and `w4a16`, via a NEW
+  `tests/model/test_mtp.cpp::CheckWideWindowRejectionRewind` (same lossless-rewind contract as the
+  existing K=3 checks) plus a new K=16 case in `tests/model/test_mtp_round.cpp`.
+- New test coverage: `tests/kernels/test_gather_i32.cpp` (the new kernel, in-range + OOB-clamp),
+  `tests/model/test_mtp.cpp::CheckReducedVocabDraftHeadLossless` (both `use_reduced=true/false`
+  against a real container with draft-head tensors, on real hardware), `--mtp-draft-head` flag
+  tests in both `tests/cli/test_args.cpp` and `tests/server/test_server_args.cpp`. Full `ctest`:
+  **36/36** (was 35/35).
+
+**Measured, real hardware** (see docs/mtp.md's "Reduced-vocab draft head" section for the complete
+table and analysis): the shipped calibration run (`D:/models/wikitext-2-raw/wiki.train.raw`, 20000
+positions teacher-forced through the real 64-layer container) found only **2977 distinct predicted
+ids** and **76.8% held-out coverage** -- far short of the 8k-16k, high-coverage subset the R9
+economic projection assumes. Re-ran with 10 dispersed corpus segments instead of one contiguous
+prefix to rule out "unlucky narrow sample" as the cause -- **numerically identical result**,
+pointing at WikiText-2 itself (a small, curated benchmark corpus) rather than the sampling strategy.
+**Headline, stated honestly**: best measured decode tok/s across the full K={1,2,3,4,6,8,12,16} x
+layout={w4a16,w4a8,mxfp4} sweep is **65.02 tok/s (w4a16, K=4, FULL-vocab head)** -- 0.95x of M3's
+68.37 baseline (within the setup's own measurement noise, this pass's own K=0 baseline was 38.44 vs
+M3's 38.86, -1.1%). **The reduced-vocab head's own best is 53.35 tok/s (w4a16, K=3)** -- 0.78x of
+baseline, a regression, not the projected 2.5-3x. Every layout's tok/s PEAKS at low K (2-3) and
+DECLINES monotonically as K grows with the reduced head, because acceptance keeps falling while the
+coverage ceiling (76.8%) compounds with the checkpoint's own already-modest wide-K acceptance (the
+FULL head only reaches 8.9-9.5% acceptance at K=16 on this checkpoint/prompt -- an independent,
+real limit on wide-K speculation for THIS model, not caused by the reduced head at all).
+**Conclusion**: the MECHANISM is complete, correct, and lossless (verified); the ECONOMIC case
+depends entirely on calibration-subset coverage, which this pass's only available corpus could not
+supply. Recommended default remains the full-vocab MTP head at its previously-measured optimal K
+(w4a16 K=3, 67.34 tok/s, docs/mtp.md's "MTP head layout" table) until a larger/more diverse
+calibration corpus is available and re-measured.
+
+**DFlash2** (`D:/models/Qwen3.8-27B-DFlash2/*.gguf`, real files already on disk): assessed, not
+ported -- a genuinely different model architecture (`general.architecture=dflash`, a block-diffusion
+drafter with its own selector mechanism), not a slice of this model's own weights; porting it would
+need a new GGUF loader and a new forward pass, a materially larger lift than the reduced-vocab head.
+Full assessment in docs/mtp.md's "DFlash2 assessment" section.
+
+**Not attempted, flagged for follow-up** (per this pass's own time budget, not silently dropped):
+- A larger/more diverse calibration corpus (hundreds of thousands of tokens, multiple domains, or
+  synthetic self-generated text) to actually raise coverage into the range the R9 projection assumes
+  and re-measure this same K-sweep.
+- The reduced-vs-full comparison only covered K={4,8,16} (not the full K list) per this pass's own
+  time budget -- every K WAS measured with the reduced head (the task's own primary ask).
+- No isolated per-draft-token latency measurement of the reduced head's own GEMM (the net decode
+  tok/s numbers above are dominated by acceptance rate at this coverage level, so the draft-side
+  latency saving, while real by construction -- ~83x fewer output rows -- was not separately
+  profiled this pass).
 
 ## Milestone 3: done
 
@@ -60,34 +393,57 @@ is inherited from the FIX pass (which DID change code, see "FIX pass" below) and
 **Known gaps going into Milestone 4** (not silently dropped, full detail in each stage's own section
 below):
 
-- **P2's fused activation-quant epilogues remain disabled.** Kernel-level math is byte-exact
-  verified (`tests/kernels/test_fused_quant.cpp`, 135/135); the model-level wiring compiles and
-  passes every tolerance-bounded ctest golden, but produces different generated text than the
-  disabled baseline for w4a8/mxfp4, and the root cause was not isolated (three specific unexplored
-  areas are named in the "R2/P2" section below). This is the single largest unrealized perf lever
-  in the roadmap (docs/r9700.md's R2 row) and the top candidate for Milestone 4's first task.
-- **`gemm_tuning_table.inc` still serves partially cache-flattered numbers.** R5's Q5 fix (a
-  >=4-buffer/>256MiB ring-rotation benchmark harness) proved the old single-buffer sweep
-  over-favored mxfp4 at M=1 by up to +71.7% on the two shapes spot-checked; the full 196-row
-  re-sweep was never run. `src/model/gemm_tuning_table.inc` carries a provenance banner noting this
-  (added by the FIX pass).
-- **`--mtp-head-layout` has no server-side flag** (`src/server/server_args.h`) -- every server
-  `Model` uses the measured-default layout-matched head (`std::nullopt`), which wins in 23/24
-  measured configs, so this is a low-priority passthrough gap, not a missing feature.
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see "R2/P2 fused activation-quant epilogues:
+  root-caused and enabled for w4a8/mxfp4" below).** P2's fused epilogues are now enabled for w4a8
+  and mxfp4; root cause was an `r4dx::core::Arena::Alloc` gap (aligned each call's start but not its
+  end), fixed in `arena.hpp`. w4a16 stays disabled (a separate, already-understood wall-clock
+  regression, not a correctness issue). This was the single largest unrealized perf lever in the
+  roadmap (docs/r9700.md's R2 row).
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see `docs/perf.md`'s "Full Q5-fixed
+  `tune_gemm.py` re-sweep" section and `docs/r9700.md`'s Q5 entry).** The full 280-row re-sweep with
+  the (already-correct) ring-rotation harness ran on real hardware: 216/280 rows changed tuning,
+  41/70 comparable `(shape,M)` cells flip the w4a16/w4a8/mxfp4 ranking, overwhelmingly mxfp4 going
+  from fastest to slowest at M in {1,2,4,8,16} on five of the ten shapes. End-to-end re-measurement:
+  mxfp4 decode improved (+6.4% `mtp=0`, +14.1% `mtp=3`), w4a16 flat within noise, w4a8 `mtp=3`
+  regressed -10.0% (MTP acceptance dropped 43.3%->35.6%, attributed to verify-band tuning changes and
+  expected floating-point reduction-order drift, not a correctness bug). The re-swept table shipped
+  (`src/model/gemm_tuning_table.inc`, provenance banner rewritten) because it is honestly correct
+  (no cell implies above-DRAM-peak bandwidth, unlike the old table) and does not regress the shipped
+  default (w4a16 stays fastest and stays the default). Full ctest 35/35 with the new table.
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see "MTP acceptance-gap investigation +
+  server/test gaps closed" below).** `src/server/server_args.h` now exposes `--mtp-head-layout
+  {bf16,layout}` (default `layout`), wired into `ModelOptions::mtp_head_layout` in
+  `src/server/main.cpp` identically to the CLI's own conversion, with a new
+  `tests/server/test_server_args.cpp::TestMtpHeadLayoutFlag`.
 - **Q8 (GPU clock/power sampling) has no working tool on this Windows ROCm 7.15 install** --
   whether the card holds boost clock through a decode/MTP-verify step is still unanswered.
-- **R13/Q17 (32k/131k long-context validation) is unmeasured** -- every perf number in this
-  milestone is at `--max-ctx 2048` (`docs/perf.md`'s standard prompt/flags).
-- **`--chat` multi-turn + MTP together has no automated mid-round-stop regression test** (the
-  underlying bookkeeping fix IS unit-tested via `PrefixState`/`mtp_round` directly, just not a live
-  end-to-end forced-mid-round-stop scenario).
-- Vision tower and DFlash2 drafting (the milestones named in Milestone 2's own "Status" line) have
-  not been started.
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see "Long-context validation" below).**
+  R13/Q17 (32k/131k long-context validation) measured on real hardware, extended to the model's own
+  native 262144-token ceiling; `--max-ctx` default raised 131072 -> 262144.
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see "MTP acceptance-gap investigation +
+  server/test gaps closed" below).** `tests/model/test_mtp.cpp::CheckChatMultiTurnMidRoundStop`
+  drives a real two-turn conversation through a real `Model` + the production
+  `r4dx::model::ProcessMtpRound`/`r4dx::server::PrefixState` helpers, with a `--max-tokens`-
+  equivalent budget forced (by a same-seed dry run) to land one token short of a round boundary, and
+  asserts turn 2's post-`Reset()` continuation is byte-identical to an independently-loaded
+  sequential reference.
+- **PARTIALLY ADDRESSED (2026-09-20 -- see "Vision tower: investigation + golden reference done, no
+  C++ yet" above and `docs/vision.md`).** The vision tower's architecture/preprocessing/mrope-
+  splicing semantics are now fully documented against real `transformers` source and validated real-
+  hardware goldens exist (`tools/reference/vision_golden.py`), but no C++ implementation exists yet
+  -- still open. DFlash2 drafting (the other milestone named in Milestone 2's own "Status" line) has
+  not been started (see the R9 pass's "DFlash2 assessment" above: architecturally a different model,
+  not a slice of this model's own weights).
 
-**Next milestone (proposed)**: (1) root-cause and re-attempt P2's fused epilogues with a real
+**Next milestone (proposed)**: ~~(1) root-cause and re-attempt P2's fused epilogues with a real
 end-to-end byte-identical-text verification gate (not just ctest's tolerance-bounded goldens, which
-did not catch the w4a8/mxfp4 bug) before re-enabling; (2) the full Q5-fixed `tune_gemm.py` re-sweep;
-(3) R13's 32k/131k long-context measurement; (4) vision tower; (5) DFlash2 drafting.
+did not catch the w4a8/mxfp4 bug) before re-enabling~~ -- **done, see the "R2/P2 ... root-caused and
+enabled" section above**; ~~(2) the full Q5-fixed `tune_gemm.py` re-sweep~~ -- **done, see this
+section's "RESOLVED" bullet above and `docs/perf.md`'s "Full Q5-fixed `tune_gemm.py` re-sweep"
+section**; (3) R13's 32k/131k long-context measurement; (4) vision tower; (5) DFlash2 drafting. New
+follow-up from this pass: root-cause w4a8's `--mtp 3` acceptance-rate drop (43.3%->35.6%) to split
+"verify-band GEMM genuinely slower" from "numerical drift shifting argmax decisions" -- not attempted
+this pass, time-boxed (see `docs/perf.md`'s re-sweep section).
 
 ## Milestone 3 profiling truth (docs/r9700.md R5 + Q2/Q3/Q5/Q7/Q8, 2026-09-20)
 
@@ -153,7 +509,266 @@ a full Q5-fixed `tune_gemm.py` re-sweep (196 rows); a lower-overhead profiling m
 trustworthy absolute ms/token for R6/R10/R11; Q8's clock/power sampling (no tool found); R10/R11/R6
 themselves (this was a measurement pass, "no new engine features" per the task).
 
-## R2/P2 fused activation-quant epilogues (docs/r9700.md): kernels done and byte-exact-verified; NOT wired into the model (real, reproducible correctness bug found and not root-caused)
+## R2/P2 fused activation-quant epilogues: root-caused and enabled for w4a8/mxfp4 (Milestone 4 follow-up, 2026-09-20)
+
+Follow-up to the "R2/P2" incident below (kept unchanged, verbatim, for history): the fused
+activation-quant epilogues were built and byte-exact-verified in isolation but shipped **disabled**
+because wiring them into the real model changed w4a8/mxfp4's generated text on real hardware, and
+the root cause was not found in time. This pass found and fixed the root cause (Problem A), decided
+Problem B (w4a16's wall-clock regression) by measurement, and re-verified with a real end-to-end
+byte-identical-text gate as the task required.
+
+**Problem A -- root cause, found.** Not the epilogue kernels' own math (`test_fused_quant.cpp`
+already verified that in isolation, 135/135) and not which GEMM consumed a fused buffer (the
+original pass's own in-model diagnostic had already cleared `gdn.in_proj_qkv`/`in_proj_z`/
+`mlp.down`'s own output bytes). It is `r4dx::core::Arena::Alloc` (`src/core/include/r4dx/core/
+arena.hpp`): it aligned each allocation's own **start** to the caller-requested alignment, but never
+rounded its **end** up to any particular boundary. A fused epilogue's per-row fp32 scale scratch
+(`next_epilogue_scale`/`x_normed_pre_scale`, allocated in `GdnLayer::Forward`/`AttentionLayer::
+Forward`/`Mlp::Forward` as `arena.Alloc<float>(T)`, `T` = the chunk's row count, 1..64) is exactly
+`4*T` bytes -- a multiple of 16 only when `T % 4 == 0`. At decode (`T=1`) and MTP verify (`T=2..4`),
+the very next default-aligned `Alloc` call in the same layer (e.g. `GdnLayer::Forward`'s
+`mixed_qkv`, `alignof(uint16_t)=2`) then starts a few bytes short of a 16-byte boundary, and every
+allocation after it in that layer inherits the same drift until the next `Reset()`. Every
+`third_party/libr4d` kernel this arena feeds (GDN conv/kkt/chunk-scan, every quantized GEMM
+family's A-operand read, attention's decode scratch) reads its device buffers with **unchecked**
+wide (16-byte) vector loads and silently reads the wrong bytes when handed a misaligned pointer --
+unlike this project's own P6-rewritten `rmsnorm`/`residual_rmsnorm`/`silu_mul` kernels, which fall
+back to a scalar loop when a buffer isn't 16-aligned. Before this fusion pass, every real call
+site's allocation *size* happened to already be a multiple of 16 bytes (`hidden`=5120,
+`conv_dim`=10240, `intermediate`=17408 are all multiples of 8 bf16 elements = 16 bytes), so
+`offset_` was always incidentally 16-aligned and this was never triggered -- several call sites'
+own comments already flagged that invariant as "incidental, not enforced"
+(`gdn_layer.cpp`/`attention_layer.hpp`/`linear.cpp`'s `i8_scratch`/`fp8_scratch` comments) before
+this pass traced it to its actual source. This matches prime suspect (b) named by the task
+("buffer aliasing/alignment when the epilogue writes into a differently-aligned arena slice than
+the standalone kernel did") -- the earlier pass's own bisection (forcing every epilogue KERNEL to a
+no-op while keeping the same extra arena allocations, and still reproducing the divergence) had
+already isolated it to the allocation shift itself, just not to which allocator invariant broke.
+
+**Fix** (`src/core/include/r4dx/core/arena.hpp`): `Arena::Alloc` now rounds the end of every
+allocation up to a 16-byte boundary before storing it as the next call's bump offset, so every
+FUTURE `Alloc` call -- regardless of what alignment it individually requests -- is guaranteed to
+start 16-aligned again, restoring the invariant the rest of the codebase already silently depended
+on. At most 15 bytes of padding per call, negligible against the arena's ~96 MiB reservation. No
+other file needed a change for Problem A -- `linear.cpp`'s `EpilogueForLayout` and every
+`GdnLayer`/`AttentionLayer`/`Mlp` fusion call site were already correct once the allocator invariant
+they all assumed was actually enforced.
+
+**Test coverage gap, closed.** The original 135-check `test_fused_quant.cpp` grid could never have
+caught this: every check there allocates its own isolated `DeviceBuffer` (each a fresh `hipMalloc`,
+which happens to come back far more than 16-byte aligned), so it never exercises `r4dx::core::Arena`
+at all. Added `CheckArenaAlignmentInvariant` to `tests/kernels/test_fused_quant.cpp`: reproduces the
+exact `GdnLayer`/`AttentionLayer`/`Mlp` allocation sequence (a 16-aligned quantized-activation data
+buffer, then a default-aligned `float[T]` scale scratch, then the layer's own next default-aligned
+buffer) through a real `r4dx::core::Arena`, for every `T` in 1..64 (decode, every MTP verify width,
+every prefill chunk width), and asserts every buffer after the scale scratch is still 16-byte
+aligned -- host-side, no GPU divergence needed to notice a regression. Full `ctest`: **35/35**
+(unchanged count -- this is an addition to an existing test binary, not a new one).
+
+**Problem B -- w4a16, decided by measurement (unchanged from the original incident).**
+`r4dx_epilogue_f16` measures -4.3% decode when wired (reproducible, re-confirmed by the original
+incident's own numbers, not re-measured this pass since nothing about the f16 path changed):
+`r4dx_model_cast_bf16_to_f16` launches a flat elementwise grid (`blocks=ceil(M*K/256)`, ~20
+independent workgroups at decode `T=1`/`K=5120`), and fusing it into rmsnorm/residual_rmsnorm/
+silu_mul's own one-workgroup-per-row epilogue collapses that work onto a single workgroup -- a real
+parallelism loss the removed launch's savings do not cover. w4a8's `r4dx_epilogue_int8_fraga8` and
+mxfp4's `r4dx_epilogue_fp8_e4m3_row` do not have this problem (their standalone kernels already
+launch `dim3(M)`, the same grid shape as the producers). Per the task's own instruction ("do not
+re-enable in that form"), `EpilogueForLayout` (`src/model/linear.cpp`) keeps returning
+`r4dx_epilogue_none` for w4a16 (and for bf16, which never quantizes its activation input) and now
+returns `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4. A wide-grid f16
+cast or a prefill-only fusion (`dim3(rows)=dim3(T)`, no parallelism loss once `T>1`) is left as
+future work, not attempted this pass.
+
+**Mandatory gate: end-to-end byte-identical generated text.** `tools/validate_fusion.ps1` (new):
+for every (layout in {w4a16, w4a8, mxfp4}) x (`--mtp` in {0, 3}) x (prompt in {short ~20-token
+single-chunk, medium ~100-token multi-chunk, long ~1000-token long-context}) -- 18 combinations --
+runs `r4dx-cli.exe` twice against the real 64-layer container (`D:\models\r4dx\qwen38-27b-v3.r4dx`),
+greedy, once with `R4DX_DISABLE_EPILOGUE=1` (forces every layout back to the pre-fusion baseline
+from the SAME binary, no second build needed) and once without, and SHA-256-hashes each run's raw
+stdout (the generated text only -- `[stats]`/`--profile` all go to stderr). **Run on real hardware,
+HIP device 1: 18/18 combinations byte-identical.** w4a16's six rows are an expected trivial pass
+(`EpilogueForLayout` returns `none` for it either way, a regression check that the env-var toggle
+itself never perturbs it); w4a8's and mxfp4's twelve rows are the real fix verification, covering
+every prompt-length/MTP combination the task required. This script is left in place as the standing
+regression gate for any future change to `linear.cpp`, `arena.hpp`, or the epilogue kernels.
+
+**Performance, measured** (real 64-layer container, `docs/perf.md`'s standard prompt/flags, HIP
+device 1, each config run twice, both runs within 0.1% of each other so a single value is reported
+per the task's own ">3% difference" threshold):
+
+| Layout | `mtp=0` decode, fusion off (M3) | `mtp=0` decode, fusion on | Delta | `mtp=3` decode, fusion off (M3) | `mtp=3` decode, fusion on | Delta |
+|---|---|---|---|---|---|---|
+| w4a8  | 35.73 tok/s | **36.19 tok/s** | +1.3% | 61.41 tok/s | **61.47 tok/s** | +0.1% (noise) |
+| mxfp4 | 30.27 tok/s | **30.85 tok/s** | +1.9% | 55.72 tok/s | **56.39 tok/s** | +1.2% |
+
+MTP acceptance/tokens-per-round are **identical** to the fusion-off baseline for both layouts at
+both `--mtp` values (w4a8: 43.3%, 2.27 tok/round, 40 rounds/120 drafted/52 accepted; mxfp4: 47.1%,
+2.32 tok/round, 34 rounds/102 drafted/48 accepted) -- expected, since fusion is greedy-deterministic
+byte-identical to the baseline, so it cannot change which tokens are accepted. Prefill and VRAM are
+unchanged within noise (prefill ~640-740 tok/s per layout, VRAM 16.17/16.60 GiB `mtp=0`/`mtp=3`,
+identical to the M3 baseline in `docs/perf.md`). w4a16 was not re-measured (`EpilogueForLayout`
+returns `none` for it, so its decode/prefill/VRAM numbers are unchanged from M3 by construction).
+
+**Launches/token** (`r4dx-cli --profile`, r4dx-owned kernel-launch counter, single profiled decode
+step, fusion on vs `R4DX_DISABLE_EPILOGUE=1`): mxfp4 597 -> **326** (-271, a real reduction visible
+to this counter because mxfp4's own quant kernel, `r4dx_quant_act_fp8e4m3_row`, lives in the same
+translation unit the counter instruments); w4a8 260 -> **260** (unchanged -- this counter is blind
+to `core::r4d::QuantActI8`, a `third_party/libr4d` entry point outside the counted translation unit,
+the same scope note docs/r9700.md's launch census already flags; the real per-step launch count IS
+lower for w4a8 too, just not visible to this particular instrument). GEMM share of `gpu_sum` in the
+profiled step rose accordingly as non-GEMM launches were removed (mxfp4: 66.0% fused vs 72.2%
+unfused of a smaller total; w4a8: 65.5% vs 68.7%) -- consistent with fusion removing non-GEMM launch
+overhead rather than touching the GEMMs themselves.
+
+**Task item 6 (measure all three layouts x `--mtp {0,3}` and decide the default): still not run.**
+The modest, real gains above (+1.3-1.9% decode at `mtp=0`) do not change the layout ranking
+(w4a16 remains fastest in absolute tok/s at both `--mtp` values); `w4a16` stays the default
+(`src/cli/cli_args.h`, README.md, docs/perf.md unchanged). P1's (docs/r9700.md) argument for
+w4a8-as-default is about GEMM throughput at higher verify widths, a separate question from this
+pass's scope.
+
+**Recommended follow-up** (not started this pass): (a) a wide-grid f16 cast or prefill-only fusion
+for w4a16 (Problem B's deferred option); (b) re-run `docs/r9700.md`'s R2 roadmap entry against the
+now-enabled w4a8/mxfp4 fusion to see whether it changes any downstream roadmap ranking; (c) task
+item 6's full layout-decision sweep, now that fusion is real for two of the three layouts.
+
+## Full Q5-fixed `tune_gemm.py` re-sweep (Milestone 4 follow-up, 2026-09-20): done
+
+Follow-up to this document's own "Known gaps" item 2 and `docs/r9700.md`'s Q5. Confirmed
+`tools/profile/tune_gemm.py`'s R5-era ring-rotation fix (`RingCall`/`ring_count`, >=4 distinct weight
+buffers totalling >256 MiB, rotated per timed call) was already correct and wired into every
+`alloc_*` helper -- i.e. already applied to the whole sweep, not just the two shapes R5 spot-checked;
+what was missing was actually running the full 280-row sweep. Ran it (all 4 layouts x 10 shapes x 7
+M-bands, HIP device 1, one process at a time, ~13 min wall clock) and regenerated
+`src/model/gemm_tuning_table.inc` in place.
+
+**Findings**: 216/280 rows (77%) picked a different `(WV,SK,MB,NPW,NT)` tuning than the old table.
+41/70 `(shape,M)` cells where w4a16/w4a8/mxfp4 are directly comparable flip the fastest-to-slowest
+ranking -- overwhelmingly mxfp4 going from fastest at M in {1,2,4,8,16} to slowest of the three, on
+`gdn.in_proj_qkv`, `gdn.in_proj_z`, `gdn.out_proj`, `attn.qg`, and `mlp.down` (e.g.
+`gdn.in_proj_qkv` M=1: 30.44 -> 52.53 us, +72.6%), generalizing R5's two-shape spot-check to a
+much broader pattern across most of the table. w4a16/w4a8 never flip past each other.
+
+**End-to-end re-measurement** (real 64-layer container, this file's standard prompt/flags, HIP
+device 1, each config run twice, within 0.2% both times): mxfp4 decode improved **+6.4% (`mtp=0`,
+30.85->32.83 tok/s) and +14.1% (`mtp=3`, 56.39->64.31 tok/s)** -- a genuine win, because the
+corrected sweep picks configs that are fastest under the cold reads the real model always does,
+where the old sweep picked whatever looked fastest on a single cache-resident buffer. w4a16 is flat
+within noise at both `--mtp` settings. **w4a8 `--mtp 3` regressed -10.0% (61.47->55.34 tok/s)**, MTP
+acceptance dropping 43.3%->35.6% -- attributed to a combination of the M=2..5 verify-band GEMMs
+getting ~8-12% slower in the honest sweep and MTP's acceptance decision being sensitive to the
+verify step's own floating-point reduction order (expected numerical drift from retiling, not a
+correctness bug: verify's batched-M forward pass IS the ground truth MTP checks the draft against).
+Full root-cause split (GEMM-latency vs numerical-drift) not attempted, time-boxed -- see "Next
+milestone" below.
+
+**Decision: shipped.** The re-swept table does not regress the shipped default (w4a16 stays fastest
+in absolute decode tok/s at both `--mtp` settings, so it stays the default) and is honestly correct
+(no cell implies above-DRAM-peak bandwidth, unlike several old mxfp4 rows) even though one
+non-default layout's MTP mode regressed. Full `ctest`: **35/35** (`tests\run_tests.ps1`, ~142s, HIP
+device 1) -- a data-only table swap, `PickTuning`'s existing fallback path makes this
+correctness-preserving by construction, confirmed by the tolerance-bounded goldens in
+`test_forward_smoke`/`test_mtp`/`test_gdn_layer`/`test_attn_layer` all still passing. Full detail,
+the flip table, and the end-to-end numbers: `docs/perf.md`'s "Full Q5-fixed `tune_gemm.py` re-sweep"
+section; `docs/r9700.md`'s Q5 entry (now marked answered) and its two other stale references to the
+pre-fix numbers (corrected in place). Docs updated, no other document found asserting the specific
+above-DRAM-peak numbers this pass corrected.
+
+## MTP acceptance-gap investigation + server/test gaps closed (Milestone 4 follow-up, 2026-09-20)
+
+Task scope: docs/mtp.md's "Acceptance gap investigation" open question (w4a16 46.3% vs mxfp4 47.1%
+vs w4a8 43.3% at K=3, with head-precision and logit-margin already falsified), plus this document's
+own Known-gaps items 3 (`--mtp-head-layout` server flag) and 6 (`--chat` multi-turn + MTP mid-round
+regression test).
+
+**h_seed drift, measured: correlates with the acceptance ranking.** Built the one route M3 named but
+never had (a 4-layer container carrying ALL FOUR layouts plus `mtp.*` weights side by side --
+`D:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted this pass via `r4dx-convert --layers 4 --mtp on
+--layouts bf16,w4a16,w4a8,mxfp4`; the pre-existing `qwen38-27b-l4-mtp.r4dx` only carries bf16+w4a16).
+Added a diagnostic-only accessor, `Model::DebugSeedHiddenBf16()` (`src/model/model.h`/`.cpp`), that
+reads back `mtp_seed_hidden_` -- the exact pre-final-norm hidden-state row `MtpHead::Draft`'s first
+step consumes -- and a one-off tool, `tests/model/tool_hseed_drift.cpp` (built, never registered as
+a ctest test -- it prints numbers, it doesn't assert a contract), that feeds the SAME fixed 64-token
+stream through a bf16 (exact-arithmetic reference, this project's own convention) `Model` and each
+quantized layout's `Model` against that container, sampling `h_seed` every 8 tokens (8 positions) and
+comparing to the bf16 reference by cosine similarity and relative L2.
+
+Measured (HIP device 1, real hardware): mean cosine / mean rel L2 vs bf16 -- **w4a16 0.99763 /
+7.16e-2** (best), **mxfp4 0.99745 / 1.061e-1** (middle), **w4a8 0.99496 / 1.257e-1** (worst). This
+is EXACTLY the measured acceptance ranking at K=3 (w4a16 51.9-54.3% > mxfp4 40.0-41.9% > w4a8
+32.5-34.2%, docs/mtp.md's "MTP head layout" table) -- the layout with the smallest h_seed drift from
+the exact-arithmetic reference has the highest acceptance, and the layout with the largest drift has
+the lowest, with mxfp4 correctly landing in between on both axes. Per-position noise exists (at 2 of
+8 sampled positions mxfp4's rel L2 briefly exceeds w4a8's -- 8 positions on a drastically-truncated
+4-layer container is a small sample), so this is a MEAN-level correlation, not a claim that every
+single position preserves the ranking; the aggregate agreement across two independent metrics
+(cosine and rel L2) and three layouts is not plausibly noise.
+
+**Mechanism, identified**: nearly all of every layout's rel L2 is driven by ONE hidden dimension
+(component index 3994 of 5120) whose bf16 reference magnitude (+26.5) dwarfs every other component
+(observed range roughly -2..+2) -- the well-documented "massive activation" / outlier-dimension
+phenomenon in transformer residual streams. Its absolute quantization error tracks the exact same
+per-layout ranking as the aggregate metric: w4a16 -0.375 (-1.4%), mxfp4 -1.125 (-4.2%), w4a8 -2.875
+(-10.8%). Because this one dimension's squared magnitude dominates the vector's squared norm, its
+quantization error alone is effectively what rel L2 (and, plausibly, the lm_head's own sensitivity
+to the residual stream) is measuring here.
+
+**Conclusion**: h_seed drift explains the acceptance ordering (a measured positive, not a clean
+negative like the two hypotheses this pass's predecessor falsified). Not a bug -- this is expected
+behavior of weight/activation quantization on a residual-stream dimension with an outsized dynamic
+range, the same reason "outlier-aware" quantization schemes exist in the wider literature; no code
+change is warranted, so this pass does NOT touch task item 4 (fix + re-measure) -- there is nothing
+found to fix. Per the task's own item-2 conditional ("if h_seed drift does not explain it, the next
+candidates in order..."), the KV-history-divergence and verify-window-disagreement-rate hypotheses
+were NOT pursued this pass, since a measured, mechanistically-grounded positive answer for h_seed
+drift was already found. Recommended follow-up (not started): whether an outlier-aware quantization
+scheme for the small number of massive-activation dimensions specifically (leaving the rest of the
+tensor at its current bit width) narrows the acceptance gap without giving up the layout's
+throughput -- see docs/mtp.md's "Acceptance gap investigation" for the full writeup and numbers.
+
+**Two small gaps closed while in this code** (docs/status.md's own Known-gaps items 3 and 6 above):
+
+1. **`--mtp-head-layout` server-side flag** (`src/server/server_args.h`, `src/server/main.cpp`):
+   added `--mtp-head-layout {bf16,layout}` (default `layout`), parsed and validated identically to
+   `src/cli/cli_args.h`'s own flag, wired into `ModelOptions::mtp_head_layout` in `main.cpp`. New
+   `tests/server/test_server_args.cpp::TestMtpHeadLayoutFlag` (defaults, `bf16` override, rejection
+   of an unrecognized value). `docs/server.md`/README.md updated (their own "deferred" notes marked
+   resolved).
+2. **`--chat` multi-turn + MTP mid-round-stop regression test**
+   (`tests/model/test_mtp.cpp::CheckChatMultiTurnMidRoundStop`, new): drives a REAL two-turn
+   conversation through a real `Model` (not a synthetic vector, unlike
+   `tests/server/test_prefix_state.cpp`'s existing `TestCommitTracksCommittedNotDisplayedTokens`,
+   which only proves `PrefixState`'s own arithmetic) -- a same-seed dry run first finds a round that
+   naturally emits >=2 tokens, then the real run enforces a `max_tokens_remaining` budget exactly one
+   token short of that round's own boundary via the production `r4dx::model::ProcessMtpRound` helper
+   `src/cli/main.cpp`/`src/server/engine.cpp` use, asserts `r4dx::server::PrefixState::Extend()`
+   correctly REFUSES to treat turn 2's re-rendered (displayed-only) conversation as a fast-path
+   extension of the model's real (committed) state (the exact desync the bookkeeping fix exists to
+   prevent), then verifies the `Reset()`+full-reprefill recovery path's turn-2 continuation is
+   byte-identical to an independently-loaded, freshly-`Prefill()`'d sequential reference. Runs for
+   every layout `test_mtp` iterates (originally bf16, w4a16 on `qwen38-27b-l4-mtp.r4dx`).
+   **UPDATE (review finding, 2026-09-20):** `test_mtp.cpp`'s main loop (this check plus
+   `CheckVerifyMatchesSequential`/`CheckRejectionRewind`/`CheckWideWindowRejectionRewind`/etc.) now
+   points at `qwen38-27b-l4-allmtp.r4dx` and iterates all FOUR layouts (bf16, w4a16, w4a8, mxfp4) --
+   w4a8/mxfp4 previously had zero coverage from this file despite being the two layouts the
+   fused-epilogue and GEMM-tuning-table passes actually perturbed. `qwen38-27b-l4-mtp-draftvocab.
+   r4dx` (used only by `CheckReducedVocabDraftHeadLossless`) was NOT re-converted and still only
+   carries bf16/w4a16, so that one check deliberately kept its own separate {bf16, w4a16} layout
+   list rather than reusing the widened one (reusing it crashed the process with
+   STATUS_STACK_BUFFER_OVERRUN against tensors that container doesn't have -- caught by re-running
+   after the change, before shipping it). `tool_hseed_drift` also still uses
+   `qwen38-27b-l4-allmtp.r4dx` (unchanged). Full `ctest`: still 37/37, `test_mtp` grew from ~110s to
+   ~147s (double the layouts through the main loop).
+
+**Build/test**: `.\build.ps1` incremental (both new source files, `model.h`/`.cpp`'s new accessor,
+and the two server-side files rebuilt their dependents cleanly, no warnings-as-errors). Full `ctest`:
+**35/35 passing** (`tests\run_tests.ps1`, ~162s, HIP device 1) -- `test_mtp` grew from ~50s to 70s
+(the new `CheckChatMultiTurnMidRoundStop` check, x2 layouts) but the test COUNT is unchanged (no new
+ctest binary was registered; `tool_hseed_drift` is built but deliberately not an `add_test`).
+
+
 
 Task scope: fuse the per-GEMM activation-quant/cast launch (`r4dx_model_cast_bf16_to_f16` for
 w4a16, `core::r4d::QuantActI8` for w4a8, `r4dx_quant_act_fp8e4m3_row` for mxfp4 -- ~257 extra

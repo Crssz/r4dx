@@ -626,6 +626,20 @@ __global__ __launch_bounds__(kThreads) void EmbeddingGatherKernel(
   for (int64_t i = threadIdx.x; i < hidden; i += kThreads) dst[i] = src[i];
 }
 
+// ---- device-side single/few-element gather (docs/r9700.md R9, reduced-vocab MTP draft head) ----
+// One thread per output element -- `n` is always tiny (1 in every current caller), so this is
+// deliberately not a one-workgroup-per-row kernel like EmbeddingGatherKernel above. Same
+// out-of-range-clamps-to-index-0 bounds guard as that kernel, for the same reason (a device fault
+// mid-kernel is unrecoverable; a wrong-but-safe value is not).
+__global__ void GatherI32Kernel(const int32_t* __restrict__ table, const int32_t* __restrict__ idx,
+                                 int32_t* __restrict__ out, int64_t n, int64_t table_size) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int32_t id = idx[i];
+  if (id < 0 || id >= table_size) id = 0;
+  out[i] = table[id];
+}
+
 }  // namespace
 
 extern "C" {
@@ -734,6 +748,17 @@ void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t
   hipLaunchKernelGGL(EmbeddingGatherKernel, dim3(static_cast<unsigned>(n)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)ids,
                      (__hip_bfloat16*)out, hidden, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_gather_i32(int64_t table, int64_t idx, int64_t out, int64_t n, int64_t table_size,
+                      int64_t stream) {
+  if (n <= 0) return;
+  ++g_launch_count;
+  const unsigned threads = n < 32 ? static_cast<unsigned>(n) : 32u;
+  const unsigned blocks = static_cast<unsigned>((n + threads - 1) / threads);
+  hipLaunchKernelGGL(GatherI32Kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+                     (const int32_t*)table, (const int32_t*)idx, (int32_t*)out, n, table_size);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

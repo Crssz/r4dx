@@ -9,6 +9,7 @@
 
 #include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
+#include "tool_call_parser.h"
 
 namespace r4dx::server {
 
@@ -61,7 +62,8 @@ size_t FindEarliestStop(const std::string& text, const std::vector<std::string>&
 // stage's task point 2). Returns true iff a --stop string matched (the caller should stop
 // generating and report finish_reason="stop").
 bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
-                       std::string& accumulated, int32_t tok) {
+                       std::string& accumulated, int32_t tok, bool stream_to_client,
+                       size_t* stop_match_pos) {
   const std::string piece = decoder.push(tok);
   if (piece.empty()) return false;
   const size_t already_emitted = accumulated.size();
@@ -71,10 +73,11 @@ bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& deco
   if (match != std::string::npos) {
     const size_t emit_len = match > already_emitted ? match - already_emitted : 0;
     const std::string trimmed = piece.substr(0, emit_len);
-    if (!trimmed.empty()) req.sink->OnToken(trimmed);
+    if (stream_to_client && !trimmed.empty()) req.sink->OnToken(trimmed);
+    if (stop_match_pos) *stop_match_pos = match;
     return true;
   }
-  req.sink->OnToken(piece);
+  if (stream_to_client) req.sink->OnToken(piece);
   return false;
 }
 
@@ -124,14 +127,63 @@ void Engine::RunRequest(PendingRequest& req) {
     if (req.kind == RequestKind::kChat) {
       r4dx::ChatJson messages = r4dx::ChatJson::array();
       for (const auto& m : req.messages) {
-        messages.push_back({{"role", m.role}, {"content", m.content}});
+        r4dx::ChatJson entry = r4dx::ChatJson::object();
+        // Map the legacy "function" role onto "tool" before rendering: chat_template.jinja
+        // (C:\AI\models\Qwen3.8-27B\chat_template.jinja) has no "function" branch at all -- only
+        // system/user/assistant/tool -- so a "function"-role message previously fell through to
+        // the template's own `{% else %}{{ raise_exception('Unexpected message role.') }}`,
+        // contradicting openai_types.cpp's own comment claiming the template treats "tool"/
+        // "function" identically (review finding, 2026-09-20). The template's "tool" branch reads
+        // only `content` (never `tool_call_id`), so this remap is exact -- `m.name` (the legacy
+        // shape's own way of identifying which function answered) carries no template effect
+        // either way, matching the pre-existing "tool" role's own behavior.
+        entry["role"] = (m.role == "function") ? "tool" : m.role;
+        entry["content"] = m.content ? r4dx::ChatJson(*m.content) : r4dx::ChatJson(nullptr);
+        if (!m.tool_calls.empty()) {
+          // Rebuild the OpenAI-wire tool_calls array into the shape chat_template.jinja's own
+          // "render an earlier turn's tool call back into the prompt" branch expects: `arguments`
+          // must be a real JSON object here (the template does `tool_call.arguments|items`), NOT
+          // the JSON-encoded STRING the wire format itself carries -- ParseToolCallsField
+          // (openai_types.cpp) already validated `arguments_json` decodes to an object, so this
+          // parse cannot fail (task point 4: multi-turn tool round trip composes with the
+          // existing chat template, no separate tool_call_id-aware rendering needed since this
+          // checkpoint's own template never looks at tool_call_id -- see chat_template.jinja's
+          // `elif message.role == "tool"` branch, which only reads `content`).
+          r4dx::ChatJson tool_calls = r4dx::ChatJson::array();
+          for (const auto& tc : m.tool_calls) {
+            r4dx::ChatJson call = r4dx::ChatJson::object();
+            call["id"] = tc.id;
+            call["type"] = "function";
+            call["function"] = {{"name", tc.name}, {"arguments", r4dx::ChatJson::parse(tc.arguments_json)}};
+            tool_calls.push_back(call);
+          }
+          entry["tool_calls"] = tool_calls;
+        }
+        if (m.tool_call_id) entry["tool_call_id"] = *m.tool_call_id;
+        if (m.name) entry["name"] = *m.name;
+        messages.push_back(entry);
       }
       r4dx::ChatJson extra_context = req.chat_template_kwargs;
       if (!extra_context.contains("enable_thinking")) {
         extra_context["enable_thinking"] = opts_.default_thinking;
       }
-      const std::string rendered = tmpl_->render(messages, /*add_generation_prompt=*/true,
-                                                   req.tools, extra_context);
+      std::string rendered;
+      try {
+        rendered = tmpl_->render(messages, /*add_generation_prompt=*/true, req.tools, extra_context);
+      } catch (const std::exception& e) {
+        // Any ChatTemplate::render() failure here is a caller-shape problem, not an engine bug:
+        // the template itself already parsed successfully at load time (ChatTemplate::from_
+        // directory), so a render-time failure can only come from one of chat_template.jinja's own
+        // `raise_exception(...)` validation calls over THIS request's messages/tools/extra_context
+        // (e.g. "No user query found in messages." when a conversation is only role:"tool"/
+        // "function" turns with no user turn anywhere, or "Unexpected message role."). Report it
+        // as a 400 rather than falling through to the generic catch below, which would invalidate
+        // the prefix-reuse cache and return an uninformative 500 for what is really a bad request
+        // (review finding, 2026-09-20).
+        req.sink->OnError(400, std::string("messages could not be rendered by this checkpoint's "
+                                            "chat template: ") + e.what());
+        return;
+      }
       // parse_special=true: required so the template's own <|im_start|>/<|im_end|> control
       // sequences become their token ids -- see tokenizer.h's encode() CAUTION note (message
       // bodies are spliced in verbatim, same caveat this server inherits from the chat template
@@ -206,6 +258,23 @@ void Engine::RunRequest(PendingRequest& req) {
     std::vector<int32_t> committed_tokens;
     std::string accumulated;
     std::string finish_reason = "length";
+    // Set by EmitToken (via its stop_match_pos out-param) the moment a --stop string matches;
+    // std::string::npos means no stop matched. `accumulated` itself keeps growing past this point
+    // (EmitToken only trims what it STREAMS, see its own comment) -- the tool_mode block below
+    // must re-trim at this boundary before re-deriving its response from `accumulated`, or it
+    // echoes the stop text (and anything decoded in the same token after it) back to the client
+    // (review finding, 2026-09-20).
+    size_t stop_match_pos = std::string::npos;
+
+    // Tool calls (docs/server.md's "Tool calls" streaming decision): whenever this request could
+    // plausibly produce a "<tool_call>" span (i.e. it offered any tool definitions), buffer the
+    // ENTIRE generation instead of streaming it token-by-token -- EmitToken below still tracks
+    // `accumulated`/applies --stop trimming exactly as always, it just skips the sink->OnToken()
+    // forward. This guarantees a client can never see a half-formed tag as a content delta (the
+    // CRITICAL failure mode this design avoids), at the honest cost of "fake" (all-at-once)
+    // streaming for any request that offers tools, whether or not a call actually happens. A
+    // request with no `tools` is completely unaffected (real per-token streaming, unchanged).
+    const bool tool_mode = req.kind == RequestKind::kChat && !req.tools.empty();
 
     // Greedy MTP (task point 2): only a temperature<=0 request on a Model actually Load()'d with
     // mtp_draft_k>0 takes the speculative path -- everything else (non-greedy, or MTP disabled at
@@ -225,7 +294,8 @@ void Engine::RunRequest(PendingRequest& req) {
         stopped = true;
       } else {
         generated_tokens.push_back(next);
-        if (EmitToken(req, decoder, accumulated, next)) {
+        if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
+                      &stop_match_pos)) {
           finish_reason = "stop";
           stopped = true;
         }
@@ -254,7 +324,8 @@ void Engine::RunRequest(PendingRequest& req) {
         for (int32_t tok : outcome.displayed) {
           generated_tokens.push_back(tok);
           next = tok;
-          if (EmitToken(req, decoder, accumulated, tok)) {
+          if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
+                        &stop_match_pos)) {
             finish_reason = "stop";
             stopped = true;
             break;
@@ -282,7 +353,8 @@ void Engine::RunRequest(PendingRequest& req) {
           break;
         }
         generated_tokens.push_back(next);
-        const bool stop_hit = EmitToken(req, decoder, accumulated, next);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
+                                        &stop_match_pos);
         // Feed `next` into the model regardless of stop_hit, so committed_tokens below accurately
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
         // token is real generated content, only its stop-marker tail text is withheld from the
@@ -296,11 +368,60 @@ void Engine::RunRequest(PendingRequest& req) {
       }
     }
     const std::string tail_text = decoder.flush();
-    if (!tail_text.empty()) req.sink->OnToken(tail_text);
+    if (!tool_mode && !tail_text.empty()) req.sink->OnToken(tail_text);
+    accumulated += tail_text;  // harmless when empty; needed below so tool-call parsing sees the
+                                // full text even in the rare case generation stopped mid-codepoint
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
     prefix_.Commit(full_tokens, committed_tokens);
+
+    if (tool_mode) {
+      // Parse this checkpoint's real tool-call surface syntax (src/server/tool_call_parser.h,
+      // docs/server.md's "Tool calls") out of the fully-buffered generation, then deliver it as
+      // one content piece (the leading/trailing prose, if any -- empty when the whole turn was a
+      // call) followed by one complete tool_calls batch, matching the "buffer whole" streaming
+      // decision documented above. Robustness (task item 7): ParseToolCalls never throws --
+      // malformed JSON in a parameter value degrades that value to a string, and a malformed
+      // <tool_call> span degrades to literal content -- so this always produces a sane response,
+      // never a crashed worker thread or a desynced stream, no matter how the model misbehaves.
+      // Re-trim at the same boundary EmitToken used to decide what to STREAM (review finding,
+      // 2026-09-20): `accumulated` itself always carries the full decoded text including a
+      // matched --stop string (and anything decoded in the same token after it) -- parsing the
+      // untrimmed string here would echo that stop text back via `parsed.content`, breaking
+      // OpenAI's "the stop string terminates generation but is never itself returned" semantics
+      // for any request combining `tools` and `stop`.
+      const std::string tool_parse_source =
+          stop_match_pos != std::string::npos && stop_match_pos < accumulated.size()
+              ? accumulated.substr(0, stop_match_pos)
+              : accumulated;
+      r4dx::server::ToolCallParseResult parsed = r4dx::server::ParseToolCalls(tool_parse_source);
+      std::vector<std::string> known_names;
+      for (const auto& t : req.tools) {
+        if (t.is_object() && t.contains("function") && t.at("function").is_object() &&
+            t.at("function").contains("name") && t.at("function").at("name").is_string()) {
+          known_names.push_back(t.at("function").at("name").get<std::string>());
+        }
+      }
+      r4dx::server::DropUnknownToolCalls(parsed, known_names);
+
+      if (!parsed.content.empty()) req.sink->OnToken(parsed.content);
+      if (!parsed.tool_calls.empty()) {
+        std::vector<ToolCallOut> tool_calls_out;
+        tool_calls_out.reserve(parsed.tool_calls.size());
+        for (auto& c : parsed.tool_calls) {
+          tool_calls_out.push_back(ToolCallOut{GenerateRequestId("call_"), c.name, c.arguments_json});
+        }
+        req.sink->OnToolCalls(tool_calls_out);
+        // A client mid-stream disconnect ("cancelled") is reported as-is regardless of whether a
+        // well-formed call happens to have already been fully buffered -- the generation as a
+        // whole did not complete normally, so claiming finish_reason "tool_calls" here would be
+        // misleading (and for a non-streaming BufferingSink, "cancelled" never actually occurs --
+        // see response_sink.h's IsCancelled() doc comment -- so this guard only ever matters for
+        // the streaming path).
+        if (finish_reason != "cancelled") finish_reason = "tool_calls";
+      }
+    }
 
     req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()));
 

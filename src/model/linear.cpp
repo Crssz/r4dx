@@ -1,6 +1,7 @@
 #include "linear.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -82,50 +83,70 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
 }
 
 int EpilogueForLayout(Layout layout) {
-  // NOT WIRED (docs/r9700.md R2/P2, 2026-09-20) -- returns r4dx_epilogue_none for every layout,
-  // deliberately, pending a fix. Full status:
+  // Milestone 4 follow-up to docs/r9700.md R2/P2 (2026-09-20): root-caused and re-enabled for
+  // w4a8/mxfp4. History: the fused epilogues (kernels.h's r4dx_epilogue: f16, fp8 row-major, int8
+  // fragA8) were built and verified BYTE-EXACT in isolation (tests/kernels/test_fused_quant.cpp,
+  // 135/135, M in {1,2,4,16,64} x K in {5120,6144,17408}), but wiring them into the model changed
+  // w4a8/mxfp4's real generated text even though an in-model diagnostic showed zero differing
+  // elements on the fused GEMMs' own outputs -- shipped disabled pending root-cause (see git log
+  // on this file / docs/status.md's original R2/P2 section for the full incident writeup this pass
+  // inherited).
   //
-  // The fused epilogues themselves (kernels.h's r4dx_epilogue: f16, fp8 row-major, int8 fragA8)
-  // are implemented in src/kernels/src/r4dx_kernels.hip and verified BYTE-EXACT against the
-  // standalone kernels they'd replace (r4dx_model_cast_bf16_to_f16 / r4dx_quant_act_fp8e4m3_row /
-  // third_party/libr4d's r4d_quant_act_i8) by tests/kernels/test_fused_quant.cpp, 135/135 checks,
-  // M in {1,2,4,16,64} x K in {5120,6144,17408} -- the task's own full grid, in isolation.
+  // ROOT CAUSE (this pass): not the epilogue kernels' own math (already independently verified),
+  // and not which GEMM consumed a fused buffer. It is `r4dx::core::Arena::Alloc`
+  // (r4dx/core/arena.hpp): it only aligned each allocation's OWN start to the caller-requested
+  // alignment, never its END. A fused epilogue's per-row fp32 scale scratch is exactly `T` floats
+  // (T = chunk row count, 1..64) -- 4*T bytes, a multiple of 16 only when T%4==0 -- so at decode
+  // (T=1) and MTP verify (T=2..4) the NEXT default-aligned allocation in the same layer (e.g.
+  // GdnLayer::Forward's `mixed_qkv`) starts a few bytes short of 16-byte alignment, and every
+  // allocation after it inherits the same drift for the rest of the layer. Every third_party/libr4d
+  // kernel this arena feeds (GDN conv/kkt/chunk-scan, every quantized GEMM family, attention's
+  // decode scratch) reads its operands with unchecked wide (16-byte) vector loads and silently
+  // reads the wrong bytes when handed a misaligned pointer -- unlike this project's OWN
+  // P6-rewritten rmsnorm/residual_rmsnorm/silu_mul kernels, which fall back to a scalar loop when
+  // misaligned. Before this fusion pass every arena allocation's SIZE happened to already be a
+  // multiple of 16 bytes (hidden/conv_dim/intermediate are all multiples of 8 bf16 elements), so
+  // `offset_` was always incidentally 16-aligned and this was never triggered -- several call
+  // sites' own comments already flagged that invariant as "incidental, not enforced" (gdn_layer.cpp,
+  // attention_layer.hpp, this file's i8_scratch/fp8_scratch allocations). FIX (arena.hpp): every
+  // Alloc call now rounds its own END up to 16 bytes too, so every FUTURE allocation starts
+  // 16-aligned again regardless of what alignment it individually requests. Covered by a new
+  // host-side ArenaAlignmentInvariant check in tests/kernels/test_fused_quant.cpp (reproduces the
+  // exact odd-T scale-then-buffer allocation sequence GdnLayer/AttentionLayer/Mlp use, T=1..64, and
+  // asserts every subsequent pointer is 16-aligned) and re-verified end-to-end BYTE-IDENTICAL
+  // generated text (SHA-256), fusion-on vs fusion-off, for w4a8 and mxfp4 across three prompt
+  // lengths x `--mtp {0,3}` (tools/validate_fusion.ps1 -- also usable as a standing regression gate;
+  // docs/status.md's R2/P2 section has the full run log).
   //
-  // w4a16's r4dx_epilogue_f16 was additionally found, when wired, to REGRESS decode wall-clock
-  // (-4.3%, reproducible): r4dx_model_cast_bf16_to_f16 launches a FLAT elementwise grid
+  // w4a16's r4dx_epilogue_f16 is a SEPARATE, unrelated issue: it is equally CORRECT now (verified
+  // the same way) but still REGRESSES decode wall-clock (-4.3%, reproducible, unchanged from the
+  // original incident): r4dx_model_cast_bf16_to_f16 launches a FLAT elementwise grid
   // (blocks=ceil(M*K/256), ~20 independent workgroups at decode T=1/K=5120), while fusing it into
   // rmsnorm/residual_rmsnorm/silu_mul's own one-workgroup-per-row epilogue collapses that work onto
-  // a SINGLE workgroup -- a real parallelism loss the saved launch does not cover. This layout's
-  // fusion is deliberately not re-enabled even once the item below is fixed; see git history on
-  // this file (or docs/status.md's R2/P2 section) for the measured numbers and the "fuse only
-  // during prefill" follow-up idea.
+  // a SINGLE workgroup -- a real parallelism loss the saved launch does not cover. Per this task's
+  // own instruction ("do not re-enable in that form"), w4a16 stays r4dx_epilogue_none until a
+  // wide-grid f16 cast or a prefill-only fusion (dim3(rows)=dim3(T), no parallelism loss at T>1) is
+  // built -- Milestone 5+ work, not part of this pass.
   //
-  // w4a8's r4dx_epilogue_int8_fraga8 and mxfp4's r4dx_epilogue_fp8_e4m3_row, when wired, were found
-  // to change the model's generated token stream on real hardware (confirmed via a real -- not
-  // isolated -- CLI generation, reproducible across runs, not GPU nondeterminism: with all fusion
-  // disabled the same prompt/flags reproduce byte-identical text across repeated runs) even though
-  // an in-model diagnostic (temporarily comparing each fused GEMM's own output against a second,
-  // unfused ApplyLinear call on the SAME inputs, immediately after the fused call, for
-  // gdn.in_proj_qkv/gdn.in_proj_z/mlp.down) showed ZERO differing elements across 200+ real
-  // decode-step samples spanning many layers. The root cause is therefore NOT in the epilogue
-  // kernels' own math (independently verified twice, in isolation and in-model) and was not
-  // isolated within this pass's time budget; likely candidate areas for a follow-up investigation,
-  // in rough priority order: (1) the NEW per-call arena allocations this fusion adds (epilogue
-  // scratch, allocated between existing allocations in GdnLayer/AttentionLayer/Mlp) shifting every
-  // LATER allocation in the same layer to a different offset than the pre-fusion code path used,
-  // interacting badly with something that is sensitive to absolute arena layout rather than going
-  // through Arena::Alloc's own bump-then-return contract; (2) gate_up's OWN local fused epilogue
-  // (mlp.cpp, x_normed_in==nullptr path) specifically -- unlike gdn.in_proj_qkv/z/mlp.down, it was
-  // not itself isolated with the same in-model diagnostic before this pass's time ran out; (3) the
-  // qg/k/v attention-layer fusion path (attention_layer.hpp) -- never exercised by this bisection
-  // at all (layer 0 in this container is a GDN layer, and cross-layer-boundary fusion was disabled
-  // throughout the bisection), so it is UNTESTED, not cleared. Per this task's own explicit
-  // instruction ("never loosen to a tolerance... shipping it unverified risks silently corrupting
-  // every quantized GEMM's input, which is worse than not shipping it"), this returns
-  // r4dx_epilogue_none unconditionally until the root cause is found and a fix is verified the same
-  // way test_fused_quant.cpp already verifies the kernels: real generated text, byte-identical to
-  // the unfused baseline, not just a tolerance-bounded numeric check.
-  (void)layout;
+  // R4DX_DISABLE_EPILOGUE=1 forces every layout back to r4dx_epilogue_none regardless of the mapping
+  // below -- the A/B toggle tools/validate_fusion.ps1 uses to regenerate the "fusion off" baseline
+  // every run from the SAME binary rather than requiring a second build. Unset in every other
+  // caller (every ctest binary, every plain CLI/server invocation), which see the mapping directly.
+  static const bool kDisabled = [] {
+    const char* e = std::getenv("R4DX_DISABLE_EPILOGUE");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (kDisabled) return r4dx_epilogue_none;
+  switch (layout) {
+    case Layout::kBf16:
+      return r4dx_epilogue_none;  // never quantizes its activation input -- nothing to fuse.
+    case Layout::kW4a16:
+      return r4dx_epilogue_none;  // Problem B: parallelism loss at decode, see comment above.
+    case Layout::kW4a8:
+      return r4dx_epilogue_int8_fraga8;
+    case Layout::kMxfp4:
+      return r4dx_epilogue_fp8_e4m3_row;
+  }
   return r4dx_epilogue_none;
 }
 

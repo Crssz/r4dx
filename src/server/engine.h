@@ -97,8 +97,18 @@ class Engine {
 
   // Shared stop-string-aware token emission (engine.cpp) used by both the plain-decode and MTP
   // generation loops in RunRequest -- see that function's definition for the full contract.
+  // `stream_to_client`: false when this request has `tools` (docs/server.md's "Tool calls"
+  // streaming decision -- generation is buffered whole, not streamed live, whenever a tool call
+  // could plausibly appear, so a client never sees a half-formed "<tool_call>" tag as content).
+  // `accumulated`/the stop-string check itself are unaffected either way. `stop_match_pos`
+  // (review finding, 2026-09-20): when a --stop string matches, the position within `accumulated`
+  // where it begins is written here (if non-null) -- `accumulated` itself still gets the FULL
+  // decoded piece appended (including the stop text), only what's *streamed* to the client is
+  // trimmed, so a caller that re-derives its response from `accumulated` after the loop ends (the
+  // tool_mode block) must re-trim at this boundary itself or it echoes the stop text back.
   static bool EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
-                         std::string& accumulated, int32_t tok);
+                         std::string& accumulated, int32_t tok, bool stream_to_client = true,
+                         size_t* stop_match_pos = nullptr);
 
   EngineOptions opts_;
   std::string model_id_;

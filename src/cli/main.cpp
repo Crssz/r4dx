@@ -318,6 +318,7 @@ int RunMain(int argc, char** argv) {
                               ? std::make_optional(r4dx::model::Layout::kBf16)
                               : std::nullopt;
   opts.embed_device_resident = (args.embed_device_resident != "off");
+  opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
 
   // allow_unimplemented_normalizer=true: Qwen3.8-27B's tokenizer.json declares normalizer.type=
   // NFC, which r4dx's tokenizer does not implement (tokenizer.h's file comment KNOWN GAP) --
@@ -397,13 +398,17 @@ int RunMain(int argc, char** argv) {
             r.mtp_drafted > 0 ? 100.0 * static_cast<double>(r.mtp_accepted) / static_cast<double>(r.mtp_drafted) : 0.0;
         std::fprintf(stderr,
                      "[stats] mtp: draft_k=%lld rounds=%lld drafted=%lld accepted=%lld "
-                     "(%.1f%% acceptance, %.2f tok/round avg)\n",
+                     "(%.1f%% acceptance, %.2f tok/round avg) draft_head=%s\n",
                      static_cast<long long>(args.mtp), static_cast<long long>(r.mtp_rounds),
                      static_cast<long long>(r.mtp_drafted), static_cast<long long>(r.mtp_accepted),
                      accept_rate,
                      r.mtp_rounds > 0
                          ? static_cast<double>(r.decode_tokens) / static_cast<double>(r.mtp_rounds)
-                         : 0.0);
+                         : 0.0,
+                     // docs/r9700.md R9: report which draft head this run actually used --
+                     // "reduced" only if the container has one AND --mtp-draft-head didn't force
+                     // "full" (Model::MtpUsingReducedVocabDraft's own two-condition check).
+                     model.MtpUsingReducedVocabDraft() ? "reduced" : "full");
       }
     }
   };

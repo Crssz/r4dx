@@ -39,6 +39,11 @@ void BufferingSink::Wait() {
   cv_.wait(lock, [&] { return done_; });
 }
 
+void BufferingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
+  std::lock_guard<std::mutex> lock(mu_);
+  tool_calls = calls;
+}
+
 // ---- StreamingSink ---------------------------------------------------------------------------
 
 StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix)
@@ -61,6 +66,17 @@ void StreamingSink::OnToken(const std::string& piece) {
   } else {
     queue_.Push(FormatSseEvent(BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt)));
   }
+}
+
+void StreamingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
+  if (calls.empty() || kind_ != Kind::kChat) return;  // /v1/completions has no tool_calls concept
+  // The single "emit tool calls whole" delta -- see ResponseSink::OnToolCalls's own doc comment
+  // and docs/server.md's "Tool calls" streaming section for why this is one complete chunk
+  // (index-tagged, so a client that DOES expect real per-delta streaming still assembles it
+  // correctly, it just receives the whole thing in one delta instead of many) rather than
+  // OpenAI's own byte-by-byte argument streaming.
+  nlohmann::json delta = {{"tool_calls", BuildToolCallsJson(calls)}};
+  queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt)));
 }
 
 void StreamingSink::OnDone(const std::string& finish_reason, int64_t /*completion_tokens*/) {

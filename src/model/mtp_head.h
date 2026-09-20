@@ -101,11 +101,26 @@ class MtpHead {
   // previously k of each. positions_/seqused_k_ (this class's own per-step scratch) are likewise
   // preloaded for the whole window in one H2D upload each before the loop, not one CopyFromHost
   // (blocking) per step.
+  // use_reduced_vocab (docs/r9700.md R9, "reduced-vocab draft head"): when true AND
+  // w.HasDraftHead(), every draft step's own lm_head GEMM+argmax runs against w.draft_lm_head (N ==
+  // w.draft_vocab_ids.size() rows instead of the full vocab) and the resulting subset-local index is
+  // mapped back to a real vocab id via w.draft_vocab_ids (r4dx_gather_i32) BEFORE it is used for
+  // anything else in this loop (the next step's embedding gather, the accumulated draft_ids_dev_/
+  // drafts result) -- every other line of this method's own algorithm is unchanged, because from
+  // that point on the value is, once again, a real vocab id like any other. This is why
+  // VERIFICATION needs no changes at all: Draft() always returns real vocab ids, whichever head
+  // produced them, and Model::VerifyWindow always checks them against the REAL model's own
+  // full-vocab lm_head (container_.LmHead(), never w.draft_lm_head) -- a draft the reduced head
+  // would only have made because its own subset omitted the correct token is simply an ordinary
+  // rejected draft (lower acceptance, exactly like a wrong full-vocab-head guess), never a wrong
+  // ACCEPTED one, so output quality cannot degrade by using this path. Silently falls back to the
+  // full-vocab head (identical to use_reduced_vocab=false) when w.HasDraftHead() is false, so a
+  // caller can request "reduced if available" unconditionally without checking the container itself.
   std::vector<int32_t> Draft(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                               const MtpWeights& w, const uint16_t* h_seed, int32_t seed_token,
                               const uint16_t* embed_table, const uint16_t* embed_table_dev,
                               int64_t vocab, const QuantLinear& lm_head, int64_t k,
-                              int64_t base_pos);
+                              int64_t base_pos, bool use_reduced_vocab = true);
 
   // Extends MTP's own KV cache (file comment) by `n` real positions [base_pos, base_pos+n), using
   // the REAL (h_i, t_{i+1}) pair at each position -- i.e. exactly Draft()'s own first-step
@@ -153,9 +168,21 @@ class MtpHead {
                                                       // gather fallback path only)
   core::DeviceBuffer<uint16_t> embed_staging_dev_;   // [hidden]
   core::DeviceBuffer<float> logits_dev_;             // [vocab] fp32 -- FinalLmHead's output
-  core::DeviceBuffer<int32_t> argmax_dev_;           // [1] -- this step's own on-device argmax;
-                                                      // also feeds the next step's device gather
-                                                      // directly when embed_table_dev != nullptr
+  core::DeviceBuffer<int32_t> argmax_dev_;           // [1] -- this step's own on-device argmax,
+                                                      // ALWAYS a real vocab id by the time it is
+                                                      // written (see subset_argmax_dev_ below for
+                                                      // the reduced-vocab head's extra hop to get
+                                                      // there); also feeds the next step's device
+                                                      // gather directly when embed_table_dev !=
+                                                      // nullptr
+  // Reduced-vocab draft head scratch (docs/r9700.md R9): argmax_dev_ must always hold a REAL vocab
+  // id (every other line of Draft()'s loop, and every caller of Draft(), assumes that) but the
+  // reduced head's own r4dx_argmax_f32 call only ever sees w.draft_vocab_ids.size() logits, so its
+  // result is a SUBSET-LOCAL index -- this one-element buffer holds that intermediate value for the
+  // one extra r4dx_gather_i32 hop (subset index -> real id, via w.draft_vocab_ids) that writes the
+  // real id into argmax_dev_ above. Unused (never allocated space needed beyond its fixed 1 element)
+  // on the full-vocab path.
+  core::DeviceBuffer<int32_t> subset_argmax_dev_;    // [1]
 
   // Device-resident draft loop scratch (docs/mtp.md "device-resident draft loop"): positions_dev_/
   // seqused_dev_ hold the WHOLE k-step window's RoPE-pos/KV-slot and seqused_k values, preloaded in

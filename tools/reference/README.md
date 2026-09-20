@@ -134,6 +134,35 @@ Key options (see `--help` for the rest): `--gdn-layer` / `--attn-layer` (default
 `--prefill-len` / `--decode-len` (default 64 / 4), `--tiny-vocab` (default 256), `--seed` (default
 1234), `--skip-mtp`.
 
+## vision_golden.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\vision_golden.py `
+    --device cuda --out-dir tools\reference\golden_out
+```
+
+The vision-tower analogue of `layer_golden.py` -- see `docs/vision.md` for the full architecture
+spec this script validates against. Builds `Qwen3_5VisionModel` directly from `modeling_qwen3_5.py`,
+loads real `model.visual.*` weights (333 tensors, all present in the real checkpoint), preprocesses
+a real image with the checkpoint's own configured `transformers.AutoImageProcessor`
+(`Qwen2VLImageProcessor`), and dumps `pixel_values`, every encoder block's output (27), block 0's
+full internal chain (norm1/qkv-raw/post-rope-q-k/proj-out/norm2/mlp-fc1/mlp-fc2), and the merger
+output. `--image <path>` uses a real photo; without it, a deterministic synthetic 448x448 test image
+is generated and saved to `<out-dir>/vision_test_image.png` for reproducibility. Output:
+`<out-dir>/vision_tower.safetensors` + `<out-dir>/vision_manifest.json` (same tolerance-table
+convention as `layer_golden.py`'s `manifest.json`, kept in a separate file since this rung has no
+text-layer components to share a manifest with).
+
+**Found and fixed while building this script**: `common.py`'s `ShardIndex.get_tensor`/
+`get_row_slice` had a real dangling-mmap bug (see `common.py`'s inline comment and `docs/vision.md`)
+that a tight loop over ~300+ tensors reproducibly turns into a Python interpreter crash (access
+violation) -- `layer_golden.py`'s/`kv_calibrate.py`'s much smaller per-component tensor counts never
+triggered it. Fixed with `.clone()`; every script in this directory benefits, no other script's own
+code changed.
+
+Runtime: ~15-25s on HIP device 1 (real weights, one 448x448 test image, 27 blocks).
+
 ## kv_calibrate.py
 
 ```powershell

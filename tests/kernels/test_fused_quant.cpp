@@ -28,6 +28,7 @@
 
 #include "kernels/model_kernels.h"
 #include "r4d.h"
+#include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
@@ -152,12 +153,64 @@ void CheckOne(const std::string& label, int epilogue, int M, int K, ProducerFn r
   }
 }
 
+// ArenaAlignmentInvariant -- Milestone 4 follow-up (docs/status.md's R2/P2 incident, root-caused
+// this pass): the ORIGINAL 135-check grid above never caught the real bug because every buffer it
+// allocates is its own isolated DeviceBuffer (each a fresh hipMalloc, which happens to come back
+// >=256-byte aligned) -- it never exercises r4dx::core::Arena, the shared bump allocator every real
+// model call site (GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward) actually carves its
+// epilogue scratch from. The real bug was an Arena::Alloc gap: it aligned each call's START but not
+// its END, so a `T`-float per-row scale scratch (T = chunk row count; not a multiple of 4 at decode
+// T=1 or MTP verify T=2..4) left the bump offset a few bytes short of 16 bytes, and every
+// allocation AFTER it in the same layer inherited that drift -- exactly the allocation sequence
+// GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward use (an epilogue's uint8 data buffer,
+// explicitly 16-aligned; its float[T] scale scratch, default-aligned; then the layer's own next
+// default-aligned buffer). This reproduces that exact sequence directly, host-side, for every T in
+// 1..64 (decode, MTP verify, and every prefill chunk width), asserting every subsequent pointer is
+// 16-byte aligned -- independent of any GPU kernel, so it fails immediately on a regression to the
+// pre-fix Arena::Alloc rather than needing a real-hardware generated-text divergence to notice it.
+void CheckArenaAlignmentInvariant() {
+  r4dx::core::Arena arena(4 << 20);  // 4 MiB, plenty for this synthetic sequence (max ~1 MiB used).
+  for (int64_t T = 1; T <= 64; ++T) {
+    arena.Reset();
+    // Mirrors gdn_layer.cpp/attention_layer.hpp/mlp.cpp's real sequence for a hidden=5120 block:
+    // (1) the epilogue's quantized-activation data buffer, explicitly 16-aligned (int8/fp8 element,
+    //     T*hidden bytes -- always a multiple of 16 since hidden=5120 is);
+    // (2) the epilogue's per-row fp32 scale scratch, T floats, DEFAULT-aligned (the buffer whose
+    //     size is NOT always a multiple of 16 -- this is the one that mattered);
+    // (3) the layer's own next default-aligned buffer (e.g. mixed_qkv, a uint16_t buffer) -- this
+    //     is the one a downstream libr4d kernel reads with an unchecked wide load.
+    constexpr int64_t kHidden = 5120;
+    uint8_t* data_buf = arena.Alloc<uint8_t>(static_cast<size_t>(T * kHidden), /*align_bytes=*/16);
+    float* scale_buf = arena.Alloc<float>(static_cast<size_t>(T));
+    uint16_t* next_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * kHidden));
+    // A second round in the same "layer" (mirrors Mlp::Forward's gate_up-epilogue THEN
+    // down-epilogue, two fused scale scratches per layer, not just one) to catch cumulative drift
+    // across more than one odd-sized allocation before Reset().
+    float* scale_buf2 = arena.Alloc<float>(static_cast<size_t>(T));
+    uint16_t* next_buf2 = arena.Alloc<uint16_t>(static_cast<size_t>(3 * T));
+
+    auto aligned16 = [](const void* p) {
+      return (reinterpret_cast<uintptr_t>(p) & 0xF) == 0;
+    };
+    Check(aligned16(data_buf), "ArenaAlignmentInvariant: data_buf not 16-aligned, T=" + std::to_string(T));
+    Check(aligned16(next_buf), "ArenaAlignmentInvariant: next_buf not 16-aligned (post scale[T]), T=" + std::to_string(T));
+    Check(aligned16(next_buf2), "ArenaAlignmentInvariant: next_buf2 not 16-aligned (post 2nd scale[T]), T=" + std::to_string(T));
+    (void)scale_buf;
+    (void)scale_buf2;
+  }
+  if (g_failures == 0) {
+    std::printf("  ok: ArenaAlignmentInvariant (T=1..64)\n");
+  }
+}
+
 }  // namespace
 
 int main() {
   R4DX_HIP_CHECK(hipSetDevice(0));
   std::mt19937 rng(1234);
   const float eps = 1e-6f;
+
+  CheckArenaAlignmentInvariant();
 
   const int Ms[] = {1, 2, 4, 16, 64};
   const int64_t Ks[] = {5120, 6144, 17408};

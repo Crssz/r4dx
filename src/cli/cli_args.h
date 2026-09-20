@@ -11,6 +11,13 @@
 
 namespace r4dx::cli {
 
+// Real ceiling for --mtp: Model::VerifyWindow (src/model/model.cpp) requires `candidates.size()
+// <= mtp_draft_k_+1`, and every candidate batch goes through the same <=max_chunk_(64)-row chunk
+// path RunChunk uses -- so mtp_draft_k_+1 <= 64, i.e. mtp <= 63. Duplicated in
+// src/server/server_args.h (kept in sync manually -- these two headers are already a deliberate,
+// documented duplication of every other --mtp* flag's parsing/validation, not a new pattern).
+inline constexpr int64_t kMaxMtpDraftK = 63;
+
 struct CliArgs {
   std::string model_path;
   std::string layout = "bf16";
@@ -25,7 +32,19 @@ struct CliArgs {
   float top_p = 1.0f;
   float min_p = 0.0f;
   uint64_t seed = 0;
-  int64_t max_ctx = 131072;
+  // docs/r9700.md R13 (2026-09-20, measured): the checkpoint's own config.json declares
+  // max_position_embeddings=262144 with rope_type "default" (no scaling trick needed) -- 262144
+  // positions are natively in-distribution for this model. The old 131072 default was a
+  // self-imposed cap at half the model's real capability, inherited from an early design decision
+  // and never revisited. Real hardware measurement (this same pass) shows the full 262144-token
+  // paged KV cache + GDN state costs 8.34 GiB (w4a16/w4a8) / 8.28 GiB (mxfp4) against a 31.86 GiB
+  // card that already holds ~15.5 GiB of weights (embedding mirror included) -- total 23.9-24.1
+  // GiB used, ~7.75 GiB (24%) still free at `--mtp 0`, ~6.83 GiB (21%) free at `--mtp 3`. Real
+  // end-to-end generation at 262144 tokens of actual prefilled context (haiku prompt + a needle
+  // retrieval fact, both padded with real corpus text) produced coherent, correct output --
+  // confirmed on real hardware, not capacity arithmetic. See docs/r9700.md's R13/Q17 entries and
+  // docs/perf.md's "Long-context validation" section for the full measurement.
+  int64_t max_ctx = 262144;
   bool stats = false;
   // tools/profile pass (2026-09-19): profiles exactly ONE decode step (Model::DecodeStepProfiled,
   // hipEvent-timed per op-family) right after the prompt's prefill, prints a table to stderr, then
@@ -53,7 +72,12 @@ struct CliArgs {
   // have no mtp.* weights, so a nonzero default would break --model pointed at any of them; the
   // task's own "K default 3" is the recommended value to pass explicitly once a --model container
   // was converted with --mtp on, not this flag's own default. Only used by --temperature 0
-  // (greedy) generation -- see main.cpp's RunTurn.
+  // (greedy) generation -- see main.cpp's RunTurn. Ceiling: 63 (kMaxMtpDraftK below) -- Model's
+  // VerifyWindow batches `mtp+1` candidates through the same <=64-row chunk path RunChunk uses
+  // (model.h's max_chunk_), so mtp+1 <= 64. VRAM cost is linear in K: the GDN window bank's
+  // rolling depth is `conv_width-2+(1+mtp)`, so widening K costs real, undocumented-until-now
+  // per-K device memory (measured ~2.3 GiB extra at K=16 against the real 64-layer container,
+  // review finding 2026-09-20) on top of whatever K=0's own fixed state already reserves.
   int64_t mtp = 0;
   // MTP head layout (docs/mtp.md "MTP head layout"): "layout" (default, measured faster in 23/24
   // K x layout configurations with no acceptance-rate cost -- see docs/mtp.md's table) loads the
@@ -62,6 +86,14 @@ struct CliArgs {
   // --layout (~0.5 GB extra VRAM, the exact-arithmetic form). No effect when --mtp is 0 or the
   // container has no mtp.* weights.
   std::string mtp_head_layout = "layout";
+  // Reduced-vocab draft head (docs/r9700.md R9, model.h's ModelOptions::mtp_draft_reduced_vocab):
+  // "reduced" (default) uses the container's OPTIONAL mtp.draft_head.* tensors (a smaller lm_head
+  // over a subset of the real vocabulary) to speed up drafting -- verification always stays
+  // full-vocab regardless, so this cannot change generated output, only speed/acceptance at wide K.
+  // "full" forces the exact pre-R9 full-vocab draft head, for an A/B comparison at matched K. No
+  // effect when --mtp is 0, the container has no mtp.* weights, or (silently) no draft_head.*
+  // tensors -- "reduced" degrades to the full-vocab behavior automatically in that last case.
+  std::string mtp_draft_head = "reduced";
   // Device-resident embedding gather (docs/mtp.md "device-resident draft loop", model.h's
   // ModelOptions::embed_device_resident): mirrors text.embed_tokens into VRAM (~2.37-2.54 GiB
   // depending on vocab/hidden) so decode/draft gathers on-device instead of a host memcpy+H2D per
@@ -87,7 +119,7 @@ inline std::string CliUsageText(const char* argv0) {
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
-         "[--embed-device-resident {on|off}]";
+         "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -151,6 +183,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--profile-prefill") a.profile_prefill = true;
     else if (arg == "--mtp") a.mtp = ParseI64("--mtp", NextCliArg(argc, argv, i, "--mtp"));
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextCliArg(argc, argv, i, "--mtp-head-layout");
+    else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextCliArg(argc, argv, i, "--mtp-draft-head");
     else if (arg == "--embed-device-resident") a.embed_device_resident = NextCliArg(argc, argv, i, "--embed-device-resident");
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
@@ -165,9 +198,16 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
-  if (a.mtp < 0) throw CliUsageError("--mtp must be >= 0");
+  if (a.mtp < 0 || a.mtp > kMaxMtpDraftK) {
+    throw CliUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftK) +
+                         "] (Model::VerifyWindow batches mtp+1 candidates through a <=64-row "
+                         "chunk)");
+  }
   if (a.mtp_head_layout != "bf16" && a.mtp_head_layout != "layout") {
     throw CliUsageError("--mtp-head-layout must be 'bf16' or 'layout'");
+  }
+  if (a.mtp_draft_head != "reduced" && a.mtp_draft_head != "full") {
+    throw CliUsageError("--mtp-draft-head must be 'reduced' or 'full'");
   }
   if (a.profile_token < 1) throw CliUsageError("--profile-token must be >= 1");
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
@@ -180,3 +220,4 @@ inline CliArgs ParseArgs(int argc, char** argv) {
 }
 
 }  // namespace r4dx::cli
+

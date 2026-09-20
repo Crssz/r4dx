@@ -142,10 +142,16 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
           return;
         }
         UsageStats usage{sink->prompt_tokens, sink->completion_tokens};
-        res.set_content(
-            BuildChatCompletionResponse(id, model_id, created, sink->text, sink->finish_reason, usage)
-                .dump(),
-            "application/json");
+        // `content` is JSON null (not "") only when the whole turn was a pure tool call with no
+        // accompanying prose -- OpenAI's own convention (openai_types.h's tool_calls-carrying
+        // BuildChatCompletionResponse overload doc comment).
+        const std::optional<std::string> content =
+            (!sink->tool_calls.empty() && sink->text.empty()) ? std::nullopt
+                                                                : std::optional<std::string>(sink->text);
+        res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
+                                                     sink->finish_reason, usage)
+                             .dump(),
+                         "application/json");
       }
     } catch (const ApiError& err) {
       RespondError(res, err);

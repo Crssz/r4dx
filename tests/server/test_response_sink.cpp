@@ -119,6 +119,56 @@ void TestStreamingSinkCancelStopsIteration() {
   CHECK(!sink.Next(event));  // queue closed, nothing was ever pushed
 }
 
+void TestBufferingSinkStoresToolCalls() {
+  BufferingSink sink;
+  sink.OnStart(5);
+  sink.OnToken("Let me check.");
+  sink.OnToolCalls({{"call_1", "get_current_weather", "{\"location\":\"Boston, MA\"}"}});
+  sink.OnDone("tool_calls", 10);
+  CHECK(sink.tool_calls.size() == 1);
+  CHECK(sink.tool_calls[0].id == "call_1");
+  CHECK(sink.finish_reason == "tool_calls");
+}
+
+void TestStreamingSinkToolCallsEmitsOneCompleteDelta() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-t", "m", 1);
+  sink.OnStart(3);
+  sink.OnToolCalls({{"call_1", "f", "{}"}});
+  sink.OnDone("tool_calls", 1);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(sink.Next(event));  // the whole tool_calls batch, one chunk
+  CHECK(event.find("\"tool_calls\"") != std::string::npos);
+  CHECK(event.find("\"name\":\"f\"") != std::string::npos);
+  CHECK(event.find("\"index\":0") != std::string::npos);
+
+  CHECK(sink.Next(event));  // finish_reason chunk
+  CHECK(event.find("\"finish_reason\":\"tool_calls\"") != std::string::npos);
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(!sink.Next(event));
+}
+
+void TestStreamingSinkOnToolCallsNoopWhenEmpty() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-u", "m", 1);
+  sink.OnStart(3);
+  sink.OnToolCalls({});  // no calls parsed -- must not enqueue an event
+  sink.OnDone("stop", 0);
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(sink.Next(event));  // straight to finish_reason, no tool_calls chunk in between
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+}
+
+void TestStreamingSinkOnToolCallsNoopForCompletionKind() {
+  StreamingSink sink(StreamingSink::Kind::kCompletion, "cmpl-t", "m", 1);
+  sink.OnToolCalls({{"call_1", "f", "{}"}});  // /v1/completions has no tool_calls concept
+  sink.OnDone("stop", 0);
+  std::string event;
+  CHECK(sink.Next(event));  // straight to finish_reason
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+}
+
 void TestStreamingSinkErrorEmitsAndCloses() {
   StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-e", "m", 1);
   sink.OnError(500, "boom");
@@ -136,6 +186,10 @@ int main() {
   TestBufferingSinkHappyPath();
   TestBufferingSinkError();
   TestBufferingSinkWaitBlocksUntilDone();
+  TestBufferingSinkStoresToolCalls();
+  TestStreamingSinkToolCallsEmitsOneCompleteDelta();
+  TestStreamingSinkOnToolCallsNoopWhenEmpty();
+  TestStreamingSinkOnToolCallsNoopForCompletionKind();
   TestStreamingSinkChatShapes();
   TestStreamingSinkCompletionShapesSkipRolePreamble();
   TestStreamingSinkEmptyTokenIsNoop();

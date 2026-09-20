@@ -6,6 +6,13 @@
 //                [--layouts mxfp4,w4a16,w4a8] [--lm-head 4bit+bf16]
 //                [--layers N] [--threads T] [--vision on|off] [--mtp on|off] [--no-bf16]
 //                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
+//                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
+//
+// --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
+// lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
+// "mtp.*") into the container for MtpHead::Draft's own drafting -- ignored unless --mtp is also on;
+// a container built without this flag simply has no draft_head.* tensors (old-container-compatible,
+// loader falls back to the full-vocab head automatically, src/model/container.cpp).
 //
 // --kv-calib fills text.layers.{i}.attn.k_descale/.v_descale (full-attention layers only) from a
 // tools/reference/kv_calibrate.py merged JSON: descale[head] = k_amax|v_amax[head] / 448.0 (see
@@ -142,6 +149,14 @@ struct AppArgs {
   int mtp = -1;
   bool no_bf16 = false;  // drop the bf16 layout for body weights even if --layouts/--lm-head asked
   std::string kv_calib;  // path to tools/reference/kv_calibrate.py's merged JSON; empty = no calib
+  // Reduced-vocab MTP draft head (docs/r9700.md R9): path to a JSON file `{"vocab_ids": [...]}`
+  // (real vocabulary ids, produced by tests/model/tool_vocab_calib.cpp's calibration pass) --
+  // when non-empty AND --mtp is on, slices those rows out of lm_head.weight and emits them as
+  // mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids (docs/container-format.md "mtp.*").
+  // Empty (default): no draft_head.* tensors are written -- MtpHead::Draft falls back to the
+  // full-vocab head unconditionally, byte-identical to every container built before this flag
+  // existed.
+  std::string draft_vocab_ids;
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -175,6 +190,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--mtp") a.mtp = ParseOnOff(next(i), "--mtp");
     else if (arg == "--no-bf16") a.no_bf16 = true;
     else if (arg == "--kv-calib") a.kv_calib = next(i);
+    else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
     else throw std::runtime_error("unknown argument: " + arg);
   }
   return a;
@@ -410,6 +426,58 @@ int RunConvert(const AppArgs& args) {
     add_bf16("mtp.norm.weight", "mtp.norm");
     add_bf16("mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_embedding");
     add_bf16("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden");
+
+    // Reduced-vocab draft head (docs/r9700.md R9): OPTIONAL, only when the caller supplied a
+    // calibration-chosen vocabulary subset (tests/model/tool_vocab_calib.cpp's own output JSON).
+    // `mtp.draft_head.lm_head` is planned/emitted through the SAME PlanLinearLayouts/
+    // EmitLinearLayouts helpers every other quantized linear uses (a plain [draft_vocab_size,
+    // hidden] slice of lm_head.weight's ROWS, same K as the real lm_head), in the same LayoutSet as
+    // every other mtp.* head linear (`layouts`) so Container::Load's mtp_head_layout selection at
+    // load time works identically to mtp.attn.qg/o and mtp.mlp.gate_up/down. `vocab_ids` is a plain
+    // raw int32 tensor (subset index -> real vocab id), written directly (not through
+    // EncodeFp32/EncodeBf16 -- it is already the on-disk bit pattern, no dtype conversion needed).
+    if (!args.draft_vocab_ids.empty()) {
+      const nlohmann::json ids_json = nlohmann::json::parse(ReadFile(args.draft_vocab_ids));
+      const std::vector<int64_t> draft_ids = ids_json.at("vocab_ids").get<std::vector<int64_t>>();
+      if (draft_ids.empty()) {
+        throw std::runtime_error("--draft-vocab-ids: 'vocab_ids' array is empty in " +
+                                  args.draft_vocab_ids);
+      }
+      const int64_t draft_vocab_size = static_cast<int64_t>(draft_ids.size());
+      std::cout << "[r4dx-convert] draft-vocab-ids=" << args.draft_vocab_ids << " ("
+                << draft_vocab_size << " ids)\n";
+
+      plan_jobs.push_back([&writer, &model, draft_vocab_size, layouts]() {
+        const auto& m = model.Meta("lm_head.weight");
+        const int64_t hidden_k = m.shape[1];
+        r4dx_convert::PlanLinearLayouts(writer, "mtp.draft_head.lm_head",
+                                         static_cast<int>(draft_vocab_size),
+                                         static_cast<int>(hidden_k), layouts);
+        writer.Plan("mtp.draft_head.vocab_ids", {draft_vocab_size, 4},
+                    static_cast<uint64_t>(draft_vocab_size) * 4);
+      });
+      emit_jobs.push_back([&writer, &model, draft_ids, layouts, threads]() {
+        const auto full = r4dx_convert::ReadTensorAsFloat(model, "lm_head.weight");
+        const int64_t hidden_k = model.Meta("lm_head.weight").shape[1];
+        const int64_t vocab_full = static_cast<int64_t>(full.size()) / hidden_k;
+        std::vector<float> sliced(draft_ids.size() * static_cast<size_t>(hidden_k));
+        std::vector<int32_t> ids32(draft_ids.size());
+        for (size_t i = 0; i < draft_ids.size(); ++i) {
+          const int64_t id = draft_ids[i];
+          if (id < 0 || id >= vocab_full) {
+            throw std::runtime_error("--draft-vocab-ids: id " + std::to_string(id) +
+                                      " out of range [0," + std::to_string(vocab_full) + ")");
+          }
+          std::copy(full.begin() + id * hidden_k, full.begin() + (id + 1) * hidden_k,
+                    sliced.begin() + static_cast<int64_t>(i) * hidden_k);
+          ids32[i] = static_cast<int32_t>(id);
+        }
+        r4dx_convert::EmitLinearLayouts(writer, "mtp.draft_head.lm_head", sliced,
+                                         static_cast<int>(draft_ids.size()),
+                                         static_cast<int>(hidden_k), layouts, threads);
+        writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
+      });
+    }
   }
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -439,6 +507,9 @@ int RunConvert(const AppArgs& args) {
       {"mtp.attn.k|v", "bf16 (when --mtp on)"},
       {"mtp.mlp.gate_up|down", "mxfp4|w4a16|w4a8|bf16 (all four present, when --mtp on)"},
       {"mtp.fc|norm|pre_fc_norm_embedding|pre_fc_norm_hidden", "bf16 (when --mtp on)"},
+      {"mtp.draft_head.lm_head", "mxfp4|w4a16|w4a8|bf16 (all four present, OPTIONAL -- only when "
+                                  "--draft-vocab-ids was given, docs/r9700.md R9)"},
+      {"mtp.draft_head.vocab_ids", "raw int32[draft_vocab_size] (OPTIONAL, same condition)"},
       {"lm_head", "mxfp4|w4a16|w4a8|bf16 (all four present)"},
   };
   metadata["quant"] = BuildQuantMetadata();
@@ -452,6 +523,9 @@ int RunConvert(const AppArgs& args) {
       {"lm_head", args.lm_head_spec},
       {"threads", threads},
       {"kv_calib", have_kv_calib ? args.kv_calib : std::string("none (descale placeholder 1.0)")},
+      {"draft_vocab_ids",
+       args.draft_vocab_ids.empty() ? std::string("none (no reduced-vocab draft head)")
+                                     : args.draft_vocab_ids},
   };
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "

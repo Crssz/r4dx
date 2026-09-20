@@ -116,8 +116,193 @@ void TestChatEmptyMessagesThrows() {
 }
 
 void TestChatUnsupportedRoleThrows() {
-  json body = {{"messages", json::array({{{"role", "tool"}, {"content", "x"}}})}};
+  json body = {{"messages", json::array({{{"role", "carrier_pigeon"}, {"content", "x"}}})}};
   CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+// ---- tool/function roles + tool_calls (task point 4: accepting tool results) ------------------
+
+void TestChatToolRoleRequiresToolCallId() {
+  json body = {{"messages", json::array({{{"role", "tool"}, {"content", "72F"}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatToolRoleAccepted() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "weather?"}},
+                                          {{"role", "tool"}, {"content", "72F, sunny"},
+                                           {"tool_call_id", "call_abc"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.messages.size() == 2);
+  CHECK(req.messages[1].role == "tool");
+  CHECK(req.messages[1].content == "72F, sunny");
+  CHECK(req.messages[1].tool_call_id.has_value() && *req.messages[1].tool_call_id == "call_abc");
+}
+
+void TestChatFunctionRoleRequiresName() {
+  json body = {{"messages", json::array({{{"role", "function"}, {"content", "72F"}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatFunctionRoleAccepted() {
+  json body = {{"messages", json::array({{{"role", "function"}, {"content", "72F"},
+                                           {"name", "get_current_weather"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.messages[0].name.has_value() && *req.messages[0].name == "get_current_weather");
+}
+
+void TestChatAssistantToolCallsRoundTrip() {
+  json body = {{"messages",
+                json::array({{{"role", "user"}, {"content", "weather?"}},
+                              {{"role", "assistant"},
+                               {"content", nullptr},
+                               {"tool_calls",
+                                json::array({{{"id", "call_1"},
+                                              {"type", "function"},
+                                              {"function",
+                                               {{"name", "get_current_weather"},
+                                                {"arguments", "{\"location\":\"Boston, MA\"}"}}}}})}},
+                              {{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "72F"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.messages.size() == 3);
+  CHECK(!req.messages[1].content.has_value());
+  CHECK(req.messages[1].tool_calls.size() == 1);
+  CHECK(req.messages[1].tool_calls[0].id == "call_1");
+  CHECK(req.messages[1].tool_calls[0].name == "get_current_weather");
+  CHECK(nlohmann::json::parse(req.messages[1].tool_calls[0].arguments_json).at("location") == "Boston, MA");
+}
+
+void TestChatAssistantToolCallsGeneratesIdWhenMissing() {
+  json body = {{"messages",
+                json::array({{{"role", "assistant"},
+                               {"content", nullptr},
+                               {"tool_calls",
+                                json::array({{{"type", "function"},
+                                              {"function", {{"name", "f"}, {"arguments", "{}"}}}}})}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(!req.messages[0].tool_calls[0].id.empty());
+}
+
+void TestChatAssistantMissingContentAndToolCallsThrows() {
+  json body = {{"messages", json::array({{{"role", "assistant"}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatToolCallsArgumentsMustBeJsonObjectString() {
+  json body = {{"messages",
+                json::array({{{"role", "assistant"},
+                               {"content", nullptr},
+                               {"tool_calls",
+                                json::array({{{"type", "function"},
+                                              {"function", {{"name", "f"}, {"arguments", "not json"}}}}})}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+
+  json body2 = {{"messages",
+                 json::array({{{"role", "assistant"},
+                                {"content", nullptr},
+                                {"tool_calls",
+                                 json::array({{{"type", "function"},
+                                               {"function", {{"name", "f"}, {"arguments", "[1,2]"}}}}})}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body2); }, 400));
+}
+
+// ---- tool_choice (task point 5) ----------------------------------------------------------------
+
+json OneToolBody(json extra) {
+  json body = {
+      {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+      {"tools", json::array({{{"type", "function"}, {"function", {{"name", "get_current_weather"},
+                                                                    {"parameters", json::object()}}}},
+                               {{"type", "function"}, {"function", {{"name", "get_time"},
+                                                                    {"parameters", json::object()}}}}})}};
+  body.update(extra);
+  return body;
+}
+
+void TestToolChoiceNoneClearsTools() {
+  const auto req = ParseChatCompletionRequest(OneToolBody({{"tool_choice", "none"}}));
+  CHECK(req.tools.empty());
+}
+
+void TestToolChoiceAutoLeavesToolsUntouched() {
+  const auto req = ParseChatCompletionRequest(OneToolBody({{"tool_choice", "auto"}}));
+  CHECK(req.tools.size() == 2);
+}
+
+void TestToolChoiceDefaultIsAutoLeavesToolsUntouched() {
+  const auto req = ParseChatCompletionRequest(OneToolBody(json::object()));
+  CHECK(req.tools.size() == 2);
+}
+
+void TestToolChoiceRequiredNeedsNonEmptyTools() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"tool_choice", "required"}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+
+  const auto req = ParseChatCompletionRequest(OneToolBody({{"tool_choice", "required"}}));
+  CHECK(req.tools.size() == 2);  // required does not filter, just needs >=1 tool present
+}
+
+void TestToolChoiceNamedFiltersToJustThatTool() {
+  const auto req = ParseChatCompletionRequest(
+      OneToolBody({{"tool_choice", {{"type", "function"}, {"function", {{"name", "get_time"}}}}}}));
+  CHECK(req.tools.size() == 1);
+  CHECK(req.tools[0].at("function").at("name") == "get_time");
+}
+
+void TestToolChoiceNamedUnknownFunctionThrows() {
+  CHECK(ThrowsApiError(
+      [&] {
+        ParseChatCompletionRequest(
+            OneToolBody({{"tool_choice", {{"type", "function"}, {"function", {{"name", "nope"}}}}}}));
+      },
+      400));
+}
+
+void TestToolChoiceUnrecognizedStringThrows() {
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(OneToolBody({{"tool_choice", "sometimes"}})); }, 400));
+}
+
+void TestToolChoiceMalformedObjectThrows() {
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(OneToolBody({{"tool_choice", json::object()}})); }, 400));
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(OneToolBody({{"tool_choice", 5}})); }, 400));
+}
+
+// ---- tools[] shape validation (review finding, 2026-09-20) --------------------------------------
+// Previously only `tools` itself being an array was checked -- an individual malformed entry
+// reached chat_template.jinja unvalidated (raising there, an uninformative 500) AND silently
+// disabled DropUnknownToolCalls's undefined-tool filter (engine.cpp's `known_names` comes out
+// empty when `t.at("function").at("name")` doesn't exist, and an empty known_names list is
+// DropUnknownToolCalls's own "no filter configured" no-op case).
+void TestToolsArrayEntryNotObjectThrows() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"tools", json::array({1, 2})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestToolsArrayEntryMissingFunctionThrows() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"tools", json::array({{{"type", "function"}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestToolsArrayEntryFunctionMissingNameThrows() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"tools", json::array({{{"type", "function"}, {"function", json::object()}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestToolsArrayEntryWrongTypeThrows() {
+  json body = {
+      {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+      {"tools", json::array({{{"type", "not_function"}, {"function", {{"name", "f"}}}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestToolsArrayWellFormedEntriesAccepted() {
+  // Regression guard: the new validation must not reject the shape every other tools[] test in
+  // this file already relies on.
+  const auto req = ParseChatCompletionRequest(OneToolBody(json::object()));
+  CHECK(req.tools.size() == 2);
 }
 
 void TestChatMissingContentThrows() {
@@ -194,6 +379,45 @@ void TestBuildChatCompletionResponse() {
   CHECK(resp.at("usage").at("total_tokens") == 10);
 }
 
+void TestBuildToolCallsJson() {
+  const json arr = BuildToolCallsJson({{"call_1", "get_current_weather", "{\"location\":\"Boston, MA\"}"}});
+  CHECK(arr.size() == 1);
+  CHECK(arr[0].at("index") == 0);
+  CHECK(arr[0].at("id") == "call_1");
+  CHECK(arr[0].at("type") == "function");
+  CHECK(arr[0].at("function").at("name") == "get_current_weather");
+  // arguments is a STRING, not an object -- the field this task flagged as "trips people up".
+  CHECK(arr[0].at("function").at("arguments").is_string());
+  CHECK(nlohmann::json::parse(arr[0].at("function").at("arguments").get<std::string>()).at("location") ==
+        "Boston, MA");
+}
+
+void TestBuildChatCompletionResponseWithToolCalls() {
+  UsageStats usage{10, 5};
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, std::nullopt,
+                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage);
+  const json& msg = resp.at("choices")[0].at("message");
+  CHECK(msg.at("content").is_null());
+  CHECK(msg.at("tool_calls").size() == 1);
+  CHECK(msg.at("tool_calls")[0].at("function").at("name") == "f");
+  CHECK(resp.at("choices")[0].at("finish_reason") == "tool_calls");
+}
+
+void TestBuildChatCompletionResponseWithProseAndToolCalls() {
+  UsageStats usage{10, 5};
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, std::string("Let me check."),
+                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage);
+  CHECK(resp.at("choices")[0].at("message").at("content") == "Let me check.");
+  CHECK(resp.at("choices")[0].at("message").at("tool_calls").size() == 1);
+}
+
+void TestBuildChatCompletionResponseNoToolCallsOmitsField() {
+  UsageStats usage{1, 1};
+  const json resp =
+      BuildChatCompletionResponse("id1", "m", 42, std::string("hi"), {}, "stop", usage);
+  CHECK(!resp.at("choices")[0].at("message").contains("tool_calls"));
+}
+
 void TestBuildChatCompletionChunk() {
   const json chunk = BuildChatCompletionChunk("id1", "m", 42, {{"content", "hi"}}, std::nullopt);
   CHECK(chunk.at("object") == "chat.completion.chunk");
@@ -240,6 +464,27 @@ int main() {
   TestChatMissingMessagesThrows();
   TestChatEmptyMessagesThrows();
   TestChatUnsupportedRoleThrows();
+  TestChatToolRoleRequiresToolCallId();
+  TestChatToolRoleAccepted();
+  TestChatFunctionRoleRequiresName();
+  TestChatFunctionRoleAccepted();
+  TestChatAssistantToolCallsRoundTrip();
+  TestChatAssistantToolCallsGeneratesIdWhenMissing();
+  TestChatAssistantMissingContentAndToolCallsThrows();
+  TestChatToolCallsArgumentsMustBeJsonObjectString();
+  TestToolChoiceNoneClearsTools();
+  TestToolChoiceAutoLeavesToolsUntouched();
+  TestToolChoiceDefaultIsAutoLeavesToolsUntouched();
+  TestToolChoiceRequiredNeedsNonEmptyTools();
+  TestToolChoiceNamedFiltersToJustThatTool();
+  TestToolChoiceNamedUnknownFunctionThrows();
+  TestToolChoiceUnrecognizedStringThrows();
+  TestToolChoiceMalformedObjectThrows();
+  TestToolsArrayEntryNotObjectThrows();
+  TestToolsArrayEntryMissingFunctionThrows();
+  TestToolsArrayEntryFunctionMissingNameThrows();
+  TestToolsArrayEntryWrongTypeThrows();
+  TestToolsArrayWellFormedEntriesAccepted();
   TestChatMissingContentThrows();
   TestChatBadSamplingRangesThrow();
   TestChatNotAnObjectThrows();
@@ -249,6 +494,10 @@ int main() {
   TestCompletionPromptWrongTypeThrows();
   TestBuildModelsResponse();
   TestBuildChatCompletionResponse();
+  TestBuildToolCallsJson();
+  TestBuildChatCompletionResponseWithToolCalls();
+  TestBuildChatCompletionResponseWithProseAndToolCalls();
+  TestBuildChatCompletionResponseNoToolCallsOmitsField();
   TestBuildChatCompletionChunk();
   TestBuildCompletionResponseAndChunk();
   TestGenerateRequestIdPrefixAndUniqueness();

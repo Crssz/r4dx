@@ -35,7 +35,7 @@ void TestMinimalPrompt() {
   CHECK(a.prompt == "hello");
   CHECK(!a.chat);
   CHECK(a.max_tokens == 128);
-  CHECK(a.max_ctx == 131072);
+  CHECK(a.max_ctx == 262144);  // docs/r9700.md R13: raised from 131072, the model's real ceiling
   CHECK(!a.thinking);
 }
 
@@ -206,6 +206,64 @@ void TestEmbedDeviceResidentFlag() {
   }
 }
 
+// --mtp-draft-head (docs/r9700.md R9, "reduced-vocab draft head"): defaults to "reduced", accepts
+// "full", rejects anything else -- mirrors TestMtpHeadLayoutFlag's shape for the sibling flag.
+void TestMtpDraftHeadFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_draft_head == "reduced");  // default
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli",  "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt",  "hi",      "--mtp", "3",
+                                         "--mtp-draft-head", "full"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_draft_head == "full");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli",  "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt",  "hi",      "--mtp-draft-head", "bogus"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::cli::CliUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
+// --mtp upper bound (review finding, 2026-09-20): Model::VerifyWindow requires mtp+1 candidates
+// to fit in a <=64-row chunk, so the real ceiling is 63 -- previously only `>= 0` was checked, so
+// e.g. --mtp 64 was accepted by the parser and only failed much later, deep inside Model::Load,
+// with an uninformative "bad allocation".
+void TestMtpUpperBound() {
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi",      "--mtp", "63"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp == 63);  // the ceiling itself must still be accepted
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi",      "--mtp", "64"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::cli::CliUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -219,6 +277,8 @@ int main() {
   TestUnparseableNumberThrowsCliUsageError();
   TestNonsensicalValuesThrow();
   TestEmbedDeviceResidentFlag();
+  TestMtpDraftHeadFlag();
+  TestMtpUpperBound();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

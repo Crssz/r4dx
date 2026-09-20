@@ -81,6 +81,13 @@ Both layers' post-norm activations and MLP output are captured too (`post_input_
 These mirror `tests/smoke_r4d.cpp`'s existing `rel_err < 2e-2` bf16-GEMM bound; don't invent a new
 number per kernel without a reason recorded here.
 
+`tools/reference/vision_golden.py` is this rung's vision-tower sibling (2026-09-20, `docs/vision.md`):
+same conventions (real weights, `manifest.json`, the same tolerance table), covering patch embed,
+all 27 encoder blocks (plus block 0's full internal kernel-granularity chain), and the merger, for a
+real (synthetic but structured) test image processed through the checkpoint's actual configured
+image processor. No `src/model` code exists yet to diff against it -- see `docs/vision.md`'s
+"What's done / what's not" for the exact state.
+
 `tools/reference/kv_calibrate.py` is the same rung's sibling for the fp8 KV descale tables:
 per-kv-head `amax` of K (post-rope) and V for a full-attention layer, which the converter turns
 into `text.layers.{i}.attn.k_descale`/`.v_descale` (`amax / 448.0`, fp8 e4m3 max). It's explicitly
@@ -156,9 +163,18 @@ needs to be pinned down empirically once `src/model`'s layer graph exists, not g
 
 ## Rung 5 -- generation sanity
 
-Not yet built. Feed a real prompt through the CLI (`src/cli`, once it exists) at a real context
-length (hundreds to thousands of tokens, exercising chunked prefill and the paged KV cache for
-real) and read the output: coherent English, no repetition collapse, no garbage tokens. This is a
-human-in-the-loop check, not a `rel_err` number -- it catches integration bugs (off-by-one in the
-paged block indexing, a wrong RoPE section boundary, a GDN state that's silently zeroed between
-chunks) that per-tensor diffs at rungs 3-4 can miss because they test one call in isolation.
+Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass
+(docs/r9700.md R13 + Q17), exercised up to the model's own native 262144-token context ceiling, not
+just "hundreds to thousands of tokens" -- real prompts (docs/perf.md's standard haiku prompt, and a
+needle-retrieval prompt with a distinctive fact stated near the start of the document and asked for
+at the end) padded with real corpus text to reach 2k/8k/32k/131072/262144 tokens, through the real
+chat template, chunked prefill, and paged KV cache. Result: coherent English, no repetition
+collapse, no garbage tokens, and correct needle recall at every context length tested, including
+262144 real prefilled tokens -- this is exactly the "off-by-one in paged block indexing / wrong
+RoPE section boundary / silently-zeroed GDN state" class of bug this rung exists to catch, and it
+did not fire at any tested context length. `--mtp 3` reproduced byte-identical text to `--mtp 0` at
+every context length, an additional cross-check that MTP's window bookkeeping stays correct this
+far out too. Full data, exact prompts, and transcripts: `docs/perf.md`'s "Long-context validation"
+section. Not yet done: a systematic needle-position sweep (fact at 10%/50%/90% depth, multiple
+distinct facts) -- this pass used one prompt design per context length, sufficient to show position
+handling works at all, not a full needle-in-a-haystack accuracy curve.

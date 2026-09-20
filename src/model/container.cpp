@@ -87,6 +87,13 @@ core::DeviceBuffer<uint32_t> UploadRawU32(const SafetensorsReader& r, const std:
   return buf;
 }
 
+core::DeviceBuffer<int32_t> UploadRawI32(const SafetensorsReader& r, const std::string& name) {
+  const int64_t n = ElemCountBySize(r, name, 4);
+  core::DeviceBuffer<int32_t> buf(static_cast<size_t>(n));
+  buf.CopyFromHost(reinterpret_cast<const int32_t*>(r.Data(name)), static_cast<size_t>(n));
+  return buf;
+}
+
 // gdn.norm_weight is stored bf16 (docs/container-format.md), but both consumers
 // (r4d_gdn_gated_rmsnorm_h128_bf16, r4d_gdn_recurrent_update_*) take a float* -- widen on load
 // once rather than every layer call.
@@ -341,6 +348,25 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     mw.norm = UploadRawU16(reader, "mtp.norm");
     mw.pre_fc_norm_hidden = UploadRawU16(reader, "mtp.pre_fc_norm_hidden");
     mw.pre_fc_norm_embedding = UploadRawU16(reader, "mtp.pre_fc_norm_embedding");
+
+    // Reduced-vocab draft head (docs/r9700.md R9, container.h's MtpWeights own doc comment):
+    // OPTIONAL, probed the same way HasMtp() probes for mtp.* itself -- present only when the
+    // container was converted with `--draft-vocab-ids` (r4dx-convert). `mtp.draft_head.vocab_ids`
+    // is the source of truth for the subset size (its own element count), read FIRST so the
+    // subsequent LoadQuantLinear call knows N without a separate metadata round-trip; an old
+    // container (or a run that omitted --draft-vocab-ids) simply lacks this tensor, leaving
+    // draft_lm_head.N == 0 (HasDraftHead() false) -- MtpHead::Draft's own fallback then runs the
+    // exact pre-R9 full-vocab path, unconditionally correct for every container ever produced.
+    if (reader.Has("mtp.draft_head.vocab_ids")) {
+      mw.draft_vocab_ids = UploadRawI32(reader, "mtp.draft_head.vocab_ids");
+      const int64_t draft_vocab_size = static_cast<int64_t>(mw.draft_vocab_ids.size());
+      // Same mtp_head_layout as every other mtp.* quantized linear (container.h's own comment on
+      // why: the draft head's error compounds across chained draft steps) -- a run that chose to
+      // build a draft head always emits it in the same LayoutSet as mtp.attn.qg/o and
+      // mtp.mlp.gate_up/down, so this load-time layout selection just works.
+      mw.draft_lm_head =
+          LoadQuantLinear(reader, "mtp.draft_head.lm_head", mtp_head_layout, draft_vocab_size, hidden);
+    }
     c.mtp_ = std::move(mw);
   }
 

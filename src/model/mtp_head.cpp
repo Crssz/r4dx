@@ -38,6 +38,7 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
       embed_staging_dev_(static_cast<size_t>(cfg.hidden_size)),
       logits_dev_(static_cast<size_t>(cfg.vocab_size)),
       argmax_dev_(1),
+      subset_argmax_dev_(1),
       positions_dev_(static_cast<size_t>(max_draft)),
       positions_host_(static_cast<size_t>(max_draft)),
       seqused_dev_(static_cast<size_t>(max_draft)),
@@ -64,7 +65,7 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
                                      const uint16_t* h_seed, int32_t seed_token,
                                      const uint16_t* embed_table, const uint16_t* embed_table_dev,
                                      int64_t vocab, const QuantLinear& lm_head, int64_t k,
-                                     int64_t base_pos) {
+                                     int64_t base_pos, bool use_reduced_vocab) {
   std::vector<int32_t> drafts;
   if (k <= 0) return drafts;
   if (k > max_draft_) {
@@ -77,6 +78,13 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
   const float eps = static_cast<float>(cfg.rms_norm_eps);
   const hipStream_t s = stream.get();
   const bool device_resident = (embed_table_dev != nullptr);
+  // Reduced-vocab draft head (docs/r9700.md R9, this method's own .h doc comment): active only when
+  // the caller asked for it AND the container actually has one -- an old container (or a run
+  // converted without --draft-vocab-ids) simply has draft_lm_head.N==0, so this unconditionally
+  // degrades to the pre-R9 full-vocab path with no caller-visible difference beyond speed.
+  const bool reduced_vocab = use_reduced_vocab && w.HasDraftHead();
+  const QuantLinear& draft_head = reduced_vocab ? w.draft_lm_head : lm_head;
+  const int64_t draft_head_vocab = reduced_vocab ? w.draft_vocab_ids.size() : vocab;
 
   // Preload this WHOLE draft window's positions/seqused_k in one H2D upload each -- was one
   // blocking CopyFromHost per step (device-resident draft loop, docs/mtp.md). Done unconditionally
@@ -161,12 +169,36 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
     Mlp mlp(cfg, w.layer.post_attention_layernorm, w.layer.mlp);
     mlp.Forward(stream, arena, attn_out, h_out, /*T=*/1);
 
-    // ---- mtp.norm -> shared lm_head -> greedy argmax (device) --------------------------------
-    FinalLmHead head(cfg, w.norm, lm_head);
+    // ---- mtp.norm -> draft lm_head (reduced-vocab if available/requested, else the shared
+    // full-vocab one) -> greedy argmax (device) -- see this method's .h doc comment for why using
+    // the reduced head here can only ever LOWER acceptance, never produce a wrong ACCEPTED token
+    // (verification always re-checks against the real model's own full-vocab head, never this one).
+    // FinalLmHead is fully generic in its own lm_head's row count (final_lm_head.cpp's Forward
+    // reads `lm_head_.N` as the vocab it produces), so the reduced head is just a smaller QuantLinear
+    // fed through the exact same GEMM path -- no separate kernel needed for the GEMM itself.
+    // logits_dev_ is sized for the FULL vocab (ctor) and the reduced head only ever needs its first
+    // draft_head_vocab elements, so reusing it here is always in-bounds either way.
+    FinalLmHead head(cfg, w.norm, draft_head);
     head.Forward(stream, arena, h_out, logits_dev_.data(), /*T=*/1);
-    r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
-                     reinterpret_cast<int64_t>(argmax_dev_.data()), vocab,
-                     reinterpret_cast<int64_t>(s));
+    if (reduced_vocab) {
+      // logits_dev_[0..draft_head_vocab) holds this step's SUBSET logits -- argmax over exactly
+      // that many elements gives a subset-LOCAL index, not a real vocab id yet.
+      r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                       reinterpret_cast<int64_t>(subset_argmax_dev_.data()), draft_head_vocab,
+                       reinterpret_cast<int64_t>(s));
+      // One device-side hop (no host sync) maps that subset-local index back to a real vocab id via
+      // w.draft_vocab_ids -- from here on, argmax_dev_ holds a real vocab id exactly like the
+      // full-vocab path always has, so every line below this point (device-resident chaining,
+      // draft_ids_dev_ accumulation, the host-gather fallback's own D2H) is completely unchanged.
+      r4dx_gather_i32(reinterpret_cast<int64_t>(w.draft_vocab_ids.data()),
+                       reinterpret_cast<int64_t>(subset_argmax_dev_.data()),
+                       reinterpret_cast<int64_t>(argmax_dev_.data()), /*n=*/1, draft_head_vocab,
+                       reinterpret_cast<int64_t>(s));
+    } else {
+      r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                       reinterpret_cast<int64_t>(argmax_dev_.data()), draft_head_vocab,
+                       reinterpret_cast<int64_t>(s));
+    }
 
     if (device_resident) {
       // D2D, not D2H -- stays entirely on-device, ordered after this step's own argmax write by

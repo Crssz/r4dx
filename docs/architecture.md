@@ -158,7 +158,8 @@ Layout matches `R4DArgs.kv` exactly (`r4d.h:44-58`): `(num_blocks, kv_heads, blo
 (`kv_block_stride` between blocks, `kv_head_stride` between heads inside a block). Descales are
 static per-(layer, head): `text.layers.{i}.attn.k_descale` / `.v_descale`,
 `fp32[kv_heads]`, calibration placeholder `1.0` (docs/container-format.md). Default max context
-131072 tokens = 8192 blocks/sequence at block size 16.
+262144 tokens = 16384 blocks/sequence at block size 16 (raised from 131072 -- "Long-context
+validation", docs/status.md/docs/perf.md; corrected here per review finding, 2026-09-20).
 
 ## GDN state
 

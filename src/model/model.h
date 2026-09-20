@@ -38,7 +38,11 @@ struct ModelOptions {
   std::string container_path;
   Layout layout = Layout::kBf16;       // body layout: GDN in_proj/out_proj, MLP gate_up/down,
                                         // lm_head (attn.qg/o are always bf16 -- see container.cpp)
-  int64_t max_ctx = 131072;            // KV cache capacity per full-attention layer, in tokens
+  // KV cache capacity per full-attention layer, in tokens. 262144 matches the checkpoint's own
+  // config.json max_position_embeddings (docs/r9700.md R13, 2026-09-20 measurement) -- raised from
+  // a stale 131072 self-imposed cap once real hardware showed the full 262144-token allocation
+  // still leaves 21-24% of the card's VRAM free. See src/cli/cli_args.h's matching comment.
+  int64_t max_ctx = 262144;
   int64_t layer_limit = -1;            // -1 = load Config().num_hidden_layers; >=0 for test
                                         // containers with fewer layers on disk
   // MTP self-speculation (docs/mtp.md): draft this many tokens per step via the container's mtp.*
@@ -59,6 +63,20 @@ struct ModelOptions {
   // (~0.5 GB extra VRAM). Ignored (no effect, no extra VRAM) when the container has no mtp.*
   // weights.
   std::optional<Layout> mtp_head_layout = std::nullopt;
+  // Reduced-vocab draft head (docs/r9700.md R9, docs/mtp.md "reduced-vocab draft head"): use the
+  // container's OPTIONAL mtp.draft_head.* tensors (a smaller lm_head over a subset of the real
+  // vocabulary) for MtpHead::Draft's own per-draft-token lm_head GEMM+argmax instead of the full
+  // shared lm_head -- cuts the dominant cost of wide speculation (each drafted token otherwise pays
+  // the FULL 248320-entry lm_head, docs/r9700.md §2.2's draft-side byte budget). Purely a drafting
+  // SPEED lever: verification (Model::VerifyWindow) always runs the real model's full-vocab
+  // lm_head regardless of this flag, so a draft the reduced head could not have produced (its own
+  // subset omitted the correct token) is simply a rejected draft -- lower acceptance at high K,
+  // never a wrong ACCEPTED token (see MtpHead::Draft's own doc comment for the full argument).
+  // Default true: use the reduced head whenever the container has one (Container::Mtp().
+  // HasDraftHead()); has zero effect on a container converted without --draft-vocab-ids. Set false
+  // (CLI/server: `--mtp-draft-head full`) to force the exact-full-vocab draft head for an A/B
+  // acceptance/tok-s comparison against the reduced head at matched K (docs/r9700.md task item 5).
+  bool mtp_draft_reduced_vocab = true;
   // Device-resident draft loop (docs/mtp.md "device-resident draft loop", docs/r9700.md P3):
   // mirror text.embed_tokens into VRAM (~2.37-2.54 GiB bf16, depending on vocab/hidden -- see
   // docs/status.md's VRAM correction note for the measured delta) so the decode/draft path can
@@ -198,6 +216,15 @@ class Model {
   // True iff this Model was Load()'d with mtp_draft_k > 0 (and the container had mtp.* weights).
   bool MtpEnabled() const { return static_cast<bool>(mtp_); }
 
+  // Diagnostic/measurement accessor (docs/r9700.md R9 task item 5, "report reduced-vs-full
+  // acceptance at matched K"): true iff every subsequent DecodeStepMtpGreedy call on this Model will
+  // actually use the reduced-vocab draft head (both ModelOptions::mtp_draft_reduced_vocab was true
+  // AND the loaded container has one, container_.Mtp().HasDraftHead()) -- lets a caller/tool report
+  // which path a given run took without duplicating Load()'s own two-condition check.
+  bool MtpUsingReducedVocabDraft() const {
+    return mtp_draft_reduced_vocab_ && mtp_ && container_.HasMtp() && container_.Mtp().HasDraftHead();
+  }
+
   // MTP self-speculative decode (docs/mtp.md): drafts up to `k` tokens via the container's mtp.*
   // head (chained from this Model's own last-produced hidden state -- see mtp_seed_hidden_'s
   // comment below), verifies them against the real model in ONE q_len<=k+1 forward pass, and
@@ -227,6 +254,16 @@ class Model {
   // are only sized when mtp_draft_k>0).
   std::vector<int32_t> VerifyWindow(const std::vector<int32_t>& candidates,
                                      std::vector<float>* logits_out = nullptr);
+
+  // Diagnostic-only accessor (docs/mtp.md "Acceptance gap investigation", h_seed drift pass): reads
+  // back `mtp_seed_hidden_` -- the exact [hidden] bf16 row `MtpHead::Draft`'s first step consumes --
+  // as raw bf16 bit patterns (uint16_t), for direct cross-layout comparison against a bf16
+  // (exact-arithmetic) reference. Requires MtpEnabled() (mtp_seed_hidden_ is only sized when
+  // mtp_draft_k>0) and at least one prior RunChunk-driving call (Prefill/DecodeStep*/
+  // DecodeStepMtpGreedy) -- throws otherwise. Not on any hot path; a plain host D2H copy of 5120
+  // bf16 values (10 KB), cheap enough to call after every Prefill/DecodeStep in a diagnostic tool
+  // without perturbing anything it measures.
+  std::vector<uint16_t> DebugSeedHiddenBf16() const;
 
  private:
   Model() = default;
@@ -300,6 +337,7 @@ class Model {
   // ---- MTP self-speculation (docs/mtp.md), all empty/unused when mtp_draft_k==0 -----------------
   std::optional<MtpHead> mtp_;
   int64_t mtp_draft_k_ = 0;
+  bool mtp_draft_reduced_vocab_ = true;  // ModelOptions::mtp_draft_reduced_vocab, copied at Load()
   // The main model's own pre-final-norm hidden state at the row that produced the CURRENT
   // "last-accepted-token"'s own logits -- exactly what MtpHead::Draft's h_seed needs (see that
   // class's file comment), AND exactly the "boundary" h_i MtpHead::PrimeKv needs to prime the ONE

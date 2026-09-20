@@ -9,6 +9,7 @@ add_library(r4dx_server_core STATIC
   openai_types.cpp
   sse.cpp
   response_sink.cpp
+  tool_call_parser.cpp
 )
 target_include_directories(r4dx_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # nlohmann/json.hpp is vendored under third_party/nlohmann/, so third_party/ itself is the include

@@ -21,6 +21,30 @@ foreach(t ${R4DX_MODEL_TESTS})
   )
 endforeach()
 
+# test_mtp's CheckChatMultiTurnMidRoundStop (docs/status.md Known-gaps: "no automated
+# multi-turn-with-a-forced-mid-round-stop regression test") drives the exact production
+# r4dx::server::PrefixState (src/server/prefix_state.h) -- header-only, no HIP/r4dx::model
+# dependency of its own, same reasoning tests/server/test_prefix_state.cpp relies on -- so it is
+# safe to include directly from this HIP-linked test binary without linking r4dx_server itself.
+target_include_directories(test_mtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/server)
+
+# tool_hseed_drift: one-off diagnostic for docs/mtp.md's "Acceptance gap investigation" (h_seed
+# drift vs a bf16 reference, per layout) -- built here (same libs, same SKIP-if-missing-container
+# convention as the tests above) but deliberately NOT registered via add_test: it prints numbers for
+# a human/doc to read, it does not assert a pass/fail contract, so it must never affect the 35/35
+# ctest count. Run manually: build\win-hip\tests\model\tool_hseed_drift.exe (HIP_VISIBLE_DEVICES=1).
+add_executable(tool_hseed_drift tool_hseed_drift.cpp)
+target_link_libraries(tool_hseed_drift PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
+# tool_vocab_calib: one-off diagnostic for docs/r9700.md R9's "reduced-vocab draft head" -- chooses
+# and measures coverage for the MTP draft head's vocabulary subset against a real calibration
+# corpus (D:/models/wikitext-2-raw) run through the real 64-layer container. Same "built but never
+# add_test()'d" convention as tool_hseed_drift above (prints numbers + writes a JSON file for a
+# human/converter run to consume, no pass/fail contract). Needs r4dx_tokenizer for the real BPE
+# tokenizer, unlike tool_hseed_drift.
+add_executable(tool_vocab_calib tool_vocab_calib.cpp)
+target_link_libraries(tool_vocab_calib PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core r4dx_tokenizer)
+
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),
 # same "plain add_test(), no ENVIRONMENT/SKIP_RETURN_CODE" pattern tests/server's HIP-free tests

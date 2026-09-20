@@ -12,6 +12,7 @@ set(R4DX_KERNEL_TESTS
   test_kernel_bandwidth
   test_fused_quant
   test_embedding_gather
+  test_gather_i32
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})

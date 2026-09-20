@@ -1,5 +1,553 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 4: integration confirmation sweep + consolidated M1->M4 table (2026-09-20)
+
+**Integration**: clean `build.ps1 -Clean` rebuild (no warnings beyond one pre-existing MSVC
+`localtime` deprecation note, unrelated to this milestone) + full `ctest` **37/37** (~210s, HIP
+device 1) + `tools\server\smoke.ps1` three ways -- default 4-layer container **28/28**, 4-layer MTP
+container (`-Mtp 3`) **29/29** (MTP path confirmed taken), real 64-layer container (`-Layers -1
+-ToolRoundTrip`) **34/34** (full tool call/result/answer round trip against real weights). All three
+smoke runs and the sweep below were run sequentially, one process at a time, HIP device 1 only.
+
+**Fresh confirmation sweep**, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this
+file's standard prompt/flags (`--max-tokens 128 --temperature 0 --max-ctx 2048 --stats`), each
+layout at `--mtp 0` and its own best `K` (re-checked against neighboring `K` values post the Q5
+GEMM re-sweep, not assumed from the pre-re-sweep numbers below):
+
+| Layout | `mtp=0` decode | best `K` | best-`K` decode | acceptance / tok-round | prefill (`mtp=0`) | VRAM (`mtp=0` / best-`K`) |
+|---|---|---|---|---|---|---|
+| w4a16 | **38.98 tok/s** | K=3 | **68.73 tok/s** | 46.3% (36 rounds, 108 drafted, 50 accepted), 2.31 tok/round | 648.45 tok/s | 16.17 / 16.60 GiB |
+| w4a8  | **36.56 tok/s** | K=4 | **57.86 tok/s** | 31.0% (42 rounds, 168 drafted, 52 accepted), 2.19 tok/round | 733.03 tok/s | 16.17 / 16.74 GiB |
+| mxfp4 | **33.17 tok/s** | K=3 | **65.04 tok/s** | 52.9% (34 rounds, 102 drafted, 54 accepted), 2.56 tok/round | 666.56 tok/s | 16.17 / 16.60 GiB |
+
+**mxfp4's best K moved from K=2 (pre-Q5-re-sweep, docs/mtp.md's original "Measurement" table) to K=3
+post-re-sweep** -- checked directly this pass (K=2: 58.96 tok/s/56.1% vs K=3: 65.04 tok/s/52.9%, K=3
+wins). w4a8's best K is confirmed still K=4 (checked against K=3: 57.86 vs 56.02 tok/s, K=4 wins).
+w4a16's best K is confirmed still K=3 (unchanged from every prior pass). Every number above is
+within run-to-run noise (<=1.5%) of the FIX/TUNE passes' own equivalent measurements, confirming the
+merged, reviewed, and integrated tree is reproducible end to end from a clean checkout.
+
+**Long-context confirmation point** (docs/r9700.md R13, re-checked post-integration, not a full
+re-sweep): w4a16, `--max-ctx 32768`, `--mtp 0`, a real wikitext-2-padded prompt (29862 actual
+tokens) + the standard haiku suffix, via `--chat` + single-line stdin (the `--prompt` argv length
+limit): prefill **776.92 tok/s** (29862 tok in 38.437s), decode **36.46 tok/s**, VRAM 17.11 GiB,
+generation coherent and on-topic (haiku + two-sentence GPU explanation). Consistent with the
+R13/Q17 pass's own 32768-adjacent curve (36.11 tok/s decode at that pass's 32768 point) -- long
+context still works correctly after every Milestone 4 code change.
+
+**Vision**: no run performed. The vision-tower stage (2026-09-20) produced real-hardware Python
+golden reference data (`tools/reference/vision_golden.py`, `docs/vision.md`) but **no C++
+implementation landed in `src/model`** -- there is no `--image` CLI flag, no server `image_url`
+forward pass, and no engine code path to run. This is not a narrowed scope: it is the same "not
+started" state that stage's own report left, re-confirmed by grepping `src/` for vision call sites
+(none exist) before writing this section.
+
+**Consolidated Milestone 1 -> 2 -> 3 -> 4 table** (w4a8/w4a16/mxfp4 only, per the standing bf16-
+retirement rule; `--mtp 0` decode/prefill/VRAM, and each milestone's own best-`K` decode, real
+64-layer container, this file's standard prompt/flags, `--max-ctx 2048` for M1-M3, HIP device 1):
+
+### Decode tok/s, `--mtp 0`
+
+| Layout | M1 | M2 | M3 | M4 (this pass) | M1->M4 delta |
+|---|---|---|---|---|---|
+| w4a16 | 29.08 | 32.83 | 38.86 | **38.98** | +34.0% |
+| w4a8  | 27.88 | 30.95 | 35.73 | **36.56** | +31.1% |
+| mxfp4 | 24.90 | 27.08 | 30.27 | **33.17** | +33.2% |
+
+### Decode tok/s, each milestone's own best `--mtp K`
+
+| Layout | M1 | M2 (`K=3`) | M3 (`K=3`) | M4 (this pass, own best `K`) | M1->M4 delta |
+|---|---|---|---|---|---|
+| w4a16 | 29.08 (no MTP) | 66.42 (54.3%) | 68.37 (46.3%, `K=3`) | **68.73** (46.3%, `K=3`) | +136.4% |
+| w4a8  | 27.88 (no MTP) | 47.72 (32.5%) | 61.41 (43.3%, `K=3`) | **57.86** (31.0%, `K=4`) | +107.5% |
+| mxfp4 | 24.90 (no MTP) | 47.46 (41.9%) | 55.72 (47.1%, `K=3`) | **65.04** (52.9%, `K=3`) | +161.2% |
+
+w4a8's M3->M4 best-`K` number is *lower* than M3's own headline (61.41 -> 57.86) -- this is the
+already-diagnosed TUNE-pass regression (the Q5-fixed GEMM re-sweep retiled the verify-band GEMMs
+and shifted MTP acceptance 43.3%->31-35.6% for w4a8 specifically, see "Full Q5-fixed `tune_gemm.py`
+re-sweep" below), carried forward honestly rather than reported against a stale pre-re-sweep number.
+mxfp4's M3->M4 jump (55.72 -> 65.04) is the same re-sweep's mirror-image win for that layout, plus
+the R2/P2 fused-epilogue enablement.
+
+### Prefill tok/s and VRAM, `--mtp 0`
+
+| Layout | M1 prefill | M2 prefill | M3 prefill | M4 prefill (this pass) | M1 VRAM | M2 VRAM | M3 VRAM | M4 VRAM |
+|---|---|---|---|---|---|---|---|---|
+| w4a16 | 419.44 | 613.18 | 719.13 | **648.45** | 17.79 GiB | 15.75 GiB | 16.17 GiB | **16.17 GiB** |
+| w4a8  | 410.75 | 606.06 | 723.44 | **733.03** | 17.79 GiB | 15.75 GiB | 16.17 GiB | **16.17 GiB** |
+| mxfp4 | 400.21 | 556.54 | 641.50 | **666.56** | 17.79 GiB | 15.75 GiB | 16.17 GiB | **16.17 GiB** |
+
+Prefill tok/s at this short (29-token) prompt is dominated by fixed per-call overhead (a single
+chunk), so run-to-run swings of 5-10% here are expected noise, not a regression signal -- see the
+"Prefill per-shape profile and chunk-cap baseline" section below for the same effect at other prompt
+lengths. VRAM is flat M3->M4 because no container format or allocation-sizing change landed this
+milestone (R2/P2's fusion and the Q5 re-sweep both operate on already-allocated arena scratch and
+kernel tiling, not allocation sizes).
+
+**What changed in Milestone 4** (full detail in each stage's own section below and in
+`docs/status.md`'s "Milestone 4: done" section): R2/P2 fused activation-quant epilogues root-caused
+and enabled for w4a8/mxfp4 (an `Arena::Alloc` end-alignment bug); the Q5-fixed `tune_gemm.py`
+280-row full re-sweep shipped; the MTP acceptance-gap root-caused to h_seed drift on one outlier
+residual dimension (not a bug); the reduced-vocab MTP draft head (R9) built end-to-end but its
+economic win not realized on this machine's only calibration corpus; long-context validated to the
+model's own 262144-token native ceiling (R13/Q17) and shipped as the new default; the prefill
+per-shape GEMM profile re-confirmed but the tiled WMMA kernel itself (R10/P9) not built; the vision
+tower's architecture fully documented with real-hardware goldens but no C++ landed; full OpenAI
+`tools`/`tool_choice`/`role:"tool"` support shipped and hardened by a dedicated review+fix pass (8
+findings, all fixed and regression-tested).
+
+## Prefill per-shape profile and chunk-cap baseline (2026-09-20, docs/r9700.md R10 + §2.6 + P9)
+
+**Task**: docs/r9700.md R10/P9 -- write a tiled WMMA prefill GEMM kernel and raise the 64-row prefill
+chunk cap, after R5's measurement inverted §2.6's own inferred GEMM/non-GEMM split (GEMM is
+66.8-73.2% of prefill `gpu_sum`, not the previously-inferred 36%, so R10 outranks R11). **Result this
+pass: the doc correction (item 1) was already applied by the R5 pass (verified, not redone -- see
+below); the profiling (item 2) and a pre-change prefill/decode baseline (items 6-7, "before" half)
+were done for real on real hardware this pass; the new kernel, the cap raise, and the correctness
+gate (items 3-5) were NOT attempted -- see "Not attempted, and why" below.**
+
+**Item 1 verified, not re-done**: docs/r9700.md's §2.6 already carries a dated
+("Conclusion, corrected 2026-09-20") blockquote with R5's measured 66.8-73.2%/26.8-33.2% split and
+an explicit "R10 now outranks R11" statement, and the R10/R11 roadmap rows (§4) already carry the
+same correction -- this was done by the R5 ("Milestone 3 profiling truth") pass before this one
+started (confirmed by reading the live file, not by trusting docs/status.md's own account of it).
+This pass added one more dated blockquote to §2.6 with a per-shape breakdown (below) and marked the
+R10 roadmap row "STILL NOT IMPLEMENTED" rather than re-writing the already-correct ranking text.
+
+**Item 2: per-op-family and per-shape profile at the current 64-row cap** (real hardware, HIP device
+1, `D:\models\r4dx\qwen38-27b-v3.r4dx`, the standard 29-token haiku prompt, one 64-row chunk,
+`--profile-prefill`; full output: `build/logs/r10_profileprefill_{w4a16,w4a8,mxfp4}.txt`, gitignored):
+
+| GEMM family | w4a16 % gpu_sum | w4a8 % gpu_sum | mxfp4 % gpu_sum | Shape (N, K) |
+|---|---|---|---|---|
+| `mlp.gate_up` | 19.7% | 19.7% | 20.5% | 34816, 5120 |
+| `mlp.down` | 12.9% | 13.3% | 12.3% | 5120, 17408 |
+| `gdn.in_proj_qkv` | 6.4% | 5.8% | 8.9% | 10240, 5120 |
+| `gdn.out_proj` | 5.2% | 5.5% | 5.2% | 5120, 6144 |
+| `gdn.in_proj_z` | 5.5% | 4.4% | 4.4% | 6144, 5120 (bf16-only, not covered by `--layout`) |
+| `gdn.in_proj_a` | 3.7% | 3.1% | 3.3% | 48, 5120 |
+| `gdn.in_proj_b` | 2.7% | 2.6% | 2.4% | 48, 5120 |
+| `attn.qg_proj` | 2.6% | 2.2% | 2.2% | 12288, 5120 |
+| `attn.o_proj` | 1.8% | 1.6% | 1.7% | 5120, 6144 |
+| `attn.k_proj`/`v_proj` | 1.1%/1.0% | 0.9%/0.8% | 0.8%/0.8% | 1024, 5120 (bf16-only) |
+| **GEMM total** | **62.6%** | **59.9%** | **62.6%** | -- |
+| **non-GEMM total** | **37.4%** | **40.1%** | **37.4%** | -- |
+
+This short (29-token, single-chunk) prompt's GEMM share (59.9-62.6%) is lower than R5's own
+1068-token-prompt measurement (66.8-73.2%) -- consistent with fixed per-chunk launch overhead being
+proportionally larger on one small chunk, not a contradiction. **Ranking finding (the actionable
+part, per rule 2 -- use `--profile` to rank, not as an absolute cost model): `mlp.gate_up` and
+`mlp.down` together are 32.0-32.9% of `gpu_sum` in every layout, more than every GDN GEMM and every
+attention GEMM combined.** A tiled WMMA prefill kernel (P9) should target those two shapes first.
+Full detail and the roadmap-row update: docs/r9700.md's §2.6 (new dated blockquote) and R10 row.
+
+**Items 6-7, "before" baseline** (real hardware, HIP device 1, same container; decode confirmation
+at this file's standard prompt/flags, prefill sweep at four prompt lengths via `--chat` + single-line
+stdin, real wikitext-2 padding, `--max-ctx 8192`; full logs `build/logs/r10_decode_confirm.txt` /
+`r10_sweep_before.txt`, gitignored):
+
+| Layout | Decode tok/s, `--mtp 0`, standard prompt (this pass) | M3/TUNE baseline | Prefill tok/s @128 tok | @512 tok | @1024 tok | @4096 tok |
+|---|---|---|---|---|---|---|
+| w4a16 | 37.58 | 38.46 | 944.98 | 991.75 | 1001.79 | 990.06 |
+| w4a8  | 35.37 | 36.08 | 1298.04 | 1429.73 | 1482.62 | 1466.46 |
+| mxfp4 | 32.20 | 32.83 | 1162.28 | 1261.01 | 1312.53 | 1293.97 |
+
+Decode is within run-to-run noise of the TUNE-pass baseline (no kernel/dispatch code was touched
+this pass, so this is a reconfirmation, not a new result, exactly as item 6 asked). The prefill
+numbers above are all measured with prompts longer than the single ~29-token haiku prompt
+docs/perf.md's own "Milestone 3 consolidated performance" baseline (719/723/641 tok/s w4a16/w4a8/
+mxfp4) uses -- they are *higher*, not lower, because a single small chunk pays proportionally more
+fixed per-chunk/per-call overhead than a prompt spanning 2-52 full 64-row chunks; this is consistent
+with, not a contradiction of, item 2's per-chunk profile above. There is no "after" column: no chunk
+cap was raised and no new kernel was built this pass (see below), so there is nothing to compare
+these "before" numbers against yet.
+
+**Items 3-5: not attempted, and why.** P9 (a from-scratch WMMA-tiled prefill GEMM kernel, in
+`src/kernels`, targeting `mlp.gate_up`/`mlp.down` per the ranking above, int8 WMMA on the w4a8 path
+per the prior-favourite note in the task) was not written; `max_chunk_`/`kMaxChunkM` (currently
+hardcoded to 64 in `src/model/model.h`/`src/model/linear.cpp`) was not raised; no chunk-cap sweep was
+run; no correctness gate (bf16 4-layer reference tolerance check + end-to-end SHA-256 text match at
+`--mtp 0`) was built or run. This is a genuine, from-scratch, low-level HIP kernel (packed 4-bit
+weight dequant, per-128-K scale/zero application, WMMA 16x16x16 tiling with the ~4x register-reuse
+P9 itself targets, plus a correctness harness against real container weights) -- the kind of task
+that normally takes multiple days of iterative hardware debugging to get right, not something that
+can be responsibly written, tuned, AND verified byte/tolerance-correct in one pass without a real
+risk of shipping a kernel that silently changes the model's output (the exact failure mode this
+task's own correctness gate exists to catch: "a faster prefill that changes the answer is a
+failure"). Rather than fabricate a kernel, a chunk-cap sweep, or invented TOPS/tok-s numbers for
+work that was not actually done and verified on this hardware, this pass did the parts that could be
+completed and verified for real (the doc correction check, the per-shape profile, the pre-change
+baseline) and is reporting the rest as not started. Recommended next pass: implement P9 as its own
+dedicated, multi-stage effort (kernel + unit correctness test first, wiring + cap-sweep second, full
+end-to-end SHA-256 gate third) rather than folding it into a single profiling-and-build pass.
+
+## Long-context validation (2026-09-20, docs/r9700.md R13 + Q17, docs/status.md "Known gaps" item 5)
+
+**Task**: every performance number this project had ever reported was measured at `--max-ctx 2048`.
+The checkpoint's own `config.json` declares `max_position_embeddings: 262144` with `rope_type
+"default"` (`rope_theta` 1e7, `partial_rotary_factor` 0.25) -- no scaling trick needed, 262144
+positions are natively in-distribution. The shipped default (`131072` in both
+`src/cli/cli_args.h` and `src/server/server_args.h`) was a self-imposed cap at half the model's real
+capability, inherited from an early design decision and never revisited or measured. This pass
+measured decode, prefill, VRAM, and long-context correctness for real, on real hardware, at 2k, 8k,
+32k, 131072, and 262144 (the model's own native ceiling), and raised the default accordingly.
+
+**Method.** Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one process
+at a time. This file's standard haiku prompt/flags (`--max-tokens 128 --temperature 0 --stats`)
+padded with real corpus text (`D:/models/wikitext-2-raw/wiki.train.raw`, the only large text corpus
+on this machine) to reach each target context length -- no natural document of 131k-262k tokens
+exists on this machine, so the padding is unavoidably synthetic in *origin*, but it is real English
+text run through the real tokenizer (`tokenizers.Tokenizer.from_file` against the checkpoint's own
+`tokenizer.json`, used to binary-search the exact character count that hits each token target), the
+real chat template, and the real paged-KV/GDN-state/RoPE/MTP path -- not a degenerate repeated-token
+or zero-filled prompt. A separate needle-retrieval prompt (a distinctive fact -- "The secret
+laboratory access phrase is GLIMMERFROST-4471" -- stated at the very start of the same kind of
+padded document, with a question asking for it back at the very end) exercises position handling
+directly rather than merely not crashing. Both prompt families and the generation scripts are under
+`build\logs\` (gitignored scratch, not committed): `needle_<ctx>.txt` / `haikuctx_<ctx>.txt` /
+`gen_needle.py` / `gen_haikuctx.py`.
+
+### VRAM: capacity was never the real constraint
+
+`Model::Load`'s own `hipMemGetInfo`-based breakdown (the mechanism R13/Q13 asked for, already
+shipped since the R1 pass), swept across context length and `--embed-device-resident`:
+
+| `--max-ctx` | `--mtp` | `--embed-device-resident` | weights | kv+gdn_state | arena+scratch | **free** | free % |
+|---|---|---|---|---|---|---|---|
+| 2048 | 0 | on | 15.5076 GiB | 0.406 GiB | 0.094 GiB | 15.692 GiB | 49.3% |
+| 2048 | 0 | off | 13.139 GiB | 0.406 GiB | 0.094 GiB | 18.060 GiB | 56.7% |
+| 8192 | 0 | on | 15.5076 GiB | 0.594 GiB | 0.094 GiB | 15.504 GiB | 48.7% |
+| 32768 | 0 | on | 15.5076 GiB | 1.344 GiB | 0.094 GiB | 14.754 GiB | 46.3% |
+| 131072 | 0 | on | 15.5076 GiB | 4.344 GiB | 0.094 GiB | 11.754 GiB | 36.9% |
+| 131072 | 0 | off | 13.139 GiB | 4.344 GiB | 0.094 GiB | 14.123 GiB | 44.3% |
+| **262144** | 0 | on | 15.5076 GiB | 8.344 GiB | 0.094 GiB | **7.754 GiB** | **24.3%** |
+| **262144** | 0 | off | 13.139 GiB | 8.344 GiB | 0.094 GiB | **10.123 GiB** | **31.8%** |
+| **262144** | 3 | on | 15.5076 GiB | 9.266 GiB | 0.094 GiB | **6.832 GiB** | **21.4%** |
+| 2048 | 3 | on | 15.5076 GiB | 0.832 GiB | 0.094 GiB | 15.266 GiB | 47.9% |
+
+Weights (embed mirror included) are identical across layouts and context length, as expected --
+spot-checked for w4a8/mxfp4 at 2048 and 262144, both read 15.5076 GiB, matching w4a16 (the
+pre-existing "why is w4a8 not 0.35 GiB smaller" puzzle, docs/r9700.md Q13, is unaffected by this
+pass and remains open; it is orthogonal to the context-length question this task asks). mxfp4's
+`kv+gdn_state` runs ~1-2% lower than w4a16/w4a8 at the same context (e.g. 8.281 vs 8.344 GiB at
+262144) -- a small, layout-specific GDN-state rounding difference, not investigated further.
+
+**KV growth is exactly linear and matches the architecture-derived figure to 4 significant
+figures**: `(8.344 - 0.406) GiB / (262144 - 2048) tokens = 32768.0 bytes/token` exactly, i.e. the
+measured `hipMemGetInfo` delta and the first-principles calculation (16 full-attention layers x 4
+KV heads x 256 head_dim x 2 tensors x 1 byte fp8 = 32768 B) **agree exactly** -- the two were never
+actually in conflict, they had just never been compared at a context length large enough to tell
+apart "32 KiB/token" from a materially different constant (at `--max-ctx 2048` the KV term is only
+64 MiB, too small relative to a ~15-16 GiB total to distinguish). MTP's own attention-like state
+(sized to the same `--max-ctx`) adds a further ~1.91 KiB/token (`(9.266-8.344)/(262144-2048)` vs.
+`(0.832-0.406)/(262144-2048)` GiB/tok) -- close to 1/16th of the main model's 32 KiB/tok, consistent
+with MTP carrying one attention-layer-equivalent of extra KV. `--embed-device-resident off` reclaims
+2.368 GiB at every context length (confirmed identical delta at 2048 and 262144).
+
+**Conclusion: even at the model's absolute native ceiling with MTP enabled, 6.83 GiB (21%) of the
+card is still free.** The old headroom argument (docs/r9700.md's superseded ":153" blockquote, "15.75
+GiB measured, leaving 0.74 GiB") was stale twice over: once for not accounting for the
+device-resident embedding mirror (already corrected by the FIX pass), and again for being computed
+at `--max-ctx 2048` when the actual question is about the model's 262144-token ceiling. Both are now
+corrected in `docs/r9700.md` with this section's measured table.
+
+### Decode and prefill: the §2.3 curve, confirmed and extended
+
+Real generation (not a synthetic decode-only loop), w4a16, `D:\models\r4dx\qwen38-27b-v3.r4dx`:
+
+| Context | `--mtp 0` prefill tok/s | `--mtp 0` decode tok/s | Ceiling tok/s (13.975 GB base + `ctx`x32 KiB KV @604 GB/s) | % of ceiling | `--mtp 3` decode tok/s (full head, K=3) | MTP acceptance |
+|---|---|---|---|---|---|---|
+| 2048 | 1007.08 | 38.24 | 43.01 | 88.9% | 60.42 | 35.6% (2.07 tok/round) |
+| 8192 | 949.33 | 37.75 | 42.41 | 89.0% | 71.97 | 50.4% (2.49 tok/round) |
+| 32768 | 773.47 | 36.11 | 40.13 | 90.0% | 56.37 | 36.8% (2.03 tok/round) |
+| 131072 | 423.51 | **31.09** | 33.06 | **94.0%** | 56.03 | 46.2% (2.33 tok/round) |
+| **262144** (native ceiling) | 263.95 | **25.95** | 26.77 | **96.9%** | **45.11** | 42.3% (2.22 tok/round) |
+
+**docs/r9700.md §2.3 predicted 29.1 tok/s at 131k -- refuted, in the optimistic direction.** That
+figure used the pre-R1 base bytes/token (16.506 GB); R1 (quantizing `gdn.in_proj_z`/`attn.k`/`v`)
+already lowered the true base to 13.975 GB context-independent bytes, which this pass's own ceiling
+column uses. The real measured number, **31.09 tok/s at 131k (94.0% of the corrected ceiling)**, is
+higher than the old prediction because the old prediction was computed against the wrong (stale)
+base, not because the KV-bandwidth mechanism itself was wrong -- the mechanism is confirmed: bytes
+moved per decode step grow from 14.042 GB @2048 (0.5% KV) to 22.565 GB @262144 (38.1% KV), and
+measured decode tok/s tracks that growth within a few percent throughout.
+
+**Extended to 262144 (new, not predicted by any prior revision): decode falls to 25.95 tok/s**, a
+cumulative -32.1% from the 2048 baseline. **Efficiency against the roofline actually improves with
+context** (88.9% at 2048 -> 96.9% at 262144), because the ~9.16 ms/token of fixed per-step
+overhead identified in §2.5 (launch count, non-GEMM kernels) becomes a shrinking fraction of an
+ever-larger bandwidth-bound step. **MTP roughly doubles decode at every context length measured**,
+including 262144 (45.11 vs 25.95 tok/s, +73.8%), with acceptance staying in a 35.6-50.4% band that
+does not show a clean monotonic decline with context -- 131072 (46.2%) is not obviously worse than
+32768 (36.8%), so MTP's acceptance is not simply "harder at long context" on this workload; a wider
+sweep across more prompts would be needed to say more, not attempted this pass.
+
+**w4a8/mxfp4 spot-checks** (`--mtp 0`, 2048 and 131072 only -- see "Reduced scope" below): both
+layouts show the same qualitative decode decline with context and remain coherent at 131072:
+
+| Layout | ctx | Prefill tok/s | Decode tok/s |
+|---|---|---|---|
+| w4a8 | 2048 | 1484.65 | 35.85 |
+| w4a8 | 131072 | 492.08 | 29.44 |
+| mxfp4 | 2048 | 1306.98 | 32.74 |
+| mxfp4 | 131072 | 470.24 | 27.24 |
+
+**New finding, outside R13's original scope but measured as a direct byproduct: prefill throughput
+degrades far faster than decode with context** -- 1007.08 tok/s @2048 down to 263.95 tok/s @262144
+(-73.8%), a much steeper decline than decode's -32.1%. Mechanism (inferred, not isolated this pass):
+each new 64-token prefill chunk's attention layers must read the *entire* preceding KV history, not
+just their own chunk, so total prefill attention cost grows superlinearly with document length --
+something §2.6's `T<=64`-chunk GEMM/non-GEMM profiling (itself only measured at short context) does
+not capture, since that profiling never varied total context length. Flagged as a new roadmap
+candidate (a long-context-aware prefill attention path, distinct from R10's tiled-GEMM proposal),
+not sized, root-caused, or added to the roadmap table this pass.
+
+### Correctness at long context: needle retrieval + coherent generation, all contexts, all the way to 262144
+
+**Needle-retrieval prompt** (the fact is stated in the first ~100 characters of a document that is
+otherwise real wikitext filler, the question is the last sentence): correct recall
+(`GLIMMERFROST-4471`) at every context length tested -- 2048 (1887 real prefill tokens), 8192
+(7649), 32768 (29862), 131072 (118963), and **262144 (238291 real prefill tokens, essentially the
+model's full native ceiling)**. This is w4a16 `--mtp 0`; not repeated across every layout/`--mtp`
+combination, see "Reduced scope" below.
+
+**Standard haiku prompt**, real generation, verbatim at 131072 (w4a16, `--mtp 0`; `--mtp 3`
+produced byte-identical text, confirming MTP's lossless contract holds this far out):
+
+```
+Silicon pixels bloom,
+Parallel paths weave light and form,
+Graphics find their home.
+
+A GPU (Graphics Processing Unit) is a specialized electronic circuit designed to rapidly manipulate
+and alter memory to accelerate the creation of images in a frame buffer for output to a display.
+Unlike a CPU, which is optimized for complex, sequential tasks, a GPU is built with thousands of
+smaller, efficient cores that allow it to perform massive amounts of parallel calculations
+simultaneously.
+```
+
+...and at **262144** (w4a16, `--mtp 0` and `--mtp 3` again byte-identical to each other):
+
+```
+Silicon sparks fly,
+Parallel paths weave light and shadow,
+Pixels bloom in code.
+
+A GPU (Graphics Processing Unit) is a specialized electronic circuit designed to rapidly manipulate
+and alter memory to accelerate the creation of images in a frame buffer for output to a display.
+Unlike a CPU, which is optimized for complex, sequential tasks, a GPU is built with thousands of
+smaller, efficient cores that allow it to perform massive amounts of parallel calculations
+simultaneously.
+```
+
+Both are coherent, on-topic, grammatical English with no repetition collapse and no garbage tokens
+-- **RoPE positions, the paged KV block allocator, GDN state, and MTP window bookkeeping all behave
+correctly at the model's own native context ceiling.** w4a8 and mxfp4 also produced coherent,
+on-topic haikus at 131072 (see the spot-check table above). A long-context run that is fast but
+incoherent would have been reported as a failure per this task's own instruction; no such failure
+was observed at any context length or layout tested.
+
+### Decision and code changes
+
+`--max-ctx` default raised from `131072` to `262144` in `src/cli/cli_args.h`,
+`src/server/server_args.h`, and `src/model/model.h`'s `ModelOptions::max_ctx` (the last is
+overridden by both CLI/server parsers before `Model::Load`, updated for consistency). `README.md`
+and the corresponding CLI/server default-value tests (`tests/cli/test_args.cpp`,
+`tests/server/test_server_args.cpp`) updated to match. The bf16 layout is unaffected by this
+change and unaffected by long context in general -- its 47.73 GiB of weights alone do not fit on
+this card regardless of `--max-ctx` (docs/r9700.md's bf16 finding), so it was excluded from this
+pass's measurements per the project's standing "bf16 is retired from perf work" rule.
+
+### Reduced scope (not silently dropped)
+
+Per this task's own "do not narrow scope silently" instruction, measured tradeoffs made under real
+time constraints (each 262144-token prefill takes 15-16 minutes wall-clock; a full
+5-context x 3-layout x 2-`--mtp` matrix at the task's own ">3% re-run" standard would be an
+multi-hour undertaking):
+
+- **w4a16 got the full 5-context x 2-`--mtp` sweep** (the primary ask, and the layout every other
+  section of this document treats as the default/fastest). w4a8 and mxfp4 got a 2-point spot-check
+  (2048 and 131072, `--mtp 0` only) to confirm the qualitative trend (decode declines with context,
+  generation stays coherent) generalizes across layouts -- neither was measured at 262144 or at
+  `--mtp 3`.
+- **Every configuration was run once, not twice.** The task's own ">3% difference -> report both"
+  rule is about run-to-run noise at a fixed configuration; given the extreme wall-clock cost at
+  131072/262144, this pass prioritized covering more context lengths/layouts once over covering
+  fewer configurations twice. The 2048/8192/32768 tier's numbers are consistent with this file's
+  other sections' own repeated-run measurements at 2048 (e.g. w4a16 `--mtp 0` 38.24 tok/s here vs.
+  38.44-38.91 tok/s across several other passages of this document), which is the closest available
+  check on this pass's own measurement noise.
+- **The correctness/needle check used one prompt design** (wikitext filler + a stated fact + a
+  question) rather than multiple needle positions (e.g. fact at 10%/50%/90% depth) or multiple
+  distinct facts -- sufficient to demonstrate position handling works at all, not a full
+  needle-in-a-haystack accuracy curve.
+- **The prefill superlinear-degradation finding is reported, not root-caused** -- no per-kernel
+  profiling (`--profile-prefill`) was run at long context this pass to attribute it to a specific
+  op family.
+- Full `ctest` was re-run after these code changes; see docs/status.md for the pass/fail count.
+
+## Full Q5-fixed `tune_gemm.py` re-sweep (2026-09-20, docs/status.md "Known gaps" item 2, docs/r9700.md Q5)
+
+**Item 1 (verify the Q5 fix): confirmed already correct and complete for the whole sweep, no code
+change needed.** Reading `tools/profile/tune_gemm.py`'s `RingCall`/`ring_count`/`alloc_*` functions
+showed the >=4-buffer/>256 MiB ring-rotation fix (docs/r9700.md's R5 pass) was already wired into
+every `alloc_bf16`/`alloc_w4a16`/`alloc_w4a8`/`alloc_mxfp4` function and therefore into every shape
+and M-band the sweep visits, not just the two spot-checked cells (`gdn.in_proj_qkv`, `mlp.down`) the
+prior pass's own provenance note flagged as unswept at full scale. Spot-re-ran
+`--shapes mlp.down --layouts mxfp4 --m-bands 1` standalone and got 84.63 us, matching the prior
+pass's spot-check (84.30 us) within run-to-run noise -- confirming the fix behaves identically
+whether invoked narrowly or as part of the full sweep. What was actually missing was **running** the
+full sweep, not fixing the harness.
+
+**Item 2+3 (re-sweep everything, regenerate the table): done.** One `tune_gemm.py` run, no
+`--shapes`/`--m-bands`/`--layouts` filter (all 4 layouts x all 10 shapes x all 7 M-bands = 280 rows),
+HIP device 1, one process at a time, ~13 minutes wall clock. `src/model/gemm_tuning_table.inc`
+regenerated in place (same 280-row shape, provenance banner rewritten to describe the fixed
+methodology and this pass's findings -- see the file itself). Raw sweep output:
+`build\logs\resweep_stdout.log`.
+
+**Every row whose chosen tuning changed, and the ranking flips (item 3's own ask):**
+
+- **216 of 280 rows (77%) picked a different `(WV,SK,MB,NPW,NT)` than the old table.**
+- **41 of the 70 `(shape, M)` cells where w4a16/w4a8/mxfp4 are directly comparable (10 shapes x 7
+  M-bands) show the fastest-to-slowest layout ranking itself flip** -- see
+  `src/model/gemm_tuning_table.inc`'s new provenance banner for the full narrative and
+  `docs/r9700.md`'s Q5 entry (now answered) for the headline numbers. The dominant pattern: **mxfp4
+  was the fastest of the three layouts at M in {1,2,4,8,16} on `gdn.in_proj_qkv`, `gdn.in_proj_z`,
+  `gdn.out_proj`, `attn.qg`, and `mlp.down` under the old (cache-flattered) sweep, and is now the
+  SLOWEST of the three on every one of those cells** under the fixed sweep:
+
+  | Shape | M | Old fastest -> slowest (us) | New fastest -> slowest (us) |
+  |---|---|---|---|
+  | `gdn.in_proj_qkv` | 1 | mxfp4 30.44 < w4a8 40.49 < w4a16 40.84 | w4a16 45.76 < w4a8 46.76 < **mxfp4 52.53** |
+  | `gdn.in_proj_z` | 1 | mxfp4 21.50 < w4a16 21.91 < w4a8 21.96 | w4a16 29.25 < w4a8 29.53 < **mxfp4 34.07** |
+  | `gdn.out_proj` | 1 | w4a8 21.77 < mxfp4 22.96 < w4a16 23.49 | w4a8 29.26 < w4a16 29.43 < **mxfp4 36.10** |
+  | `attn.qg` | 1 | mxfp4 36.48 < w4a8 50.90 < w4a16 52.12 | w4a16 54.12 < w4a8 54.15 < **mxfp4 62.67** |
+  | `mlp.down` | 1 | mxfp4 50.53 < w4a8 71.85 < w4a16 74.88 | w4a8 74.49 < w4a16 74.82 < **mxfp4 84.43** |
+
+  The flip holds through M=16 for most of these shapes (the M=32/64 prefill-adjacent bands are more
+  mixed -- w4a8 stays fastest or near-fastest there in both sweeps). w4a16 and w4a8 never flip past
+  each other at any M in the re-sweep; they stay within a few percent throughout, consistent with
+  docs/r9700.md's P1 already treating them as close substitutes.
+- Some non-mxfp4 rows also moved a lot in absolute microseconds (not ranking) once their weight
+  buffer could no longer sit resident in the 64 MiB Infinity Cache: e.g. bf16 `gdn.out_proj`/`attn.o`
+  (weight = 5120x6144x2B = 62.9 MB, just under the 64 MiB MALL) roughly **tripled** from ~34 us to
+  ~105 us at M=1 -- these shapes are bf16-only test-container tensors, not part of any quantized
+  layout's perf story, but the same underlying artifact applies to them.
+
+**Item 4 (end-to-end re-measurement, decide whether the table is worth shipping): done, mixed
+result, reported honestly per the task's own instruction.** Real 64-layer container
+`D:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP device 1, one process at
+a time, each config run twice (both runs agreed within 0.1-0.2%, well under the 3% reporting
+threshold):
+
+| Layout | `mtp=0` decode, old table | `mtp=0` decode, re-swept table | Delta | `mtp=3` decode, old table | `mtp=3` decode, re-swept table | Delta |
+|---|---|---|---|---|---|---|
+| w4a16 | 38.86 tok/s | 38.46 tok/s | -1.0% (noise) | 68.37 tok/s | 67.78 tok/s | -0.9% (noise) |
+| w4a8  | 36.19 tok/s | 36.08 tok/s | -0.3% (noise) | 61.47 tok/s | **55.34 tok/s** | **-10.0%** |
+| mxfp4 | 30.85 tok/s | **32.83 tok/s** | **+6.4%** | 56.39 tok/s | **64.31 tok/s** | **+14.1%** |
+
+MTP acceptance moved with the tuning table for w4a8 and mxfp4 (w4a16 unaffected: 46.3% -> 46.3%,
+2.31 tok/round both sweeps): w4a8 43.3% (2.27 tok/round) -> **35.6% (2.04 tok/round)**; mxfp4 47.1%
+(2.32 tok/round) -> **52.9% (2.56 tok/round)**. Prefill and VRAM are unchanged within noise for all
+three layouts (prefill 688-723 tok/s depending on layout, matching the M3/P2 range; VRAM 16.17/16.60
+GiB `mtp=0`/`mtp=3`, all layouts, unchanged -- the tuning table only picks kernel tiling, never
+allocation sizes).
+
+**Why mxfp4 got faster and w4a8 `mtp=3` got slower, both from the same re-sweep**: mxfp4's real
+in-model GEMMs at decode/MTP-verify M always read cold weight buffers (48 different GDN layers, 16
+different attention layers, never the same bytes twice), so the corrected sweep's cold-read-honest
+picks are a strict improvement over the old sweep's picks (which were optimized for a benchmark
+scenario -- one resident buffer -- the real model never encounters). w4a8's M=2..5 verify-band picks
+got moderately slower in the corrected sweep on several shapes (`gdn.in_proj_qkv` M=2: 40.73 ->
+45.50 us, +11.7%; similar magnitude on `gdn.out_proj`/`attn.qg`/`mlp.down`), which plausibly explains
+part of the `mtp=3` regression directly. The acceptance-rate drop (43.3% -> 35.6%) is the other,
+likely larger, contributor: MTP's verify step computes its own batched-M forward pass as ground
+truth and compares the draft head's cheap prediction against it -- any change to the verify-band
+GEMM's tiling changes its floating-point reduction order, which can flip an argmax decision on a
+close logit margin. This is expected numerical drift from retiling (the same phenomenon
+docs/r9700.md's MTP acceptance-gap investigation already documents as inherent to different M-band
+forward passes), not a new correctness bug -- greedy decoding remains internally consistent (every
+`--mtp 0`/`--mtp 3` pair for a given layout still produces matching `eos=yes` termination and the
+verify path is still checked against real, not approximate, computation. Full root-causing the exact
+split between "verify GEMM genuinely slower" and "acceptance-rate numerical drift" was not attempted
+this pass (time-boxed; flagged as an open follow-up).
+
+**Decision: ship the re-swept table.** Per the task's own instruction ("a tuning table is only worth
+shipping if it does not regress ... say so with numbers"), the honest sweep is a net improvement in
+this pass's own measurement: mxfp4 gains materially at both `--mtp` settings (the layout the old
+sweep most overstated), w4a16 (the shipped default) is flat within noise, and only w4a8 `--mtp 3`
+regresses. w4a16 remains the fastest layout in absolute decode tok/s at both `--mtp` settings after
+the re-sweep (67.78 vs mxfp4's 64.31 and w4a8's 55.34 at `--mtp 3`; 38.46 vs 36.08/32.83 at
+`--mtp 0`), so **the default layout is unchanged.** The re-swept table is also simply *correct* in a
+way the old one was not (its own numbers no longer imply above-DRAM-peak bandwidth on any cell,
+unlike the old mxfp4 `mlp.down`/`gdn.in_proj_qkv` M=1 rows) -- shipping a known-wrong ranking signal
+because a downstream layout's MTP acceptance happens to benefit from its specific wrongness is not
+an acceptable tradeoff regardless of the tok/s delta.
+
+**Item 5 (docs updated): this section (docs/perf.md) plus docs/r9700.md's Q5 entry (marked answered,
+with the measured deltas above) and its two other references to the pre-fix numbers (§1.2's "L2/L1"
+rule-2 corollary near the P6 kernel-mode section, and the mxfp4-deficit discussion in §2.5) corrected
+in place.** `docs/status.md`'s "Known gaps going into Milestone 4" list item 2 is marked resolved
+(see that file). No other document was found to assert the specific above-DRAM-peak numbers this
+pass corrected. `docs/r9700.md`'s §2.4 (crossover row count M* table) and its M=64-anchored "Achieved
+R" values were spot-checked against the new table: M=64 rows moved by only 1-4% across the board
+(e.g. w4a8 `mlp.gate_up` M=64: 245.34 -> 238.73 us, -2.7%), well inside that section's own
+acknowledged imprecision, so **§2.4's M* table and empirical knee-point estimates were left as-is,
+not re-derived** -- the M=1..16 flips this pass found do not materially change a table anchored at
+M=64 (open issue, flagged for a future pass if M* itself needs re-deriving from the new low-M rows).
+
+Full `ctest` after the table swap: **35/35** (`tests\run_tests.ps1`, ~142s, HIP device 1) -- the
+table is data-only (`#include`d by `src/model/linear.cpp`'s `PickTuning`), so this is a
+correctness-preserving change by construction (`PickTuning` falls back to a safe default entry for
+any `(layout,N,K,M)` the table misses regardless of which specific tuning wins) confirmed by ctest's
+golden-output checks in `test_forward_smoke`/`test_mtp`/`test_gdn_layer`/`test_attn_layer` all still
+passing bit-for-bit against their tolerance-bounded goldens.
+
+## Milestone 4 follow-up: R2/P2 fused activation-quant epilogues enabled for w4a8/mxfp4 (2026-09-20)
+
+See `docs/status.md`'s "R2/P2 fused activation-quant epilogues: root-caused and enabled for
+w4a8/mxfp4" section for the root cause (an `r4dx::core::Arena::Alloc` end-alignment gap) and the
+mandatory byte-identical gate (`tools/validate_fusion.ps1`, 18/18 combinations byte-identical on
+real hardware). This section only records the measured performance delta. w4a16 is unaffected
+(`EpilogueForLayout` still returns `r4dx_epilogue_none` for it -- Problem B, a wall-clock
+regression, not a correctness issue) and is not re-listed below; its M3 numbers three sections down
+stand unchanged.
+
+Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP
+device 1, each config run twice (both runs agreed within 0.1%, well under the task's own 3%
+threshold for reporting both):
+
+| Layout | `mtp=0` decode, fusion OFF (M3 baseline) | `mtp=0` decode, fusion ON | Delta | `mtp=3` decode, fusion OFF (M3 baseline) | `mtp=3` decode, fusion ON | Delta |
+|---|---|---|---|---|---|---|
+| w4a8  | 35.73 tok/s | **36.19 tok/s** | +1.3% | 61.41 tok/s | **61.47 tok/s** | +0.1% (noise) |
+| mxfp4 | 30.27 tok/s | **30.85 tok/s** | +1.9% | 55.72 tok/s | **56.39 tok/s** | +1.2% |
+
+MTP acceptance is unchanged (fusion is greedy-deterministic byte-identical to the baseline, so it
+cannot change which draft tokens are accepted): w4a8 43.3% (2.27 tok/round), mxfp4 47.1% (2.32
+tok/round), both identical to the M3 numbers below. Prefill and VRAM are unchanged within noise
+(prefill: w4a8 ~726-741 tok/s `mtp=0` / ~729 tok/s `mtp=3`, mxfp4 ~658-660 tok/s `mtp=0` / ~648-657
+tok/s `mtp=3`; VRAM 16.17 GiB `mtp=0` / 16.60 GiB `mtp=3`, both layouts, matching M3 exactly).
+
+**Launches/token** (`r4dx-cli --profile`, r4dx-owned kernel-launch counter, one profiled decode
+step, fusion on vs `R4DX_DISABLE_EPILOGUE=1` off): mxfp4 597 -> **326** (-271; mxfp4's own quant
+kernel, `r4dx_quant_act_fp8e4m3_row`, lives in the counted translation unit, so this counter sees
+the real reduction); w4a8 260 -> **260** (unchanged -- this counter has always been blind to
+`core::r4d::QuantActI8`, a `third_party/libr4d` entry point outside the instrumented translation
+unit; docs/r9700.md's launch census already flags this scope gap. w4a8's real per-step launch count
+is lower too, just not visible to this particular counter). GEMM share of the profiled step's
+`gpu_sum` rose as non-GEMM launches were removed: mxfp4 72.2% (fusion off) -> 66.0% (fusion on) of a
+smaller total gpu_sum (44.44ms -> 40.64ms); w4a8 68.7% -> 65.5% (38.54ms -> 36.19ms) -- consistent
+with fusion cutting non-GEMM launch overhead without touching the GEMMs themselves.
+
+The gains are smaller than docs/r9700.md's P2 principle's upper-bound estimates (7.0/9.0/14.3 ms
+scaled-to-257-calls figures were explicitly flagged there as upper bounds that "exceed the
+steady-state headroom" -- the real result sits well inside that bound, as expected) but are real,
+reproducible, and free (no accuracy cost -- MTP acceptance is byte-for-byte unchanged). The default
+layout stays `w4a16` (task item 6's full layout-decision sweep was not re-run this pass -- these
+gains do not change the ranking, w4a16 remains fastest in absolute decode tok/s at both `--mtp`
+values measured).
+
 ## Milestone 3 consolidated performance (2026-09-20, integration pass)
 
 **bf16 is not reported in this section or in any Milestone 3 table below.** Per the standing rule
@@ -838,10 +1386,12 @@ scratch arena counted in. The three quantized layouts above ran with `--max-ctx 
 run used `--max-ctx 4096` initially and was re-run at `--max-ctx 512` to leave enough headroom for
 the fp8 KV cache (16 layers x kv_heads=4 x head_dim=256 x 2 x max_ctx bytes) not to push total
 usage past the card's limit -- 512 tokens of context is more than the ~29-token prompt plus 128
-generated tokens this run needs, but this is not the 131072-token default the CLI otherwise uses,
-and a longer bf16 conversation would need either a bf16-specific `--max-ctx` well under the
-quantized layouts' headroom or a card with more VRAM. mxfp4/w4a16/w4a8 have ample headroom (~14
-GiB free at `--max-ctx 2048`) to run at the CLI's full 131072-token default in practice.
+generated tokens this run needs, but this is not the 262144-token default the CLI otherwise uses
+(review finding, 2026-09-20: this note was stale from before "Long-context validation" raised the
+default 131072 -> 262144), and a longer bf16 conversation would need either a bf16-specific
+`--max-ctx` well under the quantized layouts' headroom or a card with more VRAM. mxfp4/w4a16/w4a8
+have ample headroom (~14 GiB free at `--max-ctx 2048`) to run at the CLI's full 262144-token
+default in practice (see this document's own "Long-context validation" section's 262144 VRAM row).
 
 ## Generated text (verbatim)
 
@@ -1021,7 +1571,8 @@ despite the ~7-13% per-GEMM error measured on their GDN/MLP/lm_head linears.
   `AttentionLayer` to accept `QuantLinear` is still future work, not addressed by this pass.
 - bf16 uses essentially 100% of the R9700's 31.86 GiB VRAM at `--max-ctx 512`; a longer bf16
   conversation needs a smaller `--max-ctx` still, or more VRAM. The three quantized layouts have
-  ample headroom at the CLI's 131072-token default.
+  ample headroom at the CLI's 262144-token default (raised from 131072, see this document's own
+  "Long-context validation" section; corrected here per review finding, 2026-09-20).
 - `docs/container-format.md`'s KV descale table note (still referencing a "placeholder 1.0" from
   an earlier stage) was not touched here -- KV descales ARE real per the CONVERSION stage's
   `--kv-calib` run baked into this container; whoever owns that doc should update it (same

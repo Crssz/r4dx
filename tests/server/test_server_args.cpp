@@ -33,7 +33,7 @@ void TestDefaults() {
   CHECK(a.layout == "bf16");
   CHECK(a.host == "127.0.0.1");
   CHECK(a.port == 8080);
-  CHECK(a.max_ctx == 131072);
+  CHECK(a.max_ctx == 262144);  // docs/r9700.md R13: raised from 131072, the model's real ceiling
   CHECK(a.max_tokens_default == 128);
   CHECK(a.max_queue == 16);
   CHECK(a.layers == -1);
@@ -43,6 +43,7 @@ void TestDefaults() {
   CHECK(a.default_top_k == 0);
   CHECK(a.default_min_p == 0.0f);
   CHECK(a.log_level == "info");
+  CHECK(a.mtp_head_layout == "layout");
 }
 
 void TestAllFlags() {
@@ -130,6 +131,67 @@ void TestUnparseableNumberThrowsServerUsageError() {
   CHECK(threw_usage_error);
 }
 
+// --mtp-head-layout (docs/mtp.md / docs/status.md Known-gaps item: server-side passthrough for the
+// flag src/cli/cli_args.h already had): mirrors that CLI flag exactly -- defaults to "layout",
+// accepts "bf16", rejects anything else.
+void TestMtpHeadLayoutFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_head_layout == "layout");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--mtp", "3",
+                                         "--mtp-head-layout", "bf16"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_head_layout == "bf16");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx",
+                                         "--mtp-head-layout", "bogus"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
+// --mtp-draft-head (docs/r9700.md R9, "reduced-vocab draft head"): mirrors src/cli/cli_args.h's own
+// flag -- defaults to "reduced", accepts "full", rejects anything else.
+void TestMtpDraftHeadFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_draft_head == "reduced");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--mtp", "3",
+                                         "--mtp-draft-head", "full"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp_draft_head == "full");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx",
+                                         "--mtp-draft-head", "bogus"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 // --embed-device-resident (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own flag --
 // defaults to "on", accepts "off", rejects anything else.
 void TestEmbedDeviceResidentFlag() {
@@ -160,6 +222,29 @@ void TestEmbedDeviceResidentFlag() {
   }
 }
 
+// --mtp upper bound (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own kMaxMtpDraftK
+// check -- Model::VerifyWindow requires mtp+1 candidates to fit in a <=64-row chunk, so 63 is the
+// real ceiling; previously only `>= 0` was checked here.
+void TestMtpUpperBound() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--mtp", "63"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.mtp == 63);
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--mtp", "64"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -169,7 +254,10 @@ int main() {
   TestUnrecognizedFlagThrows();
   TestNonsensicalValuesThrow();
   TestUnparseableNumberThrowsServerUsageError();
+  TestMtpHeadLayoutFlag();
+  TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();
+  TestMtpUpperBound();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

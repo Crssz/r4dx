@@ -13,13 +13,23 @@
 
 namespace r4dx::server {
 
+// See src/cli/cli_args.h's kMaxMtpDraftK for the derivation (Model::VerifyWindow requires
+// mtp+1 candidates to fit in a <=64-row chunk) -- duplicated here rather than shared because
+// these two headers are already a deliberate, documented duplication of every other --mtp* flag.
+inline constexpr int64_t kMaxMtpDraftK = 63;
+
 struct ServerArgs {
   std::string model_path;
   std::string layout = "bf16";
   std::string tokenizer_dir = "C:\\AI\\models\\Qwen3.8-27B";
   std::string host = "127.0.0.1";
   int port = 8080;
-  int64_t max_ctx = 131072;
+  // docs/r9700.md R13 (2026-09-20, measured): raised from 131072 -- the checkpoint's own
+  // config.json declares max_position_embeddings=262144 (rope_type "default", no scaling needed),
+  // and real hardware measurement shows the full 262144-token KV+GDN allocation still leaves
+  // 21-24% of the card's VRAM free (see src/cli/cli_args.h's matching comment and docs/r9700.md's
+  // R13/Q17 entries for the full measurement).
+  int64_t max_ctx = 262144;
   // -1 (default): load every layer Config().num_hidden_layers declares (the real 64-layer
   // container). >=0: load only the first N layers -- required for a smaller test container that
   // physically carries fewer layers than its (verbatim-copied) config.json declares, e.g.
@@ -44,6 +54,24 @@ struct ServerArgs {
   // src/server/engine.cpp's RunRequest) -- non-greedy requests always take plain decode regardless
   // of this flag, matching r4dx::model::Model::DecodeStepMtpGreedy's greedy-only contract.
   int64_t mtp = 0;
+  // MTP head layout (docs/mtp.md "MTP head layout"), same flag/semantics/default as
+  // src/cli/cli_args.h's --mtp-head-layout: "layout" (default, measured faster in 23/24 K x layout
+  // configurations with no acceptance-rate cost) loads the MTP head's four quantized linears
+  // (mtp.attn.qg/o, mtp.mlp.gate_up/down) in the same layout as --layout; "bf16" forces the
+  // exact-arithmetic head instead (~0.5 GB extra VRAM). No effect when --mtp is 0 or the container
+  // has no mtp.* weights. Was previously CLI-only (docs/status.md Known-gaps: "no server-side
+  // flag") -- every server Model used the measured-default layout-matched head unconditionally;
+  // added here purely as a passthrough so a server operator can force bf16 too, without changing
+  // the measured default.
+  std::string mtp_head_layout = "layout";
+  // Reduced-vocab draft head (docs/r9700.md R9), same flag/semantics/default as
+  // src/cli/cli_args.h's --mtp-draft-head: "reduced" (default) uses the container's OPTIONAL
+  // mtp.draft_head.* tensors to speed up drafting when present, "full" forces the exact pre-R9
+  // full-vocab draft head. Verification always stays full-vocab regardless of this flag (see
+  // model.h's ModelOptions::mtp_draft_reduced_vocab / MtpHead::Draft's own doc comments), so it can
+  // only affect drafting speed/acceptance, never generated output. No effect when --mtp is 0, the
+  // container has no mtp.* weights, or (silently, "reduced" only) no draft_head.* tensors.
+  std::string mtp_draft_head = "reduced";
   // Device-resident embedding gather (src/model/model.h's ModelOptions::embed_device_resident) --
   // same escape hatch and default as src/cli/cli_args.h's --embed-device-resident (review finding,
   // 2026-09-20: ModelOptions' own doc comment promised this flag before either binary actually had
@@ -65,6 +93,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
+         "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
          "[--embed-device-resident {on|off}]";
 }
 
@@ -117,6 +146,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--default-min-p") a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p"));
     else if (arg == "--log-level") a.log_level = NextServerArg(argc, argv, i, "--log-level");
     else if (arg == "--mtp") a.mtp = ServerParseI64("--mtp", NextServerArg(argc, argv, i, "--mtp"));
+    else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextServerArg(argc, argv, i, "--mtp-head-layout");
+    else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextServerArg(argc, argv, i, "--mtp-draft-head");
     else if (arg == "--embed-device-resident") a.embed_device_resident = NextServerArg(argc, argv, i, "--embed-device-resident");
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
@@ -133,7 +164,17 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.log_level != "debug" && a.log_level != "info" && a.log_level != "warn" && a.log_level != "error") {
     throw ServerUsageError("--log-level must be one of debug|info|warn|error");
   }
-  if (a.mtp < 0) throw ServerUsageError("--mtp must be >= 0");
+  if (a.mtp < 0 || a.mtp > kMaxMtpDraftK) {
+    throw ServerUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftK) +
+                            "] (Model::VerifyWindow batches mtp+1 candidates through a <=64-row "
+                            "chunk)");
+  }
+  if (a.mtp_head_layout != "bf16" && a.mtp_head_layout != "layout") {
+    throw ServerUsageError("--mtp-head-layout must be 'bf16' or 'layout'");
+  }
+  if (a.mtp_draft_head != "reduced" && a.mtp_draft_head != "full") {
+    throw ServerUsageError("--mtp-draft-head must be 'reduced' or 'full'");
+  }
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
     throw ServerUsageError("--embed-device-resident must be 'on' or 'off'");
   }

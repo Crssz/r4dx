@@ -11,6 +11,7 @@ set(R4DX_SERVER_TESTS
   test_response_sink
   test_request_queue
   test_prefix_state
+  test_tool_call_parser
 )
 
 foreach(t ${R4DX_SERVER_TESTS})

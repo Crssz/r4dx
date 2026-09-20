@@ -34,6 +34,14 @@
   e.g. D:\models\r4dx\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
   container with -Mtp 3 (this stage's own required verification runs).
 
+.PARAMETER ToolRoundTrip
+  Exercises a real tool call/result/answer multi-turn round trip (docs/server.md's "Tool calls"):
+  offers a `get_current_weather` tool definition, sends the server's own parsed
+  `message.tool_calls` back as a `role: "tool"` follow-up message, and checks the final answer
+  comes back 200 with real prose. Off by default -- the 4-layer test container's nonsense output
+  cannot reliably be coaxed into emitting a well-formed `<tool_call>` block, so this only produces
+  a meaningful check against a real container (pass -Layers -1 with a real -Model).
+
 .EXAMPLE
   .\tools\server\smoke.ps1
 .EXAMPLE
@@ -42,6 +50,8 @@
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b.r4dx -Layout w4a16 -Layers -1 -Mtp 3
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16 -Layers -1 -ToolRoundTrip
 #>
 [CmdletBinding()]
 param(
@@ -50,6 +60,7 @@ param(
     [int]$Port = 8091,
     [int]$Layers = 4,
     [int]$Mtp = 0,
+    [switch]$ToolRoundTrip,
     [string]$Preset = "win-hip"
 )
 
@@ -201,6 +212,130 @@ try {
     if ($Mtp -gt 0) {
         $mtpLines = @(Select-String -Path $ServerErrLog -Pattern " mtp: " -SimpleMatch -ErrorAction SilentlyContinue)
         Check ($mtpLines.Count -ge 1) "-Mtp ${Mtp}: at least one request log line shows the MTP path was taken"
+    }
+
+    # ---- Real tool call / result / answer round trip (docs/server.md's "Tool calls") -------------
+    if ($ToolRoundTrip) {
+        $weatherTool = @{
+            type     = "function"
+            function = @{
+                name        = "get_current_weather"
+                description = "Get the current weather for a location."
+                parameters  = @{
+                    type       = "object"
+                    properties = @{
+                        location = @{ type = "string"; description = "City and state, e.g. Boston, MA" }
+                        unit     = @{ type = "string"; enum = @("celsius", "fahrenheit") }
+                    }
+                    required = @("location")
+                }
+            }
+        }
+        $toolReqBody = @{
+            messages    = @(@{ role = "user"; content = "What is the weather like in Boston, MA right now? Use the tool." })
+            tools       = @($weatherTool)
+            max_tokens  = 64
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 8
+        $toolResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $toolReqBody -UseBasicParsing
+        $toolChat = $toolResp.Content | ConvertFrom-Json
+        Check ($toolResp.StatusCode -eq 200) "tool round trip: tool-offering request returns 200"
+        $gotCall = ($null -ne $toolChat.choices[0].message.tool_calls) -and ($toolChat.choices[0].message.tool_calls.Count -ge 1)
+        Check $gotCall "tool round trip: model emitted at least one structured tool_calls entry"
+
+        if ($gotCall) {
+            $call = $toolChat.choices[0].message.tool_calls[0]
+            Check ($call.type -eq "function") "tool round trip: tool_calls[0].type == 'function'"
+            Check ($call.function.name -eq "get_current_weather") "tool round trip: tool_calls[0].function.name == 'get_current_weather'"
+            Check ($call.function.arguments -is [string]) "tool round trip: tool_calls[0].function.arguments is a JSON-encoded STRING, not an object"
+            Check ($toolChat.choices[0].finish_reason -eq "tool_calls") "tool round trip: finish_reason == 'tool_calls'"
+            # Parse the (string) arguments to confirm they really are valid JSON, per-OpenAI-shape.
+            $parsedArgs = $call.function.arguments | ConvertFrom-Json
+            Check ([bool]$parsedArgs.location) "tool round trip: parsed arguments carry a 'location' field"
+
+            # Feed the call + a synthetic tool result back as a follow-up turn -- the full
+            # call/result/answer round trip this section of docs/server.md documents.
+            $followUpBody = @{
+                messages = @(
+                    @{ role = "user"; content = "What is the weather like in Boston, MA right now? Use the tool." },
+                    @{ role = "assistant"; content = $null; tool_calls = @($call) },
+                    @{ role = "tool"; tool_call_id = $call.id; content = '{"temperature_f": 68, "condition": "partly cloudy"}' }
+                )
+                max_tokens  = 64
+                temperature = 0
+                stream      = $false
+            } | ConvertTo-Json -Depth 8
+            $followUpResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json" -Body $followUpBody -UseBasicParsing
+            $followUpChat = $followUpResp.Content | ConvertFrom-Json
+            Check ($followUpResp.StatusCode -eq 200) "tool round trip: role:'tool' follow-up request returns 200"
+            Check ([bool]$followUpChat.choices[0].message.content) "tool round trip: follow-up answer has non-empty content"
+        }
+    }
+
+    # ---- `tools` + `stop` together must not echo the stop text back in content -------------------
+    # Regression check (review finding, 2026-09-20): EmitToken only trims what it STREAMS, never
+    # `accumulated` itself -- the tool_mode block used to re-derive its response straight from
+    # `accumulated`, so a stop string (and anything decoded in the same token after it) leaked into
+    # `message.content` whenever a request combined `tools` and `stop`. Without `tools` the content
+    # is correctly "" for a stop string matching the very first token (a single space); with
+    # `tools` it previously came back as the stop string itself.
+    $toolsStopBody = @{
+        messages    = @(@{ role = "user"; content = "Say hello." })
+        tools       = @(@{ type = "function"; function = @{ name = "noop"; description = "does nothing"; parameters = @{ type = "object"; properties = @{} } } })
+        stop        = @(" ")
+        max_tokens  = 8
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 8
+    $toolsStopResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $toolsStopBody -UseBasicParsing
+    $toolsStopChat = $toolsStopResp.Content | ConvertFrom-Json
+    Check ($toolsStopResp.StatusCode -eq 200) "tools+stop: request returns 200"
+    $toolsStopContent = $toolsStopChat.choices[0].message.content
+    Check ([string]::IsNullOrEmpty($toolsStopContent) -or -not $toolsStopContent.Contains(" ")) `
+        "tools+stop: message.content does not echo the matched stop string (got '$toolsStopContent')"
+
+    # ---- role: "function" message is accepted and rendered, not a 500 ---------------------------
+    # Regression check (review finding, 2026-09-20): chat_template.jinja has NO "function" branch
+    # (only system/user/assistant/tool) even though ParseChatCompletionRequest accepts role
+    # "function" and docs/server.md advertises it as a supported way to carry a tool result back --
+    # previously any request containing one 500'd with "ChatTemplate::render: Unexpected message
+    # role." Engine::RunRequest now remaps "function" to "tool" before rendering.
+    $functionRoleBody = @{
+        messages = @(
+            @{ role = "user"; content = "What is the weather like in Boston, MA?" },
+            @{ role = "function"; name = "get_current_weather"; content = '{"temperature_f": 68}' }
+        )
+        max_tokens  = 8
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 5
+    $functionRoleResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $functionRoleBody -UseBasicParsing
+    Check ($functionRoleResp.StatusCode -eq 200) "role:'function' message renders and returns 200 (was 500)"
+
+    # ---- messages with no user turn (only role:"tool") is a clean 400, not a 500 ----------------
+    # Regression check (review finding, 2026-09-20): chat_template.jinja's own multi-step-tool scan
+    # raises 'No user query found in messages.' when no message.role == "user" exists anywhere --
+    # newly reachable now that tool/function roles are accepted at the request-shape level. This is
+    # a caller-shape problem (bad conversation shape), so it must come back as 400
+    # invalid_request_error, not fall through to the engine's generic 500 handler.
+    $noUserBody = @{
+        messages = @(@{ role = "tool"; tool_call_id = "call_fake"; content = "some tool result" })
+        max_tokens  = 8
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 5
+    try {
+        Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $noUserBody -UseBasicParsing | Out-Null
+        Check $false "messages with no user turn returns 400 (was 500)"
+    } catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        Check ($status -eq 400) "messages with no user turn returns 400, not 500 (got $status)"
     }
 
     # ---- 400 on an unsupported (image) content part ----------------------------------------------

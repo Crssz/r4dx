@@ -89,6 +89,22 @@ void TestZeroBudgetStillCommitsWholeRoundMinusLast() {
   CHECK(r.hit_max_tokens);
 }
 
+// docs/r9700.md R9 ("extend tests/model/test_mtp.cpp and test_mtp_round.cpp for the wider
+// windows"): ProcessMtpRound's own arithmetic is width-agnostic (it just walks whatever `round`
+// vector it is given), but this is a direct regression test that a WIDE round (K=16 => round.size()
+// up to 17) hits no size-specific assumption -- e.g. an accidentally-int8-sized loop counter or a
+// hardcoded small bound -- that a K<=4 round would never have exercised.
+void TestWideRoundK16StillCommitsAllButLast() {
+  std::vector<int32_t> round(17);
+  for (int32_t i = 0; i < 17; ++i) round[static_cast<size_t>(i)] = 1000 + i;
+  const MtpRoundResult r = ProcessMtpRound(round, NeverEos, /*max_tokens_remaining=*/100);
+  CHECK(r.committed.size() == 16);
+  CHECK(r.displayed.size() == 17);
+  for (int32_t i = 0; i < 16; ++i) CHECK(r.committed[static_cast<size_t>(i)] == 1000 + i);
+  CHECK(!r.hit_eos);
+  CHECK(!r.hit_max_tokens);
+}
+
 void TestEmptyRound() {
   const std::vector<int32_t> round = {};
   const MtpRoundResult r = ProcessMtpRound(round, NeverEos, /*max_tokens_remaining=*/100);
@@ -106,6 +122,7 @@ int main() {
   TestFullAcceptanceDisplaysWholeRound();
   TestSingleElementRoundCommitsNothing();
   TestZeroBudgetStillCommitsWholeRoundMinusLast();
+  TestWideRoundK16StillCommitsAllButLast();
   TestEmptyRound();
 
   if (g_failures > 0) {

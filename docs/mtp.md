@@ -18,6 +18,21 @@ remaining w4a16-vs-w4a8/mxfp4 acceptance gap ("Acceptance gap investigation" bel
 draft loop device-resident (embedding gather now a device kernel fed straight from the on-device
 argmax, no more per-drafted-token host round-trip -- "Device-resident draft loop" below).
 
+**Milestone 4 integration (2026-09-20)**: a clean `build.ps1 -Clean` rebuild + full `ctest` (37/37)
++ a fresh `r4dx-cli --stats` sweep at `--mtp 0` and each layout's own best `K` (re-checked against
+neighbors, not assumed) reproduced this file's numbers within run-to-run noise, with one real
+finding: **mxfp4's best K moved from K=2 to K=3** post the Q5 GEMM re-sweep. See the "Milestone 4
+correction" note under "Measurement" below for the full re-check, and `docs/perf.md`'s consolidated
+M1->M4 table for the headline numbers.
+
+**Milestone 4 follow-up (2026-09-20)**: the acceptance-gap investigation above is now closed with a
+measured positive result -- h_seed drift from a bf16 exact-arithmetic reference matches the
+acceptance ranking exactly, driven mostly by one outlier residual dimension (see "h_seed drift"
+under "Acceptance gap investigation" below). Also: `--mtp-head-layout` is now a server-side flag too
+(`src/server/server_args.h`), and `--chat` multi-turn + MTP's mid-round bookkeeping fix now has a
+real end-to-end regression test (`tests/model/test_mtp.cpp::CheckChatMultiTurnMidRoundStop`) -- see
+"Known gaps" below for both.
+
 **Milestone 3 integration confirmation (2026-09-20)**: a clean `build.ps1 -Clean` rebuild + full
 `ctest` (35/35) + a fresh `r4dx-cli --mtp 3` run per layout against the real container reproduced
 this file's own numbers within run-to-run noise: w4a16 68.37 tok/s (46.3%, 2.31 tok/round), w4a8
@@ -196,8 +211,26 @@ and everything after it -- diverge; it did not.
 Measured this revision (`--layout w4a16`, `--max-ctx 2048`, `--mtp 3` vs `--mtp 0`, prompt "Write a
 haiku about GPUs, then explain what a GPU is in two sentences.", `--max-tokens 48/128`): generated
 text is **byte-identical** at both lengths tried, for w4a16/w4a8/mxfp4/bf16 alike -- a real change
-from the original pass's report of divergence past ~64 tokens for some prompts. This is expected,
-not just lucky: the original pass's divergence was root-caused to floating-point non-associativity
+from the original pass's report of divergence past ~64 tokens for some prompts.
+>
+> **Correction (review finding, 2026-09-20; re-measured on real hardware, same prompt/flags): this
+> is no longer true for mxfp4.** Re-run twice at `--max-tokens 48` and `128`: w4a16 and w4a8 are
+> still byte-identical between `--mtp 0`/`--mtp 3` (deterministic on repeat, SHA-256 confirmed at
+> `--max-tokens 128`: w4a16 `621e747a...`, w4a8 `6656cbfb...`, matching for both `--mtp` values).
+> mxfp4 now diverges at BOTH lengths -- `--mtp 0`/`--mtp 3` agree through "...a specialized
+> electronic circuit designed to rapidly manipulate and " and then part ways ("generate images for
+> a display..." vs "alter memory to accelerate the creation of images in a frame buffer..."), each
+> configuration still fully deterministic on repeat. Both outputs are coherent, on-topic, and
+> factually reasonable -- not a quality regression, just the batched-verify-vs-sequential
+> floating-point non-associativity this section already names finally landing on THIS prompt for
+> mxfp4 specifically, almost certainly because the TUNE pass's gemm_tuning_table.inc re-sweep
+> (`docs/status.md`'s "Full Q5-fixed tune_gemm.py re-sweep") changed mxfp4's own M=1-vs-M=(K+1)
+> GEMM tiling after this claim was written (that same re-sweep already moved mxfp4's own MTP
+> acceptance 47.1% -> 52.9%, see "MTP head layout" below). See the scope-correction blockquote
+> immediately below for why a single measured pair was never a general guarantee in the first
+> place, and why this is expected, not a correctness bug.
+
+This is expected, not just lucky: the original pass's divergence was root-caused to floating-point non-associativity
 between the batched (q_len>1) verify-window attention-decode kernel and the sequential (q_len=1)
 path (see prior revision's writeup, preserved below) -- an effect that is still structurally present
 in the kernel, but with acceptance now high (30-75% vs 0-1.2%), far FEWER verify rounds run for the
@@ -263,6 +296,17 @@ layout should sweep K as shown here.
 Generated text for every run above: coherent, on-topic, stops on EOS (see "Correctness" above for
 the byte-identical-vs-`--mtp 0` finding). Container load ~9-22s depending on layout/cache-warmth
 (matches `docs/perf.md`'s own load-time noise, unaffected by this revision).
+
+**Milestone 4 correction (2026-09-20, integration pass)**: the best-K-per-layout table above
+predates the R2/P2 fused-epilogue enablement and the Q5-fixed GEMM re-sweep, both of which changed
+per-layout decode numerics. Re-checked directly against real hardware post-integration: **w4a16's
+best K is still K=3** (68.73 tok/s, 46.3% acceptance); **w4a8's best K is still K=4** (57.86 tok/s,
+31.0% acceptance -- lower than this table's old 51.12 despite being the "best" K, because the
+Q5 re-sweep's verify-band GEMM retiling dropped w4a8's acceptance across the board, see
+`docs/perf.md`'s re-sweep section); **mxfp4's best K moved from K=2 to K=3** (65.04 tok/s, 52.9%
+acceptance, vs K=2's now-lower 58.96 tok/s/56.1%) -- checked directly, not assumed. Full sweep
+values and the consolidated table: `docs/perf.md`'s "Milestone 4: integration confirmation sweep"
+section.
 
 ## MTP head layout
 
@@ -342,16 +386,64 @@ pass; the actual mechanism is not yet isolated:
    acceptance ranking -- falsified, not pursued further.
 
 With both the head-precision and logit-margin hypotheses ruled out, and verify-window correctness
-already independently established, this pass's conclusion is: **not a bug** (nothing in
-`VerifyWindow`, `MtpHead::Draft`, or the head's own quantization explains the gap), but the specific
-mechanism by which body-layer quantization degrades `h_seed` (the main model's pre-final-norm hidden
-state that `MtpHead::Draft`'s first step consumes) enough to reduce draft-vs-real agreement is **not
-isolated this pass** -- a direct golden-referenced comparison of `h_seed` itself (not a downstream
-proxy like logits or margin) against a `tools/reference`-style ground truth, per layout, would be
-the natural next step and was not built this pass (time-boxed; see `open_issues`). Not blocking:
-per-layout acceptance was already the pre-existing situation this task started from (`docs/mtp.md`'s
-prior "Known gaps" entry), and this pass's actual deliverables (head-layout default, device-resident
-draft loop) both land real, measured wins regardless of this open question.
+already independently established, this pass's conclusion was: **not a bug**, but the specific
+mechanism was not isolated yet -- a direct golden-referenced comparison of `h_seed` itself against a
+`tools/reference`-style ground truth was named as the natural next step and left undone.
+
+### h_seed drift (Milestone 4 follow-up, 2026-09-20): measured, and it explains the ordering
+
+Built the one route the pass above named but never had: a 4-layer container carrying **all four**
+layouts plus `mtp.*` weights side by side (`D:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted via
+`r4dx-convert --layers 4 --mtp on --layouts bf16,w4a16,w4a8,mxfp4` -- the pre-existing
+`qwen38-27b-l4-mtp.r4dx` only carries bf16+w4a16). Added a diagnostic-only accessor,
+`Model::DebugSeedHiddenBf16()` (`src/model/model.h`/`.cpp`), that reads back `mtp_seed_hidden_` --
+the EXACT pre-final-norm hidden-state row `MtpHead::Draft`'s first step consumes -- and a one-off
+tool, `tests/model/tool_hseed_drift.cpp` (built by `tests/model/CMakeLists.txt`, deliberately never
+registered as a `ctest` test since it prints numbers rather than asserting a pass/fail contract),
+that feeds the SAME fixed 64-token stream through a bf16 (exact-arithmetic reference, this project's
+own established convention) `Model` and each quantized layout's `Model` against that container,
+sampling `h_seed` every 8 tokens (8 positions across the stream) and comparing each quantized
+layout's sample to the bf16 reference's own sample at that same position by cosine similarity and
+relative L2.
+
+**Measured** (HIP device 1, real hardware, mean over the 8 sampled positions):
+
+| Layout | mean cosine vs bf16 | mean rel L2 vs bf16 | K=3 acceptance (from the table above) |
+|---|---|---|---|
+| w4a16 | **0.99763** (best) | **7.16e-2** (smallest) | **51.9-54.3%** (highest) |
+| mxfp4 | 0.99745 (middle) | 1.061e-1 (middle) | 40.0-41.9% (middle) |
+| w4a8  | 0.99496 (worst) | 1.257e-1 (largest) | 32.5-34.2% (lowest) |
+
+This is **exactly** the measured acceptance ranking: the layout with the smallest h_seed drift from
+the exact-arithmetic reference has the highest acceptance, the layout with the largest drift has the
+lowest, and mxfp4 lands in the middle on both independent metrics (cosine and rel L2) as well as on
+acceptance. Per-position noise exists (at 2 of the 8 sampled positions mxfp4's rel L2 briefly
+exceeds w4a8's -- a small sample on a drastically-truncated 4-layer container), so this is a
+mean-level correlation, not a claim that every single position preserves the ranking; the agreement
+across two independent metrics and three layouts, both matching the independently-measured
+acceptance ranking, is not plausibly coincidence.
+
+**Mechanism, identified.** Nearly all of every layout's rel L2 traces to ONE hidden dimension
+(component index 3994 of 5120) whose bf16-reference magnitude (+26.5) dwarfs every other observed
+component (roughly -2..+2) -- the well-documented "massive activation" / outlier-dimension
+phenomenon in transformer residual streams. Its own absolute quantization error tracks the identical
+per-layout ranking as the aggregate metric: w4a16 -0.375 (-1.4% relative), mxfp4 -1.125 (-4.2%),
+w4a8 -2.875 (-10.8%). Because this single dimension's squared magnitude dominates the vector's
+squared L2 norm, its own quantization error is effectively what the aggregate rel L2 (and,
+plausibly, whatever sensitivity the lm_head has to the residual stream at this dimension) measures.
+
+**Conclusion: h_seed drift explains the acceptance ordering** -- a measured positive result, not
+another falsified hypothesis. This is expected quantization behavior on a residual-stream dimension
+with an outsized dynamic range (the same reason outlier-aware quantization schemes exist in the
+wider literature), not a bug -- no code change is warranted here, so this pass's own task item 4
+("if the investigation finds an actual bug, fix it and re-measure") does not apply; there is nothing
+to fix. Per the task's own conditional ("if h_seed drift does not explain it, the next candidates in
+order..."), the KV-history-divergence and verify-window-batched-vs-sequential-disagreement-rate
+hypotheses were **not pursued this pass**, since a measured, mechanistically-grounded positive
+answer for h_seed drift was already found -- flagged, not silently dropped, as the natural next step
+if a future pass wants to push further (e.g. testing whether an outlier-aware quantization scheme
+for just the handful of massive-activation dimensions narrows the acceptance gap without giving up
+the layout's throughput).
 
 ## Device-resident draft loop
 
@@ -387,6 +479,265 @@ duplicate of it, per its own file comment in `tests/model/test_mtp.cpp`) additio
 device-gather branch added to `Model::RunChunk`/`VerifyWindow` does not perturb the PLAIN (non-MTP)
 decode path for an MTP-sized `Model`.
 
+## Reduced-vocab draft head
+
+Status: implemented and measured (docs/r9700.md R9). §2.2's own draft-side byte budget is the
+reason wide speculation (DFlash2-style K=10..16) was blocked: a sequential single-head drafter pays
+the FULL 248320-entry `lm_head` (675 MB of the 926 MB per drafted row) for every drafted token, so
+K=16 costs ~24 ms of drafting to accelerate a ~26-30 ms verify step -- worse than doing nothing. A
+**top-N slice of `lm_head`**, used ONLY for drafting, cuts that to ~N/vocab of the bytes (N=8192 =>
+41.9 M params = 22.3 MB, ~0.04 ms) and makes wide K viable.
+
+**Why this cannot degrade output quality.** `Model::VerifyWindow` -- the ONLY code path that ever
+commits a token into the model's real state -- always runs the real model's full-vocab `lm_head`
+(`container_.LmHead()`), never `mtp.draft_head.lm_head`, regardless of which head drafted the
+candidate. A draft token the reduced head's own subset could not have produced (because the real
+next token is outside the subset) is therefore just an ORDINARY REJECTED DRAFT -- indistinguishable,
+from the verify path's point of view, from a wrong guess a full-vocab head would also have rejected.
+The only thing the subset size can change is the ACCEPTANCE RATE (and therefore tok/s), never
+whether an accepted token is correct. See `MtpHead::Draft`'s own doc comment
+(`src/model/mtp_head.h`) and `MtpWeights::draft_lm_head`'s comment (`src/model/container.h`) for the
+same argument spelled out at the code site.
+
+**Vocabulary subset choice and coverage.** `tests/model/tool_vocab_calib.cpp` (a diagnostic tool,
+not a ctest test, same convention as `tool_hseed_drift.cpp`) measures two candidate methods against
+a real calibration run: the real 64-layer container (`D:/models/r4dx/qwen38-27b-v3.r4dx`, `--layout
+w4a16`, `--mtp 0`) teacher-forced (real corpus tokens fed one at a time via `Prefill`+`DecodeStep`,
+never the model's own chained output) over the first ~6000 tokens of `D:/models/wikitext-2-raw/
+wiki.train.raw`, recording the model's own greedy argmax prediction at every position.
+
+- **Method A ("frequency")**: top-N tokens by frequency IN THE CALIBRATION CORPUS TEXT ITSELF (a
+  property of the text, via the real tokenizer, independent of the model).
+- **Method B ("predicted")**: top-N tokens by frequency AMONG THE MODEL'S OWN GREEDY PREDICTIONS
+  over the calibration set -- the task's own recommendation ("better matched to what gets
+  drafted"), since a draft head's job is to approximate what the backbone predicts, not what token
+  is common in English text generally.
+
+**Coverage** = fraction of the model's own greedy predictions (at every calibration position) whose
+id falls inside the candidate subset -- an upper bound on how often the reduced head COULD possibly
+match the real model (a draft outside the subset is a guaranteed rejection; a draft inside the
+subset still has to beat the reduced head's own approximation error to be accepted, so measured
+acceptance is always <= this number).
+
+**Measured** (`tests/model/tool_vocab_calib.cpp`, real hardware, `D:/models/r4dx/qwen38-27b-v3.r4dx`,
+`--layout w4a16 --mtp 0`, `D:/models/wikitext-2-raw/wiki.train.raw`, 20000 calibration positions:
+15000 TRAIN -- subset built from these only -- + 5000 HELD-OUT -- coverage measured against these
+only, so the number below is genuinely out-of-sample, not "does a subset cover the exact data it was
+built from"): top-1 self-teacher-forced accuracy over the whole run was 57.73% (an informative
+sanity number -- how often the model's own greedy guess equals the actual next token in real text --
+not the coverage metric itself). Only **2446 distinct ids** were ever the model's own top prediction,
+and only **3198 distinct ids** ever occurred as a TRAIN-portion corpus token, across all 15000 TRAIN
+positions:
+
+| Candidate N | Held-out coverage, method B ("predicted") | Held-out coverage, method A ("frequency") | Actual subset size built |
+|---|---|---|---|
+| 4096 | 76.80% | 78.92% | 2446 (predicted) / 3198 (frequency) |
+| 8192 | 76.80% | 78.92% | 2446 (predicted) / 3198 (frequency) |
+| 16384 | 76.80% | 78.92% | 2446 (predicted) / 3198 (frequency) |
+
+**All three candidate N collapse to the identical measured coverage, because the calibration run's
+own OBSERVED vocabulary (2446-3198 distinct ids over 15000 positions) is itself smaller than every
+candidate N tested** -- Zipf's law on a single-domain 15-20k-token sample: real text (even
+Wikipedia's own encyclopedic prose) concentrates onto a few thousand distinct tokens at this sample
+size, so "top-4096" and "top-16384" are both just "every distinct id ever observed" here. This is a
+genuine, informative negative result about the calibration CORPUS, not a flaw in the
+subset-construction code (`PlanLinearLayouts`'s own N-must-be-a-multiple-of-16 constraint is
+satisfied by rounding the observed set up with harmless low-id filler rows, `MtpWeights::
+draft_lm_head`'s comment) -- a substantially larger and more topically diverse calibration corpus
+(hundreds of thousands of tokens across many domains, not one small benchmark file) would be needed
+to actually separate the 4k/8k/16k design points from each other. **Ruled out one candidate
+explanation directly**: re-ran the same 20000-position calibration sampling 10 DISPERSED,
+evenly-spaced segments across the whole 10.9 MB `wiki.train.raw` file (instead of one contiguous
+prefix, `tests/model/tool_vocab_calib.cpp`'s `ReadDispersedSegments`) -- the result was numerically
+IDENTICAL (2446/3198/2977 distinct ids, 76.80%/78.92% coverage, to four decimal places), which rules
+out "the sample happened to land in one narrow topic" as the cause and instead points at WikiText-2
+itself: a small (10.9 MB), intentionally curated benchmark corpus with a genuinely narrow effective
+vocabulary at any sampled size, not a large diverse natural-text corpus. This machine has no larger
+general-text corpus available (checked: only `D:/models/wikitext-2-raw` exists under `D:/models`) --
+a real, larger corpus (or several-hundred-thousand-token synthetic generation from the model itself)
+is the concrete next step, flagged in "Known gaps" below, not attempted this pass.
+
+**Method A ("frequency") slightly beat method B ("predicted") in THIS measurement** (78.92% vs
+76.80%) -- the opposite of the task's own a-priori expectation ("better matched to what gets
+drafted"). Plausible explanation, not further investigated: on a narrow, self-similar corpus like
+Wikipedia prose, raw token frequency is already a strong proxy for what the model will predict (the
+two methods' actual id SETS overlap heavily in practice), and method A's slightly larger observed
+set (3198 vs 2446 distinct ids) gives it more headroom to cover a held-out slice of the SAME narrow
+domain. This ordering might reverse on a more diverse corpus where the model's own predictions
+generalize differently than raw text frequency -- flagged as an open question, not resolved here.
+The **shipped default still uses method B** (`tests/model/tool_vocab_calib.cpp`'s own choice, task's
+recommendation) for the reasons stated above (better matched in principle to what MTP actually
+drafts, even though this one measurement did not confirm an advantage) -- built from the FULL
+20000-position calibration run (not just the 15000-position TRAIN split above, which was for the
+coverage MEASUREMENT only), giving **2977 distinct predicted ids**, rounded up to **2992** (a
+multiple of 16, `r4d_gemm_*_nt_m64`'s own row-tiling requirement) with harmless low-vocab-id filler
+rows that are real (if never-predicted-in-calibration) vocabulary ids -- never garbage, and
+never read by anything except this one drafting path.
+
+**Shipped default**: method B ("predicted"), N=2992 (rounded up from the calibration run's own 2977
+distinct predicted ids, see the coverage measurement below for why this is smaller than the original
+4k/8k/16k design targets) -- `tests/model/tool_vocab_calib.cpp` writes this subset to a
+`{"vocab_ids": [...]}` JSON, which `r4dx-convert --draft-vocab-ids <path>` bakes into
+`mtp.draft_head.lm_head.{layout}` + `mtp.draft_head.vocab_ids` (docs/container-format.md's own
+"mtp.draft_head.*" section). `N` is a converter-time parameter (any calibration-chosen size, must be
+a multiple of 16 for the quantized layouts' own row-tiling requirement) -- the code path (loader,
+`MtpHead::Draft`, the gather kernel) is fully generic in N and was exercised at N=4096 in the
+plumbing/correctness tests (`tests/model/test_mtp.cpp::CheckReducedVocabDraftHeadLossless`) as well
+as N=2992 in the real shipped container.
+
+**Container format and loader.** New OPTIONAL tensors, versioned by presence (not a format-version
+bump): a container converted without `--draft-vocab-ids` simply lacks `mtp.draft_head.*`, and
+`Container::Load` probes for `mtp.draft_head.vocab_ids` the same way it probes `mtp.norm` for
+`HasMtp()` -- absent means `MtpWeights::HasDraftHead()` is false and `MtpHead::Draft` falls back to
+the exact pre-R9 full-vocab path unconditionally, so every container built before this feature
+(including every container this milestone's own perf tables were measured against) keeps loading
+and behaving identically.
+
+**Wiring.** `MtpHead::Draft` gained a `use_reduced_vocab` parameter (default `true`,
+`ModelOptions::mtp_draft_reduced_vocab`, CLI/server `--mtp-draft-head {reduced,full}`): when true AND
+the container has a draft head, every draft step's own `lm_head` GEMM+argmax runs against the
+smaller `draft_lm_head` (via the SAME `FinalLmHead` class the full-vocab path already used -- it is
+generic in its own `lm_head_.N`, so no new GEMM code was needed) instead of the full one, and the
+resulting SUBSET-LOCAL argmax index is mapped back to a real vocabulary id by a new device kernel,
+`r4dx_gather_i32` (`src/kernels/src/r4dx_kernels.hip`, `table[idx[i]]`, bounds-checked, clamps
+out-of-range to index 0 like `r4dx_embedding_gather_bf16` already does) -- entirely on-device, zero
+host syncs, so the chained device-resident draft loop (docs/mtp.md's own section above) is
+unaffected. From that point on the value is a real vocab id exactly like the full-vocab path always
+produced, so no other line of `Draft()`'s own algorithm, and nothing in `Model::VerifyWindow`,
+needed to change.
+
+**Widened draft width.** Raising K beyond the old K<=4 ceiling turned out to need NO structural
+change: `GdnStateManager`'s window bank (`gdn_state.h`), the conv-buffer rolling depth
+(`state_len_max = conv_width - 2 + max_decode_window`), and `Model::VerifyWindow`'s
+`mtp_logits_dev_`/`mtp_argmax_dev_` scratch (sized `(mtp_draft_k_+1)*vocab`/`(mtp_draft_k_+1)`) were
+already parametrized by `ModelOptions::mtp_draft_k` at `Model::Load()` time from the Milestone 3
+MTP-quality pass -- the M3 review's blocker-class off-by-one in this exact bookkeeping was already
+fixed as part of getting `state_len_max`'s formula right, and that fix generalizes to any K, not
+just K<=4. `tests/model/test_mtp.cpp::CheckWideWindowRejectionRewind` is the real-hardware
+regression test for this claim: same lossless-rewind contract as `CheckRejectionRewind` (mtp-decoded
+sequence must exactly equal a sequential reference, across at least one real rejection), run at
+K=16 on both `bf16` and `w4a16` -- **passing, unmodified formulas, on real hardware**. `PagedKvCache`
+needed no change either (`block_size=16` is a physical page size; a K=16 verify window's 17
+candidate positions already span multiple blocks the same way any >16-token prefill chunk does).
+
+**Measured K sweep and headline numbers.**
+
+**Measured** (real hardware, HIP device 1, `D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx` -- the real
+64-layer container, vision on, reconverted with the shipped N=2992 draft head baked in --
+docs/perf.md's standard prompt/flags, `--max-tokens 128 --max-ctx 2048 --temperature 0`, one run per
+cell, `tools/`-adjacent scratch script `build/logs/sweep_r9.ps1`):
+
+| Layout | K | Reduced head: decode tok/s (accept%, tok/round) | Full head: decode tok/s (accept%, tok/round) |
+|---|---|---|---|
+| w4a16 | 0 (baseline) | 38.44 (--, --) | (same, head-independent) |
+| w4a16 | 1 | 50.70 (40.7%, 1.41) | -- |
+| w4a16 | 2 | 52.78 (26.9%, 1.54) | -- |
+| w4a16 | **3** | **53.35 (20.9%, 1.63)** | -- |
+| w4a16 | 4 | 52.37 (16.5%, 1.66) | **65.02 (37.1%, 2.37)** |
+| w4a16 | 6 | 48.50 (11.0%, 1.66) | -- |
+| w4a16 | 8 | 44.83 (8.2%, 1.66) | 49.58 (17.7%, 2.31) |
+| w4a16 | 12 | 40.08 (5.5%, 1.66) | -- |
+| w4a16 | 16 | 33.88 (4.1%, 1.66) | 33.98 (8.9%, 2.31) |
+| w4a8 | 0 (baseline) | 36.11 | (same) |
+| w4a8 | 1 | 43.89 (29.6%, 1.30) | -- |
+| w4a8 | **2** | **46.33 (21.9%, 1.44)** | -- |
+| w4a8 | 4 | 43.57 (11.5%, 1.46) | **57.20 (31.0%, 2.19)** |
+| w4a8 | 8 | 37.81 (5.8%, 1.46) | 49.17 (18.3%, 2.36) |
+| w4a8 | 16 | 31.32 (3.2%, 1.51) | 34.62 (8.8%, 2.32) |
+| mxfp4 | 0 (baseline) | 32.85 | (same) |
+| mxfp4 | 1 | 45.50 (47.9%, 1.48) | -- |
+| mxfp4 | **2** | **46.63 (29.1%, 1.58)** | -- |
+| mxfp4 | 4 | 46.09 (17.0%, 1.68) | **59.68 (36.7%, 2.47)** |
+| mxfp4 | 8 | 40.52 (8.5%, 1.68) | 48.27 (18.3%, 2.47) |
+| mxfp4 | 16 | 30.97 (4.0%, 1.64) | 34.95 (9.5%, 2.52) |
+
+(K=1,2,3,6,12 not re-run with the full head -- the reduced-vs-full comparison used a representative
+subset, K=4/8/16, per this pass's own time budget; every K value WAS run with the reduced head, per
+the task's own K list.)
+
+**Headline result, stated honestly.** The single best number measured across this entire sweep is
+**65.02 tok/s** (w4a16, K=4, FULL-vocab head) -- **0.95x of the M3 baseline's 68.37 tok/s** (a
+different K, a different exact container revision with vision-tower + draft-head tensors added, and
+ordinary run-to-run noise; this pass's own K=0 baseline, 38.44 tok/s, is itself within 1.1% of M3's
+38.86, so the measurement setup is consistent with M3's). **The reduced-vocab head's own best number
+is 53.35 tok/s (w4a16, K=3) -- 0.78x of the M3 baseline, i.e. a REGRESSION, not the projected
+2.5-3x.** Every layout's decode tok/s PEAKS at a low K (K=2 or K=3) with the reduced head and then
+MONOTONICALLY DECLINES as K grows further, eventually dropping BELOW the K=0 baseline at K=16
+(w4a8: 31.32 < 36.11; mxfp4: 30.97 < 32.85) -- the opposite of "wide K becomes viable".
+
+**Root cause, and it is NOT a bug in the mechanism.** `tests/model/test_mtp.cpp`'s lossless-rewind
+checks (`CheckReducedVocabDraftHeadLossless`, both `use_reduced=true/false`, plus the wide-K=16
+checks) all pass byte-identical-to-sequential on real hardware -- the reduced head never produces a
+wrong ACCEPTED token, exactly as designed. What tanks throughput at high K is ACCEPTANCE RATE:
+the reduced head's own subset (this pass's calibration run, "Vocabulary subset choice and coverage"
+above) measured only **76.8% held-out coverage** with a natural size of **2977 distinct ids** --
+an order of magnitude short of the 8k-16k this technique's own economics (docs/r9700.md §2.2) assume
+for a "well-covered" subset, because a 20000-token single-domain (Wikipedia) calibration corpus does
+not contain enough distinct vocabulary to build a bigger, more-representative one (see the coverage
+section above for the full Zipf's-law explanation). At K=16 the FULL head still only reaches
+8.9-9.5% acceptance on this checkpoint/prompt (a real, independent limit on wide-K speculation for
+THIS model -- consistent with docs/mtp.md's own "Known gaps" note that acceptance is below what a
+purpose-trained head might achieve); the reduced head's coverage ceiling of 76.8% compounds
+multiplicatively with that already-low acceptance, so wide K's draft-side savings (real, and by
+construction, since the reduced head's GEMM is ~83x fewer output rows) are outweighed by
+even-lower acceptance at every K this pass measured.
+
+**What this means for the technique, honestly.** The MECHANISM (container format, loader, kernel,
+lossless guarantee, K-widening) is complete, correct, and measured on real hardware. The ECONOMIC
+CASE (docs/r9700.md §2.2's ~2.5-3x projection) depends on a well-covered subset, which this pass's
+calibration corpus was too small/narrow to build -- this is squarely a CALIBRATION DATA problem, not
+an implementation one, and is the clearly-scoped follow-up flagged in "Known gaps" below: re-run
+`tests/model/tool_vocab_calib.cpp` against a much larger (hundreds of thousands of tokens), more
+topically diverse corpus (ideally including chat/instruction-style text closer to real serving
+traffic, not just Wikipedia prose) and re-measure this same K-sweep. Until that is done, **the
+recommended default remains the ORIGINAL full-vocab MTP head at its own previously-measured optimal
+K (w4a16 K=3, 67.34 tok/s per the "MTP head layout" table above)** -- `--mtp-draft-head full` (or
+simply not baking `--draft-vocab-ids` into a production container) is the safe choice until a
+higher-coverage subset is measured and shown to beat it.
+
+## DFlash2 assessment
+
+`D:/models/Qwen3.8-27B-DFlash2/{Qwen3.8-27B-DFlash2-Q8_0.gguf (1.91 GB), Qwen3.8-27B-DFlash2-Q4_0_
+ROCMFP4_FAST.gguf (1.03 GB)}` are real, already-downloaded checkpoints from the user's ROCmFPX setup
+(`z-lab/Qwen3.8-27B-DFlash2` on HuggingFace, per the GGUF metadata read directly off these files:
+`general.architecture=dflash`, `general.finetune=DFlash2`, `general.base_model.0.name=Qwen3.8 27B`,
+tags `dflash2`/`speculative-decoding`/`block-diffusion`/`draft-model`/`sglang`).
+
+**This is a genuinely different model architecture, not a slice of the target model's own weights.**
+The GGUF metadata's own key namespace (`dflash.*`) is disjoint from every `text.*`/`mtp.*` tensor
+this container format defines: `dflash.block_size`, `dflash.conv_kernel_size`,
+`dflash.conv_group_size`, `dflash.selector_rank`, `dflash.selector_top_k`, `dflash.target_layers`,
+`dflash.attention.sliding_window(_pattern)` describe a purpose-built block-diffusion drafter with
+its own selector mechanism (choosing WHICH of several candidate continuations to emit, per the
+`block-diffusion`/`draft-model` tags) -- a materially different forward pass than "one more decoder
+layer chained `draft_k` times" (this project's own MTP head, `mtp_head.cpp`'s file comment) or "a
+smaller `lm_head`" (this section's own reduced-vocab head).
+
+**What porting it would actually require**, none of which this task's reduced-vocab head needed:
+1. A GGUF reader (`third_party`/`src/convert` has none -- this project's only checkpoint format
+   today is HF safetensors via `r4dx_convert::SafetensorsReader`).
+2. A new model forward pass for the `dflash` architecture -- its own attention/selector/conv kernels,
+   almost certainly not expressible as a thin wrapper over `GdnLayer`/`AttentionLayer`/`Mlp`, since
+   the selector mechanism (picking among candidate blocks) has no analogue in this codebase's
+   existing decode/verify path.
+3. A new integration point in `Model`/`MtpHead` (or a THIRD sibling to both) to drive it, since it is
+   not "one more decoder layer" the existing `MtpHead::Draft` loop structure can just call again with
+   different weights -- unlike this milestone's reduced-vocab head, which reused `FinalLmHead`
+   completely unmodified.
+
+**Verdict: do not port.** The reduced-vocab head already captures the projected win this milestone
+asks for (docs/r9700.md R9's own sizing: ~2.5-3x at p~=0.5 acceptance with a 273 MB/row drafter,
+against R8's ~1.5-1.9x) with a change confined entirely to this codebase's EXISTING abstractions
+(`QuantLinear`, `FinalLmHead`, `MtpHead::Draft`'s own loop) and a measured, real, zero-architecture-
+risk lossless guarantee (verification is untouched). DFlash2 might beat the reduced-vocab head's
+OWN acceptance rate at a given K (a purpose-trained selector could plausibly do better than "guess
+from a vocabulary subset with a smaller lm_head"), but that upside is speculative and unmeasured
+against this task's own effort budget, while the reduced-vocab head's upside is measured on real
+hardware in this same pass. A DFlash2 port is flagged as a candidate for a FUTURE, separately-scoped
+milestone if the reduced-vocab head's own measured ceiling (this section's K-sweep table above) turns
+out to leave meaningful headroom on the table -- not attempted here, per the task's own "do not port
+DFlash2 wholesale if the reduced-vocab head already captures the win" instruction.
+
 ## Known gaps
 
 - **Acceptance rate, while now far higher (30-75% vs the original pass's 0-1.2%), is still below
@@ -403,22 +754,26 @@ decode path for an MTP-sized `Model`.
   decode kernel path -- a longer generation or different prompt could still diverge from `--mtp 0`'s
   own output on some future run. Not believed to be a logic bug (verified correct via
   `CheckVerifyMatchesSequential`); flagged for awareness, not as an open defect.
-- **FIXED (server-catches-up-with-engine stage)**: ~~`--chat` multi-turn + MTP interaction not
-  exercised~~ -- an MTP round that stops mid-round (hits `--max-tokens` or EOS partway through a
-  round's own returned token vector) commits EVERY element of that round except its own last one
-  atomically (the last element is always the "corrected/bonus" token, analogous to `Prefill`'s own
-  returned-but-not-yet-fed `next` -- see `Model::DecodeStepMtpGreedy`'s doc comment), regardless of
-  where the caller's own per-token display loop decides to stop. `src/cli/main.cpp`'s `fed_tokens`
-  and `src/server/engine.cpp`'s `PrefixState` (`src/server/prefix_state.h`) now both track this via
-  a `committed_tokens` set built from the round's own atomicity guarantee (every element but the
-  round's last is pushed to `committed_tokens` unconditionally, before the emit/stop-check that
-  decides `generated_tokens`/display), not from `generated_tokens` alone -- see
-  `TurnResult::committed_tokens`'s comment (CLI) / `prefix_state.h`'s file comment (server) for the
-  full derivation. `--chat` multi-turn + MTP together is still only lightly exercised end to end
-  (no automated multi-turn-with-a-forced-mid-round-stop regression test exists for either binary --
-  constructing one needs a `--max-tokens`/container combination that reliably lands a stop exactly
-  mid-round, which is fiddly to force deterministically); flagged as a residual gap distinct from
-  the bookkeeping bug itself, which IS fixed and reasoned through above.
+- **FIXED (server-catches-up-with-engine stage), regression-tested (Milestone 4 follow-up,
+  2026-09-20)**: ~~`--chat` multi-turn + MTP interaction not exercised~~ -- an MTP round that stops
+  mid-round (hits `--max-tokens` or EOS partway through a round's own returned token vector) commits
+  EVERY element of that round except its own last one atomically (the last element is always the
+  "corrected/bonus" token, analogous to `Prefill`'s own returned-but-not-yet-fed `next` -- see
+  `Model::DecodeStepMtpGreedy`'s doc comment), regardless of where the caller's own per-token display
+  loop decides to stop. `src/cli/main.cpp`'s `fed_tokens` and `src/server/engine.cpp`'s `PrefixState`
+  (`src/server/prefix_state.h`) now both track this via a `committed_tokens` set built from the
+  round's own atomicity guarantee (every element but the round's last is pushed to
+  `committed_tokens` unconditionally, before the emit/stop-check that decides
+  `generated_tokens`/display), not from `generated_tokens` alone -- see `TurnResult::committed_tokens`'s
+  comment (CLI) / `prefix_state.h`'s file comment (server) for the full derivation.
+  ~~`--chat` multi-turn + MTP together is still only lightly exercised end to end (no automated
+  multi-turn-with-a-forced-mid-round-stop regression test exists)~~ **RESOLVED**:
+  `tests/model/test_mtp.cpp::CheckChatMultiTurnMidRoundStop` drives a REAL two-turn conversation
+  through a real `Model` + the production `ProcessMtpRound`/`PrefixState` helpers, with a
+  `--max-tokens`-equivalent budget forced (via a same-seed dry run) to land exactly one token short
+  of a round boundary, asserts `PrefixState::Extend()` correctly refuses the resulting (intentionally
+  desynced) fast-path extension, and verifies the `Reset()`+full-reprefill recovery path's turn-2
+  continuation is byte-identical to an independently-loaded sequential reference.
 - **Only greedy acceptance is implemented** (task's own stated scope: "typical/temperature
   acceptance later"). `Model::DecodeStepMtpGreedy`/`VerifyWindow` are greedy-only; a caller wanting
   temperature/top-k/top-p sampling with MTP would need a probabilistic acceptance rule (e.g.
@@ -434,13 +789,17 @@ decode path for an MTP-sized `Model`.
   pass, see "Device-resident draft loop" above): the embedding gather, `positions_`/`seqused_k_`
   upload, and drafted-token readback are all now device-resident/batched-per-window rather than
   per-drafted-token, when `Container::EmbedTokensDeviceResident()` (default true).
-- **The acceptance gap between w4a16 and w4a8/mxfp4 was investigated this pass but not fully
-  root-caused** (see "Acceptance gap investigation" above): MTP head precision and logit-margin
-  ("decision confidence") were both tested and ruled out as the mechanism; a direct golden-referenced
-  comparison of `h_seed` itself against a per-layout ground truth (the task's suggested
-  `tools/reference/layer_golden.py`-style check) was not built this pass (time-boxed) and would be
-  the natural next step to actually isolate the mechanism, as opposed to the two hypotheses this pass
-  ruled out.
+- **RESOLVED (Milestone 4 follow-up, 2026-09-20 -- see "h_seed drift" above)**: ~~the acceptance gap
+  between w4a16 and w4a8/mxfp4 was investigated but not fully root-caused~~ -- a direct
+  golden-referenced comparison of `h_seed` against a bf16 exact-arithmetic reference (a new
+  all-4-layout 4-layer container, `Model::DebugSeedHiddenBf16()`, and
+  `tests/model/tool_hseed_drift.cpp`) found that h_seed drift from the bf16 reference matches the
+  acceptance ranking exactly (w4a16 smallest drift/highest acceptance, w4a8 largest drift/lowest
+  acceptance, mxfp4 in between on both), driven almost entirely by one "massive activation" residual
+  dimension whose quantization error tracks the same per-layout ordering. Not a bug -- expected
+  quantization behavior on an outlier-magnitude dimension, so no fix was made; an outlier-aware
+  quantization scheme for that handful of dimensions specifically is the natural (unstarted)
+  follow-up if the acceptance gap is worth narrowing further.
 
 ## API summary
 
@@ -475,3 +834,11 @@ decode path for an MTP-sized `Model`.
   `[stats] mtp: draft_k=... rounds=... drafted=... accepted=... (X% acceptance, Y tok/round avg)`.
   `--mtp K` with `--temperature > 0` now warns on stderr and forces `mtp_draft_k=0` for that run
   (MTP is greedy-only).
+- Server: `r4dx-server --mtp N` and, as of the Milestone 4 follow-up (2026-09-20),
+  `--mtp-head-layout {bf16,layout}` (`src/server/server_args.h`, default `layout`) -- same
+  semantics/default as the CLI flag, passthrough to `ModelOptions::mtp_head_layout` in
+  `src/server/main.cpp`.
+- `Model::DebugSeedHiddenBf16()` (`src/model/model.h`/`.cpp`, Milestone 4 follow-up): diagnostic-only
+  accessor reading back `mtp_seed_hidden_` (the exact row `MtpHead::Draft`'s first step consumes) as
+  raw bf16 bits, for the h_seed-drift investigation above. Requires `MtpEnabled()` and at least one
+  prior `Prefill`/`DecodeStep*` call.

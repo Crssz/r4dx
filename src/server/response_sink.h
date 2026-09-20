@@ -12,7 +12,10 @@
 #include <optional>
 #include <string>
 
+#include <vector>
+
 #include "nlohmann/json.hpp"
+#include "openai_types.h"
 #include "request_queue.h"
 
 namespace r4dx::server {
@@ -38,6 +41,14 @@ class ResponseSink {
   // slipped past validation, a KV-cache-capacity overrun, ...).
   virtual void OnError(int http_status, const std::string& message) = 0;
 
+  // Called at most once, strictly before OnDone, iff Engine parsed one or more structured tool
+  // calls out of this generation (docs/server.md's "Tool calls" -- streaming decision: tool calls
+  // are always buffered whole and delivered here as a single complete batch, never as incremental
+  // per-argument-byte deltas the way OpenAI's own server streams them -- see that section for the
+  // full rationale). Default no-op so ResponseSink's other implementations (were there any that
+  // don't care) don't have to override it.
+  virtual void OnToolCalls(const std::vector<ToolCallOut>& /*calls*/) {}
+
   // The worker polls this between decode steps; true means stop generating now. Only
   // StreamingSink ever returns true (set by Cancel() when the HTTP layer detects the client is
   // gone); BufferingSink's non-streaming request has no analogous "give up early" signal.
@@ -56,6 +67,8 @@ class BufferingSink : public ResponseSink {
   // Blocks the calling thread until OnDone or OnError has been called.
   void Wait();
 
+  void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
+
   std::string text;
   std::string finish_reason;
   int64_t prompt_tokens = 0;
@@ -63,6 +76,7 @@ class BufferingSink : public ResponseSink {
   bool errored = false;
   int error_status = 500;
   std::string error_message;
+  std::vector<ToolCallOut> tool_calls;  // set by OnToolCalls, empty for a plain-text response
 
  private:
   std::mutex mu_;
@@ -83,6 +97,7 @@ class StreamingSink : public ResponseSink {
   void OnToken(const std::string& piece) override;
   void OnDone(const std::string& finish_reason, int64_t completion_tokens) override;
   void OnError(int http_status, const std::string& message) override;
+  void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
   bool IsCancelled() const override { return cancelled_.load(std::memory_order_relaxed); }
 
   // Called by the HTTP handler thread (httplib's chunked-content-provider callback) to pull the

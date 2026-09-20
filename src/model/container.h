@@ -94,6 +94,24 @@ struct MtpWeights {
   core::DeviceBuffer<uint16_t> norm;                   // bf16 [hidden]
   core::DeviceBuffer<uint16_t> pre_fc_norm_hidden;     // bf16 [hidden]
   core::DeviceBuffer<uint16_t> pre_fc_norm_embedding;  // bf16 [hidden]
+
+  // Reduced-vocab draft head (docs/r9700.md R9, docs/mtp.md "reduced-vocab draft head"): an
+  // OPTIONAL sliced lm_head over a subset of the real vocabulary, used ONLY to speed up
+  // MtpHead::Draft's own drafting -- VERIFICATION always runs the real model's full-vocab lm_head
+  // (Model::VerifyWindow, container_.LmHead()), never this one, which is what keeps the technique
+  // lossless: a draft token this head would have produced but that the real model's full-vocab
+  // verify pass does not confirm is simply rejected, exactly like a wrong full-vocab-head draft
+  // would be -- an out-of-subset "true" next token is a lower ACCEPTANCE RATE, never a wrong
+  // accepted answer. Both members are empty/unpopulated (draft_lm_head.N == 0) when the container
+  // was converted without --draft-vocab-ids (old containers, or a run that chose not to build one)
+  // -- MtpHead::Draft falls back to the full-vocab head unconditionally in that case, the same
+  // "absent optional tensor -> old behavior" contract LoadQuantLinearWithFallback's callers use
+  // elsewhere in this file, just simpler here (no on-disk fallback CHAIN, only "present or absent",
+  // since this is a genuinely new/optional feature rather than a tensor that used to have one
+  // fixed on-disk form).
+  QuantLinear draft_lm_head;                    // [draft_vocab_size, hidden], N==0 if absent
+  core::DeviceBuffer<int32_t> draft_vocab_ids;  // [draft_vocab_size]: subset index -> real vocab id
+  bool HasDraftHead() const { return draft_lm_head.N > 0; }
 };
 
 class Container {

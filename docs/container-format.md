@@ -181,6 +181,35 @@ and no permutation -- the vision tower runs on `r4d_attn_vit_h72_bf16` in bf16 e
 `mtp.*` has the exact tensor set of one `text.layers.{i}` entry (its own attention or GDN block per
 `mtp_num_hidden_layers=1`, MLP, norms), just prefixed `mtp.` instead of `text.layers.{i}.`.
 
+### `mtp.draft_head.*` (OPTIONAL, docs/r9700.md R9 "reduced-vocab draft head")
+
+```
+mtp.draft_head.lm_head.{layout}     [draft_vocab_size, hidden]  (same {layout} family as lm_head)
+mtp.draft_head.vocab_ids            raw int32[draft_vocab_size]: subset index -> real vocab id
+```
+
+Present only when the container was converted with `--draft-vocab-ids <json>` (`src/convert/main.cpp`);
+absent from every container converted without that flag, including every container that predates
+this feature. `mtp.draft_head.lm_head` is a plain row-slice of `lm_head.weight` (same `K`=`hidden`,
+`N`=`draft_vocab_size` rows instead of the full vocab), planned/emitted through the exact same
+`PlanLinearLayouts`/`EmitLinearLayouts` helpers every other quantized linear uses, so it carries the
+same `{layout}` family (`mxfp4`/`w4a16`/`w4a8`/`bf16`) and the same `mtp_head_layout` load-time
+selection as `mtp.attn.qg/o` and `mtp.mlp.gate_up/down`. `mtp.draft_head.vocab_ids` is a raw on-disk
+int32 array (no dtype conversion, no permutation) -- element `i` is the REAL vocabulary id that
+subset-local index `i` represents; `src/model/mtp_head.cpp`'s `r4dx_gather_i32` kernel is the only
+consumer, mapping a subset-local argmax back to a real id entirely on-device.
+
+**This tensor pair is used ONLY by `MtpHead::Draft` (drafting).** `Model::VerifyWindow` always reads
+the real, full-vocab `lm_head.{layout}` tensor regardless of whether `mtp.draft_head.*` is present --
+this is what keeps the technique lossless (docs/mtp.md's "reduced-vocab draft head" section has the
+full argument): a draft token the reduced head's own subset could not represent is simply a rejected
+draft, identical in effect to a wrong full-vocab-head guess, never a wrong ACCEPTED token.
+`src/model/container.cpp`'s loader probes for `mtp.draft_head.vocab_ids` the same way it probes for
+`mtp.norm` to decide `HasMtp()` -- absent means `MtpWeights::HasDraftHead()` is false and
+`MtpHead::Draft` falls back to the full-vocab head unconditionally, so an old container (or any
+container converted without `--draft-vocab-ids`) loads and behaves exactly as before this feature
+existed.
+
 ## Provenance
 
 - `r4d.h` (this repo's `third_party/libr4d/r4d.h`): every kernel's parameter comment, cited above

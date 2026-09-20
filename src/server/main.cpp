@@ -43,7 +43,11 @@ int main(int argc, char** argv) {
   opts.model_opts.max_ctx = args.max_ctx;
   opts.model_opts.layer_limit = args.layers;
   opts.model_opts.mtp_draft_k = args.mtp;
+  opts.model_opts.mtp_head_layout = (args.mtp_head_layout == "bf16")
+                                         ? std::optional<r4dx::model::Layout>(r4dx::model::Layout::kBf16)
+                                         : std::nullopt;
   opts.model_opts.embed_device_resident = (args.embed_device_resident != "off");
+  opts.model_opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
   opts.tokenizer_dir = args.tokenizer_dir;
   opts.max_tokens_default = args.max_tokens_default;
   opts.max_queue = args.max_queue;

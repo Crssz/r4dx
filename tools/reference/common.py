@@ -114,8 +114,16 @@ class ShardIndex:
         from safetensors import safe_open
 
         shard = self.weight_map[name]
+        # .clone(): this venv's safetensors/torch build returns a tensor whose storage aliases the
+        # `safe_open` context manager's own mmap -- once `with` exits and unmaps the file, that
+        # storage is dangling. Reading a handful of tensors (layer_golden.py's ~14-20 per component)
+        # never surfaced this because Python's GC/OS page cache happened to keep the mapping alive
+        # long enough; a tight loop over a few hundred tensors (tools/reference/vision_golden.py's
+        # ~330 vision.* weights) reproducibly crashes the interpreter with SIGSEGV/access-violation,
+        # or worse, silently reads whatever now occupies that address range instead. Found and fixed
+        # 2026-09-20 while building vision_golden.py -- see docs/status.md's vision-tower entry.
         with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as f:
-            return f.get_tensor(name)
+            return f.get_tensor(name).clone()
 
     def get_row_slice(self, name: str, start: int, stop: int) -> torch.Tensor:
         """Read rows [start:stop) of a 2D tensor without materializing the whole thing."""
@@ -124,7 +132,7 @@ class ShardIndex:
         shard = self.weight_map[name]
         with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as f:
             sl = f.get_slice(name)
-            return sl[start:stop, :]
+            return sl[start:stop, :].clone()  # same dangling-mmap risk as get_tensor above
 
 
 def load_module_state(

@@ -185,6 +185,24 @@ void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t str
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
                                  int64_t vocab, int64_t stream);
 
+// ---- device-side single/few-element gather (docs/r9700.md R9, reduced-vocab MTP draft head) ----
+// out[i] = table[idx[i]] for i in [0, n), entirely on-device -- the general-purpose counterpart of
+// r4dx_embedding_gather_bf16 above but for a plain int32 lookup table instead of a [vocab,hidden]
+// embedding row table. Built for MtpHead::Draft's reduced-vocab draft head (docs/mtp.md "reduced-
+// vocab draft head"): after computing argmax over the SUBSET logits (r4dx_argmax_f32 with
+// vocab==draft_vocab_size), the result is a subset-local index, not a real vocabulary id -- this
+// kernel maps it back to the real id via the container's `mtp.draft_head.vocab_ids` table with zero
+// host round-trips, so the chained device-resident draft loop (idx feeds embedding gather feeds the
+// next draft step) never needs to leave the device. `n` is always small (1 in every current caller)
+// but this is not hardcoded to n==1 in case a future caller wants to gather a few indices in one
+// launch. Bounds-checked the same way r4dx_embedding_gather_bf16 is: an idx outside [0, table_size)
+// clamps to table[0] rather than reading out-of-bounds device memory (same "degrade to a
+// wrong-but-safe value, never fault mid-kernel" reasoning as that kernel's own doc comment).
+// table: [table_size] int32 device pointer. idx: [n] int32 device pointer (subset-local indices).
+// out: [n] int32 device pointer (may alias idx's own buffer only if n==1 -- see call sites).
+void r4dx_gather_i32(int64_t table, int64_t idx, int64_t out, int64_t n, int64_t table_size,
+                      int64_t stream);
+
 // ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
 // A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per
 // model.h's own SCOPE comment, so this needs no atomic/lock any more than PickTuning's cache does)

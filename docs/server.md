@@ -21,14 +21,16 @@ loaded), `messages` (chat) / `prompt` (completions), `temperature`, `top_p`, `to
 given), `seed`, `stop` (a string or array of strings), `stream`, `chat_template_kwargs` (an object
 passed straight through to `ChatTemplate::render()`'s `extra_context` -- `chat_template.h`
 documents `enable_thinking`/`reasoning_effort`/`preserve_thinking`/`add_vision_id` as the fields
-Qwen3.8-27B's own template understands), `tools` (passed straight through to the template so it
-still renders tool definitions into the prompt text -- see "Tool calls" below).
+Qwen3.8-27B's own template understands), `tools` (rendered into the prompt AND parsed back out of
+the generation into a structured `message.tool_calls` response field -- see "Tool calls" below),
+`tool_choice` (`"none"`/`"auto"`/`"required"`/`{"type":"function","function":{"name":...}}`, see
+"Tool calls").
 
 Message `content` may be a plain string or an OpenAI-style array of parts
 (`[{"type":"text","text":"..."}]`); any non-`"text"` part (`image_url`, ...) is rejected with a
 `400 invalid_request_error` -- there is no vision tower forward pass yet (`docs/status.md`'s "Known
-gaps"). Message `role` must be `system`, `user`, or `assistant`; `tool`/`function` roles are
-rejected the same way (see "Tool calls" below).
+gaps"). Message `role` must be `system`, `user`, `assistant`, `tool`, or `function` -- the latter two
+carry a tool result back to the model (see "Tool calls" below).
 
 ### Response shapes
 
@@ -38,15 +40,126 @@ Standard OpenAI `chat.completion` / `chat.completion.chunk` / `text_completion` 
 mid-stream). Streaming responses are `Content-Type: text/event-stream`, one `data: <json>\n\n`
 event per chunk, terminated by the literal line `data: [DONE]\n\n`.
 
+## Tool calls
+
+`tools`/`chat_template_kwargs` are rendered into the prompt by `chat_template.jinja`
+(`src/server/engine.cpp`), and a model-emitted call is parsed back out of the generation into a
+structured OpenAI `message.tool_calls` field by `src/server/tool_call_parser.h`/`.cpp`. Full
+call/result/answer multi-turn round trips are supported (`role: "tool"`/`"function"` request
+messages), and this composes with prefix reuse (below) -- a multi-turn tool conversation does not
+desync the KV prefix, since the tool-carrying turns are just more messages re-rendered through the
+same `PrefixState::Extend` prefix-match logic every other request uses.
+
+**`role: "function"` correction (review finding, 2026-09-20):** `C:\AI\models\Qwen3.8-27B\
+chat_template.jinja` has no `"function"` branch at all -- only `system`/`user`/`assistant`/`tool`
+-- so `Engine::RunRequest` remaps a `role: "function"` message to `"tool"` before rendering (the
+template's `tool` branch only ever reads `content`, never `tool_call_id`, so the remap is exact;
+`name` carries no template effect either way). Previously an unmapped `"function"` role hit the
+template's own `raise_exception('Unexpected message role.')` and the request 500'd. Separately, a
+`messages` array containing no `role: "user"` turn anywhere (e.g. only `role: "tool"`/`"function"`
+turns) hits the template's own `raise_exception('No user query found in messages.')`; this and any
+other `ChatTemplate::render()` failure are now reported as `400 invalid_request_error` (a
+caller-shape problem) rather than the engine's generic `500`.
+
+**Confirmed surface syntax** (learned from `C:\AI\models\Qwen3.8-27B\chat_template.jinja` and
+verified by driving the real 64-layer container through `r4dx-server` with a real tool definition,
+both streaming and non-streaming -- not guessed; `tool_call_parser.h`'s file comment has the full
+derivation). This is NOT the generic `<tool_call>{"name":...,"arguments":{...}}</tool_call>`
+JSON-body shape some other Qwen checkpoints use -- this checkpoint's real shape is XML-ish and
+per-parameter, no JSON envelope at the outer level:
+
+```
+<tool_call>
+<function=NAME>
+<parameter=PARAM_NAME>
+VALUE
+</parameter>
+...
+</function>
+</tool_call>
+```
+
+Multiple calls in one turn are simply concatenated `<tool_call>...</tool_call>` blocks back to
+back (confirmed with a real two-city weather prompt). A `<think>...</think>` reasoning block, when
+present, precedes the first `<tool_call>` and is left untouched in `content` (no
+`reasoning_content` extraction -- out of scope, flagged as a follow-up). A parameter `VALUE` is
+plain text, not JSON-tagged; the parser tries to `JSON::parse` the trimmed value and falls back to
+a JSON string when that fails (the same convention the template's own reverse-rendering direction
+uses), so `42`/`true`/`[1,2]`/`{"a":1}`/`null` become their real JSON types and anything else
+(`"Boston, MA"`) becomes a JSON string.
+
+**Detokenization**: verified safe on both the streaming and non-streaming paths before this parser
+was written -- `<tool_call>`/`</tool_call>` are added-but-not-special tokens
+(`src/tokenizer/tokenizer.h`), so `skip_special_tokens=true` (this server's default, `engine.cpp`)
+never strips them; `<function=...>`/`<parameter=...>` are not tokens at all (dynamic names), so
+they arrive as ordinary detokenized text. The parser only ever runs on the fully-detokenized
+string, never assumes a tag aligns to a token or decoder "piece".
+
+**Response shape**: `message.tool_calls = [{id, type:"function", function:{name, arguments}}]`,
+where `arguments` is a JSON-ENCODED STRING (OpenAI's real wire shape, not a JSON object --
+`tool_call_parser.h`'s own "this trips people up" note). `id` is server-generated
+(`GenerateRequestId("call_")`) since the model's own syntax carries no id. `message.content` is
+`null` when the turn was a pure call with no prose, or the leading/trailing prose otherwise.
+`finish_reason` is `"tool_calls"` instead of `"stop"` whenever at least one call was parsed
+(unless the client disconnected mid-stream, in which case `"cancelled"` still wins).
+
+**tool_choice**: `"none"` clears `tools` before rendering (the model is never told about any tool,
+so it structurally cannot call one); `"auto"`/`"required"` leave `tools` untouched (`"required"` is
+accepted but NOT enforced by constrained decoding -- a `required` request whose generation happens
+not to contain a call is not itself flagged as an error); a named
+`{"type":"function","function":{"name":...}}` choice filters `tools` down to just that one entry
+before rendering. Any other `tool_choice` shape (an unrecognized string, a malformed object, a name
+not present in `tools`) is rejected with a clear `400 invalid_request_error` rather than silently
+ignored (`openai_types.cpp`'s `ParseToolChoice`).
+
+**Streaming decision**: OpenAI's own server streams tool-call arguments as incremental
+`delta.tool_calls[].function.arguments` byte deltas. This server does NOT do that: whenever a
+request offers any `tools`, the ENTIRE generation is buffered (not streamed token-by-token) and,
+once complete, delivered as ordinary `content` deltas' worth of prose (if any) followed by one
+single complete `delta.tool_calls` chunk carrying every call at once (`response_sink.cpp`'s
+`StreamingSink::OnToolCalls`, `index`-tagged so a client expecting real per-delta streaming still
+assembles the array correctly). This is a deliberate choice, not an oversight: it guarantees a
+client can never observe a half-formed `<tool_call>`/`<function=...>` tag leak into a `content`
+delta (the failure mode a real per-token streaming parser would risk), at the honest cost of
+"fake" (all-at-once) streaming latency for any request that offers tools, whether or not a call
+actually happens. A request with no `tools` is completely unaffected -- real per-token streaming,
+unchanged (`engine.cpp`'s `tool_mode` gate).
+
+**Robustness**: `ParseToolCalls` never throws. A parameter value that fails to parse as JSON just
+becomes a JSON string (not an error). A structurally malformed `<tool_call>` span (missing/
+unclosed `<function=...>`/`</function>`/`<parameter=...>`, stray prose where only tag structure is
+expected, an unclosed `<tool_call>` itself) degrades to literal content -- its own raw source text,
+tags included -- rather than being dropped or crashing the worker thread; `had_malformed_call` is
+still set so a caller can log it, but nothing is surfaced to the client as an error. A call naming
+a tool the request never defined is dropped from `tool_calls` and replaced with a short synthetic
+note in `content` naming the undefined function and its arguments (`DropUnknownToolCalls`) rather
+than silently vanishing. `tests/server/test_tool_call_parser.cpp` covers every case above, including
+three verbatim captures from the real container (one call, two calls in one turn, and a call
+preceded by a `<think>` block) plus a dozen synthetic malformed-input cases.
+
+**Testing**: `tests/server/test_tool_call_parser.cpp` (parser unit cases), the tool-call-specific
+cases in `tests/server/test_openai_types.cpp` (request-side `tool_calls`/`tool_choice`
+parsing/validation, `role: "tool"`/`"function"` messages) and `tests/server/test_response_sink.cpp`
+(the streaming `OnToolCalls` SSE chunk shape), and `tools/server/smoke.ps1`'s real end-to-end tool
+round trip against a container (a tool-offering request, feeding the parsed call's result back as a
+`role: "tool"` message, checking the final answer references the tool result).
+
+## Milestone 4 integration (2026-09-20)
+
+`tools/server/smoke.ps1` re-run three ways against a clean `build.ps1 -Clean` rebuild, HIP device 1:
+default 4-layer container **28/28**, 4-layer MTP container (`-Mtp 3`) **29/29** (MTP path
+confirmed taken), real 64-layer container (`-Layers -1 -ToolRoundTrip`) **34/34**, including a real
+tool call/result/answer round trip and the REVIEW/FIX pass's regression checks (`role:"function"`
+now renders instead of 500, a no-user-turn conversation now 400s instead of 500, `tools`+`stop`
+no longer leaks the stop string into `message.content`). See `docs/status.md`'s "Milestone 4: done"
+section for the full integration accounting.
+
 ## Deferred / known gaps
 
-- **Tool calls**: `tools`/`chat_template_kwargs` are accepted and rendered into the prompt (so a
-  template-aware client can still get tool definitions in front of the model), but a model-emitted
-  tool call comes back as plain `message.content` text -- it is not parsed into a structured
-  `tool_calls` response field, and request messages with `role: "tool"` are rejected. Parsing the
-  model's tool-call surface syntax back into JSON is future work.
 - **Vision**: image content parts are rejected with `400` (see above) -- the vision tower forward
-  pass is a separate milestone (`docs/status.md`).
+  pass is a separate milestone (`docs/status.md`); its architecture and preprocessing are now fully
+  documented (`docs/vision.md`) with real-hardware validation goldens, but no `src/model` C++ exists
+  yet, so this `400` remains accurate.
 - **Sampling defaults vs. explicit values**: `--default-temperature`/`--default-top-p`/
   `--default-top-k`/`--default-min-p` seed every sampling field a request does not itself set
   (`openai_types.cpp`'s `ParseSampling` starts from the server's defaults and only overwrites a
@@ -172,11 +285,23 @@ level: `ModelOptions::mtp_head_layout` (`std::optional<Layout>`, default `std::n
 body `--layout`) and `Container::Load`'s own `mtp_head_layout` parameter, which the measured
 head-layout sweep (`docs/mtp.md`'s "MTP head layout") showed wins on speed in 23/24 configurations
 with no acceptance cost -- see `docs/status.md`'s "Milestone 3 merge note" for the full correction.
-`src/cli/cli_args.h` exposes it as `--mtp-head-layout {bf16,layout}`. **`src/server/server_args.h`
-still does not expose an equivalent `--mtp-head-layout` flag** -- every server-started `Model` uses
-the measured-default `std::nullopt` (layout-matched head), which is the winning configuration in
-nearly every measured case, so this is a minor, low-priority gap (add a passthrough flag mirroring
-the CLI's) rather than a missing feature, and is left for a future pass.
+`src/cli/cli_args.h` exposes it as `--mtp-head-layout {bf16,layout}`.
+
+**RESOLVED (Milestone 4 follow-up, 2026-09-20)**: `src/server/server_args.h` now exposes the same
+`--mtp-head-layout {bf16,layout}` flag (default `layout`, matching the CLI and the measured-winning
+configuration), wired to `ModelOptions::mtp_head_layout` in `src/server/main.cpp` identically to the
+CLI's own conversion. Covered by `tests/server/test_server_args.cpp`'s `TestMtpHeadLayoutFlag`
+(defaults, `bf16` override, and rejection of an unrecognized value).
+
+**New (docs/r9700.md R9, "reduced-vocab draft head")**: `--mtp-draft-head {reduced,full}` (default
+`reduced`), mirroring `src/cli/cli_args.h`'s own flag, wired to `ModelOptions::
+mtp_draft_reduced_vocab` in `src/server/main.cpp` identically to the CLI. `reduced` uses the
+container's OPTIONAL `mtp.draft_head.*` tensors (docs/container-format.md) to speed up drafting when
+present, degrading to the exact pre-R9 full-vocab behavior automatically when absent; `full` forces
+the full-vocab head unconditionally. Verification always stays full-vocab regardless of this flag,
+so it can only affect drafting speed/acceptance, never generated output (see docs/mtp.md's
+"Reduced-vocab draft head" section for the full argument and the measured K-sweep). Covered by
+`tests/server/test_server_args.cpp`'s `TestMtpDraftHeadFlag`.
 
 ## CLI flags
 
@@ -186,6 +311,8 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N]
     [--default-temperature F] [--default-top-p F] [--default-top-k N]
     [--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]
+    [--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}]
+    [--embed-device-resident {on|off}]
 ```
 
 `--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
@@ -203,24 +330,33 @@ quiet it down).
 ## Testing
 
 `tests/server/**` (CPU-only, no HIP device, registered in `ctest`): `test_server_args` (CLI
-parsing), `test_openai_types` (request validation + response JSON shapes), `test_sse` (SSE chunk
-formatting), `test_response_sink` (`BufferingSink`/`StreamingSink`), `test_request_queue`
-(`BoundedQueue` capacity/FIFO/close/threaded producer-consumer), `test_prefix_state`
-(`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping, see "MTP" above). All
-pass as part of the normal `.\tests\run_tests.ps1` run.
+parsing), `test_openai_types` (request validation + response JSON shapes, including `tools`/
+`tool_choice`/`role: "tool"`/`"function"` parsing), `test_sse` (SSE chunk formatting),
+`test_response_sink` (`BufferingSink`/`StreamingSink`, including the tool-calls streaming chunk
+shape), `test_request_queue` (`BoundedQueue` capacity/FIFO/close/threaded producer-consumer),
+`test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping, see
+"MTP" above), `test_tool_call_parser` (see "Tool calls" above -- real-capture and malformed-input
+cases for the model's surface syntax). All pass as part of the normal `.\tests\run_tests.ps1` run.
 
 `tools/server/smoke.ps1` is the GPU integration test: starts `r4dx-server` on HIP device 1 against
 the 4-layer test container (`--layout w4a16 --layers 4`, since that container's config.json still
 declares 64 layers -- see `--layers` above), hits `/v1/models`, a non-streaming and a streaming
 `/v1/chat/completions`, two consecutive different-prompt requests (checking the server's own stderr
-log to confirm no container reload happened -- see "Reset cost" above), and a rejected-image-part
-request, checking JSON/SSE shapes and status codes (the 4-layer model's text is nonsense, so only
-shapes/counts are checked, never the text itself). Run it with `.\tools\server\smoke.ps1`; pass
-`-Model`/`-Layout`/`-Layers -1` to point it at a real container instead, and `-Mtp N` to exercise
-the MTP path against an MTP-converted container (`.\tools\server\smoke.ps1 -Model
-D:\models\r4dx\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3`, or `-Model
-D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -Mtp 3` against the real container) -- with `-Mtp N>0` an
-extra check confirms at least one request's log line shows the MTP path was taken.
+log to confirm no container reload happened -- see "Reset cost" above), a rejected-image-part
+request, and (a `-ToolRoundTrip` switch) a real tool call/result/answer multi-turn round trip
+(request offers a tool definition, the server's parsed `message.tool_calls` is fed back as a
+`role: "tool"` follow-up message, checking the server accepts it and answers), checking JSON/SSE
+shapes and status codes (the 4-layer model's text is nonsense, so only shapes/counts are checked,
+never the text itself, except the tool-round-trip check, which needs a real container to exercise
+meaningfully -- see below). Run it with `.\tools\server\smoke.ps1`; pass `-Model`/`-Layout`/
+`-Layers -1` to point it at a real container instead, `-Mtp N` to exercise the MTP path against an
+MTP-converted container (`.\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-l4-mtp.r4dx
+-Layout w4a16 -Mtp 3`, or `-Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -Mtp 3` against the real
+container) -- with `-Mtp N>0` an extra check confirms at least one request's log line shows the MTP
+path was taken -- and `-ToolRoundTrip` for the tool round-trip check (`.\tools\server\smoke.ps1
+-Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -ToolRoundTrip`; skipped by default against the
+4-layer container, whose nonsense output cannot reliably be coaxed into emitting a well-formed
+`<tool_call>` block).
 
 ### Real-answer smoke run (once, against the full 64-layer container)
 

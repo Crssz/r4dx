@@ -76,6 +76,7 @@ Model Model::Load(const ModelOptions& opts) {
         "--mtp on)");
   }
   m.mtp_draft_k_ = opts.mtp_draft_k;
+  m.mtp_draft_reduced_vocab_ = opts.mtp_draft_reduced_vocab;
   // GDN's per-sequence window bank (gdn_state.h's file comment) must be sized for the largest
   // speculative-verify window this Model will ever run: mtp_draft_k drafts plus the seed token.
   // ==1 (window index 0 only) when MTP is disabled -- every decode call then degenerates exactly
@@ -94,11 +95,15 @@ Model Model::Load(const ModelOptions& opts) {
   // first half.
   m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(m.max_chunk_ * hidden * 2));
   m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(m.max_chunk_));
-  // R2/P2 (docs/r9700.md): EpilogueForLayout currently returns r4dx_epilogue_none for every
-  // layout (see its own doc comment in linear.cpp for why -- a real, reproducible, but
-  // undiagnosed full-model correctness issue), so this is always r4dx_epilogue_none today; kept
-  // as a real call (not a hardcoded 0) so every downstream Gdn/Attn/Mlp/ApplyLinear call site
-  // below stays wired and only needs EpilogueForLayout itself fixed, not rebuilt.
+  // R2/P2 (docs/r9700.md): the original correctness issue (an `r4dx::core::Arena::Alloc` gap that
+  // never rounded an allocation's END up to a 16-byte boundary, silently misaligning every
+  // default-aligned buffer allocated right after a fused epilogue's scale scratch) was root-caused
+  // and fixed in `arena.hpp` (docs/status.md's "R2/P2 fused activation-quant epilogues:
+  // root-caused and enabled for w4a8/mxfp4" section). EpilogueForLayout (linear.cpp) now returns
+  // `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4 (verified byte-identical
+  // end to end against the fusion-disabled baseline, `tools/validate_fusion.ps1`) and still
+  // `r4dx_epilogue_none` for w4a16/bf16 (w4a16's own separate, understood wall-clock regression --
+  // see linear.cpp's own doc comment -- and bf16 never quantizes its activation input at all).
   m.body_epilogue_ = EpilogueForLayout(opts.layout);
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
@@ -920,7 +925,7 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
                           container_.EmbedTokensDeviceResident() ? container_.EmbedTokensDevice()
                                                                   : nullptr,
                           cfg.vocab_size, container_.LmHead(), k,
-                          /*base_pos=*/pos_ - 1);
+                          /*base_pos=*/pos_ - 1, mtp_draft_reduced_vocab_);
     arena_.Reset();
   } else if (mtp_seed_valid_) {
     // k==0 degenerate call (doc's own "single DecodeStepGreedy-equivalent" case): Draft() is
@@ -972,6 +977,18 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   std::vector<int32_t> result(drafts.begin(), drafts.begin() + num_accepted_drafts);
   result.push_back(corrected);
   return result;
+}
+
+std::vector<uint16_t> Model::DebugSeedHiddenBf16() const {
+  if (!mtp_.has_value()) {
+    throw std::runtime_error("Model::DebugSeedHiddenBf16: requires MtpEnabled() (mtp_draft_k>0)");
+  }
+  if (!mtp_seed_valid_) {
+    throw std::runtime_error(
+        "Model::DebugSeedHiddenBf16: mtp_seed_hidden_ not yet valid -- call Prefill/DecodeStep* "
+        "first");
+  }
+  return mtp_seed_hidden_.CopyToHost();
 }
 
 }  // namespace r4dx::model

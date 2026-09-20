@@ -41,20 +41,25 @@ exact toolchain versions, flags, and gotchas.
 .\tests\run_tests.ps1
 ```
 
-Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 35 tests
+Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 36 tests
 covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
 residual add, silu_mul, rope, fp8/int8 activation quant, kv cache write, mxfp4 GEMM, attention
 decode, GDN chunk scan, sampler, the P6 vectorized-kernel bandwidth golden, the P2 fused-quant-
-epilogue byte-diff harness, embedding-gather in-range/OOB-clamp), the converter's quantizer
+epilogue byte-diff harness, embedding-gather in-range/OOB-clamp, the R9 reduced-vocab-draft-head
+gather-by-index kernel's in-range/OOB-clamp golden), the converter's quantizer
 round-trip / byte-packer / kernel-decode / KV-calibration / bf16-layout tests, the tokenizer's
 golden-case suite, `src/model`'s per-layer tests (GDN layer, full-attention layer,
 final-norm+lm_head, assembled-`Model` forward-pass smoke including a prefill/decode state-handoff
 equivalence check and a `Model::Reset()` byte-identity check, MTP's verify/rejection-rewind/
-mid-round-commit tests, and the pure-CPU `mtp_round` commit-bookkeeping tests), `src/cli`'s
-argument-parsing tests, `src/server`'s CPU-only tests (CLI args, OpenAI request/response JSON
-shapes, SSE framing, buffering/streaming sinks, the bounded request queue, `PrefixState`), and a
+mid-round-commit/K=16-wide-window/reduced-vocab-draft-head-lossless tests, and the pure-CPU
+`mtp_round` commit-bookkeeping tests, including a K=16 wide-round case), `src/cli`'s
+argument-parsing tests (including `--mtp-draft-head`), `src/server`'s CPU-only tests (CLI args
+including `--mtp-draft-head`, OpenAI request/response JSON shapes including `tools`/`tool_choice`/
+`role: "tool"`/`"function"` parsing, SSE framing, buffering/streaming sinks including the tool-calls
+streaming chunk shape, the bounded request queue, `PrefixState`, and the tool-call surface-syntax
+parser -- `docs/server.md`'s "Tool calls"), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). All 35 currently pass (~130s wall on HIP device 1). See `docs/status.md` for
+`ctest` invocation). All 37 currently pass (~208s wall on HIP device 1). See `docs/status.md` for
 the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
 GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
 `ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration
@@ -107,15 +112,21 @@ the real chat template and generates once; `--chat` instead starts an interactiv
 `chat_template.jinja` / `generation_config.json` live); `--think {on|off}` toggles the chat
 template's `enable_thinking`; `--temperature 0` selects greedy argmax decoding, otherwise
 temperature/top-k/top-p/min-p sampling with `--seed` applies. `--max-ctx` bounds the KV cache and
-GDN state allocation (default 131072; the bf16 layout needs a much smaller value -- see
-`docs/perf.md`). `--stats` prints container-load time, prefill/decode tokens/s, and VRAM used, plus
+GDN state allocation (default **262144**, matching the checkpoint's own `max_position_embeddings`
+-- raised from a stale 131072 self-imposed cap, docs/r9700.md R13, 2026-09-20: real hardware
+measurement shows the full 262144-token KV+GDN allocation still leaves 21-24% of the R9700's 32 GiB
+free, and generation at 262144 real prefilled tokens is coherent and correct, see
+`docs/perf.md`'s "Long-context validation"; the bf16 layout needs a much smaller value regardless,
+since its 47.73 GiB of weights alone do not fit on this card -- see `docs/perf.md`). `--stats`
+prints container-load time, prefill/decode tokens/s, and VRAM used, plus
 (when `--mtp K>0`) an MTP acceptance-rate line. `--mtp K` (default 0) enables MTP self-speculative
 decode: each decode round drafts up to `K` tokens via the checkpoint's own `mtp.*` weights, verifies
 them against the real model in one batched call, and commits the accepted prefix (plus one corrected/
 bonus token) -- greedy-only (`--mtp K` with `--temperature > 0` warns and forces `--mtp 0` for that
 run). See `docs/mtp.md` for the full design, the container requirement (the container must carry
 `mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
-per layout (roughly +55-100% decode throughput at each layout's best `K`, `--mtp 3` a reasonable
+per layout (roughly +75-165% decode throughput over `--mtp 0` at each layout's best `K` -- w4a16
+`K=3`, w4a8 `K=4`, mxfp4 `K=3`, see `docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable
 default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput
 per layout.
 
@@ -138,11 +149,20 @@ where the engine must catch up), or reloading from scratch only on a genuine pre
 `--mtp N` (Milestone 3) enables server-side MTP self-speculative decode identically to `r4dx-cli
 --mtp`: a request takes the MTP path iff the server was started with `--mtp N>0` against an
 MTP-converted container AND that request is greedy (`temperature <= 0`); every accepted token still
-streams as soon as it is committed. See `docs/server.md` for the full endpoint/field reference,
-deferred features (tool-call parsing, vision, `--mtp-head-layout` as a server-side flag), and a
-captured real streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
+streams as soon as it is committed. `--mtp-head-layout {bf16,layout}` is also a server-side flag now (mirrors the CLI), as is
+`--mtp-draft-head {reduced,full}` (docs/r9700.md R9, "reduced-vocab draft head" -- see docs/mtp.md
+for the design, measured coverage, and K-sweep). Tool calls (OpenAI `tools`/`tool_choice`/
+`message.tool_calls`/`role: "tool"` multi-turn round trips) are fully supported -- `tools` are
+rendered into the prompt and a model-emitted `<tool_call>` is parsed back into a structured
+`message.tool_calls` response (JSON-encoded `arguments` string, stable generated `id`s,
+`finish_reason: "tool_calls"`), with malformed/unknown-tool output degrading to plain content
+rather than erroring; see `docs/server.md`'s "Tool calls" section for the confirmed model surface
+syntax, `tool_choice` coverage, and the streaming (buffer-whole) decision. See `docs/server.md` for
+the full endpoint/field reference, the remaining deferred feature (vision), and a captured real
+streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
 (`.\tools\server\smoke.ps1` against the small 4-layer test container by default; pass
-`-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it at a real container with MTP enabled).
+`-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it at a real container with MTP enabled, and
+`-ToolRoundTrip` to exercise a real tool call/result/answer round trip against it).
 
 ## Layout
 
@@ -164,12 +184,30 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 
 Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation),
 Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and MTP
-self-speculative decode), and Milestone 3 (quantized `gdn.in_proj_z`/`attn.k`/`attn.v` + a 45 GiB
-real container, fused residual+rmsnorm (R3), vectorized rmsnorm/residual_rmsnorm/silu_mul kernels
-(P6), a configurable/measured MTP head layout, a device-resident embedding gather + MTP draft loop,
-and server-side `Model::Reset()`/MTP/prefix-reuse hardening) are all complete and integrated -- see
-`docs/status.md` for what exists, what passes, known gaps, and the next milestone (fused
-activation-quant epilogues (P2) re-attempted with root-caused correctness, then the vision tower,
-then DFlash2 drafting). Headline decode throughput on the real 64-layer container (`--mtp 3`, HIP
-device 1): **w4a16 68.4 tok/s, w4a8 61.4 tok/s, mxfp4 55.7 tok/s** -- see `docs/perf.md`'s
-consolidated Milestone 1 -> 2 -> 3 table for the full progression.
+self-speculative decode), Milestone 3 (quantized `gdn.in_proj_z`/`attn.k`/`attn.v` + a 45 GiB real
+container, fused residual+rmsnorm (R3), vectorized rmsnorm/residual_rmsnorm/silu_mul kernels (P6), a
+configurable/measured MTP head layout, a device-resident embedding gather + MTP draft loop, and
+server-side `Model::Reset()`/MTP/prefix-reuse hardening), and **Milestone 4** are all complete and
+integrated. Milestone 4 (2026-09-20) root-caused and enabled the fused activation-quant epilogues
+(R2/P2) for w4a8/mxfp4 (an `r4dx::core::Arena::Alloc` end-alignment gap; w4a16 stays unfused, a
+separate measured wall-clock regression, not a correctness issue); re-swept
+`src/model/gemm_tuning_table.inc` with a Q5-fixed methodology that eliminates cache-flattery
+(mxfp4 decode improved, w4a16 flat, w4a8 `--mtp 3` regressed -- attributed to verify-band GEMM
+retiling + numerical reduction-order drift, not a correctness bug); root-caused the MTP acceptance
+gap to h_seed drift on one outlier residual dimension (a measured, expected quantization effect, not
+a bug); built a reduced-vocab MTP draft head end to end (container format, loader, kernel, `K`
+widened to 16) -- mechanism verified lossless on real hardware, but its ~2.5-3x economic projection
+was not realized because this machine's only calibration corpus (WikiText-2) is too small; validated
+long-context generation to the model's own native 262144-token ceiling and raised `--max-ctx`'s
+default accordingly; documented the vision tower's full architecture against real `transformers`
+source with real-hardware validation goldens (`docs/vision.md`) but did not implement its C++; and
+shipped full OpenAI `tools`/`tool_choice`/`role:"tool"`/`"function"` support, hardened by a dedicated
+review pass (8 findings, all fixed and regression-tested) -- see "Tool calls" below and
+`docs/server.md`. See `docs/status.md` for the full Milestone 4 work-item table, what exists, what
+passes, known gaps, and the proposed next milestone (the tiled WMMA prefill GEMM kernel (R10/P9),
+then the vision tower's C++, then DFlash2 drafting).
+
+Headline decode throughput on the real 64-layer container (each layout's own best `--mtp K`, HIP
+device 1, post-Milestone-4 integration): **w4a16 68.73 tok/s (`K=3`, 46.3% acceptance), w4a8 57.86
+tok/s (`K=4`, 31.0%), mxfp4 65.04 tok/s (`K=3`, 52.9%)** -- see `docs/perf.md`'s consolidated
+Milestone 1 -> 2 -> 3 -> 4 table for the full progression.

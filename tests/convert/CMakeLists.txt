@@ -34,3 +34,21 @@ add_test(NAME convert_kv_calib COMMAND convert_kv_calib)
 add_executable(convert_bf16_layout test_bf16_layout.cpp)
 target_link_libraries(convert_bf16_layout PRIVATE r4dx_convert)
 add_test(NAME convert_bf16_layout COMMAND convert_bf16_layout)
+
+# DFlash2 task A1 item 1: minimal GGUF v3 reader (metadata KV of every type incl. arrays/strings,
+# tensor directory, F32/F16/BF16/Q8_0 dequant) against tests/convert/fixtures/tiny.gguf (generated
+# by tools/convert_ref/make_tiny_gguf.py, no gguf-py dependency either side).
+add_executable(convert_gguf_reader test_gguf_reader.cpp)
+target_link_libraries(convert_gguf_reader PRIVATE r4dx_convert)
+target_compile_definitions(convert_gguf_reader PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_gguf_reader COMMAND convert_gguf_reader)
+
+# DFlash2 task A1 item 6: DFlash2 draft container metadata + tensor directory round-trip on the
+# 2-layer/64-dim/512-vocab miniature GGUF (tests/convert/fixtures/dflash_mini.gguf), plus the
+# linear-weight orientation test.
+add_executable(convert_dflash_container test_dflash_container.cpp)
+target_link_libraries(convert_dflash_container PRIVATE r4dx_convert)
+target_compile_definitions(convert_dflash_container PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_dflash_container COMMAND convert_dflash_container)

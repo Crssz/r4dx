@@ -54,3 +54,16 @@ add_test(
     COMMAND "${R4DX_REFERENCE_VENV}/Scripts/python.exe"
             "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_manifest.py"
 )
+
+# tools/reference/dflash2_selftest.py -- the DFlash2 reference determinism gate (see
+# docs/dflash2.md section 10). CPU-only, numpy-only for the default fast path (no --with-real-
+# sanity here, since that flag needs the full 27B checkpoint on disk and is meant for manual
+# invocation, not the default ctest run). Fixtures under tools/reference/golden_out/dflash2/ are
+# regenerated on demand by the script itself when missing, so this runs unmodified on a clean
+# checkout. Same venv as reference_manifest above; this add_test() line is the only touch this
+# component makes outside tools/reference/**, docs/dflash2.md, and docs/validation.md.
+add_test(
+    NAME reference_dflash2
+    COMMAND "${R4DX_REFERENCE_VENV}/Scripts/python.exe"
+            "${CMAKE_SOURCE_DIR}/tools/reference/dflash2_selftest.py"
+)

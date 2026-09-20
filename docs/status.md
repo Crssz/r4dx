@@ -338,6 +338,80 @@ Full assessment in docs/mtp.md's "DFlash2 assessment" section.
   latency saving, while real by construction -- ~83x fewer output rows -- was not separately
   profiled this pass).
 
+## Milestone 5 (DFlash2 drafter) -- groundwork landed
+
+CPU-only groundwork for the DFlash2 self-speculative drafter (`z-lab/Qwen3.8-27B-DFlash2`, the
+largest single projected speedup on the roadmap -- ROCmFPX measured 120 tok/s vs 35 plain on this
+exact card/draft at 84% acceptance) landed on `m5-dflash2` this pass, developed across parallel
+Convert/Reference stages, an adversarial review, and a fix pass. Full detail, conventions, and the
+resolved review findings are in `docs/dflash2.md`; this section is the roadmap-level summary.
+
+**What exists:**
+
+- **A from-scratch GGUF v3 reader + Q8_0 dequantizer**, both header-only and dependency-free (no
+  `gguf-py` import anywhere, per the standing rule): `src/convert/include/r4dx_convert/
+  gguf_reader.hpp` (C++, feeds the converter) and `tools/reference/gguf_min.py` (numpy/struct-only
+  Python, feeds the reference). Both independently verified against the real 81-tensor,
+  48-metadata-key `Qwen3.8-27B-DFlash2-Q8_0.gguf`.
+- **A container spec for the DFlash2 draft** (`docs/container-format.md`'s new "DFlash2 draft
+  container" section; implementation in `src/convert/include/r4dx_convert/dflash2_container.hpp`,
+  new `r4dx-convert --dflash-gguf` CLI mode). Tensor naming, conv-layout, RoPE-pairing (`neox_split_
+  half`, corrected during review -- see below), and shape conventions are documented and covered by
+  `tests/convert/test_dflash_container.cpp`/`test_gguf_reader.cpp`. Four real containers converted
+  and re-verified: `D:\models\r4dx\qwen38-27b-dflash2-{bf16,w4a16,w4a8,mxfp4}.r4dx` (3.585 /
+  1.127 / 1.127 / 1.127 GiB), 81/81 tensors checked per layout by
+  `tools/convert_ref/dflash2_container_check.py` (bf16 full-tensor bit-exact; quantized layouts a
+  first-tile spot check, see that tool's own known limitation).
+- **A CPU-only loader stub**, `r4dx::model::DflashDraftWeights`
+  (`src/model/dflash_draft_weights.h`) -- opens a container, parses `Dflash2Config`, exposes tensor
+  lookup. No HIP dependency (confirmed via `llvm-objdump`). Device upload and the forward pass
+  itself are explicit `TODO(dflash2-forward)` markers, deliberately out of this pass's CPU-only
+  scope.
+- **A from-scratch numpy reference implementation and fixtures** (`tools/reference/dflash2_ref.py`,
+  independently re-deriving the DFlash2 forward pass -- feature capture, encoder, per-layer KV
+  injection, block-diffusion draft attention/conv/MLP, shared-target-lm_head logits, and the
+  predecessor/successor selector walk with `p_min` early-stop and `n_min` discard -- from the
+  ROCmFPX C++ source, not by importing it) plus a determinism gate
+  (`tools/reference/dflash2_selftest.py`, now wired into `ctest` as `reference_dflash2`) and three
+  golden fixtures under `tools/reference/golden_out/dflash2/` (regenerated on demand if missing, so
+  a clean checkout's `ctest` run works unmodified).
+- **A conventions document**, `docs/dflash2.md`, cross-referencing the container and the reference
+  implementation's independently-derived findings (they agreed on every overlapping claim: `n_rot`
+  =128, `neox_split_half` RoPE pairing, conv coefficient/base layout, `target_layers` = HF ids + 1,
+  selector score/walk semantics) and recording the KV-rollback lifecycle, `n_min` discard policy,
+  and the bf16-fixture's actual (determinism-only, not bit-exact-vs-GPU) precision claim -- all
+  three corrected during this pass's review (see below).
+- **Review findings resolved this pass**: two blockers (the container's RoPE-pairing metadata said
+  "interleaved" when ggml's actual MROPE dispatch for `LLM_ARCH_DFLASH` is NeoX split-half; the
+  bf16/f32 passthrough tensors -- `conv.base`, `selector.predecessor`/`successor` -- declared their
+  shape in GGUF's fastest-axis-first `ne` order instead of the row-major order every other tensor
+  family in an r4dx container uses) and five majors/minors (rollback-lifecycle doc corrected against
+  the actual driver code, golden fixtures made deliverable via on-demand regeneration instead of
+  being silently gitignored, the bf16 fixture's precision claim corrected, a CLI usage-comment
+  fix, and reader/RAM robustness hardening) were all fixed and re-verified against regenerated
+  containers and fixtures.
+
+**What the GPU stages still owe** (not started, no GPU work has touched this drafter yet):
+
+1. **Target feature capture** -- extracting the target model's residual stream entering layers
+   `[6,20,34,48,62]` during the real forward pass (needs `src/model`'s layer-input hook, not yet
+   built for this purpose).
+2. **The draft forward pass on device** -- encoder (`fc`+norm), per-layer KV injection, and the
+   block-diffusion attention/conv/MLP stack, using `third_party/libr4d`'s already-shipped fused
+   `r4d_dflash_conv_t2_g16_bf16` kernel plus ordinary GEMM/attention kernels already in the engine.
+3. **The selector walk** (predecessor/successor row-gather + greedy chain + `p_min`/`n_min` policy)
+   on device or as a cheap host step over the 8x248320 logit block.
+4. **MTP-style round integration** -- wiring a DFlash2 round into the same draft/verify/rollback
+   loop `src/model/mtp_round.hpp` already implements for the MTP head, including the draft-region
+   KV invalidation `docs/dflash2.md` now documents as the reference's actual (not "no rollback
+   needed") behavior.
+5. **A server/CLI flag** analogous to `--mtp N` to select this drafter.
+6. **End-to-end validation**: lossless-decode confirmation (drafted+verified text byte-identical to
+   plain decode), measured acceptance rate, and measured tok/s on this card, to compare against
+   ROCmFPX's reference numbers (120 tok/s @ 84% acceptance) and the current MTP head's 68 tok/s.
+
+See `docs/dflash2.md` for the full spec, conventions, and file list.
+
 ## Milestone 3: done
 
 Four work items, developed across several parallel/sequential stages (below) and merged, reviewed,

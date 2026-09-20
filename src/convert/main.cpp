@@ -27,6 +27,16 @@
 // --selftest packs exactly one tensor through every requested layout and writes it as
 // "selftest.{layout}.*" -- tools/convert_ref/selftest_compare.py runs the matching Python
 // reference on the same input and diffs the two containers byte for byte.
+//
+//   r4dx-convert --dflash-gguf <DFlash2 draft .gguf> --out <container path>
+//                [--layout {w4a16,w4a8,mxfp4,bf16}] [--threads T]
+//
+// Converts a DFlash2 speculative-decoding draft model (docs/container-format.md "DFlash2 draft
+// container") from its GGUF v3 source into its own r4dx container (container_kind
+// "dflash2_draft", separate file from the main text-model container). Produces ONE container per
+// invocation carrying exactly the requested `--layout` (bf16 is only included when
+// `--layout bf16` is requested; unlike the main HF-checkpoint mode, there is no automatic bf16
+// side-by-side -- see DflashLayoutSet).
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -45,6 +55,8 @@
 #include "r4d.h"  // r4d_gemm_{w4a16,w4a8,mxfp4a8}_nt_m64_group() -- cross-checked against this
                   // converter's own kInt4Group/kMxfp4Group at startup (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
+#include "r4dx_convert/dflash2_container.hpp"
+#include "r4dx_convert/gguf_reader.hpp"
 #include "r4dx_convert/kv_calib.hpp"
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
@@ -157,6 +169,15 @@ struct AppArgs {
   // full-vocab head unconditionally, byte-identical to every container built before this flag
   // existed.
   std::string draft_vocab_ids;
+
+  // DFlash2 draft-model mode (docs/dflash2.md): --dflash-gguf <gguf> --out <container> --layout {...}.
+  // Mutually exclusive with the HF-checkpoint (--input/--output) and --selftest modes. Uses its
+  // own --out/--layout flag names (not --output/--layouts) since this mode packs exactly one
+  // requested layout per run (no automatic bf16 companion -- pass --layout bf16 for an
+  // exact-precision container), not the HF mode's "every layout side by side" model.
+  std::string dflash_gguf;
+  std::string dflash_out;
+  std::string dflash_layout = "w4a16";  // one of w4a16, w4a8, mxfp4, bf16
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -191,6 +212,9 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--no-bf16") a.no_bf16 = true;
     else if (arg == "--kv-calib") a.kv_calib = next(i);
     else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
+    else if (arg == "--dflash-gguf") a.dflash_gguf = next(i);
+    else if (arg == "--out") a.dflash_out = next(i);
+    else if (arg == "--layout") a.dflash_layout = next(i);
     else throw std::runtime_error("unknown argument: " + arg);
   }
   return a;
@@ -578,19 +602,142 @@ int RunSelftest(const AppArgs& args) {
   return 0;
 }
 
+// ---- --dflash-gguf mode (task A1) -----------------------------------------------------------
+
+LayoutSet DflashLayoutSet(const std::string& layout_name) {
+  // Exactly the ONE requested layout, no automatic bf16 side-by-side copy (deliberately UNLIKE
+  // the main text-model container's "every layout side by side in one file" convention) -- the
+  // task spec's own expected container sizes (~1.2 GB each for w4a16/w4a8/mxfp4, ~3.9 GB for
+  // bf16) only make sense as single-layout files; `--dflash-gguf ... --layout X` produces ONE
+  // container per invocation, matching `r4dx-cli --layout`'s per-run layout selection rather than
+  // `r4dx-convert`'s (HF-mode) `--layouts a,b,c` side-by-side list.
+  LayoutSet ls;
+  ls.bf16 = false;
+  if (layout_name == "bf16") ls.bf16 = true;
+  else if (layout_name == "w4a16") ls.w4a16 = true;
+  else if (layout_name == "w4a8") ls.w4a8 = true;
+  else if (layout_name == "mxfp4") ls.mxfp4 = true;
+  else throw std::runtime_error("--layout must be one of w4a16, w4a8, mxfp4, bf16 (got '" + layout_name + "')");
+  return ls;
+}
+
+int RunDflashConvert(const AppArgs& args) {
+  using namespace r4dx_convert;
+  if (args.dflash_out.empty()) throw std::runtime_error("--dflash-gguf requires --out");
+  const int threads = ResolveThreads(args.threads);
+  const LayoutSet layouts = DflashLayoutSet(args.dflash_layout);
+
+  GgufReader gguf(Utf8ToWide(args.dflash_gguf));
+  Dflash2Metadata meta = ReadDflash2Metadata(gguf);
+
+  std::cout << "[r4dx-convert --dflash-gguf] input=" << args.dflash_gguf << " out=" << args.dflash_out
+            << " layout=" << args.dflash_layout << " threads=" << threads << "\n"
+            << "[r4dx-convert --dflash-gguf] hidden=" << meta.hidden << " block_count=" << meta.block_count
+            << " vocab=" << meta.vocab_size << " n_rot=" << meta.n_rot << "\n";
+
+  ContainerWriter writer;
+  std::vector<std::function<void()>> plan_jobs, emit_jobs;
+
+  auto add_linear = [&](std::string gguf_name, std::string container_base) {
+    plan_jobs.push_back([&writer, &gguf, gguf_name, container_base, layouts]() {
+      PlanDflash2Linear(writer, gguf, Dflash2LinearSpec{gguf_name, container_base}, layouts);
+    });
+    emit_jobs.push_back([&writer, &gguf, gguf_name, container_base, layouts, threads]() {
+      EmitDflash2Linear(writer, gguf, Dflash2LinearSpec{gguf_name, container_base}, layouts, threads);
+    });
+  };
+  auto add_f32 = [&](std::string gguf_name, std::string container_name) {
+    plan_jobs.push_back([&writer, &gguf, gguf_name, container_name]() {
+      PlanDflash2F32(writer, gguf, gguf_name, container_name);
+    });
+    emit_jobs.push_back([&writer, &gguf, gguf_name, container_name]() {
+      EmitDflash2F32(writer, gguf, gguf_name, container_name);
+    });
+  };
+  auto add_bf16 = [&](std::string gguf_name, std::string container_name) {
+    plan_jobs.push_back([&writer, &gguf, gguf_name, container_name]() {
+      PlanDflash2Bf16(writer, gguf, gguf_name, container_name);
+    });
+    emit_jobs.push_back([&writer, &gguf, gguf_name, container_name]() {
+      EmitDflash2Bf16(writer, gguf, gguf_name, container_name);
+    });
+  };
+
+  add_linear("fc.weight", "dflash.fc");
+  add_f32("enc.output_norm.weight", "dflash.enc_output_norm");
+  add_f32("output_norm.weight", "dflash.output_norm");
+  add_linear("selector_hidden.weight", "dflash.selector.hidden");
+  // Row-gather codebooks (task A1: "NOT quantized to a GEMM layout"), bf16, GGUF's own
+  // [vocab][rank] flat order preserved verbatim (see dflash2_container.hpp's file comment).
+  add_bf16("selector_predecessor.weight", "dflash.selector.predecessor");
+  add_bf16("selector_successor.weight", "dflash.selector.successor");
+
+  for (int64_t i = 0; i < meta.block_count; ++i) {
+    const std::string g = "blk." + std::to_string(i) + ".";
+    const std::string base = "dflash.layers." + std::to_string(i) + ".";
+    add_f32(g + "attn_norm.weight", base + "input_layernorm");
+    add_linear(g + "attn_q.weight", base + "self_attn.q_proj");
+    add_linear(g + "attn_k.weight", base + "self_attn.k_proj");
+    add_linear(g + "attn_v.weight", base + "self_attn.v_proj");
+    add_linear(g + "attn_output.weight", base + "self_attn.o_proj");
+    add_f32(g + "attn_q_norm.weight", base + "self_attn.q_norm");
+    add_f32(g + "attn_k_norm.weight", base + "self_attn.k_norm");
+    // conv_base: F32 in the GGUF, ne=[hidden,2,2] = flat [side][tap][hidden] (hidden fastest) --
+    // exactly third_party/libr4d/r4d_dflash_conv_body.h's expected per-side [taps,H] slicing, no
+    // permutation needed; stored bf16 per the task spec (the libr4d kernel reads bf16 x/base/delta).
+    add_bf16(g + "attn_conv_base", base + "self_attn.conv.base");
+    add_linear(g + "attn_conv_proj.weight", base + "self_attn.conv.proj");
+    add_f32(g + "ffn_norm.weight", base + "post_attention_layernorm");
+    add_linear(g + "ffn_gate.weight", base + "mlp.gate_proj");
+    add_linear(g + "ffn_up.weight", base + "mlp.up_proj");
+    add_linear(g + "ffn_down.weight", base + "mlp.down_proj");
+    add_bf16(g + "ffn_conv_base", base + "mlp.conv.base");
+    add_linear(g + "ffn_conv_proj.weight", base + "mlp.conv.proj");
+  }
+
+  for (auto& j : plan_jobs) j();
+
+  nlohmann::json metadata;
+  metadata["r4dx_format_version"] = "1";
+  metadata["container_kind"] = "dflash2_draft";
+  metadata["model_id"] = "z-lab/Qwen3.8-27B-DFlash2";
+  metadata["produced_by"] = "r4dx-convert --dflash-gguf (r4dx dev build)";
+  metadata["source_gguf"] = {
+      {"filename", args.dflash_gguf.substr(args.dflash_gguf.find_last_of("/\\") + 1)},
+      {"sha256_first_1mib", Sha256HexOfFilePrefix(args.dflash_gguf, 1024 * 1024)},
+  };
+  metadata["dflash2"] = BuildDflash2MetadataJson(meta);
+  metadata["dflash2"]["layout"] = args.dflash_layout;
+  metadata["quant"] = BuildQuantMetadata();
+
+  const auto t0 = std::chrono::steady_clock::now();
+  writer.FinalizeHeader(args.dflash_out, metadata);
+  std::cout << "[r4dx-convert --dflash-gguf] planned " << writer.PlannedTensorCount() << " tensors, "
+            << writer.PlannedDataBytes() << " data bytes\n";
+
+  for (auto& j : emit_jobs) j();
+  writer.Finish();
+
+  const auto t1 = std::chrono::steady_clock::now();
+  const double secs = std::chrono::duration<double>(t1 - t0).count();
+  std::cout << "[r4dx-convert --dflash-gguf] wrote " << args.dflash_out << " in " << secs << " s\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     ValidateKernelGroupSizes();
     AppArgs args = ParseArgs(argc, argv);
+    if (!args.dflash_gguf.empty()) return RunDflashConvert(args);
     if (args.selftest) {
       if (args.selftest_input.empty() || args.selftest_output.empty())
         throw std::runtime_error("--selftest requires --selftest-input and --selftest-output");
       return RunSelftest(args);
     }
     if (args.input.empty() || args.output.empty())
-      throw std::runtime_error("--input and --output are required (or pass --selftest)");
+      throw std::runtime_error("--input and --output are required (or pass --selftest or --dflash-gguf)");
     return RunConvert(args);
   } catch (const std::exception& e) {
     std::cerr << "r4dx-convert: error: " << e.what() << "\n";

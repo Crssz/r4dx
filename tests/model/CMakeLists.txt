@@ -54,6 +54,19 @@ add_executable(test_mtp_round test_mtp_round.cpp)
 target_include_directories(test_mtp_round PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_mtp_round COMMAND test_mtp_round)
 
+# test_dflash_draft_weights: task A1 item 3's CPU-only DflashDraftWeights loader stub
+# (src/model/dflash_draft_weights.h -- metadata + tensor directory, no device upload). Links only
+# r4dx_convert (header-only: SafetensorsReader, GgufReader, dflash2_container writer helpers used
+# to build the test's own tiny fixture container) + r4dx_core (bf16 conversions) -- deliberately
+# NOT r4dx_model/r4d_core/r4dx_hip_runtime, so this binary has no HIP dependency at all, same
+# "always runs, no ENVIRONMENT/SKIP_RETURN_CODE" pattern as test_mtp_round above.
+add_executable(test_dflash_draft_weights test_dflash_draft_weights.cpp)
+target_include_directories(test_dflash_draft_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_link_libraries(test_dflash_draft_weights PRIVATE r4dx_convert r4dx_core)
+target_compile_definitions(test_dflash_draft_weights PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../convert/fixtures")
+add_test(NAME test_dflash_draft_weights COMMAND test_dflash_draft_weights)
+
 # tests/model/attention/: golden test for r4dx::model::attention::AttentionLayer, created
 # standalone by that component before this file existed -- see its own CMakeLists.txt header note.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")

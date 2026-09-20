@@ -210,6 +210,165 @@ draft, identical in effect to a wrong full-vocab-head guess, never a wrong ACCEP
 container converted without `--draft-vocab-ids`) loads and behaves exactly as before this feature
 existed.
 
+## DFlash2 draft container (Milestone 5 groundwork)
+
+A DFlash2 speculative-decoding draft model (background: `docs/dflash2.md`, the "DFlash2 assessment"
+section of `docs/mtp.md`, `docs/status.md`) converts from its own GGUF v3 source (`D:\models\Qwen3.8-27B-DFlash2\Qwen3.8-27B-DFlash2-Q8_0.gguf`)
+into its OWN r4dx container -- a **separate file** from the main text-model container, never mixed
+into `text.*`/`vision.*`/`mtp.*`, so every existing loader/container is unaffected by this section.
+Written by `r4dx-convert --dflash-gguf <gguf> --out <container> --layout {w4a16,w4a8,mxfp4,bf16}`
+(`src/convert/main.cpp`'s `RunDflashConvert`, `src/convert/include/r4dx_convert/gguf_reader.hpp` +
+`dflash2_container.hpp`). Same safetensors-shaped shell as every other r4dx container (8-byte
+header length + JSON header + raw tensor bytes, every tensor `dtype: "U8"`).
+
+### `__metadata__`
+
+```json
+{
+  "r4dx_format_version": "1",
+  "container_kind": "dflash2_draft",
+  "model_id": "z-lab/Qwen3.8-27B-DFlash2",
+  "source_gguf": { "filename": "Qwen3.8-27B-DFlash2-Q8_0.gguf", "sha256_first_1mib": "<hex>" },
+  "produced_by": "r4dx-convert --dflash-gguf ...",
+  "dflash2": {
+    "hidden_size": 5120, "block_count": 5, "feed_forward_length": 17408,
+    "attention": { "head_count": 32, "head_count_kv": 8, "key_length": 128, "value_length": 128,
+                   "causal": false, "rms_eps": 1e-6, "sliding_window": 2048,
+                   "sliding_window_pattern": [true, true, true, true, true] },
+    "rope": { "freq_base": 1e7, "dimension_sections": [64, 0, 0, 0], "n_rot": 128,
+              "pairing": "neox_split_half" },
+    "block_size": 8, "conv_kernel_size": 2, "conv_group_size": 16,
+    "selector_rank": 256, "selector_top_k": 16,
+    "target_layers": [6, 20, 34, 48, 62],
+    "context_length": 262144, "mask_token_id": 248070, "vocab_size": 248320,
+    "source_file_type": 7, "layout": "w4a16"
+  },
+  "quant": { /* same shape BuildQuantMetadata() emits for the main container -- see below */ }
+}
+```
+
+`container_kind` is a new field absent from every pre-existing text-model container -- a loader
+that checks it can refuse to open a draft container as a body model (or vice versa) instead of
+misreading its tensor set; a loader that doesn't check it simply never looks, so nothing existing
+breaks. `target_layers` is stored **exactly as the GGUF gives it**: 0-based indices into the
+TARGET model's own decoder-layer stack, each meaning "the residual stream as it ENTERS target
+layer L" (== the OUTPUT of target layer L-1) -- for the real container, `[6,20,34,48,62]` = the
+outputs of target layers `[5,19,33,47,61]`. **`n_rot` = 128 (the FULL `key_length`/head_dim), not a
+partial rotary factor**: the real GGUF carries no `dflash.rope.dimension_count` key, and
+`llama-model.cpp`'s generic hparam load defaults `n_rot_full` to `n_embd_head_k_full` whenever that
+key is absent (verified by reading that file, not assumed) -- confirmed absent from the real
+file's 48-key metadata dump. `dimension_sections=[64,0,0,0]` (sum 64) is the M-RoPE PAIR-count
+split across (temporal, height, width, extra); `rotated_dims = 2*sum(sections) = 128 = n_rot`, so
+this is a full rotation with only the temporal (sequential-position) section active -- DFlash2's
+draft attention needs no 2D/3D image/video position awareness, unlike the main text model's
+partial (0.25 factor, 3-section) M-RoPE. **Pairing is `neox_split_half`, NOT the main model's
+interleaved M-RoPE**: `llama-model.cpp` returns `LLAMA_ROPE_TYPE_MROPE` (not `IMROPE`) for
+`LLM_ARCH_DFLASH`, and ggml's MROPE dispatch (`ggml-cpu/ops.cpp`'s `rotate_pairs`, stride
+`n_dims/2`) pairs `src[ic]` with `src[ic + n_dims/2]` -- GPT-NeoX split-half pairing `(i, i+64)`
+across all 128 dims. The interleaved scheme only fires on ggml's separate `is_imrope` branch,
+which `LLM_ARCH_DFLASH` never takes; do not assume the main text model's interleaved convention
+carries over here. `vocab_size` has no scalar GGUF key of its own (the draft
+carries no `tokenizer.ggml.tokens` array -- it has no embedding table or lm_head of its own, see
+below) and is derived from `selector_predecessor.weight`'s own on-disk shape instead.
+
+### Tensor naming
+
+```
+dflash.fc.{layout}                                [hidden, len(target_layers)*hidden]  (GGUF fc.weight)
+dflash.enc_output_norm                            f32  [hidden]                 (GGUF enc.output_norm.weight)
+dflash.output_norm                                f32  [hidden]                 (GGUF output_norm.weight)
+dflash.selector.hidden.{layout}                   [selector_rank, hidden]       (GGUF selector_hidden.weight)
+dflash.selector.predecessor                       bf16 [vocab, selector_rank]   row-gather codebook, NOT a GEMM
+dflash.selector.successor                         bf16 [vocab, selector_rank]   row-gather codebook, NOT a GEMM
+dflash.layers.{i}.input_layernorm                 f32  [hidden]                 (GGUF blk.{i}.attn_norm.weight)
+dflash.layers.{i}.self_attn.q_proj.{layout}       [head_count*key_length, hidden]
+dflash.layers.{i}.self_attn.k_proj.{layout}       [head_count_kv*key_length, hidden]
+dflash.layers.{i}.self_attn.v_proj.{layout}       [head_count_kv*value_length, hidden]
+dflash.layers.{i}.self_attn.o_proj.{layout}       [hidden, head_count*value_length]
+dflash.layers.{i}.self_attn.q_norm                f32  [key_length]
+dflash.layers.{i}.self_attn.k_norm                f32  [key_length]
+dflash.layers.{i}.self_attn.conv.base             bf16 [2 sides, 2 taps, hidden]  (GGUF blk.{i}.attn_conv_base)
+dflash.layers.{i}.self_attn.conv.proj.{layout}    [2*conv_kernel_size*(hidden/conv_group_size), hidden]
+dflash.layers.{i}.post_attention_layernorm        f32  [hidden]                 (GGUF blk.{i}.ffn_norm.weight)
+dflash.layers.{i}.mlp.gate_proj.{layout}          [feed_forward_length, hidden]
+dflash.layers.{i}.mlp.up_proj.{layout}            [feed_forward_length, hidden]
+dflash.layers.{i}.mlp.down_proj.{layout}          [hidden, feed_forward_length]
+dflash.layers.{i}.mlp.conv.base                   bf16 [2 sides, 2 taps, hidden]  (GGUF blk.{i}.ffn_conv_base)
+dflash.layers.{i}.mlp.conv.proj.{layout}          [2*conv_kernel_size*(hidden/conv_group_size), hidden]
+```
+
+`dflash.fc`'s K is `len(target_layers) * hidden` (`dflash.cpp`'s
+`n_embd_inp_enc_impl = target_layer_ids.size() * hparams.n_embd`) -- for the real checkpoint this
+equals `block_count * hidden` only because it happens to have 5 target-feature taps and 5 draft
+layers; derive the encoder input width from `target_layers`' length, not from `block_count`.
+
+Naming mirrors two existing conventions at once: `layers.{i}.input_layernorm` /
+`post_attention_layernorm` matches the main container's `text.layers.{i}.*` norm names; `self_attn.
+q_proj`/`mlp.gate_proj` etc. use HF-linear-style names per the task brief, mapped 1:1 from the
+GGUF's own `blk.{i}.*` names (cross-checked against the read-only
+`C:\Users\user\dev\ROCmFPX\gguf-py\gguf\constants.py`'s `TENSOR_NAMES` table for
+`MODEL_TENSOR.DFLASH_*`, not imported). **`ffn_gate`/`ffn_up` are kept as two separate tensors**
+(`mlp.gate_proj`/`mlp.up_proj`), unlike the main text-model container's fused `mlp.gate_up` --
+the GGUF source never fuses them, and fusing here would be an unrequested extra permutation with
+no test coverage; a future pass MAY fuse them the same way if a measured perf reason appears.
+**The draft has no `embed_tokens`/`lm_head` of its own** (task A1's own note: it reuses the
+TARGET model's embedding table and lm_head) -- there is deliberately no `dflash.embed_tokens` or
+`dflash.lm_head` tensor in this container; the loader must be handed the target `Container`'s
+`EmbedTokensHost()`/`EmbedTokensDevice()` and `LmHead()` instead (see "Loader" below).
+
+### Orientation
+
+Every GGUF linear's `ne` is `[K, N]` (`ne[0]` = in/fastest-varying, `ne[1]` = out) -- e.g.
+`fc.weight` `ne=[25600,5120]` (`K=25600` in, `N=5120` out), `blk.0.attn_q.weight` `ne=[5120,4096]`
+(`K=5120` in, `N=4096` out; confirmed directly against the real file's own tensor-info dump, not
+assumed). GGUF stores a tensor's bytes in `ne`-order (`ne[1]` outer, `ne[0]` inner), which for a 2D
+tensor is **already** row-major `[N,K]` with row = output feature -- byte-identical to the
+orientation `r4dx_convert::PlanLinearLayouts`/`EmitLinearLayouts` (the SAME packers the main HF
+converter uses) already expect. So `N=ne[1]`, `K=ne[0]`, and the flattened
+`GgufReader::DequantToF32` output feeds those packers with **no transpose or permutation** --
+verified by `tests/convert/test_dflash_container.cpp`'s orientation check (container bf16 bytes
+bit-identical to `GgufReader::DequantToBf16` of the same source tensor).
+
+`selector.predecessor`/`selector.successor`: GGUF `ne=[selector_rank, vocab]` flattens to
+`[vocab][selector_rank]` row-major (vocab outer, rank inner) -- already exactly the
+`[vocab, selector_rank]` row-gather layout the container wants, so these are a straight
+`DequantToBf16` + raw write, same as any other bf16 passthrough tensor, with NO GEMM packing
+(`selector_hidden` IS a GEMM -- `hidden -> selector_rank` -- and goes through the normal linear
+packers; only the two codebooks are row-gather).
+
+Note the container's *declared* tensor shape (the `shape` field the safetensors-style header
+records) is row-major, slowest-axis-first -- the REVERSE of GGUF's fastest-first `ne` -- for every
+bf16/f32 passthrough tensor here, even though the on-disk BYTES are copied verbatim with no
+permutation. `conv.base`'s declared shape is therefore `[2 sides, 2 taps, hidden, <width>]` and
+`selector.predecessor`/`successor`'s is `[vocab, selector_rank, <width>]`, matching the table
+above; declaring `ne` itself (fastest-first) as the shape is a defect (`PlanDflash2Bf16`/
+`PlanDflash2F32` reverse `ne` before recording it, see their own comments).
+
+`conv.base`: GGUF `ne=[hidden,2,2]` flattens to `[side][tap][hidden]` (hidden innermost) --
+exactly `third_party/libr4d/r4d_dflash_conv_body.h`'s expected per-side `[taps,H]` slice
+(`base[0,h]`/`base[1,h]` in that header's own formula), so this is also a straight `DequantToBf16`
++ raw write with no reshaping; a per-side pointer for the libr4d kernel call is
+`conv_base_ptr + side*(conv_kernel_size*hidden)`.
+
+`conv.proj`: the GGUF weight itself needs no permutation either (it's a normal linear, `K=hidden`
+in, `N=2*conv_kernel_size*(hidden/conv_group_size)` out) -- the "group index fastest, then tap,
+then side" structure the reference (`ROCmFPX/src/models/dflash.cpp`) describes is how the
+CONSUMER reshapes this GEMM's flat `N`-wide OUTPUT per token at inference time, not a permutation
+the converter applies to the weight's rows. Documented here so the loader's/forward-pass author's
+row-order assumption is written down once: output index `r` in `[0, N)` decomposes as
+`side = r / (conv_kernel_size * n_groups)`, `tap = (r / n_groups) % conv_kernel_size`,
+`group = r % n_groups`, where `n_groups = hidden / conv_group_size`.
+
+### Loader (CPU-only stage; GPU upload deferred)
+
+`src/model/dflash_draft_weights.h`/`.cpp` (`r4dx::model::DflashDraftWeights`) opens a
+`dflash2_draft` container and exposes its metadata + tensor directory (name, shape, dtype) via the
+same `r4dx_convert::SafetensorsReader` the main `Container` reuses for tensor data -- no HIP call
+anywhere in this stage, so it is fully CPU-unit-testable
+(`tests/model/test_dflash_draft_weights.cpp`). Uploading tensors to device memory (through the
+existing `QuantLinear`/`DeviceBuffer` path) and the DFlash2 forward pass itself are explicitly
+**not** implemented yet -- see that header's own `// TODO(dflash2-forward)` markers.
+
 ## Provenance
 
 - `r4d.h` (this repo's `third_party/libr4d/r4d.h`): every kernel's parameter comment, cited above

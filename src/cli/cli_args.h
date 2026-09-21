@@ -71,8 +71,10 @@ struct CliArgs {
   // behavior): most containers on disk (including every one Milestone 1/the perf pass produced)
   // have no mtp.* weights, so a nonzero default would break --model pointed at any of them; the
   // task's own "K default 3" is the recommended value to pass explicitly once a --model container
-  // was converted with --mtp on, not this flag's own default. Only used by --temperature 0
-  // (greedy) generation -- see main.cpp's RunTurn. Ceiling: 63 (kMaxMtpDraftK below) -- Model's
+  // was converted with --mtp on, not this flag's own default. Runs at any --temperature as of
+  // Milestone 6 stage S3 -- see main.cpp's RunTurn (temperature<=0 picks DecodeStepMtpGreedy,
+  // >0 picks DecodeStepMtpSampled, docs/sampling.md section 9/12). Ceiling: 63 (kMaxMtpDraftK
+  // below) -- Model's
   // VerifyWindow batches `mtp+1` candidates through the same <=64-row chunk path RunChunk uses
   // (model.h's max_chunk_), so mtp+1 <= 64. VRAM cost is linear in K: the GDN window bank's
   // rolling depth is `conv_width-2+(1+mtp)`, so widening K costs real, undocumented-until-now

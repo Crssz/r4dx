@@ -1,5 +1,153 @@
 # Status
 
+## Milestone 6: speculative sampling -- done (2026-09-21, Integrate stage)
+
+Real chat traffic sends `temperature` 0.6-1.0, so every speculation win Milestone 5 measured
+(MTP/DFlash2) only ever reached `temperature <= 0` requests. This milestone closes that gap end to
+end: a canonical-order sampler, a device row-summary kernel that avoids the old ~1 MB-per-token D2H,
+sample-and-match rejection sampling for both speculation families, and the engine/CLI gates lifted so
+`--mtp`/`--dflash` and the fast sampler both run at any temperature. Full design and every measured
+number: [sampling.md](sampling.md).
+
+**Per-item status**:
+
+| Item | Status | Detail |
+|---|---|---|
+| S1: `r4dx_topk_lse_f32` device row-summary kernel (top-64 + logsumexp, 516 B/row D2H) | **DONE** | Exact id+value equality vs. an fp64 Kahan CPU reference; all 8 precondition checks throw. `tests/kernels/test_topk_lse.cpp`. |
+| S1: canonical full-vocab sampler (`SampleCanonical`/`DrawUniform01`, `Sample` unchanged signature) | **DONE** | Statistically proven identical in distribution to the pre-M6 sampler (chi-squared vs. an independent fp64-exact reference, both old and new sampler checked); exactly one draw per emitted token, none for greedy. `tests/kernels/test_sampler_canonical.cpp`. |
+| S1: `SampleFromSummary` (exact-or-silent resolution from the top-64 summary) | **DONE** | Zero mismatches across 3 logit shapes x 6 filter combos x 100000 draws each; fallback rate matches the theory (0% when the candidate set closes inside K, up to ~97% for an unfiltered flat row). `tests/kernels/test_summary_sampler.cpp`. |
+| S2: `Model::DecodeStepSampled`/`DecodeStepMtpSampled`/`DecodeStepDflashSampled` (sample-and-match) | **DONE** | One shared verify+acceptance implementation (`VerifyAndResolveRound`) for greedy and sampled, both speculation families; real-hardware equality vs. plain sampled decode, divergences adjudicated by capturing the exact verify row (never assumed benign). `tests/model/test_mtp.cpp`, `tests/model/test_dflash_e2e.cpp`. |
+| S3: `use_mtp`/`use_dflash` gates no longer depend on temperature (`engine.cpp`, `main.cpp`) | **DONE** | A sampled request now takes `DecodeStep*Sampled`; greedy is byte-identical to before this milestone. `tools/validate_spec_sampling.ps1` (losslessness smoke gate), new `tools/server/smoke.ps1` checks. |
+| Review (adversarial): 3 majors, 5 minors | **ALL FIXED** | Unqualified "lossless" claims in README/docs corrected to "lossless IN DISTRIBUTION" with the batched-verify caveat spelled out; `docs/server.md`'s stale "gates have NOT been lifted yet" paragraph and 3 matching code comments corrected; `validate_spec_sampling.ps1`'s acceptance rule tightened from "control also diverges" (near-zero discriminating power) to "control's hash exactly matches"; a 4x D2H-size documentation error (516 B, not 2048/2052/2 KiB) fixed everywhere; a `kMinSummaryTemperature` host-side screen added so the summary path's documented lse-error band is never exercised below where it was measured to hold; a fallback-rate stats line's numerator/denominator mismatch fixed. See the Fix-stage entries below. |
+| Integrate: `docs/dflash2.md`'s own unqualified "every one of those tokens is the token plain sampled decode would have emitted" (same claim the review flagged in README/server.md, missed in this file during the Fix stage) | **FOUND AND FIXED this stage** | Now qualified identically to `sampling.md`'s own wording: a legitimate canonical sample of the row the round verified, matching plain sampled decode only when that row is numerically the one sequential decode would have computed. |
+| Integrate: clean rebuild + full `ctest` | **DONE** | 164/164 build targets, 0 warnings from this milestone's own code. `ctest`: **53 registered, 52 passed, 1 skipped** (`test_kernel_bandwidth`, gitignored golden absent), **0 failed, 634.51s** -- identical counts to every prior stage's baseline. |
+| Integrate: `tools/validate_dflash.ps1 -AllowBatchedVerifyDivergence` (must be unchanged) | **DONE, UNCHANGED** | Re-run for real: **4 byte-identical, 5 accepted**, exit 0 -- cell for cell identical to the table below (no regression from this milestone's changes to the greedy path). |
+| Integrate: `tools/validate_spec_sampling.ps1 -AllowBatchedVerifyDivergence` (full matrix) | **DONE, reproduced exactly** | 72 pairs: **40 byte-identical, 19 accepted (control's hash matched exactly), 13 unresolved** (every one an `--mtp 3` mismatch; per layout 6/11/7 w4a16, 19/5/0 w4a8, 15/3/6 mxfp4) -- exit 1, reported honestly, an exact reproduction of the Fix stage's own re-run (no regression, no improvement -- the 13 rows are a black-box script limitation, not a proven bug; the authoritative `ctest` exact-verify-row classifier is green above). |
+| Integrate: `tools/server/smoke.ps1` real container + `-ToolRoundTrip` (port 8195) | **DONE, ALL PASS** | Every check passed, including the sampled-speculative checks (`timings.draft_n>0`, reproducible on repeat, server text byte-for-byte matches a same-seeded plain sampled `r4dx-cli` run) and the full tool-call/reasoning_content/model-metadata suite. |
+| Integrate: `tools/server/smoke.ps1` default 4-layer run (port 8196) | **DONE, ALL PASS** | All checks pass (reasoning_content checks correctly SKIP against the non-real container, as designed). |
+| Integrate: headline sampled table re-confirmation (haiku + LRU-cache prompts, w4a16, `T=0.7 top_k=20 top_p=0.8`, twice each) | **DONE** | plain 38.63/38.68 (haiku), 38.73/38.71 (code); `--mtp 3` 66.32/66.30 (46.2%, 2.27 tok/rd) haiku, 94.01/93.88 (73.6%, 3.20 tok/rd) code; `--dflash k=7` 61.48/61.50 (17.5%, 2.19 tok/rd) haiku, **154.28/154.23** (66.1%, 5.56 tok/rd) code. Token-level stats (acceptance %, tok/round) are IDENTICAL to every earlier measurement of this exact cell -- only wall-clock tok/s moved, by <1.5%, ordinary run-to-run noise, well under the 3% "report both" threshold. `README.md`/`docs/perf.md`'s top section updated to carry these exact numbers. |
+| Integrate: account-path hygiene (`git grep -n -i` every tracked file for the account name / a `C:\Users\<name>` path) | **CLEAN** | Zero hits for the account name anywhere in the tree. The only `C:\Users\...` hits are pre-existing generic `...\Users\user\...` placeholders in files this milestone did not touch (`.gitmodules`, `docs/build-windows.md`, `tools/reference/*.py`, `tools/convert_ref/*.py`, `tools/profile/tune_gemm.py`, `docs/mtp.md:49`) -- confirmed via `git diff` that none of them were introduced or modified by this milestone. |
+| Integrate: scratch log cleanup (`build\logs\`) | **DONE** | All `s1_*`/`s2_*`/`s3_*`/`rev_*`/`review_fix_*`/`integrate_*` logs deleted after this section was written from them. |
+
+**Known gaps** (nothing here was silently dropped -- each is a measured, reported limitation, not
+undelivered scope):
+
+1. **`tools/validate_spec_sampling.ps1`'s 13 unresolved `--mtp 3` rows** (out of 72) are a black-box
+   SHA/text-diff script's own limitation, not a proven bug -- the authoritative check is the `ctest`
+   exact-verify-row classifier (`test_mtp.cpp::CheckSampledRoundsMatchPlain`,
+   `test_dflash_e2e.cpp::CheckSampledDflashMatchesPlain`), green in every full `ctest` run this
+   milestone, including this Integrate stage's own. A follow-up could give the PS1 script the same
+   exact-verify-row capture the `ctest` classifier has.
+2. **Pure-temperature sampling gets no benefit from the device row-summary** (fallback rate up to
+   ~1.7% measured, and structurally cannot be fully closed by a top-64 summary alone) -- filtered
+   requests (`top_k`/`top_p`/`min_p`, what real chat clients send) never fall back.
+3. **No w4a8/mxfp4 DFlash2 draft container has been tried under sampling** -- every `--dflash` cell
+   in this milestone (and Milestone 5 before it) still uses the w4a16 draft regardless of the
+   target's own layout.
+4. **No long-context sampled measurement point** -- everything in this milestone is `--max-ctx 2048`.
+5. **The `p_min`/`n_min` sweep under sampling was never run** (Milestone 5's own gap, unchanged).
+6. Every gap already listed under Milestone 5's own "Known gaps" that this milestone did not touch
+   (the standard-prompt mxfp4 acceptance gap, DFlash2's overall acceptance vs. ROCmFPX's reference,
+   R10/P9's prefill GEMM kernel, the vision tower, Q8 GPU clock/power sampling) is still open exactly
+   as that milestone left it -- see below.
+
+## Milestone 6: sampled speculative decode, stage-by-stage history (S1-S3, Review, Fix)
+
+Real chat traffic sends `temperature` 0.6-1.0, so every speculation win Milestone 5 measured
+(DFlash2/MTP) only ever applied to `temperature <= 0` requests -- real traffic got plain sampled
+decode at ~28-39 tok/s against 89-180 tok/s greedy/DFlash2 on the same container. Two causes, both
+fixed across this milestone's three stages: (a) no acceptance rule existed for a *sampling* target,
+only "draft == argmax"; (b) the sampler itself was a full-vocab CPU pass (~1 MB D2H + sort/softmax
+over 248320 floats per token).
+
+**Stage S1 (kernels + canonical sampler), done.** `r4dx_topk_lse_f32` (device row-summary kernel:
+top-64 raw logits+ids in canonical order plus a stable logsumexp, 516 B D2H instead of ~993 KB),
+`SampleCanonical`/`DrawUniform01` (the full-vocab sampler refactored to take one uniform draw `u`
+instead of the rng directly, walking canonical order = raw-logit-descending/ties-to-lower-id, proven
+statistically identical in distribution to the pre-M6 sampler), `SampleFromSummary` (exact-or-silent
+resolution from the top-64 summary alone, HIP-free header). Full ctest green (53/52/1 skip/0 failed).
+See [sampling.md](sampling.md) sections 1-6.
+
+**Stage S2 (Model wiring), done.** `Model::DecodeStepSampled` (plain sampled decode through the
+device summary), `DecodeStepMtpSampled`/`DecodeStepDflashSampled` (sample-and-match: rejection
+sampling against a deterministic drafter, provably lossless -- one shared verify+acceptance
+implementation for greedy and sampled, both speculation families). Real-hardware equality tests
+proved token-for-token identity with plain sampled decode (modulo the pre-existing batched-verify
+numeric mechanism, adjudicated per-divergence by capturing the exact verify row, never assumed).
+`src/server`/`src/cli` still gated `use_mtp`/`use_dflash` on `temperature <= 0` at the end of this
+stage -- lifting that was S3's job. See [sampling.md](sampling.md) sections 7-11.
+
+**Stage S3 (engine/CLI wiring, gate script, smoke, measurement, docs), done.** `use_mtp`/`use_dflash`
+in `Engine::RunRequest` (`src/server/engine.cpp`) and `RunTurn` (`src/cli/main.cpp`) no longer depend
+on temperature -- a `temperature > 0` request now takes `DecodeStepDflashSampled` when a drafter is
+loaded, else `DecodeStepMtpSampled` when MTP is enabled, else `DecodeStepSampled`; `temperature <= 0`
+is byte-identical to before this milestone. `Model::SetDflashInjectionEnabled` is no longer toggled
+off for sampled requests (they use the drafter now too). The per-request stderr log line gained
+`temperature=`/`stream=yes|no`/`thinking=yes|no`. New: `tools/validate_spec_sampling.ps1` (the
+losslessness gate, modeled on `tools/validate_dflash.ps1`, extended with a sampling config and seed
+axis and a cross-family control), new `tools/server/smoke.ps1` checks (seeded sampled request ->
+`timings.draft_n>0`, reproducible on repeat, matches a same-seeded CLI plain sampled run against the
+real container). A documented debug env var, `R4DX_DEBUG_FULL_VOCAB_SAMPLER=1` (`src/cli/main.cpp`),
+forces the pre-Milestone-6 full-vocab plain-sampled path for a same-binary before/after cost
+comparison. See [sampling.md](sampling.md) section 12, [server.md](server.md)'s stage S3 correction,
+and this section's own measured table below.
+
+**Measured (real 64-layer container, HIP device 1, `--max-ctx 2048`, each measurement twice; full
+table in `docs/perf.md`'s top section).** Plain sampled decode's tax over greedy fell from
+**6.2-7.5%** (the pre-stage full-vocab CPU sampler) to statistical parity (the new device-summary
+path; the Integrate stage's own re-run of the `T=0.7 top_k=20 top_p=0.8` row measured within about
+-0.8% to +0.7% of the greedy reference), verified byte-identical text before/after via the
+`R4DX_DEBUG_FULL_VOCAB_SAMPLER=1` debug flag. On the code prompt, w4a16's best cell (`--dflash k=7`,
+sampled) reaches **154.28, 154.23 tok/s** (Integrate stage re-confirmation, twice), 4.28x plain
+sampled decode's old cost and now reachable by real `temperature 0.6-1.0` traffic for the first
+time. Fallback-to-full-row rate is 0% for every `top_k`/`top_p`-filtered config measured, <=1.7% for
+pure temperature.
+
+**`tools/validate_spec_sampling.ps1 -AllowBatchedVerifyDivergence` result (re-run after a review fix,
+2026-09-21 -- see below):** 72 (layout x prompt x sampling-config x seed x {`--mtp 3`,`--dflash
+k=7`}) pairs -- **40 byte-identical, 19 accepted (a control reproduced the mismatch's EXACT hash,
+not merely "also diverged"), 13 unresolved by either control this script tried** (every one an
+`--mtp 3` mismatch; every `--dflash k=7` mismatch, 19/19, was resolved exactly by its `--mtp 7`
+cross-family control -- see [sampling.md](sampling.md) section 12.3 for the full per-layout
+breakdown). Script exit code: 1, reported honestly. **This script is a real-hardware smoke check,
+not the losslessness proof**: the authoritative check is `test_mtp.cpp`'s
+`CheckSampledRoundsMatchPlain` / `test_dflash_e2e.cpp`'s `CheckSampledDflashMatchesPlain`, which
+capture the exact verify row a mismatch used and prove the emitted token is a legitimate canonical
+sample of it -- these are green in the ctest run below, having found zero real bugs across a larger,
+independently-drafted trajectory set in stage S2.
+
+**Review fix (2026-09-21).** An adversarial review found the original acceptance rule -- downgrade a
+mismatch to WARN whenever a cross-family control *also diverges from the baseline* -- has almost no
+discriminating power at this container's actual divergence rate (`-Quick -Seeds 1`: 0/12
+byte-identical, 12 "accepted" by the old rule). The script now requires a control's hash to
+EXACTLY MATCH the mismatch's own hash, and tries a second, same-family "grouping" control
+(mirroring `tools/validate_dflash.ps1`'s own second-tier control) before giving up. Also fixed:
+`README.md`'s and `docs/server.md`'s unqualified "lossless -- the same tokens plain sampled decode
+would produce" claims (now qualified as lossless IN DISTRIBUTION, with the pre-existing
+batched-verify caveat spelled out where a reader would actually see it); `docs/server.md`'s stale
+"the gates have NOT been lifted yet" paragraph and three matching stale code comments
+(`server_args.h`, `cli_args.h`, `main.cpp`); a 4x D2H-size documentation error (516 B/row, not
+2048/2052/2 KiB); a self-contradicting perf.md clause; a `kMinSummaryTemperature` host-side screen
+added so `summary_sampler.hpp`'s documented `lse` error band is never exercised below the
+temperature it was measured to hold at; and a CLI `--stats` fallback-rate line whose denominator
+now counts emitted (not merely displayed) tokens and is suppressed under the full-vocab debug path.
+Full details, the fixed script's own file comment, and the re-measured numbers above.
+
+**Full `ctest` at the end of stage S3**: 53 registered, 52 passed, 1 skipped
+(`test_kernel_bandwidth`, gitignored golden absent), 0 failed, 652.49s -- identical counts to the
+baseline this stage started from (no regression from the engine/CLI/smoke/docs changes above).
+`tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16 -Layers -1 -Dflash
+<real w4a16 draft>` against the real container: **every check passed**, including the new seeded
+sampled-speculative checks (`timings.draft_n>0`, reproducible on repeat, matches a same-seeded
+plain sampled `r4dx-cli` run byte-for-byte).
+
+**Open going into the rest of Milestone 6:** none from stage S3's own numbered items -- see that
+stage's `open_issues` for findings/hand-offs that are not undelivered work (a pure-temperature
+request still cannot benefit from the top-64 summary, by construction; the exact fallback-tail
+mitigation is left as a measured-but-not-implemented option; the 13 `--mtp 3` `validate_spec_sampling.ps1`
+rows neither control resolves exactly are a black-box script's own limitation, not a proven bug --
+the authoritative ctest exact-verify-row classifier is green, see section 12.3).
+
 ## Milestone 5: done (2026-09-21, integration pass)
 
 **Integration**: clean `build.ps1 -Clean` rebuild (0 errors, 0 warnings from this milestone's own

@@ -21,12 +21,14 @@
 // layout pair (w4a16/w4a16) is exercised, not the full layout matrix test_mtp.cpp sweeps, to keep
 // this test's own real-45GB-container-load cost bounded to a single load per Model construction.
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "model.h"
 #include "mtp_round.hpp"
 #include "prefix_state.h"
+#include "sampled_equality.hpp"
 #include "test_common.h"
 
 using namespace r4dx_test;
@@ -457,6 +459,280 @@ bool CheckInjectionToggleGap(const ModelOptions& base_opts, const std::vector<in
   return true;
 }
 
+// ================================================================================================
+// Milestone 6 stage S2: sampled DFlash2 rounds (docs/sampling.md section 9, docs/dflash2.md)
+// ================================================================================================
+// The losslessness gate on the REAL 64-layer target: a sampled DFlash2 round draws exactly ONE
+// uniform per EMITTED token and maps it to a token by the same canonical rule plain sampled decode
+// uses, so for a fixed seed the two must emit the same tokens in the same order. Unlike
+// tests/model/test_mtp.cpp's own version of this check, the drafter here really does get accepted
+// (this is the real target against its real DFlash2 draft container), so the multi-token-round path
+// is exercised by the production drafter itself -- and the check asserts it was.
+//
+// The one divergence accepted, and how, is identical to test_mtp.cpp's (see that file's section
+// header): a speculative round computes its logits in one q_len>1 pass whose reduction order
+// differs from single-row decode's, which can move a CDF boundary past the draw. On a mismatch this
+// obtains the EXACT verify row the diverging token was resolved from (Model::ReadVerifyLogitsRow
+// after a deterministic re-run) plus the plain decode row for the same position, and accepts the
+// divergence only if canonically sampling each of those rows with that token's own draw reproduces
+// the respective run's token. The exact bookkeeping gate -- a round commits exactly as many
+// positions as it emitted tokens -- is asserted after EVERY round, not just on a mismatch.
+//
+// The reference trajectory runs on the SAME Model (Reset() in between) rather than on a second
+// independently loaded one, for the same VRAM reason every other check in this file frees one
+// Model before loading another: two full 27B targets plus a drafter do not fit. The independent-
+// Model property is not lost -- CheckSampledPlainDecodeIsDrafterIndependent below re-runs one of
+// these trajectories on a freshly loaded, drafter-free Model and requires the identical tokens.
+constexpr size_t kSampledTokens = 96;
+constexpr uint64_t kSampledSeeds[] = {1u, 20260921u};
+const int64_t kSampledKs[] = {4, 7};
+
+// A code-like prompt, built the way every other check in this file obtains tokens (no tokenizer is
+// linked into this binary): deterministic synthetic ids, but drawn from a narrow low range where a
+// BPE vocabulary's own ASCII/identifier-ish tokens live, so the target's continuation is the
+// repetitive, highly predictable kind of text a code completion request produces -- which is what
+// gives DFlash2 drafts a real chance of being accepted here.
+std::vector<int32_t> MakeCodeLikePromptTokens(int n) {
+  std::vector<int32_t> ids(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    // A short repeating cycle of low ids: the target sees an obviously periodic context and
+    // continues it, exactly the regime DFlash2's selector walk is good at.
+    ids[static_cast<size_t>(i)] = 256 + (i % 12) * 7 + (i / 12) % 3;
+  }
+  return ids;
+}
+
+struct SampledRunStats {
+  int64_t rounds = 0;
+  int64_t drafted = 0;
+  int64_t accepted = 0;
+  int64_t longest_round = 0;
+};
+
+std::vector<int32_t> RunPlainSampled(Model& m, const std::vector<int32_t>& prompt,
+                                      const r4dx::kernels::SampleParams& params, uint64_t seed,
+                                      size_t n) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  const std::vector<float> l0 = m.Prefill(prompt);
+  std::vector<int32_t> seq;
+  int32_t tok = SampleFirstToken(l0, m.Config().vocab_size, params, rng);
+  seq.push_back(tok);
+  while (seq.size() < n) {
+    tok = m.DecodeStepSampled(tok, params, rng);
+    seq.push_back(tok);
+  }
+  return seq;
+}
+
+// `capture_index`/`captured_row`: forensics for a mismatch -- on a deterministic re-run, read back
+// the EXACT logits row the sampler resolved emitted token `capture_index` from. Valid because
+// verify_logits_dev_ still holds that round's window when DecodeStepDflashSampled returns.
+std::vector<int32_t> RunDflashSampled(Model& m, const std::vector<int32_t>& prompt,
+                                       const r4dx::kernels::SampleParams& params, uint64_t seed,
+                                       size_t n, int64_t k, SampledRunStats* stats,
+                                       size_t capture_index = static_cast<size_t>(-1),
+                                       std::vector<float>* captured_row = nullptr) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  const std::vector<float> l0 = m.Prefill(prompt);
+  std::vector<int32_t> seq;
+  int32_t tok = SampleFirstToken(l0, m.Config().vocab_size, params, rng);
+  seq.push_back(tok);
+  while (seq.size() < n) {
+    const size_t base = seq.size();
+    int64_t walk_len = 0;
+    const std::vector<int32_t> round =
+        m.DecodeStepDflashSampled(tok, k, /*p_min=*/0.0f, /*n_min=*/0, params, rng, &walk_len);
+    if (captured_row != nullptr && capture_index >= base && capture_index < base + round.size()) {
+      m.ReadVerifyLogitsRow(static_cast<int64_t>(capture_index - base), *captured_row);
+    }
+    if (stats) {
+      ++stats->rounds;
+      stats->drafted += walk_len;
+      stats->accepted += static_cast<int64_t>(round.size()) - 1;  // the last token is never a draft
+      stats->longest_round =
+          std::max(stats->longest_round, static_cast<int64_t>(round.size()));
+    }
+    seq.insert(seq.end(), round.begin(), round.end());
+    tok = round.back();
+    // THE bookkeeping gate, asserted on every round: a round commits exactly as many positions as
+    // it emitted tokens, so after N emitted tokens the model holds the prompt plus N-1 of them --
+    // identical arithmetic to plain decode's. Committing the whole window, or one row too few, is
+    // caught here immediately with no tolerance.
+    if (m.PositionCount() != static_cast<int64_t>(prompt.size() + seq.size() - 1)) {
+      std::fprintf(stderr,
+                   "FAIL: after a sampled DFlash2 round of %zu tokens the model holds %lld "
+                   "positions, expected %zu\n",
+                   round.size(), static_cast<long long>(m.PositionCount()),
+                   prompt.size() + seq.size() - 1);
+      std::abort();
+    }
+  }
+  return seq;
+}
+
+// The FULL fp32 logits row plain single-row decode used for emitted token `index`.
+std::vector<float> PlainLogitsRowAt(Model& m, const std::vector<int32_t>& prompt,
+                                     const std::vector<int32_t>& seq, size_t index) {
+  m.Reset();
+  std::vector<float> row = m.Prefill(prompt);
+  for (size_t i = 0; i + 1 <= index; ++i) row = m.DecodeStep(seq[i]);
+  return row;
+}
+
+bool CheckSampledDflashMatchesPlain(Model& m, const std::vector<int32_t>& prompt,
+                                     size_t* exact_out, size_t* accepted_numeric_out,
+                                     bool* saw_accepted_draft_out,
+                                     std::vector<int32_t>* first_plain_out,
+                                     r4dx::kernels::SampleParams* first_params_out,
+                                     uint64_t* first_seed_out) {
+  const int64_t vocab = m.Config().vocab_size;
+  // The stage's own matrix: T=0.7 top_k=20 top_p=0.8 (a typical chat request) and T=1.0 pure (no
+  // candidate-set filter at all -- the configuration whose CDF walk depends on the mass outside the
+  // device summary's top-64, so it is the one that exercises the full-row fallback).
+  std::vector<SampledConfig> configs;
+  configs.push_back(SampledConfigs()[0]);
+  configs.push_back(SampledConfigs()[1]);
+
+  bool first = true;
+  for (int64_t k : kSampledKs) {
+    for (const SampledConfig& cfg : configs) {
+      for (uint64_t seed : kSampledSeeds) {
+        const std::vector<int32_t> plain = RunPlainSampled(m, prompt, cfg.params, seed, kSampledTokens);
+        if (first) {
+          *first_plain_out = plain;
+          *first_params_out = cfg.params;
+          *first_seed_out = seed;
+          first = false;
+        }
+        SampledRunStats stats;
+        const int64_t fallbacks_before = m.SampledFallbackRows();
+        const std::vector<int32_t> spec =
+            RunDflashSampled(m, prompt, cfg.params, seed, kSampledTokens, k, &stats);
+        const int64_t fallbacks = m.SampledFallbackRows() - fallbacks_before;
+        if (stats.longest_round > 1) *saw_accepted_draft_out = true;
+        std::fprintf(stderr,
+                     "[dflash] sampled k=%lld config=%-20s seed=%llu: %lld rounds, drafted=%lld "
+                     "accepted=%lld (%.1f%% accept, %.2f tok/round, longest round=%lld), %lld "
+                     "summary rows fell back to full vocab\n",
+                     static_cast<long long>(k), cfg.name, static_cast<unsigned long long>(seed),
+                     static_cast<long long>(stats.rounds), static_cast<long long>(stats.drafted),
+                     static_cast<long long>(stats.accepted),
+                     stats.drafted > 0
+                         ? 100.0 * static_cast<double>(stats.accepted) / static_cast<double>(stats.drafted)
+                         : 0.0,
+                     static_cast<double>(spec.size() - 1) / static_cast<double>(stats.rounds),
+                     static_cast<long long>(stats.longest_round),
+                     static_cast<long long>(fallbacks));
+
+        size_t j = 0;
+        while (j < plain.size() && j < spec.size() && plain[j] == spec[j]) ++j;
+        if (j >= kSampledTokens) {
+          ++*exact_out;
+          continue;
+        }
+
+        // Divergence: get both rows for that position and classify. See this section's header.
+        const std::vector<double> draws = ReplayDraws(seed, j + 1);
+        const double u = draws[j];
+        const std::string tag = std::string("[dflash-sampled k=") + std::to_string(k) + " " +
+                                 cfg.name + " seed=" + std::to_string(seed) + "]";
+        std::fprintf(stderr,
+                     "%s DIVERGENCE at index %zu after %zu identical tokens: plain=%d spec=%d "
+                     "u=%.17g\n",
+                     tag.c_str(), j, j, plain[j], spec[j], u);
+        if (j == 0) {
+          std::fprintf(stderr,
+                       "%s   index 0 comes from Prefill()'s own logits with no verify pass "
+                       "anywhere -- this cannot be the batched-verify mechanism\n",
+                       tag.c_str());
+          return false;
+        }
+        std::vector<float> row_verify;
+        RunDflashSampled(m, prompt, cfg.params, seed, kSampledTokens, k, nullptr, j, &row_verify);
+        const std::vector<float> row_decode = PlainLogitsRowAt(m, prompt, plain, j);
+        if (row_verify.size() != static_cast<size_t>(vocab)) {
+          std::fprintf(stderr, "%s   could not capture the verify row\n", tag.c_str());
+          return false;
+        }
+        const double rel = RelL2(row_verify, row_decode);
+        const int32_t from_decode =
+            r4dx::kernels::SampleCanonical(row_decode.data(), vocab, cfg.params, u);
+        const int32_t from_verify =
+            r4dx::kernels::SampleCanonical(row_verify.data(), vocab, cfg.params, u);
+        const NearTieReport tie_decode =
+            AnalyzeNearTie(row_decode, vocab, cfg.params, u, plain[j], spec[j]);
+        const NearTieReport tie_verify =
+            AnalyzeNearTie(row_verify, vocab, cfg.params, u, plain[j], spec[j]);
+        std::fprintf(stderr,
+                     "%s   decode-row vs verify-row rel L2=%.4e; canonical sample of the decode row "
+                     "at that u=%d (plain emitted %d); of the verify row=%d (spec emitted %d)\n",
+                     tag.c_str(), rel, from_decode, plain[j], from_verify, spec[j]);
+        PrintNearTie(tag.c_str(), tie_decode, u, plain[j], spec[j]);
+        std::fprintf(stderr,
+                     "%s   that pair's CDF boundary: decode row %.12f, verify row %.12f (shift "
+                     "%.3e), u=%.12f lies %s the two\n",
+                     tag.c_str(), tie_decode.boundary, tie_verify.boundary,
+                     tie_verify.boundary - tie_decode.boundary, u,
+                     (u >= std::min(tie_decode.boundary, tie_verify.boundary) &&
+                      u < std::max(tie_decode.boundary, tie_verify.boundary))
+                         ? "BETWEEN"
+                         : "outside");
+        const bool cond_rows_same_context = (rel > 0.0 && rel <= 0.5);
+        const bool cond_decode_reproduces_plain = (from_decode == plain[j]);
+        const bool cond_verify_reproduces_spec = (from_verify == spec[j]);
+        if (!(cond_rows_same_context && cond_decode_reproduces_plain &&
+              cond_verify_reproduces_spec)) {
+          std::fprintf(stderr,
+                       "%s   NOT the known batched-verify mechanism "
+                       "(rows-are-the-same-distribution=%s decode-row-reproduces-plain=%s "
+                       "verify-row-reproduces-spec=%s) -- this is a bookkeeping bug\n",
+                       tag.c_str(), cond_rows_same_context ? "yes" : "NO",
+                       cond_decode_reproduces_plain ? "yes" : "NO",
+                       cond_verify_reproduces_spec ? "yes" : "NO");
+          return false;
+        }
+        std::fprintf(stderr,
+                     "%s   ACCEPTED as the known batched-verify divergence (docs/perf.md, "
+                     "tools/validate_dflash.ps1): the speculative path sampled the RIGHT draw, from "
+                     "the RIGHT row of the RIGHT round, with the RIGHT filters\n",
+                     tag.c_str());
+        ++*accepted_numeric_out;
+      }
+    }
+  }
+  return true;
+}
+
+// The independent-Model half of the check above: plain SAMPLED decode must not depend on whether a
+// DFlash2 drafter happens to be loaded (a sampled request on a --dflash server takes exactly this
+// path -- docs/server.md's "Sampled traffic pays nothing"). Run on a freshly loaded, drafter-free
+// Model and required to be token-for-token identical.
+bool CheckSampledPlainDecodeIsDrafterIndependent(const ModelOptions& base_opts,
+                                                  const std::vector<int32_t>& prompt,
+                                                  const std::vector<int32_t>& expected,
+                                                  const r4dx::kernels::SampleParams& params,
+                                                  uint64_t seed) {
+  Model ref = Model::Load(base_opts);  // no dflash_container
+  const std::vector<int32_t> got = RunPlainSampled(ref, prompt, params, seed, expected.size());
+  if (got != expected) {
+    size_t j = 0;
+    while (j < got.size() && got[j] == expected[j]) ++j;
+    std::fprintf(stderr,
+                 "FAIL: plain sampled decode differs between a drafter-loaded Model and a "
+                 "drafter-free one at index %zu (%d vs %d) -- loading a drafter must not change a "
+                 "sampled request's own tokens\n",
+                 j, got[j], expected[j]);
+    return false;
+  }
+  std::fprintf(stderr,
+               "[dflash] plain sampled decode is identical (%zu tokens) with and without a DFlash2 "
+               "drafter loaded\n",
+               expected.size());
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -488,5 +764,53 @@ int main() {
     return 1;
   }
   std::fprintf(stderr, "[PASS] CheckInjectionToggleGap (dflash, layout=w4a16)\n");
+
+  // ---- Milestone 6 stage S2 item 3b: sampled DFlash2 rounds vs plain sampled decode -------------
+  {
+    // opts.max_ctx (512) already covers the 96-token prompt plus 96 sampled tokens, plus the
+    // forensic replays, so this keeps the same VRAM footprint as every other check in this file.
+    const ModelOptions& sampled_opts = opts;
+    const std::vector<int32_t> code_prompt = MakeCodeLikePromptTokens(96);
+    size_t exact = 0, accepted_numeric = 0;
+    bool saw_accepted_draft = false;
+    std::vector<int32_t> first_plain;
+    r4dx::kernels::SampleParams first_params;
+    uint64_t first_seed = 0;
+    bool ok = false;
+    {
+      ModelOptions dflash_opts = sampled_opts;
+      dflash_opts.dflash_container = kDflashContainerPath;
+      dflash_opts.dflash_draft_k = kDflashK;
+      Model m = Model::Load(dflash_opts);
+      ok = CheckSampledDflashMatchesPlain(m, code_prompt, &exact, &accepted_numeric,
+                                          &saw_accepted_draft, &first_plain, &first_params,
+                                          &first_seed);
+    }  // free the drafter-loaded Model before loading a second full 27B target (see above)
+    if (!ok) {
+      std::fprintf(stderr, "FAIL: CheckSampledDflashMatchesPlain\n");
+      return 1;
+    }
+    // A run in which no round ever accepted a draft would say nothing about sample-and-match: it
+    // would only prove that a one-token round emits what plain decode emits.
+    if (!saw_accepted_draft) {
+      std::fprintf(stderr,
+                   "FAIL: no sampled DFlash2 round accepted a single draft across the whole "
+                   "matrix -- sample-and-match was never actually exercised\n");
+      return 1;
+    }
+    const size_t combos =
+        (sizeof(kSampledKs) / sizeof(kSampledKs[0])) * 2 * (sizeof(kSampledSeeds) / sizeof(kSampledSeeds[0]));
+    std::fprintf(stderr,
+                 "[dflash] sampled-equality: %zu/%zu trajectories token-for-token identical to "
+                 "plain sampled decode, %zu accepted as the known batched-verify divergence, 0 "
+                 "bookkeeping failures\n",
+                 exact, combos, accepted_numeric);
+    if (!CheckSampledPlainDecodeIsDrafterIndependent(sampled_opts, code_prompt, first_plain,
+                                                      first_params, first_seed)) {
+      std::fprintf(stderr, "FAIL: CheckSampledPlainDecodeIsDrafterIndependent\n");
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] CheckSampledDflashMatchesPlain (dflash, layout=w4a16)\n");
+  }
   return 0;
 }

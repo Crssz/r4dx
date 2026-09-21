@@ -4,6 +4,7 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -223,6 +224,18 @@ Model Model::Load(const ModelOptions& opts) {
     m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.draft_window_));
   }
 
+  // Sampled-decode row summaries (docs/sampling.md section 8), sized for the widest thing that can
+  // ever be summarised at once: one plain decode row, or a whole verify window. Unconditional and
+  // ~4 KB at draft_window_==8 -- a plain sampled decode step needs these on a Model that was never
+  // sized for speculation at all, and a conditional allocation would be one more way for a caller
+  // to reach a null pointer.
+  {
+    const size_t summary_rows = static_cast<size_t>(m.draft_window_ > 1 ? m.draft_window_ : 1);
+    m.summary_ids_dev_ = core::DeviceBuffer<int32_t>(summary_rows * R4DX_TOPK_LSE_K);
+    m.summary_vals_dev_ = core::DeviceBuffer<float>(summary_rows * R4DX_TOPK_LSE_K);
+    m.summary_lse_dev_ = core::DeviceBuffer<float>(summary_rows);
+  }
+
   // Stage S3 (docs/dflash2.md section 7 item 1): load the DFlash2 drafter, if requested, as its own
   // phase so its VRAM (weights + KV ring + draft-block scratch, all allocated inside
   // DflashDraft::Load) can be reported as its own breakdown line rather than folded silently into
@@ -360,7 +373,8 @@ void Model::Reset() {
 }
 
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
-                                    bool want_logits, int32_t* greedy_token_out) {
+                                    bool want_logits, int32_t* greedy_token_out,
+                                    const SummaryRequest* summary_out) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   if (T < 1 || T > max_chunk_) {
     throw std::runtime_error("Model::RunChunk: token_ids.size() must be in [1, " +
@@ -566,6 +580,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
                        reinterpret_cast<int64_t>(argmax_dev_.data()), cfg.vocab_size,
                        reinterpret_cast<int64_t>(stream_.get()));
+    } else if (summary_out != nullptr) {
+      // Sampled path (docs/sampling.md section 8): the same "argmax it on device while it is still
+      // hot" trick one step further -- summarise the row on device so the D2H below is 516 bytes
+      // instead of vocab*4, and the host sampler gets to skip its own O(vocab) pass entirely.
+      LaunchRowSummaries(logits_dev_.data(), /*rows=*/1, summary_out->inv_temperature);
     }
     arena_.Reset();
   }
@@ -586,6 +605,12 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   if (want_logits) {
     if (greedy_token_out != nullptr) {
       argmax_dev_.CopyToHost(greedy_token_out, 1);
+    } else if (summary_out != nullptr) {
+      // round_summaries_ is this Model's one summary staging vector; a plain decode step and a
+      // verify round are never in flight at the same time (single sequence, single worker thread --
+      // this class's own SCOPE comment), so they share it rather than allocating per token.
+      FetchRowSummaries(/*rows=*/1, summary_out->inv_temperature, round_summaries_);
+      *summary_out->out = round_summaries_[0];
     } else {
       logits.resize(static_cast<size_t>(cfg.vocab_size));
       logits_dev_.CopyToHost(logits.data(), logits.size());
@@ -697,6 +722,145 @@ int32_t Model::DecodeStepGreedy(int32_t token_id) {
   int32_t next = -1;
   RunChunk({token_id}, /*is_prefill_path=*/false, /*want_logits=*/true, &next);
   return next;
+}
+
+// ---- sampled decode (docs/sampling.md sections 8-9, Milestone 6 stage S2) -----------------------
+
+// Review fix (2026-09-21, minor): kRowSummaryLseRelTol's documented "~5x headroom"
+// (summary_sampler.hpp) is conditional on |max_logit/temperature| staying under ~1e4 -- measured
+// S_full error grows from 1.7e-6 (T=1.0) to 1.5e-3 (T=0.001, already past the 1e-3 band) on this
+// model's logit scale. Below kMinSummaryTemperature the summary path is skipped in favor of the
+// full-logits path (still exactly one draw, still the canonical sampler -- see DecodeStepSampled's
+// existing inv_t==0.0f branch, which this reuses), so the band summary_sampler.hpp documents is
+// never exercised outside where it was measured to hold. 0.01 leaves >2x margin below the measured
+// safe point (T=0.005 -> 2.4e-4 error) and real chat traffic never asks for T this low.
+inline constexpr float kMinSummaryTemperature = 0.01f;
+
+float Model::SummaryInvTemperature(const kernels::SampleParams& params) {
+  if (!(params.temperature > 0.0f)) return 0.0f;  // greedy -- no sampling, no summary
+  if (params.temperature < kMinSummaryTemperature) return 0.0f;  // see kMinSummaryTemperature above
+  const float inv = 1.0f / params.temperature;
+  // The device kernel REJECTS a non-finite or non-positive inv_temperature by throwing out of an
+  // extern "C" entry point, which under this build's /EHsc is a fail-fast rather than an exception
+  // the caller could handle. Screen it here instead: a temperature below ~1e-38 overflows the
+  // reciprocal, and such a request simply takes the full-logits path (it is greedy in all but name).
+  // (kMinSummaryTemperature above already catches every temperature that could reach this, but the
+  // check is kept as a second, independent guarantee against the device kernel's own precondition.)
+  if (!(inv > 0.0f) || !(inv < std::numeric_limits<float>::infinity())) return 0.0f;
+  return inv;
+}
+
+void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature) {
+  if (rows <= 0) return;
+  const int64_t vocab = container_.Config().vocab_size;
+  const int64_t capacity = static_cast<int64_t>(summary_lse_dev_.size());
+  if (rows > capacity) {
+    throw std::runtime_error("Model::LaunchRowSummaries: rows (" + std::to_string(rows) +
+                              ") exceeds the summary scratch this Model was sized for (" +
+                              std::to_string(capacity) + ")");
+  }
+  if (!(inv_temperature > 0.0f) ||
+      !(inv_temperature < std::numeric_limits<float>::infinity())) {
+    throw std::runtime_error("Model::LaunchRowSummaries: inv_temperature must be finite and > 0");
+  }
+  // r4dx_topk_lse_f32 takes at most 8 rows per call (kernels.h) and keeps its partials in a
+  // module-scope device scratch, so only ONE call may be in flight. Both constraints are satisfied
+  // by issuing <=8-row calls back to back on stream_: stream order makes call n+1's first kernel
+  // wait for call n's merge kernel, which is exactly the serialisation that scratch needs. A K=16
+  // MTP window (17 rows) is the only shape that needs more than one call today.
+  constexpr int64_t kMaxRowsPerCall = 8;
+  for (int64_t off = 0; off < rows; off += kMaxRowsPerCall) {
+    const int64_t n = std::min(kMaxRowsPerCall, rows - off);
+    r4dx_topk_lse_f32(reinterpret_cast<int64_t>(logits_dev + off * vocab),
+                       reinterpret_cast<int64_t>(summary_ids_dev_.data() + off * R4DX_TOPK_LSE_K),
+                       reinterpret_cast<int64_t>(summary_vals_dev_.data() + off * R4DX_TOPK_LSE_K),
+                       reinterpret_cast<int64_t>(summary_lse_dev_.data() + off),
+                       static_cast<int>(n), vocab, inv_temperature,
+                       reinterpret_cast<int64_t>(stream_.get()));
+  }
+}
+
+void Model::FetchRowSummaries(int64_t rows, float inv_temperature,
+                               std::vector<kernels::RowSummary>& out) {
+  out.clear();
+  if (rows <= 0) return;
+  const int64_t vocab = container_.Config().vocab_size;
+  const size_t k_total = static_cast<size_t>(rows) * R4DX_TOPK_LSE_K;
+  summary_ids_host_.resize(k_total);
+  summary_vals_host_.resize(k_total);
+  summary_lse_host_.resize(static_cast<size_t>(rows));
+  // Plain (blocking, null-stream) D2H copies, so the caller must already have synchronised stream_
+  // -- the same rule RunChunk/VerifyWindow's own logits readback follows, for the same reason
+  // (stream_ is hipStreamNonBlocking). rows*(64*8+4) bytes in total: 516 per row.
+  summary_ids_dev_.CopyToHost(summary_ids_host_.data(), k_total);
+  summary_vals_dev_.CopyToHost(summary_vals_host_.data(), k_total);
+  summary_lse_dev_.CopyToHost(summary_lse_host_.data(), static_cast<size_t>(rows));
+
+  out.resize(static_cast<size_t>(rows));
+  for (int64_t r = 0; r < rows; ++r) {
+    kernels::RowSummary& s = out[static_cast<size_t>(r)];
+    s.k = R4DX_TOPK_LSE_K;
+    s.vocab = vocab;
+    s.inv_temperature = inv_temperature;
+    s.lse = summary_lse_host_[static_cast<size_t>(r)];
+    const size_t base = static_cast<size_t>(r) * R4DX_TOPK_LSE_K;
+    for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
+      s.ids[j] = summary_ids_host_[base + static_cast<size_t>(j)];
+      s.vals[j] = summary_vals_host_[base + static_cast<size_t>(j)];
+    }
+  }
+}
+
+int32_t Model::SampleVerifyRow(int64_t row, const std::vector<kernels::RowSummary>& summaries,
+                                const kernels::SampleParams& params, std::mt19937_64& rng) {
+  // ONE draw per emitted token, taken BEFORE either branch so that whether the summary happened to
+  // resolve this row can never change the generator's state (docs/sampling.md section 2's
+  // one-draw-per-token invariant, which is what makes a speculative round's emitted sequence equal
+  // plain sampled decode's token for token).
+  const double u = kernels::DrawUniform01(rng);
+  const kernels::SummarySampleResult r =
+      kernels::SampleFromSummary(summaries[static_cast<size_t>(row)], params, u);
+  if (r.resolved) return r.token;
+  ++sampled_fallback_rows_;
+  ReadVerifyLogitsRow(row, sampled_row_scratch_);
+  return kernels::SampleCanonical(sampled_row_scratch_.data(), container_.Config().vocab_size,
+                                   params, u);
+}
+
+int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params,
+                                  std::mt19937_64& rng) {
+  const float inv_t = SummaryInvTemperature(params);
+  if (params.temperature <= 0.0f) {
+    // Design point E: a greedy request keeps the pre-S2 code path exactly, down to consuming no
+    // draw at all -- so switching a greedy caller from DecodeStepGreedy to this method changes
+    // nothing, and a caller alternating the two keeps one generator stream.
+    return DecodeStepGreedy(token_id);
+  }
+  if (inv_t == 0.0f) {
+    // Degenerate temperature (see SummaryInvTemperature): no device summary, full-vocab path. Still
+    // exactly one draw, still the canonical sampler, so the emitted token is the same as any other
+    // path would produce for this u.
+    const std::vector<float> logits = DecodeStep(token_id);
+    return kernels::SampleCanonical(logits.data(), container_.Config().vocab_size, params,
+                                     kernels::DrawUniform01(rng));
+  }
+
+  kernels::RowSummary summary;
+  const SummaryRequest req{inv_t, &summary};
+  RunChunk({token_id}, /*is_prefill_path=*/false, /*want_logits=*/true,
+           /*greedy_token_out=*/nullptr, &req);
+
+  const double u = kernels::DrawUniform01(rng);
+  const kernels::SummarySampleResult r = kernels::SampleFromSummary(summary, params, u);
+  if (r.resolved) return r.token;
+  // Row-granular fallback: logits_dev_ still holds this step's own full fp32 row (nothing has
+  // touched it since RunChunk's lm_head, and RunChunk returned with the device idle), so this is a
+  // plain 993 KB D2H -- never a second lm_head pass.
+  ++sampled_fallback_rows_;
+  const int64_t vocab = container_.Config().vocab_size;
+  sampled_row_scratch_.resize(static_cast<size_t>(vocab));
+  logits_dev_.CopyToHost(sampled_row_scratch_.data(), static_cast<size_t>(vocab));
+  return kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, params, u);
 }
 
 // Coarser granularity than the task's ideal ("each GEMM by (N,K)", separate GDN-kernel/norm/rope/
@@ -994,7 +1158,9 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
 // ---- MTP self-speculation (docs/mtp.md) --------------------------------------------------------
 
 std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
-                                          std::vector<float>* logits_out) {
+                                          std::vector<float>* logits_out,
+                                          std::vector<kernels::RowSummary>* summaries_out,
+                                          float summary_inv_temperature) {
   // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
   // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
   // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
@@ -1143,6 +1309,13 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
         reinterpret_cast<int64_t>(verify_argmax_dev_.data() + t), cfg.vocab_size,
         reinterpret_cast<int64_t>(stream_.get()));
   }
+  // Sampled rounds (docs/sampling.md section 9): summarise every row on device too, so the round's
+  // whole D2H is T*516 bytes rather than T*~993 KB. Enqueued on the same stream as the argmaxes
+  // above and read back below with them; never launched at all for a greedy round, which therefore
+  // stays byte-identical (same kernels, same order, same launch count).
+  if (summaries_out != nullptr) {
+    LaunchRowSummaries(verify_logits_dev_.data(), T, summary_inv_temperature);
+  }
   arena_.Reset();
 
   mtp_last_hidden_ = cur;  // valid until the next RunChunk/VerifyWindow's EmbedTokens overwrites it
@@ -1155,7 +1328,83 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     logits_out->resize(static_cast<size_t>(T * cfg.vocab_size));
     verify_logits_dev_.CopyToHost(logits_out->data(), logits_out->size());
   }
+  if (summaries_out != nullptr) {
+    FetchRowSummaries(T, summary_inv_temperature, *summaries_out);
+  }
   return preds;
+}
+
+void Model::ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const {
+  if (draft_window_ <= 1) {
+    throw std::runtime_error(
+        "Model::ReadVerifyLogitsRow: this Model was not sized for speculative verification");
+  }
+  if (row < 0 || row >= draft_window_) {
+    throw std::runtime_error("Model::ReadVerifyLogitsRow: row must be in [0, " +
+                              std::to_string(draft_window_) + ")");
+  }
+  const int64_t vocab = container_.Config().vocab_size;
+  out.resize(static_cast<size_t>(vocab));
+  // Plain blocking D2H of ONE row out of the [draft_window_, vocab] verify buffer. Safe without a
+  // sync of its own: VerifyWindow ends with stream_.Synchronize() and nothing between it and this
+  // call (the host-side acceptance walk) enqueues device work -- the same "device is idle here"
+  // invariant every other plain hipMemcpy in this file relies on.
+  R4DX_HIP_CHECK(hipMemcpy(out.data(), verify_logits_dev_.data() + row * vocab,
+                            static_cast<size_t>(vocab) * sizeof(float), hipMemcpyDeviceToHost));
+}
+
+// THE shared verify+acceptance middle of every speculative round -- see model.h for the contract
+// and for why greedy and sampled rounds MUST come through here rather than through two loops that
+// could drift apart.
+std::vector<int32_t> Model::VerifyAndResolveRound(int32_t anchor,
+                                                   const std::vector<int32_t>& drafts,
+                                                   const kernels::SampleParams* params,
+                                                   std::mt19937_64* rng,
+                                                   int64_t* num_accepted_out) {
+  std::vector<int32_t> candidates;
+  candidates.reserve(drafts.size() + 1);
+  candidates.push_back(anchor);
+  candidates.insert(candidates.end(), drafts.begin(), drafts.end());
+
+  const bool sampled = (params != nullptr);
+  const float inv_t = sampled ? SummaryInvTemperature(*params) : 0.0f;
+  // A sampled round whose temperature has no usable reciprocal (see SummaryInvTemperature) still
+  // has to produce the canonical token, so it asks for the full window's logits instead of
+  // summaries and samples from those rows directly. Vanishingly rare; correctness, not speed.
+  const bool use_summaries = sampled && inv_t > 0.0f;
+  std::vector<float>* logits_out = nullptr;
+  std::vector<float> full_logits;
+  if (sampled && !use_summaries) logits_out = &full_logits;
+
+  const std::vector<int32_t> preds =
+      VerifyWindow(candidates, logits_out, use_summaries ? &round_summaries_ : nullptr,
+                    use_summaries ? inv_t : 1.0f);
+
+  const int64_t vocab = container_.Config().vocab_size;
+  const int64_t m = static_cast<int64_t>(drafts.size());
+  std::vector<int32_t> round;
+  round.reserve(drafts.size() + 1);
+  int64_t i = 0;
+  for (;; ++i) {
+    int32_t tok;
+    if (!sampled) {
+      // Greedy: the row's own argmax. The walk below then reproduces exactly the pre-S2
+      // "longest confirmed draft prefix, then the correction/bonus token" result.
+      tok = preds[static_cast<size_t>(i)];
+    } else if (use_summaries) {
+      tok = SampleVerifyRow(i, round_summaries_, *params, *rng);
+    } else {
+      tok = kernels::SampleCanonical(full_logits.data() + i * vocab, vocab, *params,
+                                      kernels::DrawUniform01(*rng));
+    }
+    round.push_back(tok);
+    // Accept draft i (== candidates[i+1]) iff this row emitted exactly it; otherwise this token is
+    // the round's last and everything after it in the window is discarded.
+    if (i < m && tok == drafts[static_cast<size_t>(i)]) continue;
+    break;
+  }
+  *num_accepted_out = i;  // == round.size() - 1
+  return round;
 }
 
 void Model::CommitVerifiedWindow(int64_t num_committed) {
@@ -1181,13 +1430,27 @@ void Model::CommitVerifiedWindow(int64_t num_committed) {
 }
 
 std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
+  return DecodeStepMtpImpl(token_id, k, /*params=*/nullptr, /*rng=*/nullptr);
+}
+
+std::vector<int32_t> Model::DecodeStepMtpSampled(int32_t token_id, int64_t k,
+                                                  const kernels::SampleParams& params,
+                                                  std::mt19937_64& rng) {
+  // Design point E: greedy requests keep the greedy path exactly, including consuming no draw.
+  if (params.temperature <= 0.0f) return DecodeStepMtpImpl(token_id, k, nullptr, nullptr);
+  return DecodeStepMtpImpl(token_id, k, &params, &rng);
+}
+
+std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
+                                               const kernels::SampleParams* params,
+                                               std::mt19937_64* rng) {
   if (!mtp_) {
     throw std::runtime_error(
-        "Model::DecodeStepMtpGreedy: MTP is not enabled on this Model (Load() with "
+        "Model::DecodeStepMtp{Greedy,Sampled}: MTP is not enabled on this Model (Load() with "
         "ModelOptions::mtp_draft_k > 0 and a container that has mtp.* weights)");
   }
   if (k < 0 || k > mtp_draft_k_) {
-    throw std::runtime_error("Model::DecodeStepMtpGreedy: k must be in [0, " +
+    throw std::runtime_error("Model::DecodeStepMtp{Greedy,Sampled}: k must be in [0, " +
                               std::to_string(mtp_draft_k_) + "]");
   }
   const ModelConfig& cfg = container_.Config();
@@ -1216,44 +1479,29 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
     arena_.Reset();
   }
 
-  std::vector<int32_t> candidates;
-  candidates.reserve(drafts.size() + 1);
-  candidates.push_back(token_id);
-  candidates.insert(candidates.end(), drafts.begin(), drafts.end());
-
-  const std::vector<int32_t> preds = VerifyWindow(candidates);  // size == candidates.size()
-
-  // Greedy acceptance: the longest prefix of drafts whose own predecessor's argmax matches it.
-  // preds[i] is the real model's own next-token prediction after processing candidate i
-  // (candidates[0]==token_id, candidates[1..]==drafts) -- so preds[i] should equal drafts[i] (the
-  // draft that FOLLOWS candidate i) for the draft to be confirmed.
+  // Verify [token_id, d1..dk] in one pass and resolve the round -- greedy (argmax acceptance) or
+  // sampled (sample-and-match), in the one shared implementation. Commits nothing.
   int64_t num_accepted_drafts = 0;
-  while (num_accepted_drafts < static_cast<int64_t>(drafts.size()) &&
-         preds[static_cast<size_t>(num_accepted_drafts)] ==
-             drafts[static_cast<size_t>(num_accepted_drafts)]) {
-    ++num_accepted_drafts;
-  }
-  const int32_t corrected = preds[static_cast<size_t>(num_accepted_drafts)];
+  std::vector<int32_t> result =
+      VerifyAndResolveRound(token_id, drafts, params, rng, &num_accepted_drafts);
   const int64_t num_committed = num_accepted_drafts + 1;  // +1 for token_id itself
 
   // Thread this round's acceptance count into the NEXT GDN decode/verify call (gdn_state.h's file
   // comment) and advance pos_ by exactly what was committed -- NOT by candidates.size(), which
-  // would silently accept every draft regardless of whether the real model agreed.
-  const int32_t num_committed_i32 = static_cast<int32_t>(num_committed);
-  mtp_num_accepted_dev_.CopyFromHost(&num_committed_i32, 1);
-  mtp_num_accepted_valid_ = true;
-  pos_ += num_committed;
-  started_ = true;
+  // would silently accept every draft regardless of whether the real model agreed. This is exactly
+  // CommitVerifiedWindow's body (that method is this block, factored out for a non-MTP drafter --
+  // model.h), so MTP and DFlash2 cannot commit differently for the same accepted count.
+  CommitVerifiedWindow(num_committed);
 
-  // Reseed MTP's h_seed from the row that produced `corrected` -- candidate index
+  // Reseed MTP's h_seed from the row that produced the round's last token -- candidate index
   // num_accepted_drafts of THIS call's window, i.e. mtp_last_hidden_'s row num_accepted_drafts.
+  // (This is the one thing CommitVerifiedWindow deliberately does not do: a DFlash2 driver has no
+  // MTP head.)
   R4DX_HIP_CHECK(hipMemcpyAsync(
       mtp_seed_hidden_.data(), mtp_last_hidden_ + num_accepted_drafts * hidden,
       static_cast<size_t>(hidden) * sizeof(uint16_t), hipMemcpyDeviceToDevice, stream_.get()));
   stream_.Synchronize();
 
-  std::vector<int32_t> result(drafts.begin(), drafts.begin() + num_accepted_drafts);
-  result.push_back(corrected);
   return result;
 }
 
@@ -1275,18 +1523,39 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
                                                     int64_t n_min, int64_t* walk_len_out,
                                                     DflashRoundTrace* trace_out,
                                                     std::vector<int32_t>* drafted_tokens_out) {
+  return DecodeStepDflashImpl(token_id, k, p_min, n_min, /*params=*/nullptr, /*rng=*/nullptr,
+                               walk_len_out, trace_out, drafted_tokens_out);
+}
+
+std::vector<int32_t> Model::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min,
+                                                     int64_t n_min,
+                                                     const kernels::SampleParams& params,
+                                                     std::mt19937_64& rng, int64_t* walk_len_out) {
+  // Design point E: greedy requests keep the greedy path exactly, including consuming no draw.
+  const bool greedy = params.temperature <= 0.0f;
+  return DecodeStepDflashImpl(token_id, k, p_min, n_min, greedy ? nullptr : &params,
+                               greedy ? nullptr : &rng, walk_len_out, /*trace_out=*/nullptr,
+                               /*drafted_tokens_out=*/nullptr);
+}
+
+std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, float p_min,
+                                                  int64_t n_min,
+                                                  const kernels::SampleParams* params,
+                                                  std::mt19937_64* rng, int64_t* walk_len_out,
+                                                  DflashRoundTrace* trace_out,
+                                                  std::vector<int32_t>* drafted_tokens_out) {
   if (!dflash_.has_value()) {
     throw std::runtime_error(
-        "Model::DecodeStepDflashGreedy: DFlash2 is not enabled on this Model (Load() with "
+        "Model::DecodeStepDflash{Greedy,Sampled}: DFlash2 is not enabled on this Model (Load() with "
         "ModelOptions::dflash_container set and dflash_draft_k > 0)");
   }
   if (k < 0 || k > dflash_draft_k_) {
-    throw std::runtime_error("Model::DecodeStepDflashGreedy: k must be in [0, " +
+    throw std::runtime_error("Model::DecodeStepDflash{Greedy,Sampled}: k must be in [0, " +
                               std::to_string(dflash_draft_k_) + "]");
   }
   if (!dflash_injection_enabled_) {
     throw std::runtime_error(
-        "Model::DecodeStepDflashGreedy: drafter injection is disabled on this Model "
+        "Model::DecodeStepDflash{Greedy,Sampled}: drafter injection is disabled on this Model "
         "(SetDflashInjectionEnabled(false)), so the drafter's ring frontier lags pos_ and a draft "
         "block here would be built at the wrong absolute positions -- re-enable injection and run "
         "at least one RunChunk (a prefill chunk or a plain decode step) first");
@@ -1299,7 +1568,7 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
   // context rather than fail. Cheap (two integer loads) next to a round's own GEMMs.
   if (dflash_->InjectedCount() != pos_) {
     throw std::runtime_error(
-        "Model::DecodeStepDflashGreedy: drafter frontier (" +
+        "Model::DecodeStepDflash{Greedy,Sampled}: drafter frontier (" +
         std::to_string(dflash_->InjectedCount()) + ") != Model position (" + std::to_string(pos_) +
         ") -- the drafter's ring and this Model's committed sequence have drifted apart");
   }
@@ -1317,29 +1586,20 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
   if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
   if (drafted_tokens_out != nullptr) *drafted_tokens_out = draft.tokens;
 
-  std::vector<int32_t> candidates;
-  candidates.reserve(draft.tokens.size() + 1);
-  candidates.push_back(token_id);
-  candidates.insert(candidates.end(), draft.tokens.begin(), draft.tokens.end());
-
-  // VerifyWindow also (as a side effect of running every layer's own capture hook, since
+  // Verify [token_id, d1..dm] in one pass and resolve the round through the SAME shared middle MTP
+  // uses -- greedy acceptance (the longest prefix of drafts the target's own argmax confirms,
+  // docs/dflash2.md section 5: "a rows accepted, the anchor is always accepted") or sample-and-match
+  // (docs/sampling.md section 9). Commits nothing yet.
+  //
+  // That VerifyWindow call also (as a side effect of running every layer's own capture hook, since
   // AttachDflashFeatureCapture is attached whenever dflash_ is set) refills DflashFeatureBuffer()/
   // DflashFeatureRows() with THIS window's own captured target features, one row per candidate --
   // exactly what gets injected below for the accepted prefix. VerifyWindow itself never injects
   // anything (model.h's own doc comment on SetDflashCaptureObserver) -- only this method does, once
   // it knows how many rows were actually accepted.
-  const std::vector<int32_t> preds = VerifyWindow(candidates);  // size == candidates.size()
-
-  // Greedy acceptance: the longest prefix of drafts whose own predecessor's argmax matches it --
-  // identical logic to DecodeStepMtpGreedy above (docs/dflash2.md section 5: "a rows accepted, the
-  // anchor is always accepted").
   int64_t num_accepted_drafts = 0;
-  while (num_accepted_drafts < static_cast<int64_t>(draft.tokens.size()) &&
-         preds[static_cast<size_t>(num_accepted_drafts)] ==
-             draft.tokens[static_cast<size_t>(num_accepted_drafts)]) {
-    ++num_accepted_drafts;
-  }
-  const int32_t corrected = preds[static_cast<size_t>(num_accepted_drafts)];
+  std::vector<int32_t> result =
+      VerifyAndResolveRound(token_id, draft.tokens, params, rng, &num_accepted_drafts);
   const int64_t num_committed = num_accepted_drafts + 1;  // +1 for token_id (the anchor) itself
 
   // Inject the accepted prefix's own just-captured target features into the drafter's ring BEFORE
@@ -1350,7 +1610,7 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
   // because VerifyWindow captures candidates in the same order they were verified.
   if (DflashFeatureRows() < num_committed) {
     throw std::runtime_error(
-        "Model::DecodeStepDflashGreedy: internal error -- VerifyWindow captured fewer rows (" +
+        "Model::DecodeStepDflash{Greedy,Sampled}: internal error -- VerifyWindow captured fewer rows (" +
         std::to_string(DflashFeatureRows()) + ") than the accepted prefix (" +
         std::to_string(num_committed) + ")");
   }
@@ -1363,8 +1623,6 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
   // out for a non-MTP drafter to call -- model.h's own doc comment on that method).
   CommitVerifiedWindow(num_committed);
 
-  std::vector<int32_t> result(draft.tokens.begin(), draft.tokens.begin() + num_accepted_drafts);
-  result.push_back(corrected);
   return result;
 }
 

@@ -49,10 +49,13 @@ struct ServerArgs {
   std::string log_level = "info";  // one of debug|info|warn|error
 
   // MTP self-speculative decode (docs/mtp.md), same semantics/default as src/cli/cli_args.h's
-  // --mtp: 0 (disabled) unless the loaded --model container was converted with --mtp on. Only
-  // ever used by a request whose OWN sampling is greedy (temperature<=0, checked per-request in
-  // src/server/engine.cpp's RunRequest) -- non-greedy requests always take plain decode regardless
-  // of this flag, matching r4dx::model::Model::DecodeStepMtpGreedy's greedy-only contract.
+  // --mtp: 0 (disabled) unless the loaded --model container was converted with --mtp on. Used by
+  // every request once the server is started with --mtp N>0 against an MTP container
+  // (Engine::RunRequest's use_mtp = model_->MtpEnabled(), no longer gated on the request's own
+  // temperature as of Milestone 6 stage S3, docs/sampling.md section 12/docs/server.md): a
+  // request's OWN sampling.temperature<=0 picks Model::DecodeStepMtpGreedy (byte-identical to
+  // pre-S3), temperature>0 picks Model::DecodeStepMtpSampled (sample-and-match rejection
+  // sampling against the request's own distribution).
   int64_t mtp = 0;
   // MTP head layout (docs/mtp.md "MTP head layout"), same flag/semantics/default as
   // src/cli/cli_args.h's --mtp-head-layout: "layout" (default, measured faster in 23/24 K x layout

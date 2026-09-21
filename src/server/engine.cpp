@@ -222,26 +222,26 @@ void Engine::RunRequest(PendingRequest& req) {
       return;
     }
 
-    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): identical greedy-only gate as
-    // MTP below, mutually exclusive with it (--dflash/--mtp are rejected together at the arg-parse
-    // layer, so at most one of use_mtp/use_dflash is ever true). model_->DflashEnabled() is private
-    // to r4dx::model::Model in the CLI's own header, so this uses the same "was the drafter loaded"
-    // signal DecodeStepDflashGreedy itself throws on -- opts_.model_opts.dflash_draft_k > 0 is set
-    // if and only if Model::Load was given a non-empty dflash_container (cli_args.h/server_args.h's
-    // own mutual-exclusion + range checks already guarantee this pairing holds).
+    // DFlash2 self-speculative decode (docs/dflash2.md, docs/sampling.md section 9/10, Milestone 6
+    // stage S3): runs at ANY temperature now -- mutually exclusive with MTP below (--dflash/--mtp
+    // are rejected together at the arg-parse layer, so at most one of use_mtp/use_dflash is ever
+    // true). model_->DflashEnabled() is private to r4dx::model::Model in the CLI's own header, so
+    // this uses the same "was the drafter loaded" signal DecodeStepDflashGreedy/Sampled themselves
+    // throw on -- opts_.model_opts.dflash_draft_k > 0 is set if and only if Model::Load was given a
+    // non-empty dflash_container (cli_args.h/server_args.h's own mutual-exclusion + range checks
+    // already guarantee this pairing holds).
     //
     // Computed HERE, before this request's prefill, because it also drives the drafter-injection
     // toggle immediately below -- the decode loop further down just reads it again.
-    const bool use_dflash =
-        !opts_.model_opts.dflash_container.empty() && req.sampling.temperature <= 0.0f;
-    // Per-request drafter-injection toggle (docs/server.md's "Sampled traffic pays nothing",
-    // model.h's SetDflashInjectionEnabled). A sampled request will never call
-    // DecodeStepDflashGreedy, so it should not pay the drafter's per-chunk feature capture +
-    // encoder GEMM + 5-layer KV injection either. Set before Prefill so the whole request --
-    // prefill chunks and plain decode steps alike -- runs with the right policy, and set on BOTH
-    // the prefix-reuse and the Reset()+reprefill path (this line precedes both). A greedy request
-    // arriving after sampled ones simply resumes injection at the current position, which
-    // DflashDraft turns into a cold-ring gap rather than a throw.
+    const bool use_dflash = !opts_.model_opts.dflash_container.empty();
+    // Per-request drafter-injection toggle (model.h's SetDflashInjectionEnabled). Every request that
+    // has a drafter loaded now uses it -- greedy via DecodeStepDflashGreedy, sampled via
+    // DecodeStepDflashSampled (docs/sampling.md section 9.2's lossless sample-and-match) -- so
+    // injection is simply always enabled whenever a drafter is configured; this call and the ring
+    // gap tolerance mechanism it feeds (model.cpp's DflashDraft cold-ring handling) are otherwise
+    // unchanged from before this stage. Set before Prefill so the whole request -- prefill chunks
+    // and plain decode steps alike -- runs with the right policy, and set on BOTH the prefix-reuse
+    // and the Reset()+reprefill path (this line precedes both).
     if (!opts_.model_opts.dflash_container.empty()) {
       model_->SetDflashInjectionEnabled(use_dflash);
     }
@@ -283,6 +283,12 @@ void Engine::RunRequest(PendingRequest& req) {
     const uint64_t seed_used =
         req.sampling.has_seed ? req.sampling.seed : std::random_device{}();
     std::mt19937_64 rng = r4dx::kernels::MakeRng(seed_used);
+    // One seeded rng per request (stage S3): the request's own seed when given, otherwise today's
+    // behavior (a fresh std::random_device seed each time, above) -- unchanged either way. Every
+    // sampling path below (plain, MTP, DFlash2) draws from this SAME generator, exactly one draw per
+    // emitted token (docs/sampling.md design point A), which is what keeps a seeded sampled request
+    // reproducible run to run at a fixed speculation setting (docs/sampling.md section 11).
+    const bool greedy = req.sampling.temperature <= 0.0f;
 
     auto decoder = tok_->make_stream_decoder(/*skip_special_tokens=*/true);
     const auto& eos_ids = tok_->eos_ids();
@@ -339,12 +345,12 @@ void Engine::RunRequest(PendingRequest& req) {
     // request with no `tools` is completely unaffected (real per-token streaming, unchanged).
     const bool tool_mode = req.kind == RequestKind::kChat && !req.tools.empty();
 
-    // Greedy MTP (task point 2): only a temperature<=0 request on a Model actually Load()'d with
-    // mtp_draft_k>0 takes the speculative path -- everything else (non-greedy, or MTP disabled at
-    // startup) is plain decode, byte-for-byte the pre-existing loop below. Mirrors src/cli/
-    // main.cpp's RunTurn `greedy && args.mtp > 0` gate exactly (MTP is greedy-only, docs/mtp.md --
-    // "probabilistic acceptance later" is still future work, per this stage's task).
-    const bool use_mtp = model_->MtpEnabled() && req.sampling.temperature <= 0.0f;
+    // MTP (docs/mtp.md, docs/sampling.md section 9/10, stage S3): any request on a Model actually
+    // Load()'d with mtp_draft_k>0 takes the speculative path now, greedy or sampled -- everything
+    // else (MTP disabled at startup, or DFlash2 active instead) is plain decode, byte-for-byte the
+    // pre-existing loop below for a greedy request. Mirrors src/cli/main.cpp's RunTurn `args.mtp > 0`
+    // gate exactly.
+    const bool use_mtp = model_->MtpEnabled();
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
     // `use_dflash` is computed above, before the prefill, because it also gates this request's
     // drafter injection (see its own comment there).
@@ -353,7 +359,10 @@ void Engine::RunRequest(PendingRequest& req) {
     const auto d0 = Clock::now();
     if (use_dflash) {
       const int64_t draft_k = opts_.model_opts.dflash_draft_k;
-      int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+      int32_t next = greedy
+                          ? r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()))
+                          : r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()),
+                                                   sp, rng);
       bool stopped = false;
       if (is_eos(next)) {
         finish_reason = "stop";
@@ -373,8 +382,14 @@ void Engine::RunRequest(PendingRequest& req) {
           break;
         }
         int64_t walk_len = 0;
-        const std::vector<int32_t> round = model_->DecodeStepDflashGreedy(
-            next, draft_k, opts_.dflash_p_min, opts_.dflash_n_min, &walk_len);
+        // Greedy: DecodeStepDflashGreedy, byte-identical to before this stage. Sampled: sample-and-
+        // match rejection sampling (DecodeStepDflashSampled, docs/sampling.md section 9.2) -- for a
+        // fixed seed this emits the same sequence as the plain sampled branch below.
+        const std::vector<int32_t> round =
+            greedy ? model_->DecodeStepDflashGreedy(next, draft_k, opts_.dflash_p_min,
+                                                     opts_.dflash_n_min, &walk_len)
+                   : model_->DecodeStepDflashSampled(next, draft_k, opts_.dflash_p_min,
+                                                      opts_.dflash_n_min, sp, rng, &walk_len);
         ++dflash_rounds;
         dflash_drafted += walk_len;
         dflash_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
@@ -408,7 +423,10 @@ void Engine::RunRequest(PendingRequest& req) {
       }
     } else if (use_mtp) {
       const int64_t draft_k = opts_.model_opts.mtp_draft_k;
-      int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+      int32_t next = greedy
+                          ? r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()))
+                          : r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()),
+                                                   sp, rng);
       bool stopped = false;
       if (is_eos(next)) {
         finish_reason = "stop";
@@ -427,7 +445,10 @@ void Engine::RunRequest(PendingRequest& req) {
           finish_reason = "cancelled";
           break;
         }
-        const std::vector<int32_t> round = model_->DecodeStepMtpGreedy(next, draft_k);
+        // Greedy: DecodeStepMtpGreedy, byte-identical to before this stage. Sampled: sample-and-match
+        // rejection sampling (DecodeStepMtpSampled, docs/sampling.md section 9).
+        const std::vector<int32_t> round = greedy ? model_->DecodeStepMtpGreedy(next, draft_k)
+                                                   : model_->DecodeStepMtpSampled(next, draft_k, sp, rng);
         ++mtp_rounds;
         mtp_drafted += draft_k;
         mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
@@ -464,7 +485,8 @@ void Engine::RunRequest(PendingRequest& req) {
           }
         }
       }
-    } else {
+    } else if (greedy) {
+      // Plain greedy decode (temperature<=0): untouched by this stage.
       for (int64_t step = 0; step < max_tokens; ++step) {
         if (req.sink->IsCancelled()) {
           finish_reason = "cancelled";
@@ -486,6 +508,37 @@ void Engine::RunRequest(PendingRequest& req) {
         // client.
         logits = model_->DecodeStep(next);
         committed_tokens.push_back(next);
+        if (stop_hit) {
+          finish_reason = "stop";
+          break;
+        }
+      }
+    } else {
+      // Plain sampled decode (docs/sampling.md section 8, stage S3): the device-row-summary fast
+      // path (Model::DecodeStepSampled) instead of a full-vocab logits D2H every step -- this
+      // milestone's whole point (docs/sampling.md's measured cost table). The FIRST token is sampled
+      // from Prefill's already-returned full logits (unavoidable -- that vector is what Prefill
+      // gives us, one draw); every subsequent token comes from DecodeStepSampled, also exactly one
+      // draw each -- so a seeded request consumes exactly one draw per emitted token throughout,
+      // same as the plain greedy loop above consumes none.
+      int32_t next = r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+      for (int64_t step = 0; step < max_tokens; ++step) {
+        if (req.sink->IsCancelled()) {
+          finish_reason = "cancelled";
+          break;
+        }
+        const int32_t tok = next;
+        if (is_eos(tok)) {
+          finish_reason = "stop";
+          break;
+        }
+        generated_tokens.push_back(tok);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
+                                        &stop_match_pos, stop_search_floor);
+        NoteReasoningProgress();
+        // Same "feed regardless of stop_hit" reasoning as the greedy branch above.
+        next = model_->DecodeStepSampled(tok, sp, rng);
+        committed_tokens.push_back(tok);
         if (stop_hit) {
           finish_reason = "stop";
           break;
@@ -609,6 +662,15 @@ void Engine::RunRequest(PendingRequest& req) {
         static_cast<long long>(new_tokens_i32.size()),
         static_cast<long long>(generated_tokens.size()), finish_reason.c_str(), prefill_tps,
         decode_tps);
+    // Stage S3 (docs/server.md): speculation now runs at any temperature, so the log line reports
+    // the settings that decide which decode path this request actually took -- temperature (greedy
+    // vs sampled), whether it streamed, and whether thinking was on.
+    if (n > 0 && n < static_cast<int>(sizeof(buf))) {
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                         " temperature=%.3g stream=%s thinking=%s",
+                         static_cast<double>(req.sampling.temperature), req.stream ? "yes" : "no",
+                         enable_thinking ? "yes" : "no");
+    }
     if (reset_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " reset=%.2fms", reset_ms);
     }

@@ -1083,6 +1083,57 @@ add_test(NAME reference_dflash2
          COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/reference/dflash2_selftest.py)
 ```
 
+## 10a. Sampled rounds (Milestone 6 stage S2)
+
+Section 5's lifecycle describes GREEDY acceptance -- "a draft is accepted iff it equals the
+target's argmax" -- which is why `--dflash` only ever ran for `temperature <= 0`.
+`Model::DecodeStepDflashSampled(token_id, k, p_min, n_min, SampleParams, rng, walk_len_out)` lifts
+that at the model level. The round is unchanged in every respect that touches DFlash2 itself --
+`DraftRound` at the drafter's frontier, one `VerifyWindow` over `[anchor, d1..dm]`, inject the
+committed rows' captured features, `CommitVerifiedWindow(matched+1)` -- and only the per-row
+acceptance decision differs: instead of comparing the draft against the row's argmax, the round
+**samples** the row (one uniform draw, from its device row summary) and accepts the draft iff the
+sampled token is it. That is rejection sampling against a deterministic proposal, so it is lossless;
+see [sampling.md](sampling.md) section 9 for the proof and section 9.2 for the exact loop, which is
+shared verbatim with MTP so the two families cannot drift apart.
+
+Greedy rounds are untouched: `DecodeStepDflashGreedy` is now a one-line wrapper over the same
+implementation with no sampler in play, and `tools/validate_dflash.ps1` plus this repo's greedy
+tests are unchanged.
+
+Measured on the real 64-layer target against the real w4a16 draft container, 96 sampled tokens on a
+code-like prompt (`tests/model/test_dflash_e2e.cpp`, two seeds per row):
+
+| k | request | accepted / drafted | tokens per round |
+|---|---|---|---|
+| 4 | `T=0.7 top_k=20 top_p=0.8` | 71/104 (68.3%), 76/92 (82.6%) | 3.73, 4.30 |
+| 4 | `T=1.0` pure | 67/116 (57.8%), 54/168 (32.1%) | 3.31, 2.29 |
+| 7 | `T=0.7 top_k=20 top_p=0.8` | 76/140 (54.3%), 86/112 (76.8%) | 4.80, 6.38 |
+| 7 | `T=1.0` pure | 74/161 (46.0%), 56/280 (20.0%) | 4.22, 2.40 |
+
+i.e. a sampled request can commit 2.3-6.4 tokens per round where a plain (non-speculative) request
+commits exactly 1, and every one of those tokens is a legitimate canonical sample of the row the
+round actually verified -- the same token plain sampled decode would have emitted PROVIDED that row
+is numerically the same one sequential single-row decode would have computed. It usually is not:
+this is the pre-existing batched-verify reduction-order mechanism ([sampling.md](sampling.md)
+sections 9.3, 11.1-11.3), which most real trajectories on this container hit at least once, adjudicated
+per-divergence rather than assumed benign ([sampling.md](sampling.md) section 11.1's classifier).
+
+**DONE (Milestone 6 stage S3)**: the `temperature <= 0` gate on `use_dflash` in
+`src/server/engine.cpp` and `src/cli/main.cpp` is lifted -- `use_dflash` is now "a drafter was
+`Model::Load`'d", independent of temperature, and the request's own temperature picks
+`DecodeStepDflashGreedy` or `DecodeStepDflashSampled` per round. `Model::SetDflashInjectionEnabled`
+is likewise no longer toggled off for sampled requests (a sampled request now uses the drafter, so
+it should pay for and benefit from injection exactly like a greedy one) -- see
+[server.md](server.md)'s stage S3 correction and [sampling.md](sampling.md) section 12 for the
+measured server/CLI numbers and `tools/validate_spec_sampling.ps1`'s losslessness gate.
+
+The known batched-verify divergence class (section 7a, `tools/validate_dflash.ps1`) applies to a
+sampled round exactly as it does to a greedy one, and more visibly, because a CDF walk is more
+sensitive to a moved boundary than an argmax is. `test_dflash_e2e.cpp` adjudicates it per
+divergence, on hardware, by recovering both logits rows -- see [sampling.md](sampling.md) section
+11.1.
+
 ## 11. Files
 
 - `tools/reference/gguf_min.py` -- from-scratch GGUF v3 reader + Q8_0 dequantizer (numpy/struct

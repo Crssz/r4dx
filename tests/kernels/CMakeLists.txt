@@ -20,6 +20,12 @@ set(R4DX_KERNEL_TESTS
   test_dflash_attn
   test_dflash_conv
   test_rmsnorm_plain
+  # Milestone 6 S1 -- sampling (docs/sampling.md). test_topk_lse is the only GPU test of the three;
+  # the other two are pure CPU (header-only sampler/summary-sampler) and are registered here simply
+  # because that is where the sampler's own tests already live (test_sampler).
+  test_topk_lse
+  test_sampler_canonical
+  test_summary_sampler
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -67,8 +73,17 @@ set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_con
 # and would still be killed rather than unwound by a HIP error raised inside src/kernels -- see
 # docs/dflash2.md's "Kernels" subsection, which records this as an open project-wide question
 # rather than something a kernel stage should decide unilaterally.
-set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp
+set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_lse.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
+
+# tool_sampler_bench: Milestone 6 S1 item 4 -- r4dx_topk_lse_f32's kernel time (hip events) and the
+# host cost of SampleFromSummary vs the full-vocab SampleCanonical/SampleLegacy per token. Prints
+# numbers for docs/sampling.md and asserts no pass/fail contract, so it follows tests/model's
+# "built but deliberately never add_test()'d" tool convention (tool_hseed_drift et al) and never
+# affects the ctest count. Run manually:
+#   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_sampler_bench.exe
+add_executable(tool_sampler_bench tool_sampler_bench.cpp)
+target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
 
 # test_fused_quant (docs/r9700.md R2/P2) additionally needs r4dx_model_kernels for
 # r4dx_model_cast_bf16_to_f16 (the "old" w4a16 cast path it byte-diffs the new fused f16 epilogue

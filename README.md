@@ -122,8 +122,18 @@ prints container-load time, prefill/decode tokens/s, and VRAM used, plus
 (when `--mtp K>0`) an MTP acceptance-rate line. `--mtp K` (default 0) enables MTP self-speculative
 decode: each decode round drafts up to `K` tokens via the checkpoint's own `mtp.*` weights, verifies
 them against the real model in one batched call, and commits the accepted prefix (plus one corrected/
-bonus token) -- greedy-only (`--mtp K` with `--temperature > 0` warns and forces `--mtp 0` for that
-run). See `docs/mtp.md` for the full design, the container requirement (the container must carry
+bonus token) -- **runs at any `--temperature` as of Milestone 6 stage S3**: `--temperature <= 0`
+accepts a draft iff it equals the target's argmax (unchanged); `--temperature > 0` accepts it by
+"sample-and-match" rejection sampling, which is lossless IN DISTRIBUTION (exactly one uniform draw
+per emitted token, against the request's own post-filter distribution). For a fixed `--seed` the
+emitted tokens match plain sampled decode's only up to a pre-existing, unrelated numeric mechanism:
+a speculative round's logits come from one batched GEMM pass whose reduction order differs from
+single-row decode's, which a CDF walk (unlike a greedy argmax) can be sensitive to on near-tie
+candidates -- on the real 64-layer container this makes most sampled trajectories diverge from
+plain decode's own text somewhere (measured 6/8 96-token trajectories in one sweep), though every
+diverging token is still a legitimate canonical sample of the round that actually ran
+(`docs/sampling.md` sections 9.3, 11-12, `tools/validate_spec_sampling.ps1`). See `docs/mtp.md` for
+the full design, the container requirement (the container must carry
 `mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
 per layout (roughly +75-165% decode throughput over `--mtp 0` at each layout's best `K` -- w4a16
 `K=3`, w4a8 `K=4`, mxfp4 `K=3`, see `docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable
@@ -131,8 +141,11 @@ default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for
 per layout.
 
 `--dflash <draft.r4dx>` (Milestone 5, docs/dflash2.md) enables DFlash2 block-diffusion
-self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, greedy-only, needs a
-separate DFlash2 draft container (`D:\models\r4dx\qwen38-27b-dflash2-{w4a16,w4a8,mxfp4,bf16}.r4dx`),
+self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, runs at any
+`--temperature` (same sample-and-match acceptance, lossless in distribution, as `--mtp` above --
+including the same batched-verify numeric caveat on a fixed-seed token-for-token match -- as of
+Milestone 6 stage S3), needs a separate DFlash2 draft container
+(`D:\models\r4dx\qwen38-27b-dflash2-{w4a16,w4a8,mxfp4,bf16}.r4dx`),
 independent of the target's own `--layout`. `--dflash-k N` (1..7, default 7), `--dflash-p-min F`
 and `--dflash-n-min N` tune the selector walk's early-stop/discard gates. Best measured so far
 (docs/perf.md's Integrate-stage final confirmation sweep, each layout's own best `--dflash-k`
@@ -145,6 +158,19 @@ standard haiku prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.
 120 tok/s / 84% acceptance the reference ROCmFPX implementation reaches on this same card/draft. The
 `p_min` sweep, the w4a8/mxfp4 DRAFT containers, and the mxfp4/standard-prompt acceptance gap are
 still open (docs/dflash2.md section 7a, docs/perf.md's top section).
+
+**Sampled (`--temperature > 0`) traffic, Milestone 6 stage S3.** The numbers above were all greedy
+(`--temperature 0`) -- the setting real chat clients almost never use. As of this stage, `--mtp`/
+`--dflash` speculation and the plain decode path's device-row-summary sampler
+([sampling.md](docs/sampling.md)) both run at any temperature, lossless IN DISTRIBUTION -- a
+fixed-seed sampled speculative request's text matches plain sampled decode's only up to the
+pre-existing batched-verify numeric mechanism described above, which in practice moves most
+trajectories on the real container. Measured, real 64-layer container: plain sampled decode's tax
+over greedy fell from 6.2-7.5% to statistical parity (within about -0.8% to +0.7%, re-confirmed by
+the Integrate stage), and w4a16's best sampled `--dflash k=7` cell reaches **154.28, 154.23 tok/s**
+on a code prompt (4.28x plain sampled decode's pre-stage cost) -- see `docs/perf.md`'s top section
+for the full matrix (all three sampling configs x both prompts x all three layouts, twice each) and
+`docs/sampling.md` section 12.
 
 ## Run the OpenAI-compatible server
 

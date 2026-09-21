@@ -69,6 +69,14 @@ target_link_libraries(tool_vocab_calib PRIVATE r4dx_model r4dx_convert r4dx_core
 add_executable(tool_dflash_probe tool_dflash_probe.cpp)
 target_link_libraries(tool_dflash_probe PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core r4dx_tokenizer)
 
+# tool_sampled_bench: Milestone 6 stage S2 item 4 (docs/sampling.md section 10) -- ms per PLAIN
+# SAMPLED decode token through the pre-S2 full-vocab path vs the device-row-summary path, on the
+# real container. Same "built, never add_test()'d" convention as the three tools above (it prints
+# numbers for a human and for docs/sampling.md; it asserts no contract), and the same
+# SKIP-if-container-missing exit 77.
+add_executable(tool_sampled_bench tool_sampled_bench.cpp)
+target_link_libraries(tool_sampled_bench PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),
 # same "plain add_test(), no ENVIRONMENT/SKIP_RETURN_CODE" pattern tests/server's HIP-free tests

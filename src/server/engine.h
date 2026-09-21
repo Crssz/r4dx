@@ -62,6 +62,10 @@ struct PendingRequest {
   SamplingParams sampling;
   int64_t max_tokens = 0;
   std::vector<std::string> stop;
+  // Set by http_server.cpp from the request body's own `stream` field (openai_types.h). RunRequest
+  // does not otherwise know which ResponseSink subclass `sink` is, and the per-request stderr log
+  // line (stage S3, docs/server.md) reports it.
+  bool stream = false;
 
   std::shared_ptr<ResponseSink> sink;
 };

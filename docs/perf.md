@@ -1,5 +1,80 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 6, stage S3: sampled speculative decode -- current headline (2026-09-21)
+
+Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx` (+ real w4a16 DFlash2 draft container
+for every `--dflash` cell), `--max-ctx 2048`, `--think off`, `--seed 42`, HIP device 1, one process
+at a time. Every cell measured twice; every pair agrees to <=0.3 tok/s (well under the 3%
+"report both" threshold) except where noted. Prompts: the standard haiku prompt (`--max-tokens
+128`) and ROCmFPX's own bench prompt, "Write a Python module implementing an LRU cache class with
+get/put, O(1) operations using a doubly linked list and dict, plus a small unittest suite. Code
+only, no explanation." (`--max-tokens 400`). "before"/"after" plain-sampled rows use
+`R4DX_DEBUG_FULL_VOCAB_SAMPLER=1` (`src/cli/main.cpp`, docs/sampling.md section 12.2) to force the
+pre-Milestone-6 full-vocab CPU sampler on the exact same binary/container/request as the "after"
+row -- both produced byte-identical generated text in every cell checked (docs/sampling.md section
+12.4 has one such A/B'd trajectory).
+
+**w4a16, full matrix (plain sampled before/after, `--mtp 3`, `--dflash k=4`, `--dflash k=7`, at all
+three sampling configs, plus a greedy reference):**
+
+| Prompt | Config | plain BEFORE | plain AFTER | `--mtp 3` (accept, tok/rd) | `--dflash k=4` (accept, tok/rd) | `--dflash k=7` (accept, tok/rd) |
+|---|---|---|---|---|---|---|
+| haiku | T=0.7 top_k=20 top_p=0.8 | 35.82, 35.75 | 38.63, 38.68 | 66.32, 66.30 (46.2%, 2.27) | 60.53, 60.54 (26.7%, 2.03) | 61.48, 61.50 (17.5%, 2.19) |
+| haiku | T=1.0 pure | 35.53, 35.52 | 38.19, 38.22 | 56.87, 56.89 (35.4%, 1.97) | 68.28, 68.33 (33.7%, 2.31) | 64.86, 64.88 (19.6%, 2.33) |
+| haiku | T=0.6 top_k=20 top_p=0.95 | 35.75, 35.83 | 38.22, 38.22 | 65.70, 65.52 (46.2%, 2.27) | 60.53, 60.62 (26.7%, 2.03) | 60.79, 60.79 (17.5%, 2.19) |
+| code | T=0.7 top_k=20 top_p=0.8 | 36.00, 36.01 | 38.73, 38.71 | 94.01, 93.88 (73.6%, 3.20) | 124.94, 125.11 (81.6%, 4.26) | 154.28, 154.23 (66.1%, 5.56) |
+| code | T=1.0 pure | 35.55, 35.51 | 38.23, 38.18 | 83.94, 84.00 (63.0%, 2.90) | 116.90, 116.97 (75.8%, 4.00) | 143.67, 143.75 (60.7%, 5.26) |
+| code | T=0.6 top_k=20 top_p=0.95 | 36.00, 35.96 | 38.22, 38.22 | 87.87, 87.92 (67.4%, 3.03) | 128.95, 129.10 (85.2%, 4.40) | 154.71, 154.54 (66.4%, 5.63) |
+
+Greedy reference (`--temperature 0`, same prompts, w4a16): haiku **38.52, 38.53** tok/s; code
+**38.45, 38.42** tok/s -- i.e. plain sampled decode AFTER this stage (38.18-38.73 across every
+config/prompt, the Integrate stage's own re-confirmation of the `T=0.7 top_k=20 top_p=0.8` row
+measured 38.63/38.68 haiku and 38.73/38.71 code) now costs **essentially nothing over greedy**
+(within about -0.8% to +0.7% of the greedy reference -- statistically at parity, some cells landing
+a hair on either side of it -- down from the BEFORE row's 35.5-36.0, a **6.2-7.5% tax**). Every
+speculative sampled cell beats plain sampled decode by 1.5-4.3x, and every `--dflash`/`--mtp` cell
+here is now reachable by real `temperature 0.6-1.0` chat traffic for the first time in this project.
+
+**w4a8 and mxfp4, `T=0.7 top_k=20 top_p=0.8` only (plain, best MTP K, `--dflash k=7`), plus a
+greedy reference:**
+
+| Layout | Prompt | plain | greedy ref | best MTP (K, accept, tok/rd) | `--dflash k=7` (accept, tok/rd) |
+|---|---|---|---|---|---|
+| w4a8 | haiku | 35.89, 35.91 | 36.13, 36.11 | K=4: 50.14, 50.15 (26.2%, 1.95) | 56.19, 56.19 (17.1%, 2.17) |
+| w4a8 | code | 36.02, 36.03 | 36.23, 36.21 | K=4: 89.08, 89.08 (61.4%, 3.45) | 129.89, 129.84 (58.8%, 5.06) |
+| mxfp4 | haiku | 32.65, 32.62 | 32.84, 32.84 | K=3: 66.62, 66.67 (56.3%, 2.69) | 60.42, 60.31 (21.7%, 2.48) |
+| mxfp4 | code | 32.80, 32.74 | 32.87, 32.80 | K=3: 78.50, 78.57 (71.7%, 3.15) | 147.67, 147.96 (74.3%, 6.15) |
+
+**Fallback-to-full-row rate** (`Model::SampledFallbackRows()`, `[stats] sampled: fallback_rows=`):
+**0% in every `top_k`/`top_p`-filtered cell above** (both configs close the candidate set inside the
+device summary's top-64 by construction, docs/sampling.md section 4.1) -- the only nonzero rows are
+`T=1.0` pure temperature, and even there it stays small because a peaked real-model row rarely needs
+the tail: w4a16 haiku plain-AFTER 1.3%, `--mtp 3` 1.5%, `--dflash k=4` 1.7%, `--dflash k=7` 0%; w4a16
+code plain-AFTER 0.5%, `--mtp 3` 0.5%, `--dflash k=4`/`k=7` 1.0% each. This matches
+docs/sampling.md section 5.3/10's prediction exactly: filtered requests (what chat clients actually
+send) never fall back; unfiltered pure temperature sometimes does, cheaply.
+
+**Reading it**: this milestone's whole point was that real chat traffic (`temperature` 0.6-1.0)
+got NONE of Milestone 5's speculation wins. It now gets ALL of them: on the code prompt, w4a16's
+best cell (`--dflash k=7`, **154.28, 154.23** tok/s -- Integrate stage re-confirmation, twice) is
+**4.28x plain sampled decode's pre-stage cost** (36.0 tok/s BEFORE) and actually HIGHER than the
+fully-greedy `--dflash` figure this same container measures at `temperature 0` (`docs/status.md`'s
+Milestone 5 table: 154.3 sampled vs. 116.9 greedy `--dflash k=4` code/w4a16, **+32.0%**) -- because
+`--dflash k=7` beat `k=4` under sampling on this run, the reverse of Milestone 5's own greedy sweep,
+which found `k=4` better on average; acceptance is seed/config-sensitive at the token level, see
+docs/sampling.md section 12.3's own losslessness-gate discussion of exactly this sensitivity.
+`--mtp`/`--dflash` acceptance under sampling (17-85%, prompt/config-dependent) is lower than the
+same settings' GREEDY acceptance on this container (Milestone 5: 24-77%) only on some cells and
+higher on others -- there is no fixed ordering, matching this stage's own `tools/validate_spec_
+sampling.ps1` finding that the underlying mechanism is genuinely trajectory-dependent, not a
+one-directional "sampling always accepts less" effect.
+
+**Not measured this pass** (time budget, not a discovered blocker): a `w4a8`/`mxfp4` `--dflash`
+sweep over the full 3-sampling-config x `--dflash-k` grid (only `k=7` was run, matching the task's
+own "at T=0.7/20/0.8 only" scope for those two layouts); a matched-precision draft container for
+`w4a8`/`mxfp4` targets (every `--dflash` cell above, on every layout, still uses the w4a16 draft,
+continuing Milestone 5's own open item); a long-context sampled point.
+
 ## Milestone 5: Integrate stage final confirmation sweep (2026-09-21) -- current headline
 
 Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, real w4a16 DFlash2 draft container

@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <optional>
@@ -80,6 +81,11 @@ struct TurnResult {
   int64_t dflash_rounds = 0;
   int64_t dflash_drafted = 0;
   int64_t dflash_accepted = 0;
+  // Set when this turn's plain-sampled branch was forced onto the pre-Milestone-6 full-vocab path
+  // by R4DX_DEBUG_FULL_VOCAB_SAMPLER (see RunTurn) -- SampledFallbackRows() is never incremented on
+  // that path (SampleFromSummary is never called), so the "fallback rate" --stats line below is not
+  // applicable and must be suppressed rather than misreported as 0%.
+  bool used_full_vocab_debug_sampler = false;
 };
 
 // Milestone 3 profiling pass (docs/r9700.md R5/Q7): prints a StepProfile's per-op-family table plus
@@ -189,19 +195,29 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
   // the per-token vocab-sized logits D2H entirely: Model::DecodeStepGreedy argmaxes ON DEVICE and
   // reads back a single int32 (host-overhead pass, 2026-09-19) instead of the ~1MB fp32 logits
   // vector this loop would otherwise copy back every decode step just to re-scan it here on the
-  // CPU for the same answer. Only the non-greedy path (temperature>0, or any top-k/top-p/min-p
-  // sampling) needs the full distribution on the host.
+  // CPU for the same answer. The non-greedy path (temperature>0, or any top-k/top-p/min-p
+  // sampling) used to need the full distribution on the host every step; as of Milestone 6 stage
+  // S1/S2 it instead goes through Model::DecodeStepSampled's device row summary (docs/sampling.md
+  // section 8) and only falls back to a full-vocab D2H+host pass on rows the summary cannot prove
+  // (Model::SampledFallbackRows(), reported below via --stats).
   const bool greedy = args.temperature <= 0.0f;
 
   const auto d0 = Clock::now();
-  if (greedy && !args.dflash.empty()) {
-    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): structurally identical to the
-    // MTP round loop directly below (same round-vector contract, same ProcessMtpRound reuse -- that
-    // header is speculation-family-agnostic despite its name, see its own file comment) --
-    // Model::DecodeStepDflashGreedy's `token_id` parameter is likewise "the last ALREADY-ACCEPTED
-    // token", so `next` (Prefill's own argmax'd result) must be pushed/emitted here exactly like the
-    // MTP branch does, or the prompt's first generated token is silently dropped.
-    int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+  if (!args.dflash.empty()) {
+    // DFlash2 self-speculative decode (docs/dflash2.md, docs/sampling.md section 9/10, Milestone 6
+    // stage S3): now runs at ANY temperature, not just greedy. `next` (the very first generated
+    // token, from Prefill's own logits) is an Argmax for a greedy run and a canonical Sample
+    // (r4dx::kernels::Sample, exactly one rng draw) for a sampled one -- same "must push/emit it
+    // here or the prompt's first generated token is silently dropped" reasoning either way, since
+    // Model::DecodeStepDflash{Greedy,Sampled}'s `token_id` parameter is "the last ALREADY-ACCEPTED
+    // token" and does not itself re-emit it. The round loop below picks DecodeStepDflashGreedy
+    // (argmax verify, byte-identical to before this stage) or DecodeStepDflashSampled
+    // (sample-and-match rejection sampling, docs/sampling.md section 9.2 -- lossless: for a fixed
+    // seed this emits the same sequence as the plain-sampled branch below) per round, both sharing
+    // the identical round-vector contract and ProcessMtpRound reuse.
+    int32_t next = greedy ? r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()))
+                          : r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()),
+                                                   sp, rng);
     bool stopped = false;
     if (is_eos(next)) {
       result.hit_eos = true;
@@ -216,8 +232,11 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
     }
     while (!stopped && static_cast<int64_t>(result.generated_tokens.size()) < args.max_tokens) {
       int64_t walk_len = 0;
-      const std::vector<int32_t> round = model.DecodeStepDflashGreedy(
-          next, args.dflash_k, args.dflash_p_min, args.dflash_n_min, &walk_len);
+      const std::vector<int32_t> round =
+          greedy ? model.DecodeStepDflashGreedy(next, args.dflash_k, args.dflash_p_min,
+                                                 args.dflash_n_min, &walk_len)
+                 : model.DecodeStepDflashSampled(next, args.dflash_k, args.dflash_p_min,
+                                                  args.dflash_n_min, sp, rng, &walk_len);
       result.dflash_rounds += 1;
       result.dflash_drafted += walk_len;
       result.dflash_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
@@ -238,22 +257,14 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
       if (outcome.hit_eos) { result.hit_eos = true; stopped = true; }
       if (outcome.hit_max_tokens) stopped = true;
     }
-  } else if (greedy && args.mtp > 0) {
-    // MTP self-speculative decode (docs/mtp.md): each DecodeStepMtpGreedy call drafts up to
-    // args.mtp tokens and returns however many the real model actually confirmed (1..args.mtp+1,
-    // always at least the corrected/bonus token) -- emit them one at a time, exactly like the
-    // plain-greedy loop below, so stop-on-EOS and --max-tokens truncation behave identically
-    // regardless of how many tokens one round happened to produce.
-    //
-    // Model::DecodeStepMtpGreedy's `token_id` parameter is "the last ALREADY-ACCEPTED token" (same
-    // convention as DecodeStep/DecodeStepGreedy) -- it does not itself re-emit that token, only
-    // whatever comes after it. `next` below (Prefill's own argmax'd result) is the FIRST generated
-    // token and has not been emitted by anything yet (unlike every later round's seed, which was
-    // already pushed into result.generated_tokens by the round that produced it) -- push it here,
-    // exactly like the plain-greedy loop below does before its own first DecodeStepGreedy call, or
-    // the prompt's first generated token is silently dropped from the output (review finding: this
-    // is exactly what happened before this fix -- "Silicon" came out as "icon").
-    int32_t next = r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()));
+  } else if (args.mtp > 0) {
+    // MTP self-speculative decode (docs/mtp.md, docs/sampling.md section 9/10, stage S3): now runs
+    // at any temperature too -- same greedy/sampled split as the DFlash2 branch above
+    // (DecodeStepMtpGreedy / DecodeStepMtpSampled), same "push the Prefill-derived first token here"
+    // reasoning (review finding, 2026-09-19: "Silicon" came out as "icon" when this was missed).
+    int32_t next = greedy ? r4dx::kernels::Argmax(logits.data(), static_cast<int64_t>(logits.size()))
+                          : r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()),
+                                                   sp, rng);
     bool stopped = false;
     if (is_eos(next)) {
       result.hit_eos = true;
@@ -267,7 +278,8 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
       }
     }
     while (!stopped && static_cast<int64_t>(result.generated_tokens.size()) < args.max_tokens) {
-      const std::vector<int32_t> round = model.DecodeStepMtpGreedy(next, args.mtp);
+      const std::vector<int32_t> round = greedy ? model.DecodeStepMtpGreedy(next, args.mtp)
+                                                 : model.DecodeStepMtpSampled(next, args.mtp, sp, rng);
       result.mtp_rounds += 1;
       result.mtp_drafted += args.mtp;
       result.mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
@@ -306,7 +318,26 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
       result.committed_tokens.push_back(next);  // fed by the DecodeStepGreedy call just above
       next = model.DecodeStepGreedy(next);
     }
-  } else {
+  } else if ([]() {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const char* v = std::getenv("R4DX_DEBUG_FULL_VOCAB_SAMPLER");
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+    return v != nullptr;
+  }()) {
+    // Documented debug flag (docs/sampling.md section 12, docs/perf.md's stage S3 measurement
+    // section): forces the pre-Milestone-6 plain-sampled path -- a full ~993 KB logits D2H every
+    // step plus the full-vocab host `r4dx::kernels::Sample` -- instead of `DecodeStepSampled`'s
+    // device-row-summary fast path, SOLELY so a "before" number can be measured against an "after"
+    // number on the exact same binary/container/request, without touching another checkout (the
+    // task's own "measure the old path" ask). Not wired to any CLI flag on purpose: this is a
+    // measurement tool, not a user-facing knob, and leaving it env-gated means it can never be hit
+    // by accident. Byte-for-byte the loop this branch replaced before this stage.
+    result.used_full_vocab_debug_sampler = true;
     for (int64_t step = 0; step < args.max_tokens; ++step) {
       const int32_t next = r4dx::kernels::Sample(
           logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
@@ -318,7 +349,26 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
         result.generated_text += piece;
       }
       logits = model.DecodeStep(next);
-      result.committed_tokens.push_back(next);  // fed by the DecodeStep call just above
+      result.committed_tokens.push_back(next);
+    }
+  } else {
+    // Plain sampled decode (docs/sampling.md section 8): same first-token-then-loop shape as the
+    // greedy branch above -- Argmax -> Sample, DecodeStepGreedy -> DecodeStepSampled -- so exactly
+    // one rng draw is consumed per emitted token (the initial Sample call for token 0, one
+    // DecodeStepSampled call per token after that). This is the reference the DFlash2/MTP sampled
+    // branches above are proven lossless against (docs/sampling.md section 9.3, tests/model/
+    // test_mtp.cpp's CheckSampledRoundsMatchPlain, tests/model/test_dflash_e2e.cpp).
+    int32_t next = r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
+    for (int64_t step = 0; step < args.max_tokens; ++step) {
+      if (is_eos(next)) { result.hit_eos = true; break; }
+      result.generated_tokens.push_back(next);
+      const std::string piece = decoder.push(next);
+      if (!piece.empty()) {
+        std::cout << piece << std::flush;
+        result.generated_text += piece;
+      }
+      result.committed_tokens.push_back(next);  // fed by the DecodeStepSampled call just below
+      next = model.DecodeStepSampled(next, sp, rng);
     }
   }
   const std::string tail = decoder.flush();
@@ -349,30 +399,10 @@ int RunMain(int argc, char** argv) {
     return 2;
   }
   opts.max_ctx = args.max_ctx;
-  // --mtp K combined with --temperature > 0 previously did nothing useful: RunTurn's
-  // `greedy && args.mtp > 0` branch (below) is skipped whenever temperature>0, generation falls
-  // through to plain Model::DecodeStep, and no warning was printed -- while the Model was still
-  // loaded with mtp_draft_k=K, needlessly allocating MtpHead's own KV cache and widening every GDN
-  // layer's window bank (review finding, 2026-09-19; cli_args.h documents the restriction in a
-  // comment, but the runtime was silent about it). Warn and drop mtp_draft_k to 0 instead -- only
-  // greedy sampling is implemented for MTP (docs/mtp.md).
-  if (args.mtp > 0 && args.temperature > 0.0f) {
-    std::fprintf(stderr,
-                 "r4dx-cli: --mtp %lld has no effect with --temperature %.3g > 0 (MTP is "
-                 "greedy-only, docs/mtp.md) -- disabling MTP for this run\n",
-                 static_cast<long long>(args.mtp), static_cast<double>(args.temperature));
-    args.mtp = 0;
-  }
-  // DFlash2 is likewise greedy-only (Model::VerifyWindow's own argmax path, docs/dflash2.md) --
-  // same warn-and-disable pattern as --mtp above, rather than silently loading and never using a
-  // multi-GiB drafter.
-  if (!args.dflash.empty() && args.temperature > 0.0f) {
-    std::fprintf(stderr,
-                 "r4dx-cli: --dflash has no effect with --temperature %.3g > 0 (DFlash2 is "
-                 "greedy-only, docs/dflash2.md) -- disabling DFlash2 for this run\n",
-                 static_cast<double>(args.temperature));
-    args.dflash.clear();
-  }
+  // --mtp K and --dflash now both run at ANY temperature (docs/sampling.md section 9/10, Milestone 6
+  // stage S3: DecodeStepMtpSampled / DecodeStepDflashSampled implement lossless sample-and-match
+  // rejection sampling for a non-greedy request). RunTurn picks the greedy or sampled method per
+  // round based on `greedy` there; no arg-time disabling is needed any more for either flag.
   opts.mtp_draft_k = args.mtp;
   opts.dflash_container = args.dflash;
   opts.dflash_draft_k = args.dflash.empty() ? 0 : args.dflash_k;
@@ -438,7 +468,14 @@ int RunMain(int argc, char** argv) {
                          full_tokens.end());
     }
 
+    // Sampled-fallback rate (docs/sampling.md section 4/12, docs/perf.md's stage S3 measurement
+    // ask): Model::SampledFallbackRows() is a cumulative-since-Load() counter, so bracket this
+    // turn's own decode with before/after reads to get just this turn's rows -- meaningful only for
+    // a temperature>0 turn (a greedy one never calls SampleFromSummary at all, so the delta is
+    // always 0 there).
+    const int64_t fallback_rows_before = model.SampledFallbackRows();
     const TurnResult r = RunTurn(model, tok, new_tokens, args);
+    const int64_t fallback_rows_this_turn = model.SampledFallbackRows() - fallback_rows_before;
     std::cout << std::endl;
 
     // committed_tokens (not generated_tokens) is what's actually in the model's KV/GDN state --
@@ -456,6 +493,22 @@ int RunMain(int argc, char** argv) {
                    static_cast<long long>(r.prefill_tokens), r.prefill_seconds, pfx_tps,
                    static_cast<long long>(r.decode_tokens), r.decode_seconds, dec_tps,
                    r.hit_eos ? "yes" : "no (max-tokens)", VramUsedGiB());
+      // Denominator is committed_tokens (rows actually emitted through the sampler this turn --
+      // Model::SampledFallbackRows()'s own unit), NOT decode_tokens/generated_tokens (DISPLAYED
+      // tokens): a speculative round that stops mid-round commits more rows than it displays
+      // (docs/mtp.md's "mid-round" gap), so dividing by decode_tokens could read over 100%.
+      // Suppressed entirely when R4DX_DEBUG_FULL_VOCAB_SAMPLER forced the old full-vocab path,
+      // where SampleFromSummary is never consulted and "0% fallback" would misreport "N/A".
+      if (args.temperature > 0.0f && !r.used_full_vocab_debug_sampler &&
+          !r.committed_tokens.empty()) {
+        std::fprintf(stderr,
+                     "[stats] sampled: fallback_rows=%lld/%lld (%.1f%% of emitted tokens took the "
+                     "full-vocab path)\n",
+                     static_cast<long long>(fallback_rows_this_turn),
+                     static_cast<long long>(r.committed_tokens.size()),
+                     100.0 * static_cast<double>(fallback_rows_this_turn) /
+                         static_cast<double>(r.committed_tokens.size()));
+      }
       if (args.mtp > 0) {
         const double accept_rate =
             r.mtp_drafted > 0 ? 100.0 * static_cast<double>(r.mtp_accepted) / static_cast<double>(r.mtp_drafted) : 0.0;

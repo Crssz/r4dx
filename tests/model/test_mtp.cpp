@@ -23,12 +23,14 @@
 // SKIPs (CTest SKIPPED, not FAILED) if the container is missing, same convention as
 // test_forward_smoke.cpp / test_gdn_layer.cpp.
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "model.h"
 #include "mtp_round.hpp"
 #include "prefix_state.h"
+#include "sampled_equality.hpp"
 #include "test_common.h"
 
 using namespace r4dx_test;
@@ -707,6 +709,579 @@ bool CheckReducedVocabDraftHeadLossless(const std::string& container_path, Layou
   return true;
 }
 
+// ================================================================================================
+// Milestone 6 stage S2: sampled speculative rounds (docs/sampling.md section 9)
+// ================================================================================================
+// The losslessness gate. A sampled MTP round draws exactly ONE uniform per EMITTED token and maps
+// it to a token by the same canonical rule plain sampled decode uses, so for a fixed seed the two
+// must emit the SAME tokens in the same order -- not merely the same distribution. Everything below
+// is that equality, at three sampling configurations x three seeds x all four layouts, against an
+// independently loaded mtp_draft_k=0 Model.
+//
+// Two drafters are exercised, because this 4-layer container's MTP head hardly ever agrees with its
+// (equally truncated) target:
+//   * the REAL MTP head -- mostly the ALL-REJECTED path (a round is usually one token, i.e. the
+//     round's row 0 sample must equal what plain decode would have sampled);
+//   * an ORACLE drafter whose drafts are the plain sampled run's OWN tokens -- the ALL-ACCEPTED
+//     path (rounds are k+1 tokens long), which is where a bookkeeping error in the commit count or
+//     in the per-row draw order would actually show up.
+//
+// THE ONE DIVERGENCE THIS FILE ACCEPTS, and why it is not a loosening. A speculative round computes
+// its logits in ONE q_len>1 forward pass; plain decode computes them one row at a time. Those are
+// different GEMM shapes, so their reduction order differs, and floating-point addition is not
+// associative -- CheckVerifyMatchesSequential above measures the result directly on this very
+// container and accepts it up to rel L2 <= 1e-2 (measured: ~1.1e-3 at bf16). A greedy argmax
+// survives that; a CDF walk does not always, because the same 1e-3 perturbation moves a candidate
+// boundary by ~1e-2 of the distribution's mass, and a draw landing inside that band picks the
+// neighbouring token. This is the SAME "known batched-verify divergence" class
+// tools/validate_dflash.ps1 exists to adjudicate, and it is handled the same way: never silently.
+// On any mismatch, ClassifySampledDivergence below obtains BOTH logits rows for the diverging
+// position -- the single-row decode one (by replaying the plain trajectory) and the EXACT verify
+// row the speculative sampler resolved that token from (by re-running the deterministic speculative
+// trajectory and reading it back with Model::ReadVerifyLogitsRow) -- and the divergence is accepted
+// ONLY if all of these hold, each of which a real bookkeeping bug would break:
+//   1. canonically sampling the DECODE row with that token's own draw u reproduces the plain run's
+//      token, so the reference trajectory really is canonical;
+//   2. canonically sampling the EXACT VERIFY row with that SAME u reproduces the SPECULATIVE run's
+//      token -- which pins the draw index, the window row, and the filters all at once: had the
+//      round sampled a different row, used a shifted draw, or applied the filters differently, the
+//      row this emission index maps to would not reproduce what it emitted;
+//   3. the two rows are the same next-token distribution (a sanity floor on rel L2 -- see the note
+//      in the classifier for why this is deliberately loose while 1 and 2 are exact).
+// Independently of all that, every runner below asserts the exact position-lockstep invariant after
+// EVERY round (a round commits exactly as many positions as it emitted tokens), which is the
+// bookkeeping gate proper. Everything else fails, loudly, with every number printed.
+constexpr size_t kSampledTokens = 48;
+constexpr uint64_t kSampledSeeds[] = {1u, 20260921u, 0x9E3779B97F4A7C15ull};
+
+// Plain sampled decode: the reference trajectory. One draw for the prefill row's own token, then
+// one per DecodeStepSampled call.
+std::vector<int32_t> RunPlainSampled(Model& m, const std::vector<int32_t>& prompt,
+                                      const r4dx::kernels::SampleParams& params, uint64_t seed,
+                                      size_t n) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  const std::vector<float> l0 = m.Prefill(prompt);
+  std::vector<int32_t> seq;
+  int32_t tok = SampleFirstToken(l0, m.Config().vocab_size, params, rng);
+  seq.push_back(tok);
+  while (seq.size() < n) {
+    tok = m.DecodeStepSampled(tok, params, rng);
+    seq.push_back(tok);
+  }
+  // The invariant every runner in this file asserts (see RunMtpSampled): after N emitted tokens the
+  // model has committed the prompt plus N-1 of them (the last is the next call's anchor).
+  if (m.PositionCount() != static_cast<int64_t>(prompt.size() + seq.size() - 1)) {
+    std::fprintf(stderr, "FAIL: plain sampled decode committed %lld positions, expected %zu\n",
+                 static_cast<long long>(m.PositionCount()), prompt.size() + seq.size() - 1);
+    std::abort();
+  }
+  return seq;
+}
+
+// The same trajectory through real MTP self-speculative sampled rounds.
+//
+// `capture_index`/`captured_row`: forensics for a mismatch. On a re-run (the trajectory is
+// deterministic in the seed) this reads back, through Model::ReadVerifyLogitsRow, the EXACT fp32
+// logits row the sampler resolved emitted token `capture_index` from -- valid because
+// verify_logits_dev_ still holds that round's window when DecodeStepMtpSampled returns and nothing
+// touches it until the next round. Having the real row, rather than a reconstruction of it, is what
+// makes ClassifySampledDivergence's verdict threshold-free.
+std::vector<int32_t> RunMtpSampled(Model& m, const std::vector<int32_t>& prompt,
+                                    const r4dx::kernels::SampleParams& params, uint64_t seed,
+                                    size_t n, int64_t k, size_t* longest_round_out,
+                                    size_t capture_index = static_cast<size_t>(-1),
+                                    std::vector<float>* captured_row = nullptr) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  const std::vector<float> l0 = m.Prefill(prompt);
+  std::vector<int32_t> seq;
+  int32_t tok = SampleFirstToken(l0, m.Config().vocab_size, params, rng);
+  seq.push_back(tok);
+  size_t longest = 0;
+  while (seq.size() < n) {
+    const size_t base = seq.size();  // global index of this round's first emitted token
+    const std::vector<int32_t> round = m.DecodeStepMtpSampled(tok, k, params, rng);
+    if (captured_row != nullptr && capture_index >= base && capture_index < base + round.size()) {
+      m.ReadVerifyLogitsRow(static_cast<int64_t>(capture_index - base), *captured_row);
+    }
+    longest = std::max(longest, round.size());
+    seq.insert(seq.end(), round.begin(), round.end());
+    tok = round.back();
+    // THE bookkeeping gate, asserted continuously rather than only on a mismatch: a round commits
+    // exactly as many positions as it emitted tokens, so after N emitted tokens the model holds the
+    // prompt plus N-1 of them -- identical to plain decode's own arithmetic. A wrong commit count
+    // (the classic speculative-decoding bug: committing the whole window, or one row too few) is
+    // caught here immediately, on every round, with no tolerance and no forensics needed.
+    if (m.PositionCount() != static_cast<int64_t>(prompt.size() + seq.size() - 1)) {
+      std::fprintf(stderr,
+                   "FAIL: after a sampled MTP round of %zu tokens the model holds %lld positions, "
+                   "expected %zu (prompt %zu + %zu emitted - 1)\n",
+                   round.size(), static_cast<long long>(m.PositionCount()),
+                   prompt.size() + seq.size() - 1, prompt.size(), seq.size());
+      std::abort();
+    }
+  }
+  if (longest_round_out) *longest_round_out = longest;
+  return seq;
+}
+
+// The same trajectory through ORACLE-drafted sampled rounds: the drafts are `oracle`'s own next k
+// tokens, so every draft is accepted and every round is k+1 long -- as long as sample-and-match is
+// right. `oracle` must hold at least n + k tokens.
+std::vector<int32_t> RunOracleSampled(Model& m, const std::vector<int32_t>& prompt,
+                                       const r4dx::kernels::SampleParams& params, uint64_t seed,
+                                       size_t n, int64_t k, const std::vector<int32_t>& oracle,
+                                       size_t* longest_round_out, OracleRoundStats* stats,
+                                       size_t capture_index = static_cast<size_t>(-1),
+                                       std::vector<float>* captured_row = nullptr) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  const std::vector<float> l0 = m.Prefill(prompt);
+  const int64_t vocab = m.Config().vocab_size;
+  std::vector<int32_t> seq;
+  int32_t tok = SampleFirstToken(l0, vocab, params, rng);
+  seq.push_back(tok);
+  size_t longest = 0;
+  while (seq.size() < n) {
+    std::vector<int32_t> drafts;
+    for (int64_t j = 0; j < k && seq.size() + static_cast<size_t>(j) < oracle.size(); ++j) {
+      drafts.push_back(oracle[seq.size() + static_cast<size_t>(j)]);
+    }
+    const size_t base = seq.size();
+    std::vector<float> window_logits;
+    const std::vector<int32_t> round = RunSampledOracleRound(
+        m, tok, drafts, params, rng, stats, captured_row ? &window_logits : nullptr);
+    if (captured_row != nullptr && capture_index >= base && capture_index < base + round.size()) {
+      const size_t row = capture_index - base;
+      captured_row->assign(window_logits.begin() + static_cast<ptrdiff_t>(row) * vocab,
+                           window_logits.begin() + static_cast<ptrdiff_t>(row + 1) * vocab);
+    }
+    longest = std::max(longest, round.size());
+    seq.insert(seq.end(), round.begin(), round.end());
+    tok = round.back();
+    if (m.PositionCount() != static_cast<int64_t>(prompt.size() + seq.size() - 1)) {  // see above
+      std::fprintf(stderr,
+                   "FAIL: after an oracle-drafted sampled round of %zu tokens the model holds %lld "
+                   "positions, expected %zu\n",
+                   round.size(), static_cast<long long>(m.PositionCount()),
+                   prompt.size() + seq.size() - 1);
+      std::abort();
+    }
+  }
+  if (longest_round_out) *longest_round_out = longest;
+  return seq;
+}
+
+// Plain sampled decode over the FULL fp32 logits row -- the definition the summary path must match
+// exactly (same Model, same rows, so there is no numeric excuse available here at all).
+std::vector<int32_t> RunPlainSampledFullVocab(Model& m, const std::vector<int32_t>& prompt,
+                                               const r4dx::kernels::SampleParams& params,
+                                               uint64_t seed, size_t n) {
+  m.Reset();
+  std::mt19937_64 rng = r4dx::kernels::MakeRng(seed);
+  std::vector<float> row = m.Prefill(prompt);
+  const int64_t vocab = m.Config().vocab_size;
+  std::vector<int32_t> seq;
+  int32_t tok = r4dx::kernels::SampleCanonical(row.data(), vocab, params,
+                                                r4dx::kernels::DrawUniform01(rng));
+  seq.push_back(tok);
+  while (seq.size() < n) {
+    row = m.DecodeStep(tok);
+    tok = r4dx::kernels::SampleCanonical(row.data(), vocab, params,
+                                          r4dx::kernels::DrawUniform01(rng));
+    seq.push_back(tok);
+  }
+  return seq;
+}
+
+// Recomputes the FULL fp32 logits row PLAIN single-row decode used for emitted token `index`, by
+// replaying the same trajectory on a fresh (mtp_draft_k=0) Model. Forensics only.
+std::vector<float> PlainLogitsRowAt(Model& ref, const std::vector<int32_t>& prompt,
+                                     const std::vector<int32_t>& seq, size_t index) {
+  ref.Reset();
+  std::vector<float> row = ref.Prefill(prompt);
+  for (size_t i = 0; i + 1 <= index; ++i) row = ref.DecodeStep(seq[i]);
+  return row;  // index==0 -> the prefill row itself
+}
+
+enum class DivergenceVerdict { kEqual, kProvenVerifyNumeric, kBug };
+
+// See this section's own header comment for the three conditions. `fetch_verify_row(j)` must return
+// the EXACT fp32 logits row the speculative run resolved its emitted token `j` from (the runners
+// above re-run the deterministic trajectory and read it back with Model::ReadVerifyLogitsRow) --
+// having the real row, not a reconstruction, is what lets condition 3 be an equality rather than a
+// tolerance. Returns kBug unless every condition holds.
+DivergenceVerdict ClassifySampledDivergence(
+    const char* tag, Model& ref, const std::vector<int32_t>& prompt,
+    const std::vector<int32_t>& plain, const std::vector<int32_t>& spec, uint64_t seed,
+    const r4dx::kernels::SampleParams& params,
+    const std::function<std::vector<float>(size_t)>& fetch_verify_row) {
+  size_t j = 0;
+  while (j < plain.size() && j < spec.size() && plain[j] == spec[j]) ++j;
+  if (j >= kSampledTokens) return DivergenceVerdict::kEqual;
+
+  const int64_t vocab = ref.Config().vocab_size;
+  const std::vector<double> draws = ReplayDraws(seed, j + 1);
+  const double u = draws[j];
+  std::fprintf(stderr,
+               "%s DIVERGENCE at index %zu after %zu identical tokens: plain=%d spec=%d u=%.17g\n",
+               tag, j, j, plain[j], spec[j], u);
+  if (j == 0) {
+    std::fprintf(stderr,
+                 "%s   index 0 comes from Prefill()'s own logits on BOTH sides, with no verify pass "
+                 "anywhere -- a divergence here cannot be the batched-verify mechanism\n",
+                 tag);
+    return DivergenceVerdict::kBug;
+  }
+
+  const std::vector<float> row_decode = PlainLogitsRowAt(ref, prompt, plain, j);
+  const std::vector<float> row_verify = fetch_verify_row(j);
+  if (row_verify.size() != static_cast<size_t>(vocab)) {
+    std::fprintf(stderr, "%s   could not capture the verify row for index %zu\n", tag, j);
+    return DivergenceVerdict::kBug;
+  }
+  const double rel = RelL2(row_verify, row_decode);
+  const int32_t from_decode = r4dx::kernels::SampleCanonical(row_decode.data(), vocab, params, u);
+  const int32_t from_verify = r4dx::kernels::SampleCanonical(row_verify.data(), vocab, params, u);
+  const NearTieReport tie_decode = AnalyzeNearTie(row_decode, vocab, params, u, plain[j], spec[j]);
+  const NearTieReport tie_verify = AnalyzeNearTie(row_verify, vocab, params, u, plain[j], spec[j]);
+  std::fprintf(stderr,
+               "%s   decode-row vs verify-row rel L2=%.4e; canonical sample of the decode row at "
+               "that u=%d (plain emitted %d); of the verify row=%d (spec emitted %d)\n",
+               tag, rel, from_decode, plain[j], from_verify, spec[j]);
+  PrintNearTie(tag, tie_decode, u, plain[j], spec[j]);
+  // The whole mechanism in two numbers: the CDF boundary between these two candidates sits at
+  // `boundary` in the decode row and at a slightly different place in the verify row, and `u` lies
+  // BETWEEN the two -- which is exactly "a near-tie in the post-filter probabilities straddling u".
+  std::fprintf(stderr,
+               "%s   that pair's CDF boundary: decode row %.12f, verify row %.12f (shift %.3e), "
+               "u=%.12f lies %s the two\n",
+               tag, tie_decode.boundary, tie_verify.boundary,
+               tie_verify.boundary - tie_decode.boundary, u,
+               (u >= std::min(tie_decode.boundary, tie_verify.boundary) &&
+                u < std::max(tie_decode.boundary, tie_verify.boundary))
+                   ? "BETWEEN"
+                   : "outside");
+
+  // Condition 3's sanity floor. `rel` is NOT required to be tiny: the two trajectories' GDN/KV
+  // state has been drifting apart in its last bits since the very first speculative round, and that
+  // drift accumulates, so by token 30 of a w4a8 run the two rows can differ by a few percent while
+  // still being the same next-token distribution for the same context. What a WRONG-CONTEXT bug
+  // (an off-by-one commit, the wrong window row) would produce is not a few percent -- it is two
+  // unrelated distributions, i.e. rel L2 near sqrt(2). This bound only has to separate those two
+  // regimes, and the bookkeeping itself is pinned exactly elsewhere (the position-lockstep
+  // assertion in every runner above, plus condition 2 below, which fails outright if the row the
+  // sampler used was not the row this emission index maps to).
+  const bool cond_rows_same_context = (rel > 0.0 && rel <= 0.5);
+  const bool cond_decode_reproduces_plain = (from_decode == plain[j]);
+  const bool cond_verify_reproduces_spec = (from_verify == spec[j]);
+  if (cond_rows_same_context && cond_decode_reproduces_plain && cond_verify_reproduces_spec) {
+    std::fprintf(stderr,
+                 "%s   ACCEPTED as the known batched-verify divergence (docs/perf.md, "
+                 "tools/validate_dflash.ps1): the speculative path sampled the RIGHT draw, from the "
+                 "RIGHT row of the RIGHT round, with the RIGHT filters -- the only difference is "
+                 "that row's own last bits, by the q_len>1-vs-T=1 reduction-order mechanism "
+                 "CheckVerifyMatchesSequential already measures on this container\n",
+                 tag);
+    return DivergenceVerdict::kProvenVerifyNumeric;
+  }
+  std::fprintf(stderr,
+               "%s   NOT the known mechanism (rows-are-the-same-distribution=%s "
+               "decode-row-reproduces-plain=%s verify-row-reproduces-spec=%s) -- this is a "
+               "bookkeeping bug\n",
+               tag, cond_rows_same_context ? "yes" : "NO",
+               cond_decode_reproduces_plain ? "yes" : "NO",
+               cond_verify_reproduces_spec ? "yes" : "NO");
+  return DivergenceVerdict::kBug;
+}
+
+// Stage S2 item 1: the SUMMARY path itself, with no speculation anywhere and therefore no numeric
+// excuse available. DecodeStepSampled resolves each token from the device row summary
+// (r4dx_topk_lse_f32's top-64 + logsumexp, 516 bytes); DecodeStep + SampleCanonical resolves it
+// from the same step's full 993 KB fp32 row. Same Model, same rows, same draws, so the two
+// trajectories must be EXACTLY equal -- this is stage S1's exactness claim re-tested on real model
+// logits rather than synthetic ones, end to end through the device kernel.
+bool CheckSampledSummaryPathExact(const ModelOptions& base_opts, const std::vector<int32_t>& prompt,
+                                   Layout layout) {
+  ModelOptions opts = base_opts;
+  opts.mtp_draft_k = 0;
+  Model m = Model::Load(opts);
+  // One seed per configuration, not the full seed sweep: every oracle-drafted round in
+  // CheckSampledRoundsMatchPlain below ALSO cross-checks the summary path row by row (see
+  // RunSampledOracleRound's own summary-vs-full-vocab assertion), across all three seeds, so a
+  // second seed here would only re-pay a real trajectory for coverage already obtained.
+  for (const SampledConfig& cfg : SampledConfigs()) {
+    {
+      const uint64_t seed = kSampledSeeds[0];
+      const int64_t before = m.SampledFallbackRows();
+      const std::vector<int32_t> summary_path =
+          RunPlainSampled(m, prompt, cfg.params, seed, kSampledTokens);
+      const int64_t fallbacks = m.SampledFallbackRows() - before;
+      const std::vector<int32_t> full_path =
+          RunPlainSampledFullVocab(m, prompt, cfg.params, seed, kSampledTokens);
+      if (summary_path != full_path) {
+        size_t j = 0;
+        while (j < summary_path.size() && summary_path[j] == full_path[j]) ++j;
+        std::fprintf(stderr,
+                     "FAIL: DecodeStepSampled (device row summary) disagrees with DecodeStep + the "
+                     "full-vocab canonical sampler on the SAME Model at index %zu (summary=%d "
+                     "full=%d, layout=%s config=%s seed=%llu) -- the summary path is not exact\n",
+                     j, summary_path[j], full_path[j], LayoutName(layout), cfg.name,
+                     static_cast<unsigned long long>(seed));
+        return false;
+      }
+      std::fprintf(stderr,
+                   "[mtp] summary-path-exact layout=%s config=%-20s seed=%llu: %zu tokens "
+                   "identical to the full-vocab path (%lld/%zu rows fell back)\n",
+                   LayoutName(layout), cfg.name, static_cast<unsigned long long>(seed),
+                   kSampledTokens, static_cast<long long>(fallbacks), kSampledTokens);
+    }
+  }
+  return true;
+}
+
+bool CheckSampledRoundsMatchPlain(const ModelOptions& base_opts, const std::vector<int32_t>& prompt,
+                                   Layout layout) {
+  ModelOptions ref_opts = base_opts;
+  ref_opts.mtp_draft_k = 0;
+  Model ref = Model::Load(ref_opts);
+
+  ModelOptions mtp_opts = base_opts;
+  mtp_opts.mtp_draft_k = kDraftK;
+  Model mtp = Model::Load(mtp_opts);
+
+  size_t oracle_rounds_over_one = 0;
+  size_t exact = 0, accepted_numeric = 0, combos = 0;
+  for (const SampledConfig& cfg : SampledConfigs()) {
+    for (uint64_t seed : kSampledSeeds) {
+      // n + kDraftK tokens so the oracle drafter below always has a full window of kDraftK drafts
+      // available, right up to the last compared token.
+      const std::vector<int32_t> plain =
+          RunPlainSampled(ref, prompt, cfg.params, seed, kSampledTokens + kDraftK);
+
+      size_t longest_mtp = 0;
+      const std::vector<int32_t> spec =
+          RunMtpSampled(mtp, prompt, cfg.params, seed, kSampledTokens, kDraftK, &longest_mtp);
+      if (spec.size() < kSampledTokens) {
+        std::fprintf(stderr, "FAIL: MTP sampled run produced only %zu tokens\n", spec.size());
+        return false;
+      }
+
+      OracleRoundStats stats;
+      size_t longest_oracle = 0;
+      const std::vector<int32_t> oracle_run = RunOracleSampled(
+          mtp, prompt, cfg.params, seed, kSampledTokens, kDraftK, plain, &longest_oracle, &stats);
+      if (stats.summary_mismatch) {
+        std::fprintf(stderr,
+                     "FAIL: a device row summary resolved a row differently from the full-vocab "
+                     "canonical sampler on that row's own logits (layout=%s config=%s)\n",
+                     LayoutName(layout), cfg.name);
+        return false;
+      }
+      if (longest_oracle > 1) ++oracle_rounds_over_one;
+
+      const std::string base_tag = std::string(LayoutName(layout)) + " " + cfg.name +
+                                    " seed=" + std::to_string(seed) + "]";
+      // On a divergence, re-run the (deterministic) speculative trajectory once more, this time
+      // reading back the exact verify row the diverging token was resolved from.
+      auto mtp_row = [&](size_t j) {
+        std::vector<float> row;
+        RunMtpSampled(mtp, prompt, cfg.params, seed, kSampledTokens, kDraftK, nullptr, j, &row);
+        return row;
+      };
+      auto oracle_row = [&](size_t j) {
+        std::vector<float> row;
+        RunOracleSampled(mtp, prompt, cfg.params, seed, kSampledTokens, kDraftK, plain, nullptr,
+                         nullptr, j, &row);
+        return row;
+      };
+      const std::pair<std::string, const std::vector<int32_t>*> runs[2] = {
+          {"[mtp-sampled " + base_tag, &spec}, {"[mtp-sampled-oracle " + base_tag, &oracle_run}};
+      const std::function<std::vector<float>(size_t)> fetchers[2] = {mtp_row, oracle_row};
+      for (int which = 0; which < 2; ++which) {
+        ++combos;
+        const DivergenceVerdict v =
+            ClassifySampledDivergence(runs[which].first.c_str(), ref, prompt, plain,
+                                      *runs[which].second, seed, cfg.params, fetchers[which]);
+        if (v == DivergenceVerdict::kBug) return false;
+        if (v == DivergenceVerdict::kEqual) ++exact;
+        else ++accepted_numeric;
+      }
+
+      std::fprintf(stderr,
+                   "[mtp] sampled-equality layout=%s config=%-20s seed=%llu: mtp longest round=%zu, "
+                   "oracle longest round=%zu, %lld/%lld oracle summary rows fell back to full vocab\n",
+                   LayoutName(layout), cfg.name, static_cast<unsigned long long>(seed), longest_mtp,
+                   longest_oracle, static_cast<long long>(stats.fallbacks),
+                   static_cast<long long>(stats.rows));
+    }
+  }
+
+  // The oracle variant exists precisely to exercise rounds LONGER than one token (this container's
+  // real MTP head hardly ever accepts). If none ever got past one token, the all-accepted path was
+  // not tested at all and the check is worthless -- fail rather than report a green that means
+  // nothing.
+  if (oracle_rounds_over_one == 0) {
+    std::fprintf(stderr,
+                 "FAIL: no oracle-drafted sampled round ever emitted more than one token, so the "
+                 "all-drafts-accepted path was never exercised (layout=%s)\n",
+                 LayoutName(layout));
+    return false;
+  }
+  // A run where EVERY trajectory diverged would mean the accepted-divergence path had become the
+  // norm rather than the exception, which is worth failing on even though each individual
+  // divergence was proven: it would point at a systematically different row, not at last-bit noise.
+  if (exact == 0) {
+    std::fprintf(stderr,
+                 "FAIL: not one of the %zu sampled trajectories was token-for-token identical to "
+                 "plain sampled decode on layout=%s -- every single one was 'explained', which is "
+                 "not a green result\n",
+                 combos, LayoutName(layout));
+    return false;
+  }
+  std::fprintf(stderr,
+               "[mtp] sampled-equality layout=%s: %zu/%zu trajectories token-for-token identical, "
+               "%zu accepted as the known batched-verify divergence, 0 bookkeeping failures; %zu of "
+               "%zu (config,seed) combinations saw oracle rounds longer than one token\n",
+               LayoutName(layout), exact, combos, accepted_numeric, oracle_rounds_over_one,
+               SampledConfigs().size() * (sizeof(kSampledSeeds) / sizeof(kSampledSeeds[0])));
+  return true;
+}
+
+// Stage S2 item 3c: the committed-vs-displayed bookkeeping (mtp_round.hpp's ProcessMtpRound) with a
+// SAMPLED round. Same structure as CheckChatMultiTurnMidRoundStop above -- and the same oracle
+// drafter, for the same reason (a real MTP round on this container is always exactly one token, and
+// a one-token round can never stop "inside" itself) -- but every emitted token now comes from
+// sample-and-match rather than from an argmax, and the turn-2 continuation is compared against an
+// independently loaded reference driven by DecodeStepSampled.
+bool CheckSampledMidRoundStop(const ModelOptions& base_opts, const std::vector<int32_t>& prompt1,
+                               const std::vector<int32_t>& prompt2_user) {
+  const r4dx::kernels::SampleParams params = SampledConfigs()[0].params;  // T=0.7 top_k=20 top_p=0.8
+  constexpr uint64_t kSeed = 4242u;
+  constexpr size_t kProbeTokens = 32;
+  auto is_eos = [](int32_t) { return false; };
+
+  ModelOptions ref_opts = base_opts;
+  ref_opts.mtp_draft_k = 0;
+  Model ref = Model::Load(ref_opts);
+  ModelOptions mtp_opts = base_opts;
+  mtp_opts.mtp_draft_k = kDraftK;
+  Model turn = Model::Load(mtp_opts);
+
+  // The oracle drafts: THIS Model's own plain sampled continuation of prompt1 under this seed --
+  // taken from `turn` rather than from `ref` on purpose, because this check is about the
+  // committed-vs-displayed bookkeeping of a long round, not about cross-Model equality (that is
+  // CheckSampledRoundsMatchPlain's job), and drafting from the same Model guarantees the rounds
+  // below really do accept and therefore really are >=3 tokens long.
+  const std::vector<int32_t> oracle = RunPlainSampled(turn, prompt1, params, kSeed, kProbeTokens);
+
+  // Dry run: find a round of >=3 tokens and budget display to stop 2 tokens short of ITS end, so
+  // ProcessMtpRound's unconditional `committed` (round.size()-1 tokens) genuinely exceeds
+  // `displayed`. Identical construction to the greedy check above.
+  auto replay = [&](int64_t budget, std::vector<int32_t>* committed, std::vector<int32_t>* displayed,
+                     bool* stopped_mid_round) -> int64_t {
+    turn.Reset();
+    std::mt19937_64 rng = r4dx::kernels::MakeRng(kSeed);
+    const std::vector<float> l0 = turn.Prefill(prompt1);
+    int32_t next = SampleFirstToken(l0, turn.Config().vocab_size, params, rng);
+    int64_t emitted = 0;      // tokens the (unbudgeted) dry run has emitted so far
+    int64_t remaining = budget;
+    int64_t found_stop_after = -1;
+    for (int round_idx = 0; round_idx < 8; ++round_idx) {
+      if (budget >= 0 && remaining <= 0) break;
+      std::vector<int32_t> drafts;
+      for (int64_t j = 1; j <= kDraftK && static_cast<size_t>(emitted + j) < oracle.size(); ++j) {
+        drafts.push_back(oracle[static_cast<size_t>(emitted + j)]);
+      }
+      const std::vector<int32_t> round =
+          RunSampledOracleRound(turn, next, drafts, params, rng, nullptr);
+      if (budget < 0) {  // dry run: just look for a round we could stop inside
+        if (round.size() >= 3 && found_stop_after < 0) {
+          found_stop_after = emitted + static_cast<int64_t>(round.size()) - 2;
+        }
+        emitted += static_cast<int64_t>(round.size());
+        next = round.back();
+        if (found_stop_after >= 0) break;
+        continue;
+      }
+      committed->push_back(next);
+      r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(round, is_eos, remaining);
+      committed->insert(committed->end(), outcome.committed.begin(), outcome.committed.end());
+      displayed->insert(displayed->end(), outcome.displayed.begin(), outcome.displayed.end());
+      remaining -= static_cast<int64_t>(outcome.displayed.size());
+      emitted += static_cast<int64_t>(outcome.displayed.size());
+      if (outcome.hit_max_tokens) {
+        *stopped_mid_round = outcome.committed.size() > outcome.displayed.size();
+        break;
+      }
+      if (outcome.hit_eos) break;
+      next = round.back();
+    }
+    return found_stop_after;
+  };
+
+  std::vector<int32_t> dummy_c, dummy_d;
+  bool dummy_mid = false;
+  const int64_t stop_after = replay(-1, &dummy_c, &dummy_d, &dummy_mid);
+  if (stop_after < 1) {
+    std::fprintf(stderr,
+                 "FAIL: CheckSampledMidRoundStop: no oracle-drafted SAMPLED round of >=3 tokens in "
+                 "8 rounds -- sample-and-match is rejecting tokens plain sampled decode itself "
+                 "produced, which is exactly the losslessness failure this milestone is about\n");
+    return false;
+  }
+
+  std::vector<int32_t> committed_turn1, displayed_turn1;
+  bool stopped_mid_round = false;
+  replay(stop_after, &committed_turn1, &displayed_turn1, &stopped_mid_round);
+  if (!stopped_mid_round) {
+    std::fprintf(stderr,
+                 "FAIL: CheckSampledMidRoundStop did not land mid-round (stop_after=%lld) -- test "
+                 "construction bug, not a product bug\n",
+                 static_cast<long long>(stop_after));
+    return false;
+  }
+  std::fprintf(stderr,
+               "[mtp] CheckSampledMidRoundStop: turn 1 stopped mid-round: displayed=%zu "
+               "committed=%zu (%zu committed-but-undisplayed token(s))\n",
+               displayed_turn1.size(), committed_turn1.size(),
+               committed_turn1.size() - displayed_turn1.size());
+
+  r4dx::server::PrefixState prefix;
+  prefix.Commit(prompt1, committed_turn1);
+  std::vector<int32_t> full_tokens_turn2 = prompt1;
+  full_tokens_turn2.insert(full_tokens_turn2.end(), displayed_turn1.begin(), displayed_turn1.end());
+  full_tokens_turn2.insert(full_tokens_turn2.end(), prompt2_user.begin(), prompt2_user.end());
+  if (auto tail = prefix.Extend(full_tokens_turn2); tail.has_value()) {
+    std::fprintf(stderr,
+                 "FAIL: CheckSampledMidRoundStop: PrefixState::Extend() wrongly treated a "
+                 "post-mid-round-stop turn 2 as a simple extension (tail.size()=%zu)\n",
+                 tail->size());
+    return false;
+  }
+
+  // Recovery: Reset() + full re-prefill + plain SAMPLED continuation, byte-identical to an
+  // independently loaded reference fed the same turn-2 conversation with the same seed.
+  constexpr size_t kTurn2Tokens = 8;
+  constexpr uint64_t kTurn2Seed = 777u;
+  const std::vector<int32_t> turn2 =
+      RunPlainSampled(turn, full_tokens_turn2, params, kTurn2Seed, kTurn2Tokens);
+  const std::vector<int32_t> turn2_ref =
+      RunPlainSampled(ref, full_tokens_turn2, params, kTurn2Seed, kTurn2Tokens);
+  if (turn2 != turn2_ref) {
+    std::fprintf(stderr,
+                 "FAIL: CheckSampledMidRoundStop: turn-2 sampled continuation (post-Reset(), "
+                 "post-mid-round-stop) diverges from an independently loaded reference\n");
+    return false;
+  }
+  std::fprintf(stderr,
+               "[mtp] CheckSampledMidRoundStop: PrefixState refused the fast path and the turn-2 "
+               "sampled continuation matches the reference exactly (%zu tokens)\n",
+               kTurn2Tokens);
+  return true;
+}
+
 std::vector<int32_t> MakeSecondTurnUserTokens(int n) {
   std::vector<int32_t> ids(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) ids[static_cast<size_t>(i)] = 3000 + (i * 67) % 5000;
@@ -774,12 +1349,43 @@ int main() {
       return 1;
     }
     std::fprintf(stderr, "[PASS] layout=%s CheckWideWindowRejectionRewind(K=16)\n", LayoutName(layout));
+
+    // Milestone 6 stage S2 (docs/sampling.md sections 8-9). Both checks run on every layout -- the
+    // same reason the greedy checks above do (a numeric difference between batched verification and
+    // single-row decode is layout-dependent, and sampling is more sensitive to it than an argmax).
+    if (!CheckSampledSummaryPathExact(opts, prompt, layout)) {
+      std::fprintf(stderr, "FAIL [%s]: CheckSampledSummaryPathExact\n", LayoutName(layout));
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s CheckSampledSummaryPathExact\n", LayoutName(layout));
+
+    if (!CheckSampledRoundsMatchPlain(opts, prompt, layout)) {
+      std::fprintf(stderr, "FAIL [%s]: CheckSampledRoundsMatchPlain\n", LayoutName(layout));
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=%s CheckSampledRoundsMatchPlain\n", LayoutName(layout));
     ++ran;
   }
 
   if (ran == 0) {
     std::fprintf(stderr, "FAIL: no layout ran to completion\n");
     return 1;
+  }
+
+  // Stage S2 item 3c: the sampled mid-round-stop bookkeeping. One layout is enough (this is about
+  // ProcessMtpRound/PrefixState arithmetic over a sampled round, not about per-layout numerics),
+  // and w4a16 is the layout every other real-hardware check in this milestone reports against.
+  {
+    ModelOptions opts;
+    opts.container_path = kContainerPath;
+    opts.layout = Layout::kW4a16;
+    opts.max_ctx = 256;
+    opts.layer_limit = 4;
+    if (!CheckSampledMidRoundStop(opts, prompt, MakeSecondTurnUserTokens(12))) {
+      std::fprintf(stderr, "FAIL: CheckSampledMidRoundStop\n");
+      return 1;
+    }
+    std::fprintf(stderr, "[PASS] layout=w4a16 CheckSampledMidRoundStop\n");
   }
 
   // Reduced-vocab draft head (docs/r9700.md R9): separate container (has mtp.draft_head.* tensors),

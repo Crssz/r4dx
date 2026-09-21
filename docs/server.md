@@ -471,14 +471,22 @@ see "MTP" below.
 requires `--model` to point at an MTP-converted container (`Container::HasMtp()`, `docs/mtp.md`),
 exactly like `r4dx-cli`.
 
-Per-request routing (`Engine::RunRequest`, `engine.cpp`): a request takes the MTP path
-(`Model::DecodeStepMtpGreedy`) iff `model_->MtpEnabled()` (the server was started with `--mtp N>0`
-against an MTP container) AND that specific request's own `sampling.temperature <= 0` (greedy) --
-every other request (non-greedy, or MTP disabled server-wide) takes the pre-existing plain-decode
-loop (`Model::DecodeStep`/`r4dx::kernels::Sample`), unchanged. This mirrors `r4dx-cli`'s own
-`greedy && args.mtp > 0` gate exactly, just evaluated per-request instead of once at process
-start-up -- MTP has no notion of probabilistic (non-greedy) acceptance yet (`docs/mtp.md`'s "Only
-greedy acceptance is implemented"), so a non-greedy request simply never sees it.
+**Per-request routing (`Engine::RunRequest`, `engine.cpp`), current as of Milestone 6 stage S3**: a
+request takes the MTP path iff `model_->MtpEnabled()` (the server was started with `--mtp N>0`
+against an MTP container) -- this no longer depends on the request's own temperature. Within that
+path, `sampling.temperature <= 0` picks `Model::DecodeStepMtpGreedy` (byte-identical to the
+pre-S3 behavior: accept iff the draft equals the target's argmax) and `temperature > 0` picks
+`Model::DecodeStepMtpSampled` (sample-and-match rejection sampling against the request's own
+distribution, [sampling.md](sampling.md) section 9). Every request still uses one seeded
+`std::mt19937_64`, unchanged either way. See the "SUPERSEDED (Milestone 6 stage S3)" note below for
+the full routing description shared with DFlash2 and plain decode.
+
+Before stage S3, acceptance meant "the draft equals the target's argmax", so there was nothing for
+a sampling request to accept, and the gate above was `... AND sampling.temperature <= 0`, with every
+other request falling back to plain decode. That is what stage S3 removed, once
+`Model::DecodeStepMtpSampled` / `DecodeStepDflashSampled` (added in stage S2) made rejection
+sampling against a sampling target possible, provably without changing a single emitted token
+([sampling.md](sampling.md) section 9) -- measured 2.3-6.4 tokens per round on real requests.
 
 **Streaming**: every token an MTP round actually confirms is pushed to the client as soon as it is
 committed -- the round's own per-candidate loop calls the same stop-string-aware
@@ -600,6 +608,61 @@ filled with junk), `tests/model/test_dflash_draft.cpp` Part 5 (a gapped ring dra
 to a ring that only ever saw the post-gap rows) and `tests/model/test_dflash_e2e.cpp`'s
 `CheckInjectionToggleGap` (the full greedy -> injection-off -> greedy-again sequence on the real
 target, whose post-gap tokens must equal an independently loaded non-dflash reference exactly).
+
+**SUPERSEDED (Milestone 6 stage S3): speculation now runs at any temperature, not just greedy.**
+Every "greedy-only gate" statement above (the MTP section's per-request routing, the DFlash2
+section's `use_dflash`/`use_mtp` gate, and the sampled-traffic-pays-nothing section's premise that a
+sampled request never reads a drafted token at all) described `temperature <= 0`-gated routing that
+no longer exists. What is true now, in both `Engine::RunRequest` (`engine.cpp`) and `r4dx-cli`'s
+`RunTurn` (`main.cpp`):
+
+* `use_mtp` is `model_->MtpEnabled()` and `use_dflash` is "a drafter was `Model::Load`'d" -- neither
+  depends on the request's `temperature` any more. A request takes the DFlash2 path when a drafter
+  is loaded, else the MTP path when MTP is enabled, else plain decode -- exactly as before, just
+  without the greedy restriction.
+* Within a speculative path, `temperature <= 0` still takes the exact pre-S3 GREEDY method
+  (`DecodeStepMtpGreedy` / `DecodeStepDflashGreedy`, byte-identical) and `temperature > 0` takes the
+  new SAMPLED method (`DecodeStepMtpSampled` / `DecodeStepDflashSampled`, [sampling.md](sampling.md)
+  section 9's lossless sample-and-match rejection sampling) -- one seeded `std::mt19937_64` per
+  request, exactly one draw per emitted token, unchanged either way.
+* Plain (non-speculative) decode also switched its `temperature > 0` path from a full-vocab
+  `r4dx::kernels::Sample` + `Model::DecodeStep` loop to `Model::DecodeStepSampled` (the device-row-
+  summary fast path, [sampling.md](sampling.md) section 8) -- this milestone's other half of the
+  fix, since a full-vocab CPU pass every token was the other reason sampled traffic was slow. Greedy
+  plain decode is untouched.
+* `Model::SetDflashInjectionEnabled` is no longer toggled per-request on `temperature`: a sampled
+  request now uses the drafter exactly like a greedy one does, so injection is simply on whenever a
+  drafter is loaded (`use_dflash`, now temperature-independent) -- the ring-gap tolerance mechanism
+  this section describes is otherwise unchanged and no longer needed for this reason (a `temperature
+  <= 0`/`> 0` alternation on the same session no longer toggles injection at all), though a
+  `--mtp`/`--dflash` server can still see a cold ring after a restart or the very first request.
+* `r4dx-cli` no longer clears `args.mtp`/`args.dflash` at `--temperature > 0` -- the paragraph above
+  saying it does ("a one-request-per-invocation process can do for free") described the old
+  behavior; both flags now work at any temperature there too, identically to the server.
+* The per-request stderr log line gained three fields: `temperature=`, `stream=yes/no`,
+  `thinking=yes/no` -- so which decode path a request actually took (and whether it streamed) is
+  visible without cross-referencing the request body.
+* **Losslessness is the new gate**, replacing "acceptance is provably correct for a sampling target"
+  as an argument: for a fixed seed, a sampled speculative request emits the SAME token sequence a
+  plain sampled request would, modulo the pre-existing batched-verify numeric mechanism
+  ([sampling.md](sampling.md) section 9.3/11). The AUTHORITATIVE check for this is the ctest
+  exact-verify-row classifier (`tests/model/test_mtp.cpp`'s `CheckSampledRoundsMatchPlain`,
+  `tests/model/test_dflash_e2e.cpp`'s `CheckSampledDflashMatchesPlain`): it captures the real verify
+  row a mismatch used and proves the emitted token is a legitimate canonical sample of it, so it can
+  tell a genuine bookkeeping bug apart from the known numeric mechanism even when nearly every
+  trajectory diverges somewhere. `tools/validate_spec_sampling.ps1` (modeled on
+  `tools/validate_dflash.ps1`) is a real-hardware, black-box SHA/text-diff smoke check on top of
+  that -- useful for a quick real-container sanity pass and for catching a regression outside the
+  ctest matrix, but at this container's high base divergence rate its cross-family control alone has
+  limited power to distinguish "known mechanism" from "new bug" (see its own file comment and
+  section 12.4 of [sampling.md](sampling.md)); it is not a substitute for the ctest classifier. See
+  that script's own file comment and its results below.
+* `tools/server/smoke.ps1` gained a seeded-`temperature=0.7`-request check (against a
+  `-Mtp`/`-Dflash` server): `timings.draft_n > 0`, the same seeded request twice returns identical
+  text, and -- real container only -- its text matches a same-seeded plain sampled `r4dx-cli` run.
+
+See [sampling.md](sampling.md) section 12 for the measured cost/acceptance table and
+`tools/validate_spec_sampling.ps1`'s own results table.
 
 ## CLI flags
 

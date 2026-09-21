@@ -130,6 +130,31 @@ used. `DecodeStepMtpGreedy(token_id, k=0)` -- the documented "degenerates to a s
 DecodeStepGreedy-equivalent result" case -- similarly primes MTP's KV directly (since `Draft()`,
 which normally does this as a side effect of drafting, is skipped when `k==0`).
 
+### Sampled rounds (Milestone 6 stage S2)
+
+Everything above describes GREEDY acceptance ("the draft is confirmed iff it equals the target's
+argmax"), which is why MTP was gated on `temperature <= 0`. `Model::DecodeStepMtpSampled` lifts that
+at the model level: it drafts and verifies identically, then walks the verified window **sampling**
+one token per row -- one uniform draw each, from that row's device summary -- and stops at the first
+row whose sampled token is not the draft that follows it.
+
+That is textbook rejection sampling against a deterministic proposal, so it is lossless: a greedy
+drafter proposes a point mass on `x`, the accept rule `min(1, p(x)/q(x))` degenerates to "accept
+with probability `p(x)`", and drawing `y ~ p` once and accepting iff `y == x` is exactly that rule.
+Because exactly one draw is consumed per *emitted* token, the stronger property holds too -- for a
+fixed seed the round emits the same tokens plain sampled decode would, token for token.
+
+Greedy and sampled rounds share ONE implementation of the verify + acceptance walk and ONE commit
+(`Model::VerifyAndResolveRound` and `CommitVerifiedWindow`), so they cannot drift apart; the greedy
+path's own behaviour is unchanged, which `tests/model/test_mtp.cpp`'s pre-existing checks still
+assert byte for byte. Full details, the one accepted divergence class and its adjudication, and the
+measured numbers: [sampling.md](sampling.md) sections 9 and 11.
+
+**Milestone 6 stage S3**: `--mtp N` is no longer gated on `temperature <= 0` at the `src/server`/
+`src/cli` level either -- `Engine::RunRequest`/`RunTurn` route a `temperature > 0` request through
+`DecodeStepMtpSampled` above instead of falling through to plain decode. See
+[server.md](server.md)'s stage S3 correction and [sampling.md](sampling.md) section 12.
+
 ## Container
 
 `D:\models\r4dx\qwen38-27b.r4dx` (the real 64-layer container used throughout `docs/perf.md`)
@@ -815,12 +840,13 @@ DFlash2 wholesale if the reduced-vocab head already captures the win" instructio
   of a round boundary, asserts `PrefixState::Extend()` correctly refuses the resulting (intentionally
   desynced) fast-path extension, and verifies the `Reset()`+full-reprefill recovery path's turn-2
   continuation is byte-identical to an independently-loaded sequential reference.
-- **Only greedy acceptance is implemented** (task's own stated scope: "typical/temperature
-  acceptance later"). `Model::DecodeStepMtpGreedy`/`VerifyWindow` are greedy-only; a caller wanting
-  temperature/top-k/top-p sampling with MTP would need a probabilistic acceptance rule (e.g.
-  speculative sampling's own accept/reject-and-resample test) this pass does not provide --
-  `src/cli/main.cpp` now explicitly warns and forces `mtp_draft_k=0` when `--temperature > 0`
-  (review finding, 2026-09-19 -- previously silent).
+- ~~**Only greedy acceptance is implemented**~~ **RESOLVED (Milestone 6 stages S2-S3)**:
+  `Model::DecodeStepMtpSampled` implements exactly the probabilistic accept/reject-and-resample rule
+  this bullet asked for (rejection sampling against a deterministic proposal, see "Sampled rounds"
+  above and [sampling.md](sampling.md) section 9), and stage S3 wired it into both `src/cli/main.cpp`
+  and `src/server/engine.cpp` -- `--mtp K` with `--temperature > 0` now runs the sampled path instead
+  of warning and disabling MTP for the run (the 2026-09-19 warn-and-force-`mtp_draft_k=0` behavior
+  this bullet used to describe is gone).
 - `tools/profile/tune_gemm.py`'s GEMM tuning table (docs/perf.md) was not re-swept for MTP's verify-
   window M values or `PrimeKv`'s own batched-priming M values (the M-band rounding in `PickTuning`
   already covers M=1..64, so every shape this revision's `PrimeKv`/`Draft()` use picks a legal, if
@@ -850,9 +876,18 @@ DFlash2 wholesale if the reduced-vocab head already captures the win" instructio
 - `Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) -> std::vector<int32_t>`: drafts up to
   `k` tokens, verifies, commits, returns 1..k+1 new tokens. Also keeps MTP's own KV cache in
   lockstep (directly when `k==0`, via `Draft()`'s own step 0 otherwise).
-- `Model::VerifyWindow(candidates, logits_out=nullptr) -> std::vector<int32_t>` (public): the
-  verify-only primitive, exposed for tests and diagnostics. Does not touch MTP's own KV cache
-  (verification is purely against the backbone).
+- `Model::DecodeStepMtpSampled(token_id, k, SampleParams, rng) -> std::vector<int32_t>`
+  (Milestone 6 stage S2, [sampling.md](sampling.md) section 9): the SAMPLED counterpart. Same
+  drafting, same one-pass verification, same commit tail -- literally the same implementation, with
+  the per-row token coming from a sampler instead of an argmax (see "Sampled rounds" above).
+  `temperature <= 0` routes straight to `DecodeStepMtpGreedy` and consumes no draw.
+- `Model::VerifyWindow(candidates, logits_out=nullptr, summaries_out=nullptr, inv_temperature=1)
+  -> std::vector<int32_t>` (public): the verify-only primitive, exposed for tests and diagnostics.
+  Does not touch MTP's own KV cache (verification is purely against the backbone). `summaries_out`
+  (stage S2) fills each row's DEVICE row summary -- `rows * 516` bytes instead of the
+  `rows * ~993 KB` `logits_out` costs -- which is what a sampled round reads.
+- `Model::ReadVerifyLogitsRow(row, out)` (public, stage S2): one row of the most recent
+  `VerifyWindow`'s logits, for the row-granular fallback and for tests.
 - `r4dx::model::MtpHead::Draft(...)` (`src/model/mtp_head.h`): the draft-only primitive. Takes a
   `base_pos` parameter (the real sequence position of its first draft step) and, this pass, an
   `embed_table_dev` parameter (device-resident embedding table pointer, or `nullptr` to fall back to
@@ -873,8 +908,9 @@ DFlash2 wholesale if the reduced-vocab head already captures the win" instructio
 - CLI: `r4dx-cli --mtp K` (0 default/disabled). `--mtp-head-layout {bf16,layout}` (default
   `layout` -- see "MTP head layout" above). `--stats` additionally prints
   `[stats] mtp: draft_k=... rounds=... drafted=... accepted=... (X% acceptance, Y tok/round avg)`.
-  `--mtp K` with `--temperature > 0` now warns on stderr and forces `mtp_draft_k=0` for that run
-  (MTP is greedy-only).
+  `--mtp K` now works at any `--temperature` (Milestone 6 stage S3): `--temperature <= 0` takes
+  `DecodeStepMtpGreedy`, `--temperature > 0` takes `DecodeStepMtpSampled` -- the older
+  warn-and-force-`mtp_draft_k=0` behavior for `--temperature > 0` is gone.
 - Server: `r4dx-server --mtp N` and, as of the Milestone 4 follow-up (2026-09-20),
   `--mtp-head-layout {bf16,layout}` (`src/server/server_args.h`, default `layout`) -- same
   semantics/default as the CLI flag, passthrough to `ModelOptions::mtp_head_layout` in

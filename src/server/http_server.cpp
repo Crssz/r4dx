@@ -150,6 +150,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       pending->sampling = req.sampling;
       pending->max_tokens = max_tokens;
       pending->stop = req.stop;
+      pending->stream = req.stream;
 
       if (req.stream) {
         auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created,
@@ -212,6 +213,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       pending->sampling = req.sampling;
       pending->max_tokens = max_tokens;
       pending->stop = req.stop;
+      pending->stream = req.stream;
 
       if (req.stream) {
         auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kCompletion, id, model_id,

@@ -589,6 +589,77 @@ try {
         Check ($status -eq 400) "image content part returns 400 (got $status)"
     }
 
+    # ---- Sampled speculative decode (Milestone 6 stage S3, docs/sampling.md section 9/10): lifting
+    # the temperature<=0 gate means a seeded, TEMPERATURE>0 request on a speculative-enabled server
+    # must (a) still take the speculative path (timings.draft_n > 0), (b) be reproducible (same
+    # seed -> identical text on repeat), and -- real container only, same gating reason as
+    # -ToolRoundTrip/reasoning_content above (the 4-layer test container's MTP head never accepts a
+    # draft at all, task's own container note, so a speculative-vs-plain text comparison there would
+    # be meaningless) -- (c) emit the SAME text a plain (no --mtp/--dflash) sampled r4dx-cli run with
+    # the identical seed/sampling flags does, per docs/sampling.md's losslessness gate
+    # (tools/validate_spec_sampling.ps1 is the exhaustive version of this same check across layouts/
+    # prompts/configs/seeds; this is the one-shot smoke-test confirmation that the SERVER's own
+    # request path -- chat template render, prefix reuse, EmitToken -- doesn't undo it).
+    #
+    # Deliberately the LAST check in this script (checks (a)/(b) above are not, but (c) below stops
+    # the server to run the CLI comparison, per the project's "never run two of your own GPU
+    # processes at once" rule -- restarting the server afterward would cost a second full container
+    # load for no coverage this stage's task asks for, so nothing here may depend on the server
+    # being alive afterward).
+    if ($Mtp -gt 0 -or $Dflash -ne "") {
+        $seededSampledBody = @{
+            messages    = @(@{ role = "user"; content = "Write one short sentence about the ocean." })
+            max_tokens  = 24
+            temperature = 0.7
+            top_k       = 20
+            top_p       = 0.8
+            seed        = 12345
+            stream      = $false
+        } | ConvertTo-Json -Depth 5
+        $seededResp1 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $seededSampledBody -UseBasicParsing
+        $seededChat1 = $seededResp1.Content | ConvertFrom-Json
+        Check ($seededResp1.StatusCode -eq 200) "sampled speculative path: seeded temperature=0.7 request returns 200"
+        Check ($seededChat1.timings.draft_n -gt 0) "sampled speculative path: timings.draft_n > 0"
+        Check ($seededChat1.timings.draft_n_accepted -le $seededChat1.timings.draft_n) `
+            "sampled speculative path: timings.draft_n_accepted <= timings.draft_n"
+
+        $seededResp2 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $seededSampledBody -UseBasicParsing
+        $seededChat2 = $seededResp2.Content | ConvertFrom-Json
+        Check ($seededResp2.StatusCode -eq 200) "sampled speculative path: repeat of the same seeded request returns 200"
+        Check ($seededChat1.choices[0].message.content -eq $seededChat2.choices[0].message.content) `
+            "sampled speculative path: same seed -> identical text on repeat ('$($seededChat1.choices[0].message.content)')"
+
+        if ($Layers -lt 0) {
+            Write-Output "[smoke] stopping server (pid $($proc.Id)) to run a same-seeded CLI comparison (project rule: one GPU process at a time)"
+            if (-not $proc.HasExited) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $proc.WaitForExit(10000) | Out-Null
+            }
+            $cliExe = Join-Path $RepoRoot "build\$Preset\src\cli\r4dx-cli.exe"
+            $cliArgs = @(
+                "--model", $Model, "--layout", $Layout, "--max-tokens", 24, "--max-ctx", $MaxCtx,
+                "--temperature", 0.7, "--top-k", 20, "--top-p", 0.8, "--seed", 12345,
+                "--prompt", "Write one short sentence about the ocean."
+            )
+            $prevPref = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $cliOut = ((& $cliExe @cliArgs 2>$null) -join "`n").Trim()
+            } finally {
+                $ErrorActionPreference = $prevPref
+            }
+            Check ($cliOut -eq $seededChat1.choices[0].message.content.Trim()) `
+                ("sampled speculative path: server text matches a same-seeded plain sampled r4dx-cli " +
+                 "run (server='$($seededChat1.choices[0].message.content.Trim())' cli='$cliOut')")
+        } else {
+            Write-Output ("  [SKIP] sampled speculative path: text matches a same-seeded CLI plain sampled run " +
+                          "(only checked against a real container, -Layers -1 -- the 4-layer test container's " +
+                          "MTP head never accepts a draft at all, task's own container note)")
+        }
+    }
+
 } finally {
     Write-Output "[smoke] stopping server (pid $($proc.Id))"
     if (-not $proc.HasExited) {

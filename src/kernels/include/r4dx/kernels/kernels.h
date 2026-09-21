@@ -256,6 +256,53 @@ void r4dx_rope_neox_bf16(int64_t q, int64_t k, int64_t pos_ids, int rows, int he
 void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows, int64_t vocab,
                       int64_t stream);
 
+// ---- per-row top-K + logsumexp row summary (Milestone 6 S1, docs/sampling.md) ------------------
+// The device-side ROW SUMMARY a sampling decode step needs instead of the full [rows, vocab] fp32
+// logits D2H: per row, the K = R4DX_TOPK_LSE_K largest RAW logits with their ids (the canonical
+// order docs/sampling.md defines: value DESCENDING, ties broken toward the LOWER id -- exactly
+// r4dx_topk16_f32's total order, at K = 64 instead of 16), plus that row's logsumexp of the
+// TEMPERATURE-SCALED logits. D2H per round is rows * (K*8 + 4) bytes (K=64: 512 + 4 = 516 per row)
+// instead of rows * vocab * 4 (~993 KB per row at this model's vocab).
+//
+//   out_vals[r, 0..K-1] / out_ids[r, 0..K-1] : the top-K of logits[r, 0..vocab) under the total
+//     order "(v,i) beats (v',i') iff v > v' || (v == v' && i < i')", sorted descending. RAW logit
+//     values, NOT scaled by inv_temperature -- the host applies its own `logits/temperature` to
+//     them so the summary path and the full-vocab path (r4dx::kernels::SampleCanonical,
+//     sampler.hpp) compute bit-identical softmax numerators over the top-K.
+//   out_lse[r] = log( sum_i exp(logits[r,i] * inv_temperature) ), accumulated stably: the row max
+//     m is taken from the top-1 above, terms are expf((logits[r,i] - m) * inv_temperature) in fp32
+//     and accumulated in DOUBLE, and the result is m*inv_temperature + log(sum). A row whose max
+//     is -inf (every entry -inf) yields -inf, not NaN. Measured |error| vs an fp64 CPU reference
+//     is <= 1e-4 over the inputs tests/kernels/test_topk_lse.cpp covers (see docs/sampling.md).
+//
+// Algorithm (why it is exactly the top-64 and not an approximation): the row is split across up to
+// 64 workgroups, each owning a contiguous slice. A block keeps a per-thread register-resident
+// top-16 and merges the 256 lists in LDS exactly as r4dx_topk16_f32 does, then REPEATS that
+// extraction four times, each round admitting only elements strictly WORSE than the previous
+// round's last emitted (value, id) pair under the same total order -- so round r yields exactly
+// ranks 16r+1 .. 16r+16 of the slice. A second kernel merges the per-slice top-64s the same way
+// (at most 64 of the row's top-64 can lie in one slice, so that slice's own top-64 holds all of
+// them) and combines the per-slice (max, sum-of-exp) pairs into the row's logsumexp. A per-thread
+// top-64 in a single round would instead need 256*64*8 = 128 KiB of LDS for the merge, twice
+// gfx1201's 64 KiB per-workgroup limit. The logsumexp accumulation is fused into each block's
+// round 1 (which re-reads the slice anyway, and by then round 0 has published the slice max), so
+// no extra pass is made for it.
+//
+// This entry point therefore makes TWO device launches and advances the launch counter below by 2.
+// It keeps its partials in a module-scope device scratch buffer (~264 KiB of VRAM), so exactly ONE
+// call may be in flight per process at a time -- the same single-worker-thread assumption
+// r4dx_kernel_launch_counter_get's non-atomic counter already relies on and model.h's own SCOPE
+// comment guarantees. Two concurrent calls (two threads, two streams) would interleave partials.
+//
+// logits: [rows, vocab] fp32 device pointer, rows contiguous (row stride == vocab).
+// out_ids: [rows, K] int32. out_vals: [rows, K] fp32. out_lse: [rows] fp32.
+// Preconditions (throw std::runtime_error, never a silently wrong answer): 1 <= rows <= 8;
+// vocab > K; inv_temperature finite and > 0. A NaN or +inf logit is undefined input, as it is for
+// r4dx_topk16_f32 / r4dx_argmax_f32.
+enum { R4DX_TOPK_LSE_K = 64 };
+void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
+                        int rows, int64_t vocab, float inv_temperature, int64_t stream);
+
 // ---- DFlash2 draft-block attention: non-causal, windowed, GQA ---------------------------------
 // The draft block's own attention (docs/dflash2.md section 4.2 / the "SWA visibility rule" row of
 // section 2's table). For query row t (absolute position q_pos = n_injected + t) the visible key

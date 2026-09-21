@@ -1,4 +1,4 @@
-// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
+﻿// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
 // compiled as one hipcc translation unit (mirrors third_party/CMakeLists.txt's per-unit recipe
 // for r4d_core; see docs/build-windows.md). One row per workgroup for the row-reduction kernels
 // (rmsnorm, quant_act_fp8), following r4d_quant_act_i8.hip's own convention in third_party/libr4d.
@@ -696,6 +696,132 @@ __device__ __forceinline__ bool TopkBetter(float a_v, int32_t a_i, float b_v, in
 
 constexpr int kTopK = 16;
 
+// LDS row pitch of one thread's 16-entry list. The PADDING (17, not 16) is what keeps the merge
+// off a bank-conflict cliff: at pitch 16 the base address of thread t is t*16 dwords, so
+// (t*16) % 32 takes only two values across a 32-lane wave and every LDS access in the merge below
+// serialises ~16 ways. 17 is coprime with the 32 banks, so 32 consecutive lanes hit 32 distinct
+// banks. Measured effect on r4dx_topk_lse_f32 at V=248320: see docs/sampling.md "Cost".
+constexpr int kTopkLdsPitch = kTopK + 1;
+
+// A register-resident sorted-descending top-16 under TopkBetter. Every index below is a
+// compile-time constant once the loops unroll, so this lives in VGPRs. The sentinel
+// (-inf, INT32_MAX) loses to every real entry, including a real -inf (tie broken by the lower id),
+// so a short slice needs no separate count.
+//
+// A plain pair of local arrays (`float bv[16]; int32_t bi[16];`) expresses the same thing but does
+// NOT survive SROA here -- measured at 256 VGPRs and 656 bytes/lane of scratch spill on gfx1201,
+// i.e. every list access going to memory. Wrapping them in a struct with member functions keeps
+// both kernels below at ~55 VGPRs and zero scratch.
+struct TopkList {
+  float v[kTopK];
+  int32_t i[kTopK];
+
+  __device__ __forceinline__ void Reset() {
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) {
+      v[j] = -INFINITY;
+      i[j] = INT32_MAX;
+    }
+  }
+
+  __device__ __forceinline__ void Insert(float val, int32_t idx) {
+    if (!TopkBetter(val, idx, v[kTopK - 1], i[kTopK - 1])) return;
+    v[kTopK - 1] = val;
+    i[kTopK - 1] = idx;
+#pragma unroll
+    for (int s = kTopK - 1; s > 0; --s) {
+      if (TopkBetter(v[s], i[s], v[s - 1], i[s - 1])) {
+        const float tv = v[s];
+        v[s] = v[s - 1];
+        v[s - 1] = tv;
+        const int32_t ti = i[s];
+        i[s] = i[s - 1];
+        i[s - 1] = ti;
+      }
+    }
+  }
+
+  __device__ __forceinline__ void Publish(float* s_v, int32_t* s_i, int tid) const {
+#pragma unroll
+    for (int j = 0; j < kTopK; ++j) {
+      s_v[tid * kTopkLdsPitch + j] = v[j];
+      s_i[tid * kTopkLdsPitch + j] = i[j];
+    }
+  }
+};
+
+// Pairwise tree merge of `kThreads` sorted-descending 16-lists held in LDS (thread t's list at
+// s_v/s_i [t*kTopkLdsPitch .. +16)) down to s_v/s_i[0..16), under TopkBetter. Shared by
+// Topk16Kernel and the summary kernels below -- the identical eight-round reduction all of them
+// need, kept in one place so they cannot drift.
+//
+// In a round, only threads with tid < stride write, and each such thread writes ONLY its own slot
+// after reading its own slot and slot tid+stride (which no active thread writes this round) into
+// registers -- so one barrier per round, at the end, is sufficient. Every thread of the block must
+// reach this function (it contains __syncthreads()).
+// One stage of a descending bitonic merge network over a TopkList, partner distance S. S is a
+// TEMPLATE parameter, not a loop variable: with `for (int s = K/2; s >= 1; s >>= 1)` the index
+// `c.v[j + s]` is only a compile-time constant if the compiler unrolls the shift loop, and when it
+// does not it lowers the dynamic register index to an indexed-move/select waterfall instead --
+// which does not show up as scratch in the resource report but costs a large multiple of the
+// straight-line code. Spelling the four stages out removes the question.
+template <int S>
+__device__ __forceinline__ void BitonicStage(TopkList& c) {
+#pragma unroll
+  for (int j = 0; j < kTopK; ++j) {
+    if ((j & S) != 0) continue;
+    if (!TopkBetter(c.v[j], c.i[j], c.v[j + S], c.i[j + S])) {
+      const float tv = c.v[j];
+      c.v[j] = c.v[j + S];
+      c.v[j + S] = tv;
+      const int32_t ti = c.i[j];
+      c.i[j] = c.i[j + S];
+      c.i[j + S] = ti;
+    }
+  }
+}
+
+// The pairwise step is Batcher's halving step followed by a bitonic merge network, both entirely
+// in registers with compile-time-constant indices, rather than the obvious two-pointer merge.
+// A two-pointer merge has to read LDS at a DATA-DEPENDENT offset (the next read address depends on
+// the previous comparison), which is a serial chain of 16 LDS loads at ~30 cycles each per thread,
+// with only the block's few active waves left to hide it by the later tree rounds. Measured on
+// gfx1201, that chain was the dominant cost of the whole summary kernel. This version issues its
+// 32 LDS loads up front as independent, fully pipelined accesses and then does fixed-index register
+// work.
+//
+// Batcher's halving step: for two DESCENDING sorted K-lists A and B, the K largest of A u B are
+// exactly { better(A[j], B[K-1-j]) : j }, and that sequence is bitonic -- so the four-stage
+// bitonic merge network below sorts it descending. `better` here is TopkBetter, a total order, and
+// the two lists' ids are disjoint (they come from disjoint thread slices), so no tie can make the
+// step ambiguous; the only repeated element possible is the (-inf, INT32_MAX) sentinel, which
+// loses to every real entry and is therefore never selected over one.
+__device__ __forceinline__ void TopkMergeLds(float* s_v, int32_t* s_i, int tid) {
+  for (int stride = kThreads / 2; stride >= 1; stride >>= 1) {
+    if (tid < stride) {
+      const int base_a = tid * kTopkLdsPitch;
+      const int base_b = (tid + stride) * kTopkLdsPitch;
+      TopkList c;
+#pragma unroll
+      for (int j = 0; j < kTopK; ++j) {
+        const float av = s_v[base_a + j];
+        const int32_t ai = s_i[base_a + j];
+        const float bv = s_v[base_b + kTopK - 1 - j];
+        const int32_t bi = s_i[base_b + kTopK - 1 - j];
+        const bool take_a = TopkBetter(av, ai, bv, bi);
+        c.v[j] = take_a ? av : bv;
+        c.i[j] = take_a ? ai : bi;
+      }
+      BitonicStage<8>(c);
+      BitonicStage<4>(c);
+      BitonicStage<2>(c);
+      BitonicStage<1>(c);
+      c.Publish(s_v, s_i, tid);
+    }
+    __syncthreads();
+  }
+}
+
 __global__ __launch_bounds__(kThreads) void Topk16Kernel(const float* __restrict__ logits,
                                                             int32_t* __restrict__ out_ids,
                                                             float* __restrict__ out_vals,
@@ -704,90 +830,229 @@ __global__ __launch_bounds__(kThreads) void Topk16Kernel(const float* __restrict
   const float* __restrict__ lr = logits + row * vocab;
   const int tid = threadIdx.x;
 
-  // Per-thread sorted-descending top-16, held in registers: every index below is a compile-time
-  // constant (the shift loop is fully unrolled), so this does not spill to scratch. The sentinel
-  // (-inf, INT32_MAX) loses to every real entry under TopkBetter, including a real -inf (tie
-  // broken by the lower id), so short slices need no separate count.
-  float bv[kTopK];
-  int32_t bi[kTopK];
-#pragma unroll
-  for (int j = 0; j < kTopK; ++j) {
-    bv[j] = -INFINITY;
-    bi[j] = INT32_MAX;
-  }
+  TopkList list;
+  list.Reset();
   for (int64_t i = tid; i < vocab; i += kThreads) {
-    const float v = lr[i];
-    const int32_t idx = static_cast<int32_t>(i);
-    if (!TopkBetter(v, idx, bv[kTopK - 1], bi[kTopK - 1])) continue;
-    bv[kTopK - 1] = v;
-    bi[kTopK - 1] = idx;
-#pragma unroll
-    for (int s = kTopK - 1; s > 0; --s) {
-      if (TopkBetter(bv[s], bi[s], bv[s - 1], bi[s - 1])) {
-        const float tv = bv[s];
-        bv[s] = bv[s - 1];
-        bv[s - 1] = tv;
-        const int32_t ti = bi[s];
-        bi[s] = bi[s - 1];
-        bi[s - 1] = ti;
-      }
-    }
+    list.Insert(lr[i], static_cast<int32_t>(i));
   }
 
-  __shared__ float s_v[kThreads * kTopK];
-  __shared__ int32_t s_i[kThreads * kTopK];
-#pragma unroll
-  for (int j = 0; j < kTopK; ++j) {
-    s_v[tid * kTopK + j] = bv[j];
-    s_i[tid * kTopK + j] = bi[j];
-  }
+  __shared__ float s_v[kThreads * kTopkLdsPitch];
+  __shared__ int32_t s_i[kThreads * kTopkLdsPitch];
+  list.Publish(s_v, s_i, tid);
   __syncthreads();
 
-  // Pairwise tree merge of the 256 sorted-16 lists (8 rounds). In a round, only threads with
-  // tid < stride write, and each such thread writes ONLY its own slot after reading its own slot
-  // and slot tid+stride (which no active thread writes this round) into registers -- so one
-  // barrier per round, at the end, is sufficient.
-  for (int stride = kThreads / 2; stride >= 1; stride >>= 1) {
-    if (tid < stride) {
-      float mv[kTopK];
-      int32_t mi[kTopK];
-      int pa = 0, pb = 0;
-      const int base_a = tid * kTopK;
-      const int base_b = (tid + stride) * kTopK;
-#pragma unroll
-      for (int j = 0; j < kTopK; ++j) {
-        // pa/pb can each reach kTopK on the last step; clamp the READ (the guard below is what
-        // decides) so a clamped read never leaves this block's LDS allocation.
-        const int ra = pa < kTopK ? pa : kTopK - 1;
-        const int rb = pb < kTopK ? pb : kTopK - 1;
-        const float av = s_v[base_a + ra];
-        const int32_t ai = s_i[base_a + ra];
-        const float bvv = s_v[base_b + rb];
-        const int32_t bii = s_i[base_b + rb];
-        if (pa < kTopK && (pb >= kTopK || TopkBetter(av, ai, bvv, bii))) {
-          mv[j] = av;
-          mi[j] = ai;
-          ++pa;
-        } else {
-          mv[j] = bvv;
-          mi[j] = bii;
-          ++pb;
-        }
-      }
-#pragma unroll
-      for (int j = 0; j < kTopK; ++j) {
-        s_v[base_a + j] = mv[j];
-        s_i[base_a + j] = mi[j];
-      }
-    }
-    __syncthreads();
-  }
+  // Pairwise tree merge of the 256 sorted-16 lists (8 rounds).
+  TopkMergeLds(s_v, s_i, tid);
 
   if (tid < kTopK) {
     out_vals[row * kTopK + tid] = s_v[tid];
     out_ids[row * kTopK + tid] = s_i[tid];
   }
 }
+
+// ---- per-row top-K + logsumexp row summary (Milestone 6 S1, docs/sampling.md) ------------------
+// See kernels.h's r4dx_topk_lse_f32 doc comment for the contract. Two launches, both below:
+//
+//   TopkLsePartialKernel  grid (chunks, rows) -- each block owns a CONTIGUOUS slice of one row and
+//                         writes that slice's own top-64 plus (slice max, sum of exp) to a
+//                         module-scope device scratch buffer.
+//   TopkLseMergeKernel    grid (rows)         -- merges the chunks*64 partial candidates into the
+//                         row's top-64 and combines the per-slice (max, sum) pairs into the lse.
+//
+// Why chunked and not one workgroup per row: measured on the R9700 at V=248320, a one-block-per-row
+// pass over the row costs ~0.19 ms (that is r4dx_argmax_f32's own measured time, and it is neither
+// bandwidth- nor ALU-bound -- a single workgroup is 8 waves on ONE CU, far too few to cover memory
+// latency, so it reaches ~5 GB/s against a 645 GB/s part). Four such passes were measured at 1.11
+// ms/row. Splitting the row across 64 workgroups puts 64 CUs on it and each block's slice then
+// stays resident in its own L0/L1 across the four extraction rounds. See docs/sampling.md "Cost".
+//
+// Why four extraction rounds per block rather than a per-thread top-64 in one: a per-thread top-64
+// merge needs 256*64*8 = 128 KiB of LDS, twice gfx1201's 64 KiB per-workgroup limit. Four rounds of
+// the per-thread top-16 machinery above keep the merge buffer at 256*16*8 = 32 KiB, and because the
+// admission test of round r is "strictly worse than the last (value, id) round r-1 emitted" under a
+// TOTAL order, round r yields exactly ranks 16r+1 .. 16r+16 -- an exact top-64, not an
+// approximation.
+constexpr int kSummaryK = R4DX_TOPK_LSE_K;                     // 64
+constexpr int kSummaryRounds = kSummaryK / kTopK;              // 4
+constexpr int kSummaryMaxRows = 8;                             // kernels.h's `rows <= 8`
+constexpr int kSummaryMaxChunks = 64;
+static_assert(kSummaryK % kTopK == 0, "K must be a whole number of extraction rounds");
+static_assert(kSummaryRounds >= 2, "the logsumexp pass is fused into round 1");
+
+// Module-scope device scratch (~264 KiB of VRAM, allocated once when the module loads) rather than
+// a caller-supplied pointer: it keeps r4dx_topk_lse_f32's signature the same shape as every other
+// entry point in kernels.h. The cost is that ONE call may be in flight per process at a time --
+// the same single-worker-thread assumption g_launch_count above already documents and model.h's
+// own SCOPE comment guarantees. Two concurrent calls (two streams, two threads) would interleave
+// their partials; kernels.h states this precondition.
+__device__ int32_t g_summary_part_ids[kSummaryMaxRows * kSummaryMaxChunks * kSummaryK];
+__device__ float g_summary_part_vals[kSummaryMaxRows * kSummaryMaxChunks * kSummaryK];
+__device__ float g_summary_part_max[kSummaryMaxRows * kSummaryMaxChunks];
+__device__ double g_summary_part_sum[kSummaryMaxRows * kSummaryMaxChunks];
+
+__global__ __launch_bounds__(kThreads) void TopkLsePartialKernel(const float* __restrict__ logits,
+                                                                      int64_t vocab,
+                                                                      float inv_temperature,
+                                                                      int chunks) {
+  const int chunk = blockIdx.x;
+  const int row = blockIdx.y;
+  const int64_t per = (vocab + chunks - 1) / chunks;
+  const int64_t begin = per * chunk;
+  const int64_t end = (begin + per < vocab) ? begin + per : vocab;
+  const float* __restrict__ lr = logits + static_cast<int64_t>(row) * vocab;
+  const int tid = threadIdx.x;
+
+  __shared__ float s_v[kThreads * kTopkLdsPitch];    // 17 KiB (padded pitch, see kTopkLdsPitch)
+  __shared__ int32_t s_i[kThreads * kTopkLdsPitch];  // 17 KiB
+  __shared__ float acc_v[kSummaryK];         // this slice's running top-64, filled 16 per round
+  __shared__ int32_t acc_i[kSummaryK];
+  __shared__ double s_sum[kThreads];         // 2 KiB, the fused logsumexp reduction
+  double lse_part = 0.0;
+
+  for (int round = 0; round < kSummaryRounds; ++round) {
+    // Admission threshold: round r considers only entries strictly WORSE (under TopkBetter) than
+    // the last entry round r-1 emitted, which is exactly "every entry of this slice not already
+    // taken".
+    float thr_v = 0.0f;
+    int32_t thr_i = 0;
+    if (round > 0) {
+      thr_v = acc_v[round * kTopK - 1];
+      thr_i = acc_i[round * kTopK - 1];
+    }
+    // This slice's max, published by round 0's first output slot, used by round 1's fused lse
+    // accumulation (round 1 re-reads the slice anyway, so the logsumexp costs no extra pass).
+    const float slice_max = round == 1 ? acc_v[0] : 0.0f;
+    const bool accumulate_lse = round == 1 && slice_max > -INFINITY;
+
+    TopkList list;
+    list.Reset();
+    for (int64_t i = begin + tid; i < end; i += kThreads) {
+      const float v = lr[i];
+      const int32_t idx = static_cast<int32_t>(i);
+      // expf((v - slice_max) * inv_temperature) in fp32, summed in DOUBLE. A -inf entry against a
+      // finite slice max gives expf(-inf) == 0, the right contribution; an all--inf slice is
+      // handled by accumulate_lse being false (its partial sum stays 0 and its max stays -inf, so
+      // the merge kernel drops it).
+      if (accumulate_lse) {
+        lse_part += static_cast<double>(expf((v - slice_max) * inv_temperature));
+      }
+      if (round > 0 && !TopkBetter(thr_v, thr_i, v, idx)) continue;  // already emitted
+      list.Insert(v, idx);
+    }
+
+    list.Publish(s_v, s_i, tid);
+    __syncthreads();
+    TopkMergeLds(s_v, s_i, tid);
+    if (tid < kTopK) {
+      acc_v[round * kTopK + tid] = s_v[tid];
+      acc_i[round * kTopK + tid] = s_i[tid];
+    }
+    __syncthreads();  // acc_* visible to the next round's threshold/slice_max reads
+  }
+
+  // Deterministic tree reduction of the per-thread double partial sums (fixed pairing order, so
+  // the result is reproducible run to run regardless of scheduling).
+  s_sum[tid] = lse_part;
+  __syncthreads();
+  for (int stride = kThreads / 2; stride >= 1; stride >>= 1) {
+    if (tid < stride) s_sum[tid] += s_sum[tid + stride];
+    __syncthreads();
+  }
+
+  const int64_t slot = (static_cast<int64_t>(row) * kSummaryMaxChunks + chunk);
+  if (tid < kSummaryK) {
+    g_summary_part_vals[slot * kSummaryK + tid] = acc_v[tid];
+    g_summary_part_ids[slot * kSummaryK + tid] = acc_i[tid];
+  }
+  if (tid == 0) {
+    g_summary_part_max[slot] = acc_v[0];
+    g_summary_part_sum[slot] = s_sum[0];
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restrict__ out_ids,
+                                                                    float* __restrict__ out_vals,
+                                                                    float* __restrict__ out_lse,
+                                                                    int chunks,
+                                                                    float inv_temperature) {
+  const int row = blockIdx.x;
+  const int n = chunks * kSummaryK;
+  const int64_t base = static_cast<int64_t>(row) * kSummaryMaxChunks * kSummaryK;
+  const int32_t* __restrict__ pids = g_summary_part_ids + base;
+  const float* __restrict__ pvals = g_summary_part_vals + base;
+  const int tid = threadIdx.x;
+
+  __shared__ float s_v[kThreads * kTopkLdsPitch];
+  __shared__ int32_t s_i[kThreads * kTopkLdsPitch];
+  __shared__ float acc_v[kSummaryK];
+  __shared__ int32_t acc_i[kSummaryK];
+
+  // The row's global top-64 is contained in the union of the per-slice top-64s: at most 64 of the
+  // row's top-64 can lie in any one slice, and that slice's own top-64 holds all of them. So the
+  // same four-round extraction over the chunks*64 partial candidates yields the exact answer --
+  // this time over EXPLICIT (value, id) pairs rather than a value array indexed by position.
+  for (int round = 0; round < kSummaryRounds; ++round) {
+    float thr_v = 0.0f;
+    int32_t thr_i = 0;
+    if (round > 0) {
+      thr_v = acc_v[round * kTopK - 1];
+      thr_i = acc_i[round * kTopK - 1];
+    }
+    TopkList list;
+    list.Reset();
+    for (int j = tid; j < n; j += kThreads) {
+      const float v = pvals[j];
+      const int32_t idx = pids[j];
+      if (round > 0 && !TopkBetter(thr_v, thr_i, v, idx)) continue;
+      list.Insert(v, idx);
+    }
+    list.Publish(s_v, s_i, tid);
+    __syncthreads();
+    TopkMergeLds(s_v, s_i, tid);
+    if (tid < kTopK) {
+      acc_v[round * kTopK + tid] = s_v[tid];
+      acc_i[round * kTopK + tid] = s_i[tid];
+    }
+    __syncthreads();
+  }
+
+  if (tid < kSummaryK) {
+    out_vals[static_cast<int64_t>(row) * kSummaryK + tid] = acc_v[tid];
+    out_ids[static_cast<int64_t>(row) * kSummaryK + tid] = acc_i[tid];
+  }
+  if (tid == 0) {
+    const float row_max = acc_v[0];
+    if (!(row_max > -INFINITY)) {
+      out_lse[row] = -INFINITY;  // every entry -inf: log(0) with no NaN in between
+      return;
+    }
+    // Each slice summed exp((v - slice_max)*invT); rescale each by exp((slice_max - row_max)*invT)
+    // and add, in a FIXED chunk order so the result is reproducible. A slice whose max is -inf
+    // contributed nothing and is skipped outright (its rescale factor would be exp(-inf) == 0
+    // anyway, but skipping keeps 0 * 0 out of the arithmetic).
+    //
+    // The rescale uses expf, not the double exp: gfx1201 has no hardware fp64 transcendental, so
+    // each double exp() compiles to a software routine running at the fp64 ALU rate, and 64 of
+    // them in this single lane MEASURED at ~0.27 ms -- most of the whole kernel (see
+    // docs/sampling.md "Cost"). expf costs ~1e-7 relative on each rescale factor, four orders of
+    // magnitude inside the 1e-4 absolute lse tolerance the contract states, while the ACCUMULATION
+    // stays in double where it matters.
+    double total = 0.0;
+    for (int c = 0; c < chunks; ++c) {
+      const float cm = g_summary_part_max[static_cast<int64_t>(row) * kSummaryMaxChunks + c];
+      if (!(cm > -INFINITY)) continue;
+      total += g_summary_part_sum[static_cast<int64_t>(row) * kSummaryMaxChunks + c] *
+               static_cast<double>(expf((cm - row_max) * inv_temperature));
+    }
+    // logf for the same fp64-software-routine reason as the expf above. `total` is bounded: the
+    // global max's own term is exactly exp(0) == 1 and every term is <= 1, so total is in
+    // [1, vocab] -- fp32 represents it to ~1e-7 relative, i.e. ~1e-7 ABSOLUTE on its log.
+    out_lse[row] = static_cast<float>(static_cast<double>(row_max) *
+                                          static_cast<double>(inv_temperature) +
+                                      static_cast<double>(logf(static_cast<float>(total))));
+  }
+}
+
 
 // ---- DFlash2 draft-block attention: non-causal, windowed, GQA ---------------------------------
 // One workgroup per (block row t, kv-head), 128 threads, serving that kv-head's up to 4 q-heads
@@ -1102,6 +1367,41 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
   hipLaunchKernelGGL(Topk16Kernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const float*)logits, (int32_t*)out_ids,
                      (float*)out_vals, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
+                        int rows, int64_t vocab, float inv_temperature, int64_t stream) {
+  if (rows <= 0) return;
+  // Hard preconditions (kernels.h): a violated one must throw, never produce a wrong summary that
+  // the host sampler would then treat as authoritative.
+  if (rows > 8) {
+    throw std::runtime_error("r4dx_topk_lse_f32: rows must be <= 8, got " + std::to_string(rows));
+  }
+  if (vocab <= kSummaryK) {
+    throw std::runtime_error("r4dx_topk_lse_f32: vocab must be > " + std::to_string(kSummaryK) +
+                              ", got " + std::to_string(vocab));
+  }
+  if (!(inv_temperature > 0.0f) || !(inv_temperature < INFINITY)) {
+    throw std::runtime_error("r4dx_topk_lse_f32: inv_temperature must be finite and > 0, got " +
+                              std::to_string(inv_temperature));
+  }
+  // Slice the row across up to kSummaryMaxChunks workgroups, never finer than ~1024 entries per
+  // slice (so a slice always holds at least the K entries its own top-K output claims, and so the
+  // per-block fixed costs -- four extraction rounds plus 8 LDS merge barriers each -- stay small
+  // against the slice's own memory traffic).
+  int chunks = static_cast<int>(vocab / 1024);
+  if (chunks < 1) chunks = 1;
+  if (chunks > kSummaryMaxChunks) chunks = kSummaryMaxChunks;
+  g_launch_count += 2;  // TWO r4dx-owned launches per call; see kernels.h's counter contract
+  hipLaunchKernelGGL(TopkLsePartialKernel,
+                     dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, (hipStream_t)stream, (const float*)logits, vocab,
+                     inv_temperature, chunks);
+  R4DX_HIP_CHECK(hipGetLastError());
+  hipLaunchKernelGGL(TopkLseMergeKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (int32_t*)out_ids, (float*)out_vals, (float*)out_lse,
+                     chunks, inv_temperature);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

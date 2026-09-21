@@ -66,6 +66,20 @@ std::vector<int32_t> MakeSecondTurnUserTokens(int n) {
   return ids;
 }
 
+// Two more independent token runs, for CheckInjectionToggleGap's "sampled turn" filler and its
+// re-enabled tail (distinct strides so no two of the four generators produce the same sequence).
+std::vector<int32_t> MakeFillerTokens(int n) {
+  std::vector<int32_t> ids(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) ids[static_cast<size_t>(i)] = 700 + (i * 113) % 5000;
+  return ids;
+}
+
+std::vector<int32_t> MakeResumeTailTokens(int n) {
+  std::vector<int32_t> ids(static_cast<size_t>(n));
+  for (int i = 0; i < n; ++i) ids[static_cast<size_t>(i)] = 1500 + (i * 29) % 5000;
+  return ids;
+}
+
 bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
                                      const std::vector<int32_t>& prompt1,
                                      const std::vector<int32_t>& prompt2_user) {
@@ -75,24 +89,12 @@ bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
   auto is_eos = [](int32_t) { return false; };
 
   // Pass 1 (dry run): replay the natural (unbudgeted) round trajectory to find a round that itself
-  // returns >=2 tokens, so stopping display strictly before ITS OWN committed prefix ends is a
-  // genuine mid-round stop (not merely landing on the round's own boundary, where displayed would
-  // equal committed exactly -- see the derivation below).
-  //
-  // FOUND while writing this test (out of this test's own scope to fix -- flagged in this stage's
-  // open_issues, not touched here): tests/model/test_mtp.cpp's own CheckChatMultiTurnMidRoundStop
-  // uses `cumulative + round.size() - 1`, i.e. max_tokens_remaining == round.size()-1 for the
-  // target round. ProcessMtpRound's `committed` is UNCONDITIONALLY round[0..size-2] (round.size()-1
-  // elements), and with max_tokens_remaining == round.size()-1, `displayed` pushes exactly
-  // round[0..size-2] too (the loop's own bound check fires exactly at index round.size()-1, one
-  // past the last pushed element) -- i.e. displayed == committed EXACTLY, every time, for ANY
-  // round.size() >= 2. `stopped_mid_round` (`committed.size() > displayed.size()`) can therefore
-  // MATHEMATICALLY NEVER be true with that formula; the "-1" needs to be "-2" (max_tokens_remaining
-  // == round.size()-2, i.e. one token stingier) to leave a genuine 1-token gap. This was not caught
-  // before because the 4-layer container that test happens to run against apparently never returns
-  // a round with size>=2 within its own first 8 rounds, so it always takes the (correctly handled,
-  // non-failing) "cannot force a mid-round stop; skipping" early-return instead of ever reaching the
-  // broken arithmetic. This test uses the corrected "-2" formula.
+  // returns >=3 tokens, and budget display to stop 2 tokens short of ITS OWN end. ProcessMtpRound's
+  // `committed` is UNCONDITIONALLY round[0..size-2] (size-1 tokens); a budget of size-1 inside the
+  // round makes `displayed` exactly those same tokens (no gap), so the budget must be size-2 to
+  // leave one committed-but-undisplayed token. Same construction as tests/model/test_mtp.cpp's
+  // CheckChatMultiTurnMidRoundStop (which originally used the gapless "-1" and never noticed,
+  // because its 4-layer container never accepts an MTP draft -- it now uses an oracle drafter).
   int64_t stop_after = -1;
   {
     Model probe = Model::Load(dflash_opts);
@@ -101,18 +103,18 @@ bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
     for (int round_idx = 0; round_idx < 8 && stop_after < 0; ++round_idx) {
       std::vector<int32_t> round =
           probe.DecodeStepDflashGreedy(next, kDflashK, /*p_min=*/0.0f, /*n_min=*/0);
-      // >=1 required: stop_after==0 would make the real run's own `while (remaining > 0)` loop
-      // below never execute a single round at all, which is a degenerate non-test, not a genuine
-      // mid-round stop.
-      const int64_t candidate = cumulative + static_cast<int64_t>(round.size()) - 2;
-      if (round.size() >= 2 && candidate >= 1) stop_after = candidate;
+      // >=3 required, not >=2: a 2-token round's budget inside the round is size-2 == 0, so
+      // stop_after == cumulative and the real run's `while (remaining > 0)` loop below exits on the
+      // PREVIOUS round's boundary without ever running this round (no gap, and the check then
+      // reports a bogus "did not land mid-round" failure). size>=3 also makes stop_after >= 1.
+      if (round.size() >= 3) stop_after = cumulative + static_cast<int64_t>(round.size()) - 2;
       cumulative += static_cast<int64_t>(round.size());
       next = round.back();
     }
   }
   if (stop_after < 0) {
     std::fprintf(stderr,
-                 "[dflash] CheckChatMultiTurnMidRoundStop: no round emitted >=2 tokens in 8 "
+                 "[dflash] CheckChatMultiTurnMidRoundStop: no round emitted >=3 tokens in 8 "
                  "rounds on this container/prompt -- cannot force a mid-round stop; skipping "
                  "(not a product failure)\n");
     return true;
@@ -295,6 +297,166 @@ bool CheckResetThenDflashContinuation(const ModelOptions& base_opts,
   return true;
 }
 
+// The per-request drafter-injection toggle and the cold-ring gap it creates (docs/server.md's
+// "Sampled traffic pays nothing", docs/dflash2.md section 5, model.h's SetDflashInjectionEnabled).
+// This is the server's real request shape, on one Model, in order:
+//   turn 1  greedy: real DFlash2 rounds with injection ON (the default) -- the ring grows in
+//           lockstep with pos_, ValidFrom() stays 0;
+//   turn 2  sampled: injection OFF -- a few dozen more prefilled tokens plus several PLAIN decode
+//           steps, none of which capture or inject, so the drafter's frontier falls behind pos_ by
+//           the whole turn (that lag IS the removed cost);
+//   turn 3  greedy again: injection back ON, one more prefilled tail, then real DFlash2 rounds --
+//           the resumed injection lands at start_pos > InjectedCount(), i.e. the cold-ring gap.
+// The hard assertions: nothing throws; DecodeStepDflashGreedy DOES throw while injection is off
+// (drafting at a stale frontier would silently produce a block at the wrong absolute positions);
+// ValidFrom() is exactly the resume position; and turn 3's decoded tokens are EXACTLY what an
+// independently loaded, no-dflash Model produces from the same full token history under plain
+// greedy decode -- the same bit-exact standard every other check in this file uses. A cold ring
+// may cost ACCEPTANCE (turn 3's drafts start with no injected context at all before the resume
+// point), but it must never change a single emitted token, because VerifyWindow still runs the
+// real model over every candidate.
+bool CheckInjectionToggleGap(const ModelOptions& base_opts, const std::vector<int32_t>& prompt1) {
+  ModelOptions dflash_opts = base_opts;
+  dflash_opts.dflash_container = kDflashContainerPath;
+  dflash_opts.dflash_draft_k = kDflashK;
+  constexpr int kWarmRounds = 3;
+  constexpr int kDisabledPrefill = 40;
+  constexpr int kDisabledSteps = 5;
+  constexpr int kResumeTail = 8;
+  constexpr int kPostGapRounds = 4;
+
+  // Every token the target's KV/GDN state actually holds, in order -- what the reference Model
+  // below is fed. A round commits its anchor plus all but its last element (mtp_round.hpp's own
+  // contract, and Model::DecodeStepDflashGreedy's `num_committed`); the last element is the next
+  // round's anchor and is still uncommitted when the loop ends.
+  std::vector<int32_t> history = prompt1;
+  Model m = Model::Load(dflash_opts);
+  int32_t next = Argmax(m.Prefill(prompt1));
+
+  for (int i = 0; i < kWarmRounds; ++i) {
+    std::vector<int32_t> round = m.DecodeStepDflashGreedy(next, kDflashK, 0.0f, 0);
+    history.push_back(next);
+    history.insert(history.end(), round.begin(), round.end() - 1);
+    next = round.back();
+  }
+  if (m.DflashValidFrom() != 0 || m.DflashInjectedCount() != m.PositionCount()) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: after append-only injection ValidFrom()=%lld "
+                 "InjectedCount()=%lld PositionCount()=%lld (expected 0 / equal)\n",
+                 static_cast<long long>(m.DflashValidFrom()),
+                 static_cast<long long>(m.DflashInjectedCount()),
+                 static_cast<long long>(m.PositionCount()));
+    return false;
+  }
+
+  // ---- turn 2: injection off ----
+  m.SetDflashInjectionEnabled(false);
+  bool threw = false;
+  try {
+    m.DecodeStepDflashGreedy(next, kDflashK, 0.0f, 0);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  if (!threw) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: DecodeStepDflashGreedy did not throw while "
+                 "injection was disabled -- it would have drafted at the drafter's stale frontier\n");
+    return false;
+  }
+
+  std::vector<int32_t> filler = MakeFillerTokens(kDisabledPrefill);
+  filler.insert(filler.begin(), next);  // commit the pending anchor as part of this chunk
+  int32_t tok = Argmax(m.Prefill(filler));
+  history.insert(history.end(), filler.begin(), filler.end());
+  for (int i = 0; i < kDisabledSteps; ++i) {
+    history.push_back(tok);
+    tok = m.DecodeStepGreedy(tok);
+  }
+  const int64_t lag = m.PositionCount() - m.DflashInjectedCount();
+  if (lag != static_cast<int64_t>(filler.size()) + kDisabledSteps) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: drafter lag is %lld, expected %lld -- the disabled "
+                 "turn either still injected or injected the wrong number of rows\n",
+                 static_cast<long long>(lag),
+                 static_cast<long long>(filler.size()) + kDisabledSteps);
+    return false;
+  }
+
+  // ---- turn 3: injection back on, straight into a cold ring ----
+  m.SetDflashInjectionEnabled(true);
+  const int64_t resume_pos = m.PositionCount();
+  std::vector<int32_t> tail = MakeResumeTailTokens(kResumeTail);
+  tail.insert(tail.begin(), tok);
+  int32_t next3 = Argmax(m.Prefill(tail));
+  history.insert(history.end(), tail.begin(), tail.end());
+  if (m.DflashValidFrom() != resume_pos) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: ValidFrom()=%lld after resuming injection at "
+                 "position %lld\n",
+                 static_cast<long long>(m.DflashValidFrom()),
+                 static_cast<long long>(resume_pos));
+    return false;
+  }
+  if (m.DflashInjectedCount() != m.PositionCount()) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: InjectedCount()=%lld != PositionCount()=%lld after "
+                 "the resume -- the post-gap injection did not re-sync the drafter\n",
+                 static_cast<long long>(m.DflashInjectedCount()),
+                 static_cast<long long>(m.PositionCount()));
+    return false;
+  }
+
+  std::vector<int32_t> dflash_sequence{next3};
+  int64_t drafted = 0, accepted = 0;
+  int32_t cur = next3;
+  for (int i = 0; i < kPostGapRounds; ++i) {
+    int64_t walk_len = 0;
+    std::vector<int32_t> round = m.DecodeStepDflashGreedy(cur, kDflashK, 0.0f, 0, &walk_len);
+    drafted += walk_len;
+    accepted += static_cast<int64_t>(round.size()) - 1;  // the last token is never a draft
+    dflash_sequence.insert(dflash_sequence.end(), round.begin(), round.end());
+    cur = round.back();
+  }
+  std::fprintf(stderr,
+               "[dflash] CheckInjectionToggleGap: post-gap rounds: %d rounds, drafted=%lld "
+               "accepted=%lld (%.1f%% accept, %.2f tok/round), ValidFrom=%lld of %lld injected\n",
+               kPostGapRounds, static_cast<long long>(drafted), static_cast<long long>(accepted),
+               drafted > 0 ? 100.0 * static_cast<double>(accepted) / static_cast<double>(drafted)
+                           : 0.0,
+               static_cast<double>(dflash_sequence.size() - 1) / kPostGapRounds,
+               static_cast<long long>(m.DflashValidFrom()),
+               static_cast<long long>(m.DflashInjectedCount()));
+
+  { Model discard = std::move(m); }  // free before loading a second full 27B target (see above)
+  Model ref = Model::Load(base_opts);  // no dflash_container -- plain sequential reference
+  int32_t ref_tok = Argmax(ref.Prefill(history));
+  std::vector<int32_t> ref_sequence;
+  for (size_t i = 0; i < dflash_sequence.size(); ++i) {
+    ref_sequence.push_back(ref_tok);
+    ref_tok = ref.DecodeStepGreedy(ref_tok);
+  }
+
+  if (dflash_sequence != ref_sequence) {
+    std::fprintf(stderr,
+                 "FAIL: CheckInjectionToggleGap: post-gap DFlash2 decode diverges from an "
+                 "independently-loaded sequential reference fed the identical %zu-token history\n",
+                 history.size());
+    for (size_t i = 0; i < dflash_sequence.size() && i < ref_sequence.size(); ++i) {
+      if (dflash_sequence[i] != ref_sequence[i]) {
+        std::fprintf(stderr, "  first divergence at index %zu: dflash=%d ref=%d\n", i,
+                     dflash_sequence[i], ref_sequence[i]);
+        break;
+      }
+    }
+    return false;
+  }
+  std::fprintf(stderr,
+               "[dflash] CheckInjectionToggleGap: post-gap DFlash2 decode matches the sequential "
+               "reference exactly (%zu tokens over a %zu-token history)\n",
+               dflash_sequence.size(), history.size());
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -320,5 +482,11 @@ int main() {
     return 1;
   }
   std::fprintf(stderr, "[PASS] CheckResetThenDflashContinuation (dflash, layout=w4a16)\n");
+
+  if (!CheckInjectionToggleGap(opts, prompt1)) {
+    std::fprintf(stderr, "FAIL: CheckInjectionToggleGap\n");
+    return 1;
+  }
+  std::fprintf(stderr, "[PASS] CheckInjectionToggleGap (dflash, layout=w4a16)\n");
   return 0;
 }

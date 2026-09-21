@@ -26,6 +26,13 @@
 //     precisely why this ring needs no rollback after a partially-rejected verify round
 //     (docs/dflash2.md section 5): nothing speculative was ever stored, and the next round's
 //     injection always starts at a strictly higher position.
+//   * THE VISIBLE STORE IS `[ValidFrom(), InjectedCount())`, intersected with the sliding window.
+//     Injection is monotonic but need not be contiguous: a caller may stop feeding this drafter and
+//     resume at a higher absolute position (the server's per-request injection toggle), which
+//     leaves a GAP of stale ring bytes below the resume point. `ValidFrom()` is that resume point
+//     and is handed to the attention kernel as `store_begin`, so the gap is never read -- the same
+//     "self-correcting via position overwrite" argument as above, just with an explicit lower
+//     bound instead of an implicit 0. See `InjectFeatures`.
 //
 // HOST/DEVICE SPLIT. Everything except the selector lattice runs on the GPU. One `DraftRound` call
 // issues its whole layer stack asynchronously and then performs exactly ONE device->host copy (a
@@ -150,6 +157,10 @@ class DflashDraft {
     return static_cast<int64_t>(cfg_.target_layers.size()) * cfg_.hidden_size;
   }
   int64_t InjectedCount() const { return n_injected_; }
+  // First position in the ring whose contents are valid -- see InjectFeatures below. 0 for a
+  // drafter that has only ever been fed append-only (the overwhelming common case, and the only
+  // case that existed before the server's per-request injection toggle).
+  int64_t ValidFrom() const { return valid_from_; }
   int64_t MaskTokenId() const { return mask_token_id_; }
   int64_t LmHeadVocab() const { return lm_head_vocab_; }
   Layout GetLayout() const { return layout_; }
@@ -158,14 +169,28 @@ class DflashDraft {
   // beyond `n_injected_`, and every slot is unconditionally overwritten before it is read again;
   // same self-correcting-via-position-overwrite argument `mtp_head.h` and `Model::Reset` already
   // make for their own caches).
-  void Reset() { n_injected_ = 0; }
+  void Reset() {
+    n_injected_ = 0;
+    valid_from_ = 0;
+  }
 
   // Encodes `rows` target-feature rows and writes their K/V into every draft layer's ring.
   // features_dev: [rows, FeatureCols()] bf16 DEVICE, contiguous (exactly what
-  // `Model::DflashFeatureBuffer()` holds after a RunChunk/VerifyWindow call). `start_pos` must
-  // equal `InjectedCount()` -- injection is strictly append-only and monotonic, which is the
-  // invariant that lets the ring skip an explicit rollback (docs/dflash2.md section 5). Advances
-  // `InjectedCount()` by `rows`. Enqueues everything on `stream`; does not synchronize.
+  // `Model::DflashFeatureBuffer()` holds after a RunChunk/VerifyWindow call). Advances
+  // `InjectedCount()` to `start_pos + rows`. Enqueues everything on `stream`; does not synchronize.
+  //
+  // `start_pos` must be >= `InjectedCount()` -- injection is still strictly monotonic, but no
+  // longer strictly contiguous:
+  //   * `start_pos == InjectedCount()` is the ordinary append, unchanged in every respect;
+  //   * `start_pos > InjectedCount()` is a GAP: the caller stopped feeding this drafter for a while
+  //     (the server's per-request injection toggle -- a `temperature>0` request never drafts, so it
+  //     pays no capture/injection cost) and has now resumed at a higher absolute position. The
+  //     skipped positions' ring bytes are stale, so `ValidFrom()` moves up to `start_pos` and
+  //     `DraftRound` tells the attention kernel (`store_begin`) to start its visible range there.
+  //     Nothing is cleared, because nothing reads them.
+  //   * `start_pos < InjectedCount()` still throws. That direction would overwrite a position the
+  //     drafter may already have attended to, which is the rollback docs/dflash2.md section 5's
+  //     "no rollback needed" argument exists to rule out.
   void InjectFeatures(core::Stream& stream, core::Arena& arena, const uint16_t* features_dev,
                       int64_t rows, int64_t start_pos);
 
@@ -238,6 +263,9 @@ class DflashDraft {
   int64_t lm_head_vocab_ = 0;
   int64_t mask_token_id_ = 0;
   int64_t n_injected_ = 0;
+  // Lower bound of the ring's VALID contiguous run (see InjectFeatures / ValidFrom). Always
+  // 0 <= valid_from_ <= n_injected_.
+  int64_t valid_from_ = 0;
   int64_t last_inject_rows_ = 0;
 
   // ---- weights -------------------------------------------------------------------------------

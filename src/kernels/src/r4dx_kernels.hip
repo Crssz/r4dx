@@ -811,7 +811,8 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
     const __hip_bfloat16* __restrict__ q, const __hip_bfloat16* __restrict__ k_block,
     const __hip_bfloat16* __restrict__ v_block, const __hip_bfloat16* __restrict__ k_store,
     const __hip_bfloat16* __restrict__ v_store, __hip_bfloat16* __restrict__ out, int T,
-    int heads_q, int heads_kv, int head_dim, int n_injected, int window, int slots, float scale) {
+    int heads_q, int heads_kv, int head_dim, int n_injected, int store_begin, int window, int slots,
+    float scale) {
   const int t = blockIdx.x;
   const int kvh = blockIdx.y;
   const int ratio = heads_q / heads_kv;
@@ -822,10 +823,12 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
   const int dpl = head_dim / 32;  // dims per lane
 
   // Visible injected-store range for this query row: SWA says a key at position p is visible iff
-  // q_pos - p < window, and only positions already injected exist -- so p in [lo, n_injected-1].
+  // q_pos - p < window, and only positions at or after `store_begin` hold VALID injected data (the
+  // ring's contiguous run is [store_begin, n_injected), docs/dflash2.md section 5) -- so p in
+  // [lo, n_injected-1]. `store_begin` is >= 0, so clamping to it subsumes the old clamp to 0.
   const int q_pos = n_injected + t;
   int lo = q_pos - window + 1;
-  if (lo < 0) lo = 0;
+  if (lo < store_begin) lo = store_begin;
   const int n_store = n_injected > lo ? n_injected - lo : 0;
   const int total = n_store + T;  // + the block's own T keys, all unconditionally visible
 
@@ -1104,8 +1107,8 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 
 void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
                             int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
-                            int head_dim, int n_injected, int window, int slots, float scale,
-                            int64_t stream) {
+                            int head_dim, int n_injected, int store_begin, int window, int slots,
+                            float scale, int64_t stream) {
   if (T <= 0 || heads_kv <= 0) return;
   // Every one of these is a HARD precondition of the kernel's fixed LDS geometry: violating one
   // would read/write outside s_q/s_sc rather than merely produce a slow answer.
@@ -1137,14 +1140,23 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
     throw std::runtime_error("r4dx_dflash_attn_bf16: n_injected must be >= 0, got " +
                               std::to_string(n_injected));
   }
+  // store_begin is the FIRST valid injected position (0 == every injected position is valid, the
+  // pre-existing behaviour). Out of [0, n_injected] it would either clamp `lo` below the ring's
+  // real start or push it past `n_injected`, i.e. read rows that were never written -- exactly the
+  // silent-garbage failure every other precondition here exists to turn into a throw.
+  if (store_begin < 0 || store_begin > n_injected) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: store_begin must be in [0, n_injected], got " +
+                              std::to_string(store_begin) + " with n_injected=" +
+                              std::to_string(n_injected));
+  }
   ++g_launch_count;
   hipLaunchKernelGGL(DflashAttnKernel,
                      dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_kv)),
                      dim3(kAttnThreads), 0, (hipStream_t)stream, (const __hip_bfloat16*)q,
                      (const __hip_bfloat16*)k_block, (const __hip_bfloat16*)v_block,
                      (const __hip_bfloat16*)k_store, (const __hip_bfloat16*)v_store,
-                     (__hip_bfloat16*)out, T, heads_q, heads_kv, head_dim, n_injected, window,
-                     slots, scale);
+                     (__hip_bfloat16*)out, T, heads_q, heads_kv, head_dim, n_injected, store_begin,
+                     window, slots, scale);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

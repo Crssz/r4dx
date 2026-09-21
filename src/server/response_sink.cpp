@@ -17,10 +17,12 @@ void BufferingSink::OnToken(const std::string& piece) {
   text += piece;
 }
 
-void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completion_tokens_in) {
+void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completion_tokens_in,
+                            const TimingStats& timings_in) {
   std::lock_guard<std::mutex> lock(mu_);
   finish_reason = finish_reason_in;
   completion_tokens = completion_tokens_in;
+  timings = timings_in;
   done_ = true;
   cv_.notify_all();
 }
@@ -46,25 +48,30 @@ void BufferingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
 
 // ---- StreamingSink ---------------------------------------------------------------------------
 
-StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix)
+StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
+                             bool include_usage)
     : kind_(kind), id_(std::move(id)), model_id_(std::move(model_id)), created_unix_(created_unix),
-      queue_(/*max_size=*/256) {}
+      include_usage_(include_usage), queue_(/*max_size=*/256) {}
 
-void StreamingSink::OnStart(int64_t /*prompt_tokens*/) {
+void StreamingSink::OnStart(int64_t prompt_tokens) {
+  prompt_tokens_ = prompt_tokens;
   if (kind_ != Kind::kChat) return;  // /v1/completions has no role-preamble chunk
   // OpenAI's first chat-completion chunk carries only {"role": "assistant"} with an empty delta
   // otherwise -- lets clients render the message bubble before any text arrives.
   nlohmann::json delta = {{"role", "assistant"}};
-  queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt)));
+  queue_.Push(FormatSseEvent(
+      BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
 }
 
 void StreamingSink::OnToken(const std::string& piece) {
   if (piece.empty()) return;
   if (kind_ == Kind::kChat) {
     nlohmann::json delta = {{"content", piece}};
-    queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt)));
+    queue_.Push(FormatSseEvent(
+        BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
   } else {
-    queue_.Push(FormatSseEvent(BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt)));
+    queue_.Push(FormatSseEvent(
+        BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt, include_usage_)));
   }
 }
 
@@ -76,15 +83,32 @@ void StreamingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
   // correctly, it just receives the whole thing in one delta instead of many) rather than
   // OpenAI's own byte-by-byte argument streaming.
   nlohmann::json delta = {{"tool_calls", BuildToolCallsJson(calls)}};
-  queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt)));
+  queue_.Push(FormatSseEvent(
+      BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
 }
 
-void StreamingSink::OnDone(const std::string& finish_reason, int64_t /*completion_tokens*/) {
+void StreamingSink::OnDone(const std::string& finish_reason, int64_t completion_tokens,
+                           const TimingStats& timings_in) {
   if (kind_ == Kind::kChat) {
-    queue_.Push(FormatSseEvent(
-        BuildChatCompletionChunk(id_, model_id_, created_unix_, nlohmann::json::object(), finish_reason)));
+    queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_,
+                                                        nlohmann::json::object(), finish_reason,
+                                                        include_usage_, timings_in)));
   } else {
-    queue_.Push(FormatSseEvent(BuildCompletionChunk(id_, model_id_, created_unix_, "", finish_reason)));
+    queue_.Push(FormatSseEvent(BuildCompletionChunk(id_, model_id_, created_unix_, "", finish_reason,
+                                                    include_usage_, timings_in)));
+  }
+  // stream_options.include_usage (task point 2): one extra chunk after the finish_reason chunk,
+  // before [DONE] -- empty `choices`, the real `usage` (prompt_tokens_ from OnStart +
+  // completion_tokens handed to us here) and the same `timings` object.
+  if (include_usage_) {
+    const UsageStats usage{prompt_tokens_, completion_tokens};
+    if (kind_ == Kind::kChat) {
+      queue_.Push(FormatSseEvent(BuildChatCompletionUsageChunk(id_, model_id_, created_unix_, usage,
+                                                                timings_in)));
+    } else {
+      queue_.Push(FormatSseEvent(BuildCompletionUsageChunk(id_, model_id_, created_unix_, usage,
+                                                            timings_in)));
+    }
   }
   queue_.Push(FormatSseDone());
   queue_.Close();

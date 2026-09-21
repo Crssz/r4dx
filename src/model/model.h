@@ -402,6 +402,40 @@ class Model {
   // comment for the internal-vs-external-observer split).
   bool DflashEnabled() const { return dflash_.has_value(); }
 
+  // ---- Per-request drafter-injection toggle (docs/server.md, docs/dflash2.md section 5) ---------
+  // `--dflash` is a LOAD-time flag, so a long-lived server holds one Model and one drafter for
+  // requests that will never speculate (`temperature>0` never calls DecodeStepDflashGreedy). While
+  // this is false, RunChunk skips BOTH the per-layer target-feature capture AND the drafter
+  // injection it feeds -- the point is to remove that cost, not to defer it -- so a sampled request
+  // on a `--dflash` server runs at plain-decode speed.
+  //
+  // The drafter then LAGS: `dflash_->InjectedCount() < pos_` for as long as injection is off. That
+  // is safe and explicitly supported: the next RunChunk after re-enabling injects at
+  // `start_pos = pos_ > InjectedCount()`, which DflashDraft::InjectFeatures turns into a cold-ring
+  // gap (its `ValidFrom()` moves up, and the skipped positions are never read again). After ANY
+  // injection, `InjectedCount() == pos_` holds again, which is what DecodeStepDflashGreedy needs.
+  //
+  // DecodeStepDflashGreedy THROWS while this is false: it would otherwise draft a block at the
+  // drafter's stale frontier instead of the model's real one. Re-enable it and run at least one
+  // RunChunk (a prefill chunk or a plain decode step) first. `Reset()` does not change this flag --
+  // it is a caller policy, not sequence state -- but it does reset the drafter, so an enabled
+  // prefill after a Reset() starts cleanly from position 0 with no gap at all.
+  //
+  // Default true, i.e. every pre-existing caller (the CLI, every test, every tool) behaves exactly
+  // as before. NOTE for a caller using the EXTERNAL dflash_observer_ mechanism instead of this
+  // Model's own drafter: this flag gates the capture itself, so the observer stops being invoked
+  // too -- do not turn it off while relying on that hook.
+  void SetDflashInjectionEnabled(bool enabled) { dflash_injection_enabled_ = enabled; }
+  bool DflashInjectionEnabled() const { return dflash_injection_enabled_; }
+
+  // Drafter-ring bookkeeping, for tests/diagnostics. Both require DflashEnabled().
+  // DflashInjectedCount() is the drafter's own frontier (== PositionCount() after any injection,
+  // lagging it while injection is disabled); DflashValidFrom() is the lower bound of its visible
+  // store, i.e. the position injection most recently RESUMED at after a gap (0 when there never
+  // was one).
+  int64_t DflashInjectedCount() const;
+  int64_t DflashValidFrom() const;
+
   // The DFlash2 analogue of DecodeStepMtpGreedy, returning the SAME round-vector contract (1..k+1
   // committed tokens: 0..k accepted drafts followed by exactly one correction/bonus token) so
   // mtp_round.hpp's ProcessMtpRound and the CLI/server round loops plug in unchanged -- see that
@@ -554,6 +588,7 @@ class Model {
   core::DeviceBuffer<uint16_t> dflash_features_dev_;  // [max_chunk_, target_layers_.size()*hidden]
   int64_t dflash_feature_rows_ = 0;  // rows filled by the most recent RunChunk/VerifyWindow call
   DflashCaptureObserver dflash_observer_ = nullptr;  // see SetDflashCaptureObserver
+  bool dflash_injection_enabled_ = true;  // see SetDflashInjectionEnabled
 
   // Stage S3: the drafter this Model owns when Load()'d with a non-empty
   // ModelOptions::dflash_container, nullopt otherwise (the overwhelming common case, byte-identical

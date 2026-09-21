@@ -191,6 +191,34 @@ feeding a draft to target verify.
    analogous case. If r4dx's draft KV ring ever stops being strictly position-indexed and
    monotonically advancing (e.g. multiple in-flight rounds, non-monotonic retries), this invariant
    breaks and an explicit rollback becomes mandatory again, mirroring llama.cpp's own `seq_rm` calls.
+
+   **Relaxed 2026-09-21: monotonic, but no longer contiguous.** `r4dx::model::DflashDraft` now keeps
+   a second counter next to `InjectedCount()`: `ValidFrom()`, the first position whose ring contents
+   are valid. **The visible store is the contiguous run `[ValidFrom(), InjectedCount())` intersected
+   with the sliding window**, and that lower bound is passed to `r4dx_dflash_attn_bf16` as its
+   `store_begin` argument (section 6b). `InjectFeatures(rows, start_pos)` accepts any
+   `start_pos >= InjectedCount()`:
+   * `start_pos == InjectedCount()` -- the ordinary append. `ValidFrom()` does not move; everything
+     above behaves exactly as before, and `ValidFrom()` is 0 for the whole life of a drafter that is
+     only ever fed this way (the CLI, every test, every warm server session).
+   * `start_pos > InjectedCount()` -- a **gap**. The driver stopped feeding this drafter for a while
+     and resumed higher up; `ValidFrom()` and `InjectedCount()` both jump to `start_pos` before the
+     rows are written. The skipped positions' bytes are stale, and are simply never read again --
+     the identical "self-correcting via position overwrite" argument, with an explicit lower bound
+     in place of the implicit 0, so no clear and no rollback is needed for them either.
+   * `start_pos < InjectedCount()` still throws. That is the rollback direction this whole section
+     exists to rule out.
+
+   The only production driver that opens a gap is `r4dx-server`: `Model::SetDflashInjectionEnabled`
+   (`src/model/model.h`) lets a request turn the target-feature capture and the injection off
+   together, and `Engine::RunRequest` turns them off for every `temperature>0` request, which will
+   never draft. The next greedy request re-enables them, its first `RunChunk` injects at
+   `start_pos = pos_ > InjectedCount()`, and that round drafts from a cold ring -- correct by
+   construction (verification still runs the real model over every candidate), just with lower
+   acceptance until the ring refills. See `docs/server.md` for the measured numbers on both sides of
+   that trade. After ANY injection `InjectedCount() == Model::pos_` holds again, which is what
+   `Model::DecodeStepDflashGreedy` checks on entry; it refuses to run at all while injection is
+   disabled, because it would otherwise build its block at the drafter's stale frontier.
 5. **New anchor**: `id_last_new` = the token sampled at the last accepted row (either the last
    accepted draft, or a "bonus"/corrected token beyond it, exactly as `docs/mtp.md`'s own verify
    step produces) -- becomes the next round's block position 0.
@@ -339,7 +367,7 @@ absent -- so a missing fixture can never hide a real regression. Regenerate with
 |---|---|---|
 | `r4dx_rope_neox_bf16` | In-place NeoX split-half rotation over ALL `head_dim` dims (n_rot == head_dim, so no pass-through tail), pair `(i, i+head_dim/2)`, theta 1e7, per-row absolute positions as an int32 DEVICE array. fp32 math, RTNE to bf16. Q and K are independently optional (`ptr=0` **and** the matching head count `0`) because the injection path ropes K only -- there is no `Wq` in it at all. | `tests/kernels/test_rope_neox.cpp` |
 | `r4dx_topk16_f32` | `[rows, vocab]` fp32 -> ids int32 `[rows,16]` + vals fp32 `[rows,16]`, descending by value, ties deterministically to the LOWER id. One workgroup per row: per-thread register top-16 over a grid-strided slice, then an 8-round pairwise LDS merge under the same total order, so the result is the exact global top-16 regardless of thread scheduling. | `tests/kernels/test_topk16.cpp` |
-| `r4dx_dflash_attn_bf16` | The draft block's attention. Visible keys for query row `t` (abs position `q = n_injected + t`): injected-store positions `p` in `[max(0, q-window+1), n_injected-1]` read at `slot = p % slots`, **plus all `T` block keys unconditionally** (the block is non-causal; `attention.causal=false`). fp32 two-pass max-subtracted softmax, bf16 out, GQA `q-head h -> kv-head h/(heads_q/heads_kv)`. The block's own K/V is scratch and is never written to the store -- which is why the ring needs no rollback (section 5). | `tests/kernels/test_dflash_attn.cpp` |
+| `r4dx_dflash_attn_bf16` | The draft block's attention. Visible keys for query row `t` (abs position `q = n_injected + t`): injected-store positions `p` in `[max(store_begin, q-window+1), n_injected-1]` read at `slot = p % slots`, **plus all `T` block keys unconditionally** (the block is non-causal; `attention.causal=false`). `store_begin` (added 2026-09-21) is the first position whose ring contents are valid, i.e. the visible store is the CONTIGUOUS run `[store_begin, n_injected)` intersected with the window; `0` is the original behaviour and the value every caller passed before the injection gap existed. Precondition `0 <= store_begin <= n_injected` (throws). Slot mapping stays `p % slots` over true absolute positions and rope positions stay absolute, so nothing else about the ring geometry changes. fp32 two-pass max-subtracted softmax, bf16 out, GQA `q-head h -> kv-head h/(heads_q/heads_kv)`. The block's own K/V is scratch and is never written to the store -- which is why the ring needs no rollback (section 5). | `tests/kernels/test_dflash_attn.cpp` |
 | `r4dx_dflash_conv_bf16` | Thin wrapper over libr4d's `r4d_dflash_conv_t2_g16_bf16` (taps 2, group 16). The whole point is the address arithmetic: `delta = dyn + side*taps*NG` while `dpitch` stays the **full** `2*taps*NG` row pitch (delta is a SLICE, not a compacted copy -- `r4d.h:118`); `base = base + side*taps*H` over `[2(side)][taps][H]`; `block_size` is the power of two `>= T`, so `(t & blockmask) >= tap` degenerates to `t >= tap` for one block starting at row 0. `out` must not alias `x`. Deliberately does **not** bump the r4dx launch counter -- the launch is libr4d's. | `tests/kernels/test_dflash_conv.cpp` |
 | `r4dx_rmsnorm_plain_bf16` | `out = x * rsqrt(mean(x^2)+eps) * w`, i.e. the PLAIN weight form -- **not** `r4dx_rmsnorm_bf16`'s `(1+w)` Qwen3.5 convention (see this doc's "RMSNorm convention" row). Output bf16 or fp32 (`out_fp32`); in-place supported. Nothing in this repo or in libr4d computed this form before. | `tests/kernels/test_rmsnorm_plain.cpp` |
 
@@ -365,6 +393,14 @@ first.
 - attention: vs CPU fp64 reference over `n_injected` in {0, 3, 40, 2047, 2048, 2049, 2100, 5000} x
   `T` in {1, 4, 8} -- norm_rel 1.63e-3..1.69e-3 throughout, i.e. pinned at the bf16 output quantum
   (2^-9 = 1.95e-3) with no drift at the ring wrap or the window clip. Fixture A norm_rel 3.4e-3.
+  The `store_begin > 0` sweep added 2026-09-21 (`n_injected` in {40, 2100, 5000} x `store_begin` in
+  {n-1, n-17, n} x `T` in {1, 8}, 18 cases) scores 1.63e-3..1.74e-3 on the same gate, with every
+  ring slot the kernel would read at `store_begin=0` but must not read at that `store_begin`
+  deliberately filled with 1e4 -- finite rather than NaN on purpose, because a junk key that is
+  actually read takes over the softmax completely and moves the output by orders of magnitude
+  instead of by a tolerance. `store_begin == n_injected` (nothing in the store visible) is included.
+  The `store_begin=0` rows above are unchanged to the printed digit, i.e. the parameter is a
+  measured no-op at 0.
 - conv: vs CPU reference at `T` in {1, 5, 8} x both sides, norm_rel 1.64e-3..1.67e-3. Fixture A
   side 0 norm_rel 2.6e-3, side 1 2.4e-3.
 - plain rmsnorm: vs CPU fp64 reference at hidden in {128, 5120, 17408} x rows in {1, 8, 40} --
@@ -460,10 +496,12 @@ Measured host cost of the whole non-device part of a round (walk + ~80 kernel la
 the 8 block keys/values as separate operands and the ring as another pair, and only
 `InjectFeatures()` ever writes the ring -- only for positions the target has already committed.
 That is precisely why a partially-rejected verify round needs no rollback (section 5): nothing
-speculative was ever stored. `InjectFeatures` additionally enforces `start_pos == InjectedCount()`
-and throws otherwise, which upholds the second half of that argument (strictly monotonic, so a
-stale byte is always physically overwritten before it can be read as committed data). Both facts
-are stated as comments at the two call sites in `dflash_draft.cpp`.
+speculative was ever stored. `InjectFeatures` additionally enforces `start_pos >= InjectedCount()`
+and throws otherwise, which upholds the second half of that argument (monotonic, so a stale byte is
+always physically overwritten before it can be read as committed data). Since 2026-09-21 a
+`start_pos` strictly ABOVE the frontier is allowed too and moves `ValidFrom()` up -- the visible
+store is `[ValidFrom(), InjectedCount())`, not `[0, InjectedCount())` (section 5's "Relaxed" note).
+Both facts are stated as comments at the two call sites in `dflash_draft.cpp`.
 
 ### The per-chunk capture observer
 

@@ -349,10 +349,12 @@ bool CheckVerifyWindowRejectsTooManyCandidates(const ModelOptions& base_opts) {
 // PrefixState/mtp_round directly, just not a live end-to-end forced-mid-round-stop scenario").
 // Unlike tests/server/test_prefix_state.cpp's TestCommitTracksCommittedNotDisplayedTokens (a
 // synthetic vector, proving only PrefixState's own arithmetic), this drives a REAL two-turn
-// conversation through a real r4dx::model::Model with real DecodeStepMtpGreedy rounds, feeding
+// conversation through a real r4dx::model::Model with real speculative rounds (DecodeStepMtpGreedy,
+// or oracle-drafted VerifyWindow+CommitVerifiedWindow rounds -- see "Drafter choice" below), feeding
 // their actual output through the SAME r4dx::model::ProcessMtpRound / r4dx::server::PrefixState
 // helpers src/cli/main.cpp and src/server/engine.cpp use, with a --max-tokens-equivalent budget
-// chosen (by a same-Model, same-seed dry run) to land exactly one token short of a round boundary --
+// chosen (by a same-Model, same-seed dry run) to stop display inside a round, one token short of
+// what that round committed --
 // i.e. the round's own atomic commit genuinely leaves at least one "committed but never displayed"
 // token in the model's real state, the exact scenario the mid-round bookkeeping fix exists for.
 bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
@@ -362,28 +364,74 @@ bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
   mtp_opts.mtp_draft_k = kDraftK;
   auto is_eos = [](int32_t) { return false; };
 
+  // Drafter choice. The point of this check is a round of >=3 tokens that the Model commits
+  // atomically. Real MTP rounds are preferred, but the 4-layer test container's MTP head never
+  // agrees with its (equally truncated) target -- measured: every one of 64 rounds x 6 prompts x 4
+  // layouts returned exactly 1 token -- so on it a real round can never be >=3 and this check used
+  // to take a "skipping" early return every single run. When the real-MTP dry run finds no such
+  // round, fall back to an ORACLE drafter: drafts are the target's own sequential greedy
+  // continuation (from an independent mtp_draft_k=0 Model), pushed through the same public
+  // VerifyWindow + CommitVerifiedWindow pair DecodeStepMtpGreedy's own verify/commit is built on
+  // (and that the DFlash2 driver uses). Acceptance is still computed from the real preds, and the
+  // committed-vs-displayed state in the Model is exactly what a lucky MTP round would have left.
+  std::vector<int32_t> oracle_seq;  // oracle_seq[0] == prefill argmax, [i+1] == i-th decoded token
+  bool use_oracle = false;
+  auto run_round = [&](Model& m, int32_t seed, size_t emitted) -> std::vector<int32_t> {
+    if (!use_oracle) return m.DecodeStepMtpGreedy(seed, kDraftK);
+    std::vector<int32_t> candidates{seed};
+    for (int64_t j = 1; j <= kDraftK && emitted + static_cast<size_t>(j) < oracle_seq.size(); ++j) {
+      candidates.push_back(oracle_seq[emitted + static_cast<size_t>(j)]);
+    }
+    const std::vector<int32_t> preds = m.VerifyWindow(candidates);
+    size_t accepted = 0;
+    while (accepted + 1 < candidates.size() && preds[accepted] == candidates[accepted + 1]) ++accepted;
+    m.CommitVerifiedWindow(static_cast<int64_t>(accepted) + 1);
+    std::vector<int32_t> round(candidates.begin() + 1, candidates.begin() + 1 + static_cast<int64_t>(accepted));
+    round.push_back(preds[accepted]);
+    return round;
+  };
+
   // Pass 1 (dry run): replay the natural (unbudgeted) round trajectory to find a round that itself
-  // returns >=2 tokens, so stopping display 1 token short of ITS OWN boundary is a genuine mid-round
-  // stop (not merely landing on the previous round's own boundary).
-  int64_t stop_after = -1;
-  {
+  // returns >=3 tokens, and budget display to stop 2 tokens short of ITS OWN end. ProcessMtpRound
+  // commits round[0..size-2] (size-1 tokens) unconditionally, so a budget of size-1 within the round
+  // displays exactly what was committed (no gap); size-2 leaves one committed-but-undisplayed token.
+  // size==2 cannot work: its size-2 == 0 budget means the real run's `while (remaining > 0)` loop
+  // stops on the PREVIOUS round's boundary and never runs this round at all.
+  auto probe_stop_after = [&]() -> int64_t {
     Model probe = Model::Load(mtp_opts);
     int32_t next = Argmax(probe.Prefill(prompt1));
     int64_t cumulative = 0;
-    for (int round_idx = 0; round_idx < 8 && stop_after < 0; ++round_idx) {
-      std::vector<int32_t> round = probe.DecodeStepMtpGreedy(next, kDraftK);
-      if (round.size() >= 2) stop_after = cumulative + static_cast<int64_t>(round.size()) - 1;
+    for (int round_idx = 0; round_idx < 8; ++round_idx) {
+      std::vector<int32_t> round = run_round(probe, next, static_cast<size_t>(cumulative));
+      if (round.size() >= 3) return cumulative + static_cast<int64_t>(round.size()) - 2;
       cumulative += static_cast<int64_t>(round.size());
       next = round.back();
     }
+    return -1;
+  };
+  int64_t stop_after = probe_stop_after();
+  if (stop_after < 0) {
+    ModelOptions seq_opts = base_opts;
+    seq_opts.mtp_draft_k = 0;
+    Model seq = Model::Load(seq_opts);
+    int32_t tok = Argmax(seq.Prefill(prompt1));
+    for (int i = 0; i < 8 * (kDraftK + 1) + 1; ++i) {
+      oracle_seq.push_back(tok);
+      tok = seq.DecodeStepGreedy(tok);
+    }
+    use_oracle = true;
+    stop_after = probe_stop_after();
   }
   if (stop_after < 0) {
     std::fprintf(stderr,
-                 "[mtp] CheckChatMultiTurnMidRoundStop: no round emitted >=2 tokens in 8 rounds on "
-                 "this container/prompt -- cannot force a mid-round stop; skipping (not a product "
-                 "failure)\n");
-    return true;
+                 "FAIL: CheckChatMultiTurnMidRoundStop: no round of >=3 tokens in 8 rounds even with "
+                 "oracle drafts (the target's own sequential greedy continuation) -- VerifyWindow is "
+                 "rejecting tokens sequential decode itself produces\n");
+    return false;
   }
+  std::fprintf(stderr, "[mtp] CheckChatMultiTurnMidRoundStop: drafter=%s stop_after=%lld\n",
+               use_oracle ? "oracle (real MTP rounds never reached 3 tokens)" : "mtp",
+               static_cast<long long>(stop_after));
 
   // Turn 1, for real: identical Model construction/prompt/K (greedy + deterministic => reproduces
   // pass 1's own trajectory exactly), this time actually enforcing the max_tokens_remaining budget.
@@ -397,7 +445,7 @@ bool CheckChatMultiTurnMidRoundStop(const ModelOptions& base_opts,
   int64_t remaining = stop_after;
   bool stopped_mid_round = false;
   while (remaining > 0) {
-    std::vector<int32_t> round = turn.DecodeStepMtpGreedy(next, kDraftK);
+    std::vector<int32_t> round = run_round(turn, next, displayed_turn1.size());
     committed_turn1.push_back(next);
     r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(round, is_eos, remaining);
     committed_turn1.insert(committed_turn1.end(), outcome.committed.begin(), outcome.committed.end());

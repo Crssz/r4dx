@@ -2,13 +2,19 @@
 // DFlash2 draft block's own attention: NON-causal within the block, sliding-window over the
 // injected-feature ring, GQA.
 //
-// Two independent checks:
+// Three independent checks:
 //  (1) A CPU fp64 reference over an (n_injected x T) sweep chosen to hit every edge of the ring
 //      and of the window: n = 0 (nothing injected at all, so only the block's own 8 keys are
 //      visible), n < window (no clipping), n exactly at the ring size (the first wrap), n just
 //      past it, and n far past it (every visible key read through a modulo). T = 1/4/8.
 //      Both sides consume the SAME bf16 inputs, so this isolates the kernel's indexing, masking
 //      and softmax from bf16 input quantisation and the tolerance can be tight.
+//  (1b) The same reference over `store_begin > 0` -- the COLD-RING GAP (docs/dflash2.md section 5):
+//      the visible store is the contiguous run [store_begin, n_injected), not [0, n_injected).
+//      Every ring slot the kernel would have read at store_begin=0 but must NOT read at this
+//      store_begin is deliberately filled with 1e4 junk, so reading even one of them makes that
+//      key's score dominate the softmax and moves the output by orders of magnitude rather than by
+//      a tolerance. store_begin == n_injected (the whole store invalid) is included.
 //  (2) Fixture A's own layer-0 attention: (attn_q_l0, attn_k_l0, attn_v_l0, injected_k_l0,
 //      injected_v_l0, n_injected=40) -> attn_out_l0, all produced by tools/reference/dflash2_ref.py
 //      with no C++ in the loop. This is what pins the CONVENTION (that the block's keys are
@@ -41,10 +47,12 @@ constexpr int kSlots = 2048;
 // The visible key list for query row t, in the EXACT order the kernel builds it: the injected
 // store's window-clipped range first, then all T of the block's own keys. `src` is the store slot
 // for a store key and -(1+j) for block key j, so the caller needs no second lookup.
-std::vector<int> VisibleKeys(int t, int n_injected, int T, int window, int slots) {
+// `store_begin` is the first VALID injected position (0 == all of them), i.e. the low end of the
+// range is clamped to it and not to 0 -- the cold-ring gap the kernel's own contract describes.
+std::vector<int> VisibleKeys(int t, int n_injected, int T, int window, int slots, int store_begin) {
   const int q_pos = n_injected + t;
   int lo = q_pos - window + 1;
-  if (lo < 0) lo = 0;
+  if (lo < store_begin) lo = store_begin;
   std::vector<int> keys;
   for (int p = lo; p < n_injected; ++p) keys.push_back(p % slots);
   for (int j = 0; j < T; ++j) keys.push_back(-(1 + j));
@@ -55,13 +63,13 @@ std::vector<int> VisibleKeys(int t, int n_injected, int T, int window, int slots
 std::vector<float> AttnRef(const std::vector<uint16_t>& q, const std::vector<uint16_t>& k_block,
                            const std::vector<uint16_t>& v_block,
                            const std::vector<uint16_t>& k_store,
-                           const std::vector<uint16_t>& v_store, int T, int n_injected, int window,
-                           int slots, double scale) {
+                           const std::vector<uint16_t>& v_store, int T, int n_injected,
+                           int store_begin, int window, int slots, double scale) {
   const int ratio = kHeadsQ / kHeadsKv;
   std::vector<float> out(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
   std::vector<double> scores;
   for (int t = 0; t < T; ++t) {
-    const std::vector<int> keys = VisibleKeys(t, n_injected, T, window, slots);
+    const std::vector<int> keys = VisibleKeys(t, n_injected, T, window, slots, store_begin);
     for (int hq = 0; hq < kHeadsQ; ++hq) {
       const int kvh = hq / ratio;
       const uint16_t* qp = q.data() + (static_cast<size_t>(t) * kHeadsQ + hq) * kHeadDim;
@@ -145,7 +153,7 @@ int main() {
             RandomBf16(static_cast<size_t>(T) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
 
         const std::vector<float> ref =
-            AttnRef(q, kb, vb, k_store, v_store, T, n, kWindow, kSlots, scale);
+            AttnRef(q, kb, vb, k_store, v_store, T, n, /*store_begin=*/0, kWindow, kSlots, scale);
 
         DeviceBuffer<uint16_t> q_d(q.size()), kb_d(kb.size()), vb_d(vb.size());
         DeviceBuffer<uint16_t> out_d(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
@@ -158,7 +166,7 @@ int main() {
                               reinterpret_cast<int64_t>(ks_d.data()),
                               reinterpret_cast<int64_t>(vs_d.data()),
                               reinterpret_cast<int64_t>(out_d.data()), T, kHeadsQ, kHeadsKv,
-                              kHeadDim, n, kWindow, kSlots, scale, 0);
+                              kHeadDim, n, /*store_begin=*/0, kWindow, kSlots, scale, 0);
         R4DX_HIP_CHECK(hipDeviceSynchronize());
 
         const ErrStats s = CompareToRef(out_d.CopyToHost(), ref);
@@ -173,6 +181,75 @@ int main() {
     }
   }
 
+  // ---- 1b. Cold-ring gap: store_begin > 0, with the invisible slots filled with junk ----
+  // Junk = 1e4, not NaN: a NaN would poison the softmax and be caught by literally any comparison,
+  // including one that reads the slot and then correctly masks it. A large FINITE value is the
+  // sharper probe -- it only shows up if its key actually enters the score row, where it takes over
+  // the softmax completely (scores are O(1) here, so exp(1e4*q.k*scale) saturates). If the kernel
+  // clamps `lo` correctly, the output is bit-for-bit what the same store WITHOUT the junk would
+  // give, and the fp64 reference (which applies the same clamp) matches to check [1]'s own floor.
+  {
+    std::mt19937 rng(101);
+    const uint16_t kJunk = FloatToBf16(1e4f);
+    std::printf("[1b] cold-ring gap sweep (store_begin > 0; slots below it filled with 1e4 junk)\n");
+    for (int n : {40, 2100, 5000}) {
+      for (int sb : {n - 1, n - 17, n}) {
+        for (int T : {1, 8}) {
+          std::vector<uint16_t> k_store =
+              RandomBf16(static_cast<size_t>(kSlots) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+          std::vector<uint16_t> v_store =
+              RandomBf16(static_cast<size_t>(kSlots) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+          // Every position the kernel WOULD read at store_begin=0 but must not read at this
+          // store_begin: p in [max(0, n - window + 1), sb). That range is under `window` wide, so
+          // no two of its positions share a slot and junking them cannot clobber a valid one.
+          const int junk_lo = std::max(0, n - kWindow + 1);
+          int junked = 0;
+          for (int p = junk_lo; p < sb; ++p) {
+            const size_t base = static_cast<size_t>(p % kSlots) * kHeadsKv * kHeadDim;
+            for (size_t i = 0; i < static_cast<size_t>(kHeadsKv) * kHeadDim; ++i) {
+              k_store[base + i] = kJunk;
+              v_store[base + i] = kJunk;
+            }
+            ++junked;
+          }
+          DeviceBuffer<uint16_t> ks_d(k_store.size()), vs_d(v_store.size());
+          ks_d.CopyFromHost(k_store);
+          vs_d.CopyFromHost(v_store);
+
+          const std::vector<uint16_t> q =
+              RandomBf16(static_cast<size_t>(T) * kHeadsQ * kHeadDim, &rng, -1.5f, 1.5f);
+          const std::vector<uint16_t> kb =
+              RandomBf16(static_cast<size_t>(T) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+          const std::vector<uint16_t> vb =
+              RandomBf16(static_cast<size_t>(T) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+          const std::vector<float> ref =
+              AttnRef(q, kb, vb, k_store, v_store, T, n, sb, kWindow, kSlots, scale);
+
+          DeviceBuffer<uint16_t> q_d(q.size()), kb_d(kb.size()), vb_d(vb.size());
+          DeviceBuffer<uint16_t> out_d(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
+          q_d.CopyFromHost(q);
+          kb_d.CopyFromHost(kb);
+          vb_d.CopyFromHost(vb);
+          r4dx_dflash_attn_bf16(reinterpret_cast<int64_t>(q_d.data()),
+                                reinterpret_cast<int64_t>(kb_d.data()),
+                                reinterpret_cast<int64_t>(vb_d.data()),
+                                reinterpret_cast<int64_t>(ks_d.data()),
+                                reinterpret_cast<int64_t>(vs_d.data()),
+                                reinterpret_cast<int64_t>(out_d.data()), T, kHeadsQ, kHeadsKv,
+                                kHeadDim, n, sb, kWindow, kSlots, scale, 0);
+          R4DX_HIP_CHECK(hipDeviceSynchronize());
+
+          const ErrStats s = CompareToRef(out_d.CopyToHost(), ref);
+          const bool pass = s.norm_rel < 4e-3 && s.max_abs < 2e-2;
+          std::printf("  n=%-5d store_begin=%-5d T=%d junked=%-5d visible_store=%-5d  "
+                      "max_abs=%.3e norm_rel=%.3e  %s\n",
+                      n, sb, T, junked, n - sb, s.max_abs, s.norm_rel, pass ? "PASS" : "FAIL");
+          ok = ok && pass;
+        }
+      }
+    }
+  }
+
   // ---- 2. Preconditions must throw, not silently read out of the kernel's fixed LDS geometry ----
   {
     DeviceBuffer<uint16_t> dummy(static_cast<size_t>(8) * kHeadsQ * kHeadDim);
@@ -181,22 +258,24 @@ int main() {
     const int64_t sp = reinterpret_cast<int64_t>(store.data());
     struct Case {
       const char* what;
-      int T, hq, hkv, hd, window, slots;
+      int T, hq, hkv, hd, n_injected, store_begin, window, slots;
     };
     const Case cases[] = {
-        {"T=9 (> block size 8)", 9, 32, 8, 128, 2048, 2048},
-        {"head_dim=160 (> 128)", 8, 32, 8, 160, 2048, 2048},
-        {"head_dim=100 (not a multiple of 32)", 8, 32, 8, 100, 2048, 2048},
-        {"heads_q/heads_kv = 8 (> 4)", 8, 64, 8, 128, 2048, 2048},
-        {"window=2049 (> 2048)", 8, 32, 8, 128, 2049, 4096},
-        {"slots < window", 8, 32, 8, 128, 2048, 1024},
+        {"T=9 (> block size 8)", 9, 32, 8, 128, 0, 0, 2048, 2048},
+        {"head_dim=160 (> 128)", 8, 32, 8, 160, 0, 0, 2048, 2048},
+        {"head_dim=100 (not a multiple of 32)", 8, 32, 8, 100, 0, 0, 2048, 2048},
+        {"heads_q/heads_kv = 8 (> 4)", 8, 64, 8, 128, 0, 0, 2048, 2048},
+        {"window=2049 (> 2048)", 8, 32, 8, 128, 0, 0, 2049, 4096},
+        {"slots < window", 8, 32, 8, 128, 0, 0, 2048, 1024},
+        {"store_begin=-1 (< 0)", 8, 32, 8, 128, 40, -1, 2048, 2048},
+        {"store_begin=41 (> n_injected)", 8, 32, 8, 128, 40, 41, 2048, 2048},
     };
     int threw = 0;
     for (const Case& c : cases) {
       bool did = false;
       try {
-        r4dx_dflash_attn_bf16(p, p, p, sp, sp, p, c.T, c.hq, c.hkv, c.hd, 0, c.window, c.slots,
-                              scale, 0);
+        r4dx_dflash_attn_bf16(p, p, p, sp, sp, p, c.T, c.hq, c.hkv, c.hd, c.n_injected,
+                              c.store_begin, c.window, c.slots, scale, 0);
       } catch (const std::exception&) {
         did = true;
       }
@@ -259,7 +338,8 @@ int main() {
                           reinterpret_cast<int64_t>(ks_d.data()),
                           reinterpret_cast<int64_t>(vs_d.data()),
                           reinterpret_cast<int64_t>(out_d.data()), T, 32, 8, 128,
-                          static_cast<int>(n_injected), kWindow, kSlots, scale, 0);
+                          static_cast<int>(n_injected), /*store_begin=*/0, kWindow, kSlots, scale,
+                          0);
     R4DX_HIP_CHECK(hipDeviceSynchronize());
 
     const ErrStats s = CompareToRef(out_d.CopyToHost(), ref);

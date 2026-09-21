@@ -23,6 +23,7 @@ int g_failures = 0;
 
 using r4dx::server::BufferingSink;
 using r4dx::server::StreamingSink;
+using r4dx::server::TimingStats;
 
 void TestBufferingSinkHappyPath() {
   BufferingSink sink;
@@ -169,6 +170,125 @@ void TestStreamingSinkOnToolCallsNoopForCompletionKind() {
   CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
 }
 
+// ---- timings (task point 1) --------------------------------------------------------------------
+
+void TestBufferingSinkStoresTimings() {
+  BufferingSink sink;
+  sink.OnStart(10);
+  sink.OnToken("hi");
+  TimingStats timings;
+  timings.prompt_n = 10;
+  timings.prompt_ms = 5.0;
+  timings.predicted_n = 1;
+  timings.predicted_ms = 2.0;
+  sink.OnDone("stop", 1, timings);
+  CHECK(sink.timings.prompt_n == 10);
+  CHECK(sink.timings.predicted_n == 1);
+}
+
+void TestBufferingSinkOnDoneDefaultTimingsIsZero() {
+  // Regression guard: OnDone's `timings` parameter defaults to {} so existing call sites that
+  // don't care (like every other test above) keep compiling unchanged.
+  BufferingSink sink;
+  sink.OnStart(1);
+  sink.OnDone("stop", 0);
+  CHECK(sink.timings.prompt_n == 0);
+  CHECK(sink.timings.predicted_n == 0);
+}
+
+void TestStreamingSinkFinishChunkCarriesTimings() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-x", "m", 1);
+  sink.OnStart(5);
+  sink.OnToken("hi");
+  TimingStats timings;
+  timings.prompt_n = 5;
+  timings.prompt_ms = 4.0;
+  timings.predicted_n = 1;
+  timings.predicted_ms = 2.0;
+  sink.OnDone("stop", 1, timings);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(sink.Next(event));  // content delta
+  CHECK(sink.Next(event));  // finish_reason chunk -- must carry "timings"
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+  CHECK(event.find("\"timings\"") != std::string::npos);
+  CHECK(event.find("\"prompt_n\":5") != std::string::npos);
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(event == "data: [DONE]\n\n");
+  CHECK(!sink.Next(event));
+}
+
+// ---- stream_options.include_usage (task point 2) ------------------------------------------------
+
+void TestStreamingSinkIncludeUsageAddsNullUsageToNormalChunksAndFinalUsageChunk() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-y", "m", 1, /*include_usage=*/true);
+  sink.OnStart(7);
+  sink.OnToken("hi");
+  TimingStats timings;
+  timings.prompt_n = 7;
+  sink.OnDone("stop", 3, timings);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble -- must carry "usage":null
+  CHECK(event.find("\"usage\":null") != std::string::npos);
+
+  CHECK(sink.Next(event));  // content delta -- must also carry "usage":null
+  CHECK(event.find("\"usage\":null") != std::string::npos);
+
+  CHECK(sink.Next(event));  // finish_reason chunk -- "usage":null AND "timings"
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+  CHECK(event.find("\"usage\":null") != std::string::npos);
+  CHECK(event.find("\"timings\"") != std::string::npos);
+
+  CHECK(sink.Next(event));  // the dedicated usage chunk: empty choices, real usage, timings
+  CHECK(event.find("\"choices\":[]") != std::string::npos);
+  CHECK(event.find("\"completion_tokens\":3") != std::string::npos);
+  CHECK(event.find("\"prompt_tokens\":7") != std::string::npos);
+  CHECK(event.find("\"timings\"") != std::string::npos);
+
+  CHECK(sink.Next(event));  // [DONE] -- still exactly one, after the usage chunk
+  CHECK(event == "data: [DONE]\n\n");
+  CHECK(!sink.Next(event));
+}
+
+void TestStreamingSinkWithoutIncludeUsageHasNoUsageKeyAnywhere() {
+  // Regression guard for the "byte-for-byte unchanged except the finish_reason chunk's `timings`"
+  // requirement -- no chunk should ever gain a "usage" key when include_usage was never requested
+  // (the default -- every StreamingSink constructed without the 5th argument, and every existing
+  // test above, exercises exactly this path).
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-z2", "m", 1);
+  sink.OnStart(4);
+  sink.OnToken("hi");
+  sink.OnDone("stop", 1);
+
+  std::string event;
+  while (sink.Next(event)) {
+    CHECK(event.find("\"usage\"") == std::string::npos);
+  }
+}
+
+void TestStreamingSinkCompletionIncludeUsageUsageChunkShape() {
+  StreamingSink sink(StreamingSink::Kind::kCompletion, "cmpl-y", "m", 1, /*include_usage=*/true);
+  sink.OnStart(2);
+  sink.OnToken("hi");
+  sink.OnDone("length", 1);
+
+  std::string event;
+  CHECK(sink.Next(event));  // text delta -- "usage":null
+  CHECK(event.find("\"usage\":null") != std::string::npos);
+  CHECK(sink.Next(event));  // finish_reason chunk -- "usage":null + timings
+  CHECK(event.find("\"usage\":null") != std::string::npos);
+  CHECK(event.find("\"timings\"") != std::string::npos);
+  CHECK(sink.Next(event));  // dedicated usage chunk
+  CHECK(event.find("\"object\":\"text_completion\"") != std::string::npos);
+  CHECK(event.find("\"choices\":[]") != std::string::npos);
+  CHECK(event.find("\"completion_tokens\":1") != std::string::npos);
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(event == "data: [DONE]\n\n");
+  CHECK(!sink.Next(event));
+}
+
 void TestStreamingSinkErrorEmitsAndCloses() {
   StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-e", "m", 1);
   sink.OnError(500, "boom");
@@ -195,6 +315,12 @@ int main() {
   TestStreamingSinkEmptyTokenIsNoop();
   TestStreamingSinkCancelStopsIteration();
   TestStreamingSinkErrorEmitsAndCloses();
+  TestBufferingSinkStoresTimings();
+  TestBufferingSinkOnDoneDefaultTimingsIsZero();
+  TestStreamingSinkFinishChunkCarriesTimings();
+  TestStreamingSinkIncludeUsageAddsNullUsageToNormalChunksAndFinalUsageChunk();
+  TestStreamingSinkWithoutIncludeUsageHasNoUsageKeyAnywhere();
+  TestStreamingSinkCompletionIncludeUsageUsageChunkShape();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

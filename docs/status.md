@@ -44,7 +44,7 @@ now within 3% of ROCmFPX's own 120 tok/s / 84% acceptance reference figure on th
 | Anchor check against the WIRED drafter (real captured features, real generation loop) | **DONE** | Was undelivered after stage S3 (only the unwired, separately-owned-`DflashDraft` harness had been checked). Fix stage closed it: `tool_dflash_probe.exe --wired` reproduces the unwired harness's own `x_final_normed` RelL2 figures (1.09e-2/1.34e-2, bf16 draft) to 4 significant figures, proving the wiring introduces no drafting-from-the-wrong-features bug. Found and fixed a real `STATUS_ACCESS_VIOLATION` while building the check (a device pointer dereferenced from host code). |
 | Measurement matrix (decode/prefill/VRAM/acceptance, both prompts, matched-K, twice each) | **DONE for the matrix this milestone commits to** (standard + code prompt x 3 layouts x plain/best-MTP/best-DFlash x 2 runs, this pass's own sweep, table above). **Explicitly NOT measured, carried to Milestone 6, not silently dropped**: the `p_min` sweep {0, 0.3, 0.5}; the w4a8/mxfp4 DRAFT containers (only w4a16 and bf16 drafts have ever been tried); the one long-context point (`--max-ctx 32768`, ~30k real prefilled tokens); an explicit prefill-with/without-`--dflash` A/B. |
 | CLI-vs-server tok/s parity | **DONE** | `r4dx-server --dflash --dflash-k 4` 77.54/77.62 tok/s vs CLI's 77.06/77.16 (pre-Fix-stage measurement) -- within 1%. Not independently re-measured this Integrate pass (neither the Fix stage's nor this pass's changes touch the server's request-routing path). |
-| Review findings (3 blockers, 3 majors, 5 minors) | **ALL FIXED or REJECTED-WITH-REASON** | See the Fix-stage section below for the full per-finding accounting; nothing was silently dropped. One item (a genuinely safe per-request drafter-injection toggle for the server, to remove the ~3% tax on sampled/`temperature>0` traffic) needs `DflashDraft` ring-gap tolerance and was spun off as its own background follow-up task rather than rushed; its disposition was not re-checked this pass. |
+| Review findings (3 blockers, 3 majors, 5 minors) | **ALL FIXED or REJECTED-WITH-REASON** | See the Fix-stage section below for the full per-finding accounting; nothing was silently dropped. One item (a genuinely safe per-request drafter-injection toggle for the server, to remove the ~3% tax on sampled/`temperature>0` traffic) needs `DflashDraft` ring-gap tolerance and was spun off as its own background follow-up task rather than rushed; its disposition was not re-checked this pass. **That follow-up landed on 2026-09-21 -- see "Milestone 5 follow-up: server sampled-traffic tax removed" below.** |
 | `test_attn_layer` skip-instead-of-crash fix | **PART OF THIS MILESTONE** | `tests/model/attention/CMakeLists.txt` (`SKIP_RETURN_CODE 77`) + `test_attn_layer.cpp` (upfront `FileExists`/`SkipMissing` gate, `try`/`catch` around the extracted `Run()` body) were uncommitted groundwork already sitting in this worktree at Milestone 5's start (closing background task `task_b93fa5a9`, opened during Milestone 4). Verified again by this Integrate pass's own clean-rebuild ctest run: `test_attn_layer` exits 77/SKIPPED, not `0xC0000409`. Recorded here explicitly per this pass's own instructions, since no earlier Milestone 5 section had named it as this milestone's own deliverable. |
 | Account-path / gguf-py hygiene | **CLEAN** | Every file in `git status --short` grepped for the local account name / `C:\Users\` and `import gguf`/`from gguf`: zero account-path hits; the one `gguf` hit (`tools/reference/dflash2_ref.py`, `from gguf_min import ...`) is the repo's own local `tools/reference/gguf_min.py`, not the external `gguf-py` package. |
 
@@ -66,9 +66,17 @@ section above or in the history below has the full accounting):
 4. **No long-context DFlash2 point exists** (everything above is `--max-ctx 2048`); the drafter's
    own 2048-token sliding window and the ring's wrap behavior are unit-tested (fixture B) but never
    measured end-to-end at real long context.
-5. **The server's unconditional per-request drafter tax on sampled (`temperature>0`) traffic**
-   (~3% measured by the review pass) has no structural fix -- would need `DflashDraft`'s ring to
-   tolerate injection gaps. Documented in `docs/server.md`, not fixed.
+5. ~~**The server's unconditional per-request drafter tax on sampled (`temperature>0`) traffic**~~
+   **CLOSED (2026-09-21, follow-up pass -- see "Server sampled-traffic tax removed" below).**
+   `DflashDraft` now tolerates injection gaps (`ValidFrom()` + the attention kernel's new
+   `store_begin`), `Model::SetDflashInjectionEnabled` turns capture and injection off together, and
+   `Engine::RunRequest` turns them off for every `temperature>0` request. Measured on the real
+   64-layer w4a16 container: sampled decode 28.03/28.04 -> 28.30/28.32 tok/s against a plain
+   server's 28.52/28.54, i.e. the tax fell from 1.75% to 0.77%. What remains is NOT the injection
+   -- an `--mtp 7` control server on the identical request measures 27.96/27.98, worse still -- it
+   is `draft_window_ = 8`'s own GDN/KV window sizing, which is structural to any speculative
+   server. Full numbers, including the cold-ring acceptance cost on the first greedy request after
+   sampled traffic, in `docs/server.md`.
 6. **DFlash2's overall acceptance (24-77% depending on prompt/layout) is still below ROCmFPX's 84%**
    reference figure on this same card/draft, though the gap has closed substantially (the code-prompt
    w4a16 cell is now within 3%, up from stage S3's ~14 points). Not root-caused which remaining
@@ -80,9 +88,54 @@ section above or in the history below has the full accounting):
 
 **Recommended order for Milestone 6**: (1) the `p_min`/`n_min` sweep and the w4a8/mxfp4 draft-
 container legs (cheap, no new code, closes the largest remaining measurement gap); (2) root-cause
-the mxfp4/standard-prompt acceptance gap; (3) the long-context DFlash2 measurement point; (4) the
-server ring-gap-tolerance fix for the sampled-traffic tax; (5) R10/P9's prefill GEMM kernel, still
-the single largest unrelated perf lever per Milestone 4's own "Known gaps" #1.
+the mxfp4/standard-prompt acceptance gap; (3) the long-context DFlash2 measurement point;
+(4) ~~the server ring-gap-tolerance fix for the sampled-traffic tax~~ **done 2026-09-21, gap 5
+above**; (5) R10/P9's prefill GEMM kernel, still the single largest unrelated perf lever per
+Milestone 4's own "Known gaps" #1.
+
+## Milestone 5 follow-up: server sampled-traffic tax removed (2026-09-21)
+
+Closes Milestone 5's own Known-gaps item 5 and the review finding it came from. Design: a cold ring
+after a gap, with a validity lower bound, rather than clearing or rolling back the ring.
+
+- **Kernel.** `r4dx_dflash_attn_bf16` gained an `int store_begin` parameter (first VALID injected
+  position; `0` is the pre-existing behaviour). It clamps the visible store range's low end to
+  `store_begin` instead of to `0`; slot mapping stays `p % slots` over true absolute positions and
+  rope positions stay absolute. Precondition `0 <= store_begin <= n_injected` throws.
+- **Drafter.** `DflashDraft` gained `valid_from_` / `ValidFrom()`. `InjectFeatures` now accepts
+  `start_pos >= InjectedCount()`: equal is the ordinary append, strictly greater is a gap (both
+  counters jump to `start_pos`, and the skipped rows' ring bytes are never read again), and below
+  the frontier still throws. `DraftRound` passes `valid_from_` as `store_begin`.
+- **Model.** `SetDflashInjectionEnabled(bool)` / `DflashInjectionEnabled()`; while false `RunChunk`
+  skips the per-layer capture, the capture observer, the injection, its arena reset and its extra
+  stream synchronize. `DecodeStepDflashGreedy` throws while injection is disabled, and now also
+  checks `InjectedCount() == pos_` on entry.
+- **Server.** `Engine::RunRequest` calls `SetDflashInjectionEnabled(use_dflash)` before the
+  request's prefill, on both the prefix-reuse and the `Reset()`+re-prefill path. The CLI is
+  unchanged (it already clears `--dflash` at `temperature>0` before `Model::Load`).
+- **Server API (2026-09-21, separate pass).** Added a llama.cpp-compatible `timings` object
+  (`prompt_n`/`prompt_ms`/`predicted_n`/`predicted_ms`/`*_per_second`, plus `draft_n`/
+  `draft_n_accepted` when MTP or DFlash2 actually ran) as a top-level sibling of `usage` on every
+  response shape, and `stream_options.include_usage` support for both endpoints -- full detail in
+  `docs/server.md`'s "`timings`"/"`stream_options`" sections.
+
+**Measured** (real `qwen38-27b-v3.r4dx`, `--layout w4a16`, w4a16 draft container, HIP device 1, one
+server at a time, identical `temperature=0.7 top_p=0.95 seed=12345` 128-token request, two runs
+each after a discarded warm-up): plain server 28.52/28.54 tok/s; `--dflash` before 28.03/28.04
+(-1.75%); `--dflash` after 28.30/28.32 (-0.77%); `--mtp 7` control 27.96/27.98. The residual is
+`draft_window_ = 8`'s GDN/KV window sizing plus the per-step `num_accepted` threading, not the
+injection. A greedy multi-turn continuation immediately after the sampled requests (prefix
+extended, so the ring really was cold) still reported real dflash stats: 68.86 tok/s, 21 rounds,
+21.8% accept, 2.48 tok/round, against 33.0% / 3.28 on a warm ring and 38.59 tok/s plain -- the
+documented downside of the trade.
+
+**Tests added**: `tests/kernels/test_dflash_attn.cpp` check [1b] (18 `store_begin > 0` cases with
+the must-not-be-read slots filled with 1e4 junk, plus two new precondition cases);
+`tests/model/test_dflash_draft.cpp` Part 5 (a gapped ring drafts BIT-IDENTICALLY to one that only
+ever saw the post-gap rows); `tests/model/test_dflash_e2e.cpp` `CheckInjectionToggleGap` (real
+64-layer target: greedy -> injection-off -> greedy-again, `ValidFrom()` equals the resume position,
+post-gap tokens exactly equal an independently loaded non-dflash reference). No new registered
+ctest targets -- all three land inside existing binaries.
 
 ## Milestone 5 (DFlash2 drafter), Integrate stage: review findings fixed, gate green, item 5 closed (2026-09-21)
 
@@ -139,7 +192,8 @@ updated in place) and `docs/perf.md`'s Milestone 5 S3 section (corrected headlin
   loops never fed the drafter, silently desyncing `pos_` from `InjectedCount()`); the server's
   unconditional per-request drafter tax on sampled (`temperature>0`) traffic is now documented in
   `docs/server.md` (a genuinely safe per-request toggle would need `DflashDraft` to tolerate gaps
-  in its own ring -- out of scope for this pass, so documented rather than half-fixed);
+  in its own ring -- out of scope for this pass, so documented rather than half-fixed; **that
+  toggle was subsequently built, 2026-09-21 -- see "Server sampled-traffic tax removed" above**);
   `tests/model/test_dflash_e2e.cpp` gained `CheckResetThenDflashContinuation` (Reset() followed by
   CONTINUED DFlash2 decode, not just a fallback to plain decode); the claimed UTF-8 BOM in
   `src/model/model.cpp` was checked directly (`ReadAllBytes`) and is NOT present -- no change
@@ -153,8 +207,9 @@ this stage (the new `CheckResetThenDflashContinuation` check runs inside the exi
 
 **Left for a follow-up pass** (explicitly, per the standing "do not narrow scope silently" rule):
 the p_min sweep; the w4a8/mxfp4 DRAFT containers; the one long-context point; an explicit prefill
-A/B; doubling the remaining single-run rows of the original haiku-prompt table; a genuinely safe
-per-request drafter-injection toggle for the server (would need `DflashDraft` ring-gap tolerance).
+A/B; doubling the remaining single-run rows of the original haiku-prompt table; ~~a genuinely safe
+per-request drafter-injection toggle for the server (would need `DflashDraft` ring-gap tolerance)~~
+-- **that last item was built on 2026-09-21, see "Server sampled-traffic tax removed" above**.
 
 ## Milestone 5 (DFlash2 drafter), stage S3: wired into generation, measured, one open finding (2026-09-20)
 

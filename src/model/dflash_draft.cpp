@@ -301,14 +301,25 @@ void DflashDraft::InjectFeatures(core::Stream& stream, core::Arena& arena,
   if (rows > max_inject_rows_) {
     throw std::runtime_error("DflashDraft::InjectFeatures: rows exceeds max_inject_rows");
   }
-  if (start_pos != n_injected_) {
-    // Append-only and monotonic. This is not a convenience check: docs/dflash2.md section 5's
-    // "no rollback needed" argument holds only because every write goes to a strictly higher
-    // position than anything already stored, so a stale rejected row is always physically
-    // overwritten before it can be read as committed data.
+  if (start_pos < n_injected_) {
+    // MONOTONIC. This is not a convenience check: docs/dflash2.md section 5's "no rollback needed"
+    // argument holds only because every write goes to a position at or above anything already
+    // stored, so a stale rejected row is always physically overwritten before it can be read as
+    // committed data. Writing BELOW n_injected_ would overwrite a position this drafter may already
+    // have attended to -- i.e. exactly the rollback that argument rules out.
     throw std::runtime_error("DflashDraft::InjectFeatures: start_pos (" +
-                             std::to_string(start_pos) + ") != InjectedCount() (" +
-                             std::to_string(n_injected_) + "); injection is append-only");
+                             std::to_string(start_pos) + ") < InjectedCount() (" +
+                             std::to_string(n_injected_) + "); injection is monotonic");
+  }
+  if (start_pos > n_injected_) {
+    // GAP (see the .h doc comment): the caller skipped some positions entirely, so every ring slot
+    // below `start_pos` is now stale. Rather than clear those bytes (up to a full 2048-slot ring x
+    // 5 layers x 2 tensors), move the validity lower bound up and let the attention kernel's own
+    // `store_begin` clamp keep them unread -- they will be physically overwritten by a later
+    // injection at their own position long before `valid_from_` could ever come back down (it
+    // never does; only Reset() lowers it).
+    valid_from_ = start_pos;
+    n_injected_ = start_pos;
   }
 
   const int64_t hidden = cfg_.hidden_size;
@@ -417,6 +428,9 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
   // handed to the attention kernel as scratch operands and are NEVER written into k_store_/v_store_
   // -- that is the whole reason a partially-rejected verify round needs no ring rollback. Only
   // InjectFeatures() ever writes the ring, and only for positions the target has already committed.
+  // `valid_from_` is passed as the kernel's `store_begin`: the visible store is the contiguous run
+  // [valid_from_, n_injected_) intersected with the window, so an injection gap's stale bytes are
+  // never read (docs/dflash2.md section 5, InjectFeatures' own doc comment).
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
   r4dx_dflash_attn_bf16(
       reinterpret_cast<int64_t>(q_.data()), reinterpret_cast<int64_t>(k_.data()),
@@ -425,7 +439,8 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
       reinterpret_cast<int64_t>(v_store_.data() + il * slots_ * kv_row),
       reinterpret_cast<int64_t>(attn_.data()), static_cast<int>(B), static_cast<int>(heads_q),
       static_cast<int>(heads_kv), static_cast<int>(head_dim), static_cast<int>(n_injected_),
-      static_cast<int>(cfg_.attention.sliding_window), static_cast<int>(slots_), scale, s);
+      static_cast<int>(valid_from_), static_cast<int>(cfg_.attention.sliding_window),
+      static_cast<int>(slots_), scale, s);
 
   ApplyLinear(stream, arena, lw.o_proj, attn_.data(), proj_.data(), B);
   r4dx_dflash_conv_bf16(reinterpret_cast<int64_t>(proj_.data()),

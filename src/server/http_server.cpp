@@ -121,7 +121,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       pending->stop = req.stop;
 
       if (req.stream) {
-        auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created);
+        auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created,
+                                                     req.stream_options_include_usage);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -149,7 +150,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
             (!sink->tool_calls.empty() && sink->text.empty()) ? std::nullopt
                                                                 : std::optional<std::string>(sink->text);
         res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
-                                                     sink->finish_reason, usage)
+                                                     sink->finish_reason, usage, sink->timings)
                              .dump(),
                          "application/json");
       }
@@ -178,8 +179,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       pending->stop = req.stop;
 
       if (req.stream) {
-        auto sink =
-            std::make_shared<StreamingSink>(StreamingSink::Kind::kCompletion, id, model_id, created);
+        auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kCompletion, id, model_id,
+                                                     created, req.stream_options_include_usage);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -201,7 +202,9 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         }
         UsageStats usage{sink->prompt_tokens, sink->completion_tokens};
         res.set_content(
-            BuildCompletionResponse(id, model_id, created, sink->text, sink->finish_reason, usage).dump(),
+            BuildCompletionResponse(id, model_id, created, sink->text, sink->finish_reason, usage,
+                                    sink->timings)
+                .dump(),
             "application/json");
       }
     } catch (const ApiError& err) {

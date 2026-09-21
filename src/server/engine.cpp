@@ -204,6 +204,30 @@ void Engine::RunRequest(PendingRequest& req) {
       return;
     }
 
+    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): identical greedy-only gate as
+    // MTP below, mutually exclusive with it (--dflash/--mtp are rejected together at the arg-parse
+    // layer, so at most one of use_mtp/use_dflash is ever true). model_->DflashEnabled() is private
+    // to r4dx::model::Model in the CLI's own header, so this uses the same "was the drafter loaded"
+    // signal DecodeStepDflashGreedy itself throws on -- opts_.model_opts.dflash_draft_k > 0 is set
+    // if and only if Model::Load was given a non-empty dflash_container (cli_args.h/server_args.h's
+    // own mutual-exclusion + range checks already guarantee this pairing holds).
+    //
+    // Computed HERE, before this request's prefill, because it also drives the drafter-injection
+    // toggle immediately below -- the decode loop further down just reads it again.
+    const bool use_dflash =
+        !opts_.model_opts.dflash_container.empty() && req.sampling.temperature <= 0.0f;
+    // Per-request drafter-injection toggle (docs/server.md's "Sampled traffic pays nothing",
+    // model.h's SetDflashInjectionEnabled). A sampled request will never call
+    // DecodeStepDflashGreedy, so it should not pay the drafter's per-chunk feature capture +
+    // encoder GEMM + 5-layer KV injection either. Set before Prefill so the whole request --
+    // prefill chunks and plain decode steps alike -- runs with the right policy, and set on BOTH
+    // the prefix-reuse and the Reset()+reprefill path (this line precedes both). A greedy request
+    // arriving after sampled ones simply resumes injection at the current position, which
+    // DflashDraft turns into a cold-ring gap rather than a throw.
+    if (!opts_.model_opts.dflash_container.empty()) {
+      model_->SetDflashInjectionEnabled(use_dflash);
+    }
+
     // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens`
     // extends what's already fed; otherwise Model::Reset() (re-zero GDN/KV/MTP state in place,
     // milliseconds -- NOT a full Model::Load(), see model.h's Reset() doc comment and this
@@ -283,14 +307,8 @@ void Engine::RunRequest(PendingRequest& req) {
     // "probabilistic acceptance later" is still future work, per this stage's task).
     const bool use_mtp = model_->MtpEnabled() && req.sampling.temperature <= 0.0f;
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
-    // DFlash2 self-speculative decode (docs/dflash2.md, stage S3): identical greedy-only gate as
-    // MTP above, mutually exclusive with it (--dflash/--mtp are rejected together at the arg-parse
-    // layer, so at most one of use_mtp/use_dflash is ever true). model_->DflashEnabled() is private
-    // to r4dx::model::Model in the CLI's own header, so this uses the same "was the drafter loaded"
-    // signal DecodeStepDflashGreedy itself throws on -- opts_.model_opts.dflash_draft_k > 0 is set
-    // if and only if Model::Load was given a non-empty dflash_container (cli_args.h/server_args.h's
-    // own mutual-exclusion + range checks already guarantee this pairing holds).
-    const bool use_dflash = !opts_.model_opts.dflash_container.empty() && req.sampling.temperature <= 0.0f;
+    // `use_dflash` is computed above, before the prefill, because it also gates this request's
+    // drafter injection (see its own comment there).
     int64_t dflash_rounds = 0, dflash_drafted = 0, dflash_accepted = 0;
 
     const auto d0 = Clock::now();
@@ -484,7 +502,26 @@ void Engine::RunRequest(PendingRequest& req) {
       }
     }
 
-    req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()));
+    // `timings` (task point 1, llama.cpp-compatible field names): `prompt_n` is the tokens
+    // actually fed to THIS request's Prefill (`new_tokens_i32`, excludes whatever prefix reuse
+    // skipped) -- deliberately NOT `full_tokens.size()` (the whole conversation-so-far, which is
+    // `usage.prompt_tokens`). `draft_n`/`draft_n_accepted` are set only when a speculative path
+    // actually ran at least one round this request (`*_rounds > 0`), mirroring the stderr log
+    // line's own "only mention mtp:/dflash: when rounds happened" gate just below.
+    TimingStats timings;
+    timings.prompt_n = static_cast<int64_t>(new_tokens_i32.size());
+    timings.prompt_ms = prefill_seconds * 1000.0;
+    timings.predicted_n = static_cast<int64_t>(generated_tokens.size());
+    timings.predicted_ms = decode_seconds * 1000.0;
+    if (use_mtp && mtp_rounds > 0) {
+      timings.draft_n = mtp_drafted;
+      timings.draft_n_accepted = mtp_accepted;
+    } else if (use_dflash && dflash_rounds > 0) {
+      timings.draft_n = dflash_drafted;
+      timings.draft_n_accepted = dflash_accepted;
+    }
+
+    req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings);
 
     const double prefill_tps = prefill_seconds > 0 ? new_tokens_i32.size() / prefill_seconds : 0.0;
     const double decode_tps =

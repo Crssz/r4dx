@@ -144,6 +144,102 @@ parsing/validation, `role: "tool"`/`"function"` messages) and `tests/server/test
 round trip against a container (a tool-offering request, feeding the parsed call's result back as a
 `role: "tool"` message, checking the final answer references the tool result).
 
+## `timings`
+
+An r4dx extension beyond the OpenAI spec: a `timings` object attached as a top-level sibling of
+`usage` on every non-streaming `/v1/chat/completions` response (both `BuildChatCompletionResponse`
+overloads, including a tool-call response), every non-streaming `/v1/completions` response, and --
+for a streaming request -- on the SSE finish_reason chunk (the same chunk that carries the
+non-null `finish_reason`), for both endpoints. Field names deliberately match llama.cpp's own
+`/completion` `timings` object, so existing bench tooling written against a llama.cpp server keeps
+working unmodified against this one:
+
+```json
+"timings": {
+  "prompt_n": 12,
+  "prompt_ms": 45.2,
+  "prompt_per_second": 265.5,
+  "predicted_n": 8,
+  "predicted_ms": 96.4,
+  "predicted_per_second": 83.0,
+  "draft_n": 32,
+  "draft_n_accepted": 24
+}
+```
+
+- **`prompt_n`/`prompt_ms`**: tokens actually fed to `Model::Prefill` THIS request and how long
+  that took. `prompt_n` is deliberately NOT `usage.prompt_tokens` (the whole conversation-so-far
+  token count) -- it is `Engine::RunRequest`'s own `new_tokens_i32.size()`, i.e. it excludes
+  whatever prefix reuse (`PrefixState::Extend`, this file's "Concurrency model" section) skipped
+  re-prefilling. A client resending a growing `messages` array (the normal chat-client pattern)
+  will see `prompt_n` stay small turn over turn while `usage.prompt_tokens` keeps growing with the
+  conversation -- that gap IS prefix reuse, made visible instead of just implied by a fast
+  response. A prefix mismatch (`Model::Reset()` + full re-prefill) instead shows `prompt_n ==
+  usage.prompt_tokens` for that request, same as if prefix reuse never existed.
+- **`predicted_n`/`predicted_ms`**: generated token count (always equal to
+  `usage.completion_tokens`) and wall-clock decode time for this request, whichever loop produced
+  it (plain sampling, greedy MTP, or greedy DFlash2).
+- **`*_per_second`**: `n / (ms / 1000)`, computed as `0.0` (never left to produce `NaN`/`inf`, both
+  of which nlohmann::json's own `dump()` refuses to serialize) whenever the corresponding `*_ms` is
+  `0` -- e.g. a zero-token generation (immediate EOS).
+- **`draft_n`/`draft_n_accepted`**: total drafted/accepted token counts, summed across every
+  speculative round this request ran (`mtp_drafted`/`mtp_accepted` for `--mtp`,
+  `dflash_drafted`/`dflash_accepted` for `--dflash` -- mutually exclusive, `server_args.h` rejects
+  both together). Present ONLY when a speculative path actually ran at least one round this
+  request (greedy MTP or DFlash2, `use_mtp`/`use_dflash` in `engine.cpp`, gated the same way the
+  existing `mtp:`/`dflash:` stderr log-line suffixes are) -- absent for a plain-decode or sampled
+  (`temperature > 0`) request, and absent even on a speculative-capable server if the request
+  finished (e.g. immediate EOS) before any round ran.
+
+Implementation: `TimingStats` (`src/server/openai_types.h`, next to `UsageStats`) is filled in by
+`Engine::RunRequest` from values it already measures for its own stderr log line (`prefill_seconds`,
+`decode_seconds`, `new_tokens_i32.size()`, `generated_tokens.size()`, the mtp_*/dflash_* counters)
+and handed to `ResponseSink::OnDone`; `BuildTimingsJson` serializes it. That stderr log line itself
+is unchanged by this feature.
+
+## `stream_options`
+
+`stream_options: {"include_usage": bool}` (OpenAI's own streaming-usage opt-in), accepted on both
+`/v1/chat/completions` and `/v1/completions`. Validated unconditionally: `stream_options` must be
+an object if present, `include_usage` must be a boolean if present -- either violation is a clear
+`400 invalid_request_error` (`openai_types.cpp`'s `ParseStreamOptions`). **Tolerance choice**:
+`stream_options` on a non-streaming request (`"stream"` absent or `false`) is accepted and simply
+ignored, rather than rejected the way OpenAI's own API does -- a caller that always sets
+`stream_options` regardless of `stream` (a common client-library pattern) should not have to special
+-case this server, and the field genuinely has nothing to do once there is no stream to attach usage
+chunks to.
+
+When `stream: true` and `stream_options.include_usage: true`, the exact SSE chunk sequence is:
+
+1. The role-preamble chunk (chat only) and every content/tool_calls delta chunk each additionally
+   carry a top-level `"usage": null`.
+2. The finish_reason chunk (unchanged shape otherwise, still carries `timings` per the section
+   above) ALSO carries `"usage": null`.
+3. One more chunk follows, `"choices": []`, with the real `"usage"` object
+   (`{prompt_tokens, completion_tokens, total_tokens}`) and the same `"timings"` object as the
+   finish_reason chunk.
+4. `data: [DONE]\n\n`.
+
+When `include_usage` is absent or `false`, streaming output is byte-for-byte identical to before
+this feature except for the `timings` key added to the finish_reason chunk (item 1 above) -- no
+chunk ever gains a `usage` key. Tool-call mode (`engine.cpp`'s whole-generation buffering, "Tool
+calls" above) behaves identically either way: the buffered `OnToolCalls` chunk is just another
+"normal chunk" for the purposes of the `usage: null` rule.
+
+Implementation: `StreamingSink` (`response_sink.h`/`.cpp`) takes an `include_usage` constructor
+flag (`http_server.cpp` passes `ChatCompletionRequest`/`CompletionRequest::
+stream_options_include_usage` straight through) and stores the request's `prompt_tokens` from
+`OnStart` so `OnDone` can build the dedicated usage chunk's `usage` object without engine.cpp having
+to pass it separately.
+
+**Testing**: `tests/server/test_openai_types.cpp` (`stream_options` parsing/validation,
+`BuildTimingsJson` arithmetic including the zero-`ms` and draft-fields-present/absent cases, every
+builder's `timings` attachment) and `tests/server/test_response_sink.cpp` (chunk ordering and
+`usage`/`timings` placement with and without `include_usage`), plus `tools/server/smoke.ps1`'s
+`timings`/`stream_options` checks against a real container (prompt_n/predicted_n arithmetic, prefix
+reuse made visible through `prompt_n`, the include_usage chunk sequence, and `draft_n` with
+`-Dflash`/`-Mtp`).
+
 ## Milestone 4 integration (2026-09-20)
 
 `tools/server/smoke.ps1` re-run three ways against a clean `build.ps1 -Clean` rebuild, HIP device 1:
@@ -318,27 +414,66 @@ its own packed layout in its own metadata. `tools/server/smoke.ps1` gained `-Dfl
 draft container, all 28 checks passed (streaming and tool-call mode both unaffected). Covered by
 `tests/server/test_server_args.cpp`'s `TestDflashFlags`.
 
-**Known tax on sampled (`temperature>0`) traffic (review finding, 2026-09-21, recorded rather than
-"fixed" -- see the reasoning below):** `--dflash` is a `Model`-wide, load-time flag, not a
-per-request one -- `Model::Load` attaches the drafter and `RunChunk` auto-feeds it
-(`DflashDraft::InjectFeatures`) on *every* prefill chunk and decode step for the life of the process,
-while `Engine::RunRequest`'s `use_dflash` gate only decides whether a given request's decode loop
-*reads* drafted tokens (greedy-only, mirroring `use_mtp`). A `temperature>0` request on a `--dflash`
-server therefore still pays the drafter's per-step encoder GEMM + 5-layer forward + KV-ring injection
-cost even though it will never call `DecodeStepDflashGreedy`. Measured on the real 64-layer w4a16
-container: a `temperature=0.8` request against a `--dflash`-enabled server reported 37.70 tok/s vs the
-CLI's own `--mtp 0` baseline of 38.90 tok/s on the same prompt (~3%), plus the drafter's ~0.95 GiB
-VRAM held regardless of whether any request ever uses it.
-`r4dx-cli` avoids this by clearing `args.dflash` outright at `temperature>0` before `Model::Load`
-(`src/cli/main.cpp`) -- a CLI process serves one request per invocation, so that is free. A server
-process serves many requests with a shared `Model` and a shared `DflashDraft` ring across turns, so
-the same trick cannot be applied per-request without desyncing `DflashDraft::InjectedCount()` from
-`Model::pos_` for a *later*, greedy request on the same session: `InjectFeatures` requires
-`start_pos == InjectedCount()` (append-only, docs/dflash2.md), so skipping injection on a sampled turn
-would make the very next greedy turn throw. Operators running a `--dflash` server for genuinely mixed
-greedy/sampled traffic should budget this ~3% tax on every request, not just the greedy ones that
-benefit from it; a per-request toggle that is actually safe would need `DflashDraft` to track and
-tolerate gaps in its own ring, which is out of scope for a documentation fix.
+**Sampled (`temperature>0`) traffic no longer pays for the drafter (Milestone 5 follow-up,
+2026-09-21).** This section previously documented a ~3% "known tax" as unfixable; it is fixed. The
+mechanism it described was real: `--dflash` is a `Model`-wide, load-time flag, `Model::Load`
+attaches the drafter, and `RunChunk` used to auto-feed it (per-layer target feature capture +
+`DflashDraft::InjectFeatures`) on *every* prefill chunk and decode step for the life of the process,
+while `Engine::RunRequest`'s `use_dflash` gate only decided whether a request's decode loop *reads*
+drafted tokens (greedy-only, mirroring `use_mtp`). The reason it was recorded rather than fixed was
+that `InjectFeatures` demanded `start_pos == InjectedCount()` (strictly append-only), so skipping
+injection on a sampled turn would have made the very next greedy turn on the same session throw.
+
+**What changed.** `DflashDraft` now tolerates a gap in its own ring: injection is still monotonic,
+but `start_pos > InjectedCount()` is accepted and moves a new validity lower bound,
+`DflashDraft::ValidFrom()`, up to the resume position. That bound is handed to
+`r4dx_dflash_attn_bf16` as its new `store_begin` parameter, which clamps the visible key range to
+`[max(store_begin, q_pos - window + 1), n_injected)` -- so the skipped positions' stale ring bytes
+are never read, and never need clearing (docs/dflash2.md section 5). On top of that,
+`Model::SetDflashInjectionEnabled(bool)` turns the capture *and* the injection off together, and
+`Engine::RunRequest` calls it with `use_dflash` (i.e. `temperature <= 0`) before the request's
+prefill, on both the prefix-reuse and the `Reset()`+re-prefill path. A sampled request therefore
+captures nothing and injects nothing; the next greedy request resumes injection at the current
+position, which is exactly the cold-ring gap the drafter now tolerates.
+
+**Measured, real 64-layer `qwen38-27b-v3.r4dx` at `--layout w4a16` + the w4a16 draft container,
+HIP device 1, one server process at a time.** Identical request each time (`temperature=0.7`,
+`top_p=0.95`, `seed=12345`, 42-token prompt, 128 generated tokens), two runs per configuration,
+after a discarded warm-up request:
+
+| Configuration | sampled decode (run 1 / run 2) | vs plain server |
+|---|---|---|
+| plain server (no `--dflash`) | 28.52 / 28.54 tok/s | -- |
+| `--dflash`, BEFORE this change | 28.03 / 28.04 tok/s | **-1.75%** |
+| `--dflash`, AFTER this change | 28.30 / 28.32 tok/s | **-0.77%** |
+
+**The remaining 0.77% is not the injection, and cannot be removed per-request.** Loading with
+`dflash_draft_k > 0` at all sets `Model::draft_window_ = 8`, which sizes the GDN window state bank
+and KV scratch for a verify window (`kv+gdn_state` 2.35 GiB vs the plain server's 0.34 GiB) and
+makes every plain decode step thread a `num_accepted` pointer through all the GDN layers plus one
+small blocking H2D. That is structural to running a speculative server, not to DFlash2: the control
+run, an `--mtp 7` server (no DFlash2 code involved at all) on the identical request, measured
+**27.96 / 27.98 tok/s** -- a *larger* sampled-traffic cost than the fixed `--dflash` server's. The
+drafter's ~1.0 GiB of VRAM is likewise still held for the life of the process regardless of whether
+any request uses it.
+
+**The honest downside: the first greedy request after sampled traffic drafts from a cold ring.**
+Its drafter has no injected context below the resume position, so its early rounds have less to
+condition on and accept fewer tokens; acceptance recovers as the ring refills behind the frontier.
+Measured on the same server, a greedy multi-turn continuation immediately after two 128-token
+sampled requests (so `PrefixState` extended rather than reset, and the ring really was cold):
+68.86 tok/s, 21 rounds, 21.8% accept, 2.48 tok/round -- against the 33.0% accept / 3.28 tok/round
+a greedy request gets on a fully warm ring. It is still ~1.8x the plain server's 38.59 tok/s on the
+same request, so the trade is a modest acceptance dip on one turn in exchange for sampled requests
+paying nothing at all. `r4dx-cli` is unaffected: it still clears `args.dflash` outright at
+`temperature>0` before `Model::Load` (`src/cli/main.cpp`), which a one-request-per-invocation
+process can do for free.
+
+Covered by `tests/kernels/test_dflash_attn.cpp` (the `store_begin` sweep with the invisible slots
+filled with junk), `tests/model/test_dflash_draft.cpp` Part 5 (a gapped ring drafts bit-identically
+to a ring that only ever saw the post-gap rows) and `tests/model/test_dflash_e2e.cpp`'s
+`CheckInjectionToggleGap` (the full greedy -> injection-off -> greedy-again sequence on the real
+target, whose post-gap tokens must equal an independently loaded non-dflash reference exactly).
 
 ## CLI flags
 

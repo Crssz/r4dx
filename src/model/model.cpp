@@ -352,7 +352,10 @@ void Model::Reset() {
   dflash_feature_rows_ = 0;
   // DFlash2's own KV ring (stage S3): drop every injected position -- the ring's bytes are left
   // alone (same self-correcting-via-position-overwrite argument DflashDraft::Reset()'s own comment
-  // makes), so this is a cheap host-only counter reset, not a device zero/sync.
+  // makes), so this is a cheap host-only counter reset, not a device zero/sync. This also clears
+  // any cold-ring gap (DflashDraft::ValidFrom() back to 0). Deliberately does NOT touch
+  // dflash_injection_enabled_: that is a caller policy about the NEXT request, not state belonging
+  // to the sequence being dropped (model.h's SetDflashInjectionEnabled).
   if (dflash_.has_value()) dflash_->Reset();
 }
 
@@ -367,6 +370,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
   const bool has_init = started_;
+  // DFlash2 target feature capture + drafter injection, as ONE decision (model.h's
+  // SetDflashInjectionEnabled): a chunk either captures and injects, or does neither. Capturing
+  // without injecting would pay the whole per-layer strided D2D cost for rows nothing ever reads,
+  // which is precisely the tax the toggle exists to remove.
+  const bool dflash_capture_active = dflash_injection_enabled_ && !dflash_target_layers_.empty();
 
   // Device-resident draft loop (docs/mtp.md "device-resident draft loop"): when the container's
   // text.embed_tokens has a VRAM mirror (Container::EmbedTokensDeviceResident()), gather straight
@@ -416,9 +424,12 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
     // DFlash2 target feature capture (see CaptureDflashLayerInput's comment above): `cur` right
     // here, before this iteration's Gdn/Attn Forward call, is exactly the residual stream entering
-    // layer `i` -- a no-op when no drafter is attached.
-    CaptureDflashLayerInput(stream_, i, cur, T, hidden, dflash_target_layers_,
-                             dflash_features_dev_.data());
+    // layer `i` -- a no-op when no drafter is attached, and skipped entirely while a caller has
+    // turned injection off (model.h's SetDflashInjectionEnabled).
+    if (dflash_capture_active) {
+      CaptureDflashLayerInput(stream_, i, cur, T, hidden, dflash_target_layers_,
+                               dflash_features_dev_.data());
+    }
 
     if (cfg.IsGdnLayer(i)) {
       GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
@@ -495,7 +506,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
     arena_.Reset();
   }
-  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = T;
+  // Rows 0..T-1 of dflash_features_dev_ are this chunk's captured features -- but ONLY if this
+  // chunk actually captured. When injection is disabled the buffer still holds whatever the last
+  // capturing call left there, so report 0 rows rather than let a caller mistake stale rows for
+  // this chunk's (same reasoning as Reset()'s own zeroing of this counter).
+  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = dflash_capture_active ? T : 0;
 
   // ---- MTP lockstep KV priming (docs/mtp.md, mtp_head.h's PrimeKv comment) ----------------------
   // Extends MtpHead's own KV cache by exactly the real positions THIS call just made knowable --
@@ -597,7 +612,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // complete on the device (the stream_.Synchronize() above already waited for them) and before any
   // later call can overwrite dflash_features_dev_ at row 0. `pos_` is still this chunk's own start
   // position here, which is exactly the absolute position of captured row 0.
-  if (dflash_observer_ && !dflash_target_layers_.empty()) {
+  if (dflash_observer_ && dflash_capture_active) {
     dflash_observer_(dflash_features_dev_.data(), T, pos_);
   }
   // Stage S3: when THIS Model owns its own drafter (ModelOptions::dflash_container), feed it
@@ -606,9 +621,12 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // object with its own, separately-managed lifetime; dflash_ is a member of this very Model, so a
   // direct call needs no captured pointer that a future Model move could invalidate). `pos_` is
   // still this chunk's own start position here, exactly InjectFeatures' own `start_pos` contract
-  // (append-only, must equal DflashDraft::InjectedCount() -- true here because Prefill/DecodeStep*
-  // never skip a chunk's worth of positions and this call always injects every one of them).
-  if (dflash_.has_value() && !dflash_target_layers_.empty()) {
+  // (monotonic, >= DflashDraft::InjectedCount()). It EQUALS InjectedCount() whenever injection has
+  // been on continuously, because Prefill/DecodeStep* never skip a chunk's worth of positions and
+  // this call always injects every one of them; it is strictly GREATER exactly once after a caller
+  // re-enables injection (model.h's SetDflashInjectionEnabled), which InjectFeatures turns into a
+  // cold-ring gap. Either way `InjectedCount() == pos_` holds again on return.
+  if (dflash_.has_value() && dflash_capture_active) {
     dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_);
     // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
     // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
@@ -1239,6 +1257,20 @@ std::vector<int32_t> Model::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   return result;
 }
 
+int64_t Model::DflashInjectedCount() const {
+  if (!dflash_.has_value()) {
+    throw std::runtime_error("Model::DflashInjectedCount: requires DflashEnabled()");
+  }
+  return dflash_->InjectedCount();
+}
+
+int64_t Model::DflashValidFrom() const {
+  if (!dflash_.has_value()) {
+    throw std::runtime_error("Model::DflashValidFrom: requires DflashEnabled()");
+  }
+  return dflash_->ValidFrom();
+}
+
 std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min,
                                                     int64_t n_min, int64_t* walk_len_out,
                                                     DflashRoundTrace* trace_out,
@@ -1251,6 +1283,25 @@ std::vector<int32_t> Model::DecodeStepDflashGreedy(int32_t token_id, int64_t k, 
   if (k < 0 || k > dflash_draft_k_) {
     throw std::runtime_error("Model::DecodeStepDflashGreedy: k must be in [0, " +
                               std::to_string(dflash_draft_k_) + "]");
+  }
+  if (!dflash_injection_enabled_) {
+    throw std::runtime_error(
+        "Model::DecodeStepDflashGreedy: drafter injection is disabled on this Model "
+        "(SetDflashInjectionEnabled(false)), so the drafter's ring frontier lags pos_ and a draft "
+        "block here would be built at the wrong absolute positions -- re-enable injection and run "
+        "at least one RunChunk (a prefill chunk or a plain decode step) first");
+  }
+  // The drift check that backs the whole round path below: DraftRound builds its block at the
+  // DRAFTER's own frontier (InjectedCount()) while VerifyWindow/CommitVerifiedWindow work at the
+  // MODEL's (pos_). These are equal after every injection -- RunChunk injects every chunk's rows,
+  // and the commit block at the end of this method injects every accepted row -- so a mismatch
+  // means some path advanced one without the other, which would silently draft against the wrong
+  // context rather than fail. Cheap (two integer loads) next to a round's own GEMMs.
+  if (dflash_->InjectedCount() != pos_) {
+    throw std::runtime_error(
+        "Model::DecodeStepDflashGreedy: drafter frontier (" +
+        std::to_string(dflash_->InjectedCount()) + ") != Model position (" + std::to_string(pos_) +
+        ") -- the drafter's ring and this Model's committed sequence have drifted apart");
   }
 
   // Built fresh every call (docs/dflash2.md, dflash_draft.h's own doc comment on

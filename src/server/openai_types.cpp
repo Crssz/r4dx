@@ -249,6 +249,26 @@ bool ParseStream(const nlohmann::json& body) {
   return body.at("stream").get<bool>();
 }
 
+// `stream_options: {"include_usage": bool}` -- parsed and validated unconditionally (independent
+// of `stream`): a non-streaming request carrying this field is accepted and the result simply goes
+// unused (see ChatCompletionRequest::stream_options_include_usage's own doc comment for why
+// tolerating it is the friendlier choice over OpenAI's own stricter rejection).
+bool ParseStreamOptions(const nlohmann::json& body) {
+  if (!body.contains("stream_options") || body.at("stream_options").is_null()) return false;
+  const nlohmann::json& so = body.at("stream_options");
+  if (!so.is_object()) {
+    throw ApiError{400, "invalid_request_error", "'stream_options' must be an object"};
+  }
+  bool include_usage = false;
+  if (so.contains("include_usage") && !so.at("include_usage").is_null()) {
+    if (!so.at("include_usage").is_boolean()) {
+      throw ApiError{400, "invalid_request_error", "'stream_options.include_usage' must be a boolean"};
+    }
+    include_usage = so.at("include_usage").get<bool>();
+  }
+  return include_usage;
+}
+
 }  // namespace
 
 nlohmann::json ErrorBody(const ApiError& err) {
@@ -323,6 +343,7 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
   req.max_tokens = ParseMaxTokens(body);
   req.stop = ParseStop(body);
   req.stream = ParseStream(body);
+  req.stream_options_include_usage = ParseStreamOptions(body);
 
   if (body.contains("chat_template_kwargs") && !body.at("chat_template_kwargs").is_null()) {
     if (!body.at("chat_template_kwargs").is_object()) {
@@ -372,6 +393,7 @@ CompletionRequest ParseCompletionRequest(const nlohmann::json& body,
   req.max_tokens = ParseMaxTokens(body);
   req.stop = ParseStop(body);
   req.stream = ParseStream(body);
+  req.stream_options_include_usage = ParseStreamOptions(body);
   return req;
 }
 
@@ -396,10 +418,28 @@ nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_
                                             {"owned_by", "r4dx"}}})}};
 }
 
+nlohmann::json BuildTimingsJson(const TimingStats& timings) {
+  const double prompt_per_second =
+      timings.prompt_ms > 0.0 ? timings.prompt_n / (timings.prompt_ms / 1000.0) : 0.0;
+  const double predicted_per_second =
+      timings.predicted_ms > 0.0 ? timings.predicted_n / (timings.predicted_ms / 1000.0) : 0.0;
+  nlohmann::json out = {{"prompt_n", timings.prompt_n},
+                        {"prompt_ms", timings.prompt_ms},
+                        {"prompt_per_second", prompt_per_second},
+                        {"predicted_n", timings.predicted_n},
+                        {"predicted_ms", timings.predicted_ms},
+                        {"predicted_per_second", predicted_per_second}};
+  if (timings.draft_n) {
+    out["draft_n"] = *timings.draft_n;
+    out["draft_n_accepted"] = timings.draft_n_accepted.value_or(0);
+  }
+  return out;
+}
+
 nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::string& model_id,
                                             int64_t created_unix, const std::string& content,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage) {
+                                            const UsageStats& usage, const TimingStats& timings) {
   return {{"id", id},
           {"object", "chat.completion"},
           {"created", created_unix},
@@ -410,7 +450,8 @@ nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::str
           {"usage",
            {{"prompt_tokens", usage.prompt_tokens},
             {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}}};
+            {"total_tokens", usage.TotalTokens()}}},
+          {"timings", BuildTimingsJson(timings)}};
 }
 
 nlohmann::json BuildToolCallsJson(const std::vector<ToolCallOut>& tool_calls) {
@@ -429,7 +470,7 @@ nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::str
                                             const std::optional<std::string>& content,
                                             const std::vector<ToolCallOut>& tool_calls,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage) {
+                                            const UsageStats& usage, const TimingStats& timings) {
   nlohmann::json message = {{"role", "assistant"}, {"content", content ? nlohmann::json(*content) : nlohmann::json(nullptr)}};
   if (!tool_calls.empty()) message["tool_calls"] = BuildToolCallsJson(tool_calls);
   return {{"id", id},
@@ -442,13 +483,16 @@ nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::str
           {"usage",
            {{"prompt_tokens", usage.prompt_tokens},
             {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}}};
+            {"total_tokens", usage.TotalTokens()}}},
+          {"timings", BuildTimingsJson(timings)}};
 }
 
 nlohmann::json BuildChatCompletionChunk(const std::string& id, const std::string& model_id,
                                          int64_t created_unix, const nlohmann::json& delta,
-                                         const std::optional<std::string>& finish_reason) {
-  return {{"id", id},
+                                         const std::optional<std::string>& finish_reason,
+                                         bool include_usage_null,
+                                         const std::optional<TimingStats>& timings) {
+  nlohmann::json out = {{"id", id},
           {"object", "chat.completion.chunk"},
           {"created", created_unix},
           {"model", model_id},
@@ -456,11 +500,30 @@ nlohmann::json BuildChatCompletionChunk(const std::string& id, const std::string
                                                {"delta", delta},
                                                {"finish_reason", finish_reason ? nlohmann::json(*finish_reason)
                                                                                 : nlohmann::json(nullptr)}}})}};
+  if (include_usage_null) out["usage"] = nullptr;
+  if (timings) out["timings"] = BuildTimingsJson(*timings);
+  return out;
+}
+
+nlohmann::json BuildChatCompletionUsageChunk(const std::string& id, const std::string& model_id,
+                                              int64_t created_unix, const UsageStats& usage,
+                                              const TimingStats& timings) {
+  return {{"id", id},
+          {"object", "chat.completion.chunk"},
+          {"created", created_unix},
+          {"model", model_id},
+          {"choices", nlohmann::json::array()},
+          {"usage",
+           {{"prompt_tokens", usage.prompt_tokens},
+            {"completion_tokens", usage.completion_tokens},
+            {"total_tokens", usage.TotalTokens()}}},
+          {"timings", BuildTimingsJson(timings)}};
 }
 
 nlohmann::json BuildCompletionResponse(const std::string& id, const std::string& model_id,
                                         int64_t created_unix, const std::string& text,
-                                        const std::string& finish_reason, const UsageStats& usage) {
+                                        const std::string& finish_reason, const UsageStats& usage,
+                                        const TimingStats& timings) {
   return {{"id", id},
           {"object", "text_completion"},
           {"created", created_unix},
@@ -472,13 +535,16 @@ nlohmann::json BuildCompletionResponse(const std::string& id, const std::string&
           {"usage",
            {{"prompt_tokens", usage.prompt_tokens},
             {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}}};
+            {"total_tokens", usage.TotalTokens()}}},
+          {"timings", BuildTimingsJson(timings)}};
 }
 
 nlohmann::json BuildCompletionChunk(const std::string& id, const std::string& model_id,
                                      int64_t created_unix, const std::string& text_delta,
-                                     const std::optional<std::string>& finish_reason) {
-  return {{"id", id},
+                                     const std::optional<std::string>& finish_reason,
+                                     bool include_usage_null,
+                                     const std::optional<TimingStats>& timings) {
+  nlohmann::json out = {{"id", id},
           {"object", "text_completion"},
           {"created", created_unix},
           {"model", model_id},
@@ -487,6 +553,24 @@ nlohmann::json BuildCompletionChunk(const std::string& id, const std::string& mo
                                                {"logprobs", nullptr},
                                                {"finish_reason", finish_reason ? nlohmann::json(*finish_reason)
                                                                                 : nlohmann::json(nullptr)}}})}};
+  if (include_usage_null) out["usage"] = nullptr;
+  if (timings) out["timings"] = BuildTimingsJson(*timings);
+  return out;
+}
+
+nlohmann::json BuildCompletionUsageChunk(const std::string& id, const std::string& model_id,
+                                          int64_t created_unix, const UsageStats& usage,
+                                          const TimingStats& timings) {
+  return {{"id", id},
+          {"object", "text_completion"},
+          {"created", created_unix},
+          {"model", model_id},
+          {"choices", nlohmann::json::array()},
+          {"usage",
+           {{"prompt_tokens", usage.prompt_tokens},
+            {"completion_tokens", usage.completion_tokens},
+            {"total_tokens", usage.TotalTokens()}}},
+          {"timings", BuildTimingsJson(timings)}};
 }
 
 }  // namespace r4dx::server

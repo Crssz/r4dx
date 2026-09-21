@@ -260,8 +260,9 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 // The draft block's own attention (docs/dflash2.md section 4.2 / the "SWA visibility rule" row of
 // section 2's table). For query row t (absolute position q_pos = n_injected + t) the visible key
 // set is:
-//   * injected-store positions p in [max(0, q_pos - window + 1), n_injected - 1]   (the SWA rule
-//     `q_pos - p < window`, plus "only already-injected positions"), read at slot p % slots;
+//   * injected-store positions p in [max(store_begin, q_pos - window + 1), n_injected - 1]   (the
+//     SWA rule `q_pos - p < window`, plus "only already-injected positions"), read at slot
+//     p % slots;
 //   * ALL T of the block's own keys, unconditionally -- the block is non-causal, and a block key
 //     in the query's future is never masked (`attention.causal=false`; the SWA rule's
 //     `q_pos - p < window` is trivially true for a negative difference).
@@ -278,13 +279,22 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 // v_store:  [slots, heads_kv, head_dim] bf16
 // out:      [T, heads_q, head_dim] bf16.
 // n_injected: number of positions already injected (== the block's start position).
+// store_begin: the FIRST position in the ring whose contents are valid, i.e. the visible store is
+//   the CONTIGUOUS run [store_begin, n_injected) intersected with the sliding window. 0 (the
+//   original behaviour, and the only value any caller passed before) means "everything injected so
+//   far is valid". A caller that stopped injecting for a while and then resumed at a higher
+//   position (r4dx::model::DflashDraft's cold-ring gap, docs/dflash2.md section 5) passes the
+//   resume position here, and the ring bytes for the skipped positions are then never read -- which
+//   is why they need not be cleared, exactly the "self-correcting via position overwrite" argument
+//   the append-only case already relies on. Slot mapping stays `p % slots` over TRUE absolute
+//   positions either way, so nothing about rope or the ring geometry changes.
 // Preconditions (throw, not silently wrong): 1 <= T <= 8; head_dim <= 128 and head_dim % 32 == 0;
 // heads_q % heads_kv == 0 and the ratio <= 4; 1 <= window <= 2048; window <= slots (so the visible
-// store range can never alias itself in the ring).
+// store range can never alias itself in the ring); 0 <= store_begin <= n_injected.
 void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
                             int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
-                            int head_dim, int n_injected, int window, int slots, float scale,
-                            int64_t stream);
+                            int head_dim, int n_injected, int store_begin, int window, int slots,
+                            float scale, int64_t stream);
 
 // ---- DFlash2 grouped dynamic depthwise conv (thin wrapper over libr4d) -------------------------
 // out[t,c] = (base[side,0,c] + dyn[t, side*taps*NG + 0*NG + g]) * x[t,c]

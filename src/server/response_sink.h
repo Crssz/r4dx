@@ -34,8 +34,14 @@ class ResponseSink {
 
   // Called exactly once, after either the last OnToken or immediately (zero generated tokens).
   // `finish_reason` is one of "stop" (eos or a --stop string matched), "length" (max_tokens
-  // reached), or "cancelled" (client disconnected mid-stream, see IsCancelled below).
-  virtual void OnDone(const std::string& finish_reason, int64_t completion_tokens) = 0;
+  // reached), or "cancelled" (client disconnected mid-stream, see IsCancelled below). `timings`
+  // (task's "timings" object, llama.cpp-compatible field names) is always attached as a top-level
+  // sibling of `usage` in whatever this sink ultimately produces -- BufferingSink just stores it
+  // for http_server.cpp to hand to the non-streaming response builders; StreamingSink attaches it
+  // to the finish_reason chunk it pushes here. Defaulted so call sites that don't care (most
+  // existing tests) don't need updating.
+  virtual void OnDone(const std::string& finish_reason, int64_t completion_tokens,
+                       const TimingStats& timings = {}) = 0;
 
   // Called instead of OnDone if something failed before or during generation (a bad request that
   // slipped past validation, a KV-cache-capacity overrun, ...).
@@ -61,7 +67,8 @@ class BufferingSink : public ResponseSink {
  public:
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
-  void OnDone(const std::string& finish_reason, int64_t completion_tokens) override;
+  void OnDone(const std::string& finish_reason, int64_t completion_tokens,
+              const TimingStats& timings = {}) override;
   void OnError(int http_status, const std::string& message) override;
 
   // Blocks the calling thread until OnDone or OnError has been called.
@@ -73,6 +80,7 @@ class BufferingSink : public ResponseSink {
   std::string finish_reason;
   int64_t prompt_tokens = 0;
   int64_t completion_tokens = 0;
+  TimingStats timings;  // set by OnDone -- http_server.cpp hands this to the response builders
   bool errored = false;
   int error_status = 500;
   std::string error_message;
@@ -91,11 +99,17 @@ class StreamingSink : public ResponseSink {
  public:
   enum class Kind { kChat, kCompletion };
 
-  StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix);
+  // `include_usage`: this request's `stream_options.include_usage` (openai_types.h). When true,
+  // every chunk this sink pushes carries a top-level `"usage": null` except one dedicated chunk
+  // pushed after the finish_reason chunk (empty `choices`, the real `usage` + `timings`), right
+  // before `[DONE]` -- OpenAI's own `stream_options.include_usage` contract.
+  StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
+                bool include_usage = false);
 
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
-  void OnDone(const std::string& finish_reason, int64_t completion_tokens) override;
+  void OnDone(const std::string& finish_reason, int64_t completion_tokens,
+              const TimingStats& timings = {}) override;
   void OnError(int http_status, const std::string& message) override;
   void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
   bool IsCancelled() const override { return cancelled_.load(std::memory_order_relaxed); }
@@ -114,6 +128,9 @@ class StreamingSink : public ResponseSink {
   Kind kind_;
   std::string id_, model_id_;
   int64_t created_unix_;
+  bool include_usage_;
+  int64_t prompt_tokens_ = 0;  // set by OnStart, used to build the dedicated usage chunk's usage
+                                // object (OnDone only receives completion_tokens directly).
   std::atomic<bool> cancelled_{false};
   BoundedQueue<std::string> queue_;  // formatted SSE events; small bounded capacity gives natural
                                       // backpressure against a slow/stalled client.

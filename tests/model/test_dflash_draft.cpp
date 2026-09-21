@@ -229,9 +229,10 @@ struct SyntheticTarget {
 };
 
 // Uploads `rows` feature rows (fp32 host -> bf16 device) and injects them in <=64-row pieces,
-// exactly as a real driver drains Model's own capture buffer chunk by chunk.
+// exactly as a real driver drains Model's own capture buffer chunk by chunk. `base_pos` shifts the
+// whole run to a higher absolute position, which Part 5 uses to open a cold-ring gap.
 void InjectAll(DflashDraft& d, Stream& stream, Arena& arena, const std::vector<float>& features_f32,
-               int64_t rows, int64_t cols) {
+               int64_t rows, int64_t cols, int64_t base_pos = 0) {
   DeviceBuffer<uint16_t> stage(static_cast<size_t>(64 * cols));
   std::vector<uint16_t> host(static_cast<size_t>(64 * cols));
   for (int64_t off = 0; off < rows; off += 64) {
@@ -240,7 +241,7 @@ void InjectAll(DflashDraft& d, Stream& stream, Arena& arena, const std::vector<f
       host[static_cast<size_t>(i)] = FloatToBf16(features_f32[static_cast<size_t>(off * cols + i)]);
     }
     stage.CopyFromHost(host.data(), static_cast<size_t>(n * cols));
-    d.InjectFeatures(stream, arena, stage.data(), n, off);
+    d.InjectFeatures(stream, arena, stage.data(), n, base_pos + off);
     stream.Synchronize();
     arena.Reset();
   }
@@ -706,6 +707,79 @@ int main() {
       if (id < 0 || id >= vocab) Fail("FAIL: w4a16 drafted an out-of-vocab id %d\n", id);
     }
     if (res_qe.tokens.empty()) Fail("FAIL: w4a16 drafted nothing at all\n");
+  }
+
+  // ---- Part 5: cold-ring gap (docs/dflash2.md section 5, InjectFeatures' relaxed invariant) ------
+  // A caller may stop feeding the drafter and resume at a HIGHER absolute position (the server's
+  // per-request injection toggle). The rows below the resume point are then stale and must be
+  // invisible -- not "nearly invisible", invisible: the round's whole device pipeline runs the
+  // identical kernel sequence either way (the visible key count `n_injected - lo` is the same), so
+  // the only possible difference is whether those bytes enter the attention scores at all. The gate
+  // is therefore BIT-EQUALITY, not a tolerance.
+  //
+  // Run A: inject rows [0,40), then the SAME 40 rows again at position 100 -- a 60-position gap
+  //        whose ring slots hold run A's own first injection (real, plausible, non-zero data, which
+  //        is a much harder probe than zeros would be: reading it produces a valid-looking answer).
+  // Run B: a ring that has ONLY ever seen rows at [100,140), from Reset().
+  // Both then draft at n=140 with the same anchor through the same real synthetic lm_head.
+  std::printf("[Part 5] cold-ring gap: rows [0,40) then a resume at 100 must be invisible\n");
+  {
+    const int64_t kGapResume = 100;
+    DflashRoundTrace tr_gap, tr_fresh;
+    DflashDraftResult res_gap, res_fresh;
+
+    draft.Reset();
+    InjectAll(draft, stream, arena, feat_a, n_inj_a, feat_cols, /*base_pos=*/0);
+    if (draft.ValidFrom() != 0) {
+      Fail("FAIL: ValidFrom()=%lld after a plain append-only injection (expected 0)\n",
+           (long long)draft.ValidFrom());
+    }
+    InjectAll(draft, stream, arena, feat_a, n_inj_a, feat_cols, /*base_pos=*/kGapResume);
+    if (draft.ValidFrom() != kGapResume || draft.InjectedCount() != kGapResume + n_inj_a) {
+      Fail("FAIL: after the gap, ValidFrom()=%lld InjectedCount()=%lld (expected %lld / %lld)\n",
+           (long long)draft.ValidFrom(), (long long)draft.InjectedCount(), (long long)kGapResume,
+           (long long)(kGapResume + n_inj_a));
+    }
+    res_gap = draft.DraftRound(stream, arena, anchor_a, B - 1, 0.0f, 0, embed, lm_head, &tr_gap);
+    arena.Reset();
+
+    draft.Reset();
+    InjectAll(draft, stream, arena, feat_a, n_inj_a, feat_cols, /*base_pos=*/kGapResume);
+    if (draft.ValidFrom() != kGapResume || draft.InjectedCount() != kGapResume + n_inj_a) {
+      Fail("FAIL: fresh-from-Reset injection at %lld gave ValidFrom()=%lld InjectedCount()=%lld\n",
+           (long long)kGapResume, (long long)draft.ValidFrom(), (long long)draft.InjectedCount());
+    }
+    res_fresh =
+        draft.DraftRound(stream, arena, anchor_a, B - 1, 0.0f, 0, embed, lm_head, &tr_fresh);
+    arena.Reset();
+
+    const bool xf_same = tr_gap.x_final_normed == tr_fresh.x_final_normed;
+    const bool logits_same = tr_gap.logits == tr_fresh.logits;
+    const bool chain_same = res_gap.tokens == res_fresh.tokens;
+    std::printf("  %-34s x_final=%s logits=%s chain=%s %s\n", "gap rows invisible (bit-exact)",
+                xf_same ? "eq" : "NE", logits_same ? "eq" : "NE", chain_same ? "eq" : "NE",
+                (xf_same && logits_same && chain_same) ? "[PASS]" : "[FAIL]");
+    if (!(xf_same && logits_same && chain_same)) {
+      ++g_failures;
+      std::printf("    the pre-gap rows [0,40) leaked into the round -- store_begin/ValidFrom is "
+                  "not reaching the attention kernel\n");
+    }
+
+    // The same check one step further: injecting BELOW the frontier must still throw (that is the
+    // rollback direction docs/dflash2.md section 5 rules out, and the half of the old append-only
+    // check that is deliberately kept).
+    bool threw = false;
+    try {
+      DeviceBuffer<uint16_t> stage(static_cast<size_t>(feat_cols));
+      stage.Zero();
+      draft.InjectFeatures(stream, arena, stage.data(), 1, draft.InjectedCount() - 1);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    arena.Reset();
+    std::printf("  %-34s threw=%s %s\n", "inject below frontier rejected", threw ? "yes" : "NO",
+                threw ? "[PASS]" : "[FAIL]");
+    if (!threw) ++g_failures;
   }
 
   std::printf(g_failures == 0 ? "[PASS] test_dflash_draft: all checks passed\n"

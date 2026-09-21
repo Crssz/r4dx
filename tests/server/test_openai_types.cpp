@@ -367,7 +367,12 @@ void TestBuildModelsResponse() {
 
 void TestBuildChatCompletionResponse() {
   UsageStats usage{7, 3};
-  const json resp = BuildChatCompletionResponse("id1", "m", 42, "hello", "stop", usage);
+  TimingStats timings;
+  timings.prompt_n = 7;
+  timings.prompt_ms = 100.0;
+  timings.predicted_n = 3;
+  timings.predicted_ms = 60.0;
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, "hello", "stop", usage, timings);
   CHECK(resp.at("id") == "id1");
   CHECK(resp.at("object") == "chat.completion");
   CHECK(resp.at("model") == "m");
@@ -377,6 +382,162 @@ void TestBuildChatCompletionResponse() {
   CHECK(resp.at("usage").at("prompt_tokens") == 7);
   CHECK(resp.at("usage").at("completion_tokens") == 3);
   CHECK(resp.at("usage").at("total_tokens") == 10);
+  CHECK(resp.at("timings").at("prompt_n") == 7);
+  CHECK(resp.at("timings").at("predicted_n") == 3);
+}
+
+// ---- timings (task point 1) --------------------------------------------------------------------
+
+void TestBuildTimingsJsonArithmetic() {
+  TimingStats t;
+  t.prompt_n = 100;
+  t.prompt_ms = 200.0;  // 500 tok/s
+  t.predicted_n = 50;
+  t.predicted_ms = 250.0;  // 200 tok/s
+  const json j = BuildTimingsJson(t);
+  CHECK(j.at("prompt_n") == 100);
+  CHECK(j.at("prompt_ms") == 200.0);
+  CHECK(j.at("prompt_per_second") == 500.0);
+  CHECK(j.at("predicted_n") == 50);
+  CHECK(j.at("predicted_ms") == 250.0);
+  CHECK(j.at("predicted_per_second") == 200.0);
+  CHECK(!j.contains("draft_n"));
+  CHECK(!j.contains("draft_n_accepted"));
+}
+
+void TestBuildTimingsJsonZeroMsAvoidsDivideByZero() {
+  TimingStats t;  // every field defaults to 0
+  const json j = BuildTimingsJson(t);
+  CHECK(j.at("prompt_per_second") == 0.0);
+  CHECK(j.at("predicted_per_second") == 0.0);
+  CHECK(!j.at("prompt_per_second").is_null());
+  CHECK(!j.at("predicted_per_second").is_null());
+  // Round-trip through dump()/parse() -- a NaN/inf would fail nlohmann's own JSON dump (it throws
+  // type_error.406 rather than emit invalid JSON), so a successful dump()+re-parse is itself proof
+  // there is no NaN/inf hiding in there.
+  const std::string dumped = j.dump();
+  CHECK(nlohmann::json::parse(dumped).at("prompt_per_second") == 0.0);
+}
+
+void TestBuildTimingsJsonDraftFieldsPresentWhenSet() {
+  TimingStats t;
+  t.prompt_n = 10;
+  t.prompt_ms = 10.0;
+  t.predicted_n = 20;
+  t.predicted_ms = 20.0;
+  t.draft_n = 32;
+  t.draft_n_accepted = 24;
+  const json j = BuildTimingsJson(t);
+  CHECK(j.contains("draft_n"));
+  CHECK(j.at("draft_n") == 32);
+  CHECK(j.contains("draft_n_accepted"));
+  CHECK(j.at("draft_n_accepted") == 24);
+}
+
+void TestBuildTimingsJsonDraftFieldsAbsentWhenUnset() {
+  TimingStats t;
+  t.prompt_n = 10;
+  t.prompt_ms = 10.0;
+  // draft_n/draft_n_accepted left unset -- the "no speculative path ran" case.
+  const json j = BuildTimingsJson(t);
+  CHECK(!j.contains("draft_n"));
+  CHECK(!j.contains("draft_n_accepted"));
+}
+
+void TestBuildCompletionResponseAttachesTimings() {
+  UsageStats usage{4, 2};
+  TimingStats timings;
+  timings.prompt_n = 4;
+  timings.prompt_ms = 8.0;
+  timings.predicted_n = 2;
+  timings.predicted_ms = 4.0;
+  const json resp = BuildCompletionResponse("id2", "m", 1, "text out", "length", usage, timings);
+  CHECK(resp.at("timings").at("prompt_n") == 4);
+  CHECK(resp.at("timings").at("predicted_n") == 2);
+}
+
+void TestBuildChatCompletionChunkTimingsOnlyWhenProvided() {
+  const json noTimings = BuildChatCompletionChunk("id1", "m", 42, json::object(), std::string("stop"));
+  CHECK(!noTimings.contains("timings"));
+  CHECK(!noTimings.contains("usage"));
+
+  TimingStats t;
+  t.prompt_n = 5;
+  const json withTimings =
+      BuildChatCompletionChunk("id1", "m", 42, json::object(), std::string("stop"), false, t);
+  CHECK(withTimings.at("timings").at("prompt_n") == 5);
+  CHECK(!withTimings.contains("usage"));
+
+  const json withUsageNull =
+      BuildChatCompletionChunk("id1", "m", 42, {{"content", "hi"}}, std::nullopt, true);
+  CHECK(withUsageNull.at("usage").is_null());
+  CHECK(!withUsageNull.contains("timings"));
+}
+
+void TestBuildChatCompletionUsageChunkShape() {
+  UsageStats usage{7, 3};
+  TimingStats timings;
+  timings.prompt_n = 7;
+  const json j = BuildChatCompletionUsageChunk("id1", "m", 42, usage, timings);
+  CHECK(j.at("object") == "chat.completion.chunk");
+  CHECK(j.at("choices").is_array() && j.at("choices").empty());
+  CHECK(j.at("usage").at("completion_tokens") == 3);
+  CHECK(j.at("timings").at("prompt_n") == 7);
+}
+
+void TestBuildCompletionUsageChunkShape() {
+  UsageStats usage{4, 2};
+  TimingStats timings;
+  const json j = BuildCompletionUsageChunk("id2", "m", 1, usage, timings);
+  CHECK(j.at("object") == "text_completion");
+  CHECK(j.at("choices").is_array() && j.at("choices").empty());
+  CHECK(j.at("usage").at("prompt_tokens") == 4);
+}
+
+// ---- stream_options (task point 2) --------------------------------------------------------------
+
+void TestStreamOptionsAbsentDefaultsFalse() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(!req.stream_options_include_usage);
+}
+
+void TestStreamOptionsIncludeUsageTrueParsed() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"stream", true},
+               {"stream_options", {{"include_usage", true}}}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.stream_options_include_usage);
+}
+
+void TestStreamOptionsOnNonStreamingRequestAcceptedAndIgnored() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"stream", false},
+               {"stream_options", {{"include_usage", true}}}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(!req.stream);
+  CHECK(req.stream_options_include_usage);  // parsed regardless -- just unused by a BufferingSink
+}
+
+void TestStreamOptionsNotAnObjectThrows() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"stream_options", "yes"}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestStreamOptionsIncludeUsageNotBooleanThrows() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+               {"stream_options", {{"include_usage", "yes"}}}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestCompletionStreamOptionsParsedTheSameWay() {
+  json body = {{"prompt", "hi"}, {"stream_options", {{"include_usage", true}}}};
+  const auto req = ParseCompletionRequest(body);
+  CHECK(req.stream_options_include_usage);
+
+  json bad = {{"prompt", "hi"}, {"stream_options", 5}};
+  CHECK(ThrowsApiError([&] { ParseCompletionRequest(bad); }, 400));
 }
 
 void TestBuildToolCallsJson() {
@@ -394,27 +555,31 @@ void TestBuildToolCallsJson() {
 
 void TestBuildChatCompletionResponseWithToolCalls() {
   UsageStats usage{10, 5};
+  TimingStats timings;
   const json resp = BuildChatCompletionResponse("id1", "m", 42, std::nullopt,
-                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage);
+                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage, timings);
   const json& msg = resp.at("choices")[0].at("message");
   CHECK(msg.at("content").is_null());
   CHECK(msg.at("tool_calls").size() == 1);
   CHECK(msg.at("tool_calls")[0].at("function").at("name") == "f");
   CHECK(resp.at("choices")[0].at("finish_reason") == "tool_calls");
+  CHECK(resp.contains("timings"));
 }
 
 void TestBuildChatCompletionResponseWithProseAndToolCalls() {
   UsageStats usage{10, 5};
+  TimingStats timings;
   const json resp = BuildChatCompletionResponse("id1", "m", 42, std::string("Let me check."),
-                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage);
+                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage, timings);
   CHECK(resp.at("choices")[0].at("message").at("content") == "Let me check.");
   CHECK(resp.at("choices")[0].at("message").at("tool_calls").size() == 1);
 }
 
 void TestBuildChatCompletionResponseNoToolCallsOmitsField() {
   UsageStats usage{1, 1};
+  TimingStats timings;
   const json resp =
-      BuildChatCompletionResponse("id1", "m", 42, std::string("hi"), {}, "stop", usage);
+      BuildChatCompletionResponse("id1", "m", 42, std::string("hi"), {}, "stop", usage, timings);
   CHECK(!resp.at("choices")[0].at("message").contains("tool_calls"));
 }
 
@@ -430,7 +595,8 @@ void TestBuildChatCompletionChunk() {
 
 void TestBuildCompletionResponseAndChunk() {
   UsageStats usage{4, 2};
-  const json resp = BuildCompletionResponse("id2", "m", 1, "text out", "length", usage);
+  TimingStats timings;
+  const json resp = BuildCompletionResponse("id2", "m", 1, "text out", "length", usage, timings);
   CHECK(resp.at("object") == "text_completion");
   CHECK(resp.at("choices")[0].at("text") == "text out");
   CHECK(resp.at("choices")[0].at("finish_reason") == "length");
@@ -502,6 +668,20 @@ int main() {
   TestBuildCompletionResponseAndChunk();
   TestGenerateRequestIdPrefixAndUniqueness();
   TestErrorBody();
+  TestBuildTimingsJsonArithmetic();
+  TestBuildTimingsJsonZeroMsAvoidsDivideByZero();
+  TestBuildTimingsJsonDraftFieldsPresentWhenSet();
+  TestBuildTimingsJsonDraftFieldsAbsentWhenUnset();
+  TestBuildCompletionResponseAttachesTimings();
+  TestBuildChatCompletionChunkTimingsOnlyWhenProvided();
+  TestBuildChatCompletionUsageChunkShape();
+  TestBuildCompletionUsageChunkShape();
+  TestStreamOptionsAbsentDefaultsFalse();
+  TestStreamOptionsIncludeUsageTrueParsed();
+  TestStreamOptionsOnNonStreamingRequestAcceptedAndIgnored();
+  TestStreamOptionsNotAnObjectThrows();
+  TestStreamOptionsIncludeUsageNotBooleanThrows();
+  TestCompletionStreamOptionsParsedTheSameWay();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

@@ -155,6 +155,54 @@ try {
     Check ($chat.usage.prompt_tokens -gt 0) "chat completion: usage.prompt_tokens > 0"
     Check ($chat.usage.total_tokens -ge $chat.usage.prompt_tokens) "chat completion: usage.total_tokens >= prompt_tokens"
 
+    # ---- `timings` (docs/server.md's "timings" section) on the non-streaming response -----------
+    Check ($null -ne $chat.timings) "chat completion: timings object is present"
+    Check ($chat.timings.predicted_per_second -gt 0) "chat completion: timings.predicted_per_second > 0"
+    Check ($chat.timings.predicted_n -eq $chat.usage.completion_tokens) "chat completion: timings.predicted_n == usage.completion_tokens"
+    Check ($chat.timings.prompt_n -gt 0) "chat completion: timings.prompt_n > 0"
+
+    # ---- `timings.prompt_n` reflects prefix reuse (docs/server.md's "prompt_n semantics under
+    # prefix reuse"): a second request that just extends the first request's own conversation
+    # (same messages plus the assistant's real reply plus one more user turn) should only prefill
+    # the newly-appended tail, so its own timings.prompt_n comes back smaller than its own
+    # usage.prompt_tokens (the whole growing conversation's token count). Run back to back with
+    # nothing else in between, so nothing else can invalidate the prefix in the meantime. The
+    # strict "smaller" assertion is only meaningful against a real container -- like -ToolRoundTrip
+    # above, the 4-layer test container's nonsense generated text is not guaranteed to round-trip
+    # byte-for-byte back through encode(decode(...)) (this tokenizer's own documented NFC-
+    # normalizer gap, tokenizer.h), which can make request 2's re-render diverge from what was
+    # actually committed to KV and force a Reset() instead of a prefix match -- not a server bug.
+    $prefixReuseBody1 = @{
+        messages    = @(@{ role = "user"; content = "What is 2 plus 2?" })
+        max_tokens  = 8
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 5
+    $prefixReuseResp1 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $prefixReuseBody1 -UseBasicParsing
+    $prefixReuseChat1 = $prefixReuseResp1.Content | ConvertFrom-Json
+
+    $prefixReuseBody2 = @{
+        messages    = @(
+            @{ role = "user"; content = "What is 2 plus 2?" },
+            @{ role = "assistant"; content = $prefixReuseChat1.choices[0].message.content },
+            @{ role = "user"; content = "And what is 3 plus 3?" }
+        )
+        max_tokens  = 8
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 5
+    $prefixReuseResp2 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $prefixReuseBody2 -UseBasicParsing
+    $prefixReuseChat2 = $prefixReuseResp2.Content | ConvertFrom-Json
+    Check ($prefixReuseResp2.StatusCode -eq 200) "prefix reuse: extending-conversation request returns 200"
+    if ($Layers -lt 0) {
+        Check ($prefixReuseChat2.timings.prompt_n -lt $prefixReuseChat2.usage.prompt_tokens) `
+            "prefix reuse: second request's timings.prompt_n ($($prefixReuseChat2.timings.prompt_n)) < usage.prompt_tokens ($($prefixReuseChat2.usage.prompt_tokens))"
+    } else {
+        Write-Output "  [SKIP] prefix reuse: prompt_n < usage.prompt_tokens (only checked against a real container, -Layers -1)"
+    }
+
     # ---- POST /v1/chat/completions, streaming (SSE) ---------------------------------------------
     # Invoke-WebRequest buffers the whole body, but that's fine here: we only need to check the
     # final SSE framing/shape, not observe incremental delivery.
@@ -184,6 +232,50 @@ try {
         if ($null -ne $c.choices[0].finish_reason) { $sawFinishReason = $true }
     }
     Check $sawFinishReason "chat completion (streaming): some event carries a non-null finish_reason"
+    $sawTimings = $false
+    foreach ($ev in $rawEvents) {
+        if ($ev -eq "data: [DONE]") { continue }
+        $c = ($ev -replace "^data: ", "") | ConvertFrom-Json
+        if ($null -ne $c.timings) { $sawTimings = $true }
+    }
+    Check $sawTimings "chat completion (streaming): the finish_reason chunk carries a timings object"
+
+    # ---- streaming WITHOUT stream_options: no chunk may carry a "usage" key at all ---------------
+    # (docs/server.md's `stream_options.include_usage` contract -- byte-for-byte unchanged apart
+    # from the new `timings` key on the finish_reason chunk, checked just above).
+    $noUsageKeyAnywhere = $true
+    foreach ($ev in $rawEvents) {
+        if ($ev -eq "data: [DONE]") { continue }
+        if (($ev -replace "^data: ", "") -match '"usage"') { $noUsageKeyAnywhere = $false }
+    }
+    Check $noUsageKeyAnywhere "chat completion (streaming, no stream_options): no chunk has a 'usage' key"
+
+    # ---- streaming WITH stream_options.include_usage=true -----------------------------------------
+    $streamUsageBody = @{
+        messages       = @(@{ role = "user"; content = "Count to three." })
+        max_tokens     = 8
+        temperature    = 0
+        stream         = $true
+        stream_options = @{ include_usage = $true }
+    } | ConvertTo-Json -Depth 5
+    $streamUsageResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $streamUsageBody -UseBasicParsing
+    Check ($streamUsageResp.StatusCode -eq 200) "chat completion (streaming, include_usage): returns 200"
+    $usageEvents = $streamUsageResp.Content -split "`n`n" | Where-Object { $_.Trim().Length -gt 0 }
+    Check ($usageEvents[-1] -eq "data: [DONE]") "chat completion (streaming, include_usage): last raw event is '[DONE]'"
+    $usageChunks = $usageEvents | Where-Object { $_ -ne "data: [DONE]" } | ForEach-Object { ($_ -replace "^data: ", "") | ConvertFrom-Json }
+    $lastDataChunk = $usageChunks[-1]
+    Check ($lastDataChunk.choices.Count -eq 0) "chat completion (streaming, include_usage): the last data chunk before [DONE] has empty choices"
+    Check ($null -ne $lastDataChunk.usage -and $lastDataChunk.usage.completion_tokens -gt 0) `
+        "chat completion (streaming, include_usage): the last data chunk's usage.completion_tokens > 0"
+    Check ($null -ne $lastDataChunk.timings) "chat completion (streaming, include_usage): the last data chunk carries timings"
+    $earlierChunksAllNullUsage = $true
+    for ($i = 0; $i -lt $usageChunks.Count - 1; $i++) {
+        if (-not ($usageChunks[$i].PSObject.Properties.Name -contains "usage") -or $null -ne $usageChunks[$i].usage) {
+            $earlierChunksAllNullUsage = $false
+        }
+    }
+    Check $earlierChunksAllNullUsage "chat completion (streaming, include_usage): every earlier chunk has usage == null"
 
     # ---- Two consecutive DIFFERENT-prompt requests must Reset(), never reload the container ------
     # docs/server.md's "Reset cost": a prefix mismatch used to pay a full Model::Load() (~18.6s
@@ -226,6 +318,24 @@ try {
     if ($Dflash -ne "") {
         $dflashLines = @(Select-String -Path $ServerErrLog -Pattern " dflash: " -SimpleMatch -ErrorAction SilentlyContinue)
         Check ($dflashLines.Count -ge 1) "-Dflash: at least one request log line shows the DFlash2 path was taken"
+    }
+
+    # ---- timings.draft_n / draft_n_accepted (docs/server.md's "timings" section) -------------------
+    # Only meaningful with a speculative path enabled (-Mtp or -Dflash) and a greedy request (both
+    # paths are greedy-only, engine.cpp's own use_mtp/use_dflash gate).
+    if ($Mtp -gt 0 -or $Dflash -ne "") {
+        $draftReqBody = @{
+            messages    = @(@{ role = "user"; content = "Write one short sentence about the ocean." })
+            max_tokens  = 24
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 5
+        $draftResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $draftReqBody -UseBasicParsing
+        $draftChat = $draftResp.Content | ConvertFrom-Json
+        Check ($draftResp.StatusCode -eq 200) "speculative path: greedy request returns 200"
+        Check ($draftChat.timings.draft_n -gt 0) "speculative path: timings.draft_n > 0"
+        Check ($draftChat.timings.draft_n_accepted -le $draftChat.timings.draft_n) "speculative path: timings.draft_n_accepted <= timings.draft_n"
     }
 
     # ---- Real tool call / result / answer round trip (docs/server.md's "Tool calls") -------------

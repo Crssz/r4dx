@@ -205,6 +205,59 @@ void TestChatToolCallsArgumentsMustBeJsonObjectString() {
   CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body2); }, 400));
 }
 
+// ---- reasoning_content on messages (task item 5e) -----------------------------------------------
+
+void TestChatAssistantReasoningContentAccepted() {
+  json body = {{"messages",
+                json::array({{{"role", "user"}, {"content", "hi"}},
+                              {{"role", "assistant"},
+                               {"content", "the answer"},
+                               {"reasoning_content", "the reasoning"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.messages[1].reasoning_content.has_value());
+  CHECK(*req.messages[1].reasoning_content == "the reasoning");
+}
+
+void TestChatReasoningContentAbsentByDefault() {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(!req.messages[0].reasoning_content.has_value());
+}
+
+void TestChatReasoningContentNonStringThrows() {
+  json body = {{"messages",
+                json::array({{{"role", "assistant"}, {"content", "x"}, {"reasoning_content", 5}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatReasoningContentNullIsSameAsAbsent() {
+  json body = {{"messages",
+                json::array({{{"role", "assistant"}, {"content", "x"}, {"reasoning_content", nullptr}}})}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(!req.messages[0].reasoning_content.has_value());
+}
+
+// ---- ResolveEnableThinking (task item 5) --------------------------------------------------------
+
+void TestResolveEnableThinkingUsesKwargsWhenPresent() {
+  CHECK(ResolveEnableThinking(json{{"enable_thinking", true}}, false) == true);
+  CHECK(ResolveEnableThinking(json{{"enable_thinking", false}}, true) == false);
+}
+
+void TestResolveEnableThinkingFallsBackToDefaultWhenAbsent() {
+  CHECK(ResolveEnableThinking(json::object(), true) == true);
+  CHECK(ResolveEnableThinking(json::object(), false) == false);
+}
+
+void TestResolveEnableThinkingFallsBackToDefaultWhenNonBoolean() {
+  CHECK(ResolveEnableThinking(json{{"enable_thinking", "yes"}}, false) == false);
+  CHECK(ResolveEnableThinking(json{{"enable_thinking", "yes"}}, true) == true);
+}
+
+void TestResolveEnableThinkingFallsBackToDefaultWhenNull() {
+  CHECK(ResolveEnableThinking(json{{"enable_thinking", nullptr}}, true) == true);
+}
+
 // ---- tool_choice (task point 5) ----------------------------------------------------------------
 
 json OneToolBody(json extra) {
@@ -358,11 +411,73 @@ void TestCompletionPromptWrongTypeThrows() {
 // ---- response builders --------------------------------------------------------------------
 
 void TestBuildModelsResponse() {
-  const json resp = BuildModelsResponse("my-model", 1000);
+  const json resp = BuildModelsResponse("my-model", 1000, 262144);
   CHECK(resp.at("object") == "list");
   CHECK(resp.at("data").size() == 1);
   CHECK(resp.at("data")[0].at("id") == "my-model");
   CHECK(resp.at("data")[0].at("object") == "model");
+}
+
+// ---- model metadata (task item 1) --------------------------------------------------------------
+
+void TestBuildModelEntryJsonCoreFieldsUnchanged() {
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  CHECK(m.at("id") == "my-model");
+  CHECK(m.at("object") == "model");
+  CHECK(m.at("created") == 1000);
+  CHECK(m.at("owned_by") == "r4dx");
+}
+
+void TestBuildModelEntryJsonContextLengthFields() {
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  CHECK(m.at("context_length") == 65536);
+  CHECK(m.at("max_model_len") == 65536);
+  CHECK(m.at("max_completion_tokens") == 65536);
+  CHECK(m.at("meta").at("n_ctx") == 65536);
+  CHECK(m.at("meta").at("n_ctx_train") == kModelNativeContextLength);
+  CHECK(kModelNativeContextLength == 262144);
+}
+
+void TestBuildModelEntryJsonCapabilitiesAndArchitecture() {
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  const json& caps = m.at("capabilities");
+  CHECK(caps.is_array());
+  auto has = [&](const char* v) {
+    for (const auto& c : caps) if (c == v) return true;
+    return false;
+  };
+  CHECK(has("completion"));
+  CHECK(has("chat"));
+  CHECK(has("tool_use"));
+  CHECK(has("reasoning"));
+  CHECK(m.at("architecture").at("input_modalities")[0] == "text");
+  CHECK(m.at("architecture").at("output_modalities")[0] == "text");
+}
+
+void TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields() {
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  const json& sp = m.at("supported_parameters");
+  CHECK(sp.is_array());
+  auto has = [&](const char* v) {
+    for (const auto& c : sp) if (c == v) return true;
+    return false;
+  };
+  for (const char* expected : {"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
+                               "max_completion_tokens", "stop", "stream", "stream_options", "tools",
+                               "tool_choice", "chat_template_kwargs"}) {
+    CHECK(has(expected));
+  }
+  // Fields this server does not parse at all must not be falsely advertised.
+  CHECK(!has("logprobs"));
+  CHECK(!has("presence_penalty"));
+  CHECK(!has("frequency_penalty"));
+  CHECK(!has("n"));
+}
+
+void TestBuildModelsResponseWrapsSingleEntry() {
+  const json resp = BuildModelsResponse("my-model", 1000, 65536);
+  CHECK(resp.at("data")[0].at("context_length") == 65536);
+  CHECK(resp.at("data")[0].at("meta").at("n_ctx_train") == kModelNativeContextLength);
 }
 
 void TestBuildChatCompletionResponse() {
@@ -583,6 +698,54 @@ void TestBuildChatCompletionResponseNoToolCallsOmitsField() {
   CHECK(!resp.at("choices")[0].at("message").contains("tool_calls"));
 }
 
+// ---- reasoning_content / completion_tokens_details (task item 5) --------------------------------
+
+void TestBuildChatCompletionResponsePlainOverloadOmitsReasoningContentByDefault() {
+  UsageStats usage{7, 3};
+  TimingStats timings;
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, "hello", "stop", usage, timings);
+  CHECK(!resp.at("choices")[0].at("message").contains("reasoning_content"));
+  CHECK(!resp.at("usage").contains("completion_tokens_details"));
+}
+
+void TestBuildChatCompletionResponsePlainOverloadWithReasoningContent() {
+  UsageStats usage{7, 3};
+  usage.reasoning_tokens = 2;
+  TimingStats timings;
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, "hello", "stop", usage, timings,
+                                                 std::string("my reasoning"));
+  CHECK(resp.at("choices")[0].at("message").at("reasoning_content") == "my reasoning");
+  CHECK(resp.at("choices")[0].at("message").at("content") == "hello");
+  CHECK(resp.at("usage").at("completion_tokens_details").at("reasoning_tokens") == 2);
+}
+
+void TestBuildChatCompletionResponseToolCallsOverloadWithReasoningContent() {
+  UsageStats usage{10, 5};
+  usage.reasoning_tokens = 3;
+  TimingStats timings;
+  const json resp = BuildChatCompletionResponse("id1", "m", 42, std::string("Let me check."),
+                                                 {{"call_1", "f", "{}"}}, "tool_calls", usage, timings,
+                                                 std::string("thinking about the tool"));
+  CHECK(resp.at("choices")[0].at("message").at("reasoning_content") == "thinking about the tool");
+  CHECK(resp.at("choices")[0].at("message").at("tool_calls").size() == 1);
+  CHECK(resp.at("usage").at("completion_tokens_details").at("reasoning_tokens") == 3);
+}
+
+void TestUsageJsonOmitsCompletionTokensDetailsWhenReasoningTokensUnset() {
+  UsageStats usage{4, 2};  // reasoning_tokens left unset -- the thinking-off / completions path
+  TimingStats timings;
+  const json resp = BuildCompletionResponse("id2", "m", 1, "text out", "length", usage, timings);
+  CHECK(!resp.at("usage").contains("completion_tokens_details"));
+}
+
+void TestChatCompletionUsageChunkCarriesCompletionTokensDetailsWhenSet() {
+  UsageStats usage{7, 3};
+  usage.reasoning_tokens = 1;
+  TimingStats timings;
+  const json j = BuildChatCompletionUsageChunk("id1", "m", 42, usage, timings);
+  CHECK(j.at("usage").at("completion_tokens_details").at("reasoning_tokens") == 1);
+}
+
 void TestBuildChatCompletionChunk() {
   const json chunk = BuildChatCompletionChunk("id1", "m", 42, {{"content", "hi"}}, std::nullopt);
   CHECK(chunk.at("object") == "chat.completion.chunk");
@@ -638,6 +801,14 @@ int main() {
   TestChatAssistantToolCallsGeneratesIdWhenMissing();
   TestChatAssistantMissingContentAndToolCallsThrows();
   TestChatToolCallsArgumentsMustBeJsonObjectString();
+  TestChatAssistantReasoningContentAccepted();
+  TestChatReasoningContentAbsentByDefault();
+  TestChatReasoningContentNonStringThrows();
+  TestChatReasoningContentNullIsSameAsAbsent();
+  TestResolveEnableThinkingUsesKwargsWhenPresent();
+  TestResolveEnableThinkingFallsBackToDefaultWhenAbsent();
+  TestResolveEnableThinkingFallsBackToDefaultWhenNonBoolean();
+  TestResolveEnableThinkingFallsBackToDefaultWhenNull();
   TestToolChoiceNoneClearsTools();
   TestToolChoiceAutoLeavesToolsUntouched();
   TestToolChoiceDefaultIsAutoLeavesToolsUntouched();
@@ -659,11 +830,21 @@ int main() {
   TestCompletionMissingPromptThrows();
   TestCompletionPromptWrongTypeThrows();
   TestBuildModelsResponse();
+  TestBuildModelEntryJsonCoreFieldsUnchanged();
+  TestBuildModelEntryJsonContextLengthFields();
+  TestBuildModelEntryJsonCapabilitiesAndArchitecture();
+  TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields();
+  TestBuildModelsResponseWrapsSingleEntry();
   TestBuildChatCompletionResponse();
   TestBuildToolCallsJson();
   TestBuildChatCompletionResponseWithToolCalls();
   TestBuildChatCompletionResponseWithProseAndToolCalls();
   TestBuildChatCompletionResponseNoToolCallsOmitsField();
+  TestBuildChatCompletionResponsePlainOverloadOmitsReasoningContentByDefault();
+  TestBuildChatCompletionResponsePlainOverloadWithReasoningContent();
+  TestBuildChatCompletionResponseToolCallsOverloadWithReasoningContent();
+  TestUsageJsonOmitsCompletionTokensDetailsWhenReasoningTokensUnset();
+  TestChatCompletionUsageChunkCarriesCompletionTokensDetailsWhenSet();
   TestBuildChatCompletionChunk();
   TestBuildCompletionResponseAndChunk();
   TestGenerateRequestIdPrefixAndUniqueness();

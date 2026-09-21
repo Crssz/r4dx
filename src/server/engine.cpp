@@ -9,6 +9,7 @@
 
 #include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
+#include "reasoning_splitter.h"
 #include "tool_call_parser.h"
 
 namespace r4dx::server {
@@ -63,13 +64,17 @@ size_t FindEarliestStop(const std::string& text, const std::vector<std::string>&
 // generating and report finish_reason="stop").
 bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
                        std::string& accumulated, int32_t tok, bool stream_to_client,
-                       size_t* stop_match_pos) {
+                       size_t* stop_match_pos, size_t min_stop_search_from) {
   const std::string piece = decoder.push(tok);
   if (piece.empty()) return false;
   const size_t already_emitted = accumulated.size();
   accumulated += piece;
   const size_t lookback = already_emitted > 0 ? std::min<size_t>(already_emitted, 63) : 0;
-  const size_t match = FindEarliestStop(accumulated, req.stop, already_emitted - lookback);
+  size_t search_from = already_emitted - lookback;
+  if (search_from < min_stop_search_from) search_from = min_stop_search_from;
+  const size_t match = search_from > accumulated.size()
+                            ? std::string::npos
+                            : FindEarliestStop(accumulated, req.stop, search_from);
   if (match != std::string::npos) {
     const size_t emit_len = match > already_emitted ? match - already_emitted : 0;
     const std::string trimmed = piece.substr(0, emit_len);
@@ -124,6 +129,13 @@ void Engine::WorkerLoop() {
 void Engine::RunRequest(PendingRequest& req) {
   try {
     std::vector<r4dx::TokenId> full_tokens;
+    // Resolved `enable_thinking` (docs/server.md's "reasoning_content" section, task item 5):
+    // false for /v1/completions unconditionally (task item 5g -- no chat template, nothing to
+    // split) and the same ResolveEnableThinking formula http_server.cpp already used to decide the
+    // sink's own splitting behavior, so the two independently-made calls can never drift apart.
+    const bool enable_thinking = req.kind == RequestKind::kChat
+                                      ? ResolveEnableThinking(req.chat_template_kwargs, opts_.default_thinking)
+                                      : false;
     if (req.kind == RequestKind::kChat) {
       r4dx::ChatJson messages = r4dx::ChatJson::array();
       for (const auto& m : req.messages) {
@@ -161,6 +173,12 @@ void Engine::RunRequest(PendingRequest& req) {
         }
         if (m.tool_call_id) entry["tool_call_id"] = *m.tool_call_id;
         if (m.name) entry["name"] = *m.name;
+        // Multi-turn reasoning_content replay (task item 5e): passed through verbatim -- the chat
+        // template's own `elif message.role == "assistant"` branch already reads
+        // `message.reasoning_content` and decides whether to keep it based on
+        // `chat_template_kwargs.preserve_thinking` (see openai_types.h's ChatMessage::
+        // reasoning_content doc comment), so no extra gating is needed here.
+        if (m.reasoning_content) entry["reasoning_content"] = *m.reasoning_content;
         messages.push_back(entry);
       }
       r4dx::ChatJson extra_context = req.chat_template_kwargs;
@@ -290,6 +308,27 @@ void Engine::RunRequest(PendingRequest& req) {
     // (review finding, 2026-09-20).
     size_t stop_match_pos = std::string::npos;
 
+    // Reasoning-span bookkeeping (task item 5, "reasoning_content"): tracks, in `accumulated`'s
+    // own character-offset space, whether/where the "</think>" close tag has appeared -- purely so
+    // (a) the stop-string search inside EmitToken can be confined to the ANSWER part only
+    // (`stop_search_floor`, see EmitToken's own doc comment for why) and (b)
+    // usage.completion_tokens_details.reasoning_tokens can be computed in TOKEN space (the
+    // sink-level ReasoningSplitter, response_sink.h, only ever sees decoded TEXT, so it cannot
+    // count tokens itself). `stop_search_floor` starts at `npos` (skip stop matching entirely) for
+    // a thinking-enabled request and 0 (no restriction) otherwise, byte-for-byte preserving
+    // today's behavior when thinking is off.
+    bool reasoning_open = enable_thinking;
+    int64_t reasoning_tokens = 0;
+    size_t stop_search_floor = enable_thinking ? std::string::npos : 0;
+    auto NoteReasoningProgress = [&]() {
+      if (!reasoning_open) return;
+      const size_t p = accumulated.find("</think>");
+      if (p == std::string::npos) return;
+      reasoning_open = false;
+      reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
+      stop_search_floor = p + 8;  // strlen("</think>")
+    };
+
     // Tool calls (docs/server.md's "Tool calls" streaming decision): whenever this request could
     // plausibly produce a "<tool_call>" span (i.e. it offered any tool definitions), buffer the
     // ENTIRE generation instead of streaming it token-by-token -- EmitToken below still tracks
@@ -322,10 +361,11 @@ void Engine::RunRequest(PendingRequest& req) {
       } else {
         generated_tokens.push_back(next);
         if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                      &stop_match_pos)) {
+                      &stop_match_pos, stop_search_floor)) {
           finish_reason = "stop";
           stopped = true;
         }
+        NoteReasoningProgress();
       }
       while (!stopped && static_cast<int64_t>(generated_tokens.size()) < max_tokens) {
         if (req.sink->IsCancelled()) {
@@ -349,11 +389,13 @@ void Engine::RunRequest(PendingRequest& req) {
           generated_tokens.push_back(tok);
           next = tok;
           if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
-                        &stop_match_pos)) {
+                        &stop_match_pos, stop_search_floor)) {
             finish_reason = "stop";
             stopped = true;
+            NoteReasoningProgress();
             break;
           }
+          NoteReasoningProgress();
         }
         if (!stopped) {
           if (outcome.hit_eos) {
@@ -374,10 +416,11 @@ void Engine::RunRequest(PendingRequest& req) {
       } else {
         generated_tokens.push_back(next);
         if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                      &stop_match_pos)) {
+                      &stop_match_pos, stop_search_floor)) {
           finish_reason = "stop";
           stopped = true;
         }
+        NoteReasoningProgress();
       }
       while (!stopped && static_cast<int64_t>(generated_tokens.size()) < max_tokens) {
         if (req.sink->IsCancelled()) {
@@ -404,11 +447,13 @@ void Engine::RunRequest(PendingRequest& req) {
           generated_tokens.push_back(tok);
           next = tok;
           if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
-                        &stop_match_pos)) {
+                        &stop_match_pos, stop_search_floor)) {
             finish_reason = "stop";
             stopped = true;
+            NoteReasoningProgress();
             break;
           }
+          NoteReasoningProgress();
         }
         if (!stopped) {
           if (outcome.hit_eos) {
@@ -433,7 +478,8 @@ void Engine::RunRequest(PendingRequest& req) {
         }
         generated_tokens.push_back(next);
         const bool stop_hit = EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                                        &stop_match_pos);
+                                        &stop_match_pos, stop_search_floor);
+        NoteReasoningProgress();
         // Feed `next` into the model regardless of stop_hit, so committed_tokens below accurately
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
         // token is real generated content, only its stop-marker tail text is withheld from the
@@ -450,6 +496,7 @@ void Engine::RunRequest(PendingRequest& req) {
     if (!tool_mode && !tail_text.empty()) req.sink->OnToken(tail_text);
     accumulated += tail_text;  // harmless when empty; needed below so tool-call parsing sees the
                                 // full text even in the rare case generation stopped mid-codepoint
+    NoteReasoningProgress();  // covers the rare case where the close tag only completes via `flush`
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
@@ -470,10 +517,30 @@ void Engine::RunRequest(PendingRequest& req) {
       // untrimmed string here would echo that stop text back via `parsed.content`, breaking
       // OpenAI's "the stop string terminates generation but is never itself returned" semantics
       // for any request combining `tools` and `stop`.
-      const std::string tool_parse_source =
+      std::string tool_parse_source =
           stop_match_pos != std::string::npos && stop_match_pos < accumulated.size()
               ? accumulated.substr(0, stop_match_pos)
               : accumulated;
+
+      // reasoning_content in tool-call mode (task item 5d): strip the thinking span out of the
+      // buffered generation BEFORE tool-call parsing even runs, using the same ReasoningSplitter
+      // class the sinks use for the per-piece streaming split -- fed the whole buffered string in
+      // one Push() call rather than piece by piece (ReasoningSplitter's own file comment on why one
+      // state machine serves both). `sink->OnReasoningContent` is the one-shot equivalent of
+      // OnToken's per-piece split, since tool_mode never streams per-piece deltas at all.
+      if (enable_thinking) {
+        ReasoningSplitter splitter;
+        std::string reasoning_raw;
+        std::string rest;
+        auto collect = [&](const std::vector<ReasoningSplitter::Event>& events) {
+          for (const auto& ev : events) (ev.is_reasoning ? reasoning_raw : rest) += ev.text;
+        };
+        collect(splitter.Push(tool_parse_source));
+        collect(splitter.Finish());
+        req.sink->OnReasoningContent(TrimReasoningWhitespace(reasoning_raw));
+        tool_parse_source = std::move(rest);
+      }
+
       r4dx::server::ToolCallParseResult parsed = r4dx::server::ParseToolCalls(tool_parse_source);
       std::vector<std::string> known_names;
       for (const auto& t : req.tools) {
@@ -502,6 +569,12 @@ void Engine::RunRequest(PendingRequest& req) {
       }
     }
 
+    // Never-closed reasoning span (task item 5a): if thinking was on but generation ended (EOS,
+    // --stop, cancellation, or max_tokens) before "</think>" ever appeared, every generated token
+    // was reasoning -- matches the sinks' own Finish()-flush contract (ReasoningSplitter's own doc
+    // comment), which puts all of it in reasoning_content and leaves content empty.
+    if (enable_thinking && reasoning_open) reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
+
     // `timings` (task point 1, llama.cpp-compatible field names): `prompt_n` is the tokens
     // actually fed to THIS request's Prefill (`new_tokens_i32`, excludes whatever prefix reuse
     // skipped) -- deliberately NOT `full_tokens.size()` (the whole conversation-so-far, which is
@@ -521,7 +594,8 @@ void Engine::RunRequest(PendingRequest& req) {
       timings.draft_n_accepted = dflash_accepted;
     }
 
-    req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings);
+    req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings,
+                     reasoning_tokens);
 
     const double prefill_tps = prefill_seconds > 0 ? new_tokens_i32.size() / prefill_seconds : 0.0;
     const double decode_tps =

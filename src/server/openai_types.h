@@ -79,6 +79,16 @@ struct ChatMessage {
   std::optional<std::string> tool_call_id;  // role=="tool" (required there); unused otherwise
   std::optional<std::string> name;          // role=="function" (legacy, required there): the
                                              // function name this message is a result of
+  // Multi-turn reasoning_content replay (docs/server.md's "reasoning_content" section, task item
+  // 5e): a client resending an earlier assistant turn this server generated may include the
+  // `reasoning_content` this server returned for it. Accepted on any role (validated as a string
+  // when present -- a non-string is a 400, ParseChatCompletionRequest), attached verbatim to the
+  // rendered message JSON (Engine::RunRequest) -- the chat template itself already reads
+  // `message.reasoning_content` on assistant turns and decides whether to keep it based on
+  // `chat_template_kwargs.preserve_thinking` (C:\AI\models\Qwen3.8-27B\chat_template.jinja), so no
+  // extra server-side gating logic is needed here: this field is passed through and the template
+  // decides.
+  std::optional<std::string> reasoning_content;
 };
 
 struct ChatCompletionRequest {
@@ -135,12 +145,48 @@ CompletionRequest ParseCompletionRequest(const nlohmann::json& body,
 // as this request's correlation id in the one-line-per-request log (engine.cpp).
 std::string GenerateRequestId(const char* prefix);
 
-nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix);
+// Resolves the effective `enable_thinking` value for a chat request exactly the way
+// Engine::RunRequest does (`chat_template_kwargs.enable_thinking` if present and a JSON boolean,
+// else `default_thinking` -- the server's `--think` flag): a non-boolean value falls back to
+// `default_thinking` rather than throwing, since chat_template_kwargs is otherwise an opaque
+// passthrough to the Jinja template (ChatTemplate::render() itself tolerates any JSON type there
+// via Jinja truthiness). Shared by http_server.cpp (which must decide a request's reasoning_content
+// behavior -- ResponseSink construction -- before the request even reaches the worker thread) and
+// engine.cpp (which decides the actual generation-time splitting), so the two independently-made
+// calls can never drift apart.
+bool ResolveEnableThinking(const nlohmann::json& chat_template_kwargs, bool default_thinking);
+
+// The model's own native context length (Qwen3.8-27B's config.json `max_position_embeddings`,
+// server_args.h's `--max-ctx` default derivation) -- NOT the same as a server's own configured
+// `--max-ctx`, which may be set lower. r4dx::model::ModelConfig does not carry this field (nothing
+// in the layer graph needs it), so it is a named constant here rather than read from the loaded
+// container, per BuildModelsResponse's `meta.n_ctx_train` (llama.cpp's own field name for exactly
+// this "the checkpoint's trained/native limit" concept).
+inline constexpr int64_t kModelNativeContextLength = 262144;
+
+// One `/v1/models` list entry / the `/v1/models/{id}` single-object response body -- OpenAI's
+// {id, object, created, owned_by} plus the r4dx extension fields BuildModelsResponse's own doc
+// comment enumerates (docs/server.md's "Model metadata" section has the full field-by-field
+// writeup). `max_ctx` is the server's own `--max-ctx` (Engine::MaxCtx()), NOT
+// kModelNativeContextLength.
+nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
+                                    int64_t max_ctx);
+
+// `{"object": "list", "data": [BuildModelEntryJson(...)]}` -- GET /v1/models's shape. This server
+// ever loads exactly one model, so `data` always has exactly one entry (task design point 2).
+nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix,
+                                    int64_t max_ctx);
 
 struct UsageStats {
   int64_t prompt_tokens = 0;
   int64_t completion_tokens = 0;
   int64_t TotalTokens() const { return prompt_tokens + completion_tokens; }
+  // `completion_tokens_details.reasoning_tokens` (DeepSeek/vLLM convention, docs/server.md's
+  // "reasoning_content" section): the number of generated tokens up to and including the
+  // "</think>" close tag. unset (not merely 0) whenever this request had thinking off -- every
+  // usage-object builder below adds the `completion_tokens_details` object iff this is set, so a
+  // thinking-off response's `usage` stays byte-identical to before this field existed.
+  std::optional<int64_t> reasoning_tokens;
 };
 
 // `timings` -- an r4dx extension beyond the OpenAI spec, attached as a top-level sibling of
@@ -167,21 +213,30 @@ struct TimingStats {
 // `*_per_second` value is 0.0 (never NaN/inf) when the corresponding `*_ms` is 0.
 nlohmann::json BuildTimingsJson(const TimingStats& timings);
 
+// `reasoning_content`: unset (the default) omits the key entirely -- a thinking-off response is
+// byte-identical to before this field existed (docs/server.md's "reasoning_content" section, task
+// item 5c). When set, `message.reasoning_content` is added alongside `message.content` (which by
+// this point is the ANSWER text only, already split out by the caller -- see response_sink.cpp's
+// BufferingSink, which owns the actual splitting).
 nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::string& model_id,
                                             int64_t created_unix, const std::string& content,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage, const TimingStats& timings);
+                                            const UsageStats& usage, const TimingStats& timings,
+                                            const std::optional<std::string>& reasoning_content = std::nullopt);
 
 // Tool-call-carrying overload: `content` is `nullopt` when the message was a pure tool call with
 // no accompanying prose (OpenAI convention: `message.content` is JSON null in that case, not "");
 // `tool_calls` is rendered as `message.tool_calls` when non-empty (omitted from the JSON object
-// entirely when empty, matching a plain-text response's existing shape exactly).
+// entirely when empty, matching a plain-text response's existing shape exactly). `reasoning_content`
+// -- see the plain-text overload's own doc comment -- is the thinking span stripped out BEFORE
+// tool-call parsing even ran (docs/server.md's "reasoning_content" section, task item 5d).
 nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::string& model_id,
                                             int64_t created_unix,
                                             const std::optional<std::string>& content,
                                             const std::vector<ToolCallOut>& tool_calls,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage, const TimingStats& timings);
+                                            const UsageStats& usage, const TimingStats& timings,
+                                            const std::optional<std::string>& reasoning_content = std::nullopt);
 
 // `[{"index":N,"id":...,"type":"function","function":{"name":...,"arguments":...}}, ...]` --
 // the `message.tool_calls` array shape (response) / the streaming `delta.tool_calls` array shape

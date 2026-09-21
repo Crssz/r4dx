@@ -118,6 +118,16 @@ after a gap, with a validity lower bound, rather than clearing or rolling back t
   `draft_n_accepted` when MTP or DFlash2 actually ran) as a top-level sibling of `usage` on every
   response shape, and `stream_options.include_usage` support for both endpoints -- full detail in
   `docs/server.md`'s "`timings`"/"`stream_options`" sections.
+- **Server API (2026-09-21, m6-server-meta pass).** `GET /v1/models`/`GET /v1/models/{id}` now
+  carry `context_length`/`max_model_len`/`max_completion_tokens`/`meta.{n_ctx,n_ctx_train}`/
+  `capabilities`/`supported_parameters`/`architecture` extension fields, and both
+  `/v1/chat/completions` response shapes gained DeepSeek/vLLM-style `reasoning_content` splitting
+  (non-streaming `message.reasoning_content`/streaming `{"reasoning_content": ...}` deltas, the
+  never-closed fallback, tool-call-mode stripping before `ParseToolCalls`, multi-turn
+  `reasoning_content` replay, and `usage.completion_tokens_details.reasoning_tokens`) driven by a
+  new pure `ReasoningSplitter` class (`src/server/reasoning_splitter.h`/`.cpp`) shared by
+  `BufferingSink`/`StreamingSink` and `Engine::RunRequest`'s tool-call-mode block -- full detail in
+  `docs/server.md`'s "Model metadata"/"`reasoning_content`" sections.
 
 **Measured** (real `qwen38-27b-v3.r4dx`, `--layout w4a16`, w4a16 draft container, HIP device 1, one
 server at a time, identical `temperature=0.7 top_p=0.95 seed=12345` 128-token request, two runs

@@ -16,6 +16,7 @@
 
 #include "nlohmann/json.hpp"
 #include "openai_types.h"
+#include "reasoning_splitter.h"
 #include "request_queue.h"
 
 namespace r4dx::server {
@@ -39,9 +40,13 @@ class ResponseSink {
   // sibling of `usage` in whatever this sink ultimately produces -- BufferingSink just stores it
   // for http_server.cpp to hand to the non-streaming response builders; StreamingSink attaches it
   // to the finish_reason chunk it pushes here. Defaulted so call sites that don't care (most
-  // existing tests) don't need updating.
+  // existing tests) don't need updating. `reasoning_tokens` (docs/server.md's "reasoning_content"
+  // section, task item 5f) is the number of generated tokens up to and including the "</think>"
+  // close tag -- meaningless (and left at its default 0) for a request that had thinking off,
+  // computed by Engine::RunRequest (the only place that has both token boundaries and decoded text
+  // at once) and handed through here rather than derived by the sink itself.
   virtual void OnDone(const std::string& finish_reason, int64_t completion_tokens,
-                       const TimingStats& timings = {}) = 0;
+                       const TimingStats& timings = {}, int64_t reasoning_tokens = 0) = 0;
 
   // Called instead of OnDone if something failed before or during generation (a bad request that
   // slipped past validation, a KV-cache-capacity overrun, ...).
@@ -55,6 +60,18 @@ class ResponseSink {
   // don't care) don't have to override it.
   virtual void OnToolCalls(const std::vector<ToolCallOut>& /*calls*/) {}
 
+  // Called at most once, strictly before OnDone and OnToken, carrying the ALREADY-TRIMMED thinking
+  // span this generation started with (docs/server.md's "reasoning_content" section, task item 5d)
+  // -- the one-shot equivalent of OnToken's per-piece reasoning/content split, used ONLY by
+  // Engine::RunRequest's tool-call-mode whole-generation-buffering path (`tool_mode`), which strips
+  // the thinking span out of the buffered text BEFORE tool-call parsing even runs (so it never
+  // flows through OnToken's incremental splitter at all -- see ReasoningSplitter's own file
+  // comment). Calling this marks the sink as "reasoning already delivered", so a subsequent
+  // OnToken() call is treated as plain content with no further tag-scanning (`parsed.content` by
+  // this point cannot contain the tag either, since it was already stripped). Default no-op so a
+  // sink constructed with thinking off, or any caller that never calls it, is unaffected.
+  virtual void OnReasoningContent(const std::string& /*text*/) {}
+
   // The worker polls this between decode steps; true means stop generating now. Only
   // StreamingSink ever returns true (set by Cancel() when the HTTP layer detects the client is
   // gone); BufferingSink's non-streaming request has no analogous "give up early" signal.
@@ -63,20 +80,35 @@ class ResponseSink {
 
 // Non-streaming (/v1/chat/completions and /v1/completions with "stream" false or absent): buffers
 // the whole reply, then wakes the HTTP handler thread blocked in Wait() once OnDone/OnError runs.
+//
+// `enable_thinking` (task item 5, defaulted to `false` so every existing `BufferingSink sink;` call
+// site keeps compiling and behaving byte-for-byte identically -- task item 5c's own requirement):
+// when true, OnToken's incoming pieces are routed through an internal ReasoningSplitter instead of
+// being appended straight to `text` -- see that field's own doc comment for the resulting split.
 class BufferingSink : public ResponseSink {
  public:
+  explicit BufferingSink(bool enable_thinking = false) : enable_thinking_(enable_thinking) {}
+
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
   void OnDone(const std::string& finish_reason, int64_t completion_tokens,
-              const TimingStats& timings = {}) override;
+              const TimingStats& timings = {}, int64_t reasoning_tokens = 0) override;
   void OnError(int http_status, const std::string& message) override;
 
   // Blocks the calling thread until OnDone or OnError has been called.
   void Wait();
 
   void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
+  void OnReasoningContent(const std::string& text) override;
 
+  // With `enable_thinking` false (the default), `text` behaves exactly as before this field
+  // existed: every OnToken piece appended verbatim. With it true, `text` holds only the ANSWER
+  // half of the split (task item 5a) and `reasoning_text` holds the trimmed reasoning half,
+  // populated once OnDone runs (or immediately by OnReasoningContent in tool_mode, already trimmed
+  // by the caller in that case -- see ResponseSink::OnReasoningContent's own doc comment).
   std::string text;
+  std::string reasoning_text;
+  int64_t reasoning_tokens = 0;  // set by OnDone; meaningless when `enable_thinking` is false
   std::string finish_reason;
   int64_t prompt_tokens = 0;
   int64_t completion_tokens = 0;
@@ -87,6 +119,11 @@ class BufferingSink : public ResponseSink {
   std::vector<ToolCallOut> tool_calls;  // set by OnToolCalls, empty for a plain-text response
 
  private:
+  const bool enable_thinking_;
+  ReasoningSplitter splitter_;
+  std::string reasoning_raw_;      // un-trimmed accumulation of every kReasoning event
+  bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
+                                       // then bypasses the splitter entirely, see OnToken's body
   std::mutex mu_;
   std::condition_variable cv_;
   bool done_ = false;
@@ -103,15 +140,21 @@ class StreamingSink : public ResponseSink {
   // every chunk this sink pushes carries a top-level `"usage": null` except one dedicated chunk
   // pushed after the finish_reason chunk (empty `choices`, the real `usage` + `timings`), right
   // before `[DONE]` -- OpenAI's own `stream_options.include_usage` contract.
+  // `enable_thinking` (task item 5b, defaulted to `false` -- every existing call site keeps
+  // compiling and behaving byte-for-byte identically, task item 5c): when true (and `kind ==
+  // kChat` -- /v1/completions never splits, task item 5g), OnToken's incoming pieces are routed
+  // through an internal ReasoningSplitter and pushed as `{"reasoning_content": ...}` deltas while
+  // inside the thinking span, `{"content": ...}` deltas after it -- never both keys in one delta.
   StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
-                bool include_usage = false);
+                bool include_usage = false, bool enable_thinking = false);
 
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
   void OnDone(const std::string& finish_reason, int64_t completion_tokens,
-              const TimingStats& timings = {}) override;
+              const TimingStats& timings = {}, int64_t reasoning_tokens = 0) override;
   void OnError(int http_status, const std::string& message) override;
   void OnToolCalls(const std::vector<ToolCallOut>& calls) override;
+  void OnReasoningContent(const std::string& text) override;
   bool IsCancelled() const override { return cancelled_.load(std::memory_order_relaxed); }
 
   // Called by the HTTP handler thread (httplib's chunked-content-provider callback) to pull the
@@ -125,10 +168,18 @@ class StreamingSink : public ResponseSink {
   void Cancel();
 
  private:
+  // Pushes one `{"reasoning_content": text}` or `{"content": text}` delta chunk, per `is_reasoning`
+  // -- the shared tail of OnToken's per-event loop and OnDone's Finish()-flush loop.
+  void PushSplitDelta(bool is_reasoning, const std::string& text);
+
   Kind kind_;
   std::string id_, model_id_;
   int64_t created_unix_;
   bool include_usage_;
+  bool enable_thinking_;
+  ReasoningSplitter splitter_;
+  bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
+                                       // then bypasses the splitter entirely, see OnToken's body
   int64_t prompt_tokens_ = 0;  // set by OnStart, used to build the dedicated usage chunk's usage
                                 // object (OnDone only receives completion_tokens directly).
   std::atomic<bool> cancelled_{false};

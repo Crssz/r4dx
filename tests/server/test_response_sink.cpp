@@ -289,6 +289,174 @@ void TestStreamingSinkCompletionIncludeUsageUsageChunkShape() {
   CHECK(!sink.Next(event));
 }
 
+// ---- reasoning_content (docs/server.md's "reasoning_content" section, task item 5) --------------
+
+void TestBufferingSinkThinkingOffLiteralTagPassesThroughByteIdentical() {
+  // Task item 5c: with thinking off (the default -- every existing BufferingSink test above
+  // exercises exactly this path), a literal "</think>" in normal output must never be scanned for
+  // or stripped.
+  BufferingSink sink;
+  sink.OnStart(5);
+  sink.OnToken("normal answer with </think> literally in it");
+  sink.OnDone("stop", 8);
+  CHECK(sink.text == "normal answer with </think> literally in it");
+  CHECK(sink.reasoning_text.empty());
+}
+
+void TestBufferingSinkSplitsReasoningAndContent() {
+  BufferingSink sink(/*enable_thinking=*/true);
+  sink.OnStart(5);
+  sink.OnToken("some reasoning");
+  sink.OnToken("</think>\n\nthe final answer");
+  sink.OnDone("stop", 10, TimingStats{}, /*reasoning_tokens=*/6);
+  CHECK(sink.reasoning_text == "some reasoning");
+  CHECK(sink.text == "the final answer");
+  CHECK(sink.reasoning_tokens == 6);
+}
+
+void TestBufferingSinkNeverClosedReasoningLeavesContentEmpty() {
+  BufferingSink sink(/*enable_thinking=*/true);
+  sink.OnStart(5);
+  sink.OnToken("the model just keeps thinking and never emits a close tag");
+  sink.OnDone("length", 12);
+  CHECK(sink.reasoning_text == "the model just keeps thinking and never emits a close tag");
+  CHECK(sink.text.empty());
+}
+
+void TestBufferingSinkReasoningTrimmedLeadingAndTrailingWhitespace() {
+  BufferingSink sink(/*enable_thinking=*/true);
+  sink.OnStart(5);
+  sink.OnToken("  \n reasoning with padding \n  </think>\n\nanswer");
+  sink.OnDone("stop", 10);
+  CHECK(sink.reasoning_text == "reasoning with padding");
+  CHECK(sink.text == "answer");
+}
+
+void TestBufferingSinkOnReasoningContentToolModeBypassesSplitter() {
+  // Engine::RunRequest's tool_mode block delivers an ALREADY-TRIMMED reasoning span via
+  // OnReasoningContent, then calls OnToken once more with `parsed.content` (tool-call tags already
+  // stripped, no thinking tag left in it either) -- that OnToken call must be treated as plain
+  // content, not re-run through the splitter (which would otherwise misclassify it, since the
+  // splitter's own internal state never saw the tag).
+  BufferingSink sink(/*enable_thinking=*/true);
+  sink.OnStart(5);
+  sink.OnReasoningContent("already trimmed reasoning");
+  sink.OnToken("Let me check the weather.");
+  sink.OnDone("tool_calls", 20);
+  CHECK(sink.reasoning_text == "already trimmed reasoning");
+  CHECK(sink.text == "Let me check the weather.");
+}
+
+void TestStreamingSinkThinkingOffNoReasoningContentKeyAnywhere() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r0", "m", 1);  // enable_thinking defaults false
+  sink.OnStart(3);
+  sink.OnToken("answer with </think> literally");
+  sink.OnDone("stop", 5);
+  std::string event;
+  while (sink.Next(event)) {
+    CHECK(event.find("reasoning_content") == std::string::npos);
+  }
+}
+
+void TestStreamingSinkSplitsIntoReasoningThenContentDeltas() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r1", "m", 1, /*include_usage=*/false,
+                     /*enable_thinking=*/true);
+  sink.OnStart(3);
+  sink.OnToken("some reasoning");
+  sink.OnToken("</think>\n\nthe answer");
+  sink.OnDone("stop", 6, TimingStats{}, /*reasoning_tokens=*/4);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(event.find("\"role\":\"assistant\"") != std::string::npos);
+
+  CHECK(sink.Next(event));  // reasoning_content delta
+  CHECK(event.find("\"reasoning_content\":\"some reasoning\"") != std::string::npos);
+  CHECK(event.find("\"content\"") == std::string::npos);  // never both keys in one delta
+
+  CHECK(sink.Next(event));  // content delta
+  CHECK(event.find("\"content\":\"the answer\"") != std::string::npos);
+  CHECK(event.find("\"reasoning_content\"") == std::string::npos);
+  CHECK(event.find("</think>") == std::string::npos);
+
+  CHECK(sink.Next(event));  // finish_reason chunk
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(!sink.Next(event));
+}
+
+void TestStreamingSinkNeverClosedFlushesReasoningOnDone() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r2", "m", 1, /*include_usage=*/false,
+                     /*enable_thinking=*/true);
+  sink.OnStart(3);
+  sink.OnToken("thinking forever, no close tag");
+  sink.OnDone("length", 6);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(sink.Next(event));  // the ORIGINAL piece's own reasoning delta (tag-holdback safe prefix)
+  CHECK(event.find("\"reasoning_content\"") != std::string::npos);
+  // Whatever OnToken already streamed plus whatever OnDone's Finish() flush adds must reconstruct
+  // to the whole never-closed text with nothing lost or duplicated; check via the finish chunk's
+  // absence of "content" (never-closed means content stays empty, task item 5a).
+  bool sawContentKey = false;
+  std::string finishEvent;
+  while (sink.Next(finishEvent)) {
+    if (finishEvent.find("\"finish_reason\":\"length\"") != std::string::npos) break;
+    if (finishEvent.find("\"content\"") != std::string::npos) sawContentKey = true;
+  }
+  CHECK(!sawContentKey);
+}
+
+void TestStreamingSinkOnReasoningContentToolModeOneShot() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r3", "m", 1, /*include_usage=*/false,
+                     /*enable_thinking=*/true);
+  sink.OnStart(3);
+  sink.OnReasoningContent("already trimmed");
+  sink.OnToken("the visible answer");
+  sink.OnToolCalls({{"call_1", "f", "{}"}});
+  sink.OnDone("tool_calls", 10);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(sink.Next(event));  // one-shot reasoning_content delta
+  CHECK(event.find("\"reasoning_content\":\"already trimmed\"") != std::string::npos);
+  CHECK(sink.Next(event));  // content delta -- plain, not re-split
+  CHECK(event.find("\"content\":\"the visible answer\"") != std::string::npos);
+  CHECK(sink.Next(event));  // tool_calls delta
+  CHECK(event.find("\"tool_calls\"") != std::string::npos);
+  CHECK(sink.Next(event));  // finish_reason chunk
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(!sink.Next(event));
+}
+
+void TestStreamingSinkIncludeUsageCarriesReasoningTokens() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r4", "m", 1, /*include_usage=*/true,
+                     /*enable_thinking=*/true);
+  sink.OnStart(3);
+  sink.OnToken("reason</think>\n\nans");
+  sink.OnDone("stop", 5, TimingStats{}, /*reasoning_tokens=*/2);
+
+  std::string event, lastDataEvent;
+  while (sink.Next(event)) {
+    if (event != "data: [DONE]\n\n") lastDataEvent = event;
+  }
+  CHECK(lastDataEvent.find("\"reasoning_tokens\":2") != std::string::npos);
+}
+
+void TestStreamingSinkCompletionKindNeverSplitsEvenIfEnableThinkingPassed() {
+  // Task item 5g: /v1/completions is never split -- defensive check that a (hypothetical)
+  // true `enable_thinking` on a kCompletion sink still behaves exactly like today.
+  StreamingSink sink(StreamingSink::Kind::kCompletion, "cmpl-r5", "m", 1, /*include_usage=*/false,
+                     /*enable_thinking=*/true);
+  sink.OnStart(3);
+  sink.OnToken("text</think>more text");
+  sink.OnDone("stop", 4);
+  std::string event;
+  CHECK(sink.Next(event));  // text delta, unsplit
+  CHECK(event.find("\"text\":\"text</think>more text\"") != std::string::npos);
+}
+
 void TestStreamingSinkErrorEmitsAndCloses() {
   StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-e", "m", 1);
   sink.OnError(500, "boom");
@@ -321,6 +489,17 @@ int main() {
   TestStreamingSinkIncludeUsageAddsNullUsageToNormalChunksAndFinalUsageChunk();
   TestStreamingSinkWithoutIncludeUsageHasNoUsageKeyAnywhere();
   TestStreamingSinkCompletionIncludeUsageUsageChunkShape();
+  TestBufferingSinkThinkingOffLiteralTagPassesThroughByteIdentical();
+  TestBufferingSinkSplitsReasoningAndContent();
+  TestBufferingSinkNeverClosedReasoningLeavesContentEmpty();
+  TestBufferingSinkReasoningTrimmedLeadingAndTrailingWhitespace();
+  TestBufferingSinkOnReasoningContentToolModeBypassesSplitter();
+  TestStreamingSinkThinkingOffNoReasoningContentKeyAnywhere();
+  TestStreamingSinkSplitsIntoReasoningThenContentDeltas();
+  TestStreamingSinkNeverClosedFlushesReasoningOnDone();
+  TestStreamingSinkOnReasoningContentToolModeOneShot();
+  TestStreamingSinkIncludeUsageCarriesReasoningTokens();
+  TestStreamingSinkCompletionKindNeverSplitsEvenIfEnableThinkingPassed();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

@@ -1,6 +1,7 @@
 #include "response_sink.h"
 
 #include "openai_types.h"
+#include "reasoning_splitter.h"
 #include "sse.h"
 
 namespace r4dx::server {
@@ -14,14 +15,38 @@ void BufferingSink::OnStart(int64_t prompt_tokens_in) {
 
 void BufferingSink::OnToken(const std::string& piece) {
   std::lock_guard<std::mutex> lock(mu_);
-  text += piece;
+  if (!enable_thinking_ || reasoning_delivered_) {
+    // Byte-identical to before this field existed (task item 5c) -- and also the tool_mode path
+    // once OnReasoningContent has already delivered the (pre-split) reasoning span, since
+    // `piece`/`text` at that point is `parsed.content`, which cannot contain the tag any more.
+    text += piece;
+    return;
+  }
+  for (const auto& ev : splitter_.Push(piece)) {
+    if (ev.is_reasoning) {
+      reasoning_raw_ += ev.text;
+    } else {
+      text += ev.text;
+    }
+  }
 }
 
 void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completion_tokens_in,
-                            const TimingStats& timings_in) {
+                            const TimingStats& timings_in, int64_t reasoning_tokens_in) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (enable_thinking_ && !reasoning_delivered_) {
+    for (const auto& ev : splitter_.Finish()) {
+      if (ev.is_reasoning) {
+        reasoning_raw_ += ev.text;
+      } else {
+        text += ev.text;
+      }
+    }
+    reasoning_text = TrimReasoningWhitespace(reasoning_raw_);
+  }
   finish_reason = finish_reason_in;
   completion_tokens = completion_tokens_in;
+  reasoning_tokens = reasoning_tokens_in;
   timings = timings_in;
   done_ = true;
   cv_.notify_all();
@@ -46,12 +71,19 @@ void BufferingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
   tool_calls = calls;
 }
 
+void BufferingSink::OnReasoningContent(const std::string& text_in) {
+  std::lock_guard<std::mutex> lock(mu_);
+  reasoning_text = text_in;  // already trimmed by the caller (engine.cpp's tool_mode block)
+  reasoning_delivered_ = true;
+}
+
 // ---- StreamingSink ---------------------------------------------------------------------------
 
 StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
-                             bool include_usage)
+                             bool include_usage, bool enable_thinking)
     : kind_(kind), id_(std::move(id)), model_id_(std::move(model_id)), created_unix_(created_unix),
-      include_usage_(include_usage), queue_(/*max_size=*/256) {}
+      include_usage_(include_usage), enable_thinking_(enable_thinking && kind == Kind::kChat),
+      queue_(/*max_size=*/256) {}
 
 void StreamingSink::OnStart(int64_t prompt_tokens) {
   prompt_tokens_ = prompt_tokens;
@@ -63,16 +95,31 @@ void StreamingSink::OnStart(int64_t prompt_tokens) {
       BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
 }
 
+void StreamingSink::PushSplitDelta(bool is_reasoning, const std::string& text) {
+  if (text.empty()) return;
+  nlohmann::json delta =
+      is_reasoning ? nlohmann::json{{"reasoning_content", text}} : nlohmann::json{{"content", text}};
+  queue_.Push(FormatSseEvent(
+      BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
+}
+
 void StreamingSink::OnToken(const std::string& piece) {
   if (piece.empty()) return;
-  if (kind_ == Kind::kChat) {
+  if (kind_ != Kind::kChat) {
+    queue_.Push(FormatSseEvent(
+        BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt, include_usage_)));
+    return;
+  }
+  if (!enable_thinking_ || reasoning_delivered_) {
+    // Byte-identical to before this field existed (task item 5c) -- and also the tool_mode path
+    // once OnReasoningContent already delivered the (pre-split) reasoning span, since `piece` at
+    // that point is `parsed.content`, which cannot contain the tag any more.
     nlohmann::json delta = {{"content", piece}};
     queue_.Push(FormatSseEvent(
         BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
-  } else {
-    queue_.Push(FormatSseEvent(
-        BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt, include_usage_)));
+    return;
   }
+  for (const auto& ev : splitter_.Push(piece)) PushSplitDelta(ev.is_reasoning, ev.text);
 }
 
 void StreamingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
@@ -87,8 +134,20 @@ void StreamingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
       BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));
 }
 
+void StreamingSink::OnReasoningContent(const std::string& text) {
+  if (kind_ != Kind::kChat) return;
+  reasoning_delivered_ = true;
+  PushSplitDelta(/*is_reasoning=*/true, text);
+}
+
 void StreamingSink::OnDone(const std::string& finish_reason, int64_t completion_tokens,
-                           const TimingStats& timings_in) {
+                           const TimingStats& timings_in, int64_t reasoning_tokens) {
+  if (enable_thinking_ && !reasoning_delivered_) {
+    // Flush whatever the splitter is still holding back -- the never-closed reasoning tail, or
+    // (silently, correctly) nothing at all if generation ended inside the answer's leading blank
+    // lines. Must happen before the finish_reason chunk: task item 5b's "nothing may be lost".
+    for (const auto& ev : splitter_.Finish()) PushSplitDelta(ev.is_reasoning, ev.text);
+  }
   if (kind_ == Kind::kChat) {
     queue_.Push(FormatSseEvent(BuildChatCompletionChunk(id_, model_id_, created_unix_,
                                                         nlohmann::json::object(), finish_reason,
@@ -101,7 +160,8 @@ void StreamingSink::OnDone(const std::string& finish_reason, int64_t completion_
   // before [DONE] -- empty `choices`, the real `usage` (prompt_tokens_ from OnStart +
   // completion_tokens handed to us here) and the same `timings` object.
   if (include_usage_) {
-    const UsageStats usage{prompt_tokens_, completion_tokens};
+    UsageStats usage{prompt_tokens_, completion_tokens};
+    if (enable_thinking_) usage.reasoning_tokens = reasoning_tokens;
     if (kind_ == Kind::kChat) {
       queue_.Push(FormatSseEvent(BuildChatCompletionUsageChunk(id_, model_id_, created_unix_, usage,
                                                                 timings_in)));

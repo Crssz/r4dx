@@ -29,12 +29,17 @@
 // Confirmed against the real model: multiple calls in one turn are simply concatenated blocks
 // (verified with a two-city weather prompt -- "...</tool_call>\n<tool_call>\n..."), and a
 // `<think>...</think>` reasoning block (only emitted when the request turns thinking on) may
-// precede the first `<tool_call>` -- the model's own generated text does NOT include the
-// opening "<think>\n" (that is part of the prompt's generation preamble, not generated), but DOES
-// include the closing "</think>\n\n" -- this parser does not special-case it: it is literal text
-// outside any <tool_call>...</tool_call> span, so it lands in `content` unchanged, exactly like
-// today's un-parsed behavior for a plain answer (no regression; reasoning_content extraction is
-// out of this task's scope, flagged in docs/server.md as a follow-up).
+// precede the first `<tool_call>` in the RAW generation -- the model's own generated text does NOT
+// include the opening "<think>\n" (that is part of the prompt's generation preamble, not
+// generated), but DOES include the closing "</think>\n\n". This parser itself still does not
+// special-case the tag at all -- by the time `Engine::RunRequest`'s `tool_mode` block ever calls
+// `ParseToolCalls`, it has already stripped the thinking span out (via `ReasoningSplitter`,
+// `reasoning_splitter.h`) and delivered it separately through `ResponseSink::OnReasoningContent`
+// as `message.reasoning_content` (docs/server.md's "reasoning_content" section) -- so a literal
+// "</think>" reaching this parser today can only be a leftover from a thinking-OFF request (no tag
+// was ever there to strip) or literal text a model happened to generate mid-answer, and either way
+// it is correctly treated as ordinary content, exactly like today's un-parsed behavior for a plain
+// answer.
 //
 // DETOKENIZATION HAZARD, verified (not assumed) before writing this parser: `<tool_call>`/
 // `</tool_call>` are added tokens in tokenizer.json but flagged `"special": false`

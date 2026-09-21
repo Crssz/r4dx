@@ -12,6 +12,7 @@ set(R4DX_SERVER_TESTS
   test_request_queue
   test_prefix_state
   test_tool_call_parser
+  test_reasoning_splitter
 )
 
 foreach(t ${R4DX_SERVER_TESTS})

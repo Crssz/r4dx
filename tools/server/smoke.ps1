@@ -96,9 +96,13 @@ function Check {
 Write-Output "[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp"
 $env:HIP_VISIBLE_DEVICES = "1"
 $ServerErrLog = "$env:TEMP\r4dx-server-smoke.err.log"
+# 4096 (raised from 512, model-metadata/reasoning_content pass): the reasoning_content checks below
+# send `max_tokens: 1024` on the real container so a real thinking span has room to close and still
+# leave room for an answer -- 512 was too tight once thinking is on.
+$MaxCtx = 4096
 $ServerArgList = @(
     "--model", $Model, "--layout", $Layout, "--host", "127.0.0.1", "--port", "$Port",
-    "--max-ctx", "512", "--max-tokens-default", "16"
+    "--max-ctx", "$MaxCtx", "--max-tokens-default", "16"
 )
 if ($Layers -ge 0) { $ServerArgList += @("--layers", "$Layers") }
 if ($Mtp -gt 0) { $ServerArgList += @("--mtp", "$Mtp") }
@@ -134,6 +138,30 @@ try {
     Check ($models.object -eq "list") "/v1/models: object == 'list'"
     Check ($models.data.Count -ge 1) "/v1/models: data has at least one entry"
     Check ([bool]$models.data[0].id) "/v1/models: data[0].id is set"
+
+    # ---- Model metadata extension fields (docs/server.md's "Model metadata" section) -------------
+    Check ($models.data[0].context_length -eq $MaxCtx) `
+        "/v1/models: data[0].context_length ($($models.data[0].context_length)) == the launched --max-ctx ($MaxCtx)"
+    Check ($models.data[0].max_model_len -eq $MaxCtx) "/v1/models: data[0].max_model_len == --max-ctx"
+    Check ($models.data[0].meta.n_ctx -eq $MaxCtx) "/v1/models: data[0].meta.n_ctx == --max-ctx"
+    Check ($models.data[0].meta.n_ctx_train -gt 0) "/v1/models: data[0].meta.n_ctx_train > 0"
+    Check (($models.data[0].capabilities) -contains "reasoning") `
+        "/v1/models: data[0].capabilities contains 'reasoning'"
+
+    # ---- GET /v1/models/{id} (task item 1) ---------------------------------------------------------
+    $modelId = $models.data[0].id
+    $oneModelResp = Invoke-WebRequest -Uri "$BaseUrl/v1/models/$modelId" -UseBasicParsing
+    Check ($oneModelResp.StatusCode -eq 200) "GET /v1/models/{id}: known id returns 200"
+    $oneModel = $oneModelResp.Content | ConvertFrom-Json
+    Check ($oneModel.id -eq $modelId) "GET /v1/models/{id}: response id matches"
+    Check ($oneModel.context_length -eq $MaxCtx) "GET /v1/models/{id}: context_length == --max-ctx"
+    try {
+        Invoke-WebRequest -Uri "$BaseUrl/v1/models/no-such-model" -UseBasicParsing | Out-Null
+        Check $false "GET /v1/models/{unknown id} returns 404"
+    } catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        Check ($status -eq 404) "GET /v1/models/{unknown id} returns 404 (got $status)"
+    }
 
     # ---- POST /v1/chat/completions, non-streaming -----------------------------------------------
     $chatBody = @{
@@ -397,6 +425,92 @@ try {
             Check ($followUpResp.StatusCode -eq 200) "tool round trip: role:'tool' follow-up request returns 200"
             Check ([bool]$followUpChat.choices[0].message.content) "tool round trip: follow-up answer has non-empty content"
         }
+    }
+
+    # ---- reasoning_content (docs/server.md's "reasoning_content" section) -------------------------
+    # Real-container only (-Layers -1): the 4-layer test container's nonsense output cannot reliably
+    # be coaxed into emitting a well-formed "</think>" close tag, same reasoning as -ToolRoundTrip.
+    if ($Layers -lt 0) {
+        $thinkBody = @{
+            messages             = @(@{ role = "user"; content = "What is 12 plus 30? Show your reasoning." })
+            chat_template_kwargs = @{ enable_thinking = $true }
+            max_tokens           = 1024
+            temperature          = 0
+            stream               = $false
+        } | ConvertTo-Json -Depth 5
+        $thinkResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $thinkBody -UseBasicParsing
+        Check ($thinkResp.StatusCode -eq 200) "reasoning_content (non-streaming): request returns 200"
+        $thinkChat = $thinkResp.Content | ConvertFrom-Json
+        $reasoningContent = $thinkChat.choices[0].message.reasoning_content
+        Check ([bool]$reasoningContent) "reasoning_content (non-streaming): message.reasoning_content is non-empty"
+        $answerContent = $thinkChat.choices[0].message.content
+        Check ($null -eq $answerContent -or -not $answerContent.Contains("</think>")) `
+            "reasoning_content (non-streaming): message.content contains no '</think>'"
+        Check ($null -eq $answerContent -or -not $answerContent.StartsWith("`n")) `
+            "reasoning_content (non-streaming): message.content has no leading newline"
+        Check ($thinkChat.usage.completion_tokens_details.reasoning_tokens -gt 0) `
+            "reasoning_content (non-streaming): usage.completion_tokens_details.reasoning_tokens > 0"
+
+        # ---- streaming equivalent: reasoning_content deltas, then content deltas, never both ------
+        $thinkStreamBody = @{
+            messages             = @(@{ role = "user"; content = "What is 12 plus 30? Show your reasoning." })
+            chat_template_kwargs = @{ enable_thinking = $true }
+            max_tokens           = 1024
+            temperature          = 0
+            stream               = $true
+        } | ConvertTo-Json -Depth 5
+        $thinkStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $thinkStreamBody -UseBasicParsing
+        Check ($thinkStreamResp.StatusCode -eq 200) "reasoning_content (streaming): request returns 200"
+        $thinkStreamEvents = $thinkStreamResp.Content -split "`n`n" | Where-Object { $_.Trim().Length -gt 0 }
+        $sawReasoningDelta = $false
+        $sawContentDelta = $false
+        $sawBothKeysInOneDelta = $false
+        $sawTagAnywhere = $false
+        foreach ($ev in $thinkStreamEvents) {
+            if ($ev -eq "data: [DONE]") { continue }
+            if ($ev.Contains("</think>")) { $sawTagAnywhere = $true }
+            $c = ($ev -replace "^data: ", "") | ConvertFrom-Json
+            $delta = $c.choices[0].delta
+            $hasReasoning = $null -ne $delta -and ($delta.PSObject.Properties.Name -contains "reasoning_content")
+            $hasContent = $null -ne $delta -and ($delta.PSObject.Properties.Name -contains "content")
+            if ($hasReasoning) { $sawReasoningDelta = $true }
+            if ($hasContent) { $sawContentDelta = $true }
+            if ($hasReasoning -and $hasContent) { $sawBothKeysInOneDelta = $true }
+        }
+        Check $sawReasoningDelta "reasoning_content (streaming): at least one delta carries reasoning_content"
+        Check $sawContentDelta "reasoning_content (streaming): at least one delta carries content"
+        Check (-not $sawBothKeysInOneDelta) "reasoning_content (streaming): no delta carries both reasoning_content and content"
+        Check (-not $sawTagAnywhere) "reasoning_content (streaming): '</think>' never appears in any event"
+
+        # ---- enable_thinking=false: no reasoning_content key anywhere ------------------------------
+        $noThinkBody = @{
+            messages             = @(@{ role = "user"; content = "Say hi." })
+            chat_template_kwargs = @{ enable_thinking = $false }
+            max_tokens           = 16
+            temperature          = 0
+            stream               = $false
+        } | ConvertTo-Json -Depth 5
+        $noThinkResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $noThinkBody -UseBasicParsing
+        Check ($noThinkResp.StatusCode -eq 200) "enable_thinking=false: request returns 200"
+        Check (-not $noThinkResp.Content.Contains("reasoning_content")) `
+            "enable_thinking=false: no reasoning_content key in the non-streaming response"
+
+        $noThinkStreamBody = @{
+            messages             = @(@{ role = "user"; content = "Say hi." })
+            chat_template_kwargs = @{ enable_thinking = $false }
+            max_tokens           = 16
+            temperature          = 0
+            stream               = $true
+        } | ConvertTo-Json -Depth 5
+        $noThinkStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $noThinkStreamBody -UseBasicParsing
+        Check (-not $noThinkStreamResp.Content.Contains("reasoning_content")) `
+            "enable_thinking=false: no reasoning_content key in any streamed chunk"
+    } else {
+        Write-Output "  [SKIP] reasoning_content checks (only checked against a real container, -Layers -1)"
     }
 
     # ---- `tools` + `stop` together must not echo the stop text back in content -------------------

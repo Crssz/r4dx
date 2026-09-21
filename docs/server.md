@@ -9,7 +9,8 @@ for where this sits in the overall module map and `docs/status.md` for milestone
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/health` | `{"status":"ok","model":"<model id>"}` |
-| GET | `/v1/models` | OpenAI models-list shape, one entry (the loaded container's `model_id`, from its `__metadata__.model_id`, `docs/container-format.md`) |
+| GET | `/v1/models` | OpenAI models-list shape, one entry (the loaded container's `model_id`, from its `__metadata__.model_id`, `docs/container-format.md`) plus r4dx extension fields -- see "Model metadata" below |
+| GET | `/v1/models/{id}` | The single model object (not list-wrapped) for `{id}`; `404` with the standard error JSON if `{id}` is not the loaded container's own `model_id` |
 | POST | `/v1/chat/completions` | Chat messages through the real `chat_template.jinja`; non-streaming JSON or SSE (`"stream": true`) |
 | POST | `/v1/completions` | A raw prompt string, tokenized directly (no chat template) |
 
@@ -30,7 +31,8 @@ Message `content` may be a plain string or an OpenAI-style array of parts
 (`[{"type":"text","text":"..."}]`); any non-`"text"` part (`image_url`, ...) is rejected with a
 `400 invalid_request_error` -- there is no vision tower forward pass yet (`docs/status.md`'s "Known
 gaps"). Message `role` must be `system`, `user`, `assistant`, `tool`, or `function` -- the latter two
-carry a tool result back to the model (see "Tool calls" below).
+carry a tool result back to the model (see "Tool calls" below). A message may also carry an optional
+`reasoning_content` (string) -- see "`reasoning_content`" below for the multi-turn replay contract.
 
 ### Response shapes
 
@@ -39,6 +41,34 @@ Standard OpenAI `chat.completion` / `chat.completion.chunk` / `text_completion` 
 `stop` string matched; `"length"` -- `max_tokens` reached; `"cancelled"` -- client disconnected
 mid-stream). Streaming responses are `Content-Type: text/event-stream`, one `data: <json>\n\n`
 event per chunk, terminated by the literal line `data: [DONE]\n\n`.
+
+## Model metadata
+
+`GET /v1/models` and `GET /v1/models/{id}` keep `id`/`object`/`created`/`owned_by` exactly as
+before, plus these r4dx extension fields (different client libraries look for different ones, so
+the common set is emitted on every entry -- `BuildModelEntryJson`, `openai_types.h`/`.cpp`):
+
+| Field | Meaning |
+|---|---|
+| `context_length` | This server's own `--max-ctx` (`Engine::MaxCtx()`). |
+| `max_model_len` | Same value, under vLLM's own OpenAI-compatible-server field name. |
+| `max_completion_tokens` | Same value again, mirroring the request-side field name. |
+| `meta.n_ctx` | Same value, under llama.cpp's `/v1/models` field name. |
+| `meta.n_ctx_train` | The checkpoint's own native context length (`kModelNativeContextLength` = 262144, Qwen3.8-27B's `config.json` `max_position_embeddings`) -- a named constant, not read from the loaded container: `r4dx::model::ModelConfig` does not carry this field (nothing in the layer graph needs it). |
+| `capabilities` | `["completion", "chat", "tool_use", "reasoning"]` -- a fixed list reflecting what this server actually does (plain completion, the chat template, `tools`/`tool_choice`, and `chat_template_kwargs.enable_thinking`). |
+| `supported_parameters` | Exactly the request fields this server's parsers actually honour: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_tokens`, `max_completion_tokens`, `stop`, `stream`, `stream_options`, `tools`, `tool_choice`, `chat_template_kwargs`. Anything not in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored today, so it is deliberately left off rather than falsely advertised. |
+| `architecture.input_modalities` / `.output_modalities` | `["text"]` / `["text"]` -- no vision tower yet ("Deferred / known gaps" below). |
+
+`max_ctx` is plumbed from `ServerArgs::max_ctx` (`server_args.h`) through `EngineOptions::
+model_opts.max_ctx` into `Engine::MaxCtx()`, which both the `/v1/models` list route and the
+`/v1/models/{id}` single-object route read directly -- there is no separate copy to keep in sync.
+`GET /v1/models/{id}` 404s (standard `ErrorBody` shape) for any `{id}` other than the loaded
+container's own `ModelId()`, since this server only ever loads exactly one model.
+
+**Testing**: `tests/server/test_openai_types.cpp`'s `TestBuildModelEntryJson*`/
+`TestBuildModelsResponse*` cases (every field, plus "only lists parameters actually parsed"), and
+`tools/server/smoke.ps1`'s `/v1/models` checks (`context_length` matches the `--max-ctx` the script
+launched the server with, `"reasoning"` present in `capabilities`).
 
 ## Tool calls
 
@@ -81,9 +111,11 @@ VALUE
 
 Multiple calls in one turn are simply concatenated `<tool_call>...</tool_call>` blocks back to
 back (confirmed with a real two-city weather prompt). A `<think>...</think>` reasoning block, when
-present, precedes the first `<tool_call>` and is left untouched in `content` (no
-`reasoning_content` extraction -- out of scope, flagged as a follow-up). A parameter `VALUE` is
-plain text, not JSON-tagged; the parser tries to `JSON::parse` the trimmed value and falls back to
+present, precedes the first `<tool_call>` in the raw generation -- but by the time `ParseToolCalls`
+ever sees the text, `Engine::RunRequest`'s `tool_mode` block has already stripped it out and
+delivered it separately as `message.reasoning_content` (the "`reasoning_content`" section below has
+the full writeup; this parser itself never special-cases the tag at all, same as always). A
+parameter `VALUE` is plain text, not JSON-tagged; the parser tries to `JSON::parse` the trimmed value and falls back to
 a JSON string when that fails (the same convention the template's own reverse-rendering direction
 uses), so `42`/`true`/`[1,2]`/`{"a":1}`/`null` become their real JSON types and anything else
 (`"Boston, MA"`) becomes a JSON string.
@@ -143,6 +175,100 @@ parsing/validation, `role: "tool"`/`"function"` messages) and `tests/server/test
 (the streaming `OnToolCalls` SSE chunk shape), and `tools/server/smoke.ps1`'s real end-to-end tool
 round trip against a container (a tool-offering request, feeding the parsed call's result back as a
 `role: "tool"` message, checking the final answer references the tool result).
+
+## `reasoning_content`
+
+DeepSeek/vLLM's `reasoning_content` convention: when a request's RESOLVED `enable_thinking` is true
+(`chat_template_kwargs.enable_thinking` if present and a JSON boolean, else the server's `--think`
+default -- `ResolveEnableThinking`, `openai_types.h`/`.cpp`; computed independently but identically
+by `http_server.cpp`, before the request even reaches the worker thread, and by `Engine::
+RunRequest`, so the two calls can never drift apart), the generation is split at the FIRST
+`"</think>"` into a reasoning span and an answer span. The splitting itself lives in exactly one
+place, `src/server/reasoning_splitter.h`/`.cpp`'s `ReasoningSplitter` (a small pure, HIP-free state
+machine, `tests/server/test_reasoning_splitter.cpp`), used both by `BufferingSink`/`StreamingSink`
+(the per-piece streaming split) and by `Engine::RunRequest`'s `tool_mode` block (a one-shot
+whole-buffer split, same class, just fed the entire buffered string in one `Push()` call). The
+model's own opening `"<think>\n"` is part of the PROMPT's generation preamble, never generated text
+(`tool_call_parser.h`'s file comment has the full derivation) -- so this only ever scans for the
+CLOSING tag.
+
+**Non-streaming** (`/v1/chat/completions`, `"stream"` false/absent): `message.reasoning_content` is
+the reasoning span, trimmed of leading/trailing whitespace/newlines; `message.content` is the
+answer span, with any leading blank lines right after the tag skipped (never leaked into either
+field). If `"</think>"` never appears before generation ends (EOS, `--stop`, cancellation, or
+`max_tokens`) -- `reasoning_content` is everything generated, `content` is `""` (empty string, not
+null), and `finish_reason` stays whatever it already was (`"length"` for the common max_tokens
+case). With thinking off, there is no `reasoning_content` key anywhere and no tag scanning happens
+at all -- a literal `"</think>"` in a normal answer passes through completely untouched, byte-for-
+byte identical to before this feature existed.
+
+**Streaming**: while inside the thinking span, deltas are `{"reasoning_content": "..."}` (no
+`"content"` key in that delta); once the close tag is seen, deltas switch to ordinary
+`{"content": "..."}` -- never both keys in one delta. The tag itself and the blank lines right
+after it never reach the client in either field. The tag can split across token/piece boundaries
+(`"</thi"` + `"nk>"`) or land at the edge of a piece; `ReasoningSplitter` holds back only the
+minimal suffix that could still be a prefix of `"</think>"` (at most 7 bytes) and flushes it the
+instant it cannot be -- nothing is ever lost or duplicated. Since `"</think>"` is pure ASCII and
+every UTF-8 continuation/lead byte has its high bit set, this holdback can never split a multi-byte
+character. If the close tag never appears, `OnDone` flushes whatever is still held back as a final
+`reasoning_content` delta before the `finish_reason` chunk (the never-closed contract above, applied
+per-delta). With thinking off, no chunk ever gains a `reasoning_content` key -- byte-for-byte
+unchanged.
+
+**Composes with `--stop`**: stop-string matching applies to the ANSWER part only. `Engine::
+RunRequest` tracks, in `accumulated`'s own character-offset space, whether/where `"</think>"` has
+appeared; `EmitToken`'s stop search is given a `min_stop_search_from` floor that is `std::string::
+npos` (skip stop matching entirely) for as long as the tag has not yet been seen, then the tag's own
+end position once it has -- so a stop string that happens to appear inside the model's own
+chain-of-thought can never truncate generation before the answer even starts. A thinking-off
+request always passes floor `0` (no restriction, today's behavior, unaffected).
+
+**Tool-call mode** (`tools` present, whole-generation buffering, "Tool calls" above): the thinking
+span is stripped out of the buffered generation BEFORE `ParseToolCalls` even runs (`Engine::
+RunRequest`'s `tool_mode` block, using the same `ReasoningSplitter` fed the whole buffer at once)
+and delivered via `ResponseSink::OnReasoningContent` -- the one-shot equivalent of `OnToken`'s
+per-piece split, since tool_mode never streams per-piece deltas at all. `tool_calls`/`content`/
+`finish_reason` semantics are otherwise unchanged; `ParseToolCalls` itself never sees the tag.
+
+**Multi-turn**: a client resending an earlier assistant turn may include the `reasoning_content`
+this server returned for it (`ChatMessage::reasoning_content`, `openai_types.h`, accepted on any
+message role -- validated as a string when present, a non-string is a `400`). It is passed straight
+through into the rendered message JSON, unconditionally -- `C:\AI\models\Qwen3.8-27B\
+chat_template.jinja` already reads `message.reasoning_content` on an assistant turn and decides
+whether to keep it wrapped in `<think>...</think>` based on `chat_template_kwargs.preserve_thinking`
+(default: keep it) and how far back the turn is relative to the latest user query, so no extra
+server-side gating logic is needed -- the field is passed through and the template decides.
+**Prefix reuse**: since the re-rendered assistant turn (its own `<think>...</think>` block rebuilt
+from JSON `reasoning_content`/`content`) is not guaranteed to be byte-identical to the model's own
+originally-generated tokens for that turn (trimming/whitespace differences), a second turn of a
+thinking conversation may legitimately take `PrefixState`'s `Reset()`+reprefill path rather than the
+prefix-extend fast path -- both are correct, just different costs; see this stage's own real
+two-turn verification run for which one actually happened and why.
+
+**`usage.completion_tokens_details`**: `usage.completion_tokens` keeps counting ALL generated
+tokens (reasoning + answer, unchanged). `completion_tokens_details.reasoning_tokens` is added
+(`BuildUsageJson`, `openai_types.cpp`, shared by every usage-object-producing builder) with the
+number of generated tokens up to and including the close tag -- computed by `Engine::RunRequest`
+itself (`generated_tokens.size()` at the moment `"</think>"` first appears in `accumulated`; the
+sink-level `ReasoningSplitter` only ever sees decoded TEXT, so it cannot count tokens). The whole
+`completion_tokens_details` object is OMITTED (not merely zeroed) when thinking is off, so that
+path's `usage` object stays byte-for-byte identical to before this field existed.
+
+**`/v1/completions` is NOT split**: the raw-text completions endpoint has no chat template and
+therefore no `enable_thinking` concept at all -- `CompletionRequest` carries no
+`chat_template_kwargs`, so `usage.completion_tokens_details` is never attached and no
+`reasoning_content` key or delta ever appears on this endpoint, regardless of what the raw prompt
+text itself contains.
+
+**Testing**: `tests/server/test_reasoning_splitter.cpp` (the splitter itself: every split position
+of `"</think>"` across piece boundaries, byte-by-byte fragmentation, the never-closed case, UTF-8
+multi-byte content on both sides, composition with a stop search scoped to the answer side only),
+`tests/server/test_response_sink.cpp` (`BufferingSink`/`StreamingSink` routing, `OnReasoningContent`
+tool_mode bypass, thinking-off byte-identical passthrough), `tests/server/test_openai_types.cpp`
+(`reasoning_content` request-side parsing/validation, `ResolveEnableThinking`, the response
+builders' `reasoning_content`/`completion_tokens_details` fields), and `tools/server/smoke.ps1`'s
+real-container checks (non-streaming and streaming `enable_thinking: true` requests, and an
+`enable_thinking: false` request confirming no `reasoning_content` key appears anywhere).
 
 ## `timings`
 

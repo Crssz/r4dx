@@ -275,6 +275,15 @@ nlohmann::json ErrorBody(const ApiError& err) {
   return {{"error", {{"message", err.message}, {"type", err.type}, {"param", nullptr}, {"code", nullptr}}}};
 }
 
+bool ResolveEnableThinking(const nlohmann::json& chat_template_kwargs, bool default_thinking) {
+  if (!chat_template_kwargs.contains("enable_thinking") ||
+      chat_template_kwargs.at("enable_thinking").is_null()) {
+    return default_thinking;
+  }
+  const nlohmann::json& v = chat_template_kwargs.at("enable_thinking");
+  return v.is_boolean() ? v.get<bool>() : default_thinking;
+}
+
 ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
                                                   const SamplingParams& sampling_defaults) {
   if (!body.is_object()) throw ApiError{400, "invalid_request_error", "request body must be a JSON object"};
@@ -320,6 +329,15 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
       cm.content = ParseMessageContent(m.at("content"), role);
     }
     cm.tool_calls = std::move(tool_calls);
+
+    // Multi-turn reasoning_content replay (task item 5e): accepted on any role (the chat template
+    // only ever reads it on an assistant turn, chat_template.jinja's own `elif message.role ==
+    // "assistant"` branch -- attaching it to another role's message is harmless, just never read),
+    // validated as a string when present so a caller sending e.g. an object gets a clear 400 rather
+    // than a confusing template render failure.
+    if (m.contains("reasoning_content") && !m.at("reasoning_content").is_null()) {
+      cm.reasoning_content = RequireString(m, "reasoning_content", "messages[]");
+    }
 
     if (role == "tool") {
       cm.tool_call_id = RequireString(m, "tool_call_id", "messages[] (role \"tool\")");
@@ -410,12 +428,67 @@ std::string GenerateRequestId(const char* prefix) {
   return std::string(prefix) + buf;
 }
 
-nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix) {
+namespace {
+
+// `usage.completion_tokens_details.reasoning_tokens` -- added iff `usage.reasoning_tokens` is set,
+// so every builder below shares this exact "omit when not applicable" rule instead of repeating it
+// (task item 5f: a thinking-off response's usage object stays byte-identical to before this field
+// existed).
+nlohmann::json BuildUsageJson(const UsageStats& usage) {
+  nlohmann::json out = {{"prompt_tokens", usage.prompt_tokens},
+                        {"completion_tokens", usage.completion_tokens},
+                        {"total_tokens", usage.TotalTokens()}};
+  if (usage.reasoning_tokens) {
+    out["completion_tokens_details"] = {{"reasoning_tokens", *usage.reasoning_tokens}};
+  }
+  return out;
+}
+
+}  // namespace
+
+// Model metadata (docs/server.md's "Model metadata" section, task item 1): every field beyond
+// {id, object, created, owned_by} is an r4dx extension -- different clients read different ones, so
+// this emits the common set several inference servers already use:
+//   context_length / max_model_len / max_completion_tokens -- this server's own `--max-ctx`
+//     (`max_ctx`), under three different names because different client libraries look for
+//     different ones (vLLM's OpenAI-compatible server uses `max_model_len`; some clients probe
+//     `context_length`; `max_completion_tokens` mirrors the request-side field name).
+//   meta.n_ctx / meta.n_ctx_train -- llama.cpp `/v1/models` shape: `n_ctx` is this server's
+//     configured `--max-ctx`, `n_ctx_train` is the checkpoint's own native limit
+//     (kModelNativeContextLength -- see that constant's own doc comment for why it is not read
+//     from the loaded container).
+//   capabilities -- a fixed list reflecting what this server actually does: plain completion, chat
+//     (the chat template), tool_use (`tools`/`tool_choice`, docs/server.md's "Tool calls"), and
+//     reasoning (`chat_template_kwargs.enable_thinking`, docs/server.md's "reasoning_content").
+//   supported_parameters -- exactly the request fields ParseChatCompletionRequest/ParseSampling/
+//     etc. actually parse (openai_types.cpp): sampling (`temperature`/`top_p`/`top_k`/`min_p`/
+//     `seed`), generation length (`max_tokens`/`max_completion_tokens`), `stop`, `stream`/
+//     `stream_options`, tool calling (`tools`/`tool_choice`), and `chat_template_kwargs`. Anything
+//     NOT in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored by this server
+//     today, so it is deliberately left out rather than falsely advertised.
+//   architecture -- text in, text out (no vision tower yet, docs/server.md's "Deferred" section).
+nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
+                                    int64_t max_ctx) {
+  return {{"id", model_id},
+          {"object", "model"},
+          {"created", created_unix},
+          {"owned_by", "r4dx"},
+          {"context_length", max_ctx},
+          {"max_model_len", max_ctx},
+          {"max_completion_tokens", max_ctx},
+          {"meta", {{"n_ctx", max_ctx}, {"n_ctx_train", kModelNativeContextLength}}},
+          {"capabilities", nlohmann::json::array({"completion", "chat", "tool_use", "reasoning"})},
+          {"supported_parameters",
+           nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
+                                  "max_completion_tokens", "stop", "stream", "stream_options",
+                                  "tools", "tool_choice", "chat_template_kwargs"})},
+          {"architecture", {{"input_modalities", nlohmann::json::array({"text"})},
+                            {"output_modalities", nlohmann::json::array({"text"})}}}};
+}
+
+nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx) {
   return {{"object", "list"},
-          {"data", nlohmann::json::array({{{"id", model_id},
-                                            {"object", "model"},
-                                            {"created", created_unix},
-                                            {"owned_by", "r4dx"}}})}};
+          {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx)})}};
 }
 
 nlohmann::json BuildTimingsJson(const TimingStats& timings) {
@@ -439,18 +512,18 @@ nlohmann::json BuildTimingsJson(const TimingStats& timings) {
 nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::string& model_id,
                                             int64_t created_unix, const std::string& content,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage, const TimingStats& timings) {
+                                            const UsageStats& usage, const TimingStats& timings,
+                                            const std::optional<std::string>& reasoning_content) {
+  nlohmann::json message = {{"role", "assistant"}, {"content", content}};
+  if (reasoning_content) message["reasoning_content"] = *reasoning_content;
   return {{"id", id},
           {"object", "chat.completion"},
           {"created", created_unix},
           {"model", model_id},
           {"choices", nlohmann::json::array({{{"index", 0},
-                                               {"message", {{"role", "assistant"}, {"content", content}}},
+                                               {"message", message},
                                                {"finish_reason", finish_reason}}})},
-          {"usage",
-           {{"prompt_tokens", usage.prompt_tokens},
-            {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}},
+          {"usage", BuildUsageJson(usage)},
           {"timings", BuildTimingsJson(timings)}};
 }
 
@@ -470,9 +543,11 @@ nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::str
                                             const std::optional<std::string>& content,
                                             const std::vector<ToolCallOut>& tool_calls,
                                             const std::string& finish_reason,
-                                            const UsageStats& usage, const TimingStats& timings) {
+                                            const UsageStats& usage, const TimingStats& timings,
+                                            const std::optional<std::string>& reasoning_content) {
   nlohmann::json message = {{"role", "assistant"}, {"content", content ? nlohmann::json(*content) : nlohmann::json(nullptr)}};
   if (!tool_calls.empty()) message["tool_calls"] = BuildToolCallsJson(tool_calls);
+  if (reasoning_content) message["reasoning_content"] = *reasoning_content;
   return {{"id", id},
           {"object", "chat.completion"},
           {"created", created_unix},
@@ -480,10 +555,7 @@ nlohmann::json BuildChatCompletionResponse(const std::string& id, const std::str
           {"choices", nlohmann::json::array({{{"index", 0},
                                                {"message", message},
                                                {"finish_reason", finish_reason}}})},
-          {"usage",
-           {{"prompt_tokens", usage.prompt_tokens},
-            {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}},
+          {"usage", BuildUsageJson(usage)},
           {"timings", BuildTimingsJson(timings)}};
 }
 
@@ -513,10 +585,7 @@ nlohmann::json BuildChatCompletionUsageChunk(const std::string& id, const std::s
           {"created", created_unix},
           {"model", model_id},
           {"choices", nlohmann::json::array()},
-          {"usage",
-           {{"prompt_tokens", usage.prompt_tokens},
-            {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}},
+          {"usage", BuildUsageJson(usage)},
           {"timings", BuildTimingsJson(timings)}};
 }
 
@@ -532,10 +601,7 @@ nlohmann::json BuildCompletionResponse(const std::string& id, const std::string&
                                                {"text", text},
                                                {"logprobs", nullptr},
                                                {"finish_reason", finish_reason}}})},
-          {"usage",
-           {{"prompt_tokens", usage.prompt_tokens},
-            {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}},
+          {"usage", BuildUsageJson(usage)},
           {"timings", BuildTimingsJson(timings)}};
 }
 
@@ -566,10 +632,7 @@ nlohmann::json BuildCompletionUsageChunk(const std::string& id, const std::strin
           {"created", created_unix},
           {"model", model_id},
           {"choices", nlohmann::json::array()},
-          {"usage",
-           {{"prompt_tokens", usage.prompt_tokens},
-            {"completion_tokens", usage.completion_tokens},
-            {"total_tokens", usage.TotalTokens()}}},
+          {"usage", BuildUsageJson(usage)},
           {"timings", BuildTimingsJson(timings)}};
 }
 

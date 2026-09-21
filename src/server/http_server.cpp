@@ -97,7 +97,31 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
   });
 
   svr.Get("/v1/models", [&engine_ref](const httplib::Request&, httplib::Response& res) {
-    res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix()).dump(), "application/json");
+    res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx()).dump(),
+                     "application/json");
+  });
+
+  // GET /v1/models/{id} (task item 1): this server ever loads exactly one model, so any id other
+  // than the loaded container's own ModelId() is a clean 404 with the standard error JSON, same
+  // shape ApiError/ErrorBody already produce for every other error path.
+  //
+  // A REGEX pattern (`(.+)`), not httplib's `:id` path-param shorthand, on purpose: `:id` compiles
+  // to a single-path-segment matcher (`PathParamsMatcher`, no slashes allowed), but this
+  // checkpoint's own `model_id` IS `"Qwen/Qwen3.8-27B"` (`__metadata__.model_id`,
+  // docs/container-format.md) -- a real HuggingFace-style "org/repo" id containing a literal "/".
+  // `:id` would 404 on the container's own real id (caught end to end by `tools/server/smoke.ps1`,
+  // not by any CPU-only unit test, since none of them drive real httplib routing). `(.+)` greedily
+  // captures everything after the prefix, slashes included.
+  svr.Get(R"(/v1/models/(.+))", [&engine_ref](const httplib::Request& httpreq, httplib::Response& res) {
+    const std::string requested_id = httpreq.matches[1];
+    if (requested_id != engine_ref.ModelId()) {
+      RespondError(res, 404, "invalid_request_error",
+                   "model '" + requested_id + "' not found (this server has loaded '" +
+                       engine_ref.ModelId() + "')");
+      return;
+    }
+    res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx()).dump(),
+                     "application/json");
   });
 
   svr.Post("/v1/chat/completions", [&engine_ref](const httplib::Request& httpreq,
@@ -109,6 +133,13 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       const int64_t max_tokens = req.max_tokens.value_or(engine_ref.MaxTokensDefault());
       const std::string id = GenerateRequestId("chatcmpl-");
       const int64_t created = NowUnix();
+      // The RESOLVED enable_thinking value (task item 5, "reasoning_content"), computed here --
+      // before the request even reaches the worker thread -- with the exact same formula
+      // Engine::RunRequest uses (ResolveEnableThinking, openai_types.h) so the two independently-
+      // made calls can never drift apart. Decides whether the sink runs its reasoning/content
+      // splitter at all (task item 5c: a thinking-off request's sink behavior must stay byte-for-
+      // byte identical to before this feature existed).
+      const bool enable_thinking = ResolveEnableThinking(req.chat_template_kwargs, engine_ref.DefaultThinking());
 
       auto pending = std::make_shared<PendingRequest>();
       pending->kind = RequestKind::kChat;
@@ -122,7 +153,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 
       if (req.stream) {
         auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created,
-                                                     req.stream_options_include_usage);
+                                                     req.stream_options_include_usage, enable_thinking);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -130,7 +161,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         }
         ServeStream(res, sink);
       } else {
-        auto sink = std::make_shared<BufferingSink>();
+        auto sink = std::make_shared<BufferingSink>(enable_thinking);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -143,14 +174,18 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
           return;
         }
         UsageStats usage{sink->prompt_tokens, sink->completion_tokens};
+        if (enable_thinking) usage.reasoning_tokens = sink->reasoning_tokens;
         // `content` is JSON null (not "") only when the whole turn was a pure tool call with no
         // accompanying prose -- OpenAI's own convention (openai_types.h's tool_calls-carrying
         // BuildChatCompletionResponse overload doc comment).
         const std::optional<std::string> content =
             (!sink->tool_calls.empty() && sink->text.empty()) ? std::nullopt
                                                                 : std::optional<std::string>(sink->text);
+        const std::optional<std::string> reasoning_content =
+            enable_thinking ? std::optional<std::string>(sink->reasoning_text) : std::nullopt;
         res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
-                                                     sink->finish_reason, usage, sink->timings)
+                                                     sink->finish_reason, usage, sink->timings,
+                                                     reasoning_content)
                              .dump(),
                          "application/json");
       }

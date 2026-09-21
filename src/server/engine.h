@@ -114,9 +114,18 @@ class Engine {
   // decoded piece appended (including the stop text), only what's *streamed* to the client is
   // trimmed, so a caller that re-derives its response from `accumulated` after the loop ends (the
   // tool_mode block) must re-trim at this boundary itself or it echoes the stop text back.
+  // `min_stop_search_from` (task item 5, "reasoning_content" -- "stop sequences apply to the
+  // ANSWER part only"): the stop-string search below never looks before this position in
+  // `accumulated`. RunRequest passes `std::string::npos` for as long as a thinking-enabled
+  // request's "</think>" close tag has not yet been seen (npos always exceeds
+  // `accumulated.size()`, so the search collapses to nothing this call -- see EmitToken's own
+  // definition), then the tag's own end position once it has, so a stop string that happens to
+  // appear inside the model's own chain-of-thought can never truncate generation before the answer
+  // even starts. Defaults to 0 (no restriction, today's behavior) so a thinking-off request is
+  // byte-for-byte unaffected.
   static bool EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
                          std::string& accumulated, int32_t tok, bool stream_to_client = true,
-                         size_t* stop_match_pos = nullptr);
+                         size_t* stop_match_pos = nullptr, size_t min_stop_search_from = 0);
 
   EngineOptions opts_;
   std::string model_id_;

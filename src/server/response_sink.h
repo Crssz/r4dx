@@ -89,9 +89,16 @@ class ResponseSink {
 // site keeps compiling and behaving byte-for-byte identically -- task item 5c's own requirement):
 // when true, OnToken's incoming pieces are routed through an internal ReasoningSplitter instead of
 // being appended straight to `text` -- see that field's own doc comment for the resulting split.
+//
+// `emit_reasoning` (OpenRouter's `reasoning.exclude` / `include_reasoning: false`,
+// ThinkingControls::include_reasoning): when false, the split still happens exactly as above (so
+// `text` is still the ANSWER half alone) but `reasoning_text` is left empty and never returned.
+// Only meaningful alongside `enable_thinking`; defaulted to true so every existing call site is
+// unaffected.
 class BufferingSink : public ResponseSink {
  public:
-  explicit BufferingSink(bool enable_thinking = false) : enable_thinking_(enable_thinking) {}
+  explicit BufferingSink(bool enable_thinking = false, bool emit_reasoning = true)
+      : enable_thinking_(enable_thinking), emit_reasoning_(emit_reasoning) {}
 
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
@@ -124,6 +131,7 @@ class BufferingSink : public ResponseSink {
 
  private:
   const bool enable_thinking_;
+  const bool emit_reasoning_;
   ReasoningSplitter splitter_;
   std::string reasoning_raw_;      // un-trimmed accumulation of every kReasoning event
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
@@ -149,8 +157,14 @@ class StreamingSink : public ResponseSink {
   // kChat` -- /v1/completions never splits, task item 5g), OnToken's incoming pieces are routed
   // through an internal ReasoningSplitter and pushed as `{"reasoning_content": ...}` deltas while
   // inside the thinking span, `{"content": ...}` deltas after it -- never both keys in one delta.
+  // `emit_reasoning` (OpenRouter's `reasoning.exclude` / `include_reasoning: false`,
+  // ThinkingControls::include_reasoning): when false, the split still runs identically but the
+  // `reasoning_content` deltas are dropped instead of pushed -- the client sees only the answer's
+  // `content` deltas. Only meaningful alongside `enable_thinking`; defaulted to true so every
+  // existing call site is unaffected.
   StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
-                bool include_usage = false, bool enable_thinking = false);
+                bool include_usage = false, bool enable_thinking = false,
+                bool emit_reasoning = true);
 
   void OnStart(int64_t prompt_tokens) override;
   void OnToken(const std::string& piece) override;
@@ -181,6 +195,7 @@ class StreamingSink : public ResponseSink {
   int64_t created_unix_;
   bool include_usage_;
   bool enable_thinking_;
+  bool emit_reasoning_;
   ReasoningSplitter splitter_;
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
                                        // then bypasses the splitter entirely, see OnToken's body

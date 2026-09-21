@@ -1,5 +1,7 @@
 #include "openai_types.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <mutex>
 #include <random>
@@ -243,6 +245,43 @@ std::vector<std::string> ParseStop(const nlohmann::json& body) {
   return out;
 }
 
+// Trimmed, lower-cased copy of an effort string -- clients spell these "High"/" high "/"HIGH".
+std::string NormalizeEffort(const std::string& raw) {
+  size_t b = 0, e = raw.size();
+  while (b < e && std::isspace(static_cast<unsigned char>(raw[b]))) ++b;
+  while (e > b && std::isspace(static_cast<unsigned char>(raw[e - 1]))) --e;
+  std::string out = raw.substr(b, e - b);
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
+// Maps the de-facto OpenAI/OpenRouter effort scale onto the THREE levels
+// C:\AI\models\Qwen3.8-27B\chat_template.jinja itself accepts -- its own
+// `{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}{{- raise_exception(...) }}`
+// branch means passing anything else through would turn a perfectly ordinary request into a
+// template render failure (a 400, engine.cpp). "none" never reaches here (it means thinking off,
+// handled by the caller); an unrecognized effort returns nullopt, i.e. "thinking on, template
+// default effort", rather than an error -- a client inventing a level should get an answer, not a
+// rejection.
+std::optional<std::string> TemplateEffortFor(const std::string& effort) {
+  if (effort == "minimal" || effort == "low") return std::string("low");
+  if (effort == "medium") return std::string("medium");
+  if (effort == "high" || effort == "xhigh" || effort == "max") return std::string("xhigh");
+  return std::nullopt;
+}
+
+// Shared validator for the two "a token budget this server has nothing to spend" fields
+// (`reasoning.max_tokens`, `thinking.budget_tokens`): validated so a malformed body is still a
+// clean 400, then ignored -- neither is listed in `supported_parameters`.
+void ValidateOptionalTokenBudget(const nlohmann::json& obj, const char* key, const char* context) {
+  if (!obj.contains(key) || obj.at(key).is_null()) return;
+  if (!obj.at(key).is_number_integer() || obj.at(key).get<int64_t>() < 0) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string("'") + context + "." + key + "' must be an integer >= 0"};
+  }
+}
+
 bool ParseStream(const nlohmann::json& body) {
   if (!body.contains("stream") || body.at("stream").is_null()) return false;
   if (!body.at("stream").is_boolean()) throw ApiError{400, "invalid_request_error", "'stream' must be a boolean"};
@@ -282,6 +321,141 @@ bool ResolveEnableThinking(const nlohmann::json& chat_template_kwargs, bool defa
   }
   const nlohmann::json& v = chat_template_kwargs.at("enable_thinking");
   return v.is_boolean() ? v.get<bool>() : default_thinking;
+}
+
+bool ResolveEnableThinking(const ThinkingControls& thinking, bool default_thinking) {
+  return thinking.enabled.value_or(default_thinking);
+}
+
+ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
+  ThinkingControls out;
+  if (!body.is_object()) return out;
+
+  // Everything is validated up front, whatever the precedence below ends up reading: a caller that
+  // sends a malformed `thinking` object alongside a well-formed `reasoning` one still gets the 400
+  // its malformed field earned, rather than silent acceptance because a higher-precedence field
+  // happened to answer the question first.
+
+  // 1. chat_template_kwargs.enable_thinking -- deliberately NOT validated (a non-boolean is
+  //    tolerated and falls through to the next source, exactly as ResolveEnableThinking(json, bool)
+  //    has always tolerated it: chat_template_kwargs is an opaque passthrough to the template).
+  std::optional<bool> ctk_enabled;
+  if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+    const nlohmann::json& ctk = body.at("chat_template_kwargs");
+    if (ctk.contains("enable_thinking") && ctk.at("enable_thinking").is_boolean()) {
+      ctk_enabled = ctk.at("enable_thinking").get<bool>();
+    }
+  }
+
+  // 2. reasoning: {"enabled", "effort", "exclude", "max_tokens"} (OpenRouter's unified field).
+  std::optional<bool> reasoning_enabled;
+  std::optional<std::string> reasoning_effort_in_object;
+  if (body.contains("reasoning") && !body.at("reasoning").is_null()) {
+    const nlohmann::json& r = body.at("reasoning");
+    if (!r.is_object()) {
+      throw ApiError{400, "invalid_request_error", "'reasoning' must be an object"};
+    }
+    if (r.contains("enabled") && !r.at("enabled").is_null()) {
+      if (!r.at("enabled").is_boolean()) {
+        throw ApiError{400, "invalid_request_error", "'reasoning.enabled' must be a boolean"};
+      }
+      reasoning_enabled = r.at("enabled").get<bool>();
+    }
+    if (r.contains("effort") && !r.at("effort").is_null()) {
+      if (!r.at("effort").is_string()) {
+        throw ApiError{400, "invalid_request_error", "'reasoning.effort' must be a string"};
+      }
+      reasoning_effort_in_object = NormalizeEffort(r.at("effort").get<std::string>());
+      if (reasoning_effort_in_object->empty()) {
+        throw ApiError{400, "invalid_request_error", "'reasoning.effort' must be a non-empty string"};
+      }
+    }
+    if (r.contains("exclude") && !r.at("exclude").is_null()) {
+      if (!r.at("exclude").is_boolean()) {
+        throw ApiError{400, "invalid_request_error", "'reasoning.exclude' must be a boolean"};
+      }
+      if (r.at("exclude").get<bool>()) out.include_reasoning = false;
+    }
+    ValidateOptionalTokenBudget(r, "max_tokens", "reasoning");
+  }
+
+  // 3. thinking: {"type": "enabled"|"disabled"} (Anthropic's own shape, which several
+  //    OpenAI-compatible gateways mirror verbatim).
+  std::optional<bool> thinking_type_enabled;
+  if (body.contains("thinking") && !body.at("thinking").is_null()) {
+    const nlohmann::json& t = body.at("thinking");
+    if (!t.is_object()) {
+      throw ApiError{400, "invalid_request_error", "'thinking' must be an object"};
+    }
+    if (t.contains("type") && !t.at("type").is_null()) {
+      if (!t.at("type").is_string()) {
+        throw ApiError{400, "invalid_request_error", "'thinking.type' must be a string"};
+      }
+      const std::string type = t.at("type").get<std::string>();
+      if (type == "enabled") {
+        thinking_type_enabled = true;
+      } else if (type == "disabled") {
+        thinking_type_enabled = false;
+      } else {
+        throw ApiError{400, "invalid_request_error",
+                        "'thinking.type' must be \"enabled\" or \"disabled\""};
+      }
+    }
+    ValidateOptionalTokenBudget(t, "budget_tokens", "thinking");
+  }
+
+  // 4. enable_thinking (top level) -- vLLM/SGLang and several local servers accept this directly.
+  std::optional<bool> top_enable_thinking;
+  if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
+    if (!body.at("enable_thinking").is_boolean()) {
+      throw ApiError{400, "invalid_request_error", "'enable_thinking' must be a boolean"};
+    }
+    top_enable_thinking = body.at("enable_thinking").get<bool>();
+  }
+
+  // 5. reasoning_effort (top level) -- OpenAI's own field name.
+  std::optional<std::string> top_effort;
+  if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+    if (!body.at("reasoning_effort").is_string()) {
+      throw ApiError{400, "invalid_request_error", "'reasoning_effort' must be a string"};
+    }
+    top_effort = NormalizeEffort(body.at("reasoning_effort").get<std::string>());
+    if (top_effort->empty()) {
+      throw ApiError{400, "invalid_request_error", "'reasoning_effort' must be a non-empty string"};
+    }
+  }
+
+  // include_reasoning: OpenRouter's legacy boolean spelling of `reasoning.exclude`, inverted.
+  // Orthogonal to the on/off question -- it only decides whether the TEXT comes back.
+  if (body.contains("include_reasoning") && !body.at("include_reasoning").is_null()) {
+    if (!body.at("include_reasoning").is_boolean()) {
+      throw ApiError{400, "invalid_request_error", "'include_reasoning' must be a boolean"};
+    }
+    if (!body.at("include_reasoning").get<bool>()) out.include_reasoning = false;
+  }
+
+  // Precedence (see ParseThinkingControls's own doc comment for why this order).
+  if (ctk_enabled) {
+    out.enabled = ctk_enabled;
+  } else if (reasoning_enabled) {
+    out.enabled = reasoning_enabled;
+  } else if (reasoning_effort_in_object) {
+    out.enabled = *reasoning_effort_in_object != "none";
+  } else if (thinking_type_enabled) {
+    out.enabled = thinking_type_enabled;
+  } else if (top_enable_thinking) {
+    out.enabled = top_enable_thinking;
+  } else if (top_effort) {
+    out.enabled = *top_effort != "none";
+  }
+
+  // The effort level itself is independent of which field answered the on/off question: the
+  // object's own `effort` wins over the top-level one, and "none" is an off-switch, not a level.
+  const std::optional<std::string>& effort =
+      reasoning_effort_in_object ? reasoning_effort_in_object : top_effort;
+  if (effort && *effort != "none") out.template_effort = TemplateEffortFor(*effort);
+
+  return out;
 }
 
 ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
@@ -393,6 +567,8 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
     req.tools = body.at("tools");
   }
   req.tool_choice = ParseToolChoice(body, req.tools);
+  // Parsed AFTER chat_template_kwargs above, since its highest-precedence source lives inside it.
+  req.thinking = ParseThinkingControls(body);
 
   return req;
 }
@@ -467,8 +643,22 @@ nlohmann::json BuildUsageJson(const UsageStats& usage) {
 //     NOT in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored by this server
 //     today, so it is deliberately left out rather than falsely advertised.
 //   architecture -- text in, text out (no vision tower yet, docs/server.md's "Deferred" section).
+//   top_provider / reasoning -- the OpenRouter-shaped capability block, the one machine-readable
+//     form several clients (and Unsloth Studio's own openrouter_model_capabilities mapper) already
+//     know how to read: context/output limits and whether thinking is supported, default-on
+//     (`--think`) and optional. See docs/server.md's "Client compatibility: Unsloth Studio".
+nlohmann::json ModelInputModalities() { return nlohmann::json::array({"text"}); }
+
+nlohmann::json ModelSupportedReasoningEfforts() {
+  // The full de-facto scale, because ParseThinkingControls accepts every one of these: "none"
+  // turns thinking off and each other level maps onto one of chat_template.jinja's own three
+  // (TemplateEffortFor, above). Advertising a level this server silently ignored would be the
+  // same false advertising `supported_parameters` exists to avoid.
+  return nlohmann::json::array({"none", "minimal", "low", "medium", "high", "xhigh", "max"});
+}
+
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx) {
+                                    int64_t max_ctx, bool default_thinking) {
   return {{"id", model_id},
           {"object", "model"},
           {"created", created_unix},
@@ -481,14 +671,25 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
           {"supported_parameters",
            nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
                                   "max_completion_tokens", "stop", "stream", "stream_options",
-                                  "tools", "tool_choice", "chat_template_kwargs"})},
-          {"architecture", {{"input_modalities", nlohmann::json::array({"text"})},
+                                  "tools", "tool_choice", "chat_template_kwargs", "reasoning",
+                                  "reasoning_effort", "include_reasoning", "enable_thinking",
+                                  "thinking"})},
+          // `is_moderated: false` -- nothing in this process filters or classifies a generation.
+          {"top_provider",
+           {{"context_length", max_ctx}, {"max_completion_tokens", max_ctx}, {"is_moderated", false}}},
+          {"reasoning",
+           {{"supported_efforts", ModelSupportedReasoningEfforts()},
+            {"default_enabled", default_thinking},
+            {"mandatory", false}}},
+          {"architecture", {{"input_modalities", ModelInputModalities()},
                             {"output_modalities", nlohmann::json::array({"text"})}}}};
 }
 
-nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx) {
+nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx,
+                                    bool default_thinking) {
   return {{"object", "list"},
-          {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx)})}};
+          {"data", nlohmann::json::array(
+                        {BuildModelEntryJson(model_id, created_unix, max_ctx, default_thinking)})}};
 }
 
 nlohmann::json BuildTimingsJson(const TimingStats& timings) {

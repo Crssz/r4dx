@@ -97,7 +97,9 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
   });
 
   svr.Get("/v1/models", [&engine_ref](const httplib::Request&, httplib::Response& res) {
-    res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx()).dump(),
+    res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
+                                         engine_ref.DefaultThinking())
+                         .dump(),
                      "application/json");
   });
 
@@ -120,7 +122,9 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                        engine_ref.ModelId() + "')");
       return;
     }
-    res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx()).dump(),
+    res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
+                                         engine_ref.DefaultThinking())
+                         .dump(),
                      "application/json");
   });
 
@@ -138,14 +142,18 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       // Engine::RunRequest uses (ResolveEnableThinking, openai_types.h) so the two independently-
       // made calls can never drift apart. Decides whether the sink runs its reasoning/content
       // splitter at all (task item 5c: a thinking-off request's sink behavior must stay byte-for-
-      // byte identical to before this feature existed).
-      const bool enable_thinking = ResolveEnableThinking(req.chat_template_kwargs, engine_ref.DefaultThinking());
+      // byte identical to before this feature existed). `emit_reasoning` is the separate
+      // "think, but do not return the thought" question (reasoning.exclude / include_reasoning,
+      // docs/server.md's "Thinking controls").
+      const bool enable_thinking = ResolveEnableThinking(req.thinking, engine_ref.DefaultThinking());
+      const bool emit_reasoning = enable_thinking && req.thinking.include_reasoning;
 
       auto pending = std::make_shared<PendingRequest>();
       pending->kind = RequestKind::kChat;
       pending->request_id = id;
       pending->messages = req.messages;
       pending->chat_template_kwargs = req.chat_template_kwargs;
+      pending->thinking = req.thinking;
       pending->tools = req.tools;
       pending->sampling = req.sampling;
       pending->max_tokens = max_tokens;
@@ -154,7 +162,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 
       if (req.stream) {
         auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created,
-                                                     req.stream_options_include_usage, enable_thinking);
+                                                     req.stream_options_include_usage, enable_thinking,
+                                                     emit_reasoning);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -162,7 +171,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         }
         ServeStream(res, sink);
       } else {
-        auto sink = std::make_shared<BufferingSink>(enable_thinking);
+        auto sink = std::make_shared<BufferingSink>(enable_thinking, emit_reasoning);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
@@ -175,6 +184,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
           return;
         }
         UsageStats usage{sink->prompt_tokens, sink->completion_tokens};
+        // Reported even when the TEXT was excluded: the tokens were really spent, and a client
+        // that asked not to see the thought still bills/accounts for it.
         if (enable_thinking) usage.reasoning_tokens = sink->reasoning_tokens;
         // `content` is JSON null (not "") only when the whole turn was a pure tool call with no
         // accompanying prose -- OpenAI's own convention (openai_types.h's tool_calls-carrying
@@ -183,7 +194,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
             (!sink->tool_calls.empty() && sink->text.empty()) ? std::nullopt
                                                                 : std::optional<std::string>(sink->text);
         const std::optional<std::string> reasoning_content =
-            enable_thinking ? std::optional<std::string>(sink->reasoning_text) : std::nullopt;
+            emit_reasoning ? std::optional<std::string>(sink->reasoning_text) : std::nullopt;
         res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
                                                      sink->finish_reason, usage, sink->timings,
                                                      reasoning_content)

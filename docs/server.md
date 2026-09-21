@@ -22,7 +22,9 @@ loaded), `messages` (chat) / `prompt` (completions), `temperature`, `top_p`, `to
 given), `seed`, `stop` (a string or array of strings), `stream`, `chat_template_kwargs` (an object
 passed straight through to `ChatTemplate::render()`'s `extra_context` -- `chat_template.h`
 documents `enable_thinking`/`reasoning_effort`/`preserve_thinking`/`add_vision_id` as the fields
-Qwen3.8-27B's own template understands), `tools` (rendered into the prompt AND parsed back out of
+Qwen3.8-27B's own template understands), the thinking controls `enable_thinking` / `reasoning_effort`
+/ `reasoning` / `thinking` / `include_reasoning` (see "Thinking controls" below), `tools` (rendered
+into the prompt AND parsed back out of
 the generation into a structured `message.tool_calls` response field -- see "Tool calls" below),
 `tool_choice` (`"none"`/`"auto"`/`"required"`/`{"type":"function","function":{"name":...}}`, see
 "Tool calls").
@@ -56,8 +58,10 @@ the common set is emitted on every entry -- `BuildModelEntryJson`, `openai_types
 | `meta.n_ctx` | Same value, under llama.cpp's `/v1/models` field name. |
 | `meta.n_ctx_train` | The checkpoint's own native context length (`kModelNativeContextLength` = 262144, Qwen3.8-27B's `config.json` `max_position_embeddings`) -- a named constant, not read from the loaded container: `r4dx::model::ModelConfig` does not carry this field (nothing in the layer graph needs it). |
 | `capabilities` | `["completion", "chat", "tool_use", "reasoning"]` -- a fixed list reflecting what this server actually does (plain completion, the chat template, `tools`/`tool_choice`, and `chat_template_kwargs.enable_thinking`). |
-| `supported_parameters` | Exactly the request fields this server's parsers actually honour: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_tokens`, `max_completion_tokens`, `stop`, `stream`, `stream_options`, `tools`, `tool_choice`, `chat_template_kwargs`. Anything not in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored today, so it is deliberately left off rather than falsely advertised. |
-| `architecture.input_modalities` / `.output_modalities` | `["text"]` / `["text"]` -- no vision tower yet ("Deferred / known gaps" below). |
+| `supported_parameters` | Exactly the request fields this server's parsers actually honour: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_tokens`, `max_completion_tokens`, `stop`, `stream`, `stream_options`, `tools`, `tool_choice`, `chat_template_kwargs`, `reasoning`, `reasoning_effort`, `include_reasoning`, `enable_thinking`, `thinking`. Anything not in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored today, so it is deliberately left off rather than falsely advertised. |
+| `top_provider` | `{context_length, max_completion_tokens, is_moderated: false}` -- the OpenRouter-shaped repeat of the same `--max-ctx` numbers above, under the field names an OpenRouter-shaped client reads. `is_moderated` is false: nothing in this process filters or classifies a generation. |
+| `reasoning` | `{supported_efforts, default_enabled, mandatory: false}` -- the OpenRouter-shaped thinking-capability block. `supported_efforts` is `["none","minimal","low","medium","high","xhigh","max"]`, exactly the set `ParseThinkingControls` accepts (`"none"` = off, each other level maps onto one of the template's own three -- see "Thinking controls" below). `default_enabled` is the server's own `--think` flag, so a client can pre-set its toggle the way this server will really behave. `mandatory` is false: thinking can always be turned off. |
+| `architecture.input_modalities` / `.output_modalities` | `["text"]` / `["text"]` -- no vision tower yet ("Deferred / known gaps" below). The input list has exactly ONE writer, `ModelInputModalities()` (`openai_types.cpp`), so the vision milestone flips it there and nowhere else. |
 
 `max_ctx` is plumbed from `ServerArgs::max_ctx` (`server_args.h`) through `EngineOptions::
 model_opts.max_ctx` into `Engine::MaxCtx()`, which both the `/v1/models` list route and the
@@ -214,6 +218,91 @@ must produce many content deltas with the first arriving well before the last, t
 streamed content must equal the non-streaming content for the same greedy request, and no content
 delta may contain `<tool_call`/`</tool_call`.
 
+## Thinking controls
+
+This checkpoint thinks when its chat template's `enable_thinking` variable is true. Clients,
+however, spell "turn thinking on" five different ways, and before this section existed this server
+accepted exactly one of them (`chat_template_kwargs.enable_thinking`), which is why a client with a
+thinking toggle -- Unsloth Studio among them -- could not drive it. All five are now accepted and
+reduced to one answer by `ParseThinkingControls` (`openai_types.h`/`.cpp`), whose result rides on
+`ChatCompletionRequest::thinking` / `PendingRequest::thinking` and is resolved by the single
+`ResolveEnableThinking(ThinkingControls, bool)` that both `http_server.cpp` (which must pick the
+sink's splitting behavior before the request reaches the worker thread) and `Engine::RunRequest`
+(which renders the template and does the generation-time splitting) call.
+
+### Accepted fields, in precedence order
+
+The FIRST source present wins; an explicit request field always beats the `--think` server default.
+
+| # | Field | Shape | Meaning |
+|---|---|---|---|
+| 1 | `chat_template_kwargs.enable_thinking` | bool | Highest, because it addresses THIS checkpoint's own template directly and is the only spelling this server accepted before -- so no existing caller's behavior moved. A non-boolean here is tolerated (not a 400) and falls through to the next source, exactly as `ResolveEnableThinking(json, bool)` always tolerated it: `chat_template_kwargs` is an opaque passthrough to the template. |
+| 2 | `reasoning` | `{"enabled": bool, "effort": str, "exclude": bool, "max_tokens": int}` | OpenRouter's unified field. `enabled` wins over `effort` inside the object. `exclude` is orthogonal (see below). `max_tokens` is validated and then ignored -- there is no reasoning-token budget here -- and is therefore NOT in `supported_parameters`. |
+| 3 | `thinking` | `{"type": "enabled"\|"disabled"}` | Anthropic's shape, which several OpenAI-compatible gateways mirror verbatim. An optional `budget_tokens` is validated and ignored, same as `reasoning.max_tokens`. |
+| 4 | `enable_thinking` | bool | Top level. vLLM/SGLang and several local servers accept it directly. |
+| 5 | `reasoning_effort` | string | OpenAI's own field name. `"none"` means thinking OFF; every other non-empty string means ON. |
+| 6 | -- | -- | Nothing named: the server's `--think` flag decides, byte-for-byte as before. |
+
+Anything malformed is a `400 invalid_request_error` with the standard error body, never a silently
+ignored field: a non-object `reasoning`/`thinking`, a non-boolean `enabled`/`exclude`/
+`enable_thinking`/`include_reasoning`, a non-string or blank `effort`/`reasoning_effort`, a
+`thinking.type` that is neither `"enabled"` nor `"disabled"`, or a negative/non-integer
+`reasoning.max_tokens`/`thinking.budget_tokens`. Every one of those, and every precedence rule
+above, is covered by `tests/server/test_openai_types.cpp`'s `TestThinking*` cases and re-checked
+end to end by `tools/server/smoke.ps1`.
+
+### Effort levels really do something here
+
+`C:\AI\models\Qwen3.8-27B\chat_template.jinja` reads `reasoning_effort` itself and accepts exactly
+three values -- `xhigh` (its default), `medium` and `low` -- raising
+`Unexpected reasoning effort ...` on anything else (which this server would surface as a `400`,
+since a template render failure is a caller-shape problem). `xhigh` and `low` each inject a
+different `reasoning_instructions` sentence into the system prompt; `medium` injects none. So an
+effort is not cosmetic, and passing a client's level through verbatim would break ordinary
+requests. `ParseThinkingControls` maps the de-facto scale onto the template's three:
+
+| Client effort | Template level |
+|---|---|
+| `none` | (thinking off -- no effort is passed at all) |
+| `minimal`, `low` | `low` |
+| `medium` | `medium` |
+| `high`, `xhigh`, `max` | `xhigh` |
+| anything else | (none -- thinking on, template's own default `xhigh`) |
+
+Matching is case- and whitespace-insensitive. The mapped level is written into the template's
+`extra_context` as `reasoning_effort` by `Engine::RunRequest`, but only when the request did not
+send an explicit `chat_template_kwargs.reasoning_effort` -- that passthrough still wins, same rule
+`enable_thinking` follows. `tools/server/smoke.ps1` proves the level really reaches the template by
+checking that `low`/`medium`/`high` render prompts of different token counts.
+
+### `reasoning.exclude` / `include_reasoning`: think, but withhold the thought
+
+`reasoning: {"exclude": true}` (OpenRouter) and `include_reasoning: false` (its legacy boolean
+spelling) are orthogonal to the on/off question: thinking still happens, the generation is still
+split so `content` is the ANSWER alone with no `</think>` leaking through, and
+`usage.completion_tokens_details.reasoning_tokens` is still reported (the tokens were really
+spent) -- only the `reasoning_content` field and its streaming deltas are suppressed. Either one
+asking for exclusion wins over the other asking for inclusion. Implemented as one `emit_reasoning`
+flag on both sinks (`response_sink.h`), defaulted to true so every existing call site is unaffected.
+
+### What the RESOLVED value changes
+
+`enable_thinking` in the template's `extra_context` (only when the request sent none itself -- the
+passthrough rule above), whether the sinks split at all, the `min_stop_search_from` floor that
+confines `--stop` matching to the answer, `usage.completion_tokens_details.reasoning_tokens`, and
+the `thinking=yes|no` field of the per-request stderr log line (which is what
+`tools/server/smoke.ps1` reads to check every spelling above against BOTH containers, since it does
+not depend on the model producing a well-formed `</think>` span).
+
+**Text-only behaviour is unchanged.** A request naming none of these fields resolves to `--think`
+and renders exactly the `extra_context` it did before this section existed, so its output is
+byte-identical. `tools/server/smoke.ps1` asserts that directly: every thinking-OFF spelling must
+produce `message.content` byte-identical to a `chat_template_kwargs.enable_thinking: false`
+baseline, with no `reasoning_content` and no `completion_tokens_details` key anywhere.
+
+**`/v1/completions` is unaffected**: it has no chat template and therefore no thinking concept.
+These fields are accepted in the body (they simply have nowhere to go) rather than rejected.
+
 ## `reasoning_content`
 
 DeepSeek/vLLM's `reasoning_content` convention: when a request's RESOLVED `enable_thinking` is true
@@ -316,6 +405,183 @@ real-container checks (non-streaming and streaming `enable_thinking: true` reque
 thinking + `tools` + streaming request confirming the reasoning span really does arrive as many
 live deltas rather than one post-generation lump, with its streamed `content` still equal to the
 same request's non-streaming `message.content`).
+
+## Client compatibility: Unsloth Studio
+
+Read from the installed copy's own source (READ ONLY, never modified): the backend Python under
+`%USERPROFILE%\.unsloth\studio\unsloth_studio\Lib\site-packages\studio\backend` and the bundled,
+minified frontend under `...\studio\frontend\dist\assets`. Identifiers below are quoted from those
+files so every claim is checkable; anything that would need the GUI driven to confirm is called out
+as unverified.
+
+### How a connection is made, and which provider types allow a custom base URL
+
+`core/inference/providers.py`'s `PROVIDER_REGISTRY` is the whole list. Four entries are
+`"hidden": True` and surfaced by the frontend as "Custom" connection presets rather than the
+provider dropdown -- `providers-api-*.js`'s own preset table is
+`[{providerType: "llama_cpp", baseUrlPlaceholder: "http://localhost:8080/v1"}, {providerType:
+"vllm", ...}, {providerType: "ollama", ...}]` plus a generic `custom`. `base_url_editable` defaults
+to `True`, and only `openai_codex` sets it to `False`, so every other type (including `openrouter`)
+accepts a custom base URL. A loopback URL is fine: `providers.py`'s SSRF guard blocks only cloud
+metadata hosts, and non-public addresses only when the operator opts in via
+`UNSLOTH_STUDIO_BLOCK_PRIVATE_PROVIDER_URLS` ("loopback and LAN endpoints are the normal case").
+
+### (a) Where the model card's values come from -- NOT from this server
+
+The card is built in `chat-*.js` (labels `Model ID`, `Connection`, `Endpoint`, `Accepts`,
+`Generates`, `Context window`, `Max output`, `Reasoning`). Its inputs:
+
+* **Context window** -- `Oe(providerType, modelId)?.contextLength`, i.e. the models.dev catalogue
+  (`routes/providers.py`'s `/model-catalog`, trimmed by `trim_models_dev_catalog`, keyed by
+  provider type + model id) or the OpenRouter live capability map. Neither has an entry for a local
+  server, so it renders **"Not published"**.
+* **Max output** -- `_n(providerType, modelId)`: OpenRouter reads its live capabilities, everything
+  else a hardcoded per-provider prefix table (`gpt-4`, `claude-*`, `gemini-*`, ...). No match for a
+  local model id, so it renders **"Follows the connection"** (the per-connection `max_output_tokens`
+  the user may type in the connection form).
+* **Reasoning** -- `_r(providerType, modelId, {isReasoningProvider, baseUrl})`, see (b).
+* **Accepts** -- `Oe(...)?.inputModalities`, else `rt(providerType, modelId)` for a plain
+  `Text`/`Text · Images` answer. Both are catalogue-driven, so a local connection renders **"Text"**.
+
+**This server's `/v1/models` is never consulted for any of it.** `core/inference/
+provider_model_capabilities.py` has `MODEL_CAPABILITY_PROVIDERS = frozenset({"openrouter"})` and
+`provider_model_capabilities()` returns `[]` for every other provider type -- and even for
+`openrouter`, the frontend gates the fetch to the official URL:
+
+```js
+var Vm = {openrouter: `https://openrouter.ai/api/v1`};
+function Hm(e){ let t = Vm[e.providerType]; if(!t) return false;
+                let n = (e.baseUrl ?? ``).trim().replace(/\/+$/,``).toLowerCase();
+                return n === `` || n === t; }
+// ... for (let n of e) { ... if(!Hm(n)) continue;  <- skips /api/providers/model-capabilities
+```
+
+So an OpenRouter-type connection pointed at a local base URL never has its capabilities fetched at
+all. **Conclusion, stated plainly: the OpenRouter-shaped `top_provider`/`reasoning`/
+`supported_parameters`/`architecture` fields this server now publishes on `/v1/models` do NOT change
+anything in this Unsloth Studio build.** They were still added (they are the one machine-readable
+capability shape several other OpenAI-compatible clients read, and the vision milestone needs
+`architecture.input_modalities` to exist), but nobody should expect Studio's card to start filling
+in because of them.
+
+### (b) Where a thinking toggle comes from, and the one setup that gets one
+
+`providers-api-*.js`'s `_r(providerType, modelId, opts)` decides `supportsReasoning` /
+`reasoningStyle` / `supportsReasoningOff` / `reasoningEffortLevels`. For the four local presets:
+
+| Connection type | Result |
+|---|---|
+| `custom` (generic "Custom") | falls to `default: return Z()` -- `supportsReasoning: false`. **No toggle.** |
+| `llama_cpp` | `hr("llama_cpp", modelId, true)` -- a models.dev lookup by NORMALIZED MODEL NAME. This container's `model_id` (`Qwen/Qwen3.8-27B`) normalizes to `qwen3.8`, which is in no catalogue, so `null` -> `Z()`. **No toggle.** |
+| `vllm` | `dr(providerType, opts)`: `providerType === "vllm" && opts?.isReasoningProvider` returns `{supportsReasoning: true, supportsReasoningOff: true, reasoningStyle: "enable_thinking"}` -- **unconditionally, no catalogue lookup, no model-id match needed.** |
+| `openrouter` (base URL overridden) | no catalogue match, so `case "openrouter": return gr`, and `gr = {supportsReasoning: true, reasoningStyle: "enable_thinking", supportsReasoningOff: true}`. **Toggle appears**, but the body it sends is the OpenRouter shape (see (c)). |
+
+`isReasoningProvider` is the connection's own saved `isReasoningModel` flag. `connections-tab-*.js`
+renders it as a switch with `htmlFor: "provider-is-reasoning"`, label **"Reasoning model"** and the
+caption **"This server runs a reasoning model"**, and gates that switch on `We(providerType)`, whose
+set is `new Set(["vllm"])` -- it exists for the vLLM preset and no other.
+
+### (c) Exactly what Unsloth then sends to this endpoint
+
+`core/inference/external_provider.py`'s `stream_chat_completion` builds the body:
+
+* **`vllm` and `llama_cpp`** take the `provider_info.get("supports_chat_template_kwargs")` branch
+  (both registry entries set it; `custom` deliberately does not). It sets
+  `body["chat_template_kwargs"]["enable_thinking"] = bool(thinking)` whenever the resolved thinking
+  is not `None`, and additionally `body["reasoning_effort"] = effort` when the effort is one of
+  `low|medium|high` (aliased first through `_LOCAL_SERVER_EFFORT_ALIASES = {"minimal": "low",
+  "xhigh": "high", "max": "high"}`). Note the asymmetry it documents: `"none"` rides on the kwarg
+  alone and is never sent as a top-level `reasoning_effort`, because "vLLM through 0.16 types the
+  top-level reasoning_effort as low | medium | high and 400s on `none`". With
+  `reasoningStyle: "enable_thinking"` (what the vLLM switch produces) the frontend sends only
+  `enableThinking`, so in practice the wire carries **`chat_template_kwargs.enable_thinking`** --
+  which this server already honoured before this milestone.
+* **`openrouter`** takes its own branch: `body["reasoning"] = {"effort": ...}` when an effort was
+  picked, `{"enabled": False}` for off, `{"enabled": True}` for on.
+* **`custom`** takes none of them and sends no thinking field at all. It also carries
+  `"body_omit": ("top_k", "min_p", "repetition_penalty")`.
+
+Everything in that list is now among the supported forms ("Thinking controls" above), so either
+setup works.
+
+Other request-shape facts worth knowing, from the same file: `vllm` is in
+`_USAGE_STREAM_OPTION_PROVIDERS`, so it sends `stream_options: {"include_usage": true}` on every
+streaming request (supported here); `vllm`/`llama_cpp` are in `_CONTINUATION_FLAG_PROVIDERS`, so a
+"continue this assistant turn" action adds `continue_final_message` / `add_generation_prompt`, which
+this server does not implement and silently ignores; `vllm`, `llama_cpp`, `ollama` and `custom` are
+in `_TEMPLATE_APPLYING_PROVIDERS`, so Studio neutralizes control markup (`</think>` and turn
+markers) inside the messages it sends.
+
+### (d) What it renders as thinking
+
+`delta.reasoning_content` -- the canonical field. `chat-*.js` accumulates
+`(delta.reasoning_content ?? "") + delta.reasoning_details[].text`; it never reads `delta.reasoning`
+itself. The backend normalizes for it first: `core/inference/sse_control_frames.py`'s
+`_normalize_reasoning_deltas` renames `delta.reasoning` to `delta.reasoning_content`, but **only
+when `reasoning_content` is absent or blank** ("The `delta.reasoning` alias Ollama and newer vLLM
+send is renamed to the canonical `reasoning_content`, streamed deltas only").
+
+**Decision on the OpenRouter-style `reasoning` alias: NOT added.** The evidence says Unsloth cannot
+benefit from it -- this server already sends `reasoning_content`, so the rename is skipped and the
+alias would be dead weight on every delta; and since the client concatenates its reasoning sources,
+a future client that summed `reasoning` and `reasoning_content` would double the thinking text. No
+client was found that needs it, and the deliverable was explicitly "add it if and only if the
+investigation shows a client needs it". If one ever turns up, it is one line in
+`StreamingSink::PushSplitDelta` and the two response builders.
+
+Request-side, Studio replays a previous turn's thought as `message.reasoning_content` on the
+assistant message (`pje` in `chat-*.js` sets `v.reasoning_content = g`), which this server already
+accepts -- see "`reasoning_content`"'s Multi-turn paragraph.
+
+### (e) How image attachments are sent, and what gates the attach button
+
+Shape (`chat-*.js`'s `hZ`): OpenAI content parts, with the image as a **`data:` URI**, never a
+remote URL --
+
+```js
+t.push({type: `image_url`,
+        image_url: {url: n.startsWith(`data:`) ? n : `data:image/png;base64,${n}`}});
+```
+
+alongside the ordinary `{type: "text", text: ...}` parts. The uploader accepts
+`image/jpeg,image/png,image/webp,image/gif`.
+
+The gate is `pY({isExternalModel, externalSupportsVision, ...})`, and for an external model its
+whole body is `n === false || ... ? "<model> cannot accept images." : null`. `externalSupportsVision`
+is `rt(providerType, modelId)`, which returns the user's per-model override if one exists, else the
+catalogue answer, else `qe(providerType)` (`true` for `openai`/`anthropic`/`gemini`/`openrouter`,
+`false` for `cohere`/`deepseek`/`mistral`, **`null` otherwise**). For `vllm`/`llama_cpp`/`custom`
+there is no catalogue entry and no provider-wide answer, so it is `null` -- and `pY` only blocks on
+an explicit `false`. **So the attach button is already open for a local connection**: Unsloth will
+happily POST `image_url` parts at this server today, and this server answers `400` (see "Request
+fields"). That is the gap the vision milestone closes; nothing has to change in Studio for it.
+
+### (3) The click-path to get a thinking toggle
+
+As far as the source proves, and no further:
+
+1. Connections -> add a connection -> choose the **Custom** option, then the **vLLM** preset
+   (`providerType: "vllm"`; `connections-tab-*.js`'s preset table).
+2. Base URL: `http://127.0.0.1:8080/v1` (whatever `--host`/`--port` this server was started with).
+3. API key: this server does not authenticate, and the registry marks the local presets' key
+   optional -- leave it blank, or type any placeholder if the form insists.
+4. Model IDs: type the loaded container's own `model_id` (this checkpoint's is `Qwen/Qwen3.8-27B`,
+   what `GET /v1/models` returns). `/v1/models` is served, so a "reload models" action should
+   discover it; the manual field exists either way.
+5. Turn ON the **"Reasoning model"** switch ("This server runs a reasoning model"). This is the
+   step that produces the toggle -- it is the only input to `dr()`, and it only exists for the vLLM
+   preset.
+
+**Not verified without driving the GUI**: the exact menu wording and order of steps 1-4, whether the
+form rejects an empty API key, whether the model list auto-populates from `/v1/models` for this
+provider type, and where the resulting thinking toggle is rendered in the composer. Everything about
+*what the toggle does to the request body*, and about the model card's values, is from the source
+and is stated above.
+
+An OpenRouter-type connection with its base URL overridden is the other setup that yields a toggle
+(it sends `reasoning: {"enabled": bool}`, also supported here), but it is the worse choice: its
+capability fetch is skipped (see (a)), its model picker is `model_list_mode: "curated"`, and it
+sends OpenRouter attribution headers. The vLLM preset is the recommended one.
 
 ## `timings`
 
@@ -428,7 +694,9 @@ section for the full integration accounting.
 - **Vision**: image content parts are rejected with `400` (see above) -- the vision tower forward
   pass is a separate milestone (`docs/status.md`); its architecture and preprocessing are now fully
   documented (`docs/vision.md`) with real-hardware validation goldens, but no `src/model` C++ exists
-  yet, so this `400` remains accurate.
+  yet, so this `400` remains accurate. Note that Unsloth Studio's attach button is ALREADY open
+  against a local connection and will POST `image_url` parts at this server today -- see "Client
+  compatibility: Unsloth Studio" (e) for the exact part shape and the gate that lets it through.
 - **Sampling defaults vs. explicit values**: `--default-temperature`/`--default-top-p`/
   `--default-top-k`/`--default-min-p` seed every sampling field a request does not itself set
   (`openai_types.cpp`'s `ParseSampling` starts from the server's defaults and only overwrites a

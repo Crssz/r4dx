@@ -136,7 +136,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // split) and the same ResolveEnableThinking formula http_server.cpp already used to decide the
     // sink's own splitting behavior, so the two independently-made calls can never drift apart.
     const bool enable_thinking = req.kind == RequestKind::kChat
-                                      ? ResolveEnableThinking(req.chat_template_kwargs, opts_.default_thinking)
+                                      ? ResolveEnableThinking(req.thinking, opts_.default_thinking)
                                       : false;
     if (req.kind == RequestKind::kChat) {
       r4dx::ChatJson messages = r4dx::ChatJson::array();
@@ -184,8 +184,21 @@ void Engine::RunRequest(PendingRequest& req) {
         messages.push_back(entry);
       }
       r4dx::ChatJson extra_context = req.chat_template_kwargs;
+      // `chat_template_kwargs.enable_thinking`, when the caller sent one, is left exactly as it
+      // arrived (an opaque passthrough the template reads with Jinja truthiness -- unchanged, and
+      // the highest-precedence source ResolveEnableThinking already read). Only when the caller
+      // sent none does the RESOLVED value go in: that is `--think` for every request that names no
+      // thinking control at all (byte-identical to before this stage) and the request's own answer
+      // for one that used `reasoning`/`thinking`/`enable_thinking`/`reasoning_effort` instead.
       if (!extra_context.contains("enable_thinking")) {
-        extra_context["enable_thinking"] = opts_.default_thinking;
+        extra_context["enable_thinking"] = enable_thinking;
+      }
+      // A requested effort, already mapped onto the three levels this template accepts
+      // (ThinkingControls::template_effort). An explicit `chat_template_kwargs.reasoning_effort`
+      // still wins, same passthrough rule as above; absent both, the template applies its own
+      // default ("xhigh").
+      if (req.thinking.template_effort && !extra_context.contains("reasoning_effort")) {
+        extra_context["reasoning_effort"] = *req.thinking.template_effort;
       }
       std::string rendered;
       try {

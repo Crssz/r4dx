@@ -58,6 +58,28 @@ struct SamplingParams {
   uint64_t seed = 0;
 };
 
+// Every thinking/reasoning control a chat request may carry, normalized into one struct by
+// ParseThinkingControls below (docs/server.md's "Thinking controls" section has the full
+// precedence table and the per-field wire shapes). Different OpenAI-compatible clients spell the
+// same intent five different ways, so all five are accepted and reduced here rather than each
+// consumer re-deriving its own answer.
+struct ThinkingControls {
+  // std::nullopt means the request named NO thinking control at all -- the caller then applies the
+  // server's own `--think` default, exactly as before these fields existed.
+  std::optional<bool> enabled;
+  // The requested effort, ALREADY MAPPED onto the three levels this checkpoint's own
+  // `chat_template.jinja` accepts ("low"/"medium"/"xhigh"; anything else makes the template's own
+  // `raise_exception('Unexpected reasoning effort ...')` fire). Unset when the request named no
+  // effort, named "none" (which means thinking off, not an effort), or named one that carries no
+  // meaning here -- in which case the template applies its own default ("xhigh").
+  std::optional<std::string> template_effort;
+  // OpenRouter's `reasoning.exclude: true` / the legacy `include_reasoning: false`: think, but do
+  // not return the reasoning TEXT to the client. The generation is still split (so `content` stays
+  // the answer only) and `usage.completion_tokens_details.reasoning_tokens` is still reported --
+  // only the `reasoning_content` field/deltas are suppressed.
+  bool include_reasoning = true;
+};
+
 // Thrown by every Parse* function below on any invalid input; the HTTP layer (http_server.cpp)
 // catches this, maps http_status to the response code, and serializes ErrorBody(*this) as the
 // body -- mirroring OpenAI's `{"error": {"message", "type", ...}}` shape.
@@ -106,6 +128,11 @@ struct ChatCompletionRequest {
   // see ToolChoice's own doc comment.
   nlohmann::json tools = nlohmann::json::array();
   ToolChoice tool_choice;
+  // Every thinking control this request carried, already reduced to one answer -- see
+  // ThinkingControls and ParseThinkingControls. `chat_template_kwargs.enable_thinking` is still
+  // carried verbatim in `chat_template_kwargs` above (the template reads it directly); this field
+  // is what decides the RESOLVED behavior for every consumer.
+  ThinkingControls thinking;
   // `stream_options: {"include_usage": bool}` (OpenAI's own streaming-usage opt-in). Parsed and
   // validated (must be an object; `include_usage` must be a boolean when present) regardless of
   // `stream` -- a non-streaming request carrying `stream_options` is accepted and this field is
@@ -156,6 +183,47 @@ std::string GenerateRequestId(const char* prefix);
 // calls can never drift apart.
 bool ResolveEnableThinking(const nlohmann::json& chat_template_kwargs, bool default_thinking);
 
+// Parses -- and validates -- every thinking control a chat request may carry, reducing them to one
+// ThinkingControls (docs/server.md's "Thinking controls"). Accepted spellings, in the precedence
+// order applied here (FIRST one present wins; an explicit request field always beats `--think`):
+//
+//   1. `chat_template_kwargs.enable_thinking` (bool)  -- the field that addresses THIS checkpoint's
+//      own template directly, and the only one this server accepted before; kept highest so no
+//      existing caller's behavior moves. A non-boolean here is tolerated, not rejected, exactly as
+//      ResolveEnableThinking(json, bool) already tolerated it.
+//   2. `reasoning: {...}` (OpenRouter) -- `enabled` (bool) wins over `effort` (string) inside it.
+//   3. `thinking: {"type": "enabled"|"disabled"}` (Anthropic-style).
+//   4. `enable_thinking` (bool, top level).
+//   5. `reasoning_effort` (string, top level).
+//   6. nothing -> `enabled` stays unset and the caller applies `--think`.
+//
+// An effort of "none" means thinking OFF; every other non-empty effort means ON. Independently of
+// the on/off answer, `reasoning.exclude: true` or `include_reasoning: false` suppresses the
+// reasoning TEXT in the response (either one asking for exclusion wins).
+//
+// Throws ApiError (400, the standard error body) on a malformed shape: a non-object `reasoning`/
+// `thinking`, a non-boolean `enabled`/`exclude`/`enable_thinking`/`include_reasoning`, a
+// non-string or empty `effort`/`reasoning_effort`, a `thinking.type` that is neither "enabled" nor
+// "disabled", or a negative/non-integer `reasoning.max_tokens`/`thinking.budget_tokens`.
+ThinkingControls ParseThinkingControls(const nlohmann::json& body);
+
+// The resolved `enable_thinking` for a request: whatever ParseThinkingControls decided, else the
+// server's `--think` default. Shared by http_server.cpp (which must pick the ResponseSink's
+// splitting behavior before the request reaches the worker thread) and engine.cpp (which decides
+// the generation-time splitting and what the chat template is rendered with), so the two
+// independently-made calls can never drift apart.
+bool ResolveEnableThinking(const ThinkingControls& thinking, bool default_thinking);
+
+// `architecture.input_modalities` for `/v1/models` -- the ONE place that list is written. Today
+// `["text"]`; the vision-tower milestone flips it to `["text","image"]` here and nowhere else
+// (docs/server.md's "Deferred / known gaps").
+nlohmann::json ModelInputModalities();
+
+// The `reasoning.supported_efforts` list `/v1/models` advertises, and the exact set of effort
+// strings ParseThinkingControls maps onto a template level. See ThinkingControls::template_effort
+// for what each one actually does on this checkpoint.
+nlohmann::json ModelSupportedReasoningEfforts();
+
 // The model's own native context length (Qwen3.8-27B's config.json `max_position_embeddings`,
 // server_args.h's `--max-ctx` default derivation) -- NOT the same as a server's own configured
 // `--max-ctx`, which may be set lower. r4dx::model::ModelConfig does not carry this field (nothing
@@ -169,13 +237,15 @@ inline constexpr int64_t kModelNativeContextLength = 262144;
 // comment enumerates (docs/server.md's "Model metadata" section has the full field-by-field
 // writeup). `max_ctx` is the server's own `--max-ctx` (Engine::MaxCtx()), NOT
 // kModelNativeContextLength.
+// `default_thinking` is the server's own `--think` flag, reported as `reasoning.default_enabled`
+// so a client can render a thinking toggle pre-set the way this server will actually behave.
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx);
+                                    int64_t max_ctx, bool default_thinking = false);
 
 // `{"object": "list", "data": [BuildModelEntryJson(...)]}` -- GET /v1/models's shape. This server
 // ever loads exactly one model, so `data` always has exactly one entry (task design point 2).
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx);
+                                    int64_t max_ctx, bool default_thinking = false);
 
 struct UsageStats {
   int64_t prompt_tokens = 0;

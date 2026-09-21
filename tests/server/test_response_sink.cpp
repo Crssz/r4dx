@@ -347,6 +347,74 @@ void TestBufferingSinkOnReasoningContentToolModeBypassesSplitter() {
   CHECK(sink.text == "Let me check the weather.");
 }
 
+// ---- emit_reasoning = false (OpenRouter's `reasoning.exclude` / `include_reasoning: false`) -----
+//
+// "Think, but do not return the thought": the split must still happen (so `content`/the content
+// deltas are the ANSWER alone, with no `</think>` leaking through) while the reasoning text is
+// withheld entirely.
+
+void TestBufferingSinkExcludeReasoningKeepsAnswerAndDropsThought() {
+  BufferingSink sink(/*enable_thinking=*/true, /*emit_reasoning=*/false);
+  sink.OnStart(5);
+  sink.OnToken("some reasoning");
+  sink.OnToken("</think>\n\nthe final answer");
+  sink.OnDone("stop", 10, TimingStats{}, /*reasoning_tokens=*/6);
+  CHECK(sink.reasoning_text.empty());
+  CHECK(sink.text == "the final answer");
+  // The token COUNT is still reported: the tokens were really spent.
+  CHECK(sink.reasoning_tokens == 6);
+}
+
+void TestBufferingSinkExcludeReasoningAlsoDropsOneShotToolModeSpan() {
+  BufferingSink sink(/*enable_thinking=*/true, /*emit_reasoning=*/false);
+  sink.OnStart(5);
+  sink.OnReasoningContent("already trimmed reasoning");
+  sink.OnToken("Let me check the weather.");
+  sink.OnDone("tool_calls", 20);
+  CHECK(sink.reasoning_text.empty());
+  CHECK(sink.text == "Let me check the weather.");
+}
+
+void TestStreamingSinkExcludeReasoningDropsReasoningDeltasOnly() {
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-x1", "m", 1, /*include_usage=*/false,
+                     /*enable_thinking=*/true, /*emit_reasoning=*/false);
+  sink.OnStart(3);
+  sink.OnToken("some reasoning");
+  sink.OnToken("</think>\n\nthe answer");
+  sink.OnDone("stop", 6, TimingStats{}, /*reasoning_tokens=*/4);
+
+  std::string event;
+  CHECK(sink.Next(event));  // role preamble
+  CHECK(event.find("\"role\":\"assistant\"") != std::string::npos);
+  CHECK(sink.Next(event));  // straight to the content delta -- no reasoning delta at all
+  CHECK(event.find("\"content\":\"the answer\"") != std::string::npos);
+  CHECK(event.find("</think>") == std::string::npos);
+  CHECK(sink.Next(event));  // finish_reason chunk
+  CHECK(event.find("\"finish_reason\":\"stop\"") != std::string::npos);
+  CHECK(sink.Next(event));  // [DONE]
+  CHECK(!sink.Next(event));
+}
+
+void TestStreamingSinkExcludeReasoningNoReasoningKeyAnywhere() {
+  for (bool one_shot : {false, true}) {
+    StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-x2", "m", 1, /*include_usage=*/true,
+                       /*enable_thinking=*/true, /*emit_reasoning=*/false);
+    sink.OnStart(3);
+    if (one_shot) {
+      sink.OnReasoningContent("already trimmed");
+      sink.OnToken("visible");
+    } else {
+      // Never-closed span: OnDone's Finish() flush must be suppressed too.
+      sink.OnToken("thinking forever, no close tag");
+    }
+    sink.OnDone("stop", 5, TimingStats{}, /*reasoning_tokens=*/2);
+    std::string event;
+    while (sink.Next(event)) {
+      CHECK(event.find("reasoning_content") == std::string::npos);
+    }
+  }
+}
+
 void TestStreamingSinkThinkingOffNoReasoningContentKeyAnywhere() {
   StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-r0", "m", 1);  // enable_thinking defaults false
   sink.OnStart(3);
@@ -494,6 +562,10 @@ int main() {
   TestBufferingSinkNeverClosedReasoningLeavesContentEmpty();
   TestBufferingSinkReasoningTrimmedLeadingAndTrailingWhitespace();
   TestBufferingSinkOnReasoningContentToolModeBypassesSplitter();
+  TestBufferingSinkExcludeReasoningKeepsAnswerAndDropsThought();
+  TestBufferingSinkExcludeReasoningAlsoDropsOneShotToolModeSpan();
+  TestStreamingSinkExcludeReasoningDropsReasoningDeltasOnly();
+  TestStreamingSinkExcludeReasoningNoReasoningKeyAnywhere();
   TestStreamingSinkThinkingOffNoReasoningContentKeyAnywhere();
   TestStreamingSinkSplitsIntoReasoningThenContentDeltas();
   TestStreamingSinkNeverClosedFlushesReasoningOnDone();

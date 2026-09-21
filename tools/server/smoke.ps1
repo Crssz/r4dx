@@ -193,6 +193,30 @@ try {
     Check (($models.data[0].capabilities) -contains "reasoning") `
         "/v1/models: data[0].capabilities contains 'reasoning'"
 
+    # ---- OpenRouter-shaped capability block (docs/server.md's "Model metadata") -------------------
+    Check ($models.data[0].top_provider.context_length -eq $MaxCtx) `
+        "/v1/models: data[0].top_provider.context_length == --max-ctx"
+    Check ($models.data[0].top_provider.max_completion_tokens -eq $MaxCtx) `
+        "/v1/models: data[0].top_provider.max_completion_tokens == --max-ctx"
+    Check ($models.data[0].top_provider.is_moderated -eq $false) `
+        "/v1/models: data[0].top_provider.is_moderated == false"
+    # The server was launched without --think, so the advertised default must say thinking is off.
+    Check ($models.data[0].reasoning.default_enabled -eq $false) `
+        "/v1/models: data[0].reasoning.default_enabled == false (server launched without --think)"
+    Check ($models.data[0].reasoning.mandatory -eq $false) "/v1/models: data[0].reasoning.mandatory == false"
+    foreach ($effort in @("none", "low", "medium", "high")) {
+        Check (($models.data[0].reasoning.supported_efforts) -contains $effort) `
+            "/v1/models: data[0].reasoning.supported_efforts contains '$effort'"
+    }
+    foreach ($param in @("reasoning", "reasoning_effort", "include_reasoning", "enable_thinking", "thinking")) {
+        Check (($models.data[0].supported_parameters) -contains $param) `
+            "/v1/models: data[0].supported_parameters contains '$param'"
+    }
+    # Stays ["text"] until the vision tower lands; the later milestone flips ModelInputModalities()
+    # (openai_types.cpp) and this check with it.
+    Check (($models.data[0].architecture.input_modalities -join ",") -eq "text") `
+        "/v1/models: data[0].architecture.input_modalities == ['text'] (no vision tower yet)"
+
     # ---- GET /v1/models/{id} (task item 1) ---------------------------------------------------------
     $modelId = $models.data[0].id
     $oneModelResp = Invoke-WebRequest -Uri "$BaseUrl/v1/models/$modelId" -UseBasicParsing
@@ -529,6 +553,95 @@ try {
         }
     }
 
+    # ---- Thinking controls (docs/server.md's "Thinking controls" section) ------------------------
+    # Every wire spelling an OpenAI-compatible client uses to turn thinking on/off. These run
+    # against BOTH containers, because they do not depend on the model producing a well-formed
+    # "</think>" span. The probe is the response's own `usage.completion_tokens_details` object,
+    # which `BuildUsageJson` (openai_types.cpp) attaches if and only if the request's RESOLVED
+    # thinking was on and OMITS entirely when it was off -- so its presence is an exact,
+    # purely-HTTP read of the value these fields are supposed to move, even when the model's text
+    # is nonsense. (The per-request stderr log line's `thinking=yes|no` says the same thing, but a
+    # redirected stderr is block-buffered, so a line can still be sitting in the CRT's buffer when
+    # the response has already come back.) The text-level consequences (a real reasoning_content
+    # span / its absence) are checked against the real container further below.
+    function Invoke-ThinkProbe {
+        param([hashtable]$Extra)
+        $body = @{
+            messages    = @(@{ role = "user"; content = "Say hi." })
+            max_tokens  = 4
+            temperature = 0
+            stream      = $false
+        }
+        foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] }
+        $resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
+        $parsed = $resp.Content | ConvertFrom-Json
+        $hasDetails = $null -ne $parsed.usage -and
+            ($parsed.usage.PSObject.Properties.Name -contains "completion_tokens_details")
+        if ($hasDetails) { "yes" } else { "no" }
+    }
+
+    # Each row: label, request body fragment, expected resolved thinking.
+    $thinkForms = @(
+        @{ Label = "chat_template_kwargs.enable_thinking=true";  Extra = @{ chat_template_kwargs = @{ enable_thinking = $true } };  Want = "yes" },
+        @{ Label = "chat_template_kwargs.enable_thinking=false"; Extra = @{ chat_template_kwargs = @{ enable_thinking = $false } }; Want = "no"  },
+        @{ Label = "enable_thinking=true";                       Extra = @{ enable_thinking = $true };                              Want = "yes" },
+        @{ Label = "enable_thinking=false";                      Extra = @{ enable_thinking = $false };                             Want = "no"  },
+        @{ Label = "reasoning_effort='high'";                    Extra = @{ reasoning_effort = "high" };                            Want = "yes" },
+        @{ Label = "reasoning_effort='medium'";                  Extra = @{ reasoning_effort = "medium" };                          Want = "yes" },
+        @{ Label = "reasoning_effort='low'";                     Extra = @{ reasoning_effort = "low" };                             Want = "yes" },
+        @{ Label = "reasoning_effort='none'";                    Extra = @{ reasoning_effort = "none" };                            Want = "no"  },
+        @{ Label = "reasoning={enabled:true}";                   Extra = @{ reasoning = @{ enabled = $true } };                     Want = "yes" },
+        @{ Label = "reasoning={enabled:false}";                  Extra = @{ reasoning = @{ enabled = $false } };                    Want = "no"  },
+        @{ Label = "reasoning={effort:'high'}";                  Extra = @{ reasoning = @{ effort = "high" } };                     Want = "yes" },
+        @{ Label = "reasoning={effort:'none'}";                  Extra = @{ reasoning = @{ effort = "none" } };                     Want = "no"  },
+        @{ Label = "reasoning={enabled:true,exclude:true}";      Extra = @{ reasoning = @{ enabled = $true; exclude = $true } };    Want = "yes" },
+        @{ Label = "thinking={type:'enabled'}";                  Extra = @{ thinking = @{ type = "enabled" } };                     Want = "yes" },
+        @{ Label = "thinking={type:'disabled'}";                 Extra = @{ thinking = @{ type = "disabled" } };                    Want = "no"  },
+        @{ Label = "include_reasoning=false (text only, thinking untouched)"; Extra = @{ include_reasoning = $false }; Want = "no" },
+        @{ Label = "no thinking field at all (follows --think, off here)";    Extra = @{};                             Want = "no" }
+    )
+    foreach ($form in $thinkForms) {
+        $got = Invoke-ThinkProbe -Extra $form.Extra
+        Check ($got -eq $form.Want) `
+            "thinking controls: $($form.Label) resolves to thinking=$($form.Want) (got '$got')"
+    }
+
+    # Precedence: chat_template_kwargs.enable_thinking outranks every other spelling.
+    $precGot = Invoke-ThinkProbe -Extra @{
+        chat_template_kwargs = @{ enable_thinking = $false }
+        reasoning            = @{ enabled = $true }
+        thinking             = @{ type = "enabled" }
+        enable_thinking      = $true
+        reasoning_effort     = "high"
+    }
+    Check ($precGot -eq "no") `
+        "thinking controls: chat_template_kwargs.enable_thinking=false beats every other field (got '$precGot')"
+
+    # Malformed shapes are a clean 400 with the standard error body, never a silent no-op.
+    $badThinkBodies = @(
+        @{ Label = "enable_thinking not a boolean";  Extra = @{ enable_thinking = "yes" } },
+        @{ Label = "reasoning_effort not a string";  Extra = @{ reasoning_effort = 3 } },
+        @{ Label = "reasoning not an object";        Extra = @{ reasoning = "high" } },
+        @{ Label = "reasoning.enabled not a boolean";Extra = @{ reasoning = @{ enabled = "yes" } } },
+        @{ Label = "reasoning.max_tokens negative";  Extra = @{ reasoning = @{ max_tokens = -1 } } },
+        @{ Label = "thinking not an object";         Extra = @{ thinking = "enabled" } },
+        @{ Label = "thinking.type unrecognized";     Extra = @{ thinking = @{ type = "on" } } },
+        @{ Label = "include_reasoning not a boolean";Extra = @{ include_reasoning = "no" } }
+    )
+    foreach ($bad in $badThinkBodies) {
+        $body = @{ messages = @(@{ role = "user"; content = "hi" }); max_tokens = 4 }
+        foreach ($k in $bad.Extra.Keys) { $body[$k] = $bad.Extra[$k] }
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing | Out-Null
+            Check $false "thinking controls: $($bad.Label) is rejected with 400"
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            Check ($status -eq 400) "thinking controls: $($bad.Label) is rejected with 400 (got $status)"
+        }
+    }
+
     # ---- reasoning_content (docs/server.md's "reasoning_content" section) -------------------------
     # Real-container only (-Layers -1): the 4-layer test container's nonsense output cannot reliably
     # be coaxed into emitting a well-formed "</think>" close tag, same reasoning as -ToolRoundTrip.
@@ -667,6 +780,101 @@ try {
             -ContentType "application/json" -Body $noThinkStreamBody -UseBasicParsing
         Check (-not $noThinkStreamResp.Content.Contains("reasoning_content")) `
             "enable_thinking=false: no reasoning_content key in any streamed chunk"
+
+        # ---- Thinking controls, text level (docs/server.md's "Thinking controls") -----------------
+        # The log-line checks above proved each spelling moves the RESOLVED answer; these prove the
+        # generation really follows it. The thinking-OFF forms must additionally produce content
+        # byte-identical to today's `chat_template_kwargs.enable_thinking: false` output -- the
+        # regression guard for "a request that does not use thinking must behave exactly as before".
+        $offBaselineContent = [string]($noThinkResp.Content | ConvertFrom-Json).choices[0].message.content
+        function Invoke-ThinkChat {
+            param([hashtable]$Extra, [string]$Prompt = "Say hi.", [int]$MaxTokens = 16)
+            $body = @{
+                messages    = @(@{ role = "user"; content = $Prompt })
+                max_tokens  = $MaxTokens
+                temperature = 0
+                stream      = $false
+            }
+            foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] }
+            $r = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
+            [pscustomobject]@{ Raw = $r.Content; Json = ($r.Content | ConvertFrom-Json) }
+        }
+
+        foreach ($offForm in @(
+            @{ Label = "enable_thinking=false";      Extra = @{ enable_thinking = $false } },
+            @{ Label = "reasoning_effort='none'";    Extra = @{ reasoning_effort = "none" } },
+            @{ Label = "reasoning={enabled:false}";  Extra = @{ reasoning = @{ enabled = $false } } },
+            @{ Label = "reasoning={effort:'none'}";  Extra = @{ reasoning = @{ effort = "none" } } },
+            @{ Label = "thinking={type:'disabled'}"; Extra = @{ thinking = @{ type = "disabled" } } }
+        )) {
+            $off = Invoke-ThinkChat -Extra $offForm.Extra
+            Check (-not $off.Raw.Contains("reasoning_content")) `
+                "thinking off via $($offForm.Label): no reasoning_content key anywhere"
+            Check (-not $off.Raw.Contains("completion_tokens_details")) `
+                "thinking off via $($offForm.Label): usage carries no completion_tokens_details"
+            $offContent = [string]$off.Json.choices[0].message.content
+            Check ($offContent -ceq $offBaselineContent) `
+                ("thinking off via $($offForm.Label): content byte-identical to the " +
+                 "chat_template_kwargs baseline")
+        }
+
+        foreach ($onForm in @(
+            @{ Label = "enable_thinking=true";       Extra = @{ enable_thinking = $true } },
+            @{ Label = "reasoning_effort='high'";    Extra = @{ reasoning_effort = "high" } },
+            @{ Label = "reasoning={enabled:true}";   Extra = @{ reasoning = @{ enabled = $true } } },
+            @{ Label = "reasoning={effort:'medium'}";Extra = @{ reasoning = @{ effort = "medium" } } },
+            @{ Label = "thinking={type:'enabled'}";  Extra = @{ thinking = @{ type = "enabled" } } }
+        )) {
+            $on = Invoke-ThinkChat -Extra $onForm.Extra `
+                -Prompt "What is 12 plus 30? Show your reasoning." -MaxTokens 1024
+            Check ([bool]$on.Json.choices[0].message.reasoning_content) `
+                "thinking on via $($onForm.Label): message.reasoning_content is non-empty"
+            Check ($on.Json.usage.completion_tokens_details.reasoning_tokens -gt 0) `
+                "thinking on via $($onForm.Label): usage.completion_tokens_details.reasoning_tokens > 0"
+        }
+
+        # ---- reasoning.exclude / include_reasoning: think, but withhold the thought ---------------
+        $thinkOnBaseline = Invoke-ThinkChat -Extra @{ enable_thinking = $true } `
+            -Prompt "What is 12 plus 30? Show your reasoning." -MaxTokens 1024
+        $thinkOnContent = [string]$thinkOnBaseline.Json.choices[0].message.content
+        foreach ($excludeForm in @(
+            @{ Label = "reasoning={enabled:true,exclude:true}"; Extra = @{ reasoning = @{ enabled = $true; exclude = $true } } },
+            @{ Label = "enable_thinking=true + include_reasoning=false"; Extra = @{ enable_thinking = $true; include_reasoning = $false } }
+        )) {
+            $ex = Invoke-ThinkChat -Extra $excludeForm.Extra `
+                -Prompt "What is 12 plus 30? Show your reasoning." -MaxTokens 1024
+            Check (-not $ex.Raw.Contains("reasoning_content")) `
+                "$($excludeForm.Label): no reasoning_content key in the response"
+            Check ($ex.Json.usage.completion_tokens_details.reasoning_tokens -gt 0) `
+                "$($excludeForm.Label): thinking still happened (reasoning_tokens > 0)"
+            $exContent = [string]$ex.Json.choices[0].message.content
+            Check ($exContent -ceq $thinkOnContent) `
+                "$($excludeForm.Label): message.content equals the same thinking-on answer"
+            Check (-not $exContent.Contains("</think>")) `
+                "$($excludeForm.Label): message.content contains no '</think>'"
+        }
+
+        # ---- reasoning_effort really reaches chat_template.jinja ----------------------------------
+        # The template injects a DIFFERENT (or no) `reasoning_instructions` sentence per level
+        # (xhigh / medium / low), so the rendered prompt length is the observable proof that the
+        # mapped effort was applied rather than silently dropped.
+        $effortPromptTokens = @{}
+        foreach ($level in @("low", "medium", "high")) {
+            $e = Invoke-ThinkChat -Extra @{ reasoning_effort = $level } -MaxTokens 4
+            $effortPromptTokens[$level] = [int]$e.Json.usage.prompt_tokens
+        }
+        Check ($effortPromptTokens["medium"] -ne $effortPromptTokens["high"]) `
+            ("reasoning_effort: 'medium' and 'high' render different prompts " +
+             "($($effortPromptTokens['medium']) vs $($effortPromptTokens['high']) prompt tokens)")
+        Check ($effortPromptTokens["low"] -ne $effortPromptTokens["high"]) `
+            ("reasoning_effort: 'low' and 'high' render different prompts " +
+             "($($effortPromptTokens['low']) vs $($effortPromptTokens['high']) prompt tokens)")
+        # An unrecognized level must still answer (template default effort), never 400 out of the
+        # template's own `raise_exception('Unexpected reasoning effort ...')`.
+        $invented = Invoke-ThinkChat -Extra @{ reasoning_effort = "ludicrous" } -MaxTokens 4
+        Check ($invented.Json.choices.Count -eq 1) `
+            "reasoning_effort: an unrecognized level still answers (template default effort), no 400"
     } else {
         Write-Output "  [SKIP] reasoning_content checks (only checked against a real container, -Layers -1)"
     }

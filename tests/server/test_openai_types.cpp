@@ -258,6 +258,154 @@ void TestResolveEnableThinkingFallsBackToDefaultWhenNull() {
   CHECK(ResolveEnableThinking(json{{"enable_thinking", nullptr}}, true) == true);
 }
 
+// ---- thinking controls (ParseThinkingControls / ResolveEnableThinking(ThinkingControls, bool)) --
+//
+// Every wire spelling an OpenAI-compatible client uses to turn thinking on/off, its precedence,
+// and the effort mapping onto the three levels chat_template.jinja itself accepts.
+
+json ThinkBody(json extra) {
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+  body.update(extra);
+  return body;
+}
+
+// Parses a full chat request and returns its reduced controls -- exercises the real path
+// (ParseChatCompletionRequest calls ParseThinkingControls), not just the helper in isolation.
+ThinkingControls Controls(json extra) {
+  return ParseChatCompletionRequest(ThinkBody(std::move(extra))).thinking;
+}
+
+void TestThinkingAbsentLeavesEnabledUnsetAndFollowsServerDefault() {
+  const ThinkingControls c = Controls(json::object());
+  CHECK(!c.enabled.has_value());
+  CHECK(!c.template_effort.has_value());
+  CHECK(c.include_reasoning);
+  CHECK(ResolveEnableThinking(c, true) == true);
+  CHECK(ResolveEnableThinking(c, false) == false);
+}
+
+void TestThinkingChatTemplateKwargsStillWins() {
+  const ThinkingControls on = Controls({{"chat_template_kwargs", {{"enable_thinking", true}}}});
+  CHECK(ResolveEnableThinking(on, false) == true);
+  const ThinkingControls off = Controls({{"chat_template_kwargs", {{"enable_thinking", false}}}});
+  CHECK(ResolveEnableThinking(off, true) == false);
+  // ... over every other spelling, including ones that disagree with it.
+  const ThinkingControls conflict =
+      Controls({{"chat_template_kwargs", {{"enable_thinking", false}}},
+                 {"reasoning", {{"enabled", true}}},
+                 {"thinking", {{"type", "enabled"}}},
+                 {"enable_thinking", true},
+                 {"reasoning_effort", "high"}});
+  CHECK(ResolveEnableThinking(conflict, true) == false);
+  // A non-boolean there is still tolerated (opaque template passthrough) and falls through.
+  const ThinkingControls non_bool =
+      Controls({{"chat_template_kwargs", {{"enable_thinking", "yes"}}}, {"enable_thinking", true}});
+  CHECK(ResolveEnableThinking(non_bool, false) == true);
+}
+
+void TestThinkingTopLevelEnableThinking() {
+  CHECK(ResolveEnableThinking(Controls({{"enable_thinking", true}}), false) == true);
+  CHECK(ResolveEnableThinking(Controls({{"enable_thinking", false}}), true) == false);
+  CHECK(ThrowsApiError([] { Controls({{"enable_thinking", "yes"}}); }, 400));
+  // null is "absent", not an error.
+  CHECK(!Controls({{"enable_thinking", nullptr}}).enabled.has_value());
+}
+
+void TestThinkingReasoningEffortString() {
+  CHECK(ResolveEnableThinking(Controls({{"reasoning_effort", "none"}}), true) == false);
+  for (const char* level : {"minimal", "low", "medium", "high", "xhigh", "max", "invented"}) {
+    CHECK(ResolveEnableThinking(Controls({{"reasoning_effort", level}}), false) == true);
+  }
+  CHECK(ThrowsApiError([] { Controls({{"reasoning_effort", 3}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning_effort", "   "}}); }, 400));
+}
+
+void TestThinkingEffortMapsOntoTemplateLevels() {
+  // The template accepts exactly xhigh/medium/low; everything else must be mapped or dropped, or
+  // chat_template.jinja's own raise_exception turns an ordinary request into a 400.
+  CHECK(Controls({{"reasoning_effort", "minimal"}}).template_effort == std::string("low"));
+  CHECK(Controls({{"reasoning_effort", "low"}}).template_effort == std::string("low"));
+  CHECK(Controls({{"reasoning_effort", "medium"}}).template_effort == std::string("medium"));
+  CHECK(Controls({{"reasoning_effort", "high"}}).template_effort == std::string("xhigh"));
+  CHECK(Controls({{"reasoning_effort", "xhigh"}}).template_effort == std::string("xhigh"));
+  CHECK(Controls({{"reasoning_effort", "max"}}).template_effort == std::string("xhigh"));
+  // Case/whitespace insensitive, like every real client spells it.
+  CHECK(Controls({{"reasoning_effort", "  HIGH "}}).template_effort == std::string("xhigh"));
+  // "none" is an off-switch, not a level; an unrecognized level means "on, template default".
+  CHECK(!Controls({{"reasoning_effort", "none"}}).template_effort.has_value());
+  CHECK(!Controls({{"reasoning_effort", "invented"}}).template_effort.has_value());
+  // The object's own effort wins over the top-level one.
+  CHECK(Controls({{"reasoning", {{"effort", "low"}}}, {"reasoning_effort", "high"}}).template_effort ==
+        std::string("low"));
+}
+
+void TestThinkingOpenRouterReasoningObject() {
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"enabled", true}}}}), false) == true);
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"enabled", false}}}}), true) == false);
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"effort", "high"}}}}), false) == true);
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"effort", "none"}}}}), true) == false);
+  // `enabled` wins over `effort` inside the object.
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"enabled", false}, {"effort", "high"}}}}),
+                               true) == false);
+  // max_tokens is validated (so a malformed body is a clean 400) but not acted on.
+  CHECK(ResolveEnableThinking(
+            Controls({{"reasoning", {{"enabled", true}, {"max_tokens", 2048}}}}), false) == true);
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", "high"}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", {{"enabled", "yes"}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", {{"effort", 1}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", {{"exclude", "yes"}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", {{"max_tokens", -1}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"reasoning", {{"max_tokens", 1.5}}}}); }, 400));
+}
+
+void TestThinkingAnthropicThinkingObject() {
+  CHECK(ResolveEnableThinking(Controls({{"thinking", {{"type", "enabled"}}}}), false) == true);
+  CHECK(ResolveEnableThinking(Controls({{"thinking", {{"type", "disabled"}}}}), true) == false);
+  CHECK(ResolveEnableThinking(
+            Controls({{"thinking", {{"type", "enabled"}, {"budget_tokens", 1024}}}}), false) == true);
+  CHECK(ThrowsApiError([] { Controls({{"thinking", "enabled"}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"thinking", {{"type", "on"}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"thinking", {{"type", true}}}}); }, 400));
+  CHECK(ThrowsApiError([] { Controls({{"thinking", {{"budget_tokens", -5}}}}); }, 400));
+}
+
+void TestThinkingPrecedenceOrderBelowChatTemplateKwargs() {
+  // reasoning > thinking > enable_thinking > reasoning_effort, each proven by making the
+  // higher-precedence field disagree with every lower one.
+  CHECK(ResolveEnableThinking(Controls({{"reasoning", {{"enabled", false}}},
+                                         {"thinking", {{"type", "enabled"}}},
+                                         {"enable_thinking", true},
+                                         {"reasoning_effort", "high"}}),
+                               true) == false);
+  CHECK(ResolveEnableThinking(
+            Controls({{"thinking", {{"type", "disabled"}}}, {"enable_thinking", true},
+                       {"reasoning_effort", "high"}}),
+            true) == false);
+  CHECK(ResolveEnableThinking(
+            Controls({{"enable_thinking", false}, {"reasoning_effort", "high"}}), true) == false);
+}
+
+void TestThinkingIncludeReasoningAndExclude() {
+  CHECK(Controls(json::object()).include_reasoning);
+  CHECK(!Controls({{"reasoning", {{"enabled", true}, {"exclude", true}}}}).include_reasoning);
+  CHECK(!Controls({{"include_reasoning", false}}).include_reasoning);
+  CHECK(Controls({{"include_reasoning", true}}).include_reasoning);
+  // Either one asking for exclusion wins over the other asking for inclusion.
+  CHECK(!Controls({{"reasoning", {{"exclude", true}}}, {"include_reasoning", true}}).include_reasoning);
+  // Excluding the TEXT says nothing about whether thinking happens.
+  CHECK(ResolveEnableThinking(Controls({{"include_reasoning", false}}), true) == true);
+  CHECK(!Controls({{"include_reasoning", false}}).enabled.has_value());
+  CHECK(ThrowsApiError([] { Controls({{"include_reasoning", "no"}}); }, 400));
+}
+
+void TestThinkingControlsOnCompletionsEndpointAreIgnored() {
+  // /v1/completions has no chat template and therefore no thinking concept at all -- a body
+  // carrying these fields is still parsed (they simply have nowhere to go), not rejected.
+  json body = {{"prompt", "hello"}, {"reasoning_effort", "high"}, {"enable_thinking", true}};
+  const auto req = ParseCompletionRequest(body);
+  CHECK(req.prompt == "hello");
+}
+
 // ---- tool_choice (task point 5) ----------------------------------------------------------------
 
 json OneToolBody(json extra) {
@@ -452,6 +600,42 @@ void TestBuildModelEntryJsonCapabilitiesAndArchitecture() {
   CHECK(has("reasoning"));
   CHECK(m.at("architecture").at("input_modalities")[0] == "text");
   CHECK(m.at("architecture").at("output_modalities")[0] == "text");
+  // The modality list has exactly one writer, so the vision milestone flips it in one place.
+  CHECK(m.at("architecture").at("input_modalities") == ModelInputModalities());
+  CHECK(ModelInputModalities().size() == 1);
+}
+
+// ---- OpenRouter-shaped capability block (docs/server.md's "Model metadata") ---------------------
+
+void TestBuildModelEntryJsonTopProviderBlock() {
+  const json m = BuildModelEntryJson("my-model", 1000, 65536);
+  CHECK(m.at("top_provider").at("context_length") == 65536);
+  CHECK(m.at("top_provider").at("max_completion_tokens") == 65536);
+  CHECK(m.at("top_provider").at("is_moderated") == false);
+}
+
+void TestBuildModelEntryJsonReasoningBlockFollowsThinkFlag() {
+  const json off = BuildModelEntryJson("my-model", 1000, 65536, /*default_thinking=*/false);
+  CHECK(off.at("reasoning").at("default_enabled") == false);
+  CHECK(off.at("reasoning").at("mandatory") == false);
+  CHECK(off.at("reasoning").at("supported_efforts") == ModelSupportedReasoningEfforts());
+
+  const json on = BuildModelEntryJson("my-model", 1000, 65536, /*default_thinking=*/true);
+  CHECK(on.at("reasoning").at("default_enabled") == true);
+
+  // Every advertised effort must be one ParseThinkingControls really accepts.
+  for (const auto& effort : ModelSupportedReasoningEfforts()) {
+    json body = {{"messages", json::array({{{"role", "user"}, {"content", "hi"}}})},
+                  {"reasoning_effort", effort}};
+    const ThinkingControls c = ParseChatCompletionRequest(body).thinking;
+    CHECK(c.enabled.has_value());
+    CHECK(*c.enabled == (effort != "none"));
+  }
+}
+
+void TestBuildModelsResponsePassesDefaultThinkingThrough() {
+  const json resp = BuildModelsResponse("my-model", 1000, 65536, /*default_thinking=*/true);
+  CHECK(resp.at("data")[0].at("reasoning").at("default_enabled") == true);
 }
 
 void TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields() {
@@ -464,7 +648,9 @@ void TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields() {
   };
   for (const char* expected : {"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
                                "max_completion_tokens", "stop", "stream", "stream_options", "tools",
-                               "tool_choice", "chat_template_kwargs"}) {
+                               "tool_choice", "chat_template_kwargs", "reasoning",
+                               "reasoning_effort", "include_reasoning", "enable_thinking",
+                               "thinking"}) {
     CHECK(has(expected));
   }
   // Fields this server does not parse at all must not be falsely advertised.
@@ -809,6 +995,16 @@ int main() {
   TestResolveEnableThinkingFallsBackToDefaultWhenAbsent();
   TestResolveEnableThinkingFallsBackToDefaultWhenNonBoolean();
   TestResolveEnableThinkingFallsBackToDefaultWhenNull();
+  TestThinkingAbsentLeavesEnabledUnsetAndFollowsServerDefault();
+  TestThinkingChatTemplateKwargsStillWins();
+  TestThinkingTopLevelEnableThinking();
+  TestThinkingReasoningEffortString();
+  TestThinkingEffortMapsOntoTemplateLevels();
+  TestThinkingOpenRouterReasoningObject();
+  TestThinkingAnthropicThinkingObject();
+  TestThinkingPrecedenceOrderBelowChatTemplateKwargs();
+  TestThinkingIncludeReasoningAndExclude();
+  TestThinkingControlsOnCompletionsEndpointAreIgnored();
   TestToolChoiceNoneClearsTools();
   TestToolChoiceAutoLeavesToolsUntouched();
   TestToolChoiceDefaultIsAutoLeavesToolsUntouched();
@@ -834,6 +1030,9 @@ int main() {
   TestBuildModelEntryJsonContextLengthFields();
   TestBuildModelEntryJsonCapabilitiesAndArchitecture();
   TestBuildModelEntryJsonSupportedParametersOnlyListsParsedFields();
+  TestBuildModelEntryJsonTopProviderBlock();
+  TestBuildModelEntryJsonReasoningBlockFollowsThinkFlag();
+  TestBuildModelsResponsePassesDefaultThinkingThrough();
   TestBuildModelsResponseWrapsSingleEntry();
   TestBuildChatCompletionResponse();
   TestBuildToolCallsJson();

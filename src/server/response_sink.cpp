@@ -42,7 +42,9 @@ void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completi
         text += ev.text;
       }
     }
-    reasoning_text = TrimReasoningWhitespace(reasoning_raw_);
+    // `emit_reasoning_` false (reasoning.exclude / include_reasoning: false): the split above
+    // still ran, so `text` is the answer alone -- only the reasoning TEXT is withheld.
+    if (emit_reasoning_) reasoning_text = TrimReasoningWhitespace(reasoning_raw_);
   }
   finish_reason = finish_reason_in;
   completion_tokens = completion_tokens_in;
@@ -73,17 +75,18 @@ void BufferingSink::OnToolCalls(const std::vector<ToolCallOut>& calls) {
 
 void BufferingSink::OnReasoningContent(const std::string& text_in) {
   std::lock_guard<std::mutex> lock(mu_);
-  reasoning_text = text_in;  // already trimmed by the caller (engine.cpp's tool_mode block)
+  // already trimmed by the caller (engine.cpp's tool_mode block)
+  if (emit_reasoning_) reasoning_text = text_in;
   reasoning_delivered_ = true;
 }
 
 // ---- StreamingSink ---------------------------------------------------------------------------
 
 StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
-                             bool include_usage, bool enable_thinking)
+                             bool include_usage, bool enable_thinking, bool emit_reasoning)
     : kind_(kind), id_(std::move(id)), model_id_(std::move(model_id)), created_unix_(created_unix),
       include_usage_(include_usage), enable_thinking_(enable_thinking && kind == Kind::kChat),
-      queue_(/*max_size=*/256) {}
+      emit_reasoning_(emit_reasoning), queue_(/*max_size=*/256) {}
 
 void StreamingSink::OnStart(int64_t prompt_tokens) {
   prompt_tokens_ = prompt_tokens;
@@ -97,6 +100,9 @@ void StreamingSink::OnStart(int64_t prompt_tokens) {
 
 void StreamingSink::PushSplitDelta(bool is_reasoning, const std::string& text) {
   if (text.empty()) return;
+  // `emit_reasoning_` false (reasoning.exclude / include_reasoning: false): the splitter still ran,
+  // so the client's `content` deltas are the answer alone -- only the reasoning deltas are dropped.
+  if (is_reasoning && !emit_reasoning_) return;
   nlohmann::json delta =
       is_reasoning ? nlohmann::json{{"reasoning_content", text}} : nlohmann::json{{"content", text}};
   queue_.Push(FormatSseEvent(

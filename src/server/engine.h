@@ -55,6 +55,10 @@ struct PendingRequest {
   // kChat
   std::vector<ChatMessage> messages;
   nlohmann::json chat_template_kwargs = nlohmann::json::object();
+  // Set by http_server.cpp from ParseChatCompletionRequest -- the reduced answer to "did this
+  // request ask for thinking, at what effort, and does it want the thought back" (openai_types.h's
+  // ThinkingControls). Unused for kCompletion (no chat template, nothing to split).
+  ThinkingControls thinking;
   nlohmann::json tools = nlohmann::json::array();
 
   // kCompletion

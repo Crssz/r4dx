@@ -25,6 +25,13 @@ struct AttnConfig {
   int rotary_dim = 64;       // head_dim * partial_rotary_factor (0.25); r4dx_rope_partial_mrope_bf16
   float rope_theta = 1.0e7f;
   float rms_eps = 1.0e-6f;
+  // mrope_section (ModelConfig::mrope_section, config.json's rope_parameters). Only read when a
+  // caller passes Forward's `rope_pos3` -- the single-row text path never consults it, because
+  // three identical position streams make the bin->stream assignment a no-op by construction.
+  // Must sum to rotary_dim/2; r4dx_rope_partial_mrope3_bf16 enforces that at the call.
+  int mrope_section_t = 11;
+  int mrope_section_h = 11;
+  int mrope_section_w = 10;
 
   int Gqa() const { return num_heads / kv_heads; }
 };

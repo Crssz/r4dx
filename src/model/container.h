@@ -22,6 +22,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "vision_weights.h"  // src/vision: the vision.* tower weights (docs/vision.md)
 
 namespace r4dx::model {
 
@@ -134,9 +135,15 @@ class Container {
   // nullptr) if that heuristic says it would not fit. EmbedTokensHost() is always populated
   // regardless of this flag -- device residency is purely an additional mirror, never a
   // replacement, so every existing host-gather call site keeps working unchanged.
+  // `load_vision` (docs/vision.md "Load policy"): upload the container's 333 `vision.*` tensors
+  // (~0.90 GiB bf16) as well. Default FALSE, so a text-only run pays exactly what it paid before
+  // this parameter existed -- the "auto" policy lives one level up, in Model::Load/ModelOptions,
+  // where it can see whether the caller asked for vision at all. Silently a no-op (not an error)
+  // when the container has no vision.* tensors: the 4-layer test container is exactly that case,
+  // and HasVision() below is how a caller finds out.
   static Container Load(const std::string& path, Layout layout, Layout lm_head_layout,
                          int64_t layer_limit = -1, Layout mtp_head_layout = Layout::kBf16,
-                         bool embed_device_resident = true);
+                         bool embed_device_resident = true, bool load_vision = false);
 
   const ModelConfig& Config() const { return config_; }
   const std::string& ModelId() const { return model_id_; }
@@ -165,6 +172,22 @@ class Container {
   bool HasMtp() const { return mtp_.has_value(); }
   const MtpWeights& Mtp() const { return mtp_.value(); }
 
+  // The vision tower's weights (docs/vision.md), present only when Load() was called with
+  // load_vision=true AND the container actually carries vision.* tensors. HasVisionTensors() is
+  // the second of those two questions on its own -- a caller that wants to say "this container
+  // COULD do vision but vision is off" needs to distinguish them.
+  bool HasVision() const { return vision_.has_value(); }
+  const vision::VisionWeights& Vision() const { return vision_.value(); }
+  bool ContainerHasVisionTensors() const { return container_has_vision_tensors_; }
+
+  // The multimodal placeholder token ids, from the TOP level of `__metadata__.model_config` (they
+  // sit next to "text_config"/"vision_config", not inside either -- docs/vision.md "Model facts").
+  // Read from the container rather than hardcoded so a differently-tokenized checkpoint splices at
+  // its own ids; the defaults are this checkpoint's, for a container converted before these keys
+  // were carried. -1 is never a valid token id, so a caller can tell "absent" from "0".
+  int64_t ImageTokenId() const { return image_token_id_; }
+  int64_t VideoTokenId() const { return video_token_id_; }
+
  private:
   Container() = default;
   // Model (model.h/model.cpp) default-constructs a Model whose Container member is filled in by
@@ -173,6 +196,8 @@ class Container {
   friend class Model;
 
   ModelConfig config_;
+  int64_t image_token_id_ = 248056;  // C:\AI\models\Qwen3.8-27B\config.json, top level
+  int64_t video_token_id_ = 248057;
   std::string model_id_, config_sha256_;
   core::PinnedBuffer<uint16_t> embed_tokens_;
   core::DeviceBuffer<uint16_t> embed_tokens_dev_;  // empty iff not device-resident (Load's own
@@ -181,6 +206,8 @@ class Container {
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;
+  std::optional<vision::VisionWeights> vision_;
+  bool container_has_vision_tensors_ = false;
 };
 
 }  // namespace r4dx::model

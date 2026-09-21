@@ -105,16 +105,37 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
 // regardless of mrope). This entry point implements the TEXT-ONLY case, where all three streams
 // equal the plain token position, so the three-stream selection is a no-op and this reduces to
 // ordinary 1D rope over `pos_ids`.
-// TODO(vision milestone): a multimodal caller needs three per-token position ids (t,h,w) instead
-// of one; add r4dx_rope_partial_mrope_multimodal_bf16 (or a `pos_ids` shaped [3, tokens]) then,
-// selecting stream `i % 3` per frequency bin `i` exactly as
-// Qwen3_5TextRotaryEmbedding.recomposition_frequencies does. Not implemented here.
+// The multimodal case is r4dx_rope_partial_mrope3_bf16 below.
 //
 // q: [tokens, heads_q, head_dim] bf16, in place. k: [tokens, heads_k, head_dim] bf16, in place.
 // pos_ids: [tokens] int32.
 void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tokens, int heads_q,
                                    int heads_k, int head_dim, int rotary_dim, float theta,
                                    int64_t stream);
+
+// ---- rope: partial rotary, 3-axis (t,h,w) mrope ----------------------------------------------
+// The multimodal counterpart of r4dx_rope_partial_mrope_bf16: same rotation, same expression
+// order, same NeoX half-split pairing -- the only difference is that each frequency bin draws its
+// position from one of THREE per-token position streams instead of a single one.
+//
+// The bin -> stream assignment is Qwen3_5TextRotaryEmbedding.recomposition_frequencies (read from
+// modeling_qwen3_5.py, not inferred): the table starts all-temporal, then the height stream
+// overwrites bins `range(1, 3*mrope_section[1], 3)` and the width stream bins
+// `range(2, 3*mrope_section[2], 3)`. With this model's mrope_section [11,11,10] and rotary_dim 64
+// (32 bins) that happens to reduce to bin index mod 3, but the section bounds are real parameters
+// here rather than an assumption -- `sec_*` must be non-negative and sum to rotary_dim/2 (throws
+// otherwise), and `sec_t` is validated rather than used (it is the complement of the other two).
+//
+// Calling this with three IDENTICAL position rows is BIT-IDENTICAL to
+// r4dx_rope_partial_mrope_bf16 over that one row (same inv_freq expression, same sincosf, same
+// rounding order) -- asserted by tests/kernels/test_rope_mrope3.cpp, and the property that lets a
+// caller with a text-only prompt keep taking the cheaper single-row entry point with no numeric
+// consequence either way.
+//
+// pos_ids3: [3, tokens] int32, contiguous, row 0 = temporal, row 1 = height, row 2 = width.
+void r4dx_rope_partial_mrope3_bf16(int64_t q, int64_t k, int64_t pos_ids3, int tokens, int heads_q,
+                                    int heads_k, int head_dim, int rotary_dim, float theta,
+                                    int sec_t, int sec_h, int sec_w, int64_t stream);
 
 // ---- fp8 e4m3 activation quantisation (feeds r4d_gemm_mxfp4a8_nt_m64) ------------------------
 // Per-row: scale = max(1e-8, max_k |x[row,k]|) / 448 (448 = e4m3fn's max finite magnitude);
@@ -379,6 +400,101 @@ void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, in
 // In-place (out == x, out_fp32 == 0) is supported -- see the kernel's own comment.
 void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
                               float eps, int out_fp32, int64_t stream);
+
+// ==== vision tower device pieces (docs/vision.md, Milestone 8 stage 3) =========================
+// The five primitives `Qwen3_5VisionModel`'s forward needs that neither this repo nor
+// third_party/libr4d already had. Every linear in the tower is a plain bf16 GEMM
+// (r4d_gemm_bf16_nt_m64) and its attention is r4d_attn_vit_h72_bf16, so what is left is the norm,
+// the two activations, the axial rope and the learned-position-grid gather -- each with its own
+// CPU-reference test in tests/kernels/test_vision_kernels.cpp and its own golden comparison in
+// tests/vision/test_vision_tower.cpp.
+
+// ---- LayerNorm with weight AND bias (NOT RMSNorm) ---------------------------------------------
+// out[r,:] = (x[r,:] - mean(x[r,:])) * rsqrt(var(x[r,:]) + eps) * weight[:] + bias[:], with the
+// BIASED variance (divide by `hidden`, not hidden-1) `torch.nn.LayerNorm` uses. This is a real
+// mean-subtracted LayerNorm -- the vision tower's norm1/norm2/merger.norm are `nn.LayerNorm`, not
+// the text side's `Qwen3_5RMSNorm`, so r4dx_rmsnorm_bf16 (no mean subtraction, no bias, and a
+// `1 + weight` convention on top) is wrong for all three in three separate ways.
+// Two reduction passes (mean, then sum of squared deviations) rather than the one-pass
+// sum/sum-of-squares identity: at block 26 the residual stream's mean is large relative to its
+// variance, and `E[x^2] - E[x]^2` cancels catastrophically there in fp32.
+// fp32 accumulation and fp32 elementwise math, bf16 in/out, matching torch's own acc_type<bf16>
+// = float on CUDA. x: [rows, hidden] bf16. weight, bias: [hidden] bf16. out: [rows, hidden] bf16.
+// In-place (out == x) is safe for the same reason r4dx_rmsnorm_bf16's is: both reductions'
+// __syncthreads() sit strictly between every read of x and any write to out.
+void r4dx_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, int64_t rows,
+                          int64_t hidden, float eps, int64_t stream);
+
+// ---- bias add ---------------------------------------------------------------------------------
+// out[r,c] = bf16(fp32(x[r,c]) + fp32(bias[c])), the `+ b` half of an `nn.Linear` whose matmul
+// half r4d_gemm_bf16_nt_m64 already did. Broadcasts one [cols] row over `rows` rows. In-place
+// (out == x) is supported and is what every vision call site uses.
+// NOTE on precision: `nn.Linear` adds its bias INSIDE the fp32 GEMM accumulator, so the reference
+// rounds to bf16 once; this pair of kernels rounds twice (GEMM output, then here). The extra
+// rounding is one bf16 ulp of the pre-bias sum, ~2^-9 relative -- far below the 1e-2 relative-L2
+// band docs/vision.md validates against, and measured as such (docs/vision.md "Measured").
+// x: [rows, cols] bf16. bias: [cols] bf16. out: [rows, cols] bf16.
+void r4dx_bias_add_bf16(int64_t x, int64_t bias, int64_t out, int64_t rows, int64_t cols,
+                         int64_t stream);
+
+// ---- GELU, both variants ----------------------------------------------------------------------
+// The vision tower uses BOTH, at different sites, and they are not interchangeable:
+//   * the encoder MLP's activation is `gelu_pytorch_tanh` (vision_config.hidden_act), i.e. the
+//     tanh approximation 0.5*x*(1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)));
+//   * the merger's activation is a bare `nn.GELU()`, i.e. approximate='none', the EXACT
+//     0.5*x*(1 + erf(x/sqrt(2))).
+// They differ by up to ~1e-3 absolute around |x| ~ 2, which is well inside what a "looks
+// plausible" check would miss and outside the merger's own tolerance, so they are two entry
+// points rather than one with a flag a call site could get wrong silently.
+// fp32 math, bf16 in/out, elementwise over `n` elements. In-place (out == x) is supported.
+void r4dx_gelu_tanh_bf16(int64_t x, int64_t out, int64_t n, int64_t stream);
+void r4dx_gelu_erf_bf16(int64_t x, int64_t out, int64_t n, int64_t stream);
+
+// ---- vision axial rope + qkv split -------------------------------------------------------------
+// `Qwen3_5VisionAttention.forward`'s first two steps in one launch: split the fused qkv projection
+// into three contiguous [tokens, heads, head_dim] tensors (the layout r4d_attn_vit_h72_bf16 takes)
+// and rotate q and k by the axial rope.
+//
+// The fused row layout is the reference's own `reshape(seq, 3, heads, head_dim)`: within row t,
+// q is columns [0, heads*head_dim), k is [heads*head_dim, 2*heads*head_dim), v is the last third.
+//
+// Rope math, per (token, head), exactly `apply_rotary_pos_emb_vision`: computed in FP32 (the
+// reference explicitly upcasts q/k/cos/sin to float32 before rotating, and rounds back afterwards),
+// over the FULL head_dim -- there is no partial_rotary_factor here, unlike the text side's 0.25 --
+// with the rotate-half pairing `cat(-x2, x1)`:
+//   half = head_dim/2
+//   out[i]        = x[i]        * cos[i]        - x[i + half] * sin[i]          (i < half)
+//   out[i + half] = x[i + half] * cos[i + half] + x[i]        * sin[i + half]
+// cos/sin are per TOKEN, shared across heads, and already carry the axial
+// cat([f_h, f_w, f_h, f_w]) recomposition (src/vision/vision_index.cpp's BuildVisionRopeCosSin).
+// v is copied through unrotated, which is the whole of what the reference does to it.
+//
+// qkv: [tokens, 3*heads*head_dim] bf16 -- the GEMM output with its bias ALREADY added.
+// cos, sin: [tokens, head_dim] fp32. q_out, k_out, v_out: [tokens, heads, head_dim] bf16.
+// Precondition (throws): head_dim even.
+void r4dx_vision_qkv_rope_bf16(int64_t qkv, int64_t cos, int64_t sin, int64_t q_out, int64_t k_out,
+                                int64_t v_out, int tokens, int heads, int head_dim, int64_t stream);
+
+// ---- learned position-embedding gather (4-tap bilinear) ----------------------------------------
+// `Qwen3_5VisionModel.forward`'s
+//   pos_embeds = (pos_embed(interp_indices) * interp_weights[:, :, None]).sum(1)
+//   hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
+// in one launch: per patch, gather `taps` rows of the learned [num_grid_per_side^2, hidden] table
+// and weighted-sum them. The table is bf16 and the weights fp32, so the reference's product
+// promotes to fp32 and the sum is fp32 -- reproduced here, including the fact that the fp32 result
+// is rounded to bf16 BEFORE the residual add (`.to(hidden_states.dtype)` happens first), not after.
+//
+// Both outputs are optional and independent, so one launch serves the model path and the test:
+//   out_f32   != 0 -> [num_patches, hidden] fp32, the raw weighted sum (the golden's `pos_embeds`).
+//   out_bf16  != 0 -> [num_patches, hidden] bf16 = bf16(fp32(x[p,:]) + fp32(bf16(sum))); requires
+//                     `x` != 0. May alias `x`.
+// table: [table_rows, hidden] bf16. indices: [num_patches, taps] int32, flat row offsets into the
+// table. weights: [num_patches, taps] fp32. x: [num_patches, hidden] bf16.
+// Bounds-checked the same way r4dx_embedding_gather_bf16 is: an index outside [0, table_rows)
+// clamps to row 0 rather than reading out-of-bounds device memory.
+void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights, int64_t x,
+                                 int64_t out_f32, int64_t out_bf16, int64_t num_patches,
+                                 int64_t hidden, int taps, int64_t table_rows, int64_t stream);
 
 // ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
 // A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per

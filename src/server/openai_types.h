@@ -10,8 +10,13 @@
 // the OpenAI wire shapes both directions -- request-side `ChatMessage::tool_calls`/`tool_call_id`
 // for a multi-turn tool round trip, response-side `ToolCallOut` for what the server emits back).
 //
-// Still deferred: image message-content parts (rejected with a 400, see
-// ParseChatCompletionRequest below) until the vision tower milestone lands.
+// Image message-content parts (docs/vision.md, docs/server.md's "Images" section): decoded and
+// preprocessed HERE, at parse time -- base64-decode, format sniff/reject, smart_resize -- because
+// none of that touches HIP or r4dx::model (r4dx::vision's own CMakeLists.txt: "no HIP, no
+// r4dx_core, no r4dx_model"), so it stays exercisable by tests/server/test_openai_types.cpp with
+// no container and no GPU, exactly like every other validation in this file. Only the vision
+// TOWER forward pass (does this container even have one? run EncodeImages) needs the loaded Model
+// and therefore happens one layer up, in Engine::RunRequest (engine.cpp).
 #pragma once
 
 #include <cstdint>
@@ -20,6 +25,7 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "preprocess.h"  // src/vision: GridThw, ImageProcessorConfig, PreprocessImages
 
 namespace r4dx::server {
 
@@ -91,12 +97,51 @@ struct ApiError {
 
 nlohmann::json ErrorBody(const ApiError& err);
 
+// One decoded, preprocessed image content part (docs/vision.md). `grid`/`pixel_values` are exactly
+// r4dx::vision::PreprocessImages' output for this ONE image -- the same `[patches, patch_dim]`
+// host fp32 tensor Model::EncodeImages consumes -- so Engine::RunRequest never re-decodes or
+// re-resizes anything; it only has to hand this straight to EncodeImages (for a NEW image) or skip
+// that call entirely (for one prefix reuse already covers). `content_hash` is over the raw
+// (post-base64-decode, pre-image-decode) file bytes the client sent -- the same fingerprint
+// PrefixState::ImageKey documents wanting ("over the DECODED/encoded image bytes"), computed once
+// here rather than re-hashing the file bytes again one layer up.
+struct ImagePart {
+  vision::GridThw grid;
+  std::vector<float> pixel_values;  // [grid.PatchCount(), patch_dim]
+  int64_t patch_dim = 0;
+  uint64_t content_hash = 0;
+};
+
+// One entry of an OpenAI content-part array, order-preserving (docs/server.md: an image may appear
+// in any position, interleaved with text). A message whose `content` was a plain string, or an
+// array with no image part at all, never populates `ChatMessage::content_parts` at all -- see that
+// field's own doc comment for why that keeps every pre-vision code path byte-identical.
+struct ContentPart {
+  bool is_image = false;
+  std::string text;    // valid iff !is_image
+  ImagePart image;      // valid iff is_image
+};
+
 struct ChatMessage {
   std::string role;  // "system" | "user" | "assistant" | "tool" | "function"
   // Absent (std::nullopt) only ever allowed for role=="assistant" with a non-empty `tool_calls`
   // (an assistant turn that was purely a tool call, no accompanying prose) -- every other role
   // requires a real (possibly empty-string) content, enforced by ParseChatCompletionRequest.
+  // For a message that carried at least one IMAGE content part, this is still the concatenation of
+  // just its TEXT parts (possibly empty) -- kept for logging/back-compat; the template is rendered
+  // from `content_parts` instead whenever that is non-empty (Engine::RunRequest).
   std::optional<std::string> content;
+  // Populated ONLY when `content` arrived as an array containing at least one image part --
+  // otherwise left empty, which is what makes every text-only request (a plain string, or an array
+  // of text-only parts) byte-identical to before image content parts existed: Engine::RunRequest
+  // renders straight from `content` in that case, exactly as it always has.
+  std::vector<ContentPart> content_parts;
+  bool HasImages() const {
+    for (const auto& p : content_parts) {
+      if (p.is_image) return true;
+    }
+    return false;
+  }
   std::vector<ToolCallOut> tool_calls;      // role=="assistant" only; empty otherwise
   std::optional<std::string> tool_call_id;  // role=="tool" (required there); unused otherwise
   std::optional<std::string> name;          // role=="function" (legacy, required there): the
@@ -157,14 +202,33 @@ struct CompletionRequest {
   bool stream_options_include_usage = false;
 };
 
+// An image content part above this many total images in one request is a clean 400 -- a
+// reasonable ceiling for a local single-user server (docs/server.md's "Images" section), not a
+// hardware limit: nothing about the vision tower itself caps image COUNT (only per-image pixel
+// count, via --image-max-pixels/ImageProcessorConfig::max_pixels), so this is purely a
+// request-shape sanity bound.
+inline constexpr size_t kMaxImagesPerRequest = 8;
+// A `data:` URI's base64 payload above this many CHARACTERS is a clean 400 rather than an
+// unbounded decode -- ~32 MiB of base64 text decodes to ~24 MiB of image bytes, generously above
+// any real photo/screenshot attachment and still small next to the request body size httplib
+// itself will buffer in memory regardless.
+inline constexpr size_t kMaxImageBase64Chars = 32 * 1024 * 1024;
+
 // Throws ApiError on any structurally or semantically invalid request body (missing/mistyped
-// field, an unsupported role, an image content part, an out-of-range sampling value, ...).
+// field, an unsupported role, a malformed/oversize/unsupported/remote image content part, an
+// out-of-range sampling value, ...).
 //
 // `sampling_defaults` seeds every field this request's body does not itself set (the server's
 // --default-temperature/--default-top-p/--default-top-k/--default-min-p flags) -- defaulted to
-// the library's own {1, 1, 0, 0} for callers (tests) that don't care.
-ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
-                                                  const SamplingParams& sampling_defaults = {});
+// the library's own {1, 1, 0, 0} for callers (tests) that don't care. `image_cfg` is the
+// server's own image preprocessing policy (`--image-max-pixels`, Engine's `image_preproc_`) --
+// defaulted to this checkpoint's own preprocessor_config.json values for callers that don't care.
+// An image part is decoded/preprocessed (never merely validated) here regardless of whether the
+// loaded container actually has a vision tower -- ParseChatCompletionRequest has no Model to ask;
+// Engine::RunRequest is what returns "this model/container has no vision tower" once it knows.
+ChatCompletionRequest ParseChatCompletionRequest(
+    const nlohmann::json& body, const SamplingParams& sampling_defaults = {},
+    const vision::ImageProcessorConfig& image_cfg = vision::ImageProcessorConfig());
 CompletionRequest ParseCompletionRequest(const nlohmann::json& body,
                                           const SamplingParams& sampling_defaults = {});
 
@@ -214,10 +278,12 @@ ThinkingControls ParseThinkingControls(const nlohmann::json& body);
 // independently-made calls can never drift apart.
 bool ResolveEnableThinking(const ThinkingControls& thinking, bool default_thinking);
 
-// `architecture.input_modalities` for `/v1/models` -- the ONE place that list is written. Today
-// `["text"]`; the vision-tower milestone flips it to `["text","image"]` here and nowhere else
-// (docs/server.md's "Deferred / known gaps").
-nlohmann::json ModelInputModalities();
+// `architecture.input_modalities` for `/v1/models` -- the ONE place that list is written.
+// `["text"]` when `has_vision` is false (no tower loaded -- `--vision off`, or a container with no
+// `vision.*` tensors at all), `["text","image"]` when it is true (docs/vision.md, docs/server.md's
+// "Images" section) -- the one-line switch stage 1 prepared, now flipped by whoever calls this
+// (BuildModelEntryJson, from `Model::HasVision()`).
+nlohmann::json ModelInputModalities(bool has_vision = false);
 
 // The `reasoning.supported_efforts` list `/v1/models` advertises, and the exact set of effort
 // strings ParseThinkingControls maps onto a template level. See ThinkingControls::template_effort
@@ -239,13 +305,18 @@ inline constexpr int64_t kModelNativeContextLength = 262144;
 // kModelNativeContextLength.
 // `default_thinking` is the server's own `--think` flag, reported as `reasoning.default_enabled`
 // so a client can render a thinking toggle pre-set the way this server will actually behave.
+// `has_vision` (docs/vision.md): true iff the loaded container's vision tower is actually resident
+// (`Model::HasVision()`) -- flips `architecture.input_modalities`/`modalities` to include "image"
+// and adds `"image"` to `capabilities` (a client checking either shape sees the same answer).
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx, bool default_thinking = false);
+                                    int64_t max_ctx, bool default_thinking = false,
+                                    bool has_vision = false);
 
 // `{"object": "list", "data": [BuildModelEntryJson(...)]}` -- GET /v1/models's shape. This server
 // ever loads exactly one model, so `data` always has exactly one entry (task design point 2).
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx, bool default_thinking = false);
+                                    int64_t max_ctx, bool default_thinking = false,
+                                    bool has_vision = false);
 
 struct UsageStats {
   int64_t prompt_tokens = 0;
@@ -276,11 +347,22 @@ struct TimingStats {
   double predicted_ms = 0.0;
   std::optional<int64_t> draft_n;
   std::optional<int64_t> draft_n_accepted;
+  // r4dx extensions (docs/vision.md, docs/server.md's "Images"): how many images this request's
+  // OWN vision-tower encode calls covered and how long they took, summed across every image this
+  // request actually ran EncodeImages for -- an image whose rows were already resident from prefix
+  // reuse (docs/vision.md "Prefix reuse across a turn that contained an image") is NOT counted
+  // here, so `image_n`/`image_ms` measure the real per-request GPU cost, not the conversation's
+  // total image count. unset (both fields, together) for a request with no image content part at
+  // all -- keeps a text-only response's `timings` object byte-identical to before this field
+  // existed, the same "omit, don't zero" convention `draft_n` already uses.
+  std::optional<int64_t> image_n;
+  std::optional<double> image_ms;
 };
 
 // {"prompt_n", "prompt_ms", "prompt_per_second", "predicted_n", "predicted_ms",
-// "predicted_per_second"} plus "draft_n"/"draft_n_accepted" iff `timings.draft_n` is set. A
-// `*_per_second` value is 0.0 (never NaN/inf) when the corresponding `*_ms` is 0.
+// "predicted_per_second"} plus "draft_n"/"draft_n_accepted" iff `timings.draft_n` is set, plus
+// "image_n"/"image_ms" iff `timings.image_n` is set. A `*_per_second` value is 0.0 (never NaN/inf)
+// when the corresponding `*_ms` is 0.
 nlohmann::json BuildTimingsJson(const TimingStats& timings);
 
 // `reasoning_content`: unset (the default) omits the key entirely -- a thinking-off response is

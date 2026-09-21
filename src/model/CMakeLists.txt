@@ -91,6 +91,9 @@ target_link_libraries(r4dx_model PUBLIC
   r4dx_hip_runtime
   r4dx_model_kernels
   r4dx_convert   # header-only: SafetensorsReader (container.cpp) + nlohmann/json (model_config.h)
+  # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
+  # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
+  r4dx_vision_tower
 )
 
 # src/model/attention/** is another agent's -- guard so this configure never blocks on it existing

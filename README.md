@@ -41,25 +41,30 @@ exact toolchain versions, flags, and gotchas.
 .\tests\run_tests.ps1
 ```
 
-Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 36 tests
+Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 62 tests
 covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
-residual add, silu_mul, rope, fp8/int8 activation quant, kv cache write, mxfp4 GEMM, attention
-decode, GDN chunk scan, sampler, the P6 vectorized-kernel bandwidth golden, the P2 fused-quant-
-epilogue byte-diff harness, embedding-gather in-range/OOB-clamp, the R9 reduced-vocab-draft-head
-gather-by-index kernel's in-range/OOB-clamp golden), the converter's quantizer
+residual add, silu_mul, rope (including the 3-axis mrope partial-rotary kernel), fp8/int8
+activation quant, kv cache write, mxfp4 GEMM, attention decode, GDN chunk scan, sampler, the P6
+vectorized-kernel bandwidth golden, the P2 fused-quant-epilogue byte-diff harness, embedding-gather
+in-range/OOB-clamp, the R9 reduced-vocab-draft-head gather-by-index kernel's in-range/OOB-clamp
+golden, and the vision tower's six device primitives), the converter's quantizer
 round-trip / byte-packer / kernel-decode / KV-calibration / bf16-layout tests, the tokenizer's
 golden-case suite, `src/model`'s per-layer tests (GDN layer, full-attention layer,
-final-norm+lm_head, assembled-`Model` forward-pass smoke including a prefill/decode state-handoff
-equivalence check and a `Model::Reset()` byte-identity check, MTP's verify/rejection-rewind/
-mid-round-commit/K=16-wide-window/reduced-vocab-draft-head-lossless tests, and the pure-CPU
-`mtp_round` commit-bookkeeping tests, including a K=16 wide-round case), `src/cli`'s
-argument-parsing tests (including `--mtp-draft-head`), `src/server`'s CPU-only tests (CLI args
-including `--mtp-draft-head`, OpenAI request/response JSON shapes including `tools`/`tool_choice`/
-`role: "tool"`/`"function"` parsing, SSE framing, buffering/streaming sinks including the tool-calls
-streaming chunk shape, the bounded request queue, `PrefixState`, and the tool-call surface-syntax
-parser -- `docs/server.md`'s "Tool calls"), and a
+final-norm+lm_head, the mrope-carrying attention layer, assembled-`Model` forward-pass smoke
+including a prefill/decode state-handoff equivalence check and a `Model::Reset()` byte-identity
+check, MTP's verify/rejection-rewind/mid-round-commit/K=16-wide-window/reduced-vocab-draft-head-
+lossless tests, and the pure-CPU `mtp_round` commit-bookkeeping tests, including a K=16 wide-round
+case), `src/cli`'s argument-parsing tests (including `--mtp-draft-head` and `--image`), `src/server`'s
+CPU-only tests (CLI args including `--mtp-draft-head`, OpenAI request/response JSON shapes including
+`tools`/`tool_choice`/`role: "tool"`/`"function"` parsing and image content parts, SSE framing,
+buffering/streaming sinks including the tool-calls streaming chunk shape, the bounded request queue,
+`PrefixState` including its image-aware key, and the tool-call surface-syntax parser --
+`docs/server.md`'s "Tool calls"), the vision tower's tests (the CPU-only preprocessing / mrope /
+index-math goldens, the whole tower against the real checkpoint's forward, and the shared
+`ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). All 37 currently pass (~208s wall on HIP device 1). See `docs/status.md` for
+`ctest` invocation). 61 pass and 1 skips (`test_kernel_bandwidth`, whose golden is gitignored),
+~636s wall on HIP device 1. See `docs/status.md` for
 the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
 GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
 `ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration
@@ -101,6 +106,17 @@ $env:HIP_VISIBLE_DEVICES = '1'
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 128 --temperature 0 --stats
 ```
+
+Add `--image <path>` (repeatable, any container the vision tower loaded from) to ask about a
+picture (docs/vision.md):
+
+```powershell
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v3.r4dx --layout w4a16 `
+    --image photo.png --prompt "What is in this picture?" --max-tokens 128 --temperature 0 --stats
+```
+
+In `--chat`, attach an image to the NEXT turn with one or more leading `/image <path>` lines typed
+into the REPL before the question itself.
 
 `--layout` selects which quantized (or `bf16`) body-weight variant baked into the container to run
 (`mxfp4` / `w4a16` / `w4a8` / `bf16`) -- as of the Milestone 2 performance pass this now includes
@@ -202,12 +218,30 @@ rendered into the prompt and a model-emitted `<tool_call>` is parsed back into a
 `message.tool_calls` response (JSON-encoded `arguments` string, stable generated `id`s,
 `finish_reason: "tool_calls"`), with malformed/unknown-tool output degrading to plain content
 rather than erroring; see `docs/server.md`'s "Tool calls" section for the confirmed model surface
-syntax, `tool_choice` coverage, and the streaming (buffer-whole) decision. See `docs/server.md` for
-the full endpoint/field reference, the remaining deferred feature (vision), and a captured real
-streamed answer, and `tools/server/smoke.ps1` for the GPU integration smoke test
-(`.\tools\server\smoke.ps1` against the small 4-layer test container by default; pass
-`-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it at a real container with MTP enabled, and
-`-ToolRoundTrip` to exercise a real tool call/result/answer round trip against it).
+syntax, `tool_choice` coverage, and the streaming (buffer-whole) decision. Images (Milestone 8
+stage 5, docs/server.md's "Images"): standard OpenAI `image_url`/`input_image` content parts, any
+number of images in any position across a conversation, against a container whose vision tower is
+loaded --
+
+```powershell
+$b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("photo.png"))
+curl.exe -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d @"
+{"messages":[{"role":"user","content":[
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,$b64"}},
+  {"type":"text","text":"What is in this picture?"}]}],
+ "max_tokens":128,"temperature":0}
+"@
+```
+
+A remote (`http://`/`https://`) `image_url` is never fetched (a clean `400`); an image against a
+container with no vision tower loaded is also a clean `400` naming the reason. See `docs/server.md`
+for the full endpoint/field reference and a captured real streamed answer, and
+`tools/server/smoke.ps1` for the GPU integration smoke test (`.\tools\server\smoke.ps1` against the
+small 4-layer test container by default; pass `-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it
+at a real container with MTP enabled, `-ToolRoundTrip` to exercise a real tool call/result/answer
+round trip, and `-Vision` to exercise the full image suite -- description, OCR, multi-image,
+image+tools, image+thinking, streaming, and multi-turn prefix reuse -- against a vision-capable
+container).
 
 ## Layout
 
@@ -226,6 +260,67 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 ```
 
 ## Status
+
+**Milestone 8 done, integrated and measured (2026-09-22, stage 8).** Every gate green on a clean
+`build.ps1 -Clean`: `ctest` 62 registered/61 passed/1 skipped, `tools/validate_dflash.ps1
+-AllowBatchedVerifyDivergence` passed with the same 4-identical/5-known-divergence result as
+before, and `tools/server/smoke.ps1` clean on the default 4-layer container, the real container with
+`-Dflash -ToolRoundTrip`, and the real container with `-Vision -Dflash` (191 PASS, 0 FAIL). Headline
+numbers, real 64-layer container, `w4a16`, `--dflash k=7` server config, greedy, twice each:
+
+| | 448x448 | 1024x1024 | 1536x1536 (default cap) |
+|---|---|---|---|
+| Image tokens | 196 | 1024 | 1024 (downsized) |
+| Encode ms | 33-34 | 159-160 | 160-161 |
+
+Prefill with an image: ~995-1003 tok/s (same rate as text). Decode + acceptance on a 1024x1024
+image prompt: plain 38.5-38.6 tok/s, `--mtp 3` 79.4-79.5 tok/s (58.5% acceptance), `--dflash k=7`
+86.9 tok/s (33.1% acceptance). VRAM: `--vision off` 16.17 GiB vs `--vision auto` 17.03-17.04 GiB
+(+0.86-0.87 GiB). Text-only decode with the tower resident: 38.75-38.81 tok/s -- no regression
+against this project's own w4a16 baseline range. Full table: `docs/perf.md`'s "Milestone 8, stage
+8" section. Known gaps (video input, remote/webp images, a real-photograph end-to-end check, the
+non-ASCII prefix-cache round-trip gap): `docs/status.md`'s Milestone 8 stage 8 entry.
+
+**User-facing image input shipped (2026-09-22, stage 5).** `--image <path>` (repeatable) on
+`r4dx-cli`, `/image <path>` lines in `--chat`, and OpenAI-shaped `image_url`/`input_image` content
+parts on `r4dx-server`'s `/v1/chat/completions` -- real-hardware verified: describing a synthetic
+image, reading a rendered string back off an OCR image exactly, two images in one request, image +
+tools, image + thinking, streaming, and an image-aware prefix cache (a turn that reuses an earlier
+turn's own image does not re-encode it; a different image at the same conversation position never
+reuses the wrong turn's KV state). A container with no vision tower now answers a clean `400`
+naming the reason instead of the old blanket "not implemented". Full detail:
+`docs/vision.md`'s "User-facing wiring: --image and image_url", `docs/server.md`'s "Images".
+
+**The model answers questions about a picture (2026-09-22).** The vision tower's merged rows are
+now spliced into the text embedding sequence at the image-placeholder positions, and 3-axis
+`(t, h, w)` mrope position ids reach every rope call site in the decode stack -- prefill (chunked
+included), plain decode, MTP verify and draft, DFlash2 injection and draft blocks. With an image in
+the prompt a token's rope position and its KV slot index stop being the same number, permanently
+for the rest of the conversation, so `Model::PrefillMultimodal` records the mrope delta and every
+later step ropes at `sequence index + delta` while its slot stays the sequence index. Greedy, on
+the real container: the synthetic golden image is described correctly (gradient, checkerboard,
+circle); a three-bar chart's count, colours and ordering are all correct; five circles are counted
+as `5`; `R4DX7391` is read exactly off a rendered text image. `--mtp 3` and `--dflash k=7` produce
+byte-identical output to plain decode with acceptance *higher* than the same question asked
+without a picture (2.91 vs 2.21 and 3.14 vs 2.52 tokens/round). Text-only generation is
+byte-identical to a build of the last pre-vision commit on all three paths. ~~`--image` on the CLI
+and `image_url` on the server are the next stage; `image_url` is still rejected with `400`.~~
+**Done, 2026-09-22, stage 5 -- see the entry above.** Full
+detail, including why the ring slot and the rope position deliberately part company for DFlash2:
+`docs/vision.md`.
+
+**Vision tower, on the GPU (2026-09-21).** `Qwen3_5VisionModel`'s forward now runs on device:
+`src/vision` loads the container's 333 `vision.*` bf16 tensors (0.9154 GiB measured) and runs patch
+embed -> the learned 48x48 position grid -> 27 encoder blocks over `r4d_attn_vit_h72_bf16` -> the
+2x2 patch merger, validated tensor by tensor against the real checkpoint's own forward (56 tensors
+across three golden cases, including every encoder block's output and a two-image batch). Encode
+cost, real container, best of 3: **27.7 ms for 448x448, 149.5 ms for 1024x1024, 396.7 ms for
+1536x1536** -- and 2048x2048 still fits next to the loaded 27B at the full 262144-token KV
+allocation with 6.5 GiB free. `--vision {auto|on|off}` decides whether the 0.9 GiB is paid at all
+(text-only output is byte-identical either way) and `--image-max-pixels N` (default 1024x1024)
+downsizes a large attachment through the reference's own `smart_resize` rather than rejecting it.
+Full detail, including why the deep-block numeric disagreement is the reference's own bf16
+attention rather than an r4dx error: `docs/vision.md`.
 
 Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation),
 Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and MTP

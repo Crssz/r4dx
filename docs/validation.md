@@ -85,8 +85,18 @@ number per kernel without a reason recorded here.
 same conventions (real weights, `manifest.json`, the same tolerance table), covering patch embed,
 all 27 encoder blocks (plus block 0's full internal kernel-granularity chain), and the merger, for a
 real (synthetic but structured) test image processed through the checkpoint's actual configured
-image processor. No `src/model` code exists yet to diff against it -- see `docs/vision.md`'s
-"What's done / what's not" for the exact state.
+image processor. `tests/vision/test_vision_tower.cpp` is what diffs against it (2026-09-21).
+
+`tools/reference/mrope_layer_golden.py` is this rung's sibling for the TEXT side of the vision
+path (2026-09-22, `docs/vision.md` "Splicing pass: what was measured"): one real full-attention
+decoder layer driven by the 3-axis `(t,h,w)` mrope position ids `Qwen3_5Model.get_rope_index`
+produces for a prompt containing an image, at the same 2e-2 bound as `layer_golden.py`'s own
+attention case and for the same reason. It exists because `layer_golden.py`'s position ids
+collapse all three streams to one sequential index, so that golden passes identically whether the
+rope kernel selects a per-bin position stream or ignores the h/w rows entirely. Consumed by
+`tests/model/attention/test_mrope_attn_layer.cpp`, which also runs a NEGATIVE control (the same
+call roping at the KV slot index) and asserts it lands well outside the band -- a tolerance test
+is only evidence if the wrong answer actually fails it.
 
 `tools/reference/kv_calibrate.py` is the same rung's sibling for the fp8 KV descale tables:
 per-kv-head `amax` of K (post-rope) and V for a full-attention layer, which the converter turns
@@ -178,3 +188,31 @@ far out too. Full data, exact prompts, and transcripts: `docs/perf.md`'s "Long-c
 section. Not yet done: a systematic needle-position sweep (fact at 10%/50%/90% depth, multiple
 distinct facts) -- this pass used one prompt design per context length, sufficient to show position
 handling works at all, not a full needle-in-a-haystack accuracy curve.
+
+### Rung 5 for images (2026-09-22, `docs/vision.md` "End to end: does the model actually see the
+picture")
+
+The vision path's version of the same question, and it needs a different kind of prompt than a
+photograph: a picture a human judges "looks about right" cannot separate a correct splice from a
+subtly wrong one. The four cases used all have an answer known BY CONSTRUCTION -- three of them
+rendered locally with `System.Drawing` from PowerShell (no network, so they are reproducible on
+this box and carry no licence question): a known string for OCR, a chart with known colours and a
+known tallest bar, and an image with a known number of countable objects, plus the tower golden's
+own synthetic gradient/checkerboard/circle image. Greedy decoding throughout, on the real
+container, through `tests/vision/tool_vision_chat`. All four answered correctly; prompts and
+verbatim answers are in `docs/vision.md`.
+
+This is the rung that catches the "positions look plausible but are shifted" class -- the failure
+mode of a wrong mrope advance rule or a mis-offset splice is fluent, confident nonsense about a
+different picture, which no tolerance test upstream would flag. It also distinguishes that class
+from plain resolution limits: the OCR case was run at three render sizes and the error is monotone
+in the patch grid (`HELLO`/`RDX 791` at a 20x40 grid, `HELLO R4DX 7301` at 40x80, exact at a 20x80
+grid with one line), which is a resolution curve, not a bookkeeping bug.
+
+Not yet done at this rung: a real photograph (all four images are synthetic or rendered).
+`image_url` in the server's own request path is DONE (2026-09-22, stage 5) -- see
+`docs/server.md`'s "Images" and `docs/vision.md`'s "User-facing wiring", including a real
+`tools/server/smoke.ps1 -Vision` run against the real container: a rendered-text OCR image read
+back exactly, a synthetic shapes image described correctly, and an image-aware prefix cache
+verified to reuse an already-fed image's rows (no re-encode) while never reusing a different
+image's KV state at the same conversation position.

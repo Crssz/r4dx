@@ -116,11 +116,20 @@ class MtpHead {
   // ACCEPTED one, so output quality cannot degrade by using this path. Silently falls back to the
   // full-vocab head (identical to use_reduced_vocab=false) when w.HasDraftHead() is false, so a
   // caller can request "reduced if available" unconditionally without checking the container itself.
+  //
+  // mrope_delta (vision milestone, docs/vision.md "Text-side splicing"): once an image has been
+  // spliced into the conversation, a token's ROPE position is `sequence_index + mrope_delta`, not
+  // `sequence_index`. Every position this method drafts at is past the prompt and therefore pure
+  // text, so all three (t,h,w) streams still carry the same value -- but that value is no longer
+  // base_pos+step. `positions_dev_` stays the sequence index (it is also the KV slot mapping for
+  // this head's own cache); `rope3_dev_` carries the rope value. 0 (the default, and every
+  // text-only conversation) leaves the pre-vision single-row path in place byte for byte.
   std::vector<int32_t> Draft(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                               const MtpWeights& w, const uint16_t* h_seed, int32_t seed_token,
                               const uint16_t* embed_table, const uint16_t* embed_table_dev,
                               int64_t vocab, const QuantLinear& lm_head, int64_t k,
-                              int64_t base_pos, bool use_reduced_vocab = true);
+                              int64_t base_pos, bool use_reduced_vocab = true,
+                              bool mrope_active = false, int64_t mrope_delta = 0);
 
   // Extends MTP's own KV cache (file comment) by `n` real positions [base_pos, base_pos+n), using
   // the REAL (h_i, t_{i+1}) pair at each position -- i.e. exactly Draft()'s own first-step
@@ -156,10 +165,16 @@ class MtpHead {
   // reused at a fixed address across calls because HIP's stream-order guarantee DOES apply there
   // (each call's own kernels consume its device data before the next call's H2D can overwrite it).
   // Caller must ensure host_staging_offset + n <= kMaxPrime; PrimeKv throws otherwise.
+  //
+  // rope3_host (vision milestone, docs/vision.md): host int32[3, n] (compact, t row then h then w)
+  // giving these n positions' 3-axis mrope rope positions. Unlike Draft's, THESE positions can
+  // land inside an image run -- PrimeKv is called from RunChunk over the prompt itself -- so a
+  // scalar delta is not enough and the caller (Model::RopePositionsHost) hands over the real rows.
+  // nullptr (the default, and every text-only conversation) keeps the pre-vision path.
   void PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                const MtpWeights& w, int64_t base_pos, const uint16_t* h_rows,
                const std::vector<int32_t>& next_tokens, const uint16_t* embed_table, int64_t vocab,
-               int64_t host_staging_offset = 0);
+               int64_t host_staging_offset = 0, const int32_t* rope3_host = nullptr);
 
  private:
   attention::AttentionLayer attn_layer_;
@@ -200,6 +215,12 @@ class MtpHead {
   core::DeviceBuffer<int32_t> seed_token_dev_;  // [1]
   core::DeviceBuffer<int32_t> draft_ids_dev_;   // [max_draft]
   core::PinnedBuffer<int32_t> draft_ids_host_;  // [max_draft]
+  // 3-axis rope positions for the same window (docs/vision.md), laid out STEP-MAJOR -- element
+  // 3*step+axis, not axis*max_draft+step -- because each step ropes exactly one token and
+  // r4dx_rope_partial_mrope3_bf16 reads its rows at stride `tokens`, which is 1 here. That makes
+  // `rope3_dev_.data() + 3*step` a valid compact [3, 1] argument with no per-step upload.
+  core::DeviceBuffer<int32_t> rope3_dev_;       // [3 * max_draft]
+  core::PinnedBuffer<int32_t> rope3_host_;      // [3 * max_draft]
 
   // PrimeKv's own scratch, sized for up to a 64-row chunk (Model::max_chunk_) so both the n=1
   // boundary call and the n<=63 within-chunk call reuse the same buffers. Device-side reuse across
@@ -220,6 +241,10 @@ class MtpHead {
   core::DeviceBuffer<int32_t> prime_seqused_dev_;     // [1], dest always offset 0
   core::PinnedBuffer<uint16_t> prime_embed_host_;     // [kMaxPrime * hidden]
   core::DeviceBuffer<uint16_t> prime_embed_dev_;      // [kMaxPrime * hidden]
+  // PrimeKv's 3-axis rope rows, [3, n] compact at device offset 0; the host side is sliced by
+  // 3*host_staging_offset for the same in-flight-H2D reason prime_positions_host_ is.
+  core::PinnedBuffer<int32_t> prime_rope3_host_;      // [3 * kMaxPrime]
+  core::DeviceBuffer<int32_t> prime_rope3_dev_;       // [3 * kMaxPrime]
 };
 
 }  // namespace r4dx::model

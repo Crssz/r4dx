@@ -5,6 +5,12 @@
 # dependency, so tests/server/** links this alone without a GPU. Mirrors src/cli's own
 # header-only-argument-parsing split (cli_args.h / r4dx_cli) for the same reason; server_args.h
 # and request_queue.h are header-only so they need no .cpp here.
+#
+# Links r4dx_vision (docs/vision.md, stage 5): image content-part decode/preprocess (base64 ->
+# stb_image -> smart_resize) is pure host C++ with no HIP/r4dx_model dependency of its own
+# (src/vision/CMakeLists.txt's own file comment), so it belongs in openai_types.cpp alongside
+# every other request-parsing/validation rule in this file, and stays exercisable by
+# tests/server/test_openai_types.cpp with no container and no GPU.
 add_library(r4dx_server_core STATIC
   openai_types.cpp
   sse.cpp
@@ -19,6 +25,7 @@ target_include_directories(r4dx_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # src/tokenizer/CMakeLists.txt). PUBLIC: openai_types.h (a public header of this target) includes
 # it, so consumers linking r4dx_server_core need this path too.
 target_include_directories(r4dx_server_core PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(r4dx_server_core PUBLIC r4dx_vision)
 target_compile_features(r4dx_server_core PUBLIC cxx_std_17)
 
 if(R4DX_BUILD_SERVER)

@@ -145,14 +145,48 @@ C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\v
 The vision-tower analogue of `layer_golden.py` -- see `docs/vision.md` for the full architecture
 spec this script validates against. Builds `Qwen3_5VisionModel` directly from `modeling_qwen3_5.py`,
 loads real `model.visual.*` weights (333 tensors, all present in the real checkpoint), preprocesses
-a real image with the checkpoint's own configured `transformers.AutoImageProcessor`
-(`Qwen2VLImageProcessor`), and dumps `pixel_values`, every encoder block's output (27), block 0's
-full internal chain (norm1/qkv-raw/post-rope-q-k/proj-out/norm2/mlp-fc1/mlp-fc2), and the merger
-output. `--image <path>` uses a real photo; without it, a deterministic synthetic 448x448 test image
-is generated and saved to `<out-dir>/vision_test_image.png` for reproducibility. Output:
-`<out-dir>/vision_tower.safetensors` + `<out-dir>/vision_manifest.json` (same tolerance-table
-convention as `layer_golden.py`'s `manifest.json`, kept in a separate file since this rung has no
-text-layer components to share a manifest with).
+real images with the checkpoint's own configured `transformers.AutoImageProcessor` (the config
+names `Qwen2VLImageProcessorFast`; in `transformers` 5.17.0 that resolves to
+`Qwen2VLImageProcessor`, which *is* the torchvision-backed one), and runs **three** cases, each
+its own `.safetensors` file and its
+own component in `<out-dir>/vision_manifest.json`:
+
+| component | image(s) | grid | what it is for |
+|---|---|---|---|
+| `vision_tower` | synthetic 448x448 | 28x28 | the deep case: every encoder block's output (27) + block 0's full internal chain (norm1/qkv-raw/post-rope-q-k/proj-out/norm2/mlp-fc1/mlp-fc2). Also carries the learned `pos_embed_table` and `rope_inv_freq`. `smart_resize` is the identity here, so this case does **not** exercise the resampler. |
+| `vision_tower_nonsquare` | synthetic 613x409 (WxH) -> 608x416 | 26x38 | the one that does: width down-sampled, height up-sampled, neither input side a multiple of 32, `h != w` afterwards. |
+| `vision_tower_two_image` | both, in one processor call and one forward | 28x28 + 26x38 | `cu_seqlens` with two segments, concatenated `pixel_values`, per-image restart of the pos-embed/rope index math. |
+
+Every case dumps the front-end tensors a from-scratch implementation has to match one at a time
+before any block output can: `pixel_values`, `image_grid_thw`, `interp_indices`/`interp_weights`
+(the 4-tap position-embedding gather), `pos_embeds`, `vision_position_ids`, `cu_seqlens`,
+`patch_embed_out`, `rope_cos`/`rope_sin`, `block_input`, `last_hidden_state`, `merger_output`.
+
+`--image`/`--image2 <path>` use real photos; without them the two deterministic synthetic test
+images are generated and saved to `<out-dir>/vision_test_image.png` and
+`<out-dir>/vision_test_image_nonsquare.png` -- `tests/vision/test_preprocess.cpp` decodes those
+exact files, so regenerating the goldens with different `--image` arguments regenerates the images
+the test reads too.
+
+The `vision_tower` component additionally carries three small CPU-only fixture groups, each pinning
+a preprocessing claim that the whole-pipeline `pixel_values` comparison would detect but not
+localize:
+
+| fixture group | files written | what it pins |
+|---|---|---|
+| `make_channel_conversion_fixtures` | `vision_test_image_rgba.png`, `vision_test_image_grey.png` (+ `rgba_pil_rgb`, `grey_pil_rgb`) | alpha is **dropped, not composited**, and greyscale is replicated -- the behaviour `src/vision`'s `stb_image` path relies on. |
+| `make_resampler_fixtures` | `vision_resize_noise_{0..3}.png` (+ `resize_noise_{i}_out`) | the uint8 antialias resampler alone, on random noise (the worst case for any rounding disagreement) at four size pairs: both axes down, the real `smart_resize` mixed pair, both axes up, and a 4x downscale -- the two photographs exercise one resize between them and no upscale at all. |
+| `make_format_fixtures` | `vision_test_image_format.{bmp,gif,jpg}` (+ `bmp_pil_rgb`, `gif_pil_rgb`, `jpeg_pil_rgb`) | the three non-PNG decoders `image_decode.h` claims. BMP/GIF must match PIL exactly; JPEG only within a small bound (stb's IDCT is not libjpeg's). |
+
+The manifest keeps `layer_golden.py`'s tolerance-table convention, in a separate file since this
+rung has no text-layer components to share a manifest with; each fixture group records its own
+file/tensor pairs under the `vision_tower` component (`channel_conversion`, `resampler_fixtures`,
+`format_fixtures`).
+
+**One deliberate divergence from a plain `.to(dtype=bfloat16)` run**: that cast also rounds the
+rope module's non-persistent `inv_freq` buffer to bf16, which the script undoes by recomputing it
+in fp32 through the rope class's own `compute_axial_rope_parameters`. See `docs/vision.md` "Rope"
+for why (and for the 0.047 absolute cos/sin error the bf16 buffer is worth).
 
 **Found and fixed while building this script**: `common.py`'s `ShardIndex.get_tensor`/
 `get_row_slice` had a real dangling-mmap bug (see `common.py`'s inline comment and `docs/vision.md`)
@@ -161,7 +195,90 @@ violation) -- `layer_golden.py`'s/`kv_calibrate.py`'s much smaller per-component
 triggered it. Fixed with `.clone()`; every script in this directory benefits, no other script's own
 code changed.
 
-Runtime: ~15-25s on HIP device 1 (real weights, one 448x448 test image, 27 blocks).
+**`--attn-impl {eager,sdpa}` and `--cases <names>`** (added with the device half, 2026-09-21).
+`eager` is the default, so every committed golden is byte-identical to before these options
+existed. They exist for one measurement: transformers' `eager_attention_forward` computes
+`torch.matmul(q, k^T)` in **bf16**, rounding the attention scores to bf16 before the `* scaling`,
+again after it, and the softmax probabilities to bf16 before the `P @ V` matmul; SDPA and
+`r4d_attn_vit_h72_bf16` keep all three in fp32/f16. Regenerating one case through SDPA into a
+scratch directory and diffing it against the committed golden is how `docs/vision.md` shows that
+the reference's own two implementations disagree with each other by as much as r4dx disagrees with
+either -- i.e. that the deep-block disagreement is the tower's bf16 conditioning, not an r4dx
+error:
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+<venv>\Scripts\python.exe tools\reference\vision_golden.py `
+    --device cuda --attn-impl sdpa --cases vision_tower --out-dir <scratch>
+$env:R4DX_VISION_GOLDEN_DIR = '<scratch>'
+build\win-hip\tests\vision\test_vision_tower.exe
+```
+
+Runtime: ~40-60s on HIP device 1 (real weights, three cases, 27 blocks each); ~20s for one case.
+
+## rope_index_golden.py
+
+```powershell
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\rope_index_golden.py `
+    --out-dir tools\reference\golden_out
+```
+
+The text-side counterpart of `vision_golden.py`: the mrope `position_ids` a prompt containing
+images gets, i.e. `Qwen3_5Model.get_rope_index` + `Qwen3_5Model.get_vision_position_ids`, called as
+the real unmodified methods bound to a shim that carries only `.config` (those two touch nothing
+else on the model). **No weights, no GPU, no images** -- `get_rope_index` consumes `input_ids` for
+shape, `mm_token_type_ids` and `image_grid_thw` -- so this is the cheapest script in this
+directory, under a second on any machine.
+
+Five synthetic cases, each dumping `input_ids`, `mm_token_type_ids`, `image_grid_thw`,
+`position_ids` `[3, 1, seq]` and `mrope_position_deltas`: `text_only`, `text_one_image`,
+`text_two_images_different_grids`, `image_first` (no leading text run), `image_last` (no trailing
+one). Output: `<out-dir>/rope_index.safetensors` + `<out-dir>/rope_index_manifest.json`, whose
+`semantics` block states the three position rules in prose. Consumed by
+`tests/vision/test_position_ids.cpp`.
+
+**`--verify-prompt <dump.json>`** (added with the splicing stage, 2026-09-22) checks the ENGINE's
+own rope rows for a REAL rendered prompt against the same unmodified `get_rope_index`, instead of
+regenerating the golden. The input is what `tests/vision/tool_vision_chat --dump-prompt` writes:
+the tokens the engine actually fed (after the processor's `<|image_pad|>` expansion), the derived
+`mm_token_type_ids`, the image grids, and `engine_position_ids` -- the `[3, seq]` rows
+`Model::PrefillMultimodal` really handed the rope kernel, not a re-derivation. The five cases above
+are synthetic; this is the same comparison against a prompt that came out of the real chat
+template and the real tokenizer, where an off-by-one in the placeholder expansion or the span
+offsets lives and a synthetic fixture cannot reach:
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+build\win-hip\tests\vision\tool_vision_chat.exe --layout w4a16 --image pic.png `
+    --prompt "Describe this image." --dump-prompt dump.json
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\rope_index_golden.py `
+    --verify-prompt dump.json
+```
+
+## mrope_layer_golden.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\mrope_layer_golden.py `
+    --device cuda --out-dir tools\reference\golden_out
+```
+
+ONE real full-attention decoder layer (layer 3 by default -- `layer_golden.py`'s own attention
+case, so the two are comparable), real weights, driven by the 3-AXIS mrope position ids
+`get_rope_index` produces for a prompt containing a 10x16-patch image. `layer_golden.py`'s own
+`mrope_position_ids` collapses (t,h,w) to one sequential index, which is correct for text but
+means that golden passes identically whether the rope kernel selects a per-bin position stream or
+ignores the h/w rows entirely; this one cannot. A full bf16 27B reference does not fit on this
+card, so one layer is the largest piece of the real stack that can be compared numerically at all.
+
+The grid is deliberately non-square (h and w cannot be swapped without changing the answer) and
+`max(h,w)//merge = 8` differs from the 40-token merged count, so the post-image advance rule is
+exercised. The image rows' hidden states are scaled 2x relative to the text rows so that a splice
+writing the right rows at the wrong offset moves the output measurably. Dumps prefill and decode
+`hidden_states` / `attention_output` / `layer_output`, post-rope q/k, the `[3, total]` position
+rows and the token/type/grid arrays. Output:
+`<out-dir>/mrope_layer_003.safetensors` + `<out-dir>/mrope_layer_manifest.json`. Consumed by
+`tests/model/attention/test_mrope_attn_layer.cpp`.
 
 ## kv_calibrate.py
 

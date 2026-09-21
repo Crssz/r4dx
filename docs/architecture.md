@@ -9,6 +9,11 @@ src/kernels/    r4dx-owned HIP kernels -- the glue r4d does not provide (see "Ow
 src/model/      the layer graph: embedding -> N decoder layers -> final norm -> lm_head, built
                 from a parsed r4dx container + config_model.
 src/tokenizer/  BPE tokenizer + chat template application (minja).
+src/vision/     the vision tower (docs/vision.md). TWO targets on purpose: r4dx_vision is the
+                CPU-only host half (image decode, the exact Qwen2VL preprocessing pipeline, the
+                mrope/pos-embed/rope/cu_seqlens index math -- no HIP, so its tests run anywhere),
+                and r4dx_vision_tower is the device half (the container's 333 vision.* tensors in
+                VRAM, plus Qwen3_5VisionModel's forward on top of them).
 src/convert/    HF checkpoint (safetensors + config.json) -> r4dx container (docs/container-format.md).
 src/server/     OpenAI-compatible chat completions API (cpp-httplib + nlohmann/json), streaming.
 src/cli/        single-process text-generation entry point.
@@ -61,7 +66,12 @@ q = rmsnorm_zero_centered(q, q_norm);  k = rmsnorm_zero_centered(k, k_norm)   --
 q, k = rope(q, k, cos, sin)                    -- partial_rotary_factor 0.25 of head_dim (256),
                                                    so only the first 64 of 256 dims rotate;
                                                    mrope_interleaved=true, sections [11,11,10]
-                                                   over (temporal, height, width) position ids
+                                                   over (temporal, height, width) position ids.
+                                                   Text-only: all three streams == the token
+                                                   position. With an image in the prompt they
+                                                   DIVERGE, and so does the rope position from
+                                                   the KV slot index -- docs/vision.md
+                                                   "Text-side splicing"
                                                                         [src/kernels: rope]
 o = r4d_attn_{prefill,decode}_h256_gqa6_{fp8kv,bf16kv}(q, k_cache, v_cache, ...)
                                                 -- kv cache write happens BEFORE this call
@@ -138,18 +148,57 @@ prefill-throughput-optimal. Attention prefill already has a dedicated query-tile
 (`r4d_attn_prefill_h256_gqa6_*`); it is only the *GEMM* side (qkv/gate_up/down/lm_head projections)
 that takes the interim path.
 
-## Own kernels (`src/kernels`, required, not yet implemented)
+## Own kernels (`src/kernels`)
+
+The text-side set (all implemented; the "not yet implemented" this heading used to carry is long
+stale):
 
 | Kernel | Purpose |
 |---|---|
 | `rmsnorm` | `input_layernorm` / `post_attention_layernorm` / `text.final_norm` (zero-centered weight, `(1+w)`, per `Qwen3_5RMSNorm`) |
 | `residual_add` | post-attention and post-MLP residual sum |
-| `rope_partial_mrope` | partial rotary (first 25% of `head_dim`=256, i.e. 64 dims), interleaved mrope with sections `[11,11,10]` over (t,h,w) position ids, `theta=1e7` |
+| `rope_partial_mrope` | partial rotary (first 25% of `head_dim`=256, i.e. 64 dims), NeoX half-split pairing, `theta=1e7`. The **text-only** entry point: all three (t,h,w) streams equal the token position, so the section split is a no-op and it takes one `int32[tokens]` array |
+| `rope_partial_mrope3` | the **multimodal** counterpart: identical rotation, but each of the 32 frequency bins draws its position from one of three `int32[3, tokens]` rows. The bin -> stream assignment is `Qwen3_5TextRotaryEmbedding.recomposition_frequencies` with sections `[11,11,10]` -- the height stream overwrites bins `range(1, 3*sec_h, 3)` and width `range(2, 3*sec_w, 3)`, the rest stay temporal. With these sections that reduces to `bin % 3`, but the bounds are carried explicitly (a section vector where a slice does not reach its last in-range bin would diverge). Three identical rows make it **bit-identical** to `rope_partial_mrope`, which is what lets every text-only caller keep the cheaper entry point. See docs/vision.md "Text-side splicing" |
 | `silu_mul` | MLP's `silu(gate) * up` |
 | `quant_act_fp8_mxfp4a8` | per-row e4m3 activation quant + f32 scale, feeding `r4d_gemm_mxfp4a8_nt_m64` (parallels `r4d_quant_act_i8` for the int8 path, which r4d already provides) |
 | `kv_write_paged_fp8_hnd` | write K/V into the fp8 e4m3 paged HND cache at decode/prefill time, applying the static per-(layer,head) descale |
 | `embedding_lookup` | `text.embed_tokens` gather (host table; device-side gather for batches) |
 | `argmax_sample` | greedy argmax now; top-k/top-p later |
+
+Plus the vision tower's own five (docs/vision.md "The device kernels"), which exist because nothing
+on the text side has the right shape: `layernorm` (mean-subtracted, with bias -- `rmsnorm` is wrong
+for it in three ways), `bias_add`, `gelu_tanh` and `gelu_erf` (the encoder MLP and the merger use
+DIFFERENT GELUs), `vision_qkv_rope` (fused qkv split + full-head axial rope) and
+`vision_pos_embed` (the 4-tap learned-grid gather).
+
+## Vision tower (`src/vision`, shipped -- full detail in docs/vision.md)
+
+Architecturally unrelated to everything above: a different attention kernel, a real mean-subtracted
+`nn.LayerNorm` instead of RMSNorm, a plain GELU MLP instead of SwiGLU, an axial 2-D rope over the
+full head instead of a partial interleaved mrope, and a learned+interpolated position embedding with
+no text-side analogue. It is bf16 end to end -- `vision.*` is passthrough in the container, never
+quantized (docs/container-format.md), so there is one numeric path, not the text side's
+mxfp4/w4a16/w4a8 fan-out.
+
+```
+image bytes
+  -> decode (stb_image) -> smart_resize -> torch's uint8 antialias resampler   [host, bit-exact]
+  -> rescale/normalize -> patchify to [num_patches, 1536] in 2x2 block order   [host]
+  -> patch embed: [1536 -> 1152] GEMM + bias                       [r4d_gemm_bf16_nt_m64 + r4dx_bias_add_bf16]
+  -> + learned 48x48 position grid, 4-tap bilinear                 [r4dx_vision_pos_embed_bf16]
+  -> for each of 27 blocks:
+       h = h + proj(attn(LayerNorm(h)))    LayerNorm  [r4dx_layernorm_bf16]
+                                           qkv+rope   [GEMM + bias + r4dx_vision_qkv_rope_bf16]
+                                           attention  [r4d_attn_vit_h72_bf16, per-image cu_seqlens]
+       h = h + fc2(gelu_tanh(fc1(LayerNorm(h))))      [GEMM + bias + r4dx_gelu_tanh_bf16]
+  -> merger: LayerNorm(1152) -> view[-1, 4608] -> fc1 -> GELU(erf) -> fc2      [r4dx_gelu_erf_bf16]
+  -> [num_merged_tokens, 5120] bf16, ready to splice into the text embedding sequence
+```
+
+`Container` owns the loaded weights, `Model` owns the tower, `Model::EncodeImages` is the entry
+point, and `--vision {auto|on|off}` decides whether the 0.9 GiB is paid for at all. The splicing of
+those merged rows into the text sequence at the `248056` placeholder positions is the one piece
+that is still unwritten.
 
 ## fp8 KV paging
 

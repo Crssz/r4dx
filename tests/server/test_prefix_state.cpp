@@ -4,6 +4,7 @@
 // (owns r4dx::model::Model) and cannot be unit-tested on CPU alone (engine.h's own file comment),
 // so this is the CPU-testable half of that bookkeeping's contract -- exercised end to end against
 // a real Model by tools/server/smoke.ps1 instead.
+#include <algorithm>
 #include <cstdio>
 #include <optional>
 #include <vector>
@@ -108,6 +109,68 @@ void TestCommitTracksCommittedNotDisplayedTokens() {
   CHECK(!tail.has_value());
 }
 
+// Vision milestone (docs/vision.md "Text-side splicing"): every image placeholder is the SAME
+// token id, so two requests carrying two DIFFERENT pictures at the same position tokenize
+// identically. These cover the four cases that distinction creates.
+void TestImageAwarePrefixReuse() {
+  using r4dx::server::ImageKey;
+  const ImageKey a{/*content_hash=*/0xAAAA, 1, 28, 28, /*token_offset=*/3};
+  ImageKey b = a;
+  b.content_hash = 0xBBBB;  // a DIFFERENT picture, same grid, same place in the prompt
+  const std::vector<int32_t> turn1 = {1, 2, 3, 248056, 248056, 9};
+  const std::vector<int32_t> turn2 = {1, 2, 3, 248056, 248056, 9, 50, 51, 52};
+
+  // Same image, extended conversation: reuse, exactly as for text.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    auto tail = p.Extend(turn2, {a});
+    CHECK(tail.has_value());
+    CHECK(*tail == std::vector<int32_t>({50, 51, 52}));
+  }
+  // Byte-identical tokens, DIFFERENT picture: must NOT reuse. This is the case that exists only
+  // because of images -- the token check alone passes.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    CHECK(std::equal(turn1.begin(), turn1.end(), turn2.begin()));  // the tokens really do match
+    CHECK(!p.Extend(turn2, {b}).has_value());
+  }
+  // The client dropped the image from the re-rendered conversation: also not an extension.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    CHECK(!p.Extend(turn2, {}).has_value());
+  }
+  // A NEW image appears in the new tail (offset past what was fed): still a valid extension.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    ImageKey c{0xCCCC, 1, 26, 38, /*token_offset=*/7};
+    auto tail = p.Extend(turn2, {a, c});
+    CHECK(tail.has_value());
+  }
+  // ...but a new image claiming an offset INSIDE the already-fed prefix is caller-bookkeeping
+  // disagreement, not a reusable prefix.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    ImageKey c{0xCCCC, 1, 26, 38, /*token_offset=*/1};
+    CHECK(!p.Extend(turn2, {a, c}).has_value());
+  }
+  // Clear()/Invalidate() drop the image list too, or the next request would compare against a
+  // conversation that no longer exists.
+  {
+    PrefixState p;
+    p.Commit(turn1, {}, {a});
+    p.Clear();
+    CHECK(p.fed_images().empty());
+    p.Commit(turn1, {}, {a});
+    p.Invalidate();
+    CHECK(p.fed_images().empty());
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -119,6 +182,7 @@ int main() {
   TestClearResetsToEmpty();
   TestInvalidateResetsToEmpty();
   TestCommitTracksCommittedNotDisplayedTokens();
+  TestImageAwarePrefixReuse();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) FAILED\n", g_failures);

@@ -41,6 +41,18 @@
   cover the draft's own target_layers (the real 64-layer container for every shipped DFlash2
   container, whose target_layers reach layer 62).
 
+.PARAMETER Vision
+  Exercises image content parts end to end (docs/vision.md, docs/server.md's "Images") against a
+  REAL vision-capable container -- pass -Model/-Layout/-Layers -1 pointed at one (e.g.
+  D:\models\r4dx\qwen38-27b-v3.r4dx). Generates its own tiny synthetic PNGs with System.Drawing (no
+  files committed to the repo): a shapes image for a description check, a rendered-text image for
+  an OCR check, then two-images-in-one-request, image+tools, image+thinking, streaming, multi-turn
+  prefix reuse (turn 2 must NOT re-encode: no `timings.image_n` key), different-image-same-text
+  (must NOT reuse the prefix), and a battery of bad-input 400s. Off by default -- the DEFAULT run
+  (no -Vision, the 4-layer test container) instead asserts the one thing that must ALWAYS hold: an
+  image content part against a container with no vision tower is a clean 400 naming that, never a
+  crash or a silent no-op.
+
 .PARAMETER ToolRoundTrip
   Exercises a real tool call/result/answer multi-turn round trip (docs/server.md's "Tool calls"):
   offers a `get_current_weather` tool definition, sends the server's own parsed
@@ -71,8 +83,53 @@ param(
     [int]$Mtp = 0,
     [string]$Dflash = "",
     [switch]$ToolRoundTrip,
+    [switch]$Vision,
     [string]$Preset = "win-hip"
 )
+
+Add-Type -AssemblyName System.Drawing
+
+# Synthetic test images (docs/vision.md's own "generate inside the script" preference over
+# committing binary fixtures): built with System.Drawing, never touching disk longer than one PNG
+# write/read round trip, freed immediately after. `DrawText` renders a KNOWN string the model is
+# expected to read back verbatim under greedy decoding (docs/vision.md's own real-container OCR
+# check used the same "render text, read text back" idea with "R4DX7391"; this stage's own smoke
+# uses a different string so the two are never confused if compared side by side).
+function New-SyntheticShapesImageBase64 {
+    $bmp = New-Object System.Drawing.Bitmap 256, 256
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $rect = New-Object System.Drawing.Rectangle 0, 0, 256, 256
+        $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            $rect, [System.Drawing.Color]::FromArgb(20, 20, 200), [System.Drawing.Color]::FromArgb(220, 220, 20),
+            [System.Drawing.Drawing2D.LinearGradientMode]::ForwardDiagonal)
+        $g.FillRectangle($brush, $rect)
+        $g.FillEllipse([System.Drawing.Brushes]::White, 78, 78, 100, 100)
+        $g.DrawEllipse((New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 4)), 78, 78, 100, 100)
+    } finally { $g.Dispose() }
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    [System.Convert]::ToBase64String($ms.ToArray())
+}
+
+function New-OcrImageBase64 {
+    param([string]$Text = "R4DXVSN9")
+    $bmp = New-Object System.Drawing.Bitmap 320, 128
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+        $g.Clear([System.Drawing.Color]::White)
+        $font = New-Object System.Drawing.Font("Consolas", 36, [System.Drawing.FontStyle]::Bold)
+        $g.DrawString($Text, $font, [System.Drawing.Brushes]::Black, 10, 40)
+        $font.Dispose()
+    } finally { $g.Dispose() }
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    [System.Convert]::ToBase64String($ms.ToArray())
+}
+
+function Image-DataUri { param([string]$Base64) "data:image/png;base64,$Base64" }
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..\..
@@ -152,6 +209,14 @@ $ServerArgList = @(
 if ($Layers -ge 0) { $ServerArgList += @("--layers", "$Layers") }
 if ($Mtp -gt 0) { $ServerArgList += @("--mtp", "$Mtp") }
 if ($Dflash -ne "") { $ServerArgList += @("--dflash", "$Dflash") }
+# The default (non--Vision) run's own "image on a non-vision container -> 400" check (below) assumes
+# this server has no vision tower loaded. That was always true before the vision milestone (every
+# -Model here, including the real 64-layer container, had no vision.* tensors), but the real
+# container now ships them, and --vision defaults to "auto" (load iff present) -- so without this,
+# pointing -Model at the real container without -Vision would auto-load vision and the "clean 400"
+# check below would wrongly fail (not a server bug: the server is correctly answering the image).
+# -Vision itself passes no --vision override, so its own real-container run keeps the "auto" default.
+if (-not $Vision) { $ServerArgList += @("--vision", "off") }
 $proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgList -PassThru `
   -RedirectStandardError $ServerErrLog `
   -RedirectStandardOutput "$env:TEMP\r4dx-server-smoke.out.log"
@@ -212,10 +277,15 @@ try {
         Check (($models.data[0].supported_parameters) -contains $param) `
             "/v1/models: data[0].supported_parameters contains '$param'"
     }
-    # Stays ["text"] until the vision tower lands; the later milestone flips ModelInputModalities()
-    # (openai_types.cpp) and this check with it.
-    Check (($models.data[0].architecture.input_modalities -join ",") -eq "text") `
-        "/v1/models: data[0].architecture.input_modalities == ['text'] (no vision tower yet)"
+    # ["text"] unless this container's vision tower is actually loaded (-Vision implies a real,
+    # vision-capable container) -- docs/vision.md's one-line ModelInputModalities() switch.
+    if ($Vision) {
+        Check (($models.data[0].architecture.input_modalities) -contains "image") `
+            "/v1/models: data[0].architecture.input_modalities contains 'image' (-Vision)"
+    } else {
+        Check (($models.data[0].architecture.input_modalities -join ",") -eq "text") `
+            "/v1/models: data[0].architecture.input_modalities == ['text'] (no vision tower loaded)"
+    }
 
     # ---- GET /v1/models/{id} (task item 1) ---------------------------------------------------------
     $modelId = $models.data[0].id
@@ -240,7 +310,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 5
     $chatResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $chatBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $chatBody -UseBasicParsing
     $chat = $chatResp.Content | ConvertFrom-Json
     Check ($chatResp.StatusCode -eq 200) "chat completion (non-streaming) returns 200"
     Check ($chat.object -eq "chat.completion") "chat completion: object == 'chat.completion'"
@@ -276,7 +346,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 5
     $prefixReuseResp1 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $prefixReuseBody1 -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $prefixReuseBody1 -UseBasicParsing
     $prefixReuseChat1 = $prefixReuseResp1.Content | ConvertFrom-Json
 
     $prefixReuseBody2 = @{
@@ -290,7 +360,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 5
     $prefixReuseResp2 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $prefixReuseBody2 -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $prefixReuseBody2 -UseBasicParsing
     $prefixReuseChat2 = $prefixReuseResp2.Content | ConvertFrom-Json
     Check ($prefixReuseResp2.StatusCode -eq 200) "prefix reuse: extending-conversation request returns 200"
     if ($Layers -lt 0) {
@@ -310,7 +380,7 @@ try {
         stream      = $true
     } | ConvertTo-Json -Depth 5
     $streamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $streamBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $streamBody -UseBasicParsing
     Check ($streamResp.StatusCode -eq 200) "chat completion (streaming) returns 200"
     Check ($streamResp.Headers["Content-Type"] -like "text/event-stream*") "chat completion (streaming): Content-Type is text/event-stream"
     $rawEvents = $streamResp.Content -split "`n`n" | Where-Object { $_.Trim().Length -gt 0 }
@@ -356,7 +426,7 @@ try {
         stream_options = @{ include_usage = $true }
     } | ConvertTo-Json -Depth 5
     $streamUsageResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $streamUsageBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $streamUsageBody -UseBasicParsing
     Check ($streamUsageResp.StatusCode -eq 200) "chat completion (streaming, include_usage): returns 200"
     $usageEvents = $streamUsageResp.Content -split "`n`n" | Where-Object { $_.Trim().Length -gt 0 }
     Check ($usageEvents[-1] -eq "data: [DONE]") "chat completion (streaming, include_usage): last raw event is '[DONE]'"
@@ -389,14 +459,14 @@ try {
         max_tokens = 8; temperature = 0; stream = $false
     } | ConvertTo-Json -Depth 5
     Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $promptABody -UseBasicParsing | Out-Null
+        -ContentType "application/json; charset=utf-8" -Body $promptABody -UseBasicParsing | Out-Null
 
     $promptBBody = @{
         messages = @(@{ role = "user"; content = "Name a fruit that is not an apple." })
         max_tokens = 8; temperature = 0; stream = $false
     } | ConvertTo-Json -Depth 5
     $respB = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $promptBBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $promptBBody -UseBasicParsing
     Check ($respB.StatusCode -eq 200) "second (different-prompt) request returns 200"
 
     Start-Sleep -Milliseconds 500  # let the worker thread's one-line-per-request log land
@@ -428,7 +498,7 @@ try {
             stream      = $false
         } | ConvertTo-Json -Depth 5
         $draftResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $draftReqBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $draftReqBody -UseBasicParsing
         $draftChat = $draftResp.Content | ConvertFrom-Json
         Check ($draftResp.StatusCode -eq 200) "speculative path: greedy request returns 200"
         Check ($draftChat.timings.draft_n -gt 0) "speculative path: timings.draft_n > 0"
@@ -476,7 +546,7 @@ try {
             stream      = $false
         } | ConvertTo-Json -Depth 8
         $toolResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $toolReqBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $toolReqBody -UseBasicParsing
         $toolChat = $toolResp.Content | ConvertFrom-Json
         Check ($toolResp.StatusCode -eq 200) "tool round trip: tool-offering request returns 200"
         $gotCall = ($null -ne $toolChat.choices[0].message.tool_calls) -and ($toolChat.choices[0].message.tool_calls.Count -ge 1)
@@ -505,7 +575,7 @@ try {
                 stream      = $false
             } | ConvertTo-Json -Depth 8
             $followUpResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-                -ContentType "application/json" -Body $followUpBody -UseBasicParsing
+                -ContentType "application/json; charset=utf-8" -Body $followUpBody -UseBasicParsing
             $followUpChat = $followUpResp.Content | ConvertFrom-Json
             Check ($followUpResp.StatusCode -eq 200) "tool round trip: role:'tool' follow-up request returns 200"
             Check ([bool]$followUpChat.choices[0].message.content) "tool round trip: follow-up answer has non-empty content"
@@ -574,7 +644,7 @@ try {
         }
         foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] }
         $resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
         $parsed = $resp.Content | ConvertFrom-Json
         $hasDetails = $null -ne $parsed.usage -and
             ($parsed.usage.PSObject.Properties.Name -contains "completion_tokens_details")
@@ -634,7 +704,7 @@ try {
         foreach ($k in $bad.Extra.Keys) { $body[$k] = $bad.Extra[$k] }
         try {
             Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-                -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing | Out-Null
+                -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing | Out-Null
             Check $false "thinking controls: $($bad.Label) is rejected with 400"
         } catch {
             $status = $_.Exception.Response.StatusCode.value__
@@ -654,7 +724,7 @@ try {
             stream               = $false
         } | ConvertTo-Json -Depth 5
         $thinkResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $thinkBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $thinkBody -UseBasicParsing
         Check ($thinkResp.StatusCode -eq 200) "reasoning_content (non-streaming): request returns 200"
         $thinkChat = $thinkResp.Content | ConvertFrom-Json
         $reasoningContent = $thinkChat.choices[0].message.reasoning_content
@@ -676,7 +746,7 @@ try {
             stream               = $true
         } | ConvertTo-Json -Depth 5
         $thinkStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $thinkStreamBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $thinkStreamBody -UseBasicParsing
         Check ($thinkStreamResp.StatusCode -eq 200) "reasoning_content (streaming): request returns 200"
         $thinkStreamEvents = $thinkStreamResp.Content -split "`n`n" | Where-Object { $_.Trim().Length -gt 0 }
         $sawReasoningDelta = $false
@@ -748,7 +818,7 @@ try {
             stream               = $false
         } | ConvertTo-Json -Depth 8
         $thinkToolNonStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $thinkToolNonStreamBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $thinkToolNonStreamBody -UseBasicParsing
         $thinkToolNonStreamChat = $thinkToolNonStreamResp.Content | ConvertFrom-Json
         $ttNonStreamContent = [string]$thinkToolNonStreamChat.choices[0].message.content
         Check ($ttContent -ceq $ttNonStreamContent) `
@@ -764,7 +834,7 @@ try {
             stream               = $false
         } | ConvertTo-Json -Depth 5
         $noThinkResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $noThinkBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $noThinkBody -UseBasicParsing
         Check ($noThinkResp.StatusCode -eq 200) "enable_thinking=false: request returns 200"
         Check (-not $noThinkResp.Content.Contains("reasoning_content")) `
             "enable_thinking=false: no reasoning_content key in the non-streaming response"
@@ -777,7 +847,7 @@ try {
             stream               = $true
         } | ConvertTo-Json -Depth 5
         $noThinkStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $noThinkStreamBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $noThinkStreamBody -UseBasicParsing
         Check (-not $noThinkStreamResp.Content.Contains("reasoning_content")) `
             "enable_thinking=false: no reasoning_content key in any streamed chunk"
 
@@ -797,7 +867,7 @@ try {
             }
             foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] }
             $r = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-                -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
+                -ContentType "application/json; charset=utf-8" -Body ($body | ConvertTo-Json -Depth 6) -UseBasicParsing
             [pscustomobject]@{ Raw = $r.Content; Json = ($r.Content | ConvertFrom-Json) }
         }
 
@@ -938,7 +1008,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 8
     $proseNonStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $proseNonStreamBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $proseNonStreamBody -UseBasicParsing
     $proseNonStreamChat = $proseNonStreamResp.Content | ConvertFrom-Json
     $proseNonStreamContent = [string]$proseNonStreamChat.choices[0].message.content
     # -ceq, not -eq: PowerShell's -eq is case-INSENSITIVE on strings, which would let a byte
@@ -963,7 +1033,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 8
     $toolsStopResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $toolsStopBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $toolsStopBody -UseBasicParsing
     $toolsStopChat = $toolsStopResp.Content | ConvertFrom-Json
     Check ($toolsStopResp.StatusCode -eq 200) "tools+stop: request returns 200"
     $toolsStopContent = $toolsStopChat.choices[0].message.content
@@ -986,7 +1056,7 @@ try {
         stream      = $false
     } | ConvertTo-Json -Depth 5
     $functionRoleResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-        -ContentType "application/json" -Body $functionRoleBody -UseBasicParsing
+        -ContentType "application/json; charset=utf-8" -Body $functionRoleBody -UseBasicParsing
     Check ($functionRoleResp.StatusCode -eq 200) "role:'function' message renders and returns 200 (was 500)"
 
     # ---- messages with no user turn (only role:"tool") is a clean 400, not a 500 ----------------
@@ -1003,24 +1073,361 @@ try {
     } | ConvertTo-Json -Depth 5
     try {
         Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $noUserBody -UseBasicParsing | Out-Null
+            -ContentType "application/json; charset=utf-8" -Body $noUserBody -UseBasicParsing | Out-Null
         Check $false "messages with no user turn returns 400 (was 500)"
     } catch {
         $status = $_.Exception.Response.StatusCode.value__
         Check ($status -eq 400) "messages with no user turn returns 400, not 500 (got $status)"
     }
 
-    # ---- 400 on an unsupported (image) content part ----------------------------------------------
-    $badBody = @{
+    # ---- images (docs/vision.md, docs/server.md's "Images") --------------------------------------
+    # A remote (never-fetched) image URL is a clean 400 regardless of whether the loaded container
+    # has a vision tower at all -- this validation happens at request-PARSE time, before the engine
+    # ever asks the Model anything (openai_types.cpp), so it is checked unconditionally here.
+    $remoteImageBody = @{
         messages = @(@{ role = "user"; content = @(@{ type = "image_url"; image_url = @{ url = "http://x" } }) })
     } | ConvertTo-Json -Depth 5
     try {
         Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $badBody -UseBasicParsing | Out-Null
-        Check $false "image content part returns 400"
+            -ContentType "application/json; charset=utf-8" -Body $remoteImageBody -UseBasicParsing | Out-Null
+        Check $false "remote image_url returns 400 (never fetched)"
     } catch {
         $status = $_.Exception.Response.StatusCode.value__
-        Check ($status -eq 400) "image content part returns 400 (got $status)"
+        Check ($status -eq 400) "remote image_url returns 400, never fetched (got $status)"
+    }
+
+    if (-not $Vision) {
+        # The default run (this container has no vision.* tensors): a well-formed LOCAL image must
+        # still be rejected, cleanly, naming the real reason -- not the old blanket "not
+        # implemented" 400, and never a crash or a hang trying to load a tower that isn't there.
+        $localImageBody = @{
+            messages = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = (Image-DataUri (New-SyntheticShapesImageBase64)) } },
+                @{ type = "text"; text = "Describe this image." }
+            ) })
+        } | ConvertTo-Json -Depth 6
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json; charset=utf-8" -Body $localImageBody -UseBasicParsing | Out-Null
+            Check $false "image on a non-vision container returns 400 'this model/container has no vision tower'"
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            $errBody = $null
+            try { $errBody = ($_.ErrorDetails.Message | ConvertFrom-Json).error.message } catch {}
+            Check ($status -eq 400 -and $errBody -like "*no vision tower*") `
+                ("image on a non-vision container returns a clean 400 naming the reason " +
+                 "(status=$status message='$errBody')")
+        }
+        Write-Output "  [SKIP] full vision suite (pass -Vision with a real vision-capable container, -Layers -1)"
+    } else {
+        # ---- -Vision: the full image suite, against a real vision-capable container ---------------
+        if ($Layers -ge 0) {
+            Write-Output "  [WARN] -Vision was passed with -Layers $Layers (not -1) -- the shapes/OCR " +
+                          "checks below assume a real container and may not mean much on a partial one"
+        }
+        $shapesImg = Image-DataUri (New-SyntheticShapesImageBase64)
+        $ocrText = "R4DXVSN9"
+        $ocrImg = Image-DataUri (New-OcrImageBase64 -Text $ocrText)
+        $otherShapesImg = Image-DataUri (New-SyntheticShapesImageBase64)  # a SECOND, independently
+                                                                            # generated PNG -- not
+                                                                            # byte-identical to
+                                                                            # $shapesImg (fresh
+                                                                            # gradient/ellipse render)
+
+        # ---- describe the synthetic image -----------------------------------------------------
+        $describeBody = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "text"; text = "Describe this image in one short sentence." }
+            ) })
+            max_tokens  = 64
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 6
+        $describeResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $describeBody -UseBasicParsing
+        $describeChat = $describeResp.Content | ConvertFrom-Json
+        Check ($describeResp.StatusCode -eq 200) "vision: describe request returns 200"
+        Check ([bool]$describeChat.choices[0].message.content) "vision: describe response has non-empty content"
+        Check ($describeChat.usage.prompt_tokens -gt 50) `
+            "vision: describe usage.prompt_tokens ($($describeChat.usage.prompt_tokens)) reflects real spliced image tokens (>50)"
+        Check ($describeChat.timings.image_n -eq 1) "vision: describe timings.image_n == 1"
+        Check ($describeChat.timings.image_ms -gt 0) "vision: describe timings.image_ms > 0"
+
+        # ---- OCR: the model must read the known string back exactly ----------------------------
+        $ocrBody = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $ocrImg } },
+                @{ type = "text"; text = "Read the text in this image and reply with exactly that text, nothing else." }
+            ) })
+            max_tokens  = 16
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 6
+        $ocrResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $ocrBody -UseBasicParsing
+        $ocrChat = $ocrResp.Content | ConvertFrom-Json
+        Check ($ocrResp.StatusCode -eq 200) "vision: OCR request returns 200"
+        $ocrAnswer = [string]$ocrChat.choices[0].message.content
+        Check ($ocrAnswer.Contains($ocrText)) `
+            "vision: OCR response contains the rendered string '$ocrText' (got '$ocrAnswer')"
+
+        # ---- two images in one request ----------------------------------------------------------
+        $twoImgBody = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "image_url"; image_url = @{ url = $ocrImg } },
+                @{ type = "text"; text = "How many images did I just show you?" }
+            ) })
+            max_tokens  = 32
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 6
+        $twoImgResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $twoImgBody -UseBasicParsing
+        $twoImgChat = $twoImgResp.Content | ConvertFrom-Json
+        Check ($twoImgResp.StatusCode -eq 200) "vision: two-images-in-one-request returns 200"
+        Check ([bool]$twoImgChat.choices[0].message.content) "vision: two-images response has non-empty content"
+        Check ($twoImgChat.timings.image_n -eq 2) "vision: two-images timings.image_n == 2"
+
+        # ---- image + tools ------------------------------------------------------------------------
+        $imgToolBody = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "text"; text = "What is the weather like in Boston, MA? Use the tool if you need to." }
+            ) })
+            tools       = @($proseTool)
+            max_tokens  = 64
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 8
+        $imgToolResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $imgToolBody -UseBasicParsing
+        Check ($imgToolResp.StatusCode -eq 200) "vision: image + tools returns 200"
+
+        # ---- image + thinking on ------------------------------------------------------------------
+        $imgThinkBody = @{
+            messages             = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "text"; text = "Describe this image." }
+            ) })
+            chat_template_kwargs = @{ enable_thinking = $true }
+            max_tokens           = 256
+            temperature          = 0
+            stream               = $false
+        } | ConvertTo-Json -Depth 8
+        $imgThinkResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $imgThinkBody -UseBasicParsing
+        $imgThinkChat = $imgThinkResp.Content | ConvertFrom-Json
+        Check ($imgThinkResp.StatusCode -eq 200) "vision: image + thinking returns 200"
+        Check ([bool]$imgThinkChat.choices[0].message.reasoning_content) `
+            "vision: image + thinking produces non-empty reasoning_content"
+
+        # ---- streaming -------------------------------------------------------------------------
+        $imgStreamBody = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "text"; text = "Describe this image in one short sentence." }
+            ) })
+            max_tokens  = 64
+            temperature = 0
+            stream      = $true
+        } | ConvertTo-Json -Depth 6
+        $imgSse = Invoke-SseStream -Uri "$BaseUrl/v1/chat/completions" -Body $imgStreamBody
+        $imgStreamedContent = ""
+        foreach ($ev in $imgSse.Events) {
+            if ($ev.Data -eq "[DONE]") { continue }
+            $c = $ev.Data | ConvertFrom-Json
+            if ($c.choices.Count -eq 0) { continue }
+            $delta = $c.choices[0].delta
+            if ($null -ne $delta -and ($delta.PSObject.Properties.Name -contains "content") -and $null -ne $delta.content) {
+                $imgStreamedContent += $delta.content
+            }
+        }
+        Check ([bool]$imgStreamedContent) "vision: streaming image request produces non-empty streamed content"
+
+        # ---- multi-turn reuse: turn 2 must NOT re-encode the image ------------------------------
+        # A one-word yes/no answer, not a full described sentence: this check's own point is the
+        # image-aware prefix-cache mechanism (PrefixState::ImageKey), not whether an arbitrary real
+        # generation round-trips byte-for-byte back through re-tokenization once replayed as a
+        # plain-string `assistant` message -- a real (if narrow) risk for ANY server that matches
+        # prefixes by re-tokenizing client-supplied text, independent of images entirely. The
+        # "vision multi-turn (free-form)" case below is the one that replays a real, non-ASCII
+        # model answer and asserts reuse still holds, so nothing here is avoided by keeping this
+        # first case small -- it is only kept small so a failure points at the image mechanism.
+        #
+        # NB every Invoke-WebRequest in this script sends `charset=utf-8` (2026-09-22). PowerShell
+        # 5.1 encodes a -Body STRING with the content type's charset, and with a bare
+        # "application/json" it falls back to Latin-1: every non-ASCII character in a replayed
+        # answer (the en-dashes a real description is full of) reaches the server mangled, the
+        # re-rendered prompt then genuinely differs from what was committed, and the prefix is
+        # correctly NOT reused. That is a CLIENT bug, and without the charset this script would
+        # measure it and blame the server.
+        $turn1Body = @{
+            messages    = @(@{ role = "user"; content = @(
+                @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                @{ type = "text"; text = "Is there a circle in this image? Reply with exactly one word: yes or no." }
+            ) })
+            max_tokens  = 4
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 6
+        $turn1Resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $turn1Body -UseBasicParsing
+        $turn1Chat = $turn1Resp.Content | ConvertFrom-Json
+        Check ($turn1Resp.StatusCode -eq 200) "vision multi-turn: turn 1 returns 200"
+        Check ($turn1Chat.timings.image_n -eq 1) "vision multi-turn: turn 1 timings.image_n == 1 (real encode)"
+
+        $turn2Body = @{
+            messages    = @(
+                @{ role = "user"; content = @(
+                    @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+                    @{ type = "text"; text = "Is there a circle in this image? Reply with exactly one word: yes or no." }
+                ) },
+                @{ role = "assistant"; content = $turn1Chat.choices[0].message.content },
+                @{ role = "user"; content = "Now tell me what color the background gradient is." }
+            )
+            max_tokens  = 32
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 8
+        $turn2Resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $turn2Body -UseBasicParsing
+        $turn2Chat = $turn2Resp.Content | ConvertFrom-Json
+        Check ($turn2Resp.StatusCode -eq 200) "vision multi-turn: turn 2 (same image, new text) returns 200"
+        Check (-not ($turn2Chat.timings.PSObject.Properties.Name -contains "image_n")) `
+            "vision multi-turn: turn 2 timings carries NO image_n (the image was NOT re-encoded)"
+        Check ($turn2Chat.timings.prompt_n -lt $turn2Chat.usage.prompt_tokens) `
+            ("vision multi-turn: turn 2 timings.prompt_n ($($turn2Chat.timings.prompt_n)) < " +
+             "usage.prompt_tokens ($($turn2Chat.usage.prompt_tokens)) -- only the new tail was prefilled")
+
+        # ---- different-image-same-text: must NOT reuse the prefix -------------------------------
+        # Same conversation shape as turn 2 above, but turn 1's OWN image is swapped for a
+        # DIFFERENT one at the identical position -- every image placeholder is the same token id
+        # (docs/vision.md), so token equality alone would wrongly call this a prefix match.
+        $diffImgTurn2Body = @{
+            messages    = @(
+                @{ role = "user"; content = @(
+                    @{ type = "image_url"; image_url = @{ url = $otherShapesImg } },
+                    @{ type = "text"; text = "Is there a circle in this image? Reply with exactly one word: yes or no." }
+                ) },
+                @{ role = "assistant"; content = $turn1Chat.choices[0].message.content },
+                @{ role = "user"; content = "Now tell me what color the background gradient is." }
+            )
+            max_tokens  = 32
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 8
+        $diffImgResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $diffImgTurn2Body -UseBasicParsing
+        $diffImgChat = $diffImgResp.Content | ConvertFrom-Json
+        Check ($diffImgResp.StatusCode -eq 200) "vision multi-turn (different image): request returns 200"
+        Check ($diffImgChat.timings.prompt_n -eq $diffImgChat.usage.prompt_tokens) `
+            ("vision multi-turn (different image): prefix NOT reused -- timings.prompt_n " +
+             "($($diffImgChat.timings.prompt_n)) == usage.prompt_tokens ($($diffImgChat.usage.prompt_tokens))")
+        Check ($diffImgChat.timings.image_n -ge 1) `
+            "vision multi-turn (different image): the new image WAS encoded this request (image_n >= 1)"
+
+        # ---- multi-turn with a REAL, free-form NON-ASCII turn-1 answer --------------------------
+        # Added 2026-09-22 after a review pass reported that reuse collapses whenever the replayed
+        # answer carries any non-ASCII character. Part of that was the Latin-1 client-encoding
+        # artifact described above (fixed), but with a correctly-encoded body the underlying
+        # tokenizer round-trip gap is still real and STRING-DEPENDENT: measured on this build, a
+        # 25-char Japanese sentence, a Korean one, emoji and em/en dashes all round-trip and reuse,
+        # while an 84-char Japanese answer and a 104-char Thai one do not. See docs/server.md's
+        # "Prefix cache, image-aware".
+        #
+        # So this case does NOT assert reuse -- that would be a coin flip on the exact sentence the
+        # model happens to produce. It asserts what must hold either way: the turn answers
+        # correctly, and the two outcomes stay CONSISTENT -- either the prefix was reused and no
+        # image was re-encoded, or it was not and the image was re-encoded and the whole prompt
+        # re-prefilled. The silent corruption this guards against is the third combination: a
+        # reused prefix whose image rows were dropped, or a re-prefill that skipped the re-encode.
+        # Asking for Japanese makes turn 1 non-ASCII by construction (an unconstrained "describe
+        # this image" often comes back pure ASCII for these synthetic shapes, which would let the
+        # case pass without exercising anything); the check below fails if it somehow does not.
+        $freeQuestion = "Describe this image in one short sentence, in Japanese."
+        $freeUser = @{ role = "user"; content = @(
+            @{ type = "image_url"; image_url = @{ url = $shapesImg } },
+            @{ type = "text"; text = $freeQuestion }
+        ) }
+        $freeTurn1Body = @{ messages = @($freeUser); max_tokens = 80; temperature = 0; stream = $false } |
+            ConvertTo-Json -Depth 6
+        $freeTurn1 = (Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $freeTurn1Body -UseBasicParsing).Content | ConvertFrom-Json
+        $freeAnswer = $freeTurn1.choices[0].message.content
+        $freeNonAscii = ($freeAnswer.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count
+        Check ($freeTurn1.timings.image_n -eq 1) "vision multi-turn (free-form): turn 1 encoded the image"
+        Check ($freeNonAscii -gt 0) `
+            "vision multi-turn (free-form): turn 1 answered with non-ASCII text ($freeNonAscii char(s)) -- the case is live"
+
+        $freeTurn2Body = @{
+            messages    = @($freeUser, @{ role = "assistant"; content = $freeAnswer },
+                             @{ role = "user"; content = "Now answer with the single word OK." })
+            max_tokens  = 8
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 8
+        $freeTurn2Resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $freeTurn2Body -UseBasicParsing
+        $freeTurn2 = $freeTurn2Resp.Content | ConvertFrom-Json
+        $freeReused = $freeTurn2.timings.prompt_n -lt $freeTurn2.usage.prompt_tokens
+        $freeReencoded = $freeTurn2.timings.PSObject.Properties.Name -contains "image_n"
+        Check ($freeTurn2Resp.StatusCode -eq 200) `
+            "vision multi-turn (free-form): turn 2 returns 200 after a $freeNonAscii-non-ASCII-char reply"
+        Check ([bool]$freeTurn2.choices[0].message.content) `
+            "vision multi-turn (free-form): turn 2 produced non-empty content"
+        if ($freeReused) {
+            Check (-not $freeReencoded) `
+                ("vision multi-turn (free-form): prefix REUSED (timings.prompt_n $($freeTurn2.timings.prompt_n) " +
+                 "< usage.prompt_tokens $($freeTurn2.usage.prompt_tokens)) and the image was NOT re-encoded")
+        } else {
+            Check ($freeReencoded -and $freeTurn2.timings.image_n -ge 1) `
+                ("vision multi-turn (free-form): prefix NOT reused (this answer did not survive the " +
+                 "tokenizer round trip) and the image WAS re-encoded -- full re-prefill of " +
+                 "$($freeTurn2.usage.prompt_tokens) token(s), image_n=$($freeTurn2.timings.image_n)")
+        }
+
+        # ---- bad inputs: unsupported format, corrupt data, oversize, too many images -----------
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post -ContentType "application/json; charset=utf-8" `
+                -Body (@{ messages = @(@{ role = "user"; content = @(
+                    @{ type = "image_url"; image_url = @{ url = "data:image/webp;base64,UklGRhoAAABXRUJQVlA4TA0AAAA" } }) }) } | ConvertTo-Json -Depth 6) `
+                -UseBasicParsing | Out-Null
+            Check $false "vision bad input: unsupported format (webp) returns 400"
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            Check ($status -eq 400) "vision bad input: unsupported format (webp) returns 400 (got $status)"
+        }
+        try {
+            Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post -ContentType "application/json; charset=utf-8" `
+                -Body (@{ messages = @(@{ role = "user"; content = @(
+                    @{ type = "image_url"; image_url = @{ url = "data:image/png;base64,dGhpcyBpcyBub3QgYSBwbmc=" } }) }) } | ConvertTo-Json -Depth 6) `
+                -UseBasicParsing | Out-Null
+            Check $false "vision bad input: corrupt image data returns 400"
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            Check ($status -eq 400) "vision bad input: corrupt image data returns 400 (got $status)"
+        }
+        try {
+            $tooMany = @()
+            for ($i = 0; $i -lt 9; $i++) { $tooMany += @{ type = "image_url"; image_url = @{ url = $ocrImg } } }
+            Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post -ContentType "application/json; charset=utf-8" `
+                -Body (@{ messages = @(@{ role = "user"; content = $tooMany }) } | ConvertTo-Json -Depth 6) `
+                -UseBasicParsing | Out-Null
+            Check $false "vision bad input: 9 images in one request returns 400 (max 8)"
+        } catch {
+            $status = $_.Exception.Response.StatusCode.value__
+            Check ($status -eq 400) "vision bad input: 9 images in one request returns 400 (got $status)"
+        }
+
+        # ---- /v1/models advertises the vision capability now -----------------------------------
+        $visionModelsResp = Invoke-WebRequest -Uri "$BaseUrl/v1/models" -UseBasicParsing
+        $visionModels = $visionModelsResp.Content | ConvertFrom-Json
+        Check (($visionModels.data[0].architecture.input_modalities) -contains "image") `
+            "vision: /v1/models architecture.input_modalities contains 'image'"
+        Check (($visionModels.data[0].capabilities) -contains "image") `
+            "vision: /v1/models capabilities contains 'image'"
     }
 
     # ---- Sampled speculative decode (Milestone 6 stage S3, docs/sampling.md section 9/10): lifting
@@ -1051,7 +1458,7 @@ try {
             stream      = $false
         } | ConvertTo-Json -Depth 5
         $seededResp1 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $seededSampledBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $seededSampledBody -UseBasicParsing
         $seededChat1 = $seededResp1.Content | ConvertFrom-Json
         Check ($seededResp1.StatusCode -eq 200) "sampled speculative path: seeded temperature=0.7 request returns 200"
         Check ($seededChat1.timings.draft_n -gt 0) "sampled speculative path: timings.draft_n > 0"
@@ -1059,7 +1466,7 @@ try {
             "sampled speculative path: timings.draft_n_accepted <= timings.draft_n"
 
         $seededResp2 = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
-            -ContentType "application/json" -Body $seededSampledBody -UseBasicParsing
+            -ContentType "application/json; charset=utf-8" -Body $seededSampledBody -UseBasicParsing
         $seededChat2 = $seededResp2.Content | ConvertFrom-Json
         Check ($seededResp2.StatusCode -eq 200) "sampled speculative path: repeat of the same seeded request returns 200"
         Check ($seededChat1.choices[0].message.content -eq $seededChat2.choices[0].message.content) `

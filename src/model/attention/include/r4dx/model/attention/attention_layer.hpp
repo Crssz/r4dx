@@ -86,6 +86,14 @@ class AttentionLayer {
   // matches, checked per-weight -- see k_shares_pre/v_shares_pre below); `next_epilogue`/
   // `next_epilogue_out`/`next_epilogue_scale` request this call's own residual+rmsnorm epilogue
   // also emit x_normed_out's fused quant epilogue for the immediately-following Mlp.
+  //
+  // `rope_pos3` (vision milestone, docs/vision.md "Text-side splicing"): device int32[3, T]
+  // (contiguous, t row then h then w) giving this chunk's 3-axis mrope ROPE positions, which a
+  // prompt containing an image makes DIFFERENT from `positions`. `positions` keeps its original
+  // meaning in that case -- it is the KV slot_mapping and the paged cache's sequence index, both
+  // of which must stay the plain running token index -- and only the rope call switches to
+  // r4dx_rope_partial_mrope3_bf16. nullptr (the default, and every text-only caller) keeps the
+  // pre-vision single-row path, byte for byte.
   void Forward(core::Arena& arena, const uint16_t* hidden_in, uint16_t* out, const AttnWeights& w,
                PagedKvCache& kv, int T, int start_pos, const int32_t* positions,
                const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
@@ -93,7 +101,7 @@ class AttentionLayer {
                SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
                const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
                int next_epilogue = 0, void* next_epilogue_out = nullptr,
-               float* next_epilogue_scale = nullptr) {
+               float* next_epilogue_scale = nullptr, const int32_t* rope_pos3 = nullptr) {
     if (T < 1 || T > 64) {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
@@ -207,12 +215,23 @@ class AttentionLayer {
                          cfg_.rms_eps, reinterpret_cast<int64_t>(stream));
     });
 
-    // ---- partial-rotary mrope (text-only: all three position streams == token position) --------
+    // ---- partial-rotary mrope ------------------------------------------------------------------
+    // Text-only (rope_pos3 == nullptr): all three position streams equal the token position, so the
+    // single-row entry point is exactly equivalent and is what every pre-vision caller keeps using.
+    // Multimodal: the (t,h,w) rows diverge from `positions` -- see this method's doc comment.
     ProfiledCall(prof, stream, "attn.rope", [&] {
-      r4dx_rope_partial_mrope_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
-                                    reinterpret_cast<int64_t>(positions), T, H, Hkv, D,
-                                    cfg_.rotary_dim, cfg_.rope_theta,
-                                    reinterpret_cast<int64_t>(stream));
+      if (rope_pos3 != nullptr) {
+        r4dx_rope_partial_mrope3_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
+                                       reinterpret_cast<int64_t>(rope_pos3), T, H, Hkv, D,
+                                       cfg_.rotary_dim, cfg_.rope_theta, cfg_.mrope_section_t,
+                                       cfg_.mrope_section_h, cfg_.mrope_section_w,
+                                       reinterpret_cast<int64_t>(stream));
+      } else {
+        r4dx_rope_partial_mrope_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
+                                      reinterpret_cast<int64_t>(positions), T, H, Hkv, D,
+                                      cfg_.rotary_dim, cfg_.rope_theta,
+                                      reinterpret_cast<int64_t>(stream));
+      }
     });
 
     // ---- fp8 paged KV cache write (post-rope K, per docs/architecture.md) -- BEFORE the attn call

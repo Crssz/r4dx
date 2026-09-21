@@ -1,5 +1,54 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 8, stage 8: vision + speculation, integrated headline (2026-09-22)
+
+Real 64-layer container `qwen38-27b-v3.r4dx`, `w4a16`, greedy (`--temperature 0`, `--seed 42`),
+`--max-ctx 2048`, HIP device 1, one process at a time, three locally-rendered synthetic shape
+images (System.Drawing, no files committed, no network, no licence question). Every cell below is
+measured twice; every pair agrees to well under the 3% "report both" threshold (differences shown
+are run-to-run noise, not a trend).
+
+**Image encode cost and token count** (`r4dx-cli --image ... --stats`, prompt "Name the three
+shapes in this image.", 48 decoded tokens):
+
+| Image | Image tokens spliced | Encode ms (twice) | Prefill tok (twice: 218/1046) | Prefill tok/s (twice) |
+|---|---|---|---|---|
+| 448x448 | 196 | 34.0, 33.3 | 218 | 999.30, 994.24 |
+| 1024x1024 | 1024 | 159.4, 158.4 | 1046 | 1001.87, 1003.10 |
+| 1536x1536 (downsized by the default `--image-max-pixels 1048576` cap) | 1024 | 161.0, 159.9 | 1046 | 999.73, 998.44 |
+
+Same finding as the prior stage's own measurement: at the default cap a 1536x1536 image and a
+1024x1024 image are identical work (`smart_resize` downsizes the larger one to the same
+1048576-pixel/1024-token budget), and image tokens prefill at the text-token rate (~995-1003 tok/s
+here vs this file's own text-only prefill figures elsewhere, all in the same band).
+
+**Decode + acceptance on an image prompt** (1024x1024 image, prompt "Describe this image in detail,
+including colors and positions.", `--max-tokens 200`, twice each):
+
+| Config | Decode tok/s (twice) | Acceptance | Tok/round |
+|---|---|---|---|
+| plain (`--mtp 0`) | 38.59, 38.53 | -- | 1.0 |
+| `--mtp 3` | 79.46, 79.41 | 58.5% (53 rounds, 159 drafted, 93 accepted) | 2.70 |
+| `--dflash k=7` | 86.89, 86.86 | 33.1% (60 rounds, 420 drafted, 139 accepted) | 3.33 |
+
+Both speculative paths run unmodified with an image spliced into the prefill -- no vision-specific
+interaction with the verify/draft mechanism.
+
+**VRAM: vision loaded vs `--vision off`** (text-only prompt, otherwise identical flags, twice for
+`--vision off`, twice for the default `auto`/loaded path):
+
+```
+--vision off    container load 7.31s/7.26s, VRAM used 16.17 GiB (delta 16.02 GiB), decode 38.79/38.81 tok/s
+--vision auto   container load 7.72s/7.70s, VRAM used 17.03/17.04 GiB (delta 16.89 GiB), decode 38.75/38.78 tok/s
+```
+
+**+0.86-0.87 GiB** for the resident tower, consistent with the tower's own previously-measured
+0.9154 GiB bf16 footprint (small variance is allocation rounding, not a new cost). **Text-only
+decode is unaffected by the tower being loaded** (38.75-38.81 tok/s whether `--vision off` or
+`auto`, all inside this file's usual noise band) and **matches this file's own w4a16 `--mtp 0`
+baseline range** (38.18-38.98 tok/s across every prior measurement pass in this document) -- **no
+regression**.
+
 ## Milestone 6, stage S3: sampled speculative decode -- current headline (2026-09-21)
 
 Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx` (+ real w4a16 DFlash2 draft container
@@ -229,12 +278,61 @@ generation coherent and on-topic (haiku + two-sentence GPU explanation). Consist
 R13/Q17 pass's own 32768-adjacent curve (36.11 tok/s decode at that pass's 32768 point) -- long
 context still works correctly after every Milestone 4 code change.
 
-**Vision**: no run performed. The vision-tower stage (2026-09-20) produced real-hardware Python
-golden reference data (`tools/reference/vision_golden.py`, `docs/vision.md`) but **no C++
-implementation landed in `src/model`** -- there is no `--image` CLI flag, no server `image_url`
-forward pass, and no engine code path to run. This is not a narrowed scope: it is the same "not
-started" state that stage's own report left, re-confirmed by grepping `src/` for vision call sites
-(none exist) before writing this section.
+**Vision** *(measured 2026-09-22, review-fix pass; the Milestone 4 pass above predates the vision
+milestone and ran nothing here)*: the full path exists and was run end to end -- `r4dx-cli --image`
+and the server's `image_url` both encode, splice and prefill. Real 64-layer container, `w4a16`,
+greedy, `--max-ctx 8192`, HIP device 1, three locally-rendered shape images (no network, no licence
+question). Every number below is one run, not a best-of.
+
+`r4dx-cli --image ... --stats`, one image per run, prompt "Name the three shapes in this image.",
+48 decoded tokens:
+
+| image | image tokens spliced | encode ms | prefill tok | prefill tok/s | decode tok/s | VRAM |
+|---|---|---|---|---|---|---|
+| 448x448 | 196 | **32.2** | 218 | 1006.28 | 38.65 | 17.25 GiB |
+| 1024x1024 | 1024 | **155.4** | 1046 | 1012.71 | 38.50 | 17.31 GiB |
+| 1536x1536 (downsized by the default `--image-max-pixels 1048576`) | 1024 | **158.2** | 1046 | 1009.28 | 38.53 | 17.31 GiB |
+| 1536x1536, `--image-max-pixels 2359296` (cap raised so the image is NOT downsized) | 2304 | **408.7** | 2326 | 1000.95 | 38.42 | 17.39 GiB |
+
+Encode cost is close to linear in merged tokens (0.164 / 0.152 / 0.177 ms per token across the
+three grids) -- consistent with docs/vision.md's own finding that the 64-row GEMM cap dominates.
+Note rows 2 and 3: at the default cap a 1536x1536 image and a 1024x1024 image are the *same* work,
+because `smart_resize` downsizes the larger one to the 1048576-pixel budget rather than rejecting
+it.
+
+Server (`r4dx-server` on a private port, same container, `timings` from the response body):
+
+| image | `timings.image_n` | `timings.image_ms` | `prompt_n` | `prompt_per_second` | decode tok/s |
+|---|---|---|---|---|---|
+| 448x448 | 1 | **37.40** | 215 | 996.55 | 38.36 |
+| 1024x1024 | 1 | **151.44** | 1043 | 1006.37 | 38.31 |
+| 1536x1536 (downsized) | 1 | **151.18** | 1043 | 1006.65 | 38.30 |
+
+**Image tokens prefill at the same rate as text tokens** -- text-only on the same server measured
+1040.25 tok/s at 190 tokens, 1008.30 at 903 and 974.01 at 5912, bracketing the 996-1007 tok/s the
+image prompts got at 215 and 1043. So the whole vision cost is the encode itself plus the image's
+own tokens' ordinary prefill time; nothing in the splice or the 3-axis mrope path shows up as a
+throughput penalty. Decode is likewise untouched: 38.3-38.7 tok/s with an image versus 38.70
+text-only on the same binary, all inside this file's usual +-1.5% noise band.
+
+**VRAM cost of the tower** (`--vision auto` vs `--vision off`, identical otherwise):
+
+```
+--vision off   weights=15.5076 GiB, kv+gdn=0.59375, arena+scratch=0.09375   (process total 16.36 GiB)
+--vision auto  weights=16.4230 GiB, kv+gdn=0.53125, arena+scratch=0.106201  (process total 17.22 GiB)
+```
+
+**+0.9154 GiB**, matching the vision-tower stage's own figure exactly: 0.858177 GiB of bf16 tensors
+plus ~57 MiB of `hipMalloc` rounding across 333 separate small allocations (docs/vision.md "Known
+limitations", item 1). A text-only run with the tower resident decodes at 38.70 tok/s against
+38.77 with `--vision off` -- i.e. the tower costs VRAM and nothing else when no image is sent.
+
+**Multi-turn**: a second turn against an already-fed image reuses the prefix -- `timings.prompt_n`
+22 of 297, and no `image_n` key at all, so the ~37 ms encode is not repeated (docs/server.md,
+"Prefix cache, image-aware").
+
+Not measured here: video (`t > 1`), a batch of images large enough to hit `kMaxImagesPerRequest`,
+and any layout other than `w4a16`.
 
 **Consolidated Milestone 1 -> 2 -> 3 -> 4 table** (w4a8/w4a16/mxfp4 only, per the standing bf16-
 retirement rule; `--mtp 0` decode/prefill/VRAM, and each milestone's own best-`K` decode, real

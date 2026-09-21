@@ -201,7 +201,7 @@ double GiB(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.
 
 Container Container::Load(const std::string& path, Layout layout, Layout lm_head_layout,
                            int64_t layer_limit, Layout mtp_head_layout,
-                           bool embed_device_resident) {
+                           bool embed_device_resident, bool load_vision) {
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
@@ -212,6 +212,13 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
                                         ? model_config.at("text_config")
                                         : model_config;  // selftest containers have no text_config
   c.config_ = ModelConfig::FromJson(text_cfg);
+  // Top-level (not text_config/vision_config) -- see Container::ImageTokenId's doc comment.
+  if (model_config.contains("image_token_id")) {
+    c.image_token_id_ = model_config.at("image_token_id").get<int64_t>();
+  }
+  if (model_config.contains("video_token_id")) {
+    c.video_token_id_ = model_config.at("video_token_id").get<int64_t>();
+  }
 
   SafetensorsReader reader(Utf8ToWide(path));
 
@@ -368,6 +375,20 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
           LoadQuantLinear(reader, "mtp.draft_head.lm_head", mtp_head_layout, draft_vocab_size, hidden);
     }
     c.mtp_ = std::move(mw);
+  }
+
+  // vision.* (docs/container-format.md, docs/vision.md "Load policy"): probed the same way mtp.*
+  // is -- one representative tensor rather than a metadata field -- and uploaded only when the
+  // caller asked, because it is ~0.90 GiB a text-only run must not pay for. `vision_config` comes
+  // from the container's own metadata; a container that carries the tensors but no vision_config
+  // block is a converter bug, so that combination throws rather than defaulting a geometry.
+  c.container_has_vision_tensors_ = vision::HasVisionTensors(reader);
+  if (load_vision && c.container_has_vision_tensors_) {
+    if (!model_config.contains("vision_config")) {
+      throw std::runtime_error("r4dx::model::Container: " + path +
+                                " carries vision.* tensors but no model_config.vision_config");
+    }
+    c.vision_ = vision::LoadVisionWeights(reader, model_config.at("vision_config"));
   }
 
   // R14 (docs/r9700.md): warn, don't fail, if this load just consumed more VRAM than was free

@@ -335,6 +335,71 @@ void TestDflashFlags() {
   }
 }
 
+// --vision / --image-max-pixels (docs/vision.md "Load policy" / "Large images").
+void TestVisionFlags() {
+  auto parse = [](std::vector<std::string> extra) {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    return r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+  };
+  auto rejects = [](std::vector<std::string> extra) {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "hi"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    try {
+      r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::cli::CliUsageError&) {
+      return true;
+    }
+    return false;
+  };
+
+  {
+    const auto a = parse({});
+    CHECK(a.vision == "auto");                 // load iff the container has a tower
+    CHECK(a.image_max_pixels == 1048576);      // 1024x1024, the measured default
+  }
+  CHECK(parse({"--vision", "on"}).vision == "on");
+  CHECK(parse({"--vision", "off"}).vision == "off");
+  CHECK(rejects({"--vision", "yes"}));
+  CHECK(rejects({"--vision", ""}));
+
+  // 0 means "the checkpoint's own ceiling", which is a legal, meaningful value -- not "unset".
+  CHECK(parse({"--image-max-pixels", "0"}).image_max_pixels == 0);
+  CHECK(parse({"--image-max-pixels", "4194304"}).image_max_pixels == 4194304);
+  CHECK(rejects({"--image-max-pixels", "1023"}));  // below one merged token
+  CHECK(rejects({"--image-max-pixels", "-1"}));
+  CHECK(rejects({"--image-max-pixels", "lots"}));
+}
+
+// docs/vision.md stage 5 (user-facing wiring): --image is repeatable, unlike every other flag in
+// this file, and attaches to whichever turn main.cpp's run_one_user_turn processes next -- see
+// that file's own comment. Purely a parsing test (no container, no decode): main.cpp's own
+// --image handling is exercised by tests/vision/tool_vision_chat and tools/server/smoke.ps1
+// (server-side), since it needs a real vision-capable container.
+void TestImageFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt", "describe this"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.image_paths.empty());
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli",      "--model", "m.r4dx", "--layout", "bf16",
+                                         "--prompt",      "describe these", "--image",
+                                         "a.png",         "--image", "b.jpg"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.image_paths.size() == 2);
+    CHECK(a.image_paths[0] == "a.png");
+    CHECK(a.image_paths[1] == "b.jpg");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -351,6 +416,8 @@ int main() {
   TestMtpDraftHeadFlag();
   TestMtpUpperBound();
   TestDflashFlags();
+  TestVisionFlags();
+  TestImageFlag();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

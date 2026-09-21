@@ -9,12 +9,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "attn_config.h"
 #include "dflash_draft_weights.h"
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "gdn_layer.h"
 #include "linear.h"
 #include "mlp.h"
+#include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
@@ -118,10 +120,33 @@ double GiB(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0
 Model Model::Load(const ModelOptions& opts) {
   Model m;
   const VramSnap vram0 = SnapVram();  // before any of this Load() call's own allocations
+  // The vision tower's ~0.90 GiB is loaded between two of its own snapshots so it gets its own
+  // VRAM breakdown line -- the same treatment the DFlash2 drafter gets below, and the only honest
+  // way to report a delta docs/vision.md quotes as a number (docs/vision.md "Load policy").
+  const bool want_vision = opts.vision != ModelOptions::VisionMode::kOff;
   m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
                                   opts.mtp_head_layout.value_or(opts.layout),
-                                  opts.embed_device_resident);
+                                  opts.embed_device_resident, want_vision);
   const VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  if (opts.vision == ModelOptions::VisionMode::kOn && !m.container_.HasVision()) {
+    throw std::runtime_error(
+        "Model::Load: --vision on was requested but the container has no vision.* tensors "
+        "(convert without --language-model-only, or use --vision auto)");
+  }
+  if (m.container_.HasVision()) {
+    m.vision_.emplace();
+    const vision::VisionWeights& vw = m.container_.Vision();
+    std::cerr << "[r4dx::model::Model] vision tower loaded: " << vw.tensor_count << " tensors, "
+              << GiB(vw.bytes) << " GiB (depth=" << vw.config.depth
+              << ", hidden=" << vw.config.hidden_size << ", out_hidden=" << vw.config.out_hidden_size
+              << ")\n";
+  } else if (opts.vision == ModelOptions::VisionMode::kAuto &&
+             m.container_.ContainerHasVisionTensors()) {
+    // Cannot happen with the current policy (auto asks for the load), but says so out loud rather
+    // than silently leaving a vision-capable container text-only if that policy ever changes.
+    std::cerr << "[r4dx::model::Model] container carries vision.* tensors but the tower was not "
+                  "loaded -- image requests will be rejected\n";
+  }
   const ModelConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = m.container_.NumLoadedLayers();
@@ -185,6 +210,12 @@ Model Model::Load(const ModelOptions& opts) {
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
   m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
   m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(1);
+  // 3-axis mrope companion (docs/vision.md): 3*64 int32 == 768 bytes, allocated unconditionally
+  // rather than lazily -- a lazy hipMalloc would have to happen on the first multimodal chunk,
+  // i.e. mid-request with the device live, which is exactly what every other per-chunk buffer in
+  // this class is persistent to avoid.
+  m.attn_rope_pos_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(3 * m.max_chunk_));
+  m.rope_pos_host_.assign(static_cast<size_t>(3 * m.max_chunk_), 0);
   // Per-layer activation scratch (rmsnorm output, gate_up, GDN conv/kkt/chunk-scan buffers,
   // activation-quant scratch): a few MB at T<=64 (see linear.h/gdn_layer.cpp's own buffer sizes).
   // 96MB gives headroom without materially affecting the ~15-35GB the weights themselves occupy.
@@ -321,6 +352,15 @@ Model Model::Load(const ModelOptions& opts) {
               << " GiB, arena+scratch=" << GiB(arena_b) << " GiB, free="
               << GiB(static_cast<int64_t>(vram3.free_bytes)) << " GiB (of "
               << GiB(static_cast<int64_t>(vram3.total_bytes)) << " GiB total)\n";
+    if (m.container_.HasVision()) {
+      // Part of `weights` above (Container::Load uploads it), broken out because it is the one
+      // component a caller can turn off with a flag. This is the SUMMED tensor size, not a
+      // hipMemGetInfo delta -- the measured delta is the difference between this load's own
+      // `weights=` figure and a `--vision off` load's, which docs/vision.md quotes.
+      std::cerr << "[r4dx::model::Model] vision tower VRAM: "
+                << GiB(m.container_.Vision().bytes)
+                << " GiB (already included in weights above; --vision off reclaims it)\n";
+    }
     if (has_dflash && vram_dflash0.ok && vram_dflash1.ok) {
       const int64_t dflash_b =
           static_cast<int64_t>(vram_dflash0.free_bytes) - static_cast<int64_t>(vram_dflash1.free_bytes);
@@ -330,6 +370,27 @@ Model Model::Load(const ModelOptions& opts) {
   }
 
   return m;
+}
+
+void Model::EncodeImages(const float* pixel_values, int64_t total_patches,
+                          const std::vector<vision::GridThw>& grids,
+                          core::DeviceBuffer<uint16_t>* out, vision::VisionEncodeStats* stats,
+                          const vision::VisionTrace* trace) {
+  if (!HasVision()) {
+    throw std::runtime_error(
+        "Model::EncodeImages: this model has no vision tower (the container carries no vision.* "
+        "tensors, or it was loaded with --vision off)");
+  }
+  const vision::VisionWeights& vw = container_.Vision();
+  if (vw.config.out_hidden_size != Config().hidden_size) {
+    throw std::runtime_error(
+        "Model::EncodeImages: vision_config.out_hidden_size (" +
+        std::to_string(vw.config.out_hidden_size) + ") does not match the text hidden_size (" +
+        std::to_string(Config().hidden_size) +
+        ") -- the merger's rows are spliced straight into the text embedding sequence, with no "
+        "extra projection (docs/vision.md)");
+  }
+  vision_->Encode(vw, pixel_values, total_patches, grids, out, stats, trace);
 }
 
 void Model::Reset() {
@@ -347,6 +408,17 @@ void Model::Reset() {
 
   pos_ = 0;
   started_ = false;
+
+  // 3-axis mrope state (docs/vision.md): the delta and the spliced spans describe the CONVERSATION,
+  // not the KV bytes, so unlike the caches above they cannot be left to self-correct by position
+  // overwrite -- a stale delta would rope the next conversation's every token at the wrong
+  // position while looking entirely healthy. Back to the text-only values, which is also what puts
+  // every rope call site back on its pre-vision single-row path.
+  mrope_active_ = false;
+  mrope_delta_ = 0;
+  mrope_block_.clear();
+  mrope_block_base_ = 0;
+  mrope_block_images_.clear();
 
   // MTP head state (model.h's own field comments): mtp_seed_hidden_'s bytes are stale but harmless
   // -- mtp_seed_valid_==false means nothing will read them until the next RunChunk/
@@ -369,7 +441,67 @@ void Model::Reset() {
   // any cold-ring gap (DflashDraft::ValidFrom() back to 0). Deliberately does NOT touch
   // dflash_injection_enabled_: that is a caller policy about the NEXT request, not state belonging
   // to the sequence being dropped (model.h's SetDflashInjectionEnabled).
-  if (dflash_.has_value()) dflash_->Reset();
+  if (dflash_.has_value()) {
+    dflash_->Reset();
+    dflash_->SetRopeDelta(0);  // back in step with mrope_delta_ above
+  }
+}
+
+// ---- 3-axis mrope plumbing (docs/vision.md "Text-side splicing") -------------------------------
+// The whole conversation's rope position assignment is two facts: a running `mrope_delta_` (every
+// text token at absolute sequence index `s` ropes at `s + mrope_delta_` on all three axes) and,
+// while PrefillMultimodal is feeding a block, that block's own explicit [3, N] rows. There is no
+// full-sequence position table: `mrope_delta_` is by construction constant over every text run
+// after the last image (position_ids.cpp derives it as exactly that running-counter difference),
+// so a table would be 3 MiB of host memory restating one integer.
+
+void Model::RopePositionsHost(int64_t start, int64_t T, std::vector<int32_t>* out3) const {
+  out3->assign(static_cast<size_t>(3 * T), 0);
+  const int64_t n_block = static_cast<int64_t>(mrope_block_.size() / 3);
+  for (int64_t t = 0; t < T; ++t) {
+    const int64_t s = start + t;
+    const int64_t in_block = s - mrope_block_base_;
+    if (n_block > 0 && in_block >= 0 && in_block < n_block) {
+      for (int axis = 0; axis < 3; ++axis) {
+        (*out3)[static_cast<size_t>(axis * T + t)] =
+            mrope_block_[static_cast<size_t>(axis * n_block + in_block)];
+      }
+    } else {
+      const int32_t p = static_cast<int32_t>(s + mrope_delta_);
+      (*out3)[static_cast<size_t>(t)] = p;
+      (*out3)[static_cast<size_t>(T + t)] = p;
+      (*out3)[static_cast<size_t>(2 * T + t)] = p;
+    }
+  }
+}
+
+const int32_t* Model::RopePositionsForChunk(int64_t start, int64_t T) {
+  if (!mrope_active_) return nullptr;
+  std::vector<int32_t> rows;
+  RopePositionsHost(start, T, &rows);
+  std::copy(rows.begin(), rows.end(), rope_pos_host_.begin());
+  // Blocking upload, at the same point in the call and for the same reason attn_positions_' own
+  // is (see RunChunk's comment): the device is idle here because the previous call synchronized.
+  attn_rope_pos_.CopyFromHost(rope_pos_host_.data(), static_cast<size_t>(3 * T));
+  return attn_rope_pos_.data();
+}
+
+void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64_t hidden) {
+  if (mrope_block_images_.empty()) return;
+  for (const ImageSpan& sp : mrope_block_images_) {
+    const int64_t span_start = mrope_block_base_ + sp.offset;  // absolute sequence index
+    const int64_t lo = std::max(span_start, start);
+    const int64_t hi = std::min(span_start + sp.tokens, start + T);
+    if (lo >= hi) continue;
+    // Both sides are contiguous row-major [rows, hidden] bf16 -- the placeholder run is contiguous
+    // in the prompt and the merger's rows are contiguous in EncodeImages' output -- so one D2D
+    // copy per (span, chunk) intersection, no kernel and no per-row loop.
+    const int64_t rows = hi - lo;
+    R4DX_HIP_CHECK(hipMemcpyAsync(dst + (lo - start) * hidden,
+                                   sp.embeds + (lo - span_start) * hidden,
+                                   static_cast<size_t>(rows * hidden) * sizeof(uint16_t),
+                                   hipMemcpyDeviceToDevice, stream_.get()));
+  }
 }
 
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
@@ -405,6 +537,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, token_ids,
                 embed_staging_, buf_a_);
   }
+  // Image splice (docs/vision.md): whichever pending span rows fall in this chunk replace the
+  // embed_tokens lookup that just ran for their placeholder token ids. Enqueued on stream_ after
+  // the gather, so it is ordered behind it; a no-op (not even a loop iteration) outside a
+  // PrefillMultimodal call carrying images.
+  SpliceImageEmbeddings(pos_, T, buf_a_.data(), hidden);
 
   // Full-attention layers' positions/slot_mapping (== pos_+t, see model.h) and seqused_k (==
   // pos_+T) are identical for every attention layer in this chunk -- upload them once here rather
@@ -418,6 +555,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
   const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
   attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  // The 3-axis rope rows for the same window -- nullptr (and no upload at all) unless an image has
+  // been spliced into this conversation, which is what keeps a text-only run byte-identical.
+  const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
@@ -469,15 +609,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttnConfig acfg;
-      acfg.hidden = static_cast<int>(hidden);
-      acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-      acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-      acfg.head_dim = static_cast<int>(cfg.head_dim);
-      acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-      acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-      acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-      attention::AttentionLayer layer(acfg);
+      attention::AttentionLayer layer(MakeAttnConfig(cfg));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -495,7 +627,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -532,6 +664,24 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // reveals real "next tokens" for MTP's boundary/within-chunk (h_i, t_{i+1}) pairs). No-op at
   // exactly zero extra cost when mtp_ is unset (the overwhelming common case).
   if (mtp_) {
+    // MTP's own attention layer ropes at the same 3-axis positions the backbone just did -- and
+    // unlike its draft loop, these positions are INSIDE the prompt, so they can land on image rows
+    // where the three axes genuinely differ (docs/vision.md). Built on the host per call because
+    // the two PrimeKv calls below cover different, non-contiguous position windows.
+    std::vector<int32_t> prime_rope3;
+    const int32_t* boundary_rope3 = nullptr;
+    const int32_t* within_rope3 = nullptr;
+    std::vector<int32_t> boundary_rope3_rows;
+    if (mrope_active_) {
+      if (mtp_seed_valid_) {
+        RopePositionsHost(pos_ - 1, 1, &boundary_rope3_rows);
+        boundary_rope3 = boundary_rope3_rows.data();
+      }
+      if (T > 1) {
+        RopePositionsHost(pos_, T - 1, &prime_rope3);
+        within_rope3 = prime_rope3.data();
+      }
+    }
     if (mtp_seed_valid_) {
       // The ONE position left dangling by the previous RunChunk/DecodeStepMtpGreedy call: h_i =
       // that call's own last-row hidden state (mtp_seed_hidden_), t_{i+1} = THIS call's own first
@@ -541,7 +691,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // offsets into MtpHead's own pinned host scratch).
       mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_ - 1, mtp_seed_hidden_.data(),
                     {token_ids[0]}, container_.EmbedTokensHost(), cfg.vocab_size,
-                    /*host_staging_offset=*/0);
+                    /*host_staging_offset=*/0, boundary_rope3);
     }
     if (T > 1) {
       // Within-chunk pairs: h_i = this chunk's own rows 0..T-2 (`cur`, unmodified since the layer
@@ -552,7 +702,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // it may still be in flight. 1 + (T-1) == T <= max_chunk_ == MtpHead::kMaxPrime always.
       const std::vector<int32_t> next_toks(token_ids.begin() + 1, token_ids.end());
       mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_, cur, next_toks,
-                    container_.EmbedTokensHost(), cfg.vocab_size, /*host_staging_offset=*/1);
+                    container_.EmbedTokensHost(), cfg.vocab_size, /*host_staging_offset=*/1,
+                    within_rope3);
     }
     R4DX_HIP_CHECK(hipMemcpyAsync(mtp_seed_hidden_.data(), cur + (T - 1) * hidden,
                                    static_cast<size_t>(hidden) * sizeof(uint16_t),
@@ -652,7 +803,17 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // re-enables injection (model.h's SetDflashInjectionEnabled), which InjectFeatures turns into a
   // cold-ring gap. Either way `InjectedCount() == pos_` holds again on return.
   if (dflash_.has_value() && dflash_capture_active) {
-    dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_);
+    // The drafter ropes on the mrope TEMPORAL axis only (docs/dflash2.md "RoPE": sections
+    // [64,0,0,0]) while its ring stays keyed on the sequence position -- so it gets the t row of
+    // this chunk's rows, not the whole [3, T] block. `rope_delta_` covers its own draft blocks,
+    // which are always past the prompt; injection can straddle an image, so it gets the real row.
+    std::vector<int32_t> inject_rope3;
+    const int32_t* inject_rope_t = nullptr;
+    if (mrope_active_) {
+      RopePositionsHost(pos_, T, &inject_rope3);
+      inject_rope_t = inject_rope3.data();  // row 0 of [3, T] is the temporal row
+    }
+    dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_, inject_rope_t);
     // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
     // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
     // arena_ in this codebase resets it when done -- InjectFeatures' own scratch allocations (the
@@ -684,6 +845,114 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
   pos_ += T;
   started_ = true;
+  return logits;
+}
+
+std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_ids,
+                                              const std::vector<ImageSpan>& images,
+                                              const std::function<void()>& on_chunk_captured,
+                                              std::vector<int32_t>* rope_rows_out) {
+  if (token_ids.empty()) throw std::runtime_error("Model::PrefillMultimodal: token_ids is empty");
+  if (images.empty() && !mrope_active_) {
+    // Text-only, and nothing has ever diverged -- the pre-vision path, byte for byte. The rows a
+    // diagnostic caller asked for are simply the sequence indices on all three axes.
+    if (rope_rows_out != nullptr) {
+      RopePositionsHost(pos_, static_cast<int64_t>(token_ids.size()), rope_rows_out);
+    }
+    return Prefill(token_ids, on_chunk_captured);
+  }
+
+  const int64_t seq_len = static_cast<int64_t>(token_ids.size());
+  if (!images.empty() && !container_.HasVision()) {
+    throw std::runtime_error(
+        "Model::PrefillMultimodal: image spans supplied but this model has no vision tower loaded "
+        "(--vision off, or a container with no vision.* tensors)");
+  }
+  // Only read when `images` is non-empty, which the check above already made imply HasVision().
+  const int merge_size =
+      container_.HasVision() ? static_cast<int>(container_.Vision().config.spatial_merge_size) : 2;
+  const int32_t image_token_id = static_cast<int32_t>(container_.ImageTokenId());
+
+  // ---- validate the spans, and derive the mm_token_type_ids the position walk needs -------------
+  // Derived from the SPANS, not from a scan for image_token_id: the spans are the contract (they
+  // carry the grid and the device rows), and checking that the tokens under each span really are
+  // the placeholder id catches a caller whose offsets have drifted from its own rendered prompt --
+  // which is the failure that would otherwise splice real embeddings over real text.
+  std::vector<uint8_t> mm_ids(static_cast<size_t>(seq_len), vision::kMmTokenTypeText);
+  std::vector<vision::GridThw> grids;
+  grids.reserve(images.size());
+  int64_t prev_end = 0;
+  for (const ImageSpan& sp : images) {
+    if (sp.offset < prev_end || sp.tokens <= 0 || sp.offset + sp.tokens > seq_len) {
+      throw std::runtime_error(
+          "Model::PrefillMultimodal: image spans must be sorted, non-overlapping and inside "
+          "token_ids; got offset=" + std::to_string(sp.offset) + " tokens=" +
+          std::to_string(sp.tokens) + " against a " + std::to_string(seq_len) + "-token prompt");
+    }
+    if (sp.embeds == nullptr) {
+      throw std::runtime_error("Model::PrefillMultimodal: image span at offset " +
+                                std::to_string(sp.offset) + " has no device embeddings");
+    }
+    if (sp.grid.MergedTokenCount(merge_size) != sp.tokens) {
+      throw std::runtime_error(
+          "Model::PrefillMultimodal: image span at offset " + std::to_string(sp.offset) +
+          " claims " + std::to_string(sp.tokens) + " tokens but its grid merges to " +
+          std::to_string(sp.grid.MergedTokenCount(merge_size)));
+    }
+    for (int64_t i = sp.offset; i < sp.offset + sp.tokens; ++i) {
+      if (token_ids[static_cast<size_t>(i)] != image_token_id) {
+        throw std::runtime_error(
+            "Model::PrefillMultimodal: token at index " + std::to_string(i) +
+            " is inside an image span but is not the image placeholder id " +
+            std::to_string(image_token_id) + " (got " +
+            std::to_string(token_ids[static_cast<size_t>(i)]) + ")");
+      }
+      mm_ids[static_cast<size_t>(i)] = vision::kMmTokenTypeImage;
+    }
+    grids.push_back(sp.grid);
+    prev_end = sp.offset + sp.tokens;
+  }
+
+  // ---- this block's 3-axis rows + the delta every later step will rope at -----------------------
+  const vision::MropePositions mp = vision::BuildMropePositionIds(
+      mm_ids, grids, merge_size, /*seq_start=*/pos_, /*mrope_start=*/pos_ + mrope_delta_);
+
+  mrope_block_ = mp.position_ids;
+  mrope_block_base_ = pos_;
+  mrope_block_images_ = images;
+  mrope_active_ = true;
+  // Cleared on EVERY exit, including an exception out of a RunChunk below: leaving a stale block
+  // table behind would silently rope a LATER call's tokens from this call's rows.
+  struct BlockGuard {
+    Model* m;
+    ~BlockGuard() {
+      m->mrope_block_.clear();
+      m->mrope_block_images_.clear();
+      m->mrope_block_base_ = 0;
+    }
+  } guard{this};
+
+  if (rope_rows_out != nullptr) *rope_rows_out = mrope_block_;
+
+  mtp_num_accepted_valid_ = false;  // same reasoning as Prefill()'s own reset
+  std::vector<float> logits;
+  for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
+    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+    const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
+                                      token_ids.begin() + static_cast<ptrdiff_t>(off + n));
+    const bool is_last_chunk = (off + n) == token_ids.size();
+    std::vector<float> chunk_logits =
+        RunChunk(chunk, /*is_prefill_path=*/true, /*want_logits=*/is_last_chunk);
+    if (on_chunk_captured) on_chunk_captured();
+    if (is_last_chunk) logits = std::move(chunk_logits);
+  }
+  // Only now: until this point the block's own explicit rows are what every chunk read, and the
+  // NEW delta describes only positions at or after `pos_` (which the loop just advanced past the
+  // whole block).
+  mrope_delta_ = mp.mrope_position_delta;
+  // The drafter ropes its own blocks on the temporal axis at `sequence index + delta`
+  // (docs/dflash2.md "RoPE" -- sections [64,0,0,0]); its ring slots stay in sequence space.
+  if (dflash_.has_value()) dflash_->SetRopeDelta(mrope_delta_);
   return logits;
 }
 
@@ -904,6 +1173,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
   const int32_t seqused_k_h = static_cast<int32_t>(pos_ + 1);
   attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  const int32_t* rope_pos3 = RopePositionsForChunk(pos_, 1);  // nullptr for a text-only run
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
@@ -939,15 +1209,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttnConfig acfg;
-      acfg.hidden = static_cast<int>(hidden);
-      acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-      acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-      acfg.head_dim = static_cast<int>(cfg.head_dim);
-      acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-      acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-      acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-      attention::AttentionLayer layer(acfg);
+      attention::AttentionLayer layer(MakeAttnConfig(cfg));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -964,7 +1226,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
                     static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s,
                     normed_in, mlp_norm_weight, buf_normed_.data(), &acc, normed_in_epilogue,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -1063,6 +1325,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
     const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
     attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+    const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);  // nullptr for a text-only run
 
     uint16_t* cur = buf_a_.data();
     uint16_t* other = buf_b_.data();
@@ -1085,15 +1348,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                       normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                       body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       } else {
-        attention::AttnConfig acfg;
-        acfg.hidden = static_cast<int>(hidden);
-        acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-        acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-        acfg.head_dim = static_cast<int>(cfg.head_dim);
-        acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-        acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-        acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-        attention::AttentionLayer layer(acfg);
+        attention::AttentionLayer layer(MakeAttnConfig(cfg));
 
         attention::AttnWeights aw;
         aw.input_layernorm = lw.input_layernorm.data();
@@ -1111,7 +1366,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                       attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
                       &acc, normed_in_epilogue, buf_normed_pre_.data(),
                       buf_normed_pre_scale_.data(), body_epilogue_, buf_normed_pre_.data(),
-                      buf_normed_pre_scale_.data());
+                      buf_normed_pre_scale_.data(), rope_pos3);
         std::swap(cur, other);
       }
 
@@ -1215,6 +1470,10 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
   const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
   attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  // The candidate rows are always past the prompt, so their 3-axis rope positions are just
+  // `pos_ + t + mrope_delta_` on all three axes -- but they still have to be BUILT, because
+  // `attn_positions_` above is the KV slot mapping and must stay the plain sequence index.
+  const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);  // nullptr for a text-only run
 
   const int32_t* num_accepted_ptr = mtp_num_accepted_valid_ ? mtp_num_accepted_dev_.data() : nullptr;
 
@@ -1246,15 +1505,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttnConfig acfg;
-      acfg.hidden = static_cast<int>(hidden);
-      acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-      acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-      acfg.head_dim = static_cast<int>(cfg.head_dim);
-      acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-      acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-      acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-      attention::AttentionLayer layer(acfg);
+      attention::AttentionLayer layer(MakeAttnConfig(cfg));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -1279,7 +1530,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -1466,7 +1717,8 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                           container_.EmbedTokensDeviceResident() ? container_.EmbedTokensDevice()
                                                                   : nullptr,
                           cfg.vocab_size, container_.LmHead(), k,
-                          /*base_pos=*/pos_ - 1, mtp_draft_reduced_vocab_);
+                          /*base_pos=*/pos_ - 1, mtp_draft_reduced_vocab_, mrope_active_,
+                          mrope_delta_);
     arena_.Reset();
   } else if (mtp_seed_valid_) {
     // k==0 degenerate call (doc's own "single DecodeStepGreedy-equivalent" case): Draft() is

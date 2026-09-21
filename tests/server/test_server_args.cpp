@@ -296,6 +296,43 @@ void TestDflashFlags() {
   }
 }
 
+// --vision / --image-max-pixels (docs/vision.md "Load policy" / "Large images"). Same three values
+// and the same default as r4dx-cli's, which tests/cli/test_args.cpp's TestVisionFlags pins on the
+// other side -- the two binaries' flags are only "the same flag" if both are asserted.
+void TestVisionFlags() {
+  auto parse = [](std::vector<std::string> extra) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    return r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+  };
+  auto rejects = [](std::vector<std::string> extra) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      return true;
+    }
+    return false;
+  };
+
+  {
+    const auto a = parse({});
+    CHECK(a.vision == "auto");
+    CHECK(a.image_max_pixels == 1048576);
+  }
+  CHECK(parse({"--vision", "on"}).vision == "on");
+  CHECK(parse({"--vision", "off"}).vision == "off");
+  CHECK(rejects({"--vision", "enabled"}));
+  CHECK(parse({"--image-max-pixels", "0"}).image_max_pixels == 0);
+  CHECK(parse({"--image-max-pixels", "2359296"}).image_max_pixels == 2359296);
+  CHECK(rejects({"--image-max-pixels", "512"}));
+  CHECK(rejects({"--image-max-pixels", "-4"}));
+  CHECK(rejects({"--image-max-pixels", "big"}));
+}
+
 }  // namespace
 
 int main() {
@@ -310,6 +347,7 @@ int main() {
   TestEmbedDeviceResidentFlag();
   TestMtpUpperBound();
   TestDflashFlags();
+  TestVisionFlags();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

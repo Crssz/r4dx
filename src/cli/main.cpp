@@ -22,8 +22,12 @@
 
 #include "chat_template.h"
 #include "cli_args.h"
+#include "image_decode.h"  // src/vision: DecodeImageFile (docs/vision.md, --image)
+#include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md, --image)
 #include "model.h"
 #include "mtp_round.hpp"
+#include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
+#include "r4dx/core/device_buffer.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "tokenizer.h"
 
@@ -115,7 +119,8 @@ void PrintProfileTable(const r4dx::model::Model::StepProfile& prof, double divis
 }
 
 TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
-                    const std::vector<int32_t>& new_tokens, const CliArgs& args) {
+                    const std::vector<int32_t>& new_tokens, const CliArgs& args,
+                    const std::vector<r4dx::model::Model::ImageSpan>& image_spans = {}) {
   TurnResult result;
   result.prefill_tokens = static_cast<int64_t>(new_tokens.size());
 
@@ -140,7 +145,14 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
   }
 
   const auto t0 = Clock::now();
-  std::vector<float> logits = model.Prefill(new_tokens);
+  // Vision (docs/vision.md "Text-side splicing"): PrefillMultimodal with an EMPTY `image_spans` is
+  // byte-identical to Prefill() (that method's own doc comment) -- it takes the exact pre-vision
+  // code path, no extra upload, no extra kernel, the single-row rope entry point -- so this is not
+  // a text-only-behavior regression risk, only a call-site unification. Every non-empty-span call
+  // comes from run_one_user_turn(), which only ever builds one when --image / "/image ..." queued
+  // a real image for this turn.
+  std::vector<float> logits =
+      image_spans.empty() ? model.Prefill(new_tokens) : model.PrefillMultimodal(new_tokens, image_spans);
   const auto t1 = Clock::now();
   result.prefill_seconds = Seconds(t0, t1);
 
@@ -412,6 +424,11 @@ int RunMain(int argc, char** argv) {
                               : std::nullopt;
   opts.embed_device_resident = (args.embed_device_resident != "off");
   opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
+  // docs/vision.md "Load policy": auto (the default) loads the container's vision.* weights iff it
+  // has them, so a text-only container costs exactly what it did before this milestone.
+  opts.vision = args.vision == "on"    ? r4dx::model::ModelOptions::VisionMode::kOn
+                : args.vision == "off" ? r4dx::model::ModelOptions::VisionMode::kOff
+                                        : r4dx::model::ModelOptions::VisionMode::kAuto;
 
   // allow_unimplemented_normalizer=true: Qwen3.8-27B's tokenizer.json declares normalizer.type=
   // NFC, which r4dx's tokenizer does not implement (tokenizer.h's file comment KNOWN GAP) --
@@ -434,6 +451,18 @@ int RunMain(int argc, char** argv) {
                  Seconds(load_t0, load_t1), vram_after, vram_after - vram_before);
   }
 
+  // Image preprocessing policy (docs/vision.md "Large images"). Validated and reported at startup
+  // rather than at the first image, so `--image-max-pixels 0.5` fails here instead of mid-session.
+  // `--image` (and `--chat`'s own `/image <path>` lines) feed it below.
+  const r4dx::vision::ImageProcessorConfig image_preproc =
+      r4dx::vision::MakeImageProcessorConfig(args.image_max_pixels);
+  if (model.HasVision()) {
+    std::fprintf(stderr,
+                 "[r4dx-cli] vision tower ready (image_max_pixels=%lld, an image above that is "
+                 "downsized by smart_resize, not rejected)\n",
+                 static_cast<long long>(image_preproc.max_pixels));
+  }
+
   r4dx::ChatJson messages = r4dx::ChatJson::array();
   if (!args.system_prompt.empty()) {
     messages.push_back({{"role", "system"}, {"content", args.system_prompt}});
@@ -443,12 +472,95 @@ int RunMain(int argc, char** argv) {
 
   std::vector<int32_t> fed_tokens;  // everything already committed to model's KV/GDN state
 
-  auto run_one_user_turn = [&](const std::string& user_text) {
-    messages.push_back({{"role", "user"}, {"content", user_text}});
+  // Vision (docs/vision.md "Text-side splicing", --image): one entry per TURN that attached at
+  // least one image, kept alive for the whole process -- a later turn's chat-template re-render
+  // still carries every earlier turn's own "image" content part (messages is append-only), so its
+  // placeholder has to be re-expanded every turn even though that image's rows were already
+  // spliced into the model's real KV/GDN state and must NOT be re-encoded (docs/vision.md "Prefix
+  // reuse across a turn that contained an image"). Grouped by turn (not by image) so a
+  // multi-image turn's rows stay in the ONE device buffer EncodeImages produced for it -- no
+  // device-to-device copy needed to split them apart.
+  struct ImageBatch {
+    std::vector<r4dx::vision::GridThw> grids;
+    r4dx::core::DeviceBuffer<uint16_t> embeds;
+  };
+  std::vector<ImageBatch> session_image_batches;
+  const int32_t image_token_id = static_cast<int32_t>(model.GetContainer().ImageTokenId());
+  const int merge_size = model.HasVision()
+                              ? static_cast<int>(model.GetContainer().Vision().config.spatial_merge_size)
+                              : 2;
+
+  auto run_one_user_turn = [&](const std::string& user_text,
+                                const std::vector<std::string>& image_paths_for_turn) {
+    int64_t turn_image_n = 0;
+    double turn_image_ms = 0.0;
+    if (!image_paths_for_turn.empty()) {
+      if (!model.HasVision()) {
+        throw std::runtime_error(
+            "--image / \"/image\" needs a vision-capable container (this container has no "
+            "vision.* tensors, or --vision off was given)");
+      }
+      std::vector<r4dx::vision::DecodedImage> decoded;
+      decoded.reserve(image_paths_for_turn.size());
+      for (const std::string& p : image_paths_for_turn) {
+        decoded.push_back(r4dx::vision::DecodeImageFile(p));
+      }
+      const r4dx::vision::PreprocessedImages pre =
+          r4dx::vision::PreprocessImages(decoded, image_preproc);
+      ImageBatch batch;
+      batch.grids = pre.grid_thw;
+      r4dx::vision::VisionEncodeStats stats;
+      model.EncodeImages(pre.pixel_values.data(), pre.TotalPatches(), pre.grid_thw, &batch.embeds,
+                         &stats);
+      turn_image_n = static_cast<int64_t>(pre.grid_thw.size());
+      turn_image_ms = stats.encode_ms;
+      session_image_batches.push_back(std::move(batch));
+    }
+
+    // Content: this turn's images (if any) followed by its text, matching the surface syntax
+    // tests/vision/tool_vision_chat.cpp already validated against the real chat template. A
+    // turn with no image keeps the exact plain-string content shape used before --image existed.
+    if (image_paths_for_turn.empty()) {
+      messages.push_back({{"role", "user"}, {"content", user_text}});
+    } else {
+      r4dx::ChatJson content = r4dx::ChatJson::array();
+      for (size_t i = 0; i < image_paths_for_turn.size(); ++i) content.push_back({{"type", "image"}});
+      content.push_back({{"type", "text"}, {"text", user_text}});
+      messages.push_back({{"role", "user"}, {"content", content}});
+    }
+
     const std::string rendered = tmpl.render(messages, /*add_generation_prompt=*/true,
                                               r4dx::ChatJson::array(), extra_context);
-    const std::vector<r4dx::TokenId> full_tokens = tok.encode(rendered, /*parse_special=*/true);
+    const std::vector<r4dx::TokenId> raw_tokens = tok.encode(rendered, /*parse_special=*/true);
+    std::vector<int32_t> full_tokens(raw_tokens.begin(), raw_tokens.end());
+
+    // Re-expand EVERY image placeholder the re-rendered whole conversation carries -- not just
+    // this turn's -- using every image ever attached this session, in order. This is what keeps
+    // `full_tokens` (the EXPANDED sequence) comparable against `fed_tokens` (also expanded, since
+    // it was built the very same way on an earlier turn). session_image_batches is empty for
+    // every text-only session, in which case this is a no-op and `full_tokens` is untouched --
+    // the same tokens tok.encode() produced, exactly as before --image existed.
+    std::vector<r4dx::vision::ImagePlaceholderSpan> expanded_spans;
+    if (!session_image_batches.empty()) {
+      std::vector<r4dx::vision::ImagePlaceholderSpan> spans_in;
+      for (const auto& batch : session_image_batches) {
+        int64_t row = 0;
+        for (const auto& g : batch.grids) {
+          r4dx::vision::ImagePlaceholderSpan sp;
+          sp.grid = g;
+          sp.embeds = batch.embeds.data() + row * model.Config().hidden_size;
+          spans_in.push_back(sp);
+          row += g.MergedTokenCount(merge_size);
+        }
+      }
+      auto expanded =
+          r4dx::vision::ExpandImagePlaceholders(full_tokens, image_token_id, spans_in, merge_size);
+      full_tokens = std::move(expanded.tokens);
+      expanded_spans = std::move(expanded.spans);
+    }
+
     std::vector<int32_t> new_tokens;
+    int64_t skip = 0;
     if (full_tokens.size() < fed_tokens.size() ||
         !std::equal(fed_tokens.begin(), fed_tokens.end(), full_tokens.begin())) {
       // The re-rendered conversation did not extend the previously-fed token prefix -- e.g. the
@@ -463,9 +575,28 @@ int RunMain(int argc, char** argv) {
                             "prefix; dropping state and re-prefilling the whole conversation\n");
       model = r4dx::model::Model::Load(opts);
       new_tokens.assign(full_tokens.begin(), full_tokens.end());
+      skip = 0;
     } else {
+      skip = static_cast<int64_t>(fed_tokens.size());
       new_tokens.assign(full_tokens.begin() + static_cast<ptrdiff_t>(fed_tokens.size()),
                          full_tokens.end());
+    }
+
+    // Only a span at or past the already-fed prefix boundary belongs to THIS Prefill/
+    // PrefillMultimodal call -- an older image's rows are already resident in the model's real
+    // KV/GDN state from the turn that first fed them (docs/vision.md "Prefix reuse across a turn
+    // that contained an image"); re-including it here would try to splice into a position
+    // `new_tokens` does not cover. Offsets are shifted from "index into the whole conversation"
+    // to "index into new_tokens", matching Model::ImageSpan::offset's own contract.
+    std::vector<r4dx::model::Model::ImageSpan> image_spans;
+    for (const auto& sp : expanded_spans) {
+      if (sp.offset < skip) continue;
+      r4dx::model::Model::ImageSpan ms;
+      ms.offset = sp.offset - skip;
+      ms.tokens = sp.tokens;
+      ms.grid = sp.grid;
+      ms.embeds = sp.embeds;
+      image_spans.push_back(ms);
     }
 
     // Sampled-fallback rate (docs/sampling.md section 4/12, docs/perf.md's stage S3 measurement
@@ -474,7 +605,7 @@ int RunMain(int argc, char** argv) {
     // a temperature>0 turn (a greedy one never calls SampleFromSummary at all, so the delta is
     // always 0 there).
     const int64_t fallback_rows_before = model.SampledFallbackRows();
-    const TurnResult r = RunTurn(model, tok, new_tokens, args);
+    const TurnResult r = RunTurn(model, tok, new_tokens, args, image_spans);
     const int64_t fallback_rows_this_turn = model.SampledFallbackRows() - fallback_rows_before;
     std::cout << std::endl;
 
@@ -485,6 +616,16 @@ int RunMain(int argc, char** argv) {
     messages.push_back({{"role", "assistant"}, {"content", r.generated_text}});
 
     if (args.stats) {
+      if (turn_image_n > 0) {
+        std::fprintf(stderr, "[stats] image: %lld image(s) encoded in %.1f ms\n",
+                     static_cast<long long>(turn_image_n), turn_image_ms);
+      }
+      if (!image_spans.empty()) {
+        int64_t image_tokens = 0;
+        for (const auto& sp : image_spans) image_tokens += sp.tokens;
+        std::fprintf(stderr, "[stats] image: %lld image token(s) spliced into this prefill\n",
+                     static_cast<long long>(image_tokens));
+      }
       const double pfx_tps = r.prefill_seconds > 0 ? r.prefill_tokens / r.prefill_seconds : 0.0;
       const double dec_tps = r.decode_seconds > 0 ? r.decode_tokens / r.decode_seconds : 0.0;
       std::fprintf(stderr,
@@ -545,14 +686,49 @@ int RunMain(int argc, char** argv) {
   };
 
   if (!args.prompt.empty()) {
-    run_one_user_turn(args.prompt);
+    run_one_user_turn(args.prompt, args.image_paths);
     return 0;
   }
 
+  // --chat: "/image <path>" queues one image for the NEXT real input line (repeatable -- several
+  // "/image" lines in a row attach several images to that one turn), matching --prompt's own
+  // --image flag one level up. --image on the command line (if given) attaches to the FIRST typed
+  // line, the natural "first turn" reading of a flag that has no other notion of "which turn" in
+  // an interactive session.
+  std::vector<std::string> queued_images = args.image_paths;
   std::string line;
   std::cout << "> " << std::flush;
+  bool first_line = true;
   while (std::getline(std::cin, line)) {
-    if (!line.empty()) run_one_user_turn(line);
+    // A redirected/piped stdin (a test harness, `foo.txt | r4dx-cli --chat`, some terminal/locale
+    // combinations) can prepend a UTF-8 BOM to the very first line and/or leave a trailing '\r' on
+    // every line (text vs binary stdin mode) -- neither survives an interactive human typing into a
+    // real console, but both would otherwise make "/image " command detection silently miss on
+    // exactly the line most likely to be it (the very first thing piped in).
+    if (first_line && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+        static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF) {
+      line.erase(0, 3);
+    }
+    first_line = false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("/image ", 0) == 0) {
+      std::string path = line.substr(7);
+      while (!path.empty() && (path.front() == ' ' || path.front() == '"')) path.erase(path.begin());
+      while (!path.empty() && (path.back() == ' ' || path.back() == '"')) path.pop_back();
+      if (path.empty()) {
+        std::fprintf(stderr, "usage: /image <path>\n");
+      } else {
+        queued_images.push_back(path);
+        std::fprintf(stderr, "[r4dx-cli] queued image '%s' for the next turn (%zu queued)\n",
+                     path.c_str(), queued_images.size());
+      }
+      std::cout << "> " << std::flush;
+      continue;
+    }
+    if (!line.empty()) {
+      run_one_user_turn(line, queued_images);
+      queued_images.clear();
+    }
     std::cout << "> " << std::flush;
   }
   return 0;

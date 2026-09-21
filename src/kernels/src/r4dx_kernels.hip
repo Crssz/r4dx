@@ -496,6 +496,60 @@ __global__ void RopePartialMropeKernel(__hip_bfloat16* __restrict__ q,
   }
 }
 
+// ---- rope: partial rotary, NeoX half-split, 3-axis (t,h,w) mrope ---------------------------
+// The multimodal counterpart of RopePartialMropeKernel above: identical arithmetic, identical
+// expression order, the only difference being WHICH of the three position streams feeds each
+// frequency bin. `pos_ids` is [3, tokens] int32 (t row, then h, then w, each `tokens` long).
+//
+// The bin -> stream assignment is Qwen3_5TextRotaryEmbedding.recomposition_frequencies, read
+// directly from the reference (modeling_qwen3_5.py): starting from an all-temporal table, the
+// height stream overwrites bins `slice(1, 3*mrope_section[1], 3)` and the width stream bins
+// `slice(2, 3*mrope_section[2], 3)`. That is exactly the predicate below -- NOT a plain `hd % 3`,
+// which only coincides with it because [11,11,10] happens to make both slices reach their last
+// in-range bin (31 for h, 29 for w). A section vector that did not would diverge, so the bound is
+// carried explicitly rather than assumed away.
+__global__ void RopePartialMrope3Kernel(__hip_bfloat16* __restrict__ q,
+                                         __hip_bfloat16* __restrict__ k,
+                                         const int32_t* __restrict__ pos_ids, int tokens,
+                                         int heads_q, int heads_k, int head_dim, int rotary_dim,
+                                         float theta, int sec_h, int sec_w) {
+  const int64_t t = blockIdx.x;
+  const int half = rotary_dim / 2;
+
+  for (int hd = threadIdx.x; hd < half; hd += blockDim.x) {
+    const int m = hd % 3;
+    int axis = 0;  // temporal
+    if (m == 1 && hd < 3 * sec_h) {
+      axis = 1;  // height
+    } else if (m == 2 && hd < 3 * sec_w) {
+      axis = 2;  // width
+    }
+    const float pos = static_cast<float>(pos_ids[static_cast<int64_t>(axis) * tokens + t]);
+
+    const float inv_freq = exp2f(-(2.0f * hd) / static_cast<float>(rotary_dim) * log2f(theta));
+    const float angle = pos * inv_freq;
+    float c, s;
+    sincosf(angle, &s, &c);  // accurate, not __sincosf -- see RopePartialMropeKernel's comment
+
+    __hip_bfloat16* qbase = q + t * static_cast<int64_t>(heads_q) * head_dim;
+    for (int h = 0; h < heads_q; ++h) {
+      __hip_bfloat16* row = qbase + static_cast<int64_t>(h) * head_dim;
+      float x0 = __bfloat162float(row[hd]);
+      float x1 = __bfloat162float(row[hd + half]);
+      row[hd] = __float2bfloat16(x0 * c - x1 * s);
+      row[hd + half] = __float2bfloat16(x1 * c + x0 * s);
+    }
+    __hip_bfloat16* kbase = k + t * static_cast<int64_t>(heads_k) * head_dim;
+    for (int h = 0; h < heads_k; ++h) {
+      __hip_bfloat16* row = kbase + static_cast<int64_t>(h) * head_dim;
+      float x0 = __bfloat162float(row[hd]);
+      float x1 = __bfloat162float(row[hd + half]);
+      row[hd] = __float2bfloat16(x0 * c - x1 * s);
+      row[hd + half] = __float2bfloat16(x1 * c + x0 * s);
+    }
+  }
+}
+
 // ---- fp8 e4m3 per-row activation quant -----------------------------------------------------
 __global__ __launch_bounds__(kThreads) void QuantActFp8Kernel(const __hip_bfloat16* __restrict__ x,
                                                                 uint8_t* __restrict__ q,
@@ -1216,6 +1270,145 @@ __global__ __launch_bounds__(kThreads) void RmsNormPlainKernel(
   }
 }
 
+// ==== vision tower device pieces (docs/vision.md) ==============================================
+
+// Grid for an elementwise pass over `n` elements, capped because the kernels below are all
+// grid-stride loops: a 9216x4304 GELU would otherwise ask for a grid the driver has to clamp.
+unsigned ElementwiseBlocks(int64_t n) {
+  const int64_t want = (n + kThreads - 1) / kThreads;
+  return static_cast<unsigned>(want < 65535 ? want : 65535);
+}
+
+// ---- LayerNorm with weight and bias -----------------------------------------------------------
+// Two reduction passes on purpose (mean, then the sum of squared deviations from it) rather than
+// the one-pass E[x^2]-E[x]^2 identity -- see kernels.h for why the identity is unusable at the
+// depths this runs at. Scalar loads: hidden is 1152 here, three 256-thread trips per pass, and
+// this is not the tower's bandwidth bottleneck (the four GEMMs per block are).
+__global__ __launch_bounds__(kThreads) void LayerNormKernel(const __hip_bfloat16* __restrict__ x,
+                                                              const __hip_bfloat16* __restrict__ w,
+                                                              const __hip_bfloat16* __restrict__ b,
+                                                              __hip_bfloat16* __restrict__ out,
+                                                              int64_t hidden, float eps) {
+  const int64_t row = blockIdx.x;
+  const __hip_bfloat16* xr = x + row * hidden;
+  __hip_bfloat16* outr = out + row * hidden;
+
+  float sum = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) sum += __bfloat162float(xr[i]);
+  const float mean = BlockReduceSum(sum) / static_cast<float>(hidden);
+
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float d = __bfloat162float(xr[i]) - mean;
+    ss += d * d;
+  }
+  const float rstd = rsqrtf(BlockReduceSum(ss) / static_cast<float>(hidden) + eps);
+
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float v = (__bfloat162float(xr[i]) - mean) * rstd;
+    outr[i] = __float2bfloat16(v * __bfloat162float(w[i]) + __bfloat162float(b[i]));
+  }
+}
+
+// ---- bias add ---------------------------------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void BiasAddKernel(const __hip_bfloat16* __restrict__ x,
+                                                            const __hip_bfloat16* __restrict__ bias,
+                                                            __hip_bfloat16* __restrict__ out,
+                                                            int64_t rows, int64_t cols) {
+  const int64_t n = rows * cols;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * kThreads) {
+    out[i] = __float2bfloat16(__bfloat162float(x[i]) + __bfloat162float(bias[i % cols]));
+  }
+}
+
+// ---- GELU -------------------------------------------------------------------------------------
+// kTanhGelu is the tanh approximation transformers calls `gelu_pytorch_tanh`; kErfGelu is
+// `nn.GELU()`'s exact form. Templated rather than branched so neither variant pays for the other.
+enum GeluKind { kTanhGelu = 0, kErfGelu = 1 };
+
+__device__ __forceinline__ float GeluTanh(float x) {
+  // sqrt(2/pi) to fp32, the same constant ACT2FN["gelu_pytorch_tanh"] uses.
+  constexpr float kSqrt2OverPi = 0.7978845608028654f;
+  const float inner = kSqrt2OverPi * (x + 0.044715f * x * x * x);
+  return 0.5f * x * (1.0f + tanhf(inner));
+}
+__device__ __forceinline__ float GeluErf(float x) {
+  constexpr float kInvSqrt2 = 0.7071067811865476f;
+  return 0.5f * x * (1.0f + erff(x * kInvSqrt2));
+}
+
+template <int KIND>
+__global__ __launch_bounds__(kThreads) void GeluKernel(const __hip_bfloat16* __restrict__ x,
+                                                         __hip_bfloat16* __restrict__ out,
+                                                         int64_t n) {
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < n;
+       i += static_cast<int64_t>(gridDim.x) * kThreads) {
+    const float v = __bfloat162float(x[i]);
+    out[i] = __float2bfloat16(KIND == kTanhGelu ? GeluTanh(v) : GeluErf(v));
+  }
+}
+
+// ---- vision axial rope + qkv split -------------------------------------------------------------
+// One block per token; each thread owns whole (head, i<half) rotation pairs so the partner element
+// is never read by another thread. v is a straight copy out of the fused row's last third.
+__global__ void VisionQkvRopeKernel(const __hip_bfloat16* __restrict__ qkv,
+                                     const float* __restrict__ cos, const float* __restrict__ sin,
+                                     __hip_bfloat16* __restrict__ q_out,
+                                     __hip_bfloat16* __restrict__ k_out,
+                                     __hip_bfloat16* __restrict__ v_out, int heads, int head_dim) {
+  const int64_t t = blockIdx.x;
+  const int per = heads * head_dim;          // one projection's width
+  const int half = head_dim >> 1;
+  const __hip_bfloat16* row = qkv + t * static_cast<int64_t>(3) * per;
+  const float* cos_t = cos + t * head_dim;
+  const float* sin_t = sin + t * head_dim;
+  __hip_bfloat16* qo = q_out + t * per;
+  __hip_bfloat16* ko = k_out + t * per;
+  __hip_bfloat16* vo = v_out + t * per;
+
+  for (int j = threadIdx.x; j < heads * half; j += blockDim.x) {
+    const int h = j / half, i = j % half;
+    const int lo = h * head_dim + i, hi = lo + half;
+    const float qlo = __bfloat162float(row[lo]), qhi = __bfloat162float(row[hi]);
+    const float klo = __bfloat162float(row[per + lo]), khi = __bfloat162float(row[per + hi]);
+    const float c0 = cos_t[i], s0 = sin_t[i];
+    const float c1 = cos_t[i + half], s1 = sin_t[i + half];
+    qo[lo] = __float2bfloat16(qlo * c0 - qhi * s0);
+    qo[hi] = __float2bfloat16(qhi * c1 + qlo * s1);
+    ko[lo] = __float2bfloat16(klo * c0 - khi * s0);
+    ko[hi] = __float2bfloat16(khi * c1 + klo * s1);
+  }
+  for (int j = threadIdx.x; j < per; j += blockDim.x) vo[j] = row[2 * per + j];
+}
+
+// ---- learned position-embedding gather --------------------------------------------------------
+__global__ __launch_bounds__(kThreads) void VisionPosEmbedKernel(
+    const __hip_bfloat16* __restrict__ table, const int32_t* __restrict__ indices,
+    const float* __restrict__ weights, const __hip_bfloat16* __restrict__ x,
+    float* __restrict__ out_f32, __hip_bfloat16* __restrict__ out_bf16, int64_t hidden, int taps,
+    int64_t table_rows) {
+  const int64_t p = blockIdx.x;
+  const int32_t* idx = indices + p * taps;
+  const float* wt = weights + p * taps;
+
+  for (int64_t d = threadIdx.x; d < hidden; d += kThreads) {
+    float acc = 0.0f;
+    for (int t = 0; t < taps; ++t) {
+      int64_t r = idx[t];
+      if (r < 0 || r >= table_rows) r = 0;  // same clamp r4dx_embedding_gather_bf16 uses
+      acc += wt[t] * __bfloat162float(table[r * hidden + d]);
+    }
+    if (out_f32 != nullptr) out_f32[p * hidden + d] = acc;
+    if (out_bf16 != nullptr) {
+      // `.to(hidden_states.dtype)` rounds the fp32 sum to bf16 FIRST, then adds -- not the other
+      // way round. Reproduced exactly (an fp32 add followed by one rounding is a different result).
+      const float pe = __bfloat162float(__float2bfloat16(acc));
+      out_bf16[p * hidden + d] = __float2bfloat16(__bfloat162float(x[p * hidden + d]) + pe);
+    }
+  }
+}
+
 }  // namespace
 
 extern "C" {
@@ -1281,6 +1474,31 @@ void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tok
   hipLaunchKernelGGL(RopePartialMropeKernel, dim3(static_cast<unsigned>(tokens)), dim3(threads), 0,
                      (hipStream_t)stream, (__hip_bfloat16*)q, (__hip_bfloat16*)k,
                      (const int32_t*)pos_ids, heads_q, heads_k, head_dim, rotary_dim, theta);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_rope_partial_mrope3_bf16(int64_t q, int64_t k, int64_t pos_ids3, int tokens, int heads_q,
+                                    int heads_k, int head_dim, int rotary_dim, float theta,
+                                    int sec_t, int sec_h, int sec_w, int64_t stream) {
+  if (tokens <= 0) return;
+  if (rotary_dim <= 0 || rotary_dim % 2 != 0 || rotary_dim > head_dim) {
+    throw std::runtime_error("r4dx_rope_partial_mrope3_bf16: rotary_dim must be even and in (0, "
+                              "head_dim], got " + std::to_string(rotary_dim));
+  }
+  if (sec_t < 0 || sec_h < 0 || sec_w < 0 || sec_t + sec_h + sec_w != rotary_dim / 2) {
+    throw std::runtime_error(
+        "r4dx_rope_partial_mrope3_bf16: mrope sections must be non-negative and sum to "
+        "rotary_dim/2 (" + std::to_string(rotary_dim / 2) + "), got [" + std::to_string(sec_t) +
+        "," + std::to_string(sec_h) + "," + std::to_string(sec_w) + "]");
+  }
+  ++g_launch_count;
+  int threads = rotary_dim / 2;
+  if (threads > 256) threads = 256;
+  if (threads < 1) threads = 1;
+  hipLaunchKernelGGL(RopePartialMrope3Kernel, dim3(static_cast<unsigned>(tokens)), dim3(threads), 0,
+                     (hipStream_t)stream, (__hip_bfloat16*)q, (__hip_bfloat16*)k,
+                     (const int32_t*)pos_ids3, tokens, heads_q, heads_k, head_dim, rotary_dim,
+                     theta, sec_h, sec_w);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
@@ -1502,6 +1720,80 @@ void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t row
   hipLaunchKernelGGL(RmsNormPlainKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
                      (void*)out, hidden, eps, out_fp32);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+// ---- vision tower device pieces (docs/vision.md) -----------------------------------------------
+
+void r4dx_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, int64_t rows,
+                          int64_t hidden, float eps, int64_t stream) {
+  if (rows <= 0 || hidden <= 0) return;
+  ++g_launch_count;
+  hipLaunchKernelGGL(LayerNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
+                     (const __hip_bfloat16*)bias, (__hip_bfloat16*)out, hidden, eps);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_bias_add_bf16(int64_t x, int64_t bias, int64_t out, int64_t rows, int64_t cols,
+                         int64_t stream) {
+  if (rows <= 0 || cols <= 0) return;
+  ++g_launch_count;
+  hipLaunchKernelGGL(BiasAddKernel, dim3(ElementwiseBlocks(rows * cols)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)bias,
+                     (__hip_bfloat16*)out, rows, cols);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_gelu_tanh_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
+  if (n <= 0) return;
+  ++g_launch_count;
+  hipLaunchKernelGGL((GeluKernel<kTanhGelu>), dim3(ElementwiseBlocks(n)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)x, (__hip_bfloat16*)out, n);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_gelu_erf_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
+  if (n <= 0) return;
+  ++g_launch_count;
+  hipLaunchKernelGGL((GeluKernel<kErfGelu>), dim3(ElementwiseBlocks(n)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)x, (__hip_bfloat16*)out, n);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_vision_qkv_rope_bf16(int64_t qkv, int64_t cos, int64_t sin, int64_t q_out, int64_t k_out,
+                                int64_t v_out, int tokens, int heads, int head_dim,
+                                int64_t stream) {
+  if (tokens <= 0 || heads <= 0) return;
+  if (head_dim <= 0 || (head_dim & 1) != 0) {
+    throw std::runtime_error("r4dx_vision_qkv_rope_bf16: head_dim must be positive and even, got " +
+                              std::to_string(head_dim));
+  }
+  ++g_launch_count;
+  int threads = heads * (head_dim / 2);
+  if (threads > kThreads) threads = kThreads;
+  hipLaunchKernelGGL(VisionQkvRopeKernel, dim3(static_cast<unsigned>(tokens)), dim3(threads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)qkv, (const float*)cos,
+                     (const float*)sin, (__hip_bfloat16*)q_out, (__hip_bfloat16*)k_out,
+                     (__hip_bfloat16*)v_out, heads, head_dim);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights, int64_t x,
+                                 int64_t out_f32, int64_t out_bf16, int64_t num_patches,
+                                 int64_t hidden, int taps, int64_t table_rows, int64_t stream) {
+  if (num_patches <= 0 || hidden <= 0) return;
+  if (taps <= 0) throw std::runtime_error("r4dx_vision_pos_embed_bf16: taps must be >= 1");
+  if (out_bf16 != 0 && x == 0) {
+    throw std::runtime_error(
+        "r4dx_vision_pos_embed_bf16: out_bf16 requires x (the residual the position embedding is "
+        "added to)");
+  }
+  ++g_launch_count;
+  hipLaunchKernelGGL(VisionPosEmbedKernel, dim3(static_cast<unsigned>(num_patches)), dim3(kThreads),
+                     0, (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)indices,
+                     (const float*)weights, (const __hip_bfloat16*)x, (float*)out_f32,
+                     (__hip_bfloat16*)out_bf16, hidden, taps, table_rows);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

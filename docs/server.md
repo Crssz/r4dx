@@ -30,9 +30,9 @@ the generation into a structured `message.tool_calls` response field -- see "Too
 "Tool calls").
 
 Message `content` may be a plain string or an OpenAI-style array of parts
-(`[{"type":"text","text":"..."}]`); any non-`"text"` part (`image_url`, ...) is rejected with a
-`400 invalid_request_error` -- there is no vision tower forward pass yet (`docs/status.md`'s "Known
-gaps"). Message `role` must be `system`, `user`, `assistant`, `tool`, or `function` -- the latter two
+(`[{"type":"text","text":"..."}]`, `[{"type":"image_url","image_url":{"url":"data:..."}}]`, or a mix
+of both -- see "Images" below for the full contract, formats, limits and error cases). Message
+`role` must be `system`, `user`, `assistant`, `tool`, or `function` -- the latter two
 carry a tool result back to the model (see "Tool calls" below). A message may also carry an optional
 `reasoning_content` (string) -- see "`reasoning_content`" below for the multi-turn replay contract.
 
@@ -57,11 +57,11 @@ the common set is emitted on every entry -- `BuildModelEntryJson`, `openai_types
 | `max_completion_tokens` | Same value again, mirroring the request-side field name. |
 | `meta.n_ctx` | Same value, under llama.cpp's `/v1/models` field name. |
 | `meta.n_ctx_train` | The checkpoint's own native context length (`kModelNativeContextLength` = 262144, Qwen3.8-27B's `config.json` `max_position_embeddings`) -- a named constant, not read from the loaded container: `r4dx::model::ModelConfig` does not carry this field (nothing in the layer graph needs it). |
-| `capabilities` | `["completion", "chat", "tool_use", "reasoning"]` -- a fixed list reflecting what this server actually does (plain completion, the chat template, `tools`/`tool_choice`, and `chat_template_kwargs.enable_thinking`). |
+| `capabilities` | `["completion", "chat", "tool_use", "reasoning"]` -- what this server actually does (plain completion, the chat template, `tools`/`tool_choice`, and `chat_template_kwargs.enable_thinking`), plus a fifth entry `"image"` whenever the loaded container's vision tower is resident (`Model::HasVision()`, "Images" below). |
 | `supported_parameters` | Exactly the request fields this server's parsers actually honour: `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `max_tokens`, `max_completion_tokens`, `stop`, `stream`, `stream_options`, `tools`, `tool_choice`, `chat_template_kwargs`, `reasoning`, `reasoning_effort`, `include_reasoning`, `enable_thinking`, `thinking`. Anything not in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored today, so it is deliberately left off rather than falsely advertised. |
 | `top_provider` | `{context_length, max_completion_tokens, is_moderated: false}` -- the OpenRouter-shaped repeat of the same `--max-ctx` numbers above, under the field names an OpenRouter-shaped client reads. `is_moderated` is false: nothing in this process filters or classifies a generation. |
 | `reasoning` | `{supported_efforts, default_enabled, mandatory: false}` -- the OpenRouter-shaped thinking-capability block. `supported_efforts` is `["none","minimal","low","medium","high","xhigh","max"]`, exactly the set `ParseThinkingControls` accepts (`"none"` = off, each other level maps onto one of the template's own three -- see "Thinking controls" below). `default_enabled` is the server's own `--think` flag, so a client can pre-set its toggle the way this server will really behave. `mandatory` is false: thinking can always be turned off. |
-| `architecture.input_modalities` / `.output_modalities` | `["text"]` / `["text"]` -- no vision tower yet ("Deferred / known gaps" below). The input list has exactly ONE writer, `ModelInputModalities()` (`openai_types.cpp`), so the vision milestone flips it there and nowhere else. |
+| `architecture.input_modalities` / `.output_modalities` | `["text","image"]` / `["text"]` when the loaded container's vision tower is resident (`Model::HasVision()`), `["text"]` / `["text"]` when it is not (`--vision off`, or a container with no `vision.*` tensors). The input list has exactly ONE writer, `ModelInputModalities()` (`openai_types.cpp`); the plainer `modalities` spelling and the `capabilities` row above are driven off the same `has_vision` flag. See "Images" below. |
 
 `max_ctx` is plumbed from `ServerArgs::max_ctx` (`server_args.h`) through `EngineOptions::
 model_opts.max_ctx` into `Engine::MaxCtx()`, which both the `/v1/models` list route and the
@@ -553,8 +553,9 @@ catalogue answer, else `qe(providerType)` (`true` for `openai`/`anthropic`/`gemi
 `false` for `cohere`/`deepseek`/`mistral`, **`null` otherwise**). For `vllm`/`llama_cpp`/`custom`
 there is no catalogue entry and no provider-wide answer, so it is `null` -- and `pY` only blocks on
 an explicit `false`. **So the attach button is already open for a local connection**: Unsloth will
-happily POST `image_url` parts at this server today, and this server answers `400` (see "Request
-fields"). That is the gap the vision milestone closes; nothing has to change in Studio for it.
+happily POST `image_url` parts at this server today -- see "Images" for the exact part shape this
+server now accepts and how it renders. Nothing has to change in Studio for it: the shape it sends
+(`data:` URI, `image_url` object) is exactly the confirmed shape "Images" documents.
 
 ### (3) The click-path to get a thinking toggle
 
@@ -689,14 +690,164 @@ now renders instead of 500, a no-user-turn conversation now 400s instead of 500,
 no longer leaks the stop string into `message.content`). See `docs/status.md`'s "Milestone 4: done"
 section for the full integration accounting.
 
-## Deferred / known gaps
+## Images
 
-- **Vision**: image content parts are rejected with `400` (see above) -- the vision tower forward
-  pass is a separate milestone (`docs/status.md`); its architecture and preprocessing are now fully
-  documented (`docs/vision.md`) with real-hardware validation goldens, but no `src/model` C++ exists
-  yet, so this `400` remains accurate. Note that Unsloth Studio's attach button is ALREADY open
-  against a local connection and will POST `image_url` parts at this server today -- see "Client
-  compatibility: Unsloth Studio" (e) for the exact part shape and the gate that lets it through.
+Milestone 8 stage 5 (2026-09-22): `image_url`/`input_image` message content parts are no longer a
+deferred-feature `400` -- see [vision.md](vision.md) for the tower/splicing design this section
+wires into the OpenAI surface.
+
+**Accepted shapes** (Stage 1's Unsloth Studio investigation, plus the two alternate shapes several
+other OpenAI-compatible clients send): `{"type":"image_url","image_url":{"url":"data:..."}}` (the
+confirmed real-client shape), `image_url` as a bare string in place of the `{"url":...}` object, and
+the Responses-API-style `{"type":"input_image","image_url":"data:..."}` (`"image"` also accepted as
+the field name there). Any position in the content array, any number of images across a single
+message or a whole conversation, in any of `image/png`, `image/jpeg`, `image/gif`, `image/bmp`.
+
+**Decoded and preprocessed at PARSE time**, not in the engine: base64-decode, format sniff,
+`smart_resize` -- all pure host C++ with no HIP/`r4dx::model` dependency
+(`src/vision/CMakeLists.txt`'s own "no HIP, no r4dx_model" claim), so `openai_types.cpp` does it
+directly (`r4dx::server::ImagePart`/`ContentPart`, `ParseChatCompletionRequest`'s new `image_cfg`
+parameter) and it stays exercisable by `tests/server/test_openai_types.cpp` with no container and
+no GPU, exactly like every other request-validation rule in that file. Only the vision TOWER
+forward pass (does this container even have one? run `Model::EncodeImages`) needs the loaded
+`Model`, so that part happens one layer up, in `Engine::RunRequest` (`engine.cpp`).
+
+**Remote URLs are never fetched**: an `http://`/`https://` `image_url` is a clean `400` --
+*"remote image URLs are not fetched by this server (a local single-user server should not make
+outbound requests on a client's behalf) -- send the image as a data: URI instead"* -- regardless of
+whether the loaded container even has a vision tower (this check runs before any Model is
+consulted). This is a deliberate scope decision, not a missing feature: an r4dx server has no
+sandboxing, rate limiting, or SSRF protection around an outbound HTTP client, and none of the real
+clients this project has actually investigated (Unsloth Studio, docs/server.md's own client-
+compatibility section) send anything but a `data:` URI in the first place.
+
+**Every other bad-input case is also a clean `400`, never a crash**: a container with no vision
+tower loaded (`"this model/container has no vision tower (loaded without vision.* tensors, or
+started with --vision off)"`), an unsupported/unrecognized image format (WebP included -- stb_image,
+and therefore `r4dx::vision::DecodeImageBytes`, does not decode it), a malformed `data:` URI, base64
+that decodes to corrupt/undecodable image bytes, oversize base64
+(`kMaxImagesPerRequest`/`kMaxImageBase64Chars`, `openai_types.h` -- 8 images and ~32 MiB of base64
+text per request, generous local-server ceilings rather than hardware limits), and a prompt whose
+image tokens (after placeholder expansion) push the total past `--max-ctx`.
+
+**Chat template rendering**: a message with at least one image content part renders as a real
+content ARRAY (`{"type":"image"}`/`{"type":"text",...}` entries, order preserved) so
+`chat_template.jinja`'s own image handling fires (`vision_start`/`image_pad`/`vision_end`,
+docs/vision.md) -- every other message (the overwhelming common case) still renders as a plain
+string or JSON `null`, byte-for-byte as before this stage. The template emits exactly ONE
+`<|image_pad|>` per image; `r4dx::vision::ExpandImagePlaceholders`
+(`src/vision/image_prompt.h` -- shared by the CLI's own `--image` path and by
+`tests/vision/tool_vision_chat`) expands each single placeholder into that image's real
+merged-token-count run BEFORE the prefix-reuse decision, exactly like the HF processor does; this
+is also what makes `usage.prompt_tokens` count the real (post-expansion) image tokens with no
+separate accounting needed.
+
+**Prefix cache, image-aware** (`src/server/prefix_state.h`'s `PrefixState::ImageKey`, built in
+Milestone 8 stage 4 and now fed from real request data): every image placeholder is the SAME token
+id, so two requests carrying two DIFFERENT pictures at the same position produce byte-identical
+token sequences -- token equality alone stopped being sufficient the moment images existed.
+`Engine::RunRequest` fingerprints every image content part in the conversation (a 64-bit hash over
+the raw, post-base64-decode bytes the client sent, `Fnv1a64` in `openai_types.cpp`) and passes the
+whole list to `PrefixState::Extend`; a request whose images do not exactly extend what was already
+fed falls to the `Model::Reset()` + full-reprefill path, same as a text mismatch. When the prefix
+DOES extend, only images whose placeholder run lands in the NEW tail are handed to
+`Model::EncodeImages` -- an already-fed image's rows are already resident in the model's real
+KV/GDN state and are never re-encoded, which is the measurable point of `timings.image_n`/
+`image_ms` below (absent entirely on a turn that encoded nothing new).
+
+**The precondition on that reuse, and one thing it is NOT** (review finding re-measured,
+2026-09-22): reuse holds only while re-rendering the conversation and re-tokenizing it reproduces
+the exact token ids that were committed. The earlier turns come back as *client-supplied text* (an
+`assistant` message whose content is the string the client received), so the server re-tokenizes
+them; anything that changes those bytes on the way back -- including the client's own encoding of
+the request body -- correctly costs the prefix.
+
+The review pass reported that **any** non-ASCII character in the replayed answer breaks reuse. Two
+separate things were going on, and only one of them is this server's. The first is the measuring
+client: same conversation, same server, same real container, a turn-1 answer carrying 3 en-dashes,
+three transports:
+
+| how the turn-2 body was sent | turn 2 `timings.prompt_n` | reused? |
+|---|---|---|
+| raw UTF-8 bytes | 22 of 297 | yes -- no `image_n`, no re-encode |
+| PowerShell `Invoke-WebRequest -Body <string>`, `Content-Type: application/json` | 297 of 297 | no -- full re-prefill + `image_n=1` |
+| the same cmdlet with `application/json; charset=utf-8` | 22 of 297 | yes -- no `image_n` |
+
+PowerShell 5.1 encodes a string body with the content type's charset and falls back to Latin-1 when
+none is given, so every non-ASCII character arrives mangled and the re-rendered prompt genuinely
+differs from what was committed. The server is right to decline; the bug is client-side. (Every
+`Invoke-WebRequest` in `tools/server/smoke.ps1` now sends the charset for this reason.)
+
+The second thing is this server's, and it is real: **the decode->encode round trip is not the
+identity for every string**, so some replayed answers genuinely do not match what was committed.
+It is string-specific, not "any non-ASCII" -- sweeping a correctly-encoded client over the same
+image and the same turn-2 request:
+
+| turn-1 answer (same image, same question shape) | non-ASCII chars | reused? |
+|---|---|---|
+| English one word / long plain ASCII / markdown | 0 | yes |
+| `circle — square — triangle` (em dashes) | 2 | yes |
+| a free-form English description (en dashes) | 3 | yes |
+| emoji | 6 | yes |
+| Korean, one sentence | 25 | yes |
+| Japanese, one short sentence | 25 | yes |
+| Japanese, cut off mid-generation (`finish=length`) | 137 | yes |
+| **Japanese, one longer sentence (a different image)** | 84 | **no** |
+| **Thai, one sentence** | 104 | **no** |
+
+The two failures carry no U+FFFD and are not truncated (`finish=stop`, and the Thai one repeats at
+both `max_tokens` 80 and 250), so they are genuine tokenizer round-trip asymmetries -- the same
+class docs/status.md records on the CLI's `--chat` side (a leading-space BPE variant). En-dashes
+and em-dashes, the characters the review pointed at, are NOT the trigger; longer non-Latin text
+frequently is. Treat reuse across a turn as best-effort, not guaranteed.
+
+When it does miss, the failure is graceful -- `Model::Reset()` + full re-prefill, correct output --
+but with an image in the prompt it costs a full re-encode (~30-150 ms depending on image size) on
+top of the re-prefill, so a client that gets long CJK/Thai answers pays roughly double on every
+turn. The real fix is to dedupe re-tokenization against the raw committed token ids; it is not
+vision-specific and is not done. `smoke.ps1` pins both ends: `vision multi-turn` keeps turn 1 to
+one ASCII word so a failure there points at the image mechanism, and `vision multi-turn
+(free-form)` replays a real Japanese answer (asserted to be non-ASCII) and asserts the two outcomes
+stay CONSISTENT -- either the prefix was reused and nothing was re-encoded, or it was not and the
+image was re-encoded and the whole prompt re-prefilled. The combination it exists to catch is the
+third one: a reused prefix whose image rows were silently dropped.
+
+**Response extensions** (`src/server/openai_types.h`):
+- `GET /v1/models`: `architecture.input_modalities` and `modalities` gain `"image"`, and
+  `capabilities` gains `"image"`, whenever the loaded container's vision tower is actually resident
+  (`Model::HasVision()`) -- the one-line switch Stage 1 prepared (`ModelInputModalities`), now
+  flipped from the real Model instead of a hardcoded `["text"]`.
+- `timings.image_n`/`timings.image_ms`: how many images THIS request's own `EncodeImages` calls
+  covered and how long they took, summed across the request. Present only when at least one image
+  was actually encoded this request (the same "omit, don't zero" convention `draft_n` already
+  uses) -- absent on a text-only request, and absent on a turn whose only image was already fed on
+  an earlier turn (prefix reuse, above).
+- `usage.prompt_tokens` already counts image tokens with no code change needed: they are part of
+  the expanded token sequence by the time `usage` is computed.
+
+**CLI parity** (`src/cli/main.cpp`): `--image <path>` (repeatable) attaches one or more images to
+the next turn -- the one-shot `--prompt` itself, or (in `--chat`) whichever line is typed first;
+every later `--chat` turn attaches images with one or more leading `"/image <path>"` input lines.
+`--stats` prints the image encode time and the number of image tokens spliced into that turn's
+prefill. The CLI keeps one `ImageBatch` (grid list + device embeddings) per turn that ever attached
+an image, alive for the whole process, for the same reason the server keeps `PrefixState::
+ImageKey`: a later turn's chat-template re-render still carries every earlier turn's own image
+content part and has to re-expand its placeholder, but must not re-encode it.
+
+**Testing**: `tests/server/test_openai_types.cpp` (every parse-time rule above -- accepted shapes,
+remote-URL/format/corrupt-data/oversize/too-many-images rejection, content-hash determinism, the
+`/v1/models` modality flip, `timings.image_n`/`image_ms` JSON shape), `tests/cli/test_args.cpp`
+(`--image` parsing), and `tools/server/smoke.ps1`'s `-Vision` switch (real container only --
+describing a synthetic image, reading a rendered string back off an OCR image, two images in one
+request, image + tools, image + thinking, streaming, multi-turn prefix reuse with no re-encode,
+the reuse-or-graceful-degradation consistency check with a real non-ASCII (Japanese) answer
+replayed verbatim,
+different-image-same-text NOT reusing the prefix, and the full bad-input battery; the DEFAULT run
+against the 4-layer container, which has no vision tensors, instead asserts the one thing that must
+ALWAYS hold -- a well-formed local image against a non-vision container is a clean 400 naming the
+real reason).
+
+## Deferred / known gaps
 - **Sampling defaults vs. explicit values**: `--default-temperature`/`--default-top-p`/
   `--default-top-k`/`--default-min-p` seed every sampling field a request does not itself set
   (`openai_types.cpp`'s `ParseSampling` starts from the server's defaults and only overwrites a
@@ -989,10 +1140,22 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]
     [--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}]
     [--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N]
-    [--dflash-p-min F] [--dflash-n-min N]
+    [--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}]
+    [--image-max-pixels N]
 ```
 
 `--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
+
+`--vision {auto|on|off}` (default `auto`) and `--image-max-pixels N` (default 1048576, i.e.
+1024x1024): the vision tower, docs/vision.md. `auto` loads the container's 333 `vision.*` tensors
+(0.9154 GiB measured) iff it has them, so a text-only container is unchanged; `on` fails the load
+when the container has none; `off` reclaims the 0.9 GiB on a vision-capable container.
+`--image-max-pixels` caps pixels PER IMAGE and **downsizes** an image above it through the same
+`smart_resize` rule the reference processor uses -- it never rejects one. Both are validated and
+reported at startup, and `--image-max-pixels` is exactly the `image_cfg` every `image_url` content
+part is now decoded/preprocessed with (`ParseChatCompletionRequest`, see "Images" above) -- a
+request against a server started with `--vision off`, or against a container with no `vision.*`
+tensors at all, still gets a clean `400` naming that reason.
 
 `--dflash <draft.r4dx>` (default empty, disabled): see the "New (Milestone 5 stage S3...)" note
 above -- mutually exclusive with `--mtp N>0`.
@@ -1014,19 +1177,23 @@ parsing), `test_openai_types` (request validation + response JSON shapes, includ
 `tool_choice`/`role: "tool"`/`"function"` parsing), `test_sse` (SSE chunk formatting),
 `test_response_sink` (`BufferingSink`/`StreamingSink`, including the tool-calls streaming chunk
 shape), `test_request_queue` (`BoundedQueue` capacity/FIFO/close/threaded producer-consumer),
-`test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping, see
-"MTP" above), `test_tool_call_parser` (see "Tool calls" above -- real-capture and malformed-input
-cases for the model's surface syntax), `test_tool_stream_gate` (the live tool-call stream gate and
-its "streamed content == non-streamed content" property over every chunking of a dozen
-representative generations), `test_reasoning_splitter` (the `</think>` split). All pass as part of
-the normal `.\tests\run_tests.ps1` run.
+`test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping,
+including `TestImageAwarePrefixReuse`, see "MTP" above and "Images"), `test_tool_call_parser` (see
+"Tool calls" above -- real-capture and malformed-input cases for the model's surface syntax),
+`test_tool_stream_gate` (the live tool-call stream gate and its "streamed content == non-streamed
+content" property over every chunking of a dozen representative generations),
+`test_reasoning_splitter` (the `</think>` split). `test_openai_types` also covers every image
+content-part rule from "Images" above (accepted shapes, remote-URL/format/corrupt-data/oversize/
+too-many-images rejection, content-hash determinism, the `/v1/models` modality flip,
+`timings.image_n`/`image_ms`). All pass as part of the normal `.\tests\run_tests.ps1` run.
 
 `tools/server/smoke.ps1` is the GPU integration test: starts `r4dx-server` on HIP device 1 against
 the 4-layer test container (`--layout w4a16 --layers 4`, since that container's config.json still
 declares 64 layers -- see `--layers` above), hits `/v1/models`, a non-streaming and a streaming
 `/v1/chat/completions`, two consecutive different-prompt requests (checking the server's own stderr
-log to confirm no container reload happened -- see "Reset cost" above), a rejected-image-part
-request, and (a `-ToolRoundTrip` switch) a real tool call/result/answer multi-turn round trip
+log to confirm no container reload happened -- see "Reset cost" above), a remote-image-url-rejected
+request and (against this default container) a local-image-rejected-with-"no vision tower" request,
+and (a `-ToolRoundTrip` switch) a real tool call/result/answer multi-turn round trip
 (request offers a tool definition, the server's parsed `message.tool_calls` is fed back as a
 `role: "tool"` follow-up message, checking the server accepts it and answers), checking JSON/SSE
 shapes and status codes (the 4-layer model's text is nonsense, so only shapes/counts are checked,
@@ -1039,7 +1206,9 @@ container) -- with `-Mtp N>0` an extra check confirms at least one request's log
 path was taken -- and `-ToolRoundTrip` for the tool round-trip check (`.\tools\server\smoke.ps1
 -Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -ToolRoundTrip`; skipped by default against the
 4-layer container, whose nonsense output cannot reliably be coaxed into emitting a well-formed
-`<tool_call>` block). The live tool-call streaming checks ("Tool calls" above) run unconditionally:
+`<tool_call>` block), and `-Vision` for the full image suite against a real vision-capable
+container (`.\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16
+-Layers -1 -Vision`; see "Images" above for the checks it runs). The live tool-call streaming checks ("Tool calls" above) run unconditionally:
 a tool-offering streaming request asking a plain prose question must yield many `delta.content`
 events whose concatenation equals the same greedy request's non-streaming `message.content`, and no
 content delta may carry `<tool_call`/`</tool_call`; the per-delta arrival-time assertion (first
@@ -1114,3 +1283,17 @@ checks failed against a real running server even though every CPU-only unit test
 of them exercise real cpp-httplib chunked-transfer wire behavior) -- see `docs/validation.md`'s
 rung 5 ("generation sanity ... catches integration bugs that per-tensor/per-component diffs can
 miss") for why this class of bug needs exactly this kind of end-to-end run.
+
+**A malformed body could answer `500` with an EMPTY body instead of `400`** (found 2026-09-22 while
+re-measuring a review finding, pre-existing and not vision-specific). `ParseJsonBody` maps a JSON
+parse failure to `ApiError{400, ...}` carrying nlohmann's own message -- and for an ill-formed
+UTF-8 byte that message *quotes the offending bytes*. `RespondError` then `dump()`ed that message
+into the response JSON, and nlohmann's default handler throws `json::type_error` rather than
+serialize invalid UTF-8. The throw happened inside the handler's own `catch` block, so it escaped
+the handler entirely and cpp-httplib answered `500` with no body at all. Reproducible with any
+request whose body carries a stray high byte -- which is what PowerShell 5.1 produces from a
+`-Body <string>` containing non-ASCII when the content type names no charset, i.e. the exact
+condition the prefix-reuse repro above hits. Fixed by dumping the error body with
+`json::error_handler_t::replace`: the bad bytes become U+FFFD and the caller gets the clean
+`400 invalid_request_error` with the parser's reason, like every other bad input. Nothing this
+server generates itself is ever invalid UTF-8, so no well-formed response changed.

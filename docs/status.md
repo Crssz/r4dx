@@ -1,5 +1,340 @@
 # Status
 
+## Milestone 8: vision tower + image input -- done, integrated, measured, committed (2026-09-22, stage 8)
+
+Stage 8 (integrate/measure/document/commit) closed out the review-fix pass below and re-ran every
+gate clean-build-to-green on real hardware, HIP device 1, one process at a time.
+
+**Review findings fixed** (full detail in the commit message and each named file): stale
+"vision doesn't exist"/"NEXT stage's work" statements struck across `docs/server.md`,
+`docs/perf.md`, `src/server/engine.h`, `src/cli/main.cpp`, `docs/vision.md`,
+`src/server/openai_types.cpp`, two test file headers, and two historical `docs/status.md` blocks
+below (now marked DONE); `tests/vision/tool_vision_chat.cpp`'s private placeholder-expansion copy
+replaced with the shared `r4dx::vision::ExpandImagePlaceholders` via a thin `ExpandForPrefill`
+adapter, plus a new `tests/vision/test_image_prompt.cpp` (six cases, a negative control that fails
+6 checks when `MergedTokenCount` is off by one, restored and passing); the "any non-ASCII reply
+loses the prefix" finding was partly a client bug (PowerShell 5.1 encoding `-Body` as Latin-1
+without an explicit `charset=utf-8`, now fixed in all 37 `tools/server/smoke.ps1` calls) but real
+underneath it -- an 84-char Japanese and a 104-char Thai reply genuinely fail the tokenizer
+round-trip and fall to a full re-prefill + re-encode (ASCII/dashes/emoji/Korean/short Japanese all
+reuse); `Qwen2VLImageProcessorFast` corrected to `Qwen2VLImageProcessor` (confirmed in the
+reference venv: the `Fast` name exists, warns, and resolves to the non-`Fast` class);
+`http_server.cpp`'s pending-request `messages` now moved, not copied.
+
+**A second, unrelated bug found and fixed while re-running the repro**: a request body with an
+ill-formed UTF-8 byte returned `500` with an empty body instead of a clean `400` -- nlohmann's own
+parse-error message quotes the offending bytes, and `RespondError`'s `dump()` then threw
+`json::type_error` from inside the handler's own catch block. Fixed with
+`dump(-1, ' ', false, error_handler_t::replace)`; verified a malformed body now returns a proper
+`400` with a readable message, valid bodies unaffected. Pre-existing, text-only, not vision-related.
+
+**A third bug found while re-running this stage's own smoke gates** (not in the review): `tools/
+server/smoke.ps1`'s default (non`-Vision`) run assumed "no `-Vision` flag" implies "the container
+has no vision tower," which was true before this milestone (every `-Model` used, including the
+real 64-layer container, had no `vision.*` tensors) but stopped being true once the real container
+shipped them under `--vision auto` (load iff present, the default). Pointing `-Model` at the real
+container with `-Dflash -ToolRoundTrip` (no `-Vision`) made the script's own "clean 400 naming no
+vision tower" check fail -- not a server bug, the server was correctly answering the image. Fixed
+by having the script pass `--vision off` explicitly whenever `-Vision` is not requested, so the
+default path's assumption is enforced rather than assumed.
+
+**Gates, clean build, HIP device 1, one process at a time**:
+
+- `build.ps1 -Clean`: 195/195 targets, clean (one pre-existing unrelated MSVC `localtime`
+  deprecation note, same as every prior milestone).
+- Full `ctest`: **62 registered, 61 passed, 1 skipped (`test_kernel_bandwidth`, gitignored golden
+  absent), 0 failed, 636.47 s**.
+- `tools/validate_dflash.ps1 -AllowBatchedVerifyDivergence`: **PASSED WITH WARNINGS -- 4
+  byte-identical cells, 5 known batched-verify-mechanism divergences** (the pre-existing,
+  DFlash2-uninvolved mechanism `--mtp 7` control runs reproduce; one mxfp4 cell resolved by the
+  grouping control instead) -- same cells the prior review recorded, no new divergence, no cell
+  moved.
+- `tools/server/smoke.ps1` (default, 4-layer container): all checks pass, 97 PASS/SKIP lines.
+- `tools/server/smoke.ps1 -Model qwen38-27b-v3.r4dx -Layout w4a16 -Layers -1 -Dflash
+  qwen38-27b-dflash2-w4a16.r4dx -ToolRoundTrip`: all checks pass (after the smoke-script fix above).
+- `tools/server/smoke.ps1` same container/draft, `-Vision`: **191 PASS, 0 FAIL, 0 SKIP** -- describe,
+  OCR (`R4DXVSN8`-class exact string readback), two images, image+tools, image+thinking, streaming,
+  multi-turn reuse, different-image-no-reuse, the free-form non-ASCII multi-turn case (both outcome
+  branches consistent), and the bad-input battery (webp/corrupt/9-images, all clean 400s).
+
+**Measurements** (real 64-layer container `qwen38-27b-v3.r4dx`, `w4a16`, greedy `--temperature 0`,
+`--seed 42`, `--max-ctx 2048`, HIP device 1, every cell run twice -- full table in `docs/perf.md`'s
+"Milestone 8, stage 8" section, short version in `README.md`):
+
+- Image encode: **448x448 -> 196 tokens, ~33-34 ms; 1024x1024 -> 1024 tokens, ~159-160 ms;
+  1536x1536 at the default `--image-max-pixels` cap -> downsized to the same 1024 tokens, ~160-161
+  ms** (the cap makes a 1536x1536 image cost exactly what a 1024x1024 image costs, as designed).
+- Prefill with an image: **~995-1003 tok/s** at both 218 and 1046 real prefill tokens -- image
+  tokens prefill at the same rate as text tokens, matching the earlier stage's own finding.
+- Decode + acceptance on the same image prompt (1024x1024, 200-token answer): plain **38.5-38.6
+  tok/s**; `--mtp 3` **79.4-79.5 tok/s** (58.5% acceptance, 2.70 tok/round); `--dflash k=7` **86.9
+  tok/s** (33.1% acceptance, 3.33 tok/round) -- vision does not disturb either speculative path's
+  mechanism.
+- VRAM: `--vision off` **16.17 GiB**, `--vision auto` (loaded) **17.03-17.04 GiB** -- **+0.86-0.87
+  GiB**, consistent with the tower's own previously-measured 0.9154 GiB bf16 footprint plus
+  allocation rounding.
+- Text-only decode with the tower resident: **38.75-38.81 tok/s** (`--vision off` and `--vision
+  auto` agree to within noise) -- **no regression** against this file's own w4a16 `--mtp 0` baseline
+  range (38.18-38.98 tok/s across every prior measurement pass).
+
+**Known gaps, stated honestly, none silently narrowed**:
+
+1. Video input (`t > 1` temporal frames) -- the vision tower's patch-embed path duplicates a single
+   frame temporally per `docs/vision.md`; no multi-frame path exists or was attempted.
+2. Remote `http(s)://` image URLs are rejected with a clean `400` by design (never fetched) -- not
+   a gap so much as a deliberate scope boundary, restated here since it is a real client-facing
+   limitation.
+3. `image/webp` is rejected (unsupported decode format) -- `image/png`, `jpeg`, `gif`, `bmp` only.
+4. The image-aware prefix cache's non-ASCII round-trip gap (above): a reply whose text does not
+   survive re-tokenization byte-for-byte falls back to a full re-prefill and (if an image is
+   involved) a full re-encode -- correct output, not always the cheap path; root cause (dedupe
+   against committed token ids rather than re-tokenized text) not fixed this stage.
+5. `r4dx-cli --chat`'s own separate, pre-existing multi-turn re-render limitation (not
+   vision-specific, documented in stage 5's own entry below) still applies when an image is
+   involved, same as when one is not.
+6. No real-photograph end-to-end check has ever been run on this project -- every image used in
+   every stage's verification, including this one, is synthetically rendered with System.Drawing.
+7. A batch of images large enough to hit `kMaxImagesPerRequest`, and every layout other than
+   `w4a16`, remain unmeasured for vision-specific throughput (text-only perf across w4a8/mxfp4 is
+   unaffected by vision and already covered elsewhere in this file).
+
+## Milestone 8 stage 5: user-facing wiring -- CLI --image, server image input, client compatibility -- done (2026-09-22)
+
+All seven listed deliverables shipped and verified on real hardware; nothing committed. Full
+detail: [vision.md](vision.md)'s "User-facing wiring: --image and image_url" and
+[server.md](server.md)'s "Images". Summary:
+
+1. **CLI**: `--image <path>` (repeatable, `src/cli/cli_args.h`/`main.cpp`) attaches to the next
+   user turn -- the one-shot `--prompt` itself, or (in `--chat`) whichever line is typed first;
+   every later `--chat` turn attaches images via one or more leading `"/image <path>"` REPL lines.
+   `--vision on|off|auto` and `--image-max-pixels` already existed (stage 3); `--stats` gains an
+   `[stats] image: ...` line (encode ms, then spliced image token count).
+2. **Server, `/v1/chat/completions`**: OpenAI content-part arrays with `image_url`/`input_image`
+   (the confirmed Unsloth Studio shape plus the two alternates several other clients send -- a bare
+   string in place of the `{"url":...}` object, and the Responses-API `"input_image"` type), any
+   position, multiple images, multiple turns, in `image/png`/`jpeg`/`gif`/`bmp`. Remote
+   `http(s)://` URLs are never fetched (`400`, with the reason spelled out). WebP/corrupt/oversize
+   base64/too-many-images/`--max-ctx`-exceeding all clean `400`s, never a crash. Replaces the old
+   deferred-feature `400` entirely.
+3. **Chat template**: a message with at least one image content part renders as a real content
+   array (`{"type":"image"}`/`{"type":"text",...}`, order preserved) so
+   `chat_template.jinja`'s own `vision_start`/`image_pad`/`vision_end` handling fires; the ONE
+   shared `r4dx::vision::ExpandImagePlaceholders` (`src/vision/image_prompt.h`, new -- used by both
+   the CLI and the server) expands each single `<|image_pad|>` marker into that image's real
+   merged-token-count run before the prefix-reuse decision, exactly like the HF processor does.
+4. **Prefix cache**: `PrefixState::ImageKey` (built stage 4) is now fed from real request data -- a
+   64-bit FNV-1a hash of each image's raw bytes, computed once at parse time
+   (`openai_types.cpp`). Two different images at the same conversation position never reuse each
+   other's KV state (verified: falls to full reprefill); the same image's rows are not re-encoded
+   on a later turn (verified: that turn's `timings` carries no `image_n` key at all) **for as long
+   as the replayed conversation re-tokenizes to what was committed** -- best-effort, not
+   guaranteed. Re-measured after the review pass (2026-09-22): the review's "ANY non-ASCII reply
+   loses the prefix" was partly its PowerShell client encoding the body as Latin-1 for want of a
+   `charset=utf-8` (fixed in `smoke.ps1`, all 37 calls), but underneath it there IS a real,
+   string-specific round-trip gap. With a correct client: ASCII, em/en dashes, emoji, Korean and
+   short Japanese reuse; an 84-char Japanese sentence and a 104-char Thai one do not (no U+FFFD,
+   `finish=stop`) and fall to a full re-prefill plus a full re-encode. A new `vision multi-turn
+   (free-form)` smoke case replays a Japanese answer and asserts the two outcomes stay consistent
+   (reused => nothing re-encoded; not reused => image re-encoded and whole prompt re-prefilled)
+   rather than asserting a coin flip. Full table: docs/server.md's "Prefix cache, image-aware".
+5. **`/v1/models`**: `architecture.input_modalities`/`modalities`/`capabilities` gain `"image"`
+   when `Model::HasVision()` is true (the one-line switch stage 1 prepared); `usage.prompt_tokens`
+   already counted image tokens with no code change needed (they are part of the expanded token
+   sequence by the time usage is computed); `timings` gains `image_n`/`image_ms`, present only when
+   this request's own `EncodeImages` calls actually ran.
+6. **`tools/server/smoke.ps1 -Vision`**: real container only, synthetic PNGs generated in-script
+   with System.Drawing (nothing committed to `tests/data`) -- describe, OCR (reads a rendered
+   string back **exactly**), two images, image+tools, image+thinking, streaming, multi-turn reuse,
+   different-image-no-reuse, and a bad-input battery, all passing. The default (non-`-Vision`) run
+   against the 4-layer text-only container instead asserts the one thing that must always hold: a
+   clean `400` naming "this model/container has no vision tower".
+7. **Text-only regression**: full `ctest` green (61 registered, up from 59, 60 passed, 1 skipped,
+   0 failed, 639.10 s, HIP device 1 -- see below), `smoke.ps1` default and real-container runs
+   unchanged and green, docs updated.
+
+**A real bug found and fixed while verifying the CLI manually** (not caught by any unit test,
+since none of them drive real stdin): a redirected/piped stdin can prepend a UTF-8 BOM to the
+very first line, which silently defeated the `"/image "` prefix check on exactly the line most
+likely to be it -- `main.cpp`'s `--chat` loop now strips a leading BOM on the first line and a
+trailing `'\r'` on every line before checking for the command.
+
+**A real, pre-existing (not new) limitation surfaced while verifying the CLI's own multi-turn
+image reuse**: unlike the server (which re-derives everything from the client's own resent
+`messages` array every request), `r4dx-cli --chat` continues from a persistent, LOCALLY re-rendered
+conversation, and a genuinely simple one-word greedy answer ("circle") triggered the
+already-documented "chat template re-render did not extend the previous token prefix" fallback --
+traced (with a temporary debug print, since removed) to the FIRST generated token's own leading-
+space BPE variant not surviving decode-then-re-encode when the same text is later replayed as a
+plain `assistant` message string, not to anything image-specific: a text-only two-turn `--chat`
+conversation against the same container does not hit it. The fallback path is correct (it
+re-splices every image with real embeds and re-prefills from scratch, producing the right answer,
+confirmed: "red") and pre-dates this stage; the server's own image-aware prefix reuse (item 4
+above) uses a structurally different, per-request mechanism and does not share this failure mode.
+**Re-measured during the review-fix pass (2026-09-22)**, after a review finding claimed the server
+shared it: **it does -- the server has the same round-trip gap, this file was wrong to say it does
+not.** The finding's own evidence (en-dashes break reuse) was its PowerShell client encoding the
+body as Latin-1 for want of a `charset=utf-8` on the content type, now fixed in
+`tools/server/smoke.ps1` (all 37 `Invoke-WebRequest` calls). But sweeping real answers with a
+correct client found genuine server-side misses: an 84-char Japanese sentence and a 104-char Thai
+one both fail to round-trip (`finish=stop`, no U+FFFD) and cost a full re-prefill AND a full
+re-encode, while ASCII, em/en dashes, emoji, Korean and a shorter Japanese sentence all reuse. So
+the trigger is the specific string, not "non-ASCII" and not images. Left as a known limitation on
+both sides, not routed around: the real fix is to dedupe re-tokenization against the raw committed
+token ids the way `PrefixState` already does for text. The new `vision multi-turn (free-form)`
+smoke case replays a Japanese answer and asserts the two outcomes stay CONSISTENT (reused => no
+re-encode; not reused => re-encode + full re-prefill), which is the invariant that must hold
+whichever way the round trip goes.
+
+**Real-hardware evidence** (`tools/server/smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx
+-Layout w4a16 -Layers -1 -Vision`, HIP device 1):
+
+```
+[PASS] vision: OCR response contains the rendered string 'R4DXVSN9' (got 'R4DXVSN9')
+[PASS] vision: describe timings.image_n == 1            [PASS] vision: two-images timings.image_n == 2
+[PASS] vision multi-turn: turn 2 timings carries NO image_n (the image was NOT re-encoded)
+[PASS] vision multi-turn: turn 2 timings.prompt_n (24) < usage.prompt_tokens (121)
+[PASS] vision multi-turn (different image): prefix NOT reused -- timings.prompt_n == usage.prompt_tokens
+[PASS] vision bad input: unsupported format (webp) / corrupt data / 9 images -- all 400
+```
+
+Plus, real `r4dx-cli --image` (same container, one-shot): a synthetic red-circle PNG generated with
+System.Drawing correctly described as *"The image shows a red circle."*, `[stats] image: 1
+image(s) encoded in 15.2 ms` / `64 image token(s) spliced into this prefill`.
+
+**Full `ctest`**: 61 registered (up from 59 -- `test_cli_args`'s new `TestImageFlag`;
+`test_openai_types`'s dozen new image-parsing cases run inside that existing binary, not as new
+registered targets), 60 passed, 1 skipped (`test_kernel_bandwidth`, gitignored golden absent),
+0 failed, 639.10 s, HIP device 1 -- identical pass/skip counts to stage 4's own baseline plus the
+one new registered test, no regression.
+
+**Known gaps, not silently narrowed**:
+
+1. The CLI `--chat` multi-turn image-reuse limitation described above (a pre-existing, generic
+   text-round-trip risk, not vision-specific) -- correct output either way, just not always the
+   cheap path.
+2. `--image-max-pixels`'s downsizing path was not separately re-exercised against a real vision
+   request this stage (stage 3 already validated it against the raw preprocessing pipeline
+   directly); nothing about this stage's own code touches that logic.
+3. No non-synthetic (real photograph) end-to-end check this stage -- `docs/vision.md`'s stage 3/4
+   passes already noted this as an open item; the synthetic images here (shapes + rendered text)
+   are what stage 6's own task brief and this stage's -Vision suite both use.
+
+## Milestone 8 stage 4: text-side splicing + 3-axis mrope through decode -- done (2026-09-22)
+
+The model answers questions about a picture. Full detail and every measurement:
+[vision.md](vision.md)'s "Text-side splicing" and "Splicing pass: what was measured". Summary:
+
+- **`Model::PrefillMultimodal(tokens, spans)`**: validates each `ImageSpan` against the real
+  tokens (including that the tokens under it are the container's own `image_token_id`, now read
+  from `__metadata__.model_config`'s top level rather than hardcoded), overwrites the
+  placeholder rows with the merger's rows (one D2D copy per span/chunk intersection -- both sides
+  are contiguous, so no kernel and no per-row loop), feeds per-token 3-axis positions, and records
+  the mrope delta.
+- **Rope position and KV slot are now separate quantities.** `attn_positions_` keeps its original
+  meaning (slot mapping, sequence index); a new trailing `rope_pos3` on
+  `AttentionLayer::Forward` routes to the new `r4dx_rope_partial_mrope3_bf16` when non-null.
+  `Model::RopePositionsForChunk` is the ONE helper every rope call site goes through and returns
+  `nullptr` outright for a text-only conversation -- which is what makes "text-only is unchanged"
+  structural rather than a claim.
+- **Every rope call site routed**: `RunChunk`, `VerifyWindow`, `DecodeStepProfiled`,
+  `PrefillProfiled`, `MtpHead::Draft` (scalar delta -- its positions are all past the prompt),
+  `MtpHead::PrimeKv` (real `[3,n]` rows -- its positions are INSIDE the prompt and can land on
+  image rows), `DflashDraft::InjectFeatures` and `DflashDraft::DraftRound`. GDN layers have no
+  rope. A new `MakeAttnConfig` (`src/model/attn_config.h`) replaces five hand-written copies of
+  the same `AttnConfig` assignments, so a site cannot silently miss the new mrope-section fields.
+- **DFlash2**: ropes on the mrope temporal axis (sections `[64,0,0,0]`) while its ring slot and
+  SWA window stay in sequence space -- forced, because an image's ~196 merged tokens share one
+  temporal position and would collide onto one ring slot.
+- **New kernel** `r4dx_rope_partial_mrope3_bf16`, implementing
+  `Qwen3_5TextRotaryEmbedding.recomposition_frequencies`' bin->stream assignment with the section
+  bounds carried explicitly. Three identical rows make it **bit-identical** to the single-row
+  kernel (0 of 207,872 elements differ), which is the basis of the text-only-unchanged argument.
+  `tests/kernels/test_rope_mrope3.cpp` also covers a `[16,10,6]` split, which differs from a naive
+  `bin % 3` on 5 of 32 bins where this model's own `[11,11,10]` differs on **0**.
+- **Layer-level golden** (`tools/reference/mrope_layer_golden.py` +
+  `tests/model/attention/test_mrope_attn_layer.cpp`): real layer 3, real weights, real
+  `get_rope_index` rows for a prompt with a 10x16-patch image. prefill **1.22e-2**, decode
+  **1.58e-2** (bound 2e-2); the negative control (roping at the KV slot index) lands at **5.48e-2**,
+  4.5x higher, so the test can actually tell a correct 3-axis rope from no mrope.
+- **The engine's own rope rows for a REAL rendered prompt** match the unmodified reference:
+  `rope_index_golden.py --verify-prompt` on a two-image, 517-token prompt reports *all 1551
+  position ids match the reference exactly, delta=-462*. Plus continuation-split coverage on all
+  five committed cases (0 mismatches over 72 split points).
+- **End to end, greedy, real container** (`tests/vision/tool_vision_chat`): the synthetic golden
+  image described correctly (gradient, checkerboard, circle), a 3-bar chart's count/colours/
+  ordering correct, "5" for five circles, and `R4DX7391` read exactly off a rendered text image.
+  The OCR misreads at lower render sizes are monotone in the patch grid, i.e. resolution, not
+  position ids.
+- **Speculative decode with an image**: `--mtp 3` 2.91 tokens/round (62.1% acceptance),
+  `--dflash k=7` 3.14 tokens/round (29.9%), both byte-identical to plain decode and both HIGHER
+  than the same question asked without a picture (2.21 / 2.52).
+- **Multi-turn prefix reuse** across a turn containing an image works (331 of 356 tokens reused,
+  delta carried). `PrefixState` gained an `ImageKey` list, because every placeholder is the same
+  token id and two different pictures at the same position tokenize identically.
+- **Text-only is byte-identical to a build of commit `20cdee3`** on plain, `--mtp 3` and
+  `--dflash k=7` (same SHA-256 each), and `validate_dflash.ps1
+  -AllowBatchedVerifyDivergence` reports the same 4-byte-identical / 5-known-divergence split, on
+  the same cells, as the table below already records.
+
+~~Not done (the next stage's): `--image` on `r4dx-cli` and `image_url` on the server (still
+correctly `400`).~~ **Both DONE in stage 5 (2026-09-22) -- see the top of this file.**
+`tool_vision_chat` remains as the splice/mrope driver (`--show-positions`, `--dump-prompt`,
+`--turn2`), which `--image` has no equivalent of.
+
+## Milestone 8 stage 3: the vision tower on the GPU -- done (2026-09-21)
+
+`Qwen3_5VisionModel`'s forward now runs on device. Full detail, every measurement and every
+derivation: [vision.md](vision.md). Summary:
+
+- **`src/vision/vision_weights.{h,cpp}`**: the container's 333 `vision.*` bf16 tensors into VRAM,
+  config-validated (element counts, and a head_dim != 72 rejected at load rather than at the first
+  `r4d_attn_vit_h72_bf16` launch). **0.9154 GiB measured** (0.8582 GiB of tensor bytes + hipMalloc
+  rounding across 333 small allocations).
+- **`src/vision/vision_tower.{h,cpp}`**: patch embed -> learned position embedding -> 27 encoder
+  blocks over `r4d_attn_vit_h72_bf16` with per-image `cu_seqlens` -> the 2x2 patch merger, in
+  1024-row scratch chunks. `Model::EncodeImages` is the entry point; `Container` owns the weights.
+- **Five new kernels** in `src/kernels` (`layernorm` with weight+bias, `bias_add`, `gelu_tanh`,
+  `gelu_erf`, `vision_qkv_rope`, `vision_pos_embed`), each against a CPU reference at **one bf16
+  ulp** (`tests/kernels/test_vision_kernels.cpp`, always-on, no golden needed).
+- **`r4d_attn_vit_h72_bf16` needed no submodule change** -- already compiled in this Windows LLP64
+  build, and `block0_attn_proj_out` (downstream of it) matches at the same `rel_l2` as its own
+  input, i.e. it amplifies nothing.
+- **Load policy** `--vision {auto|on|off}` on both binaries (`auto` = load iff the container has a
+  tower). Text-only output is **byte-identical** across all three modes on the real container
+  (same SHA-256), so a text-only run pays nothing.
+- **`--image-max-pixels N`**, default **1048576** chosen from the measurements below; it downsizes
+  through `smart_resize` rather than rejecting.
+- **Perf** (`tests/vision/tool_vision_bench`, real container, best of 3): 448x448 **27.7 ms** /
+  26.9 MiB scratch, 1024x1024 **149.5 ms** / 77.4 MiB, 1536x1536 **396.7 ms** / 147.8 MiB,
+  2048x2048 **858.8 ms** / 246.5 MiB. With the 27B model loaded at the full `--max-ctx 262144`, a
+  2048x2048 encode still leaves **6.560 GiB free**.
+- **Validation**: 56 tensors across all three golden cases (`tests/vision/test_vision_tower.cpp`),
+  including every `block_00..26_output` and the two-segment two-image case, plus a per-block
+  localization pass that runs each block from the reference's own input.
+- **Full `ctest`, three end-to-end runs**: **58 passed / 1 skipped (`test_kernel_bandwidth`,
+  gitignored golden) / 0 failed, 657.10 s** (run 1), then one run with `test_mtp` hitting the
+  known intermittent `0xc0000409` Windows fail-fast at 344 s, then **58 / 1 / 0, 659.68 s** on the
+  final tree. 59 registered, up from 57. The run-2 failure is the same box-level flake this
+  milestone already recorded twice in `test_mtp` and `test_forward_smoke`; `test_mtp` performs no
+  vision work beyond one "does this container have vision tensors" probe that returns false.
+  Detail in [vision.md](vision.md).
+
+**The one numeric finding worth carrying forward**: agreement against the committed golden degrades
+with depth (4.4e-3 at `block_00_output`, 9.4e-2 at `block_26_output`). It was root-caused, not
+tolerated. `transformers`' `eager_attention_forward` -- which the golden was generated with --
+rounds the attention scores to bf16 before the softmax and the probabilities to bf16 before the
+`P @ V` matmul; SDPA and `r4d_attn_vit_h72_bf16` keep them in fp32/f16. Regenerating the same case
+with SDPA (`vision_golden.py --attn-impl sdpa`, new, default unchanged) shows the reference's own
+two implementations disagreeing with each other by **6.74e-2** at `merger_output`, against r4dx's
+**6.73e-2** from eager and **5.35e-2** from sdpa: r4dx sits inside the reference's own spread and
+is closer to the fp32-accumulating implementation. Per-block errors are uniform (1.9e-3 .. 1.2e-2)
+with no outlier block. See vision.md's "Why the deep-block disagreement is not an r4dx error".
+
+~~**Not done, deliberately** (the next stage's work): splicing the merged rows into the text
+embedding sequence at the `248056` placeholder positions, `mrope_position_delta` through decode,
+`--image` on the CLI, `image_url` on the server (still `400`), and the rung-5 end-to-end
+description check.~~ **All five DONE in stages 4 and 5 (2026-09-22) -- see the top of this file.**
+
 ## Milestone 6: speculative sampling -- done (2026-09-21, Integrate stage)
 
 Real chat traffic sends `temperature` 0.6-1.0, so every speculation win Milestone 5 measured

@@ -38,6 +38,7 @@
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
+#include "vision_tower.h"  // src/vision: the device-side vision tower (docs/vision.md)
 
 namespace r4dx::model {
 
@@ -123,6 +124,20 @@ struct ModelOptions {
   // against a bf16, w4a16, w4a8 or mxfp4 DFlash2 draft container, independently, exactly like the
   // draft's own weights are a completely separate set of tensors from the target's.
   std::string dflash_container;
+  // Vision tower (docs/vision.md "Load policy"). The 333 `vision.*` tensors are ~0.90 GiB of
+  // bf16 that a text-only run must not pay for, so this is a three-way choice rather than a bool:
+  //   kAuto (default) -- load them iff the container actually has them. This is what the server
+  //     and the CLI default to: a vision-capable container serves images out of the box, and a
+  //     text-only container (the 4-layer test container, any --language-model-only convert) loads
+  //     exactly as it did before this milestone, with no warning and no extra byte.
+  //   kOn  -- load them, and THROW if the container has none, so a caller that meant to serve
+  //     images finds out at startup instead of at the first request.
+  //   kOff -- never load them, even from a vision-capable container. The escape hatch for a
+  //     VRAM-constrained text-only run on the real container (measured: 0.8886 GiB reclaimed,
+  //     docs/vision.md).
+  // Exposed as `--vision {auto|on|off}` on both binaries.
+  enum class VisionMode { kAuto, kOn, kOff };
+  VisionMode vision = VisionMode::kAuto;
 };
 
 class Model {
@@ -159,6 +174,21 @@ class Model {
   const ModelConfig& Config() const { return container_.Config(); }
   const Container& GetContainer() const { return container_; }
 
+  // ---- vision tower (docs/vision.md) -----------------------------------------------------------
+  // True iff this Model can encode an image: the container carried vision.* weights AND
+  // ModelOptions::vision resolved to "on". EncodeImages throws otherwise, rather than returning
+  // an empty result a caller could mistake for a blank image.
+  bool HasVision() const { return vision_.has_value() && container_.HasVision(); }
+
+  // `pixel_values`/`grids` are r4dx::vision::PreprocessImages' output (host, fp32). Writes the
+  // merged image embeddings, [sum(merged tokens), hidden_size] bf16, into `out` on the device --
+  // the rows that a later milestone splices into the text embedding sequence at the image
+  // placeholder positions.
+  void EncodeImages(const float* pixel_values, int64_t total_patches,
+                    const std::vector<vision::GridThw>& grids, core::DeviceBuffer<uint16_t>* out,
+                    vision::VisionEncodeStats* stats = nullptr,
+                    const vision::VisionTrace* trace = nullptr);
+
   // Number of tokens already committed into the KV/GDN state (0 before the first Prefill call).
   int64_t PositionCount() const { return pos_; }
 
@@ -187,6 +217,58 @@ class Model {
   // pointer compare per chunk, never invoked).
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids,
                               const std::function<void()>& on_chunk_captured = nullptr);
+
+  // ---- multimodal prefill (docs/vision.md "Text-side splicing") ---------------------------------
+  // One image occurrence inside a PrefillMultimodal call's OWN token vector.
+  struct ImageSpan {
+    // Index of the first image-placeholder token (config.json's image_token_id, 248056) within
+    // THIS call's `token_ids` -- not an absolute sequence index, so a continuation prefill states
+    // its spans relative to the tail it is feeding, exactly as it states its tokens.
+    int64_t offset = 0;
+    // Length of the placeholder run == the image's MERGED token count
+    // (grid.MergedTokenCount(merge_size)). Validated against `grid` and against the tokens
+    // actually present at [offset, offset+tokens).
+    int64_t tokens = 0;
+    // The image's PATCH grid (pre-merge), which is what the mrope advance rule
+    // `current_pos += max(grid.h, grid.w) / merge_size` reads -- NOT the merged grid, and NOT the
+    // token count (docs/vision.md).
+    vision::GridThw grid;
+    // Device [tokens, hidden_size] bf16: this image's rows of Model::EncodeImages' output, which
+    // overwrite the embed_tokens lookup at the placeholder positions.
+    const uint16_t* embeds = nullptr;
+  };
+
+  // Prefill with images spliced in. Identical to Prefill() in every other respect (same chunking,
+  // same GDN/KV bookkeeping, same returned tail logits, same `on_chunk_captured` contract), plus:
+  //   (a) the embedding rows at each span's placeholder positions are overwritten with that span's
+  //       merger rows instead of an embed_tokens lookup;
+  //   (b) every full-attention layer's rope gets per-token 3-axis (t,h,w) position ids built by
+  //       r4dx::vision::BuildMropePositionIds, continued from this Model's current mrope state;
+  //   (c) the resulting mrope delta is recorded, so every later decode / MTP verify / MTP draft /
+  //       DFlash2 step in this conversation ropes at `sequence_index + delta` while its KV slot
+  //       stays the plain sequence index.
+  // `images` must be sorted by `offset` and non-overlapping. An EMPTY `images` on a Model that has
+  // never seen one takes the exact pre-vision code path (no extra upload, no extra kernel, the
+  // single-row rope entry point) and is byte-identical to Prefill(); an empty `images` on a Model
+  // that HAS seen one is the multi-turn continuation case and keeps roping at the carried delta.
+  //
+  // `rope_rows_out` (diagnostics, non-null only under the validation tooling): receives the
+  // [3, token_ids.size()] rows this call actually fed the rope kernel, compact and indexed from 0.
+  // These are the engine's OWN rows, not a re-derivation -- which is the point: it is what lets
+  // tools/reference/rope_index_golden.py --verify-prompt check them against the unmodified
+  // reference `get_rope_index` for a REAL rendered prompt rather than for a synthetic fixture.
+  std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids,
+                                        const std::vector<ImageSpan>& images,
+                                        const std::function<void()>& on_chunk_captured = nullptr,
+                                        std::vector<int32_t>* rope_rows_out = nullptr);
+
+  // True once an image has been spliced into this conversation, i.e. once rope positions and KV
+  // slot indices have diverged. False for every text-only conversation, which is exactly the
+  // condition under which every rope call site keeps its pre-vision single-row path.
+  bool MropeActive() const { return mrope_active_; }
+  // The rope position a token at absolute sequence index `s` gets is `s + MropeDelta()` on all
+  // three axes, for every `s` past the last image (docs/vision.md). 0 for a text-only conversation.
+  int64_t MropeDelta() const { return mrope_delta_; }
 
   // Feeds one more token through the model, continuing state from the previous Prefill/DecodeStep
   // call. Returns fp32 logits[vocab] for the token that follows `token_id`.
@@ -684,6 +766,42 @@ class Model {
   core::DeviceBuffer<int32_t> attn_positions_;  // [max_chunk_]
   core::DeviceBuffer<int32_t> attn_seqused_k_;  // [1]
 
+  // ---- 3-axis mrope state (docs/vision.md "Text-side splicing") ---------------------------------
+  // Once an image has been spliced into this conversation, a token's ROPE position stops being its
+  // sequence index. `attn_rope_pos_` is the per-chunk [3, T] companion to attn_positions_ above --
+  // same "uploaded once per chunk, shared by every full-attention layer, NOT arena-allocated"
+  // lifetime and the same blocking-upload-only-when-the-device-is-idle hazard.
+  //
+  // Everything here stays at its post-construction value for a text-only conversation, and
+  // `mrope_active_ == false` is what keeps every rope call site on its pre-vision single-row path
+  // (RopePositionsForChunk returns nullptr), so a text-only run is unchanged byte for byte.
+  core::DeviceBuffer<int32_t> attn_rope_pos_;  // [3 * max_chunk_], rows t/h/w, compact per chunk
+  std::vector<int32_t> rope_pos_host_;         // [3 * max_chunk_] staging for the upload above
+  bool mrope_active_ = false;
+  // A token at absolute sequence index `s` past the last image ropes at `s + mrope_delta_`.
+  int64_t mrope_delta_ = 0;
+  // The block PrefillMultimodal is CURRENTLY feeding: its per-token [3, N] rows (compact, indexed
+  // from 0) and the absolute sequence index its row 0 sits at. Empty outside such a call -- every
+  // position outside this range is text and gets `s + mrope_delta_` on all three axes.
+  std::vector<int32_t> mrope_block_;
+  int64_t mrope_block_base_ = 0;
+  // The image spans of that same block, same index space as mrope_block_.
+  std::vector<ImageSpan> mrope_block_images_;
+
+  // Fills rope_pos_host_/attn_rope_pos_ with the [3, T] rope rows for absolute sequence positions
+  // [start, start+T) and returns the device pointer AttentionLayer::Forward's `rope_pos3` wants --
+  // or nullptr when this conversation has no mrope divergence at all, which is what keeps a
+  // text-only run on the pre-vision path. Blocking upload: same precondition as attn_positions_'
+  // own (the device must be idle at the call site).
+  const int32_t* RopePositionsForChunk(int64_t start, int64_t T);
+  // Fills `out3` (resized to 3*T) with the same rows on the HOST, for a caller that does its own
+  // upload (MtpHead::PrimeKv) or needs only the temporal row (DflashDraft). Always fills, even for
+  // a text-only conversation (where every row is just `start + t`).
+  void RopePositionsHost(int64_t start, int64_t T, std::vector<int32_t>* out3) const;
+  // Overwrites `dst`'s rows with the merger embeddings of whichever pending image spans intersect
+  // the chunk at absolute positions [start, start+T). No-op when mrope_block_images_ is empty.
+  void SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64_t hidden);
+
   std::vector<std::optional<GdnStateManager>> gdn_states_;             // one per GDN layer
   std::vector<std::optional<attention::PagedKvCache>> kv_caches_;      // one per attn layer
   GdnControlCache gdn_control_;  // shared by every GDN layer -- see gdn_state.h
@@ -761,6 +879,13 @@ class Model {
   // have no way to drain a capture Model itself does not know how to consume. VerifyWindow never
   // auto-injects into this (or any) drafter, by design -- see DecodeStepDflashGreedy.
   std::optional<DflashDraft> dflash_;
+
+  // ---- vision tower (docs/vision.md) -----------------------------------------------------------
+  // Present iff the container's vision.* weights were loaded (ModelOptions::vision resolved to on).
+  // Holds only the encode stream and the scratch arena -- the weights themselves live in
+  // container_, and are passed to Encode per call, so moving this Model cannot leave the tower
+  // pointing at a moved-from container.
+  std::optional<vision::VisionTower> vision_;
 };
 
 }  // namespace r4dx::model

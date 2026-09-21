@@ -136,6 +136,30 @@ struct CliArgs {
   // disables it -- the whole draft is discarded (not just truncated) when the walk produced fewer
   // than this many tokens.
   int64_t dflash_n_min = 0;
+  // Vision tower (docs/vision.md "Load policy", model.h's ModelOptions::vision). "auto" (default)
+  // loads the container's ~0.90 GiB of vision.* weights iff it has them, so a text-only container
+  // is byte-identical and byte-for-byte as cheap as it was before this milestone; "on" additionally
+  // fails the load when the container has none; "off" never loads them.
+  std::string vision = "auto";
+  // Per-image pixel cap (docs/vision.md "Large images"). An image whose h*w exceeds this is
+  // DOWNSIZED through the same `smart_resize` rule the reference processor uses -- not rejected --
+  // so a large attachment still answers, just at a coarser patch grid. 0 means "the checkpoint's
+  // own preprocessor_config.json ceiling" (16777216 pixels, i.e. effectively uncapped).
+  //
+  // The default is 1048576 (1024x1024, a 64x64 patch grid, 1024 merged tokens). That is a measured
+  // choice, not a round number: at 1024x1024 an encode costs 151 ms and 95 MiB of scratch, while
+  // 1536x1536 costs 400 ms / 188 MiB and 2048x2048 costs 862 ms / 319 MiB -- the tower's attention
+  // is quadratic in the patch count, so the cost per additional pixel roughly doubles across that
+  // range while the marginal detail does not. Raise it explicitly for an OCR-type workload; the
+  // scratch grows linearly and 2048x2048 still fits next to the loaded 27B model with ~29.5 GiB
+  // free (docs/vision.md has the table).
+  int64_t image_max_pixels = 1048576;
+  // --image <path> (repeatable): attach one or more images to the NEXT user turn -- the one-shot
+  // --prompt itself, or (in --chat) whichever line is typed first. Every later --chat turn instead
+  // attaches images via one or more leading "/image <path>" input lines (main.cpp) -- a REPL
+  // command is the natural per-turn equivalent of this flag once the conversation is already
+  // running interactively.
+  std::vector<std::string> image_paths;
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -154,7 +178,8 @@ inline std::string CliUsageText(const char* argv0) {
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
          "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}] "
-         "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N]";
+         "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N] "
+         "[--vision {auto|on|off}] [--image-max-pixels N] [--image <path> ...]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -224,6 +249,9 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--dflash-k") a.dflash_k = ParseI64("--dflash-k", NextCliArg(argc, argv, i, "--dflash-k"));
     else if (arg == "--dflash-p-min") a.dflash_p_min = ParseFloat("--dflash-p-min", NextCliArg(argc, argv, i, "--dflash-p-min"));
     else if (arg == "--dflash-n-min") a.dflash_n_min = ParseI64("--dflash-n-min", NextCliArg(argc, argv, i, "--dflash-n-min"));
+    else if (arg == "--vision") a.vision = NextCliArg(argc, argv, i, "--vision");
+    else if (arg == "--image-max-pixels") a.image_max_pixels = ParseI64("--image-max-pixels", NextCliArg(argc, argv, i, "--image-max-pixels"));
+    else if (arg == "--image") a.image_paths.push_back(NextCliArg(argc, argv, i, "--image"));
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -251,6 +279,14 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.profile_token < 1) throw CliUsageError("--profile-token must be >= 1");
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
     throw CliUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
+  if (a.vision != "auto" && a.vision != "on" && a.vision != "off") {
+    throw CliUsageError("--vision must be 'auto', 'on' or 'off'");
+  }
+  // 1024 pixels is 2x2 patches, i.e. exactly one merged token -- the smallest image that produces
+  // anything at all. Anything below that is a typo, not a policy.
+  if (a.image_max_pixels != 0 && a.image_max_pixels < 1024) {
+    throw CliUsageError("--image-max-pixels must be 0 (the checkpoint's own ceiling) or >= 1024");
   }
   if (a.profile && a.profile_prefill) {
     throw CliUsageError("--profile and --profile-prefill are mutually exclusive");

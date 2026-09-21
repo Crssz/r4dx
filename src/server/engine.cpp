@@ -7,6 +7,7 @@
 #include <random>
 #include <stdexcept>
 
+#include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md)
 #include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
 #include "reasoning_splitter.h"
@@ -105,6 +106,18 @@ void Engine::LoadAndStart() {
   model_ = std::make_unique<r4dx::model::Model>(r4dx::model::Model::Load(opts_.model_opts));
   model_id_ = model_->GetContainer().ModelId();
 
+  // The preprocessing config every image attachment will be decoded with (docs/vision.md "Large
+  // images"). Built once here, not per request: `--image-max-pixels` is a server-lifetime policy,
+  // and building it at load time is also what makes a bad value fail at startup rather than on the
+  // first request with an image.
+  image_preproc_ = r4dx::vision::MakeImageProcessorConfig(opts_.image_max_pixels);
+  if (model_->HasVision()) {
+    std::fprintf(stderr,
+                 "[r4dx-server] vision tower ready (image_max_pixels=%lld, an image above that is "
+                 "downsized by smart_resize, not rejected)\n",
+                 static_cast<long long>(image_preproc_.max_pixels));
+  }
+
   worker_ = std::thread(&Engine::WorkerLoop, this);
 }
 
@@ -130,7 +143,24 @@ void Engine::WorkerLoop() {
 
 void Engine::RunRequest(PendingRequest& req) {
   try {
-    std::vector<r4dx::TokenId> full_tokens;
+    // The (possibly image-EXPANDED) prompt token sequence -- see the vision block below for why
+    // this is int32 rather than r4dx::TokenId from the start (ExpandImagePlaceholders and every
+    // downstream Model call want int32_t). `image_spans`/`image_keys` are filled only when this
+    // request's messages actually carried an image content part; both stay empty for every
+    // text-only request, which is what keeps that path byte-identical to before this stage.
+    std::vector<int32_t> full_tokens_i32;
+    std::vector<r4dx::model::Model::ImageSpan> image_spans;  // offsets relative to new_tokens_i32
+    std::vector<r4dx::server::ImageKey> image_keys;          // this request's own fingerprints
+    std::vector<r4dx::core::DeviceBuffer<uint16_t>> image_embeds_owned;  // keeps EncodeImages'
+                                                                          // rows alive until
+                                                                          // PrefillMultimodal runs
+    int64_t image_encode_count = 0;
+    double image_encode_ms_total = 0.0;
+    // Every image span this request's (possibly expanded) prompt carries, offset relative to the
+    // WHOLE conversation (`full_tokens_i32`) -- filled by the vision block below, consumed once
+    // the prefix-reuse decision (further down) reveals which of them are actually NEW.
+    std::vector<r4dx::vision::ImagePlaceholderSpan> pending_image_spans;
+    std::vector<const ImagePart*> pending_image_ptrs;  // parallel to pending_image_spans
     // Resolved `enable_thinking` (docs/server.md's "reasoning_content" section, task item 5):
     // false for /v1/completions unconditionally (task item 5g -- no chat template, nothing to
     // split) and the same ResolveEnableThinking formula http_server.cpp already used to decide the
@@ -139,6 +169,32 @@ void Engine::RunRequest(PendingRequest& req) {
                                       ? ResolveEnableThinking(req.thinking, opts_.default_thinking)
                                       : false;
     if (req.kind == RequestKind::kChat) {
+      // Vision (docs/vision.md, docs/server.md "Images"): every image content part across the
+      // WHOLE conversation, in the order the client's `messages` array carries them -- a client
+      // resends the full history on every turn (the normal OpenAI chat client pattern), so an
+      // earlier turn's image is decoded again here too, even though its rows will turn out not to
+      // need re-encoding below (only the pixel-decode/preprocess already happened once, at PARSE
+      // time in openai_types.cpp -- this loop only re-derives grids/hashes from that, no image
+      // bytes are re-decoded). `image_ptrs` keeps each image's own ImagePart (pixel_values,
+      // content_hash) alongside `placeholders_in` (grid only) at the SAME index, since
+      // ExpandImagePlaceholders preserves input order 1:1 into its returned spans.
+      std::vector<r4dx::vision::ImagePlaceholderSpan> placeholders_in;
+      std::vector<const ImagePart*> image_ptrs;
+      for (const auto& m : req.messages) {
+        for (const auto& part : m.content_parts) {
+          if (!part.is_image) continue;
+          r4dx::vision::ImagePlaceholderSpan sp;
+          sp.grid = part.image.grid;
+          placeholders_in.push_back(sp);
+          image_ptrs.push_back(&part.image);
+        }
+      }
+      if (!placeholders_in.empty() && !model_->HasVision()) {
+        req.sink->OnError(400, "this model/container has no vision tower (loaded without "
+                                "vision.* tensors, or started with --vision off)");
+        return;
+      }
+
       r4dx::ChatJson messages = r4dx::ChatJson::array();
       for (const auto& m : req.messages) {
         r4dx::ChatJson entry = r4dx::ChatJson::object();
@@ -152,7 +208,21 @@ void Engine::RunRequest(PendingRequest& req) {
         // shape's own way of identifying which function answered) carries no template effect
         // either way, matching the pre-existing "tool" role's own behavior.
         entry["role"] = (m.role == "function") ? "tool" : m.role;
-        entry["content"] = m.content ? r4dx::ChatJson(*m.content) : r4dx::ChatJson(nullptr);
+        // Vision: a message with at least one image content part renders as a real content ARRAY
+        // ({"type":"image"}/{"type":"text",...} entries, order preserved) so the chat template's
+        // own image handling (vision_start/image_pad/vision_end, docs/vision.md) fires -- every
+        // other message (content_parts empty, the overwhelming common case) renders exactly as
+        // before this stage, a plain string or JSON null.
+        if (!m.content_parts.empty()) {
+          r4dx::ChatJson content = r4dx::ChatJson::array();
+          for (const auto& part : m.content_parts) {
+            content.push_back(part.is_image ? r4dx::ChatJson{{"type", "image"}}
+                                             : r4dx::ChatJson{{"type", "text"}, {"text", part.text}});
+          }
+          entry["content"] = content;
+        } else {
+          entry["content"] = m.content ? r4dx::ChatJson(*m.content) : r4dx::ChatJson(nullptr);
+        }
         if (!m.tool_calls.empty()) {
           // Rebuild the OpenAI-wire tool_calls array into the shape chat_template.jinja's own
           // "render an earlier turn's tool call back into the prompt" branch expects: `arguments`
@@ -221,19 +291,56 @@ void Engine::RunRequest(PendingRequest& req) {
       // sequences become their token ids -- see tokenizer.h's encode() CAUTION note (message
       // bodies are spliced in verbatim, same caveat this server inherits from the chat template
       // and does not sandbox, exactly like src/cli/main.cpp).
-      full_tokens = tok_->encode(rendered, /*parse_special=*/true);
+      const std::vector<r4dx::TokenId> raw_tokens = tok_->encode(rendered, /*parse_special=*/true);
+      full_tokens_i32.assign(raw_tokens.begin(), raw_tokens.end());
+
+      // Vision: expand every `<|image_pad|>` placeholder the template just emitted (one per image
+      // content part, docs/vision.md) into that image's real merged-token-count run, and record
+      // where each run landed -- `full_tokens_i32` becomes the EXPANDED sequence from here on, and
+      // `image_keys`/`pending_image_spans` feed the prefix-reuse decision just below. Untouched
+      // (an empty vector, a no-op) for every text-only request, exactly the pre-vision behavior.
+      if (!placeholders_in.empty()) {
+        const int32_t image_token_id = static_cast<int32_t>(model_->GetContainer().ImageTokenId());
+        const int merge_size =
+            static_cast<int>(model_->GetContainer().Vision().config.spatial_merge_size);
+        r4dx::vision::ExpandedImagePrompt expanded;
+        try {
+          expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id,
+                                                            placeholders_in, merge_size);
+        } catch (const std::exception& e) {
+          req.sink->OnError(400,
+                             std::string("image content parts do not match the rendered prompt's "
+                                         "own placeholders: ") + e.what());
+          return;
+        }
+        full_tokens_i32 = std::move(expanded.tokens);
+        pending_image_spans = expanded.spans;
+        pending_image_ptrs = image_ptrs;
+        image_keys.reserve(expanded.spans.size());
+        for (size_t i = 0; i < expanded.spans.size(); ++i) {
+          r4dx::server::ImageKey key;
+          key.content_hash = image_ptrs[i]->content_hash;
+          key.grid_t = expanded.spans[i].grid.t;
+          key.grid_h = expanded.spans[i].grid.h;
+          key.grid_w = expanded.spans[i].grid.w;
+          key.token_offset = expanded.spans[i].offset;
+          image_keys.push_back(key);
+        }
+      }
     } else {
       // Raw prompt: never trust literal special-token surface forms in caller-supplied text.
-      full_tokens = tok_->encode(req.raw_prompt, /*parse_special=*/false);
+      const std::vector<r4dx::TokenId> raw_tokens = tok_->encode(req.raw_prompt, /*parse_special=*/false);
+      full_tokens_i32.assign(raw_tokens.begin(), raw_tokens.end());
     }
 
-    if (full_tokens.empty()) {
+    if (full_tokens_i32.empty()) {
       req.sink->OnError(400, "prompt rendered to zero tokens");
       return;
     }
-    if (static_cast<int64_t>(full_tokens.size()) > MaxCtx()) {
-      req.sink->OnError(400, "prompt (" + std::to_string(full_tokens.size()) +
-                                  " tokens) exceeds --max-ctx (" + std::to_string(MaxCtx()) + ")");
+    if (static_cast<int64_t>(full_tokens_i32.size()) > MaxCtx()) {
+      req.sink->OnError(400, "prompt (" + std::to_string(full_tokens_i32.size()) +
+                                  " tokens, including any spliced image tokens) exceeds --max-ctx ("
+                                  + std::to_string(MaxCtx()) + ")");
       return;
     }
 
@@ -261,14 +368,20 @@ void Engine::RunRequest(PendingRequest& req) {
       model_->SetDflashInjectionEnabled(use_dflash);
     }
 
-    // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens`
+    // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens_i32`
     // extends what's already fed; otherwise Model::Reset() (re-zero GDN/KV/MTP state in place,
     // milliseconds -- NOT a full Model::Load(), see model.h's Reset() doc comment and this
-    // stage's own measurement below) and re-prefill from scratch.
+    // stage's own measurement below) and re-prefill from scratch. Image-aware (docs/vision.md
+    // "Prefix reuse across a turn that contained an image"): `image_keys` is this request's own
+    // per-image fingerprint list, so two requests carrying two DIFFERENT pictures at the same
+    // (identical, since every placeholder is the same token id) position never reuse each other's
+    // KV state -- PrefixState::Extend refuses and this falls to the Reset()+reprefill branch below.
     std::vector<int32_t> new_tokens_i32;
     double reset_ms = -1.0;  // -1 == no reset happened this request (prefix extended)
-    std::optional<std::vector<int32_t>> tail = prefix_.Extend(full_tokens);
+    int64_t skip = 0;        // tokens of full_tokens_i32 NOT re-fed this request (the fed prefix)
+    std::optional<std::vector<int32_t>> tail = prefix_.Extend(full_tokens_i32, image_keys);
     if (tail) {
+      skip = static_cast<int64_t>(full_tokens_i32.size() - tail->size());
       new_tokens_i32 = std::move(*tail);
     } else {
       const auto r0 = Clock::now();
@@ -276,17 +389,51 @@ void Engine::RunRequest(PendingRequest& req) {
       const auto r1 = Clock::now();
       reset_ms = Seconds(r0, r1) * 1000.0;
       prefix_.Clear();
-      new_tokens_i32.assign(full_tokens.begin(), full_tokens.end());
+      new_tokens_i32.assign(full_tokens_i32.begin(), full_tokens_i32.end());
+      skip = 0;
+    }
+
+    // Vision: only a span AT OR PAST the already-fed prefix boundary needs its rows spliced THIS
+    // request -- an older image's rows are already resident in the model's real KV/GDN state from
+    // the turn that first fed them, so re-encoding it here would be pure waste (the deliverable's
+    // own "does NOT re-encode the image" requirement) as well as wrong (there is no position in
+    // `new_tokens_i32` for it to land on). EncodeImages runs once per NEW image (simplicity over
+    // batching -- a request rarely carries more than a couple), timed together for `timings.
+    // image_n`/`image_ms`.
+    for (size_t i = 0; i < pending_image_spans.size(); ++i) {
+      const auto& sp = pending_image_spans[i];
+      if (sp.offset < skip) continue;  // already fed on an earlier turn -- no re-encode
+      const ImagePart& img = *pending_image_ptrs[i];
+      r4dx::core::DeviceBuffer<uint16_t> embeds;
+      r4dx::vision::VisionEncodeStats stats;
+      const auto e0 = Clock::now();
+      model_->EncodeImages(img.pixel_values.data(), sp.grid.PatchCount(), {sp.grid}, &embeds, &stats);
+      const auto e1 = Clock::now();
+      image_encode_count += 1;
+      image_encode_ms_total += Seconds(e0, e1) * 1000.0;
+      r4dx::model::Model::ImageSpan ms;
+      ms.offset = sp.offset - skip;
+      ms.tokens = sp.tokens;
+      ms.grid = sp.grid;
+      ms.embeds = embeds.data();
+      image_spans.push_back(ms);
+      image_embeds_owned.push_back(std::move(embeds));
     }
 
     int64_t max_tokens = req.max_tokens;
-    const int64_t ctx_budget = MaxCtx() - static_cast<int64_t>(full_tokens.size());
+    const int64_t ctx_budget = MaxCtx() - static_cast<int64_t>(full_tokens_i32.size());
     if (max_tokens > ctx_budget) max_tokens = std::max<int64_t>(0, ctx_budget);
 
-    req.sink->OnStart(static_cast<int64_t>(full_tokens.size()));
+    req.sink->OnStart(static_cast<int64_t>(full_tokens_i32.size()));
 
     const auto t0 = Clock::now();
-    std::vector<float> logits = model_->Prefill(new_tokens_i32);
+    // PrefillMultimodal with an EMPTY `image_spans` is byte-identical to Prefill() (that method's
+    // own doc comment: the exact pre-vision code path, no extra upload, no extra kernel, the
+    // single-row rope entry point) -- so this call-site unification carries no text-only-behavior
+    // regression risk.
+    std::vector<float> logits = image_spans.empty()
+                                     ? model_->Prefill(new_tokens_i32)
+                                     : model_->PrefillMultimodal(new_tokens_i32, image_spans);
     const auto t1 = Clock::now();
     const double prefill_seconds = Seconds(t0, t1);
 
@@ -655,7 +802,7 @@ void Engine::RunRequest(PendingRequest& req) {
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
-    prefix_.Commit(full_tokens, committed_tokens);
+    prefix_.Commit(full_tokens_i32, committed_tokens, image_keys);
 
     if (tool_mode) {
       // Parse this checkpoint's real tool-call surface syntax (src/server/tool_call_parser.h,
@@ -750,7 +897,7 @@ void Engine::RunRequest(PendingRequest& req) {
 
     // `timings` (task point 1, llama.cpp-compatible field names): `prompt_n` is the tokens
     // actually fed to THIS request's Prefill (`new_tokens_i32`, excludes whatever prefix reuse
-    // skipped) -- deliberately NOT `full_tokens.size()` (the whole conversation-so-far, which is
+    // skipped) -- deliberately NOT `full_tokens_i32.size()` (the whole conversation-so-far, which is
     // `usage.prompt_tokens`). `draft_n`/`draft_n_accepted` are set only when a speculative path
     // actually ran at least one round this request (`*_rounds > 0`), mirroring the stderr log
     // line's own "only mention mtp:/dflash: when rounds happened" gate just below.
@@ -766,6 +913,13 @@ void Engine::RunRequest(PendingRequest& req) {
       timings.draft_n = dflash_drafted;
       timings.draft_n_accepted = dflash_accepted;
     }
+    // `image_n`/`image_ms` (docs/vision.md, docs/server.md's "Images"): only THIS request's own
+    // real EncodeImages calls -- an image whose rows were reused from an earlier turn's prefix
+    // costs nothing here and is not counted, so this measures actual per-request GPU cost.
+    if (image_encode_count > 0) {
+      timings.image_n = image_encode_count;
+      timings.image_ms = image_encode_ms_total;
+    }
 
     req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings,
                      reasoning_tokens);
@@ -778,7 +932,7 @@ void Engine::RunRequest(PendingRequest& req) {
         buf, sizeof(buf),
         "request %s: prompt=%lld new=%lld generated=%lld finish=%s prefill=%.2f tok/s "
         "decode=%.2f tok/s",
-        req.request_id.c_str(), static_cast<long long>(full_tokens.size()),
+        req.request_id.c_str(), static_cast<long long>(full_tokens_i32.size()),
         static_cast<long long>(new_tokens_i32.size()),
         static_cast<long long>(generated_tokens.size()), finish_reason.c_str(), prefill_tps,
         decode_tps);

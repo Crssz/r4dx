@@ -20,7 +20,16 @@ int64_t NowUnix() {
 
 void RespondError(httplib::Response& res, const ApiError& err) {
   res.status = err.http_status;
-  res.set_content(ErrorBody(err).dump(), "application/json");
+  // `replace`, not the default throwing handler (found while re-running the review's prefix-reuse
+  // repro, 2026-09-22): an error message can quote bytes straight out of the caller's own body --
+  // nlohmann's "invalid UTF-8 byte at ..." parse_error text does exactly that -- and dumping an
+  // invalid-UTF-8 string throws json::type_error from INSIDE the handler's catch block, which
+  // escapes the handler entirely and leaves httplib to answer 500 with an empty body. A malformed
+  // body must get the same clean 400-with-a-reason every other bad input gets, so the offending
+  // bytes are replaced with U+FFFD instead of taking the whole response down. Nothing this server
+  // generates itself is ever invalid UTF-8, so no well-formed response changes.
+  res.set_content(ErrorBody(err).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                   "application/json");
 }
 
 void RespondError(httplib::Response& res, int status, const std::string& type,
@@ -98,7 +107,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 
   svr.Get("/v1/models", [&engine_ref](const httplib::Request&, httplib::Response& res) {
     res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
-                                         engine_ref.DefaultThinking())
+                                         engine_ref.DefaultThinking(), engine_ref.HasVision())
                          .dump(),
                      "application/json");
   });
@@ -123,7 +132,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       return;
     }
     res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
-                                         engine_ref.DefaultThinking())
+                                         engine_ref.DefaultThinking(), engine_ref.HasVision())
                          .dump(),
                      "application/json");
   });
@@ -132,7 +141,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                                                    httplib::Response& res) {
     try {
       const nlohmann::json body = ParseJsonBody(httpreq);
-      ChatCompletionRequest req = ParseChatCompletionRequest(body, engine_ref.SamplingDefaults());
+      ChatCompletionRequest req = ParseChatCompletionRequest(body, engine_ref.SamplingDefaults(),
+                                                              engine_ref.ImagePreprocessing());
       const std::string model_id = req.model.empty() ? engine_ref.ModelId() : req.model;
       const int64_t max_tokens = req.max_tokens.value_or(engine_ref.MaxTokensDefault());
       const std::string id = GenerateRequestId("chatcmpl-");
@@ -151,7 +161,14 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       auto pending = std::make_shared<PendingRequest>();
       pending->kind = RequestKind::kChat;
       pending->request_id = id;
-      pending->messages = req.messages;
+      // MOVED, not copied (review finding, 2026-09-22): a `ChatMessage` carries every image
+      // content part's full fp32 `pixel_values` (at the default --image-max-pixels, 4096 patches
+      // x 1536 floats = 25.2 MB per image, up to kMaxImagesPerRequest of them), so copying the
+      // vector here would hold two instances of every decoded image for the whole request --
+      // times --max-queue requests that can be parsed and queued concurrently. Nothing below
+      // reads `req.messages` again; every other `req` field moved out of here is a scalar or a
+      // small string.
+      pending->messages = std::move(req.messages);
       pending->chat_template_kwargs = req.chat_template_kwargs;
       pending->thinking = req.thinking;
       pending->tools = req.tools;

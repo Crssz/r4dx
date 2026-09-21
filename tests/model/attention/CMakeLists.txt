@@ -23,3 +23,19 @@ set_tests_properties(test_attn_layer PROPERTIES
   ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
   SKIP_RETURN_CODE 77
 )
+
+# test_mrope_attn_layer: the same layer, the same real weights, but driven by the 3-AXIS mrope
+# position ids of a prompt containing an image (docs/vision.md "Text-side splicing"). Its golden
+# comes from tools/reference/mrope_layer_golden.py; same SKIP_RETURN_CODE/ENVIRONMENT convention.
+add_executable(test_mrope_attn_layer test_mrope_attn_layer.cpp)
+target_link_libraries(test_mrope_attn_layer PRIVATE r4dx_model_attention r4dx_core r4dx_kernels
+                                                     r4d_core r4dx_convert)
+target_compile_definitions(test_mrope_attn_layer PRIVATE
+  R4DX_GOLDEN_MROPE_PATH="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/mrope_layer_003.safetensors"
+  R4DX_BF16_CONTAINER_PATH="D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
+)
+add_test(NAME test_mrope_attn_layer COMMAND test_mrope_attn_layer)
+set_tests_properties(test_mrope_attn_layer PROPERTIES
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+  SKIP_RETURN_CODE 77
+)

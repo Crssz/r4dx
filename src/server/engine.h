@@ -21,6 +21,7 @@
 #include "chat_template.h"
 #include "model.h"
 #include "openai_types.h"
+#include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
 #include "prefix_state.h"
 #include "request_queue.h"
 #include "response_sink.h"
@@ -44,6 +45,12 @@ struct EngineOptions {
   // values.
   float dflash_p_min = 0.0f;
   int64_t dflash_n_min = 0;
+  // Per-image pixel cap (docs/vision.md "Large images", --image-max-pixels). Like p_min/n_min
+  // above this is not a Model::Load sizing knob -- it is a PREPROCESSING parameter, applied when a
+  // request's image is decoded, so it lives here rather than in model_opts. 0 means the
+  // checkpoint's own preprocessor_config.json ceiling; r4dx::vision::MakeImageProcessorConfig
+  // turns it into the ImageProcessorConfig the decode path uses.
+  int64_t image_max_pixels = 1048576;
 };
 
 enum class RequestKind { kChat, kCompletion };
@@ -95,6 +102,17 @@ class Engine {
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
   bool DefaultThinking() const { return opts_.default_thinking; }
+  // The image preprocessing policy every image content part is decoded with (docs/vision.md
+  // "Large images", --image-max-pixels) -- read by http_server.cpp so ParseChatCompletionRequest
+  // can preprocess an image at PARSE time (openai_types.cpp), before the request even reaches this
+  // Engine's worker thread.
+  const r4dx::vision::ImageProcessorConfig& ImagePreprocessing() const { return image_preproc_; }
+  // True iff the loaded container's vision tower is actually resident (docs/vision.md "Load
+  // policy") -- read by http_server.cpp for /v1/models' `architecture.input_modalities`/
+  // `capabilities` and by RunRequest itself for the "this model/container has no vision tower"
+  // 400. Safe to call from any thread once LoadAndStart() has returned: model_ is never
+  // reassigned to a different Model after that (Model::Reset() reuses the same object in place).
+  bool HasVision() const { return model_ && model_->HasVision(); }
 
   // Enqueues `req` for the worker thread. Returns false (queue already at --max-queue) if the
   // caller should answer 429 instead.
@@ -146,6 +164,11 @@ class Engine {
   std::unique_ptr<r4dx::Tokenizer> tok_;
   std::unique_ptr<r4dx::ChatTemplate> tmpl_;
   std::unique_ptr<r4dx::model::Model> model_;
+
+  // Image preprocessing policy, built once in LoadAndStart from EngineOptions::image_max_pixels
+  // (docs/vision.md "Large images"). Read back out through ImagePreprocessing() above, which is
+  // how http_server.cpp's chat route decodes an `image_url` content part at PARSE time.
+  r4dx::vision::ImageProcessorConfig image_preproc_;
 
   // Prefix-reuse bookkeeping: every token already committed to model_'s KV/GDN state, in the
   // order fed. Mirrors src/cli/main.cpp's --chat loop's `fed_tokens` exactly (same mechanism, per

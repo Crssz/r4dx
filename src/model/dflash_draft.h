@@ -191,8 +191,28 @@ class DflashDraft {
   //   * `start_pos < InjectedCount()` still throws. That direction would overwrite a position the
   //     drafter may already have attended to, which is the rollback docs/dflash2.md section 5's
   //     "no rollback needed" argument exists to rule out.
+  //
+  // `rope_t_host` (vision milestone, docs/vision.md "Text-side splicing"): host int32[rows] giving
+  // each row's TEMPORAL mrope position, which stops equalling `start_pos + t` once an image has
+  // been spliced into the conversation. DFlash2's own M-RoPE sections are the degenerate
+  // `[64,0,0,0]` (docs/dflash2.md "RoPE"), i.e. temporal-only, so the temporal row is the whole of
+  // what this drafter needs -- there is no h/w stream to carry. The RING SLOT stays
+  // `(start_pos + t) % slots`, and the attention kernel's window arithmetic stays in sequence
+  // space: an image's merged tokens all share one temporal position, so keying the ring on it
+  // would collide ~196 rows onto one slot and silently destroy the store. nullptr (the default)
+  // falls back to `start_pos + t + RopeDelta()`, which is correct for every injection at or past
+  // the prompt's end (all text) and is `start_pos + t` byte for byte in a text-only conversation;
+  // only an injection that can STRADDLE an image run -- Model::RunChunk's, over the prompt itself
+  // -- has to pass the real rows.
   void InjectFeatures(core::Stream& stream, core::Arena& arena, const uint16_t* features_dev,
-                      int64_t rows, int64_t start_pos);
+                      int64_t rows, int64_t start_pos, const int32_t* rope_t_host = nullptr);
+
+  // The offset a DRAFT BLOCK's rope positions carry on top of their sequence positions, i.e. the
+  // conversation's mrope delta (docs/vision.md). A block always sits past the prompt, so its
+  // positions are pure text and a single scalar describes all of them -- unlike InjectFeatures',
+  // which can land inside an image run. 0 for every text-only conversation.
+  void SetRopeDelta(int64_t delta) { rope_delta_ = delta; }
+  int64_t RopeDelta() const { return rope_delta_; }
 
   // One draft round at the current frontier. `anchor_id` is the last committed real token (block
   // position 0); `k` caps how many tokens the walk may emit (0..block_size-1, clamped -- 0 drafts
@@ -267,6 +287,10 @@ class DflashDraft {
   // 0 <= valid_from_ <= n_injected_.
   int64_t valid_from_ = 0;
   int64_t last_inject_rows_ = 0;
+  // See SetRopeDelta. Deliberately NOT cleared by Reset(): Reset() drops the injected POSITIONS,
+  // and Model::Reset -- the only caller -- sets both this and its own mrope state back in the same
+  // breath, so clearing here would just be a second, independently-drifting copy of that decision.
+  int64_t rope_delta_ = 0;
 
   // ---- weights -------------------------------------------------------------------------------
   QuantLinear fc_;                                  // [hidden, len(target_layers)*hidden]

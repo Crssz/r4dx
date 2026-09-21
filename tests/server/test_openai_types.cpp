@@ -97,12 +97,120 @@ void TestChatContentAsTextParts() {
   CHECK(req.messages[0].content == "ab");
 }
 
-void TestChatImagePartRejected() {
-  json body = {{"messages",
-                json::array({{{"role", "user"},
-                              {"content", json::array({{{"type", "image_url"},
-                                                         {"image_url", {{"url", "http://x"}}}}})}}})}};
+// A well-known 1x1 transparent PNG (67 bytes), used by every test below that needs an image
+// that really decodes -- small enough to be inline, but a REAL PNG stb_image genuinely parses,
+// not a synthetic byte string that only happens to pass a length check.
+const char* kTinyPngDataUri =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY"
+    "42YAAAAASUVORK5CYII=";
+
+json MakeImageMessage(const std::string& url_or_field_shape) {
+  return json::array({{{"role", "user"},
+                        {"content", json::array({{{"type", "image_url"},
+                                                   {"image_url", {{"url", url_or_field_shape}}}},
+                                                  {{"type", "text"}, {"text", "describe it"}}})}}});
+}
+
+// docs/vision.md stage 5: image_url is no longer a deferred-feature 400 -- a well-formed, LOCAL
+// (data: URI) image is decoded and preprocessed right here, at parse time, with no container and
+// no GPU needed (r4dx::vision's own "no HIP, no r4dx_model" CMakeLists.txt comment).
+void TestChatImagePartAccepted() {
+  json body = {{"messages", MakeImageMessage(kTinyPngDataUri)}};
+  const auto req = ParseChatCompletionRequest(body);
+  CHECK(req.messages.size() == 1);
+  CHECK(req.messages[0].content == "describe it");        // text parts still concatenate
+  CHECK(req.messages[0].HasImages());
+  CHECK(req.messages[0].content_parts.size() == 2);        // image first, then text -- order kept
+  CHECK(req.messages[0].content_parts[0].is_image);
+  CHECK(!req.messages[0].content_parts[1].is_image);
+  CHECK(req.messages[0].content_parts[1].text == "describe it");
+  const auto& img = req.messages[0].content_parts[0].image;
+  CHECK(img.grid.h > 0 && img.grid.w > 0);
+  CHECK(img.patch_dim > 0);
+  CHECK(static_cast<int64_t>(img.pixel_values.size()) == img.grid.PatchCount() * img.patch_dim);
+  CHECK(img.content_hash != 0);
+}
+
+// Two requests with the SAME image bytes must hash identically -- PrefixState::Extend's own
+// same-image-reuse path (docs/vision.md "Prefix reuse across a turn that contained an image")
+// depends on this being deterministic, not merely "probably different for different pictures".
+void TestChatImageContentHashStable() {
+  json body1 = {{"messages", MakeImageMessage(kTinyPngDataUri)}};
+  json body2 = {{"messages", MakeImageMessage(kTinyPngDataUri)}};
+  const auto req1 = ParseChatCompletionRequest(body1);
+  const auto req2 = ParseChatCompletionRequest(body2);
+  CHECK(req1.messages[0].content_parts[0].image.content_hash != 0);
+  CHECK(req1.messages[0].content_parts[0].image.content_hash ==
+        req2.messages[0].content_parts[0].image.content_hash);
+}
+
+// Remote http(s) URLs are never fetched (docs/server.md's "Images": "a local single-user server
+// should not make outbound requests on a client's behalf") -- a clean 400, not a hang or a
+// silent no-op.
+void TestChatImageRemoteUrlRejected() {
+  json body = {{"messages", MakeImageMessage("http://example.com/cat.png")}};
   CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+  json body2 = {{"messages", MakeImageMessage("https://example.com/cat.png")}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body2); }, 400));
+}
+
+void TestChatImageUnsupportedFormatRejected() {
+  json body = {{"messages", MakeImageMessage("data:image/webp;base64,UklGRhoAAABXRUJQVlA4TA0AAAA")}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatImageMalformedDataUriRejected() {
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(json{{"messages", MakeImageMessage("not-a-data-uri")}}); }, 400));
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(json{{"messages", MakeImageMessage("data:image/png,nobase64marker")}}); }, 400));
+}
+
+void TestChatImageCorruptDataThrows() {
+  // Valid base64, but not a real image -- stb_image must fail to sniff any format.
+  json body = {{"messages", MakeImageMessage("data:image/png;base64,dGhpcyBpcyBub3QgYSBwbmc=")}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+void TestChatImageOversizeBase64Rejected() {
+  std::string huge(kMaxImageBase64Chars + 1, 'A');
+  json body = {{"messages", MakeImageMessage("data:image/png;base64," + huge)}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+}
+
+// kMaxImagesPerRequest is enforced across the WHOLE request, not per message.
+void TestChatTooManyImagesRejected() {
+  json parts = json::array();
+  for (size_t i = 0; i < kMaxImagesPerRequest + 1; ++i) {
+    parts.push_back({{"type", "image_url"}, {"image_url", {{"url", kTinyPngDataUri}}}});
+  }
+  json body = {{"messages", json::array({{{"role", "user"}, {"content", parts}}})}};
+  CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
+
+  // One under the cap still succeeds.
+  json ok_parts = json::array();
+  for (size_t i = 0; i < kMaxImagesPerRequest; ++i) {
+    ok_parts.push_back({{"type", "image_url"}, {"image_url", {{"url", kTinyPngDataUri}}}});
+  }
+  json ok_body = {{"messages", json::array({{{"role", "user"}, {"content", ok_parts}}})}};
+  const auto req = ParseChatCompletionRequest(ok_body);
+  CHECK(req.messages[0].content_parts.size() == kMaxImagesPerRequest);
+}
+
+// Alternate shapes real clients send (docs/server.md's "Images"): a bare-string `image_url`
+// (instead of the `{"url": ...}` object) and the Responses-API-style `"input_image"` type.
+void TestChatImageAlternateShapesAccepted() {
+  json body_bare = {{"messages",
+                     json::array({{{"role", "user"},
+                                   {"content", json::array({{{"type", "image_url"},
+                                                              {"image_url", kTinyPngDataUri}}})}}})}};
+  const auto req_bare = ParseChatCompletionRequest(body_bare);
+  CHECK(req_bare.messages[0].HasImages());
+
+  json body_input = {{"messages",
+                      json::array({{{"role", "user"},
+                                    {"content", json::array({{{"type", "input_image"},
+                                                               {"image_url", kTinyPngDataUri}}})}}})}};
+  const auto req_input = ParseChatCompletionRequest(body_input);
+  CHECK(req_input.messages[0].HasImages());
 }
 
 void TestChatMissingMessagesThrows() {
@@ -600,9 +708,30 @@ void TestBuildModelEntryJsonCapabilitiesAndArchitecture() {
   CHECK(has("reasoning"));
   CHECK(m.at("architecture").at("input_modalities")[0] == "text");
   CHECK(m.at("architecture").at("output_modalities")[0] == "text");
-  // The modality list has exactly one writer, so the vision milestone flips it in one place.
+  // The modality list has exactly one writer, so `has_vision` flips it in exactly one place --
+  // TestBuildModelEntryJsonVisionModalities below is the same assertion with the flag set.
   CHECK(m.at("architecture").at("input_modalities") == ModelInputModalities());
   CHECK(ModelInputModalities().size() == 1);
+}
+
+// docs/vision.md stage 5: the one-line switch stage 1 prepared, now flipped.
+void TestBuildModelEntryJsonVisionModalities() {
+  const json no_vision = BuildModelEntryJson("my-model", 1000, 65536, false, /*has_vision=*/false);
+  CHECK(no_vision.at("architecture").at("input_modalities") == json::array({"text"}));
+  CHECK(no_vision.at("modalities") == json::array({"text"}));
+  auto has_cap = [](const json& m, const char* v) {
+    for (const auto& c : m.at("capabilities")) if (c == v) return true;
+    return false;
+  };
+  CHECK(!has_cap(no_vision, "image"));
+
+  const json with_vision = BuildModelEntryJson("my-model", 1000, 65536, false, /*has_vision=*/true);
+  CHECK(with_vision.at("architecture").at("input_modalities") == json::array({"text", "image"}));
+  CHECK(with_vision.at("modalities") == json::array({"text", "image"}));
+  CHECK(has_cap(with_vision, "image"));
+
+  const json list = BuildModelsResponse("m", 1000, 65536, false, /*has_vision=*/true);
+  CHECK(list.at("data")[0].at("architecture").at("input_modalities") == json::array({"text", "image"}));
 }
 
 // ---- OpenRouter-shaped capability block (docs/server.md's "Model metadata") ---------------------
@@ -743,6 +872,27 @@ void TestBuildTimingsJsonDraftFieldsAbsentWhenUnset() {
   const json j = BuildTimingsJson(t);
   CHECK(!j.contains("draft_n"));
   CHECK(!j.contains("draft_n_accepted"));
+}
+
+// docs/vision.md: "image_n"/"image_ms" follow the same "omit, don't zero" convention as draft_n.
+void TestBuildTimingsJsonImageFieldsPresentWhenSet() {
+  TimingStats t;
+  t.prompt_n = 10;
+  t.prompt_ms = 10.0;
+  t.image_n = 2;
+  t.image_ms = 45.5;
+  const json j = BuildTimingsJson(t);
+  CHECK(j.at("image_n") == 2);
+  CHECK(j.at("image_ms") == 45.5);
+}
+
+void TestBuildTimingsJsonImageFieldsAbsentWhenUnset() {
+  TimingStats t;
+  t.prompt_n = 10;
+  t.prompt_ms = 10.0;
+  const json j = BuildTimingsJson(t);
+  CHECK(!j.contains("image_n"));
+  CHECK(!j.contains("image_ms"));
 }
 
 void TestBuildCompletionResponseAttachesTimings() {
@@ -975,7 +1125,15 @@ int main() {
   TestChatSamplingDefaultsApplyOnlyWhenOmitted();
   TestChatFullFields();
   TestChatContentAsTextParts();
-  TestChatImagePartRejected();
+  TestChatImagePartAccepted();
+  TestChatImageContentHashStable();
+  TestChatImageRemoteUrlRejected();
+  TestChatImageUnsupportedFormatRejected();
+  TestChatImageMalformedDataUriRejected();
+  TestChatImageCorruptDataThrows();
+  TestChatImageOversizeBase64Rejected();
+  TestChatTooManyImagesRejected();
+  TestChatImageAlternateShapesAccepted();
   TestChatMissingMessagesThrows();
   TestChatEmptyMessagesThrows();
   TestChatUnsupportedRoleThrows();
@@ -1052,6 +1210,9 @@ int main() {
   TestBuildTimingsJsonZeroMsAvoidsDivideByZero();
   TestBuildTimingsJsonDraftFieldsPresentWhenSet();
   TestBuildTimingsJsonDraftFieldsAbsentWhenUnset();
+  TestBuildTimingsJsonImageFieldsPresentWhenSet();
+  TestBuildTimingsJsonImageFieldsAbsentWhenUnset();
+  TestBuildModelEntryJsonVisionModalities();
   TestBuildCompletionResponseAttachesTimings();
   TestBuildChatCompletionChunkTimingsOnlyWhenProvided();
   TestBuildChatCompletionUsageChunkShape();

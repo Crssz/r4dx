@@ -26,6 +26,14 @@ set(R4DX_KERNEL_TESTS
   test_topk_lse
   test_sampler_canonical
   test_summary_sampler
+  # Milestone 8 stage 3 -- the vision tower's own device primitives (docs/vision.md). CPU-reference
+  # only (no golden data, no container), so it is an ordinary always-on GPU test with no
+  # SKIP_RETURN_CODE; the golden comparison for these same kernels is tests/vision/test_vision_tower.
+  test_vision_kernels
+  # Milestone 8 stage 4 -- the 3-axis multimodal mrope (docs/vision.md "Text-side splicing").
+  # CPU-reference only, always on. Its last case checks a rejected section vector, hence the
+  # /EHc- entry below (see that comment for why extern "C" throws are otherwise uncatchable).
+  test_rope_mrope3
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -74,7 +82,7 @@ set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_con
 # docs/dflash2.md's "Kernels" subsection, which records this as an open project-wide question
 # rather than something a kernel stage should decide unilaterally.
 set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_lse.cpp
-                            PROPERTIES COMPILE_OPTIONS "/EHc-")
+                            test_rope_mrope3.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # tool_sampler_bench: Milestone 6 S1 item 4 -- r4dx_topk_lse_f32's kernel time (hip events) and the
 # host cost of SampleFromSummary vs the full-vocab SampleCanonical/SampleLegacy per token. Prints

@@ -63,6 +63,32 @@ struct ModelConfig {
     return num_attention_heads / num_key_value_heads;
   }
 
+  // mrope_section as the three ints r4dx_rope_partial_mrope3_bf16 takes, defaulting to the even
+  // split-across-three-streams shape a config without the key implies. Throws when the config
+  // carries a section vector that does not describe this model's rotary width -- a mismatch there
+  // silently misassigns frequency bins to position streams, which is exactly the class of bug
+  // docs/vision.md's "Text-side splicing" section warns produces plausible-looking garbage.
+  void MropeSections(int* sec_t, int* sec_h, int* sec_w) const {
+    const int64_t bins = RotaryDim() / 2;
+    if (mrope_section.empty()) {
+      *sec_h = static_cast<int>(bins / 3);
+      *sec_w = static_cast<int>(bins / 3);
+      *sec_t = static_cast<int>(bins - *sec_h - *sec_w);
+      return;
+    }
+    if (mrope_section.size() != 3) {
+      throw std::runtime_error("ModelConfig::MropeSections: mrope_section must have 3 entries, got " +
+                                std::to_string(mrope_section.size()));
+    }
+    if (mrope_section[0] + mrope_section[1] + mrope_section[2] != bins) {
+      throw std::runtime_error("ModelConfig::MropeSections: mrope_section must sum to rotary_dim/2 (" +
+                                std::to_string(bins) + ")");
+    }
+    *sec_t = static_cast<int>(mrope_section[0]);
+    *sec_h = static_cast<int>(mrope_section[1]);
+    *sec_w = static_cast<int>(mrope_section[2]);
+  }
+
   bool IsGdnLayer(int64_t layer_idx) const {
     if (layer_idx < 0 || layer_idx >= static_cast<int64_t>(layer_types.size())) {
       throw std::out_of_range("ModelConfig::IsGdnLayer: layer_idx out of range");

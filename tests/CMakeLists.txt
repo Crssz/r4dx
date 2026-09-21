@@ -36,6 +36,11 @@ add_subdirectory(tokenizer)
 # it makes outside those paths.
 add_subdirectory(model)
 
+# tests/vision/: CPU-only golden tests for the host-side vision path (src/vision/**,
+# tests/vision/**, docs/vision.md); this add_subdirectory() line is the only touch that component
+# makes outside those paths (plus its own src/vision entry in the root CMakeLists.txt).
+add_subdirectory(vision)
+
 # tests/cli/: r4dx-cli argument-parsing unit test (src/cli/**).
 add_subdirectory(cli)
 

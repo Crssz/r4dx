@@ -296,7 +296,8 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
 }
 
 void DflashDraft::InjectFeatures(core::Stream& stream, core::Arena& arena,
-                                 const uint16_t* features_dev, int64_t rows, int64_t start_pos) {
+                                 const uint16_t* features_dev, int64_t rows, int64_t start_pos,
+                                 const int32_t* rope_t_host) {
   if (rows <= 0) return;
   if (rows > max_inject_rows_) {
     throw std::runtime_error("DflashDraft::InjectFeatures: rows exceeds max_inject_rows");
@@ -336,8 +337,13 @@ void DflashDraft::InjectFeatures(core::Stream& stream, core::Arena& arena,
                           reinterpret_cast<int64_t>(g_dev_.data()), rows, hidden, eps,
                           /*out_fp32=*/0, s);
 
+  // ROPE positions only (the ring slot below is computed from `start_pos` directly, in sequence
+  // space) -- see InjectFeatures' .h doc comment for why the two must not be conflated once an
+  // image is in the prompt.
   for (int64_t t = 0; t < rows; ++t) {
-    ipos_host_[static_cast<size_t>(t)] = static_cast<int32_t>(start_pos + t);
+    ipos_host_[static_cast<size_t>(t)] =
+        rope_t_host != nullptr ? rope_t_host[t]
+                                : static_cast<int32_t>(start_pos + t + rope_delta_);
   }
   ipos_dev_.CopyFromHostAsync(ipos_host_.data(), static_cast<size_t>(rows), stream);
 
@@ -536,8 +542,12 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
   block_ids_host_[0] = anchor_id;
   for (int64_t t = 1; t < B; ++t) block_ids_host_[static_cast<size_t>(t)] =
       static_cast<int32_t>(mask_token_id_);
+  // pos_host_/pos_dev_ feed r4dx_rope_neox_bf16 ONLY (ForwardLayer) -- the block's visibility
+  // window and the ring's slot arithmetic both read `n_injected_` directly -- so this is the rope
+  // position, i.e. the mrope temporal position, which `rope_delta_` offsets once an image is in
+  // the conversation (docs/vision.md; 0 for every text-only run).
   for (int64_t t = 0; t < B; ++t) pos_host_[static_cast<size_t>(t)] =
-      static_cast<int32_t>(n_injected_ + t);
+      static_cast<int32_t>(n_injected_ + t + rope_delta_);
   block_ids_dev_.CopyFromHostAsync(block_ids_host_.data(), static_cast<size_t>(B), stream);
   pos_dev_.CopyFromHostAsync(pos_host_.data(), static_cast<size_t>(B), stream);
 

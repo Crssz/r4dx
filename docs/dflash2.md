@@ -80,6 +80,38 @@ Applied identically to Q and K (never V), per head, both in the injection path (
 feature's absolute position) and in the draft block (Q and K, at `n + t` where `n` = number of
 positions already injected and `t` = the token's 0-based position within the block).
 
+### 3.1 "Absolute position" with an image in the prompt (vision milestone, docs/vision.md)
+
+`p` above is the target's mrope TEMPORAL position -- which equals the sequence index for a
+text-only conversation, and stops equalling it the moment an image is spliced in: image tokens all
+share one temporal position, and every token after an image sits at `sequence index +
+mrope_position_delta` (delta negative). Sections `[64,0,0,0]` mean the temporal row is the whole of
+what this drafter needs; there is no h/w stream to carry.
+
+The **ring slot stays `(sequence position) % slots`**, and so does the SWA visibility rule
+(`query_pos - key_pos < sliding_window`). That is forced, not a shortcut: an image's ~196 merged
+tokens share ONE temporal position, so keying a fixed-size physical ring on it would collide all of
+them onto one slot and destroy the store, and "196 tokens ago" only means 196 in sequence space.
+(llama.cpp can key its own cache on the mrope position because that cache is append-only cells
+rather than a position-indexed ring.) So this is the one place where r4dx's ring geometry and the
+rope position deliberately part company, and section 5's "self-correcting via position overwrite"
+argument is unaffected -- it is a statement about the RING's index, which is unchanged.
+
+In code: `InjectFeatures` takes an optional host `rope_t_host[rows]` and otherwise uses
+`start_pos + t + RopeDelta()`; `DraftRound`'s `pos_host_` (which feeds `r4dx_rope_neox_bf16` and
+nothing else -- the block's visibility window and the ring's slot arithmetic both read
+`n_injected_` directly) becomes `n_injected_ + t + rope_delta_`. `Model::PrefillMultimodal` sets
+`SetRopeDelta` once per prefill and `Model::Reset` puts it back to 0; only `Model::RunChunk`'s own
+injection, which can straddle an image run, passes explicit per-row temporal positions. Both
+default to 0, so a text-only conversation is byte-identical (verified against a build of commit
+`20cdee3`: `--dflash --dflash-k 7` produces the same SHA-256, docs/vision.md's own table).
+
+Measured on the real container with a 28x28-patch image in the prompt, `k=7` greedy: **3.14
+tokens/round, 44/147 drafts accepted (29.9%)**, output byte-identical to plain decode, against 2.52
+tokens/round (21.1%) for the same question without a picture. No special handling was needed for
+feature injection over image rows: the features it consumes are the target's residual stream, which
+by that point already carries the spliced embeddings.
+
 ## 4. Forward pass (as implemented in `tools/reference/dflash2_ref.py`)
 
 ### 4.1 Feature encoding + KV injection (`encode_features` + `inject`)

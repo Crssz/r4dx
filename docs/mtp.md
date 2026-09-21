@@ -480,8 +480,10 @@ default `true` -- `docs/r9700.md`'s P3 measured this table fits, 2.54 GB bf16, w
 over at 131k ctx): a new device-side gather kernel (`r4dx_embedding_gather_bf16`,
 `src/kernels/src/r4dx_kernels.hip`) reads a row straight out of the VRAM-resident embedding table
 by a DEVICE int32 id -- `r4dx_argmax_f32`'s own `out_idx` output feeds directly into the next
-draft step's gather with zero host syncs in between. `positions_`/`seqused_k_` for the whole K-step
-draft window are preloaded in one H2D upload each before the loop (`mtp_head.cpp`'s `Draft`) instead
+draft step's gather with zero host syncs in between. `positions_`/`seqused_k_` (and, once an image
+has been spliced into the conversation, `rope3_` -- see "Positions with an image in the prompt"
+below) for the whole K-step draft window are preloaded in one H2D upload each before the loop
+(`mtp_head.cpp`'s `Draft`) instead
 of one blocking `CopyFromHost` per step, and the whole window's drafted token ids are read back in
 ONE `stream.Synchronize()` + D2H at the end instead of one pair per step. `Model::RunChunk` and
 `Model::VerifyWindow` use the same device gather for the main decode/prefill path (one fewer H2D per
@@ -493,6 +495,36 @@ very large KV cache) or the container's free-VRAM heuristic at load time
 whole-GPU free memory at the point of upload) decided it would not fit. Every existing host-gather
 call site keeps working unchanged either way -- the device mirror is purely an additional path, never
 a replacement for `EmbedTokensHost()`.
+
+### Positions with an image in the prompt (vision milestone, docs/vision.md)
+
+Once an image has been spliced into a conversation, a token's ROPE position stops being its
+sequence index: image tokens carry distinct (t,h,w), and every token after an image ropes at
+`sequence index + mrope_position_delta` (delta negative). The MTP head is not exempt -- it runs a
+real full-attention decoder layer over the same positions the backbone does -- so both of its
+entry points had to learn the distinction, and each got the narrowest form that is actually
+correct for the positions it touches:
+
+- **`Draft`** only ever writes positions PAST the prompt, which are pure text, so all three
+  streams still carry the same value and a scalar `mrope_delta` describes the whole window. Its
+  `positions_dev_` keeps its original meaning -- it is this head's own KV cache slot mapping, and
+  that must stay the sequence index -- while a new `rope3_dev_` carries the rope value. That
+  buffer is STEP-MAJOR (`3*step + axis`, not `axis*max_draft + step`) because each step ropes
+  exactly one token and `r4dx_rope_partial_mrope3_bf16` reads its three rows at stride `tokens`,
+  which is 1 here; step-major makes `rope3_dev_ + 3*step` a valid compact `[3,1]` argument with no
+  per-step upload, preserving the one-H2D-per-window property above.
+- **`PrimeKv`** is different, and the difference is easy to miss: it is called from
+  `Model::RunChunk` over the PROMPT, so its positions can land inside an image run where the three
+  axes genuinely differ. A scalar delta is not enough there, so it takes the real
+  `int32[3, n]` rows (`Model::RopePositionsHost`), sliced by `3*host_staging_offset` into its own
+  pinned scratch for exactly the in-flight-H2D reason `prime_positions_host_` already is.
+
+Both default to the pre-vision behaviour (`mrope_active=false` / `rope3_host=nullptr`), which
+routes back to the single-row rope entry point -- so a text-only conversation is unchanged
+instruction for instruction. Measured on the real container with a 28x28-patch image in the
+prompt, `--mtp 3` greedy: **2.91 tokens/round, 41/66 drafts accepted (62.1%)**, output
+byte-identical to plain decode, against 2.21 tokens/round (38.9%) for the same question asked
+without a picture -- i.e. acceptance goes UP, not down (docs/vision.md's own table).
 
 Regression coverage: `tests/model/test_mtp.cpp`'s existing `CheckVerifyMatchesSequential` and
 `CheckRejectionRewind` both exercise this new path directly (the 4-layer MTP test container loads

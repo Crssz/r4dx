@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "attn_config.h"
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "linear.h"
@@ -18,17 +19,7 @@ constexpr int kGemmWV = 4, kGemmSK = 4, kGemmMB = 1;  // gdn_layer.cpp's plain-b
 }  // namespace
 
 MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft, int64_t max_ctx)
-    : attn_layer_([&] {
-        attention::AttnConfig acfg;
-        acfg.hidden = static_cast<int>(cfg.hidden_size);
-        acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
-        acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);
-        acfg.head_dim = static_cast<int>(cfg.head_dim);
-        acfg.rotary_dim = static_cast<int>(cfg.RotaryDim());
-        acfg.rope_theta = static_cast<float>(cfg.rope_theta);
-        acfg.rms_eps = static_cast<float>(cfg.rms_norm_eps);
-        return acfg;
-      }()),
+    : attn_layer_(MakeAttnConfig(cfg)),
       // Real, growing per-sequence cache sized like every backbone attention layer's own
       // PagedKvCache -- see mtp_head.h's file comment for why this is no longer a tiny scratch
       // block reset every Draft() call.
@@ -46,6 +37,8 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
       seed_token_dev_(1),
       draft_ids_dev_(static_cast<size_t>(max_draft)),
       draft_ids_host_(static_cast<size_t>(max_draft)),
+      rope3_dev_(static_cast<size_t>(3 * max_draft)),
+      rope3_host_(static_cast<size_t>(3 * max_draft)),
       max_draft_(max_draft),
       prime_positions_host_(static_cast<size_t>(kMaxPrime)),
       prime_positions_dev_(static_cast<size_t>(kMaxPrime)),
@@ -56,7 +49,9 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
       prime_seqused_host_(static_cast<size_t>(kMaxPrime)),
       prime_seqused_dev_(1),
       prime_embed_host_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
-      prime_embed_dev_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)) {
+      prime_embed_dev_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
+      prime_rope3_host_(static_cast<size_t>(3 * kMaxPrime)),
+      prime_rope3_dev_(static_cast<size_t>(3 * kMaxPrime)) {
   (void)w;  // cfg/w size this object's buffers above; neither is stored -- see mtp_head.h
 }
 
@@ -65,7 +60,8 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
                                      const uint16_t* h_seed, int32_t seed_token,
                                      const uint16_t* embed_table, const uint16_t* embed_table_dev,
                                      int64_t vocab, const QuantLinear& lm_head, int64_t k,
-                                     int64_t base_pos, bool use_reduced_vocab) {
+                                     int64_t base_pos, bool use_reduced_vocab, bool mrope_active,
+                                     int64_t mrope_delta) {
   std::vector<int32_t> drafts;
   if (k <= 0) return drafts;
   if (k > max_draft_) {
@@ -96,6 +92,18 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
   }
   positions_dev_.CopyFromHostAsync(positions_host_.data(), static_cast<size_t>(k), stream);
   seqused_dev_.CopyFromHostAsync(seqused_host_.data(), static_cast<size_t>(k), stream);
+  // 3-axis rope window (docs/vision.md): every drafted position is past the prompt, hence text, so
+  // all three streams hold the same `sequence index + delta` -- built and uploaded here for the
+  // same reason positions_/seqused_ are, one H2D for the whole window rather than one per step.
+  if (mrope_active) {
+    for (int64_t step = 0; step < k; ++step) {
+      const int32_t p = static_cast<int32_t>(base_pos + step + mrope_delta);
+      rope3_host_[static_cast<size_t>(3 * step + 0)] = p;
+      rope3_host_[static_cast<size_t>(3 * step + 1)] = p;
+      rope3_host_[static_cast<size_t>(3 * step + 2)] = p;
+    }
+    rope3_dev_.CopyFromHostAsync(rope3_host_.data(), static_cast<size_t>(3 * k), stream);
+  }
 
   // Device-resident path's one remaining small H2D: the seed token (step 0's embedding gather
   // input) is not yet known on-device -- every step AFTER 0 instead feeds straight from the
@@ -163,7 +171,13 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
 
     uint16_t* attn_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
     attn_layer_.Forward(arena, fc_out, attn_out, aw, kv_, /*T=*/1, /*start_pos=*/pos_h,
-                         positions_dev_.data() + step, seqused_dev_.data() + step, s);
+                         positions_dev_.data() + step, seqused_dev_.data() + step, s,
+                         /*x_normed_in=*/nullptr, /*next_norm_weight=*/nullptr,
+                         /*x_normed_out=*/nullptr, /*prof=*/nullptr, /*x_normed_pre_epilogue=*/0,
+                         /*x_normed_pre_data=*/nullptr, /*x_normed_pre_scale=*/nullptr,
+                         /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr,
+                         /*next_epilogue_scale=*/nullptr,
+                         mrope_active ? rope3_dev_.data() + 3 * step : nullptr);
 
     uint16_t* h_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
     Mlp mlp(cfg, w.layer.post_attention_layernorm, w.layer.mlp);
@@ -232,7 +246,7 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
 void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfig& cfg,
                       const MtpWeights& w, int64_t base_pos, const uint16_t* h_rows,
                       const std::vector<int32_t>& next_tokens, const uint16_t* embed_table,
-                      int64_t vocab, int64_t host_staging_offset) {
+                      int64_t vocab, int64_t host_staging_offset, const int32_t* rope3_host) {
   const int64_t n = static_cast<int64_t>(next_tokens.size());
   if (n <= 0) return;
   if (n > kMaxPrime) {
@@ -300,6 +314,15 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
   prime_seqused_host_[static_cast<size_t>(host_staging_offset)] = static_cast<int32_t>(base_pos + n);
   prime_seqused_dev_.CopyFromHostAsync(prime_seqused_host_.data() + host_staging_offset, 1, stream);
 
+  // 3-axis rope rows (docs/vision.md), same disjoint-host-slice discipline as the two uploads
+  // above -- 3 elements per position, so this call's slice starts at 3*host_staging_offset and is
+  // 3*n long, which still fits 3*kMaxPrime for RunChunk's (0, 1) offset pair.
+  if (rope3_host != nullptr) {
+    std::copy(rope3_host, rope3_host + 3 * n, prime_rope3_host_.begin() + 3 * host_staging_offset);
+    prime_rope3_dev_.CopyFromHostAsync(prime_rope3_host_.data() + 3 * host_staging_offset,
+                                        static_cast<size_t>(3 * n), stream);
+  }
+
   attention::AttnWeights aw;
   aw.input_layernorm = w.layer.input_layernorm.data();
   aw.qg = &w.layer.attn->qg;
@@ -316,7 +339,12 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
   uint16_t* discard_out = arena.Alloc<uint16_t>(static_cast<size_t>(n * hidden));
   attn_layer_.Forward(arena, fc_out, discard_out, aw, kv_, static_cast<int>(n),
                        static_cast<int>(base_pos), prime_positions_dev_.data(),
-                       prime_seqused_dev_.data(), s);
+                       prime_seqused_dev_.data(), s, /*x_normed_in=*/nullptr,
+                       /*next_norm_weight=*/nullptr, /*x_normed_out=*/nullptr, /*prof=*/nullptr,
+                       /*x_normed_pre_epilogue=*/0, /*x_normed_pre_data=*/nullptr,
+                       /*x_normed_pre_scale=*/nullptr, /*next_epilogue=*/0,
+                       /*next_epilogue_out=*/nullptr, /*next_epilogue_scale=*/nullptr,
+                       rope3_host != nullptr ? prime_rope3_dev_.data() : nullptr);
 }
 
 }  // namespace r4dx::model

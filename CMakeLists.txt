@@ -28,8 +28,12 @@ add_subdirectory(third_party)   # -> r4d_core, r4dx_hip_runtime
 add_subdirectory(src/core)
 add_subdirectory(src/kernels)
 add_subdirectory(src/tokenizer)
-add_subdirectory(src/model)
+# src/convert and src/vision precede src/model: r4dx_convert is the header-only SafetensorsReader
+# both the container loader and the vision weight loader read through, and r4dx_model links
+# r4dx_vision_tower (Container owns the loaded vision.* weights -- docs/vision.md "Load policy").
 add_subdirectory(src/convert)
+add_subdirectory(src/vision)
+add_subdirectory(src/model)
 add_subdirectory(src/server)
 add_subdirectory(src/cli)
 

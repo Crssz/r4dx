@@ -6,9 +6,73 @@
 #include <mutex>
 #include <random>
 
+#include "image_decode.h"  // src/vision: DecodeImageBytes (docs/vision.md)
+
 namespace r4dx::server {
 
 namespace {
+
+// ---- base64 (docs/vision.md, "data:image/...;base64,..." content parts) -----------------------
+// cpp-httplib (third_party/httplib/httplib.h) only ships base64_ENCODE (used for Basic-auth
+// headers); decoding an inbound image attachment needs the other direction, which nothing in this
+// tree provides yet, so it lives here next to the one caller that needs it.
+// Decodes RFC 4648 base64 (standard alphabet, optional '=' padding at the very end; embedded
+// whitespace tolerated and skipped, matching how some clients wrap the payload -- everything else
+// non-alphabet is a clean 400 rather than a silently-truncated decode). `context` names the field
+// in the thrown ApiError, mirroring every other Parse* helper in this file.
+int8_t Base64Value(unsigned char c) {
+  if (c >= 'A' && c <= 'Z') return static_cast<int8_t>(c - 'A');
+  if (c >= 'a' && c <= 'z') return static_cast<int8_t>(c - 'a' + 26);
+  if (c >= '0' && c <= '9') return static_cast<int8_t>(c - '0' + 52);
+  if (c == '+') return 62;
+  if (c == '/') return 63;
+  return -1;
+}
+
+std::vector<uint8_t> Base64Decode(const std::string& in, const char* context) {
+  std::vector<uint8_t> out;
+  out.reserve(in.size() / 4 * 3 + 3);
+  uint32_t acc = 0;
+  int bits = 0;
+  bool seen_padding = false;
+  for (unsigned char c : in) {
+    if (c == '=' ) { seen_padding = true; continue; }
+    if (std::isspace(c)) continue;
+    if (seen_padding) {
+      throw ApiError{400, "invalid_request_error",
+                      std::string(context) + ": malformed base64 (data after '=' padding)"};
+    }
+    const int8_t v = Base64Value(c);
+    if (v < 0) {
+      throw ApiError{400, "invalid_request_error",
+                      std::string(context) + ": malformed base64 (invalid character)"};
+    }
+    acc = (acc << 6) | static_cast<uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+// FNV-1a 64-bit -- a stable, dependency-free content fingerprint for PrefixState::ImageKey
+// (docs/vision.md "Prefix reuse across a turn that contained an image"): only ever compared for
+// EQUALITY within one server process, never persisted or compared cross-process, so cryptographic
+// strength is not the property being bought here, just "two different pictures hash differently in
+// practice" -- collisions would only ever cost a spurious cache-reuse-denied (a correctness bug in
+// the other direction -- treating two DIFFERENT pictures as the same -- is what actually matters,
+// and FNV-1a's 64 bits make that astronomically unlikely for the handful of images one request
+// carries).
+uint64_t Fnv1a64(const std::vector<uint8_t>& bytes) {
+  uint64_t h = 1469598103934665603ULL;
+  for (uint8_t b : bytes) {
+    h ^= b;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
 
 const nlohmann::json& RequireField(const nlohmann::json& obj, const char* key,
                                     const char* context) {
@@ -30,10 +94,120 @@ std::string RequireString(const nlohmann::json& obj, const char* key, const char
 // typed parts (`[{"type":"text","text":"..."}, ...]`). Any non-"text" part (image_url, input_
 // audio, ...) is rejected outright -- vision/audio input isn't implemented yet (task point 1's
 // "image parts rejected with a clear 400 until vision lands").
-std::string ParseMessageContent(const nlohmann::json& content, const std::string& role) {
-  if (content.is_string()) return content.get<std::string>();
+// Extracts the `data:...;base64,...` URI out of the several shapes real clients send an image in
+// (docs/server.md's "Images", derived from Stage 1's Unsloth Studio investigation plus the two
+// alternate shapes the task also names): the confirmed
+// `{"type":"image_url","image_url":{"url":"data:..."}}`, `image_url` as a bare string in place of
+// the object, and the Responses-API-style `{"type":"input_image","image_url":"data:..."}` (also
+// tolerating `"image"` as the field name there). Returns the raw url string; every shape check
+// beyond "which field holds it" (data: vs http(s), mime type, size) happens in the one shared
+// decode path below so it is identical regardless of which shape a client used.
+std::string ExtractImageUrl(const nlohmann::json& part, const std::string& type) {
+  const char* candidates[] = {"image_url", "image"};
+  for (const char* key : candidates) {
+    if (!part.contains(key) || part.at(key).is_null()) continue;
+    const nlohmann::json& v = part.at(key);
+    if (v.is_string()) return v.get<std::string>();
+    if (v.is_object() && v.contains("url") && v.at("url").is_string()) {
+      return v.at("url").get<std::string>();
+    }
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: '" + std::string(key) + "' must be a string or an "
+                    "object with a string 'url'"};
+  }
+  throw ApiError{400, "invalid_request_error",
+                  "messages[].content: '" + type + "' part is missing its image data "
+                  "('image_url' or 'image')"};
+}
+
+// Decodes and preprocesses one image content part's `data:` URI into an ImagePart (docs/vision.md,
+// docs/server.md's "Images"). Every clean-400 case this stage's deliverables name lives here:
+// a remote http(s) URL (never fetched -- a local single-user server should not make outbound
+// requests on a client's behalf), a non-`data:` URL of any other shape, an unsupported/unrecognized
+// image MIME type (webp included -- stb_image, and therefore r4dx::vision::DecodeImageBytes, does
+// not decode it), oversize base64, and corrupt/undecodable image bytes of a claimed-supported
+// format.
+ImagePart DecodeImageUrl(const std::string& url, const vision::ImageProcessorConfig& image_cfg) {
+  if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0) {
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: remote image URLs are not fetched by this server (a "
+                    "local single-user server should not make outbound requests on a client's "
+                    "behalf) -- send the image as a data: URI instead"};
+  }
+  if (url.rfind("data:", 0) != 0) {
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: image_url must be a data: URI (e.g. "
+                    "\"data:image/png;base64,...\") -- got a URL of an unsupported shape"};
+  }
+  const size_t comma = url.find(',');
+  const size_t semicolon = url.find(';');
+  if (comma == std::string::npos || semicolon == std::string::npos || semicolon > comma ||
+      url.compare(semicolon + 1, 7, "base64,") != 0) {
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: image_url must be a \"data:<mime>;base64,<payload>\" URI"};
+  }
+  const std::string mime = url.substr(5, semicolon - 5);  // "image/png" etc, after "data:"
+  static const std::vector<std::string> kSupportedMimes = {
+      "image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp"};
+  if (std::find(kSupportedMimes.begin(), kSupportedMimes.end(), mime) == kSupportedMimes.end()) {
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: unsupported image format '" + mime +
+                        "' (supported: image/png, image/jpeg, image/gif, image/bmp)"};
+  }
+  const std::string payload = url.substr(comma + 1);
+  if (payload.size() > kMaxImageBase64Chars) {
+    throw ApiError{400, "invalid_request_error",
+                    "messages[].content: image data too large (" + std::to_string(payload.size()) +
+                        " base64 chars, max " + std::to_string(kMaxImageBase64Chars) + ")"};
+  }
+  const std::vector<uint8_t> raw = Base64Decode(payload, "messages[].content.image_url");
+  if (raw.empty()) {
+    throw ApiError{400, "invalid_request_error", "messages[].content: image data decoded to zero bytes"};
+  }
+
+  vision::DecodedImage decoded;
+  try {
+    decoded = vision::DecodeImageBytes(raw.data(), raw.size());
+  } catch (const std::exception& e) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string("messages[].content: corrupt or unsupported image data: ") + e.what()};
+  }
+
+  ImagePart out;
+  out.content_hash = Fnv1a64(raw);
+  try {
+    const vision::PreprocessedImages pre = vision::PreprocessImages({decoded}, image_cfg);
+    out.grid = pre.grid_thw.at(0);
+    out.pixel_values = pre.pixel_values;
+    out.patch_dim = pre.patch_dim;
+  } catch (const std::exception& e) {
+    // smart_resize's own ">200 aspect ratio" rejection (preprocess.h) surfaces here as a
+    // std::runtime_error -- a genuine caller-shape problem (an absurdly thin/wide image), not a
+    // server fault.
+    throw ApiError{400, "invalid_request_error",
+                    std::string("messages[].content: could not preprocess image: ") + e.what()};
+  }
+  return out;
+}
+
+// Parses a message's `content` field, which OpenAI allows as either a plain string or an array of
+// typed parts. `text_out` receives the concatenation of every text part (unchanged meaning from
+// before image parts existed); `parts_out` receives the ordered part list but is left EMPTY unless
+// at least one image part was present -- see ChatMessage::content_parts' own doc comment for why.
+// `image_count` is threaded through (rather than computed from `parts_out->size()` by the caller)
+// so the request-wide image cap (kMaxImagesPerRequest) can be enforced across every message, not
+// just within one.
+void ParseMessageContent(const nlohmann::json& content, const std::string& role,
+                          const vision::ImageProcessorConfig& image_cfg, size_t* image_count,
+                          std::string* text_out, std::vector<ContentPart>* parts_out) {
+  if (content.is_string()) {
+    *text_out = content.get<std::string>();
+    return;
+  }
   if (content.is_array()) {
     std::string out;
+    std::vector<ContentPart> parts;
+    bool has_image = false;
     for (const auto& part : content) {
       if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
         throw ApiError{400, "invalid_request_error",
@@ -44,14 +218,33 @@ std::string ParseMessageContent(const nlohmann::json& content, const std::string
         if (!part.contains("text") || !part.at("text").is_string()) {
           throw ApiError{400, "invalid_request_error", "messages[].content: text part missing 'text'"};
         }
-        out += part.at("text").get<std::string>();
+        const std::string t = part.at("text").get<std::string>();
+        out += t;
+        ContentPart cp;
+        cp.is_image = false;
+        cp.text = t;
+        parts.push_back(std::move(cp));
+      } else if (type == "image_url" || type == "input_image") {
+        if (++*image_count > kMaxImagesPerRequest) {
+          throw ApiError{400, "invalid_request_error",
+                          "too many images in this request (max " +
+                              std::to_string(kMaxImagesPerRequest) + ")"};
+        }
+        const std::string url = ExtractImageUrl(part, type);
+        ContentPart cp;
+        cp.is_image = true;
+        cp.image = DecodeImageUrl(url, image_cfg);
+        parts.push_back(std::move(cp));
+        has_image = true;
       } else {
         throw ApiError{400, "invalid_request_error",
-                        "messages[].content: part type '" + type + "' is not supported yet "
-                        "(only 'text' -- image/audio input is not implemented; see docs/server.md)"};
+                        "messages[].content: part type '" + type + "' is not supported "
+                        "(supported: 'text', 'image_url', 'input_image')"};
       }
     }
-    return out;
+    *text_out = out;
+    if (has_image) *parts_out = std::move(parts);
+    return;
   }
   throw ApiError{400, "invalid_request_error",
                   "messages[" + role + "].content must be a string or an array of content parts"};
@@ -459,7 +652,8 @@ ThinkingControls ParseThinkingControls(const nlohmann::json& body) {
 }
 
 ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
-                                                  const SamplingParams& sampling_defaults) {
+                                                  const SamplingParams& sampling_defaults,
+                                                  const vision::ImageProcessorConfig& image_cfg) {
   if (!body.is_object()) throw ApiError{400, "invalid_request_error", "request body must be a JSON object"};
 
   ChatCompletionRequest req;
@@ -471,6 +665,9 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
   if (!messages.is_array() || messages.empty()) {
     throw ApiError{400, "invalid_request_error", "'messages' must be a non-empty array"};
   }
+  // Counts every image content part across the WHOLE request (every message), not per-message --
+  // kMaxImagesPerRequest is a request-wide cap (docs/server.md's "Images").
+  size_t image_count = 0;
   for (const auto& m : messages) {
     if (!m.is_object()) throw ApiError{400, "invalid_request_error", "messages[] entries must be objects"};
     const std::string role = RequireString(m, "role", "messages[]");
@@ -500,7 +697,11 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
       }
       cm.content = std::nullopt;
     } else {
-      cm.content = ParseMessageContent(m.at("content"), role);
+      std::string text;
+      std::vector<ContentPart> parts;
+      ParseMessageContent(m.at("content"), role, image_cfg, &image_count, &text, &parts);
+      cm.content = std::move(text);
+      cm.content_parts = std::move(parts);
     }
     cm.tool_calls = std::move(tool_calls);
 
@@ -633,21 +834,25 @@ nlohmann::json BuildUsageJson(const UsageStats& usage) {
 //     configured `--max-ctx`, `n_ctx_train` is the checkpoint's own native limit
 //     (kModelNativeContextLength -- see that constant's own doc comment for why it is not read
 //     from the loaded container).
-//   capabilities -- a fixed list reflecting what this server actually does: plain completion, chat
-//     (the chat template), tool_use (`tools`/`tool_choice`, docs/server.md's "Tool calls"), and
-//     reasoning (`chat_template_kwargs.enable_thinking`, docs/server.md's "reasoning_content").
+//   capabilities -- what this server actually does: plain completion, chat (the chat template),
+//     tool_use (`tools`/`tool_choice`, docs/server.md's "Tool calls"), reasoning
+//     (`chat_template_kwargs.enable_thinking`, docs/server.md's "reasoning_content"), and -- only
+//     when the loaded container's vision tower is resident (`has_vision`) -- image.
 //   supported_parameters -- exactly the request fields ParseChatCompletionRequest/ParseSampling/
 //     etc. actually parse (openai_types.cpp): sampling (`temperature`/`top_p`/`top_k`/`min_p`/
 //     `seed`), generation length (`max_tokens`/`max_completion_tokens`), `stop`, `stream`/
 //     `stream_options`, tool calling (`tools`/`tool_choice`), and `chat_template_kwargs`. Anything
 //     NOT in this list (e.g. `logprobs`, `presence_penalty`) is silently ignored by this server
 //     today, so it is deliberately left out rather than falsely advertised.
-//   architecture -- text in, text out (no vision tower yet, docs/server.md's "Deferred" section).
+//   architecture -- what goes in and what comes out: text out always, text in always, plus image
+//     in when `has_vision` (ModelInputModalities, below -- the one writer of that list).
 //   top_provider / reasoning -- the OpenRouter-shaped capability block, the one machine-readable
 //     form several clients (and Unsloth Studio's own openrouter_model_capabilities mapper) already
 //     know how to read: context/output limits and whether thinking is supported, default-on
 //     (`--think`) and optional. See docs/server.md's "Client compatibility: Unsloth Studio".
-nlohmann::json ModelInputModalities() { return nlohmann::json::array({"text"}); }
+nlohmann::json ModelInputModalities(bool has_vision) {
+  return has_vision ? nlohmann::json::array({"text", "image"}) : nlohmann::json::array({"text"});
+}
 
 nlohmann::json ModelSupportedReasoningEfforts() {
   // The full de-facto scale, because ParseThinkingControls accepts every one of these: "none"
@@ -658,7 +863,10 @@ nlohmann::json ModelSupportedReasoningEfforts() {
 }
 
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx, bool default_thinking) {
+                                    int64_t max_ctx, bool default_thinking, bool has_vision) {
+  nlohmann::json capabilities =
+      nlohmann::json::array({"completion", "chat", "tool_use", "reasoning"});
+  if (has_vision) capabilities.push_back("image");
   return {{"id", model_id},
           {"object", "model"},
           {"created", created_unix},
@@ -667,7 +875,10 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
           {"max_model_len", max_ctx},
           {"max_completion_tokens", max_ctx},
           {"meta", {{"n_ctx", max_ctx}, {"n_ctx_train", kModelNativeContextLength}}},
-          {"capabilities", nlohmann::json::array({"completion", "chat", "tool_use", "reasoning"})},
+          {"capabilities", capabilities},
+          // `modalities` -- a second, plainer spelling of the same "image" answer several clients
+          // probe instead of (or in addition to) `architecture.input_modalities` (docs/vision.md).
+          {"modalities", ModelInputModalities(has_vision)},
           {"supported_parameters",
            nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
                                   "max_completion_tokens", "stop", "stream", "stream_options",
@@ -681,15 +892,15 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
            {{"supported_efforts", ModelSupportedReasoningEfforts()},
             {"default_enabled", default_thinking},
             {"mandatory", false}}},
-          {"architecture", {{"input_modalities", ModelInputModalities()},
+          {"architecture", {{"input_modalities", ModelInputModalities(has_vision)},
                             {"output_modalities", nlohmann::json::array({"text"})}}}};
 }
 
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx,
-                                    bool default_thinking) {
+                                    bool default_thinking, bool has_vision) {
   return {{"object", "list"},
-          {"data", nlohmann::json::array(
-                        {BuildModelEntryJson(model_id, created_unix, max_ctx, default_thinking)})}};
+          {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx,
+                                                               default_thinking, has_vision)})}};
 }
 
 nlohmann::json BuildTimingsJson(const TimingStats& timings) {
@@ -706,6 +917,10 @@ nlohmann::json BuildTimingsJson(const TimingStats& timings) {
   if (timings.draft_n) {
     out["draft_n"] = *timings.draft_n;
     out["draft_n_accepted"] = timings.draft_n_accepted.value_or(0);
+  }
+  if (timings.image_n) {
+    out["image_n"] = *timings.image_n;
+    out["image_ms"] = timings.image_ms.value_or(0.0);
   }
   return out;
 }

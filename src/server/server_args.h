@@ -91,6 +91,14 @@ struct ServerArgs {
   int64_t dflash_k = 7;
   float dflash_p_min = 0.0f;
   int64_t dflash_n_min = 0;
+  // Vision tower (docs/vision.md "Load policy") -- same three values, same default and the same
+  // meaning as src/cli/cli_args.h's --vision: "auto" loads the container's vision.* weights iff it
+  // has them, "on" fails the load when it does not, "off" never loads them.
+  std::string vision = "auto";
+  // Per-image pixel cap (docs/vision.md "Large images") -- same default and meaning as
+  // src/cli/cli_args.h's --image-max-pixels: an image above this is DOWNSIZED via the reference's
+  // own smart_resize rule rather than rejected. 0 means the checkpoint's own 16777216 ceiling.
+  int64_t image_max_pixels = 1048576;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -109,7 +117,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
          "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
          "[--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N] "
-         "[--dflash-p-min F] [--dflash-n-min N]";
+         "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
+         "[--image-max-pixels N]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -168,6 +177,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--dflash-k") a.dflash_k = ServerParseI64("--dflash-k", NextServerArg(argc, argv, i, "--dflash-k"));
     else if (arg == "--dflash-p-min") a.dflash_p_min = ServerParseFloat("--dflash-p-min", NextServerArg(argc, argv, i, "--dflash-p-min"));
     else if (arg == "--dflash-n-min") a.dflash_n_min = ServerParseI64("--dflash-n-min", NextServerArg(argc, argv, i, "--dflash-n-min"));
+    else if (arg == "--vision") a.vision = NextServerArg(argc, argv, i, "--vision");
+    else if (arg == "--image-max-pixels") a.image_max_pixels = ServerParseI64("--image-max-pixels", NextServerArg(argc, argv, i, "--image-max-pixels"));
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -196,6 +207,12 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   }
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
     throw ServerUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
+  if (a.vision != "auto" && a.vision != "on" && a.vision != "off") {
+    throw ServerUsageError("--vision must be 'auto', 'on' or 'off'");
+  }
+  if (a.image_max_pixels != 0 && a.image_max_pixels < 1024) {
+    throw ServerUsageError("--image-max-pixels must be 0 (the checkpoint's own ceiling) or >= 1024");
   }
   if (!a.dflash.empty() && a.mtp > 0) {
     throw ServerUsageError("--dflash and --mtp are mutually exclusive (docs/dflash2.md: DFlash2 "

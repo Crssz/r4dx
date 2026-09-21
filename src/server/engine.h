@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -109,10 +110,13 @@ class Engine {
 
   // Shared stop-string-aware token emission (engine.cpp) used by both the plain-decode and MTP
   // generation loops in RunRequest -- see that function's definition for the full contract.
-  // `stream_to_client`: false when this request has `tools` (docs/server.md's "Tool calls"
-  // streaming decision -- generation is buffered whole, not streamed live, whenever a tool call
-  // could plausibly appear, so a client never sees a half-formed "<tool_call>" tag as content).
-  // `accumulated`/the stop-string check itself are unaffected either way. `stop_match_pos`
+  // `forward`: where the surviving (stop-trimmed) text goes. RunRequest builds exactly one such
+  // router per request -- a straight `sink->OnToken` passthrough for a request with no `tools`, the
+  // ToolStreamGate-controlled one (tool_stream_gate.h, docs/server.md's "Tool calls" streaming
+  // decision) for a streaming request that offers them, and a drop for a NON-streaming request that
+  // offers them (nothing is delivered live there at all; the whole generation is re-derived from
+  // `accumulated` after the loop). `accumulated`/the stop-string check itself are unaffected by
+  // which router is in play, so every decode path stays byte-for-byte identical. `stop_match_pos`
   // (review finding, 2026-09-20): when a --stop string matches, the position within `accumulated`
   // where it begins is written here (if non-null) -- `accumulated` itself still gets the FULL
   // decoded piece appended (including the stop text), only what's *streamed* to the client is
@@ -128,7 +132,8 @@ class Engine {
   // even starts. Defaults to 0 (no restriction, today's behavior) so a thinking-off request is
   // byte-for-byte unaffected.
   static bool EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
-                         std::string& accumulated, int32_t tok, bool stream_to_client = true,
+                         std::string& accumulated, int32_t tok,
+                         const std::function<void(const std::string&)>& forward,
                          size_t* stop_match_pos = nullptr, size_t min_stop_search_from = 0);
 
   EngineOptions opts_;

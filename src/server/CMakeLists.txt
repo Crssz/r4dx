@@ -10,6 +10,7 @@ add_library(r4dx_server_core STATIC
   sse.cpp
   response_sink.cpp
   tool_call_parser.cpp
+  tool_stream_gate.cpp
   reasoning_splitter.cpp
 )
 target_include_directories(r4dx_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

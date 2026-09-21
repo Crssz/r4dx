@@ -11,6 +11,7 @@
 #include "r4dx/kernels/sampler.hpp"
 #include "reasoning_splitter.h"
 #include "tool_call_parser.h"
+#include "tool_stream_gate.h"
 
 namespace r4dx::server {
 
@@ -58,12 +59,13 @@ size_t FindEarliestStop(const std::string& text, const std::vector<std::string>&
 
 // Decodes `tok` into text, applies --stop trimming (identical semantics/lookback window to
 // src/cli/main.cpp's own inline copy of this logic -- see docs/server.md's "--stop trimming
-// across token boundaries"), and pushes whatever survives to req.sink->OnToken (so every accepted
-// token -- plain-decode or MTP-round -- streams to the client as soon as it is committed, per this
-// stage's task point 2). Returns true iff a --stop string matched (the caller should stop
-// generating and report finish_reason="stop").
+// across token boundaries"), and hands whatever survives to `forward` (so every accepted token --
+// plain-decode or MTP-round -- reaches the client as soon as it is committed, per this stage's task
+// point 2). Returns true iff a --stop string matched (the caller should stop generating and report
+// finish_reason="stop").
 bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& decoder,
-                       std::string& accumulated, int32_t tok, bool stream_to_client,
+                       std::string& accumulated, int32_t tok,
+                       const std::function<void(const std::string&)>& forward,
                        size_t* stop_match_pos, size_t min_stop_search_from) {
   const std::string piece = decoder.push(tok);
   if (piece.empty()) return false;
@@ -78,11 +80,11 @@ bool Engine::EmitToken(PendingRequest& req, r4dx::Tokenizer::StreamDecoder& deco
   if (match != std::string::npos) {
     const size_t emit_len = match > already_emitted ? match - already_emitted : 0;
     const std::string trimmed = piece.substr(0, emit_len);
-    if (stream_to_client && !trimmed.empty()) req.sink->OnToken(trimmed);
+    if (!trimmed.empty()) forward(trimmed);
     if (stop_match_pos) *stop_match_pos = match;
     return true;
   }
-  if (stream_to_client) req.sink->OnToken(piece);
+  forward(piece);
   return false;
 }
 
@@ -326,6 +328,12 @@ void Engine::RunRequest(PendingRequest& req) {
     bool reasoning_open = enable_thinking;
     int64_t reasoning_tokens = 0;
     size_t stop_search_floor = enable_thinking ? std::string::npos : 0;
+    // The offset in `accumulated` of the first byte AFTER "</think>" -- the same position
+    // `stop_search_floor` ends up holding, tracked separately because the two answer very different
+    // questions (one bounds the stop-string search, the other tells the tool-call stream gate below
+    // where the ANSWER text it may gate actually starts) and nothing should silently couple them.
+    // `0` from the start when thinking is off: the whole generation is answer text then.
+    size_t think_end = enable_thinking ? std::string::npos : 0;
     auto NoteReasoningProgress = [&]() {
       if (!reasoning_open) return;
       const size_t p = accumulated.find("</think>");
@@ -333,17 +341,98 @@ void Engine::RunRequest(PendingRequest& req) {
       reasoning_open = false;
       reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
       stop_search_floor = p + 8;  // strlen("</think>")
+      think_end = p + 8;
     };
 
-    // Tool calls (docs/server.md's "Tool calls" streaming decision): whenever this request could
-    // plausibly produce a "<tool_call>" span (i.e. it offered any tool definitions), buffer the
-    // ENTIRE generation instead of streaming it token-by-token -- EmitToken below still tracks
-    // `accumulated`/applies --stop trimming exactly as always, it just skips the sink->OnToken()
-    // forward. This guarantees a client can never see a half-formed tag as a content delta (the
-    // CRITICAL failure mode this design avoids), at the honest cost of "fake" (all-at-once)
-    // streaming for any request that offers tools, whether or not a call actually happens. A
-    // request with no `tools` is completely unaffected (real per-token streaming, unchanged).
+    // Tool calls (docs/server.md's "Tool calls" streaming decision): a request that offers tool
+    // definitions gets its generation parsed for "<tool_call>" spans once, at the end, out of the
+    // fully-accumulated text (the `tool_mode` block far below) -- that part is unchanged. What the
+    // CLIENT sees while that generation is still running now depends on whether it asked to stream:
+    //
+    //   * no `tools` at all            -- straight per-token streaming, completely unaffected.
+    //   * `tools` + "stream": false    -- nothing is delivered live (there is no live anything on a
+    //                                     non-streaming request); the whole response is re-derived
+    //                                     from `accumulated` afterwards, byte-for-byte as before.
+    //   * `tools` + "stream": true     -- LIVE per-token content deltas, gated by ToolStreamGate
+    //                                     (tool_stream_gate.h) so the stream shuts off the instant a
+    //                                     real "<tool_call>" opener appears and no client ever sees
+    //                                     even a partial "<tool_" prefix of one. Previously this
+    //                                     case buffered the whole generation too, which made every
+    //                                     turn of a client that always sends `tools` (Unsloth
+    //                                     Studio does) arrive in one lump after the fact.
     const bool tool_mode = req.kind == RequestKind::kChat && !req.tools.empty();
+    const bool live_tool_stream = tool_mode && req.stream;
+
+    // Raw-offset bookkeeping for `live_tool_stream`. The sink is fed RAW generated bytes exactly as
+    // a no-tools request would feed it -- thinking span, "</think>" tag and all -- because
+    // BufferingSink/StreamingSink run their own ReasoningSplitter over that same byte stream
+    // (response_sink.h) and must see it intact to split reasoning_content from content. Only the
+    // ANSWER half runs through the gate, and since the gate can only ever hold back a SUFFIX of the
+    // stream, "how much raw text is safe to forward" collapses to a single monotonically advancing
+    // watermark over `accumulated`.
+    size_t forwarded = 0;    // bytes of `accumulated` already handed to req.sink->OnToken
+    size_t streamable = 0;   // bytes of `accumulated` eligible to be streamed at all (stop-trimmed)
+    // Offset of the first byte the gate is fed -- i.e. where the string the end-of-generation
+    // ParseToolCalls call will see begins inside `accumulated`. With thinking off that is simply 0
+    // (no tag, no blank-line skip, the whole generation is answer text and the sinks append it
+    // verbatim); with thinking on it is only known once the tag AND the first byte that survives
+    // ReasoningSplitter's leading-blank-line skip have both arrived.
+    size_t answer_begin = enable_thinking ? std::string::npos : 0;
+    size_t gate_fed = 0;     // answer bytes already pushed into `gate`
+    ToolStreamGate gate;
+    auto FlushGated = [&](bool finishing) {
+      // Keep `think_end` current before using it: a single decoded piece can carry the close tag
+      // AND answer text (even an entire "<tool_call>" opener) at once, so waiting for the call
+      // site's own NoteReasoningProgress() below would forward answer bytes the gate never saw.
+      // Idempotent -- it returns immediately once the tag has been found.
+      NoteReasoningProgress();
+      size_t safe = streamable;  // still inside the thinking span: no answer text exists yet
+      if (think_end != std::string::npos) {
+        if (answer_begin == std::string::npos) {
+          // Skip the blank lines right after the tag exactly as ReasoningSplitter does, so the gate
+          // is fed the same `rest` string the end-of-generation split produces. The skip is only
+          // final once a non-newline byte shows up; until then every byte so far is one the sink's
+          // own splitter will drop, so forwarding it raw is free.
+          size_t i = think_end;
+          while (i < streamable && (accumulated[i] == '\n' || accumulated[i] == '\r')) ++i;
+          if (i < streamable) answer_begin = i;
+        }
+        if (answer_begin != std::string::npos) {
+          if (streamable > answer_begin + gate_fed) {
+            gate.Push(accumulated.substr(answer_begin + gate_fed,
+                                          streamable - (answer_begin + gate_fed)));
+            gate_fed = streamable - answer_begin;
+          }
+          if (finishing) gate.Finish();
+          safe = answer_begin + gate.streamed_bytes();
+        }
+      }
+      if (safe > forwarded) {
+        req.sink->OnToken(accumulated.substr(forwarded, safe - forwarded));
+        forwarded = safe;
+      }
+    };
+    // The one per-request router every EmitToken call below hands its surviving text to.
+    auto forward = [&](const std::string& text) {
+      if (!tool_mode) {
+        req.sink->OnToken(text);
+        return;
+      }
+      if (!live_tool_stream) return;  // non-streaming + tools: buffered whole, delivered at the end
+      streamable += text.size();
+      // Mirror the `tool_parse_source` re-trim the tool_mode block does, so nothing at or past a
+      // matched --stop string is streamed once the match is known -- in practice this is the
+      // decoder's own `flush()` tail, the only text forwarded after EmitToken has written
+      // `stop_match_pos`. It cannot un-send a --stop string that only completed ACROSS a token
+      // boundary (EmitToken's 63-byte lookback can match at a position the client already has):
+      // that is the same inherent streaming limitation a request with no `tools` has, and the
+      // `min()` guard where `still_owed` is computed below keeps it from turning into duplicated
+      // content. The non-streaming path re-derives everything from `accumulated` and is exact.
+      if (stop_match_pos != std::string::npos && streamable > stop_match_pos) {
+        streamable = stop_match_pos;
+      }
+      FlushGated(/*finishing=*/false);
+    };
 
     // MTP (docs/mtp.md, docs/sampling.md section 9/10, stage S3): any request on a Model actually
     // Load()'d with mtp_draft_k>0 takes the speculative path now, greedy or sampled -- everything
@@ -369,8 +458,7 @@ void Engine::RunRequest(PendingRequest& req) {
         stopped = true;
       } else {
         generated_tokens.push_back(next);
-        if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                      &stop_match_pos, stop_search_floor)) {
+        if (EmitToken(req, decoder, accumulated, next, forward, &stop_match_pos, stop_search_floor)) {
           finish_reason = "stop";
           stopped = true;
         }
@@ -403,8 +491,7 @@ void Engine::RunRequest(PendingRequest& req) {
         for (int32_t tok : outcome.displayed) {
           generated_tokens.push_back(tok);
           next = tok;
-          if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
-                        &stop_match_pos, stop_search_floor)) {
+          if (EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor)) {
             finish_reason = "stop";
             stopped = true;
             NoteReasoningProgress();
@@ -433,8 +520,7 @@ void Engine::RunRequest(PendingRequest& req) {
         stopped = true;
       } else {
         generated_tokens.push_back(next);
-        if (EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                      &stop_match_pos, stop_search_floor)) {
+        if (EmitToken(req, decoder, accumulated, next, forward, &stop_match_pos, stop_search_floor)) {
           finish_reason = "stop";
           stopped = true;
         }
@@ -467,8 +553,7 @@ void Engine::RunRequest(PendingRequest& req) {
         for (int32_t tok : outcome.displayed) {
           generated_tokens.push_back(tok);
           next = tok;
-          if (EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
-                        &stop_match_pos, stop_search_floor)) {
+          if (EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor)) {
             finish_reason = "stop";
             stopped = true;
             NoteReasoningProgress();
@@ -499,8 +584,7 @@ void Engine::RunRequest(PendingRequest& req) {
           break;
         }
         generated_tokens.push_back(next);
-        const bool stop_hit = EmitToken(req, decoder, accumulated, next, /*stream_to_client=*/!tool_mode,
-                                        &stop_match_pos, stop_search_floor);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, next, forward, &stop_match_pos, stop_search_floor);
         NoteReasoningProgress();
         // Feed `next` into the model regardless of stop_hit, so committed_tokens below accurately
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
@@ -533,8 +617,7 @@ void Engine::RunRequest(PendingRequest& req) {
           break;
         }
         generated_tokens.push_back(tok);
-        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, /*stream_to_client=*/!tool_mode,
-                                        &stop_match_pos, stop_search_floor);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
         NoteReasoningProgress();
         // Same "feed regardless of stop_hit" reasoning as the greedy branch above.
         next = model_->DecodeStepSampled(tok, sp, rng);
@@ -546,10 +629,16 @@ void Engine::RunRequest(PendingRequest& req) {
       }
     }
     const std::string tail_text = decoder.flush();
-    if (!tool_mode && !tail_text.empty()) req.sink->OnToken(tail_text);
-    accumulated += tail_text;  // harmless when empty; needed below so tool-call parsing sees the
-                                // full text even in the rare case generation stopped mid-codepoint
+    accumulated += tail_text;  // BEFORE forwarding it: the live-tool-stream router reads its
+                                // watermark out of `accumulated` itself. Harmless when empty;
+                                // needed below so tool-call parsing sees the full text even in the
+                                // rare case generation stopped mid-codepoint.
+    if (!tail_text.empty()) forward(tail_text);
     NoteReasoningProgress();  // covers the rare case where the close tag only completes via `flush`
+    // Release whatever the gate is still holding back (a proper prefix of "<tool_call>" that
+    // generation ended before completing -- see ToolStreamGate::Finish), so `gate.streamed_bytes()`
+    // below is final before the remainder is computed against it.
+    if (live_tool_stream) FlushGated(/*finishing=*/true);
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
@@ -557,10 +646,9 @@ void Engine::RunRequest(PendingRequest& req) {
 
     if (tool_mode) {
       // Parse this checkpoint's real tool-call surface syntax (src/server/tool_call_parser.h,
-      // docs/server.md's "Tool calls") out of the fully-buffered generation, then deliver it as
-      // one content piece (the leading/trailing prose, if any -- empty when the whole turn was a
-      // call) followed by one complete tool_calls batch, matching the "buffer whole" streaming
-      // decision documented above. Robustness (task item 7): ParseToolCalls never throws --
+      // docs/server.md's "Tool calls") out of the fully-accumulated generation, then deliver
+      // whatever content has not already gone out live followed by one complete tool_calls batch.
+      // Robustness (task item 7): ParseToolCalls never throws --
       // malformed JSON in a parameter value degrades that value to a string, and a malformed
       // <tool_call> span degrades to literal content -- so this always produces a sane response,
       // never a crashed worker thread or a desynced stream, no matter how the model misbehaves.
@@ -576,11 +664,16 @@ void Engine::RunRequest(PendingRequest& req) {
               : accumulated;
 
       // reasoning_content in tool-call mode (task item 5d): strip the thinking span out of the
-      // buffered generation BEFORE tool-call parsing even runs, using the same ReasoningSplitter
-      // class the sinks use for the per-piece streaming split -- fed the whole buffered string in
-      // one Push() call rather than piece by piece (ReasoningSplitter's own file comment on why one
-      // state machine serves both). `sink->OnReasoningContent` is the one-shot equivalent of
-      // OnToken's per-piece split, since tool_mode never streams per-piece deltas at all.
+      // accumulated generation BEFORE tool-call parsing even runs, using the same ReasoningSplitter
+      // class the sinks use for the per-piece streaming split -- fed the whole string in one Push()
+      // call rather than piece by piece (ReasoningSplitter's own file comment on why one state
+      // machine serves both). Two things come out of this: `rest` (the ANSWER text, which is
+      // exactly what the live gate above was fed, byte for byte -- both skip the tag and the blank
+      // lines right after it at the same offsets) and, for a NON-streaming request only, the
+      // trimmed reasoning span. A live-streaming request has already delivered its reasoning as
+      // per-piece `reasoning_content` deltas through the sink's own splitter (which saw the raw
+      // "</think>" bytes the router forwarded), so calling the one-shot OnReasoningContent here too
+      // would duplicate it.
       if (enable_thinking) {
         ReasoningSplitter splitter;
         std::string reasoning_raw;
@@ -590,7 +683,7 @@ void Engine::RunRequest(PendingRequest& req) {
         };
         collect(splitter.Push(tool_parse_source));
         collect(splitter.Finish());
-        req.sink->OnReasoningContent(TrimReasoningWhitespace(reasoning_raw));
+        if (!live_tool_stream) req.sink->OnReasoningContent(TrimReasoningWhitespace(reasoning_raw));
         tool_parse_source = std::move(rest);
       }
 
@@ -604,7 +697,21 @@ void Engine::RunRequest(PendingRequest& req) {
       }
       r4dx::server::DropUnknownToolCalls(parsed, known_names);
 
-      if (!parsed.content.empty()) req.sink->OnToken(parsed.content);
+      // What is left to say. Non-streaming: all of it, exactly as before. Live stream: only the
+      // tail the gate held back -- a malformed span the parser degraded to literal content, prose
+      // that followed a call, a DropUnknownToolCalls note -- so that the concatenation of every
+      // content delta the client received equals `parsed.content` byte for byte, which is precisely
+      // what the non-streaming `message.content` would have been (tool_stream_gate.h's
+      // ToolStreamRemainder, the same function tests/server/test_tool_stream_gate.cpp asserts that
+      // invariant with).
+      const std::string still_owed =
+          live_tool_stream
+              ? ToolStreamRemainder(
+                    tool_parse_source.substr(0, std::min(gate.streamed_bytes(),
+                                                          tool_parse_source.size())),
+                    parsed.content)
+              : parsed.content;
+      if (!still_owed.empty()) req.sink->OnToken(still_owed);
       if (!parsed.tool_calls.empty()) {
         std::vector<ToolCallOut> tool_calls_out;
         tool_calls_out.reserve(parsed.tool_calls.size());
@@ -653,7 +760,7 @@ void Engine::RunRequest(PendingRequest& req) {
     const double prefill_tps = prefill_seconds > 0 ? new_tokens_i32.size() / prefill_seconds : 0.0;
     const double decode_tps =
         decode_seconds > 0 ? static_cast<double>(generated_tokens.size()) / decode_seconds : 0.0;
-    char buf[448];
+    char buf[480];
     int n = std::snprintf(
         buf, sizeof(buf),
         "request %s: prompt=%lld new=%lld generated=%lld finish=%s prefill=%.2f tok/s "
@@ -664,12 +771,16 @@ void Engine::RunRequest(PendingRequest& req) {
         decode_tps);
     // Stage S3 (docs/server.md): speculation now runs at any temperature, so the log line reports
     // the settings that decide which decode path this request actually took -- temperature (greedy
-    // vs sampled), whether it streamed, and whether thinking was on.
+    // vs sampled), whether it streamed, and whether thinking was on. `tools` is the number of tool
+    // definitions the request OFFERED (not the number the model called, which `finish=tool_calls`
+    // already implies): together with `stream` it is exactly what decides whether this request took
+    // the live-gated tool stream, so a "why did my client see nothing until the end" report can be
+    // diagnosed from the log alone.
     if (n > 0 && n < static_cast<int>(sizeof(buf))) {
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
-                         " temperature=%.3g stream=%s thinking=%s",
+                         " temperature=%.3g stream=%s thinking=%s tools=%d",
                          static_cast<double>(req.sampling.temperature), req.stream ? "yes" : "no",
-                         enable_thinking ? "yes" : "no");
+                         enable_thinking ? "yes" : "no", static_cast<int>(req.tools.size()));
     }
     if (reset_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " reset=%.2fms", reset_ms);

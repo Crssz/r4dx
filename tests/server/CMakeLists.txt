@@ -12,6 +12,7 @@ set(R4DX_SERVER_TESTS
   test_request_queue
   test_prefix_state
   test_tool_call_parser
+  test_tool_stream_gate
   test_reasoning_splitter
 )
 

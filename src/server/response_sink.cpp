@@ -16,9 +16,9 @@ void BufferingSink::OnStart(int64_t prompt_tokens_in) {
 void BufferingSink::OnToken(const std::string& piece) {
   std::lock_guard<std::mutex> lock(mu_);
   if (!enable_thinking_ || reasoning_delivered_) {
-    // Byte-identical to before this field existed (task item 5c) -- and also the tool_mode path
-    // once OnReasoningContent has already delivered the (pre-split) reasoning span, since
-    // `piece`/`text` at that point is `parsed.content`, which cannot contain the tag any more.
+    // Byte-identical to before this field existed (task item 5c) -- and also the NON-streaming
+    // tool-call path once OnReasoningContent has already delivered the (pre-split) reasoning span,
+    // since `piece`/`text` at that point is `parsed.content`, which cannot contain the tag any more.
     text += piece;
     return;
   }
@@ -111,9 +111,9 @@ void StreamingSink::OnToken(const std::string& piece) {
     return;
   }
   if (!enable_thinking_ || reasoning_delivered_) {
-    // Byte-identical to before this field existed (task item 5c) -- and also the tool_mode path
-    // once OnReasoningContent already delivered the (pre-split) reasoning span, since `piece` at
-    // that point is `parsed.content`, which cannot contain the tag any more.
+    // Byte-identical to before this field existed (task item 5c) -- and also the NON-streaming
+    // tool-call path once OnReasoningContent already delivered the (pre-split) reasoning span,
+    // since `piece` at that point is `parsed.content`, which cannot contain the tag any more.
     nlohmann::json delta = {{"content", piece}};
     queue_.Push(FormatSseEvent(
         BuildChatCompletionChunk(id_, model_id_, created_unix_, delta, std::nullopt, include_usage_)));

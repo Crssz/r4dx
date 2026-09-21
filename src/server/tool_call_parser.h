@@ -34,8 +34,9 @@
 // generated), but DOES include the closing "</think>\n\n". This parser itself still does not
 // special-case the tag at all -- by the time `Engine::RunRequest`'s `tool_mode` block ever calls
 // `ParseToolCalls`, it has already stripped the thinking span out (via `ReasoningSplitter`,
-// `reasoning_splitter.h`) and delivered it separately through `ResponseSink::OnReasoningContent`
-// as `message.reasoning_content` (docs/server.md's "reasoning_content" section) -- so a literal
+// `reasoning_splitter.h`) and delivered it separately as `message.reasoning_content` (one-shot via
+// `ResponseSink::OnReasoningContent` on a non-streaming request, as live per-piece deltas on a
+// streaming one; docs/server.md's "reasoning_content" section) -- so a literal
 // "</think>" reaching this parser today can only be a leftover from a thinking-OFF request (no tag
 // was ever there to strip) or literal text a model happened to generate mid-answer, and either way
 // it is correctly treated as ordinary content, exactly like today's un-parsed behavior for a plain

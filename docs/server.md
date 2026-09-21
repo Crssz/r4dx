@@ -145,17 +145,48 @@ not present in `tools`) is rejected with a clear `400 invalid_request_error` rat
 ignored (`openai_types.cpp`'s `ParseToolChoice`).
 
 **Streaming decision**: OpenAI's own server streams tool-call arguments as incremental
-`delta.tool_calls[].function.arguments` byte deltas. This server does NOT do that: whenever a
-request offers any `tools`, the ENTIRE generation is buffered (not streamed token-by-token) and,
-once complete, delivered as ordinary `content` deltas' worth of prose (if any) followed by one
-single complete `delta.tool_calls` chunk carrying every call at once (`response_sink.cpp`'s
-`StreamingSink::OnToolCalls`, `index`-tagged so a client expecting real per-delta streaming still
-assembles the array correctly). This is a deliberate choice, not an oversight: it guarantees a
-client can never observe a half-formed `<tool_call>`/`<function=...>` tag leak into a `content`
-delta (the failure mode a real per-token streaming parser would risk), at the honest cost of
-"fake" (all-at-once) streaming latency for any request that offers tools, whether or not a call
-actually happens. A request with no `tools` is completely unaffected -- real per-token streaming,
-unchanged (`engine.cpp`'s `tool_mode` gate).
+`delta.tool_calls[].function.arguments` byte deltas. This server does NOT do that -- the CALLS
+themselves are always delivered as one single complete `delta.tool_calls` chunk carrying every call
+at once (`response_sink.cpp`'s `StreamingSink::OnToolCalls`, `index`-tagged so a client expecting
+real per-delta streaming still assembles the array correctly), at the end, after the whole span has
+been parsed. The ANSWER TEXT around them, however, does stream live:
+
+* **`tools` + `"stream": true`** -- content streams token by token as ordinary `delta.content`,
+  exactly like a request with no tools, until a literal `<tool_call>` opener appears in the ANSWER
+  part of the generation. At that instant the content stream shuts off for good; everything from
+  there on is buffered and classified once, at the end, by `ParseToolCalls`. The gate is
+  `src/server/tool_stream_gate.h`/`.cpp`'s `ToolStreamGate` (a small pure, HIP-free state machine,
+  `tests/server/test_tool_stream_gate.cpp`), driven by `Engine::RunRequest`'s own per-request
+  forwarding router. It gates on the literal `<tool_call>` -- byte-for-byte the same constant
+  `ParseToolCalls` scans for -- and holds back any trailing text that is still a proper prefix of it
+  (at most 10 bytes, the same minimal-holdback rule `ReasoningSplitter` uses for `</think>`), so a
+  client never sees even a partial `<tool_` leak into a content delta. Because the opener is pure
+  ASCII, that holdback can never split a multi-byte UTF-8 character.
+* **`tools` + `"stream": false`** -- nothing is delivered live (there is nothing live about a
+  non-streaming request); the whole response is re-derived from the accumulated text afterwards,
+  byte-for-byte as it always was.
+* **no `tools`** -- completely unaffected, real per-token streaming, unchanged.
+
+**Streamed content equals non-streamed content.** The concatenation of every `delta.content` a
+streaming request receives is byte-identical to the `message.content` the non-streaming path returns
+for the same generation. Two things make that hold: the gate does NOT trim whitespace before an
+opener (neither does `ParseToolCalls` -- its `content` is the text outside every span, verbatim), and
+whatever the gate held back is delivered after the fact as one final content delta computed by
+`ToolStreamRemainder(streamed, parsed.content)` -- the same function
+`tests/server/test_tool_stream_gate.cpp` asserts the invariant with, over every 1-byte and every
+2-piece chunking of a dozen representative generations. So a malformed `<tool_call>` span that
+degrades to literal content, prose that follows a call, and a `DropUnknownToolCalls` note all still
+reach a streaming client, just at the end rather than live. The one thing streaming cannot undo is a
+`--stop` string that only completes ACROSS a token boundary: up to `len-1` of its bytes may already
+have gone out, exactly as on a request with no `tools` at all (the non-streaming path re-derives from
+the accumulated text and is exact).
+
+This replaces the previous whole-generation buffering, which applied to every request that merely
+OFFERED tools. That was safe but produced "fake" (all-at-once) streaming for clients that attach a
+`tools` array to every turn (Unsloth Studio does), so a plain prose answer that never called anything
+showed nothing at all until generation finished. The per-request stderr log line reports `tools=<N>`
+(definitions offered) next to `stream=`, which is exactly what decides which of the three cases above
+a request took.
 
 **Robustness**: `ParseToolCalls` never throws. A parameter value that fails to parse as JSON just
 becomes a JSON string (not an error). A structurally malformed `<tool_call>` span (missing/
@@ -169,12 +200,19 @@ than silently vanishing. `tests/server/test_tool_call_parser.cpp` covers every c
 three verbatim captures from the real container (one call, two calls in one turn, and a call
 preceded by a `<think>` block) plus a dozen synthetic malformed-input cases.
 
-**Testing**: `tests/server/test_tool_call_parser.cpp` (parser unit cases), the tool-call-specific
-cases in `tests/server/test_openai_types.cpp` (request-side `tool_calls`/`tool_choice`
-parsing/validation, `role: "tool"`/`"function"` messages) and `tests/server/test_response_sink.cpp`
-(the streaming `OnToolCalls` SSE chunk shape), and `tools/server/smoke.ps1`'s real end-to-end tool
-round trip against a container (a tool-offering request, feeding the parsed call's result back as a
-`role: "tool"` message, checking the final answer references the tool result).
+**Testing**: `tests/server/test_tool_call_parser.cpp` (parser unit cases),
+`tests/server/test_tool_stream_gate.cpp` (the live gate: holdback across every opener split point,
+`<`/`<tool_box>`/`<tool_calls>` lookalikes, malformed and unterminated spans, unicode, and the
+property test above over every chunking), the tool-call-specific cases in
+`tests/server/test_openai_types.cpp` (request-side `tool_calls`/`tool_choice` parsing/validation,
+`role: "tool"`/`"function"` messages) and `tests/server/test_response_sink.cpp` (the streaming
+`OnToolCalls` SSE chunk shape), and `tools/server/smoke.ps1`'s real end-to-end checks against a
+container: the tool call/result/answer round trip (a tool-offering request, feeding the parsed
+call's result back as a `role: "tool"` message, checking the final answer references the tool
+result), plus the live-streaming checks -- a tool-offering request asking a plain prose question
+must produce many content deltas with the first arriving well before the last, the concatenated
+streamed content must equal the non-streaming content for the same greedy request, and no content
+delta may contain `<tool_call`/`</tool_call`.
 
 ## `reasoning_content`
 
@@ -187,7 +225,7 @@ RunRequest`, so the two calls can never drift apart), the generation is split at
 place, `src/server/reasoning_splitter.h`/`.cpp`'s `ReasoningSplitter` (a small pure, HIP-free state
 machine, `tests/server/test_reasoning_splitter.cpp`), used both by `BufferingSink`/`StreamingSink`
 (the per-piece streaming split) and by `Engine::RunRequest`'s `tool_mode` block (a one-shot
-whole-buffer split, same class, just fed the entire buffered string in one `Push()` call). The
+whole-buffer split, same class, just fed the entire accumulated string in one `Push()` call). The
 model's own opening `"<think>\n"` is part of the PROMPT's generation preamble, never generated text
 (`tool_call_parser.h`'s file comment has the full derivation) -- so this only ever scans for the
 CLOSING tag.
@@ -223,12 +261,18 @@ end position once it has -- so a stop string that happens to appear inside the m
 chain-of-thought can never truncate generation before the answer even starts. A thinking-off
 request always passes floor `0` (no restriction, today's behavior, unaffected).
 
-**Tool-call mode** (`tools` present, whole-generation buffering, "Tool calls" above): the thinking
-span is stripped out of the buffered generation BEFORE `ParseToolCalls` even runs (`Engine::
-RunRequest`'s `tool_mode` block, using the same `ReasoningSplitter` fed the whole buffer at once)
-and delivered via `ResponseSink::OnReasoningContent` -- the one-shot equivalent of `OnToken`'s
-per-piece split, since tool_mode never streams per-piece deltas at all. `tool_calls`/`content`/
-`finish_reason` semantics are otherwise unchanged; `ParseToolCalls` itself never sees the tag.
+**Tool-call mode** (`tools` present, "Tool calls" above): the thinking span is always stripped out
+of the accumulated generation BEFORE `ParseToolCalls` even runs (`Engine::RunRequest`'s `tool_mode`
+block, using the same `ReasoningSplitter` fed the whole string at once), so `ParseToolCalls` never
+sees the tag and a `<tool_call>` the model writes INSIDE its own chain-of-thought is not a call --
+and, for the same reason, never closes the live stream gate either. How the reasoning reaches the
+client depends on `stream`: a NON-streaming request gets it one-shot via
+`ResponseSink::OnReasoningContent` (already trimmed), while a STREAMING one gets ordinary live
+`reasoning_content` deltas, because the engine forwards raw generated bytes -- `</think>` included --
+to `OnToken` and the sink's own splitter does the split, exactly as on a request with no `tools`.
+The whitespace rules therefore follow the path they are on, unchanged: the non-streaming span is
+whole-span trimmed, the streamed deltas are not (only the tag and the blank lines right after it are
+dropped). `tool_calls`/`content`/`finish_reason` semantics are otherwise unchanged.
 
 **Multi-turn**: a client resending an earlier assistant turn may include the `reasoning_content`
 this server returned for it (`ChatMessage::reasoning_content`, `openai_types.h`, accepted on any
@@ -267,8 +311,11 @@ multi-byte content on both sides, composition with a stop search scoped to the a
 tool_mode bypass, thinking-off byte-identical passthrough), `tests/server/test_openai_types.cpp`
 (`reasoning_content` request-side parsing/validation, `ResolveEnableThinking`, the response
 builders' `reasoning_content`/`completion_tokens_details` fields), and `tools/server/smoke.ps1`'s
-real-container checks (non-streaming and streaming `enable_thinking: true` requests, and an
-`enable_thinking: false` request confirming no `reasoning_content` key appears anywhere).
+real-container checks (non-streaming and streaming `enable_thinking: true` requests, an
+`enable_thinking: false` request confirming no `reasoning_content` key appears anywhere, and a
+thinking + `tools` + streaming request confirming the reasoning span really does arrive as many
+live deltas rather than one post-generation lump, with its streamed `content` still equal to the
+same request's non-streaming `message.content`).
 
 ## `timings`
 
@@ -348,9 +395,9 @@ When `stream: true` and `stream_options.include_usage: true`, the exact SSE chun
 
 When `include_usage` is absent or `false`, streaming output is byte-for-byte identical to before
 this feature except for the `timings` key added to the finish_reason chunk (item 1 above) -- no
-chunk ever gains a `usage` key. Tool-call mode (`engine.cpp`'s whole-generation buffering, "Tool
-calls" above) behaves identically either way: the buffered `OnToolCalls` chunk is just another
-"normal chunk" for the purposes of the `usage: null` rule.
+chunk ever gains a `usage` key. Tool-call mode ("Tool calls" above) behaves identically either way:
+the end-of-generation `OnToolCalls` chunk is just another "normal chunk" for the purposes of the
+`usage: null` rule.
 
 Implementation: `StreamingSink` (`response_sink.h`/`.cpp`) takes an `include_usage` constructor
 flag (`http_server.cpp` passes `ChatCompletionRequest`/`CompletionRequest::
@@ -701,7 +748,10 @@ parsing), `test_openai_types` (request validation + response JSON shapes, includ
 shape), `test_request_queue` (`BoundedQueue` capacity/FIFO/close/threaded producer-consumer),
 `test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping, see
 "MTP" above), `test_tool_call_parser` (see "Tool calls" above -- real-capture and malformed-input
-cases for the model's surface syntax). All pass as part of the normal `.\tests\run_tests.ps1` run.
+cases for the model's surface syntax), `test_tool_stream_gate` (the live tool-call stream gate and
+its "streamed content == non-streamed content" property over every chunking of a dozen
+representative generations), `test_reasoning_splitter` (the `</think>` split). All pass as part of
+the normal `.\tests\run_tests.ps1` run.
 
 `tools/server/smoke.ps1` is the GPU integration test: starts `r4dx-server` on HIP device 1 against
 the 4-layer test container (`--layout w4a16 --layers 4`, since that container's config.json still
@@ -721,7 +771,12 @@ container) -- with `-Mtp N>0` an extra check confirms at least one request's log
 path was taken -- and `-ToolRoundTrip` for the tool round-trip check (`.\tools\server\smoke.ps1
 -Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -ToolRoundTrip`; skipped by default against the
 4-layer container, whose nonsense output cannot reliably be coaxed into emitting a well-formed
-`<tool_call>` block).
+`<tool_call>` block). The live tool-call streaming checks ("Tool calls" above) run unconditionally:
+a tool-offering streaming request asking a plain prose question must yield many `delta.content`
+events whose concatenation equals the same greedy request's non-streaming `message.content`, and no
+content delta may carry `<tool_call`/`</tool_call`; the per-delta arrival-time assertion (first
+delta well before the end of the stream) is real-container-only, since the 4-layer container's
+decode is fast enough for the whole stream to arrive in a single socket read.
 
 ### Real-answer smoke run (once, against the full 64-layer container)
 

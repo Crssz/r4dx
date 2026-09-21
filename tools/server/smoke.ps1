@@ -45,9 +45,11 @@
   Exercises a real tool call/result/answer multi-turn round trip (docs/server.md's "Tool calls"):
   offers a `get_current_weather` tool definition, sends the server's own parsed
   `message.tool_calls` back as a `role: "tool"` follow-up message, and checks the final answer
-  comes back 200 with real prose. Off by default -- the 4-layer test container's nonsense output
-  cannot reliably be coaxed into emitting a well-formed `<tool_call>` block, so this only produces
-  a meaningful check against a real container (pass -Layers -1 with a real -Model).
+  comes back 200 with real prose. Also streams the same tool-offering turn and checks the live gate
+  still delivers one complete `delta.tool_calls` batch without leaking any `<tool_call>` markup into
+  a content delta. Off by default -- the 4-layer test container's nonsense output cannot reliably be
+  coaxed into emitting a well-formed `<tool_call>` block, so this only produces a meaningful check
+  against a real container (pass -Layers -1 with a real -Model).
 
 .EXAMPLE
   .\tools\server\smoke.ps1
@@ -91,6 +93,49 @@ function Check {
         Write-Output "  [FAIL] $Message"
         $script:Failures++
     }
+}
+
+# POSTs a streaming request and returns every "data: ..." line WITH the millisecond offset at which
+# it actually arrived. Invoke-WebRequest (used everywhere else in this script) buffers the whole
+# body before returning, which is fine for checking SSE framing but cannot tell live streaming apart
+# from a server that buffered the generation and dumped it at the end -- exactly the difference the
+# live tool-call stream gate checks below are about (docs/server.md's "Tool calls"). HttpWebRequest
+# hands back the response as soon as the headers land, and StreamReader.ReadLine returns per chunk
+# as it arrives, so the offsets below are real arrival times.
+function Invoke-SseStream {
+    param([string]$Uri, [string]$Body, [int]$TimeoutSec = 600)
+    [System.Net.ServicePointManager]::Expect100Continue = $false
+    $req = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method = "POST"
+    $req.ContentType = "application/json"
+    $req.Proxy = $null  # never route a 127.0.0.1 request through a system proxy
+    $req.Timeout = $TimeoutSec * 1000
+    $req.ReadWriteTimeout = $TimeoutSec * 1000
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $req.ContentLength = $bytes.Length
+    $reqStream = $req.GetRequestStream()
+    $reqStream.Write($bytes, 0, $bytes.Length)
+    $reqStream.Close()
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $resp = $req.GetResponse()
+    $reader = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+    $events = New-Object System.Collections.ArrayList
+    try {
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            if ($line -like "data: *") {
+                [void]$events.Add([pscustomobject]@{
+                    Data = $line.Substring(6)
+                    Ms   = $sw.Elapsed.TotalMilliseconds
+                })
+            }
+        }
+    } finally {
+        $reader.Close()
+        $resp.Close()
+    }
+    [pscustomobject]@{ Events = $events; TotalMs = $sw.Elapsed.TotalMilliseconds }
 }
 
 Write-Output "[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp"
@@ -366,6 +411,22 @@ try {
         Check ($draftChat.timings.draft_n_accepted -le $draftChat.timings.draft_n) "speculative path: timings.draft_n_accepted <= timings.draft_n"
     }
 
+    # A minimal, always-valid tool definition, shared by every tool-related check below (the live
+    # streaming checks, and the thinking+tools streaming check inside the reasoning_content block).
+    # Declared up here because those blocks run in a different order than they read.
+    $proseTool = @{
+        type     = "function"
+        function = @{
+            name        = "get_current_weather"
+            description = "Get the current weather for a location."
+            parameters  = @{
+                type       = "object"
+                properties = @{ location = @{ type = "string"; description = "City and state" } }
+                required   = @("location")
+            }
+        }
+    }
+
     # ---- Real tool call / result / answer round trip (docs/server.md's "Tool calls") -------------
     if ($ToolRoundTrip) {
         $weatherTool = @{
@@ -424,6 +485,47 @@ try {
             $followUpChat = $followUpResp.Content | ConvertFrom-Json
             Check ($followUpResp.StatusCode -eq 200) "tool round trip: role:'tool' follow-up request returns 200"
             Check ([bool]$followUpChat.choices[0].message.content) "tool round trip: follow-up answer has non-empty content"
+        }
+
+        # ---- the same tool-offering turn, STREAMED (docs/server.md's "Tool calls") ---------------
+        # The live gate must still deliver a complete tool_calls batch and must never let any part
+        # of the `<tool_call>` markup out as a content delta on the way there.
+        $toolStreamBody = @{
+            messages    = @(@{ role = "user"; content = "What is the weather like in Boston, MA right now? Use the tool." })
+            tools       = @($weatherTool)
+            max_tokens  = 64
+            temperature = 0
+            stream      = $true
+        } | ConvertTo-Json -Depth 8
+        $toolSse = Invoke-SseStream -Uri "$BaseUrl/v1/chat/completions" -Body $toolStreamBody
+        $streamedCall = $null
+        $streamedToolTagLeak = $false
+        $streamedToolFinish = ""
+        foreach ($ev in $toolSse.Events) {
+            if ($ev.Data -eq "[DONE]") { continue }
+            $c = $ev.Data | ConvertFrom-Json
+            if ($c.choices.Count -eq 0) { continue }
+            $delta = $c.choices[0].delta
+            if ($null -ne $c.choices[0].finish_reason) { $streamedToolFinish = $c.choices[0].finish_reason }
+            if ($null -eq $delta) { continue }
+            if (($delta.PSObject.Properties.Name -contains "content") -and $null -ne $delta.content) {
+                if ($delta.content.Contains("<tool_call") -or $delta.content.Contains("</tool_call")) {
+                    $streamedToolTagLeak = $true
+                }
+            }
+            if (($delta.PSObject.Properties.Name -contains "tool_calls") -and $null -ne $delta.tool_calls) {
+                $streamedCall = $delta.tool_calls[0]
+            }
+        }
+        Check ($null -ne $streamedCall) "tool round trip (streaming): a delta carries a complete tool_calls entry"
+        Check (-not $streamedToolTagLeak) "tool round trip (streaming): no content delta contains '<tool_call'/'</tool_call'"
+        if ($null -ne $streamedCall) {
+            Check ($streamedCall.function.name -eq "get_current_weather") `
+                "tool round trip (streaming): delta.tool_calls[0].function.name == 'get_current_weather'"
+            Check ($streamedCall.function.arguments -is [string]) `
+                "tool round trip (streaming): delta.tool_calls[0].function.arguments is a JSON-encoded STRING"
+            Check ($streamedToolFinish -eq "tool_calls") `
+                "tool round trip (streaming): finish_reason == 'tool_calls' (got '$streamedToolFinish')"
         }
     }
 
@@ -484,6 +586,62 @@ try {
         Check (-not $sawBothKeysInOneDelta) "reasoning_content (streaming): no delta carries both reasoning_content and content"
         Check (-not $sawTagAnywhere) "reasoning_content (streaming): '</think>' never appears in any event"
 
+        # ---- thinking + tools + streaming: reasoning streams LIVE in tool mode too -----------------
+        # (docs/server.md's "Tool-call mode" under reasoning_content.) This used to be delivered as
+        # ONE one-shot reasoning_content delta after the whole generation was buffered; it must now
+        # arrive as many per-piece deltas, exactly like the no-tools streaming path, and a
+        # "</think>" must still never reach the client.
+        $thinkToolStreamBody = @{
+            messages             = @(@{ role = "user"; content = "What is 12 plus 30? Show your reasoning." })
+            tools                = @($proseTool)
+            chat_template_kwargs = @{ enable_thinking = $true }
+            max_tokens           = 1024
+            temperature          = 0
+            stream               = $true
+        } | ConvertTo-Json -Depth 8
+        $thinkToolSse = Invoke-SseStream -Uri "$BaseUrl/v1/chat/completions" -Body $thinkToolStreamBody
+        $ttReasoningDeltas = 0
+        $ttFirstReasoningMs = -1.0
+        $ttContent = ""
+        $ttSawTag = $false
+        foreach ($ev in $thinkToolSse.Events) {
+            if ($ev.Data -eq "[DONE]") { continue }
+            if ($ev.Data.Contains("</think>") -or $ev.Data.Contains("<tool_call")) { $ttSawTag = $true }
+            $c = $ev.Data | ConvertFrom-Json
+            if ($c.choices.Count -eq 0) { continue }
+            $delta = $c.choices[0].delta
+            if ($null -eq $delta) { continue }
+            if (($delta.PSObject.Properties.Name -contains "reasoning_content") -and $null -ne $delta.reasoning_content) {
+                $ttReasoningDeltas++
+                if ($ttFirstReasoningMs -lt 0) { $ttFirstReasoningMs = $ev.Ms }
+            }
+            if (($delta.PSObject.Properties.Name -contains "content") -and $null -ne $delta.content) {
+                $ttContent += $delta.content
+            }
+        }
+        Check ($ttReasoningDeltas -gt 5) `
+            "thinking+tools (streaming): reasoning_content arrives as many live deltas, not one lump (got $ttReasoningDeltas)"
+        Check (-not $ttSawTag) "thinking+tools (streaming): no event contains '</think>' or '<tool_call'"
+        Check ($ttFirstReasoningMs -ge 0 -and $ttFirstReasoningMs -lt 0.5 * $thinkToolSse.TotalMs) `
+            ("thinking+tools (streaming): first reasoning delta arrives well before the end " +
+             "(first=$([math]::Round($ttFirstReasoningMs,1))ms total=$([math]::Round($thinkToolSse.TotalMs,1))ms)")
+
+        $thinkToolNonStreamBody = @{
+            messages             = @(@{ role = "user"; content = "What is 12 plus 30? Show your reasoning." })
+            tools                = @($proseTool)
+            chat_template_kwargs = @{ enable_thinking = $true }
+            max_tokens           = 1024
+            temperature          = 0
+            stream               = $false
+        } | ConvertTo-Json -Depth 8
+        $thinkToolNonStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json" -Body $thinkToolNonStreamBody -UseBasicParsing
+        $thinkToolNonStreamChat = $thinkToolNonStreamResp.Content | ConvertFrom-Json
+        $ttNonStreamContent = [string]$thinkToolNonStreamChat.choices[0].message.content
+        Check ($ttContent -ceq $ttNonStreamContent) `
+            ("thinking+tools: streamed content concatenation == non-streaming message.content " +
+             "(streamed $($ttContent.Length) bytes, non-streaming $($ttNonStreamContent.Length) bytes)")
+
         # ---- enable_thinking=false: no reasoning_content key anywhere ------------------------------
         $noThinkBody = @{
             messages             = @(@{ role = "user"; content = "Say hi." })
@@ -512,6 +670,74 @@ try {
     } else {
         Write-Output "  [SKIP] reasoning_content checks (only checked against a real container, -Layers -1)"
     }
+
+    # ---- Live tool-call streaming (docs/server.md's "Tool calls" streaming decision) -------------
+    # The bug this replaced: offering ANY `tools` used to buffer the whole generation, so a client
+    # that attaches a tools array to every turn (Unsloth Studio does) saw nothing at all until
+    # generation finished, even for a plain prose answer that never called a tool. These checks
+    # assert the three things that must now hold: content really arrives incrementally, its
+    # concatenation still equals the non-streaming `message.content` byte for byte, and no
+    # `<tool_call>` tag ever leaks into a content delta.
+    $prosePrompt = "Write three sentences about the sea. Do not call any tool."
+    $proseStreamBody = @{
+        messages    = @(@{ role = "user"; content = $prosePrompt })
+        tools       = @($proseTool)
+        max_tokens  = 96
+        temperature = 0
+        stream      = $true
+    } | ConvertTo-Json -Depth 8
+    $proseSse = Invoke-SseStream -Uri "$BaseUrl/v1/chat/completions" -Body $proseStreamBody
+
+    $proseContent = ""
+    $proseDeltaCount = 0
+    $proseFirstDeltaMs = -1.0
+    $proseLastDeltaMs = -1.0
+    $proseSawTag = $false
+    foreach ($ev in $proseSse.Events) {
+        if ($ev.Data -eq "[DONE]") { continue }
+        if ($ev.Data.Contains("<tool_call") -or $ev.Data.Contains("</tool_call")) { $proseSawTag = $true }
+        $c = $ev.Data | ConvertFrom-Json
+        if ($c.choices.Count -eq 0) { continue }
+        $delta = $c.choices[0].delta
+        if ($null -eq $delta -or -not ($delta.PSObject.Properties.Name -contains "content")) { continue }
+        if ($null -eq $delta.content) { continue }
+        $proseContent += $delta.content
+        $proseDeltaCount++
+        if ($proseFirstDeltaMs -lt 0) { $proseFirstDeltaMs = $ev.Ms }
+        $proseLastDeltaMs = $ev.Ms
+    }
+    Check ($proseDeltaCount -gt 5) `
+        "live tool stream: a tools-offering prose request produced many content deltas (got $proseDeltaCount)"
+    Check (-not $proseSawTag) "live tool stream: no streamed event contains '<tool_call'/'</tool_call'"
+    if ($Layers -lt 0) {
+        # Real container only: the 4-layer container decodes fast enough that the entire stream can
+        # land in a single socket read, which would make any arrival-time assertion meaningless.
+        Check ($proseFirstDeltaMs -ge 0 -and $proseFirstDeltaMs -lt 0.5 * $proseSse.TotalMs) `
+            ("live tool stream: first content delta arrives well before the end " +
+             "(first=$([math]::Round($proseFirstDeltaMs,1))ms last=$([math]::Round($proseLastDeltaMs,1))ms " +
+             "total=$([math]::Round($proseSse.TotalMs,1))ms)")
+    } else {
+        Write-Output ("  [SKIP] live tool stream: first-delta arrival time (only checked against a real " +
+                      "container, -Layers -1)")
+    }
+
+    # Same request, same greedy settings, non-streaming: the streamed concatenation must match it.
+    $proseNonStreamBody = @{
+        messages    = @(@{ role = "user"; content = $prosePrompt })
+        tools       = @($proseTool)
+        max_tokens  = 96
+        temperature = 0
+        stream      = $false
+    } | ConvertTo-Json -Depth 8
+    $proseNonStreamResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json" -Body $proseNonStreamBody -UseBasicParsing
+    $proseNonStreamChat = $proseNonStreamResp.Content | ConvertFrom-Json
+    $proseNonStreamContent = [string]$proseNonStreamChat.choices[0].message.content
+    # -ceq, not -eq: PowerShell's -eq is case-INSENSITIVE on strings, which would let a byte
+    # difference through on exactly the check whose whole point is byte identity.
+    Check ($proseContent -ceq $proseNonStreamContent) `
+        ("live tool stream: streamed content concatenation == non-streaming message.content " +
+         "(streamed $($proseContent.Length) bytes, non-streaming $($proseNonStreamContent.Length) bytes)")
 
     # ---- `tools` + `stop` together must not echo the stop text back in content -------------------
     # Regression check (review finding, 2026-09-20): EmitToken only trims what it STREAMS, never

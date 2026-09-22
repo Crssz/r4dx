@@ -46,8 +46,8 @@
 
 // The container path arrives as a string literal (this file's #ifndef default, or the -D in
 // tests/model/attention/CMakeLists.txt, which wins). Route it through r4dx_test::ContainerPath so
-// R4DX_TEST_CONTAINER_DIR can redirect it -- see tests/model/test_container_path.h for why a build
-// with a non-default R4DX_W4A16_GROUP needs that. NOTE: this test reads the container through a
+// it resolves to the copy packed at this build's w4a16 group (or R4DX_TEST_CONTAINER_DIR, when
+// set) -- see tests/model/test_container_path.h. NOTE: this test reads the container through a
 // raw SafetensorsReader, not Container::Load, so it would get NO group check of its own --
 // TryLoadQuantLinear below therefore applies the loader's CheckW4a16Group itself (the group
 // recovered from the .w4a16.wsz tensor's own size), so a mismatched container FAILS with the

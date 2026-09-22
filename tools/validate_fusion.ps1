@@ -62,8 +62,8 @@ $env:HIP_VISIBLE_DEVICES = '1'
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
-# Default containers follow build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an explicit
-# -Model/-Dflash wins.
+# The default container follows build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an
+# explicit -Model wins.
 . (Join-Path $PSScriptRoot "r4dx_containers.ps1")
 if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
 Write-Output "[validate_fusion] model=$Model"

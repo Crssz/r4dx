@@ -47,8 +47,8 @@
 
 // The container path arrives as a string literal (this file's #ifndef default, or the -D in
 // tests/model/attention/CMakeLists.txt, which wins). Route it through r4dx_test::ContainerPath so
-// R4DX_TEST_CONTAINER_DIR can redirect it -- see tests/model/test_container_path.h for why a build
-// with a non-default R4DX_W4A16_GROUP needs that.
+// it resolves to the copy packed at this build's w4a16 group (or R4DX_TEST_CONTAINER_DIR, when
+// set) -- see tests/model/test_container_path.h.
 const char* const kBf16ContainerPath = r4dx_test::ContainerPath(R4DX_BF16_CONTAINER_PATH);
 
 using namespace r4dx::core;

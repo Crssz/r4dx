@@ -70,8 +70,9 @@ buffering/streaming sinks including the tool-calls streaming chunk shape, the bo
 index-math goldens, the whole tower against the real checkpoint's forward, and the shared
 `ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). 61 pass and 1 skips (`test_kernel_bandwidth`, whose golden is gitignored),
-~636s wall on HIP device 1. No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
+`ctest` invocation). 64 tests are registered without the reference venv (66 with it): all pass
+but 1, which skips (`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP
+device 1 (2026-09-23, default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
 either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
 production v6/v3 container packed at their own build's w4a16 group (`docs/build-windows.md` "w4a16
 group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are

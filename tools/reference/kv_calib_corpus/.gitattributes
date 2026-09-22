@@ -1,0 +1,7 @@
+# The calibration corpus is tokenized byte-for-byte and its sha256 is recorded in every
+# calibration JSON this directory feeds (tools/reference/kv_calibrate_full.py). Its bytes must
+# therefore survive a round trip through git unchanged on every platform. With the repo's
+# `core.autocrlf=true` on Windows these files would otherwise be checked out with CRLF line
+# endings, every "\n" would tokenize differently, and a re-run would no longer reproduce the
+# recorded corpus hashes. `-text` disables all end-of-line conversion for this directory.
+* -text

@@ -1,5 +1,31 @@
 # Status
 
+## fp8 KV cache properly calibrated, 2026-09-22
+
+`tools/reference/kv_calibrate_full.py` replaces `kv_calibrate.py`'s prototype calibration with the
+real one: the full 64-layer bf16 stack (reusing `full_logits_golden.py`'s layer-streaming forward,
+unmodified) run over a 6-file, **8316-token** corpus -- `tools/reference/calib.txt` plus the new
+`tools/reference/kv_calib_corpus/` (original English prose, Thai prose, C++, Python, and one
+conversation rendered through the checkpoint's own chat template); `kl_corpus/` is deliberately
+excluded as held-out evaluation text. All 16 full-attention layers in one run, K captured
+**post-rope** and V at `v_proj`, plus a per-head 99.99th-percentile tail statistic. Output:
+`D:\models\r4dx\qwen38-27b.kvcalib-full.json` (175.6 s, peak VRAM 1.905 GiB).
+
+**The prototype was biased low, badly.** Per kv head, real `k_amax` is **1.41-3.29x** (median
+2.08x) the prototype's, and real `v_amax` **0.37-8.81x** (median 1.99x), with the V gap widening
+through the back half of the stack (layer 43 head 1: 6.81 -> 60.0). Descales built from the
+prototype are ~2x too small for K and up to 8x too small for V, i.e. the fp8 cache would saturate
+at +-448 on ordinary text. The shipped container `D:\models\r4dx\qwen38-27b.r4dx` still carries
+those numbers and needs re-converting with
+`r4dx-convert --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json`.
+
+Gates: `full_logits_golden.py` untouched and its own cross-check (bit-identical `model` vs
+`manual`, max logit diff 0.0000e+00) and 32/32 greedy self-consistency re-run clean; the K tap
+proven post-rope (192 non-rotary dims bit-identical, 64 rotary dims changed, per-position head
+norms preserved to 7.6e-4 relative -- a rotation); run-to-run amax reproducible to 1-3 bf16 ulps
+(max 1.4%, against fp8 e4m3's ~6.25% step), bit-exact within a process. Detail:
+`tools/reference/README.md` "kv_calibrate_full.py", `docs/validation.md` rung 3.
+
 ## Rung 4 measurement audited, 2026-09-22
 
 The `w4a16` KL number below was re-examined adversarially, on the premise that it is wrong. It

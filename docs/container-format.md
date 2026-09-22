@@ -166,12 +166,20 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
 
 `text.layers.{i}.attn.k_descale` / `.v_descale`, `fp32[kv_heads]`, one scalar per KV head, feeding
 `R4DArgs.k_descale` / `.v_descale` (`r4d.h:49-50`). `r4dx-convert --kv-calib <json>` fills these from
-a `tools/reference/kv_calibrate.py` calibration run: `descale[head] = amax[head] / 448.0` (OCP e4m3fn
+a calibration run: `descale[head] = amax[head] / 448.0` (OCP e4m3fn
 max), per `r4dx_convert::ResolveKvDescale` (`src/convert/include/r4dx_convert/kv_calib.hpp`). A layer
 missing from the calibration JSON, or omitting `--kv-calib` entirely, falls back to the placeholder
-`1.0`; the container format does not change either way, only the values. The real 64-layer container
+`1.0`; the container format does not change either way, only the values.
+
+Two producers write that JSON, in the same layout: `tools/reference/kv_calibrate.py` (a
+**prototype** -- raw embeddings into one layer, every preceding layer skipped) and
+`tools/reference/kv_calibrate_full.py` (the real one -- the whole 64-layer stack over a 6-file
+calibration corpus, all 16 full-attention layers in one file, at
+`D:\models\r4dx\qwen38-27b.kvcalib-full.json`). Use the latter. The real 64-layer container
 (`D:\models\r4dx\qwen38-27b.r4dx`) was converted with `--kv-calib` covering all 16 full-attention
-layers.
+layers, but from the **prototype's** numbers, which run 1.4-3.3x low on `k_amax` and up to 8.8x low
+on `v_amax` in the back half of the stack -- it needs re-converting against the full-forward JSON
+before its fp8 KV cache means anything (see `tools/reference/README.md`, "kv_calibrate_full.py").
 
 ## `vision.*` and `mtp.*`
 

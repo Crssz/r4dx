@@ -1,0 +1,53 @@
+Extra English prose for the fp8 KV calibration corpus. Original text written for this file; it is
+deliberately NOT drawn from tools/reference/kl_corpus/, which is the held-out corpus the KL report
+is measured on, and not from any of the repository's own source or documentation files.
+
+A lighthouse keeper on the northern coast once kept two logbooks. The first recorded the weather:
+wind from the northwest at thirty knots, visibility under a mile, swell running four metres and
+building through the afternoon. The second recorded everything else -- the gull that nested in the
+ventilation cowl for three summers running, the fishing boat that passed at the same hour every
+Tuesday, the week in February when the fog was so complete that the lamp seemed to end a few
+metres from the glass. Only the first logbook was ever collected by the harbour authority. The
+second was found in a drawer forty years later, and it is the one people now read, because the
+weather in the first is a table of numbers anyone could have written, while the second is the
+record of a particular person paying attention to a particular place.
+
+There is a lesson in that for anyone who measures things. A measurement is cheap to take and
+expensive to interpret, and the interpretation is almost always where the value is. Consider the
+ordinary business of timing a program. Anyone can report that a routine took one hundred and
+twelve milliseconds; the number is real, repeatable to within a percent or two, and very nearly
+useless on its own. What matters is whether those milliseconds were spent waiting on memory,
+waiting on a lock, or doing arithmetic that the problem actually required, and no stopwatch will
+tell you which. The stopwatch tells you that something is slow. It never tells you what to do.
+
+The same asymmetry shows up in the humbler corners of engineering. A thermometer in a server room
+reports twenty-four degrees; the interesting question is whether that reading came from the cold
+aisle or from six inches above a card that is quietly throttling. A disk reports that it wrote
+eight gigabytes; the interesting question is how many of those bytes will ever be read again. A
+questionnaire reports that eighty-one percent of respondents were satisfied; the interesting
+question is who declined to answer, and why. Each of these is a case where the instrument is
+honest and the inference is where the difficulty lies.
+
+Markets, oddly, have the same shape. A price is a single number that summarises an enormous amount
+of disagreement, and the summary is useful precisely because it throws that disagreement away. Two
+people trade at ninety-four dollars because one of them thinks the thing is worth more than that
+and the other thinks it is worth less; the price records neither belief, only the point where they
+briefly touched. When the price moves to ninety-seven, the temptation is to say that the thing
+became more valuable, which is a statement about the world, when all that is strictly known is
+that the balance of opinion shifted, which is a statement about people.
+
+None of this is an argument against measuring. It is an argument for keeping the second logbook.
+Numbers travel well and context does not, so the context has to be written down deliberately or it
+is lost the moment the person who had it moves on. The best engineering notes I have read are
+mostly prose with a few numbers in them, and they usually answer three questions that no dashboard
+ever answers on its own: what was I worried about, what did I check, and what would have changed
+my mind. Ten years later the dashboard is gone, the units may have changed, the thresholds are
+certainly wrong -- and those three answers are still worth reading.
+
+In the winter of 1871 a surveyor working a mountain valley recorded the same benchmark elevation
+on four consecutive days and got four different answers, spanning about eleven centimetres. He
+could have averaged them and moved on. Instead he wrote a page about the afternoon light, the
+shimmer over the warm rock face, and his suspicion that the refraction of the sightline changed
+with the heat of the day. He was right, and the correction he proposed was still being applied,
+with his name on it, long after every one of his individual readings had been superseded. The
+readings were data. The page was the contribution.

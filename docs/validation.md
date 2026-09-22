@@ -98,14 +98,21 @@ rope kernel selects a per-bin position stream or ignores the h/w rows entirely. 
 call roping at the KV slot index) and asserts it lands well outside the band -- a tolerance test
 is only evidence if the wrong answer actually fails it.
 
-`tools/reference/kv_calibrate.py` is the same rung's sibling for the fp8 KV descale tables:
-per-kv-head `amax` of K (post-rope) and V for a full-attention layer, which the converter turns
-into `text.layers.{i}.attn.k_descale`/`.v_descale` (`amax / 448.0`, fp8 e4m3 max). It's explicitly
-a **prototype** (see its `README.md` section and its output JSON's own `"caveat"` field) -- it
-calibrates against raw token embeddings fed straight into one layer, not the true mid-stack
-activation distribution that layer actually sees. Good enough to pin down the JSON contract and the
-descale formula; the real per-model calibration pass (full 64-layer stack, real prompts) is
-`src/convert`'s job, not this directory's.
+`tools/reference/kv_calibrate_full.py` is the same rung's sibling for the fp8 KV descale tables:
+per-kv-head `amax` of K (post-rope) and V at all 16 full-attention layers, which the converter
+turns into `text.layers.{i}.attn.k_descale`/`.v_descale` (`amax / 448.0`, fp8 e4m3 max). It runs
+the **real** full 64-layer bf16 stack over a 6-file / 8316-token calibration corpus (reusing
+`full_logits_golden.py`'s layer-streaming forward), so the K/V it measures come from the true
+mid-stack activations, and writes all 16 layers to one merged JSON. Its own gates -- the K tap
+proven post-rope by a norm-preservation check, run-to-run stability, and the comparison against the
+prototype -- are in `tools/reference/README.md`, "kv_calibrate_full.py".
+
+`tools/reference/kv_calibrate.py` is the **prototype** that preceded it (see its `README.md`
+section and its output JSON's own `"caveat"` field): it feeds raw token embeddings straight into
+one layer, skipping every preceding layer, so it calibrates against a distribution that layer never
+sees. It pinned down the JSON contract and the descale formula, and measured against the full
+forward it runs 1.4-3.3x low on `k_amax` and up to 8.8x low on `v_amax`. Do not convert a shipping
+container with it.
 
 ### Known gaps at this rung (tracked, not yet closed)
 
@@ -125,12 +132,16 @@ descale formula; the real per-model calibration pass (full 64-layer stack, real 
   `src/model`'s MTP path needs to derive the fc-fusion math from another source (the Eagle/DeepSeek-
   MTP papers this checkpoint's tensor names strongly resemble, or a newer `transformers` release
   that implements it) and extend `layer_golden.py` to match before that path can be validated here.
-- **`kv_calibrate.py`'s calibration distribution is not representative** (see above) -- treat its
-  `k_amax`/`v_amax` as a contract/format check, not a value to ship in a real container's
-  `k_descale`/`v_descale` without re-running a proper full-stack calibration. Its output JSON
-  records `torch_dtype`/`device` (amax differs materially between bf16-on-GPU and fp32-on-CPU) and
-  merges into any existing `--out` file rather than overwriting it, so calibrating all 16
-  full-attention layers is a matter of re-running it once per layer against the same output path.
+- ~~**`kv_calibrate.py`'s calibration distribution is not representative**~~ -- **CLOSED** by
+  `tools/reference/kv_calibrate_full.py` (full 64-layer forward, all 16 layers, 8316 tokens of
+  mixed English/Thai/C++/Python/chat-template corpus), which writes
+  `D:\models\r4dx\qwen38-27b.kvcalib-full.json`. What remains open is downstream, not here: the
+  shipped container `D:\models\r4dx\qwen38-27b.r4dx` still carries the **prototype's** descales and
+  has to be re-converted with `--kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json` before its
+  fp8 KV cache is trustworthy. Note the remaining caveat that no calibration pass can close: these
+  are **static** per-kv-head scales, fixed at convert time, so an activation above the corpus's
+  amax saturates at +-448 rather than getting its own scale. The JSON's `k_p9999`/`v_p9999` fields
+  are there to keep the size of that tail visible.
 
 ### Fixed since the initial Opus review (kept here for traceability, not as open gaps)
 

@@ -280,7 +280,17 @@ rows and the token/type/grid arrays. Output:
 `<out-dir>/mrope_layer_003.safetensors` + `<out-dir>/mrope_layer_manifest.json`. Consumed by
 `tests/model/attention/test_mrope_attn_layer.cpp`.
 
-## kv_calibrate.py
+## kv_calibrate.py (PROTOTYPE -- superseded by kv_calibrate_full.py)
+
+> **Do not calibrate a shipping container with this script.** It exists to pin down the math
+> (which tensor, which axis, the e4m3 recipe) and the JSON contract, and it does that by feeding
+> the calibration tokens' **raw embeddings** straight into one layer, skipping every preceding
+> layer -- so the hidden states it calibrates against are not what that layer sees mid-stack. The
+> real calibration is **`kv_calibrate_full.py`** (next section), which runs the whole 64-layer
+> stack. Measured against it, this prototype under-estimates `k_amax` by **1.4-3.3x** and, in the
+> back half of the stack, `v_amax` by up to **8.8x** -- descales built from these numbers would
+> saturate the fp8 cache at +-448 on ordinary text. The two write the same JSON layout, so the
+> converter consumes either; only the numbers differ.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
@@ -340,6 +350,209 @@ running `--layer 3`, `--layer 7`, ... `--layer 63` in sequence against the same 
 above.
 
 Runtime: ~10s on HIP device 1 (default `--num-tokens 256`); a few seconds on CPU.
+
+## kv_calibrate_full.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_calibrate_full.py `
+    --out D:\models\r4dx\qwen38-27b.kvcalib-full.json
+```
+
+The **real** static fp8 KV-cache calibration -- the one a shipping container should be converted
+with. It runs the whole 64-layer bf16 stack over the calibration corpus and records, at all 16
+`full_attention` layers in **one** run and **one** merged JSON, the per-kv-head `amax` of the two
+tensors the paged fp8 cache actually stores:
+
+- **K, post-rope** -- captured by monkeypatching `apply_rotary_pos_emb` in the modeling module
+  (the same technique `kv_calibrate.py` uses). The corpus is text-only, so mrope's three axes all
+  carry the plain token index and this reduces to ordinary partial rope (rotary dim 64 of head_dim
+  256) -- see the "rope / mrope" note under `full_logits_golden.py`.
+- **V** -- the raw `v_proj` output, captured with a forward hook. No rope is applied to V.
+
+The difference from the prototype is *where the hidden states come from*. This script does not
+build a forward of its own: it imports `full_logits_golden.StreamingReference` unchanged and runs
+`forward_hidden` per corpus file, so every K/V it measures is computed from the true mid-stack
+activation, with all 63 other real decoder layers in front of it, one materialized on device 1 at a
+time (`full_logits_golden.py` is **not** modified by this -- the streaming machinery is imported,
+not copied, and its own validations still pass, gate (a) below). The lm_head is never touched:
+calibration needs the KV tensors, not logits.
+
+Per kv head the JSON also carries `k_p9999` / `v_p9999`, the **99.99th percentile** of |K| / |V|
+over every calibration element (nearest rank, computed exactly from a kept buffer of the 8192
+largest values per head rather than from a histogram; `tail_exact` says so). These are
+informational -- the converter reads `k_amax`/`v_amax` and nothing else -- but `amax / p99.99` is
+the cheapest available read on how far out the tail the amax is chasing lives, which is exactly the
+quantity that decides whether a static per-head scale is a reasonable idea for this model. On this
+corpus that ratio is 1.3-2.9x for K, and 1.7-11.7x for V in the back half of the stack: K is
+well-behaved, V has genuine outliers.
+
+**Corpus.** `tools/reference/calib.txt` (the mixed English/code/Thai corpus the prototype used)
+plus `tools/reference/kv_calib_corpus/`, which adds original English prose, Thai prose, C++,
+Python and one chat conversation. `tools/reference/kl_corpus/` is deliberately **not** used: that
+is the held-out text the KL report is measured on, and calibrating the quantization constants on
+the same text the drift is measured on would flatter the result. Each file is tokenized with
+`add_special_tokens=False`, run as **its own sequence from a fresh context** (position 0, causal,
+no cache), truncated to `--max-tokens` (default 2048), and the reported `amax` is the max over
+every token of every file.
+
+`kv_calib_corpus/*.messages.json` is a chat entry: `{"messages": [{"role", "content"}, ...]}`
+rendered through the checkpoint's own `tokenizer.apply_chat_template(..., tokenize=False,
+add_generation_prompt=False)` before tokenization. The engine serves chat, so the calibration set
+has to contain the real control tokens (`<|im_start|>`, the role headers, `<|im_end|>`) in their
+real positions; committing the *rendered* text instead would go stale the day the checkpoint's
+template changes. The corpus of the run below:
+
+| file | kind | tokens |
+|---|---|---|
+| `calib.txt` | text | 2048 (truncated from 2110) |
+| `kv_calib_corpus/cpp_source.txt` | text | 1696 |
+| `kv_calib_corpus/english_prose.txt` | text | 921 |
+| `kv_calib_corpus/python_source.txt` | text | 1473 |
+| `kv_calib_corpus/thai_prose.txt` | text | 1297 |
+| `kv_calib_corpus/chat_conversation.messages.json` | chat template | 881 |
+| **total** | | **8316** |
+
+**Output**: one JSON in the same layout the converter already consumes -- `{"<layer_idx>": {...}}`
+for all 16 full-attention layers, `k_amax`/`v_amax` as `[kv_heads]` float arrays, plus the
+informational tail fields and full provenance per entry (`method: "full-forward"`,
+`method_detail`, `weights_source`, `config_sha256`, the `corpus` list with each file's sha256 and
+token count, `total_calibration_tokens`, `torch_dtype`, `device`, `torch_version`,
+`transformers_version`, `generated_at`, and the `caveat` / `converter_consumption` prose). No
+top-level keys other than layer indices are written, because `src/convert/main.cpp` prints
+`kv_calib_json.size()` as the layer count. The `caveat` now states what the file **is** (real
+mid-stack activations, static per-kv-head amax) and what it still is **not** (not per-token
+dynamic scaling: one scalar per kv head is fixed at convert time, so anything above this corpus's
+amax saturates at +-448 at inference).
+
+Options: `--model-dir`, `--corpus-dir` (`none` to skip), `--calib-txt` (`none` to leave it out),
+`--extra-files` (repeatable), `--max-tokens` (default 2048), `--layers 3,7` (subset, default all
+16), `--rope-check LAYER` (gate (c) below), `--out`. There is no `--device`: the script refuses to
+start unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`.
+
+**Runtime**: 175.6 s for the 6-file / 8316-token corpus (~26 s per file, the first file pays a cold
+page cache at 46 s -- as with `full_logits_golden.py` this is dominated by streaming 48 GiB of
+layer weights off disk, not by arithmetic). **Peak VRAM 1.905 GiB allocated / 3.637 GiB reserved**,
+against a 51.7 GiB checkpoint and a ~12 GiB budget.
+
+### Gates
+
+**(a) `full_logits_golden.py` is unchanged and still passes its own validation.** Nothing was
+refactored -- `StreamingReference` was already importable -- so the file is byte-identical
+(`git diff` is empty). Its documented validation run (the command under "Validation" above) was
+re-run after this script landed:
+
+```
+  top-5 ids agree: True  (model=[198, 264, 1379, 1603, 279] manual=[198, 264, 1379, 1603, 279])
+  max |logit difference| over the whole 248320-way vocabulary: 0.0000e+00
+  re-fed the 80-token sequence in 25.4s: 32/32 positions reproduce their token
+  generated text: '\nmost of the history of computing, that was the right lesson. The number of instructions was the\nbottleneck, so the number of instructions was the'
+```
+
+(The generated text differs from the one recorded under "Validation" above -- that run produced a
+different but equally fluent and on-topic continuation. Greedy decoding turns the 1-ulp bf16
+cross-process wobble documented in gate (d) into a different token the first time two candidates
+are within an ulp of each other. The check itself -- 32/32 positions reproduce -- is what passes.)
+
+**(c) the K tap really is post-rope.** `--rope-check LAYER` additionally keeps the pre-rope tensor
+(`k_norm`'s output, the `k` argument `apply_rotary_pos_emb` is called with) for one layer and
+writes `<out>.ropecheck.json`. Rope is a rotation of the first `rot_dim` dims of each head vector
+and the identity on the rest, so the captured tensor must (1) differ from the pre-rope one, and
+(2) preserve every per-position, per-head vector norm -- both of the whole head vector and of the
+rotated subspace alone -- to bf16 tolerance.
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_calibrate_full.py `
+    --max-tokens 256 --layers 3 --rope-check 3 --out <scratch>\ropecheck.json
+```
+
+```
+[kv_calib_full] rope check (layer 3): differs_from_pre_rope=True max|post-pre|=9.4375 rot_dim=64/256 passthrough_bit_identical=True
+[kv_calib_full]   full-vector norm preserved: max rel diff 7.600e-04, mean 1.263e-04
+[kv_calib_full]   rotary-subspace norm preserved: max rel diff 1.307e-03, mean 2.583e-04
+```
+
+The captured tensor is not the pre-rope one (`max|post-pre|` is 9.44 against head-vector norms of
+16.4-20.9), the 192 non-rotary dims are bit-identical and the 64 rotary ones are where all the
+change is (`fraction_elements_changed` 0.165 overall = 0.660 of the rotary dims -- the rest are
+position 0, where `cos=1, sin=0`, plus values whose rotation lands back on the same bf16), and the
+norms survive to 7.6e-4 / 1.3e-3 relative, which is bf16 round-off (bf16 has 8 mantissa bits,
+1 ulp ~ 4e-3) and not a transform. That is a rotation, applied to exactly the dims partial rope
+should touch: the tap is post-rope.
+
+**(d) determinism.** Within one process the calibration is bit-exact: the same sequence run twice
+through the same `StreamingReference` gives an identical hidden state (`hidden_sum` identical to
+the last digit) and identical amax. **Across processes it is reproducible to about 1 bf16 ulp, not
+bit-exact**, and that is a property of this bf16 reference stack on this card, not of this script.
+Two full `--max-tokens 256` runs of this script (6 files, 1536 tokens, 64 amax values per tensor):
+
+```
+k_amax: 10/64 entries differ; max rel diff 0.7463%; max bf16 ulps 1; worst at layer 47 head 3: 16.625 vs 16.75
+v_amax:  7/64 entries differ; max rel diff 1.4019%; max bf16 ulps 3; worst at layer 55 head 2: 26.75 vs 26.375
+```
+
+This is the same effect `docs/validation.md` ("The reference's own noise floor at full depth")
+already measures from the other side -- the bf16 reference's run-to-run GPU reduction-order spread,
+there worth a mean self-KL of 3.9e-04 -- surfacing here as the last bit of an amax. Isolated with a
+4-layer, 256-token probe: two forwards **inside one process** are bit-identical (same hidden-state
+sum to the last digit, same amax), while 1 of 6 **fresh processes** on the identical input produced
+a hidden-state sum of `8489.710938` where the other 5 produced `8491.220703` (and `k_amax[2]`
+7.3125 vs 7.28125, one bf16 ulp). Stable within a process but variable across processes points at
+GEMM kernel/solution selection rather than non-deterministic accumulation -- atomics would perturb
+two calls in the *same* process too. `$env:TORCH_BLAS_PREFER_HIPBLASLT = '0'` gave 6/6 identical
+processes in the same experiment, but 6 samples against a ~1-in-6 baseline deviation rate is not
+enough to call it a fix, so the script does not set it and nothing here depends on it.
+**Materiality**: the worst observed wobble is 1.4% on one `amax`, i.e. 1.4% on the descale it
+produces, against an fp8 e4m3 mantissa step of ~6.25% -- the calibration is stable to well inside
+the precision it controls, and nothing downstream can see the difference.
+
+### What the full forward changes (old prototype vs this)
+
+`k_amax`/`v_amax` per layer, **max over the 4 kv heads**, prototype (256 tokens, embeddings fed
+straight into one layer) vs this script (8316 tokens, real mid-stack activations):
+
+| layer | k old | k new | x | v old | v new | x |
+|---|---|---|---|---|---|---|
+| 3 | 6.09 | 11.50 | 1.89 | 16.38 | 8.81 | 0.54 |
+| 7 | 6.69 | 14.38 | 2.15 | 17.38 | 10.56 | 0.61 |
+| 11 | 6.56 | 14.56 | 2.22 | 10.88 | 10.13 | 0.93 |
+| 15 | 6.50 | 17.88 | 2.75 | 7.16 | 7.34 | 1.03 |
+| 19 | 7.03 | 18.13 | 2.58 | 20.38 | 9.56 | 0.47 |
+| 23 | 6.56 | 20.25 | 3.09 | 12.00 | 15.63 | 1.30 |
+| 27 | 8.00 | 21.63 | 2.70 | 11.13 | 27.63 | 2.48 |
+| 31 | 8.63 | 23.00 | 2.67 | 7.84 | 42.50 | 5.42 |
+| 35 | 7.94 | 19.75 | 2.49 | 12.81 | 38.25 | 2.99 |
+| 39 | 9.13 | 20.88 | 2.29 | 9.19 | 32.00 | 3.48 |
+| 43 | 8.50 | 20.13 | 2.37 | 13.75 | 60.00 | 4.36 |
+| 47 | 10.25 | 18.50 | 1.80 | 8.94 | 58.25 | 6.52 |
+| 51 | 10.13 | 16.63 | 1.64 | 23.38 | 62.75 | 2.68 |
+| 55 | 10.25 | 15.81 | 1.54 | 21.38 | 39.00 | 1.82 |
+| 59 | 8.50 | 16.63 | 1.96 | 35.75 | 107.00 | 2.99 |
+| 63 | 8.44 | 13.56 | 1.61 | 42.25 | 123.00 | 2.91 |
+
+Per kv head, `k_amax` grows by 1.41-3.29x (median 2.08x) and `v_amax` by 0.37-8.81x (median
+1.99x). The prototype was not merely noisy, it was **biased low almost everywhere**: converting
+with it would have set every descale 2x too small, i.e. clipped the real K distribution at half its
+range and, in the back half of the stack, the real V distribution at an eighth of it -- every value
+above the prototype's amax saturating at +-448 in the fp8 cache. The few entries where the
+prototype read *higher* (V in layers 3-19) are the mirror image: raw embeddings have their own
+outliers that the real activations at those depths do not.
+
+Note that the growth is not only "more layers in front": this run also sees 32x more tokens
+(8316 vs 256) across a wider corpus, and an amax is a max, so a longer, more varied corpus can only
+push it up. The two effects are not separated here, and do not need to be -- both are reasons the
+prototype's number was wrong for the job.
+
+### Consuming it
+
+```powershell
+r4dx-convert ... --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json
+```
+
+The converter reads only `k_amax`/`v_amax` and writes `text.layers.{i}.attn.k_descale`/`.v_descale`
+as `fp32[kv_heads] = amax / 448.0` -- exactly as documented for the prototype above (same layout,
+same formula, same fallback to 1.0 with a `WARNING` for a layer that is absent or malformed).
 
 ## Shared file format (the KL comparison)
 

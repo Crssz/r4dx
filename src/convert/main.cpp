@@ -155,6 +155,7 @@ struct AppArgs {
   std::string selftest_input, selftest_output, selftest_name = "w";
   std::string layouts_spec = "mxfp4,w4a16,w4a8";
   std::string lm_head_spec = "4bit+bf16";
+  bool lm_head_spec_explicit = false;  // --lm-head was given: --no-bf16 then leaves it alone
   int layers = -1;  // -1 = every text layer
   int threads = 0;  // 0 = hardware_concurrency
   int vision = -1;  // -1 auto (on iff full run), 0 off, 1 on
@@ -204,7 +205,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--selftest-output") a.selftest_output = next(i);
     else if (arg == "--selftest-name") a.selftest_name = next(i);
     else if (arg == "--layouts") a.layouts_spec = next(i);
-    else if (arg == "--lm-head") a.lm_head_spec = next(i);
+    else if (arg == "--lm-head") { a.lm_head_spec = next(i); a.lm_head_spec_explicit = true; }
     else if (arg == "--layers") a.layers = std::stoi(next(i));
     else if (arg == "--threads") a.threads = std::stoi(next(i));
     else if (arg == "--vision") a.vision = ParseOnOff(next(i), "--vision");
@@ -262,7 +263,10 @@ int RunConvert(const AppArgs& args) {
     // and "none" in a spec is a no-op rather than a subtractive token) -- --no-bf16 is the
     // explicit override so a quantized-only conversion is possible (review finding, minor).
     layouts.bf16 = false;
-    lm_head_layouts.bf16 = false;
+    // An explicit `--lm-head bf16` (or `4bit+bf16`) is a deliberate request for a bf16 lm_head in
+    // an otherwise quantized-only container (rung 4 follow-up: the 4-bit lm_head is where the
+    // vocab-tail KL loss sits) -- only the DEFAULT lm_head spec is subject to --no-bf16.
+    if (!args.lm_head_spec_explicit) lm_head_layouts.bf16 = false;
   }
 
   std::cout << "[r4dx-convert] input=" << args.input << " output=" << args.output << "\n"

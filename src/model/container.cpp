@@ -309,7 +309,11 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   }
 
   c.final_norm_ = UploadRawU16(reader, "text.final_norm");
-  c.lm_head_ = LoadQuantLinear(reader, "lm_head", lm_head_layout, c.config_.vocab_size, hidden);
+  // With fallback: a container converted with `--lm-head bf16` (rung 4 follow-up -- the 4-bit
+  // lm_head is where the vocab-tail KL loss concentrates) carries only lm_head.bf16.w, and every
+  // caller that asks for the body layout here should get that bf16 head rather than a throw.
+  c.lm_head_ = LoadQuantLinearWithFallback(reader, "lm_head", lm_head_layout, c.config_.vocab_size,
+                                           hidden);
 
   // mtp.* (docs/container-format.md, docs/mtp.md): present only when the container was converted
   // with --mtp on -- probe with SafetensorsReader::Has rather than trusting __metadata__, so this

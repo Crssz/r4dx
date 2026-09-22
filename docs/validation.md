@@ -528,6 +528,45 @@ descale calibration corpus), so the corpus is genuinely held out.
 token ids, against a reference validated against a plain transformers forward, with a reference
 self-noise ~200x smaller than the reported value.
 
+### Follow-up experiments (2026-09-22): where the 0.088 comes from
+
+Same corpus, same reference, same tooling; every run is `tool_teacher_forced_logprobs` + `kl_report`
+(outputs under `tools/reference/kl_out/<name>/`, JSON summaries `kl_<name>.json`). Mean KL is the
+mean over the four segments; PPL is the corpus perplexity of the r4dx side (reference 5.661).
+
+| container / layout | mean KL | cpp | english | python | thai | top-1 | PPL | runtime cost |
+|---|---|---|---|---|---|---|---|---|
+| v3 w4a16 (prototype KV calib, 4-bit lm_head) -- the rung 4 number | 0.088 | 0.059 | 0.068 | 0.069 | 0.156 | 87.0% | 6.03 | -- |
+| v3 mxfp4 | 0.111 | 0.070 | 0.085 | 0.088 | 0.204 | 84.9% | 6.28 | -- |
+| v3 w4a8 | 0.159 | 0.106 | 0.128 | 0.124 | 0.278 | 82.5% | 6.72 | -- |
+| w4a16 + **bf16 lm_head** (`--lm-head bf16`, prototype KV calib) | 0.079 | 0.053 | 0.059 | 0.061 | 0.143 | 87.2% | 5.92 | +1.9 GiB VRAM, ~-6% decode |
+| w4a16 + **full-forward KV calib** (`kv_calibrate_full.py`, 4-bit lm_head) | **0.072** | 0.045 | 0.057 | 0.052 | 0.136 | **88.4%** | 5.85 | **none** |
+
+What this says:
+
+- **The weight quantization dominates.** Three layouts sharing the same fp8 KV cache and the same
+  4-bit `lm_head` spread 0.088 -> 0.159; if the KV path were the floor they would cluster. w4a8's
+  `wq` bytes are identical to w4a16's, so its extra +0.07 nats is the price of per-row int8
+  activation quantization alone.
+- **The `lm_head` is not where the vocab-tail loss lives.** A bf16 head recovers only ~0.009 nats
+  and barely moves the >=148000 vocab-region error (`kl_audit.py` check 5: thai mass-weighted
+  |dlogp| 0.426 -> 0.400), which corrects the attribution in "Auditing this measurement" above: the
+  tail tokens are simply where the body's error is most visible. Not worth 1.9 GiB.
+- **The prototype KV calibration was clipping.** `kv_calibrate_full.py` (real mid-stack activations,
+  8316 tokens, six files incl. a chat-templated turn) finds K amax ~2x and V amax up to ~8x larger
+  than the prototype's, i.e. the old descales saturated the e4m3 cache on ordinary text. Fixing the
+  calibration alone is worth -18% KL and +1.4 points top-1 at zero runtime cost, and every new
+  container should be converted with `--kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json`.
+- Published llama.cpp Q4_K_M on this checkpoint measures 0.011-0.014 mean KL / 95-96% top-1 (its
+  own `llama-perplexity --kl-divergence` methodology, wikitext / held-out English). The remaining
+  gap is in `quant_int4.hpp`'s grid: plain min/max scale, round-to-nearest, no scale/zero search,
+  no importance weighting, 128-element groups -- the first two are converter-only changes with no
+  runtime cost and are the next step.
+
+Converter/loader changes made for this pass: `--lm-head bf16` now survives `--no-bf16` (only the
+default lm_head spec is stripped), and `Container::Load` falls back to `lm_head.bf16.w` when the
+requested layout is absent from the container.
+
 ## Rung 5 -- generation sanity
 
 Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass

@@ -1,4 +1,4 @@
-// tests/model/test_final_lm_head.cpp -- FinalLmHead (text.final_norm -> lm_head -> fp32 logits)
+﻿// tests/model/test_final_lm_head.cpp -- FinalLmHead (text.final_norm -> lm_head -> fp32 logits)
 // against tools/reference/golden_out/final_norm_lm_head.safetensors, on the golden's tiny-vocab
 // (256-row) lm_head slice, once per lm_head layout the container carries: the golden only ever
 // computes logits against lm_head.weight[0:tiny_vocab], so this builds a matching 256-row
@@ -41,7 +41,7 @@ using r4dx::model::LayoutName;
 using r4dx::model::QuantLinear;
 
 namespace {
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
 // R4DX_SOURCE_DIR is defined by tests/CMakeLists.txt from ${CMAKE_SOURCE_DIR}.
 const char* kGoldenPath =
     R4DX_SOURCE_DIR "/tools/reference/golden_out/final_norm_lm_head.safetensors";

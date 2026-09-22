@@ -37,20 +37,29 @@ std::vector<uint8_t> AsBytes(const std::vector<T>& v) {
   return std::vector<uint8_t>(p, p + v.size() * sizeof(T));
 }
 
-bool CompareBytes(const char* label, const std::vector<uint8_t>& got, const std::vector<uint8_t>& want) {
+bool CompareBytes(const std::string& label, const std::vector<uint8_t>& got,
+                  const std::vector<uint8_t>& want) {
   if (got.size() != want.size()) {
-    std::fprintf(stderr, "FAIL %s: size mismatch got=%zu want=%zu\n", label, got.size(), want.size());
+    std::fprintf(stderr, "FAIL %s: size mismatch got=%zu want=%zu\n", label.c_str(), got.size(),
+                 want.size());
     return false;
   }
   for (size_t i = 0; i < got.size(); ++i) {
     if (got[i] != want[i]) {
-      std::fprintf(stderr, "FAIL %s: first mismatch at byte %zu: got=0x%02x want=0x%02x\n", label, i,
-                   got[i], want[i]);
+      std::fprintf(stderr, "FAIL %s: first mismatch at byte %zu: got=0x%02x want=0x%02x\n",
+                   label.c_str(), i, got[i], want[i]);
       return false;
     }
   }
-  std::printf("OK   %s (%zu bytes byte-exact)\n", label, got.size());
+  std::printf("OK   %s (%zu bytes byte-exact)\n", label.c_str(), got.size());
   return true;
+}
+
+// Fixture filename suffix for an int4 group: the historical 128 set keeps its unsuffixed names
+// (its bytes are the ground truth every earlier milestone was gated against and must not move),
+// every other group gets "_g{group}" -- tools/convert_ref/gen_fixtures.py's `gsfx`.
+std::string GroupSuffix(int group) {
+  return group == 128 ? std::string() : "_g" + std::to_string(group);
 }
 
 }  // namespace
@@ -74,25 +83,36 @@ int main() {
 
   bool ok = true;
 
-  {
-    std::vector<uint8_t> q, zero;
-    std::vector<float> scale;
-    QuantizeInt4Asymmetric(w.data(), N, K, kInt4Group, /*nthreads=*/1, q, scale, zero);
-    auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/1);
-    auto wsz = PackW4A16Scales(scale, zero, N, K, kInt4Group);
-    ok &= CompareBytes("w4a16.wq", AsBytes(wq), ReadFileBytes(dir + "/w4a16_wq.bin"));
-    ok &= CompareBytes("w4a16.wsz", AsBytes(wsz), ReadFileBytes(dir + "/w4a16_wsz.bin"));
+  // Every int4 group r4d_gemm_w4a16_nt_m64 can be built with (manifest.json's "int4_groups", from
+  // gen_fixtures.py). Gating both here rather than only at kW4A16Group means the DEFAULT build
+  // still proves the group-64 packer byte-exact against the Python reference.
+  for (const auto& gj : manifest.at("int4_groups")) {
+    const int group = gj.get<int>();
+    const std::string g = GroupSuffix(group), tag = " g" + std::to_string(group);
+    {
+      std::vector<uint8_t> q, zero;
+      std::vector<float> scale;
+      QuantizeInt4Asymmetric(w.data(), N, K, group, /*nthreads=*/1, q, scale, zero);
+      auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/1);
+      auto wsz = PackW4A16Scales(scale, zero, N, K, group);
+      ok &= CompareBytes("w4a16.wq" + tag, AsBytes(wq),
+                         ReadFileBytes(dir + "/w4a16_wq" + g + ".bin"));
+      ok &= CompareBytes("w4a16.wsz" + tag, AsBytes(wsz),
+                         ReadFileBytes(dir + "/w4a16_wsz" + g + ".bin"));
+    }
+    {
+      std::vector<uint8_t> q;
+      std::vector<float> scale;
+      QuantizeInt4SymmetricPinned8(w.data(), N, K, group, /*nthreads=*/1, q, scale);
+      auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/1);
+      auto ws = PackW4A8Scales(scale, N, K, group);
+      ok &= CompareBytes("w4a8.wq" + tag, AsBytes(wq),
+                         ReadFileBytes(dir + "/w4a8_wq" + g + ".bin"));
+      ok &= CompareBytes("w4a8.ws" + tag, AsBytes(ws),
+                         ReadFileBytes(dir + "/w4a8_ws" + g + ".bin"));
+    }
   }
-  {
-    std::vector<uint8_t> q;
-    std::vector<float> scale;
-    QuantizeInt4SymmetricPinned8(w.data(), N, K, kInt4Group, /*nthreads=*/1, q, scale);
-    auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/1);
-    auto ws = PackW4A8Scales(scale, N, K, kInt4Group);
-    ok &= CompareBytes("w4a8.wq", AsBytes(wq), ReadFileBytes(dir + "/w4a8_wq.bin"));
-    ok &= CompareBytes("w4a8.ws", AsBytes(ws), ReadFileBytes(dir + "/w4a8_ws.bin"));
-  }
-  {
+  {  // mxfp4's group is its own constant, not the w4a16 build option -- one set of fixtures.
     Mxfp4Quantized mq = QuantizeMxfp4(w.data(), N, K, kMxfp4Group, /*nthreads=*/1);
     auto wq = PackMxfp4Wq(mq.packed, N, K, /*nthreads=*/1);
     auto ws = PackMxfp4Ws(mq.escale, N, K, kMxfp4Group);

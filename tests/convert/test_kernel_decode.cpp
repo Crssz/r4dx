@@ -1,4 +1,4 @@
-// Kernel-literal decode test (review finding, major: "the gating tests do not gate the thing that
+﻿// Kernel-literal decode test (review finding, major: "the gating tests do not gate the thing that
 // matters" -- test_pack_bytes.cpp only checks the C++ packer against fixtures produced by the same
 // author's Python references, so a permutation bug present in BOTH would pass silently, and the
 // only check against the real GEMM kernels' actual pointer arithmetic (tools/convert_ref/
@@ -65,14 +65,14 @@ int DecodeK(int kb, int s, int e, int lane) {
 
 int NibblePos(int e) { return (e < 4) ? (2 * e) : (2 * (e - 4) + 1); }
 
-void CheckW4A16(const std::vector<float>& w, int N, int K) {
+void CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
   std::vector<uint8_t> q, zero;
   std::vector<float> scale;
-  QuantizeInt4Asymmetric(w.data(), N, K, kInt4Group, /*nthreads=*/4, q, scale, zero);
+  QuantizeInt4Asymmetric(w.data(), N, K, group, /*nthreads=*/4, q, scale, zero);
   auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/4);
-  auto wsz = PackW4A16Scales(scale, zero, N, K, kInt4Group);
+  auto wsz = PackW4A16Scales(scale, zero, N, K, group);
 
-  const int ntiles = N / 16, kblocks = K / 64, groups_per_row = K / kInt4Group;
+  const int ntiles = N / 16, kblocks = K / 64, groups_per_row = K / group;
   for (int t = 0; t < ntiles; ++t) {
     for (int kb = 0; kb < kblocks; ++kb) {
       for (int lane = 0; lane < 32; ++lane) {
@@ -90,7 +90,7 @@ void CheckW4A16(const std::vector<float>& w, int N, int K) {
                            decoded_q, expect_q);
               ++g_failures;
             }
-            const int g = k / kInt4Group;
+            const int g = k / group;
             const size_t gidx = static_cast<size_t>(row) * groups_per_row + g;
             const int r = lane & 15;
             const size_t wsz_idx = (static_cast<size_t>(t) * groups_per_row + g) * 16 + r;
@@ -108,18 +108,18 @@ void CheckW4A16(const std::vector<float>& w, int N, int K) {
       }
     }
   }
-  std::printf("w4a16 kernel-literal decode: N=%d K=%d checked, failures so far=%d\n", N, K,
-              g_failures);
+  std::printf("w4a16 kernel-literal decode: N=%d K=%d group=%d checked, failures so far=%d\n", N, K,
+              group, g_failures);
 }
 
-void CheckW4A8(const std::vector<float>& w, int N, int K) {
+void CheckW4A8(const std::vector<float>& w, int N, int K, int group) {
   std::vector<uint8_t> q;
   std::vector<float> scale;
-  QuantizeInt4SymmetricPinned8(w.data(), N, K, kInt4Group, /*nthreads=*/4, q, scale);
+  QuantizeInt4SymmetricPinned8(w.data(), N, K, group, /*nthreads=*/4, q, scale);
   auto wq = PackW4Nibbles(q, N, K, /*nthreads=*/4);
-  auto ws = PackW4A8Scales(scale, N, K, kInt4Group);
+  auto ws = PackW4A8Scales(scale, N, K, group);
 
-  const int ntiles = N / 16, kblocks = K / 64, groups_per_row = K / kInt4Group;
+  const int ntiles = N / 16, kblocks = K / 64, groups_per_row = K / group;
   for (int t = 0; t < ntiles; ++t) {
     for (int kb = 0; kb < kblocks; ++kb) {
       for (int lane = 0; lane < 32; ++lane) {
@@ -140,7 +140,7 @@ void CheckW4A8(const std::vector<float>& w, int N, int K) {
                            decoded_signed, expect_signed);
               ++g_failures;
             }
-            const int g = k / kInt4Group;
+            const int g = k / group;
             const size_t gidx = static_cast<size_t>(row) * groups_per_row + g;
             const int r = lane & 15;
             const size_t ws_idx = (static_cast<size_t>(t) * groups_per_row + g) * 16 + r;
@@ -156,8 +156,8 @@ void CheckW4A8(const std::vector<float>& w, int N, int K) {
       }
     }
   }
-  std::printf("w4a8 kernel-literal decode: N=%d K=%d checked, failures so far=%d\n", N, K,
-              g_failures);
+  std::printf("w4a8 kernel-literal decode: N=%d K=%d group=%d checked, failures so far=%d\n", N, K,
+              group, g_failures);
 }
 
 void CheckMxfp4(const std::vector<float>& w, int N, int K) {
@@ -223,8 +223,14 @@ int main() {
   std::vector<float> w(static_cast<size_t>(N) * K);
   for (auto& v : w) v = dist(rng);
 
-  CheckW4A16(w, N, K);
-  CheckW4A8(w, N, K);
+  // Both w4a16 groups r4d_gemm_w4a16_nt_m64 can be built with (R4DX_W4A16_GROUP: a multiple of the
+  // kernel's 64-wide packed block, so 64 and 128 are the whole set). The decode below re-derives
+  // the kernel's own indexing from R4D_GEMM_W4_GROUP-parameterized source, so it is exactly the
+  // group-64 wsz stride (`t*nsz + kbase/GROUP`, `bpg = GROUP/64`) that has to be gated here.
+  for (int group : {128, 64}) {
+    CheckW4A16(w, N, K, group);
+    CheckW4A8(w, N, K, group);
+  }
   CheckMxfp4(w, N, K);
 
   if (g_failures != 0) {
@@ -234,3 +240,4 @@ int main() {
   std::printf("PASS\n");
   return 0;
 }
+

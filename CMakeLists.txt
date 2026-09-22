@@ -20,6 +20,38 @@ option(R4DX_BUILD_TESTS "Build tests" ON)
 option(R4DX_BUILD_SERVER "Build the OpenAI-compatible chat server" ON)
 option(R4DX_BUILD_CONVERT "Build the HF -> r4dx weight converter" ON)
 
+# ---- w4a16 group size (docs/build-windows.md "w4a16 group size") -------------------------------
+#
+# K per (scale, zero) pair in the w4a16 layout. It is ONE knob because it has to reach two places
+# that must never disagree:
+#   * the kernel  -- third_party/CMakeLists.txt passes it as -DR4D_GEMM_W4_GROUP to
+#                    r4d_gemm_w4a16_nt_m64, whose _group() export the converter asserts against;
+#   * the packer  -- src/convert/CMakeLists.txt passes it as -DR4DX_W4A16_GROUP to r4dx_convert's
+#                    kW4A16Group (quant_int4.hpp), which decides the .w4a16.wsz stride.
+# A container also records the value it was packed with in __metadata__.quant.w4a16.group, and
+# Container::Load (src/model/container.cpp) refuses a container whose group differs from the
+# kernel this binary was built with -- a silent mismatch is garbage GEMMs, not an error.
+#
+# The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight block, so the group must be a
+# multiple of 64: 64 and 128 are the only values libr4d accepts unmodified. Bits per weight is
+# 4 + 32/group (4.25 at 128, 4.5 at 64) -- docs/validation.md "Milestone 11 / group size" has what
+# the extra quarter-bit buys. Build a non-default group in its OWN build dir (preset win-hip-g64),
+# never on top of build/win-hip: the container and the binaries must ship as a matched pair.
+set(R4DX_W4A16_GROUP "128" CACHE STRING "w4a16 group size: K per (scale, zero) pair (64 or 128)")
+set_property(CACHE R4DX_W4A16_GROUP PROPERTY STRINGS 64 128)
+if(NOT R4DX_W4A16_GROUP MATCHES "^[0-9]+$")
+  message(FATAL_ERROR "R4DX_W4A16_GROUP must be a positive integer (got '${R4DX_W4A16_GROUP}')")
+endif()
+math(EXPR R4DX_W4A16_GROUP_REM "${R4DX_W4A16_GROUP} % 64")
+if(R4DX_W4A16_GROUP LESS 64 OR NOT R4DX_W4A16_GROUP_REM EQUAL 0)
+  message(FATAL_ERROR
+          "R4DX_W4A16_GROUP must be a positive multiple of R4D_GEMM_W4_KPB (64) -- got "
+          "'${R4DX_W4A16_GROUP}'; r4d_gemm_w4a16_nt_m64 derives bpg = group / 64 and would read "
+          "the packed weights at the wrong stride")
+endif()
+message(STATUS "r4dx: w4a16 group = ${R4DX_W4A16_GROUP} "
+               "(bits/weight = 4 + 32/${R4DX_W4A16_GROUP})")
+
 # CXX-only project: the r4d_core static library is produced by driving hipcc.exe directly through
 # add_custom_command (see third_party/CMakeLists.txt) rather than enabling CMake's HIP language,
 # which fights clang-cl on this toolchain. Everything above r4d_core is plain MSVC/clang-cl C++

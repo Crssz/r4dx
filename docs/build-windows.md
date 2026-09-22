@@ -56,8 +56,70 @@ bits that build needs and this one does not):
 ```
 
 Per-unit extras: `r4d_gdn_chunk_scan_k128_v128_c64_bf16` gets `-mcumode`;
-`r4d_gemm_w4a8_nt_m64` gets `-DR4D_GEMM_W4A8_GROUP=128`. Both match libr4d's own
-`build_windows.ps1` `$UNITS` table.
+`r4d_gemm_w4a8_nt_m64` gets `-DR4D_GEMM_W4A8_GROUP=128` (both match libr4d's own
+`build_windows.ps1` `$UNITS` table); `r4d_gemm_w4a16_nt_m64` gets
+`-DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP}`, which is the one deliberate deviation from that table
+-- see the next section.
+
+### w4a16 group size (`R4DX_W4A16_GROUP`)
+
+`R4DX_W4A16_GROUP` (root `CMakeLists.txt`, default **128**) is the w4a16 layout's group size: how
+many contiguous `K` share one `(scale, zero)` pair. It is a single CMake cache variable because it
+has to reach two places that must never disagree:
+
+| reaches | as | used for |
+|---|---|---|
+| `r4d_gemm_w4a16_nt_m64` (`third_party/CMakeLists.txt`) | `-DR4D_GEMM_W4_GROUP=<g>` | the stride the GEMM reads `.w4a16.wsz` at |
+| `r4dx_convert` (`src/convert/CMakeLists.txt`) | `-DR4DX_W4A16_GROUP=<g>` -> `kW4A16Group` | the stride the converter *writes* `.w4a16.wsz` at |
+
+Three layers check that they agree, because a mismatch produces **wrong numbers and nothing else**
+-- no crash, no NaN, no warning:
+
+1. `r4dx-convert` asserts `kW4A16Group == r4d_gemm_w4a16_nt_m64_group()` at startup
+   (`ValidateKernelGroupSizes`). w4a8 and mxfp4 are checked the same way, each against its own
+   kernel export -- w4a16 and w4a8 have **separate** converter constants (`kW4A16Group`,
+   `kW4A8Group`) precisely so this one can move on its own.
+2. Every container records the group it was packed with in `__metadata__.quant.w4a16.group`, and
+   `Container::Load` / `DflashDraftWeights::Open` refuse a container whose group differs from the
+   kernel this binary was built with (`CheckW4a16Group`, `src/model/quant_linear.h`), naming both
+   numbers. Pre-`quant`-block containers have no group recorded and are group 128 by construction,
+   so they still load on a default build.
+3. CMake rejects a group that is not a positive multiple of 64: the kernel packs
+   `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
+   128 are the only values libr4d accepts unmodified**.
+
+Bits per weight is `4 + 32/group` -- 4.25 at 128, 4.5 at 64. What the extra quarter-bit buys is
+measured in `docs/validation.md` "Milestone 11 / group size".
+
+**Build a non-default group in its own build directory.** A container and the binaries that read it
+ship as a matched pair, so `build/win-hip` stays group 128 and the `win-hip-g64` preset builds
+group 64 into `build/win-hip-g64`:
+
+```powershell
+.\build.ps1 -Preset win-hip-g64
+```
+
+The `tests/convert` suite is group-agnostic: it runs every int4 quantizer, packer and search at
+**both** 64 and 128 whatever `R4DX_W4A16_GROUP` this build is, against
+`tests/convert/fixtures/*_g64.bin` (the group-128 fixtures keep their historical unsuffixed names).
+`tools/convert_ref/selftest_compare.py` takes `--w4a16-group` / `--w4a8-group` and, by default,
+reads the group back out of the container the exe under test just wrote.
+
+The `tests/model` and `tests/model/attention` tests are different: they read fixed 4-layer
+containers at hard-coded `D:\models\r4dx\` paths, packed at group 128, which a group-64 build
+rightly refuses. Convert group-matched copies once and point the suite at them with
+`R4DX_TEST_CONTAINER_DIR` (`tests/model/test_container_path.h`) -- same basename, new directory:
+
+```powershell
+$dir = 'D:\models\r4dx\g64-testctr'
+# qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,mxfp4,w4a16,w4a8 --lm-head 4bit+bf16 --mtp off --vision off
+# qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16            --lm-head 4bit+bf16 --mtp on  --vision off
+# qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16,w4a8,mxfp4 --lm-head 4bit+bf16 --mtp on  --vision off
+# the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --layout {bf16,w4a16}
+.\build\win-hip-g64\src\convert\r4dx-convert.exe --input C:\AI\models\Qwen3.8-27B --output "$dir\..." ...
+$env:R4DX_TEST_CONTAINER_DIR = $dir
+ctest --preset win-hip-g64
+```
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
 `--rocm-path` is passed; `third_party/CMakeLists.txt` prepends `C:\opt\rocm\bin` and

@@ -20,7 +20,9 @@
 
 namespace r4dx_convert {
 
-// kInt4Group (quant_int4.hpp) and kMxfp4Group (quant_mxfp4.hpp) are the group sizes used below.
+// kW4A16Group / kW4A8Group (quant_int4.hpp) and kMxfp4Group (quant_mxfp4.hpp) are the group sizes
+// used below. w4a16's is a build option (R4DX_W4A16_GROUP) and need NOT equal w4a8's, so every
+// site below names the one belonging to the layout it is emitting.
 
 struct LayoutSet {
   bool mxfp4 = false, w4a16 = false, w4a8 = false, bf16 = true;
@@ -46,21 +48,22 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
   // Fail before planning a single byte rather than truncating silently in the quantizers/packers
   // later (review finding, minor -- see quant_int4.hpp's RequireDivisible).
   if (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) RequireDivisible(N, 16, "N", base.c_str());
-  if (layouts.w4a16 || layouts.w4a8) RequireDivisible(K, kInt4Group, "K", base.c_str());
+  if (layouts.w4a16) RequireDivisible(K, kW4A16Group, "K", base.c_str());
+  if (layouts.w4a8) RequireDivisible(K, kW4A8Group, "K", base.c_str());
   if (layouts.mxfp4) RequireDivisible(K, kMxfp4Group, "K", base.c_str());
   if (layouts.bf16)
     writer.Plan(base + ".bf16.w", {N, K, 2}, static_cast<uint64_t>(N) * K * 2);
   if (layouts.w4a16) {
     writer.Plan(base + ".w4a16.wq", {static_cast<int64_t>(N) * K / 2},
                 static_cast<uint64_t>(N) * K / 2);
-    writer.Plan(base + ".w4a16.wsz", {static_cast<int64_t>(N) * K / kInt4Group, 4},
-                static_cast<uint64_t>(N) * K / kInt4Group * 4);
+    writer.Plan(base + ".w4a16.wsz", {static_cast<int64_t>(N) * K / kW4A16Group, 4},
+                static_cast<uint64_t>(N) * K / kW4A16Group * 4);
   }
   if (layouts.w4a8) {
     writer.Plan(base + ".w4a8.wq", {static_cast<int64_t>(N) * K / 2},
                 static_cast<uint64_t>(N) * K / 2);
-    writer.Plan(base + ".w4a8.ws", {static_cast<int64_t>(N) * K / kInt4Group, 4},
-                static_cast<uint64_t>(N) * K / kInt4Group * 4);
+    writer.Plan(base + ".w4a8.ws", {static_cast<int64_t>(N) * K / kW4A8Group, 4},
+                static_cast<uint64_t>(N) * K / kW4A8Group * 4);
   }
   if (layouts.mxfp4) {
     writer.Plan(base + ".mxfp4.wq", {static_cast<int64_t>(N) * K / 2},
@@ -83,12 +86,12 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     std::vector<uint8_t> q, zero;
     std::vector<float> scale;
     if (search)
-      QuantizeInt4AsymmetricSearch(w.data(), N, K, kInt4Group, opts.importance, nthreads, q, scale,
+      QuantizeInt4AsymmetricSearch(w.data(), N, K, kW4A16Group, opts.importance, nthreads, q, scale,
                                    zero);
     else
-      QuantizeInt4Asymmetric(w.data(), N, K, kInt4Group, nthreads, q, scale, zero);
+      QuantizeInt4Asymmetric(w.data(), N, K, kW4A16Group, nthreads, q, scale, zero);
     auto wq = PackW4Nibbles(q, N, K, nthreads);
-    auto wsz = PackW4A16Scales(scale, zero, N, K, kInt4Group);
+    auto wsz = PackW4A16Scales(scale, zero, N, K, kW4A16Group);
     writer.WriteTensor(base + ".w4a16.wq", wq.data(), wq.size() * 4);
     writer.WriteTensor(base + ".w4a16.wsz", wsz.data(), wsz.size() * 4);
   }
@@ -96,11 +99,11 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     std::vector<uint8_t> q;
     std::vector<float> scale;
     if (search)
-      QuantizeInt4Pinned8Search(w.data(), N, K, kInt4Group, opts.importance, nthreads, q, scale);
+      QuantizeInt4Pinned8Search(w.data(), N, K, kW4A8Group, opts.importance, nthreads, q, scale);
     else
-      QuantizeInt4SymmetricPinned8(w.data(), N, K, kInt4Group, nthreads, q, scale);
+      QuantizeInt4SymmetricPinned8(w.data(), N, K, kW4A8Group, nthreads, q, scale);
     auto wq = PackW4Nibbles(q, N, K, nthreads);
-    auto ws = PackW4A8Scales(scale, N, K, kInt4Group);
+    auto ws = PackW4A8Scales(scale, N, K, kW4A8Group);
     writer.WriteTensor(base + ".w4a8.wq", wq.data(), wq.size() * 4);
     writer.WriteTensor(base + ".w4a8.ws", ws.data(), ws.size() * 4);
   }

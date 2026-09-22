@@ -1,4 +1,4 @@
-// tests/model/test_mtp.cpp -- correctness tests for r4dx::model::Model's MTP self-speculative
+﻿// tests/model/test_mtp.cpp -- correctness tests for r4dx::model::Model's MTP self-speculative
 // decode (docs/mtp.md), against the 4-layer MTP-enabled test container
 // (D:/models/r4dx/qwen38-27b-l4-mtp.r4dx, converted with `r4dx-convert --layers 4 --mtp on
 // --layouts bf16,w4a16`).
@@ -47,7 +47,7 @@ namespace {
 // bf16,w4a16,w4a8,mxfp4`, docs/status.md's "h_seed drift" section) already exists on disk and was
 // previously used only by the non-ctest tool_hseed_drift -- pointed at here instead so every check
 // in this file's main loop runs against all four layouts.
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int64_t kDraftK = 3;
 constexpr int kRejectionCheckRounds = 12;  // enough rounds to almost certainly see a rejection on
                                             // this drastically-truncated 4-layer container
@@ -1391,7 +1391,7 @@ int main() {
   // Reduced-vocab draft head (docs/r9700.md R9): separate container (has mtp.draft_head.* tensors),
   // separately SKIPped if missing so a machine that never ran this task's own converter step still
   // runs everything else in this file.
-  const char* kDraftVocabContainerPath = "D:/models/r4dx/qwen38-27b-l4-mtp-draftvocab.r4dx";
+  const char* kDraftVocabContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-mtp-draftvocab.r4dx");
   if (!FileExists(kDraftVocabContainerPath)) {
     // Loud, grep-able skip (review finding, 2026-09-20): this test still returns 0 (a clean
     // ctest "Passed") on a machine missing this container, so the reduced-vocab draft head --

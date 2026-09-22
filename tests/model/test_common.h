@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "test_container_path.h"  // r4dx_test::ContainerPath
+
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/stream.hpp"
@@ -27,6 +29,8 @@ inline bool FileExists(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   return static_cast<bool>(f);
 }
+
+// r4dx_test::ContainerPath (test_container_path.h) is available to every includer of this header.
 
 // SKIP_RETURN_CODE 77 -- same convention tests/tokenizer/CMakeLists.txt's tokenizer_golden test
 // uses for "the real model data this test needs isn't on this machine", mapped to CTest's SKIPPED

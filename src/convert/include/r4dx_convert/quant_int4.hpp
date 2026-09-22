@@ -46,9 +46,31 @@
 
 namespace r4dx_convert {
 
-// R4D_GEMM_W4_GROUP and this build's R4D_GEMM_W4A8_GROUP override (third_party/CMakeLists.txt
-// passes -DR4D_GEMM_W4A8_GROUP=128, so both kernels use the same group in this build).
-inline constexpr int kInt4Group = 128;
+// ---- group sizes: one constant PER KERNEL, each driven by that kernel's own build flag ---------
+//
+// These two used to be a single `kInt4Group = 128`, which was only correct because both kernels
+// happened to be built with 128. They are separate knobs in libr4d (R4D_GEMM_W4_GROUP for w4a16,
+// R4D_GEMM_W4A8_GROUP for w4a8) and they are separate constants here, each asserted against its
+// own kernel export at startup (src/convert/main.cpp ValidateKernelGroupSizes).
+//
+// w4a16's group is a BUILD OPTION: the CMake cache variable R4DX_W4A16_GROUP (root
+// CMakeLists.txt, default 128) is passed both to the kernel as -DR4D_GEMM_W4_GROUP and to this
+// header as -DR4DX_W4A16_GROUP (src/convert/CMakeLists.txt), so one switch moves both sides at
+// once. The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight block and derives
+// `bpg = R4D_GEMM_W4_GROUP / R4D_GEMM_W4_KPB`, so the group must be a multiple of 64 -- i.e. 64 is
+// the only value below the 128 default the kernel accepts as-is. Smaller group = more (scale,zero)
+// dwords per row = more bits per weight: 4 + 32/group bits, so 4.25 at 128 and 4.5 at 64.
+#ifndef R4DX_W4A16_GROUP
+#define R4DX_W4A16_GROUP 128
+#endif
+inline constexpr int kW4A16Group = R4DX_W4A16_GROUP;
+static_assert(kW4A16Group > 0 && kW4A16Group % 64 == 0,
+              "R4DX_W4A16_GROUP must be a positive multiple of R4D_GEMM_W4_KPB (64)");
+
+// w4a8's group is NOT an option: third_party/CMakeLists.txt pins the kernel to
+// -DR4D_GEMM_W4A8_GROUP=128 (its in-kernel default is 256). Change one and the startup assert in
+// src/convert/main.cpp fires naming both numbers.
+inline constexpr int kW4A8Group = 128;
 
 // k-offset (within a 16-wide WMMA step, before the lane's own 4*(lane>>4) term) of fragment
 // element e = 0..7, i.e. the inverse of r4d_gemm_w4a16_nt_m64.hip's "nibble 2e (e<4) / 2(e-4)+1

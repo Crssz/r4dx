@@ -1,4 +1,4 @@
-// tests/model/test_forward_smoke.cpp -- end-to-end smoke test for r4dx::model::Model (the full
+﻿// tests/model/test_forward_smoke.cpp -- end-to-end smoke test for r4dx::model::Model (the full
 // assembled forward pass: embedding -> N decoder layers (GDN + full attention, chunked prefill +
 // single-token decode) -> final_norm -> lm_head), against the real 4-layer test container
 // (layers 0-2 GDN, layer 3 full attention -- the real model's [linear,linear,linear,full] repeat
@@ -39,7 +39,7 @@ using r4dx::model::Model;
 using r4dx::model::ModelOptions;
 
 namespace {
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
 
 bool AllFinite(const std::vector<float>& v) {
   for (float x : v) {

@@ -708,6 +708,137 @@ $env:HIP_VISIBLE_DEVICES = '1'
   the container needs 17.5 GiB, and freeing space means deleting files this session did not create.
   Move it to `D:\models\r4dx\` when space allows; nothing in the tooling depends on its location.
 
+### Milestone 11 / group size: what the w4a16 group buys (2026-09-22)
+
+The w4a16 group -- how many contiguous `K` share one `(scale, zero)` pair -- is now a build option,
+`R4DX_W4A16_GROUP` (default 128), reaching both the kernel (`-DR4D_GEMM_W4_GROUP`) and the packer
+(`kW4A16Group`) from one CMake cache variable; `docs/build-windows.md` "w4a16 group size" has the
+mechanism and the three layers that stop the two sides drifting apart. The kernel packs 64
+contiguous K per weight block and derives `bpg = group / 64`, so **64 is the only value below 128
+it accepts unmodified** -- nothing under `third_party/libr4d/` was touched for this.
+
+The whole trade is in one identity: a w4a16 weight costs `4 + 32/group` bits (4 nibble bits plus
+one 32-bit `wsz` dword per 16 rows x group), so **4.25 bits at group 128, 4.50 at group 64** -- a
+5.88% bigger weight stream for a finer quantization grid. `wq` does not change at all.
+
+Both containers: all 64 layers, `--layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on
+--quant search --imatrix qwen38-27b.imatrix.npz --kv-calib qwen38-27b.kvcalib-full.json`. The
+group-64 one converted in 280.4 s and was deleted after measuring; the group-128 column is
+`qwen38-27b-v5.r4dx`, the production container, whose w4a16 tensors are byte-identical in `wq` to
+the group-64 one (same 12,980,060,160 bytes) and differ only in `wsz`. Both were measured in the
+same session, HIP device 1, nothing else on the GPU.
+
+| | group 128 (`v5`) | group 64 | delta |
+|---|---:|---:|---|
+| bits / weight | 4.2500 | 4.5000 | +5.88% |
+| `w4a16.wq` bytes | 12,980,060,160 | 12,980,060,160 | 0 |
+| `w4a16.wsz` bytes | 811,253,760 | 1,622,507,520 | x2 (+0.755 GiB) |
+| w4a16 weights on disk | 12.845 GiB | 13.600 GiB | +0.755 GiB |
+| `weights` in the VRAM breakdown | 15.5076 GiB | 16.2190 GiB | +0.711 GiB |
+| mean KL vs bf16 | 0.05342 | **0.04214** | **-21.1%** |
+| top-1 agreement | 89.30% | **90.71%** | **+1.41 pt** |
+| top-5 containment | 99.61% | 99.73% | +0.12 pt |
+| positions with KL > 1 | 4 | 2 | -2 |
+| plain decode tok/s | 38.69, 38.66 | 36.39, 36.44 | **-5.8%** |
+| `--mtp 3` tok/s (accept, tok/round) | 71.45, 71.24 (48.4%, 2.42) | 65.19, 65.20 (47.5%, 2.33) | -8.7% |
+| `--dflash` k=7 tok/s (accept, tok/round) | 76.34, 76.62 (24.5%, 2.68) | 74.38, 74.68 (25.3%, 2.74) | -2.5% |
+
+`tool_teacher_forced_logprobs` + `kl_report.py` against `tools/reference/kl_out/ref`, full 4-segment
+corpus, 4092 rows (`kl_m11-v5-g128.json`, `kl_m11-g64.json` -- the group-128 run reproduces the
+Milestone 10 headline 0.05342 / 89.30% to the last digit, which is the cross-check that the two
+columns are the same measurement). Speed: `docs/perf.md`'s standard haiku prompt, `--layout w4a16
+--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048 --stats`, every cell twice
+(the pairs agree to <=0.3%); both models stop at EOS (75-85 tokens) well before 256.
+
+Per segment, group 64:
+
+| segment | rows | mean KL | median KL | p99 KL | max KL | top-1 | top-5 | ppl ref | ppl test | KL>1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cpp_source | 1023 | 0.02901 | 0.00820 | 0.22107 | 0.39695 | 93.35% | 99.80% | 3.805 | 3.906 | 0 |
+| english_prose | 1023 | 0.03186 | 0.01769 | 0.19746 | 0.30259 | 91.79% | 100.00% | 3.755 | 3.906 | 0 |
+| python_source | 1023 | 0.03072 | 0.01465 | 0.21283 | 0.44035 | 93.74% | 99.90% | 4.605 | 4.749 | 0 |
+| thai_prose | 1023 | 0.07698 | 0.05085 | 0.37236 | 2.18982 | 83.97% | 99.22% | 15.610 | 16.460 | 2 |
+| **ALL** | 4092 | **0.04214** | 0.02241 | 0.28581 | 2.18982 | **90.71%** | 99.73% | 5.661 | 5.876 | 2 |
+
+Every segment improves, and the two hardest ones improve most in the places that matter: `cpp_source`
+loses its only KL>1 position outright and `thai_prose`'s p99 drops 33% (0.552 -> 0.372) even though
+its single worst position gets slightly worse (2.012 -> 2.190). Group 64 is not a different kind of
+fix from the imatrix -- it is the same fix applied twice as often.
+
+#### What decode pays
+
+**Plain decode is bandwidth, and this is what bandwidth looks like: +5.88% bytes, -5.8% tok/s.**
+38.69 -> 36.42 tok/s is the weight stream and nothing else -- same kernel, same launch geometry,
+same activation path; `wq` is bit-identical and only `wsz` doubled. The two speculative modes are
+not a second independent measurement of the same thing: `--mtp 3` loses more (-8.7%) because its
+verify step re-reads the same larger weights *and* its own draft head got slightly less accurate in
+this run (48.4% -> 47.5% acceptance), while `--dflash` loses least (-2.5%) because most of its wall
+time is the separate, small drafter -- whose own acceptance actually rises (24.5% -> 25.3%, 2.68 ->
+2.74 tok/round) since a group-64 drafter had to be converted too.
+
+That last point is a cost in its own right: **the group is a property of the whole fleet, not of one
+container.** A group-64 build refuses every group-128 container at `Container::Load`, drafters
+included, so switching means re-converting the production container, the DFlash2 drafter and the
+fixed test containers together. Both directions of that refusal were exercised by hand (a group-64
+`r4dx-cli` on `v5`, and the default build on the group-64 container) and both print the group the
+container carries, the group the kernel reads, and the `-DR4DX_W4A16_GROUP=` to fix it.
+
+#### Gates
+
+- `ctest --preset win-hip` (group 128, the default): **64/64 passed**, 783.40 s, 1 skipped
+  (`test_kernel_bandwidth`, as always). Re-run at the end of the milestone it is 62 passed / 2
+  **Not Run** / 1 skipped, 584.72 s: `reference_manifest` and `reference_dflash2` launch the
+  reference venv's `python.exe`, and that venv was deleted from the machine partway through this
+  session by something outside this work (`Could not find executable
+  .../.venv-rocm10/Scripts/python.exe`). Nothing in those two tests is touched by this milestone
+  and both passed on this exact tree earlier in the session, in the 64/64 run above.
+- `ctest --preset win-hip-g64`: the same suite, **62 passed / 2 Not Run** (the same two venv tests)
+  **/ 2 skipped** (`test_kernel_bandwidth`, plus `test_dflash_e2e` -- see "Not done"), 424.53 s,
+  with `R4DX_TEST_CONTAINER_DIR` pointed at group-64 copies of the fixed test containers
+  (`tests/model/test_container_path.h` -- without the override a non-default-group build cannot run
+  these tests at all, because it correctly refuses the group-128 originals). Every w4a16 test that
+  runs on the default build runs here too, at group 64: `test_gdn_layer`, `test_final_lm_head`,
+  `test_forward_smoke`, `test_mtp`, `test_attn_layer`, `test_teacher_forced_logprobs`,
+  `test_dflash_*`.
+- `test_attn_layer` is worth singling out, because it failed first and the failure was real:
+  it reads the container through a raw `SafetensorsReader`, **not** `Container::Load`, so it gets no
+  group check -- and its `-D`-supplied container path was overriding the in-file default, so the
+  group-64 binary was reading group-128 `wsz` bytes. The w4a16 pass reported
+  `prefill norm rel err=-nan(ind)`. That is the guard's whole thesis, demonstrated by accident: the
+  three paths that DO go through `Container::Load` refused the same container with a clear message,
+  and the one path that bypassed it produced garbage. Fixed by routing that macro through
+  `ContainerPath` as well.
+- `tests/convert` is group-agnostic on **both** builds: every int4 quantizer, packer, search and
+  kernel-literal decode runs at 64 *and* 128 whatever `R4DX_W4A16_GROUP` the build is, against
+  `tests/convert/fixtures/*_g64.bin` (the group-128 fixtures keep their historical unsuffixed names
+  and are byte-unchanged).
+- `tools/convert_ref/selftest_compare.py` (rung 1, end to end through the real CLI) passes against
+  both exes and reads the group out of the container the exe just wrote: `w4a16=128 w4a8=128` for
+  the default build, `w4a16=64 w4a8=128` for the group-64 build -- which is also the check that
+  splitting `kInt4Group` into `kW4A16Group`/`kW4A8Group` actually took effect.
+
+#### One assertion had to be corrected
+
+`tests/convert/test_quant_search.cpp` property (ii) asserted that the *unweighted* search beats RTN
+under the *imatrix-weighted* metric. Nothing guarantees that -- the unweighted search does not
+optimize that objective -- and it held at group 128 only by a 0.27% margin. Running the same case at
+group 64, where the outlier group is half as wide and the outlier therefore twice as dominant, flips
+it to 0.11% the wrong way. The assertion now compares the unweighted search against RTN under the
+unweighted metric, where the guarantee **is** structural (the RTN grid is candidate 0 and later
+candidates must win strictly); the weighted numbers are still printed for comparison. The three
+claims the case actually exists to make -- imatrix beats RTN, by a wide margin, and beats the
+unweighted search -- were unchanged and pass at both groups.
+
+#### Not done
+
+- Only the w4a16 group was made configurable. w4a8's group stays pinned at 128 and mxfp4's at 32;
+  splitting the shared `kInt4Group` constant was what made w4a16's independent, so doing the same
+  for w4a8 is now a one-line change plus a second cache variable, if a reason ever appears.
+- `test_dflash_e2e` was not run on the group-64 build: it reads `qwen38-27b-v3.r4dx`, a 42 GiB
+  production container, and a group-64 copy of it is not worth 42 GiB of disk for one test.
+- Group 32 (4.0 + 1.0 = 5.0 bits/weight) was not measured: the kernel's `bpg = group / 64` makes it
+  a libr4d change, which this milestone excluded.
+
 ## Rung 5 -- generation sanity
 
 Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass

@@ -1,4 +1,4 @@
-// tests/model/attention/test_mrope_attn_layer.cpp -- one real full-attention decoder layer driven
+﻿// tests/model/attention/test_mrope_attn_layer.cpp -- one real full-attention decoder layer driven
 // by 3-AXIS mrope position ids, against tools/reference/mrope_layer_golden.py's capture of the
 // SAME layer with the SAME real weights (docs/vision.md "Text-side splicing").
 //
@@ -44,6 +44,12 @@
 #ifndef R4DX_BF16_CONTAINER_PATH
 #define R4DX_BF16_CONTAINER_PATH "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
 #endif
+
+// The container path arrives as a string literal (this file's #ifndef default, or the -D in
+// tests/model/attention/CMakeLists.txt, which wins). Route it through r4dx_test::ContainerPath so
+// R4DX_TEST_CONTAINER_DIR can redirect it -- see tests/model/test_container_path.h for why a build
+// with a non-default R4DX_W4A16_GROUP needs that.
+const char* const kBf16ContainerPath = r4dx_test::ContainerPath(R4DX_BF16_CONTAINER_PATH);
 
 using namespace r4dx::core;
 using r4dx::model::Layout;
@@ -122,7 +128,7 @@ double NormRelErr(const std::vector<uint16_t>& got, const std::vector<uint16_t>&
 int Run() {
   R4DX_HIP_CHECK(hipSetDevice(0));
   SafetensorsReader golden(Utf8ToWide(R4DX_GOLDEN_MROPE_PATH));
-  SafetensorsReader container(Utf8ToWide(R4DX_BF16_CONTAINER_PATH));
+  SafetensorsReader container(Utf8ToWide(kBf16ContainerPath));
 
   AttnConfig cfg;  // defaults match Qwen3.8-27B's text_config, incl. mrope_section [11,11,10]
   const int hidden = cfg.hidden, H = cfg.num_heads, Hkv = cfg.kv_heads, D = cfg.head_dim;
@@ -321,8 +327,8 @@ int main() {
   if (!r4dx_test::FileExists(R4DX_GOLDEN_MROPE_PATH)) {
     return r4dx_test::SkipMissing(R4DX_GOLDEN_MROPE_PATH);
   }
-  if (!r4dx_test::FileExists(R4DX_BF16_CONTAINER_PATH)) {
-    return r4dx_test::SkipMissing(R4DX_BF16_CONTAINER_PATH);
+  if (!r4dx_test::FileExists(kBf16ContainerPath)) {
+    return r4dx_test::SkipMissing(kBf16ContainerPath);
   }
   try {
     return Run();

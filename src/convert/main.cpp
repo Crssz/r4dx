@@ -74,7 +74,8 @@
 
 #include "nlohmann/json.hpp"
 #include "r4d.h"  // r4d_gemm_{w4a16,w4a8,mxfp4a8}_nt_m64_group() -- cross-checked against this
-                  // converter's own kInt4Group/kMxfp4Group at startup (ValidateKernelGroupSizes).
+                  // converter's own kW4A16Group/kW4A8Group/kMxfp4Group at startup
+                  // (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
@@ -96,25 +97,28 @@ bool StartsWith(const std::string& s, const std::string& prefix) {
 }
 
 // Review finding (major, quant_int4.hpp): the group sizes this converter packs with
-// (r4dx_convert::kInt4Group, kMxfp4Group) are compile-time constants that must match the group
-// sizes the GPU kernels were actually built with (r4d_gemm_w4a8_nt_m64.hip's R4D_GEMM_W4A8_GROUP
-// default is 256; third_party/CMakeLists.txt:70 overrides it to 128 with a single -D that has no
-// other record anywhere). A silent mismatch here produces a container that GEMMs read at the
-// wrong stride with no error, ever. r4d_core exports the group each kernel was actually compiled
-// with, so assert against it once at startup instead of trusting the -D stayed in sync.
+// (r4dx_convert::kW4A16Group, kW4A8Group, kMxfp4Group) are compile-time constants that must match
+// the group sizes the GPU kernels were actually built with (r4d_gemm_w4a8_nt_m64.hip's
+// R4D_GEMM_W4A8_GROUP default is 256; third_party/CMakeLists.txt overrides it to 128, and w4a16's
+// R4D_GEMM_W4_GROUP is the R4DX_W4A16_GROUP build option). A silent mismatch here produces a
+// container that GEMMs read at the wrong stride with no error, ever. r4d_core exports the group
+// each kernel was actually compiled with, so assert against it once at startup instead of trusting
+// the -D flags stayed in sync. Each layout is checked against ITS OWN kernel export -- w4a16 and
+// w4a8 no longer share a constant, precisely so R4DX_W4A16_GROUP can move on its own.
 void ValidateKernelGroupSizes() {
   auto check = [](const char* label, int expected, int actual) {
     if (actual != expected) {
       throw std::runtime_error(
           std::string("r4dx-convert: group size mismatch for ") + label + ": this converter packs "
           "with group=" + std::to_string(expected) + " but r4d_core's kernel was built with group=" +
-          std::to_string(actual) + " (check third_party/CMakeLists.txt's R4D_EXTRA_* -D flags "
-          "against src/convert/include/r4dx_convert/quant_{int4,mxfp4}.hpp's kInt4Group/"
+          std::to_string(actual) + " (check third_party/CMakeLists.txt's R4D_EXTRA_* -D flags and "
+          "the R4DX_W4A16_GROUP cache variable against "
+          "src/convert/include/r4dx_convert/quant_{int4,mxfp4}.hpp's kW4A16Group/kW4A8Group/"
           "kMxfp4Group)");
     }
   };
-  check("w4a16", r4dx_convert::kInt4Group, r4d_gemm_w4a16_nt_m64_group());
-  check("w4a8", r4dx_convert::kInt4Group, r4d_gemm_w4a8_nt_m64_group());
+  check("w4a16", r4dx_convert::kW4A16Group, r4d_gemm_w4a16_nt_m64_group());
+  check("w4a8", r4dx_convert::kW4A8Group, r4d_gemm_w4a8_nt_m64_group());
   check("mxfp4", r4dx_convert::kMxfp4Group, r4d_gemm_mxfp4a8_nt_m64_group());
 }
 
@@ -125,12 +129,12 @@ void ValidateKernelGroupSizes() {
 nlohmann::json BuildQuantMetadata() {
   return {
       {"w4a16",
-       {{"group", r4dx_convert::kInt4Group},
+       {{"group", r4dx_convert::kW4A16Group},
         {"zero_mode", "free_0_15"},
         {"nibble_encoding", "offset_binary_xor8"},
         {"fragment_permutation", "wmma16x16x16_lane16_koff_0_8_1_9_2_10_3_11"}}},
       {"w4a8",
-       {{"group", r4dx_convert::kInt4Group},
+       {{"group", r4dx_convert::kW4A8Group},
         {"zero_mode", "pinned_8"},
         {"nibble_encoding", "offset_binary_xor8"},
         {"fragment_permutation", "wmma16x16x16_lane16_koff_0_8_1_9_2_10_3_11"}}},

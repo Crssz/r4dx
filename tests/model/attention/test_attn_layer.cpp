@@ -1,4 +1,4 @@
-// tests/model/attention/test_attn_layer.cpp -- r4dx::model::attention::AttentionLayer against
+﻿// tests/model/attention/test_attn_layer.cpp -- r4dx::model::attention::AttentionLayer against
 // tools/reference/layer_golden.py's layer 3 (full-attention) golden: real Qwen3.8-27B weights
 // (D:\models\r4dx\qwen38-27b-l4-bf16.r4dx, bf16 layout, layers 0-3) and real transformers
 // activations (tools/reference/golden_out/layer_003_full_attention.safetensors). Runs a T=64
@@ -43,6 +43,15 @@
 #ifndef R4DX_BF16_CONTAINER_PATH
 #define R4DX_BF16_CONTAINER_PATH "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
 #endif
+
+// The container path arrives as a string literal (this file's #ifndef default, or the -D in
+// tests/model/attention/CMakeLists.txt, which wins). Route it through r4dx_test::ContainerPath so
+// R4DX_TEST_CONTAINER_DIR can redirect it -- see tests/model/test_container_path.h for why a build
+// with a non-default R4DX_W4A16_GROUP needs that. NOTE: this test reads the container through a
+// raw SafetensorsReader, not Container::Load, so it gets NO group check -- point it at a
+// mismatched container and the w4a16 pass silently produces NaN, which is exactly the failure mode
+// the loader guard exists to prevent.
+const char* const kBf16ContainerPath = r4dx_test::ContainerPath(R4DX_BF16_CONTAINER_PATH);
 
 using namespace r4dx::core;
 using r4dx::model::Layout;
@@ -173,7 +182,7 @@ void ReportQuantizedLayouts(const SafetensorsReader& container) {
   std::printf("quantized layouts present in %s (informational; the quantized layouts below are "
               "now actually dispatched through AttentionLayer/ApplyLinear and rel-err REPORTED, "
               "not just gated bf16-tight -- see main()'s quantized pass):\n",
-              R4DX_BF16_CONTAINER_PATH);
+              kBf16ContainerPath);
   for (const char* base : bases) {
     for (const char* layout : layouts) {
       const std::string name = std::string(base) + "." + layout;
@@ -269,7 +278,7 @@ bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfi
                                     static_cast<int64_t>(H) * D);
     if (!qg_ql || !o_ql) {
       std::printf("quantized layout %s: SKIPPED (tensors not present in %s)\n", LayoutName(layout),
-                  R4DX_BF16_CONTAINER_PATH);
+                  kBf16ContainerPath);
       continue;
     }
     // k/v (R1, docs/r9700.md): optional -- a container converted before this pass carries qg/o in
@@ -330,7 +339,7 @@ int Run() {
   R4DX_HIP_CHECK(hipSetDevice(0));
 
   SafetensorsReader golden(Utf8ToWide(R4DX_GOLDEN_ATTN_PATH));
-  SafetensorsReader container(Utf8ToWide(R4DX_BF16_CONTAINER_PATH));
+  SafetensorsReader container(Utf8ToWide(kBf16ContainerPath));
 
   ReportQuantizedLayouts(container);
 
@@ -483,8 +492,8 @@ int main() {
   // test_final_lm_head.cpp): both inputs are real, non-vendored data (docs/validation.md), so a
   // machine without them must SKIP (exit 77, tests/model/attention/CMakeLists.txt's
   // SKIP_RETURN_CODE), never crash. Checked before any HIP call so the skip path touches no GPU.
-  if (!r4dx_test::FileExists(R4DX_BF16_CONTAINER_PATH)) {
-    return r4dx_test::SkipMissing(R4DX_BF16_CONTAINER_PATH);
+  if (!r4dx_test::FileExists(kBf16ContainerPath)) {
+    return r4dx_test::SkipMissing(kBf16ContainerPath);
   }
   if (!r4dx_test::FileExists(R4DX_GOLDEN_ATTN_PATH)) {
     return r4dx_test::SkipMissing(R4DX_GOLDEN_ATTN_PATH);

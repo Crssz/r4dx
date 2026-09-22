@@ -56,7 +56,8 @@ def main() -> None:
     out_dir = pathlib.Path(__file__).resolve().parents[2] / "tests" / "convert" / "fixtures"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    N, K = 32, 256  # N multiple of 16 (2 row-tiles), K multiple of 128 and 32 (int4 + mxfp4 groups)
+    N, K = 32, 256  # N multiple of 16 (2 row-tiles); K multiple of 128, 64 and 32 (both int4
+                    # groups + the mxfp4 group)
     rng = np.random.default_rng(1234)
     raw = rng.normal(0.0, 1.0, size=(N, K)).astype(np.float32)
     bf16_u16 = float_to_bf16_u16(raw).reshape(N, K)
@@ -64,16 +65,30 @@ def main() -> None:
 
     write_bf16_safetensors(str(out_dir / "input.safetensors"), "w", bf16_u16, (N, K))
 
-    manifest = {"N": N, "K": K, "int4_group": w4_ref.GROUP, "mxfp4_group": mxfp4_ref.GROUP}
+    # The int4 fixtures exist at every group r4d_gemm_w4a16_nt_m64 can be built with
+    # (R4DX_W4A16_GROUP: a multiple of the kernel's 64-wide packed block, so 64 and 128 are the
+    # whole set). The 128 set keeps its historical unsuffixed filenames -- it is the ground truth
+    # every earlier milestone was gated against and its bytes must not move -- and each other group
+    # g gets a "_g{g}" suffix. Only the w4* blobs are group-dependent; mxfp4's group is its own
+    # constant and is written once.
+    int4_groups = [128, 64]
+    manifest = {"N": N, "K": K, "int4_group": w4_ref.GROUP, "int4_groups": int4_groups,
+                "mxfp4_group": mxfp4_ref.GROUP}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
-    q16, sc16, z16 = w4_ref.quantize_asymmetric(w)
-    w4_ref.pack_nibbles(q16, N, K).tofile(str(out_dir / "w4a16_wq.bin"))
-    w4_ref.pack_w4a16_scales(sc16, z16, N, K).tofile(str(out_dir / "w4a16_wsz.bin"))
+    def gsfx(group: int) -> str:
+        return "" if group == w4_ref.GROUP else f"_g{group}"
 
-    q8, sc8 = w4_ref.quantize_symmetric_pinned8(w)
-    w4_ref.pack_nibbles(q8, N, K).tofile(str(out_dir / "w4a8_wq.bin"))
-    w4_ref.pack_w4a8_scales(sc8, N, K).tofile(str(out_dir / "w4a8_ws.bin"))
+    for group in int4_groups:
+        g = gsfx(group)
+        q16, sc16, z16 = w4_ref.quantize_asymmetric(w, group=group)
+        w4_ref.pack_nibbles(q16, N, K).tofile(str(out_dir / f"w4a16_wq{g}.bin"))
+        w4_ref.pack_w4a16_scales(sc16, z16, N, K, group=group).tofile(
+            str(out_dir / f"w4a16_wsz{g}.bin"))
+
+        q8, sc8 = w4_ref.quantize_symmetric_pinned8(w, group=group)
+        w4_ref.pack_nibbles(q8, N, K).tofile(str(out_dir / f"w4a8_wq{g}.bin"))
+        w4_ref.pack_w4a8_scales(sc8, N, K, group=group).tofile(str(out_dir / f"w4a8_ws{g}.bin"))
 
     packed, escale, wref = mxfp4_ref.quantize(w)
     mxfp4_ref.permute_wq(packed, N, K).tofile(str(out_dir / "mxfp4_wq.bin"))
@@ -88,14 +103,18 @@ def main() -> None:
     imat.tofile(str(out_dir / "search_imatrix.bin"))
 
     for suffix, im in (("", None), ("_imat", imat)):
-        q16s, sc16s, z16s = w4_ref.quantize_asymmetric_search(w, imatrix=im)
-        w4_ref.pack_nibbles(q16s, N, K).tofile(str(out_dir / f"search{suffix}_w4a16_wq.bin"))
-        w4_ref.pack_w4a16_scales(sc16s, z16s, N, K).tofile(
-            str(out_dir / f"search{suffix}_w4a16_wsz.bin"))
+        for group in int4_groups:
+            g = gsfx(group)
+            q16s, sc16s, z16s = w4_ref.quantize_asymmetric_search(w, group=group, imatrix=im)
+            w4_ref.pack_nibbles(q16s, N, K).tofile(
+                str(out_dir / f"search{suffix}_w4a16_wq{g}.bin"))
+            w4_ref.pack_w4a16_scales(sc16s, z16s, N, K, group=group).tofile(
+                str(out_dir / f"search{suffix}_w4a16_wsz{g}.bin"))
 
-        q8s, sc8s = w4_ref.quantize_symmetric_pinned8_search(w, imatrix=im)
-        w4_ref.pack_nibbles(q8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_wq.bin"))
-        w4_ref.pack_w4a8_scales(sc8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_ws.bin"))
+            q8s, sc8s = w4_ref.quantize_symmetric_pinned8_search(w, group=group, imatrix=im)
+            w4_ref.pack_nibbles(q8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_wq{g}.bin"))
+            w4_ref.pack_w4a8_scales(sc8s, N, K, group=group).tofile(
+                str(out_dir / f"search{suffix}_w4a8_ws{g}.bin"))
 
         ps, es, wr = mxfp4_ref.quantize_search(w, imatrix=im)
         mxfp4_ref.permute_wq(ps, N, K).tofile(str(out_dir / f"search{suffix}_mxfp4_wq.bin"))

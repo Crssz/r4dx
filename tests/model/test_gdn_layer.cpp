@@ -1,4 +1,4 @@
-// tests/model/test_gdn_layer.cpp -- GdnLayer + Mlp (layer 0, a GDN layer) against
+﻿// tests/model/test_gdn_layer.cpp -- GdnLayer + Mlp (layer 0, a GDN layer) against
 // tools/reference/golden_out/layer_000_gdn.safetensors (tools/reference/layer_golden.py):
 // prefill T=64, then a decode step of T=4 candidate tokens continuing the prefill's carried
 // recurrent/conv state, comparing the FULL decoder-block output (GDN block's residual add -> MLP
@@ -55,7 +55,7 @@ using r4dx::model::LayoutName;
 using r4dx::model::Mlp;
 
 namespace {
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
 // R4DX_SOURCE_DIR is defined by tests/CMakeLists.txt from ${CMAKE_SOURCE_DIR}.
 const char* kGoldenPath = R4DX_SOURCE_DIR "/tools/reference/golden_out/layer_000_gdn.safetensors";
 

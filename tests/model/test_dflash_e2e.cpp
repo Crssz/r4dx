@@ -1,4 +1,4 @@
-// tests/model/test_dflash_e2e.cpp -- real end-to-end regression test for DFlash2's own
+﻿// tests/model/test_dflash_e2e.cpp -- real end-to-end regression test for DFlash2's own
 // "mid-round-stop" bookkeeping (docs/dflash2.md, Milestone 5 stage S3 item 3): a --dflash variant
 // of tests/model/test_mtp.cpp::CheckChatMultiTurnMidRoundStop, same technique, same contract.
 //
@@ -40,8 +40,8 @@ namespace {
 
 // Real 64-layer container + real w4a16 DFlash2 draft container (docs/status.md's own paths for
 // every other real-hardware perf/e2e pass in this project).
-const char* kTargetContainerPath = "D:/models/r4dx/qwen38-27b-v3.r4dx";
-const char* kDflashContainerPath = "D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx";
+const char* kTargetContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-v3.r4dx");
+const char* kDflashContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx");
 constexpr int64_t kDflashK = 7;
 
 int32_t Argmax(const std::vector<float>& logits) {

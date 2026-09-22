@@ -1,4 +1,4 @@
-// tests/model/tool_hseed_drift.cpp -- one-off diagnostic (NOT a ctest test -- built by
+﻿// tests/model/tool_hseed_drift.cpp -- one-off diagnostic (NOT a ctest test -- built by
 // tests/model/CMakeLists.txt but never registered via add_test) for docs/mtp.md's "Acceptance gap
 // investigation" step 1: "a golden-referenced, per-layout comparison of h_seed itself -- the main
 // model's pre-final-norm hidden state that the draft head consumes."
@@ -48,7 +48,7 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
 
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   double dot = 0, na = 0, nb = 0;

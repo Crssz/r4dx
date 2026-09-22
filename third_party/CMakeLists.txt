@@ -48,7 +48,9 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
 endif()
 
 # unit -> extra per-unit flags, mirroring libr4d/build_windows.ps1's $UNITS table, restricted to
-# the 15 units r4dx links (r4d_module.hip and every r4d_ar_* unit are excluded on purpose).
+# the 15 units r4dx links (r4d_module.hip and every r4d_ar_* unit are excluded on purpose). One
+# deliberate deviation from that table: r4d_gemm_w4a16_nt_m64's group is an r4dx build option (see
+# below) rather than the kernel's own 128 default.
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_vit_h72_bf16
@@ -68,6 +70,11 @@ set(R4D_UNITS
 )
 set(R4D_EXTRA_r4d_gdn_chunk_scan_k128_v128_c64_bf16 -mcumode)
 set(R4D_EXTRA_r4d_gemm_w4a8_nt_m64 -DR4D_GEMM_W4A8_GROUP=128)
+# w4a16's group is the R4DX_W4A16_GROUP build option (root CMakeLists.txt, which also validates
+# it). The SAME number reaches r4dx_convert's kW4A16Group through src/convert/CMakeLists.txt; the
+# converter asserts this kernel's _group() export against it at startup, and Container::Load
+# asserts it against every container's own __metadata__.quant.w4a16.group.
+set(R4D_EXTRA_r4d_gemm_w4a16_nt_m64 -DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP})
 
 set(R4D_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/r4d_objs")
 file(MAKE_DIRECTORY "${R4D_OBJ_DIR}")

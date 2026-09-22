@@ -21,6 +21,16 @@
         "HIP_PATH": "C:/opt/rocm",
         "ROCM_PATH": "C:/opt/rocm"
       }
+    },
+    {
+      "name": "win-hip-g64",
+      "inherits": "win-hip",
+      "displayName": "Windows / HIP gfx1201, w4a16 group 64",
+      "description": "Same as win-hip but packs and reads w4a16 at group 64 (4.5 bits/weight instead of 4.25). Its OWN build dir on purpose: a group-64 container is only loadable by group-64 binaries, so the two must never overwrite each other. docs/validation.md 'Milestone 11 / group size' has the measurements.",
+      "binaryDir": "${sourceDir}/build/win-hip-g64",
+      "cacheVariables": {
+        "R4DX_W4A16_GROUP": "64"
+      }
     }
   ],
   "buildPresets": [
@@ -28,12 +38,26 @@
       "name": "win-hip",
       "configurePreset": "win-hip",
       "configuration": "Release"
+    },
+    {
+      "name": "win-hip-g64",
+      "configurePreset": "win-hip-g64",
+      "configuration": "Release"
     }
   ],
   "testPresets": [
     {
       "name": "win-hip",
       "configurePreset": "win-hip",
+      "configuration": "Release",
+      "environment": {
+        "HIP_VISIBLE_DEVICES": "1"
+      },
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "win-hip-g64",
+      "configurePreset": "win-hip-g64",
       "configuration": "Release",
       "environment": {
         "HIP_VISIBLE_DEVICES": "1"

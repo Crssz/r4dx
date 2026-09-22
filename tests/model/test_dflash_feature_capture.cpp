@@ -1,4 +1,4 @@
-// tests/model/test_dflash_feature_capture.cpp -- Milestone 5 B1 item 1 (docs/dflash2.md
+﻿// tests/model/test_dflash_feature_capture.cpp -- Milestone 5 B1 item 1 (docs/dflash2.md
 // "Implementation"): Model::AttachDflashFeatureCapture/DflashFeatureBuffer.
 //
 // Two things this test gates, against the real 4-layer test container (same convention as
@@ -54,11 +54,11 @@ using r4dx::model::Model;
 using r4dx::model::ModelOptions;
 
 namespace {
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
 // Same 4-layer MTP-enabled container test_mtp.cpp uses (converted `--layers 4 --mtp on --layouts
 // bf16,w4a16,w4a8,mxfp4`) -- separately SKIPped below if absent so a machine missing it still runs
 // every other check in this file.
-const char* kMtpContainerPath = "D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx";
+const char* kMtpContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int64_t kDraftK = 3;
 
 std::vector<int32_t> MakePromptTokens(int n) {

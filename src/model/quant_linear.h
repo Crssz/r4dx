@@ -7,8 +7,10 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 
+#include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group() -- see CheckW4a16Group below
 #include "r4dx/core/device_buffer.hpp"
 
 namespace r4dx::model {
@@ -17,6 +19,29 @@ enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8 };
 
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
+
+// The w4a16 group size (K per (scale, zero) pair) is a BUILD OPTION -- R4DX_W4A16_GROUP, which
+// reaches r4d_gemm_w4a16_nt_m64 as -DR4D_GEMM_W4_GROUP and r4dx-convert as kW4A16Group (root
+// CMakeLists.txt has the full story). The kernel derives the .w4a16.wsz stride from the group it
+// was COMPILED with; a container carries the group it was PACKED with in
+// __metadata__.quant.w4a16.group. If the two disagree every w4a16 GEMM silently reads scales for
+// the wrong K range -- no crash, no NaN, just wrong numbers -- so every container loader calls
+// this before touching a byte and it throws naming BOTH numbers. `what` identifies the container
+// in the message. Takes the already-extracted int rather than the JSON so this header stays free
+// of nlohmann/json (r4dx_model_attention links this target too), and is inline rather than a
+// quant_linear.cpp symbol so a header-only container reader (dflash_draft_weights.h) can call it
+// from a target that links r4d_core but not r4dx_model_linear.
+inline void CheckW4a16Group(int container_group, const std::string& what) {
+  const int kernel_group = r4d_gemm_w4a16_nt_m64_group();
+  if (container_group == kernel_group) return;
+  throw std::runtime_error(
+      "r4dx::model: " + what + " was packed with w4a16 group=" + std::to_string(container_group) +
+      " but this build's r4d_gemm_w4a16_nt_m64 kernel reads group=" +
+      std::to_string(kernel_group) +
+      " -- the .w4a16.wsz scales would be read at the wrong stride, producing wrong numbers with "
+      "no other symptom. Reconfigure with -DR4DX_W4A16_GROUP=" + std::to_string(container_group) +
+      " in its own build directory, or re-convert the container with this build's r4dx-convert.");
+}
 
 // One linear weight W[N,K], uploaded in exactly one of the four on-disk layouts
 // (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
@@ -34,9 +59,12 @@ struct QuantLinear {
   // quantizes w4a16 and w4a8 separately -- see its file comment) -- each QuantLinear holds only
   // the one layout it was loaded as.
   core::DeviceBuffer<uint8_t> wq;
-  // layout == kW4a16: uint32[N*K/128], low16 = f16 scale, high16 = f16(-(1024+zero)).
+  // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is the
+  // w4a16 group this build was configured with (R4DX_W4A16_GROUP, default 128) -- see
+  // CheckW4a16Group below, which is what guarantees the container agrees with the kernel.
   core::DeviceBuffer<uint32_t> w4a16_wsz;
-  // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused).
+  // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused). w4a8's group is fixed at
+  // 128 by third_party/CMakeLists.txt and is NOT tied to w4a16's.
   core::DeviceBuffer<uint32_t> w4a8_ws;
 
   // layout == kMxfp4: OCP MXFP4 weight.

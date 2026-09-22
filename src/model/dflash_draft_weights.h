@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "quant_linear.h"  // CheckW4a16Group -- the draft's linears carry the same .w4a16.* family
 #include "r4dx_convert/safetensors_reader.hpp"
 
 namespace r4dx::model {
@@ -73,6 +74,13 @@ class DflashDraftWeights {
         w.metadata_.at("container_kind").get<std::string>() != "dflash2_draft") {
       throw std::runtime_error("DflashDraftWeights::Open: '" + path +
                                 "' is not a dflash2_draft container (missing/wrong container_kind)");
+    }
+    // Same group guard the main container gets (Container::Load -> CheckW4a16Group): a drafter
+    // packed at a different w4a16 group than this build's kernel reads would produce silently
+    // wrong draft logits, i.e. a collapsed acceptance rate with nothing else to see.
+    if (w.metadata_.contains("quant") && w.metadata_.at("quant").contains("w4a16") &&
+        w.metadata_.at("quant").at("w4a16").contains("group")) {
+      CheckW4a16Group(w.metadata_.at("quant").at("w4a16").at("group").get<int>(), path);
     }
     w.reader_ = std::make_unique<r4dx_convert::SafetensorsReader>(r4dx_convert::Utf8ToWide(path));
     w.config_ = ParseConfig(w.metadata_.at("dflash2"));

@@ -1,4 +1,4 @@
-// tests/model/test_teacher_forced_logprobs.cpp -- the automatic regression for the Rung 4 dump
+﻿// tests/model/test_teacher_forced_logprobs.cpp -- the automatic regression for the Rung 4 dump
 // pass (tests/model/teacher_forced.h, driven by tool_teacher_forced_logprobs on the real
 // container). Runs the 4-layer self-consistency check that the tool's own `--check-greedy` runs,
 // so the pass's two invariants are enforced by ctest on every build instead of only by whoever
@@ -44,7 +44,7 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-l4-mtp.r4dx";
+const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-mtp.r4dx");
 constexpr int64_t kLayers = 4;      // the container is a --layers 4 truncation; its config.json
                                      // still declares the full 64 (see test_forward_smoke.cpp)
 constexpr int64_t kGeneratedTokens = 64;

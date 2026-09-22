@@ -39,6 +39,22 @@ nlohmann::json ReadMetadata(const std::string& path) {
   return header.at("__metadata__");
 }
 
+// Refuses a container whose w4a16 group disagrees with the group this build's
+// r4d_gemm_w4a16_nt_m64 was compiled with -- see CheckW4a16Group's comment in quant_linear.h for
+// why a mismatch is silent-wrong-numbers rather than a crash.
+//
+// A container written before the group was recorded has no `quant` block at all; those are group
+// 128 by construction (it was the only group that ever existed) and load unchanged on a group-128
+// build, so nothing that loads today stops loading. Containers that DO carry the block are checked
+// whatever `--layout` asks for: a group-mismatched container has no safe use on this build, and
+// failing at Load with a precise message beats failing later, partially, or not at all.
+void CheckQuantGroups(const nlohmann::json& metadata, const std::string& path) {
+  if (!metadata.contains("quant")) return;
+  const nlohmann::json& quant = metadata.at("quant");
+  if (!quant.contains("w4a16") || !quant.at("w4a16").contains("group")) return;
+  CheckW4a16Group(quant.at("w4a16").at("group").get<int>(), path);
+}
+
 using r4dx_convert::SafetensorsReader;
 using r4dx_convert::Utf8ToWide;
 
@@ -205,6 +221,7 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
+  CheckQuantGroups(metadata, path);
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");

@@ -60,7 +60,9 @@
 // NOTE: deliberately NOT including tests/model/test_common.h. Both it and tests/kernels/
 // npy_fixture.hpp define `r4dx_test::kSkipReturnCode`, so including both in one TU is a
 // redefinition error; npy_fixture.hpp is the one this test genuinely needs (the .npy reader), and
-// the three helpers test_common.h would have provided are four lines each, below.
+// the three helpers test_common.h would have provided are four lines each, below. (Its
+// R4DX_TEST_CONTAINER_DIR override lives in its own header for exactly this reason.)
+#include "test_container_path.h"
 
 using r4dx::core::Arena;
 using r4dx::core::Bf16ToFloat;
@@ -79,8 +81,8 @@ using r4dx::model::QuantLinear;
 
 namespace {
 
-const char* kDraftBf16 = "D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx";
-const char* kDraftW4a16 = "D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx";
+const char* kDraftBf16 = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx");
+const char* kDraftW4a16 = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx");
 
 int g_failures = 0;
 

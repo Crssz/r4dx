@@ -127,16 +127,26 @@ Every `{layout}` variant of a linear `W [N, K]` (`N` = out features, `K` = in fe
 **`bf16`**: `<name>.bf16.w` -- `[N, K]` uint8 pairs (no permutation, row-major, K-contiguous).
 
 **`w4a16`** (`r4d_gemm_w4a16_nt_m64`, f16 activation): asymmetric per-output-channel,
-per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
+per-group-of-`g`-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`. `g` is a **build
+option** -- `R4DX_W4A16_GROUP`, default 128, see docs/build-windows.md "w4a16 group size" -- and
+the value a container was packed with is recorded in `__metadata__.quant.w4a16.group` and checked
+against the kernel's own `r4d_gemm_w4a16_nt_m64_group()` at load. Everything below says 128 where
+it means `g`; at `g = 64` every `/ 128` becomes `/ 64` and the weight costs 4.5 bits instead of
+4.25 (`4 + 32/g`). `w4a8`'s group is a separate, fixed 128 and does **not** follow it.
   - `<name>.w4a16.wq` -- `uint8[N * K / 2]`, **pre-permuted into the WMMA fragment order** so a
     wave's 32 lanes read 512 contiguous bytes for a (n-tile, k-step): lane `l`'s dword holds
     element `e` of `W[n0 + (l&15)][16*ks + 8*(e>>2) + 4*(l>>4) + (e&3)]`, dword nibble `2e` (e<4)
     / `2(e-4)+1` (e>=4) (`r4d_gemm_w4a16_nt_m64.hip` "LAYOUT" comment, using the
     `r4d_gdn_wmma.h` fragment map `idx = lane%16, k = 8*(e>>2) + 4*(lane>>4) + (e&3)`).
-  - `<name>.w4a16.wsz` -- `uint32[N * K / 128]`, one dword per `(row, group)`: low 16 bits = f16
+  - `<name>.w4a16.wsz` -- `uint32[N * K / g]`, one dword per `(row, group)`: low 16 bits = f16
     `scale`, high 16 bits = f16 of `-(1024 + zero)` (ready for `v_pk_add_f16` against the
-    `0x6400 | q` widened weight nibble) (`r4d_gemm_w4a16_nt_m64.hip:56-59`, `r4d.h` `r4d_gemm_w4a16_nt_m64_group()` = 128).
-  - Group size: `r4d_gemm_w4a16_nt_m64_group()` (128, `R4D_GEMM_W4_GROUP`).
+    `0x6400 | q` widened weight nibble) (`r4d_gemm_w4a16_nt_m64.hip:56-59`, `r4d.h` `r4d_gemm_w4a16_nt_m64_group()`).
+    `wq` is unaffected by `g` -- only the number of `(scale, zero)` dwords changes.
+  - Group size `g`: `r4d_gemm_w4a16_nt_m64_group()` (`R4D_GEMM_W4_GROUP`, set from the
+    `R4DX_W4A16_GROUP` build option; 128 by default, 64 the only other value the kernel accepts as
+    built). Recorded per container in `__metadata__.quant.w4a16.group`; a container whose group
+    differs from the loading binary's kernel is REFUSED at `Container::Load`
+    (`CheckW4a16Group`) rather than read at the wrong stride.
 
 **`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): the same nibble *permutation* as `w4a16`
   (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), but its own separately
@@ -155,7 +165,10 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
   - Activation-side: `quant_act_i8` (`r4d_quant_act_i8`) produces a per-row int8 activation plus an
     f32 per-row scale at *inference* time, in the A-fragment byte order the kernel expects; nothing
     from this is stored in the container (activations are never static).
-  - Group size: `R4D_GEMM_W4A8_GROUP=128` (the build flag third_party/CMakeLists.txt passes).
+  - Group size: `R4D_GEMM_W4A8_GROUP=128` (the build flag third_party/CMakeLists.txt passes; the
+    kernel's own default is 256). This is NOT the `R4DX_W4A16_GROUP` build option -- w4a8 and
+    w4a16 have independent groups and independent converter constants (`kW4A8Group`,
+    `kW4A16Group`), each asserted against its own kernel export.
 
 **`mxfp4`** (`r4d_gemm_mxfp4a8_nt_m64`, OCP MXFP4 weight + fp8 activation):
   - `<name>.mxfp4.wq` -- `uint8[N * K / 2]` packed e2m1 (two 4-bit floats per byte), permuted by

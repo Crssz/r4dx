@@ -1,5 +1,17 @@
 # Status
 
+## Rung 4 measured, 2026-09-22
+
+Teacher-forced KL(bf16 reference || `w4a16`) on the held-out 4-segment corpus
+(`tools/reference/kl_corpus/`): overall mean KL **0.08794 nats**, top-1 agreement **87.00%**,
+top-5 containment **99.41%**, ppl 5.661 (ref) vs 6.027 (`w4a16`). `thai_prose` alone is
+noticeably worse (mean KL 0.156, top-1 78.2%) than the other three segments (mean KL 0.059-0.068,
+top-1 89-91%); all 10 KL>1 positions are on code punctuation or Thai sub-syllable tokens. Three
+sanity controls (reference-vs-itself = exact 0, a deliberately mispaired file = 16.9 nats, an
+independent from-scratch numpy recomputation matching `kl_report.py` to 3e-16) all pass. Full
+table, per-position detail and interpretation guidance: `docs/validation.md` "Rung 4 measurement:
+w4a16".
+
 ## Milestone 8: vision tower + image input -- done, integrated, measured, committed (2026-09-22, stage 8)
 
 Stage 8 (integrate/measure/document/commit) closed out the review-fix pass below and re-ran every

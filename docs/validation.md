@@ -172,8 +172,7 @@ any single layer's, and a plan for *how much* looser (e.g. `rel_err` growing rou
 needs to be pinned down empirically, not guessed here.
 
 The r4dx half of the **tooling** for that measurement is built (2026-09-22) -- see "Rung 4 tooling"
-below. Nothing in this section claims the rung passes; the tooling exists so the number can be
-measured, and this heading stays open until it has been.
+below. The `w4a16` measurement itself is in "Rung 4 measurement: w4a16" further down.
 
 ### Rung 4 tooling
 
@@ -247,7 +246,7 @@ the automatic test below excludes exactly that one row from its argmax assertion
 torch's own fp32 `log_softmax` uses a blocked/pairwise reduction much closer to the exactly-rounded
 answer -- accumulating in double lands on the same fp32 value the reference does rather than a
 different one for a reason that has nothing to do with the model. The tool always checks its own
-output is a distribution (`max |log sum_j exp(row[j])| < 1e-2`, measured ~5e-7) and exits 1 if not.
+output is a distribution (`max |log sum_j exp(row[j])| < 1e-2`, measured ~1.5e-6) and exits 1 if not.
 
 **Getting the token ids right.** Two producers, both writing the tokens file format above:
 
@@ -287,6 +286,100 @@ shapes and therefore different reduction orders, so the two agree to reduction-o
 for bit. A dump whose rows depend on an internal batching knob is the wrong artifact to compute a
 KL divergence from, so the tool has one path. At ~26 ms/row a 2048-token segment costs about a
 minute, which is not the bottleneck in this rung.
+
+### Rung 4 measurement: w4a16
+
+**Measured 2026-09-22, HIP device 1, real 64-layer container `D:/models/r4dx/qwen38-27b-v3.r4dx`.**
+
+**Corpus**: `tools/reference/kl_corpus/` (committed), the held-out four-segment corpus described in
+`tools/reference/README.md` -- `english_prose` (original), `cpp_source` (excerpt of this repo's own
+`src/model/model.cpp`), `python_source` (excerpt of this repo's own `tools/reference/layer_golden.py`),
+`thai_prose` (original) -- each truncated to exactly 1024 tokens in the committed `tokens.json`.
+Disjoint from `tools/reference/calib.txt`, which chose the fp8 KV descale constants.
+
+**Exact commands** (both sides on HIP device 1, one GPU process at a time):
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+$py = "<reference venv>\Scripts\python.exe"   # see tools/reference/README.md
+
+# reference: bf16 checkpoint, all 4 segments
+& $py tools\reference\full_logits_golden.py --device cuda `
+    --tokens tools\reference\kl_corpus\tokens.json --out-dir tools\reference\kl_out\ref
+
+# r4dx: w4a16, all 4 segments
+build\win-hip\tests\model\tool_teacher_forced_logprobs.exe `
+    --model D:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
+    --tokens tools\reference\kl_corpus\tokens.json `
+    --out-dir tools\reference\kl_out\w4a16 --max-ctx 4096 --vision off
+
+# report
+& $py tools\reference\kl_report.py `
+    --ref-dir tools\reference\kl_out\ref --test-dir tools\reference\kl_out\w4a16 `
+    --tokens tools\reference\kl_corpus\tokens.json --out tools\reference\kl_out\kl_w4a16.json
+```
+
+**Wall time / VRAM.** Reference: ~24.7-42.0s per 1024-token segment (`stack` time; the first
+segment of a run pays a cold page cache), peak 1.56 GiB allocated. r4dx `w4a16`: 28.7-28.8 ms/row
+(~29.3-29.5s per 1023-row segment), 117.4s total for 4 segments, peak **16.23 GiB** VRAM (this run
+did not share device 1 with another process). Both sides ran once each, sequentially, never
+concurrently.
+
+**Result** (`KL(P_ref || Q_w4a16)` in nats, fp64, full 248320-way vocabulary, per position):
+
+| segment | rows | mean KL | median KL | p99 KL | max KL | max @ | top-1 | top-5 | ppl ref | ppl w4a16 | KL>1 |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|
+| cpp_source | 1023 | 0.05907 | 0.02025 | 0.46623 | 1.51422 | pos 662 (tok 9 `'*'`) | 91.01% | 99.80% | 3.805 | 3.921 | 2 |
+| english_prose | 1023 | 0.06765 | 0.04152 | 0.34000 | 0.73583 | pos 109 (tok 82) | 89.74% | 99.80% | 3.755 | 4.024 | 0 |
+| python_source | 1023 | 0.06869 | 0.03267 | 0.40826 | 0.95169 | pos 645 (tok 13011) | 89.05% | 99.51% | 4.605 | 4.922 | 0 |
+| thai_prose | 1023 | 0.15633 | 0.10060 | 0.83319 | 3.89099 | pos 206 (tok 53900 `'์'`) | 78.20% | 98.53% | 15.610 | 16.991 | 8 |
+| **ALL** | 4092 | **0.08794** | 0.04833 | 0.58740 | 3.89099 | thai_prose pos 206 | **87.00%** | 99.41% | 5.661 | 6.027 | 10 |
+
+**Positions with KL > 1 nat** (10 total, all in code/Thai; none in `english_prose`/`python_source`):
+
+- `cpp_source`: pos 526 (next token 874, `' no'`, KL 1.288), pos 662 (next token 9, `'*'`, KL 1.514).
+- `thai_prose`: pos 206 (tok 53900 `'์'`, KL 3.891), pos 257 (tok 38534 `'ต'`, KL 1.351), pos 258
+  (tok 148410 `'้อง'`, KL 2.035), pos 318 (tok 149334 `'ญา'`, KL 1.717), pos 636 (tok 157620
+  `'เฉล'`, KL 2.376), pos 669 (tok 45596 `'ี่'`, KL 1.290), pos 949 (tok 35982 `'ว'`, KL 1.887), pos
+  962 (tok 148947 `'ูก'`, KL 1.808). Every Thai KL>1 token is a sub-syllable script fragment, not a
+  whole word -- consistent with the tokenizer's byte/character-level fallback for Thai and with the
+  corpus's much higher baseline reference perplexity (15.6 vs 3.8-4.6 for the other three), rather
+  than any obviously localized bug. Not investigated further per this stage's scope (report, don't
+  fix).
+
+**The `-1e4` clamp caveat.** Every logprob below -1e4 is floored to -1e4 in fp32 before the fp16
+cast on both sides (`exp(-1e4) == 0.0` even in fp64), so the KL sum is unaffected by how far below
+that floor a token's true log-prob sits. The per-segment fp16 round-trip diagnostic
+(`max |sum_v exp(logp_ref[v]) - 1|`, expect ~1e-3) came back `1.13e-03` / `8.84e-04` / `9.59e-04` /
+`1.02e-03` for the four segments -- nowhere near ~1, so the clamp/format is not corrupting the
+distributions.
+
+**Sanity controls** (per this stage's brief):
+
+1. **Reference vs itself.** `kl_report.py` with `--ref-dir`/`--test-dir` both pointed at
+   `tools/reference/kl_out/ref` gives exactly **0.00000** mean/median/p99/max KL and **100.00%**
+   top-1/top-5 on all four segments -- the report does not manufacture disagreement out of nothing.
+2. **Deliberate wrong pairing.** `cpp_source`'s reference dump paired against a file *named*
+   `cpp_source.logprobs.f16` but containing `thai_prose`'s reference bytes (copied into a scratch
+   dir under the mismatched name, `--allow-mismatch` since the sidecar's own sha256 was left as
+   `cpp_source`'s -- the point is to defeat only the content check, not the file-naming
+   convention): **mean KL 16.883 nats**, top-1 agreement **0.20%**, ppl_test **~6.97e7**, 1022/1023
+   positions KL>1 -- three orders of magnitude above the real `w4a16` result, proving the report
+   is not trivially returning small numbers.
+3. **Independent recomputation.** A from-scratch 10-line numpy script (no `kl_report` import) that
+   memory-maps both `cpp_source.logprobs.f16` files whole, widens to fp64, and computes
+   `mean(sum_v exp(ref) * (ref - test))` directly gave **0.059074700681517434**, against
+   `kl_report.py`'s own **0.059074700681517114** -- agreement to `3.2e-16`, far inside the requested
+   `1e-6`.
+
+**Interpretation** (stated as guidance, not a verdict this document draws for the reader):
+llama.cpp `Q4_K_M`-class quantizations typically land at mean KL ~0.02-0.05 nats vs bf16 with top-1
+agreement in the mid-90s%. Rule of thumb: mean KL < 0.1 = close, > 0.3 = something is broken. This
+run's overall mean KL is **0.08794** (top-1 87.0%) -- inside the "close" band but above the
+`Q4_K_M` range and with `thai_prose` alone at 0.156 mean / 78.2% top-1, i.e. visibly worse than the
+other three segments. `w4a16`'s ppl is consistently ~3-9% above the bf16 reference on every
+segment (3.921/3.805, 4.024/3.755, 4.922/4.605, 16.991/15.610), a uniform small perplexity
+inflation rather than one segment breaking outright.
 
 ## Rung 5 -- generation sanity
 

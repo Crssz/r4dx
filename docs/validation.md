@@ -164,12 +164,129 @@ descale formula; the real per-model calibration pass (full 64-layer stack, real 
 
 ## Rung 4 -- full logits, offloaded, few tokens
 
-Not yet built. Run the *whole* model (both `transformers`, CPU-offloaded a layer at a time given
-the 27B size, and r4dx end to end on HIP device 1) on a handful of real prompt tokens and diff
-final logits. This is where rung 3's per-layer tolerances compound -- expect a visibly looser
-bound than any single layer's, and a plan for *how much* looser (e.g. `rel_err` growing roughly
-with `sqrt(num_layers)` for independent per-layer error, `2e-2 * sqrt(64) ~ 0.16` as a first guess)
-needs to be pinned down empirically once `src/model`'s layer graph exists, not guessed here.
+**Not yet measured.** Run the *whole* model (both `transformers`, CPU-offloaded a layer at a time
+given the 27B size, and r4dx end to end on HIP device 1) on real prompt tokens and diff final
+logits. This is where rung 3's per-layer tolerances compound -- expect a visibly looser bound than
+any single layer's, and a plan for *how much* looser (e.g. `rel_err` growing roughly with
+`sqrt(num_layers)` for independent per-layer error, `2e-2 * sqrt(64) ~ 0.16` as a first guess)
+needs to be pinned down empirically, not guessed here.
+
+The r4dx half of the **tooling** for that measurement is built (2026-09-22) -- see "Rung 4 tooling"
+below. Nothing in this section claims the rung passes; the tooling exists so the number can be
+measured, and this heading stays open until it has been.
+
+### Rung 4 tooling
+
+Rung 4 compares distributions, not point predictions, so the artifact both sides produce is a
+**teacher-forced per-position next-token log-probability dump**: for a FIXED token sequence
+`ids[0..T-1]`, `rows = T-1` vectors where
+
+```
+row i = log_softmax(logits at position i) = log p(next token | ids[0..i]),   i in [0, T-2]
+```
+
+Nothing is sampled; `ids[T-1]` is never fed (no row would read its logits). Both halves write the
+same format so a KL report can pair them row for row:
+
+| file | contents |
+|---|---|
+| tokens file (JSON) | `{"tokenizer": "<hf path or name>", "segments": [{"name": "<str>", "token_ids": [int, ...]}, ...]}` -- ids from the checkpoint's own HF `AutoTokenizer` with `add_special_tokens=False` on the raw text: **no chat template, no BOS**. Each segment is scored independently from a fresh context at position 0. |
+| `<out-dir>/<segment>.logprobs.f16` | raw little-endian float16, row-major `[T-1, V]`, no header. `V` is the model's own `lm_head` vocab (`Config().vocab_size`), which the tools print rather than assume. |
+| `<out-dir>/<segment>.meta.json` | `{"T", "V", "dtype": "float16", "rows": T-1, "source": "<r4dx\|reference>", "layout"\|"torch_dtype", "sha256_of_token_ids_json"}` (plus provenance extras). |
+
+`sha256_of_token_ids_json` is the SHA-256, lowercase hex, of the **compact** JSON array of that
+segment's ids -- `[1,2,3]`, UTF-8, no spaces, no trailing newline, i.e.
+`json.dumps(ids, separators=(",", ":")).encode("utf-8")`. It is what lets the report prove the two
+halves scored the same tokens. The two implementations are
+`tools/reference/make_tokens_json.py`'s `token_ids_sha256()` and `r4dx_tf::TokenIdsSha256`
+(`tests/model/teacher_forced.h`); ctest's `test_teacher_forced_logprobs` pins the C++ one with the
+FIPS 180-4 `"abc"` known answer.
+
+**fp16 clamp.** fp16 cannot hold a log-prob below about -65504 and loses all resolution long
+before that, so every value is clamped to `-1e4` before the cast (in fp32, after the log_softmax).
+Every token this touches has probability below `e^-10000` -- exactly zero in any arithmetic either
+side can do -- so no KL sum moves measurably. It is recorded as `clamp_min` in the r4dx sidecar.
+
+**The r4dx half: `tests/model/tool_teacher_forced_logprobs`** (source
+`tests/model/tool_teacher_forced_logprobs.cpp`, pass in `tests/model/teacher_forced.h`). Built like
+the other `tests/model` tools (`tool_hseed_drift`, `tool_dflash_probe`, ...) and, like them,
+deliberately **not** registered with `add_test()`.
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+build\win-hip\tests\model\tool_teacher_forced_logprobs.exe `
+    --model D:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
+    --tokens <tokens.json> --out-dir <dir> [--segment <name>] [--max-ctx N] [--layers N] `
+    [--vision off] [--check-greedy N] [--no-write] [--quiet]
+```
+
+It loads the container once and drives the sequence through the engine's **own decode path**:
+`Model::Prefill({ids[0]})` for row 0, then `Model::DecodeStep(ids[i])` for row `i` -- the same GDN
+recurrent-update kernels, the same paged fp8 KV cache with its calibrated descales, and the same
+fused quant epilogues a real generation uses for the positions it generates. MTP and DFlash2 are
+unconditionally off (both are strategies for *generating*, and this tool never generates), which
+also keeps `Model`'s draft window at 1, i.e. the pre-speculation GDN state layout. `--vision`
+defaults to **off** here: the tower plays no part in a text-only log-prob dump and skipping it
+reclaims ~0.89 GiB. `--layers N` exists for the 4-layer test containers, whose `config.json` still
+declares the full 64.
+
+What it is NOT: the chunked-**prefill** path. A real generation runs its prompt through the
+chunked-scan GDN kernels (one `Prefill` call over many tokens) and only its generated positions
+through the per-token path. Feeding the whole sequence one token at a time is what makes every row
+comparable to every other row and to the reference's own uniform pass; the price is that the single
+row sitting on a prompt/generation boundary is computed here by the decode path where the
+generation computed it by the prefill path. Measured on the 4-layer container, the two agree to
+~7e-4 in row logsumexp against a neighbouring-row spread of ~1e-1, i.e. two orders of magnitude of
+separation -- enough that nothing downstream confuses the two, but not bit-for-bit, which is why
+the automatic test below excludes exactly that one row from its argmax assertion.
+
+**Numerics.** The row reduction is `m = max_j logits[j]`, `S = sum_j exp(logits[j] - m)`,
+`lse = m + log(S)`, `lp[j] = logits[j] - lse`, all on the host from the engine's fp32 logits, with
+`S` accumulated in `double` and the result rounded back to fp32. That is not a deviation from
+"computed in fp32": a naive fp32 sum over 248320 terms loses several digits to cancellation, while
+torch's own fp32 `log_softmax` uses a blocked/pairwise reduction much closer to the exactly-rounded
+answer -- accumulating in double lands on the same fp32 value the reference does rather than a
+different one for a reason that has nothing to do with the model. The tool always checks its own
+output is a distribution (`max |log sum_j exp(row[j])| < 1e-2`, measured ~5e-7) and exits 1 if not.
+
+**Getting the token ids right.** Two producers, both writing the tokens file format above:
+
+- `tools/reference/make_tokens_json.py` -- text files through the checkpoint's `AutoTokenizer`,
+  one segment per file, with per-segment truncation. This is what a corpus-driven KL run uses. Runs
+  in the read-only reference venv; no GPU, no weights, only the tokenizer files.
+- `r4dx-cli --dump-token-ids <tokens.json>` -- writes the ids **actually fed into the model's
+  KV/GDN state** so far (the rendered prompt plus every committed generated token) as a single
+  `"cli"` segment, rewritten in full after every turn. Re-tokenizing the printed text cannot
+  reproduce them: the chat template's special tokens, and anything the stream decoder's
+  `skip_special_tokens=true` dropped, would be lost. This is what makes a "generate, then score what
+  you generated" check possible at all.
+
+**The automatic check: ctest `test_teacher_forced_logprobs`**
+(`tests/model/test_teacher_forced_logprobs.cpp`, HIP device 1, SKIPPED when
+`D:/models/r4dx/qwen38-27b-l4-mtp.r4dx` is absent). It drives the *same* pass -- both TUs call
+`teacher_forced.h`, so the tool's numbers are the ones ctest checks, not a lookalike
+reimplementation -- and asserts three things on the 4-layer container:
+
+1. **Greedy consistency.** Generate 64 tokens greedily from a fixed prompt, teacher-force the whole
+   prompt+generated sequence, and require `argmax(row i) == ids[i+1]` for every row predicting a
+   generated token (except the prefill/decode boundary row above). Catches an off-by-one position,
+   the wrong row being read, or the sequence being fed into a different state than generation used.
+2. **Normalization.** `|log sum_j exp(row[j])| < 1e-2` for every row.
+3. **Row alignment against the generation loop's own logits.** Check 1 is only as strong as the
+   generated tail is varied, and a 4-layer truncation of a 27B model collapses onto one repeated
+   token, against which an off-by-one row would still "pass". So the test also compares each shared
+   row's logsumexp -- one scalar depending on all `V` logits -- between the dump and the decode loop
+   that generated the sequence, and additionally asserts that *neighbouring* rows' logsumexps are
+   separated from that disagreement by at least 10x, so the check can never go quietly vacuous.
+   Measured: disagreement 7.2e-4, neighbour spread 1.0e-1, 63/63 rows distinct.
+
+**Not done here, deliberately.** A `Model::VerifyWindow`-batched fast path would cut the ~26 ms per
+row on the real container by processing several positions per forward pass, but it cannot be shown
+*row-identical* to the step path: a `T=8` verify window and a `T=1` decode step run different GEMM
+shapes and therefore different reduction orders, so the two agree to reduction-order noise, not bit
+for bit. A dump whose rows depend on an internal batching knob is the wrong artifact to compute a
+KL divergence from, so the tool has one path. At ~26 ms/row a 2048-token segment costs about a
+minute, which is not the bottleneck in this rung.
 
 ## Rung 5 -- generation sanity
 

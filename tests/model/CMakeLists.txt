@@ -12,6 +12,7 @@ set(R4DX_MODEL_TESTS
   test_dflash_feature_capture
   test_dflash_draft
   test_dflash_e2e
+  test_teacher_forced_logprobs
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -76,6 +77,17 @@ target_link_libraries(tool_dflash_probe PRIVATE r4dx_model r4dx_convert r4dx_cor
 # SKIP-if-container-missing exit 77.
 add_executable(tool_sampled_bench tool_sampled_bench.cpp)
 target_link_libraries(tool_sampled_bench PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
+# tool_teacher_forced_logprobs: the r4dx half of Rung 4 (docs/validation.md "Rung 4 tooling") --
+# a teacher-forced per-position next-token log-prob dump for a fixed token sequence, in the shared
+# on-disk format the HF-transformers reference half writes too. Needs the real container and a
+# tokens.json that are not vendored into the repo, and produces artifacts rather than asserting a
+# contract, so it follows the same "built, never add_test()'d" convention as tool_hseed_drift /
+# tool_vocab_calib / tool_dflash_probe / tool_sampled_bench above. The contract IS asserted, on the
+# 4-layer container, by test_teacher_forced_logprobs in R4DX_MODEL_TESTS above -- both drive the
+# same pass (tests/model/teacher_forced.h), so the tool's numbers are the ones ctest checks.
+add_executable(tool_teacher_forced_logprobs tool_teacher_forced_logprobs.cpp)
+target_link_libraries(tool_teacher_forced_logprobs PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),

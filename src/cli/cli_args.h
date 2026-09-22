@@ -160,6 +160,27 @@ struct CliArgs {
   // command is the natural per-turn equivalent of this flag once the conversation is already
   // running interactively.
   std::vector<std::string> image_paths;
+  // --dump-token-ids <path> (docs/validation.md "Rung 4 tooling"): after every turn, write the
+  // token ids ACTUALLY fed into the model's KV/GDN state so far -- the rendered prompt plus every
+  // committed generated token -- as a tokens.json in the Rung 4 shared format:
+  //   {"tokenizer": "<--tokenizer-dir>", "segments": [{"name": "cli", "token_ids": [...]}]}
+  // That file is exactly what tests/model/tool_teacher_forced_logprobs consumes, which is the point:
+  // the r4dx log-prob dump has to score the SAME ids the CLI generated, and re-tokenizing the
+  // printed text cannot reproduce them (the chat template's special tokens, and any token the
+  // stream decoder's skip_special_tokens=true dropped, would be lost). The file is rewritten in
+  // full after each turn, so in --chat it always holds the whole conversation so far. Empty
+  // (default) writes nothing.
+  std::string dump_token_ids;
+  // --layers N: load only the first N decoder layers (r4dx::model::ModelOptions::layer_limit).
+  // -1 (default) loads the container's own config.json `num_hidden_layers`, i.e. every layer --
+  // byte-identical to before this flag existed for every real container. It exists for the 4-layer
+  // TEST containers (D:/models/r4dx/qwen38-27b-l4-*.r4dx, converted with `r4dx-convert --layers 4`),
+  // whose config.json still declares the full 64, so loading them without this flag fails looking
+  // for `text.layers.4.*`. tests/model's own tests have always set ModelOptions::layer_limit
+  // directly (see tests/model/test_forward_smoke.cpp); this is the same knob from the CLI, needed
+  // to drive a 4-layer container end to end -- e.g. the Rung 4 self-consistency check in
+  // docs/validation.md, which generates greedily through r4dx-cli and then scores what it generated.
+  int64_t layers = -1;
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -179,7 +200,8 @@ inline std::string CliUsageText(const char* argv0) {
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
          "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N] "
-         "[--vision {auto|on|off}] [--image-max-pixels N] [--image <path> ...]";
+         "[--vision {auto|on|off}] [--image-max-pixels N] [--image <path> ...] "
+         "[--dump-token-ids <tokens.json>] [--layers N]";
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -252,6 +274,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--vision") a.vision = NextCliArg(argc, argv, i, "--vision");
     else if (arg == "--image-max-pixels") a.image_max_pixels = ParseI64("--image-max-pixels", NextCliArg(argc, argv, i, "--image-max-pixels"));
     else if (arg == "--image") a.image_paths.push_back(NextCliArg(argc, argv, i, "--image"));
+    else if (arg == "--dump-token-ids") a.dump_token_ids = NextCliArg(argc, argv, i, "--dump-token-ids");
+    else if (arg == "--layers") a.layers = ParseI64("--layers", NextCliArg(argc, argv, i, "--layers"));
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -264,6 +288,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.top_p < 0.0f || a.top_p > 1.0f) throw CliUsageError("--top-p must be in [0, 1]");
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
+  if (a.layers == 0 || a.layers < -1) throw CliUsageError("--layers must be -1 (every layer) or > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
   if (a.mtp < 0 || a.mtp > kMaxMtpDraftK) {
     throw CliUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftK) +

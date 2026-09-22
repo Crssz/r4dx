@@ -411,6 +411,7 @@ int RunMain(int argc, char** argv) {
     return 2;
   }
   opts.max_ctx = args.max_ctx;
+  opts.layer_limit = args.layers;  // -1 (default) == the container's own num_hidden_layers
   // --mtp K and --dflash now both run at ANY temperature (docs/sampling.md section 9/10, Milestone 6
   // stage S3: DecodeStepMtpSampled / DecodeStepDflashSampled implement lossless sample-and-match
   // rejection sampling for a non-greedy request). RunTurn picks the greedy or sampled method per
@@ -614,6 +615,32 @@ int RunMain(int argc, char** argv) {
     fed_tokens = full_tokens;
     fed_tokens.insert(fed_tokens.end(), r.committed_tokens.begin(), r.committed_tokens.end());
     messages.push_back({{"role", "assistant"}, {"content", r.generated_text}});
+
+    // --dump-token-ids (docs/validation.md "Rung 4 tooling", cli_args.h's own comment): the exact
+    // ids now resident in the model's KV/GDN state, in the Rung 4 tokens.json shared format, so
+    // tests/model/tool_teacher_forced_logprobs can score the SAME sequence this run generated.
+    // Rewritten in full after every turn. Hand-written JSON rather than the nlohmann object this TU
+    // already has: one integer array does not need a DOM, and keeping the writer trivial keeps the
+    // "compact, no spaces" token_ids serialization that the shared sha256_of_token_ids_json field
+    // is defined over visible right here.
+    if (!args.dump_token_ids.empty()) {
+      std::FILE* f = std::fopen(args.dump_token_ids.c_str(), "wb");
+      if (f == nullptr) {
+        std::fprintf(stderr, "warning: cannot write --dump-token-ids %s\n",
+                     args.dump_token_ids.c_str());
+      } else {
+        std::string tok_dir_json = r4dx::ChatJson(args.tokenizer_dir).dump();
+        std::fprintf(f, "{\n  \"tokenizer\": %s,\n  \"segments\": [\n    {\n", tok_dir_json.c_str());
+        std::fprintf(f, "      \"name\": \"cli\",\n      \"token_ids\": [");
+        for (size_t i = 0; i < fed_tokens.size(); ++i) {
+          std::fprintf(f, "%s%d", i ? "," : "", fed_tokens[i]);
+        }
+        std::fprintf(f, "]\n    }\n  ]\n}\n");
+        std::fclose(f);
+        std::fprintf(stderr, "[r4dx-cli] wrote %zu token ids to %s\n", fed_tokens.size(),
+                     args.dump_token_ids.c_str());
+      }
+    }
 
     if (args.stats) {
       if (turn_image_n > 0) {

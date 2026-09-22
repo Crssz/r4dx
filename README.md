@@ -35,6 +35,13 @@ This configures and builds with the `win-hip` CMake preset (Ninja + the vLLM_for
 CMake/Ninja binaries) against the ROCm SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the
 exact toolchain versions, flags, and gotchas.
 
+One build option changes what containers this binary can read: **`R4DX_W4A16_GROUP`** (default
+**64** since Milestone 11) is how many contiguous `K` share one w4a16 `(scale, zero)` pair -- 4.5
+bits/weight at 64, 4.25 at 128. It reaches both the kernel and the converter from one cache
+variable, every container records the group it was packed with, and a loader refuses a mismatch
+rather than silently reading scales at the wrong stride. `.\build.ps1 -Preset win-hip-g128` builds
+the pre-v6 group of 128 into its own directory for reading older containers.
+
 ## Test
 
 ```powershell
@@ -78,11 +85,24 @@ smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- a
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v3.r4dx `
-    --layouts w4a8,w4a16,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v6.r4dx `
+    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
 ```
+
+That is the **current production container**, `qwen38-27b-v6.r4dx` (42.74 GiB, 418 s): mean KL
+0.03851 / top-1 90.93% against the bf16 reference, 35.96 tok/s plain and 72.93 tok/s on
+`--dflash k=7`. The `--keep-bf16` and the build's w4a16 group of 64 are Milestone 11's two chosen
+levers -- `docs/validation.md` "Milestone 11 / recipe" has why those two and nothing else. Its
+DFlash2 drafter is `qwen38-27b-dflash2-w4a16-g64.r4dx`, converted with `--dflash-gguf ... --quant
+search` (on the drafter, unlike the main model, `search` is worth 9.6% of decode).
+
+**Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
+refuses a container packed at 128 -- `v5` and everything older -- by name, with both numbers and
+the fix in the message. `docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
+`win-hip-g128` escape hatch, and the trap that an existing build directory keeps its cached group.
 
 Produces a single container carrying every requested quantized GEMM layout (plus bf16 for
 embeddings/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B them against the same
@@ -304,6 +324,17 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 ```
 
 ## Status
+
+**Milestone 11 done: `qwen38-27b-v6.r4dx` is the production container (2026-09-22).** Mean KL
+**0.05342 -> 0.03851** (-27.9%) and top-1 **89.30% -> 90.93%** against the bf16 reference, bought
+with +0.8989 GiB of weights (`weights=16.4065 GiB`) for **-7.2% plain decode** (35.96 tok/s) and
+**-4.8% on `--dflash k=7`** (72.93 tok/s, 24.9% acceptance). The two levers -- w4a16 group **64**
+(now the build default) and `--keep-bf16` on `attn.k`/`attn.v` -- were picked by ranking every
+candidate on nats-of-KL-per-GiB; they are the only two above 0.015, the third-best is 4.4x worse
+per byte, and 0.56 GiB of the +1.5 GiB budget was left unspent on purpose. Costed on paper first,
+and the prediction held to 1.5% on KL and 0.23% on VRAM. **This is a breaking change for older
+containers** -- see the matched-pair note under "Convert a checkpoint to a container" above.
+`docs/validation.md` "Milestone 11 / recipe", `docs/perf.md`'s Milestone 11 entry.
 
 **Rung 4 (teacher-forced KL vs bf16) measured and audited (2026-09-22).** `w4a16` overall mean KL
 0.08794 nats / 87.00% top-1 agreement vs the original bf16 checkpoint on a held-out 4-segment

@@ -7,14 +7,17 @@
 // normal case.
 //
 // Why this exists: the containers these tests read live at fixed D:\ paths and were packed at the
-// default w4a16 group of 128. A build configured with a different R4DX_W4A16_GROUP (see
-// docs/build-windows.md "w4a16 group size") correctly REFUSES them at Container::Load -- a
-// container and the binaries that read it are a matched pair -- so without an override there is no
-// way to run these tests on such a build at all. With it, convert group-matched copies once, point
-// the whole suite at them, and delete them afterwards:
+// w4a16 group of 128, which was the default until Milestone 11. A build configured with a
+// different R4DX_W4A16_GROUP (see docs/build-windows.md "w4a16 group size") correctly REFUSES
+// them at Container::Load -- a container and the binaries that read it are a matched pair -- so
+// without an override there is no way to run these tests on such a build at all.
 //
-//   $env:R4DX_TEST_CONTAINER_DIR = 'D:\models\r4dx\g64-testctr'
-//   & $ctest --preset win-hip-g64
+// Since Milestone 11 the DEFAULT build is group 64, so on this machine it is the default build
+// that needs the override, and `win-hip-g128` that wants it unset. Group-matched copies (same
+// basenames) live in D:\models\r4dx\g64\ -- docs/build-windows.md has the conversion recipe:
+//
+//   $env:R4DX_TEST_CONTAINER_DIR = 'D:\models\r4dx\g64'
+//   & $ctest --preset win-hip
 //
 // Returns const char* (backed by a std::deque, so the strings live for the process and never move)
 // so the call sites stay `const char* kContainerPath = ...` / `#define ...` exactly as they were.

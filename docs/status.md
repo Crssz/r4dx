@@ -1,5 +1,39 @@
 # Status
 
+## Milestone 11 complete: v6 is the production container, and group 64 is the default, 2026-09-22
+
+`D:\models\r4dx\qwen38-27b-v6.r4dx` replaces `v5`: **mean KL 0.05342 -> 0.03851 (-27.9%), top-1
+89.30% -> 90.93%**, for +0.8989 GiB of weights (15.5076 -> **16.4065 GiB**) and **-7.2% plain
+decode** (38.69 -> 35.96 tok/s), -7.5% on `--mtp 3` (65.93), **-4.8% on the fastest path**
+(`--dflash k=7`, 72.93 tok/s, 24.9% acceptance). w4a8 and mxfp4 out of the same file improve to
+0.10405 / 85.24% and 0.07764 / 86.39%. Thai -- always the worst segment -- improves most, 0.09787
+-> 0.07409.
+
+Two levers, chosen from Milestone 11's group-size and per-class sensitivity tables by ranking
+everything on nats-of-KL-per-GiB and taking the only two entries above 0.015 (the third-best is
+4.4x worse per byte, so 0.56 GiB of the +1.5 GiB budget was deliberately left unspent):
+**w4a16 group 64** (+0.7114 GiB, 0.01128 nats) and **`--keep-bf16` on `attn.k`/`attn.v`** (+0.2246
+GiB, 0.00305 nats after discounting for what group 64 already recovered). The recipe was costed on
+paper first and the prediction held to **1.5% on KL and 0.23% on VRAM** -- which is the reusable
+result: composite recipes can now be designed from the two tables instead of measured one at a
+time.
+
+**Breaking change: `R4DX_W4A16_GROUP` now defaults to 64.** A default build refuses `v5`, `v4`,
+`v3`, the old 4-layer test containers and the old DFlash2 drafters by name, with both group numbers
+and the fix in the message, rather than reading their scales at the wrong stride. The way back is
+the new **`win-hip-g128`** preset (verified: builds clean, loads `v5` at `weights=15.5076 GiB`).
+Note that an *existing* build directory keeps 128 in its CMake cache until you pass
+`-DR4DX_W4A16_GROUP=64` once. `tests/model`'s fixed-path containers were re-converted into
+`D:\models\r4dx\g64\`; `ctest --preset win-hip` needs `R4DX_TEST_CONTAINER_DIR` pointed there on
+this machine. The DFlash2 drafter was re-converted too, and **must** use `--quant search`: the
+default `rtn` costs 6.4 tok/s of DFlash2 decode (21.4% acceptance vs 24.9%), which is the opposite
+of Milestone 10's finding for the main model.
+
+Full evidence -- the decision arithmetic, predicted-vs-measured, KL for all three layouts, the
+speed table, the drafter A/B, and what a future `w8a16` kernel should target (~0.0320 at the same
++1.5 GiB ceiling, still 2.3-2.9x `Q4_K_M`) -- is in `docs/validation.md` "Milestone 11 / recipe",
+with the speed half in `docs/perf.md`.
+
 ## Milestone 10 complete: the imatrix is the lever, the search alone is not, 2026-09-22
 
 `r4dx-convert --quant search --imatrix <npz>` improves every quantized layout with **zero** change

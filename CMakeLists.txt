@@ -35,9 +35,17 @@ option(R4DX_BUILD_CONVERT "Build the HF -> r4dx weight converter" ON)
 # The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight block, so the group must be a
 # multiple of 64: 64 and 128 are the only values libr4d accepts unmodified. Bits per weight is
 # 4 + 32/group (4.25 at 128, 4.5 at 64) -- docs/validation.md "Milestone 11 / group size" has what
-# the extra quarter-bit buys. Build a non-default group in its OWN build dir (preset win-hip-g64),
-# never on top of build/win-hip: the container and the binaries must ship as a matched pair.
-set(R4DX_W4A16_GROUP "128" CACHE STRING "w4a16 group size: K per (scale, zero) pair (64 or 128)")
+# the extra quarter-bit buys.
+#
+# The DEFAULT is 64 as of Milestone 11 (docs/validation.md "Milestone 11 / recipe"): group 64 plus
+# a bf16 attn.k/attn.v cuts mean KL 27% for +0.9 GiB, and those two are the only levers in the
+# per-class sensitivity table worth more than 0.015 nats/GiB. The consequence is that every
+# container packed before v6 -- qwen38-27b-v5.r4dx, v4, v3, the old dflash2 drafters -- is group
+# 128 and this build REFUSES to load it, by name and with both numbers, rather than reading the
+# scales at the wrong stride. Configure with -DR4DX_W4A16_GROUP=128 to get the old behaviour back.
+# Build a non-default group in its OWN build dir (preset win-hip-g128), never on top of
+# build/win-hip: the container and the binaries must ship as a matched pair.
+set(R4DX_W4A16_GROUP "64" CACHE STRING "w4a16 group size: K per (scale, zero) pair (64 or 128)")
 set_property(CACHE R4DX_W4A16_GROUP PROPERTY STRINGS 64 128)
 if(NOT R4DX_W4A16_GROUP MATCHES "^[0-9]+$")
   message(FATAL_ERROR "R4DX_W4A16_GROUP must be a positive integer (got '${R4DX_W4A16_GROUP}')")

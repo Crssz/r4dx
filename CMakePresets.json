@@ -23,13 +23,13 @@
       }
     },
     {
-      "name": "win-hip-g64",
+      "name": "win-hip-g128",
       "inherits": "win-hip",
-      "displayName": "Windows / HIP gfx1201, w4a16 group 64",
-      "description": "Same as win-hip but packs and reads w4a16 at group 64 (4.5 bits/weight instead of 4.25). Its OWN build dir on purpose: a group-64 container is only loadable by group-64 binaries, so the two must never overwrite each other. docs/validation.md 'Milestone 11 / group size' has the measurements.",
-      "binaryDir": "${sourceDir}/build/win-hip-g64",
+      "displayName": "Windows / HIP gfx1201, w4a16 group 128 (pre-v6 containers)",
+      "description": "Same as win-hip but packs and reads w4a16 at the pre-Milestone-11 group of 128 (4.25 bits/weight instead of the default 4.5). qwen38-27b-v5.r4dx and every earlier container were packed at 128, and the default build refuses them by name -- this preset is how you load one without re-converting. Its OWN build dir on purpose: a container is only loadable by binaries built at its group, so the two must never overwrite each other. docs/validation.md 'Milestone 11 / recipe' has the measurements.",
+      "binaryDir": "${sourceDir}/build/win-hip-g128",
       "cacheVariables": {
-        "R4DX_W4A16_GROUP": "64"
+        "R4DX_W4A16_GROUP": "128"
       }
     }
   ],
@@ -40,8 +40,8 @@
       "configuration": "Release"
     },
     {
-      "name": "win-hip-g64",
-      "configurePreset": "win-hip-g64",
+      "name": "win-hip-g128",
+      "configurePreset": "win-hip-g128",
       "configuration": "Release"
     }
   ],
@@ -56,8 +56,8 @@
       "output": { "outputOnFailure": true }
     },
     {
-      "name": "win-hip-g64",
-      "configurePreset": "win-hip-g64",
+      "name": "win-hip-g128",
+      "configurePreset": "win-hip-g128",
       "configuration": "Release",
       "environment": {
         "HIP_VISIBLE_DEVICES": "1"

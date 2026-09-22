@@ -63,9 +63,9 @@ Per-unit extras: `r4d_gdn_chunk_scan_k128_v128_c64_bf16` gets `-mcumode`;
 
 ### w4a16 group size (`R4DX_W4A16_GROUP`)
 
-`R4DX_W4A16_GROUP` (root `CMakeLists.txt`, default **128**) is the w4a16 layout's group size: how
-many contiguous `K` share one `(scale, zero)` pair. It is a single CMake cache variable because it
-has to reach two places that must never disagree:
+`R4DX_W4A16_GROUP` (root `CMakeLists.txt`, default **64** since Milestone 11) is the w4a16 layout's
+group size: how many contiguous `K` share one `(scale, zero)` pair. It is a single CMake cache
+variable because it has to reach two places that must never disagree:
 
 | reaches | as | used for |
 |---|---|---|
@@ -83,21 +83,43 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
    `Container::Load` / `DflashDraftWeights::Open` refuse a container whose group differs from the
    kernel this binary was built with (`CheckW4a16Group`, `src/model/quant_linear.h`), naming both
    numbers. Pre-`quant`-block containers have no group recorded and are group 128 by construction,
-   so they still load on a default build.
+   so nothing checks them -- they are the one case that can still be read at the wrong stride, and
+   there are none left on this machine.
 3. CMake rejects a group that is not a positive multiple of 64: the kernel packs
    `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
    128 are the only values libr4d accepts unmodified**.
 
 Bits per weight is `4 + 32/group` -- 4.25 at 128, 4.5 at 64. What the extra quarter-bit buys is
-measured in `docs/validation.md` "Milestone 11 / group size".
+measured in `docs/validation.md` "Milestone 11 / group size"; why 64 became the default is
+"Milestone 11 / recipe" in the same file.
 
-**Build a non-default group in its own build directory.** A container and the binaries that read it
-ship as a matched pair, so `build/win-hip` stays group 128 and the `win-hip-g64` preset builds
-group 64 into `build/win-hip-g64`:
+**The default changed from 128 to 64 in Milestone 11, and that is a breaking change for existing
+containers.** `qwen38-27b-v5.r4dx`, `v4`, `v3`, the 4-layer test containers and the original
+DFlash2 drafters were all packed at group 128, and a default build now refuses every one of them:
+
+```
+r4dx::model: D:\models\r4dx\qwen38-27b-v5.r4dx was packed with w4a16 group=128 but this build's
+r4d_gemm_w4a16_nt_m64 kernel reads group=64 -- the .w4a16.wsz scales would be read at the wrong
+stride, producing wrong numbers with no other symptom. Reconfigure with -DR4DX_W4A16_GROUP=128 in
+its own build directory, or re-convert the container with this build's r4dx-convert.
+```
+
+The two ways out are exactly the two the message names: re-convert (the production container is now
+`qwen38-27b-v6.r4dx`, packed at 64 -- README's convert command), or build group 128 in its own build
+directory with the `win-hip-g128` preset:
 
 ```powershell
-.\build.ps1 -Preset win-hip-g64
+.\build.ps1 -Preset win-hip-g128
 ```
+
+**Note that an existing build directory keeps the group in its CMake cache.** Changing the default
+in `CMakeLists.txt` does *not* move a `build/win-hip` that was configured before; `cmake --preset
+win-hip` will happily re-report `w4a16 group = 128`. Pass `-DR4DX_W4A16_GROUP=64` once to move it
+(the configure line prints the group it settled on), or delete the build directory.
+
+**Build a non-default group in its own build directory.** A container and the binaries that read it
+ship as a matched pair, so `build/win-hip` is group 64 and `build/win-hip-g128` is group 128; never
+reconfigure one into the other in place.
 
 The `tests/convert` suite is group-agnostic: it runs every int4 quantizer, packer and search at
 **both** 64 and 128 whatever `R4DX_W4A16_GROUP` this build is, against
@@ -106,20 +128,34 @@ The `tests/convert` suite is group-agnostic: it runs every int4 quantizer, packe
 reads the group back out of the container the exe under test just wrote.
 
 The `tests/model` and `tests/model/attention` tests are different: they read fixed 4-layer
-containers at hard-coded `D:\models\r4dx\` paths, packed at group 128, which a group-64 build
-rightly refuses. Convert group-matched copies once and point the suite at them with
-`R4DX_TEST_CONTAINER_DIR` (`tests/model/test_container_path.h`) -- same basename, new directory:
+containers at hard-coded `D:\models\r4dx\` paths **packed at group 128**, which the now-default
+group-64 build rightly refuses. Group-matched copies live in `D:\models\r4dx\g64\` -- same
+basenames, one directory down -- and `R4DX_TEST_CONTAINER_DIR`
+(`tests/model/test_container_path.h`) points the suite at them:
 
 ```powershell
-$dir = 'D:\models\r4dx\g64-testctr'
+$env:R4DX_TEST_CONTAINER_DIR = 'D:\models\r4dx\g64'
+ctest --preset win-hip
+```
+
+**`ctest --preset win-hip` needs that variable on this machine**; without it every `tests/model`
+test that opens one of those containers fails on the group guard. `ctest --preset win-hip-g128`
+wants it *unset*, so it reads the historical group-128 copies in `D:\models\r4dx\`. The recipe for
+regenerating the directory (all five containers, ~41 GiB, ~2 min of CPU) is:
+
+```powershell
+$dir = 'D:\models\r4dx\g64'
 # qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,mxfp4,w4a16,w4a8 --lm-head 4bit+bf16 --mtp off --vision off
 # qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16            --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16,w4a8,mxfp4 --lm-head 4bit+bf16 --mtp on  --vision off
-# the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --layout {bf16,w4a16}
-.\build\win-hip-g64\src\convert\r4dx-convert.exe --input C:\AI\models\Qwen3.8-27B --output "$dir\..." ...
-$env:R4DX_TEST_CONTAINER_DIR = $dir
-ctest --preset win-hip-g64
+# the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --out ... --layout {bf16,w4a16}
+.\build\win-hip\src\convert\r4dx-convert.exe --input C:\AI\models\Qwen3.8-27B --output "$dir\..." ...
 ```
+
+`qwen38-27b-l4-mtp-draftvocab.r4dx` is **not** in `g64\`: it needs a `--draft-vocab-ids` JSON that
+is a gitignored build artifact and was not on disk, so `test_mtp`'s reduced-vocab draft-head cases
+skip on a default build. `test_dflash_e2e` skips for the same kind of reason -- its target is the
+42 GiB `qwen38-27b-v3.r4dx`, which was not worth a group-64 copy.
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
 `--rocm-path` is passed; `third_party/CMakeLists.txt` prepends `C:\opt\rocm\bin` and

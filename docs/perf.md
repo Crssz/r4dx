@@ -1,5 +1,36 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Milestone 11: what the v6 container costs in tok/s (2026-09-22)
+
+`D:\models\r4dx\qwen38-27b-v6.r4dx` buys **-27.9% mean KL** (0.05342 -> 0.03851) and **+1.64 points
+of top-1** over `v5` by spending +0.8989 GiB of weights: w4a16 group 64 instead of 128, plus
+`attn.k`/`attn.v` left in bf16. `docs/validation.md` "Milestone 11 / recipe" has the full decision,
+the arithmetic it was made on and the KL tables; this entry is the speed half.
+
+Standard prompt, `--layout w4a16 --vision off --think off --temperature 0 --max-tokens 256
+--max-ctx 2048 --stats`, HIP device 1 with the GPU to itself, twice each:
+
+| Path | v5 (group 128) | **v6** | Delta | Acceptance / tok-round (v6) |
+|---|--:|--:|--:|---|
+| plain | 38.69, 38.66 | **35.96, 35.86** | **-7.2%** | -- |
+| `--mtp 3` | 71.45, 71.24 | **65.93, 66.11** | **-7.5%** | 47.6% / 2.40 |
+| `--dflash` k=7 | 76.34, 76.62 | **72.93, 72.71** | **-4.8%** | 24.9% / 2.71 |
+
+VRAM `weights=16.4065 GiB` (was 15.5076); resident 17.01 GiB plain, 17.43 with `--mtp 3`, 19.04
+with the drafter. Prefill is unchanged at 580-641 tok/s on the 29-token standard prompt -- prefill
+is compute-bound, so it does not notice the extra bytes.
+
+**Decode tracks weight bytes, and speculation dilutes that.** +5.80% of weight bytes costs -7.2% of
+plain decode -- an amplification of 1.23x, against the 1.30x the group-size experiment measured on
+a pure group change -- but only -4.8% on DFlash2, because a speculative round amortizes one pass
+over the weight stream across 2.4-2.7 accepted tokens.
+
+**The drafter must be re-converted with `--quant search`.** A group-64 build refuses the old
+group-128 drafter. Re-converting it with the converter's *default* `--quant rtn` silently costs
+**6.4 tok/s** (66.27/66.32 tok/s at 21.4% acceptance vs 72.93/72.71 at 24.9%) -- unlike the main
+model, where Milestone 10 found `search` without an imatrix worth nothing. The shipped drafter is
+`D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx`, `--quant search`.
+
 ## Milestone 8, stage 8: vision + speculation, integrated headline (2026-09-22)
 
 Real 64-layer container `qwen38-27b-v3.r4dx`, `w4a16`, greedy (`--temperature 0`, `--seed 42`),

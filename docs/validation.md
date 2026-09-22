@@ -1022,6 +1022,183 @@ Everything else, including both new tests, passes.
 - The `w8a16` table is arithmetic from two stated assumptions, not a measurement, and there is no
   8-bit-weight kernel in libr4d to measure.
 
+### Milestone 11 / recipe: what v6 spends its extra gigabyte on (2026-09-22)
+
+The two sections above are the two halves of one question. "Group size" measured a lever that makes
+*every* weight slightly more accurate; "sensitivity" measured which weights are worth making a lot
+more accurate. This section spends a fixed budget -- **at most +1.5 GiB of weights over
+`qwen38-27b-v5.r4dx`** -- using both tables, and ships the result as
+`D:\models\r4dx\qwen38-27b-v6.r4dx`.
+
+#### The decision, and the arithmetic it was made on (before anything was converted)
+
+Everything on the menu, ranked by the only currency that matters here -- nats of mean KL recovered
+per GiB added to the weight stream, since decode on this card is weight-bandwidth-bound and a GiB
+costs the same ~6% of tok/s wherever it is spent:
+
+| lever | +GiB | nats recovered | **nats/GiB** |
+|---|--:|--:|--:|
+| `--keep-bf16` `attn.k`+`attn.v` | 0.2295 | 0.00386 | **0.01683** |
+| w4a16 group 64 | 0.7114 | 0.01128 | **0.01586** |
+| `--keep-bf16` `attn.o` | 0.6885 | 0.00248 | 0.00361 |
+| bf16 `lm_head` | 1.7391 | 0.00580 | 0.00334 |
+| everything else (9 more rows) | -- | -- | <= 0.00242 |
+
+There is a cliff after the second row: the third-best buy is **4.4x worse per byte** than the
+second. So the budget was filled greedily and then deliberately left short:
+
+- **group 64** -- +0.7114 GiB, 0.01128 nats.
+- **`--keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"`** -- priced at group-64 rates, not the
+  group-128 rates in the table above: the 32 k/v tensors are 167,772,160 parameters, so bf16 is
+  0.3125 GiB against 0.0879 GiB at 4.5 bits/weight, i.e. **+0.2246 GiB**, not +0.2295. Their nats
+  were discounted the same way: group 64 already recovered 21.1% of the error in every class, so
+  k/v's remaining share is `0.00386 x (1 - 0.211) = 0.00305` nats, not 0.00386.
+- **Predicted total: +0.936 GiB -> 16.444 GiB of weights; mean KL 0.05342 - 0.01433 = 0.0391;**
+  decode `38.69 x (1 - 0.0604 x 1.30) ~ 35.7-36.2 tok/s` (the 1.30 is the measured
+  decode-loss-per-weight-byte amplification from the group-size section: +4.59% weights cost
+  -5.95% tok/s).
+
+**What was deliberately *not* bought, with 0.564 GiB of budget still on the table:** `attn.o` is
++0.674 GiB at group-64 rates, which overruns the budget (1.610 GiB total) *and* buys 0.00196 nats
+after the same 21.1% discount -- 0.0029 nats/GiB, one fifth the rate of what was bought. Spending
+the rest of the budget at a fifth of the rate is not a better container, it is a slower one. The
+budget is a ceiling, not a target.
+
+**`lm_head` stays 4-bit.** bf16 is +1.7391 GiB on its own -- over budget by itself -- at 0.00334
+nats/GiB, and there is no cheaper setting: `--lm-head` takes *layout* tokens (`4bit`, `bf16`,
+`mxfp4`...), and no 8-bit weight kernel exists to offer an 8.25-bit middle.
+
+#### Predicted vs measured
+
+| | predicted | measured | error |
+|---|--:|--:|--:|
+| weights in VRAM | 16.444 GiB | **16.4065 GiB** | -0.23% |
+| mean KL | 0.0391 | **0.038507** | -1.5% |
+| plain decode | 35.7-36.2 tok/s | **35.96 / 35.86** | in range |
+
+The per-class sensitivity table predicts the composite container to better than 2%, including the
+cross-term discount. That is the useful result of this milestone independent of v6 itself: the
+classes are close enough to additive, and group size close enough to a uniform multiplier, that
+recipes can be *designed* on paper from the two tables instead of converted and measured one by
+one at ~7 minutes of CPU and ~2.5 minutes of GPU apiece.
+
+#### v6, measured
+
+`D:\models\r4dx\qwen38-27b-v6.r4dx`, 42.74 GiB on disk, 417.9 s to convert:
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+.\build\win-hip\src\convert\r4dx-convert.exe `
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v6.r4dx `
+    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
+```
+
+KL against the bf16 reference on `tools/reference/kl_corpus` (4092 rows, 4 segments), all three
+layouts out of the same file. v5 columns are this session's re-measurement of the same corpus, not
+transcribed numbers:
+
+| layout | mean KL v5 | **mean KL v6** | top-1 v5 | **top-1 v6** | thai KL v5 | **thai v6** | KL>1 | `weights=` |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| w4a16 | 0.05342 | **0.03851** | 89.30% | **90.93%** | 0.09787 | **0.07409** | 4 -> **2** | 16.4065 GiB |
+| w4a8 | 0.11641 | **0.10405** | -- | **85.24%** | -- | 0.20799 | 16 | 15.6951 GiB |
+| mxfp4 | 0.07966 | **0.07764** | -- | **86.39%** | -- | 0.15016 | 11 | 15.6951 GiB |
+
+w4a16 is **-27.9% mean KL and +1.64 points of top-1** for +5.80% of weight bytes. w4a8 and mxfp4
+improve too -- **-10.6%** and **-2.5%** -- although neither one's group changed and neither one was
+the target: `--keep-bf16` drops a linear from *every* layout at once, so the bf16 `attn.k`/`attn.v`
+is in all three containers. The 4x spread between w4a8's gain and mxfp4's is not explained here;
+the plausible reading is that w4a8 quantizes activations as well, so the K and V it writes into the
+fp8 cache start from a worse place and have more to gain from exact projections, but that is a
+hypothesis, not something this measurement isolates. Per-segment detail is in
+`tools/reference/kl_out/kl_v6-{w4a16,w4a8,mxfp4}.json`.
+
+Decode, `docs/perf.md`'s standard prompt (`--layout w4a16 --vision off --think off --temperature 0
+--max-tokens 256 --max-ctx 2048 --stats`), HIP device 1 with the GPU to itself, twice each:
+
+| path | v5 | **v6** | delta | acceptance / tok-round |
+|---|--:|--:|--:|---|
+| plain | 38.69, 38.66 | **35.96, 35.86** | **-7.2%** | -- |
+| `--mtp 3` | 71.45, 71.24 | **65.93, 66.11** | **-7.5%** | 47.6% / 2.40 (was 48.4% / 2.42) |
+| `--dflash` k=7 | 76.34, 76.62 | **72.93, 72.71** | **-4.8%** | 24.9% / 2.71 (was 24.5% / 2.68) |
+
+Prefill is unchanged (580-641 tok/s on a 29-token prompt; prefill is compute-bound, not
+weight-bound). VRAM: `weights=16.4065 GiB`, 17.01 GiB total resident plain, 17.43 GiB with
+`--mtp 3`, 19.04 GiB with the DFlash2 drafter. A 64-token greedy generation on a fresh prompt
+("Explain in plain English why quantizing a neural network to 4 bits usually costs accuracy...")
+comes back as ordinary well-formed English prose with correct Markdown structure -- no repetition,
+no token garbage, 35.81 tok/s.
+
+**So the bargain is: -27.9% KL, -7.2% plain decode, -4.8% on the fastest path.** Plain decode lost
+1.23x its weight-byte increase (+5.80%), close to the 1.30x the group-size experiment measured on a
+pure group change, so the amplification is a property of the weight stream and not of this
+particular recipe. DFlash2 loses less than the bytes alone would predict, because a speculative
+round amortizes one pass over the weight stream across 2.4-2.7 accepted tokens.
+
+#### The drafter has to be re-converted too, and *how* matters
+
+A group-64 build refuses the group-128 DFlash2 drafter (`DflashDraftWeights::Open` runs the same
+`CheckW4a16Group` guard), so `D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx` was converted from
+the same `Qwen3.8-27B-DFlash2-Q8_0.gguf`. The first attempt used the converter's default `--quant
+rtn` and cost **6.4 tok/s**:
+
+| drafter | dflash k=7 decode | acceptance | tok/round |
+|---|--:|--:|--:|
+| `--quant rtn` (the default) | 66.27, 66.32 | 21.4% | 2.47 |
+| `--quant search` | **72.93, 72.71** | **24.9%** | **2.71** |
+
+Both measured against the same v6 target in the same session. This is worth recording because it
+contradicts the shape of Milestone 10's finding for the *main* model, where `--quant search`
+without an imatrix was worth nothing: on the drafter it is worth 9.6% of the DFlash2 decode rate.
+The mechanism is presumably that the drafter's job is agreement with a target rather than accuracy
+in its own right, and acceptance is a much sharper function of small logit errors than KL is. The
+shipped drafter is the `search` one. (`--imatrix` remains rejected on the `--dflash-gguf` path --
+the drafter shares none of the main model's keys.)
+
+#### What this breaks, and the way out
+
+`R4DX_W4A16_GROUP` now defaults to **64**, so `build/win-hip` refuses every container packed
+before v6 -- `v5`, `v4`, `v3`, the 4-layer test containers, the original drafters -- by name, with
+both numbers, and with the fix in the message. This was a deliberate trade: v6 is only the
+production container if the production build reads it without a flag. The escape hatch is the
+`win-hip-g128` preset (verified this session: it builds clean and loads `qwen38-27b-v5.r4dx` at
+`weights=15.5076 GiB`, decoding normally), and `docs/build-windows.md` "w4a16 group size" has the
+whole story including the trap that an *existing* build directory keeps its cached 128.
+
+`tests/model` reads 4-layer containers at hard-coded group-128 paths, so group-matched copies were
+converted once into `D:\models\r4dx\g64\` and `R4DX_TEST_CONTAINER_DIR` points the suite at them.
+`qwen38-27b-l4-mtp-draftvocab.r4dx` was regenerated there with a fresh arbitrary 4096-id subset
+(the 1416 distinct ids in `kl_corpus/tokens.json`, padded from 0 -- the reduced-vocab test is about
+correctness plumbing, not coverage), so the reduced-vocab draft head keeps its automated coverage
+on the default build rather than silently dropping to `[SKIP]`.
+
+#### What a `w8a16` kernel milestone should target
+
+The sensitivity section's arithmetic (marked there as arithmetic, not measurement) says an 8-bit
+weight layout would recover ~99.6% of a class's nats at 34.0% of bf16's extra bytes -- ~2.93x the
+nats/GiB of every row in the table. Against v6 rather than v5, the concrete target is:
+
+- v6 already pays bf16 for its k/v bytes, which is 2x more than it needs to. 167,772,160
+  parameters at 8.25 bits is 0.1611 GiB against 0.0879 at 4.5, so 8-bit k/v is **+0.0732 GiB**
+  instead of +0.2246 -- it **gives back 0.1514 GiB** for 99.6% of the same nats.
+- `attn.o` (503,316,480 parameters) at 8 bits is **+0.2197 GiB** for ~0.00196 nats = **0.0089
+  nats/GiB**, which finally clears the bar that kept it out of v6. `lm_head` (1,271,398,400) is
+  **+0.5550 GiB** for ~0.00458 = **0.0083**. Both are group-64-discounted, as above.
+- All three together: `+0.8989 - 0.1514 + 0.2197 + 0.5550 = **+1.52 GiB** over v5 -- right at the
+  ceiling this milestone was given -- for `0.03851 - 0.00196 - 0.00458 = **KL ~0.0320**`.
+
+That is the honest ceiling of this direction, and it is the reason to state the target now: ~0.0320
+at a comparable bit budget is still **2.3-2.9x** llama.cpp `Q4_K_M`'s 0.011-0.014 at 4.5 bits on
+this same checkpoint. Nine classes each carry 1.6-25% of the error and the two largest are the two nothing
+can afford to widen, so no amount of per-class promotion closes that gap. A `w8a16` kernel is worth
+building for the ~17% it buys and for unblocking mixed-precision recipes generally -- it is not
+worth building in the belief that it closes the gap to `Q4_K_M`. Closing that gap needs a better
+4-bit *scheme* (llama.cpp's k-quants spend their budget on a second-level quantization of the
+scales themselves, which is a different shape of idea from anything measured in Milestone 11), and
+that is a kernel milestone of its own.
+
 ## Rung 5 -- generation sanity
 
 Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass

@@ -137,11 +137,13 @@ and `.keep_bf16_extra_bytes` (the signed byte delta against the layouts they rep
 
 **`w4a16`** (`r4d_gemm_w4a16_nt_m64`, f16 activation): asymmetric per-output-channel,
 per-group-of-`g`-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`. `g` is a **build
-option** -- `R4DX_W4A16_GROUP`, default 128, see docs/build-windows.md "w4a16 group size" -- and
-the value a container was packed with is recorded in `__metadata__.quant.w4a16.group` and checked
-against the kernel's own `r4d_gemm_w4a16_nt_m64_group()` at load. Everything below says 128 where
-it means `g`; at `g = 64` every `/ 128` becomes `/ 64` and the weight costs 4.5 bits instead of
-4.25 (`4 + 32/g`). `w4a8`'s group is a separate, fixed 128 and does **not** follow it.
+option** -- `R4DX_W4A16_GROUP`, **default 64 since Milestone 11** (128 before it), see
+docs/build-windows.md "w4a16 group size" -- and the value a container was packed with is recorded
+in `__metadata__.quant.w4a16.group` and checked against the kernel's own
+`r4d_gemm_w4a16_nt_m64_group()` at load. Everything below says 128 where it means `g`; at
+`g = 64` every `/ 128` becomes `/ 64` and the weight costs 4.5 bits instead of 4.25 (`4 + 32/g`),
+which is what `qwen38-27b-v6.r4dx` and every container packed by a default build now carry.
+`w4a8`'s group is a separate, fixed 128 and does **not** follow it.
   - `<name>.w4a16.wq` -- `uint8[N * K / 2]`, **pre-permuted into the WMMA fragment order** so a
     wave's 32 lanes read 512 contiguous bytes for a (n-tile, k-step): lane `l`'s dword holds
     element `e` of `W[n0 + (l&15)][16*ks + 8*(e>>2) + 4*(l>>4) + (e&3)]`, dword nibble `2e` (e<4)
@@ -152,7 +154,7 @@ it means `g`; at `g = 64` every `/ 128` becomes `/ 64` and the weight costs 4.5 
     `0x6400 | q` widened weight nibble) (`r4d_gemm_w4a16_nt_m64.hip:56-59`, `r4d.h` `r4d_gemm_w4a16_nt_m64_group()`).
     `wq` is unaffected by `g` -- only the number of `(scale, zero)` dwords changes.
   - Group size `g`: `r4d_gemm_w4a16_nt_m64_group()` (`R4D_GEMM_W4_GROUP`, set from the
-    `R4DX_W4A16_GROUP` build option; 128 by default, 64 the only other value the kernel accepts as
+    `R4DX_W4A16_GROUP` build option; 64 by default, 128 the only other value the kernel accepts as
     built). Recorded per container in `__metadata__.quant.w4a16.group`; a container whose group
     differs from the loading binary's kernel is REFUSED at `Container::Load`
     (`CheckW4a16Group`) rather than read at the wrong stride.

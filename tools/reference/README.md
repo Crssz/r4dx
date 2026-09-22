@@ -911,6 +911,159 @@ from the shard mmap, and evaluates the lm_head a vocabulary block at a time -- a
 
 Peak VRAM ~5.4 GiB (control) and ~1.6 GiB (streaming / noise floor).
 
+## imatrix_capture.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\imatrix_capture.py `
+    --out D:\models\r4dx\qwen38-27b.imatrix.npz
+```
+
+The **importance matrix** (llama.cpp's "imatrix") for every linear `r4dx-convert` quantizes. For a
+weight `W [N, K]` the error that actually leaves a layer is `sum_k (W[n,k] - Wq[n,k]) * x_k`, so an
+input channel whose activation is routinely large deserves a tighter fit than one that is routinely
+near zero. This script measures exactly that, with llama.cpp's semantics:
+
+```
+importance[k] = mean over calibration tokens of x_k^2      (x = the linear's INPUT activation)
+```
+
+one `float32[K]` vector per container tensor. It changes no byte layout: the imatrix is an input to
+a *better choice of q/scale/zero* for the same containers and the same kernels.
+
+**Where the activations come from.** As with `kv_calibrate_full.py`, there is no forward of its own
+here: `full_logits_golden.StreamingReference` is imported unchanged and `forward_pre_hook`s are hung
+on the real `nn.Linear` modules of each `Qwen3_5DecoderLayer` as it is materialized on device 1, so
+every `x` squared is the true mid-stack activation with all the real preceding layers in front of
+it. `lm_head`'s vector is taken from the post-final-norm hidden state `forward_hidden` returns.
+
+**Key naming.** The npz key **is** the converter's own `add_linear` container base name, so
+`src/convert/main.cpp` can look a linear's vector up with zero mapping logic:
+
+| container tensor | npz key | K | fed by (HF module input) |
+|---|---|---|---|
+| attention (layer 3, `full_attention`) | `text.layers.3.attn.qg` | 5120 | `self_attn.q_proj` |
+| GDN (layer 0, `linear_attention`) | `text.layers.0.gdn.out_proj` | 6144 | `linear_attn.out_proj` |
+| MLP (layer 17) | `text.layers.17.mlp.down` | 17408 | `mlp.down_proj` |
+| head | `lm_head` | 5120 | the post-`final_norm` hidden state |
+| MTP head | `mtp.mlp.gate_up` | 5120 | the MTP layer's `mlp.gate_proj` |
+
+341 keys for the production container: 16 full-attention layers x `attn.qg|k|v|o`, 48 GDN layers x
+`gdn.in_proj_qkv|in_proj_z|out_proj`, 64 x `mlp.gate_up|down`, `lm_head`, and the four quantized
+`mtp.*` linears. `--draft-head` adds the optional `mtp.draft_head.lm_head` (only worth capturing if
+the container will be converted with `--draft-vocab-ids`).
+
+**Fused projections share one vector.** Every `add_linear` call concatenates on the OUTPUT (`N`)
+axis only -- `mlp.gate_up` is `[gate; up]`, and `attn.qg` is already fused in the checkpoint
+(`q_proj` is `Linear(hidden, num_heads*head_dim*2)`) -- so the `K` axis is never concatenated and
+one `[K]` vector serves both halves. `verify_no_k_concat()` re-checks that against the checkpoint's
+own shapes on every run, and `--fusion-check-layer` (default 0) additionally proves `gate_proj` and
+`up_proj` are handed the *same tensor object*.
+
+**The MTP head.** `transformers` 5.17.0 has no MTP class -- the checkpoint's `mtp.*` weights are
+dead tensors to it -- so the one MTP decoder layer is driven by a small hand-rolled forward that
+mirrors `src/model/mtp_head.cpp`: `fc(concat(rmsnorm(embed(t_{i+1}), pre_fc_norm_embedding),
+rmsnorm(h_i, pre_fc_norm_hidden)))` into a real `Qwen3_5DecoderLayer` built from `mtp.layers.0.*`,
+with the embedding in `fc`'s FIRST `hidden` input columns, both norms zero-centered `(1 + w)` like
+`r4dx_rmsnorm_bf16` (`RmsNormKernel`), and `h_i` the **pre-final-norm** residual stream (`RunChunk`
+primes MTP from `cur`, before `FinalLmHead` applies `final_norm`) paired with token `i+1`. That is
+why the four `mtp.*` keys carry `T-1` rows per corpus file and everything else carries `T`. Pass
+`--no-mtp` to skip it; the converter then finds no entry for those keys and quantizes them as it
+does today.
+
+**Corpus.** Identical to `kv_calibrate_full.py`'s, via the same `collect_corpus`:
+`tools/reference/calib.txt` + `tools/reference/kv_calib_corpus/` (English prose, Thai prose, C++,
+Python, one chat conversation rendered through the checkpoint's own `apply_chat_template`), each
+file its own sequence from a fresh context, truncated to `--max-tokens` (default 2048), 8316 tokens
+total. `tools/reference/kl_corpus/` is deliberately **not** used -- that is the held-out text the KL
+report is measured on, and calibrating the quantization constants on the text the drift is measured
+on would flatter the result.
+
+**Output**: `D:\models\r4dx\qwen38-27b.imatrix.npz` (341 `float32[K]` arrays, 10.1 MiB) plus
+`qwen38-27b.imatrix.json`, a sidecar with the corpus (path + sha256 + tokens each),
+`config_sha256`, `total_calibration_tokens`, per-key `{K, rows, hf_names, tap}`, the converter
+audit's sha256 of `src/convert/main.cpp`, the gate results, and the `caveat` (what this is: the
+diagonal second moment of the input activation; what it is **not**: a Hessian, and no more
+representative than the corpus). Data, not committed.
+
+Options: `--model-dir`, `--corpus-dir`/`--calib-txt` (`none` to skip), `--extra-files`,
+`--max-tokens`, `--max-files N` (gate runs), `--no-mtp`, `--draft-head`, `--fusion-check-layer`
+(`-1` to skip), `--probe-key`, `--determinism`, `--out`. There is no `--device`: the script refuses
+to start unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`.
+
+**Runtime**: 162.1 s for the 6-file / 8316-token corpus. **Peak VRAM 3.411 GiB allocated / 5.205
+GiB reserved** against a 51.7 GiB checkpoint (another job was resident on device 1 during this run,
+so the wall time is an upper bound, not an exclusive-GPU number).
+
+### Gates
+
+**(a) the key set is the converter's, and every `K` is the checkpoint's.** Two independent halves.
+First, `audit_converter_source()` re-derives main.cpp's `add_linear` call set *from its text* --
+only the calls whose first argument is a `{...}` initializer list, which by construction skips the
+DFlash2 draft container's own same-named lambda further down the file -- and diffs it against this
+script's table, refusing to run on any difference; `PlanLinearLayouts` calls that bypass
+`add_linear` are diffed too (`mtp.draft_head.lm_head`, plus `selftest`, which is
+`r4dx-convert --selftest`'s throwaway single-tensor container, not a model tensor). Second, every
+captured vector's `K` is checked against the in-features the checkpoint's own safetensors header
+reports, and the captured key set against the enumerated one (a hook that never fires shows up as
+`missing`).
+
+```
+[imatrix] converter audit (src/convert/main.cpp): text=10 mtp=4 add_linear shapes, direct PlanLinearLayouts=['mtp.draft_head.lm_head', 'selftest']
+[imatrix] converter audit: PASS (every quantized linear in main.cpp is accounted for)
+[imatrix] 341 quantized linears (336 text, 4 mtp, lm_head), no K-concat among any fused pair
+[gate a] converter linears expected: 341   captured: 341
+[gate a] missing (hook never fired): 0  []
+[gate a] extra (captured but not a converter linear): 0  []
+[gate a] K mismatches vs the checkpoint's in-features: 0  []
+[gate a] token counts per key: {8310: 4, 8316: 337} (key count per row count)
+[gate a] PASS
+```
+
+(`8310 = 8316 - 6` is the four `mtp.*` keys: one dangling row per corpus file, see "The MTP head".)
+
+**(b) the vectors are non-negative, finite and heavy-tailed.** Heavy tails are the whole premise --
+if importance were flat, an importance-weighted quantizer could not beat the plain min/max one.
+
+```
+[gate b] non-negative / finite / not-all-zero over 341 vectors: 0 bad []
+[gate b] text.layers.32.mlp.down: K=17408 top-10 channels by importance (mean over tokens of x_k^2):
+           # 1 channel   6947  0.254748  (22.8x median)
+           # 2 channel   9030  0.243852  (21.8x median)
+           # 3 channel   1631  0.208742  (18.7x median)
+           # 4 channel  10359  0.164831  (14.7x median)
+           # 5 channel   5517  0.162194  (14.5x median)
+           # 6 channel   2809  0.153697  (13.7x median)
+           # 7 channel  10013  0.151054  (13.5x median)
+           # 8 channel  16310  0.147505  (13.2x median)
+           # 9 channel   7709  0.145186  (13.0x median)
+           #10 channel   1010  0.144492  (12.9x median)
+[gate b] text.layers.32.mlp.down: max=0.254748 median=0.0111789 min=0.00348766 max/median=22.8x  (heavy tail expected)
+[gate b] max/median across all 341 vectors: p10=80.0 p50=1108.5 p90=14764.5 p99=88726.6
+[gate b] heaviest tails: text.layers.3.attn.v (93243x), text.layers.3.attn.qg (93243x), text.layers.3.attn.k (93243x)
+[gate b] PASS
+```
+
+`text.layers.32.mlp.down` is the tamest thing in the file at 22.8x -- the median linear is at
+**1108x** and the residual-stream reads (`attn.qg|k|v` of a layer all share one input, hence the
+identical ratios) reach **93243x**, which is this checkpoint's massive-activation channels showing
+up exactly where the literature says they do.
+
+**(c) determinism.** `--determinism` runs the whole capture twice in one process and diffs every
+vector channel-wise:
+
+```
+[gate c] determinism over 341 keys: 341 bit-identical, worst relative per-channel difference 0.000e+00 on (none) (bf16 x^2 noise floor 8.0e-03)
+[gate c] PASS
+[imatrix] determinism gate PASS; nothing written (341/341 keys bit-identical)
+```
+
+(Run on `--max-files 1 --max-tokens 256`.) *Across* processes it is not bit-exact: two full runs of
+the identical command put `text.layers.32.mlp.down`'s top channel at `0.254157` and `0.254748`,
+2.3e-3 relative -- the same 1-ulp bf16 cross-process wobble `full_logits_golden.py`'s gate (d)
+documents, and 3.4x below the 8e-3 noise floor a squared bf16 activation has anyway. Ordering,
+which is all a weighted quantizer consumes, is unaffected.
+
 ## tok_golden.py
 
 Not this component's -- owned by the tokenizer agent. Don't add it here.

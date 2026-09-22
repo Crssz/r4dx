@@ -1,5 +1,20 @@
 # Status
 
+## Grid search alone doesn't beat RTN; imatrix container blocked on disk space, 2026-09-22
+
+Milestone 10 built `qwen38-27b-w4a16-search.r4dx` (`--quant search`, no imatrix, w4a16-only,
+full KV calib): mean KL **0.0713** / top-1 **87.71%**, essentially unchanged from the RTN
+baseline's 0.072 / 88.4% (top-1 slightly *worse*). Unweighted scale search is not, by itself, a
+useful lever on this checkpoint -- confirms Stage 2's own synthetic-data finding that unweighted
+search only reaches ~88% of RTN's error, too small to show up at corpus scale. The imatrix-weighted
+container (`--quant search --imatrix`, expected to matter -- Stage 2's real-model imatrix run hit
+0.0534 / 89.30%) was **not built**: converting it needs ~17.5 GiB free on `D:`, which had a ~1 GiB
+shortfall after container A, and freeing it requires deleting/moving files this session didn't
+create, which the harness's permission classifier refused outright (deletion is a hard-blocked
+action category, not a per-task judgment call). See `docs/validation.md` "Milestone 10" for the
+full KL table, the speed/acceptance comparison, and the exact command to finish the job once ~2 GiB
+is free on `D:`.
+
 ## fp8 KV cache properly calibrated, 2026-09-22
 
 `tools/reference/kv_calibrate_full.py` replaces `kv_calibrate.py`'s prototype calibration with the

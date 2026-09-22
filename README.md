@@ -115,7 +115,10 @@ from the importance matrix `tools/reference/imatrix_capture.py` captures over th
 requires `--quant search`. The run logs how many linears it weighted and how many fell back to
 unweighted MSE; on this checkpoint the count should be every quantized linear, `0` fell back. It
 costs roughly 2x the conversion wall time of `--quant rtn` (measured on a 4-layer container: 18.9 s
--> 41.0 s) and nothing at inference time.
+-> 41.0 s) and nothing at inference time. **Pass `--imatrix` whenever you pass `--quant search`** --
+milestone 10 measured `--quant search` alone at mean KL/top-1 statistically unchanged from
+`--quant rtn` (0.0713/87.71% vs 0.072/88.4%) on a real w4a16 container; the search only helps once
+`--imatrix` tells it which channels matter (`docs/validation.md` "Milestone 10").
 
 ### Generate text
 

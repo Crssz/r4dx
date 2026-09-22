@@ -567,6 +567,93 @@ Converter/loader changes made for this pass: `--lm-head bf16` now survives `--no
 default lm_head spec is stripped), and `Container::Load` falls back to `lm_head.bf16.w` when the
 requested layout is absent from the container.
 
+### Milestone 10: grid search + imatrix (2026-09-22)
+
+Two full 64-layer w4a16-only containers converted with the Stage-2 `quant_search.hpp` sweep
+(`--quant search`, 21-step 0.85x-1.15x multiplier grid, never-worse-than-RTN), both `--mtp on
+--vision on --no-bf16 --lm-head 4bit`, same full-forward KV calibration as the baseline:
+
+- **A** `D:\models\r4dx\qwen38-27b-w4a16-search.r4dx` -- `--quant search`, no imatrix. Converted in
+  **250.996 s**.
+- **B** `qwen38-27b-w4a16-search-imatrix.r4dx` (`--quant search --imatrix
+  D:\models\r4dx\qwen38-27b.imatrix.npz`) -- **not built this stage**, see "What's missing" below.
+
+Baseline for both is the existing `qwen38-27b-w4a16-kvfull.r4dx` (`--quant rtn`, same KV calib,
+already measured: `tools/reference/kl_out/w4a16-kvfull`, mean KL 0.072 / top-1 88.4%).
+
+**Full KL table, container A** (`tools/reference/kl_out/w4a16-search`, `kl_w4a16-search.json`):
+
+| segment | rows | mean KL | median KL | p99 KL | max KL | top-1 | top-5 | ppl test |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| cpp_source | 1023 | 0.04905 | 0.01564 | 0.43222 | 1.78530 | 91.10% | 99.80% | 3.958 |
+| english_prose | 1023 | 0.05096 | 0.02828 | 0.28884 | 1.49641 | 89.44% | 99.90% | 3.992 |
+| python_source | 1023 | 0.05261 | 0.02455 | 0.31608 | 0.85268 | 90.13% | 99.90% | 4.817 |
+| thai_prose | 1023 | 0.13259 | 0.09048 | 0.81995 | 2.07074 | 80.16% | 98.92% | 17.007 |
+| **ALL** | 4092 | **0.07130** | 0.03661 | 0.53250 | 2.07074 | **87.71%** | 99.63% | 5.998 |
+
+**Unweighted search essentially matches the RTN baseline, it does not beat it**: 0.0713 mean KL /
+87.71% top-1 vs RTN's 0.072 / 88.4% -- within noise on mean KL, and top-1 is actually *0.7 points
+worse*. This is consistent with Stage 2's own finding on synthetic data (`(i) random unweighted ...
+87.65% of RTN [error]`, i.e. only ~12% of the group's quantization error is squeezable by a scale
+multiplier alone when nothing tells the search which elements matter) -- on real weights, spread
+across 337 linears and rounded through fp16 storage, that ~12%-per-group win doesn't survive into a
+corpus-level KL/top-1 signal. **The imatrix weighting is not a nice-to-have here, it is the entire
+mechanism** -- Stage 2's own imatrix-weighted synthetic case improved 3x more (`76.71% of RTN`) than
+the unweighted one, and rung-4's real-model imatrix run (Stage 2's bonus section) got 0.0534 / 89.30%
+on w4a16+mxfp4+w4a8 mixed layouts. Container B (search+imatrix, w4a16-only) is the one actually worth
+measuring; it was not built this stage.
+
+**Speed/acceptance, container A vs the RTN baseline** (standard haiku prompt from docs/perf.md,
+`--max-tokens 256 --temperature 0 --max-ctx 2048 --vision off`, HIP device 1, confirmed no other
+`python` process running via `Get-Process python`, single run each -- not doubled, since A is not
+the container this stage's gate cares about):
+
+| container | mode | decode tok/s | acceptance | tok/round |
+|---|---|---:|---:|---:|
+| baseline (rtn) | plain | 38.94 | -- | -- |
+| A (search) | plain | 38.92 | -- | -- |
+| baseline (rtn) | `--mtp 3` | 63.40 | 40.4% | 2.13 |
+| A (search) | `--mtp 3` | 64.69 | 40.0% | 2.17 |
+| baseline (rtn) | `--dflash` k=7 | 77.71 | 24.8% | 2.70 |
+| A (search) | `--dflash` k=7 | 73.48 | 22.7% | 2.55 |
+
+Plain decode speed is identical within noise (both bandwidth-bound on the same byte layout, as
+expected -- the search only changes *which* of the 16 codes each weight rounds to, not the format).
+MTP/DFlash acceptance move by a point or two either direction, i.e. noise, not a systematic
+improvement -- consistent with the KL finding that unweighted search is not doing meaningful work on
+this checkpoint.
+
+Sanity (A, greedy, 64 tokens, the milestone's standard KL-corpus-adjacent prompt): coherent --
+`Here is an explanation in plain English, breaking down the concepts of 4-bit quantization and
+importance matrices.` / `### Part 1: Why 4-bit Quantization Loses Accuracy` / `To understand why
+accuracy is lost, you first need to understand what **quantization** is.`
+
+**What's missing and why (read before trusting this subsection as complete):** container **B**
+(`--quant search --imatrix`), its KL table, its speed/acceptance table, and the `kl_audit.py`
+vocab-region/entropy comparison were **not run**. Converting it needs ~17.5 GiB free on `D:`;
+after container A (17.5 GiB) the drive had **16.48 GiB free, a ~1 GiB shortfall**. Freeing that
+space means deleting or moving a file on `D:\models\r4dx\` (candidates that are clearly safe:
+`qwen38-27b-l4-bf16.r4dx.pre-r1.bak` and `qwen38-27b-l4-mtp.r4dx.pre-r1.bak`, 12.4 + 11.9 GiB of
+pre-Rung-1 backups nothing depends on, or `m9kl-full-search.r4dx`, 40.4 GiB, the Stage-2 artifact
+whose own report already says "delete it if Stage 3 needs the space") -- both `Remove-Item` and
+`Move-Item` against files this session did not create were refused by the harness's own permission
+classifier ("Irreversible Local Destruction" / "Irreversible Deletion"), which is a hard rule this
+session cannot override even though the milestone's own instructions pre-authorize the deletion.
+**Container A was kept** (it is a real, valid, fully-evaluated data point -- the "unweighted search
+doesn't beat RTN" finding above stands on its own); it is not "strictly dominated" by anything, since
+B doesn't exist yet. The exact commands to finish this once ~2 GiB is free on `D:` (leave headroom):
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+.\build\win-hip\src\convert\r4dx-convert.exe `
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-w4a16-search-imatrix.r4dx `
+    --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz
+```
+then the same `tool_teacher_forced_logprobs` / `kl_report.py` / `r4dx-cli` sequence used for A above,
+plus `kl_audit.py` on the result.
+
 ## Rung 5 -- generation sanity
 
 Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass

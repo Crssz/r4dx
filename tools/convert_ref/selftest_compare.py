@@ -4,6 +4,15 @@ run through the actual CLI rather than the CTest-internal comparison (tests/conv
 test_pack_bytes.cpp exercises the same headers in-process; this script is the end-to-end version
 against the built r4dx-convert.exe, on a freshly generated random input each run).
 
+Covers all three ways r4dx-convert can choose its quantized values, on the same input tensor:
+  * `--quant rtn`                      -- the historical min/max + round-to-nearest grid
+  * `--quant search`                   -- error-minimizing search, unweighted MSE
+  * `--quant search --imatrix <npz>`   -- the same search weighted by a synthetic importance
+                                          vector this script generates and saves with numpy.savez
+                                          (keyed "selftest", the selftest tensor's container base)
+The byte LAYOUT is identical in all three; only the values differ, which is exactly what makes a
+byte-for-byte diff the right gate for the search.
+
 Usage (from the reference venv):
   C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe selftest_compare.py
       [--exe <path to r4dx-convert.exe>] [--n 48] [--k 384] [--seed 7]
@@ -82,43 +91,62 @@ def main() -> int:
     bf16_u16 = float_to_bf16_u16(raw).reshape(args.n, args.k)
     w = bf16_u16_to_float(bf16_u16)
 
+    # Synthetic importance vector: lognormal, so it carries the heavy per-channel tail a real
+    # imatrix has (tools/reference/imatrix_capture.py measured max/median ratios of 80x-90000x) and
+    # actually moves the search's choices, rather than being a near-uniform no-op.
+    imat = rng.lognormal(0.0, 2.0, size=args.k).astype(np.float32)
+
     with tempfile.TemporaryDirectory() as tmp:
         in_path = str(pathlib.Path(tmp) / "selftest_input.safetensors")
-        out_path = str(pathlib.Path(tmp) / "selftest_output.r4dx")
+        imat_path = str(pathlib.Path(tmp) / "selftest_imatrix.npz")
         write_bf16_safetensors(in_path, "w", bf16_u16, (args.n, args.k))
+        # np.savez writes ZIP_STORED members, which is what r4dx_convert::NpzReader accepts.
+        np.savez(imat_path, **{"selftest": imat})
 
-        proc = subprocess.run(
-            [args.exe, "--selftest", "--selftest-input", in_path, "--selftest-output", out_path,
-             "--layouts", "mxfp4,w4a16,w4a8", "--threads", "4"],
-            capture_output=True, text=True)
-        print(proc.stdout, end="")
-        if proc.returncode != 0:
-            print(proc.stderr, file=sys.stderr)
-            return 1
-
-        container = ContainerReader(out_path)
         ok = True
+        for label, extra_args, expect in (
+            ("--quant rtn", ["--quant", "rtn"], None),
+            ("--quant search", ["--quant", "search"], "none"),
+            ("--quant search --imatrix", ["--quant", "search", "--imatrix", imat_path], "imat"),
+        ):
+            print(f"\n=== {label} ===")
+            out_path = str(pathlib.Path(tmp) / f"selftest_output_{len(extra_args)}_{expect}.r4dx")
+            proc = subprocess.run(
+                [args.exe, "--selftest", "--selftest-input", in_path,
+                 "--selftest-output", out_path, "--layouts", "mxfp4,w4a16,w4a8", "--threads", "4"]
+                + extra_args,
+                capture_output=True, text=True)
+            print(proc.stdout, end="")
+            if proc.returncode != 0:
+                print(proc.stderr, file=sys.stderr)
+                return 1
 
-        q16, sc16, z16 = w4_ref.quantize_asymmetric(w)
-        ok &= compare("w4a16.wq", container["selftest.w4a16.wq"],
-                      w4_ref.pack_nibbles(q16, args.n, args.k).tobytes())
-        ok &= compare("w4a16.wsz", container["selftest.w4a16.wsz"],
-                      w4_ref.pack_w4a16_scales(sc16, z16, args.n, args.k).tobytes())
+            container = ContainerReader(out_path)
+            if expect is None:
+                q16, sc16, z16 = w4_ref.quantize_asymmetric(w)
+                q8, sc8 = w4_ref.quantize_symmetric_pinned8(w)
+                packed, escale, wref = mxfp4_ref.quantize(w)
+            else:
+                im = imat if expect == "imat" else None
+                q16, sc16, z16 = w4_ref.quantize_asymmetric_search(w, imatrix=im)
+                q8, sc8 = w4_ref.quantize_symmetric_pinned8_search(w, imatrix=im)
+                packed, escale, wref = mxfp4_ref.quantize_search(w, imatrix=im)
 
-        q8, sc8 = w4_ref.quantize_symmetric_pinned8(w)
-        ok &= compare("w4a8.wq", container["selftest.w4a8.wq"],
-                      w4_ref.pack_nibbles(q8, args.n, args.k).tobytes())
-        ok &= compare("w4a8.ws", container["selftest.w4a8.ws"],
-                      w4_ref.pack_w4a8_scales(sc8, args.n, args.k).tobytes())
+            ok &= compare("w4a16.wq", container["selftest.w4a16.wq"],
+                          w4_ref.pack_nibbles(q16, args.n, args.k).tobytes())
+            ok &= compare("w4a16.wsz", container["selftest.w4a16.wsz"],
+                          w4_ref.pack_w4a16_scales(sc16, z16, args.n, args.k).tobytes())
+            ok &= compare("w4a8.wq", container["selftest.w4a8.wq"],
+                          w4_ref.pack_nibbles(q8, args.n, args.k).tobytes())
+            ok &= compare("w4a8.ws", container["selftest.w4a8.ws"],
+                          w4_ref.pack_w4a8_scales(sc8, args.n, args.k).tobytes())
+            ok &= compare("mxfp4.wq", container["selftest.mxfp4.wq"],
+                          mxfp4_ref.permute_wq(packed, args.n, args.k).tobytes())
+            ok &= compare("mxfp4.ws", container["selftest.mxfp4.ws"],
+                          mxfp4_ref.pack_ws(escale, args.n, args.k).tobytes())
+            ok &= compare("mxfp4.wref", container["selftest.mxfp4.wref"], wref.tobytes())
 
-        packed, escale, wref = mxfp4_ref.quantize(w)
-        ok &= compare("mxfp4.wq", container["selftest.mxfp4.wq"],
-                      mxfp4_ref.permute_wq(packed, args.n, args.k).tobytes())
-        ok &= compare("mxfp4.ws", container["selftest.mxfp4.ws"],
-                      mxfp4_ref.pack_ws(escale, args.n, args.k).tobytes())
-        ok &= compare("mxfp4.wref", container["selftest.mxfp4.wref"], wref.tobytes())
-
-    print("PASS" if ok else "FAIL")
+    print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1
 
 

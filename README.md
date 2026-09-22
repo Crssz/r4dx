@@ -80,7 +80,8 @@ $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
     --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v3.r4dx `
     --layouts w4a8,w4a16,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib.json
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz
 ```
 
 Produces a single container carrying every requested quantized GEMM layout (plus bf16 for
@@ -97,6 +98,24 @@ need). The older `D:\models\r4dx\qwen38-27b.r4dx` (all four layouts including fu
 disk for comparison -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of scope for
 performance work. See `docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s
 header comment for the full flag list, including `--selftest` for the byte-exact packer self-check.
+
+**`--quant` / `--imatrix` -- how the 4-bit values are chosen.** Neither flag changes a single byte of
+the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
+which `q` / `scale` / `zero` values land in those bytes, so any container is readable by any loader
+either way. `--quant search` (the **default**) replaces the historical min/max + round-to-nearest
+grid with a per-`(row, 128-K group)` search over 21 candidate scales (`0.85x .. 1.15x`) and three
+candidate integer zeros, plus a weighted least-squares refit of the scale. The round-to-nearest grid
+is itself candidate 0 and later candidates must win strictly, so the search is *never* worse.
+`--quant rtn` restores the old behaviour byte for byte -- use it to reproduce a pre-existing
+container exactly.
+
+`--imatrix <npz>` weights the search's error term by each input channel's mean activation energy,
+from the importance matrix `tools/reference/imatrix_capture.py` captures over the calibration corpus
+(`D:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names). It
+requires `--quant search`. The run logs how many linears it weighted and how many fell back to
+unweighted MSE; on this checkpoint the count should be every quantized linear, `0` fell back. It
+costs roughly 2x the conversion wall time of `--quant rtn` (measured on a 4-layer container: 18.9 s
+-> 41.0 s) and nothing at inference time.
 
 ### Generate text
 

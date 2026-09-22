@@ -138,10 +138,18 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
     `0x6400 | q` widened weight nibble) (`r4d_gemm_w4a16_nt_m64.hip:56-59`, `r4d.h` `r4d_gemm_w4a16_nt_m64_group()` = 128).
   - Group size: `r4d_gemm_w4a16_nt_m64_group()` (128, `R4D_GEMM_W4_GROUP`).
 
-**`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): **byte-for-byte the same `wq` as `w4a16`**
-  (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), plus its own scale tensor:
-  - `<name>.w4a8.wq` -- identical bytes to `<name>.w4a16.wq` (the converter writes it once and
-    hardlinks/duplicates rather than re-deriving).
+**`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): the same nibble *permutation* as `w4a16`
+  (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), but its own separately
+  quantized tensor -- see the note below:
+  - `<name>.w4a8.wq` -- `uint8[N * K / 2]`, `PackW4Nibbles`'d exactly like `w4a16.wq`, but from a
+    SYMMETRIC quantization whose integer zero is pinned to 8. `r4d_gemm_w4a8_nt_m64`'s `dequant8()`
+    has no zero-point input at all (it reads the stored nibble as a two's-complement signed nibble),
+    so sharing one `wq` with `w4a16` would only be exact if `w4a16`'s per-group zero happened to be
+    8 everywhere -- and this converter deliberately computes a free per-group zero for `w4a16`,
+    because it is measurably more accurate. So r4dx-convert emits **two separate `wq` tensors**:
+    `w4a16.wq` with a free zero and `w4a8.wq` with the zero pinned to 8. They are the same size and
+    the same layout; only the codes differ. (`src/convert/include/r4dx_convert/quant_int4.hpp`'s
+    header comment derives this from the two kernels' `dequant()` / `dequant8()`.)
   - `<name>.w4a8.ws` -- `uint16[N * K / 128]` f16 scale only (no zero point -- signed 4-bit codes,
     symmetric).
   - Activation-side: `quant_act_i8` (`r4d_quant_act_i8`) produces a per-row int8 activation plus an
@@ -161,6 +169,48 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
     scale is folded against (same source comment: "plus a per-row reference exponent").
   - Group size: `r4d_gemm_mxfp4a8_nt_m64_group()` (32).
   - Activation-side: `e4m3` with an f32 per-row scale, produced at inference time (not stored).
+
+### How the quantized values are chosen
+
+**The byte layout above does not depend on this section.** Everything here is about *which* `q` /
+`scale` / `zero` (or E8M0 exponent) values get written into those exact bytes, and a loader cannot
+tell the two modes apart except by reading `r4dx_convert_run.quant_values` out of the container
+metadata. `r4dx-convert --quant {rtn,search}` picks between them; `search` is the default.
+
+**`rtn`** -- the original quantizer, and what every container built before this flag existed
+contains. One grid per `(row, group)` straight from the data's extremes, then round-to-nearest:
+`w4a16` takes `scale = (max-min)/15`, `zero = round(-min/scale)` clipped to `0..15`; `w4a8` takes
+`scale = amax/7` with the zero pinned to 8; `mxfp4` takes `exponent = ceil(log2(amax/6))`, i.e. it
+always rounds the exponent up so nothing clips.
+
+**`search`** -- the same byte layout, but each `(row, group)` keeps the candidate that minimizes
+
+```
+E(scale, zero) = sum_k  wt_k * (x_k - scale * (q_k - zero))^2,
+                 q_k = clamp(round_half_away_from_zero(x_k / scale) + zero, 0, 15)
+```
+
+over 21 candidate scales spanning `0.85x .. 1.15x` of the `rtn` grid (step 10 is exactly `1.0x`, so
+the `rtn` grid is itself a candidate) crossed with the three integer zeros `round(-min/scale) + {-1,
+0, +1}` clamped to `0..15`, modelled on llama.cpp's `make_qkx2_quants`. The winner then gets one
+weighted least-squares refit of the float scale, `scale* = sum_k wt_k x_k (q_k-z) / sum_k wt_k
+(q_k-z)^2`, with the codes held fixed, kept only if it lowers the error. `w4a8` runs the same sweep
+with the zero held at 8 (its kernel has no zero-point input); `mxfp4` instead tries the round-up
+exponent and that exponent minus one and keeps the lower-error one. The `rtn` candidate is scored
+first and later candidates must win **strictly**, so the search's error is never above `rtn`'s --
+`tests/convert/test_quant_search.cpp` gates that group by group.
+
+`wt_k` is `1` unless `--imatrix <npz>` is given, in which case it is input channel `k`'s mean
+activation energy from `tools/reference/imatrix_capture.py`'s importance matrix, keyed by these same
+container base names. A linear absent from the `.npz` falls back to `wt_k = 1` with a warning and an
+end-of-run coverage line.
+
+The reference implementations are `src/convert/include/r4dx_convert/quant_search.hpp` and
+`tools/convert_ref/w4_ref.py` / `mxfp4_ref.py`, which agree **bit-for-bit**
+(`tools/convert_ref/selftest_compare.py` diffs the real CLI's output against the Python for all
+three modes). That is only possible because the evaluation order is pinned: float32 throughout for
+`w4a16`/`w4a8` (float64 for `mxfp4`), error accumulated sequentially over `k`, and no
+floating-point contraction.
 
 ## KV descale tables
 

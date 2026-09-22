@@ -19,6 +19,16 @@ add_test(NAME convert_pack_bytes COMMAND convert_pack_bytes)
 # check against the real kernels' actual indexing was a manual, non-CTest GPU script. This test
 # decodes the packed bytes by the kernels' own literal indexing (re-derived from the .hip sources,
 # not by inverting the packer) -- CPU-only, always runs.
+# --quant search (src/convert/include/r4dx_convert/quant_search.hpp): never worse than RTN on any
+# group, a large win on an outlier-dominated group once an imatrix de-weights the outlier channel,
+# and bit-exact agreement with tools/convert_ref/{w4_ref,mxfp4_ref}.py's search on the shared
+# random fixture. Needs the fixtures directory for the last part.
+add_executable(convert_quant_search test_quant_search.cpp)
+target_link_libraries(convert_quant_search PRIVATE r4dx_convert)
+target_compile_definitions(convert_quant_search PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_quant_search COMMAND convert_quant_search)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

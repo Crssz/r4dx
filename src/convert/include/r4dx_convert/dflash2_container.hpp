@@ -195,14 +195,17 @@ inline void PlanDflash2Linear(ContainerWriter& writer, const GgufReader& g,
   PlanLinearLayouts(writer, spec.container_base, N, K, layouts);
 }
 
+// `opts` defaults to round-to-nearest so an existing caller (and tests/convert/
+// test_dflash_container.cpp) keeps producing byte-identical drafter containers; r4dx-convert's
+// --dflash-gguf mode passes its own --quant through.
 inline void EmitDflash2Linear(ContainerWriter& writer, const GgufReader& g,
                                const Dflash2LinearSpec& spec, const LayoutSet& layouts,
-                               int nthreads) {
+                               int nthreads, const QuantOptions& opts = QuantOptions{}) {
   const auto& info = g.TensorInfo(spec.gguf_name);
   const int N = static_cast<int>(info.ne[1]);
   const int K = static_cast<int>(info.ne[0]);
   std::vector<float> w = g.DequantToF32(spec.gguf_name);
-  EmitLinearLayouts(writer, spec.container_base, w, N, K, layouts, nthreads);
+  EmitLinearLayouts(writer, spec.container_base, w, N, K, layouts, nthreads, opts);
 }
 
 // f32 norm/gate/misc tensor: dequant to f32, store as raw fp32 (task A1: "Norm weights f32" --

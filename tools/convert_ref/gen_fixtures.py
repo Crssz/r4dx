@@ -80,6 +80,28 @@ def main() -> None:
     mxfp4_ref.pack_ws(escale, N, K).tofile(str(out_dir / "mxfp4_ws.bin"))
     wref.tofile(str(out_dir / "mxfp4_wref.bin"))
 
+    # ---- --quant search fixtures (tests/convert/test_quant_search.cpp) ------------------------
+    # Same input tensor, both weightings. `search_imatrix.bin` is the float32[K] importance vector
+    # the C++ test feeds to the search -- lognormal, so it has the heavy per-channel tail a real
+    # tools/reference/imatrix_capture.py vector has and actually changes the chosen values.
+    imat = rng.lognormal(0.0, 2.0, size=K).astype(np.float32)
+    imat.tofile(str(out_dir / "search_imatrix.bin"))
+
+    for suffix, im in (("", None), ("_imat", imat)):
+        q16s, sc16s, z16s = w4_ref.quantize_asymmetric_search(w, imatrix=im)
+        w4_ref.pack_nibbles(q16s, N, K).tofile(str(out_dir / f"search{suffix}_w4a16_wq.bin"))
+        w4_ref.pack_w4a16_scales(sc16s, z16s, N, K).tofile(
+            str(out_dir / f"search{suffix}_w4a16_wsz.bin"))
+
+        q8s, sc8s = w4_ref.quantize_symmetric_pinned8_search(w, imatrix=im)
+        w4_ref.pack_nibbles(q8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_wq.bin"))
+        w4_ref.pack_w4a8_scales(sc8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_ws.bin"))
+
+        ps, es, wr = mxfp4_ref.quantize_search(w, imatrix=im)
+        mxfp4_ref.permute_wq(ps, N, K).tofile(str(out_dir / f"search{suffix}_mxfp4_wq.bin"))
+        mxfp4_ref.pack_ws(es, N, K).tofile(str(out_dir / f"search{suffix}_mxfp4_ws.bin"))
+        wr.tofile(str(out_dir / f"search{suffix}_mxfp4_wref.bin"))
+
     print("fixtures written to", out_dir)
 
 

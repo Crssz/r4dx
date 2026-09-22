@@ -15,6 +15,7 @@
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/quant_int4.hpp"
 #include "r4dx_convert/quant_mxfp4.hpp"
+#include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 
 namespace r4dx_convert {
@@ -23,6 +24,19 @@ namespace r4dx_convert {
 
 struct LayoutSet {
   bool mxfp4 = false, w4a16 = false, w4a8 = false, bf16 = true;
+};
+
+// How the quantized layouts pick their (scale, zero) values. The BYTE LAYOUT is identical either
+// way -- see quant_search.hpp. `kRtn` is the historical round-to-nearest min/max grid and is the
+// default here so every caller that does not opt in (tests/convert, the DFlash2 path's own
+// defaults) keeps producing byte-identical containers; r4dx-convert's CLI defaults to kSearch.
+enum class QuantMode { kRtn, kSearch };
+
+struct QuantOptions {
+  QuantMode mode = QuantMode::kRtn;
+  // Per-input-channel importance weights of length K, or empty for unweighted MSE. Ignored
+  // entirely when mode == kRtn.
+  ImportanceVector importance;
 };
 
 inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, int N, int K,
@@ -57,7 +71,8 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
 
 inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
                                const std::vector<float>& w, int N, int K, const LayoutSet& layouts,
-                               int nthreads) {
+                               int nthreads, const QuantOptions& opts = QuantOptions{}) {
+  const bool search = (opts.mode == QuantMode::kSearch);
   if (layouts.bf16) {
     auto bytes = EncodeBf16(w);
     writer.WriteTensor(base + ".bf16.w", bytes.data(), bytes.size());
@@ -65,7 +80,11 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
   if (layouts.w4a16) {
     std::vector<uint8_t> q, zero;
     std::vector<float> scale;
-    QuantizeInt4Asymmetric(w.data(), N, K, kInt4Group, nthreads, q, scale, zero);
+    if (search)
+      QuantizeInt4AsymmetricSearch(w.data(), N, K, kInt4Group, opts.importance, nthreads, q, scale,
+                                   zero);
+    else
+      QuantizeInt4Asymmetric(w.data(), N, K, kInt4Group, nthreads, q, scale, zero);
     auto wq = PackW4Nibbles(q, N, K, nthreads);
     auto wsz = PackW4A16Scales(scale, zero, N, K, kInt4Group);
     writer.WriteTensor(base + ".w4a16.wq", wq.data(), wq.size() * 4);
@@ -74,14 +93,20 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
   if (layouts.w4a8) {
     std::vector<uint8_t> q;
     std::vector<float> scale;
-    QuantizeInt4SymmetricPinned8(w.data(), N, K, kInt4Group, nthreads, q, scale);
+    if (search)
+      QuantizeInt4Pinned8Search(w.data(), N, K, kInt4Group, opts.importance, nthreads, q, scale);
+    else
+      QuantizeInt4SymmetricPinned8(w.data(), N, K, kInt4Group, nthreads, q, scale);
     auto wq = PackW4Nibbles(q, N, K, nthreads);
     auto ws = PackW4A8Scales(scale, N, K, kInt4Group);
     writer.WriteTensor(base + ".w4a8.wq", wq.data(), wq.size() * 4);
     writer.WriteTensor(base + ".w4a8.ws", ws.data(), ws.size() * 4);
   }
   if (layouts.mxfp4) {
-    Mxfp4Quantized mq = QuantizeMxfp4(w.data(), N, K, kMxfp4Group, nthreads);
+    Mxfp4Quantized mq = search
+                            ? QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, opts.importance,
+                                                  nthreads)
+                            : QuantizeMxfp4(w.data(), N, K, kMxfp4Group, nthreads);
     auto wq = PackMxfp4Wq(mq.packed, N, K, nthreads);
     auto ws = PackMxfp4Ws(mq.escale, N, K, kMxfp4Group);
     writer.WriteTensor(base + ".mxfp4.wq", wq.data(), wq.size());

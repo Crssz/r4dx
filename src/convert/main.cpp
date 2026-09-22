@@ -7,6 +7,17 @@
 //                [--layers N] [--threads T] [--vision on|off] [--mtp on|off] [--no-bf16]
 //                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
 //                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
+//                [--quant {rtn,search}] [--imatrix <tools/reference/imatrix_capture.py .npz>]
+//
+// --quant selects HOW the 4-bit values are chosen; it does NOT change a single byte of the on-disk
+// layout (docs/container-format.md, "How the quantized values are chosen"). `rtn` is the historical
+// min/max grid + round-to-nearest and reproduces any pre-existing container byte for byte; `search`
+// (the DEFAULT) minimizes the squared reconstruction error per (row, 128-K group) over a small
+// candidate grid (src/convert/include/r4dx_convert/quant_search.hpp). --imatrix additionally weights
+// that error by each input channel's mean activation energy, from the .npz
+// tools/reference/imatrix_capture.py writes (keyed by these same container base names); it requires
+// --quant search, and a linear with no entry in the file falls back to unweighted MSE with a
+// warning plus an end-of-run coverage line.
 //
 // --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
 // lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
@@ -45,6 +56,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -59,6 +72,7 @@
 #include "r4dx_convert/gguf_reader.hpp"
 #include "r4dx_convert/kv_calib.hpp"
 #include "r4dx_convert/linear_layouts.hpp"
+#include "r4dx_convert/npz_reader.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -179,6 +193,18 @@ struct AppArgs {
   std::string dflash_gguf;
   std::string dflash_out;
   std::string dflash_layout = "w4a16";  // one of w4a16, w4a8, mxfp4, bf16
+
+  // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
+  // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "search" (default)
+  // minimizes the (optionally importance-weighted) squared reconstruction error per (row, group);
+  // "rtn" is the historical min/max + round-to-nearest grid and reproduces every container built
+  // before this flag existed byte for byte.
+  std::string quant = "search";
+  // Importance matrix ("imatrix") .npz from tools/reference/imatrix_capture.py, keyed by the
+  // converter's own container base names. Weights the search's error term by the mean activation
+  // energy of each input channel. Only meaningful with --quant search; a linear with no entry in
+  // the file falls back to unweighted MSE (with a count reported at the end of the run).
+  std::string imatrix;
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -216,9 +242,73 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--dflash-gguf") a.dflash_gguf = next(i);
     else if (arg == "--out") a.dflash_out = next(i);
     else if (arg == "--layout") a.dflash_layout = next(i);
+    else if (arg == "--quant") a.quant = next(i);
+    else if (arg == "--imatrix") a.imatrix = next(i);
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  if (a.quant != "rtn" && a.quant != "search")
+    throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
+  if (!a.imatrix.empty() && a.quant != "search")
+    throw std::runtime_error("--imatrix requires --quant search (got --quant " + a.quant + ")");
   return a;
+}
+
+// Loads the imatrix .npz once (or nothing) and hands out per-linear weight vectors by container
+// base name. Also tallies coverage so a run against a stale/partial imatrix is visible in the log
+// rather than silently degrading to unweighted MSE for half the model.
+class ImatrixSource {
+ public:
+  ImatrixSource(const std::string& path, r4dx_convert::QuantMode mode) : mode_(mode) {
+    if (path.empty()) return;
+    npz_ = std::make_unique<r4dx_convert::NpzReader>(path);
+    std::cout << "[r4dx-convert] imatrix=" << path << " (" << npz_->Count() << " vector(s))\n";
+  }
+
+  r4dx_convert::QuantOptions For(const std::string& container_base, int64_t K) {
+    r4dx_convert::QuantOptions opts;
+    opts.mode = mode_;
+    if (!npz_) return opts;
+    int64_t len = 0;
+    const float* v = npz_->Vector(container_base, &len);
+    if (v == nullptr) {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++missing_;
+      if (missing_ <= 8)
+        std::cerr << "[r4dx-convert] WARNING: imatrix has no vector for '" << container_base
+                  << "' -- that linear is quantized with unweighted MSE\n";
+      return opts;
+    }
+    if (len != K) {
+      // A length mismatch means the imatrix was captured against a different checkpoint/shape;
+      // using it would weight the wrong channels, which is worse than not weighting at all.
+      throw std::runtime_error("r4dx-convert: imatrix vector '" + container_base + "' has length " +
+                                std::to_string(len) + " but the linear's K is " +
+                                std::to_string(K));
+    }
+    opts.importance.data = v;
+    opts.importance.size = len;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      ++hit_;
+    }
+    return opts;
+  }
+
+  void ReportCoverage() const {
+    if (!npz_) return;
+    std::cout << "[r4dx-convert] imatrix coverage: " << hit_ << " linear(s) weighted, " << missing_
+              << " fell back to unweighted MSE\n";
+  }
+
+ private:
+  r4dx_convert::QuantMode mode_;
+  std::unique_ptr<r4dx_convert::NpzReader> npz_;
+  std::mutex mu_;
+  int64_t hit_ = 0, missing_ = 0;
+};
+
+r4dx_convert::QuantMode ParseQuantMode(const std::string& s) {
+  return s == "search" ? r4dx_convert::QuantMode::kSearch : r4dx_convert::QuantMode::kRtn;
 }
 
 int ResolveThreads(int requested) {
@@ -273,6 +363,13 @@ int RunConvert(const AppArgs& args) {
             << "[r4dx-convert] hidden=" << hidden << " layers=" << layers << "/" << num_layers_total
             << " threads=" << threads << " vision=" << (do_vision ? "on" : "off")
             << " mtp=" << (do_mtp ? "on" : "off") << "\n";
+
+  // The BYTE LAYOUT is identical in both modes (docs/container-format.md "How the quantized values
+  // are chosen"); only the (scale, zero) values differ.
+  const r4dx_convert::QuantMode quant_mode = ParseQuantMode(args.quant);
+  std::cout << "[r4dx-convert] quant=" << args.quant
+            << (args.imatrix.empty() ? " (unweighted MSE)" : " (imatrix-weighted)") << "\n";
+  ImatrixSource imatrix(args.imatrix, quant_mode);
 
   const bool have_kv_calib = !args.kv_calib.empty();
   nlohmann::json kv_calib_json;
@@ -343,7 +440,7 @@ int RunConvert(const AppArgs& args) {
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
     });
-    emit_jobs.push_back([&writer, &model, hf_names, container_base, ls, threads]() {
+    emit_jobs.push_back([&writer, &model, &imatrix, hf_names, container_base, ls, threads]() {
       std::vector<float> w;
       int64_t K = 0;
       for (auto& n : hf_names) {
@@ -352,8 +449,12 @@ int RunConvert(const AppArgs& args) {
         w.insert(w.end(), part.begin(), part.end());
       }
       const int64_t N = static_cast<int64_t>(w.size()) / K;
+      // Every add_linear fuses on the OUTPUT axis only (mlp.gate_up is the only fusion and both
+      // halves share K), so one length-K importance vector per container base is well defined --
+      // tools/reference/imatrix_capture.py asserts the same thing from the other side.
       r4dx_convert::EmitLinearLayouts(writer, container_base, w, static_cast<int>(N),
-                                       static_cast<int>(K), ls, threads);
+                                       static_cast<int>(K), ls, threads,
+                                       imatrix.For(container_base, K));
     });
   };
 
@@ -484,7 +585,7 @@ int RunConvert(const AppArgs& args) {
         writer.Plan("mtp.draft_head.vocab_ids", {draft_vocab_size, 4},
                     static_cast<uint64_t>(draft_vocab_size) * 4);
       });
-      emit_jobs.push_back([&writer, &model, draft_ids, layouts, threads]() {
+      emit_jobs.push_back([&writer, &model, &imatrix, draft_ids, layouts, threads]() {
         const auto full = r4dx_convert::ReadTensorAsFloat(model, "lm_head.weight");
         const int64_t hidden_k = model.Meta("lm_head.weight").shape[1];
         const int64_t vocab_full = static_cast<int64_t>(full.size()) / hidden_k;
@@ -500,9 +601,14 @@ int RunConvert(const AppArgs& args) {
                     sliced.begin() + static_cast<int64_t>(i) * hidden_k);
           ids32[i] = static_cast<int32_t>(id);
         }
+        // Its input distribution is the MTP layer's post-`mtp.norm` hidden, NOT the backbone's, so
+        // it must never borrow `lm_head`'s vector -- imatrix_capture.py emits its own
+        // `mtp.draft_head.lm_head` only under --draft-head, and without that key this falls back to
+        // unweighted MSE (with the usual warning) rather than silently mis-weighting.
         r4dx_convert::EmitLinearLayouts(writer, "mtp.draft_head.lm_head", sliced,
                                          static_cast<int>(draft_ids.size()),
-                                         static_cast<int>(hidden_k), layouts, threads);
+                                         static_cast<int>(hidden_k), layouts, threads,
+                                         imatrix.For("mtp.draft_head.lm_head", hidden_k));
         writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
       });
     }
@@ -554,6 +660,10 @@ int RunConvert(const AppArgs& args) {
       {"draft_vocab_ids",
        args.draft_vocab_ids.empty() ? std::string("none (no reduced-vocab draft head)")
                                      : args.draft_vocab_ids},
+      // How the quantized values were CHOSEN (the byte layout is the same either way) -- so a
+      // container on disk says which quantizer produced it without re-deriving it from the bytes.
+      {"quant_values", args.quant},
+      {"imatrix", args.imatrix.empty() ? std::string("none (unweighted MSE)") : args.imatrix},
   };
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
@@ -561,6 +671,7 @@ int RunConvert(const AppArgs& args) {
 
   for (auto& j : emit_jobs) j();
   writer.Finish();
+  imatrix.ReportCoverage();
 
   const auto t1 = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -590,6 +701,12 @@ int RunSelftest(const AppArgs& args) {
     throw std::runtime_error("--selftest tensor must be BF16 or F32");
   }
 
+  // The selftest packs one tensor named `--selftest-name`'s container base "selftest", so an
+  // --imatrix passed here must carry a "selftest" vector of length K -- that is what
+  // tools/convert_ref/selftest_compare.py generates for its weighted pass.
+  ImatrixSource imatrix(args.imatrix, ParseQuantMode(args.quant));
+  const r4dx_convert::QuantOptions opts = imatrix.For("selftest", K);
+
   ContainerWriter writer;
   r4dx_convert::PlanLinearLayouts(writer, "selftest", N, K, layouts);
   nlohmann::json metadata;
@@ -598,11 +715,12 @@ int RunSelftest(const AppArgs& args) {
   metadata["produced_by"] = "r4dx-convert --selftest";
   metadata["quant"] = BuildQuantMetadata();
   writer.FinalizeHeader(args.selftest_output, metadata);
-  r4dx_convert::EmitLinearLayouts(writer, "selftest", w, N, K, layouts, threads);
+  r4dx_convert::EmitLinearLayouts(writer, "selftest", w, N, K, layouts, threads, opts);
   writer.Finish();
 
-  std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " -> " << args.selftest_output
-            << "\n";
+  std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " quant=" << args.quant
+            << (opts.importance.empty() ? " (unweighted MSE)" : " (imatrix-weighted)") << " -> "
+            << args.selftest_output << "\n";
   return 0;
 }
 
@@ -634,8 +752,14 @@ int RunDflashConvert(const AppArgs& args) {
   GgufReader gguf(Utf8ToWide(args.dflash_gguf));
   Dflash2Metadata meta = ReadDflash2Metadata(gguf);
 
+  // The DFlash2 drafter has no imatrix of its own (imatrix_capture.py's keys are the main model's
+  // container bases), so --quant search here is the unweighted-MSE search.
+  r4dx_convert::QuantOptions quant_opts;
+  quant_opts.mode = ParseQuantMode(args.quant);
+
   std::cout << "[r4dx-convert --dflash-gguf] input=" << args.dflash_gguf << " out=" << args.dflash_out
-            << " layout=" << args.dflash_layout << " threads=" << threads << "\n"
+            << " layout=" << args.dflash_layout << " threads=" << threads
+            << " quant=" << args.quant << "\n"
             << "[r4dx-convert --dflash-gguf] hidden=" << meta.hidden << " block_count=" << meta.block_count
             << " vocab=" << meta.vocab_size << " n_rot=" << meta.n_rot << "\n";
 
@@ -646,8 +770,9 @@ int RunDflashConvert(const AppArgs& args) {
     plan_jobs.push_back([&writer, &gguf, gguf_name, container_base, layouts]() {
       PlanDflash2Linear(writer, gguf, Dflash2LinearSpec{gguf_name, container_base}, layouts);
     });
-    emit_jobs.push_back([&writer, &gguf, gguf_name, container_base, layouts, threads]() {
-      EmitDflash2Linear(writer, gguf, Dflash2LinearSpec{gguf_name, container_base}, layouts, threads);
+    emit_jobs.push_back([&writer, &gguf, gguf_name, container_base, layouts, threads, quant_opts]() {
+      EmitDflash2Linear(writer, gguf, Dflash2LinearSpec{gguf_name, container_base}, layouts, threads,
+                        quant_opts);
     });
   };
   auto add_f32 = [&](std::string gguf_name, std::string container_name) {

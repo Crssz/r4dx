@@ -4,8 +4,9 @@
   Configure + build r4dx with the 'win-hip' CMake preset.
 
 .DESCRIPTION
-  Uses the vLLM_for_AMD venv's CMake 4.4.2 / Ninja (the PATH cmake is 3.31, which cannot
-  configure clang-cl builds the way this project needs) against the ROCm SDK at C:\opt\rocm.
+  Uses the vLLM_for_AMD venv's CMake 4.4.2 / Ninja when that venv exists, otherwise the cmake/ninja
+  on PATH (CMake 3.31 + Ninja from PATH configure and build the 'win-hip' preset too -- verified
+  2026-09-22 once the venv had been deleted from this machine), against the ROCm SDK at C:\opt\rocm.
   r4d_core's 15 libr4d translation units are compiled by hipcc.exe directly (see
   third_party/CMakeLists.txt); everything else is plain clang-cl C++.
 
@@ -36,13 +37,23 @@ $VenvScripts = Join-Path $VenvRoot "Scripts"
 $Cmake = Join-Path $VenvScripts "cmake.exe"
 $Ninja = Join-Path $VenvScripts "ninja.exe"
 
-foreach ($tool in @($Cmake, $Ninja)) {
-    if (-not (Test-Path $tool)) { throw "required tool not found: $tool" }
+# The reference venv is not a hard requirement -- fall back to whatever cmake/ninja are on PATH when
+# it is absent (it is a machine-local Python environment that can be deleted or recreated
+# independently of this repo). CMake 3.31 + Ninja 1.x from PATH configure and build this preset
+# correctly; the venv copies are simply the newer ones the project was originally developed against.
+if (-not (Test-Path $Cmake) -or -not (Test-Path $Ninja)) {
+    $PathCmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue)
+    $PathNinja = (Get-Command ninja.exe -ErrorAction SilentlyContinue)
+    if (-not $PathCmake) { throw "cmake.exe not found in $VenvScripts nor on PATH" }
+    if (-not $PathNinja) { throw "ninja.exe not found in $VenvScripts nor on PATH" }
+    Write-Output "[build] reference venv not found at $VenvRoot -- using PATH cmake/ninja"
+    $Cmake = $PathCmake.Source
+    $Ninja = $PathNinja.Source
+} else {
+    # So CMake's Ninja generator resolves `ninja` to the venv's 1.13 build rather than any older copy
+    # earlier on PATH.
+    $env:PATH = "$VenvScripts;$env:PATH"
 }
-
-# So CMake's Ninja generator resolves `ninja` to the venv's 1.13 build rather than any older copy
-# earlier on PATH.
-$env:PATH = "$VenvScripts;$env:PATH"
 
 $BuildDir = Join-Path $PSScriptRoot "build\$Preset"
 if ($Clean -and (Test-Path $BuildDir)) {

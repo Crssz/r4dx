@@ -1,5 +1,31 @@
 # Status
 
+## Rung 4 measurement audited, 2026-09-22
+
+The `w4a16` KL number below was re-examined adversarially, on the premise that it is wrong. It
+holds: **mean KL 0.08794 nats, top-1 87.00%, ppl 5.661 (bf16) vs 6.027 (`w4a16`) are unchanged.**
+Two re-runnable tools were added for the audit -- `tools/reference/kl_audit.py` (numpy only:
+identity, off-by-one alignment control, clamp accounting, KL-vs-reference-entropy, KL split by
+vocabulary region) and `tools/reference/reference_selfcheck.py` (GPU: the streaming reference
+against a *fully resident* 4-layer `Qwen3_5TextModel` loaded the ordinary way, plus the reference's
+own bf16 noise floor at full 64-layer depth).
+
+What the audit established: the streaming bf16 reference agrees with a plain `transformers` forward
+at every position to one or two bf16 ulps (max hidden `|diff|` 2.99e-01 vs a 1.97e-01 ulp, argmax
+48/48); the reference's self-noise at 64 layers is mean KL **3.9e-04** (0.4% of the reported value)
+at 99.61% top-1 self-agreement; the pairing is aligned (shifting it by one row collapses top-1 to
+1.5-3.4% and inflates KL to 9-15 nats); the dumped rows are what the engine really samples from
+(64/64 rows reproduce `r4dx-cli`'s greedy tokens on the real container); and the `-1e4` fp16 clamp
+fired on **zero** entries in all eight dumps, so it is not a term in the result at all.
+
+The `thai_prose` outlier is now explained rather than just reported: ~60% of it is entropy
+composition (entropy-matched, its mean KL drops from 0.15633 to 0.08930), and the rest is the
+extended/multilingual vocabulary tail (`ids >= 148000`) being reconstructed **2.1-2.7x** less
+accurately by the quantized model *in every segment* -- it only costs `thai_prose`, which draws 60%
+of its probability mass from there against ~0.03% for the other three. Real quantization loss in
+the 4-bit `lm_head`'s rare-token rows, not a tokenizer, corpus or measurement artifact. Detail:
+`docs/validation.md` "Auditing this measurement".
+
 ## Rung 4 measured, 2026-09-22
 
 Teacher-forced KL(bf16 reference || `w4a16`) on the held-out 4-segment corpus

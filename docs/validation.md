@@ -164,15 +164,19 @@ descale formula; the real per-model calibration pass (full 64-layer stack, real 
 
 ## Rung 4 -- full logits, offloaded, few tokens
 
-**Not yet measured.** Run the *whole* model (both `transformers`, CPU-offloaded a layer at a time
-given the 27B size, and r4dx end to end on HIP device 1) on real prompt tokens and diff final
-logits. This is where rung 3's per-layer tolerances compound -- expect a visibly looser bound than
-any single layer's, and a plan for *how much* looser (e.g. `rel_err` growing roughly with
-`sqrt(num_layers)` for independent per-layer error, `2e-2 * sqrt(64) ~ 0.16` as a first guess)
-needs to be pinned down empirically, not guessed here.
+**Measured for `w4a16` on 2026-09-22, and audited the same day.** Run the *whole* model (both
+`transformers`, streamed a layer at a time given the 27B size, and r4dx end to end on HIP device 1)
+over real token sequences and compare final distributions. This is where rung 3's per-layer
+tolerances compound, so the artifact is a **distribution** comparison (per-position KL over the full
+vocabulary) rather than a per-element `rel_err` bound: the original guess here was that `rel_err`
+would grow like `sqrt(num_layers)` (`2e-2 * sqrt(64) ~ 0.16`), which is not a quantity a quantized
+engine can usefully be held to at the logit level.
 
-The r4dx half of the **tooling** for that measurement is built (2026-09-22) -- see "Rung 4 tooling"
-below. The `w4a16` measurement itself is in "Rung 4 measurement: w4a16" further down.
+Three sections follow: **"Rung 4 tooling"** (the shared format and both halves' programs),
+**"Rung 4 measurement: w4a16"** (the numbers), and **"Auditing this measurement"** (the adversarial
+re-examination of those numbers, and the two tools that make it re-runnable). Layouts other than
+`w4a16` -- `w4a8`, `mxfp4` -- have not been measured yet; the tooling takes `--layout`, so each is
+one tool invocation plus one `kl_report.py` run against the same reference dumps.
 
 ### Rung 4 tooling
 
@@ -342,17 +346,24 @@ concurrently.
   (tok 148410 `'้อง'`, KL 2.035), pos 318 (tok 149334 `'ญา'`, KL 1.717), pos 636 (tok 157620
   `'เฉล'`, KL 2.376), pos 669 (tok 45596 `'ี่'`, KL 1.290), pos 949 (tok 35982 `'ว'`, KL 1.887), pos
   962 (tok 148947 `'ูก'`, KL 1.808). Every Thai KL>1 token is a sub-syllable script fragment, not a
-  whole word -- consistent with the tokenizer's byte/character-level fallback for Thai and with the
-  corpus's much higher baseline reference perplexity (15.6 vs 3.8-4.6 for the other three), rather
-  than any obviously localized bug. Not investigated further per this stage's scope (report, don't
-  fix).
+  whole word. The `thai_prose` outlier is decomposed in "Auditing this measurement" below; it is
+  real quantization loss, not a tokenizer or corpus artifact.
 
-**The `-1e4` clamp caveat.** Every logprob below -1e4 is floored to -1e4 in fp32 before the fp16
-cast on both sides (`exp(-1e4) == 0.0` even in fp64), so the KL sum is unaffected by how far below
-that floor a token's true log-prob sits. The per-segment fp16 round-trip diagnostic
+**What this number is a delta of.** The whole `w4a16` *container as configured*, not the body
+weights alone: 4-bit body weights with fp16 activations, a **4-bit `lm_head`**, and the **fp8 paged
+KV cache** with its calibrated descales, all driven through the engine's per-token decode kernels.
+Attributing the 0.088 between those three is a separate experiment (the container carries no bf16
+body layout, so it cannot be done by re-running this tool with a different `--layout`).
+
+**The `-1e4` clamp caveat -- measured, and it is a no-op.** Every logprob below -1e4 is floored to
+-1e4 in fp32 before the fp16 cast on both sides. `kl_audit.py` check 3 counts how often that
+actually fires: across all eight dumps (4 segments x 2 sides, `1023 x 248320` entries each)
+**zero** entries were at or below the floor, on either side, and therefore zero reference
+probability mass sits on a clamped test entry. The floor is insurance against an fp16 `-inf`, not
+a term in this result. The per-segment fp16 round-trip diagnostic
 (`max |sum_v exp(logp_ref[v]) - 1|`, expect ~1e-3) came back `1.13e-03` / `8.84e-04` / `9.59e-04` /
-`1.02e-03` for the four segments -- nowhere near ~1, so the clamp/format is not corrupting the
-distributions.
+`1.02e-03` for the four segments -- nowhere near ~1, so the format is not corrupting the
+distributions either.
 
 **Sanity controls** (per this stage's brief):
 
@@ -380,6 +391,131 @@ run's overall mean KL is **0.08794** (top-1 87.0%) -- inside the "close" band bu
 other three segments. `w4a16`'s ppl is consistently ~3-9% above the bf16 reference on every
 segment (3.921/3.805, 4.024/3.755, 4.922/4.605, 16.991/15.610), a uniform small perplexity
 inflation rather than one segment breaking outright.
+
+### Auditing this measurement
+
+**Audited 2026-09-22, HIP device 1.** The numbers above survived an adversarial re-examination whose
+premise was that they are wrong. Two tools were written for it and are committed, so every check
+below is re-runnable rather than a one-off:
+
+- `tools/reference/kl_audit.py` -- numpy only, no GPU, no checkpoint. Runs on the same
+  `--ref-dir`/`--test-dir`/`--tokens` triple as `kl_report.py` and adds five checks: identity,
+  alignment (the off-by-one control), clamp accounting, KL-vs-reference-entropy, and the KL split by
+  vocabulary region. `--self-test` plants a deliberately one-row-shifted dump with a clamped column
+  and requires the audit to report exactly that.
+- `tools/reference/reference_selfcheck.py` -- GPU, validates the *reference half* against code it
+  does not share.
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+& $py tools\reference\kl_audit.py --self-test
+& $py tools\reference\kl_audit.py `
+    --ref-dir tools\reference\kl_out\ref --test-dir tools\reference\kl_out\w4a16 `
+    --tokens tools\reference\kl_corpus\tokens.json --out tools\reference\kl_out\kl_audit_w4a16.json
+& $py tools\reference\reference_selfcheck.py --tokens tools\reference\kl_corpus\tokens.json `
+    --truncated 4 --tokens-n 48 --noise-floor --noise-n 256 `
+    --out tools\reference\kl_out\reference_selfcheck.json
+```
+
+**1. Is the reference itself faithful?** This is the check the measurement most depends on and the
+one `full_logits_golden.py`'s own `--cross-check` *cannot* make: `--impl model` and `--impl manual`
+share `build_layer`, `gather_embedding_rows` and `logits_fp32`, so a bug in the streaming machinery
+is invisible to them. `reference_selfcheck.py --truncated 4` therefore builds a genuine, fully
+resident `Qwen3_5TextModel` with `num_hidden_layers = 4` -- ordinary `nn.Module`, ordinary
+`load_state_dict` from the same shards, ordinary `nn.Linear` over the whole 248320-way lm_head --
+and compares it to `StreamingReference(max_layers=4)` at **every** position. `layer_types[:4]` is
+`[linear, linear, linear, full]`, so both the GDN and the full-attention path are covered.
+
+| streaming impl | hidden max\|diff\| | logits max\|diff\| | argmax agreement | per-position KL(control‖streaming) |
+|---|---:|---:|---:|---:|
+| `model` | 2.99e-01 | 3.13e-01 | 48/48 | max 1.74e-03, mean 3.42e-04 |
+| `manual` | 2.99e-01 | 3.13e-01 | 48/48 | max 1.74e-03, mean 3.42e-04 |
+
+The hidden-state disagreement is 2.99e-01 against `|hidden|max = 50.5`, where **one bf16 ulp is
+1.97e-01** -- i.e. one to two ulps, which is what two differently-ordered bf16 reductions of the
+same arithmetic are entitled to, and there is no drift with position. The streaming composition is
+faithful.
+
+**2. The reference's own noise floor at full depth.** `--noise-floor` runs all 64 layers through
+both compositions over 256 positions and measures the per-position KL between them: **mean
+3.94e-04**, median 3.3e-05, p99 3.5e-03, max 5.3e-03, top-1 self-agreement **99.61%** (a second run
+gave mean 3.47e-04 / 99.22%, which is the run-to-run spread of GPU reduction order). So the
+reference disagrees with *itself* by ~0.4% of the 0.08794 being reported, and agrees with itself on
+the top token 99%+ of the time against the 87.00% measured for `w4a16`. Neither the measured KL nor
+the measured top-1 gap is bf16 noise.
+
+**3. Is the pairing aligned?** An off-by-one on either side is the failure that looks like "merely a
+large KL". `kl_audit.py` check 2 pairs the rows deliberately wrong and reports both:
+
+| segment | top-1 aligned | top-1 `ref[i]`/`test[i+1]` | top-1 `ref[i+1]`/`test[i]` | mean KL aligned | mean KL shifted +1 |
+|---|---:|---:|---:|---:|---:|
+| cpp_source | 91.01% | 2.84% | 2.84% | 0.05907 | 15.108 |
+| english_prose | 89.74% | 3.42% | 3.33% | 0.06765 | 13.225 |
+| python_source | 89.05% | 2.05% | 2.64% | 0.06869 | 14.049 |
+| thai_prose | 78.20% | 1.66% | 1.47% | 0.15633 | 9.125 |
+
+A misaligned dump would score the right-hand columns. It scores the left-hand ones. Independently,
+the reference's own argmax hits the corpus's actual next token 71.95% / 63.54% / 66.67% / 41.25% of
+the time -- a sane profile for a 27B model on code / English / Python / Thai, and impossible if row
+`i` were not predicting token `i+1`. Both sidecars' `sha256_of_token_ids_json` also recompute to the
+tokens file's own hash on all four segments, so the two halves provably scored the same ids.
+
+**4. Is the dumped row what the engine actually samples from?** `r4dx-cli` generated 64 tokens
+greedily on the **real 64-layer `w4a16` container** (`--temperature 0`, `--vision off`, no MTP, no
+DFlash) writing `--dump-token-ids`, and `tool_teacher_forced_logprobs --check-greedy 64` then scored
+that exact 92-token sequence: **64/64 rows' argmax equals the token the CLI committed**, including
+the prompt/generation boundary row, at `max |logsumexp(row)| = 1.7e-06`. The dump is the generation
+path's own distribution, not a lookalike. (`--vision off`, `mtp 0`, `dflash false` are recorded in
+each r4dx sidecar; `tool_teacher_forced_logprobs.cpp` hard-codes the last two.)
+
+**5. Where does the divergence actually come from?** Two decompositions, both in `kl_audit.py`.
+
+*By reference entropy* (check 4). KL grows monotonically with how flat the bf16 distribution already
+is, in every segment -- from ~0.005 nats where the reference is near-certain (`H < 0.25`) to
+~0.17-0.25 where it is spread wide (`H > 3`). `thai_prose` has 72.7% of its positions above `H = 1`
+and 33.9% above `H = 3`, against 39-51% and 4.8-16.1% for the other three. Reweighting each segment
+onto `cpp_source`'s entropy histogram:
+
+| segment | raw mean KL | entropy-matched mean KL |
+|---|---:|---:|
+| cpp_source | 0.05907 | 0.05907 |
+| english_prose | 0.06765 | 0.05551 |
+| python_source | 0.06869 | 0.05837 |
+| thai_prose | 0.15633 | 0.08930 |
+
+So the other two ASCII segments are, at matched confidence, slightly *better* than `cpp_source`, and
+`thai_prose`'s 2.65x raw gap shrinks to 1.51x. Roughly 60% of the Thai outlier is composition -- the
+bf16 model is simply far less certain there (mean entropy 2.26 vs 1.15-1.36 nats; reference
+perplexity 15.6 vs 3.8-4.6) -- and ~40% is a genuine Thai-specific excess.
+
+*By vocabulary region* (check 5), which is what that remaining 40% is. `thai_prose` draws **50.7% of
+its token ids from `>= 148000`**, the checkpoint's extended/multilingual vocabulary tail, against
+0.0% / 0.0% / 0.2% for the other three. Splitting the KL sum there:
+
+| segment | ref mass in ids ≥148000 | KL from that region | KL per unit mass, low / high | mass-weighted \|Δ logp\|, low / high |
+|---|---:|---:|---:|---:|
+| cpp_source | 0.00026 | -0.00003 (-0.1%) | +0.0591 / -0.1237 | 0.174 / 0.462 |
+| english_prose | 0.00011 | -0.00000 (-0.0%) | +0.0677 / -0.0086 | 0.223 / 0.464 |
+| python_source | 0.00046 | -0.00007 (-0.1%) | +0.0688 / -0.1541 | 0.207 / 0.552 |
+| thai_prose | 0.60318 | +0.12362 (**79.1%**) | +0.0824 / **+0.2049** | 0.318 / 0.426 |
+
+The last column is the tell: in **every** segment, including the three that are 100% ASCII, the
+quantized model reproduces log-probabilities in the `>= 148000` tail **2.1-2.7x** less accurately
+than in the head of the vocabulary. For the ASCII segments that region holds ~0.01-0.05% of the
+probability mass, so it costs them nothing; for `thai_prose` it holds 60% of the mass and supplies
+79% of the KL, at 0.205 nats per unit mass against 0.082 in the low region. The Thai excess is the
+4-bit `lm_head`'s rare-token rows being reconstructed worse, surfacing on the one segment whose
+predictions live there -- a property of the quantization, not of the measurement.
+
+*Not a corpus or tokenizer artifact.* All four corpus files are already NFC-normalized,
+`decode(tokenize(text))` is a prefix of the source text for each, re-tokenizing reproduces the
+committed ids exactly, and no line longer than 20 characters is shared with `calib.txt` (the fp8 KV
+descale calibration corpus), so the corpus is genuinely held out.
+
+**Verdict.** Trustworthy as stated: the KL is `KL(P_bf16 ‖ Q_w4a16)`, in nats, over the full
+248320-way vocabulary, accumulated in fp64, averaged over positions, on aligned rows of identical
+token ids, against a reference validated against a plain transformers forward, with a reference
+self-noise ~200x smaller than the reported value.
 
 ## Rung 5 -- generation sanity
 

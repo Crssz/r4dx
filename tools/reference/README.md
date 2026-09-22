@@ -638,6 +638,66 @@ The same run's fp16 round-trip diagnostic (`1.06e-03`, `8.80e-04`, `1.65e-03`, `
 each segment's `max_abs_logsumexp_fp16` sidecar field to the digit, which is what it should be:
 both are measuring the same fp16 rounding of the same rows from two different directions.
 
+## kl_audit.py
+
+```powershell
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kl_audit.py `
+    --ref-dir tools\reference\kl_out\ref --test-dir tools\reference\kl_out\w4a16 `
+    --tokens tools\reference\kl_corpus\tokens.json --out tools\reference\kl_out\kl_audit.json
+```
+
+The adversarial companion to `kl_report.py`. `kl_report.py` answers *how far apart are these two
+dumps*; `kl_audit.py` answers *is that number measuring what it claims to, and where does it come
+from*. Same inputs, numpy only, no GPU / torch / checkpoint. Five checks:
+
+| # | check | what it catches |
+|---|---|---|
+| 1 | **identity** | both sidecars' `sha256_of_token_ids_json` recomputed from the tokens file, plus `T`/`rows`/`V` -- the two halves scoring different ids |
+| 2 | **alignment** | pairs `ref[i]` against `test[i+1]` and `ref[i+1]` against `test[i]` and reports top-1 and mean KL for both. An off-by-one row on either side looks like "merely a large KL" unless you measure the shifted pairing too. Also reports how often each side's argmax is the corpus's actual next token |
+| 3 | **clamp** | how much reference probability mass really sits on entries the test side floored at `LOGPROB_CLAMP`, and how many entries were clamped at all -- turns the fp16-clamp *argument* into a measurement |
+| 4 | **entropy** | mean KL and top-1 binned by the *reference's* own per-position entropy, plus the **entropy-matched** mean KL (each segment reweighted onto the first segment's entropy histogram). Separates "this segment is genuinely worse" from "this segment simply has flatter distributions" |
+| 5 | **vocab** | the KL sum split at `--vocab-split` (default 148000, where this checkpoint's extended/multilingual tail begins), with the reference mass in each region and the mass-weighted mean `\|logp_ref - logp_test\|`. Says whether one region of the `lm_head` is reconstructed worse than another |
+
+`--self-test` (no files, no GPU) builds a tiny pair whose test dump is deliberately shifted by
+exactly one row and carries a planted clamped column, and requires the audit to report precisely
+that: aligned top-1 0.00%, `ref[i]`/`test[i+1]` top-1 100.00%, aligned mean KL 5.375 vs shifted
+0.0000, 16 clamped entries on the test side and 0 on the reference side, and the two vocab-region
+KL contributions summing back to the total.
+
+The Rung 4 `w4a16` run through this tool is written up in docs/validation.md, "Auditing this
+measurement".
+
+## reference_selfcheck.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\reference_selfcheck.py `
+    --tokens tools\reference\kl_corpus\tokens.json --truncated 4 --tokens-n 48 `
+    --noise-floor --noise-n 256 --out tools\reference\kl_out\reference_selfcheck.json
+```
+
+Validates the *reference half* of the KL measurement against code it does not share. This matters
+because `full_logits_golden.py` is not an ordinary `transformers` forward -- it builds the skeleton
+on `meta`, streams each decoder layer's weights in and out of VRAM, gathers embedding rows straight
+from the shard mmap, and evaluates the lm_head a vocabulary block at a time -- and because its own
+`--cross-check` cannot see any of that: `--impl model` and `--impl manual` share `build_layer`,
+`gather_embedding_rows` and `logits_fp32`.
+
+- `--truncated N` (default 4) builds a **genuine, fully resident** `Qwen3_5TextModel` with
+  `num_hidden_layers = N` -- ordinary `nn.Module`, ordinary `load_state_dict` from the same shards,
+  ordinary `nn.Linear` over the whole 248320-way lm_head -- and compares it to
+  `StreamingReference(max_layers=N)` at every position: hidden states, full-vocab logits, argmax,
+  and per-position KL. `N = 4` because `layer_types[:4]` is `[linear, linear, linear, full]` for
+  this checkpoint (both paths covered) and because the resident control plus the resident lm_head
+  fits in ~5.4 GiB. Measured: max hidden `|diff|` 2.99e-01 against a bf16 ulp of 1.97e-01 at
+  `|hidden|max = 50.5`, argmax 48/48, per-position KL mean 3.42e-04.
+- `--noise-floor` runs the **full 64 layers** through both compositions and reports the
+  per-position KL between them -- the bf16 reduction-order noise floor at the depth the real
+  measurement runs at, below which no quantization KL means anything. Measured: mean 3.94e-04,
+  top-1 self-agreement 99.61% over 256 positions.
+
+Peak VRAM ~5.4 GiB (control) and ~1.6 GiB (streaming / noise floor).
+
 ## tok_golden.py
 
 Not this component's -- owned by the tokenizer agent. Don't add it here.

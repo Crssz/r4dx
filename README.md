@@ -261,9 +261,13 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 
 ## Status
 
-**Rung 4 (teacher-forced KL vs bf16) measured (2026-09-22).** `w4a16` overall mean KL 0.08794
-nats / 87.00% top-1 agreement vs the original bf16 checkpoint on a held-out 4-segment corpus --
-see `docs/validation.md`'s "Rung 4 measurement: w4a16".
+**Rung 4 (teacher-forced KL vs bf16) measured and audited (2026-09-22).** `w4a16` overall mean KL
+0.08794 nats / 87.00% top-1 agreement vs the original bf16 checkpoint on a held-out 4-segment
+corpus. The number survived an adversarial audit (`tools/reference/kl_audit.py`,
+`tools/reference/reference_selfcheck.py`): the bf16 reference matches a plain `transformers`
+forward to one bf16 ulp per position, its own self-noise at 64 layers is 3.9e-04 nats, and the
+`thai_prose` outlier is the extended-vocabulary tail of the 4-bit `lm_head`, not a measurement bug
+-- see `docs/validation.md`'s "Rung 4 measurement: w4a16" and "Auditing this measurement".
 
 **Milestone 8 done, integrated and measured (2026-09-22, stage 8).** Every gate green on a clean
 `build.ps1 -Clean`: `ctest` 62 registered/61 passed/1 skipped, `tools/validate_dflash.ps1

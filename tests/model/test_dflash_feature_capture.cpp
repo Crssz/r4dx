@@ -76,7 +76,7 @@ bool AllFinite(const std::vector<float>& v) {
 
 }  // namespace
 
-int main() {
+static int RunTest() {
   if (!FileExists(kContainerPath)) {
     return SkipMissing(kContainerPath);
   }
@@ -331,3 +331,7 @@ int main() {
 
   return 0;
 }
+
+// An exception escaping RunTest (a container the loader refuses, most often) is a FAIL with its
+// message, not a 0xc0000409 crash -- see RunGuardedMain in tests/model/test_container_path.h.
+int main() { return r4dx_test::RunGuardedMain("test_dflash_feature_capture", RunTest); }

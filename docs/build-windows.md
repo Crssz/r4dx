@@ -135,21 +135,48 @@ The `tests/convert` suite is group-agnostic: it runs every int4 quantizer, packe
 `tools/convert_ref/selftest_compare.py` takes `--w4a16-group` / `--w4a8-group` and, by default,
 reads the group back out of the container the exe under test just wrote.
 
-The `tests/model` and `tests/model/attention` tests are different: they read fixed 4-layer
-containers at hard-coded `D:\models\r4dx\` paths **packed at group 128**, which the now-default
-group-64 build rightly refuses. Group-matched copies live in `D:\models\r4dx\g64\` -- same
-basenames, one directory down -- and `R4DX_TEST_CONTAINER_DIR`
-(`tests/model/test_container_path.h`) points the suite at them:
+The `tests/model` and `tests/model/attention` tests are different: they open fixed 4-layer test
+containers, and a container is only loadable by binaries built at its own group. Those containers
+therefore exist once per group -- the historical **group-128** copies at `D:\models\r4dx\<name>`,
+**group-64** copies under the same basenames in `D:\models\r4dx\g64\` -- and every test resolves
+its path through `r4dx_test::ContainerPath` (`tests/model/test_container_path.h`) in this order:
+
+1. `R4DX_TEST_CONTAINER_DIR`, if set: `<that dir>\<basename>` (an explicit override; it wins over
+   the group, so pointing it at copies of the wrong group makes the affected tests **fail** on the
+   loader's group guard, with the loader's message).
+2. Otherwise the directory for the group the binary was built with, read at run time from
+   `r4d_gemm_w4a16_nt_m64_group()` -- the same number the loader checks the container against:
+   group 128 -> `D:\models\r4dx\<name>` (unchanged), group 64 -> `D:\models\r4dx\g64\<name>`.
+
+The tests that need the **real 64-layer container** (`test_dflash_e2e`, `test_vision_tower`, and
+the defaults of the `tool_*` diagnostics) use `ProductionTargetPath()` / `ProductionDrafterPath()`
+from the same header, which pick the production pair packed at the build's group:
+`qwen38-27b-v6.r4dx` + `qwen38-27b-dflash2-w4a16-g64.r4dx` at 64, `qwen38-27b-v3.r4dx` +
+`qwen38-27b-dflash2-w4a16.r4dx` at 128, both in `D:\models\r4dx\`. `R4DX_TEST_CONTAINER_DIR` does
+not apply to that pair (no 64-layer container is copied into `g64\`).
+
+So **no environment variable is needed on either build** -- plain `ctest --preset win-hip` and
+`ctest --preset win-hip-g128` (or `ctest --test-dir build\win-hip[-g128]` with
+`HIP_VISIBLE_DEVICES=1`) each read the containers of their own group:
 
 ```powershell
-$env:R4DX_TEST_CONTAINER_DIR = 'D:\models\r4dx\g64'
-ctest --preset win-hip
+.\build.ps1;                         ctest --preset win-hip        # group 64: g64\ + v6
+.\build.ps1 -Preset win-hip-g128;    ctest --preset win-hip-g128   # group 128: D:\models\r4dx\ + v3
+$env:R4DX_TEST_CONTAINER_DIR = 'E:\elsewhere'; ctest --preset win-hip   # optional override
 ```
 
-**`ctest --preset win-hip` needs that variable on this machine**; without it every `tests/model`
-test that opens one of those containers fails on the group guard. `ctest --preset win-hip-g128`
-wants it *unset*, so it reads the historical group-128 copies in `D:\models\r4dx\`. The recipe for
-regenerating the directory (six containers, ~52 GiB, ~3 min of CPU) is:
+A container that is **missing** makes its test SKIP (exit 77, `[SKIP] <path> not found`); one that
+is **present but refused** makes it FAIL with the loader's message (`r4dx_test::RunGuardedMain`
+catches what would otherwise escape `main()` and end the process as `0xc0000409`).
+
+`tools/validate_dflash.ps1`, `validate_fusion.ps1`, `validate_spec_sampling.ps1` and
+`tools/server/smoke.ps1` follow the same rules through `tools/r4dx_containers.ps1`: with no
+`-Model`/`-Dflash` they read `R4DX_W4A16_GROUP` from the `CMakeCache.txt` of the build directory
+whose executable they run (`build\win-hip`, or `build\<Preset>` for `smoke.ps1`) and pick the
+matching production pair (the validators) or 4-layer test container (`smoke.ps1`). An explicit
+`-Model` / `-Dflash` always wins.
+
+The recipe for regenerating `g64\` (six containers, ~52 GiB, ~3 min of CPU) is:
 
 ```powershell
 $dir = 'D:\models\r4dx\g64'
@@ -167,8 +194,8 @@ longer on disk, so it was rebuilt from a fresh arbitrary 4096-id subset (the 141
 `tools/reference/kl_corpus/tokens.json`, padded from 0) -- the reduced-vocab draft head is about
 correctness plumbing, not about which ids, so any 4096-id list does. Without it `test_mtp`'s
 reduced-vocab cases drop to `[SKIP]` on a default build even though that path is on by default in
-production. `test_dflash_e2e` does skip: its target is the 42 GiB `qwen38-27b-v3.r4dx`, which was
-not worth a group-64 copy.
+production. There is no 64-layer container in `g64\` (not worth a 42 GiB copy): the group-64
+build's real-container tests use the production `qwen38-27b-v6.r4dx` instead, as above.
 
 A bf16 or mxfp4 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
 does. `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is

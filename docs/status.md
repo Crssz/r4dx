@@ -24,8 +24,10 @@ and the fix in the message, rather than reading their scales at the wrong stride
 the new **`win-hip-g128`** preset (verified: builds clean, loads `v5` at `weights=15.5076 GiB`).
 Note that an *existing* build directory keeps 128 in its CMake cache until you pass
 `-DR4DX_W4A16_GROUP=64` once. `tests/model`'s fixed-path containers were re-converted into
-`D:\models\r4dx\g64\`; `ctest --preset win-hip` needs `R4DX_TEST_CONTAINER_DIR` pointed there on
-this machine. The DFlash2 drafter was re-converted too, and **must** use `--quant search`: the
+`D:\models\r4dx\g64\`; `ctest --preset win-hip` needed `R4DX_TEST_CONTAINER_DIR` pointed there on
+this machine (no longer, 2026-09-23: the tests now pick the container directory -- and the
+production v6/v3 pair -- matching the build's group themselves; `docs/build-windows.md` "w4a16 group
+size"). The DFlash2 drafter was re-converted too, and **must** use `--quant search`: the
 default `rtn` costs 6.4 tok/s of DFlash2 decode (21.4% acceptance vs 24.9%), which is the opposite
 of Milestone 10's finding for the main model.
 

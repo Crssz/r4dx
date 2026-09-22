@@ -33,8 +33,9 @@
   a regression check that flipping the env var alone never perturbs it.
 
 .PARAMETER Model
-  Path to a .r4dx container with mtp.* weights (required for the --mtp 3 rows). Default: the real
-  64-layer container.
+  Path to a .r4dx container with mtp.* weights (required for the --mtp 3 rows). Default: the production container matching build\win-hip's w4a16 group,
+  read from build\win-hip\CMakeCache.txt (R4DX_W4A16_GROUP) by tools\r4dx_containers.ps1: group 64
+  (the default build) -> D:\models\r4dx\qwen38-27b-v6.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx.
 
 .PARAMETER Layouts
   Comma-separated layout list. Default: w4a16,w4a8,mxfp4 (bf16 excluded, see above).
@@ -50,7 +51,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Model = "D:\models\r4dx\qwen38-27b-v3.r4dx",
+    [string]$Model = "",  # "" = the group-matched production container (see .PARAMETER Model)
     [string]$Layouts = "w4a16,w4a8,mxfp4",
     [int]$MaxTokens = 40
 )
@@ -61,6 +62,12 @@ $env:HIP_VISIBLE_DEVICES = '1'
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
+# Default containers follow build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an explicit
+# -Model/-Dflash wins.
+. (Join-Path $PSScriptRoot "r4dx_containers.ps1")
+if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
+Write-Output "[validate_fusion] model=$Model"
+if (-not (Test-Path $Model)) { throw "model container not found: $Model" }
 
 # Three prompt lengths (task requirement): short single-chunk, ~100-token multi-chunk prefill,
 # ~1000-token long-context (several 64-token prefill chunks -- docs/architecture.md's "Interim

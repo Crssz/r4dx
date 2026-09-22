@@ -48,9 +48,10 @@
 // tests/model/attention/CMakeLists.txt, which wins). Route it through r4dx_test::ContainerPath so
 // R4DX_TEST_CONTAINER_DIR can redirect it -- see tests/model/test_container_path.h for why a build
 // with a non-default R4DX_W4A16_GROUP needs that. NOTE: this test reads the container through a
-// raw SafetensorsReader, not Container::Load, so it gets NO group check -- point it at a
-// mismatched container and the w4a16 pass silently produces NaN, which is exactly the failure mode
-// the loader guard exists to prevent.
+// raw SafetensorsReader, not Container::Load, so it would get NO group check of its own --
+// TryLoadQuantLinear below therefore applies the loader's CheckW4a16Group itself (the group
+// recovered from the .w4a16.wsz tensor's own size), so a mismatched container FAILS with the
+// loader's message instead of the w4a16 pass silently producing NaN.
 const char* const kBf16ContainerPath = r4dx_test::ContainerPath(R4DX_BF16_CONTAINER_PATH);
 
 using namespace r4dx::core;
@@ -222,6 +223,14 @@ std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const 
     case Layout::kW4a16: {
       const std::string wq = base + ".w4a16.wq", wsz = base + ".w4a16.wsz";
       if (!r.Has(wq) || !r.Has(wsz)) return std::nullopt;
+      // wsz holds one uint32 per (row, group) pair: N*K/group of them, i.e. 4*N*K/group bytes
+      // (counted from the byte span: the tensor is stored with a byte dtype). Container::Load checks
+      // the __metadata__ group; this raw reader does not see __metadata__, so recover the packed
+      // group from the tensor itself and hand it to the SAME guard (throws, naming both groups).
+      const auto& wsz_meta = r.Meta(wsz);
+      const int64_t wsz_count = static_cast<int64_t>((wsz_meta.end - wsz_meta.begin) / 4);
+      r4dx::model::CheckW4a16Group(wsz_count > 0 ? static_cast<int>(N * K / wsz_count) : 0,
+                                   kBf16ContainerPath);
       q.wq = upload_u8(wq);
       q.w4a16_wsz = upload_u32(wsz);
       break;

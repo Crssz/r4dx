@@ -36,10 +36,18 @@ Layout LayoutFromName(const std::string& name);  // throws on an unrecognized na
 // rather than a quant_linear.cpp symbol so a header-only container reader
 // (dflash_draft_weights.h) can call it from a target that links r4d_core but not
 // r4dx_model_linear.
+//
+// Throws W4a16GroupMismatch, a std::runtime_error, so every existing catch site is unaffected; the
+// distinct type exists for callers that tolerate OTHER load failures (a test that skips a layout a
+// container does not carry) but must never swallow this one.
+struct W4a16GroupMismatch : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 inline void CheckW4a16Group(int container_group, const std::string& what) {
   const int kernel_group = r4d_gemm_w4a16_nt_m64_group();
   if (container_group == kernel_group) return;
-  throw std::runtime_error(
+  throw W4a16GroupMismatch(
       "r4dx::model: " + what + " was packed with w4a16 group=" + std::to_string(container_group) +
       " but this build's r4d_gemm_w4a16_nt_m64 kernel reads group=" +
       std::to_string(kernel_group) +

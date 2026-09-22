@@ -38,10 +38,11 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-// Real 64-layer container + real w4a16 DFlash2 draft container (docs/status.md's own paths for
-// every other real-hardware perf/e2e pass in this project).
-const char* kTargetContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-v3.r4dx");
-const char* kDflashContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx");
+// Real 64-layer container + real w4a16 DFlash2 draft container, the production pair packed at this
+// build's own w4a16 group (group 64: qwen38-27b-v6 + dflash2-w4a16-g64; group 128: qwen38-27b-v3 +
+// dflash2-w4a16) -- tests/model/test_container_path.h.
+const char* kTargetContainerPath = r4dx_test::ProductionTargetPath();
+const char* kDflashContainerPath = r4dx_test::ProductionDrafterPath();
 constexpr int64_t kDflashK = 7;
 
 int32_t Argmax(const std::vector<float>& logits) {
@@ -735,7 +736,7 @@ bool CheckSampledPlainDecodeIsDrafterIndependent(const ModelOptions& base_opts,
 
 }  // namespace
 
-int main() {
+static int RunTest() {
   if (!FileExists(kTargetContainerPath)) return SkipMissing(kTargetContainerPath);
   if (!FileExists(kDflashContainerPath)) return SkipMissing(kDflashContainerPath);
 
@@ -814,3 +815,7 @@ int main() {
   }
   return 0;
 }
+
+// An exception escaping RunTest (a container the loader refuses, most often) is a FAIL with its
+// message, not a 0xc0000409 crash -- see RunGuardedMain in tests/model/test_container_path.h.
+int main() { return r4dx_test::RunGuardedMain("test_dflash_e2e", RunTest); }

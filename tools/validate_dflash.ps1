@@ -47,11 +47,14 @@
   requires -AllowBatchedVerifyDivergence -- a human decision, not a default).
 
 .PARAMETER Model
-  Path to the real 64-layer target container. Default: the real 64-layer container.
+  Path to the real 64-layer target container. Default: the production container matching build\win-hip's w4a16 group,
+  read from build\win-hip\CMakeCache.txt (R4DX_W4A16_GROUP) by tools\r4dx_containers.ps1: group 64
+  (the default build) -> D:\models\r4dx\qwen38-27b-v6.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx.
 
 .PARAMETER Dflash
-  Path to the DFlash2 draft container to test. Default: the w4a16 draft container (the task's own
-  primary ask -- item 4 says "w4a16 draft" explicitly).
+  Path to the DFlash2 draft container to test. Default: the w4a16 draft container matching the same group -- group 64 ->
+  D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx.
+  (w4a16 is the task's own primary ask -- item 4 says "w4a16 draft" explicitly.)
 
 .PARAMETER Layouts
   Comma-separated TARGET body layouts. Default: w4a16,w4a8,mxfp4 (bf16 excluded, standing
@@ -76,8 +79,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Model = "D:\models\r4dx\qwen38-27b-v3.r4dx",
-    [string]$Dflash = "D:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx",
+    [string]$Model = "",   # "" = the group-matched production container (see .PARAMETER Model)
+    [string]$Dflash = "",  # "" = the group-matched w4a16 drafter (see .PARAMETER Dflash)
     # Second-tier "grouping control" draft container (review fix, 2026-09-21): used ONLY when a
     # mismatch's --mtp 7 control does NOT reproduce it. A different draft container drafts a
     # DIFFERENT token sequence (same verify mechanism, different verify-window contents), so if
@@ -96,6 +99,12 @@ $env:HIP_VISIBLE_DEVICES = '1'
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
+# Default containers follow build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an explicit
+# -Model/-Dflash wins.
+. (Join-Path $PSScriptRoot "r4dx_containers.ps1")
+if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
+if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter -BuildDir "build\win-hip" }
+Write-Output "[validate_dflash] target=$Model draft=$Dflash"
 if (-not (Test-Path $Model)) { throw "target container not found: $Model" }
 if (-not (Test-Path $Dflash)) { throw "dflash draft container not found: $Dflash" }
 

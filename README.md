@@ -71,7 +71,12 @@ index-math goldens, the whole tower against the real checkpoint's forward, and t
 `ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
 `ctest` invocation). 61 pass and 1 skips (`test_kernel_bandwidth`, whose golden is gitignored),
-~636s wall on HIP device 1. See `docs/status.md` for
+~636s wall on HIP device 1. No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
+either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
+production v6/v3 container packed at their own build's w4a16 group (`docs/build-windows.md` "w4a16
+group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are
+registered only when the reference venv's `python.exe` exists at configure time; otherwise CMake
+prints a STATUS line saying they were skipped. See `docs/status.md` for
 the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
 GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
 `ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration

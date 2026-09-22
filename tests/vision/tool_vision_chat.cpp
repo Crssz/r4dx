@@ -9,7 +9,7 @@
 // `--image` path, which is what a user actually runs.
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
-//   build\win-hip\tests\vision\tool_vision_chat.exe --model D:/models/r4dx/qwen38-27b-v3.r4dx
+//   build\win-hip\tests\vision\tool_vision_chat.exe [--model D:/models/r4dx/qwen38-27b-v6.r4dx]
 //       --tokenizer C:/AI/models/Qwen3.8-27B --layout w4a16 --image pic.png
 //       --prompt "Describe this image." [--max-tokens 128] [--mtp 3] [--dflash <container> --k 7]
 //       [--turn2 "..."] [--show-positions] [--dump-prompt out.json]
@@ -38,6 +38,7 @@
 #include "chat_template.h"
 #include "image_decode.h"
 #include "image_prompt.h"
+#include "../model/test_container_path.h"  // r4dx_test::ProductionTargetPath
 #include "model.h"
 #include "position_ids.h"
 #include "preprocess.h"
@@ -134,7 +135,7 @@ void PrintPositions(const std::vector<int32_t>& tokens,
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_path = "D:/models/r4dx/qwen38-27b-v3.r4dx";
+  std::string model_path = r4dx_test::ProductionTargetPath();  // group-matched v6 (64) / v3 (128)
   std::string tokenizer_dir = "C:/AI/models/Qwen3.8-27B";
   std::string layout = "w4a16";
   std::string prompt = "Describe this image.";

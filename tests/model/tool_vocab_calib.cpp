@@ -47,7 +47,8 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kDefaultContainer = "D:/models/r4dx/qwen38-27b-v3.r4dx";
+// The production container matching this build's w4a16 group (tests/model/test_container_path.h).
+const char* kDefaultContainer = r4dx_test::ProductionTargetPath();
 const char* kDefaultTokenizerDir = "C:/AI/models/Qwen3.8-27B";
 const char* kDefaultCorpus = "D:/models/wikitext-2-raw/wiki.train.raw";
 const char* kDefaultOutJson = "build/logs/vocab_calib.json";

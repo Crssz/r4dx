@@ -28,6 +28,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "../model/test_container_path.h"  // r4dx_test::ProductionTargetPath / RunGuardedMain
 #include "vision_test_common.h"
 #include "vision_tower.h"
 #include "vision_weights.h"
@@ -40,7 +41,11 @@ using r4dx::vision::VisionWeights;
 
 namespace {
 
-const char* kContainerPath = "D:/models/r4dx/qwen38-27b-v3.r4dx";
+// The production container matching this build's w4a16 group (v6 at 64, v3 at 128 --
+// tests/model/test_container_path.h). The vision.* tensors this test reads are bf16 and
+// group-independent, so either container would do numerically; the group-matched one is what the
+// server/CLI defaults would load next to it.
+const char* kContainerPath = r4dx_test::ProductionTargetPath();
 
 // R4DX_VISION_GOLDEN_DIR overrides where the golden tensors are read from. Used to diff this
 // implementation against a SECOND reference run -- `vision_golden.py --attn-impl sdpa` into a
@@ -342,7 +347,7 @@ void PerBlockLocalization(const VisionWeights& weights, VisionTower* tower) {
 
 }  // namespace
 
-int main() {
+static int RunTest() {
   if (!FileExists(kContainerPath)) return SkipMissing(kContainerPath);
   if (!FileExists(GoldenPath("vision_tower.safetensors"))) {
     return SkipMissing(GoldenPath("vision_tower.safetensors"));
@@ -357,9 +362,9 @@ int main() {
   }
   const VisionWeights weights =
       r4dx::vision::LoadVisionWeights(reader, metadata.at("model_config").at("vision_config"));
-  std::printf("[test_vision_tower] loaded %lld vision tensors, %.4f GiB\n",
+  std::printf("[test_vision_tower] loaded %lld vision tensors, %.4f GiB, from %s\n",
               static_cast<long long>(weights.tensor_count),
-              static_cast<double>(weights.bytes) / (1024.0 * 1024.0 * 1024.0));
+              static_cast<double>(weights.bytes) / (1024.0 * 1024.0 * 1024.0), kContainerPath);
   CHECK(weights.tensor_count == 333);
 
   VisionTower tower;
@@ -388,3 +393,6 @@ int main() {
   return 0;
 }
 
+// An exception escaping RunTest (a container the loader refuses, most often) is a FAIL with its
+// message, not a 0xc0000409 crash -- see RunGuardedMain in tests/model/test_container_path.h.
+int main() { return r4dx_test::RunGuardedMain("test_vision_tower", RunTest); }

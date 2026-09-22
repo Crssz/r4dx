@@ -7,7 +7,9 @@
   Only HIP device 1 (of the two R9700s in this machine) may be used -- see the GPU rule in
   README.md / docs/build-windows.md. Sets HIP_VISIBLE_DEVICES=1 (so device index 0 inside the
   test process is physical device 1) and runs ctest against the 'win-hip' preset's build
-  directory with the venv's CMake.
+  directory with the venv's CMake (or the one on PATH when the venv is absent). No other
+  environment variable is needed: the tests pick the containers matching the build's w4a16 group
+  themselves (tests/model/test_container_path.h).
 
 .PARAMETER Preset
   CMake preset name. Default 'win-hip'.
@@ -26,7 +28,13 @@ Set-Location $PSScriptRoot\..
 $VenvRoot = if ($env:R4DX_REFERENCE_VENV) { $env:R4DX_REFERENCE_VENV }
             else { Join-Path $env:USERPROFILE "dev\vLLM_for_AMD\.venv-rocm10" }
 $Cmake = Join-Path $VenvRoot "Scripts\cmake.exe"
-if (-not (Test-Path $Cmake)) { throw "required tool not found: $Cmake" }
+# Same fallback as build.ps1: the reference venv is a machine-local environment that can be absent;
+# the cmake/ctest on PATH run this preset just as well.
+if (-not (Test-Path $Cmake)) {
+    $PathCmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
+    if (-not $PathCmake) { throw "cmake.exe not found in $VenvRoot\Scripts nor on PATH" }
+    $Cmake = $PathCmake.Source
+}
 
 $env:HIP_VISIBLE_DEVICES = "1"
 

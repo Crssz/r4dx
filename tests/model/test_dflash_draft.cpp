@@ -424,7 +424,7 @@ void ReportEndToEnd(DflashDraft& d, Stream& stream, Arena& arena, const std::str
 
 }  // namespace
 
-int main() {
+static int RunTest() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
   if (!FileExists(kDraftBf16)) return SkipMissing(kDraftBf16);
@@ -789,3 +789,7 @@ int main() {
               g_failures);
   return g_failures == 0 ? 0 : 1;
 }
+
+// An exception escaping RunTest (a container the loader refuses, most often) is a FAIL with its
+// message, not a 0xc0000409 crash -- see RunGuardedMain in tests/model/test_container_path.h.
+int main() { return r4dx_test::RunGuardedMain("test_dflash_draft", RunTest); }

@@ -7,7 +7,7 @@
 // move the ctest count.
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
-//   build\win-hip\tests\vision\tool_vision_bench.exe --model D:/models/r4dx/qwen38-27b-v3.r4dx
+//   build\win-hip\tests\vision\tool_vision_bench.exe [--model D:/models/r4dx/qwen38-27b-v6.r4dx]
 //       --layout w4a16 [--sizes 448,1024,1536] [--no-model] [--image-max-pixels N] [--runs 3]
 //
 // `--no-model` skips loading the text model and measures the tower alone; the default loads the
@@ -24,6 +24,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "../model/test_container_path.h"  // r4dx_test::ProductionTargetPath
 #include "model.h"
 #include "preprocess.h"
 #include "vision_tower.h"
@@ -68,7 +69,7 @@ r4dx::vision::DecodedImage MakeImage(int w, int h) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_path = "D:/models/r4dx/qwen38-27b-v3.r4dx";
+  std::string model_path = r4dx_test::ProductionTargetPath();  // group-matched v6 (64) / v3 (128)
   std::string layout = "w4a16";
   std::string sizes = "448,1024,1536";
   int64_t layers = -1, max_ctx = 2048, image_max_pixels = 0, runs = 3;

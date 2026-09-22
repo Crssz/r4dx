@@ -113,7 +113,7 @@ void Report(const char* config_name, const r4dx::kernels::SampleParams& params, 
 
 int main(int argc, char** argv) {
   const std::string container =
-      argc > 1 ? argv[1] : std::string("D:/models/r4dx/qwen38-27b-v3.r4dx");
+      argc > 1 ? argv[1] : std::string(r4dx_test::ProductionTargetPath());  // group-matched v6/v3
   const std::string layout_name = argc > 2 ? argv[2] : std::string("w4a16");
   const int tokens = argc > 3 ? std::atoi(argv[3]) : 64;
   if (!r4dx_test::FileExists(container.c_str())) {

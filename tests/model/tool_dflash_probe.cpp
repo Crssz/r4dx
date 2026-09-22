@@ -74,7 +74,9 @@ using r4dx_test::SkipMissing;
 
 namespace {
 
-const char* kDefaultTarget = "D:/models/r4dx/qwen38-27b-v3.r4dx";
+// Default target: the production container matching this build's w4a16 group (v6 at 64, v3 at 128
+// -- tests/model/test_container_path.h). The bf16 drafter below is group-independent.
+const char* kDefaultTarget = r4dx_test::ProductionTargetPath();
 const char* kDefaultDraft = "D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx";
 const char* kDefaultTokenizerDir = "C:/AI/models/Qwen3.8-27B";
 const char* kDefaultOutDir = "build/logs/dflash_probe";

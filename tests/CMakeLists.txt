@@ -49,26 +49,40 @@ add_subdirectory(cli)
 # those paths.
 add_subdirectory(server)
 
-# tools/reference's pure-Python golden-generator smoke test (CPU-only, no HIP device, no C++
-# build -- see tools/reference/README.md). Needs the reference venv's python.exe (torch +
-# transformers importable); test_manifest.py is a bare-assert script with no pytest dependency, so
-# this is a plain COMMAND, not a build target. This add_test() line is the only touch this
-# component makes outside tools/reference/**, tests/reference/**, and docs/validation.md.
-add_test(
-    NAME reference_manifest
-    COMMAND "${R4DX_REFERENCE_VENV}/Scripts/python.exe"
-            "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_manifest.py"
-)
+# The two Python reference tests below need the reference venv's python.exe (torch + transformers
+# / numpy importable). That venv is a machine-local environment outside this repo and can be absent
+# -- it has been absent from this development machine since 2026-09-22 -- so they are registered only when the
+# interpreter exists at CONFIGURE time; otherwise a STATUS line says they were skipped and why, and
+# ctest never lists them (an unregistered test cannot count as a failure). build.ps1 re-runs the
+# configure step on every build, so recreating the venv (or pointing R4DX_REFERENCE_VENV at another
+# one) brings both back on the next build with nothing else to change.
+set(R4DX_REFERENCE_PYTHON "${R4DX_REFERENCE_VENV}/Scripts/python.exe")
+if(EXISTS "${R4DX_REFERENCE_PYTHON}")
+  # tools/reference's pure-Python golden-generator smoke test (CPU-only, no HIP device, no C++
+  # build -- see tools/reference/README.md). test_manifest.py is a bare-assert script with no
+  # pytest dependency, so this is a plain COMMAND, not a build target. This add_test() line is the
+  # only touch this component makes outside tools/reference/**, tests/reference/**, and
+  # docs/validation.md.
+  add_test(
+      NAME reference_manifest
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_manifest.py"
+  )
 
-# tools/reference/dflash2_selftest.py -- the DFlash2 reference determinism gate (see
-# docs/dflash2.md section 10). CPU-only, numpy-only for the default fast path (no --with-real-
-# sanity here, since that flag needs the full 27B checkpoint on disk and is meant for manual
-# invocation, not the default ctest run). Fixtures under tools/reference/golden_out/dflash2/ are
-# regenerated on demand by the script itself when missing, so this runs unmodified on a clean
-# checkout. Same venv as reference_manifest above; this add_test() line is the only touch this
-# component makes outside tools/reference/**, docs/dflash2.md, and docs/validation.md.
-add_test(
-    NAME reference_dflash2
-    COMMAND "${R4DX_REFERENCE_VENV}/Scripts/python.exe"
-            "${CMAKE_SOURCE_DIR}/tools/reference/dflash2_selftest.py"
-)
+  # tools/reference/dflash2_selftest.py -- the DFlash2 reference determinism gate (see
+  # docs/dflash2.md section 10). CPU-only, numpy-only for the default fast path (no
+  # --with-real-sanity here, since that flag needs the full 27B checkpoint on disk and is meant for
+  # manual invocation, not the default ctest run). Fixtures under tools/reference/golden_out/dflash2/
+  # are regenerated on demand by the script itself when missing, so this runs unmodified on a clean
+  # checkout. Same venv as reference_manifest above; this add_test() line is the only touch this
+  # component makes outside tools/reference/**, docs/dflash2.md, and docs/validation.md.
+  add_test(
+      NAME reference_dflash2
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_SOURCE_DIR}/tools/reference/dflash2_selftest.py"
+  )
+else()
+  message(STATUS "r4dx: reference_manifest and reference_dflash2 NOT registered -- the reference "
+                 "venv's interpreter ${R4DX_REFERENCE_PYTHON} does not exist (set "
+                 "R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and reconfigure)")
+endif()

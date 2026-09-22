@@ -75,6 +75,8 @@ bool RunLayout(const r4dx_convert::SafetensorsReader& golden, Layout layout,
     container_ptr =
         std::make_unique<Container>(Container::Load(kContainerPath, layout, Layout::kBf16,
                                                       /*layer_limit=*/1));
+  } catch (const r4dx::model::W4a16GroupMismatch&) {
+    throw;  // present but refused by the group guard: a FAIL (RunGuardedMain), never a layout SKIP
   } catch (const std::exception& e) {
     std::printf("test_gdn_layer (%s): SKIP (container load failed: %s)\n", LayoutName(layout),
                 e.what());
@@ -122,7 +124,7 @@ bool RunLayout(const r4dx_convert::SafetensorsReader& golden, Layout layout,
 
 }  // namespace
 
-int main() {
+static int RunTest() {
   if (!FileExists(kContainerPath)) return SkipMissing(kContainerPath);
   if (!FileExists(kGoldenPath)) return SkipMissing(kGoldenPath);
 
@@ -165,3 +167,7 @@ int main() {
   std::printf(all_ok ? "PASS\n" : "FAIL\n");
   return all_ok ? 0 : 1;
 }
+
+// An exception escaping RunTest (a container the loader refuses, most often) is a FAIL with its
+// message, not a 0xc0000409 crash -- see RunGuardedMain in tests/model/test_container_path.h.
+int main() { return r4dx_test::RunGuardedMain("test_gdn_layer", RunTest); }

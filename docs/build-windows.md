@@ -85,6 +85,14 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
    numbers. Pre-`quant`-block containers have no group recorded and are group 128 by construction,
    so nothing checks them -- they are the one case that can still be read at the wrong stride, and
    there are none left on this machine.
+
+   The guard fires only when the load will actually **read** `.w4a16.wsz` bytes: `Container::Load`
+   when one of `--layout` / the lm-head layout / the MTP-head layout is `w4a16`,
+   `DflashDraftWeights::Open` when the drafter carries a `.w4a16.*` tensor at all. `r4dx-convert`
+   writes the `quant` metadata block unconditionally, so a bf16 or mxfp4 container records a w4a16
+   group for a layout it holds no tensor of, and `v5` holds valid group-independent `w4a8`/`mxfp4`
+   layouts next to its group-128 `w4a16` -- `r4dx-cli --model ...v5.r4dx --layout mxfp4` is correct
+   on a group-64 build and is allowed. Only `--layout w4a16` on `v5` is refused.
 3. CMake rejects a group that is not a positive multiple of 64: the kernel packs
    `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
    128 are the only values libr4d accepts unmodified**.
@@ -141,21 +149,30 @@ ctest --preset win-hip
 **`ctest --preset win-hip` needs that variable on this machine**; without it every `tests/model`
 test that opens one of those containers fails on the group guard. `ctest --preset win-hip-g128`
 wants it *unset*, so it reads the historical group-128 copies in `D:\models\r4dx\`. The recipe for
-regenerating the directory (all five containers, ~41 GiB, ~2 min of CPU) is:
+regenerating the directory (six containers, ~52 GiB, ~3 min of CPU) is:
 
 ```powershell
 $dir = 'D:\models\r4dx\g64'
 # qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,mxfp4,w4a16,w4a8 --lm-head 4bit+bf16 --mtp off --vision off
 # qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16            --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16,w4a8,mxfp4 --lm-head 4bit+bf16 --mtp on  --vision off
+# qwen38-27b-l4-mtp-draftvocab.r4dx: as -l4-mtp plus --draft-vocab-ids <ids.json> (see below)
 # the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --out ... --layout {bf16,w4a16}
 .\build\win-hip\src\convert\r4dx-convert.exe --input C:\AI\models\Qwen3.8-27B --output "$dir\..." ...
 ```
 
-`qwen38-27b-l4-mtp-draftvocab.r4dx` is **not** in `g64\`: it needs a `--draft-vocab-ids` JSON that
-is a gitignored build artifact and was not on disk, so `test_mtp`'s reduced-vocab draft-head cases
-skip on a default build. `test_dflash_e2e` skips for the same kind of reason -- its target is the
-42 GiB `qwen38-27b-v3.r4dx`, which was not worth a group-64 copy.
+`qwen38-27b-l4-mtp-draftvocab.r4dx` **is** in `g64\`, and it is the one container whose regeneration
+is not a straight re-run: its `--draft-vocab-ids` JSON is a gitignored build artifact that was no
+longer on disk, so it was rebuilt from a fresh arbitrary 4096-id subset (the 1416 distinct ids in
+`tools/reference/kl_corpus/tokens.json`, padded from 0) -- the reduced-vocab draft head is about
+correctness plumbing, not about which ids, so any 4096-id list does. Without it `test_mtp`'s
+reduced-vocab cases drop to `[SKIP]` on a default build even though that path is on by default in
+production. `test_dflash_e2e` does skip: its target is the 42 GiB `qwen38-27b-v3.r4dx`, which was
+not worth a group-64 copy.
+
+A bf16 or mxfp4 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
+does. `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is
+redundant; the original `D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx` loads on either build.
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
 `--rocm-path` is passed; `third_party/CMakeLists.txt` prepends `C:\opt\rocm\bin` and

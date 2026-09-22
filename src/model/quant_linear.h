@@ -26,11 +26,16 @@ Layout LayoutFromName(const std::string& name);  // throws on an unrecognized na
 // was COMPILED with; a container carries the group it was PACKED with in
 // __metadata__.quant.w4a16.group. If the two disagree every w4a16 GEMM silently reads scales for
 // the wrong K range -- no crash, no NaN, just wrong numbers -- so every container loader calls
-// this before touching a byte and it throws naming BOTH numbers. `what` identifies the container
-// in the message. Takes the already-extracted int rather than the JSON so this header stays free
-// of nlohmann/json (r4dx_model_attention links this target too), and is inline rather than a
-// quant_linear.cpp symbol so a header-only container reader (dflash_draft_weights.h) can call it
-// from a target that links r4d_core but not r4dx_model_linear.
+// this before touching a byte and it throws naming BOTH numbers. Callers gate it on the w4a16
+// bytes actually being read: Container::Load only when a requested layout is kW4a16,
+// DflashDraftWeights::Open only when the container carries a `.w4a16.*` tensor. A load that never
+// touches a `.w4a16.wsz` (a `--layout mxfp4`/`w4a8`/`bf16` run, a bf16 drafter) has no stride to
+// get wrong, and refusing it would reject containers this build reads correctly. `what` identifies
+// the container in the message. Takes the already-extracted int rather than the JSON so this
+// header stays free of nlohmann/json (r4dx_model_attention links this target too), and is inline
+// rather than a quant_linear.cpp symbol so a header-only container reader
+// (dflash_draft_weights.h) can call it from a target that links r4d_core but not
+// r4dx_model_linear.
 inline void CheckW4a16Group(int container_group, const std::string& what) {
   const int kernel_group = r4d_gemm_w4a16_nt_m64_group();
   if (container_group == kernel_group) return;
@@ -60,8 +65,8 @@ struct QuantLinear {
   // the one layout it was loaded as.
   core::DeviceBuffer<uint8_t> wq;
   // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is the
-  // w4a16 group this build was configured with (R4DX_W4A16_GROUP, default 128) -- see
-  // CheckW4a16Group below, which is what guarantees the container agrees with the kernel.
+  // w4a16 group this build was configured with (R4DX_W4A16_GROUP, default 64 since Milestone 11)
+  // -- see CheckW4a16Group above, which is what guarantees the container agrees with the kernel.
   core::DeviceBuffer<uint32_t> w4a16_wsz;
   // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused). w4a8's group is fixed at
   // 128 by third_party/CMakeLists.txt and is NOT tied to w4a16's.

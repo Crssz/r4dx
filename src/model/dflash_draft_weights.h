@@ -75,15 +75,23 @@ class DflashDraftWeights {
       throw std::runtime_error("DflashDraftWeights::Open: '" + path +
                                 "' is not a dflash2_draft container (missing/wrong container_kind)");
     }
+    w.reader_ = std::make_unique<r4dx_convert::SafetensorsReader>(r4dx_convert::Utf8ToWide(path));
+    w.config_ = ParseConfig(w.metadata_.at("dflash2"));
     // Same group guard the main container gets (Container::Load -> CheckW4a16Group): a drafter
     // packed at a different w4a16 group than this build's kernel reads would produce silently
     // wrong draft logits, i.e. a collapsed acceptance rate with nothing else to see.
-    if (w.metadata_.contains("quant") && w.metadata_.at("quant").contains("w4a16") &&
+    //
+    // Gated on the container actually CARRYING w4a16 bytes (adversarial-review fix). r4dx-convert
+    // writes the `quant` metadata block unconditionally, so a `--layout bf16` or `--layout mxfp4`
+    // drafter records a w4a16 group for a layout it does not contain a single tensor of; checking
+    // it refused `qwen38-27b-dflash2-bf16.r4dx` on a group-64 build for a number nothing reads.
+    // `dflash.fc` is the first linear every dflash2 container has (src/convert/main.cpp's
+    // --dflash-gguf path), so its w4a16 form is present exactly when any w4a16 form is.
+    if (w.reader_->Has("dflash.fc.w4a16.wq") && w.metadata_.contains("quant") &&
+        w.metadata_.at("quant").contains("w4a16") &&
         w.metadata_.at("quant").at("w4a16").contains("group")) {
       CheckW4a16Group(w.metadata_.at("quant").at("w4a16").at("group").get<int>(), path);
     }
-    w.reader_ = std::make_unique<r4dx_convert::SafetensorsReader>(r4dx_convert::Utf8ToWide(path));
-    w.config_ = ParseConfig(w.metadata_.at("dflash2"));
     return w;
   }
 

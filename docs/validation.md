@@ -711,7 +711,9 @@ $env:HIP_VISIBLE_DEVICES = '1'
 ### Milestone 11 / group size: what the w4a16 group buys (2026-09-22)
 
 The w4a16 group -- how many contiguous `K` share one `(scale, zero)` pair -- is now a build option,
-`R4DX_W4A16_GROUP` (default 128), reaching both the kernel (`-DR4D_GEMM_W4_GROUP`) and the packer
+`R4DX_W4A16_GROUP` (default 128 as introduced here; **the "recipe" section below flipped the
+default to 64** on the strength of what this section measures), reaching both the kernel
+(`-DR4D_GEMM_W4_GROUP`) and the packer
 (`kW4A16Group`) from one CMake cache variable; `docs/build-windows.md` "w4a16 group size" has the
 mechanism and the three layers that stop the two sides drifting apart. The kernel packs 64
 contiguous K per weight block and derives `bpg = group / 64`, so **64 is the only value below 128
@@ -1076,8 +1078,21 @@ nats/GiB, and there is no cheaper setting: `--lm-head` takes *layout* tokens (`4
 | mean KL | 0.0391 | **0.038507** | -1.5% |
 | plain decode | 35.7-36.2 tok/s | **35.96 / 35.86** | in range |
 
-The per-class sensitivity table predicts the composite container to better than 2%, including the
-cross-term discount. That is the useful result of this milestone independent of v6 itself: the
+**Read the weights row carefully** (adversarial-review note). `weights=` is a free-VRAM delta from
+`hipMemGetInfo` around `Container::Load` (`src/model/model.cpp`), not a byte count, so it carries
+the driver's per-allocation rounding -- and v6 makes 32 fewer device allocations than v5, because a
+kept linear is one bf16 buffer where a quantized one is `wq` + `wsz`. Summed straight off the two
+containers' headers, what a `--layout w4a16` load actually uploads grows by **+0.9802 GiB**
+(`wsz` 0.7555 -> 1.5013, `wq` 12.0886 -> 12.0105, plus 0.3125 of bf16 `attn.k`/`v`), against the
++0.936 predicted and the +0.8989 the VRAM line reports. So the error on the *increment* is +4.7% in
+bytes and -4.0% as VRAM measures it; the -0.23% above is that same error divided by the 16.4 GiB
+total rather than by the ~0.9 GiB actually being predicted. Most of the byte-side gap is inherited:
+the group-size section's `+0.7114 GiB` was itself a `weights=` delta, where the header arithmetic
+for the same change is +0.7556 GiB.
+
+With that caveat stated, the per-class sensitivity table predicts the composite container to better
+than 2% on the totals it was asked about. That is the useful result of this milestone independent
+of v6 itself: the
 classes are close enough to additive, and group size close enough to a uniform multiplier, that
 recipes can be *designed* on paper from the two tables instead of converted and measured one by
 one at ~7 minutes of CPU and ~2.5 minutes of GPU apiece.
@@ -1160,8 +1175,12 @@ the drafter shares none of the main model's keys.)
 #### What this breaks, and the way out
 
 `R4DX_W4A16_GROUP` now defaults to **64**, so `build/win-hip` refuses every container packed
-before v6 -- `v5`, `v4`, `v3`, the 4-layer test containers, the original drafters -- by name, with
-both numbers, and with the fix in the message. This was a deliberate trade: v6 is only the
+before v6 -- `v5`, `v4`, `v3`, the 4-layer test containers, the `w4a16` drafter -- by name, with
+both numbers, and with the fix in the message, *whenever the run selects the `w4a16` layout*.
+(Adversarial-review fix: the guard was originally unconditional, which also refused
+`--layout mxfp4` / `--layout w4a8` on those same containers and refused the bf16 and mxfp4
+drafters, none of which read a `.w4a16.wsz` byte. Those load normally now -- `docs/build-windows.md`
+"w4a16 group size" layer 2.) This was a deliberate trade: v6 is only the
 production container if the production build reads it without a flag. The escape hatch is the
 `win-hip-g128` preset (verified this session: it builds clean and loads `qwen38-27b-v5.r4dx` at
 `weights=15.5076 GiB`, decoding normally), and `docs/build-windows.md` "w4a16 group size" has the

@@ -54,14 +54,19 @@ namespace r4dx_convert {
 // own kernel export at startup (src/convert/main.cpp ValidateKernelGroupSizes).
 //
 // w4a16's group is a BUILD OPTION: the CMake cache variable R4DX_W4A16_GROUP (root
-// CMakeLists.txt, default 128) is passed both to the kernel as -DR4D_GEMM_W4_GROUP and to this
-// header as -DR4DX_W4A16_GROUP (src/convert/CMakeLists.txt), so one switch moves both sides at
-// once. The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight block and derives
-// `bpg = R4D_GEMM_W4_GROUP / R4D_GEMM_W4_KPB`, so the group must be a multiple of 64 -- i.e. 64 is
-// the only value below the 128 default the kernel accepts as-is. Smaller group = more (scale,zero)
-// dwords per row = more bits per weight: 4 + 32/group bits, so 4.25 at 128 and 4.5 at 64.
+// CMakeLists.txt, default 64 since Milestone 11 -- 128 before it) is passed both to the kernel as
+// -DR4D_GEMM_W4_GROUP and to this header as -DR4DX_W4A16_GROUP (src/convert/CMakeLists.txt), so
+// one switch moves both sides at once. The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight
+// block and derives `bpg = R4D_GEMM_W4_GROUP / R4D_GEMM_W4_KPB`, so the group must be a multiple
+// of 64 -- i.e. 64 and 128 are the whole set the kernel accepts as-is. Smaller group = more
+// (scale,zero) dwords per row = more bits per weight: 4 + 32/group bits, so 4.25 at 128 and 4.5
+// at 64.
+//
+// The fallback below is for a translation unit compiled outside the r4dx_convert CMake target
+// (which always passes the define); it MIRRORS the CMake default on purpose, so the two cannot
+// disagree about what "default" means -- the failure mode this whole knob exists to prevent.
 #ifndef R4DX_W4A16_GROUP
-#define R4DX_W4A16_GROUP 128
+#define R4DX_W4A16_GROUP 64
 #endif
 inline constexpr int kW4A16Group = R4DX_W4A16_GROUP;
 static_assert(kW4A16Group > 0 && kW4A16Group % 64 == 0,

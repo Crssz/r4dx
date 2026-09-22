@@ -100,8 +100,10 @@ DFlash2 drafter is `qwen38-27b-dflash2-w4a16-g64.r4dx`, converted with `--dflash
 search` (on the drafter, unlike the main model, `search` is worth 9.6% of decode).
 
 **Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
-refuses a container packed at 128 -- `v5` and everything older -- by name, with both numbers and
-the fix in the message. `docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
+refuses `--layout w4a16` on a container packed at 128 -- `v5` and everything older -- by name, with
+both numbers and the fix in the message. (The other layouts are group-independent, so
+`--layout mxfp4` / `--layout w4a8` on those same containers still works.)
+`docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
 `win-hip-g128` escape hatch, and the trap that an existing build directory keeps its cached group.
 
 Produces a single container carrying every requested quantized GEMM layout (plus bf16 for

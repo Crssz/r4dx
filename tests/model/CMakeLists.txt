@@ -102,8 +102,11 @@ add_test(NAME test_mtp_round COMMAND test_mtp_round)
 # (src/model/dflash_draft_weights.h -- metadata + tensor directory, no device upload). Links only
 # r4dx_convert (header-only: SafetensorsReader, GgufReader, dflash2_container writer helpers used
 # to build the test's own tiny fixture container) + r4dx_core (bf16 conversions) -- deliberately
-# NOT r4dx_model/r4d_core/r4dx_hip_runtime, so this binary has no HIP dependency at all, same
-# "always runs, no ENVIRONMENT/SKIP_RETURN_CODE" pattern as test_mtp_round above.
+# NOT r4dx_model, and it makes no HIP *call*, so it keeps the "always runs, no
+# ENVIRONMENT/SKIP_RETURN_CODE" pattern of test_mtp_round above. (r4dx_core does INTERFACE-link
+# r4d_core/r4dx_hip_runtime, and since Milestone 11 this test needs that: dflash_draft_weights.h
+# calls r4d_gemm_w4a16_nt_m64_group() through quant_linear.h's CheckW4a16Group, which is a host
+# function -- no device required.)
 add_executable(test_dflash_draft_weights test_dflash_draft_weights.cpp)
 target_include_directories(test_dflash_draft_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 target_link_libraries(test_dflash_draft_weights PRIVATE r4dx_convert r4dx_core)

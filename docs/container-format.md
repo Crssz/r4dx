@@ -157,7 +157,10 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     `R4DX_W4A16_GROUP` build option; 64 by default, 128 the only other value the kernel accepts as
     built). Recorded per container in `__metadata__.quant.w4a16.group`; a container whose group
     differs from the loading binary's kernel is REFUSED at `Container::Load`
-    (`CheckW4a16Group`) rather than read at the wrong stride.
+    (`CheckW4a16Group`) rather than read at the wrong stride -- but only when the load actually
+    selects `w4a16` for the body, the lm head or the MTP head. The `quant` block is written
+    unconditionally, so a container's recorded w4a16 group says nothing about whether it holds a
+    `.w4a16.*` tensor, and a `--layout mxfp4` / `--layout w4a8` / `--layout bf16` run reads none.
 
 **`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): the same nibble *permutation* as `w4a16`
   (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), but its own separately

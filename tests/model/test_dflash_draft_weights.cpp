@@ -1,11 +1,19 @@
 // r4dx::model::DflashDraftWeights CPU-only test (task A1 item 3): builds a tiny dflash2_draft
 // container via the SAME r4dx_convert writer helpers src/convert/main.cpp's --dflash-gguf mode
 // uses, from tests/convert/fixtures/dflash_mini.gguf, then opens it with DflashDraftWeights and
-// checks Config()/HasTensor()/TensorMeta() -- no HIP anywhere in this binary (this target links
-// only r4dx_convert + r4dx_core, see tests/model/CMakeLists.txt).
+// checks Config()/HasTensor()/TensorMeta() -- no HIP CALL anywhere in this binary, so it needs no
+// device (this target links only r4dx_convert + r4dx_core, see tests/model/CMakeLists.txt; since
+// Milestone 11 the header does reach r4d_core for r4d_gemm_w4a16_nt_m64_group(), a host function).
+//
+// It also gates the scope of that group guard: a dflash2 container records a w4a16 group whether
+// or not it holds a single w4a16 tensor, so Open() must refuse a mismatch only for the ones that
+// do -- see the last block of main().
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "dflash_draft_weights.h"
 #include "nlohmann/json.hpp"
@@ -106,6 +114,67 @@ int main() {
     std::remove(bad_path.c_str());
     return threw;
   }());
+
+  // ---- the w4a16 group guard, and its scope (Milestone 11 + adversarial-review fix) ------------
+  // r4dx-convert writes __metadata__.quant unconditionally, so EVERY dflash2 container records a
+  // w4a16 group -- including one whose linears are bf16 or mxfp4 and which therefore contains no
+  // .w4a16.* tensor at all. DflashDraftWeights::Open must refuse a group mismatch only when the
+  // container actually carries w4a16 bytes; refusing the others rejects containers that this build
+  // can read byte-for-byte correctly (qwen38-27b-dflash2-bf16.r4dx was one).
+  {
+    const int kernel_group = r4d_gemm_w4a16_nt_m64_group();
+    const int wrong_group = (kernel_group == 128) ? 64 : 128;
+
+    auto write_draft_container = [&](const std::string& path, int recorded_group,
+                                      bool with_w4a16_tensor) {
+      ContainerWriter writer2;
+      writer2.Plan("dflash.layers.0.input_layernorm", {64, 4}, 64 * 4);
+      if (with_w4a16_tensor) writer2.Plan("dflash.fc.w4a16.wq", {32}, 32);
+      nlohmann::json md;
+      md["r4dx_format_version"] = "1";
+      md["container_kind"] = "dflash2_draft";
+      md["dflash2"] = BuildDflash2MetadataJson(meta);
+      md["dflash2"]["layout"] = with_w4a16_tensor ? "w4a16" : "bf16";
+      md["quant"] = {{"w4a16", {{"group", recorded_group}}}};
+      writer2.FinalizeHeader(path, md);
+      std::vector<uint8_t> zeros(64 * 4, 0);
+      writer2.WriteTensor("dflash.layers.0.input_layernorm", zeros.data(), 64 * 4);
+      if (with_w4a16_tensor) writer2.WriteTensor("dflash.fc.w4a16.wq", zeros.data(), 32);
+      writer2.Finish();
+    };
+    auto opens = [](const std::string& path) {
+      try {
+        (void)r4dx::model::DflashDraftWeights::Open(path);
+        return std::string();
+      } catch (const std::exception& e) {
+        return std::string(e.what());
+      }
+    };
+
+    const std::string p_bf16 = out_path + ".g_bf16";
+    const std::string p_w4a16_bad = out_path + ".g_w4a16_bad";
+    const std::string p_w4a16_ok = out_path + ".g_w4a16_ok";
+    write_draft_container(p_bf16, wrong_group, /*with_w4a16_tensor=*/false);
+    write_draft_container(p_w4a16_bad, wrong_group, /*with_w4a16_tensor=*/true);
+    write_draft_container(p_w4a16_ok, kernel_group, /*with_w4a16_tensor=*/true);
+
+    const std::string e_bf16 = opens(p_bf16);
+    const std::string e_bad = opens(p_w4a16_bad);
+    const std::string e_ok = opens(p_w4a16_ok);
+    Check("no-w4a16-tensor container opens despite a mismatched recorded group", e_bf16.empty());
+    if (!e_bf16.empty()) std::printf("  unexpected: %s\n", e_bf16.c_str());
+    Check("w4a16 container with a mismatched group is refused",
+          e_bad.find("was packed with w4a16 group=") != std::string::npos &&
+              e_bad.find(std::to_string(wrong_group)) != std::string::npos &&
+              e_bad.find(std::to_string(kernel_group)) != std::string::npos);
+    Check("w4a16 container at this build's own group opens", e_ok.empty());
+    if (!e_ok.empty()) std::printf("  unexpected: %s\n", e_ok.c_str());
+    std::printf("  kernel w4a16 group=%d, mismatched group used in the test=%d\n", kernel_group,
+                wrong_group);
+    std::remove(p_bf16.c_str());
+    std::remove(p_w4a16_bad.c_str());
+    std::remove(p_w4a16_ok.c_str());
+  }
 
   std::remove(out_path.c_str());
   if (!g_ok) return 1;

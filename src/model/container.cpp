@@ -45,10 +45,22 @@ nlohmann::json ReadMetadata(const std::string& path) {
 //
 // A container written before the group was recorded has no `quant` block at all; those are group
 // 128 by construction (it was the only group that ever existed) and load unchanged on a group-128
-// build, so nothing that loads today stops loading. Containers that DO carry the block are checked
-// whatever `--layout` asks for: a group-mismatched container has no safe use on this build, and
-// failing at Load with a precise message beats failing later, partially, or not at all.
-void CheckQuantGroups(const nlohmann::json& metadata, const std::string& path) {
+// build, so nothing that loads today stops loading.
+//
+// SCOPE (adversarial-review fix): the check fires only when THIS load will actually read
+// `.w4a16.wsz` bytes, i.e. when one of the three layout selections below is `kW4a16`. The hazard
+// the guard exists to stop is a w4a16 GEMM striding the scales wrongly; a `--layout mxfp4` or
+// `--layout w4a8` run never touches a `.w4a16.*` tensor (LoadQuantLinear reads only the requested
+// layout's tensors, and LoadQuantLinearWithFallback's fallback chain is requested -> bf16 -> bare,
+// never -> w4a16), and w4a8's and mxfp4's own groups do not move with R4DX_W4A16_GROUP. Refusing
+// those runs bought no safety and cost real capability: `qwen38-27b-v5.r4dx` carries perfectly
+// valid w4a8 and mxfp4 layouts that a group-64 build can read byte-for-byte correctly.
+void CheckQuantGroups(const nlohmann::json& metadata, const std::string& path, Layout layout,
+                       Layout lm_head_layout, Layout mtp_head_layout) {
+  if (layout != Layout::kW4a16 && lm_head_layout != Layout::kW4a16 &&
+      mtp_head_layout != Layout::kW4a16) {
+    return;
+  }
   if (!metadata.contains("quant")) return;
   const nlohmann::json& quant = metadata.at("quant");
   if (!quant.contains("w4a16") || !quant.at("w4a16").contains("group")) return;
@@ -233,7 +245,7 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
-  CheckQuantGroups(metadata, path);
+  CheckQuantGroups(metadata, path, layout, lm_head_layout, mtp_head_layout);
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");

@@ -776,8 +776,11 @@ int RunSelftest(const AppArgs& args) {
   const int threads = ResolveThreads(args.threads);
   const LayoutSet requested = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   // The selftest's single tensor has container base "selftest", so --keep-bf16 is exercisable end
-  // to end here in milliseconds -- which is what tests/convert/test_keep_bf16.cpp uses to gate the
-  // CLI wiring (regex -> LayoutSet -> emitted tensor set -> warning path) without a 27B checkpoint.
+  // to end here in milliseconds, against tests/convert/fixtures/input.safetensors and without a
+  // 27B checkpoint -- the quickest way to see the whole CLI wiring (regex -> LayoutSet -> emitted
+  // tensor set -> warning path) by hand. The automated gates are split: tests/convert/
+  // test_keep_bf16.cpp owns selection/emission/accounting through the library API (no exe, no
+  // checkpoint), and tests/model/test_keep_bf16.cpp runs the real binary on a 4-layer container.
   r4dx_convert::KeepBf16Selector keep_bf16(args.keep_bf16);
   const bool kept = keep_bf16.Matches("selftest");
   const LayoutSet layouts = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;

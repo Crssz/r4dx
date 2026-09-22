@@ -1087,3 +1087,250 @@ full expected tensor-name set per component (including the r4d-shaped GDN tensor
 attention tensors above -- a regression that silently drops one now fails this test instead of only
 being noticed by whoever diffs against the missing tensor), that the decode GDN conv output's
 trimmed length matches `--decode-len`, and that the manifest's tolerance table is well-formed.
+
+## kv_fakequant_golden.py
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_fakequant_golden.py `
+    --mode both --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --tokens tools\reference\kl_corpus\tokens.json `
+    --out-dir tools\reference\kl_out\kvfq-full-both
+```
+
+**What it measures.** How much of the rung-4 KL is the **fp8 paged KV cache**, and nothing else.
+It is `full_logits_golden.py`'s streaming bf16 forward with exactly one thing changed: at every
+`full_attention` layer the two tensors the engine's paged cache stores -- the **whole post-rope K
+vector** and the **whole V vector**, all `head_dim = 256` of each, rotary and pass-through dims
+alike -- are replaced, in place in the forward, by
+
+```
+x' = dequant_e4m3(quant_e4m3(x * (1 / descale[kv_head]))) * descale[kv_head]
+```
+
+with `descale[h] = amax[h] / 448` read from a `kv_calibrate*.py` JSON, i.e. the very number
+`src/convert/include/r4dx_convert/kv_calib.hpp`'s `ResolveKvDescale` writes into the container.
+Nothing else is quantized: not the query (it is never cached), not the `linear_attention`/GDN
+layers (they have no KV cache), not one weight anywhere. So its KL against
+`tools/reference/kl_out/ref` -- the *unquantized* run of the very same code -- is the fp8 KV
+cache's own contribution, isolated from the 4-bit body weights, the 4-bit `lm_head` and the
+engine's kernels, which is what `docs/validation.md`'s "Follow-up experiments" could not separate
+by re-running the engine (the container carries no bf16-KV layout).
+
+**The taps** are `kv_calibrate_full.py`'s, used to *substitute* rather than to observe: the
+monkeypatched `apply_rotary_pos_emb` returns a quantized `k_embed` (and an untouched `q_embed`),
+and a `v_proj` forward hook returns a quantized output. The same `LazyDecoderLayers`-builder
+wrapper identifies which layer the global rope patch is currently serving. The run asserts it
+fired on exactly `16 layers x segments` calls of each kind and prints the layer list.
+
+**Matching the kernel's numerics.** The write path is `KvWritePagedFp8Kernel`
+(`src/kernels/src/r4dx_kernels.hip`): `FloatToFp8E4M3(__bfloat162float(k[d]) * (1.0f / k_descale[h]))`
+-- note it *multiplies by the reciprocal*, which this file does too. `FloatToFp8E4M3`
+(`src/core/include/r4dx/core/dtype.hpp`) is OCP e4m3fn with round-half-to-even (`rintf`) on both
+the normal mantissa (with the `mi == 8` carry into the next exponent) and the subnormal `2^-9`
+grid, and it **saturates** at `+-448`: a finite magnitude above `448 * descale` is clipped, never
+turned into NaN. PyTorch's reference `float8_e4m3fn` cast instead NaNs anything that rounds past
+the top of the grid, so `fake_quant_e4m3` re-derives the grid from `torch.frexp`/`torch.round`
+rather than calling `.to(torch.float8_e4m3fn)`; `--self-test` check 3 prints what the installed
+torch build actually does (this ROCm build happens to saturate too) and asserts the *kernel's* rule
+either way. The read side needs no further modelling: the attention kernels fold `k_descale[h]`
+into the query once and multiply the softmax-weighted sum by `v_descale[h]`, both algebraically the
+per-head scalar multiply applied here. The one remaining deviation is that the dequantized value is
+rounded back to **bf16**, because the reference's attention math is bf16 throughout -- a `<=2^-9`
+relative perturbation on top of e4m3's `2^-4`, i.e. ~1.5% of the effect being measured, and it is
+what keeps the only difference from `--mode none` the 8-bit grid rather than a change of precision.
+
+Options: `--mode {both,k-only,v-only,none}`, `--kv-calib`, `--descale-mult` (scales every descale:
+`0.5` clips harder, `2.0` coarsens the step), `--tokens`, `--out-dir`, `--segment`, `--max-tokens`,
+`--impl`, `--lm-head-chunk`, `--row-block`, `--top-k`, `--self-test`. Output is the shared format
+above (`"source": "reference-kvfakequant"`, plus a `kv_fakequant` block in each sidecar and a
+`kv_fakequant_run.json` manifest carrying the calibration's sha256, the resolved per-layer descale
+ranges and the clipping counters), so `kl_report.py` pairs it with `kl_out/ref` unmodified.
+
+### Measurement (2026-09-22, HIP device 1, shared with another stage)
+
+All runs: corpus `tools/reference/kl_corpus/tokens.json`, all four 1024-token segments, paired
+against `tools/reference/kl_out/ref` with `kl_report.py`. `<full>` is
+`D:\models\r4dx\qwen38-27b.kvcalib-full.json` (`kv_calibrate_full.py`, the v4 descales the shipping
+container is converted with), `<old>` is `D:\models\r4dx\qwen38-27b.kvcalib.json` (the
+`kv_calibrate.py` prototype's).
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+$py = "C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe"
+$tok = "tools\reference\kl_corpus\tokens.json"
+$full = "D:\models\r4dx\qwen38-27b.kvcalib-full.json"
+$old  = "D:\models\r4dx\qwen38-27b.kvcalib.json"
+
+& $py tools\reference\kv_fakequant_golden.py --self-test           # gate: no GPU, no checkpoint
+& $py tools\reference\kl_report.py --self-test                     # gate: unchanged, still passes
+
+foreach ($r in @(
+    @{n='kvfq-none';       m='none';   c=$full; d='1.0'},
+    @{n='kvfq-full-both';  m='both';   c=$full; d='1.0'},
+    @{n='kvfq-old-both';   m='both';   c=$old;  d='1.0'},
+    @{n='kvfq-full-konly'; m='k-only'; c=$full; d='1.0'},
+    @{n='kvfq-full-vonly'; m='v-only'; c=$full; d='1.0'},
+    @{n='kvfq-full-d0.5';  m='both';   c=$full; d='0.5'},
+    @{n='kvfq-full-d2.0';  m='both';   c=$full; d='2.0'})) {
+  & $py tools\reference\kv_fakequant_golden.py --mode $r.m --kv-calib $r.c `
+      --descale-mult $r.d --tokens $tok --out-dir "tools\reference\kl_out\$($r.n)"
+  & $py tools\reference\kl_report.py --ref-dir tools\reference\kl_out\ref `
+      --test-dir "tools\reference\kl_out\$($r.n)" --tokens $tok `
+      --out "tools\reference\kl_out\kl_$($r.n).json"
+}
+
+# and, separately, the fake-quantized reference against the REAL engine's dump
+& $py tools\reference\kl_report.py --ref-dir tools\reference\kl_out\kvfq-full-both `
+    --test-dir tools\reference\kl_out\w4a16-kvfull --tokens $tok `
+    --out tools\reference\kl_out\kl_kvfqfull-vs-w4a16kvfull.json
+```
+
+**Result** -- `KL(P_bf16 || Q_fakequant)` in nats, fp64, full 248320-way vocabulary, per position,
+mean over rows. The bf16 reference's own corpus perplexity is 5.661; its self-noise at this depth
+is mean KL 3.9e-04 / 99.6% top-1 self-agreement (`reference_selfcheck.py --noise-floor`), which is
+the floor every row below has to be read against.
+
+| # | run | descales | mean KL | cpp | english | python | thai | top-1 | ppl | max KL |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | `--mode none` (gate) | -- | **0.00000** | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 100.00% | 5.661 | 0.0000 |
+| 1 | `--mode both` | full (v4) | **0.00121** | 0.00110 | 0.00117 | 0.00112 | 0.00147 | 98.63% | 5.667 | 0.0946 |
+| 2 | `--mode both` | **old** (prototype) | **0.01910** | 0.01788 | 0.01496 | 0.01839 | 0.02517 | 93.62% | 5.736 | 0.5268 |
+| 3a | `--mode k-only` | full (v4) | **0.00113** | 0.00096 | 0.00109 | 0.00104 | 0.00145 | 98.56% | 5.661 | 0.0601 |
+| 3b | `--mode v-only` | full (v4) | **0.00085** | 0.00068 | 0.00085 | 0.00070 | 0.00119 | 98.90% | 5.666 | 0.0956 |
+| 4a | `--mode both --descale-mult 0.5` | full x0.5 | **0.01684** | 0.01515 | 0.01369 | 0.01563 | 0.02289 | 94.38% | 5.718 | 0.6110 |
+| 4b | `--mode both --descale-mult 2.0` | full x2.0 | **0.00127** | 0.00102 | 0.00122 | 0.00115 | 0.00170 | 98.41% | 5.671 | 0.1335 |
+
+No run put a single position above 1 nat. Clipping counters from each run's manifest (fraction of
+cached elements whose `|x / descale|` exceeded 448, and the worst `max|x/descale| / 448` seen):
+
+| run | K clipped | K headroom | V clipped | V headroom |
+|---|---:|---:|---:|---:|
+| 1 full (v4) | 2.1e-07 | 1.100 | 5.2e-07 | 1.392 |
+| 2 old | 1.1e-03 | 3.289 | 1.9e-03 | 8.624 |
+| 4a x0.5 | 1.3e-03 | 2.201 | 2.4e-04 | 2.784 |
+| 4b x2.0 | 0 | 0.550 | 0 | 0.696 |
+
+**Against the real engine.** `kl_report.py` with the run-1 dump as the *reference* side and the
+engine's own `tools/reference/kl_out/w4a16-kvfull` (the `w4a16` + full-forward-KV-calib container,
+`docs/validation.md`'s 0.072 row) as the test side:
+
+| pairing | mean KL | cpp | english | python | thai | top-1 | KL>1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| plain bf16 ref vs engine (`kl_w4a16-kvfull.json`, for reference) | 0.07241 | 0.04463 | 0.05682 | 0.05175 | 0.13643 | 88.42% | 7 |
+| **KV-fake-quantized** ref vs the same engine dump | 0.07262 | 0.04477 | 0.05719 | 0.05186 | 0.13668 | 88.37% | 7 |
+
+Reported, not over-interpreted: giving the reference the *same* fp8 KV cache the engine has moves
+the engine's measured drift by **+0.0002 nats (+0.3%)** and its top-1 agreement by -0.05 points,
+i.e. not at all. KL is not additive, so this is a second, independent read on the same conclusion
+rather than an arithmetic identity with the 0.00121 above.
+
+### Interpretation
+
+**The fp8 KV cache is not where the engine's KL lives.** With the shipping v4 descales it costs
+**0.00121 nats** -- 1.7% of the engine's 0.07241, and only ~3x the reference's own bf16
+reduction-order noise floor (3.9e-04). Every segment behaves the same way (0.0011-0.0015, with Thai
+only 1.3x the C++ segment against the 3.1x ratio it shows for the full engine), which is itself
+informative: the fp8 cache does *not* reproduce the vocabulary-tail / Thai signature that dominates
+the engine's error, so that error is not coming from here. Conversely the **calibration** matters a
+great deal for a constant that costs nothing at runtime: the prototype descales are **0.01910**,
+**15.8x worse**, and cost 5 points of top-1 -- with 1.1e-03 of K and 1.9e-03 of V elements
+saturating against 2e-07 / 5e-07 for v4 (the prototype's `amax` are 1.4-3.3x too small for K and up
+to 8.8x too small for V). That reproduces, from the reference side alone, the -18% KL that swapping
+the calibration bought the real container, and confirms the mechanism was clipping rather than
+anything about the container.
+
+**K vs V.** K-only is **0.00113** and V-only **0.00085**; together **0.00121**, well under the
+0.00198 sum, so the two errors partly cancel through the softmax rather than compounding. K is the
+larger of the two despite K's distribution being the *better behaved* one
+(`kv_calibrate_full.py` measures `amax / p99.99` at 1.3-2.9x for K against 1.7-11.7x for V) --
+which makes sense: a K error perturbs an exponentiated dot product over all 256 dims before the
+softmax, while a V error is averaged over the attended positions afterwards. Neither term is large
+enough for the split to be actionable.
+
+**Sensitivity: the static per-head scale sits on a plateau, with a cliff on one side only.**
+Doubling every descale -- a 2x coarser quantization step, and zero clipping -- costs just
++0.00006 nats (0.00121 -> 0.00127, +5%). Halving it -- a 2x finer step, but 1.3e-03 of K elements
+clipped -- costs +0.01563 (0.00121 -> 0.01684, **14x**). So `descale = amax / 448` is not at a
+sharp optimum; it is at the low end of a wide flat region where the step size barely matters, and
+the only thing that does matter is not clipping. The practical consequence is that the safety
+margin should be spent upward: for a static scale calibrated on a held-out-ish corpus, choosing
+`amax` from a *wider* corpus (or multiplying it by a modest factor) is nearly free, while any
+scheme that tightens the scale to reduce the step -- percentile clipping at p99.99, for instance --
+would move the wrong way by an order of magnitude. Note run 1 still clips 2-5e-07 of its elements
+on this held-out corpus (headroom 1.10 for K, 1.39 for V): the calibration corpus's amax is
+genuinely exceeded in normal text, and it costs essentially nothing, which is the same statement
+seen from the other end.
+
+**What this implies for a bf16-V / per-channel-K cache.** Both are answers to a question this
+measurement says is not being asked. A **bf16 V** cache would recover at most the V-only term,
+**0.00085 nats**, for 2x the bytes and 2x the read bandwidth on half of a cache that is the
+dominant memory consumer at long context (and the whole reason the paged cache exists); at 262144
+tokens that is a multi-GiB VRAM bill for 1.2% of the engine's measured drift. **Per-channel K**
+descales (one scale per `head_dim` lane instead of one per head) would attack the 0.00113 K term,
+and the sensitivity result says it would attack the wrong half of it -- per-channel scaling buys a
+finer step where the plateau shows the step is not what costs, while the clipping it would also
+reduce is already down at 2e-07. The honest ceiling for both changes combined is the 0.00121 total,
+against an engine drift of 0.07241: even a *perfect*, zero-error KV cache would leave 98.3% of the
+gap in place. The KV path is done; `quant_int4.hpp`'s weight grid (`docs/validation.md`'s
+"Follow-up experiments" conclusion) is where the remaining nats are.
+
+### Gates
+
+**(a) `--mode none` reproduces `full_logits_golden.py` exactly.** The same taps are installed with
+the quantizer replaced by the identity, so this exercises the monkeypatch, the hook and the
+layer-identity tracking and proves they perturb nothing. Against the committed
+`tools/reference/kl_out/ref`, `kl_report.py` reports **0.00000** mean/median/p99/max KL, **100.00%**
+top-1 and top-5 on all four segments, and perplexities equal to the reference's own sidecars to the
+digit (3.805 / 3.755 / 4.605 / 15.610). Stronger than the documented bf16 cross-process wobble
+allows for: the two dumps are **byte-identical**, 0 differing fp16 entries out of `4 x 1023 x
+248320`, max `|logp_ref - logp_none| = 0.000000e+00` --
+
+```powershell
+& $py -c @'
+import numpy as np
+V, R = 248320, 1023
+for s in ("cpp_source", "english_prose", "python_source", "thai_prose"):
+    a = np.memmap(f"tools/reference/kl_out/ref/{s}.logprobs.f16", dtype="<f2", mode="r").reshape(R, V)
+    b = np.memmap(f"tools/reference/kl_out/kvfq-none/{s}.logprobs.f16", dtype="<f2", mode="r").reshape(R, V)
+    print(s, max(float(np.abs(a[i:i+64].astype(np.float32) - b[i:i+64].astype(np.float32)).max())
+                 for i in range(0, R, 64)))
+'@
+```
+
+**(b) the e4m3 fake-quant is the kernel's, checked against hand arithmetic** -- `--self-test`, no
+GPU, no checkpoint, no files. Four checks: a 19-entry hand-computed table (both tie directions,
+`1.0625 -> 1.0` and `1.1875 -> 1.25`; the `mi == 8` exponent carry, `1.9999 -> 2.0`; the subnormal
+grid, `0.017 -> 9 * 2^-9` and `2^-10 -> 0` by tie-to-even; and saturation, `449 / 500 / 1e30 ->
+448`, `-500 -> -448`); an exhaustive sweep of every finite e4m3 value (derived from the format
+definition in the test itself, not from a library) requiring an exact round trip, plus all 125
+interior midpoints requiring round-half-to-even; agreement with `torch.float8_e4m3fn` on 764 probes
+inside `|x| <= 464`; and the scaled `fake_quant_kv` round trip with per-head descales `[2.0, 0.25]`,
+where saturation must land on `448 * descale` = 896 and 112 and the clipped-element counter must
+read exactly 2.
+
+```
+[kv_fq self-test] 1. hand-computed table (descale = 1)
+    19/19 values match, including both tie directions, the exponent carry, the subnormal grid and saturation at 448
+[kv_fq self-test] 2. exhaustive sweep of every finite e4m3 value + every midpoint
+    253 representable values round-trip exactly; 125 midpoints all round half to even
+[kv_fq self-test] 3. agreement with torch.float8_e4m3fn where the two are defined alike
+    764 probes in |x| <= 464 agree exactly with torch.float8_e4m3fn
+    above it the kernel's own rule is asserted: [465.0, 479.0, 500.0, 10000.0] -> ours [448.0, 448.0, 448.0, 448.0]; this torch build gives [448.0, 448.0, 448.0, 448.0]
+    NOTE: this torch build SATURATES above the grid too, so the two happen to agree everywhere; the assertion below is on the kernel's rule, not on torch's
+[kv_fq self-test] 4. the scaled write/read round trip (fake_quant_kv)
+    per-head saturation at 448*descale (896 / 112) and the tie-to-even both hold; clipped=2, max|x/descale|/448=8.9286
+[kv_fq self-test] PASS
+```
+
+**(c) `kl_report.py --self-test` still passes** unchanged (`kl_report.py` was not modified):
+`chunk_stats` fp64 KL `0.173286795140` against the analytic `(1/4) ln 2`, max err `2.776e-17`;
+end-to-end through real files `0.173376598` (err `8.98e-05`, fp16 inputs); the asymmetric top-1/top-5
+case and the truncated-file `ValueError` both as documented. `PASS`.
+
+**Runtime**: **120.5-140.8 s** per four-segment forward run (the same ~25-41 s/segment
+`full_logits_golden.py` costs -- the fake-quant arithmetic is ~1 M elements per layer against 48 GiB
+of streamed weights, i.e. free), plus **14.4-21.6 s** per `kl_report.py` pairing. Seven runs plus
+eight reports: **~21 minutes** end to end, one GPU process at a time. Peak VRAM **1.56 GiB**
+allocated / 3.42 GiB reserved, unchanged from `full_logits_golden.py`. Each run writes 4 x 484.5 MiB
+under `kl_out/` (gitignored).

@@ -3,6 +3,10 @@
 golden_out/
 golden_out*/
 kv_calibrate_out/
+# full_logits_golden.py / the engine-side teacher-forcing tool: [T-1, 248320] fp16 dumps, ~0.5 GiB
+# per 1024-token segment. kl_corpus/tokens.json IS committed (small, deterministic); these are not.
+kl_out/
+kl_out*/
 kv_timing/
 __pycache__/
 *.pyc

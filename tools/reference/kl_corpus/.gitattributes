@@ -1,0 +1,9 @@
+# The KL corpus is tokenized byte-for-byte, so its bytes must survive a round trip through git
+# unchanged on every platform. With the repo's `core.autocrlf=true` on Windows these .txt files
+# would otherwise be checked out with CRLF line endings, every "\n" would tokenize differently, and
+# the committed tokens.json would no longer match a regeneration. `-text` disables all end-of-line
+# conversion for this directory: what was committed is what is checked out.
+#
+# tokens.json is JSON and is pinned for the same reason (its sha256_of_token_ids_json values are
+# compared against the sidecars both producers write).
+* -text

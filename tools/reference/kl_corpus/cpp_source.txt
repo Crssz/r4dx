@@ -1,0 +1,260 @@
+#include "model.h"
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
+
+#include "attn_config.h"
+#include "dflash_draft_weights.h"
+#include "embedding.h"
+#include "final_lm_head.h"
+#include "gdn_layer.h"
+#include "linear.h"
+#include "mlp.h"
+#include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
+#include "profile_span.h"
+#include "r4dx/core/error.hpp"
+#include "r4dx/core/r4d.hpp"
+#include "r4dx/kernels/kernels.h"
+#include "r4dx/model/attention/attention_layer.hpp"
+#include "r4dx/model/attention/types.hpp"
+
+namespace r4dx::model {
+
+namespace {
+
+// SpanAccumulator/SpanEntry moved to profile_span.h (Milestone 3 profiling pass, docs/r9700.md
+// R5/Q3/Q7, 2026-09-20) so GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward can record
+// per-kernel spans into the SAME accumulator this file's DecodeStepProfiled/PrefillProfiled own,
+// instead of this file only ever seeing one coarse per-block span. This local helper just converts
+// SpanAccumulator::Finish()'s SpanEntry list into Model::ProfileEntry (identical fields).
+std::vector<Model::ProfileEntry> ToProfileEntries(std::vector<SpanEntry> raw) {
+  std::vector<Model::ProfileEntry> out;
+  out.reserve(raw.size());
+  for (auto& e : raw) out.push_back({std::move(e.name), e.ms, e.count});
+  return out;
+}
+
+// DFlash2 target feature capture (docs/dflash2.md, Milestone 5 B1 item 1): called once per layer
+// iteration in both RunChunk's and VerifyWindow's layer loops, BEFORE that layer's Gdn/Attn
+// Forward call mutates `cur` -- `cur` at this point is exactly the residual stream as it enters
+// layer `layer_idx`, which is what target_layers[*] names (0-based layer INPUT index). A no-op
+// (single `.empty()` check, no allocation, no copy) when no drafter is attached, i.e. for every
+// caller before this pass and every ctest/CLI/server invocation that never calls
+// Model::AttachDflashFeatureCapture -- byte-identical behavior and r4dx-owned kernel launch count
+// to pre-B1 (this uses hipMemcpy2DAsync, the plain HIP runtime strided D2D copy, not a new r4dx-
+// owned kernel, so r4dx::kernels::r4dx_kernel_launch_counter_get() never counts it either way).
+void CaptureDflashLayerInput(core::Stream& stream, int64_t layer_idx, const uint16_t* cur,
+                              int64_t T, int64_t hidden,
+                              const std::vector<int64_t>& target_layers, uint16_t* dst) {
+  if (target_layers.empty()) return;
+  const auto it = std::find(target_layers.begin(), target_layers.end(), layer_idx);
+  if (it == target_layers.end()) return;
+  const int64_t col = static_cast<int64_t>(std::distance(target_layers.begin(), it));
+  const int64_t num_cols = static_cast<int64_t>(target_layers.size());
+  const size_t elem = sizeof(uint16_t);
+  R4DX_HIP_CHECK(hipMemcpy2DAsync(
+      /*dst=*/dst + col * hidden, /*dpitch=*/static_cast<size_t>(num_cols * hidden) * elem,
+      /*src=*/cur, /*spitch=*/static_cast<size_t>(hidden) * elem,
+      /*width=*/static_cast<size_t>(hidden) * elem, /*height=*/static_cast<size_t>(T),
+      hipMemcpyDeviceToDevice, stream.get()));
+}
+
+}  // namespace
+
+void Model::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
+  if (target_layers.empty()) {
+    DetachDflashFeatureCapture();
+    return;
+  }
+  const int64_t num_layers = container_.NumLoadedLayers();
+  for (size_t i = 0; i < target_layers.size(); ++i) {
+    if (target_layers[i] < 0 || target_layers[i] >= num_layers) {
+      throw std::out_of_range("Model::AttachDflashFeatureCapture: target layer index out of range");
+    }
+    if (i > 0 && target_layers[i] <= target_layers[i - 1]) {
+      throw std::invalid_argument(
+          "Model::AttachDflashFeatureCapture: target_layers must be sorted, strictly ascending");
+    }
+  }
+  dflash_target_layers_ = std::move(target_layers);
+  const int64_t hidden = container_.Config().hidden_size;
+  dflash_features_dev_.Resize(static_cast<size_t>(max_chunk_) *
+                               static_cast<size_t>(dflash_target_layers_.size()) *
+                               static_cast<size_t>(hidden));
+  dflash_feature_rows_ = 0;
+}
+
+void Model::DetachDflashFeatureCapture() {
+  dflash_target_layers_.clear();
+  dflash_features_dev_.Resize(0);
+  dflash_feature_rows_ = 0;
+}
+
+namespace {
+
+// Q13/R14 (docs/r9700.md): "one hipMemGetInfo + per-tensor accounting dump at end of load" --
+// four snapshots bracketing Model::Load's three allocation phases (container weights, then
+// per-layer GDN state + paged KV cache, then everything else: arena/staging/logits/MTP scratch)
+// give a real weights/KV/arena/free breakdown from what the driver actually reports, rather than
+// from summing this codebase's own byte-size arithmetic (which is exactly what Q13 flagged as
+// insufficient to explain w4a8's "identical 15.75 GiB to w4a16 despite 0.35 GiB smaller weights").
+struct VramSnap {
+  size_t free_bytes = 0, total_bytes = 0;
+  bool ok = false;
+};
+VramSnap SnapVram() {
+  VramSnap s;
+  s.ok = (hipMemGetInfo(&s.free_bytes, &s.total_bytes) == hipSuccess);
+  return s;
+}
+double GiB(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0); }
+
+}  // namespace
+
+Model Model::Load(const ModelOptions& opts) {
+  Model m;
+  const VramSnap vram0 = SnapVram();  // before any of this Load() call's own allocations
+  // The vision tower's ~0.90 GiB is loaded between two of its own snapshots so it gets its own
+  // VRAM breakdown line -- the same treatment the DFlash2 drafter gets below, and the only honest
+  // way to report a delta docs/vision.md quotes as a number (docs/vision.md "Load policy").
+  const bool want_vision = opts.vision != ModelOptions::VisionMode::kOff;
+  m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
+                                  opts.mtp_head_layout.value_or(opts.layout),
+                                  opts.embed_device_resident, want_vision);
+  const VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  if (opts.vision == ModelOptions::VisionMode::kOn && !m.container_.HasVision()) {
+    throw std::runtime_error(
+        "Model::Load: --vision on was requested but the container has no vision.* tensors "
+        "(convert without --language-model-only, or use --vision auto)");
+  }
+  if (m.container_.HasVision()) {
+    m.vision_.emplace();
+    const vision::VisionWeights& vw = m.container_.Vision();
+    std::cerr << "[r4dx::model::Model] vision tower loaded: " << vw.tensor_count << " tensors, "
+              << GiB(vw.bytes) << " GiB (depth=" << vw.config.depth
+              << ", hidden=" << vw.config.hidden_size << ", out_hidden=" << vw.config.out_hidden_size
+              << ")\n";
+  } else if (opts.vision == ModelOptions::VisionMode::kAuto &&
+             m.container_.ContainerHasVisionTensors()) {
+    // Cannot happen with the current policy (auto asks for the load), but says so out loud rather
+    // than silently leaving a vision-capable container text-only if that policy ever changes.
+    std::cerr << "[r4dx::model::Model] container carries vision.* tensors but the tower was not "
+                  "loaded -- image requests will be rejected\n";
+  }
+  const ModelConfig& cfg = m.container_.Config();
+  const int64_t hidden = cfg.hidden_size;
+  const int64_t num_layers = m.container_.NumLoadedLayers();
+
+  if (opts.mtp_draft_k > 0 && !m.container_.HasMtp()) {
+    throw std::runtime_error(
+        "Model::Load: mtp_draft_k > 0 but the container has no mtp.* weights (convert with "
+        "--mtp on)");
+  }
+  if (opts.dflash_draft_k < 0) {
+    throw std::runtime_error("Model::Load: dflash_draft_k must be >= 0");
+  }
+  if (!opts.dflash_container.empty()) {
+    if (opts.dflash_draft_k <= 0) {
+      throw std::runtime_error(
+          "Model::Load: dflash_container is set but dflash_draft_k <= 0 (nothing would ever be "
+          "drafted -- Model::VerifyWindow's own window would never exceed 1 row)");
+    }
+    if (opts.mtp_draft_k > 0) {
+      throw std::runtime_error(
+          "Model::Load: dflash_container cannot be combined with mtp_draft_k > 0 -- DFlash2 and "
+          "MTP are mutually exclusive self-speculation families (docs/dflash2.md); the CLI/server "
+          "already reject --dflash with --mtp > 0, this is Model::Load's own re-check so no caller "
+          "can bypass that by constructing ModelOptions directly)");
+    }
+  }
+  m.mtp_draft_k_ = opts.mtp_draft_k;
+  m.dflash_draft_k_ = opts.dflash_draft_k;
+  m.mtp_draft_reduced_vocab_ = opts.mtp_draft_reduced_vocab;
+  // GDN's per-sequence window bank (gdn_state.h's file comment) must be sized for the largest
+  // speculative-verify window this Model will ever run: the widest draft either speculation family
+  // can produce, plus the seed/anchor token. ==1 (window index 0 only) when neither is enabled --
+  // every decode call then degenerates exactly to this class's pre-speculation behavior, and a
+  // Model with only MTP enabled sizes identically to before dflash_draft_k existed.
+  m.draft_window_ = 1 + std::max(opts.mtp_draft_k, opts.dflash_draft_k);
+  const int64_t max_decode_window = m.draft_window_;
+
+  m.max_chunk_ = 64;
+  m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  m.embed_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
+  m.embed_ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
+  m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion (model.h's doc comment) --
+  // 2 bytes/element covers the widest epilogue format (f16); fp8/int8 use the same allocation's
+  // first half.
+  m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(m.max_chunk_ * hidden * 2));
+  m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(m.max_chunk_));
+  // R2/P2 (docs/r9700.md): the original correctness issue (an `r4dx::core::Arena::Alloc` gap that
+  // never rounded an allocation's END up to a 16-byte boundary, silently misaligning every
+  // default-aligned buffer allocated right after a fused epilogue's scale scratch) was root-caused
+  // and fixed in `arena.hpp` (docs/status.md's "R2/P2 fused activation-quant epilogues:
+  // root-caused and enabled for w4a8/mxfp4" section). EpilogueForLayout (linear.cpp) now returns
+  // `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4 (verified byte-identical
+  // end to end against the fusion-disabled baseline, `tools/validate_fusion.ps1`) and still
+  // `r4dx_epilogue_none` for w4a16/bf16 (w4a16's own separate, understood wall-clock regression --
+  // see linear.cpp's own doc comment -- and bf16 never quantizes its activation input at all).
+  m.body_epilogue_ = EpilogueForLayout(opts.layout);
+  m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
+  m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
+  m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
+  m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(1);
+  // 3-axis mrope companion (docs/vision.md): 3*64 int32 == 768 bytes, allocated unconditionally
+  // rather than lazily -- a lazy hipMalloc would have to happen on the first multimodal chunk,
+  // i.e. mid-request with the device live, which is exactly what every other per-chunk buffer in
+  // this class is persistent to avoid.
+  m.attn_rope_pos_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(3 * m.max_chunk_));
+  m.rope_pos_host_.assign(static_cast<size_t>(3 * m.max_chunk_), 0);
+  // Per-layer activation scratch (rmsnorm output, gate_up, GDN conv/kkt/chunk-scan buffers,
+  // activation-quant scratch): a few MB at T<=64 (see linear.h/gdn_layer.cpp's own buffer sizes).
+  // 96MB gives headroom without materially affecting the ~15-35GB the weights themselves occupy.
+  m.arena_.Reserve(96ull * 1024 * 1024);
+  const VramSnap vram2 = SnapVram();  // after activation scratch (buf_a_/b_/logits/arena/etc.)
+
+  const auto adims = core::r4d::GetAttnDims();  // head_dim=256, gqa=6, block_size=16
+
+  m.gdn_states_.resize(static_cast<size_t>(num_layers));
+  m.kv_caches_.resize(static_cast<size_t>(num_layers));
+  for (int64_t i = 0; i < num_layers; ++i) {
+    if (cfg.IsGdnLayer(i)) {
+      m.gdn_states_[static_cast<size_t>(i)].emplace(
+          /*max_seqs=*/1, /*H=*/cfg.linear_num_value_heads, /*V=*/cfg.linear_value_head_dim,
+          /*K=*/cfg.linear_key_head_dim, cfg.ConvDim(), cfg.linear_conv_kernel_dim,
+          max_decode_window);
+      m.gdn_states_[static_cast<size_t>(i)]->ZeroAll(m.stream_);
+    } else {
+      m.kv_caches_[static_cast<size_t>(i)].emplace(
+          static_cast<int>(cfg.num_key_value_heads), static_cast<int>(cfg.head_dim),
+          adims.block_size, static_cast<int>(opts.max_ctx));
+    }
+  }
+
+  if (opts.mtp_draft_k > 0) {
+    m.mtp_.emplace(cfg, m.container_.Mtp(), opts.mtp_draft_k, opts.max_ctx);
+    m.mtp_seed_hidden_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(hidden));
+  }
+  // Verify scratch + the GDN acceptance-count thread are shared by BOTH speculation families, so
+  // they are sized off draft_window_ rather than off mtp_draft_k alone -- a DFlash2-only Model
+  // (mtp_draft_k==0, dflash_draft_k>0) has no mtp.* weights anywhere but still verifies through
+  // Model::VerifyWindow, which needs exactly these.
+  if (m.draft_window_ > 1) {
+    m.mtp_num_accepted_dev_ = core::DeviceBuffer<int32_t>(1);
+    m.verify_logits_dev_ =
+        core::DeviceBuffer<float>(static_cast<size_t>(m.draft_window_ * cfg.vocab_size));
+    m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.draft_window_));
+  }
+
+  // Sampled-decode row summaries (docs/sampling.md section 8), sized for the widest thing that can
+  // ever be summarised at once: one plain decode row, or a whole verify window. Unconditional and
+  // ~4 KB at draft_window_==8 -- a plain sampled decode step needs these on a Model that was never

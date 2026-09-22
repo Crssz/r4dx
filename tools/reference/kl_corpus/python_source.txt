@@ -1,0 +1,230 @@
+"""tools/reference/layer_golden.py
+
+Builds Qwen3_5 text-decoder layers, one at a time, straight from the reference `transformers`
+install's `modeling_qwen3_5.py` -- real weights when the shard is downloaded, deterministic
+seeded random init otherwise -- runs them on a fixed seeded hidden-state input, and dumps
+inputs/outputs/intermediates to .safetensors + a manifest.json. This is the contract the r4dx C++
+engine's tests compare their own kernel outputs against (docs/validation.md, rung 3).
+
+Covers, per the task: one GDN layer (layer 0), one full-attention layer (layer 3), final norm +
+lm_head on a tiny vocab slice, and the MTP block (random-init fallback -- see the "mtp" section of
+the manifest and docs/validation.md: transformers 5.17.0 has no Qwen3_5 MTP forward implementation
+to load real weights into, so this exercises the container/loader's tensor *shapes* only).
+
+Usage:
+    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\reference\\layer_golden.py ^
+        --device cuda --out-dir tools\\reference\\golden_out
+
+See tools/reference/README.md for the full option list and expected runtime.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import sys
+import traceback
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+from common import (  # noqa: E402
+    DEFAULT_MODEL_DIR,
+    ShardIndex,
+    force_eager,
+    load_module_state,
+    load_text_config,
+    resolve_device,
+    save_golden,
+    set_seed,
+    sha256_file,
+    tensor_manifest_entry,
+)
+
+TOLERANCES = {
+    "bf16_matmul_rel_err": 2e-2,
+    "fp32_elementwise_rel_err": 1e-4,
+    "recurrent_state_rel_err": 5e-2,
+    "note": "bf16_matmul_rel_err for anything that ends in a r4d_gemm_* call (attn qkv/o, GDN "
+    "in/out proj, MLP, lm_head); fp32_elementwise_rel_err for norms/gates/activations computed "
+    "in fp32 by the reference; recurrent_state_rel_err is looser because the GDN state accumulates "
+    "64 (chunk) or more matmuls of drift before the golden's chunk boundary.",
+}
+
+
+def causal_additive_mask(q_len: int, kv_len: int, past_len: int, device, dtype) -> torch.Tensor:
+    """[1, 1, q_len, kv_len] additive mask: 0 where key <= query position, dtype-min elsewhere."""
+    q_pos = torch.arange(q_len, device=device).unsqueeze(1) + past_len
+    k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
+    allowed = k_pos <= q_pos
+    mask = torch.zeros(q_len, kv_len, dtype=dtype, device=device)
+    mask = mask.masked_fill(~allowed, torch.finfo(dtype).min)
+    return mask.view(1, 1, q_len, kv_len)
+
+
+def mrope_position_ids(total_len: int, device) -> torch.Tensor:
+    """[3, 1, total_len] position ids. This golden is text-only (no vision tokens), so all three
+    mrope sections (t, h, w) collapse to the same sequential index -- the standard fallback for a
+    pure-text sequence (see Qwen3_5Model.get_rope_index for the general, image-aware case)."""
+    idx = torch.arange(total_len, device=device)
+    return idx.view(1, 1, total_len).expand(3, 1, total_len).clone()
+
+
+#: Tensors `GdnCapture` guarantees on every successful GDN call (see `_wrap_rule` below). If the
+#: `kernels`/`fla`/`causal_conv1d` optional hub packages are installed in the reference venv, they
+#: can rebind `Qwen3_5GatedDeltaNet`'s module-level free functions to a real accelerated kernel
+#: before this monkeypatch takes effect -- `run_text_layer` checks this set is a subset of
+#: `cap.record` after every GDN call and raises rather than silently writing a golden with the GDN
+#: intermediates missing (see finding 6 in the Opus review this fixes).
+REQUIRED_GDN_KEYS = {
+    "gdn_q", "gdn_k", "gdn_v", "gdn_g", "gdn_beta", "gdn_core_attn_out",
+    "gdn_q_l2", "gdn_k_l2", "gdn_g_chunk_cumsum",
+}
+
+
+class GdnCapture:
+    """Monkeypatches the module-level free functions Qwen3_5GatedDeltaNet.forward calls into
+    (causal_conv1d_fn/update, torch_{chunk,recurrent}_gated_delta_rule) to record the
+    intermediates transformers doesn't otherwise expose, in TWO forms per tensor:
+
+    - the RAW form actually passed to/returned by the callee (`gdn_q`/`gdn_k`/`gdn_v`/`gdn_g`/
+      `gdn_beta`/`gdn_conv_out_*`): pre-l2norm, pre-(1/sqrt(K))-scale, POST-repeat_interleave (i.e.
+      GQA-expanded from Hg=16 key/query heads up to H=48 value heads) for q/k, and PER-TOKEN
+      (not chunk-summed) for g. `Qwen3_5GatedDeltaNet` calls
+      `torch_{chunk,recurrent}_gated_delta_rule(..., use_qk_l2norm_in_kernel=True)`, so l2norm AND
+      the query scaling happen *inside* the callee, after this wrapper's clone -- these raw tensors
+      are NOT normalized/scaled despite what an earlier version of this docstring claimed.
+    - the r4d-shaped form (`gdn_q_l2`/`gdn_k_l2`/`gdn_g_chunk_cumsum`/`gdn_core_attn_out`): what
+      `r4d_gdn_conv_prep_w4_h128_bf16` actually emits and `r4d_gdn_kkt_solve_k128_c64_bf16` /
+      `r4d_gdn_chunk_scan_k128_v128_c64_bf16` actually consume, per r4d.h's layout comments (q,k
+      `[T, Hg, K]` l2-normed but NOT scaled -- `r4d_gdn_chunk_scan_k128_v128_c64_bf16` takes the
+      `1/sqrt(K)` scale as its own `scale` float argument, matching
+      `torch_chunk_gated_delta_rule`'s `query = query * query.shape[-1] ** -0.5` applied after
+      l2norm; g `[T, H]` fp32 already cumulatively summed within each 64-token chunk; o/core_attn_out
+      `[T, H, V]`, the chunk-scan kernel's raw output BEFORE the gated RMSNorm).
+      `gdn_q_l2`/`gdn_k_l2` are de-interleaved from the raw GQA-expanded form back to `Hg` heads by
+      taking every `gqa_repeats`-th head (`repeat_interleave` duplicates each head's vector
+      `gqa_repeats` times consecutively, and l2norm of two identical vectors is itself identical, so
+      de-interleaving after l2norm is exactly equivalent to de-interleaving the original Hg-head
+      tensor before l2norm/GQA-expansion -- no information is lost).
+
+    Also records `gdn_conv_out_fn_full`/`gdn_conv_out_fn_trimmed` (from `causal_conv1d_fn`) and
+    `gdn_conv_out_update` (from `causal_conv1d_update`, already exactly `stage_seq_len` columns).
+    `causal_conv1d_fn` itself does NOT trim its cache-prepended input down to the new tokens --
+    `Qwen3_5GatedDeltaNet.forward` does that with an extra `mixed_qkv[:, :, -seq_len:]` slice AFTER
+    the call this wrapper intercepts (modeling_qwen3_5.py's GDN forward) -- so `..._full` is the raw,
+    still-cache-prefixed return value and `..._trimmed` replicates that external slice using
+    `self.stage_seq_len` (the caller MUST set this before invoking the layer). Only `..._trimmed` is
+    the correct golden for `r4d_gdn_conv_update_w4_h128_bf16`'s output shape.
+
+    Safe regardless of whether the `fla`/`causal_conv1d` optional packages are installed in the
+    reference venv (they are not, as of this writing): the wrapper captures whatever the
+    currently-bound implementation returns, it does not depend on which implementation that is --
+    but see `REQUIRED_GDN_KEYS` above for what happens if one of those packages rebinds the
+    functions out from under this monkeypatch.
+    """
+
+    PATCH_NAMES = (
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
+        "torch_chunk_gated_delta_rule",
+        "torch_recurrent_gated_delta_rule",
+    )
+
+    def __init__(self, modeling_module, gqa_repeats: int):
+        self.m = modeling_module
+        self.gqa_repeats = gqa_repeats
+        self.stage_seq_len: int | None = None  # caller MUST set this before invoking the layer
+        self.originals: dict[str, object] = {}
+        self.record: dict[str, torch.Tensor] = {}
+
+    def __enter__(self):
+        for name in self.PATCH_NAMES:
+            self.originals[name] = getattr(self.m, name)
+        self.m.causal_conv1d_fn = self._wrap_conv(self.originals["causal_conv1d_fn"], "fn")
+        self.m.causal_conv1d_update = self._wrap_conv(self.originals["causal_conv1d_update"], "update")
+        self.m.torch_chunk_gated_delta_rule = self._wrap_rule(self.originals["torch_chunk_gated_delta_rule"])
+        self.m.torch_recurrent_gated_delta_rule = self._wrap_rule(self.originals["torch_recurrent_gated_delta_rule"])
+        return self
+
+    def __exit__(self, *exc_info):
+        for name, fn in self.originals.items():
+            setattr(self.m, name, fn)
+        return False
+
+    def _wrap_conv(self, original, kind):
+        def wrapped(*args, **kwargs):
+            out = original(*args, **kwargs)
+            if kind == "fn":
+                self.record["gdn_conv_out_fn_full"] = out.detach().clone()
+                assert self.stage_seq_len is not None, "GdnCapture.stage_seq_len not set before layer() call"
+                self.record["gdn_conv_out_fn_trimmed"] = out[:, :, -self.stage_seq_len :].detach().clone()
+            else:  # "update" -- causal_conv1d_update already returns exactly stage_seq_len columns
+                self.record["gdn_conv_out_update"] = out.detach().clone()
+            return out
+
+        return wrapped
+
+    @staticmethod
+    def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """Matches modeling_qwen3_5.py's module-level `l2norm` exactly."""
+        inv_norm = torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
+        return x * inv_norm
+
+    def _wrap_rule(self, original):
+        def wrapped(query, key, value, g, beta, *args, **kwargs):
+            self.record["gdn_q"] = query.detach().clone()
+            self.record["gdn_k"] = key.detach().clone()
+            self.record["gdn_v"] = value.detach().clone()
+            self.record["gdn_g"] = g.detach().clone()
+            self.record["gdn_beta"] = beta.detach().clone()
+
+            # r4d-shaped q/k: l2-normed (matching use_qk_l2norm_in_kernel=True), NOT scaled by
+            # 1/sqrt(K) (that's r4d_gdn_chunk_scan_k128_v128_c64_bf16's own `scale` argument), and
+            # de-interleaved from the GQA-expanded H=48 heads back down to Hg=16.
+            q_l2_full = self._l2norm(query.detach().to(torch.float32))
+            k_l2_full = self._l2norm(key.detach().to(torch.float32))
+            self.record["gdn_q_l2"] = q_l2_full[:, :, :: self.gqa_repeats, :].detach().clone()
+            self.record["gdn_k_l2"] = k_l2_full[:, :, :: self.gqa_repeats, :].detach().clone()
+
+            # r4d-shaped g: cumulatively summed (log-space decay) within each 64-token chunk, exactly
+            # matching torch_chunk_gated_delta_rule's internal `cum_decay = decay.cumsum(dim=3)`
+            # after reshaping into [.., num_chunks, chunk_size].
+            chunk_size = 64
+            g_bht = g.detach().to(torch.float32).transpose(1, 2)  # [B, H, T]
+            total_len = g_bht.shape[-1]
+            pad = (chunk_size - total_len % chunk_size) % chunk_size
+            g_padded = torch.nn.functional.pad(g_bht, (0, pad))
+            g_chunks = g_padded.reshape(g_padded.shape[0], g_padded.shape[1], -1, chunk_size)
+            g_cumsum = g_chunks.cumsum(dim=3).reshape(g_padded.shape[0], g_padded.shape[1], -1)
+            g_cumsum = g_cumsum[..., :total_len].transpose(1, 2)  # back to [B, T, H]
+            self.record["gdn_g_chunk_cumsum"] = g_cumsum.detach().clone()
+
+            # Always ask the real implementation for the final recurrent state, regardless of what
+            # the caller (Qwen3_5GatedDeltaNet.forward) requested -- harmless when cache_params is
+            # None (the caller just never reads it), and it's the only way to see the state produced
+            # by a plain prefill call (no cache) at all.
+            forced = dict(kwargs)
+            forced["output_final_state"] = True
+            out, state = original(query, key, value, g, beta, *args, **forced)
+            self.record["gdn_core_attn_out"] = out.detach().clone()
+            if state is not None:
+                self.record["gdn_recurrent_state"] = state.detach().clone()
+            return out, state
+
+        return wrapped
+
+
+def build_layer(m, layer_config, layer_idx: int, device, dtype):
+    """Constructs one Qwen3_5DecoderLayer. Caller is responsible for seeding torch's RNG first --
+    the layer's default (unseeded-here) init is exactly the deterministic random fallback we want
+    when the checkpoint doesn't have this layer's weights."""
+    layer = m.Qwen3_5DecoderLayer(layer_config, layer_idx)
+    layer = layer.to(device=device, dtype=dtype)
+    layer.eval()
+    return layer
+
+

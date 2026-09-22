@@ -1,0 +1,79 @@
+Why a Cache Miss Costs More Than an Instruction
+
+Most people who learn to program are taught, early and emphatically, to count operations. An
+algorithm that performs n log n comparisons is better than one that performs n squared, and for
+large enough n that is always true. What the counting model leaves out is that not all operations
+cost the same, and on a modern processor the spread between the cheapest and the most expensive is
+not a factor of two or three but a factor of several hundred. An addition of two values already
+sitting in registers retires in a fraction of a nanosecond, and several of them retire at once. A
+load that misses every level of cache and has to be serviced by main memory can stall for the time
+it would have taken to retire four hundred additions. If your inner loop is written so that every
+iteration touches a fresh, unpredictable address, you are not running an n log n algorithm at all;
+you are running an n log n algorithm multiplied by a constant you never measured.
+
+The hardware tries very hard to hide this from you. Between the register file and the memory
+controller sit three or four levels of cache, each larger and slower than the one above it. A first
+level cache is perhaps forty-eight kilobytes and answers in four or five cycles. A last level cache
+might be ninety-six megabytes shared across all the cores and answers in fifty. Main memory, at the
+end of a bus that has to be arbitrated, refreshed, and occasionally recalibrated, answers in
+something closer to two hundred and fifty. Every one of those levels is organized into fixed-size
+lines, usually sixty-four bytes, and the unit of transfer is the line, never the byte. Reading one
+byte pulls in the sixty-three bytes around it whether you wanted them or not. This single fact
+explains more performance mysteries than any other I know.
+
+Consider the difference between walking an array of structures and walking several parallel arrays
+of scalars. In the first layout, each element is contiguous, so if you need every field of every
+element the cache line you paid for is fully consumed and nothing is wasted. In the second layout,
+each field is contiguous with the same field of its neighbours, so if you need only one field out
+of twelve you are reading a line whose every byte is useful, instead of a line where eleven twelfths
+of the traffic is thrown away. Neither layout is universally correct. The correct layout is the one
+that matches the access pattern of the code that runs most often, and discovering which that is
+requires measurement rather than intuition, because the code that runs most often is frequently not
+the code you spent the most time writing.
+
+The prefetcher complicates the story in a way that is mostly helpful and occasionally infuriating.
+Hardware prefetchers watch the stream of addresses a core requests and, when they detect a regular
+stride, begin fetching ahead of the program. A loop that walks memory forward with a constant step
+will therefore see far fewer stalls than its miss count suggests, because the misses were resolved
+before the instruction that needed them issued. The infuriating part is that this makes benchmarks
+lie. Replace the forward walk with a random permutation of the same addresses, touching exactly the
+same lines the same number of times, and throughput can fall by an order of magnitude with no change
+whatsoever to the operation count. The permutation defeated a piece of hardware you did not know was
+carrying you.
+
+Virtual memory adds a second, quieter tax. Every address your program uses is virtual and must be
+translated to a physical one, and that translation is itself a lookup in a multi-level page table
+living in memory. To avoid paying for a table walk on every access, the processor caches recent
+translations in a structure called the translation lookaside buffer. It is small: a few thousand
+entries, each covering one page. With four kilobyte pages, a few thousand entries cover a few tens
+of megabytes, and a program whose working set exceeds that will miss in the translation buffer even
+when it hits in the data cache. The symptom is peculiar and easy to misdiagnose: the data is in
+cache, the miss counters look healthy, and the program is still slow. The fix is usually to ask the
+operating system for larger pages, so that each translation entry covers two megabytes instead of
+four kilobytes and the same buffer suddenly spans gigabytes.
+
+Once the working set outgrows memory entirely, the page cache takes over and the constants change
+again by three orders of magnitude. A read that has to reach a solid state drive costs tens of
+microseconds even in the best case, and a read that reaches a spinning disk costs milliseconds. The
+operating system therefore keeps recently used file pages in whatever memory is not otherwise
+spoken for, and evicts them on some approximation of least recently used when a program needs the
+space. This is why the second run of a program that reads a large file is often dramatically faster
+than the first, and why a benchmark that does not control for cache state is not a benchmark but an
+anecdote. It is also why the honest way to report a streaming workload's time is to say whether the
+input was warm, and to report both numbers when the difference matters.
+
+What should a working programmer take from all of this? Not that operation counts are useless, but
+that they are the first term of an expansion and rarely the dominant one. When something is slower
+than the count predicts, the question to ask is not what the code is computing but what it is
+touching: how many distinct lines, in what order, with what reuse, and how far apart in time the
+reuses fall. Tools exist to answer these questions directly. Performance counters will tell you the
+miss rate at each level, the translation miss rate, and the fraction of cycles in which the core
+retired nothing at all because it was waiting. Those three numbers will usually point at the problem
+faster than any amount of reading.
+
+The deeper lesson is one about abstraction. The memory hierarchy is a leaky abstraction by design:
+it exists precisely to make the slow thing look fast most of the time, and it succeeds often enough
+that we forget it is there. The cost of the illusion is that when it fails, it fails invisibly, and
+the program does not report that it is waiting. It simply takes longer, and the profile blames
+whatever instruction happened to be holding the bag. Learning to read past that misattribution is
+most of what separates code that is fast on a slide from code that is fast on a machine.

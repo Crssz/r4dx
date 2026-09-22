@@ -175,7 +175,10 @@ per-group-of-128-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`.
 **The byte layout above does not depend on this section.** Everything here is about *which* `q` /
 `scale` / `zero` (or E8M0 exponent) values get written into those exact bytes, and a loader cannot
 tell the two modes apart except by reading `r4dx_convert_run.quant_values` out of the container
-metadata. `r4dx-convert --quant {rtn,search}` picks between them; `search` is the default.
+metadata. `r4dx-convert --quant {rtn,search}` picks between them; **`rtn` is the default**, so a
+converter command that predates these flags still produces the same bytes it always did. (A
+container built before the flags existed has no `quant_values`/`imatrix` key at all; that absence
+means `rtn`.)
 
 **`rtn`** -- the original quantizer, and what every container built before this flag existed
 contains. One grid per `(row, group)` straight from the data's extremes, then round-to-nearest:
@@ -199,6 +202,12 @@ with the zero held at 8 (its kernel has no zero-point input); `mxfp4` instead tr
 exponent and that exponent minus one and keeps the lower-error one. The `rtn` candidate is scored
 first and later candidates must win **strictly**, so the search's error is never above `rtn`'s --
 `tests/convert/test_quant_search.cpp` gates that group by group.
+
+That guarantee is about `E(scale, zero)` for one `(row, group)`, and nothing more. It does **not**
+imply a better model: `--quant search` without `--imatrix` lowers this objective on every group and
+still lands at mean KL 0.0713 / top-1 87.71% against `rtn`'s 0.0724 / 88.4% on the real checkpoint
+(`docs/validation.md` "Milestone 10"). Only the importance weighting turns the per-group win into a
+model-level one.
 
 `wt_k` is `1` unless `--imatrix <npz>` is given, in which case it is input channel `k`'s mean
 activation energy from `tools/reference/imatrix_capture.py`'s importance matrix, keyed by these same

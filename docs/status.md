@@ -1,19 +1,23 @@
 # Status
 
-## Grid search alone doesn't beat RTN; imatrix container blocked on disk space, 2026-09-22
+## Milestone 10 complete: the imatrix is the lever, the search alone is not, 2026-09-22
 
-Milestone 10 built `qwen38-27b-w4a16-search.r4dx` (`--quant search`, no imatrix, w4a16-only,
-full KV calib): mean KL **0.0713** / top-1 **87.71%**, essentially unchanged from the RTN
-baseline's 0.072 / 88.4% (top-1 slightly *worse*). Unweighted scale search is not, by itself, a
-useful lever on this checkpoint -- confirms Stage 2's own synthetic-data finding that unweighted
-search only reaches ~88% of RTN's error, too small to show up at corpus scale. The imatrix-weighted
-container (`--quant search --imatrix`, expected to matter -- Stage 2's real-model imatrix run hit
-0.0534 / 89.30%) was **not built**: converting it needs ~17.5 GiB free on `D:`, which had a ~1 GiB
-shortfall after container A, and freeing it requires deleting/moving files this session didn't
-create, which the harness's permission classifier refused outright (deletion is a hard-blocked
-action category, not a per-task judgment call). See `docs/validation.md` "Milestone 10" for the
-full KL table, the speed/acceptance comparison, and the exact command to finish the job once ~2 GiB
-is free on `D:`.
+`r4dx-convert --quant search --imatrix <npz>` improves every quantized layout with **zero** change
+to the byte layout, the kernels or decode speed -- w4a16 mean KL **0.0724 -> 0.0534** / top-1
+**88.4% -> 89.30%**, w4a8 0.1434 -> 0.1164 / 82.72% -> **84.78%**, mxfp4 0.0912 -> 0.0797. MTP
+acceptance rises 40.4% -> **48.4%** (its draft head is in the container and got better weights too),
+worth **+13.5% decode tok/s** on `--mtp 3`; plain decode is unchanged at 38.92 tok/s, as it must be.
+
+`--quant search` **without** `--imatrix` is worth nothing: it lowers its own per-group objective on
+every one of 768 real groups audited and still lands at 0.0713 / 87.71%, i.e. mean KL within noise
+of RTN and top-1 0.7 points *worse*. It was briefly made the converter default; the stage-4 review
+put the default back to **`--quant rtn`**, so a plain convert command still reproduces every
+pre-existing container byte for byte, and the useful pair has to be asked for explicitly.
+`--imatrix` is also now rejected with `--dflash-gguf` (the drafter shares none of its keys) and the
+coverage line says `WARNING` on stderr if any linear fell back to unweighted MSE. Full evidence --
+format invariance, byte provenance against the Python reference, the float64 optimality audit, the
+corpus-contamination check and the cross-session byte-identical reproduction -- is in
+`docs/validation.md` "Milestone 10".
 
 ## fp8 KV cache properly calibrated, 2026-09-22
 

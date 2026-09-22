@@ -347,16 +347,16 @@ concurrently.
 | cpp_source | 1023 | 0.05907 | 0.02025 | 0.46623 | 1.51422 | pos 662 (tok 9 `'*'`) | 91.01% | 99.80% | 3.805 | 3.921 | 2 |
 | english_prose | 1023 | 0.06765 | 0.04152 | 0.34000 | 0.73583 | pos 109 (tok 82) | 89.74% | 99.80% | 3.755 | 4.024 | 0 |
 | python_source | 1023 | 0.06869 | 0.03267 | 0.40826 | 0.95169 | pos 645 (tok 13011) | 89.05% | 99.51% | 4.605 | 4.922 | 0 |
-| thai_prose | 1023 | 0.15633 | 0.10060 | 0.83319 | 3.89099 | pos 206 (tok 53900 `'์'`) | 78.20% | 98.53% | 15.610 | 16.991 | 8 |
+| thai_prose | 1023 | 0.15633 | 0.10060 | 0.83319 | 3.89099 | pos 206 (tok 53900 `'à¹Œ'`) | 78.20% | 98.53% | 15.610 | 16.991 | 8 |
 | **ALL** | 4092 | **0.08794** | 0.04833 | 0.58740 | 3.89099 | thai_prose pos 206 | **87.00%** | 99.41% | 5.661 | 6.027 | 10 |
 
 **Positions with KL > 1 nat** (10 total, all in code/Thai; none in `english_prose`/`python_source`):
 
 - `cpp_source`: pos 526 (next token 874, `' no'`, KL 1.288), pos 662 (next token 9, `'*'`, KL 1.514).
-- `thai_prose`: pos 206 (tok 53900 `'์'`, KL 3.891), pos 257 (tok 38534 `'ต'`, KL 1.351), pos 258
-  (tok 148410 `'้อง'`, KL 2.035), pos 318 (tok 149334 `'ญา'`, KL 1.717), pos 636 (tok 157620
-  `'เฉล'`, KL 2.376), pos 669 (tok 45596 `'ี่'`, KL 1.290), pos 949 (tok 35982 `'ว'`, KL 1.887), pos
-  962 (tok 148947 `'ูก'`, KL 1.808). Every Thai KL>1 token is a sub-syllable script fragment, not a
+- `thai_prose`: pos 206 (tok 53900 `'à¹Œ'`, KL 3.891), pos 257 (tok 38534 `'à¸•'`, KL 1.351), pos 258
+  (tok 148410 `'à¹‰à¸­à¸‡'`, KL 2.035), pos 318 (tok 149334 `'à¸à¸²'`, KL 1.717), pos 636 (tok 157620
+  `'à¹€à¸‰à¸¥'`, KL 2.376), pos 669 (tok 45596 `'à¸µà¹ˆ'`, KL 1.290), pos 949 (tok 35982 `'à¸§'`, KL 1.887), pos
+  962 (tok 148947 `'à¸¹à¸'`, KL 1.808). Every Thai KL>1 token is a sub-syllable script fragment, not a
   whole word. The `thai_prose` outlier is decomposed in "Auditing this measurement" below; it is
   real quantization loss, not a tokenizer or corpus artifact.
 
@@ -437,7 +437,7 @@ resident `Qwen3_5TextModel` with `num_hidden_layers = 4` -- ordinary `nn.Module`
 and compares it to `StreamingReference(max_layers=4)` at **every** position. `layer_types[:4]` is
 `[linear, linear, linear, full]`, so both the GDN and the full-attention path are covered.
 
-| streaming impl | hidden max\|diff\| | logits max\|diff\| | argmax agreement | per-position KL(control‖streaming) |
+| streaming impl | hidden max\|diff\| | logits max\|diff\| | argmax agreement | per-position KL(controlâ€–streaming) |
 |---|---:|---:|---:|---:|
 | `model` | 2.99e-01 | 3.13e-01 | 48/48 | max 1.74e-03, mean 3.42e-04 |
 | `manual` | 2.99e-01 | 3.13e-01 | 48/48 | max 1.74e-03, mean 3.42e-04 |
@@ -503,7 +503,7 @@ perplexity 15.6 vs 3.8-4.6) -- and ~40% is a genuine Thai-specific excess.
 its token ids from `>= 148000`**, the checkpoint's extended/multilingual vocabulary tail, against
 0.0% / 0.0% / 0.2% for the other three. Splitting the KL sum there:
 
-| segment | ref mass in ids ≥148000 | KL from that region | KL per unit mass, low / high | mass-weighted \|Δ logp\|, low / high |
+| segment | ref mass in ids â‰¥148000 | KL from that region | KL per unit mass, low / high | mass-weighted \|Î” logp\|, low / high |
 |---|---:|---:|---:|---:|
 | cpp_source | 0.00026 | -0.00003 (-0.1%) | +0.0591 / -0.1237 | 0.174 / 0.462 |
 | english_prose | 0.00011 | -0.00000 (-0.0%) | +0.0677 / -0.0086 | 0.223 / 0.464 |
@@ -523,7 +523,7 @@ predictions live there -- a property of the quantization, not of the measurement
 committed ids exactly, and no line longer than 20 characters is shared with `calib.txt` (the fp8 KV
 descale calibration corpus), so the corpus is genuinely held out.
 
-**Verdict.** Trustworthy as stated: the KL is `KL(P_bf16 ‖ Q_w4a16)`, in nats, over the full
+**Verdict.** Trustworthy as stated: the KL is `KL(P_bf16 â€– Q_w4a16)`, in nats, over the full
 248320-way vocabulary, accumulated in fp64, averaged over positions, on aligned rows of identical
 token ids, against a reference validated against a plain transformers forward, with a reference
 self-noise ~200x smaller than the reported value.
@@ -567,92 +567,146 @@ Converter/loader changes made for this pass: `--lm-head bf16` now survives `--no
 default lm_head spec is stripped), and `Container::Load` falls back to `lm_head.bf16.w` when the
 requested layout is absent from the container.
 
-### Milestone 10: grid search + imatrix (2026-09-22)
+### Milestone 10: grid search + imatrix (2026-09-22, completed in the stage-4 review pass)
 
-Two full 64-layer w4a16-only containers converted with the Stage-2 `quant_search.hpp` sweep
-(`--quant search`, 21-step 0.85x-1.15x multiplier grid, never-worse-than-RTN), both `--mtp on
---vision on --no-bf16 --lm-head 4bit`, same full-forward KV calibration as the baseline:
+`r4dx-convert --quant search` chooses each `(row, 128-K group)`'s `(scale, zero)` by minimizing the
+(optionally `--imatrix`-weighted) squared reconstruction error instead of taking the min/max grid;
+`--quant rtn` is the historical round-to-nearest behaviour and remains the **default**. The on-disk
+byte layout is identical in both modes (`docs/container-format.md`, "How the quantized values are
+chosen") -- same tensor names, dtypes, shapes, sizes and offsets, verified below -- so this is a
+pure "better bytes, same kernels" experiment.
 
-- **A** `D:\models\r4dx\qwen38-27b-w4a16-search.r4dx` -- `--quant search`, no imatrix. Converted in
-  **250.996 s**.
-- **B** `qwen38-27b-w4a16-search-imatrix.r4dx` (`--quant search --imatrix
-  D:\models\r4dx\qwen38-27b.imatrix.npz`) -- **not built this stage**, see "What's missing" below.
+Containers, all 64 layers, `--lm-head 4bit --no-bf16`, same full-forward KV calibration
+(`qwen38-27b.kvcalib-full.json`), evaluated with `tool_teacher_forced_logprobs` + `kl_report.py`
+against the bf16 reference dumps in `tools/reference/kl_out/ref`:
 
-Baseline for both is the existing `qwen38-27b-w4a16-kvfull.r4dx` (`--quant rtn`, same KV calib,
-already measured: `tools/reference/kl_out/w4a16-kvfull`, mean KL 0.072 / top-1 88.4%).
+| id | container | `--quant` | `--imatrix` | layouts | convert wall |
+|---|---|---|---|---|---|
+| baseline | `qwen38-27b-w4a16-kvfull.r4dx` | `rtn` | -- | w4a16 | -- |
+| A | `qwen38-27b-w4a16-search.r4dx` | `search` | -- | w4a16 | 250.996 s |
+| B | `qwen38-27b-w4a16-search-imatrix.r4dx` | `search` | `qwen38-27b.imatrix.npz` | w4a16 | 275.809 s |
+| v4 | `qwen38-27b-v4.r4dx` | `rtn` | -- | w4a16,w4a8,mxfp4 | -- |
+| S | `m9kl-full-search.r4dx` | `search` | `qwen38-27b.imatrix.npz` | w4a16,w4a8,mxfp4 | -- |
 
-**Full KL table, container A** (`tools/reference/kl_out/w4a16-search`, `kl_w4a16-search.json`):
+#### Headline
 
-| segment | rows | mean KL | median KL | p99 KL | max KL | top-1 | top-5 | ppl test |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| cpp_source | 1023 | 0.04905 | 0.01564 | 0.43222 | 1.78530 | 91.10% | 99.80% | 3.958 |
-| english_prose | 1023 | 0.05096 | 0.02828 | 0.28884 | 1.49641 | 89.44% | 99.90% | 3.992 |
-| python_source | 1023 | 0.05261 | 0.02455 | 0.31608 | 0.85268 | 90.13% | 99.90% | 4.817 |
-| thai_prose | 1023 | 0.13259 | 0.09048 | 0.81995 | 2.07074 | 80.16% | 98.92% | 17.007 |
-| **ALL** | 4092 | **0.07130** | 0.03661 | 0.53250 | 2.07074 | **87.71%** | 99.63% | 5.998 |
+| layout | `rtn` mean KL / top-1 | `search` alone | `search --imatrix` |
+|---|---|---|---|
+| w4a16 | 0.07241 / 88.40% | 0.07130 / 87.71% | **0.05342 / 89.30%** |
+| w4a8 | 0.14340 / 82.72% | (not run) | **0.11641 / 84.78%** |
+| mxfp4 | 0.09116 / 86.14% | (not run) | **0.07966 / 86.09%** |
 
-**Unweighted search essentially matches the RTN baseline, it does not beat it**: 0.0713 mean KL /
-87.71% top-1 vs RTN's 0.072 / 88.4% -- within noise on mean KL, and top-1 is actually *0.7 points
-worse*. This is consistent with Stage 2's own finding on synthetic data (`(i) random unweighted ...
-87.65% of RTN [error]`, i.e. only ~12% of the group's quantization error is squeezable by a scale
-multiplier alone when nothing tells the search which elements matter) -- on real weights, spread
-across 337 linears and rounded through fp16 storage, that ~12%-per-group win doesn't survive into a
-corpus-level KL/top-1 signal. **The imatrix weighting is not a nice-to-have here, it is the entire
-mechanism** -- Stage 2's own imatrix-weighted synthetic case improved 3x more (`76.71% of RTN`) than
-the unweighted one, and rung-4's real-model imatrix run (Stage 2's bonus section) got 0.0534 / 89.30%
-on w4a16+mxfp4+w4a8 mixed layouts. Container B (search+imatrix, w4a16-only) is the one actually worth
-measuring; it was not built this stage.
+**The importance weighting is the entire mechanism; the search on its own is worth nothing.**
+Unweighted search lowers its own per-group objective on *every* group (0 regressions in 768 real
+groups, see "Optimality audit") and still lands at 0.0713 / 87.71% -- mean KL within noise of `rtn`
+and top-1 **0.7 points worse**. Add the imatrix and w4a16 mean KL drops 26% and top-1 gains 0.9
+points; w4a8 (whose integer zero is pinned to 8, so the scale is its only free parameter) gains the
+most top-1, +2.1 points; mxfp4 gains 12.6% mean KL at flat top-1. For scale: published llama.cpp
+`Q4_K_M` on this checkpoint is 0.011-0.014 / 95-96%, so this closes roughly a quarter of the gap to
+it without touching a kernel or a byte of layout.
 
-**Speed/acceptance, container A vs the RTN baseline** (standard haiku prompt from docs/perf.md,
-`--max-tokens 256 --temperature 0 --max-ctx 2048 --vision off`, HIP device 1, confirmed no other
-`python` process running via `Get-Process python`, single run each -- not doubled, since A is not
-the container this stage's gate cares about):
+#### Full KL table, container B (`kl_w4a16-search-imatrix.json`)
 
-| container | mode | decode tok/s | acceptance | tok/round |
-|---|---|---:|---:|---:|
-| baseline (rtn) | plain | 38.94 | -- | -- |
-| A (search) | plain | 38.92 | -- | -- |
-| baseline (rtn) | `--mtp 3` | 63.40 | 40.4% | 2.13 |
-| A (search) | `--mtp 3` | 64.69 | 40.0% | 2.17 |
-| baseline (rtn) | `--dflash` k=7 | 77.71 | 24.8% | 2.70 |
-| A (search) | `--dflash` k=7 | 73.48 | 22.7% | 2.55 |
+| segment | rows | mean KL | median KL | p99 KL | max KL | top-1 | top-5 | ppl ref | ppl test | KL>1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cpp_source | 1023 | 0.03427 | 0.01086 | 0.22265 | 1.00139 | 92.18% | 99.61% | 3.805 | 3.926 | 1 |
+| english_prose | 1023 | 0.04028 | 0.02472 | 0.22622 | 0.73900 | 90.91% | 100.00% | 3.755 | 3.957 | 0 |
+| python_source | 1023 | 0.04128 | 0.01902 | 0.29715 | 0.74457 | 91.89% | 99.80% | 4.605 | 4.774 | 0 |
+| thai_prose | 1023 | 0.09787 | 0.06685 | 0.55205 | 2.01238 | 82.21% | 98.92% | 15.610 | 16.820 | 3 |
+| **ALL** | 4092 | **0.05342** | 0.02841 | 0.35308 | 2.01238 | **89.30%** | 99.58% | 5.661 | 5.943 | 4 |
 
-Plain decode speed is identical within noise (both bandwidth-bound on the same byte layout, as
-expected -- the search only changes *which* of the 16 codes each weight rounds to, not the format).
-MTP/DFlash acceptance move by a point or two either direction, i.e. noise, not a systematic
-improvement -- consistent with the KL finding that unweighted search is not doing meaningful work on
-this checkpoint.
+Every segment improves over both `rtn` and search-alone; the largest absolute gain is `thai_prose`
+(0.1326 search-alone -> 0.0979), the segment `rtn` was worst on.
 
-Sanity (A, greedy, 64 tokens, the milestone's standard KL-corpus-adjacent prompt): coherent --
-`Here is an explanation in plain English, breaking down the concepts of 4-bit quantization and
-importance matrices.` / `### Part 1: Why 4-bit Quantization Loses Accuracy` / `To understand why
-accuracy is lost, you first need to understand what **quantization** is.`
+Container A's own table (`kl_w4a16-search.json`): cpp_source 0.04905 / 91.10%, english_prose
+0.05096 / 89.44%, python_source 0.05261 / 90.13%, thai_prose 0.13259 / 80.16%, ALL 0.07130 / 87.71%.
 
-**What's missing and why (read before trusting this subsection as complete):** container **B**
-(`--quant search --imatrix`), its KL table, its speed/acceptance table, and the `kl_audit.py`
-vocab-region/entropy comparison were **not run**. Converting it needs ~17.5 GiB free on `D:`;
-after container A (17.5 GiB) the drive had **16.48 GiB free, a ~1 GiB shortfall**. Freeing that
-space means deleting or moving a file on `D:\models\r4dx\` (candidates that are clearly safe:
-`qwen38-27b-l4-bf16.r4dx.pre-r1.bak` and `qwen38-27b-l4-mtp.r4dx.pre-r1.bak`, 12.4 + 11.9 GiB of
-pre-Rung-1 backups nothing depends on, or `m9kl-full-search.r4dx`, 40.4 GiB, the Stage-2 artifact
-whose own report already says "delete it if Stage 3 needs the space") -- both `Remove-Item` and
-`Move-Item` against files this session did not create were refused by the harness's own permission
-classifier ("Irreversible Local Destruction" / "Irreversible Deletion"), which is a hard rule this
-session cannot override even though the milestone's own instructions pre-authorize the deletion.
-**Container A was kept** (it is a real, valid, fully-evaluated data point -- the "unweighted search
-doesn't beat RTN" finding above stands on its own); it is not "strictly dominated" by anything, since
-B doesn't exist yet. The exact commands to finish this once ~2 GiB is free on `D:` (leave headroom):
+#### Speed and acceptance -- the byte layout really is free
+
+Standard haiku prompt, `--max-tokens 256 --temperature 0 --max-ctx 2048 --vision off`, HIP device 1,
+nothing else on the GPU, every cell run twice (the two runs agree to <=0.1 tok/s):
+
+| container | plain decode tok/s | `--mtp 3` tok/s (accept, tok/round) | `--dflash` k=7 tok/s (accept, tok/round) |
+|---|---:|---|---|
+| baseline (`rtn`) | 38.89, 38.93 | 63.51, 63.52 (40.4%, 2.13) | 77.72, 77.81 (24.8%, 2.70) |
+| B (`search --imatrix`) | 38.92, 38.92 | **72.01, 72.07 (48.4%, 2.42)** | 77.09, 77.15 (24.5%, 2.68) |
+
+Plain decode is identical (38.92 vs 38.89-38.93), which is the point: same bytes, same bandwidth,
+same kernels. The `--mtp 3` row is **not** noise and should not be read as one -- MTP's draft head
+lives inside the container and got better weights too, so its acceptance rises 40.4% -> 48.4% and
+carries decode with it, **+13.5% tok/s for free**. `--dflash`'s drafter is a *separate*, unchanged
+container (`qwen38-27b-dflash2-w4a16.r4dx`), so only the verifier changed and its acceptance barely
+moves (24.8% -> 24.5%). Generation stays coherent (haiku + two-sentence explanation, both
+containers).
+
+#### What was verified about the mechanism, not just the numbers
+
+- **Format invariance.** B vs the `rtn` baseline: 1514 tensors each, identical names, dtypes,
+  shapes, byte sizes *and* byte offsets; only values differ. `git diff` over the milestone touches
+  nothing under `src/model`, `src/kernels` or `third_party`.
+- **Byte provenance.** The first 16-row tile of `text.layers.3.attn.o.w4a16.{wq,wsz}` was recomputed
+  from the checkpoint with `tools/convert_ref/w4_ref.py` and matches, byte for byte, in all three
+  containers with the matching reference mode (`rtn` for the baseline, unweighted search for A,
+  `text.layers.3.attn.o`-weighted search for B). 22186/98304 codes differ between `rtn` and search
+  and a further 34607 between search and search+imatrix, so the test is not vacuous: a container
+  built with the wrong vector, or none, cannot pass its own row.
+- **Byte-exactness through the real CLI.** `tools/convert_ref/selftest_compare.py` diffs
+  `r4dx-convert --selftest` against the Python reference in all three modes (random fixture), and
+  the same diff was repeated on a **real** tensor slice (16 x 6144 of `layers.3.self_attn.o_proj`
+  with its real imatrix vector): all 7 tensors x 3 modes byte-exact.
+- **Optimality audit.** On that real slice, in float64: `search` error <= `rtn` error on **768 of
+  768** groups, both weightings (0 regressions), and on 20 randomly chosen groups an exhaustive
+  re-evaluation of the whole documented candidate set (21 scales x 3 zeros, plus a least-squares
+  refit of each candidate) found **no candidate that beats the one the converter chose**. Total
+  weighted error: 89.15% of `rtn`'s unweighted, 50.36% of `rtn`'s under the real imatrix. Rounding
+  the scale to the f16 the container actually stores does not break the guarantee either (0/768).
+- **Imatrix plumbing.** The real run reports `imatrix coverage: 341 linear(s) weighted, 0 fell back
+  to unweighted MSE`. A vector whose length does not match the linear's K is a hard error
+  (`imatrix vector 'selftest' has length 128 but the linear's K is 6144`); a `savez_compressed`
+  archive is a hard error naming the fix; a missing key warns per-linear and is counted in the
+  coverage line, which says `WARNING` and goes to stderr when anything fell back; `--imatrix`
+  without `--quant search`, and `--imatrix` with `--dflash-gguf` (the drafter shares none of the
+  keys), are both rejected at argument-parse time.
+- **No corpus contamination.** The imatrix corpus (`calib.txt` + `kv_calib_corpus/`) and the KL eval
+  corpus (`kl_corpus/`) share exactly **one** line longer than 20 characters out of 467 --
+  `from __future__ import annotations` -- and their longest common substring is 50 characters of
+  Python import boilerplate. The imatrix win is not memorized eval text.
+- **Reproducibility.** Container B was converted independently of Stage 2's all-layouts
+  `m9kl-full-search.r4dx`, on a different drive, in a different session. Their `w4a16` logprob dumps
+  are **byte-identical** (sha256 matches on `cpp_source` and `thai_prose`) and their overall mean KL
+  agrees to all 16 digits (0.05342482327243944). Converter and inference path are both
+  deterministic. The reference dumps in `tools/reference/kl_out/ref` were not touched (mtimes and
+  sha256 unchanged from the rung-4 pass).
+
+#### Why `rtn` is still the default
+
+`--quant search` alone is measurably not an improvement (top-1 0.7 points worse) and costs ~2x the
+conversion wall time, and `--imatrix` cannot be a default because it needs a capture file. Making
+`search` the default would therefore have silently changed what a plain
+`r4dx-convert --input ... --output ...` produces -- including the `--dflash-gguf` drafter path,
+which has no imatrix at all and was never measured under search -- for no gain. The pair that *is*
+worth using is explicit:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-w4a16-search-imatrix.r4dx `
-    --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v5.r4dx `
+    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
     --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
     --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz
 ```
-then the same `tool_teacher_forced_logprobs` / `kl_report.py` / `r4dx-cli` sequence used for A above,
-plus `kl_audit.py` on the result.
+
+#### Not done
+
+- No all-layouts `--mtp on --vision on` production container was rebuilt with `search --imatrix`;
+  the w4a8/mxfp4 numbers above come from Stage 2's `m9kl-full-search.r4dx`, which is `--mtp off
+  --vision off` but otherwise identical in flags to `qwen38-27b-v4.r4dx` (neither MTP nor the vision
+  tower participates in the `--vision off` teacher-forced forward, so the comparison is sound for
+  KL; it does mean the w4a8/mxfp4 **acceptance** numbers were not measured).
+- `kl_audit.py`'s vocab-region/entropy breakdown was not re-run for B.
+- Container B lives on `C:\AI\r4dx-tmp\` rather than `D:\models\r4dx\`: `D:` had 16.48 GiB free and
+  the container needs 17.5 GiB, and freeing space means deleting files this session did not create.
+  Move it to `D:\models\r4dx\` when space allows; nothing in the tooling depends on its location.
 
 ## Rung 5 -- generation sanity
 

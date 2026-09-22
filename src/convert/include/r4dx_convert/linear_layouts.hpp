@@ -29,7 +29,9 @@ struct LayoutSet {
 // How the quantized layouts pick their (scale, zero) values. The BYTE LAYOUT is identical either
 // way -- see quant_search.hpp. `kRtn` is the historical round-to-nearest min/max grid and is the
 // default here so every caller that does not opt in (tests/convert, the DFlash2 path's own
-// defaults) keeps producing byte-identical containers; r4dx-convert's CLI defaults to kSearch.
+// defaults) keeps producing byte-identical containers; r4dx-convert's CLI defaults to it too, and
+// `kSearch` is reached only via an explicit `--quant search` (src/convert/main.cpp's header comment
+// has the measurements behind that choice).
 enum class QuantMode { kRtn, kSearch };
 
 struct QuantOptions {

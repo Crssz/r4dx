@@ -102,23 +102,35 @@ header comment for the full flag list, including `--selftest` for the byte-exact
 **`--quant` / `--imatrix` -- how the 4-bit values are chosen.** Neither flag changes a single byte of
 the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
 which `q` / `scale` / `zero` values land in those bytes, so any container is readable by any loader
-either way. `--quant search` (the **default**) replaces the historical min/max + round-to-nearest
-grid with a per-`(row, 128-K group)` search over 21 candidate scales (`0.85x .. 1.15x`) and three
-candidate integer zeros, plus a weighted least-squares refit of the scale. The round-to-nearest grid
-is itself candidate 0 and later candidates must win strictly, so the search is *never* worse.
-`--quant rtn` restores the old behaviour byte for byte -- use it to reproduce a pre-existing
-container exactly.
+either way, at exactly the same decode speed. `--quant search` replaces the historical min/max +
+round-to-nearest grid with a per-`(row, 128-K group)` search over 21 candidate scales
+(`0.85x .. 1.15x`) and three candidate integer zeros, plus a weighted least-squares refit of the
+scale. `--quant rtn` is the **default** and is the historical behaviour byte for byte.
 
-`--imatrix <npz>` weights the search's error term by each input channel's mean activation energy,
-from the importance matrix `tools/reference/imatrix_capture.py` captures over the calibration corpus
-(`D:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names). It
-requires `--quant search`. The run logs how many linears it weighted and how many fell back to
-unweighted MSE; on this checkpoint the count should be every quantized linear, `0` fell back. It
-costs roughly 2x the conversion wall time of `--quant rtn` (measured on a 4-layer container: 18.9 s
--> 41.0 s) and nothing at inference time. **Pass `--imatrix` whenever you pass `--quant search`** --
-milestone 10 measured `--quant search` alone at mean KL/top-1 statistically unchanged from
-`--quant rtn` (0.0713/87.71% vs 0.072/88.4%) on a real w4a16 container; the search only helps once
-`--imatrix` tells it which channels matter (`docs/validation.md` "Milestone 10").
+**Use them as a pair: `--quant search --imatrix <npz>`, or not at all.** `--imatrix <npz>` weights
+the search's error term by each input channel's mean activation energy, from the importance matrix
+`tools/reference/imatrix_capture.py` captures over the calibration corpus
+(`D:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names); it
+requires `--quant search`. The weighting is not a refinement, it is the whole mechanism -- measured
+on the real checkpoint against the bf16 reference (`docs/validation.md` "Milestone 10"):
+
+| mode | w4a16 mean KL / top-1 | w4a8 | mxfp4 |
+|---|---|---|---|
+| `--quant rtn` (default) | 0.0724 / 88.4% | 0.1434 / 82.72% | 0.0912 / 86.14% |
+| `--quant search` alone | 0.0713 / 87.71% | -- | -- |
+| `--quant search --imatrix` | **0.0534 / 89.30%** | **0.1164 / 84.78%** | **0.0797 / 86.09%** |
+
+The search alone lowers its own per-group objective on every single group and still buys nothing at
+model level (top-1 is 0.7 points *worse* than `rtn`), which is why `rtn` stays the default and why
+`--quant search` without `--imatrix` is not worth its ~2x conversion wall time (4-layer container:
+18.9 s -> 41.0 s; the full 64-layer search+imatrix container takes 276 s). The "search is never
+worse than rtn" property that `tests/convert/test_quant_search.cpp` gates is a statement about the
+weighted squared reconstruction error of one `(row, group)`, not about KL or top-1.
+
+The run logs how many linears it weighted and how many fell back to unweighted MSE; on this
+checkpoint that is `341 weighted, 0 fell back`. Anything else means the `.npz` is stale for this
+checkpoint and part of the model was quantized unweighted -- the coverage line says `WARNING` and
+goes to stderr in that case.
 
 ### Generate text
 

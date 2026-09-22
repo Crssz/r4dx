@@ -10,14 +10,22 @@
 //                [--quant {rtn,search}] [--imatrix <tools/reference/imatrix_capture.py .npz>]
 //
 // --quant selects HOW the 4-bit values are chosen; it does NOT change a single byte of the on-disk
-// layout (docs/container-format.md, "How the quantized values are chosen"). `rtn` is the historical
-// min/max grid + round-to-nearest and reproduces any pre-existing container byte for byte; `search`
-// (the DEFAULT) minimizes the squared reconstruction error per (row, 128-K group) over a small
+// layout (docs/container-format.md, "How the quantized values are chosen"). `rtn` (the DEFAULT) is
+// the historical min/max grid + round-to-nearest and reproduces any pre-existing container byte for
+// byte; `search` minimizes the squared reconstruction error per (row, 128-K group) over a small
 // candidate grid (src/convert/include/r4dx_convert/quant_search.hpp). --imatrix additionally weights
 // that error by each input channel's mean activation energy, from the .npz
 // tools/reference/imatrix_capture.py writes (keyed by these same container base names); it requires
 // --quant search, and a linear with no entry in the file falls back to unweighted MSE with a
 // warning plus an end-of-run coverage line.
+//
+// `rtn` stays the default deliberately: `--quant search` WITHOUT --imatrix was measured on the real
+// checkpoint at mean KL 0.0713 / top-1 87.71% against rtn's 0.0724 / 88.4% -- i.e. no better, and
+// marginally worse on top-1 -- while costing ~2x the conversion wall time, and --imatrix cannot be
+// a default because it needs a capture file. The pair that IS worth using is
+// `--quant search --imatrix <npz>` (w4a16 0.0534 / 89.30%, docs/validation.md "Milestone 10"), and
+// it has to be asked for explicitly so that a plain `r4dx-convert --input ... --output ...` keeps
+// reproducing every container built before these flags existed.
 //
 // --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
 // lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
@@ -195,11 +203,12 @@ struct AppArgs {
   std::string dflash_layout = "w4a16";  // one of w4a16, w4a8, mxfp4, bf16
 
   // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
-  // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "search" (default)
-  // minimizes the (optionally importance-weighted) squared reconstruction error per (row, group);
-  // "rtn" is the historical min/max + round-to-nearest grid and reproduces every container built
-  // before this flag existed byte for byte.
-  std::string quant = "search";
+  // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "rtn" (default) is
+  // the historical min/max + round-to-nearest grid and reproduces every container built before this
+  // flag existed byte for byte; "search" minimizes the (optionally importance-weighted) squared
+  // reconstruction error per (row, group). See this file's header comment for why the default is
+  // rtn and not search.
+  std::string quant = "rtn";
   // Importance matrix ("imatrix") .npz from tools/reference/imatrix_capture.py, keyed by the
   // converter's own container base names. Weights the search's error term by the mean activation
   // energy of each input channel. Only meaningful with --quant search; a linear with no entry in
@@ -250,6 +259,14 @@ AppArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
   if (!a.imatrix.empty() && a.quant != "search")
     throw std::runtime_error("--imatrix requires --quant search (got --quant " + a.quant + ")");
+  // The imatrix .npz is keyed by the QWEN container's own add_linear base names
+  // (tools/reference/imatrix_capture.py); the DFlash2 drafter's tensors share none of them, so an
+  // --imatrix passed alongside --dflash-gguf could only ever be a no-op. Reject it instead of
+  // silently converting the drafter with unweighted MSE and reporting "imatrix-weighted".
+  if (!a.imatrix.empty() && !a.dflash_gguf.empty())
+    throw std::runtime_error(
+        "--imatrix does not apply to --dflash-gguf (the drafter has no importance matrix; "
+        "tools/reference/imatrix_capture.py only captures the main model's linears)");
   return a;
 }
 
@@ -294,10 +311,16 @@ class ImatrixSource {
     return opts;
   }
 
+  // A partial imatrix is a silent quality regression -- the container still converts, still says
+  // "imatrix-weighted" at the top of a 250 s log, and just quietly quantizes some fraction of the
+  // model with unweighted MSE. So the coverage line goes to stderr and says WARNING when anything
+  // fell back, next to the (capped) per-linear warnings, instead of being one more stdout line.
   void ReportCoverage() const {
     if (!npz_) return;
-    std::cout << "[r4dx-convert] imatrix coverage: " << hit_ << " linear(s) weighted, " << missing_
-              << " fell back to unweighted MSE\n";
+    std::ostream& os = (missing_ > 0) ? std::cerr : std::cout;
+    os << "[r4dx-convert] " << (missing_ > 0 ? "WARNING: " : "")
+       << "imatrix coverage: " << hit_ << " linear(s) weighted, " << missing_
+       << " fell back to unweighted MSE\n";
   }
 
  private:
@@ -721,6 +744,7 @@ int RunSelftest(const AppArgs& args) {
   std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " quant=" << args.quant
             << (opts.importance.empty() ? " (unweighted MSE)" : " (imatrix-weighted)") << " -> "
             << args.selftest_output << "\n";
+  imatrix.ReportCoverage();
   return 0;
 }
 

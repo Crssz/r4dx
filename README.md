@@ -99,6 +99,16 @@ disk for comparison -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of
 performance work. See `docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s
 header comment for the full flag list, including `--selftest` for the byte-exact packer self-check.
 
+**`--keep-bf16 <regex>` -- one tensor class left un-quantized.** Every linear whose container base
+name the ECMAScript regex matches (a `regex_search`, so `"attn\.o$"` selects every layer's attention
+output projection and `"^text\.layers\.[0-7]\."` selects the first eight layers) is written as
+`<base>.bf16.w` alone, and `Container::Load` falls exactly those linears back to bf16 while the rest
+of the container loads in the requested layout. It exists for the per-tensor-class sensitivity sweep
+in `docs/validation.md` "Milestone 11 / sensitivity" -- convert one class in bf16, re-run the KL
+harness, and the KL that disappears is that class's share of the quantization error. A regex that
+matches nothing warns and converts normally; an invalid one is a hard error before the first shard
+is read.
+
 **`--quant` / `--imatrix` -- how the 4-bit values are chosen.** Neither flag changes a single byte of
 the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
 which `q` / `scale` / `zero` values land in those bytes, so any container is readable by any loader

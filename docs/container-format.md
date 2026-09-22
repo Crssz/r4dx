@@ -126,6 +126,15 @@ Every `{layout}` variant of a linear `W [N, K]` (`N` = out features, `K` = in fe
 
 **`bf16`**: `<name>.bf16.w` -- `[N, K]` uint8 pairs (no permutation, row-major, K-contiguous).
 
+A linear may legitimately carry **only** `.bf16.w` while its neighbours carry a quantized layout:
+that is what `r4dx-convert --keep-bf16 <regex>` produces (docs/validation.md "Milestone 11 /
+sensitivity"). `Container::Load` resolves every quantized body linear through
+`LoadQuantLinearWithFallback`, which loads the requested layout when present, falls back to
+`.bf16.w` when it is not, and reports the per-container fallback count on stderr. So a mixed-layout
+container is a supported on-disk state, not a malformed one -- the run that made it is recorded in
+`__metadata__.r4dx_convert_run.keep_bf16` (the pattern), `.keep_bf16_linears` (the resolved names)
+and `.keep_bf16_extra_bytes` (the signed byte delta against the layouts they replaced).
+
 **`w4a16`** (`r4d_gemm_w4a16_nt_m64`, f16 activation): asymmetric per-output-channel,
 per-group-of-`g`-K quantization, `w ~= scale * (q - zero)`, `q` in `0..15`. `g` is a **build
 option** -- `R4DX_W4A16_GROUP`, default 128, see docs/build-windows.md "w4a16 group size" -- and

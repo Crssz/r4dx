@@ -839,6 +839,189 @@ unweighted search -- were unchanged and pass at both groups.
 - Group 32 (4.0 + 1.0 = 5.0 bits/weight) was not measured: the kernel's `bpg = group / 64` makes it
   a libr4d change, which this milestone excluded.
 
+### Milestone 11 / sensitivity: where the remaining nats live (2026-09-22)
+
+The group-size experiment above answered "does a finer grid help?" (yes, a little, at a price the
+decode budget cannot afford). It did not answer the question underneath it: **which weights is the
+0.0534 actually coming from?** 4-bit error is not spread evenly over 25.9 G parameters, and if it
+is concentrated somewhere cheap, that is the place to spend the next bit.
+
+#### The instrument
+
+`r4dx-convert --keep-bf16 <regex>` (this milestone; `src/convert/include/r4dx_convert/keep_bf16.hpp`,
+`docs/container-format.md` "Quantized layout tensors") writes every linear whose container base name
+matches as `<base>.bf16.w` and nothing else. `Container::Load`'s `LoadQuantLinearWithFallback` --
+now on **every** quantized body linear, not just the three R1 tensors -- sees a base with no
+quantized form and falls that one linear back to bf16, leaving the rest of the container in the
+requested `w4a16`. So one conversion per tensor class gives a model that is 4-bit everywhere except
+the class under test, and the KL that disappears against the all-4-bit baseline is that class's
+share of the error. `Container::Load` prints the fallback count on stderr, which is each run's own
+check that the regex selected what it meant (`r4dx: 48 linear(s) ... loaded as bf16`).
+
+Method, identical for every row: the Milestone 10 recipe
+(`--layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on --quant search --imatrix
+qwen38-27b.imatrix.npz --kv-calib qwen38-27b.kvcalib-full.json`) plus one `--keep-bf16` regex;
+`tool_teacher_forced_logprobs --layout w4a16 --max-ctx 4096 --vision off` over
+`tools/reference/kl_corpus`; `kl_report.py` against the bf16 reference dump. Conversions ran
+240-272 s each, KL dumps 144-210 s each; every container was deleted immediately after its dump.
+The baseline was re-measured in the same session with the same binary and reproduced the Milestone
+10 headline exactly: **mean KL 0.053425, top-1 89.296%**, `weights=15.5076 GiB`.
+
+`+GiB` is the exact weight-byte delta the converter reports (bf16 minus the `w4a16` form it
+replaced), which is what the GPU actually has to stream; the measured `weights=` line is quoted
+next to it and agrees to within the driver's allocation granularity. For `lm_head` the two differ
+by construction: the recipe's `--lm-head 4bit` writes three quantized layouts on disk, only one of
+which is ever loaded, so the on-disk delta (0.481 GiB) understates the runtime delta (1.739 GiB) --
+the table uses the runtime one, and the measured VRAM line confirms it.
+
+#### The ranked table
+
+Baseline `w4a16` = 0.053425 / 89.296% / thai 0.097875 / 82.209%. "nats" = mean KL in nats/token.
+
+| # | class kept in bf16 | linears | +GiB | measured `weights=` | mean KL | nats recovered | **nats / GiB** | top-1 | thai KL | thai top-1 | KL>1 |
+|--:|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1 | `attn.k` + `attn.v` | 32 | 0.2295 | 15.6951 | 0.04956 | 0.00386 | **0.01683** | 89.91% | 0.09398 | 82.60% | 1 |
+| 2 | `attn.o` | 16 | 0.6885 | 16.2107 | 0.05094 | 0.00248 | **0.00361** | 89.39% | 0.09315 | 82.21% | 3 |
+| 3 | `lm_head` | 1 | 1.7391 | 17.2466 | 0.04762 | 0.00580 | **0.00334** | 90.42% | 0.08950 | 83.38% | 3 |
+| 4 | `gdn.out_proj` | 48 | 2.0654 | 17.6169 | 0.04843 | 0.00499 | 0.00242 | 89.76% | 0.08565 | 82.99% | 1 |
+| 5 | *last 8 layers, all linears* | 42 | 4.1595 | 19.6614 | 0.04346 | 0.00997 | 0.00240 | 90.27% | 0.07406 | 84.46% | 4 |
+| 6 | `gdn.in_proj_qkv` | 48 | 3.4424 | 18.9607 | 0.04627 | 0.00715 | 0.00208 | 90.03% | 0.08468 | 83.97% | 1 |
+| 7 | *first 8 layers, all linears* | 42 | 4.1595 | 19.6614 | 0.04733 | 0.00610 | 0.00147 | 89.81% | 0.07628 | 84.75% | 6 |
+| 8 | `gdn.in_proj_z` | 48 | 2.0654 | 17.6169 | 0.05059 | 0.00284 | 0.00137 | 89.35% | 0.09255 | 82.50% | 5 |
+| 9 | `mlp.gate_up`, layers 32-63 | 32 | 7.8027 | 23.3103 | 0.04335 | 0.01008 | 0.00129 | 90.05% | 0.07912 | 83.77% | 1 |
+| 10 | `mlp.down` | 64 | 7.8027 | 23.2263 | 0.04550 | 0.00792 | 0.00102 | 90.30% | 0.08188 | 83.48% | 2 |
+| 11 | `mlp.gate_up`, all 64 layers *(sum of the two halves, not measured directly)* | 64 | 15.6055 | -- | -- | 0.01334 | 0.00086 | -- | -- | -- | -- |
+| 12 | `attn.qg` | 16 | 1.3770 | 16.9138 | 0.05259 | 0.00083 | 0.00060 | 89.44% | 0.09715 | 82.40% | 2 |
+| 13 | `mlp.gate_up`, layers 0-31 | 32 | 7.8027 | 23.3103 | 0.05017 | 0.00326 | 0.00042 | 89.42% | 0.09339 | 82.50% | 4 |
+
+`mlp.gate_up` is the one class that could not be measured whole: 11.4 G parameters in bf16 is
++15.6 GiB, which puts `weights` at 31.1 GiB on a 31.86 GiB card and leaves nothing for the KV cache
+-- WDDM would not fail the allocation, it would page it over PCIe and quietly invalidate the run.
+It was measured as two halves instead, and row 11 is their **sum**, marked as such.
+
+For scale: the group-64 arm from the previous section recovers 0.01128 nats for +0.7114 GiB, i.e.
+**0.01586 nats/GiB**. Only one tensor class in this whole table beats a plain finer grid, and it
+beats it by 6%.
+
+#### The cheap wins, and the expensive ones
+
+**`attn.k`/`attn.v` are the anomaly, by an order of magnitude.** 0.0169 nats/GiB is 4.7x the next
+class and 40x the worst. These are the two smallest quantized linears in the model -- 16 layers x
+[1024, 5120], 0.168 G parameters, 0.65% of the quantized weights; un-quantizing both costs 0.2295
+GiB, 1.5% of the 15.5 GiB weight stream -- and they carry **7.2%** of the error. Keeping them in
+bf16 also cuts the corpus's KL>1 positions from 4 to 1. The reason is structural and specific: `attn.k`/`attn.v`'s outputs are not consumed once and
+discarded like every other projection's, they are *written into the fp8 KV cache and re-read by
+every later position in the sequence*. A weight error there is the only one in the model that
+compounds along the context rather than along depth. (`docs/r9700.md` R1 moved these two out of
+forced-bf16 into the quantized family for a 0.336 GB/token bandwidth win; this is the bill for that,
+and it is small in bytes and large in nats.)
+
+**`lm_head` and `attn.o` are the other two cheap wins**, at 0.0033 and 0.0036. `lm_head` matches the
+Rung 4 follow-up's independently measured "lm_head share ~0.009" in direction (that experiment
+compared against a different baseline); `attn.o`'s per-byte cost is high for the same reason
+`attn.qg`'s is low -- see below.
+
+**The MLP is where the bytes are and where the nats are not.** `mlp.gate_up` + `mlp.down` is 17.1 G
+of 25.9 G parameters -- 66% of the weight stream -- and buys 0.021 of the 0.053, at the two worst
+per-byte rates in the table. If you have one gigabyte to spend, spending it on the MLP is the single
+worst thing you can do with it.
+
+**`attn.qg` is the cheapest class to quantize and the most expensive to un-quantize** (0.0006
+nats/GiB: 6x worse per byte than its own layer's `attn.o`, 28x worse than its own layer's
+`attn.k`/`v`). It is the fused query+gate matrix: half of its output is a *gate* that goes through a sigmoid, which
+is contractive, and the query half is immediately RMS-normed per head, which removes exactly the
+kind of scale error 4-bit quantization introduces. Leave it at 4 bits.
+
+**Depth matters as much as tensor class.** The two 8-layer bands are the same 42 linears and the
+same 4.1595 GiB, and the last 8 recover 63% more than the first 8 (0.00997 vs 0.00610). The split is
+sharper inside a single class: `mlp.gate_up` in layers 32-63 recovers **3.1x** what the identical
+bytes recover in layers 0-31 (0.01008 vs 0.00326). Any future mixed-precision scheme should be
+depth-aware, not just class-aware. (Both bands, notably, help Thai far more than the average --
+thai KL 0.0763/0.0741 against 0.0979 baseline -- which is consistent with the multilingual tail
+being hurt by accumulated per-layer error rather than by one bad tensor class.)
+
+**The classes are close to additive.** The nine disjoint classes' recoveries sum to 0.04923 against
+a baseline of 0.05342 -- **92.1%** of the total. The nine cover every quantized `text.layers.*`
+linear plus `lm_head`; the only quantized weights no regex here touched are the `mtp.*` head's, so
+the missing 7.9% is that plus genuine cross-class interaction. Close enough that the table can be
+read as a budget and small combinations estimated by addition without much guilt.
+
+#### What an 8-bit weight kernel would buy -- ESTIMATE, not measured
+
+libr4d has no 8-bit-weight GEMM, so this is arithmetic, not a measurement. Stated so it can be
+checked if anyone builds one.
+
+Two assumptions, both first-order:
+
+1. **Bytes.** A `w8a16` weight at group 128 costs `8 + 32/128 = 8.25` bits against w4a16's 4.25 and
+   bf16's 16, so it pays **(8.25-4.25)/(16-4.25) = 34.0%** of the bf16 extra bytes measured above.
+2. **Error.** Uniform quantization MSE falls 4x per added bit, so int8's weight-reconstruction MSE
+   is `1/256` of int4's, and KL is quadratic in a small weight perturbation (KL ~ ½ δᵀFδ), hence
+   proportional to that MSE. `w8a16` should therefore recover **99.6%** of what bf16 recovers.
+
+Together: **~2.93x the nats per GiB of the bf16 column**, for every class.
+
+| class | `w8a16` +GiB (est) | nats recovered (est) | nats/GiB (est) |
+|---|--:|--:|--:|
+| `attn.k` + `attn.v` | 0.078 | 0.00385 | 0.0492 |
+| `attn.o` | 0.234 | 0.00247 | 0.0106 |
+| `lm_head` | 0.592 | 0.00578 | 0.0098 |
+| `gdn.out_proj` | 0.703 | 0.00498 | 0.0071 |
+| `gdn.in_proj_qkv` | 1.172 | 0.00713 | 0.0061 |
+
+The interesting line is the combination. Putting the top three cheap classes
+(`attn.k`/`v` + `attn.o` + `lm_head`) at 8 bits and leaving the other 92% of the weights at 4 bits
+costs an estimated **+0.90 GiB** (15.51 -> 16.41 GiB of weights, +5.8%) and should land mean KL near
+**0.0413**, versus 0.0421 for the group-64 arm at +0.71 GiB. That is roughly the same purchase as
+group 64 -- which is to say: **still not enough.** llama.cpp `Q4_K_M` reaches 0.011-0.014 on this
+same checkpoint at 4.5 bits/weight. Neither a finer grid nor selective 8-bit closes a gap that a
+better *scheme* closes entirely inside the same budget, and the per-class table says why: the error
+is not hiding in one class waiting to be paid off. Nine classes contribute between 1.6% and 25% of
+it each, and the
+two that contribute most (`mlp.gate_up`, `mlp.down`) are exactly the two nothing can afford to widen.
+
+#### What this says to do next
+
+- **Cheap and worth doing regardless of scheme:** `attn.k`/`attn.v` at higher precision. +0.23 GiB
+  (1.5% of the weight stream, so ~1.5% of decode by the group-size section's bytes-to-tok/s
+  relation) removes 7.2% of the KL and 3 of the corpus's 4 KL>1 positions. Today's `--keep-bf16 "^text\.layers\.\d+\.attn\.[kv]$"` already builds that container; it needs no
+  new kernel.
+- **Depth-aware allocation** before class-aware allocation. A scheme that spends its extra bits on
+  layers 32-63 gets 3x the return of one that spreads them evenly.
+- **Do not** spend bytes on `attn.qg` or on the first half of `mlp.gate_up`.
+- The real target remains a `Q4_K_M`-class scheme (super-block scales, a second-level scale
+  quantization) rather than more bits on the current one. This table's job was to find out whether
+  there was a shortcut. There is a small one (`attn.k`/`v`) and no large one.
+
+#### Gates
+
+```
+ctest --preset win-hip     97% tests passed, 2 tests failed out of 66
+                           Total Test time (real) = 739.43 sec
+                           FAILED: 2 - reference_manifest (Not Run), 3 - reference_dflash2 (Not Run)
+ctest --preset win-hip -R keep_bf16
+                           1/2 Test #10: convert_keep_bf16 .......   Passed    0.01 sec
+                           2/2 Test #49: test_keep_bf16 ..........   Passed   25.82 sec
+                           100% tests passed, 0 tests failed out of 2
+```
+
+`reference_manifest` and `reference_dflash2` are the two pre-existing failures from the previous
+section: they launch the reference venv's `python.exe`, and that directory is gone from this machine.
+Everything else, including both new tests, passes.
+
+#### Not done
+
+- `mlp.gate_up` as one class (see above -- it does not fit in 32 GiB). Row 11 is the sum of two
+  halves, which the 92.1% additivity result makes credible but does not prove.
+- Nothing was measured in *combination*: every row is one class against the same baseline. The
+  additivity check is the only evidence that combinations add, and it is an aggregate one.
+- No decode-throughput numbers. Every row's cost is in bytes; the group-size section already
+  established that plain decode on this card tracks weight bytes almost exactly (+5.88% bytes ->
+  -5.8% tok/s), so tok/s for these rows is predictable from `+GiB` and was not worth 13 more GPU
+  runs.
+- The `w8a16` table is arithmetic from two stated assumptions, not a measurement, and there is no
+  8-bit-weight kernel in libr4d to measure.
+
 ## Rung 5 -- generation sanity
 
 Built (`src/cli`/`r4dx-cli.exe`) and, as of the 2026-09-20 long-context validation pass

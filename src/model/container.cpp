@@ -173,9 +173,21 @@ bool HasLayout(const SafetensorsReader& r, const std::string& base, Layout layou
 //   3. `base` is a bare single tensor with no `.{layout}` suffix at all -- the OLD, pre-R1
 //      on-disk form these three tensors used to have exclusively (every container converted
 //      before this pass). Old containers keep working unmodified (task requirement).
+//
+// Milestone 11 (docs/validation.md "Milestone 11 / sensitivity"): EVERY quantized body linear now
+// loads through this, not just the three R1 tensors. Tier 2 is what makes r4dx-convert's
+// `--keep-bf16 <regex>` work -- that flag writes a matched linear as `<base>.bf16.w` and nothing
+// else, so the container is quantized everywhere except the tensor class under test and this
+// function is the only thing that has to notice. Before, those call sites used LoadQuantLinear
+// directly and a bf16-only base was a hard "tensor not found" throw. `fallbacks`, when non-null, is
+// incremented once per linear that did NOT have the requested layout, so Load() can report the
+// count instead of falling back silently -- a container that accidentally quantized nothing and one
+// that deliberately kept one class in bf16 must not look the same in a log.
 QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const std::string& base,
-                                         Layout requested, int64_t N, int64_t K) {
+                                         Layout requested, int64_t N, int64_t K,
+                                         int* fallbacks = nullptr) {
   if (HasLayout(r, base, requested)) return LoadQuantLinear(r, base, requested, N, K);
+  if (fallbacks != nullptr) ++*fallbacks;
   if (HasLayout(r, base, Layout::kBf16)) return LoadQuantLinear(r, base, Layout::kBf16, N, K);
   if (r.Has(base)) {
     QuantLinear q;
@@ -277,6 +289,11 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   const int64_t kv_heads = c.config_.num_key_value_heads;
   const int64_t attn_out = c.config_.num_attention_heads * c.config_.head_dim;
 
+  // Milestone 11: how many linears did not carry the requested layout and loaded as bf16 instead
+  // (LoadQuantLinearWithFallback's tier 2/3). Normally 0; non-zero exactly when the container was
+  // built with r4dx-convert --keep-bf16, or is an old container predating a tensor's quantization.
+  int bf16_fallbacks = 0;
+
   c.layers_.reserve(static_cast<size_t>(num_layers));
   for (int64_t i = 0; i < num_layers; ++i) {
     const std::string base = "text.layers." + std::to_string(i) + ".";
@@ -286,17 +303,19 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
 
     if (c.config_.IsGdnLayer(i)) {
       GdnWeights g;
-      g.in_proj_qkv = LoadQuantLinear(reader, base + "gdn.in_proj_qkv", layout,
-                                       2 * key_dim + value_dim, hidden);
-      g.in_proj_z =
-          LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_z", layout, value_dim, hidden);
+      g.in_proj_qkv = LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_qkv", layout,
+                                                   2 * key_dim + value_dim, hidden,
+                                                   &bf16_fallbacks);
+      g.in_proj_z = LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_z", layout, value_dim,
+                                                 hidden, &bf16_fallbacks);
       g.in_proj_b = UploadRawU16(reader, base + "gdn.in_proj_b");
       g.in_proj_a = UploadRawU16(reader, base + "gdn.in_proj_a");
       g.conv1d_weight = UploadRawU16(reader, base + "gdn.conv1d_weight");
       g.A_log = UploadRawF32(reader, base + "gdn.A_log");
       g.dt_bias = UploadRawF32(reader, base + "gdn.dt_bias");
       g.norm_weight = UploadWidenedF32(reader, base + "gdn.norm_weight");
-      g.out_proj = LoadQuantLinear(reader, base + "gdn.out_proj", layout, hidden, value_dim);
+      g.out_proj = LoadQuantLinearWithFallback(reader, base + "gdn.out_proj", layout, hidden,
+                                                value_dim, &bf16_fallbacks);
       lw.gdn = std::move(g);
     } else {
       AttnWeights a;
@@ -305,12 +324,14 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       // through the shared r4dx::model::ApplyLinear (src/model/linear.h), which every layout
       // already supports. See docs/perf.md for the measured per-layout VRAM/throughput delta this
       // unlocks (attn.qg/o account for 16 of 64 layers' full-attention projections).
-      a.qg = LoadQuantLinear(reader, base + "attn.qg", layout, attn_out * 2, hidden);
+      a.qg = LoadQuantLinearWithFallback(reader, base + "attn.qg", layout, attn_out * 2, hidden,
+                                          &bf16_fallbacks);
       a.k = LoadQuantLinearWithFallback(reader, base + "attn.k", layout,
-                                         kv_heads * c.config_.head_dim, hidden);
+                                         kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
       a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", layout,
-                                         kv_heads * c.config_.head_dim, hidden);
-      a.o = LoadQuantLinear(reader, base + "attn.o", layout, hidden, attn_out);
+                                         kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
+      a.o = LoadQuantLinearWithFallback(reader, base + "attn.o", layout, hidden, attn_out,
+                                         &bf16_fallbacks);
       a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
       a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
       a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
@@ -318,10 +339,11 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       lw.attn = std::move(a);
     }
 
-    lw.mlp.gate_up = LoadQuantLinear(reader, base + "mlp.gate_up", layout,
-                                      2 * c.config_.intermediate_size, hidden);
-    lw.mlp.down = LoadQuantLinear(reader, base + "mlp.down", layout, hidden,
-                                   c.config_.intermediate_size);
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, base + "mlp.gate_up", layout,
+                                                  2 * c.config_.intermediate_size, hidden,
+                                                  &bf16_fallbacks);
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, base + "mlp.down", layout, hidden,
+                                               c.config_.intermediate_size, &bf16_fallbacks);
     c.layers_.push_back(std::move(lw));
   }
 
@@ -330,7 +352,7 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   // lm_head is where the vocab-tail KL loss concentrates) carries only lm_head.bf16.w, and every
   // caller that asks for the body layout here should get that bf16 head rather than a throw.
   c.lm_head_ = LoadQuantLinearWithFallback(reader, "lm_head", lm_head_layout, c.config_.vocab_size,
-                                           hidden);
+                                           hidden, &bf16_fallbacks);
 
   // mtp.* (docs/container-format.md, docs/mtp.md): present only when the container was converted
   // with --mtp on -- probe with SafetensorsReader::Has rather than trusting __metadata__, so this
@@ -350,7 +372,8 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
     // descales, fc, norm, pre_fc_norm_*) has only one on-disk form regardless of layout, same as
     // the body layers above.
     AttnWeights a;
-    a.qg = LoadQuantLinear(reader, base + "attn.qg", mtp_head_layout, attn_out * 2, hidden);
+    a.qg = LoadQuantLinearWithFallback(reader, base + "attn.qg", mtp_head_layout, attn_out * 2,
+                                        hidden, &bf16_fallbacks);
     // mtp.attn.k/v stay bf16 regardless of the requested body/head layout (docs/r9700.md's R1
     // task: "Keep mtp.* ... as they are") -- request Layout::kBf16 explicitly rather than
     // `layout`/`mtp_head_layout`, so this never picks up a quantized form even if a future
@@ -361,16 +384,18 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
                                        kv_heads * c.config_.head_dim, hidden);
     a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", Layout::kBf16,
                                        kv_heads * c.config_.head_dim, hidden);
-    a.o = LoadQuantLinear(reader, base + "attn.o", mtp_head_layout, hidden, attn_out);
+    a.o = LoadQuantLinearWithFallback(reader, base + "attn.o", mtp_head_layout, hidden, attn_out,
+                                       &bf16_fallbacks);
     a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
     a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
     a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
     a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
     lw.attn = std::move(a);
-    lw.mlp.gate_up = LoadQuantLinear(reader, base + "mlp.gate_up", mtp_head_layout,
-                                      2 * c.config_.intermediate_size, hidden);
-    lw.mlp.down = LoadQuantLinear(reader, base + "mlp.down", mtp_head_layout, hidden,
-                                   c.config_.intermediate_size);
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, base + "mlp.gate_up", mtp_head_layout,
+                                                  2 * c.config_.intermediate_size, hidden,
+                                                  &bf16_fallbacks);
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, base + "mlp.down", mtp_head_layout, hidden,
+                                               c.config_.intermediate_size, &bf16_fallbacks);
     mw.layer = std::move(lw);
     mw.fc = UploadRawU16(reader, "mtp.fc");
     mw.norm = UploadRawU16(reader, "mtp.norm");
@@ -392,8 +417,9 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
       // why: the draft head's error compounds across chained draft steps) -- a run that chose to
       // build a draft head always emits it in the same LayoutSet as mtp.attn.qg/o and
       // mtp.mlp.gate_up/down, so this load-time layout selection just works.
-      mw.draft_lm_head =
-          LoadQuantLinear(reader, "mtp.draft_head.lm_head", mtp_head_layout, draft_vocab_size, hidden);
+      mw.draft_lm_head = LoadQuantLinearWithFallback(reader, "mtp.draft_head.lm_head",
+                                                      mtp_head_layout, draft_vocab_size, hidden,
+                                                      &bf16_fallbacks);
     }
     c.mtp_ = std::move(mw);
   }
@@ -403,6 +429,19 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   // caller asked, because it is ~0.90 GiB a text-only run must not pay for. `vision_config` comes
   // from the container's own metadata; a container that carries the tensors but no vision_config
   // block is a converter bug, so that combination throws rather than defaulting a geometry.
+  // Milestone 11 (docs/validation.md "Milestone 11 / sensitivity"): say out loud how many linears
+  // did not carry the requested layout. A `--keep-bf16` sensitivity container is supposed to have a
+  // non-zero count here and the number is the experiment's own check that the regex selected the
+  // class it meant to; a PRODUCTION container reporting anything other than 0 is a converter run
+  // that quietly shipped bf16 weights (4x the bytes, and the throughput to match).
+  if (bf16_fallbacks > 0) {
+    std::fprintf(stderr,
+                  "r4dx: %d linear(s) in %s do not carry the requested layout and were loaded as "
+                  "bf16 (r4dx-convert --keep-bf16, or a container predating that tensor's "
+                  "quantization)\n",
+                  bf16_fallbacks, path.c_str());
+  }
+
   c.container_has_vision_tensors_ = vision::HasVisionTensors(reader);
   if (load_vision && c.container_has_vision_tensors_) {
     if (!model_config.contains("vision_config")) {

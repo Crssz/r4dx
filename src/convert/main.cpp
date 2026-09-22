@@ -8,6 +8,16 @@
 //                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
 //                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
 //                [--quant {rtn,search}] [--imatrix <tools/reference/imatrix_capture.py .npz>]
+//                [--keep-bf16 <ECMAScript regex over container base names>]
+//
+// --keep-bf16 (docs/validation.md "Milestone 11 / sensitivity", keep_bf16.hpp) writes every linear
+// whose container base name the regex matches as `<base>.bf16.w` ONLY, skipping every quantized
+// layout the run asked for; src/model/container.cpp's LoadQuantLinearWithFallback then loads those
+// -- and only those -- as bf16. It is the per-tensor-class sensitivity instrument: convert one
+// class in bf16, re-run the KL harness, and the KL that disappears is that class's share.
+// e.g. --keep-bf16 "attn\.o$", --keep-bf16 "^text\.layers\.[0-7]\.". Matching is regex_SEARCH, so
+// anchor when a substring would over-select. A regex that matches nothing warns and converts
+// normally (a scripted sweep must not die mid-batch on a class this checkpoint has none of).
 //
 // --quant selects HOW the 4-bit values are chosen; it does NOT change a single byte of the on-disk
 // layout (docs/container-format.md, "How the quantized values are chosen"). `rtn` (the DEFAULT) is
@@ -79,6 +89,7 @@
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
+#include "r4dx_convert/keep_bf16.hpp"
 #include "r4dx_convert/kv_calib.hpp"
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/npz_reader.hpp"
@@ -218,6 +229,11 @@ struct AppArgs {
   // energy of each input channel. Only meaningful with --quant search; a linear with no entry in
   // the file falls back to unweighted MSE (with a count reported at the end of the run).
   std::string imatrix;
+
+  // ECMAScript regex over container base names; matching linears are written as `<base>.bf16.w`
+  // only (r4dx_convert::KeepBf16Selector, keep_bf16.hpp). Empty (default) = every linear is
+  // quantized exactly as before this flag existed, byte for byte.
+  std::string keep_bf16;
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -257,6 +273,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--layout") a.dflash_layout = next(i);
     else if (arg == "--quant") a.quant = next(i);
     else if (arg == "--imatrix") a.imatrix = next(i);
+    else if (arg == "--keep-bf16") a.keep_bf16 = next(i);
     else throw std::runtime_error("unknown argument: " + arg);
   }
   if (a.quant != "rtn" && a.quant != "search")
@@ -271,6 +288,14 @@ AppArgs ParseArgs(int argc, char** argv) {
     throw std::runtime_error(
         "--imatrix does not apply to --dflash-gguf (the drafter has no importance matrix; "
         "tools/reference/imatrix_capture.py only captures the main model's linears)");
+  // --keep-bf16 is wired into the HF-checkpoint and --selftest paths only. Accepting it silently
+  // alongside --dflash-gguf would produce a drafter container in which it did nothing at all -- the
+  // exact failure mode the "matched nothing" warning exists to make visible, so reject it outright
+  // rather than emit a warning nobody reads in a sweep log. (--layout bf16 is how you get a bf16
+  // drafter.)
+  if (!a.keep_bf16.empty() && !a.dflash_gguf.empty())
+    throw std::runtime_error("--keep-bf16 does not apply to --dflash-gguf (use --layout bf16 for a "
+                             "bf16 drafter container)");
   return a;
 }
 
@@ -398,6 +423,13 @@ int RunConvert(const AppArgs& args) {
             << (args.imatrix.empty() ? " (unweighted MSE)" : " (imatrix-weighted)") << "\n";
   ImatrixSource imatrix(args.imatrix, quant_mode);
 
+  // --keep-bf16 (keep_bf16.hpp): constructed here so an invalid regex fails before the first shard
+  // is opened, not 250 s into the emit pass.
+  r4dx_convert::KeepBf16Selector keep_bf16(args.keep_bf16);
+  if (keep_bf16.Enabled())
+    std::cout << "[r4dx-convert] keep-bf16=" << keep_bf16.Pattern()
+              << " (matching linears written as <base>.bf16.w only)\n";
+
   const bool have_kv_calib = !args.kv_calib.empty();
   nlohmann::json kv_calib_json;
   if (have_kv_calib) {
@@ -456,13 +488,23 @@ int RunConvert(const AppArgs& args) {
     });
   };
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
-                         LayoutSet ls) {
-    plan_jobs.push_back([&writer, &model, hf_names, container_base, ls]() {
+                         LayoutSet requested) {
+    // --keep-bf16 decides per container base name, which is known here -- so plan and emit cannot
+    // disagree about what this linear is (the two lambdas below capture the SAME resolved `ls`,
+    // rather than each re-evaluating the regex).
+    const bool kept = keep_bf16.Matches(container_base);
+    const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
+    plan_jobs.push_back([&writer, &model, &keep_bf16, hf_names, container_base, ls, requested,
+                          kept]() {
       int64_t N = 0, K = 0;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
         N += m.shape[0];
         K = m.shape[1];
+      }
+      if (kept) {
+        keep_bf16.Record(container_base, static_cast<int>(N), static_cast<int>(K), requested,
+                         std::cout);
       }
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
@@ -603,16 +645,27 @@ int RunConvert(const AppArgs& args) {
       std::cout << "[r4dx-convert] draft-vocab-ids=" << args.draft_vocab_ids << " ("
                 << draft_vocab_size << " ids)\n";
 
-      plan_jobs.push_back([&writer, &model, draft_vocab_size, layouts]() {
+      // --keep-bf16 applies here too, resolved on the same base name the regex sees everywhere
+      // else -- so a pattern like "lm_head$" that happens to reach this optional head keeps it in
+      // bf16 rather than quantizing it while claiming otherwise.
+      const bool draft_head_kept = keep_bf16.Matches("mtp.draft_head.lm_head");
+      const LayoutSet draft_head_layouts =
+          draft_head_kept ? r4dx_convert::KeptBf16LayoutSet() : layouts;
+      plan_jobs.push_back([&writer, &model, &keep_bf16, draft_vocab_size, draft_head_layouts,
+                            layouts, draft_head_kept]() {
         const auto& m = model.Meta("lm_head.weight");
         const int64_t hidden_k = m.shape[1];
+        if (draft_head_kept) {
+          keep_bf16.Record("mtp.draft_head.lm_head", static_cast<int>(draft_vocab_size),
+                           static_cast<int>(hidden_k), layouts, std::cout);
+        }
         r4dx_convert::PlanLinearLayouts(writer, "mtp.draft_head.lm_head",
                                          static_cast<int>(draft_vocab_size),
-                                         static_cast<int>(hidden_k), layouts);
+                                         static_cast<int>(hidden_k), draft_head_layouts);
         writer.Plan("mtp.draft_head.vocab_ids", {draft_vocab_size, 4},
                     static_cast<uint64_t>(draft_vocab_size) * 4);
       });
-      emit_jobs.push_back([&writer, &model, &imatrix, draft_ids, layouts, threads]() {
+      emit_jobs.push_back([&writer, &model, &imatrix, draft_ids, draft_head_layouts, threads]() {
         const auto full = r4dx_convert::ReadTensorAsFloat(model, "lm_head.weight");
         const int64_t hidden_k = model.Meta("lm_head.weight").shape[1];
         const int64_t vocab_full = static_cast<int64_t>(full.size()) / hidden_k;
@@ -634,7 +687,7 @@ int RunConvert(const AppArgs& args) {
         // unweighted MSE (with the usual warning) rather than silently mis-weighting.
         r4dx_convert::EmitLinearLayouts(writer, "mtp.draft_head.lm_head", sliced,
                                          static_cast<int>(draft_ids.size()),
-                                         static_cast<int>(hidden_k), layouts, threads,
+                                         static_cast<int>(hidden_k), draft_head_layouts, threads,
                                          imatrix.For("mtp.draft_head.lm_head", hidden_k));
         writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
       });
@@ -644,6 +697,9 @@ int RunConvert(const AppArgs& args) {
   const auto t0 = std::chrono::steady_clock::now();
 
   for (auto& j : plan_jobs) j();
+  // After planning (every add_linear's shapes are known by now), before the header is written --
+  // so the summary/"matched nothing" warning lands ahead of the long emit pass rather than after it.
+  keep_bf16.Report(std::cout, std::cerr);
 
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";
@@ -691,6 +747,14 @@ int RunConvert(const AppArgs& args) {
       // container on disk says which quantizer produced it without re-deriving it from the bytes.
       {"quant_values", args.quant},
       {"imatrix", args.imatrix.empty() ? std::string("none (unweighted MSE)") : args.imatrix},
+      // --keep-bf16 (keep_bf16.hpp): which linears in THIS container are bf16 passthroughs rather
+      // than quantized. Recorded as the pattern plus the resolved name list, because the pattern
+      // alone cannot be re-evaluated later without the converter's own base-name vocabulary, and a
+      // sensitivity table is only readable next to the exact set of tensors each row covers.
+      {"keep_bf16", args.keep_bf16.empty() ? std::string("none (every linear quantized)")
+                                            : args.keep_bf16},
+      {"keep_bf16_linears", keep_bf16.Matched()},
+      {"keep_bf16_extra_bytes", keep_bf16.ExtraBytes()},
   };
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
@@ -710,7 +774,13 @@ int RunConvert(const AppArgs& args) {
 
 int RunSelftest(const AppArgs& args) {
   const int threads = ResolveThreads(args.threads);
-  const LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
+  const LayoutSet requested = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
+  // The selftest's single tensor has container base "selftest", so --keep-bf16 is exercisable end
+  // to end here in milliseconds -- which is what tests/convert/test_keep_bf16.cpp uses to gate the
+  // CLI wiring (regex -> LayoutSet -> emitted tensor set -> warning path) without a 27B checkpoint.
+  r4dx_convert::KeepBf16Selector keep_bf16(args.keep_bf16);
+  const bool kept = keep_bf16.Matches("selftest");
+  const LayoutSet layouts = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
 
   r4dx_convert::SafetensorsReader reader(r4dx_convert::Utf8ToWide(args.selftest_input));
   if (!reader.Has(args.selftest_name))
@@ -735,6 +805,8 @@ int RunSelftest(const AppArgs& args) {
   const r4dx_convert::QuantOptions opts = imatrix.For("selftest", K);
 
   ContainerWriter writer;
+  if (kept) keep_bf16.Record("selftest", N, K, requested, std::cout);
+  keep_bf16.Report(std::cout, std::cerr);
   r4dx_convert::PlanLinearLayouts(writer, "selftest", N, K, layouts);
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";

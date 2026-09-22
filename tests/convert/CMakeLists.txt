@@ -45,6 +45,13 @@ add_executable(convert_bf16_layout test_bf16_layout.cpp)
 target_link_libraries(convert_bf16_layout PRIVATE r4dx_convert)
 add_test(NAME convert_bf16_layout COMMAND convert_bf16_layout)
 
+# --keep-bf16 (Milestone 11, docs/validation.md "Milestone 11 / sensitivity"): regex selection over
+# container base names, "matched nothing is a warning not an error", the byte accounting against
+# what ContainerWriter really plans, and that a kept linear emits ONLY <base>.bf16.w. CPU-only.
+add_executable(convert_keep_bf16 test_keep_bf16.cpp)
+target_link_libraries(convert_keep_bf16 PRIVATE r4dx_convert)
+add_test(NAME convert_keep_bf16 COMMAND convert_keep_bf16)
+
 # DFlash2 task A1 item 1: minimal GGUF v3 reader (metadata KV of every type incl. arrays/strings,
 # tensor directory, F32/F16/BF16/Q8_0 dequant) against tests/convert/fixtures/tiny.gguf (generated
 # by tools/convert_ref/make_tiny_gguf.py, no gguf-py dependency either side).

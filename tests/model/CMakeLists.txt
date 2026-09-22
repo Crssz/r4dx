@@ -111,6 +111,25 @@ target_compile_definitions(test_dflash_draft_weights PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../convert/fixtures")
 add_test(NAME test_dflash_draft_weights COMMAND test_dflash_draft_weights)
 
+# test_keep_bf16 (Milestone 11, docs/validation.md "Milestone 11 / sensitivity"): converts a real
+# 4-layer container with `r4dx-convert --keep-bf16 <regex>` and checks that exactly the matched
+# linears load as bf16 while the rest load as w4a16, and that the mixed-layout model generates. Not
+# in R4DX_MODEL_TESTS above because it needs the r4dx-convert TARGET (it runs the binary), which
+# R4DX_BUILD_CONVERT can switch off; otherwise it follows the same conventions (device 1, SKIP 77
+# when the HF checkpoint this machine may not have is absent).
+if(TARGET r4dx-convert)
+  add_executable(test_keep_bf16 test_keep_bf16.cpp)
+  target_link_libraries(test_keep_bf16 PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+  target_compile_definitions(test_keep_bf16 PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_keep_bf16 r4dx-convert)
+  add_test(NAME test_keep_bf16 COMMAND test_keep_bf16)
+  set_tests_properties(test_keep_bf16 PROPERTIES
+    ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+    SKIP_RETURN_CODE 77
+  )
+endif()
+
 # tests/model/attention/: golden test for r4dx::model::attention::AttentionLayer, created
 # standalone by that component before this file existed -- see its own CMakeLists.txt header note.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")

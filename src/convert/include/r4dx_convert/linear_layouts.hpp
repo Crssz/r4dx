@@ -28,6 +28,37 @@ struct LayoutSet {
   bool mxfp4 = false, w4a16 = false, w4a8 = false, bf16 = true;
 };
 
+// The LayoutSet a `--keep-bf16`-matched linear is written in: `<base>.bf16.w` and NOTHING else
+// (src/convert/main.cpp's --keep-bf16, docs/validation.md "Milestone 11 / sensitivity"). Named here
+// rather than spelled out at the call site because it is a contract with the LOADER, not a local
+// choice: src/model/container.cpp's LoadQuantLinearWithFallback recognizes exactly this on-disk
+// shape -- a base carrying only the bf16 form -- and falls that one linear back to bf16 while every
+// other linear in the same container still loads in the requested quantized layout.
+inline LayoutSet KeptBf16LayoutSet() {
+  LayoutSet ls;
+  ls.mxfp4 = ls.w4a16 = ls.w4a8 = false;
+  ls.bf16 = true;
+  return ls;
+}
+
+// Exactly the byte total PlanLinearLayouts() below plans for one [N,K] linear in `layouts`. Same
+// formulas, derived once: --keep-bf16's "extra bytes vs 4-bit" accounting has to answer "what would
+// this linear have cost in the layouts it is NOT being written in", and a second hand-written copy
+// of these expressions would silently drift the moment a layout's scale tensor changes shape (as
+// w4a16.wsz just did when R4DX_W4A16_GROUP became a build option).
+inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
+  const uint64_t NK = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
+  uint64_t bytes = 0;
+  if (layouts.bf16) bytes += NK * 2;
+  if (layouts.w4a16) bytes += NK / 2 + NK / kW4A16Group * 4;
+  if (layouts.w4a8) bytes += NK / 2 + NK / kW4A8Group * 4;
+  if (layouts.mxfp4) {
+    bytes += NK / 2 + static_cast<uint64_t>(K) / kMxfp4Group * static_cast<uint64_t>(N) +
+             static_cast<uint64_t>(N);
+  }
+  return bytes;
+}
+
 // How the quantized layouts pick their (scale, zero) values. The BYTE LAYOUT is identical either
 // way -- see quant_search.hpp. `kRtn` is the historical round-to-nearest min/max grid and is the
 // default here so every caller that does not opt in (tests/convert, the DFlash2 path's own

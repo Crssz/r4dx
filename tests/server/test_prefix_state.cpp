@@ -87,6 +87,40 @@ void TestInvalidateResetsToEmpty() {
   CHECK(p.fed().empty());
 }
 
+// Regression: Invalidate() used to only clear fed_, and Extend() treats an empty fed_ as "model at
+// position 0" -- so after a request threw mid-Prefill/Decode, the NEXT request extended the empty
+// prefix, skipped Engine's Model::Reset(), and was fed on top of the failed request's leftover
+// KV/GDN state. Every prompt must be refused until a request has run to Commit() again.
+void TestInvalidateForcesResetUntilCommit() {
+  PrefixState p;
+  p.Commit({1, 2, 3}, {7, 8});
+  p.Invalidate();
+  CHECK(!p.Extend({1, 2, 3, 7, 8, 9}).has_value());  // extends the old prefix
+  CHECK(!p.Extend({42, 43}).has_value());            // unrelated conversation
+  CHECK(!p.Extend({1}).has_value());
+
+  // Engine's recovery: Extend()==nullopt -> Model::Reset() + Clear() + feed the whole prompt. The
+  // flag survives Clear() (the request can still fail after the reset) and lifts only on Commit().
+  p.Clear();
+  CHECK(!p.Extend({42, 43}).has_value());
+  p.Commit({42, 43}, {44});
+  auto tail = p.Extend({42, 43, 44, 45});
+  CHECK(tail.has_value());
+  CHECK(*tail == std::vector<int32_t>({45}));
+
+  // A second failure after recovery re-arms it.
+  p.Invalidate();
+  CHECK(!p.Extend({42, 43, 44, 45}).has_value());
+
+  // Images take the same path.
+  using r4dx::server::ImageKey;
+  const ImageKey a{/*content_hash=*/0xAAAA, 1, 28, 28, /*token_offset=*/1};
+  PrefixState q;
+  q.Commit({1, 248056, 248056, 9}, {}, {a});
+  q.Invalidate();
+  CHECK(!q.Extend({1, 248056, 248056, 9, 10}, {a}).has_value());
+}
+
 // docs/mtp.md's "mid-round" gap: an MTP round that stops mid-vector still committed every token
 // up to (not including) its own last element -- Commit()'s `committed_tokens` argument is exactly
 // that superset, distinct from whatever subset was actually shown to the client. This test checks
@@ -181,6 +215,7 @@ int main() {
   TestExtendShorterPromptIsNotAnExtension();
   TestClearResetsToEmpty();
   TestInvalidateResetsToEmpty();
+  TestInvalidateForcesResetUntilCommit();
   TestCommitTracksCommittedNotDisplayedTokens();
   TestImageAwarePrefixReuse();
 

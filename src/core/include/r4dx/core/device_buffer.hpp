@@ -5,6 +5,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
@@ -12,6 +13,7 @@
 
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/stream.hpp"
+#include "r4dx/core/tp_alloc_guard.hpp"  // docs/tp.md 2.7: counts allocs inside TP collectives
 
 // Bounds-checks a requested element count against the buffer's actual capacity before any
 // hipMemcpy* call -- a caller-supplied `count` larger than the allocation overflows the device
@@ -32,6 +34,8 @@ class DeviceBuffer {
 
   explicit DeviceBuffer(size_t count) : count_(count) {
     if (count_ > 0) {
+      static std::atomic<bool> logged{false};
+      TpNoteDeviceAlloc("allocation (DeviceBuffer constructor)", logged);
       R4DX_HIP_CHECK(hipMalloc(&ptr_, count_ * sizeof(T)));
     }
   }
@@ -68,6 +72,8 @@ class DeviceBuffer {
     Free();
     count_ = count;
     if (count_ > 0) {
+      static std::atomic<bool> logged{false};
+      TpNoteDeviceAlloc("allocation (DeviceBuffer::Resize)", logged);
       R4DX_HIP_CHECK(hipMalloc(&ptr_, count_ * sizeof(T)));
     }
   }
@@ -112,7 +118,11 @@ class DeviceBuffer {
 
  private:
   void Free() noexcept {
-    if (ptr_ != nullptr) static_cast<void>(hipFree(ptr_));
+    if (ptr_ != nullptr) {
+      static std::atomic<bool> logged{false};
+      TpNoteDeviceAlloc("free (DeviceBuffer)", logged);
+      static_cast<void>(hipFree(ptr_));
+    }
     ptr_ = nullptr;
     count_ = 0;
   }

@@ -954,10 +954,29 @@ __device__ float g_summary_part_vals[kSummaryMaxRows * kSummaryMaxChunks * kSumm
 __device__ float g_summary_part_max[kSummaryMaxRows * kSummaryMaxChunks];
 __device__ double g_summary_part_sum[kSummaryMaxRows * kSummaryMaxChunks];
 
+// r4dx_topk_lse_f32_ws's caller-owned workspace (docs/tp.md 2.7): the same four arrays, laid out
+// back to back in one buffer -- ids, vals (131072 B each), max (2048 B), sum (4096 B, 8-aligned).
+// Both kernels take the arrays as pointers; a null `ws_ids` selects the module scratch above, which
+// is what r4dx_topk_lse_f32 passes, so its partials land exactly where they always did.
+constexpr int64_t kSummaryWsIdsOff = 0;
+constexpr int64_t kSummaryWsValsOff =
+    kSummaryWsIdsOff + int64_t{kSummaryMaxRows} * kSummaryMaxChunks * kSummaryK * 4;
+constexpr int64_t kSummaryWsMaxOff =
+    kSummaryWsValsOff + int64_t{kSummaryMaxRows} * kSummaryMaxChunks * kSummaryK * 4;
+constexpr int64_t kSummaryWsSumOff = kSummaryWsMaxOff + int64_t{kSummaryMaxRows} * kSummaryMaxChunks * 4;
+constexpr int64_t kSummaryWsBytes = kSummaryWsSumOff + int64_t{kSummaryMaxRows} * kSummaryMaxChunks * 8;
+static_assert(kSummaryWsSumOff % 8 == 0, "the double partial sums must be 8-aligned");
+
 __global__ __launch_bounds__(kThreads) void TopkLsePartialKernel(const float* __restrict__ logits,
                                                                       int64_t vocab,
                                                                       float inv_temperature,
-                                                                      int chunks) {
+                                                                      int chunks, int32_t* ws_ids,
+                                                                      float* ws_vals, float* ws_max,
+                                                                      double* ws_sum) {
+  int32_t* const part_ids = ws_ids != nullptr ? ws_ids : g_summary_part_ids;
+  float* const part_vals = ws_ids != nullptr ? ws_vals : g_summary_part_vals;
+  float* const part_max = ws_ids != nullptr ? ws_max : g_summary_part_max;
+  double* const part_sum = ws_ids != nullptr ? ws_sum : g_summary_part_sum;
   const int chunk = blockIdx.x;
   const int row = blockIdx.y;
   const int64_t per = (vocab + chunks - 1) / chunks;
@@ -1025,12 +1044,12 @@ __global__ __launch_bounds__(kThreads) void TopkLsePartialKernel(const float* __
 
   const int64_t slot = (static_cast<int64_t>(row) * kSummaryMaxChunks + chunk);
   if (tid < kSummaryK) {
-    g_summary_part_vals[slot * kSummaryK + tid] = acc_v[tid];
-    g_summary_part_ids[slot * kSummaryK + tid] = acc_i[tid];
+    part_vals[slot * kSummaryK + tid] = acc_v[tid];
+    part_ids[slot * kSummaryK + tid] = acc_i[tid];
   }
   if (tid == 0) {
-    g_summary_part_max[slot] = acc_v[0];
-    g_summary_part_sum[slot] = s_sum[0];
+    part_max[slot] = acc_v[0];
+    part_sum[slot] = s_sum[0];
   }
 }
 
@@ -1038,12 +1057,20 @@ __global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restri
                                                                     float* __restrict__ out_vals,
                                                                     float* __restrict__ out_lse,
                                                                     int chunks,
-                                                                    float inv_temperature) {
+                                                                    float inv_temperature,
+                                                                    const int32_t* ws_ids,
+                                                                    const float* ws_vals,
+                                                                    const float* ws_max,
+                                                                    const double* ws_sum) {
+  const int32_t* const part_ids = ws_ids != nullptr ? ws_ids : g_summary_part_ids;
+  const float* const part_vals = ws_ids != nullptr ? ws_vals : g_summary_part_vals;
+  const float* const part_max = ws_ids != nullptr ? ws_max : g_summary_part_max;
+  const double* const part_sum = ws_ids != nullptr ? ws_sum : g_summary_part_sum;
   const int row = blockIdx.x;
   const int n = chunks * kSummaryK;
   const int64_t base = static_cast<int64_t>(row) * kSummaryMaxChunks * kSummaryK;
-  const int32_t* __restrict__ pids = g_summary_part_ids + base;
-  const float* __restrict__ pvals = g_summary_part_vals + base;
+  const int32_t* __restrict__ pids = part_ids + base;
+  const float* __restrict__ pvals = part_vals + base;
   const int tid = threadIdx.x;
 
   __shared__ float s_v[kThreads * kTopkLdsPitch];
@@ -1103,9 +1130,9 @@ __global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restri
     // stays in double where it matters.
     double total = 0.0;
     for (int c = 0; c < chunks; ++c) {
-      const float cm = g_summary_part_max[static_cast<int64_t>(row) * kSummaryMaxChunks + c];
+      const float cm = part_max[static_cast<int64_t>(row) * kSummaryMaxChunks + c];
       if (!(cm > -INFINITY)) continue;
-      total += g_summary_part_sum[static_cast<int64_t>(row) * kSummaryMaxChunks + c] *
+      total += part_sum[static_cast<int64_t>(row) * kSummaryMaxChunks + c] *
                static_cast<double>(expf((cm - row_max) * inv_temperature));
     }
     // logf for the same fp64-software-routine reason as the expf above. `total` is bounded: the
@@ -1609,7 +1636,25 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 
 void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
                         int rows, int64_t vocab, float inv_temperature, int64_t stream) {
+  r4dx_topk_lse_f32_ws(logits, out_ids, out_vals, out_lse, rows, vocab, inv_temperature, stream,
+                       /*workspace=*/0);
+}
+
+int64_t r4dx_topk_lse_workspace_bytes() { return kSummaryWsBytes; }
+
+void r4dx_topk_lse_f32_ws(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
+                           int rows, int64_t vocab, float inv_temperature, int64_t stream,
+                           int64_t workspace) {
   if (rows <= 0) return;
+  if (workspace % 16 != 0) {
+    throw std::runtime_error("r4dx_topk_lse_f32_ws: workspace must be 16-byte aligned");
+  }
+  // workspace == 0: the module scratch (a null ws_ids makes both kernels use it).
+  uint8_t* const ws = reinterpret_cast<uint8_t*>(workspace);
+  int32_t* const ws_ids = ws != nullptr ? reinterpret_cast<int32_t*>(ws + kSummaryWsIdsOff) : nullptr;
+  float* const ws_vals = ws != nullptr ? reinterpret_cast<float*>(ws + kSummaryWsValsOff) : nullptr;
+  float* const ws_max = ws != nullptr ? reinterpret_cast<float*>(ws + kSummaryWsMaxOff) : nullptr;
+  double* const ws_sum = ws != nullptr ? reinterpret_cast<double*>(ws + kSummaryWsSumOff) : nullptr;
   // Hard preconditions (kernels.h): a violated one must throw, never produce a wrong summary that
   // the host sampler would then treat as authoritative.
   if (rows > 8) {
@@ -1634,11 +1679,12 @@ void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_
   hipLaunchKernelGGL(TopkLsePartialKernel,
                      dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(rows)),
                      dim3(kThreads), 0, (hipStream_t)stream, (const float*)logits, vocab,
-                     inv_temperature, chunks);
+                     inv_temperature, chunks, ws_ids, ws_vals, ws_max, ws_sum);
   R4DX_HIP_CHECK(hipGetLastError());
   hipLaunchKernelGGL(TopkLseMergeKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (int32_t*)out_ids, (float*)out_vals, (float*)out_lse,
-                     chunks, inv_temperature);
+                     chunks, inv_temperature, (const int32_t*)ws_ids, (const float*)ws_vals,
+                     (const float*)ws_max, (const double*)ws_sum);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

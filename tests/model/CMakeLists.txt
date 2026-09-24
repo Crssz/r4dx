@@ -16,6 +16,9 @@ set(R4DX_MODEL_TESTS
   # Tensor-parallel P2a (docs/tp.md 10.1): the sharded Container::Load of both ranks, every layout,
   # read back against the file's bytes. Device 1, SKIP 77 without the 4-layer container.
   test_tp_loader
+  # Tensor-parallel P2b (docs/tp.md 10.1): TpModel in --tp-mode emulate (both ranks on device 1)
+  # against the TP=1 Model -- numerics, greedy/sampled merges, VerifyWindow, fault recovery.
+  test_tp_emulation
 )
 
 foreach(t ${R4DX_MODEL_TESTS})

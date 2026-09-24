@@ -6,6 +6,7 @@
 //     slot verified; heartbeats bumped on entry and exit of every wait;
 //   * Abort() wakes a waiter with TpAbortedError (and later calls throw at once);
 //   * a peer that never arrives -> TpTimeoutError after the timeout, and the group is aborted;
+//     BarrierFor / AllGatherFor honour their own per-call bound (EmulatedComm, docs/tp.md N45);
 //   * Reset() zeroes arrive[] AND the per-rank generations: after an asymmetric abort -- rank 1
 //     already counted the call, rank 0 never made it -- Reset() gives correct contents on the next
 //     1,000 gathers;
@@ -165,6 +166,38 @@ void TestTimeout() {
   Check(ex.Aborted(), "the timeout aborts the group");
 }
 
+// BarrierFor / AllGatherFor wait at most their own bound, not the constructor's (the 30 s default
+// here): EmulatedComm's all-reduce barrier is bounded by the all-reduce timeout (docs/tp.md N45).
+void TestPerCallBound() {
+  HostExchange ex(2);  // 30 s constructor timeout
+  const auto t0 = std::chrono::steady_clock::now();
+  bool timed_out = false;
+  try {
+    ex.BarrierFor(0, std::chrono::milliseconds(150));  // rank 1 never arrives
+  } catch (const TpTimeoutError&) {
+    timed_out = true;
+  }
+  const double ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  Check(timed_out && ms >= 150.0 && ms < 3000.0,
+        "BarrierFor(150 ms) times out at its own bound, not the 30 s constructor timeout (" +
+            std::to_string(ms) + " ms)");
+  Check(ex.Aborted(), "a BarrierFor timeout aborts the group");
+
+  // After Reset(), AllGatherFor with both ranks present gathers normally.
+  ex.Reset();
+  uint64_t got[2][2] = {};
+  std::thread t1([&] {
+    const uint64_t v = 11;
+    ex.AllGatherFor(1, &v, 8, got[1], std::chrono::milliseconds(5000));
+  });
+  const uint64_t v0 = 10;
+  ex.AllGatherFor(0, &v0, 8, got[0], std::chrono::milliseconds(5000));
+  t1.join();
+  Check(got[0][0] == 10 && got[0][1] == 11 && got[1][0] == 10 && got[1][1] == 11,
+        "AllGatherFor with both ranks present gathers both slots");
+}
+
 void TestResetAfterAsymmetricAbort() {
   HostExchange ex(2);
   Check(RunGathers(ex, 0, 10, false) == 0, "10 clean gathers before the fault");
@@ -243,6 +276,7 @@ int main() {
   TestMillionGathers();
   TestAbortWakesWaiter();
   TestTimeout();
+  TestPerCallBound();
   TestResetAfterAsymmetricAbort();
   TestSizeMismatchAndWorldOne();
   if (g_failures > 0) {

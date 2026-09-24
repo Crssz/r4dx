@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "local_text_model.h"
 #include "model.h"
 #include "teacher_forced.h"
 #include "test_common.h"
@@ -68,7 +69,9 @@ int main() {
     opts.max_ctx = 512;
     opts.layer_limit = kLayers;
     opts.vision = ModelOptions::VisionMode::kOff;
-    Model model = Model::Load(opts);
+    // Through the TP=1 TextModel, exactly as tool_teacher_forced_logprobs drives it (docs/tp.md 2.8):
+    // every call below forwards one-to-one to the Model.
+    r4dx::model::LocalTextModel model(Model::Load(opts));
 
     // ---- 1. greedy generation, exactly as r4dx-cli --temperature 0 --mtp 0 does it --------------
     // DecodeStep (full logits) rather than DecodeStepGreedy, purely so this loop can record the

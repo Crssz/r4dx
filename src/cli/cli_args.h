@@ -181,6 +181,23 @@ struct CliArgs {
   // to drive a 4-layer container end to end -- e.g. the Rung 4 self-consistency check in
   // docs/validation.md, which generates greedily through r4dx-cli and then scores what it generated.
   int64_t layers = -1;
+  // ---- tensor parallel (docs/tp.md 9.1) ----------------------------------------------------------
+  // --tp N: 1 (default) is today's single-device engine, byte for byte, and allows no other --tp-*
+  // flag; 2 is tensor parallel across two ranks (r4dx::model::TpModel).
+  int tp = 1;
+  // --tp-mode real|emulate|noop: real = one rank per GPU (docs/tp.md P4 -- refused until then);
+  // emulate = both ranks on ONE device (the byte-exact reference for real runs, and the numerics
+  // check vs TP=1); noop = one rank's shard with a no-op all-reduce (timing only).
+  std::string tp_mode = "real";
+  // --tp-devices a[,b]: process-visible HIP ordinals, rank r -> entry r; empty = auto (docs/tp.md
+  // 9.2: emulate/noop use the last visible ordinal).
+  std::vector<int> tp_devices;
+  int tp_rank = 0;              // --tp-rank r: noop only, which shard to load
+  int tp_ar_timeout_ms = 500;   // --tp-ar-timeout-ms N: all-reduce spin timeout, [10, 1500]
+  int tp_ar_nb = 4;             // --tp-ar-nb N: blocks per channel-0 all-reduce, [1, 64]
+  int tp_ar_nb_large = 4;       // --tp-ar-nb-large N: blocks per channel-1 all-reduce, [1, 64]
+  // Set when any --tp-* flag other than --tp itself was given (they are refused at --tp 1).
+  bool tp_options_given = false;
 };
 
 // Thrown for a malformed/incomplete argument list (missing required flag, unrecognized flag, a
@@ -201,7 +218,34 @@ inline std::string CliUsageText(const char* argv0) {
          "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N] "
          "[--vision {auto|on|off}] [--image-max-pixels N] [--image <path> ...] "
-         "[--dump-token-ids <tokens.json>] [--layers N]";
+         "[--dump-token-ids <tokens.json>] [--layers N] "
+         "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
+         "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N]";
+}
+
+// "auto" (or "") -> empty (docs/tp.md 9.2 auto); "a" or "a,b" -> the ordinals.
+inline std::vector<int> ParseTpDevices(const std::string& value) {
+  std::vector<int> out;
+  if (value.empty() || value == "auto") return out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t comma = value.find(',', start);
+    const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    int d = 0;
+    try {
+      size_t used = 0;
+      d = std::stoi(item, &used);
+      if (used != item.size()) throw std::invalid_argument(item);
+    } catch (const std::exception&) {
+      throw CliUsageError("--tp-devices expects 'auto' or 'a[,b]' (HIP ordinals), got '" + value + "'");
+    }
+    if (d < 0) throw CliUsageError("--tp-devices ordinals must be >= 0, got '" + value + "'");
+    out.push_back(d);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (out.size() > 2) throw CliUsageError("--tp-devices takes at most two ordinals (rank 0, rank 1)");
+  return out;
 }
 
 inline std::string NextCliArg(int argc, char** argv, int& i, const char* flag) {
@@ -243,6 +287,7 @@ inline uint64_t ParseU64(const std::string& flag, const std::string& value) {
 
 inline CliArgs ParseArgs(int argc, char** argv) {
   CliArgs a;
+  bool tp_rank_given = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextCliArg(argc, argv, i, "--model");
@@ -276,6 +321,13 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--image") a.image_paths.push_back(NextCliArg(argc, argv, i, "--image"));
     else if (arg == "--dump-token-ids") a.dump_token_ids = NextCliArg(argc, argv, i, "--dump-token-ids");
     else if (arg == "--layers") a.layers = ParseI64("--layers", NextCliArg(argc, argv, i, "--layers"));
+    else if (arg == "--tp") a.tp = ParseInt("--tp", NextCliArg(argc, argv, i, "--tp"));
+    else if (arg == "--tp-mode") { a.tp_mode = NextCliArg(argc, argv, i, "--tp-mode"); a.tp_options_given = true; }
+    else if (arg == "--tp-devices") { a.tp_devices = ParseTpDevices(NextCliArg(argc, argv, i, "--tp-devices")); a.tp_options_given = true; }
+    else if (arg == "--tp-rank") { a.tp_rank = ParseInt("--tp-rank", NextCliArg(argc, argv, i, "--tp-rank")); a.tp_options_given = true; tp_rank_given = true; }
+    else if (arg == "--tp-ar-timeout-ms") { a.tp_ar_timeout_ms = ParseInt("--tp-ar-timeout-ms", NextCliArg(argc, argv, i, "--tp-ar-timeout-ms")); a.tp_options_given = true; }
+    else if (arg == "--tp-ar-nb") { a.tp_ar_nb = ParseInt("--tp-ar-nb", NextCliArg(argc, argv, i, "--tp-ar-nb")); a.tp_options_given = true; }
+    else if (arg == "--tp-ar-nb-large") { a.tp_ar_nb_large = ParseInt("--tp-ar-nb-large", NextCliArg(argc, argv, i, "--tp-ar-nb-large")); a.tp_options_given = true; }
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -335,6 +387,37 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     throw CliUsageError("--profile/--profile-prefill and --dflash are mutually exclusive "
                          "(the profiled step/chunk loops do not feed the DFlash2 drafter, which "
                          "would desync Model::pos_ from the drafter's own injected-row count)");
+  }
+  // ---- tensor parallel (docs/tp.md 9.1) --------------------------------------------------------
+  if (a.tp != 1 && a.tp != 2) throw CliUsageError("--tp must be 1 or 2");
+  if (a.tp == 1 && a.tp_options_given) {
+    throw CliUsageError("--tp-mode/--tp-devices/--tp-rank/--tp-ar-* need --tp 2");
+  }
+  if (a.tp == 2) {
+    if (a.tp_mode != "real" && a.tp_mode != "emulate" && a.tp_mode != "noop") {
+      throw CliUsageError("--tp-mode must be 'real', 'emulate' or 'noop'");
+    }
+    if (tp_rank_given && a.tp_mode != "noop") throw CliUsageError("--tp-rank needs --tp-mode noop");
+    if (a.tp_rank < 0 || a.tp_rank > 1) throw CliUsageError("--tp-rank must be 0 or 1");
+    if (a.tp_ar_timeout_ms < 10 || a.tp_ar_timeout_ms > 1500) {
+      throw CliUsageError("--tp-ar-timeout-ms must be in [10, 1500] (the Windows TDR limit is 2 s)");
+    }
+    if (a.tp_ar_nb < 1 || a.tp_ar_nb > 64 || a.tp_ar_nb_large < 1 || a.tp_ar_nb_large > 64) {
+      throw CliUsageError("--tp-ar-nb and --tp-ar-nb-large must be in [1, 64]");
+    }
+    // Permanent in v1 (docs/tp.md 1.2): profiling under tensor parallelism.
+    if (a.profile || a.profile_prefill) {
+      throw CliUsageError("--profile/--profile-prefill are not supported with --tp 2 (docs/tp.md 1.2)");
+    }
+    // Staged rejections (docs/tp.md 9.1) -- each is removed by the phase that implements it.
+    if (a.tp_mode == "real") {
+      throw CliUsageError("--tp 2 --tp-mode real (two GPUs) is not implemented yet (docs/tp.md P4); use "
+                           "--tp-mode emulate");
+    }
+    if (a.mtp > 0) throw CliUsageError("--mtp is not supported with --tp 2 yet (docs/tp.md P5)");
+    if (!a.dflash.empty()) throw CliUsageError("--dflash is not supported with --tp 2 yet (docs/tp.md P5)");
+    if (a.vision == "on") throw CliUsageError("--vision on is not supported with --tp 2 yet (docs/tp.md P5)");
+    if (!a.image_paths.empty()) throw CliUsageError("--image is not supported with --tp 2 yet (docs/tp.md P5)");
   }
   return a;
 }

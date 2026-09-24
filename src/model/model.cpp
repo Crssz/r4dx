@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -31,12 +33,14 @@ namespace r4dx::model {
 
 namespace {
 
-// ---- tensor parallel lockstep fingerprints (docs/tp.md 6.2 H1) ----------------------------------
-// RunChunk's entry check: {kind, T, pos_, FNV-1a of the tokens}. `kind` carries the call's own
-// mode bits too (prefill path, logits wanted, greedy), because each mode issues a different
-// sequence of collectives after the layers -- two ranks that agree on the tokens but not on the
+// ---- tensor parallel lockstep fingerprints (docs/tp.md 6.2 H1, H2) ------------------------------
+// RunChunk's / VerifyWindow's entry check: {kind, T, pos_, FNV-1a of the tokens}. `kind` carries
+// the call's own mode bits too -- RunChunk: 1 prefill path, 2 logits wanted, 4 greedy, 8 row
+// summary; VerifyWindow: 1 full logits out, 2 row summaries -- because each mode issues a different
+// sequence of collectives after the layers, and two ranks that agree on the tokens but not on the
 // mode would otherwise only find out at a mismatched all-gather.
 constexpr uint64_t kLockstepRunChunk = 0x52554e4300000000ull;  // "RUNC"
+constexpr uint64_t kLockstepVerify = 0x5645524900000000ull;    // "VERI"
 
 uint64_t Fnv1a64(const std::vector<int32_t>& tokens) {
   uint64_t h = 0xcbf29ce484222325ull;
@@ -356,9 +360,12 @@ Model Model::Load(const ModelOptions& opts) {
     m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.draft_window_));
   }
   // Tensor parallel (docs/tp.md 4.4): one {local index, value} pair per row that can be argmaxed at
-  // once -- a plain decode row or a whole verify window.
+  // once -- a plain decode row or a whole verify window -- and this rank's own row-summary
+  // workspace (docs/tp.md 2.7), allocated here with the rest of the load-time scratch rather than
+  // at the first sampled row, so no sampled path ever allocates inside a collective (6.3.7).
   if (m.comm_ != nullptr) {
     m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(2 * m.draft_window_));
+    m.topk_lse_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
   }
 
   // Sampled-decode row summaries (docs/sampling.md section 8), sized for the widest thing that can
@@ -514,6 +521,11 @@ void Model::Reset() {
 
   pos_ = 0;
   started_ = false;
+  // Every call resets the arena before it returns, so this is a no-op after a normal call; after a
+  // call that THREW mid-layer (a tensor-parallel abort, docs/tp.md 2.4, or any other exception) it
+  // drops the dead call's scratch, so the next sequence starts from the same clean arena offset a
+  // fresh Model does.
+  arena_.Reset();
 
   // 3-axis mrope state (docs/vision.md): the delta and the spliced spans describe the CONVERSATION,
   // not the KV bytes, so unlike the caches above they cannot be left to self-correct by position
@@ -622,11 +634,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // same mode at the same position, and the group must be healthy, before this chunk's all-reduces
   // are enqueued. The device is idle here (the previous call ended synchronized).
   if (comm_ != nullptr) {
-    if (summary_out != nullptr) {
-      throw std::logic_error("Model::RunChunk: row summaries under tensor parallelism are P2b");
-    }
     const uint64_t kind = kLockstepRunChunk | (is_prefill_path ? 1u : 0u) |
-                          (want_logits ? 2u : 0u) | (greedy_token_out != nullptr ? 4u : 0u);
+                          (want_logits ? 2u : 0u) | (greedy_token_out != nullptr ? 4u : 0u) |
+                          (summary_out != nullptr ? 8u : 0u);
     const uint64_t fingerprint[4] = {kind, static_cast<uint64_t>(T), static_cast<uint64_t>(pos_),
                                      Fnv1a64(token_ids)};
     comm_->CheckLockstep(fingerprint);
@@ -881,11 +891,16 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
   std::vector<float> logits;
   if (want_logits && comm_ != nullptr) {
-    // Tensor parallel, H3 (docs/tp.md 6.2, 7.3, 7.5): merge the vocab shards on the host -- the
-    // greedy pair (8 B per rank), or the full row gathered in global id order. Either way every rank
-    // ends with the same answer.
+    // Tensor parallel, H3 (docs/tp.md 6.2, 7.3-7.5): merge the vocab shards on the host -- the
+    // greedy pair (8 B per rank), the row summary (536 B per rank), or the full row gathered in
+    // global id order. Either way every rank ends with the same answer.
     if (greedy_token_out != nullptr) {
       *greedy_token_out = MergeGreedyPair(argmax_pair_dev_.data());
+    } else if (summary_out != nullptr) {
+      FetchRowSummaries(/*rows=*/1, summary_out->inv_temperature, round_summaries_);
+      std::vector<tp::ArgmaxPair> no_pairs;
+      MergeShardResults(no_pairs, &round_summaries_);
+      *summary_out->out = round_summaries_[0];
     } else {
       logits.resize(static_cast<size_t>(cfg.vocab_size));
       GatherVocabRow(logits_dev_.data(), logits.data());
@@ -990,6 +1005,14 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
                                               const std::function<void()>& on_chunk_captured,
                                               std::vector<int32_t>* rope_rows_out) {
   if (token_ids.empty()) throw std::runtime_error("Model::PrefillMultimodal: token_ids is empty");
+  // SpliceImageEmbeddings copies device to device; host-resident rows (TpModel's ImageRows) get
+  // their H2D splice in docs/tp.md P5. Until then refuse them rather than D2D from a host pointer.
+  for (const ImageSpan& sp : images) {
+    if (sp.embeds_on_host) {
+      throw std::invalid_argument("Model::PrefillMultimodal: host-resident image rows (ImageSpan::embeds_on_host) "
+                                  "are not supported yet (docs/tp.md P5); pass device rows");
+    }
+  }
   if (images.empty() && !mrope_active_) {
     // Text-only, and nothing has ever diverged -- the pre-vision path, byte for byte. The rows a
     // diagnostic caller asked for are simply the sequence indices on all three axes.
@@ -1158,7 +1181,9 @@ float Model::SummaryInvTemperature(const kernels::SampleParams& params) {
 
 void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature) {
   if (rows <= 0) return;
-  const int64_t vocab = container_.Config().vocab_size;
+  // The device rows are this rank's [vocab_local_] shard (docs/tp.md 7.2's rule); at TP=1
+  // vocab_local_ == Config().vocab_size.
+  const int64_t vocab = vocab_local_;
   const int64_t capacity = static_cast<int64_t>(summary_lse_dev_.size());
   if (rows > capacity) {
     throw std::runtime_error("Model::LaunchRowSummaries: rows (" + std::to_string(rows) +
@@ -1175,8 +1200,23 @@ void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_
   // wait for call n's merge kernel, which is exactly the serialisation that scratch needs. A K=16
   // MTP window (17 rows) is the only shape that needs more than one call today.
   constexpr int64_t kMaxRowsPerCall = 8;
+  if (comm_ != nullptr && topk_lse_ws_.empty()) {
+    throw std::logic_error("Model::LaunchRowSummaries: tensor-parallel rank has no topk_lse workspace");
+  }
   for (int64_t off = 0; off < rows; off += kMaxRowsPerCall) {
     const int64_t n = std::min(kMaxRowsPerCall, rows - off);
+    if (comm_ != nullptr) {
+      // Tensor parallel (docs/tp.md 2.7): this rank's own workspace, never the kernels' module
+      // scratch -- under emulation the other rank summarizes concurrently on the same device.
+      r4dx_topk_lse_f32_ws(reinterpret_cast<int64_t>(logits_dev + off * vocab),
+                           reinterpret_cast<int64_t>(summary_ids_dev_.data() + off * R4DX_TOPK_LSE_K),
+                           reinterpret_cast<int64_t>(summary_vals_dev_.data() + off * R4DX_TOPK_LSE_K),
+                           reinterpret_cast<int64_t>(summary_lse_dev_.data() + off),
+                           static_cast<int>(n), vocab, inv_temperature,
+                           reinterpret_cast<int64_t>(stream_.get()),
+                           reinterpret_cast<int64_t>(topk_lse_ws_.data()));
+      continue;
+    }
     r4dx_topk_lse_f32(reinterpret_cast<int64_t>(logits_dev + off * vocab),
                        reinterpret_cast<int64_t>(summary_ids_dev_.data() + off * R4DX_TOPK_LSE_K),
                        reinterpret_cast<int64_t>(summary_vals_dev_.data() + off * R4DX_TOPK_LSE_K),
@@ -1190,7 +1230,9 @@ void Model::FetchRowSummaries(int64_t rows, float inv_temperature,
                                std::vector<kernels::RowSummary>& out) {
   out.clear();
   if (rows <= 0) return;
-  const int64_t vocab = container_.Config().vocab_size;
+  // The width the device summarized: this rank's shard under TP (ids are LOCAL until
+  // MergeShardResults makes the merged summary global), the whole vocabulary at TP=1.
+  const int64_t vocab = vocab_local_;
   const size_t k_total = static_cast<size_t>(rows) * R4DX_TOPK_LSE_K;
   summary_ids_host_.resize(k_total);
   summary_vals_host_.resize(k_total);
@@ -1242,7 +1284,10 @@ int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& 
     // nothing, and a caller alternating the two keeps one generator stream.
     return DecodeStepGreedy(token_id);
   }
-  RequireNotTp("DecodeStepSampled (sampled decode, docs/tp.md 7.4: P2b)");
+  // Tensor parallel (docs/tp.md 7.4): the summary RunChunk returns is already the MERGED full-row
+  // summary, the full-logits paths below gather the full row (GatherVocabRow), and the one draw `u`
+  // comes from an rng every rank holds an identical copy of (TpModel, 2.3) -- so every rank makes
+  // the same fallback decision and emits the same token.
   if (inv_t == 0.0f) {
     // Degenerate temperature (see SummaryInvTemperature): no device summary, full-vocab path. Still
     // exactly one draw, still the canonical sampler, so the emitted token is the same as any other
@@ -1266,7 +1311,13 @@ int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& 
   ++sampled_fallback_rows_;
   const int64_t vocab = container_.Config().vocab_size;
   sampled_row_scratch_.resize(static_cast<size_t>(vocab));
-  logits_dev_.CopyToHost(sampled_row_scratch_.data(), static_cast<size_t>(vocab));
+  if (comm_ != nullptr) {
+    // Tensor parallel, H5 (docs/tp.md 7.4 "unresolved row"): D2H this rank's shard and gather the
+    // full row in global id order; SampleCanonical over it with the SAME u.
+    GatherVocabRow(logits_dev_.data(), sampled_row_scratch_.data());
+  } else {
+    logits_dev_.CopyToHost(sampled_row_scratch_.data(), static_cast<size_t>(vocab));
+  }
   return kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, params, u);
 }
 
@@ -1556,7 +1607,6 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                                           std::vector<float>* logits_out,
                                           std::vector<kernels::RowSummary>* summaries_out,
                                           float summary_inv_temperature) {
-  RequireNotTp("VerifyWindow (speculative verify, docs/tp.md 7.6: P2b)");
   // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
   // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
   // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
@@ -1585,6 +1635,17 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   if (T > draft_window_) {
     throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
                               std::to_string(draft_window_) + "] (DraftWindow())");
+  }
+  // Tensor parallel, H2 (docs/tp.md 6.2): every rank must be about to verify the same window in the
+  // same mode at the same position, and the group must be healthy, before this window's all-reduces
+  // are enqueued. The device is idle here (the previous call ended synchronized).
+  if (comm_ != nullptr) {
+    const uint64_t kind =
+        kLockstepVerify | (logits_out != nullptr ? 1u : 0u) | (summaries_out != nullptr ? 2u : 0u);
+    const uint64_t fingerprint[4] = {kind, static_cast<uint64_t>(T), static_cast<uint64_t>(pos_),
+                                     Fnv1a64(candidates)};
+    comm_->CheckLockstep(fingerprint);
+    comm_->CheckHealthy();
   }
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
@@ -1696,6 +1757,15 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
   head.Forward(stream_, arena_, cur, verify_logits_dev_.data(), T);
   for (int64_t t = 0; t < T; ++t) {
+    if (comm_ != nullptr) {
+      // Tensor parallel (docs/tp.md 7.6): argmax this rank's [vocab_local_] shard of row t, keeping
+      // the winning value; the host merges the per-rank pairs below.
+      r4dx_argmax_val_f32(reinterpret_cast<int64_t>(verify_logits_dev_.data() + t * vocab_local_),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 2 * t),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 2 * t + 1),
+                           vocab_local_, reinterpret_cast<int64_t>(stream_.get()));
+      continue;
+    }
     r4dx_argmax_f32(
         reinterpret_cast<int64_t>(verify_logits_dev_.data() + t * cfg.vocab_size),
         reinterpret_cast<int64_t>(verify_argmax_dev_.data() + t), cfg.vocab_size,
@@ -1715,6 +1785,28 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   stream_.Synchronize();  // same hazard class as RunChunk's own D2H -- see that method's comment
 
   std::vector<int32_t> preds(static_cast<size_t>(T));
+  if (comm_ != nullptr) {
+    // Tensor parallel, H4 (docs/tp.md 6.2, 7.6): the T greedy pairs and (sampled) the T row
+    // summaries of this rank's shard, merged across ranks in ONE host all-gather -- after which
+    // `preds` and the summaries are global and identical on every rank, so the unchanged walk in
+    // VerifyAndResolveRound runs identically everywhere.
+    std::vector<tp::ArgmaxPair> pairs(static_cast<size_t>(T));
+    R4DX_HIP_CHECK(hipMemcpy(pairs.data(), argmax_pair_dev_.data(), pairs.size() * sizeof(tp::ArgmaxPair),
+                             hipMemcpyDeviceToHost));
+    if (summaries_out != nullptr) FetchRowSummaries(T, summary_inv_temperature, *summaries_out);
+    MergeShardResults(pairs, summaries_out);
+    for (int64_t t = 0; t < T; ++t) preds[static_cast<size_t>(t)] = pairs[static_cast<size_t>(t)].idx;
+    if (logits_out != nullptr) {
+      // The full [T, vocab_size] rows in global id order: one gather per row (T x 496,640 B per
+      // rank). A production path -- VerifyAndResolveRound asks for it on every sampled round below
+      // kMinSummaryTemperature.
+      logits_out->resize(static_cast<size_t>(T * cfg.vocab_size));
+      for (int64_t t = 0; t < T; ++t) {
+        GatherVocabRow(verify_logits_dev_.data() + t * vocab_local_, logits_out->data() + t * cfg.vocab_size);
+      }
+    }
+    return preds;
+  }
   verify_argmax_dev_.CopyToHost(preds.data(), preds.size());
   if (logits_out != nullptr) {
     logits_out->resize(static_cast<size_t>(T * cfg.vocab_size));
@@ -1727,7 +1819,6 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 }
 
 void Model::ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const {
-  RequireNotTp("ReadVerifyLogitsRow (speculative verify, docs/tp.md 7.5: P2b)");
   if (draft_window_ <= 1) {
     throw std::runtime_error(
         "Model::ReadVerifyLogitsRow: this Model was not sized for speculative verification");
@@ -1738,6 +1829,13 @@ void Model::ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const {
   }
   const int64_t vocab = container_.Config().vocab_size;
   out.resize(static_cast<size_t>(vocab));
+  if (comm_ != nullptr) {
+    // Tensor parallel, H5 (docs/tp.md 7.5): this rank's [vocab_local_] shard of row `row`, gathered
+    // into the full row in global id order. Collective: every rank reads the same row (the caller's
+    // decision comes from merged, replicated values -- SampleVerifyRow's unresolved summary).
+    GatherVocabRow(verify_logits_dev_.data() + row * vocab_local_, out.data());
+    return;
+  }
   // Plain blocking D2H of ONE row out of the [draft_window_, vocab] verify buffer. Safe without a
   // sync of its own: VerifyWindow ends with stream_.Synchronize() and nothing between it and this
   // call (the host-side acceptance walk) enqueues device work -- the same "device is idle here"
@@ -1801,7 +1899,8 @@ std::vector<int32_t> Model::VerifyAndResolveRound(int32_t anchor,
 }
 
 void Model::CommitVerifiedWindow(int64_t num_committed) {
-  RequireNotTp("CommitVerifiedWindow (speculative verify, docs/tp.md 7.6: P2b)");
+  // Tensor parallel (docs/tp.md 7.6): no collective here -- every rank commits the same count,
+  // computed from the merged (replicated) verify results.
   if (draft_window_ <= 1) {
     throw std::runtime_error(
         "Model::CommitVerifiedWindow: this Model was not sized for speculative verification");
@@ -2037,7 +2136,7 @@ std::vector<uint16_t> Model::DebugSeedHiddenBf16() const {
 
 // ---- tensor parallel (docs/tp.md 7.2-7.5) -------------------------------------------------------
 
-void Model::GatherVocabRow(const float* shard_row_dev, float* full_host) {
+void Model::GatherVocabRow(const float* shard_row_dev, float* full_host) const {
   // Plain (blocking, null-stream) D2H: the caller has synchronized stream_, the same rule every
   // other readback in this file follows. Staged in a separate vector rather than written straight
   // into this rank's slot of `full_host`, so the all-gather's source and destination never alias.
@@ -2056,6 +2155,84 @@ int32_t Model::MergeGreedyPair(const int32_t* pair_dev) {
   std::array<tp::ArgmaxPair, 2> all{};              // Model::Load allows world <= 2
   comm_->HostAllGather(&mine, sizeof(mine), all.data());
   return tp::MergeArgmax(all.data(), comm_->World());
+}
+
+void Model::MergeShardResults(std::vector<tp::ArgmaxPair>& pairs,
+                              std::vector<kernels::RowSummary>* summaries) {
+  static_assert(sizeof(tp::ArgmaxPair) == 8, "8 B per greedy row (docs/tp.md 7.3)");
+  static_assert(std::is_trivially_copyable_v<kernels::RowSummary>,
+                "row summaries cross the host exchange as raw bytes (same process, same layout)");
+  const int world = comm_->World();
+  const size_t n_pairs = pairs.size();
+  const size_t n_sums = summaries != nullptr ? summaries->size() : 0;
+  // Local -> global ids first (docs/tp.md 7.3, 7.4), so the merges below see global ids only.
+  const int32_t offset = static_cast<int32_t>(vocab_offset_);
+  for (tp::ArgmaxPair& p : pairs) p.idx += offset;
+  for (size_t r = 0; r < n_sums; ++r) {
+    kernels::RowSummary& s = (*summaries)[r];
+    for (int j = 0; j < s.k; ++j) s.ids[j] += offset;
+  }
+  // One rendezvous for everything: [pairs][summaries] per rank, rank order.
+  const size_t per_rank = n_pairs * sizeof(tp::ArgmaxPair) + n_sums * sizeof(kernels::RowSummary);
+  std::vector<uint8_t> mine(per_rank);
+  if (n_pairs > 0) std::memcpy(mine.data(), pairs.data(), n_pairs * sizeof(tp::ArgmaxPair));
+  if (n_sums > 0) {
+    std::memcpy(mine.data() + n_pairs * sizeof(tp::ArgmaxPair), summaries->data(),
+                n_sums * sizeof(kernels::RowSummary));
+  }
+  merge_pack_host_.resize(per_rank * static_cast<size_t>(world));
+  comm_->HostAllGather(mine.data(), per_rank, merge_pack_host_.data());
+
+  std::vector<tp::ArgmaxPair> row_pairs(static_cast<size_t>(world));
+  for (size_t t = 0; t < n_pairs; ++t) {
+    for (int r = 0; r < world; ++r) {
+      std::memcpy(&row_pairs[static_cast<size_t>(r)],
+                  merge_pack_host_.data() + static_cast<size_t>(r) * per_rank + t * sizeof(tp::ArgmaxPair),
+                  sizeof(tp::ArgmaxPair));
+    }
+    pairs[t].idx = tp::MergeArgmax(row_pairs.data(), world);
+    pairs[t].val = 0.0f;  // the merged value is not needed; only the token id is
+  }
+  std::vector<kernels::RowSummary> row_sums(static_cast<size_t>(world));
+  const int64_t global_vocab = container_.Config().vocab_size;
+  for (size_t t = 0; t < n_sums; ++t) {
+    for (int r = 0; r < world; ++r) {
+      std::memcpy(&row_sums[static_cast<size_t>(r)],
+                  merge_pack_host_.data() + static_cast<size_t>(r) * per_rank +
+                      n_pairs * sizeof(tp::ArgmaxPair) + t * sizeof(kernels::RowSummary),
+                  sizeof(kernels::RowSummary));
+    }
+    (*summaries)[t] = tp::MergeRowSummaries(row_sums.data(), world, global_vocab);
+  }
+}
+
+void Model::TpWarmup() {
+  if (comm_ == nullptr) {
+    throw std::logic_error("Model::TpWarmup: only a tensor-parallel rank (ModelOptions::tp.world > 1) warms up");
+  }
+  if (gdn_control_.Frozen()) throw std::logic_error("Model::TpWarmup: called twice");
+  // Every control-array key one sequence can ever ask for (docs/tp.md 2.7): cu for every chunk /
+  // window length up to max_chunk_, and the one (slot, window) pair every GDN layer shares -- every
+  // GdnStateManager is built with max_seqs 1 and the same max_decode_window (Load above).
+  int32_t slot = 1;
+  int64_t window = draft_window_;
+  for (const auto& gs : gdn_states_) {
+    if (gs) {
+      slot = gs->SlotForSeq(0);
+      window = gs->MaxDecodeWindow();
+      break;
+    }
+  }
+  gdn_control_.Prewarm(max_chunk_, slot, window);
+  // The real paths once, through the public methods (2.9 step 9): a full 64-row prefill chunk (the
+  // channel-1 all-reduce size) and a greedy decode step (channel 0). Fixed ids 0..63: the warm-up
+  // is a lockstep collective, so every rank must feed the same tokens.
+  std::vector<int32_t> ids(static_cast<size_t>(max_chunk_));
+  for (int64_t i = 0; i < max_chunk_; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+  (void)Prefill(ids);
+  (void)DecodeStepGreedy(0);
+  Reset();
+  gdn_control_.Freeze();
 }
 
 void Model::RequireNotTp(const char* what) const {

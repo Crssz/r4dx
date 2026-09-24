@@ -28,6 +28,9 @@ struct ImagePlaceholderSpan {
   int64_t tokens = 0;  // filled in by ExpandImagePlaceholders; ignored on input
   GridThw grid;
   const uint16_t* embeds = nullptr;
+  // docs/tp.md 8.3: true => `embeds` is host memory (a tensor-parallel ImageRows), carried through
+  // to Model::ImageSpan::embeds_on_host. False at TP=1 (device rows) -- and everywhere until P5.
+  bool embeds_on_host = false;
 };
 
 struct ExpandedImagePrompt {

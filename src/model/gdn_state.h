@@ -11,6 +11,8 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -135,6 +137,7 @@ class GdnControlCache {
   }
   const uint8_t* HasInitTrue() {
     if (has_init_true_.empty()) {
+      if (frozen_) Miss("HasInitTrue", 0);
       has_init_true_ = core::DeviceBuffer<uint8_t>(1);
       const uint8_t v = 1;
       has_init_true_.CopyFromHost(&v, 1);
@@ -142,12 +145,35 @@ class GdnControlCache {
     return has_init_true_.data();
   }
 
+  // ---- tensor parallel (docs/tp.md 2.7, 2.9 step 9) -------------------------------------------
+  // A first use of a key costs a hipMalloc and a blocking hipMemcpy -- both implicit device syncs,
+  // which must never happen inside a tensor-parallel collective command (docs/tp.md 6.3.7 L4). The
+  // TP warm-up (Model::TpWarmup) therefore uploads every key a single sequence can ever ask for
+  // BEFORE it runs, and freezes the cache after it: CuPair(1..max_T), CacheIdx(slot),
+  // SidxBase(slot, window) and HasInitTrue(). After Freeze() a miss throws std::logic_error instead
+  // of allocating. Never called at TP=1, where the cache stays lazy exactly as before.
+  void Prewarm(int64_t max_T, int32_t slot, int64_t window) {
+    for (int64_t T = 1; T <= max_T; ++T) (void)CuPair(T);
+    (void)CacheIdx(slot);
+    (void)SidxBase(slot, window);
+    (void)HasInitTrue();
+  }
+  void Freeze() { frozen_ = true; }
+  bool Frozen() const { return frozen_; }
+
  private:
+  [[noreturn]] static void Miss(const char* what, int64_t key) {
+    throw std::logic_error(std::string("GdnControlCache::") + what + ": key " + std::to_string(key) +
+                           " was not prewarmed before Freeze() (docs/tp.md 2.7: a lazy hipMalloc "
+                           "inside a tensor-parallel collective command)");
+  }
+
   template <typename MakeFn>
   const int32_t* Get(std::unordered_map<int64_t, core::DeviceBuffer<int32_t>>& map, int64_t key,
                       MakeFn make) {
     auto it = map.find(key);
     if (it != map.end()) return it->second.data();
+    if (frozen_) Miss("Get", key);
     std::vector<int32_t> host = make();
     core::DeviceBuffer<int32_t> buf(host.size());
     buf.CopyFromHost(host);
@@ -160,6 +186,7 @@ class GdnControlCache {
   std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> sidx_;
   std::unordered_map<int64_t, core::DeviceBuffer<int32_t>> sidx_base_;
   core::DeviceBuffer<uint8_t> has_init_true_;
+  bool frozen_ = false;
 };
 
 }  // namespace r4dx::model

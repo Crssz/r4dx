@@ -52,6 +52,20 @@ class HostExchange {
   // TpAbortedError if the group is (or becomes) aborted while waiting, TpTimeoutError (after
   // aborting the group) if a peer does not arrive within the timeout.
   void AllGather(int rank, const void* mine, size_t bytes, void* out) {
+    AllGatherFor(rank, mine, bytes, out, timeout_);
+  }
+
+  void Barrier(int rank) { AllGather(rank, nullptr, 0, nullptr); }
+
+  // The same with this call's own wait bound instead of the constructor's. EmulatedComm's
+  // all-reduce barrier waits at most the all-reduce spin timeout, exactly as long as the device
+  // kernel it stands in for would spin (docs/tp.md 6.5; Appendix B N45).
+  void BarrierFor(int rank, std::chrono::milliseconds timeout) {
+    AllGatherFor(rank, nullptr, 0, nullptr, timeout);
+  }
+
+  void AllGatherFor(int rank, const void* mine, size_t bytes, void* out,
+                    std::chrono::milliseconds timeout) {
     CheckRank(rank);
     PerRank& me = ranks_[rank];
     Bump(me);
@@ -82,10 +96,10 @@ class HostExchange {
         if ((it & 63) != 63) continue;  // read the clock every 64 polls while spinning
       }
       const auto waited = std::chrono::steady_clock::now() - t0;
-      if (waited >= timeout_) {
+      if (waited >= timeout) {
         const std::string why =
             "tp: host exchange timed out: rank " + std::to_string(rank) + " waited " +
-            std::to_string(timeout_.count()) + " ms at call " + std::to_string(g) + " for rank " +
+            std::to_string(timeout.count()) + " ms at call " + std::to_string(g) + " for rank " +
             std::to_string(q);
         Abort(why);
         Bump(me);
@@ -112,8 +126,6 @@ class HostExchange {
     }
     Bump(me);
   }
-
-  void Barrier(int rank) { AllGather(rank, nullptr, 0, nullptr); }
 
   // Poisons the exchange: every current and future waiter throws TpAbortedError until Reset().
   // The first reason is kept (the flag is set inside the same critical section that tests it).

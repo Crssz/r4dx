@@ -17,8 +17,9 @@
 
 namespace r4dx::model::tp {
 
-// Defined in tp_comm_host_mailbox.cpp.
+// Defined in tp_comm_host_mailbox.cpp / tp_comm_emulated.cpp.
 std::unique_ptr<TpEndpoint> MakeHostMailboxComm(TpGroup* group, int rank, std::atomic<uint64_t>* heartbeat);
+std::unique_ptr<TpEndpoint> MakeEmulatedComm(TpGroup* group, int rank, std::atomic<uint64_t>* heartbeat);
 
 namespace {
 
@@ -80,6 +81,10 @@ bool SyncWithWatchdog(hipStream_t stream, std::chrono::milliseconds limit) {
     hipEvent_t e;
     ~EventGuard() { (void)hipEventDestroy(e); }
   } guard{ev};
+  return SyncWithWatchdogEvent(stream, ev, limit);
+}
+
+bool SyncWithWatchdogEvent(hipStream_t stream, hipEvent_t ev, std::chrono::milliseconds limit) {
   R4DX_HIP_CHECK(hipEventRecord(ev, stream));
   const auto t0 = std::chrono::steady_clock::now();
   for (uint32_t spins = 0;; ++spins) {
@@ -157,11 +162,9 @@ double CheckWallClockRate() {
 
 std::unique_ptr<TpGroup> TpGroup::Create(Mode mode, int world, const Geometry& geometry, int ar_timeout_ms,
                                          uint32_t seq_base) {
-  if (mode == Mode::kEmulate) {
-    throw core::TpUnsupportedError("tp: TpGroup emulate mode is not implemented yet (docs/tp.md P2b)");
-  }
   if (world != 2) {
-    throw std::invalid_argument("tp: TpGroup real mode needs world == 2, got " + std::to_string(world));
+    throw std::invalid_argument(std::string("tp: TpGroup ") + (mode == Mode::kReal ? "real" : "emulate") +
+                                " mode needs world == 2, got " + std::to_string(world));
   }
   return std::unique_ptr<TpGroup>(new TpGroup(mode, world, geometry, ar_timeout_ms, seq_base));
 }
@@ -174,7 +177,12 @@ TpGroup::TpGroup(Mode mode, int world, const Geometry& geometry, int ar_timeout_
       layout_(MailboxLayout::Make(geometry.nb_small, geometry.nb_large)),
       exchange_(world),
       endpoints_(static_cast<size_t>(world), nullptr),
-      seq_base_(seq_base) {}
+      seq_base_(seq_base) {
+  for (int r = 0; r < 2; ++r) {
+    emu_abort_[r].store(0, std::memory_order_relaxed);
+    for (int p = 0; p < 2; ++p) emu_xchg_[r][p].store(nullptr, std::memory_order_relaxed);
+  }
+}
 
 TpGroup::~TpGroup() {
   if (host_ == nullptr) return;
@@ -194,6 +202,7 @@ TpGroup::~TpGroup() {
 }
 
 void TpGroup::AllocateMailbox() {
+  if (mode_ != Mode::kReal) throw std::logic_error("tp: TpGroup::AllocateMailbox: emulate mode has no mailbox");
   if (host_ != nullptr) throw std::logic_error("tp: TpGroup::AllocateMailbox called twice");
   void* h = nullptr;
   R4DX_HIP_CHECK(hipHostMalloc(&h, layout_.bytes, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable));
@@ -202,6 +211,14 @@ void TpGroup::AllocateMailbox() {
 }
 
 void TpGroup::ResetMailbox(uint32_t seq_base) {
+  if (mode_ == Mode::kEmulate) {
+    // No shared region: the emulated ABORT words are the only rank-visible state to clear. The
+    // exchange buffers need no reset here -- each endpoint zero-fills its own in ResetCounters
+    // (docs/tp.md 2.5 step 6).
+    for (auto& w : emu_abort_) w.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return;
+  }
   if (host_ == nullptr) throw std::logic_error("tp: TpGroup mailbox not allocated");
   std::memset(host_, 0, layout_.bytes);
   for (const MailboxLayout::Channel& ch : layout_.ch) {
@@ -219,6 +236,7 @@ std::unique_ptr<TpEndpoint> TpGroup::CreateEndpoint(int rank, std::atomic<uint64
     throw std::invalid_argument("tp: CreateEndpoint rank " + std::to_string(rank) + " outside [0, " +
                                 std::to_string(world_) + ")");
   }
+  if (mode_ == Mode::kEmulate) return MakeEmulatedComm(this, rank, heartbeat);
   if (host_ == nullptr) throw std::logic_error("tp: CreateEndpoint before AllocateMailbox");
   return MakeHostMailboxComm(this, rank, heartbeat);
 }
@@ -248,35 +266,39 @@ std::vector<TpEndpoint*> TpGroup::Endpoints() {
 
 void TpGroup::Recover(const RankRunner& run) {
   if (!run.run_all || !run.run_one) throw std::invalid_argument("tp: Recover needs run_all and run_one");
-  const std::vector<TpEndpoint*> eps = Endpoints();
+  // Every step closure co-owns the state it touches (docs/tp.md Appendix B N53): TpModel's progress
+  // watchdog may give up on a step while a rank is still inside it, and this frame then unwinds.
+  const auto eps = std::make_shared<const std::vector<TpEndpoint*>>(Endpoints());
   for (int r = 0; r < world_; ++r) {
-    if (eps[static_cast<size_t>(r)] == nullptr) {
+    if ((*eps)[static_cast<size_t>(r)] == nullptr) {
       throw core::TpStateError("tp: Recover: rank " + std::to_string(r) + " has no endpoint");
     }
   }
   // 1. every stream the endpoints enqueued on is idle (bounded 30 s; spinning kernels are bounded by
   //    the all-reduce timeout, so this terminates unless a kernel is truly stuck -> TpTimeoutError).
-  run.run_all([&](int r) { eps[static_cast<size_t>(r)]->SyncStreams(); });
+  run.run_all([eps](int r) { (*eps)[static_cast<size_t>(r)]->SyncStreams(); });
   // 2. each rank's VRAM seq counters; 3. a base above every value used, in wrap-safe arithmetic.
-  std::vector<uint32_t> advance(static_cast<size_t>(world_), 0);
-  run.run_all([&](int r) { advance[static_cast<size_t>(r)] = eps[static_cast<size_t>(r)]->SeqAdvance(); });
+  const auto advance = std::make_shared<std::vector<uint32_t>>(static_cast<size_t>(world_), 0u);
+  run.run_all([eps, advance](int r) {
+    (*advance)[static_cast<size_t>(r)] = (*eps)[static_cast<size_t>(r)]->SeqAdvance();
+  });
   const uint32_t old_base = SeqBase();
-  const uint32_t new_base = old_base + *std::max_element(advance.begin(), advance.end()) + 64u;
+  const uint32_t new_base = old_base + *std::max_element(advance->begin(), advance->end()) + 64u;
   // 4. zero the whole region (ABORT words, mirrors, flags, slots), flag lines := new_base (N32):
   //    both GPUs are idle.
-  run.run_one(0, [&] { ResetMailbox(new_base); });
+  run.run_one(0, [this, new_base] { ResetMailbox(new_base); });
   // 5. seq counters := new_base, Status re-initialised, on each rank.
-  run.run_all([&](int r) { eps[static_cast<size_t>(r)]->Rebase(new_base); });
+  run.run_all([eps, new_base](int r) { (*eps)[static_cast<size_t>(r)]->Rebase(new_base); });
   {
     std::lock_guard<std::mutex> lk(mu_);
     seq_base_ = new_base;
   }
   // 6. host-side counters, with no rank inside any comm call.
   exchange_.Reset();
-  run.run_all([&](int r) { eps[static_cast<size_t>(r)]->ResetCounters(); });
+  run.run_all([eps](int r) { (*eps)[static_cast<size_t>(r)]->ResetCounters(); });
   // 7. both ranks agree on the new base and their (zeroed) call counters, then the self-test.
-  run.run_all([&](int r) {
-    TpEndpoint* ep = eps[static_cast<size_t>(r)];
+  run.run_all([eps, new_base](int r) {
+    TpEndpoint* ep = (*eps)[static_cast<size_t>(r)];
     const std::array<uint64_t, 2> calls = ep->CallCounts();
     const uint64_t fp[4] = {kRecoveryTag, new_base, calls[0], calls[1]};
     ep->CheckLockstep(fp);

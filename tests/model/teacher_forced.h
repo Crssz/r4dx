@@ -14,8 +14,12 @@
 // is no row that would read its logits). The engine calls used are exactly the ones a real
 // generation makes for the positions it generates:
 //
-//     logits = Model::Prefill({ids[0]})          -> row 0
-//     logits = Model::DecodeStep(ids[i])         -> row i,  i = 1 .. T-2
+//     logits = TextModel::Prefill({ids[0]})      -> row 0
+//     logits = TextModel::DecodeStep(ids[i])     -> row i,  i = 1 .. T-2
+//
+// through r4dx::model::TextModel (docs/tp.md 2.8): a LocalTextModel -- today's Model, call for
+// call -- at TP=1, or a TpModel under `--tp 2` (each rank computes its vocab shard and the full row
+// comes back gathered, docs/tp.md 7.5).
 //
 // i.e. the same GDN recurrent-update decode kernels, the same paged fp8 KV cache with its
 // calibrated descales, and the same fused quant epilogues the engine uses when it decodes. It is
@@ -64,8 +68,8 @@
 #include <string>
 #include <vector>
 
-#include "model.h"  // also pulls in nlohmann/json.hpp via model_config.h
 #include "r4dx/core/dtype.hpp"
+#include "text_model.h"  // also pulls in nlohmann/json.hpp via model_config.h
 
 namespace r4dx_tf {
 
@@ -270,7 +274,7 @@ struct SegmentOptions {
 
 // Runs the whole pass for one segment on `model`, which it Reset()s first so the segment is always
 // evaluated from a fresh context at position 0.
-inline SegmentResult RunSegment(r4dx::model::Model& model, const Segment& seg,
+inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& seg,
                                  const SegmentOptions& opts) {
   using Clock = std::chrono::steady_clock;
   SegmentResult r;
@@ -390,6 +394,7 @@ inline SegmentResult RunSegment(r4dx::model::Model& model, const Segment& seg,
     meta["clamp_min"] = -1e4;
     meta["engine"] = "r4dx tool_teacher_forced_logprobs";
     meta["path"] = "Prefill(ids[0]) + DecodeStep(ids[1..T-2])";
+    if (model.TpWorld() > 1) meta["tp_world"] = model.TpWorld();  // absent at TP=1: same bytes as before
     meta["mtp"] = 0;
     meta["dflash"] = false;
     meta["wall_seconds"] = r.wall_s;

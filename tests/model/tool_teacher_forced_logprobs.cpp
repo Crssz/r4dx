@@ -39,6 +39,12 @@
 //                         exit 1.
 //   --no-write            run the whole pass and print the checks, write nothing
 //   --quiet               no per-row progress lines
+//   --embed-device-resident {on|off}   text.embed_tokens VRAM mirror (default on, like the CLI)
+//   --tp {1|2}            tensor parallel (docs/tp.md 9.1, 10.4): 1 (default) is the single-device
+//                         Model; 2 runs the pass through r4dx::model::TpModel
+//   --tp-mode {real|emulate|noop}   with --tp 2 (default real; real arrives in docs/tp.md P4)
+//   --tp-devices a[,b]    with --tp 2: process-visible HIP ordinals (default auto, docs/tp.md 9.2)
+//   --tp-rank r           with --tp-mode noop: which shard to load
 //
 // MTP and DFlash2 are unconditionally off (ModelOptions::mtp_draft_k stays 0, dflash_container
 // stays empty): both are speculation strategies for GENERATING, and this tool never generates -- it
@@ -54,9 +60,14 @@
 
 #include <hip/hip_runtime.h>
 
+#include <map>
+#include <memory>
+#include <sstream>
+
 #include "model.h"
 #include "teacher_forced.h"
 #include "test_common.h"
+#include "text_model.h"
 
 using r4dx_test::FileExists;
 using r4dx_test::SkipMissing;
@@ -71,12 +82,36 @@ double VramUsedGiB() {
   return static_cast<double>(total_b - free_b) / (1024.0 * 1024.0 * 1024.0);
 }
 
+// The model's VRAM use summed over its ranks' DEVICES (docs/tp.md 2.8: `Vram()` for the [vram]
+// line). At TP=1 that is one hipMemGetInfo on this thread, i.e. exactly VramUsedGiB(); under
+// --tp-mode emulate both ranks report the same device, which is counted once.
+double ModelVramGiB(const r4dx::model::TextModel& m) {
+  std::map<int, double> per_device;
+  for (const r4dx::model::VramReport& r : m.Vram()) per_device[r.device] = r.used_gib;
+  double sum = 0.0;
+  for (const auto& kv : per_device) sum += kv.second;
+  return sum;
+}
+
+std::vector<int> ParseDevices(const std::string& s) {
+  std::vector<int> d;
+  if (s.empty() || s == "auto") return d;
+  std::stringstream ss(s);
+  std::string item;
+  while (std::getline(ss, item, ',')) d.push_back(std::stoi(item));
+  return d;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string model_path, tokens_path, out_dir, only_segment;
   std::string layout = "w4a16";
   std::string vision = "off";
+  std::string embed_resident = "on";
+  std::string tp_mode = "real", tp_devices = "auto";
+  int tp = 1, tp_rank = 0;
+  bool tp_options_given = false;
   int64_t max_ctx = 8192, layers = -1, check_greedy = 0;
   bool no_write = false, quiet = false;
 
@@ -98,6 +133,11 @@ int main(int argc, char** argv) {
       else if (a == "--check-greedy") check_greedy = std::stoll(next());
       else if (a == "--no-write") no_write = true;
       else if (a == "--quiet") quiet = true;
+      else if (a == "--embed-device-resident") embed_resident = next();
+      else if (a == "--tp") tp = std::stoi(next());
+      else if (a == "--tp-mode") { tp_mode = next(); tp_options_given = true; }
+      else if (a == "--tp-devices") { tp_devices = next(); tp_options_given = true; }
+      else if (a == "--tp-rank") { tp_rank = std::stoi(next()); tp_options_given = true; }
       else {
         std::fprintf(stderr, "unrecognized argument: %s\n", a.c_str());
         return 2;
@@ -107,7 +147,25 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "usage: tool_teacher_forced_logprobs --model <container.r4dx> "
                             "--layout w4a16 --tokens <tokens.json> --out-dir <dir> "
                             "[--segment <name>] [--max-ctx N] [--layers N] [--vision off] "
-                            "[--check-greedy N] [--no-write] [--quiet]\n");
+                            "[--check-greedy N] [--no-write] [--quiet] "
+                            "[--embed-device-resident {on|off}] [--tp {1|2}] "
+                            "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]\n");
+      return 2;
+    }
+    if (embed_resident != "on" && embed_resident != "off") {
+      std::fprintf(stderr, "--embed-device-resident must be 'on' or 'off'\n");
+      return 2;
+    }
+    if (tp != 1 && tp != 2) {
+      std::fprintf(stderr, "--tp must be 1 or 2\n");
+      return 2;
+    }
+    if (tp == 1 && tp_options_given) {
+      std::fprintf(stderr, "--tp-mode/--tp-devices/--tp-rank need --tp 2\n");
+      return 2;
+    }
+    if (tp_mode != "real" && tp_mode != "emulate" && tp_mode != "noop") {
+      std::fprintf(stderr, "--tp-mode must be 'real', 'emulate' or 'noop'\n");
       return 2;
     }
     if (out_dir.empty() && !no_write) {
@@ -131,18 +189,36 @@ int main(int argc, char** argv) {
     opts.vision = vision == "on"     ? ModelOptions::VisionMode::kOn
                   : vision == "auto" ? ModelOptions::VisionMode::kAuto
                                      : ModelOptions::VisionMode::kOff;
+    opts.embed_device_resident = embed_resident != "off";
 
-    const double vram_before = VramUsedGiB();
-    Model model = Model::Load(opts);
-    const double vram_after_load = VramUsedGiB();
+    r4dx::model::TpOptions tpo;
+    tpo.world = tp;
+    if (tp == 2) {
+      tpo.mode = tp_mode == "emulate" ? r4dx::model::TpOptions::Mode::kEmulate
+                 : tp_mode == "noop"  ? r4dx::model::TpOptions::Mode::kNoop
+                                      : r4dx::model::TpOptions::Mode::kReal;
+      tpo.devices = ParseDevices(tp_devices);
+      tpo.noop_rank = tp_rank;
+    }
+
+    // Under --tp 2 this thread is the TpModel facade and makes no HIP call (docs/tp.md 2.1).
+    const double vram_before = tp == 1 ? VramUsedGiB() : 0.0;
+    std::unique_ptr<r4dx::model::TextModel> model_ptr = r4dx::model::LoadTextModel(opts, tpo);
+    r4dx::model::TextModel& model = *model_ptr;
+    const double vram_after_load = ModelVramGiB(model);
     const int64_t vocab = model.Config().vocab_size;
-    std::printf("[model] %s layout=%s layers=%lld/%lld vocab=%lld max_ctx=%lld\n",
+    std::printf("[model] %s layout=%s layers=%lld/%lld vocab=%lld max_ctx=%lld%s\n",
                 model_path.c_str(), layout.c_str(),
-                static_cast<long long>(model.GetContainer().NumLoadedLayers()),
+                static_cast<long long>(model.NumLoadedLayers()),
                 static_cast<long long>(model.Config().num_hidden_layers),
-                static_cast<long long>(vocab), static_cast<long long>(max_ctx));
-    std::printf("[vram]  %.2f GiB after load (delta %.2f GiB)\n", vram_after_load,
-                vram_after_load - vram_before);
+                static_cast<long long>(vocab), static_cast<long long>(max_ctx),
+                tp == 2 ? (" tp=2 mode=" + tp_mode).c_str() : "");
+    if (tp == 1) {
+      std::printf("[vram]  %.2f GiB after load (delta %.2f GiB)\n", vram_after_load,
+                  vram_after_load - vram_before);
+    } else {
+      std::printf("[vram]  %.2f GiB after load (summed over the ranks' devices)\n", vram_after_load);
+    }
 
     int64_t total_rows = 0, total_mismatches = 0, segments_run = 0;
     double total_wall = 0.0, worst_lse = 0.0, peak_vram = vram_after_load;
@@ -159,7 +235,7 @@ int main(int argc, char** argv) {
       std::printf("[segment] %s: T=%zu tokens -> %zu rows x %lld vocab\n", seg.name.c_str(),
                   seg.token_ids.size(), seg.token_ids.size() - 1, static_cast<long long>(vocab));
       const r4dx_tf::SegmentResult r = r4dx_tf::RunSegment(model, seg, so);
-      peak_vram = std::max(peak_vram, VramUsedGiB());
+      peak_vram = std::max(peak_vram, ModelVramGiB(model));
       total_rows += r.rows;
       total_wall += r.wall_s;
       total_mismatches += r.greedy_mismatches;

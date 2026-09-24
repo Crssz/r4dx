@@ -400,6 +400,78 @@ void TestImageFlag() {
   }
 }
 
+// --tp and --tp-* (docs/tp.md 9.1): defaults are TP=1 and change nothing; every --tp-* flag needs
+// --tp 2; the permanent (--profile*) and staged (P2b: real mode, --mtp, --dflash, --vision on,
+// --image) rejections are usage errors.
+bool TpThrows(std::vector<std::string> extra) {
+  std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi"};
+  storage.insert(storage.end(), extra.begin(), extra.end());
+  auto argv = ToArgv(storage);
+  try {
+    r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+  } catch (const r4dx::cli::CliUsageError&) {
+    return true;
+  }
+  return false;
+}
+
+void TestTpFlags() {
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.tp == 1);
+    CHECK(!a.tp_options_given);
+    CHECK(a.tp_devices.empty());
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model",   "m.r4dx", "--layout", "w4a16",
+                                         "--prompt", "hi",        "--tp",   "2",        "--tp-mode",
+                                         "emulate",  "--tp-devices", "0", "--tp-ar-timeout-ms", "700",
+                                         "--tp-ar-nb", "8", "--tp-ar-nb-large", "16"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.tp == 2);
+    CHECK(a.tp_mode == "emulate");
+    CHECK(a.tp_devices.size() == 1 && a.tp_devices[0] == 0);
+    CHECK(a.tp_ar_timeout_ms == 700);
+    CHECK(a.tp_ar_nb == 8);
+    CHECK(a.tp_ar_nb_large == 16);
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout",  "w4a16", "--prompt",
+                                         "hi",       "--tp",    "2",      "--tp-mode", "noop",  "--tp-rank",
+                                         "1",        "--tp-devices", "1,0"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.tp_mode == "noop");
+    CHECK(a.tp_rank == 1);
+    CHECK(a.tp_devices.size() == 2 && a.tp_devices[0] == 1 && a.tp_devices[1] == 0);
+  }
+  CHECK(TpThrows({"--tp", "3"}));
+  CHECK(TpThrows({"--tp-mode", "emulate"}));  // --tp-* without --tp 2
+  CHECK(TpThrows({"--tp", "1", "--tp-ar-nb", "4"}));
+  CHECK(TpThrows({"--tp", "2"}));  // default --tp-mode real: docs/tp.md P4
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "real"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "bogus"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-rank", "0"}));  // --tp-rank is noop-only
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "noop", "--tp-rank", "2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-ar-timeout-ms", "5"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-ar-timeout-ms", "1501"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-ar-nb", "0"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-ar-nb-large", "65"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-devices", "0,1,2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-devices", "x"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--profile"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--profile-prefill"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "3"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--dflash", "d.r4dx"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--vision", "on"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--image", "a.png"}));
+  CHECK(!TpThrows({"--tp", "2", "--tp-mode", "emulate", "--vision", "auto"}));
+  CHECK(!TpThrows({"--tp", "1"}));
+}
+
 }  // namespace
 
 int main() {
@@ -418,6 +490,7 @@ int main() {
   TestDflashFlags();
   TestVisionFlags();
   TestImageFlag();
+  TestTpFlags();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

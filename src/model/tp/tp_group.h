@@ -1,7 +1,9 @@
 // r4dx::model::tp::TpGroup -- the shared state of one tensor-parallel group (docs/tp.md 6.1, 6.3):
 // the pinned host mailbox both GPUs map, the HostExchange, the session seq base and recovery (2.5).
 // It creates one TpEndpoint (a core::TpComm) per rank; for Mode::kReal that endpoint is the
-// HostMailboxComm of tp_comm_host_mailbox.cpp, the port of tools/tp_bench's flag(drain 3, acq 0).
+// HostMailboxComm of tp_comm_host_mailbox.cpp, the port of tools/tp_bench's flag(drain 3, acq 0);
+// for Mode::kEmulate (both ranks on one device, docs/tp.md 6.5) it is the EmulatedComm of
+// tp_comm_emulated.cpp, and the group has no mailbox -- only the HostExchange and two abort words.
 //
 // Threading (docs/tp.md 2.1): each endpoint is created, used and destroyed on its rank's thread
 // (hipSetDevice first). The group itself is created and destroyed on the facade thread; its
@@ -140,9 +142,18 @@ class TpEndpoint : public core::TpComm {
 };
 
 class HostMailboxComm;
+class EmulatedComm;
+
+// Like SyncWithWatchdog, with a caller-owned marker event (created with hipEventDisableTiming on
+// the stream's device) instead of one created per call -- EmulatedComm synchronizes its stream at
+// every all-reduce (docs/tp.md 6.5), so it keeps one event for its whole life.
+bool SyncWithWatchdogEvent(hipStream_t stream, hipEvent_t ev, std::chrono::milliseconds limit = kStreamWatchdog);
 
 class TpGroup {
  public:
+  // kReal: HostMailboxComm, one rank per GPU through the pinned host mailbox (docs/tp.md 6.3).
+  // kEmulate: EmulatedComm, both ranks on ONE device, a host-synchronized exact add at every
+  // all-reduce (docs/tp.md 6.5) -- no mailbox; the abort words live in the group itself.
   enum class Mode { kReal, kEmulate };
   struct Geometry {
     int nb_small = 4;  // channel 0 (--tp-ar-nb)
@@ -156,9 +167,9 @@ class TpGroup {
     std::function<void(int, const std::function<void()>&)> run_one;
   };
 
-  // docs/tp.md 2.9 step 7. kReal: world must be 2 (1.2: TP > 2 is a non-goal). kEmulate arrives in
-  // P2b and throws core::TpUnsupportedError until then. ar_timeout_ms is clamped to [10, 1500].
-  // seq_base: the first session base (kInitialSeqBase; tests start near the 2^32 wrap).
+  // docs/tp.md 2.9 step 7. world must be 2 in both modes (1.2: TP > 2 is a non-goal).
+  // ar_timeout_ms is clamped to [10, 1500]. seq_base: the first session base (kInitialSeqBase;
+  // tests start near the 2^32 wrap). kEmulate keeps no device seq counters; its base only moves.
   static std::unique_ptr<TpGroup> Create(Mode mode, int world, const Geometry& geometry, int ar_timeout_ms,
                                          uint32_t seq_base = kInitialSeqBase);
   ~TpGroup();
@@ -170,10 +181,11 @@ class TpGroup {
   // does not promise zeroed memory, and a garbage flag "ahead" of the base would be a protocol
   // violation on the first all-reduce.
   void AllocateMailbox();
-  // On rank `rank`'s thread (hipSetDevice done): that rank's endpoint -- its own
+  // On rank `rank`'s thread (hipSetDevice done): that rank's endpoint -- kReal: its own
   // hipHostGetDevicePointer of the region, VRAM seq counters (both channels, set to the session
-  // base) and Status. `heartbeat` (may be null) is bumped at every AllReduceSumBf16 and registered
-  // with the HostExchange (docs/tp.md 2.2 step 6). One endpoint per rank at a time.
+  // base) and Status; kEmulate: its two 640 KiB exchange buffers and its own stream (docs/tp.md
+  // 6.5). `heartbeat` (may be null) is bumped at every AllReduceSumBf16 and registered with the
+  // HostExchange (docs/tp.md 2.2 step 6). One endpoint per rank at a time.
   std::unique_ptr<TpEndpoint> CreateEndpoint(int rank, std::atomic<uint64_t>* heartbeat);
 
   // docs/tp.md 2.5 steps 1-7, with every endpoint registered and no rank inside a comm call
@@ -187,7 +199,7 @@ class TpGroup {
   // must see its peer's unwritten flag as "not yet" (base, one behind): a 0 is "behind" only while
   // the base is below 2^31, and a session base in the upper half -- the 2^32 wrap test, or any
   // recovery after ~2^31 calls -- would read a zeroed flag as ahead of s, a protocol violation
-  // (docs/tp.md Appendix B N32).
+  // (docs/tp.md Appendix B N32). kEmulate has no region: this clears its two abort words only.
   void ResetMailbox(uint32_t seq_base);
 
   Mode GetMode() const { return mode_; }
@@ -203,6 +215,7 @@ class TpGroup {
 
  private:
   friend class HostMailboxComm;
+  friend class EmulatedComm;
   TpGroup(Mode mode, int world, const Geometry& geometry, int ar_timeout_ms, uint32_t seq_base);
   void Register(int rank, TpEndpoint* ep);
   void Unregister(int rank, TpEndpoint* ep) noexcept;
@@ -219,6 +232,12 @@ class TpGroup {
   mutable std::mutex mu_;       // guards endpoints_ and seq_base_
   std::vector<TpEndpoint*> endpoints_;
   uint32_t seq_base_;
+  // kEmulate only (docs/tp.md 6.5): the per-rank abort words the mailbox's ABORT lines hold in real
+  // mode (written only by their own rank, read by every rank), and each rank's two exchange buffers
+  // (xchg[rank][parity], device pointers on the one shared device), published at endpoint creation
+  // so the peer's add can read them.
+  std::atomic<uint32_t> emu_abort_[2] = {};
+  std::atomic<uint16_t*> emu_xchg_[2][2] = {};
 };
 
 }  // namespace r4dx::model::tp

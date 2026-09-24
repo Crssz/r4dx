@@ -17,10 +17,12 @@
 // it holds that rank's weight shard, runs on the rank-local config, all-reduces its three
 // row-parallel outputs per layer through the rank's core::TpComm, and merges every vocab-split
 // lm_head result across ranks itself, so each rank returns exactly what a full Model would (up to
-// the documented numerics, docs/tp.md 1.2). Supported so far (P2a): Prefill, DecodeStep and
-// DecodeStepGreedy. Sampled decode, every speculative-verify entry point (VerifyWindow,
-// CommitVerifiedWindow, ReadVerifyLogitsRow, DecodeStepMtp*, DecodeStepDflash*) and the profiled
-// methods throw core::TpUnsupportedError on a TP rank.
+// the documented numerics, docs/tp.md 1.2). Supported so far (P2b): Prefill, DecodeStep,
+// DecodeStepGreedy, DecodeStepSampled (merged device row summaries, docs/tp.md 7.4) and the
+// speculative-verify primitives VerifyWindow / CommitVerifiedWindow / ReadVerifyLogitsRow (7.6).
+// DecodeStepMtp* and DecodeStepDflash* (their drafters' merges arrive in P5) and the profiled
+// methods (never, docs/tp.md 1.2) throw core::TpUnsupportedError on a TP rank. A rank must run
+// TpWarmup() once after Load and before its first user call (docs/tp.md 2.9 step 9).
 #pragma once
 
 #include <cstdint>
@@ -37,6 +39,7 @@
 #include "dflash_draft.h"
 #include "gdn_state.h"
 #include "model_config.h"
+#include "model_types.h"  // ImageSpan, ImageRows, ProfileEntry, StepProfile (docs/tp.md 2.8)
 #include "mtp_head.h"
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
@@ -48,6 +51,7 @@
 #include "r4dx/core/stream.hpp"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
+#include "tp/tp_vocab.h"   // tp::ArgmaxPair (docs/tp.md 7.3), header-only and HIP-free
 #include "vision_tower.h"  // src/vision: the device-side vision tower (docs/vision.md)
 
 namespace r4dx::model {
@@ -262,24 +266,9 @@ class Model {
                               const std::function<void()>& on_chunk_captured = nullptr);
 
   // ---- multimodal prefill (docs/vision.md "Text-side splicing") ---------------------------------
-  // One image occurrence inside a PrefillMultimodal call's OWN token vector.
-  struct ImageSpan {
-    // Index of the first image-placeholder token (config.json's image_token_id, 248056) within
-    // THIS call's `token_ids` -- not an absolute sequence index, so a continuation prefill states
-    // its spans relative to the tail it is feeding, exactly as it states its tokens.
-    int64_t offset = 0;
-    // Length of the placeholder run == the image's MERGED token count
-    // (grid.MergedTokenCount(merge_size)). Validated against `grid` and against the tokens
-    // actually present at [offset, offset+tokens).
-    int64_t tokens = 0;
-    // The image's PATCH grid (pre-merge), which is what the mrope advance rule
-    // `current_pos += max(grid.h, grid.w) / merge_size` reads -- NOT the merged grid, and NOT the
-    // token count (docs/vision.md).
-    vision::GridThw grid;
-    // Device [tokens, hidden_size] bf16: this image's rows of Model::EncodeImages' output, which
-    // overwrite the embed_tokens lookup at the placeholder positions.
-    const uint16_t* embeds = nullptr;
-  };
+  // One image occurrence inside a PrefillMultimodal call's OWN token vector -- r4dx::model::ImageSpan
+  // (model_types.h, docs/tp.md 2.8, which documents every field), kept under its old spelling.
+  using ImageSpan = r4dx::model::ImageSpan;
 
   // Prefill with images spliced in. Identical to Prefill() in every other respect (same chunking,
   // same GDN/KV bookkeeping, same returned tail logits, same `on_chunk_captured` contract), plus:
@@ -355,44 +344,11 @@ class Model {
   // Not per-sequence state: Reset() deliberately leaves it alone.
   int64_t SampledFallbackRows() const { return sampled_fallback_rows_; }
 
-  // One named GPU timing span's accumulated result for one profiled decode step (tools/profile
-  // pass, 2026-09-19): `count` calls of this op family summed to `ms` milliseconds of hipEvent-
-  // measured device time (GDN kernels are one entry per GDN layer's whole Forward(), attention
-  // likewise, one entry per distinct GEMM (N,K) shape, etc. -- see DecodeStepProfiled's own
-  // comment for exactly what is and is not broken out).
-  struct ProfileEntry {
-    std::string name;
-    double ms = 0.0;
-    int count = 0;
-  };
-  // NOTE on what NOT to do with these numbers: `entries[*].ms` (hipEvent-measured) and
-  // `finish_wait_ms` (host-chrono-measured) are NOT additive -- every kernel `entries` accounts
-  // for was already enqueued (asynchronously) before `finish_wait_ms`'s clock starts, so
-  // `finish_wait_ms` is host time spent BLOCKED waiting for that SAME already-queued GPU work to
-  // finish (plus the final 4-byte D2H), not extra work on top of it. `entries[*].ms` summed
-  // (`gpu_sum_ms`) is the right number for "which kernel family dominates GPU time" (this
-  // pass's own top-3-cost ask); `finish_wait_ms` cross-validates it from the host's point of view
-  // (the two should land close to each other) and is also the honest place to see the "only sync
-  // per token" cost the host-overhead pass (item 5) was trying to minimize. `wall_ms` ~=
-  // `host_enqueue_ms` (the host-only time spent issuing every async kernel launch + CPU-side work
-  // like the embedding gather, measured BEFORE the Finish()/sync call below) + `finish_wait_ms`.
-  struct StepProfile {
-    std::vector<ProfileEntry> entries;  // per op-family, hipEvent-measured GPU device time, in
-                                         // call order (first occurrence) -- does NOT include the
-                                         // final stream-sync+readback (see finish_wait_ms)
-    double gpu_sum_ms = 0.0;            // sum of entries[*].ms
-    double host_enqueue_ms = 0.0;       // host time to issue every async launch (wall_t0 up to
-                                         // the Finish()/sync call below), NOT GPU-blocked
-    double finish_wait_ms = 0.0;        // host-chrono time for Finish()'s hipEventSynchronize +
-                                         // the final 4-byte argmax D2H -- the actual "only sync
-                                         // per token" cost, see NOTE above
-    double wall_ms = 0.0;               // host wall-clock for the whole DecodeStepProfiled call
-                                         // (~= host_enqueue_ms + finish_wait_ms)
-    int64_t r4dx_kernel_launches = 0;   // r4dx::kernels::r4dx_kernel_launch_counter_get() delta for
-                                         // just this one step (docs/r9700.md P2/task item 4) --
-                                         // r4dx-owned launches only, NOT third_party/libr4d's own
-                                         // r4d_gemm_*/r4d_gdn_*/r4d_attn_* launches; see kernels.h.
-  };
+  // One named GPU timing span's accumulated result, and one profiled step's whole breakdown --
+  // r4dx::model::ProfileEntry / StepProfile (model_types.h, docs/tp.md 2.8), which carry the full
+  // field documentation, kept under their old spellings.
+  using ProfileEntry = r4dx::model::ProfileEntry;
+  using StepProfile = r4dx::model::StepProfile;
 
   // Runs exactly one decode step (T=1) like DecodeStep, but wraps each kernel-family call in a
   // hipEvent pair so the returned StepProfile breaks down where the step's time actually went --
@@ -696,6 +652,18 @@ class Model {
                                                  std::mt19937_64& rng,
                                                  int64_t* walk_len_out = nullptr);
 
+  // ---- tensor parallel warm-up (docs/tp.md 2.9 step 9) -----------------------------------------
+  // A TP rank's one-time warm-up, run by TpModel on every rank as ONE collective command right after
+  // the ranks' Model::Load (the caller raises the all-reduce timeout around it). Uploads every
+  // GdnControlCache key a sequence can ever use (Prewarm), then runs the real paths once through
+  // the public methods with fixed token ids 0..63 -- one 64-row Prefill chunk (all-reduce channel 1)
+  // and one DecodeStepGreedy (channel 0) -- which is each rank's first touch of every kernel module,
+  // PickTuning cache fill and weight page, then Reset()s and freezes the control cache (a later
+  // miss throws std::logic_error: no lazy hipMalloc inside a collective, docs/tp.md 6.3.7). The
+  // warm-up is greedy only, so SampledFallbackRows() stays 0. Requires a TP rank (tp.world > 1);
+  // call it exactly once.
+  void TpWarmup();
+
  private:
   Model() = default;
 
@@ -766,18 +734,25 @@ class Model {
                                              DflashRoundTrace* trace_out,
                                              std::vector<int32_t>* drafted_tokens_out);
 
-  // ---- tensor parallel (docs/tp.md 7.2-7.5) -----------------------------------------------------
+  // ---- tensor parallel (docs/tp.md 7.2-7.6) -----------------------------------------------------
   // The full [vocab_size] fp32 row of one logits row whose [vocab_local_] shard sits at
   // `shard_row_dev` on this rank's device: D2H the shard, then HostAllGather -- the rank-order
   // concatenation IS the row in global id order, and every rank ends with the same bytes. The
-  // device must be idle (after stream_.Synchronize()). Requires comm_.
-  void GatherVocabRow(const float* shard_row_dev, float* full_host);
+  // device must be idle (after stream_.Synchronize()). Requires comm_. Const (host scratch is
+  // mutable) because ReadVerifyLogitsRow, a const accessor, gathers through it.
+  void GatherVocabRow(const float* shard_row_dev, float* full_host) const;
   // The merged greedy token of one row whose (local index, value) pair r4dx_argmax_val_f32 left at
   // `pair_dev` (8 bytes): D2H, + vocab_offset_, HostAllGather, tp::MergeArgmax (docs/tp.md 7.3).
   // Same preconditions as GatherVocabRow.
   int32_t MergeGreedyPair(const int32_t* pair_dev);
+  // One HostAllGather that merges `pairs.size()` greedy rows AND `summaries->size()` row summaries
+  // at once (docs/tp.md 7.4, 7.6; summaries may be null): every input is this rank's shard result
+  // with LOCAL ids; on return `pairs[t].idx` holds the merged GLOBAL greedy token of row t and every
+  // summary is the merged full-row summary (tp::MergeRowSummaries, vocab = Config().vocab_size).
+  // Both ranks pass the same row counts (they are functions of replicated state only, 6.3.6 L2).
+  void MergeShardResults(std::vector<tp::ArgmaxPair>& pairs, std::vector<kernels::RowSummary>* summaries);
   // Throws core::TpUnsupportedError naming `what` when this Model is a tensor-parallel rank: the
-  // paths TP does not support yet (sampled and speculative decode, P2b) or at all (profiling).
+  // paths TP does not support yet (the MTP and DFlash2 rounds, P5) or at all (profiling).
   void RequireNotTp(const char* what) const;
 
   Container container_;
@@ -827,7 +802,12 @@ class Model {
   // TP only: [draft_window_][2] of {int32 local index, float value} -- r4dx_argmax_val_f32's
   // output, one 8-byte tp::ArgmaxPair per row. argmax_dev_/verify_argmax_dev_ serve TP=1.
   core::DeviceBuffer<int32_t> argmax_pair_dev_;
-  std::vector<float> gather_shard_host_;  // TP only: GatherVocabRow's [vocab_local_] staging
+  mutable std::vector<float> gather_shard_host_;  // TP only: GatherVocabRow's [vocab_local_] staging
+  // TP only: r4dx_topk_lse_f32_ws's own workspace (docs/tp.md 2.7) -- this rank's row summaries
+  // never share the kernels' module scratch with the other rank (under emulation both ranks sit on
+  // ONE device). Allocated with the rest of the TP scratch in Load.
+  core::DeviceBuffer<uint8_t> topk_lse_ws_;
+  std::vector<uint8_t> merge_pack_host_;  // TP only: MergeShardResults' send/receive staging
 
   // Persistent (not arena-allocated) scratch every full-attention layer's AttentionLayer::Forward
   // shares within one RunChunk call: `positions[t] = pos_ + t` doubles as both the RoPE position

@@ -6,7 +6,9 @@
 //                     assistant reply, keep the conversation (and the model's KV/GDN state) alive
 //                     across turns.
 // Runs on whichever HIP device HIP_VISIBLE_DEVICES selects (project rule: device 1, never 0 --
-// this binary does not call hipSetDevice itself, matching every other r4dx entry point).
+// this binary does not call hipSetDevice itself, matching every other r4dx entry point). With
+// `--tp 2` (docs/tp.md 9) the model is an r4dx::model::TpModel instead: its rank threads select
+// their own devices, and this (the facade) thread makes no HIP call at all after argument parsing.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -24,12 +26,13 @@
 #include "cli_args.h"
 #include "image_decode.h"  // src/vision: DecodeImageFile (docs/vision.md, --image)
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md, --image)
-#include "model.h"
+#include "model.h"         // ModelOptions, LayoutFromName
 #include "mtp_round.hpp"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
-#include "r4dx/core/device_buffer.hpp"
 #include "r4dx/kernels/sampler.hpp"
+#include "text_model.h"  // r4dx::model::TextModel / LoadTextModel (docs/tp.md 2.8)
 #include "tokenizer.h"
+#include "vision_tower.h"  // src/vision: VisionEncodeStats
 
 namespace {
 
@@ -97,7 +100,7 @@ struct TurnResult {
 // --profile (decode) and --profile-prefill. `divisor` lets a caller show "per chunk" or "per layer"
 // averages without changing what was actually measured (PrefillProfiled sums every chunk's every
 // layer into one bucket per name -- see that method's own doc comment, model.h).
-void PrintProfileTable(const r4dx::model::Model::StepProfile& prof, double divisor,
+void PrintProfileTable(const r4dx::model::StepProfile& prof, double divisor,
                         const char* divisor_label) {
   std::fprintf(stderr, "  %-55s %10s %8s %10s %12s\n", "GPU op family (hipEvent, overlaps enqueue)",
                "ms", "calls", "% gpu_sum", divisor_label);
@@ -118,9 +121,9 @@ void PrintProfileTable(const r4dx::model::Model::StepProfile& prof, double divis
                static_cast<long long>(prof.r4dx_kernel_launches));
 }
 
-TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
+TurnResult RunTurn(r4dx::model::TextModel& model, const r4dx::Tokenizer& tok,
                     const std::vector<int32_t>& new_tokens, const CliArgs& args,
-                    const std::vector<r4dx::model::Model::ImageSpan>& image_spans = {}) {
+                    const std::vector<r4dx::model::ImageSpan>& image_spans = {}) {
   TurnResult result;
   result.prefill_tokens = static_cast<int64_t>(new_tokens.size());
 
@@ -130,7 +133,7 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
   // same "standalone diagnostic, no generated text" contract --profile has (see below).
   if (args.profile_prefill) {
     const auto t0 = Clock::now();
-    const r4dx::model::Model::StepProfile prof = model.PrefillProfiled(new_tokens);
+    const r4dx::model::StepProfile prof = model.PrefillProfiled(new_tokens);
     const auto t1 = Clock::now();
     const int64_t num_chunks = (static_cast<int64_t>(new_tokens.size()) + 63) / 64;  // max_chunk_=64
     std::fprintf(stderr,
@@ -173,7 +176,7 @@ TurnResult RunTurn(r4dx::model::Model& model, const r4dx::Tokenizer& tok,
     for (int64_t i = 1; i < args.profile_token; ++i) {
       cur_tok = model.DecodeStepGreedy(cur_tok);
     }
-    const r4dx::model::Model::StepProfile prof = model.DecodeStepProfiled(cur_tok);
+    const r4dx::model::StepProfile prof = model.DecodeStepProfiled(cur_tok);
     std::fprintf(stderr,
                  "[profile] decode step #%lld (1-indexed generated token, T=1), layout=%s:\n",
                  static_cast<long long>(args.profile_token), args.layout.c_str());
@@ -441,15 +444,50 @@ int RunMain(int argc, char** argv) {
   r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(args.tokenizer_dir, tok_options);
   r4dx::ChatTemplate tmpl = r4dx::ChatTemplate::from_directory(args.tokenizer_dir);
 
-  const double vram_before = VramUsedGiB();
+  // Tensor parallel (docs/tp.md 9.1): --tp 1 is today's single Model (r4dx::model::LocalTextModel);
+  // --tp 2 is r4dx::model::TpModel. cli_args.h already refused every staged combination.
+  r4dx::model::TpOptions tpo;
+  tpo.world = args.tp;
+  if (args.tp == 2) {
+    tpo.mode = args.tp_mode == "emulate" ? r4dx::model::TpOptions::Mode::kEmulate
+               : args.tp_mode == "noop"  ? r4dx::model::TpOptions::Mode::kNoop
+                                         : r4dx::model::TpOptions::Mode::kReal;
+    tpo.devices = args.tp_devices;
+    tpo.noop_rank = args.tp_rank;
+    tpo.ar_timeout_ms = args.tp_ar_timeout_ms;
+    tpo.ar_nb_small = args.tp_ar_nb;
+    tpo.ar_nb_large = args.tp_ar_nb_large;
+  }
+
+  // The pre-load VRAM reading is a HIP call on this thread, which under --tp 2 (the facade thread)
+  // must make none (docs/tp.md 2.8); the TP load log prints every rank's free/total instead.
+  const double vram_before = args.tp == 1 ? VramUsedGiB() : 0.0;
   const auto load_t0 = Clock::now();
-  r4dx::model::Model model = r4dx::model::Model::Load(opts);
+  std::unique_ptr<r4dx::model::TextModel> model = r4dx::model::LoadTextModel(opts, tpo);
   const auto load_t1 = Clock::now();
-  const double vram_after = VramUsedGiB();
+  // Every rank's device usage as the model reports it: at --tp 1 exactly the pre-TextModel
+  // VramUsedGiB() reading (one hipMemGetInfo on this thread); under --tp 2 one per rank, taken on
+  // the rank threads, of which this reports the largest.
+  auto vram_used_now = [&]() -> double {
+    if (args.tp == 1) return VramUsedGiB();
+    double used = 0.0;
+    for (const r4dx::model::VramReport& r : model->Vram()) used = std::max(used, r.used_gib);
+    return used;
+  };
 
   if (args.stats) {
-    std::fprintf(stderr, "[stats] container load: %.2fs, VRAM used: %.2f GiB (delta %.2f GiB)\n",
-                 Seconds(load_t0, load_t1), vram_after, vram_after - vram_before);
+    if (args.tp == 1) {
+      const double vram_after = VramUsedGiB();
+      std::fprintf(stderr, "[stats] container load: %.2fs, VRAM used: %.2f GiB (delta %.2f GiB)\n",
+                   Seconds(load_t0, load_t1), vram_after, vram_after - vram_before);
+    } else {
+      std::fprintf(stderr, "[stats] container load: %.2fs (--tp 2 --tp-mode %s)\n", Seconds(load_t0, load_t1),
+                   args.tp_mode.c_str());
+      for (const r4dx::model::VramReport& r : model->Vram()) {
+        std::fprintf(stderr, "[stats] tp rank %d (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB\n",
+                     r.rank, r.device, r.used_gib, r.free_gib, r.total_gib);
+      }
+    }
   }
 
   // Image preprocessing policy (docs/vision.md "Large images"). Validated and reported at startup
@@ -457,7 +495,7 @@ int RunMain(int argc, char** argv) {
   // `--image` (and `--chat`'s own `/image <path>` lines) feed it below.
   const r4dx::vision::ImageProcessorConfig image_preproc =
       r4dx::vision::MakeImageProcessorConfig(args.image_max_pixels);
-  if (model.HasVision()) {
+  if (model->HasVision()) {
     std::fprintf(stderr,
                  "[r4dx-cli] vision tower ready (image_max_pixels=%lld, an image above that is "
                  "downsized by smart_resize, not rejected)\n",
@@ -479,24 +517,28 @@ int RunMain(int argc, char** argv) {
   // placeholder has to be re-expanded every turn even though that image's rows were already
   // spliced into the model's real KV/GDN state and must NOT be re-encoded (docs/vision.md "Prefix
   // reuse across a turn that contained an image"). Grouped by turn (not by image) so a
-  // multi-image turn's rows stay in the ONE device buffer EncodeImages produced for it -- no
-  // device-to-device copy needed to split them apart.
+  // multi-image turn's rows stay in the ONE buffer EncodeImages produced for it (device rows at
+  // --tp 1, host rows under TP -- r4dx::model::ImageRows, docs/tp.md 2.8) -- no copy needed to split
+  // them apart.
   struct ImageBatch {
     std::vector<r4dx::vision::GridThw> grids;
-    r4dx::core::DeviceBuffer<uint16_t> embeds;
+    r4dx::model::ImageRows embeds;
   };
   std::vector<ImageBatch> session_image_batches;
-  const int32_t image_token_id = static_cast<int32_t>(model.GetContainer().ImageTokenId());
-  const int merge_size = model.HasVision()
-                              ? static_cast<int>(model.GetContainer().Vision().config.spatial_merge_size)
-                              : 2;
+  const int32_t image_token_id = static_cast<int32_t>(model->ImageTokenId());
+  const int merge_size = model->HasVision() ? static_cast<int>(model->VisionMergeSize()) : 2;
 
   auto run_one_user_turn = [&](const std::string& user_text,
                                 const std::vector<std::string>& image_paths_for_turn) {
     int64_t turn_image_n = 0;
     double turn_image_ms = 0.0;
     if (!image_paths_for_turn.empty()) {
-      if (!model.HasVision()) {
+      if (args.tp == 2) {
+        // Staged rejection (docs/tp.md 9.1): --image is refused at parse time; this is the --chat
+        // "/image" path's.
+        throw std::runtime_error("images are not supported with --tp 2 yet (docs/tp.md P5)");
+      }
+      if (!model->HasVision()) {
         throw std::runtime_error(
             "--image / \"/image\" needs a vision-capable container (this container has no "
             "vision.* tensors, or --vision off was given)");
@@ -511,8 +553,8 @@ int RunMain(int argc, char** argv) {
       ImageBatch batch;
       batch.grids = pre.grid_thw;
       r4dx::vision::VisionEncodeStats stats;
-      model.EncodeImages(pre.pixel_values.data(), pre.TotalPatches(), pre.grid_thw, &batch.embeds,
-                         &stats);
+      model->EncodeImages(pre.pixel_values.data(), pre.TotalPatches(), pre.grid_thw, &batch.embeds,
+                          &stats);
       turn_image_n = static_cast<int64_t>(pre.grid_thw.size());
       turn_image_ms = stats.encode_ms;
       session_image_batches.push_back(std::move(batch));
@@ -549,7 +591,8 @@ int RunMain(int argc, char** argv) {
         for (const auto& g : batch.grids) {
           r4dx::vision::ImagePlaceholderSpan sp;
           sp.grid = g;
-          sp.embeds = batch.embeds.data() + row * model.Config().hidden_size;
+          sp.embeds = batch.embeds.data() + row * model->Config().hidden_size;
+          sp.embeds_on_host = batch.embeds.on_host();
           spans_in.push_back(sp);
           row += g.MergedTokenCount(merge_size);
         }
@@ -574,7 +617,13 @@ int RunMain(int argc, char** argv) {
       // rather than killing the session (std::exit(1)).
       std::fprintf(stderr, "warning: chat template re-render did not extend the previous token "
                             "prefix; dropping state and re-prefilling the whole conversation\n");
-      model = r4dx::model::Model::Load(opts);
+      if (args.tp == 1) {
+        model = r4dx::model::LoadTextModel(opts, tpo);
+      } else {
+        // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same
+        // per-sequence state without touching a weight.
+        model->Reset();
+      }
       new_tokens.assign(full_tokens.begin(), full_tokens.end());
       skip = 0;
     } else {
@@ -589,14 +638,15 @@ int RunMain(int argc, char** argv) {
     // that contained an image"); re-including it here would try to splice into a position
     // `new_tokens` does not cover. Offsets are shifted from "index into the whole conversation"
     // to "index into new_tokens", matching Model::ImageSpan::offset's own contract.
-    std::vector<r4dx::model::Model::ImageSpan> image_spans;
+    std::vector<r4dx::model::ImageSpan> image_spans;
     for (const auto& sp : expanded_spans) {
       if (sp.offset < skip) continue;
-      r4dx::model::Model::ImageSpan ms;
+      r4dx::model::ImageSpan ms;
       ms.offset = sp.offset - skip;
       ms.tokens = sp.tokens;
       ms.grid = sp.grid;
       ms.embeds = sp.embeds;
+      ms.embeds_on_host = sp.embeds_on_host;
       image_spans.push_back(ms);
     }
 
@@ -605,9 +655,9 @@ int RunMain(int argc, char** argv) {
     // turn's own decode with before/after reads to get just this turn's rows -- meaningful only for
     // a temperature>0 turn (a greedy one never calls SampleFromSummary at all, so the delta is
     // always 0 there).
-    const int64_t fallback_rows_before = model.SampledFallbackRows();
-    const TurnResult r = RunTurn(model, tok, new_tokens, args, image_spans);
-    const int64_t fallback_rows_this_turn = model.SampledFallbackRows() - fallback_rows_before;
+    const int64_t fallback_rows_before = model->SampledFallbackRows();
+    const TurnResult r = RunTurn(*model, tok, new_tokens, args, image_spans);
+    const int64_t fallback_rows_this_turn = model->SampledFallbackRows() - fallback_rows_before;
     std::cout << std::endl;
 
     // committed_tokens (not generated_tokens) is what's actually in the model's KV/GDN state --
@@ -660,7 +710,7 @@ int RunMain(int argc, char** argv) {
                    "%.3fs (%.2f tok/s) | eos=%s | VRAM: %.2f GiB\n",
                    static_cast<long long>(r.prefill_tokens), r.prefill_seconds, pfx_tps,
                    static_cast<long long>(r.decode_tokens), r.decode_seconds, dec_tps,
-                   r.hit_eos ? "yes" : "no (max-tokens)", VramUsedGiB());
+                   r.hit_eos ? "yes" : "no (max-tokens)", vram_used_now());
       // Denominator is committed_tokens (rows actually emitted through the sampler this turn --
       // Model::SampledFallbackRows()'s own unit), NOT decode_tokens/generated_tokens (DISPLAYED
       // tokens): a speculative round that stops mid-round commits more rows than it displays
@@ -692,7 +742,7 @@ int RunMain(int argc, char** argv) {
                      // docs/r9700.md R9: report which draft head this run actually used --
                      // "reduced" only if the container has one AND --mtp-draft-head didn't force
                      // "full" (Model::MtpUsingReducedVocabDraft's own two-condition check).
-                     model.MtpUsingReducedVocabDraft() ? "reduced" : "full");
+                     model->MtpUsingReducedVocabDraft() ? "reduced" : "full");
       }
       if (!args.dflash.empty()) {
         const double accept_rate = r.dflash_drafted > 0

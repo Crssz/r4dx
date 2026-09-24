@@ -321,7 +321,8 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 // It keeps its partials in a module-scope device scratch buffer (~264 KiB of VRAM), so exactly ONE
 // call may be in flight per process at a time -- the single-worker-thread assumption model.h's own
 // SCOPE comment guarantees for one Model. Two concurrent calls (two threads, two streams -- e.g.
-// two tensor-parallel rank threads, docs/tp.md 2.7) would interleave partials.
+// two tensor-parallel rank threads, docs/tp.md 2.7) would interleave partials; such callers use
+// r4dx_topk_lse_f32_ws below, each with its own workspace.
 //
 // logits: [rows, vocab] fp32 device pointer, rows contiguous (row stride == vocab).
 // out_ids: [rows, K] int32. out_vals: [rows, K] fp32. out_lse: [rows] fp32.
@@ -331,6 +332,21 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 enum { R4DX_TOPK_LSE_K = 64 };
 void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
                         int rows, int64_t vocab, float inv_temperature, int64_t stream);
+
+// The same summary with the per-slice partials in a CALLER-OWNED device workspace instead of the
+// module-scope scratch above (docs/tp.md 2.7), so any number of calls may be in flight at once --
+// one per workspace. Tensor parallelism needs it: two rank threads summarize their own vocab
+// shards concurrently, and under emulation both ranks share ONE device (and so one module scratch).
+// `workspace`: device pointer to r4dx_topk_lse_workspace_bytes() bytes, 16-byte aligned (hipMalloc
+// alignment is enough); only one call per workspace may be in flight (same-stream calls are
+// serialized by stream order). workspace == 0 is the module scratch, i.e. exactly
+// r4dx_topk_lse_f32 -- which is what that entry point does, so TP=1 is byte-for-byte unchanged.
+// Same preconditions and outputs as r4dx_topk_lse_f32, plus: workspace % 16 == 0.
+void r4dx_topk_lse_f32_ws(int64_t logits, int64_t out_ids, int64_t out_vals, int64_t out_lse,
+                           int rows, int64_t vocab, float inv_temperature, int64_t stream,
+                           int64_t workspace);
+// Bytes r4dx_topk_lse_f32_ws needs in its workspace (the module scratch's size, ~262 KiB).
+int64_t r4dx_topk_lse_workspace_bytes();
 
 // ---- DFlash2 draft-block attention: non-causal, windowed, GQA ---------------------------------
 // The draft block's own attention (docs/dflash2.md section 4.2 / the "SWA visibility rule" row of

@@ -2542,12 +2542,259 @@ it refines.
     to the user: in chunks with idle gaps, with the desktop idle, or with the display moved off
     device 0 (Appendix C, question 2).
 
+**P2b**
+
+- **N45 (6.5, 6.6, 2.4: `EmulatedComm`, `tp/tp_comm_emulated.cpp`).**
+  - **The all-reduce barrier waits at most the all-reduce timeout**, not the exchange's 30 s:
+    `HostExchange` gains `AllGatherFor(..., timeout)` / `BarrierFor(rank, timeout)`; `AllGather` and
+    `Barrier` keep the constructor's 30 s. A barrier that times out is reported the way the device
+    kernel reports its spin timeout (6.3.5): the rank stores `kAbortTimeout` in its abort word,
+    claims its host-side `Status` (channel, `seq` = the call index, phase flag-wait), the exchange
+    is already poisoned by the timed-out wait, and the call throws `TpAbortedError("tp: rank <r>
+    timeout at channel <c> block 0 seq <n> phase flag-wait (emulated all-reduce waited <ms> ms for
+    rank <p>); ...")`. With the 30 s bound, fault kind 1 (a 700 ms stall on the peer) could never
+    time out under emulation, and 10.1's asymmetric-fault case would test nothing. Warm-up's 1500 ms
+    applies through `SetAllReduceTimeoutMs`, as for the real transport.
+  - **Emulate mode has no mailbox.** `TpGroup` holds two host abort words (each written only by its
+    own rank, like `ABORT[r]`) and each rank's two exchange-buffer pointers (published at endpoint
+    creation, read by the peer's add). `ResetMailbox` clears the abort words (recovery step 4);
+    `AllocateMailbox` refuses emulate mode; `SeqAdvance` returns 0 (no device seq counters), so
+    recovery moves the base by 64 only. `Create(kEmulate, ...)` needs world 2, like `kReal`.
+  - The stream wait before every emulated barrier records ONE endpoint-owned marker event and polls
+    it (`SyncWithWatchdogEvent`, the event-reusing form of `SyncWithWatchdog`, N33): 30 s bound, no
+    `hipStreamSynchronize`, no event created per call.
+  - Invariant behind "no second barrier": when a rank passes barrier c + 1, its call-c add (the
+    only reader of the peer's `xchg[peer][c & 1]`, which the peer rewrites at call c + 2) has
+    finished. Draining call c + 1's stream proves that only when both calls share a stream, so a
+    call on a different stream than the previous call's add also drains that add's stream first
+    (N53).
+  - `~EmulatedComm` syncs only its own stream: the tracked streams are the Model's, destroyed first
+    (2.6). One rank's add reads the OTHER rank's exchange buffers, so `~TpModel` drains every rank's
+    streams in a separate command before any rank frees anything (N47).
+  - `SelfTest` is 6.3.9's pattern through the emulated all-reduce (80 all-reduces, so `CallCounts()`
+    read `{48, 32}` right after a recovery).
+- **N46 (2.7: `r4dx_topk_lse_f32_ws`).** Both kernels take the four partial arrays as pointers,
+  and a null workspace makes the KERNEL select the module scratch -- instead of the host passing the
+  globals' device addresses (`hipGetSymbolAddress`, per call and per device). `r4dx_topk_lse_f32` is
+  `r4dx_topk_lse_f32_ws(..., 0)`: the same partials land in the same scratch, TP=1 outputs are
+  unchanged. The workspace is the scratch's four arrays back to back -- ids 131,072 B, vals
+  131,072 B, max 2,048 B, sum 4,096 B (8-aligned) = `r4dx_topk_lse_workspace_bytes()` = 268,288 B --
+  and must be 16-byte aligned. A rank's workspace is allocated in `Model::Load` next to
+  `argmax_pair_dev_` (every TP rank, bare or under `TpModel`), not in `TpWarmup`: no sampled path can
+  reach a missing workspace, and nothing is allocated lazily inside a collective.
+- **N47 (2.9, 2.2, 2.6: `TpModel::Load` and shutdown).**
+  - Steps 3 and 5-10 run in every mode. Step 3's real-mode requirements (distinct PCI bus, same
+    `gcnArchName`, `canMapHostMemory`) and step 4's wall-clock check stay with `--tp-mode real` (P4's
+    table: "device validation (2.9 steps 3-4)"); the probe itself runs and logs in every mode.
+  - Step 5 runs after step 6: the joint embedding decision needs `text.embed_tokens`' byte count,
+    which the pinned load (step 6) yields; the free bytes are step 3's (before any rank allocated).
+    The rule per physical device (PCI bus) is `free >= 2 * embed_bytes * ranks on it`.
+  - After step 10 the facade drops its reference to the pinned table on rank 0's thread, so the last
+    owner (a rank's `Container`) frees it on a rank thread, never on the facade.
+  - noop: one rank thread (rank `noop_rank`) with `MakeNoopComm`. Its waits use
+    `ProgressWatchdog::kNoStallLimit`: `NoopComm` never bumps a heartbeat, so the 60 s watchdog would
+    kill any long command. Fault injection is refused in noop mode.
+  - Every load-time command (probe, embed load, endpoints, `Model::Load`, the capability read) waits
+    with `kNoStallLimit` (N8); the warm-up with the 60 s watchdog (its all-reduces bump heartbeats).
+  - The warm-up latency sample (200 x 10 KiB, timed by the first rank thread) runs on a
+    `RankSlot`-owned stream that lives as long as the endpoint, because the endpoint keeps every
+    stream an all-reduce was queued on and syncs it in recovery.
+  - Shutdown after the idle wait is two commands per rank: drain the endpoint's streams (all ranks
+    first), then destroy the Model, the endpoint and that stream and `hipDeviceSynchronize()`; each
+    wait is 30 s, then `quick_exit(3)`.
+  - Each command's closure is held by a `shared_ptr`. (The first version let a closure a stalled
+    rank was still running reference the caller's stack after the facade threw `TpTimeoutError`;
+    N53 moved that state onto the heap and poisons the group on a stall.)
+- **N48 (2.4, 2.8: the facade surface).**
+  - Diagnostics and test hooks on `TpModel`: `GetState()`, `CallCounts()`, `CommStats()`,
+    `ArmFaultInjection(rank, n, kind)` (counted from the call; `TpOptions::fault_*` calls it right
+    after warm-up) and `RunCollectiveForTest(fn(Model&, rank))`, one collective command with the
+    same state check, allocation guard, `CheckHealthy` and abort-on-error as a forward call
+    (`VerifyWindow` has no `TextModel` method).
+  - `DecodeStepMtp*` / `DecodeStepDflash*` check the cached `MtpEnabled()` / `DflashEnabled()`
+    first and throw `std::runtime_error` without a command (so without `kNeedsRecovery`); both are
+    false until P5. `EncodeImages` and the profiled methods: state check, then
+    `TpUnsupportedError`, no command.
+  - `LoadTextModel` refuses any non-default `TpOptions` field at world 1 (`std::invalid_argument`),
+    the analogue of the CLI's "any `--tp-*` with `--tp 1`".
+  - `Model::Reset()` also resets the arena. After every normal call that is a no-op; after an
+    exception mid-layer it drops the dead call's scratch, so a recovered rerun starts at a fresh
+    Model's arena offset (the byte-identical rerun of 10.1).
+  - `model_types.h` also takes `ProfileEntry` (`StepProfile` holds a vector of it).
+    `ImageRows::SetFilled(on_host, rows)` sets `on_host()` / `rows()`; `LocalTextModel` counts the
+    rows from the grids.
+- **N49 (P2b scope: the verify merges; H6/H7 stay in P5).** P2b's table puts `VerifyWindow` under
+  TP (7.6) and H2-H5 here, and the MTP head (H6, 8.1) and the DFlash drafter (H7, 8.2), with their
+  files, in P5. So P2b lifts the `TpUnsupportedError` of `DecodeStepSampled` (N15: only when it
+  samples), `VerifyWindow`, `CommitVerifiedWindow` and `ReadVerifyLogitsRow`; `DecodeStepMtp*` and
+  `DecodeStepDflash*` keep theirs. H2's fingerprint `kind` is `"VERI" << 32` OR'd with 1 (full
+  logits out) and 2 (row summaries); H1 gains bit 8 (row summary). `Model::MergeShardResults` does
+  H3's and H4's merges in ONE gather (`[pairs][summaries]` per rank, ids made global first).
+  `test_tp_emulation` drives `VerifyWindow` through `RunCollectiveForTest` on ranks sized with
+  `dflash_draft_k = 7` and no drafter.
+- **N50 (10.1 `test_tp_emulation`: the w4a8 gate; measured 2026-09-24, device 1).** Max per-row rel
+  L2 vs TP=1 on the 40- / 70-token scripts: bf16 6.5e-3 / 3.5e-3, w4a16 6.9e-3 / 5.4e-3, mxfp4
+  1.5e-2 / 1.6e-2 -- inside 10.1's bounds -- but w4a8 7.7e-2 / 7.9e-2, over its 5e-2. Not a TP
+  defect: measured against the TP=1 **bf16** run, TP=2 w4a8 is 9.1e-2 / 8.4e-2 away while TP=1
+  w4a8 is 1.06e-1 / 1.03e-1 away -- TP is CLOSER to exact arithmetic (w4a16: 6.63e-2 vs 6.65e-2;
+  mxfp4: 1.32e-1 vs 1.33e-1). The int8 per-row activation scales over the rank's local K (4.3, R10)
+  change w4a8's quantization, and this 4-layer container's w4a8 logits are that sensitive. The w4a8
+  gate is therefore: rel L2 vs TP=1 <= 1e-1 per row, AND max over the script of rel L2(TP=2 vs TP=1
+  bf16) <= 1.0 x the same for TP=1 w4a8 (1.25 x until the P2b review tightened it, N53; measured
+  ratios 0.853 / 0.822). bf16, w4a16 and mxfp4 keep 10.1's bounds; G4 (w4a16) is unaffected. This
+  replaces a 10.1 bound, so it stands only with the user's approval (Appendix C, question 4). The
+  rest of the run:
+  - `DecodeStepGreedy` == argmax(`DecodeStep`) on 16/16 rows, every layout.
+  - Sampled: 3 configs x 3 seeds per layout plus T = 0.005, all trajectories equal; 17-23 of 25
+    rows fell back to the gathered full row at T = 1.0 and at top_p 0.95 / min_p 0.02 (H5
+    exercised), 0 at top_k 20.
+  - `VerifyWindow` (w4a16, 8 rows): ranks identical; merged preds == argmax of the gathered rows;
+    merged top-64 == `r4dx_topk_lse_f32` over the gathered rows exactly; |lse delta| 0.
+  - Faults: kind 0 reached the caller as "tp fault injection"; kind 1 as "tp: rank 0 timeout at
+    channel 0 block 0 seq 252 ...". After each `Reset()`: `kReady`, `CallCounts()` {48, 32} on both
+    ranks, rerun byte-identical to a fresh `TpModel`'s run.
+  - `g_tp_collective_allocs` 0. Whole test 55 s.
+- **N51 (9.1, 10.1: CLI and the teacher-forced tool).**
+  - r4dx-cli's `--tp*` flags follow 9.1. In P2b the default `--tp-mode real` is itself refused
+    (P4), so `--tp 2` needs `--tp-mode emulate` or `noop`. `/image` in `--chat` throws at that turn
+    under `--tp 2` (the `--image` flag is refused at parse time). `--stats` at `--tp 2` prints the
+    load line plus one VRAM line per rank, and the per-turn line's VRAM is the maximum over ranks;
+    the `[stats] tp:` line is P4's. `tests/cli/test_args.cpp` gains `TestTpFlags`.
+  - `tool_teacher_forced_logprobs`: `--tp`, `--tp-mode`, `--tp-devices`, `--tp-rank` (noop) and
+    `--embed-device-resident`. The `[vram]` line sums `Vram()` over DISTINCT devices (emulate's two
+    ranks share one device). The sidecar carries `"tp_world"` only when > 1, so TP=1 sidecars are
+    unchanged. `test_teacher_forced_logprobs` drives the pass through `LocalTextModel`.
+- **N52 (P2b smoke, measured 2026-09-24 on device 1, production server stopped; G2/G4 not run).**
+  - CPU tests: 28 pass, `test_position_ids` skipped (no golden data). GPU on device 1:
+    `test_tp_emulation`, `test_tp_loader`, `test_tp_allreduce_cpu_peer`, `test_topk_lse`,
+    `test_summary_sampler`, `test_sampler_canonical`, `test_forward_smoke`,
+    `test_teacher_forced_logprobs` and `test_core` pass.
+  - r4dx-cli `--tp 2 --tp-mode emulate` on `l4-allmtp` (`--layers 4`): greedy, seeded sampled, a
+    two-turn `--chat` (the prefix-mismatch `Reset()` path) and `--tp-mode noop --tp-rank 1` all run.
+  - v6 w4a16, `--tp 2 --tp-mode emulate`, the standard prompt, 64 tokens: coherent ("Silicon
+    threads weave, / Parallel light in the dark, / Pixels bloom anew." then the GPU explanation);
+    load 6.9 s with the container in the page cache (25.8 s right after a rebuild), 19.96 GiB used on
+    device 1, 25.9-26.0 tok/s decode (both ranks on one card, a host sync at every all-reduce);
+    byte-identical text on a rerun. Seeded sampled (T 0.7, top_k 20, top_p 0.8, seed 1): coherent, 0/64
+    fallback rows. The emulated isolated L(10 KiB) at warm-up reads 55-95 us.
+  - `tool_teacher_forced_logprobs --tp 2 --tp-mode emulate` on the 4-layer container: 60 rows, max
+    |logsumexp| 4.7e-7.
+
+**P2b review**
+
+- **N53 (2.2 step 6, 2.4, 2.6, 6.5, 10.1: the P2b review fixes).**
+  - **A watchdog stall no longer leaves a rank on the facade's stack (2.2 step 6).** When the
+    progress watchdog fired, the facade threw `TpTimeoutError` while the stalled rank might still
+    run a closure that referenced the facade frame (`fn`, the result slots, `pos0`/`fallback0`) and
+    the caller's arguments (`token_ids`, the rng copies, `walks`). When the stuck HIP call returned,
+    that rank could read a freed token vector in `Model::Prefill`'s chunk loop, or write a result
+    into a reused stack frame. The group was not aborted either, so the rank carried on with the
+    forward. Now:
+    - `Run`'s stall branch poisons every endpoint (`Abort(kAbortShutdown)`) before throwing, so a
+      late rank throws at its next comm operation. The facade reads its own copy of each endpoint
+      pointer (`RankSlot::facade_comm`, set after the endpoint-creation command, cleared before
+      teardown), never `endpoint`/`noop` while a rank may write them. `~TpModel`'s 2.6 step 1 uses
+      the same copy.
+    - `RunCollective`, `RunAll` and `RunOne` keep the caller's `fn`, the per-rank result slots and
+      rank 0's re-cached counters in a heap `CmdState` that every posted closure co-owns. The
+      forward methods capture their arguments by value (a `Prefill` copies its token vector once)
+      and keep the rng copies and walk lengths in `shared_ptr`s. `Vram`, `CallCounts`, `CommStats`,
+      `ArmFaultInjection` and `Reset` do the same. `TpGroup::Recover`'s step closures co-own `eps`
+      and `advance` and capture `new_base` by value, and `TpModel`'s `RankRunner` copies them into
+      the commands.
+    - `TpModel::Load` declares every local that a load command touches before `m`. A failed load
+      destroys `m` first, and `~TpModel` waits for every rank to go idle, or `quick_exit(3)`s,
+      before those locals go.
+  - **The pinned embedding table is never freed on the facade (2.1).** On a failed load (for
+    example, both ranks' `Model::Load` throwing) the facade's `embed` could be the last owner and
+    `hipHostFree` 2.37 GiB on a thread with no `hipSetDevice`. A guard destroyed before `m` now
+    drops that reference on rank 0's thread. If rank 0 can no longer run a command (`kFatal`), the
+    guard leaks the table.
+  - **`EmulatedComm` no longer assumes one stream per rank (6.5, N45).** If a rank's all-reduces
+    switched streams without a full sync, the peer's barrier at c + 1 no longer proved that this
+    rank's call-c add had finished. The peer's call c + 2 could then overwrite the buffer that add
+    was still reading, giving a silently wrong sum that both ranks would agree on. No current path
+    switches streams, but nothing enforced it. A call on a stream other than the previous call's
+    add now drains that add's stream too. One extra event wait per stream switch; recovery clears
+    the flag.
+  - **`--max-ctx` below 65 is refused by name under TP.** The warm-up prefills a 64-token chunk
+    and decodes one token. Before, such a load died inside the warm-up with the KV cache's
+    `start_pos+T exceeds max_context_tokens`.
+  - **`Model::PrefillMultimodal` refuses `ImageSpan::embeds_on_host`** (`std::invalid_argument`)
+    until P5 adds the H2D splice. Before, it would have run a D2D copy from a host pointer. At TP=1
+    the flag is always false, so no byte changes.
+  - **The w4a8 yardstick of `test_tp_emulation` is tightened from 1.25 x to 1.0 x (N50).** At 1.25 x
+    it would pass an independent w4a8-only TP error of ~0.096 rel L2, as large as w4a8's whole
+    quantization error. At 1.0 x the measured ratios, 0.853 and 0.822, pass, and an added error
+    above ~5e-2 fails. The gate change itself waits for the user (Appendix C, question 4).
+  - **Test coverage added.**
+    - `test_tp_emulation` now also checks that the injection policy set in `kNeedsRecovery` (false)
+      is what both ranks run with after `Reset()`.
+    - It adds a lockstep divergence: the ranks feed different tokens to one `DecodeStep`. That gives
+      H1 `TpDivergenceError` on both, then `kNeedsRecovery`, then `Reset()` recovers, and the rerun
+      equals the fresh run.
+    - It adds a failed recovery: rank 1 armed to throw at its 5th all-reduce, then a divergence,
+      which issues no all-reduce, then `Reset()`, whose `SelfTest` reaches the fault. The group
+      goes `kFatal`, `Reset()`, `DecodeStep()` and `CallCounts()` throw `TpStateError("tp: fatal
+      ...")`, and the cached accessors and `Vram()` still work. `~TpModel` then tears down cleanly.
+    - `test_tp_host_exchange` adds `TestPerCallBound`: `BarrierFor(150 ms)` on a 30 s exchange
+      times out at 150 ms and aborts the group, and `AllGatherFor` gathers normally after `Reset()`.
+- **N54 (P2b gates, measured 2026-09-24 after the N53 fixes, HIP device 1 only, production server
+  stopped).**
+  - **CPU tests:** `test_tp_{config,shard,vocab_merge,host_exchange,rank_worker}` and
+    `test_cli_args` pass.
+  - **`test_tp_emulation`** passes in 54.6 s, with every N53 case included. The per-row max rel L2
+    vs TP=1 is unchanged from N50:
+    - bf16: 6.5e-3 / 3.5e-3;
+    - w4a16: 6.9e-3 / 5.4e-3;
+    - w4a8: 7.7e-2 / 7.9e-2, with yardstick ratios 0.853 / 0.822 against the 1.0 limit;
+    - mxfp4: 1.5e-2 / 1.6e-2.
+  - **`run_tests.ps1`** (default, `-LE tp2gpu`): 72 of 73 pass (15 of them skips), in 574 s,
+    `test_tp_emulation` included. The one failure is the known `test_mtp`
+    `CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled trajectories, N29).
+  - **G4: PASS.** These are 10.4's commands with two differences.
+    - `--ref-dir` is `C:\Users\pay20\dev\r4dx-m8\tools\reference\kl_out\ref`, the Rung 4 bf16
+      reference dumps, only read. The tp2 worktree has no gitignored `kl_out\ref`. Its
+      `kl_corpus\tokens.json` has the same SHA-256, and `kl_report.py` checks each segment's
+      token-id hash.
+    - `tool_teacher_forced_logprobs` does not create `--out-dir`, so the two directories were made
+      first. `kl_report.py` ran under `C:\Users\pay20\dev\.venv` (numpy 2.4.3); the README's venv
+      does not exist on this box.
+
+    `kl_v6_tp2emu.json`, KL(ref || TP=2 emulated):
+
+    | Segment | Mean KL | Top-1 | KL>1 |
+    |---|--:|--:|--:|
+    | cpp_source | 0.02397 | 94.43% | 0 |
+    | english_prose | 0.02840 | 91.20% | 0 |
+    | python_source | 0.02748 | 94.13% | 0 |
+    | thai_prose | 0.07428 | 84.26% | 2 |
+    | **ALL** (4092 rows) | **0.03853** (limit 0.0435) | **91.01%** (limit 90.43%) | 2 |
+
+    - TP=1 from the same binary and run (`kl_v6_tp1.json`, an extra `kl_report.py` call): 0.03856 /
+      90.86%. Milestone 11's 0.03851 / 90.93% was measured on 2026-09-22, before `main`'s `32093f2`
+      w4a16 re-sweep (2026-09-24) changed the TP=1 tunings. G4's limits come from Milestone 11 and
+      are met by both runs.
+    - `kl_tp1_vs_tp2emu.json`: mean KL 0.00103 (10.4 expects ~1e-3), top-1 98.31%, max 0.0516, no
+      position above 1 nat.
+    - Wall time and VRAM: TP=1 took 121.5 s (29.7 ms/row) with a 17.07 GiB peak. Emulated TP=2 took
+      154.0 s (37.6 ms/row) with 20.02 GiB (both ranks on one device). The largest |logsumexp| was
+      1.9e-6.
+  - **G2 (`tp1_identity.ps1`, `-Image` = the golden vision image): PASS.** All 12 rows are
+    byte-identical to `build\baseline` (1-5, `row6_{bf16,w4a16,w4a8,mxfp4}`, 7, 8 and 9), in 437 s.
+  - **Smoke (P2b gates' CLI line):** the text is coherent and byte-identical to N52's ("Silicon
+    threads weave, / Parallel light in the dark, / Pixels bloom anew." then the GPU explanation).
+    Load took 5.9 s, decode ran at 28.7 tok/s, and VRAM used was 19.96 GiB. The emulated isolated
+    L(10 KiB) was 42.4 us.
+
 ## Appendix C -- Open questions for the user
 
 1. **`PrefixState::Invalidate` bug on `main` (8.4).** After any exception inside a request,
    today's server skips `Reset()` on the next request and prefills on top of the failed request's
    state -- silent wrong output at TP=1. The fix is ~10 lines plus a CPU test. This design lands
    it on `tp2` in P5. Do you want it fixed on `main` now, independently of TP?
+   **Resolved:** fixed on `main` in `977160e` (`needs_reset_`, lifted only by `Commit()`); `tp2`
+   takes it when it merges `main`, so P5 no longer carries it.
 2. **Device 0 for two-GPU tests and gates.** Every P3-P5 two-GPU run needs the production server
    on device 1 stopped (9.2) and puts load on the desktop card. Is there a preferred window, and
    should the desktop be kept idle (or the display moved off device 0, if this machine allows it)
@@ -2555,3 +2802,10 @@ it refines.
 3. **Stop rules.** If G3 (P2a) or G5 (P3) misses, the plan stops before P2b. If P4 lands below
    1.40x it stops; between 1.40x and 1.45x it pauses for your call. Confirm those thresholds, or
    name the speedup below which TP is not worth merging.
+4. **The w4a8 numerics gate of `test_tp_emulation` (Appendix B N50, N53).** 10.1 bounds w4a8 at
+   rel L2 <= 5e-2 per row vs TP=1; on the 4-layer container w4a8 measures 7.7e-2 / 7.9e-2, because
+   the int8 activation scales of the row-parallel layers are taken over the rank's local K (4.3) --
+   and that moves TP=2 CLOSER to the bf16 run than TP=1 w4a8 is (ratio 0.853 / 0.822). The test
+   now gates w4a8 at <= 1e-1 per row vs TP=1 AND TP=2's distance from TP=1 bf16 <= 1.0 x TP=1
+   w4a8's. Do you accept that replacement, or should w4a8 keep 10.1's 5e-2 (which fails today by
+   design, not by a defect)?

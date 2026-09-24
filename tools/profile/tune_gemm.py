@@ -15,10 +15,11 @@ per the task brief -- see the file:line references below, not re-derived from gu
   bf16   (third_party/libr4d/r4d_gemm_bf16_nt_m64.hip:153-158):
          M in 1..64; K % (SK*16) == 0; WV*SK*32 <= 1024; MB in 1..4. No N constraint, no NPW/NT.
   w4a16  (r4d_gemm_w4a16_nt_m64.hip:290-302):
-         M in 1..64; N % 16 == 0; K % (SK*128) == 0; WV*SK*32 <= 1024; MB in 1..4;
+         M in 1..64; N % 16 == 0; K % (SK*group) == 0 (group = R4D_GEMM_W4_GROUP, see "W4A16
+         GROUP" below); WV*SK*32 <= 1024; MB in 1..4;
          NPW in {1,4}; smem = WV*NPW*SK*1024 bytes <= 64*1024 i.e. WV*NPW*SK <= 64.
   w4a8   (r4d_gemm_w4a8_nt_m64.hip:265-280):
-         same as w4a16 except K % (SK*128) == 0 (GEMM_W4A8_GROUP=128 too) and
+         same as w4a16 except K % (SK*128) == 0 (GEMM_W4A8_GROUP=128) and
          NPW in {1,2,4,8}.
   mxfp4  (r4d_gemm_mxfp4a8_nt_m64.hip:233-251):
          M in 1..64; N % 16 == 0; K % (SK*32) == 0 (GEMM_MXFP4_GROUP=32); WV*SK*32 <= 1024;
@@ -30,15 +31,49 @@ constraints computed below -- not a substitute for reading them (a config this s
 generates because it fails the constraint check above is one r4d's own C++ validation would also
 have rejected, confirmed by spot-checking a few rejected combos manually against the .hip source).
 
-Usage (read-only reference venv, HIP device 1):
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\profile\\tune_gemm.py \
-      [--quick] [--out src\\model\\gemm_tuning_table.inc]
+Usage (HIP device 1; any CPython 3.12 with a ROCm build of torch -- r4d.pyd links python312 -- e.g.
+the read-only reference venv C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10 where it exists):
+  $env:HIP_VISIBLE_DEVICES = '1'
+  $env:R4DX_LIBR4D_BUILD = "$HOME\\dev\\libr4d\\build-win\\g64"   # see "W4A16 GROUP" below
+  <python.exe> tools\\profile\\tune_gemm.py [--quick] [--out src\\model\\gemm_tuning_table.inc]
 
 --quick restricts M to {1, 8, 64} and halves the iteration count, for a fast sanity sweep; the full
 run (default) covers M in {1,2,4,8,16,32,64} and is what produced docs/perf.md's table.
 
 --m-bands "1,8,64" overrides the M band list entirely (e.g. "1" alone for a fast single-row re-run
 of specific --shapes, docs/r9700.md Q5's own use case).
+
+--replace rewrites, in place, only the rows this run sweeps and leaves every other row and the
+file's header alone -- e.g. `--layouts w4a16 --replace` re-tunes w4a16 after a group change without
+re-sweeping bf16/w4a8/mxfp4.
+
+W4A16 GROUP. r4d_gemm_w4a16_nt_m64 is compiled at one group size (R4D_GEMM_W4_GROUP: K per
+(scale, zero) dword), and the group decides both which SK are legal and how big the `wsz` buffer is
+(N*K/group dwords). The r4dx build compiles the kernel at its R4DX_W4A16_GROUP option (default 64
+since Milestone 11; third_party/CMakeLists.txt passes -DR4D_GEMM_W4_GROUP). r4d.pyd is built
+separately, by libr4d's own build_windows.ps1, which passes no such flag -- so a stock
+build-win\\r4d.pyd carries the kernel source's default, 128, and sweeping it tunes a kernel the
+default r4dx build does not run. So main() prints the groups the loaded pyd was compiled with
+(r4d.GEMM_W4_GROUP / GEMM_W4A8_GROUP / GEMM_MXFP4_GROUP), sizes every scale buffer from them (a
+buffer sized for another group is either too short, and read past, or never fully read), and refuses
+to sweep a layout whose pyd group differs from the r4dx build's: --w4a16-group (default 64) for
+w4a16, 128 for w4a8, 32 for mxfp4.
+
+Building a group-64 r4d.pyd without editing libr4d: build_windows.ps1 has no group parameter, but
+clang's driver appends whatever CCC_OVERRIDE_OPTIONS names to every compile it runs, and
+R4D_GEMM_W4_GROUP is read by r4d_gemm_w4a16_nt_m64.hip alone:
+
+  $env:CCC_OVERRIDE_OPTIONS = '+-DR4D_GEMM_W4_GROUP=64'
+  & $HOME\\dev\\libr4d\\build_windows.ps1 -OutDir build-win\\g64 -RocmRoot C:\\opt\\rocm `
+      -Pybind11Include <any torch install>\\Lib\\site-packages\\torch\\include
+  Remove-Item env:CCC_OVERRIDE_OPTIONS
+
+-OutDir is relative to libr4d, and libr4d's .gitignore already covers build-win\\. -RocmRoot is the
+HIP SDK the r4dx build itself compiles with (docs/build-windows.md). -Pybind11Include is only
+needed when the reference venv, the script's default source of pybind11, is absent -- otherwise it
+tries to install pybind11 into a fresh uv venv. build.log shows "### Adding argument
+-DR4D_GEMM_W4_GROUP=64 at end" once per compile, and the group check above is the real
+verification: the pyd must report w4a16=64, or this script will not sweep it.
 
 Q5 fix (docs/r9700.md, Milestone 3 profiling pass, 2026-09-20): every bench() call used to read the
 SAME weight buffer on every iteration of its timed loop, so a shape smaller than the 64 MiB
@@ -56,6 +91,7 @@ import argparse
 import itertools
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -98,7 +134,12 @@ M_BANDS_QUICK = [1, 8, 64]
 WV_CANDIDATES = [1, 2, 4, 8, 16, 32]
 SK_CANDIDATES = [1, 2, 4, 8, 16, 32]
 NPW_CANDIDATES = {"w4a16": [1, 4], "w4a8": [1, 2, 4, 8], "mxfp4": [1, 2, 4, 8]}
-GROUP = {"w4a16": 128, "w4a8": 128, "mxfp4": 32}
+# The groups the loaded r4d.pyd was compiled with ("W4A16 GROUP" above). Legality and every scale
+# buffer's size come from these, so the sweep never hands a kernel a buffer sized for another group.
+GROUP = {"w4a16": r4d.GEMM_W4_GROUP, "w4a8": r4d.GEMM_W4A8_GROUP, "mxfp4": r4d.GEMM_MXFP4_GROUP}
+# The groups the r4dx build compiles w4a8/mxfp4 at (third_party/CMakeLists.txt); w4a16's is the
+# R4DX_W4A16_GROUP build option, taken from --w4a16-group.
+R4DX_GROUP = {"w4a8": 128, "mxfp4": 32}
 
 
 def mb_for(m: int) -> int:
@@ -166,11 +207,12 @@ def alloc_bf16(m, n, k, gen):
 def alloc_w4a16(m, n, k, gen):
     a = torch.randn(m, k, generator=gen, dtype=torch.float32).to(torch.bfloat16).to(DEVICE)
     c = torch.zeros(m, n, dtype=torch.bfloat16, device=DEVICE)
-    count = ring_count(n * (k // 2) + (n * k // 128) * 4)
+    nsz = n * k // GROUP["w4a16"]  # one (scale, zero) dword per (row, group)
+    count = ring_count(n * (k // 2) + nsz * 4)
     bufs = []
     for _ in range(count):
         wq = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8).to(DEVICE)
-        wsz = torch.randint(0, 2**31 - 1, (n * k // 128,), generator=gen, dtype=torch.int64) \
+        wsz = torch.randint(0, 2**31 - 1, (nsz,), generator=gen, dtype=torch.int64) \
             .to(torch.uint32 if hasattr(torch, "uint32") else torch.int32).to(DEVICE)
         bufs.append((wq, wsz))
     return a, bufs, c
@@ -180,11 +222,12 @@ def alloc_w4a8(m, n, k, gen):
     a = torch.randint(-127, 127, (m, k), generator=gen, dtype=torch.int8).to(DEVICE)
     ascale = torch.full((m,), 0.05, device=DEVICE)
     c = torch.zeros(m, n, dtype=torch.bfloat16, device=DEVICE)
-    count = ring_count(n * (k // 2) + (n * k // 128) * 4)
+    nws = n * k // GROUP["w4a8"]  # one scale dword per (row, group), f16 in the low half
+    count = ring_count(n * (k // 2) + nws * 4)
     bufs = []
     for _ in range(count):
         wq = torch.randint(0, 256, (n, k // 2), generator=gen, dtype=torch.uint8).to(DEVICE)
-        ws = torch.randint(0, 2**31 - 1, (n * k // 128,), generator=gen, dtype=torch.int64) \
+        ws = torch.randint(0, 2**31 - 1, (nws,), generator=gen, dtype=torch.int64) \
             .to(torch.uint32 if hasattr(torch, "uint32") else torch.int32).to(DEVICE)
         bufs.append((wq, ws))
     return a, ascale, bufs, c
@@ -291,6 +334,9 @@ def sweep_shape(layout, name, n, k, m_bands, iters):
 
 LAYOUT_ENUM = {"bf16": "Layout::kBf16", "w4a16": "Layout::kW4a16", "w4a8": "Layout::kW4a8",
                "mxfp4": "Layout::kMxfp4"}
+# One emitted row: `    {Layout::kW4a16, 10240, 5120, 1, {1, 2, 1, 1, 1}},  // gdn.in_proj_qkv 45.76us`
+# -> (layout enum, N, K, M, shape name), the key --replace matches on.
+ROW_RE = re.compile(r"^\s*\{(Layout::\w+), (\d+), (\d+), (\d+), \{[^}]*\}\},\s*// (\S+) ")
 
 
 def main():
@@ -311,7 +357,17 @@ def main():
                           "'};') instead of overwriting it. Requires --out to already exist and "
                           "contain a well-formed kGemmTuningTable array (i.e. a prior non---append "
                           "run's output).")
+    ap.add_argument("--replace", action="store_true",
+                     help="rewrite, in place in the existing --out file, exactly the rows this run "
+                          "sweeps -- matched on (layout, N, K, M, shape name) -- leaving every other "
+                          "row and the header untouched. Every swept row must already exist there.")
+    ap.add_argument("--w4a16-group", type=int, default=64,
+                     help="the R4DX_W4A16_GROUP of the r4dx build this table is for (default 64, "
+                          "that option's default). A w4a16 sweep refuses an r4d.pyd compiled at any "
+                          "other group -- see the module docstring's \"W4A16 GROUP\".")
     args = ap.parse_args()
+    if args.append and args.replace:
+        raise SystemExit("--append and --replace are mutually exclusive")
 
     if args.m_bands:
         m_bands = [int(x) for x in args.m_bands.split(",") if x]
@@ -324,6 +380,18 @@ def main():
     if shape_filter and len(shapes) != len(shape_filter):
         missing = shape_filter - {s[0] for s in shapes}
         raise SystemExit(f"--shapes named unknown shape(s): {sorted(missing)}")
+
+    want = dict(R4DX_GROUP, w4a16=args.w4a16_group)
+    print(f"r4d.pyd: {r4d.__file__}")
+    print("groups it was compiled with: " + ", ".join(f"{l}={g}" for l, g in GROUP.items()))
+    wrong = [l for l in layouts if l in want and GROUP[l] != want[l]]
+    if wrong:
+        raise SystemExit(
+            "refusing to sweep " + ", ".join(f"{l} (pyd group {GROUP[l]}, r4dx build group "
+                                              f"{want[l]})" for l in wrong) +
+            ": that would tune a kernel the r4dx build does not run. Build an r4d.pyd at the r4dx "
+            "group and point R4DX_LIBR4D_BUILD at it (module docstring, \"W4A16 GROUP\"), or pass "
+            "--w4a16-group to name the build this table is for.")
 
     all_rows = []  # (layout, name, N, K, M, WV, SK, MB, NPW, NT, us)
     print(f"{'layout':7s} {'shape':16s} {'N':>7s} {'K':>7s} {'M':>4s} {'WV/SK/MB/NPW':16s} {'us':>9s}")
@@ -352,12 +420,31 @@ def main():
         with open(args.out, "w") as f:
             f.writelines(merged)
         print(f"\nappended {len(all_rows)} rows to {args.out} (before line {close_idx + 1})")
+    elif args.replace:
+        with open(args.out) as f:
+            existing = f.readlines()
+        new = {(LAYOUT_ENUM[layout], n, k, m, name): line
+               for (layout, name, n, k, m, *_), line in zip(all_rows, row_lines)}
+        for i, line in enumerate(existing):
+            hit = ROW_RE.match(line)
+            if hit:
+                key = (hit[1], int(hit[2]), int(hit[3]), int(hit[4]), hit[5])
+                if key in new:
+                    existing[i] = new.pop(key)
+        if new:
+            raise SystemExit(f"--replace: {args.out} has no row for {sorted(new)} -- nothing "
+                              "written; use --append to add rows")
+        with open(args.out, "w") as f:
+            f.writelines(existing)
+        print(f"\nreplaced {len(all_rows)} rows in {args.out}")
     else:
         with open(args.out, "w") as f:
             f.write("// AUTO-GENERATED by tools/profile/tune_gemm.py -- do not hand-edit.\n")
             f.write("// Measured on HIP device 1, R9700 (gfx1201), this model's real (N,K) shapes.\n")
             f.write("// Included by src/model/linear.cpp's PickTuning; see that file for the fallback\n")
             f.write("// path when (layout,N,K,M) misses this table (an untuned shape/M combo).\n")
+            f.write("// Kernel groups swept: " +
+                    ", ".join(f"{l}={GROUP[l]}" for l in layouts if l in GROUP) + ".\n")
             f.write("static const GemmTuningRow kGemmTuningTable[] = {\n")
             f.writelines(row_lines)
             f.write("};\n")

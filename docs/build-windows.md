@@ -97,6 +97,11 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
    `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
    128 are the only values libr4d accepts unmodified**.
 
+A third place compiles this kernel outside CMake: libr4d's own `build_windows.ps1`, which builds the
+`r4d.pyd` that `tools/profile/tune_gemm.py` times. It passes no group flag, so a stock pyd is group
+128 and the tuner refuses to sweep w4a16 on it; `tune_gemm.py`'s module docstring ("W4A16 GROUP")
+has the recipe for a group-64 pyd.
+
 Bits per weight is `4 + 32/group` -- 4.25 at 128, 4.5 at 64. What the extra quarter-bit buys is
 measured in `docs/validation.md` "Milestone 11 / group size"; why 64 became the default is
 "Milestone 11 / recipe" in the same file.

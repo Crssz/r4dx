@@ -43,6 +43,16 @@ C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\profile\tun
     --out src\model\gemm_tuning_table.inc
 ```
 
+**The pyd must be built at the r4dx build's w4a16 group.** `r4d_gemm_w4a16_nt_m64` is compiled at
+one group size; the r4dx build uses `R4DX_W4A16_GROUP` (default 64), but libr4d's own
+`build_windows.ps1` passes no group flag, so a stock `build-win\r4d.pyd` is group 128. The tuner
+prints the groups the loaded pyd reports (`r4d.GEMM_W4_GROUP` etc.), sizes the scale buffers from
+them, and refuses a w4a16 sweep unless the pyd's group equals `--w4a16-group` (default 64). The
+three-line recipe for a group-64 pyd (`CCC_OVERRIDE_OPTIONS='+-DR4D_GEMM_W4_GROUP=64'` around
+`build_windows.ps1 -OutDir build-win\g64`, then `R4DX_LIBR4D_BUILD` pointed at it) is in
+`tune_gemm.py`'s module docstring, "W4A16 GROUP". `--layouts w4a16 --replace` re-tunes just the
+w4a16 rows in place.
+
 writes `src/model/gemm_tuning_table.inc` (checked in, git-tracked -- NOT gitignored, since
 `src/model/linear.cpp`'s `PickTuning` `#include`s it directly and the repo needs to build without
 requiring every checkout to have `r4d.pyd`/the reference venv available). Re-run after any kernel

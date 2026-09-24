@@ -1,5 +1,55 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## w4a16 group-64 tuning re-sweep (2026-09-24)
+
+**Why.** `src/model/gemm_tuning_table.inc`'s 70 w4a16 rows came from the Milestone 4 sweep
+(2026-09-20), which timed `r4d_gemm_w4a16_nt_m64` at group 128. Milestone 11 made the group a build
+option and moved the default to 64, and `qwen38-27b-v6.r4dx` is packed at 64, so production has
+been running a kernel none of its w4a16 rows were tuned on. `tools/profile/tune_gemm.py` could not
+re-tune it. It sized `wsz` as `N*K/128` regardless of the kernel, and the `r4d.pyd` it times comes
+from libr4d's own `build_windows.ps1`, which passes no group flag, so it was always the kernel
+source's default of 128.
+
+**What changed in the tool.** It now reads the groups the loaded pyd was compiled with
+(`r4d.GEMM_W4_GROUP` etc.), prints them, sizes every scale buffer from them, and refuses to sweep
+w4a16 unless the pyd's group equals `--w4a16-group` (default 64). Its module docstring ("W4A16
+GROUP") has the recipe for a group-64 pyd. The recipe wraps `CCC_OVERRIDE_OPTIONS` around an
+unmodified `build_windows.ps1`, built with `C:\opt\rocm`, the same HIP SDK the r4dx build uses.
+`--layouts w4a16 --replace` rewrote just those 70 rows in place (all 10 shapes x 7 M-bands, 40
+iterations, the Q5 ring rotation, HIP device 1).
+
+**What the sweep picked.** 64 of 70 rows changed. 30 of the new picks are SK=16 at K=5120 or
+K=17408, which splits K into whole groups at 64 but not at 128. They concentrate in the M=8 band,
+which is exactly DFlash k=7's `k+1`-row verify window: every K=5120/17408 shape picks SK=16 there.
+Such rows would make a `win-hip-g128` build's kernel throw, so `ResolveTuning` (`linear.cpp`) now
+skips a w4a16 row that is not legal at the running build's group. `tests/model/test_pick_tuning`
+checks that every tuning `PickTuning` returns for a table shape is launchable at the build's groups.
+The sweep's own M=1 microseconds are 0-6% above the old table's, but that compares two kernels:
+group 64 reads 5.9% more bytes (4.5 vs 4.25 bits/weight). `lm_head`, the most purely DRAM-bound
+shape, moved +5.8%.
+
+**End to end.** `qwen38-27b-v6.r4dx`, the Milestone 11 protocol below (standard prompt, `--layout
+w4a16 --vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048 --stats`, HIP device
+1 with the GPU to itself), twice each. Both binaries come from the same worktree build and differ
+only in the table:
+
+| Path | Old table (g128 rows) | **Re-swept (g64 rows)** | Delta | Acceptance / tok-round |
+|---|--:|--:|--:|---|
+| plain | 35.75, 35.74 | **35.99, 35.98** | **+0.7%** | -- |
+| `--dflash` k=7 | 71.97, 71.90 | **73.50, 73.66** | **+2.3%** | 24.9% / 2.71, both tables |
+
+Prefill (612-705 tok/s on the 29-token prompt) and VRAM (17.01 GiB plain, 19.04 GiB with the
+drafter) did not change. The two batches ran about 25 minutes apart, not interleaved. The plain
+delta is about the size of the between-batch drift this file has seen before, so read it as "no
+regression". DFlash's +2.3% is three times larger, which fits the verify band being where the new
+SK=16 picks are, though this A/B does not isolate that cause.
+
+**The greedy text changed, as retiling does.** Both runs of each config are byte-identical, and
+every run ends on EOS at 84 tokens. Between tables, plain decode swaps one word ("handle" ->
+"perform") and DFlash rephrases one sentence. A different SK sums each dot product in a different
+order, which can flip an argmax on a near-tie. That is the same mechanism the Milestone 4 re-sweep
+documented below. The weights, the kernel and the arithmetic are unchanged.
+
 ## Milestone 11: what the v6 container costs in tok/s (2026-09-22)
 
 `D:\models\r4dx\qwen38-27b-v6.r4dx` buys **-27.9% mean KL** (0.05342 -> 0.03851) and **+1.64 points

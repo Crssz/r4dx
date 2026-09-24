@@ -98,6 +98,17 @@ add_executable(test_mtp_round test_mtp_round.cpp)
 target_include_directories(test_mtp_round PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_mtp_round COMMAND test_mtp_round)
 
+# test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
+# covers must be launchable at THIS build's kernel groups -- the table is swept at one
+# R4DX_W4A16_GROUP but compiled into both builds (linear.cpp's ResolveTuning skips the rows that
+# are not). Host-only (no HIP call, no container), so it always runs; HIP_VISIBLE_DEVICES=1 only
+# because linking r4dx_model loads the HIP runtime, which must never see device 0.
+add_executable(test_pick_tuning test_pick_tuning.cpp)
+target_include_directories(test_pick_tuning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_link_libraries(test_pick_tuning PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME test_pick_tuning COMMAND test_pick_tuning)
+set_tests_properties(test_pick_tuning PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+
 # test_dflash_draft_weights: task A1 item 3's CPU-only DflashDraftWeights loader stub
 # (src/model/dflash_draft_weights.h -- metadata + tensor directory, no device upload). Links only
 # r4dx_convert (header-only: SafetensorsReader, GgufReader, dflash2_container writer helpers used

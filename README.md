@@ -60,8 +60,9 @@ golden-case suite, `src/model`'s per-layer tests (GDN layer, full-attention laye
 final-norm+lm_head, the mrope-carrying attention layer, assembled-`Model` forward-pass smoke
 including a prefill/decode state-handoff equivalence check and a `Model::Reset()` byte-identity
 check, MTP's verify/rejection-rewind/mid-round-commit/K=16-wide-window/reduced-vocab-draft-head-
-lossless tests, and the pure-CPU `mtp_round` commit-bookkeeping tests, including a K=16 wide-round
-case), `src/cli`'s argument-parsing tests (including `--mtp-draft-head` and `--image`), `src/server`'s
+lossless tests, the pure-CPU `mtp_round` commit-bookkeeping tests, including a K=16 wide-round
+case, and `test_pick_tuning`, which checks every GEMM tuning the table hands out is launchable at
+the build's kernel groups), `src/cli`'s argument-parsing tests (including `--mtp-draft-head` and `--image`), `src/server`'s
 CPU-only tests (CLI args including `--mtp-draft-head`, OpenAI request/response JSON shapes including
 `tools`/`tool_choice`/`role: "tool"`/`"function"` parsing and image content parts, SSE framing,
 buffering/streaming sinks including the tool-calls streaming chunk shape, the bounded request queue,
@@ -70,9 +71,10 @@ buffering/streaming sinks including the tool-calls streaming chunk shape, the bo
 index-math goldens, the whole tower against the real checkpoint's forward, and the shared
 `ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). 64 tests are registered without the reference venv (66 with it): all pass
-but 1, which skips (`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP
-device 1 (2026-09-23, default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
+`ctest` invocation). 65 tests are registered without the reference venv (67 with it). The last
+full run, at 64 before `test_pick_tuning` was added, passed all but 1, which skips
+(`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP device 1 (2026-09-23,
+default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
 either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
 production v6/v3 container packed at their own build's w4a16 group (`docs/build-windows.md` "w4a16
 group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are

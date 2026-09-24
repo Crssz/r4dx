@@ -3,8 +3,17 @@
 // Included by src/model/linear.cpp's PickTuning; see that file for the fallback
 // path when (layout,N,K,M) misses this table (an untuned shape/M combo).
 //
+// w4a16 ROWS (2026-09-24, group-64 re-sweep): the 70 kW4a16 rows were re-swept on their own
+// (`tune_gemm.py --layouts w4a16 --replace`, same Q5 ring-rotation harness as below) against
+// r4d_gemm_w4a16_nt_m64 compiled at group 64 -- the R4DX_W4A16_GROUP default since Milestone 11
+// and the group qwen38-27b-v6.r4dx is packed at. The Milestone 4 sweep below had timed the
+// group-128 kernel for them. 64/70 rows picked a different tuning, and 30 of those picks are SK=16
+// at K=5120/17408, legal at group 64 only; linear.cpp's ResolveTuning skips them on a group-128
+// build (tests/model/test_pick_tuning). bf16/w4a8/mxfp4 (210 rows) are unchanged. End-to-end
+// before/after: docs/perf.md "w4a16 group-64 tuning re-sweep".
+//
 // PROVENANCE NOTE (Milestone 4, 2026-09-20, full re-sweep with the fixed methodology): every one of
-// the 280 rows below comes from a single `tools\profile\tune_gemm.py` run (no --shapes/--m-bands
+// the 280 rows below came from a single `tools\profile\tune_gemm.py` run (no --shapes/--m-bands
 // filter, all four layouts, all ten shapes, all seven M-bands) using the SAME Q5-fixed ring-rotation
 // harness the prior pass's provenance note flagged as unapplied to the full table (>=4 distinct
 // weight buffers totalling >256 MiB, rotated once per timed call via `RingCall`, so the 64 MiB
@@ -100,76 +109,76 @@ static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kBf16, 1024, 5120, 16, {1, 8, 1, 1, 1}},  // attn.v 24.36us
     {Layout::kBf16, 1024, 5120, 32, {2, 4, 2, 1, 1}},  // attn.v 22.46us
     {Layout::kBf16, 1024, 5120, 64, {2, 4, 4, 1, 1}},  // attn.v 26.48us
-    {Layout::kW4a16, 10240, 5120, 1, {1, 2, 1, 1, 1}},  // gdn.in_proj_qkv 45.76us
-    {Layout::kW4a16, 10240, 5120, 2, {4, 2, 1, 1, 1}},  // gdn.in_proj_qkv 46.69us
-    {Layout::kW4a16, 10240, 5120, 4, {2, 2, 1, 1, 1}},  // gdn.in_proj_qkv 45.71us
-    {Layout::kW4a16, 10240, 5120, 8, {1, 2, 1, 1, 1}},  // gdn.in_proj_qkv 47.70us
-    {Layout::kW4a16, 10240, 5120, 16, {4, 4, 1, 1, 1}},  // gdn.in_proj_qkv 46.03us
-    {Layout::kW4a16, 10240, 5120, 32, {1, 4, 2, 4, 1}},  // gdn.in_proj_qkv 56.47us
-    {Layout::kW4a16, 10240, 5120, 64, {2, 4, 4, 1, 1}},  // gdn.in_proj_qkv 108.77us
-    {Layout::kW4a16, 5120, 6144, 1, {1, 4, 1, 1, 1}},  // gdn.out_proj 29.43us
-    {Layout::kW4a16, 5120, 6144, 2, {1, 4, 1, 1, 1}},  // gdn.out_proj 29.82us
-    {Layout::kW4a16, 5120, 6144, 4, {2, 4, 1, 1, 1}},  // gdn.out_proj 29.10us
-    {Layout::kW4a16, 5120, 6144, 8, {2, 4, 1, 1, 1}},  // gdn.out_proj 29.25us
-    {Layout::kW4a16, 5120, 6144, 16, {2, 8, 1, 1, 1}},  // gdn.out_proj 31.23us
-    {Layout::kW4a16, 5120, 6144, 32, {1, 8, 2, 4, 1}},  // gdn.out_proj 41.50us
-    {Layout::kW4a16, 5120, 6144, 64, {4, 4, 4, 1, 1}},  // gdn.out_proj 74.91us
-    {Layout::kW4a16, 12288, 5120, 1, {2, 2, 1, 1, 1}},  // attn.qg 54.12us
-    {Layout::kW4a16, 12288, 5120, 2, {1, 4, 1, 1, 1}},  // attn.qg 54.33us
-    {Layout::kW4a16, 12288, 5120, 4, {2, 1, 1, 1, 1}},  // attn.qg 54.17us
-    {Layout::kW4a16, 12288, 5120, 8, {32, 1, 1, 1, 1}},  // attn.qg 54.92us
-    {Layout::kW4a16, 12288, 5120, 16, {1, 4, 1, 1, 1}},  // attn.qg 54.90us
-    {Layout::kW4a16, 12288, 5120, 32, {2, 4, 2, 4, 1}},  // attn.qg 68.96us
-    {Layout::kW4a16, 12288, 5120, 64, {8, 4, 4, 1, 1}},  // attn.qg 127.94us
-    {Layout::kW4a16, 5120, 6144, 1, {4, 4, 1, 1, 1}},  // attn.o 29.15us
-    {Layout::kW4a16, 5120, 6144, 2, {2, 4, 1, 1, 1}},  // attn.o 29.20us
-    {Layout::kW4a16, 5120, 6144, 4, {4, 4, 1, 1, 1}},  // attn.o 30.81us
-    {Layout::kW4a16, 5120, 6144, 8, {1, 4, 1, 1, 1}},  // attn.o 29.62us
-    {Layout::kW4a16, 5120, 6144, 16, {1, 16, 1, 1, 1}},  // attn.o 30.18us
-    {Layout::kW4a16, 5120, 6144, 32, {1, 8, 2, 4, 1}},  // attn.o 39.40us
-    {Layout::kW4a16, 5120, 6144, 64, {4, 4, 4, 1, 1}},  // attn.o 72.01us
-    {Layout::kW4a16, 34816, 5120, 1, {4, 4, 1, 1, 1}},  // mlp.gate_up 145.67us
-    {Layout::kW4a16, 34816, 5120, 2, {4, 4, 1, 1, 1}},  // mlp.gate_up 146.20us
-    {Layout::kW4a16, 34816, 5120, 4, {1, 8, 1, 1, 1}},  // mlp.gate_up 147.28us
-    {Layout::kW4a16, 34816, 5120, 8, {2, 8, 1, 1, 1}},  // mlp.gate_up 151.22us
-    {Layout::kW4a16, 34816, 5120, 16, {2, 8, 1, 1, 1}},  // mlp.gate_up 154.83us
-    {Layout::kW4a16, 34816, 5120, 32, {1, 8, 2, 4, 1}},  // mlp.gate_up 177.42us
-    {Layout::kW4a16, 34816, 5120, 64, {8, 4, 4, 1, 1}},  // mlp.gate_up 352.38us
-    {Layout::kW4a16, 5120, 17408, 1, {4, 4, 1, 1, 1}},  // mlp.down 74.82us
-    {Layout::kW4a16, 5120, 17408, 2, {4, 2, 1, 1, 1}},  // mlp.down 74.80us
-    {Layout::kW4a16, 5120, 17408, 4, {4, 4, 1, 1, 1}},  // mlp.down 74.99us
-    {Layout::kW4a16, 5120, 17408, 8, {1, 8, 1, 1, 1}},  // mlp.down 76.28us
-    {Layout::kW4a16, 5120, 17408, 16, {2, 1, 1, 1, 1}},  // mlp.down 77.99us
-    {Layout::kW4a16, 5120, 17408, 32, {1, 8, 2, 4, 1}},  // mlp.down 95.73us
-    {Layout::kW4a16, 5120, 17408, 64, {2, 4, 4, 1, 1}},  // mlp.down 214.83us
-    {Layout::kW4a16, 248320, 5120, 1, {2, 2, 1, 1, 1}},  // lm_head 1065.87us
-    {Layout::kW4a16, 248320, 5120, 2, {1, 8, 1, 1, 1}},  // lm_head 1070.82us
-    {Layout::kW4a16, 248320, 5120, 4, {1, 8, 1, 1, 1}},  // lm_head 1080.84us
-    {Layout::kW4a16, 248320, 5120, 8, {2, 8, 1, 1, 1}},  // lm_head 1098.45us
-    {Layout::kW4a16, 248320, 5120, 16, {1, 8, 1, 1, 1}},  // lm_head 1128.56us
-    {Layout::kW4a16, 248320, 5120, 32, {1, 8, 2, 4, 1}},  // lm_head 1201.75us
-    {Layout::kW4a16, 248320, 5120, 64, {8, 4, 4, 1, 1}},  // lm_head 2641.64us
-    {Layout::kW4a16, 6144, 5120, 1, {1, 8, 1, 1, 1}},  // gdn.in_proj_z 29.25us
-    {Layout::kW4a16, 6144, 5120, 2, {2, 2, 1, 1, 1}},  // gdn.in_proj_z 28.96us
-    {Layout::kW4a16, 6144, 5120, 4, {8, 2, 1, 1, 1}},  // gdn.in_proj_z 29.78us
-    {Layout::kW4a16, 6144, 5120, 8, {2, 4, 1, 1, 1}},  // gdn.in_proj_z 29.52us
-    {Layout::kW4a16, 6144, 5120, 16, {4, 8, 1, 1, 1}},  // gdn.in_proj_z 30.11us
-    {Layout::kW4a16, 6144, 5120, 32, {1, 8, 2, 4, 1}},  // gdn.in_proj_z 36.30us
-    {Layout::kW4a16, 6144, 5120, 64, {4, 4, 4, 1, 1}},  // gdn.in_proj_z 70.45us
-    {Layout::kW4a16, 1024, 5120, 1, {2, 8, 1, 1, 1}},  // attn.k 8.73us
-    {Layout::kW4a16, 1024, 5120, 2, {4, 8, 1, 1, 1}},  // attn.k 9.89us
-    {Layout::kW4a16, 1024, 5120, 4, {1, 8, 1, 1, 1}},  // attn.k 9.10us
-    {Layout::kW4a16, 1024, 5120, 8, {1, 4, 1, 1, 1}},  // attn.k 9.20us
-    {Layout::kW4a16, 1024, 5120, 16, {1, 4, 1, 1, 1}},  // attn.k 8.90us
-    {Layout::kW4a16, 1024, 5120, 32, {2, 8, 2, 1, 1}},  // attn.k 12.64us
-    {Layout::kW4a16, 1024, 5120, 64, {4, 8, 4, 1, 1}},  // attn.k 23.95us
-    {Layout::kW4a16, 1024, 5120, 1, {1, 8, 1, 1, 1}},  // attn.v 8.70us
-    {Layout::kW4a16, 1024, 5120, 2, {4, 8, 1, 1, 1}},  // attn.v 8.59us
-    {Layout::kW4a16, 1024, 5120, 4, {2, 8, 1, 1, 1}},  // attn.v 8.45us
-    {Layout::kW4a16, 1024, 5120, 8, {2, 8, 1, 1, 1}},  // attn.v 8.33us
-    {Layout::kW4a16, 1024, 5120, 16, {1, 4, 1, 1, 1}},  // attn.v 8.82us
-    {Layout::kW4a16, 1024, 5120, 32, {1, 8, 2, 1, 1}},  // attn.v 13.51us
-    {Layout::kW4a16, 1024, 5120, 64, {1, 8, 4, 1, 1}},  // attn.v 22.53us
+    {Layout::kW4a16, 10240, 5120, 1, {2, 2, 1, 1, 1}},  // gdn.in_proj_qkv 46.49us
+    {Layout::kW4a16, 10240, 5120, 2, {1, 16, 1, 1, 1}},  // gdn.in_proj_qkv 46.67us
+    {Layout::kW4a16, 10240, 5120, 4, {1, 16, 1, 1, 1}},  // gdn.in_proj_qkv 46.48us
+    {Layout::kW4a16, 10240, 5120, 8, {1, 16, 1, 1, 1}},  // gdn.in_proj_qkv 46.74us
+    {Layout::kW4a16, 10240, 5120, 16, {2, 16, 1, 1, 1}},  // gdn.in_proj_qkv 46.38us
+    {Layout::kW4a16, 10240, 5120, 32, {4, 1, 2, 1, 1}},  // gdn.in_proj_qkv 53.43us
+    {Layout::kW4a16, 10240, 5120, 64, {2, 4, 4, 4, 1}},  // gdn.in_proj_qkv 106.25us
+    {Layout::kW4a16, 5120, 6144, 1, {4, 2, 1, 1, 1}},  // gdn.out_proj 30.03us
+    {Layout::kW4a16, 5120, 6144, 2, {4, 4, 1, 1, 1}},  // gdn.out_proj 30.54us
+    {Layout::kW4a16, 5120, 6144, 4, {16, 2, 1, 1, 1}},  // gdn.out_proj 30.42us
+    {Layout::kW4a16, 5120, 6144, 8, {1, 4, 1, 1, 1}},  // gdn.out_proj 30.55us
+    {Layout::kW4a16, 5120, 6144, 16, {2, 2, 1, 1, 1}},  // gdn.out_proj 29.55us
+    {Layout::kW4a16, 5120, 6144, 32, {2, 2, 2, 1, 1}},  // gdn.out_proj 34.35us
+    {Layout::kW4a16, 5120, 6144, 64, {1, 8, 4, 4, 1}},  // gdn.out_proj 69.25us
+    {Layout::kW4a16, 12288, 5120, 1, {1, 4, 1, 1, 1}},  // attn.qg 54.68us
+    {Layout::kW4a16, 12288, 5120, 2, {4, 4, 1, 1, 1}},  // attn.qg 56.16us
+    {Layout::kW4a16, 12288, 5120, 4, {1, 16, 1, 1, 1}},  // attn.qg 54.69us
+    {Layout::kW4a16, 12288, 5120, 8, {1, 16, 1, 1, 1}},  // attn.qg 55.60us
+    {Layout::kW4a16, 12288, 5120, 16, {1, 16, 1, 1, 1}},  // attn.qg 55.38us
+    {Layout::kW4a16, 12288, 5120, 32, {1, 16, 2, 4, 1}},  // attn.qg 64.16us
+    {Layout::kW4a16, 12288, 5120, 64, {1, 4, 4, 4, 1}},  // attn.qg 133.88us
+    {Layout::kW4a16, 5120, 6144, 1, {1, 4, 1, 1, 1}},  // attn.o 30.36us
+    {Layout::kW4a16, 5120, 6144, 2, {1, 4, 1, 1, 1}},  // attn.o 29.69us
+    {Layout::kW4a16, 5120, 6144, 4, {2, 2, 1, 1, 1}},  // attn.o 29.60us
+    {Layout::kW4a16, 5120, 6144, 8, {2, 4, 1, 1, 1}},  // attn.o 29.59us
+    {Layout::kW4a16, 5120, 6144, 16, {2, 2, 1, 1, 1}},  // attn.o 30.11us
+    {Layout::kW4a16, 5120, 6144, 32, {2, 2, 2, 1, 1}},  // attn.o 35.18us
+    {Layout::kW4a16, 5120, 6144, 64, {1, 8, 4, 4, 1}},  // attn.o 70.51us
+    {Layout::kW4a16, 34816, 5120, 1, {1, 4, 1, 1, 1}},  // mlp.gate_up 145.90us
+    {Layout::kW4a16, 34816, 5120, 2, {1, 8, 1, 1, 1}},  // mlp.gate_up 146.26us
+    {Layout::kW4a16, 34816, 5120, 4, {1, 8, 1, 1, 1}},  // mlp.gate_up 147.75us
+    {Layout::kW4a16, 34816, 5120, 8, {1, 16, 1, 1, 1}},  // mlp.gate_up 148.75us
+    {Layout::kW4a16, 34816, 5120, 16, {2, 16, 1, 1, 1}},  // mlp.gate_up 154.85us
+    {Layout::kW4a16, 34816, 5120, 32, {1, 16, 2, 4, 1}},  // mlp.gate_up 168.58us
+    {Layout::kW4a16, 34816, 5120, 64, {1, 1, 4, 4, 1}},  // mlp.gate_up 368.62us
+    {Layout::kW4a16, 5120, 17408, 1, {1, 16, 1, 1, 1}},  // mlp.down 75.60us
+    {Layout::kW4a16, 5120, 17408, 2, {1, 2, 1, 1, 1}},  // mlp.down 75.29us
+    {Layout::kW4a16, 5120, 17408, 4, {1, 16, 1, 1, 1}},  // mlp.down 76.32us
+    {Layout::kW4a16, 5120, 17408, 8, {2, 16, 1, 1, 1}},  // mlp.down 76.11us
+    {Layout::kW4a16, 5120, 17408, 16, {2, 2, 1, 1, 1}},  // mlp.down 77.70us
+    {Layout::kW4a16, 5120, 17408, 32, {1, 8, 2, 4, 1}},  // mlp.down 93.60us
+    {Layout::kW4a16, 5120, 17408, 64, {1, 8, 4, 4, 1}},  // mlp.down 171.11us
+    {Layout::kW4a16, 248320, 5120, 1, {1, 4, 1, 1, 1}},  // lm_head 1127.20us
+    {Layout::kW4a16, 248320, 5120, 2, {1, 8, 1, 1, 1}},  // lm_head 1131.93us
+    {Layout::kW4a16, 248320, 5120, 4, {1, 16, 1, 1, 1}},  // lm_head 1141.86us
+    {Layout::kW4a16, 248320, 5120, 8, {1, 16, 1, 1, 1}},  // lm_head 1157.42us
+    {Layout::kW4a16, 248320, 5120, 16, {2, 16, 1, 1, 1}},  // lm_head 1182.35us
+    {Layout::kW4a16, 248320, 5120, 32, {1, 16, 2, 4, 1}},  // lm_head 1246.95us
+    {Layout::kW4a16, 248320, 5120, 64, {8, 4, 4, 1, 1}},  // lm_head 2996.20us
+    {Layout::kW4a16, 6144, 5120, 1, {4, 2, 1, 1, 1}},  // gdn.in_proj_z 29.79us
+    {Layout::kW4a16, 6144, 5120, 2, {4, 2, 1, 1, 1}},  // gdn.in_proj_z 30.53us
+    {Layout::kW4a16, 6144, 5120, 4, {2, 4, 1, 1, 1}},  // gdn.in_proj_z 30.49us
+    {Layout::kW4a16, 6144, 5120, 8, {1, 16, 1, 1, 1}},  // gdn.in_proj_z 29.43us
+    {Layout::kW4a16, 6144, 5120, 16, {2, 16, 1, 1, 1}},  // gdn.in_proj_z 29.82us
+    {Layout::kW4a16, 6144, 5120, 32, {1, 16, 2, 4, 1}},  // gdn.in_proj_z 35.04us
+    {Layout::kW4a16, 6144, 5120, 64, {2, 4, 4, 1, 1}},  // gdn.in_proj_z 74.38us
+    {Layout::kW4a16, 1024, 5120, 1, {2, 16, 1, 1, 1}},  // attn.k 8.31us
+    {Layout::kW4a16, 1024, 5120, 2, {1, 16, 1, 1, 1}},  // attn.k 8.50us
+    {Layout::kW4a16, 1024, 5120, 4, {2, 16, 1, 1, 1}},  // attn.k 8.19us
+    {Layout::kW4a16, 1024, 5120, 8, {2, 16, 1, 1, 1}},  // attn.k 9.51us
+    {Layout::kW4a16, 1024, 5120, 16, {1, 16, 1, 1, 1}},  // attn.k 10.11us
+    {Layout::kW4a16, 1024, 5120, 32, {1, 8, 2, 1, 1}},  // attn.k 10.90us
+    {Layout::kW4a16, 1024, 5120, 64, {2, 8, 4, 1, 1}},  // attn.k 19.34us
+    {Layout::kW4a16, 1024, 5120, 1, {1, 8, 1, 1, 1}},  // attn.v 8.73us
+    {Layout::kW4a16, 1024, 5120, 2, {2, 16, 1, 1, 1}},  // attn.v 9.39us
+    {Layout::kW4a16, 1024, 5120, 4, {2, 16, 1, 1, 1}},  // attn.v 9.65us
+    {Layout::kW4a16, 1024, 5120, 8, {2, 16, 1, 1, 1}},  // attn.v 9.49us
+    {Layout::kW4a16, 1024, 5120, 16, {1, 16, 1, 1, 1}},  // attn.v 9.79us
+    {Layout::kW4a16, 1024, 5120, 32, {1, 8, 2, 1, 1}},  // attn.v 9.73us
+    {Layout::kW4a16, 1024, 5120, 64, {2, 8, 4, 1, 1}},  // attn.v 20.01us
     {Layout::kW4a8, 10240, 5120, 1, {16, 2, 1, 1, 1}},  // gdn.in_proj_qkv 46.76us
     {Layout::kW4a8, 10240, 5120, 2, {4, 2, 1, 1, 1}},  // gdn.in_proj_qkv 45.50us
     {Layout::kW4a8, 10240, 5120, 4, {2, 1, 1, 1, 1}},  // gdn.in_proj_qkv 45.91us

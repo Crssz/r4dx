@@ -19,12 +19,13 @@ constexpr int64_t kMaxChunkM = 64;
 // Hand-derived fallback, legal for every (layout,N,K) shape this model has (used only when
 // gemm_tuning_table.inc has no row for the requested shape -- see PickTuning below and linear.h's
 // comment). Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16:
-// group 16, w4a16/w4a8: group 128, mxfp4: group 32) and N divisible by 16. This model's only K
-// values are hidden_size=5120, intermediate_size=17408, and value_dim=6144 (attn.o's K =
-// num_heads*head_dim = 6144 too) -- all three are multiples of 512 (5120/512=10, 17408/512=34,
-// 6144/512=12), which is the tightest of the three group requirements (SK=4 * group=128), so SK=4
-// clears every layout at once. WV=4/SK=4 keeps the block at 512 threads (WV*SK*32, under the 1024
-// cap every kernel enforces) and the LDS reduction buffer at 16 KiB (under the 64 KiB cap); MB=1
+// group 16, w4a16: 64 or 128 (R4DX_W4A16_GROUP), w4a8: 128, mxfp4: group 32) and N divisible by
+// 16. This model's only K values are hidden_size=5120, intermediate_size=17408, and
+// value_dim=6144 (attn.o's K = num_heads*head_dim = 6144 too) -- all three are multiples of 512
+// (5120/512=10, 17408/512=34, 6144/512=12), which is the tightest of the group requirements
+// (SK=4 * group=128), so SK=4 clears every layout at once. WV=4/SK=4 keeps the block at 512
+// threads (WV*SK*32, under the 1024 cap every kernel enforces) and the LDS reduction buffer at 16
+// KiB (under the 64 KiB cap); MB=1
 // and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16 /
 // {1,2,4,8} for w4a8/mxfp4) and NT=1 takes the non-temporal weight-load path
 // r4d_gemm_w4a16_nt_m64.hip's own comment recommends for a weight that is read once per step and
@@ -53,10 +54,16 @@ LinearTuning FallbackTuning(Layout /*layout*/, int64_t N, int64_t K) {
 // Internal linkage (not declared in linear.h) -- the actual table scan, now called only on a
 // PickTuning cache miss (see below).
 static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
+  // The table's w4a16 rows are swept at one R4DX_W4A16_GROUP (tools/profile/tune_gemm.py), but one
+  // table serves every build: a row that splits K into SK slices of whole groups at 64 need not at
+  // 128 (SK=16 at K=5120), and the kernel throws on it. Such a row is skipped here, so this build
+  // falls through to the next wider M-band's row, then FallbackTuning, never an illegal launch.
+  static const int64_t kW4a16Group = r4d_gemm_w4a16_nt_m64_group();
   const GemmTuningRow* best = nullptr;
   for (const GemmTuningRow& row : kGemmTuningTable) {
     if (row.layout != layout || row.N != N || row.K != K) continue;
     if (row.M < M) continue;  // only ever round UP to a wider-or-equal measured M-band
+    if (layout == Layout::kW4a16 && K % (row.tuning.SK * kW4a16Group) != 0) continue;
     if (best == nullptr || row.M < best->M) best = &row;
   }
   if (best != nullptr) return best->tuning;

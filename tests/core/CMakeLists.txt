@@ -4,3 +4,10 @@ add_test(NAME test_core COMMAND test_core)
 # See tests/kernels/CMakeLists.txt's comment on this property: pins the test to HIP device 1
 # (the project's only permitted GPU) regardless of how ctest itself was invoked.
 set_tests_properties(test_core PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+
+# Tensor-parallel P1 (docs/tp.md 10.1): r4dx::core::HostExchange (tp_host_exchange.hpp) between
+# CPU threads. It makes no HIP call (r4dx_core is linked for its include dirs: tp_comm.hpp names
+# hipStream_t), so it is a plain add_test() with no HIP environment.
+add_executable(test_tp_host_exchange test_tp_host_exchange.cpp)
+target_link_libraries(test_tp_host_exchange PRIVATE r4dx_core)
+add_test(NAME test_tp_host_exchange COMMAND test_tp_host_exchange)

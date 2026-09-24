@@ -47,6 +47,18 @@ struct ModelConfig {
   bool tie_word_embeddings = false;
   int64_t mtp_num_hidden_layers = 1;
 
+  // ---- tensor parallel (docs/tp.md section 3.1) ----------------------------------------------
+  // A config is either GLOBAL (tp_world == 1: the model as the container describes it) or the
+  // rank-local view Shard() returns (tp_world > 1): the head counts and intermediate_size of that
+  // rank's column-/row-parallel slices, everything else unchanged. vocab_size deliberately stays
+  // GLOBAL in both (the embedding table, the sampler and every token-id range check need the full
+  // vocabulary); the rank's lm_head width is VocabShardSize().
+  int tp_world = 1;
+  int tp_rank = 0;
+  int64_t VocabShardSize() const { return vocab_size / tp_world; }
+  int64_t VocabShardBegin() const { return tp_rank * VocabShardSize(); }
+  bool IsShard() const { return tp_world > 1; }
+
   // ---- derived shapes, named exactly as docs/architecture.md / docs/container-format.md do ----
   int64_t KeyDim() const { return linear_num_key_heads * linear_key_head_dim; }
   int64_t ValueDim() const { return linear_num_value_heads * linear_value_head_dim; }
@@ -159,6 +171,89 @@ struct ModelConfig {
       c.mtp_num_hidden_layers = text_cfg.at("mtp_num_hidden_layers").get<int64_t>();
 
     return c;
+  }
+
+  // The rank-local config of `global` for tensor-parallel world `world`, rank `rank` (docs/tp.md
+  // 3.1): num_attention_heads, num_key_value_heads, intermediate_size, linear_num_key_heads and
+  // linear_num_value_heads are divided by `world`; tp_world/tp_rank are set; every other field
+  // (including vocab_size) is copied. Throws std::invalid_argument naming the failing field unless
+  // every shape the rank's kernels will see is legal:
+  //   world in {1,2}; 0 <= rank < world; global.tp_world == 1 (no double sharding);
+  //   !tie_word_embeddings (lm_head is vocab-split, the embedding table is replicated);
+  //   the four head counts and intermediate_size divide by `world`; AttnGqa()/GqaRepeats()
+  //   unchanged (the contiguous-head-block mapping of docs/tp.md 4.2 depends on it);
+  //   every row-parallel rank K % 512 == 0 (attn.o, gdn.out_proj, mlp.down -- FallbackTuning's
+  //   requirement, linear.cpp; it also implies every quant group and packed block divides it);
+  //   every column-parallel rank segment % 16 == 0 (one 16-row tile never straddles two ranks);
+  //   vocab_size % (16 * world) == 0 (the lm_head shard is whole tiles).
+  // Every check applies at world 1 too, so Shard() accepts exactly the configs TP can serve. That
+  // is why the TP=1 load path (tp_world == 1, docs/tp.md 5.1 step 7) must NOT call it: it keeps
+  // the parsed config as is, and still loads e.g. a tied-embedding container Shard would refuse.
+  static ModelConfig Shard(const ModelConfig& global, int world, int rank) {
+    const std::string where = "ModelConfig::Shard(world=" + std::to_string(world) +
+                              ", rank=" + std::to_string(rank) + "): ";
+    const auto fail = [&](const std::string& what) { throw std::invalid_argument(where + what); };
+    const auto require_div = [&](const char* field, int64_t value, int64_t divisor) {
+      if (divisor <= 0 || value % divisor != 0) {
+        fail(std::string(field) + " = " + std::to_string(value) + " is not divisible by " +
+             std::to_string(divisor));
+      }
+    };
+
+    if (world != 1 && world != 2) fail("world must be 1 or 2");
+    if (rank < 0 || rank >= world) fail("rank must be in [0, world)");
+    if (global.tp_world != 1) {
+      fail("tp_world = " + std::to_string(global.tp_world) +
+           " -- `global` is already a rank shard (no double sharding)");
+    }
+    if (global.tie_word_embeddings) {
+      fail("tie_word_embeddings = true is not supported (lm_head is vocab-split while "
+           "text.embed_tokens is replicated)");
+    }
+
+    require_div("num_attention_heads", global.num_attention_heads, world);
+    require_div("num_key_value_heads", global.num_key_value_heads, world);
+    require_div("linear_num_key_heads", global.linear_num_key_heads, world);
+    require_div("linear_num_value_heads", global.linear_num_value_heads, world);
+    require_div("intermediate_size", global.intermediate_size, world);
+
+    ModelConfig r = global;
+    r.tp_world = world;
+    r.tp_rank = rank;
+    r.num_attention_heads = global.num_attention_heads / world;
+    r.num_key_value_heads = global.num_key_value_heads / world;
+    r.linear_num_key_heads = global.linear_num_key_heads / world;
+    r.linear_num_value_heads = global.linear_num_value_heads / world;
+    r.intermediate_size = global.intermediate_size / world;
+
+    if (r.AttnGqa() != global.AttnGqa()) {
+      fail("AttnGqa() changes from " + std::to_string(global.AttnGqa()) + " to " +
+           std::to_string(r.AttnGqa()) + " (num_attention_heads / num_key_value_heads)");
+    }
+    if (r.GqaRepeats() != global.GqaRepeats()) {
+      fail("GqaRepeats() changes from " + std::to_string(global.GqaRepeats()) + " to " +
+           std::to_string(r.GqaRepeats()) + " (linear_num_value_heads / linear_num_key_heads)");
+    }
+
+    // Row-parallel K per rank.
+    require_div("attn.o rank K (num_attention_heads/world * head_dim)",
+                r.num_attention_heads * r.head_dim, 512);
+    require_div("gdn.out_proj rank K (ValueDim()/world)", r.ValueDim(), 512);
+    require_div("mlp.down rank K (intermediate_size/world)", r.intermediate_size, 512);
+
+    // Column-parallel rank segments.
+    require_div("gdn.in_proj_qkv q/k rank segment (KeyDim()/world)", r.KeyDim(), 16);
+    require_div("gdn.in_proj_qkv v / in_proj_z rank segment (ValueDim()/world)", r.ValueDim(),
+                16);
+    require_div("attn.qg rank rows (2 * num_attention_heads/world * head_dim)",
+                2 * r.num_attention_heads * r.head_dim, 16);
+    require_div("attn.k/v rank rows (num_key_value_heads/world * head_dim)",
+                r.num_key_value_heads * r.head_dim, 16);
+    require_div("mlp.gate_up rank segment (intermediate_size/world)", r.intermediate_size, 16);
+
+    require_div("vocab_size (lm_head rank shard in whole 16-row tiles)", global.vocab_size,
+                16 * static_cast<int64_t>(world));
+    return r;
   }
 };
 

@@ -606,7 +606,7 @@ static ModelConfig Shard(const ModelConfig& global, int world, int rank);
 
 | Consumer | Config | Notes |
 |---|---|---|
-| `Container` | holds both: `global_config_` (parsed from the file, used for byte strides and slicing) and `config_` = `ModelConfig::Shard(global, world, rank)` (used for `QuantLinear::N/K` and returned by `Config()`) | `Container::GlobalConfig()` is new; at world 1 the two are equal |
+| `Container` | holds both: `global_config_` (parsed from the file, used for byte strides and slicing) and `config_` = `ModelConfig::Shard(global, world, rank)` (used for `QuantLinear::N/K` and returned by `Config()`) | `Container::GlobalConfig()` is new; at world 1 the two are equal because the TP=1 path sets `config_ = global_config_` and never calls `Shard` (5.1 step 7; `Shard`'s TP-only checks would refuse e.g. a tied-embedding container TP=1 loads today) |
 | `GdnLayer`, `Mlp`, `AttentionLayer` (via `MakeAttnConfig`), `GdnStateManager`, `PagedKvCache`, `MtpHead` | rank | run unmodified on the rank config -- only the comm hook is new |
 | `Model` | rank config via `container_.Config()`; `Model::GlobalConfig()` new; `vocab_local_ = container_.LmHead().N`, `vocab_offset_ = cfg.VocabShardBegin()` | `Model::Config()` keeps returning `container_.Config()` (rank); `TextModel::Config()` returns global |
 | embedding gather (`EmbedTokensDeviceGather` clamp, host `EmbedTokens`) | `vocab_size` (global) | the table is replicated |
@@ -1314,10 +1314,12 @@ Then the unchanged `SampleFromSummary(merged, params, u)` with the one draw `u`.
 Proof it stays exact: every member of the global top-64 is within the top-64 of its own shard, so the
 merged list IS the global top-64 with the identical float values; every exact case of
 `SampleFromSummary` reads only those values. The only approximate input, `lse`, has error <= max over
-shards of the kernel's error (<= 1e-4 absolute, measured 4.8e-6) plus ~1e-7 from the double
-combination -- inside the unchanged `kRowSummaryLseRelTol = 1e-3` band, whose "exact or silent"
-guarantee is what the proof in docs/sampling.md section 4 rests on. The `kMinSummaryTemperature`
-screen (`model.cpp:1006`) applies unchanged.
+shards of the kernel's error (<= 1e-4 absolute, measured 4.8e-6) plus up to ~1 fp32 ulp of |lse|
+(the per-shard and merged fp32 roundings; the double combination itself adds ~1e-16) -- 2.4e-4 at
+|lse| in [2048, 4096), where T = 0.01 puts this model's rows -- inside the unchanged
+`kRowSummaryLseRelTol = 1e-3` band, whose "exact or silent" guarantee is what the proof in
+docs/sampling.md section 4 rests on. The `kMinSummaryTemperature` screen (`model.cpp:1006`) applies
+unchanged; that extra ulp is TP's real cost, so TP gives no reason to lower it.
 
 **Unresolved row** (`resolved == false`): each rank D2Hs its shard row (496,640 B), `HostAllGather`,
 the concatenation in rank order is the full row in global id order; `SampleCanonical(full, 248320,
@@ -1990,6 +1992,87 @@ and the evidence.
 - **B6. "Re-measure TP=1 DFlash baselines after adding the TP tuning rows, or land the sweep on
   main first."** Superseded: the rows now live in a TP-only table (2.7), so TP=1 bytes and timing do
   not change and the production G9/G10 references stay valid.
+
+### Implementation notes
+
+Where the code refined or corrected this design while implementing it. Each note names the section
+it refines.
+
+**P1**
+
+- **N1 (2.2 step 6).** `ProgressWatchdog` compares each rank's heartbeat with its value at the
+  previous wake-up, not the maximum over ranks: the maximum can stand still while a lagging rank
+  catches up, and that is progress. It fires on exactly the stated rule: no rank's heartbeat has
+  moved for 60 s. The step-5 facade wait is `WaitAllIdle(workers, group, timing, watchdog, wake,
+  now)` in `tp_rank_worker.h`. It waits for `Idle()` on every listed worker (the facade is the only
+  poster, so that equals `Done() >= seq`). It returns `kStalled` instead of throwing, so `TpModel`
+  keeps ownership of `kFatal`, the log line and `TpTimeoutError`. `now` injects the test's fake
+  clock.
+- **N2 (2.2 step 1).** `RankWorker::Post` to a busy worker throws `std::logic_error` instead of
+  asserting (the `assert` would be compiled out in the Release build). If `thread_init` throws (a
+  failed `hipSetDevice`), the worker stays up. Every command then completes without running, and
+  its `TakeError()` returns that exception.
+- **N3 (5.2 `RuleFor`).** Replicated names are listed explicitly instead of matched by the
+  `*layernorm` / `*norm*` wildcards, so a future tensor whose name merely contains "norm" still
+  throws until someone classifies it. `dflash.*` replicates (4.2's DFlash2 row; 5.2's list omits
+  it). `mtp.draft_head.*` is the two exact names `mtp.draft_head.lm_head` and
+  `mtp.draft_head.vocab_ids`; `vision.*` (rank 0 only) and `dflash.*` stay whole-prefix rules, as
+  4.2 defines them. `RuleFor` also rejects: a layer index >= `num_hidden_layers`; a GDN tensor on a
+  full-attention layer, or the reverse; `mtp.gdn.*`; and, on every path including the two prefix
+  rules, any name that still carries its `.{bf16|w4a16|w4a8|mxfp4}.{part}` suffix.
+- **N4 (4.3, 5.1 step 4).** `PlanRows`/`PlanCols` merge adjacent byte runs, so "one contiguous
+  range" means `runs.size() == 1`. `test_tp_shard` confirms 5.1's list on the real shapes: every
+  part of qg, z, k/v and lm_head except mxfp4 ws; a/b, A_log, dt_bias and the descales; and mxfp4
+  ws K-slices. mxfp4 wq column ranges need % 32 (4.3's rule, from the mxfp4 group), although wq
+  packing alone needs only % 16. Both planners also validate the full shape (N % 16; K % 64,
+  % group or % 32), so a malformed shape throws instead of truncating.
+- **N5 (10.2).** "K = 1088 (= 17 x 64) at g=64" is the per-rank K, so the full K is 2176. A full
+  K of 1088 would give 544 = 8.5 x 64 per rank, which no w4 layout can split. At full K 2176 the
+  test checks bf16, w4a16 g64 and mxfp4 byte for byte, and checks that the four group-128 layouts
+  (w4a16 g128 and w4a8, each RTN and search) are refused. The end-to-end slices use a small config
+  with the real structure: hidden 512, 4 q / 2 kv heads of 256, GDN 2 k / 8 v heads of 128,
+  intermediate 1024, vocab 1024. Plan-only checks cover the real 27B shapes: size, legality and
+  contiguity for every linear x layout x rank.
+- **N6 (10.1 `test_tp_vocab_merge`, 7.4).** "lse within 1e-6" is replaced by an ABSOLUTE bound of
+  2 fp32 ulp of the exact double-precision full-row logsumexp, plus 1e-7. A flat 1e-6 would fail
+  an exact merge on rounding alone (one ulp is 1-2e-6 at |lse| ~ 10-20). A bound relative to |lse|
+  is wrong too: `SampleFromSummary` reads lse only through `S_full = exp(lse - vals[0] * inv_t)`,
+  so an absolute lse error is the relative `S_full` error that `kRowSummaryLseRelTol = 1e-3`
+  bounds. At the tested T = 0.005, |lse| reaches 2000-2700, and 1e-6 * |lse| would accept 2-3x the
+  whole band. An exact merge carries two fp32 roundings (the dominant shard's lse and the merged
+  value) and lands within ~1 ulp; 2 ulp is <= 4.9e-4 on these rows, and the test refuses a row
+  where 2 ulp would reach the band. The same accounting corrects 7.4's "+1e-7". The 100000-u sweep
+  runs at V = 4096. At V = 248320 it is a 400-u spot check, because `SampleCanonical` costs
+  milliseconds per call there.
+- **N7 (6.6).** A size mismatch between ranks aborts the group and throws `TpDivergenceError`.
+  `Barrier` is a 0-byte `AllGather`, so both share one generation counter. After the 50 ms spin,
+  the wait loop calls `std::this_thread::yield()`, not `Sleep(0)`, which would pull `<windows.h>`
+  into a src/core header. `tp_comm.hpp` includes `<hip/hip_runtime_api.h>` for `hipStream_t`, so
+  `test_tp_host_exchange` links `r4dx_core` for the include path. It makes no HIP call and imports
+  no HIP DLL.
+
+**P1 review**
+
+- **N8 (2.2 step 6, 2.9).** `ProgressWatchdog` compares elapsed time in whole milliseconds. The
+  plain `now - last_move_ >= stall_limit` converted the limit to the clock's nanoseconds and
+  overflowed for any limit past ~292 years, so `milliseconds::max()` fired at the first wake-up.
+  `ProgressWatchdog::kNoStallLimit` (= `milliseconds::max()`) now never fires. A command that moves
+  no heartbeat -- 2.9's `LoadEmbedTokensHost` and `Model::Load`, the teardown closure -- must be
+  waited on with `kNoStallLimit` or a limit sized for it: the 60 s default would kill any load
+  that takes longer (TP=1 bf16 loads take 58-64 s today).
+- **N9 (6.6).** `HostExchange::AllGather` checks the abort flag on entry, before `++gen` and the
+  slot write. A call on an aborted group never reaches the wait, so it must not rewrite
+  `slot[g & 1]` either: a slower peer may still be copying call g's slot, and the parity argument
+  assumes the writer passed call g + 1's wait. `Abort` sets the flag inside the critical section
+  that tests it, so the first reason really is the one kept.
+- **N10 (3.2, 5.1 step 7).** `ModelConfig::Shard` applies its TP-only checks (no tied embeddings,
+  row-parallel K % 512, vocab % 16) at world 1 too, so the TP=1 load path must not call it:
+  `config_ = global_config_` there. 3.2's "at world 1 the two are equal" now says so.
+- **N11 (10.2).** `TestRealPlans` also checks, at the real 27B shapes, that every plan's runs are
+  ascending, disjoint and inside the full part, and pins exact offsets from 4.3's formulas for
+  lm_head bf16 and mxfp4 ws, mlp.down w4 wq and w4a16 g64 wsz, and mlp.gate_up w4a8 ws and mxfp4
+  wq, all on rank 1. The small config keeps every offset under 2 MB, so only these checks would
+  catch a narrowed intermediate.
 
 ## Appendix C -- Open questions for the user
 

@@ -72,6 +72,14 @@ target_link_libraries(r4dx_model_linear PUBLIC
   r4dx_model_kernels
 )
 
+# ---- r4dx_tp_shard: tensor-parallel sharding rules and byte plans (docs/tp.md 5.2) ---------------
+# CPU-only on purpose (no HIP include, no HIP call): tests/model/test_tp_shard.cpp and
+# test_tp_config.cpp run it against the converter's real packers without a device. Needs only
+# model_config.h (this directory) and nlohmann/json (third_party).
+add_library(r4dx_tp_shard STATIC tp/tp_shard.cpp)
+target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                                ${CMAKE_SOURCE_DIR}/third_party)
+
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 add_library(r4dx_model STATIC
   container.cpp

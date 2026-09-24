@@ -109,6 +109,33 @@ target_link_libraries(test_pick_tuning PRIVATE r4dx_model r4dx_convert r4dx_core
 add_test(NAME test_pick_tuning COMMAND test_pick_tuning)
 set_tests_properties(test_pick_tuning PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 
+# Tensor-parallel P1 (docs/tp.md 10.1): four CPU-only tests of the TP building blocks under
+# src/model/tp/ -- no HIP call, no device, no container -- so, like test_mtp_round above, plain
+# add_test() with no ENVIRONMENT / SKIP_RETURN_CODE: they always run.
+#   test_tp_config      ModelConfig::Shard (model_config.h)
+#   test_tp_shard       RuleFor/RankRows/PlanRows/PlanCols/Gather against the converter's packers
+#   test_tp_vocab_merge the vocab-split merges (tp_vocab.h) against full-row CPU references
+#   test_tp_rank_worker the facade/rank hand-off and progress watchdog (tp_rank_worker.h)
+# (the fifth P1 test, test_tp_host_exchange, lives in tests/core with the header it tests).
+add_executable(test_tp_config test_tp_config.cpp)
+target_link_libraries(test_tp_config PRIVATE r4dx_tp_shard)
+add_test(NAME test_tp_config COMMAND test_tp_config)
+
+add_executable(test_tp_shard test_tp_shard.cpp)
+target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
+add_test(NAME test_tp_shard COMMAND test_tp_shard)
+
+# tp_vocab.h includes the HIP-free r4dx/kernels/summary_sampler.hpp; an include dir is the whole
+# coupling (linking r4dx_kernels would drag in its hipcc object for nothing).
+add_executable(test_tp_vocab_merge test_tp_vocab_merge.cpp)
+target_include_directories(test_tp_vocab_merge PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model
+                                                       ${CMAKE_SOURCE_DIR}/src/kernels/include)
+add_test(NAME test_tp_vocab_merge COMMAND test_tp_vocab_merge)
+
+add_executable(test_tp_rank_worker test_tp_rank_worker.cpp)
+target_include_directories(test_tp_rank_worker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_tp_rank_worker COMMAND test_tp_rank_worker)
+
 # test_dflash_draft_weights: task A1 item 3's CPU-only DflashDraftWeights loader stub
 # (src/model/dflash_draft_weights.h -- metadata + tensor directory, no device upload). Links only
 # r4dx_convert (header-only: SafetensorsReader, GgufReader, dflash2_container writer helpers used

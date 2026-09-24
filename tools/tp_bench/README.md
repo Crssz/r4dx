@@ -11,24 +11,6 @@ Targets from the TP=2 plan: 1.5x needs the in-engine latency `L(10 KiB) <= ~7-12
 verify needs `L(80 KiB) <= ~15 us`, and break-even is about 80 us. The 640 KiB rows are the
 prefill all-reduce.
 
-## Measured on this box (2026-09-24, both R9700s, HIP_VISIBLE_DEVICES unset, desktop live on dev0)
-
-| stage | result |
-|---|---|
-| probe | `hipHostMalloc(Coherent\|Mapped\|Portable)` maps into both devices at the host address; peer access 0/0; `ComputePreemptionSupported=0` on both |
-| loopback RTT (p50 / p99) | dev1 3.28 / 4.40 us, dev0 2.80 / 3.52 us, dev1 with a CPU partner 2.00 / 2.40 us |
-| pingpong dev0 <-> dev1 | one-way p50 **1.24 us** (RTT p50 2.48, p99 3.40 us) |
-| isolated 10 KiB, us/AR | flag(d1,a1) 6.40 at nb=1, 10.4 at nb=8; **flag(d3,a0) 5.34 at nb=4**; ll 29-30 |
-| isolated 80 / 640 KiB, us/AR | flag(d3,a0) 11.7 / 58.3 at nb=4; ll 199 / 1758+ (ll is out) |
-| decode emulation, L per AR | **flag(d3,a0) nb=4: 10 KiB 7.47 +- 0.38 us, 80 KiB 13.33 +- 0.38 us** (vs no AR kernel); flag(d1,a1): 10.27 / 16.88; ll: 38.0 / 192.7 |
-| stress, flag(d3,a0) nb=4, all bit-exact | 10,000,000 isolated at 10 KiB (~146k AR/s), 1,280,000 under the decode pattern, 1,000,000 at 80 KiB |
-| stress, other variants, all bit-exact | 1M each of flag(d1,a1), flag(d3,a0) nb=8, ll; 128k flag(d1,a1) decode |
-
-Decision: flag(d3,a0), nb=4 passes every gate (L(10 KiB) <= 12 us, L(80 KiB) <= 15 us). With the
-measured per-rank GEMM sum (`tune_gemm.py`'s `sweep_shape`: 12.7-13.1 ms per rank vs 23.0-23.4 ms
-single-GPU at M=1/8), it projects plain decode at 18.0-18.6 ms/token, 1.50-1.55x the single-GPU
-27.8 ms.
-
 ## Build (CPU only; never runs the binary)
 
     powershell -File tools\tp_bench\build.ps1          # -> tools\tp_bench\build\ar_bench.exe

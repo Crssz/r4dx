@@ -106,10 +106,13 @@ bf16 form -- the MTP head stays bf16-only per this pass's task brief.
   So row order is **per-head-interleaved**, not query-block-then-gate-block: for head `h`, rows
   `[h*2*head_dim : h*2*head_dim + head_dim)` are query, `[h*2*head_dim + head_dim : (h+1)*2*head_dim)`
   are gate. The gate is applied *after* attention and *before* `o_proj`
-  (`attn_output * sigmoid(gate)`, line 818) -- it is not part of the attention math itself, so the
-  loader splits `qg` back into a `[num_heads*head_dim, hidden]` query matrix and a
-  `[num_heads*head_dim, hidden]` gate matrix at load time rather than the kernel seeing a fused
-  tensor.
+  (`attn_output * sigmoid(gate)`, line 818) -- it is not part of the attention math itself. The
+  loader keeps `qg` fused: `Container::Load` reads it as one `[2*num_heads*head_dim, hidden]` linear
+  (`src/model/container.cpp`, the `attn.qg` `LoadQuantLinearWithFallback` call), and
+  `AttentionLayer::Forward` runs it as one GEMM. The split happens on that GEMM's output
+  activations, per token, in `r4dx_model_attn_split_qg_bf16` (`src/model/attention/`), which
+  de-interleaves each head's `2*head_dim` outputs into separate query and gate buffers. No weight is
+  split or re-laid-out at load time.
 - **`gdn.in_proj_qkv`**: this checkpoint (`transformers` 5.17.0's `Qwen3_5GatedDeltaNet`) keeps
   `in_proj_qkv` (query+key+value, `[2*key_dim + value_dim, hidden]`), `in_proj_z`, `in_proj_b`,
   `in_proj_a` as four **separate** linears (`modeling_qwen3_5.py:544-547`) -- there is no fused
@@ -149,7 +152,9 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     element `e` of `W[n0 + (l&15)][16*ks + 8*(e>>2) + 4*(l>>4) + (e&3)]`, dword nibble `2e` (e<4)
     / `2(e-4)+1` (e>=4) (`r4d_gemm_w4a16_nt_m64.hip` "LAYOUT" comment, using the
     `r4d_gdn_wmma.h` fragment map `idx = lane%16, k = 8*(e>>2) + 4*(lane>>4) + (e&3)`).
-  - `<name>.w4a16.wsz` -- `uint32[N * K / g]`, one dword per `(row, group)`: low 16 bits = f16
+  - `<name>.w4a16.wsz` -- `uint32[N * K / g]`, one dword per `(row, group)`, ordered by 16-row
+    n-tile, then group, then row within the tile (dword `(t * (K/g) + gi) * 16 + r` holds row
+    `16t + r`, group `gi`; `PackW4A16Scales` in `quant_int4.hpp`): low 16 bits = f16
     `scale`, high 16 bits = f16 of `-(1024 + zero)` (ready for `v_pk_add_f16` against the
     `0x6400 | q` widened weight nibble) (`r4d_gemm_w4a16_nt_m64.hip:56-59`, `r4d.h` `r4d_gemm_w4a16_nt_m64_group()`).
     `wq` is unaffected by `g` -- only the number of `(scale, zero)` dwords changes.
@@ -174,8 +179,13 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     `w4a16.wq` with a free zero and `w4a8.wq` with the zero pinned to 8. They are the same size and
     the same layout; only the codes differ. (`src/convert/include/r4dx_convert/quant_int4.hpp`'s
     header comment derives this from the two kernels' `dequant()` / `dequant8()`.)
-  - `<name>.w4a8.ws` -- `uint16[N * K / 128]` f16 scale only (no zero point -- signed 4-bit codes,
-    symmetric).
+  - `<name>.w4a8.ws` -- `uint32[N * K / 128]`, one dword per `(row, group)` in the same
+    tile/group/row order and 4-byte stride as `w4a16.wsz`: low 16 bits = f16 `scale`, high 16 bits
+    zero and never read (no zero point -- signed 4-bit codes, symmetric). Only the scale is
+    *content*, but the stride is a dword: the kernel reads `Ws` through an `unsigned*` and masks
+    `& 0xFFFF` (`r4d_gemm_w4a8_nt_m64.hip`), `PackW4A8Scales` (`quant_int4.hpp`) writes
+    `uint32_t`, and `LoadQuantLinear` uploads it with `UploadRawU32` (`src/model/container.cpp`).
+    A reader that takes it as `uint16[N * K / 128]` reads half the tensor, at the wrong stride.
   - Activation-side: `quant_act_i8` (`r4d_quant_act_i8`) produces a per-row int8 activation plus an
     f32 per-row scale at *inference* time, in the A-fragment byte order the kernel expects; nothing
     from this is stored in the container (activations are never static).

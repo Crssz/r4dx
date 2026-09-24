@@ -301,8 +301,8 @@ inline std::vector<uint32_t> PackW4A16Scales(const std::vector<float>& scale,
 }
 
 // ws for w4a8: uint32[N*K/group] (same (t,g,r) order and same 4-byte stride as wsz -- the kernel
-// reads `Ws` through an `unsigned*`, `sz & 0xFFFF` only, see r4d_gemm_w4a8_nt_m64.hip; the doc's
-// "uint16[...]" is the logical content, not the physical stride). High 16 bits are 0 (unread).
+// reads `Ws` through an `unsigned*`, `sz & 0xFFFF` only, see r4d_gemm_w4a8_nt_m64.hip). The f16
+// scale is the only content; high 16 bits are 0 (unread).
 inline std::vector<uint32_t> PackW4A8Scales(const std::vector<float>& scale, int N, int K,
                                              int group) {
   RequireDivisible(N, 16, "N", "PackW4A8Scales");

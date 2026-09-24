@@ -125,7 +125,7 @@ engine's port on the same definition (and reports the vs-stand-in value next to 
 | G5 | In-engine all-reduce | 0 mismatches in 10M stress ARs; in the decode pattern, `L_vs_no_ar_kernel`(10 KiB) <= **9.0 us** and (80 KiB) <= **16.0 us** (<= 120% of tp_bench's 7.47 / 13.33) | P3 |
 | G6 | Real 2-GPU == emulation | every `*.logprobs.f16` of the teacher-forced corpus SHA-256-equal, both produced by the **same binary** in the same gate run | P4 |
 | G7 | Plain decode speed | >= **52.2 tok/s** on the standard protocol, both runs | P4 |
-| G8 | Soak | 60 min `tool_tp_soak`, exit 0, 0 aborts, 0 divergences, 0 Windows event 4101 (TDR) | P4 |
+| G8 | Soak | 60 min `tool_tp_soak`, exit 0, 0 aborts, 0 divergences, 0 TDRs (WER LiveKernelEvent 141 in the Application log, or System event 4101; N44) | P4 |
 | G9 | DFlash speed | >= **95 tok/s** `--dflash k=7`, standard protocol, both runs | P5 |
 | G10 | DFlash acceptance | mean tokens/round over the 4 prompts of `tests/model/mtp_prompts.txt` within **±5% relative** of TP=1 | P5 |
 | G11 | Server | `tools/server/smoke.ps1 -Tp 2` clean (4-layer default; real container with `-Dflash -ToolRoundTrip`; `-Vision -Dflash`; `-Mtp 3`; **`-Dflash -TpFault`**: an injected all-reduce fault fails one request and the next request succeeds with the reference output) | P5 |
@@ -1661,8 +1661,9 @@ random mode (greedy / sampled seeded / DFlash greedy / DFlash sampled when loade
 iteration re-run a fixed 512-token canary prompt greedily for 128 tokens and require the output to
 equal the first canary run exactly. Record iterations, tokens, `TpCommStats`, max exchange wait,
 per-rank VRAM at start and end. Pass: exit 0, 0 aborts, 0 divergences, canary always equal, per-rank
-VRAM drift <= 64 MiB, `g_tp_collective_allocs == 0` (2.7), and `Get-WinEvent -FilterHashtable
-@{LogName='System'; Id=4101; StartTime=<start>}` returns nothing (no TDR).
+VRAM drift <= 64 MiB, `g_tp_collective_allocs == 0` (2.7), and no TDR since the start: no
+Application-log Windows Error Reporting event for LiveKernelEvent 141 and no System event 4101
+(on this box a TDR shows up only as the former, N44).
 
 ---
 
@@ -2642,8 +2643,8 @@ it refines.
   gate is therefore: rel L2 vs TP=1 <= 1e-1 per row, AND max over the script of rel L2(TP=2 vs TP=1
   bf16) <= 1.0 x the same for TP=1 w4a8 (1.25 x until the P2b review tightened it, N53; measured
   ratios 0.853 / 0.822). bf16, w4a16 and mxfp4 keep 10.1's bounds; G4 (w4a16) is unaffected. This
-  replaces a 10.1 bound, so it stands only with the user's approval (Appendix C, question 4). The
-  rest of the run:
+  replaces a 10.1 bound; the user left the call to the implementer, so it stands (Appendix C,
+  question 4). The rest of the run:
   - `DecodeStepGreedy` == argmax(`DecodeStep`) on 16/16 rows, every layout.
   - Sampled: 3 configs x 3 seeds per layout plus T = 0.005, all trajectories equal; 17-23 of 25
     rows fell back to the gathered full row at T = 1.0 and at top_p 0.95 / min_p 0.02 (H5
@@ -2726,7 +2727,7 @@ it refines.
   - **The w4a8 yardstick of `test_tp_emulation` is tightened from 1.25 x to 1.0 x (N50).** At 1.25 x
     it would pass an independent w4a8-only TP error of ~0.096 rel L2, as large as w4a8's whole
     quantization error. At 1.0 x the measured ratios, 0.853 and 0.822, pass, and an added error
-    above ~5e-2 fails. The gate change itself waits for the user (Appendix C, question 4).
+    above ~5e-2 fails. The gate change stands (Appendix C, question 4).
   - **Test coverage added.**
     - `test_tp_emulation` now also checks that the injection policy set in `kNeedsRecovery` (false)
       is what both ranks run with after `Reset()`.
@@ -2799,6 +2800,10 @@ it refines.
    on device 1 stopped (9.2) and puts load on the desktop card. Is there a preferred window, and
    should the desktop be kept idle (or the display moved off device 0, if this machine allows it)
    during P4's 60-minute soak (R2)?
+   **Answered (2026-09-24): the display stays on device 0.** P4 keeps every GPU submission short
+   instead: a forced flush after each prefill chunk and a cap on the work queued ahead of the host
+   (decode already syncs every token). The soak is staged, 5 minutes before 60, with a TDR check
+   (WER LiveKernelEvent 141 and System 4101) after each stage; the first TDR stops device-0 work.
 3. **Stop rules.** If G3 (P2a) or G5 (P3) misses, the plan stops before P2b. If P4 lands below
    1.40x it stops; between 1.40x and 1.45x it pauses for your call. Confirm those thresholds, or
    name the speedup below which TP is not worth merging.
@@ -2809,3 +2814,4 @@ it refines.
    now gates w4a8 at <= 1e-1 per row vs TP=1 AND TP=2's distance from TP=1 bf16 <= 1.0 x TP=1
    w4a8's. Do you accept that replacement, or should w4a8 keep 10.1's 5e-2 (which fails today by
    design, not by a defect)?
+   **Answered (2026-09-24):** the user left it to the implementer; the replacement stands.

@@ -57,8 +57,13 @@ class PrefixState {
   // caller's per-image fingerprint list for THIS request, in prompt order; the prefix is only
   // reusable when this request's images start with exactly the ones already fed. A caller with no
   // images passes an empty vector and gets the original behaviour unchanged.
+  //
+  // After Invalidate() this refuses every prompt until the next Commit(): an empty fed_ alone
+  // cannot tell "the model is at position 0" (fresh Load, or Clear() after a Reset()) from "the
+  // model's state is unknown", and the empty prefix would otherwise match anything.
   std::optional<std::vector<int32_t>> Extend(const std::vector<int32_t>& full_tokens,
                                               const std::vector<ImageKey>& images = {}) const {
+    if (needs_reset_) return std::nullopt;
     if (full_tokens.size() <= fed_.size()) return std::nullopt;
     if (!std::equal(fed_.begin(), fed_.end(), full_tokens.begin())) return std::nullopt;
     if (images.size() < fed_images_.size()) return std::nullopt;
@@ -73,7 +78,8 @@ class PrefixState {
   }
 
   // Call once the model has actually been reset (Model::Reset() or a fresh Load()) -- nothing is
-  // fed yet.
+  // fed yet. Does not lift a pending Invalidate(); only Commit() does, once a request has run to
+  // completion on the reset model.
   void Clear() {
     fed_.clear();
     fed_images_.clear();
@@ -89,15 +95,18 @@ class PrefixState {
     fed_ = full_tokens;
     fed_.insert(fed_.end(), committed_tokens.begin(), committed_tokens.end());
     fed_images_ = images;
+    needs_reset_ = false;
   }
 
   // Call from a catch block around any Model call that may have left the real model state ahead
   // of what fed_ describes (Prefill/DecodeStep*/Reset throwing partway through) -- forces the next
   // request down the full-reset path rather than risking a stale prefix match against a model
-  // whose real state has silently diverged.
+  // whose real state has silently diverged. Clearing fed_ alone would not: Extend() treats an
+  // empty fed_ as a model at position 0 and would hand back the whole prompt as the "tail".
   void Invalidate() {
     fed_.clear();
     fed_images_.clear();
+    needs_reset_ = true;
   }
 
   const std::vector<int32_t>& fed() const { return fed_; }
@@ -106,6 +115,7 @@ class PrefixState {
  private:
   std::vector<int32_t> fed_;
   std::vector<ImageKey> fed_images_;
+  bool needs_reset_ = false;  // set by Invalidate(), cleared by Commit()
 };
 
 }  // namespace r4dx::server

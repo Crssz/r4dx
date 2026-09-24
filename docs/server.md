@@ -920,7 +920,11 @@ and `prefix_state.h`'s own file comment for the mid-round-stop edge case this di
 handle. An exception mid-request (`Model::Prefill`/`DecodeStep*`/`Reset` throwing partway through)
 calls `prefix_.Invalidate()` in the `catch` block, forcing the next request down the full-reset
 path rather than risking a stale prefix match against a model whose real state has silently
-diverged (unchanged in spirit from the earlier `fed_tokens_.clear()`, just renamed).
+diverged. Clearing the tracked tokens alone did not do that (true of both this and the earlier
+`fed_tokens_.clear()`): an empty prefix "matches" every prompt, so the next request skipped
+`Model::Reset()` and was fed on top of the failed request's leftover KV/GDN state. `Invalidate()`
+therefore also sets a flag that makes `Extend()` refuse every prompt until the next successful
+`Commit()` (fixed 2026-09-24, regression test `TestInvalidateForcesResetUntilCommit`).
 
 ### `Model` adapter note
 

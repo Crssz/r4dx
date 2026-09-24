@@ -81,11 +81,18 @@ target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                                 ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---- r4dx_tp: the TpComm implementations (docs/tp.md 6.1, Appendix A) ----------------------------
-# P2a: NoopComm only (tp/tp_comm_noop.cpp, docs/tp.md 6.4). The interface itself is header-only in
-# src/core (r4dx/core/tp_comm.hpp) so the header-only AttentionLayer can call through it.
-add_library(r4dx_tp STATIC tp/tp_comm_noop.cpp)
+# NoopComm (tp/tp_comm_noop.cpp, docs/tp.md 6.4); P3: TpGroup (tp/tp_group.cpp -- the pinned host
+# mailbox, seq base, recovery) and HostMailboxComm (tp/tp_comm_host_mailbox.cpp -- the two-GPU
+# all-reduce of docs/tp.md 6.3). The interface itself is header-only in src/core
+# (r4dx/core/tp_comm.hpp) so the header-only AttentionLayer can call through it.
+add_library(r4dx_tp STATIC tp/tp_comm_noop.cpp tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp)
 target_include_directories(r4dx_tp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_tp PUBLIC r4dx_core r4dx_kernels)
+# /EHc-: the r4dx_tp_* entry points are extern "C" but report bad arguments and HIP errors by
+# throwing (src/kernels/include/r4dx/kernels/tp_kernels.h). Under the default /EHsc a caller assumes
+# extern "C" never throws and such a throw kills the process instead of reaching TpModel's
+# rank-error path (see tests/kernels/CMakeLists.txt's /EHc- comment).
+set_source_files_properties(tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 add_library(r4dx_model STATIC

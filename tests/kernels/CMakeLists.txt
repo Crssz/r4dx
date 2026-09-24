@@ -93,6 +93,38 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
 add_executable(tool_sampler_bench tool_sampler_bench.cpp)
 target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
 
+# ---- tensor-parallel all-reduce, phase P3 (docs/tp.md 6.3, 10.1) ---------------------------------
+# All four link r4dx_tp (src/model/tp: TpGroup, HostMailboxComm) and share tp_ar_harness.h. They call
+# the r4dx_tp_* extern "C" entry points, which throw, hence /EHc- (see the comment above).
+#
+# test_tp_allreduce_cpu_peer: ONE GPU (device 1, like every test here) against a CPU thread acting
+# as rank 1 through a real pinned mailbox -- always on.
+add_executable(test_tp_allreduce_cpu_peer test_tp_allreduce_cpu_peer.cpp)
+target_link_libraries(test_tp_allreduce_cpu_peer PRIVATE r4dx_tp r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_tp_allreduce_cpu_peer COMMAND test_tp_allreduce_cpu_peer)
+set_tests_properties(test_tp_allreduce_cpu_peer PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+
+# test_tp_allreduce_2gpu: BOTH GPUs, LABEL tp2gpu, and opt-in (docs/tp.md 10.1 "Two-GPU tests are
+# opt-in, not just labelled"). Deliberately NO HIP_VISIBLE_DEVICES property: a per-test value would
+# be the only way it could ever see two devices, and under the win-hip test preset
+# (HIP_VISIBLE_DEVICES=1) it must see one. The binary itself exits 77 (SKIP) unless R4DX_TP2GPU=1
+# and two devices are visible; tests\run_tests.ps1 -TwoGpu is what sets that up, and the default
+# run_tests.ps1 path excludes the label (-LE tp2gpu).
+add_executable(test_tp_allreduce_2gpu test_tp_allreduce_2gpu.cpp)
+target_link_libraries(test_tp_allreduce_2gpu PRIVATE r4dx_tp r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_tp_allreduce_2gpu COMMAND test_tp_allreduce_2gpu)
+set_tests_properties(test_tp_allreduce_2gpu PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
+
+# tool_tp_ar_stress (G5: `--count 10000000 --pattern decode`) and tool_tp_ar_latency (G5's decode-
+# pattern L at 10 / 80 / 640 KiB): built, never add_test()'d -- two-GPU gate tools, run by hand with
+# HIP_VISIBLE_DEVICES unset and the production server stopped (docs/tp.md 11, P3).
+foreach(t tool_tp_ar_stress tool_tp_ar_latency)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_tp r4dx_core r4dx_kernels r4d_core)
+endforeach()
+set_source_files_properties(test_tp_allreduce_cpu_peer.cpp test_tp_allreduce_2gpu.cpp tool_tp_ar_stress.cpp
+                            tool_tp_ar_latency.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
 # test_fused_quant (docs/r9700.md R2/P2) additionally needs r4dx_model_kernels for
 # r4dx_model_cast_bf16_to_f16 (the "old" w4a16 cast path it byte-diffs the new fused f16 epilogue
 # against) and src/model/kernels/model_kernels.h's declaration.

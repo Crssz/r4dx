@@ -2235,6 +2235,313 @@ it refines.
   - Recorded, not gated (R2): rank 1 on device 0 (the desktop card, pci bus 3) measured
     15.243 ms/token. That is +0.084 ms (+0.55%) over device 1.
 
+**P3**
+
+- **N30 (6.3.1 `R4dxTpArArgs`, 6.3.5 `CheckHealthy`).** `R4dxTpArArgs` has two more fields,
+  `int32_t channel` and a padding `reserved`. On a timeout or protocol violation the kernel
+  records the channel in `R4dxTpStatus::word`. tp_bench's FLAG variant stored `0xffffffff` there,
+  because `word` was LL-only. Without the field, the "at channel <c>" of 6.3.5's message cannot be
+  derived. One `Status` per rank is shared by both channels, which keeps the sticky abort
+  rank-wide, and both channels' seq counters start at the same base, so a seq value does not
+  identify its channel. The `Status` layout is unchanged.
+  - The launcher turns `R4dxTpArArgs` into tp_bench's typed-pointer `ArArgs` and passes that by
+    value. The backend promotes pointers it loads from the kernel-argument segment to the global
+    address space. Casting `int64` to a pointer inside the kernel made every access a generic
+    `flat_*` instruction instead of `global_*` (checked in the ISA).
+- **N31 (6.3.5 `HostU32Load/Store`).** The two helpers are `inline` in `tp_group.h`, not in
+  `tp_comm_host_mailbox.cpp`. That way `TpGroup` and the CPU-peer test use the same helpers as the
+  endpoint.
+- **N32 (6.3.3, 2.5 step 4, 2.9 step 7): the mailbox reset writes the session base into every
+  flag line.** A zeroed flag is "behind" `s = base + 1` under the wrap-safe compare only while
+  `base < 2^31`.
+  - The wrap case of 10.1 (base `0xFFFFFF00`) failed on its first run. A zeroed flag read as 255
+    ahead of `s`, the ">= 2 ahead" branch fired, and that is a protocol violation (the CPU peer
+    reported it first).
+  - In production the same thing would hit the `SelfTest` of any recovery once the seq counters
+    passed 2^31. At 6.3.3's rate that is about 3.5 days of continuous decode, and the result
+    would be `kFatal`.
+  - The fix: `TpGroup::ResetMailbox(base)` memsets the region, writes `base` into every flag line
+    of both channels and both ranks, then issues a `seq_cst` fence. An unwritten flag then reads
+    exactly one behind: "not yet". It replaces "zero the whole region" in `AllocateMailbox` and in
+    recovery step 4.
+  - Stale flags from an older session still compare behind, because `new_base` stays above every
+    value used.
+- **N33 (2.5 step 1 `SyncWithWatchdog`): it polls a marker event, never `hipStreamQuery`.**
+  - Measured on device 1: while `hipStreamQuery` is being polled (a tight `yield` loop, or 1 ms
+    sleeps), a stream whose last command is an event record never reports idle. That holds for
+    timing and `DisableTiming` events alike, and was still true 3 s after its kernel finished. The
+    trailing event's own `hipEventQuery` also stays `NotReady` meanwhile.
+  - Recording a marker and polling `hipEventQuery`, as tp_bench's `wait_event_wd` does, completes
+    when the kernel ends: 101.6 ms for a 100 ms all-reduce timeout.
+  - The wait yields for the first 200,000 polls, then sleeps 1 ms at a time (tp_bench's wait). An
+    earlier `sleep_for(200 us)` after 20,000 polls overslept to the Windows timer tick, and that
+    made `CheckWallClockRate` measure the device clock 47% slow.
+  - Rule for P2b/P4 code: wait on events, never by polling `hipStreamQuery`.
+- **N34 (6.3.1 file list, 6.3.5 ISA check, 10.1).**
+  - tp_bench's gen, verify, filler, fill-hash and stand-in kernels live in `r4dx_tp_kernels.hip`
+    as `r4dx_tp_test_*` entry points. Host twins of the data pattern are in `tp_kernels.h`. The
+    tests and tools are clang-cl `.cpp` files, so they need no third hipcc object.
+  - The verify kernel accumulates per thread and issues one atomic pair per thread. tp_bench's
+    version issued one pair per mismatching element, which took more than 30 s when a whole batch
+    was wrong.
+  - `tests/kernels/tp_ar_harness.h` is the shared test harness: `RankPool` on `tp::RankWorker`,
+    `RunDriver` (tp_bench's `run_plan`/`ar_rank` on a `TpEndpoint`, with the three interleaved
+    decode conditions) and `Decode` (tp_bench's `decode_stats`).
+  - `check_tp_isa.cmake` requires the following of `r4dx_tp_ar_flag_bf16_kernel` (as revised
+    by N43):
+    - `.amdhsa_workgroup_processor_mode 1`, and no `-mcumode` in the flags;
+    - the flag store, found structurally: the first global/flat/buffer store or atomic after the
+      post-push barrier (the first `s_barrier_wait` after the first 16-B push store). It must be a
+      32-bit `SCOPE_SYS` store, immediately preceded by `global_wb scope:SCOPE_SYS`, with no store,
+      label or branch in between;
+    - between the flag store and the next barrier, a `SCOPE_SYS` 32-bit poll load and a standalone
+      `global_inv scope:SCOPE_SYS` (the acquire fence after the relaxed spin).
+  - The check rejected a hand-edited ISA without the writeback, and one in CU mode. N43 lists the
+    revised check's negative cases. The `-S` command adds `-Wno-unused-command-line-argument`,
+    because hipcc's link-only flags are unused under `-S`.
+- **N35 (build).** `tp_group.cpp`, `tp_comm_host_mailbox.cpp` and the four new test and tool
+  sources compile with `/EHc-`. The `r4dx_tp_*` entry points are `extern "C"` and throw on bad
+  arguments and HIP errors, and a `/EHsc` caller would terminate instead of unwinding
+  (`tests/kernels/CMakeLists.txt` explains why).
+- **N36 (6.1, 2.5, 2.9 step 7: the `TpGroup` API).**
+  - `TpGroup::Create(mode, world, Geometry{nb_small, nb_large}, ar_timeout_ms, seq_base = 0x1000)`.
+    `kEmulate` throws `TpUnsupportedError` until P2b.
+  - `AllocateMailbox()` runs on rank 0's thread.
+  - `CreateEndpoint(rank, heartbeat)` runs on each rank's thread. It returns a `TpEndpoint`: the
+    `TpComm` plus the per-rank recovery pieces (`SyncStreams`, `SeqAdvance`, `Rebase`,
+    `ReadStatus`, `ArmFaultInjection`, `Device`, `WallClockKhz`, `SeqBase`).
+  - `Recover(RankRunner{run_all, run_one})` runs 2.5 steps 1-7 through the caller's
+    `RunAll`/`RunOne`, with `new_base = old_base + max over ranks of (seq - old_base) + 64`.
+  - Step 1 syncs only the streams the endpoint knows: its own, and every stream an all-reduce was
+    enqueued on, at most 8 distinct ones. An all-reduce on a ninth throws `std::logic_error`
+    before enqueuing; nothing is evicted (N43). Those streams must outlive the endpoint's use of
+    them, which a `Model`'s `stream_` does. The caller syncs any other stream first, such as
+    rank 0's vision stream.
+  - `CheckWallClockRate()` (2.9 step 4) is a free function on the current device.
+  - `TpOptions::fault_*` maps to `ArmFaultInjection(at, kind)`, which counts from the arming call.
+- **N37 (6.3.4 chunking).** Each call launches `nb_eff = ceil(n16 / w)` blocks, with
+  `w = ceil(n16 / nb)` (tp_bench's `make_geom`). That equals `nb` for every engine size
+  (`n16 >= 640`), and it still depends on the byte count only (L5).
+- **N38 (6.3.9 `SelfTest`).** It first syncs the endpoint's streams, because the seq counters are
+  stream-ordered: a self-test all-reduce on the endpoint's own stream must not overlap one still
+  queued on the model's stream. Its all-reduces count in `Stats()` and `CallCounts()` like any
+  other, and both ranks count them identically. A mismatch aborts the group (`kAbortHost`) before
+  it throws `TpError`, so the peer fails fast instead of timing out.
+- **N39 (10.1 `test_tp_allreduce_cpu_peer`).**
+  - The pattern call index is `call % 13`, so the CPU peer keeps every rank's rows precomputed.
+    100,000 all-reduces then take 2.5 s instead of about 45 s of CPU hashing. 13 is odd, so data
+    stale by 2 calls, the only staleness the slot protocol could produce, still differs from the
+    expected row.
+  - The 100,000 all-reduces cycle through the four sizes, 25,000 each.
+  - The wrap case is 1,200 all-reduces over both channels, from base `0xFFFFFF00`.
+  - The bit-exact cases run at the production 500 ms timeout (N43). A CPU peer descheduled for
+    longer trips the GPU's timeout, and that is a test failure, not a reason for a longer spin.
+  - The timeout case times the kernel with hipEvents and also covers fault injection (kind 0).
+    The skipped call is timed on the host, launch to completion: hipEvent timestamps around a
+    microsecond-long kernel came out slightly out of order.
+  - A fourth case, not in 10.1, checks `r4dx_tp_add_bf16`, EmulatedComm's add for P2b: eight
+    640 KiB adds of rank 0's pattern and rank 1's, bit-exact.
+- **N40 (10.1 `test_tp_allreduce_2gpu`).**
+  - The mixed sizes cycle over `{10240, 81920, 174080, 184320, 655360, 20480, 40960, 122880}`:
+    six on channel 0, two on channel 1. There are 50 all-reduces per verified batch.
+  - A filler that reads 2 MiB and dirties 1 MiB runs before every all-reduce. tp_bench's 60 MiB /
+    4 MiB would make the 1M all-reduces take about 25 minutes instead of 25 s.
+  - Abort case: rank 1 waits 50 ms after rank 0 has enqueued, so rank 0's kernel is spinning,
+    then calls `Abort()`. The exit delay is measured from the host `steady_clock` at the `Abort`
+    to the completion of rank 0's marker event.
+- **N41 (10.1 tools).**
+  - `tool_tp_ar_stress` options:
+    - `--pattern isolated|decode`, `--bytes` (default 10240), `--mixed`;
+    - `--nb` / `--nb-large`, `--timeout-ms`, `--filler-mb` / `--dirty-mb`;
+    - `--devices` (9.2 auto), `--need-gib` (1.5 for decode, 0.5 for isolated), `--json`.
+
+    It runs `SelfTest` first and uses tp_bench's exit codes.
+  - `tool_tp_ar_latency` options:
+    - `--tokens` (default 50), `--sizes` (default `10240,81920,655360`);
+    - `--nb` (default 4), `--nb-large-list` (default `4,8,16`);
+    - `--filler-mb`, `--dirty-mb`, `--timeout-ms`, `--devices`, `--need-gib`, `--json`.
+  - The latency tool creates one `TpGroup` per `nb_large` and measures the channel-0 sizes once.
+    It prints the G5 limit next to the 10 KiB and 80 KiB rows, and names the best 640 KiB `nb`
+    under 11's 10% rule. It exits 0 when every run verified: the thresholds are printed, not
+    gated.
+- **N42 (P3 smoke, measured 2026-09-24 on both GPUs, production server stopped; not the G5
+  gate).**
+  - `test_tp_allreduce_cpu_peer` (device 1): passes in 3.0 s.
+    - 100,000 all-reduces, bit-exact.
+    - The wrap case, bit-exact.
+    - Timeout: 100.04 ms on the device for a 100 ms timeout. The `ABORT` word read
+      `kAbortTimeout`, and the `Status` named channel 0, block 3, `flag-wait`.
+    - The next call was skipped: 4 blocks, 0.06 ms, buffer untouched.
+    - The add case, bit-exact.
+  - `run_tests.ps1` (default, `-LE tp2gpu`, device 1): 71 of 72 pass, including the CPU-peer
+    test. The one failure is the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` from N29.
+  - `tool_tp_ar_stress`: 100,000 isolated 10 KiB all-reduces at 171k per second, and 100,096
+    decode-pattern all-reduces at 8.3k per second. All verified.
+  - `run_tests.ps1 -TwoGpu`: `test_tp_allreduce_2gpu` passes in 26 s.
+    - 1,000,000 mixed all-reduces verified in 25.3 s.
+    - After `Abort()`, rank 0's kernel exited 0.068 ms later.
+    - `Recover()` moved the base from `0x00001000` to `0x000b8221`.
+    - 10,000 clean all-reduces followed.
+  - `tool_tp_ar_latency --tokens 10`, a smoke run, not G5. `L_vs_no_ar_kernel` for each case:
+
+    | Size | nb | `L_vs_no_ar_kernel` (us) |
+    |---|---|---|
+    | 10 KiB | 4 | 5.0 ± 0.9 |
+    | 80 KiB | 4 | 11.0 ± 0.9 |
+    | 640 KiB | 4 | 60.2 |
+    | 640 KiB | 8 | 58.1 |
+    | 640 KiB | 16 | 59.5 |
+- **N43 (P3 review fixes).**
+  - **ISA check: the flag store is found structurally (6.3.5, N34).** The old check took "the
+    body's first 32-bit `SCOPE_SYS` store" to be the flag. After a scope downgrade of the flag's
+    release, that match moved to `note_failure`'s ABORT-word store, which also has
+    `global_wb scope:SCOPE_SYS` in front of it and the barrier and pushes above it. So the check
+    passed on exactly the regression it exists to catch.
+    - The check now anchors on the post-push barrier: the first `s_barrier_wait` after the first
+      16-B push store. The first global/flat/buffer store or atomic after that barrier must be the
+      flag: a 32-bit `SCOPE_SYS` store, immediately preceded by `global_wb scope:SCOPE_SYS`.
+    - It also checks the acquire side. Between the flag store and the next barrier there must be a
+      `SCOPE_SYS` poll load and a standalone `global_inv scope:SCOPE_SYS`, one not directly after a
+      load. The `spin_acq = 1` acquire loads carry their own `global_inv`, which does not count.
+    - Negative cases, run on edited copies of the emitted `.s`, all rejected:
+      - flag `global_wb` and store both downgraded to `SCOPE_DEV` (the reviewer's case, which the
+        old check passed);
+      - the flag store alone downgraded to `SCOPE_DEV`;
+      - the writeback removed;
+      - the writeback downgraded to `SCOPE_DEV`;
+      - `.amdhsa_workgroup_processor_mode 0`;
+      - the acquire fence's `global_inv` downgraded to `SCOPE_DEV`.
+
+      The unedited ISA passes, with the flag at body line 278.
+    - The check still reads a separate `-S` compile, not the linked object. A reviewer
+      disassembled the linked `.hip_fatbin` and found the same code today. `src/kernels/
+      CMakeLists.txt` now says both commands must expand exactly `R4DX_KERNELS_FLAGS`, with no
+      per-command device flags.
+  - **`test_tp_allreduce_cpu_peer` uses the 500 ms timeout (N39).** It used
+    `kArTimeoutMaxMs` = 1500 ms, which is the warm-up value of 2.9 step 9, not a test setting, and
+    exceeds P3's 500 ms spin bound.
+  - **Pinned D2H targets in `HostMailboxComm`.** `SelfTest` read its result into a pageable
+    `std::vector` with `hipMemcpyAsync`. HIP performs a copy to unpinned memory synchronously
+    (`hip_runtime_api.h`), so the rank thread blocked in the driver behind the spinning kernel,
+    and the 30 s `SyncWithWatchdog` after it could never fire. `SelfTest`'s buffer, and the
+    `SeqAdvance` and `ReadStatus` targets, are now `core::PinnedBuffer`s.
+  - **Recovery after a DEVICE timeout, on real GPUs (`test_tp_allreduce_2gpu` case 5).** Before
+    this, only recovery after a host `Abort()` was exercised. The new case arms fault injection
+    kind 1 (`kFaultStall`) on rank 1 at its 50th all-reduce and runs 200 10 KiB all-reduces
+    through `RunDriver`. Then it checks:
+    - rank 0's ABORT word is `kAbortTimeout` and rank 1's is 0;
+    - rank 0's Status is claimed, with code timeout, channel 0, phase flag-wait, sticky set, and
+      skipped blocks > 0;
+    - rank 1's Status is unclaimed, with blocks bailed on the abort word;
+    - both `CheckHealthy()` calls throw `TpAbortedError`, and rank 0's says "timeout at channel 0";
+    - `Recover()` gives `new base == old base + max(SeqAdvance) + 64`;
+    - 10,000 clean all-reduces follow, and `CallCounts()` agree with each other and with rank 0's
+      `Stats().ar_calls`.
+
+    Case 4 now checks its base the same way.
+  - **Measured in that case: HIP here defers submitting launches.** The call that timed out was
+    rank 0's FIRST of the run, not its 50th. The claimed seq was the first call's, all 150 of rank
+    0's outputs were its own unreduced partials, and rank 1's first call was the only one of its
+    150 that reduced correctly.
+    - So rank 1's first 49 launches, enqueued before its 700 ms host sleep, did not run until after
+      it. That is consistent with the runtime holding queued launches until a later API call
+      flushes them.
+    - Rule for P2b/P4: a rank's all-reduce kernels may start only when its queue is next flushed
+      (an event query, a sync, or more launches), not when they are enqueued. Host work between
+      enqueueing a token and the next flush shows up as the peer's spin, bounded by the 500 ms
+      timeout.
+  - **`HostMailboxComm::ResetCounters` also zeroes the `Stats()` deltas** (2.5 step 6):
+    per-channel calls and bytes, host exchanges and their max wait. `Stats().aborts` stays
+    cumulative over the endpoint's life. Before, `Stats().ar_calls` kept counting across
+    recoveries while `CallCounts()` restarted.
+  - **Streams are never evicted (N36).** `TrackStream` silently dropped the oldest of 8 tracked
+    streams, and recovery step 1 then no longer waited on it. A ninth distinct stream now throws
+    `std::logic_error` before the launch.
+  - **A stuck endpoint leaks its own memory too.** If its stream is still busy after the
+    destructor's 30 s watchdog, or the group is already marked stuck, `~HostMailboxComm` now
+    leaks its VRAM, pinned buffers and stream, like the mailbox (2.6), instead of freeing memory a
+    kernel or a queued D2H may still touch.
+  - **`tool_tp_ar_stress` exit codes.**
+    - A host error on any rank is reported first: exit 1, status "error".
+    - "timeout" (exit 3) now means a device-claimed `kAbortTimeout`. Before, any rank host error
+      also left an abort message, via `RunDriver`'s `Abort(kAbortHost)`, and was reported as a
+      timeout.
+    - Any other abort is exit 3 with status "aborted".
+  - **`TpSetup` (tests/kernels/tp_ar_harness.h) has a destructor.** When a test or tool unwinds
+    past `Destroy()`, it destroys the endpoints and streams on their rank threads through the
+    `RankPool` it was created on. It leaks them and the group if that fails. Before, they were
+    destroyed on the main thread during unwinding, on the wrong current device.
+  - **Per-rank errors in the tools.** `tool_tp_ar_stress` and `tool_tp_ar_latency` print each
+    rank's own exception to stderr, with its HIP device, from `RankPool::on_error`. `RunAll`
+    rethrows only one root cause, and the G5 run in N44 lost the other rank's error that way.
+- **N44 (P3 G5 gates, measured 2026-09-24 after the N43 fixes, both GPUs, production server
+  stopped).** Rank 0 was device 1 (headless) and rank 1 was device 0 (desktop live).
+  - **ISA check:** passes. The flag store is at body line 278, the poll at 301 and the acquire
+    fence at 389.
+  - **`test_tp_allreduce_cpu_peer`** (device 1, 500 ms timeout) passes in 3.0-3.5 s: 100,000 and
+    wrap bit-exact; the timeout case took 100.08 ms on the device.
+  - **`run_tests.ps1 -TwoGpu`** passes in 27 s:
+    - 1,000,000 mixed all-reduces in 25.4 s;
+    - `Abort()` -> exit in 0.076 ms;
+    - host-abort recovery `0x00001000 -> 0x000b8221`;
+    - device-timeout case: rank 0 timed out at channel 0, seq 761758 (its first call, N43), with
+      596 blocks skipped; rank 1 had 4 abort exits and 592 skips; recovery
+      `0x000b8221 -> 0x000ba073` (+7698 + 64);
+    - 10,000 clean all-reduces after each recovery.
+  - **`tool_tp_ar_stress --count 10000000 --pattern isolated`:** 10,000,000 10 KiB all-reduces
+    verified in 66.0 s (151k/s; tp_bench about 146k/s).
+  - **`tool_tp_ar_stress --count 10000000 --pattern decode` (the G5 line) did NOT complete: a
+    Windows TDR, not the protocol.**
+    - 1,417,088 decode-pattern all-reduces verified bit-exact at 7.26k/s, with 0 mismatches and
+      0 timeouts. Then, after about 200 s, `hipEventQuery` returned HIP error 719 (unspecified
+      launch failure). That is more than tp_bench's whole decode-pattern stress (1.28M).
+    - Windows Error Reporting logged LiveKernelEvent **141** (`VIDEO_ENGINE_TIMEOUT_DETECTED`, a
+      TDR) at 18:52:18, with dump `WATCHDOG-20260924-1852.dmp`. Two seconds later a desktop app
+      crashed inside AMD's user-mode D3D driver, so device 0's adapter was reset.
+    - Another 141 in the same WER bucket, at 18:49:44 (52 s into the run), did not stop it. The
+      same bucket also appears at 00:23 today and on 2026-09-19 during tp_bench's development.
+    - No TDR occurred in the 10M isolated run, the `-TwoGpu` test (2 MiB fillers) or the latency
+      runs below.
+    - Likely cause (not proven, and the dumps are not readable without admin rights): the decode
+      pattern keeps device 0, which has `ComputePreemptionSupported=0`, saturated with back-to-back
+      full-occupancy 60 MiB fillers. At 7.26k/s the 10M line is 23 minutes of that, and the
+      desktop's own GPU work times out. The 500 ms spin bound (R6) does not address that.
+    - Not retried: two TDRs in 200 s, and WER holds two earlier `VIDEO_TDR_FAILURE` (116)
+      bugchecks on this box.
+    - For P4 (G8, 10.x): on this box these TDRs appear **only** as WER LiveKernelEvent 141 in the
+      Application log (provider "Windows Error Reporting", `P1: 141`), with no System event 4101.
+      A check for 4101 alone would have missed both.
+  - **`tool_tp_ar_latency`** (decode pattern, 50 tokens, 60 MiB / 4 MiB fillers), max over ranks:
+
+    | Size | nb | `L_vs_no_ar_kernel` (us) | `L_vs_standin` (us) | G5 limit (us) | tp_bench (us) |
+    |---|---|---|---|---|---|
+    | 10 KiB | 4 | **5.58 ± 0.83** | 4.37 ± 0.77 | 9.0 | 7.47 ± 0.38 |
+    | 80 KiB | 4 | **12.54 ± 0.55** | 10.20 ± 0.54 | 16.0 | 13.33 ± 0.38 |
+    | 640 KiB | 4 | 61.94 ± 1.17 | 47.85 ± 0.86 | none | none |
+    | 640 KiB | 8 | 59.10 ± 0.66 | 51.00 ± 0.47 | none | none |
+    | 640 KiB | 16 | 59.30 ± 1.08 | 53.98 ± 0.85 | none | none |
+
+    Per-token ms (all-reduce / stand-in / fillers only): 15.244 / 14.685 / 14.531 at 10 KiB and
+    16.231 / 14.925 / 14.626 at 80 KiB. The best 640 KiB `nb` is 8, only 4.6% better than nb 4
+    (below 11's 10% rule), so `--tp-ar-nb-large` stays 4 and no nb-8 stress is needed.
+  - **Isolated-style latency** (the same tool with `--filler-mb 0 --dirty-mb 0`, so condition (c)
+    is empty kernels), `L_vs_no_ar_kernel`:
+    - 10 KiB: 4.51 ± 0.10 us;
+    - 80 KiB: 11.02 ± 0.13 us;
+    - 640 KiB: 59.06 ± 0.10 us.
+
+    tp_bench's isolated us/AR at nb 4 are 5.34 / 11.7 / 58.3.
+  - **`run_tests.ps1`** (default, `-LE tp2gpu`, device 1): 71 of 72 pass, including the CPU-peer
+    test. The one failure is the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (N29).
+  - **G2** (`tp1_identity.ps1`, device 1, `-Image` = the golden vision image): PASS. All 12 rows
+    are byte-identical to the baseline: 1-5, `row6_{bf16,w4a16,w4a8,mxfp4}`, 7 (vision), 8 and 9.
+  - **G5 verdict:** the latency limits, the 640 KiB `nb` record, the ISA check and G2 are met.
+    The "10M, 0 mismatches / 0 timeouts" line is not: the decode-pattern run ended in a device-0
+    TDR at 1.42M, with 0 mismatches and 0 timeouts up to then. The protocol's 10M evidence is the
+    isolated run. How to get 10M in the decode pattern without a TDR on the desktop card is left
+    to the user: in chunks with idle gaps, with the desktop idle, or with the display moved off
+    device 0 (Appendix C, question 2).
+
 ## Appendix C -- Open questions for the user
 
 1. **`PrefixState::Invalidate` bug on `main` (8.4).** After any exception inside a request,

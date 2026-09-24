@@ -12,6 +12,15 @@
 // prefill"): each chunk runs every layer once, carrying GDN recurrent/conv state and the KV
 // cache's running position across chunks. Decode processes one token (or a small window, if a
 // future speculative-decoding caller wants it -- RunChunk's T is not hardcoded to 1) at a time.
+//
+// TENSOR PARALLEL (docs/tp.md, ModelOptions::tp): a Model can also be ONE RANK of a TP=2 group --
+// it holds that rank's weight shard, runs on the rank-local config, all-reduces its three
+// row-parallel outputs per layer through the rank's core::TpComm, and merges every vocab-split
+// lm_head result across ranks itself, so each rank returns exactly what a full Model would (up to
+// the documented numerics, docs/tp.md 1.2). Supported so far (P2a): Prefill, DecodeStep and
+// DecodeStepGreedy. Sampled decode, every speculative-verify entry point (VerifyWindow,
+// CommitVerifiedWindow, ReadVerifyLogitsRow, DecodeStepMtp*, DecodeStepDflash*) and the profiled
+// methods throw core::TpUnsupportedError on a TP rank.
 #pragma once
 
 #include <cstdint>
@@ -37,10 +46,35 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
 #include "vision_tower.h"  // src/vision: the device-side vision tower (docs/vision.md)
 
 namespace r4dx::model {
+
+// The DFlash2 drafter's two host codebooks, read once per tensor-parallel process and shared by
+// every rank's drafter (docs/tp.md 8.2). Defined with DflashDraft::LoadHostCodebooks in P5; until
+// then TpRankOptions::dflash_codebooks is always null.
+struct DflashHostCodebooks;
+
+// Tensor parallel (docs/tp.md 3.3): which rank of which world THIS Model is. Default-constructed ==
+// TP=1, i.e. exactly the pre-TP Model. With world > 1, Model::Load loads rank `rank`'s shard of the
+// container (Container::Load with ContainerLoadOptions::tp_world), runs every layer on the
+// rank-local config with its row-parallel outputs all-reduced through `comm`, and merges every
+// vocab-split lm_head result across ranks itself (docs/tp.md 7). Every rank's Model must be driven
+// with the same sequence of calls and arguments (docs/tp.md 6.3.6).
+struct TpRankOptions {
+  int world = 1;
+  int rank = 0;
+  core::TpComm* comm = nullptr;  // non-owning; nullptr iff world == 1
+  // TP: the process's one pinned host copy of text.embed_tokens (Container::LoadEmbedTokensHost).
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
+  // TP: the embedding device-mirror decision taken jointly for every rank (docs/tp.md 2.9 step 5):
+  // 1 mirror, 0 host-only, -1 the Container's own free-VRAM heuristic (TP=1).
+  int embed_device_resident_decided = -1;
+  bool vision_weights_on_this_rank = true;  // TP: rank 0 only (docs/tp.md 8.3)
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;  // TP: one host copy (P5)
+};
 
 struct ModelOptions {
   std::string container_path;
@@ -138,6 +172,11 @@ struct ModelOptions {
   // Exposed as `--vision {auto|on|off}` on both binaries.
   enum class VisionMode { kAuto, kOn, kOff };
   VisionMode vision = VisionMode::kAuto;
+  // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller.
+  // Staged (docs/tp.md 9.1, 2.9 step 1): with tp.world > 1, Load refuses `mtp_draft_k > 0`, a
+  // non-empty `dflash_container` and `vision == kOn` (TpUnsupportedError) until P5, and loads
+  // `kAuto` text-only.
+  TpRankOptions tp;
 };
 
 class Model {
@@ -171,7 +210,11 @@ class Model {
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
 
+  // Under tensor parallelism (ModelOptions::tp.world > 1) Config() is the RANK-local config (head
+  // counts and intermediate_size divided by the world, docs/tp.md 3.2; vocab_size stays global) and
+  // GlobalConfig() the container's own; at TP=1 the two are equal.
   const ModelConfig& Config() const { return container_.Config(); }
+  const ModelConfig& GlobalConfig() const { return container_.GlobalConfig(); }
   const Container& GetContainer() const { return container_; }
 
   // ---- vision tower (docs/vision.md) -----------------------------------------------------------
@@ -357,6 +400,8 @@ class Model {
   // the hot path (DecodeStep/DecodeStepGreedy never call this): hipEventCreate/Record/Synchronize
   // per op adds real host-side overhead of its own, so this is diagnostic-only, invoked at most
   // once per r4dx-cli process via --profile (src/cli/main.cpp).
+  // Tensor parallel: throws core::TpUnsupportedError (profiling under TP is out of scope, docs/tp.md
+  // 1.2) -- as does PrefillProfiled below.
   StepProfile DecodeStepProfiled(int32_t token_id);
 
   // Milestone 3 profiling pass (docs/r9700.md R5/Q7): prefill's analogue of DecodeStepProfiled --
@@ -721,6 +766,20 @@ class Model {
                                              DflashRoundTrace* trace_out,
                                              std::vector<int32_t>* drafted_tokens_out);
 
+  // ---- tensor parallel (docs/tp.md 7.2-7.5) -----------------------------------------------------
+  // The full [vocab_size] fp32 row of one logits row whose [vocab_local_] shard sits at
+  // `shard_row_dev` on this rank's device: D2H the shard, then HostAllGather -- the rank-order
+  // concatenation IS the row in global id order, and every rank ends with the same bytes. The
+  // device must be idle (after stream_.Synchronize()). Requires comm_.
+  void GatherVocabRow(const float* shard_row_dev, float* full_host);
+  // The merged greedy token of one row whose (local index, value) pair r4dx_argmax_val_f32 left at
+  // `pair_dev` (8 bytes): D2H, + vocab_offset_, HostAllGather, tp::MergeArgmax (docs/tp.md 7.3).
+  // Same preconditions as GatherVocabRow.
+  int32_t MergeGreedyPair(const int32_t* pair_dev);
+  // Throws core::TpUnsupportedError naming `what` when this Model is a tensor-parallel rank: the
+  // paths TP does not support yet (sampled and speculative decode, P2b) or at all (profiling).
+  void RequireNotTp(const char* what) const;
+
   Container container_;
   core::Stream stream_;
   core::Arena arena_;
@@ -754,8 +813,21 @@ class Model {
   // OWN actual layout before using it (LoadQuantLinearWithFallback can fall one tensor back to
   // bf16 independently of this container-wide default -- see gdn_layer.cpp's defensive comment).
   int body_epilogue_ = 0;
-  core::DeviceBuffer<float> logits_dev_;        // [vocab] fp32, one row at a time
+  core::DeviceBuffer<float> logits_dev_;        // [vocab_local_] fp32, one row at a time
   core::DeviceBuffer<int32_t> argmax_dev_;      // [1] -- DecodeStepGreedy's on-device argmax result
+
+  // ---- tensor parallel (docs/tp.md 4.4, 7.2); inert at TP=1 -------------------------------------
+  core::TpComm* comm_ = nullptr;  // ModelOptions::tp.comm, non-owning; nullptr at TP=1
+  // This rank's lm_head rows (container_.LmHead().N) and the global id of the first one
+  // (Config().VocabShardBegin()): vocab_size and 0 at TP=1. Every device logits buffer, kernel
+  // `vocab` argument and D2H count uses vocab_local_; every host row a sampler or caller sees is
+  // a gathered full row of Config().vocab_size (GatherVocabRow) -- docs/tp.md 7.2's rule.
+  int64_t vocab_local_ = 0;
+  int64_t vocab_offset_ = 0;
+  // TP only: [draft_window_][2] of {int32 local index, float value} -- r4dx_argmax_val_f32's
+  // output, one 8-byte tp::ArgmaxPair per row. argmax_dev_/verify_argmax_dev_ serve TP=1.
+  core::DeviceBuffer<int32_t> argmax_pair_dev_;
+  std::vector<float> gather_shard_host_;  // TP only: GatherVocabRow's [vocab_local_] staging
 
   // Persistent (not arena-allocated) scratch every full-attention layer's AttentionLayer::Forward
   // shares within one RunChunk call: `positions[t] = pos_ + t` doubles as both the RoPE position
@@ -839,7 +911,7 @@ class Model {
   // Scratch for VerifyWindow: logits for up to draft_window_ candidate positions at once, plus one
   // argmax result per position. Shared by both speculation families (MTP and DFlash2) -- the verify
   // pass is identical for either draft source (docs/dflash2.md section 7 item 5).
-  core::DeviceBuffer<float> verify_logits_dev_;    // [draft_window_ * vocab]
+  core::DeviceBuffer<float> verify_logits_dev_;    // [draft_window_ * vocab_local_]
   core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [draft_window_]
 
   // ---- sampled decode scratch (docs/sampling.md section 8) -------------------------------------

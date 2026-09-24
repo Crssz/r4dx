@@ -188,6 +188,14 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
 // out_idx: device int32[1].
 void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream);
 
+// The same kernel, also writing the winning VALUE: out_idx[0] = the lowest index among equal maxima
+// of logits[0, vocab), out_val[0] = logits[out_idx[0]]. The tensor-parallel greedy merge's per-shard
+// half (docs/tp.md 7.3): each rank argmaxes its own lm_head vocab shard, and the host picks the rank
+// with the strictly larger value (tie -> the lower rank, i.e. the lower global id). out_val: device
+// float[1]. r4dx_argmax_f32 is this with no value output, so TP=1 is unchanged.
+void r4dx_argmax_val_f32(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                          int64_t stream);
+
 // ---- device-resident embedding gather (MTP device-residency pass, docs/mtp.md) -----------------
 // out[row,:] = table[ids[row],:], entirely on-device -- the device-resident counterpart of
 // r4dx::kernels::EmbeddingGatherHost (embedding.hpp) for a text.embed_tokens table that has been
@@ -311,9 +319,9 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
 //
 // This entry point therefore makes TWO device launches and advances the launch counter below by 2.
 // It keeps its partials in a module-scope device scratch buffer (~264 KiB of VRAM), so exactly ONE
-// call may be in flight per process at a time -- the same single-worker-thread assumption
-// r4dx_kernel_launch_counter_get's non-atomic counter already relies on and model.h's own SCOPE
-// comment guarantees. Two concurrent calls (two threads, two streams) would interleave partials.
+// call may be in flight per process at a time -- the single-worker-thread assumption model.h's own
+// SCOPE comment guarantees for one Model. Two concurrent calls (two threads, two streams -- e.g.
+// two tensor-parallel rank threads, docs/tp.md 2.7) would interleave partials.
 //
 // logits: [rows, vocab] fp32 device pointer, rows contiguous (row stride == vocab).
 // out_ids: [rows, K] int32. out_vals: [rows, K] fp32. out_lse: [rows] fp32.
@@ -497,8 +505,8 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
                                  int64_t hidden, int taps, int64_t table_rows, int64_t stream);
 
 // ---- kernel launch counter (docs/r9700.md P2/task item 4, 2026-09-20) -------------------------
-// A plain process-global counter (not thread-safe by design -- Model is single-worker-thread per
-// model.h's own SCOPE comment, so this needs no atomic/lock any more than PickTuning's cache does)
+// A process-global counter (a relaxed std::atomic since docs/tp.md 2.7: two tensor-parallel rank
+// threads launch concurrently in one process; with them it counts both ranks' launches together)
 // incremented once per r4dx-owned kernel launch above (every r4dx_* entry point in this header,
 // AFTER its `rows/M/T <= 0` early-return check, so a no-op call does not count). Counts ONLY
 // r4dx-owned launches -- NOT the r4d_gemm_*/r4d_gdn_*/r4d_attn_* launches in third_party/libr4d,

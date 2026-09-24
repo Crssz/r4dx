@@ -15,6 +15,11 @@ namespace r4dx::model {
 namespace {
 // The test's own copy of the rows, for the set of (layout, N, K) shapes to probe.
 #include "gemm_tuning_table.inc"
+// And of the tensor-parallel per-rank rows (docs/tp.md 2.7), which a TP rank thread consults
+// first: same sweep, same build-group hazard.
+namespace tp2 {
+#include "gemm_tuning_table_tp2.inc"
+}  // namespace tp2
 }  // namespace
 }  // namespace r4dx::model
 
@@ -43,19 +48,18 @@ bool Launchable(Layout layout, int64_t K, const LinearTuning& t) {
   return false;
 }
 
-}  // namespace
-
-int main() {
-  int failures = 0, checked = 0;
-  for (const auto& row : r4dx::model::kGemmTuningTable) {
+template <size_t kRows>
+void CheckTable(const r4dx::model::GemmTuningRow (&table)[kRows], const char* which, int& checked,
+                int& failures) {
+  for (const auto& row : table) {
     for (int64_t m = 1; m <= 64; ++m) {
       const LinearTuning t = r4dx::model::PickTuning(row.layout, row.N, row.K, m);
       ++checked;
       if (!Launchable(row.layout, row.K, t)) {
         std::fprintf(stderr,
-                     "FAIL layout=%d N=%lld K=%lld M=%lld -> WV=%d SK=%d MB=%d NPW=%d is not "
+                     "FAIL (%s) layout=%d N=%lld K=%lld M=%lld -> WV=%d SK=%d MB=%d NPW=%d is not "
                      "launchable at this build's groups (w4a16=%d w4a8=%d mxfp4=%d)\n",
-                     static_cast<int>(row.layout), static_cast<long long>(row.N),
+                     which, static_cast<int>(row.layout), static_cast<long long>(row.N),
                      static_cast<long long>(row.K), static_cast<long long>(m), t.WV, t.SK, t.MB,
                      t.NPW, r4d_gemm_w4a16_nt_m64_group(), r4d_gemm_w4a8_nt_m64_group(),
                      r4d_gemm_mxfp4a8_nt_m64_group());
@@ -63,6 +67,19 @@ int main() {
       }
     }
   }
+}
+
+}  // namespace
+
+int main() {
+  int failures = 0, checked = 0;
+  CheckTable(r4dx::model::kGemmTuningTable, "main table", checked, failures);
+  // A thread that loaded a tensor-parallel rank (docs/tp.md 2.7) sees the TP table first and the
+  // main table behind it: every row of both must still be launchable there.
+  r4dx::model::SetTp2TuningForThisThread(true);
+  CheckTable(r4dx::model::tp2::kGemmTuningTable, "tp2 table, tp thread", checked, failures);
+  CheckTable(r4dx::model::kGemmTuningTable, "main table, tp thread", checked, failures);
+  r4dx::model::SetTp2TuningForThisThread(false);
   std::printf("test_pick_tuning: %d/%d PickTuning results launchable (w4a16 group %d)\n",
               checked - failures, checked, r4d_gemm_w4a16_nt_m64_group());
   return failures == 0 ? 0 : 1;

@@ -12,15 +12,23 @@
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/stream.hpp"
 
+namespace r4dx::core {
+class TpComm;  // r4dx/core/tp_comm.hpp
+}  // namespace r4dx::core
+
 namespace r4dx::model {
 
 class SpanAccumulator;  // profile_span.h -- forward-declared, see gdn_layer.h's identical comment.
 
 class Mlp {
  public:
+  // `comm` (docs/tp.md 6.2, site A3): non-owning; when non-null, Forward all-reduces the
+  // row-parallel down projection's output across tensor-parallel ranks before the residual add,
+  // and `cfg` is the RANK's config (intermediate_size halved). nullptr (TP=1) is exactly the pre-TP
+  // code path.
   Mlp(const ModelConfig& cfg, const core::DeviceBuffer<uint16_t>& post_attention_layernorm,
-      const MlpWeights& w)
-      : cfg_(cfg), post_attention_layernorm_(post_attention_layernorm), w_(w) {}
+      const MlpWeights& w, core::TpComm* comm = nullptr)
+      : cfg_(cfg), post_attention_layernorm_(post_attention_layernorm), w_(w), comm_(comm) {}
 
   // x: device bf16 [T, hidden] -- current residual stream. x_out: device bf16 [T, hidden], may
   // alias x.
@@ -59,6 +67,7 @@ class Mlp {
   const ModelConfig& cfg_;
   const core::DeviceBuffer<uint16_t>& post_attention_layernorm_;
   const MlpWeights& w_;
+  core::TpComm* comm_ = nullptr;
 };
 
 }  // namespace r4dx::model

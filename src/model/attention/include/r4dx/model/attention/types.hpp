@@ -10,6 +10,10 @@
 
 #include "quant_linear.h"
 
+namespace r4dx::core {
+class TpComm;  // r4dx/core/tp_comm.hpp -- only attention_layer.hpp calls through it
+}  // namespace r4dx::core
+
 namespace r4dx::model::attention {
 
 // Geometry for Qwen3_5ForConditionalGeneration's full-attention layers (docs/architecture.md,
@@ -32,6 +36,11 @@ struct AttnConfig {
   int mrope_section_t = 11;
   int mrope_section_h = 11;
   int mrope_section_w = 10;
+  // Tensor parallel (docs/tp.md 6.2, site A2): non-owning; when non-null, Forward all-reduces the
+  // row-parallel o_proj output across ranks before the residual add. nullptr (the default, and
+  // every TP=1 layer) is exactly the pre-TP code path. num_heads/kv_heads above are then the RANK's
+  // head counts (ModelConfig::Shard).
+  core::TpComm* comm = nullptr;
 
   int Gqa() const { return num_heads / kv_heads; }
 };

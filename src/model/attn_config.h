@@ -15,8 +15,11 @@
 
 namespace r4dx::model {
 
-inline attention::AttnConfig MakeAttnConfig(const ModelConfig& cfg) {
+// `comm` (docs/tp.md 6.2): the tensor-parallel communicator the layer all-reduces its o_proj output
+// through, or nullptr (TP=1, and MtpHead::PrimeKv's K/V-only layer under TP).
+inline attention::AttnConfig MakeAttnConfig(const ModelConfig& cfg, core::TpComm* comm = nullptr) {
   attention::AttnConfig acfg;
+  acfg.comm = comm;
   acfg.hidden = static_cast<int>(cfg.hidden_size);
   acfg.num_heads = static_cast<int>(cfg.num_attention_heads);
   acfg.kv_heads = static_cast<int>(cfg.num_key_value_heads);

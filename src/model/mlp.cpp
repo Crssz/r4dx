@@ -2,6 +2,7 @@
 
 #include "linear.h"
 #include "profile_span.h"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/kernels.h"
 
 namespace r4dx::model {
@@ -111,6 +112,12 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
     ApplyLinear(stream, arena, w_.down, h, down_out, T,
                 down_epilogue != r4dx_epilogue_none ? &pre : nullptr);
   });
+  // Tensor parallel (docs/tp.md 6.2, site A3): down is row-parallel, so each rank holds a partial
+  // sum; sum it across ranks before the residual (and the fused next-norm epilogue).
+  if (comm_ != nullptr) {
+    ProfiledCall(prof, s_raw, "tp.allreduce",
+                 [&] { comm_->AllReduceSumBf16(down_out, T * hidden, s_raw); });
+  }
 
   ProfiledCall(prof, s_raw, "mlp.residual", [&] {
     if (next_norm_weight != nullptr) {

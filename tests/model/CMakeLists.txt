@@ -13,6 +13,9 @@ set(R4DX_MODEL_TESTS
   test_dflash_draft
   test_dflash_e2e
   test_teacher_forced_logprobs
+  # Tensor-parallel P2a (docs/tp.md 10.1): the sharded Container::Load of both ranks, every layout,
+  # read back against the file's bytes. Device 1, SKIP 77 without the 4-layer container.
+  test_tp_loader
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -88,6 +91,17 @@ target_link_libraries(tool_sampled_bench PRIVATE r4dx_model r4dx_convert r4dx_co
 # same pass (tests/model/teacher_forced.h), so the tool's numbers are the ones ctest checks.
 add_executable(tool_teacher_forced_logprobs tool_teacher_forced_logprobs.cpp)
 target_link_libraries(tool_teacher_forced_logprobs PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
+# tool_tp_step_bench: tensor-parallel P2a gate G3 (docs/tp.md 11) -- ms/token of ONE rank's shard
+# with a no-op all-reduce (tp::MakeNoopComm) vs the TP=1 Model, same tool, same protocol. Prints
+# numbers for the gate script, asserts nothing: built, never add_test()'d, like the tools above.
+# Renders the standard prompt through the real chat template, so it links r4dx_tokenizer -- and,
+# like r4dx-cli (src/cli/CMakeLists.txt), puts third_party ahead of the transitive ROCm include
+# path so chat_template.h's nlohmann/json.hpp is the vendored v3.11.3 r4dx_tokenizer was built with.
+add_executable(tool_tp_step_bench tool_tp_step_bench.cpp)
+target_include_directories(tool_tp_step_bench PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(tool_tp_step_bench PRIVATE r4dx_model r4dx_tokenizer r4dx_convert r4dx_core
+                                                 r4d_core)
 
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),

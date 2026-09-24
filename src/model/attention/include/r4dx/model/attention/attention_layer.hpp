@@ -33,6 +33,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/model/attention/attn_kernels.h"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
@@ -308,6 +309,14 @@ class AttentionLayer {
     ProfiledCall(prof, stream, "gemm:attn.o_proj", [&] {
       ApplyLinear(stream, arena, *w.o, gated, o_out, T);
     });
+    // Tensor parallel (docs/tp.md 6.2, site A2): o_proj is row-parallel, so each rank holds a
+    // partial sum of the output; sum it across ranks before the residual (and the fused next-norm
+    // epilogue) consumes it. Absent at TP=1 (comm == nullptr).
+    if (cfg_.comm != nullptr) {
+      ProfiledCall(prof, stream, "tp.allreduce", [&] {
+        cfg_.comm->AllReduceSumBf16(o_out, static_cast<int64_t>(T) * hidden, stream);
+      });
+    }
 
     // ---- residual add ------------------------------------------------------------------------
     ProfiledCall(prof, stream, "attn.residual", [&] {

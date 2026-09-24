@@ -11,6 +11,7 @@
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"  // SafetensorsReader, Utf8ToWide -- see file comment
+#include "tp/tp_shard.h"  // tensor-parallel shard rules and byte plans (LoadShard, docs/tp.md 5.1)
 
 namespace r4dx::model {
 
@@ -242,6 +243,35 @@ double GiB(uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.
 Container Container::Load(const std::string& path, Layout layout, Layout lm_head_layout,
                            int64_t layer_limit, Layout mtp_head_layout,
                            bool embed_device_resident, bool load_vision) {
+  ContainerLoadOptions o;
+  o.layout = layout;
+  o.lm_head_layout = lm_head_layout;
+  o.layer_limit = layer_limit;
+  o.mtp_head_layout = mtp_head_layout;
+  o.embed_device_resident = embed_device_resident;
+  o.load_vision = load_vision;
+  return Load(path, o);
+}
+
+Container Container::Load(const std::string& path, const ContainerLoadOptions& o) {
+  if (o.tp_world < 1 || o.tp_world > 2 || o.tp_rank < 0 || o.tp_rank >= o.tp_world) {
+    throw std::invalid_argument("r4dx::model::Container::Load: need tp_world in {1, 2} and 0 <= "
+                                "tp_rank < tp_world, got tp_world " + std::to_string(o.tp_world) +
+                                ", tp_rank " + std::to_string(o.tp_rank));
+  }
+  if (o.tp_world > 1) return LoadShard(path, o);
+  // tp_world == 1 (docs/tp.md 5.1 step 7): the pre-TP loader below, untouched -- no rule lookup, no
+  // staging. The TP-only options have no meaning here; refuse them rather than ignore them.
+  if (o.shared_embed_host || o.embed_device_resident_decided >= 0 || o.parse_vision_config) {
+    throw std::invalid_argument(
+        "r4dx::model::Container::Load: shared_embed_host, embed_device_resident_decided and "
+        "parse_vision_config are tensor-parallel options (tp_world > 1 only)");
+  }
+  const Layout layout = o.layout, lm_head_layout = o.lm_head_layout;
+  const Layout mtp_head_layout = o.mtp_head_layout;
+  const int64_t layer_limit = o.layer_limit;
+  const bool embed_device_resident = o.embed_device_resident, load_vision = o.load_vision;
+
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
@@ -253,6 +283,7 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
                                         ? model_config.at("text_config")
                                         : model_config;  // selftest containers have no text_config
   c.config_ = ModelConfig::FromJson(text_cfg);
+  c.global_config_ = c.config_;  // tp_world == 1: the global config IS the config (docs/tp.md 3.2)
   // Top-level (not text_config/vision_config) -- see Container::ImageTokenId's doc comment.
   if (model_config.contains("image_token_id")) {
     c.image_token_id_ = model_config.at("image_token_id").get<int64_t>();
@@ -496,6 +527,470 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   }
 
   return c;
+}
+
+// ---- tensor-parallel shard loading (docs/tp.md 4.3, 5.1) ---------------------------------------
+
+namespace {
+
+struct ShardLoadStats {
+  int sharded = 0;     // on-disk tensors this rank uploaded a slice of
+  int replicated = 0;  // on-disk tensors this rank uploaded whole
+  uint64_t uploaded_bytes = 0;
+  uint64_t staged_bytes = 0;  // the part of uploaded_bytes gathered through the host staging buffer
+};
+
+// The byte size a WHOLE on-disk part of logical shape [N, K] has (docs/tp.md 4.3, the converter's
+// packers). A tensor whose span disagrees is refused rather than sliced with the wrong strides.
+uint64_t PartBytes(const tp::PartShape& s) {
+  const uint64_t N = static_cast<uint64_t>(s.N), K = static_cast<uint64_t>(s.K);
+  switch (s.part) {
+    case tp::Part::kBf16: return N * K * 2;
+    case tp::Part::kW4Wq:
+    case tp::Part::kMxWq: return N * K / 2;
+    case tp::Part::kW4a16Wsz:
+    case tp::Part::kW4a8Ws: return N * (K / static_cast<uint64_t>(s.group)) * 4;
+    case tp::Part::kMxWs: return (K / static_cast<uint64_t>(s.group)) * N;
+    case tp::Part::kMxWref: return N;
+    case tp::Part::kElem: return N * static_cast<uint64_t>(s.row_bytes);
+  }
+  return 0;
+}
+
+// One rank's view of the container: every tensor is classified by tp::RuleFor on its base name and
+// only this rank's byte runs (tp::PlanRows/PlanCols) are uploaded -- straight from the mmap when the
+// plan is one contiguous range, through one reusable host staging buffer otherwise (docs/tp.md 5.1
+// step 4). Every name must be known to RuleFor: an unclassified tensor throws, it is never silently
+// replicated.
+class ShardLoader {
+ public:
+  ShardLoader(const SafetensorsReader& r, const ModelConfig& global, int world, int rank,
+              int w4a16_group)
+      : r_(r), global_(global), world_(world), rank_(rank), w4a16_group_(w4a16_group) {}
+
+  // A tensor with one on-disk form and no layout suffix (norms, gdn.in_proj_a/b, conv1d_weight,
+  // A_log, dt_bias, the descales, mtp.fc, ...): its whole bytes when the rule replicates, else this
+  // rank's row ranges of the row-major [N, ...] array (N = the rule's total rows).
+  template <class T>
+  core::DeviceBuffer<T> Raw(const std::string& name) {
+    const tp::ShardRule rule = tp::RuleFor(name, global_);
+    const uint64_t span = Span(name);
+    if (rule.split == tp::Split::kReplicate) return Upload<T>(name, {tp::ByteRun{0, span}}, false);
+    if (rule.split != tp::Split::kRows) {
+      throw std::logic_error("r4dx::model::Container: '" + name +
+                             "' has no layout suffix but its tensor-parallel rule is not a row split "
+                             "or a replication");
+    }
+    int64_t rows = 0;
+    for (const tp::Segment& s : rule.segments) rows += s.rows;
+    if (rows <= 0 || span % static_cast<uint64_t>(rows) != 0) {
+      throw std::runtime_error("r4dx::model::Container: tensor '" + name + "' (" +
+                               std::to_string(span) + " bytes) is not " + std::to_string(rows) +
+                               " equal rows, the row count its tensor-parallel rule splits");
+    }
+    tp::PartShape shape;
+    shape.part = tp::Part::kElem;
+    shape.N = rows;
+    shape.row_bytes = static_cast<int64_t>(span / static_cast<uint64_t>(rows));
+    return Upload<T>(name, tp::PlanRows(shape, tp::RankRows(rule, world_, rank_)), true);
+  }
+
+  // UploadWidenedF32's counterpart (gdn.norm_weight, bf16 on disk, fp32 on device): replicated.
+  core::DeviceBuffer<float> WidenedF32(const std::string& name) {
+    if (tp::RuleFor(name, global_).split != tp::Split::kReplicate) {
+      throw std::logic_error("r4dx::model::Container: '" + name + "' is widened on load, which "
+                             "only a replicated tensor supports");
+    }
+    core::DeviceBuffer<float> buf = UploadWidenedF32(r_, name);
+    ++stats_.replicated;
+    stats_.uploaded_bytes += buf.bytes();
+    return buf;
+  }
+
+  // LoadQuantLinearWithFallback's sharded counterpart: the same requested -> .bf16.w -> bare
+  // on-disk form chain, then this rank's slice of every part of that form. `N`/`K` are the GLOBAL
+  // logical shape; the returned QuantLinear carries the RANK's (docs/tp.md 5.1 step 4).
+  QuantLinear Linear(const std::string& base, Layout requested, int64_t N, int64_t K,
+                     int* fallbacks = nullptr) {
+    Layout form = requested;
+    bool bare = false;
+    if (!HasLayout(r_, base, requested)) {
+      if (fallbacks != nullptr) ++*fallbacks;
+      form = Layout::kBf16;
+      if (!HasLayout(r_, base, Layout::kBf16)) {
+        if (!r_.Has(base)) {
+          throw std::runtime_error("r4dx::model::Container: no tensor found for '" + base +
+                                   "' in any known on-disk form (requested layout, bf16, or bare)");
+        }
+        bare = true;
+      }
+    }
+
+    const tp::ShardRule rule = tp::RuleFor(base, global_);
+    QuantLinear q;
+    q.layout = form;
+    q.N = N;
+    q.K = K;
+    std::vector<tp::Range> rows;
+    tp::Range cols{0, K};
+    if (rule.split == tp::Split::kRows) {
+      int64_t total = 0;
+      for (const tp::Segment& s : rule.segments) total += s.rows;
+      if (total != N) {
+        throw std::logic_error("r4dx::model::Container: '" + base + "' has N = " +
+                               std::to_string(N) + " but its tensor-parallel rule splits " +
+                               std::to_string(total) + " rows");
+      }
+      rows = tp::RankRows(rule, world_, rank_);
+      q.N = 0;
+      for (const tp::Range& r : rows) q.N += r.count;
+    } else if (rule.split == tp::Split::kCols) {
+      if (rule.k_total != K) {
+        throw std::logic_error("r4dx::model::Container: '" + base + "' has K = " +
+                               std::to_string(K) + " but its tensor-parallel rule splits K = " +
+                               std::to_string(rule.k_total));
+      }
+      cols = tp::RankCols(rule, world_, rank_);
+      q.K = cols.count;
+    } else if (rule.split != tp::Split::kReplicate) {
+      throw std::logic_error("r4dx::model::Container: '" + base +
+                             "' is not a text/mtp linear (rank-0-only rule)");
+    }
+
+    const auto shape = [&](tp::Part p, int group) {
+      tp::PartShape s;
+      s.part = p;
+      s.N = N;
+      s.K = K;
+      s.group = group;
+      return s;
+    };
+    switch (form) {
+      case Layout::kBf16:
+        q.bf16_w = Part<uint16_t>(bare ? base : base + ".bf16.w", shape(tp::Part::kBf16, 0), rule,
+                                  rows, cols);
+        break;
+      case Layout::kW4a16:
+        q.wq = Part<uint8_t>(base + ".w4a16.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
+        q.w4a16_wsz = Part<uint32_t>(base + ".w4a16.wsz", shape(tp::Part::kW4a16Wsz, w4a16_group_),
+                                     rule, rows, cols);
+        break;
+      case Layout::kW4a8:
+        q.wq = Part<uint8_t>(base + ".w4a8.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
+        q.w4a8_ws = Part<uint32_t>(base + ".w4a8.ws", shape(tp::Part::kW4a8Ws, 128), rule, rows,
+                                   cols);
+        break;
+      case Layout::kMxfp4:
+        q.mxfp4_wq = Part<uint8_t>(base + ".mxfp4.wq", shape(tp::Part::kMxWq, 0), rule, rows, cols);
+        q.mxfp4_ws = Part<uint8_t>(base + ".mxfp4.ws", shape(tp::Part::kMxWs, 32), rule, rows, cols);
+        // K-slice: the FULL-row wref (docs/tp.md 4.3 "The mxfp4 wref exception"), which PlanCols
+        // returns for this part.
+        q.mxfp4_wref = Part<int8_t>(base + ".mxfp4.wref", shape(tp::Part::kMxWref, 0), rule, rows,
+                                    cols);
+        break;
+    }
+    return q;
+  }
+
+  // The embedding's device mirror is uploaded by LoadShard itself; this only counts it.
+  void CountReplicated(uint64_t bytes) {
+    ++stats_.replicated;
+    stats_.uploaded_bytes += bytes;
+  }
+  const ShardLoadStats& Stats() const { return stats_; }
+
+ private:
+  uint64_t Span(const std::string& name) const {
+    const auto& m = r_.Meta(name);
+    return m.end - m.begin;
+  }
+
+  template <class T>
+  core::DeviceBuffer<T> Part(const std::string& name, const tp::PartShape& shape,
+                             const tp::ShardRule& rule, const std::vector<tp::Range>& rows,
+                             tp::Range cols) {
+    const uint64_t span = Span(name);
+    if (span != PartBytes(shape)) {
+      throw std::runtime_error("r4dx::model::Container: tensor '" + name + "' is " +
+                               std::to_string(span) + " bytes, but its [" +
+                               std::to_string(shape.N) + ", " + std::to_string(shape.K) +
+                               "] layout needs " + std::to_string(PartBytes(shape)));
+    }
+    switch (rule.split) {
+      case tp::Split::kRows: return Upload<T>(name, tp::PlanRows(shape, rows), true);
+      case tp::Split::kCols: return Upload<T>(name, tp::PlanCols(shape, cols), true);
+      default: return Upload<T>(name, {tp::ByteRun{0, span}}, false);
+    }
+  }
+
+  template <class T>
+  core::DeviceBuffer<T> Upload(const std::string& name, const std::vector<tp::ByteRun>& runs,
+                               bool sharded) {
+    const uint64_t span = Span(name);
+    const uint8_t* src = r_.Data(name);
+    size_t total = 0;
+    for (const tp::ByteRun& run : runs) {
+      if (run.src_off > span || run.bytes > span - run.src_off) {
+        throw std::out_of_range("r4dx::model::Container: a byte run of '" + name +
+                                "' reaches past its " + std::to_string(span) + " bytes");
+      }
+      total += run.bytes;
+    }
+    if (total == 0 || total % sizeof(T) != 0) {
+      throw std::runtime_error("r4dx::model::Container: this rank's slice of '" + name + "' is " +
+                               std::to_string(total) + " bytes, not a positive multiple of " +
+                               std::to_string(sizeof(T)));
+    }
+    const size_t count = total / sizeof(T);
+    core::DeviceBuffer<T> buf(count);
+    if (runs.size() == 1) {
+      // One contiguous range: straight from the mmap, no staging copy.
+      buf.CopyFromHost(reinterpret_cast<const T*>(src + runs[0].src_off), count);
+    } else {
+      if (staging_.size() < total) staging_.resize(total);
+      size_t o = 0;
+      for (const tp::ByteRun& run : runs) {
+        std::memcpy(staging_.data() + o, src + run.src_off, run.bytes);
+        o += run.bytes;
+      }
+      buf.CopyFromHost(reinterpret_cast<const T*>(staging_.data()), count);
+      stats_.staged_bytes += total;
+    }
+    ++(sharded ? stats_.sharded : stats_.replicated);
+    stats_.uploaded_bytes += total;
+    return buf;
+  }
+
+  const SafetensorsReader& r_;
+  const ModelConfig& global_;
+  int world_, rank_, w4a16_group_;
+  std::vector<uint8_t> staging_;  // grown to the largest gathered tensor; freed with the loader
+  ShardLoadStats stats_;
+};
+
+}  // namespace
+
+Container Container::LoadShard(const std::string& path, const ContainerLoadOptions& o) {
+  if (o.load_vision && o.tp_rank != 0) {
+    throw std::invalid_argument(
+        "r4dx::model::Container::Load: the vision tower's weights live on tensor-parallel rank 0 "
+        "only (docs/tp.md 4.2); load_vision was set on rank " + std::to_string(o.tp_rank));
+  }
+  const VramSnapshot vram_before = SnapshotVram();
+  Container c;
+  const nlohmann::json metadata = ReadMetadata(path);
+  CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout);
+  c.model_id_ = metadata.value("model_id", std::string());
+  c.config_sha256_ = metadata.value("config_sha256", std::string());
+  const nlohmann::json& model_config = metadata.at("model_config");
+  const nlohmann::json& text_cfg = model_config.contains("text_config")
+                                        ? model_config.at("text_config")
+                                        : model_config;  // selftest containers have no text_config
+  c.global_config_ = ModelConfig::FromJson(text_cfg);
+  c.config_ = ModelConfig::Shard(c.global_config_, o.tp_world, o.tp_rank);
+  if (model_config.contains("image_token_id")) {
+    c.image_token_id_ = model_config.at("image_token_id").get<int64_t>();
+  }
+  if (model_config.contains("video_token_id")) {
+    c.video_token_id_ = model_config.at("video_token_id").get<int64_t>();
+  }
+  // The group the container's w4a16 scales were packed at -- the wsz stride per 16-row tile
+  // (docs/tp.md 4.3). A container that predates the `quant` block is group 128, CheckQuantGroups'
+  // own rule.
+  int w4a16_group = 128;
+  if (metadata.contains("quant") && metadata.at("quant").contains("w4a16") &&
+      metadata.at("quant").at("w4a16").contains("group")) {
+    w4a16_group = metadata.at("quant").at("w4a16").at("group").get<int>();
+  }
+
+  SafetensorsReader reader(Utf8ToWide(path));
+  const ModelConfig& gc = c.global_config_;
+  ShardLoader L(reader, gc, o.tp_world, o.tp_rank, w4a16_group);
+  const int64_t num_layers =
+      (o.layer_limit >= 0) ? std::min(o.layer_limit, gc.num_hidden_layers) : gc.num_hidden_layers;
+
+  // text.embed_tokens: replicated. Host: the process's one shared pinned copy when the caller has
+  // it (docs/tp.md 5.3 -- never duplicated), else this rank's own. Device mirror: the caller's joint
+  // decision when given, so every rank takes the same gather path (docs/tp.md 2.9 step 5), else the
+  // single-device 2x-headroom heuristic.
+  {
+    const int64_t n = ElemCountBySize(reader, "text.embed_tokens", 2);
+    if (tp::RuleFor("text.embed_tokens", gc).split != tp::Split::kReplicate) {
+      throw std::logic_error("r4dx::model::Container: text.embed_tokens must replicate");
+    }
+    if (o.shared_embed_host) {
+      if (o.shared_embed_host->size() != static_cast<size_t>(n)) {
+        throw std::invalid_argument("r4dx::model::Container::Load: shared_embed_host holds " +
+                                    std::to_string(o.shared_embed_host->size()) +
+                                    " elements, text.embed_tokens has " + std::to_string(n));
+      }
+      c.shared_embed_host_ = o.shared_embed_host;
+    } else {
+      c.embed_tokens_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(n));
+      std::memcpy(c.embed_tokens_.data(), reader.Data("text.embed_tokens"),
+                  static_cast<size_t>(n) * 2);
+    }
+    const size_t embed_bytes = static_cast<size_t>(n) * sizeof(uint16_t);
+    bool resident = false;
+    if (o.embed_device_resident_decided >= 0) {
+      resident = o.embed_device_resident_decided != 0;
+    } else if (o.embed_device_resident) {
+      size_t free_bytes = 0, total_bytes = 0;
+      R4DX_HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
+      resident = free_bytes > embed_bytes * 2;
+      if (!resident) {
+        std::fprintf(stderr,
+                     "r4dx: only %.2f GiB free VRAM (need ~%.2f GiB for text.embed_tokens plus "
+                     "headroom for the rest of the container) -- keeping embeddings host-only, "
+                     "gather will go through the host path\n",
+                     GiB(free_bytes), GiB(embed_bytes));
+      }
+    }
+    if (resident) {
+      c.embed_tokens_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(n));
+      c.embed_tokens_dev_.CopyFromHost(c.EmbedTokensHost(), static_cast<size_t>(n));
+    }
+    L.CountReplicated(resident ? embed_bytes : 0);
+  }
+
+  // GLOBAL shapes throughout: ShardLoader::Linear takes the logical [N, K] and returns the rank's.
+  const int64_t hidden = gc.hidden_size;
+  const int64_t key_dim = gc.KeyDim();
+  const int64_t value_dim = gc.ValueDim();
+  const int64_t kv_rows = gc.num_key_value_heads * gc.head_dim;
+  const int64_t attn_out = gc.num_attention_heads * gc.head_dim;
+  const int64_t intermediate = gc.intermediate_size;
+  int bf16_fallbacks = 0;
+
+  c.layers_.reserve(static_cast<size_t>(num_layers));
+  for (int64_t i = 0; i < num_layers; ++i) {
+    const std::string base = "text.layers." + std::to_string(i) + ".";
+    LayerWeights lw;
+    lw.input_layernorm = L.Raw<uint16_t>(base + "input_layernorm");
+    lw.post_attention_layernorm = L.Raw<uint16_t>(base + "post_attention_layernorm");
+    if (gc.IsGdnLayer(i)) {
+      GdnWeights gw;
+      gw.in_proj_qkv = L.Linear(base + "gdn.in_proj_qkv", o.layout, 2 * key_dim + value_dim,
+                                hidden, &bf16_fallbacks);
+      gw.in_proj_z = L.Linear(base + "gdn.in_proj_z", o.layout, value_dim, hidden, &bf16_fallbacks);
+      gw.in_proj_b = L.Raw<uint16_t>(base + "gdn.in_proj_b");
+      gw.in_proj_a = L.Raw<uint16_t>(base + "gdn.in_proj_a");
+      gw.conv1d_weight = L.Raw<uint16_t>(base + "gdn.conv1d_weight");
+      gw.A_log = L.Raw<float>(base + "gdn.A_log");
+      gw.dt_bias = L.Raw<float>(base + "gdn.dt_bias");
+      gw.norm_weight = L.WidenedF32(base + "gdn.norm_weight");
+      gw.out_proj = L.Linear(base + "gdn.out_proj", o.layout, hidden, value_dim, &bf16_fallbacks);
+      lw.gdn = std::move(gw);
+    } else {
+      AttnWeights a;
+      a.qg = L.Linear(base + "attn.qg", o.layout, attn_out * 2, hidden, &bf16_fallbacks);
+      a.k = L.Linear(base + "attn.k", o.layout, kv_rows, hidden, &bf16_fallbacks);
+      a.v = L.Linear(base + "attn.v", o.layout, kv_rows, hidden, &bf16_fallbacks);
+      a.o = L.Linear(base + "attn.o", o.layout, hidden, attn_out, &bf16_fallbacks);
+      a.q_norm = L.Raw<uint16_t>(base + "attn.q_norm");
+      a.k_norm = L.Raw<uint16_t>(base + "attn.k_norm");
+      a.k_descale = L.Raw<float>(base + "attn.k_descale");
+      a.v_descale = L.Raw<float>(base + "attn.v_descale");
+      lw.attn = std::move(a);
+    }
+    lw.mlp.gate_up = L.Linear(base + "mlp.gate_up", o.layout, 2 * intermediate, hidden,
+                              &bf16_fallbacks);
+    lw.mlp.down = L.Linear(base + "mlp.down", o.layout, hidden, intermediate, &bf16_fallbacks);
+    c.layers_.push_back(std::move(lw));
+  }
+
+  c.final_norm_ = L.Raw<uint16_t>("text.final_norm");
+  // Vocab-split (docs/tp.md 7.1): this rank's [vocab/world, hidden] rows.
+  c.lm_head_ = L.Linear("lm_head", o.lm_head_layout, gc.vocab_size, hidden, &bf16_fallbacks);
+
+  // mtp.* (docs/tp.md 4.2): the attention sublayer and MLP shard exactly like a body layer; fc, the
+  // norms and the optional reduced-vocab draft head replicate. Same tensor set and layout choices
+  // as the TP=1 path above.
+  if (reader.Has("mtp.norm")) {
+    MtpWeights mw;
+    LayerWeights lw;
+    lw.input_layernorm = L.Raw<uint16_t>("mtp.input_layernorm");
+    lw.post_attention_layernorm = L.Raw<uint16_t>("mtp.post_attention_layernorm");
+    AttnWeights a;
+    a.qg = L.Linear("mtp.attn.qg", o.mtp_head_layout, attn_out * 2, hidden, &bf16_fallbacks);
+    a.k = L.Linear("mtp.attn.k", Layout::kBf16, kv_rows, hidden);
+    a.v = L.Linear("mtp.attn.v", Layout::kBf16, kv_rows, hidden);
+    a.o = L.Linear("mtp.attn.o", o.mtp_head_layout, hidden, attn_out, &bf16_fallbacks);
+    a.q_norm = L.Raw<uint16_t>("mtp.attn.q_norm");
+    a.k_norm = L.Raw<uint16_t>("mtp.attn.k_norm");
+    a.k_descale = L.Raw<float>("mtp.attn.k_descale");
+    a.v_descale = L.Raw<float>("mtp.attn.v_descale");
+    lw.attn = std::move(a);
+    lw.mlp.gate_up = L.Linear("mtp.mlp.gate_up", o.mtp_head_layout, 2 * intermediate, hidden,
+                              &bf16_fallbacks);
+    lw.mlp.down = L.Linear("mtp.mlp.down", o.mtp_head_layout, hidden, intermediate,
+                           &bf16_fallbacks);
+    mw.layer = std::move(lw);
+    mw.fc = L.Raw<uint16_t>("mtp.fc");
+    mw.norm = L.Raw<uint16_t>("mtp.norm");
+    mw.pre_fc_norm_hidden = L.Raw<uint16_t>("mtp.pre_fc_norm_hidden");
+    mw.pre_fc_norm_embedding = L.Raw<uint16_t>("mtp.pre_fc_norm_embedding");
+    if (reader.Has("mtp.draft_head.vocab_ids")) {
+      mw.draft_vocab_ids = L.Raw<int32_t>("mtp.draft_head.vocab_ids");
+      const int64_t draft_vocab_size = static_cast<int64_t>(mw.draft_vocab_ids.size());
+      mw.draft_lm_head = L.Linear("mtp.draft_head.lm_head", o.mtp_head_layout, draft_vocab_size,
+                                  hidden, &bf16_fallbacks);
+    }
+    c.mtp_ = std::move(mw);
+  }
+
+  if (bf16_fallbacks > 0) {
+    std::fprintf(stderr,
+                 "r4dx: %d linear(s) in %s do not carry the requested layout and were loaded as "
+                 "bf16 (r4dx-convert --keep-bf16, or a container predating that tensor's "
+                 "quantization)\n",
+                 bf16_fallbacks, path.c_str());
+  }
+
+  // vision.* (docs/tp.md 4.2, 8.3): rank-0-only weights; any rank may parse just the geometry.
+  c.container_has_vision_tensors_ = vision::HasVisionTensors(reader);
+  if (c.container_has_vision_tensors_ && (o.load_vision || o.parse_vision_config)) {
+    if (!model_config.contains("vision_config")) {
+      throw std::runtime_error("r4dx::model::Container: " + path +
+                               " carries vision.* tensors but no model_config.vision_config");
+    }
+    if (o.load_vision) {
+      c.vision_ = vision::LoadVisionWeights(reader, model_config.at("vision_config"));
+    } else {
+      c.vision_config_ = vision::VisionConfig::FromJson(model_config.at("vision_config"));
+    }
+  }
+
+  const ShardLoadStats& st = L.Stats();
+  std::cerr << "[r4dx::model::Container] rank " << o.tp_rank << "/" << o.tp_world << ": "
+            << st.sharded << " tensors sharded, " << st.replicated << " replicated, "
+            << GiB(st.uploaded_bytes) << " GiB uploaded, " << GiB(st.staged_bytes)
+            << " GiB gathered through staging\n";
+
+  // The TP=1 path's over-commit warning (docs/r9700.md R14), for this rank's device.
+  if (vram_before.ok) {
+    const VramSnapshot vram_after = SnapshotVram();
+    constexpr uint64_t kNearZeroThreshold = 1ull << 30;  // 1 GiB
+    if (vram_after.ok && vram_after.free_bytes < kNearZeroThreshold &&
+        vram_before.free_bytes >= kNearZeroThreshold) {
+      std::cerr << "[r4dx::model::Container] WARNING: rank " << o.tp_rank << " layout '"
+                << LayoutName(o.layout) << "' left only " << GiB(vram_after.free_bytes)
+                << " GiB free (was " << GiB(vram_before.free_bytes)
+                << " GiB free before this load) -- this looks like an over-committed load; the "
+                   "driver (WDDM) pages the excess over PCIe instead of failing hipMalloc\n";
+    }
+  }
+  return c;
+}
+
+std::shared_ptr<const core::PinnedBuffer<uint16_t>> Container::LoadEmbedTokensHost(
+    const std::string& path) {
+  SafetensorsReader reader(Utf8ToWide(path));
+  const int64_t n = ElemCountBySize(reader, "text.embed_tokens", 2);
+  auto buf = std::make_shared<core::PinnedBuffer<uint16_t>>(static_cast<size_t>(n),
+                                                            hipHostMallocPortable);
+  std::memcpy(buf->data(), reader.Data("text.embed_tokens"), static_cast<size_t>(n) * 2);
+  return buf;
 }
 
 }  // namespace r4dx::model

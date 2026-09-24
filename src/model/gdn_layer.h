@@ -18,6 +18,10 @@
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/stream.hpp"
 
+namespace r4dx::core {
+class TpComm;  // r4dx/core/tp_comm.hpp
+}  // namespace r4dx::core
+
 namespace r4dx::model {
 
 class SpanAccumulator;  // profile_span.h -- forward-declared so this header does not need to
@@ -43,9 +47,12 @@ struct GdnLayerParams {
 
 class GdnLayer {
  public:
+  // `comm` (docs/tp.md 6.2, site A1): non-owning; when non-null, Forward all-reduces the
+  // row-parallel out_proj output across tensor-parallel ranks before the residual add, and `cfg`
+  // is the RANK's config (ModelConfig::Shard). nullptr (TP=1) is exactly the pre-TP code path.
   GdnLayer(const ModelConfig& cfg, const core::DeviceBuffer<uint16_t>& input_layernorm,
-           const GdnWeights& w)
-      : cfg_(cfg), input_layernorm_(input_layernorm), w_(w) {}
+           const GdnWeights& w, core::TpComm* comm = nullptr)
+      : cfg_(cfg), input_layernorm_(input_layernorm), w_(w), comm_(comm) {}
 
   // x: device bf16 [T, hidden] -- the block's input residual stream. x_out: device bf16
   // [T, hidden] -- may alias x. T: token count for this call (prefill: a chunk of the prompt,
@@ -91,6 +98,7 @@ class GdnLayer {
   const ModelConfig& cfg_;
   const core::DeviceBuffer<uint16_t>& input_layernorm_;
   const GdnWeights& w_;
+  core::TpComm* comm_ = nullptr;
 };
 
 }  // namespace r4dx::model

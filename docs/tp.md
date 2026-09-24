@@ -1603,7 +1603,8 @@ Baseline: before the first `src/` change, with the tree at `aa54c20`: `.\build.p
 `build\win-hip\tests\model\tool_teacher_forced_logprobs.exe` to `build\baseline\` (never rebuilt).
 The script first runs the pre-flight of 9.2 (production server stopped), then runs each row with
 the baseline and the candidate (`HIP_VISIBLE_DEVICES=1`, no `--tp`) and compares SHA-256 of stdout
-generated text and of `--dump-token-ids` files. The baseline stays valid for the whole branch
+generated text and of `--dump-token-ids` files, plus the timing-free `[stats] mtp/dflash/sampled`
+stderr lines (N26). The baseline stays valid for the whole branch
 because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own table (2.7), and the
 `PrefixState` fix only touches the server's error path.
 
@@ -1616,6 +1617,8 @@ because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own tab
 | 5 | row 4 + `--dflash ... --dflash-k 7` |
 | 6 | `tool_teacher_forced_logprobs` on `qwen38-27b-l4-allmtp.r4dx`, layouts bf16/w4a16/w4a8/mxfp4, `--layers 4`, kl_corpus tokens -> SHA of every `*.logprobs.f16` |
 | 7 | `--vision on --image tools\reference\golden_out\vision_test_image.png --prompt "What is in this picture?"` plain greedy (the golden image `tests/vision/test_preprocess.cpp` decodes; if the gitignored `golden_out` is absent, the script SKIPs this row and says so) |
+| 8 | row 4 + `--mtp 3` (added in P2a review, N26) |
+| 9 | `--chat`, two user turns through stdin, greedy (added in P2a review, N26) |
 
 Gate: all equal. First run at the end of P2a; re-run at the end of P3, P2b, P4, P5.
 
@@ -2073,6 +2076,164 @@ it refines.
   lm_head bf16 and mxfp4 ws, mlp.down w4 wq and w4a16 g64 wsz, and mlp.gate_up w4a8 ws and mxfp4
   wq, all on rank 1. The small config keeps every offset under 2 MB, so only these checks would
   catch a narrowed intermediate.
+
+**P2a**
+
+- **N12 (3.3, 5.1 step 7).** `Container::Load(path, ContainerLoadOptions)` at `tp_world == 1`
+  runs the pre-TP loader body. The only additions there are the options unpack and
+  `global_config_ = config_`. It refuses the TP-only options `shared_embed_host`,
+  `embed_device_resident_decided >= 0` and `parse_vision_config` at world 1 with
+  `std::invalid_argument` rather than ignoring them. The shard path is a separate private
+  `Container::LoadShard` that walks the same tensor set, so the TP=1 path does no rule lookup and no
+  staging. `load_vision` on a rank other than 0 is refused (4.2: rank-0-only).
+- **N13 (4.3, 5.1 step 4).** Layout-less row-split tensors (`gdn.in_proj_a/b`, `conv1d_weight`,
+  `A_log`, `dt_bias`, the descales) use one planner path: `Part::kElem` with
+  `row_bytes = span / (rule rows)`. That covers 2-D bf16, conv1d and fp32 vectors alike. Before
+  slicing, every quantized or bf16 part's span is checked against the byte size its global `[N, K]`
+  implies, so a malformed tensor throws instead of being sliced with the wrong strides. The loader
+  gathers into one reusable staging vector rather than calling `tp::Gather`, which allocates on
+  every call. For the embedding device mirror, `embed_device_resident_decided >= 0` overrides both
+  `embed_device_resident` and the free-VRAM heuristic, because the joint decision (2.9 step 5)
+  already includes the flag.
+- **N14 (2.9 step 1, 3.3).** The staged rejections are also enforced in `Model::Load` when
+  `tp.world > 1`. `mtp_draft_k > 0`, a non-empty `dflash_container` and `vision == kOn` throw
+  `TpUnsupportedError`; `kAuto` loads text-only and logs a line. This stops a bare rank `Model`,
+  which is what `tool_tp_step_bench` drives before `TpModel` exists, from reaching a path whose TP
+  hooks are not in yet. `Model::Load` also validates `TpRankOptions`: the TP-only fields must keep
+  their defaults at world 1, and `comm->World()/Rank()` must match `world/rank`.
+  `DflashHostCodebooks` is only forward-declared in `model.h`, and `tp.dflash_codebooks` stays null
+  until P5.
+- **N15 (P2a "sampled/speculative throw").** These entry points throw `TpUnsupportedError` on a TP
+  rank:
+  - `DecodeStepSampled`, only when it would actually sample (`temperature > 0`); the greedy
+    routing is the plain path and works;
+  - `VerifyWindow`, `CommitVerifiedWindow`, `ReadVerifyLogitsRow`;
+  - `DecodeStepMtp*` and `DecodeStepDflash*`, through their shared `*Impl`;
+  - `DecodeStepProfiled` and `PrefillProfiled`.
+
+  `RunChunk` additionally refuses a summary request under TP with a `std::logic_error`, which no
+  public path can reach.
+- **N16 (6.2 H1).** The fingerprint's `kind` word is `"RUNC" << 32` OR'd with the call's mode
+  bits: 1 = prefill path, 2 = logits wanted, 4 = greedy. Each mode issues a different collective
+  sequence after the layers, so a mode disagreement now fails at H1 rather than at a mismatched
+  all-gather.
+- **N17 (4.4, 7.2, 7.5).** `argmax_pair_dev_` is a `DeviceBuffer<int32_t>` of `2 x draft_window_`
+  elements. Row t holds `{int32 local idx, float bits}`, byte-compatible with `tp::ArgmaxPair`
+  (static_assert). `GatherVocabRow` copies the shard into its own host vector first, so the
+  all-gather's source never aliases its destination.
+- **N18 (6.4).** `NoopComm::AllReduceSumBf16` checks its arguments the way the real transport will
+  (non-null, `0 < 2n <= 655360`, `2n % 16 == 0`). It also counts per-channel `Stats()` and
+  `CallCounts()`, so `tool_tp_step_bench` can report how many all-reduce sites a step hit (8 per
+  token on a 4-layer model, 128 on 64 layers). `Abort` only records the abort. `SelfTest` and
+  `SetAllReduceTimeoutMs` are no-ops.
+- **N19 (2.7, 10.1).** `test_pick_tuning` now also runs with `SetTp2TuningForThisThread(true)` and
+  checks every row of `gemm_tuning_table_tp2.inc`, plus the main table behind it, for launchability
+  at the build's groups. This addition is not in 10.1's list. It matters because the TP table has
+  `SK=16` rows at `K=5120`, which are legal only at group 64: the hazard that test exists for.
+- **N20 (P2a tuning sweep).** Both sweeps ran on device 1 with the group-64 pyd, exactly as 11
+  gives them, and wrote 42 w4a16 rows and 7 bf16 rows. The generated file's header line names only
+  `w4a16=64`, because `--append` does not rewrite the header. Measured M=1 times in us (for R3):
+
+  | Row | M=1 time (us) |
+  |---|---|
+  | `tp2.gdn.in_proj_qkv` | 27.0 |
+  | `tp2.gdn.in_proj_z` | 18.6 |
+  | `tp2.out_proj` | 18.0 |
+  | `tp2.mlp.gate_up` | 76.3 |
+  | `tp2.mlp.down` | 40.8 |
+  | `tp2.lm_head` | 567.8 (7.1 estimated ~550) |
+  | `tp2.attn.kv` (bf16) | 13.1 |
+- **N21 (10.1 `tool_tp_step_bench`).**
+  - It runs one untimed warm-up pass (`--warmup 16` decode steps) before the `--repeats` timed
+    passes. The first pass would otherwise absorb lazy module loads and `PickTuning` cache fills.
+  - Pre-flight defaults: `--need-gib` is 17 for `--tp1` and 11 for one rank.
+  - `--layers N` sets `layer_limit`, for smoke runs on the 4-layer containers; G3 omits it.
+  - The JSON has `rank = -1` for `--tp1`, and adds `mode`, `hip_device`, `model`, `layout`,
+    `max_ctx`, `layers`, `tokens`, `repeats` and `prompt_tokens` to 11's fields.
+- **N22 (10.3 `tp1_identity.ps1`).** The script captures each binary's stdout byte for byte
+  through `System.Diagnostics.Process`, because PowerShell 5.1's `>` re-encodes native output. It
+  also:
+  - finds binaries in a flat directory (`build\baseline`) or a build tree (`build\win-hip`);
+  - takes `-Rows` to select rows;
+  - passes `--quiet` to the teacher-forced tool;
+  - writes every artifact and a `summary.txt` under `build\logs\tp1_identity`;
+  - throws on any DIFF or failed run.
+- **N23 (10.1 `test_tp_loader`).**
+  - Both ranks of a layout are loaded side by side (peak ~7 GiB).
+  - Every buffer is compared with `Gather(Plan(...))` of the file.
+  - Every rank shape is checked against 4.2's literal numbers, not re-derived from the rules.
+  - The bf16 reassembly maps every global row, or every row's column range, to its (rank, local
+    offset) by index arithmetic alone and compares it in place, without building the full tensor.
+    It covers all 47 sharded tensors of the 4-layer container.
+  - The embedding mirror is checked with decision 1 on the w4a16 pass and 0 on the others.
+  - The load-time refusals of N12 are checked.
+  - First run: 1675/1675 checks.
+
+**P2a review**
+
+- **N24 (2.7).** `Model::Load` calls `SetTp2TuningForThisThread(tp.world > 1)` on **every** load,
+  not only `true` on a rank load, and a guard clears the flag again when the load throws. The flag
+  therefore follows the thread's latest successful load: a TP=1 `Model` loaded on a thread that
+  loaded a rank earlier (a NoopComm rank, then a TP=1 reference, in one tool or test) resolves from
+  the main table alone, so its DFlash drafter's `(w4a16, 17408, 5120)` stays on `FallbackTuning`.
+  An RAII guard around every forward entry point was the alternative. It was not taken because it
+  needs one guard per entry point (`RunChunk`, `VerifyWindow`, the MTP, DFlash, `PrimeKv` and
+  profiled paths), and a missed one silently mixes tables. What remains: a rank `Model` used after
+  a later TP=1 load on the same thread runs on main-table tunings. That is slower but produces the
+  same bytes a rank would with any legal tuning. `TpModel` loads each rank on its own thread, so
+  this does not arise there. The same review also extends N14's world-1 refusal to
+  `tp.vision_weights_on_this_rank = false`.
+- **N25 (P2a tuning sweep, 2.7).** `tune_gemm.py` enforces the table split. An empty `--shapes`
+  selects every shape except the `tp2.*` ones, which run only when named. A run refuses to write
+  `tp2.*` rows to any `--out` other than `gemm_tuning_table_tp2.inc`, and other rows to that file.
+  Before this, the documented full regeneration (`--out src\model\gemm_tuning_table.inc`, or
+  `--layouts w4a16 --replace` after a group change) swept the TP shapes too. That put
+  `(w4a16, 17408, 5120)` into the main table (TP=1 DFlash bytes change), or it aborted the
+  `--replace` after the whole sweep.
+- **N26 (10.3).** `tp1_identity.ps1`:
+  - On every CLI row it also compares the timing-free stderr lines `[stats] mtp:`,
+    `[stats] dflash:` and `[stats] sampled:` (rounds, drafted, accepted, fallback rows) byte for
+    byte. Greedy verify and seeded sample-and-match emit tokens that do not depend on the drafts, so
+    text and ids alone cannot see a change in the TP=1 MTP-head or drafter bytes, which is the
+    change the separate TP table exists to prevent.
+  - It adds row 8, row 4 + `--mtp 3` (MTP sampled rounds), and row 9, a `--chat` session of two
+    user turns fed through stdin, greedy (the second turn prefills a suffix on top of the first
+    turn's state). A server row is not added. It needs an HTTP driver, and the server's
+    Reset/suffix path is the CLI's `Model` calls.
+  - A SKIPped row (row 7 without the golden image) makes the run `G2 INCOMPLETE` and exits
+    non-zero unless `-AllowSkip` is given.
+  - The tp2 worktree has no gitignored `golden_out`. G2 therefore passes
+    `-Image C:\Users\pay20\dev\r4dx\tools\reference\golden_out\vision_test_image.png`, which only
+    reads it.
+- **N27 (10.1 `tool_tp_step_bench`).** The tool prints and writes `embed_device_resident` to the
+  JSON. Each process takes the embedding-mirror decision from its own free VRAM, so G3 compares
+  like with like only when the TP=1 and rank JSONs agree, and the P2a G3 run checks that they do.
+- **N28 (2.7, P2a tuning sweep).** `gemm_tuning_table_tp2.inc` is tuned for w4a16 group 64 only.
+  At group 128, `BestRow` skips the `SK=16` `tp2.mlp.gate_up` rows for M=1..32 and rounds up to the
+  M=64 row, a prefill-shaped config, for decode. A group-128 TP build must re-sweep the TP table at
+  its group before any TP measurement means anything.
+- **N29 (P2a gates, measured 2026-09-24 after the review fixes, device 1, production server
+  stopped).**
+  - `run_tests.ps1`: 70/71 pass (`test_tp_loader` and `test_pick_tuning` included). The one
+    failure is `test_mtp` `CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled
+    trajectories). It is a known failure that predates P2a; the suspected cause is `main`'s
+    `32093f2` GEMM re-sweep.
+  - G2: `tp1_identity.ps1` rows 1-9 all EQUAL, with row 7 on the golden image through `-Image`
+    (N26). Row 9's second turn prefilled a 24-token suffix at position 37 without a re-render
+    reset.
+  - G3 (`tool_tp_step_bench`, median of 3 x 128 tokens; every run mirrored `embed_tokens` on the
+    device):
+
+    | Run | Median (ms/token) | Ratio to TP=1 |
+    |---|---|---|
+    | TP=1 | 27.644 | |
+    | rank 0 | 15.115 | 0.5468 |
+    | rank 1 | 15.159 | 0.5484 |
+
+    Both ranks are at or below 0.633, so G3 passes. Rank 1 is 1.5-1.6 ms under 1.4's
+    16.7-17.6 ms model.
+  - Recorded, not gated (R2): rank 1 on device 0 (the desktop card, pci bus 3) measured
+    15.243 ms/token. That is +0.084 ms (+0.55%) over device 1.
 
 ## Appendix C -- Open questions for the user
 

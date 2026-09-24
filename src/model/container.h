@@ -115,6 +115,31 @@ struct MtpWeights {
   bool HasDraftHead() const { return draft_lm_head.N > 0; }
 };
 
+// Every Container::Load knob in one struct (docs/tp.md 3.3). The positional Load below forwards to
+// Load(path, ContainerLoadOptions) with tp_world = 1, so every pre-TP caller is unchanged.
+//
+// Tensor parallel (tp_world > 1, docs/tp.md 5.1): the container is loaded as rank `tp_rank`'s SHARD
+// -- every tensor is classified by tp::RuleFor (src/model/tp/tp_shard.h) and only this rank's byte
+// ranges are uploaded, straight from the mmap when they are one contiguous range and through a
+// reusable host staging buffer otherwise. Config() is then the rank-local config
+// (ModelConfig::Shard) and every QuantLinear carries the RANK's N/K; GlobalConfig() is the
+// container's own. The TP-only fields below must keep their defaults at tp_world == 1 (Load throws
+// std::invalid_argument otherwise): that path is the pre-TP loader, untouched.
+struct ContainerLoadOptions {
+  Layout layout = Layout::kBf16, lm_head_layout = Layout::kBf16, mtp_head_layout = Layout::kBf16;
+  int64_t layer_limit = -1;
+  bool embed_device_resident = true;
+  // TP: >= 0 overrides the free-VRAM heuristic for the embedding device mirror (1 = mirror it, 0 =
+  // host-only), so every rank takes the same gather path (docs/tp.md 2.9 step 5). -1: the heuristic.
+  int embed_device_resident_decided = -1;
+  bool load_vision = false;          // upload vision.* weights on THIS rank (TP: rank 0 only)
+  bool parse_vision_config = false;  // TP: parse vision_config even when not uploading (rank > 0)
+  int tp_world = 1, tp_rank = 0;
+  // TP: the process's ONE pinned host copy of text.embed_tokens (LoadEmbedTokensHost), shared by
+  // every rank instead of each rank pinning its own 2.37 GiB. nullptr: this Load pins its own.
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
+};
+
 class Container {
  public:
   // Loads `path` onto the current HIP device (caller must have already selected device 1 per the
@@ -144,13 +169,29 @@ class Container {
   static Container Load(const std::string& path, Layout layout, Layout lm_head_layout,
                          int64_t layer_limit = -1, Layout mtp_head_layout = Layout::kBf16,
                          bool embed_device_resident = true, bool load_vision = false);
+  // The same, with every knob in ContainerLoadOptions (docs/tp.md 3.3) -- the only entry point for
+  // a tensor-parallel shard (o.tp_world > 1).
+  static Container Load(const std::string& path, const ContainerLoadOptions& o);
 
+  // text.embed_tokens of `path`, read into ONE pinned host buffer allocated with
+  // hipHostMallocPortable (so every device in the process can DMA from it) -- the tensor-parallel
+  // process loads it once and hands it to every rank (ContainerLoadOptions::shared_embed_host).
+  static std::shared_ptr<const core::PinnedBuffer<uint16_t>> LoadEmbedTokensHost(
+      const std::string& path);
+
+  // The RANK-local config under tensor parallelism (ModelConfig::Shard of GlobalConfig()); the
+  // container's own config at tp_world == 1, where the two are equal.
   const ModelConfig& Config() const { return config_; }
+  // The container's own (unsharded) config, whatever tp_world this Load used (docs/tp.md 3.2).
+  const ModelConfig& GlobalConfig() const { return global_config_; }
   const std::string& ModelId() const { return model_id_; }
   const std::string& ConfigSha256() const { return config_sha256_; }
 
-  // text.embed_tokens: host-resident (docs/architecture.md), [vocab, hidden] bf16, row-major.
-  const uint16_t* EmbedTokensHost() const { return embed_tokens_.data(); }
+  // text.embed_tokens: host-resident (docs/architecture.md), [vocab, hidden] bf16, row-major. The
+  // shared tensor-parallel copy (ContainerLoadOptions::shared_embed_host) when one was given.
+  const uint16_t* EmbedTokensHost() const {
+    return shared_embed_host_ ? shared_embed_host_->data() : embed_tokens_.data();
+  }
 
   // text.embed_tokens' device mirror (docs/mtp.md "device-resident draft loop") -- nullptr when
   // Load() was called with embed_device_resident=false, or when it was true but the free-VRAM
@@ -179,6 +220,13 @@ class Container {
   bool HasVision() const { return vision_.has_value(); }
   const vision::VisionWeights& Vision() const { return vision_.value(); }
   bool ContainerHasVisionTensors() const { return container_has_vision_tensors_; }
+  // True iff this Container knows the vision geometry: the tower was uploaded (HasVision()), or --
+  // a tensor-parallel rank that does not hold the tower (ContainerLoadOptions::parse_vision_config)
+  // -- only its vision_config was parsed (docs/tp.md 4.2, 8.3). VisionCfg() is valid iff this is.
+  bool HasVisionConfig() const { return vision_.has_value() || vision_config_.has_value(); }
+  const vision::VisionConfig& VisionCfg() const {
+    return vision_.has_value() ? vision_->config : vision_config_.value();
+  }
 
   // The multimodal placeholder token ids, from the TOP level of `__metadata__.model_config` (they
   // sit next to "text_config"/"vision_config", not inside either -- docs/vision.md "Model facts").
@@ -195,11 +243,16 @@ class Container {
   // pattern Container itself uses, one level up.
   friend class Model;
 
+  // The tensor-parallel shard path of Load(path, ContainerLoadOptions) (docs/tp.md 5.1).
+  static Container LoadShard(const std::string& path, const ContainerLoadOptions& o);
+
   ModelConfig config_;
+  ModelConfig global_config_;  // == config_ at tp_world == 1
   int64_t image_token_id_ = 248056;  // C:\AI\models\Qwen3.8-27B\config.json, top level
   int64_t video_token_id_ = 248057;
   std::string model_id_, config_sha256_;
-  core::PinnedBuffer<uint16_t> embed_tokens_;
+  core::PinnedBuffer<uint16_t> embed_tokens_;  // empty when shared_embed_host_ is set
+  std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host_;
   core::DeviceBuffer<uint16_t> embed_tokens_dev_;  // empty iff not device-resident (Load's own
                                                     // comment) -- see EmbedTokensDeviceResident()
   std::vector<LayerWeights> layers_;
@@ -207,6 +260,7 @@ class Container {
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;
   std::optional<vision::VisionWeights> vision_;
+  std::optional<vision::VisionConfig> vision_config_;  // parsed-only (TP rank without the tower)
   bool container_has_vision_tensors_ = false;
 };
 

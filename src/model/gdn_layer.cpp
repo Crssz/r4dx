@@ -11,6 +11,7 @@
 #include "r4d.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/kernels.h"
 
 namespace r4dx::model {
@@ -236,6 +237,11 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   ProfiledCall(prof, s, "gemm:gdn.out_proj", [&] {
     ApplyLinear(stream, arena, w_.out_proj, out_core, gdn_out, T);
   });
+  // Tensor parallel (docs/tp.md 6.2, site A1): out_proj is row-parallel, so each rank holds a
+  // partial sum; sum it across ranks before the residual (and the fused next-norm epilogue).
+  if (comm_ != nullptr) {
+    ProfiledCall(prof, s, "tp.allreduce", [&] { comm_->AllReduceSumBf16(gdn_out, T * hidden, s); });
+  }
   ProfiledCall(prof, s, "gdn.residual", [&] {
     if (next_norm_weight != nullptr) {
       r4dx_residual_rmsnorm_bf16(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(gdn_out),

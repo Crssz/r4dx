@@ -80,6 +80,13 @@ add_library(r4dx_tp_shard STATIC tp/tp_shard.cpp)
 target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                                 ${CMAKE_SOURCE_DIR}/third_party)
 
+# ---- r4dx_tp: the TpComm implementations (docs/tp.md 6.1, Appendix A) ----------------------------
+# P2a: NoopComm only (tp/tp_comm_noop.cpp, docs/tp.md 6.4). The interface itself is header-only in
+# src/core (r4dx/core/tp_comm.hpp) so the header-only AttentionLayer can call through it.
+add_library(r4dx_tp STATIC tp/tp_comm_noop.cpp)
+target_include_directories(r4dx_tp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(r4dx_tp PUBLIC r4dx_core r4dx_kernels)
+
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 add_library(r4dx_model STATIC
   container.cpp
@@ -102,6 +109,10 @@ target_link_libraries(r4dx_model PUBLIC
   # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
   # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
   r4dx_vision_tower
+  # Tensor parallel (docs/tp.md): the sharded Container::Load path plans every rank slice with
+  # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.
+  r4dx_tp_shard
+  r4dx_tp
 )
 
 # src/model/attention/** is another agent's -- guard so this configure never blocks on it existing

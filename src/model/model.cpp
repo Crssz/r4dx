@@ -1,7 +1,9 @@
 ﻿#include "model.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -23,10 +25,31 @@
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/model/attention/attention_layer.hpp"
 #include "r4dx/model/attention/types.hpp"
+#include "tp/tp_vocab.h"  // tensor-parallel vocab-split merges (docs/tp.md 7.3)
 
 namespace r4dx::model {
 
 namespace {
+
+// ---- tensor parallel lockstep fingerprints (docs/tp.md 6.2 H1) ----------------------------------
+// RunChunk's entry check: {kind, T, pos_, FNV-1a of the tokens}. `kind` carries the call's own
+// mode bits too (prefill path, logits wanted, greedy), because each mode issues a different
+// sequence of collectives after the layers -- two ranks that agree on the tokens but not on the
+// mode would otherwise only find out at a mismatched all-gather.
+constexpr uint64_t kLockstepRunChunk = 0x52554e4300000000ull;  // "RUNC"
+
+uint64_t Fnv1a64(const std::vector<int32_t>& tokens) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  const auto* p = reinterpret_cast<const uint8_t*>(tokens.data());
+  for (size_t i = 0; i < tokens.size() * sizeof(int32_t); ++i) {
+    h ^= p[i];
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
+
+static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t),
+              "argmax_pair_dev_ stores one tp::ArgmaxPair as two int32 slots");
 
 // SpanAccumulator/SpanEntry moved to profile_span.h (Milestone 3 profiling pass, docs/r9700.md
 // R5/Q3/Q7, 2026-09-20) so GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward can record
@@ -118,17 +141,86 @@ double GiB(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0
 }  // namespace
 
 Model Model::Load(const ModelOptions& opts) {
+  // ---- tensor parallel (docs/tp.md 3.3): validate this rank's options ---------------------------
+  const TpRankOptions& tp = opts.tp;
+  const bool is_tp_rank = tp.world > 1;
+  if (tp.world < 1 || tp.world > 2 || tp.rank < 0 || tp.rank >= tp.world) {
+    throw std::invalid_argument("Model::Load: ModelOptions::tp needs world in {1, 2} and 0 <= rank "
+                                "< world, got world " + std::to_string(tp.world) + ", rank " +
+                                std::to_string(tp.rank));
+  }
+  if (!is_tp_rank && (tp.comm != nullptr || tp.shared_embed_host || tp.dflash_codebooks ||
+                   tp.embed_device_resident_decided >= 0 || !tp.vision_weights_on_this_rank)) {
+    throw std::invalid_argument(
+        "Model::Load: ModelOptions::tp.comm/shared_embed_host/dflash_codebooks/"
+        "embed_device_resident_decided/vision_weights_on_this_rank are tensor-parallel options "
+        "(tp.world > 1 only)");
+  }
+  ModelOptions::VisionMode vision_mode = opts.vision;
+  if (is_tp_rank) {
+    if (tp.comm == nullptr || tp.comm->World() != tp.world || tp.comm->Rank() != tp.rank) {
+      throw std::invalid_argument(
+          "Model::Load: tp.world > 1 needs a TpComm endpoint of the same world and rank");
+    }
+    // Staged rejections (docs/tp.md 2.9 step 1, 9.1): the MTP head, the DFlash2 drafter and the
+    // vision tower get their tensor-parallel hooks in P5.
+    if (opts.mtp_draft_k > 0) {
+      throw core::TpUnsupportedError("Model::Load: MTP (mtp_draft_k > 0) is not supported under "
+                                     "tensor parallelism yet (docs/tp.md P5)");
+    }
+    if (!opts.dflash_container.empty()) {
+      throw core::TpUnsupportedError("Model::Load: DFlash2 (dflash_container) is not supported "
+                                     "under tensor parallelism yet (docs/tp.md P5)");
+    }
+    if (opts.vision == ModelOptions::VisionMode::kOn) {
+      throw core::TpUnsupportedError("Model::Load: --vision on is not supported under tensor "
+                                     "parallelism yet (docs/tp.md P5)");
+    }
+    if (opts.vision == ModelOptions::VisionMode::kAuto) {
+      std::cerr << "[r4dx::model::Model] tp rank " << tp.rank << "/" << tp.world
+                << ": --vision auto loads text-only under tensor parallelism until docs/tp.md P5\n";
+      vision_mode = ModelOptions::VisionMode::kOff;
+    }
+  }
+  // docs/tp.md 2.7: a TP rank's thread consults the per-rank tuning table first. Set on EVERY load
+  // (false at TP=1), so the flag follows this thread's latest successful Model::Load rather than any
+  // earlier rank load; a TP load that throws clears it again (Appendix B N24).
+  SetTp2TuningForThisThread(is_tp_rank);
+  struct Tp2FlagOnThrow {
+    int uncaught = std::uncaught_exceptions();
+    ~Tp2FlagOnThrow() {
+      if (std::uncaught_exceptions() > uncaught) SetTp2TuningForThisThread(false);
+    }
+  } tp2_flag_on_throw;
+
   Model m;
+  m.comm_ = tp.comm;
   const VramSnap vram0 = SnapVram();  // before any of this Load() call's own allocations
   // The vision tower's ~0.90 GiB is loaded between two of its own snapshots so it gets its own
   // VRAM breakdown line -- the same treatment the DFlash2 drafter gets below, and the only honest
   // way to report a delta docs/vision.md quotes as a number (docs/vision.md "Load policy").
-  const bool want_vision = opts.vision != ModelOptions::VisionMode::kOff;
-  m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
-                                  opts.mtp_head_layout.value_or(opts.layout),
-                                  opts.embed_device_resident, want_vision);
+  const bool want_vision = vision_mode != ModelOptions::VisionMode::kOff;
+  if (!is_tp_rank) {
+    m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
+                                    opts.mtp_head_layout.value_or(opts.layout),
+                                    opts.embed_device_resident, want_vision);
+  } else {
+    ContainerLoadOptions co;
+    co.layout = opts.layout;
+    co.lm_head_layout = opts.layout;
+    co.mtp_head_layout = opts.mtp_head_layout.value_or(opts.layout);
+    co.layer_limit = opts.layer_limit;
+    co.embed_device_resident = opts.embed_device_resident;
+    co.embed_device_resident_decided = tp.embed_device_resident_decided;
+    co.load_vision = want_vision && tp.vision_weights_on_this_rank;
+    co.parse_vision_config = want_vision;
+    co.tp_world = tp.world;
+    co.tp_rank = tp.rank;
+    co.shared_embed_host = tp.shared_embed_host;
+    m.container_ = Container::Load(opts.container_path, co);
+  }
   const VramSnap vram1 = SnapVram();  // after container weights are fully resident
-  if (opts.vision == ModelOptions::VisionMode::kOn && !m.container_.HasVision()) {
+  if (vision_mode == ModelOptions::VisionMode::kOn && !m.container_.HasVision()) {
     throw std::runtime_error(
         "Model::Load: --vision on was requested but the container has no vision.* tensors "
         "(convert without --language-model-only, or use --vision auto)");
@@ -140,7 +232,7 @@ Model Model::Load(const ModelOptions& opts) {
               << GiB(vw.bytes) << " GiB (depth=" << vw.config.depth
               << ", hidden=" << vw.config.hidden_size << ", out_hidden=" << vw.config.out_hidden_size
               << ")\n";
-  } else if (opts.vision == ModelOptions::VisionMode::kAuto &&
+  } else if (vision_mode == ModelOptions::VisionMode::kAuto &&
              m.container_.ContainerHasVisionTensors()) {
     // Cannot happen with the current policy (auto asks for the load), but says so out loud rather
     // than silently leaving a vision-capable container text-only if that policy ever changes.
@@ -150,6 +242,15 @@ Model Model::Load(const ModelOptions& opts) {
   const ModelConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = m.container_.NumLoadedLayers();
+  // docs/tp.md 7.2: this rank's lm_head rows and their first global id -- the whole vocabulary and
+  // 0 at TP=1, so every sizing below is unchanged there.
+  m.vocab_local_ = m.container_.LmHead().N;
+  m.vocab_offset_ = cfg.VocabShardBegin();
+  if (m.vocab_local_ * tp.world != cfg.vocab_size) {
+    throw std::runtime_error("Model::Load: lm_head has " + std::to_string(m.vocab_local_) +
+                             " rows, not vocab_size / tp.world = " +
+                             std::to_string(cfg.vocab_size / tp.world));
+  }
 
   if (opts.mtp_draft_k > 0 && !m.container_.HasMtp()) {
     throw std::runtime_error(
@@ -206,7 +307,7 @@ Model Model::Load(const ModelOptions& opts) {
   // `r4dx_epilogue_none` for w4a16/bf16 (w4a16's own separate, understood wall-clock regression --
   // see linear.cpp's own doc comment -- and bf16 never quantizes its activation input at all).
   m.body_epilogue_ = EpilogueForLayout(opts.layout);
-  m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
+  m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
   m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
   m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(1);
@@ -251,8 +352,13 @@ Model Model::Load(const ModelOptions& opts) {
   if (m.draft_window_ > 1) {
     m.mtp_num_accepted_dev_ = core::DeviceBuffer<int32_t>(1);
     m.verify_logits_dev_ =
-        core::DeviceBuffer<float>(static_cast<size_t>(m.draft_window_ * cfg.vocab_size));
+        core::DeviceBuffer<float>(static_cast<size_t>(m.draft_window_ * m.vocab_local_));
     m.verify_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.draft_window_));
+  }
+  // Tensor parallel (docs/tp.md 4.4): one {local index, value} pair per row that can be argmaxed at
+  // once -- a plain decode row or a whole verify window.
+  if (m.comm_ != nullptr) {
+    m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(2 * m.draft_window_));
   }
 
   // Sampled-decode row summaries (docs/sampling.md section 8), sized for the widest thing that can
@@ -512,6 +618,20 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     throw std::runtime_error("Model::RunChunk: token_ids.size() must be in [1, " +
                               std::to_string(max_chunk_) + "]");
   }
+  // Tensor parallel, H1 (docs/tp.md 6.2): every rank must be about to run the same chunk in the
+  // same mode at the same position, and the group must be healthy, before this chunk's all-reduces
+  // are enqueued. The device is idle here (the previous call ended synchronized).
+  if (comm_ != nullptr) {
+    if (summary_out != nullptr) {
+      throw std::logic_error("Model::RunChunk: row summaries under tensor parallelism are P2b");
+    }
+    const uint64_t kind = kLockstepRunChunk | (is_prefill_path ? 1u : 0u) |
+                          (want_logits ? 2u : 0u) | (greedy_token_out != nullptr ? 4u : 0u);
+    const uint64_t fingerprint[4] = {kind, static_cast<uint64_t>(T), static_cast<uint64_t>(pos_),
+                                     Fnv1a64(token_ids)};
+    comm_->CheckLockstep(fingerprint);
+    comm_->CheckHealthy();
+  }
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
@@ -586,7 +706,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     }
 
     if (cfg.IsGdnLayer(i)) {
-      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn, comm_);
       GdnLayerParams p;
       p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
       p.is_prefill = is_prefill_path;
@@ -609,7 +729,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttentionLayer layer(MakeAttnConfig(cfg));
+      attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -631,7 +751,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       std::swap(cur, other);
     }
 
-    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
+    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
     // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
     // rmsnorm epilogue into it above); next_norm_weight is null for the last layer (Mlp falls
     // back to a plain residual add, and FinalLmHead below applies its own final_norm separately).
@@ -727,7 +847,14 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // Greedy path (host-overhead pass, 2026-09-19): argmax logits_dev_ ON DEVICE while it's still
     // hot, so the only D2H this call ever does is 4 bytes instead of vocab*4 -- see
     // r4dx_argmax_f32 (src/kernels) and DecodeStepGreedy's own comment (model.h).
-    if (greedy_token_out != nullptr) {
+    if (greedy_token_out != nullptr && comm_ != nullptr) {
+      // Tensor parallel (docs/tp.md 7.3): argmax THIS rank's vocab shard, keeping the winning value
+      // too; the host merges the per-rank pairs below.
+      r4dx_argmax_val_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), vocab_local_,
+                           reinterpret_cast<int64_t>(stream_.get()));
+    } else if (greedy_token_out != nullptr) {
       r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
                        reinterpret_cast<int64_t>(argmax_dev_.data()), cfg.vocab_size,
                        reinterpret_cast<int64_t>(stream_.get()));
@@ -753,7 +880,17 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   stream_.Synchronize();
 
   std::vector<float> logits;
-  if (want_logits) {
+  if (want_logits && comm_ != nullptr) {
+    // Tensor parallel, H3 (docs/tp.md 6.2, 7.3, 7.5): merge the vocab shards on the host -- the
+    // greedy pair (8 B per rank), or the full row gathered in global id order. Either way every rank
+    // ends with the same answer.
+    if (greedy_token_out != nullptr) {
+      *greedy_token_out = MergeGreedyPair(argmax_pair_dev_.data());
+    } else {
+      logits.resize(static_cast<size_t>(cfg.vocab_size));
+      GatherVocabRow(logits_dev_.data(), logits.data());
+    }
+  } else if (want_logits) {
     if (greedy_token_out != nullptr) {
       argmax_dev_.CopyToHost(greedy_token_out, 1);
     } else if (summary_out != nullptr) {
@@ -1105,6 +1242,7 @@ int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& 
     // nothing, and a caller alternating the two keeps one generator stream.
     return DecodeStepGreedy(token_id);
   }
+  RequireNotTp("DecodeStepSampled (sampled decode, docs/tp.md 7.4: P2b)");
   if (inv_t == 0.0f) {
     // Degenerate temperature (see SummaryInvTemperature): no device summary, full-vocab path. Still
     // exactly one draw, still the canonical sampler, so the emitted token is the same as any other
@@ -1141,6 +1279,7 @@ int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& 
 // norm/rope/quant within each block -- see docs/perf.md's profile table and "Known gaps" note for
 // what this does and does not break out, and tools/profile/README.md for how to extend it.
 Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
+  RequireNotTp("DecodeStepProfiled (profiling is not supported under tensor parallelism)");
   using Clock = std::chrono::steady_clock;
   const auto wall_t0 = Clock::now();
   r4dx_kernel_launch_counter_reset();  // docs/r9700.md P2/task item 4: count just this one step
@@ -1193,7 +1332,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
     // per kernel (rmsnorm/conv_update/recurrent_update/in_proj_*/out_proj/residual) rather than as
     // one 88 us/layer lump. gpu_sum_ms is unaffected (same total, finer buckets).
     if (cfg.IsGdnLayer(i)) {
-      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn, comm_);
       GdnLayerParams p;
       p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
       p.is_prefill = false;
@@ -1209,7 +1348,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttentionLayer layer(MakeAttnConfig(cfg));
+      attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -1231,7 +1370,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
     }
 
     {
-      Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
+      Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
       mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
                   has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                   has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
@@ -1285,6 +1424,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
 }
 
 Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids) {
+  RequireNotTp("PrefillProfiled (profiling is not supported under tensor parallelism)");
   using Clock = std::chrono::steady_clock;
   const auto wall_t0 = Clock::now();
   if (token_ids.empty()) throw std::runtime_error("Model::PrefillProfiled: token_ids is empty");
@@ -1338,7 +1478,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
       const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
 
       if (cfg.IsGdnLayer(i)) {
-        GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+        GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn, comm_);
         GdnLayerParams p;
         p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
         p.is_prefill = true;
@@ -1348,7 +1488,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                       normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                       body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
       } else {
-        attention::AttentionLayer layer(MakeAttnConfig(cfg));
+        attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
         attention::AttnWeights aw;
         aw.input_layernorm = lw.input_layernorm.data();
@@ -1378,7 +1518,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         // recomputed its own rmsnorm from scratch here instead of consuming the fused one,
         // reporting a spurious "mlp.rmsnorm" launch --profile-prefill's own table showed once per
         // chunk that RunChunk never issues).
-        Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
+        Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
         mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                     has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                     has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
@@ -1416,6 +1556,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                                           std::vector<float>* logits_out,
                                           std::vector<kernels::RowSummary>* summaries_out,
                                           float summary_inv_temperature) {
+  RequireNotTp("VerifyWindow (speculative verify, docs/tp.md 7.6: P2b)");
   // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
   // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
   // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
@@ -1494,7 +1635,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                              dflash_features_dev_.data());
 
     if (cfg.IsGdnLayer(i)) {
-      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn);
+      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn, comm_);
       GdnLayerParams p;
       p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
       p.is_prefill = false;
@@ -1505,7 +1646,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
                     body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
     } else {
-      attention::AttentionLayer layer(MakeAttnConfig(cfg));
+      attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
       attention::AttnWeights aw;
       aw.input_layernorm = lw.input_layernorm.data();
@@ -1534,7 +1675,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       std::swap(cur, other);
     }
 
-    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp);
+    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
@@ -1586,6 +1727,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 }
 
 void Model::ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const {
+  RequireNotTp("ReadVerifyLogitsRow (speculative verify, docs/tp.md 7.5: P2b)");
   if (draft_window_ <= 1) {
     throw std::runtime_error(
         "Model::ReadVerifyLogitsRow: this Model was not sized for speculative verification");
@@ -1659,6 +1801,7 @@ std::vector<int32_t> Model::VerifyAndResolveRound(int32_t anchor,
 }
 
 void Model::CommitVerifiedWindow(int64_t num_committed) {
+  RequireNotTp("CommitVerifiedWindow (speculative verify, docs/tp.md 7.6: P2b)");
   if (draft_window_ <= 1) {
     throw std::runtime_error(
         "Model::CommitVerifiedWindow: this Model was not sized for speculative verification");
@@ -1695,6 +1838,7 @@ std::vector<int32_t> Model::DecodeStepMtpSampled(int32_t token_id, int64_t k,
 std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                                                const kernels::SampleParams* params,
                                                std::mt19937_64* rng) {
+  RequireNotTp("DecodeStepMtp{Greedy,Sampled} (MTP, docs/tp.md 8.1: P5)");
   if (!mtp_) {
     throw std::runtime_error(
         "Model::DecodeStepMtp{Greedy,Sampled}: MTP is not enabled on this Model (Load() with "
@@ -1796,6 +1940,7 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
                                                   std::mt19937_64* rng, int64_t* walk_len_out,
                                                   DflashRoundTrace* trace_out,
                                                   std::vector<int32_t>* drafted_tokens_out) {
+  RequireNotTp("DecodeStepDflash{Greedy,Sampled} (DFlash2, docs/tp.md 8.2: P5)");
   if (!dflash_.has_value()) {
     throw std::runtime_error(
         "Model::DecodeStepDflash{Greedy,Sampled}: DFlash2 is not enabled on this Model (Load() with "
@@ -1888,6 +2033,36 @@ std::vector<uint16_t> Model::DebugSeedHiddenBf16() const {
         "first");
   }
   return mtp_seed_hidden_.CopyToHost();
+}
+
+// ---- tensor parallel (docs/tp.md 7.2-7.5) -------------------------------------------------------
+
+void Model::GatherVocabRow(const float* shard_row_dev, float* full_host) {
+  // Plain (blocking, null-stream) D2H: the caller has synchronized stream_, the same rule every
+  // other readback in this file follows. Staged in a separate vector rather than written straight
+  // into this rank's slot of `full_host`, so the all-gather's source and destination never alias.
+  gather_shard_host_.resize(static_cast<size_t>(vocab_local_));
+  R4DX_HIP_CHECK(hipMemcpy(gather_shard_host_.data(), shard_row_dev,
+                            static_cast<size_t>(vocab_local_) * sizeof(float),
+                            hipMemcpyDeviceToHost));
+  comm_->HostAllGather(gather_shard_host_.data(),
+                       static_cast<size_t>(vocab_local_) * sizeof(float), full_host);
+}
+
+int32_t Model::MergeGreedyPair(const int32_t* pair_dev) {
+  tp::ArgmaxPair mine{};
+  R4DX_HIP_CHECK(hipMemcpy(&mine, pair_dev, sizeof(mine), hipMemcpyDeviceToHost));
+  mine.idx += static_cast<int32_t>(vocab_offset_);  // local -> global id
+  std::array<tp::ArgmaxPair, 2> all{};              // Model::Load allows world <= 2
+  comm_->HostAllGather(&mine, sizeof(mine), all.data());
+  return tp::MergeArgmax(all.data(), comm_->World());
+}
+
+void Model::RequireNotTp(const char* what) const {
+  if (comm_ != nullptr) {
+    throw core::TpUnsupportedError(std::string("Model::") + what +
+                                   " -- not supported on a tensor-parallel rank");
+  }
 }
 
 }  // namespace r4dx::model

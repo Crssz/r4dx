@@ -5,6 +5,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -21,10 +22,12 @@ namespace {
 
 constexpr int kThreads = 256;
 
-// Kernel launch counter (docs/r9700.md P2/task item 4) -- see kernels.h's doc comment. Plain
-// global, not atomic: Model is single-worker-thread (model.h's own SCOPE comment), matching
-// linear.cpp's PickTuning cache's identical no-lock reasoning.
-int64_t g_launch_count = 0;
+// Kernel launch counter (docs/r9700.md P2/task item 4) -- see kernels.h's doc comment. Atomic
+// (docs/tp.md 2.7): under tensor parallelism two rank threads launch r4dx kernels at the same time
+// in one process, and a plain `++` from both would be a data race. Relaxed is enough -- the counter
+// orders nothing, it only counts; at TP=1 one relaxed fetch_add per launch is the whole cost.
+std::atomic<int64_t> g_launch_count{0};
+inline void CountLaunches(int64_t n) { g_launch_count.fetch_add(n, std::memory_order_relaxed); }
 
 __device__ __forceinline__ float Sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -613,8 +616,12 @@ __global__ void KvWritePagedFp8Kernel(const __hip_bfloat16* __restrict__ k_new,
 // NOTE: indices are carried as int32_t throughout (not int64_t) -- this model's vocab (~250k) is
 // far under INT32_MAX, and __shfl_xor has no int64 overload, so int32 avoids a lossy cast at every
 // shuffle step.
+// `out_val` (nullable, docs/tp.md 7.2): when non-null, thread 0 also writes the winning VALUE --
+// r4dx_argmax_val_f32, the per-vocab-shard half of the tensor-parallel greedy merge. The reduction
+// is identical either way; r4dx_argmax_f32 passes nullptr.
 __global__ __launch_bounds__(kThreads) void ArgmaxKernel(const float* __restrict__ logits,
                                                             int32_t* __restrict__ out_idx,
+                                                            float* __restrict__ out_val,
                                                             int64_t vocab) {
   float best_v = -INFINITY;
   int32_t best_i = 0;
@@ -659,7 +666,10 @@ __global__ __launch_bounds__(kThreads) void ArgmaxKernel(const float* __restrict
       }
     }
   }
-  if (threadIdx.x == 0) out_idx[0] = best_i;
+  if (threadIdx.x == 0) {
+    out_idx[0] = best_i;
+    if (out_val != nullptr) out_val[0] = best_v;
+  }
 }
 
 // ---- device-resident embedding gather (MTP device-residency pass) -------------------------
@@ -936,9 +946,9 @@ static_assert(kSummaryRounds >= 2, "the logsumexp pass is fused into round 1");
 // Module-scope device scratch (~264 KiB of VRAM, allocated once when the module loads) rather than
 // a caller-supplied pointer: it keeps r4dx_topk_lse_f32's signature the same shape as every other
 // entry point in kernels.h. The cost is that ONE call may be in flight per process at a time --
-// the same single-worker-thread assumption g_launch_count above already documents and model.h's
-// own SCOPE comment guarantees. Two concurrent calls (two streams, two threads) would interleave
-// their partials; kernels.h states this precondition.
+// the single-worker-thread assumption model.h's own SCOPE comment guarantees for one Model. Two
+// concurrent calls (two streams, two threads -- e.g. two tensor-parallel rank threads, docs/tp.md
+// 2.7) would interleave their partials; kernels.h states this precondition.
 __device__ int32_t g_summary_part_ids[kSummaryMaxRows * kSummaryMaxChunks * kSummaryK];
 __device__ float g_summary_part_vals[kSummaryMaxRows * kSummaryMaxChunks * kSummaryK];
 __device__ float g_summary_part_max[kSummaryMaxRows * kSummaryMaxChunks];
@@ -1418,7 +1428,7 @@ void r4dx_rmsnorm_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int
                         int64_t epilogue_scale) {
   if (rows <= 0) return;
   CheckEpiloguePrecondition(epilogue, hidden);
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(RmsNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
                      (__hip_bfloat16*)out, hidden, eps, epilogue, (void*)epilogue_out,
@@ -1432,7 +1442,7 @@ void r4dx_residual_rmsnorm_bf16(int64_t x, int64_t residual, int64_t weight,
                                  int64_t epilogue_out, int64_t epilogue_scale) {
   if (rows <= 0) return;
   CheckEpiloguePrecondition(epilogue, hidden);
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(ResidualRmsNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x,
                      (const __hip_bfloat16*)residual, (const __hip_bfloat16*)weight,
@@ -1443,7 +1453,7 @@ void r4dx_residual_rmsnorm_bf16(int64_t x, int64_t residual, int64_t weight,
 
 void r4dx_residual_add_bf16(int64_t a, int64_t b, int64_t out, int64_t n, int64_t stream) {
   if (n <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   unsigned blocks = static_cast<unsigned>((n + kThreads - 1) / kThreads);
   hipLaunchKernelGGL(ResidualAddKernel, dim3(blocks), dim3(kThreads), 0, (hipStream_t)stream,
                      (const __hip_bfloat16*)a, (const __hip_bfloat16*)b, (__hip_bfloat16*)out, n);
@@ -1455,7 +1465,7 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
                          int64_t epilogue_out, int64_t epilogue_scale) {
   if (rows <= 0 || intermediate <= 0) return;
   CheckEpiloguePrecondition(epilogue, intermediate);
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(SiluMulKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)gate_up, (__hip_bfloat16*)out,
                      intermediate, in_row_stride, epilogue, (void*)epilogue_out,
@@ -1467,7 +1477,7 @@ void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tok
                                    int heads_k, int head_dim, int rotary_dim, float theta,
                                    int64_t stream) {
   if (tokens <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   int threads = rotary_dim / 2;
   if (threads > 256) threads = 256;
   if (threads < 1) threads = 1;
@@ -1491,7 +1501,7 @@ void r4dx_rope_partial_mrope3_bf16(int64_t q, int64_t k, int64_t pos_ids3, int t
         "rotary_dim/2 (" + std::to_string(rotary_dim / 2) + "), got [" + std::to_string(sec_t) +
         "," + std::to_string(sec_h) + "," + std::to_string(sec_w) + "]");
   }
-  ++g_launch_count;
+  CountLaunches(1);
   int threads = rotary_dim / 2;
   if (threads > 256) threads = 256;
   if (threads < 1) threads = 1;
@@ -1505,7 +1515,7 @@ void r4dx_rope_partial_mrope3_bf16(int64_t q, int64_t k, int64_t pos_ids3, int t
 void r4dx_quant_act_fp8e4m3_row(int64_t x, int64_t q, int64_t scale, int M, int K,
                                  int64_t stream) {
   if (M <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(QuantActFp8Kernel, dim3(static_cast<unsigned>(M)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (uint8_t*)q, (float*)scale, K);
   R4DX_HIP_CHECK(hipGetLastError());
@@ -1517,7 +1527,7 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                                   int64_t kv_block_stride, int64_t kv_head_stride,
                                   int64_t stream) {
   if (T <= 0 || kv_heads <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   int threads = head_dim < 256 ? head_dim : 256;
   hipLaunchKernelGGL(KvWritePagedFp8Kernel, dim3(static_cast<unsigned>(T), static_cast<unsigned>(kv_heads)),
                      dim3(threads), 0, (hipStream_t)stream, (const __hip_bfloat16*)k_new,
@@ -1529,16 +1539,25 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
 
 void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
   if (vocab <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
-                     (const float*)logits, (int32_t*)out_idx, vocab);
+                     (const float*)logits, (int32_t*)out_idx, (float*)nullptr, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_argmax_val_f32(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                          int64_t stream) {
+  if (vocab <= 0) return;
+  CountLaunches(1);
+  hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
+                     (const float*)logits, (int32_t*)out_idx, (float*)out_val, vocab);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
                                  int64_t vocab, int64_t stream) {
   if (n <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(EmbeddingGatherKernel, dim3(static_cast<unsigned>(n)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)ids,
                      (__hip_bfloat16*)out, hidden, vocab);
@@ -1548,7 +1567,7 @@ void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t
 void r4dx_gather_i32(int64_t table, int64_t idx, int64_t out, int64_t n, int64_t table_size,
                       int64_t stream) {
   if (n <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   const unsigned threads = n < 32 ? static_cast<unsigned>(n) : 32u;
   const unsigned blocks = static_cast<unsigned>((n + threads - 1) / threads);
   hipLaunchKernelGGL(GatherI32Kernel, dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
@@ -1565,7 +1584,7 @@ void r4dx_rope_neox_bf16(int64_t q, int64_t k, int64_t pos_ids, int rows, int he
     throw std::runtime_error("r4dx_rope_neox_bf16: head_dim must be positive and even, got " +
                               std::to_string(head_dim));
   }
-  ++g_launch_count;
+  CountLaunches(1);
   int threads = head_dim / 2;
   if (threads > 256) threads = 256;
   hipLaunchKernelGGL(RopeNeoxKernel, dim3(static_cast<unsigned>(rows)), dim3(threads), 0,
@@ -1581,7 +1600,7 @@ void r4dx_topk16_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int rows
   if (vocab < kTopK) {
     throw std::runtime_error("r4dx_topk16_f32: vocab must be >= 16, got " + std::to_string(vocab));
   }
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(Topk16Kernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const float*)logits, (int32_t*)out_ids,
                      (float*)out_vals, vocab);
@@ -1611,7 +1630,7 @@ void r4dx_topk_lse_f32(int64_t logits, int64_t out_ids, int64_t out_vals, int64_
   int chunks = static_cast<int>(vocab / 1024);
   if (chunks < 1) chunks = 1;
   if (chunks > kSummaryMaxChunks) chunks = kSummaryMaxChunks;
-  g_launch_count += 2;  // TWO r4dx-owned launches per call; see kernels.h's counter contract
+  CountLaunches(2);  // TWO r4dx-owned launches per call; see kernels.h's counter contract
   hipLaunchKernelGGL(TopkLsePartialKernel,
                      dim3(static_cast<unsigned>(chunks), static_cast<unsigned>(rows)),
                      dim3(kThreads), 0, (hipStream_t)stream, (const float*)logits, vocab,
@@ -1667,7 +1686,7 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
                               std::to_string(store_begin) + " with n_injected=" +
                               std::to_string(n_injected));
   }
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(DflashAttnKernel,
                      dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_kv)),
                      dim3(kAttnThreads), 0, (hipStream_t)stream, (const __hip_bfloat16*)q,
@@ -1701,7 +1720,7 @@ void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, in
                        static_cast<int64_t>(side) * kTaps * NG;  // side-major slice
   const auto* base_s = reinterpret_cast<const uint16_t*>(base) +
                         static_cast<int64_t>(side) * kTaps * H;  // base is [2][taps][H]
-  // No ++g_launch_count: the launch below is libr4d's, and that counter counts r4dx-owned
+  // No CountLaunches: the launch below is libr4d's, and that counter counts r4dx-owned
   // launches only (see its doc comment in kernels.h).
   const int rc = r4d_dflash_conv_t2_g16_bf16((const void*)x, (const void*)delta, (const void*)base_s,
                                               (void*)out, T, H, dpitch, NG, kTaps, kGroup,
@@ -1716,7 +1735,7 @@ void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, in
 void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
                               float eps, int out_fp32, int64_t stream) {
   if (rows <= 0 || hidden <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(RmsNormPlainKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
                      (void*)out, hidden, eps, out_fp32);
@@ -1728,7 +1747,7 @@ void r4dx_rmsnorm_plain_bf16(int64_t x, int64_t weight, int64_t out, int64_t row
 void r4dx_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, int64_t rows,
                           int64_t hidden, float eps, int64_t stream) {
   if (rows <= 0 || hidden <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(LayerNormKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)weight,
                      (const __hip_bfloat16*)bias, (__hip_bfloat16*)out, hidden, eps);
@@ -1738,7 +1757,7 @@ void r4dx_layernorm_bf16(int64_t x, int64_t weight, int64_t bias, int64_t out, i
 void r4dx_bias_add_bf16(int64_t x, int64_t bias, int64_t out, int64_t rows, int64_t cols,
                          int64_t stream) {
   if (rows <= 0 || cols <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(BiasAddKernel, dim3(ElementwiseBlocks(rows * cols)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (const __hip_bfloat16*)bias,
                      (__hip_bfloat16*)out, rows, cols);
@@ -1747,7 +1766,7 @@ void r4dx_bias_add_bf16(int64_t x, int64_t bias, int64_t out, int64_t rows, int6
 
 void r4dx_gelu_tanh_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
   if (n <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL((GeluKernel<kTanhGelu>), dim3(ElementwiseBlocks(n)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (__hip_bfloat16*)out, n);
   R4DX_HIP_CHECK(hipGetLastError());
@@ -1755,7 +1774,7 @@ void r4dx_gelu_tanh_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
 
 void r4dx_gelu_erf_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
   if (n <= 0) return;
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL((GeluKernel<kErfGelu>), dim3(ElementwiseBlocks(n)), dim3(kThreads), 0,
                      (hipStream_t)stream, (const __hip_bfloat16*)x, (__hip_bfloat16*)out, n);
   R4DX_HIP_CHECK(hipGetLastError());
@@ -1769,7 +1788,7 @@ void r4dx_vision_qkv_rope_bf16(int64_t qkv, int64_t cos, int64_t sin, int64_t q_
     throw std::runtime_error("r4dx_vision_qkv_rope_bf16: head_dim must be positive and even, got " +
                               std::to_string(head_dim));
   }
-  ++g_launch_count;
+  CountLaunches(1);
   int threads = heads * (head_dim / 2);
   if (threads > kThreads) threads = kThreads;
   hipLaunchKernelGGL(VisionQkvRopeKernel, dim3(static_cast<unsigned>(tokens)), dim3(threads), 0,
@@ -1789,7 +1808,7 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
         "r4dx_vision_pos_embed_bf16: out_bf16 requires x (the residual the position embedding is "
         "added to)");
   }
-  ++g_launch_count;
+  CountLaunches(1);
   hipLaunchKernelGGL(VisionPosEmbedKernel, dim3(static_cast<unsigned>(num_patches)), dim3(kThreads),
                      0, (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)indices,
                      (const float*)weights, (const __hip_bfloat16*)x, (float*)out_f32,
@@ -1797,8 +1816,8 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
-void r4dx_kernel_launch_counter_reset() { g_launch_count = 0; }
+void r4dx_kernel_launch_counter_reset() { g_launch_count.store(0, std::memory_order_relaxed); }
 
-int64_t r4dx_kernel_launch_counter_get() { return g_launch_count; }
+int64_t r4dx_kernel_launch_counter_get() { return g_launch_count.load(std::memory_order_relaxed); }
 
 }  // extern "C"

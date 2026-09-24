@@ -42,6 +42,17 @@ struct GemmTuningRow {
 // the fallback exists for robustness, not because it is expected to fire in production).
 LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M);
 
+// Tensor parallel (docs/tp.md 2.7): marks the CALLING thread as one that runs a TP=2 rank's Model
+// (Model::Load calls it on every load with ModelOptions::tp.world > 1 -- true on a rank thread in
+// TpModel, the main thread in tool_tp_step_bench -- and clears it when that load throws). On such a
+// thread PickTuning looks up src/model/gemm_tuning_table_tp2.inc (the per-rank (N,K) shapes, same
+// M-band and w4a16-group rules) FIRST, then the main table, then the fallback; its cache is
+// thread_local and keyed on the flag too. A TP=1 load sets it false, so a TP=1 Model consults the
+// main table alone, exactly as before, even on a thread that loaded a rank earlier. The
+// TP rows live in their own table because one per-rank key -- (w4a16, 17408, 5120) -- is also the
+// TP=1 DFlash drafter's gate_proj/up_proj, which the main table deliberately leaves untuned.
+void SetTp2TuningForThisThread(bool enabled);
+
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
 // r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for
 // kW4a16, r4dx_epilogue_int8_fraga8 for kW4a8, r4dx_epilogue_fp8_e4m3_row for kMxfp4. Shared by

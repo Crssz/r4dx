@@ -126,7 +126,25 @@ SHAPES = [
     ("gdn.in_proj_z", 6144, 5120),      # value_dim, hidden
     ("attn.k", 1024, 5120),             # kv_heads*head_dim (4*256), hidden
     ("attn.v", 1024, 5120),             # kv_heads*head_dim (4*256), hidden
+    # Tensor parallel TP=2 per-rank shapes (docs/tp.md 2.7, P2a). These rows go ONLY into
+    # src/model/gemm_tuning_table_tp2.inc (`--out src\model\gemm_tuning_table_tp2.inc --shapes
+    # tp2.*`), never into gemm_tuning_table.inc: linear.cpp consults that table only on a thread that
+    # loaded a TP rank, so TP=1 keeps its bytes and timing ((w4a16, 17408, 5120) is also the TP=1
+    # DFlash drafter's gate_proj/up_proj, which must stay on FallbackTuning). main() enforces it: an
+    # empty --shapes selects only the non-tp2 names, tp2.* runs only when named, and a run refuses
+    # to write tp2.* rows to any other file or other rows to that one. attn.qg at TP=2 is
+    # (6144, 5120) = gdn.in_proj_z above, served from the main table by the TP lookup's fallback.
+    ("tp2.gdn.in_proj_qkv", 5120, 5120),  # 3 segments q|k|v of 1024/1024/3072, hidden
+    ("tp2.gdn.in_proj_z", 3072, 5120),    # value_dim/2, hidden
+    ("tp2.out_proj", 5120, 3072),         # hidden, value_dim/2 (gdn.out_proj) = heads/2*256 (attn.o)
+    ("tp2.mlp.gate_up", 17408, 5120),     # 2 segments gate|up of 8704, hidden
+    ("tp2.mlp.down", 5120, 8704),         # hidden, intermediate/2
+    ("tp2.lm_head", 124160, 5120),        # vocab/2 (vocab-split lm_head), hidden
+    ("tp2.attn.kv", 512, 5120),           # kv_heads/2*head_dim, hidden (attn.k and attn.v)
 ]
+
+TP2_PREFIX = "tp2."
+TP2_TABLE = "gemm_tuning_table_tp2.inc"
 
 M_BANDS_FULL = [1, 2, 4, 8, 16, 32, 64]
 M_BANDS_QUICK = [1, 8, 64]
@@ -348,7 +366,9 @@ def main():
     ap.add_argument("--out", default=r"src\model\gemm_tuning_table.inc")
     ap.add_argument("--layouts", default="bf16,w4a16,w4a8,mxfp4")
     ap.add_argument("--shapes", default="",
-                     help="comma-separated subset of SHAPES' names to sweep (default: all). "
+                     help="comma-separated subset of SHAPES' names to sweep (default: all but the "
+                          "tp2.* ones, which run only when named and only into "
+                          "gemm_tuning_table_tp2.inc). "
                           "R1 (docs/r9700.md R4): pass --shapes gdn.in_proj_z,attn.k,attn.v "
                           "--append to add just the three newly-quantized shapes' rows without "
                           "re-running the whole (much longer) table.")
@@ -376,10 +396,19 @@ def main():
     iters = 15 if args.quick else 40
     layouts = args.layouts.split(",")
     shape_filter = set(s for s in args.shapes.split(",") if s)
-    shapes = [s for s in SHAPES if not shape_filter or s[0] in shape_filter]
+    # The default set leaves out the TP=2 per-rank shapes: they are swept only when named, and only
+    # into their own table (docs/tp.md 2.7; see SHAPES).
+    shapes = [s for s in SHAPES
+              if (s[0] in shape_filter if shape_filter else not s[0].startswith(TP2_PREFIX))]
     if shape_filter and len(shapes) != len(shape_filter):
         missing = shape_filter - {s[0] for s in shapes}
         raise SystemExit(f"--shapes named unknown shape(s): {sorted(missing)}")
+    out_is_tp2 = Path(args.out).name == TP2_TABLE
+    wrong_table = [s[0] for s in shapes if s[0].startswith(TP2_PREFIX) != out_is_tp2]
+    if wrong_table:
+        raise SystemExit(
+            f"refusing to write {sorted(wrong_table)} to {args.out}: tp2.* rows go only to "
+            f"{TP2_TABLE}, every other row only to another table (docs/tp.md 2.7)")
 
     want = dict(R4DX_GROUP, w4a16=args.w4a16_group)
     print(f"r4d.pyd: {r4d.__file__}")

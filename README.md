@@ -71,9 +71,10 @@ buffering/streaming sinks including the tool-calls streaming chunk shape, the bo
 index-math goldens, the whole tower against the real checkpoint's forward, and the shared
 `ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), the tensor-parallel
 building blocks' CPU-only tests (`test_tp_config`, `test_tp_shard`, `test_tp_vocab_merge`,
-`test_tp_host_exchange`, `test_tp_rank_worker` -- `docs/tp.md` 10.1), and a
+`test_tp_host_exchange`, `test_tp_rank_worker` -- `docs/tp.md` 10.1) and the sharded loader's
+device-1 test (`test_tp_loader`), and a
 CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). 70 tests are registered without the reference venv (72 with it). The last
+`ctest` invocation). 71 tests are registered without the reference venv (73 with it). The last
 full run, at 64 before `test_pick_tuning` was added, passed all but 1, which skips
 (`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP device 1 (2026-09-23,
 default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on

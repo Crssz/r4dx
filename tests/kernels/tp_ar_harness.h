@@ -227,6 +227,15 @@ struct DriverConfig {
   size_t filler_dirty_bytes = size_t{4} << 20;
   size_t filler_ring_bytes = size_t{512} << 20;  // >= 2 x rd, larger than the 64 MiB Infinity Cache
   int nb[2] = {4, 4};                   // the group's channel geometry (the stand-in copies its grid)
+  // Bounded submission (tp::SubmitBounder, docs/tp.md Appendix B N57): force a submission after
+  // every `flush_every` slots of a batch body (a slot = [filler +] all-reduce / stand-in; 0 = off),
+  // and keep at most `max_inflight_units` such units queued ahead of the GPU (0 = no cap). With
+  // max_inflight_units == 1 (a hipStreamSynchronize per unit) `idle_us` > 0 then keeps the host --
+  // and so the GPU, which has nothing queued -- idle that long after each unit's synchronize before
+  // the next unit is enqueued: an explicit idle gap for device-0 endurance runs (N64).
+  int flush_every = 0;
+  int max_inflight_units = 0;
+  int idle_us = 0;
   uint64_t call0 = 0;                   // pattern call index of the first all-reduce
   std::function<void(int64_t calls_verified)> on_batch;  // after each checked batch, after the next enqueue
 };
@@ -244,6 +253,7 @@ struct DriverResult {
   std::vector<double> ms[3];     // timed batch-body ms per condition
   double seconds = 0;
   int fgrid = 0;
+  tp::SubmitBounder::Stats bound;  // DriverConfig::flush_every's forced submissions and cap waits
 };
 
 inline std::string DescribeMismatch(const R4dxTpStatus& v) {
@@ -384,8 +394,22 @@ inline DriverResult RunDriver(tp::TpEndpoint& comm, int rank, hipStream_t st, co
                                s64);
     }
   };
+  if (cfg.idle_us < 0 || (cfg.idle_us > 0 && (cfg.flush_every <= 0 || cfg.max_inflight_units != 1))) {
+    throw std::invalid_argument("driver: idle_us needs flush_every > 0 and max_inflight_units == 1");
+  }
+  tp::SubmitBounder bound;
+  if (cfg.flush_every > 0) bound = tp::SubmitBounder(cfg.max_inflight_units);
+  // A yield loop, not a sleep: a Windows sleep rounds up to the timer tick (N33's wait).
+  const auto idle = [&] {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(cfg.idle_us);
+    while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
+  };
   const auto body = [&](int cond, uint64_t base) {
     for (int k = 0; k < K; ++k) {
+      if (bound.Active() && k > 0 && k % cfg.flush_every == 0) {
+        bound.EndUnit(st);
+        if (cfg.idle_us > 0) idle();
+      }
       if (cfg.fillers) {
         r4dx_tp_test_filler(reinterpret_cast<int64_t>(fring.data()) +
                                 static_cast<int64_t>(foff[static_cast<size_t>(k)] * 16),
@@ -468,6 +492,7 @@ inline DriverResult RunDriver(tp::TpEndpoint& comm, int rank, hipStream_t st, co
   }
   R.ok = R.error.empty() && R.abort_message.empty() && !R.stopped_by_peer && R.batches_ok == cfg.batches &&
          R.verify.mismatches == 0;
+  R.bound = bound.GetStats();
   return R;
 }
 

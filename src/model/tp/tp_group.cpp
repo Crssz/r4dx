@@ -86,29 +86,10 @@ bool SyncWithWatchdog(hipStream_t stream, std::chrono::milliseconds limit) {
 
 bool SyncWithWatchdogEvent(hipStream_t stream, hipEvent_t ev, std::chrono::milliseconds limit) {
   R4DX_HIP_CHECK(hipEventRecord(ev, stream));
-  const auto t0 = std::chrono::steady_clock::now();
-  for (uint32_t spins = 0;; ++spins) {
-    const hipError_t e = hipEventQuery(ev);
-    if (e == hipSuccess) break;
-    if (e != hipErrorNotReady) {
-      (void)hipGetLastError();
-      throw core::HipError(e, "hipEventQuery", __FILE__, __LINE__);
-    }
-    if ((spins & 255u) == 0u && std::chrono::steady_clock::now() - t0 > limit) {
-      (void)hipGetLastError();
-      return false;
-    }
-    // tp_bench's wait: yield for the first 200k polls (a sleep on Windows rounds up to the timer
-    // tick, which would add milliseconds to every short wait and wreck CheckWallClockRate's host
-    // timing), then 1 ms sleeps for a genuinely long wait.
-    if (spins < 200000u) {
-      std::this_thread::yield();
-    } else {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  }
-  (void)hipGetLastError();  // hipEventQuery leaves hipErrorNotReady as the thread's last error
-  return true;
+  // The poll loop is tp_submit.cpp's (shared with SubmitBounder's cap wait): yield for the first
+  // 200k polls -- a sleep on Windows rounds up to the timer tick, which would add milliseconds to
+  // every short wait and wreck CheckWallClockRate's host timing -- then 1 ms sleeps.
+  return WaitEventWithWatchdog(ev, limit);
 }
 
 double CheckWallClockRate() {

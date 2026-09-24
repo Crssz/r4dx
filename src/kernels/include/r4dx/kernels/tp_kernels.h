@@ -129,6 +129,11 @@ void r4dx_tp_test_standin_bf16(int64_t buf, int64_t local, int n16, int nb, int 
                                int64_t stream);
 // hipOccupancyMaxActiveBlocksPerMultiprocessor of the filler at 256 threads (>= 1).
 int r4dx_tp_test_filler_occupancy();
+// Submission probe (tool_tp_submit_probe, docs/tp.md Appendix B N56): one thread writes the device
+// wall_clock64 to host_u64x2[1], then release-stores `value` to host_u64x2[0], both at system scope.
+// host_u64x2 is this device's view of mapped pinned host memory; a host thread polling [0] sees the
+// kernel start with no HIP call of its own.
+void r4dx_tp_test_marker(int64_t host_u64x2, uint64_t value, int64_t stream);
 
 }  // extern "C"
 

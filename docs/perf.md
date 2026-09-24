@@ -1,5 +1,44 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Tensor parallel (`--tp 2`) on both R9700s: P4 gates (2026-09-25)
+
+`--tp 2` splits `qwen38-27b-v6.r4dx` over the two cards (docs/tp.md; README "Tensor parallel across
+both GPUs"). Rank 0 runs on HIP device 1 (headless), rank 1 on device 0 (it drives the desktop, which
+stayed live), with `--layout w4a16`, the default submission bounding (`--tp-submit-layers 32
+--tp-max-inflight 1`) and the production server stopped. Every number below was measured in the P4
+gate run with one build (docs/tp.md Appendix B N65, logs under `build\logs\p4\gate_*`). The TP=1
+column is G2's row 1 / row 4 from the same session on device 1.
+
+Standard protocol (`--vision off --think off --max-tokens 256 --max-ctx 2048 --stats`, the haiku
+prompt), one fresh process per run:
+
+| Path | TP=1 | **TP=2** | TP=2 / TP=1 |
+|---|--:|--:|--:|
+| plain greedy decode (84 tokens, EOS) | 36.06 (candidate), 36.11 (baseline binary) | **59.65, 59.33** (a third run: 58.97) | **1.65x** |
+| plain sampled decode (T 0.7, top_k 20, top_p 0.8, seed 1) | 35.89 (candidate), 35.88 (baseline), 86 tokens | **59.19, 59.24** (88 tokens) | 1.65x |
+| prefill, 29-token prompt | 695.0 | 1175-1209 | 1.7x |
+| VRAM used | 17.01 GiB | 10.01-10.07 GiB per card (9.69 GiB of it this process's buffers) | |
+
+- The three greedy runs have the same text (SHA-256 `FE60E2A2...03E4`), and so do the two sampled
+  runs. TP=2 text differs from TP=1's (the split changes the summation order), but real 2-GPU output
+  is byte-identical to `--tp-mode emulate`.
+- Load: 5.4-5.6 s with the container in the page cache.
+- Soak (`tools\tp\soak.ps1`: random requests with 16-2048-token prompts and 32-512 decode tokens,
+  one model for the whole run). 5 minutes, 54 requests: decode 59.7-60.2 tok/s sampled, 60.4-61.2
+  greedy, 59.0-60.0 when every token also gathers the full vocabulary row to the host. 60 minutes,
+  646 requests and 894,857 tokens: decode 58.7-60.6 (mean 60.03) sampled, 59.4-61.5 (60.74) greedy,
+  58.1-60.1 (59.59) full row. The greedy mean was 60.77 in the first half hour and 60.72 in the
+  second, and VRAM did not move. Prefill of the prompts of >= 256 tokens: 1393-1543 tok/s (mean
+  ~1496).
+- Teacher-forced log-probs (`tool_teacher_forced_logprobs`, the 4,092-row KL corpus, the full
+  248,320-way log-prob row written per position): 18.2 ms/row on two GPUs vs 37.4 ms/row with both
+  halves emulated on device 1. KL against the bf16 reference: 0.03853, top-1 91.01%.
+- All-reduce stress in the decode pattern (`tools\tp\ar_stress.ps1 --pattern decode --flush-every 16
+  --max-inflight 1 --idle-us 500`: 128 10 KiB all-reduces per token, each after a 60 MiB filler, a
+  synchronize and a 500 us idle gap every 16): 6,536 all-reduces/s over 2.2M and 6,437/s over 10M
+  (60 s windows about 5.1-6.6k/s; the slow windows began right after Windows logged an Auto HDR event
+  for a DirectX program on the desktop), every one bit-exact.
+
 ## w4a16 group-64 tuning re-sweep (2026-09-24)
 
 **Why.** `src/model/gemm_tuning_table.inc`'s 70 w4a16 rows came from the Milestone 4 sweep

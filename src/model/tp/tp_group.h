@@ -6,9 +6,12 @@
 // tp_comm_emulated.cpp, and the group has no mailbox -- only the HostExchange and two abort words.
 //
 // Threading (docs/tp.md 2.1): each endpoint is created, used and destroyed on its rank's thread
-// (hipSetDevice first). The group itself is created and destroyed on the facade thread; its
-// mailbox is allocated on rank 0's thread (AllocateMailbox) and freed by ~TpGroup, which must run
-// only after every endpoint is gone and no kernel can still touch the region (2.6 step 3).
+// (hipSetDevice first). The group itself is created on the facade thread (no HIP call); its
+// mailbox is allocated on rank 0's thread (AllocateMailbox) and freed by ~TpGroup, which therefore
+// runs on rank 0's thread too -- ~TpModel (its step 5) posts the group's destruction to rank 0
+// after BOTH ranks' teardown commands (Model, endpoint, hipDeviceSynchronize) have finished and
+// before the joins (2.6 step 3, Appendix B N58): never on the facade thread, and only after every
+// endpoint is gone and no kernel can still touch the region.
 //
 // Shared region (one hipHostMalloc(Coherent | Mapped | Portable)), docs/tp.md 6.3.2, offsets for
 // the default nb = 4 on both channels (MailboxLayout::Make computes every offset from the geometry):
@@ -43,6 +46,7 @@
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/core/tp_host_exchange.hpp"
 #include "r4dx/kernels/tp_kernels.h"
+#include "tp/tp_submit.h"
 
 namespace r4dx::model::tp {
 

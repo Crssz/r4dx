@@ -261,6 +261,19 @@ Rows TestLayout(const std::string& layout) {
   Rows tp[2];
   tp[0] = Script(*tpm, p40, forced);
   tp[1] = Script(*tpm, p70, forced);
+  {
+    // core::DeviceBufferBytes (docs/tp.md Appendix B N64): both emulated ranks share one device, so
+    // they report the same live-buffer figure, which the device-wide "used" must cover.
+    const std::vector<r4dx::model::VramReport> v = tpm->Vram();
+    CHECK(v.size() == 2 && v[0].buffers_gib == v[1].buffers_gib && v[0].buffers_gib > 0.5 &&
+              v[0].buffers_gib <= v[0].used_gib,
+          "[%s] Vram(): buffers %.3f / %.3f GiB, device-wide used %.3f GiB", layout.c_str(),
+          v.empty() ? 0.0 : v[0].buffers_gib, v.size() < 2 ? 0.0 : v[1].buffers_gib, v.empty() ? 0.0 : v[0].used_gib);
+    if (!v.empty()) {
+      std::printf("[%s] Vram(): this process's buffers %.3f GiB, device-wide used %.3f GiB\n", layout.c_str(),
+                  v[0].buffers_gib, v[0].used_gib);
+    }
+  }
 
   // 1. numerics vs TP=1 (and, printed for every layout, each side's distance from TP=1 bf16)
   for (int which = 0; which < 2; ++which) {
@@ -612,7 +625,21 @@ void TestFaults(const Rows& fresh40) {
   // ~TpModel in kFatal: the group is poisoned, then every rank drains and tears down normally.
 }
 
+// tp::UnitLayersForContext (docs/tp.md Appendix B N64): the prefill unit shrinks with context.
+// Host arithmetic only.
+void TestUnitLayers() {
+  namespace tp = r4dx::model::tp;
+  CHECK(tp::UnitLayersForContext(0, 262144) == 0, "submit_layers 0 stays off");
+  CHECK(tp::UnitLayersForContext(32, 64) == 32 && tp::UnitLayersForContext(32, 16384) == 32, "<= 16k: submit_layers");
+  CHECK(tp::UnitLayersForContext(32, 16385) == 16 && tp::UnitLayersForContext(32, 65536) == 16, "<= 64k: 16");
+  CHECK(tp::UnitLayersForContext(32, 65537) == 8 && tp::UnitLayersForContext(32, 131072) == 8, "<= 128k: 8");
+  CHECK(tp::UnitLayersForContext(32, 131073) == 4 && tp::UnitLayersForContext(32, 262144) == 4, "> 128k: 4");
+  CHECK(tp::UnitLayersForContext(1, 262144) == 1 && tp::UnitLayersForContext(6, 20000) == 6,
+        "a finer setting is never coarsened");
+}
+
 int RunTest() {
+  TestUnitLayers();
   if (!r4dx_test::FileExists(kContainerPath)) return r4dx_test::SkipMissing(kContainerPath);
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep stdout in order with the facade's stderr lines
   Rows fresh40_w4a16;

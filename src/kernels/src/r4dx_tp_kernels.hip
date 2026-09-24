@@ -400,6 +400,15 @@ __global__ void __launch_bounds__(256) r4dx_tp_test_filler_kernel(const uint4* _
   if (acc == 0x9E3779B9u) sink[blockIdx.x & 255u] = acc;  // keeps the reads alive; practically never taken
 }
 
+// Submission probe (docs/tp.md Appendix B N56): one thread stores the device wall clock to out[1],
+// then release-stores `value` to out[0], both at system scope into mapped host memory, so a host
+// thread polling out[0] sees the kernel START without making any HIP call.
+__global__ void r4dx_tp_test_marker_kernel(u64* out, u64 value) {
+  if (threadIdx.x != 0) return;
+  __hip_atomic_store(out + 1, (u64)wall_clock64(), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  __hip_atomic_store(out, value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 // Decode condition (b): same grid, same chunking as the all-reduce, buf = buf + local; no host traffic.
 __global__ void __launch_bounds__(1024) r4dx_tp_test_standin_kernel(uint4* __restrict__ buf,
                                                                     const uint4* __restrict__ local, int n16,
@@ -510,6 +519,13 @@ void r4dx_tp_test_standin_bf16(int64_t buf, int64_t local, int n16, int nb, int 
   CheckNt("r4dx_tp_test_standin_bf16", nt);
   hipLaunchKernelGGL(r4dx_tp_test_standin_kernel, dim3(static_cast<unsigned>(nb)), dim3(static_cast<unsigned>(nt)), 0,
                      (hipStream_t)stream, (uint4*)buf, (const uint4*)local, n16, w);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_tp_test_marker(int64_t host_u64x2, uint64_t value, int64_t stream) {
+  if (host_u64x2 == 0) Bad("r4dx_tp_test_marker: null output");
+  hipLaunchKernelGGL(r4dx_tp_test_marker_kernel, dim3(1), dim3(32), 0, (hipStream_t)stream, (u64*)host_u64x2,
+                     (u64)value);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

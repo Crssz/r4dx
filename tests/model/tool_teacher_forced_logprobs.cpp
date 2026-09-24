@@ -42,9 +42,11 @@
 //   --embed-device-resident {on|off}   text.embed_tokens VRAM mirror (default on, like the CLI)
 //   --tp {1|2}            tensor parallel (docs/tp.md 9.1, 10.4): 1 (default) is the single-device
 //                         Model; 2 runs the pass through r4dx::model::TpModel
-//   --tp-mode {real|emulate|noop}   with --tp 2 (default real; real arrives in docs/tp.md P4)
+//   --tp-mode {real|emulate|noop}   with --tp 2 (default real: both GPUs, docs/tp.md P4)
 //   --tp-devices a[,b]    with --tp 2: process-visible HIP ordinals (default auto, docs/tp.md 9.2)
 //   --tp-rank r           with --tp-mode noop: which shard to load
+//   --tp-submit-layers N, --tp-max-inflight K   with --tp 2: the prefill submission bounding
+//                         (docs/tp.md Appendix B N57; default TpOptions')
 //
 // MTP and DFlash2 are unconditionally off (ModelOptions::mtp_draft_k stays 0, dflash_container
 // stays empty): both are speculation strategies for GENERATING, and this tool never generates -- it
@@ -111,6 +113,7 @@ int main(int argc, char** argv) {
   std::string embed_resident = "on";
   std::string tp_mode = "real", tp_devices = "auto";
   int tp = 1, tp_rank = 0;
+  int tp_submit_layers = -1, tp_max_inflight = -1;  // -1: TpOptions' default
   bool tp_options_given = false;
   int64_t max_ctx = 8192, layers = -1, check_greedy = 0;
   bool no_write = false, quiet = false;
@@ -138,6 +141,8 @@ int main(int argc, char** argv) {
       else if (a == "--tp-mode") { tp_mode = next(); tp_options_given = true; }
       else if (a == "--tp-devices") { tp_devices = next(); tp_options_given = true; }
       else if (a == "--tp-rank") { tp_rank = std::stoi(next()); tp_options_given = true; }
+      else if (a == "--tp-submit-layers") { tp_submit_layers = std::stoi(next()); tp_options_given = true; }
+      else if (a == "--tp-max-inflight") { tp_max_inflight = std::stoi(next()); tp_options_given = true; }
       else {
         std::fprintf(stderr, "unrecognized argument: %s\n", a.c_str());
         return 2;
@@ -149,7 +154,8 @@ int main(int argc, char** argv) {
                             "[--segment <name>] [--max-ctx N] [--layers N] [--vision off] "
                             "[--check-greedy N] [--no-write] [--quiet] "
                             "[--embed-device-resident {on|off}] [--tp {1|2}] "
-                            "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]\n");
+                            "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
+                            "[--tp-submit-layers N] [--tp-max-inflight K]\n");
       return 2;
     }
     if (embed_resident != "on" && embed_resident != "off") {
@@ -161,7 +167,11 @@ int main(int argc, char** argv) {
       return 2;
     }
     if (tp == 1 && tp_options_given) {
-      std::fprintf(stderr, "--tp-mode/--tp-devices/--tp-rank need --tp 2\n");
+      std::fprintf(stderr, "--tp-mode/--tp-devices/--tp-rank/--tp-submit-layers/--tp-max-inflight need --tp 2\n");
+      return 2;
+    }
+    if (tp_submit_layers < -1 || tp_submit_layers > 64 || tp_max_inflight < -1 || tp_max_inflight > 64) {
+      std::fprintf(stderr, "--tp-submit-layers and --tp-max-inflight must be in [0, 64]\n");
       return 2;
     }
     if (tp_mode != "real" && tp_mode != "emulate" && tp_mode != "noop") {
@@ -199,6 +209,8 @@ int main(int argc, char** argv) {
                                       : r4dx::model::TpOptions::Mode::kReal;
       tpo.devices = ParseDevices(tp_devices);
       tpo.noop_rank = tp_rank;
+      if (tp_submit_layers >= 0) tpo.submit_layers = tp_submit_layers;
+      if (tp_max_inflight >= 0) tpo.max_inflight_units = tp_max_inflight;
     }
 
     // Under --tp 2 this thread is the TpModel facade and makes no HIP call (docs/tp.md 2.1).

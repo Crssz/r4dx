@@ -185,9 +185,10 @@ struct CliArgs {
   // --tp N: 1 (default) is today's single-device engine, byte for byte, and allows no other --tp-*
   // flag; 2 is tensor parallel across two ranks (r4dx::model::TpModel).
   int tp = 1;
-  // --tp-mode real|emulate|noop: real = one rank per GPU (docs/tp.md P4 -- refused until then);
-  // emulate = both ranks on ONE device (the byte-exact reference for real runs, and the numerics
-  // check vs TP=1); noop = one rank's shard with a no-op all-reduce (timing only).
+  // --tp-mode real|emulate|noop: real (the default) = one rank per GPU, both cards (HIP_VISIBLE_DEVICES
+  // unset: rank 0 = device 1, rank 1 = device 0); emulate = both ranks on ONE device (the byte-exact
+  // reference for real runs, and the numerics check vs TP=1); noop = one rank's shard with a no-op
+  // all-reduce (timing only).
   std::string tp_mode = "real";
   // --tp-devices a[,b]: process-visible HIP ordinals, rank r -> entry r; empty = auto (docs/tp.md
   // 9.2: emulate/noop use the last visible ordinal).
@@ -196,6 +197,13 @@ struct CliArgs {
   int tp_ar_timeout_ms = 500;   // --tp-ar-timeout-ms N: all-reduce spin timeout, [10, 1500]
   int tp_ar_nb = 4;             // --tp-ar-nb N: blocks per channel-0 all-reduce, [1, 64]
   int tp_ar_nb_large = 4;       // --tp-ar-nb-large N: blocks per channel-1 all-reduce, [1, 64]
+  // Bounded GPU submission (docs/tp.md Appendix B N57, N64, r4dx::model::TpOptions): --tp-submit-layers
+  // N forces a submission after every N layers of a prefill chunk (0 = off; at most 16, 8 and 4
+  // layers past 16k, 64k and 128k of context), --tp-max-inflight K keeps
+  // at most K such units queued ahead of the GPU (0 = no cap); both [0, 64]. -1 = not given: keep
+  // r4dx::model::TpOptions' own default (this header stays HIP-free, so it does not include it).
+  int tp_submit_layers = -1;
+  int tp_max_inflight = -1;
   // Set when any --tp-* flag other than --tp itself was given (they are refused at --tp 1).
   bool tp_options_given = false;
 };
@@ -220,7 +228,8 @@ inline std::string CliUsageText(const char* argv0) {
          "[--vision {auto|on|off}] [--image-max-pixels N] [--image <path> ...] "
          "[--dump-token-ids <tokens.json>] [--layers N] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
-         "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N]";
+         "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
+         "[--tp-max-inflight K]";
 }
 
 // "auto" (or "") -> empty (docs/tp.md 9.2 auto); "a" or "a,b" -> the ordinals.
@@ -288,6 +297,7 @@ inline uint64_t ParseU64(const std::string& flag, const std::string& value) {
 inline CliArgs ParseArgs(int argc, char** argv) {
   CliArgs a;
   bool tp_rank_given = false;
+  bool tp_submit_given = false, tp_inflight_given = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextCliArg(argc, argv, i, "--model");
@@ -328,6 +338,8 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--tp-ar-timeout-ms") { a.tp_ar_timeout_ms = ParseInt("--tp-ar-timeout-ms", NextCliArg(argc, argv, i, "--tp-ar-timeout-ms")); a.tp_options_given = true; }
     else if (arg == "--tp-ar-nb") { a.tp_ar_nb = ParseInt("--tp-ar-nb", NextCliArg(argc, argv, i, "--tp-ar-nb")); a.tp_options_given = true; }
     else if (arg == "--tp-ar-nb-large") { a.tp_ar_nb_large = ParseInt("--tp-ar-nb-large", NextCliArg(argc, argv, i, "--tp-ar-nb-large")); a.tp_options_given = true; }
+    else if (arg == "--tp-submit-layers") { a.tp_submit_layers = ParseInt("--tp-submit-layers", NextCliArg(argc, argv, i, "--tp-submit-layers")); a.tp_options_given = true; tp_submit_given = true; }
+    else if (arg == "--tp-max-inflight") { a.tp_max_inflight = ParseInt("--tp-max-inflight", NextCliArg(argc, argv, i, "--tp-max-inflight")); a.tp_options_given = true; tp_inflight_given = true; }
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -391,7 +403,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   // ---- tensor parallel (docs/tp.md 9.1) --------------------------------------------------------
   if (a.tp != 1 && a.tp != 2) throw CliUsageError("--tp must be 1 or 2");
   if (a.tp == 1 && a.tp_options_given) {
-    throw CliUsageError("--tp-mode/--tp-devices/--tp-rank/--tp-ar-* need --tp 2");
+    throw CliUsageError("--tp-mode/--tp-devices/--tp-rank/--tp-ar-*/--tp-submit-layers/--tp-max-inflight need --tp 2");
   }
   if (a.tp == 2) {
     if (a.tp_mode != "real" && a.tp_mode != "emulate" && a.tp_mode != "noop") {
@@ -405,15 +417,16 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     if (a.tp_ar_nb < 1 || a.tp_ar_nb > 64 || a.tp_ar_nb_large < 1 || a.tp_ar_nb_large > 64) {
       throw CliUsageError("--tp-ar-nb and --tp-ar-nb-large must be in [1, 64]");
     }
+    // -1 is the "not given" marker, so a GIVEN value is checked against [0, 64] including its sign.
+    if ((tp_submit_given && (a.tp_submit_layers < 0 || a.tp_submit_layers > 64)) ||
+        (tp_inflight_given && (a.tp_max_inflight < 0 || a.tp_max_inflight > 64))) {
+      throw CliUsageError("--tp-submit-layers and --tp-max-inflight must be in [0, 64]");
+    }
     // Permanent in v1 (docs/tp.md 1.2): profiling under tensor parallelism.
     if (a.profile || a.profile_prefill) {
       throw CliUsageError("--profile/--profile-prefill are not supported with --tp 2 (docs/tp.md 1.2)");
     }
     // Staged rejections (docs/tp.md 9.1) -- each is removed by the phase that implements it.
-    if (a.tp_mode == "real") {
-      throw CliUsageError("--tp 2 --tp-mode real (two GPUs) is not implemented yet (docs/tp.md P4); use "
-                           "--tp-mode emulate");
-    }
     if (a.mtp > 0) throw CliUsageError("--mtp is not supported with --tp 2 yet (docs/tp.md P5)");
     if (!a.dflash.empty()) throw CliUsageError("--dflash is not supported with --tp 2 yet (docs/tp.md P5)");
     if (a.vision == "on") throw CliUsageError("--vision on is not supported with --tp 2 yet (docs/tp.md P5)");

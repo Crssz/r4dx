@@ -154,11 +154,15 @@ Model Model::Load(const ModelOptions& opts) {
                                 std::to_string(tp.rank));
   }
   if (!is_tp_rank && (tp.comm != nullptr || tp.shared_embed_host || tp.dflash_codebooks ||
-                   tp.embed_device_resident_decided >= 0 || !tp.vision_weights_on_this_rank)) {
+                   tp.embed_device_resident_decided >= 0 || !tp.vision_weights_on_this_rank ||
+                   tp.submit_layers != 0 || tp.max_inflight_units != 0)) {
     throw std::invalid_argument(
         "Model::Load: ModelOptions::tp.comm/shared_embed_host/dflash_codebooks/"
-        "embed_device_resident_decided/vision_weights_on_this_rank are tensor-parallel options "
-        "(tp.world > 1 only)");
+        "embed_device_resident_decided/vision_weights_on_this_rank/submit_layers/max_inflight_units "
+        "are tensor-parallel options (tp.world > 1 only)");
+  }
+  if (tp.submit_layers < 0 || tp.submit_layers > 64 || tp.max_inflight_units < 0 || tp.max_inflight_units > 64) {
+    throw std::invalid_argument("Model::Load: tp.submit_layers and tp.max_inflight_units must be in [0, 64]");
   }
   ModelOptions::VisionMode vision_mode = opts.vision;
   if (is_tp_rank) {
@@ -366,6 +370,12 @@ Model Model::Load(const ModelOptions& opts) {
   if (m.comm_ != nullptr) {
     m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(2 * m.draft_window_));
     m.topk_lse_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
+    // The prefill submission bounding's events (docs/tp.md Appendix B N57): created here, on this
+    // rank's thread and device, never inside a collective command.
+    if (tp.submit_layers > 0) {
+      m.submit_ = tp::SubmitBounder(tp.max_inflight_units);
+      m.submit_layers_ = tp.submit_layers;
+    }
   }
 
   // Sampled-decode row summaries (docs/sampling.md section 8), sized for the widest thing that can
@@ -698,10 +708,23 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // to reuse yet), then body_epilogue_ once a Mlp::Forward call below has fused an epilogue into
   // buf_normed_pre_ for layer i+1 to consume (mirrors normed_in's own carry-forward exactly).
   int normed_in_epilogue = r4dx_epilogue_none;
+  // Tensor parallel: bounded submission of a prefill chunk (docs/tp.md Appendix B N57). A 64-row
+  // chunk is ~41 ms at 2k context and several hundred ms near 262k, and the runtime submits it only
+  // every 129 commands (N56); on device 0, which cannot preempt compute, the desktop waits behind
+  // whatever is submitted. So every `unit_layers` layers the chunk forces a submission and waits
+  // until at most max_inflight_units - 1 earlier units are unfinished; the unit shrinks with the
+  // chunk's end position, because attention grows with it (tp::UnitLayersForContext, N64). Decode
+  // steps and verify windows (<= 8 rows, a decode-sized step) are not split; every call already ends
+  // in the stream synchronize below. The previous call ended synchronized, so no unit is
+  // outstanding here.
+  const bool bounded = comm_ != nullptr && is_prefill_path && submit_.Active();
+  const int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
+  if (bounded) submit_.Reset();
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
+    if (bounded && i > 0 && i % unit_layers == 0) submit_.EndUnit(stream_.get());
     // Every GDN/attention layer in this architecture is immediately followed by its own Mlp, so
     // the sub-block's fused epilogue always targets THIS layer's post_attention_layernorm.
     const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();

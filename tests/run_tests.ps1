@@ -18,7 +18,8 @@
   cards): it refuses to start while r4dx-server is running, removes HIP_VISIBLE_DEVICES from the
   process environment, sets R4DX_TP2GPU=1 and runs `ctest --test-dir build\<preset> -L tp2gpu`
   -- deliberately not `--preset`, whose test environment would inject HIP_VISIBLE_DEVICES=1 into
-  every test. Both variables are restored afterwards.
+  every test. Both variables are restored afterwards. Then, whatever ctest returned, it waits 30 s
+  and runs tools\tp\tdr_check.ps1 -Since <start> (docs/tp.md Appendix B N55): a TDR fails the run.
 
 .PARAMETER Preset
   CMake preset name. Default 'win-hip'.
@@ -57,20 +58,32 @@ if ($TwoGpu) {
     }
     $SavedHip = $env:HIP_VISIBLE_DEVICES
     $SavedOptIn = $env:R4DX_TP2GPU
+    # The suite loads device 0 (the desktop card) for ~40 s: record the start and check for a TDR
+    # afterwards, whatever ctest returned (docs/tp.md Appendix B N55, N64).
+    $Start = Get-Date
+    $CtestCode = 1
     try {
         Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
         $env:R4DX_TP2GPU = "1"
         $TestDir = Join-Path "build" $Preset
-        Write-Output "[run_tests] two-GPU tests: ctest --test-dir $TestDir -L tp2gpu (HIP_VISIBLE_DEVICES unset, R4DX_TP2GPU=1)"
+        Write-Output (("[run_tests] two-GPU tests from {0:yyyy-MM-dd HH:mm:ss}: ctest --test-dir $TestDir -L tp2gpu " +
+                       "(HIP_VISIBLE_DEVICES unset, R4DX_TP2GPU=1)") -f $Start)
         & $Ctest --test-dir $TestDir -L tp2gpu --output-on-failure
-        if ($LASTEXITCODE -ne 0) { throw "ctest (tp2gpu) failed with exit code $LASTEXITCODE" }
+        $CtestCode = $LASTEXITCODE
     } finally {
         if ($null -ne $SavedHip) { $env:HIP_VISIBLE_DEVICES = $SavedHip }
         else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
         if ($null -ne $SavedOptIn) { $env:R4DX_TP2GPU = $SavedOptIn }
         else { Remove-Item env:R4DX_TP2GPU -ErrorAction SilentlyContinue }
     }
-    Write-Output "[run_tests] all two-GPU tests passed"
+    Write-Output "[run_tests] waiting 30 s for Windows Error Reporting, then the TDR check"
+    Start-Sleep -Seconds 30
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "..\tools\tp\tdr_check.ps1") `
+        -Since $Start.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+    $TdrCode = $LASTEXITCODE
+    if ($TdrCode -ne 0) { throw "a TDR happened during the two-GPU tests (tdr_check exit code $TdrCode): stop device-0 work" }
+    if ($CtestCode -ne 0) { throw "ctest (tp2gpu) failed with exit code $CtestCode" }
+    Write-Output "[run_tests] all two-GPU tests passed, no TDR since the start"
     return
 }
 

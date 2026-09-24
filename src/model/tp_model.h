@@ -17,9 +17,11 @@
 // exception that is not a core::TpAbortedError, else the lowest rank's TpAbortedError; every rank's
 // message is logged to stderr as "[r4dx-tp] rank <r> (dev <d>): <what>".
 //
-// Modes (TpOptions::Mode, docs/tp.md 9.1): kEmulate -- two ranks on ONE device, EmulatedComm
-// (6.5); kNoop -- ONE rank's shard with a no-op all-reduce (timing only, tokens meaningless);
-// kReal -- two GPUs, HostMailboxComm: docs/tp.md P4, refused by Load until then. Staged rejections
+// Modes (TpOptions::Mode, docs/tp.md 9.1): kReal -- one rank per GPU, HostMailboxComm through the
+// pinned host mailbox (6.3), after the device validation and wall-clock check of 2.9 steps 3-4;
+// kEmulate -- two ranks on ONE device, EmulatedComm (6.5); kNoop -- ONE rank's shard with a no-op
+// all-reduce (timing only, tokens meaningless). Every mode bounds prefill submissions
+// (TpOptions::submit_layers / max_inflight_units, docs/tp.md Appendix B N57). Staged rejections
 // (2.9 step 1): MTP (mtp_draft_k > 0), DFlash2 (dflash_container) and --vision on throw
 // core::TpUnsupportedError until docs/tp.md P5; --vision auto loads text-only.
 //
@@ -125,6 +127,13 @@ class TpModel final : public TextModel {
   // on the rank threads; legal in kReady and kNeedsRecovery.
   std::vector<std::array<uint64_t, 2>> CallCounts();
   std::vector<core::TpCommStats> CommStats();
+  // Per rank thread: the prefill submission bounding's counters (Model::TpSubmitStats). Same rules.
+  std::vector<tp::SubmitBounder::Stats> SubmitStats();
+  // The `--stats` line of docs/tp.md 9.1 (without the "[stats] " prefix): mode, devices, rank 0's
+  // per-channel all-reduce calls, host exchanges, the max exchange wait and aborts over ranks, and
+  // the bounding (submit_layers/max_inflight_units, units, cap waits, max cap wait). The comm
+  // counters restart at every recovery; aborts and the bounding's counters count from load.
+  std::string StatsLine();
   // Test-only: arms fault injection on `rank`'s endpoint now (counted from this call, docs/tp.md
   // TpOptions::fault_*). Legal in kReady.
   void ArmFaultInjection(int rank, int64_t at_allreduce, int kind);

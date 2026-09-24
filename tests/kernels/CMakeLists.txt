@@ -118,12 +118,15 @@ set_tests_properties(test_tp_allreduce_2gpu PROPERTIES LABELS tp2gpu SKIP_RETURN
 # tool_tp_ar_stress (G5: `--count 10000000 --pattern decode`) and tool_tp_ar_latency (G5's decode-
 # pattern L at 10 / 80 / 640 KiB): built, never add_test()'d -- two-GPU gate tools, run by hand with
 # HIP_VISIBLE_DEVICES unset and the production server stopped (docs/tp.md 11, P3).
-foreach(t tool_tp_ar_stress tool_tp_ar_latency)
+# tool_tp_submit_probe (docs/tp.md Appendix B N56): ONE device, a few ms of GPU work -- when does
+# the runtime submit an enqueued kernel, and what forces it? The evidence behind the TP submission
+# bounding (N57). Same built-only convention.
+foreach(t tool_tp_ar_stress tool_tp_ar_latency tool_tp_submit_probe)
   add_executable(${t} ${t}.cpp)
   target_link_libraries(${t} PRIVATE r4dx_tp r4dx_core r4dx_kernels r4d_core)
 endforeach()
 set_source_files_properties(test_tp_allreduce_cpu_peer.cpp test_tp_allreduce_2gpu.cpp tool_tp_ar_stress.cpp
-                            tool_tp_ar_latency.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+                            tool_tp_ar_latency.cpp tool_tp_submit_probe.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_fused_quant (docs/r9700.md R2/P2) additionally needs r4dx_model_kernels for
 # r4dx_model_cast_bf16_to_f16 (the "old" w4a16 cast path it byte-diffs the new fused f16 epilogue

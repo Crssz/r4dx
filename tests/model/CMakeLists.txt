@@ -106,6 +106,22 @@ target_include_directories(tool_tp_step_bench PRIVATE ${CMAKE_SOURCE_DIR}/third_
 target_link_libraries(tool_tp_step_bench PRIVATE r4dx_model r4dx_tokenizer r4dx_convert r4dx_core
                                                  r4d_core)
 
+# tool_tp_soak: tensor-parallel P4 gate G8 (docs/tp.md 10.5) -- one real TpModel for --minutes of
+# random prefill/decode iterations with a fixed canary; wrapped by tools/tp/soak.ps1 (pre-flight,
+# TDR check). Takes both GPUs for as long as it runs: built, never add_test()'d.
+add_executable(tool_tp_soak tool_tp_soak.cpp)
+target_link_libraries(tool_tp_soak PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
+# test_tp_real_vs_emulation: tensor-parallel P4 (docs/tp.md 10.1) -- emulate vs real, byte for byte,
+# plus real-GPU fault recovery. BOTH GPUs, LABEL tp2gpu, opt-in exactly like
+# tests/kernels/test_tp_allreduce_2gpu: deliberately NO HIP_VISIBLE_DEVICES property (under the
+# win-hip test preset it sees one device and skips), SKIP 77 unless R4DX_TP2GPU=1 and two devices are
+# visible. tests\run_tests.ps1 -TwoGpu runs it; the default run excludes the label.
+add_executable(test_tp_real_vs_emulation test_tp_real_vs_emulation.cpp)
+target_link_libraries(test_tp_real_vs_emulation PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME test_tp_real_vs_emulation COMMAND test_tp_real_vs_emulation)
+set_tests_properties(test_tp_real_vs_emulation PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
+
 # test_mtp_round: pure CPU unit test for src/model/mtp_round.hpp (ProcessMtpRound) -- no HIP
 # device, model container, or GDN/KV state needed (header-only std::vector<int32_t> arithmetic),
 # same "plain add_test(), no ENVIRONMENT/SKIP_RETURN_CODE" pattern tests/server's HIP-free tests

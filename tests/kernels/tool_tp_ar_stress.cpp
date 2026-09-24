@@ -10,11 +10,24 @@
 //                       filler that streams --filler-mb MiB and dirties --dirty-mb MiB of L2; the count
 //                       is rounded up to whole tokens
 //   --mixed             sizes cycle over both channels instead of the fixed --bytes
-// Built, never add_test()'d: it takes the desktop GPU for minutes.
+//   --flush-every N     bounded submission (docs/tp.md Appendix B N57, tp::SubmitBounder): a forced
+//                       submission after every N slots ([filler +] all-reduce) of a batch, so no
+//                       submission spans more than N slots (the runtime alone submits every 129
+//                       commands, N56); 0 (default) = off, P3's behaviour
+//   --max-inflight K    with --flush-every: at most K such units queued ahead of the GPU (0 = no
+//                       cap). K = 1 is a hipStreamSynchronize per unit, so the GPU idles at every
+//                       unit; any other K is an event record + one query per unit (plus the cap
+//                       wait) and keeps the GPU busy -- K >= 2 always has a unit queued
+//   --idle-us U         with --max-inflight 1: the host waits U us after each unit's synchronize
+//                       before enqueuing the next, an explicit GPU idle gap (N64)
+// Built, never add_test()'d: it takes the desktop GPU for minutes. A device-0 endurance run (the
+// G5 10M decode-pattern retry) goes through tools\tp\ar_stress.ps1, which watches for a TDR while
+// it runs and refuses any bounding other than --flush-every N --max-inflight 1 (N64).
 //
 //   tool_tp_ar_stress.exe [--count N=10000000] [--pattern isolated|decode] [--bytes B=10240]
 //       [--mixed] [--nb 4] [--nb-large 4] [--timeout-ms 500] [--filler-mb 60] [--dirty-mb 4]
-//       [--devices auto|a,b] [--need-gib X] [--json path]
+//       [--flush-every N] [--max-inflight K] [--idle-us U] [--devices auto|a,b] [--need-gib X]
+//       [--json path]
 // Exit codes (tp_bench's): 0 ok, 1 error, 2 data mismatch / protocol violation, 3 timeout / abort.
 #include <hip/hip_runtime.h>
 
@@ -41,14 +54,15 @@ struct Args {
   int filler_mb = 60, dirty_mb = 4;
   std::string devices;
   double need_gib = -1;
+  int flush_every = 0, max_inflight = 0, idle_us = 0;
   std::string json;
 };
 
 [[noreturn]] void Usage(const std::string& why) {
   std::fprintf(stderr,
                "%s\nusage: tool_tp_ar_stress.exe [--count N] [--pattern isolated|decode] [--bytes B] [--mixed] "
-               "[--nb N] [--nb-large N] [--timeout-ms N] [--filler-mb N] [--dirty-mb N] [--devices auto|a,b] "
-               "[--need-gib X] [--json path]\n",
+               "[--nb N] [--nb-large N] [--timeout-ms N] [--filler-mb N] [--dirty-mb N] [--flush-every N] "
+               "[--max-inflight K] [--idle-us U] [--devices auto|a,b] [--need-gib X] [--json path]\n",
                why.c_str());
   std::exit(1);
 }
@@ -73,6 +87,9 @@ Args Parse(int argc, char** argv) {
       else if (s == "--dirty-mb") a.dirty_mb = std::stoi(next());
       else if (s == "--devices") a.devices = next();
       else if (s == "--need-gib") a.need_gib = std::stod(next());
+      else if (s == "--flush-every") a.flush_every = std::stoi(next());
+      else if (s == "--max-inflight") a.max_inflight = std::stoi(next());
+      else if (s == "--idle-us") a.idle_us = std::stoi(next());
       else if (s == "--json") a.json = next();
       else Usage("unknown option " + s);
     } catch (const std::exception&) {
@@ -84,6 +101,14 @@ Args Parse(int argc, char** argv) {
   if (a.bytes < 16 || a.bytes % 16 != 0 || a.bytes > tp::kMaxAllReduceBytes) Usage("--bytes: multiple of 16 in [16, 655360]");
   if (a.nb < 1 || a.nb > 64 || a.nb_large < 1 || a.nb_large > 64) Usage("--nb / --nb-large must be in [1, 64]");
   if (a.filler_mb < 0 || a.filler_mb > 1024 || a.dirty_mb < 0 || a.dirty_mb > 256) Usage("bad --filler-mb/--dirty-mb");
+  if (a.flush_every < 0 || a.flush_every > 4096 || a.max_inflight < 0 || a.max_inflight > 64) {
+    Usage("--flush-every must be in [0, 4096] and --max-inflight in [0, 64]");
+  }
+  if (a.max_inflight > 0 && a.flush_every == 0) Usage("--max-inflight needs --flush-every");
+  if (a.idle_us < 0 || a.idle_us > 1000000) Usage("--idle-us must be in [0, 1000000]");
+  if (a.idle_us > 0 && (a.flush_every == 0 || a.max_inflight != 1)) {
+    Usage("--idle-us needs --flush-every N --max-inflight 1 (only a synchronize leaves the GPU with nothing queued)");
+  }
   if (a.need_gib < 0) a.need_gib = a.pattern == "decode" ? 1.5 : 0.5;
   return a;
 }
@@ -112,6 +137,9 @@ int main(int argc, char** argv) {
   cfg.filler_dirty_bytes = static_cast<size_t>(a.dirty_mb) << 20;
   cfg.nb[0] = a.nb;
   cfg.nb[1] = a.nb_large;
+  cfg.flush_every = a.flush_every;
+  cfg.max_inflight_units = a.max_inflight;
+  cfg.idle_us = a.idle_us;
   const int64_t requested_rounded = cfg.batches * cfg.K;
 
   int code = 0;
@@ -135,6 +163,15 @@ int main(int argc, char** argv) {
     std::printf("[stress] pattern %s, %lld all-reduces (%lld requested), %s, nb %d / %d, timeout %d ms\n",
                 a.pattern.c_str(), static_cast<long long>(requested_rounded), static_cast<long long>(a.count),
                 a.mixed ? "mixed sizes" : (std::to_string(a.bytes) + " B").c_str(), a.nb, a.nb_large, a.timeout_ms);
+    if (a.flush_every > 0 && a.max_inflight == 1) {
+      std::printf("[stress] bounded submission: hipStreamSynchronize every %d slot(s) (the GPU idles at each unit), "
+                  "then %d us of host idle\n",
+                  a.flush_every, a.idle_us);
+    } else if (a.flush_every > 0) {
+      std::printf("[stress] bounded submission: an event record + query every %d slot(s), at most %d unit(s) queued%s "
+                  "(the GPU never idles)\n",
+                  a.flush_every, a.max_inflight, a.max_inflight == 0 ? " (no cap)" : "");
+    }
     std::fflush(stdout);
     pool.RunAll([&](int r) { T.eps[static_cast<size_t>(r)]->SelfTest(); });
     const auto t0 = std::chrono::steady_clock::now();
@@ -186,6 +223,11 @@ int main(int argc, char** argv) {
   for (int r = 0; r < 2; ++r) {
     const std::string f = DescribeFailure(res[static_cast<size_t>(r)]);
     if (!f.empty()) std::printf("    rank %d: %s\n", r, f.c_str());
+    const tp::SubmitBounder::Stats& b = res[static_cast<size_t>(r)].bound;
+    if (a.flush_every > 0) {
+      std::printf("    rank %d: %llu forced submission(s), %llu cap wait(s), max %.0f us\n", r,
+                  static_cast<unsigned long long>(b.units), static_cast<unsigned long long>(b.waits), b.wait_us_max);
+    }
   }
 
   if (!a.json.empty()) {
@@ -197,8 +239,10 @@ int main(int argc, char** argv) {
          ", \"nb_large\": " + std::to_string(a.nb_large) + ", \"nt\": 256, \"timeout_ms\": " +
          std::to_string(a.timeout_ms) + ", \"filler_mb\": " + std::to_string(decode ? a.filler_mb : 0) +
          ", \"dirty_mb\": " + std::to_string(decode ? a.dirty_mb : 0) + ", \"ars_per_verified_batch\": " +
-         std::to_string(cfg.K) + ", \"devices\": [" + std::to_string(devices[0]) + ", " + std::to_string(devices[1]) +
-         "]},\n";
+         std::to_string(cfg.K) + ", \"flush_every\": " + std::to_string(a.flush_every) + ", \"max_inflight\": " +
+         std::to_string(a.max_inflight) + ", \"idle_us\": " + std::to_string(a.idle_us) + ", \"devices\": [" +
+         std::to_string(devices[0]) + ", " +
+         std::to_string(devices[1]) + "]},\n";
     j += "  \"wallclock_khz\": " + JsonArr(khz) + ",\n";
     j += "  \"result\": {\"calls_verified\": " + std::to_string(verified) + ", \"calls_requested_rounded\": " +
          std::to_string(requested_rounded) + ", \"seconds\": " + JsonNum(secs) +
@@ -211,7 +255,9 @@ int main(int argc, char** argv) {
            ", \"mismatches\": " + std::to_string(R.verify.mismatches) + ", \"failure\": " +
            (R.ok ? std::string("null") : JsonStr(DescribeFailure(R))) + ", \"n_abort_exits\": " +
            std::to_string(R.comm_status.n_abort_exits) + ", \"n_skipped_blocks\": " +
-           std::to_string(R.comm_status.n_skipped) + "}" + (r == 0 ? "," : "") + "\n";
+           std::to_string(R.comm_status.n_skipped) + ", \"forced_submissions\": " + std::to_string(R.bound.units) +
+           ", \"cap_waits\": " + std::to_string(R.bound.waits) + ", \"max_cap_wait_us\": " +
+           JsonNum(R.bound.wait_us_max) + "}" + (r == 0 ? "," : "") + "\n";
     }
     j += "  ]\n}\n";
     if (!WriteFile(a.json, j)) {

@@ -75,9 +75,20 @@ int VisibleDeviceCount() {
   return n;
 }
 
+// The process's HIP_VISIBLE_DEVICES, or "" (a CRT call, not HIP). _dupenv_s: getenv is deprecated
+// under the MSVC CRT.
+std::string HipVisibleDevices() {
+  char* v = nullptr;
+  size_t len = 0;
+  std::string out;
+  if (_dupenv_s(&v, &len, "HIP_VISIBLE_DEVICES") == 0 && v != nullptr) out = v;
+  std::free(v);
+  return out;
+}
+
 struct DeviceProbe {
   std::string name, arch;
-  int pci_bus = -1, pci_device = -1;
+  int pci_domain = -1, pci_bus = -1, pci_device = -1;
   int can_map_host = 0;
   size_t total = 0, free_bytes = 0;
   int wall_clock_khz = 0;
@@ -102,10 +113,6 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
       throw std::invalid_argument("TpModel::Load: ModelOptions::tp must be default -- TpModel fills in every rank's "
                                   "TpRankOptions itself");
     }
-  }
-  if (tp.mode == TpOptions::Mode::kReal) {
-    throw core::TpUnsupportedError(
-        "TpModel::Load: --tp-mode real (two GPUs) is not implemented yet (docs/tp.md P4); use --tp-mode emulate");
   }
   if (opts.mtp_draft_k > 0) {
     throw core::TpUnsupportedError("TpModel::Load: MTP (--mtp > 0) is not supported under tensor parallelism yet "
@@ -133,7 +140,12 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
                                 std::to_string(tp.ar_timeout_ms));
   }
   (void)tp::MailboxLayout::Make(tp.ar_nb_small, tp.ar_nb_large);  // throws unless both nb are in [1, 64]
+  if (tp.submit_layers < 0 || tp.submit_layers > 64 || tp.max_inflight_units < 0 || tp.max_inflight_units > 64) {
+    throw std::invalid_argument("TpModel::Load: submit_layers and max_inflight_units must be in [0, 64], got " +
+                                std::to_string(tp.submit_layers) + " and " + std::to_string(tp.max_inflight_units));
+  }
   const bool noop = tp.mode == TpOptions::Mode::kNoop;
+  const bool real = tp.mode == TpOptions::Mode::kReal;
   if (noop && (tp.noop_rank < 0 || tp.noop_rank >= tp.world)) {
     throw std::invalid_argument("TpModel::Load: noop_rank must be 0 or 1, got " + std::to_string(tp.noop_rank));
   }
@@ -153,20 +165,43 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   }
 
   // Devices (docs/tp.md 9.2): emulate and noop use ONE device, the last visible ordinal by default
-  // -- so HIP_VISIBLE_DEVICES=1 puts every single-device TP run on physical device 1.
+  // -- so HIP_VISIBLE_DEVICES=1 puts every single-device TP run on physical device 1. Real mode uses
+  // two, by default in descending order from the last visible one: with HIP_VISIBLE_DEVICES unset,
+  // rank 0 = device 1 (headless), rank 1 = device 0 (the desktop card).
   const int visible = VisibleDeviceCount();
   if (visible < 1) throw core::TpError("TpModel::Load: no visible HIP device");
-  int device = visible - 1;
-  if (!tp.devices.empty()) {
-    if (tp.devices.size() > 2 || (tp.devices.size() == 2 && (noop || tp.devices[0] != tp.devices[1]))) {
-      throw std::invalid_argument(std::string("TpModel::Load: --tp-mode ") + ModeName(tp.mode) +
-                                  " runs on ONE device; give --tp-devices a single ordinal");
+  std::vector<int> devices;  // per rank slot
+  if (real) {
+    if (visible < 2) {
+      const std::string hvd = HipVisibleDevices();
+      throw core::TpError("TpModel::Load: --tp 2 --tp-mode real needs two visible HIP devices; HIP_VISIBLE_DEVICES=" +
+                          (hvd.empty() ? std::string("<unset>") : hvd) + " exposes " + std::to_string(visible) +
+                          ". Unset it (or set it to 0,1).");
     }
-    device = tp.devices[0];
+    if (tp.devices.empty()) {
+      devices = {visible - 1, visible - 2};
+    } else if (tp.devices.size() != 2 || tp.devices[0] == tp.devices[1]) {
+      throw std::invalid_argument("TpModel::Load: --tp-mode real needs --tp-devices with two different ordinals "
+                                  "(rank 0, rank 1), or auto");
+    } else {
+      devices = tp.devices;
+    }
+  } else {
+    int device = visible - 1;
+    if (!tp.devices.empty()) {
+      if (tp.devices.size() > 2 || (tp.devices.size() == 2 && (noop || tp.devices[0] != tp.devices[1]))) {
+        throw std::invalid_argument(std::string("TpModel::Load: --tp-mode ") + ModeName(tp.mode) +
+                                    " runs on ONE device; give --tp-devices a single ordinal");
+      }
+      device = tp.devices[0];
+    }
+    devices.assign(noop ? 1 : 2, device);
   }
-  if (device < 0 || device >= visible) {
-    throw std::invalid_argument("TpModel::Load: HIP device " + std::to_string(device) + " is not visible (" +
-                                std::to_string(visible) + " visible device(s))");
+  for (int d : devices) {
+    if (d < 0 || d >= visible) {
+      throw std::invalid_argument("TpModel::Load: HIP device " + std::to_string(d) + " is not visible (" +
+                                  std::to_string(visible) + " visible device(s))");
+    }
   }
   if (opts.vision == ModelOptions::VisionMode::kAuto) {
     std::fprintf(stderr, "[r4dx-tp] --vision auto loads text-only under tensor parallelism until docs/tp.md P5\n");
@@ -178,6 +213,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   // before these are.
   const int n_slots = noop ? 1 : 2;
   std::vector<DeviceProbe> probe(static_cast<size_t>(n_slots));
+  std::vector<double> clock_khz(static_cast<size_t>(n_slots), 0.0);
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> embed;
   bool resident = opts.embed_device_resident;
   double latency_us = -1.0;
@@ -214,13 +250,14 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
     if (embed) (void)new std::shared_ptr<const core::PinnedBuffer<uint16_t>>(std::move(embed));
   }};
 
-  // 2. Spawn the rank threads (noop: one, for rank noop_rank; emulate: two on the same device).
+  // 2. Spawn the rank threads (noop: one, for rank noop_rank; emulate: two on the same device; real:
+  //    one per device).
   for (int i = 0; i < n_slots; ++i) {
     auto s = std::make_unique<RankSlot>();
     s->index = i;
     s->rank = noop ? tp.noop_rank : i;
-    s->device = device;
-    const int dev = device, rank = s->rank;
+    s->device = devices[static_cast<size_t>(i)];
+    const int dev = s->device, rank = s->rank;
     s->worker = std::make_unique<tp::RankWorker>(
         rank,
         [dev, rank] {
@@ -232,9 +269,9 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
     m->ranks_.push_back(std::move(s));
   }
 
-  // 3. Probe every rank's device (docs/tp.md 2.9 step 3). The real-mode requirements (distinct PCI
-  //    bus, same gcnArchName, canMapHostMemory) and the wall-clock check (step 4) arrive with
-  //    --tp-mode real in P4; the free bytes feed the embedding decision below.
+  // 3. Probe every rank's device (docs/tp.md 2.9 step 3); the free bytes feed the embedding decision
+  //    below. Real mode requires two physical devices (distinct PCI bus), the same gcnArchName (the
+  //    ranks run the same code objects and tunings) and canMapHostMemory (the mailbox, 6.3).
   m->Run(m->AllSlots(),
          [&](RankSlot& s) {
            hipDeviceProp_t p;
@@ -242,6 +279,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
            DeviceProbe& d = probe[static_cast<size_t>(s.index)];
            d.name = p.name;
            d.arch = p.gcnArchName;
+           d.pci_domain = p.pciDomainID;
            d.pci_bus = p.pciBusID;
            d.pci_device = p.pciDeviceID;
            d.can_map_host = p.canMapHostMemory;
@@ -251,9 +289,38 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
          CmdKind::kPlain, kNoStall);
   for (const auto& s : m->ranks_) {
     const DeviceProbe& d = probe[static_cast<size_t>(s->index)];
-    std::fprintf(stderr, "[r4dx-tp] rank %d -> HIP device %d (%s, pci %02x:%02x, %.2f/%.2f GiB free) [mode %s]\n",
-                 s->rank, s->device, d.name.c_str(), d.pci_bus, d.pci_device,
+    std::fprintf(stderr, "[r4dx-tp] rank %d -> HIP device %d (%s, %s, pci %02x:%02x, %.2f/%.2f GiB free) [mode %s]\n",
+                 s->rank, s->device, d.name.c_str(), d.arch.c_str(), d.pci_bus, d.pci_device,
                  static_cast<double>(d.free_bytes) / kGiB, static_cast<double>(d.total) / kGiB, ModeName(tp.mode));
+  }
+  if (real) {
+    const DeviceProbe &a = probe[0], &b = probe[1];
+    if (a.pci_domain == b.pci_domain && a.pci_bus == b.pci_bus) {
+      throw core::TpError("TpModel::Load: --tp-mode real needs two physical GPUs, but HIP devices " +
+                          std::to_string(devices[0]) + " and " + std::to_string(devices[1]) +
+                          " are the same one (pci bus " + std::to_string(a.pci_bus) +
+                          "); for both ranks on one device use --tp-mode emulate");
+    }
+    if (a.arch != b.arch) {
+      throw core::TpError("TpModel::Load: --tp-mode real needs two GPUs of the same architecture, got " + a.arch +
+                          " (HIP device " + std::to_string(devices[0]) + ") and " + b.arch + " (HIP device " +
+                          std::to_string(devices[1]) + ")");
+    }
+    for (size_t i = 0; i < probe.size(); ++i) {
+      if (probe[i].can_map_host != 1) {
+        throw core::TpError("TpModel::Load: HIP device " + std::to_string(devices[i]) +
+                            " cannot map host memory (canMapHostMemory = 0); the two-GPU all-reduce needs it");
+      }
+    }
+    // 4. Wall-clock check (docs/tp.md 2.9 step 4), before any spinning kernel: every all-reduce
+    //    timeout converts milliseconds to wall_clock64 ticks with hipDeviceAttributeWallClockRate.
+    m->Run(m->AllSlots(), [&](RankSlot& s) { clock_khz[static_cast<size_t>(s.index)] = tp::CheckWallClockRate(); },
+           CmdKind::kPlain, kNoStall);
+    for (const auto& s : m->ranks_) {
+      const size_t i = static_cast<size_t>(s->index);
+      std::fprintf(stderr, "[r4dx-tp] rank %d: device wall clock %.0f kHz measured (%d kHz reported)\n", s->rank,
+                   clock_khz[i], probe[i].wall_clock_khz);
+    }
   }
 
   // 6. The process's ONE pinned host copy of text.embed_tokens (docs/tp.md 2.9 step 6, 5.3), loaded
@@ -288,9 +355,15 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
     m->Run(m->AllSlots(), [&](RankSlot& s) { s.noop = tp::MakeNoopComm(tp.world, s.rank); }, CmdKind::kPlain,
            kNoStall);
   } else {
-    m->group_ = tp::TpGroup::Create(tp::TpGroup::Mode::kEmulate, tp.world,
+    m->group_ = tp::TpGroup::Create(real ? tp::TpGroup::Mode::kReal : tp::TpGroup::Mode::kEmulate, tp.world,
                                     tp::TpGroup::Geometry{tp.ar_nb_small, tp.ar_nb_large}, tp.ar_timeout_ms);
     tp::TpGroup* const group = m->group_.get();
+    if (real) {
+      // The pinned mailbox both GPUs map (docs/tp.md 6.3.2), allocated on rank 0's thread and reset
+      // in the same call (flags := the session base, N32): hipHostMalloc does not promise zeroed
+      // memory. ~TpModel frees it on rank 0's thread too, after both endpoints are gone.
+      m->Run({0}, [group](RankSlot&) { group->AllocateMailbox(); }, CmdKind::kPlain, kNoStall);
+    }
     m->Run(m->AllSlots(),
            [group](RankSlot& s) { s.endpoint = group->CreateEndpoint(s.rank, &s.worker->Heartbeat()); },
            CmdKind::kPlain, kNoStall);
@@ -308,6 +381,8 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
            ro.tp.shared_embed_host = embed;
            ro.tp.embed_device_resident_decided = resident ? 1 : 0;
            ro.tp.vision_weights_on_this_rank = s.rank == 0;
+           ro.tp.submit_layers = tp.submit_layers;
+           ro.tp.max_inflight_units = tp.max_inflight_units;
            s.model.emplace(Model::Load(ro));
          },
          CmdKind::kPlain, kNoStall);
@@ -464,9 +539,18 @@ TpModel::~TpModel() {
   }
   wait_idle("teardown");
   for (const auto& s : ranks_) (void)s->worker->TakeError();
-  // 5. Join the threads (~RankWorker), then free the group's shared state (docs/tp.md 2.6 step 3).
+  // 5. Free the group's shared state (docs/tp.md 2.6 step 3) -- in real mode the pinned mailbox, a
+  //    hipHostFree -- on rank 0's thread, now that every endpoint is gone and both devices were
+  //    synchronized, so no kernel can still touch it: the facade thread never calls HIP (2.1;
+  //    Appendix B N58). ~TpGroup itself leaks the region if an endpoint could not be torn down or a
+  //    stream watchdog fired. Then join the threads (~RankWorker).
+  if (group_ != nullptr) {
+    std::unique_ptr<tp::TpGroup>* g = &group_;
+    ranks_[0]->worker->Post([g] { g->reset(); });
+    wait_idle("mailbox free");
+    (void)ranks_[0]->worker->TakeError();
+  }
   ranks_.clear();
-  group_.reset();
 }
 
 // ---- command plumbing ---------------------------------------------------------------------------
@@ -674,6 +758,7 @@ std::vector<VramReport> TpModel::VramImpl() {
         r.used_gib = static_cast<double>(total_b - free_b) / kGiB;
         r.free_gib = static_cast<double>(free_b) / kGiB;
         r.total_gib = static_cast<double>(total_b) / kGiB;
+        r.buffers_gib = static_cast<double>(core::DeviceBufferBytes(s.device)) / kGiB;
       },
       CmdKind::kPlain);
   return *out;
@@ -700,6 +785,47 @@ std::vector<core::TpCommStats> TpModel::CommStats() {
   auto out = std::make_shared<std::vector<core::TpCommStats>>(ranks_.size());
   Run(AllSlots(), [out](RankSlot& s) { (*out)[static_cast<size_t>(s.index)] = s.Comm()->Stats(); }, CmdKind::kPlain);
   return *out;
+}
+
+std::vector<tp::SubmitBounder::Stats> TpModel::SubmitStats() {
+  if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
+  auto out = std::make_shared<std::vector<tp::SubmitBounder::Stats>>(ranks_.size());
+  Run(AllSlots(), [out](RankSlot& s) { (*out)[static_cast<size_t>(s.index)] = s.model->TpSubmitStats(); },
+      CmdKind::kPlain);
+  return *out;
+}
+
+std::string TpModel::StatsLine() {
+  // docs/tp.md 9.1's `--stats` line (Appendix B N59). Both ranks make the same all-reduce calls
+  // (6.3.6), so the per-channel counts are rank 0's; the exchange wait and the bounding's cap wait are
+  // the maximum over ranks (whichever rank arrives first at an exchange does the waiting). Two time
+  // bases: ar_calls, host_exchanges and max_exchange_wait restart at every recovery (the endpoint's
+  // ResetCounters, 2.5 step 6); aborts and the bounding's counters are cumulative since load.
+  const std::vector<core::TpCommStats> cs = CommStats();
+  const std::vector<tp::SubmitBounder::Stats> ss = SubmitStats();
+  std::string devs;
+  for (const auto& s : ranks_) devs += (devs.empty() ? "" : ",") + std::to_string(s->device);
+  double wait_max = 0, cap_wait_max = 0;
+  uint64_t aborts = 0, units = 0, cap_waits = 0;
+  for (const core::TpCommStats& c : cs) {
+    wait_max = std::max(wait_max, c.host_exchange_wait_us_max);
+    aborts += c.aborts;
+  }
+  for (const tp::SubmitBounder::Stats& s : ss) {
+    units = std::max(units, s.units);
+    cap_waits = std::max(cap_waits, s.waits);
+    cap_wait_max = std::max(cap_wait_max, s.wait_us_max);
+  }
+  char buf[512];
+  std::snprintf(buf, sizeof buf,
+                "tp: mode=%s devices=%s ar_calls=%llu/%llu host_exchanges=%llu max_exchange_wait=%.0fus aborts=%llu "
+                "submit=%d/%d units=%llu cap_waits=%llu max_cap_wait=%.0fus",
+                ModeName(tp_.mode), devs.c_str(), static_cast<unsigned long long>(cs[0].ar_calls[0]),
+                static_cast<unsigned long long>(cs[0].ar_calls[1]),
+                static_cast<unsigned long long>(cs[0].host_exchanges), wait_max,
+                static_cast<unsigned long long>(aborts), tp_.submit_layers, tp_.max_inflight_units,
+                static_cast<unsigned long long>(units), static_cast<unsigned long long>(cap_waits), cap_wait_max);
+  return buf;
 }
 
 void TpModel::ArmFaultInjection(int rank, int64_t at_allreduce, int kind) {
@@ -860,7 +986,8 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
   if (tp.world == 1) {
     const TpOptions d;
     if (tp.mode != d.mode || !tp.devices.empty() || tp.noop_rank != d.noop_rank || tp.ar_timeout_ms != d.ar_timeout_ms ||
-        tp.ar_nb_small != d.ar_nb_small || tp.ar_nb_large != d.ar_nb_large || tp.fault_rank != d.fault_rank ||
+        tp.ar_nb_small != d.ar_nb_small || tp.ar_nb_large != d.ar_nb_large || tp.submit_layers != d.submit_layers ||
+        tp.max_inflight_units != d.max_inflight_units || tp.fault_rank != d.fault_rank ||
         tp.fault_at_allreduce != d.fault_at_allreduce || tp.fault_kind != d.fault_kind) {
       throw std::invalid_argument("LoadTextModel: the TpOptions besides `world` are tensor-parallel options "
                                   "(world == 2 only)");

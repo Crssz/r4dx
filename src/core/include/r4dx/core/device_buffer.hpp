@@ -27,6 +27,19 @@
 
 namespace r4dx::core {
 
+// Live DeviceBuffer bytes per process-visible HIP device ordinal, over the whole process (every
+// hipMalloc in r4dx's own code is a DeviceBuffer; the HIP runtime's own memory is not counted).
+// Unlike hipMemGetInfo's device-wide "used", this counts only this process's own buffers -- on HIP
+// device 0 the desktop's memory comes and goes with whatever the user runs -- so the
+// tensor-parallel soak gates its VRAM drift on it (docs/tp.md 10.5, Appendix B N64). Ordinals >=
+// kMaxTrackedDevices are not counted. One relaxed atomic add and one hipGetDevice per allocation;
+// no behaviour change.
+inline constexpr int kMaxTrackedDevices = 16;
+inline std::atomic<int64_t> g_device_buffer_bytes[kMaxTrackedDevices]{};
+inline int64_t DeviceBufferBytes(int device) noexcept {
+  return device >= 0 && device < kMaxTrackedDevices ? g_device_buffer_bytes[device].load(std::memory_order_relaxed) : 0;
+}
+
 template <typename T>
 class DeviceBuffer {
  public:
@@ -37,6 +50,7 @@ class DeviceBuffer {
       static std::atomic<bool> logged{false};
       TpNoteDeviceAlloc("allocation (DeviceBuffer constructor)", logged);
       R4DX_HIP_CHECK(hipMalloc(&ptr_, count_ * sizeof(T)));
+      NoteBytes(true);
     }
   }
 
@@ -45,17 +59,20 @@ class DeviceBuffer {
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
-  DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_) {
+  DeviceBuffer(DeviceBuffer&& other) noexcept : ptr_(other.ptr_), count_(other.count_), device_(other.device_) {
     other.ptr_ = nullptr;
     other.count_ = 0;
+    other.device_ = -1;
   }
   DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
     if (this != &other) {
       Free();
       ptr_ = other.ptr_;
       count_ = other.count_;
+      device_ = other.device_;
       other.ptr_ = nullptr;
       other.count_ = 0;
+      other.device_ = -1;
     }
     return *this;
   }
@@ -75,6 +92,7 @@ class DeviceBuffer {
       static std::atomic<bool> logged{false};
       TpNoteDeviceAlloc("allocation (DeviceBuffer::Resize)", logged);
       R4DX_HIP_CHECK(hipMalloc(&ptr_, count_ * sizeof(T)));
+      NoteBytes(true);
     }
   }
 
@@ -122,13 +140,25 @@ class DeviceBuffer {
       static std::atomic<bool> logged{false};
       TpNoteDeviceAlloc("free (DeviceBuffer)", logged);
       static_cast<void>(hipFree(ptr_));
+      NoteBytes(false);
     }
     ptr_ = nullptr;
     count_ = 0;
+    device_ = -1;
+  }
+
+  // g_device_buffer_bytes: the allocation lands on the calling thread's current device, and the
+  // free is charged back to that same ordinal whichever thread frees it.
+  void NoteBytes(bool allocated) noexcept {
+    if (allocated && hipGetDevice(&device_) != hipSuccess) device_ = -1;
+    if (device_ < 0 || device_ >= kMaxTrackedDevices) return;
+    const int64_t b = static_cast<int64_t>(count_ * sizeof(T));
+    g_device_buffer_bytes[device_].fetch_add(allocated ? b : -b, std::memory_order_relaxed);
   }
 
   T* ptr_ = nullptr;
   size_t count_ = 0;
+  int device_ = -1;  // the ordinal ptr_ was allocated on (g_device_buffer_bytes), -1 = none
 };
 
 }  // namespace r4dx::core

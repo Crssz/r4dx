@@ -451,9 +451,27 @@ void TestTpFlags() {
   CHECK(TpThrows({"--tp", "3"}));
   CHECK(TpThrows({"--tp-mode", "emulate"}));  // --tp-* without --tp 2
   CHECK(TpThrows({"--tp", "1", "--tp-ar-nb", "4"}));
-  CHECK(TpThrows({"--tp", "2"}));  // default --tp-mode real: docs/tp.md P4
-  CHECK(TpThrows({"--tp", "2", "--tp-mode", "real"}));
+  CHECK(!TpThrows({"--tp", "2"}));  // default --tp-mode real (docs/tp.md P4)
+  CHECK(!TpThrows({"--tp", "2", "--tp-mode", "real", "--tp-devices", "1,0"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "bogus"}));
+  {
+    // Bounded submission (docs/tp.md Appendix B N57): -1 = not given (TpOptions' default).
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi", "--tp",
+                                         "2"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.tp_mode == "real" && a.tp_submit_layers == -1 && a.tp_max_inflight == -1);
+    std::vector<std::string> storage2 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi",
+                                          "--tp", "2", "--tp-submit-layers", "0", "--tp-max-inflight", "3"};
+    auto argv2 = ToArgv(storage2);
+    const auto b = r4dx::cli::ParseArgs(static_cast<int>(argv2.size()), argv2.data());
+    CHECK(b.tp_submit_layers == 0 && b.tp_max_inflight == 3 && b.tp_options_given);
+  }
+  CHECK(TpThrows({"--tp", "1", "--tp-submit-layers", "4"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-submit-layers", "-1"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-submit-layers", "65"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-max-inflight", "-2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-max-inflight", "65"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-rank", "0"}));  // --tp-rank is noop-only
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "noop", "--tp-rank", "2"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-ar-timeout-ms", "5"}));

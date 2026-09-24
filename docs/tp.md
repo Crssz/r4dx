@@ -125,11 +125,18 @@ engine's port on the same definition (and reports the vs-stand-in value next to 
 | G5 | In-engine all-reduce | 0 mismatches in 10M stress ARs; in the decode pattern, `L_vs_no_ar_kernel`(10 KiB) <= **9.0 us** and (80 KiB) <= **16.0 us** (<= 120% of tp_bench's 7.47 / 13.33) | P3 |
 | G6 | Real 2-GPU == emulation | every `*.logprobs.f16` of the teacher-forced corpus SHA-256-equal, both produced by the **same binary** in the same gate run | P4 |
 | G7 | Plain decode speed | >= **52.2 tok/s** on the standard protocol, both runs | P4 |
-| G8 | Soak | 60 min `tool_tp_soak`, exit 0, 0 aborts, 0 divergences, 0 TDRs (WER LiveKernelEvent 141 in the Application log, or System event 4101; N44) | P4 |
+| G8 | Soak | `tools\tp\soak.ps1` (`tool_tp_soak` under an in-run TDR watch, N64), 5 min, then 60 min: exit 0, 0 aborts, 0 divergences, 0 TDRs (WER LiveKernelEvent 141 in the Application log, or System event 4101; N44), the log's `summary` and `teardown` lines both exit_code 0 | P4 |
 | G9 | DFlash speed | >= **95 tok/s** `--dflash k=7`, standard protocol, both runs | P5 |
 | G10 | DFlash acceptance | mean tokens/round over the 4 prompts of `tests/model/mtp_prompts.txt` within **±5% relative** of TP=1 | P5 |
 | G11 | Server | `tools/server/smoke.ps1 -Tp 2` clean (4-layer default; real container with `-Dflash -ToolRoundTrip`; `-Vision -Dflash`; `-Mtp 3`; **`-Dflash -TpFault`**: an injected all-reduce fault fails one request and the next request succeeds with the reference output) | P5 |
 | G12 | Speculative losslessness under TP | `tools/validate_dflash.ps1 -Tp 2 -Layouts w4a16` and `tools/validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16` exit 0 under the scripts' own control rules; `test_tp_emulation`'s DFlash and MTP cases (exact H6/H7 merges, bookkeeping lockstep) pass | P5 |
+
+**Gate status (2026-09-25, Appendix B).** G1 pass (its CPU tests are in every `run_tests.ps1` run,
+last N65). G2 pass at every phase so far, last on the
+P4 tree (N65). G3 pass: 0.547 / 0.548 (N29). G4 pass: 0.03853 / 91.01% (N54). G5: latency limits met
+in P3 (N44); its 10M decode-pattern line TDR'd in P3 and passed in P4 with bounded submission (N65).
+G6 pass: 4/4 dumps SHA-256-equal (N65). G7 pass: 59.65 / 59.33 tok/s, 1.65x (N65). G8 pass: 5 and 60
+minutes, no TDR (N65). G9-G12 are P5's, not run yet.
 
 ---
 
@@ -1654,16 +1661,23 @@ against a stale reference.
 
 ### 10.5 Soak (`tool_tp_soak`)
 
-`tool_tp_soak.exe --model v6 --layout w4a16 --minutes 60 --max-ctx 8192 [--dflash <g64 drafter>]
---json build\logs\tp_soak.json`: one `TpModel` (real) for the whole run; loop: pick a random slice
-(16-2048 tokens) of a random kl_corpus segment, `Reset()`, `Prefill`, then 32-512 decode tokens in a
-random mode (greedy / sampled seeded / DFlash greedy / DFlash sampled when loaded); every 10th
-iteration re-run a fixed 512-token canary prompt greedily for 128 tokens and require the output to
-equal the first canary run exactly. Record iterations, tokens, `TpCommStats`, max exchange wait,
-per-rank VRAM at start and end. Pass: exit 0, 0 aborts, 0 divergences, canary always equal, per-rank
-VRAM drift <= 64 MiB, `g_tp_collective_allocs == 0` (2.7), and no TDR since the start: no
-Application-log Windows Error Reporting event for LiveKernelEvent 141 and no System event 4101
-(on this box a TDR shows up only as the former, N44).
+Always through `tools\tp\soak.ps1`, staged: `.\tools\tp\soak.ps1 --model v6 --layout w4a16 --minutes 5
+--max-ctx 8192 [--dflash <g64 drafter>] --json build\logs\tp_soak_5min.jsonl`, then the same with
+`--minutes 60 --json build\logs\tp_soak_60min.jsonl` (a separate log per stage). The script runs
+`tool_tp_soak.exe` with those arguments and polls the TDR check every 20 s while it runs; the first
+TDR stops the soak and all device-0 work (Appendix B N64). `tool_tp_soak`: one `TpModel` (real) for
+the whole run; loop: pick a random slice (16-2048 tokens) of a random kl_corpus segment, `Reset()`,
+`Prefill`, then 32-512 decode tokens in a random mode (greedy / sampled seeded / DFlash greedy /
+DFlash sampled when loaded); every 10th iteration re-run a fixed 512-token canary prompt greedily for
+128 tokens and require the output to equal the first canary run exactly. Record iterations, tokens,
+`TpCommStats`, max exchange wait, per-rank VRAM right after load and at the end. Pass: `soak.ps1`
+exits 0, which requires the soak's exit 0, its log's `summary` AND `teardown` lines with exit_code 0,
+0 aborts, 0 divergences, canary always equal, per-rank buffer drift (this process's live
+`DeviceBuffer` bytes on the rank's device; the device-wide `hipMemGetInfo` figure is logged, not
+gated, since on device 0 it includes the desktop) <= 64 MiB, `g_tp_collective_allocs == 0` (2.7), no
+HIP error 719 in the log, and no TDR since the start: no Application-log Windows Error Reporting event
+for LiveKernelEvent 141 and no System event 4101 (on this box a TDR shows up only as the former,
+N44).
 
 ---
 
@@ -1831,7 +1845,7 @@ Pass: ctest green; G2; G4.
 
 Gates (production server on device 1 stopped):
 ```powershell
-.\tests\run_tests.ps1 -TwoGpu                                   # incl. test_tp_real_vs_emulation
+.\tests\run_tests.ps1 -TwoGpu                                   # incl. test_tp_real_vs_emulation; TDR check after
 Remove-Item env:HIP_VISIBLE_DEVICES
 # G6: section 10.4 "G6 [P4]" block (regenerates the emulation reference with this binary)
 # G7 (twice; plus 3 identical greedy SHA-256):
@@ -1840,11 +1854,14 @@ build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --l
   --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences."
 # sampled reproducibility: same seed twice -> same text
 build\win-hip\src\cli\r4dx-cli.exe <same> --temperature 0.7 --top-k 20 --top-p 0.8 --seed 1
-build\win-hip\tests\model\tool_tp_soak.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 60 --max-ctx 8192 --json build\logs\tp_soak.json   # G8
+# G8, staged (10.5; soak.ps1 stops at the first TDR): 5 minutes, then 60, each with its own log
+.\tools\tp\soak.ps1 --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 5 --max-ctx 8192 --json build\logs\tp_soak_5min.jsonl
+.\tools\tp\soak.ps1 --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 60 --max-ctx 8192 --json build\logs\tp_soak_60min.jsonl
 $env:HIP_VISIBLE_DEVICES='1'; powershell -File tools\tp\tp1_identity.ps1 -Baseline build\baseline -Candidate build\win-hip  # G2
 ```
 Pass: G6 all hashes equal; decode >= 52.2 tok/s in both runs; 3/3 greedy SHA equal; seeded sampled
-runs equal; G8; G2. If G7 misses: below 1.40x (50.4 tok/s) stop, record, do not start P5 (risk
+runs equal; G8 (both `soak.ps1` stages exit 0; a TDR in the 5-minute stage stops P4's device-0 work
+before the 60-minute one); G2. If G7 misses: below 1.40x (50.4 tok/s) stop, record, do not start P5 (risk
 R1/R2); between 1.40x and 1.45x record the numbers and the user decides whether P5 starts.
 
 ### P5 -- MTP, DFlash2, vision, server under TP (~1,500 LOC)
@@ -2541,7 +2558,8 @@ it refines.
     TDR at 1.42M, with 0 mismatches and 0 timeouts up to then. The protocol's 10M evidence is the
     isolated run. How to get 10M in the decode pattern without a TDR on the desktop card is left
     to the user: in chunks with idle gaps, with the desktop idle, or with the display moved off
-    device 0 (Appendix C, question 2).
+    device 0 (Appendix C, question 2). (P4 ran the 10M line with a synchronize and a 500 us idle
+    gap every 16 slots, with the display still on device 0: bit-exact, no TDR, N65.)
 
 **P2b**
 
@@ -2787,6 +2805,530 @@ it refines.
     threads weave, / Parallel light in the dark, / Pixels bloom anew." then the GPU explanation).
     Load took 5.9 s, decode ran at 28.7 tok/s, and VRAM used was 19.96 GiB. The emulated isolated
     L(10 KiB) was 42.4 us.
+
+**P4**
+
+- **N55 (10.5, G8, N44: the TDR check, `tools/tp/tdr_check.ps1 -Since <datetime>`).** Windows Error
+  Reporting RE-LOGS its queued LiveKernelEvent reports in bursts, each time with a fresh
+  `TimeCreated`: 25 old reports at once at 00:11, 09:31, 09:37, 11:46, 15:12, 15:28, 15:51 and
+  19:45 on 2026-09-24; the 2026-08-19 20:08 dump alone was logged 242 times. A filter on
+  `StartTime` alone would report every such burst as a new TDR (the 19:45 burst re-logged the 18:52
+  TDR of N44 an hour later).
+  - Each 141 event names its dump, `C:\WINDOWS\LiveKernelReports\WATCHDOG\WATCHDOG-<yyyyMMdd>-<HHmm>.dmp`,
+    stamped in local time when the TDR happened. The script counts a WER `LiveKernelEvent` /
+    `P1: 141` Application event logged since `-Since` only if that stamp is at or after `-Since`
+    truncated to the minute; re-logged older dumps are listed as ignored. An event without a dump
+    name, and every System event 4101 since `-Since`, count as TDRs. Exit 1 if any.
+  - Checked against the log: `-Since 18:50` reports the 18:52 TDR (its three events and the 19:45
+    re-log); `-Since 19:00` is clean and lists 25 ignored re-logged dumps.
+  - A new WER report triggers a burst: the one application crash of this phase (N63, 23:21:55)
+    was followed at 23:21:57 by a re-log of every queued LiveKernelEvent report, which the check
+    run after it correctly ignored. Bursts also come with no trigger: 23:28:08-09 re-logged the
+    same reports with the Application log empty since 23:22:01.
+  - `tools/tp/soak.ps1` wraps `tool_tp_soak` (N60) with the server pre-flight, the start time, a 30 s
+    wait and this check. Every device-0 run of this phase was followed by it.
+- **N56 (N43, Appendix C q2: when the runtime SUBMITS; `tests/kernels/tool_tp_submit_probe.cpp`,
+  measured 2026-09-24).** A marker kernel (`r4dx_tp_test_marker`, new in `r4dx_tp_kernels.hip`)
+  release-stores a value into mapped pinned host memory when it STARTS; the host polls that memory
+  with plain loads, so it sees a kernel begin without making any HIP call. Each case queues at most
+  ~15 ms of GPU work. Results, device 1 (bus 07) and device 0 (bus 03, desktop live), no environment
+  override:
+
+  | Case | Device 1 | Device 0 |
+  |---|---|---|
+  | A: one marker, no further HIP call | not started after 200 ms; one `hipEventQuery` then started it in 3.45 ms (an idle GPU waking) | not started after 200 ms; one query: 106 us |
+  | B: marker + `hipEventRecord` only | started 60 us after the launch | 32 us |
+  | C: marker + record + ONE `hipEventQuery` | 39 us | 20 us |
+  | D: a busy kernel (600 x `s_sleep 127`) + marker + record + one query | marker started 4.54 ms after the query | 2.05 ms (higher shader clock) |
+  | E: 2048 markers, polled after every launch (0.50-0.59 us/launch) | first marker ran at launch ~225; after 200 ms with no HIP call only markers <= 1935 had run | same: first at ~208, tail stuck at 1935 |
+  | E2: 1024 markers, 20 us host pause per launch | the observed value jumped only at launches 129, 258, 387, 516, 645, 774, 903; 904-1024 not started after 200 ms | identical boundaries |
+
+  - **So the runtime submits on its own only every 129 commands**; everything after the last such
+    point waits until `hipEventRecord`, `hipEventQuery` or a synchronize -- indefinitely (200 ms
+    here, 700 ms in N43). `hipEventRecord` ALONE submits (B); record + one query is the forced
+    submission of N57's event path (the query does not rely on that side effect of the record). No
+    timer flushes the tail.
+  - **`GPU_FLUSH_ON_EXECUTION=1`** (device 1): case A started in 45 us, B 33 us, C 35 us, the E tail
+    100.8 ms after the last launch: every launch becomes its own submission, and back-to-back
+    submissions run at one per ~49 us (E2: the observed value advanced one marker per ~50 us instead
+    of one per ~3.3 us batched).
+  - **Flush cost (case F: 64 units of a ~0.2 ms busy kernel + 8 tiny kernels, an event record + one
+    query every N units; min of 3 interleaved rounds, GPU time between two timing events).** Device 1:
+    9.36 ms never / 11.64 ms every unit (64 forced) / 11.80 ms every 4 / 10.23 ms every 16; with
+    `GPU_FLUSH_ON_EXECUTION=1` 24.5-29.7 ms. Device 0: 4.78 / 9.06 / 6.69 / 5.79 ms. Host enqueue
+    stayed 0.23-0.26 ms in every configuration. A forced submission costs the GPU tens of us here
+    (not linear in the count at this granularity), and flushing every launch costs ~26 us per launch
+    (576 launches: +15 ms). N57 measures what the model's bounding costs, which is what decides.
+  - **An event record slows its stream for good (case G, device 1, fresh streams, 4096 tiny kernels
+    + a marker carried through an auto-submit, min of 3 rounds).** Launch to marker: 3.32 ms
+    (0.809 us/kernel) on a stream that never saw an event; 4.91 ms (1.198 us/kernel) after ONE
+    `hipEventRecord` -- `hipEventDisableTiming` or timing alike, and still after the event was
+    destroyed; 3.39-3.40 ms after one `hipStreamSynchronize`, one D2H `hipMemcpyAsync` or one
+    `hipMemsetAsync`. Enqueue time was the same everywhere (1.73-1.81 ms), so the extra ~0.39 us
+    per dispatch is GPU-side and sticky for the stream's life. In the model it cost decode 1.6% (N57:
+    60.1 vs 59.0-59.2 tok/s once the bounding had recorded events on `Model::stream_` during the
+    prompt prefill, whatever the unit size or cap). Case H: a small `hipMemcpyAsync` (D2H, pinned)
+    or `hipMemsetAsync` after a marker does NOT submit it (not started after 200 ms). So the only
+    submission that leaves the stream as it was is a synchronize.
+  - Two consequences beyond N57: EmulatedComm records an event on the model's stream at every
+    all-reduce (6.5, N45), so an emulated run always pays this; and recovery's `SyncStreams` (2.5
+    step 1, `SyncWithWatchdog`) records one on each tracked stream, so a real group runs ~1.6%
+    slower at decode after its first `Reset()`-recovery until the process restarts. Neither changes
+    a byte. `Model::stream_` sees no event record in a normal real-mode run with the default
+    bounding: the warm-up's latency sample uses its own stream, and the load-time `SelfTest`, which
+    syncs every stream its endpoint has queued an all-reduce on, runs before the model's first one.
+  - Confirmed on both devices: no TDR (tdr_check after the device-0 run, start 21:51:03).
+- **N57 (Appendix C q2: the device-0 submission bounding; `src/model/tp/tp_submit.{h,cpp}`).**
+  - **Where TP enqueues work with no host wait (audit).** Every `Model::RunChunk` -- each prefill
+    chunk AND each decode step -- ends in `stream_.Synchronize()` plus a host read, and the next one
+    starts with the H1 rendezvous; `VerifyWindow` ends the same way. So under TP the host is never
+    more than ONE chunk (<= 64 rows) ahead of its GPU: the "forced flush after each prefill chunk
+    and a cap" of Appendix C q2 already hold at chunk granularity, with a cap of one chunk. Decode
+    steps end in a host read every token (confirmed); `TpWarmup` is one 64-row chunk and one decode
+    step; the teacher-forced tool is `Prefill({id})` + one `DecodeStep` per row; the soak (N60) is
+    Prefill + decode. The longest stretches without a host wait are elsewhere: the warm-up latency
+    sample (200 back-to-back 10 KiB all-reduces, ~1 ms of GPU work) and `SelfTest` (a sync per
+    iteration), both negligible. What is NOT bounded by the chunk sync is the chunk itself: ~41 ms
+    per rank at 2k context, growing to several hundred ms near 262k (attention does not shrink under
+    TP, 1.4). Within it the runtime submits only every 129 commands (N56), so no single submission
+    exceeds ~5 layers, but the host can queue the whole chunk ahead of the GPU.
+  - **Mechanism.** `tp::SubmitBounder` (header above). `EndUnit(stream)` makes the runtime submit
+    the unit now and caps the GPU's queue at K units (unit i is enqueued only after unit i - K
+    finished):
+    - **K = 1 (the default): `hipStreamSynchronize(stream)`** -- submits, and waits until
+      everything so far has finished, with no event, so `Model::stream_` stays as fast as it was
+      (N56 case G). Bounded like `RunChunk`'s own end-of-chunk synchronize: a spinning all-reduce
+      gives up after its 500 ms timeout.
+    - **K = 0 or K >= 2:** records the next of `K + 1` `Model`-owned `hipEventDisableTiming` events
+      and queries it once (the runtime submits, N56), then, for K >= 2, polls (30 s watchdog, never
+      `hipStreamQuery`) until at most `K - 1` recorded units are unfinished; K = 0 is the forced
+      submission without a cap. This path taints the stream (-1.6% decode for the rest of the
+      process, N56 G) -- the documented price of K != 1.
+
+    The task's recipe was the event path for every K ("record an event and query it once"); the
+    first implementation did exactly that, and the decode A/B below found the taint, hence the
+    synchronize for K = 1. Under TP (`comm_ != nullptr`) a prefill-path `RunChunk` ends a unit
+    before layer i whenever `i > 0` and `i % submit_layers == 0`; the chunk's own synchronize ends
+    the last unit. Decode steps and verify windows (<= 8 rows) are not split. Any events are created
+    in `Model::Load` on the rank's thread (never inside a collective); a TP=1 `Model` carries an
+    inert `SubmitBounder` (no events, no HIP call), so TP=1 is unchanged (G2). The same class drives
+    `tool_tp_ar_stress --flush-every N --max-inflight K` (N62).
+  - **No deadlock across ranks.** A rank waiting for its unit i - K needs the peer's all-reduces of
+    unit i - K; the peer has submitted every unit it finished enqueuing (each `EndUnit` submits), and
+    a peer that is itself waiting waits for a unit the first rank has already submitted.
+  - **Knobs.** `TpOptions::submit_layers` (0 = off, [0, 64]) and `max_inflight_units` (0 = no cap,
+    [0, 64]) -> `TpRankOptions` (both must stay 0 at world 1, `Model::Load` refuses otherwise);
+    `--tp-submit-layers N` / `--tp-max-inflight K` on r4dx-cli (cli_args.h keeps -1 = "not given"
+    so `TpOptions` holds the one default), `tool_teacher_forced_logprobs`, `tool_tp_soak`.
+  - **Measured (2026-09-24, real 2 GPUs, v6 w4a16, `tool_tp_soak --iterations 6|8 --min-prompt
+    2048 --max-prompt 2048 --max-ctx 4096`, median prefill tok/s per run, tdr_check clean after
+    every run).** The bounding costs nothing through its cap -- the forced submissions are the cost:
+
+    | submit_layers / K | prefill tok/s (2048 tokens) | vs off in the same batch | forced submissions per chunk |
+    |---|---|---|---|
+    | 0 / 0 (off) | 1560.0, 1542.0; 1539.7, 1523.7 | -- | 0 |
+    | 32 / 1 | 1534.8; 1523.1, 1518.2 | -0.5%; -1.1%, -0.4% | 1 |
+    | 16 / 1 | 1525.9; 1505.8, 1501.3 | -1.0%; -2.2%, -1.5% | 3 |
+    | 16 / 2 | 1515.4; 1505.3, 1508.3 | -2.9%; -2.2%, -1.0% | 3 |
+    | 8 / 2, 8 / 0 | 1483.0, 1482.8 | -4.9% | 7 |
+    | 4 / 2, 4 / 0, 4 / 4 | 1446.3, 1450.2, 1438.4 | -7.3% | 15 |
+    | 1 / 2 | 1341.1 | -14.0% | 63 |
+
+    (Every row of this table used the event path, K = 1 included: it was measured before the switch
+    to the synchronize. Semicolons separate batches; the machine drifted ~2% slower over the 20
+    minutes, so each row is compared with the "off" run of its own batch; the last two batches ran
+    in opposite orders.) Each forced submission costs the chunk ~0.1-0.4 ms -- an extra submission
+    boundary on a lockstepped pair of GPUs, plus the event taint on every later dispatch.
+  - **Decode A/B (standard protocol, 84 tokens to EOS, interleaved, tdr_check clean after each).**
+    Event path, any unit size or cap (32/1, 32/2, 32/0, 4/2): 58.70-59.34 tok/s, mean 59.1; off in
+    the same series: 59.47-60.23, mean 60.0 (-1.6%) -- although decode steps are never split: the
+    prompt prefill's event records had tainted the stream (N56 G). Synchronize path (32/1 after the
+    switch): 59.66, 60.31, 60.31 tok/s vs off 60.05, 60.21, 60.15 -- -0.1%, i.e. none.
+  - **Prefill with the synchronize path, 32 / 1 (2048 tokens, 8 iterations, A B B A):** off 1536.3,
+    on 1515.4; on 1527.9, off 1521.6 tok/s -- -1.4% and +0.4%, mean -0.5%.
+  - **Default: `submit_layers = 32`, `max_inflight_units = 1` (the synchronize path).** No
+    intra-chunk setting measured below 1% except the coarsest one: one forced submission in the
+    middle of each 64-layer chunk, and the second half enqueued only after the first finished,
+    which halves the queue-ahead bound (one chunk -> 32 layers: ~21 ms at 2k context) for -0.5%
+    prefill and no decode cost. At a fixed 32 layers the unit would reach ~0.2 s near 262k; N64
+    shrinks it with context (16 / 8 / 4 layers past 16k / 64k / 128k). Finer units are one flag
+    away (`--tp-submit-layers 4 --tp-max-inflight 1`: 4 layers queued; on the event path 4/2 cost
+    -7.3% prefill at 2k). `--tp-submit-layers 0` restores the unbounded chunk.
+  - **What the bounding does not show (corrected in N64).** It bounds where submissions happen and
+    how much work is queued, and K = 1 adds a short GPU idle gap at every unit; it is not evidence
+    that long device-0 runs are TDR-safe. P3's decode stress TDR'd twice in ~200 s inside tighter
+    bounds than these (N44: every batch records events, so <= 129 commands, ~9 ms, per submission
+    and ~50 ms queued, with the GPU never idle). The P4 device-0 runs were each about a minute or
+    less; the 5-minute and 60-minute soaks are the first endurance evidence, and they run under
+    `soak.ps1`'s in-run TDR watch.
+  - Real-vs-emulation byte identity holds with the bounding on at its finest setting and off (N61).
+    Real mode ran K = 2 (the event path) and off here; K = 1 had run in real mode only in the
+    manual CLI and soak runs (stdout hashes, no logits) and in ctest only under emulation, where a
+    mid-chunk synchronize changes nothing (EmulatedComm host-waits at every all-reduce). N64 adds
+    real K = 1, fault cycles included, to `test_tp_real_vs_emulation`.
+- **N58 (2.9 steps 1-4 and 7, 2.5, 2.6, 9.2: `--tp-mode real` in `TpModel`).**
+  - The P2b rejection of `kReal` is gone. Devices: `--tp-devices auto` = `{visible - 1, visible - 2}`
+    (rank 0 = HIP device 1, rank 1 = device 0 with `HIP_VISIBLE_DEVICES` unset); an explicit list
+    must name two different visible ordinals. Fewer than two visible devices fail with 9.2's message
+    (`HIP_VISIBLE_DEVICES=<value> exposes <n>. Unset it (or set it to 0,1).`; the variable is read
+    with `_dupenv_s`, not through HIP).
+  - Step 3's real-mode checks run on the probe every mode already takes: the same PCI domain AND bus
+    is refused ("the same one ... use --tp-mode emulate"), and so are differing `gcnArchName`s and
+    `canMapHostMemory != 1`. The rank log line now also prints the arch.
+  - Step 4: `tp::CheckWallClockRate()` on each rank thread, before any spinning kernel; each rank's
+    measured and reported kHz is logged (99.1-99.7 MHz measured vs 100 MHz reported in every load of
+    this phase).
+  - Step 7: `TpGroup::Create(kReal, ...)`, then `AllocateMailbox()` on rank 0's thread (it resets the
+    region immediately, N32), then each endpoint on its own thread. SelfTest runs at load (the
+    warm-up command, unchanged) and after every recovery (`TpGroup::Recover` step 7); recovery is
+    P3's `TpGroup::Recover`, unchanged, through `TpModel::Recover`'s runner.
+  - **Shutdown frees the mailbox on rank 0's thread (2.6 step 3 refined).** 2.6 says "after both
+    joins"; after the joins no rank thread is left, so the `hipHostFree` would run on the facade
+    thread, which never calls HIP (2.1; the embedding table got the same fix in N53). `~TpModel` now
+    posts `group_.reset()` to rank 0 after BOTH ranks' teardown commands (Model, endpoint, stream,
+    `hipDeviceSynchronize`) have finished, waits for it (30 s, else `quick_exit(3)` like every
+    other shutdown wait), and only then joins. No kernel can touch the region by then; `~TpGroup`
+    still leaks it if an endpoint survived or a stream watchdog fired.
+  - `TpModel::SubmitStats()` (per rank, `Model::TpSubmitStats()`) and `TpModel::StatsLine()` (N59)
+    join the diagnostics; the 2.8 `TextModel` surface is unchanged.
+  - The warm-up's "isolated L(10 KiB)" log line is not an isolated latency in real mode: the 200
+    all-reduces reach the GPU in 129-command batches (N56), so rank 0's timed loop includes waiting
+    for rank 1's submissions (27-29 us on the 4-layer container, 6.5-12 us on v6; tp_bench's
+    isolated 5.34 us). It stays a load-time sanity line; G5's numbers are `tool_tp_ar_latency`'s.
+- **N59 (9.1: r4dx-cli under `--tp 2`).** `--tp-mode real` is the default and accepted; the staged
+  rejection is gone (MTP, DFlash, vision stay refused until P5). New flags `--tp-submit-layers N`
+  and `--tp-max-inflight K` (N57). With `--stats`, after every turn: one VRAM line per rank and
+  `[stats] tp: mode=real devices=1,0 ar_calls=<ch0>/<ch1> host_exchanges=<n>
+  max_exchange_wait=<x>us aborts=<n> submit=<layers>/<K> units=<n> cap_waits=<n>
+  max_cap_wait=<x>us` -- 9.1's line plus the unit suffix, the abort count and the bounding's
+  counters. Two time bases (corrected in N64): `ar_calls`, `host_exchanges` and
+  `max_exchange_wait` count since load (warm-up included) or the last recovery, whose step 6 resets
+  the endpoint counters (2.5); `aborts` and the bounding's `units` / `cap_waits` / `max_cap_wait`
+  are cumulative since load. Per-channel calls are rank 0's (both ranks make the same calls,
+  6.3.6), waits are the maximum over ranks. The CLI reaches the
+  facade through `dynamic_cast<TpModel*>`, because the TP diagnostics are not part of `TextModel`
+  (2.8). `tests/cli/test_args.cpp`'s `TestTpFlags` now expects `--tp 2` (real) to parse and covers
+  the new flags' ranges and their refusal at `--tp 1`.
+- **N60 (10.5, G8: `tests/model/tool_tp_soak.cpp`, `tools/tp/soak.ps1`).**
+  - One `TpModel` for the whole run; each iteration a random 16-2048-token slice of the kl_corpus
+    pool (every segment's `token_ids`, concatenated, wrapping; 4,096 tokens), `Reset()`, `Prefill`,
+    then 32-512 decode tokens in a random mode: greedy (`DecodeStepGreedy`), seeded sampled
+    (`DecodeStepSampled`, T 0.7 / top_k 20 / top_p 0.8) or full row (`DecodeStep` + host argmax,
+    the vocab gather). DFlash rounds join the mix in P5 (refused under TP until then). Canary on
+    iteration 0 and every `--canary-every` (10): the pool's first 512 tokens + 128 greedy tokens,
+    equal to the first canary run.
+  - Options beyond 10.5: `--iterations N` (instead of `--minutes`), `--tokens`, `--canary-every`,
+    `--min/--max-prompt`, `--min/--max-decode`, `--tp-mode real|emulate` (emulate for a dry run on
+    one device), `--tp-devices`, `--tp-ar-timeout-ms`, `--tp-submit-layers`, `--tp-max-inflight`,
+    `--need-gib` (default 14), `--layers`.
+  - `--json` is a JSON-lines log: a `start` line, one `iter` line per iteration (mode, lengths, tok/s,
+    canary verdict, per-rank VRAM and drift, `TpCommStats` per rank incl. max exchange wait and
+    aborts, the bounding's counters, `g_tp_collective_allocs`, fallback rows), an `error` line, a
+    `summary` line; each written with `fflush` + `_commit` before the next iteration starts.
+  - Any exception stops the run at once (no `Reset()`, no retry): exit 1. Exit 2: a canary
+    mismatch. Exit 3: aborts, VRAM drift > 64 MiB, collective allocations, or no iteration. The
+    free-VRAM pre-flight (9.2) runs on a helper thread before load. (N64: the drift is now this
+    process's `DeviceBuffer` bytes from right after load, not `hipMemGetInfo`'s device-wide used
+    bytes from iteration 0; a `loaded` and a final `teardown` line join the log.)
+  - `tools/tp/soak.ps1` (no `param()` block: every argument goes to the tool): refuses to run while
+    `r4dx-server` exists, records the start time, unsets `HIP_VISIBLE_DEVICES` (restored after),
+    runs the tool, waits 30 s, runs `tdr_check.ps1 -Since <start>`; exit 0 only if both passed.
+    (N64: the check now also runs every 20 s while the soak runs and stops it at the first TDR, and
+    the G8 verdict reads the log's `summary` and `teardown` lines.)
+- **N61 (10.1: `tests/model/test_tp_real_vs_emulation.cpp`, LABEL `tp2gpu`, opt-in).** The script is
+  10.1's plus a multi-chunk prefill and a verify window: Prefill 70 + 16 full-logit `DecodeStep`,
+  16 `DecodeStepGreedy`, a seeded 16-token `DecodeStepSampled` run (tokens AND the final rng
+  state), a 200-token (4-chunk) Prefill, and a sampled 8-row `VerifyWindow` (preds, `logits_out`,
+  row summaries; ranks sized with `dflash_draft_k = 7`). w4a16 and mxfp4 on `l4-allmtp`; emulate
+  runs with the bounding at every layer / K 1, real at every layer / K 2 (the 4-layer container has
+  no unit boundary at the default of 32), and w4a16 once more real with the bounding off -- all
+  byte-identical. (N64 adds real at every layer / K 1, the shipped default's synchronize path, for
+  both layouts, and moves the fault cycles onto that group.) Real-GPU faults on rank 1 only (so a
+  timing-out kernel spins on headless device 1, never on device 0): kind 0 at AR #37 and kind 1
+  (700 ms stall), each followed by `Reset()`, equal `CallCounts()` and a byte-identical rerun.
+  Opt-in exactly like `test_tp_allreduce_2gpu`
+  (`R4DX_TP2GPU=1`, two visible devices, else 77); the VRAM pre-flight (8 GiB per device) runs on
+  a helper thread. `run_tests.ps1 -TwoGpu` picks it up through the label.
+- **N62 (G5's unfinished 10M decode stress: `tool_tp_ar_stress --flush-every N --max-inflight K`).**
+  `DriverConfig` (tests/kernels/tp_ar_harness.h) gains `flush_every` / `max_inflight_units`:
+  `RunDriver` ends a `tp::SubmitBounder` unit after every N slots ([filler +] all-reduce or stand-in)
+  of a batch body, so the gate can retry P3's 10M decode-pattern line with bounded submissions.
+  Defaults 0 / 0 keep P3's behaviour (and `tool_tp_ar_latency`'s and `test_tp_allreduce_2gpu`'s,
+  which never set them); `--max-inflight` needs `--flush-every`. The summary and the JSON report
+  each rank's forced submissions, cap waits and max wait. Smoke, 2026-09-24, 64,000 decode-pattern
+  all-reduces (60 MiB / 4 MiB fillers), all verified, tdr_check clean: 8,184 calls/s unbounded,
+  8,019 calls/s at `--flush-every 16 --max-inflight 2` (-2.0%; 3,500 forced submissions per rank,
+  max cap wait 4.0 ms). Not run at 10M (the gate stage's call). The harness's streams already carry
+  timing events (every batch), so the event path's taint (N56 G) is part of every mode of this tool.
+  - **Corrected in N64: `--max-inflight 2` is not a TDR mitigation.** P3's unbounded run was
+    already bounded about as tightly (its per-batch event records submit every <= 129 commands,
+    ~9 ms, and `kInflight = 3` keeps ~50 ms queued) and still TDR'd twice in ~200 s; K >= 2 always
+    keeps a unit queued, so the GPU is as busy as before. A device-0 endurance retry uses only
+    `--flush-every N --max-inflight 1` (a synchronize per unit, so the GPU idles at each one),
+    optionally `--idle-us U` for a longer gap, through `tools\tp\ar_stress.ps1` (which refuses any
+    other bounding and watches for a TDR while it runs), in pieces of a few minutes with pauses.
+- **N63 (P4 bring-up, measured 2026-09-24 on both GPUs, production server stopped; not the G6-G8
+  gates, G2 not run).** Rank 0 = HIP device 1 (bus 07, headless), rank 1 = device 0 (bus 03,
+  desktop live), `HIP_VISIBLE_DEVICES` unset. Every run that touched device 0 was followed by a
+  30 s wait and `tdr_check.ps1 -Since <its start>`: all clean (~45 checks, 21:51-23:33).
+  - **4-layer container first: `test_tp_real_vs_emulation` PASS** (17.4 s; later 12.3 s and 11.7 s
+    under `run_tests.ps1 -TwoGpu`). All eight parts byte-identical: w4a16 emulate (bounding every
+    layer, K 1) vs real (every layer, K 2), real bounded vs real unbounded, mxfp4 emulate vs real.
+    Faults on real GPUs: kind 0 reached the caller as "tp fault injection"; kind 1 as "tp: rank 0
+    timeout at channel 0 block 3 seq 5369 phase flag-wait" (rank 1: 4 blocks bailed on the abort
+    word, 24 skipped); each `Reset()` recovered and the rerun matched the fresh run byte for byte.
+  - **v6 w4a16 `--tp 2` greedy, 64 tokens:** coherent and identical to N52's emulated text
+    ("Silicon threads weave, / Parallel light in the dark, / Pixels bloom anew." then the GPU
+    explanation). Load 24.1 s cold, 5.7-6.5 s with the container cached; 10.01 GiB used on each
+    card; prefill 29 tokens 1062 tok/s; decode 60.36 tok/s.
+  - **G7-style run (11's CLI line: standard protocol, `--max-tokens 256`, `--stats`):** EOS after 84
+    tokens, **decode 60.37 tok/s** (1.67x TP=1's ~36.2; G7 asks >= 52.2), prefill 1062 tok/s. Stdout
+    SHA-256 `FE60E2A2...03E4`, identical to `--tp-mode emulate` of the same binary on device 1
+    (26.91 tok/s there). Its `[stats] tp:` line: `ar_calls=11128/288 host_exchanges=174
+    max_exchange_wait=928us aborts=0`. Later runs of the same line drifted with the machine
+    (58.7-60.3 tok/s over the next hour, N57); with the final default 59.66 / 60.31 / 60.31 tok/s.
+  - **Seeded sampled** (T 0.7, top_k 20, top_p 0.8, seed 1, 64 tokens): coherent ("Silicon forests
+    rise, / Parallel streams of light flow, / Rendering worlds deep." ...), 58.41 tok/s, 0/64
+    fallback rows. (One run; the reproducibility pair is G7's.)
+  - **`GPU_FLUSH_ON_EXECUTION=1`** (standard protocol, two runs each, interleaved): decode 12.47 /
+    11.75 tok/s vs 58.98 / 59.06 unset (-79%), prompt prefill 304 / 243 vs 1188 / 1177 tok/s, same
+    text. Every launch its own submission at ~50 us each (N56): not a usable bounding.
+  - **Prefill, 2048-token prompt (N57):** 1520-1560 tok/s unbounded, -0.5% with the default.
+  - **`tool_teacher_forced_logprobs --tp 2` (real)** on the g64 `l4-allmtp`, `english_prose`:
+    1,023 rows in 3.98 s (3.9 ms/row), max |logsumexp| 4.8e-7. (The group-128 container under
+    `D:\models\r4dx` is refused by name by this g64 build; the tests' `ContainerPath` picks
+    `D:\models\r4dx\g64`.)
+  - **Soak smoke:** v6, 3 iterations of 2048-token prompts: PASS (prefill 1442-1456 tok/s, decode
+    58.3-60.5 tok/s, canary equal, VRAM drift 0 MiB, 0 collective allocations). `soak.ps1` end to end
+    on the 4-layer container (4 iterations): PASS, TDR check clean; and its failure path (a soak
+    exit 1) reports FAIL.
+  - `--tp 2` with `HIP_VISIBLE_DEVICES=1`: refused before any device work with 9.2's message.
+  - **Tests:** `run_tests.ps1` (default): 72 of 73 (15 skips) in 590 s, the one failure the known
+    `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (N29); `test_tp_emulation` 54.3 s. After the
+    K = 1 synchronize change: `test_tp_emulation`, `test_tp_loader`, `test_tp_allreduce_cpu_peer`
+    and the TP CPU tests pass again, and `run_tests.ps1 -TwoGpu` 2 of 2 (twice in total). Build:
+    no new warnings (the `fopen` deprecation warnings of `teacher_forced.h:291`, `main.cpp`'s
+    `--dump-token-ids` and `tool_vision_chat.cpp` are pre-existing; their files recompiled because
+    `model.h` changed).
+  - **One exit crash, not reproduced.** `tool_tp_soak` (real, `--tp-submit-layers 4
+    --tp-max-inflight 1`, 6 iterations) printed its PASS summary and wrote the JSON summary line,
+    then died with 0xC0000005 inside `amdhip64_7.dll` 10.0.3679.0 (System32, the driver's copy) at
+    offset 0x85f3dc (Application Error event, 23:21:55). The same configuration ran clean 3 times
+    real and 6 times emulated afterwards, and no other of the ~35 real-mode process exits of this
+    phase crashed. The WER archive (and so the dump) is admin-only. The soak now tears the group
+    down explicitly and prints `[soak] TpModel torn down; exiting with code N`, so the next one is
+    placed before or after `~TpModel`. A crash at exit would make `soak.ps1` report FAIL (exit code
+    != 0) even after a passing `summary` line: the G8 run should read both.
+- **N64 (P4 review fixes, 2026-09-24/25).**
+  - **In-run TDR watch (`tools/tp/tdr_watch.psm1`, new).** `soak.ps1` checked for a TDR only after
+    the soak had exited, and N44's first TDR (18:49:44, 52 s in) did not stop P3's stress: a 60-minute
+    soak could have run on for the rest of the hour after a first TDR. `Invoke-TdrWatched` starts the
+    tool (`Start-Process -NoNewWindow`, output unchanged), runs `tdr_check.ps1 -Since <start> -Quiet`
+    every 20 s while it runs, and at the first TDR stops it (`Stop-Process`), waits 30 s, prints the
+    check and the log's last line; no retry. After any exit: 30 s, the final check, and a scan of
+    the run's log lines for `HIP error 719` / `unspecified launch failure` (a suspected TDR, N44).
+    Pre-flight and `HIP_VISIBLE_DEVICES` handling as before. Checked without a GPU: a dummy child
+    exits 7 -> exit code 7, check clean; with the window pointed at 2026-09-24 18:50 (the 18:52 TDR)
+    the watch stopped a 120 s child 5 s in (exit -1, no child left); a log line with HIP error 719
+    -> suspected TDR, while `"prefill_tok_s":719` is not.
+  - **`soak.ps1` = G8's verdict.** Runs `tool_tp_soak` through the watch; exit 0 only with no
+    (suspected) TDR, the soak's exit 0, and this run's `summary` AND `teardown` log lines both
+    `exit_code` 0 (the soak now logs `teardown` after `~TpModel`, so N63's exit crash fails G8).
+    It refuses `--tp-max-inflight` other than 1, the only K with an idle gap inside a chunk. 10.5,
+    1.5 G8 and 11's P4 gate block now run it staged, 5 minutes then 60, one log each.
+  - **`tools/tp/ar_stress.ps1` (new)** runs `tool_tp_ar_stress` through the same watch and refuses
+    to start unless the bounding is `--flush-every N --max-inflight 1` (N62 corrected). The harness
+    gains `DriverConfig::idle_us` / `--idle-us U` (only with `--max-inflight 1`): a yield-wait of U us
+    after each unit's synchronize, with nothing queued on the GPU. `tool_tp_ar_stress` now prints the
+    mode it runs ("hipStreamSynchronize every N slot(s) (the GPU idles at each unit)" at K = 1, the
+    event wording otherwise) and records `idle_us` in its JSON.
+  - **`run_tests.ps1 -TwoGpu`** records the start, and after ctest (whatever it returned) waits 30 s
+    and runs `tdr_check.ps1 -Since <start>`; a TDR fails the run.
+  - **The safety claim is corrected** in `tp_submit.h`, N57 and N62: the bounding limits where
+    submissions happen and how much is queued, and only K = 1 idles the GPU (briefly) at each unit;
+    P3's TDR'd stress ran inside tighter bounds, so the bounding is not by itself evidence that long
+    device-0 runs are safe. The staged, watched soaks are.
+  - **Unit size scales with context (`tp::UnitLayersForContext`).** A fixed 32-layer unit near 262k
+    would queue ~200 ms per unit for a whole prompt. The unit is now `min(submit_layers, cap)` with
+    cap = submit_layers up to a chunk end of 16k, then 16 (<= 64k), 8 (<= 128k), 4 (beyond). From a
+    linear fit, not a measurement: each rank's 64-row chunk ~40 ms + ~1.4 ms per 1,000 positions
+    (N57's 2k chunk plus the attention slope of docs/perf.md's TP=1 prefill curve -- 1007 tok/s
+    averaged to 2k, 264 tok/s to 262k; prefill attention does not split under TP, 8.6), so every unit
+    stays <= ~33 ms estimated (32 layers at 16k ~31 ms, 16 at 64k ~33, 8 at 128k ~28, 4 at 262k ~25).
+    At ~0.2 ms per forced synchronize (N57's sync-path 4/1 at 2k: 1416 vs ~1530 tok/s over 15 per
+    chunk), 15 units near 262k cost ~3 ms of a ~400 ms chunk (<1%, estimated). Nothing changes at <= 16k, which covers every P4 measurement. Both ranks cut
+    the same units (same positions, H1). **Not measured past 4k context on two GPUs**; the first
+    long-context prefill on device 0 should run staged and TDR-watched. `test_tp_emulation` checks
+    the table's edges.
+  - **VRAM drift gated on this process's own buffers.** `hipMemGetInfo`'s used bytes are
+    device-wide: on HIP device 0 they include the desktop, so opening a GPU app during the soak
+    could fail G8 (or hide a real leak). `core::DeviceBuffer` (every `hipMalloc` in r4dx's own code;
+    the HIP runtime's and kernel libraries' internal memory is not in it) now keeps a per-ordinal
+    live-byte counter (`core::DeviceBufferBytes`; the buffer remembers the
+    ordinal it was allocated on, one `hipGetDevice` per allocation); `VramReport::buffers_gib` carries
+    it. `tool_tp_soak` gates on it and logs the device-wide figure beside it (`buffer_drift_mib`,
+    `vram_used_drift_mib`), and the baseline is now taken right after `Load` (a `loaded` log line),
+    not after iteration 0. `test_tp_emulation` checks both emulated ranks report the same figure and
+    that it is covered by the device-wide used bytes. r4dx-cli's `--tp 2` `--stats` VRAM lines
+    append "this process's buffers X GiB" (TP-only stderr; TP=1 output is unchanged).
+  - **Real K = 1 in ctest.** `test_tp_real_vs_emulation` now runs, per layout, emulate 1/1, real 1/1
+    (the shipped synchronize path; fault kind 0 and 1 cycles on this group for w4a16), real 1/2 (the
+    event path), each compared byte for byte with emulation, and for w4a16 real 0/0 against real
+    1/1. At K = 1 it also checks that every unit waited (`waits == units`), i.e. the synchronize
+    path ran.
+  - **Nits:** `tp_group.h`'s threading comment (the group is destroyed on rank 0's thread, ~TpModel
+    step 5); the test header's "default of 4 layers" (32); the `StatsLine` comment and N59 (two time
+    bases); `TpOptions`' cost comment (points to N57's table instead of misquoting it).
+  - **Verified 2026-09-25 (production server stopped):** build clean, no new warnings (the
+    `device_buffer.hpp` change recompiles nearly everything, so the pre-existing `getenv` / `fopen`
+    deprecations of `linear.cpp`, `test_tp_loader.cpp` and `test_dflash_draft_weights.cpp` show up
+    next to N63's three); the TP CPU
+    tests and `test_cli_args` pass; `run_tests.ps1` (default, device 1): 72 of 73 in 544 s, the one
+    failure the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (N29), `test_tp_emulation`
+    passes (50.0 s) with the new checks. `run_tests.ps1 -TwoGpu` (start 00:23:22): 2 of 2 in 73 s
+    with the new TDR check clean (`test_tp_allreduce_2gpu` 27.4 s, `test_tp_real_vs_emulation`
+    15.3 s). In the latter every comparison is byte-identical (8/8 parts): w4a16 and mxfp4 emulate
+    1/1 vs real 1/1 and vs real 1/2, w4a16 real 1/1 vs real 0/0, and both fault reruns vs the fresh
+    real 1/1 run. At 1/1 both ranks forced 33 submissions with 33 waits, at 1/2 33 with 22 waits.
+    On the real 1/1 group kind 0 reached the caller as "tp fault injection" and kind 1 as "tp: rank 0
+    timeout at channel 0 block 3 seq 5369 phase flag-wait; peer abort word 0 (none)", the same
+    call as N63's event-path run.
+  - **v6 `--tp 2` greedy smoke, 64 tokens** (start 00:25:06, tdr_check after 30 s clean): the same
+    text as N52 / N63 ("Silicon threads weave, / Parallel light in the dark, / Pixels bloom anew."
+    then the GPU explanation); load 22.2 s, prefill 29 tokens 1209 tok/s, decode 60.90 tok/s. VRAM,
+    device-wide used vs this process's buffers: rank 0 (device 1) 10.01 vs 9.69 GiB, rank 1 (device
+    0) 10.07 vs 9.69 GiB. `[stats] tp: ... submit=32/1 units=2 cap_waits=2 max_cap_wait=21009us`:
+    the warm-up chunk and the prompt chunk each synchronized once mid-chunk; the longest wait,
+    21.0 ms, is half a 64-row chunk -- N57's estimate.
+  - **`soak.ps1` end to end, `--tp-mode emulate`** (both ranks on device 1; 4-layer `l4-allmtp`,
+    `--layers 4 --iterations 3`, start 00:28:15, TDR check clean): PASS (G8 verdict), with the
+    `loaded` / `iter` / `summary` / `teardown` lines in the log, buffers 6.83 GiB vs 7.11 GiB
+    device-wide used, both drifts 0 MiB. The first attempt, without `--layers 4`, failed to load
+    ("invalid unordered_map<K, T> key") and `soak.ps1` reported FAIL with all three reasons (exit
+    code 1, no summary, no teardown line). Its `--tp-max-inflight 2` refusal fires before any GPU
+    work.
+  - **Not changed: the warm-up's 1500 ms spin timeout on the device-0 rank** (review nit). 2.9 step 9
+    relaxes both ranks for R18's first-request skew, and 1500 ms is under the 2 s TdrDelay. A lower
+    cap for "the display card" needs the process to know which card drives the display (HIP does
+    not say; both are identical R9700s), and logging the warm-up's worst device-side spin needs a
+    counter in the all-reduce kernel's Status (P3's frozen kernel and ISA check). Left for the gate
+    stage to decide; no warm-up timed out in any P4 real-mode load (N63's ~35 runs and this note's).
+- **N65 (P4 gates, measured 2026-09-25 00:32-02:45 on the uncommitted tree at `f9cfee7` + N55-N64,
+  both GPUs, production server stopped).** Rank 0 = HIP device 1 (bus 07, headless), rank 1 =
+  device 0 (bus 03, desktop live), `HIP_VISIBLE_DEVICES` unset for every real run. One build at
+  00:32 (`.\build.ps1`: no work to do, the N64 build of 00:30), not rebuilt between gates. SHA-256
+  (`build\logs\p4\gate_binaries.sha256`): `r4dx-cli.exe` `BB8F6233...A76BDF`,
+  `tool_teacher_forced_logprobs.exe` `FD7C69E9...F954D7`, `tool_tp_soak.exe` `BD0170CB...E2EFA4`,
+  `tool_tp_ar_stress.exe` `565D9782...DE24`. Every log below is under `build\logs\p4\gate_*` (the
+  G6 / G7 driver scripts in `gate_scripts\`); every device-0 run was followed by a 30 s wait and
+  `tdr_check.ps1 -Since <its start>`.
+  - **`run_tests.ps1` (default, device 1):** 72 of 73 (15 skips) in 537 s; the one failure is the
+    known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (N29); `test_tp_emulation` 49.5 s,
+    `test_tp_loader`, `test_tp_allreduce_cpu_peer`, `test_cli_args` and G1's five CPU tests pass
+    (`gate_run_tests_default.log`).
+  - **`run_tests.ps1 -TwoGpu`** (start 00:43:46): 2 of 2, TDR check clean
+    (`gate_run_tests_twogpu.log`, `gate_twogpu_ctest_LastTest.log`). `test_tp_allreduce_2gpu`
+    27.3 s (1,000,000 bit-exact in 25.5 s, both recoveries, 10,000 clean after each);
+    `test_tp_real_vs_emulation` 15.2 s, every comparison byte-identical (8/8 parts): w4a16 and mxfp4
+    emulate 1/1 vs real 1/1 and vs real 1/2, w4a16 real 1/1 vs real 0/0, and both fault reruns
+    (kind 0 "tp fault injection"; kind 1 "tp: rank 0 timeout at channel 0 block 2 seq 5369 phase
+    flag-wait") vs the fresh real 1/1 run; 33 forced submissions per rank, 33 waits at 1/1, 22 at 1/2.
+  - **G2 (`tp1_identity.ps1`, device 1, `-Image` = the golden vision image): PASS.** All 12 rows
+    byte-identical to `build\baseline` (1-5, `row6_{bf16,w4a16,w4a8,mxfp4}`, 7, 8, 9), 00:45:31-00:52:54
+    (`gate_g2.log`, runs in `gate_g2\`). This is the first G2 on N64's `DeviceBuffer` change.
+  - **G6: PASS** (`gate_g6.log`; dumps in `g6\v6_tp2emu_g6`, `g6\v6_tp2real`, binary hash in
+    `g6\v6_tp2real\binary.sha256`). 10.4's block, output dirs moved under `build\logs\p4\g6`.
+    Emulate on device 1: 4,092 rows in 152.9 s (37.4 ms/row), 20.02 GiB. Real (start 00:56:24,
+    under `tdr_watch.psm1`'s in-run watch, clean): 74.6 s (18.2 ms/row), 20.14 GiB summed over the two
+    cards, wall clock 99.07 / 99.33 MHz. All 4 `*.logprobs.f16` SHA-256-equal (`cpp_source`
+    `58E69454...`, `english_prose` `025AAE0A...`, `python_source` `4E6FB15F...`, `thai_prose`
+    `C04042C7...`), and equal to P2b's `kl_out\v6_tp2emu` dumps (N54) as well. `kl_report.py`, real vs
+    the Rung 4 reference (`gate_kl_v6_tp2real.json`): mean KL **0.03853**, top-1 **91.01%**, 2
+    positions > 1 nat -- N54's emulated numbers exactly (G4's limits 0.0435 / 90.43%).
+  - **G7: PASS** (`gate_g7.log`, `gate_g7_main_<i>_<run>.{out,err}`; 00:59:36-01:02:17, a TDR check
+    30 s after each run, all clean). 11's CLI line (standard protocol, `--max-tokens 256`, `--stats`,
+    default bounding 32/1):
+
+    | Run | Decode | Prefill (29 tok) | Text SHA-256 | `[stats] tp:` |
+    |---|--:|--:|---|---|
+    | greedy 1 | **59.65 tok/s** (84 tok, EOS) | 1191.8 tok/s | `FE60E2A2...03E4` | max_exchange_wait 720 us, max_cap_wait 23.5 ms |
+    | greedy 2 | **59.33 tok/s** | 1175.0 | `FE60E2A2...03E4` | 1560 us, 20.9 ms |
+    | greedy 3 | 58.97 tok/s | 1191.2 | `FE60E2A2...03E4` | 1457 us, 21.1 ms |
+    | sampled 1 (T 0.7, top_k 20, top_p 0.8, seed 1) | 59.19 tok/s (88 tok, EOS) | 1208.7 | `BB6F3529...73A9` | 371 us, 21.4 ms |
+    | sampled 2 | 59.24 tok/s | 1183.0 | `BB6F3529...73A9` | 231 us, 23.3 ms |
+
+    Every run: `ar_calls=11128/288` (greedy) or `11640/288` (sampled), `aborts=0`, `units=2
+    cap_waits=2`; load 5.4-5.6 s (container cached); VRAM 10.01-10.07 GiB used per card, 9.69 GiB of
+    it this process's buffers; warm-up "isolated L(10 KiB)" 6.3-14.7 us (N58: not a latency number).
+    The greedy text is N63's (same SHA-256); N63's 64-token sampled output is a prefix of this
+    88-token one ("Silicon forests rise, / Parallel streams of light flow, / Rendering worlds deep."
+    ...). TP=1 in the same session (G2
+    row 1, device 1, same protocol): 36.06 tok/s (candidate) / 36.11 (baseline), so G7's two runs
+    are **1.65x / 1.65x** (>= 1.45x, stop rule `pass`). Above 52.2 tok/s, so no bounding A/B was run
+    (N57 has it: -0.1% decode).
+  - **G8 stage 1, 5 minutes: PASS** (`soak.ps1 --model <v6> --layout w4a16 --minutes 5 --max-ctx 8192
+    --json build\logs\p4\gate_soak_5min.jsonl`, start 01:03:35, tool exit 01:08:37, in-run watch and
+    final TDR check clean; `gate_soak_5min.log`). 54 iterations (30 sampled, 13 greedy, 11 full row),
+    6 canary runs (the 5 repeats equal to the first), 75,851 tokens in 301 s; load 5.4 s. Summary and
+    teardown lines exit_code 0, 0 aborts, 0 collective allocations, 0 fallback rows; buffer drift
+    0 / 0 MiB (9.78 GiB of `DeviceBuffer` bytes per rank, 10.13 GiB device-wide used, its drift
+    0 / 0 MiB too). Both ranks read the same device-wide 10.1335 GiB throughout, so on this driver
+    `hipMemGetInfo` does not appear to count the desktop's memory on device 0, contrary to N64's
+    premise; G8 gates on the `DeviceBuffer` bytes, so it is unaffected. `ar_calls` 1,964,792 /
+    122,528 (channel 0 / channel 1, the same on both ranks), 31,699 host exchanges, max exchange wait 2.26 ms, 972
+    bounding units with 972 waits, max cap wait 22.95 ms. Decode 59.7-60.2 tok/s sampled, 60.4-61.2
+    greedy, 59.0-60.0 full row; prefill of prompts >= 256 tokens 1429-1534 tok/s.
+  - **G8 stage 2, 60 minutes: PASS** (same line with `--minutes 60 --json
+    build\logs\p4\gate_soak_60min.jsonl`; start 01:10:01, tool exit 02:10:04, in-run watch (every
+    20 s) and final check clean; `gate_soak_60min.log`). 646 iterations (228 sampled, 213 greedy,
+    205 full row), 65 canary runs (the 64 repeats equal to the first), 894,857 tokens in 3,602 s;
+    prompts up to 2,048
+    and decodes up to 512 tokens. Summary and teardown exit_code 0; 0 aborts, 0 collective
+    allocations, 0 fallback rows; buffer drift 0 / 0 MiB (9.78 GiB per rank from load to the end),
+    device-wide used drift 0 / 0 MiB. `ar_calls` 24,072,184 / 1,431,328 (per channel), 387,836 host
+    exchanges, 11,364 bounding units (11,364 waits, max 23.45 ms). Max exchange wait 10.25 ms on rank
+    0 (once, at iteration 591, t = 3,286 s; <= 2.53 ms before it; rank 1's max 2.46 ms): rank 0
+    waiting for rank 1 on the desktop card, well under the 30 s exchange bound. Decode, min-max
+    (mean): sampled 58.7-60.6 (60.03), greedy 59.4-61.5 (60.74), full row 58.1-60.1 (59.59) tok/s;
+    greedy mean 60.77 in the first half hour and 60.72 in the second. Prefill of prompts >= 256
+    tokens 1393-1543 tok/s (means 1494-1498).
+  - **G5's decode stress retry, stage 1 (~5 minutes): PASS** (`ar_stress.ps1 --count 2200000
+    --pattern decode --flush-every 16 --max-inflight 1 --idle-us 500 --json
+    build\logs\p4\gate_stress_5min.json`, 60 MiB / 4 MiB fillers; start 02:11:38, in-run watch and
+    final check clean; `gate_stress_5min.log`). 2,200,064 decode-pattern all-reduces verified
+    bit-exact in 336.6 s (6,536/s, vs 7.26k/s unbounded in N44), 0 mismatches, 0 timeouts, 0 abort
+    exits, 0 skipped blocks; 120,316 synchronized units per rank, max unit wait 6.29 ms. P3's unbounded
+    run had its first TDR 52 s in (N44).
+  - **G5's decode stress retry, stage 2 (the full 10M): PASS** (the same line with `--count 10000000
+    --json build\logs\p4\gate_stress_10M.json`; start 02:18:35, tool exit 02:44:29, in-run watch
+    (every 20 s) and final check clean; `gate_stress_10M.log`). **10,000,000** decode-pattern
+    all-reduces verified bit-exact in 1,553.5 s (6,437/s; 60 s windows ~5.1-6.6k/s), 0 mismatches,
+    0 timeouts, 0 abort exits, 0 skipped blocks; 546,875 synchronized units per rank, max unit wait
+    15.67 ms; wall clock 99.12 / 98.19 MHz. This is the line P3 could not finish (N44: TDR at 1.42M,
+    unbounded). Two desktop events fell inside the run, neither a TDR:
+    - 02:20:57, System `Display` 4125 (informational: Windows applied Auto HDR to an app, i.e. a
+      DirectX program started on the desktop). The stress rate dipped (5 s rates 4.7-6.4k/s) from
+      ~155 s to ~306 s in, then recovered to 6.2-6.6k/s.
+    - 02:26:52, an application crash: `Raycast.exe`, exception 0xe0434352 in `KERNELBASE.dll`; the
+      `.NET Runtime` 1026 event gives the cause as an unhandled `COMException (0x80070490): Element
+      not found` in `NAudio.CoreAudioApi.AudioSessionControl.Finalize()` -- an audio-session
+      finalizer, not a GPU driver module (P3's crash was inside AMD's user-mode D3D driver, N44).
+      As N55 describes, WER then re-logged every queued report at 02:26:53-54 (25 old LiveKernelEvent
+      141 dumps, 2026-08-19 to 2026-09-24 18:52, plus 4 old BlueScreen 116 reports); `tdr_check`
+      ignored all of them by their dump stamps. No 141 with a new dump, no System 4101, no HIP 719.
+  - **No TDR in the whole gate run.** A final `tdr_check.ps1 -Since 2026-09-25 00:32` is clean (the
+    25 re-logged dumps listed as ignored; its output was not saved), besides the per-run checks
+    above. The P4 verifier's own event-log queries over 2026-09-24 20:00 to 2026-09-25 02:55 agree:
+    75 LiveKernelEvent 141 events, all re-logs of 25 old dumps, no System 4101, no HIP 719. Device 0 carried ~1 h
+    40 min of TP load in this run (the -TwoGpu suite, G6's real pass, 5 CLI runs, 65 min of soak, 31
+    min of stress) with the desktop live.
+  - **P4 verdict: every P4 gate passes** -- `run_tests.ps1` (the known N29 failure only) and `-TwoGpu`,
+    G2, G6, G7 (1.65x; stop rule `pass`, so P5 may start), G8 (5 and 60 minutes) -- and G5's
+    unfinished 10M decode-pattern line now passes with `--flush-every 16 --max-inflight 1 --idle-us
+    500`. What this does not cover: long context on two GPUs -- the soak's requests stop at 2,560
+    positions (2,048-token prompts + 512 decode), so N64's context-scaled units (which change nothing
+    below 16k) are still unmeasured on real GPUs past 4k -- and the warm-up's 1500 ms spin timeout on
+    the device-0 rank stays as N64 left it (no warm-up timed out in this run's 13 real-mode loads).
 
 ## Appendix C -- Open questions for the user
 

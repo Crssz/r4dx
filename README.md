@@ -20,7 +20,8 @@ ggml/GGUF. Third-party code is limited to header-only libraries vendored under `
   MXFP4 (e2m1 + e8m0), INT4 g128 W4A16, and INT4 g128 W4A8. Weights are pre-permuted into each
   kernel's WMMA fragment order.
 - **KV cache**: fp8 e4m3, paged in 16-token HND blocks, per-layer per-head static descales.
-- **GPU rule**: only HIP device 1 (`$env:HIP_VISIBLE_DEVICES='1'`) is ever used on this machine.
+- **GPU rule**: only HIP device 1 (`$env:HIP_VISIBLE_DEVICES='1'`) is ever used on this machine,
+  except by tensor parallel (`--tp 2`, below), which uses both cards.
 - See `docs/architecture.md` for the forward-pass module map and `docs/container-format.md` for
   the weight container spec.
 
@@ -264,6 +265,42 @@ the Integrate stage), and w4a16's best sampled `--dflash k=7` cell reaches **154
 on a code prompt (4.28x plain sampled decode's pre-stage cost) -- see `docs/perf.md`'s top section
 for the full matrix (all three sampling configs x both prompts x all three layouts, twice each) and
 `docs/sampling.md` section 12.
+
+### Tensor parallel across both GPUs (`--tp 2`)
+
+`--tp 2` splits the model over this machine's two R9700s: each card holds half of every layer
+(about 10 GiB of VRAM per card at `--max-ctx 2048`, against 17 GiB at TP=1; the 262144 default
+adds KV cache, ~16-17 GiB per card), one process drives both with a thread per
+card, and the two all-reduces per layer go through pinned host memory (the cards have no
+peer-to-peer path). Its output is byte-identical to `--tp-mode emulate` (both halves on one card)
+and its KL against the bf16 reference matches TP=1's (0.03853 vs 0.03856). It is not bit-identical
+to TP=1: the split changes the order of the sums. Design, gates and measurements: `docs/tp.md`
+(Appendix B N65 for the P4 gates).
+
+```powershell
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --tp 2 `
+    --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
+    --max-tokens 256 --max-ctx 2048 --temperature 0 --stats
+```
+
+Flags: `--tp 2` (`--tp-mode real` by default; `emulate` puts both halves on one card), `--tp-devices
+a,b` (default: rank 0 on HIP device 1, rank 1 on device 0), `--tp-ar-timeout-ms` (500), and
+`--tp-submit-layers` / `--tp-max-inflight` (32 / 1: how finely a prefill chunk's GPU work is
+submitted and capped). `--stats` adds per-card VRAM and a `[stats] tp:` line.
+
+Requirements and caveats:
+- Two visible HIP devices: unset `HIP_VISIBLE_DEVICES` (with it set to `1`, `--tp 2` is refused).
+- The production `r4dx-server` stopped: it holds ~28 GiB of device 1.
+- HIP device 0 drives the desktop and cannot preempt compute, so `--tp 2` puts sustained load on the
+  display card. An unbounded all-reduce stress there caused Windows TDRs (GPU resets) in P3
+  (`docs/tp.md` N44). With the submission bounding on, a 60-minute soak and a 10M all-reduce stress
+  ran with the desktop live and no TDR (N65). Long runs go through `tools\tp\soak.ps1`, which stops
+  at the first TDR.
+- Not yet under TP (P5): `--mtp`, `--dflash`, vision / `--image`, and `r4dx-server`.
+
+Measured (2026-09-25, standard protocol): **59.65 / 59.33 tok/s** decode, against 36.06 tok/s at TP=1
+in the same session (1.65x). docs/perf.md has the rest.
 
 ## Run the OpenAI-compatible server
 

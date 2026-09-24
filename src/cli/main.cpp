@@ -31,6 +31,7 @@
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
 #include "r4dx/kernels/sampler.hpp"
 #include "text_model.h"  // r4dx::model::TextModel / LoadTextModel (docs/tp.md 2.8)
+#include "tp_model.h"    // r4dx::model::TpModel::StatsLine (--stats with --tp 2, docs/tp.md 9.1)
 #include "tokenizer.h"
 #include "vision_tower.h"  // src/vision: VisionEncodeStats
 
@@ -457,6 +458,8 @@ int RunMain(int argc, char** argv) {
     tpo.ar_timeout_ms = args.tp_ar_timeout_ms;
     tpo.ar_nb_small = args.tp_ar_nb;
     tpo.ar_nb_large = args.tp_ar_nb_large;
+    if (args.tp_submit_layers >= 0) tpo.submit_layers = args.tp_submit_layers;  // -1: TpOptions' default
+    if (args.tp_max_inflight >= 0) tpo.max_inflight_units = args.tp_max_inflight;
   }
 
   // The pre-load VRAM reading is a HIP call on this thread, which under --tp 2 (the facade thread)
@@ -484,8 +487,10 @@ int RunMain(int argc, char** argv) {
       std::fprintf(stderr, "[stats] container load: %.2fs (--tp 2 --tp-mode %s)\n", Seconds(load_t0, load_t1),
                    args.tp_mode.c_str());
       for (const r4dx::model::VramReport& r : model->Vram()) {
-        std::fprintf(stderr, "[stats] tp rank %d (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB\n",
-                     r.rank, r.device, r.used_gib, r.free_gib, r.total_gib);
+        std::fprintf(stderr,
+                     "[stats] tp rank %d (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; this "
+                     "process's buffers %.2f GiB\n",
+                     r.rank, r.device, r.used_gib, r.free_gib, r.total_gib, r.buffers_gib);
       }
     }
   }
@@ -743,6 +748,20 @@ int RunMain(int argc, char** argv) {
                      // "reduced" only if the container has one AND --mtp-draft-head didn't force
                      // "full" (Model::MtpUsingReducedVocabDraft's own two-condition check).
                      model->MtpUsingReducedVocabDraft() ? "reduced" : "full");
+      }
+      if (args.tp == 2) {
+        // docs/tp.md 9.1: one VRAM line per rank (device-wide, plus this process's own buffers,
+        // Appendix B N64), then the tensor-parallel counters (Appendix B N59 for their time bases).
+        // The TextModel surface has no TP diagnostics (2.8), so reach the facade itself.
+        for (const r4dx::model::VramReport& v : model->Vram()) {
+          std::fprintf(stderr,
+                       "[stats] tp rank %d (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; this "
+                       "process's buffers %.2f GiB\n",
+                       v.rank, v.device, v.used_gib, v.free_gib, v.total_gib, v.buffers_gib);
+        }
+        if (auto* tpm = dynamic_cast<r4dx::model::TpModel*>(model.get())) {
+          std::fprintf(stderr, "[stats] %s\n", tpm->StatsLine().c_str());
+        }
       }
       if (!args.dflash.empty()) {
         const double accept_rate = r.dflash_drafted > 0

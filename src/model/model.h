@@ -52,6 +52,7 @@
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
 #include "tp/tp_vocab.h"   // tp::ArgmaxPair (docs/tp.md 7.3), header-only and HIP-free
+#include "tp/tp_submit.h"  // tp::SubmitBounder (docs/tp.md Appendix B N57); inert at TP=1
 #include "vision_tower.h"  // src/vision: the device-side vision tower (docs/vision.md)
 
 namespace r4dx::model {
@@ -78,6 +79,12 @@ struct TpRankOptions {
   int embed_device_resident_decided = -1;
   bool vision_weights_on_this_rank = true;  // TP: rank 0 only (docs/tp.md 8.3)
   std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;  // TP: one host copy (P5)
+  // TP: bounded GPU submission in prefill chunks (tp/tp_submit.h, docs/tp.md Appendix B N57, N64):
+  // force a submission after every `submit_layers` layers of a prefill chunk (0 = off; fewer layers
+  // past 16k context, tp::UnitLayersForContext), and keep at most `max_inflight_units` such units
+  // queued ahead of the GPU (0 = no cap). TpOptions carries the defaults; both must stay 0 at world 1.
+  int submit_layers = 0;
+  int max_inflight_units = 0;
 };
 
 struct ModelOptions {
@@ -664,6 +671,10 @@ class Model {
   // call it exactly once.
   void TpWarmup();
 
+  // TP only: counters of the prefill submission bounding (docs/tp.md Appendix B N57) -- units forced
+  // and time the cap waited, cumulative since Load. All zero at TP=1 or with submit_layers == 0.
+  const tp::SubmitBounder::Stats& TpSubmitStats() const { return submit_.GetStats(); }
+
  private:
   Model() = default;
 
@@ -808,6 +819,12 @@ class Model {
   // ONE device). Allocated with the rest of the TP scratch in Load.
   core::DeviceBuffer<uint8_t> topk_lse_ws_;
   std::vector<uint8_t> merge_pack_host_;  // TP only: MergeShardResults' send/receive staging
+  // TP only: a prefill chunk forces a submission after every UnitLayersForContext(submit_layers_,
+  // chunk end) layers and waits for the cap (TpRankOptions::submit_layers / max_inflight_units,
+  // docs/tp.md Appendix B N57, N64). Inert (no events, no HIP call) at TP=1 and when
+  // submit_layers_ == 0.
+  tp::SubmitBounder submit_;
+  int64_t submit_layers_ = 0;
 
   // Persistent (not arena-allocated) scratch every full-attention layer's AttentionLayer::Forward
   // shares within one RunChunk call: `positions[t] = pos_ + t` doubles as both the RoPE position

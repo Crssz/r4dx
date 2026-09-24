@@ -84,10 +84,11 @@ target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 # NoopComm (tp/tp_comm_noop.cpp, docs/tp.md 6.4); P3: TpGroup (tp/tp_group.cpp -- the pinned host
 # mailbox, seq base, recovery) and HostMailboxComm (tp/tp_comm_host_mailbox.cpp -- the two-GPU
 # all-reduce of docs/tp.md 6.3); P2b: EmulatedComm (tp/tp_comm_emulated.cpp -- both ranks on one
-# device, docs/tp.md 6.5). The interface itself is header-only in src/core
+# device, docs/tp.md 6.5); P4: SubmitBounder (tp/tp_submit.cpp -- bounded GPU submission under TP,
+# docs/tp.md Appendix B N57). The interface itself is header-only in src/core
 # (r4dx/core/tp_comm.hpp) so the header-only AttentionLayer can call through it.
 add_library(r4dx_tp STATIC tp/tp_comm_noop.cpp tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp
-                           tp/tp_comm_emulated.cpp)
+                           tp/tp_comm_emulated.cpp tp/tp_submit.cpp)
 target_include_directories(r4dx_tp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_tp PUBLIC r4dx_core r4dx_kernels)
 # /EHc-: the r4dx_tp_* entry points are extern "C" but report bad arguments and HIP errors by

@@ -2,6 +2,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 
 namespace r4dx::model {
@@ -22,6 +23,7 @@ std::vector<VramReport> LocalTextModel::Vram() const {
   r.used_gib = static_cast<double>(total_b - free_b) / kGiB;
   r.free_gib = static_cast<double>(free_b) / kGiB;
   r.total_gib = static_cast<double>(total_b) / kGiB;
+  r.buffers_gib = static_cast<double>(core::DeviceBufferBytes(r.device)) / kGiB;
   return {r};
 }
 

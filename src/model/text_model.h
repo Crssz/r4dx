@@ -36,14 +36,28 @@ struct ModelOptions;  // model.h
 // The `--tp*` flags (docs/tp.md 9.1).
 struct TpOptions {
   int world = 1;  // 1 or 2
-  // kReal: one rank per GPU (docs/tp.md P4); kEmulate: both ranks on one device, host-synchronized
-  // exact adds (6.5); kNoop: ONE rank's shard, no-op all-reduce -- timing only, tokens meaningless.
+  // kReal: one rank per GPU, HostMailboxComm (6.3); kEmulate: both ranks on one device,
+  // host-synchronized exact adds (6.5); kNoop: ONE rank's shard, no-op all-reduce -- timing only,
+  // tokens meaningless.
   enum class Mode { kReal, kEmulate, kNoop } mode = Mode::kReal;
   std::vector<int> devices;  // process-visible HIP ordinals, rank r -> entry r; empty = auto (9.2)
   int noop_rank = 0;         // kNoop: which shard to load
   int ar_timeout_ms = 500;   // [10, 1500]
   int ar_nb_small = 4;       // channel 0 blocks
   int ar_nb_large = 4;       // channel 1 blocks
+  // Bounded GPU submission (docs/tp.md Appendix B N57, N64; device 0 drives the desktop and cannot
+  // preempt compute): a prefill chunk forces a submission after every `submit_layers` layers
+  // (0 = off; [0, 64]) and waits until the GPU has at most `max_inflight_units` such units queued
+  // (0 = no cap; [0, 64]). Only under TP, every mode. Default 32 / 1: one forced submission in the
+  // middle of every 64-layer chunk and the second half enqueued only once the first has finished,
+  // so at most half a chunk is ever queued ahead of the GPU -- the cheapest setting that tightens
+  // the chunk-level bound at all: -0.5% prefill tok/s at 2k, no decode cost (N57). Past 16k context
+  // the unit shrinks to 16, 8 and 4 layers (tp::UnitLayersForContext), because attention makes the
+  // chunk longer there. K = 1 synchronizes instead of recording events, which would slow every
+  // later dispatch on the stream (N56), and is the only K that leaves the GPU idle at each unit.
+  // Finer units cost more at 2k (N57's table). Decode steps are not split.
+  int submit_layers = 32;
+  int max_inflight_units = 1;
   // Test-only fault injection. Set by tests directly (and, from docs/tp.md P5, by TpModel::Load from
   // the environment variable R4DX_TP_FAULT="<rank>:<n>:<kind>"). Fires ONCE, at the n-th
   // AllReduceSumBf16 of `rank` counted from the END of warm-up. kind 0: the endpoint throws
@@ -54,11 +68,15 @@ struct TpOptions {
   int fault_kind = 0;
 };
 
-// One rank's device memory, as hipMemGetInfo reports it for that rank's device.
+// One rank's device memory, as hipMemGetInfo reports it for that rank's device (device-wide: other
+// processes included -- on HIP device 0, the desktop), plus this process's own live DeviceBuffer
+// bytes on that device (core::DeviceBufferBytes; under emulation both ranks share one device, so both
+// report the same figure).
 struct VramReport {
   int rank = 0;
   int device = 0;
   double used_gib = 0, free_gib = 0, total_gib = 0;
+  double buffers_gib = 0;
 };
 
 class TextModel {

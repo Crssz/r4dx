@@ -176,6 +176,46 @@ checkpoint that is `341 weighted, 0 fell back`. Anything else means the `.npz` i
 checkpoint and part of the model was quantized unweighted -- the coverage line says `WARNING` and
 goes to stderr in that case.
 
+**`--ldlq <regex>` / `--hessian-dir <dir>` / `--ldlq-damp <f>` -- error-feedback rounding
+(experimental, `docs/quant2.md` Q1).** A third way of choosing the values, again with the byte
+layout, kernels, loader and decode speed untouched. Every linear whose container base name the regex
+matches (`regex_search`, ECMAScript, exactly like `--keep-bf16`; `".*"` = all of them) is rounded by
+GPTQ/LDLQ against its input Hessian `H = E[x x^T]`: columns are quantized one at a time and each
+column's rounding error is pushed onto the not-yet-quantized columns through `chol(H^-1)`, so later
+columns compensate for earlier ones instead of every value being rounded in isolation. Each group's
+scale/zero is the `--quant search` grid weighted by `diag(H)`, picked on the error-updated weights.
+The Hessians come from `tools/reference/hessian_capture.py`: `--hessian-dir` is the directory it
+writes (`hessian.json` + one `.hess` file per distinct linear input, keyed by these same container
+base names). `--ldlq-damp` (default `0.01`) adds `damp x mean(diag H)` to the diagonal before
+factoring; a failed Cholesky is retried at 10x and then 100x the damp, logged, and a third failure is
+a hard error.
+
+```powershell
+.\build\win-hip\src\convert\r4dx-convert.exe `
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-ldlq-mlp.r4dx `
+    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
+    --hessian-dir D:\models\r4dx\qwen38-27b.hessian --ldlq "mlp\."
+```
+
+- Linears the regex does not match follow `--quant` / `--imatrix` exactly as without the flag; the
+  matched ones ignore both.
+- `--keep-bf16` wins for a linear both regexes match (it is not quantized at all).
+- A matched linear with no key in `hessian.json`, or whose `K` there differs from the checkpoint's,
+  is a hard error while *planning* -- before the header is written or a shard is read. A valid regex
+  that matches nothing warns and converts normally. `--ldlq` needs `--hessian-dir`, and neither
+  applies to `--dflash-gguf` (no Hessians are captured for the drafter).
+- The container's `__metadata__.r4dx_convert_run` records `ldlq` (the pattern), `ldlq_damp`,
+  `hessian_dir`, `hessian_manifest_sha256` and `ldlq_linears` (the resolved list). The log has one
+  `ldlq:` line per linear (factor and quantize seconds, `damp_used`, `retries`) and a total at the
+  end; linears sharing an input (`gdn.in_proj_qkv`/`_z`, `attn.qg`/`k`/`v`) reuse one factorization.
+
+No KL number yet: the pilot (`--ldlq "mlp\."` on top of v6) is gate G3 in `docs/quant2.md`, and Q1
+stops there if it does not cut mean KL by at least 10%. (`D:\models\r4dx\qwen38-27b.hessian` is an
+example output directory, not an existing capture.)
+
 ### Generate text
 
 ```powershell

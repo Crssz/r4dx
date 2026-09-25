@@ -77,10 +77,120 @@ struct ImportanceVector {
 
 // ---- w4a16: asymmetric, free integer zero 0..15 ----------------------------------------------
 //
-// Same outputs/argument order as QuantizeInt4Asymmetric, plus `imp`. Degenerate groups (a group
-// whose max == min) bypass the search entirely and take the identical branch quant_int4.hpp takes,
-// so an all-zero or constant group still encodes exactly the way it does today -- searching a
-// zero-width range would only pick an arbitrary member of a set of equally-perfect candidates.
+// One (row, group): `wg` is the group's `group` weights, `wt` its importance weights (nullptr = 1),
+// `rq` / `best_q` caller-owned scratch of `group` entries. Writes the chosen scale/zero and the
+// codes (into `qg`). `refit` = false skips the final least-squares scale refit: LDLQ
+// (quant_ldlq.hpp) picks the grid here but then re-rounds every column after error feedback, so a
+// refit fitted to THESE codes would be fitted to codes it never stores.
+//
+// Degenerate groups (a group whose max == min) bypass the search entirely and take the identical
+// branch quant_int4.hpp takes, so an all-zero or constant group still encodes exactly the way it
+// does today -- searching a zero-width range would only pick an arbitrary member of a set of
+// equally-perfect candidates.
+inline void SearchInt4AsymGroup(const float* wg, const float* wt, int group, bool refit,
+                                int32_t* rq, uint8_t* best_q, uint8_t* qg, float* out_scale,
+                                int* out_zero) {
+  R4DX_NO_FP_CONTRACT
+  float wmin = wg[0], wmax = wg[0];
+  for (int k = 1; k < group; ++k) {
+    wmin = std::min(wmin, wg[k]);
+    wmax = std::max(wmax, wg[k]);
+  }
+  const float range = wmax - wmin;
+
+  // --- degenerate group: byte-identical to QuantizeInt4Asymmetric's special case ---------------
+  if (range <= 0.0f) {
+    float sc;
+    int zp;
+    bool degenerate_zero = false;
+    if (wmax == 0.0f) {
+      sc = 0.0f;
+      zp = 0;
+      degenerate_zero = true;
+    } else {
+      sc = std::fabs(wmax);
+      zp = (wmax >= 0.0f) ? 0 : 15;
+    }
+    *out_scale = sc;
+    *out_zero = zp;
+    for (int k = 0; k < group; ++k) {
+      qg[k] = static_cast<uint8_t>(
+          degenerate_zero ? 0 : ClampInt(RoundHalfAwayFromZero(wg[k] / sc) + zp, 0, 15));
+    }
+    return;
+  }
+
+  const float s0 = std::max(range, 1e-12f) / 15.0f;
+
+  // --- candidate 0: the RTN grid itself (incumbent; later candidates must beat it) -------------
+  float best_sc = s0;
+  int best_z = ClampInt(RoundHalfAwayFromZero(-wmin / s0), 0, 15);
+  float best_err = 0.0f;
+  for (int k = 0; k < group; ++k) {
+    const int qi = ClampInt(RoundHalfAwayFromZero(wg[k] / s0) + best_z, 0, 15);
+    best_q[k] = static_cast<uint8_t>(qi);
+    const float d = wg[k] - s0 * (static_cast<float>(qi) - static_cast<float>(best_z));
+    best_err = best_err + (wt ? wt[k] : 1.0f) * (d * d);
+  }
+
+  // --- the grid: 21 scales x 3 integer zeros around round(-min/scale) --------------------------
+  for (int step = 0; step < kW4SearchSteps; ++step) {
+    const float sc = s0 * W4SearchScaleMult(step);
+    if (!(sc > 0.0f)) continue;
+    for (int k = 0; k < group; ++k) rq[k] = RoundHalfAwayFromZero(wg[k] / sc);
+    const int zc = RoundHalfAwayFromZero(-wmin / sc);
+    for (int dz = -1; dz <= 1; ++dz) {
+      const int z = ClampInt(zc + dz, 0, 15);
+      const float zf = static_cast<float>(z);
+      float err = 0.0f;
+      for (int k = 0; k < group; ++k) {
+        const int qi = ClampInt(rq[k] + z, 0, 15);
+        const float d = wg[k] - sc * (static_cast<float>(qi) - zf);
+        err = err + (wt ? wt[k] : 1.0f) * (d * d);
+      }
+      if (err < best_err) {
+        best_err = err;
+        best_sc = sc;
+        best_z = z;
+        for (int k = 0; k < group; ++k) best_q[k] = static_cast<uint8_t>(ClampInt(rq[k] + z, 0, 15));
+      }
+    }
+  }
+
+  // --- one weighted least-squares refit of the float scale, q and zero held fixed --------------
+  // scale* = sum_k wt_k x_k (q_k - z) / sum_k wt_k (q_k - z)^2, then re-score with the SAME
+  // codes (the stored q bytes are best_q, so the refit must not silently imply a re-rounding).
+  if (refit) {
+    const float zf = static_cast<float>(best_z);
+    float num = 0.0f, den = 0.0f;
+    for (int k = 0; k < group; ++k) {
+      const float t = static_cast<float>(best_q[k]) - zf;
+      const float w_k = wt ? wt[k] : 1.0f;
+      num = num + (w_k * wg[k]) * t;
+      den = den + w_k * (t * t);
+    }
+    if (den > 0.0f) {
+      const float sc2 = num / den;
+      if (sc2 > 0.0f) {
+        float err2 = 0.0f;
+        for (int k = 0; k < group; ++k) {
+          const float d = wg[k] - sc2 * (static_cast<float>(best_q[k]) - zf);
+          err2 = err2 + (wt ? wt[k] : 1.0f) * (d * d);
+        }
+        if (err2 < best_err) {
+          best_err = err2;
+          best_sc = sc2;
+        }
+      }
+    }
+  }
+
+  *out_scale = best_sc;
+  *out_zero = best_z;
+  for (int k = 0; k < group; ++k) qg[k] = best_q[k];
+}
+
+// Same outputs/argument order as QuantizeInt4Asymmetric, plus `imp`.
 inline void QuantizeInt4AsymmetricSearch(const float* w, int N, int K, int group,
                                           const ImportanceVector& imp, int nthreads,
                                           std::vector<uint8_t>& q, std::vector<float>& scale,
@@ -92,116 +202,18 @@ inline void QuantizeInt4AsymmetricSearch(const float* w, int N, int K, int group
   zero.assign(static_cast<size_t>(N) * groups_per_row, 0);
 
   ParallelFor(0, N, nthreads, [&](int64_t r0, int64_t r1) {
-    R4DX_NO_FP_CONTRACT
     std::vector<int32_t> rq(static_cast<size_t>(group));  // round(x/sc), hoisted per candidate scale
     std::vector<uint8_t> best_q(static_cast<size_t>(group));
     for (int64_t row = r0; row < r1; ++row) {
       const float* wr = w + row * K;
       for (int g = 0; g < groups_per_row; ++g) {
-        const float* wg = wr + static_cast<int64_t>(g) * group;
         const int64_t kbase = static_cast<int64_t>(g) * group;
         const size_t gidx = static_cast<size_t>(row) * groups_per_row + g;
-        uint8_t* qg = q.data() + row * static_cast<int64_t>(K) + kbase;
-
-        float wmin = wg[0], wmax = wg[0];
-        for (int k = 1; k < group; ++k) {
-          wmin = std::min(wmin, wg[k]);
-          wmax = std::max(wmax, wg[k]);
-        }
-        const float range = wmax - wmin;
-
-        // --- degenerate group: byte-identical to QuantizeInt4Asymmetric's special case ---------
-        if (range <= 0.0f) {
-          float sc;
-          int zp;
-          bool degenerate_zero = false;
-          if (wmax == 0.0f) {
-            sc = 0.0f;
-            zp = 0;
-            degenerate_zero = true;
-          } else {
-            sc = std::fabs(wmax);
-            zp = (wmax >= 0.0f) ? 0 : 15;
-          }
-          scale[gidx] = sc;
-          zero[gidx] = static_cast<uint8_t>(zp);
-          for (int k = 0; k < group; ++k) {
-            qg[k] = static_cast<uint8_t>(
-                degenerate_zero ? 0 : ClampInt(RoundHalfAwayFromZero(wg[k] / sc) + zp, 0, 15));
-          }
-          continue;
-        }
-
-        const float s0 = std::max(range, 1e-12f) / 15.0f;
-
-        // --- candidate 0: the RTN grid itself (incumbent; later candidates must beat it) -------
-        float best_sc = s0;
-        int best_z = ClampInt(RoundHalfAwayFromZero(-wmin / s0), 0, 15);
-        float best_err = 0.0f;
-        for (int k = 0; k < group; ++k) {
-          const int qi = ClampInt(RoundHalfAwayFromZero(wg[k] / s0) + best_z, 0, 15);
-          best_q[k] = static_cast<uint8_t>(qi);
-          const float d = wg[k] - s0 * (static_cast<float>(qi) - static_cast<float>(best_z));
-          best_err = best_err + imp.at(kbase + k) * (d * d);
-        }
-
-        // --- the grid: 21 scales x 3 integer zeros around round(-min/scale) --------------------
-        for (int step = 0; step < kW4SearchSteps; ++step) {
-          const float sc = s0 * W4SearchScaleMult(step);
-          if (!(sc > 0.0f)) continue;
-          for (int k = 0; k < group; ++k) rq[k] = RoundHalfAwayFromZero(wg[k] / sc);
-          const int zc = RoundHalfAwayFromZero(-wmin / sc);
-          for (int dz = -1; dz <= 1; ++dz) {
-            const int z = ClampInt(zc + dz, 0, 15);
-            const float zf = static_cast<float>(z);
-            float err = 0.0f;
-            for (int k = 0; k < group; ++k) {
-              const int qi = ClampInt(rq[k] + z, 0, 15);
-              const float d = wg[k] - sc * (static_cast<float>(qi) - zf);
-              err = err + imp.at(kbase + k) * (d * d);
-            }
-            if (err < best_err) {
-              best_err = err;
-              best_sc = sc;
-              best_z = z;
-              for (int k = 0; k < group; ++k)
-                best_q[k] = static_cast<uint8_t>(ClampInt(rq[k] + z, 0, 15));
-            }
-          }
-        }
-
-        // --- one weighted least-squares refit of the float scale, q and zero held fixed --------
-        // scale* = sum_k wt_k x_k (q_k - z) / sum_k wt_k (q_k - z)^2, then re-score with the SAME
-        // codes (the stored q bytes are best_q, so the refit must not silently imply a re-rounding).
-        {
-          const float zf = static_cast<float>(best_z);
-          float num = 0.0f, den = 0.0f;
-          for (int k = 0; k < group; ++k) {
-            const float t = static_cast<float>(best_q[k]) - zf;
-            const float wt = imp.at(kbase + k);
-            num = num + (wt * wg[k]) * t;
-            den = den + wt * (t * t);
-          }
-          if (den > 0.0f) {
-            const float sc2 = num / den;
-            if (sc2 > 0.0f) {
-              float err2 = 0.0f;
-              for (int k = 0; k < group; ++k) {
-                const float d =
-                    wg[k] - sc2 * (static_cast<float>(best_q[k]) - zf);
-                err2 = err2 + imp.at(kbase + k) * (d * d);
-              }
-              if (err2 < best_err) {
-                best_err = err2;
-                best_sc = sc2;
-              }
-            }
-          }
-        }
-
-        scale[gidx] = best_sc;
-        zero[gidx] = static_cast<uint8_t>(best_z);
-        for (int k = 0; k < group; ++k) qg[k] = best_q[k];
+        int zp = 0;
+        SearchInt4AsymGroup(wr + kbase, imp.empty() ? nullptr : imp.data + kbase, group,
+                            /*refit=*/true, rq.data(), best_q.data(),
+                            q.data() + row * static_cast<int64_t>(K) + kbase, &scale[gidx], &zp);
+        zero[gidx] = static_cast<uint8_t>(zp);
       }
     }
   });
@@ -214,6 +226,78 @@ inline void QuantizeInt4AsymmetricSearch(const float* w, int N, int K, int group
 // the only free parameter is the scale. The search therefore sweeps the same 21 multipliers around
 // amax/7 with the zero held at 8, and refits. Degenerate (all-zero) groups bypass the search and
 // take today's `max(amax, 1e-12)/7` branch unchanged.
+//
+// SearchInt4Pinned8Group is one (row, group), with the same `wt` / `refit` meaning as
+// SearchInt4AsymGroup.
+inline void SearchInt4Pinned8Group(const float* wg, const float* wt, int group, bool refit,
+                                   uint8_t* best_q, uint8_t* qg, float* out_scale) {
+  R4DX_NO_FP_CONTRACT
+  float amax = std::fabs(wg[0]);
+  for (int k = 1; k < group; ++k) amax = std::max(amax, std::fabs(wg[k]));
+  const float s0 = std::max(amax, 1e-12f) / 7.0f;
+
+  if (amax <= 0.0f) {  // every code is 8; searching the scale of an all-zero group is moot
+    *out_scale = s0;
+    for (int k = 0; k < group; ++k) qg[k] = 8;
+    return;
+  }
+
+  float best_sc = s0;
+  float best_err = 0.0f;
+  for (int k = 0; k < group; ++k) {
+    const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / s0), -8, 7);
+    best_q[k] = static_cast<uint8_t>(qs + 8);
+    const float d = wg[k] - s0 * static_cast<float>(qs);
+    best_err = best_err + (wt ? wt[k] : 1.0f) * (d * d);
+  }
+
+  for (int step = 0; step < kW4SearchSteps; ++step) {
+    const float sc = s0 * W4SearchScaleMult(step);
+    if (!(sc > 0.0f)) continue;
+    float err = 0.0f;
+    for (int k = 0; k < group; ++k) {
+      const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / sc), -8, 7);
+      const float d = wg[k] - sc * static_cast<float>(qs);
+      err = err + (wt ? wt[k] : 1.0f) * (d * d);
+    }
+    if (err < best_err) {
+      best_err = err;
+      best_sc = sc;
+      for (int k = 0; k < group; ++k) {
+        const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / sc), -8, 7);
+        best_q[k] = static_cast<uint8_t>(qs + 8);
+      }
+    }
+  }
+
+  if (refit) {
+    float num = 0.0f, den = 0.0f;
+    for (int k = 0; k < group; ++k) {
+      const float t = static_cast<float>(best_q[k]) - 8.0f;
+      const float w_k = wt ? wt[k] : 1.0f;
+      num = num + (w_k * wg[k]) * t;
+      den = den + w_k * (t * t);
+    }
+    if (den > 0.0f) {
+      const float sc2 = num / den;
+      if (sc2 > 0.0f) {
+        float err2 = 0.0f;
+        for (int k = 0; k < group; ++k) {
+          const float d = wg[k] - sc2 * (static_cast<float>(best_q[k]) - 8.0f);
+          err2 = err2 + (wt ? wt[k] : 1.0f) * (d * d);
+        }
+        if (err2 < best_err) {
+          best_err = err2;
+          best_sc = sc2;
+        }
+      }
+    }
+  }
+
+  *out_scale = best_sc;
+  for (int k = 0; k < group; ++k) qg[k] = best_q[k];
+}
+
 inline void QuantizeInt4Pinned8Search(const float* w, int N, int K, int group,
                                        const ImportanceVector& imp, int nthreads,
                                        std::vector<uint8_t>& q, std::vector<float>& scale) {
@@ -223,80 +307,15 @@ inline void QuantizeInt4Pinned8Search(const float* w, int N, int K, int group,
   scale.assign(static_cast<size_t>(N) * groups_per_row, 0.0f);
 
   ParallelFor(0, N, nthreads, [&](int64_t r0, int64_t r1) {
-    R4DX_NO_FP_CONTRACT
     std::vector<uint8_t> best_q(static_cast<size_t>(group));
     for (int64_t row = r0; row < r1; ++row) {
       const float* wr = w + row * K;
       for (int g = 0; g < groups_per_row; ++g) {
-        const float* wg = wr + static_cast<int64_t>(g) * group;
         const int64_t kbase = static_cast<int64_t>(g) * group;
         const size_t gidx = static_cast<size_t>(row) * groups_per_row + g;
-        uint8_t* qg = q.data() + row * static_cast<int64_t>(K) + kbase;
-
-        float amax = std::fabs(wg[0]);
-        for (int k = 1; k < group; ++k) amax = std::max(amax, std::fabs(wg[k]));
-        const float s0 = std::max(amax, 1e-12f) / 7.0f;
-
-        if (amax <= 0.0f) {  // every code is 8; searching the scale of an all-zero group is moot
-          scale[gidx] = s0;
-          for (int k = 0; k < group; ++k) qg[k] = 8;
-          continue;
-        }
-
-        float best_sc = s0;
-        float best_err = 0.0f;
-        for (int k = 0; k < group; ++k) {
-          const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / s0), -8, 7);
-          best_q[k] = static_cast<uint8_t>(qs + 8);
-          const float d = wg[k] - s0 * static_cast<float>(qs);
-          best_err = best_err + imp.at(kbase + k) * (d * d);
-        }
-
-        for (int step = 0; step < kW4SearchSteps; ++step) {
-          const float sc = s0 * W4SearchScaleMult(step);
-          if (!(sc > 0.0f)) continue;
-          float err = 0.0f;
-          for (int k = 0; k < group; ++k) {
-            const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / sc), -8, 7);
-            const float d = wg[k] - sc * static_cast<float>(qs);
-            err = err + imp.at(kbase + k) * (d * d);
-          }
-          if (err < best_err) {
-            best_err = err;
-            best_sc = sc;
-            for (int k = 0; k < group; ++k) {
-              const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / sc), -8, 7);
-              best_q[k] = static_cast<uint8_t>(qs + 8);
-            }
-          }
-        }
-
-        {
-          float num = 0.0f, den = 0.0f;
-          for (int k = 0; k < group; ++k) {
-            const float t = static_cast<float>(best_q[k]) - 8.0f;
-            const float wt = imp.at(kbase + k);
-            num = num + (wt * wg[k]) * t;
-            den = den + wt * (t * t);
-          }
-          if (den > 0.0f) {
-            const float sc2 = num / den;
-            if (sc2 > 0.0f) {
-              float err2 = 0.0f;
-              for (int k = 0; k < group; ++k) {
-                const float d = wg[k] - sc2 * (static_cast<float>(best_q[k]) - 8.0f);
-                err2 = err2 + imp.at(kbase + k) * (d * d);
-              }
-              if (err2 < best_err) {
-                best_err = err2;
-                best_sc = sc2;
-              }
-            }
-          }
-        }
-
-        scale[gidx] = best_sc;
-        for (int k = 0; k < group; ++k) qg[k] = best_q[k];
+        SearchInt4Pinned8Group(wr + kbase, imp.empty() ? nullptr : imp.data + kbase, group,
+                               /*refit=*/true, best_q.data(),
+                               q.data() + row * static_cast<int64_t>(K) + kbase, &scale[gidx]);
       }
     }
   });
@@ -314,6 +333,54 @@ inline void QuantizeInt4Pinned8Search(const float* w, int N, int K, int group,
 // existing quantizer already works in Python floats (float64) and the reconstruction
 // `sign * magnitude * 2^(raw-127)` is exactly representable in both, so float64 on both sides is
 // the *easier* bit-exact contract here, not the harder one.
+//
+// SearchMxfp4Group is one (row, group): `wg` the group's `group` weights, `wt` its importance
+// weights (nullptr = 1), `codes` caller-owned scratch of `group` entries. Writes the chosen E8M0
+// raw exponent to `out_raw` and the chosen e2m1 codes to `best_codes`. There is no refit to skip
+// here (the exponent is the only parameter), so LDLQ (quant_ldlq.hpp) calls it unchanged and keeps
+// only `out_raw`, re-encoding every column itself after error feedback.
+inline void SearchMxfp4Group(const float* wg, const float* wt, int group, uint8_t* codes,
+                             uint8_t* best_codes, int* out_raw) {
+  float amax = 0.0f;
+  for (int k = 0; k < group; ++k) amax = std::max(amax, std::fabs(wg[k]));
+
+  int best_raw;
+  if (amax <= 0.0f) {
+    best_raw = 0;
+    for (int k = 0; k < group; ++k) best_codes[k] = EncodeE2M1(wg[k] / std::ldexp(1.0f, -127));
+  } else {
+    const int e = static_cast<int>(std::ceil(std::log2(amax / 6.0)));
+    const int raw0 = ClampInt(e + 127, 0, 254);
+    best_raw = raw0;
+    double best_err = 0.0;
+    // candidate 0 = today's round-up exponent (incumbent, kept on ties)
+    for (int cand = 0; cand < 2; ++cand) {
+      const int raw = (cand == 0) ? raw0 : raw0 - 1;
+      if (raw < 0) continue;
+      const double scale = std::ldexp(1.0, raw - 127);
+      const float scale_f = std::ldexp(1.0f, raw - 127);
+      double err = 0.0;
+      for (int k = 0; k < group; ++k) {
+        const uint8_t code = EncodeE2M1(wg[k] / scale_f);
+        codes[k] = code;
+        const double mag = static_cast<double>(kE2M1Magnitude[code & 0x7]);
+        const double recon = ((code & 0x8) ? -mag : mag) * scale;
+        const double d = static_cast<double>(wg[k]) - recon;
+        err = err + static_cast<double>(wt ? wt[k] : 1.0f) * (d * d);
+      }
+      if (cand == 0) {
+        best_err = err;
+        for (int k = 0; k < group; ++k) best_codes[k] = codes[k];
+      } else if (err < best_err) {
+        best_err = err;
+        best_raw = raw;
+        for (int k = 0; k < group; ++k) best_codes[k] = codes[k];
+      }
+    }
+  }
+  *out_raw = best_raw;
+}
+
 inline Mxfp4Quantized QuantizeMxfp4Search(const float* w, int N, int K, int group,
                                            const ImportanceVector& imp, int nthreads) {
   RequireDivisible(K, group, "K", "QuantizeMxfp4Search");
@@ -332,43 +399,9 @@ inline Mxfp4Quantized QuantizeMxfp4Search(const float* w, int N, int K, int grou
       for (int g = 0; g < groups_per_row; ++g) {
         const float* wg = wr + static_cast<int64_t>(g) * group;
         const int64_t kbase = static_cast<int64_t>(g) * group;
-        float amax = 0.0f;
-        for (int k = 0; k < group; ++k) amax = std::max(amax, std::fabs(wg[k]));
-
-        int best_raw;
-        if (amax <= 0.0f) {
-          best_raw = 0;
-          for (int k = 0; k < group; ++k) best_codes[k] = EncodeE2M1(wg[k] / std::ldexp(1.0f, -127));
-        } else {
-          const int e = static_cast<int>(std::ceil(std::log2(amax / 6.0)));
-          const int raw0 = ClampInt(e + 127, 0, 254);
-          best_raw = raw0;
-          double best_err = 0.0;
-          // candidate 0 = today's round-up exponent (incumbent, kept on ties)
-          for (int cand = 0; cand < 2; ++cand) {
-            const int raw = (cand == 0) ? raw0 : raw0 - 1;
-            if (raw < 0) continue;
-            const double scale = std::ldexp(1.0, raw - 127);
-            const float scale_f = std::ldexp(1.0f, raw - 127);
-            double err = 0.0;
-            for (int k = 0; k < group; ++k) {
-              const uint8_t code = EncodeE2M1(wg[k] / scale_f);
-              codes[k] = code;
-              const double mag = static_cast<double>(kE2M1Magnitude[code & 0x7]);
-              const double recon = ((code & 0x8) ? -mag : mag) * scale;
-              const double d = static_cast<double>(wg[k]) - recon;
-              err = err + static_cast<double>(imp.at(kbase + k)) * (d * d);
-            }
-            if (cand == 0) {
-              best_err = err;
-              for (int k = 0; k < group; ++k) best_codes[k] = codes[k];
-            } else if (err < best_err) {
-              best_err = err;
-              best_raw = raw;
-              for (int k = 0; k < group; ++k) best_codes[k] = codes[k];
-            }
-          }
-        }
+        int best_raw = 0;
+        SearchMxfp4Group(wg, imp.empty() ? nullptr : imp.data + kbase, group, codes.data(),
+                         best_codes.data(), &best_raw);
 
         out.escale[static_cast<size_t>(row) * groups_per_row + g] = static_cast<uint8_t>(best_raw);
         row_max_raw = std::max(row_max_raw, static_cast<uint8_t>(best_raw));

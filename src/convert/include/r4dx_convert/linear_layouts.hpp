@@ -9,11 +9,13 @@
 #pragma once
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/quant_int4.hpp"
+#include "r4dx_convert/quant_ldlq.hpp"
 #include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -72,6 +74,14 @@ struct QuantOptions {
   // Per-input-channel importance weights of length K, or empty for unweighted MSE. Ignored
   // entirely when mode == kRtn.
   ImportanceVector importance;
+  // LDLQ error-feedback rounding (docs/quant2.md 2.2, quant_ldlq.hpp): when non-null, EVERY
+  // quantized layout this call emits goes through the *Ldlq quantizer against this factor instead,
+  // and `mode`/`importance` are ignored for this linear (the per-group grid inside LDLQ is weighted
+  // by the factor's own diag(H), which is what the imatrix approximates anyway). Same byte layout,
+  // same packers -- only the q/scale/zero values change, exactly like --quant. Non-owning: the
+  // factor lives in r4dx_convert::HessianStore's cache (src/convert/main.cpp's --ldlq), and must
+  // outlive the EmitLinearLayouts call. bf16 emission is unaffected.
+  const LdlqFactor* ldlq = nullptr;
 };
 
 inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, int N, int K,
@@ -108,7 +118,15 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
 inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
                                const std::vector<float>& w, int N, int K, const LayoutSet& layouts,
                                int nthreads, const QuantOptions& opts = QuantOptions{}) {
-  const bool search = (opts.mode == QuantMode::kSearch);
+  const LdlqFactor* ldlq = opts.ldlq;
+  const bool search = (ldlq == nullptr) && (opts.mode == QuantMode::kSearch);
+  // A factor for a different K would read U out of bounds (or, worse, in bounds with the wrong
+  // stride). The CLI already checks the manifest's K during planning; this is the backstop for any
+  // other caller.
+  if (ldlq != nullptr && (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) && ldlq->K != K) {
+    throw std::runtime_error("EmitLinearLayouts: '" + base + "' has K=" + std::to_string(K) +
+                             " but its LDLQ factor was built for K=" + std::to_string(ldlq->K));
+  }
   if (layouts.bf16) {
     auto bytes = EncodeBf16(w);
     writer.WriteTensor(base + ".bf16.w", bytes.data(), bytes.size());
@@ -116,7 +134,9 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
   if (layouts.w4a16) {
     std::vector<uint8_t> q, zero;
     std::vector<float> scale;
-    if (search)
+    if (ldlq != nullptr)
+      QuantizeInt4AsymmetricLdlq(w.data(), N, K, kW4A16Group, *ldlq, nthreads, q, scale, zero);
+    else if (search)
       QuantizeInt4AsymmetricSearch(w.data(), N, K, kW4A16Group, opts.importance, nthreads, q, scale,
                                    zero);
     else
@@ -129,7 +149,9 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
   if (layouts.w4a8) {
     std::vector<uint8_t> q;
     std::vector<float> scale;
-    if (search)
+    if (ldlq != nullptr)
+      QuantizeInt4Pinned8Ldlq(w.data(), N, K, kW4A8Group, *ldlq, nthreads, q, scale);
+    else if (search)
       QuantizeInt4Pinned8Search(w.data(), N, K, kW4A8Group, opts.importance, nthreads, q, scale);
     else
       QuantizeInt4SymmetricPinned8(w.data(), N, K, kW4A8Group, nthreads, q, scale);
@@ -139,10 +161,11 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     writer.WriteTensor(base + ".w4a8.ws", ws.data(), ws.size() * 4);
   }
   if (layouts.mxfp4) {
-    Mxfp4Quantized mq = search
-                            ? QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, opts.importance,
-                                                  nthreads)
-                            : QuantizeMxfp4(w.data(), N, K, kMxfp4Group, nthreads);
+    Mxfp4Quantized mq =
+        ldlq != nullptr ? QuantizeMxfp4Ldlq(w.data(), N, K, kMxfp4Group, *ldlq, nthreads)
+        : search        ? QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, opts.importance,
+                                              nthreads)
+                        : QuantizeMxfp4(w.data(), N, K, kMxfp4Group, nthreads);
     auto wq = PackMxfp4Wq(mq.packed, N, K, nthreads);
     auto ws = PackMxfp4Ws(mq.escale, N, K, kMxfp4Group);
     writer.WriteTensor(base + ".mxfp4.wq", wq.data(), wq.size());

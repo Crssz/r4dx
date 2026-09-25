@@ -9,6 +9,8 @@
 //                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
 //                [--quant {rtn,search}] [--imatrix <tools/reference/imatrix_capture.py .npz>]
 //                [--keep-bf16 <ECMAScript regex over container base names>]
+//                [--hessian-dir <tools/reference/hessian_capture.py output dir>
+//                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //
 // --keep-bf16 (docs/validation.md "Milestone 11 / sensitivity", keep_bf16.hpp) writes every linear
 // whose container base name the regex matches as `<base>.bf16.w` ONLY, skipping every quantized
@@ -36,6 +38,28 @@
 // `--quant search --imatrix <npz>` (w4a16 0.0534 / 89.30%, docs/validation.md "Milestone 10"), and
 // it has to be asked for explicitly so that a plain `r4dx-convert --input ... --output ...` keeps
 // reproducing every container built before these flags existed.
+//
+// --ldlq <regex> (docs/quant2.md section 2, quant_ldlq.hpp) is a third way of choosing the values,
+// again with the byte layout untouched: every linear whose container base name the regex matches
+// (regex_SEARCH, ECMAScript, exactly like --keep-bf16; ".*" = every linear) is rounded column by
+// column with GPTQ/LDLQ error feedback against its input Hessian H = E[x x^T], read from the
+// directory tools/reference/hessian_capture.py writes (--hessian-dir, required; its hessian.json maps
+// these same base names to .hess files, several bases sharing one file where they share an input).
+// Each group's (scale, zero) comes from the `search` grid weighted by diag(H), on the error-updated
+// weights, without the final refit. For those linears --quant/--imatrix are ignored; every other
+// linear follows --quant/--imatrix exactly as without the flag. --ldlq-damp (default 0.01) is the
+// relative Tikhonov damping, H += damp * mean(diag H) * I, retried at 10x and 100x on a failed
+// Cholesky. Precedence and failure modes, all deliberate:
+//   - --keep-bf16 wins over --ldlq for a linear both match (it is not quantized at all);
+//   - a matching linear with no manifest key, or whose manifest K differs from the checkpoint's, is
+//     a hard error during PLANNING -- before the header is written or a single shard read -- not a
+//     silent fallback: a partially-LDLQ'd container measured as "LDLQ" would poison the KL table;
+//   - a VALID regex that matches nothing warns (stderr) and converts normally, like --keep-bf16;
+//   - --ldlq without --hessian-dir, or with --dflash-gguf (no Hessians exist for the drafter), is an
+//     argument error.
+// __metadata__.r4dx_convert_run records the pattern, the damp, the directory, hessian.json's sha256
+// and the resolved list of LDLQ'd bases; each LDLQ'd linear logs its factor/emit seconds, damp_used
+// and retry count, and the run ends with a one-line total.
 //
 // --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
 // lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
@@ -69,6 +93,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -76,6 +101,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -89,10 +115,12 @@
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
+#include "r4dx_convert/hessian_store.hpp"
 #include "r4dx_convert/keep_bf16.hpp"
 #include "r4dx_convert/kv_calib.hpp"
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/npz_reader.hpp"
+#include "r4dx_convert/quant_ldlq.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -234,6 +262,16 @@ struct AppArgs {
   // only (r4dx_convert::KeepBf16Selector, keep_bf16.hpp). Empty (default) = every linear is
   // quantized exactly as before this flag existed, byte for byte.
   std::string keep_bf16;
+
+  // LDLQ error-feedback rounding (docs/quant2.md section 2; this file's header comment). `ldlq` is an
+  // ECMAScript regex over container base names, empty (default) = no linear is LDLQ'd and every
+  // container is byte-identical to one built before these flags existed. `hessian_dir` is
+  // tools/reference/hessian_capture.py's output directory (hessian.json + *.hess). `ldlq_damp` is the
+  // RELATIVE damping (times mean(diag H)); 0 is allowed (the H = I gate in convert_quant_ldlq uses
+  // it), negative/non-finite is rejected.
+  std::string ldlq;
+  std::string hessian_dir;
+  float ldlq_damp = 0.01f;
 };
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
@@ -274,6 +312,19 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--quant") a.quant = next(i);
     else if (arg == "--imatrix") a.imatrix = next(i);
     else if (arg == "--keep-bf16") a.keep_bf16 = next(i);
+    else if (arg == "--ldlq") a.ldlq = next(i);
+    else if (arg == "--hessian-dir") a.hessian_dir = next(i);
+    else if (arg == "--ldlq-damp") {
+      const std::string v = next(i);
+      size_t used = 0;
+      try {
+        a.ldlq_damp = std::stof(v, &used);
+      } catch (const std::exception&) {
+        used = 0;
+      }
+      if (used != v.size() || !std::isfinite(a.ldlq_damp) || a.ldlq_damp < 0.0f)
+        throw std::runtime_error("--ldlq-damp must be a finite number >= 0, got '" + v + "'");
+    }
     else throw std::runtime_error("unknown argument: " + arg);
   }
   if (a.quant != "rtn" && a.quant != "search")
@@ -296,6 +347,19 @@ AppArgs ParseArgs(int argc, char** argv) {
   if (!a.keep_bf16.empty() && !a.dflash_gguf.empty())
     throw std::runtime_error("--keep-bf16 does not apply to --dflash-gguf (use --layout bf16 for a "
                              "bf16 drafter container)");
+  // --ldlq has nothing to round against without the Hessians; failing here rather than at the first
+  // matching linear keeps "forgot a flag" a one-second error instead of a mid-plan one.
+  if (!a.ldlq.empty() && a.hessian_dir.empty())
+    throw std::runtime_error("--ldlq requires --hessian-dir <tools/reference/hessian_capture.py "
+                             "output directory>");
+  // hessian_capture.py captures the main model's linear inputs only (docs/quant2.md 1.2: "LDLQ for
+  // the DFlash2 drafter" is a non-goal), and its keys are the Qwen container's base names -- the
+  // drafter shares none of them, so the flags could only ever be a no-op there. Same reasoning as
+  // --imatrix/--keep-bf16 above.
+  if ((!a.ldlq.empty() || !a.hessian_dir.empty()) && !a.dflash_gguf.empty())
+    throw std::runtime_error("--ldlq/--hessian-dir do not apply to --dflash-gguf (no Hessians are "
+                             "captured for the drafter; tools/reference/hessian_capture.py only "
+                             "covers the main model's linears)");
   return a;
 }
 
@@ -357,6 +421,179 @@ class ImatrixSource {
   std::unique_ptr<r4dx_convert::NpzReader> npz_;
   std::mutex mu_;
   int64_t hit_ = 0, missing_ = 0;
+};
+
+bool HasQuantizedLayout(const LayoutSet& ls) { return ls.w4a16 || ls.w4a8 || ls.mxfp4; }
+
+double SecondsBetween(std::chrono::steady_clock::time_point a,
+                      std::chrono::steady_clock::time_point b) {
+  return std::chrono::duration<double>(b - a).count();
+}
+
+// The `--ldlq <regex>` selector plus the HessianStore behind it (docs/quant2.md 2.2-2.3).
+//
+// The decision "is this linear LDLQ'd" is made ONCE per linear by the caller (add_linear), from
+// Matches() + the linear's resolved LayoutSet, and captured by value in both the plan and the emit
+// lambda -- the same discipline --keep-bf16 uses, so the two passes cannot disagree. Plan() is the
+// planning-pass half: it checks the manifest (key present, K equal, K a whole number of 128-column
+// LDLQ blocks, every emitted layout's group dividing the block) and the key's .hess file on disk
+// (header and exact size, no payload read), and records the base, so a stale or partial Hessian
+// directory dies before the header is written and before a single shard is read. (A file whose
+// payload is corrupt but correctly sized -- non-finite values, trace mismatch -- is still only
+// caught when Factor() reads it.) Factor()/Record() are the emit-pass half.
+//
+// Not thread-safe, and it does not need to be: both passes run their job lists sequentially (the
+// parallelism is INSIDE each quantizer), and the store's one-entry cache relies on that order --
+// adjacent linears sharing a tap (gdn.in_proj_qkv/z, attn.qg/k/v) are emitted back to back, so they
+// factor once.
+class LdlqSource {
+ public:
+  // quant_ldlq.hpp's column-block width (docs/quant2.md 2.2: B = 128). The quantizers throw on
+  // K % 128 != 0 themselves; checking it here moves that failure from the emit pass to planning.
+  static constexpr int64_t kBlock = 128;
+
+  LdlqSource(const std::string& pattern, const std::string& hessian_dir, float damp)
+      : pattern_(pattern), dir_(hessian_dir), damp_(damp) {
+    if (pattern_.empty()) {
+      // ParseArgs already rejects --ldlq without --hessian-dir; the reverse is merely pointless, but
+      // it usually means the --ldlq half of a copy-pasted command line went missing.
+      if (!dir_.empty())
+        std::cerr << "[r4dx-convert] WARNING: --hessian-dir given without --ldlq -- ignored, no "
+                     "linear is LDLQ'd\n";
+      return;
+    }
+    try {
+      re_ = std::regex(pattern_, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+      throw std::runtime_error("--ldlq: invalid ECMAScript regex '" + pattern_ + "': " + e.what());
+    }
+    // Parses (and validates the format/version of) hessian.json right here, at startup: a wrong
+    // directory is a one-second error, not a mid-plan one.
+    store_ = std::make_unique<r4dx_convert::HessianStore>(dir_);
+    enabled_ = true;
+  }
+
+  bool Enabled() const { return enabled_; }
+  const std::string& Pattern() const { return pattern_; }
+  const std::string& Dir() const { return dir_; }
+  float Damp() const { return damp_; }
+  std::string ManifestSha256() const { return store_ ? store_->ManifestSha256() : std::string(); }
+  // The LDLQ'd bases, in container (= planning) order. Filled by Plan(); complete once the planning
+  // pass is over, which is before the metadata that records it is built.
+  const std::vector<std::string>& Linears() const { return planned_; }
+
+  bool Matches(const std::string& container_base) const {
+    return enabled_ && std::regex_search(container_base, re_);
+  }
+
+  // Planning pass, for a linear the caller decided to LDLQ. Throws on any manifest problem.
+  void Plan(const std::string& container_base, int64_t K, const LayoutSet& ls) {
+    if (!store_->Has(container_base)) {
+      throw std::runtime_error(
+          "--ldlq '" + pattern_ + "' selects '" + container_base + "' but " + dir_ +
+          "/hessian.json has no key for it -- capture it with tools/reference/hessian_capture.py "
+          "(the MTP draft head needs its --draft-head) or narrow the regex");
+    }
+    const int64_t hk = store_->KOf(container_base);
+    if (hk != K) {
+      throw std::runtime_error("--ldlq: '" + container_base + "' has K=" + std::to_string(K) +
+                               " in this checkpoint but " + dir_ + "/hessian.json says K=" +
+                               std::to_string(hk) + " (" + store_->File(container_base) +
+                               ") -- the Hessians were captured against a different checkpoint");
+    }
+    if (K % kBlock != 0) {
+      throw std::runtime_error("--ldlq: '" + container_base + "' has K=" + std::to_string(K) +
+                               ", not a multiple of the LDLQ block width " +
+                               std::to_string(kBlock));
+    }
+    // quant_ldlq.hpp also needs every emitted layout's group to tile the block (a group never
+    // straddles two blocks). w4a8 (128) and mxfp4 (32) always do; w4a16's group is the build's
+    // R4DX_W4A16_GROUP, which may be any multiple of 64 (192, 256, ... do not divide 128).
+    auto require_group = [&](bool on, int group, const char* layout) {
+      if (on && kBlock % group != 0) {
+        throw std::runtime_error("--ldlq: '" + container_base + "' emits " + layout +
+                                 " with group " + std::to_string(group) +
+                                 ", which does not divide the LDLQ block width " +
+                                 std::to_string(kBlock) + " -- LDLQ needs a build with group <= " +
+                                 std::to_string(kBlock) + " or drop " + layout + " from --layouts");
+      }
+    };
+    require_group(ls.w4a16, r4dx_convert::kW4A16Group, "w4a16");
+    require_group(ls.w4a8, r4dx_convert::kW4A8Group, "w4a8");
+    require_group(ls.mxfp4, r4dx_convert::kMxfp4Group, "mxfp4");
+    // The file itself (header, size, K/rows vs the manifest), each distinct file once.
+    store_->CheckFile(container_base);
+    planned_.push_back(container_base);
+  }
+
+  // Planning pass, for a linear the regex matched but that is NOT LDLQ'd: --keep-bf16 won, or the
+  // run asked for no quantized layout of it (e.g. `--lm-head bf16`). Counted, so the summary line
+  // can say why the selection is smaller than the regex suggests.
+  void NoteSkipped() { ++skipped_; }
+
+  // Emit pass. `*reused` = this base shares its Hessian file with the linear emitted just before it
+  // (same tap), i.e. the store's cached factorization was returned rather than a new one computed.
+  const r4dx_convert::LdlqFactor& Factor(const std::string& container_base, int64_t K, int threads,
+                                         bool* reused) {
+    const std::string file = store_->File(container_base);
+    *reused = (file == last_file_);
+    last_file_ = file;
+    return store_->Factor(container_base, K, damp_, threads);
+  }
+
+  // Emit pass, after the linear is written: the per-linear log line and the run totals.
+  void Record(const std::string& container_base, int64_t N, int64_t K, double factor_s,
+              double emit_s, const r4dx_convert::LdlqFactor& f, bool reused, std::ostream& log) {
+    ++done_;
+    if (!reused) ++factorizations_;
+    if (f.retries > 0) ++retried_;
+    factor_s_ += factor_s;
+    emit_s_ += emit_s;
+    log << "[r4dx-convert] ldlq: " << container_base << " [" << N << "," << K << "] factor "
+        << factor_s << " s" << (reused ? " (shared tap, cached)" : "") << ", quantize+write "
+        << emit_s << " s, damp_used=" << f.damp_used << " retries=" << f.retries << "\n";
+  }
+
+  // After the planning pass (before the long emit pass), like KeepBf16Selector::Report. A valid
+  // regex that selects nothing is a WARNING on stderr, not an error: same sweep-script reasoning as
+  // --keep-bf16, and a container built that way is still an ordinary --quant container.
+  void ReportPlan(std::ostream& log, std::ostream& warn) const {
+    if (!enabled_) return;
+    if (planned_.empty()) {
+      warn << "[r4dx-convert] WARNING: --ldlq '" << pattern_ << "' selected no quantized linear"
+           << (skipped_ > 0 ? " (" + std::to_string(skipped_) +
+                                  " match(es) are bf16-only: --keep-bf16 or no 4-bit layout)"
+                            : std::string())
+           << " -- every linear follows --quant/--imatrix as usual\n";
+      return;
+    }
+    log << "[r4dx-convert] ldlq '" << pattern_ << "': " << planned_.size()
+        << " linear(s) selected, damp=" << damp_ << ", hessian-dir=" << dir_
+        << " (hessian.json sha256 " << store_->ManifestSha256() << ")";
+    if (skipped_ > 0) log << "; " << skipped_ << " other match(es) are bf16-only, not LDLQ'd";
+    log << "\n";
+  }
+
+  // End of run. LDLQ'd linears never consult --imatrix, so they are in neither count of the imatrix
+  // coverage line -- said here so the two lines add up.
+  void ReportRun(std::ostream& log) const {
+    if (!enabled_ || planned_.empty()) return;
+    log << "[r4dx-convert] ldlq: " << done_ << " linear(s) quantized with LDLQ ("
+        << factorizations_ << " factorization(s), " << factor_s_ << " s; quantize+write "
+        << emit_s_ << " s; " << retried_ << " needed a damping retry) -- not counted in the "
+        << "imatrix coverage line\n";
+  }
+
+ private:
+  std::string pattern_, dir_;
+  float damp_ = 0.0f;
+  bool enabled_ = false;
+  std::regex re_;
+  std::unique_ptr<r4dx_convert::HessianStore> store_;
+  std::vector<std::string> planned_;
+  int64_t skipped_ = 0, done_ = 0, factorizations_ = 0, retried_ = 0;
+  double factor_s_ = 0.0, emit_s_ = 0.0;
+  std::string last_file_;
 };
 
 r4dx_convert::QuantMode ParseQuantMode(const std::string& s) {
@@ -430,6 +667,15 @@ int RunConvert(const AppArgs& args) {
     std::cout << "[r4dx-convert] keep-bf16=" << keep_bf16.Pattern()
               << " (matching linears written as <base>.bf16.w only)\n";
 
+  // --ldlq (LdlqSource): regex compiled and hessian.json parsed here, before the first shard is
+  // opened; the per-linear manifest checks run in the planning pass below.
+  LdlqSource ldlq(args.ldlq, args.hessian_dir, args.ldlq_damp);
+  if (ldlq.Enabled())
+    std::cout << "[r4dx-convert] ldlq=" << ldlq.Pattern() << " damp=" << ldlq.Damp()
+              << " hessian-dir=" << ldlq.Dir()
+              << " (matching linears: LDLQ error-feedback rounding; --quant/--imatrix ignored for "
+                 "them)\n";
+
   const bool have_kv_calib = !args.kv_calib.empty();
   nlohmann::json kv_calib_json;
   if (have_kv_calib) {
@@ -487,15 +733,50 @@ int RunConvert(const AppArgs& args) {
       writer.WriteTensor(container_name, bytes.data(), bytes.size());
     });
   };
+  // The one emit path for every linear that may be quantized (add_linear and the MTP draft head), so
+  // the LDLQ-vs-imatrix choice cannot drift between the two sites. `use_ldlq` is the caller's
+  // already-resolved decision. Every add_linear fuses on the OUTPUT axis only (mlp.gate_up is the
+  // only fusion and both halves share K), so one length-K importance vector -- and one K x K Hessian
+  // -- per container base is well defined; tools/reference/imatrix_capture.py and
+  // hessian_capture.py assert the same thing from the other side.
+  auto emit_linear = [&writer, &imatrix, &ldlq, quant_mode, threads](
+                         const std::string& container_base, const std::vector<float>& w, int64_t N,
+                         int64_t K, const LayoutSet& ls, bool use_ldlq) {
+    if (!use_ldlq) {
+      r4dx_convert::EmitLinearLayouts(writer, container_base, w, static_cast<int>(N),
+                                       static_cast<int>(K), ls, threads,
+                                       imatrix.For(container_base, K));
+      return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    bool reused = false;
+    // A reference into the store's one-entry cache: valid until the next Factor() call, which is
+    // the next LDLQ'd linear's emit -- i.e. strictly after this EmitLinearLayouts returns.
+    const r4dx_convert::LdlqFactor& f = ldlq.Factor(container_base, K, threads, &reused);
+    const auto t1 = std::chrono::steady_clock::now();
+    r4dx_convert::QuantOptions opts;
+    opts.mode = quant_mode;  // ignored once opts.ldlq is set; kept so the struct reads truthfully
+    opts.ldlq = &f;
+    r4dx_convert::EmitLinearLayouts(writer, container_base, w, static_cast<int>(N),
+                                     static_cast<int>(K), ls, threads, opts);
+    const auto t2 = std::chrono::steady_clock::now();
+    ldlq.Record(container_base, N, K, SecondsBetween(t0, t1), SecondsBetween(t1, t2), f, reused,
+                std::cout);
+  };
+
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
                          LayoutSet requested) {
-    // --keep-bf16 decides per container base name, which is known here -- so plan and emit cannot
-    // disagree about what this linear is (the two lambdas below capture the SAME resolved `ls`,
-    // rather than each re-evaluating the regex).
+    // --keep-bf16 and --ldlq decide per container base name, which is known here -- so plan and
+    // emit cannot disagree about what this linear is (the two lambdas below capture the SAME
+    // resolved `ls` / `use_ldlq`, rather than each re-evaluating a regex). --keep-bf16 wins: a kept
+    // linear has no quantized layout left to round, and neither has one whose run asked for bf16
+    // only (`--lm-head bf16`), so LDLQ applies only when some 4-bit layout survives.
     const bool kept = keep_bf16.Matches(container_base);
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
-    plan_jobs.push_back([&writer, &model, &keep_bf16, hf_names, container_base, ls, requested,
-                          kept]() {
+    const bool ldlq_matched = ldlq.Matches(container_base);
+    const bool use_ldlq = ldlq_matched && HasQuantizedLayout(ls);
+    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, hf_names, container_base, ls,
+                          requested, kept, ldlq_matched, use_ldlq]() {
       int64_t N = 0, K = 0;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
@@ -506,10 +787,15 @@ int RunConvert(const AppArgs& args) {
         keep_bf16.Record(container_base, static_cast<int>(N), static_cast<int>(K), requested,
                          std::cout);
       }
+      // The manifest + file check lives HERE, in planning, so a missing key / wrong K / missing or
+      // truncated .hess / group not dividing the LDLQ block aborts before
+      // FinalizeHeader and before the first shard is read.
+      if (use_ldlq) ldlq.Plan(container_base, K, ls);
+      else if (ldlq_matched) ldlq.NoteSkipped();
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
     });
-    emit_jobs.push_back([&writer, &model, &imatrix, hf_names, container_base, ls, threads]() {
+    emit_jobs.push_back([&model, &emit_linear, hf_names, container_base, ls, use_ldlq]() {
       std::vector<float> w;
       int64_t K = 0;
       for (auto& n : hf_names) {
@@ -518,12 +804,7 @@ int RunConvert(const AppArgs& args) {
         w.insert(w.end(), part.begin(), part.end());
       }
       const int64_t N = static_cast<int64_t>(w.size()) / K;
-      // Every add_linear fuses on the OUTPUT axis only (mlp.gate_up is the only fusion and both
-      // halves share K), so one length-K importance vector per container base is well defined --
-      // tools/reference/imatrix_capture.py asserts the same thing from the other side.
-      r4dx_convert::EmitLinearLayouts(writer, container_base, w, static_cast<int>(N),
-                                       static_cast<int>(K), ls, threads,
-                                       imatrix.For(container_base, K));
+      emit_linear(container_base, w, N, K, ls, use_ldlq);
     });
   };
 
@@ -651,21 +932,31 @@ int RunConvert(const AppArgs& args) {
       const bool draft_head_kept = keep_bf16.Matches("mtp.draft_head.lm_head");
       const LayoutSet draft_head_layouts =
           draft_head_kept ? r4dx_convert::KeptBf16LayoutSet() : layouts;
-      plan_jobs.push_back([&writer, &model, &keep_bf16, draft_vocab_size, draft_head_layouts,
-                            layouts, draft_head_kept]() {
+      // --ldlq likewise, resolved once with add_linear's rule. The draft head's Hessian is the MTP
+      // layer's post-`mtp.norm` hidden (hessian_capture.py writes mtp.draft_head.hess only under
+      // --draft-head), never lm_head's -- so a regex like "lm_head$" that reaches this head against
+      // a directory captured without --draft-head is the planning-time "no key" error, by design.
+      const bool draft_head_ldlq_matched = ldlq.Matches("mtp.draft_head.lm_head");
+      const bool draft_head_ldlq =
+          draft_head_ldlq_matched && HasQuantizedLayout(draft_head_layouts);
+      plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, draft_vocab_size, draft_head_layouts,
+                            layouts, draft_head_kept, draft_head_ldlq_matched, draft_head_ldlq]() {
         const auto& m = model.Meta("lm_head.weight");
         const int64_t hidden_k = m.shape[1];
         if (draft_head_kept) {
           keep_bf16.Record("mtp.draft_head.lm_head", static_cast<int>(draft_vocab_size),
                            static_cast<int>(hidden_k), layouts, std::cout);
         }
+        if (draft_head_ldlq) ldlq.Plan("mtp.draft_head.lm_head", hidden_k, draft_head_layouts);
+        else if (draft_head_ldlq_matched) ldlq.NoteSkipped();
         r4dx_convert::PlanLinearLayouts(writer, "mtp.draft_head.lm_head",
                                          static_cast<int>(draft_vocab_size),
                                          static_cast<int>(hidden_k), draft_head_layouts);
         writer.Plan("mtp.draft_head.vocab_ids", {draft_vocab_size, 4},
                     static_cast<uint64_t>(draft_vocab_size) * 4);
       });
-      emit_jobs.push_back([&writer, &model, &imatrix, draft_ids, draft_head_layouts, threads]() {
+      emit_jobs.push_back([&writer, &model, &emit_linear, draft_ids, draft_head_layouts,
+                           draft_head_ldlq]() {
         const auto full = r4dx_convert::ReadTensorAsFloat(model, "lm_head.weight");
         const int64_t hidden_k = model.Meta("lm_head.weight").shape[1];
         const int64_t vocab_full = static_cast<int64_t>(full.size()) / hidden_k;
@@ -684,11 +975,10 @@ int RunConvert(const AppArgs& args) {
         // Its input distribution is the MTP layer's post-`mtp.norm` hidden, NOT the backbone's, so
         // it must never borrow `lm_head`'s vector -- imatrix_capture.py emits its own
         // `mtp.draft_head.lm_head` only under --draft-head, and without that key this falls back to
-        // unweighted MSE (with the usual warning) rather than silently mis-weighting.
-        r4dx_convert::EmitLinearLayouts(writer, "mtp.draft_head.lm_head", sliced,
-                                         static_cast<int>(draft_ids.size()),
-                                         static_cast<int>(hidden_k), draft_head_layouts, threads,
-                                         imatrix.For("mtp.draft_head.lm_head", hidden_k));
+        // unweighted MSE (with the usual warning) rather than silently mis-weighting. (Same rule
+        // for its Hessian under --ldlq, see above.)
+        emit_linear("mtp.draft_head.lm_head", sliced, static_cast<int64_t>(draft_ids.size()),
+                    hidden_k, draft_head_layouts, draft_head_ldlq);
         writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
       });
     }
@@ -700,6 +990,7 @@ int RunConvert(const AppArgs& args) {
   // After planning (every add_linear's shapes are known by now), before the header is written --
   // so the summary/"matched nothing" warning lands ahead of the long emit pass rather than after it.
   keep_bf16.Report(std::cout, std::cerr);
+  ldlq.ReportPlan(std::cout, std::cerr);
 
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";
@@ -755,6 +1046,16 @@ int RunConvert(const AppArgs& args) {
                                             : args.keep_bf16},
       {"keep_bf16_linears", keep_bf16.Matched()},
       {"keep_bf16_extra_bytes", keep_bf16.ExtraBytes()},
+      // --ldlq (docs/quant2.md 2.3): pattern + resolved base list for the same reason as keep_bf16
+      // above, plus the damp and the exact Hessian set (directory AND hessian.json's sha256 -- the
+      // path alone says nothing once the directory is re-captured). Linears NOT in ldlq_linears
+      // were chosen by quant_values/imatrix exactly as before.
+      {"ldlq", ldlq.Enabled() ? args.ldlq : std::string("none")},
+      {"ldlq_damp", ldlq.Enabled() ? nlohmann::json(ldlq.Damp()) : nlohmann::json(nullptr)},
+      {"hessian_dir", ldlq.Enabled() ? args.hessian_dir : std::string("none")},
+      {"hessian_manifest_sha256",
+       ldlq.Enabled() ? ldlq.ManifestSha256() : std::string("none")},
+      {"ldlq_linears", ldlq.Linears()},
   };
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
@@ -763,6 +1064,7 @@ int RunConvert(const AppArgs& args) {
   for (auto& j : emit_jobs) j();
   writer.Finish();
   imatrix.ReportCoverage();
+  ldlq.ReportRun(std::cout);
 
   const auto t1 = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -805,11 +1107,21 @@ int RunSelftest(const AppArgs& args) {
   // --imatrix passed here must carry a "selftest" vector of length K -- that is what
   // tools/convert_ref/selftest_compare.py generates for its weighted pass.
   ImatrixSource imatrix(args.imatrix, ParseQuantMode(args.quant));
-  const r4dx_convert::QuantOptions opts = imatrix.For("selftest", K);
+  // --ldlq works here too, against a --hessian-dir whose hessian.json has a "selftest" key of this
+  // K: the whole CLI path (regex -> manifest check -> factor -> *Ldlq quantizers -> packers) on one
+  // small tensor, without a checkpoint or a capture run. Same resolution rule as add_linear.
+  LdlqSource ldlq(args.ldlq, args.hessian_dir, args.ldlq_damp);
+  const bool ldlq_matched = ldlq.Matches("selftest");
+  const bool use_ldlq = ldlq_matched && HasQuantizedLayout(layouts);
+  r4dx_convert::QuantOptions opts;
+  if (!use_ldlq) opts = imatrix.For("selftest", K);
 
   ContainerWriter writer;
   if (kept) keep_bf16.Record("selftest", N, K, requested, std::cout);
   keep_bf16.Report(std::cout, std::cerr);
+  if (use_ldlq) ldlq.Plan("selftest", K, layouts);
+  else if (ldlq_matched) ldlq.NoteSkipped();
+  ldlq.ReportPlan(std::cout, std::cerr);
   r4dx_convert::PlanLinearLayouts(writer, "selftest", N, K, layouts);
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";
@@ -817,13 +1129,31 @@ int RunSelftest(const AppArgs& args) {
   metadata["produced_by"] = "r4dx-convert --selftest";
   metadata["quant"] = BuildQuantMetadata();
   writer.FinalizeHeader(args.selftest_output, metadata);
-  r4dx_convert::EmitLinearLayouts(writer, "selftest", w, N, K, layouts, threads, opts);
+  if (use_ldlq) {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool reused = false;
+    const r4dx_convert::LdlqFactor& f = ldlq.Factor("selftest", K, threads, &reused);
+    const auto t1 = std::chrono::steady_clock::now();
+    opts.mode = ParseQuantMode(args.quant);
+    opts.ldlq = &f;
+    r4dx_convert::EmitLinearLayouts(writer, "selftest", w, N, K, layouts, threads, opts);
+    const auto t2 = std::chrono::steady_clock::now();
+    ldlq.Record("selftest", N, K, SecondsBetween(t0, t1), SecondsBetween(t1, t2), f, reused,
+                std::cout);
+  } else {
+    r4dx_convert::EmitLinearLayouts(writer, "selftest", w, N, K, layouts, threads, opts);
+  }
   writer.Finish();
 
-  std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " quant=" << args.quant
-            << (opts.importance.empty() ? " (unweighted MSE)" : " (imatrix-weighted)") << " -> "
-            << args.selftest_output << "\n";
+  std::cout << "[r4dx-convert --selftest] N=" << N << " K=" << K << " quant="
+            << (use_ldlq ? std::string("ldlq (damp ") + std::to_string(args.ldlq_damp) + ")"
+                         : args.quant)
+            << (use_ldlq                   ? " (Hessian-weighted)"
+                : opts.importance.empty() ? " (unweighted MSE)"
+                                          : " (imatrix-weighted)")
+            << " -> " << args.selftest_output << "\n";
   imatrix.ReportCoverage();
+  ldlq.ReportRun(std::cout);
   return 0;
 }
 

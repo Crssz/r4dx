@@ -29,6 +29,18 @@ target_compile_definitions(convert_quant_search PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME convert_quant_search COMMAND convert_quant_search)
 
+# --ldlq (docs/quant2.md section 2.2, gate G1): dense_linalg.hpp's GEMM / Cholesky / triangular
+# inverse against double references (bit-identical across thread counts and the AVX-512 / scalar
+# paths), FactorHessian's damping and retry, H = I reproducing the no-refit group search byte for
+# byte, a proxy-loss win of at least 20% over search+diag(H) on correlated inputs for all three
+# layouts, thread-count-independent output bytes, HessianStore on fixtures/hess_small (written by
+# tools/reference/hessian_capture.py --write-fixture), and the packers accepting LDLQ output. CPU-only.
+add_executable(convert_quant_ldlq test_quant_ldlq.cpp)
+target_link_libraries(convert_quant_ldlq PRIVATE r4dx_convert)
+target_compile_definitions(convert_quant_ldlq PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_quant_ldlq COMMAND convert_quant_ldlq)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

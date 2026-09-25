@@ -1,0 +1,110 @@
+{
+  "files": {
+    "a.hess": {
+      "K": 128,
+      "rows": 1024,
+      "trace": 477.5871845036745,
+      "sum_upper": 2291.152532234468,
+      "min_diag": 0.13330358266830444,
+      "max_diag": 201.8722381591797,
+      "bytes": 33088,
+      "sha256": "ae779c5ca46aa045159133c266eabcc6807c891e3ab42838a67ef732d4e27e2b",
+      "samples": [
+        [
+          0,
+          0,
+          2.4643404483795166
+        ],
+        [
+          0,
+          1,
+          1.0473307371139526
+        ],
+        [
+          1,
+          0,
+          1.0473307371139526
+        ],
+        [
+          64,
+          42,
+          0.16832275688648224
+        ],
+        [
+          42,
+          64,
+          0.16832275688648224
+        ],
+        [
+          127,
+          0,
+          0.013486740179359913
+        ],
+        [
+          127,
+          127,
+          0.8078742027282715
+        ]
+      ]
+    },
+    "bc.hess": {
+      "K": 256,
+      "rows": 2048,
+      "trace": 1289.5973924063146,
+      "sum_upper": 5204.015263409851,
+      "min_diag": 0.039300382137298584,
+      "max_diag": 499.8450622558594,
+      "bytes": 131648,
+      "sha256": "b0488ad9fe877075d51e6777be338f78c71af5bc8f43bc68c3228bb64d3739c9",
+      "samples": [
+        [
+          0,
+          0,
+          1.452940821647644
+        ],
+        [
+          0,
+          1,
+          0.7076709270477295
+        ],
+        [
+          1,
+          0,
+          0.7076709270477295
+        ],
+        [
+          128,
+          85,
+          -0.023055387660861015
+        ],
+        [
+          85,
+          128,
+          -0.023055387660861015
+        ],
+        [
+          255,
+          0,
+          -0.0011020114179700613
+        ],
+        [
+          255,
+          255,
+          0.36700430512428284
+        ]
+      ]
+    }
+  },
+  "keys": {
+    "t.a": "a.hess",
+    "t.b": "bc.hess",
+    "t.c": "bc.hess"
+  },
+  "manifest_sha256": "55256857d9c8d7ffea6efc067a9e1aa1b1f12d4f8a36c72d78a5a5512a3de2a2",
+  "semantics": {
+    "trace": "f64 sum of the stored fp32 diagonal (== the header's trace field)",
+    "sum_upper": "exactly-rounded (math.fsum) f64 sum of all K*(K+1)/2 stored fp32 entries",
+    "samples": "[i, j, H[i][j]] of the full symmetric expansion; values are exact fp32",
+    "manifest_sha256": "sha256 of hessian.json's bytes (HessianStore::ManifestSha256)"
+  }
+}

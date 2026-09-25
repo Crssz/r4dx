@@ -1064,6 +1064,180 @@ the identical command put `text.layers.32.mlp.down`'s top channel at `0.254157` 
 documents, and 3.4x below the 8e-3 noise floor a squared bf16 activation has anyway. Ordering,
 which is all a weighted quantizer consumes, is unaffected.
 
+## hessian_capture.py
+
+```powershell
+# no GPU: corpus sizes, the file list, the disk estimate
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py --dry-run
+
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+    --out-dir D:\models\r4dx\hessian-v1
+```
+
+The **input Hessians** `r4dx-convert --ldlq` needs (docs/quant2.md section 2, phase Q1). For a
+linear `y = x W^T` the mean squared output error of a quantized `Wq` over a calibration set is
+`tr((W - Wq) H (W - Wq)^T)` with
+
+```
+H = mean over calibration tokens of x x^T      (x = the linear's INPUT activation, [K, K])
+```
+
+`imatrix_capture.py`'s vector is exactly `diag(H)`. LDLQ needs the whole matrix: the correlations
+between input channels are what let the rounding error of column `k` be compensated on the columns
+after it. Like the imatrix it changes no byte layout -- it is an input to a better choice of
+`q/scale/zero` for the same containers and kernels.
+
+**Layer-major, unlike `imatrix_capture.py`.** A Hessian accumulator is `[K, K]` fp64 (`mlp.down`'s
+alone is 2.3 GiB), so all of them at once would be ~200 GiB. The loop is therefore inverted: every
+calibration sequence is embedded once, then for each text layer the layer is materialized ONCE
+(`StreamingReference.build_layer`) and every sequence's hidden state is pushed through it with
+exactly the call `StreamingReference._forward_manual` makes (`attention_mask=None` on
+`linear_attention` layers, the additive causal mask otherwise, `_manual_rope`'s partial-rope
+`(cos, sin)`). Only one layer's accumulators are resident at a time (<= 3.2 GiB); they are written
+to disk and freed before the next layer is built. The only state carried between layers is the
+hidden states of all sequences (1.6 GiB bf16 for the default corpus; on the device when <= 6 GiB,
+else on the host -- `--hidden-device`).
+
+**Taps.** One Hessian per distinct linear INPUT, hooked (`forward_pre_hook`) on ONE representative
+module; `hessian.json`'s `keys` maps every converter container base name to the file it reads:
+
+| layer type | file | representative module | container keys served |
+|---|---|---|---|
+| GDN | `L{i:02d}.in.hess` | `linear_attn.in_proj_qkv` | `gdn.in_proj_qkv`, `gdn.in_proj_z` |
+| GDN | `L{i:02d}.out.hess` | `linear_attn.out_proj` | `gdn.out_proj` |
+| attention | `L{i:02d}.in.hess` | `self_attn.q_proj` | `attn.qg`, `attn.k`, `attn.v` |
+| attention | `L{i:02d}.out.hess` | `self_attn.o_proj` | `attn.o` |
+| both | `L{i:02d}.mlp_in.hess` | `mlp.gate_proj` | `mlp.gate_up` |
+| both | `L{i:02d}.mlp_mid.hess` | `mlp.down_proj` | `mlp.down` |
+| head | `lm_head.hess` | `ref.model.norm` of the last layer's output | `lm_head` |
+| MTP | `mtp.in.hess`, `mtp.out.hess`, `mtp.mlp_in.hess`, `mtp.mlp_mid.hess` | the MTP layer's `q_proj`/`o_proj`/`gate_proj`/`down_proj` | `mtp.attn.qg`, `mtp.attn.o`, `mtp.mlp.gate_up`, `mtp.mlp.down` |
+| MTP | `mtp.draft_head.hess` (`--draft-head` only) | post-`mtp.norm` hidden | `mtp.draft_head.lm_head` |
+
+The key set and each key's tap come from `imatrix_capture.enumerate_quantized_linears` (imported,
+not copied), whose table `audit_converter_source` re-derives from `src/convert/main.cpp`'s text on
+every run -- a new `add_linear` stops the script instead of producing a set with a hole in it.
+`verify_no_k_concat` re-checks that no fused tensor concatenates on `K`. `lm_head`'s input is the
+stack output through the model's own final-norm module (what `forward_hidden`, and so the imatrix,
+applies); the MTP head is driven by `imatrix_capture.MtpTaps` unchanged, fed the PRE-final-norm
+hidden per sequence, with `result.accums` pre-populated by Hessian accumulators that are duck-typed
+to its `ChannelAccum` (`.k`, `.rows`, `.update(x)`) -- `T-1` rows per sequence there, as in the
+imatrix. `--no-mtp` skips the head.
+
+**Numerics.** Per sequence, `x` (bf16) is upcast to fp32 and `x^T x` is one fp32 GEMM (TF32
+explicitly off; <= 2048 products per entry, each exact in fp32), added in place into an fp64
+device accumulator. `H = acc / rows` is rounded to fp32 once, on write.
+
+**File format** (little-endian), one per tap, `<out-dir>/<file>.hess`:
+
+```
+[8]  magic "R4DXHES1"
+[4]  u32 K
+[4]  u32 flags            (bit 0 = packed upper triangle; always set in v1, a reader rejects others)
+[8]  u64 rows             (tokens accumulated)
+[8]  f64 trace            (sum of the STORED fp32 diagonal)
+[32] reserved (zero)
+then K*(K+1)/2 float32: H[i][j] for i = 0..K-1, j = i..K-1   (row-major packed upper triangle)
+```
+
+`write_hess_file` is the one writer (the capture and `--write-fixture` both call it); it writes to
+`<file>.tmp` and renames, and `read_hess_file` is its Python mirror of `hessian_store.hpp`'s reader.
+`<out-dir>/hessian.json`: `{"format": "r4dx-hessian", "version": 1, "files": {"<file>": {"K",
+"rows", "trace"}}, "keys": {"<container base name>": "<file>"}, ...}` plus provenance: the corpus
+(every source with sha256 and token counts), `config_sha256`, the converter audit, the per-tap
+module and keys, per-file min/max diagonal, the gates, versions, wall time and peak VRAM. **The
+manifest is written last**, and an existing one is deleted before a capture starts (`--force`
+required to reuse a directory that has one), so a crashed run leaves a directory the converter
+refuses instead of a half-valid set.
+
+**Corpus** (~171k tokens, 86 sequences, each its own fresh context):
+
+- `calib.txt` + `kv_calib_corpus/` -- `kv_calibrate_full.collect_corpus`, exactly the imatrix
+  corpus, each file truncated to `--seq-len`;
+- the first `--wikitext-seqs` (64) non-overlapping `--seq-len` (2048) token windows of
+  `D:/models/wikitext-2-raw/wiki.train.raw`, from the start (only a prefix is tokenized; the last
+  256 tokens of that prefix are discarded, so the cut cannot change a kept token);
+- `--code-seqs` (16) windows of this repo's own `*.cpp/*.h/*.hpp/*.hip/*.py` (tracked files,
+  `git ls-files`), sorted, concatenated with one `==> path <==` header line per file, CRLF
+  normalized to LF (so the tokens and the recorded sha256 do not depend on `core.autocrlf`). The
+  windows are spread evenly over the whole concatenation so kernels, model, server, tests and
+  tooling are all represented rather than only the alphabetically first directory. Excluded:
+  `third_party/` and `src/tokenizer/vendor/` (vendored, not this repo's code -- the latter is
+  llama.cpp's unicode range tables), and -- to stay disjoint from the held-out KL
+  corpus -- `src/model/model.cpp`, `tools/reference/layer_golden.py` (the `kl_corpus/` excerpts'
+  sources) and anything under `tools/reference/kl_corpus/`.
+
+`--dry-run` (under `%USERPROFILE%\dev\.venv`, transformers 5.3.0, CPU-only torch -- token counts
+under the reference venv may differ slightly):
+
+```
+[hessian] converter audit (src/convert/main.cpp): text=10 mtp=4 add_linear shapes, direct PlanLinearLayouts=['mtp.draft_head.lm_head', 'selftest']
+[hessian] corpus: 86 sequences, 171268 tokens (2.4s to tokenize)
+    calib       1 seq    1755 tok  calib
+    ...
+    wikitext   64 seq  131072 tok  D:\models\wikitext-2-raw\wiki.train.raw
+    code       16 seq   32768 tok  code
+[hessian] 341 converter linears -> 261 taps; selected 261 file(s) serving 341 key(s), text layers 0..63
+    L00.in.hess            K= 5120 rows~ 171268     50.0 MiB  text.layers.0.gdn.in_proj_qkv,text.layers.0.gdn.in_proj_z
+    ...
+    mtp.mlp_mid.hess       K=17408 rows~ 171182    578.0 MiB  mtp.mlp.down
+[hessian] disk estimate 47.66 GiB for 261 file(s)
+```
+
+### Gates (recorded under `hessian.json` `gates`; exit code 1 if any fails)
+
+A set whose gates fail is written as `hessian.failed.json` instead of `hessian.json` -- the full
+report is kept, but `r4dx-convert --hessian-dir` refuses the directory (it only opens
+`hessian.json`), so a failed set cannot be converted against by accident. A new capture into the
+same `--out-dir` deletes a stale `hessian.failed.json` before it starts.
+
+- `converter_audit_ok` -- as imatrix gate (a) part 1; a failing audit stops the script before any
+  work.
+- `keys_selected_ok` / `complete` -- every selected converter key is in `keys`; `complete`
+  additionally requires EVERY converter linear (341 for the production container) and the
+  shared-input check on both layer types. `--keys` / `--layers` runs are never `complete`.
+- `k_ok` -- every file's `K` is the checkpoint's in-features (from the safetensors headers); an
+  accumulator also refuses any hook input of a different width.
+- `finite_ok`, `min_diag_ok` (`min_diag` and the file it is in are recorded).
+- `rows_ok` -- `rows >= 4 x K` for every file (a K = 17408 Hessian from fewer rows is badly
+  rank-deficient and LDLQ leans on damping alone); a failure is printed as a boxed warning.
+- `shared_input_ok` -- on the first GDN layer and the first attention layer, `in_proj_z` /
+  `k_proj` / `v_proj` / `up_proj` are hooked as well and must receive the SAME storage
+  (`data_ptr`, shape, stride) with equal values as their representative, on every sequence.
+
+**Safety.** The capture refuses unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`; `--dry-run`
+and `--write-fixture` never touch `torch.cuda` and are exempt. Before capturing it checks that the
+`--out-dir` drive has at least 1.1x the disk estimate free.
+
+**Options**: `--model-dir`, `--out-dir` (default `D:\models\r4dx\hessian-v1`), `--force`,
+`--corpus-dir`/`--calib-txt` (`none` to skip), `--wikitext` (`none` to skip), `--wikitext-seqs`,
+`--code-seqs`, `--seq-len`, `--no-mtp`, `--draft-head`, `--layers N` (SMOKE: first N text layers
+only; lm_head/MTP then see layer N-1's output, so their files are written but given NO key in
+`keys` -- no converter run can LDLQ them from a smoke set -- and the manifest says `smoke: true`),
+`--keys REGEX`
+(write only taps serving a matching key -- `re.search`, like `--keep-bf16` -- e.g. `'mlp\.'` for the
+G3 pilot, which also matches `mtp.mlp.*` exactly as the converter's `--ldlq "mlp\."` will),
+`--hidden-device auto|cuda|cpu`, `--dry-run`, `--write-fixture DIR`.
+
+**Expected cost** (not yet measured -- a GPU run is handed to the user): the dominant work is the
+`mlp.down` GEMM, `17408^2 x 2048 x 2` FLOP per sequence and layer, ~7 PFLOP over the whole run;
+writing ~48 GiB. The design budget is 30-60 min on device 1 with the server stopped.
+
+**Test fixture.** `--write-fixture DIR` needs no checkpoint, no torch and no GPU (numpy only). It
+writes `tests/convert/fixtures/hess_small/`: `a.hess` (K=128, 1024 rows) and `bc.hess` (K=256,
+2048 rows), from a seeded X with AR(1)-correlated channels and heavy-tailed per-channel scales,
+with the same `write_hess_file`/`write_manifest` the capture uses; keys `t.a -> a.hess`,
+`t.b`/`t.c -> bc.hess`. `expected.json` records each file's K, rows, trace, the exactly-rounded
+fp64 sum of all stored upper-triangle entries (`sum_upper`), min/max diagonal, sha256, a few exact
+entries of the symmetric expansion, and `hessian.json`'s sha256, for the C++ reader test.
+Regenerating is byte-for-byte reproducible; the directory's `.gitattributes` (`* -text`) keeps git's
+end-of-line conversion away from the hashed bytes.
+
+```powershell
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+    --write-fixture tests\convert\fixtures\hess_small
+```
+
 ## tok_golden.py
 
 Not this component's -- owned by the tokenizer agent. Don't add it here.

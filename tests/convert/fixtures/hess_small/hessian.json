@@ -1,0 +1,27 @@
+{
+  "format": "r4dx-hessian",
+  "version": 1,
+  "files": {
+    "a.hess": {
+      "K": 128,
+      "rows": 1024,
+      "trace": 477.5871845036745
+    },
+    "bc.hess": {
+      "K": 256,
+      "rows": 2048,
+      "trace": 1289.5973924063146
+    }
+  },
+  "keys": {
+    "t.a": "a.hess",
+    "t.b": "bc.hess",
+    "t.c": "bc.hess"
+  },
+  "tool": "tools/reference/hessian_capture.py --write-fixture",
+  "fixture": {
+    "seed": 20260925,
+    "generator": "numpy default_rng; X = (Z @ chol(AR1(0.9)).T) * lognormal channel scales with k//64 channels x10; H = X^T X / rows in fp64, stored fp32",
+    "note": "synthetic test data for tests/convert (hessian_store.hpp); not a real Hessian"
+  }
+}

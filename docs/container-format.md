@@ -215,7 +215,10 @@ tell the two modes apart except by reading `r4dx_convert_run.quant_values` out o
 metadata. `r4dx-convert --quant {rtn,search}` picks between them; **`rtn` is the default**, so a
 converter command that predates these flags still produces the same bytes it always did. (A
 container built before the flags existed has no `quant_values`/`imatrix` key at all; that absence
-means `rtn`.)
+means `rtn`.) `--ldlq <regex>` (below) is a third, per-linear choice layered on top: the linears
+listed in `r4dx_convert_run.ldlq_linears` were rounded by LDLQ, every other one by
+`quant_values`. (`ldlq` = `"none"`, or no `ldlq` key at all in a container that predates the
+flag, means no linear was.)
 
 **`rtn`** -- the original quantizer, and what every container built before this flag existed
 contains. One grid per `(row, group)` straight from the data's extremes, then round-to-nearest:
@@ -257,6 +260,51 @@ The reference implementations are `src/convert/include/r4dx_convert/quant_search
 three modes). That is only possible because the evaluation order is pinned: float32 throughout for
 `w4a16`/`w4a8` (float64 for `mxfp4`), error accumulated sequentially over `k`, and no
 floating-point contraction.
+
+#### `ldlq` -- error-feedback rounding against the input Hessian
+
+**Same bytes, same packers, same kernels** -- LDLQ changes only which `q` / `scale` / `zero` (or
+E8M0 exponent) values are written, exactly like `search` does, and only for the linears
+`r4dx-convert --ldlq <regex>` selects (`regex_search` over the container base names, like
+`--keep-bf16`, which wins where both match). Design and gates: `docs/quant2.md` section 2.
+
+`rtn` and `search` both choose every `(row, group)` in isolation and minimize the error in the
+*weights*. What the model feels is the error in the *outputs*, `(W - Wq) x`, and input channels are
+correlated. LDLQ (the GPTQ algorithm; LDLQ is QuIP's name for the same recursion) minimizes the
+proxy `tr((W - Wq) H (W - Wq)^T)` with `H = E[x x^T]`, the linear's input second moment over a
+calibration corpus, by rounding one input column `k` at a time and feeding that column's rounding
+error forward onto the columns not yet rounded, weighted so that the later columns absorb it where
+the inputs make that possible:
+
+```
+H     <- H + damp * mean(diag H) * I          (--ldlq-damp, default 0.01; retried at 10x, 100x)
+U     =  upper Cholesky factor of H^-1        (H^-1 = U^T U, computed without forming H^-1)
+for k in 0..K-1:
+  if k starts a group: pick the group's (scale, zero) from the CURRENT (already error-updated)
+                       weights with the `search` grid, weighted by diag(H), without the refit
+  q[:, k] = round per layout (the same clamp/round `search` uses)
+  e       = (W[:, k] - dequant(q[:, k])) / U[k][k]
+  W[:, j] -= e * U[k][j]   for every j > k
+```
+
+The last line is applied lazily -- within a 128-column block immediately, to the columns after the
+block as one matrix product per block -- which is the same arithmetic reordered, not an
+approximation. The refit `search` ends with is skipped because it would fit the scale to codes that
+error feedback then changes. Per layout the only differences are the ones `search` already has:
+`w4a16` has a free zero, `w4a8` pins it at 8, `mxfp4` chooses between the round-up exponent and
+that exponent minus one and then encodes E2M1. The implementation
+(`src/convert/include/r4dx_convert/quant_ldlq.hpp`, CPU, deterministic: the output bytes do not
+depend on `--threads`) requires `K` to be a multiple of 128.
+
+It needs the Hessians. `tools/reference/hessian_capture.py` runs the bf16 checkpoint over a
+calibration corpus and writes a directory -- one `.hess` file per distinct linear input (the packed
+upper triangle of `H` in float32, with `K`, the token count and the trace for an integrity check)
+and a `hessian.json` that maps each container base name to its file (linears reading the same input,
+such as `gdn.in_proj_qkv` and `gdn.in_proj_z`, share one). `r4dx-convert --hessian-dir` points at
+that directory; a selected linear missing from `hessian.json`, or with a different `K`, fails the
+conversion before any tensor is written. The container records the pattern (`ldlq`), `ldlq_damp`,
+`hessian_dir`, the sha256 of the `hessian.json` it used (`hessian_manifest_sha256`) and the
+resolved `ldlq_linears` list in `r4dx_convert_run`.
 
 ## KV descale tables
 

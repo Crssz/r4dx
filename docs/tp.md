@@ -1648,6 +1648,13 @@ because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own tab
 
 Gate: all equal. First run at the end of P2a; re-run at the end of P3, P2b, P4, P5.
 
+**Re-frozen 2026-09-25 at `f7d4927`.** That commit (sampled MTP rounding, `docs/mtp.md`) deliberately
+changes TP=1 bits: verify-sized prefill chunks of 2-16 rows take the M=1 GEMM tuning, and the decode
+attention rescales per row past 16 x segments keys. So the `aa54c20` baseline no longer matches
+TP=1 output byte for byte. The same three binaries, built at `f7d4927` (libr4d `a30b186`), now live
+outside any worktree at `%USERPROFILE%\dev\r4dx-baselines\tp1-f7d4927\` with their hashes in
+`BASELINE.txt`; pass that directory as `-Baseline`. The old `aa54c20` copy is archived, not deleted.
+
 ### 10.4 Emulation vs real, KL vs TP=1
 
 ```powershell

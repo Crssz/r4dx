@@ -35,7 +35,14 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import DEFAULT_MODEL_DIR, resolve_device  # noqa: E402
+from common import (  # noqa: E402
+    DEFAULT_MODEL_DIR,
+    DEFAULT_TOKENIZER_MODE,
+    TOKENIZER_HELP,
+    TOKENIZER_MODES,
+    load_ref_tokenizer,
+    resolve_device,
+)
 
 
 def main() -> int:
@@ -52,16 +59,19 @@ def main() -> int:
     ap.add_argument("--thinking", action="store_true", help="enable_thinking=True (default off, "
                                                               "matching the r4dx perf run)")
     ap.add_argument("--top-k", type=int, default=5)
+    ap.add_argument("--tokenizer", choices=TOKENIZER_MODES, default=DEFAULT_TOKENIZER_MODE,
+                    help=TOKENIZER_HELP + " canonical gives the prompt ids r4dx-cli feeds the engine.")
     args = ap.parse_args()
 
     device = resolve_device(args.device)
     print(f"[first_token] loading tokenizer + model from {args.model_dir} on {device} "
           f"(this can take several minutes for a 27B-parameter checkpoint) ...", flush=True)
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
     t0 = time.time()
-    tok = AutoTokenizer.from_pretrained(str(args.model_dir), trust_remote_code=True)
+    tok = load_ref_tokenizer(args.model_dir, args.tokenizer)
+    print(f"[first_token] tokenizer: {tok.mode} ({tok.describe()})", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         str(args.model_dir),
         torch_dtype=torch.bfloat16,
@@ -78,12 +88,10 @@ def main() -> int:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
 
-    input_ids = tok.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        enable_thinking=args.thinking,
-        return_tensors="pt",
-    ).to(device)
+    # The template renders text (unaffected by the tokenizer mode); the ids are that text encoded
+    # in --tokenizer's mode.
+    ids = tok.encode_chat(messages, add_generation_prompt=True, enable_thinking=args.thinking)
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
     print(f"[first_token] prompt token count: {input_ids.shape[-1]}", flush=True)
 
     t1 = time.time()

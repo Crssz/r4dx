@@ -403,12 +403,18 @@ def main() -> int:
     print(markdown(results, total, args.ref_dir, args.test_dir))
 
     if args.out:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from common import tokens_file_tokenizer_mode  # torch-free
+
         payload = {
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "ref_dir": str(args.ref_dir),
             "test_dir": str(args.test_dir),
             "tokens_file": str(args.tokens),
             "tokenizer": doc.get("tokenizer"),
+            # docs/quant2.md 3.4: Thai KL is comparable only between runs of the same mode.
+            "tokenizer_mode": tokens_file_tokenizer_mode(doc),
+            "tokenizer_provenance": doc.get("tokenizer_provenance"),
             "kl_alarm_nats": KL_ALARM,
             "logprob_clamp": LOGPROB_CLAMP,
             "segments": [{k: v for k, v in s.items() if not k.startswith("_")} for s in results],

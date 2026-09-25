@@ -69,7 +69,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    DEFAULT_TOKENIZER_MODE,
+    TOKENIZER_HELP,
+    TOKENIZER_MODES,
+    UNKNOWN_TOKENIZER_MODE,
     ShardIndex,
+    load_ref_tokenizer,
+    recorded_tokenizer_mode,
+    refuse_tokenizer_mode_change,
     load_text_config,
     resolve_device,
     sha256_file,
@@ -726,8 +733,27 @@ def main() -> int:
                     help="gate (b) top-10 probe; default: a mid-stack mlp.down")
     ap.add_argument("--determinism", action="store_true",
                     help="gate (c): run the whole capture TWICE and diff, write nothing")
+    ap.add_argument("--tokenizer", choices=TOKENIZER_MODES, default=DEFAULT_TOKENIZER_MODE,
+                    help=TOKENIZER_HELP + " Recorded as the sidecar's 'tokenizer'; a sidecar "
+                         "without one was made with hf-auto.")
+    ap.add_argument("--force", action="store_true",
+                    help="replace an existing --out whose tokenizer mode differs from this run's "
+                         "(the default --out is the hf-auto imatrix)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
+
+    # Never silently replace an artifact of the other tokenizer mode (docs/quant2.md 3.4): the
+    # default --out is the pre-switch (hf-auto) imatrix. Checked before anything touches the GPU.
+    if not args.determinism:
+        sidecar = args.out.parent / (args.out.stem + ".json")
+        if sidecar.exists():
+            prev = json.loads(sidecar.read_text(encoding="utf-8"))
+            refuse_tokenizer_mode_change("imatrix", f"{args.out} (sidecar {sidecar.name})",
+                                         [recorded_tokenizer_mode(prev.get("tokenizer"))[0]],
+                                         args.tokenizer, args.force)
+        elif args.out.exists():
+            refuse_tokenizer_mode_change("imatrix", f"{args.out} (no sidecar)",
+                                         [UNKNOWN_TOKENIZER_MODE], args.tokenizer, args.force)
 
     # The GPU rule, enforced before anything expensive happens (common.resolve_device re-checks it).
     visible = os.environ.get("HIP_VISIBLE_DEVICES")
@@ -752,10 +778,10 @@ def main() -> int:
                          "any imatrix it produces")
     print("[imatrix] converter audit: PASS (every quantized linear in main.cpp is accounted for)")
 
-    from transformers import AutoTokenizer
     import transformers
 
-    tokenizer = AutoTokenizer.from_pretrained(str(args.model_dir))
+    tokenizer = load_ref_tokenizer(args.model_dir, args.tokenizer)
+    print(f"[imatrix] tokenizer: {tokenizer.mode} ({tokenizer.describe()})")
     calib_txt = None if str(args.calib_txt).lower() == "none" else args.calib_txt
     corpus_dir = None if str(args.corpus_dir).lower() == "none" else args.corpus_dir
     corpus = collect_corpus(corpus_dir, calib_txt, args.extra_files, tokenizer, args.max_tokens)
@@ -828,6 +854,7 @@ def main() -> int:
         "max_tokens_per_file": args.max_tokens,
         "corpus": [{"name": c.name, "path": repo_relative(c.path), "kind": c.kind,
                     "sha256": sha256_file(c.path), "tokens": len(c.token_ids)} for c in corpus],
+        "tokenizer": tokenizer.provenance(),
         "mtp": do_mtp,
         "draft_head": bool(args.draft_head),
         "device": str(device),

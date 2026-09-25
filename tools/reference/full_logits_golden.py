@@ -54,9 +54,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
     ShardIndex,
+    load_ref_tokenizer,
     load_text_config,
     resolve_device,
     sha256_file,
+    tokens_file_tokenizer_mode,
 )
 
 #: fp16's smallest finite magnitude is ~-65504, so a log-probability below that would become -inf
@@ -591,11 +593,15 @@ def main() -> int:
     if args.max_tokens:
         segments = [{"name": s["name"], "token_ids": s["token_ids"][: args.max_tokens]} for s in segments]
 
+    # This script tokenizes nothing: the ids come from the tokens file, and the tokenizer mode that
+    # made them (common.tokens_file_tokenizer_mode: make_tokens_json.py's record, the r4dx-cli dump
+    # shape, ...; "unknown" when it cannot tell) is recorded below. The tokenizer only decodes
+    # pieces for display, which no mode changes, so it is always the canonical one.
+    tokens_mode = tokens_file_tokenizer_mode(doc)
+    print(f"[full_logits] tokens file {args.tokens}: tokenizer mode {tokens_mode}")
     tok = None
     try:
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(str(args.model_dir))
+        tok = load_ref_tokenizer(args.model_dir, "canonical")
     except Exception as exc:  # decoding pieces is a nicety, never a requirement
         print(f"[full_logits] tokenizer unavailable ({type(exc).__name__}: {exc}); ids only")
 
@@ -613,6 +619,8 @@ def main() -> int:
         "config_sha256": sha256_file(args.model_dir / "config.json"),
         "tokens_file": str(args.tokens),
         "tokenizer": doc.get("tokenizer"),
+        "tokenizer_mode": tokens_mode,
+        "tokenizer_provenance": doc.get("tokenizer_provenance"),
         "device": str(device),
         "torch_dtype": "bfloat16",
         "impl": args.impl,

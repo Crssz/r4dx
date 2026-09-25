@@ -35,6 +35,55 @@ uses.
 If you run both scripts in the same shell, run them one after another, not in parallel -- this
 repo's GPU tests are serialized by convention (one process on device 1 at a time).
 
+## Tokenization (`--tokenizer`)
+
+Every script here that turns text into token ids does it through one class,
+`common.RefTokenizer`, and takes `--tokenizer canonical|hf-auto` (docs/quant2.md 3.4):
+
+- **`canonical`** (the default): `tokenizers.Tokenizer.from_file(<model>/tokenizer.json)`. This is
+  the checkpoint's own on-disk pre-tokenizer, which is what r4dx's C++ tokenizer and r4dx-server
+  produce, and what the model generates in.
+- **`hf-auto`**: transformers' `AutoTokenizer`. For this checkpoint, transformers 5.17 loads a
+  `Qwen2Tokenizer` that replaces tokenizer.json's pre-tokenizer regex with an older one. That regex
+  splits Thai (and Lao, Khmer, Devanagari, Hebrew, diacritic Arabic) combining marks off their
+  consonants: "ที่นี่ไม่ใช่เมืองแห่งความสงบ" is 6 ids canonical and 14 hf-auto. It is kept only
+  to reproduce what was made with it: every artifact from before 2026-09-26 (hessian-v1, the
+  imatrix, the kvcalib json, `kl_corpus/tokens.json`).
+
+In both modes no special token is added (no BOS/EOS), and special tokens written in the text
+(`<|im_start|>`, `<think>`, ...) are recognized as their ids, like r4dx's `parse_special=true`.
+Chats are rendered by the checkpoint's template (`apply_chat_template(tokenize=False)`, which the
+bug does not touch), then encoded in the chosen mode. English and code give the same ids in both
+modes.
+
+Where canonical and r4dx could still differ, and what the tools do about it:
+
+- **NFC.** tokenizer.json declares an NFC normalizer. `tokenizers` applies it, but r4dx and
+  r4dx-server do not (`src/tokenizer/tokenizer.h`, KNOWN GAP). So canonical refuses text that is
+  not already NFC (a `ValueError` naming the first offending character). Every corpus here is NFC.
+- **Special-token literals.** Raw documents are encoded the way r4dx's chat path encodes, with
+  `parse_special=true`. r4dx-server's raw `/v1/completions` prompt uses `parse_special=false`, which
+  spells a literal like `<|im_start|>` out in ordinary pieces. This only matters for text that
+  contains such literals: hessian_capture's repo-code windows do (80 at `714955f`), the KL corpus
+  and the prose files do not.
+- **hf-auto depends on the transformers version.** Only 5.17's AutoTokenizer splits; 5.3.0's
+  tokenizes canonically. `RefTokenizer` refuses to load hf-auto when its AutoTokenizer encodes the
+  Thai probe exactly as tokenizer.json does, so an hf-auto label never sits on canonical ids.
+
+Every output records the mode: `tokenizer` (a `RefTokenizer.provenance()` dict with `mode` first,
+plus the tokenizers/transformers versions, the tokenizer.json sha256 and the probe's id count) in
+an imatrix sidecar, a kvcalib entry and `hessian.json`'s `corpus`; `tokenizer_mode` and
+`tokenizer_provenance` in a tokens file. An imatrix, kvcalib or Hessian record without one
+predates the switch and is hf-auto. A tokens file without one is read by
+`common.tokens_file_tokenizer_mode`, which does not guess: the r4dx-cli dump shape and the exact
+canonical description (`tokens_thai_canon.json`) are canonical, `tokens.json` (known by its token
+ids) is hf-auto, and anything else is `unknown`.
+
+The tools whose default output is a pre-switch artifact (imatrix_capture, kv_calibrate_full,
+kv_calibrate's merge, make_tokens_json) refuse to overwrite or extend an output of another or an
+unknown mode unless `--force` is given. hessian_capture already requires `--force` to replace a
+set, and names the existing set's mode.
+
 ## layer_golden.py
 
 ```powershell
@@ -299,8 +348,9 @@ C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\k
 ```
 
 Prototype of the static fp8 KV descale calibration from `docs/container-format.md` ("KV descale
-tables"). Tokenizes a calibration text (real tokenizer, via `AutoTokenizer` -- this only *uses*
-the tokenizer to build input ids, it doesn't touch anything under `src/tokenizer` or
+tables"). Tokenizes a calibration text (real tokenizer, via `common.RefTokenizer` in `--tokenizer`'s
+mode, canonical by default and recorded as the entry's `tokenizer` -- this only *uses* the
+tokenizer to build input ids, it doesn't touch anything under `src/tokenizer` or
 `tools/reference/tok_golden.py`, which belong to the tokenizer agent), gathers the calibration
 tokens' `text.embed_tokens` rows (real weights, row-gathered so the full `[248320, 5120]` table is
 never materialized), runs them through `--layer`'s `input_layernorm` + `self_attn` (real weights),
@@ -308,7 +358,9 @@ and records the per-kv-head `amax` of K (**post-rope** -- captured by monkeypatc
 `apply_rotary_pos_emb`, matching exactly what the paged fp8 cache would store) and V (no rope
 applied to V; captured via a forward hook on `v_proj`). `--layer` must be a `full_attention` layer
 (0-indexed `3, 7, 11, ...`; the script asserts this and explains why if you pick a GDN layer --
-r4d's paged fp8 KV cache is attention-only).
+r4d's paged fp8 KV cache is attention-only). It merges the layer into an existing `--out`; when the
+file's other layer entries were tokenized in another mode (no record: hf-auto), it refuses before
+calibrating unless `--force` is given.
 
 **Calibration corpus**: `--calib-text-file <path>` (default: `tools/reference/calib.txt` next to
 this script if present, else the old built-in `DEFAULT_CALIBRATION_TEXT` paragraph). `calib.txt` is
@@ -391,10 +443,11 @@ well-behaved, V has genuine outliers.
 plus `tools/reference/kv_calib_corpus/`, which adds original English prose, Thai prose, C++,
 Python and one chat conversation. `tools/reference/kl_corpus/` is deliberately **not** used: that
 is the held-out text the KL report is measured on, and calibrating the quantization constants on
-the same text the drift is measured on would flatter the result. Each file is tokenized with
-`add_special_tokens=False`, run as **its own sequence from a fresh context** (position 0, causal,
-no cache), truncated to `--max-tokens` (default 2048), and the reported `amax` is the max over
-every token of every file.
+the same text the drift is measured on would flatter the result. Each file is tokenized in
+`--tokenizer`'s mode (canonical by default, no special tokens added; recorded as every layer
+entry's `tokenizer` -- the kvcalib json below has none, so it is hf-auto), run as **its own
+sequence from a fresh context** (position 0, causal, no cache), truncated to `--max-tokens`
+(default 2048), and the reported `amax` is the max over every token of every file.
 
 `kv_calib_corpus/*.messages.json` is a chat entry: `{"messages": [{"role", "content"}, ...]}`
 rendered through the checkpoint's own `tokenizer.apply_chat_template(..., tokenize=False,
@@ -413,11 +466,14 @@ template changes. The corpus of the run below:
 | `kv_calib_corpus/chat_conversation.messages.json` | chat template | 881 |
 | **total** | | **8316** |
 
+Those counts are hf-auto (the run predates `--tokenizer`). Canonically, `calib.txt` is 1755 tokens
+(not truncated) and `thai_prose.txt` 702, 7428 in total; the other files are unchanged.
+
 **Output**: one JSON in the same layout the converter already consumes -- `{"<layer_idx>": {...}}`
 for all 16 full-attention layers, `k_amax`/`v_amax` as `[kv_heads]` float arrays, plus the
 informational tail fields and full provenance per entry (`method: "full-forward"`,
 `method_detail`, `weights_source`, `config_sha256`, the `corpus` list with each file's sha256 and
-token count, `total_calibration_tokens`, `torch_dtype`, `device`, `torch_version`,
+token count, `tokenizer`, `total_calibration_tokens`, `torch_dtype`, `device`, `torch_version`,
 `transformers_version`, `generated_at`, and the `caveat` / `converter_consumption` prose). No
 top-level keys other than layer indices are written, because `src/convert/main.cpp` prints
 `kv_calib_json.size()` as the layer count. The `caveat` now states what the file **is** (real
@@ -427,8 +483,10 @@ amax saturates at +-448 at inference).
 
 Options: `--model-dir`, `--corpus-dir` (`none` to skip), `--calib-txt` (`none` to leave it out),
 `--extra-files` (repeatable), `--max-tokens` (default 2048), `--layers 3,7` (subset, default all
-16), `--rope-check LAYER` (gate (c) below), `--out`. There is no `--device`: the script refuses to
-start unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`.
+16), `--rope-check LAYER` (gate (c) below), `--tokenizer canonical|hf-auto` (default canonical;
+hf-auto reproduces the existing json's corpus), `--force` (replace an `--out` of another tokenizer
+mode, e.g. the default path's hf-auto json, which is otherwise refused), `--out`. There is no
+`--device`: the script refuses to start unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`.
 
 **Runtime**: 175.6 s for the 6-file / 8316-token corpus (~26 s per file, the first file pays a cold
 page cache at 46 s -- as with `full_logits_golden.py` this is dominated by streaming 48 GiB of
@@ -568,13 +626,19 @@ position. Two *independent* producers write the same two file kinds, and `kl_rep
 **Tokens file** (`kl_corpus/tokens.json`, committed):
 
 ```json
-{"tokenizer": "C:\\AI\\models\\Qwen3.8-27B",
+{"tokenizer": "C:\\AI\\models\\Qwen3.8-27B", "tokenizer_mode": "hf-auto",
  "segments": [{"name": "english_prose", "token_ids": [8241, 264, ...]}, ...]}
 ```
 
-Ids come from the checkpoint's own `AutoTokenizer` with `add_special_tokens=False` on the raw file
-text -- **no chat template, no BOS, no EOS**. Each segment is evaluated independently from a fresh
-context (position 0).
+Ids are the raw file text encoded by `make_tokens_json.py` in its `--tokenizer` mode (see
+"Tokenization" above) -- **no chat template, no BOS, no EOS**. `tokenizer_mode` records the mode
+and `tokenizer_provenance` the versions behind it. A file without the field is read by
+`common.tokens_file_tokenizer_mode`: an r4dx-cli `--dump-token-ids` file (only `tokenizer` and
+`segments`, one `"cli"` segment) and a file whose `tokenizer` is exactly the canonical description
+(`tokens_thai_canon.json`) are canonical, `tokens.json` (identified by its token ids) is hf-auto,
+and any other file is `unknown`. `full_logits_golden.py`, `kv_fakequant_golden.py` and
+`kl_report.py --out` write that mode (and any `tokenizer_provenance`) into their run records. Each
+segment is evaluated independently from a fresh context (position 0).
 
 **Log-prob file**, one pair per segment, in the producer's `--out-dir`:
 
@@ -607,9 +671,15 @@ recomputes it from the tokens file and refuses to pair two dumps whose sidecars 
 ## make_tokens_json.py
 
 ```powershell
+# the committed tokens.json (AutoTokenizer ids; the output gains "tokenizer_mode" and "tokenizer_provenance")
 C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\make_tokens_json.py `
-    --corpus-dir tools\reference\kl_corpus --max-tokens 1024 `
+    --tokenizer hf-auto --corpus-dir tools\reference\kl_corpus --max-tokens 1024 `
     --out tools\reference\kl_corpus\tokens.json
+
+# the canonical Thai segment, tokens_thai_canon.json
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\make_tokens_json.py `
+    --tokenizer canonical --file thai_prose_canon=tools\reference\kl_corpus\thai_prose.txt `
+    --max-tokens 1024 --out tools\reference\kl_corpus\tokens_thai_canon.json
 ```
 
 Turns a directory of `.txt` files into the tokens file above -- one segment per file, named after
@@ -617,6 +687,15 @@ the file's stem, truncated to exactly `--max-tokens` ids, and **failing loudly**
 tokenizes to fewer than `--min-tokens` (default: `--max-tokens`) rather than silently emitting a
 short segment. `--file NAME=PATH` (repeatable) replaces the directory scan when you want an ad-hoc
 corpus. No GPU, no weights: only the tokenizer files under `--model-dir` are read.
+
+`--tokenizer` defaults to `canonical`, which is what a new tokens file should be. The default
+never silently re-tokenizes an existing file, though: if `--out` exists and holds the other mode
+(`tokens.json`, with no `tokenizer_mode`, counts as hf-auto) or a mode that cannot be determined,
+the run is refused. Pass the file's own mode to regenerate it as it is, or `--force` to replace it.
+Both commands above reproduce their files' token ids and every field those files have. The output
+also adds `tokenizer_mode` and `tokenizer_provenance`, so it is not byte-identical to a file made
+before those fields existed. Pairing is unaffected: it goes by the token ids' sha256, and the r4dx
+half ignores unknown keys.
 
 ## kl_corpus/
 
@@ -630,7 +709,13 @@ comfortably over 1024 tokens, all four truncated to exactly 1024 in `tokens.json
 | `english_prose` | `english_prose.txt` | 1386 | original technical-explanatory English prose (written for this corpus: an essay on the memory hierarchy). No third-party or licensed text. |
 | `cpp_source` | `cpp_source.txt` | 4124 | a verbatim excerpt of this repo's own `src/model/model.cpp` (first 260 lines) |
 | `python_source` | `python_source.txt` | 3531 | a verbatim excerpt of this repo's own `tools/reference/layer_golden.py` (first 230 lines) |
-| `thai_prose` | `thai_prose.txt` | 2325 | original Thai prose (written for this corpus: everyday and technical topics) |
+| `thai_prose` | `thai_prose.txt` | 2325 (hf-auto; 1220 canonical) | original Thai prose (written for this corpus: everyday and technical topics) |
+
+`tokens.json` is hf-auto, like every KL number measured before 2026-09-26: its `thai_prose` segment
+is Thai split at the combining marks, token boundaries the served model never produces. The other
+three segments are the same ids in both modes. `tokens_thai_canon.json` holds one segment,
+`thai_prose_canon`: the first 1024 canonical ids of the same file. Thai KL from the two files is
+not comparable (docs/quant2.md 3.4).
 
 Nothing here is downloaded, scraped or licensed: two files are this repository's own source and two
 were written for this purpose. All four are UTF-8 **without** a BOM and LF-only, and
@@ -975,12 +1060,13 @@ does today.
 `tools/reference/calib.txt` + `tools/reference/kv_calib_corpus/` (English prose, Thai prose, C++,
 Python, one chat conversation rendered through the checkpoint's own `apply_chat_template`), each
 file its own sequence from a fresh context, truncated to `--max-tokens` (default 2048), 8316 tokens
-total. `tools/reference/kl_corpus/` is deliberately **not** used -- that is the held-out text the KL
+total with hf-auto (the existing imatrix) and 7428 canonically (`--tokenizer`, default canonical;
+recorded as the sidecar's `tokenizer`). `tools/reference/kl_corpus/` is deliberately **not** used -- that is the held-out text the KL
 report is measured on, and calibrating the quantization constants on the text the drift is measured
 on would flatter the result.
 
 **Output**: `D:\models\r4dx\qwen38-27b.imatrix.npz` (341 `float32[K]` arrays, 10.1 MiB) plus
-`qwen38-27b.imatrix.json`, a sidecar with the corpus (path + sha256 + tokens each),
+`qwen38-27b.imatrix.json`, a sidecar with the corpus (path + sha256 + tokens each), `tokenizer`,
 `config_sha256`, `total_calibration_tokens`, per-key `{K, rows, hf_names, tap}`, the converter
 audit's sha256 of `src/convert/main.cpp`, the gate results, and the `caveat` (what this is: the
 diagonal second moment of the input activation; what it is **not**: a Hessian, and no more
@@ -988,7 +1074,9 @@ representative than the corpus). Data, not committed.
 
 Options: `--model-dir`, `--corpus-dir`/`--calib-txt` (`none` to skip), `--extra-files`,
 `--max-tokens`, `--max-files N` (gate runs), `--no-mtp`, `--draft-head`, `--fusion-check-layer`
-(`-1` to skip), `--probe-key`, `--determinism`, `--out`. There is no `--device`: the script refuses
+(`-1` to skip), `--probe-key`, `--determinism`, `--tokenizer canonical|hf-auto`, `--force`
+(replace an `--out` whose sidecar records another tokenizer mode, e.g. the default path's hf-auto
+imatrix, which is otherwise refused), `--out`. There is no `--device`: the script refuses
 to start unless `$env:HIP_VISIBLE_DEVICES` is exactly `'1'`.
 
 **Runtime**: 162.1 s for the 6-file / 8316-token corpus. **Peak VRAM 3.411 GiB allocated / 5.205
@@ -1184,8 +1272,18 @@ a WARNING and recorded under the source's `kl_disjointness.overlaps`, but it is 
 repo files share runs with model.cpp or layer_golden.py, and v1's own code windows meet one.
 docs/quant2.md 3.3 has the details.
 
-`--dry-run` (under `%USERPROFILE%\dev\.venv`, transformers 5.3.0, CPU-only torch -- token counts
-under the reference venv may differ slightly):
+**Tokenizer.** Every source (calib files, WikiText, code, gen raw documents and rendered chats) is
+encoded by one `common.RefTokenizer` in `--tokenizer`'s mode, recorded as `hessian.json`
+`corpus.tokenizer` (see "Tokenization" above). The default is canonical for a new capture. With
+`--rms-only` the default is the mode the set records, and hf-auto when it records none (hessian-v1).
+An explicit `--tokenizer` that disagrees with the set is refused, and `corpus_mismatches` compares
+the mode too. At `--code-rev 34d381a`, `--tokenizer hf-auto` gives hessian-v1's 86 sequences and
+172,156 tokens id for id. Canonical gives 171,268: `calib.txt` and `thai_prose.txt` change, and the
+code windows shift by a few tokens (docs/quant2.md 3.4).
+
+`--dry-run` (under `%USERPROFILE%\dev\.venv`, transformers 5.3.0, CPU-only torch -- whose
+AutoTokenizer still gave the canonical counts; the reference venv's 5.17 gives 172,156 with
+`--tokenizer hf-auto`, which that 5.3.0 venv now refuses):
 
 ```
 [hessian] converter audit (src/convert/main.cpp): text=10 mtp=4 add_linear shapes, direct PlanLinearLayouts=['mtp.draft_head.lm_head', 'selftest']
@@ -1236,7 +1334,7 @@ only; lm_head/MTP then see layer N-1's output, so their files are written but gi
 (write only taps serving a matching key -- `re.search`, like `--keep-bf16` -- e.g. `'mlp\.'` for the
 G3 pilot, which also matches `mtp.mlp.*` exactly as the converter's `--ldlq "mlp\."` will),
 `--hidden-device auto|cuda|cpu`, `--dry-run`, `--write-fixture DIR`, `--regate`, `--rms-taps`,
-`--rms-only`, `--code-rev COMMIT` (below).
+`--rms-only`, `--code-rev COMMIT` (below), `--tokenizer canonical|hf-auto` (above).
 
 ### Weightless rms taps (`--rms-taps`, `--rms-only`)
 
@@ -1277,7 +1375,8 @@ The rms taps hook the norm module's INPUT (a forward_pre_hook on each layer's `i
 - the checkpoint's `config.json` sha256 is the set's;
 - this run's corpus matches the recorded one field by field (every source's sha256, token counts,
   windows and file list; only `file_list_method` and `kl_disjointness`, which say how a source was
-  read and checked, are ignored);
+  read and checked, are ignored), tokenized in the mode the set records (hessian-v1 records none:
+  hf-auto). An explicit `--tokenizer` that disagrees is refused before anything is tokenized;
 - without `--force`, the manifest has no `rms_keys` yet. With `--force`, the old rms entries are
   removed from it before the capture starts.
 
@@ -1309,7 +1408,12 @@ CPU test: `tests/reference/test_hessian_rms.py` (ctest `reference_hessian_rms`, 
 GPU). It runs a tiny random 2-layer Qwen3_5 stack with a dead channel through `run_capture`, the
 gates, `finish_rms_only` / `merge_rms_manifest` and `regate`. The `--gen-file` corpus source has
 its own: `tests/reference/test_hessian_corpus.py` (ctest `reference_hessian_corpus`, no GPU; it
-reads the checkpoint's tokenizer and SKIPs the rendering part without it).
+reads the checkpoint's tokenizer and SKIPs the rendering part without it). Its section (h) covers
+the two tokenizer modes: the Thai probe, `tests/tokenizer/golden.json`'s chat and encode cases,
+the gen windows in both modes, `--rms-only`'s choice of mode end to end, the NFC refusal, the
+hf-auto split check, the tokens-file mode rules, `make_tokens_json.py` end to end (both kl_corpus
+tokens files reproduced, the mode guard) and the output guards of imatrix_capture and
+kv_calibrate(_full).
 
 **Expected cost** (not yet measured -- a GPU run is handed to the user): the dominant work is the
 `mlp.down` GEMM, `17408^2 x 2048 x 2` FLOP per sequence and layer, ~7 PFLOP over the whole run;

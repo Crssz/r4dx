@@ -80,8 +80,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    load_ref_tokenizer,
     resolve_device,
     sha256_file,
+    tokens_file_tokenizer_mode,
 )
 import full_logits_golden as flg  # noqa: E402
 from full_logits_golden import StreamingReference  # noqa: E402
@@ -527,11 +529,13 @@ def main() -> int:
     if args.max_tokens:
         segments = [{"name": s["name"], "token_ids": s["token_ids"][: args.max_tokens]} for s in segments]
 
+    # As in full_logits_golden: the ids come from the tokens file, whose tokenizer mode is recorded
+    # below; the tokenizer only decodes pieces for display (mode-independent, so canonical).
+    tokens_mode = tokens_file_tokenizer_mode(doc)
+    print(f"[kv_fq] tokens file {args.tokens}: tokenizer mode {tokens_mode}")
     tok = None
     try:
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(str(args.model_dir))
+        tok = load_ref_tokenizer(args.model_dir, "canonical")
     except Exception as exc:
         print(f"[kv_fq] tokenizer unavailable ({type(exc).__name__}: {exc}); ids only")
 
@@ -558,6 +562,9 @@ def main() -> int:
         "model_dir": str(args.model_dir),
         "config_sha256": sha256_file(args.model_dir / "config.json"),
         "tokens_file": repo_relative(args.tokens),
+        "tokenizer": doc.get("tokenizer"),
+        "tokenizer_mode": tokens_mode,
+        "tokenizer_provenance": doc.get("tokenizer_provenance"),
         "device": str(device),
         "torch_dtype": "bfloat16",
         "impl": args.impl,

@@ -41,6 +41,24 @@ chat/001 (thinking, two turns), thai_prose/000 (raw), english_prose/001 (REJECTE
     (g) sources 1-3 (build_corpus): every token window is checked, an overlap is RECORDED under its
         own source's kl_disjointness (and printed, cp1252-safe), not refused; a code window's hit
         names the repo file holding the shared run
+    (h) tokenization (--tokenizer, docs/quant2.md 3.4; needs the checkpoint's tokenizer): the Thai
+        probe is 6 ids canonical and 14 hf-auto; canonical is tokenizers.Tokenizer.from_file itself;
+        every chat case of tests/tokenizer/golden.json (r4dx's ground truth) renders and encodes to
+        its prompt and ids canonically, every non-special encode case matches canonically and every
+        compat case matches hf-auto; a Thai chat encodes differently in the two modes while its
+        render does not; the fixture's gen windows under both modes (Thai shorter canonically, the
+        text and every other category identical); the served-prompt prefix property in both modes;
+        a bare transformers tokenizer is refused; provenance: corpus_record's mode,
+        recorded_tokenizer_mode, corpus_mismatches, and --rms-only's mode resolution end to end
+        (--dry-run on a temp set: a set recording no mode is read as hf-auto and matches, an
+        explicit mismatching --tokenizer is refused, a canonical set follows its record, a set
+        whose record lies about its tokens is caught by the token counts); canonical refuses
+        non-NFC text; hf-auto refuses an AutoTokenizer that does not split (transformers 5.3.0);
+        tokens_file_tokenizer_mode never guesses (r4dx-cli dump shape, exact canonical description,
+        tokens.json by its ids, else unknown); make_tokens_json.main end to end (canonical default,
+        the recorded mode and provenance, tokens.json and tokens_thai_canon.json reproduced byte for
+        byte but for the two added fields, the mode guard and --force); the mode guards of
+        imatrix_capture, kv_calibrate_full and kv_calibrate (before the GPU rule; no GPU touched)
 
 Plain script, no pytest dependency, like test_hessian_rms.py:
 
@@ -108,15 +126,19 @@ def raises(exc_type, needle: str, fn, label: str) -> None:
 
 class CharTokenizer:
     """One id per character, no chat template: enough for build_gen_corpus on raw-only files and for
-    build_corpus' text sources."""
+    build_corpus' text sources. Duck-typed to common.RefTokenizer (which build_corpus requires)."""
 
+    mode = "char (test stand-in)"
     chat_template = None
 
-    def __call__(self, text, add_special_tokens=False, verbose=True):
-        return {"input_ids": [ord(c) for c in text]}
+    def encode(self, text):
+        return [ord(c) for c in text]
 
-    def decode(self, ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+    def decode(self, ids):
         return "".join(map(chr, ids))
+
+    def render_chat(self, messages, **kwargs):
+        raise AssertionError("CharTokenizer has no chat template")
 
 
 def captured(fn, encoding: str = "utf-8"):
@@ -149,14 +171,13 @@ def by_id(samples: list[dict]) -> dict[str, dict]:
     return {s["id"]: s for s in samples}
 
 
-def load_tokenizer():
-    from common import DEFAULT_MODEL_DIR
+def load_tokenizer(mode: str = "canonical"):
+    """The capture's own tokenizer (common.RefTokenizer) in `mode`; canonical is the default mode."""
+    from common import DEFAULT_MODEL_DIR, load_ref_tokenizer
 
     if not (DEFAULT_MODEL_DIR / "tokenizer.json").exists():
         return None, DEFAULT_MODEL_DIR
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(str(DEFAULT_MODEL_DIR)), DEFAULT_MODEL_DIR
+    return load_ref_tokenizer(DEFAULT_MODEL_DIR, mode), DEFAULT_MODEL_DIR
 
 
 def skip(label: str) -> None:
@@ -271,8 +292,7 @@ def test_render(tok, model_dir: Path) -> None:
     want0 = (f"<|im_start|>system\n{m[0]['content']}<|im_end|>\n<|im_start|>user\n{m[1]['content']}"
              f"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{m[2]['content']}<|im_end|>\n")
     check(r0 == want0, "(b) thinking-off chat: system, user, then assistant with the EMPTY think block")
-    gp0 = tok.apply_chat_template(m[:-1], chat_template=tpl, tokenize=False, add_generation_prompt=True,
-                                  enable_thinking=False)
+    gp0 = tok.render_chat(m[:-1], chat_template=tpl, add_generation_prompt=True, enable_thinking=False)
     check(r0 == gp0 + m[2]["content"] + "<|im_end|>\n",
           "(b) thinking-off chat == the enable_thinking=false generation prompt + the generated turn")
 
@@ -290,8 +310,7 @@ def test_render(tok, model_dir: Path) -> None:
           "(b) thinking chat: the default-effort system turn, then both turns with their thoughts, final last")
     check(r1.endswith(hc.assistant_turn_rendering(m[3])) and final == hc.assistant_turn_rendering(m[3]),
           "(b) the final turn's thinking block survives, in assistant_turn_rendering's form")
-    gp1 = tok.apply_chat_template(m[:-1], chat_template=tpl, tokenize=False, add_generation_prompt=True,
-                                  enable_thinking=True)
+    gp1 = tok.render_chat(m[:-1], chat_template=tpl, add_generation_prompt=True, enable_thinking=True)
     check(gp1.endswith("<|im_start|>assistant\n<think>\n") and
           r1 == gp1 + m[3]["reasoning_content"] + "\n</think>\n\n" + m[3]["content"] + "<|im_end|>\n",
           "(b) thinking chat == the thinking generation prompt (which ends in <think>\\n) + the generated turn")
@@ -299,8 +318,8 @@ def test_render(tok, model_dir: Path) -> None:
     # What preserve_thinking=false would do (neither the generator nor this script sets it): only the
     # earlier turn loses its thought; the final one keeps it. check_rendered_chat refuses that render,
     # and one that lost the final thought.
-    np_ = tok.apply_chat_template(m, chat_template=tpl, tokenize=False, add_generation_prompt=False,
-                                  enable_thinking=True, preserve_thinking=False)
+    np_ = tok.render_chat(m, chat_template=tpl, add_generation_prompt=False, enable_thinking=True,
+                          preserve_thinking=False)
     check(m[1]["reasoning_content"] not in np_ and np_.endswith(final),
           "(b) preserve_thinking=false: the earlier thought is dropped, the final turn's is kept")
     raises(SystemExit, "assistant turn 1/2", lambda: hc.check_rendered_chat(c1, np_),
@@ -311,13 +330,14 @@ def test_render(tok, model_dir: Path) -> None:
     raises(SystemExit, "at the end of the conversation", lambda: hc.check_rendered_chat(c1, r1 + "x"),
            "(b) check_rendered_chat refuses anything after the final turn")
 
-    # Tokens: exactly the template text's, one id per control token, no BOS, and what transformers'
-    # own apply_chat_template(tokenize=True) gives.
-    cid = {t: tok.convert_tokens_to_ids(t) for t in ("<|im_start|>", "<|im_end|>", "<think>", "</think>")}
+    # Tokens: exactly the template text's, one id per control token, no BOS. These chats are English,
+    # so transformers' own apply_chat_template(tokenize=True) -- AutoTokenizer, i.e. hf-auto -- gives
+    # the same ids as the canonical encode (for Thai it would not: (h)).
+    cid = {t: tok.hf.convert_tokens_to_ids(t) for t in ("<|im_start|>", "<|im_end|>", "<think>", "</think>")}
     for sample, text in ((c0, r0), (c1, r1)):
-        ids = list(tok(text, add_special_tokens=False)["input_ids"])
-        ref = tok.apply_chat_template(sample["messages"], chat_template=tpl, tokenize=True, return_dict=False,
-                                      add_generation_prompt=False, enable_thinking=sample["enable_thinking"])
+        ids = tok.encode(text)
+        ref = tok.hf.apply_chat_template(sample["messages"], chat_template=tpl, tokenize=True, return_dict=False,
+                                         add_generation_prompt=False, enable_thinking=sample["enable_thinking"])
         check(ids == list(ref), f"(b) {sample['id']}: ids == apply_chat_template(tokenize=True)")
         check(all(ids.count(i) == text.count(t) for t, i in cid.items()) and ids[0] == cid["<|im_start|>"],
               f"(b) {sample['id']}: one id per <|im_start|>/<|im_end|>/<think>/</think>, no BOS")
@@ -334,8 +354,8 @@ def expected_concat(tok, samples: list[dict]) -> dict[str, str]:
         if s["rejected"]:
             out.setdefault(s["category"], [])
             continue
-        t = s["text"] if s["format"] == "raw" else tok.apply_chat_template(
-            s["messages"], tokenize=False, add_generation_prompt=False, enable_thinking=s["enable_thinking"])
+        t = s["text"] if s["format"] == "raw" else tok.render_chat(
+            s["messages"], add_generation_prompt=False, enable_thinking=s["enable_thinking"])
         out.setdefault(s["category"], []).append((s["format"], t))
     res = {}
     for cat, items in out.items():
@@ -384,7 +404,7 @@ def test_packing(tok, tmp: Path) -> None:
     ok_all = True
     tails = 0
     for cat, text in concat.items():
-        ids = list(tok(text, add_special_tokens=False)["input_ids"])
+        ids = tok.encode(text)
         n_all = len(ids) // L
         want = [(f"gen/{cat}/{w:03d}", "gen", ids[w * L:(w + 1) * L]) for w in range(n_all)]
         got = [t for t in seq_tuples(seqs) if t[0].startswith(f"gen/{cat}/")]
@@ -748,6 +768,423 @@ def test_windows(tmp: Path) -> None:
     check(ok, f"(g) a code window's overlap names the file ({type(res).__name__}: {str(res)[:160]!r})")
 
 
+# ---- (h) -----------------------------------------------------------------------------------------
+
+#: "This place is not a peaceful city" -- the probe docs/quant2.md 3.4 quotes. Almost every
+#: syllable carries a combining mark (a tone mark or vowel sign, Unicode category Mn), which
+#: AutoTokenizer's pre-tokenizer splits off its consonant.
+THAI_PROBE = ("ที่นี่ไม่ใช่เมื"
+              "องแห่งความสงบ")
+GOLDEN = REPO_ROOT / "tests" / "tokenizer" / "golden.json"
+
+
+def test_modes(canon, hf, model_dir: Path) -> None:
+    """Both modes against the tokenizer's own ground truth, the gen fixture under both."""
+    import common
+    from tokenizers import Tokenizer
+
+    raw = Tokenizer.from_file(str(model_dir / "tokenizer.json"))  # encode_special_tokens False: recognized
+    check(canon.mode == "canonical" and hf.mode == "hf-auto" and common.DEFAULT_TOKENIZER_MODE == "canonical"
+          and common.LEGACY_TOKENIZER_MODE == "hf-auto", "(h) the modes; canonical is the default, hf-auto the legacy")
+    c, h = canon.encode(THAI_PROBE), hf.encode(THAI_PROBE)
+    check(common.THAI_PROBE == THAI_PROBE, "(h) common.THAI_PROBE is the probe docs/quant2.md 3.4 quotes")
+    check(len(c) == 6 and len(h) == 14, f"(h) the Thai probe: 6 ids canonical, 14 hf-auto (got {len(c)}, {len(h)})")
+    check(c == raw.encode(THAI_PROBE, add_special_tokens=False).ids,
+          "(h) canonical is tokenizers.Tokenizer.from_file(tokenizer.json) itself")
+    check(canon.decode(c) == THAI_PROBE and hf.decode(h) == THAI_PROBE and canon.decode(h) == THAI_PROBE,
+          "(h) both id sequences decode back to the probe (decoding is mode-independent)")
+    check(canon.provenance()["thai_probe_ids"] == 6 and hf.provenance()["thai_probe_ids"] == 14,
+          "(h) provenance records the probe's id count (6 canonical, 14 hf-auto)")
+
+    # hf-auto's ids depend on the transformers version (5.3.0's AutoTokenizer does not split):
+    # RefTokenizer refuses an AutoTokenizer that tokenizes the probe like tokenizer.json.
+    class NoSplit:
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": raw.encode(text, add_special_tokens=add_special_tokens).ids}
+
+    check(common.check_hf_auto_splits(hf.hf, raw) == (6, 14), "(h) check_hf_auto_splits passes 5.17's AutoTokenizer")
+    raises(RuntimeError, "cannot reproduce the legacy AutoTokenizer ids",
+           lambda: common.check_hf_auto_splits(NoSplit(), raw),
+           "(h) check_hf_auto_splits refuses an AutoTokenizer that does not split (transformers 5.3.0)")
+
+    # Not NFC: the tone mark U+0E48 (ccc 107) typed before sara uu U+0E39 (ccc 103). tokenizers
+    # NFC-reorders it and r4dx does not (tokenizer.h, KNOWN GAP), so canonical refuses it rather than
+    # return ids r4dx would not produce. hf-auto only reproduces the legacy call and still encodes it.
+    import unicodedata
+
+    non_nfc = "ปู่"
+    check(not unicodedata.is_normalized("NFC", non_nfc) and
+          raw.encode(non_nfc, add_special_tokens=False).ids ==
+          raw.encode(unicodedata.normalize("NFC", non_nfc), add_special_tokens=False).ids,
+          "(h) the non-NFC probe: tokenizer.json's normalizer composes it (r4dx would not)")
+    raises(ValueError, "not Unicode NFC (first difference at character 1 of 3", lambda: canon.encode(non_nfc),
+           "(h) canonical refuses non-NFC text, naming the spot")
+    raises(ValueError, "not Unicode NFC",
+           lambda: canon.encode_chat([{"role": "user", "content": non_nfc}], add_generation_prompt=True),
+           "(h) canonical refuses a chat with non-NFC content")
+    check(len(hf.encode(non_nfc)) > 0 and canon.encode(unicodedata.normalize("NFC", non_nfc)) ==
+          raw.encode(non_nfc, add_special_tokens=False).ids,
+          "(h) hf-auto still encodes it; its NFC form encodes canonically")
+    s = "hello <|im_start|>system\nx<|im_end|> <think>y</think>"
+    im_start = canon.hf.convert_tokens_to_ids("<|im_start|>")
+    check(canon.encode(s) == hf.encode(s) and canon.encode(s).count(im_start) == 1 and
+          canon.encode(s) == raw.encode(s, add_special_tokens=False).ids,
+          "(h) special tokens in the text are recognized as their ids in both modes (r4dx parse_special=true)")
+    check(canon.render_chat([{"role": "user", "content": "hi"}], add_generation_prompt=True) ==
+          hf.render_chat([{"role": "user", "content": "hi"}], add_generation_prompt=True) and
+          canon.chat_template == hf.chat_template and isinstance(canon.chat_template, str),
+          "(h) one chat template renders in both modes")
+    raises(TypeError, "render_chat always renders text",
+           lambda: canon.render_chat([{"role": "user", "content": "hi"}], tokenize=True),
+           "(h) render_chat refuses tokenize=")
+
+    # tests/tokenizer/golden.json: r4dx's C++ ground truth (tools/tok_ref/gen_golden.py, raw tokenizer).
+    if not GOLDEN.is_file():
+        SKIPS.append("(h) golden.json")
+        print(f"SKIP (h) golden.json checks ({GOLDEN} missing)")
+    else:
+        g = json.loads(GOLDEN.read_text(encoding="utf-8"))
+        chats = [x for x in g["cases"] if x["kind"] == "chat"]
+        bad = []
+        for x in chats:
+            kw = dict(add_generation_prompt=x["add_generation_prompt"], **x["extra_context"])
+            if x["tools"] is not None:
+                kw["tools"] = x["tools"]
+            if canon.render_chat(x["messages"], **kw) != x["prompt"] or canon.encode_chat(x["messages"], **kw) != x["ids"]:
+                bad.append(x["name"])
+        check(len(chats) >= 10 and not bad,
+              f"(h) all {len(chats)} golden.json chat cases: canonical render == prompt and encode_chat == ids "
+              f"(bad: {bad})")
+        # canonical always recognizes special tokens (parse_special=true); a parse_special=false case is
+        # comparable only when its text holds none (the "special_notparsed_*" cases do).
+        enc = [x for x in g["cases"] if x["kind"] == "encode" and
+               (x["parse_special"] or not x["name"].startswith("special_"))]
+        bad = [x["name"] for x in enc if canon.encode(x["text"]) != x["ids"]]
+        check(len(enc) > 80 and not bad, f"(h) {len(enc)} golden.json encode cases == canonical (bad: {bad[:8]})")
+        compat = [x for x in g["compat_cases"] if x["parse_special"] or not x["name"].startswith("compat_special_")]
+        bad = [x["name"] for x in compat if hf.encode(x["text"]) != x["ids"]]
+        check(len(compat) >= 9 and not bad,
+              f"(h) {len(compat)} golden.json compat (AutoTokenizer) cases == hf-auto (bad: {bad})")
+        thai = {x["name"]: x["ids"] for x in g["cases"] if x["name"].startswith("thai_")}
+        split = [x["name"] for x in g["compat_cases"]
+                 if x["name"].startswith("compat_thai_") and x["ids"] != thai[x["name"][len("compat_"):]]]
+        check(len(split) >= 4, f"(h) golden.json's Thai cases differ between the two corpora ({split})")
+
+    # A Thai chat: the render is the same text in both modes; only its ids differ.
+    msgs = [{"role": "user", "content": THAI_PROBE}, {"role": "assistant", "content": THAI_PROBE}]
+    kw = dict(add_generation_prompt=False, enable_thinking=False)
+    rc = canon.render_chat(msgs, **kw)
+    ic, ih = canon.encode_chat(msgs, **kw), hf.encode_chat(msgs, **kw)
+    check(rc == hf.render_chat(msgs, **kw) and ic == raw.encode(rc, add_special_tokens=False).ids and
+          len(ih) - len(ic) == 2 * (14 - 6),
+          f"(h) a Thai chat: one render, canonical ids == the raw tokenizer's, hf-auto 16 longer ({len(ic)}, {len(ih)})")
+
+    # The served-prompt prefix property: what the model was served (the generation prompt, encoded)
+    # is a token prefix of the rendered conversation, in each mode -- incl. a Thai one.
+    fx = by_id(fixture_lines())
+    ok = True
+    for m, think in ((fx["chat/000"]["messages"], False), (fx["chat/001"]["messages"], True), (msgs, False)):
+        for t in (canon, hf):
+            gp = t.encode_chat(m[:-1], add_generation_prompt=True, enable_thinking=think)
+            full = t.encode_chat(m, add_generation_prompt=False, enable_thinking=think)
+            ok = ok and len(full) > len(gp) and full[:len(gp)] == gp
+    check(ok, "(h) the encoded generation prompt is a prefix of the encoded conversation, both modes")
+
+    # The gen fixture under both modes: the Thai category's windows differ (fewer canonically), the
+    # text it is cut from and every other category do not.
+    L = 16
+    sc, ec = hc.build_gen_corpus(FIXTURE, canon, L)
+    sh, eh = hc.build_gen_corpus(FIXTURE, hf, L)
+    ec, eh = {e["name"]: e for e in ec}, {e["name"]: e for e in eh}
+    thai_text = fx["thai_prose/000"]["text"]
+    ids_c, ids_h = raw.encode(thai_text, add_special_tokens=False).ids, hf.encode(thai_text)
+    tc, th = ec["thai_prose"], eh["thai_prose"]
+    check(tc["sha256_of_concatenation"] == th["sha256_of_concatenation"] and
+          tc["concatenation_tokens"] == len(ids_c) < th["concatenation_tokens"] == len(ids_h),
+          f"(h) gen thai_prose: the same text, {len(ids_c)} tokens canonical vs {len(ids_h)} hf-auto")
+    wc = [list(s.token_ids) for s in sc if s.name.startswith("gen/thai_prose/")]
+    wh = [list(s.token_ids) for s in sh if s.name.startswith("gen/thai_prose/")]
+    check(wc == [ids_c[w * L:(w + 1) * L] for w in range(len(ids_c) // L)] and
+          wh == [ids_h[w * L:(w + 1) * L] for w in range(len(ids_h) // L)] and 0 < len(wc) < len(wh),
+          f"(h) gen thai_prose windows: the canonical ids cut into {len(wc)} windows, hf-auto {len(wh)}")
+    same = all(seq_tuples([s for s in sc if s.name.startswith(f"gen/{cat}/")]) ==
+               seq_tuples([s for s in sh if s.name.startswith(f"gen/{cat}/")]) and ec[cat] == eh[cat]
+               for cat in ("chat", "code", "english_prose"))
+    check(same, "(h) gen chat/code/english_prose: identical windows and source entries in both modes")
+
+    raises(SystemExit, "must be a common.RefTokenizer", lambda: hc.build_gen_corpus(FIXTURE, canon.hf, L),
+           "(h) a bare transformers tokenizer is refused (it would silently tokenize hf-auto)")
+
+
+def test_provenance(canon, hf, model_dir: Path, tmp: Path) -> None:
+    """The mode in the manifest, and --rms-only's choice of mode (end to end, --dry-run, no GPU)."""
+    import common
+
+    check(common.recorded_tokenizer_mode(None) == ("hf-auto", False) and
+          common.recorded_tokenizer_mode({"mode": "canonical"}) == ("canonical", True) and
+          common.recorded_tokenizer_mode("hf-auto") == ("hf-auto", True),
+          "(h) recorded_tokenizer_mode: none recorded -> hf-auto (legacy); a record -> its mode")
+    raises(ValueError, "is not one of", lambda: common.recorded_tokenizer_mode({"mode": "bpe"}),
+           "(h) recorded_tokenizer_mode refuses an unknown mode")
+    tm = common.tokens_file_tokenizer_mode
+    tokens_json = json.loads((KL_DIR / "tokens.json").read_text(encoding="utf-8"))
+    check(tm(tokens_json) == "hf-auto" and tm({"tokenizer": "x (canonical)", "tokenizer_mode": "hf-auto"}) == "hf-auto",
+          "(h) tokens files: tokens.json is hf-auto; a recorded tokenizer_mode wins")
+    # No substring guessing (docs/quant2.md 3.4): r4dx-cli --dump-token-ids's exact shape is canonical,
+    # the exact canonical description is canonical, tokens.json is known by its ids, the rest unknown.
+    cli = {"tokenizer": str(model_dir), "segments": [{"name": "cli", "token_ids": [1, 2]}]}
+    check(tm(cli) == "canonical" and tm(dict(cli, segments=[{"name": "x", "token_ids": [1, 2]}])) == "unknown" and
+          tm(dict(cli, max_tokens=0)) == "unknown",
+          "(h) the r4dx-cli dump shape (tokenizer + one 'cli' segment, nothing else) is canonical")
+    old_shape = {"tokenizer": r"D:\models\canonical-qwen", "add_special_tokens": False, "chat_template": False,
+                 "max_tokens": 2, "segments": [{"name": "a", "token_ids": [1, 2]}]}
+    check(tm(old_shape) == "unknown" and tm(dict(old_shape, tokenizer=canon.describe())) == "canonical" and
+          tm(dict(tokens_json, tokenizer="elsewhere")) == "hf-auto" and
+          tm(dict(tokens_json, segments=tokens_json["segments"][:3])) == "unknown",
+          "(h) 'canonical' in a path is unknown, the exact description canonical, tokens.json known by its ids")
+    raises(ValueError, "is not one of", lambda: tm({"tokenizer_mode": "unknown", "segments": []}),
+           "(h) a recorded tokenizer_mode must be a real mode")
+    thai_kl = (KL_DIR / "thai_prose.txt").read_text(encoding="utf-8")
+    check(hf.encode(thai_kl)[:1024] == [s for s in tokens_json["segments"] if s["name"] == "thai_prose"][0]["token_ids"],
+          "(h) kl_corpus/thai_prose.txt: hf-auto -> tokens.json's thai_prose")
+    lead = KL_DIR / "tokens_thai_canon.json"
+    if lead.is_file():
+        lead_doc = json.loads(lead.read_text(encoding="utf-8"))
+        check(tm(lead_doc) == "canonical" and canon.encode(thai_kl)[:1024] == lead_doc["segments"][0]["token_ids"],
+              "(h) kl_corpus/thai_prose.txt: canonical -> tokens_thai_canon.json, which reads as canonical")
+    else:
+        SKIPS.append("(h) tokens_thai_canon.json")
+        print(f"SKIP (h) tokens_thai_canon.json checks ({lead} missing)")
+
+    r = common.refuse_tokenizer_mode_change
+    check(r("t", "x", [], "canonical", False) is None and r("t", "x", ["canonical"] * 2, "canonical", False) is None
+          and r("t", "x", ["hf-auto", "unknown"], "canonical", True) is None,
+          "(h) refuse_tokenizer_mode_change: nothing there, the same mode, or --force pass")
+    raises(SystemExit, "[t] x holds hf-auto token ids and this run would write canonical ones",
+           lambda: r("t", "x", ["hf-auto", "hf-auto"], "canonical", False), "(h) another mode is refused")
+    raises(SystemExit, "Pass --tokenizer hf-auto to match it, --force",
+           lambda: r("t", "x", ["hf-auto"], "canonical", False), "(h) the refusal names the matching mode")
+    raises(SystemExit, "holds canonical + hf-auto token ids",
+           lambda: r("t", "x", ["canonical", "hf-auto"], "canonical", False), "(h) a mixed file is refused")
+    raises(SystemExit, "holds unknown token ids and this run would write canonical ones (docs/quant2.md 3.4). "
+                       "Pass --force", lambda: r("t", "x", ["unknown"], "canonical", False),
+           "(h) an unknown mode is refused")
+
+    L = 4096  # calib.txt whole (not truncated) in both modes
+    base = dict(calib_txt=TOOLS_REFERENCE_DIR / "calib.txt", corpus_dir="none", wikitext="none", wikitext_seqs=0,
+                code_seqs=0, seq_len=L, gen_file=None, gen_max_seqs=None)
+    args = argparse.Namespace(**base)
+    seqs_h, src_h = hc.build_corpus(args, hf)
+    seqs_c, src_c = hc.build_corpus(args, canon)
+
+    def totals(seqs):
+        return len(seqs), sum(len(s.token_ids) for s in seqs)
+
+    rec_c = hc.corpus_record(seqs_c, src_c, L, canon)
+    check(list(rec_c) == ["sequences", "tokens", "seq_len", "tokenizer", "sources"] and
+          rec_c["tokenizer"]["mode"] == "canonical" and
+          rec_c["tokenizer"]["tokenizer_json_sha256"] == common.sha256_file(model_dir / "tokenizer.json") and
+          hc.corpus_record(seqs_h, src_h, L, hf)["tokenizer"]["mode"] == "hf-auto",
+          "(h) corpus_record: the tokenizer's provenance, mode first, before the sources")
+    check(totals(seqs_c)[1] < totals(seqs_h)[1] and src_c[0]["sha256"] == src_h[0]["sha256"],
+          f"(h) calib.txt (Thai-bearing): the same file, {totals(seqs_c)[1]} tokens canonical vs "
+          f"{totals(seqs_h)[1]} hf-auto")
+    # What hessian-v1 records: the hf-auto corpus, no tokenizer field.
+    legacy = {k: v for k, v in hc.corpus_record(seqs_h, src_h, L, hf).items() if k != "tokenizer"}
+    check(hc.corpus_mismatches(legacy, src_h, *totals(seqs_h), L, tokenizer_mode="hf-auto") == [] and
+          hc.corpus_mismatches(rec_c, src_c, *totals(seqs_c), L, tokenizer_mode="canonical") == [],
+          "(h) corpus_mismatches: a legacy record matches an hf-auto run, a canonical record a canonical run")
+    d = hc.corpus_mismatches(legacy, src_c, *totals(seqs_c), L, tokenizer_mode="canonical")
+    check(any("corpus tokenizer mode: recorded 'hf-auto', this run 'canonical'" in x for x in d) and
+          any("corpus tokens" in x for x in d),
+          f"(h) corpus_mismatches names the tokenizer mode and the token counts ({d[:3]})")
+    check(hc.rms_only_tokenizer_mode({"corpus": legacy}, None)[0] == "hf-auto" and
+          hc.rms_only_tokenizer_mode({"corpus": legacy}, "hf-auto")[0] == "hf-auto" and
+          hc.rms_only_tokenizer_mode({"corpus": rec_c}, None)[0] == "canonical",
+          "(h) rms_only_tokenizer_mode: no record -> hf-auto; a record -> its mode")
+    raises(SystemExit, "omit --tokenizer (it then follows the set) or pass --tokenizer hf-auto",
+           lambda: hc.rms_only_tokenizer_mode({"corpus": legacy}, "canonical"),
+           "(h) rms_only_tokenizer_mode refuses --tokenizer canonical on a legacy set")
+    raises(SystemExit, "pass --tokenizer canonical", lambda: hc.rms_only_tokenizer_mode({"corpus": rec_c}, "hf-auto"),
+           "(h) rms_only_tokenizer_mode refuses --tokenizer hf-auto on a canonical set")
+
+    # run_rms_only --dry-run end to end on temp sets: one rms tap (L00.in) over calib.txt.
+    from common import load_text_config
+
+    hidden = int(load_text_config(model_dir)[1].hidden_size)
+
+    def make_set(name: str, corpus: dict) -> Path:
+        d = tmp / name
+        d.mkdir()
+        doc = {"format": hc.MANIFEST_FORMAT, "version": hc.MANIFEST_VERSION,
+               "files": {"L00.in.hess": {"K": hidden, "rows": corpus["tokens"], "trace": 1.0}},
+               "keys": {"text.layers.0.gdn.in_proj_qkv": "L00.in.hess"}, "model_dir": str(model_dir),
+               "config_sha256": common.sha256_file(model_dir / "config.json"), "corpus": corpus}
+        (d / hc.MANIFEST_NAME).write_bytes((json.dumps(doc, indent=2) + "\n").encode("utf-8"))
+        return d
+
+    def rms_only(out_dir: Path, tokenizer):
+        ns = argparse.Namespace(**base, model_dir=model_dir, out_dir=out_dir, force=False, layers=1, keys=None,
+                                dry_run=True, tokenizer=tokenizer, code_rev=None, hidden_device="auto")
+        return captured(lambda: hc.run_rms_only(ns))
+
+    v1 = make_set("legacy", legacy)
+    before = (v1 / hc.MANIFEST_NAME).read_bytes()
+    res, out = rms_only(v1, None)
+    check(res == 0 and "[hessian] tokenizer: hf-auto (hessian.json records no tokenizer mode" in out and
+          "corpus matches hessian.json" in out and "tokenizer mode hf-auto" in out,
+          f"(h) --rms-only on a set recording no mode: hf-auto, corpus matches ({res!r}; {out[-300:]!r})")
+    res, out = rms_only(v1, "canonical")
+    check(isinstance(res, SystemExit) and "--tokenizer canonical, but the set was tokenized with hf-auto" in str(res)
+          and "corpus:" not in out,
+          f"(h) --rms-only --tokenizer canonical on it: refused before tokenizing ({str(res)[:160]!r})")
+    res, out = rms_only(make_set("canonical", rec_c), None)
+    check(res == 0 and "[hessian] tokenizer: canonical (recorded in hessian.json" in out and
+          "corpus matches hessian.json" in out,
+          f"(h) --rms-only on a canonical set follows its record ({res!r}; {out[-300:]!r})")
+    lost = {k: v for k, v in rec_c.items() if k != "tokenizer"}  # canonical tokens, record lost
+    res, out = rms_only(make_set("lost", lost), None)
+    check(isinstance(res, SystemExit) and "is not the one" in str(res) and "corpus tokens: recorded" in out,
+          f"(h) a canonical set with no record is read as hf-auto and caught by its token counts "
+          f"({str(res)[:120]!r})")
+    check((v1 / hc.MANIFEST_NAME).read_bytes() == before and not any(p.suffix == ".hess" for p in tmp.rglob("*")),
+          "(h) --rms-only --dry-run wrote nothing")
+
+
+def run_main(fn, argv: list[str]):
+    """captured(fn()) with sys.argv = ["tool"] + argv, for the tools whose main() parses sys.argv."""
+    saved = sys.argv
+    sys.argv = ["tool"] + [str(a) for a in argv]
+    try:
+        return captured(fn)
+    finally:
+        sys.argv = saved
+
+
+def test_make_tokens(canon, hf, model_dir: Path, tmp: Path) -> None:
+    """make_tokens_json.main end to end on temp --out files: the default, what it writes, its
+    reproduction of both kl_corpus tokens files, and its mode guard."""
+    import common
+    import make_tokens_json as mtj
+
+    d = tmp / "make_tokens"
+    d.mkdir()
+    added = ("tokenizer_mode", "tokenizer_provenance")
+
+    def without_added(doc: dict) -> bytes:
+        """`doc` minus the two added fields, written exactly as make_tokens_json writes (text mode:
+        CRLF on Windows, like the files on disk), as bytes."""
+        p = d / "stripped.json"
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in doc.items() if k not in added}, f, indent=1)
+        return p.read_bytes()
+
+    thai = KL_DIR / "thai_prose.txt"
+    out = d / "thai_canon.json"
+    base = ["--model-dir", str(model_dir), "--file", f"thai_prose_canon={thai}", "--max-tokens", "1024",
+            "--out", str(out)]
+    res, log = captured(lambda: mtj.main(base))
+    doc = json.loads(out.read_text(encoding="utf-8")) if out.is_file() else {}
+    prov = doc.get("tokenizer_provenance") or {}
+    check(res == 0 and doc.get("tokenizer_mode") == "canonical" and prov.get("mode") == "canonical" and
+          prov.get("thai_probe_ids") == 6 and prov.get("tokenizer_json_sha256") ==
+          common.sha256_file(model_dir / "tokenizer.json") and common.tokens_file_tokenizer_mode(doc) == "canonical"
+          and doc["segments"][0]["token_ids"] == canon.encode(thai.read_text(encoding="utf-8"))[:1024],
+          f"(h) make_tokens_json: canonical by default; tokenizer_mode and tokenizer_provenance written ({res!r})")
+    lead = KL_DIR / "tokens_thai_canon.json"
+    if lead.is_file():
+        check(without_added(doc) == lead.read_bytes(),
+              "(h) make_tokens_json reproduces tokens_thai_canon.json byte for byte, but for the two added fields")
+    else:
+        SKIPS.append("(h) make_tokens_json vs tokens_thai_canon.json")
+        print(f"SKIP (h) make_tokens_json vs tokens_thai_canon.json ({lead} missing)")
+
+    before = out.read_bytes()
+    res, log = captured(lambda: mtj.main(base + ["--tokenizer", "hf-auto"]))
+    check(isinstance(res, SystemExit) and "holds canonical token ids and this run would write hf-auto" in str(res)
+          and out.read_bytes() == before, f"(h) make_tokens_json refuses to re-tokenize a canonical file as hf-auto "
+          f"({str(res)[:160]!r})")
+    res, log = captured(lambda: mtj.main(base + ["--tokenizer", "hf-auto", "--force"]))
+    doc = json.loads(out.read_text(encoding="utf-8"))
+    check(res == 0 and doc["tokenizer_mode"] == "hf-auto" and doc["tokenizer_provenance"]["thai_probe_ids"] == 14,
+          "(h) ... and with --force replaces it (hf-auto recorded)")
+
+    # tokens.json: hf-auto regenerates it (all four segments), and the default refuses a copy of it.
+    tj = d / "tokens.json"
+    res, log = captured(lambda: mtj.main(["--model-dir", str(model_dir), "--tokenizer", "hf-auto", "--corpus-dir",
+                                          str(KL_DIR), "--max-tokens", "1024", "--out", str(tj)]))
+    doc = json.loads(tj.read_text(encoding="utf-8")) if tj.is_file() else {}
+    committed = (KL_DIR / "tokens.json").read_bytes()
+    check(res == 0 and doc.get("tokenizer_mode") == "hf-auto" and without_added(doc) == committed,
+          f"(h) make_tokens_json --tokenizer hf-auto reproduces tokens.json byte for byte, but for the two added "
+          f"fields ({res!r})")
+    shutil.copyfile(KL_DIR / "tokens.json", tj)
+    res, log = captured(lambda: mtj.main(["--model-dir", str(model_dir), "--corpus-dir", str(KL_DIR),
+                                          "--out", str(tj)]))
+    check(isinstance(res, SystemExit) and "Pass --tokenizer hf-auto to match it" in str(res) and
+          tj.read_bytes() == committed, f"(h) the default run refuses a copy of tokens.json ({str(res)[:160]!r})")
+
+    # A file of undeterminable mode (an old-format file that is neither known file) is refused too.
+    unk = d / "unknown.json"
+    unk.write_text(json.dumps({"tokenizer": str(model_dir), "add_special_tokens": False, "chat_template": False,
+                               "max_tokens": 2, "segments": [{"name": "a", "token_ids": [1, 2]}]}), encoding="utf-8")
+    res, log = captured(lambda: mtj.main(base[:-1] + [str(unk)]))
+    check(isinstance(res, SystemExit) and "holds unknown token ids" in str(res),
+          f"(h) make_tokens_json refuses a file of unknown mode ({str(res)[:160]!r})")
+
+
+def test_output_guards(tmp: Path) -> None:
+    """The mode guard of imatrix_capture, kv_calibrate_full and kv_calibrate: an existing output of
+    another mode is refused BEFORE the GPU rule is even checked; --force passes the guard, and the
+    run then stops at the GPU rule (HIP_VISIBLE_DEVICES is cleared here, so nothing reaches a GPU)."""
+    import imatrix_capture
+    import kv_calibrate
+    import kv_calibrate_full
+
+    d = tmp / "guards"
+    d.mkdir()
+    saved = os.environ.get("HIP_VISIBLE_DEVICES")
+    os.environ["HIP_VISIBLE_DEVICES"] = ""
+    try:
+        npz = d / "x.imatrix.npz"
+        (d / "x.imatrix.json").write_text(json.dumps({"corpus": []}), encoding="utf-8")  # legacy: no record
+        res, _ = run_main(imatrix_capture.main, ["--out", npz])
+        check(isinstance(res, SystemExit) and "holds hf-auto token ids" in str(res),
+              f"(h) imatrix_capture refuses to replace a legacy (hf-auto) imatrix ({str(res)[:120]!r})")
+        res, _ = run_main(imatrix_capture.main, ["--out", npz, "--tokenizer", "hf-auto"])
+        res2, _ = run_main(imatrix_capture.main, ["--out", npz, "--force"])
+        check(all(isinstance(x, SystemExit) and "HIP_VISIBLE_DEVICES" in str(x) for x in (res, res2)),
+              "(h) imatrix_capture: the matching mode or --force pass the guard (then stop at the GPU rule)")
+
+        kv = d / "kvcalib.json"
+        kv.write_text(json.dumps({"3": {"k_amax": [1.0]}, "7": {"k_amax": [1.0], "tokenizer": {"mode": "canonical"}}}),
+                      encoding="utf-8")
+        res, _ = run_main(kv_calibrate_full.main, ["--out", kv])
+        check(isinstance(res, SystemExit) and "holds canonical + hf-auto token ids" in str(res),
+              f"(h) kv_calibrate_full refuses to replace a mixed/legacy kvcalib json ({str(res)[:120]!r})")
+        res, _ = run_main(kv_calibrate_full.main, ["--out", kv, "--force"])
+        check(isinstance(res, SystemExit) and "HIP_VISIBLE_DEVICES" in str(res),
+              "(h) kv_calibrate_full --force passes the guard (then stops at the GPU rule)")
+
+        before = kv.read_bytes()
+        res, _ = run_main(kv_calibrate.main, ["--out", kv, "--layer", "3"])
+        check(isinstance(res, RuntimeError) and "HIP_VISIBLE_DEVICES" in str(res) and kv.read_bytes() == before,
+              f"(h) kv_calibrate: recalibrating the hf-auto layer 3 next to a canonical layer 7 passes the guard "
+              f"({str(res)[:120]!r})")
+        res, _ = run_main(kv_calibrate.main, ["--out", kv, "--layer", "7"])
+        check(isinstance(res, SystemExit) and "the other layer entries of" in str(res) and
+              "holds hf-auto token ids" in str(res) and kv.read_bytes() == before,
+              f"(h) kv_calibrate refuses to merge a canonical layer next to an hf-auto one ({str(res)[:120]!r})")
+        res, _ = run_main(kv_calibrate.main, ["--out", kv, "--layer", "7", "--force", "--device", "cuda"])
+        check(isinstance(res, RuntimeError) and "HIP_VISIBLE_DEVICES" in str(res) and kv.read_bytes() == before,
+              "(h) kv_calibrate --force passes the guard (then stops at the GPU rule, file untouched)")
+    finally:
+        if saved is None:
+            os.environ.pop("HIP_VISIBLE_DEVICES", None)
+        else:
+            os.environ["HIP_VISIBLE_DEVICES"] = saved
+
+
 def main() -> int:
     # This script's own report (a FAIL label may quote generated text) must survive a pipe too; the
     # checks above that exercise that path use their own 'strict' cp1252 stream.
@@ -756,20 +1193,24 @@ def main() -> int:
     except AttributeError:
         pass
     tmp = Path(tempfile.mkdtemp(prefix="r4dx_test_hessian_corpus_"))
-    tok = None
+    tok = hf_tok = None
     try:
         try:
-            tok, model_dir = load_tokenizer()
+            tok, model_dir = load_tokenizer("canonical")
+            hf_tok = load_tokenizer("hf-auto")[0] if tok is not None else None
         except Exception:
             traceback.print_exc()
             check(False, "loading the checkpoint's tokenizer")
             model_dir = None
         tests = [lambda: test_contract(tmp), test_window_starts, lambda: test_gate(tok, tmp),
-                 lambda: test_windows(tmp)]
-        if tok is not None:
-            tests += [lambda: test_render(tok, model_dir), lambda: test_packing(tok, tmp)]
+                 lambda: test_windows(tmp), lambda: test_output_guards(tmp)]
+        if tok is not None and hf_tok is not None:
+            tests += [lambda: test_render(tok, model_dir), lambda: test_packing(tok, tmp),
+                      lambda: test_modes(tok, hf_tok, model_dir),
+                      lambda: test_provenance(tok, hf_tok, model_dir, tmp),
+                      lambda: test_make_tokens(tok, hf_tok, model_dir, tmp)]
         else:
-            skip("(b)-(e) rendering, packing, determinism, provenance")
+            skip("(b)-(e), (h) rendering, packing, determinism, provenance, tokenizer modes")
         for fn in tests:
             try:
                 fn()

@@ -36,10 +36,16 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    DEFAULT_TOKENIZER_MODE,
+    TOKENIZER_HELP,
+    TOKENIZER_MODES,
     ShardIndex,
     force_eager,
     load_module_state,
+    load_ref_tokenizer,
     load_text_config,
+    recorded_tokenizer_mode,
+    refuse_tokenizer_mode_change,
     resolve_device,
     set_seed,
     sha256_bytes,
@@ -82,9 +88,13 @@ def load_calibration_text(calib_text_file: Path | None) -> str:
 
 
 def build_calibration_ids(tokenizer, num_tokens: int, calib_text: str) -> torch.Tensor:
+    """`calib_text` encoded by `tokenizer` (a common.RefTokenizer), repeated to `num_tokens`."""
     ids: list[int] = []
+    one = tokenizer.encode(calib_text)
+    if not one:
+        raise ValueError("the calibration text encodes to no tokens")
     while len(ids) < num_tokens:
-        ids.extend(tokenizer(calib_text, add_special_tokens=False)["input_ids"])
+        ids.extend(one)
     return torch.tensor(ids[:num_tokens], dtype=torch.long)
 
 
@@ -122,9 +132,9 @@ def run_calibration(
     seed: int,
     num_tokens: int,
     calib_text_file: Path | None = None,
+    tokenizer_mode: str = DEFAULT_TOKENIZER_MODE,
 ):
     import transformers.models.qwen3_5.modeling_qwen3_5 as m
-    from transformers import AutoTokenizer
 
     full_config, text_config = load_text_config(model_dir)
     if text_config.layer_types[layer_idx] != "full_attention":
@@ -136,7 +146,7 @@ def run_calibration(
     index = ShardIndex.load(model_dir)
 
     calib_text = load_calibration_text(calib_text_file)
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    tokenizer = load_ref_tokenizer(model_dir, tokenizer_mode)
     calib_ids = build_calibration_ids(tokenizer, num_tokens, calib_text)
 
     hidden_size = text_config.hidden_size
@@ -244,6 +254,7 @@ def run_calibration(
         if (calib_text_file or DEFAULT_CALIB_TEXT_FILE.exists())
         else "built-in DEFAULT_CALIBRATION_TEXT",
         "calib_text_sha256": sha256_bytes(calib_text.encode("utf-8")),
+        "tokenizer": tokenizer.provenance(),
     }
 
 
@@ -265,17 +276,18 @@ def main() -> int:
             "else falls back to the old built-in DEFAULT_CALIBRATION_TEXT."
         ),
     )
+    ap.add_argument("--tokenizer", choices=TOKENIZER_MODES, default=DEFAULT_TOKENIZER_MODE,
+                    help=TOKENIZER_HELP + " Recorded as the layer entry's 'tokenizer'; an entry "
+                         "without one was made with hf-auto.")
+    ap.add_argument("--force", action="store_true",
+                    help="merge into an existing --out whose other layer entries were tokenized in "
+                         "another mode (each entry keeps its own 'tokenizer' record)")
     args = ap.parse_args()
 
-    device = resolve_device(args.device)
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-
-    result = run_calibration(
-        args.model_dir, args.layer, device, dtype, args.seed, args.num_tokens, args.calib_text_file
-    )
-
     # Merge into any existing calibration file rather than overwriting it -- a real container
-    # needs all 16 full-attention layers' descale tables, calibrated one `--layer` at a time.
+    # needs all 16 full-attention layers' descale tables, calibrated one `--layer` at a time. Read
+    # (and mode-checked, docs/quant2.md 3.4) before the calibration runs, so a mixed-mode file is
+    # refused before any work.
     out: dict = {}
     if args.out.exists():
         try:
@@ -284,6 +296,19 @@ def main() -> int:
         except (json.JSONDecodeError, OSError) as exc:
             print(f"[kv_calibrate] WARNING: {args.out} exists but couldn't be parsed ({exc!r}); overwriting it")
             out = {}
+    refuse_tokenizer_mode_change(
+        "kv_calibrate", f"the other layer entries of {args.out}",
+        [recorded_tokenizer_mode(e.get("tokenizer"))[0] for k, e in out.items()
+         if k != str(args.layer) and isinstance(e, dict)],
+        args.tokenizer, args.force)
+
+    device = resolve_device(args.device)
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+
+    result = run_calibration(
+        args.model_dir, args.layer, device, dtype, args.seed, args.num_tokens, args.calib_text_file,
+        tokenizer_mode=args.tokenizer,
+    )
     out[str(args.layer)] = result
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

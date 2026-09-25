@@ -80,7 +80,7 @@ sys.path.insert(0, str(HERE))
 import gen_corpus as gc  # noqa: E402
 
 TOOLS_REFERENCE_DIR = HERE.parent / "reference"
-#: The checkpoint (tools/reference/common.py's DEFAULT_MODEL_DIR; not imported, it imports torch).
+#: The checkpoint (tools/reference/common.py's DEFAULT_MODEL_DIR; common is imported only by (k)).
 MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
 
 CHECKS = 0
@@ -514,11 +514,16 @@ def check_with_reader(out: Path, kl: Path) -> None:
         skip(label, f"no tokenizer.json under {MODEL_DIR}")
         return
     try:
-        from transformers import AutoTokenizer
+        import tokenizers  # noqa: F401
+        import transformers  # noqa: F401
     except ImportError as e:
-        skip(label, f"no transformers: {e}")
+        skip(label, f"no tokenizers/transformers: {e}")
         return
-    tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
+    # The capture's own tokenizer, in its default (canonical) mode: tokenizer.json as r4dx-server
+    # tokenizes what it serves (docs/quant2.md 3.4).
+    from common import load_ref_tokenizer
+
+    tok = load_ref_tokenizer(MODEL_DIR)
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):

@@ -53,7 +53,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    DEFAULT_TOKENIZER_MODE,
+    TOKENIZER_HELP,
+    TOKENIZER_MODES,
+    load_ref_tokenizer,
     load_text_config,
+    recorded_tokenizer_mode,
+    refuse_tokenizer_mode_change,
     resolve_device,
     sha256_bytes,
     sha256_file,
@@ -280,14 +286,16 @@ def render_chat(path: Path, tokenizer) -> str:
     """A `*.messages.json` corpus entry: `{"messages": [{"role", "content"}, ...]}` rendered with
     the checkpoint's OWN chat template (the engine serves chat, so the calibration set has to
     contain the real control tokens in their real positions). `add_generation_prompt=False`: the
-    conversation already ends with the assistant's turn."""
+    conversation already ends with the assistant's turn. `tokenizer` is a common.RefTokenizer."""
     doc = json.loads(path.read_text(encoding="utf-8"))
     messages = doc["messages"] if isinstance(doc, dict) else doc
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    return tokenizer.render_chat(messages, add_generation_prompt=False)
 
 
 def collect_corpus(corpus_dir: Path, calib_txt: Path | None, extra: list[Path],
                    tokenizer, max_tokens: int) -> list[CorpusFile]:
+    """One CorpusFile per file, its text (a chat rendered, see render_chat) encoded by `tokenizer`
+    -- a common.RefTokenizer, whose mode the caller records -- and truncated to `max_tokens`."""
     paths: list[Path] = []
     if calib_txt is not None:
         if not calib_txt.exists():
@@ -318,7 +326,7 @@ def collect_corpus(corpus_dir: Path, calib_txt: Path | None, extra: list[Path],
             text = p.read_text(encoding="utf-8")
             name = p.stem
         cf = CorpusFile(name, p, kind, text)
-        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        ids = tokenizer.encode(text)
         cf.token_ids = list(ids)[:max_tokens]  # one sequence per file, fresh context, truncated
         if len(cf.token_ids) < 2:
             raise SystemExit(f"[kv_calib_full] {p} tokenizes to {len(cf.token_ids)} ids; need >= 2")
@@ -380,8 +388,23 @@ def main() -> int:
     ap.add_argument("--rope-check", type=int, default=None, metavar="LAYER",
                     help="gate (c): on LAYER, also capture the pre-rope K and verify the tap is "
                          "post-rope; writes <out>.ropecheck.json")
+    ap.add_argument("--tokenizer", choices=TOKENIZER_MODES, default=DEFAULT_TOKENIZER_MODE,
+                    help=TOKENIZER_HELP + " Recorded as every layer entry's 'tokenizer'; a kvcalib "
+                         "json without one was made with hf-auto.")
+    ap.add_argument("--force", action="store_true",
+                    help="replace an existing --out whose tokenizer mode differs from this run's "
+                         "(the default --out is the hf-auto kvcalib json)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
+
+    # Never silently replace an artifact of the other tokenizer mode (docs/quant2.md 3.4): the
+    # default --out is the pre-switch (hf-auto) kvcalib json. Checked before anything else.
+    if args.out.exists():
+        prev = json.loads(args.out.read_text(encoding="utf-8"))
+        refuse_tokenizer_mode_change(
+            "kv_calib_full", str(args.out),
+            [recorded_tokenizer_mode(e.get("tokenizer"))[0] for e in prev.values() if isinstance(e, dict)],
+            args.tokenizer, args.force)
 
     # The GPU rule, enforced before anything expensive happens (common.resolve_device re-checks it).
     visible = os.environ.get("HIP_VISIBLE_DEVICES")
@@ -393,10 +416,10 @@ def main() -> int:
     device = resolve_device("cuda")
     dtype = torch.bfloat16
 
-    from transformers import AutoTokenizer
     import transformers
 
-    tokenizer = AutoTokenizer.from_pretrained(str(args.model_dir))
+    tokenizer = load_ref_tokenizer(args.model_dir, args.tokenizer)
+    print(f"[kv_calib_full] tokenizer: {tokenizer.mode} ({tokenizer.describe()})")
 
     calib_txt = None if str(args.calib_txt).lower() == "none" else args.calib_txt
     corpus_dir = None if str(args.corpus_dir).lower() == "none" else args.corpus_dir
@@ -455,6 +478,7 @@ def main() -> int:
                     "sha256": sha256_file(c.path), "tokens": len(c.token_ids),
                     "rendered_sha256": sha256_bytes(c.text.encode("utf-8"))}
                    for c in corpus]
+    tokenizer_prov = tokenizer.provenance()
     generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     out: dict = {}
@@ -487,6 +511,7 @@ def main() -> int:
             "model_dir": str(args.model_dir),
             "config_sha256": sha256_file(args.model_dir / "config.json"),
             "corpus": corpus_meta,
+            "tokenizer": tokenizer_prov,
             "total_calibration_tokens": total_tokens,
             "max_tokens_per_file": args.max_tokens,
             "torch_version": torch.__version__,

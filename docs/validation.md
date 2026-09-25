@@ -204,7 +204,7 @@ same format so a KL report can pair them row for row:
 
 | file | contents |
 |---|---|
-| tokens file (JSON) | `{"tokenizer": "<hf path or name>", "segments": [{"name": "<str>", "token_ids": [int, ...]}, ...]}` -- ids from the checkpoint's own HF `AutoTokenizer` with `add_special_tokens=False` on the raw text: **no chat template, no BOS**. Each segment is scored independently from a fresh context at position 0. |
+| tokens file (JSON) | `{"tokenizer": "<description>", "tokenizer_mode": "canonical"\|"hf-auto", "segments": [{"name": "<str>", "token_ids": [int, ...]}, ...]}` (plus provenance extras) -- ids of the raw text with nothing added: **no chat template, no BOS**. `tokenizer_mode` says how text became ids: `canonical` is the checkpoint's `tokenizer.json` as r4dx tokenizes it, `hf-auto` transformers' `AutoTokenizer`, which splits Thai combining marks (only the pre-2026-09-26 `kl_corpus/tokens.json`); see docs/quant2.md 3.4. Each segment is scored independently from a fresh context at position 0. |
 | `<out-dir>/<segment>.logprobs.f16` | raw little-endian float16, row-major `[T-1, V]`, no header. `V` is the model's own `lm_head` vocab (`Config().vocab_size`), which the tools print rather than assume. |
 | `<out-dir>/<segment>.meta.json` | `{"T", "V", "dtype": "float16", "rows": T-1, "source": "<r4dx\|reference>", "layout"\|"torch_dtype", "sha256_of_token_ids_json"}` (plus provenance extras). |
 
@@ -265,15 +265,20 @@ output is a distribution (`max |log sum_j exp(row[j])| < 1e-2`, measured ~1.5e-6
 
 **Getting the token ids right.** Two producers, both writing the tokens file format above:
 
-- `tools/reference/make_tokens_json.py` -- text files through the checkpoint's `AutoTokenizer`,
-  one segment per file, with per-segment truncation. This is what a corpus-driven KL run uses. Runs
-  in the read-only reference venv; no GPU, no weights, only the tokenizer files.
+- `tools/reference/make_tokens_json.py` -- text files through the checkpoint's tokenizer, one
+  segment per file, with per-segment truncation. This is what a corpus-driven KL run uses.
+  `--tokenizer canonical` (the default) is `tokenizer.json` as r4dx tokenizes; `--tokenizer
+  hf-auto` (AutoTokenizer) only regenerates `kl_corpus/tokens.json`. The file records
+  `tokenizer_mode` (docs/quant2.md 3.4). Runs in the read-only reference venv; no GPU, no weights,
+  only the tokenizer files.
 - `r4dx-cli --dump-token-ids <tokens.json>` -- writes the ids **actually fed into the model's
   KV/GDN state** so far (the rendered prompt plus every committed generated token) as a single
   `"cli"` segment, rewritten in full after every turn. Re-tokenizing the printed text cannot
   reproduce them: the chat template's special tokens, and anything the stream decoder's
   `skip_special_tokens=true` dropped, would be lost. This is what makes a "generate, then score what
-  you generated" check possible at all.
+  you generated" check possible at all. The file carries no `tokenizer_mode`; the Python readers
+  (`common.tokens_file_tokenizer_mode`) take this exact shape -- `tokenizer` and `segments` only,
+  one `"cli"` segment -- as canonical, r4dx's own tokenizer.
 
 **The automatic check: ctest `test_teacher_forced_logprobs`**
 (`tests/model/test_teacher_forced_logprobs.cpp`, HIP device 1, SKIPPED when

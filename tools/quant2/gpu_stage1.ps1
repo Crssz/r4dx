@@ -6,13 +6,21 @@
 #   1. GPU ctests for the new Q2 kernels, the Q3 grouped dispatch, and the default-path regressions
 #   2. libr4d's grouped w4a16 GEMM correctness test (all three groups vs a CPU dequant reference)
 #   3. the Q1 Hessian capture (~30-60 min, ~48 GiB)
+#
+# -Tokenizer (docs/quant2.md 3.4): hessian-v1, the default -HessianDir, is an hf-auto (AutoTokenizer)
+# set, so this script captures hf-auto by default. A canonical capture needs -Tokenizer canonical AND
+# another -HessianDir; a canonical set under the hessian-v1 name is refused.
 param(
   [string]$OutDir = 'D:\models\r4dx\quant2-gpu',
   [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
   [string]$HessianDir = 'D:\models\r4dx\hessian-v1',
+  [ValidateSet('hf-auto', 'canonical')][string]$Tokenizer = 'hf-auto',
   [switch]$SkipCapture
 )
 $ErrorActionPreference = 'Continue'
+if (-not $SkipCapture -and $Tokenizer -ne 'hf-auto' -and (Split-Path -Leaf $HessianDir) -eq 'hessian-v1') {
+  throw "[stage1] hessian-v1 is the hf-auto set (docs/quant2.md 3.4): pass another -HessianDir for a $Tokenizer capture"
+}
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 if (Get-Process r4dx-server -ErrorAction SilentlyContinue) { throw '[stage1] stop r4dx-server first' }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
@@ -42,7 +50,7 @@ Step 'libr4d_w4a16_groups' {
 if (-not $SkipCapture) {
   Step 'hessian_capture' {
     Push-Location $repo
-    try { & $Python -u tools\reference\hessian_capture.py --out-dir $HessianDir } finally { Pop-Location }
+    try { & $Python -u tools\reference\hessian_capture.py --out-dir $HessianDir --tokenizer $Tokenizer } finally { Pop-Location }
   }
 }
 Write-Host "[stage1] done: $(Join-Path $OutDir 'summary.json')"

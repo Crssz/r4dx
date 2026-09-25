@@ -30,10 +30,18 @@ struct LinearTuning {
 // order the partial sums are added in, so two M-bands with different SK give the same row
 // different last bits -- and a speculative verify row must equal the single-row decode row exactly
 // (linear.cpp's kRowTile).
+//
+// `group` (quant2 Q3, docs/quant2.md section 5.1) is the w4a16 group the row was measured at, and
+// is part of the key for w4a16: 0 -- what every row generated before per-tensor groups leaves it at
+// -- means "this build's default group", so those rows serve exactly the linears they served
+// before and nothing else; a row naming 32/64/128 serves only linears at that group. A w4a16
+// linear at a non-default group with no row of its own falls back to FallbackTuning, like an
+// untuned shape. Ignored for every other layout.
 struct GemmTuningRow {
   Layout layout;
   int64_t N, K, M;
   LinearTuning tuning;
+  int group = 0;
 };
 
 // Picks a WV/SK/MB/NPW/NT for a (layout, N, K) GEMM chunk of M rows. Looks up
@@ -44,7 +52,15 @@ struct GemmTuningRow {
 // a 4-layer container with the same shapes as the real 64-layer one, so in practice every shape
 // PickTuning ever sees during normal operation IS covered by the table once tune_gemm.py has run;
 // the fallback exists for robustness, not because it is expected to fire in production).
-LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M);
+// `w4a16_group` (layout kW4a16 only; QuantLinear::w4a16_group): 0 or this build's default group
+// resolve exactly as before per-tensor groups; 32/64/128 otherwise look up only rows measured at
+// that group (GemmTuningRow::group), then FallbackTuning. Every pick is legal for the kernel at
+// that group: K % (SK * max(group, 64)) == 0.
+LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int w4a16_group = 0);
+
+// The group an r4d_gemm_w4a16_nt_m64 launch for a QuantLinear with this w4a16_group runs at: 0
+// becomes r4d_gemm_w4a16_nt_m64_group(), anything else is returned as is.
+int EffectiveW4a16Group(int w4a16_group);
 
 // Tensor parallel (docs/tp.md 2.7): marks the CALLING thread as one that runs a TP=2 rank's Model
 // (Model::Load calls it on every load with ModelOptions::tp.world > 1 -- true on a rank thread in

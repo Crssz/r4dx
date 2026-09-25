@@ -169,6 +169,41 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     selects `w4a16` for the body, the lm head or the MTP head. The `quant` block is written
     unconditionally, so a container's recorded w4a16 group says nothing about whether it holds a
     `.w4a16.*` tensor, and a `--layout mxfp4` / `--layout w4a8` / `--layout bf16` run reads none.
+  - **Per-tensor groups** (docs/quant2.md section 5, Q3; `r4dx-convert --w4a16-group-rule
+    "<regex>=<g>"`, `src/convert/include/r4dx_convert/w4a16_groups.hpp`). `quant.w4a16.group` stays
+    the container's DEFAULT group -- the one it was packed with and the one a loading binary's
+    `r4d_gemm_w4a16_nt_m64_group()` must equal. A linear packed at another `g` in {32, 64, 128}
+    differs in exactly two places:
+    - its scale tensor is **`<name>.w4a16.wsz.g<g>`** (e.g. `text.layers.5.mlp.down.w4a16.wsz.g32`),
+      `uint32[N * K / g]` in the same tile/group/row order as above, instead of `<name>.w4a16.wsz`
+      (`<name>.w4a16.wq` keeps its name and its bytes' layout: the 64-K packed block does not
+      depend on the group);
+    - its base is listed in the optional **`__metadata__.quant.w4a16.groups`**, an object
+      `{"<container base>": g, ...}` naming ONLY the linears whose group differs from the default.
+      No key, or an empty object, means every w4a16 linear is at the default -- a container
+      converted without the flag has neither the key nor a renamed tensor, and is byte-identical
+      to one converted before per-tensor groups existed.
+
+    The loader resolves each w4a16 linear's group from the map (default otherwise), reads the
+    matching scale name, and dispatches `r4d_gemm_w4a16_nt_m64_g` for a non-default group (the
+    default keeps the existing entry). The default-group check applies to the unmapped linears; a
+    mapped one needs `r4d_gemm_w4a16_nt_m64_has_group(g)`. Shape rules: `K % g == 0`, `K % 64 == 0`
+    (32 is half a packed block), `N % 16 == 0` -- the converter refuses anything else while
+    planning. At `g = 32` a weight costs 5 bits (`4 + 32/32`).
+
+    The rename is the guard against **binaries that predate per-tensor groups**: they never read the
+    map, look for the bare `.w4a16.wsz`, and so cannot read the scales at the default stride. Their
+    `LoadQuantLinearWithFallback` (requested layout -> `.bf16.w` -> bare name) then throws "no tensor
+    found ... in any known on-disk form" -- but only if the linear has no `.bf16.w` to fall back to;
+    with one it would load the bf16 copy instead (right numbers, wrong layout and memory, one
+    fallback-count line in the log). So `r4dx-convert` refuses a non-default group on any linear that
+    also keeps a `.bf16.w` (convert with `--no-bf16` and an `--lm-head` spec without bf16, as the
+    production recipe already does). `r4dx_format_version` is not bumped: no reader checks it.
+    `__metadata__.r4dx_convert_run` records `w4a16_group_rules` (the rules as given; first match
+    wins), `w4a16_groups` (the resolved map, identical to `quant.w4a16.groups`) and
+    `w4a16_group_extra_bytes` (the signed `.wsz` byte delta against packing those linears at the
+    default) -- all three only when rules were given. The DFlash2 drafter container never carries
+    a map (`--w4a16-group-rule` is refused with `--dflash-gguf`).
 
 **`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): the same nibble *permutation* as `w4a16`
   (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), but its own separately

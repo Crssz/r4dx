@@ -46,7 +46,14 @@ constexpr int64_t kRowTile = 16;
 // {1,2,4,8} for w4a8/mxfp4) and NT=1 takes the non-temporal weight-load path
 // r4d_gemm_w4a16_nt_m64.hip's own comment recommends for a weight that is read once per step and
 // never reused.
-LinearTuning FallbackTuning(Layout /*layout*/, int64_t N, int64_t K) {
+//
+// quant2 Q3 (docs/quant2.md section 5.1): this is also the tuning of every w4a16 linear at a
+// per-tensor group the table has no row for. The kernel's rule at group g is K % (SK * max(g, 64))
+// -- a split must start on a 64-K packed block, which a group of 32 does not guarantee -- so SK=4
+// needs K % 256 at g32/g64 and K % 512 at g128: the K % 512 check below already covers all three.
+// `w4a16_group` is the EFFECTIVE group (EffectiveW4a16Group); the explicit check only keeps a future
+// edit of SK from quietly breaking the per-tensor groups.
+LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int w4a16_group) {
   if (K % 512 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
                               " is not a multiple of 512 (SK=4 * w4a16/w4a8 group 128) -- this "
@@ -56,7 +63,20 @@ LinearTuning FallbackTuning(Layout /*layout*/, int64_t N, int64_t K) {
     throw std::runtime_error("r4dx::model::PickTuning: N=" + std::to_string(N) +
                               " is not a multiple of 16");
   }
-  return LinearTuning{/*WV=*/4, /*SK=*/4, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
+  constexpr int kSk = 4;
+  if (layout == Layout::kW4a16 && K % (kSk * std::max(w4a16_group, 64)) != 0) {
+    throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
+                              " does not split into SK=4 whole groups at w4a16 group " +
+                              std::to_string(w4a16_group));
+  }
+  return LinearTuning{/*WV=*/4, /*SK=*/kSk, /*MB=*/1, /*NPW=*/1, /*NT=*/1};
+}
+
+// r4d_gemm_w4a16_nt_m64_group(): the group the historical entry serves and every row with
+// GemmTuningRow::group == 0 was meant for.
+int DefaultW4a16Group() {
+  static const int kGroup = r4d_gemm_w4a16_nt_m64_group();
+  return kGroup;
 }
 
 // tools/profile/tune_gemm.py's measured sweep, if it has been generated (src/model/CMakeLists.txt
@@ -79,15 +99,25 @@ thread_local bool t_tp2_tuning = false;
 // splits K into SK slices of whole groups at 64 need not at 128 (SK=16 at K=5120), and the kernel
 // throws on it. Such a row is skipped here, so this build falls through to the next wider M-band's
 // row, then the next table / FallbackTuning, never an illegal launch.
+//
+// quant2 Q3: for w4a16 the group is part of the key. `w4a16_group` is the EFFECTIVE group of the
+// launch (EffectiveW4a16Group); a row's is its GemmTuningRow::group, 0 meaning the build default.
+// At the default group every existing row matches and the legality test is the one above
+// (max(g, 64) == g for every default a build accepts), so the default path picks what it always
+// picked. At another group only rows measured there match, and the test is the kernel's own
+// K % (SK * max(g, 64)).
 template <size_t kRows>
 const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout, int64_t N,
-                             int64_t K, int64_t M) {
-  static const int64_t kW4a16Group = r4d_gemm_w4a16_nt_m64_group();
+                             int64_t K, int64_t M, int w4a16_group) {
   const GemmTuningRow* best = nullptr;
   for (const GemmTuningRow& row : table) {
     if (row.layout != layout || row.N != N || row.K != K) continue;
     if (row.M < M) continue;  // only ever round UP to a wider-or-equal measured M-band
-    if (layout == Layout::kW4a16 && K % (row.tuning.SK * kW4a16Group) != 0) continue;
+    if (layout == Layout::kW4a16) {
+      const int row_group = row.group == 0 ? DefaultW4a16Group() : row.group;
+      if (row_group != w4a16_group) continue;
+      if (K % (row.tuning.SK * std::max(w4a16_group, 64)) != 0) continue;
+    }
     if (best == nullptr || row.M < best->M) best = &row;
   }
   return best;
@@ -97,26 +127,34 @@ const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout,
 
 void SetTp2TuningForThisThread(bool enabled) { t_tp2_tuning = enabled; }
 
+int EffectiveW4a16Group(int w4a16_group) {
+  return w4a16_group == 0 ? DefaultW4a16Group() : w4a16_group;
+}
+
 // Internal linkage (not declared in linear.h) -- the actual table scan, now called only on a
 // PickTuning cache miss (see below). `tp2`: the TP table first (docs/tp.md 2.7), then the main one.
-static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M, bool tp2) {
+// `w4a16_group`: the effective group for kW4a16, 0 for every other layout.
+static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M, bool tp2,
+                                  int w4a16_group) {
   // Any chunk that fits in one row tile resolves through the M=1 band (kRowTile's comment): a
   // verify window's rows then sum in exactly the order a single-row decode's do.
   if (M > 1 && M <= kRowTile) {
-    LinearTuning t = ResolveTuning(layout, N, K, 1, tp2);
+    LinearTuning t = ResolveTuning(layout, N, K, 1, tp2, w4a16_group);
     if (layout == Layout::kW4a16) t.NT = 0;
     return t;
   }
   if (tp2) {
-    if (const GemmTuningRow* row = BestRow(tp2::kGemmTuningTable, layout, N, K, M)) {
+    if (const GemmTuningRow* row = BestRow(tp2::kGemmTuningTable, layout, N, K, M, w4a16_group)) {
       return row->tuning;
     }
   }
-  if (const GemmTuningRow* row = BestRow(kGemmTuningTable, layout, N, K, M)) return row->tuning;
-  return FallbackTuning(layout, N, K);
+  if (const GemmTuningRow* row = BestRow(kGemmTuningTable, layout, N, K, M, w4a16_group)) {
+    return row->tuning;
+  }
+  return FallbackTuning(layout, N, K, w4a16_group);
 }
 
-LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
+LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int w4a16_group) {
   // Cache the resolved LinearTuning per (layout,N,K,M) (review finding, 2026-09-19): PickTuning is
   // called once per <=64-row sub-chunk of every GEMM -- roughly 6 GEMMs x 64 layers per decode
   // token -- and a linear scan of kGemmTuningTable's ~196 rows on every one of those calls is
@@ -128,14 +166,17 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M) {
   // locking is needed. N/K fit in 20 bits (this model's widest is intermediate_size=17408 < 2^20),
   // M in 8 bits (<=64), layout in 4 bits (48..51) -- packed key never collides for any shape this
   // model has. Bit 52 is SetTp2TuningForThisThread's flag, so a thread that flips it cannot be
-  // served a row resolved under the other setting.
+  // served a row resolved under the other setting. Bits 53 and up hold the effective w4a16 group
+  // (quant2 Q3; 0 for every other layout, so their keys do not split by it), which is at most 256
+  // for any build r4dx configures -- 9 bits, 53..61, clear of the sign bit.
   static thread_local std::unordered_map<int64_t, LinearTuning> cache;
   const bool tp2 = t_tp2_tuning;
-  const int64_t key = (static_cast<int64_t>(tp2) << 52) | (static_cast<int64_t>(layout) << 48) |
-                      (N << 28) | (K << 8) | M;
+  const int group = layout == Layout::kW4a16 ? EffectiveW4a16Group(w4a16_group) : 0;
+  const int64_t key = (static_cast<int64_t>(group) << 53) | (static_cast<int64_t>(tp2) << 52) |
+                      (static_cast<int64_t>(layout) << 48) | (N << 28) | (K << 8) | M;
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
-  const LinearTuning t = ResolveTuning(layout, N, K, M, tp2);
+  const LinearTuning t = ResolveTuning(layout, N, K, M, tp2, group);
   cache.emplace(key, t);
   return t;
 }
@@ -264,7 +305,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
     // (M up to 64, chunked here into <=64-row slices) want different WV/SK/MB/NPW even for the
     // same (layout,N,K) -- PickTuning's table is keyed by the exact per-launch row count `m`, not
     // the caller's total `M` (see linear.h's PickTuning comment on M-band rounding).
-    const LinearTuning t = PickTuning(w.layout, N, K, m);
+    const LinearTuning t = PickTuning(w.layout, N, K, m, w.w4a16_group);
 
     switch (w.layout) {
       case Layout::kBf16:
@@ -281,8 +322,20 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                        static_cast<int64_t>(m) * K, reinterpret_cast<int64_t>(s));
           a = f16_scratch;
         }
-        core::r4d::GemmW4a16NtM64(a, w.wq.data(), w.w4a16_wsz.data(), yc, m, static_cast<int>(K),
-                                   static_cast<int>(N), t.WV, t.SK, t.MB, t.NPW, t.NT, s);
+        // quant2 Q3 (docs/quant2.md section 5.1): a linear at the build's default group -- every
+        // linear of a container without __metadata__.quant.w4a16.groups -- keeps the historical
+        // entry, so the default path launches exactly the kernel it always did. Only a linear the
+        // container packed at another group goes through the per-group entry.
+        const int g = EffectiveW4a16Group(w.w4a16_group);
+        if (g == DefaultW4a16Group()) {
+          core::r4d::GemmW4a16NtM64(a, w.wq.data(), w.w4a16_wsz.data(), yc, m,
+                                     static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB,
+                                     t.NPW, t.NT, s);
+        } else {
+          core::r4d::GemmW4a16NtM64G(g, a, w.wq.data(), w.w4a16_wsz.data(), yc, m,
+                                      static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB,
+                                      t.NPW, t.NT, s);
+        }
         break;
       }
       case Layout::kW4a8: {

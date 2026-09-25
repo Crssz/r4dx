@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group() -- see CheckW4a16Group below
+#include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group()/_has_group() -- see CheckW4a16Group below
 #include "r4dx/core/device_buffer.hpp"
 
 namespace r4dx::model {
@@ -56,6 +56,19 @@ inline void CheckW4a16Group(int container_group, const std::string& what) {
       " in its own build directory, or re-convert the container with this build's r4dx-convert.");
 }
 
+// quant2 Q3 (docs/quant2.md section 5.1): a linear named in __metadata__.quant.w4a16.groups is packed
+// at its OWN group and runs through r4d_gemm_w4a16_nt_m64_g, so what it needs from this build is
+// not "same group as the build default" (CheckW4a16Group, which still governs every unmapped
+// linear) but "the kernel is instantiated at that group". Same exception type, for the same catch
+// sites.
+inline void CheckW4a16MappedGroup(int group, const std::string& base, const std::string& what) {
+  if (r4d_gemm_w4a16_nt_m64_has_group(group) != 0) return;
+  throw W4a16GroupMismatch("r4dx::model: " + what + " packs '" + base + "' at w4a16 group=" +
+                           std::to_string(group) +
+                           " (__metadata__.quant.w4a16.groups), which this build's "
+                           "r4d_gemm_w4a16_nt_m64_g does not instantiate");
+}
+
 // One linear weight W[N,K], uploaded in exactly one of the four on-disk layouts
 // (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
 // thing that reads the layout-specific buffers below; Container's job stops at "the right bytes
@@ -72,10 +85,17 @@ struct QuantLinear {
   // quantizes w4a16 and w4a8 separately -- see its file comment) -- each QuantLinear holds only
   // the one layout it was loaded as.
   core::DeviceBuffer<uint8_t> wq;
-  // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is the
-  // w4a16 group this build was configured with (R4DX_W4A16_GROUP, default 64 since Milestone 11)
-  // -- see CheckW4a16Group above, which is what guarantees the container agrees with the kernel.
+  // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is
+  // w4a16_group below -- by default the group this build was configured with (R4DX_W4A16_GROUP,
+  // default 64 since Milestone 11); see CheckW4a16Group above, which is what guarantees the
+  // container agrees with the kernel.
   core::DeviceBuffer<uint32_t> w4a16_wsz;
+  // layout == kW4a16: this linear's own group (docs/quant2.md section 5.1), or 0 = "this build's
+  // default", r4d_gemm_w4a16_nt_m64_group(). 0 is what every QuantLinear built before per-tensor
+  // groups -- and every one not named in __metadata__.quant.w4a16.groups -- carries, and it keeps
+  // ApplyLinear on the historical r4d_gemm_w4a16_nt_m64 entry. A non-zero group other than the
+  // default dispatches r4d_gemm_w4a16_nt_m64_g (linear.cpp).
+  int w4a16_group = 0;
   // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused). w4a8's group is fixed at
   // 128 by third_party/CMakeLists.txt and is NOT tied to w4a16's.
   core::DeviceBuffer<uint32_t> w4a8_ws;

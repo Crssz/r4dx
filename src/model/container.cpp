@@ -6,6 +6,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 
 #include "nlohmann/json.hpp"
@@ -13,6 +14,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"  // SafetensorsReader, Utf8ToWide -- see file comment
 #include "tp/tp_shard.h"  // tensor-parallel shard rules and byte plans (LoadShard, docs/tp.md 5.1)
+#include "w4a16_group_meta.h"  // quant2 Q3: __metadata__.quant.w4a16.groups (docs/quant2.md 5.1)
 
 namespace r4dx::model {
 
@@ -57,16 +59,47 @@ nlohmann::json ReadMetadata(const std::string& path) {
 // never -> w4a16), and w4a8's and mxfp4's own groups do not move with R4DX_W4A16_GROUP. Refusing
 // those runs bought no safety and cost real capability: `qwen38-27b-v5.r4dx` carries perfectly
 // valid w4a8 and mxfp4 layouts that a group-64 build can read byte-for-byte correctly.
-void CheckQuantGroups(const nlohmann::json& metadata, const std::string& path, Layout layout,
-                       Layout lm_head_layout, Layout mtp_head_layout) {
+//
+// quant2 Q3 (docs/quant2.md section 5.1): per-tensor groups. The map (`quant.w4a16.groups`) is
+// parsed on every load -- ParseW4a16Groups is structural and never throws for a container without
+// one -- and the result travels with the load as W4a16LoadGroups, which every w4a16 read resolves
+// its linear's group and scale-tensor name through. The kernel checks stay gated as above:
+//   - no map (every container converted without --w4a16-group-rule): exactly the check above, up
+//     front, unchanged;
+//   - a map: every mapped group must be one r4d_gemm_w4a16_nt_m64_g instantiates, up front
+//     (CheckW4a16MappedGroup); the default-group equality then applies only to the linears WITHOUT
+//     a map entry, so it runs when the first such linear is actually read as w4a16
+//     (W4a16LoadGroups::Resolve), with the same W4a16GroupMismatch.
+struct W4a16LoadGroups {
+  W4a16Groups groups;
+  bool check_default_per_linear = false;
+  std::string path;
+
+  // QuantLinear::w4a16_group for `base`, about to be read as w4a16.
+  int Resolve(const std::string& base) const {
+    if (check_default_per_linear && !groups.Mapped(base)) {
+      CheckW4a16Group(groups.default_group, path);
+    }
+    return groups.QuantLinearGroup(base);
+  }
+};
+
+W4a16LoadGroups CheckQuantGroups(const nlohmann::json& metadata, const std::string& path,
+                                 Layout layout, Layout lm_head_layout, Layout mtp_head_layout) {
+  W4a16LoadGroups w;
+  w.groups = ParseW4a16Groups(metadata, path);
+  w.path = path;
   if (layout != Layout::kW4a16 && lm_head_layout != Layout::kW4a16 &&
       mtp_head_layout != Layout::kW4a16) {
-    return;
+    return w;
   }
-  if (!metadata.contains("quant")) return;
-  const nlohmann::json& quant = metadata.at("quant");
-  if (!quant.contains("w4a16") || !quant.at("w4a16").contains("group")) return;
-  CheckW4a16Group(quant.at("w4a16").at("group").get<int>(), path);
+  if (w.groups.mapped.empty()) {
+    if (w.groups.default_recorded) CheckW4a16Group(w.groups.default_group, path);
+    return w;
+  }
+  for (const auto& [base, group] : w.groups.mapped) CheckW4a16MappedGroup(group, base, path);
+  w.check_default_per_linear = true;
+  return w;
 }
 
 using r4dx_convert::SafetensorsReader;
@@ -137,8 +170,74 @@ core::DeviceBuffer<float> UploadWidenedF32(const SafetensorsReader& r, const std
   return buf;
 }
 
-QuantLinear LoadQuantLinear(const SafetensorsReader& r, const std::string& base, Layout layout,
-                             int64_t N, int64_t K) {
+// quant2 Q3: the byte sizes a w4a16 linear [N, K] at `group` must have on disk -- `.w4a16.wq`
+// N*K/2, the scales N*(K/group) dwords -- plus the kernel's shape rules at that group (K % group,
+// K % 64 for the packed block, N % 16). The tensor-parallel loader checks every part's size
+// against its [N, K] already (ShardLoader::Part); this is the TP=1 path's counterpart, so a scale
+// tensor of the wrong group can never be read at the wrong stride.
+void CheckW4a16Shape(const SafetensorsReader& r, const std::string& base, const std::string& wsz,
+                     int64_t N, int64_t K, int group) {
+  const auto fail = [&](const std::string& why) {
+    throw std::runtime_error("r4dx::model::Container: w4a16 linear '" + base + "' [" +
+                             std::to_string(N) + ", " + std::to_string(K) + "] at group " +
+                             std::to_string(group) + ": " + why);
+  };
+  if (group <= 0 || K % group != 0 || K % 64 != 0 || N % 16 != 0) {
+    fail("K must be a multiple of the group and of 64, N of 16");
+  }
+  const uint64_t wq_bytes = r.Meta(base + ".w4a16.wq").end - r.Meta(base + ".w4a16.wq").begin;
+  const uint64_t wsz_bytes = r.Meta(wsz).end - r.Meta(wsz).begin;
+  const uint64_t nk = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
+  if (wq_bytes != nk / 2) {
+    fail("'" + base + ".w4a16.wq' is " + std::to_string(wq_bytes) + " bytes, expected " +
+         std::to_string(nk / 2));
+  }
+  if (wsz_bytes != nk / static_cast<uint64_t>(group) * 4) {
+    fail("'" + wsz + "' is " + std::to_string(wsz_bytes) + " bytes, expected " +
+         std::to_string(nk / static_cast<uint64_t>(group) * 4));
+  }
+}
+
+// quant2 Q3: every base the map names must be a w4a16 linear written at its mapped group -- its
+// `.w4a16.wq` and `.w4a16.wsz.g<g>` present, and NO bare `.w4a16.wsz` (which would make the
+// container readable at the default stride by a binary that ignores the map). Checked once per
+// load, before any upload, whatever layout the load selects: a map naming a tensor the container
+// does not have is a converter bug, not a layout choice.
+void CheckW4a16GroupTensors(const SafetensorsReader& r, const W4a16Groups& groups,
+                            const std::string& path) {
+  for (const auto& [base, group] : groups.mapped) {
+    const std::string wsz = groups.WszName(base);
+    if (!r.Has(base + ".w4a16.wq") || !r.Has(wsz)) {
+      throw std::runtime_error("r4dx::model::Container: " + path +
+                               " __metadata__.quant.w4a16.groups lists '" + base + "' at group " +
+                               std::to_string(group) + " but the container has no '" + base +
+                               ".w4a16.wq' + '" + wsz + "'");
+    }
+    if (r.Has(base + ".w4a16.wsz")) {
+      throw std::runtime_error("r4dx::model::Container: " + path + " lists '" + base +
+                               "' at w4a16 group " + std::to_string(group) +
+                               " but also carries the default-group '" + base + ".w4a16.wsz'");
+    }
+  }
+}
+
+// One stderr line when a load that selects w4a16 meets a per-tensor group map; silent otherwise, so
+// a container without a map logs exactly what it always did.
+void LogW4a16Groups(const W4a16Groups& groups, const std::string& path) {
+  std::map<int, int> per_group;
+  for (const auto& kv : groups.mapped) ++per_group[kv.second];
+  std::string detail;
+  for (const auto& kv : per_group) {
+    detail += (detail.empty() ? "" : ", ") + std::string("g") + std::to_string(kv.first) + " x" +
+              std::to_string(kv.second);
+  }
+  std::fprintf(stderr,
+               "r4dx: %s packs %zu w4a16 linear(s) at a per-tensor group (%s; default g%d)\n",
+               path.c_str(), groups.mapped.size(), detail.c_str(), groups.default_group);
+}
+
+QuantLinear LoadQuantLinear(const SafetensorsReader& r, const W4a16LoadGroups& w4a16,
+                             const std::string& base, Layout layout, int64_t N, int64_t K) {
   QuantLinear q;
   q.layout = layout;
   q.N = N;
@@ -147,10 +246,15 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const std::string& base,
     case Layout::kBf16:
       q.bf16_w = UploadRawU16(r, base + ".bf16.w");
       break;
-    case Layout::kW4a16:
+    case Layout::kW4a16: {
+      // quant2 Q3: the linear's own group and scale name (the bare `.w4a16.wsz` unless mapped).
+      q.w4a16_group = w4a16.Resolve(base);
+      const std::string wsz = w4a16.groups.WszName(base);
+      CheckW4a16Shape(r, base, wsz, N, K, w4a16.groups.GroupFor(base));
       q.wq = UploadRawU8(r, base + ".w4a16.wq");
-      q.w4a16_wsz = UploadRawU32(r, base + ".w4a16.wsz");
+      q.w4a16_wsz = UploadRawU32(r, wsz);
       break;
+    }
     case Layout::kW4a8:
       q.wq = UploadRawU8(r, base + ".w4a8.wq");
       q.w4a8_ws = UploadRawU32(r, base + ".w4a8.ws");
@@ -164,11 +268,13 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const std::string& base,
   return q;
 }
 
-// True iff `r` carries every tensor `LoadQuantLinear(r, base, layout, ...)` would read.
-bool HasLayout(const SafetensorsReader& r, const std::string& base, Layout layout) {
+// True iff `r` carries every tensor `LoadQuantLinear(r, groups, base, layout, ...)` would read
+// (for w4a16, the scale tensor of `base`'s own group: W4a16Groups::WszName).
+bool HasLayout(const SafetensorsReader& r, const W4a16Groups& groups, const std::string& base,
+               Layout layout) {
   switch (layout) {
     case Layout::kBf16: return r.Has(base + ".bf16.w");
-    case Layout::kW4a16: return r.Has(base + ".w4a16.wq") && r.Has(base + ".w4a16.wsz");
+    case Layout::kW4a16: return r.Has(base + ".w4a16.wq") && r.Has(groups.WszName(base));
     case Layout::kW4a8: return r.Has(base + ".w4a8.wq") && r.Has(base + ".w4a8.ws");
     case Layout::kMxfp4:
       return r.Has(base + ".mxfp4.wq") && r.Has(base + ".mxfp4.ws") && r.Has(base + ".mxfp4.wref");
@@ -197,12 +303,28 @@ bool HasLayout(const SafetensorsReader& r, const std::string& base, Layout layou
 // incremented once per linear that did NOT have the requested layout, so Load() can report the
 // count instead of falling back silently -- a container that accidentally quantized nothing and one
 // that deliberately kept one class in bf16 must not look the same in a log.
-QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const std::string& base,
-                                         Layout requested, int64_t N, int64_t K,
-                                         int* fallbacks = nullptr) {
-  if (HasLayout(r, base, requested)) return LoadQuantLinear(r, base, requested, N, K);
+//
+// quant2 Q3 (docs/quant2.md section 5.1): a base listed in __metadata__.quant.w4a16.groups that is
+// requested as w4a16 never falls back -- the container promised that linear at its own group, and
+// quietly serving a bf16 copy (or anything else) instead would hide a broken container.
+// CheckW4a16GroupTensors has already refused a map entry without its tensors, so this is the
+// second line, not the first.
+QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const W4a16LoadGroups& w4a16,
+                                         const std::string& base, Layout requested, int64_t N,
+                                         int64_t K, int* fallbacks = nullptr) {
+  if (HasLayout(r, w4a16.groups, base, requested)) {
+    return LoadQuantLinear(r, w4a16, base, requested, N, K);
+  }
+  if (requested == Layout::kW4a16 && w4a16.groups.Mapped(base)) {
+    throw std::runtime_error("r4dx::model::Container: '" + base + "' is listed in " +
+                             "__metadata__.quant.w4a16.groups at group " +
+                             std::to_string(w4a16.groups.GroupFor(base)) + " but '" +
+                             w4a16.groups.WszName(base) + "' is missing; not falling back");
+  }
   if (fallbacks != nullptr) ++*fallbacks;
-  if (HasLayout(r, base, Layout::kBf16)) return LoadQuantLinear(r, base, Layout::kBf16, N, K);
+  if (HasLayout(r, w4a16.groups, base, Layout::kBf16)) {
+    return LoadQuantLinear(r, w4a16, base, Layout::kBf16, N, K);
+  }
   if (r.Has(base)) {
     QuantLinear q;
     q.layout = Layout::kBf16;
@@ -349,7 +471,8 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
-  CheckQuantGroups(metadata, path, layout, lm_head_layout, mtp_head_layout);
+  const W4a16LoadGroups w4a16 =
+      CheckQuantGroups(metadata, path, layout, lm_head_layout, mtp_head_layout);
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");
@@ -371,6 +494,9 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       ParseRotationMetadata(metadata, c.global_config_, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
+  // quant2 Q3: a no-op for a container without a per-tensor group map.
+  CheckW4a16GroupTensors(reader, w4a16.groups, path);
+  if (w4a16.check_default_per_linear) LogW4a16Groups(w4a16.groups, path);
 
   const int64_t num_layers = (layer_limit >= 0)
                                   ? std::min(layer_limit, c.config_.num_hidden_layers)
@@ -429,10 +555,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
 
     if (c.config_.IsGdnLayer(i)) {
       GdnWeights g;
-      g.in_proj_qkv = LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_qkv", layout,
+      g.in_proj_qkv = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.in_proj_qkv", layout,
                                                    2 * key_dim + value_dim, hidden,
                                                    &bf16_fallbacks);
-      g.in_proj_z = LoadQuantLinearWithFallback(reader, base + "gdn.in_proj_z", layout, value_dim,
+      g.in_proj_z = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.in_proj_z", layout, value_dim,
                                                  hidden, &bf16_fallbacks);
       g.in_proj_b = UploadRawU16(reader, base + "gdn.in_proj_b");
       g.in_proj_a = UploadRawU16(reader, base + "gdn.in_proj_a");
@@ -440,7 +566,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       g.A_log = UploadRawF32(reader, base + "gdn.A_log");
       g.dt_bias = UploadRawF32(reader, base + "gdn.dt_bias");
       g.norm_weight = UploadWidenedF32(reader, base + "gdn.norm_weight");
-      g.out_proj = LoadQuantLinearWithFallback(reader, base + "gdn.out_proj", layout, hidden,
+      g.out_proj = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.out_proj", layout, hidden,
                                                 value_dim, &bf16_fallbacks);
       lw.gdn = std::move(g);
     } else {
@@ -450,13 +576,13 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       // through the shared r4dx::model::ApplyLinear (src/model/linear.h), which every layout
       // already supports. See docs/perf.md for the measured per-layout VRAM/throughput delta this
       // unlocks (attn.qg/o account for 16 of 64 layers' full-attention projections).
-      a.qg = LoadQuantLinearWithFallback(reader, base + "attn.qg", layout, attn_out * 2, hidden,
+      a.qg = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.qg", layout, attn_out * 2, hidden,
                                           &bf16_fallbacks);
-      a.k = LoadQuantLinearWithFallback(reader, base + "attn.k", layout,
+      a.k = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.k", layout,
                                          kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
-      a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", layout,
+      a.v = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.v", layout,
                                          kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
-      a.o = LoadQuantLinearWithFallback(reader, base + "attn.o", layout, hidden, attn_out,
+      a.o = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.o", layout, hidden, attn_out,
                                          &bf16_fallbacks);
       a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
       a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
@@ -465,10 +591,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       lw.attn = std::move(a);
     }
 
-    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, base + "mlp.gate_up", layout,
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.gate_up", layout,
                                                   2 * c.config_.intermediate_size, hidden,
                                                   &bf16_fallbacks);
-    lw.mlp.down = LoadQuantLinearWithFallback(reader, base + "mlp.down", layout, hidden,
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.down", layout, hidden,
                                                c.config_.intermediate_size, &bf16_fallbacks);
     c.layers_.push_back(std::move(lw));
   }
@@ -477,7 +603,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // With fallback: a container converted with `--lm-head bf16` (rung 4 follow-up -- the 4-bit
   // lm_head is where the vocab-tail KL loss concentrates) carries only lm_head.bf16.w, and every
   // caller that asks for the body layout here should get that bf16 head rather than a throw.
-  c.lm_head_ = LoadQuantLinearWithFallback(reader, "lm_head", lm_head_layout, c.config_.vocab_size,
+  c.lm_head_ = LoadQuantLinearWithFallback(reader, w4a16,"lm_head", lm_head_layout, c.config_.vocab_size,
                                            hidden, &bf16_fallbacks);
   if (rotation) {
     c.rotation_ = LoadRotationWeights(reader, *rotation, c.global_config_, c.config_, path,
@@ -503,7 +629,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
     // descales, fc, norm, pre_fc_norm_*) has only one on-disk form regardless of layout, same as
     // the body layers above.
     AttnWeights a;
-    a.qg = LoadQuantLinearWithFallback(reader, base + "attn.qg", mtp_head_layout, attn_out * 2,
+    a.qg = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.qg", mtp_head_layout, attn_out * 2,
                                         hidden, &bf16_fallbacks);
     // mtp.attn.k/v stay bf16 regardless of the requested body/head layout (docs/r9700.md's R1
     // task: "Keep mtp.* ... as they are") -- request Layout::kBf16 explicitly rather than
@@ -511,21 +637,21 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
     // converter run ever quantized mtp.*. LoadQuantLinearWithFallback (not UploadRawU16) so this
     // still works against the OLD bare-tensor on-disk form (pre-R1 containers) as well as any
     // future `.bf16.w`-suffixed form -- see LoadQuantLinearWithFallback's own comment.
-    a.k = LoadQuantLinearWithFallback(reader, base + "attn.k", Layout::kBf16,
+    a.k = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.k", Layout::kBf16,
                                        kv_heads * c.config_.head_dim, hidden);
-    a.v = LoadQuantLinearWithFallback(reader, base + "attn.v", Layout::kBf16,
+    a.v = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.v", Layout::kBf16,
                                        kv_heads * c.config_.head_dim, hidden);
-    a.o = LoadQuantLinearWithFallback(reader, base + "attn.o", mtp_head_layout, hidden, attn_out,
+    a.o = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.o", mtp_head_layout, hidden, attn_out,
                                        &bf16_fallbacks);
     a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
     a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
     a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
     a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
     lw.attn = std::move(a);
-    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, base + "mlp.gate_up", mtp_head_layout,
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.gate_up", mtp_head_layout,
                                                   2 * c.config_.intermediate_size, hidden,
                                                   &bf16_fallbacks);
-    lw.mlp.down = LoadQuantLinearWithFallback(reader, base + "mlp.down", mtp_head_layout, hidden,
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.down", mtp_head_layout, hidden,
                                                c.config_.intermediate_size, &bf16_fallbacks);
     mw.layer = std::move(lw);
     mw.fc = UploadRawU16(reader, "mtp.fc");
@@ -548,7 +674,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       // why: the draft head's error compounds across chained draft steps) -- a run that chose to
       // build a draft head always emits it in the same LayoutSet as mtp.attn.qg/o and
       // mtp.mlp.gate_up/down, so this load-time layout selection just works.
-      mw.draft_lm_head = LoadQuantLinearWithFallback(reader, "mtp.draft_head.lm_head",
+      mw.draft_lm_head = LoadQuantLinearWithFallback(reader, w4a16,"mtp.draft_head.lm_head",
                                                       mtp_head_layout, draft_vocab_size, hidden,
                                                       &bf16_fallbacks);
     }
@@ -652,9 +778,11 @@ uint64_t PartBytes(const tp::PartShape& s) {
 // replicated.
 class ShardLoader {
  public:
+  // `w4a16`: the container's w4a16 groups (quant2 Q3) -- each w4a16 linear's scale name and the
+  // group its wsz slice is cut at (tp::Part::kW4a16Wsz strides by the group), per tensor.
   ShardLoader(const SafetensorsReader& r, const ModelConfig& global, int world, int rank,
-              int w4a16_group)
-      : r_(r), global_(global), world_(world), rank_(rank), w4a16_group_(w4a16_group) {}
+              const W4a16LoadGroups& w4a16)
+      : r_(r), global_(global), world_(world), rank_(rank), w4a16_(w4a16) {}
 
   // A tensor with one on-disk form and no layout suffix (norms, gdn.in_proj_a/b, conv1d_weight,
   // A_log, dt_bias, the descales, mtp.fc, ...): its whole bytes when the rule replicates, else this
@@ -702,10 +830,17 @@ class ShardLoader {
                      int* fallbacks = nullptr) {
     Layout form = requested;
     bool bare = false;
-    if (!HasLayout(r_, base, requested)) {
+    if (!HasLayout(r_, w4a16_.groups, base, requested)) {
+      // quant2 Q3: a mapped w4a16 linear never falls back (LoadQuantLinearWithFallback).
+      if (requested == Layout::kW4a16 && w4a16_.groups.Mapped(base)) {
+        throw std::runtime_error("r4dx::model::Container: '" + base + "' is listed in " +
+                                 "__metadata__.quant.w4a16.groups at group " +
+                                 std::to_string(w4a16_.groups.GroupFor(base)) + " but '" +
+                                 w4a16_.groups.WszName(base) + "' is missing; not falling back");
+      }
       if (fallbacks != nullptr) ++*fallbacks;
       form = Layout::kBf16;
-      if (!HasLayout(r_, base, Layout::kBf16)) {
+      if (!HasLayout(r_, w4a16_.groups, base, Layout::kBf16)) {
         if (!r_.Has(base)) {
           throw std::runtime_error("r4dx::model::Container: no tensor found for '" + base +
                                    "' in any known on-disk form (requested layout, bf16, or bare)");
@@ -759,9 +894,14 @@ class ShardLoader {
                                   rows, cols);
         break;
       case Layout::kW4a16:
+        // quant2 Q3: the linear's own group sets both the scale tensor's name and the dword
+        // stride its K slice is cut at; a rank's K range is whole 64-K blocks (wq's rule), so it
+        // is whole groups at 32, 64 and 128 alike.
+        q.w4a16_group = w4a16_.Resolve(base);
         q.wq = Part<uint8_t>(base + ".w4a16.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
-        q.w4a16_wsz = Part<uint32_t>(base + ".w4a16.wsz", shape(tp::Part::kW4a16Wsz, w4a16_group_),
-                                     rule, rows, cols);
+        q.w4a16_wsz = Part<uint32_t>(w4a16_.groups.WszName(base),
+                                     shape(tp::Part::kW4a16Wsz, w4a16_.groups.GroupFor(base)), rule,
+                                     rows, cols);
         break;
       case Layout::kW4a8:
         q.wq = Part<uint8_t>(base + ".w4a8.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
@@ -851,7 +991,8 @@ class ShardLoader {
 
   const SafetensorsReader& r_;
   const ModelConfig& global_;
-  int world_, rank_, w4a16_group_;
+  int world_, rank_;
+  const W4a16LoadGroups& w4a16_;
   std::vector<uint8_t> staging_;  // grown to the largest gathered tensor; freed with the loader
   ShardLoadStats stats_;
 };
@@ -867,7 +1008,8 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
-  CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout);
+  const W4a16LoadGroups w4a16 =
+      CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout);
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");
@@ -882,21 +1024,18 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   if (model_config.contains("video_token_id")) {
     c.video_token_id_ = model_config.at("video_token_id").get<int64_t>();
   }
-  // The group the container's w4a16 scales were packed at -- the wsz stride per 16-row tile
-  // (docs/tp.md 4.3). A container that predates the `quant` block is group 128, CheckQuantGroups'
-  // own rule.
-  int w4a16_group = 128;
-  if (metadata.contains("quant") && metadata.at("quant").contains("w4a16") &&
-      metadata.at("quant").at("w4a16").contains("group")) {
-    w4a16_group = metadata.at("quant").at("w4a16").at("group").get<int>();
-  }
+  // The groups the container's w4a16 scales were packed at -- the wsz stride per 16-row tile
+  // (docs/tp.md 4.3) -- now per tensor (quant2 Q3): `w4a16` above. A container that predates the
+  // `quant` block is group 128, CheckQuantGroups' own rule (ParseW4a16Groups' default).
   // quant2: the TP=1 path's parse, before any upload (docs/quant2.md section 3.1).
   const std::optional<RotationSpec> rotation =
       ParseRotationMetadata(metadata, c.global_config_, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
+  CheckW4a16GroupTensors(reader, w4a16.groups, path);  // quant2 Q3; see Container::Load
+  if (w4a16.check_default_per_linear && o.tp_rank == 0) LogW4a16Groups(w4a16.groups, path);
   const ModelConfig& gc = c.global_config_;
-  ShardLoader L(reader, gc, o.tp_world, o.tp_rank, w4a16_group);
+  ShardLoader L(reader, gc, o.tp_world, o.tp_rank, w4a16);
   const int64_t num_layers =
       (o.layer_limit >= 0) ? std::min(o.layer_limit, gc.num_hidden_layers) : gc.num_hidden_layers;
 

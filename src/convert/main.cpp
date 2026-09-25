@@ -12,6 +12,19 @@
 //                [--hessian-dir <tools/reference/hessian_capture.py output dir>
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
+//                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64|128>"]...
+//
+// --w4a16-group-rule (docs/quant2.md section 5, w4a16_groups.hpp; repeatable, first matching rule
+// wins, unmatched linears keep the build default R4DX_W4A16_GROUP) packs the w4a16 layout of every
+// linear whose container base name the regex matches (regex_SEARCH, like --keep-bf16) at that group
+// instead: its scale tensor becomes `<base>.w4a16.wsz.g<g>` and __metadata__.quant.w4a16.groups
+// lists it, so the runtime dispatches r4d_gemm_w4a16_nt_m64_g for it and a binary that predates
+// per-tensor groups refuses the container instead of reading the scales at the default stride.
+// That refusal only happens if the linear has no `.bf16.w` to fall back to, so a non-default group
+// on a linear that keeps bf16 is a planning error (use --no-bf16, and an --lm-head spec without
+// bf16). K must be a multiple of the group and of 64, N of 16 -- checked while planning. Without
+// the flag every container is byte-identical to one built before it existed.
+// __metadata__.r4dx_convert_run records the rules, the resolved map and the .wsz byte delta.
 //
 // --keep-bf16 (docs/validation.md "Milestone 11 / sensitivity", keep_bf16.hpp) writes every linear
 // whose container base name the regex matches as `<base>.bf16.w` ONLY, skipping every quantized
@@ -95,10 +108,12 @@
 //
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts mxfp4,w4a16,w4a8] [--threads T]
+//                [--no-bf16] [--w4a16-group-rule "<regex>=<g>"]...
 //
 // --selftest packs exactly one tensor through every requested layout and writes it as
 // "selftest.{layout}.*" -- tools/convert_ref/selftest_compare.py runs the matching Python
-// reference on the same input and diffs the two containers byte for byte.
+// reference on the same input and diffs the two containers byte for byte. Its container base is
+// "selftest", which --keep-bf16 / --ldlq / --w4a16-group-rule match against like any other.
 //
 //   r4dx-convert --dflash-gguf <DFlash2 draft .gguf> --out <container path>
 //                [--layout {w4a16,w4a8,mxfp4,bf16}] [--threads T]
@@ -144,6 +159,7 @@
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
+#include "r4dx_convert/w4a16_groups.hpp"
 
 namespace {
 
@@ -181,12 +197,29 @@ void ValidateKernelGroupSizes() {
   check("mxfp4", r4dx_convert::kMxfp4Group, r4d_gemm_mxfp4a8_nt_m64_group());
 }
 
+// --w4a16-group-rule: every group a rule can hand out must be one this build's
+// r4d_gemm_w4a16_nt_m64_g actually instantiates -- the same "ask the kernel, do not trust the
+// constant" discipline as ValidateKernelGroupSizes, for the per-tensor groups.
+void ValidateKernelRuleGroups(const r4dx_convert::W4a16GroupRules& rules) {
+  for (const auto& r : rules.Rules()) {
+    if (r4d_gemm_w4a16_nt_m64_has_group(r.group) == 0) {
+      throw std::runtime_error("--w4a16-group-rule '" + r.spec + "': this build's r4d_core has no "
+                               "r4d_gemm_w4a16_nt_m64 instantiation at group " +
+                               std::to_string(r.group) + " (r4d_gemm_w4a16_nt_m64_has_group)");
+    }
+  }
+}
+
 // Builds the __metadata__["quant"] block (review finding, major): the task brief asked for
 // per-tensor quant layout/group/permutation in __metadata__ and the original run only had prose
 // in quant_summary. This is the authoritative, loader-checkable record -- src/model should assert
 // its own kernel's group() matches these before trusting the container.
-nlohmann::json BuildQuantMetadata() {
-  return {
+//
+// `w4a16_groups` is W4a16GroupRules::GroupsJson(): the linears packed at a group other than
+// `w4a16.group` (docs/quant2.md section 5). Written as `w4a16.groups` only when non-empty, so a
+// container converted without --w4a16-group-rule keeps exactly the header it had before.
+nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann::json::object()) {
+  nlohmann::json q = {
       {"w4a16",
        {{"group", r4dx_convert::kW4A16Group},
         {"zero_mode", "free_0_15"},
@@ -202,6 +235,8 @@ nlohmann::json BuildQuantMetadata() {
         {"scale_encoding", "e8m0"},
         {"fragment_permutation", "mxfp4_layout_permute_w"}}},
   };
+  if (!w4a16_groups.empty()) q["w4a16"]["groups"] = w4a16_groups;
+  return q;
 }
 
 // Parses a comma/plus-separated list of layout tokens ("mxfp4", "w4a16", "w4a8", "bf16", "4bit"
@@ -299,6 +334,11 @@ struct AppArgs {
   std::string rotate = "none";
   uint64_t rotation_seed = r4dx_convert::kDefaultRotationSeed;
   bool rotation_seed_explicit = false;
+
+  // Per-tensor w4a16 groups (docs/quant2.md section 5; w4a16_groups.hpp): every
+  // --w4a16-group-rule "<regex>=<g>" in command-line order, first match wins. Empty (default) =
+  // every w4a16 linear at the build default and a byte-identical container.
+  std::vector<std::string> w4a16_group_rules;
 };
 
 // --rotation-seed: a full u64, decimal or 0x-prefixed hex. std::stoull alone would accept "-1"
@@ -382,8 +422,18 @@ AppArgs ParseArgs(int argc, char** argv) {
       a.rotation_seed = ParseSeed(next(i));
       a.rotation_seed_explicit = true;
     }
+    else if (arg == "--w4a16-group-rule") a.w4a16_group_rules.push_back(next(i));
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  // Parsed here (syntax, group, regex) so a typo is an argument error, not a mid-plan one; the
+  // selector itself is rebuilt by the run that uses it.
+  if (!a.w4a16_group_rules.empty()) (void)r4dx_convert::W4a16GroupRules(a.w4a16_group_rules);
+  // The DFlash2 drafter's loader (src/model/dflash_draft.cpp) reads every w4a16 linear at the
+  // container's one default group, and its tensors share none of the Qwen base names the rules are
+  // written against -- reject the combination rather than build a drafter it silently ignored.
+  if (!a.w4a16_group_rules.empty() && !a.dflash_gguf.empty())
+    throw std::runtime_error("--w4a16-group-rule does not apply to --dflash-gguf (the drafter is "
+                             "packed at the build's default w4a16 group only)");
   const r4dx_convert::RotationKind rotate_kind = r4dx_convert::ParseRotationKind(a.rotate);
   // The rotation is a property of the Qwen text stack (Q is 5120 wide, folded into its layers and
   // undone at its exit by the runtime): the selftest's one bare tensor has no residual stream to
@@ -572,8 +622,9 @@ class LdlqSource {
                                std::to_string(kBlock));
     }
     // quant_ldlq.hpp also needs every emitted layout's group to tile the block (a group never
-    // straddles two blocks). w4a8 (128) and mxfp4 (32) always do; w4a16's group is the build's
-    // R4DX_W4A16_GROUP, which may be any multiple of 64 (192, 256, ... do not divide 128).
+    // straddles two blocks). w4a8 (128) and mxfp4 (32) always do; w4a16's group is this linear's
+    // own (`ls.w4a16_group`: a --w4a16-group-rule's 32/64/128, all fine, or the build's
+    // R4DX_W4A16_GROUP, which may be any multiple of 64 -- 192, 256, ... do not divide 128).
     auto require_group = [&](bool on, int group, const char* layout) {
       if (on && kBlock % group != 0) {
         throw std::runtime_error("--ldlq: '" + container_base + "' emits " + layout +
@@ -583,7 +634,7 @@ class LdlqSource {
                                  std::to_string(kBlock) + " or drop " + layout + " from --layouts");
       }
     };
-    require_group(ls.w4a16, r4dx_convert::kW4A16Group, "w4a16");
+    require_group(ls.w4a16, ls.w4a16_group, "w4a16");
     require_group(ls.w4a8, r4dx_convert::kW4A8Group, "w4a8");
     require_group(ls.mxfp4, r4dx_convert::kMxfp4Group, "mxfp4");
     // The file itself (header, size, K/rows vs the manifest), each distinct file once.
@@ -956,6 +1007,18 @@ int RunConvert(const AppArgs& args) {
     std::cout << "[r4dx-convert] keep-bf16=" << keep_bf16.Pattern()
               << " (matching linears written as <base>.bf16.w only)\n";
 
+  // --w4a16-group-rule (w4a16_groups.hpp): rules parsed and checked against the kernel's own
+  // instantiations here; each linear's group is resolved once in add_linear, and its shape and the
+  // bf16-companion guard are checked in the planning pass below.
+  r4dx_convert::W4a16GroupRules w4a16_groups(args.w4a16_group_rules);
+  if (w4a16_groups.Enabled()) {
+    ValidateKernelRuleGroups(w4a16_groups);
+    for (const auto& r : w4a16_groups.Rules())
+      std::cout << "[r4dx-convert] w4a16-group-rule " << r.spec << " (regex '" << r.pattern
+                << "' -> group " << r.group << "; first match wins, default "
+                << r4dx_convert::kW4A16Group << ")\n";
+  }
+
   // --ldlq (LdlqSource): regex compiled and hessian.json parsed here, before the first shard is
   // opened; the per-linear manifest checks run in the planning pass below.
   LdlqSource ldlq(args.ldlq, args.hessian_dir, args.ldlq_damp);
@@ -1149,12 +1212,15 @@ int RunConvert(const AppArgs& args) {
     // resolved `ls` / `use_ldlq`, rather than each re-evaluating a regex). --keep-bf16 wins: a kept
     // linear has no quantized layout left to round, and neither has one whose run asked for bf16
     // only (`--lm-head bf16`), so LDLQ applies only when some 4-bit layout survives.
+    // --w4a16-group-rule resolves the w4a16 group into `requested` first, so --keep-bf16's "would
+    // have been" bytes are priced at the group the linear would really have had.
+    requested = w4a16_groups.Apply(container_base, requested);
     const bool kept = keep_bf16.Matches(container_base);
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
     const bool use_ldlq = ldlq_matched && HasQuantizedLayout(ls);
-    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, hf_names, container_base, ls,
-                          requested, kept, ldlq_matched, use_ldlq, fold]() {
+    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, hf_names,
+                          container_base, ls, requested, kept, ldlq_matched, use_ldlq, fold]() {
       int64_t N = 0, K = 0;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
@@ -1169,6 +1235,7 @@ int RunConvert(const AppArgs& args) {
       // The manifest + file check lives HERE, in planning, so a missing key / wrong K / missing or
       // truncated .hess / group not dividing the LDLQ block aborts before
       // FinalizeHeader and before the first shard is read.
+      w4a16_groups.Plan(container_base, N, K, ls);
       if (use_ldlq) ldlq.Plan(container_base, K, ls);
       else if (ldlq_matched) ldlq.NoteSkipped();
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
@@ -1343,9 +1410,11 @@ int RunConvert(const AppArgs& args) {
       // --keep-bf16 applies here too, resolved on the same base name the regex sees everywhere
       // else -- so a pattern like "lm_head$" that happens to reach this optional head keeps it in
       // bf16 rather than quantizing it while claiming otherwise.
+      // --w4a16-group-rule likewise (add_linear's order: the group first, then --keep-bf16).
+      const LayoutSet draft_head_requested = w4a16_groups.Apply("mtp.draft_head.lm_head", layouts);
       const bool draft_head_kept = keep_bf16.Matches("mtp.draft_head.lm_head");
       const LayoutSet draft_head_layouts =
-          draft_head_kept ? r4dx_convert::KeptBf16LayoutSet() : layouts;
+          draft_head_kept ? r4dx_convert::KeptBf16LayoutSet() : draft_head_requested;
       // --ldlq likewise, resolved once with add_linear's rule. The draft head's Hessian is the MTP
       // layer's post-`mtp.norm` hidden (hessian_capture.py writes mtp.draft_head.hess only under
       // --draft-head), never lm_head's -- so a regex like "lm_head$" that reaches this head against
@@ -1353,14 +1422,16 @@ int RunConvert(const AppArgs& args) {
       const bool draft_head_ldlq_matched = ldlq.Matches("mtp.draft_head.lm_head");
       const bool draft_head_ldlq =
           draft_head_ldlq_matched && HasQuantizedLayout(draft_head_layouts);
-      plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, draft_vocab_size, draft_head_layouts,
-                            layouts, draft_head_kept, draft_head_ldlq_matched, draft_head_ldlq]() {
+      plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &w4a16_groups, draft_vocab_size,
+                            draft_head_layouts, draft_head_requested, draft_head_kept,
+                            draft_head_ldlq_matched, draft_head_ldlq]() {
         const auto& m = model.Meta("lm_head.weight");
         const int64_t hidden_k = m.shape[1];
         if (draft_head_kept) {
           keep_bf16.Record("mtp.draft_head.lm_head", static_cast<int>(draft_vocab_size),
-                           static_cast<int>(hidden_k), layouts, std::cout);
+                           static_cast<int>(hidden_k), draft_head_requested, std::cout);
         }
+        w4a16_groups.Plan("mtp.draft_head.lm_head", draft_vocab_size, hidden_k, draft_head_layouts);
         if (draft_head_ldlq) ldlq.Plan("mtp.draft_head.lm_head", hidden_k, draft_head_layouts);
         else if (draft_head_ldlq_matched) ldlq.NoteSkipped();
         r4dx_convert::PlanLinearLayouts(writer, "mtp.draft_head.lm_head",
@@ -1407,6 +1478,7 @@ int RunConvert(const AppArgs& args) {
   // so the summary/"matched nothing" warning lands ahead of the long emit pass rather than after it.
   keep_bf16.Report(std::cout, std::cerr);
   ldlq.ReportPlan(std::cout, std::cerr);
+  w4a16_groups.Report(std::cout, std::cerr);
 
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";
@@ -1445,7 +1517,7 @@ int RunConvert(const AppArgs& args) {
         "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
     metadata["rotation"] = rot.Metadata();
   }
-  metadata["quant"] = BuildQuantMetadata();
+  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
   metadata["model_config"] = config;
   metadata["r4dx_convert_run"] = {
       {"layers_converted", layers},
@@ -1490,6 +1562,15 @@ int RunConvert(const AppArgs& args) {
     if (!args.imatrix.empty())
       metadata["r4dx_convert_run"]["imatrix_rotated"] = "diagonal model: (M o M)^T v";
   }
+  // --w4a16-group-rule: only when given, so a container converted without it keeps its header byte
+  // for byte. The rules as typed (order matters: first match wins), the resolved map (the same one
+  // __metadata__.quant.w4a16.groups carries -- recorded here too so the run record is complete on
+  // its own) and the .w4a16.wsz byte delta against the default group.
+  if (w4a16_groups.Enabled()) {
+    metadata["r4dx_convert_run"]["w4a16_group_rules"] = w4a16_groups.RulesJson();
+    metadata["r4dx_convert_run"]["w4a16_groups"] = w4a16_groups.GroupsJson();
+    metadata["r4dx_convert_run"]["w4a16_group_extra_bytes"] = w4a16_groups.ExtraBytes();
+  }
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
             << writer.PlannedDataBytes() << " data bytes\n";
@@ -1510,7 +1591,16 @@ int RunConvert(const AppArgs& args) {
 
 int RunSelftest(const AppArgs& args) {
   const int threads = ResolveThreads(args.threads);
-  const LayoutSet requested = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
+  // --w4a16-group-rule on the base "selftest", resolved before --keep-bf16 exactly as add_linear
+  // does: the renamed `.w4a16.wsz.g<g>` tensor, the metadata map and the bf16-companion guard are
+  // all reachable here without a checkpoint (tests/convert/test_w4a16_groups.cpp drives them).
+  // --no-bf16 is honoured here too (it used to be ignored by the selftest, whose bf16 is always
+  // on otherwise), because that guard refuses a non-default group next to a `.bf16.w`.
+  r4dx_convert::W4a16GroupRules w4a16_groups(args.w4a16_group_rules);
+  if (w4a16_groups.Enabled()) ValidateKernelRuleGroups(w4a16_groups);
+  LayoutSet parsed = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
+  if (args.no_bf16) parsed.bf16 = false;
+  const LayoutSet requested = w4a16_groups.Apply("selftest", parsed);
   // The selftest's single tensor has container base "selftest", so --keep-bf16 is exercisable end
   // to end here in milliseconds, against tests/convert/fixtures/input.safetensors and without a
   // 27B checkpoint -- the quickest way to see the whole CLI wiring (regex -> LayoutSet -> emitted
@@ -1553,6 +1643,8 @@ int RunSelftest(const AppArgs& args) {
   ContainerWriter writer;
   if (kept) keep_bf16.Record("selftest", N, K, requested, std::cout);
   keep_bf16.Report(std::cout, std::cerr);
+  w4a16_groups.Plan("selftest", N, K, layouts);
+  w4a16_groups.Report(std::cout, std::cerr);
   if (use_ldlq) ldlq.Plan("selftest", K, layouts);
   else if (ldlq_matched) ldlq.NoteSkipped();
   ldlq.ReportPlan(std::cout, std::cerr);
@@ -1561,7 +1653,13 @@ int RunSelftest(const AppArgs& args) {
   metadata["r4dx_format_version"] = "1";
   metadata["model_id"] = "selftest";
   metadata["produced_by"] = "r4dx-convert --selftest";
-  metadata["quant"] = BuildQuantMetadata();
+  metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
+  // Only with rules, as in RunConvert (the selftest has no r4dx_convert_run block otherwise).
+  if (w4a16_groups.Enabled()) {
+    metadata["r4dx_convert_run"] = {{"w4a16_group_rules", w4a16_groups.RulesJson()},
+                                    {"w4a16_groups", w4a16_groups.GroupsJson()},
+                                    {"w4a16_group_extra_bytes", w4a16_groups.ExtraBytes()}};
+  }
   writer.FinalizeHeader(args.selftest_output, metadata);
   if (use_ldlq) {
     const auto t0 = std::chrono::steady_clock::now();

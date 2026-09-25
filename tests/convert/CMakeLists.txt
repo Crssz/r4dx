@@ -76,6 +76,24 @@ add_executable(convert_keep_bf16 test_keep_bf16.cpp)
 target_link_libraries(convert_keep_bf16 PRIVATE r4dx_convert)
 add_test(NAME convert_keep_bf16 COMMAND convert_keep_bf16)
 
+# --w4a16-group-rule (docs/quant2.md section 5, Q3; w4a16_groups.hpp): rule parsing and first-match
+# selection over real base names, planning checks (K % g, K % 64, N % 16, the bf16-companion guard),
+# byte accounting at mixed groups (LinearLayoutBytes, --keep-bf16's extra bytes), the renamed
+# `.w4a16.wsz.g<g>` tensor and its bytes, LDLQ at g32/g128 through EmitLinearLayouts, and -- when
+# r4dx-convert is built -- the exe's --selftest: byte-identical to pre-Q3 without rules, the
+# __metadata__ map and run record with them, and the refusals. CPU-only (the exe only asks r4d_core
+# which groups it instantiates).
+add_executable(convert_w4a16_groups test_w4a16_groups.cpp)
+target_link_libraries(convert_w4a16_groups PRIVATE r4dx_convert)
+target_compile_definitions(convert_w4a16_groups PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_w4a16_groups PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_w4a16_groups r4dx-convert)
+endif()
+add_test(NAME convert_w4a16_groups COMMAND convert_w4a16_groups)
+
 # DFlash2 task A1 item 1: minimal GGUF v3 reader (metadata KV of every type incl. arrays/strings,
 # tensor directory, F32/F16/BF16/Q8_0 dequant) against tests/convert/fixtures/tiny.gguf (generated
 # by tools/convert_ref/make_tiny_gguf.py, no gguf-py dependency either side).

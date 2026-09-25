@@ -231,6 +231,12 @@ int main() {
     CheckW4A16(w, N, K, group);
     CheckW4A8(w, N, K, group);
   }
+  // Per-tensor w4a16 group 32 (docs/quant2.md section 5, --w4a16-group-rule): the kernel's G = 32
+  // body splits each packed 64-K block into two groups -- k steps 0,1 read (scale, zero) dword
+  // `t*nsz + kbase/32 + 2b`, k steps 2,3 dword `... + 2b + 1` -- which is k / 32 for every k of the
+  // block, i.e. the same `(t * K/g + k/g) * 16 + r` index CheckW4A16 decodes by. w4a8 has no
+  // per-tensor group, so it stays at the two above.
+  CheckW4A16(w, N, K, 32);
   CheckMxfp4(w, N, K);
 
   if (g_failures != 0) {

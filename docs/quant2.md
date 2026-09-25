@@ -347,14 +347,134 @@ Cost gate G7 decides whether `gdn.out_proj`'s extra launch stays.
 
 ## 5. Q3 -- per-tensor w4a16 group
 
-- libr4d: `R4D_GEMM_W4_GROUP` becomes a template parameter; entry points
-  `r4d_gemm_w4a16_nt_m64_g{32,64,128}` plus the existing one (build default) for compatibility.
+- libr4d: `R4D_GEMM_W4_GROUP` becomes a template parameter; one new entry point
+  `r4d_gemm_w4a16_nt_m64_g(int group, ...)` (32/64/128 instantiated) plus
+  `r4d_gemm_w4a16_nt_m64_has_group(int)`, and the existing entry (build default) unchanged for
+  compatibility.
 - Container: `__metadata__.quant.w4a16.groups` maps base name -> group when not all equal; the
   loader dispatches per `QuantLinear`; the tuning table gains a group column; the TP slicer
   already takes the group per tensor (`ShardLoader`'s `w4a16_group_` becomes per call).
 - Allocation: the Milestone 11 method, automated -- measure per (class, depth half) the KL
   recovered by g32 / g64 / g128 (one class at a time, rung 4), then fill the byte budget greedily by
   nats per GiB and stop at the cliff.
+
+### 5.1 Q3 implementation note (runtime)
+
+The on-disk format is docs/container-format.md, w4a16, "Per-tensor groups": `quant.w4a16.group`
+stays the container's default, the optional `quant.w4a16.groups` lists only the linears at another
+group, and such a linear's scales are `<base>.w4a16.wsz.g<g>` instead of `<base>.w4a16.wsz`. The
+converter side is `r4dx-convert --w4a16-group-rule` (README). This note covers the runtime half.
+
+**Off by default.** A container without the map takes the pre-Q3 path everywhere. The parse returns
+an empty map. Every scale tensor keeps its bare name. Every `QuantLinear::w4a16_group` stays 0, which
+means "this build's default". `ApplyLinear` then calls the historical `r4d_gemm_w4a16_nt_m64` entry
+with the tuning `PickTuning` has always returned, and the group check runs up front exactly as
+before. The kernel code for that entry is unchanged: the libr4d change diffs the 16 default
+instantiations' ISA as identical at both build defaults. The runtime has no flag for this: the
+container decides.
+
+**Loader** (`src/model/w4a16_group_meta.h`, `src/model/container.cpp`, `src/model/quant_linear.h`):
+
+- `w4a16_group_meta.h: ParseW4a16Groups` is HIP-free and header-only, like `rotation_meta.h`. It
+  runs on every load, TP=1 and TP alike, straight after the metadata read. It returns the default
+  group (128 when the `quant` block predates it, the historical rule) and the map. It throws, naming
+  the path, when:
+  - `groups` is not an object, or is present without `group`;
+  - a key is empty;
+  - a value is not an integer, not 32/64/128, or equal to the default.
+
+  `W4a16Groups::GroupFor`/`WszName`/`QuantLinearGroup` are the only places that turn a base name into
+  a group, a scale-tensor name or a `QuantLinear::w4a16_group`.
+- `container.cpp: CheckQuantGroups` still fires only when the load selects w4a16 for the body, the
+  lm head or the MTP head. It now returns `W4a16LoadGroups`, which every w4a16 read goes through.
+  - No map: `CheckW4a16Group(default)` up front, unchanged.
+  - A map: every mapped group must pass `r4d_gemm_w4a16_nt_m64_has_group` up front
+    (`CheckW4a16MappedGroup`, a `W4a16GroupMismatch`). The default-equality check then applies only
+    to linears without a map entry. It runs when the first such linear is read as w4a16
+    (`W4a16LoadGroups::Resolve`) and throws the same exception type. In practice every real
+    container has unmapped w4a16 linears, so a binary whose default differs from the container's
+    still refuses it.
+- `CheckW4a16GroupTensors` runs once per load, before any upload, for any layout. Each mapped base
+  must carry `.w4a16.wq` and `.w4a16.wsz.g<g>`, and must NOT carry a bare `.w4a16.wsz`. This check
+  rejects a map entry for an unknown base.
+- `LoadQuantLinear` (TP=1) reads the linear's own scale name and sets `w4a16_group`. It checks
+  `wq` = N·K/2 bytes, the scales = N·(K/g)·4 bytes, and `K % g`, `K % 64`, `N % 16`. The TP loader
+  already checked every part's size. At TP=1 this check is new for every w4a16 linear, but a
+  container the converter wrote always passes it.
+- `LoadQuantLinearWithFallback` and `ShardLoader::Linear`: a mapped base requested as w4a16 never
+  falls back to `.bf16.w` or the bare name. It throws instead. Unmapped bases keep the
+  requested -> bf16 -> bare chain unchanged.
+- TP: `ShardLoader` holds the `W4a16LoadGroups` instead of one int. It cuts each linear's wsz at the
+  linear's own group (`tp::PartShape::group`), under the linear's own name. `tp_shard.cpp` needed
+  no change, because `PlanRows`/`PlanCols` were already generic in the group. A rank's K range is
+  whole 64-K blocks (wq's rule), so it is whole groups at 32, 64 and 128. mlp.down's per-rank
+  8704 = 136 × 64 = 272 × 32.
+- The DFlash2 drafter refuses a container that carries a non-empty map
+  (`dflash_draft_weights.h`). The converter never writes one for a drafter.
+- One stderr line announces a map when the load selects w4a16 (TP: rank 0 only).
+
+**Dispatch and tuning** (`src/model/linear.{h,cpp}`, `src/core/include/r4dx/core/r4d.hpp`):
+
+- `ApplyLinear`: `EffectiveW4a16Group(w.w4a16_group)` (0 becomes `r4d_gemm_w4a16_nt_m64_group()`).
+  If the result equals the build default, it calls `core::r4d::GemmW4a16NtM64`, the historical
+  entry. Any other group calls the new `GemmW4a16NtM64G(group, ...)`, which wraps
+  `r4d_gemm_w4a16_nt_m64_g`. The default path adds one int compare per GEMM chunk.
+- `GemmTuningRow` gains a trailing `int group = 0`, so generated `.inc` rows still compile
+  unchanged. For w4a16 the group is part of the key: a row's group is `row.group`, with 0 meaning
+  the build default. The request's group is `EffectiveW4a16Group`.
+  - At the default group every existing row matches. The legality test becomes
+    `K % (SK * max(g, 64))`, which equals the old `K % (SK * g)` for every default a build
+    accepts, so the default path picks exactly what it always did.
+    `test_pick_tuning` checks this against a verbatim copy of the pre-Q3 resolution, for every row,
+    both tables and M = 1..64.
+  - At a non-default group no row matches yet, because `tune_gemm.py` writes group 0. The pick
+    falls back to `FallbackTuning` (WV4/SK4/MB1/NPW1). That tuning is legal at 32, 64 and 128 for
+    every K this model has, TP ranks included, since `K % 512` covers `4·max(g, 64)`. It gets the
+    same kRowTile treatment (M <= 16 shares M=1's SK, NT=0 on M = 2..16). The PickTuning cache key
+    carries the effective group in bits 53 and up.
+- The kernel's K rule for a split is `K % (SK * max(group, 64))`. A split must start on a 64-K
+  packed block, which a group of 32 does not guarantee. `BestRow`, `FallbackTuning` and
+  `test_pick_tuning`'s `Launchable` all use this form.
+
+**Old binaries refuse a mixed-group container.** This is reasoned from `main` at `e18a3a9`
+(`src/model/container.cpp`). Its `CheckQuantGroups` reads only `quant.w4a16.group`, which is the
+unchanged default, so the load proceeds. For a mapped linear, `LoadQuantLinearWithFallback` calls
+`HasLayout(kW4a16)`. That call needs the bare `<base>.w4a16.wsz`, which the container does not
+have. The fallback chain then tries `<base>.bf16.w`, then the bare `<base>`, and throws "no tensor
+found for '<base>' in any known on-disk form". The TP `ShardLoader::Linear` on `main` runs the same
+chain and throws the same error. The drafter never meets a map.
+
+That refusal depends on the linear having no `.bf16.w`. With a bf16 companion, the old binary
+would silently load the bf16 copy: correct numbers, the wrong layout, about 3.5× the bytes, and only a
+fallback count in the log. So `r4dx-convert` refuses a non-default group on any linear that keeps
+`.bf16.w`. Use `--no-bf16`, plus an `--lm-head` spec without bf16. The v6 recipe already does both.
+Loads with `--layout mxfp4` or `w4a8` on an old binary are correct, because the map changes only
+w4a16 tensors. `r4dx_format_version` is not a guard, because no reader checks it.
+
+**Costs and consequences.**
+
+- Speed: every mapped linear runs untuned (FallbackTuning) until `tools/profile/tune_gemm.py` sweeps
+  `r4d_gemm_w4a16_nt_m64_g` at that group and writes rows with the group column. Its parser and
+  writer do not yet know the column. The KL sweep is unaffected, but G8's decode number for a
+  mixed container needs those rows.
+- Determinism: a linear's arithmetic depends on its group and SK. kRowTile holds per group, so the
+  verify-row exactness of f7d4927 holds on a mixed container too.
+
+**Tests.** These CPU tests always run:
+
+- `test_w4a16_group_meta` checks:
+  - the parse and 16 refusal cases;
+  - the scale-tensor names;
+  - a round trip through the converter's own `W4a16GroupRules`;
+  - every real linear's TP=2 wsz slice at 32/64/128.
+- `test_tp_shard`'s variants gain w4a16 g32, byte-exact against the converter's packers, with a
+  pinned rank-1 mlp.down g32 offset.
+- `test_pick_tuning` covers groups 0/32/64/128 for launchability, the pre-Q3 pick at the default,
+  the fallback at other groups, the row-tile SK, and `has_group`.
+
+`test_tp_loader`, a GPU test, now resolves each linear's wsz name and group through the map. The
+GPU side (a mixed container loaded and decoded, TP=1 and TP=2, plus rung-4 KL per candidate) is
+handed to the user.
 
 ## 6. GPU runs this plan needs (each handed to the user)
 

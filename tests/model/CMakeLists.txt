@@ -174,6 +174,14 @@ add_executable(test_rotation_meta test_rotation_meta.cpp)
 target_link_libraries(test_rotation_meta PRIVATE r4dx_tp_shard)
 add_test(NAME test_rotation_meta COMMAND test_rotation_meta)
 
+# test_w4a16_group_meta: quant2 Q3's `__metadata__.quant.w4a16.groups` parse and scale-tensor names
+# (src/model/w4a16_group_meta.h, header-only and HIP-free), read back from r4dx-convert's own
+# W4a16GroupRules, and each group's TP=2 wsz slices (docs/quant2.md section 5.1). CPU-only, like
+# test_rotation_meta; r4dx_convert supplies the converter headers and its R4DX_W4A16_GROUP.
+add_executable(test_w4a16_group_meta test_w4a16_group_meta.cpp)
+target_link_libraries(test_w4a16_group_meta PRIVATE r4dx_tp_shard r4dx_convert)
+add_test(NAME test_w4a16_group_meta COMMAND test_w4a16_group_meta)
+
 # tp_vocab.h includes the HIP-free r4dx/kernels/summary_sampler.hpp; an include dir is the whole
 # coupling (linking r4dx_kernels would drag in its hipcc object for nothing).
 add_executable(test_tp_vocab_merge test_tp_vocab_merge.cpp)

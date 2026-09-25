@@ -73,7 +73,11 @@ set(R4D_EXTRA_r4d_gemm_w4a8_nt_m64 -DR4D_GEMM_W4A8_GROUP=128)
 # w4a16's group is the R4DX_W4A16_GROUP build option (root CMakeLists.txt, which also validates
 # it). The SAME number reaches r4dx_convert's kW4A16Group through src/convert/CMakeLists.txt; the
 # converter asserts this kernel's _group() export against it at startup, and Container::Load
-# asserts it against every container's own __metadata__.quant.w4a16.group.
+# asserts it against every container's own __metadata__.quant.w4a16.group. It is only the DEFAULT:
+# r4d_gemm_w4a16_nt_m64_g serves exactly groups 32/64/128 per call whatever this is (a default
+# outside those three, which the root CMakeLists.txt accepts, is served by the ungrouped entry
+# only), and r4d_gemm_w4a16_nt_m64 is that template at this group -- the same device code as
+# before the group was a template parameter.
 set(R4D_EXTRA_r4d_gemm_w4a16_nt_m64 -DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP})
 # add_custom_command cannot scan hipcc's #includes, so every unit depends on every libr4d header
 # (r4d_common.h, r4d_dt16.h, r4d_gdn_wmma.h, ...: an edit to one rebuilds each unit, a superset of

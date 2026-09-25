@@ -191,6 +191,15 @@ inline void GemmW4a16NtM64(const void* a, const void* wq, const void* wsz, void*
                          reinterpret_cast<int64_t>(wsz), reinterpret_cast<int64_t>(c), M, K, N,
                          WV, SK, MB, NPW, NT, reinterpret_cast<int64_t>(stream));
 }
+// The same GEMM at a per-tensor w4a16 group (docs/quant2.md section 5.1): 32, 64 or 128, whatever
+// the build default. K must be divisible by SK * max(group, 64); the kernel throws otherwise.
+inline void GemmW4a16NtM64G(int group, const void* a, const void* wq, const void* wsz, void* c,
+                             int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
+                             hipStream_t stream) {
+  r4d_gemm_w4a16_nt_m64_g(group, reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(wq),
+                           reinterpret_cast<int64_t>(wsz), reinterpret_cast<int64_t>(c), M, K, N,
+                           WV, SK, MB, NPW, NT, reinterpret_cast<int64_t>(stream));
+}
 inline void GemmW4a8NtM64(const void* a, const void* ascale, const void* wq, const void* ws,
                            void* c, int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
                            hipStream_t stream) {

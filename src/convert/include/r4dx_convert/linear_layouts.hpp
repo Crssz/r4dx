@@ -24,11 +24,30 @@ namespace r4dx_convert {
 
 // kW4A16Group / kW4A8Group (quant_int4.hpp) and kMxfp4Group (quant_mxfp4.hpp) are the group sizes
 // used below. w4a16's is a build option (R4DX_W4A16_GROUP) and need NOT equal w4a8's, so every
-// site below names the one belonging to the layout it is emitting.
+// site below names the one belonging to the layout it is emitting. w4a16's is additionally
+// PER LINEAR: LayoutSet::w4a16_group, the build default unless r4dx-convert's
+// --w4a16-group-rule (w4a16_groups.hpp) resolved another one for this base.
 
 struct LayoutSet {
   bool mxfp4 = false, w4a16 = false, w4a8 = false, bf16 = true;
+  // K per (scale, zero) pair of THIS linear's w4a16 layout (docs/quant2.md section 5). Anything but
+  // kW4A16Group -- the container's default, __metadata__.quant.w4a16.group -- also renames the
+  // scale tensor (W4a16WszName) and must be listed in __metadata__.quant.w4a16.groups. Ignored
+  // when `w4a16` is false.
+  int w4a16_group = kW4A16Group;
 };
+
+// The name of a w4a16 linear's scale tensor. At the container's default group it is the historical
+// `<base>.w4a16.wsz`; at any other group it is `<base>.w4a16.wsz.g<group>` (docs/container-format.md,
+// w4a16, "Per-tensor groups"). The rename is the compatibility guard, not decoration: a binary that
+// predates per-tensor groups looks for the bare `.w4a16.wsz`, does not find it, and refuses the
+// tensor, instead of reading its scales at the default group's stride -- wrong numbers with no
+// other symptom. (r4dx-convert refuses a non-default group on a linear that also keeps a
+// `.bf16.w`, which such a binary would silently load instead; see W4a16GroupRules::Plan.)
+inline std::string W4a16WszName(const std::string& base, int group) {
+  return group == kW4A16Group ? base + ".w4a16.wsz"
+                              : base + ".w4a16.wsz.g" + std::to_string(group);
+}
 
 // The LayoutSet a `--keep-bf16`-matched linear is written in: `<base>.bf16.w` and NOTHING else
 // (src/convert/main.cpp's --keep-bf16, docs/validation.md "Milestone 11 / sensitivity"). Named here
@@ -52,7 +71,7 @@ inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   const uint64_t NK = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
   uint64_t bytes = 0;
   if (layouts.bf16) bytes += NK * 2;
-  if (layouts.w4a16) bytes += NK / 2 + NK / kW4A16Group * 4;
+  if (layouts.w4a16) bytes += NK / 2 + NK / layouts.w4a16_group * 4;
   if (layouts.w4a8) bytes += NK / 2 + NK / kW4A8Group * 4;
   if (layouts.mxfp4) {
     bytes += NK / 2 + static_cast<uint64_t>(K) / kMxfp4Group * static_cast<uint64_t>(N) +
@@ -89,7 +108,19 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
   // Fail before planning a single byte rather than truncating silently in the quantizers/packers
   // later (review finding, minor -- see quant_int4.hpp's RequireDivisible).
   if (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) RequireDivisible(N, 16, "N", base.c_str());
-  if (layouts.w4a16) RequireDivisible(K, kW4A16Group, "K", base.c_str());
+  const int g16 = layouts.w4a16_group;
+  if (layouts.w4a16) {
+    // The build default is whatever this converter was compiled for (checked against the kernel at
+    // startup); any other group must be one r4d_gemm_w4a16_nt_m64_g instantiates.
+    if (g16 != kW4A16Group && !IsW4A16GroupSupported(g16)) {
+      throw std::runtime_error("r4dx_convert: w4a16 group " + std::to_string(g16) + " for " + base +
+                               " is not one the kernel instantiates (32, 64, 128) nor this "
+                               "build's default (" + std::to_string(kW4A16Group) + ")");
+    }
+    RequireDivisible(K, g16, "K", base.c_str());
+    // PackW4Nibbles' 64-K block: implied by the line above for any group >= 64, NOT for 32.
+    RequireDivisible(K, 64, "K", base.c_str());
+  }
   if (layouts.w4a8) RequireDivisible(K, kW4A8Group, "K", base.c_str());
   if (layouts.mxfp4) RequireDivisible(K, kMxfp4Group, "K", base.c_str());
   if (layouts.bf16)
@@ -97,8 +128,8 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
   if (layouts.w4a16) {
     writer.Plan(base + ".w4a16.wq", {static_cast<int64_t>(N) * K / 2},
                 static_cast<uint64_t>(N) * K / 2);
-    writer.Plan(base + ".w4a16.wsz", {static_cast<int64_t>(N) * K / kW4A16Group, 4},
-                static_cast<uint64_t>(N) * K / kW4A16Group * 4);
+    writer.Plan(W4a16WszName(base, g16), {static_cast<int64_t>(N) * K / g16, 4},
+                static_cast<uint64_t>(N) * K / g16 * 4);
   }
   if (layouts.w4a8) {
     writer.Plan(base + ".w4a8.wq", {static_cast<int64_t>(N) * K / 2},
@@ -132,19 +163,19 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     writer.WriteTensor(base + ".bf16.w", bytes.data(), bytes.size());
   }
   if (layouts.w4a16) {
+    const int g16 = layouts.w4a16_group;  // this linear's own group (PlanLinearLayouts checked it)
     std::vector<uint8_t> q, zero;
     std::vector<float> scale;
     if (ldlq != nullptr)
-      QuantizeInt4AsymmetricLdlq(w.data(), N, K, kW4A16Group, *ldlq, nthreads, q, scale, zero);
+      QuantizeInt4AsymmetricLdlq(w.data(), N, K, g16, *ldlq, nthreads, q, scale, zero);
     else if (search)
-      QuantizeInt4AsymmetricSearch(w.data(), N, K, kW4A16Group, opts.importance, nthreads, q, scale,
-                                   zero);
+      QuantizeInt4AsymmetricSearch(w.data(), N, K, g16, opts.importance, nthreads, q, scale, zero);
     else
-      QuantizeInt4Asymmetric(w.data(), N, K, kW4A16Group, nthreads, q, scale, zero);
+      QuantizeInt4Asymmetric(w.data(), N, K, g16, nthreads, q, scale, zero);
     auto wq = PackW4Nibbles(q, N, K, nthreads);
-    auto wsz = PackW4A16Scales(scale, zero, N, K, kW4A16Group);
+    auto wsz = PackW4A16Scales(scale, zero, N, K, g16);
     writer.WriteTensor(base + ".w4a16.wq", wq.data(), wq.size() * 4);
-    writer.WriteTensor(base + ".w4a16.wsz", wsz.data(), wsz.size() * 4);
+    writer.WriteTensor(W4a16WszName(base, g16), wsz.data(), wsz.size() * 4);
   }
   if (layouts.w4a8) {
     std::vector<uint8_t> q;

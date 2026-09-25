@@ -216,6 +216,42 @@ No KL number yet: the pilot (`--ldlq "mlp\."` on top of v6) is gate G3 in `docs/
 stops there if it does not cut mean KL by at least 10%. (`D:\models\r4dx\qwen38-27b.hessian` is an
 example output directory, not an existing capture.)
 
+**`--w4a16-group-rule "<regex>=<g>"` -- per-tensor w4a16 group (experimental, `docs/quant2.md`
+Q3).** Repeatable. Every linear whose container base name the regex matches (`regex_search`,
+ECMAScript, like `--keep-bf16`) is packed in w4a16 at group `g` (32, 64 or 128) instead of the
+build's `R4DX_W4A16_GROUP`. Rules are tried in the order given and the first match wins, so an
+exception goes before a broad rule (a rule may name the default group); unmatched linears keep the
+default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.5 at 64, 4.25 at 128.
+
+```powershell
+.\build\win-hip\src\convert\r4dx-convert.exe `
+    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-groups.r4dx `
+    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
+    --w4a16-group-rule "^text\.layers\.([0-9]|[12][0-9]|3[01])\.mlp\.down$=32" `
+    --w4a16-group-rule "gdn\.in_proj_z$=128"
+```
+
+- A matched linear's scale tensor is written as `<base>.w4a16.wsz.g<g>` and listed in
+  `__metadata__.quant.w4a16.groups` (docs/container-format.md "Per-tensor groups"); nothing else
+  changes. A binary built before per-tensor groups refuses such a container rather than reading
+  the scales at the wrong stride -- which is why a non-default group on a linear that also keeps a
+  `.bf16.w` is a hard error: use `--no-bf16`, and an `--lm-head` spec without bf16.
+- `K` must be a multiple of the group and of 64, `N` of 16 -- checked while planning, before the
+  header is written. A malformed rule, an invalid regex or another group is an argument error; a
+  rule that decides no w4a16 linear warns and converts normally. `--keep-bf16` wins over a rule;
+  `--ldlq` rounds at the linear's own group. Not accepted with `--dflash-gguf`.
+- The log has one line per rule and a total (`.w4a16.wsz` bytes against the default);
+  `__metadata__.r4dx_convert_run` records `w4a16_group_rules`, `w4a16_groups` and
+  `w4a16_group_extra_bytes`. Without the flag the container is byte-identical to before.
+- Choosing the rules: `tools/quant2/group_sweep.ps1 -Convert -Kl` converts and measures (rung 4, HIP
+  device 1) one candidate per tensor class x depth half x group, and
+  `tools/quant2/alloc_groups.py` ranks them by nats of KL per GiB, fills a byte budget (default:
+  equal bytes), reports the cliff and prints the flags for the chosen set. The runtime side
+  (`r4d_gemm_w4a16_nt_m64_g`, the loader and the tuning table) must be built from the same tree.
+
 ### Generate text
 
 ```powershell

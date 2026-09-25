@@ -125,6 +125,10 @@ struct Variant {
 };
 const Variant kVariants[] = {
     {"bf16", Scheme::kBf16, 0},
+    // quant2 Q3 (docs/quant2.md section 5.1): 32 is a per-tensor group only (never a build default),
+    // and half a 64-K packed block -- the wsz slice at 32 must still line up with wq's.
+    {"w4a16 g32", Scheme::kW4a16, 32},
+    {"w4a16 search+imatrix g32", Scheme::kW4a16Search, 32},
     {"w4a16 g64", Scheme::kW4a16, 64},
     {"w4a16 g128", Scheme::kW4a16, 128},
     {"w4a16 search+imatrix g64", Scheme::kW4a16Search, 64},
@@ -610,6 +614,7 @@ void TestRealPlans() {
   const ModelConfig g = RealConfig();
   const LayoutParts layouts[] = {
       {"bf16", {{Part::kBf16, 0}}},
+      {"w4a16 g32", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 32}}},  // quant2 Q3 per-tensor group
       {"w4a16 g64", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 64}}},
       {"w4a16 g128", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 128}}},
       {"w4a8", {{Part::kW4Wq, 0}, {Part::kW4a8Ws, 128}}},
@@ -762,6 +767,11 @@ void TestRealPlans() {
   Check(ends(plan1("text.layers.0.mlp.down", {Part::kW4a16Wsz, 5120, 17408, 64, 0}), 320, 136 * 64,
              (size_t{319} * 272 + 136) * 64, 136 * 64),
         "real offsets: mlp.down w4a16 g64 wsz rank 1 = [(t*272 + 136)*64, +136*64), t = 0..319");
+  // quant2 Q3: the same split at a per-tensor group of 32 -- 544 groups per tile, rank 1 takes
+  // groups [272, 544), still exactly wq's blocks [136, 272).
+  Check(ends(plan1("text.layers.0.mlp.down", {Part::kW4a16Wsz, 5120, 17408, 32, 0}), 320,
+             272 * 64, (size_t{319} * 544 + 272) * 64, 272 * 64),
+        "real offsets: mlp.down w4a16 g32 wsz rank 1 = [(t*544 + 272)*64, +272*64), t = 0..319");
   // mlp.gate_up rank 1 rows [8704, +8704) u [26112, +8704): 160 B per row of w4a8 ws (40 groups x
   // 4 B), 2560 B per row of mxfp4 wq.
   Check(ends(plan1("text.layers.0.mlp.gate_up", {Part::kW4a8Ws, 34816, 5120, 128, 0}), 2,
@@ -772,7 +782,7 @@ void TestRealPlans() {
         "real offsets: mlp.gate_up mxfp4 wq rank 1 = rows 8704.. and 26112.. at 2560 B per row");
   Pass("real shapes: " + std::to_string(plans) +
        " (tensor, rank, layout, part) plans legal, exact size, ascending and in bounds, contiguous "
-       "exactly where 5.1 says; 6 rank-1 offsets pinned to 4.3's formulas");
+       "exactly where 5.1 says; 7 rank-1 offsets pinned to 4.3's formulas");
 }
 
 // ---- 3. end to end on the small config ----------------------------------------------------------

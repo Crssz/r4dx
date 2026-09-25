@@ -72,6 +72,17 @@ inline constexpr int kW4A16Group = R4DX_W4A16_GROUP;
 static_assert(kW4A16Group > 0 && kW4A16Group % 64 == 0,
               "R4DX_W4A16_GROUP must be a positive multiple of R4D_GEMM_W4_KPB (64)");
 
+// Per-tensor w4a16 groups (docs/quant2.md section 5, Q3): r4d_gemm_w4a16_nt_m64_g instantiates the
+// kernel at exactly these three groups, independently of the build default above, and a container
+// may carry any of them tensor by tensor (__metadata__.quant.w4a16.groups, w4a16_groups.hpp). 32
+// is half a packed 64-K block -- the kernel has a separate loop body for it -- which is why the
+// static_assert above still speaks for the DEFAULT only: a per-tensor 32 is validated at run time
+// (K % 64 as well as K % 32, see PlanLinearLayouts), not at build time. All three divide the LDLQ
+// block width (128), so --ldlq works at each of them.
+inline bool IsW4A16GroupSupported(int group) {
+  return group == 32 || group == 64 || group == 128;
+}
+
 // w4a8's group is NOT an option: third_party/CMakeLists.txt pins the kernel to
 // -DR4D_GEMM_W4A8_GROUP=128 (its in-kernel default is 256). Change one and the startup assert in
 // src/convert/main.cpp fires naming both numbers.

@@ -92,6 +92,17 @@ class DflashDraftWeights {
         w.metadata_.at("quant").at("w4a16").contains("group")) {
       CheckW4a16Group(w.metadata_.at("quant").at("w4a16").at("group").get<int>(), path);
     }
+    // quant2 Q3 (docs/quant2.md section 5.1): the drafter reads every linear at the container's
+    // one default group (dflash_draft.cpp's bare `.w4a16.wsz`). r4dx-convert refuses
+    // --w4a16-group-rule with --dflash-gguf, so a drafter never carries a per-tensor map; one that
+    // does was not written by it, and is refused by name rather than by a missing tensor later.
+    if (w.metadata_.contains("quant") && w.metadata_.at("quant").contains("w4a16") &&
+        w.metadata_.at("quant").at("w4a16").contains("groups") &&
+        !w.metadata_.at("quant").at("w4a16").at("groups").empty()) {
+      throw std::runtime_error("DflashDraftWeights::Open: '" + path +
+                                "' carries __metadata__.quant.w4a16.groups; per-tensor w4a16 "
+                                "groups are not supported for the DFlash2 drafter");
+    }
     return w;
   }
 

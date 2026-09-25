@@ -36,6 +36,7 @@
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "test_common.h"
 #include "tp/tp_shard.h"
+#include "w4a16_group_meta.h"
 
 using r4dx::model::Container;
 using r4dx::model::ContainerLoadOptions;
@@ -116,9 +117,10 @@ struct LoadedPair {
 
 class RankChecker {
  public:
-  RankChecker(const FileView& f, const ModelConfig& global, int rank, int w4a16_group,
-              Layout requested, Checker& ck)
-      : f_(f), g_(global), rank_(rank), group_(w4a16_group), requested_(requested), ck_(ck) {}
+  // `groups`: the container's w4a16 groups (quant2 Q3) -- each linear's wsz name and slice group.
+  RankChecker(const FileView& f, const ModelConfig& global, int rank,
+              const r4dx::model::W4a16Groups& groups, Layout requested, Checker& ck)
+      : f_(f), g_(global), rank_(rank), groups_(groups), requested_(requested), ck_(ck) {}
 
   template <class T>
   void Raw(const std::string& name, const r4dx::core::DeviceBuffer<T>& buf, size_t rank_elems) {
@@ -172,7 +174,10 @@ class RankChecker {
       }
       case Layout::kW4a16:
         part(base + ".w4a16.wq", tp::Part::kW4Wq, 0, DeviceBytes(q.wq));
-        part(base + ".w4a16.wsz", tp::Part::kW4a16Wsz, group_, DeviceBytes(q.w4a16_wsz));
+        part(groups_.WszName(base), tp::Part::kW4a16Wsz, groups_.GroupFor(base),
+             DeviceBytes(q.w4a16_wsz));
+        ck_.Expect(q.w4a16_group == groups_.QuantLinearGroup(base),
+                   Where(base) + ": w4a16_group " + std::to_string(q.w4a16_group));
         break;
       case Layout::kW4a8:
         part(base + ".w4a8.wq", tp::Part::kW4Wq, 0, DeviceBytes(q.wq));
@@ -193,7 +198,7 @@ class RankChecker {
   bool HasForm(const std::string& base, Layout l) const {
     switch (l) {
       case Layout::kBf16: return f_.Has(base + ".bf16.w");
-      case Layout::kW4a16: return f_.Has(base + ".w4a16.wq") && f_.Has(base + ".w4a16.wsz");
+      case Layout::kW4a16: return f_.Has(base + ".w4a16.wq") && f_.Has(groups_.WszName(base));
       case Layout::kW4a8: return f_.Has(base + ".w4a8.wq") && f_.Has(base + ".w4a8.ws");
       case Layout::kMxfp4:
         return f_.Has(base + ".mxfp4.wq") && f_.Has(base + ".mxfp4.ws") &&
@@ -207,7 +212,8 @@ class RankChecker {
 
   const FileView& f_;
   const ModelConfig& g_;
-  int rank_, group_;
+  int rank_;
+  const r4dx::model::W4a16Groups& groups_;
   Layout requested_;
   Checker& ck_;
 };
@@ -215,9 +221,9 @@ class RankChecker {
 // Rank shapes from docs/tp.md 4.2 at TP=2 (v6 / 27B, which the 4-layer container shares).
 constexpr int64_t kHidden = 5120;
 
-void CheckRank(const Container& c, const FileView& f, const ModelConfig& g, int rank, int group,
-               Layout layout, Checker& ck) {
-  RankChecker rc(f, g, rank, group, layout, ck);
+void CheckRank(const Container& c, const FileView& f, const ModelConfig& g, int rank,
+               const r4dx::model::W4a16Groups& groups, Layout layout, Checker& ck) {
+  RankChecker rc(f, g, rank, groups, layout, ck);
   ck.Expect(c.NumLoadedLayers() == kLayers, "layer count");
   for (int64_t i = 0; i < kLayers; ++i) {
     const std::string b = "text.layers." + std::to_string(i) + ".";
@@ -492,7 +498,7 @@ int RunTest() {
   // The container's own config and w4a16 group, parsed independently of the loader under test by
   // a TP=1 metadata-only route: ModelConfig::FromJson on the header's text_config.
   ModelConfig global;
-  int w4a16_group = 128;
+  r4dx::model::W4a16Groups w4a16_groups;  // default 128 and no map unless the header says so
   {
     std::FILE* fp = std::fopen(kContainerPath, "rb");
     if (fp == nullptr) throw std::runtime_error("cannot open container");
@@ -506,9 +512,8 @@ int RunTest() {
     const nlohmann::json meta = nlohmann::json::parse(header).at("__metadata__");
     const nlohmann::json& mc = meta.at("model_config");
     global = ModelConfig::FromJson(mc.contains("text_config") ? mc.at("text_config") : mc);
-    if (meta.contains("quant") && meta.at("quant").contains("w4a16")) {
-      w4a16_group = meta.at("quant").at("w4a16").value("group", 128);
-    }
+    // quant2 Q3: the default group and any per-tensor map (test_w4a16_group_meta covers the parse).
+    w4a16_groups = r4dx::model::ParseW4a16Groups(meta, kContainerPath);
   }
 
   const auto shared = Container::LoadEmbedTokensHost(kContainerPath);
@@ -532,7 +537,7 @@ int RunTest() {
       p.rank[r] = std::make_unique<Container>(Container::Load(kContainerPath, o));
     }
     const int before = ck.failures;
-    for (int r = 0; r < kWorld; ++r) CheckRank(*p.rank[r], f, global, r, w4a16_group, layout, ck);
+    for (int r = 0; r < kWorld; ++r) CheckRank(*p.rank[r], f, global, r, w4a16_groups, layout, ck);
     CheckEmbed(p, f, shared, decided, /*check_host_bytes=*/layout == Layout::kBf16, ck);
     if (layout == Layout::kBf16) CheckBf16Reassembly(p, f, global, ck);
     std::printf("test_tp_loader: %-5s both ranks checked (%d failure(s))\n", LayoutName(layout),

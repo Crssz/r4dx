@@ -26,14 +26,15 @@
 //       H = X^T X / rows, W random [256, K]. proxy(Wq) = tr((W - deq Wq) H (W - deq Wq)^T), in
 //       double. The LDLQ proxy must be <= 0.2x that of the search quantizer weighted by diag(H)
 //       (the --quant search --imatrix path; docs/quant2.md's G1 floor is 0.8, this data leaves the
-//       correct loop at ~0.1), for w4a16 at groups 64 and 128, w4a8 and mxfp4. RTN is printed
+//       correct loop at ~0.1), for w4a16 at groups 32, 64 and 128 (32: a per-tensor group,
+//       docs/quant2.md section 5), w4a8 and mxfp4. RTN is printed
 //       alongside for scale. The ratio cannot see a broken lazy-block update on its own, so each
 //       layout is also checked against an UNBLOCKED per-row GPTQ reference (full-row feedback after
 //       every column, group parameters chosen from the current weights with the no-refit search;
 //       K = 512 is 4 column blocks): codes may differ at <= 0.1% (fp summation order) and the proxy
 //       by <= 0.5%.
-//   (e) determinism. LDLQ output bytes are identical at nthreads 1, 3 and 16 for all three layouts,
-//       and with the scalar path forced. So are FactorHessian's U and diag_h.
+//   (e) determinism. LDLQ output bytes are identical at nthreads 1, 3 and 16 for all three layouts
+//       (w4a16 at groups 32, 64 and 128), and with the scalar path forced. So are FactorHessian's U and diag_h.
 //   (f) HessianStore on tests/convert/fixtures/hess_small, which
 //       tools/reference/hessian_capture.py --write-fixture wrote. Checked against expected.json:
 //       the file size and sha256, K / rows / trace, the fp64 sum of the upper triangle (to 1e-6
@@ -1004,7 +1005,9 @@ void TestProxyAndPackers() {
       CheckAgainstRef(kt + " " + what, ref, codes, p_ldlq, Proxy(W, ref.deq, Hd, N, K));
     };
 
-    for (int group : {64, 128}) {
+    // 32 is a per-tensor w4a16 group (--w4a16-group-rule, docs/quant2.md section 5); 64 / 128 the
+    // two build defaults.
+    for (int group : {32, 64, 128}) {
       const std::string what = Fmt("w4a16 g%d", group);
       std::vector<uint8_t> q0, z0, q1, z1, q2, z2;
       std::vector<float> s0, s1, s2;
@@ -1072,7 +1075,7 @@ void TestDeterminism() {
   }
 
   // Each layout at 16 threads is the reference; 1 and 3 threads, and the scalar path, must match it.
-  for (int group : {64, 128}) {
+  for (int group : {32, 64, 128}) {
     std::vector<uint8_t> q16, z16;
     std::vector<float> s16;
     QuantizeInt4AsymmetricLdlq(W.data(), N, K, group, f, 16, q16, s16, z16);

@@ -40,7 +40,10 @@ function Run([string]$name, [scriptblock]$cmd) {
 }
 
 $resultsPath = Join-Path $OutDir 'results.json'
-$results = @(if (Test-Path $resultsPath) { Get-Content $resultsPath -Raw | ConvertFrom-Json })
+# PS 5.1's ConvertFrom-Json emits a JSON array as ONE pipeline object; wrapping that in @() nests it
+# (and the next save writes {"value": [...], "Count": n}). foreach enumerates the rows themselves.
+$results = @()
+if (Test-Path $resultsPath) { foreach ($row in (Get-Content $resultsPath -Raw | ConvertFrom-Json)) { $results += $row } }
 
 foreach ($v in $Variant) {
   $name, $extra = $v -split '=', 2

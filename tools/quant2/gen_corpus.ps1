@@ -1,0 +1,131 @@
+# quant2 corpus v2, self-generated part (docs/quant2.md 2.1): start r4dx-server on HIP device 1 with the
+# q1full container (plus the DFlash2 drafter unless -NoDflash), wait for /health, run
+# tools\quant2\gen_corpus.py against it, and ALWAYS stop the server afterwards. Resumable: a re-run
+# continues samples.jsonl where the last one stopped (gen_corpus.py's docstring, "Resume").
+#
+#   .\tools\quant2\gen_corpus.ps1                 # the whole prompt set -> D:\models\r4dx\corpus-v2
+#   .\tools\quant2\gen_corpus.ps1 -Limit 5        # smoke: the first 5 in processing order (mixed categories)
+#   .\tools\quant2\gen_corpus.ps1 -Limit 8 -OnlyCategory chat   # smoke the thinking budget first (below)
+#   .\tools\quant2\gen_corpus.ps1 -NoDflash       # plain sampled decode
+#
+# Before the full run, smoke the chats: their thinking turns run at the template's default xhigh
+# effort within a 7168-token (one turn) or 3584-token (two turns) budget that holds thought AND
+# answer, and nothing in docs/ has measured this model's thought lengths yet. Count the
+# "reasoning never closed" rejects in gen_corpus.log (or reject_reasons in gen_manifest.json). A full
+# run then resumes after the smoke's samples; if a budget is changed instead, the generator refuses the
+# changed entries' lines (their prompt_sha256) until they are deleted.
+#
+# Writes to -OutDir: samples.jsonl, gen_manifest.json, gen_corpus.log (the generator's progress lines,
+# appended across runs) and server_<stamp>.{out,err}.log per run.
+#
+# Why --dflash (k=7) by default, from docs/sampling.md section 12 and the sections it builds on:
+# - Supported: with a drafter loaded, the server sends every temperature > 0 request through
+#   DecodeStepDflashSampled (12.1), injection included (12.2).
+# - Exact in distribution, always: the sampled round draws once per emitted token and accepts a draft
+#   iff the draw equals it (9.1), so the emitted tokens are distributed exactly as plain sampled decode's.
+# - Exact token for token, within a bound: since 2026-09-25 a verify row equals the plain decode row bit
+#   for bit for every --dflash-k <= 7 (9.3's note; docs/mtp.md "Sampled rounds are bit-exact"), so a
+#   fixed seed gives plain decode's own tokens. The narrow remainder is a verify window straddling a
+#   change of the attention kernel's segment width (context 512, 1024, ... at --max-ctx >= 1024, as
+#   here): there the tokens may differ from plain decode's, the distribution does not.
+# - k = 7: the best w4a16 sampled cell (12.4 and docs/perf.md "Milestone 6, stage S3": 154 tok/s on the
+#   code prompt at T=0.6-0.7, above k=4's 125-129) and the quant2 decode bench's k. The thinking chats
+#   sample at T=1.0 (the checkpoint's recommendation), where fewer drafts match: that costs speed only.
+# The text only has to be realistic input (the Hessians come from the bf16 checkpoint later), so the
+# drafter only buys speed; -NoDflash is the plain-decode fallback.
+param(
+  [string]$OutDir = 'D:\models\r4dx\corpus-v2',
+  [int]$Limit = 0,
+  [switch]$NoDflash,
+  [string]$OnlyCategory = '',
+  [string]$Model = 'D:\models\r4dx\qwen38-27b-q1full.r4dx',
+  [string]$Dflash = 'D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx',
+  [int]$DflashK = 7,
+  [int]$Port = 18080,
+  [int]$LoadTimeoutSec = 900,
+  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+)
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$serverExe = Join-Path $repo 'build\win-hip\src\server\r4dx-server.exe'
+$gen = Join-Path $PSScriptRoot 'gen_corpus.py'
+$prompts = Join-Path $PSScriptRoot 'corpus_v2_prompts.json'
+
+# HIP device 1 must be ours alone: a second model process would share the GPU and skew both.
+$busy = @(Get-Process r4dx-server, r4dx-cli, r4dx-convert -ErrorAction SilentlyContinue)
+if ($busy.Count) {
+  throw ('[corpus] refusing to start while these run: ' +
+         (($busy | ForEach-Object { "$($_.ProcessName) (pid $($_.Id))" }) -join ', '))
+}
+# Anything else answering on the port would answer /health for us.
+$listening = $null
+try { $listening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop } catch { }
+if ($listening) { throw "[corpus] port $Port is already in use (pid $(@($listening)[0].OwningProcess)); pass -Port" }
+$need = @($serverExe, $Model, $Python, $gen, $prompts)
+if (-not $NoDflash) { $need += $Dflash }
+foreach ($p in $need) { if (-not (Test-Path $p)) { throw "[corpus] not found: $p" } }
+New-Item -ItemType Directory -Force $OutDir | Out-Null
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$errLog = Join-Path $OutDir "server_$stamp.err.log"
+$outLog = Join-Path $OutDir "server_$stamp.out.log"
+$serverArgs = @('--model', $Model, '--layout', 'w4a16', '--vision', 'off', '--max-ctx', '8192', '--port', "$Port")
+if (-not $NoDflash) { $serverArgs += @('--dflash', $Dflash, '--dflash-k', "$DflashK") }
+# PS 5.1's Start-Process joins -ArgumentList with spaces and quotes nothing: quote what needs it.
+$argLine = ($serverArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+
+# Both are restored in the finally block: run from an interactive session, neither may outlive the script.
+$prevHip = $env:HIP_VISIBLE_DEVICES
+$prevPyEnc = $env:PYTHONIOENCODING
+$env:HIP_VISIBLE_DEVICES = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+$proc = $null
+$code = 1
+try {
+  Write-Host "[corpus] starting r4dx-server on HIP device 1: $argLine"
+  $proc = Start-Process -FilePath $serverExe -ArgumentList $argLine -PassThru -NoNewWindow `
+    -RedirectStandardError $errLog -RedirectStandardOutput $outLog
+  # PS 5.1: a -PassThru Process reports an EMPTY ExitCode unless its Handle was opened before the
+  # process exited; caching it now keeps the load-failure message's exit code.
+  $null = $proc.Handle
+  $t0 = Get-Date
+  $health = $null
+  while (((Get-Date) - $t0).TotalSeconds -lt $LoadTimeoutSec) {
+    Start-Sleep -Seconds 2
+    if ($proc.HasExited) {
+      Get-Content $errLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+      throw "[corpus] r4dx-server exited during load (exit $($proc.ExitCode)); log $errLog"
+    }
+    try {
+      $h = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/health" -TimeoutSec 5
+      if ($h.status -eq 'ok') { $health = $h; break }
+    } catch { }
+  }
+  if (-not $health) { throw "[corpus] /health not ok after $LoadTimeoutSec s; log $errLog" }
+  Write-Host ('[corpus] server ready after {0:N0} s (model {1})' -f ((Get-Date) - $t0).TotalSeconds, $health.model)
+
+  $genArgs = @($gen, '--prompts', $prompts, '--server', "http://127.0.0.1:$Port",
+               '--out', (Join-Path $OutDir 'samples.jsonl'), '--manifest', (Join-Path $OutDir 'gen_manifest.json'),
+               '--log', (Join-Path $OutDir 'gen_corpus.log'), '--container', $Model,
+               # provenance only; unquoted, because PS 5.1 mangles embedded quotes in native arguments
+               '--server-cmdline', ('r4dx-server.exe ' + ($serverArgs -join ' ')))
+  if (-not $NoDflash) { $genArgs += @('--dflash-container', $Dflash, '--dflash-k', "$DflashK") }
+  if ($Limit -gt 0) { $genArgs += @('--limit', "$Limit") }
+  if ($OnlyCategory) { $genArgs += @('--only-category', $OnlyCategory) }
+  # PS 5.1 makes native stderr lines error records, which 'Stop' would turn into a terminating error
+  # (and so kill the server mid-run); the generator's exit code is the verdict.
+  $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { & $Python @genArgs } finally { $ErrorActionPreference = $prev }
+  $code = $LASTEXITCODE
+  Write-Host ("[corpus] gen_corpus.py exit $code (0 ok, 1 transport abort or a crash, 2 refused requests " +
+              "or a file/prompt/kl-dir refusal, 130 interrupted; gen_corpus.log has the reason)")
+} finally {
+  if ($proc -and -not $proc.HasExited) {
+    Write-Host "[corpus] stopping r4dx-server (pid $($proc.Id))"
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    $null = $proc.WaitForExit(60000)
+  }
+  $env:HIP_VISIBLE_DEVICES = $prevHip
+  $env:PYTHONIOENCODING = $prevPyEnc
+}
+exit $code

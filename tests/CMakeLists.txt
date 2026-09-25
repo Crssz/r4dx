@@ -91,8 +91,24 @@ if(EXISTS "${R4DX_REFERENCE_PYTHON}")
               "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_hessian_rms.py"
   )
   set_tests_properties(reference_hessian_rms PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=6")
+
+  # hessian_capture.py's corpus source 4, the self-generated samples.jsonl (--gen-file, docs/quant2.md
+  # "Corpus v2"): contract checks, chat-template rendering, per-category packing, provenance and the
+  # kl_corpus disjointness gate, on tests/reference/fixtures/hessian_gen_samples.jsonl. No GPU; the
+  # rendering/packing part reads the checkpoint's tokenizer and SKIPs when it is not on disk.
+  # PYTHONIOENCODING: ctest pipes stdout, and a pipe on Windows gets the ANSI code page (cp1252),
+  # which cannot hold the Thai the gate prints. The test checks that path itself on its own strict
+  # cp1252 stream; this only keeps the log readable.
+  add_test(
+      NAME reference_hessian_corpus
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_hessian_corpus.py"
+  )
+  set_tests_properties(reference_hessian_corpus PROPERTIES ENVIRONMENT
+                       "OMP_NUM_THREADS=1;PYTHONIOENCODING=utf-8")
 else()
-  message(STATUS "r4dx: reference_manifest, reference_dflash2 and reference_hessian_rms NOT "
+  message(STATUS "r4dx: reference_manifest, reference_dflash2, reference_hessian_rms and "
+                 "reference_hessian_corpus NOT "
                  "registered -- the reference venv's interpreter ${R4DX_REFERENCE_PYTHON} does not "
                  "exist (set R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and "
                  "reconfigure)")

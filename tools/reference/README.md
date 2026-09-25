@@ -1166,6 +1166,23 @@ refuses instead of a half-valid set.
   llama.cpp's unicode range tables), and -- to stay disjoint from the held-out KL
   corpus -- `src/model/model.cpp`, `tools/reference/layer_golden.py` (the `kl_corpus/` excerpts'
   sources) and anything under `tools/reference/kl_corpus/`.
+- with `--gen-file samples.jsonl` (none by default; docs/quant2.md 3.3 "Corpus v2"): text our own
+  quantized model generated through r4dx-server. `load_gen_samples` holds the file to the
+  generator's contract. The non-rejected samples are rendered in id order: raw ones verbatim, chats
+  through the checkpoint's `chat_template.jinja` with `enable_thinking` as recorded and
+  `add_generation_prompt=False` (every assistant turn keeps its `<think>` block; a thinking-off turn
+  gets the empty one). Each category's concatenation is cut into non-overlapping windows (the tail
+  is dropped and reported; `--gen-max-seqs N` keeps N evenly spread ones). One source entry per
+  category records the file's sha256, the sample ids, the rejected count and the dropped tail.
+  **Disjointness gate:** the run stops, after listing every offending sample, if any rendered
+  sample shares a 50-character (whitespace-normalized) run with a `kl_corpus/*.txt` file. For a raw
+  sample, the prompt and the other message fields are checked as well. `#include`/import lines of
+  the KL files are not compared.
+
+Every token window of the first three sources is checked the same way. A hit there is printed as
+a WARNING and recorded under the source's `kl_disjointness.overlaps`, but it is not refused. Some
+repo files share runs with model.cpp or layer_golden.py, and v1's own code windows meet one.
+docs/quant2.md 3.3 has the details.
 
 `--dry-run` (under `%USERPROFILE%\dev\.venv`, transformers 5.3.0, CPU-only torch -- token counts
 under the reference venv may differ slightly):
@@ -1211,7 +1228,8 @@ and `--write-fixture` never touch `torch.cuda` and are exempt. Before capturing 
 
 **Options**: `--model-dir`, `--out-dir` (default `D:\models\r4dx\hessian-v1`), `--force`,
 `--corpus-dir`/`--calib-txt` (`none` to skip), `--wikitext` (`none` to skip), `--wikitext-seqs`,
-`--code-seqs`, `--seq-len`, `--no-mtp`, `--draft-head`, `--layers N` (SMOKE: first N text layers
+`--code-seqs`, `--gen-file SAMPLES_JSONL`, `--gen-max-seqs N`, `--seq-len`, `--no-mtp`,
+`--draft-head`, `--layers N` (SMOKE: first N text layers
 only; lm_head/MTP then see layer N-1's output, so their files are written but given NO key in
 `keys` -- no converter run can LDLQ them from a smoke set -- and the manifest says `smoke: true`),
 `--keys REGEX`
@@ -1258,7 +1276,8 @@ The rms taps hook the norm module's INPUT (a forward_pre_hook on each layer's `i
 - `hessian.json` exists;
 - the checkpoint's `config.json` sha256 is the set's;
 - this run's corpus matches the recorded one field by field (every source's sha256, token counts,
-  windows and file list; only `file_list_method` is ignored);
+  windows and file list; only `file_list_method` and `kl_disjointness`, which say how a source was
+  read and checked, are ignored);
 - without `--force`, the manifest has no `rms_keys` yet. With `--force`, the old rms entries are
   removed from it before the capture starts.
 
@@ -1288,7 +1307,9 @@ rms files no exemption, because only the post-norm taps are listed under `taps`.
 
 CPU test: `tests/reference/test_hessian_rms.py` (ctest `reference_hessian_rms`, no checkpoint, no
 GPU). It runs a tiny random 2-layer Qwen3_5 stack with a dead channel through `run_capture`, the
-gates, `finish_rms_only` / `merge_rms_manifest` and `regate`.
+gates, `finish_rms_only` / `merge_rms_manifest` and `regate`. The `--gen-file` corpus source has
+its own: `tests/reference/test_hessian_corpus.py` (ctest `reference_hessian_corpus`, no GPU; it
+reads the checkpoint's tokenizer and SKIPs the rendering part without it).
 
 **Expected cost** (not yet measured -- a GPU run is handed to the user): the dominant work is the
 `mlp.down` GEMM, `17408^2 x 2048 x 2` FLOP per sequence and layer, ~7 PFLOP over the whole run;

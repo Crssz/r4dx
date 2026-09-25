@@ -77,6 +77,41 @@ the post-norm file's; `diag(H_post)_i` within 2% of `(1 + w_i)^2 diag(H_rms)_i` 
 must all pass before anything rms goes into a manifest; otherwise nothing rms is written into it and
 the report goes to `hessian_rms.failed.json`.
 
+**Self-generated corpus (`--gen-file`, corpus source 4; docs/quant2.md "Corpus v2").** A
+`samples.jsonl` written by the corpus generator (text our own quantized model produced through
+r4dx-server; one JSON object per line: id "<category>/<NNN>", category, format "raw"|"chat",
+enable_thinking, the FULL `messages` incl. every generated assistant turn and its
+`reasoning_content`, `text` = the final assistant content stripped for "raw", rejected /
+reject_reason, ...). `load_gen_samples` validates that contract and drops the rejected samples;
+`render_gen_sample` turns each remaining one, in id order, into the text the model would read: a raw
+document verbatim, a chat through the checkpoint's own chat template with `enable_thinking` as
+recorded and `add_generation_prompt=False`; `build_gen_corpus` tokenizes each category's
+concatenation (raw documents joined by a blank line, chats back to back -- each ends in
+`<|im_end|>\n`) with no special tokens added and cuts it into non-overlapping `--seq-len` windows
+(the short tail is dropped and reported; `--gen-max-seqs` keeps an evenly spread subset). What the
+template does with thinking (checked on every render, `check_rendered_chat`): EVERY assistant turn
+becomes `<|im_start|>assistant\n<think>\n{reasoning_content|trim}\n</think>\n\n{content|trim}<|im_end|>\n`
+unless the caller sets `preserve_thinking=false` (the generator does not, and neither does this
+script), in which case only the turns after the last user message keep the block -- the final
+assistant turn of a sample always does. A turn without reasoning (thinking off) gets the EMPTY block
+`<think>\n\n</think>\n\n`, which is exactly the generation prompt the template appends for
+`enable_thinking=false`, so the rendered chat is what the model was served plus what it generated.
+`enable_thinking=true` also puts the template's default (`xhigh`) reasoning-effort sentence into
+the system turn.
+
+**Disjointness with the held-out KL corpus, every source** (`kl_index` / `find_kl_overlaps`): a
+"hit" is a `KL_SHINGLE_CHARS`-character (whitespace-normalized) run shared with a
+`tools/reference/kl_corpus/*.txt` file outside that file's `#include` / Python import lines
+(`KL_BOILERPLATE_LINE`: the cpp/python KL excerpts open with the standard include/import blocks any
+code shares, which is idiom, not eval text). Every non-rejected gen sample is checked BEFORE
+tokenizing -- its rendered text, plus for a raw sample the prompt and every other message field
+(`gen_gate_texts`) -- and ANY hit stops the run after listing every offending sample. Every token
+window of sources 1-3 is checked too, decoded back to its text (`gate_windows`), but a hit there is
+printed and recorded, not refused: those windows are fixed by the design, and the repo code they
+cut from quotes model.cpp / layer_golden.py in places (build_corpus says where and why). Each
+source entry records the check and its hits as `kl_disjointness`. Lines that can carry generated or
+KL text go through `say`, which escapes what the console cannot encode.
+
 **Numerics.** Per sequence, `x` (bf16) is upcast to fp32 and `x^T x` is formed by one fp32 GEMM
 (TF32 explicitly off) -- a sum of <= 2048 products per entry -- and added into an fp64 device
 accumulator, so the ~172k-row sum loses nothing to accumulation order. `H = acc / rows` is written
@@ -106,6 +141,8 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v1
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --rms-only --code-rev <commit> `
         --out-dir D:\\models\\r4dx\\hessian-v1
+    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v2 `
+        --rms-taps --wikitext-seqs 128 --code-seqs 48 --gen-file D:\\models\\r4dx\\corpus-v2\\samples.jsonl
 
 `--dry-run` and `--write-fixture` never touch the GPU. See tools/reference/README.md
 ("hessian_capture.py") for the option list, the corpus, the gates and the expected runtime.
@@ -150,6 +187,37 @@ CODE_SUFFIXES = (".cpp", ".h", ".hpp", ".hip", ".py")
 #: Not "this repo's own" source: vendored libraries. Their style is not r4dx's and they are large
 #: (src/tokenizer/vendor/ is llama.cpp's unicode tables, ~236 KB of mostly hex range literals).
 CODE_EXCLUDE_PREFIXES = ("third_party/", "src/tokenizer/vendor/")
+
+#: --gen-file (samples.jsonl): the categories and formats the corpus generator writes. Anything else
+#: is a contract violation and stops the run (a typo would otherwise become a category of its own).
+GEN_CATEGORIES = ("thai_prose", "english_prose", "chat", "code", "multilingual")
+GEN_FORMATS = ("raw", "chat")
+#: What follows a raw document in a category's concatenation when anything comes after it. A
+#: rendered chat needs no separator: it ends in "<|im_end|>\n", so the next sample starts fresh.
+GEN_RAW_SEPARATOR = "\n\n"
+#: The disjointness gate (every corpus source): no calibration text may share this many consecutive
+#: characters (after collapsing every whitespace run to one space) with any
+#: tools/reference/kl_corpus/*.txt file, outside that file's boilerplate lines (next).
+KL_SHINGLE_CHARS = 50
+#: The lines of a KL file the gate does NOT compare against: an `#include <x>` / `#include "x"`
+#: directive or a Python import statement (`import a.b as c, d`, `from a import b, c`,
+#: `from a import (b, c)`, and every line of a `from a import (` block up to its `)`), each with an
+#: optional trailing comment. The cpp/python KL excerpts are the HEADERS of model.cpp and
+#: layer_golden.py, so they open with sorted standard includes/imports that any C++ or Python text
+#: shares: `\n#include <algorithm>\n#include <chrono>\n#include <` and
+#: `from __future__ import annotations\n\nimport argparse` are 50 normalized characters on their
+#: own. Such a match is idiom, not eval text. Each run of lines between boilerplate lines is
+#: shingled on its own, so no shingle spans one either. The grammar is strict (a prose line such as
+#: "import tariffs on steel" is not an import statement); the per-file count of skipped lines is
+#: recorded, and is 0 for the prose files.
+_PY_NAMES = r"\w+(?:\s+as\s+\w+)?(?:\s*,\s*\w+(?:\s+as\s+\w+)?)*\s*,?"
+KL_BOILERPLATE_LINE = re.compile(
+    r"\s*(?:#\s*include\s*(?:<[^<>]*>|\"[^\"]*\")\s*(?://.*|/\*.*)?"
+    r"|import\s+[\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*\s*(?:#.*)?"
+    rf"|from\s+[\w.]+\s+import\s+(?:\*|{_PY_NAMES}|\(\s*{_PY_NAMES}\s*\)|(?P<open>\()\s*(?:{_PY_NAMES})?)"
+    r"\s*(?:#.*)?)")
+#: A line inside a `from a import (` block: names, a comment, the closing `)`, or blank.
+KL_IMPORT_CONTINUATION = re.compile(rf"\s*(?:{_PY_NAMES})?\s*(?P<close>\))?\s*(?:#.*)?")
 
 HESS_MAGIC = b"R4DXHES1"
 HESS_FLAG_PACKED_UPPER = 1
@@ -235,8 +303,10 @@ RMS_FAILED_MANIFEST_NAME = "hessian_rms.failed.json"
 #: checkpoint moves channels by far more.
 RMS_CONSISTENCY_RTOL = 0.02
 #: Corpus-source fields that say HOW a source was read, not what it contains: --rms-only ignores
-#: them when comparing its corpus with the recorded one (--code-rev changes file_list_method only).
-CORPUS_HOW_FIELDS = ("file_list_method",)
+#: them when comparing its corpus with the recorded one (--code-rev changes file_list_method only;
+#: a gen source's kl_disjointness records what the gate checked against, which a later edit of
+#: kl_corpus/ may change without changing a single calibration token).
+CORPUS_HOW_FIELDS = ("file_list_method", "kl_disjointness")
 
 CAVEAT = (
     "H = mean over calibration tokens of x x^T (x = the linear's INPUT activation, bf16 upcast to "
@@ -245,8 +315,13 @@ CAVEAT = (
     "before it (full_logits_golden.StreamingReference's layers, driven layer-major). What this is "
     "NOT: it is not a sequential-GPTQ Hessian -- the preceding layers are the bf16 originals, not "
     "their quantized versions (docs/quant2.md 1.2) -- and it is only as representative as the "
-    "corpus (calib.txt + kv_calib_corpus/ + WikiText-2 train + this repo's own sources, disjoint "
-    "from the held-out KL corpus tools/reference/kl_corpus/)."
+    "corpus (calib.txt + kv_calib_corpus/ + WikiText-2 train + this repo's own sources + with "
+    "--gen-file text self-generated by the quantized model). None of it is the held-out KL corpus "
+    "tools/reference/kl_corpus/, and model.cpp and layer_golden.py, the sources of its code "
+    "excerpts, are left out. A 50-character whitespace-normalized run shared with kl_corpus/ "
+    "outside its #include/import lines refuses a generated sample (prompts included); in the "
+    "windows of the other sources, which can hold repo code quoting those two files, every such "
+    "run is listed under corpus.sources[*].kl_disjointness.overlaps."
 )
 
 
@@ -560,7 +635,9 @@ def _tokenize_prefix(tokenizer, text: str, need: int, margin: int = 256) -> tupl
     chars = max(4096, need * 8)
     while True:
         chunk = text[:chars]
-        ids = tokenizer(chunk, add_special_tokens=False)["input_ids"]
+        # verbose=False: --wikitext-seqs 128 tokenizes a ~2M-char prefix (~480k tokens), past the
+        # model's maximum length; only L-token windows of it are ever run. The ids are unchanged.
+        ids = tokenizer(chunk, add_special_tokens=False, verbose=False)["input_ids"]
         if len(ids) >= need + margin or chars >= len(text):
             return list(ids)[:need], len(chunk)
         chars *= 2
@@ -632,6 +709,450 @@ def git_blobs(commit: str, paths: list[str]) -> dict[str, bytes]:
     return blobs
 
 
+# --------------------------------------------------------------------------------------------
+# Corpus source 4: self-generated samples (--gen-file, docs/quant2.md "Corpus v2")
+# --------------------------------------------------------------------------------------------
+
+
+def load_gen_samples(path: Path) -> tuple[list[dict], list[dict], str]:
+    """Read a samples.jsonl and hold it to the generator's interface contract. Returns (the samples
+    with rejected == false, sorted by id; the rejected ones, sorted by id; the file's sha256).
+
+    Refused on any line (the line number is named): not a JSON object; an id that is not a unique
+    "<category>/<rest>" string whose category is the sample's `category` and one of GEN_CATEGORIES;
+    a format not in GEN_FORMATS; a non-boolean `rejected` or `enable_thinking`. Refused on a
+    non-rejected sample only (a rejected one is counted, never rendered): `messages` that is not a
+    list of {role: system|user|assistant, content: str} objects with a user turn and ending in an
+    assistant turn; a raw sample whose `text` is empty or not the final assistant content stripped;
+    a chat sample with a non-null `text`; a thinking chat whose FINAL assistant turn has no
+    `reasoning_content` string (its thought would render as an empty block), or a non-thinking one
+    with a non-empty `reasoning_content` on any turn (it would render a thought the model never had
+    in context). An earlier assistant turn of a thinking chat may lack `reasoning_content`: it then
+    renders with an empty block, which is exactly what the model was served if the generator did
+    not replay that thought."""
+    raw = path.read_bytes()
+    sha = hashlib.sha256(raw).hexdigest()
+    used: list[dict] = []
+    rejected: list[dict] = []
+    seen: dict[str, int] = {}
+    bad: list[str] = []
+    # Split on "\n" only, NOT str.splitlines(): that also breaks at U+2028/U+2029, U+0085, \v, \f
+    # and \x1c-\x1e, which json.dumps(ensure_ascii=False) leaves unescaped inside a string -- a
+    # generated sample containing one would be cut in half. (json.loads ignores a trailing "\r".)
+    for lineno, line in enumerate(raw.decode("utf-8").split("\n"), 1):
+        if not line.strip():
+            continue
+        where = f"{path.name}:{lineno}"
+        try:
+            s = json.loads(line)
+        except json.JSONDecodeError as e:
+            bad.append(f"{where}: not JSON ({e})")
+            continue
+        if not isinstance(s, dict):
+            bad.append(f"{where}: not a JSON object")
+            continue
+        sid, cat, fmt = s.get("id"), s.get("category"), s.get("format")
+        if not isinstance(sid, str) or "/" not in sid or sid.split("/", 1)[0] != cat:
+            bad.append(f"{where}: id {sid!r} is not '<category>/<NNN>' for category {cat!r}")
+            continue
+        where = f"{where} ({sid})"
+        if sid in seen:
+            bad.append(f"{where}: duplicate id (first on line {seen[sid]})")
+            continue
+        seen[sid] = lineno
+        if cat not in GEN_CATEGORIES:
+            bad.append(f"{where}: category {cat!r} is not one of {list(GEN_CATEGORIES)}")
+        elif fmt not in GEN_FORMATS:
+            bad.append(f"{where}: format {fmt!r} is not one of {list(GEN_FORMATS)}")
+        elif not isinstance(s.get("rejected"), bool):
+            bad.append(f"{where}: rejected {s.get('rejected')!r} is not a boolean")
+        elif not isinstance(s.get("enable_thinking"), bool):
+            bad.append(f"{where}: enable_thinking {s.get('enable_thinking')!r} is not a boolean")
+        elif s["rejected"]:
+            rejected.append(s)
+        else:
+            why = _gen_sample_problem(s)
+            if why:
+                bad.append(f"{where}: {why}")
+            else:
+                used.append(s)
+    if bad:
+        for b in bad[:16]:
+            say(f"[hessian]   {b}")
+        raise SystemExit(f"[hessian] --gen-file {path}: {len(bad)} line(s) break the samples.jsonl "
+                         f"contract (docs/quant2.md 'Corpus v2'); first: {bad[0]}")
+    if not used:
+        raise SystemExit(f"[hessian] --gen-file {path}: no sample with rejected == false "
+                         f"({len(rejected)} rejected)")
+    return sorted(used, key=lambda s: s["id"]), sorted(rejected, key=lambda s: s["id"]), sha
+
+
+def _gen_sample_problem(s: dict) -> str | None:
+    """What makes a non-rejected sample unusable (load_gen_samples' per-sample rules), or None."""
+    msgs = s.get("messages")
+    if not isinstance(msgs, list) or not msgs or not all(
+            isinstance(m, dict) and m.get("role") in ("system", "user", "assistant") and
+            isinstance(m.get("content"), str) for m in msgs):
+        return "messages is not a non-empty list of {role: system|user|assistant, content: str}"
+    if msgs[-1]["role"] != "assistant":
+        return f"the last message is a {msgs[-1]['role']!r} turn, not the generated assistant turn"
+    if not any(m["role"] == "user" for m in msgs):
+        return "no user turn (the chat template refuses a conversation without one)"
+    for m in msgs:
+        rc = m.get("reasoning_content")
+        if rc is not None and not isinstance(rc, str):
+            return f"reasoning_content {type(rc).__name__} is not a string"
+    final = msgs[-1]
+    if s["format"] == "raw":
+        text = s.get("text")
+        if not isinstance(text, str) or not text:
+            return "a raw sample needs a non-empty text"
+        if text != final["content"].strip():
+            return "text is not the final assistant content stripped of surrounding whitespace"
+        return None
+    if s.get("text") is not None:
+        return "a chat sample's text must be null (the messages are what is rendered)"
+    if s["enable_thinking"] and not isinstance(final.get("reasoning_content"), str):
+        return "enable_thinking is true but the final assistant turn has no reasoning_content"
+    if not s["enable_thinking"] and any(m.get("reasoning_content") for m in msgs):
+        return "enable_thinking is false but a turn carries a non-empty reasoning_content"
+    return None
+
+
+def assistant_turn_rendering(message: dict) -> str:
+    """How the checkpoint's chat_template.jinja writes an assistant turn with preserve_thinking
+    unset: `<|im_start|>assistant\\n<think>\\n` + reasoning_content|trim + `\\n</think>\\n\\n` +
+    content|trim + `<|im_end|>\\n` (jinja's trim is str.strip; a missing/non-string
+    reasoning_content renders as the empty block `<think>\\n\\n</think>\\n\\n`)."""
+    rc = message.get("reasoning_content")
+    return ("<|im_start|>assistant\n<think>\n" + (rc if isinstance(rc, str) else "").strip() +
+            "\n</think>\n\n" + message["content"].strip() + "<|im_end|>\n")
+
+
+def check_rendered_chat(sample: dict, text: str) -> None:
+    """Every assistant turn of a rendered chat must appear in order in the form
+    `assistant_turn_rendering` gives, and the render must END with the final one: a template (or a
+    transformers version) that dropped the final turn's thought, rendered a thinking-off turn
+    without its empty block, or appended anything after the model's own turn stops the run instead
+    of quietly calibrating on text the model was never served."""
+    turns = [m for m in sample["messages"] if m["role"] == "assistant"]
+    pos = 0
+    for k, m in enumerate(turns):
+        block = assistant_turn_rendering(m)
+        at = text.find(block, pos)
+        last = k == len(turns) - 1
+        if at < 0 or (last and at + len(block) != len(text)):
+            raise SystemExit(
+                f"[hessian] --gen-file sample {sample['id']}: the chat template did not render "
+                f"assistant turn {k + 1}/{len(turns)} as <think>\\n<reasoning>\\n</think>\\n\\n<content>"
+                f"<|im_end|>{' at the end of the conversation' if last and at >= 0 else ''} -- a "
+                f"different chat_template.jinja than the one this script was checked against?")
+        pos = at + len(block)
+
+
+def render_gen_sample(sample: dict, tokenizer, chat_template: str | None) -> str:
+    """The text one non-rejected sample contributes. Raw: its `text` verbatim. Chat: its full
+    `messages` through `chat_template` (the checkpoint's own) with `enable_thinking` as recorded and
+    `add_generation_prompt=False` -- the conversation already ends with the model's turn -- then
+    checked by `check_rendered_chat`. No other template variable is set: `reasoning_effort` stays
+    the template's default (xhigh) and `preserve_thinking` unset, as for a request that sends
+    neither."""
+    if sample["format"] == "raw":
+        return sample["text"]
+    if not isinstance(chat_template, str):
+        raise SystemExit(f"[hessian] --gen-file sample {sample['id']} is a chat but the tokenizer "
+                         f"has no chat template")
+    text = tokenizer.apply_chat_template(sample["messages"], chat_template=chat_template,
+                                         tokenize=False, add_generation_prompt=False,
+                                         enable_thinking=bool(sample["enable_thinking"]))
+    if not isinstance(text, str):
+        raise SystemExit(f"[hessian] apply_chat_template(tokenize=False) returned "
+                         f"{type(text).__name__}, not the rendered string")
+    check_rendered_chat(sample, text)
+    return text
+
+
+def ws_normalize(text: str) -> str:
+    """The disjointness gate's normalization: every whitespace run (str.split's Unicode notion,
+    CR/LF, tabs and NBSP included) becomes one space, and leading/trailing whitespace goes."""
+    return " ".join(text.split())
+
+
+def kl_gate_segments(text: str) -> tuple[list[tuple[str, list[int]]], int]:
+    """How the gate reads one kl_corpus file: (the runs of consecutive lines that are not
+    boilerplate (KL_BOILERPLATE_LINE and the continuation lines of a `from a import (` block), each
+    whitespace-normalized exactly as ws_normalize normalizes the whole run -- the non-empty
+    normalized lines joined by one space -- with the 1-based file line of every one of its
+    characters; the number of boilerplate lines skipped). A file without boilerplate is ONE segment,
+    equal to ws_normalize(text)."""
+    segs: list[tuple[str, list[int]]] = []
+    pieces: list[str] = []
+    line_of: list[int] = []
+    skipped = 0
+    in_import = False
+
+    def close() -> None:
+        if pieces:
+            segs.append((" ".join(pieces), line_of.copy()))
+            pieces.clear()
+            line_of.clear()
+
+    for no, line in enumerate(text.split("\n"), 1):
+        if in_import:
+            m = KL_IMPORT_CONTINUATION.fullmatch(line)
+            if m:
+                skipped += 1
+                in_import = m.group("close") is None
+                continue
+            in_import = False  # not an import line after all: an unclosed `(`, read on as text
+        m = KL_BOILERPLATE_LINE.fullmatch(line)
+        if m:
+            close()
+            skipped += 1
+            in_import = m.group("open") is not None
+            continue
+        piece = ws_normalize(line)
+        if piece:
+            if pieces:
+                line_of.append(no)  # the joining space
+            pieces.append(piece)
+            line_of.extend([no] * len(piece))
+    close()
+    return segs, skipped
+
+
+@dataclass
+class KlIndex:
+    """The held-out KL corpus as the disjointness gate sees it (`kl_index`)."""
+    shingles: dict[str, tuple[str, int]]  #: n-char normalized run -> (file name, 1-based line)
+    shas: dict[str, str]                  #: file name -> sha256 of its bytes
+    boilerplate_lines: dict[str, int]     #: file name -> lines skipped (KL_BOILERPLATE_LINE)
+    label: str                            #: the directory, repo-relative when inside the repo
+
+    def record(self, checked: str, overlaps: list[dict] | None = None) -> dict:
+        """A source entry's `kl_disjointness` (a CORPUS_HOW_FIELDS field): what was compared against
+        what, the overlaps found (find_kl_overlaps hits; a gen source never has any -- its gate
+        refuses the run instead) and whether there were none."""
+        return {"shingle_chars": KL_SHINGLE_CHARS,
+                "normalization": "every whitespace run -> one space (str.split), then trimmed",
+                "kl_dir": self.label, "kl_files": dict(self.shas),
+                "kl_boilerplate": ("#include and Python import lines (trailing comment allowed) are "
+                                   "not compared; no shingle spans one"),
+                "kl_boilerplate_lines": dict(self.boilerplate_lines), "shingles": len(self.shingles),
+                "checked": checked, "overlaps": list(overlaps or []), "ok": not overlaps}
+
+
+def kl_index(kl_dir: Path | None = None, n: int = KL_SHINGLE_CHARS) -> KlIndex:
+    """Every n-character substring of every `kl_gate_segments` segment of every `kl_dir/*.txt`
+    (default: the repo's tools/reference/kl_corpus/) -> (file name, 1-based line where it starts):
+    ~34k entries for the KL corpus. Refuses a directory without .txt files: the gate would pass
+    vacuously."""
+    kl_dir = kl_dir if kl_dir is not None else REPO_ROOT / KL_CORPUS_DIR
+    files = sorted(kl_dir.glob("*.txt"))
+    if not files:
+        raise SystemExit(f"[hessian] disjointness gate: no *.txt under {kl_dir} to compare against")
+    shingles: dict[str, tuple[str, int]] = {}
+    shas: dict[str, str] = {}
+    skipped: dict[str, int] = {}
+    for p in files:
+        raw = p.read_bytes()
+        shas[p.name] = hashlib.sha256(raw).hexdigest()
+        segs, skipped[p.name] = kl_gate_segments(raw.decode("utf-8"))
+        for t, line_of in segs:
+            for i in range(len(t) - n + 1):
+                shingles.setdefault(t[i:i + n], (p.name, line_of[i]))
+    try:
+        label = kl_dir.resolve().relative_to(REPO_ROOT).as_posix() + "/"
+    except ValueError:
+        label = str(kl_dir)
+    return KlIndex(shingles, shas, skipped, label)
+
+
+def find_kl_overlaps(texts: list[tuple[str, str]], shingles: dict[str, tuple[str, int]],
+                     n: int = KL_SHINGLE_CHARS) -> list[dict]:
+    """For each (id, text) that shares an n-character whitespace-normalized substring with the KL
+    corpus, its FIRST such position: {id, offset (in the normalized text), substring, kl_file,
+    kl_line}. One hash lookup per character position -- ~1.5M for ~400k tokens of generated text,
+    about a second."""
+    hits = []
+    for sid, text in texts:
+        t = ws_normalize(text)
+        for i in range(len(t) - n + 1):
+            where = shingles.get(t[i:i + n])
+            if where is not None:
+                hits.append({"id": sid, "offset": i, "substring": t[i:i + n],
+                             "kl_file": where[0], "kl_line": where[1]})
+                break
+    return hits
+
+
+def say(msg: str) -> None:
+    """print() for a line that may carry generated or KL text (Thai): a stream that cannot encode it
+    -- on Windows a pipe or a file gets the ANSI code page (cp1252) with 'strict' errors, and ctest
+    always pipes -- gets `\\uXXXX` escapes instead of a UnicodeEncodeError that would bury the
+    gate's refusal under a traceback. main() reconfigures sys.stdout the same way; this also
+    covers code that imports the module (the tests)."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(msg.encode(enc, errors="backslashreplace").decode(enc, errors="replace"), flush=True)
+
+
+def report_kl_hits(hits: list[dict]) -> None:
+    """One line per hit, EVERY hit: the ids are what the user acts on."""
+    for h in hits:
+        say(f"[hessian]   {h['id']}{' ' + h['where'] if h.get('where') else ''} (normalized char "
+            f"{h['offset']}) shares {h['substring']!r} with {h['kl_file']} line {h['kl_line']}")
+
+
+def gen_gate_texts(sample: dict, rendered: str) -> list[tuple[str, str]]:
+    """What the gate reads of one non-rejected sample, as (where, text): the rendered text, and for
+    a RAW sample also every message's `content` and `reasoning_content` except the final content
+    (that IS the rendered text) -- the prompt is not calibrated on there, but it steered the text
+    (a prompt quoting KL text makes the model write on in the eval's domain). A rendered chat
+    already holds every message."""
+    raw = sample["format"] == "raw"
+    texts = [("text" if raw else "rendered chat", rendered)]
+    if raw:
+        last = len(sample["messages"]) - 1
+        for k, m in enumerate(sample["messages"]):
+            for fld in ("content", "reasoning_content"):
+                if (k, fld) != (last, "content") and isinstance(m.get(fld), str) and m[fld].strip():
+                    texts.append((f"messages[{k}].{fld}", m[fld]))
+    return texts
+
+
+def gate_windows(seqs: list[Seq], tokenizer, kl: KlIndex) -> list[dict]:
+    """The disjointness check over token windows (corpus sources 1-3; build_corpus records its hits,
+    it does not refuse them): each sequence's ids decoded back to text exactly (special tokens
+    kept, no clean-up) and scanned -- the text the Hessians are actually calibrated on. One hit per
+    window at most, `id` the sequence name."""
+    return find_kl_overlaps(
+        [(s.name, tokenizer.decode(s.token_ids, skip_special_tokens=False,
+                                   clean_up_tokenization_spaces=False)) for s in seqs],
+        kl.shingles)
+
+
+def gen_window_starts(n_tokens: int, seq_len: int, max_seqs: int | None) -> list[int]:
+    """Token offsets of the windows cut from one category's `n_tokens`-token concatenation: all
+    `n_tokens // seq_len` non-overlapping windows 0, L, 2L, ... (the short tail is dropped). With
+    `max_seqs` below that, `max_seqs` of them spread evenly over the whole concatenation, first and
+    last included like the code windows -- a subset of the uncapped windows, so the cap only ever
+    removes windows, never moves one."""
+    n_all = n_tokens // seq_len
+    if max_seqs is None or max_seqs >= n_all:
+        picked = list(range(n_all))
+    elif max_seqs == 1:
+        picked = [0]
+    else:  # consecutive picks differ by >= floor((n_all - 1) / (max_seqs - 1)) >= 1: distinct
+        picked = [w * (n_all - 1) // (max_seqs - 1) for w in range(max_seqs)]
+    return [w * seq_len for w in picked]
+
+
+def build_gen_corpus(path: Path, tokenizer, seq_len: int, max_seqs: int | None = None,
+                     kl: KlIndex | None = None) -> tuple[list[Seq], list[dict]]:
+    """Corpus source 4 (`--gen-file`): the non-rejected samples of `path` (load_gen_samples), each
+    rendered (render_gen_sample), gated against the held-out KL corpus (`kl`, default kl_index())
+    BEFORE any tokenizing (gen_gate_texts + find_kl_overlaps; a SystemExit after every overlapping
+    sample has been listed), then per category (sorted), the
+    rendered samples in id order are concatenated -- a raw document is followed by
+    GEN_RAW_SEPARATOR when anything comes after it, a chat by nothing (it ends in `<|im_end|>\\n`) --
+    tokenized as one text with NO special tokens added (the template's control tokens are in the
+    text and the tokenizer maps them; the checkpoint adds no BOS), and cut into the
+    `gen_window_starts` windows. Returns the sequences (`gen/<category>/<w>`) and one source entry
+    per category present in the file (also a category whose every sample was rejected)."""
+    if max_seqs is not None and max_seqs < 1:
+        raise SystemExit(f"[hessian] --gen-max-seqs {max_seqs}: must be >= 1 (omit it for no cap)")
+    if not path.is_file():
+        raise SystemExit(f"[hessian] --gen-file {path} does not exist")
+    used, rejected, file_sha = load_gen_samples(path)
+    template = getattr(tokenizer, "chat_template", None)
+    rendered = [(s, render_gen_sample(s, tokenizer, template)) for s in used]
+
+    kl = kl if kl is not None else kl_index()
+    t0 = time.perf_counter()
+    hits: list[dict] = []
+    chars = 0
+    for s, t in rendered:
+        for where, text in gen_gate_texts(s, t):
+            chars += len(text)
+            h = find_kl_overlaps([(s["id"], text)], kl.shingles)
+            if h:
+                hits.append(dict(h[0], where=where))
+                break
+    gate_s = time.perf_counter() - t0
+    if hits:
+        report_kl_hits(hits)
+        raise SystemExit(
+            f"[hessian] --gen-file {path}: {len(hits)} sample(s), every one listed above, share a "
+            f"{KL_SHINGLE_CHARS}-character whitespace-normalized run with the held-out KL corpus "
+            f"{kl.label} (first: {hits[0]['id']} vs {hits[0]['kl_file']}). The Hessians must not be "
+            f"calibrated on the text KL is measured on: mark those samples rejected (or regenerate "
+            f"them) and rerun.")
+    say(f"[hessian] gen disjointness gate: PASS -- {len(rendered)} sample(s), {chars} chars "
+        f"(prompts included), no {KL_SHINGLE_CHARS}-char overlap with {len(kl.shas)} kl_corpus "
+        f"file(s) ({len(kl.shingles)} shingles, {gate_s:.2f}s)")
+    disjoint = kl.record("every non-rejected sample: its rendered text, and for a raw sample every "
+                         "other message field (the prompt) too")
+    template_sha = hashlib.sha256(template.encode("utf-8")).hexdigest() \
+        if isinstance(template, str) else None
+
+    seqs: list[Seq] = []
+    sources: list[dict] = []
+    for cat in sorted({s["category"] for s in used} | {s["category"] for s in rejected}):
+        items = [(s, t) for s, t in rendered if s["category"] == cat]
+        rej = [s for s in rejected if s["category"] == cat]
+        parts = []
+        for k, (s, t) in enumerate(items):
+            if k and items[k - 1][0]["format"] == "raw":
+                parts.append(GEN_RAW_SEPARATOR)
+            parts.append(t)
+        text = "".join(parts)
+        # verbose=False: a category's concatenation is longer than model_max_length on purpose;
+        # only seq_len windows of it are ever run.
+        ids = list(tokenizer(text, add_special_tokens=False, verbose=False)["input_ids"]) \
+            if text else []
+        starts = gen_window_starts(len(ids), seq_len, max_seqs)
+        for w, s0 in enumerate(starts):
+            seqs.append(Seq(f"gen/{cat}/{w:03d}", "gen", ids[s0:s0 + seq_len]))
+        formats = {f: sum(1 for s, _ in items if s["format"] == f) for f in GEN_FORMATS}
+        # Counted by the "<kind>" of the generator's "<kind>: <detail>" reject_reason, the keys of
+        # gen_manifest.json's reject_reasons: the detail is per sample (a length, a turn, and for a
+        # "kl overlap" the matched run of KL text, which has no place in hessian.json). The full
+        # reasons stay in the jsonl, whose sha256 is recorded.
+        reasons: dict[str, int] = {}
+        for s in rej:
+            r = s.get("reject_reason")
+            k = r.split(":", 1)[0].strip() if isinstance(r, str) and r.strip() else "unspecified"
+            reasons[k] = reasons.get(k, 0) + 1
+        finish: dict[str, int] = {}
+        for s, _ in items:
+            f = str(s.get("finish_reason"))
+            finish[f] = finish.get(f, 0) + 1
+        entry = {"source": "gen", "name": cat, "path": str(path), "sha256": file_sha,
+                 "samples": len(items), "samples_rejected": len(rej),
+                 "reject_reasons": dict(sorted(reasons.items())), "formats": formats,
+                 "thinking_samples": sum(1 for s, _ in items
+                                         if s["format"] == "chat" and s["enable_thinking"]),
+                 "finish_reasons": dict(sorted(finish.items())),
+                 "sample_ids": [s["id"] for s, _ in items]}
+        if formats["chat"]:
+            entry["chat_template_sha256"] = template_sha
+        entry.update({
+            "packing": ("rendered samples in id order; a raw document is followed by a blank line "
+                        "when anything comes after it, a chat (ending in <|im_end|>\\n) by nothing; "
+                        "tokenized as one text, add_special_tokens=False; non-overlapping windows"),
+            "sha256_of_concatenation": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "concatenation_chars": len(text), "concatenation_tokens": len(ids),
+            "tokens": len(starts) * seq_len, "sequences": len(starts),
+            "windows_available": len(ids) // seq_len, "max_seqs": max_seqs,
+            "window_starts": starts, "dropped_tail_tokens": len(ids) % seq_len,
+            "kl_disjointness": disjoint})
+        sources.append(entry)
+        if not starts:
+            print(f"[hessian] WARNING gen/{cat}: {len(ids)} token(s) from {len(items)} sample(s) "
+                  f"make no full {seq_len}-token window -- this category contributes nothing")
+    return seqs, sources
+
+
 def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
     from common import sha256_file
     from kv_calibrate_full import collect_corpus, repo_relative
@@ -670,6 +1191,7 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
     # 3. This repo's own sources, concatenated (sorted, one header line per file), N windows spread
     #    evenly over the whole concatenation so every part of the tree -- kernels, model, server,
     #    tests, Python tooling -- is represented, not just the alphabetically first directory.
+    code_parts: list[tuple[str, str]] = []  # (path, text) -- names the file behind a gate hit
     if args.code_seqs > 0:
         # --code-rev: that commit's tree, not the working tree -- how --rms-only reproduces the code
         # windows of a set captured at an older checkout (its sha256_of_concatenation must match).
@@ -685,6 +1207,7 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
             if not body.endswith("\n"):
                 body += "\n"
             parts.append(f"==> {rel} <==\n{body}")
+            code_parts.append((rel, body))
         text = "".join(parts)
         # verbose=False: silences the "longer than the model's maximum length" warning -- this is
         # tokenization of a whole source tree, not a model input; only L-token windows are run.
@@ -702,12 +1225,79 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
                         "sha256_of_concatenation": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                         "concatenation_tokens": len(ids), "tokens": n * L, "sequences": n,
                         "window_starts": starts, "file_list": files})
+
+    # The disjointness check over sources 1-3 (the gen samples are gated in build_gen_corpus, before
+    # tokenizing): every window, decoded back to exactly the text the Hessians see, against
+    # kl_corpus/ outside its #include/import lines. RECORDED per source (kl_disjointness.overlaps)
+    # and printed, NOT refused: leaving model.cpp and layer_golden.py out of the code concatenation
+    # keeps the KL excerpts' own sources away, but not the files sharing runs with them -- model.h
+    # and three others repeat a model.cpp comment, container.cpp a block of its code, ten files the
+    # venv usage line of layer_golden.py's docstring, the rest single idiomatic lines (25 of 277
+    # files at the time of writing). Whether a
+    # window meets one depends on --code-seqs and on the commit (--code-seqs 48 on the working tree
+    # hit one window; 17 of 21 counts between 16 and 64 hit >= 1), and hessian-v1's own code/04 (at
+    # 34d381a) holds that model.cpp comment, so refusing would make the corpus a lottery and
+    # `--rms-only` on hessian-v1 impossible. A hit names the repo file(s) holding the shared run.
+    kl = kl_index()
+    t0 = time.perf_counter()
+    hits = gate_windows(seqs, tokenizer, kl)
+    for h in hits:
+        if h["id"].startswith("code/"):
+            files = [rel for rel, body in code_parts if h["substring"] in ws_normalize(body)]
+            h["where"] = "in " + ", ".join(files) if files else "across a file boundary"
+    if hits:
+        say(f"[hessian] WARNING disjointness: {len(hits)} of {len(seqs)} window(s) of sources 1-3 "
+            f"share a {KL_SHINGLE_CHARS}-character whitespace-normalized run with the held-out KL "
+            f"corpus {kl.label} (repo code quoting model.cpp / layer_golden.py; recorded under the "
+            f"source's kl_disjointness.overlaps, not refused):")
+        report_kl_hits(hits)
+    elif seqs:
+        say(f"[hessian] disjointness: {len(seqs)} window(s) of sources 1-3, no "
+            f"{KL_SHINGLE_CHARS}-char overlap with kl_corpus ({time.perf_counter() - t0:.2f}s)")
+    for src in sources:
+        mine = [h for h in hits if (h["id"] == f"calib/{src['name']}" if src["source"] == "calib"
+                                    else h["id"].startswith(src["source"] + "/"))]
+        src["kl_disjointness"] = kl.record("every token window of this source, decoded; overlaps "
+                                           "recorded, not refused", mine)
+
+    # 4. Text our own quantized model generated (--gen-file samples.jsonl): per category, the
+    #    rendered non-rejected samples in id order, gated disjoint from kl_corpus/, cut into
+    #    non-overlapping windows (build_gen_corpus). Appended after sources 1-3, whose tokens a run
+    #    without --gen-file leaves exactly as they were.
+    gen_file = getattr(args, "gen_file", None)
+    if gen_file is not None and str(gen_file).lower() != "none":
+        gen_seqs, gen_sources = build_gen_corpus(Path(gen_file), tokenizer, L,
+                                                 getattr(args, "gen_max_seqs", None), kl)
+        seqs += gen_seqs
+        sources += gen_sources
     if not seqs:
         raise SystemExit("[hessian] empty corpus")
     for s in seqs:
         if len(s.token_ids) < 2:
             raise SystemExit(f"[hessian] sequence {s.name} has {len(s.token_ids)} tokens; need >= 2")
     return seqs, sources
+
+
+def print_corpus_sources(sources: list[dict]) -> None:
+    """The corpus report: one line per source, a second line per gen category (samples used and
+    rejected, the concatenation, the windows taken and the dropped tail), and a subtotal per source
+    kind."""
+    for src in sources:
+        label = src.get("name") or src.get("path") or src["source"]
+        print(f"    {src['source']:<9} {src['sequences']:>3} seq {src['tokens']:>7} tok  {label}")
+        if src["source"] == "gen":
+            f = src["formats"]
+            print(f"              {src['samples']} sample(s) ({f['raw']} raw, {f['chat']} chat, "
+                  f"{src['thinking_samples']} thinking) + {src['samples_rejected']} rejected; "
+                  f"{src['concatenation_tokens']} tok -> {src['sequences']} of "
+                  f"{src['windows_available']} window(s); tail of {src['dropped_tail_tokens']} tok "
+                  f"dropped")
+    kinds: dict[str, list[int]] = {}
+    for src in sources:
+        k = kinds.setdefault(src["source"], [0, 0])
+        k[0] += src["sequences"]
+        k[1] += src["tokens"]
+    print("    by source: " + "; ".join(f"{k} {n} seq {t} tok" for k, (n, t) in kinds.items()))
 
 
 # --------------------------------------------------------------------------------------------
@@ -1494,6 +2084,7 @@ def run_rms_only(args) -> int:
     total_tokens = sum(len(s.token_ids) for s in seqs)
     print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
           f"({time.perf_counter() - t0:.1f}s to tokenize)")
+    print_corpus_sources(sources)
     diffs = corpus_mismatches(doc.get("corpus", {}), sources, len(seqs), total_tokens, args.seq_len)
     if diffs:
         for d in diffs[:24]:
@@ -1502,6 +2093,12 @@ def run_rms_only(args) -> int:
         hint = (f" The code windows are read from this checkout's working tree unless --code-rev "
                 f"names the commit the set was captured at (recorded sha256_of_concatenation "
                 f"{code[0].get('sha256_of_concatenation')})." if code else "")
+        gen = [s for s in doc.get("corpus", {}).get("sources", []) if s.get("source") == "gen"]
+        if gen:
+            cap = gen[0].get("max_seqs")
+            hint += (f" The set includes self-generated text: pass --gen-file {gen[0].get('path')} "
+                     f"(sha256 {gen[0].get('sha256')})"
+                     f"{f' and --gen-max-seqs {cap}' if cap is not None else ''} as recorded.")
         raise SystemExit(f"[hessian] --rms-only: this corpus is not the one {manifest_path} was "
                          f"captured from, so the rms taps would not see the post-norm taps' "
                          f"activations. Pass that capture's corpus options.{hint}")
@@ -1563,6 +2160,7 @@ def run_rms_only(args) -> int:
         manifest_sha256_before=sha_start,
         corpus={"sequences": len(seqs), "tokens": total_tokens, "seq_len": args.seq_len,
                 "code_rev": getattr(args, "code_rev", None),
+                "gen_file": None if args.gen_file is None else str(args.gen_file),
                 "matches": "the manifest's corpus: every source's sha256, token counts, windows"},
         layers_forwarded=n_fwd, keys_filter=args.keys,
         device=str(device), hidden_device=str(hidden_device),
@@ -1597,6 +2195,12 @@ def finish_rms_only(out_dir: Path, doc: dict, sha_start: str, rms_plans: list[Rm
 
 
 def main() -> int:
+    # Generated and KL text (Thai) can reach stdout, and on Windows a pipe or a file (a tee'd or
+    # redirected capture) gets the ANSI code page with 'strict' errors: escape instead of dying.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except AttributeError:
+        pass
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--regate", action="store_true",
@@ -1621,6 +2225,16 @@ def main() -> int:
     ap.add_argument("--wikitext-seqs", type=int, default=64)
     ap.add_argument("--code-seqs", type=int, default=16,
                     help="windows of this repo's own sources (0 to skip)")
+    ap.add_argument("--gen-file", type=Path, default=None, metavar="SAMPLES_JSONL",
+                    help="corpus source 4: the corpus generator's samples.jsonl (text self-generated "
+                         "by the quantized model; docs/quant2.md 'Corpus v2'). Non-rejected samples "
+                         "are rendered (chats through the checkpoint's chat template), refused if "
+                         "any (prompts included) shares a 50-char run with "
+                         "tools/reference/kl_corpus/ outside its include/import lines, and cut "
+                         "per category into non-overlapping --seq-len windows (default: none)")
+    ap.add_argument("--gen-max-seqs", type=int, default=None, metavar="N",
+                    help="with --gen-file: at most N windows per category, spread evenly over its "
+                         "concatenation (default: every full window)")
     ap.add_argument("--seq-len", type=int, default=2048,
                     help="window length, and the truncation of every calib file")
     ap.add_argument("--no-mtp", action="store_true", help="skip the mtp.* head")
@@ -1696,9 +2310,7 @@ def main() -> int:
     total_tokens = sum(len(s.token_ids) for s in seqs)
     print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
           f"({time.perf_counter() - t0:.1f}s to tokenize)")
-    for src in sources:
-        label = src.get("name") or src.get("path") or src["source"]
-        print(f"    {src['source']:<9} {src['sequences']:>3} seq {src['tokens']:>7} tok  {label}")
+    print_corpus_sources(sources)
 
     _, text_config = load_text_config(model_dir)
     n_layers = int(text_config.num_hidden_layers)

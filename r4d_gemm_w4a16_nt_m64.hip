@@ -53,23 +53,36 @@
 // two-mask, four-permute unpack below produces.  The packer in radiance_w4.py builds this and the
 // isolation bench checks it against a dequantized reference, element by element.
 //
-// QUANTIZER.  Asymmetric, per output channel, per group of R4D_GEMM_W4_GROUP contiguous K:
+// QUANTIZER.  Asymmetric, per output channel, per group of G contiguous K:
 // w ~= scale * (q - zero) with q in 0..15 and an INTEGER zero, which is what makes the subtract
 // exact.  Both parameters live in one dword per (row, group): the f16 scale in the low half and the
 // f16 of -(1024 + zero) in the high half, ready to be broadcast into a v_pk_add_f16.
+//
+// THE GROUP IS A TEMPLATE PARAMETER.  G is 32, 64 or 128 through r4d_gemm_w4a16_nt_m64_g, and the
+// build default R4D_GEMM_W4_GROUP through r4d_gemm_w4a16_nt_m64, which is the same template at that
+// G -- so a caller that never asks for a group gets the instruction stream it always got.  The
+// packed weight does not depend on G at all (a 64-K block is 64 K whatever the group), only the
+// Wsz stride does, which is what lets one model mix groups tensor by tensor.  G >= 64 is the
+// original loop: a group is bpg = G/64 whole packed blocks.  G = 32 splits a block instead -- k
+// steps 0,1 belong to one group and 2,3 to the next -- so it has its own loop body, with one
+// weight load per block and two scale loads, restarts and epilogues.  Both need every split to
+// start on a packed block, hence K % (SK * max(G, 64)) == 0.
 #include "r4d.h"
 #include "r4d_gdn_wmma.h"
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #define R4D_GEMM_W4_MAX_M 64
 #ifndef R4D_GEMM_W4_GROUP
-#define R4D_GEMM_W4_GROUP 128        // K per (scale, zero) pair
-#endif
+#define R4D_GEMM_W4_GROUP 128        // build default K per (scale, zero) pair: what the ungrouped
+#endif                               // entry point and _group() serve
 #define R4D_GEMM_W4_KPB   64         // K per packed block: 4 k steps, 16 bytes per lane
 #define WAVE32 32
+static_assert(R4D_GEMM_W4_GROUP == 32 || R4D_GEMM_W4_GROUP % R4D_GEMM_W4_KPB == 0,
+              "R4D_GEMM_W4_GROUP must be 32 or a multiple of the 64-K packed block");
 
 typedef _Float16 v8h  __attribute__((ext_vector_type(8)));
 typedef unsigned uint4v __attribute__((ext_vector_type(4)));
@@ -155,12 +168,14 @@ __device__ __forceinline__ v8f mmah(v8h a, v8h b, v8f c) {
 }
 
 // MT = row tiles per BLOCK, as in the bf16 kernel: more of them amortise the weight fragment and
-// its unpack over more WMMA, fewer put more blocks on the machine.
-template <int MT, int NPW, bool NT>
+// its unpack over more WMMA, fewer put more blocks on the machine.  G = K per (scale, zero) pair.
+template <int G, int MT, int NPW, bool NT>
 __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
     const unsigned short* __restrict__ A, const unsigned* __restrict__ Wq,
     const unsigned* __restrict__ Wsz, __hip_bfloat16* __restrict__ C,
     int M, int K, int N, int WV, int SK) {
+  static_assert(G == 32 || G % R4D_GEMM_W4_KPB == 0,
+                "a group is half a packed block or a whole number of them");
   extern __shared__ float red[];        // WV*NPW*SK*256 floats: a 16x16 tile per (column, split)
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
@@ -168,7 +183,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
   const int n0 = nt0 * 16;
   const int mt0 = blockIdx.y * MT;
   const int Ks = K / SK;
-  const int groups = Ks / R4D_GEMM_W4_GROUP;              // groups this split owns
+  const int groups = Ks / G;                              // groups this split owns
   const int kbase = ksplit * Ks;
 
   v8f acc[NPW][MT];
@@ -191,7 +206,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
     // Weight: one uint4 per lane per four k steps, tiles already permuted, so the whole k loop is
     // global_load_b128 with a constant stride and no address arithmetic per step.
     const int kpb = K / R4D_GEMM_W4_KPB;                  // packed blocks in a full row of tiles
-    const int nsz = K / R4D_GEMM_W4_GROUP;                // (scale, zero) dwords per row of tiles
+    const int nsz = K / G;                                // (scale, zero) dwords per row of tiles
     r4d_gw4 pw[NPW];
     r4d_gu1 ps[NPW];
     const int ntlast = N / 16 - 1;
@@ -205,56 +220,114 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
               (size_t)(t * kpb + kbase / R4D_GEMM_W4_KPB) * WAVE32 + lane;
       // Quantizer parameters: 16 distinct dwords per group, read by the 16 lanes that own the rows.
       ps[j] = (r4d_gu1)(const unsigned*)(Wsz) +
-              (size_t)(t * nsz + kbase / R4D_GEMM_W4_GROUP) * 16 + (lane & 15);
+              (size_t)(t * nsz + kbase / G) * 16 + (lane & 15);
     }
 
-    const int bpg = R4D_GEMM_W4_GROUP / R4D_GEMM_W4_KPB;  // packed blocks per group
+    if constexpr (G >= R4D_GEMM_W4_KPB) {
+      // A group is bpg whole packed blocks.  This is the loop as it was before G was a template
+      // parameter, token for token, so the build-default instantiation compiles to the same code.
+      const int bpg = G / R4D_GEMM_W4_KPB;                // packed blocks per group
 
-    for (int g = 0; g < groups; g++) {
-      float sc[NPW];
-      __half2 nz[NPW];
+      for (int g = 0; g < groups; g++) {
+        float sc[NPW];
+        __half2 nz[NPW];
 #pragma unroll
-      for (int j = 0; j < NPW; j++) {
-        const unsigned sz = ps[j][(size_t)g * 16];
-        sc[j] = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
-        nz[j] = __half2half2(__ushort_as_half((unsigned short)(sz >> 16)));
+        for (int j = 0; j < NPW; j++) {
+          const unsigned sz = ps[j][(size_t)g * 16];
+          sc[j] = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
+          nz[j] = __half2half2(__ushort_as_half((unsigned short)(sz >> 16)));
+        }
+
+        // The first WMMA of a group takes an inline zero for C, so the group accumulator costs no
+        // instruction to clear.
+        v8f g_acc[NPW][MT];
+#pragma unroll
+        for (int b = 0; b < bpg; b++) {
+          uint4v wv[NPW];
+#pragma unroll
+          for (int j = 0; j < NPW; j++) {
+            const size_t o = (size_t)(g * bpg + b) * WAVE32;
+            wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
+          }
+#pragma unroll
+          for (int s = 0; s < 4; s++) {
+            const int u = b * 4 + s;
+            v8h afrag[MT];
+#pragma unroll
+            for (int i = 0; i < MT; i++) afrag[i] = fragA(pa[i], u);   // loaded once, spent NPW times
+#pragma unroll
+            for (int j = 0; j < NPW; j++) {
+              const v8h bfrag = dequant(wv[j][s], nz[j]);
+#pragma unroll
+              for (int i = 0; i < MT; i++)
+                g_acc[j][i] = u == 0 ? mmah(afrag[i], bfrag, (v8f)(0.f))
+                                     : mmah(afrag[i], bfrag, g_acc[j][i]);
+            }
+          }
+        }
+#pragma unroll
+        for (int j = 0; j < NPW; j++)
+#pragma unroll
+          for (int i = 0; i < MT; i++)
+#pragma unroll
+            for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
+#pragma unroll
+        for (int i = 0; i < MT; i++) pa[i] += (G / 16) * 4;
       }
+    } else {
+      // A packed block holds gpb = 64/G groups (two, at G = 32).  The weight is still loaded once
+      // per block, as one b128 per lane; what repeats per group is the scale load, the restart of
+      // the group accumulator on the group's first k step, and the f32 epilogue.  Twice the
+      // epilogues and twice the scale bytes of G = 64, which is the price of the finer group.
+      constexpr int gpb = R4D_GEMM_W4_KPB / G;            // groups per packed block
+      constexpr int spg = G / 16;                         // k steps per group
+      const int blocks = groups / gpb;                    // packed blocks this split owns
 
-      // The first WMMA of a group takes an inline zero for C, so the group accumulator costs no
-      // instruction to clear.
-      v8f g_acc[NPW][MT];
-#pragma unroll
-      for (int b = 0; b < bpg; b++) {
+      for (int b = 0; b < blocks; b++) {
         uint4v wv[NPW];
 #pragma unroll
         for (int j = 0; j < NPW; j++) {
-          const size_t o = (size_t)(g * bpg + b) * WAVE32;
+          const size_t o = (size_t)b * WAVE32;
           wv[j] = NT ? __builtin_nontemporal_load(&pw[j][o]) : pw[j][o];
         }
 #pragma unroll
-        for (int s = 0; s < 4; s++) {
-          const int u = b * 4 + s;
-          v8h afrag[MT];
-#pragma unroll
-          for (int i = 0; i < MT; i++) afrag[i] = fragA(pa[i], u);   // loaded once, spent NPW times
+        for (int h = 0; h < gpb; h++) {
+          const int g = b * gpb + h;
+          float sc[NPW];
+          __half2 nz[NPW];
 #pragma unroll
           for (int j = 0; j < NPW; j++) {
-            const v8h bfrag = dequant(wv[j][s], nz[j]);
+            const unsigned sz = ps[j][(size_t)g * 16];
+            sc[j] = __half2float(__ushort_as_half((unsigned short)(sz & 0xFFFFu)));
+            nz[j] = __half2half2(__ushort_as_half((unsigned short)(sz >> 16)));
+          }
+
+          v8f g_acc[NPW][MT];
+#pragma unroll
+          for (int u = 0; u < spg; u++) {                 // u: k step within the group
+            const int s = h * spg + u;                    // s: k step within the packed block
+            v8h afrag[MT];
+#pragma unroll
+            for (int i = 0; i < MT; i++) afrag[i] = fragA(pa[i], u);
+#pragma unroll
+            for (int j = 0; j < NPW; j++) {
+              const v8h bfrag = dequant(wv[j][s], nz[j]);
+#pragma unroll
+              for (int i = 0; i < MT; i++)
+                g_acc[j][i] = u == 0 ? mmah(afrag[i], bfrag, (v8f)(0.f))
+                                     : mmah(afrag[i], bfrag, g_acc[j][i]);
+            }
+          }
+#pragma unroll
+          for (int j = 0; j < NPW; j++)
 #pragma unroll
             for (int i = 0; i < MT; i++)
-              g_acc[j][i] = u == 0 ? mmah(afrag[i], bfrag, (v8f)(0.f))
-                                   : mmah(afrag[i], bfrag, g_acc[j][i]);
-          }
+#pragma unroll
+              for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
+#pragma unroll
+          for (int i = 0; i < MT; i++) pa[i] += spg * 4;
         }
       }
-#pragma unroll
-      for (int j = 0; j < NPW; j++)
-#pragma unroll
-        for (int i = 0; i < MT; i++)
-#pragma unroll
-          for (int e = 0; e < 8; e++) acc[j][i][e] = fmaf(g_acc[j][i][e], sc[j], acc[j][i][e]);
-#pragma unroll
-      for (int i = 0; i < MT; i++) pa[i] += (R4D_GEMM_W4_GROUP / 16) * 4;
     }
   }
 
@@ -285,13 +358,20 @@ __global__ __launch_bounds__(1024) void r4d_gemm_w4a16_nt_m64_kernel(
   }
 }
 
-void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K, int N,
-                           int WV, int SK, int MB, int NPW, int NT, int64_t stream) {
+// The host side of both entry points, at one group.  Every split has to start on a packed block
+// (the weight pointer is kbase/64 blocks in) and hold whole groups, so the K rule is
+// K % (SK * max(G, 64)) == 0 -- SK * G for the groups that are whole blocks, as it always was.
+template <int G>
+static void r4d_gemm_w4a16_nt_m64_launch(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M,
+                                         int K, int N, int WV, int SK, int MB, int NPW, int NT,
+                                         int64_t stream) {
+  constexpr int kdiv = G > R4D_GEMM_W4_KPB ? G : R4D_GEMM_W4_KPB;
   if (M < 1 || M > R4D_GEMM_W4_MAX_M)
     throw std::runtime_error("r4d gemm_w4a16_nt_m64: M must be 1..64");
   if (N % 16) throw std::runtime_error("r4d gemm_w4a16_nt_m64: N must be a multiple of 16");
-  if (K % (SK * R4D_GEMM_W4_GROUP))
-    throw std::runtime_error("r4d gemm_w4a16_nt_m64: K must be divisible by SK*128");
+  if (K % (SK * kdiv))
+    throw std::runtime_error("r4d gemm_w4a16_nt_m64: K must be divisible by SK*" +
+                             std::to_string(kdiv) + " at group " + std::to_string(G));
   if (WV * SK * WAVE32 > 1024) throw std::runtime_error("r4d gemm_w4a16_nt_m64: threads/block > 1024");
   if (MB < 1 || MB > 4) throw std::runtime_error("r4d gemm_w4a16_nt_m64: MB must be 1..4");
   if (NPW != 1 && NPW != 4) throw std::runtime_error("r4d gemm_w4a16_nt_m64: NPW must be 1 or 4");
@@ -305,7 +385,7 @@ void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M,
   auto Sp = (const unsigned*)wsz;
   auto Cp = (__hip_bfloat16*)c;
   hipStream_t st = (hipStream_t)stream;
-#define LAUNCH(MT, NP, TT) hipLaunchKernelGGL((r4d_gemm_w4a16_nt_m64_kernel<MT, NP, TT>), grid, \
+#define LAUNCH(MT, NP, TT) hipLaunchKernelGGL((r4d_gemm_w4a16_nt_m64_kernel<G, MT, NP, TT>), grid, \
                                               block, smem, st, Ap, Wp, Sp, Cp, M, K, N, WV, SK)
 #define LAUNCH_MB(NP, TT) switch (MB) { \
     case 1: LAUNCH(1, NP, TT); break; \
@@ -320,6 +400,40 @@ void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M,
   }
 #undef LAUNCH_MB
 #undef LAUNCH
+}
+
+// The build default: the group this library was compiled for, and the entry every caller that
+// predates per-tensor groups uses.
+void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K, int N,
+                           int WV, int SK, int MB, int NPW, int NT, int64_t stream) {
+  r4d_gemm_w4a16_nt_m64_launch<R4D_GEMM_W4_GROUP>(a, wq, wsz, c, M, K, N, WV, SK, MB, NPW, NT,
+                                                  stream);
+}
+
+// Any instantiated group, chosen per call -- one model can carry tensors packed at different
+// groups, and the packed weight is the same bytes whichever group its scales were fitted at.
+// Exactly 32, 64 and 128: a build default outside that set (192, 256, ...) is served by
+// r4d_gemm_w4a16_nt_m64 alone, not here.  Asking for the build default here, when it is one of the
+// three, runs the same kernel r4d_gemm_w4a16_nt_m64 does.
+int r4d_gemm_w4a16_nt_m64_has_group(int group) {
+  return group == 32 || group == 64 || group == 128;
+}
+
+void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K,
+                             int N, int WV, int SK, int MB, int NPW, int NT, int64_t stream) {
+#define LAUNCH_G(GG) r4d_gemm_w4a16_nt_m64_launch<GG>(a, wq, wsz, c, M, K, N, WV, SK, MB, NPW, NT, \
+                                                      stream)
+  switch (group) {
+    case 32: LAUNCH_G(32); return;
+    case 64: LAUNCH_G(64); return;
+    case 128: LAUNCH_G(128); return;
+    default: break;
+  }
+#undef LAUNCH_G
+  throw std::runtime_error("r4d gemm_w4a16_nt_m64_g: group " + std::to_string(group) +
+                           " is not instantiated (32, 64, 128; the build default " +
+                           std::to_string(R4D_GEMM_W4_GROUP) +
+                           " is r4d_gemm_w4a16_nt_m64's)");
 }
 
 int r4d_gemm_w4a16_nt_m64_max_m(void) { return R4D_GEMM_W4_MAX_M; }

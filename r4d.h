@@ -272,10 +272,18 @@ int  r4d_gemm_bf16_nt_m64_max_m(void);
 // kernel's whole weight path is one global_load_b128 per lane per four k steps. Wq is N*K/2 bytes;
 // Wsz is one dword per (row, group), the f16 scale in its low half and the f16 of -(1024 + zero)
 // in its high half. N must be a multiple of 16 and K divisible by SK * group().
+// group() is the BUILD DEFAULT (R4D_GEMM_W4_GROUP), which is what r4d_gemm_w4a16_nt_m64 serves.
 void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K, int N,
                            int WV, int SK, int MB, int NPW, int NT, int64_t stream);
 int  r4d_gemm_w4a16_nt_m64_max_m(void);
 int  r4d_gemm_w4a16_nt_m64_group(void);
+// The same kernel at a group chosen per call. has_group() is 1 for 32, 64 and 128, 0 otherwise --
+// a build default outside those three is served by r4d_gemm_w4a16_nt_m64 only. The packed Wq is
+// the same bytes at every group; Wsz has K/group dwords per row. K must be divisible by SK * max(group, 64) -- a split has to start on a 64-K packed
+// block -- and an uninstantiated group throws, like any other rejected shape.
+int  r4d_gemm_w4a16_nt_m64_has_group(int group);
+void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K,
+                             int N, int WV, int SK, int MB, int NPW, int NT, int64_t stream);
 
 // 4-bit weight, 8-bit activation. Signed 4-bit codes, per-row activation scale, int8 WMMA.
 void r4d_gemm_w4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t c, int M, int K, int N,

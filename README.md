@@ -39,7 +39,8 @@ constants and by `kernels()`.
 | `ar_oneshot_2rank_wht6` | the same handshake with a Walsh-Hadamard-rotated 6-bit wire payload (lossy) |
 | `gemm_bf16_nt_m16` | skinny bf16 GEMM, `C[M,N] = A[M,K] @ W[N,K]^T`, M ≤ 16, split-K (superseded by the WMMA kernel below on every shape measured so far) |
 | `gemm_bf16_nt_m64` | the same GEMM for M ≤ 64, one 16x16x16 WMMA per row tile per 16 of K |
-| `gemm_w4a16_nt_m64` | the same GEMM with a **4-bit weight** — asymmetric scale and integer zero per 128 K, pre-permuted offline into WMMA fragment order so the weight path is one `global_load_b128` per lane per four k steps, f16 activations, bf16 out |
+| `gemm_w4a16_nt_m64` | the same GEMM with a **4-bit weight** — asymmetric scale and integer zero per group of K (the build default `GEMM_W4_GROUP`, 128 unless `-DR4D_GEMM_W4_GROUP` says otherwise), pre-permuted offline into WMMA fragment order so the weight path is one `global_load_b128` per lane per four k steps, f16 activations, bf16 out |
+| `gemm_w4a16_nt_m64_g` | the same kernel with the group chosen per call from 32 / 64 / 128 (`gemm_w4a16_nt_m64_has_group`), so one model can mix groups tensor by tensor; the packed weight is the same bytes at every group, only the scale stride changes |
 
 ## Asking the library instead of remembering
 

@@ -41,6 +41,18 @@ target_compile_definitions(convert_quant_ldlq PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME convert_quant_ldlq COMMAND convert_quant_ldlq)
 
+# --rotate (docs/quant2.md sections 3-4, rotation.hpp): splitmix64 generation of rotation.signs /
+# mix5 / had_*_signs, Q and Hb against their closed forms (every entry of the production 5120 Q),
+# orthogonality and round trips, fold exactness on a random miniature layer (in-projection with the
+# norm folded, out-projection, and the q2ab down / o / gdn_out K side), the Hessian change of basis
+# against a direct capture on the folded input plus the tr(W H W^T) invariance, HessianStore's
+# transform hook and cache key on fixtures/hess_small, and the imatrix diagonal model. CPU-only.
+add_executable(convert_rotation test_rotation.cpp)
+target_link_libraries(convert_rotation PRIVATE r4dx_convert)
+target_compile_definitions(convert_rotation PRIVATE
+  R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME convert_rotation COMMAND convert_rotation)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

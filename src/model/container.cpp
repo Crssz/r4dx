@@ -1,6 +1,7 @@
 #include "container.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -214,6 +215,79 @@ QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const std::s
                             "' in any known on-disk form (requested layout, bf16, or bare)");
 }
 
+// quant2 (docs/quant2.md section 3.1): the rotation.* tensors a container with
+// `__metadata__.rotation` must carry. Each is checked on disk against the GLOBAL shape
+// (rotation_meta.h's RotationTensors), its values are checked on the host (every sign exactly +-1,
+// mix5 orthogonal -- the kernels multiply by them, so a corrupt value would silently scale or skew
+// the residual rather than fail), then it is uploaded through `upload` (UploadRawF32 at TP=1,
+// ShardLoader::Raw<float> under tensor parallelism, which cuts the q2ab sign vectors by
+// tp::RuleFor) and the upload is checked against the LOCAL shape (`local` = the rank config).
+template <class UploadF32>
+RotationWeights LoadRotationWeights(const SafetensorsReader& r, const RotationSpec& spec,
+                                    const ModelConfig& global, const ModelConfig& local,
+                                    const std::string& path, UploadF32&& upload) {
+  const std::vector<RotationTensor> want = RotationTensors(spec, global);
+  const std::vector<RotationTensor> want_local = RotationTensors(spec, local);
+  RotationWeights w;
+  w.spec = spec;
+  // RotationTensors' order: signs, mix5, then (q2ab) had_down, had_o, had_gdn_out.
+  core::DeviceBuffer<float>* const dst[] = {&w.signs, &w.mix5, &w.had_down_signs, &w.had_o_signs,
+                                            &w.had_gdn_out_signs};
+  const std::string kind = RotationKindName(spec.kind);
+  for (size_t i = 0; i < want.size(); ++i) {
+    const std::string name = want[i].name;
+    if (!r.Has(name)) {
+      throw std::runtime_error("r4dx::model::Container: " + path + " has __metadata__.rotation kind " +
+                               kind + " but no tensor '" + name + "'");
+    }
+    const int64_t n = ElemCountBySize(r, name, 4);
+    if (n != want[i].elems) {
+      throw std::runtime_error("r4dx::model::Container: rotation tensor '" + name + "' in " + path +
+                               " has " + std::to_string(n) + " fp32 elements, the model needs " +
+                               std::to_string(want[i].elems));
+    }
+    std::vector<float> host(static_cast<size_t>(n));
+    std::memcpy(host.data(), r.Data(name), static_cast<size_t>(n) * sizeof(float));
+    if (name == kRotationMix5) {
+      for (int a = 0; a < 5; ++a) {
+        for (int b = 0; b < 5; ++b) {
+          double dot = 0.0;
+          for (int k = 0; k < 5; ++k) dot += static_cast<double>(host[a * 5 + k]) * host[b * 5 + k];
+          if (!(std::fabs(dot - (a == b ? 1.0 : 0.0)) <= 1e-5)) {
+            throw std::runtime_error("r4dx::model::Container: rotation.mix5 in " + path +
+                                     " is not orthogonal (R R^T deviates from I by more than 1e-5)");
+          }
+        }
+      }
+    } else {
+      for (int64_t j = 0; j < n; ++j) {
+        const float v = host[static_cast<size_t>(j)];
+        if (v != 1.0f && v != -1.0f) {
+          throw std::runtime_error("r4dx::model::Container: rotation tensor '" + name + "' in " +
+                                   path + " has element " + std::to_string(j) + " = " +
+                                   std::to_string(v) + ", not +-1");
+        }
+      }
+    }
+    *dst[i] = upload(name);
+    if (static_cast<int64_t>(dst[i]->size()) != want_local[i].elems) {
+      throw std::logic_error("r4dx::model::Container: this rank's slice of '" + name + "' has " +
+                             std::to_string(dst[i]->size()) + " elements, the rank config needs " +
+                             std::to_string(want_local[i].elems));
+    }
+  }
+  return w;
+}
+
+void LogRotation(const RotationSpec& spec, const std::string& path) {
+  std::fprintf(stderr,
+               "r4dx: %s is a quant2 %s rotated container (seed 0x%llx): online Q / Q^T at the "
+               "layer-stack boundary%s\n",
+               path.c_str(), RotationKindName(spec.kind),
+               static_cast<unsigned long long>(spec.seed),
+               spec.Hadamard() ? ", Hadamard on the mlp.down / attn.o / gdn.out_proj inputs" : "");
+}
+
 }  // namespace
 
 namespace {
@@ -291,6 +365,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   if (model_config.contains("video_token_id")) {
     c.video_token_id_ = model_config.at("video_token_id").get<int64_t>();
   }
+  // quant2 (docs/quant2.md section 3.1): parsed before any upload, so an unknown rotation kind fails
+  // here rather than after the whole container has been read into VRAM. nullopt: unrotated.
+  const std::optional<RotationSpec> rotation =
+      ParseRotationMetadata(metadata, c.global_config_, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
 
@@ -341,8 +419,13 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   for (int64_t i = 0; i < num_layers; ++i) {
     const std::string base = "text.layers." + std::to_string(i) + ".";
     LayerWeights lw;
-    lw.input_layernorm = UploadRawU16(reader, base + "input_layernorm");
-    lw.post_attention_layernorm = UploadRawU16(reader, base + "post_attention_layernorm");
+    // A rotated container stores its (zeroed, folded) norms under `.rotated` names so that a binary
+    // predating quant2 -- which never reads __metadata__.rotation -- fails on a missing tensor
+    // instead of running rotated weights in the unrotated basis (docs/container-format.md).
+    const char* norm_suffix = rotation ? ".rotated" : "";
+    lw.input_layernorm = UploadRawU16(reader, base + "input_layernorm" + norm_suffix);
+    lw.post_attention_layernorm =
+        UploadRawU16(reader, base + "post_attention_layernorm" + norm_suffix);
 
     if (c.config_.IsGdnLayer(i)) {
       GdnWeights g;
@@ -396,6 +479,11 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // caller that asks for the body layout here should get that bf16 head rather than a throw.
   c.lm_head_ = LoadQuantLinearWithFallback(reader, "lm_head", lm_head_layout, c.config_.vocab_size,
                                            hidden, &bf16_fallbacks);
+  if (rotation) {
+    c.rotation_ = LoadRotationWeights(reader, *rotation, c.global_config_, c.config_, path,
+                                      [&](const std::string& name) { return UploadRawF32(reader, name); });
+    LogRotation(*rotation, path);
+  }
 
   // mtp.* (docs/container-format.md, docs/mtp.md): present only when the container was converted
   // with --mtp on -- probe with SafetensorsReader::Has rather than trusting __metadata__, so this
@@ -802,6 +890,9 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
       metadata.at("quant").at("w4a16").contains("group")) {
     w4a16_group = metadata.at("quant").at("w4a16").at("group").get<int>();
   }
+  // quant2: the TP=1 path's parse, before any upload (docs/quant2.md section 3.1).
+  const std::optional<RotationSpec> rotation =
+      ParseRotationMetadata(metadata, c.global_config_, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
   const ModelConfig& gc = c.global_config_;
@@ -866,8 +957,9 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   for (int64_t i = 0; i < num_layers; ++i) {
     const std::string base = "text.layers." + std::to_string(i) + ".";
     LayerWeights lw;
-    lw.input_layernorm = L.Raw<uint16_t>(base + "input_layernorm");
-    lw.post_attention_layernorm = L.Raw<uint16_t>(base + "post_attention_layernorm");
+    const char* norm_suffix = rotation ? ".rotated" : "";  // see Container::Load
+    lw.input_layernorm = L.Raw<uint16_t>(base + "input_layernorm" + norm_suffix);
+    lw.post_attention_layernorm = L.Raw<uint16_t>(base + "post_attention_layernorm" + norm_suffix);
     if (gc.IsGdnLayer(i)) {
       GdnWeights gw;
       gw.in_proj_qkv = L.Linear(base + "gdn.in_proj_qkv", o.layout, 2 * key_dim + value_dim,
@@ -902,6 +994,15 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   c.final_norm_ = L.Raw<uint16_t>("text.final_norm");
   // Vocab-split (docs/tp.md 7.1): this rank's [vocab/world, hidden] rows.
   c.lm_head_ = L.Linear("lm_head", o.lm_head_layout, gc.vocab_size, hidden, &bf16_fallbacks);
+  // quant2 (docs/quant2.md section 3.1): every rank runs the same residual ops on its own full
+  // replicated rows, so signs/mix5 replicate; the q2ab sign vectors are cut by tp::RuleFor with the
+  // K range of their linear's columns (mlp.down 8704 = 17 x 512 per rank, attn.o 12 heads x 256,
+  // gdn.out_proj 24 heads x 128), which LoadRotationWeights checks against the rank config.
+  if (rotation) {
+    c.rotation_ = LoadRotationWeights(reader, *rotation, gc, c.config_, path,
+                                      [&](const std::string& name) { return L.Raw<float>(name); });
+    if (o.tp_rank == 0) LogRotation(*rotation, path);
+  }
 
   // mtp.* (docs/tp.md 4.2): the attention sublayer and MLP shard exactly like a body layer; fc, the
   // norms and the optional reduced-vocab draft head replicate. Same tensor set and layout choices

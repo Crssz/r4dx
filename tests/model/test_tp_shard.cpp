@@ -484,6 +484,13 @@ void TestRuleForReal() {
       {"dflash.fc", R, {}, 0},
       {"dflash.layers.0.self_attn.q_proj", R, {}, 0},
       {"dflash.selector.predecessor", R, {}, 0},
+      // quant2 rotation tensors (docs/quant2.md 3.1): Q replicates; each q2ab Hadamard sign vector
+      // splits over its linear's K (test_rotation_meta.cpp checks rank range == that RankCols).
+      {"rotation.signs", R, {}, 0},
+      {"rotation.mix5", R, {}, 0},
+      {"rotation.had_down_signs", ROWS, {{0, 17408}}, 0},
+      {"rotation.had_o_signs", ROWS, {{0, 6144}}, 0},
+      {"rotation.had_gdn_out_signs", ROWS, {{0, 6144}}, 0},
   };
   int ok = 0;
   for (const RuleCase& c : cases) {
@@ -520,6 +527,8 @@ void TestRuleForReal() {
       "dflash.layers.0.self_attn.q_proj.bf16.w",
       "vision.blocks.0.attn.qkv.mxfp4.ws",
       "text.norm",
+      "rotation.had_up_signs",  // only the five named rotation.* tensors are known
+      "rotation.signs.bf16.w",
       "embed_tokens",
       "lm_head2",
       "",

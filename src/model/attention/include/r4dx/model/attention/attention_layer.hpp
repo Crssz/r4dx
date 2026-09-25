@@ -296,13 +296,25 @@ class AttentionLayer {
 
     // ---- output gate: attn_out * sigmoid(gate) --------------------------------------------------
     uint16_t* gated = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
-    ProfiledCall(prof, stream, "attn.gate_mul", [&] {
-      r4dx_model_attn_gate_mul_bf16(reinterpret_cast<int64_t>(attn_out),
-                                     reinterpret_cast<int64_t>(gate),
-                                     reinterpret_cast<int64_t>(gated),
-                                     static_cast<int64_t>(T) * H * D,
-                                     reinterpret_cast<int64_t>(stream));
-    });
+    if (w.o_had_signs != nullptr) {
+      // quant2 Q2b (docs/quant2.md section 4): gated = (attn_out * sigmoid(gate)) Hb, one launch,
+      // block = D (one head); o_proj's K order is head * D + d, the row layout of [T, H, D].
+      ProfiledCall(prof, stream, "attn.gate_mul_hadamard", [&] {
+        r4dx_model_attn_gate_mul_hadamard_bf16(
+            reinterpret_cast<int64_t>(attn_out), reinterpret_cast<int64_t>(gate),
+            reinterpret_cast<int64_t>(gated), static_cast<int64_t>(T) * H * D,
+            reinterpret_cast<int64_t>(stream), reinterpret_cast<int64_t>(w.o_had_signs), D,
+            static_cast<int64_t>(H) * D);
+      });
+    } else {
+      ProfiledCall(prof, stream, "attn.gate_mul", [&] {
+        r4dx_model_attn_gate_mul_bf16(reinterpret_cast<int64_t>(attn_out),
+                                       reinterpret_cast<int64_t>(gate),
+                                       reinterpret_cast<int64_t>(gated),
+                                       static_cast<int64_t>(T) * H * D,
+                                       reinterpret_cast<int64_t>(stream));
+      });
+    }
 
     // ---- o_proj ----------------------------------------------------------------------------------
     uint16_t* o_out = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);

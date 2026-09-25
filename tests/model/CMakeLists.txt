@@ -167,6 +167,13 @@ add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)
 
+# test_rotation_meta: quant2's `__metadata__.rotation` parse (src/model/rotation_meta.h, header-only
+# and HIP-free) and the TP slicing of the rotation.* tensors (docs/quant2.md section 3.1). CPU-only
+# like the TP tests above; r4dx_tp_shard supplies src/model + third_party on the include path.
+add_executable(test_rotation_meta test_rotation_meta.cpp)
+target_link_libraries(test_rotation_meta PRIVATE r4dx_tp_shard)
+add_test(NAME test_rotation_meta COMMAND test_rotation_meta)
+
 # tp_vocab.h includes the HIP-free r4dx/kernels/summary_sampler.hpp; an include dir is the whole
 # coupling (linking r4dx_kernels would drag in its hipcc object for nothing).
 add_executable(test_tp_vocab_merge test_tp_vocab_merge.cpp)

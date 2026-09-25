@@ -1,6 +1,7 @@
 # src/kernels: r4dx-owned HIP kernels (rmsnorm, residual add, rope, silu_mul, fp8 activation
 # quant, kv cache paging writes -- docs/architecture.md "Own kernels"; the tensor-parallel
-# all-reduce -- docs/tp.md 6.3.1, the second hipcc object below), plus the host-only
+# all-reduce -- docs/tp.md 6.3.1, the second hipcc object below; the quant2 residual rotation --
+# docs/quant2.md sections 3-4, the third), plus the host-only
 # embedding-gather and CPU-sampler headers (no device code, so no hipcc step for those).
 #
 # The kernels themselves are real __global__ device code, so -- like third_party/libr4d's
@@ -51,6 +52,7 @@ add_custom_command(
           "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_KERNELS_SRC}" -o "${R4DX_KERNELS_OBJ}"
   DEPENDS "${R4DX_KERNELS_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d.h"
@@ -58,6 +60,27 @@ add_custom_command(
   VERBATIM
 )
 set_source_files_properties("${R4DX_KERNELS_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
+# ---- quant2 residual rotation (docs/quant2.md section 3-4) ---------------------------------------
+# rotate_residual.hip: Q / Q^T on the residual stream and the in-place blockwise Hadamard
+# (include/r4dx/kernels/rotate_residual.h). Same flags as r4dx_kernels.hip; shares
+# hadamard_device.h's butterfly with it (r4dx_silu_mul_hadamard_bf16) and with
+# src/model/attention's attn_kernels.hip.
+set(R4DX_ROTATE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/rotate_residual.hip")
+set(R4DX_ROTATE_OBJ "${R4DX_KERNELS_OBJ_DIR}/rotate_residual.obj")
+add_custom_command(
+  OUTPUT "${R4DX_ROTATE_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_ROTATE_SRC}" -o "${R4DX_ROTATE_OBJ}"
+  DEPENDS "${R4DX_ROTATE_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/rotate_residual.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) rotate_residual.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_ROTATE_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
 # ---- second hipcc object: the tensor-parallel all-reduce (docs/tp.md 6.3.1) ----------------------
 # r4dx_tp_kernels.hip is a port of tools/tp_bench's flag(drain 3, acq 0) kernel. It is built with
@@ -111,7 +134,7 @@ add_custom_command(
 )
 add_custom_target(r4dx_tp_kernels_isa ALL DEPENDS "${R4DX_TP_KERNELS_ISA_STAMP}")
 
-add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}")
+add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}" "${R4DX_ROTATE_OBJ}")
 set_target_properties(r4dx_kernels PROPERTIES LINKER_LANGUAGE CXX)
 add_dependencies(r4dx_kernels r4dx_tp_kernels_isa)
 target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

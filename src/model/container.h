@@ -22,6 +22,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "rotation_meta.h"   // quant2 __metadata__.rotation (docs/quant2.md section 3.1)
 #include "vision_weights.h"  // src/vision: the vision.* tower weights (docs/vision.md)
 
 namespace r4dx::model {
@@ -113,6 +114,26 @@ struct MtpWeights {
   QuantLinear draft_lm_head;                    // [draft_vocab_size, hidden], N==0 if absent
   core::DeviceBuffer<int32_t> draft_vocab_ids;  // [draft_vocab_size]: subset index -> real vocab id
   bool HasDraftHead() const { return draft_lm_head.N > 0; }
+};
+
+// quant2 residual rotation (docs/quant2.md sections 3, 3.1, 4; docs/container-format.md "Residual
+// rotation"): the container's rotation.* tensors, uploaded as stored (fp32, never regenerated from
+// the seed). Present iff `__metadata__.rotation` is (rotation_meta.h's ParseRotationMetadata); the
+// text layers' weights were then folded by the converter and are only correct together with Model's
+// online ops -- Q at the stack entry, Q^T at the stack exit and on DFlash2 feature captures, and for
+// q2ab the three input Hadamards below. Everything else (embed, final_norm, lm_head, mtp.*, vision.*)
+// is untouched by the fold.
+struct RotationWeights {
+  RotationSpec spec;
+  core::DeviceBuffer<float> signs;  // fp32 [hidden] (+-1): Q's diagonal D. Replicated under TP
+  core::DeviceBuffer<float> mix5;   // fp32 [25], R[c][b] at c*5 + b. Replicated under TP
+  // q2ab only; empty (data() == nullptr) for q2a. Under tensor parallelism each is this RANK's
+  // slice, cut with exactly the K range the slicer gives the matching linear's columns (tp::RuleFor's
+  // rotation.* rules), so a kernel indexes it with the rank-local column: [Config().intermediate_size]
+  // for mlp.down, [num_attention_heads * head_dim] for attn.o, [ValueDim()] for gdn.out_proj.
+  core::DeviceBuffer<float> had_down_signs;
+  core::DeviceBuffer<float> had_o_signs;
+  core::DeviceBuffer<float> had_gdn_out_signs;
 };
 
 // Every Container::Load knob in one struct (docs/tp.md 3.3). The positional Load below forwards to
@@ -213,6 +234,13 @@ class Container {
   bool HasMtp() const { return mtp_.has_value(); }
   const MtpWeights& Mtp() const { return mtp_.value(); }
 
+  // True iff the container carries `__metadata__.rotation` (quant2, docs/quant2.md section 3.1) --
+  // decided by the metadata key alone, never by probing for rotation.* tensors: a container without
+  // the key gets no rotation op anywhere, and one with a kind this binary does not implement already
+  // failed Load(). Rotation() is valid iff this is.
+  bool HasRotation() const { return rotation_.has_value(); }
+  const RotationWeights& Rotation() const { return rotation_.value(); }
+
   // The vision tower's weights (docs/vision.md), present only when Load() was called with
   // load_vision=true AND the container actually carries vision.* tensors. HasVisionTensors() is
   // the second of those two questions on its own -- a caller that wants to say "this container
@@ -259,6 +287,7 @@ class Container {
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;
+  std::optional<RotationWeights> rotation_;  // iff __metadata__.rotation
   std::optional<vision::VisionWeights> vision_;
   std::optional<vision::VisionConfig> vision_config_;  // parsed-only (TP rank without the tower)
   bool container_has_vision_tensors_ = false;

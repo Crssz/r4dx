@@ -4,6 +4,7 @@
 #include "profile_span.h"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "rotation_meta.h"  // kHadDownBlock (quant2 Q2b)
 
 namespace r4dx::model {
 
@@ -99,12 +100,26 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
       down_pre_scale = arena.Alloc<float>(static_cast<size_t>(T));
     }
   }
-  ProfiledCall(prof, s_raw, "mlp.silu_mul", [&] {
-    r4dx_silu_mul_bf16(reinterpret_cast<int64_t>(gate_up), reinterpret_cast<int64_t>(h), T,
-                        intermediate, /*in_row_stride=*/2 * intermediate, s, down_epilogue,
-                        reinterpret_cast<int64_t>(down_pre_data),
-                        reinterpret_cast<int64_t>(down_pre_scale));
-  });
+  if (down_had_signs_ != nullptr) {
+    // quant2 Q2b (docs/quant2.md section 4): h = (silu(gate) * up) Hb in one launch -- the product
+    // stays fp32 into the transform, and the epilogue (if any) quantizes the ROTATED row, which is
+    // what the W Hb-folded mlp.down expects.
+    ProfiledCall(prof, s_raw, "mlp.silu_mul_hadamard", [&] {
+      r4dx_silu_mul_hadamard_bf16(reinterpret_cast<int64_t>(gate_up), reinterpret_cast<int64_t>(h),
+                                   T, intermediate, /*in_row_stride=*/2 * intermediate, s,
+                                   down_epilogue, reinterpret_cast<int64_t>(down_pre_data),
+                                   reinterpret_cast<int64_t>(down_pre_scale),
+                                   reinterpret_cast<int64_t>(down_had_signs_),
+                                   static_cast<int>(kHadDownBlock));
+    });
+  } else {
+    ProfiledCall(prof, s_raw, "mlp.silu_mul", [&] {
+      r4dx_silu_mul_bf16(reinterpret_cast<int64_t>(gate_up), reinterpret_cast<int64_t>(h), T,
+                          intermediate, /*in_row_stride=*/2 * intermediate, s, down_epilogue,
+                          reinterpret_cast<int64_t>(down_pre_data),
+                          reinterpret_cast<int64_t>(down_pre_scale));
+    });
+  }
 
   uint16_t* down_out = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
   ProfiledCall(prof, s_raw, "gemm:mlp.down", [&] {

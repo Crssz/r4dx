@@ -92,6 +92,27 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
                          int epilogue = r4dx_epilogue_none, int64_t epilogue_out = 0,
                          int64_t epilogue_scale = 0);
 
+// ---- silu_mul + blockwise Hadamard (quant2 Q2b, docs/quant2.md section 4) --------------------
+// out[r, :] = (silu(gate[r, :]) * up[r, :]) Hb, where h Hb := (h * s) then FWHT / sqrt(block) on
+// each contiguous block of `block` (natural/Sylvester order; see rotate_residual.h). The silu*up
+// product stays fp32 into the transform -- it is NOT rounded to bf16 first -- so each output element
+// is rounded to bf16 exactly once. Same gate_up layout, out layout and epilogue contract as
+// r4dx_silu_mul_bf16 above; the epilogue is applied to the ROTATED bf16 row (the value mlp.down's
+// quantized GEMM consumes). signs: fp32 [intermediate] (+-1, rotation.had_down_signs), indexed by
+// the row-local column, so a TP rank passes its own K-slice with its own `intermediate` (8704 =
+// 17 x 512 per rank at TP=2).
+// Preconditions (throw): block a power of two in [2, 1024], intermediate % block == 0, plus the
+// epilogue's own (int8_fraga8: intermediate % 16 == 0).
+// Launch shape: epilogue none / f16 (elementwise) -> one workgroup per (row, block), so decode's
+// single row still spreads over intermediate/block workgroups; fp8 / int8 (a row-wide absmax
+// scale) -> one workgroup per row, blocks processed in 4096-float LDS chunks, then the epilogue.
+// The bf16 `out` is bit-identical between the two shapes.
+// No defaults on the epilogue arguments: `signs`/`block` follow them.
+void r4dx_silu_mul_hadamard_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
+                                  int64_t in_row_stride, int64_t stream, int epilogue,
+                                  int64_t epilogue_out, int64_t epilogue_scale, int64_t signs,
+                                  int block);
+
 // ---- rope: partial rotary, text-only mrope ---------------------------------------------------
 // Rotates the first `rotary_dim` (64 = head_dim * partial_rotary_factor 0.25) dims of each head
 // in place, NeoX/half-split pairing (rotate_half: element i pairs with i + rotary_dim/2), matching
@@ -531,5 +552,9 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
 // after the R3/P2 fusion pass -- see docs/mtp.md and docs/status.md for the measured before/after.
 void r4dx_kernel_launch_counter_reset();
 int64_t r4dx_kernel_launch_counter_get();
+// For r4dx_kernels' OTHER hipcc translation units (rotate_residual.hip, whose entry points are
+// declared in rotate_residual.h) to count their own launches into the same counter. Not for
+// callers outside src/kernels.
+void r4dx_kernel_launch_counter_add(int64_t n);
 
 }  // extern "C"

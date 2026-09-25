@@ -34,6 +34,9 @@ set(R4DX_MODEL_ATTN_FLAGS
   -D_DLL -D_MT -Xclang --dependent-lib=msvcrt
   -I "${CMAKE_CURRENT_SOURCE_DIR}/include"
   -I "${CMAKE_CURRENT_SOURCE_DIR}/../../core/include"
+  # src/kernels' hadamard_device.h (device-only FwhtLds, shared with r4dx_kernels' quant2 kernels)
+  # for r4dx_model_attn_gate_mul_hadamard_bf16.
+  -I "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels/include"
 )
 if(EXISTS "${R4DX_MODEL_ATTN_DEVICE_LIB_PATH}")
   list(APPEND R4DX_MODEL_ATTN_FLAGS --rocm-device-lib-path=${R4DX_MODEL_ATTN_DEVICE_LIB_PATH})
@@ -53,6 +56,7 @@ add_custom_command(
   DEPENDS "${R4DX_MODEL_ATTN_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/model/attention/attn_kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../core/include/r4dx/core/dtype.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels/include/r4dx/kernels/hadamard_device.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) r4dx_model_attention attn_kernels.obj"
   VERBATIM
 )

@@ -205,6 +205,133 @@ folded fp32. The Hessian capture for a rotated container MUST record activations
 basis (`hessian_capture.py --rotation-seed`): `H' = Q^T H Q` for residual-side taps, computed from
 `H` exactly rather than re-captured.
 
+### 3.1 Q2a implementation note (runtime)
+
+The metadata kinds the converter writes are `q2a` and `q2ab` (docs/container-format.md "Residual
+rotation"); `hadamard1024x5` above was a draft name, and the loader refuses it like any other
+unknown kind. This note covers the runtime half. Q2b's three input Hadamards are listed here too,
+because they share the loader and the call sites.
+
+**Off by default.** Everything hangs on `Container::HasRotation()`, which is true only when
+`__metadata__.rotation` is present. Without the key, `Model::RotateResidual` returns before launching
+anything and `Model::HadSigns()` returns three null pointers. Every layer call then takes its
+pre-quant2 branch: the same kernels in the same order, the same r4dx launch count, and the same
+profile span names. The runtime has no flag for this: the container decides.
+
+**Loader** (`src/model/rotation_meta.h`, `src/model/container.{h,cpp}`, `src/model/tp/tp_shard.cpp`):
+
+- `rotation_meta.h: ParseRotationMetadata` is HIP-free and header-only. Both `Container::Load`
+  (TP=1) and `Container::LoadShard` (TP) call it right after the config is parsed, before any upload.
+  It returns nullopt when the key is absent. It throws, naming the path, in these cases:
+  - an unknown `kind`;
+  - a missing, mistyped or negative `seed`;
+  - `hidden`/`block` other than 5120/1024, or a model `hidden_size` other than 5120;
+  - a q2a block that carries `had`;
+  - q2ab `had` blocks other than 512/256/128;
+  - a q2ab model with `head_dim != 256`, `linear_value_head_dim != 128`, or an
+    `intermediate_size` that is not a multiple of 512. The o and gdn_out Hadamards run one head per
+    block.
+
+  `RotationTensors(spec, cfg)` lists the tensors and fp32 lengths a config needs.
+- `container.cpp: LoadRotationWeights` runs after `lm_head` on both paths. For each tensor it:
+  - checks presence and the global length on disk;
+  - checks on the host that every sign is exactly ±1 and that `mix5` is orthogonal to 1e-5;
+  - uploads it (`UploadRawF32` at TP=1, `ShardLoader::Raw<float>` under TP);
+  - checks the uploaded length against the rank config.
+
+  The result is `RotationWeights` (`container.h`), exposed as `Container::Rotation()`. One stderr
+  line announces a rotated container.
+- `tp_shard.cpp: RuleFor`:
+  - `rotation.signs` and `rotation.mix5` replicate.
+  - `rotation.had_down_signs` is `Rows({intermediate_size})`, `rotation.had_o_signs` is
+    `Rows({heads*head_dim})`, and `rotation.had_gdn_out_signs` is `Rows({ValueDim()})`. Each is one
+    segment, so rank r gets `[r*K/2, K/2)`: exactly its linear's `RankCols`, a whole number of
+    blocks (mlp.down 17 x 512, attn.o 12 heads, gdn.out_proj 24 heads).
+
+  Any other `rotation.*` name still throws.
+  `tests/model/test_rotation_meta.cpp` (CPU) checks that equality for both ranks.
+
+**The online ops.** All of them are enqueued on `stream_` and none is a new kind of barrier. Each
+site is listed as file: function.
+
+| # | site | op | rows | why here |
+|---|---|---|---|---|
+| E1 | `model.cpp: Model::RunChunk`, after the embed gather (device or host) and `SpliceImageEmbeddings`, before the positions upload and layer 0 | `x Q` | `buf_a_[0, T)` | the one entry for Prefill, PrefillMultimodal (and its text-only fallback), DecodeStep, DecodeStepGreedy, DecodeStepSampled (and its fallbacks), TpWarmup and every TP rank. Image rows are spliced first, so they are rotated along with the text rows |
+| E2 | `model.cpp: Model::VerifyWindow`, after the embed gather | `x Q` | `buf_a_[0, T)` | every speculative verify: VerifyAndResolveRound from the MTP and DFlash2 decode paths, the TpWarmup speculative round, and direct callers. It has no splice, because candidates always follow the prompt |
+| E3 | `model.cpp: Model::DecodeStepProfiled`, after the `embed` span | `x Q` | row 0 | span `rotate.entry` |
+| E4 | `model.cpp: Model::PrefillProfiled`, per chunk, after the `embed` span | `x Q` | `[0, T)` | span `rotate.entry`. Needed for correctness: the KV/GDN state written here is read by later decode steps |
+| X1 | `model.cpp: Model::RunChunk`, right after the layer loop | `x Q^T` | `cur[0, T)` | before every reader of the pre-final-norm residual: MTP within-chunk `PrimeKv` (rows 0..T-2), the `mtp_seed_hidden_` copy (row T-1, read later by the boundary `PrimeKv`, `MtpHead::Draft` and `DebugSeedHiddenBf16`), and `FinalLmHead` |
+| X2 | `model.cpp: Model::VerifyWindow`, right after the layer loop | `x Q^T` | `cur[0, T)` | before `FinalLmHead` (all T rows) and `mtp_last_hidden_ = cur`, which DecodeStepMtpImpl copies into `mtp_seed_hidden_` |
+| X3 | `model.cpp: Model::DecodeStepProfiled`, after the loop | `x Q^T` | row 0 | span `rotate.exit`, before the `final_norm+lm_head` span |
+| X4 | `model.cpp: Model::PrefillProfiled`, per chunk, after the loop | `x Q^T` | `[0, T)` | span `rotate.exit`. Nothing reads the result; it keeps the profile at RunChunk's real cost |
+| D1 | `model.cpp: Model::RunChunk`, after X1, gated on `dflash_capture_active` | `x Q^T` | `dflash_features_dev_[0, T*cols)` | the captures are layer INPUTS, so they are rotated. They must be derotated before the observer, `dflash_->InjectFeatures` and `DflashFeatureBuffer()` read them (all after the synchronize). The gate is the capture's own: a chunk that did not capture must not rotate an earlier chunk's rows a second time |
+| D2 | `model.cpp: Model::VerifyWindow`, after X2, gated on `!dflash_target_layers_.empty()` | `x Q^T` | `dflash_features_dev_[0, T*cols)` | the same, with that capture's own gate, which is not `dflash_injection_enabled_`. Read by DecodeStepDflashImpl's `InjectFeatures` and by tests |
+| H1 | `mlp.cpp: Mlp::Forward` (`down_had_signs`, a ctor argument) | `(silu*up) Hb`, B 512 | `[T, intermediate]` | the backbone's only `silu_mul`, fused as `r4dx_silu_mul_hadamard_bf16`, with the w4a8/mxfp4 epilogue applied to the rotated row |
+| H2 | `attention_layer.hpp: AttentionLayer::Forward` (`AttnWeights::o_had_signs`) | `(o*sigmoid(g)) Hb`, B = head_dim | `[T, H*D]` | fused as `r4dx_model_attn_gate_mul_hadamard_bf16`, on the prefill and decode/verify paths alike |
+| H3 | `gdn_layer.cpp: GdnLayer::Forward` (`GdnLayerParams::out_had_signs`), after the prefill/decode branches rejoin at `out_core` | `h Hb` in place, B = V | `[T, H*V]` | `r4dx_hadamard_inplace_bf16`. Decode's gated norm lives inside libr4d's recurrent kernel, so it cannot be fused |
+
+The Hb pointers come from `Model::HadSigns()` and are set in exactly the four backbone loops (RunChunk,
+VerifyWindow, DecodeStepProfiled, PrefillProfiled). All of them are per-call data with a null
+default, never a Container-wide flag. `MtpHead` reuses `Mlp` and `AttentionLayer` on never-folded
+weights, and it never receives the pointers.
+
+**Why the list is complete.**
+
+1. *Every pass through the folded weights is one of four loops.* The only constructions of
+   `GdnLayer`, `AttentionLayer` and `Mlp` over `container_.Layer(i)` are in RunChunk, VerifyWindow,
+   DecodeStepProfiled and PrefillProfiled. The only other constructions are in `mtp_head.cpp`
+   (Draft, PrimeKv), and they use the `mtp.*` weights, which are never folded. Every public Model
+   entry point that runs the backbone reaches one of those four loops. `LocalTextModel` and
+   `TpModel` only forward to `Model`, per rank, and the residual is replicated under TP. So there is
+   no TP-specific site: each rank rotates its own full rows with replicated `signs`/`mix5`, and
+   applies Hb with its own sign slice.
+2. *Each loop has one way in.* Each loop fills `buf_a_` from the embedding gather, and RunChunk then
+   splices image rows. The entry op follows both. Layer 0 is called with `normed_in == nullptr`, so
+   its own input rmsnorm runs on the rotated rows, and no fused kernel crosses the entry.
+3. *Each loop has one way out.* The residual leaves only as `cur` after the loop. The last layer's
+   `Mlp` does a plain `residual_add` (`next_norm_weight == nullptr`), so no fused residual+rmsnorm
+   straddles the exit. Every reader of the residual is downstream of the exit in the same call, or
+   in a later call: `FinalLmHead`, MTP priming, `mtp_seed_hidden_`, `mtp_last_hidden_`,
+   `DebugSeedHiddenBf16`.
+4. *Inside the stack, nothing reads x in the wrong basis.* The residual adds and the fused
+   residual+rmsnorm epilogues are basis-agnostic, because the stored norm weight is 0: `rms(x)*1`
+   commutes with Q. Every reader of the normed residual is a folded in-projection. The one other
+   in-loop reader is the DFlash2 capture, which D1/D2 undo.
+5. *Q2b.* Each fused op has one backbone launch site: `silu_mul` is launched only by
+   `Mlp::Forward`, the gate multiply only by `AttentionLayer::Forward`, and the gated-norm output
+   comes only from GdnLayer's two branches, which rejoin at one point.
+6. *Untouched on purpose.* These keep their un-rotated behaviour, and nothing may pre-rotate them:
+   - `text.embed_tokens`, both the host copy and the VRAM mirror, which the MTP head and the DFlash2
+     drafter (`MakeTargetEmbeddingProvider`) also read;
+   - the vision tower's output, which is spliced before the entry op;
+   - `final_norm` and `lm_head`, which the drafter shares;
+   - the MTP head;
+   - the drafter's own `silu_mul` and attention.
+
+**Costs and consequences.**
+
+- *Launch count.* r4dx-owned launches per decode token rise by 2 for q2a (entry and exit). q2ab adds
+  48 more on the 64-layer model: one `gdn.out_hadamard` per GDN layer. `silu_mul_hadamard` replaces
+  `silu_mul` one for one, and the attention variant is uncounted, like `gate_mul`. So
+  docs/perf.md's 259 becomes 261 for q2a and 309 for q2ab. RunChunk also launches one more when a
+  DFlash2 capture is active.
+- *Determinism.* Every rotate kernel is row-independent, so a row's result does not depend on T or
+  on the grid. The TP=1 identity baseline and the verify-row exactness from f7d4927 hold for each
+  kind of container separately. They do not hold across rotated and unrotated containers, because
+  the weights differ.
+- *Unrotated-container tests.* `test_dflash_feature_capture` compares capture column 0 bit for bit
+  with the embedding rows and checks the launch count, and the layer-golden tests assume unrotated
+  weights. They keep passing because they run on the unrotated 4-layer container. On a rotated
+  container, column 0 is `bf16(bf16(x Q) Q^T)`, which is not bit-equal to `x`.
+- *Binaries older than this branch* never read `__metadata__.rotation`. They load a rotated container
+  without complaint and produce garbage. Only binaries from this branch refuse unknown kinds or apply
+  the ops.
+
+**Tests.** `test_rotation_meta` (CPU, always runs) covers the parse, all 21 refusal cases, the
+model-shape refusals, and the TP slices. `test_tp_shard` gains the five `RuleFor` cases. The GPU
+side is `tests/kernels/test_rotate_residual`, `test_attn_gate_mul_hadamard`, and gates G5/G6 on a
+real rotated container. All of it is handed to the user to run.
+
 ## 4. Q2b -- online Hadamard on the down / o / out_proj inputs
 
 `W' = W Hb` on the K side with `Hb` blockwise normalized Hadamard (random signs from the same seed),

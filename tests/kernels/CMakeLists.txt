@@ -34,6 +34,12 @@ set(R4DX_KERNEL_TESTS
   # CPU-reference only, always on. Its last case checks a rejected section vector, hence the
   # /EHc- entry below (see that comment for why extern "C" throws are otherwise uncatchable).
   test_rope_mrope3
+  # quant2 Q2a/Q2b rotation kernels (docs/quant2.md sections 3-4): r4dx_rotate_residual_bf16,
+  # r4dx_hadamard_inplace_bf16, r4dx_silu_mul_hadamard_bf16 and src/model/attention's
+  # r4dx_model_attn_gate_mul_hadamard_bf16, each against rotation_ref.hpp's fp64 reference.
+  # CPU-reference only, always on; both check precondition throws, hence the /EHc- entry below.
+  test_rotate_residual
+  test_attn_gate_mul_hadamard
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -82,7 +88,18 @@ set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_con
 # docs/dflash2.md's "Kernels" subsection, which records this as an open project-wide question
 # rather than something a kernel stage should decide unilaterally.
 set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_lse.cpp
-                            test_rope_mrope3.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+                            test_rope_mrope3.cpp test_rotate_residual.cpp
+                            test_attn_gate_mul_hadamard.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
+# test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
+# r4dx_kernels.
+target_link_libraries(test_attn_gate_mul_hadamard PRIVATE r4dx_model_attention)
+
+# test_rotation_ref_cpu: pure CPU (no HIP call, no kernel library) -- pins rotation_ref.hpp, the
+# fp64 reference the two tests above compare against, to the rotation contract's definitions
+# (dense Sylvester FWHT, the closed-form rows of Q, norms/inverses, TP K-slicing).
+add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
+add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
 
 # tool_sampler_bench: Milestone 6 S1 item 4 -- r4dx_topk_lse_f32's kernel time (hip events) and the
 # host cost of SampleFromSummary vs the full-vocab SampleCanonical/SampleLegacy per token. Prints

@@ -76,6 +76,9 @@ text.final_norm                                 bf16  [hidden]
 lm_head.{layout}                                [vocab, hidden]           (all four layouts, incl. bf16)
 mtp.*                                            same tensor set as one text layer, prefixed mtp.
 vision.*                                         bf16 passthrough, HF parameter names preserved
+rotation.signs                                  fp32  [hidden]             (rotated containers only, see "Residual rotation")
+rotation.mix5                                   fp32  [5, 5]               (rotated containers only)
+rotation.had_{down,o,gdn_out}_signs             fp32  [K of that linear]   (q2ab containers only)
 ```
 
 `{layout}` is one of `mxfp4`, `w4a16`, `w4a8`, `bf16`. Every linear that participates in the A/B
@@ -305,6 +308,97 @@ that directory; a selected linear missing from `hessian.json`, or with a differe
 conversion before any tensor is written. The container records the pattern (`ldlq`), `ldlq_damp`,
 `hessian_dir`, the sha256 of the `hessian.json` it used (`hessian_manifest_sha256`) and the
 resolved `ldlq_linears` list in `r4dx_convert_run`.
+
+## Residual rotation (`__metadata__.rotation`, `rotation.*`)
+
+`r4dx-convert --rotate {none,q2a,q2ab} [--rotation-seed <u64>]` (docs/quant2.md sections 3-4;
+`src/convert/include/r4dx_convert/rotation.hpp`). **`none` is the default and changes nothing**: no
+fold, no `rotation.*` tensor, no `rotation` / `rotate` metadata key -- a container converted without
+the flag is byte-identical to one converted before it existed (checked on the real checkpoint,
+`--layers 4 --mtp on`, bf16 and `--quant search --imatrix` w4a16/w4a8/mxfp4: sha256-identical
+files). Everything below applies only to a container whose `__metadata__` has a `rotation` key.
+
+**The contract with the loader.** A rotated container's text-layer weights are only correct together
+with the runtime's online ops; read as an ordinary container they produce garbage *with no error*.
+So a binary MUST refuse a `rotation.kind` it does not implement (anything but `q2a` / `q2ab` today),
+and MUST NOT apply any rotation op to a container without the key. Note that binaries built before
+this section existed never look at `__metadata__.rotation` at all.
+
+```json
+"rotation": { "kind": "q2a" | "q2ab", "seed": 1592598565, "hidden": 5120, "block": 1024,
+              "had": { "down": 512, "o": 256, "gdn_out": 128 } }      // "had": q2ab only
+```
+
+Residual rows are row vectors `x` (`hidden = 5120 = 5 x 1024`); `Q` is orthogonal:
+
+```
+x Q    y = x * d                               d = rotation.signs (+-1)
+       y[b*1024 : (b+1)*1024] = FWHT(block) / 32    for b in 0..4   (natural/Sylvester order)
+       z[b*1024 + i] = sum_c y[c*1024 + i] * R[c][b]                 R = rotation.mix5, R[c][b] at [c][b]
+x Q^T  y[c*1024 + i] = sum_b x[b*1024 + i] * R[c][b];  FWHT / 32 per block;  * d
+```
+
+`FWHT` is the unnormalized Walsh-Hadamard transform, `H[i][j] = (-1)^popcount(i & j)`, so
+`FWHT / sqrt(B)` is its own inverse. For `q2ab`, the input `h` of three out-projections is also
+rotated online by a block Hadamard `h Hb := (h * s)`, then `FWHT / sqrt(B)` on each contiguous block
+of `B`:
+
+| linear | K (TP=1) | B | `s` |
+|---|---|---|---|
+| `mlp.down` | 17408 (`intermediate_size`) | 512 | `rotation.had_down_signs` |
+| `attn.o` | 6144 (`num_attention_heads * head_dim`, one head per block) | 256 | `rotation.had_o_signs` |
+| `gdn.out_proj` | 6144 (`linear_num_value_heads * linear_value_head_dim`, one head per block) | 128 | `rotation.had_gdn_out_signs` |
+
+All five `rotation.*` tensors are fp32, stored like every other single-layout tensor (`U8`, trailing
+element-width axis of 4, no `.{layout}` suffix): `rotation.signs` `[5120, 4]`, `rotation.mix5`
+`[5, 5, 4]` (row-major `R[c][b]`), `rotation.had_*_signs` `[K, 4]`. Every value of a sign vector is
+exactly `+1.0f` or `-1.0f`. The runtime reads these tensors and never regenerates them. Under TP the
+Hadamard sign vectors are sliced with the same K range as their linear's columns (every rank's K is a
+whole number of blocks), and `signs` / `mix5` are replicated.
+
+**What is folded (fp32, before any quantization; text layers `0 .. layers_converted-1` only):**
+
+| tensor | stored as |
+|---|---|
+| `text.layers.{i}.input_layernorm.rotated`, `.post_attention_layernorm.rotated` | **all zeros** (bf16 `+0.0`, same shape): the zero-centred norm then computes `rms(x) * 1`, which commutes with `Q`. **Renamed** from the bare names on purpose: a binary predating `__metadata__.rotation` fails on the missing bare tensor instead of running rotated weights in the unrotated basis |
+| in-projections `gdn.in_proj_qkv/z/a/b`, `attn.qg/k/v` (norm = that layer's `input_layernorm`), `mlp.gate_up` (norm = `post_attention_layernorm`) | `W' = W diag(1 + w_norm) Q`: every row `r -> (r * (1 + w)) Q` |
+| out-projections `gdn.out_proj`, `attn.o`, `mlp.down` | `W' = Q^T W`: every column, taken as a row, `-> c Q` |
+| `q2ab` additionally, those three | `W'' = W' Hb`: every row `-> row Hb` (the runtime feeds `h Hb`) |
+
+Every layout of a folded linear -- bf16, the quantized ones, a `--keep-bf16` bf16-only one, and the
+bf16-only `gdn.in_proj_a/b` -- is produced from the folded fp32, rounded once. The fold is per row on
+the K side and per column on the N side, so the output-axis fusions (`mlp.gate_up`'s gate|up rows,
+`attn.qg`'s per-head query/gate interleave) are unaffected. **Untouched, byte-identical to an
+unrotated container:** `text.embed_tokens`, `text.final_norm`, `lm_head`, all of `mtp.*` (including
+the draft head), `vision.*`, and inside the text layers `gdn.conv1d_weight`, `A_log`, `dt_bias`,
+`gdn.norm_weight`, `attn.q_norm/k_norm` and the KV descales. The runtime therefore applies `x Q` to
+the stack's input rows (after the embedding gather and vision splice), `x Q^T` to its output rows
+(before `final_norm` and anything else that reads the pre-final-norm residual: MTP priming, verify
+windows), and `x Q^T` to DFlash2 feature captures -- the MTP head, the DFlash2 drafter and the vision
+tower all run un-rotated.
+
+**Generation** (converter only). One splitmix64 stream seeded with `seed`, drawn in this order:
+`rotation.signs` (5120 draws, sign = the draw's top bit, set -> `-1`); then 25 standard normals by
+Box-Muller from 13 pairs of draws (`u1 = ((a >> 11) + 1) * 2^-53`, `u2 = (b >> 11) * 2^-53`,
+`r cos(2 pi u2)`, `r sin(2 pi u2)`, `r = sqrt(-2 ln u1)`; the last sine is dropped), filled row-major
+into a 5x5 matrix whose rows are orthonormalized in order by modified Gram-Schmidt (two passes, fp64)
+and stored as `R` in fp32; then, for `q2ab`, `had_down_signs`, `had_o_signs`, `had_gdn_out_signs` by
+top bit. `q2a` and `q2ab` of the same seed share `signs` and `mix5`. Default seed `0x5EED2025`.
+
+**Choosing the quantized values on a rotated container.** `--ldlq` rounds a folded linear against its
+input Hessian carried into the new basis, computed exactly from the captured (un-rotated) `H`:
+`Q^T D^-1 H D^-1 Q` (`D = diag(1 + w_norm)`) for an in-projection -- refused if any `|1 + w| < 1e-3`
+-- and `Hb^T H Hb` for a `q2ab` out-projection; an out-projection's N-side `Q^T` does not change its
+input. (Then `tr(W' H' W'^T) = tr(W H W^T)`: the proxy of the same error is the same.) `--imatrix`
+vectors, which are only `diag(H)`, are carried over under their own diagonal model instead --
+`diag(M^T diag(v) M)`, which after a Hadamard is a per-block constant -- so on rotated linears they
+carry little information; `--ldlq` is the tool there.
+
+`r4dx_convert_run` records `rotate` and `rotation_seed` (and `imatrix_rotated` when `--imatrix` was
+given); `quant_summary` gains a note for the zeroed norms and the `rotation.*` tensors.
+`tests/convert/test_rotation.cpp` (ctest `convert_rotation`) gates the generation, `Q` / `Hb` against
+their closed forms and for orthogonality, the fold identities on a miniature layer, and the Hessian
+change of basis against a direct capture on the folded input.
 
 ## KV descale tables
 

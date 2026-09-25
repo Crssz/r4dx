@@ -42,6 +42,7 @@
 #include <cstdio>  // sha256.hpp uses std::snprintf without including it
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <set>
@@ -197,6 +198,18 @@ inline std::vector<float> ReadHessFile(const std::string& path, int64_t* K_out, 
   return H;
 }
 
+// An optional change of basis applied to H after ReadHessFile has validated it and before it is
+// factored (docs/quant2.md sections 3-4): a linear folded by r4dx-convert --rotate sees its input as
+// x M, so LDLQ must round against H' = M^T H M (rotation.hpp's TransformHessianQ /
+// TransformHessianHadamard), not the captured H. `id` names the transform completely -- kind plus a
+// hash of whatever it depends on (the folded norm weights) -- because it is part of the factor
+// cache key: two linears sharing a tap file but not a transform must never share a factor, and two
+// sharing both (attn.qg / k / v under one input_layernorm) still should.
+struct HessianTransform {
+  std::string id;
+  std::function<void(std::vector<float>& H, int64_t K, int nthreads)> apply;
+};
+
 class HessianStore {
  public:
   explicit HessianStore(const std::string& dir) : dir_(dir) {
@@ -286,15 +299,20 @@ class HessianStore {
   }
 
   // The factor for `key`'s tap. The returned reference stays valid until the next Factor() call
-  // that needs a DIFFERENT (file, damp): only the last factor is cached, which is all the emit loop
-  // needs -- the bases sharing a tap (in_proj_qkv / in_proj_z, qg / k / v) are emitted back to back.
-  const LdlqFactor& Factor(const std::string& key, int64_t K, float damp, int nthreads) {
+  // that needs a DIFFERENT (file, damp, transform id): only the last factor is cached, which is all
+  // the emit loop needs -- the bases sharing a tap (in_proj_qkv / in_proj_z, qg / k / v) are
+  // emitted back to back. `xf` (nullable) is applied to H before factoring; see HessianTransform.
+  const LdlqFactor& Factor(const std::string& key, int64_t K, float damp, int nthreads,
+                           const HessianTransform* xf = nullptr) {
     const std::string file = File(key);
     const FileInfo& fi = files_.at(file);
     if (fi.K != K)
       throw std::runtime_error("HessianStore: '" + key + "' has K=" + std::to_string(K) +
                                " but its Hessian " + file + " is K=" + std::to_string(fi.K));
-    if (cached_valid_ && cached_file_ == file &&
+    const std::string xf_id = xf ? xf->id : std::string();
+    if (xf && xf_id.empty())
+      throw std::runtime_error("HessianStore: a HessianTransform needs a non-empty id (cache key)");
+    if (cached_valid_ && cached_file_ == file && cached_xf_id_ == xf_id &&
         std::memcmp(&cached_damp_, &damp, sizeof(float)) == 0)
       return cached_;
 
@@ -313,8 +331,10 @@ class HessianStore {
       throw std::runtime_error("HessianStore: " + path + " header says rows=" +
                                std::to_string(frows) + " but hessian.json says rows=" +
                                std::to_string(fi.rows));
+    if (xf) xf->apply(H, K, nthreads);
     cached_ = FactorHessian(std::move(H), K, damp, nthreads);
     cached_file_ = file;
+    cached_xf_id_ = xf_id;
     cached_damp_ = damp;
     cached_valid_ = true;
     return cached_;
@@ -335,6 +355,7 @@ class HessianStore {
 
   LdlqFactor cached_;
   std::string cached_file_;
+  std::string cached_xf_id_;  // "" = untransformed
   float cached_damp_ = 0.0f;
   bool cached_valid_ = false;
 };

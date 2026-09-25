@@ -13,6 +13,7 @@
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "r4dx/kernels/rotate_residual.h"  // r4dx_hadamard_inplace_bf16 (quant2 Q2b)
 
 namespace r4dx::model {
 
@@ -229,6 +230,19 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
           states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
           /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
           kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+    });
+  }
+
+  // ---- quant2 Q2b: out_proj's input Hadamard (docs/quant2.md section 4) ------------------------
+  // Both branches above end with out_core = the gated norm's [T, H*V] output (prefill: the separate
+  // GdnGatedRmsNorm; decode/verify: fused into the recurrent kernel's epilogue, which is why this
+  // cannot be fused into a producer the way mlp.down's and attn.o's Hadamards are), so ONE in-place
+  // launch here covers every path. Block V = one value head.
+  if (p.out_had_signs != nullptr) {
+    ProfiledCall(prof, s, "gdn.out_hadamard", [&] {
+      r4dx_hadamard_inplace_bf16(reinterpret_cast<int64_t>(out_core), T, value_dim,
+                                  reinterpret_cast<int64_t>(p.out_had_signs), V,
+                                  reinterpret_cast<int64_t>(s));
     });
   }
 

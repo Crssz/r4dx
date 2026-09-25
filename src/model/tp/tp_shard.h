@@ -56,7 +56,9 @@ struct ShardRule {
 // still carries its ".{bf16|w4a16|w4a8|mxfp4}.{part}" suffix -- for a layer index out of range,
 // and for a GDN tensor on a full-attention layer or the reverse. The two exceptions are
 // whole-prefix rules by design (docs/tp.md 4.2): every other `vision.*` name is rank-0-only and
-// every other `dflash.*` name (a separate, fully replicated container) is replicated.
+// every other `dflash.*` name (a separate, fully replicated container) is replicated. The five
+// quant2 `rotation.*` tensors are named one by one (docs/quant2.md section 3.1): signs/mix5
+// replicate, and each Hadamard sign vector is a row split over its linear's K.
 ShardRule RuleFor(const std::string& base, const ModelConfig& global);
 
 // Rank `rank`'s global row ranges of a kRows rule, in concatenation order (one per segment).

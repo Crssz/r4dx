@@ -807,6 +807,24 @@ class Model {
   // paths TP does not support at all (profiling, docs/tp.md 1.2).
   void RequireNotTp(const char* what) const;
 
+  // ---- quant2 residual rotation (docs/quant2.md sections 3.1, 4) ---------------------------------
+  // In place on `rows` contiguous [hidden] bf16 rows at `x`, enqueued on stream_: x <- x Q
+  // (inverse == false: the layer stack's entry, after the embedding gather and image splice) or
+  // x <- x Q^T (inverse == true: the stack's exit, and the DFlash2 feature captures). A no-op -- no
+  // launch, nothing enqueued -- unless the container carries __metadata__.rotation
+  // (Container::HasRotation), which is what keeps every unrotated container byte-identical.
+  void RotateResidual(uint16_t* x, int64_t rows, bool inverse);
+  // The q2ab online-Hadamard sign vectors (this rank's K slices) for the BACKBONE's Mlp /
+  // AttnWeights / GdnLayerParams -- all nullptr on an unrotated or q2a container. Only the four
+  // backbone layer loops (RunChunk, VerifyWindow, DecodeStepProfiled, PrefillProfiled) pass them on;
+  // the MTP head and the DFlash2 drafter never do (their weights are never folded).
+  struct BackboneHadSigns {
+    const float* down = nullptr;
+    const float* o = nullptr;
+    const float* gdn_out = nullptr;
+  };
+  BackboneHadSigns HadSigns() const;
+
   Container container_;
   core::Stream stream_;
   core::Arena arena_;

@@ -78,6 +78,12 @@ struct AttnWeights {
   const uint16_t* k_norm = nullptr;           // [head_dim] bf16
   const float* k_descale = nullptr;           // [kv_heads] fp32
   const float* v_descale = nullptr;           // [kv_heads] fp32
+  // quant2 Q2b (docs/quant2.md section 4): [num_heads*head_dim] fp32 (+-1), a q2ab container's
+  // rotation.had_o_signs (this rank's heads under TP). Non-null: the output-gate multiply also
+  // applies o_proj's online blockwise Hadamard, one head (head_dim) per block, because that
+  // container's attn.o was folded W Hb. nullptr (the default -- unrotated/q2a containers, the MTP
+  // head, every test) is exactly the plain gate multiply.
+  const float* o_had_signs = nullptr;
 };
 
 }  // namespace r4dx::model::attention

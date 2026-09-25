@@ -11,6 +11,7 @@
 //                [--keep-bf16 <ECMAScript regex over container base names>]
 //                [--hessian-dir <tools/reference/hessian_capture.py output dir>
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
+//                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
 //
 // --keep-bf16 (docs/validation.md "Milestone 11 / sensitivity", keep_bf16.hpp) writes every linear
 // whose container base name the regex matches as `<base>.bf16.w` ONLY, skipping every quantized
@@ -60,6 +61,24 @@
 // __metadata__.r4dx_convert_run records the pattern, the damp, the directory, hessian.json's sha256
 // and the resolved list of LDLQ'd bases; each LDLQ'd linear logs its factor/emit seconds, damp_used
 // and retry count, and the run ends with a one-line total.
+//
+// --rotate (docs/quant2.md sections 3-4, rotation.hpp; default `none`, which leaves every byte of
+// the container exactly as without the flag) folds an orthogonal residual-stream rotation Q into
+// the 64-layer text stack, in fp32 before any quantization: `q2a` stores both layer norms of every
+// text layer as 0 and folds W diag(1 + w_norm) Q into every in-projection (attn.qg/k/v,
+// gdn.in_proj_qkv/z/a/b, mlp.gate_up -- the bf16-only in_proj_a/b and any --keep-bf16 linear are
+// rounded to bf16 once, from the folded fp32) and Q^T W into every out-projection (attn.o,
+// gdn.out_proj, mlp.down); `q2ab` additionally folds a block Hadamard W Hb into the K side of those
+// three out-projections (blocks 256 / 128 / 512). The embedding table, final_norm, lm_head, vision.*
+// and mtp.* are untouched: the runtime applies x Q at the stack's entry and x Q^T at its exit, and
+// Hb on the three inputs, from the tensors this writes (rotation.signs, rotation.mix5 and, for q2ab,
+// rotation.had_{down,o,gdn_out}_signs, generated from --rotation-seed, default 0x5EED2025) and the
+// __metadata__.rotation block that tells it to (docs/container-format.md "Residual rotation"). It
+// composes with every way of choosing values: --ldlq rounds a rotated linear against its Hessian
+// carried into the new basis (Q^T D^-1 H D^-1 Q for in-projections, Hb^T H Hb for the q2ab K side,
+// computed from the captured H); --imatrix vectors are carried over under their own diagonal model
+// (rotation.hpp's header says exactly what that is and is not). --layers N folds all N converted
+// layers. Not accepted with --selftest or --dflash-gguf.
 //
 // --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
 // lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
@@ -121,6 +140,7 @@
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/npz_reader.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
+#include "r4dx_convert/rotation.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -272,7 +292,39 @@ struct AppArgs {
   std::string ldlq;
   std::string hessian_dir;
   float ldlq_damp = 0.01f;
+
+  // Residual-stream rotation (docs/quant2.md sections 3-4; this file's header comment). "none"
+  // (default) = no fold, no rotation tensors, no metadata key: byte-identical to a container built
+  // before these flags existed.
+  std::string rotate = "none";
+  uint64_t rotation_seed = r4dx_convert::kDefaultRotationSeed;
+  bool rotation_seed_explicit = false;
 };
+
+// --rotation-seed: a full u64, decimal or 0x-prefixed hex. std::stoull alone would accept "-1"
+// (wrapping to 2^64-1) and read a leading-zero value as octal, so both are ruled out explicitly.
+uint64_t ParseSeed(const std::string& v) {
+  const bool hex = v.size() > 2 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X');
+  const std::string digits = hex ? v.substr(2) : v;
+  bool ok = !digits.empty();
+  for (char c : digits)
+    ok = ok && (hex ? std::isxdigit(static_cast<unsigned char>(c)) != 0
+                    : std::isdigit(static_cast<unsigned char>(c)) != 0);
+  uint64_t out = 0;
+  if (ok) {
+    try {
+      size_t used = 0;
+      out = std::stoull(digits, &used, hex ? 16 : 10);
+      ok = used == digits.size();
+    } catch (const std::exception&) {
+      ok = false;  // out of range
+    }
+  }
+  if (!ok)
+    throw std::runtime_error("--rotation-seed must be an unsigned 64-bit integer (decimal or 0x hex), "
+                             "got '" + v + "'");
+  return out;
+}
 
 // Strict on/off parser for --vision/--mtp (review finding, minor): the previous `(v == "on") ? 1
 // : 0` silently treated any typo ("yes", "true", "1", a fat-fingered value) as OFF, which could
@@ -325,8 +377,21 @@ AppArgs ParseArgs(int argc, char** argv) {
       if (used != v.size() || !std::isfinite(a.ldlq_damp) || a.ldlq_damp < 0.0f)
         throw std::runtime_error("--ldlq-damp must be a finite number >= 0, got '" + v + "'");
     }
+    else if (arg == "--rotate") a.rotate = next(i);
+    else if (arg == "--rotation-seed") {
+      a.rotation_seed = ParseSeed(next(i));
+      a.rotation_seed_explicit = true;
+    }
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  const r4dx_convert::RotationKind rotate_kind = r4dx_convert::ParseRotationKind(a.rotate);
+  // The rotation is a property of the Qwen text stack (Q is 5120 wide, folded into its layers and
+  // undone at its exit by the runtime): the selftest's one bare tensor has no residual stream to
+  // rotate and no runtime to undo it, and the DFlash2 drafter is un-rotated by design
+  // (docs/quant2.md 1.2) -- a rotated drafter would be silently wrong, so both are argument errors.
+  if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || !a.dflash_gguf.empty()))
+    throw std::runtime_error("--rotate applies only to the HF-checkpoint conversion (--input/--output), "
+                             "not to --selftest or --dflash-gguf");
   if (a.quant != "rtn" && a.quant != "search")
     throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
   if (!a.imatrix.empty() && a.quant != "search")
@@ -531,14 +596,19 @@ class LdlqSource {
   // can say why the selection is smaller than the regex suggests.
   void NoteSkipped() { ++skipped_; }
 
-  // Emit pass. `*reused` = this base shares its Hessian file with the linear emitted just before it
-  // (same tap), i.e. the store's cached factorization was returned rather than a new one computed.
+  // Emit pass. `*reused` = this base shares its Hessian file AND its --rotate change of basis with
+  // the linear emitted just before it (same tap, same fold), i.e. the store's cached factorization
+  // was returned rather than a new one computed. `xf` is RotationSource::HessianFor's transform, or
+  // nullptr for a linear whose input basis the rotation does not change.
   const r4dx_convert::LdlqFactor& Factor(const std::string& container_base, int64_t K, int threads,
-                                         bool* reused) {
+                                         bool* reused,
+                                         const r4dx_convert::HessianTransform* xf = nullptr) {
     const std::string file = store_->File(container_base);
-    *reused = (file == last_file_);
+    const std::string xf_id = xf ? xf->id : std::string();
+    *reused = (file == last_file_ && xf_id == last_xf_id_);
     last_file_ = file;
-    return store_->Factor(container_base, K, damp_, threads);
+    last_xf_id_ = xf_id;
+    return store_->Factor(container_base, K, damp_, threads, xf);
   }
 
   // Emit pass, after the linear is written: the per-linear log line and the run totals.
@@ -593,7 +663,226 @@ class LdlqSource {
   std::vector<std::string> planned_;
   int64_t skipped_ = 0, done_ = 0, factorizations_ = 0, retried_ = 0;
   double factor_s_ = 0.0, emit_s_ = 0.0;
-  std::string last_file_;
+  std::string last_file_, last_xf_id_;
+};
+
+// ---- --rotate (docs/quant2.md sections 3-4, rotation.hpp) ------------------------------------------
+
+// What --rotate does to ONE linear. Resolved at the call site in RunConvert's text-layer loop -- the
+// only loop that folds; the MTP head, lm_head, the draft head and the DFlash2 drafter all take the
+// default (kNone) -- and handed to add_linear as a VARIABLE, never as a string literal:
+// tools/reference/imatrix_capture.py's audit_converter_source parses every add_linear call and
+// requires exactly one quoted string after the HF-name list.
+enum class HadSite { kNone, kDown, kO, kGdnOut };
+
+struct LinearFold {
+  enum Kind { kNone, kIn, kOut };
+  Kind kind = kNone;
+  std::string norm_hf;           // kIn: the HF zero-centred norm whose (1 + w) folds into this linear
+  HadSite had = HadSite::kNone;  // kOut under q2ab: the block Hadamard folded into the K side
+  // The linear's INPUT basis changes (so its Hessian / imatrix vector must follow it).
+  bool RotatesInput() const { return kind == kIn || had != HadSite::kNone; }
+};
+
+const char* HadSiteName(HadSite s) {
+  switch (s) {
+    case HadSite::kDown: return "down";
+    case HadSite::kO: return "o";
+    case HadSite::kGdnOut: return "gdn_out";
+    default: return "none";
+  }
+}
+
+// Owns the generated rotation (r4dx_convert::RotationSet) for the run and applies it per linear:
+// shape checks at planning time, the weight fold, the Hessian and imatrix changes of basis at emit
+// time, and the metadata block. A disabled source (--rotate none) hands out kNone folds only, so
+// every call site below degenerates to exactly the pre-rotation code path.
+class RotationSource {
+ public:
+  RotationSource(const std::string& kind, uint64_t seed, bool seed_explicit,
+                 const nlohmann::json& text_cfg)
+      : kind_(r4dx_convert::ParseRotationKind(kind)) {
+    using namespace r4dx_convert;
+    if (kind_ == RotationKind::kNone) {
+      if (seed_explicit)
+        std::cerr << "[r4dx-convert] WARNING: --rotation-seed given without --rotate -- ignored, the "
+                     "container is not rotated\n";
+      return;
+    }
+    RotationShape shape;
+    shape.hidden = text_cfg.at("hidden_size").get<int64_t>();
+    // The runtime's online op (src/kernels, one workgroup per 5120-wide row) and the tensor name
+    // rotation.mix5 are both this exact factorization, so anything else is refused here rather than
+    // written as a container no binary can run.
+    if (shape.hidden != 5 * kRotationBlock)
+      throw std::runtime_error("--rotate: hidden_size=" + std::to_string(shape.hidden) +
+                               ", but the rotation is defined for 5120 = 5 x 1024 only");
+    if (kind_ == RotationKind::kQ2ab) {
+      const int64_t head_dim = text_cfg.at("head_dim").get<int64_t>();
+      const int64_t v_head_dim = text_cfg.at("linear_value_head_dim").get<int64_t>();
+      // attn.o's and gdn.out_proj's Hadamard block IS one head (the runtime's fused kernels run one
+      // workgroup per (token, head)); a checkpoint with other head widths needs other kernels.
+      if (head_dim != kHadBlockO || v_head_dim != kHadBlockGdnOut)
+        throw std::runtime_error("--rotate q2ab: needs head_dim=" + std::to_string(kHadBlockO) +
+                                 " and linear_value_head_dim=" + std::to_string(kHadBlockGdnOut) +
+                                 " (got " + std::to_string(head_dim) + ", " +
+                                 std::to_string(v_head_dim) + ")");
+      shape.k_down = text_cfg.at("intermediate_size").get<int64_t>();
+      shape.k_o = text_cfg.at("num_attention_heads").get<int64_t>() * head_dim;
+      shape.k_gdn_out = text_cfg.at("linear_num_value_heads").get<int64_t>() * v_head_dim;
+    }
+    set_ = GenerateRotationSet(kind_, seed, shape);
+  }
+
+  bool Enabled() const { return kind_ != r4dx_convert::RotationKind::kNone; }
+  bool Hadamard() const { return kind_ == r4dx_convert::RotationKind::kQ2ab; }
+  const char* KindName() const { return r4dx_convert::RotationKindName(kind_); }
+  uint64_t Seed() const { return set_.seed; }
+  const r4dx_convert::RotationSet& Set() const { return set_; }
+
+  LinearFold In(const std::string& norm_hf) const {
+    LinearFold f;
+    if (Enabled()) {
+      f.kind = LinearFold::kIn;
+      f.norm_hf = norm_hf;
+    }
+    return f;
+  }
+  LinearFold Out(HadSite site) const {
+    LinearFold f;
+    if (Enabled()) {
+      f.kind = LinearFold::kOut;
+      if (Hadamard()) f.had = site;
+    }
+    return f;
+  }
+
+  const r4dx_convert::BlockHadamard& Had(HadSite s) const {
+    switch (s) {
+      case HadSite::kDown: return set_.had_down;
+      case HadSite::kO: return set_.had_o;
+      case HadSite::kGdnOut: return set_.had_gdn_out;
+      default: throw std::logic_error("RotationSource::Had(kNone)");
+    }
+  }
+
+  // Planning pass: the linear's shape against the fold (and the norm tensor's), so a mismatch dies
+  // before the header is written.
+  void CheckPlan(const LinearFold& f, const std::string& base, int64_t N, int64_t K,
+                 ShardedModel& model) const {
+    if (f.kind == LinearFold::kNone) return;
+    const int64_t hidden = set_.q.hidden;
+    if (f.kind == LinearFold::kIn) {
+      if (K != hidden)
+        throw std::runtime_error("--rotate: in-projection '" + base + "' has K=" +
+                                 std::to_string(K) + ", expected hidden=" + std::to_string(hidden));
+      const auto& m = model.Meta(f.norm_hf);
+      if (m.shape.size() != 1 || m.shape[0] != hidden)
+        throw std::runtime_error("--rotate: norm '" + f.norm_hf + "' folded into '" + base +
+                                 "' is not a [" + std::to_string(hidden) + "] vector");
+      return;
+    }
+    if (N != hidden)
+      throw std::runtime_error("--rotate: out-projection '" + base + "' has N=" + std::to_string(N) +
+                               ", expected hidden=" + std::to_string(hidden));
+    if (f.had != HadSite::kNone && K != Had(f.had).K)
+      throw std::runtime_error("--rotate q2ab: '" + base + "' has K=" + std::to_string(K) +
+                               " but rotation.had_" + HadSiteName(f.had) + "_signs is " +
+                               std::to_string(Had(f.had).K) + " long");
+  }
+
+  // Emit pass. The fp32 norm weight of a kIn fold (empty otherwise), read once per linear and shared
+  // by Fold / Importance / HessianFor.
+  std::vector<float> ReadNorm(const LinearFold& f, ShardedModel& model) const {
+    if (f.kind != LinearFold::kIn) return {};
+    return r4dx_convert::ReadTensorAsFloat(model, f.norm_hf);
+  }
+
+  // W [N, K] in place, fp32 -> (double math) -> fp32, before any rounding to the container's forms.
+  // A q2ab out-projection is two passes (Q^T on the columns, then Hb on the rows) with the weight
+  // held in fp32 between them: ~1e-7 relative, far below even bf16's step, and it keeps the peak at
+  // one fp32 copy of mlp.down instead of a 713 MB double one.
+  void Fold(const LinearFold& f, const std::vector<float>& norm, std::vector<float>& w, int64_t N,
+            int64_t K, int threads) {
+    using namespace r4dx_convert;
+    if (f.kind == LinearFold::kIn) {
+      FoldRowsQ(w, N, K, norm.data(), set_.q, threads);
+      ++folded_in_;
+    } else if (f.kind == LinearFold::kOut) {
+      FoldColumnsQt(w, N, K, set_.q, threads);
+      ++folded_out_;
+      if (f.had != HadSite::kNone) {
+        FoldRowsHadamard(w, N, K, Had(f.had), threads);
+        ++folded_had_;
+      }
+    }
+  }
+
+  // The --imatrix vector carried into the folded linear's input basis under the diagonal model
+  // (rotation.hpp). Only called for f.RotatesInput().
+  std::vector<float> Importance(const LinearFold& f, const std::vector<float>& norm,
+                                const r4dx_convert::ImportanceVector& v, int64_t K) {
+    ++imatrix_rotated_;
+    if (f.kind == LinearFold::kIn)
+      return r4dx_convert::TransformImportanceQ(v.data, K, norm.data(), set_.q);
+    return r4dx_convert::TransformImportanceHadamard(v.data, K, Had(f.had));
+  }
+
+  // The LDLQ Hessian's change of basis for a folded linear, or nullptr when its input basis is
+  // unchanged (every out-projection under q2a, and every unfolded linear). The id -- part of
+  // HessianStore's factor cache key -- is the kind, the seed, the site and, for an in-projection,
+  // the norm's name and the sha256 of its fp32 bytes: attn.qg / k / v (one input_layernorm) and
+  // gdn.in_proj_qkv / z still share one factorization, and nothing else can.
+  std::unique_ptr<r4dx_convert::HessianTransform> HessianFor(const LinearFold& f,
+                                                             const std::vector<float>& norm) {
+    if (!f.RotatesInput()) return nullptr;
+    ++ldlq_rotated_;
+    auto xf = std::make_unique<r4dx_convert::HessianTransform>();
+    const std::string prefix =
+        std::string(KindName()) + ":seed=" + std::to_string(set_.seed) + ":";
+    if (f.kind == LinearFold::kIn) {
+      const std::string bytes(reinterpret_cast<const char*>(norm.data()), norm.size() * sizeof(float));
+      xf->id = prefix + "in:" + f.norm_hf + ":" + r4dx_convert::Sha256Hex(bytes);
+      const r4dx_convert::ResidualRotation* q = &set_.q;
+      xf->apply = [q, norm](std::vector<float>& H, int64_t K, int t) {
+        r4dx_convert::TransformHessianQ(H, K, norm.data(), *q, t);
+      };
+    } else {
+      xf->id = prefix + "had:" + HadSiteName(f.had);
+      const r4dx_convert::BlockHadamard* hb = &Had(f.had);
+      xf->apply = [hb](std::vector<float>& H, int64_t K, int t) {
+        r4dx_convert::TransformHessianHadamard(H, K, *hb, t);
+      };
+    }
+    return xf;
+  }
+
+  // __metadata__.rotation (docs/container-format.md "Residual rotation"). Only written when enabled.
+  nlohmann::json Metadata() const {
+    nlohmann::json j = {{"kind", KindName()},
+                        {"seed", set_.seed},
+                        {"hidden", set_.q.hidden},
+                        {"block", set_.q.block}};
+    if (Hadamard())
+      j["had"] = {{"down", set_.had_down.block}, {"o", set_.had_o.block},
+                  {"gdn_out", set_.had_gdn_out.block}};
+    return j;
+  }
+
+  void ReportRun(std::ostream& log) const {
+    if (!Enabled()) return;
+    log << "[r4dx-convert] rotate " << KindName() << ": folded " << folded_in_
+        << " in-projection(s) (W diag(1+w) Q), " << folded_out_ << " out-projection(s) (Q^T W)";
+    if (Hadamard()) log << ", " << folded_had_ << " of them also W Hb on the K side";
+    log << "; " << ldlq_rotated_ << " LDLQ Hessian(s) and " << imatrix_rotated_
+        << " imatrix vector(s) carried into the rotated basis\n";
+  }
+
+ private:
+  r4dx_convert::RotationKind kind_;
+  r4dx_convert::RotationSet set_;
+  int64_t folded_in_ = 0, folded_out_ = 0, folded_had_ = 0, ldlq_rotated_ = 0,
+          imatrix_rotated_ = 0;
 };
 
 r4dx_convert::QuantMode ParseQuantMode(const std::string& s) {
@@ -676,6 +965,19 @@ int RunConvert(const AppArgs& args) {
               << " (matching linears: LDLQ error-feedback rounding; --quant/--imatrix ignored for "
                  "them)\n";
 
+  // --rotate (RotationSource): Q / Hb generated here from the seed, and the checkpoint's shape checked
+  // against them, before the first shard is opened.
+  RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit, text_cfg);
+  if (rot.Enabled()) {
+    std::cout << "[r4dx-convert] rotate=" << rot.KindName() << " seed=0x" << std::hex << rot.Seed()
+              << std::dec << " (text layers folded; norms stored as 0; rotation.* tensors + "
+              << "__metadata__.rotation written)\n";
+    if (!args.imatrix.empty())
+      std::cout << "[r4dx-convert] rotate: --imatrix vectors of rotated linears are carried into the "
+                   "new basis under the diagonal model (rotation.hpp) -- use --ldlq for the exact "
+                   "Hessian\n";
+  }
+
   const bool have_kv_calib = !args.kv_calib.empty();
   nlohmann::json kv_calib_json;
   if (have_kv_calib) {
@@ -698,6 +1000,69 @@ int RunConvert(const AppArgs& args) {
     });
     emit_jobs.push_back([&writer, &model, hf_name, container_name]() {
       auto bytes = r4dx_convert::CopyRawBf16(model, hf_name);
+      writer.WriteTensor(container_name, bytes.data(), bytes.size());
+    });
+  };
+  // --rotate: a zero-centred layer norm whose (1 + w) has been folded into the next linear(s) is
+  // stored as 0 (bf16 +0.0, all bytes zero) in the checkpoint tensor's shape, so the kernel computes
+  // rms(x) * 1 -- which commutes with Q. Without --rotate this is add_bf16, byte for byte.
+  // Rotated, the tensor is renamed `<name>.rotated` on purpose: a pre-quant2 binary never reads
+  // __metadata__.rotation, and the missing bare name is what stops it from running rotated weights
+  // in the unrotated basis.
+  auto add_norm = [&](std::string hf_name, std::string container_name) {
+    if (!rot.Enabled()) {
+      add_bf16(hf_name, container_name);
+      return;
+    }
+    container_name += ".rotated";
+    plan_jobs.push_back([&writer, &model, hf_name, container_name]() {
+      const auto& meta = model.Meta(hf_name);
+      std::vector<int64_t> shape = meta.shape;
+      shape.push_back(2);
+      writer.Plan(container_name, shape, static_cast<uint64_t>(meta.ElemCount()) * 2);
+    });
+    emit_jobs.push_back([&writer, &model, hf_name, container_name]() {
+      const std::vector<uint8_t> zeros(static_cast<size_t>(model.Meta(hf_name).ElemCount()) * 2, 0);
+      writer.WriteTensor(container_name, zeros.data(), zeros.size());
+    });
+  };
+  // A bf16-only linear (gdn.in_proj_a/b) that --rotate folds: read as fp32, fold, round to bf16
+  // ONCE. Unfolded (the default) it is add_bf16's raw byte copy, so nothing changes without --rotate.
+  auto add_bf16_linear = [&](std::string hf_name, std::string container_name, LinearFold fold) {
+    if (fold.kind == LinearFold::kNone) {
+      add_bf16(hf_name, container_name);
+      return;
+    }
+    plan_jobs.push_back([&writer, &model, &rot, hf_name, container_name, fold]() {
+      const auto& meta = model.Meta(hf_name);
+      if (meta.shape.size() != 2)
+        throw std::runtime_error("--rotate: '" + hf_name + "' is not a 2-D linear weight");
+      rot.CheckPlan(fold, container_name, meta.shape[0], meta.shape[1], model);
+      writer.Plan(container_name, {meta.shape[0], meta.shape[1], 2},
+                  static_cast<uint64_t>(meta.ElemCount()) * 2);
+    });
+    emit_jobs.push_back([&writer, &model, &rot, hf_name, container_name, fold, threads]() {
+      std::vector<float> w = r4dx_convert::ReadTensorAsFloat(model, hf_name);
+      const auto& meta = model.Meta(hf_name);
+      rot.Fold(fold, rot.ReadNorm(fold, model), w, meta.shape[0], meta.shape[1], threads);
+      auto bytes = r4dx_convert::EncodeBf16(w);
+      writer.WriteTensor(container_name, bytes.data(), bytes.size());
+    });
+  };
+  // Raw fp32 values the converter itself produced (the rotation.* tensors), `shape` without the
+  // trailing element-width dim, which is appended exactly as add_fp32_widen does.
+  auto add_fp32_values = [&](std::string container_name, std::vector<int64_t> shape,
+                             const std::vector<float>* values) {
+    int64_t n = 1;
+    for (int64_t d : shape) n *= d;
+    if (n != static_cast<int64_t>(values->size()))
+      throw std::logic_error("add_fp32_values: shape/value count mismatch for " + container_name);
+    shape.push_back(4);
+    plan_jobs.push_back([&writer, container_name, shape, n]() {
+      writer.Plan(container_name, shape, static_cast<uint64_t>(n) * 4);
+    });
+    emit_jobs.push_back([&writer, container_name, values]() {
+      auto bytes = r4dx_convert::EncodeFp32(*values);
       writer.WriteTensor(container_name, bytes.data(), bytes.size());
     });
   };
@@ -739,20 +1104,31 @@ int RunConvert(const AppArgs& args) {
   // only fusion and both halves share K), so one length-K importance vector -- and one K x K Hessian
   // -- per container base is well defined; tools/reference/imatrix_capture.py and
   // hessian_capture.py assert the same thing from the other side.
-  auto emit_linear = [&writer, &imatrix, &ldlq, quant_mode, threads](
+  //
+  // `w` arrives ALREADY folded by --rotate (the caller did it); `fold` / `norm` only say how this
+  // linear's input basis changed, so the imatrix vector and the LDLQ Hessian can follow it. With
+  // `fold.kind == kNone` (always, without --rotate) both paths are exactly the pre-rotation code.
+  auto emit_linear = [&writer, &imatrix, &ldlq, &rot, quant_mode, threads](
                          const std::string& container_base, const std::vector<float>& w, int64_t N,
-                         int64_t K, const LayoutSet& ls, bool use_ldlq) {
+                         int64_t K, const LayoutSet& ls, bool use_ldlq, const LinearFold& fold,
+                         const std::vector<float>& norm) {
     if (!use_ldlq) {
+      r4dx_convert::QuantOptions opts = imatrix.For(container_base, K);
+      std::vector<float> rotated_importance;  // must outlive EmitLinearLayouts (opts points at it)
+      if (fold.RotatesInput() && !opts.importance.empty()) {
+        rotated_importance = rot.Importance(fold, norm, opts.importance, K);
+        opts.importance.data = rotated_importance.data();
+      }
       r4dx_convert::EmitLinearLayouts(writer, container_base, w, static_cast<int>(N),
-                                       static_cast<int>(K), ls, threads,
-                                       imatrix.For(container_base, K));
+                                       static_cast<int>(K), ls, threads, opts);
       return;
     }
     const auto t0 = std::chrono::steady_clock::now();
     bool reused = false;
+    const std::unique_ptr<r4dx_convert::HessianTransform> xf = rot.HessianFor(fold, norm);
     // A reference into the store's one-entry cache: valid until the next Factor() call, which is
     // the next LDLQ'd linear's emit -- i.e. strictly after this EmitLinearLayouts returns.
-    const r4dx_convert::LdlqFactor& f = ldlq.Factor(container_base, K, threads, &reused);
+    const r4dx_convert::LdlqFactor& f = ldlq.Factor(container_base, K, threads, &reused, xf.get());
     const auto t1 = std::chrono::steady_clock::now();
     r4dx_convert::QuantOptions opts;
     opts.mode = quant_mode;  // ignored once opts.ldlq is set; kept so the struct reads truthfully
@@ -764,8 +1140,10 @@ int RunConvert(const AppArgs& args) {
                 std::cout);
   };
 
+  // `fold` is what --rotate does to this linear (RotationSource::In / Out); the default, kNone, is
+  // what every call outside the text-layer loop -- and every call without --rotate -- gets.
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
-                         LayoutSet requested) {
+                         LayoutSet requested, LinearFold fold = LinearFold{}) {
     // --keep-bf16 and --ldlq decide per container base name, which is known here -- so plan and
     // emit cannot disagree about what this linear is (the two lambdas below capture the SAME
     // resolved `ls` / `use_ldlq`, rather than each re-evaluating a regex). --keep-bf16 wins: a kept
@@ -775,14 +1153,15 @@ int RunConvert(const AppArgs& args) {
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
     const bool use_ldlq = ldlq_matched && HasQuantizedLayout(ls);
-    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, hf_names, container_base, ls,
-                          requested, kept, ldlq_matched, use_ldlq]() {
+    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, hf_names, container_base, ls,
+                          requested, kept, ldlq_matched, use_ldlq, fold]() {
       int64_t N = 0, K = 0;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
         N += m.shape[0];
         K = m.shape[1];
       }
+      rot.CheckPlan(fold, container_base, N, K, model);
       if (kept) {
         keep_bf16.Record(container_base, static_cast<int>(N), static_cast<int>(K), requested,
                          std::cout);
@@ -795,7 +1174,8 @@ int RunConvert(const AppArgs& args) {
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
     });
-    emit_jobs.push_back([&model, &emit_linear, hf_names, container_base, ls, use_ldlq]() {
+    emit_jobs.push_back([&model, &emit_linear, &rot, hf_names, container_base, ls, use_ldlq, fold,
+                         threads]() {
       std::vector<float> w;
       int64_t K = 0;
       for (auto& n : hf_names) {
@@ -804,55 +1184,89 @@ int RunConvert(const AppArgs& args) {
         w.insert(w.end(), part.begin(), part.end());
       }
       const int64_t N = static_cast<int64_t>(w.size()) / K;
-      emit_linear(container_base, w, N, K, ls, use_ldlq);
+      // The fold is per ROW on the K side (in-projections, the q2ab Hadamard) and per COLUMN on the
+      // N side (out-projections), so the output-axis fusions -- mlp.gate_up's gate|up rows, attn.qg's
+      // per-head query/gate interleave -- need no special case. Every layout of this linear,
+      // --keep-bf16's bf16-only one included, is then produced from the folded fp32.
+      const std::vector<float> norm = rot.ReadNorm(fold, model);
+      rot.Fold(fold, norm, w, N, K, threads);
+      emit_linear(container_base, w, N, K, ls, use_ldlq, fold, norm);
     });
   };
 
   for (int i = 0; i < layers; ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
-    add_bf16(hf + "input_layernorm.weight", base + "input_layernorm");
-    add_bf16(hf + "post_attention_layernorm.weight", base + "post_attention_layernorm");
+    // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
+    // mixer in-projections, post_attention_layernorm's into mlp.gate_up, and Q^T (plus, for q2ab,
+    // the per-site Hadamard) into the three out-projections. Plain variables on purpose -- see
+    // LinearFold.
+    const LinearFold mixer_in_fold = rot.In(hf + "input_layernorm.weight");
+    const LinearFold mlp_in_fold = rot.In(hf + "post_attention_layernorm.weight");
+    const LinearFold o_fold = rot.Out(HadSite::kO);
+    const LinearFold gdn_out_fold = rot.Out(HadSite::kGdnOut);
+    const LinearFold down_fold = rot.Out(HadSite::kDown);
+    add_norm(hf + "input_layernorm.weight", base + "input_layernorm");
+    add_norm(hf + "post_attention_layernorm.weight", base + "post_attention_layernorm");
 
     if (layer_types.at(i) == "full_attention") {
       // q_proj is already the fused query+output-gate matrix in this checkpoint (HF's
       // Qwen3_5Attention builds it as Linear(hidden, num_heads*head_dim*2)); attn.qg is a direct
       // copy/quantize of it, no fusion needed at convert time.
-      add_linear({hf + "self_attn.q_proj.weight"}, base + "attn.qg", layouts);
+      add_linear({hf + "self_attn.q_proj.weight"}, base + "attn.qg", layouts, mixer_in_fold);
       // attn.k/v (R1, docs/r9700.md): join the quantized-linear family -- 1024x5120 x16 layers,
       // 0.336 GB/token, previously forced bf16 regardless of --layout. Same LayoutSet as every
       // other body linear, so a run without --layouts w4a16 (say) simply omits that variant here
       // too, exactly like attn.qg/o already do.
-      add_linear({hf + "self_attn.k_proj.weight"}, base + "attn.k", layouts);
-      add_linear({hf + "self_attn.v_proj.weight"}, base + "attn.v", layouts);
-      add_linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", layouts);
+      add_linear({hf + "self_attn.k_proj.weight"}, base + "attn.k", layouts, mixer_in_fold);
+      add_linear({hf + "self_attn.v_proj.weight"}, base + "attn.v", layouts, mixer_in_fold);
+      add_linear({hf + "self_attn.o_proj.weight"}, base + "attn.o", layouts, o_fold);
       add_bf16(hf + "self_attn.q_norm.weight", base + "attn.q_norm");
       add_bf16(hf + "self_attn.k_norm.weight", base + "attn.k_norm");
       add_descale(base + "attn.k_descale", kv_heads, i, "k", /*calib_applicable=*/true);
       add_descale(base + "attn.v_descale", kv_heads, i, "v", /*calib_applicable=*/true);
     } else {
-      add_linear({hf + "linear_attn.in_proj_qkv.weight"}, base + "gdn.in_proj_qkv", layouts);
+      add_linear({hf + "linear_attn.in_proj_qkv.weight"}, base + "gdn.in_proj_qkv", layouts,
+                 mixer_in_fold);
       // gdn.in_proj_z (R1, docs/r9700.md): joins the quantized-linear family -- 6144x5120 x48
       // layers, 3.02 GB/token, the single largest bf16-only tensor in the model (more bytes/token
       // than the entire quantized GDN weight set combined). in_proj_a/in_proj_b stay bf16 (too
       // small to matter, feed the decay path).
-      add_linear({hf + "linear_attn.in_proj_z.weight"}, base + "gdn.in_proj_z", layouts);
-      add_bf16(hf + "linear_attn.in_proj_b.weight", base + "gdn.in_proj_b");
-      add_bf16(hf + "linear_attn.in_proj_a.weight", base + "gdn.in_proj_a");
+      add_linear({hf + "linear_attn.in_proj_z.weight"}, base + "gdn.in_proj_z", layouts,
+                 mixer_in_fold);
+      add_bf16_linear(hf + "linear_attn.in_proj_b.weight", base + "gdn.in_proj_b", mixer_in_fold);
+      add_bf16_linear(hf + "linear_attn.in_proj_a.weight", base + "gdn.in_proj_a", mixer_in_fold);
       add_bf16(hf + "linear_attn.conv1d.weight", base + "gdn.conv1d_weight");
       add_fp32_widen(hf + "linear_attn.A_log", base + "gdn.A_log");
       add_fp32_widen(hf + "linear_attn.dt_bias", base + "gdn.dt_bias");
       add_bf16(hf + "linear_attn.norm.weight", base + "gdn.norm_weight");
-      add_linear({hf + "linear_attn.out_proj.weight"}, base + "gdn.out_proj", layouts);
+      add_linear({hf + "linear_attn.out_proj.weight"}, base + "gdn.out_proj", layouts,
+                 gdn_out_fold);
     }
     add_linear({hf + "mlp.gate_proj.weight", hf + "mlp.up_proj.weight"}, base + "mlp.gate_up",
-                layouts);
-    add_linear({hf + "mlp.down_proj.weight"}, base + "mlp.down", layouts);
+                layouts, mlp_in_fold);
+    add_linear({hf + "mlp.down_proj.weight"}, base + "mlp.down", layouts, down_fold);
   }
 
+  // Everything from here on is outside the rotated stack and is never folded: the runtime applies
+  // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
   add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
   add_bf16("model.language_model.norm.weight", "text.final_norm");
   add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
+
+  // --rotate: the transforms themselves, fp32, exactly the values every fold above used (the runtime
+  // reads these; it never regenerates them from the seed). No .{layout} suffix, like every other
+  // single-layout tensor. Written only when rotated -- an unrotated container has none of them.
+  if (rot.Enabled()) {
+    const r4dx_convert::RotationSet& rs = rot.Set();
+    add_fp32_values("rotation.signs", {rs.q.hidden}, &rs.q.signs);
+    add_fp32_values("rotation.mix5", {rs.q.nblk, rs.q.nblk}, &rs.q.mix);
+    if (rot.Hadamard()) {
+      add_fp32_values("rotation.had_down_signs", {rs.had_down.K}, &rs.had_down.signs);
+      add_fp32_values("rotation.had_o_signs", {rs.had_o.K}, &rs.had_o.signs);
+      add_fp32_values("rotation.had_gdn_out_signs", {rs.had_gdn_out.K}, &rs.had_gdn_out.signs);
+    }
+  }
 
   if (do_vision) {
     for (const auto& name : model.AllNames()) {
@@ -977,8 +1391,10 @@ int RunConvert(const AppArgs& args) {
         // `mtp.draft_head.lm_head` only under --draft-head, and without that key this falls back to
         // unweighted MSE (with the usual warning) rather than silently mis-weighting. (Same rule
         // for its Hessian under --ldlq, see above.)
+        // Never folded by --rotate: it reads the MTP head's own (un-rotated) hidden.
         emit_linear("mtp.draft_head.lm_head", sliced, static_cast<int64_t>(draft_ids.size()),
-                    hidden_k, draft_head_layouts, draft_head_ldlq);
+                    hidden_k, draft_head_layouts, draft_head_ldlq, LinearFold{},
+                    std::vector<float>{});
         writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
       });
     }
@@ -1020,6 +1436,15 @@ int RunConvert(const AppArgs& args) {
       {"mtp.draft_head.vocab_ids", "raw int32[draft_vocab_size] (OPTIONAL, same condition)"},
       {"lm_head", "mxfp4|w4a16|w4a8|bf16 (all four present)"},
   };
+  // --rotate: every key below is written ONLY for a rotated container, so an unrotated one keeps
+  // exactly the header bytes it had before the flag existed.
+  if (rot.Enabled()) {
+    metadata["quant_summary"]["text.layers.*.input_layernorm|post_attention_layernorm"] =
+        "bf16 zeros: rotated container, (1 + w) folded into the next linear (__metadata__.rotation)";
+    metadata["quant_summary"]["rotation.*"] =
+        "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
+    metadata["rotation"] = rot.Metadata();
+  }
   metadata["quant"] = BuildQuantMetadata();
   metadata["model_config"] = config;
   metadata["r4dx_convert_run"] = {
@@ -1057,6 +1482,14 @@ int RunConvert(const AppArgs& args) {
        ldlq.Enabled() ? ldlq.ManifestSha256() : std::string("none")},
       {"ldlq_linears", ldlq.Linears()},
   };
+  if (rot.Enabled()) {
+    metadata["r4dx_convert_run"]["rotate"] = rot.KindName();
+    metadata["r4dx_convert_run"]["rotation_seed"] = rot.Seed();
+    // How an --imatrix vector reached a rotated linear (rotation.hpp): not diag(H'), which the
+    // vector cannot give, but the diagonal model carried into the new basis.
+    if (!args.imatrix.empty())
+      metadata["r4dx_convert_run"]["imatrix_rotated"] = "diagonal model: (M o M)^T v";
+  }
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
             << writer.PlannedDataBytes() << " data bytes\n";
@@ -1065,6 +1498,7 @@ int RunConvert(const AppArgs& args) {
   writer.Finish();
   imatrix.ReportCoverage();
   ldlq.ReportRun(std::cout);
+  rot.ReportRun(std::cout);
 
   const auto t1 = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(t1 - t0).count();

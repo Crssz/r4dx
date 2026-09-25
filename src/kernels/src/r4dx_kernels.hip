@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,7 @@
 #include "r4d.h"  // third_party/libr4d: r4d_dflash_conv_t2_g16_bf16 (the DFlash2 conv wrapper below)
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "r4dx/kernels/hadamard_device.h"  // FwhtLds for r4dx_silu_mul_hadamard_bf16
 #include "r4dx/kernels/kernels.h"
 
 using r4dx::core::FloatToFp8E4M3;
@@ -453,6 +455,81 @@ __global__ __launch_bounds__(kThreads) void SiluMulKernel(
 
   if (epilogue != r4dx_epilogue_none) {
     __syncthreads();  // see RmsNormKernel's identical comment -- outr[] must be fully visible.
+    void* eo = static_cast<uint8_t*>(epilogue_out) +
+               static_cast<size_t>(row) * intermediate * (epilogue == r4dx_epilogue_f16 ? 2 : 1);
+    float* es = epilogue_scale + row;
+    ApplyEpilogueRow(outr, epilogue, eo, es, intermediate);
+  }
+}
+
+// ---- silu_mul + blockwise Hadamard (quant2 Q2b, kernels.h r4dx_silu_mul_hadamard_bf16) ----------
+// Two launch shapes over the same per-element math, so the bf16 output is bit-identical between
+// them: each element is g*Sigmoid(g)*u*s[k] in fp32 (as SiluMulKernel, minus its bf16 rounding),
+// the same FwhtLds butterflies over its block, one multiply by `scale`, one __float2bfloat16.
+constexpr int kSiluHadMaxBlock = 1024;  // Hb block limit (LDS floats in the per-block kernel)
+constexpr int kSiluHadChunk = 4096;     // per-row kernel: LDS floats per chunk of whole blocks
+
+// Epilogue none / f16: one workgroup per (row, block), grid = dim3(rows, intermediate / block). At
+// decode (rows = 1) that is intermediate/block workgroups instead of SiluMulKernel's one -- the
+// parallelism loss linear.cpp's EpilogueForLayout comment measured for a one-workgroup-per-row
+// shape does not apply. f16 is elementwise, so it is done per block right here, from the same bf16
+// value just stored (byte-identical to ApplyEpilogueRow's f16 branch).
+__global__ __launch_bounds__(256) void SiluMulHadamardBlockKernel(
+    const __hip_bfloat16* __restrict__ gate_up, __hip_bfloat16* __restrict__ out,
+    int64_t intermediate, int64_t in_row_stride, const float* __restrict__ signs, int block,
+    int log2_block, float scale, int epilogue, void* __restrict__ epilogue_out) {
+  __shared__ float v[kSiluHadMaxBlock];
+  const int64_t row = blockIdx.x;
+  const int64_t k0 = static_cast<int64_t>(blockIdx.y) * block;
+  const __hip_bfloat16* g = gate_up + row * in_row_stride + k0;
+  const __hip_bfloat16* u = g + intermediate;
+  const float* s = signs + k0;
+  for (int i = threadIdx.x; i < block; i += blockDim.x) {
+    const float gv = __bfloat162float(g[i]);
+    const float uv = __bfloat162float(u[i]);
+    v[i] = gv * Sigmoid(gv) * uv * s[i];
+  }
+  __syncthreads();
+  r4dx::kernels::hadamard::FwhtLds(v, block, log2_block);
+  __hip_bfloat16* outr = out + row * intermediate + k0;
+  uint16_t* out16 = (epilogue == r4dx_epilogue_f16)
+                        ? reinterpret_cast<uint16_t*>(epilogue_out) + row * intermediate + k0
+                        : nullptr;
+  for (int i = threadIdx.x; i < block; i += blockDim.x) {
+    const __hip_bfloat16 o = __float2bfloat16(v[i] * scale);
+    outr[i] = o;
+    if (out16 != nullptr) out16[i] = FloatToF16(__bfloat162float(o));
+  }
+}
+
+// Epilogue fp8 / int8 (per-row absmax scale): one workgroup per row. A whole fp32 row does not fit
+// in LDS (17408 * 4 = 68 KB > 64 KB), so the row goes through in chunks of whole blocks
+// (`chunk` floats, a multiple of block, <= kSiluHadChunk), then the barrier + ApplyEpilogueRow
+// re-read of the rotated bf16 row, exactly as SiluMulKernel's own epilogue.
+__global__ __launch_bounds__(kThreads) void SiluMulHadamardRowKernel(
+    const __hip_bfloat16* __restrict__ gate_up, __hip_bfloat16* __restrict__ out,
+    int64_t intermediate, int64_t in_row_stride, const float* __restrict__ signs, int log2_block,
+    int chunk, float scale, int epilogue, void* __restrict__ epilogue_out,
+    float* __restrict__ epilogue_scale) {
+  __shared__ float v[kSiluHadChunk];
+  const int64_t row = blockIdx.x;
+  const __hip_bfloat16* gu = gate_up + row * in_row_stride;
+  __hip_bfloat16* outr = out + row * intermediate;
+  for (int64_t k0 = 0; k0 < intermediate; k0 += chunk) {
+    const int n = static_cast<int>(intermediate - k0 < chunk ? intermediate - k0 : chunk);
+    for (int i = threadIdx.x; i < n; i += kThreads) {
+      const float gv = __bfloat162float(gu[k0 + i]);
+      const float uv = __bfloat162float(gu[intermediate + k0 + i]);
+      v[i] = gv * Sigmoid(gv) * uv * signs[k0 + i];
+    }
+    __syncthreads();
+    r4dx::kernels::hadamard::FwhtLds(v, n, log2_block);
+    for (int i = threadIdx.x; i < n; i += kThreads) outr[k0 + i] = __float2bfloat16(v[i] * scale);
+    __syncthreads();  // every thread is done reading v[] before the next chunk overwrites it
+  }
+
+  if (epilogue != r4dx_epilogue_none) {
+    // The loop's trailing barrier already orders every thread's outr[] writes before this re-read.
     void* eo = static_cast<uint8_t*>(epilogue_out) +
                static_cast<size_t>(row) * intermediate * (epilogue == r4dx_epilogue_f16 ? 2 : 1);
     float* es = epilogue_scale + row;
@@ -1500,6 +1577,43 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
+void r4dx_silu_mul_hadamard_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
+                                  int64_t in_row_stride, int64_t stream, int epilogue,
+                                  int64_t epilogue_out, int64_t epilogue_scale, int64_t signs,
+                                  int block) {
+  using namespace r4dx::kernels::hadamard;
+  if (!IsPow2(block) || block < 2 || block > kSiluHadMaxBlock) {
+    throw std::runtime_error("r4dx_silu_mul_hadamard_bf16: block must be a power of two in [2, " +
+                             std::to_string(kSiluHadMaxBlock) + "], got " + std::to_string(block));
+  }
+  if (intermediate <= 0 || intermediate % block != 0) {
+    throw std::runtime_error("r4dx_silu_mul_hadamard_bf16: intermediate (" +
+                             std::to_string(intermediate) + ") must be a positive multiple of block (" +
+                             std::to_string(block) + ")");
+  }
+  if (rows <= 0) return;
+  if (signs == 0) throw std::runtime_error("r4dx_silu_mul_hadamard_bf16: signs must be non-null");
+  CheckEpiloguePrecondition(epilogue, intermediate);
+  const int log2_block = Log2Pow2(block);
+  const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(block)));
+  CountLaunches(1);
+  if (epilogue == r4dx_epilogue_none || epilogue == r4dx_epilogue_f16) {
+    hipLaunchKernelGGL(SiluMulHadamardBlockKernel,
+                       dim3(static_cast<unsigned>(rows), static_cast<unsigned>(intermediate / block)),
+                       dim3(ThreadsForBlock(block)), 0, (hipStream_t)stream,
+                       (const __hip_bfloat16*)gate_up, (__hip_bfloat16*)out, intermediate,
+                       in_row_stride, (const float*)signs, block, log2_block, scale, epilogue,
+                       (void*)epilogue_out);
+  } else {
+    const int chunk = (kSiluHadChunk / block) * block;
+    hipLaunchKernelGGL(SiluMulHadamardRowKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads),
+                       0, (hipStream_t)stream, (const __hip_bfloat16*)gate_up, (__hip_bfloat16*)out,
+                       intermediate, in_row_stride, (const float*)signs, log2_block, chunk, scale,
+                       epilogue, (void*)epilogue_out, (float*)epilogue_scale);
+  }
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
 void r4dx_rope_partial_mrope_bf16(int64_t q, int64_t k, int64_t pos_ids, int tokens, int heads_q,
                                    int heads_k, int head_dim, int rotary_dim, float theta,
                                    int64_t stream) {
@@ -1865,5 +1979,7 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
 void r4dx_kernel_launch_counter_reset() { g_launch_count.store(0, std::memory_order_relaxed); }
 
 int64_t r4dx_kernel_launch_counter_get() { return g_launch_count.load(std::memory_order_relaxed); }
+
+void r4dx_kernel_launch_counter_add(int64_t n) { CountLaunches(n); }
 
 }  // extern "C"

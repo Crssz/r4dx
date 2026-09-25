@@ -56,7 +56,8 @@ bool LookupLayerRule(const std::string& s, const ModelConfig& g, ShardRule* rule
   const int64_t attn_out = g.num_attention_heads * g.head_dim;
   const int64_t kv_rows = g.num_key_value_heads * g.head_dim;
   *kind = LayerKind::kAny;
-  if (s == "input_layernorm" || s == "post_attention_layernorm") {
+  if (s == "input_layernorm" || s == "post_attention_layernorm" ||
+      s == "input_layernorm.rotated" || s == "post_attention_layernorm.rotated") {
     *rule = Replicate();
   } else if (s == "mlp.gate_up") {
     *rule = Rows({g.intermediate_size, g.intermediate_size});
@@ -240,6 +241,17 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
     return r;
   }
   if (StartsWith(base, "dflash.")) return Replicate();  // replicated drafter (docs/tp.md 8.2)
+  // quant2 rotation tensors (docs/quant2.md section 3.1, docs/container-format.md "Residual
+  // rotation"). signs/mix5 define Q on the residual stream, which every rank holds in full, so they
+  // replicate. Each q2ab Hadamard sign vector is indexed by the K column of the linear whose input it
+  // rotates, so it splits exactly like that linear's K: one row segment of K single-element rows
+  // gives rank r [r*K/world, K/world), the range RankCols gives the linear's Cols(K) rule.
+  if (base == "rotation.signs" || base == "rotation.mix5") return Replicate();
+  if (base == "rotation.had_down_signs") return Rows({global.intermediate_size});  // mlp.down
+  if (base == "rotation.had_o_signs") {
+    return Rows({global.num_attention_heads * global.head_dim});  // attn.o
+  }
+  if (base == "rotation.had_gdn_out_signs") return Rows({global.ValueDim()});  // gdn.out_proj
   unknown();
   return {};  // unreachable
 }

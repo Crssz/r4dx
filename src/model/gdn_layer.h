@@ -43,6 +43,13 @@ struct GdnLayerParams {
   // num_accepted-1 rather than window index 0 -- see GdnStateManager's file comment and
   // Model::DecodeStepMtpGreedy (model.cpp) for the caller side of this contract.
   const int32_t* num_accepted = nullptr;
+  // quant2 Q2b (docs/quant2.md section 4): non-owning device fp32 [cfg.ValueDim()] (+-1) -- a q2ab
+  // container's rotation.had_gdn_out_signs (this rank's K slice under TP). When non-null, out_proj's
+  // input is rotated in place by the blockwise Hadamard (block = linear_value_head_dim = 128, one
+  // value head per block) after the gated norm, on the prefill and the decode/verify path alike,
+  // because that container's gdn.out_proj was folded W Hb. nullptr (the default) is exactly the
+  // pre-quant2 path; only Model's backbone loops ever set it.
+  const float* out_had_signs = nullptr;
 };
 
 class GdnLayer {

@@ -25,6 +25,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "r4dx/kernels/rotate_residual.h"  // quant2 residual rotation (docs/quant2.md 3.1)
 #include "r4dx/model/attention/attention_layer.hpp"
 #include "r4dx/model/attention/types.hpp"
 #include "tp/tp_vocab.h"  // tensor-parallel vocab-split merges (docs/tp.md 7.3)
@@ -121,6 +122,26 @@ void Model::DetachDflashFeatureCapture() {
   dflash_target_layers_.clear();
   dflash_features_dev_.Resize(0);
   dflash_feature_rows_ = 0;
+}
+
+// quant2 (docs/quant2.md section 3.1 lists every call site and why the list is complete).
+void Model::RotateResidual(uint16_t* x, int64_t rows, bool inverse) {
+  if (!container_.HasRotation() || rows <= 0) return;
+  const RotationWeights& r = container_.Rotation();
+  r4dx_rotate_residual_bf16(reinterpret_cast<int64_t>(x), rows, container_.Config().hidden_size,
+                             reinterpret_cast<int64_t>(r.signs.data()),
+                             reinterpret_cast<int64_t>(r.mix5.data()), inverse ? 1 : 0,
+                             reinterpret_cast<int64_t>(stream_.get()));
+}
+
+Model::BackboneHadSigns Model::HadSigns() const {
+  BackboneHadSigns h;
+  if (!container_.HasRotation() || !container_.Rotation().spec.Hadamard()) return h;
+  const RotationWeights& r = container_.Rotation();
+  h.down = r.had_down_signs.data();
+  h.o = r.had_o_signs.data();
+  h.gdn_out = r.had_gdn_out_signs.data();
+  return h;
 }
 
 namespace {
@@ -701,6 +722,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // the gather, so it is ordered behind it; a no-op (not even a loop iteration) outside a
   // PrefillMultimodal call carrying images.
   SpliceImageEmbeddings(pos_, T, buf_a_.data(), hidden);
+  // quant2 stack entry (docs/quant2.md section 3.1): x <- x Q on every row -- text and spliced image
+  // rows alike -- AFTER the gather and the splice (the embedding table and the vision rows stay
+  // un-rotated; MTP and the DFlash2 drafter read the same table) and before layer 0, whose own input
+  // rmsnorm runs on the rotated rows (normed_in is null below). No-op on an unrotated container.
+  RotateResidual(buf_a_.data(), T, /*inverse=*/false);
 
   // Full-attention layers' positions/slot_mapping (== pos_+t, see model.h) and seqused_k (==
   // pos_+T) are identical for every attention layer in this chunk -- upload them once here rather
@@ -739,6 +765,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const bool bounded = comm_ != nullptr && is_prefill_path && submit_.Active();
   const int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
   if (bounded) submit_.Reset();
+  // quant2 Q2b (docs/quant2.md section 4): all nullptr unless the container is q2ab.
+  const BackboneHadSigns had = HadSigns();
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -776,6 +804,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       p.num_accepted = (!is_prefill_path && draft_window_ > 1 && mtp_num_accepted_valid_)
                             ? mtp_num_accepted_dev_.data()
                             : nullptr;
+      p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -793,6 +822,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       aw.k_norm = lw.attn->k_norm.data();
       aw.k_descale = lw.attn->k_descale.data();
       aw.v_descale = lw.attn->v_descale.data();
+      aw.o_had_signs = had.o;
 
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
@@ -803,7 +833,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       std::swap(cur, other);
     }
 
-    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
+    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
     // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
     // rmsnorm epilogue into it above); next_norm_weight is null for the last layer (Mlp falls
     // back to a plain residual add, and FinalLmHead below applies its own final_norm separately).
@@ -823,6 +853,21 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
+  }
+  // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
+  // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
+  // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
+  // below: MTP's within-chunk PrimeKv (rows 0..T-2), the mtp_seed_hidden_ copy (row T-1, later read
+  // by the next PrimeKv, MtpHead::Draft and DebugSeedHiddenBf16), and FinalLmHead (row T-1).
+  RotateResidual(cur, T, /*inverse=*/true);
+  // The DFlash2 captures above are layer INPUTS, i.e. rotated rows: bring them back to the basis the
+  // drafter's fc was trained in before anything reads them (dflash_observer_, dflash_->
+  // InjectFeatures and DflashFeatureBuffer() below, all after the stream_.Synchronize()). Gated on
+  // exactly the capture's own condition: when this chunk did not capture, the buffer holds an
+  // earlier call's already-derotated rows, which must not be rotated a second time.
+  if (dflash_capture_active) {
+    RotateResidual(dflash_features_dev_.data(),
+                   T * static_cast<int64_t>(dflash_target_layers_.size()), /*inverse=*/true);
   }
   // Rows 0..T-1 of dflash_features_dev_ are this chunk's captured features -- but ONLY if this
   // chunk actually captured. When injection is disabled the buffer still holds whatever the last
@@ -1395,6 +1440,11 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
                   embed_staging_, buf_a_);
     }
   });
+  // quant2 stack entry, as RunChunk's (docs/quant2.md section 3.1) -- its own span, and none at all
+  // on an unrotated container, so that profile keeps exactly its pre-quant2 entries.
+  if (container_.HasRotation()) {
+    acc.Add(s, "rotate.entry", [&] { RotateResidual(buf_a_.data(), 1, /*inverse=*/false); });
+  }
 
   std::vector<int32_t> positions_h = {static_cast<int32_t>(pos_)};
   attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
@@ -1406,6 +1456,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   uint16_t* other = buf_b_.data();
   const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
   int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
+  const BackboneHadSigns had = HadSigns();  // quant2 Q2b, see RunChunk's identical pattern
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -1431,6 +1482,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       // round's real num_accepted, silently profiling the wrong GDN window.
       p.num_accepted =
           (draft_window_ > 1 && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data() : nullptr;
+      p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                     cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -1448,6 +1500,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       aw.k_norm = lw.attn->k_norm.data();
       aw.k_descale = lw.attn->k_descale.data();
       aw.v_descale = lw.attn->v_descale.data();
+      aw.o_had_signs = had.o;
 
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)], 1,
                     static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s,
@@ -1458,7 +1511,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
     }
 
     {
-      Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
+      Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
       mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
                   has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                   has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
@@ -1471,6 +1524,10 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
+  }
+  // quant2 stack exit, as RunChunk's (docs/quant2.md section 3.1): before final_norm.
+  if (container_.HasRotation()) {
+    acc.Add(s, "rotate.exit", [&] { RotateResidual(cur, 1, /*inverse=*/true); });
   }
 
   acc.Add(s, "final_norm+lm_head (full-vocab GEMM + widen)", [&] {
@@ -1545,6 +1602,11 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                     embed_staging_, buf_a_);
       }
     });
+    // quant2 stack entry, per chunk (docs/quant2.md section 3.1): required for correctness, not just
+    // for the profile -- the KV/GDN state this chunk writes is what later decode steps read.
+    if (container_.HasRotation()) {
+      acc.Add(s, "rotate.entry", [&] { RotateResidual(buf_a_.data(), T, /*inverse=*/false); });
+    }
 
     std::vector<int32_t> positions_h(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
@@ -1559,6 +1621,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     uint16_t* other = buf_b_.data();
     const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern
     int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
+    const BackboneHadSigns had = HadSigns();  // quant2 Q2b, see RunChunk's identical pattern
 
     for (int64_t i = 0; i < num_layers; ++i) {
       const LayerWeights& lw = container_.Layer(i);
@@ -1571,6 +1634,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         p.slot = gdn_states_[static_cast<size_t>(i)]->SlotForSeq(0);
         p.is_prefill = true;
         p.has_init = has_init;
+        p.out_had_signs = had.gdn_out;
         layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                       cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
                       normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -1588,6 +1652,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         aw.k_norm = lw.attn->k_norm.data();
         aw.k_descale = lw.attn->k_descale.data();
         aw.v_descale = lw.attn->v_descale.data();
+        aw.o_had_signs = had.o;
 
         layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                       static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
@@ -1606,7 +1671,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         // recomputed its own rmsnorm from scratch here instead of consuming the fused one,
         // reporting a spurious "mlp.rmsnorm" launch --profile-prefill's own table showed once per
         // chunk that RunChunk never issues).
-        Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
+        Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
         mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                     has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                     has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
@@ -1619,6 +1684,11 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
       normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
       arena_.Reset();
+    }
+    // quant2 stack exit (docs/quant2.md section 3.1): nothing reads the residual on this diagnostic
+    // path, but the profile should carry RunChunk's real per-chunk cost.
+    if (container_.HasRotation()) {
+      acc.Add(s, "rotate.exit", [&] { RotateResidual(cur, T, /*inverse=*/true); });
     }
 
     // Diagnostic-only (see model.h's doc comment): no final_norm/lm_head, no MTP KV priming --
@@ -1700,6 +1770,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, candidates,
                 embed_staging_, buf_a_);
   }
+  // quant2 stack entry, as RunChunk's (docs/quant2.md section 3.1). No image splice here: candidate
+  // rows always come after the prompt.
+  RotateResidual(buf_a_.data(), T, /*inverse=*/false);
 
   // Same reasoning/hazard as RunChunk's own upload (model.cpp's RunChunk comment): safe here
   // because the previous call (Prefill/DecodeStep*/VerifyWindow) always ends with
@@ -1720,6 +1793,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   uint16_t* other = buf_b_.data();
   const uint16_t* normed_in = nullptr;  // R3 fusion, see RunChunk's identical pattern above
   int normed_in_epilogue = r4dx_epilogue_none;  // R2/P2, see RunChunk's identical pattern
+  const BackboneHadSigns had = HadSigns();  // quant2 Q2b, see RunChunk's identical pattern
 
   for (int64_t i = 0; i < num_layers; ++i) {
     const LayerWeights& lw = container_.Layer(i);
@@ -1739,6 +1813,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       p.is_prefill = false;
       p.has_init = has_init;
       p.num_accepted = num_accepted_ptr;
+      p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -1756,6 +1831,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       aw.k_norm = lw.attn->k_norm.data();
       aw.k_descale = lw.attn->k_descale.data();
       aw.v_descale = lw.attn->v_descale.data();
+      aw.o_had_signs = had.o;
 
       // Note: this call unconditionally writes K/V for every one of the T candidate positions into
       // the paged cache BEFORE the attention math runs (AttentionLayer::Forward's own doc comment),
@@ -1773,7 +1849,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       std::swap(cur, other);
     }
 
-    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_);
+    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
@@ -1785,6 +1861,17 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
 
     arena_.Reset();
+  }
+  // quant2 stack exit, as RunChunk's (docs/quant2.md section 3.1): all T rows, before FinalLmHead
+  // (every row) and before mtp_last_hidden_ = cur below, which DecodeStepMtpImpl copies into
+  // mtp_seed_hidden_.
+  RotateResidual(cur, T, /*inverse=*/true);
+  // This window's DFlash2 captures, back to the drafter's basis. The capture above is NOT gated on
+  // dflash_injection_enabled_ (unlike RunChunk's), so neither is this: exactly the capture's own
+  // condition, a non-empty target layer list.
+  if (!dflash_target_layers_.empty()) {
+    RotateResidual(dflash_features_dev_.data(),
+                   T * static_cast<int64_t>(dflash_target_layers_.size()), /*inverse=*/true);
   }
   if (!dflash_target_layers_.empty()) dflash_feature_rows_ = T;
 

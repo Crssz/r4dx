@@ -26,9 +26,20 @@ class Mlp {
   // row-parallel down projection's output across tensor-parallel ranks before the residual add,
   // and `cfg` is the RANK's config (intermediate_size halved). nullptr (TP=1) is exactly the pre-TP
   // code path.
+  // `down_had_signs` (quant2 Q2b, docs/quant2.md section 4): non-owning device fp32
+  // [cfg.intermediate_size] (+-1) -- a q2ab container's rotation.had_down_signs (this rank's K slice
+  // under TP). When non-null, silu_mul also applies mlp.down's online blockwise Hadamard (block
+  // kHadDownBlock = 512) in the same launch, because that container's mlp.down was folded W Hb.
+  // nullptr (the default: an unrotated or q2a container, the MTP head, every test) is exactly the
+  // plain silu_mul path. Deliberately per-construction data, not a Container-wide flag this class
+  // reads: MtpHead reuses Mlp on its never-rotated weights.
   Mlp(const ModelConfig& cfg, const core::DeviceBuffer<uint16_t>& post_attention_layernorm,
-      const MlpWeights& w, core::TpComm* comm = nullptr)
-      : cfg_(cfg), post_attention_layernorm_(post_attention_layernorm), w_(w), comm_(comm) {}
+      const MlpWeights& w, core::TpComm* comm = nullptr, const float* down_had_signs = nullptr)
+      : cfg_(cfg),
+        post_attention_layernorm_(post_attention_layernorm),
+        w_(w),
+        comm_(comm),
+        down_had_signs_(down_had_signs) {}
 
   // x: device bf16 [T, hidden] -- current residual stream. x_out: device bf16 [T, hidden], may
   // alias x.
@@ -68,6 +79,7 @@ class Mlp {
   const core::DeviceBuffer<uint16_t>& post_attention_layernorm_;
   const MlpWeights& w_;
   core::TpComm* comm_ = nullptr;
+  const float* down_had_signs_ = nullptr;
 };
 
 }  // namespace r4dx::model

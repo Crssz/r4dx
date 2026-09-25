@@ -284,10 +284,19 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             #pragma unroll
             for (int e = 1; e < 8; ++e) smax = fmaxf(smax, sc[e]);
 
-            if (wave_any(smax > m_ref + PGROW)) {
+            // The rescale is decided per ROW (lanes c and c+16 hold its two halves), not per wave.
+            // A wave's 16 rows are one position's heads (plus duplicates of them) at q_len=1 but
+            // heads of 2-3 positions in a verify window, so a wave-wide decision let one position's
+            // jump past GROW rescale another position's rows too -- which their own q_len=1 step
+            // never does, and moving m_ref by a non-integer amount rounds P and acc differently. A
+            // row that did not trigger keeps its m_ref and is scaled by exactly 1. (At q_len=1 this
+            // also drops a position's sympathetic rescales of its other heads: the same softmax.)
+            const uint32_t grows = (uint32_t)wave_any(smax > m_ref + PGROW);
+            if (grows) {
+                const bool  grow  = ((grows | (grows >> 16)) >> c) & 1u;
                 const float rmax  = fmaxf(smax, swap16(smax));
-                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
-                const float alpha = ex2(m_ref - mnew);
+                const float mnew  = grow ? fmaxf(fmaxf(m_ref, rmax), -3.0e38f) : m_ref;
+                const float alpha = grow ? ex2(m_ref - mnew) : 1.0f;
                 #pragma unroll
                 for (int dt = 0; dt < NKS; ++dt)
                     #pragma unroll
@@ -399,7 +408,15 @@ void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
     // segment count below would divide by zero, so leave zeros and stop. `ctx` is block-uniform,
     // so every thread takes this branch together and the barriers further down stay matched.
     if (ctx <= 0) { ((uint16_t*)a.out)[(size_t)job * HEAD_DIM + d] = 0; return; }
-    const int u = r4d_attn_used(ctx, tile, splits);
+    // u counts the segments holding any of THIS row's keys, not the block's. A verify window's
+    // earlier rows see fewer tiles than ctx (its last row's), and the segments past their own are
+    // fully masked for them (weight 0) -- but the CHAINS split below assigns segments to chains by
+    // u, so merging over the block's u rounds such a row differently from the q_len=1 launch at its
+    // own position. With the row's own count every segment lands in the chain that launch puts it
+    // in. At q_len=1 this is r4d_attn_used(ctx).
+    const int qrow = tok - seq * a.q_len;
+    const int rtps = r4d_attn_tps(ctx, tile, splits);
+    const int u = (r4d_attn_tiles(ctx - a.q_len + 1 + qrow, tile) + rtps - 1) / rtps;
     const size_t nrow = (size_t)a.num_seqs * a.q_len * a.q_heads * splits;
     const size_t base = (size_t)job * splits;
 

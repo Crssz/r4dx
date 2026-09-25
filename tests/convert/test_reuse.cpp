@@ -10,7 +10,9 @@
 //
 //   (0) the library pieces: Sha256File against the FIPS vector and against Sha256Hex across its read
 //       buffer; Sha256Files (order, missing file); ContainerDataSha256; CpuIdentity;
-//       ReuseGuardMismatches (the completion fields ignored, changed / absent fields named);
+//       ReuseGuardMismatches (the completion fields and the per-linear record ignored, changed /
+//       absent fields named); LayoutSetId / ParseLayoutSetId (round trip, every non-canonical
+//       spelling refused) and LinearLayoutTensorNames == what PlanLinearLayouts plans;
 //       ContainerWriter::WriteTensorChunked, ReadBackDigests (another handle while the writer holds
 //       the file), HeaderOccurrences, PatchHeader, Close. Prints the sha256 throughput (the 27B
 //       checkpoint's 55.6 GB are hashed one shard per worker).
@@ -30,12 +32,16 @@
 //       nothing; a moved (copied) checkpoint and another --threads are accepted.
 //   (c) the guard: every real flag / input file / checkpoint file / binary difference is refused
 //       before an output file exists, naming its reuse_guard field; every leaf of a recorded guard,
-//       changed in a copy of the baseline, is refused naming that leaf; so are an unfinished
+//       changed in a copy of the baseline, is refused naming that leaf (the per-linear record
+//       reuse_guard.linears included); so are an unfinished
 //       baseline (emit_complete 0), one without a guard, a truncated one, one whose data does not
 //       hash to its data_sha256 (placeholder, another digest, the second half zeroed at full length,
 //       one bit flipped), one whose header is not JSON, --output == the baseline (which stays
 //       untouched), a missing file, a quant block from another build, a group map naming an unknown
-//       linear or disagreeing with the tensors, and a tensor directory with a tensor missing, an
+//       linear or disagreeing with the per-linear record, a keep list disagreeing with it, a record
+//       without `linears`, naming a linear this run does not write or missing one, a valid record
+//       that names tensors the baseline does not have (with and without a matching group map), and a
+//       tensor directory with a tensor missing, an
 //       extra one or another shape (with a digest recomputed for it, so PlanReuse is what refuses);
 //       --reuse-tensors-from with --selftest is an argument error.
 //   (d) LDLQ + rotation: --rotate q2ab --ldlq ".*" against synthetic Hessians (keys + rms_keys):
@@ -46,6 +52,18 @@
 //       the guard hashes all 7 .hess files; a .hess payload edited in place under an unchanged
 //       hessian.json (it passes every Hessian check and changes the mlp.down bytes) is refused by
 //       the guard; two same-K files swapped under it are refused even by a full run (header trace).
+//   (e) --keep-bf16 may differ (docs/quant2.md 5.3): the guard records no keep regex, only each
+//       linear's resolved layout set, and a reuse recomputes the linears whose set differs. On the
+//       sweep recipe: (i) a keep added (layer 0 mlp.down) == its full run, one linear recomputed, the
+//       keep_bf16_extra_bytes delta exact; (ii) a keep removed (attn.v quantized) == its full run, and
+//       the reverse of (i); another spelling of the same keep set recomputes nothing; (iii) a keep plus
+//       a group rule on the same class (keep wins for layer 0) == its full run, from the no-rule
+//       baseline and from full(R); a keep change together with any other difference is still
+//       refused. (iv) on the q2ab + LDLQ fixture: layer 0 mlp.down (Hadamard-folded, K side), layer 1
+//       attn.o (Hadamard) and attn.k (in-projection, shared rms tap) kept in bf16 -- their bf16 bytes
+//       are the folded weights, not the checkpoint's -- reuse == full, and the reverse (un-keeping
+//       them LDLQs exactly those three, attn.k's factor fresh where the full run took it from the
+//       cache) == the no-keep full run.
 //
 // Every file this test writes goes to a fresh directory under %TEMP% (~450 MB, most of it the
 // K = 5120 Hessians) and is removed at the end. `convert_reuse --make-fixture <dir>` writes the
@@ -204,8 +222,10 @@ void TestLibrary() {
     json b = a;
     b["emit_complete"] = 0;
     b["data_sha256"] = ReuseDataPlaceholder();
+    b[kReuseLinearsKey] = {{"text.layers.0.mlp.down", "bf16"}};
     Gate(ReuseGuardMismatches(a, b).empty(),
-         "(0) ReuseGuardMismatches ignores the completion fields (emit_complete, data_sha256)");
+         "(0) ReuseGuardMismatches ignores the completion fields (emit_complete, data_sha256) and the "
+         "per-linear record (linears)");
     b["args"]["quant"] = "rtn";
     b["checkpoint"]["shards"]["m.safetensors"]["sha256"] = "bb";
     std::vector<std::string> d = ReuseGuardMismatches(a, b);
@@ -220,6 +240,61 @@ void TestLibrary() {
     Gate(d.size() == 2 && d[0] == "reuse_guard.args.layers: baseline 2, this run (absent)" &&
              d[1] == "reuse_guard.extra: baseline (absent), this run true",
          "(0) ReuseGuardMismatches names fields present on one side only");
+
+    {
+      // reuse_guard.linears' vocabulary: one canonical string per resolved LayoutSet.
+      LayoutSet q;
+      q.bf16 = false;
+      q.w4a16 = true;
+      LayoutSet v6 = q;
+      v6.w4a8 = v6.mxfp4 = true;
+      v6.w4a16_group = 32;
+      LayoutSet all = v6;
+      all.bf16 = true;
+      all.w4a16_group = 128;
+      LayoutSet none;
+      none.bf16 = false;
+      LayoutSet w8;
+      w8.bf16 = false;
+      w8.w4a8 = true;
+      const std::vector<std::pair<LayoutSet, std::string>> sets = {
+          {KeptBf16LayoutSet(), "bf16"},
+          {q, "w4a16.g" + std::to_string(kW4A16Group)},
+          {v6, "w4a16.g32+w4a8+mxfp4"},
+          {all, "bf16+w4a16.g128+w4a8+mxfp4"},
+          {w8, "w4a8"},
+          {none, "none"}};
+      bool ids = true, names = true;
+      for (const auto& s : sets) {
+        LayoutSet back;
+        ids = ids && LayoutSetId(s.first) == s.second && ParseLayoutSetId(s.second, &back) &&
+              LayoutSetId(back) == s.second && back.bf16 == s.first.bf16 &&
+              back.w4a16 == s.first.w4a16 && back.w4a8 == s.first.w4a8 &&
+              back.mxfp4 == s.first.mxfp4 &&
+              (!back.w4a16 || back.w4a16_group == s.first.w4a16_group);
+        ContainerWriter w;
+        PlanLinearLayouts(w, "x.y", 32, 256, s.first);
+        std::vector<std::string> planned;
+        for (size_t i = 0; i < w.PlannedTensorCount(); ++i) planned.push_back(w.PlannedName(i));
+        names = names && planned == LinearLayoutTensorNames("x.y", s.first);
+      }
+      Gate(ids, "(0) LayoutSetId: bf16 / w4a16.g<default> / w4a16.g32+w4a8+mxfp4 / "
+                "bf16+w4a16.g128+w4a8+mxfp4 / w4a8 / none, and ParseLayoutSetId round-trips each");
+      Gate(names, "(0) LinearLayoutTensorNames == the names PlanLinearLayouts plans, for each set");
+      bool refused = true;
+      std::string accepted;
+      for (const char* bad : {"", "bf16+", "+bf16", "w4a8+bf16", "bf16+bf16", "w4a16.g48",
+                              "w4a16.g064", "w4a16.g", "w4a16", "w4a16.g99999", "fp8", "none+bf16",
+                              "bf16 ", "BF16", "mxfp4+w4a8"}) {
+        LayoutSet ls;
+        if (ParseLayoutSetId(bad, &ls)) {
+          refused = false;
+          accepted += std::string(" '") + bad + "'";
+        }
+      }
+      Gate(refused, "(0) ParseLayoutSetId refuses every non-canonical or unknown spelling" +
+                        (accepted.empty() ? std::string() : " -- accepted:" + accepted));
+    }
 
     const fs::path cp = dir / "c.r4dx";
     std::vector<uint8_t> ta(20);
@@ -913,6 +988,23 @@ void TestExe(const Fixture& f) {
              RunField(b0.c, "/reuse_guard/inputs/hessian_files") == "none",
          "(a) guard v" + std::to_string(kReuseGuardVersion) +
              ": converter.cpu recorded; inputs.hessian_files \"none\" without --ldlq");
+    // The per-linear record: 17 linears (layer 0: 5, layer 1: 6, lm_head, MTP: 4, the draft head),
+    // k/v "bf16" (the recipe's --keep-bf16), R's four at their groups, the rest at the default; the
+    // keep regex's text is not part of the guard.
+    const json lin0 = RunField(b0.c, "/reuse_guard/linears"), linr = RunField(fr.c, "/reuse_guard/linears");
+    const std::string gdef = "w4a16.g" + std::to_string(kW4A16Group);
+    Gate(lin0.is_object() && lin0.size() == 17 && lin0.value("text.layers.1.attn.k", "") == "bf16" &&
+             lin0.value("text.layers.1.attn.v", "") == "bf16" &&
+             lin0.value("text.layers.0.mlp.down", "") == gdef && lin0.value("lm_head", "") == gdef &&
+             lin0.value("mtp.draft_head.lm_head", "") == gdef &&
+             linr.value("text.layers.0.mlp.down", "") == "w4a16.g32" &&
+             linr.value("mtp.mlp.down", "") == "w4a16.g32" &&
+             linr.value("mtp.draft_head.lm_head", "") == "w4a16.g128" &&
+             linr.value("text.layers.0.mlp.gate_up", "") == gdef &&
+             RunField(b0.c, "/reuse_guard/args").is_object() &&
+             !RunField(b0.c, "/reuse_guard/args").contains("keep_bf16"),
+         "(a) reuse_guard.linears records all 17 linears' resolved layout sets (k/v bf16, R's four at "
+         "32 / 128 in full(R)); args has no keep_bf16 -- " + lin0.dump());
   }
   const Result ng = run.Convert("full: no rule, no guard", recipe, noguard);
   {
@@ -981,8 +1073,7 @@ void TestExe(const Fixture& f) {
   run.Refused("without --no-bf16", Without(recipe, "--no-bf16"), from0, "reuse_guard.args.layouts.bf16:");
   run.Refused("--quant rtn (no --imatrix)", Without(With(recipe, "--quant", "rtn"), "--imatrix"), from0,
               "reuse_guard.args.quant:");
-  run.Refused("--keep-bf16 another regex", With(recipe, "--keep-bf16", "\"attn\\.k$\""), from0,
-              "reuse_guard.args.keep_bf16:");
+  // (--keep-bf16 another regex is NOT refused any more: the linears it changes are recomputed -- (e).)
   run.Refused("--ldlq (with --hessian-dir)",
               With(With(recipe, "--hessian-dir", Q(f.hess)), "--ldlq", "\"^text\\.layers\\.0\\.\""), from0,
               "reuse_guard.args.ldlq:");
@@ -1145,24 +1236,210 @@ void TestExe(const Fixture& f) {
     mutated(b0.c, h, "a tensor of another shape", "tensor 'text.final_norm' is U8 [2560,4]");
   }
   {
-    // full(R)'s map entry removed: the map says default, the tensors say g32.
+    // full(R)'s map entry removed: the map says default, the record (and the tensors) say g32.
     json h = fr.c.header;
     h["__metadata__"]["quant"]["w4a16"]["groups"].erase("text.layers.0.mlp.down");
     WriteWithHeader(fr.c, h, mut);
-    run.Refused("group map without a linear the tensors have at g32", recipe,
-                " --reuse-tensors-from " + Q(mut), "text.layers.0.mlp.down.w4a16.wsz");
-    // ... and saying 128 where the tensor is .g32.
+    run.Refused("group map without a linear the record has at g32", recipe,
+                " --reuse-tensors-from " + Q(mut),
+                "quant.w4a16.groups maps 'text.layers.0.mlp.down' to nothing (the default group");
+    // ... and saying 128 where the record (and the tensor) say g32.
     h = fr.c.header;
     h["__metadata__"]["quant"]["w4a16"]["groups"]["text.layers.0.mlp.down"] = 128;
     WriteWithHeader(fr.c, h, mut);
-    run.Refused("group map disagreeing with the scale tensor's group", recipe,
-                " --reuse-tensors-from " + Q(mut), "has no text.layers.0.mlp.down.w4a16.wsz.g128");
+    run.Refused("group map disagreeing with the record's group", recipe,
+                " --reuse-tensors-from " + Q(mut),
+                "maps 'text.layers.0.mlp.down' to group 128 but its reuse_guard.linears records "
+                "\"w4a16.g32\"");
+  }
+  {
+    // The per-linear record itself: missing, naming a linear this run does not write, missing one.
+    json h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"].erase(kReuseLinearsKey);
+    mutated(b0.c, h, "a guard without the per-linear record", "reuse_guard.linears is missing");
+    h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"][kReuseLinearsKey]["text.layers.9.mlp.down"] =
+        "w4a16.g" + std::to_string(kW4A16Group);
+    mutated(b0.c, h, "a record naming a linear this run does not write",
+            "reuse_guard.linears.text.layers.9.mlp.down: baseline");
+    h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"][kReuseLinearsKey].erase("lm_head");
+    mutated(b0.c, h, "a record without one of this run's linears",
+            "reuse_guard.linears.lm_head: baseline (absent)");
+    // The keep list disagreeing with the record (attn.k kept, the record says quantized).
+    h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"][kReuseLinearsKey]["text.layers.1.attn.k"] =
+        "w4a16.g" + std::to_string(kW4A16Group);
+    mutated(b0.c, h, "keep_bf16_linears disagreeing with the record",
+            "keep_bf16_linears lists \"text.layers.1.attn.k\" but its reuse_guard.linears records");
+    // A valid record that lies about an AFFECTED linear (rule R recomputes mlp.down): the baseline's
+    // tensors must be the ones its record names.
+    h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"][kReuseLinearsKey]["text.layers.0.mlp.down"] = "bf16";
+    mutated(b0.c, h, "a record naming tensors the baseline does not have (recomputed linear)",
+            "records 'text.layers.0.mlp.down' as \"bf16\" (reuse_guard.linears) but has no tensor "
+            "'text.layers.0.mlp.down.bf16.w'");
+    // ... and about a COPIED one, group map edited to agree: the directory refuses it.
+    h = b0.c.header;
+    h["__metadata__"]["r4dx_convert_run"]["reuse_guard"][kReuseLinearsKey]["text.layers.0.gdn.in_proj_z"] =
+        "w4a16.g32";
+    h["__metadata__"]["quant"]["w4a16"]["groups"] = {{"text.layers.0.gdn.in_proj_z", 32}};
+    WriteWithHeader(b0.c, h, mut);
+    run.Refused("record + group map both claiming g32 for a g64 linear this run copies", recipe,
+                rule_r + " --w4a16-group-rule \"in_proj_z$=32\" --reuse-tensors-from " + Q(mut),
+                "this run writes 'text.layers.0.gdn.in_proj_z.w4a16.wsz.g32' but the baseline has no "
+                "such tensor");
   }
   {
     const std::string b = ReadWhole(base0);
     WriteWhole(mut, b.substr(0, b.size() - 10));
     run.Refused("truncated baseline", recipe, from_mut, "truncated");
   }
+}
+
+// The container's r4dx_convert_run.keep_bf16_linears as a list (container order).
+std::vector<std::string> KeptList(const Container& c) {
+  std::vector<std::string> v;
+  const json k = RunField(c, "/keep_bf16_linears");
+  if (k.is_array())
+    for (const auto& b : k) v.push_back(b.get<std::string>());
+  return v;
+}
+
+// (e) i-iii: --keep-bf16 differing between the baseline and this run, on the sweep's recipe. Uses
+// (a)'s base0.r4dx (keep k/v, no rule) and full_r.r4dx (keep k/v, rule R) from `root`.
+void TestKeep(const Fixture& f) {
+  std::printf("---- (e) --keep-bf16 differs: reuse == full (sweep recipe) ----\n");
+  const fs::path& root = f.root;
+  Runner run(root);
+  std::string why;
+  const Opts recipe = RecipeOpts(f);
+  const fs::path base0 = root / "base0.r4dx", full_r = root / "full_r.r4dx";
+  const Container b0 = ReadContainer(base0), fr = ReadContainer(full_r);
+  if (!Gate(b0.ok && fr.ok, "(e) (a)'s baseline and full(R) are there")) return;
+  const std::string from0 = " --reuse-tensors-from " + Q(base0);
+  const std::string gdef = "w4a16.g" + std::to_string(kW4A16Group);
+  const std::string l0down = "text.layers.0.mlp.down";
+
+  // (i) A keep added: the recipe's k/v plus layer 0's mlp.down, as ONE merged regex.
+  const Opts k1 = With(recipe, "--keep-bf16", "\"^text\\.layers\\.(?:[0-9]+\\.attn\\.[kv]|0\\.mlp\\.down)$\"");
+  const fs::path full_k1 = root / "full_k1.r4dx";
+  const Result fk1 = run.Convert("full: keep k/v + layer 0 mlp.down, --record-reuse-guard", k1, full_k1,
+                                 " --record-reuse-guard");
+  const Result rk1 = run.Convert("reuse: keep k/v + layer 0 mlp.down from the baseline", k1,
+                                 root / "reuse_k1.r4dx", from0);
+  if (!Gate(fk1.rc == 0 && rk1.rc == 0 && fk1.c.ok && rk1.c.ok, "(e-i) full and reuse exit 0")) {
+    std::printf("%s\n%s\n", fk1.log.c_str(), rk1.log.c_str());
+    return;
+  }
+  {
+    const std::set<std::string> d = DifferingTensors(b0, fk1.c);
+    bool only = !d.empty();
+    for (const auto& t : d) only = only && OwnedBy(t, {l0down});
+    const int64_t nk = kHidden * kInter;
+    const int64_t per = 2 * nk - (nk / 2 + nk / kW4A16Group * 4);
+    Gate(only && d.count(l0down + ".bf16.w") && d.count(l0down + ".w4a16.wq") &&
+             !fk1.c.tensors.count(l0down + ".w4a16.wq") &&
+             KeptList(fk1.c) == std::vector<std::string>{l0down, "text.layers.1.attn.k",
+                                                         "text.layers.1.attn.v"} &&
+             RunField(fk1.c, "/reuse_guard/linears/" + l0down) == "bf16" &&
+             RunField(fk1.c, "/keep_bf16_extra_bytes").get<int64_t>() -
+                     RunField(b0, "/keep_bf16_extra_bytes").get<int64_t>() == per,
+         "(e-i) premise: the added keep changes only layer 0 mlp.down (bf16.w only, no w4a16), the keep "
+         "list gains it, and keep_bf16_extra_bytes grows by exactly 2NK - w4a16(g" +
+             std::to_string(kW4A16Group) + ") = " + std::to_string(per) + " B");
+  }
+  Gate(SameAsFull(rk1.c, fk1.c, &why) && RecomputedSet(rk1.c) == std::set<std::string>{l0down} &&
+           Contains(rk1.log, "reuse: recompute " + l0down + " (baseline " + gdef + " -> bf16)"),
+       "(e-i) a keep added: reuse == full, only layer 0 mlp.down recomputed (" + gdef + " -> bf16)" +
+           (why.empty() ? "" : " -- " + why));
+  why.clear();
+
+  // (ii) A keep removed: only attn.k kept, attn.v quantized (LDLQ-free recipe: search + imatrix).
+  const Opts k2 = With(recipe, "--keep-bf16", "\"^text\\.layers\\.[0-9]+\\.attn\\.k$\"");
+  const Result fk2 = run.Convert("full: keep attn.k only, --record-reuse-guard", k2, root / "full_k2.r4dx",
+                                 " --record-reuse-guard");
+  const Result rk2 = run.Convert("reuse: keep attn.k only from the baseline", k2, root / "reuse_k2.r4dx", from0);
+  Gate(fk2.rc == 0 && rk2.rc == 0 && SameAsFull(rk2.c, fk2.c, &why) &&
+           RecomputedSet(rk2.c) == std::set<std::string>{"text.layers.1.attn.v"} &&
+           fk2.c.tensors.count("text.layers.1.attn.v.w4a16.wq") &&
+           !fk2.c.tensors.count("text.layers.1.attn.v.bf16.w") &&
+           Contains(rk2.log, "reuse: recompute text.layers.1.attn.v (baseline bf16 -> " + gdef + ")"),
+       "(e-ii) a keep removed: reuse == full, only attn.v recomputed (bf16 -> " + gdef + ")" +
+           (why.empty() ? "" : " -- " + why));
+  why.clear();
+  const Result rk0 = run.Convert("reuse: the recipe's keep from full(keep + layer 0 mlp.down)", recipe,
+                                 root / "reuse_k0.r4dx", " --reuse-tensors-from " + Q(full_k1));
+  Gate(rk0.rc == 0 && SameAsFull(rk0.c, b0, &why) && RecomputedSet(rk0.c) == std::set<std::string>{l0down},
+       "(e-ii) reverse of (i): reuse(recipe) from a baseline keeping one more linear == the baseline's "
+       "full run" + (why.empty() ? "" : " -- " + why));
+  why.clear();
+  {
+    // Another spelling of the SAME keep set: nothing to recompute; the header differs from the
+    // baseline's only in the recorded pattern (and reused_from).
+    const std::string alt = "\"attn\\.[kv]$\"";
+    const Result rs = run.Convert("reuse: the same keep set spelled another way", With(recipe, "--keep-bf16", alt),
+                                  root / "reuse_same.r4dx", from0);
+    json h = rs.c.header;
+    bool ok = rs.rc == 0 && rs.c.ok && rs.c.data == b0.data && RecomputedSet(rs.c).empty() &&
+              RunField(rs.c, "/reused_from/tensors_recomputed") == 0 &&
+              RunField(rs.c, "/keep_bf16") == "attn\\.[kv]$";
+    if (ok) {
+      h["__metadata__"]["r4dx_convert_run"].erase("reused_from");
+      h["__metadata__"]["r4dx_convert_run"]["keep_bf16"] = RunField(b0, "/keep_bf16");
+      ok = h.dump() == b0.header_text;
+    }
+    Gate(ok, "(e-ii) another spelling of the same keep set recomputes nothing; data == the baseline's, "
+             "header == the baseline's apart from the pattern text and reused_from");
+  }
+
+  // (iii) A keep and a group rule on the same class: layer 0's mlp.down kept (keep wins over the
+  // rule), layer 1's and the MTP's at 32.
+  const Opts k1r = k1;
+  const std::string rule32 = " --w4a16-group-rule \"mlp\\.down$=32\"";
+  const Result fkr = run.Convert("full: keep + layer 0 mlp.down, mlp.down=32, --record-reuse-guard", k1r,
+                                 root / "full_k1r.r4dx", rule32 + " --record-reuse-guard");
+  const Result rkr0 = run.Convert("reuse: keep + rule from the no-rule baseline", k1r, root / "reuse_k1r0.r4dx",
+                                  rule32 + from0);
+  const Result rkrr = run.Convert("reuse: keep + rule from full(R)", k1r, root / "reuse_k1rr.r4dx",
+                                  rule32 + " --reuse-tensors-from " + Q(full_r));
+  if (!Gate(fkr.rc == 0 && rkr0.rc == 0 && rkrr.rc == 0, "(e-iii) full and both reuses exit 0")) {
+    std::printf("%s\n%s\n%s\n", fkr.log.c_str(), rkr0.log.c_str(), rkrr.log.c_str());
+    return;
+  }
+  Gate(RunField(fkr.c, "/w4a16_groups") == json{{"mtp.mlp.down", 32}, {"text.layers.1.mlp.down", 32}} &&
+           RunField(fkr.c, "/reuse_guard/linears/" + l0down) == "bf16",
+       "(e-iii) premise: keep wins over the rule for layer 0 (bf16, not in the group map); layer 1 and "
+       "the MTP's mlp.down at 32");
+  Gate(SameAsFull(rkr0.c, fkr.c, &why) &&
+           RecomputedSet(rkr0.c) ==
+               std::set<std::string>{l0down, "text.layers.1.mlp.down", "mtp.mlp.down"},
+       "(e-iii) keep + rule from the no-rule baseline == full; the three mlp.down recomputed" +
+           (why.empty() ? "" : " -- " + why));
+  why.clear();
+  Gate(SameAsFull(rkrr.c, fkr.c, &why) &&
+           RecomputedSet(rkrr.c) == std::set<std::string>{l0down, "mtp.draft_head.lm_head"} &&
+           Contains(rkrr.log, "reuse: recompute " + l0down + " (baseline w4a16.g32 -> bf16)") &&
+           Contains(rkrr.log, "reuse: recompute mtp.draft_head.lm_head (baseline w4a16.g128 -> " + gdef + ")"),
+       "(e-iii) keep + rule from full(R) == full: layer 0 mlp.down (g32 -> bf16) and the draft head "
+       "(R's g128 -> default) recomputed, layer 1 / MTP mlp.down (g32 both) copied" +
+           (why.empty() ? "" : " -- " + why));
+  why.clear();
+  // A keep change does not open the guard for anything else.
+  run.Refused("keep change + --quant rtn (no --imatrix)", Without(With(k1, "--quant", "rtn"), "--imatrix"),
+              from0, "reuse_guard.args.quant:");
+  run.Refused("keep change + --kv-calib another file", With(k1, "--kv-calib", Q(f.kv2)), from0,
+              "reuse_guard.inputs.kv_calib_sha256:");
+}
+
+// Raw tensor bytes of the synthetic checkpoint (both shards), by HF name.
+std::map<std::string, std::string> CheckpointTensors(const fs::path& ckpt) {
+  std::map<std::string, std::string> m;
+  for (const char* s : {"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"}) {
+    const Container c = ReadContainer(ckpt / s);
+    m.insert(c.tensors.begin(), c.tensors.end());
+  }
+  return m;
 }
 
 void TestLdlqRotation(const Fixture& f) {
@@ -1278,6 +1555,68 @@ void TestLdlqRotation(const Fixture& f) {
     run.Refused("ldlq: in.rms.hess and mlp_in.rms.hess swapped, hessian.json unchanged (full run)",
                 With(opts, "--hessian-dir", Q(hs)), "", "header says trace=");
   }
+
+  // (e-iv) --keep-bf16 on the rotated q2ab + LDLQ container: layer 0 mlp.down (Q^T W Hb, the down
+  // Hadamard), layer 1 attn.o (Q^T W Hb, the o Hadamard) and attn.k (W diag(1+w) Q, sharing the
+  // input_layernorm rms tap with attn.qg / attn.v) written as bf16 of the folded fp32.
+  std::printf("---- (e-iv) --keep-bf16 differs on q2ab + LDLQ ----\n");
+  const std::set<std::string> kb = {"text.layers.0.mlp.down", "text.layers.1.attn.k",
+                                    "text.layers.1.attn.o"};
+  const Opts ko = With(opts, "--keep-bf16", "\"^text\\.layers\\.(?:0\\.mlp\\.down|1\\.attn\\.[ko])$\"");
+  const fs::path kfp = root / "ldlq_full_keep.r4dx";
+  const Result kf = run.Convert("ldlq full: keep 0.mlp.down + 1.attn.k/o, --record-reuse-guard", ko, kfp,
+                                " --record-reuse-guard");
+  const Result ku = run.Convert("ldlq reuse: the keep from the no-keep baseline", ko,
+                                root / "ldlq_reuse_keep.r4dx", " --reuse-tensors-from " + Q(d0p));
+  const Result kr = run.Convert("ldlq reuse: no keep from full(keep)", opts, root / "ldlq_reuse_unkeep.r4dx",
+                                " --reuse-tensors-from " + Q(kfp));
+  if (!Gate(kf.rc == 0 && ku.rc == 0 && kr.rc == 0 && kf.c.ok && ku.c.ok && kr.c.ok,
+            "(e-iv) full(keep) and both reuses exit 0")) {
+    std::printf("%s\n%s\n%s\n", kf.log.c_str(), ku.log.c_str(), kr.log.c_str());
+    return;
+  }
+  {
+    const std::set<std::string> d = DifferingTensors(d0.c, kf.c);
+    bool only = !d.empty();
+    for (const auto& t : d) only = only && OwnedBy(t, kb);
+    bool bf16_only = true;
+    for (const auto& b : kb)
+      bf16_only = bf16_only && kf.c.tensors.count(b + ".bf16.w") && !kf.c.tensors.count(b + ".w4a16.wq");
+    Gate(only && bf16_only && RunField(kf.c, "/ldlq_linears").size() == 8 &&
+             RunField(kf.c, "/ldlq_rms_linears").size() == 6 && KeptList(kf.c).size() == 3 &&
+             RunField(kf.c, "/reuse_guard/linears/text.layers.1.attn.o") == "bf16" &&
+             RunField(kf.c, "/reuse_guard/inputs/hessian_files") ==
+                 RunField(d0.c, "/reuse_guard/inputs/hessian_files"),
+         "(e-iv) premise: only the three kept linears change (bf16.w only); LDLQ drops them (8 of 11 "
+         "LDLQ'd, 6 against rms Hessians); the guard's .hess set is the same (it follows --ldlq only)");
+    // The kept bf16 is the FOLDED weight, not the checkpoint's bytes: the Hadamard / Q folds ran.
+    const std::map<std::string, std::string> raw = CheckpointTensors(f.ckpt);
+    const std::string& o = kf.c.tensors.at("text.layers.1.attn.o.bf16.w");
+    const std::string& dn = kf.c.tensors.at("text.layers.0.mlp.down.bf16.w");
+    const std::string& k = kf.c.tensors.at("text.layers.1.attn.k.bf16.w");
+    const std::string& o_raw = raw.at(std::string(kL1) + "self_attn.o_proj.weight");
+    const std::string& dn_raw = raw.at(std::string(kL0) + "mlp.down_proj.weight");
+    const std::string& k_raw = raw.at(std::string(kL1) + "self_attn.k_proj.weight");
+    Gate(o.size() == o_raw.size() && o != o_raw && dn.size() == dn_raw.size() && dn != dn_raw &&
+             k.size() == k_raw.size() && k != k_raw,
+         "(e-iv) the kept attn.o / mlp.down / attn.k bf16 are the rotated (folded) weights: same size "
+         "as the checkpoint's, different bytes");
+  }
+  Gate(SameAsFull(ku.c, kf.c, &why) && RecomputedSet(ku.c) == kb &&
+           Contains(ku.log, "ldlq: 0 linear(s) quantized with LDLQ"),
+       "(e-iv) reuse(keep) from the no-keep baseline == full(keep); the three recomputed as bf16, no "
+       "LDLQ" + (why.empty() ? "" : " -- " + why));
+  why.clear();
+  const std::string k_rms = "ldlq: text.layers.1.attn.k [64,5120] rms Hessian in.rms.hess: factor";
+  Gate(SameAsFull(kr.c, d0.c, &why) && RecomputedSet(kr.c) == kb &&
+           Contains(kr.log, "ldlq: 3 linear(s) quantized with LDLQ") &&
+           Contains(LineWith(d0.log, k_rms), "(shared tap, cached)") &&
+           !LineWith(kr.log, k_rms).empty() && !Contains(LineWith(kr.log, k_rms), "cached"),
+       "(e-iv) reverse: un-keeping them from full(keep) == the no-keep full run; exactly those three "
+       "LDLQ'd, attn.k's rms factor fresh (cached in the full run)" + (why.empty() ? "" : " -- " + why));
+  why.clear();
+  run.Refused("ldlq: keep change + --ldlq-damp 0.02", With(ko, "--ldlq-damp", "0.02"),
+              " --reuse-tensors-from " + Q(d0p), "reuse_guard.args.ldlq_damp:");
 }
 
 #endif  // R4DX_CONVERT_EXE
@@ -1303,6 +1642,7 @@ int main(int argc, char** argv) {
       const Fixture f = MakeFixture(root);
       std::printf("     fixture written in %.1f s\n", Since(t));
       TestExe(f);
+      TestKeep(f);
       TestLdlqRotation(f);
     } catch (const std::exception& e) {
       Gate(false, std::string("(a-d) threw unexpectedly: ") + e.what());

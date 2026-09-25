@@ -2,16 +2,19 @@
 // --reuse-tensors-from <baseline.r4dx> (docs/quant2.md 5.2; src/convert/main.cpp has the per-tensor
 // decision and the header comment).
 //
-// A Q3 group sweep converts ~31 containers that differ from one baseline only in ONE
-// --w4a16-group-rule. Every linear is quantized independently (LDLQ: its own Hessian, no sequential
-// dependency), so such a candidate differs from the baseline only in the linears whose w4a16 group
-// the rule changes. --reuse-tensors-from copies every other tensor verbatim from the baseline instead
-// of recomputing it. That is sound only if the baseline was produced by THE SAME converter binary
-// on the same CPU from THE SAME inputs with THE SAME flags except the group rules, and only if its
-// bytes are still the ones that conversion wrote. So a run that records a guard writes
-// __metadata__.r4dx_convert_run.reuse_guard -- the identity of everything the bytes can depend on,
-// plus a digest of the bytes themselves -- and a reuse run refuses a baseline whose guard differs
-// from its own in any field, or whose data no longer matches its digest.
+// A Q3 sweep converts ~40 containers that differ from one baseline only in ONE candidate: a
+// --w4a16-group-rule, or a --keep-bf16 that keeps more (or fewer) linears in bf16. Every linear is
+// quantized independently (LDLQ: its own Hessian, no sequential dependency), so such a candidate
+// differs from the baseline only in the linears whose RESOLVED layout set (LayoutSetId: the w4a16
+// group, or bf16-only) differs. --reuse-tensors-from copies every other tensor verbatim from the
+// baseline instead of recomputing it. That is sound only if the baseline was produced by THE SAME
+// converter binary on the same CPU from THE SAME inputs with THE SAME flags except the per-linear
+// layout choices, and only if its bytes are still the ones that conversion wrote. So a run that
+// records a guard writes __metadata__.r4dx_convert_run.reuse_guard -- the identity of everything the
+// bytes can depend on, the resolved layout set of every linear, and a digest of the bytes themselves
+// -- and a reuse run refuses a baseline whose guard differs from its own in any identity field, or
+// whose data no longer matches its digest, and recomputes exactly the linears whose recorded layout
+// set differs from its own.
 //
 // This header holds the pieces that do not need main.cpp's AppArgs: file / checkpoint hashing, the
 // running binary's and CPU's identity, the data digest, the guard comparison and the baseline's
@@ -42,6 +45,7 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "r4dx_convert/linear_layouts.hpp"      // LayoutSetId (reuse_guard.linears)
 #include "r4dx_convert/safetensors_reader.hpp"  // SafetensorsReader, Utf8ToWide, WideToUtf8
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/threadpool.hpp"          // ParallelEach
@@ -50,7 +54,17 @@ namespace r4dx_convert {
 
 // Bumped whenever the guard's fields or their meaning change: a baseline with another version is
 // refused like any other guard mismatch. 2: converter.cpu, inputs.hessian_files, data_sha256.
-constexpr int kReuseGuardVersion = 2;
+// 3: args.keep_bf16 (the regex text) is gone; `linears` records every linear's resolved layout set
+// and a reuse recomputes the linears whose set differs, so --keep-bf16 may differ like the group rules.
+constexpr int kReuseGuardVersion = 3;
+
+// reuse_guard.linears: {"<container base>": LayoutSetId(its resolved LayoutSet)} for every linear the
+// run writes through add_linear (and the MTP draft head) -- after --w4a16-group-rule and --keep-bf16,
+// i.e. what the linear IS in this container, not the flags that made it so. NOT part of the identity
+// ReuseGuardMismatches compares (it is the one thing a reuse may change): src/convert/main.cpp's
+// PlanReuse compares it linear by linear, recomputes every linear whose set differs, and checks the
+// baseline's tensors against the baseline's own record.
+constexpr const char* kReuseLinearsKey = "linears";
 
 // The two completion fields inside reuse_guard. FinalizeHeader writes them as placeholders (the
 // header goes to disk before the emit pass); once writer.Finish() has confirmed that every planned
@@ -280,7 +294,8 @@ inline void FlattenJsonLeaves(const nlohmann::json& j, const std::string& prefix
 
 // The guard fields that differ between the baseline's guard and this run's, one line each
 // ("<path>: baseline <v>, this run <v>"), ignoring the completion fields kReuseCompleteKey and
-// kReuseDataKey (checked on their own). Empty means the guards are identical.
+// kReuseDataKey (checked on their own) and the per-linear record kReuseLinearsKey (PlanReuse's).
+// Empty means the guards are identical.
 inline std::vector<std::string> ReuseGuardMismatches(const nlohmann::json& baseline,
                                                      const nlohmann::json& current) {
   nlohmann::json a = baseline, b = current;
@@ -288,6 +303,7 @@ inline std::vector<std::string> ReuseGuardMismatches(const nlohmann::json& basel
     if (!g->is_object()) continue;
     g->erase(kReuseCompleteKey);
     g->erase(kReuseDataKey);
+    g->erase(kReuseLinearsKey);
   }
   std::vector<std::string> out;
   if (a == b) return out;
@@ -308,15 +324,6 @@ inline std::vector<std::string> ReuseGuardMismatches(const nlohmann::json& basel
   if (out.empty()) out.push_back("reuse_guard: the objects differ in structure (baseline " + a.dump() +
                                  ", this run " + b.dump() + ")");
   return out;
-}
-
-// The container suffixes a linear's layouts are written under (linear_layouts.hpp's
-// PlanLinearLayouts, W4a16WszName). Used to account for a recomputed linear's BASELINE tensors, which
-// this run does not plan under the same names when its w4a16 group changed.
-inline bool IsLinearLayoutSuffix(const std::string& s) {
-  return s == "bf16.w" || s == "w4a16.wq" || s == "w4a16.wsz" || s == "w4a16.wsz.g32" ||
-         s == "w4a16.wsz.g64" || s == "w4a16.wsz.g128" || s == "w4a8.wq" || s == "w4a8.ws" ||
-         s == "mxfp4.wq" || s == "mxfp4.ws" || s == "mxfp4.wref";
 }
 
 // The baseline container: its header (raw bytes, for the identity recorded in reused_from, and

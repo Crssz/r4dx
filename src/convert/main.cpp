@@ -18,21 +18,27 @@
 // --reuse-tensors-from <baseline> (docs/quant2.md 5.2, reuse_guard.hpp) writes exactly the container
 // a full run with the same flags would write, but copies every tensor whose bytes cannot depend on
 // the difference between this run and the baseline's verbatim from the baseline instead of computing
-// it. The ONLY difference it allows is --w4a16-group-rule (plus --output, --threads and this flag):
-// the linears whose w4a16 group differs between the two runs -- including a linear a BASELINE rule
-// moved that this run leaves at the default -- are recomputed, every layout of them, and everything
-// else is copied (each linear is quantized on its own, so nothing else can depend on another linear's
-// group). The baseline must carry __metadata__.r4dx_convert_run.reuse_guard, which a run given
+// it. The ONLY differences it allows are --w4a16-group-rule and --keep-bf16 (plus --output, --threads
+// and this flag), and it does not compare either flag's text: both runs record every linear's
+// RESOLVED layout set (reuse_guard.linears: "w4a16.g64", "bf16", ...), and the linears whose set
+// differs -- a group either run's rules moved, a linear either run keeps in bf16 and the other
+// quantizes -- are recomputed, every layout of them, and everything else is copied (each linear is
+// quantized on its own, so nothing else can depend on another linear's group or precision; every
+// header field a keep or a rule changes -- the group map, keep_bf16_linears, ldlq_linears, the byte
+// totals -- comes from the planning pass, which a reuse run executes in full). The baseline must carry
+// __metadata__.r4dx_convert_run.reuse_guard, which a run given
 // --record-reuse-guard (or --reuse-tensors-from, which implies it) writes: the sha256 of this
 // converter's own executable and runtime DLLs, the CPU's identity, the sha256 of config.json,
 // model.safetensors.index.json and every shard, of the --imatrix / --kv-calib / --draft-vocab-ids
-// files, of hessian.json and of every .hess file the --ldlq regex can read, and every other flag,
-// resolved. Any difference -- a rebuilt binary included; there is deliberately no override --
+// files, of hessian.json and of every .hess file the --ldlq regex can read (whichever linears are
+// kept: the set follows --ldlq alone), and every other flag, resolved. Any difference -- a rebuilt
+// binary included; there is deliberately no override --
 // refuses the reuse before the first shard is read, naming each field. So does a baseline whose
 // emit pass never finished (the guard's emit_complete marker, patched from 0 to 1 only after every
 // tensor is durably on disk), one whose tensor data no longer hashes to the guard's data_sha256
 // (patched in with the marker, from every tensor read back from the file), and a baseline whose
-// tensor directory does not match what this run writes. The output records reused_from (the
+// tensor directory (or group map, or keep list) does not match its own per-linear record and what
+// this run writes. The output records reused_from (the
 // baseline's path, header sha256 and data_sha256, the copied / recomputed counts and the recomputed
 // linears) next to its own reuse_guard; apart from reused_from (and `threads`, when it differs) its
 // header and data are byte-identical to a full run's with --record-reuse-guard.
@@ -1084,13 +1090,16 @@ nlohmann::json LayoutSetJson(const LayoutSet& ls) {
 }
 
 // __metadata__.r4dx_convert_run.reuse_guard: everything this run's bytes can depend on EXCEPT the
-// --w4a16-group-rule list (and --output, --threads, the reuse flags), in resolved form -- so two
-// spellings of one setting (--layers 99 on a 64-layer checkpoint, --vision's auto default) compare
-// equal while any real difference does not. Files are identified by content; a flag whose file the
-// run never reads is recorded as unused rather than hashed. Every field is compared, whole: a new
-// input the converter learns to read must be added here (and kReuseGuardVersion bumped). The two
-// completion fields (emit_complete, data_sha256) are written as placeholders and patched once the
-// data is on disk (RunConvert's end; reuse_guard.hpp).
+// per-linear layout choices -- --w4a16-group-rule and --keep-bf16 -- (and --output, --threads, the
+// reuse flags), in resolved form -- so two spellings of one setting (--layers 99 on a 64-layer
+// checkpoint, --vision's auto default) compare equal while any real difference does not. Files are
+// identified by content; a flag whose file the run never reads is recorded as unused rather than
+// hashed. Every field is compared, whole: a new input the converter learns to read must be added here
+// (and kReuseGuardVersion bumped). The per-linear choices are recorded resolved, not as regex text:
+// RunConvert adds reuse_guard.linears (every linear's LayoutSetId) once add_linear has resolved them,
+// and PlanReuse compares that linear by linear instead. The two completion fields (emit_complete,
+// data_sha256) are written as placeholders and patched once the data is on disk (RunConvert's end;
+// reuse_guard.hpp).
 nlohmann::json BuildReuseGuard(const AppArgs& args, const std::string& config_text, int layers,
                                bool do_vision, bool do_mtp, const LayoutSet& layouts,
                                const LayoutSet& lm_head_layouts, const LdlqSource& ldlq,
@@ -1144,7 +1153,7 @@ nlohmann::json BuildReuseGuard(const AppArgs& args, const std::string& config_te
       {"layouts", LayoutSetJson(layouts)},
       {"lm_head", LayoutSetJson(lm_head_layouts)},
       {"quant", args.quant},
-      {"keep_bf16", args.keep_bf16},
+      // No keep_bf16: what it keeps is per-linear, in reuse_guard.linears (RunConvert adds it).
       {"ldlq", ldlq.Enabled() ? args.ldlq : std::string()},
       {"ldlq_damp", ldlq.Enabled() ? nlohmann::json(ldlq.Damp()) : nlohmann::json(nullptr)},
       {"rotate", rot.KindName()},
@@ -1215,8 +1224,8 @@ void CheckReuseBaseline(r4dx_convert::BaselineContainer& b, const nlohmann::json
   const std::vector<std::string> diff = r4dx_convert::ReuseGuardMismatches(bg, guard);
   if (!diff.empty()) {
     std::string msg = who + ": refused -- the baseline was not converted from the same inputs with "
-                            "the same flags by this binary (only --w4a16-group-rule, --output and "
-                            "--threads may differ); " + std::to_string(diff.size()) +
+                            "the same flags by this binary (only --w4a16-group-rule, --keep-bf16, "
+                            "--output and --threads may differ); " + std::to_string(diff.size()) +
                       " guard field(s) differ:";
     for (const auto& d : diff) msg += "\n  " + d;
     throw std::runtime_error(msg);
@@ -1236,27 +1245,73 @@ void CheckReuseBaseline(r4dx_convert::BaselineContainer& b, const nlohmann::json
 struct ReusePlan {
   std::vector<bool> copy;                       // per plan/emit job
   std::vector<std::string> recomputed_linears;  // container order
+  std::vector<std::string> recomputed_why;      // same order: "<baseline set> -> <this run's set>"
   int64_t tensors_copied = 0, tensors_recomputed = 0;
   uint64_t bytes_copied = 0, bytes_recomputed = 0;
 };
 
 // `job_tensors[j]` = the writer's plan indices job j planned; `linear_jobs` = job -> container base,
-// for every add_linear (and the MTP draft head) job; `groups_now` = this run's
-// W4a16GroupRules::Groups(). A linear is AFFECTED when its w4a16 group here differs from the
-// baseline's (__metadata__.quant.w4a16.groups, default = the build's group): a rule in either run
-// that the other lacks, or two different groups. An affected job runs as usual -- all its layouts,
-// not just w4a16 -- and every other job is copied, after its every tensor was checked to exist in the
-// baseline under the same name with dtype U8, the same shape and the same size. The baseline must not
-// hold anything else except an affected linear's own layout tensors; any inconsistency refuses the
-// reuse (the guard matched, so it means the guard missed something -- nothing is trusted then).
+// for every add_linear (and the MTP draft head) job; `layouts_now` = base -> the LayoutSet this run
+// resolved for it (after --w4a16-group-rule and --keep-bf16), which this run's guard records as
+// reuse_guard.linears. A linear is AFFECTED when its LayoutSetId here differs from the one the
+// baseline's guard records for it: a rule or a keep in either run that the other lacks, or two
+// different groups. An affected job runs as usual -- all its layouts -- and every other job is copied,
+// after its every tensor was checked to exist in the baseline under the same name with dtype U8, the
+// same shape and the same size.
+//
+// Nothing is inferred from either run's regex text, and the baseline's record is not trusted on its
+// own: it must name exactly this run's linears, each with a canonical layout set; the baseline's other
+// records of the same decisions (quant.w4a16.groups, which the runtime reads, and
+// r4dx_convert_run.keep_bf16_linears) must agree with it; an affected linear's baseline tensors must
+// be exactly the ones its recorded set names; and the baseline must hold nothing else. Any
+// inconsistency refuses the reuse (the guard matched, so it means the guard missed something --
+// nothing is trusted then).
 ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWriter& writer,
                     const std::vector<std::pair<size_t, size_t>>& job_tensors,
                     const std::map<size_t, std::string>& linear_jobs,
-                    const std::map<std::string, int>& groups_now) {
+                    const std::map<std::string, LayoutSet>& layouts_now) {
+  using r4dx_convert::kReuseLinearsKey;
+  using r4dx_convert::LayoutSetId;
   const std::string who = "--reuse-tensors-from " + b.path;
+  const std::string inconsistent = " -- refusing an inconsistent baseline";
   const r4dx_convert::SafetensorsReader& r = *b.reader;
-  std::map<std::string, int> groups_then;
+  for (const auto& kv : linear_jobs) {
+    if (!layouts_now.count(kv.second))
+      throw std::logic_error("PlanReuse: linear job '" + kv.second + "' has no resolved LayoutSet");
+  }
+
+  // (1) The baseline's per-linear record: exactly this run's linears, each a canonical layout set.
+  const nlohmann::json& bg = b.metadata.at("r4dx_convert_run").at("reuse_guard");
+  const auto rec = bg.find(kReuseLinearsKey);
+  if (rec == bg.end() || !rec->is_object())
+    throw std::runtime_error(who + ": the baseline's reuse_guard." + kReuseLinearsKey +
+                             " is missing or not an object" + inconsistent);
+  std::map<std::string, LayoutSet> then;
+  for (auto it = rec->begin(); it != rec->end(); ++it) {
+    const std::string field = "reuse_guard." + std::string(kReuseLinearsKey) + "." + it.key() + ": ";
+    const auto now = layouts_now.find(it.key());
+    if (now == layouts_now.end())
+      throw std::runtime_error(who + ": " + field + "baseline " + it.value().dump() +
+                               ", this run (absent) -- the baseline records a linear this run does "
+                               "not write" + inconsistent);
+    LayoutSet ls;
+    if (!it.value().is_string() || !r4dx_convert::ParseLayoutSetId(it.value().get<std::string>(), &ls))
+      throw std::runtime_error(who + ": " + field + "the baseline records " + it.value().dump() +
+                               ", which is not a layout set this converter writes (this run: \"" +
+                               LayoutSetId(now->second) + "\")" + inconsistent);
+    then.emplace(it.key(), ls);
+  }
+  for (const auto& kv : layouts_now) {
+    if (!then.count(kv.first))
+      throw std::runtime_error(who + ": reuse_guard." + std::string(kReuseLinearsKey) + "." + kv.first +
+                               ": baseline (absent), this run \"" + LayoutSetId(kv.second) + "\"" +
+                               inconsistent);
+  }
+
+  // (2) The baseline's other records of the same decisions agree with (1): its group map (what the
+  // runtime dispatches on) and its keep list.
   const nlohmann::json& w16 = b.metadata.at("quant").at("w4a16");
+  std::map<std::string, int> groups_then;
   if (w16.contains("groups")) {
     if (!w16["groups"].is_object())
       throw std::runtime_error(who + ": the baseline's quant.w4a16.groups is not an object");
@@ -1264,47 +1319,76 @@ ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWri
       if (!it.value().is_number_integer())
         throw std::runtime_error(who + ": the baseline's quant.w4a16.groups[\"" + it.key() +
                                  "\"] is not an integer");
+      if (!then.count(it.key()))
+        throw std::runtime_error(who + ": the baseline's quant.w4a16.groups lists '" + it.key() +
+                                 "', which this run does not write as a linear");
       groups_then[it.key()] = it.value().get<int>();
     }
   }
-  std::set<std::string> linear_bases;
-  for (const auto& kv : linear_jobs) linear_bases.insert(kv.second);
-  for (const auto& kv : groups_then) {
-    if (!linear_bases.count(kv.first))
-      throw std::runtime_error(who + ": the baseline's quant.w4a16.groups lists '" + kv.first +
-                               "', which this run does not write as a linear");
+  for (const auto& kv : then) {
+    const bool mapped = kv.second.w4a16 && kv.second.w4a16_group != r4dx_convert::kW4A16Group;
+    const auto g = groups_then.find(kv.first);
+    if (mapped == (g != groups_then.end()) && (!mapped || g->second == kv.second.w4a16_group)) continue;
+    throw std::runtime_error(
+        who + ": the baseline's quant.w4a16.groups maps '" + kv.first + "' to " +
+        (g == groups_then.end() ? "nothing (the default group " + std::to_string(r4dx_convert::kW4A16Group) + ")"
+                                : "group " + std::to_string(g->second)) +
+        " but its reuse_guard." + kReuseLinearsKey + " records \"" + LayoutSetId(kv.second) + "\"" +
+        inconsistent);
   }
-  auto group_of = [](const std::map<std::string, int>& m, const std::string& base) {
-    const auto it = m.find(base);
-    return it == m.end() ? r4dx_convert::kW4A16Group : it->second;
-  };
+  const nlohmann::json& brun = b.metadata.at("r4dx_convert_run");
+  if (brun.contains("keep_bf16_linears")) {
+    const nlohmann::json& kept = brun["keep_bf16_linears"];
+    if (!kept.is_array())
+      throw std::runtime_error(who + ": the baseline's r4dx_convert_run.keep_bf16_linears is not an array");
+    for (const auto& k : kept) {
+      const auto t = k.is_string() ? then.find(k.get<std::string>()) : then.end();
+      if (t == then.end() || LayoutSetId(t->second) != LayoutSetId(r4dx_convert::KeptBf16LayoutSet()))
+        throw std::runtime_error(
+            who + ": the baseline's r4dx_convert_run.keep_bf16_linears lists " + k.dump() + " but its "
+            "reuse_guard." + kReuseLinearsKey + " records " +
+            (t == then.end() ? std::string("no such linear") : "\"" + LayoutSetId(t->second) + "\"") +
+            inconsistent);
+    }
+  }
+
   auto shape_str = [](const std::vector<int64_t>& s) {
     std::string o = "[";
     for (size_t i = 0; i < s.size(); ++i) o += (i ? "," : "") + std::to_string(s[i]);
     return o + "]";
   };
 
+  // (3) Per job.
   ReusePlan p;
   p.copy.assign(job_tensors.size(), false);
-  std::set<std::string> accounted, affected;
+  std::set<std::string> accounted;
   for (size_t j = 0; j < job_tensors.size(); ++j) {
     const auto lj = linear_jobs.find(j);
     if (lj != linear_jobs.end()) {
       const std::string& base = lj->second;
-      const int g_now = group_of(groups_now, base), g_then = group_of(groups_then, base);
-      if (g_now != g_then) {
-        affected.insert(base);
+      const LayoutSet& ls_now = layouts_now.at(base);
+      const LayoutSet& ls_then = then.at(base);
+      const std::string id_now = LayoutSetId(ls_now), id_then = LayoutSetId(ls_then);
+      if (id_now != id_then) {
         p.recomputed_linears.push_back(base);
+        p.recomputed_why.push_back(id_then + " -> " + id_now);
+        // The baseline's own tensors of this linear: exactly the ones its record names (a leftover
+        // or a missing one is refused by the directory check below / here).
+        for (const std::string& name : r4dx_convert::LinearLayoutTensorNames(base, ls_then)) {
+          if (!r.Has(name))
+            throw std::runtime_error(who + ": the baseline records '" + base + "' as \"" + id_then +
+                                     "\" (reuse_guard." + kReuseLinearsKey + ") but has no tensor '" +
+                                     name + "'" + inconsistent);
+          accounted.insert(name);
+        }
+        // This job's other tensors (the MTP draft head's vocab_ids) are recomputed with it; the
+        // baseline's copy of one is its own, not a stray.
+        const std::vector<std::string> own = r4dx_convert::LinearLayoutTensorNames(base, ls_now);
         for (size_t t = job_tensors[j].first; t < job_tensors[j].second; ++t) {
           const std::string& name = writer.PlannedName(t);
-          if (r.Has(name)) accounted.insert(name);
+          if (std::find(own.begin(), own.end(), name) == own.end() && r.Has(name)) accounted.insert(name);
           ++p.tensors_recomputed;
           p.bytes_recomputed += writer.PlannedBytes(t);
-          // The baseline must really hold this linear at the group its map says.
-          if (name == base + ".w4a16.wq" && !r.Has(r4dx_convert::W4a16WszName(base, g_then)))
-            throw std::runtime_error(who + ": the baseline maps '" + base + "' to w4a16 group " +
-                                     std::to_string(g_then) + " but has no " +
-                                     r4dx_convert::W4a16WszName(base, g_then));
         }
         continue;
       }
@@ -1330,18 +1414,9 @@ ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWri
     p.copy[j] = true;
   }
   for (const auto& name : r.Names()) {
-    if (accounted.count(name)) continue;
-    bool own_layout = false;
-    for (const auto& base : affected) {
-      if (StartsWith(name, base + ".") &&
-          r4dx_convert::IsLinearLayoutSuffix(name.substr(base.size() + 1))) {
-        own_layout = true;
-        break;
-      }
-    }
-    if (!own_layout)
+    if (!accounted.count(name))
       throw std::runtime_error(who + ": the baseline has tensor '" + name + "', which this run "
-                               "does not write -- refusing an inconsistent baseline");
+                               "does not write and its record does not name" + inconsistent);
   }
   return p;
 }
@@ -1458,8 +1533,9 @@ int RunConvert(const AppArgs& args) {
       const auto tb = std::chrono::steady_clock::now();
       CheckReuseBaseline(*baseline, reuse_guard, threads);
       std::cout << "[r4dx-convert] reuse: baseline " << args.reuse_from
-                << " matches this run's guard (every field; the w4a16 group rules may differ), and "
-                   "its data matches its recorded data_sha256 (read in "
+                << " matches this run's guard (every field; the per-linear layout sets -- "
+                   "--w4a16-group-rule, --keep-bf16 -- may differ), and its data matches its "
+                   "recorded data_sha256 (read in "
                 << SecondsBetween(tb, std::chrono::steady_clock::now()) << " s)\n";
     }
   }
@@ -1470,9 +1546,17 @@ int RunConvert(const AppArgs& args) {
   // Every add_* below pushes exactly ONE plan job and ONE emit job, so job j's emit writes exactly the
   // tensors job j's plan registered (checked when planning runs). `linear_jobs`: job index -> container
   // base for the jobs that write a linear's layouts (add_linear, the MTP draft head) -- the only jobs
-  // a --w4a16-group-rule can change, so the only ones --reuse-tensors-from may have to recompute.
+  // a --w4a16-group-rule or --keep-bf16 can change, so the only ones --reuse-tensors-from may have to
+  // recompute. `linear_layouts`: base -> the LayoutSet it is written in, resolved once where the job
+  // is added (the guard records it as reuse_guard.linears; PlanReuse compares it).
   std::vector<std::function<void()>> plan_jobs, emit_jobs;
   std::map<size_t, std::string> linear_jobs;
+  std::map<std::string, LayoutSet> linear_layouts;
+  auto note_linear = [&](const std::string& base, const LayoutSet& ls) {
+    if (!linear_layouts.emplace(base, ls).second)
+      throw std::logic_error("RunConvert: linear '" + base + "' added twice");
+    linear_jobs[plan_jobs.size()] = base;
+  };
 
   auto add_bf16 = [&](std::string hf_name, std::string container_name) {
     plan_jobs.push_back([&writer, &model, hf_name, container_name]() {
@@ -1649,7 +1733,7 @@ int RunConvert(const AppArgs& args) {
     // so an unrotated container reads exactly the Hessians it did before rms_keys existed.
     const bool rotated_in = fold.kind == LinearFold::kIn;
     const bool use_rms = use_ldlq && rotated_in && ldlq.HasRms(container_base);
-    linear_jobs[plan_jobs.size()] = container_base;
+    note_linear(container_base, ls);
     plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, hf_names,
                           container_base, ls, requested, kept, ldlq_matched, use_ldlq, rotated_in,
                           use_rms, fold]() {
@@ -1859,7 +1943,7 @@ int RunConvert(const AppArgs& args) {
       const bool draft_head_ldlq_matched = ldlq.Matches("mtp.draft_head.lm_head");
       const bool draft_head_ldlq =
           draft_head_ldlq_matched && HasQuantizedLayout(draft_head_layouts);
-      linear_jobs[plan_jobs.size()] = "mtp.draft_head.lm_head";
+      note_linear("mtp.draft_head.lm_head", draft_head_layouts);
       plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &w4a16_groups, draft_vocab_size,
                             draft_head_layouts, draft_head_requested, draft_head_kept,
                             draft_head_ldlq_matched, draft_head_ldlq]() {
@@ -1927,16 +2011,27 @@ int RunConvert(const AppArgs& args) {
   ldlq.ReportPlan(std::cout, std::cerr);
   w4a16_groups.Report(std::cout, std::cerr);
 
+  // The guard's per-linear record (reuse_guard.hpp's kReuseLinearsKey): every linear's resolved
+  // layout set, which a later --reuse-tensors-from of this container compares linear by linear.
+  if (want_guard) {
+    nlohmann::json rec = nlohmann::json::object();
+    for (const auto& kv : linear_layouts) rec[kv.first] = r4dx_convert::LayoutSetId(kv.second);
+    reuse_guard[r4dx_convert::kReuseLinearsKey] = rec;
+  }
+
   // --reuse-tensors-from: which jobs are copied (PlanReuse), decided before the header is written so
   // the header can record it and an inconsistent baseline dies before any output exists.
   ReusePlan reuse_plan;
   if (baseline) {
-    reuse_plan = PlanReuse(*baseline, writer, job_tensors, linear_jobs, w4a16_groups.Groups());
+    reuse_plan = PlanReuse(*baseline, writer, job_tensors, linear_jobs, linear_layouts);
+    for (size_t i = 0; i < reuse_plan.recomputed_linears.size(); ++i)
+      std::cout << "[r4dx-convert] reuse: recompute " << reuse_plan.recomputed_linears[i]
+                << " (baseline " << reuse_plan.recomputed_why[i] << ")\n";
     std::cout << "[r4dx-convert] reuse: " << reuse_plan.tensors_copied << " tensor(s) ("
               << reuse_plan.bytes_copied << " B) copied from the baseline, "
               << reuse_plan.tensors_recomputed << " tensor(s) (" << reuse_plan.bytes_recomputed
               << " B) of " << reuse_plan.recomputed_linears.size()
-              << " linear(s) whose w4a16 group differs recomputed\n";
+              << " linear(s) whose layout set (w4a16 group or --keep-bf16) differs recomputed\n";
   }
 
   nlohmann::json metadata;

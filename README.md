@@ -141,7 +141,9 @@ of the container loads in the requested layout. It exists for the per-tensor-cla
 in `docs/validation.md` "Milestone 11 / sensitivity" -- convert one class in bf16, re-run the KL
 harness, and the KL that disappears is that class's share of the quantization error. A regex that
 matches nothing warns and converts normally; an invalid one is a hard error before the first shard
-is read.
+is read. The flag takes ONE regex -- a second `--keep-bf16` replaces the first -- so combine sets by
+alternation, e.g. `"^text\.layers\.(?:[0-9]+\.attn\.[kv]|[0-3]\.mlp\.down)$"` (the recipe's k/v plus
+layers 0-3's `mlp.down`; `docs/quant2.md` 5.3 prices such keeps).
 
 **`--quant` / `--imatrix` -- how the 4-bit values are chosen.** Neither flag changes a single byte of
 the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
@@ -247,16 +249,25 @@ default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.
   `__metadata__.r4dx_convert_run` records `w4a16_group_rules`, `w4a16_groups` and
   `w4a16_group_extra_bytes`. Without the flag the container is byte-identical to before.
 - Choosing the rules: `tools/quant2/group_sweep.ps1 -Convert -Kl` converts and measures (rung 4, HIP
-  device 1) one candidate per tensor class x depth half x group, and
+  device 1) one candidate per tensor class x depth half x group, plus bf16 keeps of a few sensitive
+  linear sets and un-keeps of the recipe's bf16 attn.k/v (`docs/quant2.md` 5.3, which gives the
+  `-ExtraArgs` for the current q2ab + LDLQ recipe; the default `-Recipe` alone is unrotated), and
   `tools/quant2/alloc_groups.py` ranks them by nats of KL per GiB, fills a byte budget (default:
-  equal bytes), reports the cliff and prints the flags for the chosen set. The runtime side
-  (`r4d_gemm_w4a16_nt_m64_g`, the loader and the tuning table) must be built from the same tree.
+  equal bytes; candidates whose linear sets overlap exclude each other, and an exchange pass plus an
+  exhaustive check settle which one by first-order KL, not by order), reports the cliff and
+  prints the flags for the chosen set -- the rules plus, when a keep or un-keep was picked, ONE
+  `--keep-bf16` that replaces the recipe's (the flag is single-valued: the last one wins). The
+  runtime side (`r4d_gemm_w4a16_nt_m64_g`, the loader and the tuning table) must be built from the
+  same tree.
 - `--reuse-tensors-from <baseline.r4dx>` writes the same container, but copies every tensor except
-  the linears whose group differs from the baseline's. The baseline must have been converted with
+  the linears whose resolved layout set differs from the baseline's: another w4a16 group, or bf16
+  (`--keep-bf16`) on one side only. Neither flag's regex is compared; both runs record every
+  linear's resolved layout in the guard. The baseline must have been converted with
   `--record-reuse-guard` by the same binary on the same CPU, from the same checkpoint and input
-  files (all hashed, `.hess` files included), with the same flags apart from the rules. Its data
-  must still match the digest it recorded. Anything else is refused, naming the field.
-  `group_sweep.ps1` does this by default (`-NoReuse` for full conversions). See `docs/quant2.md` 5.2.
+  files (all hashed, `.hess` files included), with the same flags apart from `--w4a16-group-rule`
+  and `--keep-bf16`. Its data must still match the digest it recorded. Anything else is refused,
+  naming the field. `group_sweep.ps1` does this by default (`-NoReuse` for full conversions). See
+  `docs/quant2.md` 5.2.
 
 ### Generate text
 

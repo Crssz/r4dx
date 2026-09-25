@@ -62,6 +62,82 @@ inline LayoutSet KeptBf16LayoutSet() {
   return ls;
 }
 
+// The tensor names PlanLinearLayouts() below plans for `base` in `layouts`, in its order (the shapes
+// and sizes are PlanLinearLayouts'; tests/convert/test_reuse.cpp holds the two to the same names).
+// r4dx-convert --reuse-tensors-from uses it to name exactly the tensors a BASELINE holds for a linear
+// it recomputes, from the baseline's recorded LayoutSetId.
+inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
+                                                        const LayoutSet& layouts) {
+  std::vector<std::string> n;
+  if (layouts.bf16) n.push_back(base + ".bf16.w");
+  if (layouts.w4a16) {
+    n.push_back(base + ".w4a16.wq");
+    n.push_back(W4a16WszName(base, layouts.w4a16_group));
+  }
+  if (layouts.w4a8) {
+    n.push_back(base + ".w4a8.wq");
+    n.push_back(base + ".w4a8.ws");
+  }
+  if (layouts.mxfp4) {
+    n.push_back(base + ".mxfp4.wq");
+    n.push_back(base + ".mxfp4.ws");
+    n.push_back(base + ".mxfp4.wref");
+  }
+  return n;
+}
+
+// One linear's RESOLVED layout set as a canonical string -- what r4dx-convert's reuse guard records
+// per linear (reuse_guard.linears, docs/quant2.md 5.2): the layouts in the fixed order bf16, w4a16
+// (with its own group, always spelled out), w4a8, mxfp4, joined by '+', or "none". So a
+// --keep-bf16 linear is "bf16", the Q3 sweep recipe's quantized linear "w4a16.g64", a v6-recipe one
+// "w4a16.g64+w4a8+mxfp4". Everything a linear's tensors depend on beyond the run-wide flags is in it:
+// its tensor names and sizes, which quantizers run (LDLQ applies iff a 4-bit layout is present), and
+// at which w4a16 group.
+inline std::string LayoutSetId(const LayoutSet& ls) {
+  std::string s;
+  auto add = [&](const std::string& t) { s += (s.empty() ? "" : "+") + t; };
+  if (ls.bf16) add("bf16");
+  if (ls.w4a16) add("w4a16.g" + std::to_string(ls.w4a16_group));
+  if (ls.w4a8) add("w4a8");
+  if (ls.mxfp4) add("mxfp4");
+  return s.empty() ? std::string("none") : s;
+}
+
+// The inverse of LayoutSetId, strict: only the canonical spelling of a layout set this build can write
+// (a w4a16 group of 32/64/128 or the build default) parses; anything else returns false.
+inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
+  LayoutSet ls;
+  ls.bf16 = false;
+  if (id != "none") {
+    size_t pos = 0;
+    while (pos <= id.size()) {
+      const size_t plus = id.find('+', pos);
+      const std::string t = id.substr(pos, plus == std::string::npos ? std::string::npos : plus - pos);
+      if (t == "bf16") {
+        ls.bf16 = true;
+      } else if (t == "w4a8") {
+        ls.w4a8 = true;
+      } else if (t == "mxfp4") {
+        ls.mxfp4 = true;
+      } else if (t.compare(0, 7, "w4a16.g") == 0 && t.size() > 7 && t.size() <= 10) {
+        for (size_t i = 7; i < t.size(); ++i)
+          if (t[i] < '0' || t[i] > '9') return false;
+        ls.w4a16 = true;
+        ls.w4a16_group = std::stoi(t.substr(7));
+        if (ls.w4a16_group != kW4A16Group && !IsW4A16GroupSupported(ls.w4a16_group)) return false;
+      } else {
+        return false;
+      }
+      if (plus == std::string::npos) break;
+      pos = plus + 1;
+    }
+  }
+  // Canonical only: the fixed order, each layout once, no empty token, no leading zeros.
+  if (LayoutSetId(ls) != id) return false;
+  *out = ls;
+  return true;
+}
+
 // Exactly the byte total PlanLinearLayouts() below plans for one [N,K] linear in `layouts`. Same
 // formulas, derived once: --keep-bf16's "extra bytes vs 4-bit" accounting has to answer "what would
 // this linear have cost in the layouts it is NOT being written in", and a second hand-written copy

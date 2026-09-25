@@ -28,7 +28,7 @@ before any kernel work.
 | Q2a rotation | one orthogonal `Q` on the 5120-wide residual stream, folded into every in-projection (K side) and out-projection (N side); norm weights folded into the next linear; **online `Q` at stack entry and `Q^T` at stack exit** | embedding table, vision rows, lm_head, MTP and the DFlash2 drafter stay byte-identical and un-rotated |
 | Q2a `Q` | `Q = D . (I_5 (x) H_1024/32) . (R_5 (x) I_1024)`: random signs, 5 blockwise normalized Hadamards, a random 5x5 orthogonal mix | 5120 = 5 x 1024 has no Hadamard; this is exact, orthogonal and O(n log n) |
 | Q2b online Hadamards | `mlp.down` input: block 512, fused into `silu_mul`; `attn.o` input: block 256 per head, fused into the output-gate multiply; `gdn.out_proj` input: block 128 per head, one extra kernel | block sizes divide both the full and the TP=2 per-rank K, so no block straddles a rank |
-| Q3 | libr4d `r4d_gemm_w4a16_nt_m64` group becomes a template parameter (32/64/128 instantiated); group recorded per tensor; allocation by the Milestone 11 nats-per-GiB rule | makes depth/class-aware precision possible without a second format |
+| Q3 | libr4d `r4d_gemm_w4a16_nt_m64` group becomes a template parameter (32/64/128 instantiated); group recorded per tensor; allocation by the Milestone 11 nats-per-GiB rule, with bf16 keeps (and un-keeps of the recipe's attn.k/v) priced in the same currency (5.3) | makes depth/class-aware precision possible without a second format |
 | GPU work | every GPU run is handed to the user as an exact command (repo rule); CPU/convert work proceeds without asking | `gpu-runs-need-approval` |
 
 ---
@@ -603,7 +603,9 @@ Cost gate G7 decides whether `gdn.out_proj`'s extra launch stays.
   already takes the group per tensor (`ShardLoader`'s `w4a16_group_` becomes per call).
 - Allocation: the Milestone 11 method, automated -- measure per (class, depth half) the KL
   recovered by g32 / g64 / g128 (one class at a time, rung 4), then fill the byte budget greedily by
-  nats per GiB and stop at the cliff.
+  nats per GiB and stop at the cliff. The same sweep also measures bf16 keeps of a few sensitive
+  linear sets and un-keeps of the recipe's bf16 attn.k/v (5.3), so every option is one precision
+  (g32 / g64 / g128 / bf16) for one set of linears, and sets that overlap exclude each other.
 
 ### 5.1 Q3 implementation note (runtime)
 
@@ -725,22 +727,40 @@ handed to the user.
 
 ### 5.2 Reusing a baseline (`--reuse-tensors-from`)
 
-The Q3 sweep converts ~31 containers, each the no-rule baseline plus ONE `--w4a16-group-rule`, at
-~24 min each. `r4dx-convert --reuse-tensors-from <baseline.r4dx>` writes exactly the container a full
-run with the same flags writes, but copies from the baseline every tensor that cannot depend on the
-difference (`src/convert/main.cpp`: `BuildReuseGuard`, `OpenReuseBaseline`, `CheckReuseBaseline`,
-`PlanReuse`; `reuse_guard.hpp`).
+The Q3 sweep converts a baseline and 41 candidates, each the baseline plus ONE change -- a
+`--w4a16-group-rule`, or a `--keep-bf16` that keeps more or fewer linears in bf16 (5.3) -- at ~24 min
+each as full conversions.
+`r4dx-convert --reuse-tensors-from <baseline.r4dx>` writes exactly the container a full run with the
+same flags writes, but copies from the baseline every tensor that cannot depend on the difference
+(`src/convert/main.cpp`: `BuildReuseGuard`, `OpenReuseBaseline`, `CheckReuseBaseline`, `PlanReuse`;
+`reuse_guard.hpp`).
 
-**Recomputed:** every linear whose w4a16 group differs between the two runs, read from each run's
-`quant.w4a16.groups` (absent = the default). That covers a rule in this run, a rule only the BASELINE
-had, and two different groups. All of that linear's layouts are recomputed, with everything its job
-writes (the MTP draft head's `vocab_ids` too). **Copied:** everything else. Each linear is quantized
-from its own weight and its own Hessian or imatrix vector, and nothing reads another linear's
-quantized output. HessianStore's factor cache is only a cache: a reuse run may factor a shared tap
-afresh, and `convert_reuse` (d) checks the bytes do not care. Before copying, every copied tensor
-must exist in the baseline under the same name with dtype U8, the same shape and the same size. The
-baseline must hold nothing else except the recomputed linears' own layout tensors, and its group map
-must agree with its scale tensors. The copy streams from the baseline's mapping in 64 MiB writes.
+**Recomputed:** every linear whose RESOLVED layout set differs between the two runs, read from each
+run's `reuse_guard.linears` (below): `"w4a16.g64"`, `"w4a16.g32"`, `"bf16"`, ... per linear, after
+the rules and `--keep-bf16` (`LayoutSetId`, `linear_layouts.hpp`). That covers a rule in this run, a
+rule only the BASELINE had, two different groups, a linear either run keeps in bf16 and the other
+quantizes, and any mix of these; neither flag's regex text is compared, so two spellings of one keep
+set recompute nothing. All of that linear's layouts are recomputed, with everything its job writes
+(the MTP draft head's `vocab_ids` too). **Copied:** everything else. Each linear is quantized from its
+own weight and its own Hessian or imatrix vector, and nothing reads another linear's quantized
+output. HessianStore's factor cache is only a cache: a reuse run may factor a shared tap afresh, and
+`convert_reuse` (d) and (e-iv) check the bytes do not care.
+
+What `--keep-bf16` touches beyond a kept linear's own tensors is either recomputed or independent of
+it (the audit behind 5.3): `keep_bf16`, `keep_bf16_linears`, `keep_bf16_extra_bytes`,
+`ldlq_linears`, `ldlq_rms_linears`, `quant.w4a16.groups` and `w4a16_group_extra_bytes` all come from
+the planning pass, which a reuse run executes in full; the `.hess` files the guard hashes follow
+`--ldlq` alone (`HessianStore::FilesFor`), so un-keeping a linear reads no unhashed file; the
+kv-calib descales, the zeroed norms and the `rotation.*` tensors do not consult `--keep-bf16`; a kept
+linear is folded (`W diag(1+w) Q`, `Q^T W Hb`) exactly like a quantized one, then rounded to bf16
+once.
+
+The baseline's record is not trusted on its own. Before anything is copied: the record must name
+exactly this run's linears, each a canonical layout set; the baseline's `quant.w4a16.groups` and
+`keep_bf16_linears` must agree with it; a recomputed linear's baseline tensors must be exactly the
+ones its record names; every copied tensor must exist in the baseline under the same name with dtype
+U8, the same shape and the same size; and the baseline must hold nothing else. The copy streams from
+the baseline's mapping in 64 MiB writes.
 
 **The guard** is `__metadata__.r4dx_convert_run.reuse_guard`. `--record-reuse-guard` writes it, and
 so does every reuse run. A baseline without a guard (any older converter's container), or with an
@@ -750,14 +770,15 @@ this run's in every field:
 
 | field | content |
 |---|---|
-| `version` | the guard format (2) |
+| `version` | the guard format (3: `args.keep_bf16` gone, `linears` added) |
 | `converter.exe_sha256` | the running `r4dx-convert.exe` (r4d_core is linked statically) |
 | `converter.runtime_dlls` | ucrtbase / msvcp140 / vcruntime140 as loaded (`rotation.mix5` uses ucrt's log/cos/sin) |
 | `converter.cpu` | vendor, brand, family/model/stepping, FMA3/AVX/AVX2/AVX-512F, XCR0, `_get_FMA3_enable()`: ucrt picks its FMA3 or SSE2 transcendentals at run time, and they can differ in the last bit |
 | `converter.{w4a16,w4a8,mxfp4}_group`, `avx512` | build constants; the LDLQ microkernel path |
 | `checkpoint` | sha256 of `config.json` and `model.safetensors.index.json`; length + sha256 of every shard the index names (whole files). The path is not compared. |
-| `args` | resolved `layers`, `vision`, `mtp`, the body and lm_head layout sets after `--no-bf16`, `quant`, `keep_bf16`, `ldlq`, `ldlq_damp`, `rotate`, `rotation_seed` |
+| `args` | resolved `layers`, `vision`, `mtp`, the body and lm_head layout sets after `--no-bf16`, `quant`, `ldlq`, `ldlq_damp`, `rotate`, `rotation_seed` |
 | `inputs` | sha256 of `--imatrix`, `--kv-calib`, `--draft-vocab-ids` (when `--mtp` is on) and `hessian.json`; `hessian_files`: length + sha256 of every `.hess` file the `--ldlq` regex can make the run read (the selected bases' `keys` and `rms_keys` files) |
+| `linears` | not compared as a whole: every linear's resolved layout set (`{"text.layers.0.mlp.down": "w4a16.g64", "text.layers.3.attn.k": "bf16", ...}`); `PlanReuse` compares it linear by linear (above) |
 | `emit_complete`, `data_sha256` | not compared: the completion fields (below) |
 
 `hessian.json` alone does not identify the Hessians. It pins each file's K, rows and header trace
@@ -769,8 +790,9 @@ passes every check. A reuse run never reads the files of the linears it copies, 
 shards and the `.hess` files are hashed in one parallel pass (about 54 GiB for hessian-v1 with
 `--ldlq ".*"`, on NVMe).
 
-Not compared: the group rules, `--output`, `--threads` (the bytes do not depend on it, gate G1(c)),
-and input file paths. There is deliberately no `--reuse-allow-binary-mismatch`. Any rebuild can change
+Not compared: the group rules and the `--keep-bf16` regex (both resolved into `linears`), `--output`,
+`--threads` (the bytes do not depend on it, gate G1(c)), and input file paths. There is deliberately
+no `--reuse-allow-binary-mismatch`. Any rebuild can change
 what a quantizer writes. A container mixing two converters' tensors would measure as a group-rule
 effect, silently. The price of refusing is one baseline conversion. Also refused: a baseline without
 a guard, `--output` equal to the baseline, a header that is not JSON, and a quant block from
@@ -804,26 +826,44 @@ not been timed on the 27B yet. Nor has the 18.5 GB copy.
 **Sweep:** `tools/quant2/group_sweep.ps1 -Convert` converts the baseline with `--record-reuse-guard`,
 keeps it, and passes `--reuse-tensors-from` to every candidate. `<name>.meta.json` records
 `reused_from`, the container's `data_sha256` and its guard identity (`guard_json`: the guard without
-the completion fields). A measured baseline is never replaced silently. If its container is gone,
+the completion fields and without `linears`, the one field the candidates change). A measured
+baseline is never replaced silently. If its container is gone,
 it is converted again, and the new container must have the recorded `data_sha256` and `guard_json`.
 Otherwise the sweep stops, because `kl_baseline.json` and every candidate measured against it are
 stale; start a new `-OutDir`. A measured baseline from an older sweep, with no digest recorded,
-cannot be checked, so continue it with `-NoReuse`. `-Kl` leaves out a candidate whose `guard_json`
-differs from the baseline's. `-ReuseFrom <container>` uses another source; `-NoReuse` is the old
-full-conversion path.
+cannot be checked, so continue it with `-NoReuse`. Since guard v3, `guard_json` no longer carries the
+recipe's `--keep-bf16` (a keep candidate changes it), so `-Kl` leaves out a candidate whose
+`guard_json` differs from the baseline's, whose `keep_bf16_linears` is not the baseline's plus (keep) /
+minus (unkeep) / unchanged by (group) its own set, or whose `baseline_data_sha256` (the baseline it
+was planned and verified against) is not the measured baseline's `data_sha256`. A measured baseline
+also fixes the recipe's `--keep-bf16` for its `-OutDir`: a run whose `-Recipe`/`-ExtraArgs` give
+another is refused before any work, and `candidates.json` carries the baseline's own `convert_args`
+as the recipe. `-ReuseFrom <container>` uses another source; `-NoReuse` is the old full-conversion
+path.
 
-**Test:** `convert_reuse`, CPU, ~35 s. It runs a synthetic 2-shard checkpoint through the sweep's
+**Test:** `convert_reuse`, CPU, ~45 s. It runs a synthetic 2-shard checkpoint through the sweep's
 recipe (imatrix, kv-calib, MTP, draft head, vision) and through `--rotate q2ab --ldlq ".*"` with rms
 Hessians. It checks:
 - reuse(R) == full(R), and the reverse, `data_sha256` included;
 - chained reuse, a group change on both sides, and a default-group rule;
 - a moved checkpoint and another `--threads` are accepted;
 - every flag, input file, checkpoint file and binary difference is refused, and so is each of the
-  48 guard leaves mutated in a copy of the baseline;
+  64 guard leaves (the 17 `linears` entries included) mutated in a copy of the baseline;
 - every inconsistent or unfinished baseline is refused. That includes one whose data no longer
-  matches its digest: half zeroed at full length, or one bit flipped;
+  matches its digest (half zeroed at full length, or one bit flipped), and one whose per-linear
+  record is missing, names a linear this run does not write, misses one, disagrees with its group map
+  or keep list, or names tensors the baseline does not have;
 - a `.hess` payload edited in place under an unchanged `hessian.json` is refused. So are two
-  swapped same-K files, even by a full run.
+  swapped same-K files, even by a full run;
+- (e) `--keep-bf16` differing: a keep added (layer 0 `mlp.down`, one linear recomputed, the
+  `keep_bf16_extra_bytes` delta exactly `2NK - w4a16(g64)`), a keep removed (`attn.v`), the reverse,
+  another spelling of the same keep set (nothing recomputed), a keep together with a group rule on
+  the same class (keep wins; from the no-rule baseline and from a baseline with rules), each ==
+  its full run; a keep change together with any other difference is still refused; and on the
+  q2ab + LDLQ fixture, layer 0 `mlp.down` (down Hadamard), layer 1 `attn.o` (o Hadamard) and
+  `attn.k` (rms tap shared with `attn.qg`/`attn.v`) kept: their bf16 bytes are the folded weights,
+  reuse == full both ways, and un-keeping them LDLQs exactly those three (`attn.k`'s factor fresh
+  where the full run took it from the cache).
 
 **Measured on the 27B (2026-09-26, `D:\models\r4dx\q3-reuse-test`, recipe `run_variants.ps1`'s base +
 `--rotate q2ab --hessian-dir hessian-v1 --ldlq .`, while corpus v2 generation ran on the GPU):** the
@@ -835,6 +875,160 @@ differs only under `r4dx_convert_run.reused_from`. The pre-feature `qwen38-27b-q
 refused as a baseline (no guard). Most of a reuse run is the recomputed linears' own LDLQ
 factorizations (an `mlp.down` factor is ~12.6 s, 32 of them), so a candidate on a smaller class is
 cheaper still.
+
+### 5.3 Sensitive-tensor candidates (bf16 keep)
+
+llama.cpp's `Q4_K_M` keeps `attn_v` and `ffn_down` at a higher precision in half the layers. r4dx has
+one higher precision, bf16 (`--keep-bf16`): 2 bytes per weight against w4a16 g64's 0.5625, so keeping
+a linear adds 1.4375·N·K bytes, 3.56x its w4a16 size. v6 bought bf16 `attn.k`/`attn.v` (+0.2246 GiB)
+at Milestone 11's 0.0168 nats/GiB (`docs/validation.md`, v5 recipe). On the current recipe that price
+no longer holds:
+
+| container (section 7) | attn.k / attn.v | mean KL | weights |
+|---|---|--:|--:|
+| q2ab_ldlq | bf16 | 0.02261 | -- |
+| q2ab_nokv | w4a16 g64 | 0.02333 | -0.2246 GiB |
+
+That is +0.00072 nats for 0.2246 GiB, **0.0032 nats/GiB**, a fifth of Milestone 11's figure: LDLQ and
+the rotation removed most of the error bf16 was buying back, so the Milestone 11 per-class ranking is
+stale for every class, not just k/v. The sweep therefore measures bf16 keeps on the current recipe as
+candidates in the same currency as the groups, and prices the recipe's own k/v keep as two savers.
+
+The current recipe is q2ab_ldlq (section 7). `group_sweep.ps1`'s default `-Recipe` alone is the
+unrotated v6 recipe, so the Q3 round runs:
+
+```powershell
+.\tools\quant2\group_sweep.ps1 -Convert -Kl `
+    -ExtraArgs '--rotate','q2ab','--hessian-dir','D:\models\r4dx\hessian-v1','--ldlq','.'
+```
+
+Every later run on that `-OutDir` (a bare `-Kl` re-collect included) passes the same `-ExtraArgs`.
+The startup line prints the recipe's `--keep-bf16`, `--rotate` and `--ldlq`.
+
+**Candidate kinds** (`tools/quant2/group_sweep.ps1`; `-CandidateFile` rows
+`{"name", "kind", "bases_regex", "group"}`, a row without `kind` is a group candidate):
+
+- `group`: the set moves to g32 / g128 (`--w4a16-group-rule "<bases_regex>=<g>"`), as before.
+- `keep`: the set is written in bf16. `--keep-bf16` is single-valued (r4dx-convert keeps the last
+  one), so a second flag would silently REPLACE the recipe's k/v term and confound the candidate
+  with "k/v quantized". The recipe's `--keep-bf16` is replaced by ONE merged regex,
+  `(?:<recipe>)|(?:<bases_regex>)`.
+- `unkeep`: the set, which the recipe keeps, is quantized like every other linear (LDLQ included):
+  `^(?![\s\S]*?(?:<bases_regex>))[\s\S]*?(?:<recipe>)`, which matches iff the recipe's regex matches
+  and the candidate's does not, anchored or not.
+
+Every candidate is verified against the converter's output, not its regex text. Before converting,
+its intended set is the baseline's linears that `bases_regex` matches, each in the state the kind
+needs (w4a16 for group / keep, kept for unkeep). After converting, the linears whose layout differs
+from the baseline's (read from the two tensor directories) must be exactly that set, at the
+candidate's precision; the converter's `keep_bf16_linears` must be the baseline's plus / minus it;
+and a reuse run's `reused_from.linears_recomputed` must be the same set. `<name>.meta.json` records
+`kind`, `precision`, the set (`linears`) and `extra_bytes`: what a `--layout w4a16` load reads (wq +
+wsz, or bf16.w), candidate minus baseline, cross-checked against the converter's
+`w4a16_group_extra_bytes` / `keep_bf16_extra_bytes` delta (the baseline already carries +241,172,480 B
+for its 32 k/v linears). Reuse (5.2) recomputes only the changed linears; a kept linear is folded and
+rounded to bf16 without LDLQ, so a keep candidate converts faster than a group candidate of the same
+class. `-ListCandidates` prints the list, with each candidate's resolved linear count and byte delta
+once the baseline is converted.
+
+**Allocation** (`tools/quant2/alloc_groups.py`): every option is one precision for one linear set.
+Two candidates whose recorded linear SETS overlap are mutually exclusive -- `mlp.down.L0-3.bf16` and
+`mlp.down.L0-31.g32` were each measured with the other's linears at the baseline's precision, so
+their deltas do not add (and keep wins over a rule in the converter). An overlapping saver never
+funds a spender. Unkeep savers are ordinary savers and can fund a keep or a g32 spender.
+
+The greedy fill alone settles an overlap by ORDER: free savers are taken first, then spenders by
+nats/GiB, and the first pick locks its linears. Every default keep lies inside a g32 and a g128
+candidate of its class half, so a free g128 half, or a g32 half slightly ahead by nats/GiB, would
+lock out a keep that recovers several times more. Two steps follow the fill:
+
+- **Exchange pass.** Each candidate left out because it overlaps a pick is priced as a swap. The
+  picks it overlaps go out, it goes in, the shortfall is funded by the cheapest disjoint savers
+  (judged by total KL), and the fill re-runs on what that frees. The best improving swap is made, and
+  the pass repeats until no swap improves.
+- **Exhaustive step.** The first-order optimum is computed exactly, cluster by overlap cluster, on
+  the bytes/dKL Pareto frontier. The default list's clusters have at most three candidates, and the
+  step takes milliseconds for the 41 candidates. It replaces the picks only when strictly better.
+  On seeded random inputs shaped like the default list, the fill alone reaches the optimum in
+  151/300, the fill plus exchange pass in 275/300, and all three steps in 300/300
+  (`--self-test`).
+
+Candidates left out for overlap are named with their role, free savers included.
+
+The flags printed for the picks carry one `--keep-bf16` that replaces the recipe's (recipe + keeps -
+unkeeps), with the linear set it must resolve to. The recipe is the measured baseline's
+`convert_args`. The allocator checks, with Python's `re`, that the regex matches exactly that set
+among every linear the file names: the baseline's w4a16 and kept linears and every candidate's set.
+If a recipe does not match the baseline's, the allocator exits 2 at that point instead of producing
+a combined container that differs from the prediction. After converting, check the combined
+container's `keep_bf16_linears` too.
+
+**Runtime support** (all ten classes run as bf16 inside a w4a16 container; M11 = measured kept in
+Milestone 11, unrotated):
+
+| class | TP=1 | TP=2 | q2ab-rotated |
+|---|---|---|---|
+| `gdn.in_proj_qkv` | `LoadQuantLinearWithFallback` loads `.bf16.w`, `ApplyLinear`'s kBf16 case; M11 | `ShardLoader::Linear` slices the bf16 form, `Rows{KeyDim,KeyDim,ValueDim}`; untuned (FallbackTuning) | in-projection: `W diag(1+w) Q` folded in fp32, rounded to bf16 once (the path the always-bf16 `gdn.in_proj_a/b` take) |
+| `gdn.in_proj_z` | same; M11 | `Rows{ValueDim}`; untuned | in-projection fold |
+| `gdn.out_proj` | same; M11 | `Cols(ValueDim)`; untuned | `Q^T W Hb` folded before the bf16 emit; the runtime's Hadamard keys on its signs, not the weight's layout. **Not yet measured.** |
+| `attn.qg` | same; M11 | `Rows{2*attn_out}`; its rank shape has a bf16 row | in-projection fold |
+| `attn.k`, `attn.v` | bf16 in the recipe | tuned bf16 rows at 512x5120 | measured: q2ab_ldlq, TP=2 emulate smoke 162/0 (G6) |
+| `attn.o` | same; M11 | `Cols(attn_out)`; untuned | `Q^T W Hb`; the gate-multiply Hadamard keys on its signs. **Not yet measured.** |
+| `mlp.gate_up` | same; M11 (two depth halves) | `Rows{I,I}`; untuned | in-projection fold (post_attention_layernorm) |
+| `mlp.down` | same; M11 | `Cols(intermediate)`; untuned | `Q^T W Hb`; the Hadamard fused into silu_mul keys on its signs. **Not yet measured.** |
+| `lm_head` | M11 (+1.739 GiB, 0.0033 nats/GiB) | vocab split; untuned | never folded (outside the rotated stack) |
+
+**Byte prices** (w4a16 g64 = N·K/2 + N·K/16 bytes, bf16 = 2·N·K):
+
+| class | [N, K] | linears | w4a16 g64 / linear | bf16 / linear | keep delta / linear | whole class kept |
+|---|---|--:|--:|--:|--:|--:|
+| `gdn.in_proj_qkv` | [10240, 5120] | 48 | 29,491,200 | 104,857,600 | +75,366,400 | +3.3691 GiB |
+| `gdn.in_proj_z` | [6144, 5120] | 48 | 17,694,720 | 62,914,560 | +45,219,840 | +2.0215 GiB |
+| `gdn.out_proj` | [5120, 6144] | 48 | 17,694,720 | 62,914,560 | +45,219,840 | +2.0215 GiB |
+| `attn.qg` | [12288, 5120] | 16 | 35,389,440 | 125,829,120 | +90,439,680 | +1.3477 GiB |
+| `attn.k`, `attn.v` | [1024, 5120] | 16 + 16 | 2,949,120 | 10,485,760 | +7,536,640 | +0.2246 GiB (both) |
+| `attn.o` | [5120, 6144] | 16 | 17,694,720 | 62,914,560 | +45,219,840 | +0.6738 GiB |
+| `mlp.gate_up` | [34816, 5120] | 64 | 100,270,080 | 356,515,840 | +256,245,760 | +15.2734 GiB |
+| `mlp.down` | [5120, 17408] | 64 | 50,135,040 | 178,257,920 | +128,122,880 | +7.6367 GiB |
+| `lm_head` | [248320, 5120] | 1 | 715,161,600 | 2,542,796,800 | +1,827,635,200 | +1.7021 GiB |
+
+**Default keep / unkeep candidates** (after the 30 group candidates; GiB against the baseline):
+
+| name | kind | layers | linears | extra GiB |
+|---|---|---|--:|--:|
+| `mlp.down.L0-3.bf16` | keep | 0-3 | 4 | +0.4773 |
+| `mlp.down.L60-63.bf16` | keep | 60-63 | 4 | +0.4773 |
+| `mlp.gate_up.L62-63.bf16` | keep | 62, 63 | 2 | +0.4773 |
+| `gdn.in_proj_qkv.L0-7.bf16` | keep | 0-7 (GDN) | 6 | +0.4211 |
+| `gdn.in_proj_qkv.L56-63.bf16` | keep | 56-63 (GDN) | 6 | +0.4211 |
+| `gdn.out_proj.L0-15.bf16` | keep | 0-15 (GDN) | 12 | +0.5054 |
+| `gdn.out_proj.L48-63.bf16` | keep | 48-63 (GDN) | 12 | +0.5054 |
+| `attn.o.L0-31.bf16` | keep | 3, 7, ..., 31 | 8 | +0.3369 |
+| `attn.o.L32-63.bf16` | keep | 35, 39, ..., 63 | 8 | +0.3369 |
+| `attn.kv.L0-31.g64` | unkeep | 3, 7, ..., 31 | 16 | -0.1123 |
+| `attn.kv.L32-63.g64` | unkeep | 35, 39, ..., 63 | 16 | -0.1123 |
+
+Quantizing all of k/v measured +0.00072 nats, so each half should move about 0.0004; splitting k from
+v is probably below what rung 4 resolves. `lm_head` bf16 (+1.7021 GiB, ~3x a candidate) is left out:
+`lm_head.g32` (+0.074 GiB) is its affordable probe, and a keep regex for it must be `^lm_head$`
+(`lm_head$` also keeps `mtp.draft_head.lm_head`). Lower-prior sets for a `-CandidateFile`:
+`gdn.in_proj_z` layers 48-63 (+0.5054 GiB), `attn.qg` layers 51/55/59/63 (+0.3369), `mlp.gate_up`
+layers 0-1 (+0.4773); a whole layer 0 (+0.5124) or 63 (+0.4843) only as a diagnostic, since it
+overlaps the class candidates. Anchor every keep regex with `^text\.layers\.`: an unanchored
+`mlp\.down$` or `attn\.o$` also keeps the MTP head's linears.
+
+Caveats:
+
+- The three bf16 out-projections in a rotated container are correct by code (the fold runs before
+  the bf16 emit; `convert_reuse` (e-iv) checks the kept bytes are the folded weights) but have never
+  been measured. The first KL of such a candidate doubles as that check, and so does its load line
+  `r4dx: N linear(s) ... loaded as bf16`, which must read 32 + the candidate's linear count.
+- TP=2: only `attn.k`/`attn.v` have tuned TP=2 bf16 rows (`attn.qg`'s 6144x5120 rank shape matches
+  a TP=1 bf16 row). Every other kept class runs FallbackTuning at TP=2. KL is measured at TP=1, but a
+  TP=2 decode number for a kept pick needs `tune_gemm.py` bf16 rows at the per-rank shapes first.
+- Cost: a ~0.48 GiB spender is ~+2.9% weight bytes, ~-3.8% plain decode at the measured 1.23-1.30x
+  amplification. At equal bytes it is funded only where its nats/GiB beats the cheapest savers,
+  including the two k/v halves at ~0.003.
 
 ## 6. GPU runs this plan needs (each handed to the user)
 

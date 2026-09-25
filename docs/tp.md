@@ -1,6 +1,6 @@
 # TP=2 tensor parallel for r4dx -- implementation design
 
-Branch `tp2` (worktree `C:\Users\pay20\dev\r4dx-tp2`, from `main` at `aa54c20`). Written 2026-09-24.
+Branch `tp2` (worktree `%USERPROFILE%\dev\r4dx-tp2`, from `main` at `aa54c20`). Written 2026-09-24.
 This is the design coding agents follow **literally**. Where it says MUST, do exactly that; where it
 names a file, function or signature, use that name. Anything not covered here is a question for the
 user, not a judgment call.
@@ -1757,7 +1757,7 @@ The first run **creates** the TP table (no `--append`), the second appends to it
 `gemm_tuning_table.inc`:
 
 ```powershell
-$env:HIP_VISIBLE_DEVICES='1'; $env:R4DX_LIBR4D_BUILD='C:\Users\pay20\dev\libr4d\build-win\g64'
+$env:HIP_VISIBLE_DEVICES='1'; $env:R4DX_LIBR4D_BUILD='%USERPROFILE%\dev\libr4d\build-win\g64'
 & $py tools\profile\tune_gemm.py --layouts w4a16 --w4a16-group 64 --out src\model\gemm_tuning_table_tp2.inc `
   --shapes tp2.gdn.in_proj_qkv,tp2.gdn.in_proj_z,tp2.out_proj,tp2.mlp.gate_up,tp2.mlp.down,tp2.lm_head
 & $py tools\profile\tune_gemm.py --layouts bf16 --append --out src\model\gemm_tuning_table_tp2.inc --shapes tp2.attn.kv
@@ -2010,7 +2010,7 @@ and the evidence.
   tp_bench's vs-stand-in L, so the projection is short by 128 x the stand-in cost."** Rejected in
   its premise. The 7.47 us (10 KiB) and 13.33 us (80 KiB) numbers this design uses **are**
   tp_bench's `L_vs_no_ar_kernel` values, not vs-stand-in: the sweep's own output
-  (`C:\Users\pay20\dev\r4dx\tools\tp_bench\build\runs\sweep.json`, untracked build output in the
+  (`%USERPROFILE%\dev\r4dx\tools\tp_bench\build\runs\sweep.json`, untracked build output in the
   main worktree, 2026-09-24) has in `summary.decision` `best_L_vs_no_ar_kernel_us_10KiB = 7.470` and `_80KiB = 13.333`, while
   `best_L_us_10KiB` (vs stand-in) is 8.263 and `_80KiB` 11.939; `tools/tp_bench/README.md:23` labels
   them "(vs no AR kernel)". `NoopComm` with no kernel is exactly tp_bench's condition (c), so G3 +
@@ -2250,7 +2250,7 @@ it refines.
   - A SKIPped row (row 7 without the golden image) makes the run `G2 INCOMPLETE` and exits
     non-zero unless `-AllowSkip` is given.
   - The tp2 worktree has no gitignored `golden_out`. G2 therefore passes
-    `-Image C:\Users\pay20\dev\r4dx\tools\reference\golden_out\vision_test_image.png`, which only
+    `-Image %USERPROFILE%\dev\r4dx\tools\reference\golden_out\vision_test_image.png`, which only
     reads it.
 - **N27 (10.1 `tool_tp_step_bench`).** The tool prints and writes `embed_device_resident` to the
   JSON. Each process takes the embedding-mirror decision from its own free VRAM, so G3 compares
@@ -2801,12 +2801,12 @@ it refines.
     `test_tp_emulation` included. The one failure is the known `test_mtp`
     `CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled trajectories, N29).
   - **G4: PASS.** These are 10.4's commands with two differences.
-    - `--ref-dir` is `C:\Users\pay20\dev\r4dx-m8\tools\reference\kl_out\ref`, the Rung 4 bf16
+    - `--ref-dir` is `%USERPROFILE%\dev\r4dx-m8\tools\reference\kl_out\ref`, the Rung 4 bf16
       reference dumps, only read. The tp2 worktree has no gitignored `kl_out\ref`. Its
       `kl_corpus\tokens.json` has the same SHA-256, and `kl_report.py` checks each segment's
       token-id hash.
     - `tool_teacher_forced_logprobs` does not create `--out-dir`, so the two directories were made
-      first. `kl_report.py` ran under `C:\Users\pay20\dev\.venv` (numpy 2.4.3); the README's venv
+      first. `kl_report.py` ran under `%USERPROFILE%\dev\.venv` (numpy 2.4.3); the README's venv
       does not exist on this box.
 
     `kl_v6_tp2emu.json`, KL(ref || TP=2 emulated):

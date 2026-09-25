@@ -302,6 +302,16 @@ for bit. A dump whose rows depend on an internal batching knob is the wrong arti
 KL divergence from, so the tool has one path. At ~26 ms/row a 2048-token segment costs about a
 minute, which is not the bottleneck in this rung.
 
+> **2026-09-25:** a window of up to 10 rows is now row-identical to the step path, except where it
+> straddles a change of the attention kernel's segment width (context 512, 1024, ... at `--max-ctx`
+> >= 1024) -- [mtp.md](mtp.md), "Sampled rounds are bit-exact". The tool still has one path; this
+> only removes the reason above for most positions. Its own rows (one `Prefill` of one token, then
+> `DecodeStep`: every GEMM at M=1, attention at `q_len = 1`) are touched by one part of that fix:
+> the decode attention now decides its lazy rescale per row, which moves the last bits of rows past
+> 16 x segments keys. Re-run on `qwen38-27b-v6.r4dx` (`--max-ctx 4096`, all four dumps change):
+> mean KL 0.03856 -> 0.03853, top-1 90.86% -> 91.03%, 2 positions above 1 nat either way; the two
+> dumps differ from each other by mean KL 0.00039. The numbers in this file stand.
+
 ### Rung 4 measurement: w4a16
 
 **Measured 2026-09-22, HIP device 1, real 64-layer container `D:/models/r4dx/qwen38-27b-v3.r4dx`.**

@@ -23,9 +23,13 @@ struct LinearTuning {
 // row was measured at (one of the M-bands tools/profile/tune_gemm.py swept: 1,2,4,8,16,32,64) --
 // PickTuning below looks up the smallest tabulated M that is >= the caller's chunk M (a tuning
 // measured for a wider M is still legal, just not necessarily optimal, for a narrower call; the
-// reverse -- a narrower M's tuning serving a wider call -- is also legal since WV/SK/MB/NPW/NT
-// only choose how the same sum is tiled, never what it computes, but is more likely to
-// underutilize the GPU on the wider call, so PickTuning always rounds up, never down).
+// reverse -- a narrower M's tuning serving a wider call -- is also legal, but is more likely to
+// underutilize the GPU on the wider call, so PickTuning rounds up, never down). One exception: a
+// chunk of M <= 16 rows (one row tile) always gets the M=1 band's tuning (NT aside), whatever the
+// M=2..16 bands measured. WV/MB/NPW/NT only choose how the work is laid out, but SK also sets the
+// order the partial sums are added in, so two M-bands with different SK give the same row
+// different last bits -- and a speculative verify row must equal the single-row decode row exactly
+// (linear.cpp's kRowTile).
 struct GemmTuningRow {
   Layout layout;
   int64_t N, K, M;

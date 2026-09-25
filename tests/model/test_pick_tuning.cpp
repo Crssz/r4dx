@@ -3,7 +3,8 @@
 // kernels accept. The table is swept at ONE w4a16 group (tools/profile/tune_gemm.py) but compiled
 // into both R4DX_W4A16_GROUP builds, and r4d_gemm_w4a16_nt_m64 throws when K % (SK * group) != 0:
 // a group-64 row with SK=16 at K=5120 is exactly that on a group-128 build, so ResolveTuning
-// (src/model/linear.cpp) must skip it. Host-only -- PickTuning and the *_group() exports are plain
+// (src/model/linear.cpp) must skip it. And every chunk of M <= 16 rows must get the SK the M=1
+// band gets (CheckRowTileSk below). Host-only -- PickTuning and the *_group() exports are plain
 // host functions, no HIP call is made -- so it runs on every build, like test_mtp_round.
 #include <cstdint>
 #include <cstdio>
@@ -69,6 +70,31 @@ void CheckTable(const r4dx::model::GemmTuningRow (&table)[kRows], const char* wh
   }
 }
 
+// A speculative verify window (M = k+1 <= 16 rows) must compute every row bit-identically to the
+// single-row decode (M=1) of the same context, or a sampled round can emit a different token than
+// plain sampled decode (docs/mtp.md, "Sampled rounds are bit-exact"). In these kernels a row's
+// arithmetic depends on SK and nothing else (linear.cpp's kRowTile), so every M in 1..16 must get
+// the SK that M=1 gets.
+template <size_t kRows>
+void CheckRowTileSk(const r4dx::model::GemmTuningRow (&table)[kRows], const char* which,
+                    int& checked, int& failures) {
+  for (const auto& row : table) {
+    const LinearTuning t1 = r4dx::model::PickTuning(row.layout, row.N, row.K, 1);
+    for (int64_t m = 2; m <= 16; ++m) {
+      const LinearTuning t = r4dx::model::PickTuning(row.layout, row.N, row.K, m);
+      ++checked;
+      if (t.SK != t1.SK) {
+        std::fprintf(stderr,
+                     "FAIL (%s) layout=%d N=%lld K=%lld: M=%lld gets SK=%d but M=1 gets SK=%d -- a "
+                     "verify row of that width would not sum in decode's order\n",
+                     which, static_cast<int>(row.layout), static_cast<long long>(row.N),
+                     static_cast<long long>(row.K), static_cast<long long>(m), t.SK, t1.SK);
+        ++failures;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -82,5 +108,15 @@ int main() {
   r4dx::model::SetTp2TuningForThisThread(false);
   std::printf("test_pick_tuning: %d/%d PickTuning results launchable (w4a16 group %d)\n",
               checked - failures, checked, r4d_gemm_w4a16_nt_m64_group());
-  return failures == 0 ? 0 : 1;
+
+  int sk_failures = 0, sk_checked = 0;
+  CheckRowTileSk(r4dx::model::kGemmTuningTable, "main table", sk_checked, sk_failures);
+  r4dx::model::SetTp2TuningForThisThread(true);
+  CheckRowTileSk(r4dx::model::tp2::kGemmTuningTable, "tp2 table, tp thread", sk_checked,
+                 sk_failures);
+  CheckRowTileSk(r4dx::model::kGemmTuningTable, "main table, tp thread", sk_checked, sk_failures);
+  r4dx::model::SetTp2TuningForThisThread(false);
+  std::printf("test_pick_tuning: %d/%d M=2..16 picks share M=1's SK\n", sk_checked - sk_failures,
+              sk_checked);
+  return failures == 0 && sk_failures == 0 ? 0 : 1;
 }

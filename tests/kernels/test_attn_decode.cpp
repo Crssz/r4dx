@@ -352,6 +352,121 @@ int main() {
     ok = ok && (max_rel2 < 5e-2);
   }
 
+  // ---- a verify window (q_len=T) row vs the q_len=1 launch at that row's own position -----------
+  // Speculative decode is exact only if every row of a verify window rounds exactly like the plain
+  // decode step at its position (docs/mtp.md, "Sampled rounds are bit-exact"), so this is a BIT
+  // comparison. Each window straddles a 16-key tile boundary where the split-KV merge's segment
+  // count reaches a multiple of its 4 accumulation chains (ctx 48 -> 49, 112 -> 113, ...): the
+  // window's first 8 rows see one segment fewer than its last row. Before the merge counted each
+  // row's own segments (r4d_attn_splitkv_combine_kernel), those rows went through a different chain
+  // split than their own decode step and differed in their last bits. Same cache, same max_ctx,
+  // and no window crosses a change of tiles-per-segment (ctx 256 here), which reshapes the segments
+  // themselves and is not this check's subject.
+  const int T = 10;  // the widest window this kernel serves (q_len * gqa <= 64)
+  std::vector<uint16_t> qw_h(static_cast<size_t>(T) * q_heads * head_dim);
+  for (auto& v : qw_h) v = FloatToBf16(dist(rng));
+  DeviceBuffer<uint16_t> qw_d(qw_h.size()), outw_d(qw_h.size()), out1_d(qw_h.size());
+  qw_d.CopyFromHost(qw_h);
+  DeviceBuffer<int32_t> ctx_d(1);
+  // The window at positions p..p+T-1 over `cache`'s 300-token cache (a's block table, descales and
+  // max_ctx) against the T q_len=1 launches at each row's own position; returns the number of bf16
+  // outputs that differ.
+  auto WindowVsSteps = [&](const DeviceBuffer<uint8_t>& cache, int p) -> size_t {
+    R4DArgs w = a;
+    w.kv = cache.data();
+    w.q = qw_d.data();
+    w.seqused_k = ctx_d.data();
+    w.q_len = T;
+    const std::vector<int32_t> ctx_window = {p + T};
+    ctx_d.CopyFromHost(ctx_window);
+    const int64_t wbytes = r4d::AttnDecodeScratchBytes(w);
+    DeviceBuffer<uint8_t> wscratch_d(wbytes > 0 ? static_cast<size_t>(wbytes) : 1);
+    w.scratch = wbytes > 0 ? wscratch_d.data() : nullptr;
+    w.out = outw_d.data();
+    r4d::AttnDecodeFp8Kv(w, nullptr);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    const std::vector<uint16_t> outw_h = outw_d.CopyToHost();
+
+    for (int i = 0; i < T; ++i) {
+      R4DArgs s = a;
+      const size_t row_off = static_cast<size_t>(i) * q_heads * head_dim;
+      s.kv = cache.data();
+      s.q = qw_d.data() + row_off;
+      s.out = out1_d.data() + row_off;
+      s.seqused_k = ctx_d.data();
+      s.q_len = 1;
+      const std::vector<int32_t> ctx_row = {p + i + 1};
+      ctx_d.CopyFromHost(ctx_row);
+      r4d::AttnDecodeFp8Kv(s, nullptr);  // a.scratch is sized for q_len=1
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+    }
+    const std::vector<uint16_t> out1_h = out1_d.CopyToHost();
+    size_t differing = 0;
+    for (size_t e = 0; e < out1_h.size(); ++e) differing += (out1_h[e] != outw_h[e]);
+    return differing;
+  };
+  for (const int p : {40, 104, 168, 232}) {
+    const size_t differing = WindowVsSteps(cache_d, p);
+    std::printf("attn_decode verify window at positions %d..%d (ctx %d) vs q_len=1 at each row's "
+                "own position: %zu/%zu bf16 outputs differ\n",
+                p, p + T - 1, p + T, differing, qw_h.size());
+    ok = ok && differing == 0;
+  }
+
+  // ---- the same comparison where a segment's second tile rescales one row ----------------------
+  // At max_ctx 512 the merge has 16 segments, so past context 256 each spans 2 tiles, and a row's
+  // lazy rescale (its tile max above m_ref + GROW, 14 octaves on the f16 P path) can fire on a
+  // segment's SECOND tile. That decision used to be the whole wave's: one row's jump rescaled every
+  // row of its wave whose tile max had risen at all. A q_len=1 launch's wave holds the heads of one
+  // position, a verify window's the heads of 2-3, so the other positions' rows rescaled in the
+  // window and not in their own decode step. Here one key in the second tile of each of segments
+  // 5-8 is planted along the query of head 0 of every KV group at window position 1, 3, 6 or 8 --
+  // a row in each of the 4 waves -- so that those rows' max jumps by ~30 octaves there; nothing in
+  // the uniform(-1,1) data does. Window 280..289: it and every row's own launch have 2 tiles per
+  // segment, so the partition is the same and only the rescale decision can differ.
+  {
+    const int planted_key[] = {176, 208, 240, 272};  // 2nd tile of segments 5, 6, 7, 8
+    const int target_pos[] = {1, 3, 6, 8};            // window rows 6, 18, 36, 48: waves 0-3
+    const float plant_scale = 4.0f;                   // score ~ 4 |q|^2 / 16 * log2(e) ~ 30 octaves
+    const int n_plant = 4;
+    std::vector<uint16_t> kp_h(static_cast<size_t>(n_plant) * kv_heads * head_dim);
+    std::vector<uint16_t> vp_h(kp_h.size());
+    std::vector<int32_t> slot_p(n_plant);
+    for (int j = 0; j < n_plant; ++j) {
+      slot_p[j] = planted_key[j];
+      for (int kvh = 0; kvh < kv_heads; ++kvh) {
+        const size_t dst = (static_cast<size_t>(j) * kv_heads + kvh) * head_dim;
+        const size_t src_v = (static_cast<size_t>(planted_key[j]) * kv_heads + kvh) * head_dim;
+        const size_t src_q = (static_cast<size_t>(target_pos[j]) * q_heads + kvh * gqa) * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+          kp_h[dst + d] = FloatToBf16(plant_scale * Bf16ToFloat(qw_h[src_q + d]));
+          vp_h[dst + d] = v_h[src_v + d];  // the token's own V
+        }
+      }
+    }
+    DeviceBuffer<uint8_t> planted_d(cache_h.size());
+    planted_d.CopyFromHost(cache_h);
+    DeviceBuffer<uint16_t> kp_d(kp_h.size()), vp_d(vp_h.size());
+    DeviceBuffer<int32_t> slotp_d(n_plant);
+    kp_d.CopyFromHost(kp_h);
+    vp_d.CopyFromHost(vp_h);
+    slotp_d.CopyFromHost(slot_p);
+    r4dx_kv_write_paged_fp8_hnd(reinterpret_cast<int64_t>(kp_d.data()),
+                                 reinterpret_cast<int64_t>(vp_d.data()),
+                                 reinterpret_cast<int64_t>(slotp_d.data()),
+                                 reinterpret_cast<int64_t>(kd_d.data()),
+                                 reinterpret_cast<int64_t>(vd_d.data()),
+                                 reinterpret_cast<int64_t>(planted_d.data()), n_plant, kv_heads,
+                                 head_dim, block_size, kv_block_stride, kv_head_stride, 0);
+    R4DX_HIP_CHECK(hipDeviceSynchronize());
+    const int p = 280;
+    const size_t differing = WindowVsSteps(planted_d, p);
+    std::printf("attn_decode verify window at positions %d..%d (ctx %d, 2 tiles per segment, one "
+                "row per wave rescaled on a second tile) vs q_len=1: %zu/%zu bf16 outputs differ\n",
+                p, p + T - 1, p + T, differing, qw_h.size());
+    ok = ok && differing == 0;
+  }
+
   std::printf(ok ? "PASS\n" : "FAIL\n");
   return ok ? 0 : 1;
 }

@@ -37,7 +37,8 @@
 // decode/prefill re-measurement this table's new numbers were checked against, and the corrected
 // layout-ranking conclusion (mxfp4 is no longer competitive at decode/MTP-verify M, w4a16 stays the
 // shipped default). This affects speed only, never correctness -- WV/SK/MB/NPW/NT pick tiling, not
-// arithmetic.
+// arithmetic. (SK does set the order of each output's sums, i.e. its last bits: linear.cpp's
+// kRowTile keeps every chunk of <= 16 rows on the M=1 row so a verify row sums like a decode row.)
 static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kBf16, 10240, 5120, 1, {8, 4, 1, 1, 1}},  // gdn.in_proj_qkv 169.87us
     {Layout::kBf16, 10240, 5120, 2, {1, 16, 1, 1, 1}},  // gdn.in_proj_qkv 169.96us

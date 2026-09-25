@@ -1166,6 +1166,13 @@ sensitive to a moved boundary than an argmax is. `test_dflash_e2e.cpp` adjudicat
 divergence, on hardware, by recovering both logits rows -- see [sampling.md](sampling.md) section
 11.1.
 
+> **2026-09-25:** the verify row is now bit-identical to the decode row ([mtp.md](mtp.md), "Sampled
+> rounds are bit-exact"), so `test_dflash_e2e`'s sampled check requires all 8 trajectories to match
+> (8/8, where it measured 2/8) and greedy `--dflash k=7` emits plain decode's text on the standard
+> prompt at TP=1 and on all four `tests/model/mtp_prompts.txt` prompts at TP=2 (HEAD differed on
+> three). The class survives only where a window straddles a change of the attention split's segment
+> width (context 512, 1024, ... at `--max-ctx` >= 1024).
+
 ## 11. Files
 
 - `tools/reference/gguf_min.py` -- from-scratch GGUF v3 reader + Q8_0 dequantizer (numpy/struct

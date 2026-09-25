@@ -1,5 +1,81 @@
 # Status
 
+## Sampled speculation is bit-exact again: verify rows sum in decode's order, 2026-09-25
+
+`test_mtp`'s `CheckSampledRoundsMatchPlain [w4a16]` failed on main (0 of 18 sampled trajectories
+identical to plain sampled decode) and `tools/validate_spec_sampling.ps1 -Layouts w4a16` left 5 of
+24 rows unresolved, all `--mtp 3`. It was not a losslessness bug: acceptance, draws, commits and the
+row summaries were right every time. The verify window's rows were not bit-identical to the plain
+decode rows for the same context, for three reasons, and a draw between two near-tied candidates
+then picked a different token. All three are fixed ([mtp.md](mtp.md), "Sampled rounds are
+bit-exact"):
+
+1. **GEMM split-K.** The tuning table picks SK per M-band, and a verify window (M = k+1) got a
+   different SK than decode (M=1) for most shapes, so it added the same products in another order.
+   `PickTuning` now gives every chunk of at most 16 rows the M=1 band's WV/SK/MB/NPW, with NT=0 at
+   w4a16 (`src/model/linear.cpp`, `kRowTile`). The group-64 re-sweep (32093f2) did not create this;
+   the pre-re-sweep binary passes only because 2 of its 18 trajectories happen to match.
+2. **The attention split-KV merge** assigned KV segments to its 4 accumulation chains by the
+   window's segment count, so a window straddling a tile boundary merged its earlier rows in another
+   order than their decode steps (first at context 48 -> 49). It now counts each row's own segments
+   (unchanged at `q_len = 1`).
+3. **The attention's lazy rescale** was decided per wave, and a verify window's wave holds heads of
+   2-3 positions where a decode step's holds one, so past 16 x segments keys of context (512 at
+   `--max-ctx` >= 1024) one position's jump rescaled another's rows. It is now decided per row.
+   Before it, a v6 window at 600..607 had all 8 rows differ, and greedy `--mtp 3` / `--dflash` rows
+   from a 600-token prompt differed from the first verify row on.
+
+Fixes 2 and 3 are **edits to the libr4d submodule** (`third_party/libr4d/r4d_attn_decode_h256_gqa6.hip`),
+which have to be committed there (branch `windows-llp64`) and the submodule pointer bumped in the
+same r4dx commit; without them the new `test_attn_decode` windows fail. `third_party/CMakeLists.txt`
+now makes every libr4d unit depend on every libr4d header, and `r4d_attn_paged_h256_gqa6` on the two
+`.hip` files it includes, so an edit to any of them rebuilds the object.
+
+**Bounds.** A verify row equals the decode row for a window of at most 10 rows -- `--mtp` <= 9 at
+TP=1, every `--dflash-k`, every `--mtp` at TP=2. A wider window runs the prefill attention kernel
+(measured on v6: `--mtp 10`'s 11 rows all differ, `--mtp 9`'s 10 rows all match).
+
+| check | before (HEAD 2d954c5 unless noted) | this fix |
+|---|---|---|
+| `test_mtp` `CheckSampledRoundsMatchPlain`, identical / 18 | w4a16 **0** (FAIL), bf16 4 | **18 on all four layouts** |
+| `test_mtp` `CheckVerifyMatchesSequential`, logits that differ per row (w4a16) | 32,934-54,261 of 248,320 | **0** (now asserted) |
+| `test_dflash_e2e` `CheckSampledDflashMatchesPlain`, identical / 8 | 2 (this fix without fix 1) | **8** |
+| `validate_spec_sampling.ps1 -Layouts w4a16`, TP=1 | OK 10, WARN 9, **FAILED 5** | **24 / 24 byte-identical** |
+| `validate_dflash.ps1 -Layouts w4a16`, TP=1 | OK 2, WARN 1 (short prompt, `--mtp 7` control) | **3 / 3 byte-identical** |
+| `validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16` (both GPUs; fixes 1-2) | OK 13, WARN 8, FAILED 3 (P5 gate log) | **24 / 24 byte-identical**, no TDR |
+| v6 window at 600..607 (`max_ctx` 2048), rows that differ | 8 of 8 (with fixes 1-2) | **0** |
+| greedy `--dflash k=7` text vs plain, standard prompt | differs (TP=1 and TP=2) | **identical** |
+
+The plain baselines of both scripts hashed identically before and after (24 of 24 and 3 of 3,
+the multi-chunk and ~3,500-token prompts included), and the TP=2 plain baselines equal the P5 gate
+run's (`r4dx-tp2\build\logs\p5\gate_g12_spec_tp2.log`, 24 of 24). `tests\run_tests.ps1` on device 1:
+0 of 74 failed (59 passed, `test_mtp`, `test_dflash_e2e` and `test_tp_emulation` included; 15
+skipped, as each does when its fixture is absent).
+
+**Cost and side effects** ([perf.md](perf.md), "Sampled speculation bit-exact"). TP=1, standard
+protocol, mean of three: plain unchanged at w4a16, w4a8 and mxfp4 (same text); `--mtp 3` -0.1% to
++0.5%; `--dflash k=7` -0.2% to **-0.6%** (w4a16 74.66 -> 74.24), from the 8-row verify. TP=2: time
+per round -1.2% to +0.4% on four prompts, but tok/s moves with the text, because HEAD's speculative
+text at TP=2 differed from TP=2 plain decode on three of the four and now equals it: `--dflash`
+-6.8% (first five primes), -3.6% (haiku), -1.9%, +1.2%; `--mtp 3` +3.4% (haiku). **Plain decode
+changes past 16 x segments keys** (fix 3 at `q_len = 1`): the rows' last bits move, the softmax does
+not -- teacher-forced KL 0.03856 -> 0.03853, top-1 90.86% -> 91.03%, KL between the two dumps
+0.00039. Every plain text measured (the standard prompt at three layouts, 24 + 3 script baselines,
+the ~3,500-token one at `--max-ctx 4096` among them, four prompts at TP=2) is unchanged.
+
+The tests no longer accept a divergence: `CheckVerifyMatchesSequential` requires bit-identical
+rows; `CheckSampledRoundsMatchPlain` and `CheckSampledDflashMatchesPlain` fail on any mismatch and
+keep the classifier only to say which kind it is. New: `test_pick_tuning` checks every M=2..16 pick
+carries the M=1 pick's SK (host-only), and `test_attn_decode` compares five verify windows with
+`q_len = 1` launches bit for bit, one of them at 2 tiles per segment with a row rescaled on a
+second tile. Each fails without its fix.
+
+**Still open.** A window that straddles a change of the attention decode kernel's segment width
+(tiles per segment: context 512, 1024, ... at `--max-ctx` >= 1024, 256 at 512) still gives its
+earlier rows a different partition (measured: rows 510/511 of a window at 510..513; with all three
+fixes, a greedy `--mtp 3` run's rows match up to context 1024 and not after), and a sampled run
+that crosses one can diverge from plain decode from there on.
+
 ## Milestone 11 complete: v6 is the production container, and group 64 is the default, 2026-09-22
 
 `D:\models\r4dx\qwen38-27b-v6.r4dx` replaces `v5`: **mean KL 0.05342 -> 0.03851 (-27.9%), top-1

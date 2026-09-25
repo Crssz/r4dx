@@ -21,6 +21,7 @@
 // layout pair (w4a16/w4a16) is exercised, not the full layout matrix test_mtp.cpp sweeps, to keep
 // this test's own real-45GB-container-load cost bounded to a single load per Model construction.
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -470,14 +471,18 @@ bool CheckInjectionToggleGap(const ModelOptions& base_opts, const std::vector<in
 // (this is the real target against its real DFlash2 draft container), so the multi-token-round path
 // is exercised by the production drafter itself -- and the check asserts it was.
 //
-// The one divergence accepted, and how, is identical to test_mtp.cpp's (see that file's section
-// header): a speculative round computes its logits in one q_len>1 pass whose reduction order
-// differs from single-row decode's, which can move a CDF boundary past the draw. On a mismatch this
-// obtains the EXACT verify row the diverging token was resolved from (Model::ReadVerifyLogitsRow
-// after a deterministic re-run) plus the plain decode row for the same position, and accepts the
-// divergence only if canonically sampling each of those rows with that token's own draw reproduces
-// the respective run's token. The exact bookkeeping gate -- a round commits exactly as many
-// positions as it emitted tokens -- is asserted after EVERY round, not just on a mismatch.
+// No divergence is accepted, as in test_mtp.cpp (see that file's section header): a verify row is
+// bit-identical to the single-row decode row for the same context (docs/mtp.md, "Sampled rounds
+// are bit-exact"; this check's 96 + 96 positions stay below the attention split's first
+// tiles-per-segment change at max_ctx 512, context 256, where that identity has its one known
+// exception). Until 2026-09-25 a q_len>1 pass summed in a different order and this check accepted
+// the resulting divergence when it was proven; it measured 2 of 8 trajectories identical. On a
+// mismatch it still obtains the EXACT verify row the diverging token was resolved from
+// (Model::ReadVerifyLogitsRow after a deterministic re-run) plus the plain decode row for the same
+// position, and says which failure it is: two rows that differ yet each reproduce their own run's
+// token at that token's draw is the reduction-order mechanism back; anything else is a bookkeeping
+// bug. The exact bookkeeping gate -- a round commits exactly as many positions as it emitted
+// tokens -- is asserted after EVERY round, not just on a mismatch.
 //
 // The reference trajectory runs on the SAME Model (Reset() in between) rather than on a second
 // independently loaded one, for the same VRAM reason every other check in this file frees one
@@ -583,7 +588,7 @@ std::vector<float> PlainLogitsRowAt(Model& m, const std::vector<int32_t>& prompt
 }
 
 bool CheckSampledDflashMatchesPlain(Model& m, const std::vector<int32_t>& prompt,
-                                     size_t* exact_out, size_t* accepted_numeric_out,
+                                     size_t* exact_out, size_t* row_differs_out,
                                      bool* saw_accepted_draft_out,
                                      std::vector<int32_t>* first_plain_out,
                                      r4dx::kernels::SampleParams* first_params_out,
@@ -680,26 +685,30 @@ bool CheckSampledDflashMatchesPlain(Model& m, const std::vector<int32_t>& prompt
                       u < std::max(tie_decode.boundary, tie_verify.boundary))
                          ? "BETWEEN"
                          : "outside");
-        const bool cond_rows_same_context = (rel > 0.0 && rel <= 0.5);
+        size_t ndiff = 0;
+        for (size_t e = 0; e < row_verify.size(); ++e) {
+          ndiff += std::memcmp(&row_verify[e], &row_decode[e], sizeof(float)) != 0;
+        }
+        const bool cond_rows_same_context = (ndiff > 0 && rel <= 0.5);
         const bool cond_decode_reproduces_plain = (from_decode == plain[j]);
         const bool cond_verify_reproduces_spec = (from_verify == spec[j]);
         if (!(cond_rows_same_context && cond_decode_reproduces_plain &&
               cond_verify_reproduces_spec)) {
           std::fprintf(stderr,
-                       "%s   NOT the known batched-verify mechanism "
-                       "(rows-are-the-same-distribution=%s decode-row-reproduces-plain=%s "
-                       "verify-row-reproduces-spec=%s) -- this is a bookkeeping bug\n",
+                       "%s   a bookkeeping bug (rows differ but are the same distribution=%s "
+                       "decode-row-reproduces-plain=%s verify-row-reproduces-spec=%s) -- FAIL\n",
                        tag.c_str(), cond_rows_same_context ? "yes" : "NO",
                        cond_decode_reproduces_plain ? "yes" : "NO",
                        cond_verify_reproduces_spec ? "yes" : "NO");
           return false;
         }
         std::fprintf(stderr,
-                     "%s   ACCEPTED as the known batched-verify divergence (docs/perf.md, "
-                     "tools/validate_dflash.ps1): the speculative path sampled the RIGHT draw, from "
-                     "the RIGHT row of the RIGHT round, with the RIGHT filters\n",
-                     tag.c_str());
-        ++*accepted_numeric_out;
+                     "%s   the speculative path sampled the RIGHT draw from the RIGHT row of the "
+                     "RIGHT round with the RIGHT filters, but that verify row is not bit-identical "
+                     "to the decode row (%zu logits differ): the window's reduction order no longer "
+                     "matches single-row decode's -- FAIL\n",
+                     tag.c_str(), ndiff);
+        ++*row_differs_out;
       }
     }
   }
@@ -772,7 +781,7 @@ static int RunTest() {
     // forensic replays, so this keeps the same VRAM footprint as every other check in this file.
     const ModelOptions& sampled_opts = opts;
     const std::vector<int32_t> code_prompt = MakeCodeLikePromptTokens(96);
-    size_t exact = 0, accepted_numeric = 0;
+    size_t exact = 0, row_differs = 0;
     bool saw_accepted_draft = false;
     std::vector<int32_t> first_plain;
     r4dx::kernels::SampleParams first_params;
@@ -783,7 +792,7 @@ static int RunTest() {
       dflash_opts.dflash_container = kDflashContainerPath;
       dflash_opts.dflash_draft_k = kDflashK;
       Model m = Model::Load(dflash_opts);
-      ok = CheckSampledDflashMatchesPlain(m, code_prompt, &exact, &accepted_numeric,
+      ok = CheckSampledDflashMatchesPlain(m, code_prompt, &exact, &row_differs,
                                           &saw_accepted_draft, &first_plain, &first_params,
                                           &first_seed);
     }  // free the drafter-loaded Model before loading a second full 27B target (see above)
@@ -803,9 +812,16 @@ static int RunTest() {
         (sizeof(kSampledKs) / sizeof(kSampledKs[0])) * 2 * (sizeof(kSampledSeeds) / sizeof(kSampledSeeds[0]));
     std::fprintf(stderr,
                  "[dflash] sampled-equality: %zu/%zu trajectories token-for-token identical to "
-                 "plain sampled decode, %zu accepted as the known batched-verify divergence, 0 "
-                 "bookkeeping failures\n",
-                 exact, combos, accepted_numeric);
+                 "plain sampled decode, %zu diverged from a verify row that differs from the "
+                 "decode row, 0 bookkeeping failures\n",
+                 exact, combos, row_differs);
+    if (exact != combos) {
+      std::fprintf(stderr,
+                   "FAIL: CheckSampledDflashMatchesPlain: %zu of %zu sampled trajectories diverged "
+                   "from plain sampled decode (see the DIVERGENCE lines above)\n",
+                   combos - exact, combos);
+      return 1;
+    }
     if (!CheckSampledPlainDecodeIsDrafterIndependent(sampled_opts, code_prompt, first_plain,
                                                       first_params, first_seed)) {
       std::fprintf(stderr, "FAIL: CheckSampledPlainDecodeIsDrafterIndependent\n");

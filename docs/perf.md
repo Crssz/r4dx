@@ -1,5 +1,83 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Sampled speculation bit-exact: what it costs (2026-09-25)
+
+The fix that makes every verify row bit-identical to the decode row ([mtp.md](mtp.md), "Sampled
+rounds are bit-exact") changes three things on the hot path: `PickTuning` gives every GEMM chunk
+of 2-16 rows the M=1 band's WV/SK/MB/NPW with NT=0 (w4a16), the attention split-KV merge counts
+each row's own segments, and the decode attention decides its lazy rescale per row. HIP device 1,
+`qwen38-27b-v6.r4dx`, the Milestone 11 protocol (standard prompt, `--vision off --think off
+--temperature 0 --max-tokens 256 --max-ctx 2048 --stats`), HEAD and the fix interleaved, three runs
+each:
+
+| Layout, path | HEAD 2d954c5 | **This fix** | Delta (means) | Acceptance / tok-round | Text |
+|---|--:|--:|--:|---|---|
+| w4a16 plain | 36.27, 36.24, 36.24 | **36.26, 36.27, 36.23** | 0.0% | -- | identical (84 tokens, EOS) |
+| w4a16 `--mtp 3` | 68.89, 68.78, 68.67 | **69.15, 69.20, 69.01** | **+0.5%** | 50.0% / 2.47, both | equals plain, both |
+| w4a16 `--dflash` k=7 | 74.71, 74.59, 74.67 | **74.22, 74.30, 74.21** | **-0.6%** | 24.9% / 2.71, both | HEAD differs from plain; the fix equals plain |
+| w4a8 plain | 36.01, 36.01, 36.00 | 36.02, 35.99, 36.01 | 0.0% | -- | identical (81 tokens) |
+| w4a8 `--mtp 3` | 59.09, 59.01, 59.10 | 59.06, 58.97, 59.07 | -0.1% | 40.5% / 2.19, both | equals plain, both |
+| w4a8 `--dflash` k=7 | 66.58, 66.47, 66.54 | 66.21, 66.22, 66.32 | -0.4% | 22.3% / 2.53, both | equals plain, both |
+| mxfp4 plain | 32.73, 32.78, 32.74 | 32.72, 32.78, 32.78 | 0.0% | -- | identical (89 tokens) |
+| mxfp4 `--mtp 3` | 54.43, 54.41, 54.39 | 54.60, 54.58, 54.65 | +0.4% | 39.0% / 2.17, both | equals plain, both |
+| mxfp4 `--dflash` k=7 | 66.47, 66.52, 66.55 | 66.35, 66.49, 66.35 | -0.2% | 24.7% / 2.70, both | equals plain, both |
+
+bf16 was not measured: the 27B bf16 layout does not fit one card. The DFlash2 loss is the 8-row
+verify: an earlier build with the first two changes put one `VerifyWindow` of 8 rows at position 60
+at 32.12 ms with HEAD's per-band table and 32.27 ms with this fix (mean of two runs; 4 rows: 30.00
+-> 29.83 ms), and measured `--dflash` -0.9% and `--mtp 3` +0.3% on this protocol. The merge change
+alone costs nothing measurable (`--dflash` 74.51, 74.47 against HEAD's 74.64, 74.48; `--mtp 3`
+68.76, 68.70 against 68.71, 68.69). The per-row rescale adds a few scalar operations inside a
+branch the old code already took, and is included in the numbers above.
+
+**`--tp 2`** (both cards, the P5 setup: rank 0 on device 1, rank 1 on device 0 with the desktop live,
+the same flags plus `--tp 2`, two runs each, `tools\tp\tdr_check.ps1` 30 s after every run, no TDR).
+At HEAD the greedy speculative text at TP=2 differed from TP=2 plain decode on three of the four
+`tests/model/mtp_prompts.txt` prompts; with the fix it equals plain decode on all four, and that
+changes how many drafts each round accepts. So tok/s moves with the text, and the cost of the fix is
+the time per round:
+
+| Prompt, path | HEAD tok/s (rounds) | **This fix** tok/s (rounds) | tok/s | ms / round | Text |
+|---|--:|--:|--:|--:|---|
+| haiku plain | 61.53, 61.40 | 60.78, 61.60 | -0.5% | -- | identical (84 tokens) |
+| haiku `--mtp 3` | 108.17, 107.94 (35) | 111.79, 111.61 (34) | +3.4% | 22.21 -> 22.12 | HEAD differs from plain; the fix equals plain |
+| haiku `--dflash` k=7 | 121.05, 120.71 (30) | 117.40, 115.69 (31) | **-3.6%** | 23.16 -> 23.25 (+0.4%) | HEAD differs from plain; the fix equals plain |
+| Fibonacci `--dflash` k=7 | 252.76, 249.70 (19) | 253.81, 254.72 (19) | +1.2% | 23.46 -> 23.18 | equals plain, both |
+| Romeo and Juliet `--dflash` k=7 | 121.73, 121.69 (30, 85 tokens) | 119.59, 119.09 (30, 83 tokens) | -1.9% | 23.28 -> 23.18 | HEAD differs from plain; the fix equals plain |
+| first five primes `--dflash` k=7 | 214.93, 212.22 (51) | 199.00, 199.19 (55) | **-6.8%** | 23.50 -> 23.38 | HEAD differs from plain; the fix equals plain |
+
+The per-round time moves by -1.2% to +0.4%, so the tuning rule costs nothing measurable at TP=2
+either (its M=2..16 chunks take the tp2 table's M=1 rows, as decode does). The -3.6% and -6.8% are
+the prompts where HEAD's drifted text happened to accept more drafts per round than plain decode's
+text does. Plain TP=2 decode on the other three prompts: 61.45 -> 61.74, 61.56 -> 61.40 and 61.66
+-> 61.47 tok/s, identical text.
+
+**Why NT=0.** Giving the verify bands the M=1 rows exactly as tabulated (NT=1) cost more: `--dflash`
+73.01, 72.97 (-2.0%) and `--mtp 3` 68.27, 68.29 (-0.5%), and the 8-row verify 32.72 ms. An in-model
+search over the SK-preserving tunings of the two shapes that the per-shape exemption pointed at
+(`mlp.gate_up`, SK=4; `gdn.out_proj`/`attn.o`, SK=2) found NT=0 worth 0.3-0.5 ms on its own, a
+wider WV worth nothing and NPW=4 a loss of 1.7-2.2 ms. NT only chooses the cache policy of the
+weight loads, so it cannot change a row. An isolated sweep of the same tunings (the kind of
+measurement `tools/profile/tune_gemm.py` makes, a >= 256 MiB weight ring) did not predict the
+cost: there the M=1 tuning at M=8 was at most 0.6 us slower than the M=8 pick for every shape but
+`mlp.gate_up` (+1.7 us). Every w4a16 row in both tuning tables carries NT=1.
+
+**What plain output can change.** Two things move bits outside speculation:
+
+- A prefill chunk of 2-16 rows (a prompt's last chunk, or a short follow-up turn) now takes the M=1
+  tuning, and a chunk of at most 10 rows also runs the decode attention kernel
+  (`attention_layer.hpp`), so it takes the per-row merge and the per-row rescale too. Its rows can
+  differ in their last bits from before, so the plain text of a prompt whose last chunk is that short
+  can change. The 29-token standard prompt is one 29-row chunk and does not move.
+- Plain decode past 16 x segments keys of context (512 at `--max-ctx` 1024 and above at TP=1, 256
+  at `--max-ctx 512`): the per-row rescale no longer rescales a position's other heads when one of
+  them jumps, so those rows change in their last bits (the same softmax). Teacher-forced KL over the
+  corpus (`--max-ctx 4096`, context up to 1,023): mean KL 0.03856 -> 0.03853, top-1 90.86% -> 91.03%;
+  the old and new dumps differ by mean KL 0.00039 (TP=1 vs TP=2: 0.00103). No plain text measured
+  changed: the tables above, the 24 + 3 plain baselines of `tools/validate_spec_sampling.ps1` and
+  `tools/validate_dflash.ps1` -- the latter's ~3,500-token prompt at `--max-ctx 4096` (greedy, 40
+  tokens) among them.
+
 ## Tensor parallel (`--tp 2`) with DFlash2, MTP and the server: P5 gates (2026-09-25)
 
 The setup is the P4 section's below: rank 0 on HIP device 1, rank 1 on device 0 with the desktop

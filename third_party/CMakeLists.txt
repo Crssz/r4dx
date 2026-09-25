@@ -75,6 +75,14 @@ set(R4D_EXTRA_r4d_gemm_w4a8_nt_m64 -DR4D_GEMM_W4A8_GROUP=128)
 # converter asserts this kernel's _group() export against it at startup, and Container::Load
 # asserts it against every container's own __metadata__.quant.w4a16.group.
 set(R4D_EXTRA_r4d_gemm_w4a16_nt_m64 -DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP})
+# add_custom_command cannot scan hipcc's #includes, so every unit depends on every libr4d header
+# (r4d_common.h, r4d_dt16.h, r4d_gdn_wmma.h, ...: an edit to one rebuilds each unit, a superset of
+# the ones that include it), and a unit that #includes other .hip files lists them below. Without
+# these an edit to the decode or prefill attention kernel, or to GROW in r4d_dt16.h, leaves the old
+# object in place.
+file(GLOB R4D_HEADERS CONFIGURE_DEPENDS "${LIBR4D_DIR}/*.h")
+set(R4D_DEPS_r4d_attn_paged_h256_gqa6
+  "${LIBR4D_DIR}/r4d_attn_decode_h256_gqa6.hip" "${LIBR4D_DIR}/r4d_attn_prefill_h256_gqa6.hip")
 
 set(R4D_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/r4d_objs")
 file(MAKE_DIRECTORY "${R4D_OBJ_DIR}")
@@ -92,7 +100,7 @@ foreach(unit ${R4D_UNITS})
     OUTPUT "${obj}"
     COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4D_HIPCC_PATH}"
             "${R4D_HIPCC}" ${R4D_BASE_FLAGS} ${extra} -c "${src}" -o "${obj}"
-    DEPENDS "${src}" "${LIBR4D_DIR}/r4d.h"
+    DEPENDS "${src}" ${R4D_HEADERS} ${R4D_DEPS_${unit}}
     COMMENT "hipcc (${R4D_GFX_ARCH}) ${unit}.obj"
     VERBATIM
   )

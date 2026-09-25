@@ -155,6 +155,123 @@ measured numbers: [sampling.md](sampling.md) sections 9 and 11.
 `DecodeStepMtpSampled` above instead of falling through to plain decode. See
 [server.md](server.md)'s stage S3 correction and [sampling.md](sampling.md) section 12.
 
+### Sampled rounds are bit-exact (2026-09-25)
+
+The token-for-token identity above only holds if every verify row equals the plain decode row for
+the same context, bit for bit. It did not, and the tests had been adjudicating the difference as
+"the known batched-verify divergence". After the group-64 GEMM re-sweep (32093f2) that stopped
+being the exception: `test_mtp`'s `CheckSampledRoundsMatchPlain [w4a16]` found 0 of 18 sampled
+trajectories identical, and `tools/validate_spec_sampling.ps1 -Layouts w4a16` left 5 of 24 rows
+unresolved. Nothing was wrong with acceptance, draws, commits or the summaries. Three reduction-order
+differences made the verify rows differ (the third only past 16 x segments keys of context), and
+all three are now gone, for a verify window of at most 10 rows ("Bounds" below).
+
+**What the rows looked like** (4-layer w4a16 test container, one fully accepted 4-row window after
+a 24-token prompt, compared with sequential `DecodeStep`):
+
+| build | logits that differ, rows 0-3 (of 248,320) | rel L2 |
+|---|---|---|
+| HEAD 2d954c5 | 34,934 / 54,261 / 38,220 / 32,934 | 1.52e-3 - 1.98e-3 |
+| HEAD with the pre-32093f2 w4a16 rows | 49,806 / 51,529 / 39,361 / 34,713 | 1.61e-3 - 1.95e-3 |
+| this fix | 0 / 0 / 0 / 0 | 0 |
+
+The largest difference is 0.0625, one bf16 step of a logit, so this was never a wrong context. Along
+the 9 real-MTP sampled trajectories at HEAD, only the prefill row was bit-identical: row 0 of the
+first verify window already differed in all 9, and the tokens split later, at emitted index 1, 1,
+1, 2, 2, 13, 17, 45 and 46 -- wherever a draw fell between two near-tied candidates (the pure
+`T=1.0` configuration diverged on its first verified token every time). The re-sweep did not create
+the mechanism; it moved which draws landed in a disputed band. The pre-re-sweep test binary
+(`r4dx-m8`, c4e292d, group-64 containers) passes with 2 of 18 identical, and its own rows differ by
+rel L2 1.6e-3 - 1.9e-3.
+
+**1. GEMM split-K (`src/model/linear.cpp`, `kRowTile`).** In every `r4d_gemm_*_nt_m64` kernel an
+output element is summed in an order set by SK alone. The tuning table picks SK per M-band, and its
+M=1 (decode) and M=4/M=8 (verify) picks differ for most shapes: at HEAD `gdn.in_proj_qkv` is SK=2
+at M=1 and SK=16 at M=4, and before the re-sweep `mlp.gate_up` was 4 against 8 and `lm_head` 2
+against 8. A chunk of at most 16 rows is one row tile, so `PickTuning` now gives every M in 1..16
+the M=1 band's WV/SK/MB/NPW. With only that change, every row of the 4-layer windows above and of 9
+sampled trajectories x 48 tokens was bit-identical at w4a16, bf16 and w4a8.
+
+**2. The split-KV merge (`third_party/libr4d/r4d_attn_decode_h256_gqa6.hip`).** On the 64-layer
+container, greedy `--dflash` still differed from plain decode. The decode attention merges its
+KV segments in 4 interleaved chains, and which chain a segment lands in depended on how many
+segments the whole launch used, set by the window's LAST row. When a window straddles a 16-key
+tile boundary, its earlier rows have one segment fewer, the extra one fully masked for them, and
+once the count reaches a multiple of 4 (context 48 -> 49, 112 -> 113, ...) their segments are
+merged in a different order than their own decode step's. The merge now counts each row's own
+segments; at `q_len = 1` that is the old count, so plain decode is unchanged. Measured on
+`qwen38-27b-v6.r4dx`, one 8-row window at positions 44..51: before, rows 46-51 differed
+(113,085 logits at row 46); after, none. Greedy from a 40-token prompt for 256 tokens, every
+emitted token's row against plain decode's: `--dflash k=7`, `--mtp 3` and an oracle drafter that
+rejects a different draft every round (k=7) were all 256 of 256 bit-identical after the fix; with
+fix 1 alone the first row differed at emitted index 4 (DFlash) and 7 (MTP).
+
+**3. The lazy rescale's trigger (same file, `r4d_attn_decode_kernel`).** Every measurement above
+ran below 16 x segments keys of context (512 at `--max-ctx` 1024 and above, TP=1), where each
+segment is one 16-key tile and every live row rescales on it. Past that a segment spans 2 or more
+tiles, and a row rescales on a later one when its tile max passes `m_ref` + 14 octaves (the f16 P
+path's GROW). That decision was the whole wave's: when one row jumped, every row of the wave whose
+tile max had risen at all moved its `m_ref` too, by a non-integer amount that rounds P and the
+accumulator differently. A `q_len = 1` launch's wave holds one position's heads; a verify window's
+holds heads of 2-3 positions, so rows rescaled in the window that their own decode step did not.
+The decision is now per row. Measured on `qwen38-27b-v6.r4dx`, `max_ctx` 2048: one 8-row window
+at positions 600..607 had all 8 rows differ with fixes 1 and 2 (116,525-227,446 of 248,320 logits
+each, rel L2 3.7e-3 - 2.2e-2), and none with fix 3. Greedy from a 600-token prompt for 256 tokens:
+with fixes 1 and 2, `--mtp 3` and `--dflash k=7` rows differed from the first verify row on and
+their text split from plain decode at emitted index 79; with fix 3 both are 256 of 256
+bit-identical. This is not a rare corner at that depth: the first verify window of both runs, and
+every row of the 600..607 window, already differed.
+
+This one also moves plain decode: at `q_len = 1` a position's other heads no longer rescale when
+one of them does. That is the same softmax, but rows past 16 x segments keys change in their last
+bits. Teacher-forced over the KL corpus (`tool_teacher_forced_logprobs --max-ctx 4096`, 4,092 rows,
+context up to 1,023): all four dumps change; mean KL against the bf16 reference 0.03856 -> 0.03853,
+top-1 90.86% -> 91.03%; the old and new dumps differ from each other by mean KL 0.00039 (top-1
+99.46%, max 0.0315, none above 1 nat), against 0.00103 between TP=1 and TP=2. The standard
+protocol's plain text is unchanged (its context stays under 512).
+
+**Bounds.** Bit-exactness holds for a verify window of at most 10 rows: `attention_layer.hpp`
+sends a wider window (`q_len * gqa > 64`) to the prefill attention kernel, which tiles differently,
+and the GEMM rule covers 16 rows. That is `--mtp` <= 9 at TP=1, every `--dflash-k` (<= 7) and every
+`--mtp` at TP=2 (<= 7). Measured on v6 at position 600: `--mtp 9`'s 10-row window is 10 of 10 rows
+identical, `--mtp 10`'s 11-row window 0 of 11 (112,650-240,004 logits differ per row).
+
+**What is left.** The attention decode kernel's segment WIDTH (tiles per segment) is also set by
+the window's last row, and it changes wherever the context crosses a multiple of 16 x segments
+keys: at context 512, 1024, 1536, ... for `--max-ctx` 1024 and above on this model at TP=1 (32
+segments), at 256 for `--max-ctx 512` (16 segments), per `decode_splits` in
+`r4d_attn_paged_h256_gqa6.hip`. A window that straddles one of those contexts still gives its
+earlier rows a different partition. Measured with fixes 1 and 2: 4-layer container, `max_ctx`
+1024, window at 510..513 -- rows 510 and 511 differ (13,797 and 18,543 logits), 512 and 513 do not;
+`qwen38-27b-v6.r4dx`, window at 506..513 -- all 8 rows differ, the later ones through the earlier
+rows' KV. With fix 3, v6 at `max_ctx` 2048: a window at 1020..1027 has all 8 rows differ, and greedy
+`--mtp 3` from a 900-token prompt keeps every row identical up to emitted index 124 (context 1024)
+and not after it (its text happened to stay equal over 256 tokens). After such a round the
+speculative run's state carries different last bits and later draws can split from plain decode as
+before. Closing it would mean launching such a window's attention in two parts, one per partition;
+not done here.
+
+**Tests.** `tests/model/test_pick_tuning` (host-only) requires every M=2..16 pick to carry the M=1
+pick's SK (without fix 1, 4,816 of 9,135 do not). `test_attn_decode` compares 10-row windows with
+the `q_len = 1` launch at each row's position, bit for bit: four that straddle a merge-chain
+boundary (without fix 2: 7 of 245,760 bf16 outputs differ), and one at 280..289 at 2 tiles per
+segment with a key planted in a segment's second tile along one query row of each wave, so that row
+rescales there (without fix 3: 1,262 of 61,440 differ). `test_mtp`'s
+`CheckVerifyMatchesSequential` now requires bit-identical rows, and `CheckSampledRoundsMatchPlain`
+and `test_dflash_e2e`'s
+`CheckSampledDflashMatchesPlain` now fail on any divergence instead of accepting a proven one:
+18/18 identical on all four layouts, and 8/8 on the real container (2/8 without fix 1). On the
+real container at TP=1, `tools/validate_spec_sampling.ps1 -Layouts w4a16` went from 5 of 24 rows
+unresolved (9 more resolved only by a control) to 24/24 byte-identical, and
+`tools/validate_dflash.ps1 -Layouts w4a16` from 2 identical + 1 control-resolved to 3/3, with every
+plain baseline unchanged (both re-run with all three fixes); at `-Tp 2` (both GPUs, fixes 1 and 2,
+whose contexts never reach a second tile per segment) `validate_spec_sampling.ps1` went from 3 of 24
+unresolved (P5 gate) to 24/24. Greedy `--mtp`/`--dflash` output equalled `--mtp 0` output on every
+prompt measured here, at TP=1 and on four prompts at TP=2; the "byte-identical at the measured
+prompt/length only" caveats below date from before this fix, and still apply past a segment-width
+change or above 10 rows. Cost: [perf.md](perf.md) "Sampled speculation bit-exact"; summary:
+[status.md](status.md).
+
 ## Container
 
 `D:\models\r4dx\qwen38-27b.r4dx` (the real 64-layer container used throughout `docs/perf.md`)
@@ -220,6 +337,10 @@ GDN's conv_update/recurrent_update over a genuine multi-candidate window with th
 slot banking) agrees with the plain sequential T=1 path to ordinary bf16/quantization noise, not a
 structural difference. Unaffected by this revision's two fixes (this check was already passing
 before them -- the verify/commit machinery was never the bug).
+
+> **Since 2026-09-25 the check is bit-exact**, not rel L2 <= 1e-2: every row of the window equals
+> the sequential row bit for bit on all four layouts (see "Sampled rounds are bit-exact" above for
+> the reduction-order differences that the old 1e-2 gate had been absorbing).
 
 ### Rejection rewind (`tests/model/test_mtp.cpp`)
 

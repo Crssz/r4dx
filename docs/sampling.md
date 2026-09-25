@@ -474,6 +474,17 @@ distribution's mass and a draw landing inside that band picks the neighbour. Thi
 batched-verify divergence** class [`tools/validate_dflash.ps1`](../tools/validate_dflash.ps1) exists
 to adjudicate, and the tests treat it the same way — never silently. See section 11.
 
+> **2026-09-25: the exception is gone, within a bound and with one narrow remainder.** The
+> difference was three reduction orders that a verify row did not share with its decode step, not
+> the `q_len > 1` pass as such: the GEMM tuning table's per-M-band split-K, the attention split-KV
+> merge's chain assignment, and the attention's wave-wide lazy-rescale decision. With all three
+> fixed a verify row of a window of at most 10 rows equals the plain decode row bit for bit, so the
+> identity above holds without an exception for `--mtp` <= 9 at TP=1, every `--dflash-k` and every
+> `--mtp` at TP=2, and the tests now fail on any divergence. A wider window (`--mtp` 10 and up at
+> TP=1) runs the prefill attention kernel and is outside the guarantee. The remainder is a window
+> that straddles a change of the attention kernel's segment width (context 512, 1024, ... at
+> `--max-ctx` >= 1024). Details and measurements: [mtp.md](mtp.md), "Sampled rounds are bit-exact".
+
 ---
 
 ## 10. Cost of a plain sampled token
@@ -517,6 +528,13 @@ All on real hardware, HIP device 1, registered in `ctest`.
 
 ### 11.1 How a mismatch is adjudicated
 
+> **Since 2026-09-25 no mismatch is accepted.** A verify row is bit-identical to the decode row
+> ([mtp.md](mtp.md), "Sampled rounds are bit-exact"), so `CheckSampledRoundsMatchPlain` and
+> `CheckSampledDflashMatchesPlain` require every trajectory to match and fail otherwise. The
+> classification below still runs on a mismatch, as forensics: when the conditions hold it now
+> reports that the reduction-order mechanism is back rather than accepting it. The section is kept
+> as it was written for Milestone 6.
+
 Never by loosening a bound. On any mismatch the test recovers **both** logits rows for the diverging
 emission — the plain single-row decode row (by replaying the plain trajectory) and the **exact**
 verify row the speculative sampler resolved that token from (by re-running the deterministic
@@ -553,6 +571,12 @@ assertion.
 | 4-layer w4a8 | 16 / 18 | 2 | 0 |
 | 4-layer mxfp4 | 18 / 18 | 0 | 0 |
 | real 64-layer w4a16 (DFlash2) | 2 / 8 | 6 | 0 |
+
+Re-measured 2026-09-25 (group-64 containers, HIP device 1). At HEAD 2d954c5 the 4-layer w4a16 row
+had fallen to **0 / 18** (18 accepted), which failed the check's "every trajectory explained is not a
+green" guard; bf16 was 4 / 18. With the reduction-order fixes, **18 / 18 on all four layouts and
+8 / 8 on the real container**, with the acceptance path removed from both tests (measured with the
+first two fixes, and again with all three).
 
 The 4-layer container is the *worst* case for this, not a representative one: four layers of a 27B
 model produce a nearly flat next-token distribution, where hundreds of candidates sit within the

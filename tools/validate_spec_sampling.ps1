@@ -96,10 +96,10 @@
   while an r4dx-server is running (docs/tp.md 9.2); after every run it scans that run's stderr for HIP
   error 719 and, 5 s later, checks for a device-0 TDR (tools\tp\tdr_check.ps1, Appendix B N55),
   stopping at the first one (no retry); and on every exit it runs the check once more 30 s after the
-  last run. A TDR fails the script (exit 1). An MTP FAILED row at -Tp 2 is ambiguous on its own: the
-  known test_mtp CheckSampledRoundsMatchPlain [w4a16] failure (0/18 identical sampled trajectories at
-  TP=1, Appendix B N29) is this property -- run the same matrix at -Tp 1 on the same tree before
-  blaming TP (Appendix B N80).
+  last run. A TDR fails the script (exit 1). An MTP FAILED row at -Tp 2 is ambiguous on its own --
+  run the same matrix at -Tp 1 on the same tree before blaming TP (Appendix B N80). Since 2026-09-25
+  (docs/mtp.md "Sampled rounds are bit-exact") -Layouts w4a16 is 24/24 byte-identical at both -Tp 1
+  and -Tp 2; the old test_mtp CheckSampledRoundsMatchPlain [w4a16] failure (Appendix B N29) is fixed.
 
 .EXAMPLE
   .\tools\validate_spec_sampling.ps1

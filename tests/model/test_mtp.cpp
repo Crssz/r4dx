@@ -7,10 +7,12 @@
 //  1. CheckVerifyMatchesSequential: VerifyWindow's per-position logits, for a window of candidate
 //     tokens constructed to be EXACTLY what a reference sequential decode itself produces (so
 //     every one of them is "accepted" by definition), equal that reference's own per-step logits
-//     (rel L2 <= 1e-2) at the corresponding position. This is the speculative-verify decode kernel
+//     BIT FOR BIT at the corresponding position. This is the speculative-verify decode kernel
 //     path (attention's decode kernel at q_len>1, GDN's conv_update/recurrent_update over a
-//     genuine multi-candidate window with GdnStateManager's per-candidate slot banking) agreeing
-//     with the plain sequential T=1 path it must be mathematically equivalent to.
+//     genuine multi-candidate window with GdnStateManager's per-candidate slot banking, every GEMM
+//     at M=k+1) agreeing with the plain sequential T=1 path it must be equivalent to. Exact, not a
+//     tolerance: a verify row that differs in its last bits changes a sampled round's tokens (the
+//     sampled section below), and src/model/linear.cpp's kRowTile rule is what makes it exact.
 //  2. CheckRejectionRewind: running real MTP self-speculative decode (DecodeStepMtpGreedy) for
 //     several rounds on the 4-layer container -- whose drastically truncated depth makes MTP's own
 //     drafts agree with the real (equally truncated) model only some of the time, so this
@@ -23,6 +25,7 @@
 // SKIPs (CTest SKIPPED, not FAILED) if the container is missing, same convention as
 // test_forward_smoke.cpp / test_gdn_layer.cpp.
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <vector>
@@ -70,6 +73,13 @@ std::vector<int32_t> MakePromptTokens(int n) {
   return ids;
 }
 
+// How many elements of two equal-length logits rows differ in their bit patterns (0 == identical).
+size_t CountBitDifferences(const std::vector<float>& a, const std::vector<float>& b) {
+  size_t n = 0;
+  for (size_t i = 0; i < a.size(); ++i) n += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+  return n;
+}
+
 bool CheckVerifyMatchesSequential(const ModelOptions& base_opts,
                                    const std::vector<int32_t>& prompt) {
   ModelOptions ref_opts = base_opts;
@@ -109,12 +119,17 @@ bool CheckVerifyMatchesSequential(const ModelOptions& base_opts,
   for (int64_t i = 0; i <= kDraftK; ++i) {
     const std::vector<float> row(verify_logits.begin() + i * vocab,
                                   verify_logits.begin() + (i + 1) * vocab);
-    const double rel = RelL2(row, seq_logits[static_cast<size_t>(i)]);
-    std::fprintf(stderr, "[mtp] verify-vs-sequential row %lld rel L2=%.4e\n",
-                 static_cast<long long>(i), rel);
-    if (!(rel <= 1e-2)) {
-      std::fprintf(stderr, "FAIL: verify row %lld rel L2=%.4e exceeds 1e-2\n",
-                   static_cast<long long>(i), rel);
+    const std::vector<float>& ref_row = seq_logits[static_cast<size_t>(i)];
+    const double rel = RelL2(row, ref_row);
+    const size_t ndiff = CountBitDifferences(row, ref_row);
+    std::fprintf(stderr, "[mtp] verify-vs-sequential row %lld rel L2=%.4e, %zu/%lld logits differ\n",
+                 static_cast<long long>(i), rel, ndiff, static_cast<long long>(vocab));
+    if (ndiff != 0) {
+      std::fprintf(stderr,
+                   "FAIL: verify row %lld is not bit-identical to the sequential decode row (%zu "
+                   "logits differ, rel L2=%.4e) -- a window row no longer sums in decode's order "
+                   "(src/model/linear.cpp's kRowTile)\n",
+                   static_cast<long long>(i), ndiff, rel);
       ok = false;
     }
     if (i < kDraftK && preds[static_cast<size_t>(i)] != candidates[static_cast<size_t>(i + 1)]) {
@@ -726,31 +741,30 @@ bool CheckReducedVocabDraftHeadLossless(const std::string& container_path, Layou
 //     path (rounds are k+1 tokens long), which is where a bookkeeping error in the commit count or
 //     in the per-row draw order would actually show up.
 //
-// THE ONE DIVERGENCE THIS FILE ACCEPTS, and why it is not a loosening. A speculative round computes
-// its logits in ONE q_len>1 forward pass; plain decode computes them one row at a time. Those are
-// different GEMM shapes, so their reduction order differs, and floating-point addition is not
-// associative -- CheckVerifyMatchesSequential above measures the result directly on this very
-// container and accepts it up to rel L2 <= 1e-2 (measured: ~1.1e-3 at bf16). A greedy argmax
-// survives that; a CDF walk does not always, because the same 1e-3 perturbation moves a candidate
-// boundary by ~1e-2 of the distribution's mass, and a draw landing inside that band picks the
-// neighbouring token. This is the SAME "known batched-verify divergence" class
-// tools/validate_dflash.ps1 exists to adjudicate, and it is handled the same way: never silently.
-// On any mismatch, ClassifySampledDivergence below obtains BOTH logits rows for the diverging
-// position -- the single-row decode one (by replaying the plain trajectory) and the EXACT verify
-// row the speculative sampler resolved that token from (by re-running the deterministic speculative
-// trajectory and reading it back with Model::ReadVerifyLogitsRow) -- and the divergence is accepted
-// ONLY if all of these hold, each of which a real bookkeeping bug would break:
-//   1. canonically sampling the DECODE row with that token's own draw u reproduces the plain run's
-//      token, so the reference trajectory really is canonical;
-//   2. canonically sampling the EXACT VERIFY row with that SAME u reproduces the SPECULATIVE run's
-//      token -- which pins the draw index, the window row, and the filters all at once: had the
-//      round sampled a different row, used a shifted draw, or applied the filters differently, the
-//      row this emission index maps to would not reproduce what it emitted;
-//   3. the two rows are the same next-token distribution (a sanity floor on rel L2 -- see the note
-//      in the classifier for why this is deliberately loose while 1 and 2 are exact).
+// NO DIVERGENCE IS ACCEPTED. Every trajectory must be token-for-token identical to plain sampled
+// decode. That holds because a verify window's rows are bit-identical to the single-row decode rows
+// for the same context (CheckVerifyMatchesSequential above). Until 2026-09-25 they were not: the
+// GEMM tuning table gave the M=k+1 window a different split-K than M=1 decode for most shapes, so
+// every window row differed in its last bits (rel L2 ~1.5e-3 on this container), and a draw that
+// landed between two near-tied candidates picked the neighbouring token. This check then ACCEPTED
+// such a divergence as "the known batched-verify divergence" whenever the classifier below proved
+// it, and failed only when all 18 trajectories of a layout diverged, which w4a16 reached at the
+// group-64 re-sweep. src/model/linear.cpp's kRowTile rule removed that, and the attention split-KV
+// merge now counts each row's own segments, which removed the second, rarer order difference
+// (docs/mtp.md, "Sampled rounds are bit-exact"), so any mismatch is now a failure.
+// ClassifySampledDivergence still gathers the forensics for one: it obtains BOTH logits rows for
+// the diverging position -- the single-row decode one (by replaying the plain trajectory) and the
+// EXACT verify row the speculative sampler resolved that token from (by re-running the
+// deterministic speculative trajectory and reading it back with Model::ReadVerifyLogitsRow) -- and
+// names which of two failures it is:
+//   * the two rows differ, yet each, canonically sampled at that token's own draw u, reproduces its
+//     own run's token: the reduction-order mechanism is back (a GEMM tuning or a kernel whose
+//     window rows no longer sum in decode's order);
+//   * anything else -- including two IDENTICAL rows behind two different tokens: a bookkeeping bug
+//     (a shifted draw, the wrong window row, the filters applied differently).
 // Independently of all that, every runner below asserts the exact position-lockstep invariant after
 // EVERY round (a round commits exactly as many positions as it emitted tokens), which is the
-// bookkeeping gate proper. Everything else fails, loudly, with every number printed.
+// bookkeeping gate proper.
 constexpr size_t kSampledTokens = 48;
 constexpr uint64_t kSampledSeeds[] = {1u, 20260921u, 0x9E3779B97F4A7C15ull};
 
@@ -905,13 +919,13 @@ std::vector<float> PlainLogitsRowAt(Model& ref, const std::vector<int32_t>& prom
   return row;  // index==0 -> the prefill row itself
 }
 
-enum class DivergenceVerdict { kEqual, kProvenVerifyNumeric, kBug };
+enum class DivergenceVerdict { kEqual, kVerifyRowDiffers, kBug };
 
-// See this section's own header comment for the three conditions. `fetch_verify_row(j)` must return
-// the EXACT fp32 logits row the speculative run resolved its emitted token `j` from (the runners
-// above re-run the deterministic trajectory and read it back with Model::ReadVerifyLogitsRow) --
-// having the real row, not a reconstruction, is what lets condition 3 be an equality rather than a
-// tolerance. Returns kBug unless every condition holds.
+// Forensics for a mismatch -- see this section's own header comment for the two failure classes
+// (both fail the check). `fetch_verify_row(j)` must return the EXACT fp32 logits row the
+// speculative run resolved its emitted token `j` from (the runners above re-run the deterministic
+// trajectory and read it back with Model::ReadVerifyLogitsRow) -- having the real row, not a
+// reconstruction, is what lets the conditions below be equalities rather than tolerances.
 DivergenceVerdict ClassifySampledDivergence(
     const char* tag, Model& ref, const std::vector<int32_t>& prompt,
     const std::vector<int32_t>& plain, const std::vector<int32_t>& spec, uint64_t seed,
@@ -942,14 +956,17 @@ DivergenceVerdict ClassifySampledDivergence(
     return DivergenceVerdict::kBug;
   }
   const double rel = RelL2(row_verify, row_decode);
+  const size_t ndiff = CountBitDifferences(row_verify, row_decode);
   const int32_t from_decode = r4dx::kernels::SampleCanonical(row_decode.data(), vocab, params, u);
   const int32_t from_verify = r4dx::kernels::SampleCanonical(row_verify.data(), vocab, params, u);
   const NearTieReport tie_decode = AnalyzeNearTie(row_decode, vocab, params, u, plain[j], spec[j]);
   const NearTieReport tie_verify = AnalyzeNearTie(row_verify, vocab, params, u, plain[j], spec[j]);
   std::fprintf(stderr,
-               "%s   decode-row vs verify-row rel L2=%.4e; canonical sample of the decode row at "
-               "that u=%d (plain emitted %d); of the verify row=%d (spec emitted %d)\n",
-               tag, rel, from_decode, plain[j], from_verify, spec[j]);
+               "%s   decode-row vs verify-row rel L2=%.4e (%zu/%lld logits differ); canonical sample "
+               "of the decode row at that u=%d (plain emitted %d); of the verify row=%d (spec "
+               "emitted %d)\n",
+               tag, rel, ndiff, static_cast<long long>(vocab), from_decode, plain[j], from_verify,
+               spec[j]);
   PrintNearTie(tag, tie_decode, u, plain[j], spec[j]);
   // The whole mechanism in two numbers: the CDF boundary between these two candidates sits at
   // `boundary` in the decode row and at a slightly different place in the verify row, and `u` lies
@@ -964,32 +981,28 @@ DivergenceVerdict ClassifySampledDivergence(
                    ? "BETWEEN"
                    : "outside");
 
-  // Condition 3's sanity floor. `rel` is NOT required to be tiny: the two trajectories' GDN/KV
-  // state has been drifting apart in its last bits since the very first speculative round, and that
-  // drift accumulates, so by token 30 of a w4a8 run the two rows can differ by a few percent while
-  // still being the same next-token distribution for the same context. What a WRONG-CONTEXT bug
-  // (an off-by-one commit, the wrong window row) would produce is not a few percent -- it is two
-  // unrelated distributions, i.e. rel L2 near sqrt(2). This bound only has to separate those two
-  // regimes, and the bookkeeping itself is pinned exactly elsewhere (the position-lockstep
-  // assertion in every runner above, plus condition 2 below, which fails outright if the row the
-  // sampler used was not the row this emission index maps to).
-  const bool cond_rows_same_context = (rel > 0.0 && rel <= 0.5);
+  // The reduction-order class needs rows that differ (ndiff > 0) but are still the same next-token
+  // distribution. `rel` is NOT required to be tiny: once the first window row differs, the two
+  // trajectories' GDN/KV state drifts apart in its last bits and that drift accumulates, so by
+  // token 30 the rows could differ by a few percent while still being the same distribution for the
+  // same context. What a WRONG-CONTEXT bug (an off-by-one commit, the wrong window row) would
+  // produce is not a few percent -- it is two unrelated distributions, i.e. rel L2 near sqrt(2).
+  const bool cond_rows_same_context = (ndiff > 0 && rel <= 0.5);
   const bool cond_decode_reproduces_plain = (from_decode == plain[j]);
   const bool cond_verify_reproduces_spec = (from_verify == spec[j]);
   if (cond_rows_same_context && cond_decode_reproduces_plain && cond_verify_reproduces_spec) {
     std::fprintf(stderr,
-                 "%s   ACCEPTED as the known batched-verify divergence (docs/perf.md, "
-                 "tools/validate_dflash.ps1): the speculative path sampled the RIGHT draw, from the "
-                 "RIGHT row of the RIGHT round, with the RIGHT filters -- the only difference is "
-                 "that row's own last bits, by the q_len>1-vs-T=1 reduction-order mechanism "
-                 "CheckVerifyMatchesSequential already measures on this container\n",
+                 "%s   the speculative path sampled the RIGHT draw from the RIGHT row of the RIGHT "
+                 "round with the RIGHT filters, but that verify row is not bit-identical to the "
+                 "decode row: the window's reduction order no longer matches single-row decode's "
+                 "(src/model/linear.cpp's kRowTile, tests/model/test_pick_tuning; the attention "
+                 "merge, tests/kernels/test_attn_decode) -- FAIL\n",
                  tag);
-    return DivergenceVerdict::kProvenVerifyNumeric;
+    return DivergenceVerdict::kVerifyRowDiffers;
   }
   std::fprintf(stderr,
-               "%s   NOT the known mechanism (rows-are-the-same-distribution=%s "
-               "decode-row-reproduces-plain=%s verify-row-reproduces-spec=%s) -- this is a "
-               "bookkeeping bug\n",
+               "%s   a bookkeeping bug (rows differ but are the same distribution=%s "
+               "decode-row-reproduces-plain=%s verify-row-reproduces-spec=%s) -- FAIL\n",
                tag, cond_rows_same_context ? "yes" : "NO",
                cond_decode_reproduces_plain ? "yes" : "NO",
                cond_verify_reproduces_spec ? "yes" : "NO");
@@ -1052,7 +1065,7 @@ bool CheckSampledRoundsMatchPlain(const ModelOptions& base_opts, const std::vect
   Model mtp = Model::Load(mtp_opts);
 
   size_t oracle_rounds_over_one = 0;
-  size_t exact = 0, accepted_numeric = 0, combos = 0;
+  size_t exact = 0, row_differs = 0, combos = 0;
   for (const SampledConfig& cfg : SampledConfigs()) {
     for (uint64_t seed : kSampledSeeds) {
       // n + kDraftK tokens so the oracle drafter below always has a full window of kDraftK drafts
@@ -1106,7 +1119,7 @@ bool CheckSampledRoundsMatchPlain(const ModelOptions& base_opts, const std::vect
                                       *runs[which].second, seed, cfg.params, fetchers[which]);
         if (v == DivergenceVerdict::kBug) return false;
         if (v == DivergenceVerdict::kEqual) ++exact;
-        else ++accepted_numeric;
+        else ++row_differs;  // a failure too, reported once every trajectory has been classified
       }
 
       std::fprintf(stderr,
@@ -1129,23 +1142,20 @@ bool CheckSampledRoundsMatchPlain(const ModelOptions& base_opts, const std::vect
                  LayoutName(layout));
     return false;
   }
-  // A run where EVERY trajectory diverged would mean the accepted-divergence path had become the
-  // norm rather than the exception, which is worth failing on even though each individual
-  // divergence was proven: it would point at a systematically different row, not at last-bit noise.
-  if (exact == 0) {
-    std::fprintf(stderr,
-                 "FAIL: not one of the %zu sampled trajectories was token-for-token identical to "
-                 "plain sampled decode on layout=%s -- every single one was 'explained', which is "
-                 "not a green result\n",
-                 combos, LayoutName(layout));
-    return false;
-  }
   std::fprintf(stderr,
                "[mtp] sampled-equality layout=%s: %zu/%zu trajectories token-for-token identical, "
-               "%zu accepted as the known batched-verify divergence, 0 bookkeeping failures; %zu of "
-               "%zu (config,seed) combinations saw oracle rounds longer than one token\n",
-               LayoutName(layout), exact, combos, accepted_numeric, oracle_rounds_over_one,
+               "%zu diverged from a verify row that differs from the decode row, 0 bookkeeping "
+               "failures; %zu of %zu (config,seed) combinations saw oracle rounds longer than one "
+               "token\n",
+               LayoutName(layout), exact, combos, row_differs, oracle_rounds_over_one,
                SampledConfigs().size() * (sizeof(kSampledSeeds) / sizeof(kSampledSeeds[0])));
+  if (exact != combos) {
+    std::fprintf(stderr,
+                 "FAIL: %zu of the %zu sampled trajectories diverged from plain sampled decode on "
+                 "layout=%s (see the DIVERGENCE lines above)\n",
+                 combos - exact, combos, LayoutName(layout));
+    return false;
+  }
   return true;
 }
 

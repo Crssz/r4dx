@@ -16,6 +16,22 @@ namespace {
 
 constexpr int64_t kMaxChunkM = 64;
 
+// Rows per M tile of every r4d_gemm_*_nt_m64 kernel. Each output element is summed in an order set
+// by SK alone -- the groups of one K slice in order, then the SK slices in a fixed order -- so a row's
+// result does not depend on WV/MB/NPW/NT or on the other rows of the launch, but it DOES depend on
+// SK: a different split adds the same partial products in a different order and can round
+// differently. The measured table picks its SK per M-band, and its M=1 and M=4/M=8 picks differ for
+// most shapes, which made every row of a speculative verify window (M = k+1) differ in its last bits
+// from the single-row decode (M=1) row for the same context -- and a sampled round then emitted a
+// different token whenever a draw landed between two near-tied candidates (docs/mtp.md, "Sampled
+// rounds are bit-exact"). A chunk of at most kRowTile rows is a single row tile, so ResolveTuning
+// gives all of them the M=1 band's WV/SK/MB/NPW. Only NT (a cache hint on the weight loads, which
+// changes no arithmetic) differs for M=2..16 at w4a16: NT=0 there, because the M=1 band's NT=1 was
+// the slower choice once the verify window's rows are distinct -- measured on qwen38-27b-v6.r4dx,
+// one VerifyWindow at position 60, mean of two runs: 8 rows 32.12 ms with the old per-band table,
+// 32.72 ms with the M=1 tuning as is, 32.27 ms with it and NT=0; 4 rows 30.00 / 30.12 / 29.83 ms.
+constexpr int64_t kRowTile = 16;
+
 // Hand-derived fallback, legal for every (layout,N,K) shape this model has (used only when
 // gemm_tuning_table.inc has no row for the requested shape -- see PickTuning below and linear.h's
 // comment). Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16:
@@ -84,6 +100,13 @@ void SetTp2TuningForThisThread(bool enabled) { t_tp2_tuning = enabled; }
 // Internal linkage (not declared in linear.h) -- the actual table scan, now called only on a
 // PickTuning cache miss (see below). `tp2`: the TP table first (docs/tp.md 2.7), then the main one.
 static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M, bool tp2) {
+  // Any chunk that fits in one row tile resolves through the M=1 band (kRowTile's comment): a
+  // verify window's rows then sum in exactly the order a single-row decode's do.
+  if (M > 1 && M <= kRowTile) {
+    LinearTuning t = ResolveTuning(layout, N, K, 1, tp2);
+    if (layout == Layout::kW4a16) t.NT = 0;
+    return t;
+  }
   if (tp2) {
     if (const GemmTuningRow* row = BestRow(tp2::kGemmTuningTable, layout, N, K, M)) {
       return row->tuning;

@@ -1755,10 +1755,10 @@ try {
                 ("sampled speculative path: server text matches a same-seeded plain sampled r4dx-cli " +
                  "run (server='$serverText' cli='$cliOut')")
             if ($Tp -eq 2 -and $cliOut -ne $serverText) {
-                # A -Tp 2 mismatch alone does not say TP caused it: seeded speculative text also differs
-                # from plain at --tp 1 in the batched-verify class (docs/sampling.md 9.3, the validate
-                # scripts' controls) and in the known test_mtp CheckSampledRoundsMatchPlain [w4a16]
-                # failure (0/18 identical sampled trajectories at TP=1, docs/tp.md Appendix B N29). The
+                # A -Tp 2 mismatch alone does not say TP caused it: seeded speculative text can still
+                # differ from plain at --tp 1 once a verify window straddles a change of the attention
+                # split's segment width (docs/mtp.md "Sampled rounds are bit-exact"; before 2026-09-25
+                # it differed far more often, docs/tp.md Appendix B N29). The
                 # control: the same seeded request through r4dx-cli at --tp 1 on device 1, speculative
                 # and plain. It changes no check -- it says which class the FAIL above is in (N80).
                 $env:HIP_VISIBLE_DEVICES = "1"

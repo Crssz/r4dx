@@ -62,6 +62,11 @@ constraint-legal-for-every-shape default (`FallbackTuning`, `linear.cpp`) for an
 table has no row for, so a stale or missing table degrades gracefully rather than breaking the
 build or crashing at runtime.
 
+**The M=2..16 bands are measured but not used as is.** `PickTuning` gives every chunk of at most 16
+rows the M=1 band's WV/SK/MB/NPW (and NT=0 at w4a16), so a speculative verify row sums in exactly
+the order the decode row does (`src/model/linear.cpp`'s `kRowTile`, docs/mtp.md "Sampled rounds are
+bit-exact"). A re-sweep therefore changes verify-window speed only through the M=1 rows.
+
 `--quick` restricts M to {1,8,64} and halves the iteration count, for a fast sanity check that the
 sweep machinery still runs after a kernel/shape change, without waiting for the full ~25-30 minute
 sweep.

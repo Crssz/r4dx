@@ -67,8 +67,8 @@ foreach ($v in $Variant) {
   $segs = [ordered]@{}; foreach ($s in $j.segments) { $segs[$s.name] = [math]::Round($s.mean_kl, 5) }
   $results += [pscustomobject]@{ name = $name; flags = $extra; mean_kl = $j.overall.mean_kl;
     median_kl = $j.overall.median_kl; top1_pct = $j.overall.top1_agreement_pct; p99_kl = $j.overall.p99_kl;
-    segments = $segs; bytes = (Get-Item $container).Length; convert_min = (Get-Content $done) }
-  $results | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 $resultsPath
+    segments = $segs; bytes = (Get-Item $container).Length; convert_min = [string](Get-Content $done -Raw).Trim() }
+  ConvertTo-Json -InputObject @($results) -Depth 4 | Set-Content -Encoding utf8 $resultsPath
   Write-Host ("[var] {0,-16} mean KL {1:N5}  top-1 {2:N2}%" -f $name, $j.overall.mean_kl, $j.overall.top1_agreement_pct)
   if ($DeleteContainers) { Remove-Item -Force $container }
 }

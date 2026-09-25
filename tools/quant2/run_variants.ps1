@@ -51,8 +51,17 @@ foreach ($v in $Variant) {
   if (-not ((Test-Path $container) -and (Test-Path $done))) {
     Remove-Item -Force $container, $done -ErrorAction SilentlyContinue
     $xargs = @(if ($extra) { $extra -split ' +' | Where-Object { $_ } })
+    # '--no-keep-kv' (a driver token, not a converter flag) drops the v6 recipe's --keep-bf16 on
+    # attn.k/attn.v, so those linears are quantized like every other one.
+    $vbase = $base
+    if ($xargs -contains '--no-keep-kv') {
+      $xargs = @($xargs | Where-Object { $_ -ne '--no-keep-kv' })
+      $i = [array]::IndexOf($base, '--keep-bf16')
+      # index filter, not a range: PS ranges count DOWN when the pair is last (6..5).
+      $vbase = @(for ($k = 0; $k -lt $base.Count; $k++) { if ($k -ne $i -and $k -ne $i + 1) { $base[$k] } })
+    }
     $t0 = Get-Date
-    Run "convert_$name" { & $conv @base --output $container @xargs }
+    Run "convert_$name" { & $conv @vbase --output $container @xargs }
     $convMin = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
     Set-Content -Encoding utf8 $done $convMin
   }

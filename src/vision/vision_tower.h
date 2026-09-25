@@ -80,6 +80,10 @@ class VisionTower {
   // Device bytes the scratch arena currently holds (0 before the first Encode).
   int64_t ScratchBytes() const { return static_cast<int64_t>(arena_.capacity_bytes()); }
 
+  // The encode stream, for a caller that must drain it after an Encode that threw partway (docs/tp.md
+  // 2.5 step 1: TpModel's recovery, on the tower's rank thread).
+  hipStream_t StreamHandle() const { return stream_.get(); }
+
   // The scratch an ordinary (untraced) encode of `total_patches` patches at `row_chunk` rows per
   // chunk needs -- the sizing a caller uses to choose --image-max-pixels, and exactly the number
   // docs/vision.md's "Large images" table reports. Does not allocate.

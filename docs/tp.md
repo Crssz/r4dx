@@ -132,11 +132,15 @@ engine's port on the same definition (and reports the vs-stand-in value next to 
 | G12 | Speculative losslessness under TP | `tools/validate_dflash.ps1 -Tp 2 -Layouts w4a16` and `tools/validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16` exit 0 under the scripts' own control rules; `test_tp_emulation`'s DFlash and MTP cases (exact H6/H7 merges, bookkeeping lockstep) pass | P5 |
 
 **Gate status (2026-09-25, Appendix B).** G1 pass (its CPU tests are in every `run_tests.ps1` run,
-last N65). G2 pass at every phase so far, last on the
-P4 tree (N65). G3 pass: 0.547 / 0.548 (N29). G4 pass: 0.03853 / 91.01% (N54). G5: latency limits met
+last N82). G2 pass at every phase so far, last on the
+P5 tree (N82). G3 pass: 0.547 / 0.548 (N29). G4 pass: 0.03853 / 91.01% (N54). G5: latency limits met
 in P3 (N44); its 10M decode-pattern line TDR'd in P3 and passed in P4 with bounded submission (N65).
 G6 pass: 4/4 dumps SHA-256-equal (N65). G7 pass: 59.65 / 59.33 tok/s, 1.65x (N65). G8 pass: 5 and 60
-minutes, no TDR (N65). G9-G12 are P5's, not run yet.
+minutes, no TDR (N65). G9 pass: 118.75 / 119.96 tok/s (N82). G10 pass: 4.135 vs 4.028 tokens/round,
++2.7% (N82). G11 pass: all five smokes 0 FAIL, `-Dflash -TpFault` included (N82). G12 **fails** on
+its pass rule: `validate_dflash -Tp 2` exits 0 and the ctest cases pass, but `validate_spec_sampling
+-Tp 2` exits 1 on 3 unresolved `--mtp 3` rows of 24. The same matrix at `-Tp 1` on the same tree
+exits 1 on 5 such rows, including all three (N82; N29's class).
 
 ---
 
@@ -1373,6 +1377,9 @@ in meaning. **Data per round: T x 8 B greedy; T x (8 + 536) B sampled; + 496,640
 - Reduced-vocab draft head: replicated, so both ranks compute the same subset argmax and
   `r4dx_gather_i32` mapping on device; the chain stays device-resident, no merge.
 - Verification is `VerifyWindow` (7.6); losslessness argument unchanged.
+- On the branch (Appendix B N80): `--mtp` is at most 7 under TP (`tp::kMaxUnsplitDraftK`), because
+  verify windows, like decode steps, are not cut into `SubmitBounder` units -- an up-to-64-row MTP
+  window would be a prefill chunk's shape queued unsplit on device 0.
 
 ### 8.2 DFlash2 (`src/model/dflash_draft.{h,cpp}`)
 
@@ -1434,11 +1441,12 @@ in meaning. **Data per round: T x 8 B greedy; T x (8 + 536) B sampled; + 496,640
 dflash_injection_))`. `Model::Reset` has no collectives; it re-zeroes GDN state and resets host
 counters, the DFlash ring counters and the mrope state on each rank.
 
-**Server recovery after an error needs two fixes, one of them a bug on `main` today.**
+**Server recovery after an error needs two fixes; both are on the branch.** (The line numbers below
+are from before `977160e` and P5.)
 
 1. `SetDflashInjectionEnabled` must not throw in `kNeedsRecovery` (2.4): `Engine::RunRequest` calls it
    (`engine.cpp:367-369`) before the prefix decision.
-2. **`PrefixState::Invalidate()` does not force a reset today.** The catch block
+2. **`PrefixState::Invalidate()` did not force a reset before `977160e`.** The catch block
    (`engine.cpp:980-987`) calls `prefix_.Invalidate()`, which clears `fed_`
    (`prefix_state.h:98-101`, identical to `Clear()`). With `fed_` empty, the next request's
    `Extend(full_tokens)` passes every check (`full_tokens.size() > 0`, `std::equal` over an empty
@@ -1449,20 +1457,27 @@ counters, the DFlash ring counters and the mrope state on each rank.
    TP=2 it is permanent failure: `Reset()` is never called, so every forward call throws
    `TpStateError`, the catch invalidates again, and the server answers 500 until restarted.
 
-   Fix (in `src/server/prefix_state.h`): add `bool needs_reset_ = false;`. `Invalidate()` clears
-   `fed_`/`fed_images_` **and** sets `needs_reset_ = true`; `Extend()` returns `std::nullopt` while
-   `needs_reset_` is set; `Clear()` (called right after `model_->Reset()`, `engine.cpp:391`) clears
-   it. The first request after construction is unaffected (`needs_reset_` starts `false`, the
-   model is fresh). `tests/server/test_prefix_state.cpp` gains
-   `TestInvalidateForcesResetPath` (`Commit`, `Invalidate`, then `Extend` of a longer prompt
-   returns `nullopt`; after `Clear()` it extends again). It changes behaviour only on the error
-   path (G2 rows never throw), but it IS a behaviour change, so on `tp2` it lands in P5 together
-   with the server's TP support. Landing it on `main` now, independently of TP, is recommended and
-   is the user's decision (Appendix C).
+   Fix -- **landed on `main` in `977160e` and merged into `tp2`** (`src/server/prefix_state.h`,
+   Appendix C question 1): `bool needs_reset_ = false;`. `Invalidate()` clears `fed_`/`fed_images_`
+   **and** sets `needs_reset_ = true`; `Extend()` returns `std::nullopt` while `needs_reset_` is
+   set; **only `Commit()` lifts it** -- `Clear()` (called right after `model_->Reset()`) does NOT,
+   so a pending invalidation survives a `Reset()` that itself fails, and is lifted only once a
+   request has run to completion on the reset model. The engine's error path therefore satisfies
+   this section as it stands: the next request's `Extend` returns `nullopt` -> `Reset()` +
+   `Clear()` + full prefill -> `Commit` (which lifts the flag). The first request after
+   construction is unaffected (`needs_reset_` starts `false`, the model is fresh).
+   `tests/server/test_prefix_state.cpp` has `TestInvalidateForcesResetUntilCommit` (`Commit`,
+   `Invalidate`, then `Extend` of a longer prompt returns `nullopt`, still `nullopt` after
+   `Clear()`, and extends again only after a `Commit`). It changes behaviour only on the error
+   path (G2 rows never throw).
 
 With both fixes, the request after any TP error runs: cached toggle -> `Extend` refuses ->
-`Reset()` (recovery 2.5 + `Model::Reset` + toggle) -> normal request. G11's `-TpFault` case proves
-it end to end on the production `--dflash` configuration.
+`Reset()` (recovery 2.5 + `Model::Reset` + toggle) -> `Clear()` -> normal request -> `Commit`.
+G11's `-TpFault` case proves it end to end on the production `--dflash` configuration. On the
+branch (P5, Appendix B N74, N76): the engine's error log names the group state ("tp: group needs
+recovery; the next request resets it"), the request whose `Reset()` recovered the group logs
+`tp_recovery=yes`, and `tests/server/test_engine_recovery.cpp` checks the engine side of this
+sequence on CPU, against a fake with `TpModel`'s state machine.
 
 ### 8.5 mrope deltas
 
@@ -1494,7 +1509,10 @@ attention is out of scope here (docs/perf.md already flags it as a single-GPU le
 | `--tp-ar-nb N`, `--tp-ar-nb-large N` | 4, 4 | expert: blocks per all-reduce for channel 0 / 1, [1, 64] |
 
 Usage errors (`CliUsageError` / `ServerUsageError`): any `--tp-*` with `--tp 1`; `--tp` not in {1,2};
-`--tp 2` with `--profile` or `--profile-prefill` (permanent in v1); `--tp-rank` outside noop.
+`--tp 2` with `--profile` or `--profile-prefill` (permanent in v1); `--tp-rank` outside noop;
+`--tp 2` with `--mtp` above 7 (P5 review, Appendix B N80: a verify window is never split into
+device-0 submission units, so it stays at most 8 rows -- `TpModel::Load` and `Model::Load` refuse it
+too; `--tp 1` keeps its 63).
 **Staged rejections** (removed by the phase that implements them): the `--tp*` flags appear in P2b;
 until P4 `--tp-mode real`; until P5 `--tp 2` with `--mtp > 0`, `--dflash`, `--vision on`,
 `--image`/`/image`, and `r4dx-server --tp 2` altogether. The same rejections are enforced a second
@@ -1551,7 +1569,7 @@ time in `TpModel::Load` (2.9 step 1), so tests and tools that bypass the arg par
 | `tests/model/test_tp_rank_worker.cpp` | CPU (threads) | ctest | none | `RankWorker` + `CompletionGroup` (2.2): 2 workers x **1,000,000 empty commands with `WorkerTiming{0 us, 0 us}`** (every hand-off goes through both condvars) and no hang (the test's own 120 s alarm); 10,000 commands with random 0-2 ms sleeps on one side; an exception in a command comes back through `TakeError()`; the progress-watchdog helper fires only when no heartbeat moves (fake clock); destructor with a busy worker waits for it and never overwrites `cmd_` | P1 |
 | `tests/model/test_tp_loader.cpp` | GPU | ctest, `HIP_VISIBLE_DEVICES=1`, SKIP 77 | dev 1 | load `qwen38-27b-l4-allmtp.r4dx` at `{world 2, rank r}` for r = 0,1 in each of the 4 layouts: every uploaded buffer D2H == `Gather(Plan(...))` of the file bytes; every `QuantLinear::N/K` == rank shape; bf16 layout: rank 0 ∪ rank 1 slices reassemble the full tensors exactly; `EmbedTokensHost()` of both ranks is the same pointer when shared | P2a |
 | `tests/model/test_tp_emulation.cpp` | GPU | ctest, dev 1, SKIP 77 | dev 1 | TP=1 `Model` vs `TpModel(emulate)` on `l4-allmtp`, all 4 layouts: prefill 40 and 70 tokens (1 and 2 chunks) + 16 teacher-forced `DecodeStep` rows, per-row rel L2 of logits <= 1e-2 (bf16, w4a16) / <= 5e-2 (w4a8, mxfp4); `DecodeStepGreedy` == argmax of `DecodeStep` path (exact); `DecodeStepSampled` vs `DecodeStep`+`SampleCanonical` on the same TpModel, 3 configs x 3 seeds, trajectories **exactly** equal (validates 7.4 end to end); one merged summary vs `r4dx_topk_lse_f32` over the gathered row (ids/vals exact, lse <= 1e-4); `Reset()` then rerun == first run byte for byte; fault injection (rank 1 throws at AR #37): the injected exception reaches the caller, the next forward call throws `TpStateError`, `SetDflashInjectionEnabled` and every cached accessor still work in `kNeedsRecovery`, `Reset()` recovers, both endpoints report equal `CallCounts()`, rerun == fresh run byte for byte; the same with an asymmetric fault (kind 1, stall -> peer timeout). Every case ends with `g_tp_collective_allocs == 0` (2.7) | P2b |
-| `test_tp_emulation.cpp`, P5 additions | GPU | same | dev 1 | **MTP** K=3 greedy/sampled (bookkeeping lockstep: committed positions == emitted tokens each round; sampled rounds vs plain sampled decode via `tests/model/sampled_equality.hpp`'s classifier) and the reduced-vocab head on `l4-mtp-draftvocab`. **DFlash** k=7 on `l4-allmtp` + `ProductionDrafterPath()` (`test_container_path.h:131`), greedy and seeded sampled, 3 prompts: (a) **H7 exactness** -- a test hook (`Model::DflashDebugLastTop16()`, compiled only with `R4DX_TP_TESTING`) returns the merged `cand/unary` of the last round; the test gathers the drafter's full `[8, 248320]` logits through `GatherVocabRow`, computes the CPU top-16 with `r4dx_topk16_f32`'s total order, and requires exact equality; (b) **H6 exactness** for MTP full-vocab drafts the same way; (c) **lockstep bookkeeping** -- after every round `DflashInjectedCount() == PositionCount()` on both ranks and the drafts/`walk_len` agree (the facade already compares them); (d) **lossless-by-construction** -- every emitted greedy token equals the merged argmax of its verify row, recomputed from a gathered full row. **Tiny temperature**: `DecodeStepMtpSampled` and `DecodeStepDflashSampled` at `T = 0.005` (the `logits_out` path, H4) equal `SampleCanonical` over gathered rows | P5 |
+| `test_tp_emulation.cpp`, P5 additions | GPU | same | dev 1 | **MTP** K=3 greedy/sampled (bookkeeping lockstep: committed positions == emitted tokens each round; sampled rounds vs plain sampled decode via `tests/model/sampled_equality.hpp`'s classifier) and the reduced-vocab head on `l4-mtp-draftvocab`. **DFlash** k=7 on `l4-allmtp` + `ProductionDrafterPath()` (`test_container_path.h:131`), greedy and seeded sampled, 3 prompts: (a) **H7 exactness** -- a test hook (`Model::DflashDebugLastTop16()`, compiled only with `R4DX_TP_TESTING`) returns the merged `cand/unary` of the last round; the test gathers the drafter's full `[8, 248320]` logits through `GatherVocabRow`, computes the CPU top-16 with `r4dx_topk16_f32`'s total order, and requires exact equality; (b) **H6 exactness** for MTP full-vocab drafts the same way; (c) **lockstep bookkeeping** -- after every round `DflashInjectedCount() == PositionCount()` on both ranks and the drafts/`walk_len` agree (the facade already compares them); (d) **lossless-by-construction** -- every emitted greedy token equals the merged argmax of its verify row, recomputed from a gathered full row. **Tiny temperature**: `DecodeStepMtpSampled` and `DecodeStepDflashSampled` at `T = 0.005` (the `logits_out` path, H4) equal `SampleCanonical` over gathered rows. On the branch (Appendix B N72, N80): DFlash2 and a second MTP suite on v6, sampled rounds checked against their own verify rows, plus three comparisons with the TP=1 `Model` -- a verify / commit script (8-row windows committing 3, 8, 1, 5), a TP=1 replay of every speculative trajectory's windows and commits, and vision (two images, rank 0's encode, host-row splice) | P5 |
 | `tests/kernels/test_tp_allreduce_cpu_peer.cpp` | GPU | ctest, dev 1 | dev 1 | the engine AR kernel against a **CPU thread** acting as rank 1 through a real pinned mailbox: 100,000 ARs at {10240, 81920, 174080, 655360} B, bit-exact; timeout path (CPU peer silent) returns within timeout +10%, ABORT word set, next call skips (sticky); seq base `0xFFFFFF00` crosses the 2^32 wrap cleanly | P3 |
 | `tests/kernels/test_tp_allreduce_2gpu.cpp` | GPU | ctest, LABEL `tp2gpu`, **opt-in** (below) | dev 0+1 | `HostMailboxComm` end to end: 1,000,000 ARs, mixed sizes on both channels, interleaved with VRAM filler kernels that dirty L2, verified bit-exact every batch (tp_bench's hash pattern); abort propagation (rank 1 `Abort()` -> rank 0 kernel exits < 5 ms, both see `TpAbortedError`); `Recover()` then 10,000 more clean ARs | P3 |
 | `tests/model/test_tp_real_vs_emulation.cpp` | GPU | ctest, LABEL `tp2gpu`, opt-in | dev 0+1 | on `l4-allmtp` w4a16 and mxfp4: a fixed script (prefill 70, 16 full-logit steps, 16 greedy, 16 seeded sampled) run in emulate mode then real mode -> **byte-identical** outputs; P5 extends with MTP K=3 and DFlash k=7 (`ProductionDrafterPath()`) greedy and seeded-sampled rounds, byte-identical tokens, `walk_len` and final logits | P4, P5 |
@@ -1560,7 +1578,8 @@ time in `TpModel::Load` (2.9 step 1), so tests and tools that bypass the arg par
 | `tests/kernels/tool_tp_ar_latency.cpp` | GPU tool | built only | dev 0+1 | tp_bench's decode pattern using the engine comm, with all three interleaved conditions -- (a) AR, (b) stand-in kernel on the same grid, (c) fillers only -- 128 ARs per token, 60 MiB filler, 4 MiB dirty; reports **`L_vs_no_ar_kernel = (T_a - T_c)/128`** (the G5 number) and `L_vs_standin = (T_a - T_b)/128` at 10 KiB, 80 KiB, 640 KiB, for nb in {4, 8, 16} on channel 1 | P3 |
 | `tests/model/tool_tp_soak.cpp` | GPU tool | built only | dev 0+1 | G8 (10.5) | P4 |
 | `tests/model/tool_teacher_forced_logprobs.cpp` | GPU tool (existing) | built only | any | gains `--tp 2 --tp-mode real|emulate|noop --tp-devices` and `--embed-device-resident`; `teacher_forced.h::RunSegment` takes `TextModel&` | P2b |
-| `tests/server/test_prefix_state.cpp` (existing) | CPU | ctest | none | + `TestInvalidateForcesResetPath` (8.4) | P5 |
+| `tests/server/test_prefix_state.cpp` (existing) | CPU | ctest | none | + `TestInvalidateForcesResetPath` (8.4; landed on `main` as `TestInvalidateForcesResetUntilCommit`) | P5 |
+| `tests/server/test_engine_recovery.cpp` | CPU (links `r4dx-server`'s libraries, no GPU call; `HIP_VISIBLE_DEVICES=1`) | ctest, skips (77) without the tokenizer directory | none | `Engine::RunRequest`'s error path against a CPU fake of `TpModel`'s state machine and one of the TP=1 model (no state machine: a skipped `Reset()` silently runs on the leftovers): a mid-decode fault and a prefill fault each answer 500, the request after each goes through `Reset()` and reproduces the fresh-engine text; with a drafter configured, the injection toggle runs before that `Reset()` (Appendix B N76, N80) | P5 |
 | `tools/tp/tp1_identity.ps1` | script | -- | dev 1 | G2 (10.3) | P2a |
 
 **Two-GPU tests are opt-in, not just labelled.** A per-test `HIP_VISIBLE_DEVICES` property would
@@ -1874,15 +1893,16 @@ R1/R2); between 1.40x and 1.45x record the numbers and the user decides whether 
 | `src/model/container.cpp` | vision config parse on rank > 0 (if not done in P2a) | +30 |
 | `src/model/tp_model.cpp`, `text_model.h` | `EncodeImages` solo command, `ImageRows::host`; `R4DX_TP_FAULT` parse; lift the MTP/DFlash/vision rejections | +110 |
 | `src/cli/main.cpp` | drop staged rejections; `embeds_on_host` from `ImageRows` | +40 |
-| `src/server/server_args.h`, `engine.h/.cpp`, `main.cpp` | `--tp*` flags, `EngineOptions::tp`, `unique_ptr<TextModel>`, `ImageRows`, `ms.embeds_on_host`, per-request log gets `tp=2` | +170 |
-| `src/server/prefix_state.h` | `needs_reset_` (8.4) | +10 |
-| `tools/server/smoke.ps1` | `-Tp`, `-TpMode`, `-TpFault`; with `-Tp 2` remove `HIP_VISIBLE_DEVICES`, pass `--tp 2` to the server AND to every `r4dx-cli` comparison run it makes. `-TpFault`: start the server with `R4DX_TP_FAULT=1:3000:1` (rank 1 stalls 700 ms at its 3000th post-warm-up all-reduce, i.e. inside the first long request), send request A (expect HTTP 500 or 200 -- either is accepted, it is the fault request), then request B = the standard smoke prompt, which must return 200 with text equal to the non-fault reference | +90 |
-| `tools/validate_dflash.ps1`, `tools/validate_spec_sampling.ps1` | `-Tp 2`: remove `HIP_VISIBLE_DEVICES` and pass `--tp 2` to every `r4dx-cli` run (ground truth, speculative and control runs alike) | +40 |
-| tests: `test_tp_emulation.cpp` (+420: MTP, DFlash, tiny-T), `test_tp_real_vs_emulation.cpp` (+180: MTP, DFlash), `tests/server/test_prefix_state.cpp` (+25) | 10.1 | 625 |
+| `src/server/server_args.h`, `engine.h/.cpp`, `main.cpp` | `--tp*` flags, `EngineOptions::tp`, `unique_ptr<TextModel>`, `ImageRows`, `ms.embeds_on_host`, per-request log gets `tp=2` -- done (Appendix B N74) | +170 |
+| `src/server/prefix_state.h` | `needs_reset_` (8.4) -- already on `tp2` from `main`'s `977160e` (8.4) | -- |
+| `tools/server/smoke.ps1` | `-Tp`, `-TpMode`, `-TpFault`; with `-Tp 2` remove `HIP_VISIBLE_DEVICES`, pass `--tp 2` to the server AND to every `r4dx-cli` comparison run it makes. `-TpFault`: start the server with `R4DX_TP_FAULT=1:3000:1` (rank 1 stalls 700 ms at its 3000th post-warm-up all-reduce, i.e. inside the first long request), send request A (expect HTTP 500 or 200 -- either is accepted, it is the fault request), then request B = the standard smoke prompt, which must return 200 with text equal to the non-fault reference -- done (N77) | +90 |
+| `tools/validate_dflash.ps1`, `tools/validate_spec_sampling.ps1` | `-Tp 2`: remove `HIP_VISIBLE_DEVICES` and pass `--tp 2` to every `r4dx-cli` run (ground truth, speculative and control runs alike) -- done (N78) | +40 |
+| tests: `test_tp_emulation.cpp` (+420: MTP, DFlash, tiny-T), `test_tp_real_vs_emulation.cpp` (+180: MTP, DFlash), `tests/server/test_prefix_state.cpp` (+25; on `main` since `977160e`); new `tests/server/test_engine_recovery.cpp` (N76) | 10.1 | 625 |
 
 Optional in P5 (behaviour-identical, speed only): the server's plain greedy loop (`engine.cpp:733-759`)
 calls `DecodeStep` + host `Sample`; switch it to `DecodeStepGreedy` (same token: device argmax and host
 `Argmax` share the lowest-index tie-break) to avoid a 1 MB gather per token under TP. Must pass G2.
+Done (N75: identical tokens at TP=1 and TP=2; the server is not in G2's matrix).
 
 Gates:
 ```powershell
@@ -1905,12 +1925,19 @@ $d = "D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx"
 .\tools\validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16 -AllowBatchedVerifyDivergence
 .\tests\run_tests.ps1 -TwoGpu
 $env:HIP_VISIBLE_DEVICES='1'; .\tests\run_tests.ps1; powershell -File tools\tp\tp1_identity.ps1 -Baseline build\baseline -Candidate build\win-hip
+# TP=1 controls (Appendix B N80), same tree, device 1 -- run whenever a speculative row above fails:
+.\tools\validate_spec_sampling.ps1 -Tp 1 -Layouts w4a16 -AllowBatchedVerifyDivergence
+.\tools\server\smoke.ps1 -Model $m -Layers -1 -Mtp 3
 ```
 Pass: >= 95 tok/s twice; G10; every smoke run 0 FAIL, including `-TpFault`; both validate scripts
 exit 0 (a WARN row is accepted only through the scripts' own exact-hash control rule, and every WARN
 is listed in the phase commit message); ctest green (incl. the DFlash/MTP cases of
 `test_tp_emulation` and `test_tp_real_vs_emulation`); G2. `--mtp 3` tok/s is recorded in
-docs/perf.md (projected ~100-110, not gated).
+docs/perf.md (projected ~100-110, not gated). A speculative-vs-plain sampled FAIL at `-Tp 2` (the
+G11 smokes' last check, a `validate_spec_sampling -Tp 2` MTP row) is not by itself a TP result: the
+known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` failure (N29) is that property at TP=1. The
+smoke prints its own TP=1 control on such a FAIL (N80); the gate note records it and the TP=1
+controls above. The pass rule itself is unchanged.
 
 ---
 
@@ -1930,7 +1957,7 @@ docs/perf.md (projected ~100-110, not gated).
 | R10 | w4a8/mxfp4 numerics drift more under TP (local-K activation scales) | G4 is on the production layout (w4a16); w4a8/mxfp4 get the looser rel-L2 check in `test_tp_emulation` and an informational KL report |
 | R11 | Prefill gains below projection (640 KiB ARs, 58 us x 128 per chunk) | channel 1 `nb` sweep in P3; long-context prefill is attention-bound and gains little by design (1.4) |
 | R12 | VRAM: two replicated drafters + replicated embedding + desktop on device 0 | 4.5 shows ~17 GiB/rank at 262k with everything on; the joint embed-residency decision falls back to host gather on both ranks if either is short |
-| R13 | Recovery cannot run (a stream stuck past the watchdog) | `kFatal`: every call throws; the server answers errors and must be restarted; logged with rank and Status |
+| R13 | Recovery cannot run (a stream stuck past the watchdog) | `kFatal`: every call throws; the server answers errors and must be restarted; logged with rank and Status; `/health` answers 503 `tp_fatal` from then on (N80) |
 | R14 | Scope creep into graphs / fused AR+norm / drafter sharding | explicit non-goals (1.2); each is a separate measured proposal after P5 |
 | R15 | `tools/server/smoke.ps1` compares server output against `r4dx-cli` output | P5 passes `--tp 2` to both sides of every comparison |
 | R16 | The server never recovers from a TP error (toggle before `Reset()`; `PrefixState::Invalidate` never forcing `Reset()`) | host-only calls legal in `kNeedsRecovery` (2.4); `needs_reset_` (8.4); G11 `-TpFault` on the production `--dflash` config; `test_tp_emulation` checks the toggle and accessors in `kNeedsRecovery` |
@@ -1948,8 +1975,8 @@ New: `src/core/include/r4dx/core/tp_comm.hpp`, `tp_host_exchange.hpp`, `tp_alloc
 `src/kernels/check_tp_isa.cmake`; `src/model/tp/tp_shard.{h,cpp}`, `tp_vocab.h`, `tp_rank_worker.h`,
 `tp_group.{h,cpp}`, `tp_comm_noop.{h,cpp}`, `tp_comm_emulated.cpp`, `tp_comm_host_mailbox.cpp`;
 `src/model/model_types.h`, `text_model.h`, `local_text_model.{h,cpp}`, `tp_model.{h,cpp}`,
-`gemm_tuning_table_tp2.inc` (generated); tests and tools listed in 10.1;
-`tools/tp/tp1_identity.ps1`.
+`gemm_tuning_table_tp2.inc` (generated); tests and tools listed in 10.1 (incl.
+`tests/server/test_engine_recovery.cpp`, P5); `tools/tp/tp1_identity.ps1`.
 
 Modified: `src/model/model_config.h`, `container.{h,cpp}`, `model.{h,cpp}`, `gdn_layer.{h,cpp}`,
 `mlp.{h,cpp}`, `gdn_state.h`, `linear.{h,cpp}`, `mtp_head.{h,cpp}`, `dflash_draft.{h,cpp}`,
@@ -1958,9 +1985,11 @@ Modified: `src/model/model_config.h`, `container.{h,cpp}`, `model.{h,cpp}`, `gdn
 `src/kernels/src/r4dx_kernels.hip`, `kernels.h`, `CMakeLists.txt`; `src/vision/image_prompt.h`;
 `src/cli/{cli_args.h,main.cpp}`; `src/server/{server_args.h,engine.h,engine.cpp,main.cpp,
 prefix_state.h}`; `tests/model/{teacher_forced.h,tool_teacher_forced_logprobs.cpp,CMakeLists.txt}`,
-`tests/server/test_prefix_state.cpp`, `tests/kernels/CMakeLists.txt`, `tests/core/CMakeLists.txt`,
+`tests/server/test_prefix_state.cpp`, `tests/server/{test_server_args.cpp,CMakeLists.txt}`,
+`tests/kernels/CMakeLists.txt`, `tests/core/CMakeLists.txt`,
 `tests/run_tests.ps1`; `tools/profile/tune_gemm.py` (`SHAPES` only); `tools/server/smoke.ps1`,
-`tools/validate_dflash.ps1`, `tools/validate_spec_sampling.ps1`; `README.md`, `docs/perf.md`.
+`tools/validate_dflash.ps1`, `tools/validate_spec_sampling.ps1`; `README.md`, `docs/perf.md`,
+`docs/server.md`.
 **Not** modified: `src/model/gemm_tuning_table.inc`.
 
 CMake targets: `r4dx_tp_shard` (CPU), `r4dx_tp` (links `r4dx_core`, `r4dx_kernels`),
@@ -3329,6 +3358,549 @@ it refines.
     positions (2,048-token prompts + 512 decode), so N64's context-scaled units (which change nothing
     below 16k) are still unmeasured on real GPUs past 4k -- and the warm-up's 1500 ms spin timeout on
     the device-0 rank stays as N64 left it (no warm-up timed out in this run's 13 real-mode loads).
+
+**P5** (model side: `src/model`, `src/cli`, the model tests and tools; `src/server` and the
+`tools/*.ps1` scripts are the second P5 pass's)
+
+- **N66 (8.1: MTP under TP).**
+  - `MtpHead(cfg, w, max_draft, max_ctx, logits_rows, comm = nullptr)`. `Model::Load` passes
+    `logits_rows = max(LmHead().N, Mtp().draft_lm_head.N)` (the whole vocabulary at TP=1, so the
+    allocation is the old one) and the rank's `comm_`. `attn_layer_` and `Draft`'s `Mlp` all-reduce
+    through `comm` (A2/A3); `prime_attn_layer_` has a null comm and serves `PrimeKv` only.
+  - `Draft`'s `vocab` argument is now the EMBEDDING table's rows only; the full-vocab head's argmax
+    runs over `lm_head.N`. `Draft` throws if a draft head is wider than `logits_rows`.
+  - Full-vocab head under TP (H6): per step `r4dx_argmax_val_f32` over the shard -> `Synchronize` ->
+    8-B D2H -> `+ VocabShardBegin()` -> `HostAllGather` -> `tp::MergeArgmax`; the merged token goes
+    to `drafts` on the host and, with the device embedding mirror, into `seed_token_dev_` by a
+    blocking H2D (the device is idle) for the next step's gather. The chain's `draft_ids_dev_`
+    accumulation and its end-of-window readback are skipped on that path. `argmax_pair_dev_` (2
+    int32) exists only under TP. The replicated reduced-vocab head keeps the device chain (no merge).
+  - At TP=1 nothing changed except `prime_attn_layer_` (a host object equal to `attn_layer_`) and
+    two host checks; G2 rows 3 and 8 are byte-identical and equally fast (N73).
+- **N67 (8.2, 2.9 step 6: DFlash2 under TP).**
+  - `DflashHostCodebooks` (`predecessor`, `successor`: plain host vectors) is defined in
+    `dflash_draft.h`; `model.h`'s forward declaration is gone (it includes `dflash_draft.h`).
+    `DflashDraft::LoadHostCodebooks(path)` reads them CPU-only; `DflashDraft` holds a
+    `shared_ptr<const DflashHostCodebooks>` (at TP=1 its own copy, read from the file as before).
+  - `DflashDraftOptions` gains `vocab_offset`, `global_vocab`, `comm`, `shared_codebooks`
+    (`lm_head_vocab` existed). `Model::Load` passes `lm_head_vocab = vocab_local_` always (== the
+    vocabulary at TP=1) and the other four only on a TP rank. The mask-id, anchor-id and codebook-size
+    checks use `global_vocab`. One check beyond 8.2: `[vocab_offset, +lm_head_vocab)` must lie inside
+    `global_vocab`, and without a comm the two TP fields must keep their TP=1 values.
+  - H7: after the round's one D2H + synchronize, the local ids are made global IN the staging blob,
+    one `HostAllGather` moves each rank's `[unary | cand]` prefix of it (1,024 B at block 8: 512 B
+    unary, 512 B cand), and `tp::MergeTop16` writes `merged_cand_` / `merged_unary_`, which the
+    selector walk (and a trace) then read. `gate` stays the local staging slice (replicated).
+  - `TpModel::Load` reads the codebooks once on the facade thread (CPU only) right after the pinned
+    embedding load and passes them in `TpRankOptions::dflash_codebooks`; the facade's reference is
+    dropped when Load returns (plain host memory: freeing it on any thread is no HIP call).
+- **N68 (8.3, 2.8: vision under TP).**
+  - `Model::Load` implements 8.3's table: `--vision on` needs `HasVisionConfig()` on a TP rank; the
+    `kAuto` "tower not loaded" warning is skipped when `!vision_weights_on_this_rank`; the P2a/P2b
+    `kAuto` -> text-only override is gone. `Model::VisionSpliceEnabled()` (= `HasVisionConfig()`)
+    gates `PrefillMultimodal`, whose merge size now comes from `VisionCfg()`; the P2b refusal of
+    host rows is gone and `SpliceImageEmbeddings` copies host-to-device when `embeds_on_host`.
+    `container.cpp` needed nothing: P2a already parses the config on rank > 0.
+  - `TpModel::EncodeImages`: a solo command on rank 0's slot through `RunGuarded` (a failure makes
+    the group `kNeedsRecovery`, like every device-work call, 2.4). The closure co-owns a heap block
+    (N53) with copies of the pixels (`total_patches x PatchDim()` floats; `PatchDim` is cached from
+    rank 0's `VisionCfg()` at load and compared across ranks with the other capabilities), the grids
+    and the stats; the tower's `DeviceBuffer` lives and dies on rank 0's thread, its rows are D2H'd
+    into the block and moved into `ImageRows::host` (`SetFilled(true, merged tokens)`).
+  - `TpModel::PrefillMultimodal` refuses a span without `embeds_on_host` (`std::invalid_argument`,
+    before any command: a device pointer names one device) and copies the rows into a heap block
+    the closure co-owns (N53), rebasing the spans onto it. The CLI's `/image` refusal is gone; its
+    spans already carried `embeds_on_host` from `ImageRows` (P2b).
+- **N69 (Appendix B N57: the vision encode is bounded without `SubmitBounder`).** On a TP rank
+  with `submit_layers > 0`, `Model::EncodeImages` passes `VisionTower::Encode` a pre-block hook that
+  returns false: the tower synchronizes its own stream before calling it, so at most one of the 27
+  encoder blocks is queued ahead of the host -- the K = 1 synchronize semantics, no event, and never
+  `Model::stream_`. `SubmitBounder` lives in `Model` and has no hook into the tower's stream loop;
+  the existing hook needed no `src/vision` change. It matters only when rank 0 (the tower's rank)
+  runs on the desktop card (`--tp-devices 0,1`; the default puts it on device 1). Measured on the
+  golden image (196 tokens), one run each: 32.7 ms real (rank 0 = device 1), 32.0 ms emulated, vs
+  32.2 / 31.6 ms at TP=1 (G2 row 7, baseline / candidate).
+- **N70 (2.9 step 9, N53: warm-up with a drafter).** `Model::TpWarmup` runs one
+  `DecodeStepMtpGreedy(0, mtp_draft_k)` or `DecodeStepDflashGreedy(0, dflash_draft_k, 0, 0)` after the
+  decode step (p_min / n_min off: the widest window). `Model::WarmupPositions(opts)` = 65, plus
+  `1 + k` with a drafter (73 at k = 7), replaces `TpModel::Load`'s fixed 65 in the `--max-ctx` check.
+- **N71 (9.1: `R4DX_TP_FAULT`; the staged rejections).**
+  - `TpModel::Load` reads `R4DX_TP_FAULT` (`_dupenv_s`) when `TpOptions::fault_rank == -1`: exactly
+    three non-negative decimal integers `rank:n:kind`, rank and kind 0 or 1, else
+    `std::invalid_argument` naming the value; then TpOptions' own fault validation (n > 0, not noop).
+    A fault set in TpOptions wins and the variable is reported as ignored. Armed faults are logged
+    (`*** FAULT INJECTION ARMED (R4DX_TP_FAULT): rank 1 will throw at its all-reduce #40 ... ***`).
+    Checked on l4-allmtp emulate (device 1): `1:40:0` fired at rank 1's 40th post-warm-up
+    all-reduce and r4dx-cli exited 1 with "tp fault injection"; `1:2x:0` and `2:40:0` were refused
+    at load.
+  - Gone: `Model::Load`'s MTP / DFlash2 / `--vision on` refusals and its `kAuto` override, the same
+    three in `TpModel::Load`, the `RequireNotTp` of `DecodeStepMtpImpl` / `DecodeStepDflashImpl`,
+    `cli_args.h`'s `--mtp` / `--dflash` / `--vision on` / `--image` refusals under `--tp 2`, and
+    `main.cpp`'s `/image` refusal. `--profile*` stays refused (1.2). `tests/cli/test_args.cpp`'s
+    `TestTpFlags` now expects those combinations to parse, and `--mtp` + `--dflash` and
+    `--dflash-k 8` to stay refused under `--tp 2`.
+- **N72 (10.1: the P5 tests; deviations).**
+  - **The hooks are compiled only into `r4dx_model_tptest`**: the same sources as `r4dx_model` with
+    `R4DX_TP_TESTING` defined PUBLIC, linked only by `test_tp_emulation` and
+    `test_tp_real_vs_emulation` (both `#error` without it); production binaries never carry them.
+    Hooks: `Model::MtpDebugSetCapture` / `MtpDebugLastDraft` (while on, each merged draft step also
+    D2Hs its shard and all-gathers the full row -- one extra exchange per step, the same on both
+    ranks), `DflashDebugLastTop16` and `DflashDebugGatherDraftLogits` (collective: one
+    `GatherVocabRow` per block row).
+  - **DFlash2 runs on v6 + `ProductionDrafterPath()`, not on `l4-allmtp`**: the drafter's target
+    layers {6, 20, 34, 48, 62} do not exist in the 4-layer container, and
+    `AttachDflashFeatureCapture` refuses a layer `>= NumLoadedLayers()` at load. MTP runs on
+    `l4-allmtp` (and the reduced head on `l4-mtp-draftvocab`) AND on v6: the 4-layer head never
+    accepts, so only v6 exercises multi-token MTP rounds. The v6 prompts are a random 24- or
+    32-token run repeated (drafts accept), plus one plain random prompt for DFlash.
+  - **Sampled rounds are checked against their own verify rows, not against plain sampled
+    decode**: for every emitted token i, `SampleCanonical(gathered verify row i, u_i)` with `u_i`
+    replayed from the generator before the round must equal it, and the generator must have
+    advanced by exactly one draw per emitted token. That is exact and deterministic. 10.1's
+    comparison with plain sampled decode through `sampled_equality.hpp`'s classifier was not used:
+    the classifier lives in `test_mtp.cpp`, and its TP=1 run is the known w4a16 failure (N29), so a
+    TP=2 failure there could not be told from it.
+  - The v6 cases need 22 / 24 GiB free on the device (both emulated ranks; N73's 20.29 / 22.91 GiB
+    at `--max-ctx 2048`) and fail by name ("is the production server running?") below that.
+    `test_tp_real_vs_emulation`'s DFlash case has its own pre-flight: 24 GiB on HIP ordinal
+    visible - 1 (the emulate pass) and 13 GiB on the other.
+  - `tool_tp_soak` gains `--dflash <drafter> [--dflash-k 7]` (10.5's DFlash modes): DFlash2 greedy
+    and seeded sampled generations join the mode draw, as whole rounds until the decode length is
+    reached; without `--dflash` the draw is the pre-P5 one, so earlier seeds replay the same
+    iterations. `--max-ctx` must then also hold `2 * (k + 1)` positions of slack. Dry run
+    (emulate, v6, 6 iterations, 2026-09-25): PASS, both DFlash modes drawn, buffer drift 0 / 0 MiB.
+- **N73 (P5 model side, measured 2026-09-25 03:26-04:03 on the uncommitted tree at `155b587`,
+  production server stopped; not the G9-G12 gates).** Rank 0 = HIP device 1 (bus 07), rank 1 =
+  device 0 (bus 03, desktop live), `HIP_VISIBLE_DEVICES` unset for every real run; every device-0
+  run was followed by a 30 s wait and `tdr_check.ps1 -Since <its start>` (all clean), the
+  test run by `tdr_watch.psm1`'s in-run watch too. Logs: `build\logs\p5\`.
+  - **Build:** `.\build.ps1` clean; the only warnings are the pre-existing `fopen` deprecations
+    (`teacher_forced.h:291`, `main.cpp`'s `--dump-token-ids`, `tool_vision_chat.cpp`).
+  - **`run_tests.ps1` (default, device 1):** 72 of 73 (15 skips) in 587.9 s; the one failure is
+    the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled trajectories,
+    N29); `test_tp_emulation` 95.2 s, `test_cli_args` and G1's five CPU tests pass.
+  - **`test_tp_emulation`** (standalone 85 s and 83 s, the same round counts both times): every P2b
+    case with N54's numbers (max rel L2 bf16 6.5e-3 / 3.5e-3, w4a16 6.9e-3 / 5.4e-3, w4a8 7.7e-2 /
+    7.9e-2 at yardstick ratios 0.853 / 0.822, mxfp4 1.5e-2 / 1.6e-2),
+    then MTP -- `l4-allmtp` 12 greedy rounds (36 H6 draft steps), 18 sampled rounds, 6 at
+    T = 0.005; the reduced head 12 rounds; v6 12 greedy rounds emitting 30 tokens (longest round 4),
+    18 sampled (43 tokens), 6 at T = 0.005 (17) -- and DFlash2 on v6: 18 greedy rounds emitting 64
+    tokens (longest round 8, 144 H7 block rows exact), 18 sampled (59 tokens), 6 at T = 0.005 (39);
+    every greedy Reset() rerun equal; 0 collective allocations.
+  - **`run_tests.ps1 -TwoGpu`** (start 03:53:22): 2 of 2, TDR check clean.
+    `test_tp_allreduce_2gpu` 27.8 s; `test_tp_real_vs_emulation` 37.2 s: every P4 comparison
+    byte-identical as in N65, plus MTP (16 rounds, 16 tokens) and DFlash2 on v6 (16 rounds, 96
+    tokens) emulate vs real with the default 32/1 bounding: rounds, walk lengths, merged drafts /
+    top-16s, rng state and the tail logits all byte-identical. (A standalone run under the in-run
+    TDR watch, start 03:34:02, took 32 s and matched.)
+  - **CLI, v6 w4a16 `--tp 2` (real), standard protocol (`--max-tokens 256`), one run each; the
+    same line with `--tp-mode emulate` on device 1 gave the same stdout SHA-256 every time:**
+
+    | Run | Decode | Rounds / accepted | tok/round | Stdout SHA-256 | VRAM used per card (buffers) |
+    |---|--:|---|--:|---|---|
+    | plain | 61.45 tok/s (84 tok, EOS) | -- | -- | `FE60E2A2...03E4` (= N65) | 10.01 (9.69) GiB |
+    | `--mtp 3` | **108.31 tok/s** | 35 rounds, 50 of 105 drafts (47.6%) | 2.40 | `0C45C2D5...8DD2` | 10.24 (9.90) GiB |
+    | `--dflash <g64 drafter> --dflash-k 7` | **120.20 tok/s** | 30 rounds, 55 of 210 (26.2%) | 2.80 | `3163DB2F...0491` | 11.55 (11.18) GiB |
+    | `--vision on --image <golden>` "What is in this picture?" | 61.11 tok/s (256, max) | -- | -- | `AD1D8802...8408` | rank 0 10.99 (10.57), rank 1 10.07 (9.72) GiB |
+
+    Emulated (device 1): 53.40 / 61.42 / 28.80 tok/s at 20.29 / 22.91 / 20.89 GiB. The image run
+    encoded 1 image (196 tokens spliced) in 32.7 ms on rank 0 and prefilled 216 tokens at 1456
+    tok/s; its text is a coherent description of the image. TP=1 in the same session (G2 rows 3 and
+    2, candidate): 68.65 tok/s with `--mtp 3`, 74.77 with `--dflash`, so the TP=2 runs are 1.58x and
+    1.61x (single runs; G9 is the gate). The MTP and DFlash2 texts differ from the plain one (at
+    bytes 0xE5 and 0x43, e.g. "Pixels bloom alive." with DFlash2); at TP=1 the DFlash2 (row 2) and
+    MTP (row 3) texts differ from each other the same way ("anew." / "alive."). Whether each
+    difference is the accepted batched-verify class is G12's call (the validate scripts), not run.
+  - **TP=1 (`tp1_identity.ps1 -Rows 2,3,5,7,8`, a partial run, not G2):** all five EQUAL to
+    `build\baseline` (DFlash2 greedy and sampled, MTP greedy and sampled, vision); decode tok/s
+    baseline / candidate 74.53 / 74.77, 68.75 / 68.65, 66.18 / 66.25, 36.13 / 36.14, 57.95 / 57.96.
+  - **No TDR:** 6 device-0 runs (4 CLI, the watched test, the `-TwoGpu` suite), each checked.
+
+P5 server side (`src/server`, `tests/server`, `tools/server/smoke.ps1`, the validate scripts,
+`tools/tp/tdr_watch.psm1`, `docs/server.md`):
+
+- **N74 (9.1, 2.8, 8.3, 8.4: `r4dx-server --tp 2`).**
+  - `server_args.h` has r4dx-cli's `--tp`, `--tp-mode`, `--tp-devices`, `--tp-rank`,
+    `--tp-ar-timeout-ms`, `--tp-ar-nb`, `--tp-ar-nb-large`, `--tp-submit-layers`, `--tp-max-inflight`
+    with the same defaults, ranges and usage errors (`ParseServerTpDevices` duplicates
+    `ParseTpDevices` with `ServerUsageError`, the headers' documented duplication; the server has no
+    `--profile*`, so that rejection has no counterpart). `test_server_args`' new `TestTpFlags`
+    mirrors `test_cli_args`' (defaults, a full flag set, every range edge, `--tp-*` refused at
+    `--tp 1`, MTP / DFlash / vision accepted under `--tp 2`, `--mtp` + `--dflash` and `--dflash-k 8`
+    still refused).
+  - `main.cpp` fills `EngineOptions::tp` exactly as `src/cli/main.cpp` fills its `TpOptions` (-1 =
+    keep `TpOptions`' 32 / 1 bounding default). `Engine` holds `unique_ptr<TextModel>` from
+    `LoadTextModel` and uses only the cached accessors (`ModelId`, `ImageTokenId`,
+    `VisionMergeSize`, `HasVision`, `MtpEnabled`); `image_embeds_owned` is a
+    `vector<ImageRows>` (reserved up front) and each span carries `embeds_on_host = rows.on_host()`.
+    No server thread makes a HIP call under TP. `http_server.cpp` needed nothing (it reads only
+    `Engine`'s cached values).
+  - Logging: at load one `tp rank <r> (HIP device <d>): VRAM used ... buffers ...` line per rank;
+    the per-request `info` line gains ` tp=2` (plus ` tp_mode=emulate|noop`, and ` tp_recovery=yes`
+    when that request's `Reset()` found the group in `kNeedsRecovery`); `--log-level debug` adds
+    the `--stats` `tp:` line (N59) per request, caught locally because the sink is already done.
+    `--tp 1` lines are unchanged. The error line appends `(tp: group needs recovery; the next
+    request resets it)` or `(tp: fatal, restart the server)` from `TpModel::GetState()`.
+  - Recovery needed no engine logic beyond `977160e`'s `PrefixState` (8.4) and `TpModel`'s
+    host-only `SetDflashInjectionEnabled` (2.4): the catch invalidates, the next request's `Extend`
+    refuses, its `Reset()` recovers. The engine reaches `TpModel` (`GetState`, `Options`,
+    `StatsLine`) through a `dynamic_cast` held in `tp_model_`, like the CLI (N59).
+  - Deviation: `EngineOptions::model_loader` (empty = `LoadTextModel`), a test seam for N76.
+- **N75 (P5's optional row: the server's plain greedy loop on `DecodeStepGreedy`).** The first token
+  stays the host argmax of `Prefill`'s row; every later one is `DecodeStepGreedy(tok)` instead of
+  `Argmax(DecodeStep(tok))` -- the same forwards in the same order, same committed tokens. A/B
+  (2026-09-25, `r4dx-server` driven by a scratch script: 4 chat requests x 64 tokens, a two-turn
+  conversation with prefix reuse, a `/v1/completions`, a stop-string request, `max_tokens` 1;
+  response texts, token counts and finish reasons compared as one JSON; `--vision off --max-ctx
+  4096`, device 1):
+  - v6 w4a16, TP=1: the pre-change binary (built 03:26 from the model-side tree) vs the switched
+    one -- identical, with real text, 3 EOS stops, a stop-string match and a reused prefix. Decode
+    35.36-36.26 vs 35.43-36.43 tok/s over the 9 requests.
+  - v6 w4a16, `--tp 2 --tp-mode emulate`: a build of this tree with only the loop reverted vs the
+    switched one -- identical; decode 28.32-28.78 vs 28.72-29.01 tok/s. (Its text is TP=2's --
+    "Pixels bloom anew." where TP=1 has "alive." -- as expected, not the same as TP=1's.)
+  - 4-layer `l4-bf16` (`--layers 4`), TP=1 old / new and TP=2 emulate before / after: identical,
+    but that container emits one repeated token (spaces) at temperature 0, so this only shows the
+    loop's counts and finish reasons.
+  - At the model level `test_tp_emulation` already checks `DecodeStepGreedy == argmax(DecodeStep)`
+    row by row for every layout under TP (its item 2). The server is not in G2's matrix (CLI rows
+    only), so G2 is unaffected by construction. The real-mode TP=2 decode gain was not measured.
+- **N76 (8.4: `tests/server/test_engine_recovery.cpp`, new, CPU).** `Engine::RunRequest` through
+  `engine.cpp` itself, with `model_loader` returning `FakeTpModel`: `TpModel`'s state machine in
+  miniature (a failed forward leaves `kNeedsRecovery`; every device-work call then throws
+  "call Reset() first"; `Reset()` recovers; the injection toggle and the cached accessors stay
+  legal), whose argmax is a hash of everything fed since its last `Reset()` (so running on a failed
+  request's leftovers changes the text). Plain and with a (fake) drafter: a mid-decode fault and,
+  after it, a prefill fault each answer 500; the request after each answers 200 through one
+  recovery with the fresh-engine / pre-fault text; with a drafter the toggle runs twice while the
+  group awaits recovery. It links what `r4dx-server` links (HIP import libraries, no GPU call),
+  registered in the default ctest set, 77 without the tokenizer directory; 1.42 s. Mutation check:
+  with `prefix_.Clear()` in place of `Invalidate()` in the catch it fails 11 checks (500 after
+  the fault, 0 recoveries).
+- **N77 (P5 table, G11: `tools/server/smoke.ps1 -Tp / -TpMode / -TpFault`).**
+  - `-Tp 2` passes `--tp 2 --tp-mode <m>` to the server and to the one `r4dx-cli` comparison run
+    (the seeded sampled check). Real mode (default) removes `HIP_VISIBLE_DEVICES`, refuses to start
+    while any `r4dx-server` runs, and is TDR-wrapped: `tdr_watch.psm1`'s new `Start-TdrWatchJob` (a
+    background job: `tdr_check -Quiet` every 20 s, at the first TDR it writes a marker and stops the
+    server, no retry), a check before the CLI comparison run, and after the server stops a 30 s
+    wait, `tdr_check -Since <start>` and a scan of the server's stderr for HIP error 719 -- each a
+    `Check` row. New rows: one `tp rank` load line per rank thread, request lines carry `tp=2`.
+  - Deviation: `-TpMode emulate|noop` keep `HIP_VISIBLE_DEVICES=1` (one device, device 1; no TDR
+    machinery). The caller's `HIP_VISIBLE_DEVICES` and `R4DX_TP_FAULT` are restored at the end
+    (previously the script left `HIP_VISIBLE_DEVICES=1` set in the calling session).
+  - `-TpFault` (`-TpFaultSpec`, default `1:3000:1`, is an addition): `R4DX_TP_FAULT` is set for
+    the server process only. First the reference -- the standard smoke prompt ("Say hello in one
+    short sentence.", 8 tokens, greedy) sent to the same server before the fault fires, which is
+    how this script gets "the non-fault reference" without a second load (deviation: the table does
+    not say where the reference comes from). Then request A (a 512-token greedy story), 500 or 200
+    accepted, plus two checks the table does not list: the log shows the fault fired while A ran
+    (else the test would pass vacuously) and the server is still up. Then request B = the
+    reference request: 200, text / token count / finish_reason equal to the reference, and its log
+    line has `tp_recovery=yes`. The regular smoke then runs on the recovered server.
+  - The reference uses 72 all-reduces on the 4-layer container (measured with the `--log-level
+    debug` `tp:` line: +64 channel 0 / +8 channel 1 per request, 8 per forward), so A reaches #3000
+    ~366 tokens in; on v6 (128 per forward) about 15 (computed).
+  - The watch job was checked without a GPU: pointed at 2026-09-24 18:50 (N44's 18:52 TDR) it
+    stopped a dummy child 6 s in (5 s poll) and wrote a marker naming `WATCHDOG-20260924-1852.dmp`;
+    pointed at now it left the child running through two polls.
+- **N78 (P5 table, G12: `tools/validate_dflash.ps1 -Tp 2`, `tools/validate_spec_sampling.ps1 -Tp
+  2`).** `--tp 2` (real) on every `r4dx-cli` run -- ground truth, speculative, `--mtp 7` controls
+  and the `-DflashAlt` grouping controls alike. `HIP_VISIBLE_DEVICES` is removed right before the
+  first run (so an argument or path error leaves the caller's session untouched) and restored at
+  exit. Beyond the table: refuse to start while an `r4dx-server` runs; `tdr_check -Quiet` after
+  EVERY run, throwing at the first TDR (no retry); the matrix is wrapped in `try`/`catch` so every
+  exit -- pass, fail, abort -- goes through `Exit-Validation`: a 30 s wait, the final `tdr_check
+  -Since <start>`, and exit 1 on a TDR. `-Tp 1` behaves as before. Checked: both parse; with a
+  missing `-Model` both stop before any GPU work with `HIP_VISIBLE_DEVICES` untouched. Neither was
+  run on GPU (gate stage). `tdr_check` takes ~0.3 s here, so the per-run check costs ~10 s over a
+  ~36-run `validate_spec_sampling -Layouts w4a16` matrix (estimated). (Revised by the P5 review,
+  N80: the exit path is a `finally`, the per-run check waits 5 s and scans the run's stderr, and
+  `R4DX_TP_FAULT` is removed too.)
+- **N79 (P5 server side, measured 2026-09-25 04:15-04:40 on the uncommitted tree at `155b587` +
+  N66-N78; production server stopped throughout).** Logs: `build\logs\p5s\`.
+  - **Build:** `.\build.ps1` clean, no warnings in any file it recompiled (the server, `tests/server`).
+    `r4dx-server.exe` SHA-256 `8CAE05AE...F03A9B` for the second `-Tp 2` / `-TpFault` pair and every
+    run after it; the first pair and the first TP=1 smoke ran the build before a comment-only edit
+    to `engine.cpp`.
+  - **CPU tests** (`ctest -R` over the nine server tests, `test_engine_recovery` and
+    `test_cli_args`): 11 of 11 in 1.70 s. `run_tests.ps1` was not rerun (the model side's N73 run
+    covers everything outside `src/server` / `tests/server`).
+  - **smoke.ps1, 4-layer `l4-bf16` default:** TP=1 (device 1) 95 PASS 0 FAIL in 7.2 s (twice).
+    `-Tp 2` (real, start 04:30:35 and 04:36:24) 99 PASS 0 FAIL each, ~37 s with the 30 s TDR wait;
+    VRAM 3.39 GiB used per card, 3.21 GiB of it this process's buffers; request decode 240.82-499
+    tok/s over the run's 29 requests (1-96 generated tokens each). `-Tp 2 -TpFault` (real, start 04:31:28 and 04:37:11) 107 PASS 0
+    FAIL each: rank 1 stalled at all-reduce #3000; rank 0 "timeout at channel 0 block 2 (then 0)
+    seq 7329 phase flag-wait"; rank 1 "4 blocks bailed on an abort word, 24 skipped (sticky)";
+    request A 500; request B 200 with the reference's text (8 spaces on this container -- the
+    engine-level text check with real state dependence is N76's), `reset=23.42ms` / `23.29ms`
+    including the recovery ("[r4dx-tp] recovered: group reset after an earlier error").
+    `-Tp 2 -TpMode emulate` (device 1) 97 PASS in 7.1 s; with `-TpFault` 105 PASS in 9.2 s (the
+    emulated barrier timed out after 500 ms, `reset=19.89ms`).
+  - **Not run here (gate stage):** the real-container smokes (`-Layers -1` with `-Dflash`,
+    `-Vision`, `-Mtp 3`, `-TpFault`), both validate scripts, G9-G12. No MTP path ran on the server,
+    so nothing here bears on the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` failure
+    (N29).
+  - **No TDR:** 4 device-0 runs (2 x `-Tp 2`, 2 x `-Tp 2 -TpFault`), each followed by the
+    script's own 30 s wait + `tdr_check` and an independent `tdr_check -Since <start>`; a final
+    `tdr_check -Since 04:30` clean. Every other GPU run of this pass (the A/B, the emulate smokes,
+    the all-reduce count) used device 1 only.
+
+**P5 review**
+
+- **N80 (P5 review fixes, 2026-09-25: one must-fix, the should-fixes and the nits, all applied; the
+  proposed within-TP state check was replaced by a TP=1 comparison, and the optional range check on
+  merged DFlash2 ids left out, both for the reasons below).**
+  - **`--mtp` at most 7 under TP (must-fix; 8.1, 9.1, N57).** A verify window, like a decode step,
+    is never cut into `SubmitBounder` units -- N57's audit and `RunChunk`'s comment rest on "verify
+    windows are at most 8 rows". P5 let MTP run under TP with K up to 63: windows of up to 64 rows
+    over all 64 layers, a prefill chunk's shape queued unsplit on device 0. Now
+    `tp::kMaxUnsplitDraftK = 7` (`tp_submit.h`): `TpModel::Load` refuses `mtp_draft_k > 7`, a TP
+    rank's `Model::Load` refuses `max(mtp_draft_k, dflash_draft_k) > 7` (DFlash2's own cap is its
+    8-wide block), and both parsers give a usage error for `--tp 2 --mtp 8..63` (`kMaxMtpDraftKTp`;
+    `--tp 1` keeps 63). That also caps the replicated reduced-vocab head's device-resident chain
+    (its steps' all-reduces queue behind one synchronize) at 7 one-layer steps. G11's `--mtp 3` and
+    the validate controls' `--mtp 7` are unaffected. `test_cli_args` / `test_server_args`: `--tp 2
+    --mtp 7` parses; `--mtp 8` and `--tp-mode emulate --mtp 63` are refused; `--tp 1 --mtp 63` parses.
+  - **Speculative state against TP=1 (should-fix, both model-side reviews).** Every P5 check
+    compared the code with its own output. The suggested fix -- the decode row after the rounds vs
+    `Reset()` + `Prefill(everything committed)` + the same step, within TP, at 1e-2 -- fails on
+    correct code: measured 1.1e-2 .. 9.1e-2 (4-layer MTP 1.6e-2 .. 2.6e-2, v6 MTP 1.1e-2 .. 1.8e-2,
+    v6 DFlash2 1.4e-2 .. 9.1e-2, the P2b verify + commit 1.33e-2 vs the window's own row 3 and 1.55e-2
+    vs the rebuild), because a verify window and a prefill chunk are different kernels (the
+    batched-verify class), so no bound on it separates a TP error from path numerics. Instead,
+    `test_tp_emulation` now compares with the TP=1 `Model` through the SAME path:
+    - `TestVerifyWindow` (4-layer w4a16): `Prefill(40)`, four 8-row windows committing 3, 8, 1 and 5,
+      then a decode step, on TP and TP=1 -- all 32 window rows and the decode row within 1e-2.
+    - Every MTP / DFlash2 trajectory but the reruns is recorded -- per round the verify window (MTP:
+      anchor + the k drafts; DFlash2: anchor + accepted drafts, the rejected drafts' slots filled with
+      the round's last token at the walk's width) and the commit count, plus TP's decode row after the
+      last round -- and replayed on a TP=1 `Model` with the same options minus the drafter
+      (`VerifyWindow` + `CommitVerifiedWindow` is a round's whole effect on the target; the committed
+      state depends only on each window's first n candidates). Bounds: 1e-2 on the 4-layer
+      container, 5e-2 on v6, where the TP=1 distance grows with depth.
+    - Mutation check: rank 1 seeding its GDN heads one window index early (`n - 1` into
+      `mtp_num_accepted_dev_` for n > 1, TP only -- the reviews' example) left every earlier P5 check
+      green (H6 / H7, losslessness, lockstep, rng) and failed only the new ones: the verify script at
+      3.10e-2 (window rows) / 5.93e-2 (decode row), the v6 MTP replays at 1.65e-1 .. 3.08e-1, the v6
+      DFlash2 replays at 1.05e-1 .. 2.61e-1 (the 4-layer MTP replay rose from 3.5e-3 only to 8.5e-3:
+      that head never accepts at greedy, so most of its rounds commit one token). Reverted.
+    - The design's `sampled_equality.hpp` comparison with plain sampled decode stays out (N72).
+  - **Vision under TP in ctest (should-fix; 8.3, N68/N69).** `test_tp_emulation` item 9 on v6: two
+    synthetic images (256x256 and 320x256, 64 + 80 merged tokens) through ONE
+    `TpModel::EncodeImages`, then a 166-token `PrefillMultimodal` and 3 decode steps, against TP=1.
+    Encoder rows within 1e-2 (measured byte-identical), logits within 5e-2 and within 0.5x of how
+    far swapping image 1 for another moves TP=1's; TP=1's host-row splice equals its device-row splice
+    byte for byte; a device span is refused by `TpModel::PrefillMultimodal` (`std::invalid_argument`,
+    group still ready). The CMake comment now describes this case.
+  - **The reduced head's "no merge" check (should-fix / nit).** Capture is on in that block, and
+    `MtpHead` keeps what each `Draft()` returned while capture is on (`DebugDrafts`, the new third
+    out-parameter of `Model::MtpDebugLastDraft`): per round the H6 capture must be empty, all k
+    drafts members of `mtp.draft_head.vocab_ids`, and the accepted tokens the drafts. On the merged
+    path `drafts == draft_tokens` is checked too.
+  - **Scripts (three should-fixes, the script nits).**
+    - `smoke.ps1`: every environment change, the server start and `Start-TdrWatchJob` are inside the
+      `try`; the `finally` tolerates a null server / job. The watch job is ended before the `r4dx-cli`
+      comparison run (its target is the stopped server; a marker from it stops the script there),
+      whose stderr now joins the HIP error 719 scan. In real mode a `-TpFaultSpec` stall on rank 0 is
+      refused (N61); `TpModel::Load` also warns when real mode arms a stall whose peer is HIP device 0.
+    - `smoke.ps1`, on a `-Tp 2` sampled speculative-vs-plain FAIL: the same seeded request through
+      `r4dx-cli --tp 1` on device 1, speculative and plain, and a line saying whether the mismatch is
+      there at TP=1 too (and with the same texts) -- the pre-existing class (N29 / batched verify) --
+      or TP-specific. The check stays FAILED; section 11's gate block lists the TP=1 controls, and
+      its pass rule is unchanged.
+    - `validate_dflash.ps1` / `validate_spec_sampling.ps1`: the final 30 s wait + `tdr_check` and the
+      environment restore run from a `finally` (Ctrl-C skips `catch`, not `finally`);
+      `R4DX_TP_FAULT` is saved, removed and restored under `-Tp 2`; each run's stderr goes to a file
+      scanned for HIP error 719, and the per-run `tdr_check` waits 5 s. Left open: a 141 event that WER
+      logs more than 5 s after a run is caught by the next per-run check or the final one, after the
+      next run has started (the 5 s cost ~3 min over a 36-run matrix, estimated). Their help text
+      says an MTP FAILED row at `-Tp 2` needs the `-Tp 1` matrix on the same tree (N29).
+  - **Nits.** `MergeTop16AcrossRanks` leaves the (-inf, INT32_MAX) sentinel ids alone, so the merge
+    equals the full-row kernel's output in the NaN-flooded case too (no range check added: TP and
+    TP=1 then read the same row). The solo `EncodeImages` (no heartbeat) waits with a 10-minute stall
+    limit instead of 60 s (`RunGuarded` takes a limit). `TpModel::Recover` first drains every rank's
+    vision stream (`Model::VisionStream()` -> `VisionTower::StreamHandle()`) with `SyncWithWatchdog`
+    (a stream busy after 30 s fails the recovery: kFatal). `/health` answers 503
+    `{"status":"tp_fatal"}` once a request found the group kFatal (`Engine::TpFatal()`, an atomic
+    the worker thread sets; not exercised by a test). `test_engine_recovery` gains a TP=1 mode (a
+    fault leaves its tokens, later calls succeed), so a skipped `Reset()` fails its text checks, and
+    runs with `HIP_VISIBLE_DEVICES=1` (it loads the HIP runtime, like `test_pick_tuning`).
+- **N81 (the P5 review fixes, measured 2026-09-25 05:20-06:07 on the uncommitted tree at `155b587`
+  + N66-N80; production server stopped throughout; not the G9-G12 gates).** Logs:
+  `build\logs\p5fix\`. Every device-0 run (the `-TwoGpu` suite, 2 CLI runs, 2 `smoke.ps1 -Tp 2`) was
+  followed by a 30 s wait and `tdr_check -Since <its start>`, all clean; a final `tdr_check -Since
+  05:20` clean. Everything else ran on device 1.
+  - **Build:** `.\build.ps1` clean; only the pre-existing `fopen` deprecations.
+  - **CPU tests** (`ctest -R`, the server tests, `test_cli_args`, the TP CPU tests,
+    `test_pick_tuning`, `test_mtp_round`): 16 of 16 in 21.9 s; `test_engine_recovery` 2.9 s (four
+    scenarios). Its mutation check (`prefix_.Clear()` for `Invalidate()`): 20 checks fail, the TP=1
+    mode's through the text checks (the request answers 200 with other text); reverted.
+  - **`test_tp_emulation`** (standalone, start 05:44:23): PASS in 123 s. P2b numbers as in N54 (max
+    rel L2 bf16 6.5e-3 / 3.5e-3, w4a16 6.9e-3 / 5.4e-3, w4a8 7.7e-2 / 7.9e-2 at ratios 0.853 / 0.822,
+    mxfp4 1.5e-2 / 1.6e-2) and the round counts as in N73. New: the verify / commit script vs TP=1
+    8.57e-3 (32 window rows) / 3.30e-3 (the decode row); TP=1 replays 3.48e-3 (l4-allmtp, 6
+    trajectories, 36 rounds, 38 committed tokens), 1.73e-2 (v6 MTP, 6 / 36 / 90), 2.20e-2 (v6
+    DFlash2, 7 / 42 / 162); vision -- 2 images, 64 + 80 tokens, encoded on rank 0 in 24.0 ms
+    (emulated), encoder rows byte-identical to TP=1's, logits 9.92e-3 from TP=1's over the 166-token
+    prompt and 3 decode steps, while swapping image 1 moves TP=1's by 5.16e-2 (ratio 0.19).
+  - **`run_tests.ps1` (default, device 1, start 05:47:54):** 73 of 74 (15 skips) in 646.3 s; the one
+    failure is the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled
+    trajectories, N29). `test_tp_emulation` 137.1 s, `test_engine_recovery` 2.9 s.
+  - **`run_tests.ps1 -TwoGpu`** (start 05:59:42): 2 of 2 (`test_tp_allreduce_2gpu` 27.8 s,
+    `test_tp_real_vs_emulation` 37.5 s), TDR check clean.
+  - **CLI, v6 w4a16 `--tp 2` (real), G9's line, one run each:** `--mtp 3` 108.02 tok/s (35 rounds,
+    50 of 105 accepted, 2.40 tok/round), stdout SHA-256 `0C45C2D5...8DD2`; `--dflash <g64 drafter>
+    --dflash-k 7` 120.77 tok/s (30 rounds, 55 of 210, 2.80), `3163DB2F...0491` -- both byte-identical
+    to N73's. `--tp 2 --mtp 8` is refused at parse time (exit 2).
+  - **`smoke.ps1`, 4-layer `l4-bf16` default:** the first `-Tp 2` (real, start 06:03:09) got
+    through 98 checks (0 FAIL) and its final `tdr_check` (clean), then threw in the new HIP-719 scan:
+    `Select-String` on the absent r4dx-cli stderr log is a terminating error despite `-ErrorAction
+    SilentlyContinue`, and it left the caller's `HIP_VISIBLE_DEVICES` removed. Fixed (only existing
+    logs are scanned; the environment restore sits in a nested `finally`), then `-Tp 2` (real, start
+    06:04:48) 99 PASS 0 FAIL in 35 s with the caller's `HIP_VISIBLE_DEVICES=1` back; `-Tp 2 -TpMode
+    emulate -TpFault` 105 PASS in 9 s (`reset=19.17ms`, `tp_recovery=yes`); TP=1 95 PASS in 5 s;
+    `-Tp 2 -TpFault -TpFaultSpec 0:3000:1` refused before anything started.
+  - **`validate_dflash.ps1 -Tp 2 -MaxTokens -5`** (05:43:31; the first `r4dx-cli` run fails at
+    argument parsing, before any HIP call): ABORTED, then the `finally`'s 30 s wait and clean
+    `tdr_check`, exit 1, and the caller's `HIP_VISIBLE_DEVICES=1` and `R4DX_TP_FAULT=9:9:9` back.
+  - **Not run (gate stage):** G9-G12, the real-container smokes, both validate scripts on GPU, G2.
+
+**P5 gates**
+
+- **N82 (P5 gates, measured 2026-09-25 06:11-07:10 on the uncommitted tree at `155b587` + N66-N81,
+  both GPUs, production server stopped throughout).** Rank 0 = HIP device 1 (bus 07, headless),
+  rank 1 = device 0 (bus 03, desktop live), `HIP_VISIBLE_DEVICES` unset for every real run. One
+  build at 06:11 (`.\build.ps1`: "ninja: no work to do", N81's build of 05:44), not rebuilt between
+  gates. SHA-256 (`build\logs\p5\gate_binaries.sha256`): `r4dx-cli.exe` `943B0AF3...530DC3`,
+  `r4dx-server.exe` `E2673BC0...3276E9`, `test_tp_emulation.exe` `03D2A953...02AB81`,
+  `test_tp_real_vs_emulation.exe` `035D7037...DB35E7`, `test_tp_allreduce_2gpu.exe`
+  `8F1434B9...DB0A48`, `tool_teacher_forced_logprobs.exe` `34BC0582...D82DBD`. Every log below is
+  under `build\logs\p5\gate_*` (the driver scripts in `gate_scripts\`). Every device-0 run was
+  followed by a 30 s wait and `tdr_check.ps1 -Since <its start>`. The `-TwoGpu` suite and both
+  validate scripts also ran under `tdr_watch.psm1`'s `Start-TdrWatchJob` (every 20 s; at a marker
+  the driver kills the worktree's test / `r4dx-cli` processes), and each smoke under its own watch.
+  Deviation: not `Invoke-TdrWatched`, whose `Stop-Process` would stop only the script's powershell
+  and leave its running `r4dx-cli` child on device 0.
+  - **`run_tests.ps1` (default, device 1, start 06:11:57):** 73 of 74 (15 skips) in 637.7 s. The one
+    failure is the known `test_mtp CheckSampledRoundsMatchPlain [w4a16]` (0/18 identical sampled
+    trajectories: 9 MTP + 9 oracle, N29), which is not a TP result. `test_tp_emulation` 135.6 s (its
+    MTP, DFlash2 and vision cases and N80's TP=1 replays pass), `test_engine_recovery` 2.86 s
+    (`gate_run_tests_default.log`, `gate_default_ctest_LastTest.log`).
+  - **`run_tests.ps1 -TwoGpu`** (start 06:23:24; in-run watch, the suite's own check and the final
+    check clean): 2 of 2, `test_tp_allreduce_2gpu` 27.8 s, `test_tp_real_vs_emulation` 37.4 s. Every
+    comparison byte-identical: the seven P4 parts (8/8 each), MTP K=3 on `l4-allmtp` (16 rounds, 16
+    tokens) and DFlash2 k=7 on v6 (16 rounds, 96 tokens), emulate vs real at 32/1
+    (`gate_run_tests_twogpu.log`, `gate_twogpu_ctest_LastTest.log`).
+  - **G2 (`tp1_identity.ps1`, device 1, `-Image` = the golden vision image): PASS.** All 12 rows
+    byte-identical to `build\baseline`, 06:25:55-06:33:10 (`gate_g2.log`, runs in `gate_g2\`). Decode
+    baseline / candidate: row 1 36.23 / 36.20, row 2 (DFlash2) 74.75 / 74.63, row 3 (MTP) 68.76 /
+    68.62, row 5 66.14 / 65.93, row 8 57.92 / 57.88 tok/s.
+  - **G9: PASS** (`gate_g9.log`, `gate_g9.json`, `gate_g9_*.{out,err}`). Section 11's line (standard
+    protocol, `--dflash <g64 drafter> --dflash-k 7`), then the same line at TP=1 on device 1:
+
+    | Run | Decode | Rounds / accepted | tok/round | Stdout SHA-256 | `[stats] tp:` |
+    |---|--:|---|--:|---|---|
+    | TP=2 1 (06:33:43) | **118.75 tok/s** (84 tok, EOS) | 30, 55 of 210 | 2.80 | `3163DB2F...0491` | max_exchange_wait 434 us, max_cap_wait 25.3 ms |
+    | TP=2 2 (06:34:22) | **119.96 tok/s** | 30, 55 of 210 | 2.80 | `3163DB2F...0491` | 1626 us, 21.8 ms |
+    | TP=1 (06:35:00) | 74.73 tok/s | 31, 54 of 217 | 2.71 | `1F9CCC20...2C02` (= G2 row 2) | -- |
+
+    Both TP=2 runs: `ar_calls=4344/288`, `host_exchanges=99`, `aborts=0`, `units=2 cap_waits=2`;
+    prefill (29 tokens) 1171.7 / 1186.8 tok/s against 628.5; VRAM 11.55 GiB used per card, 11.18 GiB
+    of it this process's buffers, against 19.04 GiB at TP=1. **1.59x / 1.61x.** The TP=2 text is
+    N73's and N81's. G10's first prompt is this line again: a third run at 121.03 tok/s.
+  - **G10: PASS** (`gate_g10.log`, `gate_g10.json`). The G9 flags on each line of
+    `tests\model\mtp_prompts.txt`, each prompt at TP=2 and then at TP=1 (device 1):
+
+    | Prompt | TP=2 tok/round (rounds, tokens) | TP=1 tok/round | Decode TP=2 / TP=1 |
+    |---|--:|--:|---|
+    | 1 haiku + GPU | 2.80 (30, 84, EOS) | 2.71 (31, 84) | 121.03 / 74.69 tok/s |
+    | 2 Fibonacci | 5.89 (19, 112, EOS) | 5.60 (20, 112) | 252.48 / 153.89 |
+    | 3 Romeo and Juliet | 2.83 (30, 85, EOS) | 2.97 (30, 89) | 121.45 / 81.65 |
+    | 4 prime numbers | 5.02 (51, 256, max) | 4.83 (53, 256) | 213.98 / 132.27 |
+
+    The mean of the printed values is 4.135 at TP=2 and 4.028 at TP=1: **+2.7%** (limit +-5%).
+    Prompt 2's text is byte-identical at TP=1 and TP=2 (`ACF6D20E...`); the other three differ.
+  - **`--mtp 3` (not gated; `gate_mtp3.log`, `gate_mtp3.json`):** the standard protocol, TP=2
+    **107.90 / 107.92 tok/s** (35 rounds, 50 of 105 accepted, 2.40 tok/round, stdout
+    `0C45C2D5...8DD2` both times, = N73 / N81), 10.24 GiB per card (9.90 GiB buffers). TP=1 (device
+    1): 68.74 tok/s (34 rounds, 51 of 102, 2.47; its text is G2 rows 1 and 3's) at 17.43 GiB, so
+    **1.57x**. The design projected ~100-110.
+  - **G11: PASS** (`gate_g11.log`; per line `gate_g11_<n>_*.log`, the server's `*.server.err.log`,
+    the comparison run's `*.cli.err.log`). Every line: its own in-run watch, 30 s wait,
+    `tdr_check` and HIP-719 scan, plus an independent `tdr_check`, all clean.
+
+    | Line | Start | PASS / FAIL / SKIP | Wall |
+    |---|---|---|--:|
+    | `-Tp 2` (4-layer `l4-bf16`) | 06:40:20 | 99 / 0 / 4 | 38.9 s |
+    | `-Tp 2 -Model <v6> -Layers -1 -Dflash <d> -ToolRoundTrip` | 06:40:59 | 178 / 0 / 1 | 57.4 s |
+    | `... -Vision -Dflash <d>` | 06:41:57 | 195 / 0 / 0 | 60.8 s |
+    | `... -Mtp 3` | 06:42:58 | 164 / 0 / 1 | 59.4 s |
+    | `... -Dflash <d> -TpFault` | 06:43:57 | 172 / 0 / 1 | 57.9 s |
+
+    - VRAM per card at load: 11.55 GiB with DFlash2 (11.21 GiB buffers), rank 0 12.47 GiB with the
+      vision tower too, 10.24 GiB with MTP.
+    - The sampled speculative-vs-plain check passed on all four speculative real-container lines
+      (`-Dflash -ToolRoundTrip`, `-Vision -Dflash`, `-Mtp 3`, `-Dflash -TpFault`: the server's seeded
+      text equals a same-seeded plain `r4dx-cli --tp 2` run), so no TP=1 control was printed.
+    - Vision: the OCR image read back `R4DXVSN9`, two images gave `image_n == 2`, turn 2 did not
+      re-encode.
+    - `-TpFault`: rank 1 stalled at all-reduce #3000, and rank 0 reported "timeout at channel 0 block 2
+      seq 7340 phase flag-wait". Rank 1 reported "4 blocks bailed on an abort word, 300 skipped
+      (sticky)". Request A answered 500. Request B answered 200 with the reference text ("Hello!", 2
+      tokens, stop) and `tp_recovery=yes`, `reset=23.58ms` including the recovery, DFlash2 on.
+  - **G12: FAIL on its pass rule, because `validate_spec_sampling -Tp 2` exits 1.** The rest of G12
+    passes: `validate_dflash -Tp 2` and the ctest cases (`test_tp_emulation`'s H6 / H7 merges,
+    lockstep and TP=1 replays; `test_tp_real_vs_emulation`'s MTP and DFlash2 parts).
+    - `validate_dflash.ps1 -Tp 2 -Layouts w4a16 -AllowBatchedVerifyDivergence` (start 06:45:11, 123
+      s, 7 `r4dx-cli` runs, watch and checks clean; `gate_g12_dflash_tp2.log`): **exit 0**. 2 of 3
+      byte-identical (medium, long), 1 WARN: short prompt, `--dflash` "Pixels bloom alive." vs
+      `--mtp 0` "Pixels bloom anew." (char 65). It was accepted because the `--mtp 7` control
+      diverges too AND matches `--dflash` exactly.
+    - `validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16 -AllowBatchedVerifyDivergence` (start
+      06:47:32, 677 s, 51 `r4dx-cli` runs, watch and checks clean; `gate_g12_spec_tp2.log`): **exit
+      1**, 13 OK, 8 WARN, 3 FAILED of 24. The rows are rebuilt in `gate_g12_spec_tp2.rows.txt`
+      because the summary table is cut at console width.
+      - FAILED, all `--mtp 3`: standard T=0.7/top_k 20/top_p 0.8 seed 2 (char 49; both controls
+        match the baseline instead); standard T=1.0 seed 2 (char 171) and code T=1.0 seed 2 (char 87;
+        both controls diverge, differently).
+      - WARN, each accepted by the script's exact-hash rule. Standard T=0.7/20/0.8 seed 1:
+        `--mtp 3` (the `--dflash` control matched) and `--dflash` (the `--mtp 7` control matched).
+        Standard T=1.0 seed 1: `--dflash` (`--mtp 7`). Standard T=1.0 seed 2: `--dflash` (the mxfp4
+        drafter's grouping control matched; `--mtp 7` did not). Standard T=0.6/20/0.95 seed 1:
+        `--mtp 3` (`--dflash`) and `--dflash` (`--mtp 7`). Code T=0.7/20/0.8 seed 2 and code T=1.0
+        seed 2: `--dflash` (`--mtp 7`).
+      - Every `--dflash` mismatch was resolved by a control's exact hash.
+    - **TP=1 control on the same tree (N80), device 1** (`validate_spec_sampling -Tp 1`, start
+      06:59:22, 539 s; `gate_g12_spec_tp1.log`, `gate_g12_spec_tp1.rows.txt`): **exit 1**, 10 OK, 9
+      WARN, 5 FAILED. All five are `--mtp 3`: standard T=0.7 seed 2, standard T=1.0 seeds 1 and 2,
+      code T=1.0 seeds 1 and 2. All three TP=2 FAILED combinations fail at TP=1 too, and TP=2 fails
+      no combination that TP=1 passes. That is the known class (N29; docs/status.md's 13 of 72
+      unresolved `--mtp 3` rows at TP=1 in Milestone 6), not a TP result on its own. The pass rule is
+      unchanged, so G12 stays failed. Its 9 WARN rows, each by the exact-hash rule: `--mtp 3` at
+      standard T=0.7/20/0.8 and T=0.6/20/0.95 seed 1 (the `--dflash` control matched), and
+      `--dflash` on all six standard-prompt combinations and on code T=1.0 seed 2 (the `--mtp 7`
+      control matched each).
+    - TP=1 smoke control `smoke.ps1 -Model <v6> -Layers -1 -Mtp 3` (device 1, start 07:09:04, 43 s;
+      `gate_g11_tp1ctl_mtp3.*`): the sampled speculative-vs-plain check passes. 159 PASS, **1 FAIL**,
+      1 SKIP. The FAIL is "thinking+tools: streamed content concatenation == non-streaming
+      message.content (streamed 283 bytes, non-streaming 286 bytes)". Both requests generated 208
+      tokens in 67 rounds with 142 accepted (the server log), so the tokens agree and the difference
+      is in how the content was put together. The same check passed at `-Tp 2` (104 = 104 bytes, a
+      114-token text). Not a gate row. **It predates TP:** the frozen `build\baseline` server
+      (`aa54c20`, before any TP code) run through the same `smoke.ps1` and command on device 1 gives
+      the same 159 / 1 / 1 and the same FAIL, 283 vs 286 bytes (`smoke_baseline_aa54c20_mtp3.log`).
+      It is a streaming-assembly bug on `main`, left for a separate fix.
+    - **Server TP=1 greedy A/B on the gated binary** (N75's loop change, which G2 does not cover):
+      `build\baseline` `r4dx-server` vs the gated `E2673BC0...`, v6 w4a16, `--max-ctx 4096`, three
+      `temperature 0` chat requests (84, 160 and 9 completion tokens), device 1: all three
+      `message.content` SHA-256-equal (`server_ab_tp1\`).
+  - **No TDR.** Device-0 runs: the `-TwoGpu` suite, 8 CLI runs (G9 2, G10 4, `--mtp 3` 2), the five
+    G11 smokes and both validate scripts at `-Tp 2`, each checked as above. A final `tdr_check -Since
+    06:11` is clean, with no re-logged dumps in the window (`gate_tdr_check_final.log`).
+  - **P5 verdict:** G2, G9, G10 and G11 pass, and ctest is green apart from N29's known failure.
+    G12 fails on `validate_spec_sampling -Tp 2`'s exit 1: 3 unresolved `--mtp 3` rows, all three
+    unresolved at TP=1 as well. Every WARN row the validate scripts accepted (both `-Tp 2` gate
+    runs and the `-Tp 1` control) is listed above.
 
 ## Appendix C -- Open questions for the user
 

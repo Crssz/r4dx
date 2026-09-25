@@ -297,10 +297,37 @@ Requirements and caveats:
   (`docs/tp.md` N44). With the submission bounding on, a 60-minute soak and a 10M all-reduce stress
   ran with the desktop live and no TDR (N65). Long runs go through `tools\tp\soak.ps1`, which stops
   at the first TDR.
-- Not yet under TP (P5): `--mtp`, `--dflash`, vision / `--image`, and `r4dx-server`.
+- `--mtp` is at most 7 under `--tp 2` (63 at TP=1).
 
-Measured (2026-09-25, standard protocol): **59.65 / 59.33 tok/s** decode, against 36.06 tok/s at TP=1
-in the same session (1.65x). docs/perf.md has the rest.
+`--dflash <drafter> --dflash-k 7`, `--mtp 3`, `--vision on --image <png>` and `r4dx-server` all
+take `--tp 2` with the same flags as at TP=1. Every rank holds a full copy of the DFlash2 drafter, and
+the vision tower runs on rank 0. The server needs `HIP_VISIBLE_DEVICES` unset and no other
+`r4dx-server` running; after a failed request (e.g. an all-reduce timeout) the next request resets
+the group and runs normally:
+
+```powershell
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 `
+    --host 127.0.0.1 --port 8080 --tp 2 `
+    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
+```
+
+Decode speed, standard protocol, one fresh process per run, TP=1 on device 1 in the same session
+(2026-09-25; the plain row is from the P4 gates, the other two from P5's):
+
+| Path | TP=1 | TP=2 |
+|---|--:|--:|
+| plain greedy | 36.06 tok/s | **59.65 / 59.33** (1.65x) |
+| `--dflash <g64 drafter> --dflash-k 7` | 74.73 | **118.75 / 119.96** (1.59x / 1.61x) |
+| `--mtp 3` | 68.74 | **107.90 / 107.92** (1.57x) |
+
+DFlash2's tokens per round over the four `tests/model/mtp_prompts.txt` prompts average 4.135 at TP=2
+against 4.028 at TP=1. The server's smoke passes at `--tp 2` with DFlash2, MTP, images and an injected
+all-reduce fault. As at TP=1, sampled speculative text can differ from plain sampled text through the
+batched-verify mechanism. `tools/validate_spec_sampling.ps1 -Layouts w4a16` leaves 3 of 24 rows
+unresolved at TP=2 and 5 at TP=1, all of them `--mtp 3` and the TP=2 three among the TP=1 five, so
+it exits 1 at both and gate G12 is not met. docs/perf.md has the rest; `docs/tp.md` Appendix B N82
+has the P5 gates.
 
 ## Run the OpenAI-compatible server
 

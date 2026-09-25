@@ -6,8 +6,11 @@
 // tokens in a random mode -- greedy (DecodeStepGreedy), seeded sampled (DecodeStepSampled; T 0.7,
 // top_k 20, top_p 0.8) or full-row (DecodeStep + host argmax: the vocab gather). Every
 // --canary-every-th iteration (and the first) re-runs a fixed canary: the pool's first 512 tokens,
-// then 128 greedy tokens, which must equal the first canary run exactly. DFlash rounds join the mode
-// mix in docs/tp.md P5 (the drafter is refused under TP until then).
+// then 128 greedy tokens, which must equal the first canary run exactly. With --dflash <drafter>
+// (docs/tp.md 10.5, P5) two more modes join the mix: DFlash2 greedy rounds and seeded sampled rounds
+// (DecodeStepDflash{Greedy,Sampled}, k = --dflash-k, p_min / n_min off), each until at least the
+// iteration's decode length has been emitted; the canary stays plain greedy. Without --dflash the
+// random sequence of iterations is the pre-P5 one.
 //
 // One JSON object per line is appended to --json (a "start" line, a "loaded" line, one "iter" line
 // per iteration, an "error" line on failure, a "summary" line at the end and a "teardown" line once
@@ -34,6 +37,7 @@
 //                [--min-prompt 16] [--max-prompt 2048] [--min-decode 32] [--max-decode 512]
 //                [--tp-mode real|emulate] [--tp-devices a,b] [--tp-ar-timeout-ms 500]
 //                [--tp-submit-layers N] [--tp-max-inflight K] [--need-gib 14] [--layers N]
+//                [--dflash <drafter.r4dx> [--dflash-k 7]]
 #include <hip/hip_runtime.h>
 #include <io.h>
 
@@ -90,6 +94,8 @@ struct Args {
   int tp_ar_timeout_ms = 500;
   int tp_submit_layers = -1, tp_max_inflight = -1;  // -1: TpOptions' default
   double need_gib = 14.0;
+  std::string dflash;   // empty: no drafter, the pre-P5 mode mix
+  int64_t dflash_k = 7;
 };
 
 [[noreturn]] void Usage(const std::string& why) {
@@ -98,7 +104,7 @@ struct Args {
                "[--iterations N] [--max-ctx 8192] [--seed 1] [--json <log.jsonl>] [--tokens <tokens.json>] "
                "[--canary-every 10] [--min-prompt 16] [--max-prompt 2048] [--min-decode 32] [--max-decode 512] "
                "[--tp-mode real|emulate] [--tp-devices a,b] [--tp-ar-timeout-ms N] [--tp-submit-layers N] "
-               "[--tp-max-inflight K] [--need-gib X] [--layers N]\n",
+               "[--tp-max-inflight K] [--need-gib X] [--layers N] [--dflash <drafter.r4dx> [--dflash-k 7]]\n",
                why.c_str());
   std::exit(1);
 }
@@ -135,6 +141,8 @@ Args Parse(int argc, char** argv) {
       else if (s == "--tp-submit-layers") a.tp_submit_layers = std::stoi(next());
       else if (s == "--tp-max-inflight") a.tp_max_inflight = std::stoi(next());
       else if (s == "--need-gib") a.need_gib = std::stod(next());
+      else if (s == "--dflash") a.dflash = next();
+      else if (s == "--dflash-k") a.dflash_k = std::stoll(next());
       else Usage("unknown argument " + s);
     } catch (const std::exception&) {
       Usage("bad value for " + s);
@@ -147,9 +155,14 @@ Args Parse(int argc, char** argv) {
   if (a.min_prompt < 1 || a.max_prompt < a.min_prompt || a.min_decode < 1 || a.max_decode < a.min_decode) {
     Usage("need 1 <= --min-prompt <= --max-prompt and 1 <= --min-decode <= --max-decode");
   }
-  if (a.max_prompt + a.max_decode > a.max_ctx || kCanaryPrompt + kCanaryDecode > a.max_ctx) {
-    Usage("--max-prompt + --max-decode (and the 640-position canary) must fit in --max-ctx");
+  // A DFlash2 generation may run past its decode length by up to one round (k tokens) and verifies
+  // a k+1-row window beyond that.
+  const int64_t spec_slack = a.dflash.empty() ? 0 : 2 * (a.dflash_k + 1);
+  if (a.max_prompt + a.max_decode + spec_slack > a.max_ctx || kCanaryPrompt + kCanaryDecode > a.max_ctx) {
+    Usage("--max-prompt + --max-decode (+ 2 * (--dflash-k + 1) with --dflash, and the 640-position canary) must "
+          "fit in --max-ctx");
   }
+  if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) Usage("--dflash-k must be in [1, 7]");
   if (a.tp_submit_layers < -1 || a.tp_submit_layers > 64 || a.tp_max_inflight < -1 || a.tp_max_inflight > 64) {
     Usage("--tp-submit-layers and --tp-max-inflight must be in [0, 64]");
   }
@@ -243,17 +256,28 @@ std::string Preflight(const std::vector<int>& devices_in, bool real, double need
 
 // ---- one generation -----------------------------------------------------------------------------
 
-enum class Mode { kGreedy, kSampled, kFullRow };
+// The first three modes are the pre-P5 mix (drawn from [0, 2]); the DFlash2 ones join it only with
+// --dflash (drawn from [0, 4]).
+enum class Mode { kGreedy, kSampled, kFullRow, kDflashGreedy, kDflashSampled };
 const char* ModeName(Mode m) {
-  return m == Mode::kGreedy ? "greedy" : m == Mode::kSampled ? "sampled" : "full_row";
+  switch (m) {
+    case Mode::kGreedy: return "greedy";
+    case Mode::kSampled: return "sampled";
+    case Mode::kFullRow: return "full_row";
+    case Mode::kDflashGreedy: return "dflash_greedy";
+    case Mode::kDflashSampled: return "dflash_sampled";
+  }
+  return "?";
 }
 
 struct Gen {
   std::vector<int32_t> tokens;
   double prefill_s = 0, decode_s = 0;
+  int64_t rounds = 0;  // DFlash2 modes: speculative rounds run
 };
 
-Gen Generate(TpModel& m, const std::vector<int32_t>& prompt, int decode, Mode mode, uint64_t sample_seed) {
+Gen Generate(TpModel& m, const std::vector<int32_t>& prompt, int decode, Mode mode, uint64_t sample_seed,
+             int64_t dflash_k = 0) {
   Gen g;
   const int64_t V = m.Config().vocab_size;
   kernels::SampleParams sp;
@@ -265,8 +289,25 @@ Gen Generate(TpModel& m, const std::vector<int32_t>& prompt, int decode, Mode mo
   m.Reset();
   const auto t0 = Clock::now();
   const std::vector<float> logits = m.Prefill(prompt);
-  int32_t next = mode == Mode::kSampled ? kernels::Sample(logits.data(), V, sp, rng) : kernels::Argmax(logits.data(), V);
+  const bool sampled = mode == Mode::kSampled || mode == Mode::kDflashSampled;
+  int32_t next = sampled ? kernels::Sample(logits.data(), V, sp, rng) : kernels::Argmax(logits.data(), V);
   const auto t1 = Clock::now();
+  if (mode == Mode::kDflashGreedy || mode == Mode::kDflashSampled) {
+    // Whole rounds until at least `decode` tokens past the first one were emitted; every round's
+    // last token is the next round's (not yet committed) anchor, like `next` above.
+    g.tokens.push_back(next);
+    while (static_cast<int>(g.tokens.size()) <= decode) {
+      const std::vector<int32_t> r = mode == Mode::kDflashGreedy
+                                         ? m.DecodeStepDflashGreedy(next, dflash_k, 0.0f, 0)
+                                         : m.DecodeStepDflashSampled(next, dflash_k, 0.0f, 0, sp, rng);
+      g.tokens.insert(g.tokens.end(), r.begin(), r.end());
+      next = r.back();
+      ++g.rounds;
+    }
+    g.prefill_s = std::chrono::duration<double>(t1 - t0).count();
+    g.decode_s = std::chrono::duration<double>(Clock::now() - t1).count();
+    return g;
+  }
   for (int i = 0; i < decode; ++i) {
     g.tokens.push_back(next);
     if (mode == Mode::kGreedy) {
@@ -389,6 +430,11 @@ int main(int argc, char** argv) {
   opts.max_ctx = a.max_ctx;
   opts.layer_limit = a.layers;
   opts.vision = ModelOptions::VisionMode::kOff;
+  const bool dflash = !a.dflash.empty();
+  if (dflash) {
+    opts.dflash_container = a.dflash;
+    opts.dflash_draft_k = a.dflash_k;
+  }
   TpOptions tpo;
   tpo.world = 2;
   tpo.mode = real ? TpOptions::Mode::kReal : TpOptions::Mode::kEmulate;
@@ -402,7 +448,8 @@ int main(int argc, char** argv) {
             ",\"max_ctx\":" + std::to_string(a.max_ctx) + ",\"seed\":" + std::to_string(a.seed) +
             ",\"submit_layers\":" + std::to_string(tpo.submit_layers) + ",\"max_inflight_units\":" +
             std::to_string(tpo.max_inflight_units) + ",\"ar_timeout_ms\":" + std::to_string(tpo.ar_timeout_ms) +
-            ",\"pool_tokens\":" + std::to_string(pool.size()) + "}");
+            ",\"pool_tokens\":" + std::to_string(pool.size()) + ",\"dflash\":" + Str(a.dflash) + ",\"dflash_k\":" +
+            std::to_string(dflash ? a.dflash_k : 0) + "}");
 
   std::unique_ptr<TpModel> m;
   const auto load0 = Clock::now();
@@ -434,7 +481,7 @@ int main(int argc, char** argv) {
       if (a.iterations > 0 ? iter >= a.iterations : since() >= a.minutes * 60.0) break;
       const bool canary = iter % a.canary_every == 0;
       std::uniform_int_distribution<int> plen(a.min_prompt, a.max_prompt), dlen(a.min_decode, a.max_decode),
-          mode_d(0, 2);
+          mode_d(0, dflash ? 4 : 2);
       std::uniform_int_distribution<size_t> start_d(0, pool.size() - 1);
       const int P = plen(rng), D = dlen(rng);
       const Mode mode = static_cast<Mode>(mode_d(rng));
@@ -443,8 +490,9 @@ int main(int argc, char** argv) {
       std::vector<int32_t> prompt(static_cast<size_t>(P));
       for (int i = 0; i < P; ++i) prompt[static_cast<size_t>(i)] = pool[(start + static_cast<size_t>(i)) % pool.size()];
 
-      const Gen g = Generate(*m, prompt, D, mode, sample_seed);
-      tokens_total += P + D;
+      const Gen g = Generate(*m, prompt, D, mode, sample_seed, a.dflash_k);
+      const int emitted = static_cast<int>(g.tokens.size()) - 1;  // == D except for DFlash2 rounds
+      tokens_total += P + emitted;
       std::string canary_state = "null";
       double canary_s = 0;
       if (canary) {
@@ -468,14 +516,15 @@ int main(int argc, char** argv) {
       const Snapshot s = Snap(*m);
       log->Line("{\"type\":\"iter\",\"iter\":" + std::to_string(iter) + ",\"t_s\":" + Num(since()) + ",\"mode\":\"" +
                 ModeName(mode) + "\",\"prompt_tokens\":" + std::to_string(P) + ",\"decode_tokens\":" +
-                std::to_string(D) + ",\"start\":" + std::to_string(start) + ",\"prefill_tok_s\":" +
-                Num(P / g.prefill_s) + ",\"decode_tok_s\":" + Num(D / g.decode_s) + ",\"canary\":" + canary_state +
+                std::to_string(emitted) + ",\"rounds\":" + std::to_string(g.rounds) + ",\"start\":" +
+                std::to_string(start) + ",\"prefill_tok_s\":" + Num(P / g.prefill_s) + ",\"decode_tok_s\":" +
+                Num(emitted / g.decode_s) + ",\"canary\":" + canary_state +
                 ",\"canary_s\":" + Num(canary_s) + ",\"buffer_drift_mib\":" + Arr(DriftMiB(s, first, true)) +
                 ",\"vram_used_drift_mib\":" + Arr(DriftMiB(s, first, false)) + "," + CommJson(s) +
                 ",\"fallback_rows\":" + std::to_string(m->SampledFallbackRows()) + "}");
       std::printf("[soak] iter %lld  %.0f s  %-8s prompt %4d  decode %3d  prefill %.0f tok/s  decode %.1f tok/s%s\n",
-                  static_cast<long long>(iter), since(), ModeName(mode), P, D, P / g.prefill_s, D / g.decode_s,
-                  canary ? (std::string("  canary ") + canary_state).c_str() : "");
+                  static_cast<long long>(iter), since(), ModeName(mode), P, emitted, P / g.prefill_s,
+                  emitted / g.decode_s, canary ? (std::string("  canary ") + canary_state).c_str() : "");
       if (canary_fail) break;
     }
   } catch (const std::exception& e) {

@@ -2,7 +2,9 @@
 <#
 .SYNOPSIS
   Runs a two-GPU tool while watching for a Windows TDR, and stops it at the first one (docs/tp.md
-  10.5, G8; Appendix B N44, N55, N64). Imported by tools\tp\soak.ps1 and tools\tp\ar_stress.ps1.
+  10.5, G8; Appendix B N44, N55, N64). Imported by tools\tp\soak.ps1 and tools\tp\ar_stress.ps1;
+  tools\server\smoke.ps1 -Tp 2 uses Start-TdrWatchJob (end of this file) instead, since its run is a
+  server plus the requests the script itself sends, not one tool process.
 
 .DESCRIPTION
   Invoke-TdrWatched:
@@ -158,4 +160,35 @@ function Invoke-TdrWatched {
     return $r
 }
 
-Export-ModuleMember -Function Invoke-TdrWatched
+# For a run that is not one tool process -- tools\server\smoke.ps1 -Tp 2 drives an r4dx-server with
+# requests from the calling script (docs/tp.md P5, Appendix B N77): a background job that runs
+# tdr_check.ps1 -Since <Since> -Quiet every -PollSeconds and, at the first TDR, writes the check's
+# output to -Marker and stops -TargetPid at once (no retry). Returns the job; the caller removes it
+# (Stop-Job / Remove-Job) when the run ends, then waits 30 s and runs the final check itself.
+function Start-TdrWatchJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Since,
+        [Parameter(Mandatory = $true)][int]$TargetPid,
+        [Parameter(Mandatory = $true)][string]$Marker,
+        [ValidateRange(5, 300)][int]$PollSeconds = 20
+    )
+    if (-not [System.IO.Path]::IsPathRooted($Marker)) { throw "tdr_watch: -Marker must be an absolute path, got $Marker" }
+    Remove-Item -LiteralPath $Marker -ErrorAction SilentlyContinue
+    return Start-Job -ScriptBlock {
+        param($Check, $SinceText, $ProcId, $MarkerPath, $Poll)
+        while ($true) {
+            Start-Sleep -Seconds $Poll
+            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Check -Since $SinceText -Quiet
+            if ($LASTEXITCODE -ne 0) {
+                $lines = @($out) + @("[tdr_watch] TDR: stopped pid $ProcId at " + (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') +
+                                     "; no retry")
+                $lines | Set-Content -LiteralPath $MarkerPath
+                Stop-Process -Id $ProcId -Force -ErrorAction SilentlyContinue
+                return
+            }
+        }
+    } -ArgumentList $script:TdrCheck, $Since.ToString('yyyy-MM-ddTHH:mm:ss'), $TargetPid, $Marker, $PollSeconds
+}
+
+Export-ModuleMember -Function Invoke-TdrWatched, Start-TdrWatchJob

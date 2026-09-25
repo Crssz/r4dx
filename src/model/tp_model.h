@@ -21,9 +21,11 @@
 // pinned host mailbox (6.3), after the device validation and wall-clock check of 2.9 steps 3-4;
 // kEmulate -- two ranks on ONE device, EmulatedComm (6.5); kNoop -- ONE rank's shard with a no-op
 // all-reduce (timing only, tokens meaningless). Every mode bounds prefill submissions
-// (TpOptions::submit_layers / max_inflight_units, docs/tp.md Appendix B N57). Staged rejections
-// (2.9 step 1): MTP (mtp_draft_k > 0), DFlash2 (dflash_container) and --vision on throw
-// core::TpUnsupportedError until docs/tp.md P5; --vision auto loads text-only.
+// (TpOptions::submit_layers / max_inflight_units, docs/tp.md Appendix B N57). MTP, DFlash2 and
+// vision run under every mode (docs/tp.md 8.1-8.3): the vision tower lives on rank 0, whose solo
+// EncodeImages command returns HOST rows that every rank splices; the DFlash2 codebooks are read
+// once, on this thread (CPU only), and shared by both ranks' drafters. R4DX_TP_FAULT
+// ("<rank>:<n>:<kind>", docs/tp.md 9.1) arms TpOptions::fault_* from the environment.
 //
 // Thread safety: like Model, one facade thread issues every call. HasVision() and the other cached
 // accessors are plain reads of values fixed at load and are safe from any thread.
@@ -92,13 +94,17 @@ class TpModel final : public TextModel {
   // on each rank before it runs, and Reset() applies it after recovery. Legal in every state.
   void SetDflashInjectionEnabled(bool enabled) override { dflash_injection_ = enabled; }
 
-  // docs/tp.md P5 (vision under TP): throws core::TpUnsupportedError until then.
+  // docs/tp.md 8.3: a solo command on rank 0 (the tower's rank); `out` gets pageable host rows
+  // (ImageRows::host, on_host() true) that PrefillMultimodal splices on every rank. A device-work
+  // call: TpStateError unless kReady, and a failure makes the group kNeedsRecovery.
   void EncodeImages(const float* pixel_values, int64_t total_patches,
                     const std::vector<vision::GridThw>& grids, ImageRows* out,
                     vision::VisionEncodeStats* stats = nullptr) override;
 
   // ---- forward: one collective command each; results compared across ranks (docs/tp.md 2.3) ----
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids) override;
+  // Every span must be host-resident (ImageSpan::embeds_on_host, EncodeImages' rows); the rows are
+  // copied once into memory the command owns (Appendix B N53) and spliced by every rank.
   std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                        const std::vector<ImageSpan>& images) override;
   std::vector<float> DecodeStep(int32_t token_id) override;
@@ -177,7 +183,11 @@ class TpModel final : public TextModel {
     Run(slots, body, kind, stall_limit_);
   }
   // Run, and any failure makes the group kNeedsRecovery (unless it is already kFatal).
-  void RunGuarded(const std::vector<int>& slots, const std::function<void(RankSlot&)>& body, CmdKind kind);
+  void RunGuarded(const std::vector<int>& slots, const std::function<void(RankSlot&)>& body, CmdKind kind,
+                  std::chrono::milliseconds stall);
+  void RunGuarded(const std::vector<int>& slots, const std::function<void(RankSlot&)>& body, CmdKind kind) {
+    RunGuarded(slots, body, kind, stall_limit_);
+  }
   // Throws TpStateError unless kReady (the device-work precondition, docs/tp.md 2.4).
   void RequireReady() const;
   // Host-side poison of every endpoint the facade knows (RankSlot::facade_comm), from the facade
@@ -314,6 +324,7 @@ class TpModel final : public TextModel {
   std::string model_id_;
   int64_t image_token_id_ = -1;
   int64_t vision_merge_size_ = 2;
+  int64_t vision_patch_dim_ = 0;  // floats per pixel_values row EncodeImages copies (0: no vision)
   bool has_vision_ = false;
   bool mtp_enabled_ = false;
   bool mtp_reduced_vocab_ = false;

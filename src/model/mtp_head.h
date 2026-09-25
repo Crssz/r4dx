@@ -45,6 +45,16 @@
 // which always starts from the correctly-committed frontier) before anything could ever read it --
 // the same "self-correcting via position overwrite" trick the main model's own KV cache already
 // relies on (docs/mtp.md's "State commit and rewind").
+//
+// TENSOR PARALLEL (docs/tp.md 8.1): on a TP rank this head is sharded exactly like a body attention
+// layer + MLP (half the heads, half the MLP width; mtp.fc, the norms and the optional reduced-vocab
+// draft head replicate), `cfg` is the rank-local config, and every draft step all-reduces its
+// attention o_proj and MLP down outputs through `comm` (docs/tp.md 6.2 A2/A3). PrimeKv runs NO
+// all-reduce: it uses a second attention layer built with a null communicator, because only its
+// (column-parallel, rank-local) K/V write matters. The shared lm_head is vocab-split, so the
+// FULL-vocab draft head can no longer chain its argmax on the device: each step argmaxes this rank's
+// shard, and the ranks merge the (index, value) pairs on the host (docs/tp.md 6.2 H6) before the
+// next step's embedding gather. The reduced-vocab head is replicated and keeps its device chain.
 #pragma once
 
 #include <cstdint>
@@ -76,15 +86,24 @@ class MtpHead {
   // max_ctx: this Model's ModelOptions::max_ctx -- MTP's own KV cache is sized to the SAME capacity
   // as every backbone attention layer's PagedKvCache (see file comment: this is a real, growing,
   // per-sequence cache now, not a tiny scratch block).
-  MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft, int64_t max_ctx);
+  // logits_rows: the widest lm_head a draft step will ever run, max(lm_head.N, draft_lm_head.N)
+  // (docs/tp.md 4.4) -- the whole vocabulary at TP=1, where the reduced head is never wider than
+  // it; under TP the shared head is this rank's vocab shard while the replicated reduced head is
+  // not capped at half the vocabulary by the container format.
+  // comm: the rank's tensor-parallel communicator (docs/tp.md 8.1), or nullptr at TP=1.
+  MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft, int64_t max_ctx,
+          int64_t logits_rows, core::TpComm* comm = nullptr);
 
   // h_seed: device bf16 [hidden], the main model's pre-final-norm hidden state at the row that
   // produced seed_token's own logits (see Model::DecodeStepMtpGreedy). seed_token: the last
   // already-accepted real token. cfg/w: the CURRENT (live) container config/mtp weights -- see
   // this class's own comment for why these are per-call parameters, not stored members. embed_table
   // /vocab: Container::EmbedTokensHost()/Config().vocab_size (MTP shares the main model's embedding
-  // table -- mtp_use_dedicated_embeddings=false in the real checkpoint's config.json). lm_head:
-  // Container::LmHead() (shared, not MTP's own). base_pos: the REAL sequence position this round's
+  // table -- mtp_use_dedicated_embeddings=false in the real checkpoint's config.json); `vocab` is
+  // the EMBEDDING table's row count only -- the global vocabulary under TP too, where the table is
+  // replicated. lm_head: Container::LmHead() (shared, not MTP's own); the full-vocab draft head's
+  // argmax runs over its own lm_head.N rows, which is this rank's vocab shard under TP (docs/tp.md
+  // 8.1) and the whole vocabulary at TP=1. base_pos: the REAL sequence position this round's
   // first draft step writes into MTP's own KV cache -- always Model::pos_ - 1 at the moment
   // DecodeStepMtpGreedy is called (see PrimeKv's comment for the derivation: this is exactly the
   // position PrimeKv would prime next if no drafting happened at all). Returns exactly `k`
@@ -176,13 +195,34 @@ class MtpHead {
                const std::vector<int32_t>& next_tokens, const uint16_t* embed_table, int64_t vocab,
                int64_t host_staging_offset = 0, const int32_t* rope3_host = nullptr);
 
+#ifdef R4DX_TP_TESTING
+  // Test hook (docs/tp.md 10.1, the H6 exactness check of tests/model/test_tp_emulation.cpp): while
+  // capture is on, every step of a full-vocab draft that merges its argmax across ranks (TP only)
+  // also gathers that step's full [vocab] logits row (a D2H of this rank's shard + one host
+  // all-gather; every rank captures identically, so lockstep holds) and records the merged token.
+  // DebugRows() is [steps][vocab] fp32 in global id order, DebugTokens() [steps]; both are cleared
+  // at the start of every Draft() while capture is on, and stay empty on the reduced-vocab head and
+  // at TP=1 (no merge happens there). DebugDrafts() is what the last Draft() returned while capture
+  // was on, on every path -- so an empty DebugTokens() beside k DebugDrafts() shows a round that
+  // drafted without a merge.
+  void DebugSetCapture(bool on) { debug_capture_ = on; }
+  const std::vector<int32_t>& DebugDrafts() const { return debug_drafts_; }
+  const std::vector<float>& DebugRows() const { return debug_rows_; }
+  const std::vector<int32_t>& DebugTokens() const { return debug_tokens_; }
+#endif
+
  private:
   attention::AttentionLayer attn_layer_;
+  // PrimeKv's layer (docs/tp.md 6.2): the same attention sublayer with a NULL communicator, so
+  // priming -- whose output is discarded, only the K/V write matters -- runs no all-reduce under TP.
+  // At TP=1 comm is null anyway and the two layers are identical.
+  attention::AttentionLayer prime_attn_layer_;
+  core::TpComm* comm_ = nullptr;  // non-owning; nullptr at TP=1
   attention::PagedKvCache kv_;
   core::PinnedBuffer<uint16_t> embed_staging_host_;  // [hidden] -- one token's embedding row (host
                                                       // gather fallback path only)
   core::DeviceBuffer<uint16_t> embed_staging_dev_;   // [hidden]
-  core::DeviceBuffer<float> logits_dev_;             // [vocab] fp32 -- FinalLmHead's output
+  core::DeviceBuffer<float> logits_dev_;             // [logits_rows] fp32 -- FinalLmHead's output
   core::DeviceBuffer<int32_t> argmax_dev_;           // [1] -- this step's own on-device argmax,
                                                       // ALWAYS a real vocab id by the time it is
                                                       // written (see subset_argmax_dev_ below for
@@ -198,6 +238,10 @@ class MtpHead {
   // real id into argmax_dev_ above. Unused (never allocated space needed beyond its fixed 1 element)
   // on the full-vocab path.
   core::DeviceBuffer<int32_t> subset_argmax_dev_;    // [1]
+  // TP only (docs/tp.md 8.1): r4dx_argmax_val_f32's {int32 local index, float value} over this
+  // rank's lm_head shard -- one tp::ArgmaxPair, merged across ranks on the host every draft step.
+  // Empty at TP=1, which keeps its device-resident argmax chain.
+  core::DeviceBuffer<int32_t> argmax_pair_dev_;      // [2]
 
   // Device-resident draft loop scratch (docs/mtp.md "device-resident draft loop"): positions_dev_/
   // seqused_dev_ hold the WHOLE k-step window's RoPE-pos/KV-slot and seqused_k values, preloaded in
@@ -245,6 +289,14 @@ class MtpHead {
   // 3*host_staging_offset for the same in-flight-H2D reason prime_positions_host_ is.
   core::PinnedBuffer<int32_t> prime_rope3_host_;      // [3 * kMaxPrime]
   core::DeviceBuffer<int32_t> prime_rope3_dev_;       // [3 * kMaxPrime]
+
+#ifdef R4DX_TP_TESTING
+  bool debug_capture_ = false;
+  std::vector<float> debug_rows_;       // see DebugSetCapture
+  std::vector<int32_t> debug_tokens_;
+  std::vector<int32_t> debug_drafts_;
+  std::vector<float> debug_shard_host_;
+#endif
 };
 
 }  // namespace r4dx::model

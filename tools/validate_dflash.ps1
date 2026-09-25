@@ -72,10 +72,24 @@
   name. A mismatch whose control does NOT diverge is a hard FAILED regardless of this switch (that
   pattern would mean the divergence is dflash-specific, i.e. a real bug).
 
+.PARAMETER Tp
+  Tensor parallelism (docs/tp.md P5, gate G12): 1 (default) runs everything on HIP device 1, exactly
+  as before this parameter existed. 2 passes `--tp 2` (real mode, both GPUs) to EVERY r4dx-cli run --
+  ground truth, --dflash, and both controls alike, so every comparison is TP=2 against TP=2 -- and
+  REMOVES HIP_VISIBLE_DEVICES and R4DX_TP_FAULT for the run (both restored at the end, from a
+  finally: an error or Ctrl-C restores them too). It refuses to start while an r4dx-server is running
+  (docs/tp.md 9.2); after every run it scans that run's stderr for HIP error 719 and, 5 s later, checks
+  for a device-0 TDR (tools\tp\tdr_check.ps1, Appendix B N55), stopping at the first one (no retry);
+  and on every exit it runs the check once more 30 s after the last run. A TDR fails the script (exit
+  1). An MTP / DFlash2 mismatch here is classified by the script's own controls at --tp 2; running the
+  same matrix at -Tp 1 on the same tree says whether it is also there at TP=1 (Appendix B N29, N80).
+
 .EXAMPLE
   .\tools\validate_dflash.ps1
 .EXAMPLE
   .\tools\validate_dflash.ps1 -Layouts w4a16 -MaxTokens 64
+.EXAMPLE
+  .\tools\validate_dflash.ps1 -Tp 2 -Layouts w4a16 -AllowBatchedVerifyDivergence
 #>
 [CmdletBinding()]
 param(
@@ -90,12 +104,84 @@ param(
     [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-mxfp4.r4dx",
     [string]$Layouts = "w4a16,w4a8,mxfp4",
     [int]$MaxTokens = 40,
-    [switch]$AllowBatchedVerifyDivergence
+    [switch]$AllowBatchedVerifyDivergence,
+    [ValidateSet(1, 2)][int]$Tp = 1
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
-$env:HIP_VISIBLE_DEVICES = '1'
+
+# ---- -Tp 2 (docs/tp.md P5): both GPUs, every r4dx-cli run under --tp 2, a TDR check after each ------
+$SavedHipVisible = $env:HIP_VISIBLE_DEVICES
+$SavedTpFault = $env:R4DX_TP_FAULT
+$TdrCheck = Join-Path $PSScriptRoot "tp\tdr_check.ps1"
+$RunStart = Get-Date
+$CliErrLog = Join-Path $env:TEMP "validate_dflash.cli.err.log"  # the latest r4dx-cli run's stderr
+$script:TdrSeen = $false
+$TpArgs = @()
+if ($Tp -eq 2) {
+    $running = @(Get-Process r4dx-server -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        throw "an r4dx-server is running (pid $(($running | ForEach-Object { $_.Id }) -join ', ')) -- stop it first: -Tp 2 uses both GPUs (docs/tp.md 9.2)"
+    }
+    $TpArgs = @("--tp", "2")  # the environment changes happen inside the try around the matrix (below)
+} else {
+    $env:HIP_VISIBLE_DEVICES = '1'
+}
+
+# -Tp 2, after every r4dx-cli run: the first TDR stops device-0 work (throws; the finally around the
+# matrix still runs the final check). The run's own stderr is scanned first -- the P3 TDR reached HIP
+# as error 719 (docs/tp.md Appendix B N44) -- then tdr_check, after 5 s for Windows Error Reporting.
+# WER can log the 141 event later than that; the final check 30 s after the last run still fails the
+# script then, but the next run has started (Appendix B N80).
+function Assert-NoTdrYet {
+    if ($Tp -ne 2) { return }
+    $hip719 = @()
+    if (Test-Path -LiteralPath $CliErrLog) {
+        $hip719 = @(Select-String -LiteralPath $CliErrLog -Pattern 'HIP error 719\b|unspecified launch failure')
+    }
+    if ($hip719.Count -gt 0) {
+        $script:TdrSeen = $true
+        foreach ($l in $hip719) { Write-Host "  $($l.Line)" }
+        throw "suspected TDR (HIP error 719 in the r4dx-cli run's stderr) -- stopping all device-0 work (no retry)"
+    }
+    Start-Sleep -Seconds 5
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+    if ($LASTEXITCODE -ne 0) {
+        $script:TdrSeen = $true
+        foreach ($l in @($out)) { Write-Host "  $l" }
+        throw "TDR since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss')) -- stopping all device-0 work (no retry)"
+    }
+}
+
+# -Tp 2, from the finally around the matrix -- so on EVERY exit, a failure or Ctrl-C included: the
+# final TDR check (30 s after the last run, so Windows Error Reporting has logged a late one), then the
+# caller's HIP_VISIBLE_DEVICES and R4DX_TP_FAULT come back.
+function Complete-TpRun {
+    if ($Tp -ne 2) { return }
+    Write-Host "[validate_dflash] waiting 30 s for Windows Error Reporting, then tdr_check -Since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss'))"
+    Start-Sleep -Seconds 30
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+    $rc = $LASTEXITCODE
+    foreach ($l in @($out)) { Write-Output "  $l" }
+    if ($rc -ne 0) {
+        $script:TdrSeen = $true
+        Write-Output "[validate_dflash] a TDR occurred during the run (see above)"
+    }
+    if ($null -ne $SavedHipVisible) { $env:HIP_VISIBLE_DEVICES = $SavedHipVisible }
+    else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
+    if ($null -ne $SavedTpFault) { $env:R4DX_TP_FAULT = $SavedTpFault }
+    else { Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue }
+}
+
+# Every exit after the matrix goes through here: a TDR (-Tp 2) turns any exit code into 1.
+function Exit-Validation([int]$code) {
+    if ($script:TdrSeen) {
+        Write-Output "[validate_dflash] FAILED: a TDR occurred during the run"
+        $code = 1
+    }
+    exit $code
+}
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
@@ -169,6 +255,8 @@ function Invoke-Generation([string]$layout, [string]$prompt, [int]$maxCtx, [stri
     # grouping (a different draft container's own drafted-token sequence, or a higher p_min early
     # stop) while holding the target/layout/prompt fixed -- the review's fix for the blocker this
     # file's own history records.
+    # `$TpArgs` (-Tp 2): `--tp 2` on every mode alike, so ground truth and speculation share one engine.
+    # stderr goes to $CliErrLog (overwritten per run), which Assert-NoTdrYet scans under -Tp 2.
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -177,21 +265,22 @@ function Invoke-Generation([string]$layout, [string]$prompt, [int]$maxCtx, [stri
                 $dflashArgs = @("--dflash", $draftPath)
                 if ($pMin -gt 0) { $dflashArgs += @("--dflash-p-min", "$pMin") }
                 $out = & $Cli --model $Model --layout $layout --prompt $prompt --max-tokens $MaxTokens `
-                    --max-ctx $maxCtx --temperature 0 @dflashArgs 2>$null
+                    --max-ctx $maxCtx --temperature 0 @dflashArgs @TpArgs 2>$CliErrLog
             }
             "control" {
                 $out = & $Cli --model $Model --layout $layout --prompt $prompt --max-tokens $MaxTokens `
-                    --max-ctx $maxCtx --temperature 0 --mtp 7 2>$null
+                    --max-ctx $maxCtx --temperature 0 --mtp 7 @TpArgs 2>$CliErrLog
             }
             default {
                 $out = & $Cli --model $Model --layout $layout --prompt $prompt --max-tokens $MaxTokens `
-                    --max-ctx $maxCtx --temperature 0 --mtp 0 2>$null
+                    --max-ctx $maxCtx --temperature 0 --mtp 0 @TpArgs 2>$CliErrLog
             }
         }
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref
     }
+    Assert-NoTdrYet
     $joined = ($out -join "`n")
     if ($exitCode -ne 0) {
         throw "r4dx-cli exited $exitCode (layout=$layout max-ctx=$maxCtx mode=$mode) -- stdout was: $joined"
@@ -208,100 +297,120 @@ $results = @()
 $failures = 0
 $warnings = 0
 
-foreach ($layout in $LayoutList) {
-    foreach ($label in $Prompts.Keys) {
-        $prompt = $Prompts[$label]
-        $maxCtx = $MaxCtxByLabel[$label]
-        Write-Output "[validate_dflash] layout=$layout prompt=$label max-ctx=$maxCtx ..."
-        $baseline = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "baseline"
-        $dflashed = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "dflash"
-        $hashBase = Get-Sha256Hex $baseline
-        $hashDflash = Get-Sha256Hex $dflashed
-        $match = ($hashBase -eq $hashDflash)
-        $status = "OK"
-        $controlNote = ""
-        if (-not $match) {
-            $diffPos = Find-FirstDiff $baseline $dflashed
-            Write-Output "  MISMATCH vs --mtp 0 -- first diff at char $diffPos"
-            $ctxStart = [Math]::Max(0, $diffPos - 40)
-            $ctxLen = 120
-            $baseSnip = $baseline.Substring($ctxStart, [Math]::Min($ctxLen, $baseline.Length - $ctxStart))
-            $dflSnip  = $dflashed.Substring($ctxStart, [Math]::Min($ctxLen, $dflashed.Length - $ctxStart))
-            Write-Output "  baseline (--mtp 0) around diff: ...$baseSnip..."
-            Write-Output "  dflash            around diff: ...$dflSnip..."
+$aborted = $false
+try {
+    if ($Tp -eq 2) {
+        Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+        # TpModel::Load arms R4DX_TP_FAULT in every --tp 2 run: never inherit one (smoke.ps1 -TpFault's).
+        Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue
+        Write-Output ("[validate_dflash] -Tp 2: --tp 2 on every r4dx-cli run, HIP_VISIBLE_DEVICES and R4DX_TP_FAULT " +
+                      "removed (both GPUs), TDR check after every run from $($RunStart.ToString('yyyy-MM-dd HH:mm:ss'))")
+    }
+    foreach ($layout in $LayoutList) {
+        foreach ($label in $Prompts.Keys) {
+            $prompt = $Prompts[$label]
+            $maxCtx = $MaxCtxByLabel[$label]
+            Write-Output "[validate_dflash] layout=$layout prompt=$label max-ctx=$maxCtx ..."
+            $baseline = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "baseline"
+            $dflashed = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "dflash"
+            $hashBase = Get-Sha256Hex $baseline
+            $hashDflash = Get-Sha256Hex $dflashed
+            $match = ($hashBase -eq $hashDflash)
+            $status = "OK"
+            $controlNote = ""
+            if (-not $match) {
+                $diffPos = Find-FirstDiff $baseline $dflashed
+                Write-Output "  MISMATCH vs --mtp 0 -- first diff at char $diffPos"
+                $ctxStart = [Math]::Max(0, $diffPos - 40)
+                $ctxLen = 120
+                $baseSnip = $baseline.Substring($ctxStart, [Math]::Min($ctxLen, $baseline.Length - $ctxStart))
+                $dflSnip  = $dflashed.Substring($ctxStart, [Math]::Min($ctxLen, $dflashed.Length - $ctxStart))
+                Write-Output "  baseline (--mtp 0) around diff: ...$baseSnip..."
+                Write-Output "  dflash            around diff: ...$dflSnip..."
 
-            # Control run: does the EXISTING, dflash-uninvolved MTP path ALSO diverge from --mtp 0
-            # on this exact prompt/layout? If yes, this is the pre-existing batched-verify
-            # reduction-order mechanism (docs/mtp.md), not a dflash-specific bug -- confirmed by
-            # running it, not assumed from the layout name (see this script's own file comment for
-            # the 2026-09-20 finding that motivated this).
-            Write-Output "  running --mtp 7 control (no --dflash) to test whether this is the pre-existing batched-verify mechanism ..."
-            $control = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "control"
-            $hashControl = Get-Sha256Hex $control
-            $controlDiverges = ($hashControl -ne $hashBase)
-            $controlMatchesDflash = ($hashControl -eq $hashDflash)
-            if ($controlDiverges) {
-                $controlNote = "control(--mtp 7) also diverges from --mtp 0" +
-                    $(if ($controlMatchesDflash) { " AND matches --dflash exactly (same mechanism, confirmed)" } else { " (different divergence -- inspect)" })
-                if ($AllowBatchedVerifyDivergence) {
-                    $status = "WARN ($controlNote)"
-                    $warnings++
-                } else {
-                    $status = "FAILED (control confirms batched-verify mechanism -- rerun with -AllowBatchedVerifyDivergence to accept)"
-                    $failures++
-                }
-            } else {
-                # Review fix (2026-09-21, blocker): the --mtp 7 control is too weak a falsifier for
-                # every case -- it changes NOTHING about DFlash2's own drafted-token sequence, so a
-                # divergence that is really "the verify window happened to group these particular
-                # tokens together" can survive it untouched. Before declaring a real bug, try a
-                # SECOND, orthogonal control that changes ONLY the grouping (a different draft
-                # container -> a different drafted-token sequence -> a different verify-window
-                # membership, still through the identical DFlash2 code path) while holding
-                # everything else fixed. A bookkeeping/lifecycle bug cannot be switched off by
-                # re-quantizing the draft container; if THIS control also fails to reproduce the
-                # divergence AND does not itself just happen to match --mtp 0 by coincidence, only
-                # then is the row a real, unexplained dflash-specific bug.
-                $controlNote = "control(--mtp 7) does NOT diverge from --mtp 0"
-                if (Test-Path $DflashAlt) {
-                    Write-Output "  running grouping control (--dflash $DflashAlt, different draft container, same target/layout/prompt) ..."
-                    $grouping = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "dflash" -draftPath $DflashAlt
-                    $hashGrouping = Get-Sha256Hex $grouping
-                    $groupingMatchesBase = ($hashGrouping -eq $hashBase)
-                    if ($groupingMatchesBase) {
-                        $controlNote += "; grouping control (--dflash $DflashAlt) DOES match --mtp 0 -- " +
-                            "divergence is verify-window grouping (same class as the documented batched-verify " +
-                            "mechanism, confirmed by an orthogonal draft-container change), not a bookkeeping bug"
-                        if ($AllowBatchedVerifyDivergence) {
-                            $status = "WARN ($controlNote)"
-                            $warnings++
-                        } else {
-                            $status = "FAILED (grouping control confirms verify-window grouping -- rerun with -AllowBatchedVerifyDivergence to accept)"
-                            $failures++
-                        }
+                # Control run: does the EXISTING, dflash-uninvolved MTP path ALSO diverge from --mtp 0
+                # on this exact prompt/layout? If yes, this is the pre-existing batched-verify
+                # reduction-order mechanism (docs/mtp.md), not a dflash-specific bug -- confirmed by
+                # running it, not assumed from the layout name (see this script's own file comment for
+                # the 2026-09-20 finding that motivated this).
+                Write-Output "  running --mtp 7 control (no --dflash) to test whether this is the pre-existing batched-verify mechanism ..."
+                $control = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "control"
+                $hashControl = Get-Sha256Hex $control
+                $controlDiverges = ($hashControl -ne $hashBase)
+                $controlMatchesDflash = ($hashControl -eq $hashDflash)
+                if ($controlDiverges) {
+                    $controlNote = "control(--mtp 7) also diverges from --mtp 0" +
+                        $(if ($controlMatchesDflash) { " AND matches --dflash exactly (same mechanism, confirmed)" } else { " (different divergence -- inspect)" })
+                    if ($AllowBatchedVerifyDivergence) {
+                        $status = "WARN ($controlNote)"
+                        $warnings++
                     } else {
-                        $controlNote += "; grouping control (--dflash $DflashAlt) ALSO diverges from --mtp 0 -- " +
-                            "reproduced under an unrelated draft container, still not proven dflash-specific, but " +
-                            "not cleared either -- FAILED pending investigation"
-                        $status = "FAILED (unresolved -- neither control reproduces cleanly; see ControlNote)"
+                        $status = "FAILED (control confirms batched-verify mechanism -- rerun with -AllowBatchedVerifyDivergence to accept)"
                         $failures++
                     }
                 } else {
-                    $controlNote += " -- this mismatch is dflash-specific ($DflashAlt not found, no grouping control run)"
-                    $status = "FAILED (real bug -- control did not reproduce it)"
-                    $failures++
+                    # Review fix (2026-09-21, blocker): the --mtp 7 control is too weak a falsifier for
+                    # every case -- it changes NOTHING about DFlash2's own drafted-token sequence, so a
+                    # divergence that is really "the verify window happened to group these particular
+                    # tokens together" can survive it untouched. Before declaring a real bug, try a
+                    # SECOND, orthogonal control that changes ONLY the grouping (a different draft
+                    # container -> a different drafted-token sequence -> a different verify-window
+                    # membership, still through the identical DFlash2 code path) while holding
+                    # everything else fixed. A bookkeeping/lifecycle bug cannot be switched off by
+                    # re-quantizing the draft container; if THIS control also fails to reproduce the
+                    # divergence AND does not itself just happen to match --mtp 0 by coincidence, only
+                    # then is the row a real, unexplained dflash-specific bug.
+                    $controlNote = "control(--mtp 7) does NOT diverge from --mtp 0"
+                    if (Test-Path $DflashAlt) {
+                        Write-Output "  running grouping control (--dflash $DflashAlt, different draft container, same target/layout/prompt) ..."
+                        $grouping = Invoke-Generation -layout $layout -prompt $prompt -maxCtx $maxCtx -mode "dflash" -draftPath $DflashAlt
+                        $hashGrouping = Get-Sha256Hex $grouping
+                        $groupingMatchesBase = ($hashGrouping -eq $hashBase)
+                        if ($groupingMatchesBase) {
+                            $controlNote += "; grouping control (--dflash $DflashAlt) DOES match --mtp 0 -- " +
+                                "divergence is verify-window grouping (same class as the documented batched-verify " +
+                                "mechanism, confirmed by an orthogonal draft-container change), not a bookkeeping bug"
+                            if ($AllowBatchedVerifyDivergence) {
+                                $status = "WARN ($controlNote)"
+                                $warnings++
+                            } else {
+                                $status = "FAILED (grouping control confirms verify-window grouping -- rerun with -AllowBatchedVerifyDivergence to accept)"
+                                $failures++
+                            }
+                        } else {
+                            $controlNote += "; grouping control (--dflash $DflashAlt) ALSO diverges from --mtp 0 -- " +
+                                "reproduced under an unrelated draft container, still not proven dflash-specific, but " +
+                                "not cleared either -- FAILED pending investigation"
+                            $status = "FAILED (unresolved -- neither control reproduces cleanly; see ControlNote)"
+                            $failures++
+                        }
+                    } else {
+                        $controlNote += " -- this mismatch is dflash-specific ($DflashAlt not found, no grouping control run)"
+                        $status = "FAILED (real bug -- control did not reproduce it)"
+                        $failures++
+                    }
                 }
+                Write-Output "  $controlNote"
+            } else {
+                Write-Output "  OK ($hashBase)"
             }
-            Write-Output "  $controlNote"
-        } else {
-            Write-Output "  OK ($hashBase)"
-        }
-        $results += [pscustomobject]@{
-            Layout = $layout; Prompt = $label
-            BaselineSha256 = $hashBase; DflashSha256 = $hashDflash; Status = $status; ControlNote = $controlNote
+            $results += [pscustomobject]@{
+                Layout = $layout; Prompt = $label
+                BaselineSha256 = $hashBase; DflashSha256 = $hashDflash; Status = $status; ControlNote = $controlNote
+            }
         }
     }
+} catch {
+    # A failed run or (-Tp 2) a TDR: reported here; the finally still runs the final TDR check.
+    Write-Output "[validate_dflash] ABORTED: $_"
+    $aborted = $true
+} finally {
+    # A finally, not only the catch: PowerShell runs finally blocks on Ctrl-C (a pipeline stop), which
+    # skips catch blocks -- an interrupted -Tp 2 run must still get the final TDR check and give the
+    # caller its environment back (docs/tp.md Appendix B N80).
+    Complete-TpRun
 }
+if ($aborted) { Exit-Validation 1 }
 
 Write-Output ""
 Write-Output "[validate_dflash] summary:"
@@ -310,12 +419,12 @@ $results | Format-Table -AutoSize | Out-String | Write-Output
 if ($failures -gt 0) {
     Write-Output "[validate_dflash] FAILED: $failures / $($results.Count) combinations diverged " +
         "(not accepted as the known mxfp4 batched-reduction-order mechanism)"
-    exit 1
+    Exit-Validation 1
 }
 if ($warnings -gt 0) {
     Write-Output "[validate_dflash] PASSED WITH WARNINGS: $($results.Count - $warnings) byte-identical, " +
         "$warnings accepted as the known mxfp4 divergence mechanism (docs/mtp.md)"
-    exit 0
+    Exit-Validation 0
 }
 Write-Output "[validate_dflash] PASSED: $($results.Count) / $($results.Count) combinations byte-identical"
-exit 0
+Exit-Validation 0

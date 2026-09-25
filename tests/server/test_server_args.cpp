@@ -333,6 +333,95 @@ void TestVisionFlags() {
   CHECK(rejects({"--image-max-pixels", "big"}));
 }
 
+// --tp and --tp-* (docs/tp.md 9.1): the same flags, ranges and usage errors as r4dx-cli's, which
+// tests/cli/test_args.cpp's TestTpFlags pins on the other side (same reason as TestVisionFlags).
+bool TpThrows(std::vector<std::string> extra) {
+  std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--layout", "w4a16"};
+  storage.insert(storage.end(), extra.begin(), extra.end());
+  auto argv = ToArgv(storage);
+  try {
+    r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+  } catch (const r4dx::server::ServerUsageError&) {
+    return true;
+  }
+  return false;
+}
+
+void TestTpFlags() {
+  auto parse = [](std::vector<std::string> extra) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--layout", "w4a16"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    return r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+  };
+  {
+    const auto a = parse({});
+    CHECK(a.tp == 1);
+    CHECK(!a.tp_options_given);
+    CHECK(a.tp_mode == "real");
+    CHECK(a.tp_devices.empty());
+    CHECK(a.tp_submit_layers == -1 && a.tp_max_inflight == -1);
+  }
+  {
+    const auto a = parse({"--tp", "2", "--tp-mode", "emulate", "--tp-devices", "0", "--tp-ar-timeout-ms", "700",
+                          "--tp-ar-nb", "8", "--tp-ar-nb-large", "16"});
+    CHECK(a.tp == 2);
+    CHECK(a.tp_mode == "emulate");
+    CHECK(a.tp_devices.size() == 1 && a.tp_devices[0] == 0);
+    CHECK(a.tp_ar_timeout_ms == 700);
+    CHECK(a.tp_ar_nb == 8);
+    CHECK(a.tp_ar_nb_large == 16);
+    CHECK(a.tp_options_given);
+  }
+  {
+    const auto a = parse({"--tp", "2", "--tp-mode", "noop", "--tp-rank", "1", "--tp-devices", "1,0"});
+    CHECK(a.tp_mode == "noop");
+    CHECK(a.tp_rank == 1);
+    CHECK(a.tp_devices.size() == 2 && a.tp_devices[0] == 1 && a.tp_devices[1] == 0);
+  }
+  {
+    const auto a = parse({"--tp", "2"});
+    CHECK(a.tp == 2 && a.tp_mode == "real" && !a.tp_options_given);
+    const auto b = parse({"--tp", "2", "--tp-submit-layers", "0", "--tp-max-inflight", "3"});
+    CHECK(b.tp_submit_layers == 0 && b.tp_max_inflight == 3 && b.tp_options_given);
+  }
+  CHECK(TpThrows({"--tp", "3"}));
+  CHECK(TpThrows({"--tp", "0"}));
+  CHECK(TpThrows({"--tp-mode", "emulate"}));  // --tp-* without --tp 2
+  CHECK(TpThrows({"--tp", "1", "--tp-ar-nb", "4"}));
+  CHECK(TpThrows({"--tp", "1", "--tp-submit-layers", "4"}));
+  CHECK(!TpThrows({"--tp", "1"}));
+  CHECK(!TpThrows({"--tp", "2", "--tp-mode", "real", "--tp-devices", "1,0"}));
+  CHECK(!TpThrows({"--tp", "2", "--tp-devices", "auto"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "bogus"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-submit-layers", "-1"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-submit-layers", "65"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-max-inflight", "-2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-max-inflight", "65"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-rank", "0"}));  // --tp-rank is noop-only
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "noop", "--tp-rank", "2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-ar-timeout-ms", "5"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-ar-timeout-ms", "1501"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-ar-nb", "0"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-ar-nb-large", "65"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-devices", "0,1,2"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-devices", "x"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-devices", "-1"}));
+  CHECK(TpThrows({"--tp", "two"}));
+  // MTP, DFlash2 and vision run under --tp 2 (docs/tp.md P5) ...
+  CHECK(!TpThrows({"--tp", "2", "--mtp", "3"}));
+  CHECK(!TpThrows({"--tp", "2", "--dflash", "d.r4dx", "--dflash-k", "7"}));
+  CHECK(!TpThrows({"--tp", "2", "--vision", "on"}));
+  // ... while the rules that hold at --tp 1 still hold at --tp 2.
+  CHECK(TpThrows({"--tp", "2", "--mtp", "3", "--dflash", "d.r4dx"}));
+  CHECK(TpThrows({"--tp", "2", "--dflash", "d.r4dx", "--dflash-k", "8"}));
+  // --mtp is capped at 7 under --tp 2, as in r4dx-cli (docs/tp.md Appendix B N80).
+  CHECK(!TpThrows({"--tp", "2", "--mtp", "7"}));
+  CHECK(TpThrows({"--tp", "2", "--mtp", "8"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "63"}));
+  CHECK(!TpThrows({"--tp", "1", "--mtp", "63"}));
+}
+
 }  // namespace
 
 int main() {
@@ -348,6 +437,7 @@ int main() {
   TestMtpUpperBound();
   TestDflashFlags();
   TestVisionFlags();
+  TestTpFlags();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

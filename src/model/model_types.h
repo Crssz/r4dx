@@ -36,8 +36,8 @@ struct ImageSpan {
   // embed_tokens lookup at the placeholder positions. Device memory unless `embeds_on_host`.
   const uint16_t* embeds = nullptr;
   // docs/tp.md 8.3: true => `embeds` is HOST memory (a tensor-parallel ImageRows), spliced with an
-  // H2D copy on every rank. Always false at TP=1 (device rows, the D2D splice) -- and, until
-  // docs/tp.md P5 enables vision under TP, always false everywhere.
+  // H2D copy on every rank. False for the device rows LocalTextModel produces at TP=1 (the D2D
+  // splice, byte for byte the pre-TP path).
   bool embeds_on_host = false;
 };
 
@@ -58,7 +58,7 @@ class ImageRows {
   }
 
   core::DeviceBuffer<uint16_t> dev;  // filled by LocalTextModel
-  std::vector<uint16_t> host;        // filled by TpModel (docs/tp.md P5)
+  std::vector<uint16_t> host;        // filled by TpModel (docs/tp.md 8.3)
 
  private:
   bool on_host_ = false;

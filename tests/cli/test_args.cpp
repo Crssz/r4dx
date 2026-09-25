@@ -401,8 +401,8 @@ void TestImageFlag() {
 }
 
 // --tp and --tp-* (docs/tp.md 9.1): defaults are TP=1 and change nothing; every --tp-* flag needs
-// --tp 2; the permanent (--profile*) and staged (P2b: real mode, --mtp, --dflash, --vision on,
-// --image) rejections are usage errors.
+// --tp 2; the permanent rejection (--profile*) is a usage error, and the staged ones are gone (P4:
+// real mode; P5: --mtp, --dflash, --vision on, --image).
 bool TpThrows(std::vector<std::string> extra) {
   std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi"};
   storage.insert(storage.end(), extra.begin(), extra.end());
@@ -482,11 +482,23 @@ void TestTpFlags() {
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--tp-devices", "x"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--profile"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--profile-prefill"}));
-  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "3"}));
-  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--dflash", "d.r4dx"}));
-  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--vision", "on"}));
-  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--image", "a.png"}));
+  // docs/tp.md P5 lifted the staged rejections: MTP, DFlash2 and vision run under --tp 2.
+  CHECK(!TpThrows({"--tp", "2", "--mtp", "3"}));
+  CHECK(!TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "3"}));
+  CHECK(!TpThrows({"--tp", "2", "--dflash", "d.r4dx", "--dflash-k", "7"}));
+  CHECK(!TpThrows({"--tp", "2", "--tp-mode", "emulate", "--dflash", "d.r4dx"}));
+  CHECK(!TpThrows({"--tp", "2", "--vision", "on"}));
+  CHECK(!TpThrows({"--tp", "2", "--image", "a.png"}));
   CHECK(!TpThrows({"--tp", "2", "--tp-mode", "emulate", "--vision", "auto"}));
+  // ... while the rules that hold at --tp 1 still hold at --tp 2.
+  CHECK(TpThrows({"--tp", "2", "--mtp", "3", "--dflash", "d.r4dx"}));
+  CHECK(TpThrows({"--tp", "2", "--dflash", "d.r4dx", "--dflash-k", "8"}));
+  // --mtp is capped at 7 under --tp 2 (verify windows stay <= 8 rows, docs/tp.md Appendix B N80);
+  // --tp 1 keeps its 63.
+  CHECK(!TpThrows({"--tp", "2", "--mtp", "7"}));
+  CHECK(TpThrows({"--tp", "2", "--mtp", "8"}));
+  CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "63"}));
+  CHECK(!TpThrows({"--tp", "1", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1"}));
 }
 

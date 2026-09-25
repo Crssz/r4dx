@@ -29,7 +29,7 @@ struct ImagePlaceholderSpan {
   GridThw grid;
   const uint16_t* embeds = nullptr;
   // docs/tp.md 8.3: true => `embeds` is host memory (a tensor-parallel ImageRows), carried through
-  // to Model::ImageSpan::embeds_on_host. False at TP=1 (device rows) -- and everywhere until P5.
+  // to Model::ImageSpan::embeds_on_host. False at TP=1 (device rows).
   bool embeds_on_host = false;
 };
 

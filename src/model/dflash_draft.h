@@ -42,10 +42,21 @@
 // row-gather codebooks, which are kept host-resident as bf16 (2 x 127 MB) rather than mirrored to
 // VRAM -- a device gather would have to come back to the host anyway for the walk, which is
 // inherently sequential across block positions.
+//
+// TENSOR PARALLEL (docs/tp.md 8.2). Every rank loads the WHOLE drafter (replicated: it is
+// launch-bound, so sharding it would buy little and add a second sharding scheme), and both ranks'
+// drafters share ONE host copy of the codebooks (DflashDraftOptions::shared_codebooks,
+// LoadHostCodebooks). The drafter's own layers need no communication: both ranks inject the same
+// replicated target features and run the same block, so the rings and the block activations stay
+// identical. Only the TARGET's lm_head is vocab-split: each rank's round sees this rank's
+// [block_size, vocab/2] logits and top-16s them locally, and the ranks merge the per-row top-16s on
+// the host (docs/tp.md 6.2 H7) under r4dx_topk16_f32's own total order -- which makes the merged
+// `cand`/`unary` exactly the full-vocabulary top-16 -- before the (identical) selector walk.
 #pragma once
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -57,7 +68,20 @@
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 
+namespace r4dx::core {
+class TpComm;  // r4dx/core/tp_comm.hpp
+}  // namespace r4dx::core
+
 namespace r4dx::model {
+
+// The drafter's two host-resident selector codebooks (`dflash.selector.{predecessor,successor}`,
+// [vocab][selector_rank] bf16 each, 2 x 127 MB for the real drafter). Plain host vectors, so they
+// can be read -- and freed -- on any thread with no HIP call. Under tensor parallelism the process
+// reads them ONCE (DflashDraft::LoadHostCodebooks, on the TpModel facade thread) and every rank's
+// drafter shares that copy (docs/tp.md 2.9 step 6, 5.3).
+struct DflashHostCodebooks {
+  std::vector<uint16_t> predecessor, successor;
+};
 
 // Gathers `n` TARGET embedding rows into `out_dev` ([n, hidden] bf16, device). BOTH id forms are
 // handed over so either backing can be used with no extra allocation: `ids_host` for
@@ -103,12 +127,23 @@ struct DflashDraftOptions {
   // Row count of the lm_head the LmHeadProvider will use; 0 means "the container's own
   // vocab_size" (248320 for the real drafter). A test driving a synthetic small-vocab target sets
   // this to that target's vocab so the logits buffer and the top-16 launch are sized correctly.
+  // Under tensor parallelism it is this rank's shard of the target's vocab-split lm_head (124160):
+  // it sizes the logits buffer and the per-rank top-16 (docs/tp.md 8.2).
   int64_t lm_head_vocab = 0;
   // Overrides the container's `mask_token_id` (248070). Same reason as `lm_head_vocab`: the real
   // mask id is out of range for a synthetic small-vocab target, and the Python reference clamps it
   // to `vocab-1` in exactly that case (`dflash2_ref.py::_synthetic_mask_id`). <0 == use the
   // container's own value.
   int64_t mask_token_id_override = -1;
+  // ---- tensor parallel (docs/tp.md 8.2); every field's default is TP=1 -------------------------
+  int64_t vocab_offset = 0;      // global id of this rank's first lm_head row (rank * 124160)
+  int64_t global_vocab = 0;      // the whole vocabulary (248320); 0 => lm_head_vocab (TP=1). The
+                                 // token-id range checks (mask id, anchor) and the codebook size
+                                 // check use it: the codebooks and token ids stay global.
+  core::TpComm* comm = nullptr;  // non-owning; non-null => merge the per-rank top-16s (H7)
+  // The process's one host copy of the codebooks (LoadHostCodebooks); nullptr => read them from
+  // `container_path` (TP=1, and a bare rank Model a test or tool builds directly).
+  std::shared_ptr<const DflashHostCodebooks> shared_codebooks;
 };
 
 // Per-round intermediate capture, for tests/diagnostics ONLY: filling it costs one extra
@@ -145,6 +180,10 @@ struct DflashDraftResult {
 class DflashDraft {
  public:
   static DflashDraft Load(const DflashDraftOptions& opts);
+  // Reads the container's two selector codebooks into host memory, CPU only (no HIP call) -- the
+  // copy TpModel shares across its ranks (DflashDraftOptions::shared_codebooks, docs/tp.md 2.9 step
+  // 6). Load itself reads them the same way when no shared copy is given.
+  static std::shared_ptr<const DflashHostCodebooks> LoadHostCodebooks(const std::string& container_path);
 
   DflashDraft(DflashDraft&&) = default;
   DflashDraft& operator=(DflashDraft&&) = default;
@@ -162,8 +201,20 @@ class DflashDraft {
   // case that existed before the server's per-request injection toggle).
   int64_t ValidFrom() const { return valid_from_; }
   int64_t MaskTokenId() const { return mask_token_id_; }
-  int64_t LmHeadVocab() const { return lm_head_vocab_; }
+  int64_t LmHeadVocab() const { return lm_head_vocab_; }    // this rank's lm_head rows under TP
+  int64_t GlobalVocab() const { return global_vocab_; }     // == LmHeadVocab() at TP=1
   Layout GetLayout() const { return layout_; }
+  const std::shared_ptr<const DflashHostCodebooks>& HostCodebooks() const { return codebooks_; }
+
+#ifdef R4DX_TP_TESTING
+  // Test hooks (docs/tp.md 10.1, tests/model/test_tp_emulation.cpp's H7 exactness check). The
+  // cand/unary the most recent DraftRound's selector walk consumed, [block_size * 16] each -- the
+  // MERGED full-vocabulary top-16 under TP, the kernel's own at TP=1 -- and the device pointer of
+  // that round's [block_size, LmHeadVocab()] logits (this rank's shard under TP), valid until the
+  // next DraftRound.
+  void DebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const;
+  const float* DebugLogitsDevice() const { return logits_dev_.data(); }
+#endif
 
   // Drops every injected position (the ring's bytes are left alone -- nothing can read a slot at or
   // beyond `n_injected_`, and every slot is unconditionally overwritten before it is read again;
@@ -277,10 +328,18 @@ class DflashDraft {
     return book.data() + id * cfg_.selector_rank;
   }
 
+  // H7 (docs/tp.md 8.2): after the round's one D2H, turn this rank's top-16s in sel_stage_host_
+  // into the full-vocab top-16s in merged_cand_/merged_unary_ (ids made global in place, one host
+  // all-gather, tp::MergeTop16).
+  void MergeTop16AcrossRanks();
+
   Dflash2Config cfg_;
   Layout layout_ = Layout::kW4a16;
   int64_t max_inject_rows_ = 64;
   int64_t lm_head_vocab_ = 0;
+  int64_t global_vocab_ = 0;
+  int64_t vocab_offset_ = 0;
+  core::TpComm* comm_ = nullptr;  // non-owning; nullptr at TP=1
   int64_t mask_token_id_ = 0;
   int64_t n_injected_ = 0;
   // Lower bound of the ring's VALID contiguous run (see InjectFeatures / ValidFrom). Always
@@ -299,8 +358,9 @@ class DflashDraft {
   QuantLinear selector_hidden_;                     // [selector_rank, hidden]
   // Host-resident bf16 row-gather codebooks, [vocab][selector_rank] each (127 MB each for the real
   // drafter). Host, not VRAM: the lattice walk is sequential across block positions and runs on the
-  // host, so a device copy would be gathered only to be copied straight back.
-  std::vector<uint16_t> selector_predecessor_, selector_successor_;
+  // host, so a device copy would be gathered only to be copied straight back. Shared (read-only)
+  // with the other rank's drafter under tensor parallelism.
+  std::shared_ptr<const DflashHostCodebooks> codebooks_;
   std::vector<LayerWeights> layers_;
 
   // ---- KV ring (docs/dflash2.md section 5) ------------------------------------------------------
@@ -337,6 +397,13 @@ class DflashDraft {
   core::DeviceBuffer<uint8_t> sel_stage_dev_;
   core::PinnedBuffer<uint8_t> sel_stage_host_;
   int64_t sel_off_unary_ = 0, sel_off_cand_ = 0, sel_off_gate_ = 0, sel_stage_bytes_ = 0;
+
+  // ---- tensor parallel H7 host scratch (docs/tp.md 8.2); empty at TP=1 ---------------------------
+  std::vector<uint8_t> top16_gather_;       // [world][unary | cand] staging bytes, rank order
+  std::vector<int32_t> top16_ids_all_;      // [world][block_size][16], ids global
+  std::vector<float> top16_vals_all_;       // [world][block_size][16]
+  std::vector<int32_t> merged_cand_;        // [block_size][16] -- the walk's input under TP
+  std::vector<float> merged_unary_;         // [block_size][16]
 };
 
 }  // namespace r4dx::model

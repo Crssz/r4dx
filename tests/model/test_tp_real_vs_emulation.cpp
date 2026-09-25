@@ -29,6 +29,17 @@
 // ranks agree on CallCounts(), and the rerun equals the fresh real run byte for byte. Every case ends
 // with core::g_tp_collective_allocs == 0.
 //
+// P5 (docs/tp.md 10.1): the speculative rounds, emulate vs real with the shipped bounding (32/1),
+// byte for byte -- every round's tokens, walk_len (DFlash2), the merged drafts / top-16 of every
+// round (the R4DX_TP_TESTING hooks), the generator after the sampled rounds, and the full logits of
+// one DecodeStep after the rounds (the state they committed):
+//   * MTP K=3 on l4-allmtp w4a16: 8 greedy rounds, then 8 seeded sampled rounds (T 0.7, top_k 20,
+//     top_p 0.8);
+//   * DFlash2 k=7 on the real v6 container + its w4a16 drafter (the production pair; the drafter's
+//     target layers need the 64-layer target): the same two scripts. Its emulate pass holds both
+//     ranks, drafters included, on device 1 (~23 GiB), so it has its own pre-flight; it SKIPs, with a
+//     line saying so, when the production pair is absent.
+//
 // Opt-in (docs/tp.md 10.1): unless R4DX_TP2GPU is exactly "1" it prints SKIP and exits 77; with
 // fewer than two visible HIP devices it exits 77; SKIP 77 without the container; then the per-device
 // free-VRAM pre-flight (exit 1). `tests\run_tests.ps1 -TwoGpu` runs it (HIP_VISIBLE_DEVICES unset:
@@ -42,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -56,6 +68,10 @@
 #include "test_common.h"
 #include "tp_model.h"
 
+#ifndef R4DX_TP_TESTING
+#error "test_tp_real_vs_emulation needs the R4DX_TP_TESTING hooks: link r4dx_model_tptest (src/model/CMakeLists.txt)"
+#endif
+
 namespace {
 
 using r4dx::model::Model;
@@ -69,6 +85,10 @@ const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b
 constexpr int64_t kLayers = 4;
 constexpr int kRows = 16;
 constexpr double kNeedGiB = 8.0;  // both emulated ranks sit on one device (~3.5 GiB each)
+// The DFlash2 case on the production pair: emulate puts both v6 w4a16 ranks and both drafters on one
+// device (22.91 GiB used at --max-ctx 2048, Appendix B N73); a real rank needs about half.
+constexpr double kNeedGiBDflashEmulate = 24.0;
+constexpr double kNeedGiBDflashRank = 13.0;
 
 int g_failures = 0;
 
@@ -293,19 +313,21 @@ void FaultCycle(TpModel& m, const ScriptOut& fresh, int kind) {
 }
 
 // On a helper thread (the main thread is the TpModel facade): "" or the pre-flight failure.
-std::string Preflight(int* visible_out) {
+// need_gib(d): the free GiB HIP ordinal d must have.
+std::string Preflight(int* visible_out, const std::function<double(int)>& need_gib) {
   std::string msg;
   int visible = 0;
   std::thread t([&] {
     if (hipGetDeviceCount(&visible) != hipSuccess) visible = 0;
     for (int d = 0; d < visible && msg.empty(); ++d) {
       size_t free_b = 0, total_b = 0;
+      const double need = need_gib(d);
       if (hipSetDevice(d) != hipSuccess || hipMemGetInfo(&free_b, &total_b) != hipSuccess) {
         msg = "cannot query HIP device " + std::to_string(d);
-      } else if (static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0) < kNeedGiB) {
+      } else if (static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0) < need) {
         char b[200];
         std::snprintf(b, sizeof b, "need %.1f GiB free on HIP device %d, have %.2f GiB -- is the production server running?",
-                      kNeedGiB, d, static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0));
+                      need, d, static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0));
         msg = b;
       }
     }
@@ -316,6 +338,129 @@ std::string Preflight(int* visible_out) {
   return msg;
 }
 
+// ---- P5: the speculative rounds, emulate vs real (docs/tp.md 10.1) -------------------------------
+
+enum class Drafter { kMtp, kDflash };
+
+struct SpecOut {
+  std::vector<std::vector<int32_t>> greedy_rounds, sampled_rounds;
+  std::vector<int64_t> walks;                 // DFlash: every round's walk_len, greedy then sampled
+  std::vector<int32_t> drafts;                // MTP: every round's merged drafts, concatenated
+  std::vector<int32_t> cand;                  // DFlash: every round's merged top-16 ids ...
+  std::vector<float> unary;                   // ... and values, concatenated
+  std::mt19937_64 rng_after;
+  std::vector<float> greedy_tail, sampled_tail;  // DecodeStep logits after each script
+};
+
+// Rank 0's drafter capture of the round that just ran (the ranks' copies are compared by the
+// facade's H2 fingerprint and by test_tp_emulation; here it is the real-vs-emulate evidence).
+void CaptureDrafter(TpModel& m, Drafter drafter, SpecOut* o) {
+  auto cap = std::make_shared<std::array<std::pair<std::vector<int32_t>, std::vector<float>>, 2>>();
+  m.RunCollectiveForTest([cap, drafter](Model& mm, int rank) {
+    auto& c = (*cap)[static_cast<size_t>(rank)];
+    if (drafter == Drafter::kMtp) {
+      std::vector<float> rows;
+      mm.MtpDebugLastDraft(&rows, &c.first);
+    } else {
+      mm.DflashDebugLastTop16(&c.first, &c.second);
+    }
+  });
+  const auto& c = (*cap)[0];
+  if (drafter == Drafter::kMtp) {
+    o->drafts.insert(o->drafts.end(), c.first.begin(), c.first.end());
+  } else {
+    o->cand.insert(o->cand.end(), c.first.begin(), c.first.end());
+    o->unary.insert(o->unary.end(), c.second.begin(), c.second.end());
+  }
+}
+
+SpecOut RunSpecScript(TpModel& m, Drafter drafter, int64_t k, const std::vector<int32_t>& prompt) {
+  constexpr int kRounds = 8;
+  const int64_t V = m.Config().vocab_size;
+  SpecOut o;
+  const auto round = [&](int32_t tok, const kernels::SampleParams* sp, std::mt19937_64* rng) {
+    int64_t walk = -1;
+    std::vector<int32_t> r;
+    if (drafter == Drafter::kMtp) {
+      r = sp == nullptr ? m.DecodeStepMtpGreedy(tok, k) : m.DecodeStepMtpSampled(tok, k, *sp, *rng);
+    } else {
+      r = sp == nullptr ? m.DecodeStepDflashGreedy(tok, k, 0.0f, 0, &walk)
+                        : m.DecodeStepDflashSampled(tok, k, 0.0f, 0, *sp, *rng, &walk);
+      o.walks.push_back(walk);
+    }
+    CaptureDrafter(m, drafter, &o);
+    return r;
+  };
+  if (drafter == Drafter::kMtp) m.RunCollectiveForTest([](Model& mm, int) { mm.MtpDebugSetCapture(true); });
+  // greedy
+  m.Reset();
+  int32_t t = kernels::Argmax(m.Prefill(prompt).data(), V);
+  for (int i = 0; i < kRounds; ++i) {
+    o.greedy_rounds.push_back(round(t, nullptr, nullptr));
+    t = o.greedy_rounds.back().back();
+  }
+  o.greedy_tail = m.DecodeStep(t);
+  // seeded sampled
+  kernels::SampleParams sp;
+  sp.temperature = 0.7f;
+  sp.top_k = 20;
+  sp.top_p = 0.8f;
+  std::mt19937_64 rng = kernels::MakeRng(1);
+  m.Reset();
+  const std::vector<float> lg = m.Prefill(prompt);
+  int32_t s = kernels::Sample(lg.data(), V, sp, rng);
+  for (int i = 0; i < kRounds; ++i) {
+    o.sampled_rounds.push_back(round(s, &sp, &rng));
+    s = o.sampled_rounds.back().back();
+  }
+  o.rng_after = rng;
+  o.sampled_tail = m.DecodeStep(s);
+  if (drafter == Drafter::kMtp) m.RunCollectiveForTest([](Model& mm, int) { mm.MtpDebugSetCapture(false); });
+  return o;
+}
+
+int CompareSpec(const SpecOut& a, const SpecOut& b, const std::string& label) {
+  int diffs = 0;
+  const auto part = [&](bool same, const char* what) {
+    if (!same) {
+      std::fprintf(stderr, "[%s] %s differ\n", label.c_str(), what);
+      ++diffs;
+    }
+  };
+  part(a.greedy_rounds == b.greedy_rounds, "greedy rounds");
+  part(a.sampled_rounds == b.sampled_rounds, "sampled rounds");
+  part(a.walks == b.walks, "walk lengths");
+  part(a.drafts == b.drafts, "merged MTP drafts (H6)");
+  part(a.cand == b.cand && SameFloats(a.unary, b.unary), "merged top-16s (H7)");
+  part(a.rng_after == b.rng_after, "rng states after the sampled rounds");
+  part(SameFloats(a.greedy_tail, b.greedy_tail), "logits after the greedy rounds");
+  part(SameFloats(a.sampled_tail, b.sampled_tail), "logits after the sampled rounds");
+  size_t tokens = 0, rounds = a.greedy_rounds.size() + a.sampled_rounds.size();
+  for (const auto& r : a.greedy_rounds) tokens += r.size();
+  for (const auto& r : a.sampled_rounds) tokens += r.size();
+  std::printf("[%s] %s (%zu rounds, %zu tokens)\n", label.c_str(), diffs == 0 ? "byte-identical (8/8 parts)" : "DIFFERENT",
+              rounds, tokens);
+  return diffs;
+}
+
+void SpecRealVsEmulation(const char* name, const ModelOptions& opts, Drafter drafter, int64_t k,
+                         const std::vector<int32_t>& prompt) {
+  SpecOut emu, real;
+  {
+    std::unique_ptr<TpModel> m = TpModel::Load(opts, Options(TpOptions::Mode::kEmulate, 32, 1));
+    emu = RunSpecScript(*m, drafter, k, prompt);
+    CHECK(m->GetState() == TpModel::State::kReady, "[%s] emulated group not ready", name);
+  }
+  {
+    std::unique_ptr<TpModel> m = TpModel::Load(opts, Options(TpOptions::Mode::kReal, 32, 1));
+    real = RunSpecScript(*m, drafter, k, prompt);
+    CHECK(m->GetState() == TpModel::State::kReady, "[%s] real group not ready", name);
+  }
+  CHECK(CompareSpec(emu, real, std::string(name) + ": emulate vs real (submit 32/1)") == 0,
+        "[%s] real two-GPU speculative rounds differ from emulation", name);
+  CheckNoCollectiveAllocs(name);
+}
+
 int RunTest() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep stdout in order with the facade's stderr lines
   if (GetEnv("R4DX_TP2GPU") != "1") {
@@ -324,7 +469,7 @@ int RunTest() {
   }
   if (!r4dx_test::FileExists(kContainerPath)) return r4dx_test::SkipMissing(kContainerPath);
   int visible = 0;
-  const std::string pre = Preflight(&visible);
+  const std::string pre = Preflight(&visible, [](int) { return kNeedGiB; });
   if (visible < 2) {
     std::printf("SKIP: two-GPU test needs two visible HIP devices, HIP_VISIBLE_DEVICES exposes %d\n", visible);
     return 77;
@@ -357,6 +502,44 @@ int RunTest() {
             "[%s] the submission bounding changed the results", layout);
     }
     CheckNoCollectiveAllocs(layout);
+  }
+
+  // P5: MTP on the 4-layer container, DFlash2 on the production pair.
+  {
+    std::printf("==== MTP K=3 (l4-allmtp w4a16) ====\n");
+    ModelOptions o = BaseOptions("w4a16");
+    o.dflash_draft_k = 0;
+    o.mtp_draft_k = 3;
+    SpecRealVsEmulation("mtp", o, Drafter::kMtp, 3, Tokens(40, 11));
+  }
+  {
+    const char* target = r4dx_test::ProductionTargetPath();
+    const char* drafter = r4dx_test::ProductionDrafterPath();
+    if (!r4dx_test::FileExists(target) || !r4dx_test::FileExists(drafter)) {
+      std::printf("SKIP (not a failure): %s or %s missing -- no DFlash2 case\n", target, drafter);
+    } else {
+      std::printf("==== DFlash2 k=7 (v6 w4a16 + drafter) ====\n");
+      // The emulate pass holds both ranks (drafters included) on the last visible ordinal, HIP
+      // device 1; the real pass one rank per device.
+      int vis = 0;
+      const std::string pre_dflash =
+          Preflight(&vis, [visible](int d) { return d == visible - 1 ? kNeedGiBDflashEmulate : kNeedGiBDflashRank; });
+      if (!pre_dflash.empty()) {
+        std::fprintf(stderr, "test_tp_real_vs_emulation: DFlash2 case: %s\n", pre_dflash.c_str());
+        return 1;
+      }
+      ModelOptions o;
+      o.container_path = target;
+      o.layout = r4dx::model::Layout::kW4a16;
+      o.max_ctx = 1024;
+      o.vision = ModelOptions::VisionMode::kOff;
+      o.dflash_container = drafter;
+      o.dflash_draft_k = 7;
+      std::vector<int32_t> prompt;
+      const std::vector<int32_t> unit = Tokens(24, 5);
+      for (int c = 0; c < 3; ++c) prompt.insert(prompt.end(), unit.begin(), unit.end());  // repeated: drafts accept
+      SpecRealVsEmulation("dflash", o, Drafter::kDflash, 7, prompt);
+    }
   }
   if (g_failures != 0) {
     std::fprintf(stderr, "test_tp_real_vs_emulation: %d check(s) failed\n", g_failures);

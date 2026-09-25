@@ -101,6 +101,14 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
   Engine& engine_ref = impl_->engine;
 
   svr.Get("/health", [&engine_ref](const httplib::Request&, httplib::Response& res) {
+    // `--tp 2` after the TP group went kFatal (docs/tp.md 2.4): every request answers 500 until the
+    // process is restarted, so the health check says so instead of "ok" (Engine::TpFatal).
+    if (engine_ref.TpFatal()) {
+      res.status = 503;
+      nlohmann::json body = {{"status", "tp_fatal"}, {"model", engine_ref.ModelId()}};
+      res.set_content(body.dump(), "application/json");
+      return;
+    }
     nlohmann::json body = {{"status", "ok"}, {"model", engine_ref.ModelId()}};
     res.set_content(body.dump(), "application/json");
   });

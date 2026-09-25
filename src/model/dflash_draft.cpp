@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -13,8 +14,10 @@
 #include "linear.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/embedding.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "tp/tp_vocab.h"  // tp::MergeTop16 (docs/tp.md 7.2, 8.2 H7)
 
 namespace r4dx::model {
 
@@ -159,7 +162,18 @@ QuantLinear LoadQuantLinear(const DflashDraftWeights& w, const std::string& base
 
 int64_t AlignUp(int64_t v, int64_t a) { return (v + a - 1) / a * a; }
 
+std::shared_ptr<const DflashHostCodebooks> ReadHostCodebooks(const DflashDraftWeights& w) {
+  auto books = std::make_shared<DflashHostCodebooks>();
+  books->predecessor = ReadHostBf16(w, "dflash.selector.predecessor");
+  books->successor = ReadHostBf16(w, "dflash.selector.successor");
+  return books;
+}
+
 }  // namespace
+
+std::shared_ptr<const DflashHostCodebooks> DflashDraft::LoadHostCodebooks(const std::string& container_path) {
+  return ReadHostCodebooks(DflashDraftWeights::Open(container_path));
+}
 
 DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   DflashDraft d;
@@ -167,6 +181,8 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   d.cfg_ = w.Config();
   d.layout_ = opts.layout;
   d.max_inject_rows_ = opts.max_inject_rows;
+  d.comm_ = opts.comm;
+  d.vocab_offset_ = opts.vocab_offset;
 
   const Dflash2Config& c = d.cfg_;
   const int64_t hidden = c.hidden_size;
@@ -197,11 +213,21 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   }
 
   d.lm_head_vocab_ = (opts.lm_head_vocab > 0) ? opts.lm_head_vocab : c.vocab_size;
+  // Token ids and the codebooks' rows are GLOBAL; only the lm_head (hence the logits buffer and
+  // the per-rank top-16) is this rank's shard under TP (docs/tp.md 8.2). TP=1: the same number.
+  d.global_vocab_ = (opts.global_vocab > 0) ? opts.global_vocab : d.lm_head_vocab_;
+  if (opts.comm != nullptr ? (d.vocab_offset_ < 0 || d.vocab_offset_ + d.lm_head_vocab_ > d.global_vocab_)
+                           : (d.vocab_offset_ != 0 || d.global_vocab_ != d.lm_head_vocab_)) {
+    throw std::runtime_error("DflashDraft: lm_head rows [" + std::to_string(d.vocab_offset_) + ", +" +
+                             std::to_string(d.lm_head_vocab_) + ") do not fit the vocab " +
+                             std::to_string(d.global_vocab_) +
+                             " (a vocab offset / global vocab needs a tensor-parallel comm)");
+  }
   d.mask_token_id_ =
       (opts.mask_token_id_override >= 0) ? opts.mask_token_id_override : c.mask_token_id;
-  if (d.mask_token_id_ < 0 || d.mask_token_id_ >= d.lm_head_vocab_) {
+  if (d.mask_token_id_ < 0 || d.mask_token_id_ >= d.global_vocab_) {
     throw std::runtime_error("DflashDraft: mask_token_id " + std::to_string(d.mask_token_id_) +
-                             " is outside the lm_head vocab " + std::to_string(d.lm_head_vocab_));
+                             " is outside the lm_head vocab " + std::to_string(d.global_vocab_));
   }
 
   // ---- weights ---------------------------------------------------------------------------------
@@ -209,11 +235,10 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   d.enc_output_norm_ = UploadF32AsBf16(w, "dflash.enc_output_norm");
   d.output_norm_ = UploadF32AsBf16(w, "dflash.output_norm");
   d.selector_hidden_ = LoadQuantLinear(w, "dflash.selector.hidden", opts.layout, rank, hidden);
-  d.selector_predecessor_ = ReadHostBf16(w, "dflash.selector.predecessor");
-  d.selector_successor_ = ReadHostBf16(w, "dflash.selector.successor");
-  if (static_cast<int64_t>(d.selector_predecessor_.size()) < d.lm_head_vocab_ * rank ||
-      static_cast<int64_t>(d.selector_successor_.size()) < d.lm_head_vocab_ * rank) {
-    throw std::runtime_error("DflashDraft: selector codebooks are smaller than lm_head_vocab*rank");
+  d.codebooks_ = opts.shared_codebooks ? opts.shared_codebooks : ReadHostCodebooks(w);
+  if (static_cast<int64_t>(d.codebooks_->predecessor.size()) < d.global_vocab_ * rank ||
+      static_cast<int64_t>(d.codebooks_->successor.size()) < d.global_vocab_ * rank) {
+    throw std::runtime_error("DflashDraft: selector codebooks are smaller than vocab*rank");
   }
 
   d.layers_.resize(static_cast<size_t>(n_layer));
@@ -522,7 +547,7 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
   }
   if (k < 0) k = 0;
   k = std::min<int64_t>(k, B - 1);
-  if (anchor_id < 0 || anchor_id >= lm_head_vocab_) {
+  if (anchor_id < 0 || anchor_id >= global_vocab_) {
     throw std::runtime_error("DflashDraft::DraftRound: anchor_id out of vocab range");
   }
   if (n_injected_ + B > cfg_.context_length) {
@@ -592,9 +617,17 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
     R4DX_HIP_CHECK(hipEventDestroy(ev1));
   }
 
-  const auto* unary = reinterpret_cast<const float*>(sel_stage_host_.data() + sel_off_unary_);
-  const auto* cand = reinterpret_cast<const int32_t*>(sel_stage_host_.data() + sel_off_cand_);
+  const float* unary = reinterpret_cast<const float*>(sel_stage_host_.data() + sel_off_unary_);
+  const int32_t* cand = reinterpret_cast<const int32_t*>(sel_stage_host_.data() + sel_off_cand_);
   const auto* gate = reinterpret_cast<const uint16_t*>(sel_stage_host_.data() + sel_off_gate_);
+  if (comm_ != nullptr) {
+    // Tensor parallel, H7 (docs/tp.md 8.2): the kernel top-16'd this rank's vocab shard only; the
+    // merged lists are the full row's top-16 exactly. `gate` comes from the replicated drafter
+    // output and is already identical on every rank.
+    MergeTop16AcrossRanks();
+    cand = merged_cand_.data();
+    unary = merged_unary_.data();
+  }
 
   if (trace != nullptr) {
     trace->x_final_normed = xf_.CopyToHost();
@@ -610,6 +643,60 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
 
   return SelectorWalk(anchor_id, k, p_min, n_min, cand, unary, gate, trace);
 }
+
+void DflashDraft::MergeTop16AcrossRanks() {
+  // Every rank's round is identical up to the lm_head (replicated drafter, replicated features),
+  // and each rank's top-16 is sorted under r4dx_topk16_f32's total order "(v, i) beats (v', i') iff
+  // v > v' || (v == v' && i < i')". With the ids made global (rank r's are all below rank r+1's),
+  // every member of the full row's top-16 is in its own shard's top-16, so the rank-order merge
+  // under the same order IS the full row's top-16, values bit for bit (tp_vocab.h).
+  constexpr int64_t kTop = 16;  // selector_top_k, checked at Load
+  const int64_t B = cfg_.block_size;
+  const int world = comm_->World();
+  const size_t n = static_cast<size_t>(B * kTop);
+  static_assert(sizeof(float) == sizeof(int32_t), "unary and cand slots are 4 bytes each");
+  auto* cand = reinterpret_cast<int32_t*>(sel_stage_host_.data() + sel_off_cand_);
+  const int32_t offset = static_cast<int32_t>(vocab_offset_);
+  // Local -> global id, in the staging blob -- except r4dx_topk16_f32's (-inf, INT32_MAX) sentinel
+  // (a shard row with fewer than 16 non-NaN values): moved, it would overflow and then beat a real
+  // -inf in the merge. Left alone, the merge equals the full-row kernel's output, sentinels included.
+  for (size_t i = 0; i < n; ++i) {
+    if (cand[i] != INT32_MAX) cand[i] += offset;
+  }
+  // One rendezvous per round: this rank's [unary | cand] prefix of the staging blob (1 KiB at
+  // B = 8), exactly as the D2H left it -- unary at offset 0 (sel_off_unary_), cand at sel_off_cand_.
+  const size_t per_rank = static_cast<size_t>(sel_off_cand_) + n * sizeof(int32_t);
+  top16_gather_.resize(per_rank * static_cast<size_t>(world));
+  comm_->HostAllGather(sel_stage_host_.data(), per_rank, top16_gather_.data());
+  top16_ids_all_.resize(n * static_cast<size_t>(world));
+  top16_vals_all_.resize(n * static_cast<size_t>(world));
+  for (int r = 0; r < world; ++r) {
+    const uint8_t* src = top16_gather_.data() + static_cast<size_t>(r) * per_rank;
+    std::memcpy(top16_vals_all_.data() + static_cast<size_t>(r) * n, src + sel_off_unary_,
+                n * sizeof(float));
+    std::memcpy(top16_ids_all_.data() + static_cast<size_t>(r) * n, src + sel_off_cand_,
+                n * sizeof(int32_t));
+  }
+  merged_cand_.resize(n);
+  merged_unary_.resize(n);
+  tp::MergeTop16(top16_ids_all_.data(), top16_vals_all_.data(), world, static_cast<int>(B),
+                 merged_cand_.data(), merged_unary_.data());
+}
+
+#ifdef R4DX_TP_TESTING
+void DflashDraft::DebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const {
+  const size_t n = static_cast<size_t>(cfg_.block_size * cfg_.selector_top_k);
+  if (comm_ != nullptr) {
+    cand->assign(merged_cand_.begin(), merged_cand_.end());
+    unary->assign(merged_unary_.begin(), merged_unary_.end());
+    return;
+  }
+  const auto* c = reinterpret_cast<const int32_t*>(sel_stage_host_.data() + sel_off_cand_);
+  const auto* u = reinterpret_cast<const float*>(sel_stage_host_.data() + sel_off_unary_);
+  cand->assign(c, c + n);
+  unary->assign(u, u + n);
+}
+#endif
 
 DflashDraftResult DflashDraft::SelectorWalk(int32_t anchor_id, int64_t k, float p_min,
                                             int64_t n_min, const int32_t* cand, const float* unary,
@@ -646,12 +733,12 @@ DflashDraftResult DflashDraft::SelectorWalk(int32_t anchor_id, int64_t k, float 
       std::vector<float>& mat = trace->score[static_cast<size_t>(t - 1)];
       mat.assign(static_cast<size_t>(P.size()) * static_cast<size_t>(topk), 0.0f);
       for (size_t a = 0; a < P.size(); ++a) {
-        const uint16_t* pred_a = SelectorRow(selector_predecessor_, P[a]);
+        const uint16_t* pred_a = SelectorRow(codebooks_->predecessor, P[a]);
         for (int64_t r = 0; r < rank; ++r) {
           cond[static_cast<size_t>(r)] = core::Bf16ToFloat(pred_a[r]) * core::Bf16ToFloat(gate_t[r]);
         }
         for (int64_t b = 0; b < topk; ++b) {
-          const uint16_t* succ_b = SelectorRow(selector_successor_, cand_t[b]);
+          const uint16_t* succ_b = SelectorRow(codebooks_->successor, cand_t[b]);
           float acc = 0.0f;
           for (int64_t r = 0; r < rank; ++r) {
             acc += cond[static_cast<size_t>(r)] * core::Bf16ToFloat(succ_b[r]);
@@ -664,12 +751,12 @@ DflashDraftResult DflashDraft::SelectorWalk(int32_t anchor_id, int64_t k, float 
             mat[static_cast<size_t>(pred_idx) * static_cast<size_t>(topk) + static_cast<size_t>(b)];
       }
     } else {
-      const uint16_t* pred_a = SelectorRow(selector_predecessor_, P[static_cast<size_t>(pred_idx)]);
+      const uint16_t* pred_a = SelectorRow(codebooks_->predecessor, P[static_cast<size_t>(pred_idx)]);
       for (int64_t r = 0; r < rank; ++r) {
         cond[static_cast<size_t>(r)] = core::Bf16ToFloat(pred_a[r]) * core::Bf16ToFloat(gate_t[r]);
       }
       for (int64_t b = 0; b < topk; ++b) {
-        const uint16_t* succ_b = SelectorRow(selector_successor_, cand_t[b]);
+        const uint16_t* succ_b = SelectorRow(codebooks_->successor, cand_t[b]);
         float acc = 0.0f;
         for (int64_t r = 0; r < rank; ++r) {
           acc += cond[static_cast<size_t>(r)] * core::Bf16ToFloat(succ_b[r]);

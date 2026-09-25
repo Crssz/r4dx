@@ -17,6 +17,11 @@ namespace r4dx::cli {
 // src/server/server_args.h (kept in sync manually -- these two headers are already a deliberate,
 // documented duplication of every other --mtp* flag's parsing/validation, not a new pattern).
 inline constexpr int64_t kMaxMtpDraftK = 63;
+// Under --tp 2 the ceiling is 7 (docs/tp.md Appendix B N80): a verify window is never split into
+// the device-0 submission units a prefill chunk is (src/model/tp/tp_submit.h's kMaxUnsplitDraftK,
+// which TpModel::Load enforces too), so it must stay decode-sized -- at most 8 rows, DFlash2's
+// block. Same duplication as kMaxMtpDraftK (src/server/server_args.h).
+inline constexpr int64_t kMaxMtpDraftKTp = 7;
 
 struct CliArgs {
   std::string model_path;
@@ -422,15 +427,16 @@ inline CliArgs ParseArgs(int argc, char** argv) {
         (tp_inflight_given && (a.tp_max_inflight < 0 || a.tp_max_inflight > 64))) {
       throw CliUsageError("--tp-submit-layers and --tp-max-inflight must be in [0, 64]");
     }
-    // Permanent in v1 (docs/tp.md 1.2): profiling under tensor parallelism.
+    if (a.mtp > kMaxMtpDraftKTp) {
+      throw CliUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftKTp) +
+                           "] with --tp 2 (a verify window is not split into device-0 submission units, "
+                           "so it stays at most 8 rows; docs/tp.md Appendix B N80)");
+    }
+    // Permanent in v1 (docs/tp.md 1.2): profiling under tensor parallelism. (--mtp, --dflash,
+    // --vision on and --image run under --tp 2 as of docs/tp.md P5.)
     if (a.profile || a.profile_prefill) {
       throw CliUsageError("--profile/--profile-prefill are not supported with --tp 2 (docs/tp.md 1.2)");
     }
-    // Staged rejections (docs/tp.md 9.1) -- each is removed by the phase that implements it.
-    if (a.mtp > 0) throw CliUsageError("--mtp is not supported with --tp 2 yet (docs/tp.md P5)");
-    if (!a.dflash.empty()) throw CliUsageError("--dflash is not supported with --tp 2 yet (docs/tp.md P5)");
-    if (a.vision == "on") throw CliUsageError("--vision on is not supported with --tp 2 yet (docs/tp.md P5)");
-    if (!a.image_paths.empty()) throw CliUsageError("--image is not supported with --tp 2 yet (docs/tp.md P5)");
   }
   return a;
 }

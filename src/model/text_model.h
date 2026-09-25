@@ -55,14 +55,16 @@ struct TpOptions {
   // the unit shrinks to 16, 8 and 4 layers (tp::UnitLayersForContext), because attention makes the
   // chunk longer there. K = 1 synchronizes instead of recording events, which would slow every
   // later dispatch on the stream (N56), and is the only K that leaves the GPU idle at each unit.
-  // Finer units cost more at 2k (N57's table). Decode steps are not split.
+  // Finer units cost more at 2k (N57's table). Decode steps and verify windows are not split, which
+  // is why TpModel::Load caps --mtp at 7 (windows of at most 8 rows, N80).
   int submit_layers = 32;
   int max_inflight_units = 1;
-  // Test-only fault injection. Set by tests directly (and, from docs/tp.md P5, by TpModel::Load from
-  // the environment variable R4DX_TP_FAULT="<rank>:<n>:<kind>"). Fires ONCE, at the n-th
-  // AllReduceSumBf16 of `rank` counted from the END of warm-up. kind 0: the endpoint throws
-  // std::runtime_error("tp fault injection"); kind 1: it sleeps 700 ms before enqueuing (the peer's
-  // all-reduce times out). Logged loudly when armed.
+  // Test-only fault injection. Set by tests directly, or by TpModel::Load from the environment
+  // variable R4DX_TP_FAULT="<rank>:<n>:<kind>" (e.g. 1:3000:1; used only when these fields are left
+  // unset, refused by name when malformed, ignored at --tp 1) so tools/server/smoke.ps1 can drive
+  // the production binaries. Fires ONCE, at the n-th AllReduceSumBf16 of `rank` counted from the
+  // END of warm-up. kind 0: the endpoint throws std::runtime_error("tp fault injection"); kind 1:
+  // it sleeps 700 ms before enqueuing (the peer's all-reduce times out). Logged loudly when armed.
   int fault_rank = -1;
   int64_t fault_at_allreduce = -1;
   int fault_kind = 0;
@@ -104,7 +106,8 @@ class TextModel {
 
   // ---- vision ---------------------------------------------------------------------------------
   // Model::EncodeImages, with the merged rows written to `out` (device rows at TP=1; host rows
-  // under TP, docs/tp.md 8.3) and out->rows() set.
+  // under TP, docs/tp.md 8.3) and out->rows() set. A span built from them carries
+  // ImageSpan::embeds_on_host = out->on_host().
   virtual void EncodeImages(const float* pixel_values, int64_t total_patches,
                             const std::vector<vision::GridThw>& grids, ImageRows* out,
                             vision::VisionEncodeStats* stats = nullptr) = 0;

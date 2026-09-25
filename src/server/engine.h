@@ -1,13 +1,21 @@
-// r4dx::server::Engine -- owns the single Model/Tokenizer/ChatTemplate instance on HIP device 1
-// and the one worker thread that ever calls into it (task point 2: "single-model, single-GPU, one
-// request at a time: a request queue with a worker thread that owns the Model"). HTTP handler
-// threads (http_server.cpp) only ever call Submit()/ModelId()/etc -- never touch r4dx::model::
-// Model directly, so there is exactly one call path into the GPU.
+// r4dx::server::Engine -- owns the single model/Tokenizer/ChatTemplate instance and the one worker
+// thread that ever calls into it (task point 2: "single-model, single-GPU, one request at a time: a
+// request queue with a worker thread that owns the Model"). HTTP handler threads (http_server.cpp)
+// only ever call Submit()/ModelId()/etc -- never touch the model directly, so there is exactly one
+// call path into the GPU.
+//
+// The model is an r4dx::model::TextModel (docs/tp.md 2.8): at `--tp 1` a LocalTextModel -- one
+// Model on HIP device 1, every call a one-line forward, byte for byte the pre-TP server -- and at
+// `--tp 2` a TpModel, whose rank threads own one device each (docs/tp.md 2.1). Under TP neither the
+// worker thread nor any HTTP thread makes a HIP call; a failed request leaves the group in
+// kNeedsRecovery and the next request's Reset() recovers it (docs/tp.md 2.4, 8.4).
 //
 // This header (unlike request_queue.h/openai_types.h/response_sink.h) pulls in r4dx::model::Model
 // and is therefore HIP-dependent -- it is not linked into tests/server's CPU-only unit tests, only
 // into the r4dx-server executable (see src/server/CMakeLists.txt) and exercised end to end by
-// tools/server/smoke.ps1 instead.
+// tools/server/smoke.ps1 instead. The one exception is tests/server/test_engine_recovery.cpp, which
+// links what r4dx-server links but runs RunRequest against a CPU fake model (EngineOptions::
+// model_loader), with no GPU work.
 #pragma once
 
 #include <atomic>
@@ -19,18 +27,31 @@
 #include <vector>
 
 #include "chat_template.h"
-#include "model.h"
+#include "model.h"  // ModelOptions
 #include "openai_types.h"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
 #include "prefix_state.h"
 #include "request_queue.h"
 #include "response_sink.h"
+#include "text_model.h"  // r4dx::model::TextModel / TpOptions (docs/tp.md 2.8)
 #include "tokenizer.h"
+
+namespace r4dx::model {
+class TpModel;
+}
 
 namespace r4dx::server {
 
 struct EngineOptions {
   r4dx::model::ModelOptions model_opts;
+  // The --tp* flags (docs/tp.md 9.1), filled by main.cpp exactly as r4dx-cli fills its own:
+  // world 1 (the default) is the single-device server; world 2 loads a TpModel.
+  r4dx::model::TpOptions tp;
+  // How LoadAndStart builds the model. Empty (always, in r4dx-server) = r4dx::model::LoadTextModel.
+  // tests/server/test_engine_recovery.cpp substitutes a CPU fake to drive RunRequest's error path.
+  std::function<std::unique_ptr<r4dx::model::TextModel>(const r4dx::model::ModelOptions&,
+                                                        const r4dx::model::TpOptions&)>
+      model_loader;
   std::string tokenizer_dir;
   int64_t max_tokens_default = 128;
   int max_queue = 16;
@@ -90,11 +111,12 @@ class Engine {
   Engine(const Engine&) = delete;
   Engine& operator=(const Engine&) = delete;
 
-  // Loads the tokenizer/chat-template/model (HIP device 1, per the project's GPU rule -- this
-  // process does not call hipSetDevice itself, same as r4dx-cli; the caller's environment must
-  // already have HIP_VISIBLE_DEVICES=1 set) and starts the worker thread. Throws on failure --
-  // call before the HTTP server starts listening, so a bad --model/--tokenizer-dir fails fast
-  // instead of accepting connections it can never serve.
+  // Loads the tokenizer/chat-template/model and starts the worker thread. `--tp 1`: HIP device 1,
+  // per the project's GPU rule -- this process does not call hipSetDevice itself, same as r4dx-cli;
+  // the caller's environment must already have HIP_VISIBLE_DEVICES=1 set. `--tp 2`: the TpModel's
+  // rank threads pick their devices (docs/tp.md 9.2; real mode needs HIP_VISIBLE_DEVICES unset).
+  // Throws on failure -- call before the HTTP server starts listening, so a bad --model/
+  // --tokenizer-dir fails fast instead of accepting connections it can never serve.
   void LoadAndStart();
 
   const std::string& ModelId() const { return model_id_; }
@@ -111,8 +133,14 @@ class Engine {
   // policy") -- read by http_server.cpp for /v1/models' `architecture.input_modalities`/
   // `capabilities` and by RunRequest itself for the "this model/container has no vision tower"
   // 400. Safe to call from any thread once LoadAndStart() has returned: model_ is never
-  // reassigned to a different Model after that (Model::Reset() reuses the same object in place).
+  // reassigned to a different model after that (Reset() reuses the same object in place), and
+  // TextModel::HasVision is a value cached at load under TP (docs/tp.md 2.4's host-only table).
   bool HasVision() const { return model_ && model_->HasVision(); }
+  // True once a `--tp 2` request has left the TP group kFatal (its recovery failed, or a rank got
+  // stuck inside a HIP call): every later request answers 500 until the process is restarted, so
+  // http_server.cpp's /health reports it (503) instead of "ok" (docs/tp.md 2.4, R13; Appendix B N80).
+  // Set only by the worker thread; any thread may read it. Always false at `--tp 1`.
+  bool TpFatal() const { return tp_fatal_.load(std::memory_order_acquire); }
 
   // Enqueues `req` for the worker thread. Returns false (queue already at --max-queue) if the
   // caller should answer 429 instead.
@@ -163,7 +191,11 @@ class Engine {
 
   std::unique_ptr<r4dx::Tokenizer> tok_;
   std::unique_ptr<r4dx::ChatTemplate> tmpl_;
-  std::unique_ptr<r4dx::model::Model> model_;
+  std::unique_ptr<r4dx::model::TextModel> model_;
+  // model_ itself when it is a TpModel (`--tp 2`), else null: the TP diagnostics (the group state
+  // around a recovery, the `--log-level debug` stats line) are not part of TextModel (docs/tp.md
+  // 2.8), the same reason r4dx-cli reaches the facade through a dynamic_cast.
+  r4dx::model::TpModel* tp_model_ = nullptr;
 
   // Image preprocessing policy, built once in LoadAndStart from EngineOptions::image_max_pixels
   // (docs/vision.md "Large images"). Read back out through ImagePreprocessing() above, which is
@@ -183,6 +215,9 @@ class Engine {
   BoundedQueue<std::shared_ptr<PendingRequest>> queue_;
   std::thread worker_;
   std::atomic<bool> stop_{false};
+  // TpFatal(): the worker thread's copy of `tp_model_->GetState() == kFatal`, taken after every
+  // failed request -- TpModel's own state is facade-thread-only, so the HTTP threads read this.
+  std::atomic<bool> tp_fatal_{false};
 };
 
 }  // namespace r4dx::server

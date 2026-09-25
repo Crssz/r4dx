@@ -75,15 +75,46 @@ int VisibleDeviceCount() {
   return n;
 }
 
-// The process's HIP_VISIBLE_DEVICES, or "" (a CRT call, not HIP). _dupenv_s: getenv is deprecated
+// An environment variable's value, or "" (a CRT call, not HIP). _dupenv_s: getenv is deprecated
 // under the MSVC CRT.
-std::string HipVisibleDevices() {
+std::string GetEnvVar(const char* name) {
   char* v = nullptr;
   size_t len = 0;
   std::string out;
-  if (_dupenv_s(&v, &len, "HIP_VISIBLE_DEVICES") == 0 && v != nullptr) out = v;
+  if (_dupenv_s(&v, &len, name) == 0 && v != nullptr) out = v;
   std::free(v);
   return out;
+}
+
+std::string HipVisibleDevices() { return GetEnvVar("HIP_VISIBLE_DEVICES"); }
+
+// R4DX_TP_FAULT="<rank>:<n>:<kind>" (docs/tp.md 9.1, TpOptions::fault_*): test-only fault injection
+// for the production binaries (tools/server/smoke.ps1 -TpFault). Three decimal integers separated
+// by ':' -- anything else is refused by name rather than ignored, so a typo cannot silently run a
+// fault-free "fault" test. The values themselves are validated with TpOptions' own rules.
+void ParseTpFaultEnv(const std::string& value, TpOptions* tp) {
+  const auto malformed = [&value] {
+    return std::invalid_argument("TpModel::Load: R4DX_TP_FAULT must be \"<rank>:<n>:<kind>\" (three non-negative "
+                                 "integers, e.g. 1:3000:1), got \"" + value + "\"");
+  };
+  int64_t field[3] = {0, 0, 0};
+  size_t start = 0;
+  for (int i = 0; i < 3; ++i) {
+    const size_t end = i < 2 ? value.find(':', start) : value.size();
+    if (end == std::string::npos) throw malformed();
+    const std::string item = value.substr(start, end - start);
+    if (item.empty() || item.size() > 12 || item.find_first_not_of("0123456789") != std::string::npos) {
+      throw malformed();
+    }
+    field[i] = std::stoll(item);
+    start = end + 1;
+  }
+  if (field[0] > 1 || field[2] > 1) {
+    throw std::invalid_argument("TpModel::Load: R4DX_TP_FAULT \"" + value + "\": rank and kind must be 0 or 1");
+  }
+  tp->fault_rank = static_cast<int>(field[0]);
+  tp->fault_at_allreduce = field[1];
+  tp->fault_kind = static_cast<int>(field[2]);
 }
 
 struct DeviceProbe {
@@ -98,10 +129,20 @@ struct DeviceProbe {
 
 // ---- load ---------------------------------------------------------------------------------------
 
-std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions& tp) {
-  // 1. Validate (docs/tp.md 2.9 step 1), including the staged rejections -- enforced here and not
-  //    only in the arg parsers, so a test or tool that builds a TpModel directly cannot reach a path
-  //    whose TP hooks are not in yet.
+std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions& tp_arg) {
+  // Test-only fault injection from the environment (docs/tp.md 9.1): R4DX_TP_FAULT arms what a test
+  // would set in TpOptions::fault_*, so tools/server/smoke.ps1 can drive the production binaries. A
+  // fault the caller set directly wins; the variable is then ignored, loudly.
+  TpOptions tp = tp_arg;
+  const std::string fault_env = GetEnvVar("R4DX_TP_FAULT");
+  if (!fault_env.empty()) {
+    if (tp.fault_rank == -1) {
+      ParseTpFaultEnv(fault_env, &tp);
+    } else {
+      std::fprintf(stderr, "[r4dx-tp] R4DX_TP_FAULT=%s ignored: TpOptions already arms a fault\n", fault_env.c_str());
+    }
+  }
+  // 1. Validate (docs/tp.md 2.9 step 1).
   if (tp.world != 2) {
     throw std::invalid_argument("TpModel::Load: TpOptions::world must be 2, got " + std::to_string(tp.world));
   }
@@ -114,26 +155,23 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
                                   "TpRankOptions itself");
     }
   }
-  if (opts.mtp_draft_k > 0) {
-    throw core::TpUnsupportedError("TpModel::Load: MTP (--mtp > 0) is not supported under tensor parallelism yet "
-                                   "(docs/tp.md P5)");
+  // The load-time warm-up (2.9 step 9, Model::TpWarmup) prefills one full 64-token chunk, decodes
+  // one token and, with a drafter, verifies one full-width speculative window. Refuse a smaller
+  // context here, by name, instead of failing inside the warm-up with the KV cache's capacity error
+  // (Appendix B N53).
+  const int64_t warmup_positions = Model::WarmupPositions(opts);
+  if (opts.max_ctx < warmup_positions) {
+    throw std::invalid_argument("TpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +
+                                " under tensor parallelism with these options (the load-time warm-up prefills a "
+                                "64-token chunk, decodes one token and runs one speculative round when --mtp or "
+                                "--dflash is on), got " + std::to_string(opts.max_ctx));
   }
-  if (!opts.dflash_container.empty()) {
-    throw core::TpUnsupportedError("TpModel::Load: DFlash2 (--dflash) is not supported under tensor parallelism "
-                                   "yet (docs/tp.md P5)");
-  }
-  if (opts.vision == ModelOptions::VisionMode::kOn) {
-    throw core::TpUnsupportedError("TpModel::Load: --vision on is not supported under tensor parallelism yet "
-                                   "(docs/tp.md P5)");
-  }
-  // The load-time warm-up (2.9 step 9, Model::TpWarmup) prefills one full 64-token chunk and
-  // decodes one token: 65 positions of KV. Refuse a smaller context here, by name, instead of
-  // failing inside the warm-up with the KV cache's capacity error (Appendix B N53).
-  constexpr int64_t kWarmupPositions = 65;
-  if (opts.max_ctx < kWarmupPositions) {
-    throw std::invalid_argument("TpModel::Load: --max-ctx must be at least " + std::to_string(kWarmupPositions) +
-                                " under tensor parallelism (the load-time warm-up prefills a 64-token chunk and "
-                                "decodes one token), got " + std::to_string(opts.max_ctx));
+  // A verify window is never split into submission units, so it must stay decode-sized (Model::Load
+  // checks the same on every rank; tp_submit.h's kMaxUnsplitDraftK, Appendix B N80).
+  if (opts.mtp_draft_k > tp::kMaxUnsplitDraftK) {
+    throw std::invalid_argument("TpModel::Load: --mtp must be at most " + std::to_string(tp::kMaxUnsplitDraftK) +
+                                " under tensor parallelism (verify windows of at most 8 rows), got " +
+                                std::to_string(opts.mtp_draft_k));
   }
   if (tp.ar_timeout_ms < tp::kArTimeoutMinMs || tp.ar_timeout_ms > tp::kArTimeoutMaxMs) {
     throw std::invalid_argument("TpModel::Load: ar_timeout_ms must be in [10, 1500], got " +
@@ -162,6 +200,11 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
       throw std::invalid_argument("TpModel::Load: fault injection needs a real transport or the emulated one "
                                   "(--tp-mode emulate); NoopComm moves nothing to fault");
     }
+    std::fprintf(stderr,
+                 "[r4dx-tp] *** FAULT INJECTION ARMED%s: rank %d will %s at its all-reduce #%lld after warm-up "
+                 "(test-only) ***\n",
+                 tp.fault_rank == tp_arg.fault_rank ? "" : " (R4DX_TP_FAULT)", tp.fault_rank,
+                 tp.fault_kind == tp::kFaultThrow ? "throw" : "stall 700 ms", static_cast<long long>(tp.fault_at_allreduce));
   }
 
   // Devices (docs/tp.md 9.2): emulate and noop use ONE device, the last visible ordinal by default
@@ -203,10 +246,17 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
                                   std::to_string(visible) + " visible device(s))");
     }
   }
-  if (opts.vision == ModelOptions::VisionMode::kAuto) {
-    std::fprintf(stderr, "[r4dx-tp] --vision auto loads text-only under tensor parallelism until docs/tp.md P5\n");
+  // A stall fault makes the PEER's all-reduce kernel spin until it times out, so real-GPU stalls go
+  // on the rank whose peer is the headless card (Appendix B N61). Said out loud, not refused: a test
+  // may mean it.
+  if (real && tp.fault_rank != -1 && tp.fault_kind == tp::kFaultStall &&
+      devices[static_cast<size_t>(1 - tp.fault_rank)] == 0) {
+    std::fprintf(stderr,
+                 "[r4dx-tp] WARNING: the stall fault on rank %d makes rank %d's all-reduce spin for up to %d ms on HIP "
+                 "device 0 (with HIP_VISIBLE_DEVICES unset, the desktop card, which cannot preempt compute); N61 puts "
+                 "real-GPU stalls on the rank whose peer is headless\n",
+                 tp.fault_rank, 1 - tp.fault_rank, tp.ar_timeout_ms);
   }
-
   // Everything the load commands' rank closures touch is declared BEFORE `m` (Appendix B N53): if a
   // command throws -- including the progress watchdog's TpTimeoutError while a rank is still inside
   // it -- `m` is destroyed first, and ~TpModel waits for every rank to go idle (or ends the process)
@@ -215,11 +265,12 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   std::vector<DeviceProbe> probe(static_cast<size_t>(n_slots));
   std::vector<double> clock_khz(static_cast<size_t>(n_slots), 0.0);
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> embed;
+  std::shared_ptr<const DflashHostCodebooks> codebooks;
   bool resident = opts.embed_device_resident;
   double latency_us = -1.0;
   struct Caps {
     std::string id;
-    int64_t image_token = 0, merge = 2, layers = 0, vocab = 0, hidden = 0;
+    int64_t image_token = 0, merge = 2, patch_dim = 0, layers = 0, vocab = 0, hidden = 0;
     bool vision = false, mtp = false, mtp_reduced = false, dflash = false;
   };
   std::vector<Caps> caps(static_cast<size_t>(n_slots));
@@ -324,9 +375,12 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   }
 
   // 6. The process's ONE pinned host copy of text.embed_tokens (docs/tp.md 2.9 step 6, 5.3), loaded
-  //    on rank 0's thread with hipHostMallocPortable so every device may DMA from it.
+  //    on rank 0's thread with hipHostMallocPortable so every device may DMA from it; and, with
+  //    --dflash, the drafter's two host codebooks (2 x 127 MB of plain host memory), read once on
+  //    this thread -- CPU only, no HIP call -- and shared by both ranks' drafters (8.2).
   m->Run({0}, [&](RankSlot&) { embed = Container::LoadEmbedTokensHost(opts.container_path); }, CmdKind::kPlain,
          kNoStall);
+  if (!opts.dflash_container.empty()) codebooks = DflashDraft::LoadHostCodebooks(opts.dflash_container);
 
   // 5. The embedding device-mirror decision, taken ONCE for every rank (docs/tp.md 2.9 step 5): the
   //    2x-headroom heuristic of the single-device loader, applied per PHYSICAL device against every
@@ -381,6 +435,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
            ro.tp.shared_embed_host = embed;
            ro.tp.embed_device_resident_decided = resident ? 1 : 0;
            ro.tp.vision_weights_on_this_rank = s.rank == 0;
+           ro.tp.dflash_codebooks = codebooks;
            ro.tp.submit_layers = tp.submit_layers;
            ro.tp.max_inflight_units = tp.max_inflight_units;
            s.model.emplace(Model::Load(ro));
@@ -442,6 +497,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
            c.merge = mm.GetContainer().HasVisionConfig()
                          ? static_cast<int64_t>(mm.GetContainer().VisionCfg().spatial_merge_size)
                          : 2;
+           c.patch_dim = mm.GetContainer().HasVisionConfig() ? mm.GetContainer().VisionCfg().PatchDim() : 0;
            c.layers = mm.GetContainer().NumLoadedLayers();
            c.vocab = mm.GlobalConfig().vocab_size;
            c.hidden = mm.GlobalConfig().hidden_size;
@@ -455,15 +511,16 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   m->global_config_ = rank0_global_config;
   for (size_t i = 1; i < caps.size(); ++i) {
     const Caps &a = caps[0], &b = caps[i];
-    if (a.id != b.id || a.image_token != b.image_token || a.merge != b.merge || a.layers != b.layers ||
-        a.vocab != b.vocab || a.hidden != b.hidden || a.mtp != b.mtp || a.mtp_reduced != b.mtp_reduced ||
-        a.dflash != b.dflash) {
+    if (a.id != b.id || a.image_token != b.image_token || a.merge != b.merge || a.patch_dim != b.patch_dim ||
+        a.layers != b.layers || a.vocab != b.vocab || a.hidden != b.hidden || a.mtp != b.mtp ||
+        a.mtp_reduced != b.mtp_reduced || a.dflash != b.dflash) {
       throw core::TpDivergenceError("TpModel::Load: the ranks disagree on the loaded model's identity or capabilities");
     }
   }
   m->model_id_ = caps[0].id;
   m->image_token_id_ = caps[0].image_token;
   m->vision_merge_size_ = caps[0].merge;
+  m->vision_patch_dim_ = caps[0].patch_dim;
   m->has_vision_ = caps[0].vision;
   m->mtp_enabled_ = caps[0].mtp;
   m->mtp_reduced_vocab_ = caps[0].mtp_reduced;
@@ -631,9 +688,10 @@ void TpModel::Run(const std::vector<int>& slots, const std::function<void(RankSl
   std::rethrow_exception(root ? root : first_aborted);
 }
 
-void TpModel::RunGuarded(const std::vector<int>& slots, const std::function<void(RankSlot&)>& body, CmdKind kind) {
+void TpModel::RunGuarded(const std::vector<int>& slots, const std::function<void(RankSlot&)>& body, CmdKind kind,
+                         std::chrono::milliseconds stall) {
   try {
-    Run(slots, body, kind);
+    Run(slots, body, kind, stall);
   } catch (...) {
     if (state_ != State::kFatal) state_ = State::kNeedsRecovery;
     throw;
@@ -685,6 +743,18 @@ void TpModel::RequireRngsEqual(const std::vector<std::mt19937_64>& rngs, const c
 // ---- recovery and sequence state ----------------------------------------------------------------
 
 void TpModel::Recover() {
+  // 2.5 step 1 for the one stream the endpoints do not know: the vision tower's (rank 0 only; no
+  // all-reduce runs on it). An EncodeImages that threw partway may still have an encoder block
+  // queued there. A stream still busy after 30 s fails the recovery (the group becomes kFatal).
+  Run(AllSlots(),
+      [](RankSlot& s) {
+        const hipStream_t vs = s.model.has_value() ? s.model->VisionStream() : nullptr;
+        if (vs != nullptr && !tp::SyncWithWatchdog(vs)) {
+          throw core::TpTimeoutError("tp: rank " + std::to_string(s.rank) +
+                                     "'s vision stream is still busy after 30 s");
+        }
+      },
+      CmdKind::kPlain);
   if (group_ != nullptr) {
     // docs/tp.md 2.5 steps 1-7 through the rank threads (plain commands: the comm is aborted, and
     // every step talks to the endpoint directly). The endpoints know every stream an all-reduce was
@@ -848,11 +918,58 @@ void TpModel::RunCollectiveForTest(const std::function<void(Model&, int)>& fn) {
 
 // ---- vision / profiling -------------------------------------------------------------------------
 
-void TpModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
-                           vision::VisionEncodeStats*) {
+void TpModel::EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
+                           ImageRows* out, vision::VisionEncodeStats* stats) {
   RequireReady();
-  throw core::TpUnsupportedError("TpModel::EncodeImages: vision is not supported under tensor parallelism yet "
-                                 "(docs/tp.md P5)");
+  if (!has_vision_) {
+    throw std::runtime_error("TpModel::EncodeImages: this model has no vision tower (the container carries no "
+                             "vision.* tensors, or it was loaded with --vision off)");
+  }
+  if (total_patches <= 0 || pixel_values == nullptr) {
+    throw std::invalid_argument("TpModel::EncodeImages: needs pixel values for total_patches > 0 patches");
+  }
+  // docs/tp.md 8.3: a SOLO command on rank 0, the only rank that holds the tower (no TpComm; rank 1
+  // stays idle). The merged rows come back to pageable host memory -- ImageRows::host -- which every
+  // rank's PrefillMultimodal then splices with an H2D copy; no device pointer crosses ranks, and
+  // releasing the rows on this thread is not a HIP call. The closure owns everything it reads or
+  // writes (Appendix B N53): the pixels, grids and stats are copied into a heap block it co-owns.
+  struct EncodeState {
+    std::vector<float> pixels;
+    std::vector<vision::GridThw> grids;
+    std::vector<uint16_t> rows;
+    vision::VisionEncodeStats stats;
+    int64_t merged_tokens = 0;
+  };
+  auto st = std::make_shared<EncodeState>();
+  st->pixels.assign(pixel_values, pixel_values + total_patches * vision_patch_dim_);
+  st->grids = grids;
+  int slot = -1;
+  for (const auto& s : ranks_) {
+    if (s->rank == 0) slot = s->index;
+  }
+  if (slot < 0) throw std::logic_error("TpModel::EncodeImages: no rank 0 in this group");
+  // The encode runs no all-reduce, so no heartbeat moves and the progress watchdog times the whole
+  // command: its limit is sized for the command (tp_rank_worker.h's rule), not the forward calls'
+  // 60 s. docs/vision.md measured 0.86 s at 2048x2048 (16384 patches), and attention grows with the
+  // square of the patch count up to the 16 MP ceiling (65536 patches), so a slow but healthy encode
+  // must not be mistaken for a stuck HIP call (which makes the group fatal). The tower's per-block
+  // synchronize (N69) keeps what is queued on the GPU short either way.
+  constexpr std::chrono::milliseconds kEncodeStallLimit{10 * 60 * 1000};
+  RunGuarded({slot},
+             [st, total_patches](RankSlot& s) {
+               core::DeviceBuffer<uint16_t> dev;  // the tower's output, freed on this rank's thread
+               s.model->EncodeImages(st->pixels.data(), total_patches, st->grids, &dev, &st->stats);
+               const int64_t hidden = s.model->Config().hidden_size;
+               const int64_t merged = static_cast<int64_t>(dev.size()) / hidden;
+               st->rows.resize(dev.size());
+               // A plain (blocking) D2H: Encode ended with its own stream synchronize.
+               if (!dev.empty()) dev.CopyToHost(st->rows.data(), dev.size());
+               st->merged_tokens = merged;
+             },
+             CmdKind::kPlain, std::max(stall_limit_, kEncodeStallLimit));
+  out->host = std::move(st->rows);
+  out->SetFilled(/*on_host=*/true, st->merged_tokens);
+  if (stats != nullptr) *stats = st->stats;
 }
 
 StepProfile TpModel::DecodeStepProfiled(int32_t) {
@@ -883,8 +1000,37 @@ std::vector<float> TpModel::Prefill(const std::vector<int32_t>& token_ids) {
 
 std::vector<float> TpModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                               const std::vector<ImageSpan>& images) {
-  std::vector<std::vector<float>> r = RunCollective(
-      [ids = token_ids, spans = images](Model& m, int) { return m.PrefillMultimodal(ids, spans); });
+  // docs/tp.md 8.3: every rank splices the SAME host rows (EncodeImages' ImageRows::host) with an
+  // H2D copy; a device pointer would name memory on one device only, so it is refused before any
+  // command runs. The rows are copied into a heap block the rank closures co-own (Appendix B N53:
+  // a rank still running after a watchdog stall must never read the caller's buffer).
+  const int64_t hidden = global_config_.hidden_size;
+  auto rows = std::make_shared<std::vector<uint16_t>>();
+  size_t total = 0;
+  for (const ImageSpan& sp : images) {
+    if (!sp.embeds_on_host) {
+      throw std::invalid_argument("TpModel::PrefillMultimodal: image rows must be host-resident under tensor "
+                                  "parallelism (ImageSpan::embeds_on_host, from TpModel::EncodeImages)");
+    }
+    if (sp.embeds == nullptr || sp.tokens <= 0) {
+      throw std::invalid_argument("TpModel::PrefillMultimodal: an image span has no rows");
+    }
+    total += static_cast<size_t>(sp.tokens * hidden);
+  }
+  rows->resize(total);
+  std::vector<ImageSpan> spans = images;
+  size_t at = 0;
+  for (ImageSpan& sp : spans) {
+    const size_t n = static_cast<size_t>(sp.tokens * hidden);
+    std::memcpy(rows->data() + at, sp.embeds, n * sizeof(uint16_t));
+    sp.embeds = rows->data() + at;
+    at += n;
+  }
+  std::vector<std::vector<float>> r =
+      RunCollective([ids = token_ids, spans = std::move(spans), rows](Model& m, int) {
+        (void)rows;  // co-owned: `spans` point into it
+        return m.PrefillMultimodal(ids, spans);
+      });
   RequireAllEqual(r, "PrefillMultimodal logits");
   return std::move(r[0]);
 }

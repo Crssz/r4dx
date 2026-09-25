@@ -13,6 +13,8 @@
 #include "reasoning_splitter.h"
 #include "tool_call_parser.h"
 #include "tool_stream_gate.h"
+#include "tp_model.h"  // r4dx::model::TpModel: GetState / StatsLine (tp_model_, engine.h)
+#include "vision_tower.h"  // src/vision: VisionEncodeStats
 
 namespace r4dx::server {
 
@@ -103,8 +105,22 @@ void Engine::LoadAndStart() {
       r4dx::Tokenizer::from_directory(opts_.tokenizer_dir, tok_options));
   tmpl_ = std::make_unique<r4dx::ChatTemplate>(r4dx::ChatTemplate::from_directory(opts_.tokenizer_dir));
 
-  model_ = std::make_unique<r4dx::model::Model>(r4dx::model::Model::Load(opts_.model_opts));
-  model_id_ = model_->GetContainer().ModelId();
+  // docs/tp.md 2.8: --tp 1 is a LocalTextModel (Model::Load, exactly the pre-TP call); --tp 2 a
+  // TpModel.
+  model_ = opts_.model_loader ? opts_.model_loader(opts_.model_opts, opts_.tp)
+                              : r4dx::model::LoadTextModel(opts_.model_opts, opts_.tp);
+  model_id_ = model_->ModelId();
+  tp_model_ = dynamic_cast<r4dx::model::TpModel*>(model_.get());
+  if (tp_model_ != nullptr) {
+    // One line per rank (docs/tp.md 9.1's --stats VRAM lines): which HIP device each rank landed on
+    // is the first thing to check when a --tp 2 server misbehaves.
+    for (const r4dx::model::VramReport& v : model_->Vram()) {
+      std::fprintf(stderr,
+                   "[r4dx-server] tp rank %d (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; "
+                   "this process's buffers %.2f GiB\n",
+                   v.rank, v.device, v.used_gib, v.free_gib, v.total_gib, v.buffers_gib);
+    }
+  }
 
   // The preprocessing config every image attachment will be decoded with (docs/vision.md "Large
   // images"). Built once here, not per request: `--image-max-pixels` is a server-lifetime policy,
@@ -149,11 +165,12 @@ void Engine::RunRequest(PendingRequest& req) {
     // request's messages actually carried an image content part; both stay empty for every
     // text-only request, which is what keeps that path byte-identical to before this stage.
     std::vector<int32_t> full_tokens_i32;
-    std::vector<r4dx::model::Model::ImageSpan> image_spans;  // offsets relative to new_tokens_i32
-    std::vector<r4dx::server::ImageKey> image_keys;          // this request's own fingerprints
-    std::vector<r4dx::core::DeviceBuffer<uint16_t>> image_embeds_owned;  // keeps EncodeImages'
-                                                                          // rows alive until
-                                                                          // PrefillMultimodal runs
+    std::vector<r4dx::model::ImageSpan> image_spans;  // offsets relative to new_tokens_i32
+    std::vector<r4dx::server::ImageKey> image_keys;   // this request's own fingerprints
+    // Keeps EncodeImages' rows alive until PrefillMultimodal runs: device rows at --tp 1, host rows
+    // under TP (r4dx::model::ImageRows, docs/tp.md 2.8/8.3). Moving an ImageRows keeps its data()
+    // pointer (both members move their storage), so the spans below stay valid as this grows.
+    std::vector<r4dx::model::ImageRows> image_embeds_owned;
     int64_t image_encode_count = 0;
     double image_encode_ms_total = 0.0;
     // Every image span this request's (possibly expanded) prompt carries, offset relative to the
@@ -300,9 +317,8 @@ void Engine::RunRequest(PendingRequest& req) {
       // `image_keys`/`pending_image_spans` feed the prefix-reuse decision just below. Untouched
       // (an empty vector, a no-op) for every text-only request, exactly the pre-vision behavior.
       if (!placeholders_in.empty()) {
-        const int32_t image_token_id = static_cast<int32_t>(model_->GetContainer().ImageTokenId());
-        const int merge_size =
-            static_cast<int>(model_->GetContainer().Vision().config.spatial_merge_size);
+        const int32_t image_token_id = static_cast<int32_t>(model_->ImageTokenId());
+        const int merge_size = static_cast<int>(model_->VisionMergeSize());
         r4dx::vision::ExpandedImagePrompt expanded;
         try {
           expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id,
@@ -363,7 +379,9 @@ void Engine::RunRequest(PendingRequest& req) {
     // gap tolerance mechanism it feeds (model.cpp's DflashDraft cold-ring handling) are otherwise
     // unchanged from before this stage. Set before Prefill so the whole request -- prefill chunks
     // and plain decode steps alike -- runs with the right policy, and set on BOTH the prefix-reuse
-    // and the Reset()+reprefill path (this line precedes both).
+    // and the Reset()+reprefill path (this line precedes both). Under TP it is a host-only store on
+    // the facade, legal while the group awaits recovery (docs/tp.md 2.4): it must not throw here,
+    // before the Reset() below that recovers the group after a failed request (8.4).
     if (!opts_.model_opts.dflash_container.empty()) {
       model_->SetDflashInjectionEnabled(use_dflash);
     }
@@ -379,11 +397,17 @@ void Engine::RunRequest(PendingRequest& req) {
     std::vector<int32_t> new_tokens_i32;
     double reset_ms = -1.0;  // -1 == no reset happened this request (prefix extended)
     int64_t skip = 0;        // tokens of full_tokens_i32 NOT re-fed this request (the fed prefix)
+    bool tp_recovered = false;  // this request's Reset() recovered a TP group (docs/tp.md 2.5)
+    // After a failed request prefix_ refuses every prompt until the next Commit() (prefix_state.h's
+    // needs_reset_, docs/tp.md 8.4), so this request takes the Reset() branch: under TP that
+    // Reset() is what recovers a group an earlier error left in kNeedsRecovery.
     std::optional<std::vector<int32_t>> tail = prefix_.Extend(full_tokens_i32, image_keys);
     if (tail) {
       skip = static_cast<int64_t>(full_tokens_i32.size() - tail->size());
       new_tokens_i32 = std::move(*tail);
     } else {
+      tp_recovered = tp_model_ != nullptr &&
+                     tp_model_->GetState() == r4dx::model::TpModel::State::kNeedsRecovery;
       const auto r0 = Clock::now();
       model_->Reset();
       const auto r1 = Clock::now();
@@ -400,22 +424,26 @@ void Engine::RunRequest(PendingRequest& req) {
     // `new_tokens_i32` for it to land on). EncodeImages runs once per NEW image (simplicity over
     // batching -- a request rarely carries more than a couple), timed together for `timings.
     // image_n`/`image_ms`.
+    image_embeds_owned.reserve(pending_image_spans.size());
     for (size_t i = 0; i < pending_image_spans.size(); ++i) {
       const auto& sp = pending_image_spans[i];
       if (sp.offset < skip) continue;  // already fed on an earlier turn -- no re-encode
       const ImagePart& img = *pending_image_ptrs[i];
-      r4dx::core::DeviceBuffer<uint16_t> embeds;
+      r4dx::model::ImageRows embeds;
       r4dx::vision::VisionEncodeStats stats;
       const auto e0 = Clock::now();
       model_->EncodeImages(img.pixel_values.data(), sp.grid.PatchCount(), {sp.grid}, &embeds, &stats);
       const auto e1 = Clock::now();
       image_encode_count += 1;
       image_encode_ms_total += Seconds(e0, e1) * 1000.0;
-      r4dx::model::Model::ImageSpan ms;
+      r4dx::model::ImageSpan ms;
       ms.offset = sp.offset - skip;
       ms.tokens = sp.tokens;
       ms.grid = sp.grid;
       ms.embeds = embeds.data();
+      // docs/tp.md 8.3: false at --tp 1 (device rows, the pre-TP D2D splice); true under TP, where
+      // rank 0's encode came back as host rows that every rank splices with an H2D copy.
+      ms.embeds_on_host = embeds.on_host();
       image_spans.push_back(ms);
       image_embeds_owned.push_back(std::move(embeds));
     }
@@ -731,27 +759,34 @@ void Engine::RunRequest(PendingRequest& req) {
         }
       }
     } else if (greedy) {
-      // Plain greedy decode (temperature<=0): untouched by this stage.
+      // Plain greedy decode (temperature<=0). The first token is the host argmax of Prefill's full
+      // row (Sample() at temperature<=0 is exactly Argmax, and draws nothing); every later one comes
+      // from DecodeStepGreedy (docs/tp.md P5), which runs the same forward as DecodeStep and takes
+      // the argmax on the device -- the same token, since the device argmax and the host Argmax share
+      // the lowest-index tie-break -- instead of returning the whole [vocab] row. Under TP that
+      // saves the per-token full-row gather (~1 MB through the host exchange); at --tp 1 it saves the
+      // ~1 MB D2H and the host scan. The same forward calls, in the same order, as the DecodeStep
+      // loop this replaced (docs/tp.md Appendix B N75 has the A/B that shows identical tokens).
+      int32_t next = r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
       for (int64_t step = 0; step < max_tokens; ++step) {
         if (req.sink->IsCancelled()) {
           finish_reason = "cancelled";
           break;
         }
-        const int32_t next =
-            r4dx::kernels::Sample(logits.data(), static_cast<int64_t>(logits.size()), sp, rng);
-        if (is_eos(next)) {
+        const int32_t tok = next;
+        if (is_eos(tok)) {
           finish_reason = "stop";
           break;
         }
-        generated_tokens.push_back(next);
-        const bool stop_hit = EmitToken(req, decoder, accumulated, next, forward, &stop_match_pos, stop_search_floor);
+        generated_tokens.push_back(tok);
+        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
         NoteReasoningProgress();
-        // Feed `next` into the model regardless of stop_hit, so committed_tokens below accurately
+        // Feed `tok` into the model regardless of stop_hit, so committed_tokens below accurately
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
         // token is real generated content, only its stop-marker tail text is withheld from the
         // client.
-        logits = model_->DecodeStep(next);
-        committed_tokens.push_back(next);
+        next = model_->DecodeStepGreedy(tok);
+        committed_tokens.push_back(tok);
         if (stop_hit) {
           finish_reason = "stop";
           break;
@@ -927,7 +962,7 @@ void Engine::RunRequest(PendingRequest& req) {
     const double prefill_tps = prefill_seconds > 0 ? new_tokens_i32.size() / prefill_seconds : 0.0;
     const double decode_tps =
         decode_seconds > 0 ? static_cast<double>(generated_tokens.size()) / decode_seconds : 0.0;
-    char buf[480];
+    char buf[560];
     int n = std::snprintf(
         buf, sizeof(buf),
         "request %s: prompt=%lld new=%lld generated=%lld finish=%s prefill=%.2f tok/s "
@@ -951,6 +986,17 @@ void Engine::RunRequest(PendingRequest& req) {
     }
     if (reset_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " reset=%.2fms", reset_ms);
+    }
+    // docs/tp.md P5: which engine served the request. Absent at --tp 1, so that line is unchanged.
+    // `tp_recovery=yes`: this request's reset= also recovered the group after an earlier failure
+    // (docs/tp.md 2.5; tools/server/smoke.ps1 -TpFault reads it).
+    if (tp_model_ != nullptr && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      const auto mode = tp_model_->Options().mode;
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " tp=%d%s%s", model_->TpWorld(),
+                         mode == r4dx::model::TpOptions::Mode::kEmulate ? " tp_mode=emulate"
+                         : mode == r4dx::model::TpOptions::Mode::kNoop  ? " tp_mode=noop"
+                                                                         : "",
+                         tp_recovered ? " tp_recovery=yes" : "");
     }
     if (use_mtp && mtp_rounds > 0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
       const double accept_rate =
@@ -977,6 +1023,16 @@ void Engine::RunRequest(PendingRequest& req) {
                     static_cast<double>(generated_tokens.size()) / static_cast<double>(dflash_rounds));
     }
     LogLine(opts_.log_level, "info", buf);
+    // r4dx-cli --stats' `tp:` line (docs/tp.md 9.1, Appendix B N59), per request at debug level only:
+    // it is one short host command on each rank thread. Caught here: the sink is already done, so a
+    // failure must not reach the catch below (which would report the finished request a second time).
+    if (tp_model_ != nullptr && opts_.log_level == "debug") {
+      try {
+        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": " + tp_model_->StatsLine());
+      } catch (const std::exception& e) {
+        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": tp stats unavailable: " + e.what());
+      }
+    }
   } catch (const std::exception& e) {
     // Invalidate the prefix-reuse fast path (review finding, 2026-09-19; unchanged by this stage):
     // if Model::Prefill/DecodeStep*/Reset threw partway through, the model may have already
@@ -984,10 +1040,25 @@ void Engine::RunRequest(PendingRequest& req) {
     // record. Leaving it stale would let the NEXT request's Extend() take the "matches, feed only
     // the tail" branch against a model whose real state has silently diverged from what prefix_
     // claims -- Invalidate() forces the next request down the full-reset path instead.
+    //
+    // Under TP (docs/tp.md 2.4, 8.4) any failure also leaves the group in kNeedsRecovery, where
+    // every device call throws until Reset(): the next request's Extend() refuses (Invalidate()
+    // holds until a Commit()), so it resets -- which recovers the group -- and runs normally.
+    // kFatal (recovery itself failed) answers 500 until the process is restarted.
     prefix_.Invalidate();
-    LogLine(opts_.log_level, "error",
-            "request " + req.request_id + ": " + std::string(e.what()));
-    req.sink->OnError(500, e.what());
+    std::string what = e.what();
+    std::string tp_note;
+    if (tp_model_ != nullptr) {
+      const auto state = tp_model_->GetState();
+      tp_note = state == r4dx::model::TpModel::State::kNeedsRecovery
+                    ? " (tp: group needs recovery; the next request resets it)"
+                : state == r4dx::model::TpModel::State::kFatal ? " (tp: fatal, restart the server)"
+                                                                : "";
+      // kFatal never clears: /health turns 503 from here on (TpFatal(), engine.h).
+      if (state == r4dx::model::TpModel::State::kFatal) tp_fatal_.store(true, std::memory_order_release);
+    }
+    LogLine(opts_.log_level, "error", "request " + req.request_id + ": " + what + tp_note);
+    req.sink->OnError(500, what);
   }
 }
 

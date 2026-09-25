@@ -68,6 +68,15 @@ inline int64_t UnitLayersForContext(int64_t submit_layers, int64_t ctx_end) {
   return submit_layers < cap ? submit_layers : cap;
 }
 
+// The most drafted tokens a tensor-parallel speculative round may verify (docs/tp.md Appendix B
+// N80). A verify window, like a decode step, is never cut into SubmitBounder units -- it reaches the
+// GPU as one queue of every layer -- which is safe only while it stays decode-sized: at most 8 rows,
+// DFlash2's whole block (anchor + 7). An MTP window of up to 64 rows would be a prefill chunk's
+// shape, unsplit. So MTP's draft count is capped at 7 under TP (Model::Load, TpModel::Load and both
+// arg parsers); that also caps the replicated reduced-vocab head's device-resident draft chain,
+// which queues its steps' all-reduces with one synchronize at the end, at 7 one-layer steps.
+inline constexpr int64_t kMaxUnsplitDraftK = 7;
+
 class SubmitBounder {
  public:
   struct Stats {

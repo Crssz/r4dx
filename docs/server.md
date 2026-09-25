@@ -8,7 +8,7 @@ for where this sits in the overall module map and `docs/status.md` for milestone
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/health` | `{"status":"ok","model":"<model id>"}` |
+| GET | `/health` | `{"status":"ok","model":"<model id>"}`; under `--tp 2`, `503` with `{"status":"tp_fatal",...}` once the tensor-parallel group is fatal (every request then answers `500` until the server is restarted -- `docs/tp.md` 2.4, Appendix B N80) |
 | GET | `/v1/models` | OpenAI models-list shape, one entry (the loaded container's `model_id`, from its `__metadata__.model_id`, `docs/container-format.md`) plus r4dx extension fields -- see "Model metadata" below |
 | GET | `/v1/models/{id}` | The single model object (not list-wrapped) for `{id}`; `404` with the standard error JSON if `{id}` is not the loaded container's own `model_id` |
 | POST | `/v1/chat/completions` | Chat messages through the real `chat_template.jinja`; non-streaming JSON or SSE (`"stream": true`) |
@@ -1146,7 +1146,13 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N]
     [--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}]
     [--image-max-pixels N]
+    [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
+    [--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N]
+    [--tp-max-inflight K]
 ```
+
+`--tp 2` (default 1) and the `--tp-*` flags: tensor parallel across two ranks, the same flags,
+defaults, ranges and usage errors as `r4dx-cli`'s (docs/tp.md 9.1); see "Tensor parallel" below.
 
 `--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
 
@@ -1174,6 +1180,49 @@ fewer layers than its (verbatim-copied) `config.json` declares, e.g.
 default -- prints exactly the required prompt/generated/prefill/decode-tok/s line; `warn`/`error`
 quiet it down).
 
+## Tensor parallel (`--tp 2`, docs/tp.md P5)
+
+`--tp 2` runs the model as `r4dx::model::TpModel` (docs/tp.md): one rank thread per GPU, each owning
+its shard, the engine's worker thread the facade. Real mode (the default) needs
+`HIP_VISIBLE_DEVICES` **unset** -- rank 0 then runs on HIP device 1 (headless; it also runs the
+vision tower), rank 1 on device 0 (the desktop card) -- and every other `r4dx-server` stopped;
+`--tp-mode emulate` puts both ranks on one device (the byte-exact reference, `HIP_VISIBLE_DEVICES=1`
+is fine), `noop` one rank with a no-op all-reduce (timing only). MTP, DFlash2 and images work under
+`--tp 2` exactly as at `--tp 1`; image rows come back from rank 0 as host memory and every rank
+splices them (`ImageSpan::embeds_on_host`). `/v1/models`, the request shapes and the response shapes
+do not change.
+
+- **Load log:** one `[r4dx-server] tp rank <r> (HIP device <d>): VRAM used ... this process's
+  buffers ...` line per rank.
+- **Per-request log:** the `info` line gains ` tp=2` (plus ` tp_mode=emulate|noop` outside real
+  mode); at `--log-level debug` a second line carries r4dx-cli's `--stats` `tp:` counters
+  (docs/tp.md Appendix B N59). A `--tp 1` line is unchanged.
+- **Errors and recovery (docs/tp.md 2.4, 8.4):** any failure inside a request -- including an
+  all-reduce timeout or a result divergence between the ranks -- answers that request `500` and
+  leaves the group needing recovery (the error line says so: `(tp: group needs recovery; the next
+  request resets it)`). The next request's prefix check refuses (`PrefixState::Invalidate`), so it
+  runs `Reset()`, which recovers the group (`reset=23.42ms` on the 4-layer test container,
+  docs/tp.md Appendix B N79), and then runs normally; its log line
+  shows `tp_recovery=yes`. If recovery itself fails the group is fatal and every request answers
+  `500` (`tp: fatal, restart the process`) until the server is restarted; `/health` then answers
+  `503` `{"status":"tp_fatal",...}` instead of `ok`, so a supervisor or client can see it
+  (docs/tp.md Appendix B N80).
+- **`--mtp` is at most 7 under `--tp 2`** (a usage error above it; `--tp 1` keeps 63): a verify window
+  is never split into the device-0 submission units a prefill chunk is, so it stays at most 8 rows
+  (docs/tp.md Appendix B N80).
+- **Plain greedy decode** uses `DecodeStepGreedy` (the device argmax) at every `--tp`, instead of a
+  full-row `DecodeStep` plus a host argmax -- the same tokens (docs/tp.md Appendix B N75), without
+  the per-token full-vocabulary gather under TP.
+
+`tools/server/smoke.ps1 -Tp 2 [-TpMode real|emulate|noop] [-TpFault]` runs the smoke under TP
+(docs/tp.md Appendix B N77): in real mode it removes `HIP_VISIBLE_DEVICES`, passes `--tp 2` to the
+server and to every `r4dx-cli` comparison run, and wraps the run in the device-0 TDR check;
+`-TpFault` injects an all-reduce timeout (`R4DX_TP_FAULT`) and checks that the request after it
+returns the pre-fault reference text. In real mode a `-TpFaultSpec` stall on rank 0 is refused (its
+peer's all-reduce would spin on the desktop card); a failing sampled speculative-vs-plain comparison
+under `-Tp 2` is followed by the same comparison at `--tp 1`, whose result the script prints
+(docs/tp.md Appendix B N80).
+
 ## Testing
 
 `tests/server/**` (CPU-only, no HIP device, registered in `ctest`): `test_server_args` (CLI
@@ -1186,7 +1235,11 @@ including `TestImageAwarePrefixReuse`, see "MTP" above and "Images"), `test_tool
 "Tool calls" above -- real-capture and malformed-input cases for the model's surface syntax),
 `test_tool_stream_gate` (the live tool-call stream gate and its "streamed content == non-streamed
 content" property over every chunking of a dozen representative generations),
-`test_reasoning_splitter` (the `</think>` split). `test_openai_types` also covers every image
+`test_reasoning_splitter` (the `</think>` split), `test_engine_recovery` (the engine's error and
+recovery path through `engine.cpp` itself, against CPU fakes of the tensor-parallel model's state
+machine and of the TP=1 model, where a skipped `Reset()` would silently reuse a failed request's
+state -- it links the server's libraries but makes no GPU call, and skips without the tokenizer
+directory). `test_openai_types` also covers every image
 content-part rule from "Images" above (accepted shapes, remote-URL/format/corrupt-data/oversize/
 too-many-images rejection, content-hash determinism, the `/v1/models` modality flip,
 `timings.image_n`/`image_ms`). All pass as part of the normal `.\tests\run_tests.ps1` run.

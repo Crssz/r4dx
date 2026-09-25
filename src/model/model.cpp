@@ -164,30 +164,18 @@ Model Model::Load(const ModelOptions& opts) {
   if (tp.submit_layers < 0 || tp.submit_layers > 64 || tp.max_inflight_units < 0 || tp.max_inflight_units > 64) {
     throw std::invalid_argument("Model::Load: tp.submit_layers and tp.max_inflight_units must be in [0, 64]");
   }
-  ModelOptions::VisionMode vision_mode = opts.vision;
+  const ModelOptions::VisionMode vision_mode = opts.vision;
   if (is_tp_rank) {
     if (tp.comm == nullptr || tp.comm->World() != tp.world || tp.comm->Rank() != tp.rank) {
       throw std::invalid_argument(
           "Model::Load: tp.world > 1 needs a TpComm endpoint of the same world and rank");
     }
-    // Staged rejections (docs/tp.md 2.9 step 1, 9.1): the MTP head, the DFlash2 drafter and the
-    // vision tower get their tensor-parallel hooks in P5.
-    if (opts.mtp_draft_k > 0) {
-      throw core::TpUnsupportedError("Model::Load: MTP (mtp_draft_k > 0) is not supported under "
-                                     "tensor parallelism yet (docs/tp.md P5)");
-    }
-    if (!opts.dflash_container.empty()) {
-      throw core::TpUnsupportedError("Model::Load: DFlash2 (dflash_container) is not supported "
-                                     "under tensor parallelism yet (docs/tp.md P5)");
-    }
-    if (opts.vision == ModelOptions::VisionMode::kOn) {
-      throw core::TpUnsupportedError("Model::Load: --vision on is not supported under tensor "
-                                     "parallelism yet (docs/tp.md P5)");
-    }
-    if (opts.vision == ModelOptions::VisionMode::kAuto) {
-      std::cerr << "[r4dx::model::Model] tp rank " << tp.rank << "/" << tp.world
-                << ": --vision auto loads text-only under tensor parallelism until docs/tp.md P5\n";
-      vision_mode = ModelOptions::VisionMode::kOff;
+    // Verify windows are never split into submission units (tp_submit.h's kMaxUnsplitDraftK,
+    // docs/tp.md Appendix B N80), so a tensor-parallel rank verifies at most 8 rows at a time.
+    if (std::max(opts.mtp_draft_k, opts.dflash_draft_k) > tp::kMaxUnsplitDraftK) {
+      throw std::invalid_argument("Model::Load: mtp_draft_k and dflash_draft_k must be at most " +
+                                  std::to_string(tp::kMaxUnsplitDraftK) + " under tensor parallelism, got " +
+                                  std::to_string(opts.mtp_draft_k) + " / " + std::to_string(opts.dflash_draft_k));
     }
   }
   // docs/tp.md 2.7: a TP rank's thread consults the per-rank tuning table first. Set on EVERY load
@@ -228,7 +216,11 @@ Model Model::Load(const ModelOptions& opts) {
     m.container_ = Container::Load(opts.container_path, co);
   }
   const VramSnap vram1 = SnapVram();  // after container weights are fully resident
-  if (vision_mode == ModelOptions::VisionMode::kOn && !m.container_.HasVision()) {
+  // docs/tp.md 8.3: a tensor-parallel rank without the tower (rank 1) only parsed the vision
+  // config, so the "the container has vision" test is HasVisionConfig() there -- the tower itself
+  // is rank 0's. At TP=1 the two are the same test.
+  if (vision_mode == ModelOptions::VisionMode::kOn &&
+      !(is_tp_rank ? m.container_.HasVisionConfig() : m.container_.HasVision())) {
     throw std::runtime_error(
         "Model::Load: --vision on was requested but the container has no vision.* tensors "
         "(convert without --language-model-only, or use --vision auto)");
@@ -241,9 +233,10 @@ Model Model::Load(const ModelOptions& opts) {
               << ", hidden=" << vw.config.hidden_size << ", out_hidden=" << vw.config.out_hidden_size
               << ")\n";
   } else if (vision_mode == ModelOptions::VisionMode::kAuto &&
-             m.container_.ContainerHasVisionTensors()) {
+             m.container_.ContainerHasVisionTensors() && tp.vision_weights_on_this_rank) {
     // Cannot happen with the current policy (auto asks for the load), but says so out loud rather
-    // than silently leaving a vision-capable container text-only if that policy ever changes.
+    // than silently leaving a vision-capable container text-only if that policy ever changes. A
+    // tensor-parallel rank the tower does not live on by design stays quiet (docs/tp.md 8.3).
     std::cerr << "[r4dx::model::Model] container carries vision.* tensors but the tower was not "
                   "loaded -- image requests will be rejected\n";
   }
@@ -350,7 +343,11 @@ Model Model::Load(const ModelOptions& opts) {
   }
 
   if (opts.mtp_draft_k > 0) {
-    m.mtp_.emplace(cfg, m.container_.Mtp(), opts.mtp_draft_k, opts.max_ctx);
+    // docs/tp.md 8.1, 4.4: the head's logits buffer holds the widest draft head it can run -- this
+    // rank's lm_head shard or the replicated reduced head (the whole vocabulary at TP=1) -- and its
+    // attention/MLP all-reduce through this rank's comm (null at TP=1).
+    const int64_t logits_rows = std::max(m.container_.LmHead().N, m.container_.Mtp().draft_lm_head.N);
+    m.mtp_.emplace(cfg, m.container_.Mtp(), opts.mtp_draft_k, opts.max_ctx, logits_rows, m.comm_);
     m.mtp_seed_hidden_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(hidden));
   }
   // Verify scratch + the GDN acceptance-count thread are shared by BOTH speculation families, so
@@ -432,9 +429,17 @@ Model Model::Load(const ModelOptions& opts) {
     DflashDraftOptions dopts;
     dopts.container_path = opts.dflash_container;
     dopts.layout = dflash_layout;
-    dopts.lm_head_vocab = cfg.vocab_size;  // the TARGET's own vocab (docs/dflash2.md: the drafter
-                                            // has no lm_head of its own, MakeTargetLmHeadProvider
-                                            // always runs the target's real head)
+    // The TARGET's lm_head rows (docs/dflash2.md: the drafter has no lm_head of its own,
+    // MakeTargetLmHeadProvider always runs the target's real head) -- the whole vocabulary at TP=1,
+    // this rank's vocab shard under TP, where the drafter merges its per-rank top-16s with the
+    // other rank's (docs/tp.md 8.2) and shares the process's one host copy of the codebooks.
+    dopts.lm_head_vocab = m.vocab_local_;
+    if (is_tp_rank) {
+      dopts.vocab_offset = m.vocab_offset_;
+      dopts.global_vocab = cfg.vocab_size;
+      dopts.comm = m.comm_;
+      dopts.shared_codebooks = tp.dflash_codebooks;
+    }
     m.dflash_ = DflashDraft::Load(dopts);
     // Auto-feed this Model-owned drafter from every RunChunk call (prefill chunk + plain decode
     // step) -- see RunChunk's own comment for exactly where, and model.h's dflash_ field comment
@@ -512,6 +517,17 @@ void Model::EncodeImages(const float* pixel_values, int64_t total_patches,
         std::to_string(Config().hidden_size) +
         ") -- the merger's rows are spliced straight into the text embedding sequence, with no "
         "extra projection (docs/vision.md)");
+  }
+  if (comm_ != nullptr && submit_layers_ > 0) {
+    // Tensor parallel, bounded submission (docs/tp.md Appendix B N57): the tower's whole encode --
+    // ~160 ms for a 1024-token image, far more for a large one -- would otherwise reach the GPU as
+    // one unbroken queue. VisionTower synchronizes its stream before calling a pre-block hook, so a
+    // hook that leaves the residual stream alone (returns false) bounds the queue to one encoder
+    // block, the same "hipStreamSynchronize per unit" the prefill bounding's K = 1 uses (no event on
+    // the stream, N56). The vision stream is the tower's own, never this Model's stream_.
+    const vision::VisionPreBlock per_block = [](int64_t, void*, int64_t) { return false; };
+    vision_->Encode(vw, pixel_values, total_patches, grids, out, stats, trace, &per_block);
+    return;
   }
   vision_->Encode(vw, pixel_values, total_patches, grids, out, stats, trace);
 }
@@ -623,12 +639,15 @@ void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64
     if (lo >= hi) continue;
     // Both sides are contiguous row-major [rows, hidden] bf16 -- the placeholder run is contiguous
     // in the prompt and the merger's rows are contiguous in EncodeImages' output -- so one D2D
-    // copy per (span, chunk) intersection, no kernel and no per-row loop.
+    // copy per (span, chunk) intersection, no kernel and no per-row loop. Tensor-parallel image rows
+    // live on the HOST (TpModel's ImageRows, docs/tp.md 8.3): the same copy, host to device, on
+    // every rank.
     const int64_t rows = hi - lo;
     R4DX_HIP_CHECK(hipMemcpyAsync(dst + (lo - start) * hidden,
                                    sp.embeds + (lo - span_start) * hidden,
                                    static_cast<size_t>(rows * hidden) * sizeof(uint16_t),
-                                   hipMemcpyDeviceToDevice, stream_.get()));
+                                   sp.embeds_on_host ? hipMemcpyHostToDevice : hipMemcpyDeviceToDevice,
+                                   stream_.get()));
   }
 }
 
@@ -714,9 +733,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // whatever is submitted. So every `unit_layers` layers the chunk forces a submission and waits
   // until at most max_inflight_units - 1 earlier units are unfinished; the unit shrinks with the
   // chunk's end position, because attention grows with it (tp::UnitLayersForContext, N64). Decode
-  // steps and verify windows (<= 8 rows, a decode-sized step) are not split; every call already ends
-  // in the stream synchronize below. The previous call ended synchronized, so no unit is
-  // outstanding here.
+  // steps and verify windows (<= 8 rows under TP, a decode-sized step: Load caps the draft count at
+  // tp::kMaxUnsplitDraftK, N80) are not split; every call already ends in the stream synchronize
+  // below. The previous call ended synchronized, so no unit is outstanding here.
   const bool bounded = comm_ != nullptr && is_prefill_path && submit_.Active();
   const int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
   if (bounded) submit_.Reset();
@@ -1028,14 +1047,6 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
                                               const std::function<void()>& on_chunk_captured,
                                               std::vector<int32_t>* rope_rows_out) {
   if (token_ids.empty()) throw std::runtime_error("Model::PrefillMultimodal: token_ids is empty");
-  // SpliceImageEmbeddings copies device to device; host-resident rows (TpModel's ImageRows) get
-  // their H2D splice in docs/tp.md P5. Until then refuse them rather than D2D from a host pointer.
-  for (const ImageSpan& sp : images) {
-    if (sp.embeds_on_host) {
-      throw std::invalid_argument("Model::PrefillMultimodal: host-resident image rows (ImageSpan::embeds_on_host) "
-                                  "are not supported yet (docs/tp.md P5); pass device rows");
-    }
-  }
   if (images.empty() && !mrope_active_) {
     // Text-only, and nothing has ever diverged -- the pre-vision path, byte for byte. The rows a
     // diagnostic caller asked for are simply the sequence indices on all three axes.
@@ -1046,14 +1057,17 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
   }
 
   const int64_t seq_len = static_cast<int64_t>(token_ids.size());
-  if (!images.empty() && !container_.HasVision()) {
+  // VisionSpliceEnabled(), not HasVision(): a tensor-parallel rank without the tower still splices
+  // the rows rank 0 encoded (docs/tp.md 8.3). The same test at TP=1.
+  if (!images.empty() && !VisionSpliceEnabled()) {
     throw std::runtime_error(
         "Model::PrefillMultimodal: image spans supplied but this model has no vision tower loaded "
         "(--vision off, or a container with no vision.* tensors)");
   }
-  // Only read when `images` is non-empty, which the check above already made imply HasVision().
+  // Only read when `images` is non-empty, which the check above already made imply
+  // VisionSpliceEnabled().
   const int merge_size =
-      container_.HasVision() ? static_cast<int>(container_.Vision().config.spatial_merge_size) : 2;
+      VisionSpliceEnabled() ? static_cast<int>(container_.VisionCfg().spatial_merge_size) : 2;
   const int32_t image_token_id = static_cast<int32_t>(container_.ImageTokenId());
 
   // ---- validate the spans, and derive the mm_token_type_ids the position walk needs -------------
@@ -1074,7 +1088,7 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
     }
     if (sp.embeds == nullptr) {
       throw std::runtime_error("Model::PrefillMultimodal: image span at offset " +
-                                std::to_string(sp.offset) + " has no device embeddings");
+                                std::to_string(sp.offset) + " has no embeddings");
     }
     if (sp.grid.MergedTokenCount(merge_size) != sp.tokens) {
       throw std::runtime_error(
@@ -1960,7 +1974,9 @@ std::vector<int32_t> Model::DecodeStepMtpSampled(int32_t token_id, int64_t k,
 std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                                                const kernels::SampleParams* params,
                                                std::mt19937_64* rng) {
-  RequireNotTp("DecodeStepMtp{Greedy,Sampled} (MTP, docs/tp.md 8.1: P5)");
+  // Tensor parallel (docs/tp.md 8.1): MtpHead::Draft merges the full-vocab head's per-step argmax
+  // across ranks itself (H6), and VerifyWindow merges the verify rows (H4), so every rank drafts,
+  // verifies and commits the same round; nothing here differs from TP=1.
   if (!mtp_) {
     throw std::runtime_error(
         "Model::DecodeStepMtp{Greedy,Sampled}: MTP is not enabled on this Model (Load() with "
@@ -2062,7 +2078,9 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
                                                   std::mt19937_64* rng, int64_t* walk_len_out,
                                                   DflashRoundTrace* trace_out,
                                                   std::vector<int32_t>* drafted_tokens_out) {
-  RequireNotTp("DecodeStepDflash{Greedy,Sampled} (DFlash2, docs/tp.md 8.2: P5)");
+  // Tensor parallel (docs/tp.md 8.2): DraftRound merges the per-rank top-16s itself (H7), so both
+  // ranks walk the same selector lattice to the same drafts; the rest of the round is the shared
+  // verify path (7.6), unchanged.
   if (!dflash_.has_value()) {
     throw std::runtime_error(
         "Model::DecodeStepDflash{Greedy,Sampled}: DFlash2 is not enabled on this Model (Load() with "
@@ -2254,9 +2272,68 @@ void Model::TpWarmup() {
   for (int64_t i = 0; i < max_chunk_; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
   (void)Prefill(ids);
   (void)DecodeStepGreedy(0);
+  // One full-width speculative round when a drafter is loaded (docs/tp.md 2.9 step 9): the MTP
+  // head's or the DFlash2 drafter's first touch of its own kernels and weights, its per-step H6 /
+  // per-round H7 merge, and the widest verify window (H2/H4). The DFlash round runs with p_min and
+  // n_min off, so the walk always drafts dflash_draft_k_ tokens.
+  if (mtp_) {
+    (void)DecodeStepMtpGreedy(0, mtp_draft_k_);
+  } else if (dflash_.has_value()) {
+    (void)DecodeStepDflashGreedy(0, dflash_draft_k_, /*p_min=*/0.0f, /*n_min=*/0);
+  }
   Reset();
   gdn_control_.Freeze();
 }
+
+int64_t Model::WarmupPositions(const ModelOptions& opts) {
+  // TpWarmup: a 64-row prefill chunk (Model's max_chunk_) and one decode step, then -- with a
+  // drafter -- a verify window of 1 + k rows starting right after them.
+  constexpr int64_t kChunkAndDecode = 64 + 1;
+  const int64_t k = opts.mtp_draft_k > 0 ? opts.mtp_draft_k
+                                         : (!opts.dflash_container.empty() ? opts.dflash_draft_k : 0);
+  return kChunkAndDecode + (k > 0 ? 1 + k : 0);
+}
+
+#ifdef R4DX_TP_TESTING
+void Model::MtpDebugSetCapture(bool on) {
+  if (!mtp_) throw std::runtime_error("Model::MtpDebugSetCapture: requires MtpEnabled()");
+  mtp_->DebugSetCapture(on);
+}
+
+void Model::MtpDebugLastDraft(std::vector<float>* rows, std::vector<int32_t>* tokens,
+                              std::vector<int32_t>* drafts) const {
+  if (!mtp_) throw std::runtime_error("Model::MtpDebugLastDraft: requires MtpEnabled()");
+  *rows = mtp_->DebugRows();
+  *tokens = mtp_->DebugTokens();
+  if (drafts != nullptr) *drafts = mtp_->DebugDrafts();
+}
+
+void Model::DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const {
+  if (!dflash_.has_value()) throw std::runtime_error("Model::DflashDebugLastTop16: requires DflashEnabled()");
+  dflash_->DebugLastTop16(cand, unary);
+}
+
+void Model::DflashDebugGatherDraftLogits(std::vector<float>* out) {
+  if (!dflash_.has_value()) {
+    throw std::runtime_error("Model::DflashDebugGatherDraftLogits: requires DflashEnabled()");
+  }
+  // The drafter's [block_size, vocab_local_] rows, each gathered into the full row in global id
+  // order -- the drafter's lm_head IS this Model's (vocab-split) head. The device is idle: the last
+  // round ended synchronized.
+  const int64_t B = dflash_->BlockSize();
+  const int64_t V = container_.Config().vocab_size;
+  out->resize(static_cast<size_t>(B * V));
+  const float* dev = dflash_->DebugLogitsDevice();
+  for (int64_t r = 0; r < B; ++r) {
+    if (comm_ != nullptr) {
+      GatherVocabRow(dev + r * vocab_local_, out->data() + r * V);
+    } else {
+      R4DX_HIP_CHECK(hipMemcpy(out->data() + r * V, dev + r * V, static_cast<size_t>(V) * sizeof(float),
+                               hipMemcpyDeviceToHost));
+    }
+  }
+}
+#endif
 
 void Model::RequireNotTp(const char* what) const {
   if (comm_ != nullptr) {

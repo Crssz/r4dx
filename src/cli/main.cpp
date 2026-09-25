@@ -446,7 +446,8 @@ int RunMain(int argc, char** argv) {
   r4dx::ChatTemplate tmpl = r4dx::ChatTemplate::from_directory(args.tokenizer_dir);
 
   // Tensor parallel (docs/tp.md 9.1): --tp 1 is today's single Model (r4dx::model::LocalTextModel);
-  // --tp 2 is r4dx::model::TpModel. cli_args.h already refused every staged combination.
+  // --tp 2 is r4dx::model::TpModel (MTP, DFlash2 and images included, docs/tp.md P5); cli_args.h
+  // already refused the permanent exclusion (--profile*).
   r4dx::model::TpOptions tpo;
   tpo.world = args.tp;
   if (args.tp == 2) {
@@ -538,11 +539,8 @@ int RunMain(int argc, char** argv) {
     int64_t turn_image_n = 0;
     double turn_image_ms = 0.0;
     if (!image_paths_for_turn.empty()) {
-      if (args.tp == 2) {
-        // Staged rejection (docs/tp.md 9.1): --image is refused at parse time; this is the --chat
-        // "/image" path's.
-        throw std::runtime_error("images are not supported with --tp 2 yet (docs/tp.md P5)");
-      }
+      // Under --tp 2 the encode runs on rank 0 and the rows come back on the host (ImageRows::host,
+      // docs/tp.md 8.3); the spans below carry embeds_on_host from them.
       if (!model->HasVision()) {
         throw std::runtime_error(
             "--image / \"/image\" needs a vision-capable container (this container has no "

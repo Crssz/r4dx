@@ -1,5 +1,37 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Tensor parallel (`--tp 2`) with DFlash2, MTP and the server: P5 gates (2026-09-25)
+
+The setup is the P4 section's below: rank 0 on HIP device 1, rank 1 on device 0 with the desktop
+live, `--layout w4a16`, bounding 32/1, production server stopped. Every number was measured in the
+P5 gate run with one build (docs/tp.md Appendix B N82, logs under `build\logs\p5\gate_*`). The TP=1
+column ran on device 1 in the same session.
+
+Standard protocol, one fresh process per run:
+
+| Path | TP=1 | **TP=2** | TP=2 / TP=1 |
+|---|--:|--:|--:|
+| `--dflash qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` (84 tokens, EOS) | 74.73 (2.71 tok/round) | **118.75, 119.96** (2.80 tok/round; a third run 121.03) | **1.59x / 1.61x** |
+| `--mtp 3` (84 tokens, EOS) | 68.74 (2.47 tok/round) | **107.90, 107.92** (2.40 tok/round) | **1.57x** |
+| prefill, 29-token prompt, with the DFlash2 drafter | 600.8-628.5 | 1171.7-1201.0 | 1.86-2.0x |
+| VRAM used, DFlash2 | 19.04 GiB | 11.55 GiB per card (11.18 GiB of it this process's buffers) | |
+| VRAM used, MTP | 17.43 GiB | 10.24 GiB per card (9.90 GiB buffers) | |
+
+DFlash2 k=7 on the four prompts of `tests/model/mtp_prompts.txt`, same flags:
+
+| Prompt | TP=1 decode (tok/round) | TP=2 decode (tok/round) | TP=2 / TP=1 |
+|---|--:|--:|--:|
+| haiku + GPU (84 tokens) | 74.69 (2.71) | 121.03 (2.80) | 1.62x |
+| Fibonacci function (112) | 153.89 (5.60) | 252.48 (5.89) | 1.64x |
+| Romeo and Juliet (89 / 85) | 81.65 (2.97) | 121.45 (2.83) | 1.49x |
+| first five primes (256, max-tokens) | 132.27 (4.83) | 213.98 (5.02) | 1.62x |
+
+- Tokens per round average 4.135 at TP=2 and 4.028 at TP=1, +2.7% (gate G10 allows +-5%). The TP=2
+  text differs from TP=1's except on the Fibonacci prompt, as it does for plain decode.
+- `r4dx-server --tp 2` (`tools\server\smoke.ps1 -Tp 2 -Dflash ... -TpFault`): the request after an
+  injected all-reduce timeout reset the group in 23.58 ms, recovery included, and returned the
+  reference text.
+
 ## Tensor parallel (`--tp 2`) on both R9700s: P4 gates (2026-09-25)
 
 `--tp 2` splits `qwen38-27b-v6.r4dx` over the two cards (docs/tp.md; README "Tensor parallel across

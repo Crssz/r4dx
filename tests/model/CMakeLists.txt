@@ -17,13 +17,22 @@ set(R4DX_MODEL_TESTS
   # read back against the file's bytes. Device 1, SKIP 77 without the 4-layer container.
   test_tp_loader
   # Tensor-parallel P2b (docs/tp.md 10.1): TpModel in --tp-mode emulate (both ranks on device 1)
-  # against the TP=1 Model -- numerics, greedy/sampled merges, VerifyWindow, fault recovery.
+  # against the TP=1 Model -- numerics, greedy/sampled merges, VerifyWindow, fault recovery; P5: the
+  # MTP and DFlash2 rounds (the H6/H7 merges through the R4DX_TP_TESTING hooks) and the state they
+  # commit, tiny-temperature speculative rounds, and vision on the real container (rank 0's encode,
+  # host rows spliced on both ranks) against TP=1.
   test_tp_emulation
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
   add_executable(${t} ${t}.cpp)
-  target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+  # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
+  # src/model/CMakeLists.txt); every other test links the production library.
+  if(t STREQUAL "test_tp_emulation")
+    target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
+  else()
+    target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+  endif()
   add_test(NAME ${t} COMMAND ${t})
   set_tests_properties(${t} PROPERTIES
     ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
@@ -118,7 +127,7 @@ target_link_libraries(tool_tp_soak PRIVATE r4dx_model r4dx_convert r4dx_core r4d
 # win-hip test preset it sees one device and skips), SKIP 77 unless R4DX_TP2GPU=1 and two devices are
 # visible. tests\run_tests.ps1 -TwoGpu runs it; the default run excludes the label.
 add_executable(test_tp_real_vs_emulation test_tp_real_vs_emulation.cpp)
-target_link_libraries(test_tp_real_vs_emulation PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_link_libraries(test_tp_real_vs_emulation PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
 add_test(NAME test_tp_real_vs_emulation COMMAND test_tp_real_vs_emulation)
 set_tests_properties(test_tp_real_vs_emulation PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
 

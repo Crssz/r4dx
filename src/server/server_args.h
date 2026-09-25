@@ -17,6 +17,8 @@ namespace r4dx::server {
 // mtp+1 candidates to fit in a <=64-row chunk) -- duplicated here rather than shared because
 // these two headers are already a deliberate, documented duplication of every other --mtp* flag.
 inline constexpr int64_t kMaxMtpDraftK = 63;
+// ... and 7 under --tp 2: src/cli/cli_args.h's kMaxMtpDraftKTp (docs/tp.md Appendix B N80).
+inline constexpr int64_t kMaxMtpDraftKTp = 7;
 
 struct ServerArgs {
   std::string model_path;
@@ -99,6 +101,25 @@ struct ServerArgs {
   // src/cli/cli_args.h's --image-max-pixels: an image above this is DOWNSIZED via the reference's
   // own smart_resize rule rather than rejected. 0 means the checkpoint's own 16777216 ceiling.
   int64_t image_max_pixels = 1048576;
+
+  // ---- tensor parallel (docs/tp.md 9.1) -----------------------------------------------------------
+  // The same flags, defaults, ranges and usage errors as src/cli/cli_args.h's --tp* (the two headers
+  // are the documented duplication above; tests/server/test_server_args.cpp's TestTpFlags mirrors
+  // tests/cli/test_args.cpp's). --tp 1 (default) is today's single-device server and allows no other
+  // --tp-* flag; --tp 2 runs r4dx::model::TpModel (real mode: both GPUs, HIP_VISIBLE_DEVICES unset --
+  // rank 0 = device 1, rank 1 = device 0).
+  int tp = 1;
+  std::string tp_mode = "real";  // real|emulate|noop
+  std::vector<int> tp_devices;   // --tp-devices a[,b]; empty = auto (docs/tp.md 9.2)
+  int tp_rank = 0;               // --tp-rank r: noop only
+  int tp_ar_timeout_ms = 500;    // [10, 1500]
+  int tp_ar_nb = 4;              // [1, 64]
+  int tp_ar_nb_large = 4;        // [1, 64]
+  // --tp-submit-layers N / --tp-max-inflight K (docs/tp.md Appendix B N57, N64), both [0, 64];
+  // -1 = not given: keep r4dx::model::TpOptions' own default (this header stays HIP-free).
+  int tp_submit_layers = -1;
+  int tp_max_inflight = -1;
+  bool tp_options_given = false;  // any --tp-* flag other than --tp itself (refused at --tp 1)
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -118,12 +139,41 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
          "[--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
-         "[--image-max-pixels N]";
+         "[--image-max-pixels N] "
+         "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
+         "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
+         "[--tp-max-inflight K]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
   if (i + 1 >= argc) throw ServerUsageError(std::string(flag) + " requires a value");
   return argv[++i];
+}
+
+// src/cli/cli_args.h's ParseTpDevices, throwing ServerUsageError: "auto" (or "") -> empty
+// (docs/tp.md 9.2 auto); "a" or "a,b" -> the ordinals.
+inline std::vector<int> ParseServerTpDevices(const std::string& value) {
+  std::vector<int> out;
+  if (value.empty() || value == "auto") return out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t comma = value.find(',', start);
+    const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    int d = 0;
+    try {
+      size_t used = 0;
+      d = std::stoi(item, &used);
+      if (used != item.size()) throw std::invalid_argument(item);
+    } catch (const std::exception&) {
+      throw ServerUsageError("--tp-devices expects 'auto' or 'a[,b]' (HIP ordinals), got '" + value + "'");
+    }
+    if (d < 0) throw ServerUsageError("--tp-devices ordinals must be >= 0, got '" + value + "'");
+    out.push_back(d);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (out.size() > 2) throw ServerUsageError("--tp-devices takes at most two ordinals (rank 0, rank 1)");
+  return out;
 }
 
 // Same rationale as src/cli/cli_args.h's ParseNumber: std::stoll/stof throw std::invalid_argument/
@@ -152,6 +202,8 @@ inline float ServerParseFloat(const std::string& flag, const std::string& value)
 
 inline ServerArgs ParseServerArgs(int argc, char** argv) {
   ServerArgs a;
+  bool tp_rank_given = false;
+  bool tp_submit_given = false, tp_inflight_given = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
@@ -179,6 +231,15 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--dflash-n-min") a.dflash_n_min = ServerParseI64("--dflash-n-min", NextServerArg(argc, argv, i, "--dflash-n-min"));
     else if (arg == "--vision") a.vision = NextServerArg(argc, argv, i, "--vision");
     else if (arg == "--image-max-pixels") a.image_max_pixels = ServerParseI64("--image-max-pixels", NextServerArg(argc, argv, i, "--image-max-pixels"));
+    else if (arg == "--tp") a.tp = ServerParseInt("--tp", NextServerArg(argc, argv, i, "--tp"));
+    else if (arg == "--tp-mode") { a.tp_mode = NextServerArg(argc, argv, i, "--tp-mode"); a.tp_options_given = true; }
+    else if (arg == "--tp-devices") { a.tp_devices = ParseServerTpDevices(NextServerArg(argc, argv, i, "--tp-devices")); a.tp_options_given = true; }
+    else if (arg == "--tp-rank") { a.tp_rank = ServerParseInt("--tp-rank", NextServerArg(argc, argv, i, "--tp-rank")); a.tp_options_given = true; tp_rank_given = true; }
+    else if (arg == "--tp-ar-timeout-ms") { a.tp_ar_timeout_ms = ServerParseInt("--tp-ar-timeout-ms", NextServerArg(argc, argv, i, "--tp-ar-timeout-ms")); a.tp_options_given = true; }
+    else if (arg == "--tp-ar-nb") { a.tp_ar_nb = ServerParseInt("--tp-ar-nb", NextServerArg(argc, argv, i, "--tp-ar-nb")); a.tp_options_given = true; }
+    else if (arg == "--tp-ar-nb-large") { a.tp_ar_nb_large = ServerParseInt("--tp-ar-nb-large", NextServerArg(argc, argv, i, "--tp-ar-nb-large")); a.tp_options_given = true; }
+    else if (arg == "--tp-submit-layers") { a.tp_submit_layers = ServerParseInt("--tp-submit-layers", NextServerArg(argc, argv, i, "--tp-submit-layers")); a.tp_options_given = true; tp_submit_given = true; }
+    else if (arg == "--tp-max-inflight") { a.tp_max_inflight = ServerParseInt("--tp-max-inflight", NextServerArg(argc, argv, i, "--tp-max-inflight")); a.tp_options_given = true; tp_inflight_given = true; }
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -221,6 +282,35 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
     throw ServerUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up "
                             "to block_size-1 drafted tokens)");
+  }
+  // ---- tensor parallel (docs/tp.md 9.1): src/cli/cli_args.h's rules, minus --profile* (the server
+  // has no profiling flags) ------------------------------------------------------------------------
+  if (a.tp != 1 && a.tp != 2) throw ServerUsageError("--tp must be 1 or 2");
+  if (a.tp == 1 && a.tp_options_given) {
+    throw ServerUsageError("--tp-mode/--tp-devices/--tp-rank/--tp-ar-*/--tp-submit-layers/--tp-max-inflight need --tp 2");
+  }
+  if (a.tp == 2) {
+    if (a.tp_mode != "real" && a.tp_mode != "emulate" && a.tp_mode != "noop") {
+      throw ServerUsageError("--tp-mode must be 'real', 'emulate' or 'noop'");
+    }
+    if (tp_rank_given && a.tp_mode != "noop") throw ServerUsageError("--tp-rank needs --tp-mode noop");
+    if (a.tp_rank < 0 || a.tp_rank > 1) throw ServerUsageError("--tp-rank must be 0 or 1");
+    if (a.tp_ar_timeout_ms < 10 || a.tp_ar_timeout_ms > 1500) {
+      throw ServerUsageError("--tp-ar-timeout-ms must be in [10, 1500] (the Windows TDR limit is 2 s)");
+    }
+    if (a.tp_ar_nb < 1 || a.tp_ar_nb > 64 || a.tp_ar_nb_large < 1 || a.tp_ar_nb_large > 64) {
+      throw ServerUsageError("--tp-ar-nb and --tp-ar-nb-large must be in [1, 64]");
+    }
+    // -1 is the "not given" marker, so a GIVEN value is checked against [0, 64] including its sign.
+    if ((tp_submit_given && (a.tp_submit_layers < 0 || a.tp_submit_layers > 64)) ||
+        (tp_inflight_given && (a.tp_max_inflight < 0 || a.tp_max_inflight > 64))) {
+      throw ServerUsageError("--tp-submit-layers and --tp-max-inflight must be in [0, 64]");
+    }
+    if (a.mtp > kMaxMtpDraftKTp) {
+      throw ServerUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftKTp) +
+                              "] with --tp 2 (a verify window is not split into device-0 submission units, "
+                              "so it stays at most 8 rows; docs/tp.md Appendix B N80)");
+    }
   }
   return a;
 }

@@ -1,6 +1,7 @@
 #include "mtp_head.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -8,9 +9,12 @@
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "linear.h"
+#include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/embedding.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "tp/tp_vocab.h"  // tp::ArgmaxPair / MergeArgmax (docs/tp.md 7.3, H6)
 
 namespace r4dx::model {
 
@@ -18,8 +22,11 @@ namespace {
 constexpr int kGemmWV = 4, kGemmSK = 4, kGemmMB = 1;  // gdn_layer.cpp's plain-bf16-linear constants
 }  // namespace
 
-MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft, int64_t max_ctx)
-    : attn_layer_(MakeAttnConfig(cfg)),
+MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft, int64_t max_ctx,
+                 int64_t logits_rows, core::TpComm* comm)
+    : attn_layer_(MakeAttnConfig(cfg, comm)),
+      prime_attn_layer_(MakeAttnConfig(cfg, /*comm=*/nullptr)),
+      comm_(comm),
       // Real, growing per-sequence cache sized like every backbone attention layer's own
       // PagedKvCache -- see mtp_head.h's file comment for why this is no longer a tiny scratch
       // block reset every Draft() call.
@@ -27,9 +34,10 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
           core::r4d::GetAttnDims().block_size, /*max_context_tokens=*/static_cast<int>(max_ctx)),
       embed_staging_host_(static_cast<size_t>(cfg.hidden_size)),
       embed_staging_dev_(static_cast<size_t>(cfg.hidden_size)),
-      logits_dev_(static_cast<size_t>(cfg.vocab_size)),
+      logits_dev_(static_cast<size_t>(logits_rows)),
       argmax_dev_(1),
       subset_argmax_dev_(1),
+      argmax_pair_dev_(comm != nullptr ? 2 : 0),
       positions_dev_(static_cast<size_t>(max_draft)),
       positions_host_(static_cast<size_t>(max_draft)),
       seqused_dev_(static_cast<size_t>(max_draft)),
@@ -80,7 +88,25 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
   // degrades to the pre-R9 full-vocab path with no caller-visible difference beyond speed.
   const bool reduced_vocab = use_reduced_vocab && w.HasDraftHead();
   const QuantLinear& draft_head = reduced_vocab ? w.draft_lm_head : lm_head;
-  const int64_t draft_head_vocab = reduced_vocab ? w.draft_vocab_ids.size() : vocab;
+  // The draft head's own row count -- NOT `vocab` (the embedding table's rows): the full head is
+  // this rank's vocab shard under TP (docs/tp.md 8.1). At TP=1 lm_head.N == vocab.
+  const int64_t draft_head_vocab =
+      reduced_vocab ? static_cast<int64_t>(w.draft_vocab_ids.size()) : lm_head.N;
+  if (draft_head_vocab > static_cast<int64_t>(logits_dev_.size())) {
+    throw std::runtime_error("MtpHead::Draft: the draft head has " + std::to_string(draft_head_vocab) +
+                             " rows, more than the logits_rows this head was constructed for");
+  }
+  // Tensor parallel, full-vocab head (docs/tp.md 8.1, 6.2 H6): each step argmaxes this rank's
+  // vocab shard, and the ranks merge the (index, value) pairs on the host before the next step's
+  // embedding gather -- so the drafts arrive on the host one step at a time instead of through the
+  // device-resident chain below. The replicated reduced head needs no merge and keeps the chain.
+  const bool merge_steps = comm_ != nullptr && !reduced_vocab;
+#ifdef R4DX_TP_TESTING
+  if (debug_capture_) {
+    debug_rows_.clear();
+    debug_tokens_.clear();
+  }
+#endif
 
   // Preload this WHOLE draft window's positions/seqused_k in one H2D upload each -- was one
   // blocking CopyFromHost per step (device-resident draft loop, docs/mtp.md). Done unconditionally
@@ -180,7 +206,7 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
                          mrope_active ? rope3_dev_.data() + 3 * step : nullptr);
 
     uint16_t* h_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
-    Mlp mlp(cfg, w.layer.post_attention_layernorm, w.layer.mlp);
+    Mlp mlp(cfg, w.layer.post_attention_layernorm, w.layer.mlp, comm_);
     mlp.Forward(stream, arena, attn_out, h_out, /*T=*/1);
 
     // ---- mtp.norm -> draft lm_head (reduced-vocab if available/requested, else the shared
@@ -194,6 +220,48 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
     // draft_head_vocab elements, so reusing it here is always in-bounds either way.
     FinalLmHead head(cfg, w.norm, draft_head);
     head.Forward(stream, arena, h_out, logits_dev_.data(), /*T=*/1);
+    if (merge_steps) {
+      // H6: this rank's (lowest local index, value) of the shard's maximum, then the host merge --
+      // the full row's argmax with the lowest-index tie-break (docs/tp.md 7.3), identical on every
+      // rank. The sync is the step's host hop; every rank runs the same number of steps, so the
+      // all-gathers pair up.
+      r4dx_argmax_val_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), draft_head_vocab,
+                           reinterpret_cast<int64_t>(s));
+      stream.Synchronize();
+      tp::ArgmaxPair mine{};
+      R4DX_HIP_CHECK(hipMemcpy(&mine, argmax_pair_dev_.data(), sizeof(mine), hipMemcpyDeviceToHost));
+      mine.idx += static_cast<int32_t>(cfg.VocabShardBegin());  // local -> global id
+      std::array<tp::ArgmaxPair, 2> all{};                      // Model::Load allows world <= 2
+      comm_->HostAllGather(&mine, sizeof(mine), all.data());
+      const int32_t next_token = tp::MergeArgmax(all.data(), comm_->World());
+#ifdef R4DX_TP_TESTING
+      if (debug_capture_) {
+        // The step's full row in global id order: this rank's shard, all-gathered (rank order ==
+        // global id order). The device is idle (synchronized above).
+        debug_shard_host_.resize(static_cast<size_t>(draft_head_vocab));
+        R4DX_HIP_CHECK(hipMemcpy(debug_shard_host_.data(), logits_dev_.data(),
+                                 debug_shard_host_.size() * sizeof(float), hipMemcpyDeviceToHost));
+        const size_t row = static_cast<size_t>(draft_head_vocab) * static_cast<size_t>(comm_->World());
+        const size_t at = debug_rows_.size();
+        debug_rows_.resize(at + row);
+        comm_->HostAllGather(debug_shard_host_.data(), debug_shard_host_.size() * sizeof(float),
+                             debug_rows_.data() + at);
+        debug_tokens_.push_back(next_token);
+      }
+#endif
+      drafts.push_back(next_token);
+      cur_token = next_token;
+      cur_hidden = h_out;
+      if (device_resident) {
+        // The next step's gather input, uploaded after the host merge: a blocking H2D is safe here,
+        // the device is idle (synchronized above).
+        seed_token_dev_.CopyFromHost(&next_token, 1);
+        cur_token_dev = seed_token_dev_.data();
+      }
+      continue;
+    }
     if (reduced_vocab) {
       // logits_dev_[0..draft_head_vocab) holds this step's SUBSET logits -- argmax over exactly
       // that many elements gives a subset-LOCAL index, not a real vocab id yet.
@@ -234,12 +302,15 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
     }
   }
 
-  if (device_resident) {
+  if (device_resident && !merge_steps) {
     // The ONE sync + D2H for the whole k-step window, replacing what was previously k of each.
     stream.Synchronize();
     draft_ids_dev_.CopyToHost(draft_ids_host_.data(), static_cast<size_t>(k));
     drafts.assign(draft_ids_host_.begin(), draft_ids_host_.begin() + k);
   }
+#ifdef R4DX_TP_TESTING
+  if (debug_capture_) debug_drafts_ = drafts;
+#endif
   return drafts;
 }
 
@@ -336,8 +407,10 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
 
   // Output (h', the post-attention-sublayer activation) is discarded -- priming only needs the
   // K/V write (see this method's .h comment for why no mlp/norm/lm_head/chaining is needed here).
+  // prime_attn_layer_, not attn_layer_: its null communicator skips the o_proj all-reduce, whose
+  // sum nothing would read (docs/tp.md 6.2; identical to attn_layer_ at TP=1).
   uint16_t* discard_out = arena.Alloc<uint16_t>(static_cast<size_t>(n * hidden));
-  attn_layer_.Forward(arena, fc_out, discard_out, aw, kv_, static_cast<int>(n),
+  prime_attn_layer_.Forward(arena, fc_out, discard_out, aw, kv_, static_cast<int>(n),
                        static_cast<int>(base_pos), prime_positions_dev_.data(),
                        prime_seqused_dev_.data(), s, /*x_normed_in=*/nullptr,
                        /*next_norm_weight=*/nullptr, /*x_normed_out=*/nullptr, /*prof=*/nullptr,

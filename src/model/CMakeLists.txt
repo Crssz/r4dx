@@ -99,7 +99,7 @@ set_source_files_properties(tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp tp/tp_co
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
-add_library(r4dx_model STATIC
+set(R4DX_MODEL_SOURCES
   container.cpp
   gdn_layer.cpp
   mlp.cpp
@@ -112,23 +112,31 @@ add_library(r4dx_model STATIC
   local_text_model.cpp
   tp_model.cpp
 )
-target_include_directories(r4dx_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(r4dx_model PUBLIC
-  r4dx_model_linear
-  r4dx_core
-  r4dx_kernels
-  r4d_core
-  r4dx_hip_runtime
-  r4dx_model_kernels
-  r4dx_convert   # header-only: SafetensorsReader (container.cpp) + nlohmann/json (model_config.h)
-  # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
-  # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
-  r4dx_vision_tower
-  # Tensor parallel (docs/tp.md): the sharded Container::Load path plans every rank slice with
-  # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.
-  r4dx_tp_shard
-  r4dx_tp
-)
+# r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel
+# test hooks (Model::DflashDebugLastTop16 and friends, docs/tp.md 10.1 "P5 additions") -- linked only
+# by tests/model/test_tp_emulation and test_tp_real_vs_emulation, so the production binaries never
+# carry them. The define is PUBLIC: every TU that sees model.h in such a test must agree on it.
+foreach(lib r4dx_model r4dx_model_tptest)
+  add_library(${lib} STATIC ${R4DX_MODEL_SOURCES})
+  target_include_directories(${lib} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(${lib} PUBLIC
+    r4dx_model_linear
+    r4dx_core
+    r4dx_kernels
+    r4d_core
+    r4dx_hip_runtime
+    r4dx_model_kernels
+    r4dx_convert   # header-only: SafetensorsReader (container.cpp) + nlohmann/json (model_config.h)
+    # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
+    # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
+    r4dx_vision_tower
+    # Tensor parallel (docs/tp.md): the sharded Container::Load path plans every rank slice with
+    # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.
+    r4dx_tp_shard
+    r4dx_tp
+  )
+endforeach()
+target_compile_definitions(r4dx_model_tptest PUBLIC R4DX_TP_TESTING=1)
 
 # src/model/attention/** is another agent's -- guard so this configure never blocks on it existing
 # yet, per the task's own instruction.
@@ -136,5 +144,6 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/attention/CMakeLists.txt")
   add_subdirectory(attention)
   if(TARGET r4dx_model_attention)
     target_link_libraries(r4dx_model PUBLIC r4dx_model_attention)
+    target_link_libraries(r4dx_model_tptest PUBLIC r4dx_model_attention)
   endif()
 endif()

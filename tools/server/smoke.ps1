@@ -6,7 +6,8 @@
 
 .DESCRIPTION
   Only HIP device 1 may be used (project GPU rule) -- sets HIP_VISIBLE_DEVICES=1 before starting
-  r4dx-server.exe. Defaults to the 4-layer test container (qwen38-27b-l4-bf16.r4dx, --layout
+  r4dx-server.exe; the one exception is -Tp 2 in real mode, which uses both GPUs by design (docs/tp.md
+  9.2) under a TDR watch (see -Tp). Defaults to the 4-layer test container (qwen38-27b-l4-bf16.r4dx, --layout
   w4a16, in the directory matching build\<Preset>'s w4a16 group -- see -Model) -- that model's
   text is nonsense (4 of 64 layers, arbitrary quantized-layout weights on a model that was never actually trained/converted for real use at 4 layers), so this
   script only checks response/SSE *shapes* and token counts, never the generated text itself.
@@ -71,8 +72,55 @@
   coaxed into emitting a well-formed `<tool_call>` block, so this only produces a meaningful check
   against a real container (pass -Layers -1 with a real -Model).
 
+.PARAMETER Tp
+  Tensor parallelism (docs/tp.md 9.1, P5): 1 (default) is the single-device server on HIP device 1,
+  exactly as before this parameter existed. 2 starts r4dx-server with `--tp 2` (and `--tp-mode`, see
+  -TpMode) and passes the same `--tp 2 --tp-mode <mode>` to every r4dx-cli comparison run this script
+  makes, so server and CLI always run the same engine. In real mode (the default) HIP_VISIBLE_DEVICES
+  is REMOVED for the whole run (both GPUs: rank 0 = device 1, rank 1 = device 0, the desktop card),
+  the script refuses to start while any r4dx-server is already running (docs/tp.md 9.2), and the run
+  is wrapped in the device-0 TDR check (tools\tp\tdr_check.ps1, Appendix B N55/N64): every 20 s while
+  the server runs (a TDR stops the server at once, no retry), once more before the r4dx-cli
+  comparison run starts, then 30 s after the end, plus a scan of the server's and that r4dx-cli run's
+  stderr for HIP error 719. Any TDR fails the run. When that sampled comparison fails under -Tp 2,
+  the same seeded request also runs through r4dx-cli at --tp 1 (device 1), speculative and plain, and
+  the script says whether the mismatch is also there at TP=1 (the known class, docs/tp.md Appendix B
+  N29 / N80) or TP-specific; the check itself stays FAILED either way.
+
+.PARAMETER TpMode
+  With -Tp 2: real (default), emulate or noop -- passed to `--tp-mode`. emulate and noop keep
+  HIP_VISIBLE_DEVICES=1 (both ranks, or the one noop rank, on device 1), so they touch no device 0 and
+  run no TDR check. noop's tokens are meaningless (a no-op all-reduce, timing only): only shapes hold.
+
+.PARAMETER TpFault
+  With -Tp 2 (real or emulate): the recovery check of docs/tp.md 8.4 / gate G11. The server starts
+  with R4DX_TP_FAULT=<-TpFaultSpec> (default 1:3000:1: rank 1 stalls 700 ms before its 3000th
+  all-reduce after warm-up, so rank 0's all-reduce times out -- on device 1, the headless card, in real
+  mode). Right after the server is ready, before every other check: the reference request (the
+  standard smoke prompt, the first chat request below, greedy) is sent while the fault is still
+  pending; then request A, a long greedy generation that crosses the armed all-reduce (HTTP 500 or 200
+  are both accepted for A itself -- it is the fault request -- but the server log must show the fault
+  fired while A ran); then request B = the standard smoke prompt again, which must return 200 with
+  text equal to the reference, through a Reset() that recovered the group (the request log line's
+  `tp_recovery=yes`). The rest of the smoke then runs on the recovered server as usual.
+
+.PARAMETER TpFaultSpec
+  The R4DX_TP_FAULT value -TpFault uses ("<rank>:<n>:<kind>", docs/tp.md 9.1). Default 1:3000:1.
+  On the 4-layer default container the reference request uses 72 all-reduces (measured: 8 per
+  forward, one prefill chunk + 8 decode steps), so request A reaches #3000 about 366 tokens in; on
+  the 64-layer container (64 layers x 2 = 128 per forward) that is roughly 15 tokens in (computed,
+  not measured). A request A that ends before #3000 fails the "fault fired while request A ran" check.
+  In real mode a stall on rank 0 (0:<n>:1) is refused before anything starts: rank 1's all-reduce would
+  spin on HIP device 0, the desktop card, until it timed out (docs/tp.md Appendix B N61).
+
 .EXAMPLE
   .\tools\server\smoke.ps1
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Tp 2                 # both GPUs, the 4-layer default container
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Tp 2 -TpFault        # recovery after an injected all-reduce timeout
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Tp 2 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layers -1 -Dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -TpFault
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layout w4a16 -Layers -1
 .EXAMPLE
@@ -94,7 +142,11 @@ param(
     [string]$Dflash = "",
     [switch]$ToolRoundTrip,
     [switch]$Vision,
-    [string]$Preset = "win-hip"
+    [string]$Preset = "win-hip",
+    [ValidateSet(1, 2)][int]$Tp = 1,
+    [ValidateSet("", "real", "emulate", "noop")][string]$TpMode = "",
+    [switch]$TpFault,
+    [string]$TpFaultSpec = "1:3000:1"
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -210,9 +262,48 @@ function Invoke-SseStream {
     [pscustomobject]@{ Events = $events; TotalMs = $sw.Elapsed.TotalMilliseconds }
 }
 
-Write-Output "[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp"
-$env:HIP_VISIBLE_DEVICES = "1"
+# ---- tensor parallel (-Tp 2, docs/tp.md P5) ----------------------------------------------------
+if ($Tp -eq 1 -and ($TpMode -ne "" -or $TpFault)) { throw "-TpMode and -TpFault need -Tp 2" }
+$TpModeResolved = if ($TpMode) { $TpMode } else { "real" }
+if ($TpFault -and $TpModeResolved -eq "noop") {
+    throw "-TpFault needs -TpMode real or emulate (noop's all-reduce moves nothing, so there is nothing to fault)"
+}
+# Every r4dx-server and r4dx-cli this script starts runs the same engine.
+$TpArgs = @()
+if ($Tp -eq 2) { $TpArgs = @("--tp", "2", "--tp-mode", $TpModeResolved) }
+# Real mode is the one configuration that touches HIP device 0 (the desktop card): both GPUs, so no
+# other r4dx-server may be running (docs/tp.md 9.2), and the run is TDR-watched (see -Tp).
+$UsesDevice0 = ($Tp -eq 2 -and $TpModeResolved -eq "real")
+if ($UsesDevice0) {
+    $already = @(Get-Process r4dx-server -ErrorAction SilentlyContinue)
+    if ($already.Count -gt 0) {
+        throw ("an r4dx-server is already running (pid $(($already | ForEach-Object { $_.Id }) -join ', ')) -- " +
+               "stop it first: -Tp 2 uses both GPUs (docs/tp.md 9.2)")
+    }
+}
+$TdrCheck = Join-Path $RepoRoot "tools\tp\tdr_check.ps1"
+$TdrMarker = "$env:TEMP\r4dx-server-smoke.tdr.txt"
+# -TpFaultSpec (docs/tp.md 9.1's R4DX_TP_FAULT, parsed again by TpModel::Load): a stall (kind 1) makes
+# the OTHER rank's all-reduce kernel spin until it times out, so in real mode it must not be armed on
+# rank 0, whose peer is rank 1 on HIP device 0 -- the desktop card, which cannot preempt compute
+# (docs/tp.md Appendix B N61, N80).
+if ($TpFault) {
+    if ($TpFaultSpec -notmatch '^(\d+):(\d+):(\d+)$') { throw "-TpFaultSpec must be <rank>:<n>:<kind>, got '$TpFaultSpec'" }
+    if ($UsesDevice0 -and [int]$Matches[1] -eq 0 -and [int]$Matches[3] -eq 1) {
+        throw ("-TpFaultSpec $TpFaultSpec stalls rank 0, so rank 1's all-reduce would spin on HIP device 0 (the desktop " +
+               "card) until it times out; real-mode stalls go on rank 1 (docs/tp.md Appendix B N61)")
+    }
+}
+$RunStart = Get-Date
+# Restored in the finally below: -Tp 2 real removes HIP_VISIBLE_DEVICES and -TpFault sets R4DX_TP_FAULT,
+# and a caller that runs this in its own session must be left with neither change. Every environment
+# change, the server start and the TDR watch happen INSIDE that try, so no failure between them can
+# skip the restore, the server stop or the final TDR check (N80).
+$SavedHipVisible = $env:HIP_VISIBLE_DEVICES
+$SavedTpFault = $env:R4DX_TP_FAULT
 $ServerErrLog = "$env:TEMP\r4dx-server-smoke.err.log"
+$CliErrLog = "$env:TEMP\r4dx-server-smoke.cli.err.log"  # the -Tp 2 r4dx-cli comparison run's stderr
+Remove-Item -LiteralPath $CliErrLog -ErrorAction SilentlyContinue
 # 4096 (raised from 512, model-metadata/reasoning_content pass): the reasoning_content checks below
 # send `max_tokens: 1024` on the real container so a real thinking span has room to close and still
 # leave room for an answer -- 512 was too tight once thinking is on.
@@ -232,11 +323,38 @@ if ($Dflash -ne "") { $ServerArgList += @("--dflash", "$Dflash") }
 # check below would wrongly fail (not a server bug: the server is correctly answering the image).
 # -Vision itself passes no --vision override, so its own real-container run keeps the "auto" default.
 if (-not $Vision) { $ServerArgList += @("--vision", "off") }
-$proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgList -PassThru `
-  -RedirectStandardError $ServerErrLog `
-  -RedirectStandardOutput "$env:TEMP\r4dx-server-smoke.out.log"
+$ServerArgList += $TpArgs
+$proc = $null
+$tdrJob = $null
 
 try {
+    Write-Output ("[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp" +
+                  $(if ($Tp -eq 2) { " tp=2 tp-mode=$TpModeResolved" } else { "" }) +
+                  $(if ($TpFault) { " R4DX_TP_FAULT=$TpFaultSpec" } else { "" }))
+    if ($UsesDevice0) {
+        Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+        Write-Output ("[smoke] -Tp 2 real: HIP_VISIBLE_DEVICES removed (both GPUs); TDR watch from " +
+                      "$($RunStart.ToString('yyyy-MM-dd HH:mm:ss')), every 20 s")
+    } else {
+        $env:HIP_VISIBLE_DEVICES = "1"
+    }
+    # Never inherit an armed fault; -TpFault arms one for the server process only (removed right after
+    # it starts, so no r4dx-cli comparison run below sees it).
+    Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue
+    if ($TpFault) { $env:R4DX_TP_FAULT = $TpFaultSpec }
+    $proc = Start-Process -FilePath $ServerExe -ArgumentList $ServerArgList -PassThru `
+      -RedirectStandardError $ServerErrLog `
+      -RedirectStandardOutput "$env:TEMP\r4dx-server-smoke.out.log"
+    Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue
+
+    # In-run TDR watch (-Tp 2 real; tools\tp\tdr_watch.psm1's Start-TdrWatchJob, Appendix B N64/N77): a
+    # background job runs tdr_check every 20 s and, at the first TDR, writes $TdrMarker and stops the
+    # server at once -- no retry. Every request after that fails, and the finally below reports the TDR.
+    if ($UsesDevice0) {
+        Import-Module (Join-Path $RepoRoot "tools\tp\tdr_watch.psm1") -Force
+        $tdrJob = Start-TdrWatchJob -Since $RunStart -TargetPid $proc.Id -Marker $TdrMarker
+    }
+
     # Wait for the model to load and the listener to come up (container load alone can take
     # several seconds even for the 4-layer test container -- see docs/perf.md's load-time table
     # for the real 64-layer container's much longer load).
@@ -255,6 +373,94 @@ try {
     }
     if (-not $ready) { throw "server did not become ready within timeout" }
     Write-Output "[smoke] server ready"
+
+    # ---- --tp 2: the load reported every rank (engine.cpp's one VRAM line per rank) --------------
+    if ($Tp -eq 2) {
+        $rankLines = @(Select-String -Path $ServerErrLog -Pattern "[r4dx-server] tp rank " -SimpleMatch -ErrorAction SilentlyContinue)
+        $wantRanks = if ($TpModeResolved -eq "noop") { 1 } else { 2 }
+        Check ($rankLines.Count -eq $wantRanks) `
+            "--tp 2 --tp-mode ${TpModeResolved}: the load log has one 'tp rank' VRAM line per rank thread (got $($rankLines.Count), want $wantRanks)"
+        foreach ($l in $rankLines) { Write-Output "  [info] $($l.Line)" }
+    }
+
+    # ---- -TpFault: a request that hits an injected all-reduce fault, then recovery ---------------
+    # docs/tp.md 8.4 / gate G11. The fault (R4DX_TP_FAULT, armed at load) fires once, at the n-th
+    # all-reduce after warm-up; the reference below runs while it is still pending, request A crosses
+    # it, and request B -- the same request as the reference -- must come back 200 with the reference's
+    # text, through the Reset() that recovers the group (docs/tp.md 2.5). Runs first, so the fault's
+    # position does not depend on how many all-reduces the checks further down use.
+    if ($TpFault) {
+        $faultRefBody = @{
+            messages    = @(@{ role = "user"; content = "Say hello in one short sentence." })
+            max_tokens  = 8
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 5
+        $faultRefResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $faultRefBody -UseBasicParsing
+        $faultRef = $faultRefResp.Content | ConvertFrom-Json
+        Check ($faultRefResp.StatusCode -eq 200) "TpFault: the reference request (before the fault fires) returns 200"
+        $firedBefore = @(Select-String -Path $ServerErrLog -Pattern "fault injection (kind" -SimpleMatch -ErrorAction SilentlyContinue).Count
+        Check ($firedBefore -eq 0) "TpFault: the fault has not fired yet after the reference request"
+
+        # Request A: long and greedy, so it crosses the armed all-reduce on the 4-layer container too
+        # (see -TpFaultSpec).
+        $faultABody = @{
+            messages    = @(@{ role = "user"; content = "Write a long story about a lighthouse keeper who finds a message in a bottle. Use at least 600 words." })
+            max_tokens  = 512
+            temperature = 0
+            stream      = $false
+        } | ConvertTo-Json -Depth 5
+        $faultAStatus = 0
+        try {
+            $faultAResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json; charset=utf-8" -Body $faultABody -UseBasicParsing -TimeoutSec 900
+            $faultAStatus = [int]$faultAResp.StatusCode
+        } catch {
+            if ($null -eq $_.Exception.Response) { throw }
+            $faultAStatus = [int]$_.Exception.Response.StatusCode.value__
+        }
+        Check ($faultAStatus -eq 500 -or $faultAStatus -eq 200) "TpFault: request A (the fault request) returns 500 or 200 (got $faultAStatus)"
+        $fired = $false
+        for ($i = 0; $i -lt 20 -and -not $fired; $i++) {
+            $fired = @(Select-String -Path $ServerErrLog -Pattern "fault injection (kind" -SimpleMatch -ErrorAction SilentlyContinue).Count -gt 0
+            if (-not $fired) { Start-Sleep -Milliseconds 500 }
+        }
+        Check $fired "TpFault: the armed fault fired while request A ran (server log: 'fault injection (kind ...) at all-reduce #...')"
+        foreach ($l in @(Select-String -Path $ServerErrLog -Pattern "fault injection \(kind|\[r4dx-tp\] rank \d+ \(dev|tp: group needs recovery|tp: fatal" -ErrorAction SilentlyContinue)) {
+            Write-Output "  [info] $($l.Line)"
+        }
+        Check (-not $proc.HasExited) "TpFault: the server is still running after request A"
+
+        $faultBStatus = 0
+        $faultB = $null
+        try {
+            $faultBResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json; charset=utf-8" -Body $faultRefBody -UseBasicParsing
+            $faultBStatus = [int]$faultBResp.StatusCode
+            $faultB = $faultBResp.Content | ConvertFrom-Json
+        } catch {
+            if ($null -eq $_.Exception.Response) { throw }
+            $faultBStatus = [int]$_.Exception.Response.StatusCode.value__
+        }
+        Check ($faultBStatus -eq 200) "TpFault: request B (the standard smoke prompt, after the fault) returns 200 (got $faultBStatus)"
+        $refText = [string]$faultRef.choices[0].message.content
+        $bText = if ($null -ne $faultB) { [string]$faultB.choices[0].message.content } else { "" }
+        Check ($null -ne $faultB -and $bText -ceq $refText -and
+               $faultB.usage.completion_tokens -eq $faultRef.usage.completion_tokens -and
+               $faultB.choices[0].finish_reason -eq $faultRef.choices[0].finish_reason) `
+            ("TpFault: request B's text, token count and finish_reason equal the pre-fault reference " +
+             "(reference='$refText' B='$bText')")
+        $recovered = $false
+        for ($i = 0; $i -lt 20 -and -not $recovered; $i++) {
+            $recovered = @(Select-String -Path $ServerErrLog -Pattern " tp_recovery=yes" -SimpleMatch -ErrorAction SilentlyContinue).Count -gt 0
+            if (-not $recovered) { Start-Sleep -Milliseconds 500 }
+        }
+        Check $recovered "TpFault: request B's log line shows its Reset() recovered the group (tp_recovery=yes)"
+        foreach ($l in @(Select-String -Path $ServerErrLog -Pattern " tp_recovery=yes" -SimpleMatch -ErrorAction SilentlyContinue)) {
+            Write-Output "  [info] $($l.Line)"
+        }
+    }
 
     # ---- GET /v1/models ------------------------------------------------------------------------
     $modelsResp = Invoke-WebRequest -Uri "$BaseUrl/v1/models" -UseBasicParsing
@@ -491,6 +697,11 @@ try {
 
     $resetLines = @(Select-String -Path $ServerErrLog -Pattern "reset=" -SimpleMatch -ErrorAction SilentlyContinue)
     Check ($resetLines.Count -ge 1) "at least one request log line shows a cheap Model::Reset() (reset=...ms), not a reload"
+
+    if ($Tp -eq 2) {
+        $tpLines = @(Select-String -Path $ServerErrLog -Pattern " tp=2" -SimpleMatch -ErrorAction SilentlyContinue)
+        Check ($tpLines.Count -ge 1) "--tp 2: the per-request log lines carry tp=2 ($($tpLines.Count) so far)"
+    }
 
     if ($Mtp -gt 0) {
         $mtpLines = @(Select-String -Path $ServerErrLog -Pattern " mtp: " -SimpleMatch -ErrorAction SilentlyContinue)
@@ -1494,21 +1705,70 @@ try {
                 $proc.WaitForExit(10000) | Out-Null
             }
             $cliExe = Join-Path $RepoRoot "build\$Preset\src\cli\r4dx-cli.exe"
-            $cliArgs = @(
+            # -Tp 2: the same --tp 2 --tp-mode as the server ($TpArgs), so both sides run one engine.
+            $cliBaseArgs = @(
                 "--model", $Model, "--layout", $Layout, "--max-tokens", 24, "--max-ctx", $MaxCtx,
                 "--temperature", 0.7, "--top-k", 20, "--top-p", 0.8, "--seed", 12345,
                 "--prompt", "Write one short sentence about the ocean."
             )
+            $cliArgs = $cliBaseArgs + $TpArgs
+            if ($UsesDevice0) {
+                # The in-run watch targets the server's pid, which is gone: end it here (a TDR it saw
+                # already stopped the server and left $TdrMarker). The CLI run is short (one load plus
+                # 24 tokens); the finally's 30 s wait and tdr_check -Since $RunStart cover it, and its
+                # stderr joins the HIP error 719 scan there.
+                if ($null -ne $tdrJob) {
+                    Stop-Job $tdrJob -ErrorAction SilentlyContinue
+                    Remove-Job $tdrJob -Force -ErrorAction SilentlyContinue
+                    $tdrJob = $null
+                }
+                if (Test-Path -LiteralPath $TdrMarker) { throw "the in-run TDR watch saw a TDR -- not starting the r4dx-cli comparison run" }
+                # First TDR stops device-0 work: check before the next device-0 process starts.
+                & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "TDR since $RunStart -- not starting the r4dx-cli comparison run" }
+            }
             $prevPref = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             try {
-                $cliOut = ((& $cliExe @cliArgs 2>$null) -join "`n").Trim()
+                if ($Tp -eq 2) {
+                    $cliOut = ((& $cliExe @cliArgs 2>$CliErrLog) -join "`n").Trim()
+                } else {
+                    $cliOut = ((& $cliExe @cliArgs 2>$null) -join "`n").Trim()
+                }
             } finally {
                 $ErrorActionPreference = $prevPref
             }
-            Check ($cliOut -eq $seededChat1.choices[0].message.content.Trim()) `
+            $serverText = $seededChat1.choices[0].message.content.Trim()
+            Check ($cliOut -eq $serverText) `
                 ("sampled speculative path: server text matches a same-seeded plain sampled r4dx-cli " +
-                 "run (server='$($seededChat1.choices[0].message.content.Trim())' cli='$cliOut')")
+                 "run (server='$serverText' cli='$cliOut')")
+            if ($Tp -eq 2 -and $cliOut -ne $serverText) {
+                # A -Tp 2 mismatch alone does not say TP caused it: seeded speculative text also differs
+                # from plain at --tp 1 in the batched-verify class (docs/sampling.md 9.3, the validate
+                # scripts' controls) and in the known test_mtp CheckSampledRoundsMatchPlain [w4a16]
+                # failure (0/18 identical sampled trajectories at TP=1, docs/tp.md Appendix B N29). The
+                # control: the same seeded request through r4dx-cli at --tp 1 on device 1, speculative
+                # and plain. It changes no check -- it says which class the FAIL above is in (N80).
+                $env:HIP_VISIBLE_DEVICES = "1"
+                $specArgs = if ($Mtp -gt 0) { @("--mtp", "$Mtp") } else { @("--dflash", $Dflash) }
+                $prevPref = $ErrorActionPreference
+                $ErrorActionPreference = "Continue"
+                try {
+                    $tp1Plain = ((& $cliExe @cliBaseArgs 2>$null) -join "`n").Trim()
+                    $tp1Spec = ((& $cliExe @cliBaseArgs @specArgs 2>$null) -join "`n").Trim()
+                } finally {
+                    $ErrorActionPreference = $prevPref
+                }
+                if ($tp1Spec -ne $tp1Plain) {
+                    Write-Output ("  [info] TP=1 control: speculative and plain differ at --tp 1 too" +
+                                  $(if ($tp1Spec -eq $serverText -and $tp1Plain -eq $cliOut) { ", with exactly the --tp 2 texts" } else { "" }) +
+                                  " -- the pre-existing class (N29 / batched verify), not a TP regression by itself " +
+                                  "(tp1 spec='$tp1Spec' tp1 plain='$tp1Plain')")
+                } else {
+                    Write-Output ("  [info] TP=1 control: speculative == plain at --tp 1 ('$tp1Plain') -- the --tp 2 " +
+                                  "mismatch is TP-specific: investigate")
+                }
+            }
         } else {
             Write-Output ("  [SKIP] sampled speculative path: text matches a same-seeded CLI plain sampled run " +
                           "(only checked against a real container, -Layers -1 -- the 4-layer test container's " +
@@ -1517,9 +1777,48 @@ try {
     }
 
 } finally {
-    Write-Output "[smoke] stopping server (pid $($proc.Id))"
-    if (-not $proc.HasExited) {
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    # The environment restore sits in its own finally, so no failure in the cleanup above it can skip
+    # it; $proc / $tdrJob are null when the try failed before starting them (N80).
+    try {
+        if ($null -ne $proc) {
+            Write-Output "[smoke] stopping server (pid $($proc.Id))"
+            if (-not $proc.HasExited) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                $proc.WaitForExit(30000) | Out-Null
+            }
+        }
+        # ---- -Tp 2 real: the device-0 TDR check (tools\tp\tdr_check.ps1, Appendix B N55/N64) ------
+        if ($null -ne $tdrJob) {
+            Stop-Job $tdrJob -ErrorAction SilentlyContinue
+            Remove-Job $tdrJob -Force -ErrorAction SilentlyContinue
+        }
+        if ($UsesDevice0) {
+            if (Test-Path -LiteralPath $TdrMarker) {
+                Get-Content -LiteralPath $TdrMarker | ForEach-Object { Write-Output "  $_" }
+                Check $false "tp: the in-run TDR watch saw no TDR (it stopped the server, see above)"
+            }
+            Write-Output ("[smoke] device 0 in use since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss')): waiting 30 s for " +
+                          "Windows Error Reporting, then tdr_check")
+            Start-Sleep -Seconds 30
+            $tdrOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+            $tdrRc = $LASTEXITCODE
+            foreach ($l in @($tdrOut)) { Write-Output "  $l" }
+            Check ($tdrRc -eq 0) "tp: no TDR since the run started (tdr_check -Since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss')))"
+            # The P3 TDR reached HIP as error 719 (N44): such an error in the server's log, or in the
+            # r4dx-cli comparison run's (when there was one), is a suspected TDR.
+            $scanLogs = @(@($ServerErrLog, $CliErrLog) | Where-Object { Test-Path -LiteralPath $_ })
+            $hip719 = @()
+            if ($scanLogs.Count -gt 0) {
+                $hip719 = @(Select-String -LiteralPath $scanLogs -Pattern 'HIP error 719\b|unspecified launch failure')
+            }
+            Check ($hip719.Count -eq 0) ("tp: the server log" + $(if ($scanLogs.Count -gt 1) { " and the r4dx-cli run's" } else { "" }) +
+                                         " report no HIP error 719 / unspecified launch failure (a suspected TDR)")
+        }
+    } finally {
+        if ($null -ne $SavedHipVisible) { $env:HIP_VISIBLE_DEVICES = $SavedHipVisible }
+        else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
+        if ($null -ne $SavedTpFault) { $env:R4DX_TP_FAULT = $SavedTpFault }
+        else { Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue }
     }
 }
 

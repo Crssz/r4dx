@@ -17,12 +17,15 @@
 // it holds that rank's weight shard, runs on the rank-local config, all-reduces its three
 // row-parallel outputs per layer through the rank's core::TpComm, and merges every vocab-split
 // lm_head result across ranks itself, so each rank returns exactly what a full Model would (up to
-// the documented numerics, docs/tp.md 1.2). Supported so far (P2b): Prefill, DecodeStep,
-// DecodeStepGreedy, DecodeStepSampled (merged device row summaries, docs/tp.md 7.4) and the
-// speculative-verify primitives VerifyWindow / CommitVerifiedWindow / ReadVerifyLogitsRow (7.6).
-// DecodeStepMtp* and DecodeStepDflash* (their drafters' merges arrive in P5) and the profiled
-// methods (never, docs/tp.md 1.2) throw core::TpUnsupportedError on a TP rank. A rank must run
-// TpWarmup() once after Load and before its first user call (docs/tp.md 2.9 step 9).
+// the documented numerics, docs/tp.md 1.2). Supported: Prefill, PrefillMultimodal (host-resident
+// image rows spliced with an H2D copy, docs/tp.md 8.3), DecodeStep, DecodeStepGreedy,
+// DecodeStepSampled (merged device row summaries, docs/tp.md 7.4), the speculative-verify
+// primitives VerifyWindow / CommitVerifiedWindow / ReadVerifyLogitsRow (7.6), and the MTP (8.1)
+// and DFlash2 (8.2) rounds, whose drafters merge their vocab-split argmax / top-16 across ranks.
+// The vision tower lives on rank 0 only (HasVision() is its encode capability; every rank splices,
+// VisionSpliceEnabled()). Only the profiled methods (docs/tp.md 1.2) throw core::TpUnsupportedError
+// on a TP rank. A rank must run TpWarmup() once after Load and before its first user call
+// (docs/tp.md 2.9 step 9).
 #pragma once
 
 #include <cstdint>
@@ -57,10 +60,6 @@
 
 namespace r4dx::model {
 
-// The DFlash2 drafter's two host codebooks, read once per tensor-parallel process and shared by
-// every rank's drafter (docs/tp.md 8.2). Defined with DflashDraft::LoadHostCodebooks in P5; until
-// then TpRankOptions::dflash_codebooks is always null.
-struct DflashHostCodebooks;
 
 // Tensor parallel (docs/tp.md 3.3): which rank of which world THIS Model is. Default-constructed ==
 // TP=1, i.e. exactly the pre-TP Model. With world > 1, Model::Load loads rank `rank`'s shard of the
@@ -78,7 +77,10 @@ struct TpRankOptions {
   // 1 mirror, 0 host-only, -1 the Container's own free-VRAM heuristic (TP=1).
   int embed_device_resident_decided = -1;
   bool vision_weights_on_this_rank = true;  // TP: rank 0 only (docs/tp.md 8.3)
-  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;  // TP: one host copy (P5)
+  // TP: the DFlash2 drafter's two host codebooks, read ONCE per process (DflashDraft::
+  // LoadHostCodebooks) and shared by every rank's drafter (docs/tp.md 2.9 step 6, 8.2). Null =>
+  // the rank's drafter reads its own copy from ModelOptions::dflash_container.
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;
   // TP: bounded GPU submission in prefill chunks (tp/tp_submit.h, docs/tp.md Appendix B N57, N64):
   // force a submission after every `submit_layers` layers of a prefill chunk (0 = off; fewer layers
   // past 16k context, tp::UnitLayersForContext), and keep at most `max_inflight_units` such units
@@ -183,10 +185,9 @@ struct ModelOptions {
   // Exposed as `--vision {auto|on|off}` on both binaries.
   enum class VisionMode { kAuto, kOn, kOff };
   VisionMode vision = VisionMode::kAuto;
-  // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller.
-  // Staged (docs/tp.md 9.1, 2.9 step 1): with tp.world > 1, Load refuses `mtp_draft_k > 0`, a
-  // non-empty `dflash_container` and `vision == kOn` (TpUnsupportedError) until P5, and loads
-  // `kAuto` text-only.
+  // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
+  // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
+  // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
   TpRankOptions tp;
 };
 
@@ -231,17 +232,29 @@ class Model {
   // ---- vision tower (docs/vision.md) -----------------------------------------------------------
   // True iff this Model can encode an image: the container carried vision.* weights AND
   // ModelOptions::vision resolved to "on". EncodeImages throws otherwise, rather than returning
-  // an empty result a caller could mistake for a blank image.
+  // an empty result a caller could mistake for a blank image. Under tensor parallelism only the
+  // rank that holds the tower (rank 0) can encode (docs/tp.md 8.3).
   bool HasVision() const { return vision_.has_value() && container_.HasVision(); }
+  // True iff PrefillMultimodal may splice image rows: this Model knows the vision geometry (the
+  // tower is loaded, or -- on a tensor-parallel rank without it -- the vision config was parsed).
+  // Equal to HasVision() at TP=1; true on EVERY rank under TP (docs/tp.md 8.3).
+  bool VisionSpliceEnabled() const { return container_.HasVisionConfig(); }
 
   // `pixel_values`/`grids` are r4dx::vision::PreprocessImages' output (host, fp32). Writes the
   // merged image embeddings, [sum(merged tokens), hidden_size] bf16, into `out` on the device --
   // the rows that a later milestone splices into the text embedding sequence at the image
-  // placeholder positions.
+  // placeholder positions. On a tensor-parallel rank with bounded submission on
+  // (TpRankOptions::submit_layers > 0, docs/tp.md Appendix B N57) the encode synchronizes its stream
+  // before every encoder block, so at most one block is ever queued ahead of the host (an image on
+  // a device that cannot preempt compute must not queue the whole tower at once).
   void EncodeImages(const float* pixel_values, int64_t total_patches,
                     const std::vector<vision::GridThw>& grids, core::DeviceBuffer<uint16_t>* out,
                     vision::VisionEncodeStats* stats = nullptr,
                     const vision::VisionTrace* trace = nullptr);
+  // The tower's own encode stream, or nullptr without a tower. TpModel's recovery drains it on the
+  // tower's rank (docs/tp.md 2.5 step 1): no all-reduce ever runs on it, so the comm endpoints, which
+  // drain every stream they queued on, do not know it.
+  hipStream_t VisionStream() const { return vision_.has_value() ? vision_->StreamHandle() : nullptr; }
 
   // Number of tokens already committed into the KV/GDN state (0 before the first Prefill call).
   int64_t PositionCount() const { return pos_; }
@@ -663,17 +676,45 @@ class Model {
   // A TP rank's one-time warm-up, run by TpModel on every rank as ONE collective command right after
   // the ranks' Model::Load (the caller raises the all-reduce timeout around it). Uploads every
   // GdnControlCache key a sequence can ever use (Prewarm), then runs the real paths once through
-  // the public methods with fixed token ids 0..63 -- one 64-row Prefill chunk (all-reduce channel 1)
-  // and one DecodeStepGreedy (channel 0) -- which is each rank's first touch of every kernel module,
-  // PickTuning cache fill and weight page, then Reset()s and freezes the control cache (a later
-  // miss throws std::logic_error: no lazy hipMalloc inside a collective, docs/tp.md 6.3.7). The
-  // warm-up is greedy only, so SampledFallbackRows() stays 0. Requires a TP rank (tp.world > 1);
-  // call it exactly once.
+  // the public methods with fixed token ids 0..63 -- one 64-row Prefill chunk (all-reduce channel 1),
+  // one DecodeStepGreedy (channel 0) and, when enabled, one full-width speculative round
+  // (DecodeStepMtpGreedy at mtp_draft_k, or DecodeStepDflashGreedy at dflash_draft_k with the p_min /
+  // n_min gates off: the widest verify window and the H6/H7 merges) -- which is each rank's first
+  // touch of every kernel module, PickTuning cache fill and weight page, then Reset()s and freezes
+  // the control cache (a later miss throws std::logic_error: no lazy hipMalloc inside a collective,
+  // docs/tp.md 6.3.7). The warm-up is greedy only, so SampledFallbackRows() stays 0. It needs
+  // WarmupPositions() of KV capacity. Requires a TP rank (tp.world > 1); call it exactly once.
   void TpWarmup();
+  // The sequence positions TpWarmup writes: the 64-row chunk, the decode step and, with a drafter,
+  // the speculative round's verify window (DraftWindow() rows). TpModel::Load checks --max-ctx
+  // against it before loading.
+  static int64_t WarmupPositions(const ModelOptions& opts);
 
   // TP only: counters of the prefill submission bounding (docs/tp.md Appendix B N57) -- units forced
   // and time the cap waited, cumulative since Load. All zero at TP=1 or with submit_layers == 0.
   const tp::SubmitBounder::Stats& TpSubmitStats() const { return submit_.GetStats(); }
+
+#ifdef R4DX_TP_TESTING
+  // ---- test hooks (docs/tp.md 10.1 "P5 additions"; tests/model/test_tp_emulation.cpp) ----------
+  // Compiled only into the r4dx_model_tptest library variant (src/model/CMakeLists.txt), never into
+  // the production binaries.
+  //
+  // MTP (H6): while capture is on, every full-vocab draft step that merges its argmax across ranks
+  // also gathers its full [vocab] logits row (MtpHead::DebugSetCapture -- an extra host all-gather
+  // per step, the same on every rank). MtpDebugLastDraft returns the last Draft's rows ([steps *
+  // vocab], global id order) and merged tokens -- empty when no step merged (the reduced-vocab head,
+  // TP=1) -- and, if `drafts` is given, the tokens that Draft returned on whichever path it took.
+  // Requires MtpEnabled().
+  void MtpDebugSetCapture(bool on);
+  void MtpDebugLastDraft(std::vector<float>* rows, std::vector<int32_t>* tokens,
+                         std::vector<int32_t>* drafts = nullptr) const;
+  // DFlash2 (H7): the cand/unary the last DraftRound's selector walk consumed ([block_size * 16],
+  // the merged full-vocab top-16 under TP), and -- COLLECTIVE under TP, every rank must call it --
+  // that round's drafter logits gathered into full rows ([block_size * vocab], global id order).
+  // Valid until the next DraftRound. Require DflashEnabled().
+  void DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const;
+  void DflashDebugGatherDraftLogits(std::vector<float>* out);
+#endif
 
  private:
   Model() = default;
@@ -763,7 +804,7 @@ class Model {
   // Both ranks pass the same row counts (they are functions of replicated state only, 6.3.6 L2).
   void MergeShardResults(std::vector<tp::ArgmaxPair>& pairs, std::vector<kernels::RowSummary>* summaries);
   // Throws core::TpUnsupportedError naming `what` when this Model is a tensor-parallel rank: the
-  // paths TP does not support yet (the MTP and DFlash2 rounds, P5) or at all (profiling).
+  // paths TP does not support at all (profiling, docs/tp.md 1.2).
   void RequireNotTp(const char* what) const;
 
   Container container_;

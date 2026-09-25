@@ -87,10 +87,26 @@
   .DESCRIPTION) at the SAME seed/prompt/layout/sampling-config matches the mismatch's OWN hash
   exactly. A mismatch neither control reproduces exactly is a hard FAILED regardless of this switch.
 
+.PARAMETER Tp
+  Tensor parallelism (docs/tp.md P5, gate G12): 1 (default) runs everything on HIP device 1, exactly
+  as before this parameter existed. 2 passes `--tp 2` (real mode, both GPUs) to EVERY r4dx-cli run --
+  the plain sampled ground truth, both speculative modes and every control alike, so every comparison
+  is TP=2 against TP=2 -- and REMOVES HIP_VISIBLE_DEVICES and R4DX_TP_FAULT for the run (both
+  restored at the end, from a finally: an error or Ctrl-C restores them too). It refuses to start
+  while an r4dx-server is running (docs/tp.md 9.2); after every run it scans that run's stderr for HIP
+  error 719 and, 5 s later, checks for a device-0 TDR (tools\tp\tdr_check.ps1, Appendix B N55),
+  stopping at the first one (no retry); and on every exit it runs the check once more 30 s after the
+  last run. A TDR fails the script (exit 1). An MTP FAILED row at -Tp 2 is ambiguous on its own: the
+  known test_mtp CheckSampledRoundsMatchPlain [w4a16] failure (0/18 identical sampled trajectories at
+  TP=1, Appendix B N29) is this property -- run the same matrix at -Tp 1 on the same tree before
+  blaming TP (Appendix B N80).
+
 .EXAMPLE
   .\tools\validate_spec_sampling.ps1
 .EXAMPLE
   .\tools\validate_spec_sampling.ps1 -Quick -AllowBatchedVerifyDivergence
+.EXAMPLE
+  .\tools\validate_spec_sampling.ps1 -Tp 2 -Layouts w4a16 -AllowBatchedVerifyDivergence
 #>
 [CmdletBinding()]
 param(
@@ -101,12 +117,81 @@ param(
     [string]$Seeds = "1,2",
     [int]$MaxTokens = 48,
     [switch]$Quick,
-    [switch]$AllowBatchedVerifyDivergence
+    [switch]$AllowBatchedVerifyDivergence,
+    [ValidateSet(1, 2)][int]$Tp = 1
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
-$env:HIP_VISIBLE_DEVICES = '1'
+
+# ---- -Tp 2 (docs/tp.md P5): both GPUs, every r4dx-cli run under --tp 2, a TDR check after each ------
+# Same helpers as tools/validate_dflash.ps1's (see its comments).
+$SavedHipVisible = $env:HIP_VISIBLE_DEVICES
+$SavedTpFault = $env:R4DX_TP_FAULT
+$TdrCheck = Join-Path $PSScriptRoot "tp\tdr_check.ps1"
+$RunStart = Get-Date
+$CliErrLog = Join-Path $env:TEMP "validate_spec_sampling.cli.err.log"  # the latest r4dx-cli run's stderr
+$script:TdrSeen = $false
+$TpArgs = @()
+if ($Tp -eq 2) {
+    $running = @(Get-Process r4dx-server -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        throw "an r4dx-server is running (pid $(($running | ForEach-Object { $_.Id }) -join ', ')) -- stop it first: -Tp 2 uses both GPUs (docs/tp.md 9.2)"
+    }
+    $TpArgs = @("--tp", "2")  # the environment changes happen inside the try around the matrix (below)
+} else {
+    $env:HIP_VISIBLE_DEVICES = '1'
+}
+
+# -Tp 2, after every r4dx-cli run: HIP error 719 in its stderr, then (5 s later) tdr_check; the first
+# TDR stops device-0 work (throws; the finally around the matrix still runs the final check).
+function Assert-NoTdrYet {
+    if ($Tp -ne 2) { return }
+    $hip719 = @()
+    if (Test-Path -LiteralPath $CliErrLog) {
+        $hip719 = @(Select-String -LiteralPath $CliErrLog -Pattern 'HIP error 719\b|unspecified launch failure')
+    }
+    if ($hip719.Count -gt 0) {
+        $script:TdrSeen = $true
+        foreach ($l in $hip719) { Write-Host "  $($l.Line)" }
+        throw "suspected TDR (HIP error 719 in the r4dx-cli run's stderr) -- stopping all device-0 work (no retry)"
+    }
+    Start-Sleep -Seconds 5
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+    if ($LASTEXITCODE -ne 0) {
+        $script:TdrSeen = $true
+        foreach ($l in @($out)) { Write-Host "  $l" }
+        throw "TDR since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss')) -- stopping all device-0 work (no retry)"
+    }
+}
+
+# -Tp 2, from the finally around the matrix (every exit, a failure or Ctrl-C included): the final TDR
+# check 30 s after the last run, then the caller's HIP_VISIBLE_DEVICES and R4DX_TP_FAULT come back.
+function Complete-TpRun {
+    if ($Tp -ne 2) { return }
+    Write-Host "[validate_spec_sampling] waiting 30 s for Windows Error Reporting, then tdr_check -Since $($RunStart.ToString('yyyy-MM-dd HH:mm:ss'))"
+    Start-Sleep -Seconds 30
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $TdrCheck -Since $RunStart.ToString('yyyy-MM-ddTHH:mm:ss') -Quiet
+    $rc = $LASTEXITCODE
+    foreach ($l in @($out)) { Write-Output "  $l" }
+    if ($rc -ne 0) {
+        $script:TdrSeen = $true
+        Write-Output "[validate_spec_sampling] a TDR occurred during the run (see above)"
+    }
+    if ($null -ne $SavedHipVisible) { $env:HIP_VISIBLE_DEVICES = $SavedHipVisible }
+    else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
+    if ($null -ne $SavedTpFault) { $env:R4DX_TP_FAULT = $SavedTpFault }
+    else { Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue }
+}
+
+# Every exit after the matrix goes through here: a TDR (-Tp 2) turns any exit code into 1.
+function Exit-Validation([int]$code) {
+    if ($script:TdrSeen) {
+        Write-Output "[validate_spec_sampling] FAILED: a TDR occurred during the run"
+        $code = 1
+    }
+    exit $code
+}
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
@@ -204,15 +289,17 @@ function Invoke-Generation([string]$layout, [string]$prompt, [int]$maxCtx, [hash
     # only stdout carries the generated text this function needs to hash. Same $ErrorActionPreference
     # relaxation as validate_dflash.ps1's own Invoke-Generation, for the identical reason (Windows
     # PowerShell 5.1 turns a redirected-away stderr line from a native exe into a terminating
-    # NativeCommandError under "Stop").
+    # NativeCommandError under "Stop"). `$TpArgs` (-Tp 2): `--tp 2` on every mode alike. stderr goes to
+    # $CliErrLog (overwritten per run), which Assert-NoTdrYet scans under -Tp 2.
     $prevPref = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $out = & $Cli @commonArgs @modeArgs 2>$null
+        $out = & $Cli @commonArgs @modeArgs @TpArgs 2>$CliErrLog
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevPref
     }
+    Assert-NoTdrYet
     $joined = ($out -join "`n")
     if ($exitCode -ne 0) {
         throw "r4dx-cli exited $exitCode (layout=$layout max-ctx=$maxCtx mode=$mode seed=$seed) -- stdout was: $joined"
@@ -308,39 +395,59 @@ $results = @()
 $failures = 0
 $warnings = 0
 
-foreach ($layout in $LayoutList) {
-    foreach ($promptLabel in $Prompts.Keys) {
-        $promptInfo = $Prompts[$promptLabel]
-        foreach ($cfgLabel in $SamplingConfigs.Keys) {
-            $cfg = $SamplingConfigs[$cfgLabel]
-            foreach ($seed in $SeedList) {
-                Write-Output "[validate_spec_sampling] layout=$layout prompt=$promptLabel sampling=$cfgLabel seed=$seed ..."
-                $baseline = Invoke-Generation -layout $layout -prompt $promptInfo.Text -maxCtx $promptInfo.MaxCtx `
-                    -cfg $cfg -seed $seed -mode "baseline"
-                $hashBase = Get-Sha256Hex $baseline
+$aborted = $false
+try {
+    if ($Tp -eq 2) {
+        Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+        # TpModel::Load arms R4DX_TP_FAULT in every --tp 2 run: never inherit one (smoke.ps1 -TpFault's).
+        Remove-Item env:R4DX_TP_FAULT -ErrorAction SilentlyContinue
+        Write-Output ("[validate_spec_sampling] -Tp 2: --tp 2 on every r4dx-cli run, HIP_VISIBLE_DEVICES and " +
+                      "R4DX_TP_FAULT removed (both GPUs), TDR check after every run from " +
+                      "$($RunStart.ToString('yyyy-MM-dd HH:mm:ss'))")
+    }
+    foreach ($layout in $LayoutList) {
+        foreach ($promptLabel in $Prompts.Keys) {
+            $promptInfo = $Prompts[$promptLabel]
+            foreach ($cfgLabel in $SamplingConfigs.Keys) {
+                $cfg = $SamplingConfigs[$cfgLabel]
+                foreach ($seed in $SeedList) {
+                    Write-Output "[validate_spec_sampling] layout=$layout prompt=$promptLabel sampling=$cfgLabel seed=$seed ..."
+                    $baseline = Invoke-Generation -layout $layout -prompt $promptInfo.Text -maxCtx $promptInfo.MaxCtx `
+                        -cfg $cfg -seed $seed -mode "baseline"
+                    $hashBase = Get-Sha256Hex $baseline
 
-                $mtpControls = @(
-                    @{ Mode = "dflash"; Label = "--dflash k=7 (cross-family)" }
-                    @{ Mode = "control-mtp7"; Label = "--mtp 7 (same-family grouping)" }
-                )
-                $results += Test-OneCombination -layout $layout -promptLabel $promptLabel -prompt $promptInfo.Text `
-                    -maxCtx $promptInfo.MaxCtx -cfgLabel $cfgLabel -cfg $cfg -seed $seed `
-                    -targetMode "mtp" -targetLabel "--mtp 3" -controls $mtpControls `
-                    -baseline $baseline -hashBase $hashBase
+                    $mtpControls = @(
+                        @{ Mode = "dflash"; Label = "--dflash k=7 (cross-family)" }
+                        @{ Mode = "control-mtp7"; Label = "--mtp 7 (same-family grouping)" }
+                    )
+                    $results += Test-OneCombination -layout $layout -promptLabel $promptLabel -prompt $promptInfo.Text `
+                        -maxCtx $promptInfo.MaxCtx -cfgLabel $cfgLabel -cfg $cfg -seed $seed `
+                        -targetMode "mtp" -targetLabel "--mtp 3" -controls $mtpControls `
+                        -baseline $baseline -hashBase $hashBase
 
-                $dflashControls = @(
-                    @{ Mode = "control-mtp7"; Label = "--mtp 7 (cross-family)" }
-                    @{ Mode = "dflash-alt"; Label = "--dflash $DflashAlt (same-family grouping)"; DraftPath = $DflashAlt
-                       SkipIf = { -not $HasDflashAlt }; SkipReason = "$DflashAlt not found" }
-                )
-                $results += Test-OneCombination -layout $layout -promptLabel $promptLabel -prompt $promptInfo.Text `
-                    -maxCtx $promptInfo.MaxCtx -cfgLabel $cfgLabel -cfg $cfg -seed $seed `
-                    -targetMode "dflash" -targetLabel "--dflash k=7" -controls $dflashControls `
-                    -baseline $baseline -hashBase $hashBase
+                    $dflashControls = @(
+                        @{ Mode = "control-mtp7"; Label = "--mtp 7 (cross-family)" }
+                        @{ Mode = "dflash-alt"; Label = "--dflash $DflashAlt (same-family grouping)"; DraftPath = $DflashAlt
+                           SkipIf = { -not $HasDflashAlt }; SkipReason = "$DflashAlt not found" }
+                    )
+                    $results += Test-OneCombination -layout $layout -promptLabel $promptLabel -prompt $promptInfo.Text `
+                        -maxCtx $promptInfo.MaxCtx -cfgLabel $cfgLabel -cfg $cfg -seed $seed `
+                        -targetMode "dflash" -targetLabel "--dflash k=7" -controls $dflashControls `
+                        -baseline $baseline -hashBase $hashBase
+                }
             }
         }
     }
+} catch {
+    # A failed run or (-Tp 2) a TDR: reported here; the finally still runs the final TDR check.
+    Write-Output "[validate_spec_sampling] ABORTED: $_"
+    $aborted = $true
+} finally {
+    # A finally, not only the catch: Ctrl-C skips catch blocks but runs finally blocks (docs/tp.md
+    # Appendix B N80).
+    Complete-TpRun
 }
+if ($aborted) { Exit-Validation 1 }
 
 foreach ($r in $results) {
     if ($r.Status -like "FAILED*") { $failures++ }
@@ -353,11 +460,11 @@ $results | Format-Table -AutoSize | Out-String | Write-Output
 
 if ($failures -gt 0) {
     Write-Output "[validate_spec_sampling] FAILED: $failures / $($results.Count) combinations diverged (not accepted as the known batched-verify mechanism)"
-    exit 1
+    Exit-Validation 1
 }
 if ($warnings -gt 0) {
     Write-Output "[validate_spec_sampling] PASSED WITH WARNINGS: $($results.Count - $warnings) byte-identical, $warnings accepted as the known batched-verify divergence mechanism (docs/sampling.md section 9.3)"
-    exit 0
+    Exit-Validation 0
 }
 Write-Output "[validate_spec_sampling] PASSED: $($results.Count) / $($results.Count) combinations byte-identical"
-exit 0
+Exit-Validation 0

@@ -7,6 +7,11 @@
 # search+imatrix, attn.k/v kept bf16) and appends its own converter flags:
 #
 #   .\tools\quant2\run_variants.ps1 -Variant 'q2ab_ldlq=--rotate q2ab --hessian-dir D:\models\r4dx\hessian-v1 --ldlq .'
+#
+# -ExtraKl name=tokens.json=refdir (repeatable) also scores each container on another tokens file
+# against its own bf16 reference, stored as extra.<name> on the row (kl_<variant>.<name>.json). The
+# default adds the canonically tokenized Thai segment (docs/quant2.md 3.4); tokens.json's Thai
+# segment is the AutoTokenizer (split-mark) form, kept for comparability with earlier rows.
 param(
   [Parameter(Mandatory = $true)][string[]]$Variant,
   [string]$OutDir = 'D:\models\r4dx\kl-q2',
@@ -14,6 +19,7 @@ param(
   [string]$ContainerDir = 'D:\models\r4dx',
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
   [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string[]]$ExtraKl = @('thai_canon=tools\reference\kl_corpus\tokens_thai_canon.json=D:\models\r4dx\kl-thai-canon\ref'),
   [switch]$DeleteContainers
 )
 $ErrorActionPreference = 'Stop'
@@ -70,6 +76,22 @@ foreach ($v in $Variant) {
   }
   $env:HIP_VISIBLE_DEVICES = '1'
   if (Get-Process r4dx-server -ErrorAction SilentlyContinue) { throw '[var] stop r4dx-server first' }
+  # Extra tokens files first: kl_<name>.json (written last) is what marks the variant measured.
+  $extraRows = [ordered]@{}
+  foreach ($x in $ExtraKl) {
+    $xn, $xtok, $xref = $x -split '=', 3
+    if (-not (Test-Path (Join-Path $xref 'reference_run.json'))) { throw "[var] -ExtraKl ${xn}: no reference in $xref" }
+    $xkl = Join-Path $OutDir "kl_$name.$xn.json"
+    if (-not (Test-Path $xkl)) {
+      $xdir = Join-Path $OutDir "tf_$name.$xn"
+      New-Item -ItemType Directory -Force $xdir | Out-Null
+      Run "tf_$name.$xn" { & $tool --model $container --layout w4a16 --tokens $xtok --out-dir $xdir --max-ctx 4096 --vision off }
+      Run "kl_$name.$xn" { & $Python tools\reference\kl_report.py --ref-dir $xref --test-dir $xdir --tokens $xtok --out $xkl }
+      Remove-Item -Recurse -Force $xdir
+    }
+    $xj = Get-Content $xkl -Raw | ConvertFrom-Json
+    $extraRows[$xn] = [ordered]@{ mean_kl = $xj.overall.mean_kl; top1_pct = $xj.overall.top1_agreement_pct }
+  }
   $dir = Join-Path $OutDir "tf_$name"
   New-Item -ItemType Directory -Force $dir | Out-Null
   Run "tf_$name" { & $tool --model $container --layout w4a16 --tokens $tokens --out-dir $dir --max-ctx 4096 --vision off }
@@ -79,8 +101,10 @@ foreach ($v in $Variant) {
   $segs = [ordered]@{}; foreach ($s in $j.segments) { $segs[$s.name] = [math]::Round($s.mean_kl, 5) }
   $results += [pscustomobject]@{ name = $name; flags = $extra; mean_kl = $j.overall.mean_kl;
     median_kl = $j.overall.median_kl; top1_pct = $j.overall.top1_agreement_pct; p99_kl = $j.overall.p99_kl;
-    segments = $segs; bytes = (Get-Item $container).Length; convert_min = [string](Get-Content $done -Raw).Trim() }
-  ConvertTo-Json -InputObject @($results) -Depth 4 | Set-Content -Encoding utf8 $resultsPath
-  Write-Host ("[var] {0,-16} mean KL {1:N5}  top-1 {2:N2}%" -f $name, $j.overall.mean_kl, $j.overall.top1_agreement_pct)
+    segments = $segs; extra = $extraRows; bytes = (Get-Item $container).Length
+    convert_min = [string](Get-Content $done -Raw).Trim() }
+  ConvertTo-Json -InputObject @($results) -Depth 5 | Set-Content -Encoding utf8 $resultsPath
+  Write-Host ("[var] {0,-16} mean KL {1:N5}  top-1 {2:N2}%  {3}" -f $name, $j.overall.mean_kl, $j.overall.top1_agreement_pct,
+    (($extraRows.Keys | ForEach-Object { "{0} {1:N5}" -f $_, $extraRows[$_].mean_kl }) -join '  '))
   if ($DeleteContainers) { Remove-Item -Force $container }
 }

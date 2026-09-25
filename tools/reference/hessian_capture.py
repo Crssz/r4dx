@@ -173,6 +173,7 @@ import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -1222,6 +1223,7 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
         files, method, commit = repo_code_files(getattr(args, "code_rev", None))
         blobs = git_blobs(commit, files) if commit is not None else None
         parts = []
+        nfc_files = []
         for rel in files:
             raw = blobs[rel] if blobs is not None else (REPO_ROOT / rel).read_bytes()
             # CRLF -> LF: with core.autocrlf=true the checkout's line endings are a property of the
@@ -1230,6 +1232,13 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
             body = body.replace("\r\n", "\n")
             if not body.endswith("\n"):
                 body += "\n"
+            # Canonical tokenization refuses non-NFC text (common.RefTokenizer); the tree carries
+            # such text on purpose (tests/reference/test_hessian_corpus.py's non-NFC probe, from
+            # f87a4b0 on), so the canonical path NFC-normalizes each file and names the ones it
+            # changed. hf-auto keeps the bytes as they are (hessian-v1's corpus reproduces).
+            if tokenizer.mode == "canonical" and not unicodedata.is_normalized("NFC", body):
+                body = unicodedata.normalize("NFC", body)
+                nfc_files.append(rel)
             parts.append(f"==> {rel} <==\n{body}")
             code_parts.append((rel, body))
         text = "".join(parts)
@@ -1248,7 +1257,10 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
                         [p + "**" for p in CODE_EXCLUDE_PREFIXES],
                         "sha256_of_concatenation": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                         "concatenation_tokens": len(ids), "tokens": n * L, "sequences": n,
-                        "window_starts": starts, "file_list": files})
+                        "window_starts": starts, "file_list": files,
+                        # only when non-empty, so a tree with no non-NFC file records exactly what
+                        # it did before this field existed (hessian-v2 at 714955f; --rms-only).
+                        **({"nfc_normalized_files": nfc_files} if nfc_files else {})})
 
     # The disjointness check over sources 1-3 (the gen samples are gated in build_gen_corpus, before
     # tokenizing): every window, decoded back to exactly the text the Hessians see, against

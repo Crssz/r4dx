@@ -110,7 +110,11 @@ param(
   [switch]$KeepContainers,
   [switch]$KeepLogprobs,
   [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
-  [string]$Tool = ''            # default: this worktree's tool_teacher_forced_logprobs.exe
+  [string]$Tool = '',           # default: this worktree's tool_teacher_forced_logprobs.exe
+  # The rung-4 tokens file every candidate is scored on (and -RefDir's reference was dumped from).
+  # tokens.json's thai_prose is the AutoTokenizer split-mark form; tokens_canon.json is the same four
+  # texts tokenized as r4dx serves them (docs/quant2.md 3.4) -- the one to allocate against.
+  [string]$Tokens = 'tools\reference\kl_corpus\tokens.json'
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -126,7 +130,8 @@ if (-not $RefDir) { $RefDir = Join-Path $OutDir 'ref' }
 # not the main checkout's (which q1_pilot.ps1 can use, its containers being single-group).
 if (-not $Tool) { $Tool = Join-Path $repo 'build\win-hip\tests\model\tool_teacher_forced_logprobs.exe' }
 $conv = Join-Path $repo 'build\win-hip\src\convert\r4dx-convert.exe'
-$tokens = 'tools\reference\kl_corpus\tokens.json'
+$tokens = $Tokens
+if (-not (Test-Path $tokens)) { throw "[q3] -Tokens $tokens not found" }
 
 function Run([string]$name, [scriptblock]$cmd) {
   $log = Join-Path $OutDir "$name.log"

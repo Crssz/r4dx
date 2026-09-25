@@ -1150,6 +1150,24 @@ The DFlash column follows each container's own greedy text (acceptance of one pr
 across containers), so four prompts do not resolve a quality effect on acceptance; plain decode is the
 per-token cost the gates mean.
 
+**Thai, tokenized as the model is served (3.4).** `tokens.json`'s `thai_prose` segment is the
+AutoTokenizer split-mark form (1024 of 2325 tokens; the same text is 1220 canonical tokens), a token
+stream r4dx never produces. Re-measured on `kl_corpus/tokens_thai_canon.json` (the same text, first
+1024 canonical tokens, its own bf16 reference `D:\models\r4dx\kl-thai-canon\ref`):
+
+| container | thai (split, above) | **thai (canonical)** | top-1 canonical | 4-segment mean with canonical thai |
+|---|--:|--:|--:|--:|
+| v6 | 0.0745 | **0.0391** | 90.71% | ~0.0297 |
+| q1full | 0.0500 | **0.0312** | 91.98% | ~0.0207 |
+| q2ab_ldlq | 0.0446 | **0.0271** | 91.01% | ~0.0182 |
+| q2ab_nokv | 0.0461 | **0.0277** | 90.71% | ~0.0187 |
+
+Half of the "Thai is 2x English" gap was the split tokenization. On served Thai, q2ab_ldlq removes 31%
+of v6's KL (the split segment said 40%), and Thai is still the worst segment. The Q4_K_M figure
+quoted since Milestone 11 (0.011-0.014, docs/validation.md) is llama.cpp's published
+`llama-perplexity --kl-divergence` number on English WikiText, not rung 4 on `kl_corpus/`: it is not
+comparable with any row here until a Q4_K_M model is scored on the same tokens.
+
 Gates: G3 **failed** narrowly (-9.5% vs the -10% bar; KL fell in every segment) -- Q2 went ahead as a
 stated deviation because it was already built and LDLQ is expected to need the rotation. G4 **passed**
 (q1full -34%, speed-neutral; validate_dflash 3/3 and server smoke 205/0). G5 **passed** (rotated vs

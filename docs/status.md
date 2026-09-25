@@ -255,7 +255,12 @@ detail: [vision.md](vision.md)'s "User-facing wiring: --image and image_url" and
    `finish=stop`) and fall to a full re-prefill plus a full re-encode. A new `vision multi-turn
    (free-form)` smoke case replays a Japanese answer and asserts the two outcomes stay consistent
    (reused => nothing re-encoded; not reused => image re-encoded and whole prompt re-prefilled)
-   rather than asserting a coin flip. Full table: docs/server.md's "Prefix cache, image-aware".
+   rather than asserting a coin flip. Until 2026-09-25 it replayed Latin-1 mojibake, not the
+   answer: the server's responses named no charset, so the smoke's `Invoke-WebRequest` decoded
+   turn 1 as Latin-1, and every earlier pass took the not-reused branch. With `charset=utf-8` on
+   every response, a TP=1 `-Vision` run on v6 replays the real Japanese answer (28 non-ASCII
+   characters) and reuses the prefix (`prompt_n` 22 of 128, no re-encode). Full table:
+   docs/server.md's "Prefix cache, image-aware".
 5. **`/v1/models`**: `architecture.input_modalities`/`modalities`/`capabilities` gain `"image"`
    when `Model::HasVision()` is true (the one-line switch stage 1 prepared); `usage.prompt_tokens`
    already counted image tokens with no code change needed (they are part of the expanded token

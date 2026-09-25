@@ -8,6 +8,17 @@
 #include "response_sink.h"
 #include "sse.h"
 
+// httplib picks what to compress by the EXACT Content-Type string
+// (detail::can_compress_content_type): it exempts SSE only as a bare "text/event-stream" and lists
+// only a bare "application/json". So with kSseContentType / kJsonContentType (http_server.h) a
+// stream would count as compressible text/* and JSON bodies would not. No compressor is compiled in
+// today, so nothing is compressed at all; but a compressed stream stops arriving live (httpx, under
+// the OpenAI Python SDK, sends `Accept-Encoding: gzip, deflate` by default), so enabling one must
+// first teach httplib the charset forms.
+#if defined(CPPHTTPLIB_ZLIB_SUPPORT) || defined(CPPHTTPLIB_BROTLI_SUPPORT)
+#error "httplib compression is on: exempt kSseContentType from it first (see the comment above)"
+#endif
+
 namespace r4dx::server {
 
 namespace {
@@ -29,7 +40,7 @@ void RespondError(httplib::Response& res, const ApiError& err) {
   // bytes are replaced with U+FFFD instead of taking the whole response down. Nothing this server
   // generates itself is ever invalid UTF-8, so no well-formed response changes.
   res.set_content(ErrorBody(err).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
-                   "application/json");
+                   kJsonContentType);
 }
 
 void RespondError(httplib::Response& res, int status, const std::string& type,
@@ -66,7 +77,7 @@ void ServeStream(httplib::Response& res, std::shared_ptr<StreamingSink> sink) {
   res.set_header("Cache-Control", "no-cache");
   res.set_header("X-Accel-Buffering", "no");  // hint reverse proxies not to buffer the stream
   res.set_chunked_content_provider(
-      "text/event-stream",
+      kSseContentType,
       [sink](size_t /*offset*/, httplib::DataSink& ds) -> bool {
         // cpp-httplib's chunked-provider contract (detail::write_content_chunked): returning
         // false from this callback is treated as Error::Canceled -- the response is aborted
@@ -106,18 +117,18 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
     if (engine_ref.TpFatal()) {
       res.status = 503;
       nlohmann::json body = {{"status", "tp_fatal"}, {"model", engine_ref.ModelId()}};
-      res.set_content(body.dump(), "application/json");
+      res.set_content(body.dump(), kJsonContentType);
       return;
     }
     nlohmann::json body = {{"status", "ok"}, {"model", engine_ref.ModelId()}};
-    res.set_content(body.dump(), "application/json");
+    res.set_content(body.dump(), kJsonContentType);
   });
 
   svr.Get("/v1/models", [&engine_ref](const httplib::Request&, httplib::Response& res) {
     res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
                                          engine_ref.DefaultThinking(), engine_ref.HasVision())
                          .dump(),
-                     "application/json");
+                     kJsonContentType);
   });
 
   // GET /v1/models/{id} (task item 1): this server ever loads exactly one model, so any id other
@@ -129,8 +140,8 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
   // checkpoint's own `model_id` IS `"Qwen/Qwen3.8-27B"` (`__metadata__.model_id`,
   // docs/container-format.md) -- a real HuggingFace-style "org/repo" id containing a literal "/".
   // `:id` would 404 on the container's own real id (caught end to end by `tools/server/smoke.ps1`,
-  // not by any CPU-only unit test, since none of them drive real httplib routing). `(.+)` greedily
-  // captures everything after the prefix, slashes included.
+  // and on CPU by tests/server/test_http_server.cpp, whose fake model's id is "fake/scripted").
+  // `(.+)` greedily captures everything after the prefix, slashes included.
   svr.Get(R"(/v1/models/(.+))", [&engine_ref](const httplib::Request& httpreq, httplib::Response& res) {
     const std::string requested_id = httpreq.matches[1];
     if (requested_id != engine_ref.ModelId()) {
@@ -142,7 +153,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
     res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
                                          engine_ref.DefaultThinking(), engine_ref.HasVision())
                          .dump(),
-                     "application/json");
+                     kJsonContentType);
   });
 
   svr.Post("/v1/chat/completions", [&engine_ref](const httplib::Request& httpreq,
@@ -224,7 +235,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                                                      sink->finish_reason, usage, sink->timings,
                                                      reasoning_content)
                              .dump(),
-                         "application/json");
+                         kJsonContentType);
       }
     } catch (const ApiError& err) {
       RespondError(res, err);
@@ -278,7 +289,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
             BuildCompletionResponse(id, model_id, created, sink->text, sink->finish_reason, usage,
                                     sink->timings)
                 .dump(),
-            "application/json");
+            kJsonContentType);
       }
     } catch (const ApiError& err) {
       RespondError(res, err);
@@ -291,6 +302,10 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 HttpServer::~HttpServer() = default;
 
 bool HttpServer::Listen(const std::string& host, int port) { return impl_->svr.listen(host, port); }
+
+int HttpServer::BindToAnyPort(const std::string& host) { return impl_->svr.bind_to_any_port(host); }
+
+bool HttpServer::ListenAfterBind() { return impl_->svr.listen_after_bind(); }
 
 void HttpServer::Stop() { impl_->svr.stop(); }
 

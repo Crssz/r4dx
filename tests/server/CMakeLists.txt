@@ -2,8 +2,9 @@
 # JSON building, SSE chunk formatting, the bounded request queue, ResponseSink) -- no HIP device
 # needed, plain add_test() COMMANDs like tests/cli's test_cli_args, not the ENVIRONMENT/
 # SKIP_RETURN_CODE-gated pattern tests/model uses. src/server/engine.cpp/http_server.cpp (the
-# HIP+httplib-dependent half) are exercised instead by tools/server/smoke.ps1 against a real
-# container on HIP device 1 -- see docs/server.md.
+# HIP+httplib-dependent half) are exercised against a real container on HIP device 1 by
+# tools/server/smoke.ps1 -- see docs/server.md -- and, against CPU fakes of the model, by
+# test_engine_recovery and test_http_server below.
 set(R4DX_SERVER_TESTS
   test_server_args
   test_openai_types
@@ -50,6 +51,39 @@ if(R4DX_BUILD_SERVER)
   )
   add_test(NAME test_engine_recovery COMMAND test_engine_recovery)
   set_tests_properties(test_engine_recovery PROPERTIES
+    ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+    SKIP_RETURN_CODE 77
+  )
+
+  # test_http_server: http_server.cpp's routes end to end -- a real Engine and HttpServer on an
+  # OS-chosen loopback port (HttpServer::BindToAnyPort), a scripted CPU fake of the TP=1 model,
+  # httplib's own client (the response Content-Type charset, and streamed vs non-streamed content as
+  # a client reads them). Same GPU-free setup, link line, include order and tokenizer-directory skip
+  # as test_engine_recovery above (http_server.h's content-type constants are checked before that
+  # skip), plus third_party/httplib for the server and the client.
+  add_executable(test_http_server test_http_server.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/engine.cpp
+    ${CMAKE_SOURCE_DIR}/src/server/http_server.cpp
+  )
+  target_include_directories(test_http_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/third_party/httplib
+    ${CMAKE_SOURCE_DIR}/src/server
+  )
+  target_compile_definitions(test_http_server PRIVATE
+    R4DX_TOKENIZER_MODEL_DIR="${R4DX_TOKENIZER_MODEL_DIR}"
+  )
+  target_link_libraries(test_http_server PRIVATE
+    r4dx_server_core
+    r4dx_model
+    r4dx_tokenizer
+    r4dx_core
+    r4dx_kernels
+    r4d_core
+    r4dx_hip_runtime
+  )
+  add_test(NAME test_http_server COMMAND test_http_server)
+  set_tests_properties(test_http_server PROPERTIES
     ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
     SKIP_RETURN_CODE 77
   )

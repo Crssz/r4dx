@@ -3889,7 +3889,11 @@ P5 server side (`src/server`, `tests/server`, `tools/server/smoke.ps1`, the vali
       114-token text). Not a gate row. **It predates TP:** the frozen `build\baseline` server
       (`aa54c20`, before any TP code) run through the same `smoke.ps1` and command on device 1 gives
       the same 159 / 1 / 1 and the same FAIL, 283 vs 286 bytes (`smoke_baseline_aa54c20_mtp3.log`).
-      It is a streaming-assembly bug on `main`, left for a separate fix.
+      It is a streaming-assembly bug on `main`, left for a separate fix. (Traced later, 2026-09-25:
+      not stream assembly, and not MTP: plain decode gives the same answer. The server's two
+      contents were the same 286 UTF-8 bytes. The answer's `×` and `→` went out under a
+      charset-less `application/json`, which the smoke's PowerShell 5.1 client decodes as Latin-1.
+      Fixed by declaring `charset=utf-8`: docs/server.md "Response shapes".)
     - **Server TP=1 greedy A/B on the gated binary** (N75's loop change, which G2 does not cover):
       `build\baseline` `r4dx-server` vs the gated `E2673BC0...`, v6 w4a16, `--max-ctx 4096`, three
       `temperature 0` chat requests (84, 160 and 9 completion tokens), device 1: all three

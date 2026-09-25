@@ -41,8 +41,38 @@ carry a tool result back to the model (see "Tool calls" below). A message may al
 Standard OpenAI `chat.completion` / `chat.completion.chunk` / `text_completion` objects, including
 `usage.{prompt_tokens,completion_tokens,total_tokens}` and `finish_reason` (`"stop"` -- EOS or a
 `stop` string matched; `"length"` -- `max_tokens` reached; `"cancelled"` -- client disconnected
-mid-stream). Streaming responses are `Content-Type: text/event-stream`, one `data: <json>\n\n`
-event per chunk, terminated by the literal line `data: [DONE]\n\n`.
+mid-stream). Streaming responses are `Content-Type: text/event-stream; charset=utf-8`, one
+`data: <json>\n\n` event per chunk, terminated by the literal line `data: [DONE]\n\n`. Every other
+response, including every error body, is `Content-Type: application/json; charset=utf-8`.
+
+**Why the charset is spelled out** (2026-09-25). Every body is UTF-8, and non-ASCII text goes out
+as raw UTF-8, not `\u` escapes. RFC 8259 gives `application/json` no charset parameter, and the SSE
+spec fixes `text/event-stream` to UTF-8, so a conforming client needs neither. Windows PowerShell 5.1
+does not conform: `Invoke-WebRequest` / `Invoke-RestMethod` decode a body whose `Content-Type` names
+no charset as ISO-8859-1. A local probe served the same UTF-8 JSON both ways. With the bare type,
+`12 + 30 = 42 × → done` (21 characters) came back as 24 characters: `×` became `Ã` + U+0097 and `→`
+became `â` + U+0086 + U+0092. With `; charset=utf-8` it came back intact. That was the whole
+of `smoke.ps1 -Model <v6> -Layers -1 -Mtp 3`'s one failure, "thinking+tools: streamed content
+concatenation == non-streaming message.content (streamed 283 bytes, non-streaming 286 bytes)". The
+check's lengths were UTF-16 characters, not bytes; it now prints both, and after the fix reads
+"streamed 283 chars, 286 UTF-8 bytes; non-streaming 283 chars, 286 UTF-8 bytes". That run's answer
+carries one `×` and one `→`.
+Captured raw, the server's streamed content (149 deltas) and its non-streaming `message.content` were
+the same 286 UTF-8 bytes. The smoke read the SSE side as UTF-8 (283 characters) and the JSON side
+through `Invoke-WebRequest` (286). MTP was not a factor: plain decode at `--tp 1` generates the same
+answer, `×` and `→` included, in the same 149 deltas. The runs that passed were the `-Tp 2` ones
+(104 and 100 characters). Under that decoding an equal-length, `-ceq`-equal pass means the text was
+pure ASCII. The frozen pre-TP server failed identically, because every response had always been a
+bare `application/json`. So nothing in the stream assembly (`ReasoningSplitter`, `ToolStreamGate`)
+was involved. `tests/server/test_http_server.cpp` replays that exact answer over
+real HTTP, checks each content type, and compares the two paths the way that client reads them.
+
+One httplib coupling comes with the parameter: httplib decides what to compress by the exact
+`Content-Type` string, and exempts SSE only as a bare `text/event-stream`. With the charset, a stream
+would count as compressible `text/*`, and a compressed stream no longer arrives live. No compressor
+is compiled in, so nothing is compressed today; `http_server.cpp` stops the build with an `#error`
+if `CPPHTTPLIB_ZLIB_SUPPORT` or `CPPHTTPLIB_BROTLI_SUPPORT` is ever defined, until that exemption
+covers the charset form.
 
 ## Model metadata
 
@@ -183,7 +213,9 @@ degrades to literal content, prose that follows a call, and a `DropUnknownToolCa
 reach a streaming client, just at the end rather than live. The one thing streaming cannot undo is a
 `--stop` string that only completes ACROSS a token boundary: up to `len-1` of its bytes may already
 have gone out, exactly as on a request with no `tools` at all (the non-streaming path re-derives from
-the accumulated text and is exact).
+the accumulated text and is exact). The identity is in bytes. A client that compares the two must also
+decode both as UTF-8, which both content types now declare (see "Response shapes" above for the
+client that did not).
 
 This replaces the previous whole-generation buffering, which applied to every request that merely
 OFFERED tools. That was safe but produced "fake" (all-at-once) streaming for clients that attach a
@@ -776,7 +808,11 @@ three transports:
 PowerShell 5.1 encodes a string body with the content type's charset and falls back to Latin-1 when
 none is given, so every non-ASCII character arrives mangled and the re-rendered prompt genuinely
 differs from what was committed. The server is right to decline; the bug is client-side. (Every
-`Invoke-WebRequest` in `tools/server/smoke.ps1` now sends the charset for this reason.)
+`Invoke-WebRequest` in `tools/server/smoke.ps1` now sends the charset for this reason.) The response
+side had the same artifact until 2026-09-25, and that half was the server's: its bare
+`application/json` made the same cmdlet decode every reply as Latin-1 (see "Response shapes"), so a
+PowerShell client replayed mojibake of a non-ASCII answer however it encoded the request, and could
+never get the prefix back. Every response now declares `charset=utf-8`.
 
 The second thing is this server's, and it is real: **the decode->encode round trip is not the
 identity for every string**, so some replayed answers genuinely do not match what was committed.
@@ -811,6 +847,16 @@ one ASCII word so a failure there points at the image mechanism, and `vision mul
 stay CONSISTENT -- either the prefix was reused and nothing was re-encoded, or it was not and the
 image was re-encoded and the whole prompt re-prefilled. The combination it exists to catch is the
 third one: a reused prefix whose image rows were silently dropped.
+
+Until the response charset fix (2026-09-25) that case did not replay the real answer. The smoke reads
+turn 1 through `Invoke-WebRequest`, so it replayed the Latin-1 mojibake, and `PrefixState::Extend`
+reuses only when everything committed is a prefix of the new prompt, so every earlier pass took the
+NOT-reused branch. The P5 gate G11's `-Tp 2 -Vision -Dflash` line (docs/tp.md,
+`gate_g11_3_vision_dflash.log`) reported "84 non-ASCII chars", a count of Latin-1 characters (three
+per 3-byte Japanese character), and a full re-prefill of 233 tokens with `image_n=1`. With the
+charset, `smoke.ps1 -Model <v6> -Layers -1 -Vision` at TP=1 on device 1 (no MTP, 181 PASS / 0 FAIL)
+replays the real Japanese answer (28 non-ASCII characters) and takes the REUSED branch for the
+first time: `timings.prompt_n` 22 of `usage.prompt_tokens` 128, and no `image_n`.
 
 **Response extensions** (`src/server/openai_types.h`):
 - `GET /v1/models`: `architecture.input_modalities` and `modalities` gain `"image"`, and
@@ -1239,7 +1285,14 @@ content" property over every chunking of a dozen representative generations),
 recovery path through `engine.cpp` itself, against CPU fakes of the tensor-parallel model's state
 machine and of the TP=1 model, where a skipped `Reset()` would silently reuse a failed request's
 state -- it links the server's libraries but makes no GPU call, and skips without the tokenizer
-directory). `test_openai_types` also covers every image
+directory), `test_http_server` (`http_server.cpp`'s routes over real HTTP on a loopback port, against
+a scripted CPU fake of the TP=1 model and httplib's own client. It checks every route's
+`charset=utf-8`. It also replays the real `--mtp 3` thinking+tools answer through MTP-shaped rounds
+and through plain decode, and checks that streamed and non-streamed content agree in bytes and as a
+charset-honouring client reads them. Same GPU-free setup and skip as `test_engine_recovery`, except
+that it checks `http_server.h`'s two content-type constants before the skip, so a revert to a bare
+type fails even without the tokenizer).
+`test_openai_types` also covers every image
 content-part rule from "Images" above (accepted shapes, remote-URL/format/corrupt-data/oversize/
 too-many-images rejection, content-hash determinism, the `/v1/models` modality flip,
 `timings.image_n`/`image_ms`). All pass as part of the normal `.\tests\run_tests.ps1` run.

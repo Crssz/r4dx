@@ -219,6 +219,12 @@ function Check {
     }
 }
 
+# "<n> chars, <m> UTF-8 bytes" for a check message. .Length counts UTF-16 characters, not bytes.
+# Printed alone and labelled "bytes", a 283-vs-286 mismatch (the same 286 UTF-8 bytes on the wire,
+# one side decoded as Latin-1) looked like 3 bytes lost in the stream assembly (docs/server.md's
+# "Response shapes").
+function Text-Size { param([string]$Text) "$($Text.Length) chars, $([System.Text.Encoding]::UTF8.GetByteCount($Text)) UTF-8 bytes" }
+
 # POSTs a streaming request and returns every "data: ..." line WITH the millisecond offset at which
 # it actually arrived. Invoke-WebRequest (used everywhere else in this script) buffers the whole
 # body before returning, which is fine for checking SSE framing but cannot tell live streaming apart
@@ -1049,7 +1055,7 @@ try {
         $ttNonStreamContent = [string]$thinkToolNonStreamChat.choices[0].message.content
         Check ($ttContent -ceq $ttNonStreamContent) `
             ("thinking+tools: streamed content concatenation == non-streaming message.content " +
-             "(streamed $($ttContent.Length) bytes, non-streaming $($ttNonStreamContent.Length) bytes)")
+             "(streamed $(Text-Size $ttContent); non-streaming $(Text-Size $ttNonStreamContent))")
 
         # ---- enable_thinking=false: no reasoning_content key anywhere ------------------------------
         $noThinkBody = @{
@@ -1241,7 +1247,7 @@ try {
     # difference through on exactly the check whose whole point is byte identity.
     Check ($proseContent -ceq $proseNonStreamContent) `
         ("live tool stream: streamed content concatenation == non-streaming message.content " +
-         "(streamed $($proseContent.Length) bytes, non-streaming $($proseNonStreamContent.Length) bytes)")
+         "(streamed $(Text-Size $proseContent); non-streaming $(Text-Size $proseNonStreamContent))")
 
     # ---- `tools` + `stop` together must not echo the stop text back in content -------------------
     # Regression check (review finding, 2026-09-20): EmitToken only trims what it STREAMS, never
@@ -1488,7 +1494,10 @@ try {
         # answer (the en-dashes a real description is full of) reaches the server mangled, the
         # re-rendered prompt then genuinely differs from what was committed, and the prefix is
         # correctly NOT reused. That is a CLIENT bug, and without the charset this script would
-        # measure it and blame the server.
+        # measure it and blame the server. The RESPONSE side had the same artifact until 2026-09-25:
+        # the server's bare "application/json" made Invoke-WebRequest decode every reply as Latin-1,
+        # so a replayed non-ASCII answer was mojibake of the real one, however the request was sent.
+        # The server now declares charset=utf-8 on every response (docs/server.md's "Response shapes").
         $turn1Body = @{
             messages    = @(@{ role = "user"; content = @(
                 @{ type = "image_url"; image_url = @{ url = $shapesImg } },
@@ -1557,7 +1566,10 @@ try {
         # ---- multi-turn with a REAL, free-form NON-ASCII turn-1 answer --------------------------
         # Added 2026-09-22 after a review pass reported that reuse collapses whenever the replayed
         # answer carries any non-ASCII character. Part of that was the Latin-1 client-encoding
-        # artifact described above (fixed), but with a correctly-encoded body the underlying
+        # artifact described above (fixed). Until 2026-09-25 this case also replayed the turn-1 answer
+        # as the response-side mojibake above, not the answer itself, so it could only ever take the
+        # "NOT reused" branch; with the server's charset=utf-8 it replays the real text (measured:
+        # TP=1 v6, 28 non-ASCII chars, REUSED). With a correctly-encoded body the underlying
         # tokenizer round-trip gap is still real and STRING-DEPENDENT: measured on this build, a
         # 25-char Japanese sentence, a Korean one, emoji and em/en dashes all round-trip and reuse,
         # while an 84-char Japanese answer and a 104-char Thai one do not. See docs/server.md's

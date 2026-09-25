@@ -144,6 +144,21 @@ MANIFEST_VERSION = 1
 #: Hessian of a K = 17408 linear is badly rank-deficient and LDLQ leans entirely on damping.
 ROWS_PER_K_MIN = 4
 
+#: How many non-positive-diagonal channel indices a file's stats carry. A file with more than this
+#: many fails the diagonal gate outright: that is a broken capture, not a handful of dead channels.
+MAX_REPORTED_CHANNELS = 64
+
+#: The zero-centred norm that feeds each representative module. A channel whose (1 + w) is exactly
+#: 0 is identically zero after the norm, so its Hessian row/column is exactly zero: a property of
+#: the checkpoint (e.g. layer 7 post_attention_layernorm channel 3994), not a capture bug. LDLQ is
+#: unaffected -- damping keeps the factorization defined and the weight column sees a constant-zero
+#: input. The diagonal gate therefore allows exactly those channels and nothing else.
+NORM_BEFORE = {
+    "linear_attn.in_proj_qkv": "input_layernorm",
+    "self_attn.q_proj": "input_layernorm",
+    "mlp.gate_proj": "post_attention_layernorm",
+}
+
 #: Modules whose input is ANOTHER module's input (same tensor), and the representative that is
 #: actually hooked for it. Anything a converter spec names that is neither here nor in TAP_OF is a
 #: hard error (the converter audit should have caught it first).
@@ -235,7 +250,8 @@ def write_hess_file(path: Path, h: np.ndarray, rows: int, want_sum: bool = False
     if size != hess_file_bytes(k):
         raise RuntimeError(f"{path}: wrote {size} bytes, expected {hess_file_bytes(k)}")
     stats = {"K": k, "rows": int(rows), "trace": trace, "finite": bool(finite),
-             "min_diag": float(diag.min()), "max_diag": float(diag.max()), "bytes": size}
+             "min_diag": float(diag.min()), "max_diag": float(diag.max()), "bytes": size,
+             "nonpos_channels": np.flatnonzero(diag <= 0.0)[:MAX_REPORTED_CHANNELS].tolist()}
     if want_sum:
         stats["sum_upper"] = sum_upper
     return stats
@@ -797,8 +813,67 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
 # --------------------------------------------------------------------------------------------
 
 
+def norm_weight_name(scope: str, layer: int | None, module: str) -> str | None:
+    """HF name of the zero-centred norm whose output a tap's representative module reads, or None
+    for taps not fed by a norm (out_proj / o_proj / down_proj inputs)."""
+    if scope == "lm_head":
+        return "model.language_model.norm.weight"
+    if scope == "mtp":
+        if module == "mtp:norm_out":
+            return "mtp.norm.weight"
+        n = NORM_BEFORE.get(module.split(":", 1)[1])
+        return f"mtp.layers.0.{n}.weight" if n else None
+    n = NORM_BEFORE.get(module)
+    return f"model.language_model.layers.{layer}.{n}.weight" if n else None
+
+
+def structural_zero_channels(model_dir: Path, taps: dict[str, tuple]) -> dict[str, list[int]]:
+    """{file: channels whose preceding norm scale (1 + w) is exactly 0}. `taps` maps each file to
+    (scope, layer, module). CPU only: reads the norm vectors from the checkpoint's shards."""
+    import torch
+    from safetensors import safe_open
+
+    weight_map = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    out: dict[str, list[int]] = {}
+    for f, (scope, layer, module) in taps.items():
+        name = norm_weight_name(scope, layer, module)
+        if name is None:
+            continue
+        with safe_open(str(model_dir / weight_map[name]), framework="pt", device="cpu") as sf:
+            w = sf.get_tensor(name).to(torch.float32)
+        out[f] = torch.nonzero(1.0 + w == 0.0).flatten().tolist()
+    return out
+
+
+def read_hess_diag(path: Path) -> np.ndarray:
+    """The stored fp32 diagonal of a .hess file (row i of the packed upper triangle starts at
+    element i*K - i*(i-1)/2), memory-mapped: no full read."""
+    with open(path, "rb") as f:
+        magic, k, flags, _rows, _trace = HESS_HEADER.unpack(f.read(HESS_HEADER.size))
+    if magic != HESS_MAGIC or flags != HESS_FLAG_PACKED_UPPER:
+        raise ValueError(f"{path}: not a v1 packed .hess file")
+    tri = np.memmap(path, dtype="<f4", mode="r", offset=HESS_HEADER.size)
+    i = np.arange(k, dtype=np.int64)
+    return np.asarray(tri[i * k - i * (i - 1) // 2], dtype=np.float64)
+
+
+def diag_gate(nonpos: dict[str, list[int]], structural: dict[str, list[int]]) -> dict:
+    """Non-positive diagonal channels are allowed only where the preceding norm scale is exactly 0,
+    and never more than MAX_REPORTED_CHANNELS per file (the stats would be truncated)."""
+    bad = {}
+    for f, ch in nonpos.items():
+        extra = sorted(set(ch) - set(structural.get(f, [])))
+        if extra or len(ch) >= MAX_REPORTED_CHANNELS:
+            bad[f] = extra or ch
+    return {"min_diag_ok": not bad,
+            "nonpositive_diag_files": sorted(bad),
+            "nonpositive_diag_unexplained": bad,
+            "structural_zero_channels": {f: ch for f, ch in sorted(nonpos.items()) if ch and f not in bad}}
+
+
 def evaluate_gates(audit: dict, all_keys: list[str], plans: list[TapPlan], st: CaptureState,
-                   selected_keys: list[str], shared_expected: list[int]) -> dict:
+                   selected_keys: list[str], shared_expected: list[int],
+                   structural: dict[str, list[int]]) -> dict:
     served = {k for p in plans if p.file in st.written for k in p.keys}
     missing_all = sorted(set(all_keys) - served)
     missing_sel = sorted(set(selected_keys) - served)
@@ -810,7 +885,7 @@ def evaluate_gates(audit: dict, all_keys: list[str], plans: list[TapPlan], st: C
         if w is not None and w["K"] != p.k:
             k_bad.append((p.file, w["K"], p.k))
     not_finite = sorted(f for f, w in st.written.items() if not w["finite"])
-    nonpos = sorted(f for f, w in st.written.items() if not (w["min_diag"] > 0.0))
+    dg = diag_gate({f: w["nonpos_channels"] for f, w in st.written.items()}, structural)
     min_diag = min((w["min_diag"] for w in st.written.values()), default=float("nan"))
     min_diag_file = min(st.written, key=lambda f: st.written[f]["min_diag"]) if st.written else None
     rows_short = sorted((f, w["rows"], ROWS_PER_K_MIN * w["K"]) for f, w in st.written.items()
@@ -831,10 +906,9 @@ def evaluate_gates(audit: dict, all_keys: list[str], plans: list[TapPlan], st: C
         "k_mismatches": k_bad,
         "finite_ok": not not_finite,
         "not_finite": not_finite,
-        "min_diag_ok": not nonpos,
+        **dg,
         "min_diag": min_diag,
         "min_diag_file": min_diag_file,
-        "nonpositive_diag_files": nonpos,
         "rows_ok": not rows_short,
         "rows_per_k_min": ROWS_PER_K_MIN,
         "rows_short": rows_short,
@@ -858,8 +932,10 @@ def print_gates(g: dict) -> None:
           f"({g['keys_missing_all_count']} missing{': ' + str(g['keys_missing_all'][:6]) if g['keys_missing_all_count'] else ''})")
     print(f"[gate] K matches checkpoint in-features: {pf(g['k_ok'])} {g['k_mismatches'][:8]}")
     print(f"[gate] finite: {pf(g['finite_ok'])} {g['not_finite'][:8]}")
-    print(f"[gate] min diag > 0: {pf(g['min_diag_ok'])} (min {g['min_diag']:.4e} in "
-          f"{g['min_diag_file']})")
+    print(f"[gate] min diag > 0 except structurally dead channels: {pf(g['min_diag_ok'])} "
+          f"(min {g['min_diag']:.4e} in {g['min_diag_file']}; dead (1+w)==0 channels allowed: "
+          f"{g['structural_zero_channels'] or 'none'}; unexplained: "
+          f"{g['nonpositive_diag_unexplained'] or 'none'})")
     print(f"[gate] rows >= {g['rows_per_k_min']} x K: {pf(g['rows_ok'])} (worst rows/K "
           f"{g['worst_rows_over_k']['ratio']:.2f} in {g['worst_rows_over_k']['file']})")
     if not g["rows_ok"]:
@@ -890,9 +966,47 @@ def _existing_anchor(p: Path) -> Path:
     return p
 
 
+def regate(out_dir: Path, model_dir: Path) -> int:
+    """CPU only: re-run the diagonal gate over a set a capture already wrote (reading each file's
+    diagonal from disk and the norm vectors from the checkpoint), keep every other recorded gate,
+    and promote hessian.failed.json to hessian.json if everything now passes. For a set written
+    before the dead-channel rule existed -- no re-capture needed."""
+    failed = out_dir / FAILED_MANIFEST_NAME
+    if not failed.exists():
+        raise SystemExit(f"[hessian] --regate: {failed} not found (nothing to re-gate)")
+    doc = json.loads(failed.read_text(encoding="utf-8"))
+    gates = doc["gates"]
+    nonpos = {}
+    for f in doc["files"]:
+        d = read_hess_diag(out_dir / f)
+        nonpos[f] = np.flatnonzero(d <= 0.0)[:MAX_REPORTED_CHANNELS].tolist()
+    taps = {f: (t["scope"], t["layer"], t["module"]) for f, t in doc["taps"].items()}
+    structural = structural_zero_channels(model_dir, taps)
+    gates.pop("nonpositive_diag_files", None)
+    gates.update(diag_gate(nonpos, structural))
+    gates["ok"] = all(gates[g] for g in ("converter_audit_ok", "keys_selected_ok", "k_ok",
+                                         "finite_ok", "min_diag_ok", "rows_ok", "shared_input_ok"))
+    print_gates(gates)
+    if not gates["ok"]:
+        print("[hessian] --regate: still failing; hessian.failed.json left as is")
+        return 1
+    extra = {k: v for k, v in doc.items() if k not in ("format", "version", "files", "keys")}
+    extra["gates"] = gates
+    extra["regated"] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "rule": "non-positive diagonal allowed only on channels whose preceding "
+                                "norm scale (1 + w) is exactly 0"}
+    path = write_manifest(out_dir, doc["files"], doc["keys"], extra)
+    failed.unlink()
+    print(f"[hessian] --regate: gates pass; wrote {path}")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--regate", action="store_true",
+                    help="CPU only: re-evaluate the gates of the set in --out-dir (after a gate "
+                         "rule change) and promote hessian.failed.json to hessian.json if it passes")
     ap.add_argument("--write-fixture", type=Path, default=None, metavar="DIR",
                     help="CPU only, no checkpoint: write the tiny deterministic test set "
                          "(tests/convert/fixtures/hess_small) and exit")
@@ -930,6 +1044,10 @@ def main() -> int:
 
     if args.write_fixture is not None:
         return write_fixture(args.write_fixture)
+    if args.regate:
+        sys.path.insert(0, str(TOOLS_REF))
+        from common import DEFAULT_MODEL_DIR
+        return regate(args.out_dir, args.model_dir or DEFAULT_MODEL_DIR)
 
     # The GPU rule, before anything expensive (common.resolve_device re-checks it). --dry-run never
     # touches the GPU, so it is exempt.
@@ -1067,7 +1185,9 @@ def main() -> int:
     # The first layer of each type, over the WHOLE stack: a --layers smoke that stops before the
     # first attention layer reports the shared-input check as incomplete.
     shared_expected = [ref.layer_types.index(t) for t in SHARED_GATE if t in ref.layer_types]
-    gates = evaluate_gates(audit, all_keys, plans, st, selected_keys, shared_expected)
+    structural = structural_zero_channels(model_dir, {p.file: (p.scope, p.layer, p.module)
+                                                      for p in plans if p.file in st.written})
+    gates = evaluate_gates(audit, all_keys, plans, st, selected_keys, shared_expected, structural)
     print_gates(gates)
 
     files = {f: w for f, w in st.written.items()}

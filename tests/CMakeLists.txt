@@ -49,13 +49,13 @@ add_subdirectory(cli)
 # those paths.
 add_subdirectory(server)
 
-# The two Python reference tests below need the reference venv's python.exe (torch + transformers
+# The Python reference tests below need the reference venv's python.exe (torch + transformers
 # / numpy importable). That venv is a machine-local environment outside this repo and can be absent
 # -- it has been absent from this development machine since 2026-09-22 -- so they are registered only when the
 # interpreter exists at CONFIGURE time; otherwise a STATUS line says they were skipped and why, and
 # ctest never lists them (an unregistered test cannot count as a failure). build.ps1 re-runs the
 # configure step on every build, so recreating the venv (or pointing R4DX_REFERENCE_VENV at another
-# one) brings both back on the next build with nothing else to change.
+# one) brings them back on the next build with nothing else to change.
 set(R4DX_REFERENCE_PYTHON "${R4DX_REFERENCE_VENV}/Scripts/python.exe")
 if(EXISTS "${R4DX_REFERENCE_PYTHON}")
   # tools/reference's pure-Python golden-generator smoke test (CPU-only, no HIP device, no C++
@@ -81,8 +81,19 @@ if(EXISTS "${R4DX_REFERENCE_PYTHON}")
       COMMAND "${R4DX_REFERENCE_PYTHON}"
               "${CMAKE_SOURCE_DIR}/tools/reference/dflash2_selftest.py"
   )
+
+  # tools/reference/hessian_capture.py's weightless rms taps (--rms-taps / --rms-only, docs/quant2.md
+  # 3.2): a tiny random 2-layer Qwen3_5 stack driven through the tool's own capture, gates, manifest
+  # merge and --regate on the CPU. No checkpoint, no GPU (it checks no CUDA/HIP context was made).
+  add_test(
+      NAME reference_hessian_rms
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_hessian_rms.py"
+  )
+  set_tests_properties(reference_hessian_rms PROPERTIES ENVIRONMENT "OMP_NUM_THREADS=6")
 else()
-  message(STATUS "r4dx: reference_manifest and reference_dflash2 NOT registered -- the reference "
-                 "venv's interpreter ${R4DX_REFERENCE_PYTHON} does not exist (set "
-                 "R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and reconfigure)")
+  message(STATUS "r4dx: reference_manifest, reference_dflash2 and reference_hessian_rms NOT "
+                 "registered -- the reference venv's interpreter ${R4DX_REFERENCE_PYTHON} does not "
+                 "exist (set R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and "
+                 "reconfigure)")
 endif()

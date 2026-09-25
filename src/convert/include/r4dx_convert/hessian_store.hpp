@@ -14,9 +14,22 @@
 // <dir>/hessian.json:
 //   { "format": "r4dx-hessian", "version": 1,
 //     "files": { "<file>": { "K": int, "rows": int, "trace": float } },
-//     "keys":  { "<container base name, e.g. text.layers.3.mlp.down>": "<file>" }, ...provenance }
+//     "keys":  { "<container base name, e.g. text.layers.3.mlp.down>": "<file>" },
+//     "rms_keys": { "<container base name>": "<file>" },          OPTIONAL
+//     ...provenance }
 // Several container bases share one file when they share an input (gdn.in_proj_qkv / in_proj_z;
 // attn.qg / k / v): the Hessian is a property of the linear's INPUT, not of its weight.
+//
+// "rms_keys" (hessian_capture.py --rms-taps / --rms-only; docs/quant2.md 3.2) maps the in-projections
+// fed by a zero-centred norm (gdn.in_proj_qkv/z and attn.qg/k/v -> L{i}.in.rms.hess, mlp.gate_up ->
+// L{i}.mlp_in.rms.hess) to the Hessian of the norm's WEIGHTLESS output rms(x) = x / sqrt(mean(x^2)
+// + eps), captured from the same activations as the key's own post-norm file. Only a rotated
+// conversion reads it (rotation.hpp's TransformHessianRmsQ); an unrotated one never does. Every entry
+// must name a file listed under "files", for a base that also has a "keys" entry, that is no base's
+// "keys" file, and that is exactly that entry's rms twin (RmsFileNameFor: L03.in.hess ->
+// L03.in.rms.hess -- so a base cannot be paired with another tap's or layer's rms(x), which K could
+// not tell apart), with its K and (when both list it) its rows -- anything else is a manifest error
+// at construction. Factor(kRms) also refuses a zero diagonal: rms(x) has no dead channel.
 //
 // ---- Validation ------------------------------------------------------------------------------
 // ReadHessFile checks magic, flags, reserved bytes, the exact file size for K, that every stored
@@ -210,6 +223,11 @@ struct HessianTransform {
   std::function<void(std::vector<float>& H, int64_t K, int nthreads)> apply;
 };
 
+// Which of the manifest's maps resolves a base name to its file: "keys" (the linear's captured
+// input -- for a norm-fed tap, the post-norm activation with (1 + w) applied) or "rms_keys" (the
+// same tap's weightless rms(x); see the header). The chosen file is part of the factor cache key.
+enum class HessianSource { kKeys, kRms };
+
 class HessianStore {
  public:
   explicit HessianStore(const std::string& dir) : dir_(dir) {
@@ -259,9 +277,64 @@ class HessianStore {
                                  "\", which is not listed under \"files\"");
       keys_[it.key()] = file;
     }
+    if (j.contains("rms_keys")) {
+      if (!j["rms_keys"].is_object())
+        throw std::runtime_error(who + ": \"rms_keys\" is not an object");
+      std::set<std::string> key_files;
+      for (const auto& kv : keys_) key_files.insert(kv.second);
+      for (auto it = j["rms_keys"].begin(); it != j["rms_keys"].end(); ++it) {
+        const std::string tag = who + ": rms_keys[\"" + it.key() + "\"]";
+        if (!it.value().is_string()) throw std::runtime_error(tag + " is not a file name");
+        const std::string file = it.value().get<std::string>();
+        if (!files_.count(file))
+          throw std::runtime_error(tag + " names \"" + file +
+                                   "\", which is not listed under \"files\"");
+        auto k = keys_.find(it.key());
+        if (k == keys_.end())
+          throw std::runtime_error(tag + " has no \"keys\" entry (an rms Hessian supplements a "
+                                         "base's captured Hessian, it does not replace it)");
+        if (k->second == file)
+          throw std::runtime_error(tag + " names \"" + file + "\", the same file as keys[\"" +
+                                   it.key() + "\"] -- the rms Hessian is a separate capture");
+        if (key_files.count(file))
+          throw std::runtime_error(tag + " names \"" + file + "\", which is a \"keys\" file (a "
+                                         "captured linear input), not a weightless rms Hessian");
+        // The rms file is tied to the base's own tap by name, so a manifest cannot pair a base
+        // with another tap's or another layer's rms(x) -- every norm-fed tap has K = hidden, so K
+        // alone could not tell them apart.
+        const std::string want = RmsFileNameFor(k->second);
+        if (file != want)
+          throw std::runtime_error(tag + " names \"" + file + "\", but keys[\"" + it.key() +
+                                   "\"] is \"" + k->second + "\", whose rms Hessian is \"" + want +
+                                   "\" (the weightless tap of the SAME norm input)");
+        if (files_.at(file).K != files_.at(k->second).K)
+          throw std::runtime_error(tag + " names \"" + file + "\" with K=" +
+                                   std::to_string(files_.at(file).K) + ", but keys[\"" + it.key() +
+                                   "\"] (\"" + k->second + "\") has K=" +
+                                   std::to_string(files_.at(k->second).K));
+        const FileInfo &fr = files_.at(file), &fp = files_.at(k->second);
+        if (fr.has_rows && fp.has_rows && fr.rows != fp.rows)
+          throw std::runtime_error(tag + " names \"" + file + "\" with rows=" +
+                                   std::to_string(fr.rows) + ", but \"" + k->second +
+                                   "\" has rows=" + std::to_string(fp.rows) +
+                                   " -- both taps of one capture see the same tokens");
+        rms_keys_[it.key()] = file;
+      }
+    }
+  }
+
+  // The weightless rms tap paired with a post-norm tap file (hessian_capture.py's rms_file_name):
+  // "L03.in.hess" -> "L03.in.rms.hess". "rms_keys" must name exactly this file for each base.
+  static std::string RmsFileNameFor(const std::string& keys_file) {
+    const std::string ext = ".hess";
+    const bool has_ext = keys_file.size() >= ext.size() &&
+                         keys_file.compare(keys_file.size() - ext.size(), ext.size(), ext) == 0;
+    return (has_ext ? keys_file.substr(0, keys_file.size() - ext.size()) : keys_file) + ".rms.hess";
   }
 
   bool Has(const std::string& key) const { return keys_.count(key) != 0; }
+  // True when "rms_keys" has an entry for `key` (which then also has a "keys" entry of the same K).
+  bool HasRms(const std::string& key) const { return rms_keys_.count(key) != 0; }
 
   int64_t KOf(const std::string& key) const { return files_.at(File(key)).K; }
 
@@ -272,6 +345,18 @@ class HessianStore {
     return it->second;
   }
 
+  std::string RmsFile(const std::string& key) const {
+    auto it = rms_keys_.find(key);
+    if (it == rms_keys_.end())
+      throw std::runtime_error("HessianStore: no rms Hessian (hessian.json \"rms_keys\") for '" +
+                               key + "' in " + dir_);
+    return it->second;
+  }
+
+  std::string FileFor(const std::string& key, HessianSource src) const {
+    return src == HessianSource::kRms ? RmsFile(key) : File(key);
+  }
+
   const std::string& ManifestSha256() const { return sha256_; }
   const std::string& Dir() const { return dir_; }
 
@@ -279,9 +364,9 @@ class HessianStore {
   // equal to the manifest's. Reads 64 bytes, never the payload, and each distinct file once -- so a
   // missing or truncated file (an interrupted capture, a partial copy) fails before the converter
   // writes a header, not hours into the emit pass. The payload checks (finiteness, trace) still run
-  // in ReadHessFile at Factor() time.
-  void CheckFile(const std::string& key) {
-    const std::string file = File(key);
+  // in ReadHessFile at Factor() time. kRms checks `key`'s "rms_keys" file instead.
+  void CheckFile(const std::string& key, HessianSource src = HessianSource::kKeys) {
+    const std::string file = FileFor(key, src);
     if (checked_files_.count(file)) return;
     const FileInfo& fi = files_.at(file);
     const std::string path = hessian_detail::JoinPath(dir_, file);
@@ -298,13 +383,16 @@ class HessianStore {
     checked_files_.insert(file);
   }
 
-  // The factor for `key`'s tap. The returned reference stays valid until the next Factor() call
-  // that needs a DIFFERENT (file, damp, transform id): only the last factor is cached, which is all
-  // the emit loop needs -- the bases sharing a tap (in_proj_qkv / in_proj_z, qg / k / v) are
-  // emitted back to back. `xf` (nullable) is applied to H before factoring; see HessianTransform.
+  // The factor for `key`'s tap: its "keys" file, or with src == kRms its "rms_keys" file. The
+  // returned reference stays valid until the next Factor() call that needs a DIFFERENT (file,
+  // damp, transform id): only the last factor is cached, which is all the emit loop needs -- the
+  // bases sharing a tap (in_proj_qkv / in_proj_z, qg / k / v) are emitted back to back, and they
+  // share the file under either source. `xf` (nullable) is applied to H before factoring; see
+  // HessianTransform.
   const LdlqFactor& Factor(const std::string& key, int64_t K, float damp, int nthreads,
-                           const HessianTransform* xf = nullptr) {
-    const std::string file = File(key);
+                           const HessianTransform* xf = nullptr,
+                           HessianSource src = HessianSource::kKeys) {
+    const std::string file = FileFor(key, src);
     const FileInfo& fi = files_.at(file);
     if (fi.K != K)
       throw std::runtime_error("HessianStore: '" + key + "' has K=" + std::to_string(K) +
@@ -331,6 +419,21 @@ class HessianStore {
       throw std::runtime_error("HessianStore: " + path + " header says rows=" +
                                std::to_string(frows) + " but hessian.json says rows=" +
                                std::to_string(fi.rows));
+    if (src == HessianSource::kRms) {
+      // rms(x) of a real residual row has no structurally zero channel ((1 + w) is not applied),
+      // so a zero diagonal means the file is not what "rms_keys" promises -- e.g. the norm's
+      // OUTPUT (or a weighted input) was captured, with a dead channel's row/column zeroed.
+      // Factoring it anyway would let damping hide exactly the direction the rms path exists to
+      // penalize. ReadHessFile has already refused negative / non-finite values.
+      for (int64_t i = 0; i < K; ++i)
+        if (!(H[static_cast<size_t>(i * K + i)] > 0.0f))
+          throw std::runtime_error(
+              "HessianStore: rms Hessian " + path + " (rms_keys[\"" + key + "\"]) has H[" +
+              std::to_string(i) + "][" + std::to_string(i) +
+              "] = 0; the weightless rms(x) tap has no zero channel -- this looks like a post-norm "
+              "(weighted) capture. Recapture with tools/reference/hessian_capture.py --rms-only "
+              "--force");
+    }
     if (xf) xf->apply(H, K, nthreads);
     cached_ = FactorHessian(std::move(H), K, damp, nthreads);
     cached_file_ = file;
@@ -351,6 +454,7 @@ class HessianStore {
   std::string sha256_;
   std::map<std::string, FileInfo> files_;
   std::map<std::string, std::string> keys_;
+  std::map<std::string, std::string> rms_keys_;  // "rms_keys"; empty when the manifest has none
   std::set<std::string> checked_files_;  // CheckFile's memo
 
   LdlqFactor cached_;

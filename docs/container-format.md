@@ -344,6 +344,12 @@ conversion before any tensor is written. The container records the pattern (`ldl
 `hessian_dir`, the sha256 of the `hessian.json` it used (`hessian_manifest_sha256`) and the
 resolved `ldlq_linears` list in `r4dx_convert_run`.
 
+`hessian.json` may also carry `"rms_keys"`: for each norm-fed in-projection, the Hessian of the norm's
+weightless output `rms(x)`. Only a rotated conversion reads it (see "Residual rotation" below). Each
+entry must name the listed rms twin of the base's `"keys"` file (`L03.in.hess` -> `L03.in.rms.hess`),
+with the same `K` and, when both list them, the same `rows`. Any other entry is refused when the
+manifest is read. An rms file with a zero diagonal is refused when it is factored.
+
 ## Residual rotation (`__metadata__.rotation`, `rotation.*`)
 
 `r4dx-convert --rotate {none,q2a,q2ab} [--rotation-seed <u64>]` (docs/quant2.md sections 3-4;
@@ -421,10 +427,23 @@ and stored as `R` in fp32; then, for `q2ab`, `had_down_signs`, `had_o_signs`, `h
 top bit. `q2a` and `q2ab` of the same seed share `signs` and `mix5`. Default seed `0x5EED2025`.
 
 **Choosing the quantized values on a rotated container.** `--ldlq` rounds a folded linear against its
-input Hessian carried into the new basis, computed exactly from the captured (un-rotated) `H`:
-`Q^T D^-1 H D^-1 Q` (`D = diag(1 + w_norm)`) for an in-projection -- refused if any `|1 + w| < 1e-3`
--- and `Hb^T H Hb` for a `q2ab` out-projection; an out-projection's N-side `Q^T` does not change its
-input. (Then `tr(W' H' W'^T) = tr(W H W^T)`: the proxy of the same error is the same.) `--imatrix`
+input Hessian carried into the new basis, computed exactly from the captured (un-rotated) Hessians:
+
+- **An in-projection with an rms Hessian.** When `hessian.json`'s `"rms_keys"` lists the
+  in-projection, `--ldlq` uses `Q^T H_rms Q`. `H_rms` is captured on the norm's weightless output
+  `rms(x)`, and the folded linear's input is exactly `rms(x) Q`. This needs no division, so it is
+  defined even where `(1 + w) == 0`.
+- **An in-projection without one.** `--ldlq` divides the norm out of the post-norm capture:
+  `Q^T D^-1 H D^-1 Q`, with `D = diag(1 + w_norm)`. The conversion is refused during planning if
+  any `|1 + w| < 1e-3`, and the message says to capture the rms Hessians with
+  `hessian_capture.py --rms-only`.
+- **A `q2ab` out-projection.** `--ldlq` uses `Hb^T H Hb`.
+- **An out-projection's N-side `Q^T`** does not change the linear's input, so its Hessian is
+  unchanged.
+
+Then `tr(W' H' W'^T) = tr(W H W^T)`: the proxy of the same error is the same. `r4dx_convert_run`
+lists the in-projections that used `H_rms` as `ldlq_rms_linears`, rotated containers only. See
+`docs/quant2.md` 3.2 for why the division path is not good enough. `--imatrix`
 vectors, which are only `diag(H)`, are carried over under their own diagonal model instead --
 `diag(M^T diag(v) M)`, which after a Hadamard is a per-block constant -- so on rotated linears they
 carry little information; `--ldlq` is the tool there.

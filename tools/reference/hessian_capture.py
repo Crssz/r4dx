@@ -54,6 +54,29 @@ the PRE-final-norm hidden per sequence: its hooks look accumulators up in `resul
 container key and call `.update(x)`, so pre-populating that dict with Hessian accumulators is all
 it takes (`T-1` rows per sequence there, see imatrix_capture's docstring).
 
+**Weightless rms taps (`--rms-taps`, `--rms-only`; docs/quant2.md 3.2).** A rotated container
+(`r4dx-convert --rotate q2a/q2ab`) runs every text layer's zero-centred norm WITHOUT its weight and
+folds `(1 + w)` into the next in-projections, so their input becomes `rms(x) Q` with
+`rms(x) = x * rsqrt(mean(x^2) + eps)` -- no weight. The converter needs `H_rms = E[rms(x)^T rms(x)]`,
+which the post-norm taps above give only divided by `(1 + w)`: impossible at a dead channel
+(`(1 + w) == 0`, e.g. layer 7 post_attention_layernorm channel 3994) and noisy where `|1 + w|` is
+small. So a forward_pre_hook on each text layer's `input_layernorm` / `post_attention_layernorm`
+reads the norm's INPUT (the bf16 residual) and accumulates `rms(x)` computed exactly as
+`Qwen3_5RMSNorm._norm(x.float())` does -- fp32, the module's own eps, NO `(1 + w)` multiply and NO
+bf16 cast (`rms_weightless`) -- into `L{i:02d}.in.rms.hess` / `L{i:02d}.mlp_in.rms.hess`
+(`rms_file_name`: the post-norm file of the same activations with `.rms` before `.hess`, a pairing
+the converter's HessianStore enforces). `hessian.json` `rms_keys` maps gdn.in_proj_qkv/z and
+attn.qg/k/v to the first and mlp.gate_up to the second (gdn.in_proj_a/b read the same input but stay
+bf16 and are never LDLQ'd). `--rms-taps` adds them to a full capture; `--rms-only` captures ONLY them
+(still a full layer-major forward) and merges them into the validated set already in `--out-dir`,
+after checking the checkpoint config and the corpus against what that set records (`--code-rev`
+reads the repo-source part of the corpus from the commit the set was captured at). Their gates
+(`evaluate_rms_gates`: finite; min diag > 0 with NO dead-channel exemption; rows >= 4K and equal to
+the post-norm file's; `diag(H_post)_i` within 2% of `(1 + w_i)^2 diag(H_rms)_i` on every channel with
+`(1 + w_i) != 0` and exactly 0 where it is 0, which proves both captures saw the same activations)
+must all pass before anything rms goes into a manifest; otherwise nothing rms is written into it and
+the report goes to `hessian_rms.failed.json`.
+
 **Numerics.** Per sequence, `x` (bf16) is upcast to fp32 and `x^T x` is formed by one fp32 GEMM
 (TF32 explicitly off) -- a sum of <= 2048 products per entry -- and added into an fp64 device
 accumulator, so the ~172k-row sum loses nothing to accumulation order. `H = acc / rows` is written
@@ -81,6 +104,8 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
     $env:HIP_VISIBLE_DEVICES = '1'
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --dry-run
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v1
+    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --rms-only --code-rev <commit> `
+        --out-dir D:\\models\\r4dx\\hessian-v1
 
 `--dry-run` and `--write-fixture` never touch the GPU. See tools/reference/README.md
 ("hessian_capture.py") for the option list, the corpus, the gates and the expected runtime.
@@ -190,6 +215,29 @@ SHARED_GATE = {
                        ("mlp.gate_proj", ["mlp.up_proj"])],
 }
 
+#: --rms-taps / --rms-only: per text layer, (the zero-centred norm whose INPUT is hooked, the tap
+#: name). The rms file is L{i:02d}.<tap>.rms.hess; the post-norm file of the same activations is
+#: L{i:02d}.<tap>.hess (the table above: in_proj_qkv / q_proj read input_layernorm's output, gate_proj
+#: reads post_attention_layernorm's).
+RMS_NORMS = (("input_layernorm", "in"), ("post_attention_layernorm", "mlp_in"))
+#: The container keys (after "text.layers.{i}.") an rms tap may serve: the LDLQ'd in-projections a
+#: rotated container feeds from that norm. gdn.in_proj_a/b read the same input but stay bf16 in the
+#: container and are never LDLQ'd, so they have no key at all.
+RMS_KEY_SUFFIXES = {"in": ("gdn.in_proj_qkv", "gdn.in_proj_z", "attn.qg", "attn.k", "attn.v"),
+                    "mlp_in": ("mlp.gate_up",)}
+#: A post-norm tap file an rms tap can pair with.
+RMS_POST_FILE_RE = re.compile(r"L(\d{2,})\.(in|mlp_in)\.hess")
+#: Where a failed rms capture's report goes: the manifest is left exactly as it was.
+RMS_FAILED_MANIFEST_NAME = "hessian_rms.failed.json"
+#: The consistency gate's tolerance: diag(H_post)_i vs (1 + w_i)^2 diag(H_rms)_i. Both are means over
+#: the same activations; the only difference is that the post-norm tap's input was rounded to bf16
+#: (<= 2^-9 relative per element, so <= ~0.4% on a mean square). A different corpus, layer, norm or
+#: checkpoint moves channels by far more.
+RMS_CONSISTENCY_RTOL = 0.02
+#: Corpus-source fields that say HOW a source was read, not what it contains: --rms-only ignores
+#: them when comparing its corpus with the recorded one (--code-rev changes file_list_method only).
+CORPUS_HOW_FIELDS = ("file_list_method",)
+
 CAVEAT = (
     "H = mean over calibration tokens of x x^T (x = the linear's INPUT activation, bf16 upcast to "
     "fp32, fp64 accumulation, stored fp32 packed upper triangle), measured on a REAL forward of "
@@ -282,11 +330,22 @@ def read_hess_file(path: Path) -> tuple[np.ndarray, int, float]:
     return h, int(rows), float(trace)
 
 
+def rms_file_name(post_file: str) -> str:
+    """The weightless rms tap paired with a post-norm tap file: `L03.in.hess` -> `L03.in.rms.hess`.
+    `hessian_store.hpp` refuses any other pairing in `rms_keys`."""
+    if not post_file.endswith(".hess") or post_file.endswith(".rms.hess"):
+        raise ValueError(f"rms_file_name: {post_file!r} is not a post-norm .hess file name")
+    return post_file[:-len(".hess")] + ".rms.hess"
+
+
 def write_manifest(out_dir: Path, files: dict[str, dict], keys: dict[str, str],
-                   extra: dict, manifest_name: str = MANIFEST_NAME) -> Path:
-    """`hessian.json` (or `manifest_name`): the contract's three fields first (format/version, files {K,
-    rows, trace}, keys), then whatever provenance the caller passes. LF line endings on every
-    platform (its sha256 is recorded in converted containers), written via a temp file + rename."""
+                   extra: dict, manifest_name: str = MANIFEST_NAME,
+                   rms_keys: dict[str, str] | None = None) -> Path:
+    """`hessian.json` (or `manifest_name`): the contract's fields first (format/version, files {K,
+    rows, trace}, keys, and `rms_keys` when given), then whatever provenance the caller passes. LF
+    line endings on every platform (its sha256 is recorded in converted containers), written via a
+    temp file + rename. `rms_keys` is checked the way HessianStore will: every value a listed file
+    that is not a "keys" file, for a base with a "keys" entry, named `rms_file_name(keys[base])`."""
     doc = {"format": MANIFEST_FORMAT, "version": MANIFEST_VERSION,
            "files": {name: {"K": int(v["K"]), "rows": int(v["rows"]), "trace": float(v["trace"])}
                      for name, v in sorted(files.items())},
@@ -294,6 +353,16 @@ def write_manifest(out_dir: Path, files: dict[str, dict], keys: dict[str, str],
     for name in keys.values():
         if name not in doc["files"]:
             raise RuntimeError(f"manifest key points at {name!r}, which is not in files")
+    if "rms_keys" in extra:
+        raise RuntimeError("manifest extra field 'rms_keys': pass it as rms_keys= so it is checked")
+    if rms_keys is not None:
+        key_files = set(keys.values())
+        for base, name in rms_keys.items():
+            if name not in doc["files"] or name in key_files or base not in keys or \
+                    name != rms_file_name(keys[base]):
+                raise RuntimeError(f"rms_keys[{base!r}] = {name!r} is not the listed rms file "
+                                   f"paired with keys[{base!r}] = {keys.get(base)!r}")
+        doc["rms_keys"] = dict(sorted(rms_keys.items()))
     for k, v in extra.items():
         if k in doc:
             raise RuntimeError(f"manifest extra field {k!r} would overwrite a contract field")
@@ -441,6 +510,36 @@ def build_tap_plan(specs, expect_k: dict[str, int]) -> list[TapPlan]:
     return list(plans.values())
 
 
+@dataclass
+class RmsTapPlan:
+    file: str                   #: e.g. "L03.in.rms.hess"
+    layer: int                  #: text layer index
+    norm: str                   #: "input_layernorm" | "post_attention_layernorm" (its INPUT is hooked)
+    post_file: str              #: the post-norm tap of the same activations, e.g. "L03.in.hess"
+    k: int                      #: hidden size
+    keys: list[str] = field(default_factory=list)
+
+
+def build_rms_plans(post_keys: dict[str, list[str]], n_run: int, hidden: int) -> list[RmsTapPlan]:
+    """One weightless rms tap per text layer < n_run and norm (RMS_NORMS) whose post-norm tap file is
+    in `post_keys` (file -> the container keys reading it); those keys become its `rms_keys`. Refuses
+    a key the rotated container does not feed from that norm (RMS_KEY_SUFFIXES)."""
+    plans = []
+    for i in range(n_run):
+        for norm, tap in RMS_NORMS:
+            post = f"L{i:02d}.{tap}.hess"
+            keys = post_keys.get(post)
+            if not keys:
+                continue
+            want = {f"text.layers.{i}.{s}" for s in RMS_KEY_SUFFIXES[tap]}
+            bad = sorted(set(keys) - want)
+            if bad:
+                raise SystemExit(f"[hessian] {post} serves {bad}: not an in-projection fed by layer "
+                                 f"{i}'s {norm} (expected a subset of {sorted(want)})")
+            plans.append(RmsTapPlan(rms_file_name(post), i, norm, post, hidden, sorted(keys)))
+    return plans
+
+
 # --------------------------------------------------------------------------------------------
 # Corpus
 # --------------------------------------------------------------------------------------------
@@ -467,24 +566,40 @@ def _tokenize_prefix(tokenizer, text: str, need: int, margin: int = 256) -> tupl
         chars *= 2
 
 
-def repo_code_files() -> tuple[list[str], str]:
-    """This repo's own C++/HIP/Python sources, repo-relative posix paths, sorted. Tracked files
-    only (`git ls-files`) so build trees and scratch files never leak in; falls back to walking the
-    tree (skipping build*/, .git/, dot-dirs) when git is unavailable."""
-    method = "git ls-files"
-    try:
-        out = subprocess.run(["git", "-C", str(REPO_ROOT), "ls-files", "-z"], check=True,
-                             capture_output=True).stdout.decode("utf-8")
+def _git(*args: str, stdin: bytes | None = None) -> bytes:
+    return subprocess.run(["git", "-C", str(REPO_ROOT), *args], input=stdin, check=True,
+                          capture_output=True).stdout
+
+
+def repo_code_files(rev: str | None = None) -> tuple[list[str], str, str | None]:
+    """This repo's own C++/HIP/Python sources, repo-relative posix paths, sorted, plus how they were
+    listed and (with `rev`) the resolved commit. Tracked files only (`git ls-files`) so build trees
+    and scratch files never leak in; falls back to walking the tree (skipping build*/, .git/,
+    dot-dirs) when git is unavailable. With `rev` (--code-rev) the files are those of that commit's
+    tree instead, and git is required."""
+    commit = None
+    if rev is not None:
+        try:
+            commit = _git("rev-parse", "--verify", "--quiet", rev + "^{commit}").decode().strip()
+            out = _git("ls-tree", "-r", "-z", "--name-only", commit).decode("utf-8")
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise SystemExit(f"[hessian] --code-rev {rev!r}: not a commit of {REPO_ROOT} ({e})")
+        method = f"git ls-tree {commit} (--code-rev {rev})"
         paths = [p for p in out.split("\0") if p]
-    except (OSError, subprocess.CalledProcessError):
-        method = "filesystem walk (git unavailable)"
-        paths = []
-        for p in REPO_ROOT.rglob("*"):
-            rel = p.relative_to(REPO_ROOT).as_posix()
-            top = rel.split("/", 1)[0]
-            if top.startswith(".") or top.startswith("build") or not p.is_file():
-                continue
-            paths.append(rel)
+    else:
+        method = "git ls-files"
+        try:
+            out = _git("ls-files", "-z").decode("utf-8")
+            paths = [p for p in out.split("\0") if p]
+        except (OSError, subprocess.CalledProcessError):
+            method = "filesystem walk (git unavailable)"
+            paths = []
+            for p in REPO_ROOT.rglob("*"):
+                rel = p.relative_to(REPO_ROOT).as_posix()
+                top = rel.split("/", 1)[0]
+                if top.startswith(".") or top.startswith("build") or not p.is_file():
+                    continue
+                paths.append(rel)
     keep = []
     for rel in paths:
         if not rel.endswith(CODE_SUFFIXES):
@@ -494,7 +609,27 @@ def repo_code_files() -> tuple[list[str], str]:
         if rel.startswith(CODE_EXCLUDE_PREFIXES):
             continue
         keep.append(rel)
-    return sorted(keep), method
+    return sorted(keep), method, commit
+
+
+def git_blobs(commit: str, paths: list[str]) -> dict[str, bytes]:
+    """`<commit>:<path>` for every path, from one `git cat-file --batch`."""
+    try:
+        out = _git("cat-file", "--batch",
+                   stdin="".join(f"{commit}:{p}\n" for p in paths).encode("utf-8"))
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise SystemExit(f"[hessian] git cat-file --batch at {commit} failed: {e}")
+    blobs: dict[str, bytes] = {}
+    pos = 0
+    for p in paths:
+        nl = out.index(b"\n", pos)
+        head = out[pos:nl].decode("utf-8", errors="replace").split()
+        if len(head) != 3 or head[1] != "blob":
+            raise SystemExit(f"[hessian] {commit}:{p} is not a blob ({' '.join(head)})")
+        size = int(head[2])
+        blobs[p] = out[nl + 1:nl + 1 + size]
+        pos = nl + 1 + size + 1  # the content is followed by one LF
+    return blobs
 
 
 def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
@@ -536,12 +671,16 @@ def build_corpus(args, tokenizer) -> tuple[list[Seq], list[dict]]:
     #    evenly over the whole concatenation so every part of the tree -- kernels, model, server,
     #    tests, Python tooling -- is represented, not just the alphabetically first directory.
     if args.code_seqs > 0:
-        files, method = repo_code_files()
+        # --code-rev: that commit's tree, not the working tree -- how --rms-only reproduces the code
+        # windows of a set captured at an older checkout (its sha256_of_concatenation must match).
+        files, method, commit = repo_code_files(getattr(args, "code_rev", None))
+        blobs = git_blobs(commit, files) if commit is not None else None
         parts = []
         for rel in files:
+            raw = blobs[rel] if blobs is not None else (REPO_ROOT / rel).read_bytes()
             # CRLF -> LF: with core.autocrlf=true the checkout's line endings are a property of the
             # machine, not of the source, and must not change the tokens or the recorded sha256.
-            body = (REPO_ROOT / rel).read_bytes().decode("utf-8", errors="replace")
+            body = raw.decode("utf-8", errors="replace")
             body = body.replace("\r\n", "\n")
             if not body.endswith("\n"):
                 body += "\n"
@@ -614,6 +753,28 @@ class HessianAccum:
         return h
 
 
+def rms_weightless(x, eps: float):
+    """`Qwen3_5RMSNorm._norm(x.float())` exactly (transformers' modeling_qwen3_5.py): fp32
+    `x * rsqrt(mean(x^2) + eps)` over the last axis -- WITHOUT the `(1 + w)` multiply and WITHOUT the
+    `.type_as(x)` bf16 cast that follow it in the module's forward. That is what a rotated
+    container's weightless norm feeds its folded in-projections (before Q). The runtime's
+    RmsNormKernel computes the same `x * rsqrtf(sum(x^2)/hidden + eps)` in fp32."""
+    import torch
+
+    xf = x.float()
+    return xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+
+
+def norm_eps(mod) -> float:
+    """A norm module's own epsilon. `Qwen3_5RMSNorm` stores it as `eps`; `Qwen3_5RMSNormGated` (and
+    Llama-style norms) as `variance_epsilon`."""
+    for attr in ("eps", "variance_epsilon"):
+        v = getattr(mod, attr, None)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    raise SystemExit(f"[hessian] {type(mod).__name__} has neither .eps nor .variance_epsilon")
+
+
 class SharedInputGate:
     """Proves the shared-tap assumption: on the first layer of each type, every companion module
     (`in_proj_z`, `k_proj`, `v_proj`, `up_proj`) must be handed the same storage, with equal values,
@@ -671,20 +832,28 @@ class CaptureState:
     seconds_per_file: dict[str, float] = field(default_factory=dict)
     layer_seconds: list[float] = field(default_factory=list)
     shared_gate: SharedInputGate = field(default_factory=SharedInputGate)
+    #: The weightless rms taps (RmsTapPlan): stats, the norm's eps, and the fp32 (1 + w) the norm
+    #: module multiplies by (from the materialized layer), for evaluate_rms_gates.
+    rms_written: dict[str, dict] = field(default_factory=dict)
+    rms_eps: dict[str, float] = field(default_factory=dict)
+    rms_scale: dict[str, np.ndarray] = field(default_factory=dict)
 
 
-def _write_accum(out_dir: Path, plan: TapPlan, acc: HessianAccum, st: CaptureState) -> None:
+def _write_accum(out_dir: Path, plan, acc: HessianAccum, st: CaptureState,
+                 rms: bool = False) -> None:
     import torch
 
     t0 = time.perf_counter()
     rows = acc.rows
     h = acc.finalize_fp32()
+    on_device = h.is_cuda
     host = h.cpu().numpy()
     del h
-    torch.cuda.empty_cache()
+    if on_device:
+        torch.cuda.empty_cache()
     stats = write_hess_file(out_dir / plan.file, host, rows)
     del host
-    st.written[plan.file] = stats
+    (st.rms_written if rms else st.written)[plan.file] = stats
     st.seconds_per_file[plan.file] = time.perf_counter() - t0
     warn = "" if stats["finite"] and stats["min_diag"] > 0 else "   <-- NOT FINITE / NON-POSITIVE DIAG"
     print(f"[hessian]   {plan.file:<22} K={stats['K']:>5} rows={rows:>7} "
@@ -694,21 +863,28 @@ def _write_accum(out_dir: Path, plan: TapPlan, acc: HessianAccum, st: CaptureSta
 
 
 def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, out_dir: Path,
-                hidden_device, want_draft_head: bool) -> CaptureState:
+                hidden_device, want_draft_head: bool, rms_plans: list[RmsTapPlan] = (),
+                shared_gate: bool = True) -> CaptureState:
+    """The layer-major pass. `rms_plans` adds the weightless rms taps (a forward_pre_hook on the
+    layer's norm module, see rms_weightless); `--rms-only` passes no `plans` and `shared_gate=False`,
+    so only those are hooked."""
     import torch
-    from imatrix_capture import CaptureResult, MtpTaps
 
     st = CaptureState()
     dev = ref.device
     layer_types = ref.layer_types
     gate_layers = {}
-    for t in ("linear_attention", "full_attention"):
-        if t in layer_types[:n_run]:
-            gate_layers[layer_types.index(t)] = t
+    if shared_gate:
+        for t in ("linear_attention", "full_attention"):
+            if t in layer_types[:n_run]:
+                gate_layers[layer_types.index(t)] = t
     by_layer: dict[int, list[TapPlan]] = {}
     for p in plans:
         if p.scope == "layer":
             by_layer.setdefault(p.layer, []).append(p)
+    rms_by_layer: dict[int, list[RmsTapPlan]] = {}
+    for rp in rms_plans:
+        rms_by_layer.setdefault(rp.layer, []).append(rp)
 
     rope_cache: dict[int, tuple] = {}
     mask_cache: dict[int, object] = {}
@@ -742,6 +918,18 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                     mod = getattr(mod, part)
                 handles.append(mod.register_forward_pre_hook(
                     lambda _m, inputs, _acc=acc: _acc.update(inputs[0])))
+            # The weightless rms taps: the norm's INPUT is the residual x; accumulate rms(x) with the
+            # module's own eps, no weight (the scale it would apply is recorded for the gates).
+            rms_accs: dict[str, HessianAccum] = {}
+            for rp in rms_by_layer.get(i, []):
+                norm = getattr(layer, rp.norm)
+                eps = norm_eps(norm)
+                acc = HessianAccum(rp.k, dev)
+                rms_accs[rp.file] = acc
+                st.rms_eps[rp.file] = eps
+                st.rms_scale[rp.file] = (1.0 + norm.weight.detach().float()).cpu().numpy()
+                handles.append(norm.register_forward_pre_hook(
+                    lambda _m, inputs, _acc=acc, _eps=eps: _acc.update(rms_weightless(inputs[0], _eps))))
             gated = i in gate_layers
             if gated:
                 handles += st.shared_gate.install(layer, i, gate_layers[i])
@@ -763,14 +951,18 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
             del layer
             t_fwd = time.perf_counter() - t_layer
             print(f"[hessian] layer {i:>2}/{n_run} ({layer_types[i]}): forward+accumulate "
-                  f"{t_fwd:.1f}s, writing {len(accs)} tap(s)", flush=True)
+                  f"{t_fwd:.1f}s, writing {len(accs) + len(rms_accs)} tap(s)", flush=True)
             for p in by_layer.get(i, []):
                 _write_accum(out_dir, p, accs.pop(p.file), st)
+            for rp in rms_by_layer.get(i, []):
+                _write_accum(out_dir, rp, rms_accs.pop(rp.file), st, rms=True)
             st.layer_seconds.append(time.perf_counter() - t_layer)
 
         # lm_head + MTP: both consume the stack's output, one pass over the sequences.
         head_plans = [p for p in plans if p.scope in ("lm_head", "mtp")]
         if head_plans:
+            from imatrix_capture import CaptureResult, MtpTaps
+
             t_head = time.perf_counter()
             result = CaptureResult()
             lm_acc = None
@@ -954,6 +1146,123 @@ def print_gates(g: dict) -> None:
     print(f"[gate] overall: {pf(g['ok'])}{'' if g['complete'] else '   -- INCOMPLETE SET (smoke/pilot)'}")
 
 
+RMS_GATES = ("rms_complete", "rms_k_ok", "rms_finite_ok", "rms_min_diag_ok", "rms_rows_ok",
+             "rms_rows_match_ok", "rms_consistency_ok")
+
+
+def evaluate_rms_gates(rms_plans: list[RmsTapPlan], written: dict[str, dict], out_dir: Path,
+                       post_rows: dict[str, int], scales: dict[str, np.ndarray]) -> dict:
+    """The weightless rms files' gates. CPU only: the diagonals are read back from disk (what the
+    converter will read), `scales[file]` is the fp32 (1 + w) of the tap's norm and `post_rows` the
+    rows of each paired post-norm file.
+
+    - finite; min diag > 0 with NO exemption (rms(x) of a real residual has no structurally zero
+      channel -- a zero means the norm's OUTPUT, or a weighted input, was hooked);
+    - rows >= 4 x K, and == the post-norm file's rows (the same tokens);
+    - consistency, which proves both captures saw the same activations through the same norm: on
+      every channel with (1 + w_i) != 0, |diag(H_post)_i - (1 + w_i)^2 diag(H_rms)_i| <=
+      RMS_CONSISTENCY_RTOL x (1 + w_i)^2 diag(H_rms)_i, and diag(H_post)_i == 0 exactly where
+      (1 + w_i) == 0. The worst channel is reported."""
+    missing, k_bad, not_finite, rows_short, rows_mismatch = [], [], [], [], []
+    nonpos: dict[str, list[int]] = {}
+    inconsistent: list[str] = []
+    dead_nonzero: dict[str, list[int]] = {}
+    per_file: dict[str, dict] = {}
+    worst = {"rel": 0.0, "file": None, "channel": None, "post_diag": None, "predicted_diag": None}
+    for rp in rms_plans:
+        w = written.get(rp.file)
+        post_path = out_dir / rp.post_file
+        if w is None or not (out_dir / rp.file).exists() or not post_path.exists():
+            missing.append(rp.file if w is None else f"{rp.file} (or its pair {rp.post_file})")
+            continue
+        if w["K"] != rp.k:
+            k_bad.append((rp.file, w["K"], rp.k))
+        if not w["finite"]:
+            not_finite.append(rp.file)
+        if w["nonpos_channels"] or not w["min_diag"] > 0.0:
+            nonpos[rp.file] = list(w["nonpos_channels"])
+        if w["rows"] < ROWS_PER_K_MIN * w["K"]:
+            rows_short.append((rp.file, w["rows"], ROWS_PER_K_MIN * w["K"]))
+        if post_rows.get(rp.post_file) != w["rows"]:
+            rows_mismatch.append((rp.file, w["rows"], rp.post_file, post_rows.get(rp.post_file)))
+        d_rms = read_hess_diag(out_dir / rp.file)
+        d_post = read_hess_diag(post_path)
+        s = np.asarray(scales[rp.file], dtype=np.float64)
+        if not (d_rms.shape == d_post.shape == s.shape):
+            k_bad.append((rp.file, int(d_rms.shape[0]), int(d_post.shape[0]), int(s.shape[0])))
+            continue
+        live = s != 0.0
+        pred = s * s * d_rms
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = np.abs(d_post - pred) / pred
+        rel = np.where(live, np.where(np.isfinite(rel), rel, np.inf), 0.0)
+        j = int(np.argmax(rel))
+        dead = np.flatnonzero(~live)
+        dz = [int(c) for c in dead if d_post[c] != 0.0]
+        per_file[rp.file] = {
+            "post_file": rp.post_file, "worst_rel": float(rel[j]), "worst_channel": j,
+            "post_diag": float(d_post[j]), "predicted_diag": float(pred[j]),
+            "median_rel": float(np.median(rel[live])) if live.any() else 0.0,
+            "dead_channels": dead[:MAX_REPORTED_CHANNELS].tolist(),
+            "min_diag": w["min_diag"], "max_diag": w["max_diag"], "rows": w["rows"]}
+        if not rel[j] <= RMS_CONSISTENCY_RTOL:
+            inconsistent.append(rp.file)
+        if dz:
+            dead_nonzero[rp.file] = dz[:MAX_REPORTED_CHANNELS]
+        if not rel[j] <= worst["rel"]:
+            worst = {"rel": float(rel[j]), "file": rp.file, "channel": j,
+                     "post_diag": float(d_post[j]), "predicted_diag": float(pred[j])}
+    min_file = min(per_file, key=lambda f: per_file[f]["min_diag"]) if per_file else None
+    g = {
+        "rms_files": len(rms_plans),
+        "rms_complete": not missing and bool(rms_plans),
+        "rms_missing": missing,
+        "rms_k_ok": not k_bad,
+        "rms_k_mismatches": k_bad,
+        "rms_finite_ok": not not_finite,
+        "rms_not_finite": not_finite,
+        "rms_min_diag_ok": not nonpos,
+        "rms_nonpositive_diag": nonpos,
+        "rms_min_diag": per_file[min_file]["min_diag"] if min_file else None,
+        "rms_min_diag_file": min_file,
+        "rms_rows_ok": not rows_short,
+        "rms_rows_per_k_min": ROWS_PER_K_MIN,
+        "rms_rows_short": rows_short,
+        "rms_rows_match_ok": not rows_mismatch,
+        "rms_rows_mismatch": rows_mismatch,
+        "rms_consistency_ok": not inconsistent and not dead_nonzero,
+        "rms_consistency_rtol": RMS_CONSISTENCY_RTOL,
+        "rms_consistency_worst": worst,
+        "rms_consistency_failed": inconsistent,
+        "rms_dead_channels_nonzero_in_post": dead_nonzero,
+        "rms_per_file": per_file,
+    }
+    g["ok"] = all(g[k] for k in RMS_GATES)
+    return g
+
+
+def print_rms_gates(g: dict) -> None:
+    def pf(ok):
+        return "PASS" if ok else "FAIL"
+    print(f"\n[gate] rms files present: {pf(g['rms_complete'])} ({g['rms_files']} planned"
+          f"{'; missing ' + str(g['rms_missing'][:6]) if g['rms_missing'] else ''})")
+    print(f"[gate] rms K == hidden == post-norm K: {pf(g['rms_k_ok'])} {g['rms_k_mismatches'][:6]}")
+    print(f"[gate] rms finite: {pf(g['rms_finite_ok'])} {g['rms_not_finite'][:8]}")
+    print(f"[gate] rms min diag > 0, no exemption: {pf(g['rms_min_diag_ok'])} (min "
+          f"{g['rms_min_diag']} in {g['rms_min_diag_file']}"
+          f"{'; non-positive: ' + str(dict(list(g['rms_nonpositive_diag'].items())[:4])) if g['rms_nonpositive_diag'] else ''})")
+    print(f"[gate] rms rows >= {g['rms_rows_per_k_min']} x K: {pf(g['rms_rows_ok'])} "
+          f"{g['rms_rows_short'][:6]}")
+    print(f"[gate] rms rows == post-norm rows: {pf(g['rms_rows_match_ok'])} {g['rms_rows_mismatch'][:4]}")
+    w = g["rms_consistency_worst"]
+    print(f"[gate] diag(H_post) vs (1+w)^2 diag(H_rms) within {g['rms_consistency_rtol']:.0%}: "
+          f"{pf(g['rms_consistency_ok'])} (worst {w['rel']:.3e} at {w['file']} channel {w['channel']}: "
+          f"post {w['post_diag']} vs predicted {w['predicted_diag']}"
+          f"{'; failing ' + str(g['rms_consistency_failed'][:6]) if g['rms_consistency_failed'] else ''}"
+          f"{'; dead channels non-zero in post ' + str(g['rms_dead_channels_nonzero_in_post']) if g['rms_dead_channels_nonzero_in_post'] else ''})")
+    print(f"[gate] rms overall: {pf(g['ok'])}")
+
+
 # --------------------------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------------------------
@@ -975,11 +1284,17 @@ def regate(out_dir: Path, model_dir: Path) -> int:
     if not failed.exists():
         raise SystemExit(f"[hessian] --regate: {failed} not found (nothing to re-gate)")
     doc = json.loads(failed.read_text(encoding="utf-8"))
+    # A --rms-taps capture lists its rms files (and rms_keys) only if their own gates passed at
+    # capture time; a manifest claiming otherwise is not something to promote.
+    if doc.get("rms_keys") and not doc.get("rms_capture", {}).get("gates", {}).get("ok"):
+        raise SystemExit("[hessian] --regate: rms_keys present but rms_capture.gates.ok is not true")
     gates = doc["gates"]
     nonpos = {}
     for f in doc["files"]:
         d = read_hess_diag(out_dir / f)
         nonpos[f] = np.flatnonzero(d <= 0.0)[:MAX_REPORTED_CHANNELS].tolist()
+    # Only the post-norm taps are in "taps", so only they can be exempted by a dead (1 + w) == 0
+    # channel; the rms files (listed in "files" too) are re-gated with no exemption.
     taps = {f: (t["scope"], t["layer"], t["module"]) for f, t in doc["taps"].items()}
     structural = structural_zero_channels(model_dir, taps)
     gates.pop("nonpositive_diag_files", None)
@@ -990,15 +1305,295 @@ def regate(out_dir: Path, model_dir: Path) -> int:
     if not gates["ok"]:
         print("[hessian] --regate: still failing; hessian.failed.json left as is")
         return 1
-    extra = {k: v for k, v in doc.items() if k not in ("format", "version", "files", "keys")}
+    extra = {k: v for k, v in doc.items()
+             if k not in ("format", "version", "files", "keys", "rms_keys")}
     extra["gates"] = gates
     extra["regated"] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(),
                         "rule": "non-positive diagonal allowed only on channels whose preceding "
-                                "norm scale (1 + w) is exactly 0"}
-    path = write_manifest(out_dir, doc["files"], doc["keys"], extra)
+                                "norm scale (1 + w) is exactly 0 (never on an rms file)"}
+    path = write_manifest(out_dir, doc["files"], doc["keys"], extra, rms_keys=doc.get("rms_keys"))
     failed.unlink()
     print(f"[hessian] --regate: gates pass; wrote {path}")
     return 0
+
+
+# --------------------------------------------------------------------------------------------
+# --rms-only / --rms-taps: the manifest side (CPU)
+# --------------------------------------------------------------------------------------------
+
+
+def corpus_mismatches(recorded: dict, sources: list[dict], n_seqs: int, n_tokens: int,
+                      seq_len: int) -> list[str]:
+    """How this run's corpus differs from a manifest's recorded `corpus` (empty: identical). Every
+    source field is compared except CORPUS_HOW_FIELDS -- sha256s, token counts, windows, file lists."""
+    diffs = []
+    for name, want, got in (("seq_len", recorded.get("seq_len"), seq_len),
+                            ("sequences", recorded.get("sequences"), n_seqs),
+                            ("tokens", recorded.get("tokens"), n_tokens)):
+        if want != got:
+            diffs.append(f"corpus {name}: recorded {want!r}, this run {got!r}")
+    rec = recorded.get("sources", [])
+    if len(rec) != len(sources):
+        diffs.append(f"corpus sources: recorded {len(rec)}, this run {len(sources)}")
+
+    def short(v):
+        s = repr(v)
+        return s if len(s) <= 80 else s[:77] + "..."
+    for a, b in zip(rec, sources):
+        a2 = {k: v for k, v in a.items() if k not in CORPUS_HOW_FIELDS}
+        b2 = {k: v for k, v in b.items() if k not in CORPUS_HOW_FIELDS}
+        for k in sorted(set(a2) | set(b2)):
+            if a2.get(k) != b2.get(k):
+                label = a.get("name") or a.get("path") or ""
+                diffs.append(f"source {a.get('source')}{'/' + label if label else ''} {k}: "
+                             f"recorded {short(a2.get(k))}, this run {short(b2.get(k))}")
+    return diffs
+
+
+def rms_keys_of(rms_plans: list[RmsTapPlan]) -> dict[str, str]:
+    return {k: rp.file for rp in rms_plans for k in rp.keys}
+
+
+def manifest_without_rms(doc: dict) -> tuple[dict, dict, dict]:
+    """(files, keys, extra) of a manifest with its rms entries (rms_keys, their files, rms_capture)
+    removed -- what `--rms-only --force` rewrites before recapturing them."""
+    rms_files = set(doc.get("rms_keys", {}).values())
+    if rms_files & set(doc["keys"].values()):
+        raise SystemExit(f"[hessian] manifest lists {sorted(rms_files & set(doc['keys'].values()))} "
+                         f"under both keys and rms_keys -- refusing to touch it")
+    files = {f: v for f, v in doc["files"].items() if f not in rms_files}
+    extra = {k: v for k, v in doc.items()
+             if k not in ("format", "version", "files", "keys", "rms_keys", "rms_capture")}
+    return files, dict(doc["keys"]), extra
+
+
+def merge_rms_manifest(out_dir: Path, doc: dict, rms_plans: list[RmsTapPlan],
+                       written: dict[str, dict], rms_capture: dict) -> Path:
+    """`doc` (the validated hessian.json, without rms entries) plus the rms files under "files",
+    "rms_keys" and the "rms_capture" provenance, rewritten atomically (write_manifest: temp + rename,
+    LF). Every other field is kept as it was, in its order."""
+    files, keys, extra = manifest_without_rms(doc)
+    for rp in rms_plans:
+        if rp.file in files:
+            raise RuntimeError(f"{rp.file} is already listed in the manifest")
+        files[rp.file] = written[rp.file]
+    extra["rms_capture"] = rms_capture
+    return write_manifest(out_dir, files, keys, extra, rms_keys=rms_keys_of(rms_plans))
+
+
+def write_rms_failed(out_dir: Path, rms_plans: list[RmsTapPlan], written: dict[str, dict],
+                     rms_capture: dict) -> Path:
+    """The report of an rms capture whose gates failed: its files and the rms_keys it would have
+    added, under RMS_FAILED_MANIFEST_NAME (never opened by the converter). The manifest is untouched."""
+    doc = {"format": MANIFEST_FORMAT + "-rms-failed", "version": MANIFEST_VERSION,
+           "files": {f: {"K": int(w["K"]), "rows": int(w["rows"]), "trace": float(w["trace"])}
+                     for f, w in sorted(written.items())},
+           "rms_keys": dict(sorted(rms_keys_of(rms_plans).items())),
+           "rms_capture": rms_capture}
+    path = out_dir / RMS_FAILED_MANIFEST_NAME
+    tmp = out_dir / (RMS_FAILED_MANIFEST_NAME + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write((json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    os.replace(tmp, path)
+    return path
+
+
+def rms_capture_record(tool: str, rms_plans: list[RmsTapPlan], st: CaptureState, gates: dict,
+                       **provenance) -> dict:
+    """hessian.json "rms_capture": what the rms taps are, how and from what they were captured."""
+    return {
+        "tool": tool,
+        "semantics": ("H_rms = E[r^T r] over every calibration token, r = rms(x) = x * rsqrt(mean(x^2) "
+                      "+ eps) of a text layer's input_layernorm / post_attention_layernorm INPUT x "
+                      "(the bf16 residual), in fp32 exactly as Qwen3_5RMSNorm._norm(x.float()) with "
+                      "the module's own eps -- NO (1 + w) multiply, NO bf16 cast. The input a "
+                      "rotated container's weightless norm feeds its folded in-projections (before "
+                      "Q). fp32 GEMM per sequence, fp64 accumulation, stored fp32 packed upper "
+                      "triangle; 'rms_keys' maps each norm-fed in-projection to its file."),
+        "eps": sorted(set(st.rms_eps.values())),
+        "taps": {rp.file: {"layer": rp.layer, "norm": rp.norm, "post_file": rp.post_file,
+                           "keys": rp.keys,
+                           "tap": f"forward_pre_hook on layer {rp.layer}'s {rp.norm} (its input)"}
+                 for rp in rms_plans},
+        "file_stats": {f: {"min_diag": w["min_diag"], "max_diag": w["max_diag"],
+                           "finite": w["finite"], "bytes": w["bytes"],
+                           "seconds": st.seconds_per_file.get(f)}
+                       for f, w in sorted(st.rms_written.items())},
+        "gates": gates,
+        **provenance,
+    }
+
+
+
+def _pick_hidden_device(args, device, hidden_bytes: int):
+    import torch
+
+    if args.hidden_device == "auto":
+        return device if hidden_bytes <= 6 * 2**30 else torch.device("cpu")
+    return device if args.hidden_device == "cuda" else torch.device("cpu")
+
+
+def run_rms_only(args) -> int:
+    """--rms-only: capture ONLY the weightless rms taps (a full layer-major forward, nothing else
+    hooked) and merge them into the validated set already in --out-dir. Before any GPU work it
+    refuses unless hessian.json exists, the checkpoint's config.json sha256 and this run's corpus
+    (every source's sha256, token counts and windows) equal what the manifest records -- the rms
+    taps must see the SAME activations as the post-norm taps they pair with -- and (without --force)
+    the manifest has no rms_keys yet. hessian.json is rewritten only if every rms gate passes and the
+    manifest did not change meanwhile; otherwise it is left byte-identical and the report goes to
+    hessian_rms.failed.json."""
+    sys.path.insert(0, str(TOOLS_REF))
+    from common import DEFAULT_MODEL_DIR, load_text_config, sha256_file
+
+    model_dir = args.model_dir or DEFAULT_MODEL_DIR
+    out_dir = args.out_dir
+    manifest_path = out_dir / MANIFEST_NAME
+    if not manifest_path.exists():
+        hint = (f"; {FAILED_MANIFEST_NAME} is there -- promote it with --regate first"
+                if (out_dir / FAILED_MANIFEST_NAME).exists() else "")
+        raise SystemExit(f"[hessian] --rms-only: {manifest_path} not found (it merges into a "
+                         f"validated set){hint}")
+    raw = manifest_path.read_bytes()
+    doc = json.loads(raw.decode("utf-8"))
+    if doc.get("format") != MANIFEST_FORMAT or doc.get("version") != MANIFEST_VERSION:
+        raise SystemExit(f"[hessian] --rms-only: {manifest_path} is not an {MANIFEST_FORMAT} "
+                         f"v{MANIFEST_VERSION} manifest")
+    cfg_sha = sha256_file(model_dir / "config.json")
+    if doc.get("config_sha256") != cfg_sha:
+        raise SystemExit(f"[hessian] --rms-only: {model_dir}\\config.json sha256 {cfg_sha} is not "
+                         f"the set's ({doc.get('config_sha256')}, captured from "
+                         f"{doc.get('model_dir')}) -- pass the same --model-dir")
+    if doc.get("rms_keys") and not args.force:
+        raise SystemExit(f"[hessian] --rms-only: {manifest_path} already has rms_keys "
+                         f"({len(doc['rms_keys'])} keys); pass --force to recapture them (the old "
+                         f"rms entries are removed from it before the capture starts)")
+
+    _, text_config = load_text_config(model_dir)
+    n_layers = int(text_config.num_hidden_layers)
+    hidden = int(text_config.hidden_size)
+    n_run = n_layers if args.layers is None else max(1, min(args.layers, n_layers))
+    key_re = re.compile(args.keys) if args.keys else None
+    post_keys: dict[str, list[str]] = {}
+    for k, f in doc["keys"].items():
+        if RMS_POST_FILE_RE.fullmatch(f) and (key_re is None or key_re.search(k)):
+            post_keys.setdefault(f, []).append(k)
+    rms_plans = build_rms_plans(post_keys, n_run, hidden)
+    if not rms_plans:
+        raise SystemExit("[hessian] --rms-only: the manifest has no norm-fed tap "
+                         "(L{i}.in / L{i}.mlp_in) selected by --layers/--keys")
+    for rp in rms_plans:
+        if int(doc["files"][rp.post_file]["K"]) != hidden:
+            raise SystemExit(f"[hessian] {rp.post_file} has K={doc['files'][rp.post_file]['K']}, "
+                             f"not hidden_size {hidden}")
+
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    t0 = time.perf_counter()
+    seqs, sources = build_corpus(args, tokenizer)
+    total_tokens = sum(len(s.token_ids) for s in seqs)
+    print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
+          f"({time.perf_counter() - t0:.1f}s to tokenize)")
+    diffs = corpus_mismatches(doc.get("corpus", {}), sources, len(seqs), total_tokens, args.seq_len)
+    if diffs:
+        for d in diffs[:24]:
+            print(f"[hessian]   {d}")
+        code = [s for s in doc.get("corpus", {}).get("sources", []) if s.get("source") == "code"]
+        hint = (f" The code windows are read from this checkout's working tree unless --code-rev "
+                f"names the commit the set was captured at (recorded sha256_of_concatenation "
+                f"{code[0].get('sha256_of_concatenation')})." if code else "")
+        raise SystemExit(f"[hessian] --rms-only: this corpus is not the one {manifest_path} was "
+                         f"captured from, so the rms taps would not see the post-norm taps' "
+                         f"activations. Pass that capture's corpus options.{hint}")
+    print(f"[hessian] corpus matches {manifest_path.name} (sha256s, token counts, windows)")
+
+    n_fwd = max(rp.layer for rp in rms_plans) + 1
+    estimate = sum(hess_file_bytes(rp.k) for rp in rms_plans) + (1 << 20)
+    print(f"[hessian] --rms-only: {len(rms_plans)} weightless rms tap(s) serving "
+          f"{sum(len(rp.keys) for rp in rms_plans)} key(s), text layers 0..{n_fwd - 1} forwarded")
+    if args.dry_run:
+        for rp in rms_plans:
+            print(f"    {rp.file:<22} K={rp.k:>5} rows~{total_tokens:>7} "
+                  f"{hess_file_bytes(rp.k) / 2**20:8.1f} MiB  {rp.norm} input; pairs "
+                  f"{rp.post_file}; {','.join(rp.keys)}")
+    anchor = _existing_anchor(out_dir)
+    free = shutil.disk_usage(anchor).free
+    print(f"[hessian] disk estimate {estimate / 2**30:.2f} GiB; free at {anchor}: "
+          f"{free / 2**30:.2f} GiB (need 1.1 x estimate)")
+    if args.dry_run:
+        print("[hessian] --dry-run: nothing captured, nothing written")
+        return 0
+    if free < 1.1 * estimate:
+        raise SystemExit("[hessian] not enough free space on the target drive -- refusing to start")
+
+    if doc.get("rms_keys"):  # --force: the old rms entries go first, so hessian.json never lists
+        files, keys, extra = manifest_without_rms(doc)  # a file this run is about to overwrite
+        write_manifest(out_dir, files, keys, extra)
+        print(f"[hessian] --force: removed the old rms entries from {manifest_path}")
+        raw = manifest_path.read_bytes()
+        doc = json.loads(raw.decode("utf-8"))
+    sha_start = hashlib.sha256(raw).hexdigest()
+    stale = out_dir / RMS_FAILED_MANIFEST_NAME
+    if stale.exists():
+        stale.unlink()
+
+    import torch
+    import transformers
+    from common import resolve_device
+    from full_logits_golden import StreamingReference
+
+    device = resolve_device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
+    hidden_bytes = total_tokens * hidden * 2
+    hidden_device = _pick_hidden_device(args, device, hidden_bytes)
+    ref = StreamingReference(model_dir, device, dtype=torch.bfloat16)
+    torch.cuda.reset_peak_memory_stats()
+    t_start = time.perf_counter()
+    st = run_capture(ref, seqs, [], [], n_fwd, out_dir, hidden_device, False,
+                     rms_plans=rms_plans, shared_gate=False)
+    seconds = time.perf_counter() - t_start
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    print(f"[hessian] rms capture done: {seconds:.1f}s, peak VRAM {peak:.3f} GiB")
+
+    return finish_rms_only(
+        out_dir, doc, sha_start, rms_plans, st,
+        generated_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        model_dir=str(model_dir), config_sha256=cfg_sha,
+        manifest_sha256_before=sha_start,
+        corpus={"sequences": len(seqs), "tokens": total_tokens, "seq_len": args.seq_len,
+                "code_rev": getattr(args, "code_rev", None),
+                "matches": "the manifest's corpus: every source's sha256, token counts, windows"},
+        layers_forwarded=n_fwd, keys_filter=args.keys,
+        device=str(device), hidden_device=str(hidden_device),
+        torch_version=torch.__version__, transformers_version=transformers.__version__,
+        seconds=seconds, peak_vram_gib=peak)
+
+
+def finish_rms_only(out_dir: Path, doc: dict, sha_start: str, rms_plans: list[RmsTapPlan],
+                    st: CaptureState, **provenance) -> int:
+    """--rms-only after the capture (CPU): gate the rms files; merge them into hessian.json only if
+    every gate passes AND hessian.json is still the file `doc` was read from (sha256 `sha_start`);
+    otherwise leave it byte-identical and write hessian_rms.failed.json. Returns the exit code."""
+    manifest_path = out_dir / MANIFEST_NAME
+    post_rows = {rp.post_file: int(doc["files"][rp.post_file]["rows"]) for rp in rms_plans}
+    gates = evaluate_rms_gates(rms_plans, st.rms_written, out_dir, post_rows, st.rms_scale)
+    now = manifest_path.read_bytes() if manifest_path.exists() else b""
+    gates["manifest_unchanged_ok"] = hashlib.sha256(now).hexdigest() == sha_start
+    gates["ok"] = gates["ok"] and gates["manifest_unchanged_ok"]
+    print_rms_gates(gates)
+    if not gates["manifest_unchanged_ok"]:
+        print(f"[gate] {manifest_path} changed during the capture: FAIL (not merging into it)")
+    record = rms_capture_record("tools/reference/hessian_capture.py --rms-only", rms_plans, st,
+                                gates, **provenance)
+    if gates["ok"]:
+        path = merge_rms_manifest(out_dir, doc, rms_plans, st.rms_written, record)
+        print(f"\n[hessian] merged {len(rms_plans)} rms file(s) and "
+              f"{len(rms_keys_of(rms_plans))} rms_keys into {path}")
+        return 0
+    path = write_rms_failed(out_dir, rms_plans, st.rms_written, record)
+    print(f"\n[hessian] RMS GATES FAILED -- {manifest_path} left unchanged; report in {path}")
+    return 1
 
 
 def main() -> int:
@@ -1015,7 +1610,9 @@ def main() -> int:
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--force", action="store_true",
                     help="allow an --out-dir that already holds a hessian.json (it is deleted "
-                         "before the capture starts; stale .hess files are overwritten)")
+                         "before the capture starts; stale .hess files are overwritten). With "
+                         "--rms-only: allow a hessian.json that already has rms_keys (those entries "
+                         "are removed from it before the capture starts)")
     ap.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR,
                     help="kv_calib_corpus-style directory; 'none' to skip")
     ap.add_argument("--calib-txt", type=Path, default=DEFAULT_CALIB_TXT, help="'none' to skip")
@@ -1040,6 +1637,19 @@ def main() -> int:
                     help="where the inter-layer hidden states live (auto: device if <= 6 GiB)")
     ap.add_argument("--dry-run", action="store_true",
                     help="print corpus sizes, the file list and the disk estimate; no GPU")
+    ap.add_argument("--rms-taps", action="store_true",
+                    help="also capture the weightless rms taps L{i}.in.rms.hess / L{i}.mlp_in.rms.hess "
+                         "(rms(x) of each text layer's input_layernorm / post_attention_layernorm "
+                         "input, no weight) that r4dx-convert --rotate rounds in-projections against; "
+                         "listed under hessian.json rms_keys only if their gates pass")
+    ap.add_argument("--rms-only", action="store_true",
+                    help="capture ONLY the weightless rms taps and merge them into the validated set "
+                         "already in --out-dir (same checkpoint and corpus required; --force replaces "
+                         "rms entries it already has)")
+    ap.add_argument("--code-rev", default=None, metavar="COMMIT",
+                    help="read the repo-source windows of the corpus from this commit's tree instead "
+                         "of the working tree (for --rms-only against a set captured at an older "
+                         "checkout; its code sha256_of_concatenation must match)")
     args = ap.parse_args()
 
     if args.write_fixture is not None:
@@ -1057,6 +1667,8 @@ def main() -> int:
             "[hessian] refusing to run: $env:HIP_VISIBLE_DEVICES must be exactly '1' (only HIP "
             f"device 1, the headless R9700, may be used). Got {visible!r}. (--dry-run needs no GPU.)"
         )
+    if args.rms_only:
+        return run_rms_only(args)
 
     sys.path.insert(0, str(TOOLS_REF))
     from common import DEFAULT_MODEL_DIR, ShardIndex, load_text_config, sha256_file
@@ -1110,20 +1722,32 @@ def main() -> int:
     selected_keys = [k for p in plans for k in p.keys]
     if not plans:
         raise SystemExit("[hessian] --keys/--layers select no tap at all")
+    # --rms-taps: one weightless rms tap per selected norm-fed post-norm tap (same layer, same keys).
+    rms_plans = (build_rms_plans({p.file: p.keys for p in plans if p.scope == "layer"}, n_run,
+                                 int(text_config.hidden_size)) if args.rms_taps else [])
+    if args.rms_taps and not rms_plans:
+        raise SystemExit("[hessian] --rms-taps: --keys/--layers select no norm-fed tap (L{i}.in / "
+                         "L{i}.mlp_in)")
     # MTP taps carry T-1 rows per sequence (MtpTaps pairs row i with token i+1), all others T.
     predicted_rows = {p.file: total_tokens - (len(seqs) if p.scope == "mtp" else 0) for p in plans}
-    estimate = sum(hess_file_bytes(p.k) for p in plans) + (1 << 20)
+    estimate = (sum(hess_file_bytes(p.k) for p in plans) +
+                sum(hess_file_bytes(rp.k) for rp in rms_plans) + (1 << 20))
 
     print(f"[hessian] {len(all_keys)} converter linears -> {len(plans_all)} taps; selected "
           f"{len(plans)} file(s) serving {len(selected_keys)} key(s), text layers 0..{n_run - 1}"
-          f"{'' if key_re is None else f', --keys {args.keys!r}'}")
+          f"{'' if key_re is None else f', --keys {args.keys!r}'}"
+          f"{f'; + {len(rms_plans)} weightless rms tap(s)' if rms_plans else ''}")
     short = [(p.file, predicted_rows[p.file], ROWS_PER_K_MIN * p.k) for p in plans
              if predicted_rows[p.file] < ROWS_PER_K_MIN * p.k]
     if args.dry_run:
         for p in plans:
             print(f"    {p.file:<22} K={p.k:>5} rows~{predicted_rows[p.file]:>7} "
                   f"{hess_file_bytes(p.k) / 2**20:8.1f} MiB  {','.join(p.keys)}")
-    print(f"[hessian] disk estimate {estimate / 2**30:.2f} GiB for {len(plans)} file(s)")
+        for rp in rms_plans:
+            print(f"    {rp.file:<22} K={rp.k:>5} rows~{total_tokens:>7} "
+                  f"{hess_file_bytes(rp.k) / 2**20:8.1f} MiB  rms_keys: {','.join(rp.keys)}")
+    print(f"[hessian] disk estimate {estimate / 2**30:.2f} GiB for {len(plans) + len(rms_plans)} "
+          f"file(s)")
     if short:
         print(f"[hessian] WARNING: {len(short)} tap(s) would get fewer than {ROWS_PER_K_MIN} x K "
               f"rows: {short[:6]}")
@@ -1143,10 +1767,10 @@ def main() -> int:
             raise SystemExit(f"[hessian] {manifest_path} already exists; pass --force to replace "
                              f"the set (the old manifest is deleted before capturing)")
         manifest_path.unlink()
-    # A previous failed run's report describes .hess files this run is about to overwrite.
-    failed_path = args.out_dir / FAILED_MANIFEST_NAME
-    if failed_path.exists():
-        failed_path.unlink()
+    # A previous failed run's reports describe .hess files this run is about to overwrite.
+    for stale in (FAILED_MANIFEST_NAME, RMS_FAILED_MANIFEST_NAME):
+        if (args.out_dir / stale).exists():
+            (args.out_dir / stale).unlink()
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     import torch
@@ -1158,10 +1782,7 @@ def main() -> int:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     hidden_bytes = total_tokens * int(text_config.hidden_size) * 2
-    if args.hidden_device == "auto":
-        hidden_device = device if hidden_bytes <= 6 * 2**30 else torch.device("cpu")
-    else:
-        hidden_device = device if args.hidden_device == "cuda" else torch.device("cpu")
+    hidden_device = _pick_hidden_device(args, device, hidden_bytes)
 
     t0 = time.perf_counter()
     ref = StreamingReference(model_dir, device, dtype=torch.bfloat16)
@@ -1175,7 +1796,7 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
     st = run_capture(ref, seqs, plans, specs, n_run, args.out_dir, hidden_device,
-                     args.draft_head)
+                     args.draft_head, rms_plans=rms_plans)
     seconds = time.perf_counter() - t_start
     peak = torch.cuda.max_memory_allocated() / 2**30
     reserved = torch.cuda.max_memory_reserved() / 2**30
@@ -1237,11 +1858,34 @@ def main() -> int:
         "peak_vram_reserved_gib": reserved,
         "caveat": CAVEAT,
     }
+    # --rms-taps: the rms files enter the manifest ("files", "rms_keys", "rms_capture") only if their
+    # own gates pass -- whichever manifest name the post-norm gates choose, so --regate keeps them.
+    # Otherwise the post-norm set is written without them and the rms report goes to
+    # hessian_rms.failed.json (--rms-only can redo just that part).
+    rms_keys = None
+    rms_ok = True
+    if rms_plans:
+        rms_gates = evaluate_rms_gates(rms_plans, st.rms_written, args.out_dir,
+                                       {f: w["rows"] for f, w in st.written.items()}, st.rms_scale)
+        print_rms_gates(rms_gates)
+        rms_ok = rms_gates["ok"]
+        record = rms_capture_record("tools/reference/hessian_capture.py --rms-taps", rms_plans, st,
+                                    rms_gates)
+        if rms_ok:
+            for rp in rms_plans:
+                files[rp.file] = st.rms_written[rp.file]
+            rms_keys = rms_keys_of(rms_plans)
+            extra["rms_capture"] = record
+        else:
+            rms_failed = write_rms_failed(args.out_dir, rms_plans, st.rms_written, record)
+            print(f"[hessian] RMS GATES FAILED -- the rms files are NOT listed in the manifest; "
+                  f"report in {rms_failed}")
     # A failed set is written as hessian.failed.json, which HessianStore never opens: the gate report
     # survives for diagnosis, but `--hessian-dir` on this directory is a "cannot open hessian.json"
     # error rather than a conversion against Hessians the gates just called invalid.
     path = write_manifest(args.out_dir, files, keys, extra,
-                          manifest_name=MANIFEST_NAME if gates["ok"] else FAILED_MANIFEST_NAME)
+                          manifest_name=MANIFEST_NAME if gates["ok"] else FAILED_MANIFEST_NAME,
+                          rms_keys=rms_keys)
     total_bytes = sum(w["bytes"] for w in files.values())
     print(f"\n[hessian] wrote {len(files)} .hess file(s), {total_bytes / 2**30:.2f} GiB, and {path}")
     print(f"[hessian] tokens={total_tokens} wall={seconds:.1f}s peak={peak:.3f} GiB")
@@ -1250,7 +1894,7 @@ def main() -> int:
     if not gates["ok"]:
         print(f"[hessian] GATES FAILED -- manifest written as {FAILED_MANIFEST_NAME}, not "
               f"{MANIFEST_NAME}; the converter will not load this set")
-    return 0 if gates["ok"] else 1
+    return 0 if gates["ok"] and rms_ok else 1
 
 
 if __name__ == "__main__":

@@ -167,7 +167,8 @@ share a tap (`in_proj_qkv`/`in_proj_z`, `qg`/`k`/`v`) factor once.
   first shard is read (the manifest is checked during planning).
 - `--keep-bf16` wins over `--ldlq` for a linear both match.
 - `__metadata__.r4dx_convert_run` records `ldlq` (pattern), `ldlq_damp`, `hessian_dir`, the
-  manifest sha256 and the list of LDLQ'd bases.
+  manifest sha256 and the list of LDLQ'd bases. A rotated container also records
+  `ldlq_rms_linears`, the in-projections rounded against the weightless rms Hessian (section 3.2).
 
 Expected cost: ~2e14 multiply-adds for the whole model per layout (lm_head alone 6.5e12). At the
 measured microkernel rate (reported by the ctest) this should be a few minutes per layout on the
@@ -203,7 +204,9 @@ binary never applies the op to an unrotated container. The fold happens in fp32 
 quantization; bf16 linears (`gdn.in_proj_a/b`, `--keep-bf16` ones) are rounded once from the
 folded fp32. The Hessian capture for a rotated container MUST record activations in the rotated
 basis (`hessian_capture.py --rotation-seed`): `H' = Q^T H Q` for residual-side taps, computed from
-`H` exactly rather than re-captured.
+`H` exactly rather than re-captured. (As built, the converter does this change of basis itself,
+from an unrotated capture; for the norm-fed in-projections it needs the weightless rms taps of
+section 3.2.)
 
 ### 3.1 Q2a implementation note (runtime)
 
@@ -331,6 +334,122 @@ weights, and it never receives the pointers.
 model-shape refusals, and the TP slices. `test_tp_shard` gains the five `RuleFor` cases. The GPU
 side is `tests/kernels/test_rotate_residual`, `test_attn_gate_mul_hadamard`, and gates G5/G6 on a
 real rotated container. All of it is handed to the user to run.
+
+### 3.2 Q2a: the in-projection Hessian comes from the weightless rms tap
+
+A rotated container runs each zero-centred norm without its weight and folds `(1 + w)` into the next
+in-projections. So their input is `r' = rms(x) Q`, where `rms(x) = x * rsqrt(mean(x^2) + eps)` has no
+weight, and LDLQ must round against `H' = E[r'^T r'] = Q^T H_rms Q` with
+`H_rms = E[rms(x)^T rms(x)]`. Section 2.1's taps record the post-norm input
+`x_n = rms(x) (1 + w)`, so `H = D H_rms D` with `D = diag(1 + w)`. The first converter recovered
+`H_rms` by division, as `Q^T D^-1 H D^-1 Q` (`rotation.hpp: TransformHessianQ`). That has two
+problems:
+
+- **It fails at a dead channel.** Where `(1 + w_j) == 0`, `H` has an all-zero row and column, and no
+  `D^-1` exists. The real checkpoint has one: layer 7 `post_attention_layernorm[3994]`. Refusing is
+  the right call there. The rotation spreads channel `j`'s residual value, which can be large,
+  across every direction of its block. A Hessian that exempted the channel would give the direction
+  `e_j Q` zero weight, and rounding error would leak along it with no penalty.
+- **It amplifies noise where `|1 + w|` is merely small**, by `1 / (1 + w)^2`.
+
+**The fix: capture `H_rms` directly.** `hessian_capture.py --rms-taps` (with a full capture) or
+`--rms-only` (merged into an existing set) hooks the input of each text layer's `input_layernorm`
+and `post_attention_layernorm` (a forward_pre_hook on the norm module, so `x` is the bf16 residual).
+It accumulates `r = x.float() * rsqrt(mean(x.float()^2) + eps)` -- `Qwen3_5RMSNorm._norm(x.float())`
+exactly, with the module's own `eps` (`Qwen3_5RMSNorm` stores it as `.eps`, not `.variance_epsilon`),
+without the weight multiply or any bf16 cast -- as an fp32 GEMM per sequence into an fp64
+accumulator, into `L{i:02d}.in.rms.hess` and `L{i:02d}.mlp_in.rms.hess` (same format as 2.1; the
+name is the post-norm tap's with `.rms` before `.hess`). `hessian.json` gains `"rms_keys"`, which
+maps each norm-fed in-projection to its file: `gdn.in_proj_qkv/z` and `attn.qg/k/v` to `L.in.rms`,
+and `mlp.gate_up` to `L.mlp_in.rms`. `gdn.in_proj_a/b` stay bf16 and are never LDLQ'd, so they have
+no entry.
+
+- **Gates** (`evaluate_rms_gates`, recorded under `"rms_capture".gates`): finite; min diagonal > 0
+  with NO dead-channel exemption (`rms(x)` has no structurally zero channel); `rows >= 4K` and equal
+  to the paired post-norm file's rows; and consistency: on every channel with `(1 + w_i) != 0`,
+  `diag(H_post)_i` within 2% of `(1 + w_i)^2 diag(H_rms)_i` (the worst channel is reported), and
+  `diag(H_post)_i == 0` exactly where `(1 + w_i) == 0`. That proves both captures saw the same
+  activations through the same norm: the only difference is the bf16 rounding of the post-norm
+  input, <= ~0.4% on a mean square. If any gate fails, nothing rms goes into `hessian.json`; the
+  report is written to `hessian_rms.failed.json` instead.
+- **`--rms-only`** runs the full layer-major forward with only the rms taps hooked, then merges into
+  the validated `hessian.json` in `--out-dir`: it adds the files under `"files"`, `"rms_keys"` and
+  `"rms_capture"` (provenance and gates), and keeps every other byte, rewriting the manifest once
+  through the temp + rename writer with LF endings. Before any GPU work it refuses (also under
+  `--dry-run`) unless the checkpoint's `config.json` sha256 matches the set's and this run's corpus
+  matches the recorded one: every source's sha256, token counts, windows and file list. The
+  repo-source windows come from the working tree, so a set captured at an older checkout needs
+  `--code-rev <commit>`, which reads them from that commit's tree. `D:\models\r4dx\hessian-v1`
+  matches at `--code-rev 34d381a`. The run also refuses a manifest that already has `rms_keys`
+  unless `--force` is given, and then it removes the old rms entries before capturing. It refuses
+  to merge if `hessian.json` changed during the capture. With `--rms-taps`, a full capture lists the
+  rms files only if their own gates pass, and `--regate` keeps them and re-gates their diagonals with
+  no exemption.
+
+**Converter** (`hessian_store.hpp`, `rotation.hpp`, `main.cpp: add_linear`):
+
+- `HessianStore` parses the optional `"rms_keys"` map. It refuses:
+  - a map that is not an object, or a value that is not a string;
+  - a file not listed under `"files"`;
+  - a base with no `"keys"` entry;
+  - the `"keys"` file itself, or any other base's `"keys"` file;
+  - any file but the base's own rms twin (`L03.in.hess` -> `L03.in.rms.hess`). Every norm-fed tap
+    has `K = hidden`, so only the name ties the rms file to the base's tap and layer;
+  - a `K` different from that entry's file, or `rows` different when both are listed.
+
+  `Factor(kRms)` also refuses an rms file with a zero diagonal. That is what a capture of the norm's
+  output (or a weighted input) would give on a dead channel, and damping would hide it.
+
+  `Factor(..., HessianSource::kRms)` factors the rms file. The file is part of the one-entry cache
+  key, so `in_proj_qkv/z` share one factorization and so do `qg/k/v`. A base's `"keys"` file and its
+  rms file never share one.
+- `add_linear` decides once per linear: `use_rms = --ldlq selects it AND it is a rotated
+  in-projection AND rms_keys has it`.
+  - When `use_rms` is true, the Hessian is `TransformHessianRmsQ(H_rms) = Q^T H_rms Q`. There is no
+    division and no norm weight. The transform id is `"<kind>:seed=<s>:in-rms"`, and planning checks
+    the rms file's header and size.
+  - Otherwise, a rotated in-projection falls back to the division path. Planning now reads the
+    norm vector and refuses any `|1 + w| < 1e-3` before the header is written, not at that layer's
+    emit. The message names the linear and the channel and says to run
+    `hessian_capture.py --rms-only`.
+- **Unrotated conversions never read an rms file** (`fold.kind` is `kNone`). They are byte-identical
+  to before, whether or not `"rms_keys"` exists.
+- `r4dx_convert_run.ldlq_rms_linears` (rotated containers only) lists the in-projections that used
+  `H_rms`. The per-linear log line names the rms file.
+
+**Tests.** `tests/convert/test_rms_hessian.cpp` (ctest `convert_rms_hessian`, CPU) covers:
+
+- `TransformHessianRmsQ` against the dense closed-form `Q`, in full at 80 and 256 and on a sampled
+  48 x 48 block at 5120;
+- a dead channel on captured activations: the division path refuses; the rms path matches a direct
+  capture on `rms(x) Q`, keeps `tr(W' H' W'^T) = tr(W H W^T)`, and gives `e_j Q` its energy
+  `H_rms[j][j]`;
+- every `rms_keys` refusal, and `Factor(kRms)` on a zero diagonal;
+- `r4dx-convert` on a synthetic 2-layer checkpoint with a dead channel:
+  - unrotated output matches a digest pinned from the pre-rms build, with and without `rms_keys`;
+  - `q2ab` without `rms_keys` is refused during planning;
+  - with `rms_keys`, `ldlq_rms_linears` is recorded, and the w4a16 bytes equal fold, then
+    `Q^T H_rms Q`, then LDLQ;
+  - a partial `rms_keys` mixes both paths in one run.
+
+`tests/reference/test_hessian_rms.py` (ctest `reference_hessian_rms`, CPU, no checkpoint) drives a
+tiny random 2-layer Qwen3_5 stack, with a dead channel, through the tool's own `run_capture`, gates,
+`--rms-only` merge and `--regate`. It checks:
+
+- `rms_weightless` is `Qwen3_5RMSNorm._norm(x.float())` bit for bit;
+- each rms file equals an fp64 `E[rms(x)^T rms(x)]` of the recorded norm inputs;
+- the gates pass on a consistent capture (worst 1.4e-3);
+- a merge keeps every other manifest byte;
+- nothing is merged after a different corpus, a zeroed rms diagonal, a rows mismatch, or a manifest
+  that changed mid-run;
+- `--regate` keeps `rms_keys` and gives the rms files no dead-channel exemption.
+
+**GPU run (handed to the user).** With `$env:HIP_VISIBLE_DEVICES = '1'`, the merge into the existing
+set is
+`python tools\reference\hessian_capture.py --rms-only --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1`
+(128 files, 6.25 GiB, one layer-major forward with nothing else hooked; `--dry-run` first checks the
+corpus without the GPU). After that, `r4dx-convert --rotate q2ab --hessian-dir D:\models\r4dx\hessian-v1
+--ldlq .` no longer needs the division path.
 
 ## 4. Q2b -- online Hadamard on the down / o / out_proj inputs
 

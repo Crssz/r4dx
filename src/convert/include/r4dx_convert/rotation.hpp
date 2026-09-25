@@ -46,9 +46,19 @@
 //   in-projection: x_in = x_n (the HF normed input, (1+w) included), x_in' = x_n D^-1 Q, so
 //                  M = D^-1 Q (M^-T = D Q, the fold above) and H' = Q^T D^-1 H D^-1 Q
 //                  (TransformHessianQ; |1+w| >= 1e-3 or throw)
+//   in-projection, from the WEIGHTLESS tap: the folded linear's input is exactly r' = rms(x) Q
+//                  (rms(x) = x / sqrt(mean(x^2) + eps), no weight), so with H_rms = E[rms(x)^T rms(x)]
+//                  captured directly (hessian.json "rms_keys", hessian_capture.py --rms-taps /
+//                  --rms-only) H' = Q^T H_rms Q                                (TransformHessianRmsQ)
+//                  -- no division and no norm weight. This is the path to prefer: where (1+w) == 0
+//                  (a dead channel) the post-norm H has a zero row/column and no finite D^-1
+//                  exists, yet the rotation spreads that channel's residual value over every
+//                  direction of its block, so a Hessian blind to it lets the rounding error leak
+//                  there; and where |1+w| is merely small, dividing amplifies the capture's bf16
+//                  noise by 1/(1+w)^2.
 //   Q2b K side:    M = Hb, H' = Hb^T H Hb                 (TransformHessianHadamard)
 //   out-projection's N-side Q^T does not change its input: H unchanged.
-// Both are computed with the fast transforms, never a dense K x K product: the row transform on
+// All are computed with the fast transforms, never a dense K x K product: the row transform on
 // every row of H (A -> A M), then the same transform on every column (-> M^T A M), then an exact
 // symmetrization (the two halves differ only by rounding).
 //
@@ -399,15 +409,27 @@ inline void FoldRowsHadamard(std::vector<float>& W, int64_t N, int64_t K, const 
 
 // ---- Hessians ------------------------------------------------------------------------------------
 
+// What to do when the post-norm Hessian cannot be divided by (1 + w): the error text of every
+// division-path refusal (TransformHessianQ here, r4dx-convert's planning check) ends with it.
+inline constexpr const char* kRmsHessianHint =
+    "capture the weightless rms Hessians with `tools/reference/hessian_capture.py --rms-only "
+    "--out-dir <this --hessian-dir>` plus the set's corpus options (and `--code-rev <commit>` if the "
+    "repo's sources changed since it was captured; --dry-run checks the corpus without the GPU). It "
+    "adds \"rms_keys\" to hessian.json, and r4dx-convert then rounds every rotated in-projection "
+    "against Q^T H_rms Q, which needs no division";
+
 // Throws if any |1 + w| < 1e-3: D^-1 would blow that channel's Hessian row/column up by > 1e3
-// (a norm weight of exactly -1 zeroes the channel, and no finite H' represents that).
-inline void CheckNormInvertible(const float* norm_w, int64_t K, const std::string& who) {
+// (a norm weight of exactly -1 zeroes the channel, and no finite H' represents that). `hint`
+// (nullable) is appended to the message.
+inline void CheckNormInvertible(const float* norm_w, int64_t K, const std::string& who,
+                                const char* hint = nullptr) {
   for (int64_t k = 0; k < K; ++k) {
     const double d = 1.0 + static_cast<double>(norm_w[k]);
     if (!(std::fabs(d) >= 1e-3)) {
       throw std::runtime_error(who + ": |1 + norm_weight[" + std::to_string(k) + "]| = " +
                                std::to_string(std::fabs(d)) +
-                               " < 1e-3 -- the norm cannot be divided out of this linear's Hessian");
+                               " < 1e-3 -- the norm cannot be divided out of this linear's Hessian" +
+                               (hint ? std::string(" -- ") + hint : std::string()));
     }
   }
 }
@@ -428,31 +450,20 @@ inline void SymmetrizeInPlace(float* H, int64_t K, int nthreads) {
   });
 }
 
-}  // namespace rotation_detail
-
-// In-projection tap: H' = Q^T D^-1 H D^-1 Q, D = diag(1 + norm_w) (nullptr: D = I).
-inline void TransformHessianQ(std::vector<float>& H, int64_t K, const float* norm_w,
-                              const ResidualRotation& q, int nthreads) {
-  if (K != q.hidden || H.size() != static_cast<size_t>(K * K))
-    throw std::runtime_error("TransformHessianQ: H is " + std::to_string(K) + "^2 but Q is " +
-                             std::to_string(q.hidden) + " wide");
-  std::vector<double> dinv;
-  if (norm_w) {
-    CheckNormInvertible(norm_w, K, "TransformHessianQ");
-    dinv.resize(static_cast<size_t>(K));
-    for (int64_t k = 0; k < K; ++k)
-      dinv[static_cast<size_t>(k)] = 1.0 / (1.0 + static_cast<double>(norm_w[k]));
-  }
-  // Rows: A = D^-1 H D^-1, then A Q. The row index is needed for D^-1's left factor, so this pass
-  // is spelled out instead of going through ApplyToRows.
+// H <- Q^T A Q with A = D^-1 H D^-1 (dinv == nullptr: A = H), then the exact symmetrization. The
+// row index is needed for D^-1's left factor, so the row pass is spelled out instead of going
+// through ApplyToRows. Every row / column result depends only on its own data: the output does not
+// depend on nthreads.
+inline void QtHQInPlace(std::vector<float>& H, int64_t K, const double* dinv,
+                        const ResidualRotation& q, int nthreads) {
   ParallelFor(0, K, nthreads, [&](int64_t r0, int64_t r1) {
     std::vector<double> v(static_cast<size_t>(K)), tmp(static_cast<size_t>(K));
     for (int64_t r = r0; r < r1; ++r) {
       float* row = H.data() + r * K;
-      if (norm_w) {
-        const double dr = dinv[static_cast<size_t>(r)];
+      if (dinv) {
+        const double dr = dinv[r];
         for (int64_t k = 0; k < K; ++k)
-          v[static_cast<size_t>(k)] = static_cast<double>(row[k]) * dr * dinv[static_cast<size_t>(k)];
+          v[static_cast<size_t>(k)] = static_cast<double>(row[k]) * dr * dinv[k];
       } else {
         for (int64_t k = 0; k < K; ++k) v[static_cast<size_t>(k)] = row[k];
       }
@@ -462,7 +473,39 @@ inline void TransformHessianQ(std::vector<float>& H, int64_t K, const float* nor
   });
   // Columns: Q^T (A Q).
   ApplyToColumns(H.data(), K, K, nthreads, [&](double* v, double* tmp) { q.Apply(v, tmp); });
-  rotation_detail::SymmetrizeInPlace(H.data(), K, nthreads);
+  SymmetrizeInPlace(H.data(), K, nthreads);
+}
+
+}  // namespace rotation_detail
+
+// In-projection tap, from the captured POST-norm H: H' = Q^T D^-1 H D^-1 Q, D = diag(1 + norm_w)
+// (nullptr: D = I). Refuses a norm with any |1 + w| < 1e-3 (kRmsHessianHint says what to do).
+inline void TransformHessianQ(std::vector<float>& H, int64_t K, const float* norm_w,
+                              const ResidualRotation& q, int nthreads) {
+  if (K != q.hidden || H.size() != static_cast<size_t>(K * K))
+    throw std::runtime_error("TransformHessianQ: H is " + std::to_string(K) + "^2 but Q is " +
+                             std::to_string(q.hidden) + " wide");
+  std::vector<double> dinv;
+  if (norm_w) {
+    CheckNormInvertible(norm_w, K, "TransformHessianQ", kRmsHessianHint);
+    dinv.resize(static_cast<size_t>(K));
+    for (int64_t k = 0; k < K; ++k)
+      dinv[static_cast<size_t>(k)] = 1.0 / (1.0 + static_cast<double>(norm_w[k]));
+  }
+  rotation_detail::QtHQInPlace(H, K, norm_w ? dinv.data() : nullptr, q, nthreads);
+}
+
+// In-projection tap, from the WEIGHTLESS rms Hessian H_rms = E[rms(x)^T rms(x)] of the norm's input
+// (hessian.json "rms_keys"): H' = Q^T H_rms Q, exactly the second moment of the folded linear's
+// input rms(x) Q. No norm weight, no division, so it is defined for every channel -- a dead one
+// ((1 + w) == 0) included -- and needs nothing but Q. Same fast transforms and bits as
+// TransformHessianQ(H, K, nullptr, q, nthreads).
+inline void TransformHessianRmsQ(std::vector<float>& H, int64_t K, const ResidualRotation& q,
+                                 int nthreads) {
+  if (K != q.hidden || H.size() != static_cast<size_t>(K * K))
+    throw std::runtime_error("TransformHessianRmsQ: H is " + std::to_string(K) + "^2 but Q is " +
+                             std::to_string(q.hidden) + " wide");
+  rotation_detail::QtHQInPlace(H, K, nullptr, q, nthreads);
 }
 
 // Q2b tap: H' = Hb^T H Hb.

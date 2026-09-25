@@ -88,10 +88,13 @@
 // rotation.had_{down,o,gdn_out}_signs, generated from --rotation-seed, default 0x5EED2025) and the
 // __metadata__.rotation block that tells it to (docs/container-format.md "Residual rotation"). It
 // composes with every way of choosing values: --ldlq rounds a rotated linear against its Hessian
-// carried into the new basis (Q^T D^-1 H D^-1 Q for in-projections, Hb^T H Hb for the q2ab K side,
-// computed from the captured H); --imatrix vectors are carried over under their own diagonal model
-// (rotation.hpp's header says exactly what that is and is not). --layers N folds all N converted
-// layers. Not accepted with --selftest or --dflash-gguf.
+// carried into the new basis (Hb^T H Hb for the q2ab K side; for an in-projection Q^T H_rms Q when
+// hessian.json's "rms_keys" has the weightless rms(x) Hessian of its norm's input -- the folded
+// input is exactly rms(x) Q -- and otherwise Q^T D^-1 H D^-1 Q from the post-norm capture, which is
+// refused during planning if any |1 + w| < 1e-3); --imatrix vectors are carried over under their
+// own diagonal model (rotation.hpp's header says exactly what that is and is not).
+// r4dx_convert_run.ldlq_rms_linears lists the in-projections that used H_rms. --layers N folds all
+// N converted layers. Not accepted with --selftest or --dflash-gguf.
 //
 // --draft-vocab-ids (docs/r9700.md R9, "reduced-vocab draft head"): bakes an OPTIONAL smaller
 // lm_head (mtp.draft_head.lm_head.{layout} + mtp.draft_head.vocab_ids, docs/container-format.md
@@ -596,13 +599,26 @@ class LdlqSource {
   // The LDLQ'd bases, in container (= planning) order. Filled by Plan(); complete once the planning
   // pass is over, which is before the metadata that records it is built.
   const std::vector<std::string>& Linears() const { return planned_; }
+  // The subset of Linears() rounded against their "rms_keys" Hessian (rotated in-projections only;
+  // see HasRms), same order.
+  const std::vector<std::string>& RmsLinears() const { return planned_rms_; }
 
   bool Matches(const std::string& container_base) const {
     return enabled_ && std::regex_search(container_base, re_);
   }
 
-  // Planning pass, for a linear the caller decided to LDLQ. Throws on any manifest problem.
-  void Plan(const std::string& container_base, int64_t K, const LayoutSet& ls) {
+  // hessian.json has a weightless rms Hessian ("rms_keys", hessian_store.hpp) for this base. Only a
+  // ROTATED in-projection may use it -- its folded input is exactly rms(x) Q -- so the caller
+  // (add_linear) combines this with the linear's fold, once, and hands the result to Plan() and
+  // Factor(). An unrotated linear never reads the rms file, whatever the manifest holds.
+  bool HasRms(const std::string& container_base) const {
+    return enabled_ && store_->HasRms(container_base);
+  }
+
+  // Planning pass, for a linear the caller decided to LDLQ. Throws on any manifest problem. `rms`:
+  // the caller's decision that this linear rounds against its "rms_keys" file (then checked on disk
+  // too).
+  void Plan(const std::string& container_base, int64_t K, const LayoutSet& ls, bool rms = false) {
     if (!store_->Has(container_base)) {
       throw std::runtime_error(
           "--ldlq '" + pattern_ + "' selects '" + container_base + "' but " + dir_ +
@@ -639,6 +655,11 @@ class LdlqSource {
     require_group(ls.mxfp4, r4dx_convert::kMxfp4Group, "mxfp4");
     // The file itself (header, size, K/rows vs the manifest), each distinct file once.
     store_->CheckFile(container_base);
+    if (rms) {
+      // HessianStore already refused an "rms_keys" entry whose K differs from the "keys" one.
+      store_->CheckFile(container_base, r4dx_convert::HessianSource::kRms);
+      planned_rms_.push_back(container_base);
+    }
     planned_.push_back(container_base);
   }
 
@@ -650,29 +671,36 @@ class LdlqSource {
   // Emit pass. `*reused` = this base shares its Hessian file AND its --rotate change of basis with
   // the linear emitted just before it (same tap, same fold), i.e. the store's cached factorization
   // was returned rather than a new one computed. `xf` is RotationSource::HessianFor's transform, or
-  // nullptr for a linear whose input basis the rotation does not change.
+  // nullptr for a linear whose input basis the rotation does not change. `rms` = Plan()'s: factor
+  // the base's "rms_keys" file instead of its "keys" one.
   const r4dx_convert::LdlqFactor& Factor(const std::string& container_base, int64_t K, int threads,
                                          bool* reused,
-                                         const r4dx_convert::HessianTransform* xf = nullptr) {
-    const std::string file = store_->File(container_base);
+                                         const r4dx_convert::HessianTransform* xf = nullptr,
+                                         bool rms = false) {
+    const r4dx_convert::HessianSource src =
+        rms ? r4dx_convert::HessianSource::kRms : r4dx_convert::HessianSource::kKeys;
+    const std::string file = store_->FileFor(container_base, src);
     const std::string xf_id = xf ? xf->id : std::string();
     *reused = (file == last_file_ && xf_id == last_xf_id_);
     last_file_ = file;
     last_xf_id_ = xf_id;
-    return store_->Factor(container_base, K, damp_, threads, xf);
+    return store_->Factor(container_base, K, damp_, threads, xf, src);
   }
 
   // Emit pass, after the linear is written: the per-linear log line and the run totals.
   void Record(const std::string& container_base, int64_t N, int64_t K, double factor_s,
-              double emit_s, const r4dx_convert::LdlqFactor& f, bool reused, std::ostream& log) {
+              double emit_s, const r4dx_convert::LdlqFactor& f, bool reused, std::ostream& log,
+              bool rms = false) {
     ++done_;
     if (!reused) ++factorizations_;
     if (f.retries > 0) ++retried_;
     factor_s_ += factor_s;
     emit_s_ += emit_s;
-    log << "[r4dx-convert] ldlq: " << container_base << " [" << N << "," << K << "] factor "
-        << factor_s << " s" << (reused ? " (shared tap, cached)" : "") << ", quantize+write "
-        << emit_s << " s, damp_used=" << f.damp_used << " retries=" << f.retries << "\n";
+    log << "[r4dx-convert] ldlq: " << container_base << " [" << N << "," << K << "]"
+        << (rms ? " rms Hessian " + store_->RmsFile(container_base) + ":" : std::string())
+        << " factor " << factor_s << " s" << (reused ? " (shared tap, cached)" : "")
+        << ", quantize+write " << emit_s << " s, damp_used=" << f.damp_used
+        << " retries=" << f.retries << "\n";
   }
 
   // After the planning pass (before the long emit pass), like KeepBf16Selector::Report. A valid
@@ -693,6 +721,10 @@ class LdlqSource {
         << " (hessian.json sha256 " << store_->ManifestSha256() << ")";
     if (skipped_ > 0) log << "; " << skipped_ << " other match(es) are bf16-only, not LDLQ'd";
     log << "\n";
+    if (!planned_rms_.empty())
+      log << "[r4dx-convert] ldlq: " << planned_rms_.size()
+          << " rotated in-projection(s) round against the weightless rms Hessian "
+             "(hessian.json rms_keys): H' = Q^T H_rms Q\n";
   }
 
   // End of run. LDLQ'd linears never consult --imatrix, so they are in neither count of the imatrix
@@ -711,7 +743,7 @@ class LdlqSource {
   bool enabled_ = false;
   std::regex re_;
   std::unique_ptr<r4dx_convert::HessianStore> store_;
-  std::vector<std::string> planned_;
+  std::vector<std::string> planned_, planned_rms_;
   int64_t skipped_ = 0, done_ = 0, factorizations_ = 0, retried_ = 0;
   double factor_s_ = 0.0, emit_s_ = 0.0;
   std::string last_file_, last_xf_id_;
@@ -879,19 +911,44 @@ class RotationSource {
     return r4dx_convert::TransformImportanceHadamard(v.data, K, Had(f.had));
   }
 
+  // Planning pass, for an in-projection that --ldlq rounds against its POST-norm Hessian (no
+  // "rms_keys" entry): TransformHessianQ will divide (1 + w) out of it, which needs every
+  // |1 + w| >= 1e-3. Checked here, from the [hidden] norm vector alone, so a dead channel fails the
+  // conversion before the header is written instead of at that layer's emit, and the message says
+  // how to get the rms Hessian that needs no division.
+  void CheckNormDivisible(const LinearFold& f, const std::string& base, ShardedModel& model) {
+    if (f.kind != LinearFold::kIn) return;
+    const std::vector<float> norm = r4dx_convert::ReadTensorAsFloat(model, f.norm_hf);
+    r4dx_convert::CheckNormInvertible(
+        norm.data(), static_cast<int64_t>(norm.size()),
+        "--rotate " + std::string(KindName()) + " --ldlq: '" + base + "' (norm '" + f.norm_hf +
+            "') has no rms Hessian in hessian.json, and its post-norm Hessian cannot be used",
+        r4dx_convert::kRmsHessianHint);
+    ++ldlq_divided_;
+  }
+
   // The LDLQ Hessian's change of basis for a folded linear, or nullptr when its input basis is
   // unchanged (every out-projection under q2a, and every unfolded linear). The id -- part of
-  // HessianStore's factor cache key -- is the kind, the seed, the site and, for an in-projection,
-  // the norm's name and the sha256 of its fp32 bytes: attn.qg / k / v (one input_layernorm) and
-  // gdn.in_proj_qkv / z still share one factorization, and nothing else can.
+  // HessianStore's factor cache key, next to the file -- is the kind, the seed, the site and, for an
+  // in-projection rounded against its post-norm Hessian, the norm's name and the sha256 of its fp32
+  // bytes; for one rounded against its weightless rms Hessian (`rms`, the "rms_keys" file) it is
+  // "in-rms", since Q^T H_rms Q depends on nothing else. Either way attn.qg / k / v (one
+  // input_layernorm tap) and gdn.in_proj_qkv / z still share one factorization, and nothing else can.
   std::unique_ptr<r4dx_convert::HessianTransform> HessianFor(const LinearFold& f,
-                                                             const std::vector<float>& norm) {
+                                                             const std::vector<float>& norm,
+                                                             bool rms = false) {
     if (!f.RotatesInput()) return nullptr;
     ++ldlq_rotated_;
     auto xf = std::make_unique<r4dx_convert::HessianTransform>();
     const std::string prefix =
         std::string(KindName()) + ":seed=" + std::to_string(set_.seed) + ":";
-    if (f.kind == LinearFold::kIn) {
+    if (f.kind == LinearFold::kIn && rms) {
+      xf->id = prefix + "in-rms";
+      const r4dx_convert::ResidualRotation* q = &set_.q;
+      xf->apply = [q](std::vector<float>& H, int64_t K, int t) {
+        r4dx_convert::TransformHessianRmsQ(H, K, *q, t);
+      };
+    } else if (f.kind == LinearFold::kIn) {
       const std::string bytes(reinterpret_cast<const char*>(norm.data()), norm.size() * sizeof(float));
       xf->id = prefix + "in:" + f.norm_hf + ":" + r4dx_convert::Sha256Hex(bytes);
       const r4dx_convert::ResidualRotation* q = &set_.q;
@@ -926,14 +983,18 @@ class RotationSource {
         << " in-projection(s) (W diag(1+w) Q), " << folded_out_ << " out-projection(s) (Q^T W)";
     if (Hadamard()) log << ", " << folded_had_ << " of them also W Hb on the K side";
     log << "; " << ldlq_rotated_ << " LDLQ Hessian(s) and " << imatrix_rotated_
-        << " imatrix vector(s) carried into the rotated basis\n";
+        << " imatrix vector(s) carried into the rotated basis";
+    if (ldlq_divided_ > 0)
+      log << " (" << ldlq_divided_ << " in-projection Hessian(s) by dividing the norm out of the "
+          << "post-norm capture: no rms_keys entry)";
+    log << "\n";
   }
 
  private:
   r4dx_convert::RotationKind kind_;
   r4dx_convert::RotationSet set_;
   int64_t folded_in_ = 0, folded_out_ = 0, folded_had_ = 0, ldlq_rotated_ = 0,
-          imatrix_rotated_ = 0;
+          imatrix_rotated_ = 0, ldlq_divided_ = 0;
 };
 
 r4dx_convert::QuantMode ParseQuantMode(const std::string& s) {
@@ -1171,10 +1232,12 @@ int RunConvert(const AppArgs& args) {
   // `w` arrives ALREADY folded by --rotate (the caller did it); `fold` / `norm` only say how this
   // linear's input basis changed, so the imatrix vector and the LDLQ Hessian can follow it. With
   // `fold.kind == kNone` (always, without --rotate) both paths are exactly the pre-rotation code.
+  // `use_rms` (the caller's, like `use_ldlq`; only ever true for a rotated in-projection): round
+  // against Q^T H_rms Q from the base's "rms_keys" file instead of dividing the norm out of H.
   auto emit_linear = [&writer, &imatrix, &ldlq, &rot, quant_mode, threads](
                          const std::string& container_base, const std::vector<float>& w, int64_t N,
-                         int64_t K, const LayoutSet& ls, bool use_ldlq, const LinearFold& fold,
-                         const std::vector<float>& norm) {
+                         int64_t K, const LayoutSet& ls, bool use_ldlq, bool use_rms,
+                         const LinearFold& fold, const std::vector<float>& norm) {
     if (!use_ldlq) {
       r4dx_convert::QuantOptions opts = imatrix.For(container_base, K);
       std::vector<float> rotated_importance;  // must outlive EmitLinearLayouts (opts points at it)
@@ -1188,10 +1251,11 @@ int RunConvert(const AppArgs& args) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     bool reused = false;
-    const std::unique_ptr<r4dx_convert::HessianTransform> xf = rot.HessianFor(fold, norm);
+    const std::unique_ptr<r4dx_convert::HessianTransform> xf = rot.HessianFor(fold, norm, use_rms);
     // A reference into the store's one-entry cache: valid until the next Factor() call, which is
     // the next LDLQ'd linear's emit -- i.e. strictly after this EmitLinearLayouts returns.
-    const r4dx_convert::LdlqFactor& f = ldlq.Factor(container_base, K, threads, &reused, xf.get());
+    const r4dx_convert::LdlqFactor& f =
+        ldlq.Factor(container_base, K, threads, &reused, xf.get(), use_rms);
     const auto t1 = std::chrono::steady_clock::now();
     r4dx_convert::QuantOptions opts;
     opts.mode = quant_mode;  // ignored once opts.ldlq is set; kept so the struct reads truthfully
@@ -1200,7 +1264,7 @@ int RunConvert(const AppArgs& args) {
                                      static_cast<int>(K), ls, threads, opts);
     const auto t2 = std::chrono::steady_clock::now();
     ldlq.Record(container_base, N, K, SecondsBetween(t0, t1), SecondsBetween(t1, t2), f, reused,
-                std::cout);
+                std::cout, use_rms);
   };
 
   // `fold` is what --rotate does to this linear (RotationSource::In / Out); the default, kNone, is
@@ -1219,8 +1283,16 @@ int RunConvert(const AppArgs& args) {
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
     const bool use_ldlq = ldlq_matched && HasQuantizedLayout(ls);
+    // A rotated in-projection rounds against the weightless rms Hessian when hessian.json has one
+    // for it ("rms_keys"): its folded input is exactly rms(x) Q, so H' = Q^T H_rms Q needs no
+    // division by (1 + w). Without one it falls back to dividing the post-norm H, which the plan job
+    // below checks is possible. Never for an unrotated linear (fold.kind is kNone without --rotate),
+    // so an unrotated container reads exactly the Hessians it did before rms_keys existed.
+    const bool rotated_in = fold.kind == LinearFold::kIn;
+    const bool use_rms = use_ldlq && rotated_in && ldlq.HasRms(container_base);
     plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, hf_names,
-                          container_base, ls, requested, kept, ldlq_matched, use_ldlq, fold]() {
+                          container_base, ls, requested, kept, ldlq_matched, use_ldlq, rotated_in,
+                          use_rms, fold]() {
       int64_t N = 0, K = 0;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
@@ -1234,15 +1306,20 @@ int RunConvert(const AppArgs& args) {
       }
       // The manifest + file check lives HERE, in planning, so a missing key / wrong K / missing or
       // truncated .hess / group not dividing the LDLQ block aborts before
-      // FinalizeHeader and before the first shard is read.
+      // FinalizeHeader and before the first weight is read. (A rotated in-projection without an rms
+      // Hessian also has its [hidden] norm vector read here, to refuse a (1 + w) it cannot divide.)
       w4a16_groups.Plan(container_base, N, K, ls);
-      if (use_ldlq) ldlq.Plan(container_base, K, ls);
-      else if (ldlq_matched) ldlq.NoteSkipped();
+      if (use_ldlq) {
+        ldlq.Plan(container_base, K, ls, use_rms);
+        if (rotated_in && !use_rms) rot.CheckNormDivisible(fold, container_base, model);
+      } else if (ldlq_matched) {
+        ldlq.NoteSkipped();
+      }
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
     });
-    emit_jobs.push_back([&model, &emit_linear, &rot, hf_names, container_base, ls, use_ldlq, fold,
-                         threads]() {
+    emit_jobs.push_back([&model, &emit_linear, &rot, hf_names, container_base, ls, use_ldlq,
+                         use_rms, fold, threads]() {
       std::vector<float> w;
       int64_t K = 0;
       for (auto& n : hf_names) {
@@ -1257,7 +1334,7 @@ int RunConvert(const AppArgs& args) {
       // --keep-bf16's bf16-only one included, is then produced from the folded fp32.
       const std::vector<float> norm = rot.ReadNorm(fold, model);
       rot.Fold(fold, norm, w, N, K, threads);
-      emit_linear(container_base, w, N, K, ls, use_ldlq, fold, norm);
+      emit_linear(container_base, w, N, K, ls, use_ldlq, use_rms, fold, norm);
     });
   };
 
@@ -1464,7 +1541,7 @@ int RunConvert(const AppArgs& args) {
         // for its Hessian under --ldlq, see above.)
         // Never folded by --rotate: it reads the MTP head's own (un-rotated) hidden.
         emit_linear("mtp.draft_head.lm_head", sliced, static_cast<int64_t>(draft_ids.size()),
-                    hidden_k, draft_head_layouts, draft_head_ldlq, LinearFold{},
+                    hidden_k, draft_head_layouts, draft_head_ldlq, /*use_rms=*/false, LinearFold{},
                     std::vector<float>{});
         writer.WriteTensor("mtp.draft_head.vocab_ids", ids32.data(), ids32.size() * 4);
       });
@@ -1561,6 +1638,11 @@ int RunConvert(const AppArgs& args) {
     // vector cannot give, but the diagonal model carried into the new basis.
     if (!args.imatrix.empty())
       metadata["r4dx_convert_run"]["imatrix_rotated"] = "diagonal model: (M o M)^T v";
+    // Which LDLQ'd in-projections were rounded against the weightless rms Hessian (hessian.json
+    // "rms_keys": H' = Q^T H_rms Q). Every other LDLQ'd in-projection of a rotated container divided
+    // the norm out of its post-norm Hessian (Q^T D^-1 H D^-1 Q). Rotated containers only: an
+    // unrotated one never reads an rms Hessian, and its header keeps exactly its old keys.
+    metadata["r4dx_convert_run"]["ldlq_rms_linears"] = ldlq.RmsLinears();
   }
   // --w4a16-group-rule: only when given, so a container converted without it keeps its header byte
   // for byte. The rules as typed (order matters: first match wins), the resolved map (the same one

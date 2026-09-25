@@ -1217,7 +1217,78 @@ only; lm_head/MTP then see layer N-1's output, so their files are written but gi
 `--keys REGEX`
 (write only taps serving a matching key -- `re.search`, like `--keep-bf16` -- e.g. `'mlp\.'` for the
 G3 pilot, which also matches `mtp.mlp.*` exactly as the converter's `--ldlq "mlp\."` will),
-`--hidden-device auto|cuda|cpu`, `--dry-run`, `--write-fixture DIR`.
+`--hidden-device auto|cuda|cpu`, `--dry-run`, `--write-fixture DIR`, `--regate`, `--rms-taps`,
+`--rms-only`, `--code-rev COMMIT` (below).
+
+### Weightless rms taps (`--rms-taps`, `--rms-only`)
+
+```powershell
+# no GPU: plan + corpus check against the existing set
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+    --rms-only --dry-run --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
+
+$env:HIP_VISIBLE_DEVICES = '1'
+C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+    --rms-only --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
+```
+
+A rotated container (`r4dx-convert --rotate q2a/q2ab`) runs each text layer's zero-centred norm
+without its weight and folds `(1 + w)` into the next in-projections. Their input is then
+`rms(x) Q`, so LDLQ needs `H_rms = E[rms(x)^T rms(x)]` (docs/quant2.md 3.2). The post-norm taps give
+that only by dividing by `(1 + w)`, which is impossible at a dead channel (layer 7
+`post_attention_layernorm[3994]`).
+
+The rms taps hook the norm module's INPUT (a forward_pre_hook on each layer's `input_layernorm` and
+`post_attention_layernorm`, which receives the bf16 residual). They accumulate
+`rms_weightless(x) = x.float() * rsqrt(mean(x.float()^2) + norm.eps)`, which is exactly
+`Qwen3_5RMSNorm._norm(x.float())`: no `(1 + w)` multiply and no bf16 cast. The files are
+`L{i:02d}.in.rms.hess` and `L{i:02d}.mlp_in.rms.hess`, the post-norm tap's name with `.rms` before
+`.hess`. `hessian.json` `rms_keys` maps `gdn.in_proj_qkv/z` and `attn.qg/k/v` to the first, and
+`mlp.gate_up` to the second.
+
+- `--rms-taps` adds them to a full capture.
+- `--rms-only` captures only them. It is still a full layer-major forward, with nothing else hooked
+  and no shared-input gate. It then merges them into the validated `hessian.json` already in
+  `--out-dir`: the files, `rms_keys` and an `rms_capture` block (provenance and gates) are added,
+  and every other byte is kept. The manifest is rewritten once, through the temp + rename writer,
+  with LF endings.
+
+**Before any GPU work** (under `--dry-run` too), `--rms-only` refuses unless:
+
+- `hessian.json` exists;
+- the checkpoint's `config.json` sha256 is the set's;
+- this run's corpus matches the recorded one field by field (every source's sha256, token counts,
+  windows and file list; only `file_list_method` is ignored);
+- without `--force`, the manifest has no `rms_keys` yet. With `--force`, the old rms entries are
+  removed from it before the capture starts.
+
+The rms taps must see the same activations as the post-norm taps they pair with. The repo-source
+windows come from the working tree, which changes with every commit, so `--code-rev COMMIT` reads
+them from that commit's tree (`git ls-tree` + `git cat-file --batch`). `hessian-v1` was captured at
+`34d381a`; its code `sha256_of_concatenation` `d525c7df...` reproduces there, and on this branch's
+working tree it does not.
+
+**Gates** (`evaluate_rms_gates`, under `rms_capture.gates`; the diagonals are read back from disk):
+
+- finite;
+- min diag > 0 with **no** dead-channel exemption;
+- rows >= 4 x K, and equal to the paired post-norm file's rows;
+- consistency: on every channel with `(1 + w_i) != 0`, `diag(H_post)_i` must be within 2% of
+  `(1 + w_i)^2 diag(H_rms)_i`, with the worst channel reported. `diag(H_post)_i` must be exactly 0
+  where `(1 + w_i) == 0`. `(1 + w)` is taken from the materialized norm module. Only the post-norm
+  input's bf16 rounding separates the two, which is <= ~0.4% on a mean square. A different corpus,
+  layer, norm or checkpoint moves channels by far more.
+
+`--rms-only` also refuses to merge if `hessian.json` changed during the capture. If anything fails,
+`hessian.json` stays byte-identical and the report goes to `hessian_rms.failed.json`. Under
+`--rms-taps`, a failing rms gate leaves the rms files out of the manifest the post-norm gates choose,
+writes the same report, and exits 1. `--regate` keeps `rms_keys`, and its diagonal re-gate gives the
+rms files no exemption, because only the post-norm taps are listed under `taps`. Cost: 128 files of
+50 MiB (6.25 GiB) and one forward over the corpus.
+
+CPU test: `tests/reference/test_hessian_rms.py` (ctest `reference_hessian_rms`, no checkpoint, no
+GPU). It runs a tiny random 2-layer Qwen3_5 stack with a dead channel through `run_capture`, the
+gates, `finish_rms_only` / `merge_rms_manifest` and `regate`.
 
 **Expected cost** (not yet measured -- a GPU run is handed to the user): the dominant work is the
 `mlp.down` GEMM, `17408^2 x 2048 x 2` FLOP per sequence and layer, ~7 PFLOP over the whole run;

@@ -42,7 +42,9 @@
 // same bytes as before the flag existed is a property of main.cpp's call sites (every new path is
 // gated on RotationSource::Enabled(), and no header key is added when it is off) -- checked by
 // converting the real checkpoint (--layers 4) with the pre-rotation binary and this one and
-// comparing the files byte for byte; see docs/container-format.md "Residual rotation".
+// comparing the files byte for byte; see docs/container-format.md "Residual rotation". The
+// weightless rms Hessian path for in-projections (TransformHessianRmsQ, hessian.json "rms_keys",
+// dead norm channels) and the exe end to end on a synthetic checkpoint are test_rms_hessian.cpp's.
 //
 // R4DX_CONVERT_FIXTURES_DIR is injected by tests/convert/CMakeLists.txt as an absolute path.
 #include <algorithm>

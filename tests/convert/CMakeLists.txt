@@ -53,6 +53,23 @@ target_compile_definitions(convert_rotation PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME convert_rotation COMMAND convert_rotation)
 
+# The weightless rms Hessian path for rotated in-projections (docs/quant2.md 3.2; rotation.hpp's
+# TransformHessianRmsQ, hessian.json "rms_keys"): Q^T H Q against the dense closed-form Q at the
+# miniature and production sizes, a dead norm channel ((1 + w) == 0: the division path refuses, the
+# rms path matches a direct capture on rms(x) Q), HessianStore's rms_keys parsing and refusals, and
+# -- when r4dx-convert is built -- the exe on a synthetic 2-layer checkpoint: unrotated output
+# byte-identical to the pre-rms build (pinned digest) whether or not rms_keys exist, q2ab refused
+# during planning without them, and with them the recorded ldlq_rms_linears and w4a16 bytes equal to
+# fold -> Q^T H_rms Q -> LDLQ. CPU-only; writes ~250 MB under %TEMP% and removes it.
+add_executable(convert_rms_hessian test_rms_hessian.cpp)
+target_link_libraries(convert_rms_hessian PRIVATE r4dx_convert)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_rms_hessian PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_rms_hessian r4dx-convert)
+endif()
+add_test(NAME convert_rms_hessian COMMAND convert_rms_hessian)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

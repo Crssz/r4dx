@@ -67,7 +67,10 @@ $tokens = 'tools\reference\kl_corpus\tokens.json'
 function Run([string]$name, [scriptblock]$cmd) {
   $log = Join-Path $OutDir "$name.log"
   Write-Host "[q3] $name -> $log"
-  & $cmd *> $log
+  # PS 5.1 makes native stderr lines error records; under 'Stop' the first one would abort the
+  # sweep. Success is judged by the exit code alone.
+  $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { & $cmd *> $log } finally { $ErrorActionPreference = $prev }
   if ($LASTEXITCODE -ne 0) { throw "[q3] $name failed (exit $LASTEXITCODE), see $log" }
 }
 

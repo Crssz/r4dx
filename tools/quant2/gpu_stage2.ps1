@@ -35,6 +35,7 @@ Step 'ctest_skipped' {
 }
 
 foreach ($r in 'none', 'q2a', 'q2ab') {
+  New-Item -ItemType Directory -Force (Join-Path $OutDir "g5_$r") | Out-Null  # the tool does not create --out-dir
   Step "g5_tf_$r" {
     & $tool --model (Join-Path $L4Dir "l4-$r.r4dx") --layout bf16 --layers 4 --tokens $tokens `
       --out-dir (Join-Path $OutDir "g5_$r") --max-ctx 4096 --vision off

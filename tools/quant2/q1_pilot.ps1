@@ -26,7 +26,11 @@ $tokens = 'tools\reference\kl_corpus\tokens.json'
 function Run([string]$name, [scriptblock]$cmd) {
   $log = Join-Path $OutDir "$name.log"
   Write-Host "[q1] $name -> $log"
-  & $cmd *> $log
+  # Windows PowerShell 5.1 turns every stderr line of a native program into an error record, and
+  # under 'Stop' the first one (a transformers fallback warning, the engine's VRAM line) would abort
+  # the script. Success is judged by the exit code alone.
+  $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { & $cmd *> $log } finally { $ErrorActionPreference = $prev }
   if ($LASTEXITCODE -ne 0) { throw "[q1] $name failed (exit $LASTEXITCODE), see $log" }
 }
 
@@ -56,6 +60,7 @@ if ($Kl) {
   }
   foreach ($c in @(@{n = 'v6'; m = $V6 }, @{n = 'q1pilot'; m = $Pilot })) {
     $dir = Join-Path $OutDir $c.n
+    New-Item -ItemType Directory -Force $dir | Out-Null  # the tool does not create --out-dir
     Run "tf_$($c.n)" { & $Tool --model $c.m --layout w4a16 --tokens $tokens --out-dir $dir --max-ctx 4096 --vision off }
     Run "kl_$($c.n)" { & $Python tools\reference\kl_report.py --ref-dir $ref --test-dir $dir --tokens $tokens --out (Join-Path $OutDir "kl_$($c.n).json") }
   }

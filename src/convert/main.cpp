@@ -13,6 +13,29 @@
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
 //                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64|128>"]...
+//                [--record-reuse-guard] [--reuse-tensors-from <baseline container>]
+//
+// --reuse-tensors-from <baseline> (docs/quant2.md 5.2, reuse_guard.hpp) writes exactly the container
+// a full run with the same flags would write, but copies every tensor whose bytes cannot depend on
+// the difference between this run and the baseline's verbatim from the baseline instead of computing
+// it. The ONLY difference it allows is --w4a16-group-rule (plus --output, --threads and this flag):
+// the linears whose w4a16 group differs between the two runs -- including a linear a BASELINE rule
+// moved that this run leaves at the default -- are recomputed, every layout of them, and everything
+// else is copied (each linear is quantized on its own, so nothing else can depend on another linear's
+// group). The baseline must carry __metadata__.r4dx_convert_run.reuse_guard, which a run given
+// --record-reuse-guard (or --reuse-tensors-from, which implies it) writes: the sha256 of this
+// converter's own executable and runtime DLLs, the CPU's identity, the sha256 of config.json,
+// model.safetensors.index.json and every shard, of the --imatrix / --kv-calib / --draft-vocab-ids
+// files, of hessian.json and of every .hess file the --ldlq regex can read, and every other flag,
+// resolved. Any difference -- a rebuilt binary included; there is deliberately no override --
+// refuses the reuse before the first shard is read, naming each field. So does a baseline whose
+// emit pass never finished (the guard's emit_complete marker, patched from 0 to 1 only after every
+// tensor is durably on disk), one whose tensor data no longer hashes to the guard's data_sha256
+// (patched in with the marker, from every tensor read back from the file), and a baseline whose
+// tensor directory does not match what this run writes. The output records reused_from (the
+// baseline's path, header sha256 and data_sha256, the copied / recomputed counts and the recomputed
+// linears) next to its own reuse_guard; apart from reused_from (and `threads`, when it differs) its
+// header and data are byte-identical to a full run's with --record-reuse-guard.
 //
 // --w4a16-group-rule (docs/quant2.md section 5, w4a16_groups.hpp; repeatable, first matching rule
 // wins, unmatched linears keep the build default R4DX_W4A16_GROUP) packs the w4a16 layout of every
@@ -133,12 +156,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -158,6 +184,7 @@
 #include "r4dx_convert/linear_layouts.hpp"
 #include "r4dx_convert/npz_reader.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
+#include "r4dx_convert/reuse_guard.hpp"
 #include "r4dx_convert/rotation.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
@@ -172,6 +199,12 @@ using r4dx_convert::ShardedModel;
 
 bool StartsWith(const std::string& s, const std::string& prefix) {
   return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+size_t Count(const std::string& hay, const std::string& needle) {
+  size_t n = 0;
+  for (size_t p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1)) ++n;
+  return n;
 }
 
 // Review finding (major, quant_int4.hpp): the group sizes this converter packs with
@@ -342,6 +375,13 @@ struct AppArgs {
   // --w4a16-group-rule "<regex>=<g>" in command-line order, first match wins. Empty (default) =
   // every w4a16 linear at the build default and a byte-identical container.
   std::vector<std::string> w4a16_group_rules;
+
+  // docs/quant2.md 5.2 (this file's header comment, reuse_guard.hpp). `reuse_from`: a baseline
+  // container whose unaffected tensors are copied instead of recomputed; implies
+  // `record_reuse_guard`, which writes r4dx_convert_run.reuse_guard. Both off (default) = no hashing
+  // and a header byte-identical to one written before these flags existed.
+  std::string reuse_from;
+  bool record_reuse_guard = false;
 };
 
 // --rotation-seed: a full u64, decimal or 0x-prefixed hex. std::stoull alone would accept "-1"
@@ -426,8 +466,16 @@ AppArgs ParseArgs(int argc, char** argv) {
       a.rotation_seed_explicit = true;
     }
     else if (arg == "--w4a16-group-rule") a.w4a16_group_rules.push_back(next(i));
+    else if (arg == "--reuse-tensors-from") a.reuse_from = next(i);
+    else if (arg == "--record-reuse-guard") a.record_reuse_guard = true;
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  // The guard describes an HF-checkpoint conversion (checkpoint files, its flags); the selftest and
+  // the drafter have neither a sweep to share a baseline across nor a guard to check one against.
+  if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || !a.dflash_gguf.empty()))
+    throw std::runtime_error("--reuse-tensors-from / --record-reuse-guard apply only to the "
+                             "HF-checkpoint conversion (--input/--output), not to --selftest or "
+                             "--dflash-gguf");
   // Parsed here (syntax, group, regex) so a typo is an argument error, not a mid-plan one; the
   // selector itself is rebuilt by the run that uses it.
   if (!a.w4a16_group_rules.empty()) (void)r4dx_convert::W4a16GroupRules(a.w4a16_group_rules);
@@ -596,6 +644,15 @@ class LdlqSource {
   const std::string& Dir() const { return dir_; }
   float Damp() const { return damp_; }
   std::string ManifestSha256() const { return store_ ? store_->ManifestSha256() : std::string(); }
+  // Every .hess file this run could read (HessianStore::FilesFor over the bases the regex selects),
+  // as (name in hessian.json, path). Empty when --ldlq is off. The reuse guard hashes them.
+  std::vector<std::pair<std::string, std::string>> HessianFiles() const {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (!enabled_) return out;
+    for (const auto& f : store_->FilesFor([this](const std::string& b) { return Matches(b); }))
+      out.push_back({f, r4dx_convert::hessian_detail::JoinPath(dir_, f)});  // the path Factor opens
+    return out;
+  }
   // The LDLQ'd bases, in container (= planning) order. Filled by Plan(); complete once the planning
   // pass is over, which is before the metadata that records it is built.
   const std::vector<std::string>& Linears() const { return planned_; }
@@ -1018,6 +1075,277 @@ std::string ReadFile(const std::string& path) {
   return ss.str();
 }
 
+// ---- --record-reuse-guard / --reuse-tensors-from (docs/quant2.md 5.2, reuse_guard.hpp) ------------
+
+nlohmann::json LayoutSetJson(const LayoutSet& ls) {
+  // Without w4a16_group: the group is the one thing a reuse may change, and it is resolved per
+  // linear (the per-tensor decision in RunConvert), never at the LayoutSet the flags give.
+  return {{"bf16", ls.bf16}, {"mxfp4", ls.mxfp4}, {"w4a16", ls.w4a16}, {"w4a8", ls.w4a8}};
+}
+
+// __metadata__.r4dx_convert_run.reuse_guard: everything this run's bytes can depend on EXCEPT the
+// --w4a16-group-rule list (and --output, --threads, the reuse flags), in resolved form -- so two
+// spellings of one setting (--layers 99 on a 64-layer checkpoint, --vision's auto default) compare
+// equal while any real difference does not. Files are identified by content; a flag whose file the
+// run never reads is recorded as unused rather than hashed. Every field is compared, whole: a new
+// input the converter learns to read must be added here (and kReuseGuardVersion bumped). The two
+// completion fields (emit_complete, data_sha256) are written as placeholders and patched once the
+// data is on disk (RunConvert's end; reuse_guard.hpp).
+nlohmann::json BuildReuseGuard(const AppArgs& args, const std::string& config_text, int layers,
+                               bool do_vision, bool do_mtp, const LayoutSet& layouts,
+                               const LayoutSet& lm_head_layouts, const LdlqSource& ldlq,
+                               const RotationSource& rot, int threads) {
+  using namespace r4dx_convert;
+  auto file_id = [](const std::string& path, bool used) {
+    if (path.empty()) return std::string("none");
+    if (!used) return std::string("unused");
+    return Sha256File(path);
+  };
+  nlohmann::json g = nlohmann::json::object();
+  g["version"] = kReuseGuardVersion;
+  g[kReuseCompleteKey] = 0;
+  g[kReuseDataKey] = ReuseDataPlaceholder();
+  // The binary itself, not a version string: a rebuild from any other source, with other build
+  // options (R4DX_W4A16_GROUP, the vendored r4d_core it links statically) or none at all hashes
+  // differently, and is refused. Deliberately no override: a baseline costs one conversion, while a
+  // container mixing two converters' tensors would measure as a group-rule effect.
+  g["converter"] = {{"exe_sha256", Sha256File(ExecutablePath())},
+                    // the CRT DLLs the exe hash does not cover (rotation.mix5 goes through ucrt's
+                    // log/cos/sin)
+                    {"runtime_dlls", RuntimeModulesIdentity()},
+                    // ... and the CPU, which picks ucrt's FMA3 or SSE2 transcendentals (and
+                    // dense_linalg's path) at run time
+                    {"cpu", CpuIdentity()},
+                    {"w4a16_group", kW4A16Group},
+                    {"w4a8_group", kW4A8Group},
+                    {"mxfp4_group", kMxfp4Group},
+                    // bit-identical by construction and gated (dense_linalg.hpp), recorded anyway
+                    {"avx512", linalg::UseAvx512()}};
+  // The two large file sets -- the checkpoint's shards and the .hess files LDLQ can read, often on
+  // different drives -- in one parallel pass, so neither waits for the other.
+  const CheckpointFiles cf = ReadCheckpointIndex(args.input);
+  const std::vector<std::pair<std::string, std::string>> hess = ldlq.HessianFiles();
+  std::vector<std::string> paths;
+  for (const auto& s : cf.shards) paths.push_back(args.input + "\\" + s);
+  for (const auto& h : hess) paths.push_back(h.second);
+  const std::vector<FileDigest> dig = Sha256Files(paths, threads);
+  g["checkpoint"] = CheckpointIdentity(
+      config_text, cf,
+      std::vector<FileDigest>(dig.begin(), dig.begin() + static_cast<std::ptrdiff_t>(cf.shards.size())));
+  nlohmann::json hess_files = ldlq.Enabled() ? nlohmann::json::object() : nlohmann::json("none");
+  for (size_t i = 0; i < hess.size(); ++i) {
+    const FileDigest& d = dig[cf.shards.size() + i];
+    hess_files[hess[i].first] = {{"bytes", d.bytes}, {"sha256", d.sha256}};
+  }
+  g["args"] = {
+      {"layers", layers},
+      {"vision", do_vision},
+      {"mtp", do_mtp},
+      {"layouts", LayoutSetJson(layouts)},
+      {"lm_head", LayoutSetJson(lm_head_layouts)},
+      {"quant", args.quant},
+      {"keep_bf16", args.keep_bf16},
+      {"ldlq", ldlq.Enabled() ? args.ldlq : std::string()},
+      {"ldlq_damp", ldlq.Enabled() ? nlohmann::json(ldlq.Damp()) : nlohmann::json(nullptr)},
+      {"rotate", rot.KindName()},
+      {"rotation_seed", rot.Enabled() ? nlohmann::json(rot.Seed()) : nlohmann::json(nullptr)},
+  };
+  g["inputs"] = {
+      {"imatrix_sha256", file_id(args.imatrix, true)},
+      {"kv_calib_sha256", file_id(args.kv_calib, true)},
+      {"draft_vocab_ids_sha256", file_id(args.draft_vocab_ids, do_mtp)},
+      // hessian.json by content, AND every .hess file the --ldlq regex can make this run read
+      // (HessianStore::FilesFor: the selected bases' keys and rms_keys files), each by length +
+      // sha256: the manifest pins each file's K, rows and header trace (CheckFile), but nothing
+      // ties a payload to it -- an in-place edit that keeps the diagonal passes every check. A
+      // reuse run never reads the files of the linears it copies, so only their hashes can say the
+      // baseline rounded against the same Hessians. The directory's path is not part of it.
+      {"hessian_manifest_sha256", ldlq.Enabled() ? ldlq.ManifestSha256() : std::string("none")},
+      {"hessian_files", hess_files},
+  };
+  return g;
+}
+
+// --reuse-tensors-from, first half, before this run's guard is hashed (so a baseline that could never
+// be used -- an older converter's, without a guard -- is refused at once, not after the checkpoint
+// and the Hessians are read): opens the baseline (its header only) and refuses it unless it is a
+// completed conversion that recorded a guard and a data digest. CheckReuseBaseline does the rest.
+std::unique_ptr<r4dx_convert::BaselineContainer> OpenReuseBaseline(const AppArgs& args) {
+  namespace fs = std::filesystem;
+  const std::string who = "--reuse-tensors-from " + args.reuse_from;
+  std::error_code ec;
+  const fs::path base_path = fs::u8path(args.reuse_from), out_path = fs::u8path(args.output);
+  if (!fs::is_regular_file(base_path, ec))
+    throw std::runtime_error(who + ": no such file");
+  // FinalizeHeader truncates --output: never let it be the file this run copies from.
+  if (fs::exists(out_path, ec) && fs::equivalent(out_path, base_path, ec))
+    throw std::runtime_error(who + ": --output is the baseline itself");
+  auto b = r4dx_convert::BaselineContainer::Open(args.reuse_from);
+  const nlohmann::json& md = b->metadata;
+  if (!md.contains("r4dx_convert_run") || !md["r4dx_convert_run"].is_object() ||
+      !md["r4dx_convert_run"].contains("reuse_guard")) {
+    throw std::runtime_error(who + ": the baseline has no __metadata__.r4dx_convert_run.reuse_guard "
+                             "-- convert it with --record-reuse-guard (the guard records what the "
+                             "baseline was made from; without it nothing can be checked)");
+  }
+  const nlohmann::json& bg = md["r4dx_convert_run"]["reuse_guard"];
+  const auto done = bg.is_object() ? bg.find(r4dx_convert::kReuseCompleteKey) : bg.end();
+  if (!bg.is_object() || done == bg.end() || !done->is_number_integer() || done->get<int64_t>() != 1) {
+    throw std::runtime_error(who + ": the baseline's emit pass never completed (reuse_guard." +
+                             std::string(r4dx_convert::kReuseCompleteKey) + " is not 1) -- it is "
+                             "an interrupted or failed conversion; convert it again");
+  }
+  const auto data = bg.find(r4dx_convert::kReuseDataKey);
+  const std::string recorded = data != bg.end() && data->is_string() ? data->get<std::string>() : "";
+  if (!r4dx_convert::IsSha256Hex(recorded) || recorded == r4dx_convert::ReuseDataPlaceholder())
+    throw std::runtime_error(who + ": the baseline's reuse_guard." + r4dx_convert::kReuseDataKey +
+                             " is not a recorded digest -- an interrupted or failed conversion; "
+                             "convert it again");
+  return b;
+}
+
+// --reuse-tensors-from, second half, once this run's guard is built: refuses the baseline unless its
+// guard equals `guard` field for field, its quant block is this build's, and its tensor data still
+// hashes to the digest it recorded (read in full, `threads` tensors at a time -- last, being the
+// expensive part). Still before the first shard is opened.
+void CheckReuseBaseline(r4dx_convert::BaselineContainer& b, const nlohmann::json& guard, int threads) {
+  const std::string who = "--reuse-tensors-from " + b.path;
+  const nlohmann::json& md = b.metadata;
+  const nlohmann::json& bg = md.at("r4dx_convert_run").at("reuse_guard");
+  const std::vector<std::string> diff = r4dx_convert::ReuseGuardMismatches(bg, guard);
+  if (!diff.empty()) {
+    std::string msg = who + ": refused -- the baseline was not converted from the same inputs with "
+                            "the same flags by this binary (only --w4a16-group-rule, --output and "
+                            "--threads may differ); " + std::to_string(diff.size()) +
+                      " guard field(s) differ:";
+    for (const auto& d : diff) msg += "\n  " + d;
+    throw std::runtime_error(msg);
+  }
+  // The format block, apart from the per-tensor map a reuse may change (the guard's binary hash
+  // already implies it; checked explicitly because the copy trusts it).
+  nlohmann::json q = md.contains("quant") ? md["quant"] : nlohmann::json();
+  if (q.is_object() && q.contains("w4a16") && q["w4a16"].is_object()) q["w4a16"].erase("groups");
+  if (q != BuildQuantMetadata())
+    throw std::runtime_error(who + ": the baseline's __metadata__.quant " + q.dump() +
+                             " differs from this build's " + BuildQuantMetadata().dump());
+  // Last (it reads the whole file): the bytes are still the ones its conversion wrote and digested.
+  b.VerifyData(bg.at(r4dx_convert::kReuseDataKey).get<std::string>(), threads);
+}
+
+// The per-job decision: which emit jobs this run copies from the baseline and which it runs.
+struct ReusePlan {
+  std::vector<bool> copy;                       // per plan/emit job
+  std::vector<std::string> recomputed_linears;  // container order
+  int64_t tensors_copied = 0, tensors_recomputed = 0;
+  uint64_t bytes_copied = 0, bytes_recomputed = 0;
+};
+
+// `job_tensors[j]` = the writer's plan indices job j planned; `linear_jobs` = job -> container base,
+// for every add_linear (and the MTP draft head) job; `groups_now` = this run's
+// W4a16GroupRules::Groups(). A linear is AFFECTED when its w4a16 group here differs from the
+// baseline's (__metadata__.quant.w4a16.groups, default = the build's group): a rule in either run
+// that the other lacks, or two different groups. An affected job runs as usual -- all its layouts,
+// not just w4a16 -- and every other job is copied, after its every tensor was checked to exist in the
+// baseline under the same name with dtype U8, the same shape and the same size. The baseline must not
+// hold anything else except an affected linear's own layout tensors; any inconsistency refuses the
+// reuse (the guard matched, so it means the guard missed something -- nothing is trusted then).
+ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWriter& writer,
+                    const std::vector<std::pair<size_t, size_t>>& job_tensors,
+                    const std::map<size_t, std::string>& linear_jobs,
+                    const std::map<std::string, int>& groups_now) {
+  const std::string who = "--reuse-tensors-from " + b.path;
+  const r4dx_convert::SafetensorsReader& r = *b.reader;
+  std::map<std::string, int> groups_then;
+  const nlohmann::json& w16 = b.metadata.at("quant").at("w4a16");
+  if (w16.contains("groups")) {
+    if (!w16["groups"].is_object())
+      throw std::runtime_error(who + ": the baseline's quant.w4a16.groups is not an object");
+    for (auto it = w16["groups"].begin(); it != w16["groups"].end(); ++it) {
+      if (!it.value().is_number_integer())
+        throw std::runtime_error(who + ": the baseline's quant.w4a16.groups[\"" + it.key() +
+                                 "\"] is not an integer");
+      groups_then[it.key()] = it.value().get<int>();
+    }
+  }
+  std::set<std::string> linear_bases;
+  for (const auto& kv : linear_jobs) linear_bases.insert(kv.second);
+  for (const auto& kv : groups_then) {
+    if (!linear_bases.count(kv.first))
+      throw std::runtime_error(who + ": the baseline's quant.w4a16.groups lists '" + kv.first +
+                               "', which this run does not write as a linear");
+  }
+  auto group_of = [](const std::map<std::string, int>& m, const std::string& base) {
+    const auto it = m.find(base);
+    return it == m.end() ? r4dx_convert::kW4A16Group : it->second;
+  };
+  auto shape_str = [](const std::vector<int64_t>& s) {
+    std::string o = "[";
+    for (size_t i = 0; i < s.size(); ++i) o += (i ? "," : "") + std::to_string(s[i]);
+    return o + "]";
+  };
+
+  ReusePlan p;
+  p.copy.assign(job_tensors.size(), false);
+  std::set<std::string> accounted, affected;
+  for (size_t j = 0; j < job_tensors.size(); ++j) {
+    const auto lj = linear_jobs.find(j);
+    if (lj != linear_jobs.end()) {
+      const std::string& base = lj->second;
+      const int g_now = group_of(groups_now, base), g_then = group_of(groups_then, base);
+      if (g_now != g_then) {
+        affected.insert(base);
+        p.recomputed_linears.push_back(base);
+        for (size_t t = job_tensors[j].first; t < job_tensors[j].second; ++t) {
+          const std::string& name = writer.PlannedName(t);
+          if (r.Has(name)) accounted.insert(name);
+          ++p.tensors_recomputed;
+          p.bytes_recomputed += writer.PlannedBytes(t);
+          // The baseline must really hold this linear at the group its map says.
+          if (name == base + ".w4a16.wq" && !r.Has(r4dx_convert::W4a16WszName(base, g_then)))
+            throw std::runtime_error(who + ": the baseline maps '" + base + "' to w4a16 group " +
+                                     std::to_string(g_then) + " but has no " +
+                                     r4dx_convert::W4a16WszName(base, g_then));
+        }
+        continue;
+      }
+    }
+    for (size_t t = job_tensors[j].first; t < job_tensors[j].second; ++t) {
+      const std::string& name = writer.PlannedName(t);
+      if (!r.Has(name))
+        throw std::runtime_error(who + ": this run writes '" + name + "' but the baseline has no "
+                                 "such tensor -- refusing an inconsistent baseline");
+      const auto& m = r.Meta(name);
+      const uint64_t bytes = m.end - m.begin;
+      if (m.dtype != "U8" || m.shape != writer.PlannedShape(t) || bytes != writer.PlannedBytes(t)) {
+        throw std::runtime_error(
+            who + ": tensor '" + name + "' is " + m.dtype + " " + shape_str(m.shape) + " " +
+            std::to_string(bytes) + " B in the baseline but U8 " + shape_str(writer.PlannedShape(t)) +
+            " " + std::to_string(writer.PlannedBytes(t)) + " B in this run -- refusing an "
+            "inconsistent baseline");
+      }
+      accounted.insert(name);
+      ++p.tensors_copied;
+      p.bytes_copied += bytes;
+    }
+    p.copy[j] = true;
+  }
+  for (const auto& name : r.Names()) {
+    if (accounted.count(name)) continue;
+    bool own_layout = false;
+    for (const auto& base : affected) {
+      if (StartsWith(name, base + ".") &&
+          r4dx_convert::IsLinearLayoutSuffix(name.substr(base.size() + 1))) {
+        own_layout = true;
+        break;
+      }
+    }
+    if (!own_layout)
+      throw std::runtime_error(who + ": the baseline has tensor '" + name + "', which this run "
+                               "does not write -- refusing an inconsistent baseline");
+  }
+  return p;
+}
+
 // ---- normal mode --------------------------------------------------------------------------
 
 int RunConvert(const AppArgs& args) {
@@ -1110,10 +1438,41 @@ int RunConvert(const AppArgs& args) {
               << " layer(s) in file)\n";
   }
 
+  // --record-reuse-guard / --reuse-tensors-from (docs/quant2.md 5.2): the guard is computed -- and a
+  // baseline checked against it -- before the first shard is opened, so a refused baseline costs the
+  // hashing (disk-bound: the whole checkpoint is read once), not a conversion.
+  const bool want_guard = args.record_reuse_guard || !args.reuse_from.empty();
+  nlohmann::json reuse_guard;
+  std::unique_ptr<r4dx_convert::BaselineContainer> baseline;
+  if (want_guard) {
+    if (!args.reuse_from.empty()) baseline = OpenReuseBaseline(args);  // header checks only
+    const auto tg = std::chrono::steady_clock::now();
+    reuse_guard = BuildReuseGuard(args, config_text, layers, do_vision, do_mtp, layouts,
+                                  lm_head_layouts, ldlq, rot, threads);
+    const nlohmann::json& hf = reuse_guard["inputs"]["hessian_files"];
+    std::cout << "[r4dx-convert] reuse guard: binary, checkpoint ("
+              << reuse_guard["checkpoint"]["shards"].size() << " shard(s)), "
+              << (hf.is_object() ? hf.size() : 0) << " Hessian file(s) and input files hashed in "
+              << SecondsBetween(tg, std::chrono::steady_clock::now()) << " s\n";
+    if (baseline) {
+      const auto tb = std::chrono::steady_clock::now();
+      CheckReuseBaseline(*baseline, reuse_guard, threads);
+      std::cout << "[r4dx-convert] reuse: baseline " << args.reuse_from
+                << " matches this run's guard (every field; the w4a16 group rules may differ), and "
+                   "its data matches its recorded data_sha256 (read in "
+                << SecondsBetween(tb, std::chrono::steady_clock::now()) << " s)\n";
+    }
+  }
+
   ShardedModel model(args.input);
   ContainerWriter writer;
 
+  // Every add_* below pushes exactly ONE plan job and ONE emit job, so job j's emit writes exactly the
+  // tensors job j's plan registered (checked when planning runs). `linear_jobs`: job index -> container
+  // base for the jobs that write a linear's layouts (add_linear, the MTP draft head) -- the only jobs
+  // a --w4a16-group-rule can change, so the only ones --reuse-tensors-from may have to recompute.
   std::vector<std::function<void()>> plan_jobs, emit_jobs;
+  std::map<size_t, std::string> linear_jobs;
 
   auto add_bf16 = [&](std::string hf_name, std::string container_name) {
     plan_jobs.push_back([&writer, &model, hf_name, container_name]() {
@@ -1290,6 +1649,7 @@ int RunConvert(const AppArgs& args) {
     // so an unrotated container reads exactly the Hessians it did before rms_keys existed.
     const bool rotated_in = fold.kind == LinearFold::kIn;
     const bool use_rms = use_ldlq && rotated_in && ldlq.HasRms(container_base);
+    linear_jobs[plan_jobs.size()] = container_base;
     plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, hf_names,
                           container_base, ls, requested, kept, ldlq_matched, use_ldlq, rotated_in,
                           use_rms, fold]() {
@@ -1499,6 +1859,7 @@ int RunConvert(const AppArgs& args) {
       const bool draft_head_ldlq_matched = ldlq.Matches("mtp.draft_head.lm_head");
       const bool draft_head_ldlq =
           draft_head_ldlq_matched && HasQuantizedLayout(draft_head_layouts);
+      linear_jobs[plan_jobs.size()] = "mtp.draft_head.lm_head";
       plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &w4a16_groups, draft_vocab_size,
                             draft_head_layouts, draft_head_requested, draft_head_kept,
                             draft_head_ldlq_matched, draft_head_ldlq]() {
@@ -1550,12 +1911,33 @@ int RunConvert(const AppArgs& args) {
 
   const auto t0 = std::chrono::steady_clock::now();
 
-  for (auto& j : plan_jobs) j();
+  if (plan_jobs.size() != emit_jobs.size())
+    throw std::logic_error("RunConvert: " + std::to_string(plan_jobs.size()) + " plan jobs but " +
+                           std::to_string(emit_jobs.size()) + " emit jobs");
+  // job j planned the writer's tensors [first, second) -- exactly what emit job j writes.
+  std::vector<std::pair<size_t, size_t>> job_tensors(plan_jobs.size());
+  for (size_t j = 0; j < plan_jobs.size(); ++j) {
+    const size_t first = writer.PlannedTensorCount();
+    plan_jobs[j]();
+    job_tensors[j] = {first, writer.PlannedTensorCount()};
+  }
   // After planning (every add_linear's shapes are known by now), before the header is written --
   // so the summary/"matched nothing" warning lands ahead of the long emit pass rather than after it.
   keep_bf16.Report(std::cout, std::cerr);
   ldlq.ReportPlan(std::cout, std::cerr);
   w4a16_groups.Report(std::cout, std::cerr);
+
+  // --reuse-tensors-from: which jobs are copied (PlanReuse), decided before the header is written so
+  // the header can record it and an inconsistent baseline dies before any output exists.
+  ReusePlan reuse_plan;
+  if (baseline) {
+    reuse_plan = PlanReuse(*baseline, writer, job_tensors, linear_jobs, w4a16_groups.Groups());
+    std::cout << "[r4dx-convert] reuse: " << reuse_plan.tensors_copied << " tensor(s) ("
+              << reuse_plan.bytes_copied << " B) copied from the baseline, "
+              << reuse_plan.tensors_recomputed << " tensor(s) (" << reuse_plan.bytes_recomputed
+              << " B) of " << reuse_plan.recomputed_linears.size()
+              << " linear(s) whose w4a16 group differs recomputed\n";
+  }
 
   nlohmann::json metadata;
   metadata["r4dx_format_version"] = "1";
@@ -1653,12 +2035,85 @@ int RunConvert(const AppArgs& args) {
     metadata["r4dx_convert_run"]["w4a16_groups"] = w4a16_groups.GroupsJson();
     metadata["r4dx_convert_run"]["w4a16_group_extra_bytes"] = w4a16_groups.ExtraBytes();
   }
+  // --record-reuse-guard / --reuse-tensors-from: only then, so a container converted without them
+  // keeps its header byte for byte. `reuse_guard` is identical to a full run's with the same flags
+  // (it is written with emit_complete 0 and a zero data_sha256, both patched below once the data is
+  // on disk -- to the same values a full run patches in, the data being identical); `reused_from`
+  // exists only in a reuse run's output and is the one header difference against that full run
+  // (docs/quant2.md 5.2).
+  if (want_guard) {
+    metadata["r4dx_convert_run"]["reuse_guard"] = reuse_guard;
+    // The completion patches below rewrite these exact texts in place; they must be unambiguous.
+    for (const std::string& needle :
+         {r4dx_convert::ReuseCompleteNeedle(0),
+          r4dx_convert::ReuseDataNeedle(r4dx_convert::ReuseDataPlaceholder())}) {
+      if (Count(metadata.dump(), needle) != 1)
+        throw std::runtime_error("reuse guard: '" + needle + "' does not occur exactly once in __metadata__");
+    }
+  }
+  if (baseline) {
+    metadata["r4dx_convert_run"]["reused_from"] = {
+        {"path", args.reuse_from},
+        {"header_sha256", r4dx_convert::Sha256Hex(baseline->header_bytes)},
+        {"data_sha256", baseline->data_sha256},
+        {"tensors_copied", reuse_plan.tensors_copied},
+        {"bytes_copied", reuse_plan.bytes_copied},
+        {"tensors_recomputed", reuse_plan.tensors_recomputed},
+        {"bytes_recomputed", reuse_plan.bytes_recomputed},
+        {"linears_recomputed", reuse_plan.recomputed_linears},
+    };
+  }
   writer.FinalizeHeader(args.output, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
             << writer.PlannedDataBytes() << " data bytes\n";
 
-  for (auto& j : emit_jobs) j();
+  for (size_t j = 0; j < emit_jobs.size(); ++j) {
+    if (baseline && reuse_plan.copy[j]) {
+      // Verbatim, straight out of the baseline's mapping (PlanReuse checked name, dtype, shape and
+      // size); WriteTensorChunked streams it, so a multi-GB tensor is never held in memory twice.
+      for (size_t t = job_tensors[j].first; t < job_tensors[j].second; ++t) {
+        const std::string& name = writer.PlannedName(t);
+        writer.WriteTensorChunked(name, baseline->reader->Data(name), writer.PlannedBytes(t));
+      }
+    } else {
+      emit_jobs[j]();
+    }
+  }
   writer.Finish();
+  // Every planned tensor was written (Finish throws otherwise): only now can this container become a
+  // --reuse-tensors-from baseline. ReadBackDigests syncs the file to disk and hashes every tensor as
+  // it is there; a copied tensor must read back as exactly the baseline's verified bytes. Then the
+  // digest and the marker, each patched durably (after the data, before returning), in that order:
+  // a crash between them leaves emit_complete 0, which is refused.
+  if (want_guard) {
+    const auto td = std::chrono::steady_clock::now();
+    const std::vector<std::string> digests = writer.ReadBackDigests(threads);
+    std::vector<std::pair<std::string, std::string>> named(digests.size());
+    for (size_t t = 0; t < digests.size(); ++t) named[t] = {writer.PlannedName(t), digests[t]};
+    if (baseline) {
+      for (size_t j = 0; j < emit_jobs.size(); ++j) {
+        if (!reuse_plan.copy[j]) continue;
+        for (size_t t = job_tensors[j].first; t < job_tensors[j].second; ++t) {
+          if (digests[t] != baseline->tensor_sha256.at(writer.PlannedName(t)))
+            throw std::runtime_error("reuse: the copy of '" + writer.PlannedName(t) +
+                                     "' does not read back as the baseline's bytes -- the output is "
+                                     "left unfinished (emit_complete 0)");
+        }
+      }
+    }
+    const std::string data_sha256 = r4dx_convert::ContainerDataSha256(std::move(named));
+    writer.PatchHeader(r4dx_convert::ReuseDataNeedle(r4dx_convert::ReuseDataPlaceholder()),
+                       r4dx_convert::ReuseDataNeedle(data_sha256));
+    writer.PatchHeader(r4dx_convert::ReuseCompleteNeedle(0), r4dx_convert::ReuseCompleteNeedle(1));
+    std::cout << "[r4dx-convert] reuse guard: data_sha256 " << data_sha256 << " (every tensor read "
+              << "back in " << SecondsBetween(td, std::chrono::steady_clock::now())
+              << " s); emit_complete 1\n";
+  }
+  writer.Close();
+  if (baseline)
+    std::cout << "[r4dx-convert] reuse: copied " << reuse_plan.tensors_copied << " tensor(s) from "
+              << args.reuse_from << "; recomputed " << reuse_plan.recomputed_linears.size()
+              << " linear(s)\n";
   imatrix.ReportCoverage();
   ldlq.ReportRun(std::cout);
   rot.ReportRun(std::cout);

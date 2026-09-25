@@ -11,9 +11,15 @@
 // tensor's worth of packed bytes resident at a time -- never the whole model).
 #pragma once
 
+#include <io.h>     // _commit, _fileno (Sync)
+#include <share.h>  // _SH_DENYWR (FinalizeHeader)
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -21,6 +27,8 @@
 
 #include "nlohmann/json.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"  // Utf8ToWide -- see FinalizeHeader's _wfopen note
+#include "r4dx_convert/sha256.hpp"
+#include "r4dx_convert/threadpool.hpp"          // ParallelEach (ReadBackDigests)
 
 namespace r4dx_convert {
 
@@ -58,26 +66,32 @@ class ContainerWriter {
           {"data_offsets", {e.offset, e.offset + e.nbytes}},
       };
     }
-    const std::string header_str = header.dump();
+    header_str_ = header.dump();
+    const std::string& header_str = header_str_;
     const uint64_t header_len = header_str.size();
     data_start_ = 8 + header_len;
 
-    // _wfopen, not fopen: safetensors_reader.hpp deliberately opens shards via CreateFileW/
+    // _wfsopen, not fopen: safetensors_reader.hpp deliberately opens shards via CreateFileW/
     // Utf8ToWide because ANSI-codepage fopen() can silently resolve a non-ASCII path differently
     // (or fail); the writer previously used narrow fopen() here, an inconsistency flagged by
     // review (minor). --output is typically ASCII in practice, but this keeps every path-open in
-    // the component on the same UTF-8-safe code path.
-    if (_wfopen_s(&file_, Utf8ToWide(path).c_str(), L"wb") != 0 || !file_)
-      throw std::runtime_error("ContainerWriter: cannot create output file " + path);
-    std::fwrite(&header_len, 1, 8, file_);
-    std::fwrite(header_str.data(), 1, header_str.size(), file_);
+    // the component on the same UTF-8-safe code path. _SH_DENYWR (not _wfopen_s, whose files are
+    // not sharable at all): no other writer while this one holds the file, but ReadBackDigests'
+    // own read handles may open it.
+    file_ = _wfsopen(Utf8ToWide(path).c_str(), L"wb", _SH_DENYWR);
+    if (!file_) throw std::runtime_error("ContainerWriter: cannot create output file " + path);
+    path_ = path;
+    if (std::fwrite(&header_len, 1, 8, file_) != 8 ||
+        std::fwrite(header_str.data(), 1, header_str.size(), file_) != header_str.size())
+      throw std::runtime_error("ContainerWriter: header write failed for " + path);
     // Pre-size the file so every WriteTensor() below is a pure seek+write, no growth races.
     const uint64_t total = data_start_ + cursor_;
     if (total > 8 + header_len) {
       if (_fseeki64(file_, static_cast<int64_t>(total - 1), SEEK_SET) != 0)
         throw std::runtime_error("ContainerWriter: pre-size seek failed");
       const char zero = 0;
-      std::fwrite(&zero, 1, 1, file_);
+      if (std::fwrite(&zero, 1, 1, file_) != 1)
+        throw std::runtime_error("ContainerWriter: pre-size write failed for " + path);
     }
     std::fflush(file_);
     finalized_ = true;
@@ -88,6 +102,7 @@ class ContainerWriter {
   // this class.
   void WriteTensor(const std::string& name, const void* data, uint64_t nbytes) {
     if (!finalized_) throw std::runtime_error("ContainerWriter: WriteTensor() before FinalizeHeader()");
+    if (!file_) throw std::runtime_error("ContainerWriter: WriteTensor() after Close()");
     auto it = index_.find(name);
     if (it == index_.end()) throw std::runtime_error("ContainerWriter: unplanned tensor " + name);
     Entry& e = plan_[static_cast<size_t>(it->second)];
@@ -103,6 +118,125 @@ class ContainerWriter {
         throw std::runtime_error("ContainerWriter: write failed for " + name);
     }
     e.written = true;
+  }
+
+  // WriteTensor for a source too large to want in one call -- r4dx-convert --reuse-tensors-from
+  // copies tensors of up to a few GB straight out of the baseline's mapping: same checks, one seek,
+  // then `chunk`-byte writes, so the pages of `data` are touched front to back in bounded steps.
+  void WriteTensorChunked(const std::string& name, const uint8_t* data, uint64_t nbytes,
+                          uint64_t chunk = uint64_t{64} << 20) {
+    if (!finalized_) throw std::runtime_error("ContainerWriter: WriteTensorChunked() before FinalizeHeader()");
+    if (!file_) throw std::runtime_error("ContainerWriter: WriteTensorChunked() after Close()");
+    auto it = index_.find(name);
+    if (it == index_.end()) throw std::runtime_error("ContainerWriter: unplanned tensor " + name);
+    Entry& e = plan_[static_cast<size_t>(it->second)];
+    if (nbytes != e.nbytes) {
+      throw std::runtime_error("ContainerWriter: size mismatch for " + name + " (planned " +
+                                std::to_string(e.nbytes) + ", got " + std::to_string(nbytes) + ")");
+    }
+    {
+      std::lock_guard<std::mutex> lock(io_mutex_);
+      if (_fseeki64(file_, static_cast<int64_t>(data_start_ + e.offset), SEEK_SET) != 0)
+        throw std::runtime_error("ContainerWriter: seek failed for " + name);
+      for (uint64_t done = 0; done < nbytes;) {
+        const uint64_t n = std::min<uint64_t>(chunk, nbytes - done);
+        if (std::fwrite(data + done, 1, static_cast<size_t>(n), file_) != n)
+          throw std::runtime_error("ContainerWriter: write failed for " + name);
+        done += n;
+      }
+    }
+    e.written = true;
+  }
+
+  // Planned tensor `i` (plan order = data order): name, shape (as in the header), byte size.
+  const std::string& PlannedName(size_t i) const { return plan_names_.at(i); }
+  const std::vector<int64_t>& PlannedShape(size_t i) const { return plan_.at(i).shape; }
+  uint64_t PlannedBytes(size_t i) const { return plan_.at(i).nbytes; }
+
+  // How often `needle` occurs in the header FinalizeHeader wrote.
+  size_t HeaderOccurrences(const std::string& needle) const {
+    size_t n = 0;
+    for (size_t p = header_str_.find(needle); p != std::string::npos;
+         p = header_str_.find(needle, p + 1))
+      ++n;
+    return n;
+  }
+
+  // Everything written so far is on disk: the CRT buffer is flushed to the OS, and the OS cache to
+  // the device (_commit = FlushFileBuffers). Without the second half the OS may write pages back
+  // in any order, so after a crash or power loss a header patched "complete" could sit over tensor
+  // pages that never reached the disk (the pre-sized file's zeros).
+  void Sync() {
+    if (!file_) throw std::runtime_error("ContainerWriter: Sync() without an open file");
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    SyncLocked();
+  }
+
+  // Rewrites the one occurrence of `from` in the on-disk header as `to` (same length, so no offset
+  // moves). Durable on both sides: every byte written before the call is on disk before the patch
+  // is written (so a completion marker can never reach the disk ahead of the data it vouches for),
+  // and the patch itself is on disk when the call returns. r4dx-convert's reuse guard uses it to
+  // record its data digest and flip its completion marker after Finish(); check
+  // HeaderOccurrences(from) == 1 right after FinalizeHeader so a header that cannot be patched fails
+  // before the emit pass, not after it.
+  void PatchHeader(const std::string& from, const std::string& to) {
+    if (!finalized_) throw std::runtime_error("ContainerWriter: PatchHeader() before FinalizeHeader()");
+    if (!file_) throw std::runtime_error("ContainerWriter: PatchHeader() after Close()");
+    if (from.size() != to.size())
+      throw std::logic_error("ContainerWriter::PatchHeader: '" + from + "' and '" + to +
+                             "' differ in length");
+    if (HeaderOccurrences(from) != 1)
+      throw std::logic_error("ContainerWriter::PatchHeader: '" + from +
+                             "' does not occur exactly once in the header");
+    const size_t pos = header_str_.find(from);
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    SyncLocked();
+    if (_fseeki64(file_, static_cast<int64_t>(8 + pos), SEEK_SET) != 0 ||
+        std::fwrite(to.data(), 1, to.size(), file_) != to.size())
+      throw std::runtime_error("ContainerWriter: header patch failed");
+    SyncLocked();
+    header_str_.replace(pos, to.size(), to);
+  }
+
+  // sha256 (hex) of every planned tensor's bytes AS THEY ARE IN THE FILE, in plan order: Sync()s,
+  // then reads each tensor back through its own read handle, `threads` tensors at a time, the
+  // largest first. What r4dx-convert's reuse guard digests -- the file, not the buffers handed to
+  // WriteTensor. Call after Finish().
+  std::vector<std::string> ReadBackDigests(int threads) {
+    if (!finalized_) throw std::runtime_error("ContainerWriter: ReadBackDigests() before FinalizeHeader()");
+    Sync();
+    std::vector<size_t> order(plan_.size());
+    std::iota(order.begin(), order.end(), size_t{0});
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return plan_[a].nbytes > plan_[b].nbytes; });
+    std::vector<std::string> out(plan_.size());
+    const std::wstring wpath = Utf8ToWide(path_);
+    ParallelEach(order.size(), threads, [&](size_t k) {
+      const size_t i = order[k];
+      const Entry& e = plan_[i];
+      std::ifstream f(wpath.c_str(), std::ios::binary);
+      if (!f) throw std::runtime_error("ContainerWriter: cannot reopen " + path_ + " to read it back");
+      f.seekg(static_cast<std::streamoff>(data_start_ + e.offset));
+      std::vector<char> buf(static_cast<size_t>(std::min<uint64_t>(e.nbytes, uint64_t{8} << 20)));
+      Sha256 h;
+      for (uint64_t done = 0; done < e.nbytes;) {
+        const uint64_t n = std::min<uint64_t>(buf.size(), e.nbytes - done);
+        f.read(buf.data(), static_cast<std::streamsize>(n));
+        if (!f) throw std::runtime_error("ContainerWriter: short read-back of " + plan_names_[i]);
+        h.Update(reinterpret_cast<const uint8_t*>(buf.data()), static_cast<size_t>(n));
+        done += n;
+      }
+      out[i] = h.HexDigest();
+    });
+    return out;
+  }
+
+  // Closes the file, reporting a failed close (the destructor cannot). Idempotent.
+  void Close() {
+    if (!file_) return;
+    std::FILE* f = file_;
+    file_ = nullptr;
+    if (std::fclose(f) != 0) throw std::runtime_error("ContainerWriter: closing " + path_ + " failed");
   }
 
   // Review finding (minor): FinalizeHeader pre-sizes the whole file with zeros, so a planned
@@ -136,8 +270,16 @@ class ContainerWriter {
     uint64_t offset = 0, nbytes = 0;
     bool written = false;
   };
+
+  void SyncLocked() {
+    if (std::fflush(file_) != 0 || _commit(_fileno(file_)) != 0)
+      throw std::runtime_error("ContainerWriter: flushing " + path_ + " to disk failed");
+  }
+
   std::vector<Entry> plan_;
   std::vector<std::string> plan_names_;
+  std::string path_;
+  std::string header_str_;  // the JSON header as written (PatchHeader keeps it in sync)
   std::unordered_map<std::string, int64_t> index_;
   uint64_t cursor_ = 0;
   uint64_t data_start_ = 0;

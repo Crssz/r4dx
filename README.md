@@ -251,6 +251,12 @@ default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.
   `tools/quant2/alloc_groups.py` ranks them by nats of KL per GiB, fills a byte budget (default:
   equal bytes), reports the cliff and prints the flags for the chosen set. The runtime side
   (`r4d_gemm_w4a16_nt_m64_g`, the loader and the tuning table) must be built from the same tree.
+- `--reuse-tensors-from <baseline.r4dx>` writes the same container, but copies every tensor except
+  the linears whose group differs from the baseline's. The baseline must have been converted with
+  `--record-reuse-guard` by the same binary on the same CPU, from the same checkpoint and input
+  files (all hashed, `.hess` files included), with the same flags apart from the rules. Its data
+  must still match the digest it recorded. Anything else is refused, naming the field.
+  `group_sweep.ps1` does this by default (`-NoReuse` for full conversions). See `docs/quant2.md` 5.2.
 
 ### Generate text
 

@@ -37,8 +37,11 @@
 // means a corrupt file, not an unusual activation), and that the recomputed trace matches the header
 // to a relative 1e-3 -- a truncated-then-zero-padded or half-rewritten file fails one of these
 // before any factorization time is spent on it. HessianStore additionally checks every key's file
-// against the manifest's K (and rows, when present). CheckFile runs the header + size half of this
-// (no payload read) at planning time, so a missing or truncated file fails before the emit pass.
+// against the manifest's K, and rows and trace when present (the trace exactly: one f64, written to
+// both by the capture). CheckFile runs the header + size half of this (no payload read) at planning
+// time, so a missing, truncated or swapped file fails before the emit pass. None of this binds the
+// payload to the manifest -- a same-size edit that keeps the diagonal passes -- so r4dx-convert's
+// reuse guard hashes the .hess files themselves (FilesFor).
 //
 // ---- Memory ---------------------------------------------------------------------------------
 // The largest tap (mlp.down, K = 17408) is 606 MB packed and 1.21 GB expanded. ReadHessFile reads
@@ -145,8 +148,10 @@ inline HessHeader OpenHessFile(const std::string& path, const std::string& who, 
 
 }  // namespace hessian_detail
 
-// Full symmetric K x K (row-major) from one .hess file; *K and *rows receive the header values.
-inline std::vector<float> ReadHessFile(const std::string& path, int64_t* K_out, uint64_t* rows_out) {
+// Full symmetric K x K (row-major) from one .hess file; *K, *rows and *trace receive the header
+// values (each pointer may be null).
+inline std::vector<float> ReadHessFile(const std::string& path, int64_t* K_out, uint64_t* rows_out,
+                                       double* trace_out = nullptr) {
   using namespace hessian_detail;
   const std::string who = "ReadHessFile(" + path + ")";
   std::ifstream f;
@@ -208,6 +213,7 @@ inline std::vector<float> ReadHessFile(const std::string& path, int64_t* K_out, 
 
   if (K_out) *K_out = K;
   if (rows_out) *rows_out = rows;
+  if (trace_out) *trace_out = trace_hdr;
   return H;
 }
 
@@ -265,6 +271,12 @@ class HessianStore {
           throw std::runtime_error(who + ": files[\"" + it.key() + "\"].rows is not an integer");
         fi.rows = e["rows"].get<uint64_t>();
         fi.has_rows = true;
+      }
+      if (e.contains("trace")) {
+        if (!e["trace"].is_number())
+          throw std::runtime_error(who + ": files[\"" + it.key() + "\"].trace is not a number");
+        fi.trace = e["trace"].get<double>();
+        fi.has_trace = true;
       }
       files_[it.key()] = fi;
     }
@@ -360,26 +372,38 @@ class HessianStore {
   const std::string& ManifestSha256() const { return sha256_; }
   const std::string& Dir() const { return dir_; }
 
+  // Every file a run could read when it LDLQs the bases `select` accepts: each accepted base's
+  // "keys" file and, when it has one, its "rms_keys" file (read only by a rotated in-projection,
+  // listed regardless). Sorted, distinct, names as in "files". r4dx-convert's reuse guard hashes
+  // these: hessian.json's sha256 alone does not identify the Hessians, since nothing ties a .hess
+  // payload to the manifest beyond its header (K, rows, trace).
+  std::vector<std::string> FilesFor(const std::function<bool(const std::string&)>& select) const {
+    std::set<std::string> out;
+    for (const auto& kv : keys_) {
+      if (!select(kv.first)) continue;
+      out.insert(kv.second);
+      auto r = rms_keys_.find(kv.first);
+      if (r != rms_keys_.end()) out.insert(r->second);
+    }
+    return std::vector<std::string>(out.begin(), out.end());
+  }
+
   // Planning-time check of `key`'s file on disk: header valid, exact size for its K, K and rows
-  // equal to the manifest's. Reads 64 bytes, never the payload, and each distinct file once -- so a
-  // missing or truncated file (an interrupted capture, a partial copy) fails before the converter
-  // writes a header, not hours into the emit pass. The payload checks (finiteness, trace) still run
-  // in ReadHessFile at Factor() time. kRms checks `key`'s "rms_keys" file instead.
+  // equal to the manifest's, and the header's f64 trace EXACTLY equal to the manifest's when it
+  // lists one (hessian_capture.py writes both from one value, and ReadHessFile ties the header's
+  // trace to the payload's diagonal) -- so two same-K files swapped under one manifest fail here.
+  // Reads 64 bytes, never the payload, and each distinct file once -- so a missing or truncated
+  // file (an interrupted capture, a partial copy) fails before the converter writes a header, not
+  // hours into the emit pass. The payload checks (finiteness, trace vs the diagonal) still run in
+  // ReadHessFile at Factor() time. kRms checks `key`'s "rms_keys" file instead.
   void CheckFile(const std::string& key, HessianSource src = HessianSource::kKeys) {
     const std::string file = FileFor(key, src);
     if (checked_files_.count(file)) return;
-    const FileInfo& fi = files_.at(file);
     const std::string path = hessian_detail::JoinPath(dir_, file);
     std::ifstream f;
     const hessian_detail::HessHeader h =
         hessian_detail::OpenHessFile(path, "HessianStore(" + path + ")", f);
-    if (h.K != fi.K)
-      throw std::runtime_error("HessianStore: " + path + " header says K=" + std::to_string(h.K) +
-                               " but hessian.json says K=" + std::to_string(fi.K));
-    if (fi.has_rows && h.rows != fi.rows)
-      throw std::runtime_error("HessianStore: " + path + " header says rows=" +
-                               std::to_string(h.rows) + " but hessian.json says rows=" +
-                               std::to_string(fi.rows));
+    CheckHeaderAgainstManifest(path, files_.at(file), h.K, h.rows, h.trace);
     checked_files_.insert(file);
   }
 
@@ -411,14 +435,9 @@ class HessianStore {
     const std::string path = hessian_detail::JoinPath(dir_, file);
     int64_t fk = 0;
     uint64_t frows = 0;
-    std::vector<float> H = ReadHessFile(path, &fk, &frows);
-    if (fk != fi.K)
-      throw std::runtime_error("HessianStore: " + path + " header says K=" + std::to_string(fk) +
-                               " but hessian.json says K=" + std::to_string(fi.K));
-    if (fi.has_rows && frows != fi.rows)
-      throw std::runtime_error("HessianStore: " + path + " header says rows=" +
-                               std::to_string(frows) + " but hessian.json says rows=" +
-                               std::to_string(fi.rows));
+    double ftrace = 0.0;
+    std::vector<float> H = ReadHessFile(path, &fk, &frows, &ftrace);
+    CheckHeaderAgainstManifest(path, fi, fk, frows, ftrace);
     if (src == HessianSource::kRms) {
       // rms(x) of a real residual row has no structurally zero channel ((1 + w) is not applied),
       // so a zero diagonal means the file is not what "rms_keys" promises -- e.g. the norm's
@@ -448,7 +467,30 @@ class HessianStore {
     int64_t K = 0;
     uint64_t rows = 0;
     bool has_rows = false;
+    double trace = 0.0;
+    bool has_trace = false;
   };
+
+  // A .hess header (K, rows, trace) against its "files" entry: K always, rows and trace when the
+  // manifest lists them. The trace compares exactly: it is one f64, written to both places by the
+  // capture (Python's repr round-trips it through the JSON).
+  static void CheckHeaderAgainstManifest(const std::string& path, const FileInfo& fi, int64_t K,
+                                         uint64_t rows, double trace) {
+    if (K != fi.K)
+      throw std::runtime_error("HessianStore: " + path + " header says K=" + std::to_string(K) +
+                               " but hessian.json says K=" + std::to_string(fi.K));
+    if (fi.has_rows && rows != fi.rows)
+      throw std::runtime_error("HessianStore: " + path + " header says rows=" +
+                               std::to_string(rows) + " but hessian.json says rows=" +
+                               std::to_string(fi.rows));
+    if (fi.has_trace && !(trace == fi.trace)) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), " header says trace=%.17g but hessian.json says trace=%.17g",
+                    trace, fi.trace);
+      throw std::runtime_error("HessianStore: " + path + buf +
+                               " -- not the file this manifest was written for");
+    }
+  }
 
   std::string dir_;
   std::string sha256_;

@@ -142,6 +142,18 @@ class SafetensorsReader {
     const auto& m = tensors_.at(name);
     return view_ + data_start_ + m.begin;
   }
+  // The JSON header's bytes exactly as in the file (from the mapping, so the same bytes the tensor
+  // directory was parsed from).
+  std::string HeaderJson() const {
+    return std::string(reinterpret_cast<const char*>(view_ + 8), static_cast<size_t>(data_start_ - 8));
+  }
+  // Every tensor name in the file (no particular order; __metadata__ excluded).
+  std::vector<std::string> Names() const {
+    std::vector<std::string> out;
+    out.reserve(tensors_.size());
+    for (const auto& kv : tensors_) out.push_back(kv.first);
+    return out;
+  }
 
  private:
   std::string path_display_;

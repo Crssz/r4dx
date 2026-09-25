@@ -70,6 +70,23 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_rms_hessian COMMAND convert_rms_hessian)
 
+# --record-reuse-guard / --reuse-tensors-from (docs/quant2.md 5.2; reuse_guard.hpp): the library
+# pieces (file hashing, the guard diff, ContainerWriter's chunked write and header patch) and -- when
+# r4dx-convert is built -- the exe on a synthetic 2-shard checkpoint: a reuse run with one group rule
+# from a no-rule baseline is byte-identical to the full run with that rule (header modulo
+# reused_from), the reverse too, with the Q3 sweep's recipe and with --rotate q2ab --ldlq; every
+# guard field (real flags, input files, checkpoint files, the binary, and each recorded leaf mutated
+# in a copy of the baseline) and every inconsistent baseline is refused before an output exists.
+# CPU-only; writes ~450 MB under %TEMP% and removes it.
+add_executable(convert_reuse test_reuse.cpp)
+target_link_libraries(convert_reuse PRIVATE r4dx_convert)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_reuse PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_reuse r4dx-convert)
+endif()
+add_test(NAME convert_reuse COMMAND convert_reuse)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

@@ -10,11 +10,45 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <exception>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 namespace r4dx_convert {
+
+// Runs fn(i) for i in [0, n) on up to `threads` workers, one item at a time, in index order (the
+// items -- whole files, whole tensors -- are few and uneven, unlike ParallelFor's row ranges; a
+// caller that wants the largest first orders them so). The first exception is rethrown after every
+// worker has stopped; no item is started after it.
+template <typename Fn>
+void ParallelEach(size_t n, int threads, Fn&& fn) {
+  std::atomic<size_t> next{0};
+  std::exception_ptr err;
+  std::mutex mu;
+  auto work = [&]() {
+    for (;;) {
+      const size_t i = next.fetch_add(1);
+      if (i >= n) return;
+      try {
+        fn(i);
+      } catch (...) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!err) err = std::current_exception();
+        next.store(n);
+        return;
+      }
+    }
+  };
+  const size_t workers = std::min<size_t>(n, static_cast<size_t>(threads > 1 ? threads : 1));
+  std::vector<std::thread> pool;
+  for (size_t t = 1; t < workers; ++t) pool.emplace_back(work);
+  work();
+  for (auto& t : pool) t.join();
+  if (err) std::rethrow_exception(err);
+}
 
 // Calls body(lo, hi) once per chunk, on up to `nthreads` worker threads, then blocks until all
 // chunks finish. `end <= begin` is a no-op. `nthreads <= 1` (or a range too small to split

@@ -676,9 +676,12 @@ void TestStore() {
     // A zero diagonal in an rms file: what a capture of the norm's OUTPUT gives on a dead channel.
     // The manifest is fine; Factor(kRms) refuses it (the keys source of the same base still works).
     {
-      write_manifest(good);
       const std::string bytes = ReadWhole(dir / "t.in.rms.hess");
-      WriteHessPacked(dir / "t.in.rms.hess", K, rows, post);  // H_post: row/column 5 are exactly 0
+      // H_post: row/column 5 are exactly 0. The manifest lists the file's own trace, as a capture
+      // would -- CheckFile holds the header's trace to it exactly.
+      nlohmann::json j = good;
+      j["files"]["t.in.rms.hess"]["trace"] = WriteHessPacked(dir / "t.in.rms.hess", K, rows, post);
+      write_manifest(j);
       HessianStore s(dir.u8string());
       s.CheckFile("t.qkv", HessianSource::kRms);
       ExpectThrow("(c) Factor(kRms) refuses an rms file with a zero diagonal", "H[5][5] = 0", [&]() {
@@ -692,6 +695,22 @@ void TestStore() {
       }
       Gate(ok, "(c) ... while Factor(kKeys) of the post-norm file (zero at the dead channel) still factors");
       WriteWhole(dir / "t.in.rms.hess", bytes);
+    }
+    // Two same-K files swapped under one manifest: K and rows agree, only the header trace (one f64,
+    // written to both by the capture) tells them apart -- CheckFile and Factor refuse it exactly.
+    {
+      write_manifest(good);
+      const std::string rms_bytes = ReadWhole(dir / "t.in.rms.hess");
+      const std::string out_bytes = ReadWhole(dir / "t.out.hess");
+      WriteWhole(dir / "t.in.rms.hess", out_bytes);
+      WriteWhole(dir / "t.out.hess", rms_bytes);
+      HessianStore s(dir.u8string());
+      ExpectThrow("(c) CheckFile refuses a file whose header trace is not the manifest's", "trace=",
+                  [&]() { s.CheckFile("t.qkv", HessianSource::kRms); });
+      ExpectThrow("(c) ... and Factor refuses it too", "trace=",
+                  [&]() { s.Factor("t.out", K, 0.01f, 2, nullptr, HessianSource::kKeys); });
+      WriteWhole(dir / "t.in.rms.hess", rms_bytes);
+      WriteWhole(dir / "t.out.hess", out_bytes);
     }
     // A truncated rms file passes the manifest but fails the planning-time CheckFile(kRms).
     {

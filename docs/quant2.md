@@ -723,6 +723,119 @@ w4a16 tensors. `r4dx_format_version` is not a guard, because no reader checks it
 GPU side (a mixed container loaded and decoded, TP=1 and TP=2, plus rung-4 KL per candidate) is
 handed to the user.
 
+### 5.2 Reusing a baseline (`--reuse-tensors-from`)
+
+The Q3 sweep converts ~31 containers, each the no-rule baseline plus ONE `--w4a16-group-rule`, at
+~24 min each. `r4dx-convert --reuse-tensors-from <baseline.r4dx>` writes exactly the container a full
+run with the same flags writes, but copies from the baseline every tensor that cannot depend on the
+difference (`src/convert/main.cpp`: `BuildReuseGuard`, `OpenReuseBaseline`, `CheckReuseBaseline`,
+`PlanReuse`; `reuse_guard.hpp`).
+
+**Recomputed:** every linear whose w4a16 group differs between the two runs, read from each run's
+`quant.w4a16.groups` (absent = the default). That covers a rule in this run, a rule only the BASELINE
+had, and two different groups. All of that linear's layouts are recomputed, with everything its job
+writes (the MTP draft head's `vocab_ids` too). **Copied:** everything else. Each linear is quantized
+from its own weight and its own Hessian or imatrix vector, and nothing reads another linear's
+quantized output. HessianStore's factor cache is only a cache: a reuse run may factor a shared tap
+afresh, and `convert_reuse` (d) checks the bytes do not care. Before copying, every copied tensor
+must exist in the baseline under the same name with dtype U8, the same shape and the same size. The
+baseline must hold nothing else except the recomputed linears' own layout tensors, and its group map
+must agree with its scale tensors. The copy streams from the baseline's mapping in 64 MiB writes.
+
+**The guard** is `__metadata__.r4dx_convert_run.reuse_guard`. `--record-reuse-guard` writes it, and
+so does every reuse run. A baseline without a guard (any older converter's container), or with an
+unfinished one, is refused from its header alone, before anything is hashed. Otherwise a reuse is
+refused, before the first shard is read and naming each field, unless the baseline's guard equals
+this run's in every field:
+
+| field | content |
+|---|---|
+| `version` | the guard format (2) |
+| `converter.exe_sha256` | the running `r4dx-convert.exe` (r4d_core is linked statically) |
+| `converter.runtime_dlls` | ucrtbase / msvcp140 / vcruntime140 as loaded (`rotation.mix5` uses ucrt's log/cos/sin) |
+| `converter.cpu` | vendor, brand, family/model/stepping, FMA3/AVX/AVX2/AVX-512F, XCR0, `_get_FMA3_enable()`: ucrt picks its FMA3 or SSE2 transcendentals at run time, and they can differ in the last bit |
+| `converter.{w4a16,w4a8,mxfp4}_group`, `avx512` | build constants; the LDLQ microkernel path |
+| `checkpoint` | sha256 of `config.json` and `model.safetensors.index.json`; length + sha256 of every shard the index names (whole files). The path is not compared. |
+| `args` | resolved `layers`, `vision`, `mtp`, the body and lm_head layout sets after `--no-bf16`, `quant`, `keep_bf16`, `ldlq`, `ldlq_damp`, `rotate`, `rotation_seed` |
+| `inputs` | sha256 of `--imatrix`, `--kv-calib`, `--draft-vocab-ids` (when `--mtp` is on) and `hessian.json`; `hessian_files`: length + sha256 of every `.hess` file the `--ldlq` regex can make the run read (the selected bases' `keys` and `rms_keys` files) |
+| `emit_complete`, `data_sha256` | not compared: the completion fields (below) |
+
+`hessian.json` alone does not identify the Hessians. It pins each file's K, rows and header trace
+(`CheckFile` holds the header to them, the trace exactly, so two same-K files swapped under one
+manifest are refused even by a full run), and `ReadHessFile` ties the trace to the diagonal. But
+nothing ties the rest of a payload to the manifest, so an in-place edit that keeps the diagonal
+passes every check. A reuse run never reads the files of the linears it copies, so only
+`hessian_files` can say that the baseline rounded against the same Hessians. The checkpoint's
+shards and the `.hess` files are hashed in one parallel pass (about 54 GiB for hessian-v1 with
+`--ldlq ".*"`, on NVMe).
+
+Not compared: the group rules, `--output`, `--threads` (the bytes do not depend on it, gate G1(c)),
+and input file paths. There is deliberately no `--reuse-allow-binary-mismatch`. Any rebuild can change
+what a quantizer writes. A container mixing two converters' tensors would measure as a group-rule
+effect, silently. The price of refusing is one baseline conversion. Also refused: a baseline without
+a guard, `--output` equal to the baseline, a header that is not JSON, and a quant block from
+another build.
+
+**Completion and data digest.** ContainerWriter pre-sizes the file, so an interrupted conversion
+looks valid: a whole header over zero-filled tensors. So the guard's two completion fields are
+written as placeholders (`emit_complete` 0, `data_sha256` 64 zeros). After `writer.Finish()` the
+converter syncs the file to disk (`_commit`), reads every tensor back in parallel, and records
+`data_sha256`. That is the sha256 over `"<name>\n<sha256 of the tensor's bytes>\n"`, names in byte
+order. Then `emit_complete` flips to 1. Each patch is durable: the data reaches the disk before the
+patch is written, and the patch before the call returns. A reuse run refuses a baseline whose
+marker is not 1 or whose digest is still the placeholder. It then hashes the baseline's every
+tensor, in parallel and straight from its mapping, and refuses it unless they give `data_sha256`.
+That catches a completed baseline that was later partly overwritten, or copied by a tool that died
+half way (full length, header intact, a zero tail). The mapping is opened share-read only, so the
+baseline cannot change between that check and the copy. The copy pass then checks that every copied
+tensor reads back from the output with the baseline's digest.
+
+**What differs from a full run.** The data section is identical byte for byte, and so is the
+recorded `data_sha256`. Against a full run with `--record-reuse-guard`, the header text differs
+only by `r4dx_convert_run.reused_from` (path, the baseline's header sha256 and `data_sha256`,
+tensors / bytes copied and recomputed, `linears_recomputed`), plus `threads` if `--threads`
+differed. Against a full run without the flag, it also has `reuse_guard`. Without either flag no
+hashing happens and the header is unchanged. The guard hashes the whole checkpoint, one shard per
+worker at ~350 MB/s each: 30 s for the 27B checkpoint (55.6 GB, 18 shards, 32 threads), measured
+2026-09-26. The `.hess` files, the baseline's data check and the output's read-back digest (18.5 GB
+each, one tensor per worker; the bf16 `embed_tokens`, ~2.5 GB, is the longest single item) have
+not been timed on the 27B yet. Nor has the 18.5 GB copy.
+
+**Sweep:** `tools/quant2/group_sweep.ps1 -Convert` converts the baseline with `--record-reuse-guard`,
+keeps it, and passes `--reuse-tensors-from` to every candidate. `<name>.meta.json` records
+`reused_from`, the container's `data_sha256` and its guard identity (`guard_json`: the guard without
+the completion fields). A measured baseline is never replaced silently. If its container is gone,
+it is converted again, and the new container must have the recorded `data_sha256` and `guard_json`.
+Otherwise the sweep stops, because `kl_baseline.json` and every candidate measured against it are
+stale; start a new `-OutDir`. A measured baseline from an older sweep, with no digest recorded,
+cannot be checked, so continue it with `-NoReuse`. `-Kl` leaves out a candidate whose `guard_json`
+differs from the baseline's. `-ReuseFrom <container>` uses another source; `-NoReuse` is the old
+full-conversion path.
+
+**Test:** `convert_reuse`, CPU, ~35 s. It runs a synthetic 2-shard checkpoint through the sweep's
+recipe (imatrix, kv-calib, MTP, draft head, vision) and through `--rotate q2ab --ldlq ".*"` with rms
+Hessians. It checks:
+- reuse(R) == full(R), and the reverse, `data_sha256` included;
+- chained reuse, a group change on both sides, and a default-group rule;
+- a moved checkpoint and another `--threads` are accepted;
+- every flag, input file, checkpoint file and binary difference is refused, and so is each of the
+  48 guard leaves mutated in a copy of the baseline;
+- every inconsistent or unfinished baseline is refused. That includes one whose data no longer
+  matches its digest: half zeroed at full length, or one bit flipped;
+- a `.hess` payload edited in place under an unchanged `hessian.json` is refused. So are two
+  swapped same-K files, even by a full run.
+
+**Measured on the 27B (2026-09-26, `D:\models\r4dx\q3-reuse-test`, recipe `run_variants.ps1`'s base +
+`--rotate q2ab --hessian-dir hessian-v1 --ldlq .`, while corpus v2 generation ran on the GPU):** the
+guarded no-rule baseline took 25.8 min. Candidate A (`mlp.down` in layers 0-31 at group 32)
+took **8.7 min** by reuse (64 tensors / 1.78 GB recomputed, 1423 / 18.2 GB copied) against **23.4 min**
+for the full conversion. `compare_containers.py`: the tensor directory is identical, all 1487 data
+ranges are identical, both files' `data_sha256` is `3408ff4d...` and recomputes; `__metadata__`
+differs only under `r4dx_convert_run.reused_from`. The pre-feature `qwen38-27b-q2ab_ldlq.r4dx` was
+refused as a baseline (no guard). Most of a reuse run is the recomputed linears' own LDLQ
+factorizations (an `mlp.down` factor is ~12.6 s, 32 of them), so a candidate on a smaller class is
+cheaper still.
+
 ## 6. GPU runs this plan needs (each handed to the user)
 
 1. Q1 Hessian capture, device 1, server stopped, ~30-60 min.

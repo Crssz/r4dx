@@ -8,11 +8,11 @@
 #   .\tools\quant2\gen_corpus.ps1 -Limit 8 -OnlyCategory chat   # smoke the thinking budget first (below)
 #   .\tools\quant2\gen_corpus.ps1 -NoDflash       # plain sampled decode
 #
-# Before the full run, smoke the chats: their thinking turns run at the template's default xhigh
-# effort within a 7168-token (one turn) or 3584-token (two turns) budget that holds thought AND
-# answer, and nothing in docs/ has measured this model's thought lengths yet. Count the
-# "reasoning never closed" rejects in gen_corpus.log (or reject_reasons in gen_manifest.json). A full
-# run then resumes after the smoke's samples; if a budget is changed instead, the generator refuses the
+# The chats' thinking turns run at the template's default xhigh effort within a 7168-token (one turn)
+# or 3584-token (two turns) budget that holds thought AND answer. The 2026-09-26 smoke (8 chats, 5
+# thinking) cut 4 thoughts at the budget; such a turn is KEPT (truncated_thought_turn in its record,
+# see gen_corpus.py), since the corpus only needs realistic input, not finished answers. A full run
+# resumes after any earlier samples in -OutDir; if a budget is changed, the generator refuses the
 # changed entries' lines (their prompt_sha256) until they are deleted.
 #
 # Writes to -OutDir: samples.jsonl, gen_manifest.json, gen_corpus.log (the generator's progress lines,

@@ -13,10 +13,12 @@ SKIPPED with a message when what it needs is missing.
         for the thinking mode (thinking on = its generation_config.json), enable_thinking,
         max_tokens, stream false and no reasoning_effort
     (b) two-turn chats: the second request replays turn 1 (with its reasoning_content) plus the
-        follow-up; the record holds both turns; a turn-1 rejection sends no second request
+        follow-up; the record holds both turns; a turn 1 cut inside its thought sends no second
+        request
     (c) resume: --limit, then a torn last line, then a full run -> the torn fragment is dropped
         and regenerated, finished ids are never requested again, every id exactly once
-    (d) rejection, kept in the file: degenerate repetition, empty output, reasoning never closed,
+    (d) rejection, kept in the file: degenerate repetition, empty output, an empty answer after a
+        closed thought (a thought cut by max_tokens is KEPT, truncated_thought_turn set),
         a too-short document, reasoning_content with thinking off, a think tag in a raw document,
         text overlapping a (synthetic) KL corpus; a line rejected BY HAND without a reason is
         warned about and counted as "unspecified", and the run still writes its manifest
@@ -284,7 +286,7 @@ MAIN_ENTRIES = [
 EXPECTED_ORDER = ["chat/001", "english_prose/001", "thai_prose/001", "code/001", "chat/002",
                   "english_prose/002", "multilingual/001", "chat/003", "thai_prose/002", "code/002",
                   "english_prose/003", "chat/004"]
-EXPECTED_REJECT = {"english_prose/002": "too short", "chat/003": "reasoning never closed",
+EXPECTED_REJECT = {"english_prose/002": "too short",
                    "code/001": "degenerate content", "code/002": "unexpected reasoning_content",
                    "multilingual/001": "empty output", "english_prose/003": "think tag in a raw document",
                    "thai_prose/002": "kl overlap"}
@@ -531,8 +533,9 @@ def check_with_reader(out: Path, kl: Path) -> None:
           and all((s["sequences"] > 0) == bool(s["sample_ids"]) for s in src.values()),
           f"{label}: every kept sample rendered and packed "
           f"({ {c: (s['sample_ids'], s['samples_rejected'], s['sequences']) for c, s in src.items()} })")
-    check(src["chat"]["formats"] == {"raw": 0, "chat": 3} and src["chat"]["thinking_samples"] == 1,
-          f"(k) the kept chats: chat/001 (thinking, two turns), chat/002 (two turns), chat/004 "
+    check(src["chat"]["formats"] == {"raw": 0, "chat": 4} and src["chat"]["thinking_samples"] == 2,
+          f"(k) the kept chats: chat/001 (thinking, two turns), chat/002 (two turns), chat/003 "
+          f"(thinking, cut inside its thought), chat/004 "
           f"({src['chat']['formats']}, {src['chat']['thinking_samples']} thinking)")
     c1 = next(u for u in used if u["id"] == "chat/001")
     r1 = hc.render_gen_sample(c1, tok, tok.chat_template)
@@ -644,7 +647,8 @@ def test_generation(tmp: Path, stub: Stub) -> None:
           and all("reasoning_content" not in m for m in r2["messages"]),
           "(b) chat/002: no system, no reasoning_content with thinking off")
     check(len(stub.posts_for("A question whose thinking never ends. [[unclosed]]")) == 1
-          and len(rec["chat/003"]["messages"]) == 3, "(b) a rejected turn 1 sends no follow-up")
+          and len(rec["chat/003"]["messages"]) == 3,
+          "(b) a turn 1 cut inside its thought sends no follow-up")
 
     # ---- (d) rejection ------------------------------------------------------------------------
     for sid, r in rec.items():
@@ -654,13 +658,19 @@ def test_generation(tmp: Path, stub: Stub) -> None:
                   f"(d) {sid} rejected as {want!r} (got {r['reject_reason']!r})")
         else:
             check(not r["rejected"] and r["reject_reason"] is None, f"(d) {sid} kept ({r['reject_reason']})")
-    check(rec["chat/003"]["finish_reason"] == "length", "(d) unclosed reasoning keeps finish_reason length")
+    check(rec["chat/003"]["finish_reason"] == "length" and rec["chat/003"]["truncated_thought_turn"] == 1
+          and all(r["truncated_thought_turn"] is None for sid, r in rec.items() if sid != "chat/003"),
+          "(d) a thought cut by max_tokens is KEPT: finish_reason length, truncated_thought_turn 1")
+    for fin, want in (("length", None), ("stop", "empty answer")):
+        got = gc.check_turn("chat", True, 0, "", "a thought", True, fin)
+        check(got == want or bool(want and got and got.startswith(want)),
+              f"(d) empty answer after a thought, finish {fin!r} -> {want!r} (got {got!r})")
 
     # ---- (j) the manifest ---------------------------------------------------------------------
     m = json.loads(manifest.read_text(encoding="utf-8"))
     c = m["counts"]
     check((c["planned"], c["done"], c["accepted"], c["rejected"], c["missing"], c["complete"])
-          == (12, 12, 5, 7, 0, True), f"(j) counts {c}")
+          == (12, 12, 6, 6, 0, True), f"(j) counts {c}")
     check(c["reject_reasons"] == {k: 1 for k in EXPECTED_REJECT.values()}, f"(j) reasons {c['reject_reasons']}")
     check(c["tokens"]["completion"] == sum(r["completion_tokens"] for r in recs)
           and c["tokens"]["prompt"] == sum(r["prompt_tokens"] for r in recs), "(j) token totals")
@@ -746,7 +756,7 @@ def test_generation(tmp: Path, stub: Stub) -> None:
           "(d) the reasonless hand-rejected line is warned about")
     m5 = json.loads(out5.with_name("gen_manifest.json").read_text(encoding="utf-8"))
     rr = m5["counts"]["reject_reasons"]
-    check(m5["counts"]["rejected"] == 9 and rr.get(gc.UNSPECIFIED_REJECT) == 1 and rr.get("kl overlap") == 2
+    check(m5["counts"]["rejected"] == 8 and rr.get(gc.UNSPECIFIED_REJECT) == 1 and rr.get("kl overlap") == 2
           and m5["runs"][-1]["exit"] == "ok",
           f"(d) the manifest counts them: {m5['counts']['rejected']} rejected, reasons {rr}")
     lines[0]["completion_tokens"] = str(lines[0]["completion_tokens"])

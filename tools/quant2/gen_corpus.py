@@ -59,9 +59,15 @@ template, docs/server.md "Multi-turn"), appends the entry's follow-up and sends 
 **Rejection** (the line is still written, with `rejected: true`, so a resume does not redo it and the
 capture can report it). A turn is rejected for:
 
-- empty output: no content after stripping; with thinking on and a non-empty `reasoning_content`
-  this means `</think>` never came before `max_tokens` ("reasoning never closed"). A two-turn chat
-  stops there: a follow-up to an empty answer is not a realistic conversation.
+- empty output: no content after stripping ("empty answer" when a thought came first). EXCEPT a
+  thinking turn cut by `max_tokens` inside its thought (no content, non-empty `reasoning_content`,
+  finish_reason "length"): that one is KEPT and its record gets `truncated_thought_turn`. The
+  corpus only has to be realistic model input, and a long thought is exactly what the served model
+  reads while thinking (the template's default effort is xhigh; the 2026-09-26 smoke cut 4 of 8
+  thinking chats at 3.6k-7.2k tokens, so rejecting them discarded most of the chat tokens). The
+  capture's template render closes the thought (`</think>`, empty answer, `<|im_end|>`): a handful of
+  tokens the server never produced. A two-turn chat stops there: a follow-up to an empty answer is
+  not a realistic conversation.
 - a "raw" document shorter than `MIN_RAW_CHARS`, or containing a think tag (thinking is off for
   every raw entry, so a tag is a server or template fault).
 - `reasoning_content` present with thinking off (the same kind of fault).
@@ -577,16 +583,24 @@ def degenerate_reason(text: str) -> str | None:
     return None
 
 
+def is_truncated_thought(thinking: bool, content: str, reasoning: str | None, finish) -> bool:
+    """A thinking turn cut by max_tokens inside its thought: no answer, a non-empty
+    reasoning_content, finish_reason "length". Kept (see the module docstring)."""
+    return (thinking and not content.strip() and bool(reasoning and reasoning.strip())
+            and finish == "length")
+
+
 def check_turn(fmt: str, thinking: bool, turn: int, content: str, reasoning: str | None,
-               has_reasoning_key: bool) -> str | None:
+               has_reasoning_key: bool, finish=None) -> str | None:
     """The reject reason for one generated turn ("<kind>: <detail>"), or None to keep it."""
     where = f"turn {turn + 1}"
     if not thinking and has_reasoning_key:
         return f"unexpected reasoning_content: thinking was off ({where})"
     body = content.strip()
-    if not body:
+    if not body and not is_truncated_thought(thinking, content, reasoning, finish):
         if thinking and reasoning and reasoning.strip():
-            return f"reasoning never closed: no content after {len(reasoning)} reasoning chars ({where})"
+            return (f"empty answer: no content after {len(reasoning)} reasoning chars, "
+                    f"finish_reason {finish!r} ({where})")
         return f"empty output: no content ({where})"
     if fmt == "raw":
         if len(body) < MIN_RAW_CHARS:
@@ -720,6 +734,7 @@ def generate_sample(entry: dict, client: Client, kl_shingles: dict[str, str] | N
     seeds, finishes, timings = [], [], []
     prompt_tokens = completion_tokens = 0
     reason = None
+    truncated_turn = None
     model = None
     content = ""
     t0 = time.monotonic()
@@ -746,9 +761,12 @@ def generate_sample(entry: dict, client: Client, kl_shingles: dict[str, str] | N
         finishes.append(finish)
         model = resp.get("model", model)
         reason = (check_turn(entry["format"], thinking, turn, content, reasoning,
-                             "reasoning_content" in msg)
+                             "reasoning_content" in msg, finish)
                   or kl_reason(turn, content, reasoning, kl_shingles or {}))
         if reason:
+            break
+        if is_truncated_thought(thinking, content, reasoning, finish):
+            truncated_turn = turn + 1
             break
     samp = SAMPLING[thinking]
     return {
@@ -771,6 +789,7 @@ def generate_sample(entry: dict, client: Client, kl_shingles: dict[str, str] | N
         "max_tokens": entry["max_tokens"],
         "turn_seeds": seeds,
         "turn_finish_reasons": finishes,
+        "truncated_thought_turn": truncated_turn,
         "timings": timings,
         "model": model,
         "elapsed_s": round(time.monotonic() - t0, 3),

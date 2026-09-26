@@ -109,6 +109,20 @@ from `base_pos_new = base_pos_old + num_committed - 1`, exactly the first positi
 rejection left holding stale/hypothetical data, before anything could ever read further ahead
 (causal attention only reads positions `<= current`).
 
+**Prefill after a multi-token round** (fixed 2026-09-26). The window-slot thread above covers the
+next decode step or verify round, which both read `num_accepted`. A PREFILL does not: its chunked-
+scan path seeds from window 0 and `r4d_gdn_conv_prep` reads the conv history at offset 0. So when a
+conversation continued by prefill -- the server's prefix reuse, `r4dx-cli --chat` -- after a turn
+whose last round committed n > 1 tokens, the prefill started from the GDN state n-1 tokens back
+(window 0 held the state after the round's first candidate only). Measured on the 4-layer
+container, after a 4-token round: a 1-token prefill was rel L2 6.4e-3 off the sequential twin, with a
+different argmax on w4a16. `Model::CollapseSpeculativeWindow` (called by `Prefill` and
+`PrefillMultimodal` before their first chunk) now copies window n-1 to window 0 and the conv history
+from offset n-1 to offset 0 -- where a plain decode step leaves them -- and the result is bit-identical
+to the sequential twin (`tests/model/test_prompt_checkpoint`'s `CheckExtendAfterMultiTokenRound`,
+bf16 and w4a16, 70-token and 1-token tails). DFlash2 rounds commit through the same
+`CommitVerifiedWindow`, so the same fix covers them.
+
 `ModelOptions::mtp_draft_k == 0` (the default) makes every one of these changes a no-op: window
 banking degenerates to exactly 1 slot (today's pre-MTP layout), `num_accepted` stays nullptr always,
 MTP's own KV cache and priming calls never run, and `Model::DecodeStep(Greedy)`/`RunChunk` are

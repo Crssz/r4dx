@@ -320,6 +320,15 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   return d;
 }
 
+void DflashDraft::Rewind(int64_t n) {
+  if (n < 0 || n > n_injected_) {
+    throw std::runtime_error("DflashDraft::Rewind: position " + std::to_string(n) + " is outside [0, " +
+                             std::to_string(n_injected_) + "]");
+  }
+  valid_from_ = std::min(n, std::max(valid_from_, n_injected_ - slots_));
+  n_injected_ = n;
+}
+
 void DflashDraft::InjectFeatures(core::Stream& stream, core::Arena& arena,
                                  const uint16_t* features_dev, int64_t rows, int64_t start_pos,
                                  const int32_t* rope_t_host) {

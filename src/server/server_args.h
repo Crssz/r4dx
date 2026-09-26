@@ -86,6 +86,11 @@ struct ServerArgs {
   // 2026-09-20: ModelOptions' own doc comment promised this flag before either binary actually had
   // it). "off" forces the host-gather path instead of mirroring text.embed_tokens into VRAM.
   std::string embed_device_resident = "on";
+  // Prompt checkpoint (docs/server.md "Prefix cache"; r4dx::model::ModelOptions::prompt_checkpoint):
+  // "on" (default) saves the GDN state at the end of every prompt, so a follow-up whose replayed
+  // reply does not re-tokenize to the generated tokens still reuses the prompt before it instead of
+  // re-prefilling the whole conversation. "off" reclaims its VRAM (~150 MiB on the 27B).
+  std::string prompt_checkpoint = "on";
   // DFlash2 self-speculative decode (docs/dflash2.md, stage S3), same flag/semantics/default as
   // src/cli/cli_args.h's --dflash/--dflash-k/--dflash-p-min/--dflash-n-min: empty (default)
   // disables it; mutually exclusive with --mtp > 0 (checked below -- Model::Load re-checks it too).
@@ -137,7 +142,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
          "[--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}] "
-         "[--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N] "
+         "[--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}] "
+         "[--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
          "[--image-max-pixels N] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
@@ -225,6 +231,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextServerArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextServerArg(argc, argv, i, "--mtp-draft-head");
     else if (arg == "--embed-device-resident") a.embed_device_resident = NextServerArg(argc, argv, i, "--embed-device-resident");
+    else if (arg == "--prompt-checkpoint") a.prompt_checkpoint = NextServerArg(argc, argv, i, "--prompt-checkpoint");
     else if (arg == "--dflash") a.dflash = NextServerArg(argc, argv, i, "--dflash");
     else if (arg == "--dflash-k") a.dflash_k = ServerParseI64("--dflash-k", NextServerArg(argc, argv, i, "--dflash-k"));
     else if (arg == "--dflash-p-min") a.dflash_p_min = ServerParseFloat("--dflash-p-min", NextServerArg(argc, argv, i, "--dflash-p-min"));
@@ -268,6 +275,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   }
   if (a.embed_device_resident != "on" && a.embed_device_resident != "off") {
     throw ServerUsageError("--embed-device-resident must be 'on' or 'off'");
+  }
+  if (a.prompt_checkpoint != "on" && a.prompt_checkpoint != "off") {
+    throw ServerUsageError("--prompt-checkpoint must be 'on' or 'off'");
   }
   if (a.vision != "auto" && a.vision != "on" && a.vision != "off") {
     throw ServerUsageError("--vision must be 'auto', 'on' or 'off'");

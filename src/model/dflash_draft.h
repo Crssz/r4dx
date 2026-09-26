@@ -225,6 +225,14 @@ class DflashDraft {
     valid_from_ = 0;
   }
 
+  // Moves the frontier back to `n` (<= InjectedCount()) -- Model::RestoreCheckpoint, which returns
+  // the target to an earlier position. Positions [n, InjectedCount()) become unreadable exactly as a
+  // Reset() makes every position unreadable, and the next InjectFeatures at `n` is an ordinary
+  // append. The ring slot is `pos % slots_`, so injecting [n, InjectedCount()) overwrote the slots of
+  // positions [n - slots_, InjectedCount() - slots_); what stays valid below `n` is therefore
+  // [max(ValidFrom(), InjectedCount() - slots_), n).
+  void Rewind(int64_t n);
+
   // Encodes `rows` target-feature rows and writes their K/V into every draft layer's ring.
   // features_dev: [rows, FeatureCols()] bf16 DEVICE, contiguous (exactly what
   // `Model::DflashFeatureBuffer()` holds after a RunChunk/VerifyWindow call). Advances

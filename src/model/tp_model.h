@@ -93,6 +93,10 @@ class TpModel final : public TextModel {
   // Host-only (docs/tp.md 2.4): stores the policy on the facade; every forward command applies it
   // on each rank before it runs, and Reset() applies it after recovery. Legal in every state.
   void SetDflashInjectionEnabled(bool enabled) override { dflash_injection_ = enabled; }
+  // One command each on every rank (each rank copies its own shard of the GDN state; no TpComm), with
+  // a forward call's state rules: TpStateError unless kReady, and a failure makes it kNeedsRecovery.
+  void SaveCheckpoint() override;
+  void RestoreCheckpoint() override;
 
   // docs/tp.md 8.3: a solo command on rank 0 (the tower's rank); `out` gets pageable host rows
   // (ImageRows::host, on_host() true) that PrefillMultimodal splices on every rank. A device-work

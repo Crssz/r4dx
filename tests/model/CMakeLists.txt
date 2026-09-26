@@ -13,6 +13,10 @@ set(R4DX_MODEL_TESTS
   test_dflash_draft
   test_dflash_e2e
   test_teacher_forced_logprobs
+  # Model::SaveCheckpoint/RestoreCheckpoint (docs/server.md "Prefix cache"): a restore then a prefill
+  # is bit-identical to never having generated in between -- plain decode, multi-token speculative
+  # rounds, TpModel in emulate mode. Device 1, SKIP 77 without the 4-layer MTP container.
+  test_prompt_checkpoint
   # Tensor-parallel P2a (docs/tp.md 10.1): the sharded Container::Load of both ranks, every layout,
   # read back against the file's bytes. Device 1, SKIP 77 without the 4-layer container.
   test_tp_loader

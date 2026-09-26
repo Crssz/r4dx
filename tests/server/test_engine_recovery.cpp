@@ -25,10 +25,13 @@
 //   4. with a drafter, the per-request injection toggle is called after the fault and before the
 //      Reset(), i.e. while a TP group awaits recovery -- which is why TpModel must keep it host-only
 //      (docs/tp.md 2.4).
+// CheckpointScenario covers --prompt-checkpoint's reuse path the same way (see its own comment).
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -40,6 +43,7 @@
 #include "openai_types.h"
 #include "response_sink.h"
 #include "text_model.h"
+#include "tokenizer.h"
 
 #ifndef R4DX_TOKENIZER_MODEL_DIR
 #define R4DX_TOKENIZER_MODEL_DIR "C:/AI/models/Qwen3.8-27B"
@@ -105,7 +109,30 @@ class FakeTextModel final : public r4dx::model::TextModel {
     dirty_ = false;
     state_ = State::kReady;
     fed_.clear();
+    ckpt_.reset();  // Model::Reset() drops the checkpoint too
   }
+
+  // Model::SaveCheckpoint/RestoreCheckpoint: the "state" is fed_, so a checkpoint is a copy of it and
+  // a restore truncates back to it. Device work: refused in kNeedsRecovery like a forward.
+  int saves = 0;
+  int restores = 0;
+  void SaveCheckpoint() override {
+    RequireReady();
+    ckpt_ = fed_;
+    ++saves;
+  }
+  void RestoreCheckpoint() override {
+    RequireReady();
+    if (!ckpt_) throw std::logic_error("FakeTextModel: no checkpoint since the last Reset()");
+    fed_ = *ckpt_;
+    ++restores;
+  }
+
+  // The next prompt makes the model answer exactly `reply` (the last token is meant to be an EOS):
+  // the state after that request's LAST prefill call -- the engine may split a prompt around its
+  // checkpoint -- answers reply[0], and so on; any other state keeps the hash. Still a pure function
+  // of fed_, so a state that is not exactly the new prompt still changes the text.
+  void ScriptReplyToNextPrompt(std::vector<int32_t> reply) { pending_reply_ = std::move(reply); }
 
   // ---- device work: TpStateError's message in kNeedsRecovery (TP mode) ---------------------------
   void EncodeImages(const float*, int64_t, const std::vector<r4dx::vision::GridThw>&, ImageRows*,
@@ -114,6 +141,10 @@ class FakeTextModel final : public r4dx::model::TextModel {
   }
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids) override {
     Forward(token_ids);
+    if (!pending_reply_.empty()) {  // armed until the first decode step (Decode below)
+      script_prompt_ = fed_;
+      script_reply_ = pending_reply_;
+    }
     return Row();
   }
   std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids,
@@ -121,11 +152,11 @@ class FakeTextModel final : public r4dx::model::TextModel {
     return Prefill(token_ids);
   }
   std::vector<float> DecodeStep(int32_t token_id) override {
-    Forward({token_id});
+    Decode(token_id);
     return Row();
   }
   int32_t DecodeStepGreedy(int32_t token_id) override {
-    Forward({token_id});
+    Decode(token_id);
     return Next();
   }
   int32_t DecodeStepSampled(int32_t, const r4dx::kernels::SampleParams&, std::mt19937_64&) override {
@@ -142,7 +173,7 @@ class FakeTextModel final : public r4dx::model::TextModel {
   std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t, float, int64_t,
                                               int64_t* walk_len_out) override {
     if (!dflash_) throw std::logic_error("FakeTextModel: no drafter");
-    Forward({token_id});
+    Decode(token_id);
     if (walk_len_out != nullptr) *walk_len_out = 0;
     return {Next()};
   }
@@ -156,8 +187,15 @@ class FakeTextModel final : public r4dx::model::TextModel {
   }
 
  private:
-  void Forward(const std::vector<int32_t>& tokens) {
+  void RequireReady() const {
     if (state_ != State::kReady) throw std::runtime_error("tp: group aborted by an earlier error; call Reset() first");
+  }
+  void Decode(int32_t token_id) {
+    pending_reply_.clear();  // the scripted prompt is final once generation starts
+    Forward({token_id});
+  }
+  void Forward(const std::vector<int32_t>& tokens) {
+    RequireReady();
     fed_.insert(fed_.end(), tokens.begin(), tokens.end());
     if (fault_in_ > 0 && --fault_in_ == 0) {
       dirty_ = true;
@@ -168,6 +206,15 @@ class FakeTextModel final : public r4dx::model::TextModel {
   // FNV-1a over everything fed since the last Reset(), mapped into ordinary (non-special, non-EOS)
   // token ids.
   int32_t Next() const {
+    if (!script_reply_.empty() && fed_.size() >= script_prompt_.size() &&
+        std::equal(script_prompt_.begin(), script_prompt_.end(), fed_.begin())) {
+      const size_t i = fed_.size() - script_prompt_.size();
+      if (i < script_reply_.size() &&
+          std::equal(script_reply_.begin(), script_reply_.begin() + static_cast<ptrdiff_t>(i),
+                     fed_.begin() + static_cast<ptrdiff_t>(script_prompt_.size()))) {
+        return script_reply_[i];
+      }
+    }
     uint64_t h = 1469598103934665603ull;
     for (int32_t t : fed_) h = (h ^ static_cast<uint32_t>(t)) * 1099511628211ull;
     return static_cast<int32_t>(1000 + h % 20000);
@@ -186,6 +233,8 @@ class FakeTextModel final : public r4dx::model::TextModel {
   bool dirty_ = false;
   int64_t fault_in_ = 0;
   std::vector<int32_t> fed_;
+  std::optional<std::vector<int32_t>> ckpt_;
+  std::vector<int32_t> pending_reply_, script_prompt_, script_reply_;
 };
 
 struct Harness {
@@ -193,11 +242,14 @@ struct Harness {
   FakeTextModel* fake = nullptr;
 };
 
-Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp) {
+Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool checkpoint = false,
+                   bool thinking = false) {
   Harness e;
   r4dx::server::EngineOptions opts;
   opts.tokenizer_dir = tokenizer_dir;
   opts.model_opts.max_ctx = 4096;
+  opts.model_opts.prompt_checkpoint = checkpoint;  // --prompt-checkpoint
+  opts.default_thinking = thinking;                // --think on
   opts.log_level = "warn";
   if (dflash) {
     // Only the engine's own "is a drafter configured" signal; the fake stands in for it.
@@ -223,14 +275,16 @@ r4dx::server::ChatMessage Msg(const std::string& role, const std::string& conten
 }
 
 std::shared_ptr<r4dx::server::BufferingSink> Run(Harness& e, const std::vector<r4dx::server::ChatMessage>& messages,
-                                                 int64_t max_tokens) {
+                                                 int64_t max_tokens, bool thinking = false) {
   auto req = std::make_shared<r4dx::server::PendingRequest>();
   req->kind = r4dx::server::RequestKind::kChat;
   req->request_id = r4dx::server::GenerateRequestId("chatcmpl-");
   req->messages = messages;
   req->sampling.temperature = 0.0f;
   req->max_tokens = max_tokens;
-  auto sink = std::make_shared<r4dx::server::BufferingSink>();
+  // `thinking`: split the reply into `text` (the answer) and `reasoning_text`, as http_server.cpp
+  // builds the sink for a thinking request.
+  auto sink = std::make_shared<r4dx::server::BufferingSink>(thinking);
   req->sink = sink;
   if (!e.engine->Submit(req)) throw std::runtime_error("queue full");
   sink->Wait();
@@ -302,6 +356,146 @@ void Scenario(const std::string& tokenizer_dir, bool dflash, bool tp) {
   e.engine->Shutdown();
 }
 
+// --prompt-checkpoint (docs/server.md "Prefix cache") through RunRequest itself, on the 2026-09-26
+// smoke failure: turn 1 answers " yes" (leading space) then EOS, the client replays it, the chat
+// template's |trim renders "yes", so turn 2 does not extend the committed sequence.
+//   - without a checkpoint: a full re-prefill (the bug, kept as the reference behaviour);
+//   - with one: exactly one restore, only the tokens after turn 1's prompt are prefilled, and the
+//     text equals a fresh engine's for the same conversation -- the fake's text hashes its whole
+//     state, so a restore to the wrong position, or a stale tail, would change it;
+//   - a fault in the prefill right after a restore: that request answers 500, and the next one
+//     resets rather than restoring (Invalidate() drops the checkpoint with everything else) and
+//     produces a fresh engine's text.
+void CheckpointScenario(const std::string& tokenizer_dir, bool tp) {
+  const char* tag = tp ? "tp2 checkpoint" : "tp1 checkpoint";
+  const int failures_before = g_failures;
+  r4dx::Tokenizer::Options topt;
+  topt.allow_unimplemented_normalizer = true;  // as Engine::LoadAndStart
+  const r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(tokenizer_dir, topt);
+  const std::vector<r4dx::TokenId> space_yes = tok.encode(" yes");
+  const std::vector<r4dx::TokenId> im_end = tok.encode("<|im_end|>", /*parse_special=*/true);
+  const auto& eos = tok.eos_ids();
+  if (space_yes.size() != 1 || im_end.size() != 1 || std::find(eos.begin(), eos.end(), im_end[0]) == eos.end()) {
+    CHECK(false, "[%s] ' yes' and <|im_end|> must be single tokens and <|im_end|> an EOS", tag);
+    return;
+  }
+  const std::string question = "Is there a circle in this image? Reply with exactly one word: yes or no.";
+  const std::vector<r4dx::server::ChatMessage> turn1 = {Msg("user", question)};
+
+  auto fresh_text = [&](const std::vector<r4dx::server::ChatMessage>& messages, int64_t max_tokens) {
+    Harness fresh = MakeEngine(tokenizer_dir, /*dflash=*/false, tp);
+    const auto want = Run(fresh, messages, max_tokens);
+    fresh.engine->Shutdown();
+    return want->errored ? std::string("<errored>") : want->text;
+  };
+
+  for (bool checkpoint : {false, true}) {
+    Harness e = MakeEngine(tokenizer_dir, /*dflash=*/false, tp, checkpoint);
+    e.fake->ScriptReplyToNextPrompt({space_yes[0], im_end[0]});
+    const auto a = Run(e, turn1, 4);
+    CHECK(!a->errored && a->text == " yes", "[%s] turn 1 answered '%s', want ' yes'", tag, a->text.c_str());
+    const std::vector<r4dx::server::ChatMessage> turn2 = {
+        Msg("user", question), Msg("assistant", a->text), Msg("user", "Now tell me what color the background is.")};
+    const auto b = Run(e, turn2, 8);
+    CHECK(!b->errored, "[%s] turn 2 failed: %s", tag, b->error_message.c_str());
+    CHECK(b->prompt_tokens > a->prompt_tokens, "[%s] turn 2 is not longer than turn 1", tag);
+    if (!checkpoint) {
+      CHECK(b->timings.prompt_n == b->prompt_tokens && e.fake->restores == 0,
+            "[%s] off: turn 2 prefilled %lld of %lld tokens, restores %d (want everything, 0)", tag,
+            static_cast<long long>(b->timings.prompt_n), static_cast<long long>(b->prompt_tokens), e.fake->restores);
+      e.engine->Shutdown();
+      continue;
+    }
+    CHECK(e.fake->saves == 2 && e.fake->restores == 1, "[%s] saves %d restores %d, want 2 and 1", tag, e.fake->saves,
+          e.fake->restores);
+    CHECK(b->timings.prompt_n == b->prompt_tokens - a->prompt_tokens,
+          "[%s] turn 2 prefilled %lld tokens, want %lld (everything after turn 1's prompt)", tag,
+          static_cast<long long>(b->timings.prompt_n), static_cast<long long>(b->prompt_tokens - a->prompt_tokens));
+    const std::string want2 = fresh_text(turn2, 8);
+    CHECK(b->text == want2, "[%s] turn 2 text '%s', a fresh engine's '%s'", tag, b->text.c_str(), want2.c_str());
+
+    // Turn 3 extends turn 2's prompt but not its reply (the client edited it), so it restores; the
+    // restored state's first forward faults.
+    std::vector<r4dx::server::ChatMessage> turn3 = turn2;
+    turn3.push_back(Msg("assistant", "An edited answer."));
+    turn3.push_back(Msg("user", "Thanks."));
+    e.fake->ArmFault(1);
+    const auto c = Run(e, turn3, 8);
+    CHECK(c->errored && c->error_status == 500 && e.fake->restores == 2,
+          "[%s] the faulting turn 3: errored=%d status=%d restores=%d (want 500 after a restore)", tag,
+          static_cast<int>(c->errored), c->error_status, e.fake->restores);
+    const auto d = Run(e, turn3, 8);
+    CHECK(!d->errored && e.fake->restores == 2 && e.fake->recoveries == 1 && d->timings.prompt_n == d->prompt_tokens,
+          "[%s] after the fault: errored=%d restores=%d recoveries=%d prefilled %lld of %lld (want a Reset() and a "
+          "full prefill, no restore)",
+          tag, static_cast<int>(d->errored), e.fake->restores, e.fake->recoveries,
+          static_cast<long long>(d->timings.prompt_n), static_cast<long long>(d->prompt_tokens));
+    const std::string want3 = fresh_text(turn3, 8);
+    CHECK(d->text == want3, "[%s] turn 3 text '%s', a fresh engine's '%s'", tag, d->text.c_str(), want3.c_str());
+    e.engine->Shutdown();
+  }
+  if (g_failures == failures_before) {
+    std::printf("[%s] a trimmed ' yes' reply: off -> full re-prefill; on -> one restore, only the new tail "
+                "prefilled, fresh-engine text; a fault after a restore -> reset, not restore\n",
+                tag);
+  }
+}
+
+// --prompt-checkpoint with thinking on (--think on): the prompt ends "<think>\n", and the client
+// replays turn 1's answer WITHOUT its reasoning, which renders "<think>\n\n</think>\n\n<answer>" --
+// "\n\n" is one token, so the replay diverges at the prompt's LAST token. The engine checkpoints one
+// token early (engine.cpp's ckpt_back): turn 2 must restore and prefill everything from there, and
+// match a fresh engine -- also after a regenerate of turn 1 in between, which restores to that
+// checkpoint with only the held-back token left and must keep it.
+void CheckpointThinkingScenario(const std::string& tokenizer_dir, bool tp) {
+  const char* tag = tp ? "tp2 checkpoint+think" : "tp1 checkpoint+think";
+  const int failures_before = g_failures;
+  r4dx::Tokenizer::Options topt;
+  topt.allow_unimplemented_normalizer = true;
+  const r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(tokenizer_dir, topt);
+  std::vector<r4dx::TokenId> reply = tok.encode("Okay.\n</think>\n\nYes.", /*parse_special=*/true);
+  const std::vector<r4dx::TokenId> im_end = tok.encode("<|im_end|>", /*parse_special=*/true);
+  reply.push_back(im_end.at(0));
+  const std::vector<r4dx::server::ChatMessage> turn1 = {Msg("user", "Is 7 a prime number?")};
+
+  Harness e = MakeEngine(tokenizer_dir, /*dflash=*/false, tp, /*checkpoint=*/true, /*thinking=*/true);
+  e.fake->ScriptReplyToNextPrompt(std::vector<int32_t>(reply.begin(), reply.end()));
+  const auto a = Run(e, turn1, 16, /*thinking=*/true);
+  CHECK(!a->errored && a->text == "Yes." && a->reasoning_text == "Okay.",
+        "[%s] turn 1: answer '%s' reasoning '%s', want 'Yes.' / 'Okay.'", tag, a->text.c_str(), a->reasoning_text.c_str());
+  // A regenerate (the same turn 1 again): it restores the checkpoint and feeds only the held-back "\n",
+  // and must KEEP that checkpoint rather than save a new one at the prompt's end -- or the next turn,
+  // below, could no longer reuse it.
+  const auto regen = Run(e, turn1, 16, /*thinking=*/true);
+  CHECK(!regen->errored && regen->text == a->text && e.fake->restores == 1 && e.fake->saves == 1 &&
+            regen->timings.prompt_n == 1,
+        "[%s] regenerate: errored=%d text '%s' restores=%d saves=%d prompt_n=%lld (want a's text, 1, 1, 1)", tag,
+        static_cast<int>(regen->errored), regen->text.c_str(), e.fake->restores, e.fake->saves,
+        static_cast<long long>(regen->timings.prompt_n));
+  // The client drops the reasoning, as most OpenAI clients do.
+  const std::vector<r4dx::server::ChatMessage> turn2 = {Msg("user", "Is 7 a prime number?"), Msg("assistant", a->text),
+                                                         Msg("user", "And 9?")};
+  const auto b = Run(e, turn2, 8, /*thinking=*/true);
+  CHECK(!b->errored && e.fake->restores == 2, "[%s] turn 2: errored=%d restores=%d (want a second restore)", tag,
+        static_cast<int>(b->errored), e.fake->restores);
+  CHECK(b->timings.prompt_n == b->prompt_tokens - (a->prompt_tokens - 1),
+        "[%s] turn 2 prefilled %lld tokens, want %lld (everything from one token before turn 1's prompt end)", tag,
+        static_cast<long long>(b->timings.prompt_n), static_cast<long long>(b->prompt_tokens - (a->prompt_tokens - 1)));
+  {
+    Harness fresh = MakeEngine(tokenizer_dir, /*dflash=*/false, tp, /*checkpoint=*/false, /*thinking=*/true);
+    const auto want = Run(fresh, turn2, 8, /*thinking=*/true);
+    CHECK(!want->errored && b->text == want->text && b->reasoning_text == want->reasoning_text,
+          "[%s] turn 2 differs from a fresh engine's ('%s' vs '%s')", tag, b->text.c_str(), want->text.c_str());
+    fresh.engine->Shutdown();
+  }
+  e.engine->Shutdown();
+  if (g_failures == failures_before) {
+    std::printf("[%s] a regenerate keeps the checkpoint; reasoning dropped from the replay: a restore from one "
+                "token before turn 1's prompt end, fresh-engine text\n",
+                tag);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -315,6 +509,8 @@ int main() {
     for (bool tp : {true, false}) {
       Scenario(tokenizer_dir, /*dflash=*/false, tp);
       Scenario(tokenizer_dir, /*dflash=*/true, tp);
+      CheckpointScenario(tokenizer_dir, tp);
+      CheckpointThinkingScenario(tokenizer_dir, tp);
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "unexpected exception: %s\n", e.what());

@@ -1,6 +1,7 @@
 // tests/server/test_prefix_state.cpp -- pure CPU unit test for src/server/prefix_state.h's
-// PrefixState, the prefix-reuse/invalidate-on-failure bookkeeping Engine::RunRequest drives
-// (docs/server.md "Prefix reuse", docs/mtp.md's "mid-round" gap). Engine itself is HIP-dependent
+// PrefixState, the prefix-reuse/invalidate-on-failure/prompt-checkpoint bookkeeping
+// Engine::RunRequest drives (docs/server.md "Prefix reuse" and "Prefix cache", docs/mtp.md's
+// "mid-round" gap). Engine itself is HIP-dependent
 // (owns r4dx::model::Model) and cannot be unit-tested on CPU alone (engine.h's own file comment),
 // so this is the CPU-testable half of that bookkeeping's contract -- exercised end to end against
 // a real Model by tools/server/smoke.ps1 instead.
@@ -205,6 +206,163 @@ void TestImageAwarePrefixReuse() {
   }
 }
 
+// ---- prompt checkpoint (prefix_state.h's PROMPT CHECKPOINT, docs/server.md "Prefix cache") ------
+// Symbolic ids for the 2026-09-26 failure: turn 1's prompt ends with the generation prompt's
+// "</think>\n\n"; the model answers " yes" (leading space) then EOS; the client replays it and the
+// chat template's `|trim` renders "yes" -- a different token.
+constexpr int32_t kSpaceYes = 1000;  // " yes", what was generated and committed
+constexpr int32_t kYes = 2000;       // "yes", what the re-render contains
+constexpr int32_t kImEnd = 3000;
+const std::vector<int32_t> kTurn1 = {1, 2, 3, 4};                               // ...assistant\n<think>\n\n</think>\n\n
+const std::vector<int32_t> kTurn2 = {1, 2, 3, 4, kYes, kImEnd, 50, 51, 52, 53};  // + "yes<|im_end|>\n<|im_start|>user..."
+
+void TestCheckpointRecoversTrimmedReply() {
+  // Without a checkpoint this is the bug: fed() = turn 1 + " yes", which turn 2 does not extend, so
+  // the only option is a full re-prefill.
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes});
+    CHECK(!p.Extend(kTurn2).has_value());
+    CHECK(!p.Plan(kTurn2).has_value());
+    CHECK(!p.has_checkpoint());
+  }
+  // With one, turn 2 restores the state after turn 1's prompt and feeds only what follows it --
+  // the re-rendered reply included, which is what makes the result exact.
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes}, {}, /*checkpoint_len=*/kTurn1.size());
+    CHECK(p.has_checkpoint() && p.checkpoint() == kTurn1);
+    CHECK(!p.Extend(kTurn2).has_value());  // Extend() is fed()-only, unchanged
+    auto plan = p.Plan(kTurn2);
+    CHECK(plan.has_value());
+    CHECK(plan->from_checkpoint);
+    CHECK(plan->tail == std::vector<int32_t>(kTurn2.begin() + 4, kTurn2.end()));
+  }
+}
+
+// A reply that DOES re-tokenize keeps the longer reuse: fed() wins over the checkpoint.
+void TestCheckpointPrefersFullSequence() {
+  PrefixState p;
+  p.Commit(kTurn1, {kYes}, {}, /*checkpoint_len=*/kTurn1.size());
+  auto plan = p.Plan(kTurn2);
+  CHECK(plan.has_value());
+  CHECK(!plan->from_checkpoint);
+  CHECK(plan->tail == std::vector<int32_t>(kTurn2.begin() + 5, kTurn2.end()));
+  // An empty reply (EOS first, nothing committed): fed() == the checkpoint, the same tail either way.
+  PrefixState q;
+  q.Commit(kTurn1, {}, {}, /*checkpoint_len=*/kTurn1.size());
+  plan = q.Plan(kTurn2);
+  CHECK(plan.has_value() && !plan->from_checkpoint && plan->tail.size() == kTurn2.size() - 4);
+}
+
+// The checkpoint is exact too: anything that does not strictly extend the checkpointed prompt resets.
+void TestCheckpointNeverReusesADifferentPrompt() {
+  PrefixState p;
+  p.Commit(kTurn1, {kSpaceYes}, {}, /*checkpoint_len=*/kTurn1.size());
+  CHECK(!p.Plan({1, 2, 9, 4, kYes, kImEnd}).has_value());  // diverges inside the prompt
+  CHECK(!p.Plan(kTurn1).has_value());                       // byte-identical: nothing left to feed
+  CHECK(!p.Plan({1, 2, 3}).has_value());                    // shorter
+  CHECK(!p.Plan({7, 8}).has_value());                       // another conversation
+}
+
+// Vision: the image-key rules hold for the checkpoint exactly as for fed() -- the case the task
+// names: a different picture at the same position must NOT reuse, even though every placeholder is
+// the same token id and the reply mismatch sends the decision to the checkpoint.
+void TestCheckpointImageRules() {
+  using r4dx::server::ImageKey;
+  const ImageKey a{/*content_hash=*/0xAAAA, 1, 28, 28, /*token_offset=*/1};
+  ImageKey b = a;
+  b.content_hash = 0xBBBB;
+  const std::vector<int32_t> turn1 = {1, 248056, 248056, 9, 4};
+  const std::vector<int32_t> turn2 = {1, 248056, 248056, 9, 4, kYes, kImEnd, 50, 51};
+  PrefixState p;
+  p.Commit(turn1, {kSpaceYes}, {a}, /*checkpoint_len=*/turn1.size());
+
+  auto same = p.Plan(turn2, {a});
+  CHECK(same.has_value() && same->from_checkpoint);
+  CHECK(same.has_value() && same->tail == std::vector<int32_t>({kYes, kImEnd, 50, 51}));
+  CHECK(!p.Plan(turn2, {b}).has_value());  // different image, same tokens
+  CHECK(!p.Plan(turn2, {}).has_value());   // image dropped from the replay
+  // A new image in the new tail (past the checkpoint) is fine; one claiming an offset inside the
+  // checkpointed prompt is bookkeeping disagreement.
+  ImageKey c{0xCCCC, 1, 26, 38, /*token_offset=*/7};
+  CHECK(p.Plan(turn2, {a, c}).has_value());
+  c.token_offset = 3;
+  CHECK(!p.Plan(turn2, {a, c}).has_value());
+}
+
+// Thinking on: the prompt ends "<think>" "\n", and a client that drops the reasoning replays
+// "<think>" "\n\n" "</think>" "\n\n" ... -- "\n\n" is one token, so the replay diverges AT the prompt's
+// last token. engine.cpp therefore checkpoints one token early; the record is that shorter prefix.
+void TestCheckpointBeforeThePromptEnd() {
+  constexpr int32_t kThink = 500, kNl = 198, kNlNl = 271, kThinkEnd = 501;
+  const std::vector<int32_t> turn1 = {1, 2, kThink, kNl};
+  const std::vector<int32_t> turn2 = {1, 2, kThink, kNlNl, kThinkEnd, kNlNl, kYes, kImEnd, 50, 51};
+  {
+    PrefixState p;  // checkpoint at the prompt's end: never a prefix of the replay
+    p.Commit(turn1, {77, 78}, {}, turn1.size());
+    CHECK(!p.Plan(turn2).has_value());
+  }
+  PrefixState p;
+  p.Commit(turn1, {77, 78}, {}, turn1.size() - 1);
+  CHECK(p.checkpoint() == std::vector<int32_t>({1, 2, kThink}));
+  auto plan = p.Plan(turn2);
+  CHECK(plan.has_value() && plan->from_checkpoint);
+  CHECK(plan.has_value() && plan->tail == std::vector<int32_t>(turn2.begin() + 3, turn2.end()));
+  // fed() still covers the whole committed sequence, and wins when the replay does reproduce it.
+  std::vector<int32_t> full = turn1;
+  full.insert(full.end(), {77, 78, 60});
+  plan = p.Plan(full);
+  CHECK(plan.has_value() && !plan->from_checkpoint && plan->tail == std::vector<int32_t>({60}));
+  // A length past the prompt, or zero, is not a checkpoint.
+  p.Commit(turn1, {}, {}, turn1.size() + 1);
+  CHECK(!p.has_checkpoint());
+  p.Commit(turn1, {}, {}, 0);
+  CHECK(!p.has_checkpoint());
+}
+
+// Lifetime: each Commit() replaces the checkpoint (or drops it), and Clear()/Invalidate() drop it --
+// they pair with Model::Reset(), which drops the model's copy.
+void TestCheckpointLifetime() {
+  // Turn 3 extends turn 2's prompt, not turn 1's: the checkpoint moved.
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes}, {}, kTurn1.size());
+    p.Commit(kTurn2, {kSpaceYes}, {}, kTurn2.size());
+    std::vector<int32_t> turn3 = kTurn2;
+    turn3.insert(turn3.end(), {kYes, kImEnd, 60});
+    auto plan = p.Plan(turn3);
+    CHECK(plan.has_value() && plan->from_checkpoint && plan->tail.size() == 3);
+    CHECK(p.checkpoint() == kTurn2);
+  }
+  // A request that did not checkpoint drops the old one (the model's copy no longer matches).
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes}, {}, kTurn1.size());
+    p.Commit(kTurn1, {kSpaceYes}, {}, std::nullopt);
+    CHECK(!p.has_checkpoint() && !p.Plan(kTurn2).has_value());
+  }
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes}, {}, kTurn1.size());
+    p.Clear();
+    CHECK(!p.has_checkpoint() && p.checkpoint().empty());
+    CHECK(p.Plan(kTurn2).has_value() && !p.Plan(kTurn2)->from_checkpoint);  // empty fed(): whole prompt
+  }
+  // After a failed request nothing is reused, the checkpoint included, until the next Commit().
+  {
+    PrefixState p;
+    p.Commit(kTurn1, {kSpaceYes}, {}, kTurn1.size());
+    p.Invalidate();
+    CHECK(!p.has_checkpoint());
+    CHECK(!p.Plan(kTurn2).has_value());
+    p.Clear();
+    CHECK(!p.Plan(kTurn2).has_value());
+    p.Commit(kTurn2, {}, {}, kTurn2.size());
+    CHECK(p.Plan({1, 2, 3, 4, kYes, kImEnd, 50, 51, 52, 53, 70}).has_value());
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +376,12 @@ int main() {
   TestInvalidateForcesResetUntilCommit();
   TestCommitTracksCommittedNotDisplayedTokens();
   TestImageAwarePrefixReuse();
+  TestCheckpointRecoversTrimmedReply();
+  TestCheckpointPrefersFullSequence();
+  TestCheckpointNeverReusesADifferentPrompt();
+  TestCheckpointImageRules();
+  TestCheckpointBeforeThePromptEnd();
+  TestCheckpointLifetime();
 
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) FAILED\n", g_failures);

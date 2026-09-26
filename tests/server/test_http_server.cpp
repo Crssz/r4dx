@@ -108,6 +108,9 @@ class ScriptedTextModel final : public r4dx::model::TextModel {
   std::vector<VramReport> Vram() const override { return {}; }
   void SetDflashInjectionEnabled(bool) override {}
   void Reset() override { pos_ = 0; }
+  // LiveServer leaves ModelOptions::prompt_checkpoint off, so the engine never calls these.
+  void SaveCheckpoint() override { throw std::logic_error("ScriptedTextModel: no checkpoint"); }
+  void RestoreCheckpoint() override { throw std::logic_error("ScriptedTextModel: no checkpoint"); }
 
   void EncodeImages(const float*, int64_t, const std::vector<r4dx::vision::GridThw>&, ImageRows*,
                     r4dx::vision::VisionEncodeStats*) override {

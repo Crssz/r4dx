@@ -50,6 +50,7 @@ class GdnStateManager {
         V_(V),
         K_(K),
         conv_dim_(conv_dim),
+        conv_width_(conv_width),
         state_len_max_(conv_width - 2 + max_decode_window),
         max_decode_window_(max_decode_window < 1 ? 1 : max_decode_window),
         recurrent_(static_cast<size_t>((max_seqs * max_decode_window_ + 1) * H * V * K)),
@@ -78,10 +79,64 @@ class GdnStateManager {
     conv_.ZeroAsync(stream);
   }
 
+  // After a speculative verify call that committed n > 1 of its candidates, sequence `seq_id`'s live
+  // state is in window slot n-1 and its conv history at offset n-1 of the rolling buffer (the next
+  // decode/verify call is pointed there through num_accepted). A chunked-scan PREFILL reads neither:
+  // it seeds from window 0 and from the history at offset 0 (gdn_layer.cpp's is_prefill branch,
+  // r4d_gdn_conv_prep's cache read). Moves the live state there -- where a plain decode step leaves
+  // it. Enqueued on `stream`. n == 1 is already in place.
+  void CollapseWindow(int32_t seq_id, int64_t n, core::Stream& stream) {
+    if (n <= 1) return;
+    if (n > max_decode_window_) throw std::logic_error("GdnStateManager::CollapseWindow: n exceeds the window");
+    R4DX_HIP_CHECK(hipMemcpyAsync(RecurrentSlotPtr(SlotForSeq(seq_id)),
+                                  RecurrentSlotPtr(WindowSlot(seq_id, static_cast<int32_t>(n - 1))),
+                                  static_cast<size_t>(RecurrentSlotStride()) * sizeof(float),
+                                  hipMemcpyDeviceToDevice, stream.get()));
+    // The conv line is [conv_dim][state_len_max] with each channel's history contiguous; the history a
+    // step reads is conv_width-1 entries. One strided column per entry, in ascending order: column j
+    // reads entry n-1+j, which only a LATER column (j' = n-1+j > j) overwrites.
+    uint16_t* line = ConvSeqPtr(seq_id);
+    const size_t pitch = static_cast<size_t>(state_len_max_) * sizeof(uint16_t);
+    for (int64_t j = 0; j < conv_width_ - 1; ++j) {
+      R4DX_HIP_CHECK(hipMemcpy2DAsync(line + j, pitch, line + (n - 1) + j, pitch, sizeof(uint16_t),
+                                      static_cast<size_t>(conv_dim_), hipMemcpyDeviceToDevice, stream.get()));
+    }
+  }
+
+  // ---- prompt checkpoint (Model::SaveCheckpoint, docs/server.md "Prefix cache") ------------------
+  // One spare copy of a sequence's window-0 recurrent slot and its conv state: the per-sequence state
+  // that moving the position back cannot rewind (the next call READS it, where the KV caches are
+  // overwritten before they are read). Allocated only when a Model is loaded to checkpoint.
+  void AllocateCheckpoint() {
+    ckpt_recurrent_ = core::DeviceBuffer<float>(static_cast<size_t>(RecurrentSlotStride()));
+    ckpt_conv_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(ConvSeqStride()));
+  }
+  size_t CheckpointBytes() const { return ckpt_recurrent_.bytes() + ckpt_conv_.bytes(); }
+  // Both enqueue on `stream` and do not synchronize. The copy is of window 0 and of the conv cache
+  // line the layer addresses with cache_idx == SlotForSeq(seq_id) (gdn_layer.cpp): the live state
+  // only while no speculative round has moved it to another window slot / history offset since the
+  // last prefill, which is Model::SaveCheckpoint's precondition.
+  void SaveCheckpoint(int32_t seq_id, core::Stream& stream) {
+    CopyAsync(ckpt_recurrent_.data(), RecurrentSlotPtr(SlotForSeq(seq_id)), ckpt_recurrent_.bytes(), stream);
+    CopyAsync(ckpt_conv_.data(), ConvSeqPtr(seq_id), ckpt_conv_.bytes(), stream);
+  }
+  void RestoreCheckpoint(int32_t seq_id, core::Stream& stream) {
+    CopyAsync(RecurrentSlotPtr(SlotForSeq(seq_id)), ckpt_recurrent_.data(), ckpt_recurrent_.bytes(), stream);
+    CopyAsync(ConvSeqPtr(seq_id), ckpt_conv_.data(), ckpt_conv_.bytes(), stream);
+  }
+
  private:
-  int64_t H_, V_, K_, conv_dim_, state_len_max_, max_decode_window_;
+  uint16_t* ConvSeqPtr(int32_t seq_id) { return conv_.data() + static_cast<int64_t>(SlotForSeq(seq_id)) * ConvSeqStride(); }
+  static void CopyAsync(void* dst, const void* src, size_t bytes, core::Stream& stream) {
+    if (bytes == 0) throw std::logic_error("GdnStateManager: checkpoint storage was never allocated");
+    R4DX_HIP_CHECK(hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, stream.get()));
+  }
+
+  int64_t H_, V_, K_, conv_dim_, conv_width_, state_len_max_, max_decode_window_;
   core::DeviceBuffer<float> recurrent_;
   core::DeviceBuffer<uint16_t> conv_;
+  core::DeviceBuffer<float> ckpt_recurrent_;  // [H*V*K], empty unless AllocateCheckpoint()
+  core::DeviceBuffer<uint16_t> ckpt_conv_;    // [conv_dim * state_len_max]
 };
 
 // r4dx::model::GdnControlCache -- caches the tiny per-call control arrays every GdnLayer::Forward

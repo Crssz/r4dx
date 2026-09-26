@@ -1,4 +1,4 @@
-﻿#include "model.h"
+#include "model.h"
 
 #include <algorithm>
 #include <array>
@@ -371,6 +371,21 @@ Model Model::Load(const ModelOptions& opts) {
     m.mtp_.emplace(cfg, m.container_.Mtp(), opts.mtp_draft_k, opts.max_ctx, logits_rows, m.comm_);
     m.mtp_seed_hidden_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(hidden));
   }
+  // Prompt checkpoint (model.h's SaveCheckpoint): allocated next to the state it copies, so it is
+  // part of the kv+gdn_state figure below; its own line follows that one.
+  int64_t ckpt_bytes = 0;
+  if (opts.prompt_checkpoint) {
+    m.prompt_checkpoint_ = true;
+    for (auto& gs : m.gdn_states_) {
+      if (!gs) continue;
+      gs->AllocateCheckpoint();
+      ckpt_bytes += static_cast<int64_t>(gs->CheckpointBytes());
+    }
+    if (m.mtp_) {
+      m.ckpt_mtp_seed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(hidden));
+      ckpt_bytes += static_cast<int64_t>(m.ckpt_mtp_seed_.bytes());
+    }
+  }
   // Verify scratch + the GDN acceptance-count thread are shared by BOTH speculation families, so
   // they are sized off draft_window_ rather than off mtp_draft_k alone -- a DFlash2-only Model
   // (mtp_draft_k==0, dflash_draft_k>0) has no mtp.* weights anywhere but still verifies through
@@ -517,6 +532,11 @@ Model Model::Load(const ModelOptions& opts) {
                 << " GiB (weights+kv_ring+draft_scratch; already included in kv+gdn_state above)\n";
     }
   }
+  if (m.prompt_checkpoint_) {
+    // The summed buffer sizes, like the vision line above.
+    std::cerr << "[r4dx::model::Model] prompt checkpoint VRAM: " << GiB(ckpt_bytes)
+              << " GiB (already included in kv+gdn_state above)\n";
+  }
 
   return m;
 }
@@ -592,6 +612,7 @@ void Model::Reset() {
   // the identical self-correcting-via-position-overwrite reason kv_caches_ doesn't (see above).
   mtp_seed_valid_ = false;
   mtp_num_accepted_valid_ = false;
+  mtp_last_committed_ = 1;
   mtp_last_hidden_ = nullptr;
 
   // DFlash2 target feature capture (review finding, 2026-09-20): dflash_features_dev_'s bytes are
@@ -609,6 +630,69 @@ void Model::Reset() {
   if (dflash_.has_value()) {
     dflash_->Reset();
     dflash_->SetRopeDelta(0);  // back in step with mrope_delta_ above
+  }
+
+  // A checkpoint describes the conversation just dropped. Its buffers are left alone.
+  ckpt_pos_ = -1;
+  at_prefill_end_ = false;
+}
+
+void Model::SaveCheckpoint() {
+  if (!prompt_checkpoint_) {
+    throw std::runtime_error("Model::SaveCheckpoint: this Model was loaded without ModelOptions::prompt_checkpoint");
+  }
+  if (!started_) throw std::runtime_error("Model::SaveCheckpoint: nothing has been fed yet");
+  // A decode step or verify window since the last prefill may have left the live GDN state in a
+  // window slot / conv history offset other than the window 0 / offset 0 copied below.
+  if (!at_prefill_end_) {
+    throw std::runtime_error("Model::SaveCheckpoint: a decode step or verify window has run since the last "
+                             "prefill; checkpoint right after Prefill/PrefillMultimodal");
+  }
+  for (auto& gs : gdn_states_) {
+    if (gs) gs->SaveCheckpoint(0, stream_);
+  }
+  if (mtp_) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(ckpt_mtp_seed_.data(), mtp_seed_hidden_.data(), ckpt_mtp_seed_.bytes(),
+                                  hipMemcpyDeviceToDevice, stream_.get()));
+  }
+  stream_.Synchronize();  // every public call returns with the device idle (RunChunk's invariant)
+  ckpt_pos_ = pos_;
+  ckpt_mrope_active_ = mrope_active_;
+  ckpt_mrope_delta_ = mrope_delta_;
+  ckpt_mtp_seed_valid_ = mtp_seed_valid_;
+}
+
+void Model::RestoreCheckpoint() {
+  if (!prompt_checkpoint_) {
+    throw std::runtime_error("Model::RestoreCheckpoint: this Model was loaded without ModelOptions::prompt_checkpoint");
+  }
+  if (ckpt_pos_ < 0) throw std::runtime_error("Model::RestoreCheckpoint: no checkpoint since Load()/Reset()");
+  for (auto& gs : gdn_states_) {
+    if (gs) gs->RestoreCheckpoint(0, stream_);
+  }
+  if (mtp_) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(mtp_seed_hidden_.data(), ckpt_mtp_seed_.data(), ckpt_mtp_seed_.bytes(),
+                                  hipMemcpyDeviceToDevice, stream_.get()));
+  }
+  stream_.Synchronize();
+  pos_ = ckpt_pos_;
+  started_ = true;
+  at_prefill_end_ = true;  // the restored state IS a post-prefill state
+  arena_.Reset();  // as Reset(): drops a dead call's scratch if the previous call threw
+  // mrope: the delta is fixed by the prompt (decode never moves it); no block is mid-feed between calls.
+  mrope_active_ = ckpt_mrope_active_;
+  mrope_delta_ = ckpt_mrope_delta_;
+  // MTP: the seed row is the checkpointed prompt's last hidden state again; the window-slot thread
+  // restarts from window 0, exactly as after the prefill that produced the checkpoint.
+  mtp_seed_valid_ = ckpt_mtp_seed_valid_;
+  mtp_num_accepted_valid_ = false;
+  mtp_last_hidden_ = nullptr;
+  dflash_feature_rows_ = 0;
+  if (dflash_.has_value()) {
+    // A drafter whose injection lagged (toggled off) is already at or behind pos_: the next RunChunk
+    // turns that into a cold-ring gap as usual.
+    if (dflash_->InjectedCount() > pos_) dflash_->Rewind(pos_);
+    dflash_->SetRopeDelta(mrope_delta_);
   }
 }
 
@@ -680,6 +764,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     throw std::runtime_error("Model::RunChunk: token_ids.size() must be in [1, " +
                               std::to_string(max_chunk_) + "]");
   }
+  if (!is_prefill_path) at_prefill_end_ = false;  // SaveCheckpoint's precondition (model.h)
   // Tensor parallel, H1 (docs/tp.md 6.2): every rank must be about to run the same chunk in the
   // same mode at the same position, and the group must be healthy, before this chunk's all-reduces
   // are enqueued. The device is idle here (the previous call ended synchronized).
@@ -1020,6 +1105,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     const int32_t one = 1;
     mtp_num_accepted_dev_.CopyFromHost(&one, 1);
     mtp_num_accepted_valid_ = true;
+    mtp_last_committed_ = 1;
   }
 
   // DFlash2 per-chunk capture drain (model.h's SetDflashCaptureObserver): invoked once per
@@ -1176,7 +1262,8 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
 
   if (rope_rows_out != nullptr) *rope_rows_out = mrope_block_;
 
-  mtp_num_accepted_valid_ = false;  // same reasoning as Prefill()'s own reset
+  CollapseSpeculativeWindow();  // same reasoning as Prefill()'s own call
+  at_prefill_end_ = false;      // until the last chunk has landed (set again at the end)
   std::vector<float> logits;
   for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
     const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
@@ -1195,18 +1282,21 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
   // The drafter ropes its own blocks on the temporal axis at `sequence index + delta`
   // (docs/dflash2.md "RoPE" -- sections [64,0,0,0]); its ring slots stay in sequence space.
   if (dflash_.has_value()) dflash_->SetRopeDelta(mrope_delta_);
+  at_prefill_end_ = true;
   return logits;
 }
 
 std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
                                     const std::function<void()>& on_chunk_captured) {
   if (token_ids.empty()) throw std::runtime_error("Model::Prefill: token_ids is empty");
-  // Prefill's chunked-scan GDN path always lands its result at window index 0 (GdnLayerParams::slot
-  // == GdnStateManager::SlotForSeq, never a windowed verify slot -- see that class's file comment),
-  // exactly what a nullptr-seeded MTP verify call reads. Any num_accepted carried from a PRIOR
-  // generation (e.g. --chat's previous turn) refers to THAT turn's now-stale window slots, not this
-  // fresh prefill's -- drop it so the first verify round after this call seeds correctly.
-  mtp_num_accepted_valid_ = false;
+  // Prefill's chunked-scan GDN path always reads and lands its result at window index 0
+  // (GdnLayerParams::slot == GdnStateManager::SlotForSeq, never a windowed verify slot -- see that
+  // class's file comment), exactly what a nullptr-seeded MTP verify call reads. A PRIOR generation's
+  // last verify round (e.g. --chat's or the server's previous turn) may have left the live state in
+  // another window slot: move it to window 0 first, then drop the num_accepted thread so the first
+  // verify round after this call seeds correctly.
+  CollapseSpeculativeWindow();
+  at_prefill_end_ = false;  // until the last chunk has landed
   std::vector<float> logits;
   for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
     const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
@@ -1222,7 +1312,19 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
     if (on_chunk_captured) on_chunk_captured();
     if (is_last_chunk) logits = std::move(chunk_logits);
   }
+  at_prefill_end_ = true;
   return logits;
+}
+
+void Model::CollapseSpeculativeWindow() {
+  if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
+    // Enqueued on stream_, so ordered before the prefill's own kernels; no other buffer is touched.
+    for (auto& gs : gdn_states_) {
+      if (gs) gs->CollapseWindow(0, mtp_last_committed_, stream_);
+    }
+  }
+  mtp_num_accepted_valid_ = false;
+  mtp_last_committed_ = 1;
 }
 
 std::vector<float> Model::DecodeStep(int32_t token_id) {
@@ -1743,6 +1845,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     throw std::runtime_error("Model::VerifyWindow: candidates.size() must be in [1, " +
                               std::to_string(draft_window_) + "] (DraftWindow())");
   }
+  // Every candidate writes its own GDN window slot, window 0 included, whether or not it is later
+  // committed: no longer a post-prefill state (SaveCheckpoint's precondition, model.h).
+  at_prefill_end_ = false;
   // Tensor parallel, H2 (docs/tp.md 6.2): every rank must be about to verify the same window in the
   // same mode at the same position, and the group must be healthy, before this window's all-reduces
   // are enqueued. The device is idle here (the previous call ended synchronized).
@@ -2042,6 +2147,7 @@ void Model::CommitVerifiedWindow(int64_t num_committed) {
   const int32_t n = static_cast<int32_t>(num_committed);
   mtp_num_accepted_dev_.CopyFromHost(&n, 1);
   mtp_num_accepted_valid_ = true;
+  mtp_last_committed_ = num_committed;
   pos_ += num_committed;
   started_ = true;
 }

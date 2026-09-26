@@ -847,6 +847,7 @@ point's measured bpw equals its target plus 0.0045 for suh/svh. Results are in
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
 | trellis K3.5m | 3.5045 | 9.93 | 0.01611 | 94.18% | 0.1165 | 0.0136 | 0.0174 | 0.0145 | 0.0190 |
 | **trellis K4m** | 4.0045 | 11.34 | **0.00813** | 95.94% | 0.0544 | 0.0066 | 0.0082 | 0.0077 | 0.0100 |
+| trellis mix4.25m | 4.2545 | 12.05 | 0.00688 | 96.53% | | 0.0055 | 0.0076 | 0.0064 | 0.0081 |
 | **trellis mix4.5m** | 4.5045 | 12.76 | **0.00547** | 96.90% | 0.0387 | 0.0044 | 0.0063 | 0.0050 | 0.0063 |
 | UD-Q4_K_XL (GGUF, weights only) | ~5.05 all text weights | 15.35 decode | 0.00706 | 96.38% | | 0.0058 | 0.0082 | 0.0054 | 0.0089 |
 | q2ab_hv2_q3 (runtime, today's best) | ~4.5 | 13.68 decode | 0.01555 | 93.65% | | | | | |
@@ -856,6 +857,8 @@ per-linear table in (b) predicts they sit slightly above matched, mostly through
 
 **A0 passes.** K4m is at the ~0.008 gate, and mix4.5m is at 0.68 of it. Each half bit roughly
 halves the KL (0.0161 → 0.0081 → 0.0055), and the ratio holds in every segment, Thai included.
+mix4.25m (EXL3's allocator puts K = 5 on layers 0-7 and 56-63: 100 of the 400 linears) sits
+between them at 0.00688, already below UD-Q4_K_XL.
 
 Two cautions when comparing:
 

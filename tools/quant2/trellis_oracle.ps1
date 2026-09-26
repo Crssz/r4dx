@@ -7,8 +7,9 @@
 #   .\tools\quant2\trellis_oracle.ps1                       # the default plan below
 #   .\tools\quant2\trellis_oracle.ps1 -Points K4m,mix4.5m   # a subset
 #
-# A point is K<rate>[m] (a uniform rate; the m suffix = --hessian-basis matched) or mix4.5[m]
-# (EXL3's 4/5 allocation over K4[m] + K5[m], a manifest only). A mix quantizes its sources first.
+# A point is K<rate>[m] (a uniform rate; the m suffix = --hessian-basis matched) or mix<bpw>[m]
+# (EXL3's 4/5 allocation at that bpw over K4[m] + K5[m], e.g. mix4.5m or mix4.25m; a manifest only).
+# A mix quantizes its sources first.
 param(
   [string[]]$Points = @('K4m', 'mix4.5m', 'K3.5m', 'K4'),
   [string]$QDir = 'D:\models\r4dx\trellis-q',
@@ -69,11 +70,11 @@ foreach ($p in $Points) {
   $klPath = Join-Path $out 'kl_canon.json'
   if (Test-Path $klPath) { Write-Host "[trellis] $p already measured"; continue }
   $src = Join-Path $QDir $p
-  if ($p -match '^mix4\.5(m?)$') {
-    $sfx = $Matches[1]
+  if ($p -match '^mix([0-9.]+)(m?)$') {
+    $bpw = $Matches[1]; $sfx = $Matches[2]
     Quantize "K4$sfx"; Quantize "K5$sfx"
     if (-not (Complete $src)) {
-      Run "mix_$p" { & $Python tools\reference\trellis_quant.py mix --bpw 4.5 --src (Join-Path $QDir "K4$sfx") --src (Join-Path $QDir "K5$sfx") --out-dir $src }
+      Run "mix_$p" { & $Python tools\reference\trellis_quant.py mix --bpw $bpw --src (Join-Path $QDir "K4$sfx") --src (Join-Path $QDir "K5$sfx") --out-dir $src }
     }
   } else {
     Quantize $p

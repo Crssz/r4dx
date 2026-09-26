@@ -832,6 +832,42 @@ cuda --tiles 256` identical states and costs at K = 3, 3.5, 4, 4.5, 5, 6):
   tiles/s, so a full rate is about 1.3-1.5 h on device 1 in either basis. `quantize-model` refuses
   to start if the HIP encoder differs from the CPU one in a single state.
 
+### 14.1 Full-model results (the A0 gate)
+
+Run on 2026-09-26 with `tools/quant2/trellis_oracle.ps1` on device 1, code be15724. Each rate
+quantizes all 400 decoder linears; the K=4 run took 73 min at about 28,000 tiles/s, and 4.5 is
+`mix` over K4m and K5m. Scoring used the same weights-only
+reference forward (`full_logits_golden.py --weights-override`) with the same tokens
+(`tokens_canon.json`, 4 segments, canonical Thai) and the same bf16 reference
+(`D:\models\r4dx\kl-canon\ref`) as the UD-Q4_K_XL row. Every run checked 400/400 tensors, and each
+point's measured bpw equals its target plus 0.0045 for suh/svh. Results are in
+`D:\models\r4dx\kl-trellis\summary.json`.
+
+| model | bpw (decoder linears) | decoder GiB | mean KL | top-1 | p99 KL | cpp | en | py | thai |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| trellis K3.5m | 3.5045 | 9.93 | 0.01611 | 94.18% | 0.1165 | 0.0136 | 0.0174 | 0.0145 | 0.0190 |
+| **trellis K4m** | 4.0045 | 11.34 | **0.00813** | 95.94% | 0.0544 | 0.0066 | 0.0082 | 0.0077 | 0.0100 |
+| **trellis mix4.5m** | 4.5045 | 12.76 | **0.00547** | 96.90% | 0.0387 | 0.0044 | 0.0063 | 0.0050 | 0.0063 |
+| UD-Q4_K_XL (GGUF, weights only) | ~5.05 all text weights | 15.35 decode | 0.00706 | 96.38% | | 0.0058 | 0.0082 | 0.0054 | 0.0089 |
+| q2ab_hv2_q3 (runtime, today's best) | ~4.5 | 13.68 decode | 0.01555 | 93.65% | | | | | |
+
+`m` = `--hessian-basis matched`. The exl3-basis runs (EXL3 fidelity) were not run at full model; the
+per-linear table in (b) predicts they sit slightly above matched, mostly through attention k/v.
+
+**A0 passes.** K4m is at the ~0.008 gate, and mix4.5m is at 0.68 of it. Each half bit roughly
+halves the KL (0.0161 → 0.0081 → 0.0055), and the ratio holds in every segment, Thai included.
+
+Two cautions when comparing:
+
+- **Versus q2ab_hv2_q3 (fair on Hessians, not on scope).** Both use hessian-v2. But q2ab's 0.01555
+  is a runtime number. It includes a 4-bit g32 lm_head, the fp8 KV cache (about +0.0012 on its own)
+  and the kernels' activation rounding. The oracle's rows are weights-only, with a bf16 lm_head.
+  Gate A2 in `docs/trellis-kernel.md` measures that difference on the real runtime.
+- **Versus UD-Q4_K_XL (optimistic).** Both rows are weights-only on the same reference path. But
+  the GGUF also quantizes lm_head and embeddings, and hessian-v2 is domain-matched to the KL corpus
+  (13). So the oracle is flattered, by an amount not measured here. Even so, mix4.5m's 0.00547 at
+  12.76 GiB of decoder weights against 0.00706 at 15.35 GiB of decode bytes leaves a wide margin.
+
 ---
 
 ## 15. References

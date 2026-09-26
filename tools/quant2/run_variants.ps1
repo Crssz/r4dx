@@ -20,12 +20,17 @@ param(
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
   [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
   [string[]]$ExtraKl = @('thai_canon=tools\reference\kl_corpus\tokens_thai_canon.json=D:\models\r4dx\kl-thai-canon\ref'),
+  # Where the per-variant log-prob dumps go while kl_report.py reads them (~2 GB for 4 segments,
+  # deleted right after): a drive with room, when -OutDir's is full of containers.
+  [string]$ScratchDir = '',
   [switch]$DeleteContainers
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
 New-Item -ItemType Directory -Force $OutDir | Out-Null
+if (-not $ScratchDir) { $ScratchDir = $OutDir }
+New-Item -ItemType Directory -Force $ScratchDir | Out-Null
 $conv = Join-Path $repo 'build\win-hip\src\convert\r4dx-convert.exe'
 $tool = Join-Path $repo 'build\win-hip\tests\model\tool_teacher_forced_logprobs.exe'
 $tokens = 'tools\reference\kl_corpus\tokens.json'
@@ -83,7 +88,7 @@ foreach ($v in $Variant) {
     if (-not (Test-Path (Join-Path $xref 'reference_run.json'))) { throw "[var] -ExtraKl ${xn}: no reference in $xref" }
     $xkl = Join-Path $OutDir "kl_$name.$xn.json"
     if (-not (Test-Path $xkl)) {
-      $xdir = Join-Path $OutDir "tf_$name.$xn"
+      $xdir = Join-Path $ScratchDir "tf_$name.$xn"
       New-Item -ItemType Directory -Force $xdir | Out-Null
       Run "tf_$name.$xn" { & $tool --model $container --layout w4a16 --tokens $xtok --out-dir $xdir --max-ctx 4096 --vision off }
       Run "kl_$name.$xn" { & $Python tools\reference\kl_report.py --ref-dir $xref --test-dir $xdir --tokens $xtok --out $xkl }
@@ -92,7 +97,7 @@ foreach ($v in $Variant) {
     $xj = Get-Content $xkl -Raw | ConvertFrom-Json
     $extraRows[$xn] = [ordered]@{ mean_kl = $xj.overall.mean_kl; top1_pct = $xj.overall.top1_agreement_pct }
   }
-  $dir = Join-Path $OutDir "tf_$name"
+  $dir = Join-Path $ScratchDir "tf_$name"
   New-Item -ItemType Directory -Force $dir | Out-Null
   Run "tf_$name" { & $tool --model $container --layout w4a16 --tokens $tokens --out-dir $dir --max-ctx 4096 --vision off }
   Run "kl_$name" { & $Python tools\reference\kl_report.py --ref-dir $RefDir --test-dir $dir --tokens $tokens --out $klPath }

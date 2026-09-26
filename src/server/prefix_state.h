@@ -17,6 +17,16 @@
 // misaligning every subsequent token's RoPE position / KV slot. See src/server/engine.cpp's
 // RunRequest and src/cli/main.cpp's RunTurn for the two callers that build `committed_tokens`
 // correctly.
+//
+// PROMPT CHECKPOINT (docs/server.md "Prefix cache"): the GDN recurrent state cannot be rewound, so
+// fed() is only reusable when the next prompt re-tokenizes to EVERY committed token, the reply
+// included -- and a replayed reply often does not: the chat template trims it (a " yes" reply comes
+// back as "yes"), a client drops the reasoning, a tool call re-renders in the template's own shape.
+// When the model also saved its state at the end of the prompt (Model::SaveCheckpoint, passed to
+// Commit() as `checkpoint_len`), Plan() falls back to that shorter prefix: restore, then feed only
+// what follows it. Both candidates obey the same exactness rule -- the new prompt's tokens must
+// strictly extend the candidate's, and its image keys must start with the candidate's -- so neither
+// can reuse state the new prompt does not describe.
 #pragma once
 
 #include <algorithm>
@@ -64,25 +74,33 @@ class PrefixState {
   std::optional<std::vector<int32_t>> Extend(const std::vector<int32_t>& full_tokens,
                                               const std::vector<ImageKey>& images = {}) const {
     if (needs_reset_) return std::nullopt;
-    if (full_tokens.size() <= fed_.size()) return std::nullopt;
-    if (!std::equal(fed_.begin(), fed_.end(), full_tokens.begin())) return std::nullopt;
-    if (images.size() < fed_images_.size()) return std::nullopt;
-    if (!std::equal(fed_images_.begin(), fed_images_.end(), images.begin())) return std::nullopt;
-    // An image that begins inside the already-fed prefix but was not recorded as fed would mean
-    // the caller's own bookkeeping disagrees with this one; refuse rather than guess.
-    for (size_t i = fed_images_.size(); i < images.size(); ++i) {
-      if (images[i].token_offset < static_cast<int64_t>(fed_.size())) return std::nullopt;
-    }
-    return std::vector<int32_t>(full_tokens.begin() + static_cast<ptrdiff_t>(fed_.size()),
-                                 full_tokens.end());
+    return TailAfter(fed_, full_tokens, images);
+  }
+
+  // Engine::RunRequest's decision (see the file comment's PROMPT CHECKPOINT): continue from fed()
+  // when Extend() would, else from the checkpointed prompt when the new prompt strictly extends
+  // that (same rules, images included), else std::nullopt -- Model::Reset() + Clear() + feed
+  // everything, exactly as for Extend().
+  struct Reuse {
+    bool from_checkpoint = false;  // Model::RestoreCheckpoint() first; the model is then at checkpoint().size()
+    std::vector<int32_t> tail;     // then feed these
+  };
+  std::optional<Reuse> Plan(const std::vector<int32_t>& full_tokens,
+                            const std::vector<ImageKey>& images = {}) const {
+    if (needs_reset_) return std::nullopt;
+    if (auto tail = TailAfter(fed_, full_tokens, images)) return Reuse{false, std::move(*tail)};
+    if (!has_checkpoint_) return std::nullopt;
+    if (auto tail = TailAfter(checkpoint_, full_tokens, images)) return Reuse{true, std::move(*tail)};
+    return std::nullopt;
   }
 
   // Call once the model has actually been reset (Model::Reset() or a fresh Load()) -- nothing is
-  // fed yet. Does not lift a pending Invalidate(); only Commit() does, once a request has run to
-  // completion on the reset model.
+  // fed yet, and Model::Reset() drops the model's checkpoint too. Does not lift a pending
+  // Invalidate(); only Commit() does, once a request has run to completion on the reset model.
   void Clear() {
     fed_.clear();
     fed_images_.clear();
+    DropCheckpoint();
   }
 
   // Call after a request completes successfully. `full_tokens`: the prompt this request rendered
@@ -90,32 +108,72 @@ class PrefixState {
   // this turn's own newly-committed tokens -- see file header comment for why this is not always
   // the same as "the tokens shown to the client".
   // `images`: this request's own image fingerprints, in prompt order -- see Extend().
+  // `checkpoint_len`: the model saved its state right after prefilling the first `*checkpoint_len`
+  // tokens of `full_tokens` (Model::SaveCheckpoint) -- the prompt's end, or just before it (engine.cpp:
+  // a thinking prompt's trailing "\n") -- replacing any older checkpoint; std::nullopt drops the
+  // recorded one. Every image must lie inside those tokens (fed_images_ serves both prefixes).
   void Commit(const std::vector<int32_t>& full_tokens, const std::vector<int32_t>& committed_tokens,
-              const std::vector<ImageKey>& images = {}) {
+              const std::vector<ImageKey>& images = {},
+              std::optional<size_t> checkpoint_len = std::nullopt) {
     fed_ = full_tokens;
     fed_.insert(fed_.end(), committed_tokens.begin(), committed_tokens.end());
     fed_images_ = images;
     needs_reset_ = false;
+    if (checkpoint_len && *checkpoint_len > 0 && *checkpoint_len <= full_tokens.size()) {
+      checkpoint_.assign(full_tokens.begin(), full_tokens.begin() + static_cast<ptrdiff_t>(*checkpoint_len));
+      has_checkpoint_ = true;
+    } else {
+      DropCheckpoint();
+    }
   }
 
   // Call from a catch block around any Model call that may have left the real model state ahead
   // of what fed_ describes (Prefill/DecodeStep*/Reset throwing partway through) -- forces the next
   // request down the full-reset path rather than risking a stale prefix match against a model
   // whose real state has silently diverged. Clearing fed_ alone would not: Extend() treats an
-  // empty fed_ as a model at position 0 and would hand back the whole prompt as the "tail".
+  // empty fed_ as a model at position 0 and would hand back the whole prompt as the "tail". The
+  // checkpoint goes too: the next request resets, and the Reset() drops the model's copy.
   void Invalidate() {
     fed_.clear();
     fed_images_.clear();
+    DropCheckpoint();
     needs_reset_ = true;
   }
 
   const std::vector<int32_t>& fed() const { return fed_; }
   const std::vector<ImageKey>& fed_images() const { return fed_images_; }
+  bool has_checkpoint() const { return has_checkpoint_; }
+  const std::vector<int32_t>& checkpoint() const { return checkpoint_; }
 
  private:
+  // The tail of `full_tokens` after `prefix`, if `full_tokens` strictly extends it and `images`
+  // strictly extend fed_images_ in the sense Extend() documents. fed_images_ serves both prefixes:
+  // every image lies inside a prompt, and the checkpoint IS the last committed prompt.
+  std::optional<std::vector<int32_t>> TailAfter(const std::vector<int32_t>& prefix,
+                                                const std::vector<int32_t>& full_tokens,
+                                                const std::vector<ImageKey>& images) const {
+    if (full_tokens.size() <= prefix.size()) return std::nullopt;
+    if (!std::equal(prefix.begin(), prefix.end(), full_tokens.begin())) return std::nullopt;
+    if (images.size() < fed_images_.size()) return std::nullopt;
+    if (!std::equal(fed_images_.begin(), fed_images_.end(), images.begin())) return std::nullopt;
+    // An image that begins inside the already-fed prefix but was not recorded as fed would mean
+    // the caller's own bookkeeping disagrees with this one; refuse rather than guess.
+    for (size_t i = fed_images_.size(); i < images.size(); ++i) {
+      if (images[i].token_offset < static_cast<int64_t>(prefix.size())) return std::nullopt;
+    }
+    return std::vector<int32_t>(full_tokens.begin() + static_cast<ptrdiff_t>(prefix.size()),
+                                 full_tokens.end());
+  }
+  void DropCheckpoint() {
+    checkpoint_.clear();
+    has_checkpoint_ = false;
+  }
+
   std::vector<int32_t> fed_;
   std::vector<ImageKey> fed_images_;
   bool needs_reset_ = false;  // set by Invalidate(), cleared by Commit()
+  std::vector<int32_t> checkpoint_;  // the tokens the model's checkpoint was saved after
+  bool has_checkpoint_ = false;
 };
 
 }  // namespace r4dx::server

@@ -6,6 +6,7 @@
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <string_view>
 
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md)
 #include "mtp_round.hpp"
@@ -178,6 +179,9 @@ void Engine::RunRequest(PendingRequest& req) {
     // the prefix-reuse decision (further down) reveals which of them are actually NEW.
     std::vector<r4dx::vision::ImagePlaceholderSpan> pending_image_spans;
     std::vector<const ImagePart*> pending_image_ptrs;  // parallel to pending_image_spans
+    // --prompt-checkpoint: how many of the prompt's LAST tokens the checkpoint leaves out (see where
+    // the chat branch below sets it).
+    int64_t ckpt_back = 0;
     // Resolved `enable_thinking` (docs/server.md's "reasoning_content" section, task item 5):
     // false for /v1/completions unconditionally (task item 5g -- no chat template, nothing to
     // split) and the same ResolveEnableThinking formula http_server.cpp already used to decide the
@@ -310,6 +314,16 @@ void Engine::RunRequest(PendingRequest& req) {
       // and does not sandbox, exactly like src/cli/main.cpp).
       const std::vector<r4dx::TokenId> raw_tokens = tok_->encode(rendered, /*parse_special=*/true);
       full_tokens_i32.assign(raw_tokens.begin(), raw_tokens.end());
+      // With thinking on the generation prompt ends "<think>\n". A later turn that replays this
+      // reply WITHOUT its reasoning -- most OpenAI clients drop reasoning_content -- renders
+      // "<think>\n" + "" + "\n</think>\n\n...", and "\n\n" is ONE token: the replay diverges AT this
+      // prompt's last token, so a checkpoint at the prompt's end would never be its prefix. One
+      // token earlier it is (docs/server.md "Prefix cache", prompt checkpoint).
+      static constexpr std::string_view kThinkOpen = "<think>\n";
+      if (rendered.size() >= kThinkOpen.size() &&
+          std::string_view(rendered).substr(rendered.size() - kThinkOpen.size()) == kThinkOpen) {
+        ckpt_back = 1;
+      }
 
       // Vision: expand every `<|image_pad|>` placeholder the template just emitted (one per image
       // content part, docs/vision.md) into that image's real merged-token-count run, and record
@@ -393,18 +407,30 @@ void Engine::RunRequest(PendingRequest& req) {
     // "Prefix reuse across a turn that contained an image"): `image_keys` is this request's own
     // per-image fingerprint list, so two requests carrying two DIFFERENT pictures at the same
     // (identical, since every placeholder is the same token id) position never reuse each other's
-    // KV state -- PrefixState::Extend refuses and this falls to the Reset()+reprefill branch below.
+    // KV state -- PrefixState::Plan refuses and this falls to the Reset()+reprefill branch below.
+    //
+    // Prompt checkpoint (docs/server.md "Prefix cache", --prompt-checkpoint): when the new prompt
+    // does not re-tokenize to the whole committed sequence -- the replayed reply differs from what
+    // was generated, e.g. the chat template trimmed its leading space -- but does extend the
+    // previous PROMPT, the model returns to the state it saved right after prefilling that prompt
+    // and only the rest is fed.
     std::vector<int32_t> new_tokens_i32;
-    double reset_ms = -1.0;  // -1 == no reset happened this request (prefix extended)
+    double reset_ms = -1.0;    // -1 == no reset happened this request (prefix extended)
+    double restore_ms = -1.0;  // -1 == no checkpoint restore this request
     int64_t skip = 0;        // tokens of full_tokens_i32 NOT re-fed this request (the fed prefix)
     bool tp_recovered = false;  // this request's Reset() recovered a TP group (docs/tp.md 2.5)
     // After a failed request prefix_ refuses every prompt until the next Commit() (prefix_state.h's
     // needs_reset_, docs/tp.md 8.4), so this request takes the Reset() branch: under TP that
     // Reset() is what recovers a group an earlier error left in kNeedsRecovery.
-    std::optional<std::vector<int32_t>> tail = prefix_.Extend(full_tokens_i32, image_keys);
-    if (tail) {
-      skip = static_cast<int64_t>(full_tokens_i32.size() - tail->size());
-      new_tokens_i32 = std::move(*tail);
+    std::optional<PrefixState::Reuse> reuse = prefix_.Plan(full_tokens_i32, image_keys);
+    if (reuse) {
+      if (reuse->from_checkpoint) {
+        const auto r0 = Clock::now();
+        model_->RestoreCheckpoint();
+        restore_ms = Seconds(r0, Clock::now()) * 1000.0;
+      }
+      skip = static_cast<int64_t>(full_tokens_i32.size() - reuse->tail.size());
+      new_tokens_i32 = std::move(reuse->tail);
     } else {
       tp_recovered = tp_model_ != nullptr &&
                      tp_model_->GetState() == r4dx::model::TpModel::State::kNeedsRecovery;
@@ -454,16 +480,55 @@ void Engine::RunRequest(PendingRequest& req) {
 
     req.sink->OnStart(static_cast<int64_t>(full_tokens_i32.size()));
 
-    const auto t0 = Clock::now();
-    // PrefillMultimodal with an EMPTY `image_spans` is byte-identical to Prefill() (that method's
-    // own doc comment: the exact pre-vision code path, no extra upload, no extra kernel, the
-    // single-row rope entry point) -- so this call-site unification carries no text-only-behavior
-    // regression risk.
-    std::vector<float> logits = image_spans.empty()
-                                     ? model_->Prefill(new_tokens_i32)
-                                     : model_->PrefillMultimodal(new_tokens_i32, image_spans);
-    const auto t1 = Clock::now();
-    const double prefill_seconds = Seconds(t0, t1);
+    // --prompt-checkpoint: the state after the first `ckpt_len` tokens of this prompt is saved for
+    // the next request's Plan() -- after a prefill, before any decode step moves the GDN state into a
+    // speculative window slot (model.h's SaveCheckpoint). That is the prompt's end, or `ckpt_back`
+    // tokens before it, which splits this prefill in two around the save. The split needs this
+    // request to feed more than those tokens itself (see below for a tail that short) and every
+    // image span in the first half (the held-back token is the "\n" of "<think>\n", never one).
+    //
+    // A tail no longer than ckpt_back cannot be split -- a regenerate of a thinking prompt: the restore
+    // put the model back at the checkpoint, one token before the prompt's end, and only that token is
+    // left. Saving at the end would replace a checkpoint that already sits where it should with one
+    // at the very boundary ckpt_back exists to avoid, so the one the model holds is kept: a restore
+    // does not consume it, and on any reuse path it is still a prefix of this prompt.
+    const bool checkpointed = opts_.model_opts.prompt_checkpoint;
+    const bool tail_too_short = static_cast<int64_t>(new_tokens_i32.size()) <= ckpt_back;
+    const bool keep_checkpoint = checkpointed && tail_too_short && prefix_.has_checkpoint();
+    int64_t back = checkpointed && !tail_too_short ? ckpt_back : 0;
+    const auto head_n = [&] { return new_tokens_i32.size() - static_cast<size_t>(back); };
+    for (const auto& s : image_spans) {
+      if (static_cast<size_t>(s.offset + s.tokens) > head_n()) back = 0;
+    }
+    const size_t ckpt_len =
+        keep_checkpoint ? prefix_.checkpoint().size() : full_tokens_i32.size() - static_cast<size_t>(back);
+    double prefill_seconds = 0.0;
+    double ckpt_ms = -1.0;
+    // PrefillMultimodal with an EMPTY span list is byte-identical to Prefill() (that method's own
+    // doc comment: the exact pre-vision code path, no extra upload, no extra kernel, the single-row
+    // rope entry point) -- so this call-site unification carries no text-only-behavior regression
+    // risk. A text-only second half after an image goes through Prefill, as any text-only tail does.
+    auto prefill = [&](const std::vector<int32_t>& ids, const std::vector<r4dx::model::ImageSpan>& spans) {
+      const auto a = Clock::now();
+      std::vector<float> out = spans.empty() ? model_->Prefill(ids) : model_->PrefillMultimodal(ids, spans);
+      prefill_seconds += Seconds(a, Clock::now());
+      return out;
+    };
+    auto save = [&] {
+      const auto a = Clock::now();
+      model_->SaveCheckpoint();
+      ckpt_ms = Seconds(a, Clock::now()) * 1000.0;
+    };
+    std::vector<float> logits;
+    if (back > 0) {
+      const auto split = new_tokens_i32.begin() + static_cast<ptrdiff_t>(head_n());
+      prefill(std::vector<int32_t>(new_tokens_i32.begin(), split), image_spans);
+      save();
+      logits = prefill(std::vector<int32_t>(split, new_tokens_i32.end()), {});
+    } else {
+      logits = prefill(new_tokens_i32, image_spans);
+      if (checkpointed && !keep_checkpoint) save();
+    }
 
     r4dx::kernels::SampleParams sp;
     sp.temperature = req.sampling.temperature;
@@ -837,7 +902,8 @@ void Engine::RunRequest(PendingRequest& req) {
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
 
-    prefix_.Commit(full_tokens_i32, committed_tokens, image_keys);
+    prefix_.Commit(full_tokens_i32, committed_tokens, image_keys,
+                   checkpointed ? std::optional<size_t>(ckpt_len) : std::nullopt);
 
     if (tool_mode) {
       // Parse this checkpoint's real tool-call surface syntax (src/server/tool_call_parser.h,
@@ -986,6 +1052,14 @@ void Engine::RunRequest(PendingRequest& req) {
     }
     if (reset_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " reset=%.2fms", reset_ms);
+    }
+    // --prompt-checkpoint: `restore=` -- this request continued from the previous prompt's
+    // checkpoint (its reply did not re-tokenize); `ckpt=` -- what saving this prompt's state cost.
+    if (restore_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " restore=%.2fms", restore_ms);
+    }
+    if (ckpt_ms >= 0.0 && n > 0 && n < static_cast<int>(sizeof(buf))) {
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " ckpt=%.2fms", ckpt_ms);
     }
     // docs/tp.md P5: which engine served the request. Absent at --tp 1, so that line is unchanged.
     // `tp_recovery=yes`: this request's reset= also recovered the group after an earlier failure

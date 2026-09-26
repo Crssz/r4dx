@@ -39,6 +39,8 @@ class LocalTextModel final : public TextModel {
 
   void Reset() override { m_.Reset(); }
   void SetDflashInjectionEnabled(bool enabled) override { m_.SetDflashInjectionEnabled(enabled); }
+  void SaveCheckpoint() override { m_.SaveCheckpoint(); }
+  void RestoreCheckpoint() override { m_.RestoreCheckpoint(); }
 
   void EncodeImages(const float* pixel_values, int64_t total_patches,
                     const std::vector<vision::GridThw>& grids, ImageRows* out,

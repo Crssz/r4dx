@@ -837,16 +837,17 @@ class docs/status.md records on the CLI's `--chat` side (a leading-space BPE var
 and em-dashes, the characters the review pointed at, are NOT the trigger; longer non-Latin text
 frequently is. Treat reuse across a turn as best-effort, not guaranteed.
 
-When it does miss, the failure is graceful -- `Model::Reset()` + full re-prefill, correct output --
-but with an image in the prompt it costs a full re-encode (~30-150 ms depending on image size) on
-top of the re-prefill, so a client that gets long CJK/Thai answers pays roughly double on every
-turn. The real fix is to dedupe re-tokenization against the raw committed token ids; it is not
-vision-specific and is not done. `smoke.ps1` pins both ends: `vision multi-turn` keeps turn 1 to
-one ASCII word so a failure there points at the image mechanism, and `vision multi-turn
-(free-form)` replays a real Japanese answer (asserted to be non-ASCII) and asserts the two outcomes
-stay CONSISTENT -- either the prefix was reused and nothing was re-encoded, or it was not and the
-image was re-encoded and the whole prompt re-prefilled. The combination it exists to catch is the
-third one: a reused prefix whose image rows were silently dropped.
+When it misses, the failure is graceful and correct. Until 2026-09-26 it also cost `Model::Reset()`
+plus a full re-prefill, and with an image in the prompt a full re-encode (~30-150 ms depending on
+image size) on top, so a client that gets long CJK/Thai answers paid roughly double on every turn.
+The **prompt checkpoint** below limits a miss inside the previous reply to re-prefilling that reply
+and the new turn: the prompt before it, and any image in it, are kept. `smoke.ps1` pins both ends:
+`vision multi-turn` keeps turn 1 to one word so a failure there points at the image mechanism, and
+`vision multi-turn (free-form)` replays a real Japanese answer (asserted to be non-ASCII) and
+asserts the two outcomes stay CONSISTENT -- either the prefix was reused and nothing was
+re-encoded, or it was not and the image was re-encoded and the whole prompt re-prefilled. The
+combination it exists to catch is the third one: a reused prefix whose image rows were silently
+dropped.
 
 Until the response charset fix (2026-09-25) that case did not replay the real answer. The smoke reads
 turn 1 through `Invoke-WebRequest`, so it replayed the Latin-1 mojibake, and `PrefixState::Extend`
@@ -857,6 +858,103 @@ per 3-byte Japanese character), and a full re-prefill of 233 tokens with `image_
 charset, `smoke.ps1 -Model <v6> -Layers -1 -Vision` at TP=1 on device 1 (no MTP, 181 PASS / 0 FAIL)
 replays the real Japanese answer (28 non-ASCII characters) and takes the REUSED branch for the
 first time: `timings.prompt_n` 22 of `usage.prompt_tokens` 128, and no `image_n`.
+
+**Prompt checkpoint** (`--prompt-checkpoint {on|off}`, default `on`; 2026-09-26). Everything above
+reuses state only when the new prompt re-tokenizes to EVERY committed token, the previous reply
+included, because the GDN recurrent state cannot be rewound to an arbitrary prefix. A reply often
+does not survive that round trip even with a correct client: `chat_template.jinja` line 103 renders
+every replayed message through `render_content(...)|trim`. Found by `smoke.ps1 -Layers -1 -Vision`
+on `qwen38-27b-q2ab_ldlq.r4dx`: turn 1 ("Is there a circle in this image? Reply with exactly one
+word: yes or no.") generated ` yes` (leading space) then EOS, the client replayed `" yes"`, the
+template rendered `yes` -- a different token -- and the whole 121-token prompt was re-prefilled and
+the image re-encoded. Any reply with leading or trailing whitespace did the same, as do the
+round-trip failures in the table above, a reasoning span or tool call the template re-renders in
+its own shape, and a reply the client edits: for a real chat client, a full re-prefill per turn.
+
+The engine now saves the per-sequence state that cannot be rewound right after each request's
+prefill (`Model::SaveCheckpoint`: every GDN layer's window-0 recurrent slot and conv line, the MTP
+seed row, the position and mrope delta; `ckpt=` in the request log line), and
+`PrefixState::Plan` (`src/server/prefix_state.h`) takes the first of:
+1. the whole committed sequence, when the new prompt extends it -- unchanged;
+2. the previous PROMPT, when the new prompt extends that instead -- `Model::RestoreCheckpoint`
+   (`restore=` in the log line), then prefill everything after it, the replayed reply included;
+3. `Model::Reset()` and a full prefill.
+
+Both reuse candidates obey one rule: the new prompt's tokens must strictly extend the candidate's,
+and its image keys must start with the candidate's. Neither can continue from state the new prompt
+does not describe -- a different picture at the same position still resets (the image key refuses
+it, even though every placeholder token matches), and an image inside the checkpointed prompt is
+not re-encoded. The KV caches need no copy: a restore only moves the position back, and every KV
+row past it is overwritten before anything reads it (the argument `Model::Reset()` and speculative
+rejection already rely on). A DFlash2 drafter's ring is rewound rather than restored
+(`DflashDraft::Rewind`): the reply's injection overwrote some of its sliding-window slots below the
+restore point, so the next drafts can differ from a drafter that never generated -- acceptance,
+never the verified tokens.
+
+**Thinking on.** With `enable_thinking` the prompt ends `<think>` `\n`, and a client that replays
+the reply WITHOUT its `reasoning_content` -- most OpenAI clients drop it -- renders `<think>\n` + `""`
++ `\n</think>\n\n...`, where `\n\n` is ONE token: the replay diverges AT the prompt's last token, so a
+checkpoint at the prompt's end would never be its prefix. For a prompt that ends `<think>\n` the
+engine therefore checkpoints one token early, splitting the prefill around the save (the held-back
+token costs one extra 1-token forward, below). A client that does send `reasoning_content` back
+still reuses the whole committed sequence when it re-tokenizes, or the checkpoint when it does not.
+
+Exactness is tested at three levels: `tests/model/test_prompt_checkpoint` requires restore +
+`Prefill(T)` to return logits BIT-IDENTICAL to `Prefill(P)` + `Prefill(T)` with nothing generated in
+between -- after plain decode, straight after speculative rounds that commit several tokens at once
+(the live GDN state is then in another window slot), after real MTP rounds, after a second restore,
+and under `--tp 2` (emulate); `tests/server/test_engine_recovery` drives the ` yes` case
+(`CheckpointScenario`) and the thinking-on dropped-reasoning case (`CheckpointThinkingScenario`)
+through `Engine::RunRequest` against a CPU fake whose text hashes its whole state (one restore, only
+the tokens after the checkpoint prefilled, a fresh engine's text; after a fault, a reset rather than a
+restore); `test_prefix_state` covers the decision itself, image keys included.
+
+Options weighed:
+- (a) Commit what the template WOULD render for the finished turn, and keep a prompt-end snapshot
+  for when that differs from what was generated. The snapshot has to be taken before decode (the
+  reply is not known yet), so (a) costs what (b) costs, and its re-render only predicts the
+  server's own template -- not a client that drops the reasoning, normalizes the text or edits it.
+- (b) The prompt-end checkpoint, above: covers any divergence inside the previous reply, whatever
+  caused it. **Chosen.**
+- (c) Splice the committed token ids back over the re-rendered reply. Nothing re-prefilled, but the
+  model would continue from a conversation that differs from what the chat template renders for
+  it -- not exact. Rejected. Several checkpoints per turn (llama.cpp's context checkpoints) would
+  also spare a long reply that diverges only at its END (trailing whitespace) its re-prefill; one
+  checkpoint at the prompt's end covers the reported case and every divergence at a reply's start.
+  Not done.
+
+Cost (measured 2026-09-26, TP=1, 64 layers, w4a16, on HIP device 0 because device 1 was busy;
+`qwen38-27b-v6.r4dx` with this branch, and `qwen38-27b-q2ab_ldlq.r4dx` -- the container the failure
+was found on -- with the change applied to the quant2 branch):
+
+| | |
+|---|---|
+| VRAM | 0.143 GiB of buffers: 48 GDN layers x (3 MiB fp32 recurrent slot + a 60 KiB conv line), plus the MTP seed row with `--mtp`. `hipMemGetInfo`'s free drops 0.19 GiB (13.865 -> 13.678 GiB). Each rank holds its own half under `--tp 2`; `--prompt-checkpoint off` reclaims it |
+| save, every request | 0.80-0.88 ms (`ckpt=`), once, right after the prefill |
+| restore, when taken | 0.86-1.08 ms (`restore=`) |
+| thinking-on prompts only | +32 ms on a 78-token prompt (96.5 -> 128.8 ms): the held-back token's own forward -- about one decode step -- plus the first half's unused logits row |
+| decode | unchanged: 32.76 (off) vs 33.10 (on) tok/s over 256 tokens |
+| the reported case, turn 2 (q2ab_ldlq, turn 1 answered `" yes"`) | 25 of 121 tokens prefilled in 38.0 ms, no image encode -- was 121 of 121 in 134.2 ms plus a 10.9 ms re-encode |
+| a reply ending in a space (`"1 "` cut at `max_tokens` 2, v6) | 17 of 47 tokens prefilled in 36.5 ms -- was 47 of 47 in 67 ms |
+
+The savings grow with the conversation: without the checkpoint every such turn re-prefilled the
+whole conversation. The split moves where a thinking prompt's last prefill chunk ends, so its logits
+are not bit-identical to `--prompt-checkpoint off`'s (the GDN chunked scan rounds per chunk) -- the
+same property every reuse boundary already has.
+
+Not covered: a replay whose PROMPT part changes -- `preserve_thinking: false` drops an older
+turn's thinking block once a newer user query exists, an edited system prompt -- still resets; so
+does a byte-identical repeat of the previous prompt (a "regenerate") with thinking off, because the
+checkpoint holds no logits for the prompt's last token. With thinking on a regenerate restores the
+one-token-early checkpoint, feeds the held-back token again, and keeps that checkpoint for the turn
+after it. `r4dx-cli --chat` keeps its own reuse unchanged (no checkpoint; it does get the fix below).
+
+Found alongside, by the same test (docs/mtp.md "Prefill after a multi-token round"): under `--mtp`
+or `--dflash`, path 1 -- the ordinary extend -- continued from a GDN state n-1 tokens back whenever
+the previous turn's last speculative round had committed n > 1 tokens, because a prefill reads
+window slot 0 and the round left the live state in slot n-1. Fixed in `Model::Prefill`
+(`CollapseSpeculativeWindow`); it affected `r4dx-cli --chat` the same way. Path 2 never had it: a
+restore puts back a post-prefill state.
 
 **Response extensions** (`src/server/openai_types.h`):
 - `GET /v1/models`: `architecture.input_modalities` and `modalities` gain `"image"`, and
@@ -941,7 +1039,9 @@ the new tail tokens are fed via `Model::Prefill`; otherwise the model is reloade
 (`Model::Load`) and the whole prompt is re-prefilled from scratch. This is exactly what a normal
 OpenAI chat client does (resend the whole growing `messages` array each turn), so a multi-turn
 conversation against this server reuses the KV cache the same way `--chat` does -- there is no
-separate "session id" concept.
+separate "session id" concept. When the replayed reply does not re-tokenize, the server falls back
+to the state it saved at the end of the previous prompt (`--prompt-checkpoint`, "Prefix cache,
+image-aware" above) rather than re-prefilling everything.
 
 **Reset cost (server-catches-up-with-engine stage)**: a mismatched-prefix reset now calls
 `model_->Reset()` (`r4dx::model::Model::Reset()`, `src/model/model.h`/`.cpp`) instead of a full
@@ -1189,7 +1289,8 @@ r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
     [--default-temperature F] [--default-top-p F] [--default-top-k N]
     [--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N]
     [--mtp-head-layout {bf16|layout}] [--mtp-draft-head {reduced|full}]
-    [--embed-device-resident {on|off}] [--dflash <draft.r4dx>] [--dflash-k N]
+    [--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}]
+    [--dflash <draft.r4dx>] [--dflash-k N]
     [--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}]
     [--image-max-pixels N]
     [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
@@ -1215,6 +1316,10 @@ tensors at all, still gets a clean `400` naming that reason.
 
 `--dflash <draft.r4dx>` (default empty, disabled): see the "New (Milestone 5 stage S3...)" note
 above -- mutually exclusive with `--mtp N>0`.
+
+`--prompt-checkpoint {on|off}` (default `on`): save the GDN state at the end of every prompt so a
+follow-up whose replayed reply does not re-tokenize still reuses the prompt before it -- see
+"Prefix cache, image-aware" above. `off` reclaims its VRAM.
 
 `--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B`, same as `r4dx-cli`. `--think` sets the
 server-wide default for the chat template's `enable_thinking` when a request's
@@ -1276,16 +1381,19 @@ parsing), `test_openai_types` (request validation + response JSON shapes, includ
 `tool_choice`/`role: "tool"`/`"function"` parsing), `test_sse` (SSE chunk formatting),
 `test_response_sink` (`BufferingSink`/`StreamingSink`, including the tool-calls streaming chunk
 shape), `test_request_queue` (`BoundedQueue` capacity/FIFO/close/threaded producer-consumer),
-`test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit bookkeeping,
-including `TestImageAwarePrefixReuse`, see "MTP" above and "Images"), `test_tool_call_parser` (see
+`test_prefix_state` (`PrefixState`'s prefix-match / invalidate / MTP-aware commit / prompt-checkpoint
+bookkeeping, including `TestImageAwarePrefixReuse` and `TestCheckpointImageRules`, see "MTP" above
+and "Images"), `test_tool_call_parser` (see
 "Tool calls" above -- real-capture and malformed-input cases for the model's surface syntax),
 `test_tool_stream_gate` (the live tool-call stream gate and its "streamed content == non-streamed
 content" property over every chunking of a dozen representative generations),
 `test_reasoning_splitter` (the `</think>` split), `test_engine_recovery` (the engine's error and
 recovery path through `engine.cpp` itself, against CPU fakes of the tensor-parallel model's state
 machine and of the TP=1 model, where a skipped `Reset()` would silently reuse a failed request's
-state -- it links the server's libraries but makes no GPU call, and skips without the tokenizer
-directory), `test_http_server` (`http_server.cpp`'s routes over real HTTP on a loopback port, against
+state; `CheckpointScenario` and `CheckpointThinkingScenario` drive `--prompt-checkpoint`'s restore
+path the same way -- it links
+the server's libraries but makes no GPU call, and skips without the tokenizer directory),
+`test_http_server` (`http_server.cpp`'s routes over real HTTP on a loopback port, against
 a scripted CPU fake of the TP=1 model and httplib's own client. It checks every route's
 `charset=utf-8`. It also replays the real `--mtp 3` thinking+tools answer through MTP-shaped rounds
 and through plain decode, and checks that streamed and non-streamed content agree in bytes and as a

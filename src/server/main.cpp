@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
                                          ? std::optional<r4dx::model::Layout>(r4dx::model::Layout::kBf16)
                                          : std::nullopt;
   opts.model_opts.embed_device_resident = (args.embed_device_resident != "off");
+  opts.model_opts.prompt_checkpoint = (args.prompt_checkpoint != "off");
   opts.model_opts.mtp_draft_reduced_vocab = (args.mtp_draft_head != "full");
   // docs/vision.md "Load policy" -- same three-way policy as r4dx-cli's --vision.
   opts.model_opts.vision = args.vision == "on"    ? r4dx::model::ModelOptions::VisionMode::kOn

@@ -185,6 +185,12 @@ struct ModelOptions {
   // Exposed as `--vision {auto|on|off}` on both binaries.
   enum class VisionMode { kAuto, kOn, kOff };
   VisionMode vision = VisionMode::kAuto;
+  // Prompt checkpoint (docs/server.md "Prefix cache"): allocate one spare copy of every GDN layer's
+  // per-sequence state (+ the MTP seed row) so SaveCheckpoint/RestoreCheckpoint can return the
+  // sequence to the end of an earlier prompt. ~150 MiB on the 27B (48 GDN layers x (3 MiB fp32
+  // recurrent + the conv line)); halved per rank under TP. Off by default: r4dx-server turns it on
+  // (--prompt-checkpoint), nothing else calls it.
+  bool prompt_checkpoint = false;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -258,6 +264,26 @@ class Model {
 
   // Number of tokens already committed into the KV/GDN state (0 before the first Prefill call).
   int64_t PositionCount() const { return pos_; }
+
+  // ---- prompt checkpoint (docs/server.md "Prefix cache"; needs ModelOptions::prompt_checkpoint) ---
+  // The GDN state cannot be rewound, so a server whose next prompt diverges anywhere inside the
+  // previous reply (the chat template trims it, a client drops the reasoning, ...) would otherwise
+  // re-prefill the whole conversation. SaveCheckpoint() remembers the sequence state at
+  // PositionCount() -- every GDN layer's recurrent/conv state, the MTP seed row, and the host-side
+  // position / mrope bookkeeping -- replacing any earlier checkpoint. It must run right after
+  // Prefill/PrefillMultimodal (or RestoreCheckpoint), before any decode step or VerifyWindow: those
+  // write GDN window slots / conv history offsets other than the ones copied (gdn_state.h), so it
+  // throws once one has run. RestoreCheckpoint() puts that state back: PositionCount() returns to the
+  // checkpoint's position and the next Prefill continues exactly as it would have right after the
+  // checkpointed prefill -- bit for bit, for everything that decides the target's logits. KV rows
+  // past that position are left stale; every write lands at its own position before anything can
+  // read it (Reset()'s argument). A DFlash2 drafter's ring is rewound, not restored
+  // (DflashDraft::Rewind): positions the reply's injection overwrote in its sliding window are gone,
+  // so the next drafts may differ from a drafter that never generated -- never the verified tokens.
+  // A restore keeps the checkpoint; Reset() drops it. Synchronous, like Reset().
+  void SaveCheckpoint();
+  void RestoreCheckpoint();
+  int64_t CheckpointPosition() const { return ckpt_pos_; }  // -1: no checkpoint
 
   // Feeds `token_ids` through the model in <=64-token chunks, continuing from whatever state
   // (GDN recurrent/conv, KV cache) this Model already holds. Despite the name this is not
@@ -920,6 +946,18 @@ class Model {
   int64_t pos_ = 0;        // tokens already committed to KV/GDN state
   bool started_ = false;   // false only before the very first RunChunk call (GDN has_init gate)
 
+  // ---- prompt checkpoint (SaveCheckpoint); the GDN half lives in each GdnStateManager ------------
+  bool prompt_checkpoint_ = false;  // ModelOptions::prompt_checkpoint, copied at Load()
+  int64_t ckpt_pos_ = -1;           // -1: none since Load()/Reset()
+  // SaveCheckpoint's precondition: true from the end of a Prefill/PrefillMultimodal (or a
+  // RestoreCheckpoint) until the next RunChunk decode step or VerifyWindow, either of which moves the
+  // GDN state out of the window-0 / offset-0 place GdnStateManager::SaveCheckpoint copies from.
+  bool at_prefill_end_ = false;
+  bool ckpt_mrope_active_ = false;
+  int64_t ckpt_mrope_delta_ = 0;
+  bool ckpt_mtp_seed_valid_ = false;
+  core::DeviceBuffer<uint16_t> ckpt_mtp_seed_;  // [hidden] bf16, MTP only: mtp_seed_hidden_'s copy
+
   // ---- MTP self-speculation (docs/mtp.md), all empty/unused when mtp_draft_k==0 -----------------
   std::optional<MtpHead> mtp_;
   int64_t mtp_draft_k_ = 0;
@@ -946,6 +984,16 @@ class Model {
   // drafting.
   core::DeviceBuffer<int32_t> mtp_num_accepted_dev_;
   bool mtp_num_accepted_valid_ = false;
+  // mtp_num_accepted_dev_'s value, on the host: how many tokens the last decode step / verify round
+  // committed. >1 means the live GDN state is in window slot n-1, not where a prefill reads it --
+  // see CollapseSpeculativeWindow.
+  int64_t mtp_last_committed_ = 1;
+  // Called by Prefill/PrefillMultimodal before their first chunk: moves the live GDN state from the
+  // last verify round's window slot / conv offset to window 0 / offset 0 (GdnStateManager::
+  // CollapseWindow), then drops the num_accepted thread as before. Without the move, the prefill
+  // that continues a conversation after a speculative round that committed n > 1 tokens (the
+  // server's prefix reuse, r4dx-cli --chat) seeded from the state n-1 tokens back.
+  void CollapseSpeculativeWindow();
   // Scratch for VerifyWindow: logits for up to draft_window_ candidate positions at once, plus one
   // argmax result per position. Shared by both speculation families (MTP and DFlash2) -- the verify
   // pass is identical for either draft source (docs/dflash2.md section 7 item 5).

@@ -813,6 +813,14 @@ void TpModel::Reset() {
   cached_position_ = 0;
 }
 
+void TpModel::SaveCheckpoint() {
+  RunCollective([](Model& m, int) { m.SaveCheckpoint(); });
+}
+
+void TpModel::RestoreCheckpoint() {
+  RunCollective([](Model& m, int) { m.RestoreCheckpoint(); });  // re-caches PositionCount()
+}
+
 // ---- host-only / diagnostics --------------------------------------------------------------------
 
 // The result slots of the diagnostic commands below are heap blocks the closures co-own (N53).

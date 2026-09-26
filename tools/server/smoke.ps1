@@ -157,7 +157,10 @@ Add-Type -AssemblyName System.Drawing
 # expected to read back verbatim under greedy decoding (docs/vision.md's own real-container OCR
 # check used the same "render text, read text back" idea with "R4DX7391"; this stage's own smoke
 # uses a different string so the two are never confused if compared side by side).
+# Deterministic: the same arguments give byte-identical PNGs. -Square draws a square where the circle
+# is -- a DIFFERENT picture of the same size (so the same grid and placeholder run).
 function New-SyntheticShapesImageBase64 {
+    param([switch]$Square)
     $bmp = New-Object System.Drawing.Bitmap 256, 256
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     try {
@@ -166,8 +169,14 @@ function New-SyntheticShapesImageBase64 {
             $rect, [System.Drawing.Color]::FromArgb(20, 20, 200), [System.Drawing.Color]::FromArgb(220, 220, 20),
             [System.Drawing.Drawing2D.LinearGradientMode]::ForwardDiagonal)
         $g.FillRectangle($brush, $rect)
-        $g.FillEllipse([System.Drawing.Brushes]::White, 78, 78, 100, 100)
-        $g.DrawEllipse((New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 4)), 78, 78, 100, 100)
+        $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 4)
+        if ($Square) {
+            $g.FillRectangle([System.Drawing.Brushes]::White, 78, 78, 100, 100)
+            $g.DrawRectangle($pen, 78, 78, 100, 100)
+        } else {
+            $g.FillEllipse([System.Drawing.Brushes]::White, 78, 78, 100, 100)
+            $g.DrawEllipse($pen, 78, 78, 100, 100)
+        }
     } finally { $g.Dispose() }
     $ms = New-Object System.IO.MemoryStream
     $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
@@ -224,6 +233,23 @@ function Check {
 # one side decoded as Latin-1) looked like 3 bytes lost in the stream assembly (docs/server.md's
 # "Response shapes").
 function Text-Size { param([string]$Text) "$($Text.Length) chars, $([System.Text.Encoding]::UTF8.GetByteCount($Text)) UTF-8 bytes" }
+
+# The server's log line for one request ("request <id>: prompt=... new=... [reset=|restore=] ckpt=...",
+# engine.cpp; <id> is the response's own `id`). Written just after the response goes out, so it is
+# polled for briefly. "" when it never appears.
+function Get-RequestLogLine {
+    param([string]$Id)
+    for ($i = 0; $i -lt 20; $i++) {
+        $hit = @(Select-String -Path $ServerErrLog -Pattern "request ${Id}:" -SimpleMatch -ErrorAction SilentlyContinue)
+        if ($hit.Count -gt 0) { return $hit[-1].Line }
+        Start-Sleep -Milliseconds 250
+    }
+    return ""
+}
+
+# True when a reply begins or ends with whitespace, which the chat template's |trim drops when the
+# client replays it -- so the replayed turn cannot re-tokenize to what was generated.
+function Test-EdgeWhitespace { param([string]$Text) $Text -match '^\s' -or $Text -match '\s$' }
 
 # POSTs a streaming request and returns every "data: ..." line WITH the millisecond offset at which
 # it actually arrived. Invoke-WebRequest (used everywhere else in this script) buffers the whole
@@ -379,6 +405,11 @@ try {
     }
     if (-not $ready) { throw "server did not become ready within timeout" }
     Write-Output "[smoke] server ready"
+
+    # ---- --prompt-checkpoint (on by default, docs/server.md "Prefix cache"): its VRAM, per rank ---
+    $ckptVram = @(Select-String -Path $ServerErrLog -Pattern "prompt checkpoint VRAM:" -SimpleMatch -ErrorAction SilentlyContinue)
+    Check ($ckptVram.Count -ge 1) "--prompt-checkpoint (default on): the load log reports the checkpoint's VRAM"
+    foreach ($l in $ckptVram) { Write-Output "  [info] $($l.Line)" }
 
     # ---- --tp 2: the load reported every rank (engine.cpp's one VRAM line per rank) --------------
     if ($Tp -eq 2) {
@@ -596,6 +627,116 @@ try {
     } else {
         Write-Output "  [SKIP] prefix reuse: prompt_n < usage.prompt_tokens (only checked against a real container, -Layers -1)"
     }
+
+    # ---- prompt checkpoint: a whitespace-led reply (docs/server.md "Prefix cache") ---------------
+    # 2026-09-26: turn 1 answered " yes" (leading space) then EOS. The client replays exactly that,
+    # but chat_template.jinja renders a replayed assistant turn through |trim, so the re-rendered
+    # history says "yes" -- a different token -- and the server re-prefilled the whole conversation
+    # (the GDN state cannot be rewound to the end of turn 1's prompt). With --prompt-checkpoint (on by
+    # default) it keeps the state saved right after turn 1's prompt and continues from there: turn 2
+    # must prefill EXACTLY the tokens after turn 1's prompt -- prompt_n == prompt_tokens(turn 2) -
+    # prompt_tokens(turn 1); matching the whole committed sequence would prefill fewer, a reset all of
+    # them -- and its log line must show `restore=`. Deterministic: greedy, so a given container and
+    # build answer each question the same way every run. The case takes the first question whose
+    # answer has edge whitespace and FAILS (never skips) when none has, so it cannot pass without
+    # taking the path. The questions run from the likeliest LEADING space (a completion-style prompt:
+    # the model continues the quoted text, " Paris") to a TRAILING one that holds by construction:
+    # this tokenizer splits "1 2" into "1", " ", "2", so a count cut at max_tokens 2 ends "1 ".
+    # Real container only, like the reuse check above.
+    if ($Layers -lt 0) {
+        $wsQuestions = @(
+            @{ q = 'Continue this text with exactly one word and nothing else: "The capital of France is"'; max = 4 },
+            @{ q = "Is the sky blue on a clear day? Reply with exactly one word: yes or no."; max = 4 },
+            @{ q = "Count from 1 to 10, separated by single spaces, and nothing else."; max = 2 }
+        )
+        $wsTurn1 = $null
+        $wsQuestion = ""
+        $wsReplies = @()
+        foreach ($wq in $wsQuestions) {
+            $q = $wq.q
+            $qBody = @{ messages = @(@{ role = "user"; content = $q }); max_tokens = $wq.max; temperature = 0; stream = $false } |
+                ConvertTo-Json -Depth 5
+            $qChat = (Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json; charset=utf-8" -Body $qBody -UseBasicParsing).Content | ConvertFrom-Json
+            $qReply = [string]$qChat.choices[0].message.content
+            $wsReplies += "'$qReply'"
+            if (Test-EdgeWhitespace $qReply) { $wsTurn1 = $qChat; $wsQuestion = $q; break }
+        }
+        Check ($null -ne $wsTurn1) `
+            "whitespace-led reply: a greedy turn 1 answered with leading/trailing whitespace -- the case is live (replies: $($wsReplies -join ', '))"
+        if ($null -ne $wsTurn1) {
+            $wsReply = [string]$wsTurn1.choices[0].message.content
+            $wsTurn2Body = @{
+                messages    = @(
+                    @{ role = "user"; content = $wsQuestion },
+                    @{ role = "assistant"; content = $wsReply },
+                    @{ role = "user"; content = "Why? Answer in one short sentence." }
+                )
+                max_tokens  = 16
+                temperature = 0
+                stream      = $false
+            } | ConvertTo-Json -Depth 5
+            $wsTurn2Resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+                -ContentType "application/json; charset=utf-8" -Body $wsTurn2Body -UseBasicParsing
+            $wsTurn2 = $wsTurn2Resp.Content | ConvertFrom-Json
+            $wsWant = $wsTurn2.usage.prompt_tokens - $wsTurn1.usage.prompt_tokens
+            Check ($wsTurn2Resp.StatusCode -eq 200 -and [bool]$wsTurn2.choices[0].message.content) `
+                "whitespace-led reply ('$wsReply'): turn 2 returns 200 with content"
+            $wsLine = Get-RequestLogLine $wsTurn2.id
+            # Under --mtp/--dflash a reply cut at max_tokens can end on a DISPLAYED token that was never
+            # committed (the round's last token is fed only by the next round, docs/mtp.md): a trailing
+            # " " then never reached the model, the committed sequence re-tokenizes, and turn 2 correctly
+            # reuses all of it -- the full-sequence path, fewer tokens prefilled than the checkpoint's.
+            $wsTrailingOnly = ($wsReply -notmatch '^\s')
+            if (($Mtp -gt 0 -or $Dflash -ne "") -and $wsTrailingOnly -and $wsLine -notmatch ' restore=') {
+                Check ($wsTurn2.timings.prompt_n -lt $wsWant -and $wsLine -notmatch ' reset=') `
+                    ("whitespace-led reply ('$wsReply', speculative, the trailing token never committed): turn 2 reused the " +
+                     "whole committed sequence -- timings.prompt_n $($wsTurn2.timings.prompt_n) < $wsWant, no reset")
+            } else {
+                Check ($wsTurn2.timings.prompt_n -eq $wsWant) `
+                    ("whitespace-led reply: turn 2 prefilled exactly the $wsWant token(s) after turn 1's prompt " +
+                     "(timings.prompt_n $($wsTurn2.timings.prompt_n) of usage.prompt_tokens $($wsTurn2.usage.prompt_tokens)) -- " +
+                     "continued from the prompt checkpoint, not a full re-prefill")
+                Check ($wsLine -match ' restore=') "whitespace-led reply: turn 2's log line shows the checkpoint restore"
+            }
+            Write-Output "  [info] $wsLine"
+        }
+    }
+
+    # ---- prompt checkpoint: thinking on, reasoning dropped from the replay -----------------------
+    # With thinking on the prompt ends "<think>" "\n"; a client that replays the answer WITHOUT its
+    # reasoning_content (most do) renders "<think>\n" + "" + "\n</think>\n\n..." -- "\n\n" is one token,
+    # so the replay diverges AT turn 1's last prompt token, whatever the model said. The server
+    # checkpoints one token early for such a prompt (docs/server.md "Prefix cache"), so turn 2 must
+    # prefill exactly prompt_tokens(turn 2) - (prompt_tokens(turn 1) - 1) tokens and log restore=.
+    # Deterministic by construction on any container: it depends only on the template, not the reply
+    # (a turn 1 cut at max_tokens inside its reasoning replays an empty answer, which diverges the same way).
+    $thinkKwargs = @{ enable_thinking = $true; reasoning_effort = "low" }
+    $thinkQ = "What is 2 plus 2? Answer with just the number."
+    $thinkT1Body = @{ messages = @(@{ role = "user"; content = $thinkQ }); max_tokens = 64; temperature = 0
+                      stream = $false; chat_template_kwargs = $thinkKwargs } | ConvertTo-Json -Depth 6
+    $thinkT1 = (Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json; charset=utf-8" -Body $thinkT1Body -UseBasicParsing).Content | ConvertFrom-Json
+    $thinkAnswer = [string]$thinkT1.choices[0].message.content
+    $thinkT2Body = @{
+        messages             = @(@{ role = "user"; content = $thinkQ }, @{ role = "assistant"; content = $thinkAnswer },
+                                 @{ role = "user"; content = "And 3 plus 3?" })
+        max_tokens           = 16
+        temperature          = 0
+        stream               = $false
+        chat_template_kwargs = $thinkKwargs
+    } | ConvertTo-Json -Depth 6
+    $thinkT2Resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+        -ContentType "application/json; charset=utf-8" -Body $thinkT2Body -UseBasicParsing
+    $thinkT2 = $thinkT2Resp.Content | ConvertFrom-Json
+    $thinkWant = $thinkT2.usage.prompt_tokens - ($thinkT1.usage.prompt_tokens - 1)
+    Check ($thinkT2Resp.StatusCode -eq 200) "thinking, reasoning dropped: turn 2 returns 200 (turn 1 answered '$thinkAnswer')"
+    Check ($thinkT2.timings.prompt_n -eq $thinkWant) `
+        ("thinking, reasoning dropped: turn 2 prefilled exactly the $thinkWant token(s) from one token before turn 1's " +
+         "prompt end (timings.prompt_n $($thinkT2.timings.prompt_n) of usage.prompt_tokens $($thinkT2.usage.prompt_tokens))")
+    $thinkLine = Get-RequestLogLine $thinkT2.id
+    Check ($thinkLine -match ' restore=') "thinking, reasoning dropped: turn 2's log line shows the checkpoint restore"
+    Write-Output "  [info] $thinkLine"
 
     # ---- POST /v1/chat/completions, streaming (SSE) ---------------------------------------------
     # Invoke-WebRequest buffers the whole body, but that's fine here: we only need to check the
@@ -1360,11 +1501,9 @@ try {
         $shapesImg = Image-DataUri (New-SyntheticShapesImageBase64)
         $ocrText = "R4DXVSN9"
         $ocrImg = Image-DataUri (New-OcrImageBase64 -Text $ocrText)
-        $otherShapesImg = Image-DataUri (New-SyntheticShapesImageBase64)  # a SECOND, independently
-                                                                            # generated PNG -- not
-                                                                            # byte-identical to
-                                                                            # $shapesImg (fresh
-                                                                            # gradient/ellipse render)
+        # A DIFFERENT picture of the same size (a square where the circle is). Until 2026-09-26 this was a
+        # second call of the same drawing, which is byte-identical to $shapesImg -- the same image key.
+        $otherShapesImg = Image-DataUri (New-SyntheticShapesImageBase64 -Square)
 
         # ---- describe the synthetic image -----------------------------------------------------
         $describeBody = @{
@@ -1535,11 +1674,32 @@ try {
         Check ($turn2Chat.timings.prompt_n -lt $turn2Chat.usage.prompt_tokens) `
             ("vision multi-turn: turn 2 timings.prompt_n ($($turn2Chat.timings.prompt_n)) < " +
              "usage.prompt_tokens ($($turn2Chat.usage.prompt_tokens)) -- only the new tail was prefilled")
+        # The 2026-09-26 failure itself: a reply with edge whitespace (" yes") re-renders trimmed, so
+        # turn 2 can only continue from turn 1's prompt checkpoint (see "whitespace-led reply" above).
+        $turn1Reply = [string]$turn1Chat.choices[0].message.content
+        if (Test-EdgeWhitespace $turn1Reply) {
+            $turn2Want = $turn2Chat.usage.prompt_tokens - $turn1Chat.usage.prompt_tokens
+            Check ($turn2Chat.timings.prompt_n -eq $turn2Want -and (Get-RequestLogLine $turn2Chat.id) -match ' restore=') `
+                ("vision multi-turn: turn 1's reply ('$turn1Reply') re-renders trimmed, so turn 2 continued from the " +
+                 "prompt checkpoint -- prefilled exactly the $turn2Want token(s) after turn 1's prompt " +
+                 "(timings.prompt_n $($turn2Chat.timings.prompt_n)) and logged restore=")
+        }
 
         # ---- different-image-same-text: must NOT reuse the prefix -------------------------------
-        # Same conversation shape as turn 2 above, but turn 1's OWN image is swapped for a
-        # DIFFERENT one at the identical position -- every image placeholder is the same token id
-        # (docs/vision.md), so token equality alone would wrongly call this a prefix match.
+        # Turn 2's exact conversation with turn 1's image swapped for a DIFFERENT picture of the same
+        # size ($otherShapesImg: a square where the circle is). Every image placeholder is the same
+        # token id (docs/vision.md), so the TOKENS equal turn 2's and only the image key can refuse.
+        # Turn 1 is re-sent first so the last committed prompt is turn 1's again: this request's tokens
+        # then strictly extend it, which is exactly what the prompt checkpoint (or, for a reply that
+        # re-tokenizes, the whole committed sequence) reuses when the image matches -- as turn 2 did.
+        # Until 2026-09-26 this ran right after turn 2, whose committed tokens it never extended, and
+        # with a byte-identical "other" image, so it could not have caught an image-key bug.
+        $turn1AgainResp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post `
+            -ContentType "application/json; charset=utf-8" -Body $turn1Body -UseBasicParsing
+        $turn1Again = $turn1AgainResp.Content | ConvertFrom-Json
+        Check ($turn1AgainResp.StatusCode -eq 200 -and
+               [string]$turn1Again.choices[0].message.content -ceq $turn1Reply) `
+            "vision multi-turn (different image): turn 1 re-sent answers the same ('$($turn1Again.choices[0].message.content)')"
         $diffImgTurn2Body = @{
             messages    = @(
                 @{ role = "user"; content = @(
@@ -1557,11 +1717,16 @@ try {
             -ContentType "application/json; charset=utf-8" -Body $diffImgTurn2Body -UseBasicParsing
         $diffImgChat = $diffImgResp.Content | ConvertFrom-Json
         Check ($diffImgResp.StatusCode -eq 200) "vision multi-turn (different image): request returns 200"
+        Check ($diffImgChat.usage.prompt_tokens -eq $turn2Chat.usage.prompt_tokens) `
+            ("vision multi-turn (different image): the same $($turn2Chat.usage.prompt_tokens) prompt tokens as turn 2 " +
+             "-- only the image differs")
         Check ($diffImgChat.timings.prompt_n -eq $diffImgChat.usage.prompt_tokens) `
             ("vision multi-turn (different image): prefix NOT reused -- timings.prompt_n " +
              "($($diffImgChat.timings.prompt_n)) == usage.prompt_tokens ($($diffImgChat.usage.prompt_tokens))")
         Check ($diffImgChat.timings.image_n -ge 1) `
             "vision multi-turn (different image): the new image WAS encoded this request (image_n >= 1)"
+        Check ((Get-RequestLogLine $diffImgChat.id) -notmatch ' restore=') `
+            "vision multi-turn (different image): no prompt-checkpoint restore in its log line"
 
         # ---- multi-turn with a REAL, free-form NON-ASCII turn-1 answer --------------------------
         # Added 2026-09-22 after a review pass reported that reuse collapses whenever the replayed

@@ -103,6 +103,9 @@ class TextModel {
   // ---- sequence state -------------------------------------------------------------------------
   virtual void Reset() = 0;
   virtual void SetDflashInjectionEnabled(bool enabled) = 0;
+  // Model::SaveCheckpoint / RestoreCheckpoint (ModelOptions::prompt_checkpoint). Device work.
+  virtual void SaveCheckpoint() = 0;
+  virtual void RestoreCheckpoint() = 0;
 
   // ---- vision ---------------------------------------------------------------------------------
   // Model::EncodeImages, with the merged rows written to `out` (device rows at TP=1; host rows

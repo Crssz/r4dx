@@ -224,6 +224,34 @@ void TestEmbedDeviceResidentFlag() {
   }
 }
 
+// --prompt-checkpoint (docs/server.md "Prefix cache"): defaults to "on", accepts "off", rejects
+// anything else.
+void TestPromptCheckpointFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.prompt_checkpoint == "on");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--prompt-checkpoint", "off"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.prompt_checkpoint == "off");
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--prompt-checkpoint", "yes"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+}
+
 // --mtp upper bound (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own kMaxMtpDraftK
 // check -- Model::VerifyWindow requires mtp+1 candidates to fit in a <=64-row chunk, so 63 is the
 // real ceiling; previously only `>= 0` was checked here.
@@ -434,6 +462,7 @@ int main() {
   TestMtpHeadLayoutFlag();
   TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();
+  TestPromptCheckpointFlag();
   TestMtpUpperBound();
   TestDflashFlags();
   TestVisionFlags();

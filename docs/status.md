@@ -283,7 +283,10 @@ default path's assumption is enforced rather than assumed.
 4. The image-aware prefix cache's non-ASCII round-trip gap (above): a reply whose text does not
    survive re-tokenization byte-for-byte falls back to a full re-prefill and (if an image is
    involved) a full re-encode -- correct output, not always the cheap path; root cause (dedupe
-   against committed token ids rather than re-tokenized text) not fixed this stage.
+   against committed token ids rather than re-tokenized text) not fixed this stage. **Narrowed
+   2026-09-26** by the server's prompt checkpoint (docs/server.md "Prefix cache, image-aware",
+   `--prompt-checkpoint`): such a miss now re-prefills only the previous reply and the new turn; the
+   prompt before it, and any image in it, are reused.
 5. `r4dx-cli --chat`'s own separate, pre-existing multi-turn re-render limitation (not
    vision-specific, documented in stage 5's own entry below) still applies when an image is
    involved, same as when one is not.

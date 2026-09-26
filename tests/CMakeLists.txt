@@ -106,9 +106,19 @@ if(EXISTS "${R4DX_REFERENCE_PYTHON}")
   )
   set_tests_properties(reference_hessian_corpus PROPERTIES ENVIRONMENT
                        "OMP_NUM_THREADS=1;PYTHONIOENCODING=utf-8")
+
+  # tools/reference/gguf_dequant.py + gguf_validate.py (the --weights-gguf path of
+  # full_logits_golden.py): hand-built blocks per ggml type, a synthetic GGUF, the qwen35 map, and
+  # -- when the Unsloth GGUF and the bf16 checkpoint are on disk -- real tensors. numpy only, no GPU.
+  add_test(
+      NAME reference_gguf_dequant
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_gguf_dequant.py"
+  )
+  set_tests_properties(reference_gguf_dequant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
 else()
-  message(STATUS "r4dx: reference_manifest, reference_dflash2, reference_hessian_rms and "
-                 "reference_hessian_corpus NOT "
+  message(STATUS "r4dx: reference_manifest, reference_dflash2, reference_hessian_rms, "
+                 "reference_hessian_corpus and reference_gguf_dequant NOT "
                  "registered -- the reference venv's interpreter ${R4DX_REFERENCE_PYTHON} does not "
                  "exist (set R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and "
                  "reconfigure)")

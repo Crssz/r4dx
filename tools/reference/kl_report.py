@@ -112,6 +112,47 @@ def read_meta(directory: Path, name: str) -> dict:
         return json.load(f)
 
 
+def side_identity(directory: Path, meta: dict) -> dict:
+    """What produced one side of a segment: the layer count (the sidecar's, else -- for dumps written
+    before sidecars recorded it -- the directory's reference_run.json; None for the r4dx engine, which
+    always runs the whole model), --debug-max-layers, and for a full_logits_golden.py --weights-gguf
+    dump the GGUF's header sha256 and substituted tensor count."""
+    run = {}
+    run_path = directory / "reference_run.json"
+    if "n_layers" not in meta and run_path.exists():
+        try:
+            with open(run_path, "r", encoding="utf-8") as f:
+                run = json.load(f)
+        except (OSError, ValueError):
+            run = {}
+    wg = meta.get("weights_gguf") or {}
+    return {"source": meta.get("source"),
+            "n_layers": meta.get("n_layers", run.get("n_layers")),
+            "debug_max_layers": meta.get("debug_max_layers", run.get("debug_max_layers")),
+            "gguf_header_sha256": wg.get("header_sha256"),
+            "gguf_substituted_count": wg.get("substituted_count"),
+            "gguf_path": wg.get("path")}
+
+
+def check_sides(results: list[dict], strict: bool) -> list[str]:
+    """Every segment of one side must come from the same producer: one layer count, one GGUF. A
+    directory mixing two runs (another GGUF, a --debug-max-layers dump) would otherwise be scored
+    segment by segment without complaint."""
+    problems = []
+    for side in ("ref", "test"):
+        ids = {json.dumps({k: r[f"{side}_identity"][k] for k in ("n_layers", "gguf_header_sha256",
+                                                                  "gguf_substituted_count")}, sort_keys=True)
+               for r in results}
+        if len(ids) > 1:
+            problems.append(f"the {side} directory mixes dumps of different runs across segments: "
+                            + " vs ".join(sorted(ids)))
+    if problems and strict:
+        raise SystemExit("[kl_report] " + "; ".join(problems))
+    for p in problems:
+        print(f"[kl_report] WARNING {p}")
+    return problems
+
+
 def open_rows(directory: Path, name: str, rows: int, vocab: int) -> np.memmap:
     path = directory / f"{name}.logprobs.f16"
     if not path.exists():
@@ -143,6 +184,14 @@ def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Pa
         if meta.get("sha256_of_token_ids_json") not in (None, sha):
             problems.append(f"{side}.sha256_of_token_ids_json={meta.get('sha256_of_token_ids_json')} "
                             f"but the tokens file hashes to {sha}")
+    if ref_meta.get("weights_gguf"):  # full_logits_golden.py --weights-gguf: a test side, never a ref
+        problems.append(f"ref side is a --weights-gguf dump (source {ref_meta.get('source')!r}), "
+                        "not the bf16 reference")
+    ref_id, test_id = side_identity(ref_dir, ref_meta), side_identity(test_dir, test_meta)
+    if (ref_id["n_layers"] is not None and test_id["n_layers"] is not None
+            and int(ref_id["n_layers"]) != int(test_id["n_layers"])):
+        problems.append(f"layer count mismatch: ref ran {ref_id['n_layers']} layers, test "
+                        f"{test_id['n_layers']} (a --debug-max-layers dump?)")
     vocab = int(ref_meta["V"])
     if int(test_meta["V"]) != vocab:
         problems.append(f"vocab mismatch: ref V={vocab}, test V={test_meta['V']}")
@@ -195,6 +244,8 @@ def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Pa
         "positions_kl_gt_1": int((kl > KL_ALARM).sum()),
         "max_abs_p_ref_sum_minus_1": p_sum_dev,
         "problems": problems,
+        "ref_identity": ref_id,
+        "test_identity": test_id,
         "_kl": kl,
         "_nll_ref": nll_ref,
         "_nll_test": nll_test,
@@ -241,17 +292,29 @@ def markdown(segs: list[dict], total: dict, ref_dir: Path, test_dir: Path) -> st
     head = ("| segment | rows | mean KL | median KL | p99 KL | max KL | max @ | top-1 | top-5 | "
             "ppl ref | ppl test | KL>1 |")
     sep = "|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|"
+    def describe(ident: dict) -> str:
+        s = f"source {ident['source']!r}"
+        if ident["n_layers"] is not None:
+            s += f", {ident['n_layers']} layers"
+        if ident["gguf_header_sha256"]:
+            s += (f", GGUF weights `{Path(ident['gguf_path'] or '?').name}` (header sha256 "
+                  f"{ident['gguf_header_sha256'][:16]}..., {ident['gguf_substituted_count']} tensors substituted)")
+        return s
+
     lines = [
-        f"# KL(reference || r4dx) -- {len(segs)} segment(s)",
+        f"# KL(reference || test) -- {len(segs)} segment(s)",
         "",
-        f"- reference log-probs: `{ref_dir}`",
-        f"- test log-probs:      `{test_dir}`",
+        f"- reference log-probs: `{ref_dir}` ({describe(segs[0]['ref_identity'])})",
+        f"- test log-probs:      `{test_dir}` ({describe(segs[0]['test_identity'])})",
         f"- KL is in **nats**, summed over the full {segs[0]['V']}-way vocabulary, computed in fp64 "
         f"from fp16 inputs.",
         f"- `KL>1` counts positions whose KL exceeds {KL_ALARM} nat.",
-        "",
-        head, sep,
     ]
+    for side in ("ref", "test"):
+        dbg = segs[0][f"{side}_identity"]["debug_max_layers"]
+        if dbg:
+            lines.append(f"- **WARNING: the {side} side is a --debug-max-layers {dbg} dump -- NOT a valid golden.**")
+    lines += ["", head, sep]
     for s in segs:
         lines.append(
             f"| {s['name']} | {s['rows']} | {s['mean_kl']:.5f} | {s['median_kl']:.5f} | "
@@ -348,14 +411,39 @@ def self_test() -> int:
               f"(analytic {ppl_ref_analytic:.9f}, rel err {ppl_rel:.3e})")
         ok &= ppl_rel < 1e-3
 
+        # A truncated (--debug-max-layers) dump must not be scored against a full reference: the test
+        # sidecar says 16 layers, the reference's layer count comes from its reference_run.json.
+        with open(ref_dir / "reference_run.json", "w", encoding="utf-8") as f:
+            json.dump({"n_layers": 64}, f)
+        meta_path = test_dir / "selftest.meta.json"
+        good_meta = meta_path.read_text(encoding="utf-8")
+        meta_path.write_text(json.dumps({**json.loads(good_meta), "n_layers": 16, "debug_max_layers": 16}),
+                             encoding="utf-8")
+        try:
+            compare_segment("selftest", token_ids, ref_dir, test_dir, row_chunk=3, strict=True)
+            print("[self-test] 3. layer-count mismatch NOT detected -- FAIL")
+            ok = False
+        except SystemExit as exc:
+            print(f"[self-test] 3. layer-count mismatch detected: {str(exc)[:90]}")
+        meta_path.write_text(good_meta, encoding="utf-8")
+        # Segments of one side from two different runs (two GGUFs) must be refused too.
+        seg_b = dict(seg, test_identity={**seg["test_identity"], "gguf_header_sha256": "ab" * 32})
+        try:
+            check_sides([seg, seg_b], strict=True)
+            print("[self-test] 4. mixed test directory NOT detected -- FAIL")
+            ok = False
+        except SystemExit:
+            print("[self-test] 4. mixed test directory detected")
+        ok &= check_sides([seg, seg], strict=True) == []
+
         # A size/shape mismatch must be caught, not silently misread.
         (test_dir / "selftest.logprobs.f16").write_bytes(b"\x00" * 10)
         try:
             compare_segment("selftest", token_ids, ref_dir, test_dir, row_chunk=3, strict=True)
-            print("[self-test] 3. truncated file NOT detected -- FAIL")
+            print("[self-test] 5. truncated file NOT detected -- FAIL")
             ok = False
         except ValueError as exc:
-            print(f"[self-test] 3. truncated file detected: {type(exc).__name__}")
+            print(f"[self-test] 5. truncated file detected: {type(exc).__name__}")
 
     print(f"[self-test] {'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
@@ -399,6 +487,7 @@ def main() -> int:
     for seg in segments:
         results.append(compare_segment(seg["name"], seg["token_ids"], args.ref_dir, args.test_dir,
                                        args.row_chunk, strict=not args.allow_mismatch))
+    side_problems = check_sides(results, strict=not args.allow_mismatch)
     total = overall(results)
     print(markdown(results, total, args.ref_dir, args.test_dir))
 
@@ -417,6 +506,9 @@ def main() -> int:
             "tokenizer_provenance": doc.get("tokenizer_provenance"),
             "kl_alarm_nats": KL_ALARM,
             "logprob_clamp": LOGPROB_CLAMP,
+            "ref_identity": results[0]["ref_identity"],
+            "test_identity": results[0]["test_identity"],
+            "side_problems": side_problems,
             "segments": [{k: v for k, v in s.items() if not k.startswith("_")} for s in results],
             "overall": total,
         }

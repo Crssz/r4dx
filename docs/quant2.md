@@ -1186,4 +1186,5 @@ template trims replayed assistant content (`|trim`), the re-rendered history the
 committed tokens, and the server's all-or-nothing reuse (the GDN state cannot be rewound) correctly
 re-prefills. The same smoke's free-form case (a 37-non-ASCII-char Japanese turn 1) REUSED the prefix
 without re-encoding the image on this container. The server-side gap (reuse lost after any
-whitespace-led reply) is filed as its own task.
+whitespace-led reply) is filed as its own task; its fix (built on quant2 4bece0b in the scratch
+worktree `r4dx-ckpt-q2`, not merged yet) makes this container's yes/no case pass, per that session.

@@ -868,6 +868,186 @@ Key options: `--segment NAME` (repeatable/comma-separated), `--max-tokens N` (tr
 segment), `--impl {model,manual}`, `--lm-head-chunk`, `--row-block`, `--top-k`, `--skip-segments`
 (validations only), and `--debug-max-layers N`, which runs only the first N layers for timing
 experiments and prints a loud warning that the outputs are **not** a valid golden.
+`--weights-gguf FILE` (with `--gguf-threads`, `--gguf-sha256`) swaps in a llama.cpp GGUF's
+quantized weights -- see the next section.
+
+## A llama.cpp GGUF on our tokens: `--weights-gguf`, gguf_dequant.py, gguf_validate.py
+
+Rung 4 used to be compared with llama.cpp's *published* Q4_K_M KL (0.011-0.014,
+`llama-perplexity --kl-divergence` on English WikiText), which is not measured on our tokens.
+`full_logits_golden.py --weights-gguf` runs **this** reference forward with every weight a GGUF
+quantized replaced by its dequantized value, writes the shared log-prob format, and `kl_report.py`
+scores it against the existing bf16 reference on `kl_corpus/`.
+
+```powershell
+$py   = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+$gguf = 'D:\huggingface\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\4ca720788d1e01f1bff70c033e0d0028fd02e502\Qwen3.8-27B-UD-Q4_K_XL.gguf'
+# CPU, no GPU: every tensor against the checkpoint and against ggml's C (~4 min, 6 processes)
+& $py tools\reference\gguf_validate.py --gguf $gguf --out-dir D:\models\r4dx\kl-gguf\validation
+# HIP device 1. Check free commit first: the run itself peaks at ~15 GiB of it (see "Host memory")
+(Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory / 1MB   # GB; want >= 20
+$env:HIP_VISIBLE_DEVICES = '1'
+& $py tools\reference\full_logits_golden.py --device cuda --tokens tools\reference\kl_corpus\tokens.json `
+    --weights-gguf $gguf --gguf-sha256 --out-dir D:\models\r4dx\kl-gguf\q1
+& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\kl-q1\ref --test-dir D:\models\r4dx\kl-gguf\q1 `
+    --tokens tools\reference\kl_corpus\tokens.json --out D:\models\r4dx\kl-gguf\kl_q1.json
+# the Thai canonical corpus the same way: tokens_thai_canon.json, ref D:\models\r4dx\kl-thai-canon\ref
+```
+
+The 64-layer run must log `substituting 498 tensors {'Q5_K': 191, 'Q8_0': 108, 'IQ4_XS': 70,
+'Q4_K': 69, 'Q6_K': 50, 'IQ4_NL': 6, 'Q3_K': 3, 'IQ3_S': 1}, keeping 353 lossless ones after an
+exact check, 0 absent from the GGUF`, and end with `GGUF weights: 498 tensors substituted`. The
+GGUF's other 8 quantized and 7 F32 tensors are the MTP layer (`blk.64`), which the logits never
+read. Before quoting the KL, check that `reference_run.json` says `"n_layers": 64` and
+`"debug_max_layers": null`; kl_report.py refuses a layer-count mismatch by itself.
+
+**What is substituted.** For every checkpoint tensor the forward reads (layer weights, the
+embedding rows of the sequence, the final norm, the lm_head):
+
+- the GGUF stores it in a lossy type (anything but F32/BF16): the GGUF's value -- dequantized in
+  float32, put back in the HF layout, rounded to bf16 like every other weight of the reference. On
+  first use it is compared with the bf16 value, and the run **aborts** if its relative error or
+  cosine falls outside `gguf_dequant.WEIGHT_ERROR_BOUNDS`. The embedding is compared on the rows
+  the run uses. Those are a sample, sometimes of a handful of rows, and single ordinary rows reach
+  0.106 against the Q4_K bound of 0.100, so its pooled figure is held to the per-row bound below.
+  Every row is also measured on its own, because one catastrophic row is invisible in a pooled
+  figure. A row above `ROW_ERROR_FACTOR` (2) x its type's bound is recorded in `reference_run.json`
+  (`row_outliers_used`). For the embedding and the lm_head, where one row is one token, such a row
+  **aborts** the run unless its f16 block scales are all coarse (below 2^-20, at most 4
+  significant bits: a row of ~1e-5 values that the format cannot resolve), or unless
+  `--gguf-allow-row-outliers` is passed after gguf_validate.py showed the row is the file's own.
+  The Unsloth file's one such embedding row, 107517, is coarse, and no kl_corpus token uses it.
+- the GGUF stores it losslessly (F32: all norms, `A_log`, `dt_bias`, `conv1d`, the GDN norm): the
+  checkpoint's value, kept only after checking the GGUF holds exactly the converted checkpoint value
+  (bit for bit; `-exp(A_log)` to 1 ulp). A mismatch means the GGUF is of another model, and aborts.
+- the GGUF lacks it: the checkpoint's value.
+
+Everything else is the bf16 reference unchanged: activations, the attention/GDN math and the lm_head
+matmul. So the number is the effect of **weight** quantization alone. llama.cpp's own end-to-end KL
+is somewhat higher, because its matmuls also quantize activations (Q8_1/Q8_K) and it keeps an f16
+KV cache. As a comparison for our weight-only quant2 containers, though, this is the right number.
+Dequantization runs on the CPU (`--gguf-threads`, default 8, ~550 M weights/s), about a minute
+per segment.
+
+**Host memory.** Windows' commit limit, not free RAM, is what runs out. On the CPU dry run this
+process peaks at ~14-15 GiB of commit, bf16 or `--weights-gguf` alike. Most of that is safetensors'
+shard mappings: while a shard is open, its whole view is charged against commit. Opening the
+3.2 GiB lm_head shard takes 3.1 GiB of free commit, and reading one layer out of a 3.7 GiB shard
+raises the peak by ~7 GiB. The GGUF path adds at most ~1.5 GiB (a 32768-row fp32 lm_head block is
+640 MiB) and ~25 MiB per dequant thread, so lowering `--gguf-threads` or `--lm-head-chunk` barely
+helps. A run warns at start below 20 GiB free and records its own peak in `reference_run.json`
+(`host_commit_gib`). If there is less, stop what holds commit first, such as an idle
+`r4dx-server` or other python jobs. A failed allocation shows up as numpy's `ArrayMemoryError` or
+as an access violation (0xC0000005) in native code. One CPU-only review process died of the
+latter while three other heavy jobs ran, and the same layers passed on a clean rerun.
+
+**Can't be mistaken for the reference.** Segment sidecars say `"source": "reference-ggufweights"`
+and carry a `weights_gguf` block (path, size, mtime, header sha256, the full sha256 with
+`--gguf-sha256`, substituted counts per type). Every sidecar, bf16 or not, also records
+`n_layers` and `debug_max_layers`. `reference_run.json` carries the full record: counts per type
+and class, every substituted tensor's rel/cos and worst row, the used outlier rows, and the
+lossless checks. `--weights-gguf` needs an explicit `--out-dir`. A run refuses a directory that
+already holds a dump of another kind (bf16 vs GGUF weights), of another GGUF (by header sha256) or
+with another layer count. For sidecars from before they recorded a layer count, the count in the
+directory's `reference_run.json` is used. `kl_report.py` refuses a `--ref-dir` whose sidecars carry
+`weights_gguf`. It also refuses a ref/test layer-count mismatch and a directory whose segments
+come from different runs (layer count, GGUF, substituted count). Its report names both sides and
+flags a `--debug-max-layers` side.
+
+**gguf_dequant.py** (numpy only, no `gguf` package) memory-maps the file, parses the v2/v3 header
+(every metadata type, `general.alignment`, bounds and overlap checks) and dequantizes F32, F16,
+BF16, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and IQ3_S. Those are all the types in the
+Unsloth UD-Q4_K_XL file. The block layouts are in its docstring, and the arithmetic is float32 in
+ggml's `dequantize_row_*` order. Its output is bit-identical to ggml's own C `dequantize_row_*`
+(called through ctypes from a local llama.cpp build's `ggml-base.dll`, CPU code only: `GgmlC`,
+`$env:R4DX_GGML_BASE_DLL`, default `~/dev/ROCmFPX/build-hip/bin`) and to gguf-py's, on real
+blocks, hand-built blocks and random bytes. IQ3_S needs ggml's 512-entry `iq3s_grid`. That table is **not
+derivable**, so it is read from a local `ggml-common.h` (`$env:R4DX_GGML_COMMON_H`, default
+`~/dev/ROCmFPX/ggml/src/ggml-common.h`) and checked against a pinned SHA-256, which also matches
+gguf-py's own copy. Without the file, IQ3_S raises and nothing is guessed. `Qwen35Map` holds the
+llama.cpp `qwen35` <-> HF name map and the inverse layout transforms:
+
+- Norm weights are stored as `w + 1`, except the GDN `ssm_norm`.
+- `A_log` is stored as `-exp(A_log)`.
+- `conv1d` `[C,1,K]` is stored as `[C,K]`.
+- The GDN V heads are in llama.cpp's tiled order: GGUF head `h` is HF head `(h % 16) * 3 + h // 16`.
+  This covers the V rows of `in_proj_qkv`, `in_proj_z`/`a`/`b`, `A_log`, `dt_bias`, the V channels
+  of `conv1d`, and the columns of `out_proj`.
+
+Everything else is identity. `q_proj` keeps its per-head `[q|gate]` interleave, and nothing is
+rope-permuted.
+
+**gguf_validate.py** checks every GGUF tensor through that same code path. Lossy tensors report rel
+error and cosine against the checkpoint, and each must be inside its type's bound and within 1.4x
+its type's median. Lossless tensors must match exactly. With a ggml-base library on disk
+(`--ggml-c`, default: search, skip if absent), the first, last, worst, every listed outlier and 6
+random rows of each quantized tensor must also decode bit-identically in ggml's C. Any failure
+exits 1.
+
+The bounds and the 1.4x rule were **fitted to this file**: `WEIGHT_ERROR_BOUNDS` sits 25-45% above
+the per-type maxima of the table below. So "inside the bounds" is partly circular here. It is a
+tripwire for a mapping or layout error (rel 0.28-1.4) or a GGUF of another model, not proof of a
+correct decode. The evidence that does not depend on this file is:
+
+- bit-exactness against ggml's C, here and in test part (f), and against gguf-py;
+- the V-head reorder: the 240 tensors that carry it would be at rel >= 1.05 without its inverse.
+
+Result for the Unsloth file (`D:\models\r4dx\kl-gguf\validation`): **866 tensors, 0 failures**.
+All 360 lossless tensors match (349 bit-exact, 11 `-exp(A_log)` 1 ulp off). ggml's C re-decoded
+4525 rows of all 506 quantized tensors, every type, with 0 differing bits.
+
+| type | tensors | rel error median (max) | cos min | worst single row |
+|---|--:|--:|--:|--:|
+| Q8_0 | 110 | 0.0061 (0.0069) | 0.99998 | 0.0125 |
+| Q6_K | 56 | 0.0195 (0.0242) | 0.99971 | 0.1217 |
+| Q5_K | 191 | 0.0383 (0.0401) | 0.99920 | 0.0605 |
+| Q4_K | 69 | 0.0764 (0.0789) | 0.99689 | 1.4226 |
+| IQ4_NL | 6 | 0.0808 (0.0853) | 0.99636 | 0.1291 |
+| IQ4_XS | 70 | 0.0810 (0.0904) | 0.99591 | 0.1433 |
+| IQ3_S | 1 | 0.1468 | 0.98997 | 0.1664 |
+| Q3_K | 3 | 0.1542 (0.1608) | 0.98704 | 0.2246 |
+
+The file averages 5.14 bits per weight: 5.07 on the trunk linears, 4.5 on the embedding (Q4_K),
+6.56 on the lm_head (Q6_K).
+
+*Why each type's maximum sits above its median.* The worst tensors are 1.03-1.24x their type's
+median. Examples: `blk.0.ffn_down` (IQ4_XS, 0.0904 vs 0.0810, 1.12x), `blk.0.ffn_up` (Q3_K),
+`blk.64.nextn.eh_proj` (Q6_K, MTP, not in the logits) and `blk.32.ssm_beta` (Q8_0). Their bf16
+weights look like their peers' (blk.0.ffn_down's mean block absmax/rms 2.384, blk.15's 2.384,
+blk.12's 2.381; kurtosis 3.20 vs 3.11 and 3.10), and the error is spread evenly over rows
+(blk.0.ffn_down row rel median 0.090, max 0.106). It is uneven over
+**input columns**, though. For blk.0.ffn_down the per-column rel runs from 0.058 at p1 to 0.122 at
+p99; for blk.15.ffn_down, 0.065 to 0.095. That is what an importance-weighted quantizer does: this
+file was made with an imatrix (`quantize.imatrix.file` = `imatrix_unsloth.gguf`, 496 entries: one
+per trunk tensor), which spends precision on the input columns that carry the most activation.
+Layer 0's activations are the most skewed. A decode or layout bug would not have this pattern: it
+would not stay row-uniform, and the C decode would differ.
+
+*Rows.* The pooled rel hides a single bad row, so every row is measured too. A row above 2x its
+type's bound is listed, not failed. In this file there are 9 such rows in 5 tensors, and ggml's C
+decodes every one of them identically:
+
+- `token_embd` row 107517 (rel 1.40, cos 0.00). Its bf16 values are ~1e-5 (norm 8.1e-4, the median
+  row's is 0.93), and every f16 scale d of its 20 super-blocks underflowed to 0, so it decodes to
+  its min offsets alone. No kl_corpus token uses it: the worst used rows are 494 (0.106,
+  tokens.json) and 328 (0.102, tokens_thai_canon.json).
+- 5 rows of GDN `in_proj_qkv`, all Q4_K: blk.10 rows 3492 (rel 1.42) and 1444, blk.9 rows 265 and
+  379, blk.16 row 4029. These are near-dead Q/K channels, norm 3-8e-4 against a median of 1.13.
+  Every block scale is below 2^-20 (coarse), so the rel is 0.21-1.42 and the cos 0.49-0.98.
+- 3 rows of `blk.58.ffn_down` (Q6_K): 4316 (rel 0.122), 149 and 310 (0.078). Their scales are
+  normal, and cos is 0.993-0.997, so they are the right rows. They are heavy-tailed: peak/rms is
+  19-32 against ~4 for a typical row, and a super-block's largest sub-block amplitude is up to 9-16x
+  its median sub-block's, against ~2. Such spread within a super-block is the likely cause.
+
+**CPU wiring check** (no GPU): `--device cpu --debug-max-layers 4 --weights-gguf ... --cross-check
+16` on two 24-token segments substitutes 33 tensors (layers 0-3, the embedding and the lm_head),
+bit-checks 23 lossless ones, and finishes in about a minute. `--impl model` and `--impl manual`
+agree exactly, and kl_report.py against the 4-layer bf16 run gives mean KL 0.00008, flagging both
+sides as `--debug-max-layers` dumps. The out-dir guard refuses a GGUF dump into the bf16
+directory, a 2-layer dump into the 4-layer one, a bf16 run into the GGUF directory, and a
+directory holding another GGUF's dump. The bf16 path's `.logprobs.f16` are byte-identical to HEAD's
+`full_logits_golden.py` on the same dry run. The 64-layer skeleton (no forward) plans 498
+substituted, 353 lossless, 0 absent.
 
 ## kl_report.py
 
@@ -908,8 +1088,9 @@ first through `chunk_stats` directly in fp64 (must match to ~1e-16), then throug
 pipeline* -- the pair is written out as real `.logprobs.f16` + `.meta.json` files in a temp
 directory and read back through `compare_segment`, where it only has to hold to fp16 precision
 (~1e-4 on the KL, ~1e-3 relative on the perplexity). A third case with genuinely different argmaxes
-exercises the top-1 / top-5 wiring, and a fourth truncates one file to confirm the size check
-fires:
+exercises the top-1 / top-5 wiring. Then a 16-layer test sidecar against a 64-layer reference
+(whose count comes from its `reference_run.json`) must be refused, and so must a test directory
+whose segments come from two GGUFs. Last, a truncated file confirms the size check fires:
 
 ```
 [self-test] 1. chunk_stats fp64 KL     = 0.173286795140 (analytic 0.173286795140, max err 2.776e-17)
@@ -917,9 +1098,18 @@ fires:
 [self-test]    asymmetric pair KL      = 1.167546089433 (analytic 1.167546089433), top1_agree=False (expect False), top5_contain=True (expect True, V=4 < 5)
 [self-test] 2. end-to-end file KL     = 0.173376598 (analytic 0.173286795, err 8.980e-05, fp16 inputs)
 [self-test]    ppl_ref               = 4.759100090 (analytic 4.756828460, rel err 4.776e-04)
-[self-test] 3. truncated file detected: ValueError
+[self-test] 3. layer-count mismatch detected: [kl_report] segment 'selftest': layer count mismatch: ref ran 64 layers, test 16 (a --debu
+[self-test] 4. mixed test directory detected
+[self-test] 5. truncated file detected: ValueError
 [self-test] PASS
 ```
+
+The report also checks each side's provenance: the layer count (from the sidecar, else the
+directory's `reference_run.json`; the r4dx engine's sidecars have none and always run the whole
+model), `--debug-max-layers`, and for a `--weights-gguf` dump the GGUF's header sha256 and
+substituted count. A ref/test layer-count mismatch, or one side mixing runs across segments, is
+refused (a warning under `--allow-mismatch`). The markdown names both sides and flags a
+`--debug-max-layers` dump.
 
 **Identity smoke check on real data.** Passing the same directory as both `--ref-dir` and
 `--test-dir` must produce exactly zero KL and 100% agreement across all four 1024-token segments,
@@ -1457,6 +1647,28 @@ full expected tensor-name set per component (including the r4d-shaped GDN tensor
 attention tensors above -- a regression that silently drops one now fails this test instead of only
 being noticed by whoever diffs against the missing tensor), that the decode GDN conv output's
 trimmed length matches `--decode-len`, and that the manifest's tolerance table is well-formed.
+
+`tests/reference/test_gguf_dequant.py` (ctest `reference_gguf_dequant`) is numpy-only and runs in
+about 30 s with every optional input present (214 checks). It covers:
+
+- Hand-built blocks for every implemented ggml type. An encoder written from the ggml layouts packs
+  known integers, and decoding must reproduce their exact values. Six deliberately broken decoders
+  were each caught.
+- The same blocks, plus random bytes, decoded bit-identically by gguf-py, if the ROCmFPX checkout
+  is present.
+- A synthetic GGUF v3 covering every metadata type, a non-default alignment, and the refusals; the
+  per-row scale diagnostics on a row whose f16 d is 0 and one whose d is a coarse subnormal.
+- The qwen35 map: tiled order, round trips for every transform, `gguf_row` against `to_hf`, and
+  the 1-ulp lossless rule.
+- If the Unsloth GGUF and the checkpoint are on disk, `gguf_validate.check_tensor` on 19 real
+  tensors (one per transform tag and one per quant type), and token_embd row 107517 found as the
+  one outlier among rows 0, 494 and 107517, with all 20 scales 0.
+- If a local llama.cpp build's `ggml-base.dll` is on disk (`$env:R4DX_GGML_BASE_DLL`, default
+  `~/dev/ROCmFPX/build-hip/bin`; SKIPped otherwise): ggml's own C `dequantize_row_*` through
+  ctypes, bit-identical on the hand-built and random blocks and on gathered and contiguous rows of
+  a real tensor of every quantized type (token_embd with row 107517, and output, among them).
+  One flipped quant bit moves exactly one value. This is the check that does not lean on bounds
+  fitted to the file.
 
 ## kv_fakequant_golden.py
 

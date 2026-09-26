@@ -1168,6 +1168,37 @@ quoted since Milestone 11 (0.011-0.014, docs/validation.md) is llama.cpp's publi
 `llama-perplexity --kl-divergence` number on English WikiText, not rung 4 on `kl_corpus/`: it is not
 comparable with any row here until a Q4_K_M model is scored on the same tokens.
 
+**Corpus v2, the Q3 sweep, and a GGUF on the same tokens (2026-09-26).** All KL below is on the
+canonical four segments (`tokens_canon.json`, reference `D:\models\r4dx\kl-canon\ref`); "decode
+bytes" is every text-layer weight plus `lm_head` (what one decode step streams; the embedding is a
+row gather), measured from the files.
+
+| model | recipe | canonical KL | top-1 | decode bytes |
+|---|---|--:|--:|--:|
+| v6 | int4 g64 search + imatrix | ~0.0297 | -- | 13.68 GiB |
+| q2ab_hv2 | q2ab + LDLQ, hessian-v2 (corpus v2, canonical) | 0.01615 | -- | 13.68 GiB |
+| **q2ab_hv2_q3** | q2ab_hv2 + the Q3 allocation below | **0.01555** | 93.65% (tokens.json) | 13.68 GiB |
+| Unsloth UD-Q4_K_XL (GGUF) | Q5_K 191 / Q8_0 110 / IQ4_XS 70 / Q4_K 69 / Q6_K 56 / ... tensors | **0.00706** (weights only) | 96.38% | 15.35 GiB |
+
+- hessian-v2 vs v1 (q2ab_hv2 vs q2ab_ldlq): canonical Thai 0.0271 -> 0.0197 (-27%), english -10%,
+  python -2%, cpp +12% (v1's code windows were this repo; the cpp segment is its own model.cpp).
+- The Q3 sweep (`C:\AI\r4dx-q3-sweep\candidates.json`, 41 candidates by reuse, ~4 min each):
+  bf16 keeps are the worst buys (0.0002-0.0008 nats/GiB against 0.002-0.016 for g32), i.e. with
+  LDLQ + rotation "preserve sensitive tensors in bf16" no longer pays; quantizing attn.k/v in
+  layers 0-31 is free (-0.112 GiB, no measurable KL). Single-candidate deltas below ~0.0002 are
+  noise (attn.qg -> g32 measured worse). The equal-bytes allocation predicted -6.8% first-order and
+  measured -3.7%: `--w4a16-group-rule` g32 on attn.o, gdn.in_proj_z and gdn.out_proj (L0-31),
+  mlp.down (L32-63), attn.o (L32-63) and lm_head; g128 on mlp.down (L0-31) and mlp.gate_up (L32-63);
+  `--keep-bf16 "^text\.layers\.(3[2-9]|[45][0-9]|6[0-3])\.attn\.[kv]$"`. G8 passes (16.4024 GiB).
+- The GGUF was scored by `full_logits_golden.py --weights-gguf` (weights only; r4dx's own number
+  also carries the fp8 KV cache, ~0.0012 by `kv_fakequant_golden.py`). It streams 12% more bytes
+  (~5.05 bits/weight against ~4.5) and has about half our weight error. The bytes are the smaller
+  part: our sweep implies g32 everywhere (~5 bits/weight, about UD's bytes) would reach only
+  ~0.013. The rest is format -- Q4_K reaches 32-weight granularity at 4.5 bits/weight through 6-bit
+  sub-block scales under an fp16 super-block scale, and the mix spends 5-8 bits where it matters.
+  Next: the EXL3/QTIP trellis oracle (docs/trellis.md), then a native RDNA4 kernel if it clears
+  ~0.008 at 4.0-4.5 bits/weight.
+
 Gates: G3 **failed** narrowly (-9.5% vs the -10% bar; KL fell in every segment) -- Q2 went ahead as a
 stated deviation because it was already built and LDLQ is expected to need the rotation. G4 **passed**
 (q1full -34%, speed-neutral; validate_dflash 3/3 and server smoke 205/0). G5 **passed** (rotated vs

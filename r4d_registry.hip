@@ -123,6 +123,14 @@ static const R4DConstraint cGemmNtW4A8[] = {
 static const R4DConstraint cGemmNtMxfp4A8[] = {
     C_LE("M", 64), C_DIV("K", 32), C_DIV("N", 16), C_IN("dtype", "mxfp4a8"),
 };
+// The trellis GEMM's M1 entry is the raw one (no output transform), so it gets its own op: a caller
+// selecting "gemm_nt" must never be handed a kernel that stops short of the linear.
+static const R4DConstraint cGemmNtTrellisRaw[] = {
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 128), C_IN("dtype", "trellis_mul1_k4"),
+};
+static const R4DConstraint cTrellisReconstruct[] = {
+    C_DIV("K", 16), C_DIV("N", 32), C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+};
 static const R4DConstraint cQuantActI8[] = {
     C_DIV("K", 16), C_IN("dtype", "bf16"),
 };
@@ -270,6 +278,21 @@ static const R4DKernelInfo kKernels[] = {
      "e4m3 A with an f32 per-row scale, e2m1 W with an E8M0 scale per 32 K folded into the "
      "element against a per-row reference, bf16 C, fp32 accumulate",
      ROW(cGemmNtMxfp4A8)},
+    {"gemm_trellis_nt_m64_raw", "gemm", "gemm_nt_raw",
+     "skinny GEMM C[M,N] = A[M,K] @ Q[K,N] with a trellis-coded weight Q (EXL3/QTIP mul1), "
+     "16x16x16 f16 WMMA, split-K in LDS and across blocks (last-arriving block sums a split "
+     "128-column group), NO output transform -- the test and bench entry",
+     "M <= 64; K, N multiples of 128; tiles in the n-pair grid; block width WV*NP*32 in "
+     "{32,64,128,256} dividing N; (K/16) divisible by SK*SKG*U; KB = 4 "
+     "(gemm_trellis_nt_m64_has_rate)",
+     "f16 A (already input-transformed), mul1 trellis W at KB bits per weight, fp32 C, fp32 "
+     "accumulate, deterministic reduction",
+     ROW(cGemmNtTrellisRaw)},
+    {"trellis_reconstruct_f16", "quant", "trellis_reconstruct",
+     "the whole decoded trellis weight Q[K,N] as f16, with the GEMM's own device decode",
+     "K a multiple of 16, N of 32 (tile pairs); KB 4 or 5",
+     "mul1 trellis W in the n-pair grid in, f16 Q out, bit-exact against the reference decode",
+     ROW(cTrellisReconstruct)},
     {"quant_act_i8", "quant", "quant_act",
      "per-row symmetric int8 quantisation of a bf16 activation, written in the byte order "
      "gemm_w4a8_nt_m64's A fragment reads",

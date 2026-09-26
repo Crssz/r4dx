@@ -285,6 +285,43 @@ int  r4d_gemm_w4a16_nt_m64_has_group(int group);
 void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K,
                              int N, int WV, int SK, int MB, int NPW, int NT, int64_t stream);
 
+// Skinny GEMM with a TRELLIS-coded weight: EXL3 / QTIP tiles of 16 k x 16 n, each a tail-biting
+// ring of 256*KB bits whose 16-bit states hash to f16 values (the "mul1" codebook), f16 A, 16x16x16
+// WMMA, one kernel for M = 1..64. `w` is the tiles' uint32 ring words in the PAIR GRID -- word w of
+// tile (tn, tk) at (((tn >> 1) * (K/16) + tk) * 2 + (tn & 1)) * 8KB + w -- N*K*KB/8 bytes, 16-byte
+// aligned. Q[K,N] below is the decoded weight in its regularized domain; the linear it belongs to is
+// W^T = diag(suh) H Q H diag(svh) (128-point Hadamards), whose input side is applied to A before
+// this call. Two A parts: output columns >= n_split read a1 (a fused gate/up pair with different
+// input transforms), all others a0; a1 = 0 means a0. Tuning: WV x SK waves per block (column blocks
+// x in-block K splits), NP tile pairs per wave (block width Wc = 32 WV NP, one of 32/64/128/256),
+// SKG blocks splitting K across the grid, MT row tiles per block, U k-tiles per step, NT for
+// non-temporal weight loads. Legal only when K and N are multiples of 128, N and n_split of Wc,
+// (K/16) of SK*SKG*U, SK*Wc*32 <= 64 KiB, WV*SK*32 <= 1024, and (NP, U, MT) is instantiated
+// (NP, U in {1,2,4}, NP*U <= 8; MT up to 4 at NP 1 and at (NP, U) = (2, 1), 3 at (2, 2) and
+// (2, 4), 2 at (4, 1), 1 at (4, 2) -- what fits 190 VGPRs); anything else throws. A 128-column
+// group whose sums come from
+// more than one block (SKG > 1 or Wc < 128) is finished by the last block to arrive, through `ws`
+// (fp32, ws_bytes(M, N, SKG)) and `tickets` (u32 [N/128], zero before the first call; every
+// complete launch leaves them zero again), and needs every row tile in one block (ceil(M/16) <= MT).
+// A row's result depends on the tuning's summation order (SK, SKG, Wc), never on M or on the other
+// rows, so a caller that gives every M <= 16 the same tuning gets verify rows equal to decode rows.
+//
+// _raw is the test and diagnostic entry: fp32 C[M,N] = A @ Q with no output transform, so one-hot
+// A rows return rows of Q bit for bit. `clk` (0 = off): 4 uint64 that block (0,0,0)'s thread 0
+// fills with clock64() / wall_clock64() at entry and at the end of its own work, for the shader
+// clock during a real launch.
+void r4d_gemm_trellis_nt_m64_raw(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t c,
+                                 int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
+                                 int SK, int MT, int NP, int SKG, int U, int NT, int64_t clk,
+                                 int64_t stream);
+int    r4d_gemm_trellis_nt_m64_has_rate(int KB);   // 1 for an instantiated KB (4), else 0
+int    r4d_gemm_trellis_nt_m64_max_m(void);         // 64
+size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG);
+// The whole decoded Q[K,N] as f16 bits (row-major, K rows), from the same pair-grid words and the
+// same device decode as the GEMM, bit-exact against the format's reference decode. KB 4 or 5; K a
+// multiple of 16, N of 32.
+void   r4d_trellis_reconstruct_f16(int64_t w, int64_t q, int K, int N, int KB, int64_t stream);
+
 // 4-bit weight, 8-bit activation. Signed 4-bit codes, per-row activation scale, int8 WMMA.
 void r4d_gemm_w4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t c, int M, int K, int N,
                           int WV, int SK, int MB, int NPW, int NT, int64_t stream);

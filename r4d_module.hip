@@ -675,6 +675,18 @@ PYBIND11_MODULE(r4d, m) {
         py::arg("stream"));
   m.def("gemm_w4a16_nt_m64_has_group",
         [](int group) { return r4d_gemm_w4a16_nt_m64_has_group(group) != 0; }, py::arg("group"));
+  m.def("gemm_trellis_nt_m64_raw", &r4d_gemm_trellis_nt_m64_raw, py::arg("a0"), py::arg("a1"),
+        py::arg("n_split"), py::arg("w"), py::arg("c"), py::arg("ws"), py::arg("tickets"),
+        py::arg("M"), py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("WV"), py::arg("SK"),
+        py::arg("MT"), py::arg("NP"), py::arg("SKG"), py::arg("U"), py::arg("NT"),
+        py::arg("clk"), py::arg("stream"));
+  m.def("gemm_trellis_nt_m64_has_rate",
+        [](int KB) { return r4d_gemm_trellis_nt_m64_has_rate(KB) != 0; }, py::arg("KB"));
+  m.def("gemm_trellis_nt_m64_ws_bytes", &r4d_gemm_trellis_nt_m64_ws_bytes, py::arg("M"),
+        py::arg("N"), py::arg("SKG"));
+  m.attr("GEMM_TRELLIS_MAX_M") = r4d_gemm_trellis_nt_m64_max_m();
+  m.def("trellis_reconstruct_f16", &r4d_trellis_reconstruct_f16, py::arg("w"), py::arg("q"),
+        py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("stream"));
   m.def("gemm_w4a8_nt_m64", &r4d_gemm_w4a8_nt_m64, py::arg("a"), py::arg("ascale"), py::arg("wq"),
         py::arg("ws"), py::arg("c"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("WV"),
         py::arg("SK"), py::arg("MB"), py::arg("NPW"), py::arg("NT"), py::arg("stream"));

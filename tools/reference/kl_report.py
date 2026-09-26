@@ -126,12 +126,15 @@ def side_identity(directory: Path, meta: dict) -> dict:
         except (OSError, ValueError):
             run = {}
     wg = meta.get("weights_gguf") or {}
+    wo = meta.get("weights_override") or {}  # full_logits_golden.py --weights-override
     return {"source": meta.get("source"),
             "n_layers": meta.get("n_layers", run.get("n_layers")),
             "debug_max_layers": meta.get("debug_max_layers", run.get("debug_max_layers")),
             "gguf_header_sha256": wg.get("header_sha256"),
             "gguf_substituted_count": wg.get("substituted_count"),
-            "gguf_path": wg.get("path")}
+            "gguf_path": wg.get("path"),
+            "override_manifest_sha256": wo.get("manifest_sha256"),
+            "override_path": wo.get("manifest")}
 
 
 def check_sides(results: list[dict], strict: bool) -> list[str]:
@@ -140,8 +143,9 @@ def check_sides(results: list[dict], strict: bool) -> list[str]:
     segment by segment without complaint."""
     problems = []
     for side in ("ref", "test"):
-        ids = {json.dumps({k: r[f"{side}_identity"][k] for k in ("n_layers", "gguf_header_sha256",
-                                                                  "gguf_substituted_count")}, sort_keys=True)
+        ids = {json.dumps({k: r[f"{side}_identity"].get(k) for k in (
+                    "n_layers", "gguf_header_sha256", "gguf_substituted_count",
+                    "override_manifest_sha256")}, sort_keys=True)
                for r in results}
         if len(ids) > 1:
             problems.append(f"the {side} directory mixes dumps of different runs across segments: "
@@ -186,6 +190,9 @@ def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Pa
                             f"but the tokens file hashes to {sha}")
     if ref_meta.get("weights_gguf"):  # full_logits_golden.py --weights-gguf: a test side, never a ref
         problems.append(f"ref side is a --weights-gguf dump (source {ref_meta.get('source')!r}), "
+                        "not the bf16 reference")
+    if ref_meta.get("weights_override"):  # --weights-override: likewise only ever a test side
+        problems.append(f"ref side is a --weights-override dump (source {ref_meta.get('source')!r}), "
                         "not the bf16 reference")
     ref_id, test_id = side_identity(ref_dir, ref_meta), side_identity(test_dir, test_meta)
     if (ref_id["n_layers"] is not None and test_id["n_layers"] is not None

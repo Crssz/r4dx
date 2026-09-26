@@ -116,9 +116,21 @@ if(EXISTS "${R4DX_REFERENCE_PYTHON}")
               "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_gguf_dequant.py"
   )
   set_tests_properties(reference_gguf_dequant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
+
+  # tools/reference/trellis_quant.py (the EXL3 trellis oracle, docs/trellis.md) and its native
+  # encoders (trellis_viterbi.hip, built on first use with the venv's ROCm clang++): codebooks,
+  # brute-force Viterbi optimality, native == torch bit for bit, the bitstream, LDLQ / regularize /
+  # refit, the int4 baseline, allocation and the --weights-override plumbing. CPU; the HIP encoder
+  # is checked too when the environment has HIP_VISIBLE_DEVICES=1, SKIPped otherwise.
+  add_test(
+      NAME reference_trellis_quant
+      COMMAND "${R4DX_REFERENCE_PYTHON}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_trellis_quant.py"
+  )
+  set_tests_properties(reference_trellis_quant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
 else()
   message(STATUS "r4dx: reference_manifest, reference_dflash2, reference_hessian_rms, "
-                 "reference_hessian_corpus and reference_gguf_dequant NOT "
+                 "reference_hessian_corpus, reference_gguf_dequant and reference_trellis_quant NOT "
                  "registered -- the reference venv's interpreter ${R4DX_REFERENCE_PYTHON} does not "
                  "exist (set R4DX_REFERENCE_VENV to a venv with torch/transformers/numpy and "
                  "reconfigure)")

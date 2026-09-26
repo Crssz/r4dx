@@ -32,6 +32,13 @@ output is tagged `"source": "reference-ggufweights"` with a `weights_gguf` recor
 `--out-dir`, and it will not write into a directory holding a bf16 reference (nor a bf16 run into a
 GGUF-weights directory).
 
+`--weights-override <dir>` does the same with the weights of an override directory (a
+`weights_override.json` manifest written by trellis_quant.py: the EXL3 trellis oracle's packed
+bitstreams + fp16 scales, reconstructed in the original basis on the device, or plain dense
+tensors), via `OverrideWeightsReference`. Output tagged `"source": "reference-overrideweights"`
+with a `weights_override` record (manifest sha256, measured bits/weight, per-class K); the same
+explicit-`--out-dir` and no-mixing rules apply.
+
 Usage (reference venv only -- read-only against the venv and the checkpoint):
 
     $env:HIP_VISIBLE_DEVICES = '1'
@@ -787,11 +794,172 @@ class GGUFWeightsReference(StreamingReference):
         }
 
 
+# --------------------------------------------------------------------------------------------
+# An override directory's weights in the reference forward (--weights-override)
+# --------------------------------------------------------------------------------------------
+
+
+def override_rel_bound(K: float) -> float:
+    """Loosest plausible relative weight error of a trellis tensor at K bits: 2^-(K-2) (0.25 at
+    K = 4). LDLQ trades weight error for output error, so the measured values sit well inside it
+    (docs/trellis.md; the manifest records each tensor's own); a layout or mapping error is ~1.4."""
+    return 2.0 ** (-(float(K) - 2.0))
+
+
+class OverrideWeightsReference(StreamingReference):
+    """`StreamingReference` with the weights of an override directory substituted in
+    (`--weights-override`): every checkpoint tensor its `weights_override.json` lists is replaced by
+    the directory's value -- a `trellis-exl3` entry is reconstructed on the device from its stored
+    bits exactly as trellis_quant.reconstruct does (diag(suh) P_k decode(words) P_n diag(svh),
+    transposed to the HF [out, in] layout), a `dense` entry is read as is -- then rounded to bf16
+    like every other weight. Everything else is the checkpoint's. Weight-only, like --weights-gguf.
+
+    Checks, so a wrong directory cannot produce a plausible-looking KL: the manifest must be
+    complete for the layers this run uses and name only decoder-layer weights of this checkpoint
+    (same config.json sha256); on first use each tensor's shape must match and its relative error
+    against the bf16 value must be under `override_rel_bound(K)` with cosine >= 0.9, AND within
+    2% of the error trellis_quant.py recorded when it wrote the bits."""
+
+    source_tag = "reference-overrideweights"
+
+    def __init__(self, model_dir: Path, device, override_dir: Path, dtype=torch.bfloat16,
+                 max_layers: int | None = None, verbose: bool = True):
+        import trellis_quant as tq
+
+        self.tq = tq
+        self.manifest = tq.load_manifest(Path(override_dir))
+        self.manifest_path = Path(self.manifest["_path"])
+        self.manifest_sha256 = sha256_file(self.manifest_path)
+        self.tensor_stats: dict[str, dict] = {}
+        self.reconstruct_seconds = 0.0
+        self._cb_cache: dict = {}
+        super().__init__(model_dir, device, dtype=dtype, max_layers=max_layers, verbose=verbose)
+        cfg_sha = sha256_file(Path(model_dir) / "config.json")
+        if self.manifest.get("config_sha256") not in (None, cfg_sha):
+            raise SystemExit(f"[full_logits] {self.manifest_path} was made for another checkpoint "
+                             f"(config.json sha256 {self.manifest['config_sha256'][:16]}... vs {cfg_sha[:16]}...)")
+        names = list(self.manifest["tensors"])
+        bad = [n for n in names if n not in self.index.weight_map or self._layer_of(n) is None]
+        if bad:
+            raise SystemExit(f"[full_logits] --weights-override: {len(bad)} manifest entries are not "
+                             f"decoder-layer weights of this checkpoint (only those are supported): {bad[:5]}")
+        self.plan = sorted(n for n in names if self._layer_of(n) < self.n_layers)
+        missing_files = sorted({str(tq.tensor_file(self.manifest, self.manifest["tensors"][n]))
+                                for n in self.plan
+                                if not tq.tensor_file(self.manifest, self.manifest["tensors"][n]).exists()})
+        if missing_files:
+            raise SystemExit(f"[full_logits] --weights-override: missing files {missing_files[:5]}")
+        if not self.manifest.get("complete", True):
+            # An unfinished quantize-model run: usable only for layers it has fully written.
+            listed = set(names)
+            required = [tq.hf_name(i, m) for i in range(self.n_layers)
+                        for m in tq.module_list(self.layer_types[i])]
+            lacking = [n for n in required if n not in listed]
+            if lacking:
+                raise SystemExit(f"[full_logits] {self.manifest_path} is incomplete (quantize-model has not "
+                                 f"finished) and lacks {len(lacking)} of the {len(required)} linears this "
+                                 f"{self.n_layers}-layer run needs, e.g. {lacking[:3]}")
+        if verbose:
+            s = self.manifest.get("summary", {})
+            print(f"[full_logits] --weights-override {self.manifest_path}: substituting {len(self.plan)} "
+                  f"tensors ({self.manifest.get('encoding')}, {s.get('bpw') or float('nan'):.4f} bpw "
+                  f"measured over the manifest, K per class "
+                  f"{ {c: v['K'] for c, v in s.get('by_class', {}).items()} })", flush=True)
+
+    @staticmethod
+    def _layer_of(name: str) -> int | None:
+        return GGUFWeightsReference._layer_of(name)
+
+    def _check(self, name: str, w_hat: torch.Tensor, w_bf16: torch.Tensor) -> None:
+        rec = self.manifest["tensors"][name]
+        if tuple(w_hat.shape) != tuple(w_bf16.shape):
+            raise SystemExit(f"[full_logits] OVERRIDE SHAPE CHECK FAILED: {name} is {tuple(w_hat.shape)} "
+                             f"in the override, {tuple(w_bf16.shape)} in the checkpoint")
+        w = w_bf16.to(device=w_hat.device, dtype=torch.float32)
+        rel, cos = self.tq.rel_cos(w, w_hat)  # fp64 accumulation
+        K = rec.get("K")
+        bound = override_rel_bound(K) if K is not None else 0.5
+        want = rec.get("rel_weight_err")
+        st = {"K": K, "encoding": rec.get("encoding"), "rel": rel, "cos": cos, "rel_recorded": want,
+              "rel_bound": bound, "bpw": (rec.get("bits") or {}).get("bpw"), "proxy": rec.get("proxy"),
+              "file": str(self.tq.tensor_file(self.manifest, rec))}
+        self.tensor_stats[name] = st
+        if rel > bound or cos < 0.9:
+            raise SystemExit(f"[full_logits] OVERRIDE WEIGHT CHECK FAILED: {name} (K={K}) has rel error "
+                             f"{rel:.4f} (bound {bound:.3f}) and cosine {cos:.6f} against the bf16 "
+                             "checkpoint -- a layout/mapping error or a directory of another model")
+        if want is not None and abs(rel - want) > 0.02 * want + 1e-4:
+            raise SystemExit(f"[full_logits] OVERRIDE WEIGHT CHECK FAILED: {name} reconstructs to rel error "
+                             f"{rel:.5f} but trellis_quant.py recorded {want:.5f} when it wrote these "
+                             "bits -- the file does not hold what the manifest says")
+
+    def layer_state(self, prefix: str, keys: list[str]) -> dict[str, torch.Tensor]:
+        names = [prefix + k for k in keys]
+        sub = set(n for n in names if n in self.manifest["tensors"])
+        read = [n for n in names if n not in sub or n not in self.tensor_stats]
+        raw = get_tensors_grouped(self.index, read)
+        sd = {}
+        for k, n in zip(keys, names):
+            if n in sub:
+                t0 = time.perf_counter()
+                w_hat = self.tq.load_override_tensor(self.manifest, n, self.device, self._cb_cache)
+                self.reconstruct_seconds += time.perf_counter() - t0
+                if n not in self.tensor_stats:
+                    self._check(n, w_hat, raw.pop(n))
+                sd[k] = w_hat.to(dtype=self.dtype)
+                del w_hat
+            else:
+                sd[k] = raw.pop(n).to(device=self.device, dtype=self.dtype)
+        return sd
+
+    def segment_meta(self) -> dict:
+        s = self.manifest.get("summary", {})
+        return {**super().segment_meta(), "weights_override": {
+            "manifest": str(self.manifest_path), "manifest_sha256": self.manifest_sha256,
+            "encoding": self.manifest.get("encoding"), "bpw_target": self.manifest.get("bpw_target"),
+            "bpw_measured": s.get("bpw"), "substituted_count": len(self.plan),
+            "weights": "override directory for every tensor its manifest lists (reconstructed in the "
+                       "original basis), bf16 checkpoint otherwise; activations as in the bf16 "
+                       "reference (weight-only quantization)",
+        }}
+
+    def weights_record(self) -> dict:
+        """The `weights_override` block of reference_run.json."""
+        m = self.manifest
+        s = m.get("summary", {})
+        used = {n: m["tensors"][n] for n in self.plan}
+        used_summary = self.tq.summarize_tensors(used) if used else {}
+        rels = sorted(v["rel"] for v in self.tensor_stats.values())
+        return {
+            "manifest": str(self.manifest_path), "manifest_sha256": self.manifest_sha256,
+            "encoding": m.get("encoding"), "bpw_target": m.get("bpw_target"),
+            "K_uniform": m.get("K_uniform"), "allocation": m.get("allocation"),
+            "hessian_dir": m.get("hessian_dir"), "hessian_manifest_sha256": m.get("hessian_manifest_sha256"),
+            "hessian_basis": m.get("hessian_basis"), "recipe": m.get("recipe"),
+            "provenance": m.get("provenance"),
+            "summary_manifest": s,
+            "summary_used": {k: used_summary.get(k) for k in ("n_tensors", "numel", "bits", "bpw",
+                                                               "bpw_trellis_only", "decode_gib",
+                                                               "proxy_mean", "proxy_max", "by_class")},
+            "rule": ("every tensor the manifest lists is replaced by its reconstruction from the stored "
+                     "form (trellis bits + fp16 suh/svh, or dense), rounded to bf16; everything else is "
+                     "the bf16 checkpoint's"),
+            "checked": {"count": len(self.tensor_stats), "rel_median": rels[len(rels) // 2] if rels else None,
+                        "rel_max": rels[-1] if rels else None,
+                        "cos_min": min((v["cos"] for v in self.tensor_stats.values()), default=None)},
+            "per_tensor": self.tensor_stats,
+            "reconstruct_seconds": self.reconstruct_seconds,
+            "note": ("weight-only: activations, attention/GDN math, norms, embeddings and the lm_head are "
+                     "the bf16 reference's; only the listed decoder linears are quantized"),
+        }
+
+
 def out_dir_dumps(out_dir: Path) -> list[dict]:
     """What `out_dir` already holds, one entry per reference_run.json / *.meta.json: `kind` 'bf16'
-    (a bf16 reference) or 'gguf' (a --weights-gguf dump), `gguf` (that GGUF's header sha256) and
-    `n_layers` (None when unknown: segment sidecars written before they recorded it fall back to
-    the directory's reference_run.json). Sidecars of other writers (the r4dx engine) are skipped."""
+    (a bf16 reference), 'gguf' (a --weights-gguf dump) or 'override' (a --weights-override dump),
+    `gguf` (the GGUF's header sha256, or the override manifest's sha256) and `n_layers` (None when
+    unknown: segment sidecars written before they recorded it fall back to the directory's
+    reference_run.json). Sidecars of other writers (the r4dx engine) are skipped."""
     if not out_dir.is_dir():
         return []
     docs = []
@@ -808,34 +976,42 @@ def out_dir_dumps(out_dir: Path) -> list[dict]:
         except (OSError, ValueError):
             continue
         wg = doc.get("weights_gguf")
+        wo = doc.get("weights_override")
         if wg:
-            kind = "gguf"
+            kind, ident = "gguf", wg.get("header_sha256")
+        elif wo:
+            kind, ident = "override", wo.get("manifest_sha256")
         elif what == "run" or doc.get("source") == "reference":
-            kind = "bf16"
+            kind, ident = "bf16", None
         else:
             continue
         n_layers = doc.get("n_layers")
         if what == "run":
             run_layers = n_layers
-        out.append({"file": path.name, "kind": kind, "gguf": (wg or {}).get("header_sha256"),
-                    "n_layers": n_layers})
+        out.append({"file": path.name, "kind": kind, "gguf": ident, "n_layers": n_layers})
     for d in out:
         if d["n_layers"] is None:
             d["n_layers"] = run_layers
     return out
 
 
+DUMP_KIND_TEXT = {"bf16": "bf16 reference", "gguf": "--weights-gguf dump",
+                  "override": "--weights-override dump"}
+
+
 def out_dir_conflicts(out_dir: Path, kind: str, gguf_sha: str | None, n_layers: int) -> list[str]:
-    """Why a `kind` dump (of the GGUF with header sha256 `gguf_sha`, over `n_layers` layers) must
-    not be written into `out_dir`: kl_report.py pairs files by segment name, so a directory that
-    mixes a bf16 reference with a GGUF-weights dump, two different GGUFs, or two layer counts would
-    silently score the wrong thing. Empty when it may."""
+    """Why a `kind` dump (of the GGUF with header sha256 `gguf_sha` / the override manifest with
+    sha256 `gguf_sha`, over `n_layers` layers) must not be written into `out_dir`: kl_report.py
+    pairs files by segment name, so a directory that mixes a bf16 reference with a substituted-
+    weights dump, two different GGUFs or override manifests, or two layer counts would silently
+    score the wrong thing. Empty when it may."""
     why = []
     for d in out_dir_dumps(out_dir):
         if d["kind"] != kind:
-            why.append(f"{d['file']} is a {'bf16 reference' if d['kind'] == 'bf16' else '--weights-gguf dump'}")
-        elif kind == "gguf" and d["gguf"] and gguf_sha and d["gguf"] != gguf_sha:
-            why.append(f"{d['file']} is a dump of another GGUF (header sha256 {d['gguf'][:16]}...)")
+            why.append(f"{d['file']} is a {DUMP_KIND_TEXT[d['kind']]}")
+        elif kind in ("gguf", "override") and d["gguf"] and gguf_sha and d["gguf"] != gguf_sha:
+            what = "GGUF (header" if kind == "gguf" else "override manifest (manifest"
+            why.append(f"{d['file']} is a dump of another {what} sha256 {d['gguf'][:16]}...)")
         elif d["n_layers"] is not None and int(d["n_layers"]) != int(n_layers):
             why.append(f"{d['file']} ran {d['n_layers']} layers, this run {n_layers}")
     return why
@@ -1105,6 +1281,10 @@ def main() -> int:
     ap.add_argument("--gguf-allow-row-outliers", action="store_true",
                     help="use (and record) an embedding / lm_head row above the per-row error bound instead "
                          "of aborting; only after gguf_validate.py shows the row is the file's own")
+    ap.add_argument("--weights-override", type=Path, default=None, metavar="DIR",
+                    help="substitute the weights of this override directory (its weights_override.json, "
+                         "e.g. trellis_quant.py quantize-model / mix output); see "
+                         "OverrideWeightsReference. The output is NOT a bf16 reference")
     ap.add_argument("--segment", action="append", default=None,
                     help="segment name to run (repeatable, or comma-separated); default: all")
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
@@ -1131,21 +1311,29 @@ def main() -> int:
     # A --weights-gguf dump and a bf16 reference must never share a directory, nor two GGUFs or two
     # layer counts: kl_report.py pairs files by segment name, so a mixed directory would silently
     # score the wrong thing.
+    if args.weights_gguf and args.weights_override:
+        raise SystemExit("[full_logits] --weights-gguf and --weights-override are mutually exclusive")
     if args.out_dir is None:
-        if args.weights_gguf:
-            raise SystemExit("[full_logits] --weights-gguf needs an explicit --out-dir")
+        if args.weights_gguf or args.weights_override:
+            raise SystemExit("[full_logits] --weights-gguf / --weights-override need an explicit --out-dir")
         args.out_dir = Path(__file__).parent / "kl_out" / "ref"
     gguf_sha = None
+    dump_kind = "bf16"
     if args.weights_gguf:
         import gguf_dequant as gd
 
+        dump_kind = "gguf"
         with gd.GGUFFile(args.weights_gguf) as g:
             gguf_sha = g.header_sha256
+    elif args.weights_override:
+        import trellis_quant as tq
+
+        dump_kind = "override"
+        gguf_sha = sha256_file(Path(tq.load_manifest(args.weights_override)["_path"]))
     want_layers = args.debug_max_layers or load_text_config(args.model_dir)[1].num_hidden_layers
-    conflicts = out_dir_conflicts(args.out_dir, "gguf" if args.weights_gguf else "bf16", gguf_sha, want_layers)
+    conflicts = out_dir_conflicts(args.out_dir, dump_kind, gguf_sha, want_layers)
     if conflicts:
-        raise SystemExit(f"[full_logits] refusing to write a "
-                         f"{'--weights-gguf dump' if args.weights_gguf else 'bf16 reference'} "
+        raise SystemExit(f"[full_logits] refusing to write a {DUMP_KIND_TEXT[dump_kind]} "
                          f"({want_layers} layers) into {args.out_dir}: " + "; ".join(conflicts[:5]))
     commit_avail, _ = host_commit_gib()
     if commit_avail is not None and commit_avail < LOW_COMMIT_GIB:
@@ -1186,6 +1374,9 @@ def main() -> int:
                                    max_layers=args.debug_max_layers, threads=args.gguf_threads,
                                    full_sha256=args.gguf_sha256,
                                    allow_row_outliers=args.gguf_allow_row_outliers)
+    elif args.weights_override:
+        ref = OverrideWeightsReference(args.model_dir, device, args.weights_override,
+                                       max_layers=args.debug_max_layers)
     else:
         ref = StreamingReference(args.model_dir, device, max_layers=args.debug_max_layers)
     print(f"[full_logits] skeleton ready in {time.perf_counter() - t0:.1f}s: {ref.n_layers} layers, "
@@ -1204,7 +1395,9 @@ def main() -> int:
         "device": str(device),
         "source": ref.source_tag,
         "weights": ("GGUF-dequantized where the GGUF quantized, else bf16 checkpoint (see weights_gguf)"
-                    if args.weights_gguf else "bf16 checkpoint"),
+                    if args.weights_gguf else
+                    "override directory where its manifest lists a tensor, else bf16 checkpoint "
+                    "(see weights_override)" if args.weights_override else "bf16 checkpoint"),
         "torch_dtype": "bfloat16",
         "impl": args.impl,
         "n_layers": ref.n_layers,
@@ -1240,6 +1433,18 @@ def main() -> int:
             print(f"    used rows above the per-row bound in {name}: "
                   + ", ".join(f"{o['row']} (rel {o['rel']:.3f}{', coarse scale' if o['coarse_scale'] else ''})"
                               for o in rows))
+    if args.weights_override:
+        run["weights_override"] = w = ref.weights_record()
+        su, ck = w["summary_used"], w["checked"]
+        if ck["count"] and su.get("bpw") is not None:
+            print(f"[full_logits] override weights: {ck['count']} tensors substituted ({w['encoding']}), "
+                  f"{su['bpw']:.4f} bpw measured ({su['decode_gib']:.3f} GiB), rel median "
+                  f"{ck['rel_median']:.4f} max {ck['rel_max']:.4f}, cos min {ck['cos_min']:.6f}, "
+                  f"reconstruct {w['reconstruct_seconds']:.0f}s")
+            for cls, v in (su.get("by_class") or {}).items():
+                print(f"    {cls:26s} n={v['n']:3d} K {v['K']} bpw {v['bpw']:.4f}")
+        else:
+            print("[full_logits] override weights: no tensor was substituted (no segment ran?)")
     avail_end, peak = host_commit_gib()
     run["host_commit_gib"] = {"available_at_start": commit_avail, "available_at_end": avail_end,
                               "process_peak": peak}

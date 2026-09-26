@@ -8,5 +8,7 @@ kv_calibrate_out/
 kl_out/
 kl_out*/
 kv_timing/
+# trellis_quant.py's native encoders, built on first use from trellis_viterbi.hip
+.trellis_build/
 __pycache__/
 *.pyc

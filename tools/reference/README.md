@@ -1049,6 +1049,83 @@ directory holding another GGUF's dump. The bf16 path's `.logprobs.f16` are byte-
 `full_logits_golden.py` on the same dry run. The 64-layer skeleton (no forward) plans 498
 substituted, 353 lossless, 0 absent.
 
+## The EXL3 trellis oracle: trellis_quant.py and `--weights-override`
+
+Before any RDNA4 trellis kernel is written, this measures what EXL3-style trellis quantization
+(exllamav3 at 6b84a21, MIT; QTIP, arXiv 2406.11235) would score on **our** model and tokens,
+weights only. The specification it implements, section by section, is `docs/trellis.md`
+(section 14 lists the functions). `trellis_quant.py quantize-model` quantizes every decoder linear
+exactly as EXL3 does and writes the stored form (packed trellis bitstream + fp16 suh/svh, so the
+bits per weight are measured); `full_logits_golden.py --weights-override <dir>` reconstructs those
+weights in the original basis inside the bf16 reference forward; `kl_report.py` scores the dump
+against the bf16 reference as usual.
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+$py = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+& $py tests\reference\test_trellis_quant.py                       # incl. the HIP encoder
+& $py tools\reference\trellis_quant.py selftest --device cuda      # hip == cpu == torch
+& $py tools\reference\trellis_quant.py bench --device cuda --K 3.5,4,5 --tiles 8192
+& $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --out-dir D:\models\r4dx\trellis-q\K4
+& $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched `
+    --out-dir D:\models\r4dx\trellis-q\K4m                            # the "what we would ship" basis
+& $py tools\reference\trellis_quant.py mix --bpw 4.5 --src D:\models\r4dx\trellis-q\K4 `
+    --src D:\models\r4dx\trellis-q\K5 --out-dir D:\models\r4dx\trellis-q\mix4.5
+& $py tools\reference\full_logits_golden.py --device cuda --tokens tools\reference\kl_corpus\tokens_canon.json `
+    --weights-override D:\models\r4dx\trellis-q\K4 --out-dir D:\models\r4dx\kl-trellis\4.0
+& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\kl-canon\ref --test-dir D:\models\r4dx\kl-trellis\4.0 `
+    --tokens tools\reference\kl_corpus\tokens_canon.json --out D:\models\r4dx\kl-trellis\4.0\kl_canon.json
+```
+
+**Encoders.** The Viterbi is the only heavy part (2 x 256 x 65,536 candidate evaluations per
+256-weight tile, 95.0 M tiles per rate). Three implementations give the same states bit for bit:
+`viterbi_torch` (the reference; ~100 tiles/s), the native CPU build of `trellis_viterbi.hip`
+(std::thread, 7,500-12,700 tiles/s on the 9950X, ~6,700 inside quantize-model) and its HIP build
+(gfx1201, one workgroup per tile, one kernel per rate, mul1 computed in registers; 26,900-30,700
+tiles/s measured on the R9700, ~1 h of encoder time per rate). Both native builds are compiled on first use with the
+venv's own ROCm `clang++` into `tools/reference/.trellis_build/` (gitignored) and called through
+ctypes, the HIP one on torch's stream with torch's device pointers, in bounded launches (a few tiles
+per workgroup each). `--backend auto` picks hip on `--device cuda`; `quantize-model` and `linear`
+first check the chosen native encoder against the reference on random tiles at every K they will
+use and refuse to run if a single state differs (fall back with `--backend cpu`: CPU Viterbi, GPU
+linear algebra, ~4-5 h per rate).
+
+**The override directory** (`weights_override.json`, format `r4dx-weights-override` v1): per
+tensor its encoding (`trellis-exl3` or `dense`), file, K, codebook, shape, measured bits (trellis,
+scales, total, bpw), proxy losses (undamped and damped H, before and after refit), relative weight
+error, g scale, seeds and timings; a summary with bpw and GiB per class; the job (checkpoint config
+sha256, Hessian manifest sha256, basis, recipe with its deviations) and provenance (git HEAD, the
+sha256 of trellis_quant.py and trellis_viterbi.hip, the encoder and its self-check). A `quantize-model`
+run resumes layer by layer and lists what is missing until complete; the resume key includes the
+sha256 of trellis_quant.py and trellis_viterbi.hip, and a layer is used only when every tensor has
+this run's K (anything else is redone, and listed as `stale_layers` until it is). `mix` manifests
+point at the source directories' files by absolute path, allocate with EXL3's qgroups (q/k/v,
+in_proj_qkv + in_proj_z, gate + up promoted together) and refuse sources of different Hessians,
+basis or checkpoint.
+
+**Two bases.** `--hessian-basis exl3` (default) reproduces EXL3's LDL factor of the sign-only rotated
+Hessian (the fidelity oracle); `--hessian-basis matched` factors the Hessian of the weight actually
+quantized (input-scale magnitudes included), a converter-only choice that lowers the proxy of
+attention q/k/v by 7-73% (docs/trellis.md 14); judge the gate on it, with the exl3 run alongside. **Calibration bias:** hessian-v2 is domain-matched
+to the KL corpus with no random-token rows, so the oracle's KL is probably optimistic against a stock
+EXL3 conversion and against UD-Q4_K_XL (fair against quant2, which uses the same Hessians).
+
+**`--weights-override` checks.** The manifest must be for this checkpoint (config sha256), list only
+decoder-layer weights, have its files, and cover every quantized linear of the layers the run uses.
+On first use each tensor must have the checkpoint's shape, a relative error against the bf16 weight
+under `2^-(K-2)` with cosine >= 0.9 (a layout slip gives ~1.4), AND within 2% of the error recorded
+when its bits were written. Sidecars say `"source": "reference-overrideweights"` with a
+`weights_override` block (manifest path and sha256, bpw measured); `reference_run.json` has the
+per-class K and bpw and every tensor's check. The out-dir guard and kl_report.py treat it like a
+GGUF dump: never a reference, never mixed with another kind, manifest or layer count.
+
+**Disk and time per rate** (decoder linears only; lm_head and embeddings stay bf16): K = 3.5 /
+4 / 5 write 10.6 / 12.1 / 15.2 GB (+0.0045 bpw of scales) per basis; a 4.5 mix writes only a
+manifest. `quantize-model` takes about 1.3-1.5 h per rate and basis on device 1 (one attention layer
+in 70 s at ~28,600 tiles/s). The
+KL dump is ~2 GiB per rate on tokens_canon.json (4 x 1023 x 248,320 fp16) and the forward adds
+~1 min of reconstruction to the bf16 reference's ~2 min.
+
 ## kl_report.py
 
 ```powershell
@@ -1647,6 +1724,21 @@ full expected tensor-name set per component (including the r4d-shaped GDN tensor
 attention tensors above -- a regression that silently drops one now fails this test instead of only
 being noticed by whoever diffs against the missing tensor), that the decode GDN conv output's
 trimmed length matches `--decode-len`, and that the manifest's tolerance table is well-formed.
+
+`tests/reference/test_trellis_quant.py` (ctest `reference_trellis_quant`) tests the trellis oracle
+on the CPU in a few minutes, and its HIP encoder too when `HIP_VISIBLE_DEVICES=1`: the codebooks
+against docs/trellis.md 4.3 and an independent integer derivation; Viterbi optimality by brute force
+on tiny rings (the pinned pass is exact for every boundary edge; the two-pass ring is closed, its cost
+exact and never below the optimum) and the two-pass result against the exact tail-biting optimum on
+128-position rings; native CPU (and HIP) == torch reference, states and costs bit for bit, every
+rate, random and tie-heavy targets; the bitstream (round trips, the MSB-first word layout against a
+slow bit-string packer, any word pattern is a closed ring); the Hadamards, regularize -> unrotate,
+block LDL, LDLQ with H = I = plain per-tile encoding, concatenated = separate LDLQ passes, a synthetic
+linear with a dead input channel end to end (bits measured, refit never hurts, feedback helps), the
+int4 baseline, EXL3's global-scale sample order, the allocator with EXL3's qgroups (whole groups
+only, also on the real checkpoint's 400 linears off the planned points), `.hess` reading, Lloyd-Max
+values, the Gaussian K = 4 MSE, quantize-model's resume key (code hashes, per-tensor K) and the
+`--weights-override` plumbing (manifest, reload = recorded error, out-dir refusals, kl_report identity).
 
 `tests/reference/test_gguf_dequant.py` (ctest `reference_gguf_dequant`) is numpy-only and runs in
 about 30 s with every optional input present (214 checks). It covers:

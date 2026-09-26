@@ -1198,6 +1198,13 @@ row gather), measured from the files.
   sub-block scales under an fp16 super-block scale, and the mix spends 5-8 bits where it matters.
   Next: the EXL3/QTIP trellis oracle (docs/trellis.md), then a native RDNA4 kernel if it clears
   ~0.008 at 4.0-4.5 bits/weight.
+- q2ab_hv2_q3 on the merged tree (main c0f7386 in, 8271fde): full ctest green (93, three
+  device-0/bandwidth skips; reference_dflash2 needed its gitignored fixtures regenerated after the
+  2026-09-25 venv rebuild); G6 5/5 -- validate_dflash 3/3, validate_spec_sampling 24/24, smoke
+  dflash+tools+vision 217/0 (the prompt checkpoint fixes the " yes" multi-turn case), MTP 168/0,
+  TP=2 emulate 170/0. Decode (`D:\models\r4dx\quant2-bench-final`, 4 prompts x 2 runs,
+  interleaved): plain 35.94 tok/s vs v6 35.95 and q2ab_hv2 35.93 -- speed-neutral; dflash k=7
+  108.28 vs 108.94 / 103.94 (text-dependent); VRAM 17.07 vs 17.01 GiB.
 
 Gates: G3 **failed** narrowly (-9.5% vs the -10% bar; KL fell in every segment) -- Q2 went ahead as a
 stated deviation because it was already built and LDLQ is expected to need the rotation. G4 **passed**

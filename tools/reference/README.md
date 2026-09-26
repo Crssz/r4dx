@@ -1126,6 +1126,63 @@ in 70 s at ~28,600 tiles/s). The
 KL dump is ~2 GiB per rate on tokens_canon.json (4 x 1023 x 248,320 fp16) and the forward adds
 ~1 min of reconstruction to the bf16 reference's ~2 min.
 
+## Trellis kernel references: trellis_golden.py, trellis_lane_check.py, trellis_perf_model.py
+
+CPU only (torch on its CPU device; `torch.cuda` is never touched). They back the production design
+in `docs/trellis-kernel.md` (M0).
+
+```powershell
+$py = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+& $py tools\reference\trellis_golden.py               # writes tests\kernels\golden\trellis (~3 s)
+& $py tools\reference\trellis_golden.py --check       # the files against their manifest.json
+& $py tools\reference\trellis_golden.py --selftest    # the script's own math; writes nothing
+& $py tools\reference\trellis_lane_check.py           # 0 mismatches at KB = 4 and 5, or exit 1
+& $py tools\reference\trellis_perf_model.py [--kb 5]  # the 4.6 cycle-budget model
+```
+
+**trellis_golden.py** writes the golden vectors of section 6 as `.npy` files that
+`tests/kernels/npy_fixture.hpp` reads (`LoadNpyU32` for ring words, `LoadNpyF16Bits` for fp16,
+`LoadNpyF32`), 6.0 MiB in 45 files plus `manifest.json` (sha256, dtype and shape of every file,
+the parameters, the conventions and the source pins). Random cases: ring words at KB = 4 and 5
+(K = 1024, N = 512) in the pair grid and their `decode_words` Q; bf16-exact activations, suh
+(2 parts) and svh; the fp32-emulated input transform at prescale 0 and 4 (FwhtLds's butterfly
+order, one f16 rounding); fp64 full-linear references for P = 1 and P = 2, from the exact
+activations (`y`, the Frobenius reference) and from the f16 A (`ya`, the per-element reference).
+Real cases: 256 x 256 blocks of the `K4m` oracle (L03 attn.k, L10 mlp.down, L07 mlp.gate_up as 2
+parts), cut after checking each file's sha256 against the oracle's manifest, and checked against
+the bf16 checkpoint (block relative error equal to the tensor's recorded error; a layout slip gives
+~1.4). Generation is deterministic (a regeneration is byte-identical). `to_pair_grid` /
+`from_pair_grid` / `pair_grid_rows` / `pair_grid_cols` are the reference for the converter's regrid
+and the TP slices (2.1, 2.4). The generator also prints how an fp32 kernel pipeline sits against
+section 6's tolerances: about 1 element in 32,768 lands over 4 bf16 ulp of `ya` where the output is
+near zero (none with a `1e-4 * rms(row)` floor), and `||C - y|| / ||y||` is 1.6-1.7e-3 against the
+2e-3 bound (the bf16 output rounding; the f16 A alone gives 2e-4).
+
+**trellis_lane_check.py** emulates the GEMM's lane map (4.2, 4.4) per lane from the pair grid:
+the words each lane loads, the `v_alignbit` extraction, the fragment element order and the value
+path (`v_mad_u32_u16`, `v_pk_mad_u16`, `v_sad_u8`/`v_sad_hi_u8`, `v_pk_fma_f16`). Every weight's
+state must equal `unpack_states` + `tensor_core_perm` and its f16 bits `decode_words`' Q, at KB = 4
+and 5; the value path must equal `codebook_np` for all 65,536 states.
+
+**trellis_perf_model.py** is 4.6's model: need vs memory cycles per fragment, the plain-decode
+table, the break-even exposed fraction, the byte ratios per shape family, and the M1/M2 budget.
+
+**trellis_isa_report.py** (M1) reads the device-only assembly listing the build writes for
+libr4d's trellis GEMM and prints, per instantiation (NP, U, MT, NT): VGPR / SGPR / scratch / spills
+from the code-object metadata, and the main K loop's instruction mix -- VALU, WMMA, VMEM, SALU,
+the decode subset and every other VALU op -- as VALU per (tile pair, k-tile) and per weight (4.2
+asks for the whole-loop count, not the decode subset) -- and the loop's schedule: its s_delay_alu
+count and its near dependencies (a VALU reading a VGPR written 1-3 VALU earlier with no s_delay_alu
+between), in all and those whose producer is inline asm. gfx12 stalls the whole SIMD on a near
+dependency the compiler did not mark, and it marks only its own instructions, so the asm column
+must be 0; the first M1 decode (one asm per hash) had 4-249 per loop and issued at ~0.52 VALU per
+clock. The build's own check of the same listing (`third_party/check_trellis_isa.cmake`) fails on
+more than 190 VGPRs, scratch, spills or any near dependency on an asm VALU.
+
+```powershell
+& $py tools\reference\trellis_isa_report.py build\win-hip\third_party\r4d_objs\r4d_gemm_trellis_nt_m64-gfx1201.s [--json out.json]
+```
+
 ## kl_report.py
 
 ```powershell

@@ -40,6 +40,12 @@ set(R4DX_KERNEL_TESTS
   # CPU-reference only, always on; both check precondition throws, hence the /EHc- entry below.
   test_rotate_residual
   test_attn_gate_mul_hadamard
+  # Trellis weights, milestone M1 (docs/trellis-kernel.md 4.2-4.5, 6): libr4d's trellis decode,
+  # r4d_trellis_reconstruct_f16 and the raw r4d_gemm_trellis_nt_m64 bit-exact against the CPU
+  # decode (trellis_ref.hpp) and the goldens tools/reference/trellis_golden.py writes into
+  # golden/trellis/. The golden part runs last and returns 77 when that directory is absent (after
+  # every CPU-reference check has passed); it checks precondition throws, hence /EHc- below.
+  test_trellis_decode
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -67,6 +73,7 @@ set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
 # has passed, and 1 if that part failed -- so a skip never hides a real regression.
 set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
                      test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_trellis_decode PROPERTIES SKIP_RETURN_CODE 77)
 
 # `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
 # to be able to CATCH anything at all.
@@ -89,7 +96,8 @@ set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_con
 # rather than something a kernel stage should decide unilaterally.
 set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_lse.cpp
                             test_rope_mrope3.cpp test_rotate_residual.cpp
-                            test_attn_gate_mul_hadamard.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+                            test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
+                            PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
 # r4dx_kernels.
@@ -109,6 +117,46 @@ add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
 #   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_sampler_bench.exe
 add_executable(tool_sampler_bench tool_sampler_bench.cpp)
 target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
+
+# tool_trellis_gemm_bench: trellis milestone M1's measurements (docs/trellis-kernel.md 4.6, 6
+# "Benches"): the 336-GEMM decode-step replay against production w4a16, op rates and WMMA/VALU/
+# memory overlap, the split-group tail and the M = 64 prefill shape; writes JSON to --out. Built,
+# never add_test()'d (the real runs are scheduled GPU time):
+#   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_trellis_gemm_bench.exe --out x.json
+# Its device side (fills, the clock probe, the op-rate and pipe loops) is a hipcc object of its own,
+# built exactly like src/kernels' objects and including libr4d's r4d_trellis_dq.h, so the pipe loops
+# run the GEMM's own decode. It links r4dx_model_linear for PickTuning, production's w4a16 dispatch,
+# and catches the raw GEMM's rejections of illegal tunings, hence /EHc-.
+set(R4DX_TQ_BENCH_SRC "${CMAKE_CURRENT_SOURCE_DIR}/tool_trellis_gemm_bench_kernels.hip")
+set(R4DX_TQ_BENCH_OBJ "${CMAKE_CURRENT_BINARY_DIR}/objs/tool_trellis_gemm_bench_kernels.obj")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/objs")
+set(R4DX_TQ_BENCH_FLAGS
+  -O3 -std=c++17 --offload-arch=${R4D_GFX_ARCH}
+  -Wno-unused-result -ffp-contract=off
+  --rocm-path=${R4D_ROCM_ROOT}
+  -DNDEBUG
+  -D_DLL -D_MT -Xclang --dependent-lib=msvcrt
+  -I "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+)
+if(EXISTS "${R4D_ROCM_ROOT}/lib/llvm/amdgcn/bitcode")
+  list(APPEND R4DX_TQ_BENCH_FLAGS --rocm-device-lib-path=${R4D_ROCM_ROOT}/lib/llvm/amdgcn/bitcode)
+endif()
+add_custom_command(
+  OUTPUT "${R4DX_TQ_BENCH_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env
+          "PATH=${R4D_ROCM_ROOT}/bin;${R4D_ROCM_ROOT}/lib/llvm/bin;$ENV{PATH}"
+          "${R4D_ROCM_ROOT}/bin/hipcc.exe" ${R4DX_TQ_BENCH_FLAGS} -c "${R4DX_TQ_BENCH_SRC}"
+          -o "${R4DX_TQ_BENCH_OBJ}"
+  DEPENDS "${R4DX_TQ_BENCH_SRC}" "${CMAKE_SOURCE_DIR}/third_party/libr4d/r4d_trellis_dq.h"
+          "${CMAKE_SOURCE_DIR}/third_party/libr4d/r4d_gdn_wmma.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) tool_trellis_gemm_bench_kernels.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_TQ_BENCH_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+add_executable(tool_trellis_gemm_bench tool_trellis_gemm_bench.cpp "${R4DX_TQ_BENCH_OBJ}")
+target_include_directories(tool_trellis_gemm_bench BEFORE PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(tool_trellis_gemm_bench PRIVATE r4dx_model_linear r4dx_core r4dx_kernels r4d_core)
+set_source_files_properties(tool_trellis_gemm_bench.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # ---- tensor-parallel all-reduce, phase P3 (docs/tp.md 6.3, 10.1) ---------------------------------
 # All four link r4dx_tp (src/model/tp: TpGroup, HostMailboxComm) and share tp_ar_harness.h. They call

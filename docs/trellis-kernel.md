@@ -436,7 +436,7 @@ in fragment order, so neither A nor B needs a k-permutation.
 - State q (position `32c+16h+q`) is then big-endian bits `[21+5q, 37+5q)` of `V0..V3` for every lane.
 - F0 takes q = {0,1,8,9,2,3,10,11} and F1 takes q = {4,5,12,13,6,7,14,15}.
 
-**CPU verification** (session scratchpad; committed in M0 as `tools/reference/trellis_lane_map.py`):
+**CPU verification** (session scratchpad; committed in M0 as `tools/reference/trellis_lane_check.py`):
 
 - For 64 random tiles, all 32 lanes × 8 elements × 2 fragments decode **0 mismatches** against
   `unpack_states` + `tensor_core_perm_inv`, at both KB = 4 and KB = 5.
@@ -585,6 +585,40 @@ That is about 134 VGPRs (150 with A prefetch), or 11 (10) waves/SIMD. The cap is
 instantiation's `.vgpr_count`. Prefill: MT = 4, NP = 1 is about 150 VGPRs; MT = 4, NP = 2 at U = 1
 is about 195 (trellis has no per-group `g_acc`, so this is close to w4a16's 192 at M = 64). Never
 set a min-waves `__launch_bounds__` (`r9700.md:707-708`).
+
+**As built (M1, compile only).** `r4d_gemm_trellis_nt_m64_raw` at KB = 4, gfx1201, from the build's
+own listing (`tools/reference/trellis_isa_report.py`):
+
+- **Whole K loop: exactly 62 VALU per (tile pair, k-tile), 3.875 per weight, in every
+  instantiation**: the decode subset and nothing else. The weight and activation bases are
+  wave-uniform SGPRs bumped once per step and every load is `global_load` saddr + a loop-invariant
+  lane offset + an immediate, so the probe's 11 address VALU (0.69 op/w) are gone. Two compiler
+  behaviours had to be defeated for that, each with an empty inline asm that costs no instruction:
+  loop strength reduction turning the bases into per-lane 64-bit pointers, and LICM hoisting the
+  lane offset's zero-extension out of the loop (the saddr pattern needs it in the load's block).
+- **Decode schedule (after the M1 review).** The decode of one (pair, k-tile) is a single inline-asm
+  block (`r4d_trellis_k4_decode`) whose internal dependencies are all at least 8 VALU apart and
+  which ends in `s_delay_alu instid0(VALU_DEP_1)`. The first build used one asm per hash: LLVM
+  inserts `s_delay_alu` only between instructions it generated, gfx12 then stalls the whole SIMD's
+  VALU on each near dependency, and the scheduler left 4-249 of them per K loop (a different number
+  per instantiation); the pipe bench's decode loop issued at 0.50-0.52 VALU per clock at 1, 2 and 4
+  waves per SIMD. The build check now also fails on any VALU that reads an asm result 1-3 VALU
+  later without an `s_delay_alu` between. Measured at M = 1 (weights streamed from DRAM, 10
+  shape/tuning pairs, bit-identical outputs): 1.4-19% faster than the per-hash version, most where
+  the old schedule was worst.
+- **Prefetch:** MT <= 2 double-buffers one step ahead (two named register stages, no copies at the
+  loop edge), with `sched_barrier`s pinning each stage's loads ahead of the other stage's decode:
+  without them the scheduler sank the loads toward their use, at (NP, U) = (4, 1) past the other
+  decode (the loop opened on `s_wait_loadcnt 0`; 1.46x the time). (NP, U, MT) = (2, 4, 2) and
+  (4, 1, 2) take one stage (accumulators plus two stages exceed 128 VGPRs; really double-buffered
+  they reached 192 and scratch), as does MT >= 3, where each fragment already feeds 3-4 WMMA per
+  pair. At an even step count the last issue re-reads the final step: peeling it off measured
+  0-1.2% slower on 9 of 10 shapes, so the redundant, cache-resident load stays.
+- **Instantiated:** NP·U <= 8 and, per (NP, U), MT up to 4 at NP = 1 and at (2, 1), 3 at (2, 2) and
+  (2, 4), 2 at (4, 1), 1 at (4, 2) (set when the next MT up spilled or reached 191-192 VGPRs; with
+  the one-block decode it still spills at (4, 1), and would fit at (2, 2), (2, 4) and (4, 2)). 50
+  kernels, 54-188 VGPRs, no scratch (checked at build time by `third_party/check_trellis_isa.cmake`);
+  the prefill (MT, NP) = (4, 2) at U = 1 is 182.
 
 **Tuning knobs.** All go into the tuning table (`LinearTuning`, 5.3) except `AFFINE`, which is a
 compile-time variant:
@@ -1221,3 +1255,52 @@ rejected outright. Where a finding's own evidence was off, the doc follows the c
 - **I15.** The review's "48 fewer launches" is also off for q2ab_hv2_q3: v1 is 34 fewer (48 GDN
   Hadamards + 2 residual rotations − 16 extra transforms, because q2ab keeps attn.k/v bf16 in layers
   32-63), and M5 is 194 fewer, not 208.
+
+---
+
+## 10. Measured
+
+### 10.1 M1 (2026-09-26, device 1; libr4d `67528dd`)
+
+Full data is in `D:\models\r4dx\trellis-m1\` (start with `m1_report.md`).
+
+**Tests.**
+- `test_trellis_decode`: 2957 checks, all bit-exact.
+- Whole suite (`ctest -LE tp2gpu`): 92 pass, 1 skipped for an absent golden, 0 fail.
+- Every one of the 50 instantiations runs exactly 62 VALU per tile pair per k-tile. VGPRs range
+  from 54 to 188, with no scratch.
+
+**Gate: GO at M = 1 and at M = 8, provisional on the in-model clock.** The replay runs one decode
+step's 336 GEMMs at full size. Trellis `_raw` runs without the output transform; w4a16 runs
+q2ab_hv2_q3's production groups and tunings. S is taken per alternating pair of chains; each row
+pools 3 runs.
+
+| trellis tuning | M | trellis ms/token | w4a16 ms/token | S median [p25..p75] |
+|---|---|--:|--:|---|
+| fallback (4.4) | 1 | 21.10 | 22.81 | +1.73 [+1.68..+1.76] |
+| fallback | 8 | 21.86 | 23.56 | +1.70 [+1.66..+1.77] |
+| swept at M = 1 | 1 | 20.21 | 22.84 | +2.63 [+2.59..+2.64] |
+| swept at M = 1 | 8 | 22.10 | 23.60 | +1.49 [+1.44..+1.52] |
+
+The bar was S ≥ +0.16 ms. Trellis reaches 0.94-0.99 of w4a16's effective bandwidth, against a
+byte ratio of 0.879.
+
+**What this changes in 4.6.** The expected case there failed A3. The measurements are better:
+
+- The decode ops issue at full rate. `v_mul_lo_u32` is quarter rate and is not on the path.
+- WMMA and VALU do not overlap. But at 2 or more waves per SIMD, the ALU hides behind memory:
+  β = 0.01-0.03, against 0.25 at 1 wave.
+- Split tails have no measurable cost.
+- The clock sag is 3-6% below w4a16's in the same run (2.78-3.15 GHz). The verdict holds unless the
+  in-model SCLK falls below 2.63-2.83 GHz.
+- **Prefill** at M = 64 on the MLP pair is at parity with tuned w4a16 (474 vs 479 µs), not the
+  29-45% loss 4.7 expected. So M8 may be unnecessary.
+
+**For M2.**
+- M2's added work X may be up to about 1.3 ms per token (bound by M = 8 against tuned w4a16).
+- Pick each shape's tuning for M = 1 and M = 8 together, timed on whole chains. The M = 1-only
+  sweep gains 0.89 ms at M = 1 but loses 0.24 ms at M = 8.
+- Use NT = 1 for M ≤ 16, drop SKG = 8, and keep at least 2 waves per SIMD.
+- Add the in-model clock probe and the DFlash/MTP round timing early.
+- AFFINE is not needed.
+- The one weak shape is k/v at 1024 columns (335-406 GB/s vs 465-478).

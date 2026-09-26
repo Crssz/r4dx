@@ -7,7 +7,7 @@
   Uses the vLLM_for_AMD venv's CMake 4.4.2 / Ninja when that venv exists, otherwise the cmake/ninja
   on PATH (CMake 3.31 + Ninja from PATH configure and build the 'win-hip' preset too -- verified
   2026-09-22 once the venv had been deleted from this machine), against the ROCm SDK at C:\opt\rocm.
-  r4d_core's 15 libr4d translation units are compiled by hipcc.exe directly (see
+  r4d_core's 16 libr4d translation units are compiled by hipcc.exe directly (see
   third_party/CMakeLists.txt); everything else is plain clang-cl C++.
 
 .PARAMETER Preset

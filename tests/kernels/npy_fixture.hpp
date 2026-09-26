@@ -2,8 +2,10 @@
 // tools/reference/dflash2_ref.py writes into tools/reference/golden_out/dflash2/fixture_{a,b,c}/,
 // plus the shared helpers the four DFlash2 kernel tests use to drive a kernel from those arrays.
 //
-// Scope, deliberately: little-endian '<f4' (float32) and '<i8' (int64) C-order arrays only -- that
-// is every dtype those fixtures contain. Anything else throws rather than silently mis-reading.
+// Scope, deliberately: little-endian C-order '<f4' (float32) and '<i8' (int64) arrays -- every dtype
+// those fixtures contain -- plus '<u4' (uint32 ring words) and '<f2' (fp16, returned as raw bits),
+// which the trellis goldens (tools/reference/trellis_golden.py -> tests/kernels/golden/trellis/)
+// add. Anything else throws rather than silently mis-reading.
 // The fixture directory is located through the R4DX_SOURCE_DIR compile definition
 // (tests/CMakeLists.txt), never a hardcoded absolute path.
 //
@@ -112,38 +114,51 @@ inline std::vector<char> ReadWhole(const std::string& path) {
   return raw;
 }
 
-// Loads a '<f4' array. `expect` (if non-empty) is checked against the stored shape, so a fixture
-// regenerated with different dimensions fails loudly here instead of producing a garbage compare.
-inline std::vector<float> LoadNpyF32(const std::string& path,
-                                      const std::vector<int64_t>& expect = {}) {
+// Loads an array whose descr must be `descr` into elements of T (sizeof(T) = the descr's width).
+// `expect` (if non-empty) is checked against the stored shape, so a fixture regenerated with
+// different dimensions fails loudly here instead of producing a garbage compare.
+template <typename T>
+inline std::vector<T> LoadNpyAs(const std::string& path, const char* descr,
+                                const std::vector<int64_t>& expect) {
   const std::vector<char> raw = ReadWhole(path);
   const NpyHeader h = ParseNpyHeader(raw, path);
-  if (h.descr != "<f4") {
-    throw std::runtime_error("npy_fixture: expected '<f4' in " + path + ", got '" + h.descr + "'");
+  if (h.descr != descr) {
+    throw std::runtime_error(std::string("npy_fixture: expected '") + descr + "' in " + path +
+                             ", got '" + h.descr + "'");
   }
   if (!expect.empty() && h.shape != expect) {
     std::string got;
     for (int64_t d : h.shape) got += std::to_string(d) + ",";
     throw std::runtime_error("npy_fixture: unexpected shape [" + got + "] in " + path);
   }
-  std::vector<float> out(static_cast<size_t>(h.Count()));
-  std::memcpy(out.data(), raw.data() + h.data_offset, out.size() * sizeof(float));
+  std::vector<T> out(static_cast<size_t>(h.Count()));
+  if (h.data_offset + out.size() * sizeof(T) > raw.size()) {
+    throw std::runtime_error("npy_fixture: truncated data in " + path);
+  }
+  std::memcpy(out.data(), raw.data() + h.data_offset, out.size() * sizeof(T));
   return out;
+}
+
+inline std::vector<float> LoadNpyF32(const std::string& path,
+                                      const std::vector<int64_t>& expect = {}) {
+  return LoadNpyAs<float>(path, "<f4", expect);
 }
 
 inline std::vector<int64_t> LoadNpyI64(const std::string& path,
                                         const std::vector<int64_t>& expect = {}) {
-  const std::vector<char> raw = ReadWhole(path);
-  const NpyHeader h = ParseNpyHeader(raw, path);
-  if (h.descr != "<i8") {
-    throw std::runtime_error("npy_fixture: expected '<i8' in " + path + ", got '" + h.descr + "'");
-  }
-  if (!expect.empty() && h.shape != expect) {
-    throw std::runtime_error("npy_fixture: unexpected shape in " + path);
-  }
-  std::vector<int64_t> out(static_cast<size_t>(h.Count()));
-  std::memcpy(out.data(), raw.data() + h.data_offset, out.size() * sizeof(int64_t));
-  return out;
+  return LoadNpyAs<int64_t>(path, "<i8", expect);
+}
+
+// '<u4': the trellis goldens' ring words (pair grid or oracle layout), uploaded as-is.
+inline std::vector<uint32_t> LoadNpyU32(const std::string& path,
+                                         const std::vector<int64_t>& expect = {}) {
+  return LoadNpyAs<uint32_t>(path, "<u4", expect);
+}
+
+// '<f2' as raw fp16 bit patterns, so a kernel's f16 output compares bit for bit.
+inline std::vector<uint16_t> LoadNpyF16Bits(const std::string& path,
+                                             const std::vector<int64_t>& expect = {}) {
+  return LoadNpyAs<uint16_t>(path, "<f2", expect);
 }
 
 inline std::vector<int64_t> NpyShape(const std::string& path) {

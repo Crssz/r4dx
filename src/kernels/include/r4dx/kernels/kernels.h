@@ -92,6 +92,16 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
                          int epilogue = r4dx_epilogue_none, int64_t epilogue_out = 0,
                          int64_t epilogue_scale = 0);
 
+// ---- silu_mul, wide grid (docs/trellis-kernel.md 10.2) ---------------------------------------
+// r4dx_silu_mul_bf16 with no epilogue -- the same gate_up / out layouts and the same per-element
+// math, so `out` is bit-identical to it -- on a grid of (rows, ceil(intermediate / 2048))
+// workgroups, each one 2048-element slice of a row, instead of one workgroup per row: at decode
+// (rows = 1) the plain kernel runs the whole 17408-wide row on one workgroup. The trellis body's
+// Mlp calls it (its mlp.down has no fused producer epilogue in v1); every other layout keeps
+// r4dx_silu_mul_bf16.
+void r4dx_silu_mul_wide_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
+                              int64_t in_row_stride, int64_t stream);
+
 // ---- silu_mul + blockwise Hadamard (quant2 Q2b, docs/quant2.md section 4) --------------------
 // out[r, :] = (silu(gate[r, :]) * up[r, :]) Hb, where h Hb := (h * s) then FWHT / sqrt(block) on
 // each contiguous block of `block` (natural/Sylvester order; see rotate_residual.h). The silu*up

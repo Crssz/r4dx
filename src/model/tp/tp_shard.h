@@ -78,12 +78,18 @@ enum class Part {
   kMxWs,      // uint8 [K/32][N]
   kMxWref,    // int8 [N], each row's max E8M0 exponent
   kElem,      // [N] rows of `row_bytes` each: 1-D vectors, conv1d_weight ([conv_dim][4] bf16)
+  // `.trellis.w` (docs/trellis-kernel.md 2.1, 2.4): the pair grid, 64*rate bytes per (32-row tile
+  // pair, 16-K tile), pair-row-major -- so a run of rows is one byte range and a K range is one run
+  // per pair row. Every range must be whole 128-blocks (both Hadamards work in 128-blocks), which
+  // also makes it whole tile pairs. The trellis suh / svh scale vectors are kElem parts.
+  kTrellisW,
 };
 struct PartShape {
   Part part = Part::kBf16;
   int64_t N = 0, K = 0;   // the FULL logical W[N, K] the part belongs to (kElem: N rows, K unused)
   int group = 0;          // kW4a16Wsz: container w4a16 group; kW4a8Ws: 128; kMxWs: 32
   int64_t row_bytes = 0;  // kElem only: bytes per row (8 for conv1d_weight, 4 for fp32 vectors)
+  int rate = 0;           // kTrellisW only: trellis bits per weight (KB)
 };
 struct ByteRun {
   size_t src_off = 0;
@@ -94,12 +100,12 @@ struct ByteRun {
 // (any list of global row ranges works). Adjacent runs are merged, so a single run means "one
 // contiguous range of the mmap: upload it directly, no staging". Throws std::invalid_argument on a
 // shape the part cannot have, a range out of bounds, or a range misaligned for the part (the
-// 16-row-tile parts need begin and count % 16).
+// 16-row-tile parts need begin and count % 16, kTrellisW % 128).
 std::vector<ByteRun> PlanRows(const PartShape& shape, const std::vector<Range>& rows);
 // Byte runs whose concatenation is that part of W[:, cols]. kMxWref returns the FULL [N]
 // (docs/tp.md 4.3 "The mxfp4 wref exception"). kElem has no column axis and throws. Throws
 // std::invalid_argument on a misaligned range (w4 wq: % 64; w4 scale dwords: % group; mxfp4 wq
-// and ws: % 32).
+// and ws: % 32; trellis w: % 128).
 std::vector<ByteRun> PlanCols(const PartShape& shape, Range cols);
 // Concatenation of `runs` out of `full` (`full_bytes` long). Throws std::out_of_range if a run
 // reaches past the end.

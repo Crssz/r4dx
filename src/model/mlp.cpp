@@ -112,6 +112,14 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
                                    reinterpret_cast<int64_t>(down_had_signs_),
                                    static_cast<int>(kHadDownBlock));
     });
+  } else if (w_.down.layout == Layout::kTrellis && down_epilogue == r4dx_epilogue_none) {
+    // docs/trellis-kernel.md 10.2: a trellis mlp.down takes plain bf16 h (EpilogueForLayout is
+    // none; ApplyLinear runs its input transform), so no epilogue is fused here -- the wide-grid
+    // form, the same bytes as r4dx_silu_mul_bf16 without the one-workgroup-per-row decode cost.
+    ProfiledCall(prof, s_raw, "mlp.silu_mul", [&] {
+      r4dx_silu_mul_wide_bf16(reinterpret_cast<int64_t>(gate_up), reinterpret_cast<int64_t>(h), T,
+                              intermediate, /*in_row_stride=*/2 * intermediate, s);
+    });
   } else {
     ProfiledCall(prof, s_raw, "mlp.silu_mul", [&] {
       r4dx_silu_mul_bf16(reinterpret_cast<int64_t>(gate_up), reinterpret_cast<int64_t>(h), T,

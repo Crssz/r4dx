@@ -252,6 +252,8 @@ std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const 
     }
     case Layout::kBf16:
       return std::nullopt;  // caller already has the bf16 path
+    case Layout::kTrellis:
+      return std::nullopt;  // the 4-layer test container carries no trellis tensors
   }
   return q;
 }

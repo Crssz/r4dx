@@ -11,14 +11,14 @@
 // decode, MTP verify and DFlash verify alike; NT = 1 at every M <= 16 (10.1: trellis must not take
 // w4a16's NT = 0 rule for M > 1). M > 16 (prefill chunks) is 4.4's fallback until M5 sweeps it.
 //
-// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (milestone M4 moves this
-// file into src/model and wires it into linear.cpp; until then it lives in tests/kernels, where
-// trellis_tuning_rows.hpp reads it for test_trellis_gemm's row-identity check and the bench's
-// `--tuning-file table`):
+// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (src/model/linear.h;
+// linear.cpp includes this file inside namespace trellis and PickTuning reads it for every trellis
+// linear; tests/kernels/trellis_tuning_rows.hpp reads the same file for test_trellis_gemm's
+// row-identity check and the bench's `--tuning-file table`):
 //   {Layout::kTrellis, N, K, M, {WV, SK, MB = MT, NPW = NP, NT, SKG, U}, group = 0, rate = KB}
-// i.e. LinearTuning gains `int SKG = 1, U = 2` after NT and GemmTuningRow gains `int rate = 0`
-// after group. The array has the main table's name, like gemm_tuning_table_tp2.inc: include it
-// inside its own namespace.
+// i.e. LinearTuning's `int SKG = 1, U = 2` after NT and GemmTuningRow's `int rate = 0` after group.
+// The array has the main table's name, like gemm_tuning_table_tp2.inc: include it inside its own
+// namespace.
 static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kTrellis, 10240, 5120, 1, {4, 4, 1, 1, 1, 1, 2}, 0, 4},  // gdn.in_proj_qkv Wc 128
     {Layout::kTrellis, 6144, 5120, 1, {4, 4, 1, 1, 1, 1, 2}, 0, 4},  // gdn.in_proj_z Wc 128

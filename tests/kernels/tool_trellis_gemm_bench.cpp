@@ -67,8 +67,9 @@
 //            q2ab runs its Hadamard form) q2ab's silu_mul Hadamard and attention gate-mul Hadamard
 //            over the plain ones.
 //            Trellis tuning, per (N, K, KB) -- one row serves k and v, and gdn.out_proj and attn.o --:
-//            --tuning-file (a JSON of tunings, or `table` for tests/kernels/gemm_tuning_table_trellis.inc
-//            as built), else --joint's pick, else 4.4's fallback.
+//            --tuning-file (a JSON of tunings, or `table` for
+//            src/model/gemm_tuning_table_trellis.inc as built), else --joint's pick, else 4.4's
+//            fallback.
 //            --joint picks each key's tuning for M = 1 and M = 8 TOGETHER (row identity gives both one
 //            tuning): the legal space under 10.1's rules (NT 1, MT 1, SKG <= 4, >= 2 waves per SIMD)
 //            is screened per key on flushed chains of all its instances by t(M=1) + t(M=8), and the
@@ -121,7 +122,7 @@
 #include "r4dx/kernels/kernels.h"           // r4dx_trellis_input_bf16, the silu_mul pair
 #include "r4dx/kernels/rotate_residual.h"   // q2ab's residual rotation and GDN Hadamard
 #include "r4dx/model/attention/attn_kernels.h"   // the attention gate-mul pair (info)
-#include "trellis_tuning_rows.hpp"          // tests/kernels/gemm_tuning_table_trellis.inc, as built
+#include "trellis_tuning_rows.hpp"          // src/model/gemm_tuning_table_trellis.inc, as built
 
 extern "C" {
 void r4dx_tq_bench_fill_u32(int64_t p, int64_t n, uint32_t seed, uint32_t and_mask, uint32_t or_mask,
@@ -1135,7 +1136,7 @@ class Bench {
   }
 
   // --tuning-file: JSON as --tunings-out writes it ({"tunings": [{N, K, KB, WV, ...}]}), or "table"
-  // for the M = 1 rows of tests/kernels/gemm_tuning_table_trellis.inc as this binary was built.
+  // for the M = 1 rows of src/model/gemm_tuning_table_trellis.inc as this binary was built.
   KeyTunes LoadTunings() const {
     KeyTunes out;
     for (const std::string& f : args_.tuning_files) {
@@ -1343,14 +1344,14 @@ class Bench {
            "// decode, MTP verify and DFlash verify alike; NT = 1 at every M <= 16 (10.1: trellis must not take\n"
            "// w4a16's NT = 0 rule for M > 1). M > 16 (prefill chunks) is 4.4's fallback until M5 sweeps it.\n"
            "//\n"
-           "// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (milestone M4 moves this\n"
-           "// file into src/model and wires it into linear.cpp; until then it lives in tests/kernels, where\n"
-           "// trellis_tuning_rows.hpp reads it for test_trellis_gemm's row-identity check and the bench's\n"
-           "// `--tuning-file table`):\n"
+           "// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (src/model/linear.h;\n"
+           "// linear.cpp includes this file inside namespace trellis and PickTuning reads it for every trellis\n"
+           "// linear; tests/kernels/trellis_tuning_rows.hpp reads the same file for test_trellis_gemm's\n"
+           "// row-identity check and the bench's `--tuning-file table`):\n"
            "//   {Layout::kTrellis, N, K, M, {WV, SK, MB = MT, NPW = NP, NT, SKG, U}, group = 0, rate = KB}\n"
-           "// i.e. LinearTuning gains `int SKG = 1, U = 2` after NT and GemmTuningRow gains `int rate = 0`\n"
-           "// after group. The array has the main table's name, like gemm_tuning_table_tp2.inc: include it\n"
-           "// inside its own namespace.\n"
+           "// i.e. LinearTuning's `int SKG = 1, U = 2` after NT and GemmTuningRow's `int rate = 0` after group.\n"
+           "// The array has the main table's name, like gemm_tuning_table_tp2.inc: include it inside its own\n"
+           "// namespace.\n"
            "static const GemmTuningRow kGemmTuningTable[] = {\n";
       for (auto& rw : rows) {
         const TKey& k = rw.first;

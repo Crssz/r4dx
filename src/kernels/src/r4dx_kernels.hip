@@ -160,7 +160,15 @@ __device__ __forceinline__ void ApplyEpilogueRow(const __hip_bfloat16* __restric
 
 // Shared precondition for r4dx_epilogue_int8_fraga8 (matches r4d_quant_act_i8's own throw) --
 // checked once here rather than duplicated at every one of this epilogue's three call sites below.
+// Also refuses any epilogue value this file does not know (docs/trellis-kernel.md 5.3): an unknown
+// value would reach ApplyEpilogueRow, which silently writes nothing for it and leaves the caller's
+// pre-quantized buffer uninitialized.
 void CheckEpiloguePrecondition(int epilogue, int64_t K) {
+  if (epilogue != r4dx_epilogue_none && epilogue != r4dx_epilogue_f16 &&
+      epilogue != r4dx_epilogue_fp8_e4m3_row && epilogue != r4dx_epilogue_int8_fraga8) {
+    throw std::runtime_error("r4dx epilogue: unknown r4dx_epilogue value " +
+                             std::to_string(epilogue));
+  }
   if (epilogue == r4dx_epilogue_int8_fraga8 && (K % 16) != 0) {
     throw std::runtime_error(
         "r4dx epilogue int8_fraga8: hidden/intermediate must be a multiple of 16, got " +
@@ -459,6 +467,63 @@ __global__ __launch_bounds__(kThreads) void SiluMulKernel(
                static_cast<size_t>(row) * intermediate * (epilogue == r4dx_epilogue_f16 ? 2 : 1);
     float* es = epilogue_scale + row;
     ApplyEpilogueRow(outr, epilogue, eo, es, intermediate);
+  }
+}
+
+// ---- silu_mul, wide grid (kernels.h r4dx_silu_mul_wide_bf16; docs/trellis-kernel.md 10.2) -------
+// SiluMulKernel's per-element math and the same vectorized / scalar split, so `out` is
+// bit-identical to it, but each workgroup takes one kSiluWideChunk-element slice of a row: grid =
+// dim3(rows, ceil(intermediate / kSiluWideChunk)). At decode (rows = 1, intermediate 17408) that is
+// 9 workgroups instead of one -- the one-workgroup-per-row shape measured +0.105 ms per token at
+// M = 1 against q2ab's per-block silu_mul Hadamard (docs/trellis-kernel.md 10.2). No epilogue.
+constexpr int64_t kSiluWideChunk = static_cast<int64_t>(kThreads) * 8;  // one uint4 per thread
+
+__global__ __launch_bounds__(kThreads) void SiluMulWideKernel(
+    const __hip_bfloat16* __restrict__ gate_up, __hip_bfloat16* __restrict__ out,
+    int64_t intermediate, int64_t in_row_stride) {
+  const int64_t row = blockIdx.x;
+  const int64_t c0 = static_cast<int64_t>(blockIdx.y) * kSiluWideChunk;
+  const int64_t n = intermediate - c0 < kSiluWideChunk ? intermediate - c0 : kSiluWideChunk;
+  const __hip_bfloat16* gu = gate_up + row * in_row_stride + c0;
+  __hip_bfloat16* outr = out + row * intermediate + c0;
+
+  // The same test as SiluMulKernel's (over the whole row), so every chunk of a row takes the path
+  // the one-workgroup kernel would; a chunk start is a multiple of 8 elements, so it keeps the
+  // row's 16-byte alignment.
+  const __hip_bfloat16* row_gu = gate_up + row * in_row_stride;
+  const bool vec_ok = (intermediate % 8 == 0) &&
+                       (reinterpret_cast<uintptr_t>(row_gu) % 16 == 0) &&
+                       (reinterpret_cast<uintptr_t>(row_gu + intermediate) % 16 == 0) &&
+                       (reinterpret_cast<uintptr_t>(out + row * intermediate) % 16 == 0);
+  if (vec_ok) {
+    const uint4* __restrict__ g4 = reinterpret_cast<const uint4*>(gu);
+    const uint4* __restrict__ u4 = reinterpret_cast<const uint4*>(gu + intermediate);
+    uint4* __restrict__ out4 = reinterpret_cast<uint4*>(outr);
+    const int64_t n4 = n >> 3;
+    for (int64_t i = threadIdx.x; i < n4; i += kThreads) {
+      const uint4 gc = g4[i];
+      const uint4 uc = u4[i];
+      const unsigned gdw[4] = {gc.x, gc.y, gc.z, gc.w};
+      const unsigned udw[4] = {uc.x, uc.y, uc.z, uc.w};
+      unsigned odw[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        __hip_bfloat16 glo, ghi, ulo, uhi;
+        UnpackBf16x2(gdw[j], &glo, &ghi);
+        UnpackBf16x2(udw[j], &ulo, &uhi);
+        const float gl = __bfloat162float(glo), gh = __bfloat162float(ghi);
+        const float ul = __bfloat162float(ulo), uh = __bfloat162float(uhi);
+        odw[j] = PackBf16x2(__float2bfloat16(gl * Sigmoid(gl) * ul),
+                             __float2bfloat16(gh * Sigmoid(gh) * uh));
+      }
+      out4[i] = make_uint4(odw[0], odw[1], odw[2], odw[3]);
+    }
+  } else {
+    for (int64_t i = threadIdx.x; i < n; i += kThreads) {
+      float g = __bfloat162float(gu[i]);
+      float u = __bfloat162float(gu[intermediate + i]);
+      outr[i] = __float2bfloat16(g * Sigmoid(g) * u);
+    }
   }
 }
 
@@ -1574,6 +1639,18 @@ void r4dx_silu_mul_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t inte
                      (hipStream_t)stream, (const __hip_bfloat16*)gate_up, (__hip_bfloat16*)out,
                      intermediate, in_row_stride, epilogue, (void*)epilogue_out,
                      (float*)epilogue_scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_silu_mul_wide_bf16(int64_t gate_up, int64_t out, int64_t rows, int64_t intermediate,
+                              int64_t in_row_stride, int64_t stream) {
+  if (rows <= 0 || intermediate <= 0) return;
+  CountLaunches(1);
+  const int64_t chunks = (intermediate + kSiluWideChunk - 1) / kSiluWideChunk;
+  hipLaunchKernelGGL(SiluMulWideKernel,
+                     dim3(static_cast<unsigned>(rows), static_cast<unsigned>(chunks)),
+                     dim3(kThreads), 0, (hipStream_t)stream, (const __hip_bfloat16*)gate_up,
+                     (__hip_bfloat16*)out, intermediate, in_row_stride);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

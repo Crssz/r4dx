@@ -28,6 +28,7 @@
 //   5. The mxfp4 wref exception, with rows built so the full-row wref clamps a group the shard's
 //      own wref would not.
 //   6. Misalignment throws; Gather bounds.
+//   7. Trellis `.trellis.w` (docs/trellis-kernel.md 2.4) against the converter's RegridToPairGrid.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -43,6 +44,7 @@
 #include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
+#include "r4dx_convert/trellis_import.hpp"  // RegridToPairGrid: the trellis packer (7. below)
 #include "tp/tp_shard.h"
 
 using r4dx::model::ModelConfig;
@@ -1083,6 +1085,79 @@ void TestMisalignment() {
   Pass("misaligned / out-of-bounds plans and runs are refused");
 }
 
+// 7. Trellis `.trellis.w` (docs/trellis-kernel.md 2.1, 2.4, 5.5): the converter's own packer is
+//    r4dx_convert::trellis::RegridToPairGrid, from the oracle layout [K/16][N/16][8 KB] words. On
+//    random words at KB 4 and 5, both ranks: Gather(regrid(W), PlanRows) == regrid(W[rank rows])
+//    for a fused two-segment (gate_up-shaped) split, and Gather(regrid(W), PlanCols) ==
+//    regrid(W[:, rank K]); the byte counts; and the 128-granular range checks.
+void TestTrellisPlans() {
+  std::mt19937 rng(20260927);
+  const int64_t N = 1024, K = 768;
+  const int64_t kt = K / 16;
+  for (int kb : {4, 5}) {
+    const int64_t nw = 8 * kb;
+    std::vector<uint32_t> oracle(static_cast<size_t>(kt * (N / 16) * nw));
+    for (auto& w : oracle) w = static_cast<uint32_t>(rng());
+    // regrid of the oracle words of the tile rows `tns` (in order) and the k-tiles
+    // [tk0, tk0 + tkn).
+    const auto regrid = [&](const std::vector<int64_t>& tns, int64_t tk0, int64_t tkn) {
+      std::vector<uint32_t> part(static_cast<size_t>(tkn * static_cast<int64_t>(tns.size()) * nw));
+      for (int64_t tk = 0; tk < tkn; ++tk) {
+        for (size_t i = 0; i < tns.size(); ++i) {
+          std::memcpy(&part[static_cast<size_t>((tk * static_cast<int64_t>(tns.size()) +
+                                                  static_cast<int64_t>(i)) * nw)],
+                      &oracle[static_cast<size_t>(((tk0 + tk) * (N / 16) + tns[i]) * nw)],
+                      static_cast<size_t>(nw) * 4);
+        }
+      }
+      const int64_t n = static_cast<int64_t>(tns.size()) * 16, k = tkn * 16;
+      std::vector<uint32_t> out(static_cast<size_t>(n * k * kb / 32));
+      r4dx_convert::trellis::RegridToPairGrid(
+          {{reinterpret_cast<const uint8_t*>(part.data()), n}}, k, kb, out.data(), 1);
+      return AsBytes(out);
+    };
+    std::vector<int64_t> all(static_cast<size_t>(N / 16));
+    for (int64_t t = 0; t < N / 16; ++t) all[static_cast<size_t>(t)] = t;
+    const std::vector<uint8_t> full = regrid(all, 0, kt);
+    PartShape sh;
+    sh.part = Part::kTrellisW;
+    sh.N = N;
+    sh.K = K;
+    sh.rate = kb;
+    Check(full.size() == static_cast<size_t>(N * K * kb / 8), "trellis w: N*K*KB/8 bytes");
+    ShardRule gate_up;
+    gate_up.split = Split::kRows;
+    gate_up.segments = {{0, 512}, {512, 512}};
+    for (int r = 0; r < 2; ++r) {
+      const std::vector<Range> rows = RankRows(gate_up, 2, r);
+      std::vector<int64_t> tns;
+      for (const Range& rg : rows)
+        for (int64_t t = rg.begin / 16; t < (rg.begin + rg.count) / 16; ++t) tns.push_back(t);
+      const std::vector<ByteRun> runs = PlanRows(sh, rows);
+      Check(runs.size() == 2 && Gather(full.data(), full.size(), runs) == regrid(tns, 0, kt),
+            "trellis w KB " + std::to_string(kb) + " rank " + std::to_string(r) +
+                ": two-segment row slice == regrid(W[rank rows]) (two runs)");
+      const Range cols = {r * K / 2, K / 2};
+      const std::vector<ByteRun> cruns = PlanCols(sh, cols);
+      Check(cruns.size() == static_cast<size_t>(N / 32) &&
+                Gather(full.data(), full.size(), cruns) == regrid(all, cols.begin / 16, K / 2 / 16),
+            "trellis w KB " + std::to_string(kb) + " rank " + std::to_string(r) +
+                ": K slice == regrid(W[:, rank K]) (one run per pair row)");
+    }
+    Check(Throws([&] { PlanRows(sh, {{64, 128}}); }) && Throws([&] { PlanRows(sh, {{0, 96}}); }) &&
+              Throws([&] { PlanCols(sh, {64, 384}); }) && Throws([&] { PlanCols(sh, {0, 320}); }),
+          "trellis w: a range that is not whole 128-blocks is refused");
+    PartShape bad = sh;
+    bad.N = 1000;
+    PartShape bad_rate = sh;
+    bad_rate.rate = 0;
+    Check(Throws([&] { PlanRows(bad, {{0, 128}}); }) &&
+              Throws([&] { PlanRows(bad_rate, {{0, 128}}); }),
+          "trellis w: a shape that is not 128-blocks, or no rate, is refused");
+  }
+  Pass("trellis .trellis.w: row and K slices equal the converter's regrid of the slice");
+}
+
 }  // namespace
 
 int main() {
@@ -1095,6 +1170,7 @@ int main() {
   TestDesignCases();
   TestMxfp4WrefException();
   TestMisalignment();
+  TestTrellisPlans();
   if (g_failures > 0) {
     std::fprintf(stderr, "%d of %d check(s) FAILED\n", g_failures, g_checks);
     return 1;

@@ -12,8 +12,10 @@
 #include "nlohmann/json.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "r4dx/core/r4d.hpp"  // GemmTrellisTicketsBytes / GemmTrellisZeroTickets
 #include "r4dx_convert/safetensors_reader.hpp"  // SafetensorsReader, Utf8ToWide -- see file comment
 #include "tp/tp_shard.h"  // tensor-parallel shard rules and byte plans (LoadShard, docs/tp.md 5.1)
+#include "trellis_meta.h"  // __metadata__.quant.trellis (docs/trellis-kernel.md 2.3, 2.5)
 #include "w4a16_group_meta.h"  // quant2 Q3: __metadata__.quant.w4a16.groups (docs/quant2.md 5.1)
 
 namespace r4dx::model {
@@ -102,8 +104,176 @@ W4a16LoadGroups CheckQuantGroups(const nlohmann::json& metadata, const std::stri
   return w;
 }
 
+// Everything a linear's load reads from `__metadata__` besides its shape: the w4a16 groups (quant2
+// Q3) and the trellis block (docs/trellis-kernel.md 2.3; nullopt for a container without one).
+struct LinearLoadMeta {
+  W4a16LoadGroups w4a16;
+  std::optional<TrellisSpec> trellis;
+  std::string path;
+};
+
+// docs/trellis-kernel.md 2.5 and 5.1: a head requested as kTrellis loads w4a16 -- the heads of a
+// trellis container are never trellis -- so every caller gets the same answer (Model::Load passes
+// the body layout for lm_head, tests pass whatever they load the body with).
+ContainerLoadOptions MapTrellisHeads(const ContainerLoadOptions& o) {
+  ContainerLoadOptions m = o;
+  if (m.lm_head_layout == Layout::kTrellis) m.lm_head_layout = Layout::kW4a16;
+  if (m.mtp_head_layout == Layout::kTrellis) m.mtp_head_layout = Layout::kW4a16;
+  return m;
+}
+
+// docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body
+// layout -- run by both loaders right after the parse, before any upload.
+void CheckTrellisChoice(const std::optional<TrellisSpec>& trellis, bool rotated, Layout layout,
+                        const std::string& path) {
+  if (trellis && rotated) {
+    throw std::runtime_error("r4dx::model::Container: " + path +
+                             " carries both __metadata__.rotation and __metadata__.quant.trellis; "
+                             "the two are mutually exclusive (docs/trellis-kernel.md 3.4)");
+  }
+  if (trellis && layout != Layout::kTrellis) {
+    throw std::runtime_error("r4dx::model::Container: " + path + " -- this container's body is "
+                             "trellis: run with --layout trellis (requested '" +
+                             std::string(LayoutName(layout)) + "')");
+  }
+  if (!trellis && layout == Layout::kTrellis) {
+    throw std::runtime_error("r4dx::model::Container: --layout trellis needs a trellis container "
+                             "(__metadata__.quant.trellis), and " + path + " has none");
+  }
+}
+
 using r4dx_convert::SafetensorsReader;
 using r4dx_convert::Utf8ToWide;
+
+// The trellis tensor suffixes (docs/trellis-kernel.md 2.1).
+constexpr const char* kTrellisSuffixes[] = {".trellis.w", ".trellis.suh", ".trellis.svh"};
+
+// docs/trellis-kernel.md 2.5, the refusals that need the tensor directory: every `.trellis.*`
+// tensor belongs to a `linears` entry, every entry has its three tensors, and every entry's rate is
+// one this build's kernel instantiates. A container without the block may carry no `.trellis.*`
+// tensor at all. Checked once per load, before any upload.
+void CheckTrellisTensors(const SafetensorsReader& r, const std::optional<TrellisSpec>& trellis,
+                         const std::string& path) {
+  for (const std::string& name : r.Names()) {
+    for (const char* suffix : kTrellisSuffixes) {
+      const size_t n = std::strlen(suffix);
+      if (name.size() <= n || name.compare(name.size() - n, n, suffix) != 0) continue;
+      const std::string base = name.substr(0, name.size() - n);
+      if (!trellis) {
+        throw std::runtime_error("r4dx::model::Container: " + path + " carries '" + name +
+                                 "' but no __metadata__.quant.trellis to read it with");
+      }
+      if (trellis->Find(base) == nullptr) {
+        throw std::runtime_error("r4dx::model::Container: " + path + " carries '" + name +
+                                 "' but __metadata__.quant.trellis.linears has no '" + base + "'");
+      }
+    }
+  }
+  if (!trellis) return;
+  for (const auto& [base, spec] : trellis->linears) {
+    for (const char* suffix : kTrellisSuffixes) {
+      if (!r.Has(base + suffix)) {
+        throw std::runtime_error("r4dx::model::Container: " + path +
+                                 " __metadata__.quant.trellis.linears lists '" + base +
+                                 "' but the container has no '" + base + suffix + "'");
+      }
+    }
+    CheckTrellisRate(spec.bits, base, path);
+  }
+}
+
+// One trellis linear's entry, which CheckTrellisTensors has matched with its tensors.
+const TrellisLinearSpec& TrellisFor(const LinearLoadMeta& meta, const std::string& base) {
+  const TrellisLinearSpec* t = meta.trellis ? meta.trellis->Find(base) : nullptr;
+  if (t == nullptr) {
+    throw std::logic_error("r4dx::model::Container: '" + base + "' is not a trellis linear of " +
+                           meta.path);
+  }
+  return *t;
+}
+
+// docs/trellis-kernel.md 2.5: the GLOBAL shape rules of one trellis linear [N, K] -- K, N and every
+// part whole 128-blocks, the parts summing to N -- and its three tensors' byte sizes (N*K*bits/8,
+// P*K*2, N*2), checked before a byte of it is uploaded, by both loaders.
+void CheckTrellisShape(const SafetensorsReader& r, const std::string& base,
+                       const TrellisLinearSpec& t, int64_t N, int64_t K, const std::string& path) {
+  const auto fail = [&](const std::string& why) {
+    throw std::runtime_error("r4dx::model::Container: trellis linear '" + base + "' [" +
+                             std::to_string(N) + ", " + std::to_string(K) + "] at " +
+                             std::to_string(t.bits) + " bits in " + path + ": " + why);
+  };
+  if (N <= 0 || K <= 0 || N % kTrellisBlock != 0 || K % kTrellisBlock != 0) {
+    fail("K and N must be multiples of 128");
+  }
+  if (!t.parts.empty()) {
+    int64_t sum = 0;
+    for (int64_t p : t.parts) sum += p;
+    if (sum != N) fail("its parts sum to " + std::to_string(sum) + " rows, not N");
+  }
+  const auto span = [&](const char* suffix) {
+    const auto& m = r.Meta(base + suffix);
+    return static_cast<uint64_t>(m.end - m.begin);
+  };
+  const uint64_t n = static_cast<uint64_t>(N), k = static_cast<uint64_t>(K);
+  const uint64_t want_w = n * k * static_cast<uint64_t>(t.bits) / 8;
+  const uint64_t want_suh = static_cast<uint64_t>(t.Parts()) * k * 2;
+  if (span(".trellis.w") != want_w) {
+    fail("'.trellis.w' is " + std::to_string(span(".trellis.w")) + " bytes, expected " +
+         std::to_string(want_w));
+  }
+  if (span(".trellis.suh") != want_suh) {
+    fail("'.trellis.suh' is " + std::to_string(span(".trellis.suh")) + " bytes, expected " +
+         std::to_string(want_suh));
+  }
+  if (span(".trellis.svh") != n * 2) {
+    fail("'.trellis.svh' is " + std::to_string(span(".trellis.svh")) + " bytes, expected " +
+         std::to_string(n * 2));
+  }
+}
+
+// The fields of a trellis QuantLinear that do not depend on a rank's slice.
+void SetTrellisFields(QuantLinear& q, const TrellisLinearSpec& t) {
+  q.trellis_bits = t.bits;
+  q.trellis_prescale_log2 = t.prescale_log2;
+  q.trellis_parts = t.Parts();
+}
+
+void LogTrellis(const TrellisSpec& spec, const std::string& path) {
+  std::map<int, int> per_rate;
+  int two_part = 0;
+  for (const auto& kv : spec.linears) {
+    ++per_rate[kv.second.bits];
+    if (kv.second.Parts() > 1) ++two_part;
+  }
+  std::string detail;
+  for (const auto& kv : per_rate) {
+    detail += (detail.empty() ? "" : ", ") + std::string("KB=") + std::to_string(kv.first) + " x" +
+              std::to_string(kv.second);
+  }
+  std::fprintf(stderr,
+               "r4dx: %s is a trellis container: %zu body linears (%s; %d with two input "
+               "transforms), prescale 2^%d, heads w4a16/bf16\n",
+               path.c_str(), spec.linears.size(), detail.c_str(), two_part, spec.prescale_log2);
+}
+
+// A trellis container converted with `--lm-head bf16` (A2's twin, docs/trellis-kernel.md 1) stores
+// lm_head as bf16 only, so the w4a16 head a trellis load asks for falls back by design -- not a
+// `--keep-bf16` linear or an old container, which the loaders' generic fallback line names. Called
+// right after the head's load with the fallback count from before it: such a head is taken out of
+// that count (true, and the caller says so on its own line).
+bool TakeTrellisBf16Head(const LinearLoadMeta& meta, const QuantLinear& head, int fallbacks_before,
+                         int* fallbacks) {
+  if (!meta.trellis || *fallbacks == fallbacks_before || head.layout != Layout::kBf16) return false;
+  --*fallbacks;
+  return true;
+}
+
+void LogTrellisBf16Head(const std::string& path) {
+  std::fprintf(stderr,
+               "r4dx: %s stores lm_head as bf16 only (a trellis container converted with "
+               "--lm-head bf16) -- loaded as bf16\n",
+               path.c_str());
+}
 
 int64_t ElemCountBySize(const SafetensorsReader& r, const std::string& name, int64_t elem_bytes) {
   const auto& m = r.Meta(name);
@@ -168,6 +338,26 @@ core::DeviceBuffer<float> UploadWidenedF32(const SafetensorsReader& r, const std
   core::DeviceBuffer<float> buf(static_cast<size_t>(n));
   buf.CopyFromHost(host);
   return buf;
+}
+
+// Trellis suh / svh (docs/trellis-kernel.md 2.1, 5.1): fp16 on disk, fp32 on device (the input
+// transform and the GEMM epilogue both multiply in fp32), from `bytes` of fp16 at `src`.
+core::DeviceBuffer<float> UploadWidenedF16Bytes(const uint8_t* src, size_t bytes) {
+  const size_t n = bytes / 2;
+  std::vector<float> host(n);
+  for (size_t i = 0; i < n; ++i) {
+    uint16_t h;
+    std::memcpy(&h, src + 2 * i, 2);
+    host[i] = core::F16ToFloat(h);
+  }
+  core::DeviceBuffer<float> buf(n);
+  buf.CopyFromHost(host);
+  return buf;
+}
+
+core::DeviceBuffer<float> UploadWidenedF16(const SafetensorsReader& r, const std::string& name) {
+  const int64_t n = ElemCountBySize(r, name, 2);
+  return UploadWidenedF16Bytes(r.Data(name), static_cast<size_t>(n) * 2);
 }
 
 // quant2 Q3: the byte sizes a w4a16 linear [N, K] at `group` must have on disk -- `.w4a16.wq`
@@ -236,8 +426,9 @@ void LogW4a16Groups(const W4a16Groups& groups, const std::string& path) {
                path.c_str(), groups.mapped.size(), detail.c_str(), groups.default_group);
 }
 
-QuantLinear LoadQuantLinear(const SafetensorsReader& r, const W4a16LoadGroups& w4a16,
+QuantLinear LoadQuantLinear(const SafetensorsReader& r, const LinearLoadMeta& meta,
                              const std::string& base, Layout layout, int64_t N, int64_t K) {
+  const W4a16LoadGroups& w4a16 = meta.w4a16;
   QuantLinear q;
   q.layout = layout;
   q.N = N;
@@ -255,6 +446,18 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const W4a16LoadGroups& w
       q.w4a16_wsz = UploadRawU32(r, wsz);
       break;
     }
+    case Layout::kTrellis: {
+      // docs/trellis-kernel.md 5.1: the pair-grid words as stored, suh / svh widened to fp32.
+      const TrellisLinearSpec& t = TrellisFor(meta, base);
+      CheckTrellisShape(r, base, t, N, K, meta.path);
+      SetTrellisFields(q, t);
+      q.trellis_part_n[0] = t.parts.empty() ? N : t.parts[0];
+      q.trellis_part_n[1] = t.parts.empty() ? 0 : t.parts[1];
+      q.trellis_w = UploadRawU32(r, base + ".trellis.w");
+      q.trellis_suh = UploadWidenedF16(r, base + ".trellis.suh");
+      q.trellis_svh = UploadWidenedF16(r, base + ".trellis.svh");
+      break;
+    }
     case Layout::kW4a8:
       q.wq = UploadRawU8(r, base + ".w4a8.wq");
       q.w4a8_ws = UploadRawU32(r, base + ".w4a8.ws");
@@ -268,16 +471,21 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const W4a16LoadGroups& w
   return q;
 }
 
-// True iff `r` carries every tensor `LoadQuantLinear(r, groups, base, layout, ...)` would read
-// (for w4a16, the scale tensor of `base`'s own group: W4a16Groups::WszName).
-bool HasLayout(const SafetensorsReader& r, const W4a16Groups& groups, const std::string& base,
+// True iff `r` carries every tensor `LoadQuantLinear(r, meta, base, layout, ...)` would read
+// (for w4a16, the scale tensor of `base`'s own group: W4a16Groups::WszName; for trellis, a
+// `linears` entry as well -- a base without one, a `--keep-bf16` linear, takes the bf16 fallback).
+bool HasLayout(const SafetensorsReader& r, const LinearLoadMeta& meta, const std::string& base,
                Layout layout) {
+  const W4a16Groups& groups = meta.w4a16.groups;
   switch (layout) {
     case Layout::kBf16: return r.Has(base + ".bf16.w");
     case Layout::kW4a16: return r.Has(base + ".w4a16.wq") && r.Has(groups.WszName(base));
     case Layout::kW4a8: return r.Has(base + ".w4a8.wq") && r.Has(base + ".w4a8.ws");
     case Layout::kMxfp4:
       return r.Has(base + ".mxfp4.wq") && r.Has(base + ".mxfp4.ws") && r.Has(base + ".mxfp4.wref");
+    case Layout::kTrellis:
+      return meta.trellis && meta.trellis->Find(base) != nullptr && r.Has(base + ".trellis.w") &&
+             r.Has(base + ".trellis.suh") && r.Has(base + ".trellis.svh");
   }
   return false;
 }
@@ -309,11 +517,12 @@ bool HasLayout(const SafetensorsReader& r, const W4a16Groups& groups, const std:
 // quietly serving a bf16 copy (or anything else) instead would hide a broken container.
 // CheckW4a16GroupTensors has already refused a map entry without its tensors, so this is the
 // second line, not the first.
-QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const W4a16LoadGroups& w4a16,
+QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const LinearLoadMeta& meta,
                                          const std::string& base, Layout requested, int64_t N,
                                          int64_t K, int* fallbacks = nullptr) {
-  if (HasLayout(r, w4a16.groups, base, requested)) {
-    return LoadQuantLinear(r, w4a16, base, requested, N, K);
+  const W4a16LoadGroups& w4a16 = meta.w4a16;
+  if (HasLayout(r, meta, base, requested)) {
+    return LoadQuantLinear(r, meta, base, requested, N, K);
   }
   if (requested == Layout::kW4a16 && w4a16.groups.Mapped(base)) {
     throw std::runtime_error("r4dx::model::Container: '" + base + "' is listed in " +
@@ -322,8 +531,8 @@ QuantLinear LoadQuantLinearWithFallback(const SafetensorsReader& r, const W4a16L
                              w4a16.groups.WszName(base) + "' is missing; not falling back");
   }
   if (fallbacks != nullptr) ++*fallbacks;
-  if (HasLayout(r, w4a16.groups, base, Layout::kBf16)) {
-    return LoadQuantLinear(r, w4a16, base, Layout::kBf16, N, K);
+  if (HasLayout(r, meta, base, Layout::kBf16)) {
+    return LoadQuantLinear(r, meta, base, Layout::kBf16, N, K);
   }
   if (r.Has(base)) {
     QuantLinear q;
@@ -449,14 +658,17 @@ Container Container::Load(const std::string& path, Layout layout, Layout lm_head
   return Load(path, o);
 }
 
-Container Container::Load(const std::string& path, const ContainerLoadOptions& o) {
+Container Container::Load(const std::string& path, const ContainerLoadOptions& o_in) {
+  // docs/trellis-kernel.md 5.1: the heads of a trellis container are w4a16 (or bf16) -- mapped
+  // here, at the top, so the TP=1 path and LoadShard both see it.
+  const ContainerLoadOptions o = MapTrellisHeads(o_in);
   if (o.tp_world < 1 || o.tp_world > 2 || o.tp_rank < 0 || o.tp_rank >= o.tp_world) {
     throw std::invalid_argument("r4dx::model::Container::Load: need tp_world in {1, 2} and 0 <= "
                                 "tp_rank < tp_world, got tp_world " + std::to_string(o.tp_world) +
                                 ", tp_rank " + std::to_string(o.tp_rank));
   }
   if (o.tp_world > 1) return LoadShard(path, o);
-  // tp_world == 1 (docs/tp.md 5.1 step 7): the pre-TP loader below, untouched -- no rule lookup, no
+  // tp_world == 1 (docs/tp.md 5.1 step 7): the single-device loader below -- no rule lookup, no
   // staging. The TP-only options have no meaning here; refuse them rather than ignore them.
   if (o.shared_embed_host || o.embed_device_resident_decided >= 0 || o.parse_vision_config) {
     throw std::invalid_argument(
@@ -471,8 +683,9 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
-  const W4a16LoadGroups w4a16 =
-      CheckQuantGroups(metadata, path, layout, lm_head_layout, mtp_head_layout);
+  LinearLoadMeta meta;
+  meta.w4a16 = CheckQuantGroups(metadata, path, layout, lm_head_layout, mtp_head_layout);
+  meta.path = path;
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");
@@ -492,11 +705,16 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // here rather than after the whole container has been read into VRAM. nullopt: unrotated.
   const std::optional<RotationSpec> rotation =
       ParseRotationMetadata(metadata, c.global_config_, path);
+  // docs/trellis-kernel.md 2.5: the trellis block, next to the rotation and with the same timing --
+  // parsed and checked against the requested layout before any upload. nullopt: not trellis.
+  meta.trellis = ParseTrellisMetadata(metadata, path);
+  CheckTrellisChoice(meta.trellis, rotation.has_value(), layout, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
   // quant2 Q3: a no-op for a container without a per-tensor group map.
-  CheckW4a16GroupTensors(reader, w4a16.groups, path);
-  if (w4a16.check_default_per_linear) LogW4a16Groups(w4a16.groups, path);
+  CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);
+  if (meta.w4a16.check_default_per_linear) LogW4a16Groups(meta.w4a16.groups, path);
+  CheckTrellisTensors(reader, meta.trellis, path);
 
   const int64_t num_layers = (layer_limit >= 0)
                                   ? std::min(layer_limit, c.config_.num_hidden_layers)
@@ -555,10 +773,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
 
     if (c.config_.IsGdnLayer(i)) {
       GdnWeights g;
-      g.in_proj_qkv = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.in_proj_qkv", layout,
+      g.in_proj_qkv = LoadQuantLinearWithFallback(reader, meta,base + "gdn.in_proj_qkv", layout,
                                                    2 * key_dim + value_dim, hidden,
                                                    &bf16_fallbacks);
-      g.in_proj_z = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.in_proj_z", layout, value_dim,
+      g.in_proj_z = LoadQuantLinearWithFallback(reader, meta,base + "gdn.in_proj_z", layout, value_dim,
                                                  hidden, &bf16_fallbacks);
       g.in_proj_b = UploadRawU16(reader, base + "gdn.in_proj_b");
       g.in_proj_a = UploadRawU16(reader, base + "gdn.in_proj_a");
@@ -566,7 +784,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       g.A_log = UploadRawF32(reader, base + "gdn.A_log");
       g.dt_bias = UploadRawF32(reader, base + "gdn.dt_bias");
       g.norm_weight = UploadWidenedF32(reader, base + "gdn.norm_weight");
-      g.out_proj = LoadQuantLinearWithFallback(reader, w4a16,base + "gdn.out_proj", layout, hidden,
+      g.out_proj = LoadQuantLinearWithFallback(reader, meta,base + "gdn.out_proj", layout, hidden,
                                                 value_dim, &bf16_fallbacks);
       lw.gdn = std::move(g);
     } else {
@@ -576,13 +794,13 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       // through the shared r4dx::model::ApplyLinear (src/model/linear.h), which every layout
       // already supports. See docs/perf.md for the measured per-layout VRAM/throughput delta this
       // unlocks (attn.qg/o account for 16 of 64 layers' full-attention projections).
-      a.qg = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.qg", layout, attn_out * 2, hidden,
+      a.qg = LoadQuantLinearWithFallback(reader, meta,base + "attn.qg", layout, attn_out * 2, hidden,
                                           &bf16_fallbacks);
-      a.k = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.k", layout,
+      a.k = LoadQuantLinearWithFallback(reader, meta,base + "attn.k", layout,
                                          kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
-      a.v = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.v", layout,
+      a.v = LoadQuantLinearWithFallback(reader, meta,base + "attn.v", layout,
                                          kv_heads * c.config_.head_dim, hidden, &bf16_fallbacks);
-      a.o = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.o", layout, hidden, attn_out,
+      a.o = LoadQuantLinearWithFallback(reader, meta,base + "attn.o", layout, hidden, attn_out,
                                          &bf16_fallbacks);
       a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
       a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
@@ -591,10 +809,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       lw.attn = std::move(a);
     }
 
-    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.gate_up", layout,
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, meta,base + "mlp.gate_up", layout,
                                                   2 * c.config_.intermediate_size, hidden,
                                                   &bf16_fallbacks);
-    lw.mlp.down = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.down", layout, hidden,
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, meta,base + "mlp.down", layout, hidden,
                                                c.config_.intermediate_size, &bf16_fallbacks);
     c.layers_.push_back(std::move(lw));
   }
@@ -603,8 +821,11 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // With fallback: a container converted with `--lm-head bf16` (rung 4 follow-up -- the 4-bit
   // lm_head is where the vocab-tail KL loss concentrates) carries only lm_head.bf16.w, and every
   // caller that asks for the body layout here should get that bf16 head rather than a throw.
-  c.lm_head_ = LoadQuantLinearWithFallback(reader, w4a16,"lm_head", lm_head_layout, c.config_.vocab_size,
+  const int fallbacks_before_head = bf16_fallbacks;
+  c.lm_head_ = LoadQuantLinearWithFallback(reader, meta,"lm_head", lm_head_layout, c.config_.vocab_size,
                                            hidden, &bf16_fallbacks);
+  const bool trellis_bf16_head =
+      TakeTrellisBf16Head(meta, c.lm_head_, fallbacks_before_head, &bf16_fallbacks);
   if (rotation) {
     c.rotation_ = LoadRotationWeights(reader, *rotation, c.global_config_, c.config_, path,
                                       [&](const std::string& name) { return UploadRawF32(reader, name); });
@@ -629,7 +850,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
     // descales, fc, norm, pre_fc_norm_*) has only one on-disk form regardless of layout, same as
     // the body layers above.
     AttnWeights a;
-    a.qg = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.qg", mtp_head_layout, attn_out * 2,
+    a.qg = LoadQuantLinearWithFallback(reader, meta,base + "attn.qg", mtp_head_layout, attn_out * 2,
                                         hidden, &bf16_fallbacks);
     // mtp.attn.k/v stay bf16 regardless of the requested body/head layout (docs/r9700.md's R1
     // task: "Keep mtp.* ... as they are") -- request Layout::kBf16 explicitly rather than
@@ -637,21 +858,21 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
     // converter run ever quantized mtp.*. LoadQuantLinearWithFallback (not UploadRawU16) so this
     // still works against the OLD bare-tensor on-disk form (pre-R1 containers) as well as any
     // future `.bf16.w`-suffixed form -- see LoadQuantLinearWithFallback's own comment.
-    a.k = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.k", Layout::kBf16,
+    a.k = LoadQuantLinearWithFallback(reader, meta,base + "attn.k", Layout::kBf16,
                                        kv_heads * c.config_.head_dim, hidden);
-    a.v = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.v", Layout::kBf16,
+    a.v = LoadQuantLinearWithFallback(reader, meta,base + "attn.v", Layout::kBf16,
                                        kv_heads * c.config_.head_dim, hidden);
-    a.o = LoadQuantLinearWithFallback(reader, w4a16,base + "attn.o", mtp_head_layout, hidden, attn_out,
+    a.o = LoadQuantLinearWithFallback(reader, meta,base + "attn.o", mtp_head_layout, hidden, attn_out,
                                        &bf16_fallbacks);
     a.q_norm = UploadRawU16(reader, base + "attn.q_norm");
     a.k_norm = UploadRawU16(reader, base + "attn.k_norm");
     a.k_descale = UploadRawF32(reader, base + "attn.k_descale");
     a.v_descale = UploadRawF32(reader, base + "attn.v_descale");
     lw.attn = std::move(a);
-    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.gate_up", mtp_head_layout,
+    lw.mlp.gate_up = LoadQuantLinearWithFallback(reader, meta,base + "mlp.gate_up", mtp_head_layout,
                                                   2 * c.config_.intermediate_size, hidden,
                                                   &bf16_fallbacks);
-    lw.mlp.down = LoadQuantLinearWithFallback(reader, w4a16,base + "mlp.down", mtp_head_layout, hidden,
+    lw.mlp.down = LoadQuantLinearWithFallback(reader, meta,base + "mlp.down", mtp_head_layout, hidden,
                                                c.config_.intermediate_size, &bf16_fallbacks);
     mw.layer = std::move(lw);
     mw.fc = UploadRawU16(reader, "mtp.fc");
@@ -674,7 +895,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       // why: the draft head's error compounds across chained draft steps) -- a run that chose to
       // build a draft head always emits it in the same LayoutSet as mtp.attn.qg/o and
       // mtp.mlp.gate_up/down, so this load-time layout selection just works.
-      mw.draft_lm_head = LoadQuantLinearWithFallback(reader, w4a16,"mtp.draft_head.lm_head",
+      mw.draft_lm_head = LoadQuantLinearWithFallback(reader, meta,"mtp.draft_head.lm_head",
                                                       mtp_head_layout, draft_vocab_size, hidden,
                                                       &bf16_fallbacks);
     }
@@ -697,6 +918,14 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
                   "bf16 (r4dx-convert --keep-bf16, or a container predating that tensor's "
                   "quantization)\n",
                   bf16_fallbacks, path.c_str());
+  }
+  // docs/trellis-kernel.md 4.5: every trellis linear's tickets, one zeroed buffer for the
+  // container.
+  if (meta.trellis) {
+    c.trellis_ = std::move(meta.trellis);
+    c.AssignTrellisTickets();
+    LogTrellis(*c.trellis_, path);
+    if (trellis_bf16_head) LogTrellisBf16Head(path);
   }
 
   c.container_has_vision_tensors_ = vision::HasVisionTensors(reader);
@@ -767,6 +996,7 @@ uint64_t PartBytes(const tp::PartShape& s) {
     case tp::Part::kMxWs: return (K / static_cast<uint64_t>(s.group)) * N;
     case tp::Part::kMxWref: return N;
     case tp::Part::kElem: return N * static_cast<uint64_t>(s.row_bytes);
+    case tp::Part::kTrellisW: return N * K * static_cast<uint64_t>(s.rate) / 8;
   }
   return 0;
 }
@@ -778,11 +1008,12 @@ uint64_t PartBytes(const tp::PartShape& s) {
 // replicated.
 class ShardLoader {
  public:
-  // `w4a16`: the container's w4a16 groups (quant2 Q3) -- each w4a16 linear's scale name and the
-  // group its wsz slice is cut at (tp::Part::kW4a16Wsz strides by the group), per tensor.
+  // `meta.w4a16`: the container's w4a16 groups (quant2 Q3) -- each w4a16 linear's scale name and
+  // the group its wsz slice is cut at (tp::Part::kW4a16Wsz strides by the group), per tensor.
+  // `meta.trellis`: each trellis linear's rate and parts (docs/trellis-kernel.md 2.3, 5.1).
   ShardLoader(const SafetensorsReader& r, const ModelConfig& global, int world, int rank,
-              const W4a16LoadGroups& w4a16)
-      : r_(r), global_(global), world_(world), rank_(rank), w4a16_(w4a16) {}
+              const LinearLoadMeta& meta)
+      : r_(r), global_(global), world_(world), rank_(rank), meta_(meta), w4a16_(meta.w4a16) {}
 
   // A tensor with one on-disk form and no layout suffix (norms, gdn.in_proj_a/b, conv1d_weight,
   // A_log, dt_bias, the descales, mtp.fc, ...): its whole bytes when the rule replicates, else this
@@ -830,7 +1061,7 @@ class ShardLoader {
                      int* fallbacks = nullptr) {
     Layout form = requested;
     bool bare = false;
-    if (!HasLayout(r_, w4a16_.groups, base, requested)) {
+    if (!HasLayout(r_, meta_, base, requested)) {
       // quant2 Q3: a mapped w4a16 linear never falls back (LoadQuantLinearWithFallback).
       if (requested == Layout::kW4a16 && w4a16_.groups.Mapped(base)) {
         throw std::runtime_error("r4dx::model::Container: '" + base + "' is listed in " +
@@ -840,7 +1071,7 @@ class ShardLoader {
       }
       if (fallbacks != nullptr) ++*fallbacks;
       form = Layout::kBf16;
-      if (!HasLayout(r_, w4a16_.groups, base, Layout::kBf16)) {
+      if (!HasLayout(r_, meta_, base, Layout::kBf16)) {
         if (!r_.Has(base)) {
           throw std::runtime_error("r4dx::model::Container: no tensor found for '" + base +
                                    "' in any known on-disk form (requested layout, bf16, or bare)");
@@ -916,6 +1147,9 @@ class ShardLoader {
         q.mxfp4_wref = Part<int8_t>(base + ".mxfp4.wref", shape(tp::Part::kMxWref, 0), rule, rows,
                                     cols);
         break;
+      case Layout::kTrellis:
+        TrellisSlice(q, base, rule, rows, cols, N, K);
+        break;
     }
     return q;
   }
@@ -931,6 +1165,102 @@ class ShardLoader {
   uint64_t Span(const std::string& name) const {
     const auto& m = r_.Meta(name);
     return m.end - m.begin;
+  }
+
+  // docs/trellis-kernel.md 2.4, 5.1, 5.5: this rank's slice of trellis linear `base` (GLOBAL
+  // [N, K]; q.N / q.K are already the rank's). The words go through Part() with kTrellisW; suh and
+  // svh have explicit plans, because Part() picks the plan by the linear's rule, which is right for
+  // neither:
+  //   column-parallel (kRows): suh replicated (every part, full K), svh cut by the rank's rows;
+  //   row-parallel (kCols): suh cut by the rank's K range (one part only), svh replicated.
+  // Both are gathered as fp16 and widened on the host. Every rank range must be whole 128-blocks
+  // (both Hadamards work in them), and each part's rank-local width is the rank's rows inside it.
+  void TrellisSlice(QuantLinear& q, const std::string& base, const tp::ShardRule& rule,
+                    const std::vector<tp::Range>& rows, tp::Range cols, int64_t N, int64_t K) {
+    const TrellisLinearSpec& t = TrellisFor(meta_, base);
+    CheckTrellisShape(r_, base, t, N, K, meta_.path);
+    const auto fail = [&](const std::string& why) {
+      throw std::runtime_error("r4dx::model::Container: trellis linear '" + base + "' at TP=" +
+                               std::to_string(world_) + " rank " + std::to_string(rank_) + ": " +
+                               why + " (docs/trellis-kernel.md 2.4)");
+    };
+    for (const tp::Range& r : rows) {
+      if (r.begin % kTrellisBlock != 0 || r.count % kTrellisBlock != 0) {
+        fail("the rank's rows [" + std::to_string(r.begin) + ", " +
+             std::to_string(r.begin + r.count) + ") are not whole 128-blocks");
+      }
+    }
+    if (cols.begin % kTrellisBlock != 0 || cols.count % kTrellisBlock != 0) {
+      fail("the rank's K range [" + std::to_string(cols.begin) + ", " +
+           std::to_string(cols.begin + cols.count) + ") is not whole 128-blocks");
+    }
+    SetTrellisFields(q, t);
+    tp::PartShape wshape;
+    wshape.part = tp::Part::kTrellisW;
+    wshape.N = N;
+    wshape.K = K;
+    wshape.rate = t.bits;
+    q.trellis_w = Part<uint32_t>(base + ".trellis.w", wshape, rule, rows, cols);
+
+    const std::string suh = base + ".trellis.suh", svh = base + ".trellis.svh";
+    const auto elem = [](int64_t n) {
+      tp::PartShape s;
+      s.part = tp::Part::kElem;
+      s.N = n;
+      s.row_bytes = 2;  // fp16
+      return s;
+    };
+    if (rule.split == tp::Split::kCols) {
+      if (t.Parts() != 1) fail("a row-parallel linear with two input transforms");
+      q.trellis_suh = WidenedF16(suh, tp::PlanRows(elem(K), {cols}), true);
+    } else {
+      q.trellis_suh = WidenedF16(suh, {tp::ByteRun{0, Span(suh)}}, false);
+    }
+    if (rule.split == tp::Split::kRows) {
+      q.trellis_svh = WidenedF16(svh, tp::PlanRows(elem(N), rows), true);
+    } else {
+      q.trellis_svh = WidenedF16(svh, {tp::ByteRun{0, Span(svh)}}, false);
+    }
+
+    // Rank-local parts: the rank's rows inside each part's global range, in concatenation order
+    // (every rank range lies inside one part, and the part index never decreases along them).
+    const int parts = t.Parts();
+    const int64_t global_n[2] = {parts > 1 ? t.parts[0] : N, parts > 1 ? t.parts[1] : 0};
+    if (rule.split != tp::Split::kRows) {
+      q.trellis_part_n[0] = global_n[0];
+      q.trellis_part_n[1] = global_n[1];
+      return;
+    }
+    int64_t local[2] = {0, 0};
+    int last_part = 0;
+    for (const tp::Range& r : rows) {
+      const int p = (parts > 1 && r.begin >= global_n[0]) ? 1 : 0;
+      const int64_t part_end = p == 0 ? global_n[0] : global_n[0] + global_n[1];
+      if (r.begin + r.count > part_end || p < last_part) {
+        fail("the rank's rows [" + std::to_string(r.begin) + ", " +
+             std::to_string(r.begin + r.count) + ") cross a part boundary");
+      }
+      local[p] += r.count;
+      last_part = p;
+    }
+    if (parts > 1 && (local[0] == 0 || local[1] == 0)) fail("a part has no rows on this rank");
+    q.trellis_part_n[0] = local[0];
+    q.trellis_part_n[1] = local[1];
+  }
+
+  // The fp16 bytes `runs` of `name`, gathered and widened to fp32 (trellis suh / svh).
+  core::DeviceBuffer<float> WidenedF16(const std::string& name,
+                                       const std::vector<tp::ByteRun>& runs, bool sharded) {
+    const std::vector<uint8_t> bytes = tp::Gather(r_.Data(name), Span(name), runs);
+    if (bytes.empty() || bytes.size() % 2 != 0) {
+      throw std::runtime_error("r4dx::model::Container: this rank's slice of '" + name + "' is " +
+                               std::to_string(bytes.size()) + " bytes, not whole fp16 values");
+    }
+    core::DeviceBuffer<float> buf = UploadWidenedF16Bytes(bytes.data(), bytes.size());
+    ++(sharded ? stats_.sharded : stats_.replicated);
+    stats_.uploaded_bytes += buf.bytes();  // the fp32 device bytes, as WidenedF32 counts them
+    if (runs.size() > 1) stats_.staged_bytes += bytes.size();
+    return buf;
   }
 
   template <class T>
@@ -992,6 +1322,7 @@ class ShardLoader {
   const SafetensorsReader& r_;
   const ModelConfig& global_;
   int world_, rank_;
+  const LinearLoadMeta& meta_;
   const W4a16LoadGroups& w4a16_;
   std::vector<uint8_t> staging_;  // grown to the largest gathered tensor; freed with the loader
   ShardLoadStats stats_;
@@ -1008,8 +1339,10 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   const VramSnapshot vram_before = SnapshotVram();
   Container c;
   const nlohmann::json metadata = ReadMetadata(path);
-  const W4a16LoadGroups w4a16 =
-      CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout);
+  LinearLoadMeta meta;
+  meta.w4a16 = CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, o.mtp_head_layout);
+  meta.path = path;
+  const W4a16LoadGroups& w4a16 = meta.w4a16;
   c.model_id_ = metadata.value("model_id", std::string());
   c.config_sha256_ = metadata.value("config_sha256", std::string());
   const nlohmann::json& model_config = metadata.at("model_config");
@@ -1030,12 +1363,17 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   // quant2: the TP=1 path's parse, before any upload (docs/quant2.md section 3.1).
   const std::optional<RotationSpec> rotation =
       ParseRotationMetadata(metadata, c.global_config_, path);
+  // docs/trellis-kernel.md 2.5: the TP=1 path's trellis parse and refusals, before any upload; the
+  // spec travels into ShardLoader, whose kTrellis case needs each linear's rate and parts.
+  meta.trellis = ParseTrellisMetadata(metadata, path);
+  CheckTrellisChoice(meta.trellis, rotation.has_value(), o.layout, path);
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, w4a16.groups, path);  // quant2 Q3; see Container::Load
   if (w4a16.check_default_per_linear && o.tp_rank == 0) LogW4a16Groups(w4a16.groups, path);
+  CheckTrellisTensors(reader, meta.trellis, path);
   const ModelConfig& gc = c.global_config_;
-  ShardLoader L(reader, gc, o.tp_world, o.tp_rank, w4a16);
+  ShardLoader L(reader, gc, o.tp_world, o.tp_rank, meta);
   const int64_t num_layers =
       (o.layer_limit >= 0) ? std::min(o.layer_limit, gc.num_hidden_layers) : gc.num_hidden_layers;
 
@@ -1132,7 +1470,10 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
 
   c.final_norm_ = L.Raw<uint16_t>("text.final_norm");
   // Vocab-split (docs/tp.md 7.1): this rank's [vocab/world, hidden] rows.
+  const int fallbacks_before_head = bf16_fallbacks;
   c.lm_head_ = L.Linear("lm_head", o.lm_head_layout, gc.vocab_size, hidden, &bf16_fallbacks);
+  const bool trellis_bf16_head =
+      TakeTrellisBf16Head(meta, c.lm_head_, fallbacks_before_head, &bf16_fallbacks);
   // quant2 (docs/quant2.md section 3.1): every rank runs the same residual ops on its own full
   // replicated rows, so signs/mix5 replicate; the q2ab sign vectors are cut by tp::RuleFor with the
   // K range of their linear's columns (mlp.down 8704 = 17 x 512 per rank, attn.o 12 heads x 256,
@@ -1186,6 +1527,13 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
                  "quantization)\n",
                  bf16_fallbacks, path.c_str());
   }
+  // docs/trellis-kernel.md 4.5: this rank's own ticket buffer (each rank loads its own Container).
+  if (meta.trellis) {
+    c.trellis_ = meta.trellis;
+    c.AssignTrellisTickets();
+    if (o.tp_rank == 0) LogTrellis(*c.trellis_, path);
+    if (o.tp_rank == 0 && trellis_bf16_head) LogTrellisBf16Head(path);
+  }
 
   // vision.* (docs/tp.md 4.2, 8.3): rank-0-only weights; any rank may parse just the geometry.
   c.container_has_vision_tensors_ = vision::HasVisionTensors(reader);
@@ -1221,6 +1569,53 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
     }
   }
   return c;
+}
+
+template <class Fn>
+void Container::ForEachLinear(Fn&& fn) {
+  const auto layer = [&](LayerWeights& lw) {
+    if (lw.attn) {
+      fn(lw.attn->qg);
+      fn(lw.attn->k);
+      fn(lw.attn->v);
+      fn(lw.attn->o);
+    }
+    if (lw.gdn) {
+      fn(lw.gdn->in_proj_qkv);
+      fn(lw.gdn->in_proj_z);
+      fn(lw.gdn->out_proj);
+    }
+    fn(lw.mlp.gate_up);
+    fn(lw.mlp.down);
+  };
+  for (LayerWeights& lw : layers_) layer(lw);
+  fn(lm_head_);
+  if (mtp_) {
+    layer(mtp_->layer);
+    fn(mtp_->draft_lm_head);
+  }
+}
+
+void Container::AssignTrellisTickets() {
+  size_t total = 0;
+  ForEachLinear([&](QuantLinear& q) {
+    if (q.layout == Layout::kTrellis) {
+      total += core::r4d::GemmTrellisTicketsBytes(static_cast<int>(q.N)) / sizeof(uint32_t);
+    }
+  });
+  trellis_tickets_ = core::DeviceBuffer<uint32_t>(total);
+  trellis_tickets_.Zero();
+  size_t off = 0;
+  ForEachLinear([&](QuantLinear& q) {
+    if (q.layout != Layout::kTrellis) return;
+    q.trellis_tickets = trellis_tickets_.data() + off;
+    off += core::r4d::GemmTrellisTicketsBytes(static_cast<int>(q.N)) / sizeof(uint32_t);
+  });
+}
+
+void Container::ZeroTrellisTickets(hipStream_t stream) {
+  if (trellis_tickets_.empty()) return;
+  core::r4d::GemmTrellisZeroTickets(trellis_tickets_.data(), trellis_tickets_.bytes(), stream);
 }
 
 std::shared_ptr<const core::PinnedBuffer<uint16_t>> Container::LoadEmbedTokensHost(

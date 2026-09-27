@@ -102,10 +102,12 @@ set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm PR
 # and would still be killed rather than unwound by a HIP error raised inside src/kernels -- see
 # docs/dflash2.md's "Kernels" subsection, which records this as an open project-wide question
 # rather than something a kernel stage should decide unilaterally.
+# test_fused_quant.cpp checks that the rmsnorm / residual_rmsnorm / silu_mul host entries throw on
+# an epilogue value they do not know (docs/trellis-kernel.md 5.3).
 set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_lse.cpp
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
-                            test_trellis_input.cpp test_trellis_gemm.cpp
+                            test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -131,9 +133,9 @@ target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core
 # "Benches"): the 336-GEMM decode-step replay against production w4a16, op rates and WMMA/VALU/
 # memory overlap, the split-group tail and the M = 64 prefill shape; and M2's full-linear replay
 # (--modes full: input transforms + GEMMs with the epilogue against q2ab's casts, Hadamards and
-# rotations, KB 4 or the 4.5 bpw mix, the joint M = 1 / M = 8 tuning pick that writes
-# tests/kernels/gemm_tuning_table_trellis.inc, which milestone M4 moves into src/model when it wires
-# the table into linear.cpp); writes JSON to --out. Built,
+# rotations, KB 4 or the 4.5 bpw mix, the joint M = 1 / M = 8 tuning pick whose --inc-out wrote
+# src/model/gemm_tuning_table_trellis.inc, the trellis rows linear.cpp's PickTuning reads); writes
+# JSON to --out. Built,
 # never add_test()'d (the real runs are scheduled GPU time):
 #   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_trellis_gemm_bench.exe --out x.json
 # Its device side (fills, the clock probe, the op-rate and pipe loops) is a hipcc object of its own,

@@ -9,6 +9,13 @@
 // the rest of the model). Tensors that only ever have one on-disk form (embeddings, norms,
 // attn.k/v, descales, A_log/dt_bias, conv1d_weight) are uploaded as that form regardless of
 // `layout`.
+//
+// Trellis (docs/trellis-kernel.md 2, 5.1): a container carrying `__metadata__.quant.trellis` has a
+// trellis BODY (the 400 decoder linears) and loads only with `layout` kTrellis, and kTrellis only
+// loads such a container. Its lm_head and MTP head stay w4a16 (or bf16), so a requested
+// lm_head_layout / mtp_head_layout of kTrellis is read as kW4a16 by every Load -- the same answer
+// for every caller, whether it passes the body layout for the heads (Model::Load) or not; a head
+// with no w4a16 form (the `--lm-head bf16` twin) then takes the ordinary bf16 fallback.
 #pragma once
 
 #include <cstdint>
@@ -23,6 +30,7 @@
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 #include "rotation_meta.h"   // quant2 __metadata__.rotation (docs/quant2.md section 3.1)
+#include "trellis_meta.h"    // __metadata__.quant.trellis (docs/trellis-kernel.md 2.3)
 #include "vision_weights.h"  // src/vision: the vision.* tower weights (docs/vision.md)
 
 namespace r4dx::model {
@@ -241,6 +249,18 @@ class Container {
   bool HasRotation() const { return rotation_.has_value(); }
   const RotationWeights& Rotation() const { return rotation_.value(); }
 
+  // True iff the container carries `__metadata__.quant.trellis` (docs/trellis-kernel.md 2.3), i.e.
+  // its body linears are trellis (Load refuses any other body layout for it). Trellis() is valid
+  // iff this is.
+  bool HasTrellis() const { return trellis_.has_value(); }
+  const TrellisSpec& Trellis() const { return trellis_.value(); }
+  // docs/trellis-kernel.md 4.5: every trellis linear's split-group tickets live in ONE device
+  // buffer of this Container (each QuantLinear::trellis_tickets is its slice), zeroed at load. A
+  // launch that completes leaves its tickets zero again, so this only matters after one that did
+  // not (a device fault or TDR); Model::Reset() calls it. One hipMemsetAsync on `stream`; a no-op
+  // for a container without trellis linears.
+  void ZeroTrellisTickets(hipStream_t stream);
+
   // The vision tower's weights (docs/vision.md), present only when Load() was called with
   // load_vision=true AND the container actually carries vision.* tensors. HasVisionTensors() is
   // the second of those two questions on its own -- a caller that wants to say "this container
@@ -274,6 +294,13 @@ class Container {
   // The tensor-parallel shard path of Load(path, ContainerLoadOptions) (docs/tp.md 5.1).
   static Container LoadShard(const std::string& path, const ContainerLoadOptions& o);
 
+  // Calls `fn(QuantLinear&)` for every linear this Container holds (body, lm_head, MTP head).
+  template <class Fn>
+  void ForEachLinear(Fn&& fn);
+  // Allocates trellis_tickets_ (zeroed) with one N/128 slice per trellis linear and points each
+  // linear's trellis_tickets at its slice. Called once, at the end of both loaders.
+  void AssignTrellisTickets();
+
   ModelConfig config_;
   ModelConfig global_config_;  // == config_ at tp_world == 1
   int64_t image_token_id_ = 248056;  // C:\AI\models\Qwen3.8-27B\config.json, top level
@@ -288,6 +315,8 @@ class Container {
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;
   std::optional<RotationWeights> rotation_;  // iff __metadata__.rotation
+  std::optional<TrellisSpec> trellis_;       // iff __metadata__.quant.trellis
+  core::DeviceBuffer<uint32_t> trellis_tickets_;  // every trellis linear's tickets (4.5)
   std::optional<vision::VisionWeights> vision_;
   std::optional<vision::VisionConfig> vision_config_;  // parsed-only (TP rank without the tower)
   bool container_has_vision_tensors_ = false;

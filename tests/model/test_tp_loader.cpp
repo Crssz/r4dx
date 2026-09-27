@@ -18,9 +18,13 @@
 //     file's bytes; the device mirror follows embed_device_resident_decided (and holds the file's
 //     bytes when present).
 // Plus the load-time refusals: TP-only options at tp_world 1, vision weights on rank 1.
+// And the trellis cases (docs/trellis-kernel.md 2.4, 5.5; CheckTrellisTp below) on tests/convert's
+// tiny trellis containers (FIXTURES_REQUIRED trellis_tiny): both ranks' words, suh, svh and part
+// widths against the TP=1 load of the same file.
 //
-// GPU test on HIP device 1 (ctest sets HIP_VISIBLE_DEVICES=1); SKIPs (77) when the container is
-// absent. Peak VRAM ~7 GiB (both bf16 ranks at once, no embedding mirror).
+// GPU test on HIP device 1 (ctest sets HIP_VISIBLE_DEVICES=1); SKIPs (77) when neither the 4-layer
+// container nor the tiny trellis ones are present. Peak VRAM ~7 GiB (both bf16 ranks at once, no
+// embedding mirror).
 #include <hip/hip_runtime.h>
 
 #include <cstdio>
@@ -36,6 +40,7 @@
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "test_common.h"
 #include "tp/tp_shard.h"
+#include "trellis_ref.hpp"  // tests/kernels: PairGridIndex (the trellis cases)
 #include "w4a16_group_meta.h"
 
 using r4dx::model::Container;
@@ -191,6 +196,9 @@ class RankChecker {
           ck_.Expect(q.mxfp4_wref.size() == static_cast<size_t>(N), Where(base) + ": full wref");
         }
         break;
+      case Layout::kTrellis:  // never requested here; CheckTrellisTp covers the trellis slices
+        ck_.Expect(false, Where(base) + ": loaded as trellis from a non-trellis container");
+        break;
     }
   }
 
@@ -203,6 +211,8 @@ class RankChecker {
       case Layout::kMxfp4:
         return f_.Has(base + ".mxfp4.wq") && f_.Has(base + ".mxfp4.ws") &&
                f_.Has(base + ".mxfp4.wref");
+      case Layout::kTrellis:
+        return false;
     }
     return false;
   }
@@ -491,8 +501,163 @@ void CheckRefusals(const std::shared_ptr<const r4dx::core::PinnedBuffer<uint16_t
             "tp_rank out of range");
 }
 
+// ---- trellis (docs/trellis-kernel.md 2.4, 5.5, 6) -----------------------------------------------
+// tests/convert's tiny trellis containers (FIXTURES_REQUIRED trellis_tiny) loaded whole (TP = 1)
+// and as both ranks of TP = 2. Every rank's trellis buffers must be the slice of the TP = 1 buffers
+// its rows or K range select, derived by index arithmetic alone -- not through the byte planners:
+//   words: each tile (tn, tk) of the rank's own [N, K] pair grid (trellis_ref::PairGridIndex) holds
+//     the 8*KB words of the global tile it stands for (the rank's row map for a column-parallel
+//     linear, k0/16 + tk for a row-parallel one);
+//   suh: column-parallel replicated (every part), row-parallel the rank's K range;
+//   svh: column-parallel the rank's rows, row-parallel replicated;
+// plus the rank shape (the literal numbers of the tiny config: hidden 256, 2 key heads and 8 value
+// heads of 128, 4 heads of 256 and 2 KV heads, intermediate 1024), the rank-local part widths of
+// mlp.gate_up (512 + 512), rate, prescale and tickets. Returns the containers checked (0: absent).
+const char* const kTrellisTiny[] = {R4DX_TRELLIS_TINY_DIR "/tiny_k4.r4dx",
+                                    R4DX_TRELLIS_TINY_DIR "/tiny_mix.r4dx"};
+
+int CheckTrellisTp(Checker& ck) {
+  int checked = 0;
+  for (const char* path : kTrellisTiny) {
+    if (!r4dx_test::FileExists(path)) continue;
+    ++checked;
+    ContainerLoadOptions o1;
+    o1.layout = o1.lm_head_layout = o1.mtp_head_layout = Layout::kTrellis;
+    o1.embed_device_resident = false;
+    const Container full = Container::Load(path, o1);
+    const ModelConfig& g = full.GlobalConfig();
+    const auto shared = Container::LoadEmbedTokensHost(path);
+    std::unique_ptr<Container> rank[kWorld];
+    for (int r = 0; r < kWorld; ++r) {
+      ContainerLoadOptions o = o1;
+      o.tp_world = kWorld;
+      o.tp_rank = r;
+      o.embed_device_resident_decided = 0;
+      o.shared_embed_host = shared;
+      rank[r] = std::make_unique<Container>(Container::Load(path, o));
+    }
+    const int before = ck.failures;
+    // {base, full linear, rank linears, rank N, rank K}
+    struct Lin {
+      std::string base;
+      const QuantLinear* full;
+      const QuantLinear* rank[kWorld];
+      int64_t rank_n, rank_k;
+    };
+    std::vector<Lin> lins;
+    for (int64_t i = 0; i < full.NumLoadedLayers(); ++i) {
+      const std::string b = "text.layers." + std::to_string(i) + ".";
+      const auto& f = full.Layer(i);
+      const auto& r0 = rank[0]->Layer(i);
+      const auto& r1 = rank[1]->Layer(i);
+      if (g.IsGdnLayer(i)) {
+        lins.push_back({b + "gdn.in_proj_qkv", &f.gdn->in_proj_qkv,
+                        {&r0.gdn->in_proj_qkv, &r1.gdn->in_proj_qkv}, 768, 256});
+        lins.push_back({b + "gdn.in_proj_z", &f.gdn->in_proj_z,
+                        {&r0.gdn->in_proj_z, &r1.gdn->in_proj_z}, 512, 256});
+        lins.push_back({b + "gdn.out_proj", &f.gdn->out_proj,
+                        {&r0.gdn->out_proj, &r1.gdn->out_proj}, 256, 512});
+      } else {
+        lins.push_back({b + "attn.qg", &f.attn->qg, {&r0.attn->qg, &r1.attn->qg}, 1024, 256});
+        lins.push_back({b + "attn.k", &f.attn->k, {&r0.attn->k, &r1.attn->k}, 256, 256});
+        lins.push_back({b + "attn.v", &f.attn->v, {&r0.attn->v, &r1.attn->v}, 256, 256});
+        lins.push_back({b + "attn.o", &f.attn->o, {&r0.attn->o, &r1.attn->o}, 256, 512});
+      }
+      lins.push_back({b + "mlp.gate_up", &f.mlp.gate_up, {&r0.mlp.gate_up, &r1.mlp.gate_up}, 1024,
+                      256});
+      lins.push_back({b + "mlp.down", &f.mlp.down, {&r0.mlp.down, &r1.mlp.down}, 256, 512});
+    }
+    for (const Lin& l : lins) {
+      const QuantLinear& q = *l.full;
+      const std::string what = std::string(path) + " " + l.base;
+      ck.Expect(q.layout == Layout::kTrellis, what + ": TP=1 loads trellis");
+      if (q.layout != Layout::kTrellis) continue;
+      const int kb = q.trellis_bits;
+      const int64_t N = q.N, K = q.K;
+      const std::vector<uint32_t> fw = q.trellis_w.CopyToHost();
+      const std::vector<float> fsuh = q.trellis_suh.CopyToHost(), fsvh = q.trellis_svh.CopyToHost();
+      const tp::ShardRule rule = tp::RuleFor(l.base, g);
+      for (int r = 0; r < kWorld; ++r) {
+        const QuantLinear& s = *l.rank[r];
+        const std::string w = what + " rank " + std::to_string(r);
+        ck.Expect(s.layout == Layout::kTrellis && s.trellis_bits == kb &&
+                      s.trellis_prescale_log2 == q.trellis_prescale_log2 &&
+                      s.trellis_parts == q.trellis_parts && s.trellis_tickets != nullptr,
+                  w + ": rate / prescale / parts / tickets");
+        ck.Expect(s.N == l.rank_n && s.K == l.rank_k,
+                  w + ": rank shape [" + std::to_string(s.N) + ", " + std::to_string(s.K) + "]");
+        if (s.layout != Layout::kTrellis || s.N != l.rank_n || s.K != l.rank_k) continue;
+        // The rank's global rows (column-parallel) or K range (row-parallel), by the rule's logic.
+        std::vector<int64_t> row_of;  // local row -> global row
+        int64_t k0 = 0;
+        if (rule.split == tp::Split::kRows) {
+          for (const auto& seg : rule.segments) {
+            const int64_t part = seg.rows / kWorld;
+            for (int64_t i = 0; i < part; ++i) row_of.push_back(seg.begin + r * part + i);
+          }
+        } else {
+          for (int64_t n = 0; n < N; ++n) row_of.push_back(n);
+          k0 = r * (K / kWorld);
+        }
+        const std::vector<uint32_t> sw = s.trellis_w.CopyToHost();
+        bool words = sw.size() == static_cast<size_t>(s.N * s.K * kb / 32);
+        for (int64_t tn = 0; words && tn < s.N / 16; ++tn) {
+          const int64_t gtn = row_of[static_cast<size_t>(16 * tn)] / 16;
+          for (int64_t tk = 0; words && tk < s.K / 16; ++tk) {
+            const size_t li = trellis_ref::PairGridIndex(s.K, kb, tn, tk);
+            const size_t gi = trellis_ref::PairGridIndex(K, kb, gtn, k0 / 16 + tk);
+            words = std::memcmp(&sw[li], &fw[gi], static_cast<size_t>(8 * kb) * 4) == 0;
+          }
+        }
+        ck.Expect(words, w + ": every tile's words are its global tile's");
+        std::vector<float> want_suh, want_svh;
+        if (rule.split == tp::Split::kRows) {
+          want_suh = fsuh;
+          for (int64_t row : row_of) want_svh.push_back(fsvh[static_cast<size_t>(row)]);
+        } else {
+          want_suh.assign(fsuh.begin() + k0, fsuh.begin() + k0 + s.K);
+          want_svh = fsvh;
+        }
+        ck.Expect(s.trellis_suh.CopyToHost() == want_suh, w + ": suh slice");
+        ck.Expect(s.trellis_svh.CopyToHost() == want_svh, w + ": svh slice");
+        const bool two = q.trellis_parts == 2;
+        ck.Expect(s.trellis_part_n[0] == (two ? q.trellis_part_n[0] / kWorld : s.N) &&
+                      s.trellis_part_n[1] == (two ? q.trellis_part_n[1] / kWorld : 0),
+                  w + ": rank-local part widths " + std::to_string(s.trellis_part_n[0]) + " + " +
+                      std::to_string(s.trellis_part_n[1]));
+      }
+    }
+    ck.Expect(lins.size() == 11, std::string(path) + ": 11 trellis linears checked");
+    std::printf("test_tp_loader: trellis %s both ranks checked (%d failure(s))\n", path,
+                ck.failures - before);
+    std::fflush(stdout);
+  }
+  return checked;
+}
+
+// CheckTrellisTp, run after the w4a16 block and with its throws caught: a trellis failure is counted
+// as one, never allowed to cost the w4a16 TP-loader checks their run. Returns the containers checked
+// (a throwing run counts as one).
+int CheckTrellisTpGuarded(Checker& ck) {
+  try {
+    return CheckTrellisTp(ck);
+  } catch (const std::exception& e) {
+    ++ck.checks;
+    ++ck.failures;
+    std::fprintf(stderr, "[FAIL] test_tp_loader: the trellis cases threw: %s\n", e.what());
+    return 1;
+  }
+}
+
 int RunTest() {
-  if (!r4dx_test::FileExists(kContainerPath)) return r4dx_test::SkipMissing(kContainerPath);
+  if (!r4dx_test::FileExists(kContainerPath)) {
+    Checker trellis_ck;
+    const int trellis_checked = CheckTrellisTpGuarded(trellis_ck);
+    if (trellis_checked == 0) return r4dx_test::SkipMissing(kContainerPath);
+    std::printf("test_tp_loader: %s absent -- trellis cases only: %d/%d checks passed\n",
+                kContainerPath, trellis_ck.checks - trellis_ck.failures, trellis_ck.checks);
+    return trellis_ck.failures == 0 ? 0 : 1;
+  }
   const FileView f(kContainerPath);
 
   // The container's own config and w4a16 group, parsed independently of the loader under test by
@@ -545,7 +710,12 @@ int RunTest() {
     std::fflush(stdout);
   }
 
-  std::printf("test_tp_loader: %d/%d checks passed\n", ck.checks - ck.failures, ck.checks);
+  Checker trellis_ck;
+  const int trellis_checked = CheckTrellisTpGuarded(trellis_ck);
+  ck.checks += trellis_ck.checks;
+  ck.failures += trellis_ck.failures;
+  std::printf("test_tp_loader: %d/%d checks passed (%d trellis container(s))\n",
+              ck.checks - ck.failures, ck.checks, trellis_checked);
   return ck.failures == 0 ? 0 : 1;
 }
 

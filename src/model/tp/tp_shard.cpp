@@ -21,7 +21,8 @@ bool HasLayoutSuffix(const std::string& base) {
   const size_t prev = base.rfind('.', last - 1);
   const size_t begin = prev == std::string::npos ? 0 : prev + 1;
   const std::string layout = base.substr(begin, last - begin);
-  return layout == "bf16" || layout == "w4a16" || layout == "w4a8" || layout == "mxfp4";
+  return layout == "bf16" || layout == "w4a16" || layout == "w4a8" || layout == "mxfp4" ||
+         layout == "trellis";
 }
 
 ShardRule Replicate() { return ShardRule{}; }
@@ -117,9 +118,16 @@ const char* PartName(Part p) {
     case Part::kMxWs: return "mxfp4 ws";
     case Part::kMxWref: return "mxfp4 wref";
     case Part::kElem: return "elem";
+    case Part::kTrellisW: return "trellis w";
   }
   return "?";
 }
+
+// The trellis pair grid's granularity (docs/trellis-kernel.md 2.4): every Hadamard block.
+constexpr int64_t kTrellisAlign = 128;
+
+// Bytes of one (32-row tile pair, 16-K tile) block of the trellis pair grid.
+int64_t TrellisBlockBytes(const PartShape& sh) { return 64 * static_cast<int64_t>(sh.rate); }
 
 bool IsTilePart(Part p) {
   return p == Part::kW4Wq || p == Part::kW4a16Wsz || p == Part::kW4a8Ws || p == Part::kMxWq;
@@ -158,6 +166,11 @@ void CheckShape(const char* fn, const PartShape& sh) {
       break;
     case Part::kMxWs:
       RequireDiv(fn, sh, "K", sh.K, sh.group);
+      break;
+    case Part::kTrellisW:
+      RequireDiv(fn, sh, "N", sh.N, kTrellisAlign);
+      RequireDiv(fn, sh, "K", sh.K, kTrellisAlign);
+      if (sh.rate <= 0) Fail(std::string(fn) + ": trellis w needs rate > 0");
       break;
     default:
       break;
@@ -294,6 +307,11 @@ std::vector<ByteRun> PlanRows(const PartShape& sh, const std::vector<Range>& row
            std::to_string(r.begin) + ", " + std::to_string(r.begin + r.count) +
            ") is not whole 16-row tiles");
     }
+    if (sh.part == Part::kTrellisW &&
+        (r.begin % kTrellisAlign != 0 || r.count % kTrellisAlign != 0)) {
+      Fail("PlanRows: trellis w row range [" + std::to_string(r.begin) + ", " +
+           std::to_string(r.begin + r.count) + ") is not whole 128-row blocks");
+    }
     const int64_t a = r.begin, n = r.count;
     switch (sh.part) {
       case Part::kBf16:
@@ -312,6 +330,10 @@ std::vector<ByteRun> PlanRows(const PartShape& sh, const std::vector<Range>& row
         break;
       case Part::kElem:
         Append(runs, a * sh.row_bytes, n * sh.row_bytes);
+        break;
+      case Part::kTrellisW:  // pair rows [a/32, (a+n)/32), each (K/16) blocks: one byte range
+        Append(runs, (a / 32) * (K / 16) * TrellisBlockBytes(sh),
+               (n / 32) * (K / 16) * TrellisBlockBytes(sh));
         break;
       case Part::kMxWs:
         break;  // below: the row ranges are gathered inside every k-group row
@@ -337,6 +359,7 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
     case Part::kW4a8Ws:
     case Part::kMxWs: align = sh.group; break;
     case Part::kMxWq: align = 32; break;
+    case Part::kTrellisW: align = kTrellisAlign; break;
     default: break;
   }
   if (cols.begin % align != 0 || cols.count % align != 0) {
@@ -373,6 +396,12 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
       break;
     case Part::kMxWref:  // the FULL row max, see the header
       Append(runs, 0, N);
+      break;
+    case Part::kTrellisW:  // per pair row, the k-tiles [k0/16, (k0+k)/16): N/32 runs
+      for (int64_t pr = 0; pr < N / 32; ++pr) {
+        Append(runs, (pr * (K / 16) + k0 / 16) * TrellisBlockBytes(sh),
+               (k / 16) * TrellisBlockBytes(sh));
+      }
       break;
     case Part::kElem:
       break;

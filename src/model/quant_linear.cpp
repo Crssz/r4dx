@@ -10,6 +10,7 @@ const char* LayoutName(Layout l) {
     case Layout::kMxfp4: return "mxfp4";
     case Layout::kW4a16: return "w4a16";
     case Layout::kW4a8: return "w4a8";
+    case Layout::kTrellis: return "trellis";
   }
   return "?";
 }
@@ -19,6 +20,7 @@ Layout LayoutFromName(const std::string& name) {
   if (name == "mxfp4") return Layout::kMxfp4;
   if (name == "w4a16") return Layout::kW4a16;
   if (name == "w4a8") return Layout::kW4a8;
+  if (name == "trellis") return Layout::kTrellis;
   throw std::runtime_error("r4dx::model::LayoutFromName: unrecognized layout '" + name + "'");
 }
 

@@ -3,12 +3,18 @@
 # summary.json. Every step runs even when an earlier one fails; exit 1 if any failed.
 #
 #   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\qwen38-27b-q2ab_ldlq.r4dx
+#   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx -Layout trellis
+#
+# -Layout (default w4a16) is the container's body layout: passed as -Layouts to both validators and
+# as -Layout to the three smoke steps (docs/trellis-kernel.md gate A4; a trellis container refuses
+# any other). The DFlash drafter keeps its own layout.
 #
 # TP=2 runs in --tp-mode emulate (both ranks on device 1): the byte-exact reference of the sharded
 # math, which is what a rotated container changes; real mode only adds the device-0 transport.
 param(
   [Parameter(Mandatory = $true)][string]$Model,
   [string]$Dflash = 'D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx',
+  [string]$Layout = 'w4a16',
   [string]$OutDir = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -24,15 +30,15 @@ $env:HIP_VISIBLE_DEVICES = '1'
 
 $steps = @(
   @{ name = 'validate_dflash'; file = 'tools\validate_dflash.ps1'
-     args = @('-Model', $Model, '-Dflash', $Dflash, '-Layouts', 'w4a16') },
+     args = @('-Model', $Model, '-Dflash', $Dflash, '-Layouts', $Layout) },
   @{ name = 'validate_spec_sampling'; file = 'tools\validate_spec_sampling.ps1'
-     args = @('-Model', $Model, '-Dflash', $Dflash, '-Layouts', 'w4a16', '-AllowBatchedVerifyDivergence') },
+     args = @('-Model', $Model, '-Dflash', $Dflash, '-Layouts', $Layout, '-AllowBatchedVerifyDivergence') },
   @{ name = 'smoke_dflash_tools_vision'; file = 'tools\server\smoke.ps1'
-     args = @('-Model', $Model, '-Layers', '-1', '-Dflash', $Dflash, '-ToolRoundTrip', '-Vision') },
+     args = @('-Model', $Model, '-Layout', $Layout, '-Layers', '-1', '-Dflash', $Dflash, '-ToolRoundTrip', '-Vision') },
   @{ name = 'smoke_mtp3'; file = 'tools\server\smoke.ps1'
-     args = @('-Model', $Model, '-Layers', '-1', '-Mtp', '3') },
+     args = @('-Model', $Model, '-Layout', $Layout, '-Layers', '-1', '-Mtp', '3') },
   @{ name = 'smoke_tp2_emulate_dflash'; file = 'tools\server\smoke.ps1'
-     args = @('-Model', $Model, '-Layers', '-1', '-Dflash', $Dflash, '-Tp', '2', '-TpMode', 'emulate') }
+     args = @('-Model', $Model, '-Layout', $Layout, '-Layers', '-1', '-Dflash', $Dflash, '-Tp', '2', '-TpMode', 'emulate') }
 )
 
 $summary = @()

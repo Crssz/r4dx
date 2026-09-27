@@ -580,6 +580,10 @@ void Model::Reset() {
   for (auto& gs : gdn_states_) {
     if (gs) gs->ZeroAll(stream_);
   }
+  // docs/trellis-kernel.md 4.5: a trellis GEMM that did not complete (a device fault or TDR) can
+  // leave its split-group tickets non-zero, and every later call of that linear would be silently
+  // wrong; one hipMemsetAsync over the container's ticket buffer (a no-op without trellis linears).
+  container_.ZeroTrellisTickets(stream_.get());
   // Block until the zeroing above has actually landed before returning -- Reset() is meant to be a
   // synchronous "the model is fresh now" call (Engine measures and logs its own latency around
   // this, docs/server.md), and the zeroing is tiny (a few MB at most), so this sync costs

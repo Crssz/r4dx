@@ -63,7 +63,7 @@ and must not slow decode.
 |---|---|---|
 | A0 | Oracle pre-gate (`docs/trellis.md:6-7`) | Matched-basis oracle weights-only KL ≤ ~0.008 at `K4m` or `mix4.5m`. If this fails, **nothing below M0 is started.** |
 | A1 | Quality | Rung-4 canonical KL (`tool_teacher_forced_logprobs --layout trellis` + `kl_report.py` against `D:\models\r4dx\kl-canon\ref` on `tokens_canon.json`) **≤ 0.0117** (0.75 × [0.01555]), at decode bytes ≤ [13.68 GiB]. Try `K4m` (about 12.13 GiB) first, then `mix4.5m` (about 13.55 GiB). A result between 0.0117 and 0.01555 is a real but small gain that does not justify a second weight format; report it and do not ship. |
-| A2 | Implementation fidelity | On a `--lm-head bf16` twin of the container (same body bytes): runtime KL − oracle KL of the same point − 0.0012 (fp8 KV, `docs/quant2.md:1194`) must lie within **±8e-4**, which is 2× the reference self-noise of 3.9e-4 (`docs/quant2.md:64`). Top-1 must be within 0.3 points of the oracle's. Measured on v1 (M4); M5's fused producers are byte-identical to v1 by construction and by test (5.4), so A2 carries over. |
+| A2 | Implementation fidelity | On a `--lm-head bf16` twin of the container (same body bytes): the runtime's KL measured **from the oracle's own dump** of the same point (`kl_report.py --allow-mismatch --ref-dir D:\models\r4dx\kl-trellis\<point>`, section 6 step 3) − 0.0012 (fp8 KV, `docs/quant2.md:1194`) must lie within **±8e-4**, which is 2× the reference self-noise of 3.9e-4 (`docs/quant2.md:64`). Top-1 against the bf16 reference must be within 0.3 points of the oracle's. Measured on v1 (M4); M5's fused producers are byte-identical to v1 by construction and by test (5.4), so A2 carries over. *Revised at M4 (10.4):* the first wording took runtime KL − oracle KL, both from the bf16 reference, which assumes the two KLs add; they do not (the cross term measured −8.4e-4, as large as the bound). |
 | A3 | Decode speed | `tools/quant2/bench_decode.ps1`, interleaved with q2ab_hv2_q3 in the same run, both on the new binary (A6 shows its w4a16 path is unchanged). Median tok/s must be ≥ q2ab's median − 0.5% for plain [35.9], `--dflash k=7` [108.3] and `--mtp 3` [65.9]. Each mode is predicted from its own round composition (4.6): the drafter is unaffected, and the per-row transform and epilogue scale with M. |
 | A3p | Prefill | Tokens/s on the ≥ 256-token prompts of the same run, compared with q2ab: **≥ 0.80×**. The expected value is 0.74-0.84× (4.7), so M8 is planned. |
 | A4 | G6 | `tools/quant2/g6_validate.ps1 -Layout trellis` 5/5 (`g6_validate.ps1:25-36`): `validate_dflash`, `validate_spec_sampling` (plain vs `--mtp 3` vs `--dflash k=7`, sampled, bit-exact), smoke `-Dflash -ToolRoundTrip -Vision`, smoke `-Mtp 3`, and smoke `-Tp 2 -TpMode emulate -Dflash`. `g6_validate.ps1` gains a `-Layout` parameter (default `w4a16`) that it passes as `-Layouts` to both validators and as `-Layout` to all three smoke steps; today it hardcodes `w4a16` (`:27`, `:29`) and the smoke steps fall back to `smoke.ps1`'s default (`:138`). The validators and `smoke.ps1` need no change. |
@@ -916,7 +916,9 @@ It exists in case `x⊙suh` falls into the f16 subnormal range. suh is about |W|
 1e-2. M4 measures `max|A|` and the subnormal fraction on the KL corpus and picks `s`. The default is
 0. It lives in the container (`quant.trellis.prescale_log2`, 2.3) and in
 `QuantLinear::trellis_prescale_log2`; the transform takes it as an argument and the GEMM receives
-`out_scale = 2^-s/√128`.
+`out_scale = 2^-s/√128`. *Measured at M4 (10.4):* max|A| = 0.405 on K4m; subnormals are 5.5% of A
+overall and up to 72% in layers 0-4's mlp.down / gdn.out_proj / attn.o inputs, but add 0.0003% to
+A's rounding noise, so `s` stays 0.
 
 ### 4.9 Fused pairs
 
@@ -1078,7 +1080,7 @@ sharded as today (`tp_shard.cpp:222-234`).
 | `test_trellis_gemm` | tests/kernels | Full linear (transform + GEMM + epilogue) against fp64 on random and real tiles, M ∈ {1, 3, 8, 16, 17, 64}, P ∈ {1, 2}. Tolerance: per element ≤ 4 bf16 ulp of the fp64 value computed from the f16-rounded A, and relative Frobenius ≤ 2e-3. **Row identity:** for every M ≤ 16 tuning row, row r of an M-row call is bit-identical to the M = 1 call on the same input. Determinism: 100 repeats at SKG = 8 and at `Wc` = 32 give identical bytes. Ticket reset: with tickets deliberately left non-zero the result is wrong (so the test can see the failure), and after `ZeroTrellisTickets` the next call is bit-exact again. Precondition throws (including `NP·U > 8` and the LDS rule). |
 | `test_trellis_input` | tests/kernels | `r4dx_trellis_input_bf16` is **bit-exact** against the fp32 emulation: nout 1-3, prescale, outputs at a part stride, M = 1..64, K ∈ {3072, 5120, 6144, 8704, 17408}. Each fused variant (M5) is **byte-identical to the v1 pair** (producer's bf16 output, then `r4dx_trellis_input_bf16`). `Fwht128Wave` equals `FwhtLds` bitwise. |
 | `convert_trellis_import` | tests/convert (CPU) | A synthetic 2-layer checkpoint plus a synthetic override directory written by the golden script (random words; checkpoint weights = their reconstruction, so verify passes exactly), in both manifest forms: a quantize-model manifest and a mix manifest (absolute `file` paths, no `stale_layers`/`layers_done`/top-level `code_sha256`, float `K`). Checks the regrid bytes against python, metadata and summary. Refusals: sha mismatch, `complete: false`, stale layer, K = 3.5, exl3 basis without the allow flag, `--rotate q2ab`, missing linear, gate K ≠ up K, config sha mismatch, `--trellis-from` with `--selftest`/`--dflash-gguf`/`--reuse-tensors-from`. Checks that `--keep-bf16` skips a manifest entry. Follows the `convert_rms_hessian` exe pattern (`tests/convert/CMakeLists.txt:64-71`). |
-| `test_trellis_linear` + `test_tp_loader` cases | tests/model | Load the convert test's tiny container. `ApplyLinear` (with and without `pre`, P ∈ {1, 2}, M ∈ {1, 16, 17, 64, 65, 130} so the part stride and the chunk offset are both exercised) against CPU. `EpilogueForLayout(kTrellis) == r4dx_epilogue_none`. `Container::Load` with a trellis `lm_head_layout` loads w4a16. Loader refusals (2.5) in both `Load` and `LoadShard`. TP = 2 shard slices of every part, suh and svh included, equal the corresponding slices of the full buffers (`test_tp_loader.cpp` pattern). `test_pick_tuning`: trellis rows, and every pick for M = 1..64 on both the TP = 1 and TP = 2 tables and on the fallback is legal. |
+| `test_trellis_linear` + `test_tp_loader` cases | tests/model | Load the convert test's tiny container. `ApplyLinear` (with and without `pre`, P ∈ {1, 2}, M ∈ {1, 16, 17, 64, 65, 130} so the part stride and the chunk offset are both exercised) against CPU. `EpilogueForLayout(kTrellis) == r4dx_epilogue_none`. Row identity at M = 2, 4, 8 and 16, and a non-zero prescale (4.8) on a header-patched copy (both added at the M4 review, 10.4). `Container::Load` with a trellis `lm_head_layout` loads w4a16. Loader refusals (2.5) in both `Load` and `LoadShard`. TP = 2 shard slices of every part, suh and svh included, equal the corresponding slices of the full buffers (`test_tp_loader.cpp` pattern). `test_pick_tuning`: trellis rows, and every pick for M = 1..64 on both the TP = 1 and TP = 2 tables and on the fallback is legal. |
 | `test_fused_quant` case | tests/kernels | The rmsnorm, residual_rmsnorm and silu_mul host entries throw on an unknown epilogue value. |
 | `test_trellis_gemm.py` | libr4d | The libr4d convention: random words against a torch-CPU reference through `r4d.pyd`. |
 
@@ -1087,8 +1089,8 @@ sharded as today (`tp_shard.cpp:222-234`).
 1. Convert `qwen38-27b-trellis-k4m.r4dx`, plus its `--lm-head bf16` twin for A2.
 2. `tool_teacher_forced_logprobs --layout trellis --tokens tools\reference\kl_corpus\tokens_canon.json`,
    then `kl_report.py --ref-dir D:\models\r4dx\kl-canon\ref`. This gives A1.
-3. `kl_report.py --ref-dir <oracle golden dump D:\models\r4dx\kl-trellis\K4m>` against the twin's
-   runtime dump, as a diagnostic, together with A2's arithmetic on the two reference KLs.
+3. `kl_report.py --allow-mismatch --ref-dir <oracle golden dump D:\models\r4dx\kl-trellis\K4m>`
+   against the twin's runtime dump. This gives A2 (as revised at M4, 10.4).
 4. Greedy sanity check: `r4dx-cli` on the haiku prompt.
 5. **A6 (w4a16 regression)** on the final binary with q2ab_hv2_q3: full ctest, `g6_validate.ps1`
    (default layout), `tools/tp/tp1_identity.ps1`, and a generated-text SHA A/B against the
@@ -1494,3 +1496,202 @@ The twin's 1843 non-lm_head tensors are byte-identical to K4m's. The reconstruct
 s. Hashing the oracle files takes about 6 s. An independent numpy check finds the pair grid, suh and
 svh byte-equal to the oracle files for 15 linears across both containers. They include gate_up at
 KB = 4 and 5, down with K = 17408, and attn.k/v with N = 1024.
+
+### 10.4 M4 (2026-09-27, device 1; runtime v1)
+
+Outputs are in `D:\models\r4dx\trellis-m4\`.
+
+**Built** as 5.1-5.3 and 5.5-5.6. A trellis container runs in r4dx-cli, r4dx-server and
+`tool_teacher_forced_logprobs` with `--layout trellis`. Changes to the plan:
+
+- **Metadata.** `src/model/trellis_meta.h` (`ParseTrellisMetadata`, HIP-free like
+  `rotation_meta.h`) refuses everything 2.5 lists. It also refuses a `linears` field other than
+  `bits`, `parts` and `prescale_log2`, a prescale outside [-16, 16], and a container whose
+  `r4dx_convert_run.trellis.verify` does not pass (10.3): `result` not starting with "pass",
+  `failed` not 0, `checked` other than the HF tensors (one per part), or no record at all. The
+  loaders also refuse any `.trellis.*` tensor without a `linears` entry, and `.trellis.*` tensors in
+  a container without the block, whatever layout is requested.
+- **Heads.** `Container::Load` maps a trellis `lm_head_layout` / `mtp_head_layout` to w4a16 before
+  it dispatches to `LoadShard`. The `--lm-head bf16` twin's head then takes the bf16 fallback; both
+  loaders say so on a line of its own ("stores lm_head as bf16 only") and leave it out of the
+  generic `--keep-bf16` fallback count.
+- **Tickets.** `Container::AssignTrellisTickets` gives each trellis linear an N/128 slice of one
+  zeroed buffer. `Model::Reset()` calls `ZeroTrellisTickets`.
+- **Dispatch.** `ApplyLinear` allocates `ws` from the arena whenever a chunk's tuning splits a
+  128-group (SKG > 1 or Wc < 128). With a `pre`, it checks the part stride and that every part
+  starts 16-byte aligned (`data`, and `part_stride` a multiple of 8 elements): the GEMM reads A with
+  unchecked 8-byte loads. `TrellisChunkTuning` checks each chunk's pick against the linear's part
+  boundary, which `PickTuning` does not know: a block may not straddle it (`n_split % Wc`), and the
+  loader guarantees only 128-alignment, so a future Wc = 256 row on a boundary that is an odd
+  multiple of 128 takes 4.4's fallback (Wc 128) instead of throwing at launch. Today's rows (Wc 32
+  and 128) and boundaries (17408; 8704 per TP = 2 rank) never take it.
+- **Tuning.** The table is `src/model/gemm_tuning_table_trellis.inc`, included in `namespace
+  trellis` and read after the TP table and the main table. `tests/kernels/trellis_tuning_rows.hpp`
+  includes the same file through its own copies of the three types; `test_pick_tuning`
+  static_asserts the copies field for field against `linear.h` / `quant_linear.h` and compares the
+  rows by field name. `PickTuning`'s last argument is the rate for trellis (cache-key bits 53+).
+  `BestRow` matches `rate` and skips a row that does not fit the chunk. M <= 16 takes the M = 1 pick
+  whole, NT included.
+- **silu_mul.** `r4dx_silu_mul_wide_bf16` has the plain kernel's per-element math with no epilogue,
+  one 2048-element slice per workgroup (9 at decode). `test_silu_mul` checks it byte-identical to
+  `r4dx_silu_mul_bf16`. `Mlp` runs it only when `mlp.down` is trellis, so the w4a16 path is
+  unchanged.
+- **TP.** `tp::Part::kTrellisW` (KB in the new `PartShape::rate`) plans rows and K ranges at
+  128-block granularity. `ShardLoader` cuts suh and svh with explicit plans (widened on the host)
+  and derives each rank's part widths (gate_up 8704 + 8704).
+- **Epilogue entries.** `CheckEpiloguePrecondition` throws on an unknown epilogue value.
+- **G6.** `tools/quant2/g6_validate.ps1` takes `-Layout` (default w4a16, the same invocations as
+  before) and passes it as `-Layouts` to both validators and `-Layout` to the three smoke steps (A4).
+- **A-range hook.** `R4DX_TRELLIS_A_STATS=<file>` makes `ApplyLinear` copy every transformed A back
+  and tally it per linear (below); unset, the trellis path tests one static pointer.
+
+**Tests** (device 1, after the M4 review's fixes). `ctest -LE tp2gpu`: 90 pass, 0 fail, and
+`test_kernel_bandwidth` is skipped for an absent golden. 91 are registered: the 90 of 10.2 plus
+`test_trellis_linear`.
+
+- `test_trellis_linear` (1071 checks) runs on the tiny containers. It checks the loader and
+  `ApplyLinear` on all 11 linears of both containers at M = 1, 16, 17, 64, 65 and 130, against the
+  fp64 linear of trellis_ref's bit-exact A. The worst element is 0.125 of the 4-ulp tolerance.
+  It also checks:
+  - the `pre` path, byte-identical at an odd part stride, and refused when a part is not 16-byte
+    aligned;
+  - row identity at M = 2, 4, 8 and 16 (the MTP and DFlash verify windows);
+  - a non-zero prescale: a header-patched tiny_k4 at s = 3, with one linear's own s = -3, matches
+    the fp64 linear at its s on every linear, and 130 of its 176 M = 16 rows (those whose A scales
+    exactly) equal the s = 0 load byte for byte; making `out_scale` 2^+s fails it;
+  - the ticket reset;
+  - both ranks of TP = 2: column-parallel columns, row-parallel partials, and the partials adding up;
+  - 36 refusal cases on patched copies, 35 through both `Load` and `LoadShard` (now also every
+    Hadamard field, a linear's own prescale out of range, and a rotated trellis container) and one
+    through `LoadShard` only (a part boundary a rank's rows cross, which loads at TP = 1), plus the
+    unpatched copy loading. A rank range that is not whole 128-blocks is not reachable by a header
+    patch (every tiny shape splits into whole blocks).
+- `test_tp_loader`: the tiny containers' TP = 2 words (tile by tile through the pair-grid index),
+  suh, svh and part widths against the TP = 1 load. They run after the w4a16 cases, and a throw
+  in them is counted as a failure instead of skipping those.
+- `test_tp_shard`: `kTrellisW` plans against the converter's `RegridToPairGrid`.
+- `test_pick_tuning`: 6738 trellis checks. Every pick for M = 1..64 passes the kernel's legality
+  rules, transcribed, on the table rows, the TP = 2 rank shapes and the tiny shapes. M = 2..16 get
+  the M = 1 pick. The rate is part of the key. The kernel tests' copy of the rows equals
+  production's field by field.
+- `test_fused_quant`: unknown epilogue values throw.
+
+A6 spot check (M6 runs the gate itself): `tools/tp/tp1_identity.ps1` on q2ab_hv2_q3, this tree
+against a build of the pre-M4 HEAD 064831d (`build\a6-head`): rows 1-9, row 6 in all four layouts,
+byte-identical (`fix-a6.log`).
+
+**Sanity** (greedy, the haiku prompt, `--think off`, 256 max tokens):
+
+| run | output | decode tok/s |
+|---|---|--:|
+| K4m | "Silicon hearts beat, / Parallel streams of light flow, / Rendering worlds." then two correct sentences | 34.9 |
+| K4m `--mtp 3` | byte-identical to the plain run (44.7% acceptance) | 57.8 |
+| K4m `--tp 2 --tp-mode emulate` | the same haiku, one phrase different | 27.1 |
+| twin (bf16 lm_head) | a different haiku, then correct sentences | 32.4 |
+
+These rates are single runs, not a bench (A3 is M5's). `tools/server/smoke.ps1 -Layout trellis` on
+K4m passes. `--layout w4a16` on K4m is refused, and so is `--layout trellis` on q2ab_hv2_q3.
+Repeated on the fixed tree (`fix_sanity_*`, with the default max-ctx and the vision tower loaded):
+all four outputs are the same text as above, at 38.5 (plain), 66.3 (`--mtp 3`, 44.7%), 29.0 (TP = 2
+emulate) and 35.0 (twin) tok/s -- single runs differ by up to 15%, so neither set says anything
+about A3.
+
+**Measured M4: gates A1 and A2.** These runs used the post-review binary on device 1:
+`tool_teacher_forced_logprobs --max-ctx 4096 --vision off` on `tokens_canon.json`, then `kl_report.py`
+against `D:\models\r4dx\kl-canon\ref`, the same scoring as `docs/trellis.md` 14.1. Each run took 2-3
+minutes. The results are in `D:\models\r4dx\trellis-m4\m4_report.md`, which also has per-segment
+top-1 and p99, and in `m4_gates.json`. KL is in nats.
+
+| container | layout | mean KL | cpp | en | py | thai | top-1 | p99 |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| K4m (w4a16 g32 lm_head, fp8 KV; 12.130 GiB) | trellis | **0.01004** | 0.00782 | 0.01050 | 0.00953 | 0.01230 | 95.53% | 0.0666 |
+| mix4.5m (same heads; 13.546 GiB) | trellis | **0.00747** | 0.00611 | 0.00841 | 0.00676 | 0.00858 | 95.92% | 0.0479 |
+| twin (bf16 lm_head, fp8 KV) | trellis | **0.00847** | 0.00671 | 0.00859 | 0.00819 | 0.01036 | 95.99% | 0.0568 |
+| q2ab_hv2_q3 (13.680 GiB), same binary | w4a16 | **0.01559** | 0.01222 | 0.01733 | 0.01419 | 0.01863 | 94.92% | 0.1036 |
+| twin, `--tp 2 --tp-mode emulate` | trellis | 0.00841 | 0.00673 | 0.00849 | 0.00822 | 0.01019 | 96.16% | 0.0581 |
+| twin against the oracle's dump (A2, 6 step 3) | trellis | 0.00117 | 0.00130 | 0.00126 | 0.00111 | 0.00102 | 98.44% | 0.0082 |
+| oracle K4m, weights only (14.1) | reference | 0.00813 | 0.00664 | 0.00817 | 0.00773 | 0.00998 | 95.94% | 0.0544 |
+| oracle mix4.5m, weights only (14.1) | reference | 0.00547 | 0.00438 | 0.00625 | 0.00495 | 0.00632 | 96.90% | 0.0387 |
+
+No row in any run has KL > 1 nat. The twin and K4m dumps are byte-identical to the ones M4 took
+before the review fixes, which ran at the default max-ctx of 8192. So the runtime is deterministic,
+and the fixes left the M = 1 path unchanged.
+
+- **A1 passes for both containers.** K4m scores 0.01004 and mix4.5m 0.00747, against the 0.0117
+  bar. On the same tokens, q2ab_hv2_q3 scores 0.01559 with top-1 94.92%. (Its recorded 93.65% was
+  measured on `tokens.json`, whose Thai is the split form.)
+  - Runtime minus oracle is +0.00191 for K4m and +0.00200 for mix4.5m.
+  - For K4m, the twin splits that gap. The w4a16 g32 lm_head accounts for 0.00157, so it is now
+    the largest term outside the body. fp8 KV plus the runtime account for 0.00034.
+- **A2 top-1 passes.** The twin scores 95.99%, against the oracle's 95.94% (+0.05 points).
+- **A2 KL: the revised wording passes, and the first wording misses on the low side.**
+  - The revised wording (section 1) measures KL(oracle dump ‖ twin) − 0.0012 = 0.001173 − 0.0012 =
+    **−2.7e-5**, against ±8e-4. The TP = 2 emulate twin gives 0.00118.
+  - The first wording measures KL(ref ‖ twin) − 0.00813 − 0.0012 = **−8.64e-4**, just outside the
+    bound.
+  - A kernel or format bug can only add error, so a miss toward the reference is not one. The
+    direct measure leaves nothing over the fp8-KV allowance.
+  - The cause is that every dump carries its own evaluation noise:
+    - **The bf16 reference is not reproducible.** Two reference dumps of the same Thai tokens, with
+      the same impl and three hours apart (`kl-canon\ref` and `kl-thai-canon\ref`), differ on
+      every row: KL **7.0e-4**, top-1 agreement 98.92%.
+    - **The runtime's own summation-order noise is about the same.** The twin at TP = 1 against
+      TP = 2 emulate gives KL **9.0e-4**, top-1 agreement 98.75%.
+    - **The cross term matches.** The exact identity is KL(r‖t) = KL(r‖o) + KL(o‖t) + C, with
+      C = Σ (p_r − p_o)(log p_o − log p_t). It measures C = **−8.4e-4**. C is negative in all four
+      segments (−6.3e-4 to −1.2e-3) and on 62% of rows. This is what independent per-dump noise
+      predicts, C ≈ −2 × the oracle dump's own noise KL (about 4e-4), because the runtime does not
+      share that noise.
+  - **What each wording expects.** The fp8 allowance, 0.0012, is itself a KL between two
+    reference-path runs, so it holds two runs' noise.
+    - The revised wording compares like with like, and a faithful runtime lands near 0.
+    - The first wording expects about −2 × 4e-4 for a faithful runtime, which puts it on the lower
+      edge of the ±8e-4 window. A runtime with a real excess of up to about 1.6e-3 would have
+      passed.
+  - Whether to keep the revision is the user's decision (section 1). By the same bookkeeping, fp8
+    KV itself costs only about 4e-4 of its 0.0012.
+- **A6 sanity passes.** q2ab_hv2_q3 on this binary reproduces the recorded 0.01555 when it is scored
+  the way that number was:
+  - Its cpp, en and py KL and top-1 are bit-equal to the recorded 2026-09-26 run.
+  - Its Thai, scored against `kl-thai-canon\ref`, gives 0.01847, the recorded value.
+  - The 0.01559 in the table (+4e-5) comes from the other Thai reference dump.
+- **A5 side result.** The TP = 2 emulate twin (0.00841, and 0.00118 from the oracle) runs the trellis
+  TP slicing end to end on real weights.
+- **Which tunings the KL runs measured.** The teacher-forced pass feeds every row through
+  `DecodeStep` (`Prefill` of one token, then one token per step: `tests/model/teacher_forced.h`),
+  so A1 and A2 ran every linear at M = 1, i.e. the table rows. Verify rows at M = 2..16 run the same
+  tuning and equal the M = 1 rows bit for bit (row identity, `test_trellis_linear` and libr4d's
+  `test_trellis_gemm`); the M > 16 prefill fallback is checked against fp64 by `test_trellis_linear`
+  (M = 17, 64, 65, 130) and ran end to end on the greedy runs' 29-token prompt.
+
+**A-range study** (4.8; K4m, `tool_teacher_forced_logprobs --no-write` on `tokens_canon.json` with
+`R4DX_TRELLIS_A_STATS`, `a_range_k4m.json`; 336 linears, 1.19e10 A elements, all at M = 1):
+
+| class | max \|A\| | rms A | subnormal (class / worst layer) | rounding-noise excess (class / worst layer) |
+|---|--:|--:|--:|--:|
+| gdn.in_proj_qkv, in_proj_z, attn.qg, k, v | 0.18-0.31 | 0.014-0.022 | 0.46-0.58% / 1.8% (L1) | 0.000% / 0.001% |
+| mlp.gate_up | 0.151 | 0.0090 | 1.1% / 5.3% (L0) | 0.000% / 0.03% |
+| attn.o | 0.228 | 0.0056 | 7.2% / 34% (L3) | 0.001% / 3.3% |
+| gdn.out_proj | 0.405 | 0.0040 | 10.1% / 50% (L4) | 0.004% / 5.4% (L1) |
+| mlp.down | 0.388 | 0.0038 | 10.0% / 72% (L0) | 0.004% / 35% (L0) |
+
+"Rounding-noise excess" is A's f16 rounding noise (ulp²/12 per element) with the real subnormal
+floor over the same with an unbounded exponent range. No element overflowed or was non-finite, and
+max |A| = 0.405 leaves 2^17.3 of headroom. The subnormals sit in the unnormalized inputs of layers
+0-4 (mlp.down, gdn.out_proj, attn.o), where rms A is 1-3e-4: there they raise the rounding noise's
+variance by up to 35% (L0 mlp.down), yet that noise is still 2.4e-4 of rms A, far below the 4-bit
+weights' error, and over all linears the excess is 0.0003%. A2's direct measure (0.00117 against
+the fp8-KV allowance of 0.0012) leaves no room for an effect either. **`s` stays 0** for K4m: a
+shift would be exact and free (s = 6 would leave 0.1% subnormal at 2^11 headroom, s = 8 0.02% at
+2^9.3), and a header-patched copy would need no re-conversion, but it would change the measured
+binary for no measurable gain; a future container may set it per linear (`linears.*.prescale_log2`)
+with A2 re-run.
+
+**Open for M5 and later:**
+- No trellis rows for M > 16 or for TP = 2; those take 4.4's fallback.
+- Not done: the in-model clock probe and the DFlash/MTP round timing (10.2). Needed before M5's
+  sweep: M4's single runs (34.9 plain, 57.8 `--mtp 3`) sat below q2ab_hv2_q3's bench medians (35.9,
+  65.9) although M2's replay, at 3.19-3.24 GHz, put trellis 2.4-2.8 ms per token ahead (R1), while
+  the repeat above ran 38.5 and 66.3; only M5's interleaved bench decides A3.
+- G6 on K4m (`g6_validate.ps1 -Layout trellis`, A4) is M6's: none of DFlash, vision, the tool round
+  trip or TP = 2 with DFlash ran in M4.

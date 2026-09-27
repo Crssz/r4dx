@@ -26,6 +26,11 @@ set(R4DX_MODEL_TESTS
   # commit, tiny-temperature speculative rounds, and vision on the real container (rank 0's encode,
   # host rows spliced on both ranks) against TP=1.
   test_tp_emulation
+  # Trellis milestone M4 (docs/trellis-kernel.md 5.1-5.3, 6): the loader and ApplyLinear on
+  # tests/convert's tiny trellis containers against the CPU references of tests/kernels/
+  # trellis_ref.hpp, the pre-transformed path, row identity, the ticket reset and every loader
+  # refusal of 2.5 at TP=1 and TP=2. Device 1, SKIP 77 without the tiny containers.
+  test_trellis_linear
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -42,6 +47,17 @@ foreach(t ${R4DX_MODEL_TESTS})
     ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
     SKIP_RETURN_CODE 77
   )
+endforeach()
+
+# Trellis (docs/trellis-kernel.md 6): test_trellis_linear and test_tp_loader's trellis cases load
+# the tiny containers convert_trellis_import (tests/convert) keeps in its build directory -- the
+# fixture trellis_tiny, so ctest runs that test first -- and read tests/kernels/trellis_ref.hpp's
+# CPU references (an include dir, as test_dflash_draft below; no tests/kernels target is linked).
+foreach(t test_trellis_linear test_tp_loader)
+  target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../kernels)
+  target_compile_definitions(${t} PRIVATE
+    R4DX_TRELLIS_TINY_DIR="${CMAKE_BINARY_DIR}/tests/convert/trellis_import")
+  set_tests_properties(${t} PROPERTIES FIXTURES_REQUIRED trellis_tiny)
 endforeach()
 
 # test_dflash_draft (Milestone 5 stage S2, docs/dflash2.md "Implementation") reads the same

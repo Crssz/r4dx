@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -203,6 +204,60 @@ void CheckArenaAlignmentInvariant() {
   }
 }
 
+// docs/trellis-kernel.md 5.3: an epilogue value the kernels do not know must throw at the host
+// entry (rmsnorm, residual_rmsnorm, silu_mul, silu_mul_hadamard), never reach ApplyEpilogueRow --
+// which writes nothing for it and would leave the caller's pre-quantized buffer uninitialized.
+// Checked before any launch, so the (valid) buffers are never touched. Needs /EHc-
+// (tests/kernels/CMakeLists.txt): the entries are extern "C".
+template <typename Fn>
+bool Throws(Fn fn) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+    return true;
+  }
+  return false;
+}
+
+void CheckUnknownEpilogueThrows() {
+  constexpr int64_t K = 256;
+  DeviceBuffer<uint16_t> a(2 * K), b(2 * K), w(K), o1(2 * K), o2(2 * K), eo(2 * K);
+  DeviceBuffer<float> es(2), signs(K);
+  const auto p = [](const auto& buf) { return reinterpret_cast<int64_t>(buf.data()); };
+  for (int bad : {-1, 4, 7, 1000}) {
+    const std::string tag = " rejects epilogue " + std::to_string(bad);
+    Check(Throws([&] {
+            r4dx_rmsnorm_bf16(p(a), p(w), p(o1), 1, K, 1e-6f, 0, bad, p(eo), p(es));
+          }),
+          "rmsnorm" + tag);
+    Check(Throws([&] {
+            r4dx_residual_rmsnorm_bf16(p(a), p(b), p(w), p(o1), p(o2), 1, K, 1e-6f, 0, bad, p(eo),
+                                       p(es));
+          }),
+          "residual_rmsnorm" + tag);
+    Check(Throws([&] {
+            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo), p(es));
+          }),
+          "silu_mul" + tag);
+    Check(Throws([&] {
+            r4dx_silu_mul_hadamard_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo), p(es), p(signs),
+                                        128);
+          }),
+          "silu_mul_hadamard" + tag);
+  }
+  // The four values the kernels know still pass the check (one row; the byte checks are below).
+  for (int good : {static_cast<int>(r4dx_epilogue_none), static_cast<int>(r4dx_epilogue_f16),
+                   static_cast<int>(r4dx_epilogue_fp8_e4m3_row),
+                   static_cast<int>(r4dx_epilogue_int8_fraga8)}) {
+    Check(!Throws([&] {
+            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, good, p(eo), p(es));
+          }),
+          "silu_mul accepts epilogue " + std::to_string(good));
+  }
+  R4DX_HIP_CHECK(hipDeviceSynchronize());
+  if (g_failures == 0) std::printf("  ok: unknown epilogue values throw at every host entry\n");
+}
+
 }  // namespace
 
 int main() {
@@ -211,6 +266,7 @@ int main() {
   const float eps = 1e-6f;
 
   CheckArenaAlignmentInvariant();
+  CheckUnknownEpilogueThrows();
 
   const int Ms[] = {1, 2, 4, 16, 64};
   const int64_t Ks[] = {5120, 6144, 17408};

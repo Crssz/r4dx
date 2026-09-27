@@ -216,6 +216,35 @@ inline void GemmMxfp4a8NtM64(const void* a, const void* ascale, const void* wq, 
                           reinterpret_cast<int64_t>(wref), reinterpret_cast<int64_t>(c), M, K, N,
                           WV, SK, MB, NPW, reinterpret_cast<int64_t>(stream));
 }
+// Trellis-coded weight (docs/trellis-kernel.md 4.3-4.5; r4d.h has the whole contract): C[M][N]
+// bf16 = bf16((FWHT128(A_p @ Q)[m][n] * svh[n]) * out_scale). a0 / a1: f16 [M][K], row stride K,
+// ALREADY input-transformed (r4dx_trellis_input_bf16); output columns >= n_split read a1 (a1
+// nullptr: a0 everywhere, n_split N for a one-part linear). w: pair-grid ring words; svh: fp32
+// [N]; out_scale = 2^-s / sqrt(128). ws (fp32, GemmTrellisWsBytes) and tickets (u32 [N/128],
+// GemmTrellisTicketsBytes) serve a 128-column group split across blocks (SKG > 1 or a block
+// narrower than 128 columns) and may be nullptr otherwise. MT is LinearTuning::MB and NP
+// LinearTuning::NPW. Throws on an illegal shape or tuning.
+inline void GemmTrellisNtM64(const void* a0, const void* a1, int n_split, const void* w,
+                              const void* svh, void* c, void* ws, void* tickets, int M, int K,
+                              int N, int KB, int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                              float out_scale, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                          reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                          reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                          reinterpret_cast<int64_t>(tickets), M, K, N, KB, WV, SK, MT, NP, SKG, U,
+                          NT, out_scale, reinterpret_cast<int64_t>(stream));
+}
+// SKG * M * N fp32: the split-group partials of one M-row call.
+inline size_t GemmTrellisWsBytes(int M, int N, int SKG) {
+  return r4d_gemm_trellis_nt_m64_ws_bytes(M, N, SKG);
+}
+// (N / 128) u32: one linear's tickets.
+inline size_t GemmTrellisTicketsBytes(int N) { return r4d_gemm_trellis_nt_m64_tickets_bytes(N); }
+// hipMemsetAsync(tickets, 0, bytes) on `stream`: the reset after a launch that did not complete.
+inline void GemmTrellisZeroTickets(void* tickets, size_t bytes, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64_zero_tickets(reinterpret_cast<int64_t>(tickets), bytes,
+                                       reinterpret_cast<int64_t>(stream));
+}
 inline void QuantActI8(const void* a, void* q, void* s, int M, int K, hipStream_t stream) {
   r4d_quant_act_i8(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(q),
                     reinterpret_cast<int64_t>(s), M, K, reinterpret_cast<int64_t>(stream));

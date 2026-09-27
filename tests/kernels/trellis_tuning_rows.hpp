@@ -1,12 +1,12 @@
-// tests/kernels/trellis_tuning_rows.hpp -- tests/kernels/gemm_tuning_table_trellis.inc, readable
-// before milestone M4 moves it into src/model and wires it into linear.cpp: the trellis rows are
-// written for the structs as docs/trellis-kernel.md 5.3 extends them (LinearTuning += SKG, U;
-// GemmTuningRow += rate; Layout += kTrellis, appended last per 5.1), which src/model does not have
-// yet. This header declares those shapes -- quant_linear.h's Layout with kTrellis appended, and
-// linear.h's two structs with the new fields -- in its own namespace and includes the table there,
-// so test_trellis_gemm (row identity for every row) and tool_trellis_gemm_bench (replaying it) read
-// the very file M4 will include, and a row that stops compiling against the 5.3 layout fails here
-// first.
+// tests/kernels/trellis_tuning_rows.hpp -- src/model/gemm_tuning_table_trellis.inc (the trellis
+// rows linear.cpp's PickTuning reads, docs/trellis-kernel.md 5.3), readable from a kernel test that
+// does not link r4dx_model_linear: this header declares the shapes the rows are written for --
+// quant_linear.h's Layout (kTrellis appended last, 5.1) and linear.h's LinearTuning / GemmTuningRow
+// (SKG, U, rate) -- in its own namespace and includes the table there, so test_trellis_gemm (row
+// identity for every row) and tool_trellis_gemm_bench (replaying it) read the very file production
+// runs. The declarations must stay field-for-field linear.h's: tests/model/test_pick_tuning.cpp,
+// which sees both, static_asserts the layouts and compares the rows field by field, since a field
+// reordered in only one copy would still compile.
 #pragma once
 
 #include <cstdint>
@@ -29,6 +29,6 @@ struct GemmTuningRow {
   int rate = 0;
 };
 
-#include "gemm_tuning_table_trellis.inc"
+#include "../../src/model/gemm_tuning_table_trellis.inc"
 
 }  // namespace trellis_rows

@@ -13,9 +13,14 @@
 
 namespace r4dx::model {
 
-// Tiling parameters for one r4d_gemm_*_nt_m64 launch.
+// Tiling parameters for one r4d_gemm_*_nt_m64 launch. Trellis (docs/trellis-kernel.md 4.3, 5.3)
+// reads MB as MT (row tiles per block) and NPW as NP (tile pairs per wave), and is the only layout
+// that reads the last two: SKG, the blocks splitting K across the grid, and U, the k-tiles per
+// unrolled step. Every other layout's rows keep their five values and ignore these.
 struct LinearTuning {
   int WV, SK, MB, NPW, NT;
+  int SKG = 1;
+  int U = 2;
 };
 
 // One measured (layout, N, K, M) -> LinearTuning row (tools/profile/tune_gemm.py's sweep output,
@@ -37,11 +42,17 @@ struct LinearTuning {
 // before and nothing else; a row naming 32/64/128 serves only linears at that group. A w4a16
 // linear at a non-default group with no row of its own falls back to FallbackTuning, like an
 // untuned shape. Ignored for every other layout.
+//
+// `rate` (trellis only, docs/trellis-kernel.md 5.3): the trellis bits per weight (KB, 4 or 5) the
+// row was measured at, part of the key like w4a16's group -- a row serves only linears at its
+// rate. The trellis rows live in src/model/gemm_tuning_table_trellis.inc (tests/kernels/
+// tool_trellis_gemm_bench.exe --joint --inc-out writes it), one M = 1 row per (N, K, KB).
 struct GemmTuningRow {
   Layout layout;
   int64_t N, K, M;
   LinearTuning tuning;
   int group = 0;
+  int rate = 0;
 };
 
 // Picks a WV/SK/MB/NPW/NT for a (layout, N, K) GEMM chunk of M rows. Looks up
@@ -52,11 +63,16 @@ struct GemmTuningRow {
 // a 4-layer container with the same shapes as the real 64-layer one, so in practice every shape
 // PickTuning ever sees during normal operation IS covered by the table once tune_gemm.py has run;
 // the fallback exists for robustness, not because it is expected to fire in production).
-// `w4a16_group` (layout kW4a16 only; QuantLinear::w4a16_group): 0 or this build's default group
+// `variant`: the w4a16 group for kW4a16 (QuantLinear::w4a16_group): 0 or this build's default group
 // resolve exactly as before per-tensor groups; 32/64/128 otherwise look up only rows measured at
 // that group (GemmTuningRow::group), then FallbackTuning. Every pick is legal for the kernel at
-// that group: K % (SK * max(group, 64)) == 0.
-LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int w4a16_group = 0);
+// that group: K % (SK * max(group, 64)) == 0. For kTrellis it is the linear's rate
+// (QuantLinear::trellis_bits), matched against GemmTuningRow::rate; the trellis rows are consulted
+// after the TP table (on a TP thread) and the main table, then the M-aware fallback of
+// docs/trellis-kernel.md 4.4 -- an M <= 16 chunk gets the M = 1 pick whole (NT included, 10.1), an
+// M > 16 chunk an unsplit 128-column block with every row tile in it. Every other layout ignores
+// it.
+LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int variant = 0);
 
 // The group an r4d_gemm_w4a16_nt_m64 launch for a QuantLinear with this w4a16_group runs at: 0
 // becomes r4d_gemm_w4a16_nt_m64_group(), anything else is returned as is.
@@ -78,6 +94,10 @@ void SetTp2TuningForThisThread(bool enabled);
 // kW4a16, r4dx_epilogue_int8_fraga8 for kW4a8, r4dx_epilogue_fp8_e4m3_row for kMxfp4. Shared by
 // every ApplyLinear caller that wants to pre-fuse its producer's quant epilogue (docs/r9700.md
 // R2/P2) so both sides of the wiring agree on the mapping in exactly one place.
+// kTrellis is r4dx_epilogue_none (docs/trellis-kernel.md 5.3): its input transform is per LINEAR
+// (x * suh, then a Hadamard), which no producer epilogue value can name, so every layer runs its
+// plain bf16 path and ApplyLinear applies the transform itself; a fused trellis producer passes a
+// PreQuantizedActivation with transform_id instead (below), never through this function.
 int EpilogueForLayout(Layout layout);
 
 // A producer's already-quantized activation (docs/r9700.md R2/P2's fused epilogue output,
@@ -86,21 +106,31 @@ int EpilogueForLayout(Layout layout);
 // reinterpreting bytes in the wrong format. `data` is [M,K] contiguous in the format `epilogue`
 // selects (f16 uint16_t, fp8e4m3 uint8_t, or int8 fragA8-permuted int8_t); `scale` is [M] fp32,
 // unused (may be nullptr) for r4dx_epilogue_f16.
+//
+// Trellis (docs/trellis-kernel.md 5.3): an already input-transformed A (r4dx_trellis_input_bf16's
+// output for THIS linear) is passed with `transform_id` = w.trellis_suh.data() (the transform is
+// per linear, so ApplyLinear throws when the id is another linear's) and `epilogue` none. `data`
+// then holds the linear's parts, each f16 [M][K] with row stride K, part p at data + p *
+// part_stride elements (part_stride >= M * K; ignored for a one-part linear); a <= 64-row chunk m0
+// reads each part at + m0 * K.
 struct PreQuantizedActivation {
   int epilogue = 0;  // r4dx_epilogue_none means "no pre-quantized input provided"
   const void* data = nullptr;
   const float* scale = nullptr;
+  const void* transform_id = nullptr;  // trellis only: the linear's trellis_suh.data()
+  int64_t part_stride = 0;             // trellis only: elements between the parts in `data`
 };
 
 // x: device bf16 [M, K], row-major, CONTIGUOUS (row stride exactly K -- every r4d_gemm_*_nt_m64
 // entry point reads its A/C operands at a hardcoded stride of K/N respectively; there is no
 // strided-view form to call into). y: device bf16 [M, N], row-major, contiguous, disjoint from x.
 // `arena` supplies this call's activation-quant scratch (w4a16's f16 cast, w4a8's int8 quant,
-// mxfp4's fp8 quant) for up to a 64-row chunk; the caller is responsible for giving the arena
-// enough headroom and Reset()-ing it between top-level forward-pass steps (Arena's own contract --
-// see r4dx/core/arena.hpp), not between individual ApplyLinear calls (this function does not reset
-// it, so several ApplyLinear calls in the same layer share one growing allocation, which is the
-// intended usage).
+// mxfp4's fp8 quant, trellis's transformed parts and split-group partials -- at most 2 * 64 * K
+// f16 plus SKG * 64 * N fp32) for up to a 64-row chunk; the caller is responsible for giving the
+// arena enough headroom and Reset()-ing it between top-level forward-pass steps (Arena's own
+// contract -- see r4dx/core/arena.hpp), not between individual ApplyLinear calls (this function
+// does not reset it, so several ApplyLinear calls in the same layer share one growing allocation,
+// which is the intended usage).
 // `stream` is a raw hipStream_t (not core::Stream&) so this can be called from components that
 // only have a raw stream handle (e.g. r4dx::model::attention::AttentionLayer, which owns its
 // stream as a plain hipStream_t parameter) without pulling in core::Stream's RAII ownership --
@@ -112,7 +142,8 @@ struct PreQuantizedActivation {
 // required even when `pre` is given (kBf16 always reads it directly; a caller that only produced a
 // quantized epilogue for a NON-bf16 layout does not need to also keep the plain bf16 buffer alive
 // for THIS call, but ApplyLinear does not special-case that -- every existing caller already has
-// both).
+// both). A trellis `w` takes `pre` when pre->transform_id is set (its already transformed parts,
+// PreQuantizedActivation's doc), and otherwise runs its input transform itself.
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
                   uint16_t* y, int64_t M, const PreQuantizedActivation* pre = nullptr);
 

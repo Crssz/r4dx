@@ -15,7 +15,9 @@
 
 namespace r4dx::model {
 
-enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8 };
+// kTrellis (docs/trellis-kernel.md 5.1) is appended LAST, so the values the other four are keyed
+// under in PickTuning's cache (linear.cpp) do not move.
+enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8, kTrellis };
 
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
@@ -69,7 +71,18 @@ inline void CheckW4a16MappedGroup(int group, const std::string& base, const std:
                            "r4d_gemm_w4a16_nt_m64_g does not instantiate");
 }
 
-// One linear weight W[N,K], uploaded in exactly one of the four on-disk layouts
+// Trellis (docs/trellis-kernel.md 2.5): a linear's per-linear rate (`bits`, 4 or 5) must be one
+// r4d_gemm_trellis_nt_m64 instantiates, or every GEMM of it would throw mid-decode; the loader asks
+// the kernel once per linear instead. Inline for the same reason as the two checks above.
+inline void CheckTrellisRate(int bits, const std::string& base, const std::string& what) {
+  if (r4d_gemm_trellis_nt_m64_has_rate(bits) != 0) return;
+  throw std::runtime_error("r4dx::model: " + what + " packs trellis linear '" + base + "' at " +
+                           std::to_string(bits) +
+                           " bits per weight (__metadata__.quant.trellis.linears), which this "
+                           "build's r4d_gemm_trellis_nt_m64 does not instantiate");
+}
+
+// One linear weight W[N,K], uploaded in exactly one of the five on-disk layouts
 // (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
 // thing that reads the layout-specific buffers below; Container's job stops at "the right bytes
 // are on the device in the container's documented byte order".
@@ -104,6 +117,28 @@ struct QuantLinear {
   core::DeviceBuffer<uint8_t> mxfp4_wq;    // uint8[N*K/2], fragment-permuted e2m1 pairs
   core::DeviceBuffer<uint8_t> mxfp4_ws;    // uint8[(K/32)*N], E8M0 exponent per (group, row)
   core::DeviceBuffer<int8_t> mxfp4_wref;   // int8[N], per-row reference exponent
+
+  // layout == kTrellis (docs/trellis-kernel.md 2.1, 5.1): W^T = diag(suh) H Q H diag(svh), Q the
+  // decoded trellis tiles, H the natural-order 128-point Hadamard / sqrt(128). Every size here is
+  // the RANK's under tensor parallelism (N, K and part N are the rank-local shape).
+  //   trellis_w: the uint32 ring words in the pair grid, N*K*bits/32 of them.
+  //   trellis_suh: fp32 [parts][K], the input-side scale (signs folded in), widened from fp16.
+  //   trellis_svh: fp32 [N], the output-side scale, in container row order (gate then up).
+  //   trellis_tickets: u32 [N/128], this linear's slice of its Container's one ticket buffer (the
+  //     split 128-group finish, docs/trellis-kernel.md 4.5); Container::ZeroTrellisTickets clears
+  //     it.
+  //   trellis_part_n: output columns of each part (mlp.gate_up: gate's then up's; one part
+  //     otherwise, trellis_part_n[0] == N). Part 1 reads its own input transform (its own suh).
+  //   trellis_prescale_log2: the power-of-two shift s of the input side (A = f16(H(x*suh) *
+  //     2^s/sqrt(128))), undone by the GEMM's out_scale; from __metadata__.quant.trellis.
+  core::DeviceBuffer<uint32_t> trellis_w;
+  core::DeviceBuffer<float> trellis_suh;
+  core::DeviceBuffer<float> trellis_svh;
+  uint32_t* trellis_tickets = nullptr;
+  int trellis_bits = 0;
+  int trellis_parts = 0;
+  int64_t trellis_part_n[2] = {0, 0};
+  int trellis_prescale_log2 = 0;
 };
 
 }  // namespace r4dx::model

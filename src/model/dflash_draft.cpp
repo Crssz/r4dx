@@ -156,6 +156,11 @@ QuantLinear LoadQuantLinear(const DflashDraftWeights& w, const std::string& base
       q.mxfp4_ws = UploadRawU8(w, base + ".mxfp4.ws");
       q.mxfp4_wref = UploadRawI8(w, base + ".mxfp4.wref");
       break;
+    case Layout::kTrellis:
+      // docs/trellis-kernel.md 2.2, 5.1: the drafter is never trellis (no converter writes one).
+      throw std::runtime_error("r4dx::model::DflashDraft: '" + base +
+                               "' requested as trellis -- a DFlash2 draft container has no trellis "
+                               "layout (w4a16, w4a8, mxfp4 or bf16)");
   }
   return q;
 }

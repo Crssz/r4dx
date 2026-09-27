@@ -287,36 +287,50 @@ void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int6
 
 // Skinny GEMM with a TRELLIS-coded weight: EXL3 / QTIP tiles of 16 k x 16 n, each a tail-biting
 // ring of 256*KB bits whose 16-bit states hash to f16 values (the "mul1" codebook), f16 A, 16x16x16
-// WMMA, one kernel for M = 1..64. `w` is the tiles' uint32 ring words in the PAIR GRID -- word w of
-// tile (tn, tk) at (((tn >> 1) * (K/16) + tk) * 2 + (tn & 1)) * 8KB + w -- N*K*KB/8 bytes, 16-byte
-// aligned. Q[K,N] below is the decoded weight in its regularized domain; the linear it belongs to is
-// W^T = diag(suh) H Q H diag(svh) (128-point Hadamards), whose input side is applied to A before
-// this call. Two A parts: output columns >= n_split read a1 (a fused gate/up pair with different
-// input transforms), all others a0; a1 = 0 means a0. Tuning: WV x SK waves per block (column blocks
-// x in-block K splits), NP tile pairs per wave (block width Wc = 32 WV NP, one of 32/64/128/256),
-// SKG blocks splitting K across the grid, MT row tiles per block, U k-tiles per step, NT for
-// non-temporal weight loads. Legal only when K and N are multiples of 128, N and n_split of Wc,
-// (K/16) of SK*SKG*U, SK*Wc*32 <= 64 KiB, WV*SK*32 <= 1024, and (NP, U, MT) is instantiated
-// (NP, U in {1,2,4}, NP*U <= 8; MT up to 4 at NP 1 and at (NP, U) = (2, 1), 3 at (2, 2) and
-// (2, 4), 2 at (4, 1), 1 at (4, 2) -- what fits 190 VGPRs); anything else throws. A 128-column
-// group whose sums come from
-// more than one block (SKG > 1 or Wc < 128) is finished by the last block to arrive, through `ws`
-// (fp32, ws_bytes(M, N, SKG)) and `tickets` (u32 [N/128], zero before the first call; every
-// complete launch leaves them zero again), and needs every row tile in one block (ceil(M/16) <= MT).
+// WMMA, one kernel for M = 1..64, KB = 4 or 5 bits per weight. `w` is the tiles' uint32 ring words
+// in the PAIR GRID -- word w of tile (tn, tk) at (((tn >> 1) * (K/16) + tk) * 2 + (tn & 1)) * 8KB + w
+// -- N*K*KB/8 bytes, 16-byte aligned. Q[K,N] below is the decoded weight in its regularized domain;
+// the linear it belongs to is W^T = diag(suh) H Q H diag(svh) (natural-order 128-point Hadamards,
+// each with its 1/sqrt(128)), whose input side -- A = f16(H(x * suh) * 2^s / sqrt(128)) -- is applied
+// to A before this call (r4dx's r4dx_trellis_input_bf16).
+//
+// The linear: C[m][n] = bf16( (FWHT128(A @ Q)[m][n] * svh[n]) * out_scale ), bf16 C [M][N], svh fp32
+// [N], out_scale = 2^-s / sqrt(128) (s = the input side's prescale). fp32 from the accumulator through
+// the FWHT (stages in natural order, a + b / a - b, FwhtLds's order) and svh, one bf16 rounding (to
+// nearest even). Two A parts: output columns >= n_split read a1 (a fused gate/up pair with different
+// input transforms), all others a0; a1 = 0 means a0; every 128-column group lies inside one part.
+// Tuning: WV x SK waves per block (column blocks x in-block K splits), NP tile pairs per wave (block
+// width Wc = 32 WV NP, one of 32/64/128/256), SKG blocks splitting K across the grid, MT row tiles
+// per block, U k-tiles per step, NT for non-temporal weight loads. Legal only when K and N are
+// multiples of 128, N and n_split of Wc, (K/16) of SK*SKG*U, SK*Wc*32 <= 64 KiB, WV*SK*32 <= 1024,
+// and (KB, NP, U, MT) is instantiated (NP, U in {1,2,4}, NP*U <= 8; MT up to 4 at NP 1 and at
+// (NP, U) = (2, 1), 3 at (2, 2), 3 at KB 4 / 2 at KB 5 at (2, 4), 2 at (4, 1), 1 at (4, 2) -- what
+// fits 190 VGPRs); anything else throws. A 128-column group whose sums come from more than one
+// block (SKG > 1 or Wc < 128) is finished (summed, transformed, rounded) by the last block to
+// arrive, through `ws` (fp32, ws_bytes(M, N, SKG)) and `tickets` (u32 [N/128], tickets_bytes(N);
+// zero before the first call, and every complete launch leaves them zero again -- zero_tickets
+// resets a buffer a launch that did not complete left behind), and needs every row tile in one
+// block (ceil(M/16) <= MT). One ticket buffer per linear (never shared by two linears in flight).
 // A row's result depends on the tuning's summation order (SK, SKG, Wc), never on M or on the other
 // rows, so a caller that gives every M <= 16 the same tuning gets verify rows equal to decode rows.
-//
-// _raw is the test and diagnostic entry: fp32 C[M,N] = A @ Q with no output transform, so one-hot
-// A rows return rows of Q bit for bit. `clk` (0 = off): 4 uint64 that block (0,0,0)'s thread 0
-// fills with clock64() / wall_clock64() at entry and at the end of its own work, for the shader
-// clock during a real launch.
+void r4d_gemm_trellis_nt_m64(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh,
+                             int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                             int WV, int SK, int MT, int NP, int SKG, int U, int NT, float out_scale,
+                             int64_t stream);
+// _raw is the test and diagnostic entry: fp32 C[M,N] = A @ Q with no output transform (the same
+// kernel, reduction and legality), so one-hot A rows return rows of Q bit for bit. `clk` (0 = off):
+// 4 uint64 that block (0,0,0)'s thread 0 fills with clock64() / wall_clock64() at entry and at the
+// end of its own work, for the shader clock during a real launch.
 void r4d_gemm_trellis_nt_m64_raw(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t c,
                                  int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
                                  int SK, int MT, int NP, int SKG, int U, int NT, int64_t clk,
                                  int64_t stream);
-int    r4d_gemm_trellis_nt_m64_has_rate(int KB);   // 1 for an instantiated KB (4), else 0
+int    r4d_gemm_trellis_nt_m64_has_rate(int KB);   // 1 for an instantiated KB (4, 5), else 0
 int    r4d_gemm_trellis_nt_m64_max_m(void);         // 64
-size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG);
+size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
+size_t r4d_gemm_trellis_nt_m64_tickets_bytes(int N);              // (N / 128) * 4
+// hipMemsetAsync(tickets, 0, bytes) on `stream`: the reset after a launch that did not complete.
+void   r4d_gemm_trellis_nt_m64_zero_tickets(int64_t tickets, size_t bytes, int64_t stream);
 // The whole decoded Q[K,N] as f16 bits (row-major, K rows), from the same pair-grid words and the
 // same device decode as the GEMM, bit-exact against the format's reference decode. KB 4 or 5; K a
 // multiple of 16, N of 32.

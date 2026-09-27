@@ -72,48 +72,12 @@ __device__ __forceinline__ unsigned r4d_trellis_k5_word(int lane, int i) {
 }
 
 // ---- value path ------------------------------------------------------------------------------
-// x = s * 0x83DCD12D (mod 2^32) for the 16-bit state s in the HIGH (HI) or LOW half of r. Inline
-// asm because nothing in the builtins reaches v_mad_u32_u16's op_sel, and plain C lowers the
-// 32-bit product to the quarter-rate v_mul_lo_u32. Not volatile: the scheduler may move and CSE it.
-// These per-op helpers serve KB = 5, which only the reconstruct test entry decodes today, so their
-// schedule (see r4d_trellis_k4_decode on why it matters) is not tuned; KB = 4 is one asm block.
-template <bool HI>
-__device__ __forceinline__ unsigned r4d_trellis_hash(unsigned r) {
-  unsigned t, x;
-  if constexpr (HI) {
-    asm("v_mad_u32_u16 %0, %1, %2, 0 op_sel:[1,0,0,0]" : "=v"(t) : "v"(r), "s"(R4D_TRELLIS_MUL1_KMLO));
-    asm("v_pk_mad_u16 %0, %1, %2, %3 op_sel_hi:[1,1,1]"
-        : "=v"(x) : "s"(R4D_TRELLIS_MUL1_KMHI), "v"(r), "v"(t));
-  } else {
-    asm("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t) : "v"(r), "s"(R4D_TRELLIS_MUL1_KMLO));
-    asm("v_pk_mad_u16 %0, %1, %2, %3 op_sel_hi:[1,0,1]"
-        : "=v"(x) : "s"(R4D_TRELLIS_MUL1_KMHI), "v"(r), "v"(t));
-  }
-  return x;
-}
-
-// Two hashes -> the f16 bits of 1024 + bytesum(xa) (low half) and 1024 + bytesum(xb) (high half).
-__device__ __forceinline__ unsigned r4d_trellis_pack(unsigned xa, unsigned xb) {
-  return __builtin_amdgcn_sad_hi_u8(xb, 0u, __builtin_amdgcn_sad_u8(xa, 0u, R4D_TRELLIS_ONES_F16X2));
-}
-
-// The codebook's affine map on both halves, one rounding (== codebook_np bit for bit).
-__device__ __forceinline__ unsigned r4d_trellis_affine(unsigned d) {
-  const r4d_h2 kinv = __builtin_bit_cast(r4d_h2, R4D_TRELLIS_KINV_F16X2);
-  const r4d_h2 kbias = __builtin_bit_cast(r4d_h2, R4D_TRELLIS_KBIAS_F16X2);
-  return __builtin_bit_cast(unsigned, __builtin_elementwise_fma(__builtin_bit_cast(r4d_h2, d), kinv, kbias));
-}
-
-// Eight hashed states in fragment element order -> the fragment, built as four dwords and bit-cast
-// whole. (A caller that wants single elements bit-casts the whole fragment too: this compiler reads
-// __builtin_bit_cast(unsigned short, f[e]) from the vector's first element whatever e is.)
+// Both decodes below are single inline-asm blocks (r4d_trellis_k4_decode says why). Inline asm at
+// all because nothing in the builtins reaches v_mad_u32_u16's op_sel, and plain C lowers the 32-bit
+// product to the quarter-rate v_mul_lo_u32. A fragment is built as four dwords and bit-cast whole:
+// this compiler reads __builtin_bit_cast(unsigned short, f[e]) from the vector's first element
+// whatever e is, so a caller that wants single elements bit-casts the whole fragment too.
 typedef unsigned r4d_u32x4 __attribute__((ext_vector_type(4)));
-__device__ __forceinline__ v8h r4d_trellis_frag(const unsigned (&x)[8]) {
-  r4d_u32x4 d;
-#pragma unroll
-  for (int i = 0; i < 4; ++i) d[i] = r4d_trellis_affine(r4d_trellis_pack(x[2 * i], x[2 * i + 1]));
-  return __builtin_bit_cast(v8h, d);
-}
 
 // ---- KB = 4 ------------------------------------------------------------------------------------
 // P, A, B: this lane's words (r4d_trellis_k4_off_p / _off_ab) of one block. f0 / f1: the lane's
@@ -230,35 +194,115 @@ __device__ __forceinline__ void r4d_trellis_k4_decode(unsigned P, unsigned A, un
 }
 
 // ---- KB = 5 ------------------------------------------------------------------------------------
-// W[0..4]: this lane's words (r4d_trellis_k5_word). State q is big-endian bits [21 + 5q, 37 + 5q)
-// of V0..V3; F0 takes q {0,1,8,9,2,3,10,11}, F1 q {4,5,12,13,6,7,14,15}. q = 15 starts on a word
-// boundary (bit 96), so its state is V3's high half and hashes through op_sel with no extract.
-template <int Q>
-__device__ __forceinline__ unsigned r4d_trellis_k5_hash(const unsigned (&V)[4]) {
-  constexpr int r = 21 + 5 * Q, i = r >> 5, s = r & 31;
-  if constexpr (s == 0) {
-    return r4d_trellis_hash<true>(V[i]);
-  } else if constexpr (s <= 16) {
-    return r4d_trellis_hash<false>(V[i] >> (16 - s));
-  } else {
-    return r4d_trellis_hash<false>(__builtin_amdgcn_alignbit(V[i], V[i + 1], 48 - s));
-  }
-}
+// The per-lane alignment of the five words: 16 h bits (h = lane >> 4). Loop-invariant.
+__device__ __forceinline__ unsigned r4d_trellis_k5_shift(int lane) { return 16u * (unsigned)(lane >> 4); }
 
-__device__ __forceinline__ void r4d_trellis_k5_decode(const unsigned (&W)[5], int lane, v8h& f0,
+// W[0..4]: this lane's words (r4d_trellis_k5_word), CLOBBERED (the block reuses them as scratch).
+// sh = r4d_trellis_k5_shift(lane). V_i = alignbit(W_i, W_i+1, sh); state q is then big-endian bits
+// [21 + 5q, 37 + 5q) of V0..V3 on every lane: V_i >> (16 - s) when it lies inside V_i (s = the bit
+// offset in V_i <= 16), alignbit(V_i, V_i+1, 48 - s) when it straddles, and q = 15 (bit 96) is V3's
+// high half, hashed through op_sel with no extract. F0 takes q {0,1,8,9,2,3,10,11} and F1
+// {4,5,12,13,6,7,14,15} as elements e0..e7, i.e. dwords (q0,q1) (q8,q9) (q2,q3) (q10,q11) and
+// (q4,q5) (q12,q13) (q6,q7) (q14,q15).
+//
+// One asm block for the reason r4d_trellis_k4_decode gives, 75 VALU: 4 alignbit (V), 15 extracts,
+// 16 mad_u32_u16, 16 pk_mad_u16, 8 sad_u8, 8 sad_hi_u8, 8 pk_fma -- 4.69 per weight. Every
+// dependency inside is at least 8 VALU apart except the first four extracts' on V1 / V2 (4 and 6);
+// the block ends in s_delay_alu for the WMMA that reads the last dword. The low products of the 16
+// hashes go through eight temporaries in two batches: W0..W4 (dead after V3) and V0..V2 (dead after
+// the extracts). Registers: 24 (the five words, V0..V3 and 15 states; q15's hash lands in V3).
+__device__ __forceinline__ void r4d_trellis_k5_decode(unsigned (&W)[5], unsigned sh, v8h& f0,
                                                       v8h& f1) {
-  const unsigned sh = 16u * (unsigned)(lane >> 4);
-  unsigned V[4];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) V[i] = __builtin_amdgcn_alignbit(W[i], W[i + 1], sh);
-  const unsigned x0[8] = {r4d_trellis_k5_hash<0>(V), r4d_trellis_k5_hash<1>(V),
-                          r4d_trellis_k5_hash<8>(V), r4d_trellis_k5_hash<9>(V),
-                          r4d_trellis_k5_hash<2>(V), r4d_trellis_k5_hash<3>(V),
-                          r4d_trellis_k5_hash<10>(V), r4d_trellis_k5_hash<11>(V)};
-  const unsigned x1[8] = {r4d_trellis_k5_hash<4>(V), r4d_trellis_k5_hash<5>(V),
-                          r4d_trellis_k5_hash<12>(V), r4d_trellis_k5_hash<13>(V),
-                          r4d_trellis_k5_hash<6>(V), r4d_trellis_k5_hash<7>(V),
-                          r4d_trellis_k5_hash<14>(V), r4d_trellis_k5_hash<15>(V)};
-  f0 = r4d_trellis_frag(x0);
-  f1 = r4d_trellis_frag(x1);
+  unsigned v0, v1, v2, v3, s0, s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14;
+  asm("v_alignbit_b32 %[v1], %[w1], %[w2], %[sh]\n\t"
+      "v_alignbit_b32 %[v2], %[w2], %[w3], %[sh]\n\t"
+      "v_alignbit_b32 %[v0], %[w0], %[w1], %[sh]\n\t"
+      "v_alignbit_b32 %[v3], %[w3], %[w4], %[sh]\n\t"
+      // The 15 extracts, V1 / V2 shifts first (their V is oldest).
+      "v_lshrrev_b32 %[s3], 12, %[v1]\n\t"
+      "v_lshrrev_b32 %[s9], 14, %[v2]\n\t"
+      "v_lshrrev_b32 %[s4], 7, %[v1]\n\t"
+      "v_lshrrev_b32 %[s10], 9, %[v2]\n\t"
+      "v_alignbit_b32 %[s0], %[v0], %[v1], 27\n\t"
+      "v_alignbit_b32 %[s12], %[v2], %[v3], 31\n\t"
+      "v_lshrrev_b32 %[s5], 2, %[v1]\n\t"
+      "v_lshrrev_b32 %[s11], 4, %[v2]\n\t"
+      "v_alignbit_b32 %[s1], %[v0], %[v1], 22\n\t"
+      "v_alignbit_b32 %[s13], %[v2], %[v3], 26\n\t"
+      "v_alignbit_b32 %[s6], %[v1], %[v2], 29\n\t"
+      "v_alignbit_b32 %[s2], %[v0], %[v1], 17\n\t"
+      "v_alignbit_b32 %[s14], %[v2], %[v3], 21\n\t"
+      "v_alignbit_b32 %[s7], %[v1], %[v2], 24\n\t"
+      "v_alignbit_b32 %[s8], %[v1], %[v2], 19\n\t"
+      // Hash batch 1 (s3 s9 s4 s10 s0 s12 s5 s11): s * 0xD12D into a temporary, then
+      // + s * 0x83DC << 16 back into the state's register.
+      "v_mad_u32_u16 %[w0], %[s3], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w1], %[s9], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w2], %[s4], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w3], %[s10], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w4], %[s0], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v0], %[s12], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v1], %[s5], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v2], %[s11], %[klo], 0\n\t"
+      "v_pk_mad_u16 %[s3], %[khi], %[s3], %[w0] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s9], %[khi], %[s9], %[w1] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s4], %[khi], %[s4], %[w2] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s10], %[khi], %[s10], %[w3] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s0], %[khi], %[s0], %[w4] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s12], %[khi], %[s12], %[v0] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s5], %[khi], %[s5], %[v1] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s11], %[khi], %[s11], %[v2] op_sel_hi:[1,0,1]\n\t"
+      // Hash batch 2 (s1 s13 s6 s2 s14 s7 s8, and q15 = V3's high half into V3).
+      "v_mad_u32_u16 %[w0], %[s1], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w1], %[s13], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w2], %[s6], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w3], %[s2], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[w4], %[s14], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v0], %[s7], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v1], %[s8], %[klo], 0\n\t"
+      "v_mad_u32_u16 %[v2], %[v3], %[klo], 0 op_sel:[1,0,0,0]\n\t"
+      "v_pk_mad_u16 %[s1], %[khi], %[s1], %[w0] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s13], %[khi], %[s13], %[w1] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s6], %[khi], %[s6], %[w2] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s2], %[khi], %[s2], %[w3] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s14], %[khi], %[s14], %[w4] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s7], %[khi], %[s7], %[v0] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[s8], %[khi], %[s8], %[v1] op_sel_hi:[1,0,1]\n\t"
+      "v_pk_mad_u16 %[v3], %[khi], %[v3], %[v2] op_sel_hi:[1,1,1]\n\t"
+      // Dword = (1024 + bytesum) of its low element (sad_u8) and high element (sad_hi_u8).
+      "v_sad_u8 %[s4], %[s4], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s10], %[s10], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s0], %[s0], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s12], %[s12], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s6], %[s6], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s2], %[s2], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s14], %[s14], 0, 0x64006400\n\t"
+      "v_sad_u8 %[s8], %[s8], 0, 0x64006400\n\t"
+      "v_sad_hi_u8 %[s4], %[s5], 0, %[s4]\n\t"
+      "v_sad_hi_u8 %[s10], %[s11], 0, %[s10]\n\t"
+      "v_sad_hi_u8 %[s0], %[s1], 0, %[s0]\n\t"
+      "v_sad_hi_u8 %[s12], %[s13], 0, %[s12]\n\t"
+      "v_sad_hi_u8 %[s6], %[s7], 0, %[s6]\n\t"
+      "v_sad_hi_u8 %[s2], %[s3], 0, %[s2]\n\t"
+      "v_sad_hi_u8 %[s14], %[v3], 0, %[s14]\n\t"
+      "v_sad_hi_u8 %[s8], %[s9], 0, %[s8]\n\t"
+      // The codebook's affine map, one rounding (see r4d_trellis_k4_decode).
+      "v_pk_fma_f16 %[s4], %[s4], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s10], %[s10], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s0], %[s0], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s12], %[s12], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s6], %[s6], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s2], %[s2], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s14], %[s14], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "v_pk_fma_f16 %[s8], %[s8], %[kinv], 0xc931 op_sel_hi:[1,0,0]\n\t"
+      "s_delay_alu instid0(VALU_DEP_1)"
+      : [w0] "+v"(W[0]), [w1] "+v"(W[1]), [w2] "+v"(W[2]), [w3] "+v"(W[3]), [w4] "+v"(W[4]),
+        [v0] "=&v"(v0), [v1] "=&v"(v1), [v2] "=&v"(v2), [v3] "=&v"(v3), [s0] "=&v"(s0),
+        [s1] "=&v"(s1), [s2] "=&v"(s2), [s3] "=&v"(s3), [s4] "=&v"(s4), [s5] "=&v"(s5),
+        [s6] "=&v"(s6), [s7] "=&v"(s7), [s8] "=&v"(s8), [s9] "=&v"(s9), [s10] "=&v"(s10),
+        [s11] "=&v"(s11), [s12] "=&v"(s12), [s13] "=&v"(s13), [s14] "=&v"(s14)
+      : [sh] "v"(sh), [klo] "s"(R4D_TRELLIS_MUL1_KMLO), [khi] "s"(R4D_TRELLIS_MUL1_KMHI),
+        [kinv] "s"(R4D_TRELLIS_KINV_F16X2));
+  f0 = __builtin_bit_cast(v8h, (r4d_u32x4){s0, s8, s2, s10});
+  f1 = __builtin_bit_cast(v8h, (r4d_u32x4){s4, s12, s6, s14});
 }

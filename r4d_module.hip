@@ -675,6 +675,14 @@ PYBIND11_MODULE(r4d, m) {
         py::arg("stream"));
   m.def("gemm_w4a16_nt_m64_has_group",
         [](int group) { return r4d_gemm_w4a16_nt_m64_has_group(group) != 0; }, py::arg("group"));
+  m.def("gemm_trellis_nt_m64", &r4d_gemm_trellis_nt_m64, py::arg("a0"), py::arg("a1"),
+        py::arg("n_split"), py::arg("w"), py::arg("svh"), py::arg("c"), py::arg("ws"),
+        py::arg("tickets"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("WV"),
+        py::arg("SK"), py::arg("MT"), py::arg("NP"), py::arg("SKG"), py::arg("U"), py::arg("NT"),
+        py::arg("out_scale"), py::arg("stream"));
+  m.def("gemm_trellis_nt_m64_tickets_bytes", &r4d_gemm_trellis_nt_m64_tickets_bytes, py::arg("N"));
+  m.def("gemm_trellis_nt_m64_zero_tickets", &r4d_gemm_trellis_nt_m64_zero_tickets,
+        py::arg("tickets"), py::arg("bytes"), py::arg("stream"));
   m.def("gemm_trellis_nt_m64_raw", &r4d_gemm_trellis_nt_m64_raw, py::arg("a0"), py::arg("a1"),
         py::arg("n_split"), py::arg("w"), py::arg("c"), py::arg("ws"), py::arg("tickets"),
         py::arg("M"), py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("WV"), py::arg("SK"),

@@ -480,6 +480,9 @@ int    r4d_gemm_trellis_nt_m64_has_rate(int KB);
 int    r4d_gemm_trellis_nt_m64_max_m(void);                          // 64
 size_t r4d_gemm_trellis_nt_m64_ws_bytes(int M, int N, int SKG);     // SKG * M * N * 4; used whenever a
                                                                     // 128-group spans > 1 WG
+size_t r4d_gemm_trellis_nt_m64_tickets_bytes(int N);                // (N / 128) * 4 (added in M2)
+void   r4d_gemm_trellis_nt_m64_zero_tickets(int64_t tickets, size_t bytes, int64_t stream);
+                                                                    // hipMemsetAsync; the 4.5 reset
 // Test and diagnostic entries (same device decode code):
 void r4d_gemm_trellis_nt_m64_raw(/* same minus svh/out_scale; fp32 C, no output transform */);
 void r4d_trellis_reconstruct_f16(int64_t w, int64_t q /* f16 [K][N] */, int K, int N, int KB, int64_t stream);
@@ -638,8 +641,10 @@ The prescale `s` is not a knob: it comes from the container (2.3).
 
 **Fallback tuning** (`FallbackTuning` gains M, 5.3):
 
-- M ≤ 16: WV = 4, NP = 1, SK = 2, MT = 1, U = 2, NT = 1, with `SKG = clamp(128 / (N/128), 1, 8)`
-  rounded down to a power of two and reduced until `(K/16) % (SK·SKG·U) == 0`.
+- M ≤ 16: WV = 4, NP = 1, SK = 2, MT = 1, U = 2, NT = 1, with `SKG = clamp(128 / (N/128), 1, 4)`
+  rounded down to a power of two and reduced until `(K/16) % (SK·SKG·U) == 0`. (Revision 2 capped
+  SKG at 8, which only attn.k/v reached; 10.1 dropped SKG = 8 from the tunings. The kernel still
+  accepts it, and `test_trellis_gemm` keeps it deterministic and row-identical.)
 - M > 16: SKG = 1, MT = min(4, ceil(M/16)), WV = 4, NP = 1, SK = 2, U = 2, NT = 0.
 
 Without the M > 16 rule, every prefill chunk of a linear with N < 16384 (k, v, z, o, out_proj,
@@ -852,8 +857,10 @@ rather than reusing it.
 
 ### 4.8 FWHT-128 and the input-transform kernels
 
-**`Fwht128Wave`** (`r4d_fwht128.h` in libr4d; an identical copy in `hadamard_device.h`, pinned by
-test).
+**`Fwht128Wave`** (`r4d_fwht128_wave` in libr4d's `r4d_fwht128.h`). There is one definition, no
+copy: `src/kernels/src/trellis_transform.hip` includes the libr4d header (through libr4d's `-I`), so
+the input transform and the GEMM's output transform run the same butterfly. `test_trellis_input`
+pins it bitwise to `FwhtLds` through the `r4dx_fwht128_f32` diagnostic.
 
 - One wave handles 128 points. Lane l holds `i = l + 32r`, r = 0..3.
 - Stages `lg = 0..4` are cross-lane: the partner is `l ^ (1<<lg)`, fetched with DPP `row_xmask` for
@@ -865,8 +872,10 @@ test).
   in fp32.
 - Cost is about 48 VALU per 128 points: negligible.
 
-**`r4dx_trellis_input_bf16(x, M, K, nout, suh[3], out[3], part_stride, prescale_log2, stream)`**
-(new `src/kernels/src/trellis_transform.hip`, declared in `kernels.h`).
+**`r4dx_trellis_input_bf16(x, M, K, nout, suh, out, prescale_log2, stream)`** (new
+`src/kernels/src/trellis_transform.hip`, declared in `kernels.h`). `suh` and `out` are **host**
+arrays of `nout` device pointers (`const int64_t*`); there is no `part_stride` argument (as built in
+M2).
 
 - Grid `(K/128, M)`, one wave (32 threads) per WG, one 128-block each. So K only needs to be
   ÷128, the loader's own rule (the first revision's `K/512` grid needed ÷512; every shape passes
@@ -876,8 +885,12 @@ test).
   Its cost counts against M2's 0.30 ms budget (4.6).
 - It reads one bf16 128-block of x, then for each output `o < nout` (up to 3):
   `v = x·suh_o` (fp32, suh widened at load), `Fwht128Wave`, then
-  `out_o = f16_rn(v · 2^s/√128)`. Output o is written at `out[o] + row·K`, and the outputs of one
-  linear's parts are `part_stride` elements apart (5.3).
+  `out_o = f16_rn(v · 2^s/√128)`. Output o is written at `out[o] + row·K`. For one linear's parts
+  the caller passes `suh[1] = suh[0] + K` and `out[1] = out[0] + part_stride` (5.3).
+- The product `v · 2^s/√128` is rounded to fp32 before the f16 conversion. Left alone, the compiler
+  fuses the multiply and the conversion into one `v_fma_mixlo_f16`, which rounds the exact product
+  once and differs in the last f16 bit on about 1e-5 of the elements; an empty `asm` keeps the fp32
+  product (M2). The M5 fused producers must do the same, or they are not byte-identical to v1.
 - **There is exactly one rounding, straight to f16.** The q2ab kernels round to bf16 first and then
   to f16 (`r4dx_kernels.hip:499-501`); the trellis variants must not.
 
@@ -976,7 +989,7 @@ It exists in case `x⊙suh` falls into the f16 subnormal range. suh is about |W|
 | `r4dx_kernels.hip:163` and the rmsnorm / residual_rmsnorm / silu_mul host entries | `CheckEpiloguePrecondition` throws on any epilogue value it does not know, so an unknown value can never again reach `ApplyEpilogueRow`. Shared code: covered by A6. |
 | `linear.h:89-93` | `PreQuantizedActivation` gains `const void* transform_id` (must equal `w.trellis_suh.data()`) and `int64_t part_stride` (elements between parts). For trellis, `data` holds `P` parts, each `[M][K]` f16, part `p` at `data + p·part_stride`; chunk `m0` is at `+ m0·K` inside each part (`linear.cpp:318` offsets by `m0*K` only, which is right within a part and wrong across parts once M > 64 without the stride). `ApplyLinear` takes the trellis path when `pre && pre->transform_id != nullptr`, and throws if the id is not this linear's: the transform is per linear, so an epilogue-kind check is not enough (`linear.cpp:262-267`). |
 | `linear.cpp:269-298` | Scratch: without `pre`, `P·kMaxChunkM·K` f16 for A, with `part_stride = kMaxChunkM·K`. For split 128-groups at M ≤ 16, `r4d_gemm_trellis_nt_m64_ws_bytes` of fp32 from the arena: at most 16·34816·8·4 B = 17.8 MB, inside the 96 MiB arena (`model.cpp:345`). |
-| `linear.cpp:310-376` | New case, per chunk. Without `pre`: `r4dx_trellis_input_bf16(xc, m, K, P, suh parts, scratch, part_stride, s)`. Then `GemmTrellisNtM64(a0, a1, part_n[0], ...)` with `out_scale = 2^-s/√128`. |
+| `linear.cpp:310-376` | New case, per chunk. Without `pre`: `r4dx_trellis_input_bf16(xc, m, K, P, suh_ptrs, out_ptrs, s, stream)` with host arrays `suh_ptrs = {suh, suh + K}` and `out_ptrs = {scratch, scratch + part_stride}` (4.8; the kernel takes no stride). Then `GemmTrellisNtM64(a0, a1, part_n[0], ...)` with `out_scale = 2^-s/√128`. A Wc = 32 table row (out_proj/o, k/v, down) takes the split path, so it needs `ws` even at SKG = 1. |
 
 **v1 is self-contained.** Because `EpilogueForLayout(kTrellis)` is none, every existing call site
 already passes plain bf16 activations and no `pre`, and becomes correct as soon as the loader
@@ -1063,7 +1076,7 @@ sharded as today (`tp_shard.cpp:222-234`).
 |---|---|---|
 | `test_trellis_decode` | tests/kernels | `r4d_trellis_reconstruct_f16` is **bit-exact** against `decode_words`: random and real tiles, KB = 4 and 5. `_raw` GEMM with one-hot A rows returns decoded weights **bit-exactly** for every tuning row of both tables (tests the lane map, pair grid, SK/SKG reduction and part selection). |
 | `test_trellis_gemm` | tests/kernels | Full linear (transform + GEMM + epilogue) against fp64 on random and real tiles, M ∈ {1, 3, 8, 16, 17, 64}, P ∈ {1, 2}. Tolerance: per element ≤ 4 bf16 ulp of the fp64 value computed from the f16-rounded A, and relative Frobenius ≤ 2e-3. **Row identity:** for every M ≤ 16 tuning row, row r of an M-row call is bit-identical to the M = 1 call on the same input. Determinism: 100 repeats at SKG = 8 and at `Wc` = 32 give identical bytes. Ticket reset: with tickets deliberately left non-zero the result is wrong (so the test can see the failure), and after `ZeroTrellisTickets` the next call is bit-exact again. Precondition throws (including `NP·U > 8` and the LDS rule). |
-| `test_trellis_input` | tests/kernels | `r4dx_trellis_input_bf16` is **bit-exact** against the fp32 emulation: nout 1-3, prescale, `part_stride`, M = 1..64, K ∈ {3072, 5120, 6144, 8704, 17408}. Each fused variant (M5) is **byte-identical to the v1 pair** (producer's bf16 output, then `r4dx_trellis_input_bf16`). `Fwht128Wave` equals `FwhtLds` bitwise. |
+| `test_trellis_input` | tests/kernels | `r4dx_trellis_input_bf16` is **bit-exact** against the fp32 emulation: nout 1-3, prescale, outputs at a part stride, M = 1..64, K ∈ {3072, 5120, 6144, 8704, 17408}. Each fused variant (M5) is **byte-identical to the v1 pair** (producer's bf16 output, then `r4dx_trellis_input_bf16`). `Fwht128Wave` equals `FwhtLds` bitwise. |
 | `convert_trellis_import` | tests/convert (CPU) | A synthetic 2-layer checkpoint plus a synthetic override directory written by the golden script (random words; checkpoint weights = their reconstruction, so verify passes exactly), in both manifest forms: a quantize-model manifest and a mix manifest (absolute `file` paths, no `stale_layers`/`layers_done`/top-level `code_sha256`, float `K`). Checks the regrid bytes against python, metadata and summary. Refusals: sha mismatch, `complete: false`, stale layer, K = 3.5, exl3 basis without the allow flag, `--rotate q2ab`, missing linear, gate K ≠ up K, config sha mismatch, `--trellis-from` with `--selftest`/`--dflash-gguf`/`--reuse-tensors-from`. Checks that `--keep-bf16` skips a manifest entry. Follows the `convert_rms_hessian` exe pattern (`tests/convert/CMakeLists.txt:64-71`). |
 | `test_trellis_linear` + `test_tp_loader` cases | tests/model | Load the convert test's tiny container. `ApplyLinear` (with and without `pre`, P ∈ {1, 2}, M ∈ {1, 16, 17, 64, 65, 130} so the part stride and the chunk offset are both exercised) against CPU. `EpilogueForLayout(kTrellis) == r4dx_epilogue_none`. `Container::Load` with a trellis `lm_head_layout` loads w4a16. Loader refusals (2.5) in both `Load` and `LoadShard`. TP = 2 shard slices of every part, suh and svh included, equal the corresponding slices of the full buffers (`test_tp_loader.cpp` pattern). `test_pick_tuning`: trellis rows, and every pick for M = 1..64 on both the TP = 1 and TP = 2 tables and on the fallback is legal. |
 | `test_fused_quant` case | tests/kernels | The rmsnorm, residual_rmsnorm and silu_mul host entries throw on an unknown epilogue value. |
@@ -1304,3 +1317,180 @@ byte ratio of 0.879.
 - Add the in-model clock probe and the DFlash/MTP round timing early.
 - AFFINE is not needed.
 - The one weak shape is k/v at 1024 columns (335-406 GB/s vs 465-478).
+
+### 10.2 M2 (2026-09-27, device 1; libr4d `67528dd` plus the uncommitted M2 tree)
+
+Full data is in `D:\models\r4dx\trellis-m2\` (start with `m2_report.md`).
+
+**Built.**
+- libr4d: `r4d_gemm_trellis_nt_m64`, the whole linear (4.5: 8-row LDS reduction, tickets, the fp32
+  FWHT of `r4d_fwht128.h`, svh, one bf16 rounding), two A parts, and KB = 5. The K loop is exactly
+  62 VALU per tile pair and k-tile at KB = 4 and 75 at KB = 5 in all 100 instantiations; at most
+  189 VGPRs, no scratch. `test_trellis_gemm.py` runs it through `r4d.pyd`.
+- r4dx: `r4dx_trellis_input_bf16` (4.8), `test_trellis_input`, `test_trellis_gemm`, and the bench's
+  `--modes full`. The tuning rows are in `tests/kernels/gemm_tuning_table_trellis.inc`; M4 moves the
+  file into `src/model` when it wires it in.
+- Three things the build needed:
+  - at KB = 5, a `readfirstlane` on the prefetch step select, which the compiler otherwise put in a
+    VGPR ("illegal VGPR to SGPR copy");
+  - in the transform, an empty `asm` that keeps the fp32 product (4.8);
+  - in the epilogue, barriers that order LDS only. `__syncthreads()` also waits for every global
+    access and invalidates L0 at each barrier in WGP mode. With svh loaded before the reduction,
+    the output side at M = 1 fell from 0.31-0.33 to 0.23 ms per token.
+
+**Tests** (device 1). All three trellis tests pass:
+- `test_trellis_input`: 360 checks, bit-exact.
+- `test_trellis_decode`: 3152 checks, all 98 instantiations.
+- `test_trellis_gemm`: 10935 checks.
+  - Accuracy: worst element 0.405 of the tolerance; ‖C−y‖/‖y‖ ≤ 1.78e-3.
+  - The epilogue is checked bit for bit against `bf16_rn((FwhtLds(S)·svh)·out_scale)` of the
+    `_raw` sums, in 512 calls. The check fails on a reassociated product or a reordered FWHT.
+  - Row identity holds for every table row and for the fallback.
+  - 100 repeats give identical bytes at SKG = 4, at Wc = 32, and at SKG = 8.
+- Whole suite (`ctest -LE tp2gpu`): 89 pass, 0 fail, and `test_kernel_bandwidth` is skipped for an
+  absent golden. Only 90 tests were registered, because the reference venv had gone and the six
+  `reference_*` Python tests are not registered without it.
+
+**Gate: pass at M = 1 and M = 8, for K4 and the 4.5 bpw mix.** The replay runs one decode step's 336
+linears with the table tunings, against q2ab_hv2_q3's GEMMs plus its casts, GDN Hadamards and
+residual rotations. Each row pools 36 pairs; brackets are p25..p75 of the pairs.
+
+| rate | M | trellis ms/token | q2ab ms/token | S | X | X − S |
+|---|---|--:|--:|--:|---|---|
+| K4 | 1 | 20.64 | 23.18 | +2.71 | +0.17 [+0.14..+0.19] | −2.53 [−2.55..−2.51] |
+| K4 | 8 | 21.36 | 24.11 | +2.69 | −0.07 [−0.08..−0.04] | −2.74 [−2.77..−2.73] |
+| mix | 1 | 23.16 | 23.19 | +0.20 | +0.17 [+0.12..+0.19] | −0.04 [−0.06..−0.02] |
+| mix | 8 | 23.74 | 24.14 | +0.34 | −0.07 [−0.10..−0.04] | −0.41 [−0.45..−0.39] |
+
+The bars were X ≤ 0.30 ms and X − S ≤ 0.14 ms. Both chains ran at 3187-3237 MHz.
+
+- **Where X comes from** at M = 1: the 336 transforms (0.320 ms) cost 0.008 ms more than q2ab's
+  320 casts, 48 GDN Hadamards and 2 rotations (0.350 ms). The epilogue and split tails add
+  0.23 ms (K4) and 0.19 ms (mix). At M = 8 both are at or below zero.
+- **Outside X.** v1 runs the plain silu_mul and attention gate-mul where q2ab runs their Hadamard
+  forms.
+  - silu_mul: +0.105 ms at M = 1 (one workgroup per row), 0 at M = 8.
+  - gate-mul: −0.015 ms.
+  - **v1 end to end** is (X − S) plus these: K4 −2.44 / −2.76 ms and mix **+0.055** / −0.43 ms per
+    token at M = 1 / 8. The mix at M = 1 is inside A3's 0.14 ms margin.
+
+**For M4.**
+- **Wire the table.** Make 5.3's struct changes: `kTrellis` last, `SKG`/`U` in `LinearTuning`,
+  `rate` in `GemmTuningRow`, and `BestRow` matching on `rate`. Include the file in its own
+  namespace, as with the TP = 2 table. There are no TP = 2 rows and no rows for M > 16, so those
+  take the fallback. The fallback is now capped at SKG = 4 (4.4).
+- **Tickets and workspace.**
+  - Tickets: one `tickets_bytes(N)` slice per linear, cleared by `zero_tickets`.
+  - Workspace: `ws_bytes(M, N, SKG)`. The Wc = 32 rows (out_proj/o, k/v, down) take the split
+    path, so they need `ws` even at SKG = 1.
+- **The transform** takes host arrays of suh and out pointers (4.8, 5.3).
+- **silu_mul.** Give trellis a wide-grid silu_mul, or M5's fused variant; that removes the
+  +0.105 ms.
+- **Not done in M2,** because the files were outside its scope:
+  - the `GemmTrellisNtM64` wrapper in `r4d.hpp`;
+  - the in-model clock probe;
+  - the DFlash/MTP round timing.
+
+### 10.3 M3 (2026-09-27, CPU only; converter)
+
+Logs are in `D:\models\r4dx\trellis-m3\`. The recipe is `tools/quant2/trellis_convert.ps1`.
+
+**Built** as section 3 specifies: `r4dx-convert --trellis-from` in `src/convert/main.cpp` and
+`trellis_import.hpp`, with the `trellis` `LayoutSet` in `linear_layouts.hpp`. Changes to the plan
+in 3.3:
+
+- Steps 7-8 (file sha256, tensor dtype and shape) run after planning and before the header is
+  written, so a changed oracle directory produces no output.
+- **Stricter verify.** Step 10 also requires `|rel - rec| / rec <= 1e-4`, on top of the spec's
+  `0.02 rec + 1e-4`. The spec's 2% cannot see one wrong 16×16 tile of a large tensor (about 6e-4 of
+  rel on a gate_up) or a check that skipped part of a tensor (a mutation that drops one 128-row block
+  from the sums moves rel by up to 0.56% on the test fixture). The CPU reconstruction reproduces the
+  oracle's rel to 2e-8 on the real containers and 2e-7 on the fixture, so 1e-4 leaves a wide margin.
+- **Where the output lives.** The container is written as `<output>.partial` and renamed to
+  `<output>` only after the check passes. Any earlier `<output>` or `<output>.verify-failed` is
+  removed first. A failed check renames the file to `<output>.verify-failed`. A conversion that dies
+  (in the emit pass or inside the check) leaves only `.partial`. So `<output>` never holds an
+  unfinished or unchecked container.
+- **Durability.** The data is flushed to disk before the file is closed. The header patch flushes
+  the file again before it writes, and flushes the patch after.
+- **What the header records.** `r4dx_convert_run.trellis.verify` is `{mode, tolerance, result,
+  worst, worst_tensor, checked, failed}`, with `worst` as a number (3.3's `verify: {mode, worst}`).
+  The check patches the numbers in place of the fixed-width "pending" placeholder of `result`, as
+  more members of the same object. JSON whitespace pads the space after the last value.
+- **`--trellis-verify none`** exists in debug builds only, as 3.3 says. A release converter refuses
+  it. A debug build records `result` "not run (--trellis-verify none, a debug build)" with no
+  numbers.
+
+**For M4 (loader).** Accept a container only when `verify.result` starts with "pass", or check
+`failed == 0` and `checked` equal to the HF tensors of `quant.trellis.linears`. "pending" (the
+conversion died), "FAILED" and "not run" are refused. A `.partial` or `.verify-failed` file is never
+under the intended name anyway.
+
+**Recipe.** These flags cover everything outside the body. They are q2ab_hv2_q3's flags without the
+rotation.
+
+```
+--layouts w4a16 --lm-head w4a16 --no-bf16 --mtp on --vision on --kv-calib <kvcalib-full>
+--quant search --imatrix <imatrix> --hessian-dir C:\AI\r4dx-hessian\hessian-v2 --ldlq .
+--w4a16-group-rule "^lm_head$=32"
+```
+
+With these flags:
+
+- lm_head is w4a16 g32. It and the MTP head's qg, o, gate_up and down (w4a16 g64) are LDLQ'd against
+  hessian-v2's unrotated keys.
+- The other q3 rules and the attn.k/v `--keep-bf16` are dropped: no body linear has a w4a16 layout
+  any more.
+- The lm_head is `w4a16` rather than `4bit`, because `--layout trellis` loads the w4a16 head.
+
+The script pins the manifest to the one whose KL was measured: `weights_override.manifest_sha256` of
+the A0 run's `D:\models\r4dx\kl-trellis\<oracle>\reference_run.json` (K4m `7e9037f4…`, mix4.5m
+`48a2eacb…`), so a manifest changed since then is refused. `-ManifestSha256` overrides the pin. The
+log records the converter's path, time and sha256.
+
+611 tensors outside the body are byte-identical to q2ab_hv2_q3's, in both the K4m and the mix
+container: lm_head.w4a16, mtp.* (except its two layernorms), vision, the embeddings, final_norm, the
+descales, q/k norms, conv1d, A_log, dt_bias and the GDN norm. This is `compare_containers.py` with
+every body linear, the rotation, the layernorms, gdn.in_proj_a/b and lm_head's dropped mxfp4/w4a8
+copies excluded. The recipe's own `-Compare` set is 356 of them.
+
+**Tests.** `convert_trellis_import` covers the pair grid, the codebook, the ring tables and the
+LayoutSet. On the fixture that `tools/reference/trellis_import_golden.py` writes:
+
+- the decode of 26 oracle tensors matches `decode_words` bit for bit;
+- the regrid matches `to_pair_grid` byte for byte, in both manifest forms;
+- the converter runs in both forms, and its metadata is checked, including `verify.worst <= 1e-4`;
+- the non-body tensors equal those of a conversion without `--trellis-from`;
+- the `--lm-head bf16` twin, `--keep-bf16` and `--trellis-prescale-log2` work;
+- every refusal in 3.3 is hit, plus one file recorded with two sha256, a prescale outside
+  [-16, 16] and (release builds) `--trellis-verify none`;
+- a rec off by 2× and one off by 1e-3 (inside the spec's 2%) both fail, with the numbers in the
+  header, the file renamed to `.verify-failed`, and neither `<output>` nor `.partial` left.
+
+The fixture checkpoint's error is deliberately uneven: `W_hat·(1 + a·g)`, with the amplitude a drawn
+per 16×16 tile from [0.002, 0.02]. With an even error (plain bf16 rounding), a check that covers only
+part of a tensor reproduces rel exactly and cannot be caught.
+
+The test keeps `tiny_k4.r4dx` and `tiny_mix.r4dx` in the build tree's `tests/convert/trellis_import/`
+for M4; a test that loads them declares `FIXTURES_REQUIRED trellis_tiny`. Their config is the real
+model's in miniature: hidden 256, 4 heads of 256, 2 KV heads, GDN 2 key and 8 value heads of 128,
+intermediate 1024, vocab 128. The test checks it against the runtime's own code:
+
+- `ModelConfig::FromJson` parses it;
+- every trellis linear has the [N, K] that `Container::Load` asks for;
+- `ModelConfig::Shard` accepts it at TP = 2, and every trellis rank range is a multiple of 128.
+
+All 15 `convert_*` tests pass, including `convert_rms_hessian`'s pinned digest of an unrotated
+container built without the flag.
+
+| container | oracle | time | file | decode bytes | verify, worst \|rel - rec\|/rec |
+|---|---|--:|--:|--:|---|
+| `qwen38-27b-trellis-k4m.r4dx` | K4m | 1.7 min | 15.66 GiB | **12.130 GiB** | 400/400, 1.79e-8 |
+| `qwen38-27b-trellis-k4m-lmbf16.r4dx` | K4m, `--lm-head bf16` | 1.6 min | 17.29 GiB | 13.758 GiB | 400/400, 1.79e-8 |
+| `qwen38-27b-trellis-mix45m.r4dx` | mix4.5m | 1.8 min | 17.08 GiB | **13.546 GiB** | 400/400, 1.96e-8 |
+
+Decode bytes are measured by `tools/quant2/decode_bytes.py`, which gives 13.680 GiB for q2ab_hv2_q3.
+The twin's 1843 non-lm_head tensors are byte-identical to K4m's. The reconstruction check takes 22-39
+s. Hashing the oracle files takes about 6 s. An independent numpy check finds the pair grid, suh and
+svh byte-equal to the oracle files for 15 linears across both containers. They include gate_up at
+KB = 4 and 5, down with K = 17408, and attn.k/v with N = 1024.

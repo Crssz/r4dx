@@ -13,8 +13,10 @@ per kernel:
   (tile pair, k-tile) and per weight. One loop iteration is the kernel's ping-pong pair of steps
   (2 U k-tiles for each of NP pairs; one step at MT >= 3), counted from its WMMA: 2 MT per
   (pair, k-tile). A lane decodes 16 weights per (pair, k-tile). The decode
-  subset is 62 VALU per (pair, k-tile) (6 alignbit, 16 mad_u32_u16, 16 pk_mad_u16, 8 sad_u8,
-  8 sad_hi_u8, 8 pk_fma_f16); everything else in the loop is overhead;
+  subset is 62 VALU per (pair, k-tile) at KB = 4 (6 alignbit, 16 mad_u32_u16, 16 pk_mad_u16,
+  8 sad_u8, 8 sad_hi_u8, 8 pk_fma_f16) and 75 at KB = 5 (13 alignbit and 6 lshrrev for the
+  alignment and the states, then the same 56); everything else in the loop is overhead. The
+  instantiations are (KB, NP, U, MT, NT); the raw and the full entry share each one;
   the loop's schedule: its s_delay_alu count, and its NEAR dependencies -- VALU (WMMA included)
   reading a VGPR written by one of the 3 VALU before it with no s_delay_alu in between -- in all
   (`near`) and those whose producer is inline asm (`near_asm`). gfx12 stalls the whole SIMD's VALU
@@ -33,9 +35,9 @@ import re
 import sys
 from collections import Counter
 
-KERNEL_RE = re.compile(r"r4d_gemm_trellis_nt_m64_raw_kernelILi(\d+)ELi(\d+)ELi(\d+)ELb([01])E")
-DECODE_OPS = ("v_alignbit_b32", "v_mad_u32_u16", "v_pk_mad_u16", "v_sad_u8", "v_sad_hi_u8",
-              "v_pk_fma_f16")
+KERNEL_RE = re.compile(r"r4d_gemm_trellis_nt_m64_kernelILi(\d+)ELi(\d+)ELi(\d+)ELi(\d+)ELb([01])E")
+DECODE_OPS = ("v_alignbit_b32", "v_lshrrev_b32", "v_mad_u32_u16", "v_pk_mad_u16", "v_sad_u8",
+              "v_sad_hi_u8", "v_pk_fma_f16")
 
 
 def split_functions(lines: list[str]) -> dict[str, list[str]]:
@@ -190,14 +192,14 @@ def main() -> int:
         m = KERNEL_RE.search(name)
         if not m:
             continue
-        NP, U, MT, NT = (int(g) for g in m.groups())
+        KB, NP, U, MT, NT = (int(g) for g in m.groups())
         md = meta.get(name, {})
         loop = main_loop(body)
         c = classify(loop)
         nd = near_deps(loop)
         tiles = c["wmma"] // (2 * MT)                        # (pair, k-tile) per loop iteration
         rows.append({
-            "NP": NP, "U": U, "MT": MT, "NT": NT, **md,
+            "KB": KB, "NP": NP, "U": U, "MT": MT, "NT": NT, **md,
             "loop_valu": c["valu"], "loop_wmma": c["wmma"], "loop_vmem": c["vmem_load"],
             "loop_salu": c["salu"], "loop_wait": c["wait"],
             "loop_delay_alu": nd["delay_alu"], "loop_near": nd["near"], "loop_near_asm": nd["near_asm"],
@@ -206,13 +208,13 @@ def main() -> int:
             "decode": {op: c[op] for op in DECODE_OPS},
             "overhead_ops": {k[6:]: v for k, v in sorted(c.items()) if k.startswith("other:")},
         })
-    rows.sort(key=lambda r: (r["NP"], r["U"], r["MT"], r["NT"]))
-    print(f"{'NP':>2} {'U':>2} {'MT':>2} {'NT':>2} {'vgpr':>4} {'sgpr':>4} {'scr':>3} | "
+    rows.sort(key=lambda r: (r["KB"], r["NP"], r["U"], r["MT"], r["NT"]))
+    print(f"{'KB':>2} {'NP':>2} {'U':>2} {'MT':>2} {'NT':>2} {'vgpr':>4} {'sgpr':>4} {'scr':>3} | "
           f"{'VALU':>5} {'WMMA':>4} {'VMEM':>4} {'SALU':>4} | {'VALU/(pair,kt)':>14} {'VALU/w':>6} | "
           f"{'dly':>3} {'near':>4} {'asm':>3} | overhead")
     for r in rows:
         ov = ", ".join(f"{k} {v}" for k, v in r["overhead_ops"].items())
-        print(f"{r['NP']:>2} {r['U']:>2} {r['MT']:>2} {r['NT']:>2} {r.get('vgpr', -1):>4} {r.get('sgpr', -1):>4} "
+        print(f"{r['KB']:>2} {r['NP']:>2} {r['U']:>2} {r['MT']:>2} {r['NT']:>2} {r.get('vgpr', -1):>4} {r.get('sgpr', -1):>4} "
               f"{r.get('scratch', -1):>3} | {r['loop_valu']:>5} {r['loop_wmma']:>4} {r['loop_vmem']:>4} "
               f"{r['loop_salu']:>4} | {r['valu_per_pair_ktile']:>14.2f} {r['valu_per_weight']:>6.3f} | "
               f"{r['loop_delay_alu']:>3} {r['loop_near']:>4} {r['loop_near_asm']:>3} | {ov}")

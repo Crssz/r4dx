@@ -23,12 +23,26 @@ Exit status 0 when the containers are identical apart from the allowed metadata 
 Python stdlib only.
 
   python tools/quant2/compare_containers.py a_reuse.r4dx a_full.r4dx --allow r4dx_convert_run.reused_from
+
+Subsets (--tensors REGEX, --exclude REGEX; re.search over tensor names) compare only the selected
+tensors: the same names in both, each with the same dtype, shape and bytes -- not their
+data_offsets, the data section's size or its gaps, and not the data_sha256 records, all of which
+depend on the rest of the file. --no-metadata skips __metadata__. That is how a trellis container
+(docs/trellis-kernel.md; `<base>.trellis.w|suh|svh` body linears, __metadata__.quant.trellis) is
+held against the w4a16 container whose non-body tensors it must reproduce, e.g.
+
+  python tools/quant2/compare_containers.py qwen38-27b-trellis-k4m.r4dx qwen38-27b-q2ab_hv2_q3.r4dx `
+      --tensors "^(lm_head\\.w4a16\\.|mtp\\.|vision\\.|text\\.embed_tokens$)" --no-metadata
+
+A container with __metadata__.quant.trellis also gets a one-line trellis summary (linears per KB,
+prescale, the converter's reconstruction-check result).
 """
 import argparse
 import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -89,8 +103,14 @@ def data_ranges(c):
     return out
 
 
-def digest_all(c, threads):
-    ranges = data_ranges(c)
+def digest_all(c, threads, names=None):
+    """sha256 of every data range; with `names`, of those tensors only (no gaps)."""
+    if names is None:
+        ranges = data_ranges(c)
+    else:
+        ds = c["data_start"]
+        ranges = [("tensor:" + n, ds + c["tensors"][n]["data_offsets"][0], ds + c["tensors"][n]["data_offsets"][1])
+                  for n in names]
     ranges_by_size = sorted(ranges, key=lambda r: r[2] - r[1], reverse=True)
     out = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as ex:
@@ -106,6 +126,24 @@ def container_data_sha256(tensor_digests):
     for name, d in lines:
         h.update(name + b"\n" + d.encode("ascii") + b"\n")
     return h.hexdigest()
+
+
+def trellis_summary(c):
+    """One line about __metadata__.quant.trellis, or None."""
+    md = c["metadata"] or {}
+    q = (md.get("quant") or {}).get("trellis")
+    if not isinstance(q, dict):
+        return None
+    per = {}
+    for e in (q.get("linears") or {}).values():
+        per[e.get("bits")] = per.get(e.get("bits"), 0) + 1
+    names = [n for n in c["tensors"] if ".trellis." in n]
+    tbytes = sum(c["tensors"][n]["data_offsets"][1] - c["tensors"][n]["data_offsets"][0] for n in names)
+    run = ((md.get("r4dx_convert_run") or {}).get("trellis") or {})
+    verify = ((run.get("verify") or {}).get("result") or "(no record)").strip()
+    return (f"{len(q.get('linears') or {})} trellis linears ({', '.join(f'KB={k} x{v}' for k, v in sorted(per.items()))}), "
+            f"{len(names)} .trellis.* tensors = {tbytes / 2**30:.3f} GiB, prescale_log2 {q.get('prescale_log2')}, "
+            f"{run.get('manifest_form', '?')} manifest {str(run.get('manifest_sha256', '?'))[:16]}, verify: {verify}")
 
 
 def flatten(j, prefix, out):
@@ -132,24 +170,39 @@ def main():
     ap.add_argument("--allow", action="append", default=[],
                     help="__metadata__ leaf path (or prefix) expected to differ; repeatable")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--tensors", help="compare only the tensors whose name matches this regex (re.search)")
+    ap.add_argument("--exclude", help="leave out the tensors whose name matches this regex (re.search)")
+    ap.add_argument("--no-metadata", action="store_true", help="do not compare __metadata__")
     ap.add_argument("--json-out", help="write the full result as JSON here")
     args = ap.parse_args()
 
     t0 = time.time()
     A, B = read_header(args.a), read_header(args.b)
     problems = []
-    result = {"a": args.a, "b": args.b, "allow": args.allow}
+    result = {"a": args.a, "b": args.b, "allow": args.allow, "tensors_filter": args.tensors,
+              "exclude_filter": args.exclude}
+    subset = bool(args.tensors or args.exclude)
+    inc = re.compile(args.tensors) if args.tensors else None
+    exc = re.compile(args.exclude) if args.exclude else None
+
+    def selected(names):
+        return {n for n in names if (inc is None or inc.search(n)) and (exc is None or not exc.search(n))}
 
     # ---- tensor directory ------------------------------------------------------------------------
-    na, nb = set(A["tensors"]), set(B["tensors"])
+    na, nb = selected(A["tensors"]), selected(B["tensors"])
     only_a, only_b = sorted(na - nb), sorted(nb - na)
     if only_a:
         problems.append(f"{len(only_a)} tensor(s) only in A: {only_a[:10]}")
     if only_b:
         problems.append(f"{len(only_b)} tensor(s) only in B: {only_b[:10]}")
+    if subset and not (na | nb):
+        problems.append("the filters select no tensor in either container")
     dir_diff = []
     for name in sorted(na & nb):
         ta, tb = A["tensors"][name], B["tensors"][name]
+        if subset:  # offsets depend on the rest of the file
+            ta = {k: v for k, v in ta.items() if k != "data_offsets"}
+            tb = {k: v for k, v in tb.items() if k != "data_offsets"}
         if ta != tb:
             dir_diff.append(name)
             if len(dir_diff) <= 10:
@@ -158,16 +211,21 @@ def main():
         problems.append(f"... {len(dir_diff)} directory entries differ in total")
     data_a = A["file_size"] - A["data_start"]
     data_b = B["file_size"] - B["data_start"]
-    if data_a != data_b:
+    if data_a != data_b and not subset:
         problems.append(f"data section sizes differ: A {data_a} B {data_b}")
     result["tensors"] = {"a": len(na), "b": len(nb), "directory_differs": dir_diff}
     result["data_bytes"] = {"a": data_a, "b": data_b}
 
     # ---- data ------------------------------------------------------------------------------------
-    print(f"[cmp] hashing {args.a} ({data_a / 2**30:.2f} GiB of data) ...", flush=True)
-    da = digest_all(A, args.threads)
-    print(f"[cmp] hashing {args.b} ({data_b / 2**30:.2f} GiB of data) ...", flush=True)
-    db = digest_all(B, args.threads)
+    def sel_bytes(c, names):
+        return sum(c["tensors"][n]["data_offsets"][1] - c["tensors"][n]["data_offsets"][0] for n in names)
+
+    print(f"[cmp] hashing {args.a} ({(sel_bytes(A, na) if subset else data_a) / 2**30:.2f} GiB of data) ...",
+          flush=True)
+    da = digest_all(A, args.threads, sorted(na) if subset else None)
+    print(f"[cmp] hashing {args.b} ({(sel_bytes(B, nb) if subset else data_b) / 2**30:.2f} GiB of data) ...",
+          flush=True)
+    db = digest_all(B, args.threads, sorted(nb) if subset else None)
     labels = sorted(set(da) | set(db))
     data_diff = [lb for lb in labels if da.get(lb) != db.get(lb)]
     for lb in data_diff[:20]:
@@ -180,6 +238,8 @@ def main():
     # ---- each file's recorded data digest ---------------------------------------------------------
     result["data_sha256"] = {}
     for tag, c, d in (("a", A, da), ("b", B, db)):
+        if subset:  # the record covers every tensor of the file
+            break
         recorded = (((c["metadata"] or {}).get("r4dx_convert_run") or {}).get("reuse_guard") or {}).get("data_sha256")
         computed = container_data_sha256({lb[len("tensor:"):]: h for lb, h in d.items() if lb.startswith("tensor:")})
         result["data_sha256"][tag] = {"recorded": recorded, "computed": computed}
@@ -188,8 +248,9 @@ def main():
 
     # ---- __metadata__ ----------------------------------------------------------------------------
     fa, fb = {}, {}
-    flatten(A["metadata"] or {}, "", fa)
-    flatten(B["metadata"] or {}, "", fb)
+    if not args.no_metadata:
+        flatten(A["metadata"] or {}, "", fa)
+        flatten(B["metadata"] or {}, "", fb)
     meta_diff, meta_allowed = [], []
     for k in sorted(set(fa) | set(fb)):
         va, vb = fa.get(k, "(absent)"), fb.get(k, "(absent)")
@@ -209,7 +270,7 @@ def main():
             if isinstance(cur, dict):
                 cur.pop(parts[-1], None)
         return m
-    same_order = json.dumps(strip(A["metadata"])) == json.dumps(strip(B["metadata"]))
+    same_order = args.no_metadata or json.dumps(strip(A["metadata"])) == json.dumps(strip(B["metadata"]))
     result["metadata"]["same_key_order_after_allowed_removed"] = same_order
     if not same_order and not meta_diff:
         problems.append("__metadata__ has the same leaves but in another key order")
@@ -218,22 +279,32 @@ def main():
     result["problems"] = problems
     result["seconds"] = round(time.time() - t0, 1)
 
-    print(f"[cmp] A: {args.a}: {len(na)} tensors, {data_a} data bytes, header {A['header_len']} B")
-    print(f"[cmp] B: {args.b}: {len(nb)} tensors, {data_b} data bytes, header {B['header_len']} B")
-    print(f"[cmp] tensor directory (name, dtype, shape, data_offsets): "
+    sel = (f" selected by --tensors {args.tensors!r} --exclude {args.exclude!r}" if subset else "")
+    print(f"[cmp] A: {args.a}: {len(na)} tensors{sel}, {data_a} data bytes, header {A['header_len']} B")
+    print(f"[cmp] B: {args.b}: {len(nb)} tensors{sel}, {data_b} data bytes, header {B['header_len']} B")
+    for tag, c in (("A", A), ("B", B)):
+        ts = trellis_summary(c)
+        result.setdefault("trellis", {})[tag.lower()] = ts
+        if ts:
+            print(f"[cmp] {tag} trellis: {ts}")
+    print(f"[cmp] tensor directory (name, dtype, shape{'' if subset else ', data_offsets'}): "
           f"{'identical' if not (only_a or only_b or dir_diff) else 'DIFFERS'}")
     print(f"[cmp] data: {len(labels)} range(s) compared ({len(gaps_a)} uncovered gap(s) in A), "
           f"{len(data_diff)} differ")
     for tag in ("a", "b"):
-        d = result["data_sha256"][tag]
-        if d["recorded"] is not None:
+        d = result["data_sha256"].get(tag)
+        if d and d["recorded"] is not None:
             print(f"[cmp] {tag.upper()} data_sha256 recorded {d['recorded']} "
                   f"{'== recomputed' if d['recorded'] == d['computed'] else '!= recomputed ' + d['computed']}")
-    print(f"[cmp] __metadata__: {len(meta_allowed)} allowed differing leaf path(s): {meta_allowed}")
-    print(f"[cmp] __metadata__: {len(meta_diff)} other differing leaf path(s)")
+    if args.no_metadata:
+        print("[cmp] __metadata__: not compared (--no-metadata)")
+    else:
+        print(f"[cmp] __metadata__: {len(meta_allowed)} allowed differing leaf path(s): {meta_allowed}")
+        print(f"[cmp] __metadata__: {len(meta_diff)} other differing leaf path(s)")
     for p in problems:
         print(f"  DIFF {p}")
-    print(f"[cmp] {'IDENTICAL' if not problems else 'DIFFERENT'} (modulo --allow {args.allow}) "
+    print(f"[cmp] {'IDENTICAL' if not problems else 'DIFFERENT'} (modulo --allow {args.allow}"
+          f"{', tensor subset' if subset else ''}{', no metadata' if args.no_metadata else ''}) "
           f"in {result['seconds']} s")
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:

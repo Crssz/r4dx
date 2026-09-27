@@ -14,6 +14,35 @@
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
 //                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64|128>"]...
 //                [--record-reuse-guard] [--reuse-tensors-from <baseline container>]
+//                [--trellis-from <oracle dir or its weights_override.json>
+//                 [--trellis-manifest-sha256 <hex>] [--trellis-verify full|none]
+//                 [--trellis-allow-basis exl3] [--trellis-prescale-log2 <int>]]
+//
+// --trellis-from (docs/trellis-kernel.md sections 2-3, trellis_import.hpp) IMPORTS the EXL3/QTIP
+// trellis bits tools/reference/trellis_quant.py wrote (a quantize-model directory or a mix
+// manifest) for every text-layer body linear -- attn.qg/k/v/o, gdn.in_proj_qkv/z/out_proj,
+// mlp.gate_up/down -- as `<base>.trellis.w` (the oracle's words, whole tiles moved into the pair
+// grid, nothing re-encoded), `.trellis.suh` and `.trellis.svh`, plus __metadata__.quant.trellis.
+// Those linears get the trellis layout ONLY, whatever --layouts says (no `.bf16.w` next to them:
+// its absence is what makes an old binary refuse the container); --layouts / --lm-head / --ldlq /
+// --w4a16-group-rule keep governing every other linear (lm_head, mtp.*, the draft head), exactly
+// as without the flag. --keep-bf16 still wins for a base it matches (its manifest entries are
+// skipped). Refused, before anything is written: a manifest whose format / version / encoding /
+// codebook is not the oracle's, complete false or missing_count > 0, a used layer in
+// stale_layers, hessian_basis other than "matched" (unless --trellis-allow-basis exl3),
+// config_sha256 other than this checkpoint's, a used tensor with K not in {4, 5}, a shape other
+// than the checkpoint's, gate K != up K, any body linear not (fully) covered, an oracle file whose
+// sha256 differs from its record, --rotate other than none, and the combination with --selftest /
+// --dflash-gguf / --reuse-tensors-from / --record-reuse-guard.
+// The container is written as <output>.partial and gets its name only once it is complete and
+// checked: --trellis-verify full (the default; `none` is accepted by debug builds only)
+// reconstructs every imported tensor from the CLOSED file's bytes on the CPU and requires
+// |rel - rel_weight_err| <= 0.02 rel_weight_err + 1e-4 (the spec's tolerance) and
+// |rel - rel_weight_err| / rel_weight_err <= 1e-4 (trellis_import.hpp kStrictRelDev) against the
+// bf16 checkpoint. The result is patched into __metadata__.r4dx_convert_run.trellis.verify (result,
+// worst, worst_tensor, checked, failed); a failure renames the file to <output>.verify-failed, and
+// a conversion that dies leaves only the .partial file -- so <output> itself only ever holds a
+// checked container.
 //
 // --reuse-tensors-from <baseline> (docs/quant2.md 5.2, reuse_guard.hpp) writes exactly the container
 // a full run with the same flags would write, but copies every tensor whose bytes cannot depend on
@@ -195,6 +224,7 @@
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
+#include "r4dx_convert/trellis_import.hpp"
 #include "r4dx_convert/w4a16_groups.hpp"
 
 namespace {
@@ -388,6 +418,13 @@ struct AppArgs {
   // and a header byte-identical to one written before these flags existed.
   std::string reuse_from;
   bool record_reuse_guard = false;
+
+  // --trellis-from and its options (docs/trellis-kernel.md 3.2; this file's header comment). Empty
+  // `trellis.from` (default) = no trellis linear, and a container byte-identical to one built
+  // before these flags existed. `trellis_options` = any --trellis-* option other than
+  // --trellis-from was given (refused without it).
+  r4dx_convert::trellis::TrellisOptions trellis;
+  bool trellis_options = false;
 };
 
 // --rotation-seed: a full u64, decimal or 0x-prefixed hex. std::stoull alone would accept "-1"
@@ -474,8 +511,73 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--w4a16-group-rule") a.w4a16_group_rules.push_back(next(i));
     else if (arg == "--reuse-tensors-from") a.reuse_from = next(i);
     else if (arg == "--record-reuse-guard") a.record_reuse_guard = true;
+    else if (arg == "--trellis-from") a.trellis.from = next(i);
+    else if (arg == "--trellis-manifest-sha256") {
+      a.trellis.manifest_sha256 = next(i);
+      std::transform(a.trellis.manifest_sha256.begin(), a.trellis.manifest_sha256.end(),
+                     a.trellis.manifest_sha256.begin(), [](char c) {
+                       return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                     });
+      if (!r4dx_convert::IsSha256Hex(a.trellis.manifest_sha256))
+        throw std::runtime_error("--trellis-manifest-sha256 must be 64 hex digits, got '" +
+                                 a.trellis.manifest_sha256 + "'");
+      a.trellis_options = true;
+    }
+    else if (arg == "--trellis-verify") {
+      a.trellis.verify = next(i);
+      if (a.trellis.verify != "full" && a.trellis.verify != "none")
+        throw std::runtime_error("--trellis-verify must be 'full' or 'none', got '" +
+                                 a.trellis.verify + "'");
+#if defined(NDEBUG)
+      // docs/trellis-kernel.md 3.3 step 10: an unverified trellis container is a debug artefact; a
+      // release converter always runs the check (it costs well under a minute on the 27B).
+      if (a.trellis.verify == "none")
+        throw std::runtime_error("--trellis-verify none exists for debug builds only "
+                                 "(docs/trellis-kernel.md 3.3 step 10): this release r4dx-convert "
+                                 "always runs the reconstruction check");
+#endif
+      a.trellis_options = true;
+    }
+    else if (arg == "--trellis-allow-basis") {
+      a.trellis.allow_basis = next(i);
+      if (a.trellis.allow_basis != "exl3")
+        throw std::runtime_error("--trellis-allow-basis accepts only 'exl3' (the matched basis "
+                                 "needs no flag), got '" + a.trellis.allow_basis + "'");
+      a.trellis_options = true;
+    }
+    else if (arg == "--trellis-prescale-log2") {
+      const std::string v = next(i);
+      size_t used = 0;
+      int s = 0;
+      try {
+        s = std::stoi(v, &used);
+      } catch (const std::exception&) {
+        used = 0;
+      }
+      // 2^s scales the f16 activations the kernel reads (docs/trellis-kernel.md 4.8): far outside
+      // +-16 every activation over- or underflows f16.
+      if (used != v.size() || s < -16 || s > 16)
+        throw std::runtime_error("--trellis-prescale-log2 must be an integer in [-16, 16], got '" +
+                                 v + "'");
+      a.trellis.prescale_log2 = s;
+      a.trellis_options = true;
+    }
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  // --trellis-from (docs/trellis-kernel.md 3.3 step 6): an import of oracle bits into the Qwen
+  // body. The selftest and the drafter have no body to import into; a reuse has nothing to reuse
+  // (an import is I/O-bound) and its guard does not cover the oracle files (refused in v1, 3.4).
+  if (a.trellis_options && a.trellis.from.empty())
+    throw std::runtime_error("--trellis-manifest-sha256 / --trellis-verify / --trellis-allow-basis "
+                             "/ --trellis-prescale-log2 need --trellis-from");
+  if (!a.trellis.from.empty() && (a.selftest || !a.dflash_gguf.empty()))
+    throw std::runtime_error("--trellis-from applies only to the HF-checkpoint conversion "
+                             "(--input/--output), not to --selftest or --dflash-gguf");
+  if (!a.trellis.from.empty() && (!a.reuse_from.empty() || a.record_reuse_guard))
+    throw std::runtime_error("--trellis-from cannot be combined with --reuse-tensors-from / "
+                             "--record-reuse-guard (docs/trellis-kernel.md 3.4: the reuse guard "
+                             "does not cover the oracle files, and an import has nothing to "
+                             "reuse)");
   // The guard describes an HF-checkpoint conversion (checkpoint files, its flags); the selftest and
   // the drafter have neither a sweep to share a baseline across nor a guard to check one against.
   if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || !a.dflash_gguf.empty()))
@@ -499,6 +601,13 @@ AppArgs ParseArgs(int argc, char** argv) {
   if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || !a.dflash_gguf.empty()))
     throw std::runtime_error("--rotate applies only to the HF-checkpoint conversion (--input/--output), "
                              "not to --selftest or --dflash-gguf");
+  // A trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with the
+  // norms removed it would be garbage, and the runtime cannot rotate per linear
+  // (docs/trellis-kernel.md 3.4). The loader refuses the combination too.
+  if (rotate_kind != r4dx_convert::RotationKind::kNone && !a.trellis.from.empty())
+    throw std::runtime_error("--trellis-from needs --rotate none (got --rotate " + a.rotate +
+                             "): the oracle quantized the unrotated weights, and a rotated "
+                             "container would feed them x Q with the norms folded away");
   if (a.quant != "rtn" && a.quant != "search")
     throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
   if (!a.imatrix.empty() && a.quant != "search")
@@ -774,7 +883,8 @@ class LdlqSource {
     if (planned_.empty()) {
       warn << "[r4dx-convert] WARNING: --ldlq '" << pattern_ << "' selected no quantized linear"
            << (skipped_ > 0 ? " (" + std::to_string(skipped_) +
-                                  " match(es) are bf16-only: --keep-bf16 or no 4-bit layout)"
+                                  " match(es) have no 4-bit layout: --keep-bf16, bf16-only or "
+                                  "trellis)"
                             : std::string())
            << " -- every linear follows --quant/--imatrix as usual\n";
       return;
@@ -782,7 +892,9 @@ class LdlqSource {
     log << "[r4dx-convert] ldlq '" << pattern_ << "': " << planned_.size()
         << " linear(s) selected, damp=" << damp_ << ", hessian-dir=" << dir_
         << " (hessian.json sha256 " << store_->ManifestSha256() << ")";
-    if (skipped_ > 0) log << "; " << skipped_ << " other match(es) are bf16-only, not LDLQ'd";
+    if (skipped_ > 0)
+      log << "; " << skipped_
+          << " other match(es) have no 4-bit layout (bf16-only or trellis), not LDLQ'd";
     log << "\n";
     if (!planned_rms_.empty())
       log << "[r4dx-convert] ldlq: " << planned_rms_.size()
@@ -1505,6 +1617,23 @@ int RunConvert(const AppArgs& args) {
                    "Hessian\n";
   }
 
+  // --trellis-from (trellis_import.hpp, docs/trellis-kernel.md 3): the manifest is read and its
+  // whole-manifest checks (format, completeness, codebook, basis, config sha, the
+  // --trellis-manifest-sha256 pin) run here, before the first shard is opened; the per-linear
+  // checks run as add_linear resolves each body linear and in the planning pass, the file hashes
+  // right after it.
+  r4dx_convert::trellis::TrellisSource trellis(args.trellis, config_text);
+  if (trellis.Enabled()) {
+    std::cout << "[r4dx-convert] trellis-from=" << trellis.ManifestPath() << " (sha256 "
+              << trellis.ManifestSha256() << ", " << (trellis.IsMix() ? "mix" : "quantize-model")
+              << " form): every text-layer body linear is imported in the trellis layout only; "
+                 "--layouts / --lm-head / --ldlq / --w4a16-group-rule govern the rest\n";
+    if (!trellis.VerifyFull())
+      std::cerr << "[r4dx-convert] WARNING: --trellis-verify none (debug build): the imported "
+                   "tensors are NOT checked against the checkpoint; the header records "
+                   "\"not run\"\n";
+  }
+
   const bool have_kv_calib = !args.kv_calib.empty();
   nlohmann::json kv_calib_json;
   if (have_kv_calib) {
@@ -1723,6 +1852,17 @@ int RunConvert(const AppArgs& args) {
     // have been" bytes are priced at the group the linear would really have had.
     requested = w4a16_groups.Apply(container_base, requested);
     const bool kept = keep_bf16.Matches(container_base);
+    // --trellis-from (docs/trellis-kernel.md 3.4): a body linear the manifest covers is written in
+    // the trellis layout ONLY, whatever --layouts says -- so it has no 4-bit layout for LDLQ or a
+    // group rule to act on, and no `.bf16.w` next to it (the old-binary guard). --keep-bf16 still
+    // wins; a kept linear's "would have been" bytes are then priced at the trellis layout it
+    // replaced.
+    bool imported = false;
+    if (trellis.Enabled() && r4dx_convert::trellis::IsBodyLinearBase(container_base)) {
+      LayoutSet tls;
+      imported = trellis.Resolve(container_base, hf_names, kept, &tls, std::cout);
+      if (tls.trellis) requested = tls;
+    }
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
     const bool use_ldlq = ldlq_matched && HasQuantizedLayout(ls);
@@ -1734,16 +1874,21 @@ int RunConvert(const AppArgs& args) {
     const bool rotated_in = fold.kind == LinearFold::kIn;
     const bool use_rms = use_ldlq && rotated_in && ldlq.HasRms(container_base);
     note_linear(container_base, ls);
-    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, hf_names,
-                          container_base, ls, requested, kept, ldlq_matched, use_ldlq, rotated_in,
-                          use_rms, fold]() {
+    plan_jobs.push_back([&writer, &model, &keep_bf16, &ldlq, &rot, &w4a16_groups, &trellis,
+                          hf_names, container_base, ls, requested, kept, ldlq_matched, use_ldlq,
+                          rotated_in, use_rms, fold, imported]() {
       int64_t N = 0, K = 0;
+      std::vector<int64_t> part_n;
       for (auto& n : hf_names) {
         const auto& m = model.Meta(n);
         N += m.shape[0];
         K = m.shape[1];
+        part_n.push_back(m.shape[0]);
       }
       rot.CheckPlan(fold, container_base, N, K, model);
+      // The manifest's [n, k] of every part against the checkpoint's (docs/trellis-kernel.md 3.3
+      // step 4).
+      if (imported) trellis.Plan(container_base, part_n, K);
       if (kept) {
         keep_bf16.Record(container_base, static_cast<int>(N), static_cast<int>(K), requested,
                          std::cout);
@@ -1762,6 +1907,14 @@ int RunConvert(const AppArgs& args) {
       r4dx_convert::PlanLinearLayouts(writer, container_base, static_cast<int>(N),
                                        static_cast<int>(K), ls);
     });
+    if (imported) {
+      // Every byte of an imported linear comes from the oracle files: the checkpoint weight is not
+      // read here (the reconstruction check reads it once the container is closed).
+      emit_jobs.push_back([&writer, &trellis, container_base, threads]() {
+        trellis.Emit(writer, container_base, threads);
+      });
+      return;
+    }
     emit_jobs.push_back([&model, &emit_linear, &rot, hf_names, container_base, ls, use_ldlq,
                          use_rms, fold, threads]() {
       std::vector<float> w;
@@ -1993,6 +2146,10 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
+  // --trellis-from: every body linear add_linear resolved is covered (or kept bf16), and no layer
+  // this run takes tensors from is stale -- before a single shard is read.
+  if (trellis.Enabled()) trellis.CheckCoverage(std::cout, std::cerr);
+
   const auto t0 = std::chrono::steady_clock::now();
 
   if (plan_jobs.size() != emit_jobs.size())
@@ -2010,6 +2167,12 @@ int RunConvert(const AppArgs& args) {
   keep_bf16.Report(std::cout, std::cerr);
   ldlq.ReportPlan(std::cout, std::cerr);
   w4a16_groups.Report(std::cout, std::cerr);
+  // --trellis-from: the oracle files' sha256 and tensor shapes (docs/trellis-kernel.md 3.3 steps
+  // 7-8), moved ahead of the header so a changed oracle directory costs no output.
+  if (trellis.Enabled()) {
+    trellis.CheckFiles(threads, std::cout);
+    trellis.ReportPlan(std::cout);
+  }
 
   // The guard's per-linear record (reuse_guard.hpp's kReuseLinearsKey): every linear's resolved
   // layout set, which a later --reuse-tensors-from of this container compares linear by linear.
@@ -2071,7 +2234,22 @@ int RunConvert(const AppArgs& args) {
         "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
     metadata["rotation"] = rot.Metadata();
   }
+  // --trellis-from: the body's summary lines say what the body now is (the four entries above
+  // describe the multi-layout body, which a trellis container does not have), and
+  // __metadata__.quant.trellis is what the loader parses (docs/trellis-kernel.md 2.3, 2.5). Only
+  // then, so every other container keeps its header byte for byte.
+  if (trellis.Enabled()) {
+    for (const char* k : {"text.layers.*.mlp.gate_up|down", "text.layers.*.attn.qg|o",
+                          "text.layers.*.attn.k|v", "text.layers.*.gdn.in_proj_z"})
+      metadata["quant_summary"].erase(k);
+    metadata["quant_summary"]
+            ["text.layers.*.attn.qg|k|v|o, gdn.in_proj_qkv|z|out_proj, mlp.gate_up|down"] =
+        "body: " + trellis.SummaryLine() +
+        " -- the trellis layout only (<base>.trellis.w|suh|svh, __metadata__.quant.trellis); "
+        "--keep-bf16 bases (r4dx_convert_run.keep_bf16_linears) bf16 only";
+  }
   metadata["quant"] = BuildQuantMetadata(w4a16_groups.GroupsJson());
+  if (trellis.Enabled()) metadata["quant"]["trellis"] = trellis.QuantMetadata();
   metadata["model_config"] = config;
   metadata["r4dx_convert_run"] = {
       {"layers_converted", layers},
@@ -2146,6 +2324,7 @@ int RunConvert(const AppArgs& args) {
         throw std::runtime_error("reuse guard: '" + needle + "' does not occur exactly once in __metadata__");
     }
   }
+  if (trellis.Enabled()) metadata["r4dx_convert_run"]["trellis"] = trellis.RunMetadata();
   if (baseline) {
     metadata["r4dx_convert_run"]["reused_from"] = {
         {"path", args.reuse_from},
@@ -2158,9 +2337,30 @@ int RunConvert(const AppArgs& args) {
         {"linears_recomputed", reuse_plan.recomputed_linears},
     };
   }
-  writer.FinalizeHeader(args.output, metadata);
+  // --trellis-from: the container is written as <output>.partial and renamed to <output> only once
+  // it is complete and checked (after the emit pass), so <output> never holds an unfinished or
+  // unchecked trellis container -- not even an earlier run's, which goes now, with a stale
+  // .verify-failed (a file another process holds open fails the run here, not after the emit
+  // pass).
+  const std::string write_path = trellis.Enabled() ? args.output + ".partial" : args.output;
+  if (trellis.Enabled()) {
+    for (const std::string& p : {args.output, write_path, args.output + ".verify-failed"}) {
+      std::error_code ec;
+      std::filesystem::remove(std::filesystem::u8path(p), ec);
+      if (ec)
+        throw std::runtime_error("--trellis-from: cannot remove the existing " + p + " (" +
+                                 ec.message() + ")");
+    }
+  }
+  writer.FinalizeHeader(write_path, metadata);
   std::cout << "[r4dx-convert] planned " << writer.PlannedTensorCount() << " tensors, "
             << writer.PlannedDataBytes() << " data bytes\n";
+  // The reconstruction check's result is patched over this placeholder once the file is closed, so
+  // it must be unambiguous (checked now, not after the emit pass).
+  if (trellis.Enabled() && trellis.VerifyFull() &&
+      writer.HeaderOccurrences(trellis.VerifyNeedle()) != 1)
+    throw std::logic_error(
+        "trellis: the verify placeholder does not occur exactly once in the header");
 
   for (size_t j = 0; j < emit_jobs.size(); ++j) {
     if (baseline && reuse_plan.copy[j]) {
@@ -2204,7 +2404,53 @@ int RunConvert(const AppArgs& args) {
               << "back in " << SecondsBetween(td, std::chrono::steady_clock::now())
               << " s); emit_complete 1\n";
   }
+  // --trellis-from: every byte on the device before the file is closed -- the check below reads it
+  // back, and the result patched into the header must never reach the disk ahead of the data.
+  if (trellis.Enabled()) writer.Sync();
   writer.Close();
+  if (trellis.Enabled()) {
+    namespace fs = std::filesystem;
+    // --trellis-verify full (docs/trellis-kernel.md 3.3 step 10): every imported tensor
+    // reconstructed from the CLOSED file's bytes against the checkpoint. The result replaces the
+    // placeholder in r4dx_convert_run.trellis.verify; a failure renames the file to
+    // <output>.verify-failed, an error inside the check leaves it as <output>.partial -- either way
+    // no loader ever picks it up under its intended name.
+    if (trellis.VerifyFull()) {
+      const auto tv = std::chrono::steady_clock::now();
+      r4dx_convert::trellis::TrellisVerifySummary vs;
+      try {
+        vs = trellis.Verify(write_path, model, threads, std::cout);
+        r4dx_convert::trellis::PatchContainerHeader(write_path, trellis.VerifyNeedle(),
+                                                    trellis.VerifyPatch(vs));
+      } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what()) + "\n(--trellis-verify full did not finish: "
+                                 "the unchecked output is left as " + write_path + ")");
+      }
+      std::cout << "[r4dx-convert] trellis verify: " << (vs.checked - vs.failed) << "/"
+                << vs.checked << " HF tensors within tolerance, worst |rel - rec| / rec "
+                << vs.worst_dev << " (" << vs.worst_name << "), in "
+                << SecondsBetween(tv, std::chrono::steady_clock::now()) << " s\n";
+      if (vs.failed > 0) {
+        const fs::path failed = fs::u8path(args.output + ".verify-failed");
+        std::error_code ec;
+        fs::rename(fs::u8path(write_path), failed, ec);
+        std::string msg = "--trellis-verify full: " + std::to_string(vs.failed) + " of " +
+                          std::to_string(vs.checked) +
+                          " imported tensor(s) do not reconstruct to the oracle's rel_weight_err; "
+                          "the output is " +
+                          (ec ? write_path + " (renaming it failed: " + ec.message() + ")"
+                              : failed.u8string()) +
+                          ":";
+        for (size_t i = 0; i < vs.failures.size() && i < 12; ++i) msg += "\n  " + vs.failures[i];
+        throw std::runtime_error(msg);
+      }
+    }
+    std::error_code ec;
+    fs::rename(fs::u8path(write_path), fs::u8path(args.output), ec);
+    if (ec)
+      throw std::runtime_error("--trellis-from: renaming the finished " + write_path + " to " +
+                               args.output + " failed: " + ec.message());
+  }
   if (baseline)
     std::cout << "[r4dx-convert] reuse: copied " << reuse_plan.tensors_copied << " tensor(s) from "
               << args.reuse_from << "; recomputed " << reuse_plan.recomputed_linears.size()

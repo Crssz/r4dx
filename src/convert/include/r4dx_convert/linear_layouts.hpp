@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "r4dx_convert/container_writer.hpp"
@@ -35,7 +36,31 @@ struct LayoutSet {
   // scale tensor (W4a16WszName) and must be listed in __metadata__.quant.w4a16.groups. Ignored
   // when `w4a16` is false.
   int w4a16_group = kW4A16Group;
+  // The trellis layout (docs/trellis-kernel.md 2; r4dx-convert --trellis-from, trellis_import.hpp):
+  // `<base>.trellis.w` / `.suh` / `.svh`, IMPORTED from an oracle directory, never quantized here.
+  // Exclusive -- a trellis linear has no other layout (3.4: no `.bf16.w` may defeat the old-binary
+  // guard). `trellis_bits` is KB (4 or 5); `trellis_parts` the N of each fused part in container
+  // row order ({17408, 17408} for mlp.gate_up; empty = one part of N). Ignored when `trellis` is
+  // false.
+  bool trellis = false;
+  int trellis_bits = 0;
+  std::vector<int64_t> trellis_parts;
 };
+
+// The trellis LayoutSet of one imported linear: that layout and nothing else.
+inline LayoutSet TrellisLayoutSet(int bits, std::vector<int64_t> parts = {}) {
+  LayoutSet ls;
+  ls.mxfp4 = ls.w4a16 = ls.w4a8 = ls.bf16 = false;
+  ls.trellis = true;
+  ls.trellis_bits = bits;
+  ls.trellis_parts = std::move(parts);
+  return ls;
+}
+
+// Number of fused parts of a trellis linear (1 when trellis_parts is empty).
+inline int64_t TrellisPartCount(const LayoutSet& ls) {
+  return ls.trellis_parts.empty() ? 1 : static_cast<int64_t>(ls.trellis_parts.size());
+}
 
 // The name of a w4a16 linear's scale tensor. At the container's default group it is the historical
 // `<base>.w4a16.wsz`; at any other group it is `<base>.w4a16.wsz.g<group>` (docs/container-format.md,
@@ -83,6 +108,11 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
     n.push_back(base + ".mxfp4.ws");
     n.push_back(base + ".mxfp4.wref");
   }
+  if (layouts.trellis) {
+    n.push_back(base + ".trellis.w");
+    n.push_back(base + ".trellis.suh");
+    n.push_back(base + ".trellis.svh");
+  }
   return n;
 }
 
@@ -92,7 +122,8 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
 // --keep-bf16 linear is "bf16", the Q3 sweep recipe's quantized linear "w4a16.g64", a v6-recipe one
 // "w4a16.g64+w4a8+mxfp4". Everything a linear's tensors depend on beyond the run-wide flags is in it:
 // its tensor names and sizes, which quantizers run (LDLQ applies iff a 4-bit layout is present), and
-// at which w4a16 group.
+// at which w4a16 group. A trellis linear is "trellis.k4" / "trellis.k5" (its parts follow from its
+// HF names, not from a flag, so they are not part of the id).
 inline std::string LayoutSetId(const LayoutSet& ls) {
   std::string s;
   auto add = [&](const std::string& t) { s += (s.empty() ? "" : "+") + t; };
@@ -100,6 +131,7 @@ inline std::string LayoutSetId(const LayoutSet& ls) {
   if (ls.w4a16) add("w4a16.g" + std::to_string(ls.w4a16_group));
   if (ls.w4a8) add("w4a8");
   if (ls.mxfp4) add("mxfp4");
+  if (ls.trellis) add("trellis.k" + std::to_string(ls.trellis_bits));
   return s.empty() ? std::string("none") : s;
 }
 
@@ -125,6 +157,9 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
         ls.w4a16 = true;
         ls.w4a16_group = std::stoi(t.substr(7));
         if (ls.w4a16_group != kW4A16Group && !IsW4A16GroupSupported(ls.w4a16_group)) return false;
+      } else if (t == "trellis.k4" || t == "trellis.k5") {
+        ls.trellis = true;
+        ls.trellis_bits = t.back() - '0';
       } else {
         return false;
       }
@@ -134,6 +169,8 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
   }
   // Canonical only: the fixed order, each layout once, no empty token, no leading zeros.
   if (LayoutSetId(ls) != id) return false;
+  // Trellis is exclusive (TrellisLayoutSet): "bf16+trellis.k4" is not a set this converter writes.
+  if (ls.trellis && (ls.bf16 || ls.w4a16 || ls.w4a8 || ls.mxfp4)) return false;
   *out = ls;
   return true;
 }
@@ -152,6 +189,11 @@ inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   if (layouts.mxfp4) {
     bytes += NK / 2 + static_cast<uint64_t>(K) / kMxfp4Group * static_cast<uint64_t>(N) +
              static_cast<uint64_t>(N);
+  }
+  if (layouts.trellis) {
+    bytes += NK * static_cast<uint64_t>(layouts.trellis_bits) / 8 +
+             static_cast<uint64_t>(TrellisPartCount(layouts)) * static_cast<uint64_t>(K) * 2 +
+             static_cast<uint64_t>(N) * 2;
   }
   return bytes;
 }
@@ -179,8 +221,42 @@ struct QuantOptions {
   const LdlqFactor* ldlq = nullptr;
 };
 
+// The trellis layout's shape rules (docs/trellis-kernel.md 2.1, 2.4, 2.5): KB in {4, 5}; K, N and
+// every part a multiple of 128 (both Hadamards and the scale vectors work in 128-blocks, and every
+// TP = 2 rank range must be 128-aligned); the parts sum to N; no other layout next to it.
+inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, const LayoutSet& ls) {
+  auto fail = [&](const std::string& why) {
+    throw std::runtime_error("r4dx_convert: trellis linear " + base + " [" + std::to_string(N) +
+                             "," + std::to_string(K) + "]: " + why);
+  };
+  if (ls.bf16 || ls.w4a16 || ls.w4a8 || ls.mxfp4)
+    fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4)");
+  if (ls.trellis_bits != 4 && ls.trellis_bits != 5)
+    fail("KB=" + std::to_string(ls.trellis_bits) + " is not a rate the kernel instantiates (4, 5)");
+  if (K % 128 != 0) fail("K is not a multiple of 128");
+  if (N % 128 != 0) fail("N is not a multiple of 128");
+  int64_t sum = 0;
+  for (int64_t p : ls.trellis_parts) {
+    if (p <= 0 || p % 128 != 0)
+      fail("part N=" + std::to_string(p) + " is not a positive multiple of 128");
+    sum += p;
+  }
+  if (!ls.trellis_parts.empty() && sum != N)
+    fail("its parts sum to " + std::to_string(sum) + ", not N");
+}
+
 inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, int N, int K,
                                const LayoutSet& layouts) {
+  if (layouts.trellis) {
+    CheckTrellisLayout(base, N, K, layouts);
+    const uint64_t NK = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
+    const int64_t P = TrellisPartCount(layouts);
+    writer.Plan(base + ".trellis.w", {static_cast<int64_t>(NK * layouts.trellis_bits / 8)},
+                NK * static_cast<uint64_t>(layouts.trellis_bits) / 8);
+    writer.Plan(base + ".trellis.suh", {P * K, 2}, static_cast<uint64_t>(P * K) * 2);
+    writer.Plan(base + ".trellis.svh", {N, 2}, static_cast<uint64_t>(N) * 2);
+    return;
+  }
   // Fail before planning a single byte rather than truncating silently in the quantizers/packers
   // later (review finding, minor -- see quant_int4.hpp's RequireDivisible).
   if (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) RequireDivisible(N, 16, "N", base.c_str());
@@ -225,6 +301,12 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
 inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
                                const std::vector<float>& w, int N, int K, const LayoutSet& layouts,
                                int nthreads, const QuantOptions& opts = QuantOptions{}) {
+  // Trellis bits are imported from an oracle directory (TrellisSource::Emit), never computed from
+  // `w`: a caller that gets here with a trellis LayoutSet lost track of which linear it holds.
+  if (layouts.trellis)
+    throw std::logic_error("EmitLinearLayouts: '" + base +
+                           "' is a trellis linear -- its tensors are imported "
+                           "(TrellisSource::Emit), not quantized");
   const LdlqFactor* ldlq = opts.ldlq;
   const bool search = (ldlq == nullptr) && (opts.mode == QuantMode::kSearch);
   // A factor for a different K would read U out of bounds (or, worse, in bounds with the wrong

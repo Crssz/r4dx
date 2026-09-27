@@ -89,6 +89,30 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_reuse COMMAND convert_reuse)
 
+# --trellis-from (docs/trellis-kernel.md sections 2-3 and 6; trellis_import.hpp): the pair grid, the
+# mul1 codebook and ring tables, the trellis LayoutSet -- always; then, on the synthetic 2-layer
+# checkpoint and oracle directories tools/reference/trellis_import_golden.py writes into
+# tools/reference/golden_out/trellis_import (gitignored): the decode and the regrid against the
+# Python references byte for byte and -- when r4dx-convert is built -- the exe in both manifest
+# forms, its metadata and reconstruction check, the non-trellis tensors against a plain conversion,
+# and every refusal. Exits 77 (SKIPPED) without the fixture. Keeps the two converted containers in trellis_import/ of this build directory
+# (tiny_k4.r4dx, tiny_mix.r4dx) for the runtime's tests: a test that loads them declares
+# FIXTURES_REQUIRED trellis_tiny. Reads src/model/model_config.h (header-only) to check them against
+# the runtime's own config parse and TP = 2 rules. CPU-only; ~60 MB under %TEMP%, removed.
+add_executable(convert_trellis_import test_trellis_import.cpp)
+target_link_libraries(convert_trellis_import PRIVATE r4dx_convert)
+target_include_directories(convert_trellis_import PRIVATE ${CMAKE_SOURCE_DIR}/src/model)
+target_compile_definitions(convert_trellis_import PRIVATE
+  R4DX_TRELLIS_TINY_DIR="${CMAKE_CURRENT_BINARY_DIR}/trellis_import")
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_trellis_import PRIVATE
+    R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_trellis_import r4dx-convert)
+endif()
+add_test(NAME convert_trellis_import COMMAND convert_trellis_import)
+set_tests_properties(convert_trellis_import PROPERTIES SKIP_RETURN_CODE 77
+  FIXTURES_SETUP trellis_tiny)
+
 add_executable(convert_kernel_decode test_kernel_decode.cpp)
 target_link_libraries(convert_kernel_decode PRIVATE r4dx_convert)
 add_test(NAME convert_kernel_decode COMMAND convert_kernel_decode)

@@ -8,9 +8,10 @@
 //   r4d_trellis_reconstruct_f16 the whole decoded Q against decode_words (goldens) and the CPU decode
 //                               (random shapes), KB = 4 and 5;
 //   r4d_gemm_trellis_nt_m64_raw one-hot A rows return rows of Q bit for bit:
-//                               - every instantiated (NP, U, MT) x NT, split and unsplit, over every k
-//                                 of a 1024 x 512 weight (even step counts) and of a 1152 x 512 one
-//                                 (9 steps: the loop, then its odd tail) (full coverage);
+//                               - every instantiated (KB, NP, U, MT) x NT (KB 4 and 5), split and
+//                                 unsplit, over every k of a 1024 x 512 weight (even step counts)
+//                                 and of a 1152 x 512 one (9 steps: the loop, then its odd tail)
+//                                 (full coverage);
 //                               - the whole legal tuning space (WV, SK, SKG, MT, NP, U, NT) on a
 //                                 K = 8192 weight, with both A parts (each with both NT values),
 //                                 rows >= M left untouched, and the tickets back at zero after every
@@ -124,15 +125,15 @@ struct Tuning {
 
 // One weight on the device plus the buffers a call needs, for M up to 64.
 struct Gemm {
-  int K, N;
+  int K, N, KB;
   std::vector<uint16_t> q;               // the CPU decode, [K][N] f16 bits
   DeviceBuffer<uint32_t> w;
   DeviceBuffer<uint16_t> a0, a1;         // [64][K] f16
   DeviceBuffer<float> c;                 // [64][N]
   DeviceBuffer<float> ws;                // [8][64][N]
   DeviceBuffer<uint32_t> tickets;        // [N/128]
-  Gemm(const std::vector<uint32_t>& grid, std::vector<uint16_t> q_, int K_, int N_)
-      : K(K_), N(N_), q(std::move(q_)), w(grid.size()), a0(static_cast<size_t>(64) * K_),
+  Gemm(const std::vector<uint32_t>& grid, std::vector<uint16_t> q_, int K_, int N_, int KB_ = 4)
+      : K(K_), N(N_), KB(KB_), q(std::move(q_)), w(grid.size()), a0(static_cast<size_t>(64) * K_),
         a1(static_cast<size_t>(64) * K_), c(static_cast<size_t>(64) * N_),
         ws(static_cast<size_t>(8) * 64 * N_), tickets(static_cast<size_t>(N_ / 128)) {
     w.CopyFromHost(grid);
@@ -140,7 +141,7 @@ struct Gemm {
   }
   void Run(const Tuning& t, int M, int n_split, bool two_parts) {
     r4d_gemm_trellis_nt_m64_raw(P(a0.data()), two_parts ? P(a1.data()) : 0, n_split, P(w.data()),
-                                P(c.data()), P(ws.data()), P(tickets.data()), M, K, N, 4, t.WV, t.SK,
+                                P(c.data()), P(ws.data()), P(tickets.data()), M, K, N, KB, t.WV, t.SK,
                                 t.MT, t.NP, t.SKG, t.U, t.NT, 0, 0);
   }
 };
@@ -292,36 +293,42 @@ void TestRawSweep(std::mt19937_64& rng) {
 //     odd tail. Every production K has an odd factor (5120 = 320 k-tiles, 6144 = 384, 17408 = 1088),
 //     so e.g. SK*SKG*U = 64 at K = 5120 gives 5 steps: this path.
 void TestRawFullCoverage(std::mt19937_64& rng) {
-  const int N = 512, KB = 4;
-  auto weight = [&](int K) {
-    std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
-    std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
-    return std::make_unique<Gemm>(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N);
-  };
-  std::unique_ptr<Gemm> even = weight(1024), odd = weight(1152);
-  int kernels = 0;
-  for (int NP : {1, 2, 4})
-    for (int U : {1, 2, 4})
-      for (int MT = 1; MT <= 4; ++MT)
-        for (int NT : {0, 1}) {
-          // Unsplit: a 128-column block (WV = 4 / NP). Split: the narrowest block of this NP (WV 1)
-          // with SKG 2, so both split kinds meet in one ticket. At K = 1024 SK is 2; at K = 1152 it
-          // makes SK*SKG*U = 8.
-          const int WV = 4 / NP;
-          const Tuning unsplit{WV, 2, MT, NP, 1, U, NT}, split{1, 2, MT, NP, 2, U, NT};
-          const Tuning odd_unsplit{WV, 8 / U, MT, NP, 1, U, NT}, odd_split{1, 4 / U, MT, NP, 2, U, NT};
-          if (Throws([&] { even->Run(unsplit, 1, N, false); })) continue;
-          R4DX_HIP_CHECK(hipDeviceSynchronize());
-          ++kernels;
-          FullCoverage(*even, unsplit, (NT + MT) % 2 == 1, N / 2, "full coverage K=1024");
-          FullCoverage(*even, split, (NT + MT) % 2 == 0, N / 2, "full coverage K=1024");
-          FullCoverage(*odd, odd_unsplit, (NT + MT) % 2 == 0, N / 2, "full coverage K=1152 (9 steps)");
-          FullCoverage(*odd, odd_split, (NT + MT) % 2 == 1, N / 2, "full coverage K=1152 (9 steps)");
-        }
-  std::printf("  full coverage N=%d, K=1024 (even step counts) and K=1152 (9 steps, odd tail): %d "
-              "instantiations x {unsplit, split}\n", N, kernels);
-  Check(kernels == 50, "full coverage: expected 50 instantiated kernels, ran " +
-                           std::to_string(kernels));
+  const int N = 512;
+  for (int KB : {4, 5}) {
+    auto weight = [&](int K) {
+      std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(K / 16) * (N / 16) * 8 * KB);
+      std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, K, N, KB);
+      return std::make_unique<Gemm>(grid, trellis_ref::DecodePairGrid(grid, K, N, KB), K, N, KB);
+    };
+    std::unique_ptr<Gemm> even = weight(1024), odd = weight(1152);
+    int kernels = 0;
+    const std::string kb = " KB=" + std::to_string(KB);
+    for (int NP : {1, 2, 4})
+      for (int U : {1, 2, 4})
+        for (int MT = 1; MT <= 4; ++MT)
+          for (int NT : {0, 1}) {
+            // Unsplit: a 128-column block (WV = 4 / NP). Split: the narrowest block of this NP (WV 1)
+            // with SKG 2, so both split kinds meet in one ticket. At K = 1024 SK is 2; at K = 1152 it
+            // makes SK*SKG*U = 8.
+            const int WV = 4 / NP;
+            const Tuning unsplit{WV, 2, MT, NP, 1, U, NT}, split{1, 2, MT, NP, 2, U, NT};
+            const Tuning odd_unsplit{WV, 8 / U, MT, NP, 1, U, NT}, odd_split{1, 4 / U, MT, NP, 2, U, NT};
+            if (Throws([&] { even->Run(unsplit, 1, N, false); })) continue;
+            R4DX_HIP_CHECK(hipDeviceSynchronize());
+            ++kernels;
+            FullCoverage(*even, unsplit, (NT + MT) % 2 == 1, N / 2, "full coverage K=1024" + kb);
+            FullCoverage(*even, split, (NT + MT) % 2 == 0, N / 2, "full coverage K=1024" + kb);
+            FullCoverage(*odd, odd_unsplit, (NT + MT) % 2 == 0, N / 2, "full coverage K=1152 (9 steps)" + kb);
+            FullCoverage(*odd, odd_split, (NT + MT) % 2 == 1, N / 2, "full coverage K=1152 (9 steps)" + kb);
+          }
+    std::printf("  full coverage KB=%d N=%d, K=1024 (even step counts) and K=1152 (9 steps, odd tail): %d "
+                "instantiations x {unsplit, split}\n", KB, N, kernels);
+    // KB = 4: every (NP, U) with NP*U <= 8 up to its MT cap, 25 x 2 NT; KB = 5 gives up one MT at
+    // (NP, U) = (2, 4): 24 x 2.
+    const int want = KB == 4 ? 50 : 48;
+    Check(kernels == want, "full coverage KB " + std::to_string(KB) + ": expected " + std::to_string(want) +
+                               " instantiated kernels, ran " + std::to_string(kernels));
+  }
 }
 
 // On dense random A at a production shape (K = 5120: 320 k-tiles, so SK*SKG*U = 64 runs 5 steps,
@@ -424,7 +431,9 @@ void TestPreconditions() {
   Check(Throws([&] { call(65, K, N, N, 4, 4, 2, 1, 1, 1, 2, 16); }), "M = 65 accepted");
   Check(Throws([&] { call(1, 1000, N, N, 4, 4, 2, 1, 1, 1, 2, 16); }), "K % 128 accepted");
   Check(Throws([&] { call(1, K, 500, 500, 4, 4, 2, 1, 1, 1, 2, 16); }), "N % 128 accepted");
-  Check(Throws([&] { call(1, K, N, N, 5, 4, 2, 1, 1, 1, 2, 16); }), "KB = 5 accepted (not instantiated)");
+  Check(Throws([&] { call(1, K, N, N, 3, 4, 2, 1, 1, 1, 2, 16); }), "KB = 3 accepted (not instantiated)");
+  Check(Throws([&] { call(1, K, N, N, 6, 4, 2, 1, 1, 1, 2, 16); }), "KB = 6 accepted (not instantiated)");
+  Check(Throws([&] { call(1, K, N, N, 5, 1, 2, 3, 2, 1, 4, 16); }), "(KB 5, NP 2, U 4, MT 3) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 1, 4, 1, 4, 16); }), "NP*U = 16 accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 1, 2, 2, 4, 1, 2, 16); }), "(NP 4, U 2, MT 2) accepted");
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 4, 1, 1, 16); }), "Wc = 512 accepted");
@@ -439,8 +448,9 @@ void TestPreconditions() {
   Check(Throws([&] { call(1, K, N, N, 4, 4, 2, 1, 1, 3, 2, 16); }), "SKG = 3 accepted");
   Check(Throws([&] { r4d_trellis_reconstruct_f16(16, 16, 1024, 48, 4, 0); }), "reconstruct N % 32 accepted");
   Check(Throws([&] { r4d_trellis_reconstruct_f16(16, 16, 1024, 64, 3, 0); }), "reconstruct KB = 3 accepted");
-  Check(r4d_gemm_trellis_nt_m64_has_rate(4) == 1 && r4d_gemm_trellis_nt_m64_has_rate(5) == 0,
-        "has_rate: 4 yes, 5 not yet");
+  Check(r4d_gemm_trellis_nt_m64_has_rate(4) == 1 && r4d_gemm_trellis_nt_m64_has_rate(5) == 1 &&
+            r4d_gemm_trellis_nt_m64_has_rate(3) == 0,
+        "has_rate: 4 and 5 yes, 3 no");
   Check(r4d_gemm_trellis_nt_m64_max_m() == 64, "max_m 64");
   Check(r4d_gemm_trellis_nt_m64_ws_bytes(16, 5120, 8) == static_cast<size_t>(8) * 16 * 5120 * 4,
         "ws_bytes = SKG*M*N*4");

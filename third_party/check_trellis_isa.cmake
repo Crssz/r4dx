@@ -6,7 +6,7 @@
 #
 # Reads a device-only -S listing and fails the build unless
 #
-#   - every r4d_gemm_trellis_nt_m64_raw_kernel and r4d_trellis_reconstruct_f16_kernel instantiation
+#   - every r4d_gemm_trellis_nt_m64_kernel and r4d_trellis_reconstruct_f16_kernel instantiation
 #     has .vgpr_count <= 190 (8 waves per SIMD on gfx1201, docs/r9700.md C14), no scratch
 #     (.private_segment_fixed_size 0) and no VGPR/SGPR spills (code-object metadata). The
 #     instantiated (NP, U, MT) set is the kernel's own r4d_tq_max_mt table; a compiler that allocates
@@ -18,8 +18,10 @@
 #     s_delay_alu in front of a VALU that reads a recent VALU result only when it generated the
 #     producer itself; behind inline asm it cannot, and the consumer then stalls the SIMD's VALU for
 #     every wave on it. The first M1 kernel (one asm per hash) had 14-275 of them per K loop and
-#     decoded at ~0.52 VALU per clock; r4d_trellis_k4_decode is one asm block whose dependencies are
-#     all >= 8 VALU apart and which ends in an s_delay_alu, so the count must be 0. Only the asm
+#     decoded at ~0.52 VALU per clock; r4d_trellis_k4_decode and r4d_trellis_k5_decode are one asm
+#     block each whose dependencies are all >= 4 VALU apart (>= 8 but for KB = 5's first extracts)
+#     and which end in an s_delay_alu, so the count must be 0. Every GEMM instantiation (KB 4 and
+#     5; the raw and the full entry are one kernel) is checked. Only the asm
 #     blocks and the 3 VALU after each are parsed (a near dependency on an asm producer can only be
 #     there), and the check fails if it finds no asm VALU at all, so it cannot pass vacuously.
 #
@@ -66,7 +68,7 @@ set(asm_valu 0)
 set(near 0)
 set(near_msgs "")
 foreach(line IN LISTS lines)
-  if(line MATCHES "^(_Z[0-9A-Za-z_]*r4d_gemm_trellis_nt_m64_raw_kernel[0-9A-Za-z_]*):")
+  if(line MATCHES "^(_Z[0-9A-Za-z_]*r4d_gemm_trellis_nt_m64_kernel[0-9A-Za-z_]*):")
     set(fn "${CMAKE_MATCH_1}")
     set(in_asm OFF)
     set(tail 0)
@@ -171,7 +173,7 @@ set(failures "")
 foreach(line IN LISTS lines)
   if(line MATCHES "^[ \t-]*\\.name:[ \t]+([^ \t]+)")
     set(name "${CMAKE_MATCH_1}")
-    if(NOT name MATCHES "r4d_gemm_trellis_nt_m64_raw_kernel|r4d_trellis_reconstruct_f16_kernel")
+    if(NOT name MATCHES "r4d_gemm_trellis_nt_m64_kernel|r4d_trellis_reconstruct_f16_kernel")
       set(name "")
     else()
       math(EXPR count "${count} + 1")
@@ -214,8 +216,8 @@ if(near GREATER 0)
   string(REPLACE ";" "\n  " msg "${near_msgs}")
   message(FATAL_ERROR "check_trellis_isa: ${ISA}: ${near} VALU instructions read an inline-asm VALU "
                       "result 1-3 VALU later with no s_delay_alu between (they stall the SIMD), e.g.\n"
-                      "  ${msg}\n(keep r4d_trellis_k4_decode's dependencies >= 4 VALU apart inside "
-                      "the block and its trailing s_delay_alu)")
+                      "  ${msg}\n(keep r4d_trellis_k4_decode's / r4d_trellis_k5_decode's dependencies "
+                      ">= 4 VALU apart inside the block and its trailing s_delay_alu)")
 endif()
 message(STATUS "check_trellis_isa: ${count} trellis kernels OK (max ${worst} VGPRs <= ${max_vgpr}, "
                "no scratch, no spills); ${asm_valu} asm VALU in the GEMM kernels, 0 near "

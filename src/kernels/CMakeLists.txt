@@ -1,7 +1,8 @@
 # src/kernels: r4dx-owned HIP kernels (rmsnorm, residual add, rope, silu_mul, fp8 activation
 # quant, kv cache paging writes -- docs/architecture.md "Own kernels"; the tensor-parallel
 # all-reduce -- docs/tp.md 6.3.1, the second hipcc object below; the quant2 residual rotation --
-# docs/quant2.md sections 3-4, the third), plus the host-only
+# docs/quant2.md sections 3-4, the third; the trellis input transform -- docs/trellis-kernel.md
+# 4.8, the fourth), plus the host-only
 # embedding-gather and CPU-sampler headers (no device code, so no hipcc step for those).
 #
 # The kernels themselves are real __global__ device code, so -- like third_party/libr4d's
@@ -82,6 +83,28 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_ROTATE_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
+# ---- trellis input transform (docs/trellis-kernel.md 4.8) ----------------------------------------
+# trellis_transform.hip: r4dx_trellis_input_bf16 (x * suh -> FWHT-128 -> f16, the A of libr4d's
+# r4d_gemm_trellis_nt_m64) and its FWHT diagnostic (declared in kernels.h). Same flags as
+# r4dx_kernels.hip (WGP mode; -ffp-contract=off keeps x * suh a separate rounding ahead of the first
+# butterfly). The butterfly is libr4d's r4d_fwht128.h (found through the libr4d -I above), shared
+# with the GEMM's output transform; hadamard_device.h's FwhtLds is the diagnostic's other side.
+set(R4DX_TRELLIS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/trellis_transform.hip")
+set(R4DX_TRELLIS_OBJ "${R4DX_KERNELS_OBJ_DIR}/trellis_transform.obj")
+add_custom_command(
+  OUTPUT "${R4DX_TRELLIS_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_TRELLIS_SRC}" -o "${R4DX_TRELLIS_OBJ}"
+  DEPENDS "${R4DX_TRELLIS_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_fwht128.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) trellis_transform.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_TRELLIS_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
 # ---- second hipcc object: the tensor-parallel all-reduce (docs/tp.md 6.3.1) ----------------------
 # r4dx_tp_kernels.hip is a port of tools/tp_bench's flag(drain 3, acq 0) kernel. It is built with
 # EXACTLY r4dx_kernels.hip's flags -- WGP mode, never -mcumode: the drain-3 correctness argument
@@ -134,7 +157,8 @@ add_custom_command(
 )
 add_custom_target(r4dx_tp_kernels_isa ALL DEPENDS "${R4DX_TP_KERNELS_ISA_STAMP}")
 
-add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}" "${R4DX_ROTATE_OBJ}")
+add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}" "${R4DX_ROTATE_OBJ}"
+            "${R4DX_TRELLIS_OBJ}")
 set_target_properties(r4dx_kernels PROPERTIES LINKER_LANGUAGE CXX)
 add_dependencies(r4dx_kernels r4dx_tp_kernels_isa)
 target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

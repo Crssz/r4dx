@@ -1,7 +1,8 @@
-// tests/kernels/tool_trellis_gemm_bench.cpp -- trellis weights, milestone M1's measurements
-// (docs/trellis-kernel.md 4.6, 6 "Benches", 7 M1). HIP device 1 only; prints a summary and writes
-// every number to the JSON file named by --out. Four modes (the fifth, the in-model clock probe, is
-// an r4dx debug hook and not part of this tool; its median SCLK comes back in as --in-model-sclk):
+// tests/kernels/tool_trellis_gemm_bench.cpp -- trellis weights, milestone M1's and M2's measurements
+// (docs/trellis-kernel.md 4.6, 6 "Benches", 7 M1/M2). HIP device 1 only; prints a summary and writes
+// every number to the JSON file named by --out. M1's four modes (the fifth, the in-model clock
+// probe, is an r4dx debug hook and not part of this tool; its median SCLK comes back in as
+// --in-model-sclk) and M2's full-linear replay:
 //
 //   replay   One decode step's 336 body GEMMs (the 400 HF linears, gate/up fused) in layer order,
 //            at full size with random weights: trellis KB = 4 through r4d_gemm_trellis_nt_m64_raw
@@ -49,10 +50,40 @@
 //   prefill  M = 64 on mlp.gate_up and mlp.down: trellis at (MT, NP) in {(4,1), (2,2), (4,2)}, U = 1,
 //            best of WV / SK / SKG, against w4a16 at production's M = 64 tuning (and, with --sweep, a
 //            tuned one), per w4a16 group.
+//   full     Milestone M2 (docs/trellis-kernel.md 7 M2, 4.6 point 3, 10.1): the FULL linear chain of
+//            one decode step, at M = 1 and M = 8, in one process and rotating chain by chain:
+//              T_raw   the 336 raw GEMMs (M1's basis for S),
+//              T_full  per linear r4dx_trellis_input_bf16 (x * suh -> FWHT-128 -> f16; gate_up's two
+//                      parts in one call) and r4d_gemm_trellis_nt_m64 with its FWHT/svh/bf16 epilogue,
+//              B_gemm  production w4a16 GEMMs (M1's baseline),
+//              B_full  what q2ab_hv2_q3 runs around them: the bf16 -> f16 cast of every w4a16 linear
+//                      (not the bf16 k/v), the 48 GDN in-place Hadamards (block 128 on out_core) and
+//                      the 2 residual rotations, plus the GEMMs,
+//            and the components alone (transforms, full GEMMs, q2ab's extras). Per rep:
+//              S = B_gemm - T_raw,  X = (T_full - T_raw) - (B_full - B_gemm),  X - S = T_full - B_full;
+//            the M2 gate is X <= 0.30 ms (the design target; 10.1 relaxes the hard cap to ~1.3 ms) and
+//            X - S <= 0.14 ms. Also the per-key cost of the transform and the epilogue (flushed), the
+//            probe clock of both full chains, and (info, outside X: v1 runs the plain kernel where
+//            q2ab runs its Hadamard form) q2ab's silu_mul Hadamard and attention gate-mul Hadamard
+//            over the plain ones.
+//            Trellis tuning, per (N, K, KB) -- one row serves k and v, and gdn.out_proj and attn.o --:
+//            --tuning-file (a JSON of tunings, or `table` for tests/kernels/gemm_tuning_table_trellis.inc
+//            as built), else --joint's pick, else 4.4's fallback.
+//            --joint picks each key's tuning for M = 1 and M = 8 TOGETHER (row identity gives both one
+//            tuning): the legal space under 10.1's rules (NT 1, MT 1, SKG <= 4, >= 2 waves per SIMD)
+//            is screened per key on flushed chains of all its instances by t(M=1) + t(M=8), and the
+//            best four per key are then compared on the WHOLE full-linear step chain (paired, both M),
+//            one key at a time. --tunings-out writes the result as JSON, --inc-out as the table
+//            include (every key of this run, plus any --tuning-file key this run did not have).
+//   --kb 4 | mix   the trellis rate: KB = 4 everywhere, or EXL3's 4.5 bpw allocation (KB = 5 on
+//            layers 0-15 and 48-63, KB = 4 on 16-47; --kb-manifest <mix4.5m weights_override.json>
+//            reads the exact per-tensor K instead and checks gate K == up K).
 //
 //   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_trellis_gemm_bench.exe `
-//       --out <json> [--modes replay,ops,split,prefill] [--reps 10] [--layers 64] [--sweep]
-//       [--in-model-sclk <MHz>] [--alu-fraction <0..1>]
+//       --out <json> [--modes replay,ops,split,prefill,full] [--reps 10] [--layers 64] [--sweep]
+//       [--in-model-sclk <MHz>] [--alu-fraction <0..1>] [--kb 4|mix] [--kb-manifest <json>]
+//       [--tuning-file <json>|table]... [--joint] [--joint-all] [--tunings-out <json>]
+//       [--inc-out <path>]
 //
 // TIMING is GPU-side: one-thread kernels write wall_clock64() before and after the launches (Timer
 // below; hip events proved unreliable for short intervals on this stack). The REALTIME counter's
@@ -75,15 +106,22 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "kernels/model_kernels.h"   // r4dx_model_cast_bf16_to_f16: production's w4a16 cast
 #include "linear.h"   // r4dx::model::PickTuning: production's w4a16 / bf16 dispatch
 #include "nlohmann/json.hpp"
 #include "r4d.h"
 #include "r4dx/core/error.hpp"
+#include "r4dx/kernels/kernels.h"           // r4dx_trellis_input_bf16, the silu_mul pair
+#include "r4dx/kernels/rotate_residual.h"   // q2ab's residual rotation and GDN Hadamard
+#include "r4dx/model/attention/attn_kernels.h"   // the attention gate-mul pair (info)
+#include "trellis_tuning_rows.hpp"          // tests/kernels/gemm_tuning_table_trellis.inc, as built
 
 extern "C" {
 void r4dx_tq_bench_fill_u32(int64_t p, int64_t n, uint32_t seed, uint32_t and_mask, uint32_t or_mask,
@@ -131,6 +169,15 @@ struct Args {
   double in_model_sclk = 0.0;   // MHz; 0 = not given, the gate is provisional
   double alu_fraction = 1.0;    // the share of trellis GEMM time that scales with 1 / SCLK
   double warmup_s = 0.3;
+  // M2 (mode full)
+  std::string kb = "4";                     // "4" or "mix"
+  std::string kb_manifest;                  // mix: the exact per-tensor K
+  std::vector<std::string> tuning_files;    // JSON tuning sets, or "table"
+  bool joint = false;                       // pick the keys without a --tuning-file tuning
+  bool joint_all = false;                   // ... and re-pick those too
+  int joint_top = 4;                        // candidates per key taken to the whole-chain stage
+  int joint_reps = 6;                       // paired whole-chain reps per comparison
+  std::string tunings_out, inc_out;
 };
 
 double Quantile(std::vector<double> v, double q) {
@@ -236,6 +283,41 @@ int ProductionGroup(const Shape& s, int layer) {
   return 64;
 }
 
+// The per-tensor K of a trellis_quant.py weights_override.json (the mix4.5m manifest), keyed by
+// (layer, shape); gate and up must agree (they are one fused linear). nlohmann reads the manifest's
+// 'K' and 'k' keys as the distinct keys they are.
+std::map<std::pair<int, const Shape*>, int> ReadKbManifest(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot read --kb-manifest " + path);
+  const json d = json::parse(f);
+  const std::pair<const char*, const Shape*> mods[] = {
+      {"linear_attn.in_proj_qkv", &kQkv}, {"linear_attn.in_proj_z", &kZ}, {"linear_attn.out_proj", &kOutProj},
+      {"self_attn.q_proj", &kQg},         {"self_attn.k_proj", &kAttnK},  {"self_attn.v_proj", &kAttnV},
+      {"self_attn.o_proj", &kAttnO},      {"mlp.gate_proj", &kGateUp},    {"mlp.up_proj", &kGateUp},
+      {"mlp.down_proj", &kDown}};
+  std::map<std::pair<int, const Shape*>, int> out;
+  for (auto& kv : d.at("tensors").items()) {
+    const std::string& name = kv.key();
+    const size_t lp = name.find("layers.");
+    if (lp == std::string::npos) continue;
+    const int layer = std::stoi(name.substr(lp + 7));
+    const size_t dot = name.find('.', lp + 7);
+    const std::string mod = name.substr(dot + 1, name.rfind(".weight") - dot - 1);
+    const Shape* s = nullptr;
+    for (auto& m : mods)
+      if (mod == m.first) s = m.second;
+    if (!s) throw std::runtime_error("--kb-manifest: unknown module " + name);
+    const double K = kv.value().at("K").get<double>();
+    if (K != 4.0 && K != 5.0) throw std::runtime_error("--kb-manifest: " + name + " has K " + std::to_string(K));
+    const int kb = static_cast<int>(K);
+    auto it = out.find({layer, s});
+    if (it != out.end() && it->second != kb)
+      throw std::runtime_error("--kb-manifest: gate K != up K in layer " + std::to_string(layer));
+    out[{layer, s}] = kb;
+  }
+  return out;
+}
+
 // Whether production's PickTuning (TP = 1) serves this linear from a measured row of its table,
 // mirroring linear.cpp's BestRow (a chunk of M <= 16 rows resolves through the M = 1 band; a w4a16
 // row serves only its own group, 0 meaning the build default, and only if K splits into whole
@@ -262,12 +344,18 @@ struct Linear {
   int layer;
   const Shape* s;
   int group;                  // w4a16 group, 0 = bf16
-  uint32_t* tw = nullptr;     // trellis pair-grid words, N*K/2 bytes
+  int kb = 4;                 // trellis bits per weight
+  uint32_t* tw = nullptr;     // trellis pair-grid words, N*K*kb/8 bytes
   uint32_t* tickets = nullptr;
+  float* suh = nullptr;       // trellis input scales, fp32 [parts][K]
+  float* svh = nullptr;       // trellis output scales, fp32 [N]
   uint8_t* wq = nullptr;      // w4a16 packed weight
   uint32_t* wsz = nullptr;    // w4a16 (scale, zero) dwords
   uint16_t* wbf = nullptr;    // bf16 weight
-  size_t TrellisBytes() const { return static_cast<size_t>(s->N) * s->K / 2; }
+  int Parts() const { return s == &kGateUp ? 2 : 1; }   // mlp.gate_up: gate and up
+  size_t TrellisBytes() const { return static_cast<size_t>(s->N) * s->K / 8 * kb; }
+  // What a container stores besides the words: fp16 suh [parts][K] and svh [N].
+  size_t TrellisScaleBytes() const { return static_cast<size_t>(Parts()) * s->K * 2 + static_cast<size_t>(s->N) * 2; }
   size_t BaselineBytes() const {
     if (group == 0) return static_cast<size_t>(s->N) * s->K * 2;
     return static_cast<size_t>(s->N) * s->K / 2 + static_cast<size_t>(s->N) * (s->K / group) * 4;
@@ -288,11 +376,29 @@ struct TTune {
     return json{{"WV", WV}, {"SK", SK}, {"MT", MT}, {"NP", NP}, {"SKG", SKG}, {"U", U}, {"NT", NT},
                 {"Wc", Wc()}};
   }
+  std::string Str() const {
+    char b[96];
+    std::snprintf(b, sizeof b, "WV%d NP%d SK%d SKG%d U%d MT%d NT%d", WV, NP, SK, SKG, U, MT, NT);
+    return b;
+  }
+  bool operator==(const TTune& o) const {
+    return WV == o.WV && SK == o.SK && MT == o.MT && NP == o.NP && SKG == o.SKG && U == o.U && NT == o.NT;
+  }
 };
 
+// A trellis tuning key: the table has one row per (N, K, KB), so attn.k and attn.v share a tuning,
+// and so do gdn.out_proj and attn.o.
+using TKey = std::tuple<int, int, int>;
+TKey KeyOf(const Linear& l) { return TKey{l.s->N, l.s->K, l.kb}; }
+std::string KeyName(const TKey& k) {
+  return std::to_string(std::get<0>(k)) + "x" + std::to_string(std::get<1>(k)) + " KB" +
+         std::to_string(std::get<2>(k));
+}
+
 // docs/trellis-kernel.md 4.4's fallback: M <= 16 -> WV 4, NP 1, SK 2, MT 1, U 2, NT 1, SKG =
-// clamp(128 / (N/128), 1, 8) rounded down to a power of two and reduced until it divides the K
-// tiles; M > 16 -> SKG 1, MT min(4, ceil(M/16)), NT 0.
+// clamp(128 / (N/128), 1, 4) rounded down to a power of two and reduced until it divides the K
+// tiles; M > 16 -> SKG 1, MT min(4, ceil(M/16)), NT 0. (M1's replay ran the first revision's cap
+// of 8, which differs only on attn.k/v: SKG 8 there; 10.1 dropped it.)
 TTune FallbackTuning(int N, int K, int M) {
   TTune t{4, 2, 1, 1, 1, 2, 1};
   if (M > 16) {
@@ -300,7 +406,7 @@ TTune FallbackTuning(int N, int K, int M) {
     t.NT = 0;
     return t;
   }
-  int skg = std::max(1, std::min(8, 128 / (N / 128)));
+  int skg = std::max(1, std::min(4, 128 / (N / 128)));
   int p = 1;
   while (p * 2 <= skg) p *= 2;
   skg = p;
@@ -358,6 +464,27 @@ class Bench {
     ws_bytes_ = r4d_gemm_trellis_nt_m64_ws_bytes(64, 34816, 8);
     ws_ = small_->Take<float>(ws_bytes_);
     clk_ = small_->Take<unsigned long long>(4096 * 4 * 8);
+    // q2ab's extras (mode full): the residual rotation's signs and mix, the GDN Hadamard's signs,
+    // their activations, and the silu_mul and attention gate-mul pairs' (the gate-mul reads out_core_
+    // as attn_out and had_signs_ as attn.o's signs).
+    rot_signs_ = small_->Take<float>(5120 * 4);
+    rot_mix5_ = small_->Take<float>(25 * 4);
+    had_signs_ = small_->Take<float>(6144 * 4);
+    resid_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 5120 * 2);
+    out_core_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 6144 * 2);
+    gate_in_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 6144 * 2);
+    gated_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 6144 * 2);
+    Fill(gate_in_, static_cast<size_t>(64) * 6144 / 2, 38, 0x807F807Fu, 0x3F003F00u);
+    silu_in_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 34816 * 2);
+    silu_out_ = small_->Take<uint16_t>(static_cast<size_t>(64) * 17408 * 2);
+    silu_signs_ = small_->Take<float>(17408 * 4);
+    Fill(silu_signs_, 17408, 37, 0x80000000u, 0x3F800000u);
+    Fill(rot_signs_, 5120, 31, 0x80000000u, 0x3F800000u);    // +-1
+    Fill(had_signs_, 6144, 32, 0x80000000u, 0x3F800000u);
+    Fill(rot_mix5_, 25, 33, 0x807FFFFFu, 0x3E000000u);       // +-[0.125, 0.25)
+    Fill(resid_, static_cast<size_t>(64) * 5120 / 2, 34, 0x807F807Fu, 0x3C003C00u);
+    Fill(out_core_, static_cast<size_t>(64) * 6144 / 2, 35, 0x807F807Fu, 0x3C003C00u);
+    Fill(silu_in_, static_cast<size_t>(64) * 34816 / 2, 36, 0x807F807Fu, 0x3F003F00u);
     flush_ = std::make_unique<Blob>(kFlushBytes);
     Fill(flush_->base, kFlushBytes / 4, 7, ~0u, 0u);
     R4DX_HIP_CHECK(hipStreamSynchronize(st_));
@@ -432,9 +559,24 @@ class Bench {
       order.push_back(&kDown);
       for (const Shape* s : order) linears_.push_back(Linear{L, s, ProductionGroup(*s, L)});
     }
-    size_t tb = 0, wb = 0, tk = 0;
+    // The trellis rate per linear: 4 everywhere, or the 4.5 bpw mix.
+    std::map<std::pair<int, const Shape*>, int> manifest_kb;
+    if (args_.kb == "mix" && !args_.kb_manifest.empty()) manifest_kb = ReadKbManifest(args_.kb_manifest);
+    for (Linear& l : linears_) {
+      if (args_.kb != "mix") continue;
+      if (manifest_kb.empty()) {
+        l.kb = (l.layer < 16 || l.layer >= 48) ? 5 : 4;   // EXL3's 4.5 allocation (mix4.5m)
+      } else {
+        auto it = manifest_kb.find({l.layer, l.s});
+        if (it == manifest_kb.end())
+          throw std::runtime_error("--kb-manifest has no K for layer " + std::to_string(l.layer) + " " + l.s->cls);
+        l.kb = it->second;
+      }
+    }
+    size_t tb = 0, wb = 0, tk = 0, sb = 0;
     for (const Linear& l : linears_) {
       tb += Round256(l.TrellisBytes());
+      sb += Round256(static_cast<size_t>(l.Parts()) * l.s->K * 4) + Round256(static_cast<size_t>(l.s->N) * 4);
       tk += Round256(static_cast<size_t>(l.s->N / 128) * 4);
       if (l.group == 0) wb += Round256(l.BaselineBytes());
       else wb += Round256(static_cast<size_t>(l.s->N) * l.s->K / 2) +
@@ -446,16 +588,22 @@ class Bench {
                 "%.2f of %.2f GiB free)\n",
                 tb / 1073741824.0, wb / 1073741824.0, linears_.size(), args_.layers, free_b / 1073741824.0,
                 total_b / 1073741824.0);
-    if (tb + wb + tk + (256ull << 20) > free_b)
+    if (tb + wb + tk + sb + (256ull << 20) > free_b)
       throw std::runtime_error("not enough free device memory for both formats; use --layers N");
     trellis_ = std::make_unique<Blob>(tb);
     base_ = std::make_unique<Blob>(wb);
     tick_ = std::make_unique<Blob>(tk);
+    scales_ = std::make_unique<Blob>(sb);
     uint32_t seed = 1;
     for (Linear& l : linears_) {
       l.tw = trellis_->Take<uint32_t>(l.TrellisBytes());
       Fill(l.tw, l.TrellisBytes() / 4, seed++, ~0u, 0u);
       l.tickets = tick_->Take<uint32_t>(static_cast<size_t>(l.s->N / 128) * 4);
+      // suh ~ +-[2^-7, 2^-6), svh ~ +-[1, 2): the oracle's orders of magnitude.
+      l.suh = scales_->Take<float>(static_cast<size_t>(l.Parts()) * l.s->K * 4);
+      l.svh = scales_->Take<float>(static_cast<size_t>(l.s->N) * 4);
+      Fill(l.suh, static_cast<size_t>(l.Parts()) * l.s->K, seed++, 0x807FFFFFu, 0x3C000000u);
+      Fill(l.svh, static_cast<size_t>(l.s->N), seed++, 0x807FFFFFu, 0x3F800000u);
       if (l.group == 0) {
         l.wbf = base_->Take<uint16_t>(l.BaselineBytes());
         Fill(l.wbf, l.BaselineBytes() / 4, seed++, 0x807F807Fu, 0x3C003C00u);
@@ -473,6 +621,11 @@ class Bench {
       const ClassKey k{l.s, l.group};
       if (classes_.find(k) == classes_.end()) class_order_.push_back(k);
       classes_[k].push_back(&l);
+      const TKey tk2 = KeyOf(l);
+      if (keys_.find(tk2) == keys_.end()) key_order_.push_back(tk2);
+      keys_[tk2].push_back(&l);
+      std::string& names = key_classes_[tk2];
+      if (names.find(l.s->cls) == std::string::npos) names += (names.empty() ? "" : ", ") + std::string(l.s->cls);
     }
     R4DX_HIP_CHECK(hipMemsetAsync(tick_->base, 0, tick_->size, st_));
     R4DX_HIP_CHECK(hipStreamSynchronize(st_));
@@ -484,7 +637,39 @@ class Bench {
     const bool two = l.s == &kGateUp;
     r4d_gemm_trellis_nt_m64_raw(P(a_f16_.at(l.s->K)), two ? P(a_f16b_.at(l.s->K)) : 0,
                                 two ? l.s->N / 2 : l.s->N, P(l.tw), P(c_f32_), P(ws_), P(l.tickets), M,
-                                l.s->K, l.s->N, 4, t.WV, t.SK, t.MT, t.NP, t.SKG, t.U, t.NT, P(clk), P(st_));
+                                l.s->K, l.s->N, l.kb, t.WV, t.SK, t.MT, t.NP, t.SKG, t.U, t.NT, P(clk),
+                                P(st_));
+  }
+  // M2: the linear's GEMM with its output transform (bf16 C), prescale 0.
+  void LaunchTrellisFull(const Linear& l, int M, const TTune& t) {
+    const bool two = l.s == &kGateUp;
+    r4d_gemm_trellis_nt_m64(P(a_f16_.at(l.s->K)), two ? P(a_f16b_.at(l.s->K)) : 0,
+                            two ? l.s->N / 2 : l.s->N, P(l.tw), P(l.svh), P(c_bf16_), P(ws_), P(l.tickets),
+                            M, l.s->K, l.s->N, l.kb, t.WV, t.SK, t.MT, t.NP, t.SKG, t.U, t.NT, kOutScale,
+                            P(st_));
+  }
+  // M2: the linear's input transform (v1: every linear transforms its own input; gate_up's two
+  // parts in one call), into the A buffers the GEMM reads.
+  void LaunchTransform(const Linear& l, int M) {
+    const int K = l.s->K;
+    const int64_t suh[2] = {P(l.suh), P(l.suh + K)};
+    const int64_t out[2] = {P(a_f16_.at(K)), P(a_f16b_.at(K))};
+    r4dx_trellis_input_bf16(P(a_bf16_.at(K)), M, K, l.Parts(), suh, out, 0, P(st_));
+  }
+  // q2ab's activation cast in front of a w4a16 linear (ApplyLinear's r4dx_model_cast_bf16_to_f16;
+  // the bf16 k/v take none).
+  void LaunchCast(const Linear& l, int M) {
+    if (l.group == 0) return;
+    r4dx_model_cast_bf16_to_f16(P(a_bf16_.at(l.s->K)), P(a_f16_.at(l.s->K)), static_cast<int64_t>(M) * l.s->K,
+                                P(st_));
+  }
+  // q2ab's other online rotations: the GDN in-place Hadamard on out_proj's input (block 128,
+  // gdn_layer.cpp) and the residual rotations at the stack's entry and exit (model.cpp).
+  void LaunchGdnHadamard(int M) {
+    r4dx_hadamard_inplace_bf16(P(out_core_), M, 6144, P(had_signs_), 128, P(st_));
+  }
+  void LaunchRotation(int M, bool inverse) {
+    r4dx_rotate_residual_bf16(P(resid_), M, 5120, P(rot_signs_), P(rot_mix5_), inverse ? 1 : 0, P(st_));
   }
   // Production's tuning for a linear (linear.cpp ApplyLinear's PickTuning).
   static LinearTuning ProductionTuning(const Linear& l, int M) {
@@ -933,6 +1118,496 @@ class Bench {
     return best;
   }
 
+  // ---- full linear (M2) ------------------------------------------------------------------------
+  using KeyTunes = std::map<TKey, TTune>;
+  enum class TChain { kRaw, kFull, kGemm, kXform };
+  enum class BChain { kGemm, kFull, kExtras };
+
+  std::vector<const Linear*> All() const {
+    std::vector<const Linear*> v;
+    for (const Linear& l : linears_) v.push_back(&l);
+    return v;
+  }
+
+  static TTune TuneFromJson(const json& j) {
+    return TTune{j.at("WV").get<int>(), j.at("SK").get<int>(), j.value("MT", 1), j.at("NP").get<int>(),
+                 j.at("SKG").get<int>(), j.at("U").get<int>(), j.value("NT", 1)};
+  }
+
+  // --tuning-file: JSON as --tunings-out writes it ({"tunings": [{N, K, KB, WV, ...}]}), or "table"
+  // for the M = 1 rows of tests/kernels/gemm_tuning_table_trellis.inc as this binary was built.
+  KeyTunes LoadTunings() const {
+    KeyTunes out;
+    for (const std::string& f : args_.tuning_files) {
+      if (f == "table") {
+        for (const trellis_rows::GemmTuningRow& row : trellis_rows::kGemmTuningTable) {
+          if (row.layout != trellis_rows::Layout::kTrellis || row.M != 1) continue;
+          const trellis_rows::LinearTuning& t = row.tuning;
+          out[TKey{static_cast<int>(row.N), static_cast<int>(row.K), row.rate}] =
+              TTune{t.WV, t.SK, t.MB, t.NPW, t.SKG, t.U, t.NT};
+        }
+        continue;
+      }
+      std::ifstream in(f, std::ios::binary);
+      if (!in) throw std::runtime_error("cannot read --tuning-file " + f);
+      const json d = json::parse(in);
+      const json& arr = d.contains("tunings") ? d.at("tunings") : d;
+      for (const json& e : arr)
+        out[TKey{e.at("N").get<int>(), e.at("K").get<int>(), e.at("KB").get<int>()}] = TuneFromJson(e);
+    }
+    return out;
+  }
+
+  // One trellis step over `ls` in layer order: per linear the transform and the full GEMM (what v1's
+  // ApplyLinear runs), or one of them, or M1's raw GEMM.
+  void LaunchTChain(const std::vector<const Linear*>& ls, int M, const KeyTunes& tune, TChain what) {
+    for (const Linear* l : ls) {
+      const TTune& t = tune.at(KeyOf(*l));
+      switch (what) {
+        case TChain::kRaw: LaunchTrellis(*l, M, t, nullptr); break;
+        case TChain::kFull: LaunchTransform(*l, M); LaunchTrellisFull(*l, M, t); break;
+        case TChain::kGemm: LaunchTrellisFull(*l, M, t); break;
+        case TChain::kXform: LaunchTransform(*l, M); break;
+      }
+    }
+  }
+  // One q2ab_hv2_q3 step over the whole body: the residual rotation at the stack's entry, per
+  // linear the cast and the GEMM, the GDN Hadamard in front of every out_proj, the inverse rotation
+  // at the exit; or the GEMMs alone, or everything but the GEMMs.
+  void LaunchBChain(const std::vector<const Linear*>& ls, int M, BChain what) {
+    const bool extras = what != BChain::kGemm, gemm = what != BChain::kExtras;
+    if (extras) LaunchRotation(M, false);
+    for (const Linear* l : ls) {
+      if (extras) {
+        if (l->s == &kOutProj) LaunchGdnHadamard(M);
+        LaunchCast(*l, M);
+      }
+      if (gemm) LaunchBaseline(*l, M);
+    }
+    if (extras) LaunchRotation(M, true);
+  }
+
+  // A key's instances as flushed full-GEMM chains (median of sweep_reps, ms per linear), after one
+  // unflushed chain that doubles as the legality probe; negative when the host rejects the tuning.
+  double SweepTimeKey(const std::vector<const Linear*>& ls, int M, const TTune& t) {
+    auto chain = [&] {
+      return Chain([&] {
+        for (const Linear* l : ls) LaunchTrellisFull(*l, M, t);
+      }, "trellis full " + t.Str() + " on " + ls[0]->s->cls);
+    };
+    if (chain() < 0) return -1.0;
+    std::vector<double> v;
+    for (int r = 0; r < args_.sweep_reps; ++r) {
+      Flush();
+      const double ms = chain();
+      if (ms < 0) return -1.0;
+      v.push_back(ms);
+    }
+    return Median(v) / ls.size();
+  }
+
+  // docs/trellis-kernel.md 10.1's joint pick. Stage 1 screens every tuning 10.1 allows (NT 1, MT 1,
+  // SKG <= 4, >= 2 waves per SIMD) per key by t(M=1) + t(M=8) on flushed chains of the key's
+  // instances; stage 2 takes each key's best joint_top into the whole full-linear step, one key at a
+  // time (largest first), and keeps a candidate only when paired whole-step chains say it saves
+  // time at M = 1 + M = 8 (median < -5 us and upper quartile < 0).
+  KeyTunes JointSelect(KeyTunes tune, const std::set<TKey>& fixed, json& log) {
+    const int simds = 4 * std::max(1, wgps_);
+    std::map<TKey, std::vector<std::pair<double, TTune>>> top;
+    std::map<TKey, double> weight;   // the key's best screened ms per token (both M)
+    for (const TKey& k : key_order_) {
+      if (fixed.count(k) && !args_.joint_all) continue;
+      const std::vector<const Linear*>& ls = keys_.at(k);
+      const int N = std::get<0>(k);
+      std::vector<std::pair<double, TTune>> scored;
+      json all = json::array();
+      for (int WV : {1, 2, 4})
+        for (int NP : {1, 2, 4})
+          for (int SK : {1, 2, 4, 8, 16})
+            for (int SKG : {1, 2, 4})
+              for (int U : {1, 2, 4}) {
+                const TTune t{WV, SK, 1, NP, SKG, U, 1};
+                const int Wc = t.Wc();
+                if (Wc > 256 || N % Wc != 0) continue;
+                if ((N / Wc) * SKG * WV * SK < 2 * simds) continue;   // >= 2 waves per SIMD
+                const double t1 = SweepTimeKey(ls, 1, t);
+                if (t1 < 0) continue;
+                const double t8 = SweepTimeKey(ls, 8, t);
+                if (t8 < 0) continue;
+                scored.push_back({t1 + t8, t});
+                all.push_back({{"tuning", t.Json()}, {"m1_us", 1000 * t1}, {"m8_us", 1000 * t8}});
+              }
+      std::sort(scored.begin(), scored.end(),
+                [](const std::pair<double, TTune>& a, const std::pair<double, TTune>& b) { return a.first < b.first; });
+      if (scored.empty()) throw std::runtime_error("joint: no legal tuning for " + KeyName(k));
+      if (static_cast<int>(scored.size()) > args_.joint_top) scored.resize(args_.joint_top);
+      json best = json::array();
+      for (auto& s : scored) best.push_back({{"tuning", s.second.Json()}, {"m1_plus_m8_us", 1000 * s.first}});
+      log["screen"][KeyName(k)] = {{"classes", key_classes_.at(k)}, {"instances", ls.size()},
+                                   {"legal", all.size()}, {"best", best}, {"all", all}};
+      std::printf("  joint screen %-18s (%s): %zu legal, best %s %.2f us (M=1 + M=8 per linear)\n",
+                  KeyName(k).c_str(), key_classes_.at(k).c_str(), all.size(), scored[0].second.Str().c_str(),
+                  1000 * scored[0].first);
+      tune[k] = scored[0].second;
+      top[k] = scored;
+      weight[k] = scored[0].first * ls.size();
+    }
+    // Stage 2: the whole step.
+    const std::vector<const Linear*> all = All();
+    auto step = [&](const KeyTunes& tn, int M) {
+      return Must(Chain([&] { LaunchTChain(all, M, tn, TChain::kFull); }, "joint step"), "joint step");
+    };
+    std::vector<TKey> order;
+    for (auto& kv : top) order.push_back(kv.first);
+    std::sort(order.begin(), order.end(), [&](const TKey& a, const TKey& b) { return weight[a] > weight[b]; });
+    Warm();
+    json stage2 = json::array();
+    for (const TKey& k : order) {
+      for (size_t i = 1; i < top[k].size(); ++i) {
+        KeyTunes alt = tune;
+        alt[k] = top[k][i].second;
+        if (alt[k] == tune[k]) continue;
+        std::vector<double> d, d1, d8;
+        for (int r = 0; r < args_.joint_reps; ++r) {
+          double c1, c8, a1, a8;
+          if (r % 2 == 0) {
+            c1 = step(tune, 1), a1 = step(alt, 1), c8 = step(tune, 8), a8 = step(alt, 8);
+          } else {
+            a1 = step(alt, 1), c1 = step(tune, 1), a8 = step(alt, 8), c8 = step(tune, 8);
+          }
+          d1.push_back(a1 - c1);
+          d8.push_back(a8 - c8);
+          d.push_back((a1 + a8) - (c1 + c8));
+        }
+        const bool take = Median(d) < -0.005 && Quantile(d, 0.75) < 0.0;
+        stage2.push_back({{"key", KeyName(k)}, {"current", tune[k].Json()}, {"candidate", alt[k].Json()},
+                          {"delta_ms_m1_plus_m8", Spread(d)}, {"delta_ms_m1", Median(d1)}, {"delta_ms_m8", Median(d8)},
+                          {"taken", take}});
+        std::printf("  joint step %-18s %s -> %s: %+.3f ms (M=1 %+.3f, M=8 %+.3f) per step pair%s\n",
+                    KeyName(k).c_str(), tune[k].Str().c_str(), alt[k].Str().c_str(), Median(d), Median(d1),
+                    Median(d8), take ? "  TAKEN" : "");
+        if (take) tune[k] = alt[k];
+      }
+    }
+    log["whole_step"] = stage2;
+    return tune;
+  }
+
+  void WriteTunings(const KeyTunes& tune, const std::map<TKey, std::string>& source) const {
+    if (!args_.tunings_out.empty()) {
+      json arr = json::array();
+      for (auto& kv : tune) {
+        json e = kv.second.Json();
+        e["N"] = std::get<0>(kv.first);
+        e["K"] = std::get<1>(kv.first);
+        e["KB"] = std::get<2>(kv.first);
+        auto it = key_classes_.find(kv.first);
+        e["classes"] = it == key_classes_.end() ? "" : it->second;
+        e["source"] = source.count(kv.first) ? source.at(kv.first) : "file";
+        arr.push_back(e);
+      }
+      std::ofstream f(args_.tunings_out, std::ios::binary);
+      if (!f) throw std::runtime_error("cannot write " + args_.tunings_out);
+      f << json{{"format", "r4dx-trellis-tunings"}, {"version", 1}, {"tunings", arr}}.dump(1) << "\n";
+      std::printf("wrote %s\n", args_.tunings_out.c_str());
+    }
+    if (!args_.inc_out.empty()) {
+      // The shape names every (N, K) serves in this model (a key of another run keeps its row).
+      const std::map<std::pair<int, int>, const char*> names = {
+          {{10240, 5120}, "gdn.in_proj_qkv"}, {{6144, 5120}, "gdn.in_proj_z"},
+          {{5120, 6144}, "gdn.out_proj, attn.o"}, {{12288, 5120}, "attn.qg"},
+          {{1024, 5120}, "attn.k, attn.v"}, {{34816, 5120}, "mlp.gate_up"}, {{5120, 17408}, "mlp.down"}};
+      // Rows by KB, then in layer order of the shapes.
+      const std::vector<std::pair<int, int>> shape_order = {{10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120},
+                                                            {1024, 5120},  {34816, 5120}, {5120, 17408}};
+      auto rank = [&](const TKey& k) {
+        const auto it = std::find(shape_order.begin(), shape_order.end(),
+                                  std::make_pair(std::get<0>(k), std::get<1>(k)));
+        return std::make_pair(std::get<2>(k), static_cast<int>(it - shape_order.begin()));
+      };
+      std::vector<std::pair<TKey, TTune>> rows(tune.begin(), tune.end());
+      std::sort(rows.begin(), rows.end(), [&](const std::pair<TKey, TTune>& a, const std::pair<TKey, TTune>& b) {
+        return rank(a.first) < rank(b.first);
+      });
+      std::ostringstream o;
+      o << "// GENERATED by tests/kernels/tool_trellis_gemm_bench.exe --modes full --joint (docs/trellis-kernel.md\n"
+           "// 7 M2, 10.1); --inc-out wrote this file. Measured on HIP device 1, R9700 (gfx1201), at full size\n"
+           "// with random weights: every legal tuning under 10.1's rules (NT 1, MT 1, SKG <= 4, >= 2 waves per\n"
+           "// SIMD) screened per (N, K, KB) on flushed chains by t(M = 1) + t(M = 8), the best four then\n"
+           "// compared on the whole full-linear decode step (input transforms + GEMMs with the epilogue), paired,\n"
+           "// at M = 1 and M = 8 together. KB = 4 rows from a --kb 4 run, KB = 5 rows from a --kb mix run\n"
+           "// (EXL3's 4.5 bpw allocation). The JSON beside the run has every candidate's time.\n"
+           "//\n"
+           "// Trellis rows of the GEMM tuning table (docs/trellis-kernel.md 5.3), one M = 1 row per (N, K, KB):\n"
+           "// a trellis chunk of M <= 16 rows always runs its M = 1 row (row identity, 4.3), so these serve\n"
+           "// decode, MTP verify and DFlash verify alike; NT = 1 at every M <= 16 (10.1: trellis must not take\n"
+           "// w4a16's NT = 0 rule for M > 1). M > 16 (prefill chunks) is 4.4's fallback until M5 sweeps it.\n"
+           "//\n"
+           "// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (milestone M4 moves this\n"
+           "// file into src/model and wires it into linear.cpp; until then it lives in tests/kernels, where\n"
+           "// trellis_tuning_rows.hpp reads it for test_trellis_gemm's row-identity check and the bench's\n"
+           "// `--tuning-file table`):\n"
+           "//   {Layout::kTrellis, N, K, M, {WV, SK, MB = MT, NPW = NP, NT, SKG, U}, group = 0, rate = KB}\n"
+           "// i.e. LinearTuning gains `int SKG = 1, U = 2` after NT and GemmTuningRow gains `int rate = 0`\n"
+           "// after group. The array has the main table's name, like gemm_tuning_table_tp2.inc: include it\n"
+           "// inside its own namespace.\n"
+           "static const GemmTuningRow kGemmTuningTable[] = {\n";
+      for (auto& rw : rows) {
+        const TKey& k = rw.first;
+        const TTune& t = rw.second;
+        const auto nm = names.find({std::get<0>(k), std::get<1>(k)});
+        char b[256];
+        std::snprintf(b, sizeof b, "    {Layout::kTrellis, %d, %d, 1, {%d, %d, %d, %d, %d, %d, %d}, 0, %d},  // %s Wc %d\n",
+                      std::get<0>(k), std::get<1>(k), t.WV, t.SK, t.MT, t.NP, t.NT, t.SKG, t.U, std::get<2>(k),
+                      nm == names.end() ? "?" : nm->second, t.Wc());
+        o << b;
+      }
+      o << "};\n";
+      std::ofstream f(args_.inc_out, std::ios::binary);
+      if (!f) throw std::runtime_error("cannot write " + args_.inc_out);
+      f << o.str();
+      std::printf("wrote %s (%zu rows)\n", args_.inc_out.c_str(), rows.size());
+    }
+  }
+
+  // One-wave clock probes after every linear of a full chain (untimed): trellis (transform + GEMM)
+  // or q2ab (cast + GEMM).
+  json ProbePassFull(const std::vector<const Linear*>& all, int M, const KeyTunes& tune, bool trellis) {
+    const size_t n = std::min<size_t>(all.size(), 4096);
+    for (size_t i = 0; i < n; ++i) {
+      if (trellis) {
+        LaunchTransform(*all[i], M);
+        LaunchTrellisFull(*all[i], M, tune.at(KeyOf(*all[i])));
+      } else {
+        LaunchCast(*all[i], M);
+        LaunchBaseline(*all[i], M);
+      }
+      r4dx_tq_bench_clock_probe(P(probe_ + 8 * i), args_.probe_iters, P(st_));
+    }
+    R4DX_HIP_CHECK(hipStreamSynchronize(st_));
+    R4DX_HIP_CHECK(hipGetLastError());
+    std::vector<unsigned long long> pr(8 * n);
+    R4DX_HIP_CHECK(hipMemcpy(pr.data(), probe_, pr.size() * 8, hipMemcpyDeviceToHost));
+    std::vector<double> mhz;
+    for (size_t i = 0; i < n; ++i) {
+      const double dc = static_cast<double>(pr[8 * i + 2] - pr[8 * i]);
+      const double dw = static_cast<double>(pr[8 * i + 3] - pr[8 * i + 1]);
+      if (dw > 0) mhz.push_back(dc / dw * wall_mhz_);
+    }
+    return {{"median_mhz", Median(mhz)}, {"p25_mhz", Quantile(mhz, 0.25)}, {"p75_mhz", Quantile(mhz, 0.75)},
+            {"min_mhz", Min(mhz)}, {"probes", mhz.size()}};
+  }
+
+  json ReplayFullAt(int M, const KeyTunes& tune) {
+    const std::vector<const Linear*> all = All();
+    auto T = [&](TChain w) {
+      return Must(Chain([&] { LaunchTChain(all, M, tune, w); }, "trellis step"), "trellis step");
+    };
+    auto B = [&](BChain w) { return Must(Chain([&] { LaunchBChain(all, M, w); }, "w4a16 step"), "w4a16 step"); };
+    for (int i = 0; i < 2; ++i) T(TChain::kFull), B(BChain::kFull);
+    // Seven chains per rep in a rotating order; every derived quantity is taken per rep.
+    constexpr int kChains = 7;
+    std::vector<double> t_raw, t_full, t_gemm, t_xform, b_gemm, b_full, b_extra;
+    for (int r = 0; r < args_.reps; ++r)
+      for (int k = 0; k < kChains; ++k) switch ((r + k) % kChains) {
+          case 0: t_raw.push_back(T(TChain::kRaw)); break;
+          case 1: t_full.push_back(T(TChain::kFull)); break;
+          case 2: b_gemm.push_back(B(BChain::kGemm)); break;
+          case 3: b_full.push_back(B(BChain::kFull)); break;
+          case 4: t_gemm.push_back(T(TChain::kGemm)); break;
+          case 5: t_xform.push_back(T(TChain::kXform)); break;
+          case 6: b_extra.push_back(B(BChain::kExtras)); break;
+        }
+    const size_t n = t_raw.size();
+    std::vector<double> S(n), X(n), D(n), Xc(n), epi(n);
+    for (size_t r = 0; r < n; ++r) {
+      S[r] = b_gemm[r] - t_raw[r];
+      X[r] = (t_full[r] - t_raw[r]) - (b_full[r] - b_gemm[r]);
+      D[r] = t_full[r] - b_full[r];
+      epi[r] = t_gemm[r] - t_raw[r];
+      Xc[r] = t_xform[r] + epi[r] - b_extra[r];
+    }
+    size_t tbytes = 0, tsbytes = 0, bbytes = 0;
+    for (const Linear* l : all) tbytes += l->TrellisBytes(), tsbytes += l->TrellisScaleBytes(), bbytes += l->BaselineBytes();
+    json j;
+    json tj;
+    for (auto& kv : tune) tj[KeyName(kv.first)] = kv.second.Json();
+    j["trellis_tuning"] = tj;
+    j["linears"] = all.size();
+    auto put = [&](const char* name, const std::vector<double>& v) {
+      j[name] = Spread(v);
+      j[name]["all"] = v;
+    };
+    put("trellis_raw_gemm_ms", t_raw);
+    put("trellis_full_ms", t_full);
+    put("trellis_full_gemm_ms", t_gemm);
+    put("trellis_transform_ms", t_xform);
+    put("w4a16_gemm_ms", b_gemm);
+    put("w4a16_full_ms", b_full);
+    put("w4a16_extras_ms", b_extra);
+    j["S_ms"] = Spread(S);
+    j["X_ms"] = Spread(X);
+    j["X_minus_S_ms"] = Spread(D);
+    j["X_from_components_ms"] = Spread(Xc);
+    j["epilogue_and_tails_ms"] = Spread(epi);
+    j["trellis_bytes"] = tbytes;
+    j["trellis_scale_bytes"] = tsbytes;
+    j["w4a16_bytes"] = bbytes;
+    const double x = Median(X), d = Median(D);
+    j["gate"] = {{"X_le_0.30_ms", x <= 0.30},
+                 {"X_le_1.3_ms_hard_cap", x <= 1.3},
+                 {"X_minus_S_le_0.14_ms", d <= 0.14},
+                 {"X_minus_S_upper_quartile_le_0.14_ms", Quantile(D, 0.75) <= 0.14},
+                 {"rule", "X <= 0.30 ms per token (design; 10.1: hard cap ~1.3) and X - S <= 0.14 ms, medians of per-rep values"}};
+    // q2ab's extras one kind at a time, and its silu_mul Hadamard over the plain silu_mul v1 runs
+    // (information: A3 sees it, the X of 4.6 point 3 does not count it).
+    {
+      std::vector<const Linear*> cast_ls;
+      int n_out = 0;
+      for (const Linear* l : all) {
+        if (l->group != 0) cast_ls.push_back(l);
+        n_out += l->s == &kOutProj;
+      }
+      auto med = [&](const std::function<void()>& f) {
+        Must(Chain(f, "extras"), "extras");
+        std::vector<double> v;
+        for (int r = 0; r < std::max(3, args_.reps / 2); ++r) v.push_back(Must(Chain(f, "extras"), "extras"));
+        return Median(v);
+      };
+      const int n_mlp = static_cast<int>(Instances(&kDown).size());
+      j["w4a16_extras_by_kind_ms"] = {
+          {"casts", med([&] { for (const Linear* l : cast_ls) LaunchCast(*l, M); })},
+          {"cast_count", cast_ls.size()},
+          {"gdn_hadamards", med([&] { for (int i = 0; i < n_out; ++i) LaunchGdnHadamard(M); })},
+          {"gdn_hadamard_count", n_out},
+          {"residual_rotations", med([&] { LaunchRotation(M, false); LaunchRotation(M, true); })},
+          {"trellis_transforms", med([&] { for (const Linear* l : all) LaunchTransform(*l, M); })},
+          {"transform_count", all.size()}};
+      const double sh = med([&] {
+        for (int i = 0; i < n_mlp; ++i)
+          r4dx_silu_mul_hadamard_bf16(P(silu_in_), P(silu_out_), M, 17408, 34816, P(st_), r4dx_epilogue_none, 0, 0,
+                                      P(silu_signs_), 512);
+      });
+      const double sp = med([&] {
+        for (int i = 0; i < n_mlp; ++i) r4dx_silu_mul_bf16(P(silu_in_), P(silu_out_), M, 17408, 34816, P(st_));
+      });
+      j["info_silu_mul"] = {{"q2ab_hadamard_ms", sh}, {"plain_ms", sp}, {"q2ab_minus_plain_ms", sh - sp},
+                            {"count", n_mlp},
+                            {"note", "v1 trellis runs the plain silu_mul where q2ab runs the Hadamard one; not in X"}};
+      // attention.o's input: q2ab's gate-mul rotates it in the same launch (block = head_dim 256),
+      // v1 runs the plain gate-mul and rotates in the transform. [M, 24 heads x 256] bf16.
+      const int n_attn = static_cast<int>(Instances(&kAttnO).size());
+      const int64_t n_gate = static_cast<int64_t>(M) * 6144;
+      const double gh = med([&] {
+        for (int i = 0; i < n_attn; ++i)
+          r4dx_model_attn_gate_mul_hadamard_bf16(P(out_core_), P(gate_in_), P(gated_), n_gate, P(st_),
+                                                 P(had_signs_), 256, 6144);
+      });
+      const double gp = med([&] {
+        for (int i = 0; i < n_attn; ++i)
+          r4dx_model_attn_gate_mul_bf16(P(out_core_), P(gate_in_), P(gated_), n_gate, P(st_));
+      });
+      j["info_attn_gate_mul"] = {
+          {"q2ab_hadamard_ms", gh}, {"plain_ms", gp}, {"q2ab_minus_plain_ms", gh - gp}, {"count", n_attn},
+          {"note", "v1 trellis runs the plain gate-mul where q2ab runs the Hadamard one; not in X"}};
+    }
+    // Per key, flushed, us per linear: M1's raw GEMM, the full GEMM, and the transform.
+    json pk;
+    const int kr = std::max(3, args_.reps / 3);
+    for (const TKey& k : key_order_) {
+      const std::vector<const Linear*>& ls = keys_.at(k);
+      const TTune& t = tune.at(k);
+      auto flushed = [&](const std::function<void()>& f) {
+        Must(Chain(f, "per key"), "per key");
+        std::vector<double> v;
+        for (int r = 0; r < kr; ++r) {
+          Flush();
+          v.push_back(Must(Chain(f, "per key"), "per key"));
+        }
+        return 1000.0 * Median(v) / ls.size();
+      };
+      const double raw = flushed([&] { for (const Linear* l : ls) LaunchTrellis(*l, M, t, nullptr); });
+      const double full = flushed([&] { for (const Linear* l : ls) LaunchTrellisFull(*l, M, t); });
+      const double xf = flushed([&] { for (const Linear* l : ls) LaunchTransform(*l, M); });
+      size_t b = 0;
+      for (const Linear* l : ls) b += l->TrellisBytes();
+      pk[KeyName(k)] = {{"classes", key_classes_.at(k)}, {"instances", ls.size()}, {"tuning", t.Json()},
+                        {"raw_gemm_us", raw}, {"full_gemm_us", full}, {"epilogue_us", full - raw},
+                        {"transform_us", xf}, {"full_gemm_gbps", b / ls.size() / full / 1e3}};
+    }
+    j["per_key"] = pk;
+    // Clocks of the two full chains.
+    const json pt = ProbePassFull(all, M, tune, true), pb = ProbePassFull(all, M, tune, false);
+    j["probe_sclk"] = {{"trellis_full", pt}, {"w4a16_full", pb},
+                       {"trellis_over_w4a16", pt["median_mhz"].get<double>() / pb["median_mhz"].get<double>()}};
+    std::printf("full M=%d (%s): trellis %.3f ms [raw GEMMs %.3f, full GEMMs %.3f, transforms %.3f] | w4a16 %.3f ms "
+                "[GEMMs %.3f, extras %.3f] per token\n",
+                M, args_.kb == "mix" ? "4.5 mix" : "KB 4", Median(t_full), Median(t_raw), Median(t_gemm),
+                Median(t_xform), Median(b_full), Median(b_gemm), Median(b_extra));
+    std::printf("  S = %+.3f ms, X = %+.3f ms [IQR %+.3f..%+.3f] (components %+.3f), X - S = %+.3f ms [IQR %+.3f..%+.3f]"
+                " -> X <= 0.30: %s, X - S <= 0.14: %s; probe SCLK trellis %.0f / w4a16 %.0f MHz\n",
+                Median(S), x, Quantile(X, 0.25), Quantile(X, 0.75), Median(Xc), d, Quantile(D, 0.25),
+                Quantile(D, 0.75), x <= 0.30 ? "yes" : "NO", d <= 0.14 ? "yes" : "NO",
+                pt["median_mhz"].get<double>(), pb["median_mhz"].get<double>());
+    for (auto& kv : pk.items())
+      std::printf("  %-18s %-24s raw %8.2f us, full %8.2f (epilogue %+6.2f), transform %5.2f us per linear\n",
+                  kv.key().c_str(), kv.value()["classes"].get<std::string>().c_str(),
+                  kv.value()["raw_gemm_us"].get<double>(), kv.value()["full_gemm_us"].get<double>(),
+                  kv.value()["epilogue_us"].get<double>(), kv.value()["transform_us"].get<double>());
+    {
+      const json &si = j["info_silu_mul"], &ga = j["info_attn_gate_mul"];
+      std::printf("  info, outside X (v1 runs the plain kernel where q2ab runs its Hadamard form): silu_mul x%d "
+                  "q2ab %.3f / plain %.3f ms, attn gate-mul x%d q2ab %.3f / plain %.3f ms -> v1 %+.3f ms per token\n",
+                  si["count"].get<int>(), si["q2ab_hadamard_ms"].get<double>(), si["plain_ms"].get<double>(),
+                  ga["count"].get<int>(), ga["q2ab_hadamard_ms"].get<double>(), ga["plain_ms"].get<double>(),
+                  -(si["q2ab_minus_plain_ms"].get<double>() + ga["q2ab_minus_plain_ms"].get<double>()));
+    }
+    return j;
+  }
+
+  void ReplayFull() {
+    json r;
+    r["kb"] = args_.kb;
+    r["kb_manifest"] = args_.kb_manifest;
+    std::map<std::string, int> rates;
+    size_t tbytes = 0;
+    for (const Linear& l : linears_) ++rates["KB" + std::to_string(l.kb)], tbytes += l.TrellisBytes() + l.TrellisScaleBytes();
+    r["linears_per_kb"] = rates;
+    r["trellis_body_bytes_with_scales"] = tbytes;
+    std::printf("full: trellis %s, %zu linears (", args_.kb == "mix" ? "4.5 bpw mix" : "KB 4", linears_.size());
+    for (auto& kv : rates) std::printf(" %s: %d", kv.first.c_str(), kv.second);
+    std::printf(" ), %.3f GiB of words and scales\n", tbytes / 1073741824.0);
+    KeyTunes tune = LoadTunings();
+    std::set<TKey> fixed;
+    std::map<TKey, std::string> source;
+    for (const TKey& k : key_order_) {
+      if (tune.count(k)) {
+        fixed.insert(k);
+        source[k] = "file";
+      } else {
+        const TTune f = FallbackTuning(std::get<0>(k), std::get<1>(k), 1);
+        tune[k] = f;
+        source[k] = "fallback (4.4)";
+      }
+    }
+    Warm();
+    if (args_.joint) {
+      json log;
+      tune = JointSelect(tune, fixed, log);
+      for (const TKey& k : key_order_)
+        if (!fixed.count(k) || args_.joint_all) source[k] = "joint";
+      r["joint"] = log;
+    }
+    json tj;
+    for (const TKey& k : key_order_)
+      tj[KeyName(k)] = {{"classes", key_classes_.at(k)}, {"instances", keys_.at(k).size()},
+                        {"source", source.at(k)}, {"tuning", tune.at(k).Json()}};
+    r["tunings"] = tj;
+    WriteTunings(tune, source);
+    for (int M : {1, 8}) r["M" + std::to_string(M)] = ReplayFullAt(M, tune);
+    out_["full"] = r;
+  }
+
   // ---- split tail ------------------------------------------------------------------------------
   // Each split row (Wc, SKG) against the unsplit control of equal parallelism: Wc 128 (WV 4, NP 1),
   // SKG 1, SK 2 SKG -- the same number of waves, each over the same K range, so split - control is
@@ -1275,8 +1950,15 @@ class Bench {
   double wall_mhz_ = 100.0;
   int wgps_ = 32;
   static constexpr size_t kFlushBytes = 256ull << 20;
-  std::unique_ptr<Blob> small_, trellis_, base_, tick_, flush_;
+  const float kOutScale = static_cast<float>(1.0 / std::sqrt(128.0));   // 2^-s / sqrt(128), s = 0
+  std::unique_ptr<Blob> small_, trellis_, base_, tick_, scales_, flush_;
   std::map<int, uint16_t*> a_f16_, a_f16b_, a_bf16_;
+  float *rot_signs_ = nullptr, *rot_mix5_ = nullptr, *had_signs_ = nullptr, *silu_signs_ = nullptr;
+  uint16_t *resid_ = nullptr, *out_core_ = nullptr, *silu_in_ = nullptr, *silu_out_ = nullptr;
+  uint16_t *gate_in_ = nullptr, *gated_ = nullptr;
+  std::map<TKey, std::vector<const Linear*>> keys_;
+  std::vector<TKey> key_order_;
+  std::map<TKey, std::string> key_classes_;
   float* c_f32_ = nullptr;
   uint16_t* c_bf16_ = nullptr;
   float* ws_ = nullptr;
@@ -1306,6 +1988,15 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--in-model-sclk") a.in_model_sclk = std::stod(next());
     else if (k == "--alu-fraction") a.alu_fraction = std::stod(next());
     else if (k == "--warmup-s") a.warmup_s = std::stod(next());
+    else if (k == "--kb") a.kb = next();
+    else if (k == "--kb-manifest") a.kb_manifest = next();
+    else if (k == "--tuning-file") a.tuning_files.push_back(next());
+    else if (k == "--joint") a.joint = true;
+    else if (k == "--joint-all") a.joint = a.joint_all = true;
+    else if (k == "--joint-top") a.joint_top = std::stoi(next());
+    else if (k == "--joint-reps") a.joint_reps = std::stoi(next());
+    else if (k == "--tunings-out") a.tunings_out = next();
+    else if (k == "--inc-out") a.inc_out = next();
     else if (k == "--modes") {
       a.modes.clear();
       std::string v = next();
@@ -1313,20 +2004,25 @@ Args ParseArgs(int argc, char** argv) {
       while (p <= v.size()) {
         const size_t q = v.find(',', p);
         const std::string m = v.substr(p, q == std::string::npos ? std::string::npos : q - p);
-        if (m != "replay" && m != "ops" && m != "split" && m != "prefill")
-          throw std::runtime_error("unknown mode '" + m + "' (replay, ops, split, prefill)");
+        if (m != "replay" && m != "ops" && m != "split" && m != "prefill" && m != "full")
+          throw std::runtime_error("unknown mode '" + m + "' (replay, ops, split, prefill, full)");
         a.modes.insert(m);
         if (q == std::string::npos) break;
         p = q + 1;
       }
     } else {
       throw std::runtime_error("unknown argument " + k +
-                               " (--out <json> [--modes replay,ops,split,prefill] [--reps N] "
+                               " (--out <json> [--modes replay,ops,split,prefill,full] [--reps N] "
                                "[--layers N] [--sweep] [--sweep-reps N] [--probe-iters N] "
-                               "[--in-model-sclk MHz] [--alu-fraction F] [--warmup-s S])");
+                               "[--in-model-sclk MHz] [--alu-fraction F] [--warmup-s S] [--kb 4|mix] "
+                               "[--kb-manifest json] [--tuning-file json|table]... [--joint] [--joint-all] "
+                               "[--joint-top N] [--joint-reps N] [--tunings-out json] [--inc-out path])");
     }
   }
   if (a.out.empty()) throw std::runtime_error("--out <json> is required");
+  if (a.kb != "4" && a.kb != "mix") throw std::runtime_error("--kb must be 4 or mix");
+  if (!a.kb_manifest.empty() && a.kb != "mix") throw std::runtime_error("--kb-manifest needs --kb mix");
+  if (a.joint_top < 1 || a.joint_reps < 1) throw std::runtime_error("--joint-top / --joint-reps must be >= 1");
   if (a.layers < 1 || a.layers > 64) throw std::runtime_error("--layers must be 1..64");
   if (a.reps < 1) throw std::runtime_error("--reps must be >= 1");
   if (a.in_model_sclk < 0) throw std::runtime_error("--in-model-sclk must be a positive MHz value");
@@ -1344,15 +2040,20 @@ int main(int argc, char** argv) {
     R4DX_HIP_CHECK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
     {
       Bench b(args, st);
-      const bool model = args.modes.count("replay") || args.modes.count("split") || args.modes.count("prefill");
+      const bool model = args.modes.count("replay") || args.modes.count("split") || args.modes.count("prefill") ||
+                         args.modes.count("full");
       b.Setup();
       b.Out()["args"] = {{"reps", args.reps}, {"layers", args.layers}, {"sweep", args.sweep},
                          {"sweep_reps", args.sweep_reps}, {"in_model_sclk", args.in_model_sclk},
                          {"alu_fraction", args.alu_fraction}, {"warmup_s", args.warmup_s},
-                         {"modes", std::vector<std::string>(args.modes.begin(), args.modes.end())}};
+                         {"modes", std::vector<std::string>(args.modes.begin(), args.modes.end())},
+                         {"kb", args.kb}, {"kb_manifest", args.kb_manifest}, {"tuning_files", args.tuning_files},
+                         {"joint", args.joint}, {"joint_all", args.joint_all}, {"joint_top", args.joint_top},
+                         {"joint_reps", args.joint_reps}};
       // The JSON is rewritten after every mode, so a later failure keeps the earlier numbers.
       if (args.modes.count("ops")) b.Ops(), b.Write();
       if (model) b.SetupModel();
+      if (args.modes.count("full")) b.ReplayFull(), b.Write();
       if (args.modes.count("replay")) b.Replay(), b.Write();
       if (args.modes.count("split")) b.Split(), b.Write();
       if (args.modes.count("prefill")) b.Prefill(), b.Write();

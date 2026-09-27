@@ -113,6 +113,32 @@ void r4dx_silu_mul_hadamard_bf16(int64_t gate_up, int64_t out, int64_t rows, int
                                   int64_t epilogue_out, int64_t epilogue_scale, int64_t signs,
                                   int block);
 
+// ---- trellis linear input transform (docs/trellis-kernel.md 4.8) ------------------------------
+// The input side of a trellis linear (W^T = diag(suh) H Q H diag(svh), H the natural-order 128-point
+// Hadamard / sqrt(128)): for each output o < nout, on every row and every 128-block of K,
+//   out[o][row, k] = f16_rn( FWHT128( fp32(x[row, :]) * suh[o][:] )[k] * scale ),
+//   scale = float(2^prescale_log2 / sqrt(128)) (rounded once on the host),
+// FWHT128 unnormalized, fp32, stages lg = 0..6 in FwhtLds's order (libr4d's r4d_fwht128.h, shared
+// with r4d_gemm_trellis_nt_m64's output side). The product x * suh is rounded to fp32 before the
+// first butterfly (never fused into it), and the result is rounded ONCE, straight to f16 (not to
+// bf16 first). r4d_gemm_trellis_nt_m64 takes the f16 result as its A with out_scale =
+// 2^-prescale_log2 / sqrt(128). Deterministic and row-independent.
+// x: [M, K] bf16, row-major, contiguous. suh / out: HOST arrays of nout (1..3) device pointers:
+// suh[o] fp32 [K] (the linear's suh, widened from the container's fp16), out[o] f16 [M, K] with row
+// stride K. Several outputs serve a linear's parts (mlp.gate_up: nout 2, suh[1] = suh[0] + K,
+// out[1] = out[0] + part_stride elements) or several linears sharing one input (qg/k/v: nout 3).
+// Preconditions (throw): nout in 1..3, K a positive multiple of 128, M in 0..65535 (M = 0 is a
+// no-op), non-null pointers, |prescale_log2| <= 24. Launch: grid (K / 128, M), one wave32 per
+// workgroup, one 128-block each.
+void r4dx_trellis_input_bf16(int64_t x, int64_t M, int64_t K, int nout, const int64_t* suh,
+                              const int64_t* out, int prescale_log2, int64_t stream);
+
+// Test / diagnostic entry: an unnormalized in-place 128-point FWHT of each 128-float block of x
+// (fp32 [blocks * 128]) through libr4d's one-wave r4d_fwht128_wave (use_lds == 0; the trellis
+// kernels' butterfly) or r4dx's FwhtLds (use_lds != 0; the quant2 rotation kernels'), so a test can
+// hold the two to bit-equality.
+void r4dx_fwht128_f32(int64_t x, int64_t blocks, int use_lds, int64_t stream);
+
 // ---- rope: partial rotary, text-only mrope ---------------------------------------------------
 // Rotates the first `rotary_dim` (64 = head_dim * partial_rotary_factor 0.25) dims of each head
 // in place, NeoX/half-split pairing (rotate_half: element i pairs with i + rotary_dim/2), matching

@@ -209,9 +209,27 @@ class _LazyLayerIter:
 # --------------------------------------------------------------------------------------------
 
 
+def new_gemm_guard_state():
+    """A fresh record for hessian_capture's GemmGuard (`install_gemm_guard` / `guard_linear` keep
+    their counts and events in `state.gemm_guard`). Set it as `StreamingReference.gemm_guard_state`
+    to have every streamed decoder layer's nn.Linear and the lm_head GEMMs checked."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(gemm_guard={"recomputed": 0, "confirmed_large": 0, "failed": 0, "events": []})
+
+
 class StreamingReference:
     #: The `source` field of every `.meta.json` this reference writes (kl_report.py's shared format).
     source_tag = "reference"
+    #: GemmGuard (see `new_gemm_guard_state`): when set, every nn.Linear of every streamed layer and
+    #: every lm_head block GEMM whose output is non-finite or > 1e5 is recomputed, a differing
+    #: recompute replacing it. torch 2.9.1+rocmsdk20260116 on gfx1201 (both R9700s) sporadically
+    #: returns garbage tiles (|y| 1e7..1e36) from the full-attention layers' k_proj / v_proj GEMM,
+    #: ~1 in 1000 layer calls, never on a recompute; an unguarded bf16 reference can carry such a
+    #: tile silently (a re-run of the same segment gave ppl 16.4 instead of 3.81). Clean outputs
+    #: are untouched, so a run without events is byte-identical to one without the guard. None (the
+    #: default here; `main` turns it on unless --no-gemm-guard) leaves every other caller unchanged.
+    gemm_guard_state = None
 
     def __init__(self, model_dir: Path, device, dtype=torch.bfloat16, max_layers: int | None = None,
                  verbose: bool = True):
@@ -263,6 +281,10 @@ class StreamingReference:
         layer.eval()
         for p in layer.parameters():
             p.requires_grad_(False)
+        if self.gemm_guard_state is not None:
+            from hessian_capture import install_gemm_guard  # noqa: E402  (lazy: it imports this module)
+
+            install_gemm_guard(layer, self.gemm_guard_state, f"L{i:02d}")  # hooks die with the layer
         return layer
 
     def layer_state(self, prefix: str, keys: list[str]) -> dict[str, torch.Tensor]:
@@ -349,8 +371,13 @@ class StreamingReference:
         rows = hidden.shape[0]
         out = torch.empty(rows, self.vocab_size, device=self.device, dtype=torch.float32)
         for start, stop, w in self.lm_head_blocks(chunk):
-            out[:, start:stop] = torch.nn.functional.linear(hidden, w).float()
-            del w
+            y = torch.nn.functional.linear(hidden, w)
+            if self.gemm_guard_state is not None:
+                from hessian_capture import guard_linear  # noqa: E402
+
+                y = guard_linear(hidden, w, None, y, self.gemm_guard_state, f"lm_head[{start}:{stop}]")
+            out[:, start:stop] = y.float()
+            del w, y
         return out
 
     def lm_head_blocks(self, chunk: int):
@@ -1314,6 +1341,9 @@ def main() -> int:
                     help="prefix length (tokens of the first selected segment) for --selfcheck-greedy")
     ap.add_argument("--skip-segments", action="store_true",
                     help="run only the requested validations, write no .logprobs.f16")
+    ap.add_argument("--no-gemm-guard", action="store_true",
+                    help="do not recompute non-finite / > 1e5 linear outputs (StreamingReference."
+                         "gemm_guard_state); the default guard leaves clean outputs untouched")
     args = ap.parse_args()
 
     # A --weights-gguf dump and a bf16 reference must never share a directory, nor two GGUFs or two
@@ -1387,6 +1417,8 @@ def main() -> int:
                                        max_layers=args.debug_max_layers)
     else:
         ref = StreamingReference(args.model_dir, device, max_layers=args.debug_max_layers)
+    if not args.no_gemm_guard:
+        ref.gemm_guard_state = new_gemm_guard_state()
     print(f"[full_logits] skeleton ready in {time.perf_counter() - t0:.1f}s: {ref.n_layers} layers, "
           f"hidden={ref.text_config.hidden_size}, V={ref.vocab_size}, impl={args.impl}", flush=True)
     if args.debug_max_layers:
@@ -1453,6 +1485,18 @@ def main() -> int:
                 print(f"    {cls:26s} n={v['n']:3d} K {v['K']} bpw {v['bpw']:.4f}")
         else:
             print("[full_logits] override weights: no tensor was substituted (no segment ran?)")
+    if ref.gemm_guard_state is not None:
+        from hessian_capture import GEMM_GUARD_LIMIT
+
+        g = ref.gemm_guard_state.gemm_guard
+        run["gemm_guard"] = {"limit": GEMM_GUARD_LIMIT, **g,
+                             "rule": "a linear output with a non-finite value or |y| > limit is recomputed; "
+                                     "a bit-equal recompute is kept as real, a different one replaces it "
+                                     "(hessian_capture.install_gemm_guard / guard_linear)"}
+        print(f"[full_logits] GemmGuard: {g['recomputed']} recomputed, {g['confirmed_large']} confirmed "
+              f"large, {g['failed']} failed", flush=True)
+    else:
+        run["gemm_guard"] = None  # --no-gemm-guard
     avail_end, peak = host_commit_gib()
     run["host_commit_gib"] = {"available_at_start": commit_avail, "available_at_end": avail_end,
                               "process_peak": peak}

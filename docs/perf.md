@@ -1,5 +1,62 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Trellis at TP=2 (2026-09-28)
+
+main's build of `88d3b75` (quant2 merged; `build\win-hip`), `--layout trellis --tp 2 --tp-mode real`,
+`HIP_VISIBLE_DEVICES` unset: rank 0 on HIP device 1, rank 1 on device 0 with the desktop live,
+production server stopped. The protocol is the one the section below uses:
+`tools/quant2/bench_decode.ps1 -Runs 3` with both containers interleaved run by run. Each entry ends
+in `!2`, which the script now takes to mean `--tp 2`. Four `tests/model/mtp_prompts.txt` prompts per
+mode, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048`, and DFlash2 is
+`qwen38-27b-dflash2-w4a16-g64.r4dx` at k = 7. Each number is the median of the per-run
+token-weighted aggregates. Prefill is the warm >= 256-token `--chat` turns. The TP=1 column is the
+section below (M5 part 3, HIP device 1). It was not re-run: that build was the quant2 checkout of the
+same source, and TP=1 is not TP work. `tools\tp\tdr_check.ps1` found no TDR. Logs are in
+`D:\models\r4dx\trellis-tp2\bench\`.
+
+| mode | mix4.5m TP=1 | **mix4.5m TP=2** | TP=2 / TP=1 | K4m TP=1 | **K4m TP=2** | TP=2 / TP=1 |
+|---|--:|--:|--:|--:|--:|--:|
+| plain | 36.69 | **61.29** | **1.67x** | 40.34 | **66.52** | **1.65x** |
+| `--dflash k=7` | 116.55 | **169.77** | **1.46x** | 123.52 | **180.43** | **1.46x** |
+| `--mtp 3` | 77.65 | **121.30** | **1.56x** | 81.98 | **128.48** | **1.57x** |
+| prefill tok/s | 1172.8 | **1532.6** | 1.31x | 1209.7 | **1585.6** | 1.31x |
+| prefill vs q2ab TP=1 (757.2) | 1.55x | **2.02x** | | 1.60x | **2.09x** | |
+
+VRAM used per card (device-wide `hipMemGetInfo`, the same on both ranks; this process's buffers
+in parentheses) against TP=1's single card:
+
+| mode | mix4.5m TP=1 | mix4.5m TP=2, per card | K4m TP=1 | K4m TP=2, per card |
+|---|--:|--:|--:|--:|
+| plain | 16.87 | 9.88 (9.63) | 15.46 | 9.18 (8.92) |
+| `--dflash k=7` | 18.96 | 11.36 (11.12) | 17.55 | 10.66 (10.41) |
+| `--mtp 3` | 17.36 | 10.05 (9.84) | 15.95 | 9.35 (9.14) |
+
+- Plain decode at TP=2 takes 16.3 ms per token for mix4.5m and 15.0 ms for K4m (from tok/s,
+  host included). At TP=1 it was 27.3 and 24.8. There is no per-step GPU probe at TP=2:
+  `R4DX_CLOCK_PROBE` is TP=1 only.
+- Speculation scales less than plain decode: 1.46x for DFlash and 1.56x for MTP, against 1.66x for
+  plain. The DFlash2 drafter is replicated on both ranks (docs/tp.md 4.5), so its time does not
+  halve. Part of the gap is text. mix4.5m's TP=2 answers to the
+  haiku and Fibonacci prompts differ from TP=1's and accept fewer drafts: DFlash takes 2.90 / 4.71
+  tokens per round where TP=1 took 3.17 / 5.89.
+- Text: every TP=2 run reproduced its text across the 3 runs. Greedy `--dflash` and `--mtp 3` text
+  equals plain text on all 8 (container, prompt) pairs. TP=2 text differs from TP=1 text on 3 of
+  the 8 pairs, all of them fluent, because the all-reduce changes the summation order: mix4.5m on
+  the haiku and Fibonacci prompts, and K4m on the primes prompt after 129 characters. The other 5
+  pairs are byte-identical.
+- The first bench.md marked K4m plain p0 "unstable". That was a log artifact: the two rank threads'
+  load lines interleaved mid-line on stderr and a fragment went into the text hash. The generated
+  text was identical, and `bench_decode.ps1` now hashes only the lines after `[stats] container
+  load` (`eefec73`).
+- **The TP=2 KB = 5 `gate_up` M = 1 row stays** (`gemm_tuning_table_trellis_tp2.inc`: WV4 SK1 U2).
+  The TP=1 table's M5 part-3 row, WV1 SK16 U4, was tested at the rank shape (17408 x 5120):
+  `tool_trellis_gemm_bench --modes full --tp 2 --kb mix --kb-manifest <mix4.5m> --reps 20`, the
+  table alone against the table plus that row as a later `--tuning-file`, 6 alternating processes
+  each. The row is **slower**: `gate_up` KB5 costs 93.3 us per call against 91.2, and the full-linear
+  step costs 12.228 ms against 12.169 at M = 1 (+0.06 ms) and 12.524 against 12.480 at M = 8. M5's
+  TP=2 joint run had already made WV4 SK1 U2 its pick over every screened alternative, and no
+  candidate came near the 0.1 ms/step bar for an in-model A/B (`D:\models\r4dx\trellis-tp2\tune\`).
+
 ## Trellis weights (`--layout trellis`): decode and prefill against q2ab_hv2_q3 (2026-09-28)
 
 Branch `quant2`, the EXL3-style trellis body (docs/trellis-kernel.md; libr4d branch `trellis`,

@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 #include "linear.h"  // r4dx::model::ApplyLinear -- shared qg/o/k/v quantized-linear dispatch
@@ -68,10 +69,15 @@ inline int PrefillSplitKvSplits(int ctx, int q_len, int kv_heads) {
 // "1" = never split (the pre-M1 prefill, bit for bit -- the kill switch); N > 1 = exactly N segments
 // on every prefill-kernel call a prompt prefill makes, at any depth (A/B and calibration runs),
 // capped at 32 (the fp32 partials are 64 x q_heads x N x 1032 B of the layer's 96 MiB arena).
+// "exact" = kPrefillAttnExact: every prompt-prefill call takes the exact-wide launch
+// (r4d_attn_prefill_exact_*), which is the plain launch's output bit for bit over 8x the
+// workgroups -- lossless by construction, about 2x on the attention call instead of split-KV's 5-6x.
+inline constexpr int kPrefillAttnExact = -2;
 inline int PrefillSplitKvOverride() {
   static const int v = [] {
     const char* e = std::getenv("R4DX_PREFILL_SPLITKV");
     if (e == nullptr || *e == '\0') return -1;
+    if (std::strcmp(e, "exact") == 0) return kPrefillAttnExact;
     const int n = std::atoi(e);
     return n < 1 ? 1 : (n > 32 ? 32 : n);
   }();
@@ -349,9 +355,14 @@ class AttentionLayer {
       const int forced = prefill_split_kv ? PrefillSplitKvOverride() : 1;
       const int splits = !prefill_split_kv ? 1
                          : forced > 0     ? forced
+                         : forced == kPrefillAttnExact ? 1
                                           : PrefillSplitKvSplits(start_pos + T, T, Hkv);
       a.scratch = nullptr;
-      if (splits > 1) {
+      if (forced == kPrefillAttnExact) {
+        a.splits = 0;  // the library's default exact-wide geometry
+        ProfiledCall(prof, stream, "attn.core_prefill",
+                     [&] { r4dx::core::r4d::AttnPrefillExactFp8Kv(a, stream); });
+      } else if (splits > 1) {
         a.splits = splits;
         const int64_t bytes = r4dx::core::r4d::AttnPrefillSplitKvScratchBytes(a);
         a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(bytes), /*align_bytes=*/256);

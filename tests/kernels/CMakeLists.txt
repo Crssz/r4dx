@@ -140,6 +140,11 @@ target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core
 add_executable(tool_attn_prefill_bench tool_attn_prefill_bench.cpp)
 target_link_libraries(tool_attn_prefill_bench PRIVATE r4dx_core r4d_core)
 
+# tool_attn_prefill_precision: prefill M1 diagnosis -- plain, exact-wide and split-KV prefill
+# attention against an fp64 CPU reference (docs/prefill.md "M1 results"). Built, never add_test()'d.
+add_executable(tool_attn_prefill_precision tool_attn_prefill_precision.cpp)
+target_link_libraries(tool_attn_prefill_precision PRIVATE r4dx_core r4dx_kernels r4d_core)
+
 # tool_trellis_gemm_bench: trellis milestone M1's measurements (docs/trellis-kernel.md 4.6, 6
 # "Benches"): the 336-GEMM decode-step replay against production w4a16, op rates and WMMA/VALU/
 # memory overlap, the split-group tail and the M = 64 prefill shape; and M2's full-linear replay

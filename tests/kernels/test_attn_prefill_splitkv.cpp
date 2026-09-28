@@ -11,6 +11,8 @@
 //      (checked: split max-abs error <= 1.5 x unsplit's + 2e-3, and max-rel <= 5e-2 like
 //      test_attn_decode), and the split-vs-unsplit difference is printed for the record.
 //   3. deterministic: the same split launch twice gives the same bits (fixed-order merge).
+//   4. the exact-wide entry (r4d_attn_prefill_exact_h256_gqa6_fp8kv, R4DX_PREFILL_SPLITKV=exact)
+//      is the plain launch bit for bit in every geometry it offers.
 // Cases cover: chunk at depth 0 (causal diagonal only), depths that are not multiples of the
 // 16-token page or the 48-key tile (partial pages / partial tiles), a partial query block
 // (q_len 37), several query blocks (q_len 150), a split count above the tile count (empty
@@ -247,6 +249,26 @@ int main() {
                   diff, same.size());
       case_ok = case_ok && diff == 0;
     }
+
+    // Exact-wide prefill (the lossless mode): every geometry is the plain launch, bit for bit.
+    for (int g : {0, 242, 244, 121, 122, 124, 62, 64}) {
+      R4DArgs b = a;
+      b.out = out_d.data();
+      b.splits = g;
+      R4DX_HIP_CHECK(hipMemset(out_d.data(), 0xFF, out_d.size() * 2));
+      const int rc = r4d_attn_prefill_exact_h256_gqa6_fp8kv(&b, nullptr);
+      R4DX_HIP_CHECK(hipDeviceSynchronize());
+      const std::vector<uint16_t> same = out_d.CopyToHost();
+      size_t diff = 0;
+      for (size_t i = 0; i < same.size(); ++i) diff += same[i] != base[i];
+      if (rc != 0 || diff != 0) {
+        std::printf("    exact geometry %3d: rc %d, %zu/%zu bf16 differ from the plain launch FAIL\n", g, rc,
+                    diff, same.size());
+        case_ok = false;
+      }
+    }
+    std::printf("    exact entry, 8 geometries: bit-identical to the plain launch%s\n",
+                case_ok ? "" : " -- NO");
 
     for (int sp : cs.splits) {
       const std::vector<uint16_t> got = run(sp, true);

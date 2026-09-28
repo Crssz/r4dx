@@ -62,6 +62,7 @@ int main(int argc, char** argv) {
   std::vector<int> qlens = {64, 128, 256, 512, 1024};
   std::vector<int> splits = {2, 4, 8, 16};
   std::vector<int> splitkv = {2, 4, 8, 16, 32};
+  std::vector<int> exact;  // r4d_attn_prefill_exact_* geometries (NW*10+DS), bit-compared to plain
   int reps = 20, warmup = 3, kv_heads_arg = 4;
   const char* out_path = nullptr;
   for (int i = 1; i < argc; ++i) {
@@ -71,6 +72,7 @@ int main(int argc, char** argv) {
     else if (a == "--qlens" && v) { qlens = ParseList(v); ++i; }
     else if (a == "--splits" && v) { splits = ParseList(v); ++i; }
     else if (a == "--splitkv" && v) { splitkv = ParseList(v); ++i; }
+    else if (a == "--exact" && v) { exact = ParseList(v); ++i; }
     else if (a == "--reps" && v) { reps = std::atoi(v); ++i; }
     else if (a == "--kv-heads" && v) { kv_heads_arg = std::atoi(v); ++i; }  // 2 = one TP=2 rank
     else if (a == "--warmup" && v) { warmup = std::atoi(v); ++i; }
@@ -78,7 +80,7 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr,
                    "usage: tool_attn_prefill_bench [--depths a,b] [--qlens a,b] [--splits a,b] "
-                   "[--splitkv a,b] [--kv-heads N] [--reps N] [--warmup N] [--out f.json]\n");
+                   "[--splitkv a,b] [--exact g,g] [--kv-heads N] [--reps N] [--warmup N] [--out f.json]\n");
       return 2;
     }
   }
@@ -151,7 +153,7 @@ int main(int argc, char** argv) {
                                  (head_dim + 2) * 4;
     R4DX_HIP_CHECK(hipMalloc(&scratch_d, scratch_bytes));
   }
-  auto time_call = [&](int num_seqs, int q_len, int ctx, int splitkv_n = 0) -> double {
+  auto time_call = [&](int num_seqs, int q_len, int ctx, int splitkv_n = 0, int exact_g = 0) -> double {
     std::vector<int> seq(static_cast<size_t>(num_seqs), ctx);
     R4DX_HIP_CHECK(hipMemcpy(seq_d, seq.data(), seq.size() * sizeof(int), hipMemcpyHostToDevice));
     R4DArgs a{};
@@ -173,9 +175,10 @@ int main(int argc, char** argv) {
     a.kv_head_stride = kv_head_stride;
     a.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     a.max_ctx = ctx;
-    a.splits = splitkv_n;
+    a.splits = exact_g > 0 ? exact_g : splitkv_n;
     a.scratch = splitkv_n > 0 ? scratch_d : nullptr;
     auto launch = [&]() {
+      if (exact_g > 0) return r4d_attn_prefill_exact_h256_gqa6_fp8kv(&a, s);
       return splitkv_n > 0 ? r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(&a, s)
                            : r4d_attn_prefill_h256_gqa6_fp8kv(&a, s);
     };
@@ -218,6 +221,25 @@ int main(int argc, char** argv) {
                   d, sp, kv_heads * sp, ms,
                   base > 0 ? (" (x" + std::to_string(base / ms).substr(0, 5) + " vs unsplit)").c_str()
                            : "");
+    }
+    // Exact-wide prefill: the plain call's bits over more workgroups. Bit-compared, then timed.
+    for (int g : exact) {
+      const size_t n = static_cast<size_t>(64) * q_heads * head_dim;
+      R4DX_HIP_CHECK(hipMemset(out_d, 0, n * 2));
+      time_call(1, 64, d + 64);
+      std::vector<uint16_t> ref(n), got(n);
+      R4DX_HIP_CHECK(hipMemcpy(ref.data(), out_d, n * 2, hipMemcpyDeviceToHost));
+      R4DX_HIP_CHECK(hipMemset(out_d, 0, n * 2));
+      const double ms = time_call(1, 64, d + 64, 0, g);
+      R4DX_HIP_CHECK(hipMemcpy(got.data(), out_d, n * 2, hipMemcpyDeviceToHost));
+      size_t diff = 0;
+      for (size_t i = 0; i < n; ++i) diff += ref[i] != got[i];
+      const int grid = g < 10 ? kv_heads : (64 / ((g / 10) * 16 / 6)) * (g % 10) * kv_heads;
+      results.push_back({"exact", d, 64, g, grid, ms});
+      std::printf("[attn-bench] depth %6d exact %3d (q_len 64) grid %4d: %9.4f ms/call, %zu/%zu bf16 differ "
+                  "from plain%s\n",
+                  d, g, grid, ms, diff, n,
+                  base > 0 ? (" (x" + std::to_string(base / ms).substr(0, 5) + " vs unsplit)").c_str() : "");
     }
     for (int sp : splits) {
       if (d / sp < 64) continue;

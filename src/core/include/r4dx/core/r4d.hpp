@@ -80,6 +80,12 @@ inline void AttnPrefillSplitKvBf16Kv(const Args& a, hipStream_t stream) {
 inline int64_t AttnPrefillSplitKvScratchBytes(const Args& a) {
   return r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(&a);
 }
+// Exact-wide prefill (prefill M1 lossless mode): AttnPrefillFp8Kv's bits over more workgroups.
+// Args::splits 0 = the default geometry (see r4d.h).
+inline void AttnPrefillExactFp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_exact_h256_gqa6_fp8kv",
+                 r4d_attn_prefill_exact_h256_gqa6_fp8kv(&a, stream));
+}
 inline void AttnDecodeFp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_decode_h256_gqa6_fp8kv", r4d_attn_decode_h256_gqa6_fp8kv(&a, stream));
 }

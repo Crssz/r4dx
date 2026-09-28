@@ -140,6 +140,15 @@ function Invoke-Cli($e, [string[]]$cliArgs, [string[]]$stdin, [string]$log) {
   return [pscustomobject]@{ code = $code; out = $out }
 }
 
+# The generated text: the non-log lines after the "[stats] container load" line. Load logs come
+# before it, and under --tp 2 the two rank threads' load lines can interleave mid-line on stderr,
+# leaving fragments that do not start with '['.
+function TextOf([string[]]$out) {
+  $i = 0
+  for ($k = 0; $k -lt $out.Count; $k++) { if ($out[$k] -match '^\[stats\] container load') { $i = $k + 1; break } }
+  return (@($out | Select-Object -Skip $i) | Where-Object { $_ -notmatch '^\[' -and $_ -notmatch 'NativeCommandError|CategoryInfo|^\s*At |^\s*\+ ' }) -join "`n"
+}
+
 for ($r = 1; $r -le $Runs; $r++) {
   foreach ($e in $entries) {
     for ($p = 0; $p -lt $prompts.Count; $p++) {
@@ -151,7 +160,7 @@ for ($r = 1; $r -le $Runs; $r++) {
         if ($m -match '^mtp(\d+)$') { $cliArgs += @('--mtp', $Matches[1]) }
         $res = Invoke-Cli $e $cliArgs $null $log
         $code = $res.code; $out = $res.out
-        $text = ($out | Where-Object { $_ -notmatch '^\[' -and $_ -notmatch 'NativeCommandError|CategoryInfo|^\s*At |^\s*\+ ' }) -join "`n"
+        $text = TextOf $out
         $row = [ordered]@{ name = $e.name; layout = $e.layout; tp = $e.tp; mode = $m; prompt = $p; run = $r; exit = $code
                            decode_tok_s = $null; tokens = $null; decode_s = $null; prefill_tokens = $null
                            prefill_s = $null; accept_pct = $null; tok_per_round = $null; vram_gib = $null

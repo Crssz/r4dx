@@ -25,13 +25,14 @@ committed.
 | `ttft_cli.ps1` | Measures cold TTFT through `r4dx-cli --prompt-file ... --stats`, one fresh process per run. `-ProfilePrefill` prints the `--profile-prefill` per-op table (the attention-share profile). |
 | `warm_delta.py` / `warm_delta.ps1` | Warm-turn cost at depth: a cold 32k/64k prompt, then a ~4k-token user turn appended through the server's prefix reuse (plus the same 4k cold at offset 0). Writes `warm_delta.jsonl` with each request's `timings`. |
 | `probe_depth.py` | Per-chunk prefill time vs depth (linears by class, chunked GDN, attention core, other) from the in-model probe timeline: run the CLI with `R4DX_PROFILE_LINEARS=all` and `R4DX_PROBE_TIMELINE=<csv>` (src/model/debug_probe.h; about 1% overhead at 128k), then `probe_depth.py --timeline <csv> --out <json>`. |
-| `tests/kernels/tool_attn_prefill_bench` | The prefill attention kernel alone at depth D: today's 64-row call vs bigger q_len and an emulated split-KV partial pass (`--depths`, `--qlens`, `--splits`, `--out`). |
+| `tests/kernels/tool_attn_prefill_bench` | The prefill attention kernel alone at depth D: today's 64-row call vs bigger q_len and an emulated split-KV partial pass (`--depths`, `--qlens`, `--splits`, `--out`). M1 adds `--splitkv` (the real split-KV entry) and `--exact g,g` (exact-wide geometries, bit-compared against the plain call). |
+| `tests/kernels/tool_attn_prefill_precision` | (M1) Plain, exact-wide and split-KV prefill attention against an fp64 CPU reference over the same fp8 cache, with flat and peaky data: rms error, the share correctly rounded, and closer or farther than plain. |
 
 Engine changes made for this kit:
 - `r4dx-cli --prompt-file <path>`: the Windows command line caps `--prompt` at 32767 characters, which is about 8k tokens.
 - `tool_teacher_forced_logprobs --tail-rows R [--tail-path decode|prefill]`: long-prefix mode. The sidecar records `first_row`, `prefix_tokens` and `prefill_seconds`.
 - (M1) `tool_teacher_forced_logprobs --prefix-split-at K`: prefills the prefix as two calls, which shifts every chunk boundary the way a prefix-cache restore does. This gives a rounding-level calibration for a variant's KL (`docs/prefill.md`). Pass it through `run_kl.ps1 -ExtraArgs`.
-- (M1) `R4DX_PREFILL_SPLITKV=0` turns split-KV prefill attention off. The result is the pre-M1 prefill, bit for bit. `=N` forces N segments on every call.
+- (M1) `R4DX_PREFILL_SPLITKV=0` turns split-KV prefill attention off. The result is the pre-M1 prefill, bit for bit. `=N` forces N segments on every call. `=exact` takes the exact-wide launch on every prompt-prefill call: the pre-M1 bits, about 1.5x faster at 128k.
 
 ## Tasks (`build_tasks.py`)
 

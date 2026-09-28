@@ -82,9 +82,19 @@ pass):
 
 ### Dense accuracy baselines
 
-- **Task set:** 154 RULER-style items from 8k to 128k, on mix45m at TP=1 with the 60e6fae binaries.
-  - The per-task scores for each length are in `baseline\tasks\mix45m\summary.json`.
-  - TODO: copy the table here.
+- **Task set:** 154 RULER-style items from 8k to 128k, on mix45m at TP=1 with the 60e6fae binaries
+  (`baseline\tasks\mix45m\summary.json`). Score in %, items in parentheses:
+
+  | task | 8k | 32k | 64k | 128k |
+  |---|---|---|---|---|
+  | niah_single | 100 (8) | 100 (8) | 100 (4) | 100 (2) |
+  | niah_multikey | 100 (8) | 100 (8) | 100 (4) | 100 (2) |
+  | niah_multivalue | 100 (8) | 100 (8) | 100 (4) | 100 (2) |
+  | niah_multiquery | 100 (8) | 100 (8) | 100 (4) | 100 (2) |
+  | vt | 97.5 (8) | 95.0 (8) | 30.0 (4) | 80.0 (2) |
+  | cwe | 100 (8) | 100 (8) | 100 (4) | 100 (2) |
+  | code_qa | 100 (8) | 100 (8) | 100 (4) | 50.0 (2) |
+  | **mean** | 99.6 | 99.3 | 90.0 | 90.0 |
 - **KL references:** prose, code and recall at 8k, 32k and 128k. Continuation perplexity:
 
   | length | prose | code | recall |
@@ -215,3 +225,223 @@ Kernel, q_len 64, ms per call (`tool_attn_prefill_bench --splitkv`, merge includ
 
 End to end at TP=1, prefix prefill: 32k goes from 38.3 s to 29.3 s (1.31x), and 128k from 299.6 s
 to 141.6 s (2.12x). TP=2 was not run in M1: this milestone ran on HIP device 1 only.
+
+## M1 results: the lossless gate, diagnosis and the exact-wide mode
+
+Split-KV at 4b04ece missed the lossless gate (mean KL <= 0.0005 and top-1 >= 99.5% against the M0
+dense dumps). It failed on prose_32k (0.00090, 97.7%), code_32k (0.00318, 98.0%) and prose_128k
+(0.00163, 96.9%). This section diagnoses why, adds a mode that is bit-identical, and re-validates
+both. Commits: libr4d `c9c0237` and `dec5a4f` (branch `prefill`), r4dx `d731bb8` and `b5e5eb9`.
+Raw outputs are in `D:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1 with
+the `b5e5eb9` build.
+
+### Diagnosis: split-KV is differently rounded, not less accurate
+
+Where the split and unsplit kernels can differ:
+
+| candidate | status in 4b04ece |
+|---|---|
+| partial O stored at reduced precision | No: each segment writes its fp32 accumulator. |
+| LSE, max or rescale order in the merge | fp32, with a fixed segment order, and deterministic. |
+| P rounded to f16 against a different max | **Yes.** p = 2^(s - m_ref + SHIFT) is rounded to f16 before the PV WMMA. m_ref is the kernel's lazy running max. Each segment starts it from its own first tile, so a split P is rounded against a different reference than the unsplit P: a different rounding, not a coarser one. |
+| fp32 summation order | **Yes.** Unsplit sums the tiles sequentially into one accumulator. Split sums them per segment and then merges the segments. |
+| segment boundaries vs tile order | Already on 48-key tile boundaries. That does not remove either of the two differences above. |
+
+The kernel-level test is `tool_attn_prefill_precision` (new). It runs one 64-row chunk at depth D
+through the plain, exact and split-KV (S = 8/16/32) launches. The reference is fp64 on the CPU
+(QK, softmax and PV in double) over the same fp8 cache and bf16 query. There are two data sets:
+- **flat:** i.i.d. data (entropy 7.6-11.7 nats);
+- **peaky:** keys share a mean direction and each row has 6 strongly aligned keys (top weight
+  about 0.15).
+
+Each metric compares against fp64:
+- **rms err:** rms error;
+- **correct:** the share of outputs equal to the correctly rounded bf16 of the fp64 value;
+- **closer / farther:** the share of outputs where the variant is nearer to fp64 than plain, or
+  further from it.
+
+| data | depth | variant | rms err | correct | closer / farther than plain |
+|---|---|---|---|---|---|
+| flat | 2048 | plain | 2.246e-05 | 87.88% | - |
+| flat | 2048 | split 8 | 2.246e-05 | 87.96% | 6.5% / 6.5% |
+| flat | 32768 | plain | 5.747e-06 | 87.64% | - |
+| flat | 32768 | split 8 | 5.748e-06 | 87.60% | 6.6% / 6.7% |
+| flat | 122880 | plain | 2.914e-06 | 87.84% | - |
+| flat | 122880 | split 8 | 2.915e-06 | 87.79% | 6.5% / 6.6% |
+| peaky | 2048 | plain | 6.236e-04 | 81.33% | - |
+| peaky | 2048 | split 8 | 6.235e-04 | 81.71% | 5.9% / 5.4% |
+| peaky | 32768 | plain | 6.220e-04 | 83.78% | - |
+| peaky | 32768 | split 8 | 6.181e-04 | 83.95% | 5.8% / 5.6% |
+| peaky | 122880 | plain | 6.547e-04 | 83.50% | - |
+| peaky | 122880 | split 8 | 6.163e-04 | 84.16% | 6.4% / 5.7% |
+| peaky | 122880 | split 16 | 6.157e-04 | 84.28% | 6.7% / 5.9% |
+
+Split 16 and split 32 match split 8 at every depth. The exact launch is bit-identical to plain at
+every depth.
+
+Split-KV's error against fp64 is the unsplit kernel's error:
+- With flat data, rms is within 0.05%.
+- With peaky data at depth, split-KV is slightly *more* accurate: rms is 6% lower at 123k, and the
+  correctly-rounded share is higher. The unsplit kernel's single long sequential fp32 sum is the
+  weaker of the two.
+- On the outputs where the two differ, split-KV is closer to fp64 about as often as it is farther.
+
+So the dense run is not a more correct reference. It is one member of a class of equally accurate
+roundings, and the model amplifies any change within that class:
+- M1's own calibration: moving the chunk boundaries with today's kernels gives 32k mean KL
+  0.0013-0.048, and split 8 vs split 16 gives the same KL as dense vs split 8.
+- On the task set (below), split 8 flips one knife-edge vt item at 32k, and split 4 and split 16 do
+  not.
+
+**Consequence for the gate.** "KL <= 0.0005 against the dense dump" can only be met by a kernel
+that is bit-identical to the dense one. No split of the KV range can be: the unsplit accumulator
+is a sequential fp32 sum under a history-dependent lazy max, and any parallel partition
+reassociates it. The meaningful gate for a non-bit-identical kernel is:
+1. error against an fp64 reference no worse than the unsplit kernel's (above: met);
+2. KL against dense within the calibrated rounding-class spread (met: split-KV KL is below the
+   chunk-shift KL at 32k);
+3. task scores within the spread of equally accurate variants, and perplexity not worse.
+
+A model-level KL against a higher-precision run (fp32 P, or HF bf16) is not available: r4dx has no
+higher-precision attention path, and an HF run at 32k-128k does not fit this box (M0 caveat). The
+kernel-level fp64 comparison stands in for it.
+
+### The lossless alternative: exact-wide prefill (`R4DX_PREFILL_SPLITKV=exact`)
+
+The plain call's parallelism can be widened along the two axes that never touch a row's
+arithmetic:
+- **Query rows:** fewer warps per workgroup. A wave keeps the same 16 rows, so its wave-uniform
+  lazy-max decisions stay the same.
+- **Output columns (DSPLIT):** DS workgroups share a q-block. Each redoes QK and the softmax, so it
+  has the same m_ref sequence, f16 P and row sum. Each stages only its 1/DS slice of V and writes
+  those d-tiles.
+
+Tile size is free too, because the lazy-max check runs once per 16-key m-tile. The default
+geometry is 12 warps x 4 d-slices x 96-key tiles, which gives 32 workgroups per chunk at 4 KV
+heads. `R4DX_PREFILL_SPLITKV=exact` routes every prompt-prefill call there at any depth. The price
+is recomputing QK and restaging K in every d-slice.
+
+| depth | plain ms | exact ms (x) | split-KV S=8 ms (x) | 2 KV heads: plain | exact (x) | S=16 (x) |
+|---|---|---|---|---|---|---|
+| 8192 | 0.695 | 0.308 (2.25x) | 0.143 (4.9x) | 0.679 | 0.258 (2.6x) | 0.086 (7.9x) |
+| 32768 | 2.714 | 1.175 (2.31x) | 0.496 (5.5x) | 2.790 | 1.033 (2.7x) | 0.246 (11.4x) |
+| 65536 | 5.514 | 2.410 (2.29x) | 0.981 (5.6x) | 5.721 | 2.202 (2.6x) | 0.522 (11.0x) |
+| 122880 | 10.859 | 4.518 (2.40x) | 1.779 (6.1x) | 11.053 | 4.365 (2.5x) | 0.960 (11.5x) |
+
+The table is `tool_attn_prefill_bench --exact`, q_len 64. It has 0 differing bf16 outputs in every
+geometry. `test_attn_prefill_splitkv` checks the same property for 11 geometries in every case:
+depth 0 to 32700, q_len 37/64/150, and a permuted block table.
+
+### Validation (TP=1, HIP device 1)
+
+**Cold TTFT** (`ttft_cli.ps1`, 2 runs, prefill seconds). The dense rerun is the same binary with
+`R4DX_PREFILL_SPLITKV=0`, run the same afternoon. It is about 5% slower at 8k than M0's morning
+runs, so compare within a row against it.
+
+| length | dense M0 | dense rerun | split-KV (default law) | exact |
+|---|---|---|---|---|
+| 8k | 7.23 / 7.28 | 7.62 / 7.60 | 7.58 / 7.61 (1.00x) | 7.33 / 7.37 (1.03x) |
+| 32k | 38.41 / 38.56 | 38.73 / 38.59 | 31.29 / 31.18 (1.24x) | 34.04 / 33.52 (1.14x) |
+| 64k | 103.03 / 102.94 | - | 66.62 / 66.70 (1.54x vs M0) | 78.35 / 78.50 (1.31x vs M0) |
+| 128k | 309.21 / 309.05 | 301.30 / 301.20 | 149.86 / 149.84 (2.01x) | 199.65 / 199.38 (1.51x) |
+
+The KL harness's prefix prefill gives the same ratios: split-KV 141.7 s vs 299.6 s at 128k, and
+exact 199.1 s.
+
+**Warm 4k turn** (`warm_delta.ps1`, prompt ms of the ~4k appended turn):
+
+| offset | dense (M0) | split-KV | exact |
+|---|---|---|---|
+| 0 (cold 4k) | 3.49 s | 3.63 s | 3.61 s |
+| after 32k | 6.54 s | 4.15 s | 4.96 s |
+| after 64k | 9.79 s | 4.67 s | 6.28 s |
+
+**KL against the M0 dense dumps** (`kl_compare.py`, 256 tail rows per segment):
+
+| segment | split-KV mean KL | p99 | top-1 % | ppl dense -> split | exact |
+|---|---|---|---|---|---|
+| prose_8k / code_8k / recall_8k | 0 (bytes identical) | 0 | 100 | identical | 0 (bytes identical, prose_8k) |
+| prose_32k | 0.00090 | 0.0057 | 97.66 | 3.915 -> 3.910 | 0 (bytes identical) |
+| code_32k | 0.00318 | 0.0770 | 98.05 | 1.837 -> 1.824 | 0 (bytes identical) |
+| recall_32k | 0.00018 | 0.0034 | 99.61 | 1.310 -> 1.310 | 0 (bytes identical) |
+| prose_128k | 0.00163 | 0.0114 | 96.88 | 4.524 -> 4.532 | 0 (bytes identical) |
+| code_128k | 0.00058 | 0.0113 | 100 | 1.192 -> 1.190 | 0 (bytes identical) |
+| recall_128k | 0.00009 | 0.0020 | 100 | 1.176 -> 1.175 | 0 (bytes identical) |
+
+- The split-KV dumps are 4b04ece's (`validate\kl\dense_vs_m1.json`). The `b5e5eb9` build
+  reproduces the 32k dumps byte for byte.
+- The exact dumps were made with the 12x4 geometry (48-key tiles). The 96-key default was
+  rechecked on code_32k and prose_128k, and those dumps are also byte-identical to dense.
+- kl_compare reports exact's top-5 on prose_128k as 99.61%. That is a tie-order artifact: the files
+  are byte-identical.
+
+**Task set against the M0 dense baseline** (score %, `score_tasks.py --compare`):
+
+| length | dense | split-KV | identical outputs | score changes |
+|---|---|---|---|---|
+| 32k (56 items) | 99.3 | 97.9 | 49/56 | vt-32k-03: 1.0 -> 0.2 (vt 95.0 -> 85.0) |
+| 128k (14 items) | 90.0 | 90.0 | 11/14 | none |
+
+vt calibration at 32k, with the same binary and the same 8 items:
+
+| mode | vt score | outputs identical to dense |
+|---|---|---|
+| split 8 (the default law) | 85.0 | 5/8 |
+| split 4 | 95.0 | 6/8 |
+| split 16 | 95.0 | 6/8 |
+| exact | 95.0 | 8/8 |
+
+The vt-32k-03 answer is knife-edge: the split-8 run stopped after the first of five names. Two
+other equally accurate rounding members keep it.
+
+**Other checks (b5e5eb9 build):**
+- `ctest -LE tp2gpu`: 92/92 passed. That includes `test_attn_prefill_splitkv` with the exact
+  geometries, and `test_forward_smoke`, which failed on both main and 4b04ece in the earlier run
+  with HIP error 719.
+- Short-prompt greedy identity against main, for plain, dflash7 and mtp3 with 4 prompts each:
+  12/12 byte-identical text and token ids. Those prompts never reach the split threshold. The exact
+  mode is bit-identical by construction.
+- Decode: unchanged. Decode, verify windows and MTP priming never take either new path. 4b04ece's
+  bench (`validate\decode_bench.log`: dflash7 116.37 vs 116.15 main, plain 36.54 vs 36.61) covers
+  the same decode code.
+
+**TP=2: not run.** TP=2 cold TTFT at 32k and 128k (split-KV and exact) and TP=2 short-prompt
+identity against main TP=2 need device 0. Device 0 is held until M0's own TP=2 128k run 2 finishes
+and writes `D:\models\r4dx\prefill-m0\TP2_DONE`, and that marker did not appear during this pass.
+To run them afterwards (the phase script is in this session's scratchpad, and its steps are the
+plain `ttft_cli.ps1 -Tp 2` calls):
+- `ttft_cli.ps1 -Tp 2 -Lengths 32k,128k -Runs 2 -Cli <b5e5eb9 build>\src\cli\r4dx-cli.exe`, once with
+  `R4DX_PREFILL_SPLITKV` unset and once with `=exact`;
+- the identity loop with `--tp 2 --tp-mode real` against `C:\Users\pay20\dev\r4dx\build\win-hip`.
+
+Expected from the kernel numbers: split-KV gives a TP=2 rank 16 segments, 11.5x on the attention
+call at 123k, against 2.5x for exact.
+
+### Gate decision
+
+| variant | lossless gate (KL <= 0.0005, top-1 >= 99.5%) | fp64 error vs plain | tasks | 128k TTFT |
+|---|---|---|---|---|
+| split-KV (branch default) | **fails** on 3 of 9 segments | equal (slightly better at depth) | 128k equal; 32k one knife-edge vt flip, not seen at S=4/16 | 2.01x (target 2x: met) |
+| exact-wide (`=exact`) | **passes** (bit-identical) | identical | identical | 1.51x (target: missed) |
+
+No single variant meets both the lossless gate and the 2x target. Nothing is merged to main.
+Options:
+
+1. **Exact as the default, split-KV opt-in.** Lossless by construction, 1.5x at 128k, 1.3x at 64k.
+   Split-KV stays one environment variable away for users who accept rounding-class drift for
+   2.0x.
+2. **Split-KV as the default under the redefined gate** (fp64 error no worse than dense, KL within
+   the calibrated rounding spread, task scores within the spread of equal-accuracy variants). This
+   is 2.0x at 128k and 1.5x at 64k. Keep exact as the switch for bit-for-bit reproducibility
+   against older runs.
+3. **Bigger chunks (option c) instead.** Not a lossless path either: it moves GDN and chunk
+   boundaries, which the calibration shows costs more KL than split-KV (32k mean KL 0.0013-0.048).
+   It also has the largest blast radius.
+4. **Push exact further.** It is capped by the redundant QK and K staging per d-slice. Measured:
+   2.3-2.4x per call at depth, and about 2x on the attention share of the 128k prefill end to end
+   (roughly 197 s -> 95 s, with 104 s of non-attention work). Closing the gap to
+   split-KV needs the d-slices to share QK, which RDNA4 cannot do across workgroups without a trip
+   through global memory.
+
+Recommendation: option 1 if "M1 = lossless" is binding, and option 2 otherwise. The fp64 analysis
+says split-KV costs no accuracy, only reproducibility against the old bits.

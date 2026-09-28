@@ -48,6 +48,12 @@
 //   --tp-rank r           with --tp-mode noop: which shard to load
 //   --tp-submit-layers N, --tp-max-inflight K   with --tp 2: the prefill submission bounding
 //                         (docs/tp.md Appendix B N57; default TpOptions')
+//   --tail-rows R         long-prefix mode (tools/prefill's KL harness): run the first T-R tokens of
+//                         each segment through ONE Prefill call (the chunked prefill path) and emit
+//                         only the last R rows; the sidecar records first_row, prefix_tokens and
+//                         prefill_seconds. 0 (default) = the uniform pass
+//   --tail-path {decode|prefill}   long-prefix mode: feed the tail through DecodeStep (default) or
+//                         through one-token Prefill calls
 //
 // MTP and DFlash2 are unconditionally off (ModelOptions::mtp_draft_k stays 0, dflash_container
 // stays empty): both are speculation strategies for GENERATING, and this tool never generates -- it
@@ -116,7 +122,8 @@ int main(int argc, char** argv) {
   int tp = 1, tp_rank = 0;
   int tp_submit_layers = -1, tp_max_inflight = -1;  // -1: TpOptions' default
   bool tp_options_given = false;
-  int64_t max_ctx = 8192, layers = -1, check_greedy = 0;
+  int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0;
+  std::string tail_path = "decode";
   bool no_write = false, quiet = false;
 
   try {
@@ -135,6 +142,8 @@ int main(int argc, char** argv) {
       else if (a == "--layers") layers = std::stoll(next());
       else if (a == "--vision") vision = next();
       else if (a == "--check-greedy") check_greedy = std::stoll(next());
+      else if (a == "--tail-rows") tail_rows = std::stoll(next());
+      else if (a == "--tail-path") tail_path = next();
       else if (a == "--no-write") no_write = true;
       else if (a == "--quiet") quiet = true;
       else if (a == "--embed-device-resident") embed_resident = next();
@@ -156,7 +165,12 @@ int main(int argc, char** argv) {
                             "[--check-greedy N] [--no-write] [--quiet] "
                             "[--embed-device-resident {on|off}] [--tp {1|2}] "
                             "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
-                            "[--tp-submit-layers N] [--tp-max-inflight K]\n");
+                            "[--tp-submit-layers N] [--tp-max-inflight K] [--tail-rows R] "
+                            "[--tail-path {decode|prefill}]\n");
+      return 2;
+    }
+    if (tail_rows < 0 || (tail_path != "decode" && tail_path != "prefill")) {
+      std::fprintf(stderr, "--tail-rows must be >= 0 and --tail-path 'decode' or 'prefill'\n");
       return 2;
     }
     if (embed_resident != "on" && embed_resident != "off") {
@@ -245,13 +259,23 @@ int main(int argc, char** argv) {
       so.check_greedy_last_n = check_greedy;
       so.progress_every = quiet ? 0 : 64;
       so.container_path = model_path;
-      std::printf("[segment] %s: T=%zu tokens -> %zu rows x %lld vocab\n", seg.name.c_str(),
-                  seg.token_ids.size(), seg.token_ids.size() - 1, static_cast<long long>(vocab));
+      so.tail_rows = tail_rows;
+      so.tail_via_prefill = tail_path == "prefill";
+      std::printf("[segment] %s: T=%zu tokens -> %lld rows x %lld vocab\n", seg.name.c_str(),
+                  seg.token_ids.size(),
+                  static_cast<long long>(tail_rows > 0 ? tail_rows
+                                                       : static_cast<int64_t>(seg.token_ids.size()) - 1),
+                  static_cast<long long>(vocab));
       const r4dx_tf::SegmentResult r = r4dx_tf::RunSegment(model, seg, so);
       peak_vram = std::max(peak_vram, ModelVramGiB(model));
       total_rows += r.rows;
       total_wall += r.wall_s;
       total_mismatches += r.greedy_mismatches;
+      if (tail_rows > 0) {
+        const long long n = static_cast<long long>(r.T - tail_rows);
+        std::printf("[prefill] %s: %lld-token prefix in %.3fs (%.2f tok/s)\n", seg.name.c_str(), n,
+                    r.prefill_s, r.prefill_s > 0.0 ? static_cast<double>(n) / r.prefill_s : 0.0);
+      }
       worst_lse = std::max(worst_lse, r.max_abs_lse);
       std::printf("[segment] %s: %lld rows in %.2fs (%.1f ms/row), max |logsumexp(row)| = %.3e, "
                   "sha256(token_ids)=%s\n",

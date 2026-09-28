@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,6 +30,10 @@ struct CliArgs {
   std::string layout = "bf16";
   std::string tokenizer_dir = "C:\\AI\\models\\Qwen3.8-27B";
   std::string prompt;
+  // --prompt-file <path>: the one-shot prompt read verbatim (UTF-8) from a file instead of the command
+  // line, whose 32767-character Windows limit caps --prompt near 8k tokens (tools/prefill's long
+  // prompts). Mutually exclusive with --prompt and --chat; ParseArgs loads it into `prompt`.
+  std::string prompt_file;
   bool chat = false;
   std::string system_prompt;
   bool thinking = false;
@@ -224,7 +230,7 @@ struct CliUsageError : std::runtime_error {
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16|trellis} "
-         "(--prompt \"...\" | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
+         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
@@ -309,6 +315,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--layout") a.layout = NextCliArg(argc, argv, i, "--layout");
     else if (arg == "--tokenizer-dir") a.tokenizer_dir = NextCliArg(argc, argv, i, "--tokenizer-dir");
     else if (arg == "--prompt") a.prompt = NextCliArg(argc, argv, i, "--prompt");
+    else if (arg == "--prompt-file") a.prompt_file = NextCliArg(argc, argv, i, "--prompt-file");
     else if (arg == "--chat") a.chat = true;
     else if (arg == "--system") a.system_prompt = NextCliArg(argc, argv, i, "--system");
     else if (arg == "--think") a.thinking = NextCliArg(argc, argv, i, "--think") == "on";
@@ -349,6 +356,15 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else throw CliUsageError("unrecognized argument: " + arg);
   }
   if (a.model_path.empty()) throw CliUsageError("--model is required");
+  if (!a.prompt_file.empty()) {
+    if (!a.prompt.empty()) throw CliUsageError("--prompt and --prompt-file are mutually exclusive");
+    std::ifstream pf(a.prompt_file, std::ios::binary);
+    if (!pf) throw CliUsageError("cannot read --prompt-file " + a.prompt_file);
+    std::ostringstream ss;
+    ss << pf.rdbuf();
+    a.prompt = ss.str();
+    if (a.prompt.empty()) throw CliUsageError("--prompt-file " + a.prompt_file + " is empty");
+  }
   if (a.prompt.empty() && !a.chat) throw CliUsageError("one of --prompt or --chat is required");
   if (!a.prompt.empty() && a.chat) throw CliUsageError("--prompt and --chat are mutually exclusive");
   // Reject nonsensical numeric values outright rather than passing them to the model, where they

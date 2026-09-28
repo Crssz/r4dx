@@ -234,6 +234,8 @@ struct SegmentResult {
   int64_t V = 0;
   int64_t rows = 0;
   double wall_s = 0.0;
+  // Wall time of the pass's first Prefill call (in long-prefix mode, the whole N-token prefix).
+  double prefill_s = 0.0;
   // max over rows of |log sum_j exp(row[j])| -- 0 for an exact log_softmax, so this is the pass's
   // own arithmetic self-check (the gate's "logsumexp(row) within 1e-2 of 0" assertion).
   double max_abs_lse = 0.0;
@@ -270,6 +272,15 @@ struct SegmentOptions {
   int64_t progress_every = 64;
   // Extra provenance copied verbatim into the sidecar.
   std::string container_path;
+  // Long-prefix mode (tools/prefill, the prefill KL harness): 0 (default) is the uniform pass above,
+  // byte for byte. R > 0 (and R < T) instead runs the first N = T-R tokens through ONE
+  // TextModel::Prefill call -- the real chunked prefill path, i.e. the path a long prompt takes --
+  // and emits only the last R rows (row N-1 from that Prefill's logits, rows N..T-2 from the tail
+  // feed below). The dump is then [R, V] and the sidecar records "first_row" = N-1.
+  int64_t tail_rows = 0;
+  // How the tail tokens ids[N..T-2] are fed in long-prefix mode: false = DecodeStep (the decode
+  // path, like a generation), true = one-token TextModel::Prefill calls (the prefill path).
+  bool tail_via_prefill = false;
 };
 
 // Runs the whole pass for one segment on `model`, which it Reset()s first so the segment is always
@@ -280,9 +291,15 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
   SegmentResult r;
   r.T = static_cast<int64_t>(seg.token_ids.size());
   r.V = model.Config().vocab_size;
-  r.rows = r.T - 1;
   r.sha256 = TokenIdsSha256(seg.token_ids);
   if (r.T < 2) throw std::runtime_error("RunSegment: segment '" + seg.name + "' needs T >= 2");
+  if (opts.tail_rows < 0 || opts.tail_rows >= r.T) {
+    throw std::runtime_error("RunSegment: segment '" + seg.name + "' (T=" + std::to_string(r.T) +
+                              ") needs 0 <= tail_rows < T, got " + std::to_string(opts.tail_rows));
+  }
+  // Row index of the first emitted row: 0 for the uniform pass, N-1 in long-prefix mode.
+  const int64_t first_row = opts.tail_rows > 0 ? r.T - opts.tail_rows - 1 : 0;
+  r.rows = r.T - 1 - first_row;
 
   std::FILE* out = nullptr;
   std::string bin_path;
@@ -292,11 +309,12 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
     if (out == nullptr) throw std::runtime_error("cannot write " + bin_path);
   }
 
-  // Rows [first_greedy_row, rows-1] are the ones whose successor token was greedily generated.
+  // Rows [first_greedy_row, T-2] are the ones whose successor token was greedily generated (row
+  // indices are absolute positions, also in long-prefix mode).
   const int64_t first_greedy_row =
       opts.check_greedy_last_n > 0
-          ? std::max<int64_t>(0, r.rows - opts.check_greedy_last_n)
-          : r.rows;  // == no row qualifies
+          ? std::max<int64_t>(0, r.T - 1 - opts.check_greedy_last_n)
+          : r.T - 1;  // == no row qualifies
 
   std::vector<float> lp(static_cast<size_t>(r.V));
   std::vector<uint16_t> half(static_cast<size_t>(r.V));
@@ -305,9 +323,12 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
 
   const auto t0 = Clock::now();
   model.Reset();
-  std::vector<float> logits = model.Prefill({seg.token_ids[0]});
+  std::vector<float> logits =
+      model.Prefill(std::vector<int32_t>(seg.token_ids.begin(), seg.token_ids.begin() + first_row + 1));
+  r.prefill_s = std::chrono::duration<double>(Clock::now() - t0).count();
 
-  for (int64_t i = 0; i < r.rows; ++i) {
+  for (int64_t k = 0; k < r.rows; ++k) {
+    const int64_t i = first_row + k;  // absolute row index
     if (static_cast<int64_t>(logits.size()) != r.V) {
       if (out) std::fclose(out);
       throw std::runtime_error("RunSegment: engine returned " + std::to_string(logits.size()) +
@@ -366,16 +387,19 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
       }
     }
 
-    if (opts.progress_every > 0 && ((i + 1) % opts.progress_every == 0 || i + 1 == r.rows)) {
+    if (opts.progress_every > 0 && ((k + 1) % opts.progress_every == 0 || k + 1 == r.rows)) {
       const double el = std::chrono::duration<double>(Clock::now() - t0).count();
       std::printf("  [%s] row %lld/%lld  %.1fs  (%.1f ms/row)\n", seg.name.c_str(),
-                  static_cast<long long>(i + 1), static_cast<long long>(r.rows), el,
-                  1000.0 * el / static_cast<double>(i + 1));
+                  static_cast<long long>(k + 1), static_cast<long long>(r.rows), el,
+                  1000.0 * el / static_cast<double>(k + 1));
       std::fflush(stdout);
     }
 
     // Feed the next token. ids[T-1] is deliberately never fed: no row would read its logits.
-    if (i + 1 < r.rows) logits = model.DecodeStep(seg.token_ids[static_cast<size_t>(i + 1)]);
+    if (k + 1 < r.rows) {
+      const int32_t next = seg.token_ids[static_cast<size_t>(i + 1)];
+      logits = opts.tail_via_prefill ? model.Prefill({next}) : model.DecodeStep(next);
+    }
   }
   r.wall_s = std::chrono::duration<double>(Clock::now() - t0).count();
 
@@ -393,7 +417,15 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
     meta["container"] = opts.container_path;
     meta["clamp_min"] = -1e4;
     meta["engine"] = "r4dx tool_teacher_forced_logprobs";
-    meta["path"] = "Prefill(ids[0]) + DecodeStep(ids[1..T-2])";
+    if (opts.tail_rows > 0) {
+      meta["path"] = std::string("Prefill(ids[0..N)) + ") +
+                     (opts.tail_via_prefill ? "Prefill({id})" : "DecodeStep") + "(ids[N..T-2])";
+      meta["first_row"] = first_row;
+      meta["prefix_tokens"] = first_row + 1;
+      meta["prefill_seconds"] = r.prefill_s;
+    } else {
+      meta["path"] = "Prefill(ids[0]) + DecodeStep(ids[1..T-2])";
+    }
     if (model.TpWorld() > 1) meta["tp_world"] = model.TpWorld();  // absent at TP=1: same bytes as before
     meta["mtp"] = 0;
     meta["dflash"] = false;

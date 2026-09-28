@@ -502,9 +502,42 @@ void TestTpFlags() {
   CHECK(!TpThrows({"--tp", "1"}));
 }
 
+// --prompt-file (tools/prefill): loads the file verbatim into `prompt`; exclusive with --prompt and
+// --chat; a missing or empty file is a usage error.
+void TestPromptFile() {
+  const std::string path = "test_args_prompt_file.tmp";
+  const std::string body = "line one\nline two \xE0\xB8\x81\n";
+  {
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    CHECK(f != nullptr);
+    if (f == nullptr) return;
+    std::fwrite(body.data(), 1, body.size(), f);
+    std::fclose(f);
+  }
+  auto parse = [](std::vector<std::string> extra, r4dx::cli::CliArgs* out) {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx"};
+    storage.insert(storage.end(), extra.begin(), extra.end());
+    auto argv = ToArgv(storage);
+    try {
+      *out = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::cli::CliUsageError&) {
+      return false;
+    }
+    return true;
+  };
+  r4dx::cli::CliArgs a;
+  CHECK(parse({"--prompt-file", path}, &a));
+  CHECK(a.prompt == body);
+  CHECK(!parse({"--prompt-file", path, "--prompt", "x"}, &a));
+  CHECK(!parse({"--prompt-file", path, "--chat"}, &a));
+  CHECK(!parse({"--prompt-file", "no_such_file_test_args.tmp"}, &a));
+  std::remove(path.c_str());
+}
+
 }  // namespace
 
 int main() {
+  TestPromptFile();
   TestMinimalPrompt();
   TestChatAndOptions();
   TestMissingModelThrows();

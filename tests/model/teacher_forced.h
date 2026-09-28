@@ -281,6 +281,11 @@ struct SegmentOptions {
   // How the tail tokens ids[N..T-2] are fed in long-prefix mode: false = DecodeStep (the decode
   // path, like a generation), true = one-token TextModel::Prefill calls (the prefill path).
   bool tail_via_prefill = false;
+  // Long-prefix mode only: K > 0 prefills the prefix as TWO Prefill calls, ids[0..K) then the rest,
+  // which shifts every later 64-row chunk boundary by K -- what a prefix-cache restore at position K
+  // followed by the suffix's prefill does. The same math at a different rounding: the calibration
+  // for a variant's KL (prefill M1). 0 (default) = one Prefill call, byte for byte.
+  int64_t prefix_split_at = 0;
 };
 
 // Runs the whole pass for one segment on `model`, which it Reset()s first so the segment is always
@@ -323,8 +328,14 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
 
   const auto t0 = Clock::now();
   model.Reset();
-  std::vector<float> logits =
-      model.Prefill(std::vector<int32_t>(seg.token_ids.begin(), seg.token_ids.begin() + first_row + 1));
+  std::vector<float> logits;
+  if (opts.tail_rows > 0 && opts.prefix_split_at > 0 && opts.prefix_split_at < first_row + 1) {
+    model.Prefill(std::vector<int32_t>(seg.token_ids.begin(), seg.token_ids.begin() + opts.prefix_split_at));
+    logits = model.Prefill(std::vector<int32_t>(seg.token_ids.begin() + opts.prefix_split_at,
+                                                seg.token_ids.begin() + first_row + 1));
+  } else {
+    logits = model.Prefill(std::vector<int32_t>(seg.token_ids.begin(), seg.token_ids.begin() + first_row + 1));
+  }
   r.prefill_s = std::chrono::duration<double>(Clock::now() - t0).count();
 
   for (int64_t k = 0; k < r.rows; ++k) {
@@ -423,6 +434,7 @@ inline SegmentResult RunSegment(r4dx::model::TextModel& model, const Segment& se
       meta["first_row"] = first_row;
       meta["prefix_tokens"] = first_row + 1;
       meta["prefill_seconds"] = r.prefill_s;
+      if (opts.prefix_split_at > 0) meta["prefix_split_at"] = opts.prefix_split_at;
     } else {
       meta["path"] = "Prefill(ids[0]) + DecodeStep(ids[1..T-2])";
     }

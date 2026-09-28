@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "linear.h"  // r4dx::model::ApplyLinear -- shared qg/o/k/v quantized-linear dispatch
@@ -40,6 +41,42 @@
 #include "r4dx/model/attention/types.hpp"
 
 namespace r4dx::model::attention {
+
+// prefill M1 split law (docs/prefill.md): how many KV segments one prefill attention call gets at
+// context `ctx` (= start_pos + T, the call's seqused_k). A pure function of (ctx, q_len, kv_heads),
+// so every rank of a TP group, every rerun and every prefix-reuse replay of the same chunk makes the
+// same choice.
+//   - Below kPrefillSplitKvMinCtx: 1, i.e. the plain launch, so short and medium prompts stay
+//     bit-identical to the unsplit runtime.
+//   - Above it: enough segments that q_blocks x kv_heads x splits reaches kPrefillSplitKvTargetWgs
+//     workgroups (the device's 32 WGPs each hold one of these 54 KB-LDS workgroups), rounded down to
+//     a power of two, and never segments thinner than kPrefillSplitKvMinTiles 48-key tiles.
+// At TP=2 kv_heads per rank is half, so the same law gives each rank twice the segments.
+inline constexpr int kPrefillSplitKvMinCtx = 8192;
+inline constexpr int kPrefillSplitKvTargetWgs = 32;
+inline constexpr int kPrefillSplitKvMinTiles = 8;
+inline int PrefillSplitKvSplits(int ctx, int q_len, int kv_heads) {
+  if (ctx < kPrefillSplitKvMinCtx || q_len < 1 || kv_heads < 1) return 1;
+  const int units = ((q_len + 63) / 64) * kv_heads;
+  const int tiles = (ctx + 47) / 48;
+  int s = 1;
+  while (s * 2 * units <= kPrefillSplitKvTargetWgs && tiles / (s * 2) >= kPrefillSplitKvMinTiles) s *= 2;
+  return s;
+}
+
+// R4DX_PREFILL_SPLITKV (read once per process): unset or empty = PrefillSplitKvSplits' law; "0" or
+// "1" = never split (the pre-M1 prefill, bit for bit -- the kill switch); N > 1 = exactly N segments
+// on every prefill-kernel call a prompt prefill makes, at any depth (A/B and calibration runs),
+// capped at 32 (the fp32 partials are 64 x q_heads x N x 1032 B of the layer's 96 MiB arena).
+inline int PrefillSplitKvOverride() {
+  static const int v = [] {
+    const char* e = std::getenv("R4DX_PREFILL_SPLITKV");
+    if (e == nullptr || *e == '\0') return -1;
+    const int n = std::atoi(e);
+    return n < 1 ? 1 : (n > 32 ? 32 : n);
+  }();
+  return v;
+}
 
 class AttentionLayer {
  public:
@@ -95,6 +132,12 @@ class AttentionLayer {
   // of which must stay the plain running token index -- and only the rope call switches to
   // r4dx_rope_partial_mrope3_bf16. nullptr (the default, and every text-only caller) keeps the
   // pre-vision single-row path, byte for byte.
+  //
+  // `prefill_split_kv` (prefill M1, docs/prefill.md): true only from a PROMPT prefill chunk
+  // (Model::RunChunk on its prefill path, Model::PrefillProfiled). It lets the prefill-kernel branch
+  // below split the KV range when the context is deep (PrefillSplitKvSplits); false -- the default,
+  // and every decode, verify-window (MTP/DFlash), MTP-priming and test caller -- keeps the plain
+  // launch, bit for bit.
   void Forward(core::Arena& arena, const uint16_t* hidden_in, uint16_t* out, const AttnWeights& w,
                PagedKvCache& kv, int T, int start_pos, const int32_t* positions,
                const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
@@ -102,7 +145,8 @@ class AttentionLayer {
                SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
                const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
                int next_epilogue = 0, void* next_epilogue_out = nullptr,
-               float* next_epilogue_scale = nullptr, const int32_t* rope_pos3 = nullptr) {
+               float* next_epilogue_scale = nullptr, const int32_t* rope_pos3 = nullptr,
+               bool prefill_split_kv = false) {
     if (T < 1 || T > 64) {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
@@ -300,9 +344,23 @@ class AttentionLayer {
       ProfiledCall(prof, stream, "attn.core_decode",
                    [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
     } else {
+      // prefill M1: a deep prefill chunk cuts the KV range into segments (PrefillSplitKvSplits);
+      // below its threshold, and on every non-prefill caller, this is the plain launch.
+      const int forced = prefill_split_kv ? PrefillSplitKvOverride() : 1;
+      const int splits = !prefill_split_kv ? 1
+                         : forced > 0     ? forced
+                                          : PrefillSplitKvSplits(start_pos + T, T, Hkv);
       a.scratch = nullptr;
-      ProfiledCall(prof, stream, "attn.core_prefill",
-                   [&] { r4dx::core::r4d::AttnPrefillFp8Kv(a, stream); });
+      if (splits > 1) {
+        a.splits = splits;
+        const int64_t bytes = r4dx::core::r4d::AttnPrefillSplitKvScratchBytes(a);
+        a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(bytes), /*align_bytes=*/256);
+        ProfiledCall(prof, stream, "attn.core_prefill",
+                     [&] { r4dx::core::r4d::AttnPrefillSplitKvFp8Kv(a, stream); });
+      } else {
+        ProfiledCall(prof, stream, "attn.core_prefill",
+                     [&] { r4dx::core::r4d::AttnPrefillFp8Kv(a, stream); });
+      }
     }
 
     // ---- output gate: attn_out * sigmoid(gate) --------------------------------------------------

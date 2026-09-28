@@ -66,6 +66,20 @@ inline void AttnPrefillFp8Kv(const Args& a, hipStream_t stream) {
 inline void AttnPrefillBf16Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_prefill_h256_gqa6_bf16kv", r4d_attn_prefill_h256_gqa6_bf16kv(&a, stream));
 }
+// Split-KV prefill (prefill M1): Args::splits segments of the KV range, fp32 partials in
+// Args::scratch (AttnPrefillSplitKvScratchBytes), fixed-order merge. splits <= 1 is exactly
+// AttnPrefill*Kv above (same kernel, same bits, no scratch).
+inline void AttnPrefillSplitKvFp8Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa6_fp8kv",
+                 r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(&a, stream));
+}
+inline void AttnPrefillSplitKvBf16Kv(const Args& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa6_bf16kv",
+                 r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(&a, stream));
+}
+inline int64_t AttnPrefillSplitKvScratchBytes(const Args& a) {
+  return r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(&a);
+}
 inline void AttnDecodeFp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_decode_h256_gqa6_fp8kv", r4d_attn_decode_h256_gqa6_fp8kv(&a, stream));
 }

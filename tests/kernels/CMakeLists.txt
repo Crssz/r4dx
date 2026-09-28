@@ -8,6 +8,9 @@ set(R4DX_KERNEL_TESTS
   test_kv_write
   test_sampler
   test_attn_decode
+  # prefill M1: split-KV prefill attention -- splits<=1 bit-identical to the plain launch, split
+  # outputs at the unsplit kernel's own error against a CPU fp32 reference, deterministic.
+  test_attn_prefill_splitkv
   test_gdn_chunk_scan
   test_kernel_bandwidth
   test_fused_quant

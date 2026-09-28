@@ -30,6 +30,8 @@ committed.
 Engine changes made for this kit:
 - `r4dx-cli --prompt-file <path>`: the Windows command line caps `--prompt` at 32767 characters, which is about 8k tokens.
 - `tool_teacher_forced_logprobs --tail-rows R [--tail-path decode|prefill]`: long-prefix mode. The sidecar records `first_row`, `prefix_tokens` and `prefill_seconds`.
+- (M1) `tool_teacher_forced_logprobs --prefix-split-at K`: prefills the prefix as two calls, which shifts every chunk boundary the way a prefix-cache restore does. This gives a rounding-level calibration for a variant's KL (`docs/prefill.md`). Pass it through `run_kl.ps1 -ExtraArgs`.
+- (M1) `R4DX_PREFILL_SPLITKV=0` turns split-KV prefill attention off. The result is the pre-M1 prefill, bit for bit. `=N` forces N segments on every call.
 
 ## Tasks (`build_tasks.py`)
 

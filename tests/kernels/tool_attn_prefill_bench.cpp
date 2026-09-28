@@ -13,6 +13,9 @@
 //           ctx D/S + 64 each (grid 1 x 4 x S): the parallel partial pass of a split-KV prefill
 //           (each segment writes normalized bf16 rather than f16 partials + LSE, same size class).
 //           The LSE merge is not included: it is one small pass over 64 x 24 x S x ~520 B.
+//   splitkv prefill M1 (docs/prefill.md): the REAL split-KV prefill, r4d_attn_prefill_splitkv_*,
+//           q_len 64 at depth D cut into S segments (--splitkv, default 2..32), fp32 partials and
+//           the merge included. --kv-heads 2 is one TP=2 rank's shape (default 4).
 // Timing: hipEvents around --reps back-to-back launches after --warmup, reported as the mean per
 // call. Output: one line per shape on stdout and, with --out, a JSON file.
 //
@@ -58,7 +61,8 @@ int main(int argc, char** argv) {
   std::vector<int> depths = {0, 8192, 32768, 65536, 122880};
   std::vector<int> qlens = {64, 128, 256, 512, 1024};
   std::vector<int> splits = {2, 4, 8, 16};
-  int reps = 20, warmup = 3;
+  std::vector<int> splitkv = {2, 4, 8, 16, 32};
+  int reps = 20, warmup = 3, kv_heads_arg = 4;
   const char* out_path = nullptr;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -66,20 +70,22 @@ int main(int argc, char** argv) {
     if (a == "--depths" && v) { depths = ParseList(v); ++i; }
     else if (a == "--qlens" && v) { qlens = ParseList(v); ++i; }
     else if (a == "--splits" && v) { splits = ParseList(v); ++i; }
+    else if (a == "--splitkv" && v) { splitkv = ParseList(v); ++i; }
     else if (a == "--reps" && v) { reps = std::atoi(v); ++i; }
+    else if (a == "--kv-heads" && v) { kv_heads_arg = std::atoi(v); ++i; }  // 2 = one TP=2 rank
     else if (a == "--warmup" && v) { warmup = std::atoi(v); ++i; }
     else if (a == "--out" && v) { out_path = v; ++i; }
     else {
       std::fprintf(stderr,
                    "usage: tool_attn_prefill_bench [--depths a,b] [--qlens a,b] [--splits a,b] "
-                   "[--reps N] [--warmup N] [--out f.json]\n");
+                   "[--splitkv a,b] [--kv-heads N] [--reps N] [--warmup N] [--out f.json]\n");
       return 2;
     }
   }
   R4DX_HIP_CHECK(hipSetDevice(0));
   int head_dim = 0, gqa = 0, block_size = 0, max_decode_rows = 0;
   r4d_attn_dims(&head_dim, &gqa, &block_size, &max_decode_rows);
-  const int kv_heads = 4, q_heads = kv_heads * gqa;
+  const int kv_heads = kv_heads_arg, q_heads = kv_heads * gqa;
   const int max_q = std::max(64, *std::max_element(qlens.begin(), qlens.end()));
   const int max_depth = *std::max_element(depths.begin(), depths.end());
   const int max_splits = splits.empty() ? 1 : *std::max_element(splits.begin(), splits.end());
@@ -137,7 +143,15 @@ int main(int argc, char** argv) {
   R4DX_HIP_CHECK(hipEventCreate(&e0));
   R4DX_HIP_CHECK(hipEventCreate(&e1));
 
-  auto time_call = [&](int num_seqs, int q_len, int ctx) -> double {
+  // splitkv > 0: the split-KV entry with that many segments (scratch_d holds its partials).
+  const int max_splitkv = splitkv.empty() ? 1 : *std::max_element(splitkv.begin(), splitkv.end());
+  void* scratch_d = nullptr;
+  {
+    const size_t scratch_bytes = static_cast<size_t>(64) * q_heads * std::min(64, std::max(1, max_splitkv)) *
+                                 (head_dim + 2) * 4;
+    R4DX_HIP_CHECK(hipMalloc(&scratch_d, scratch_bytes));
+  }
+  auto time_call = [&](int num_seqs, int q_len, int ctx, int splitkv_n = 0) -> double {
     std::vector<int> seq(static_cast<size_t>(num_seqs), ctx);
     R4DX_HIP_CHECK(hipMemcpy(seq_d, seq.data(), seq.size() * sizeof(int), hipMemcpyHostToDevice));
     R4DArgs a{};
@@ -159,14 +173,20 @@ int main(int argc, char** argv) {
     a.kv_head_stride = kv_head_stride;
     a.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     a.max_ctx = ctx;
+    a.splits = splitkv_n;
+    a.scratch = splitkv_n > 0 ? scratch_d : nullptr;
+    auto launch = [&]() {
+      return splitkv_n > 0 ? r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(&a, s)
+                           : r4d_attn_prefill_h256_gqa6_fp8kv(&a, s);
+    };
     for (int i = 0; i < warmup; ++i) {
-      if (r4d_attn_prefill_h256_gqa6_fp8kv(&a, s) != 0) {
+      if (launch() != 0) {
         std::fprintf(stderr, "[attn-bench] launch rejected\n");
         std::exit(1);
       }
     }
     R4DX_HIP_CHECK(hipEventRecord(e0, s));
-    for (int i = 0; i < reps; ++i) r4d_attn_prefill_h256_gqa6_fp8kv(&a, s);
+    for (int i = 0; i < reps; ++i) launch();
     R4DX_HIP_CHECK(hipEventRecord(e1, s));
     R4DX_HIP_CHECK(hipEventSynchronize(e1));
     float ms = 0.0f;
@@ -188,6 +208,16 @@ int main(int argc, char** argv) {
                   (q != 64 && base > 0) ? (" (x" + std::to_string(base / (ms * 64.0 / q)).substr(0, 5) +
                                            " vs q_len 64)").c_str()
                                         : "");
+    }
+    // prefill M1: the real split-KV prefill (r4d_attn_prefill_splitkv_*: one sequence, the KV range
+    // cut into S segments, fp32 partials AND the merge), q_len 64 at depth D.
+    for (int sp : splitkv) {
+      const double ms = time_call(1, 64, d + 64, sp);
+      results.push_back({"splitkv", d, 64, sp, kv_heads * sp, ms});
+      std::printf("[attn-bench] depth %6d splitkv %2d (q_len 64) grid %4d: %9.4f ms/call incl. merge%s\n",
+                  d, sp, kv_heads * sp, ms,
+                  base > 0 ? (" (x" + std::to_string(base / ms).substr(0, 5) + " vs unsplit)").c_str()
+                           : "");
     }
     for (int sp : splits) {
       if (d / sp < 64) continue;

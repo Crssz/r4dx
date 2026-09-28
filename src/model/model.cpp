@@ -928,7 +928,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
+                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3,
+                    /*prefill_split_kv=*/is_prefill_path);
       std::swap(cur, other);
     }
 
@@ -1786,7 +1787,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                       attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
                       &acc, normed_in_epilogue, buf_normed_pre_.data(),
                       buf_normed_pre_scale_.data(), body_epilogue_, buf_normed_pre_.data(),
-                      buf_normed_pre_scale_.data(), rope_pos3);
+                      buf_normed_pre_scale_.data(), rope_pos3, /*prefill_split_kv=*/true);
         std::swap(cur, other);
       }
 

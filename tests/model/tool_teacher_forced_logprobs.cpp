@@ -54,6 +54,9 @@
 //                         prefill_seconds. 0 (default) = the uniform pass
 //   --tail-path {decode|prefill}   long-prefix mode: feed the tail through DecodeStep (default) or
 //                         through one-token Prefill calls
+//   --prefix-split-at K   long-prefix mode: prefill the prefix as two calls, ids[0..K) then the rest
+//                         (chunk boundaries shifted by K, like a prefix-cache restore) -- the
+//                         calibration for a variant's KL. 0 (default) = one call
 //
 // MTP and DFlash2 are unconditionally off (ModelOptions::mtp_draft_k stays 0, dflash_container
 // stays empty): both are speculation strategies for GENERATING, and this tool never generates -- it
@@ -122,7 +125,7 @@ int main(int argc, char** argv) {
   int tp = 1, tp_rank = 0;
   int tp_submit_layers = -1, tp_max_inflight = -1;  // -1: TpOptions' default
   bool tp_options_given = false;
-  int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0;
+  int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0, prefix_split_at = 0;
   std::string tail_path = "decode";
   bool no_write = false, quiet = false;
 
@@ -144,6 +147,7 @@ int main(int argc, char** argv) {
       else if (a == "--check-greedy") check_greedy = std::stoll(next());
       else if (a == "--tail-rows") tail_rows = std::stoll(next());
       else if (a == "--tail-path") tail_path = next();
+      else if (a == "--prefix-split-at") prefix_split_at = std::stoll(next());
       else if (a == "--no-write") no_write = true;
       else if (a == "--quiet") quiet = true;
       else if (a == "--embed-device-resident") embed_resident = next();
@@ -166,7 +170,7 @@ int main(int argc, char** argv) {
                             "[--embed-device-resident {on|off}] [--tp {1|2}] "
                             "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
                             "[--tp-submit-layers N] [--tp-max-inflight K] [--tail-rows R] "
-                            "[--tail-path {decode|prefill}]\n");
+                            "[--tail-path {decode|prefill}] [--prefix-split-at K]\n");
       return 2;
     }
     if (tail_rows < 0 || (tail_path != "decode" && tail_path != "prefill")) {
@@ -261,6 +265,7 @@ int main(int argc, char** argv) {
       so.container_path = model_path;
       so.tail_rows = tail_rows;
       so.tail_via_prefill = tail_path == "prefill";
+      so.prefix_split_at = prefix_split_at;
       std::printf("[segment] %s: T=%zu tokens -> %lld rows x %lld vocab\n", seg.name.c_str(),
                   seg.token_ids.size(),
                   static_cast<long long>(tail_rows > 0 ? tail_rows

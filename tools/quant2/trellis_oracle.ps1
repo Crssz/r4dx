@@ -20,6 +20,10 @@ param(
   [string]$KlDir = 'D:\models\r4dx\kl-trellis',
   [string]$RefDir = 'D:\models\r4dx\kl-canon\ref',
   [string]$Tokens = 'tools\reference\kl_corpus\tokens_canon.json',
+  # The bf16 checkpoint quantize-model reads and the golden run streams; '' = the tools' default
+  # (common.DEFAULT_MODEL_DIR). A fine-tune with the base's config.json (e.g. Huihui abliterated) MUST
+  # pass it: config_sha256 cannot tell the two apart, so nothing else would refuse the base weights.
+  [string]$ModelDir = '',
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )
 $ErrorActionPreference = 'Stop'
@@ -27,6 +31,7 @@ $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location $repo
 $env:HIP_VISIBLE_DEVICES = '1'
 $env:PYTHONIOENCODING = 'utf-8'
+$modelArgs = @(if ($ModelDir) { '--model-dir', $ModelDir })
 New-Item -ItemType Directory -Force $QDir, $KlDir | Out-Null
 if (-not (Test-Path (Join-Path $RefDir 'reference_run.json'))) { throw "[trellis] no reference in $RefDir" }
 
@@ -64,7 +69,7 @@ function Quantize([string]$point) {
   $basis = if ($Matches[2]) { 'matched' } else { 'exl3' }
   $k = $Matches[1]
   Assert-GpuFree
-  Run "quantize_$point" { & $Python tools\reference\trellis_quant.py quantize-model --device cuda --K $k --hessian-basis $basis --hessian-dir $HessianDir --out-dir $dir }
+  Run "quantize_$point" { & $Python tools\reference\trellis_quant.py quantize-model --device cuda --K $k --hessian-basis $basis --hessian-dir $HessianDir --out-dir $dir @modelArgs }
   if (-not (Complete $dir)) { throw "[trellis] $dir incomplete after quantize-model" }
 }
 
@@ -86,7 +91,7 @@ foreach ($p in $Points) {
   Assert-GpuFree
   # A partial dump from an interrupted run would be refused (or worse, mixed); start it clean.
   if (Test-Path $out) { Remove-Item -Recurse -Force $out }
-  Run "golden_$p" { & $Python tools\reference\full_logits_golden.py --device cuda --tokens $Tokens --weights-override $src --out-dir $out }
+  Run "golden_$p" { & $Python tools\reference\full_logits_golden.py --device cuda --tokens $Tokens --weights-override $src --out-dir $out @modelArgs }
   $klTmp = Join-Path $KlDir "kl_$p.tmp.json"
   Run "kl_$p" { & $Python tools\reference\kl_report.py --ref-dir $RefDir --test-dir $out --tokens $Tokens --out $klTmp }
   Move-Item -Force $klTmp $klPath

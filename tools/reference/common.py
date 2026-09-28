@@ -330,6 +330,10 @@ def resolve_device(requested: str) -> torch.device:  # noqa: F821 (annotations a
     selected by setting $env:HIP_VISIBLE_DEVICES='1' *before* the process starts (torch/HIP reads
     it at import/init time). Once that's set, torch's ROCm build sees exactly one device at CUDA
     index 0, which is physical device 1.
+
+    Opt-in exception: with $env:R4DX_ALLOW_GPU0='1' (set only when the user has granted device 0
+    for the run, e.g. two independent reference jobs in parallel), HIP_VISIBLE_DEVICES='0' is
+    accepted too. Device 0 drives the desktop; torch's kernels are short, so no TDR risk is known.
     """
     import torch
 
@@ -338,7 +342,8 @@ def resolve_device(requested: str) -> torch.device:  # noqa: F821 (annotations a
         return torch.device("cpu")
     if requested in ("cuda", "gpu", "hip"):
         visible = os.environ.get("HIP_VISIBLE_DEVICES")
-        if visible != "1":
+        allow0 = os.environ.get("R4DX_ALLOW_GPU0") == "1"
+        if visible != "1" and not (allow0 and visible == "0"):
             raise RuntimeError(
                 "Refusing to touch the GPU: $env:HIP_VISIBLE_DEVICES must be '1' (only HIP device "
                 "1, the headless R9700, may be used -- see CLAUDE.md 'use GPU device 1'). Got "

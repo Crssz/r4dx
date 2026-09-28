@@ -56,6 +56,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -838,6 +839,13 @@ class OverrideWeightsReference(StreamingReference):
         if self.manifest.get("config_sha256") not in (None, cfg_sha):
             raise SystemExit(f"[full_logits] {self.manifest_path} was made for another checkpoint "
                              f"(config.json sha256 {self.manifest['config_sha256'][:16]}... vs {cfg_sha[:16]}...)")
+        # A fine-tune (e.g. an abliterated model) shares the base's config.json byte for byte, so
+        # the sha above cannot tell them apart: the manifest's own checkpoint path must match too.
+        made_from = self.manifest.get("model_dir")
+        if made_from is not None and (os.path.normcase(os.path.abspath(made_from))
+                                      != os.path.normcase(os.path.abspath(str(model_dir)))):
+            raise SystemExit(f"[full_logits] {self.manifest_path} was quantized from {made_from}, "
+                             f"not --model-dir {model_dir}; pass the same --model-dir")
         names = list(self.manifest["tensors"])
         bad = [n for n in names if n not in self.index.weight_map or self._layer_of(n) is None]
         if bad:

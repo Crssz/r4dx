@@ -251,7 +251,7 @@ int main() {
     }
 
     // Exact-wide prefill (the lossless mode): every geometry is the plain launch, bit for bit.
-    for (int g : {0, 242, 244, 121, 122, 124, 62, 64}) {
+    for (int g : {0, 242, 244, 121, 122, 124, 62, 64, 1124, 1244, 1064}) {
       R4DArgs b = a;
       b.out = out_d.data();
       b.splits = g;
@@ -267,7 +267,7 @@ int main() {
         case_ok = false;
       }
     }
-    std::printf("    exact entry, 8 geometries: bit-identical to the plain launch%s\n",
+    std::printf("    exact entry, 11 geometries: bit-identical to the plain launch%s\n",
                 case_ok ? "" : " -- NO");
 
     for (int sp : cs.splits) {

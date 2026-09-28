@@ -234,7 +234,8 @@ int main(int argc, char** argv) {
       R4DX_HIP_CHECK(hipMemcpy(got.data(), out_d, n * 2, hipMemcpyDeviceToHost));
       size_t diff = 0;
       for (size_t i = 0; i < n; ++i) diff += ref[i] != got[i];
-      const int grid = g < 10 ? kv_heads : (64 / ((g / 10) * 16 / 6)) * (g % 10) * kv_heads;
+      const int gg = g % 1000;  // 1000+: the same geometry with 96-key tiles
+      const int grid = gg < 10 ? kv_heads : (64 / ((gg / 10) * 16 / 6)) * (gg % 10) * kv_heads;
       results.push_back({"exact", d, 64, g, grid, ms});
       std::printf("[attn-bench] depth %6d exact %3d (q_len 64) grid %4d: %9.4f ms/call, %zu/%zu bf16 differ "
                   "from plain%s\n",

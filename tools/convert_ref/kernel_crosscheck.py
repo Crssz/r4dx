@@ -14,7 +14,7 @@ HIP_VISIBLE_DEVICES=1 itself if unset, but run it alone, never alongside another
 
 Usage (reference venv, r4d.pyd on PYTHONPATH):
   $env:HIP_VISIBLE_DEVICES = '1'
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe kernel_crosscheck.py
+  python kernel_crosscheck.py
 """
 import os
 import pathlib

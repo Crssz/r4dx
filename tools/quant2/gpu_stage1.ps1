@@ -12,7 +12,7 @@
 # another -HessianDir; a canonical set under the hessian-v1 name is refused.
 param(
   [string]$OutDir = 'D:\models\r4dx\quant2-gpu',
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string]$HessianDir = 'D:\models\r4dx\hessian-v1',
   [ValidateSet('hf-auto', 'canonical')][string]$Tokenizer = 'hf-auto',
   [switch]$SkipCapture

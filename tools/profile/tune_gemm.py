@@ -32,7 +32,7 @@ generates because it fails the constraint check above is one r4d's own C++ valid
 have rejected, confirmed by spot-checking a few rejected combos manually against the .hip source).
 
 Usage (HIP device 1; any CPython 3.12 with a ROCm build of torch -- r4d.pyd links python312 -- e.g.
-the read-only reference venv C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10 where it exists):
+$env:R4DX_REFERENCE_VENV's interpreter when that is set, else python on PATH):
   $env:HIP_VISIBLE_DEVICES = '1'
   $env:R4DX_LIBR4D_BUILD = "$HOME\\dev\\libr4d\\build-win\\g64"   # see "W4A16 GROUP" below
   <python.exe> tools\\profile\\tune_gemm.py [--quick] [--out src\\model\\gemm_tuning_table.inc]

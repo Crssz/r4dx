@@ -32,9 +32,10 @@ $env:HIP_VISIBLE_DEVICES = '1'
 .\build.ps1
 ```
 
-This configures and builds with the `win-hip` CMake preset (Ninja + the vLLM_for_AMD venv's
-CMake/Ninja binaries) against the ROCm SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the
-exact toolchain versions, flags, and gotchas.
+This configures and builds with the `win-hip` CMake preset (Ninja + CMake from
+`$env:R4DX_REFERENCE_VENV\Scripts` when that is set, else the cmake/ninja on PATH) against the ROCm
+SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the exact toolchain versions, flags, and
+gotchas.
 
 One build option changes what containers this binary can read: **`R4DX_W4A16_GROUP`** (default
 **64** since Milestone 11) is how many contiguous `K` share one w4a16 `(scale, zero)` pair -- 4.5
@@ -251,7 +252,7 @@ default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.
 - Choosing the rules: `tools/quant2/group_sweep.ps1 -Convert -Kl` converts and measures (rung 4, HIP
   device 1) one candidate per tensor class x depth half x group, plus bf16 keeps of a few sensitive
   linear sets and un-keeps of the recipe's bf16 attn.k/v (`docs/quant2.md` 5.3, which gives the
-  `-ExtraArgs` for the current q2ab + LDLQ recipe; the default `-Recipe` alone is unrotated), and
+  `-ExtraArgs` for the q2ab + LDLQ recipe, now retired in favour of the trellis body; the default `-Recipe` alone is unrotated), and
   `tools/quant2/alloc_groups.py` ranks them by nats of KL per GiB, fills a byte budget (default:
   equal bytes; candidates whose linear sets overlap exclude each other, and an exchange pass plus an
   exhaustive check settle which one by first-order KL, not by order), reports the cliff and
@@ -500,6 +501,16 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 ```
 
 ## Status
+
+**Trellis weights (2026-09-28): `qwen38-27b-trellis-mix45m.r4dx` with `--layout trellis` is the
+default recommended container.** Canonical rung-4 KL 0.00747 (top-1 96.26%) against
+q2ab_hv2_q3's 0.01559 (94.92%) at 13.55 against 13.68 GiB of decode bytes, on a native RDNA4 WMMA
+trellis kernel; decode +1.1% plain, +6.3% `--dflash k=7`, -1.8% `--mtp 3` (acceptance), prefill
+1.55x. `qwen38-27b-trellis-k4m.r4dx` (KL 0.01004, 12.13 GiB) is the speed option: +11% plain, +13%
+DFlash, +3.7% `--mtp 3`, prefill 1.60x. **q2ab is retired**: q2ab_hv2_q3 is quoted only as the
+historical baseline these gains were measured against. Recipe and numbers: `docs/quant2.md` 7.1; gates: `docs/trellis-kernel.md` section 1 and 10;
+format: `docs/container-format.md` "Trellis body layout". Everything below about v6 and w4a16 still
+holds for `--layout w4a16` containers.
 
 **Milestone 11 done: `qwen38-27b-v6.r4dx` is the production container (2026-09-22).** Mean KL
 **0.05342 -> 0.03851** (-27.9%) and top-1 **89.30% -> 90.93%** against the bf16 reference, bought

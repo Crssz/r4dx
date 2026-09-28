@@ -7,9 +7,13 @@ See `docs/validation.md` for where this fits in the overall validation ladder.
 
 Everything here is read-only against:
 
-- `C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10` -- the reference `transformers` 5.17.0 /
-  `torch` 2.13.0+rocm10.0.0 install. **Run every script in this directory with that venv's
-  `python.exe`.** Never `pip`/`uv install` into it -- these scripts only import from it.
+- the reference Python: a `torch` (ROCm) + `transformers` + `numpy` install. **`python` in every
+  command below means that interpreter**: `$env:R4DX_REFERENCE_VENV\Scripts\python.exe` when that
+  variable names a venv (the tests' CMake and the `tools/quant2` scripts' `-Python` default read the
+  same variable), else `python` on PATH. The goldens here were made with `transformers` 5.17.0 /
+  `torch` 2.13.0+rocm10.0.0 in a venv that has since been deleted; later work (trellis) used a system
+  Python 3.12 with torch 2.9.1 ROCm / transformers 5.5. Never `pip`/`uv install` into it -- these
+  scripts only import from it.
 - `C:\AI\models\Qwen3.8-27B` -- the Qwen3.8-27B checkpoint. Shards may still be downloading; every
   tensor read from it is allowed to fail and falls back to deterministic seeded random init
   instead (see "Weight fallback" below). As of this writing all 18 shards are fully downloaded and
@@ -88,7 +92,7 @@ set, and names the existing set's mode.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\layer_golden.py `
+python tools\reference\layer_golden.py `
     --device cuda --out-dir tools\reference\golden_out
 ```
 
@@ -187,7 +191,7 @@ Key options (see `--help` for the rest): `--gdn-layer` / `--attn-layer` (default
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\vision_golden.py `
+python tools\reference\vision_golden.py `
     --device cuda --out-dir tools\reference\golden_out
 ```
 
@@ -268,7 +272,7 @@ Runtime: ~40-60s on HIP device 1 (real weights, three cases, 27 blocks each); ~2
 ## rope_index_golden.py
 
 ```powershell
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\rope_index_golden.py `
+python tools\reference\rope_index_golden.py `
     --out-dir tools\reference\golden_out
 ```
 
@@ -300,7 +304,7 @@ offsets lives and a synthetic fixture cannot reach:
 $env:HIP_VISIBLE_DEVICES = '1'
 build\win-hip\tests\vision\tool_vision_chat.exe --layout w4a16 --image pic.png `
     --prompt "Describe this image." --dump-prompt dump.json
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\rope_index_golden.py `
+python tools\reference\rope_index_golden.py `
     --verify-prompt dump.json
 ```
 
@@ -308,7 +312,7 @@ C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\r
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\mrope_layer_golden.py `
+python tools\reference\mrope_layer_golden.py `
     --device cuda --out-dir tools\reference\golden_out
 ```
 
@@ -343,7 +347,7 @@ rows and the token/type/grid arrays. Output:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_calibrate.py `
+python tools\reference\kv_calibrate.py `
     --device cuda --layer 3 --out tools\reference\kv_calibrate_out\kv_descale.json
 ```
 
@@ -407,7 +411,7 @@ Runtime: ~10s on HIP device 1 (default `--num-tokens 256`); a few seconds on CPU
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_calibrate_full.py `
+python tools\reference\kv_calibrate_full.py `
     --out D:\models\r4dx\qwen38-27b.kvcalib-full.json
 ```
 
@@ -521,7 +525,7 @@ rotated subspace alone -- to bf16 tolerance.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_calibrate_full.py `
+python tools\reference\kv_calibrate_full.py `
     --max-tokens 256 --layers 3 --rope-check 3 --out <scratch>\ropecheck.json
 ```
 
@@ -672,12 +676,12 @@ recomputes it from the tokens file and refuses to pair two dumps whose sidecars 
 
 ```powershell
 # the committed tokens.json (AutoTokenizer ids; the output gains "tokenizer_mode" and "tokenizer_provenance")
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\make_tokens_json.py `
+python tools\reference\make_tokens_json.py `
     --tokenizer hf-auto --corpus-dir tools\reference\kl_corpus --max-tokens 1024 `
     --out tools\reference\kl_corpus\tokens.json
 
 # the canonical Thai segment, tokens_thai_canon.json
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\make_tokens_json.py `
+python tools\reference\make_tokens_json.py `
     --tokenizer canonical --file thai_prose_canon=tools\reference\kl_corpus\thai_prose.txt `
     --max-tokens 1024 --out tools\reference\kl_corpus\tokens_thai_canon.json
 ```
@@ -733,7 +737,7 @@ same reason it ignores `golden_out*/`.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\full_logits_golden.py `
+python tools\reference\full_logits_golden.py `
     --device cuda --tokens tools\reference\kl_corpus\tokens.json `
     --out-dir tools\reference\kl_out\ref
 ```
@@ -791,7 +795,7 @@ Three checks, all run on the real checkpoint on HIP device 1. Reproduce with:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\full_logits_golden.py `
+python tools\reference\full_logits_golden.py `
     --device cuda --segment english_prose --cross-check 48 --selfcheck-greedy 32 `
     --selfcheck-prefix 48 --skip-segments --out-dir tools\reference\kl_out\validation
 ```
@@ -880,7 +884,7 @@ quantized replaced by its dequantized value, writes the shared log-prob format, 
 scores it against the existing bf16 reference on `kl_corpus/`.
 
 ```powershell
-$py   = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+$py   = 'python'
 $gguf = 'D:\huggingface\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\4ca720788d1e01f1bff70c033e0d0028fd02e502\Qwen3.8-27B-UD-Q4_K_XL.gguf'
 # CPU, no GPU: every tensor against the checkpoint and against ggml's C (~4 min, 6 processes)
 & $py tools\reference\gguf_validate.py --gguf $gguf --out-dir D:\models\r4dx\kl-gguf\validation
@@ -1062,7 +1066,7 @@ against the bf16 reference as usual.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-$py = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+$py = 'python'
 & $py tests\reference\test_trellis_quant.py                       # incl. the HIP encoder
 & $py tools\reference\trellis_quant.py selftest --device cuda      # hip == cpu == torch
 & $py tools\reference\trellis_quant.py bench --device cuda --K 3.5,4,5 --tiles 8192
@@ -1132,7 +1136,7 @@ CPU only (torch on its CPU device; `torch.cuda` is never touched). They back the
 in `docs/trellis-kernel.md` (M0).
 
 ```powershell
-$py = 'C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+$py = 'python'
 & $py tools\reference\trellis_golden.py               # writes tests\kernels\golden\trellis (~3 s)
 & $py tools\reference\trellis_golden.py --check       # the files against their manifest.json
 & $py tools\reference\trellis_golden.py --selftest    # the script's own math; writes nothing
@@ -1186,7 +1190,7 @@ more than 190 VGPRs, scratch, spills or any near dependency on an asm VALU.
 ## kl_report.py
 
 ```powershell
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kl_report.py `
+python tools\reference\kl_report.py `
     --ref-dir tools\reference\kl_out\ref --test-dir tools\reference\kl_out\r4dx `
     --tokens tools\reference\kl_corpus\tokens.json --out tools\reference\kl_out\kl.json
 ```
@@ -1263,7 +1267,7 @@ both are measuring the same fp16 rounding of the same rows from two different di
 ## kl_audit.py
 
 ```powershell
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kl_audit.py `
+python tools\reference\kl_audit.py `
     --ref-dir tools\reference\kl_out\ref --test-dir tools\reference\kl_out\w4a16 `
     --tokens tools\reference\kl_corpus\tokens.json --out tools\reference\kl_out\kl_audit.json
 ```
@@ -1293,7 +1297,7 @@ measurement".
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\reference_selfcheck.py `
+python tools\reference\reference_selfcheck.py `
     --tokens tools\reference\kl_corpus\tokens.json --truncated 4 --tokens-n 48 `
     --noise-floor --noise-n 256 --out tools\reference\kl_out\reference_selfcheck.json
 ```
@@ -1324,7 +1328,7 @@ Peak VRAM ~5.4 GiB (control) and ~1.6 GiB (streaming / noise floor).
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\imatrix_capture.py `
+python tools\reference\imatrix_capture.py `
     --out D:\models\r4dx\qwen38-27b.imatrix.npz
 ```
 
@@ -1480,10 +1484,10 @@ which is all a weighted quantizer consumes, is unaffected.
 
 ```powershell
 # no GPU: corpus sizes, the file list, the disk estimate
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py --dry-run
+python tools\reference\hessian_capture.py --dry-run
 
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+python tools\reference\hessian_capture.py `
     --out-dir D:\models\r4dx\hessian-v1
 ```
 
@@ -1664,11 +1668,11 @@ G3 pilot, which also matches `mtp.mlp.*` exactly as the converter's `--ldlq "mlp
 
 ```powershell
 # no GPU: plan + corpus check against the existing set
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+python tools\reference\hessian_capture.py `
     --rms-only --dry-run --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
 
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+python tools\reference\hessian_capture.py `
     --rms-only --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
 ```
 
@@ -1754,7 +1758,7 @@ Regenerating is byte-for-byte reproducible; the directory's `.gitattributes` (`*
 end-of-line conversion away from the hashed bytes.
 
 ```powershell
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\hessian_capture.py `
+python tools\reference\hessian_capture.py `
     --write-fixture tests\convert\fixtures\hess_small
 ```
 
@@ -1770,7 +1774,7 @@ the only python on this machine with `torch`+`transformers` importable together 
 `pytest` installed and is read-only). Run it directly:
 
 ```powershell
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tests\reference\test_manifest.py
+python tests\reference\test_manifest.py
 ```
 
 It's also registered as ctest test `reference_manifest` in `tests/CMakeLists.txt`, so
@@ -1823,7 +1827,7 @@ about 30 s with every optional input present (214 checks). It covers:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\reference\kv_fakequant_golden.py `
+python tools\reference\kv_fakequant_golden.py `
     --mode both --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
     --tokens tools\reference\kl_corpus\tokens.json `
     --out-dir tools\reference\kl_out\kvfq-full-both
@@ -1888,7 +1892,7 @@ container is converted with), `<old>` is `D:\models\r4dx\qwen38-27b.kvcalib.json
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-$py = "C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe"
+$py = "python"
 $tok = "tools\reference\kl_corpus\tokens.json"
 $full = "D:\models\r4dx\qwen38-27b.kvcalib-full.json"
 $old  = "D:\models\r4dx\qwen38-27b.kvcalib.json"

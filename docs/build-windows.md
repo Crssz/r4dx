@@ -10,10 +10,10 @@ this machine on 2026-09-19 (`smoke_r4d` PASS on HIP device 1).
   `lld-link.exe` under `C:\opt\rocm\lib\llvm\bin`; device bitcode
   `C:\opt\rocm\lib\llvm\amdgcn\bitcode`; runtime `C:\opt\rocm\bin\amdhip64_7.dll`; import lib
   `C:\opt\rocm\lib\amdhip64.lib`.
-- **CMake**: 4.4.2, **Ninja**: 1.13.2 -- both from
-  `C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\{cmake,ninja,ctest}.exe`. The PATH cmake is
-  3.31 and cannot drive this configuration; `build.ps1` / `tests/run_tests.ps1` always call the
-  venv's binaries by full path, never bare `cmake`/`ninja`/`ctest`.
+- **CMake**: 4.4.2, **Ninja**: 1.13.2 -- originally both from a reference venv's
+  `Scripts\{cmake,ninja,ctest}.exe`. `build.ps1` / `tests/run_tests.ps1` use
+  `$env:R4DX_REFERENCE_VENV\Scripts` when that venv exists, else the cmake/ninja/ctest on PATH
+  (CMake 3.31 + Ninja configure and build this preset too, verified 2026-09-22).
 - **MSVC**: 2022 BuildTools 14.44 + Windows Kits 10.0.26100 -- not invoked directly; clang-cl
   auto-detects them (link/library search paths) without needing `vcvars64.bat`, because clang-cl
   probes the registry/VS installer metadata itself. No `vcvars` step was needed for this build.

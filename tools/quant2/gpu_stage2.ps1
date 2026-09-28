@@ -8,7 +8,8 @@
 #   3. gate G3, the Q1 pilot: tools/quant2/q1_pilot.ps1 -Kl (bf16 reference dump, v6, pilot)
 param(
   [string]$OutDir = 'D:\models\r4dx\quant2-gpu2',
-  [string]$L4Dir = 'D:\models\r4dx\quant2-l4'
+  [string]$L4Dir = 'D:\models\r4dx\quant2-l4',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -16,7 +17,7 @@ if (Get-Process r4dx-server -ErrorAction SilentlyContinue) { throw '[stage2] sto
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $env:HIP_VISIBLE_DEVICES = '1'
 $tool = Join-Path $repo 'build\win-hip\tests\model\tool_teacher_forced_logprobs.exe'
-$py = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+$py = $Python
 $tokens = Join-Path $repo 'tools\reference\kl_corpus\tokens.json'
 $summary = [ordered]@{}
 

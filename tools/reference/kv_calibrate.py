@@ -16,7 +16,7 @@ tool exists to pin down the math (which tensor, which axis, e4m3 recipe) and the
 ahead of that; see "How the converter will consume this" below and docs/validation.md.
 
 Usage:
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\reference\\kv_calibrate.py ^
+    python tools\\reference\\kv_calibrate.py ^
         --device cuda --layer 3 --out tools\\reference\\kv_calibrate_out\\kv_descale.json
 
 See tools/reference/README.md for the full option list and expected runtime.

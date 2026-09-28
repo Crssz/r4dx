@@ -61,7 +61,7 @@ foreach ($s in $steps) {
   $warn = @([regex]::Matches($text, '\bWARN\b')).Count
   $row = [ordered]@{ step = $s.name; exit = $code; pass = $pass; fail = $fail; warn = $warn
                      minutes = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
-                     last = (@(Get-Content $log | Where-Object { $_.Trim() }) | Select-Object -Last 1) }
+                     last = [string](@(Get-Content $log | Where-Object { $_.Trim() }) | Select-Object -Last 1) }
   $summary += [pscustomobject]$row
   Write-Host ("[g6] {0,-26} exit {1}  PASS {2}  FAIL {3}  WARN {4}  ({5} min)" -f $s.name, $code, $pass, $fail, $warn, $row.minutes)
   ConvertTo-Json -InputObject @($summary) -Depth 3 | Set-Content -Encoding utf8 (Join-Path $OutDir 'summary.json')

@@ -11,7 +11,7 @@ row, M=1 band) -- this script re-times them live rather than re-sweeping, since 
 was already done and checked in by the GEMM-tuning pass (docs/perf.md "GEMM tuning sweep").
 
 Usage (read-only reference venv, HIP device 1):
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\bench\\skinny_gemm_roofline.py
+  python tools\\bench\\skinny_gemm_roofline.py
 """
 import os
 import sys

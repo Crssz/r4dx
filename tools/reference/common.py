@@ -1,13 +1,14 @@
 """Shared helpers for r4dx's Python reference/validation tooling.
 
 Everything under tools/reference/** is read-only against:
-  - C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10  (the reference transformers install -- never
-    pip/uv install into it, we only import from it)
+  - the reference Python (torch + transformers + numpy): $env:R4DX_REFERENCE_VENV's
+    Scripts\\python.exe when that is set, else python on PATH -- never pip/uv install into it, we
+    only import from it
   - C:\\AI\\models\\Qwen3.8-27B                          (the checkpoint; shards may still be
     downloading, so every tensor read here is allowed to fail and fall back to random init)
 
-Run these scripts with that venv's python.exe, e.g.:
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\reference\\layer_golden.py
+Run these scripts with that interpreter, e.g.:
+    python tools\\reference\\layer_golden.py
 
 torch is imported inside the functions that need it, so the tokenizer helpers below (and the
 constants) can be imported by tools that must not pull torch in (hessian_capture.py's
@@ -25,9 +26,9 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
-DEFAULT_REFERENCE_VENV = Path(
-    os.environ.get("R4DX_REFERENCE_VENV", Path.home() / "dev" / "vLLM_for_AMD" / ".venv-rocm10")
-)
+#: The reference venv when $env:R4DX_REFERENCE_VENV names one, else None (python on PATH).
+DEFAULT_REFERENCE_VENV = (Path(os.environ["R4DX_REFERENCE_VENV"])
+                          if os.environ.get("R4DX_REFERENCE_VENV") else None)
 
 
 # --------------------------------------------------------------------------------------------

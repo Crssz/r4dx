@@ -33,6 +33,8 @@
 #   sample at T=1.0 (the checkpoint's recommendation), where fewer drafts match: that costs speed only.
 # The text only has to be realistic input (the Hessians come from the bf16 checkpoint later), so the
 # drafter only buys speed; -NoDflash is the plain-decode fallback.
+#
+# -Python defaults to $env:R4DX_REFERENCE_VENV\Scripts\python.exe when that is set, else python on PATH.
 param(
   [string]$OutDir = 'D:\models\r4dx\corpus-v2',
   [int]$Limit = 0,
@@ -43,7 +45,7 @@ param(
   [int]$DflashK = 7,
   [int]$Port = 18080,
   [int]$LoadTimeoutSec = 900,
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -61,9 +63,10 @@ if ($busy.Count) {
 $listening = $null
 try { $listening = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop } catch { }
 if ($listening) { throw "[corpus] port $Port is already in use (pid $(@($listening)[0].OwningProcess)); pass -Port" }
-$need = @($serverExe, $Model, $Python, $gen, $prompts)
+$need = @($serverExe, $Model, $gen, $prompts)
 if (-not $NoDflash) { $need += $Dflash }
 foreach ($p in $need) { if (-not (Test-Path $p)) { throw "[corpus] not found: $p" } }
+if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) { throw "[corpus] no Python: $Python" }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

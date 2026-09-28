@@ -12,7 +12,7 @@ the manifest and docs/validation.md: transformers 5.17.0 has no Qwen3_5 MTP forw
 to load real weights into, so this exercises the container/loader's tensor *shapes* only).
 
 Usage:
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\reference\\layer_golden.py ^
+    python tools\\reference\\layer_golden.py ^
         --device cuda --out-dir tools\\reference\\golden_out
 
 See tools/reference/README.md for the full option list and expected runtime.

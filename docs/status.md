@@ -1,5 +1,35 @@
 # Status
 
+## Trellis weights pass every ship gate (branch `quant2`, landed on main), 2026-09-28
+
+The 400 decoder linears in EXL3/QTIP's trellis format, run by a native RDNA4 WMMA kernel (libr4d
+branch `trellis`, `r4d_gemm_trellis_nt_m64`; `--layout trellis`). Design, gates and measurements:
+[trellis-kernel.md](trellis-kernel.md) (section 1, section 10); results and recipe:
+[quant2.md](quant2.md) 7.1; format: [container-format.md](container-format.md) "Trellis body layout";
+speed: [perf.md](perf.md) top section.
+
+| container | decode bytes | runtime KL | top-1 | plain / `--dflash k=7` / `--mtp 3` tok/s | gates |
+|---|--:|--:|--:|---|---|
+| q2ab_hv2_q3 (w4a16, retired; historical baseline) | 13.68 GiB | 0.01559 | 94.92% | 36.30 / 109.63 / 79.06 | -- |
+| **trellis-mix45m (recommended)** | 13.55 GiB | **0.00747** | 96.26% | 36.69 / 116.55 / 77.65 | A0-A2, A4-A6; A3 misses `--mtp 3` by 1.8% (acceptance), inside D1's 4% |
+| trellis-k4m (speed) | 12.13 GiB | 0.01004 | 95.53% | 40.34 / 123.52 / 81.98 | all, A3 +11% / +13% / +4% |
+
+- **Recommended container:** `D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx` with `--layout trellis`
+  (accuracy first, then speed, native RDNA4). Prefill is 1.55x q2ab's (K4m 1.60x). Speed option:
+  `D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx`.
+- **q2ab is retired.** q2ab_hv2_q3 is no longer a recommendation or kept on disk; its row above is
+  the historical baseline the gates were measured against. The w4a16 path itself is unchanged and
+  supported.
+- **M6 (this pass):** G6 (`g6_validate.ps1 -Layout trellis`) 5/5 on both trellis containers; A6 on
+  q2ab_hv2_q3 (w4a16 path unchanged): ctest 90 pass / 0 fail, G6 w4a16 5/5, `tp1_identity.ps1` G2
+  PASS against the frozen `tp1-f7d4927` baseline, and generated text equal to the pre-trellis binary
+  in 12 / 12 cells ([trellis-kernel.md](trellis-kernel.md) 10.7).
+- Scripts no longer default to the deleted reference venv: they use `$env:R4DX_REFERENCE_VENV` when
+  set, else `python` / cmake on PATH; the tests' CMake registers the Python reference tests only
+  when an interpreter (`R4DX_REFERENCE_PYTHON`, the venv, or `python` on PATH) imports torch,
+  transformers and numpy, and three of them only under the reference venv's transformers 5.17.0
+  ([trellis-kernel.md](trellis-kernel.md) 10.8).
+
 ## Sampled speculation is bit-exact again: verify rows sum in decode's order, 2026-09-25
 
 `test_mtp`'s `CheckSampledRoundsMatchPlain [w4a16]` failed on main (0 of 18 sampled trajectories

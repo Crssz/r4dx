@@ -11,7 +11,7 @@ automated pass/fail gate.
 
 Usage (reference venv only -- see common.py's file comment, read-only against that venv and the
 checkpoint):
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\reference\\first_token.py ^
+    python tools\\reference\\first_token.py ^
         --device cpu --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences."
 
 Runtime / feasibility note (see docs/perf.md "Correctness evidence"): a full 27B-parameter forward

@@ -25,7 +25,7 @@ full_logits_golden.StreamingReference. Layer 1's post_attention_layernorm has a 
 
 Plain script, no pytest dependency, like test_manifest.py:
 
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tests\\reference\\test_hessian_rms.py
+    python tests\\reference\\test_hessian_rms.py
 
 Exits 0 and prints "OK (<n> checks)" on success; 1 and every failed check otherwise.
 """

@@ -12,7 +12,7 @@ importable -- doesn't have pytest installed, and is read-only; see tools/referen
 Run directly with the reference venv's python, or via ctest (registered as `reference_manifest`
 in tests/CMakeLists.txt, which invokes this exact command):
 
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tests\\reference\\test_manifest.py
+    python tests\\reference\\test_manifest.py
 
 Exits 0 and prints "OK (<n> checks)" on success; exits 1 and prints every failed assertion
 otherwise (does not stop at the first failure, so a run reports everything wrong in one shot).

@@ -62,7 +62,7 @@ chat/001 (thinking, two turns), thai_prose/000 (raw), english_prose/001 (REJECTE
 
 Plain script, no pytest dependency, like test_hessian_rms.py:
 
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tests\\reference\\test_hessian_corpus.py
+    python tests\\reference\\test_hessian_corpus.py
 
 Exits 0 and prints "OK (<n> checks)" on success; 1 and every failed check otherwise.
 """

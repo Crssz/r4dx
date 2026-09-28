@@ -18,7 +18,7 @@ param(
   [string]$RefDir = 'D:\models\r4dx\kl-q1\ref',
   [string]$ContainerDir = 'D:\models\r4dx',
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string[]]$ExtraKl = @('thai_canon=tools\reference\kl_corpus\tokens_thai_canon.json=D:\models\r4dx\kl-thai-canon\ref'),
   # Where the per-variant log-prob dumps go while kl_report.py reads them (~2 GB for 4 segments,
   # deleted right after): a drive with room, when -OutDir's is full of containers.

@@ -81,7 +81,8 @@ rotation.mix5                                   fp32  [5, 5]               (rota
 rotation.had_{down,o,gdn_out}_signs             fp32  [K of that linear]   (q2ab containers only)
 ```
 
-`{layout}` is one of `mxfp4`, `w4a16`, `w4a8`, `bf16`. Every linear that participates in the A/B
+`{layout}` is one of `mxfp4`, `w4a16`, `w4a8`, `bf16`, or -- for the 400 decoder body linears of a
+trellis container only -- `trellis` (see "Trellis body layout" below). Every linear that participates in the A/B
 (everything the milestone list benchmarks -- attention qg/k/v/o, GDN in/out proj, MLP gate_up/down,
 lm_head) is stored in **all three quantized layouts plus bf16**, so the server can switch layouts
 with a flag rather than a re-convert. `text.embed_tokens`, `text.*_norm`, `*.A_log`, `*.dt_bias`,
@@ -454,6 +455,102 @@ given); `quant_summary` gains a note for the zeroed norms and the `rotation.*` t
 their closed forms and for orthogonality, the fold identities on a miniature layer, and the Hessian
 change of basis against a direct capture on the folded input.
 
+## Trellis body layout (`__metadata__.quant.trellis`, `<base>.trellis.*`)
+
+`r4dx-convert --trellis-from <oracle dir>` (docs/trellis-kernel.md sections 2-3; the format itself
+is EXL3/QTIP's, docs/trellis.md). The converter **imports** the bits that
+`tools/reference/trellis_quant.py quantize-model` (one rate) or `mix` (EXL3's 4/5 allocation) wrote,
+pinned by the manifest's sha256 (`--trellis-manifest-sha256`) and checked by a full CPU
+reconstruction (`--trellis-verify full`, the only mode a release converter accepts) before the file
+gets its final name. It never re-encodes. A container converted without the flag has no
+`quant.trellis` key and no `.trellis.*` tensor, and is byte-identical to one converted before it
+existed.
+
+**Which linears.** All 400 decoder linears (HF tensors), which are 336 container bases:
+`gdn.in_proj_qkv`, `gdn.in_proj_z`, `gdn.out_proj` (48 GDN layers), `attn.qg`, `attn.k`, `attn.v`,
+`attn.o` (16 attention layers), `mlp.gate_up` (gate and up, two parts) and `mlp.down` (64 layers).
+A trellis base carries **only** its three `.trellis.*` tensors: no `.w4a16.*` and no `.bf16.w`
+(a `--keep-bf16` base instead carries only `.bf16.w`). Everything else follows the flags as in any
+container; the shipped recipe writes `lm_head` as w4a16 g32 (`--lm-head w4a16 --w4a16-group-rule
+"^lm_head$=32"`), the MTP head's `qg`/`o`/`gate_up`/`down` as w4a16 g64, and `mtp.attn.k/v`,
+`mtp.fc`, `gdn.in_proj_a/b`, the conv, norms, embeddings and `vision.*` as bf16/fp32 -- 611
+tensors byte-identical to `qwen38-27b-q2ab_hv2_q3.r4dx`'s (trellis-kernel.md 10.3).
+
+| tensor | shape (U8) | content |
+|---|---|---|
+| `<base>.trellis.w` | `[N*K*KB/8]`, 1-D | uint32 little-endian ring words, `8*KB` per 16x16 tile, in the pair grid below |
+| `<base>.trellis.suh` | `[P*K, 2]` | fp16 input scale with the input Hadamard's signs folded in; `P` = 2 for `mlp.gate_up` (gate's `K` values, then up's), 1 otherwise |
+| `<base>.trellis.svh` | `[N, 2]` | fp16 output scale with the output Hadamard's signs folded in, in container row order (gate rows, then up rows) |
+
+`KB` is the linear's trellis bits per weight (4 or 5). **Pair grid:** word `w` (`0 <= w < 8*KB`) of
+tile `(tn, tk)` -- HF rows `16tn..16tn+15`, columns `16tk..16tk+15` -- is at uint32 index
+
+```
+idx(tn, tk, w) = (((tn >> 1) * (K/16) + tk) * 2 + (tn & 1)) * 8*KB + w
+```
+
+a whole-tile permutation of the oracle's `[k/16][n/16][8KB]` order. Inside a tile the words are the
+oracle's exactly: the stream's bit `S[32w]` at bit 31, positions in EXL3's tensor-core order, a
+16-bit tail-biting state, EXL3's `mul1` codebook. The linear computes, per 128-block of `K` and of
+`N` (`H` = the 128-point Sylvester Hadamard scaled by `1/sqrt(128)`, `D` = the decoded `[N, K]`
+matrix):
+
+```
+y = svh * H_N( D . H_K( suh * x ) )          (per part for gate_up: part p uses suh[p*K : (p+1)*K])
+```
+
+The runtime applies `H_K(suh * x)` as the GEMM's input transform (f16, times `2^prescale_log2`) and
+`H_N` then `svh` (times `2^-prescale_log2`) in the GEMM epilogue, in fp32 with one bf16 rounding.
+
+```json
+"quant": { "trellis": {
+  "format": "r4dx-trellis", "version": 1, "codebook": "mul1",
+  "codebook_consts": {"mult": "0x83dcd12d", "k_inv_f16": "0x1eee", "k_bias_f16": "0xc931"},
+  "state_bits": 16, "tail_biting": true, "position_order": "exl3-tensor-core",
+  "bitstream": "ring-u32-msb-first", "tile_grid": "n32-pairs-k-major",
+  "hadamard": {"block": 128, "order": "sylvester-natural", "scale": "1/sqrt(128)",
+               "input": "x*suh then H", "output": "H then *svh"},
+  "prescale_log2": 0,
+  "linears": { "text.layers.0.gdn.in_proj_qkv": {"bits": 5},
+               "text.layers.0.mlp.gate_up": {"bits": 5, "parts": [17408, 17408]}, ... } } }
+```
+
+- `bits` is per linear; `gate_up`'s two parts always share it. `parts` appears only on a
+  multi-part linear. A linear may carry its own `prescale_log2` (the container-wide one is the
+  default; both in [-16, 16]; 0 in every shipped container).
+- `quant_summary` names the body as e.g. `"body: trellis mul1 KB=4 x200 + KB=5 x200 (imported)"`
+  (HF tensors per rate).
+- `r4dx_convert_run.trellis` records the import: `manifest`, `manifest_sha256`, `manifest_form`
+  (`quantize-model` / `mix`), `hessian_basis` (only `matched` is imported unless
+  `--trellis-allow-basis exl3`), `hessian_manifest_sha256`, `code_sha256`, the oracle's `recipe`,
+  `allocation_sources` (a mix), `hf_tensors_per_K`, `kept_bf16`, every source `files` entry with its
+  sha256, and `verify: {mode, tolerance, result, worst, worst_tensor, checked, failed}`. `result` is
+  written as a fixed-width "pending" placeholder and patched in place once the reconstruction check
+  has passed.
+
+**The contract with the loader** (`src/model/trellis_meta.h`; `Container::Load` and
+`Container::LoadShard`). A trellis-aware binary refuses: any unknown `format`, `version`,
+`codebook`, `position_order`, `bitstream`, `tile_grid` or `hadamard` value; a `bits` the kernel does
+not instantiate; a `linears` field other than `bits`, `parts`, `prescale_log2`; a `.trellis.*`
+tensor without a `linears` entry (or in a container without the block) and an entry without its
+three tensors; byte sizes other than `N*K*bits/8`, `P*K*2`, `N*2`; any `K`, part or `N` (and, under
+TP, any rank range) not a multiple of 128; `rotation` together with `trellis`; a `verify` record
+that is missing or does not pass; and **any `--layout` other than `trellis`** on such a container
+(and `--layout trellis` on one without the block). A trellis `--lm-head`/MTP-head layout request is
+mapped to w4a16. A binary that predates the format finds neither `.w4a16.*` nor `.bf16.w` for a body
+linear and throws "no tensor found" -- that, not `r4dx_format_version` (not bumped), is the guard.
+
+**Tensor parallelism** (TP = 2): column-parallel linears (`gate_up`, `qkv`, `z`, `qg`, `k`, `v`) cut
+`.trellis.w` by pair rows and `svh` by rank rows and replicate `suh`; row-parallel ones (`down`, `o`,
+`out_proj`) cut `.trellis.w` per pair row by the rank's K range and `suh` by that range and replicate
+`svh`. Every rank range of this model is 128-aligned.
+
+**Sizes** (`tools/quant2/decode_bytes.py`: every text-layer weight plus `lm_head`):
+`qwen38-27b-trellis-k4m.r4dx` (KB = 4 everywhere) 15.66 GiB on disk, 12.130 GiB decode;
+`qwen38-27b-trellis-mix45m.r4dx` (KB = 5 on 168 of the 336 bases, 200 of 400 HF tensors) 17.08 GiB,
+13.546 GiB; `qwen38-27b-q2ab_hv2_q3.r4dx` for comparison 13.680 GiB decode. The recipe and the
+measured quality and speed are in docs/quant2.md section 7 ("Trellis").
+
 ## KV descale tables
 
 `text.layers.{i}.attn.k_descale` / `.v_descale`, `fp32[kv_heads]`, one scalar per KV head, feeding
@@ -675,7 +772,7 @@ existing `QuantLinear`/`DeviceBuffer` path) and the DFlash2 forward pass itself 
   by line range against the `windows-llp64` checkout at commit `7675605`.
 - `third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip`, `r4d_gemm_mxfp4a8_nt_m64.hip`,
   `r4d_gdn_wmma.h`, `r4d_registry.hip`, `mxfp4_layout.py`: exact permutation math.
-- `transformers/models/qwen3_5/modeling_qwen3_5.py` (transformers 5.17.0, read-only reference venv
-  at `C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10`): `Qwen3_5MLP.forward` (gate_up fusion),
+- `transformers/models/qwen3_5/modeling_qwen3_5.py` (transformers 5.17.0, in the read-only reference
+  venv of the time, since deleted): `Qwen3_5MLP.forward` (gate_up fusion),
   `Qwen3_5Attention.__init__`/`forward` (q/gate fusion), `Qwen3_5GatedDeltaNet.__init__`/`forward`
   (GDN projection layout, conv/gating math).

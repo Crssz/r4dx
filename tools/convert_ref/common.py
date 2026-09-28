@@ -7,7 +7,7 @@ round-half-away-from-zero tie-break (NOT numpy's default round-half-to-even), be
 C++'s `std::floor(x+0.5f)` / `std::ceil(x-0.5f)` computes.
 
 Run with the read-only reference venv:
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe
+  python
 """
 import numpy as np
 

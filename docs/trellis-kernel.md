@@ -1004,6 +1004,11 @@ disappear.
 
 ### 5.4 Layer code (M5, fused producers; v1 needs none)
 
+*Built at M5 part 3 (10.6)*: the qg/k/v and in_proj_qkv/z shared transforms through
+`SharedTrellisInput` (linear.h), and the silu_mul and gate-mul producers as
+`r4dx_silu_mul_trellis_bf16` / `r4dx_attn_gate_mul_trellis_bf16` (kernels.h). gdn.out_proj keeps
+ApplyLinear's own transform and loads its weights normally (`temporal_weight_loads`, 10.6).
+
 | File:line | Change |
 |---|---|
 | `attention_layer.hpp:172-207` | When `qg`, `k` and `v` are trellis: one `r4dx_trellis_input_bf16` with `nout = 3`, then three `pre`s with their `transform_id`s. |
@@ -1695,3 +1700,489 @@ with A2 re-run.
   the repeat above ran 38.5 and 66.3; only M5's interleaved bench decides A3.
 - G6 on K4m (`g6_validate.ps1 -Layout trellis`, A4) is M6's: none of DFlash, vision, the tool round
   trip or TP = 2 with DFlash ran in M4.
+
+### 10.5 M5, part 1 (2026-09-27, device 1; tooling, prefill and TP = 2 rows)
+
+Outputs are in `D:\models\r4dx\trellis-m5\`: the probe runs in `probe\` (one JSON and log per
+container, mode and probe; `probe\analysis.txt` has the tables below), the tuning runs as
+`ptune_*` and `tp2_*` (JSON and text), the test logs as `ctest_*.log`.
+
+**Built.**
+- **In-model clock probe and round composition** (6 "Benches" mode 5; Q-g3, Q-g8):
+  `src/model/debug_probe.h`. `R4DX_CLOCK_PROBE=1` runs one wave of 8 x 400 dependent `v_add`
+  between `clock64()` / `wall_clock64()` reads after every Mlp of `RunChunk` and `VerifyWindow`.
+  The device code is `src/model/kernels/clock_probe_device.h`, which `tool_trellis_gemm_bench`'s
+  probe and timer now include too, so the two clocks come from one kernel. Every model call gets a
+  GPU span (a `wall_clock64` stamp before its first kernel and after its last) and host times:
+  prefill, decode, verify, mtp_prime, and the rounds mtp_round / dflash_round with their
+  mtp_draft / dflash_draft / dflash_inject parts. A round's "other" is its host time minus the
+  drafter, verify and inject spans.
+- **Per-linear-class breakdown:** `R4DX_PROFILE_LINEARS=1` stamps every `gemm:` span of the layer
+  code (`ProfiledCall` with no hipEvent profiler attached; `FinalLmHead` now has a `gemm:lm_head`
+  span). `ApplyLinear` adds one stamp between the input stage (the w4a16 cast or the trellis
+  transform) and the GEMM. `=all` stamps every span. The spans are summed per (call kind, rows,
+  class, layer).
+- **Output and cost.** `R4DX_PROBE_JSON=<file>` writes the JSON at exit; a `[probe]` summary goes to
+  stderr. The timing is the bench's: wall_clock64 stamps, the REALTIME rate calibrated against host
+  time at `Model::Load`, and the empty bracket (0.7 us) subtracted. The probe runs at TP = 1 only.
+  Stamps are read back only where the model already synchronized. Unset, the cost is one pointer
+  test per hook: `Model::probe_`, and one static pointer in `ProfiledCall` and `ApplyLinear`.
+- **Prefill rows:** `tool_trellis_gemm_bench --modes ptune` (M = 32 and 64 by default). It screens
+  every legal tuning per (N, K, KB) on flushed full-GEMM chains: MT a divisor of the chunk's row
+  tiles, a split group only with every row tile in its block, and at least one wave per SIMD. It
+  then takes the best four, each also with NT flipped, into the whole prefill chunk, paired. A key
+  that `--tuning-file` already gives a row keeps it, so a `--kb mix` run after a `--kb 4` run adds
+  only the KB = 5 rows. `src/model/gemm_tuning_table_trellis.inc` now has M = 32 and M = 64 rows for
+  all 14 keys. `BestRow` serves M = 17..32 from the M = 32 row and 33..64 from the M = 64 row; the
+  M = 1 rows are unchanged. The sweep lives in the bench tool, as M2's M = 1 pick does, not in
+  `tune_gemm.py` (5.6).
+- **TP = 2 rows** (`--tp 2`: one rank's shapes; the column-parallel linears split N, the
+  row-parallel ones K). `src/model/gemm_tuning_table_trellis_tp2.inc` holds the M = 1 joint pick and
+  the M = 32 / 64 rows for all 14 per-rank keys. `linear.cpp` reads it (namespace `trellis_tp2`)
+  on a TP thread before the TP = 1 trellis rows, because the rank's attn.qg (6144 x 5120) has
+  gdn.in_proj_z's TP = 1 shape. The tuning is cheap: every joint or prefill run here took under 2
+  minutes.
+- **`tools/quant2/bench_decode.ps1`.**
+  - Entries are `name=path[@exe][#layout]`, and `-Modes` takes `plain`, `dflash<k>` and `mtp<k>`
+    (default `plain,dflash7,mtp3`, A3's three).
+  - **Prefill (A3p):** one `--chat` process per entry and run. The first decode prompt is a warm-up
+    turn and is not counted. Every line of the new `tools/quant2/prefill_prompts.txt` (three ASCII
+    prompts of 339-544 tokens) is then a turn of its own.
+  - Tables: per-prompt and aggregate tok/s, the median of per-run aggregates, and each entry against
+    `-Baseline` (default: the first entry).
+  - Before every run the script waits until no other GPU job runs and the CPU is below `-MaxCpuPct`
+    (at most 5 minutes for the CPU alone).
+- **Tests.**
+  - `test_pick_tuning`: every prefill row is the pick at its own M. Every M > 16 pick equals
+    `ExpectedTrellis`, an independent transcription of `BestRow`. The TP = 2 rows are served first
+    on a TP thread and never on a TP = 1 thread. The TP = 2 copy in `trellis_tuning_rows.hpp` equals
+    production's field by field.
+  - `test_trellis_gemm`: `TestPrefillRows` runs every M > 16 row of both tables at both ends of its
+    M band, on its K and KB with N = 1024, against the fp64 linear: 112 calls, worst element 0.916
+    of the tolerance. Row identity now covers the TP = 2 M = 1 rows as well.
+
+**Measured: the in-model clock.** Prompt p3 of `tests/model/mtp_prompts.txt`, 256 greedy tokens,
+one process per container and mode. The clock is the median probe; the replay's (M2) was 3187-3237
+MHz for both formats.
+
+| mode (rows) | q2ab_hv2_q3 | K4m | mix4.5m |
+|---|--:|--:|--:|
+| plain decode (T = 1) | 3352 | **3142** (-6.3%) | 3142 |
+| `--mtp 3` verify (T = 4) | 3299 | 3182 | 3192 |
+| `--dflash k=7` verify (T = 8) | 3225 | 3189 | 3207 |
+
+- **The two formats' clocks diverge over a generation.** q2ab's per-step median climbs from 3210 to
+  3355 MHz. K4m's starts at the same 3140-3210 and ends at 3100-3145.
+- Within a trellis step the clock falls from L0-15 to L48-63 (3167 to 3110 for K4m). q2ab's stays
+  flat at 3351-3354.
+- The replay's short alternating chains sat at the start of that curve for both formats. A whole
+  generation of trellis GEMMs runs into the power limit (4.6's "clock sag its own ALU load
+  causes"); w4a16's memory-bound step gets more boost.
+
+**Measured: the linear classes** (the same prompt, `R4DX_PROFILE_LINEARS=1`). Each class is in ms
+per decode step, summed over its layers. For the w4a16 class that is cast + GEMM, against M1's
+flushed per-class replay (GEMMs plus 0.85 us per cast). For the trellis class it is transform +
+GEMM with epilogue, against M2's per-key replay at M = 1 (table tunings).
+
+| class | q2ab | replay | K4m | replay | K4m / replay | mix | K4m - q2ab |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| gdn.in_proj_qkv | 2.452 | 2.395 | 2.308 | 2.157 | 1.070 | 2.551 | -0.144 |
+| gdn.in_proj_z | 1.607 | 1.560 | 1.482 | 1.372 | 1.080 | 1.665 | -0.125 |
+| gdn.out_proj | 1.919 | 1.638 | 1.596 | 1.397 | 1.143 | 1.749 | -0.322 |
+| attn.qg | 0.962 | 0.943 | 0.902 | 0.846 | 1.066 | 1.008 | -0.061 |
+| attn.k + attn.v | 0.431 | 0.406 | 0.288 | 0.258 | 1.12 | 0.307 | -0.143 |
+| attn.o | 0.592 | 0.566 | 0.501 | 0.466 | 1.075 | 0.558 | -0.092 |
+| mlp.gate_up | 10.413 | 10.055 | 9.987 | 9.407 | 1.062 | 11.693 | -0.426 |
+| mlp.down | 5.519 | 5.428 | 4.976 | 4.752 | 1.047 | 5.649 | -0.543 |
+| body linears | **23.896** | 22.99 | **22.041** | 20.66 | 1.067 | 25.179 | **-1.855** |
+| lm_head (same w4a16 bytes) | 1.262 | | 1.302 | | | 1.329 | +0.040 |
+| decode step, GPU span (clock runs) | **27.269** | | **25.455** | | | 28.702 | **-1.814** |
+
+- **What this says about the gap** that M4's single runs raised: there is no loss.
+  - In the model, K4m's step is 1.81 ms (6.6%) shorter than q2ab's. Its body linears save 1.86 ms,
+    against the replay's 2.44 ms (20.64 against 23.08 with casts; 10.2's v1 end-to-end figure is
+    -2.44 at M = 1).
+  - The 0.6 ms lost is roughly both formats running slower in the model than in the replay (w4a16
+    +3.5%, of which about 1% is the probe's own mid stamp), plus trellis's lower clock (3142 against
+    3229 MHz in the replay: +2.8% for ALU-bound time). This matches trellis's +6.8%.
+  - lm_head is the same kernel on the same bytes in both containers and runs 3.2% slower in the K4m
+    process. So the clock deficit slows memory-bound kernels a little too.
+  - M4's 34.9 and 57.8 tok/s were single runs. Here, on the same binary and prompt (with 64 probes
+    per step), K4m ran 37.86 and q2ab 35.43 tok/s.
+- **mix4.5m is 1.43 ms (5.2%) slower per step than q2ab**, not at parity as the replay had it
+  (+0.055 ms, 10.2). Its gate_up alone costs +1.28 ms. KB = 5's extra ALU at the sagged clock is
+  what D1 would have to absorb.
+- Outside the linears, the steps match: 2.19 (q2ab) against 2.12 ms (K4m). v1's plain silu_mul and
+  gate-mul, and the missing rotations, net out at -0.06 ms.
+
+**Measured: the round composition** (the clock runs; ms per round, means; "other" is the host time
+of the round minus the three GPU spans, and ms per token includes the gap between rounds):
+
+| mode | container | round | drafter | verify (T) | inject | other | tokens / round | ms / token |
+|---|---|--:|--:|--:|--:|--:|--:|--:|
+| `--mtp 3` | q2ab | 36.88 | 6.66 | 29.34 (4) | | 0.89 | 3.15 | 11.74 |
+| `--mtp 3` | K4m | 34.85 | 6.66 | 27.31 (4) | | 0.88 | 3.06 | 11.42 |
+| `--mtp 3` | mix | 38.23 | 6.68 | 30.55 (4) | | 1.01 | 3.01 | 12.73 |
+| `--dflash k=7` | q2ab | 38.08 | 4.60 | 32.09 (8) | 0.24 | 1.15 | 5.17 | 7.38 |
+| `--dflash k=7` | K4m | 35.65 | 4.64 | 29.93 (8) | 0.24 | 0.86 | 5.02 | 7.11 |
+| `--dflash k=7` | mix | 38.90 | 4.60 | 33.22 (8) | 0.24 | 0.84 | 5.10 | 7.63 |
+
+- The drafters and the injection are the w4a16 / bf16 heads in every container, and they cost the
+  same everywhere.
+- K4m's verify windows are 2.0 ms (T = 4) and 2.2 ms (T = 8) shorter, 5.5-6.4% of a round.
+- Acceptance is text- and model-dependent. On this prompt K4m's tokens per round were 3% lower, so
+  its per-token gain shrank to 2.7% (MTP) and 3.6% (DFlash). On the haiku prompt below it was 4-7
+  points higher. Only the multi-prompt interleaved bench (A3) can average this out.
+
+**Measured: prefill.** Whole chunks (every linear's transform and GEMM) from the tool, in ms per
+chunk. "q2ab" is production's path at the same M: casts, the w4a16 GEMMs at PickTuning's rows, and
+the GDN Hadamards and rotations. Its g32 / g128 linears have no table rows, so they run the
+fallback.
+
+| run | M | 4.4 fallback | tuned | tuned / fallback | q2ab | q2ab / tuned |
+|---|--:|--:|--:|--:|--:|--:|
+| TP = 1, K4 | 32 | 30.25 | 26.72 | 0.883 | 38.36 | 1.44 |
+| TP = 1, K4 | 64 | 53.54 | 45.14 | 0.843 | 75.34 | 1.67 |
+| TP = 1, mix | 32 | 33.04 | 29.43 | 0.891 | 38.37 | 1.30 |
+| TP = 1, mix | 64 | 60.38 | 46.44 | 0.769 | 75.18 | 1.62 |
+| TP = 2 rank, K4 | 32 | 17.35 | 15.06 | 0.868 | 23.14 | 1.54 |
+| TP = 2 rank, K4 | 64 | 29.79 | 24.91 | 0.836 | 44.10 | 1.77 |
+| TP = 2 rank, mix | 32 | 18.63 | 16.25 | 0.872 | 23.12 | 1.42 |
+| TP = 2 rank, mix | 64 | 33.23 | 25.82 | 0.777 | 44.11 | 1.71 |
+
+- In the model, the 26-token prefill chunk takes 32.3 ms (K4m) against 44.7 ms (q2ab).
+- With `bench_decode.ps1`'s warm prefill of the 353-558-token turns, K4m ran 1161-1226 tok/s
+  against q2ab's 734-771: **1.59x**. A3p's bar is 0.80x, and 4.7 expected 0.74-0.84x.
+- M8 (tiled prefill) is not needed for A3p.
+- The same numbers show a w4a16 gap: q2ab's per-tensor groups have no M = 64 rows.
+
+**TP = 2 per-rank M = 1 pick** (`--tp 2 --modes full --joint`; ms per rank per token, replay at
+M = 1):
+- K4: trellis 11.04 against w4a16 12.45 (S = +1.55, X - S = -1.43).
+- mix: 12.23 against 12.48 (X - S = -0.25).
+- `--tp 2 --tp-mode emulate` on K4m (device 1) prints K4m's haiku at 29.37 tok/s. A 356-token
+  prompt prefills at 1011 tok/s, with both emulated ranks on one device.
+
+**Bench smoke, not a benchmark** (`bench_decode.ps1 -Runs 1`, the haiku prompt only, q2ab_hv2_q3
+against K4m):
+
+| mode | q2ab | K4m |
+|---|--:|--:|
+| plain | 36.28 tok/s | 38.96 tok/s (+7.4%) |
+| dflash7 | 72.59 tok/s (24.4% acceptance) | 90.73 tok/s (31.5% acceptance) |
+| mtp3 | 63.19 tok/s (43.3% acceptance) | 68.81 tok/s (47.9% acceptance) |
+| prefill | 756 tok/s | 1202 tok/s |
+
+A3 itself is the interleaved multi-prompt run of M5 part 2:
+
+```
+.\tools\quant2\bench_decode.ps1 -OutDir D:\models\r4dx\trellis-m5\bench -Container `
+    q2ab=D:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx,`
+    k4m=D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx#trellis,`
+    mix=D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx#trellis
+```
+
+**Tests** (device 1, the final tree):
+- `ctest -LE tp2gpu`: 90 pass, 0 fail, and `test_kernel_bandwidth` is skipped (absent golden);
+  91 are registered (`ctest_full2.log`).
+- The first full run (`ctest_full.log`) failed `test_mtp` and `test_dflash_feature_capture` with
+  HIP error 719 ("unspecified launch failure"), 13 s and 11 s in, back to back. The same binary
+  passed both alone and then the whole suite. No display-driver reset was logged. Neither test loads
+  trellis weights, and with the env vars unset every probe hook is a null test. It is recorded as a
+  transient fault.
+- **A6 spot check:** `tools/tp/tp1_identity.ps1` on q2ab_hv2_q3 against the pre-M4 build
+  (`build\a6-head`) is byte-identical on rows 1-9 (row 6 in all four layouts) and gives the same
+  hashes as M4's `fix-a6.log` (`a6_identity.log`). The probe hooks and the table changes leave the
+  w4a16 path unchanged.
+
+**Open for M5 part 2:**
+- A3: the interleaved bench above. The probe predicts K4m about 6-7% ahead in plain decode, with
+  MTP and DFlash depending on acceptance, and mix4.5m about 5% behind.
+- The clock deficit (3142 against 3352 MHz in sustained decode) is where M5's levers pay.
+  AFFINE (4.6) removes 0.5 VALU op/w, which is power as well as time. The fused producers (5.4)
+  remove launches.
+- q2ab_hv2_q3's g32 / g128 linears have no w4a16 tuning rows at any M, including the M = 64 prefill
+  that made its chunk 1.6-1.7x slower here. That is a w4a16 table gap, outside the trellis gates.
+
+### 10.6 M5, parts 2 and 3 (2026-09-28, device 1; the A3 bench, the slow layers found and fixed)
+
+Outputs are in `D:\models\r4dx\trellis-m5\`: part 2's bench in `bench\` and its probes in
+`part2_probe\`; part 3's probes in `part3\probe\` (one JSON, log and, where taken, span timeline per
+run), the fusion A/B in `part3\fusion\`, the final bench in `part3\bench\`, and every script in
+`part3\scripts\`. All runs: prompt p3 of `tests/model/mtp_prompts.txt`, 256 greedy tokens, unless a
+table says otherwise. Step and verify times are the probe's GPU spans (medians); the probe's own
+stamps make them a few percent longer than an unprofiled step.
+
+**Part 2: A3 on the part-1 binary** (`bench_decode.ps1 -Runs 3`, the three containers interleaved;
+median of per-run token-weighted tok/s over the 4 prompts; every run reproduced its text):
+
+| mode | q2ab | K4m | vs q2ab | mix4.5m | vs q2ab |
+|---|--:|--:|--:|--:|--:|
+| plain | 35.98 | 38.63 | +7.35% PASS | 34.43 | **-4.32% FAIL** |
+| `--dflash k=7` | 108.71 | 119.74 | +10.15% PASS | 104.60 | **-3.78% FAIL** |
+| `--mtp 3` | 78.30 | 79.17 | +1.12% PASS | 72.88 | **-6.93% FAIL** |
+| prefill (>= 256-token turns, warm) | 753.6 | 1198.3 | 1.590x PASS | 1153.6 | 1.531x PASS |
+
+K4m's per-token gain in plain decode was 1.91 ms against the replay's 2.44 (10.2), and mix4.5m was
+1.25 ms per token behind q2ab where the replay had it at parity. In the model most layers' GEMMs ran
+5-7% slower than the replay, while a few ran at replay speed: K4m `gate_up` 157.5 us on most layers,
+147.5 on L3, L7, L20, L27, L31, L34, L35, L55 and L59; KB = 5 `gate_up` 213.6 against 183 (+17%).
+
+**Part 3: the cause -- the GDN state's dirty lines behind non-temporal weight streams.** Per step, a
+timeline of every span (the probe's new `R4DX_PROBE_TIMELINE`) shows the fast and slow layers fixed:
+L3 fast in 99.2% of the steps, L4 in 0%. What it is not:
+
+| experiment (K4m, plain) | body + lm_head spans, ms/step | `gate_up` median, us |
+|---|--:|--:|
+| part-1 binary (per-tensor `hipMalloc` weights) | 23.67 | 157.3 |
+| all trellis words in one `hipMalloc`, 256-byte sub-allocations (the replay's layout) | 23.81 | 158.5, the same layers fast |
+| `GPU_NUM_MEM_DEPENDENCY=0`, `PAL_MALL_POLICY=1`, `PAL_MALL_POLICY=2` | 23.66, 23.69, 23.72 | unchanged |
+| a stamp around every span (`R4DX_PROFILE_LINEARS=all`) | -- | a different fixed set of fast layers |
+| **the GDN recurrent update skipped** (timing only; the outputs are wrong) | **22.68** | **148.6**, every layer |
+| **only its state store skipped** | **22.72** | **148.2** |
+| only its state load skipped | 23.79 | 158.2 |
+| its state stored non-temporally (`th:TH_STORE_NT`) | 23.69 | 157.7 |
+
+- No time period fits the fast set (a search over 50 us - 6 ms), and `tool_trellis_gemm_bench
+  --modes disp` rules out where the dispatcher starts a GEMM's workgroups: `gate_up` 144.0 us and
+  `down` 72.5-73.2 us whichever of the 128 slots a one-workgroup locator got and after any of 97
+  pad sizes, both per synchronize and back to back.
+- **The mechanism.** The recurrent update writes the layer's new fp32 state, 48 heads x 64 KB = 3 MB
+  per token, and leaves it dirty in the L2. The trellis GEMMs load their weights non-temporally (every
+  table row is NT = 1), which evicts almost nothing, so those lines drain a few at a time through the
+  next ~150 MB of weight stream, each write-back turning the DRAM bus around mid-stream: about 20 us
+  per GDN layer, spread over out_proj, gate_up, down and the next layer's in_proj. An attention
+  layer writes no state, so the lines drain there, and the GEMMs just after it run clean -- which is
+  why the fast set was mostly attention layers, and why an extra launch moved it. w4a16's rows mostly
+  load normally, flush the lines at once and show the effect only weakly (q2ab `gate_up` in L32-63:
+  155 us after an attention layer, 161.5 after a GDN one). The replay runs no recurrent update, so it
+  never saw it.
+
+**Fixes tried** (decode and verify GPU spans per step, K4m / mix4.5m, ms):
+
+| variant | decode (T = 1) | MTP verify (T = 4) | DFlash verify (T = 8) |
+|---|--:|--:|--:|
+| part-1 binary | 25.33 / 28.64 | 27.24 / 30.48 | 29.78 / 33.12 |
+| state written through (a libr4d `_wt` entry: `scope:SCOPE_SYS` stores) at every T | 24.92 / 27.55 | 27.73 / 30.51 | 32.61 / 35.15 |
+| the same, T = 1 only | 24.88 / 27.44 | = part 1 | = part 1 |
+| NT = 0 on every trellis GEMM | 24.94 / 27.50 | 26.96 / 29.44 | 29.72 / 32.22 |
+| **NT = 0 on gdn.out_proj only** (adopted) | **24.69 / 27.21** | **26.31 / 28.79** | **29.06 / 31.38** |
+| q2ab_hv2_q3 (unchanged by all of this) | 27.28 | 29.31 | 32.19 |
+
+- Written through, the state costs its burst inside the update (9.3 -> 14.8 us per layer at one
+  token), which is worth it at T = 1 but not in a verify window, where it writes one state per
+  candidate (12 and 24 MB per layer). On q2ab it cost +0.47 ms per step. Not kept.
+- gdn.out_proj is the first weight stream after the update. Loaded normally it flushes the lines in
+  one burst (it runs 1.29x its replay time instead of 1.14x), and every GEMM after it runs clean.
+  It is `ApplyLinear(..., temporal_weight_loads = true)` from `GdnLayer::Forward`: NT is a cache hint,
+  so the bits are the same (`test_trellis_linear`; the K4m teacher-forced dump below). attn.o keeps
+  its row's NT = 1. No libr4d change.
+
+**Fused producers and shared input transforms (5.4, 4.9)**, as specified, and all byte-identical:
+- `r4dx_silu_mul_trellis_bf16` (mlp.down's A straight from silu_mul) and
+  `r4dx_attn_gate_mul_trellis_bf16` (attn.o's from the gate-mul), in `trellis_transform.hip`;
+- `SharedTrellisInput` (linear.h): one `r4dx_trellis_input_bf16` with nout = 2 for
+  gdn.in_proj_qkv / in_proj_z and nout = 3 for attn.qg / k / v, each linear then taking its A through
+  `PreQuantizedActivation::transform_id`;
+- `TrellisFusionEnabled()` switches them off under `R4DX_DISABLE_EPILOGUE=1` (and under
+  `R4DX_TRELLIS_A_STATS`, which wants ApplyLinear's own transform to run). 160 launches fewer per
+  token (5.4). Decode -0.10 (K4m) / -0.17 (mix) ms per step; within noise in the verify windows.
+
+**One tuning row.** Behind clean GEMMs the KB = 5 `gate_up` M = 1 row (WV4 SK1 U1) runs 183.2 us and
+M2's screening-stage best (WV1 SK16 U4) 182.1; per step on mix4.5m that is -0.11 ms at decode,
+-0.19 at T = 4 and -0.07 at T = 8, and the SCLK rose 3065 -> 3145 MHz. It replaces the row
+(`gemm_tuning_table_trellis.inc`, annotated). The KB = 4 rows stay: part 2 found the same swap neutral
+for K4m. **Unlike everything above, it changes mix4.5m's numerics**: another split of K sums the
+same products in another order (row identity still holds; `test_trellis_gemm` checks it for every
+row). So mix4.5m's KL was measured again on the final binary (`--max-ctx 4096 --vision off`, as M4):
+**0.00747** (0.007472 against 0.007466 before), top-1 96.26% (95.92%), per segment cpp 0.00607, en
+0.00847, py 0.00674, thai 0.00860 (`part3\kl_mix_sw5.json`). A1 stands; K4m has no KB = 5 row, and
+the K4m twin that measured A2 is unchanged.
+
+**In the model against the replay, after** (plain; us per call, median over the layers; the replay
+is M2's full GEMM plus transform, 10.5):
+
+| class | K4m before | K4m after | replay | mix KB5 before | mix KB5 after | replay |
+|---|--:|--:|--:|--:|--:|--:|
+| gdn.in_proj_qkv (with both transforms after) | 48.30 | 45.72 | 44.93 | 58.27 | 55.87 | 55.53 |
+| gdn.in_proj_z (no transform after) | 30.76 | 28.05 | 28.59 | 38.95 | 34.60 | 35.37 |
+| gdn.out_proj (absorbs the flush) | 33.40 | 37.68 | 29.10 | 39.98 | 44.74 | 34.91 |
+| attn.qg (all three transforms after) | 56.63 | 53.81 | 52.88 | 69.87 | 65.94 | 65.46 |
+| attn.k / attn.v | 8.70 / 8.55 | 7.20 / 7.06 | 8.07 | 9.84 / 9.63 | 8.22 / 8.02 | 9.12 |
+| attn.o (fused producer) | 31.10 | 28.33 | 29.10 | 37.90 | 34.25 | 34.91 |
+| mlp.gate_up | 157.54 | 148.08 | 146.98 | 213.70 | 182.05 | 182.56 |
+| mlp.down (fused producer) | 78.31 | 73.06 | 74.25 | 100.12 | 91.19 | 92.20 |
+
+Every class but out_proj now runs within 2% of its replay time or below it (in_proj_qkv and attn.qg
+carry their siblings' transforms). K4m's body linears plus lm_head went 23.72 -> 22.81 ms per step.
+
+**Final probe** (the final binary; ms per step or round; tokens per round on this prompt):
+
+| container | decode | MTP verify (T = 4) | MTP round, tok/round | DFlash verify (T = 8) | DFlash round, tok/round |
+|---|--:|--:|--:|--:|--:|
+| q2ab_hv2_q3 | 27.28 @ 3349 MHz | 29.31 | 36.53, 3.15 | 32.19 | 37.76, 5.17 |
+| K4m | 24.59 @ 3072 | 26.34 | 33.54, 3.06 | 29.15 | 34.79, 5.02 |
+| mix4.5m | 26.93 @ 3145 | 28.69 | 35.79, 3.01 | 31.59 | 37.03, 5.10 |
+
+**Numerics: unchanged by the fixes and fusions** (checked before the tuning row above):
+- `tools/validate_fusion.ps1 -Layouts trellis` (fusion on vs `R4DX_DISABLE_EPILOGUE=1`, generated
+  text SHA-256, 3 prompt lengths x `--mtp 0/3`): 6/6 on K4m and 6/6 on mix4.5m (`part3\fusion\`).
+- `tool_teacher_forced_logprobs` on K4m, `tokens_canon.json`, the default max-ctx: all four
+  segments' `.logprobs.f16` SHA-256-equal to M4's `trellis-m4\kl_k4m\` dump, so K4m's runtime KL
+  stays 0.01004. mix4.5m: the fused and the `R4DX_DISABLE_EPILOGUE=1` dumps are SHA-equal, and
+  `kl_report.py` against `kl-canon\ref` gives 0.00747 / top-1 95.92%, M4's figures to the last digit
+  (`part3\kl_mix_on.json`). The dumps were deleted after the comparison.
+- The final bench's generated text against part 2's, log by log (`part3\bench\text_vs_part2.txt`):
+  every q2ab and K4m run the same (9 q2ab logs differ only in how part 2's console wrote U+2212);
+  mix4.5m's p2, p3 the same, and its p0, p1 and prefill turns different -- the tuning row.
+- `ctest -LE tp2gpu`: 90 pass, 0 fail, `test_kernel_bandwidth` skipped (absent golden)
+  (`part3\ctest_full.log`). A6 spot check: `tools/tp/tp1_identity.ps1` on q2ab_hv2_q3 against
+  `build\a6-head` is byte-identical on rows 1-9 with part 1's hashes (`part3\a6_identity.log`; the
+  15 GB of row-6 dumps deleted). `test_trellis_input` adds 90 fused-producer configurations against their
+  v1 pairs and the producers' precondition throws (467 checks); `test_trellis_linear` adds the
+  temporal-load identity and `SharedTrellisInput` against each linear's own call, and its refusals
+  (1337 checks).
+
+**Part 3: A3 on the final binary** (the same protocol as part 2; `part3\bench\`, 54 minutes; spread
+across runs at most 0.16%; every run reproduced its text):
+
+| mode | q2ab | K4m | vs q2ab (part 2) | mix4.5m | vs q2ab (part 2) |
+|---|--:|--:|--:|--:|--:|
+| plain | 36.30 | 40.34 | **+11.14% PASS** (+7.35%) | 36.69 | **+1.07% PASS** (-4.32%) |
+| `--dflash k=7` | 109.63 | 123.52 | **+12.67% PASS** (+10.15%) | 116.55 | **+6.31% PASS** (-3.78%) |
+| `--mtp 3` | 79.06 | 81.98 | **+3.69% PASS** (+1.12%) | 77.65 | **-1.79% FAIL** (-6.93%) |
+| prefill (>= 256-token turns, warm) | 757.2 | 1209.7 | **1.598x PASS** (1.590x) | 1172.8 | **1.549x PASS** (1.531x) |
+
+The spec modes split (all prompts and runs pooled; "speed only" = this container's ms per round at
+q2ab's tokens per round):
+
+| mode | container | ms / round | tokens / round | acceptance | speed only |
+|---|---|--:|--:|--:|--:|
+| `--dflash k=7` | K4m | -8.4% | +3.3% | 46.2% | +9.1% |
+| `--dflash k=7` | mix4.5m | -1.5% | +4.7% | 46.9% | +1.5% |
+| `--mtp 3` | K4m | -8.2% | -4.8% | 57.5% | +8.9% |
+| `--mtp 3` | mix4.5m | -1.3% | -3.0% | 59.4% | +1.3% |
+
+- q2ab itself measured 0.3-1% faster than in part 2 on the same code path (its text is
+  byte-identical); the comparison that counts is within one run.
+- **K4m's plain gain is now 2.76 ms per token (27.55 against 24.79 ms), above the replay's
+  predicted 2.44** (part 2: 1.91): the replay did not have the fusions, and the in-model probes put
+  every class at or under its replay time but out_proj.
+- mix4.5m's DFlash tokens per round rose from -1.1% to +4.7% against q2ab with the tuning row's new
+  text; its speed-only margin, +1.5%, passes without that. Its MTP miss is acceptance (59.4% against
+  q2ab's 62.0% on these four prompts), not speed.
+
+**Verdicts.**
+- **K4m: A3 PASS** in all three modes (+11.1%, +12.7%, +3.7%) and **A3p PASS** (1.60x).
+- **mix4.5m: A3p PASS** (1.55x); **A3 PASS** in plain (+1.1%) and DFlash (+6.3%); **A3 FAIL** in
+  MTP by 1.79%, which is inside D1's 4% (section 1) and comes from acceptance: at q2ab's tokens per
+  round it would be +1.3%.
+
+**Open.**
+- w4a16 has the same effect weakly -- q2ab's `gate_up` in L32-63 runs 155 us after an attention layer
+  and 161.5 after a GDN one -- and its gdn.out_proj ignores `temporal_weight_loads`. A w4a16 A/B of
+  that flag (its out_proj rows are mostly g32 fallback tunings) is outside the trellis gates (A6).
+- The TP = 2 table keeps its KB = 5 `gate_up` row; TP = 2 was not benchmarked (5.5).
+- gdn.out_proj now runs 1.29x its replay time because it absorbs the flush; the flush itself is
+  about 3 MB per layer, so ~5 us of the ~8.5 us is the write-back.
+
+### 10.7 M6 (2026-09-28, device 1; gates A4, A5, A6)
+
+The final binary is M5's tree (the M5 work on top of f197269; libr4d `ddc410f` on `trellis`),
+rebuilt with nothing to do; M6 changed only scripts, the tests' CMake and docs. Outputs are in
+`D:\models\r4dx\trellis-m6\` (`scripts\` holds the A6 driver and the text comparison).
+
+**A4: G6 on both trellis containers** (`g6_validate.ps1 -Layout trellis`, `g6-k4m\`, `g6-mix45m\`):
+
+| step | K4m | mix4.5m | q2ab_hv2_q3 (A6, below) |
+|---|---|---|---|
+| validate_dflash (plain vs `--dflash`, 3 prompts) | 3/3 byte-identical | 3/3 | 3/3 |
+| validate_spec_sampling (plain vs `--mtp 3` vs `--dflash k=7`, sampled) | 24/24 byte-identical | 24/24 | 24/24 |
+| smoke `-Dflash -ToolRoundTrip -Vision` | 217 PASS, 0 FAIL | 217 / 0 | 217 / 0 |
+| smoke `-Mtp 3` | 168 / 0 | 168 / 0 | 168 / 0 |
+| smoke `-Tp 2 -TpMode emulate -Dflash` | 170 / 0 | 170 / 0 | 170 / 0 |
+| steps exit 0 | **5 / 5** | **5 / 5** | **5 / 5** |
+
+Nothing failed, so nothing needed fixing: DFlash, vision, the tool round trip and TP = 2 with DFlash
+(none of which M4 ran on a trellis container) all work with `--layout trellis`. Each step takes
+0.6-6.3 minutes, the same as on q2ab. `g6_validate.ps1` now writes the last log line of each step
+into `summary.json` as a plain string (it serialized PowerShell's file-provider properties before).
+
+**A5: TP = 2 supported.** The emulate smoke above on both containers, plus `test_tp_loader`'s trellis
+cases (both ranks' words, suh, svh and part widths against the TP = 1 load) in the ctest run below.
+Real TP = 2 needs device 0 and was not run, as for q2ab.
+
+**A6: the w4a16 path is unchanged** (q2ab_hv2_q3 and v6 on the final binary; `a6\`):
+- **ctest** (`tests\run_tests.ps1`, `-LE tp2gpu`): 90 pass, 0 fail, `test_kernel_bandwidth` skipped
+  for its absent golden; 91 registered (`a6\ctest.log`). The six Python reference tests are not
+  registered: no interpreter that imports torch/transformers/numpy is configured (below).
+- **G6, default `-Layout w4a16`** on q2ab_hv2_q3: 5/5 (table above). All 30 output hashes of both
+  validators equal the 2026-09-26 G6 run on the pre-trellis binary
+  (`D:\models\r4dx\g6-qwen38-27b-q2ab_hv2_q3\`), in order.
+- **`tools/tp/tp1_identity.ps1`** against the frozen baseline `%USERPROFILE%\dev\r4dx-baselines\tp1-f7d4927`
+  (docs/tp.md 10.3; its default v6 container, since the f7d4927 binaries predate rotation and cannot
+  read q2ab): **G2 PASS**, rows 1-9 byte-identical, row 6 in all four layouts, row 7 on the golden
+  image (`a6\tp1_identity.log`). Rows 7-9 also carry the same hashes as the baseline's own
+  `identity_check.log`. The row-6 dumps were deleted after the comparison.
+- **Generated text against the pre-trellis quant2 binary.** A temporary worktree of 2ff3a52 (the last
+  commit before the libr4d pin moved; libr4d `99a5d94` from the canonical clone), built, then
+  `bench_decode.ps1 -Runs 1 -NoPrefill` with `new=q2ab_hv2_q3` (this binary) and
+  `pre=q2ab_hv2_q3@<its r4dx-cli>` over the four prompts in plain, `--dflash k=7` and `--mtp 3`
+  (`a6\text_ab\`, compared by `scripts\text_ab.py` on text SHA-256, tokens, acceptance and tokens per
+  round): **12 / 12 equal** -- in every mode and prompt the same text SHA-256 and token count (91,
+  107, 89 and 256 tokens; within a prompt the three modes give the same text too), the same
+  acceptance (DFlash 24.4 / 59.2 / 28.6 / 60.3%, MTP 43.3 / 72.5 / 50.9 / 71.6%) and tokens per round,
+  at the same speed (plain 36.15-36.22 against 36.17-36.20 tok/s; `a6\text_ab_compare.log`). The
+  temporary worktree and its build were removed afterwards.
+
+**Script defaults (not a gate).** The reference venv the scripts defaulted to was deleted. Every
+`tools/quant2/*.ps1` that runs Python now takes `-Python`, defaulting to
+`$env:R4DX_REFERENCE_VENV\Scripts\python.exe` when that is set and `python` on PATH otherwise;
+`build.ps1` and `tests/run_tests.ps1` use the venv's cmake only when the variable is set;
+`tests/CMakeLists.txt` picks the first interpreter that imports torch, transformers and numpy from
+`-DR4DX_REFERENCE_PYTHON`, the venv, the `R4DX_REFERENCE_PYTHON` environment variable and `python`
+on PATH (10.8). Usage lines in the Python tools and `tools/reference/README.md` say `python`.
+`trellis_convert.ps1`, `trellis_oracle.ps1` and `trellis_quant.py` default to hessian-v2's new home,
+`D:\models\r4dx\hessian\hessian-v2` (moved from `C:\AI\r4dx-hessian` on 2026-09-28).
+
+**Verdicts.** **A4 PASS** (5/5 on K4m and mix4.5m), **A5 PASS**, **A6 PASS** (ctest green, G6 w4a16 5/5, G2 identity, text 12/12). With
+M4's A0-A2 and M5's A3/A3p, both containers are shippable under D1: K4m passes every gate; mix4.5m
+misses A3 in `--mtp 3` only, by 1.79% (acceptance), inside D1's 4%. By the user's rule (accuracy
+first) **mix4.5m is the recommended container** (0.00747 against K4m's 0.01004 and q2ab's 0.01559);
+the recipe is in docs/quant2.md 7.1. K4m is the speed option. q2ab_hv2_q3, the baseline every gate
+above compares against, is retired (2026-09-28): its figures are historical, the w4a16 path stays.
+
+### 10.8 Pre-merge review fixes (2026-09-28, device 1)
+
+Two reviews of the branch (correctness; merge readiness). Fixed:
+
+- **w4a16 scales sized at the group the kernel reads** (`src/model/container.cpp`). A container with
+  no `quant.w4a16.group` parses to default 128 and skips `CheckW4a16Group`; `CheckW4a16Shape` and the
+  TP loader's `kW4a16Wsz` part both sized its scales at that 128, while the kernel reads the build's
+  group (64), so a group-128 wsz passed and was read at the wrong stride. Both now size at
+  `W4a16LoadGroups::KernelGroup` (a mapped linear's own group, else `r4d_gemm_w4a16_nt_m64_group()`),
+  and such a container is refused with the byte counts. Predates quant2; every shipped container
+  records its group, so no load changes. `test_trellis_linear` has the refusal as a header-patched
+  case (TP = 1 and TP = 2).
+- **`TrellisRowFits` mirrors all of libr4d's static rules** (`src/model/linear.cpp`): the parameter
+  sets, the (KB, NP, U, MT) instantiation table (a copy of `r4d_tq_max_mt`), Wc <= 256, <= 1024
+  threads and <= 64 KiB of LDS, so a regenerated row outside them is skipped instead of throwing at
+  its first launch. All 84 shipped rows (TP = 1 and TP = 2 tables) pass, so no pick changes.
+- **The ticket protocol's invariant is written down** at `ApplyLinear`'s trellis case: no two
+  launches of one linear may overlap (one stream per Model, one Container per rank).
+- **Python reference tests** (`tests/CMakeLists.txt`): the interpreter is the first of
+  `-DR4DX_REFERENCE_PYTHON`, the venv, `$env:R4DX_REFERENCE_PYTHON` and `python` on PATH (looked up
+  uncached) that imports torch/transformers/numpy. `reference_hessian_rms`, `reference_gguf_dequant`
+  and `reference_trellis_quant` register on any such interpreter; `reference_manifest`,
+  `reference_dflash2` and `reference_hessian_corpus` only under transformers 5.17.0, the reference
+  venv whose goldens and tokenizer ids they compare against (under Python 3.12 / transformers 5.5 /
+  torch 2.9.1 they fail for the environment: a missing optional GDN package, a golden diff, and the
+  tokenizer probe that says to use 5.17.0).
+- Smaller: `trellis_quant.py`'s `--hessian-dir` default, `run_tests.ps1`'s cmake error message,
+  `bench_decode.ps1`'s prompt-length note, `.gitmodules` `branch = trellis` (where the pin lives).
+
+**Tests** (`build.ps1` with `$env:R4DX_REFERENCE_PYTHON` = Python 3.12, then `tests\run_tests.ps1`):
+94 registered, 93 pass, 0 fail, `test_kernel_bandwidth` skipped (absent golden) -- the three
+portable reference tests now among them (`D:\models\r4dx\trellis-m6\review\ctest.log`). G6 steps
+that load through the changed code, on mix4.5m: `validate_dflash` 3/3 byte-identical, with the same
+three hashes as M6's `g6-mix45m`; `smoke -Tp 2 -TpMode emulate -Dflash` all checks passed.

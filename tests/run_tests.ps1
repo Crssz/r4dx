@@ -11,6 +11,11 @@
   environment variable is needed: the tests pick the containers matching the build's w4a16 group
   themselves (tests/model/test_container_path.h).
 
+  The Python reference tests are registered, or not, when build.ps1 configures (tests/CMakeLists.txt
+  says which interpreter it found, or why none): set $env:R4DX_REFERENCE_PYTHON (or
+  R4DX_REFERENCE_VENV) to an interpreter with torch + transformers + numpy before building to have
+  them in this run. Three of them also need the reference venv's transformers 5.17.0.
+
   The default run excludes the tensor-parallel two-GPU tests (ctest -LE tp2gpu) and makes sure
   R4DX_TP2GPU is not set, so they SKIP even if selected some other way (docs/tp.md 10.1).
 
@@ -40,14 +45,13 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..
 
-$VenvRoot = if ($env:R4DX_REFERENCE_VENV) { $env:R4DX_REFERENCE_VENV }
-            else { Join-Path $env:USERPROFILE "dev\vLLM_for_AMD\.venv-rocm10" }
-$Cmake = Join-Path $VenvRoot "Scripts\cmake.exe"
+$VenvRoot = $env:R4DX_REFERENCE_VENV
+$Cmake = if ($VenvRoot) { Join-Path $VenvRoot "Scripts\cmake.exe" } else { "" }
 # Same fallback as build.ps1: the reference venv is a machine-local environment that can be absent;
 # the cmake/ctest on PATH run this preset just as well.
-if (-not (Test-Path $Cmake)) {
+if (-not $Cmake -or -not (Test-Path $Cmake)) {
     $PathCmake = Get-Command cmake.exe -ErrorAction SilentlyContinue
-    if (-not $PathCmake) { throw "cmake.exe not found in $VenvRoot\Scripts nor on PATH" }
+    if (-not $PathCmake) { throw "cmake.exe not found in the reference venv ('$VenvRoot') nor on PATH" }
     $Cmake = $PathCmake.Source
 }
 $Ctest = Join-Path (Split-Path $Cmake) "ctest.exe"

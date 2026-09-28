@@ -11,7 +11,7 @@ side quantize -- no bf16-rounding discrepancy between "the value I quantized" an
 C++ side reads back out of the file" to worry about.
 
 Run with the read-only reference venv:
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe gen_fixtures.py
+  python gen_fixtures.py
 """
 import json
 import pathlib

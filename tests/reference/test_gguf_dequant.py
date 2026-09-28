@@ -31,7 +31,7 @@ gguf_validate.py. numpy only: no torch, no GPU.
 
 Plain script, no pytest (like test_manifest.py):
 
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tests\\reference\\test_gguf_dequant.py
+    python tests\\reference\\test_gguf_dequant.py
 
 Exits 0 and prints "OK (<n> checks)" on success; 1 and every failed check otherwise.
 """

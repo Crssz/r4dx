@@ -4,7 +4,7 @@ implementation is checked against (CTest 'tokenizer_golden', tests/tokenizer/gol
 
 Run with the read-only reference venv (CPU only, no GPU touched):
 
-    C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\tok_ref\\gen_golden.py
+    python tools\\tok_ref\\gen_golden.py
 
 Loads the real tokenizer.json / tokenizer_config.json / chat_template.jinja /
 generation_config.json from C:\\AI\\models\\Qwen3.8-27B (read-only).

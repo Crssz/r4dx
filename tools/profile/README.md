@@ -39,7 +39,7 @@ a redundant second check, since the kernel itself throws `std::runtime_error` on
 combo too.
 
 ```
-C:\Users\user\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe tools\profile\tune_gemm.py \
+python tools\profile\tune_gemm.py \
     --out src\model\gemm_tuning_table.inc
 ```
 

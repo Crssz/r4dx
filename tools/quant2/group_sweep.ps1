@@ -109,7 +109,7 @@ param(
   [switch]$NoReuse,             # every candidate a full conversion (the pre-reuse path)
   [switch]$KeepContainers,
   [switch]$KeepLogprobs,
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string]$Tool = '',           # default: this worktree's tool_teacher_forced_logprobs.exe
   # The rung-4 tokens file every candidate is scored on (and -RefDir's reference was dumped from).
   # tokens.json's thai_prose is the AutoTokenizer split-mark form; tokens_canon.json is the same four

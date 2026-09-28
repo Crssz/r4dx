@@ -971,7 +971,8 @@ the rotation removed most of the error bf16 was buying back, so the Milestone 11
 stale for every class, not just k/v. The sweep therefore measures bf16 keeps on the current recipe as
 candidates in the same currency as the groups, and prices the recipe's own k/v keep as two savers.
 
-The current recipe is q2ab_ldlq (section 7). `group_sweep.ps1`'s default `-Recipe` alone is the
+The recipe at the time of this round was q2ab_ldlq (section 7; q2ab has since been retired in favour
+of the trellis body, 7.1). `group_sweep.ps1`'s default `-Recipe` alone is the
 unrotated v6 recipe, so the Q3 round runs:
 
 ```powershell
@@ -1226,3 +1227,119 @@ re-prefills. The same smoke's free-form case (a 37-non-ASCII-char Japanese turn 
 without re-encoding the image on this container. The server-side gap (reuse lost after any
 whitespace-led reply) is filed as its own task; its fix (built on quant2 4bece0b in the scratch
 worktree `r4dx-ckpt-q2`, not merged yet) makes this container's yes/no case pass, per that session.
+
+### 7.1 Trellis body (2026-09-26 to 09-28, device 1)
+
+The "Next" above: the 400 decoder linears in EXL3/QTIP's trellis format (`mul1` codebook, 16-bit
+tail-biting state, 128-point Hadamards with folded signs; `docs/trellis.md`), quantized by the
+Python oracle `tools/reference/trellis_quant.py` against hessian-v2 in the matched basis (no q2ab
+rotation: the trellis incoherence processing replaces it), imported bit for bit by
+`r4dx-convert --trellis-from`, and run by a native RDNA4 kernel, libr4d's `r4d_gemm_trellis_nt_m64`
+(WMMA f16, one kernel for M = 1..64; `--layout trellis`). lm_head, the MTP head, the DFlash2
+drafter and vision keep the q2ab_hv2_q3 recipe (w4a16, lm_head g32). Design and every measurement:
+`docs/trellis-kernel.md` (gates in section 1, measured in 10); on-disk format:
+`docs/container-format.md` "Trellis body layout".
+
+**Oracle curve** (weights only, bf16 lm_head, `full_logits_golden.py --weights-override` against
+`kl-canon\ref` on `tokens_canon.json`; `docs/trellis.md` 14.1). `m` = matched Hessian basis; a mix is
+EXL3's 4/5-bit allocation over K4m + K5m.
+
+| point | bpw (decoder linears) | decoder GiB | mean KL | top-1 |
+|---|--:|--:|--:|--:|
+| K3.5m | 3.5045 | 9.93 | 0.01611 | 94.18% |
+| **K4m** | 4.0045 | 11.34 | **0.00813** | 95.94% |
+| mix4.25m | 4.2545 | 12.05 | 0.00688 | 96.53% |
+| **mix4.5m** | 4.5045 | 12.76 | **0.00547** | 96.90% |
+| UD-Q4_K_XL (GGUF, weights only) | ~5.05 | 15.35 decode | 0.00706 | 96.38% |
+
+**Runtime** (gate A1: `tool_teacher_forced_logprobs --layout trellis --max-ctx 4096 --vision off` on
+`tokens_canon.json`, `kl_report.py` against `kl-canon\ref`; w4a16 g32 lm_head and fp8 KV included):
+
+| container | decode bytes | mean KL | cpp | en | py | thai | top-1 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| q2ab_hv2_q3 (w4a16, same binary) | 13.680 GiB | 0.01559 | 0.01222 | 0.01733 | 0.01419 | 0.01863 | 94.92% |
+| `qwen38-27b-trellis-k4m.r4dx` | **12.130 GiB** | **0.01004** (-36%) | 0.00782 | 0.01050 | 0.00953 | 0.01230 | 95.53% |
+| `qwen38-27b-trellis-mix45m.r4dx` | **13.546 GiB** | **0.00747** (-52%) | 0.00607 | 0.00847 | 0.00674 | 0.00860 | 96.26% |
+
+- mix4.5m's figure is on the final binary (M5 changed one KB = 5 tuning row, i.e. a summation
+  order; M4 measured 0.00747 / 95.92% before it). K4m's dumps are SHA-equal to M4's.
+- Runtime minus oracle is about +0.002 for both. On K4m's `--lm-head bf16` twin, 0.00157 of it is the
+  w4a16 g32 lm_head, now the largest error term outside the body; gate A2 (the twin against the
+  oracle's own dump: 0.00117, i.e. the fp8-KV allowance of 0.0012 and nothing more) shows the kernel
+  adds no error of its own.
+- Against UD-Q4_K_XL: mix4.5m's runtime 0.00747 is within 6% of the GGUF's weights-only 0.00706
+  although it also carries the fp8 KV cache and a 4-bit lm_head, at 12% fewer decode bytes (13.55
+  against 15.35 GiB); its oracle (weights only, the like-for-like row) is 0.00547.
+
+**Speed** (gate A3/A3p, `bench_decode.ps1 -Runs 3`, the three containers interleaved on one binary;
+tok/s, change vs q2ab; `docs/perf.md` top section, trellis-kernel.md 10.6):
+
+| mode | q2ab_hv2_q3 | trellis-k4m | trellis-mix45m |
+|---|--:|--:|--:|
+| plain | 36.30 | 40.34 (+11.1%) | 36.69 (+1.1%) |
+| `--dflash k=7` | 109.63 | 123.52 (+12.7%) | 116.55 (+6.3%) |
+| `--mtp 3` | 79.06 | 81.98 (+3.7%) | 77.65 (**-1.8%**, acceptance; +1.3% at q2ab's tokens/round) |
+| prefill (>= 256-token turns) | 757.2 | 1.60x | 1.55x |
+
+**G6 on the trellis containers** (gate A4, `g6_validate.ps1 -Layout trellis`, M6,
+`D:\models\r4dx\trellis-m6\g6-k4m`, `g6-mix45m`): **5/5 on both** -- validate_dflash 3/3
+byte-identical, validate_spec_sampling 24/24 (plain vs `--mtp 3` vs `--dflash k=7`, sampled,
+bit-exact), smoke dflash + tools + vision 217/0, smoke MTP 3 168/0, smoke TP = 2 emulate + DFlash
+170/0 -- the same counts as q2ab_hv2_q3. A5 (TP = 2 supported): that emulate smoke plus
+`test_tp_loader`'s trellis cases in ctest. A6 (w4a16 unchanged, on the final binary): ctest 90 pass /
+0 fail (one skip for an absent golden); G6 `-Layout w4a16` on q2ab_hv2_q3 5/5 with all 30 validator
+hashes equal to the 2026-09-26 run; `tp1_identity.ps1` G2 PASS against the frozen
+`tp1-f7d4927` baseline; and q2ab_hv2_q3's generated text, token counts and acceptance equal to the
+pre-trellis quant2 binary (2ff3a52) in 12 / 12 cells (4 prompts x plain, `--dflash k=7`,
+`--mtp 3`). Details: trellis-kernel.md 10.7.
+
+**Recommendation: `qwen38-27b-trellis-mix45m.r4dx`, `--layout trellis`.** By the user's rule
+(accuracy first, then speed, native RDNA4; D1 in trellis-kernel.md 1) it is the most accurate
+container r4dx has -- half q2ab_hv2_q3's KL (0.00747 against 0.01559), top-1 +1.3 points -- at
+slightly fewer decode bytes (13.55 against 13.68 GiB), on a WMMA kernel. It passes A0-A2 and
+A4-A6; A3 passes in plain (+1.1%) and DFlash (+6.3%) and misses `--mtp 3` by 1.8%, inside D1's 4%
+and from acceptance, not speed. `qwen38-27b-trellis-k4m.r4dx` is the speed pick (+11% plain, +13%
+DFlash, 1.5 GiB smaller, KL 0.01004 -- still 36% below q2ab_hv2_q3) and passes every gate.
+
+**q2ab is retired (2026-09-28).** The q2ab_hv2_q3 container (and the q2ab + LDLQ w4a16 body recipe
+of sections 4-7) is no longer the baseline or a recommendation, and its containers are no longer
+kept; every q2ab figure in this document is a historical comparison. The default recommendation is
+mix4.5m (`D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx`, `--layout trellis`), K4m
+(`qwen38-27b-trellis-k4m.r4dx`) the speed option. The runtime's w4a16 path, rotation kinds and
+converter flags stay supported for any container that uses them (and for the trellis containers'
+w4a16 lm_head and MTP head).
+
+**Recipe** (mix4.5m; K4m is the same without steps 2-3 and with `-Oracle K4m`). The reference Python
+is `$env:R4DX_REFERENCE_VENV\Scripts\python.exe` or `python` on PATH (torch ROCm, transformers,
+numpy); the Hessians are hessian-v2 (3.3), now at `D:\models\r4dx\hessian\hessian-v2`.
+
+```powershell
+$env:HIP_VISIBLE_DEVICES = '1'
+$h = 'D:\models\r4dx\hessian\hessian-v2'
+# 1-3. the oracle's bits (GPU, ~75 min per rate), then EXL3's 4/5 allocation at 4.5 bpw (a manifest)
+python tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched --hessian-dir $h --out-dir D:\models\r4dx\trellis-q\K4m
+python tools\reference\trellis_quant.py quantize-model --device cuda --K 5 --hessian-basis matched --hessian-dir $h --out-dir D:\models\r4dx\trellis-q\K5m
+python tools\reference\trellis_quant.py mix --bpw 4.5 --src D:\models\r4dx\trellis-q\K4m --src D:\models\r4dx\trellis-q\K5m --out-dir D:\models\r4dx\trellis-q\mix4.5m
+# (tools\quant2\trellis_oracle.ps1 -Points mix4.5m runs 1-3 plus the weights-only KL, whose
+#  reference_run.json the next step takes its manifest pin from)
+# 4. the container (CPU, ~2 min, full reconstruction check)
+.\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx
+```
+
+Step 4 runs:
+
+```
+r4dx-convert --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx
+  --trellis-from D:\models\r4dx\trellis-q\mix4.5m
+  --trellis-manifest-sha256 48a2eacb3f103aad8ed27880ddc16bf4ed1ebe9388a58d7cecbcd93e3f3f7712
+  --trellis-verify full --layouts w4a16 --lm-head w4a16 --no-bf16 --mtp on --vision on
+  --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json --quant search
+  --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz --hessian-dir D:\models\r4dx\hessian\hessian-v2
+  --ldlq . --w4a16-group-rule "^lm_head$=32" --threads 32
+```
+
+(K4m's pin is `7e9037f4...`, the full value in its `kl-trellis\K4m\reference_run.json`.) The body
+flags apply only to the non-trellis linears (lm_head, the MTP head): no `--rotate`, no body group
+rules, no attn.k/v keep. Serve it with `r4dx-server --model <container> --layout trellis` plus the
+usual `--dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` or `--mtp 3`; a
+trellis container refuses every other `--layout`, and a pre-trellis binary refuses the container.

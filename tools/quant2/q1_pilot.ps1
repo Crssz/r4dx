@@ -14,7 +14,7 @@ param(
   [string]$Pilot = 'D:\models\r4dx\qwen38-27b-q1pilot.r4dx',
   [string]$V6 = 'D:\models\r4dx\qwen38-27b-v6.r4dx',
   [string]$OutDir = 'D:\models\r4dx\kl-q1',
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string]$Tool = 'C:\Users\pay20\dev\r4dx\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe'
 )
 $ErrorActionPreference = 'Stop'

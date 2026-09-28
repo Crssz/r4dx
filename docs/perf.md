@@ -1,5 +1,36 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+## Trellis weights (`--layout trellis`): decode and prefill against q2ab_hv2_q3 (2026-09-28)
+
+Branch `quant2`, the EXL3-style trellis body (docs/trellis-kernel.md; libr4d branch `trellis`,
+`r4d_gemm_trellis_nt_m64`, WMMA f16). HIP device 1, `tools/quant2/bench_decode.ps1 -Runs 3`: the
+three containers interleaved run by run on one binary, four `tests/model/mtp_prompts.txt` prompts per
+mode, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048`, median of the
+per-run token-weighted aggregates; prefill is the warm >= 256-token `--chat` turns of
+`tools/quant2/prefill_prompts.txt`. Every run reproduced its text. (docs/trellis-kernel.md 10.6,
+`D:\models\r4dx\trellis-m5\part3\bench\`.) mix4.5m is the default recommended container, K4m the
+speed option; q2ab_hv2_q3 has since been retired and is kept here as the historical baseline.
+
+| mode | q2ab_hv2_q3 (w4a16) | trellis-k4m | vs q2ab | trellis-mix45m | vs q2ab |
+|---|--:|--:|--:|--:|--:|
+| plain | 36.30 | 40.34 | **+11.1%** | 36.69 | **+1.1%** |
+| `--dflash k=7` | 109.63 | 123.52 | **+12.7%** | 116.55 | **+6.3%** |
+| `--mtp 3` | 79.06 | 81.98 | **+3.7%** | 77.65 | **-1.8%** |
+| prefill tok/s | 757.2 | 1209.7 | **1.60x** | 1172.8 | **1.55x** |
+
+- Per decode step (GPU span, probe): q2ab 27.28 ms, K4m 24.59, mix4.5m 26.93. The 4-row MTP verify
+  29.31 / 26.34 / 28.69 ms and the 8-row DFlash verify 32.19 / 29.15 / 31.59 ms.
+- mix4.5m's `--mtp 3` miss is acceptance (59.4% against q2ab's 62.0% on these prompts); at q2ab's
+  tokens per round it would be +1.3%. Its DFlash gain is partly text (+1.5% on speed alone).
+- What got it there (M5): the GDN recurrent update leaves 3 MB of dirty state per layer in L2, which
+  drained through the next non-temporal trellis weight streams (~20 us per GDN layer);
+  `gdn.out_proj` now loads its weights temporally (`ApplyLinear(..., temporal_weight_loads)`), which
+  flushes them in one burst. Plus fused producers (silu_mul, the attention gate-mul) and shared input
+  transforms: 160 launches fewer per token. w4a16 ignores the flag; its bytes and text are unchanged
+  (gate A6, docs/trellis-kernel.md 10.7).
+- The w4a16 side has the same dirty-state effect weakly (`gate_up` 155 us after an attention layer,
+  161.5 after a GDN one); trying the flag there is open.
+
 ## Sampled speculation bit-exact: what it costs (2026-09-25)
 
 The fix that makes every verify row bit-identical to the decode row ([mtp.md](mtp.md), "Sampled

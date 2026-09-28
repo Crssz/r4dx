@@ -19,7 +19,7 @@ packed with, which makes the same invocation the right gate for a group-64 build
 default build's.
 
 Usage (from the reference venv):
-  C:\\Users\\user\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe selftest_compare.py
+  python selftest_compare.py
       [--exe <path to r4dx-convert.exe>] [--n 48] [--k 384] [--seed 7]
       [--w4a16-group 128|64] [--w4a8-group 128]
 """

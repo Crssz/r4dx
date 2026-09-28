@@ -48,7 +48,7 @@ SKIPPED with a message when what it needs is missing.
 
 Plain script, no pytest dependency, like tests/reference/test_hessian_rms.py:
 
-    C:\\Users\\pay20\\dev\\vLLM_for_AMD\\.venv-rocm10\\Scripts\\python.exe tools\\quant2\\test_gen_corpus.py
+    python tools\\quant2\\test_gen_corpus.py
 
 Exits 0 and prints "OK (<n> checks[, <k> skipped])" on success; 1 and every failed check otherwise.
 """

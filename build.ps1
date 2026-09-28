@@ -4,9 +4,9 @@
   Configure + build r4dx with the 'win-hip' CMake preset.
 
 .DESCRIPTION
-  Uses the vLLM_for_AMD venv's CMake 4.4.2 / Ninja when that venv exists, otherwise the cmake/ninja
-  on PATH (CMake 3.31 + Ninja from PATH configure and build the 'win-hip' preset too -- verified
-  2026-09-22 once the venv had been deleted from this machine), against the ROCm SDK at C:\opt\rocm.
+  Uses $env:R4DX_REFERENCE_VENV's CMake / Ninja when that variable names a venv that has them,
+  otherwise the cmake/ninja on PATH (CMake 3.31 + Ninja from PATH configure and build the 'win-hip'
+  preset too, verified 2026-09-22), against the ROCm SDK at C:\opt\rocm.
   r4d_core's 16 libr4d translation units are compiled by hipcc.exe directly (see
   third_party/CMakeLists.txt); everything else is plain clang-cl C++.
 
@@ -30,23 +30,23 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 # Derived from the environment rather than hardcoded, so no local account name is baked into the
-# repo. Override with $env:R4DX_REFERENCE_VENV if the reference venv lives elsewhere.
-$VenvRoot = if ($env:R4DX_REFERENCE_VENV) { $env:R4DX_REFERENCE_VENV }
-            else { Join-Path $env:USERPROFILE "dev\vLLM_for_AMD\.venv-rocm10" }
-$VenvScripts = Join-Path $VenvRoot "Scripts"
-$Cmake = Join-Path $VenvScripts "cmake.exe"
-$Ninja = Join-Path $VenvScripts "ninja.exe"
+# repo: $env:R4DX_REFERENCE_VENV names the reference venv, if any.
+$VenvRoot = $env:R4DX_REFERENCE_VENV
+$VenvScripts = if ($VenvRoot) { Join-Path $VenvRoot "Scripts" } else { "" }
+$Cmake = if ($VenvScripts) { Join-Path $VenvScripts "cmake.exe" } else { "" }
+$Ninja = if ($VenvScripts) { Join-Path $VenvScripts "ninja.exe" } else { "" }
 
 # The reference venv is not a hard requirement -- fall back to whatever cmake/ninja are on PATH when
 # it is absent (it is a machine-local Python environment that can be deleted or recreated
 # independently of this repo). CMake 3.31 + Ninja 1.x from PATH configure and build this preset
 # correctly; the venv copies are simply the newer ones the project was originally developed against.
-if (-not (Test-Path $Cmake) -or -not (Test-Path $Ninja)) {
+if (-not $Cmake -or -not (Test-Path $Cmake) -or -not (Test-Path $Ninja)) {
     $PathCmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue)
     $PathNinja = (Get-Command ninja.exe -ErrorAction SilentlyContinue)
-    if (-not $PathCmake) { throw "cmake.exe not found in $VenvScripts nor on PATH" }
-    if (-not $PathNinja) { throw "ninja.exe not found in $VenvScripts nor on PATH" }
-    Write-Output "[build] reference venv not found at $VenvRoot -- using PATH cmake/ninja"
+    if (-not $PathCmake) { throw "cmake.exe not found in the reference venv ('$VenvRoot') nor on PATH" }
+    if (-not $PathNinja) { throw "ninja.exe not found in the reference venv ('$VenvRoot') nor on PATH" }
+    if ($VenvRoot) { Write-Output "[build] no cmake/ninja in $VenvRoot\Scripts -- using PATH cmake/ninja" }
+    else { Write-Output "[build] R4DX_REFERENCE_VENV not set -- using PATH cmake/ninja" }
     $Cmake = $PathCmake.Source
     $Ninja = $PathNinja.Source
 } else {

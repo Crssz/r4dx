@@ -177,9 +177,18 @@ class AttentionLayer {
     // in_proj_qkv/out_proj and MLP's gate_up/down. Replaces this component's own bf16-only Linear
     // (attention/linear.hpp) for this weight -- that wrapper is still used below for k/v, which
     // have no quantized on-disk form.
+    // docs/trellis-kernel.md 4.9 / 5.4 (M5): trellis qg, k and v read the same `normed`, so one
+    // input transform (nout = 3) serves all three -- each output the same bytes as the linear's own
+    // -- inside qg's span, where qg's own transform would have been; k and v run none.
+    PreQuantizedActivation trellis_in[3];
+    const QuantLinear* const trellis_in_w[3] = {w.qg, w.k, w.v};
+    bool trellis_shared = false;
     uint16_t* qg_raw = arena.Alloc<uint16_t>(static_cast<size_t>(T) * 2 * H * D);
     ProfiledCall(prof, stream, "gemm:attn.qg_proj", [&] {
-      ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T, have_qg_pre ? &normed_pre : nullptr);
+      trellis_shared = !have_qg_pre &&
+                       SharedTrellisInput(stream, arena, normed, T, trellis_in_w, 3, trellis_in);
+      ApplyLinear(stream, arena, *w.qg, normed, qg_raw, T,
+                  trellis_shared ? &trellis_in[0] : have_qg_pre ? &normed_pre : nullptr);
     });
 
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
@@ -200,10 +209,12 @@ class AttentionLayer {
     const bool k_shares_pre = have_qg_pre && (EpilogueForLayout(w.k->layout) == qg_epilogue);
     const bool v_shares_pre = have_qg_pre && (EpilogueForLayout(w.v->layout) == qg_epilogue);
     ProfiledCall(prof, stream, "gemm:attn.k_proj", [&] {
-      ApplyLinear(stream, arena, *w.k, normed, k, T, k_shares_pre ? &normed_pre : nullptr);
+      ApplyLinear(stream, arena, *w.k, normed, k, T,
+                  trellis_shared ? &trellis_in[1] : k_shares_pre ? &normed_pre : nullptr);
     });
     ProfiledCall(prof, stream, "gemm:attn.v_proj", [&] {
-      ApplyLinear(stream, arena, *w.v, normed, v, T, v_shares_pre ? &normed_pre : nullptr);
+      ApplyLinear(stream, arena, *w.v, normed, v, T,
+                  trellis_shared ? &trellis_in[2] : v_shares_pre ? &normed_pre : nullptr);
     });
 
     // ---- per-head q_norm / k_norm (RMSNorm over head_dim, one shared weight per head) ----------
@@ -296,7 +307,26 @@ class AttentionLayer {
 
     // ---- output gate: attn_out * sigmoid(gate) --------------------------------------------------
     uint16_t* gated = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
-    if (w.o_had_signs != nullptr) {
+    // docs/trellis-kernel.md 4.8 / 5.4 (M5): a trellis o_proj takes the gate-mul's product straight
+    // into its input transform (r4dx_attn_gate_mul_trellis_bf16: the same bf16 product, then the
+    // same transform, so the same bytes as the gate-mul and ApplyLinear's own transform) -- one
+    // launch, and `gated` is never written.
+    PreQuantizedActivation o_pre;
+    const bool o_fused = w.o_had_signs == nullptr && TrellisFusionEnabled() &&
+                         w.o->layout == Layout::kTrellis && w.o->trellis_parts == 1 &&
+                         w.o->K == static_cast<int64_t>(H) * D;
+    if (o_fused) {
+      uint16_t* a_o = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D, /*align_bytes=*/16);
+      ProfiledCall(prof, stream, "attn.gate_mul_trellis", [&] {
+        r4dx_attn_gate_mul_trellis_bf16(reinterpret_cast<int64_t>(attn_out),
+                                        reinterpret_cast<int64_t>(gate), T,
+                                        static_cast<int64_t>(H) * D,
+                                        reinterpret_cast<int64_t>(w.o->trellis_suh.data()),
+                                        reinterpret_cast<int64_t>(a_o), w.o->trellis_prescale_log2,
+                                        reinterpret_cast<int64_t>(stream));
+      });
+      o_pre = PreQuantizedActivation{r4dx_epilogue_none, a_o, nullptr, w.o->trellis_suh.data(), 0};
+    } else if (w.o_had_signs != nullptr) {
       // quant2 Q2b (docs/quant2.md section 4): gated = (attn_out * sigmoid(gate)) Hb, one launch,
       // block = D (one head); o_proj's K order is head * D + d, the row layout of [T, H, D].
       ProfiledCall(prof, stream, "attn.gate_mul_hadamard", [&] {
@@ -319,7 +349,7 @@ class AttentionLayer {
     // ---- o_proj ----------------------------------------------------------------------------------
     uint16_t* o_out = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
     ProfiledCall(prof, stream, "gemm:attn.o_proj", [&] {
-      ApplyLinear(stream, arena, *w.o, gated, o_out, T);
+      ApplyLinear(stream, arena, *w.o, gated, o_out, T, o_fused ? &o_pre : nullptr);
     });
     // Tensor parallel (docs/tp.md 6.2, site A2): o_proj is row-parallel, so each rank holds a
     // partial sum of the output; sum it across ranks before the residual (and the fused next-norm

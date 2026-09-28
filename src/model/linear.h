@@ -148,7 +148,31 @@ struct PreQuantizedActivation {
 // for THIS call, but ApplyLinear does not special-case that -- every existing caller already has
 // both). A trellis `w` takes `pre` when pre->transform_id is set (its already transformed parts,
 // PreQuantizedActivation's doc), and otherwise runs its input transform itself.
+// `temporal_weight_loads` (trellis only; every other layout ignores it): load the weights with the
+// normal cache policy (NT = 0) whatever the tuning row says. The trellis rows load non-temporally,
+// which evicts almost nothing from the L2 -- so a GEMM right behind a kernel that left dirty lines
+// there (the GDN recurrent update's new state) would leave them to drain, a few at a time, through
+// every later weight stream; normal loads flush them in one burst instead (docs/trellis-kernel.md
+// 10.6). It changes no bits: NT is a cache hint only.
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
-                  uint16_t* y, int64_t M, const PreQuantizedActivation* pre = nullptr);
+                  uint16_t* y, int64_t M, const PreQuantizedActivation* pre = nullptr,
+                  bool temporal_weight_loads = false);
+
+// docs/trellis-kernel.md 4.8 / 5.4 (M5): whether the layers use the trellis fused producers and
+// shared input transforms below -- on unless R4DX_DISABLE_EPILOGUE=1 (the same A/B switch
+// tools/validate_fusion.ps1 uses for the other layouts' fused epilogues, EpilogueForLayout) or
+// R4DX_TRELLIS_A_STATS is set (that hook tallies the A ApplyLinear's own transform writes, so it wants
+// every linear to run it). Both paths give the same bytes; this only picks the launches.
+bool TrellisFusionEnabled();
+
+// docs/trellis-kernel.md 4.9 / 5.4 (M5): one input transform for n (2..3) trellis linears that read
+// the same activation x [M, K] (attn.qg / k / v, gdn.in_proj_qkv / in_proj_z) --
+// r4dx_trellis_input_bf16 with nout = n, which computes each output exactly as the linear's own
+// ApplyLinear would, so the bytes are the same -- and pre[i] set up to hand linear i its A
+// (PreQuantizedActivation::transform_id). Returns false, launching and allocating nothing, unless
+// TrellisFusionEnabled() and every linear is a one-part trellis linear of x's K with the first one's
+// prescale; the caller then passes no `pre`. The A buffers come from `arena`.
+bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* x, int64_t M,
+                        const QuantLinear* const* ws, int n, PreQuantizedActivation* pre);
 
 }  // namespace r4dx::model

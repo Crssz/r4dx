@@ -143,6 +143,25 @@ void r4dx_silu_mul_hadamard_bf16(int64_t gate_up, int64_t out, int64_t rows, int
 void r4dx_trellis_input_bf16(int64_t x, int64_t M, int64_t K, int nout, const int64_t* suh,
                               const int64_t* out, int prescale_log2, int64_t stream);
 
+// ---- trellis fused producers (docs/trellis-kernel.md 4.8, 5.4; M5) ----------------------------
+// A producer's bf16 output fed straight into the input transform above, in one launch, BYTE-IDENTICAL
+// to the v1 pair (the producer's own bf16 kernel, then r4dx_trellis_input_bf16 with nout = 1): each
+// element is first rounded to bf16 exactly as the producer rounds it, then widened and multiplied by
+// suh in fp32. The bf16 intermediate is never written.
+//   r4dx_silu_mul_trellis_bf16: the producer is r4dx_silu_mul_wide_bf16 (= r4dx_silu_mul_bf16's
+//     bytes) -- h = bf16(g * sigmoid(g) * u) over gate_up rows [gate | up] of in_row_stride -- and
+//     the output is mlp.down's A, f16 [rows, intermediate]; suh fp32 [intermediate].
+//   r4dx_attn_gate_mul_trellis_bf16: the producer is r4dx_model_attn_gate_mul_bf16 -- h =
+//     bf16(attn_out * sigmoid(gate)) over [rows, K] -- and the output is attn.o's A, f16 [rows, K];
+//     suh fp32 [K].
+// Preconditions (throw): K / intermediate a positive multiple of 128, rows in 0..65535 (0 is a
+// no-op), non-null pointers, |prescale_log2| <= 24. Launch: grid (K / 128, rows), one wave32 each.
+void r4dx_silu_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermediate,
+                                 int64_t in_row_stride, int64_t suh, int64_t out, int prescale_log2,
+                                 int64_t stream);
+void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t rows, int64_t K,
+                                      int64_t suh, int64_t out, int prescale_log2, int64_t stream);
+
 // Test / diagnostic entry: an unnormalized in-place 128-point FWHT of each 128-float block of x
 // (fp32 [blocks * 128]) through libr4d's one-wave r4d_fwht128_wave (use_lds == 0; the trellis
 // kernels' butterfly) or r4dx's FwhtLds (use_lds != 0; the quant2 rotation kernels'), so a test can

@@ -89,6 +89,15 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
   // returns r4dx_epilogue_none today (unresolved full-model correctness issue, not yet fixed).
   uint16_t* h = arena.Alloc<uint16_t>(static_cast<size_t>(T * intermediate));
   const int down_epilogue = EpilogueForLayout(w_.down.layout);
+  // A trellis mlp.down's A straight from silu_mul (the fused producer below).
+  const bool down_trellis_fused = down_had_signs_ == nullptr && TrellisFusionEnabled() &&
+                                  w_.down.layout == Layout::kTrellis && w_.down.trellis_parts == 1 &&
+                                  w_.down.K == intermediate;
+  uint16_t* down_trellis_a = nullptr;
+  if (down_trellis_fused) {
+    down_trellis_a =
+        arena.Alloc<uint16_t>(static_cast<size_t>(T * intermediate), /*align_bytes=*/16);
+  }
   uint8_t* down_pre_data = nullptr;
   float* down_pre_scale = nullptr;
   if (down_epilogue != r4dx_epilogue_none) {
@@ -112,6 +121,17 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
                                    reinterpret_cast<int64_t>(down_had_signs_),
                                    static_cast<int>(kHadDownBlock));
     });
+  } else if (down_trellis_fused) {
+    // docs/trellis-kernel.md 4.8 / 5.4 (M5): the product straight into mlp.down's input transform
+    // (r4dx_silu_mul_trellis_bf16: the same bf16 h as the wide kernel below, then the same
+    // transform ApplyLinear would run, so the same bytes) -- one launch; `h` is never written.
+    ProfiledCall(prof, s_raw, "mlp.silu_mul_trellis", [&] {
+      r4dx_silu_mul_trellis_bf16(reinterpret_cast<int64_t>(gate_up), T, intermediate,
+                                 /*in_row_stride=*/2 * intermediate,
+                                 reinterpret_cast<int64_t>(w_.down.trellis_suh.data()),
+                                 reinterpret_cast<int64_t>(down_trellis_a),
+                                 w_.down.trellis_prescale_log2, s);
+    });
   } else if (w_.down.layout == Layout::kTrellis && down_epilogue == r4dx_epilogue_none) {
     // docs/trellis-kernel.md 10.2: a trellis mlp.down takes plain bf16 h (EpilogueForLayout is
     // none; ApplyLinear runs its input transform), so no epilogue is fused here -- the wide-grid
@@ -132,8 +152,12 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
   uint16_t* down_out = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
   ProfiledCall(prof, s_raw, "gemm:mlp.down", [&] {
     PreQuantizedActivation pre{down_epilogue, down_pre_data, down_pre_scale};
+    if (down_trellis_fused) {
+      pre = PreQuantizedActivation{r4dx_epilogue_none, down_trellis_a, nullptr,
+                                   w_.down.trellis_suh.data(), 0};
+    }
     ApplyLinear(stream, arena, w_.down, h, down_out, T,
-                down_epilogue != r4dx_epilogue_none ? &pre : nullptr);
+                down_trellis_fused || down_epilogue != r4dx_epilogue_none ? &pre : nullptr);
   });
   // Tensor parallel (docs/tp.md 6.2, site A3): down is row-parallel, so each rank holds a partial
   // sum; sum it across ranks before the residual (and the fused next-norm epilogue).

@@ -38,7 +38,10 @@
   (the default build) -> D:\models\r4dx\qwen38-27b-v6.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx.
 
 .PARAMETER Layouts
-  Comma-separated layout list. Default: w4a16,w4a8,mxfp4 (bf16 excluded, see above).
+  Comma-separated layout list. Default: w4a16,w4a8,mxfp4 (bf16 excluded, see above). `trellis`
+  (docs/trellis-kernel.md 5.4, M5) needs -Model to be a trellis container, alone in the list (a
+  trellis container carries no other body layout): R4DX_DISABLE_EPILOGUE=1 also turns off the
+  trellis fused producers and shared input transforms (TrellisFusionEnabled, src/model/linear.h).
 
 .PARAMETER MaxTokens
   --max-tokens for every generation. Default 40 -- long enough to exercise several decode/MTP-verify

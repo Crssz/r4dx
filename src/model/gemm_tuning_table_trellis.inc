@@ -8,7 +8,10 @@
 // four then compared on the whole full-linear decode step (input transforms + GEMMs with the
 // epilogue), paired, at M = 1 and M = 8 together. A trellis chunk of M <= 16 rows always runs its
 // M = 1 row (row identity, 4.3), so these serve decode, MTP verify and DFlash verify alike; NT = 1
-// at every M <= 16 (10.1: trellis must not take w4a16's NT = 0 rule for M > 1).
+// at every M <= 16 (10.1: trellis must not take w4a16's NT = 0 rule for M > 1). Two exceptions
+// from M5 part 3 (docs/trellis-kernel.md 10.6), both in-model A/Bs: the KB = 5 mlp.gate_up row is
+// the joint run's screening-stage best (WV1 SK16 U4), not its final pick; and gdn.out_proj runs its
+// row at NT = 0 whatever the row says (GdnLayer's temporal_weight_loads, linear.h).
 //
 // M = 32 and M = 64 rows (--modes ptune, M5): prefill chunks. Every legal tuning (MT up to the
 // chunk's row tiles, a split 128-group only with all of them in its block, >= 1 wave per SIMD)
@@ -63,7 +66,7 @@ static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kTrellis, 1024, 5120, 1, {1, 8, 1, 1, 1, 1, 2}, 0, 5},  // attn.k, attn.v Wc 32
     {Layout::kTrellis, 1024, 5120, 32, {2, 8, 2, 1, 0, 2, 4}, 0, 5},  // attn.k, attn.v Wc 64
     {Layout::kTrellis, 1024, 5120, 64, {4, 8, 1, 1, 0, 1, 4}, 0, 5},  // attn.k, attn.v Wc 128
-    {Layout::kTrellis, 34816, 5120, 1, {4, 1, 1, 1, 1, 1, 1}, 0, 5},  // mlp.gate_up Wc 128
+    {Layout::kTrellis, 34816, 5120, 1, {1, 16, 1, 1, 1, 1, 4}, 0, 5},  // mlp.gate_up Wc 32 (M5 part 3: in-model A/B, docs/trellis-kernel.md 10.6)
     {Layout::kTrellis, 34816, 5120, 32, {2, 8, 2, 2, 0, 1, 2}, 0, 5},  // mlp.gate_up Wc 128
     {Layout::kTrellis, 34816, 5120, 64, {2, 4, 4, 2, 0, 1, 1}, 0, 5},  // mlp.gate_up Wc 128
     {Layout::kTrellis, 5120, 17408, 1, {1, 4, 1, 1, 1, 1, 4}, 0, 5},  // mlp.down Wc 32

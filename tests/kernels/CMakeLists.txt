@@ -111,8 +111,10 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
-# r4dx_kernels.
+# r4dx_kernels; so does r4dx_model_attn_gate_mul_bf16, test_trellis_input's v1 producer for the
+# fused gate-mul (M5).
 target_link_libraries(test_attn_gate_mul_hadamard PRIVATE r4dx_model_attention)
+target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 
 # test_rotation_ref_cpu: pure CPU (no HIP call, no kernel library) -- pins rotation_ref.hpp, the
 # fp64 reference the two tests above compare against, to the rotation contract's definitions

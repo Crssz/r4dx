@@ -85,7 +85,8 @@ set_source_files_properties("${R4DX_ROTATE_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE
 
 # ---- trellis input transform (docs/trellis-kernel.md 4.8) ----------------------------------------
 # trellis_transform.hip: r4dx_trellis_input_bf16 (x * suh -> FWHT-128 -> f16, the A of libr4d's
-# r4d_gemm_trellis_nt_m64) and its FWHT diagnostic (declared in kernels.h). Same flags as
+# r4d_gemm_trellis_nt_m64), its fused producers (M5: r4dx_silu_mul_trellis_bf16,
+# r4dx_attn_gate_mul_trellis_bf16) and its FWHT diagnostic (declared in kernels.h). Same flags as
 # r4dx_kernels.hip (WGP mode; -ffp-contract=off keeps x * suh a separate rounding ahead of the first
 # butterfly). The butterfly is libr4d's r4d_fwht128.h (found through the libr4d -I above), shared
 # with the GEMM's output transform; hadamard_device.h's FwhtLds is the diagnostic's other side.
@@ -98,6 +99,7 @@ add_custom_command(
   DEPENDS "${R4DX_TRELLIS_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_fwht128.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) trellis_transform.obj"

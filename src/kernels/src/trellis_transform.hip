@@ -14,6 +14,10 @@
 // permlanex16 for the cross-lane stages), the same header the GEMM's output transform runs, so the
 // two sides of a trellis linear share one butterfly. Every output of the call (a linear's parts, or
 // several linears on one input) reuses the row's x from registers.
+//
+// The fused producers (M5, docs/trellis-kernel.md 4.8 / 5.4) run the same transform on a value they
+// compute themselves -- silu_mul's or the attention gate-mul's bf16 product -- instead of loading x.
+#include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -22,6 +26,7 @@
 #include <string>
 
 #include "r4d_fwht128.h"
+#include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/hadamard_device.h"
 #include "r4dx/kernels/kernels.h"
@@ -42,6 +47,29 @@ __device__ __forceinline__ float Bf16BitsToFloat(uint16_t b) {
   return __builtin_bit_cast(float, static_cast<uint32_t>(b) << 16);
 }
 
+// One output of one 128-block: v = xv * suh (fp32), FWHT, then f16(fp32(v * scale)) at
+// out + off + 32 r. xv: the block's x, lane l holding elements l + 32 r; k_off: the block's first
+// column plus the lane, for suh.
+__device__ __forceinline__ void TransformBlock(const float (&xv)[4], const float* __restrict__ suh,
+                                               uint16_t* __restrict__ out, int64_t off,
+                                               int64_t k_off, float scale, int lane) {
+  float v[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) v[r] = xv[r] * suh[k_off + kTqWave * r];
+  r4d_fwht128_wave(v, lane);
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    // The product is an fp32 value first, then rounded to f16 (the golden's and the converter's
+    // f16(fp32(v * scale))). Left alone, the compiler folds the multiply and the conversion into
+    // one v_fma_mixlo_f16 -- one rounding of the exact product, which differs in the last f16 bit
+    // on ~1e-5 of the elements; the empty asm keeps the fp32 product (no instruction).
+    float prod = v[r] * scale;
+    asm("" : "+v"(prod));
+    const _Float16 h = static_cast<_Float16>(prod);   // round to nearest even
+    out[off + kTqWave * r] = __builtin_bit_cast(uint16_t, h);
+  }
+}
+
 // grid (K / 128, M), one wave per workgroup.
 __global__ __launch_bounds__(kTqWave) void TrellisInputKernel(const uint16_t* __restrict__ x,
                                                                int64_t K, int nout,
@@ -56,22 +84,59 @@ __global__ __launch_bounds__(kTqWave) void TrellisInputKernel(const uint16_t* __
 #pragma unroll
   for (int o = 0; o < kTqMaxOut; ++o) {
     if (o >= nout) break;   // uniform
-    float v[4];
-#pragma unroll
-    for (int r = 0; r < 4; ++r) v[r] = xv[r] * p.suh[o][k_off + kTqWave * r];
-    r4d_fwht128_wave(v, lane);
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-      // The product is an fp32 value first, then rounded to f16 (the golden's and the converter's
-      // f16(fp32(v * scale))). Left alone, the compiler folds the multiply and the conversion into
-      // one v_fma_mixlo_f16 -- one rounding of the exact product, which differs in the last f16 bit
-      // on ~1e-5 of the elements; the empty asm keeps the fp32 product (no instruction).
-      float prod = v[r] * scale;
-      asm("" : "+v"(prod));
-      const _Float16 h = static_cast<_Float16>(prod);   // round to nearest even
-      p.out[o][off + kTqWave * r] = __builtin_bit_cast(uint16_t, h);
-    }
+    TransformBlock(xv, p.suh[o], p.out[o], off, k_off, scale, lane);
   }
+}
+
+// ---- fused producers (kernels.h: r4dx_silu_mul_trellis_bf16, r4dx_attn_gate_mul_trellis_bf16) --
+// Each element is the producer's own bf16 value -- the same expression and the same rounding as its
+// v1 kernel -- widened back to fp32, then the transform above. -ffp-contract=off (this object's
+// flags, the same as r4dx_kernels.hip's and attn_kernels.hip's) keeps every product a separately
+// rounded multiply, as there.
+
+// r4dx_kernels.hip's Sigmoid, and SiluMulWideKernel's element: __float2bfloat16(g * Sigmoid(g) * u).
+__device__ __forceinline__ float TqSigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+__global__ __launch_bounds__(kTqWave) void SiluMulTrellisKernel(const uint16_t* __restrict__ gate_up,
+                                                                 int64_t intermediate,
+                                                                 int64_t in_row_stride,
+                                                                 const float* __restrict__ suh,
+                                                                 uint16_t* __restrict__ out,
+                                                                 float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int64_t k_off = static_cast<int64_t>(blockIdx.x) * kTqBlock + lane;
+  const uint16_t* gu = gate_up + static_cast<int64_t>(blockIdx.y) * in_row_stride;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float g = Bf16BitsToFloat(gu[k_off + kTqWave * r]);
+    const float u = Bf16BitsToFloat(gu[intermediate + k_off + kTqWave * r]);
+    const __hip_bfloat16 h = __float2bfloat16(g * TqSigmoid(g) * u);
+    xv[r] = __bfloat162float(h);
+  }
+  TransformBlock(xv, suh, out, static_cast<int64_t>(blockIdx.y) * intermediate + k_off, k_off, scale,
+                 lane);
+}
+
+// attn_kernels.hip's GateMulKernel element: FloatToBf16(a * (1 / (1 + expf(-g)))).
+__global__ __launch_bounds__(kTqWave) void GateMulTrellisKernel(const uint16_t* __restrict__ attn_out,
+                                                                 const uint16_t* __restrict__ gate,
+                                                                 int64_t K,
+                                                                 const float* __restrict__ suh,
+                                                                 uint16_t* __restrict__ out,
+                                                                 float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int64_t k_off = static_cast<int64_t>(blockIdx.x) * kTqBlock + lane;
+  const int64_t off = static_cast<int64_t>(blockIdx.y) * K + k_off;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float a = r4dx::core::Bf16ToFloat(attn_out[off + kTqWave * r]);
+    const float g = r4dx::core::Bf16ToFloat(gate[off + kTqWave * r]);
+    const float sg = 1.0f / (1.0f + expf(-g));
+    xv[r] = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(a * sg));
+  }
+  TransformBlock(xv, suh, out, off, k_off, scale, lane);
 }
 
 // The diagnostic twins: one 128-block per workgroup.
@@ -97,6 +162,21 @@ __global__ __launch_bounds__(64) void Fwht128LdsKernel(float* __restrict__ x) {
 
 [[noreturn]] void TqFail(const std::string& what) {
   throw std::runtime_error("r4dx_trellis_input_bf16: " + what);
+}
+
+// The fused producers' shared preconditions (r4dx_trellis_input_bf16's, for one output) and their
+// transform scale.
+float ProducerScale(const char* who, int64_t rows, int64_t K, int64_t suh, int64_t out,
+                    int prescale_log2) {
+  const auto fail = [&](const std::string& what) {
+    throw std::runtime_error(std::string(who) + ": " + what);
+  };
+  if (K <= 0 || K % kTqBlock != 0) fail("K must be a positive multiple of 128, got " + std::to_string(K));
+  if (rows < 0 || rows > 65535) fail("rows must be 0..65535, got " + std::to_string(rows));
+  if (prescale_log2 < -kTqMaxPrescale || prescale_log2 > kTqMaxPrescale)
+    fail("|prescale_log2| must be <= 24, got " + std::to_string(prescale_log2));
+  if (suh == 0 || out == 0) fail("suh and out must be non-null");
+  return static_cast<float>(std::ldexp(1.0, prescale_log2) / std::sqrt(128.0));
 }
 
 }  // namespace
@@ -127,6 +207,41 @@ void r4dx_trellis_input_bf16(int64_t x, int64_t M, int64_t K, int nout, const in
                      dim3(static_cast<unsigned>(K / kTqBlock), static_cast<unsigned>(M)),
                      dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
                      reinterpret_cast<const uint16_t*>(x), K, nout, p, scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_silu_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermediate,
+                                 int64_t in_row_stride, int64_t suh, int64_t out, int prescale_log2,
+                                 int64_t stream) {
+  const float scale =
+      ProducerScale("r4dx_silu_mul_trellis_bf16", rows, intermediate, suh, out, prescale_log2);
+  if (gate_up == 0) throw std::runtime_error("r4dx_silu_mul_trellis_bf16: gate_up is null");
+  if (in_row_stride < 2 * intermediate) {
+    throw std::runtime_error("r4dx_silu_mul_trellis_bf16: in_row_stride must be >= 2 * intermediate");
+  }
+  if (rows == 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(SiluMulTrellisKernel,
+                     dim3(static_cast<unsigned>(intermediate / kTqBlock), static_cast<unsigned>(rows)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(gate_up), intermediate, in_row_stride,
+                     reinterpret_cast<const float*>(suh), reinterpret_cast<uint16_t*>(out), scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t rows, int64_t K,
+                                      int64_t suh, int64_t out, int prescale_log2, int64_t stream) {
+  const float scale = ProducerScale("r4dx_attn_gate_mul_trellis_bf16", rows, K, suh, out, prescale_log2);
+  if (attn_out == 0 || gate == 0) {
+    throw std::runtime_error("r4dx_attn_gate_mul_trellis_bf16: attn_out and gate must be non-null");
+  }
+  if (rows == 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(GateMulTrellisKernel,
+                     dim3(static_cast<unsigned>(K / kTqBlock), static_cast<unsigned>(rows)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(attn_out), reinterpret_cast<const uint16_t*>(gate),
+                     K, reinterpret_cast<const float*>(suh), reinterpret_cast<uint16_t*>(out), scale);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

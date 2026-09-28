@@ -14,6 +14,11 @@
 //   against the Python goldens (tools/reference/trellis_golden.py -> golden/trellis/): the random
 //   case's A at prescale 0 and 4 and the three real oracle blocks' A, bit for bit;
 //
+//   the fused producers (M5, 4.8 / 5.4) BYTE-IDENTICAL to their v1 pairs: r4dx_silu_mul_trellis_bf16
+//   against r4dx_silu_mul_wide_bf16 then the transform, r4dx_attn_gate_mul_trellis_bf16 against
+//   r4dx_model_attn_gate_mul_bf16 then the transform -- the TP = 1 and TP = 2 rank widths, M up to
+//   64, prescale 0 / 4 / -3, and inputs that saturate the sigmoid;
+//
 //   the host's precondition throws (hence /EHc-).
 //
 // GPU test: HIP device 1 via HIP_VISIBLE_DEVICES=1 (tests/kernels/CMakeLists.txt). The golden part
@@ -37,6 +42,7 @@
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "r4dx/model/attention/attn_kernels.h"   // r4dx_model_attn_gate_mul_bf16: the v1 producer
 #include "trellis_ref.hpp"
 
 using namespace r4dx::core;
@@ -253,6 +259,108 @@ void TestPreconditions() {
   Check(Throws([&] { call(0, 1, 5120, 1, suh, out, 0); }), "null x accepted");
   Check(!Throws([&] { call(16, 0, 5120, 1, suh, out, 0); }), "M = 0 is a no-op, not an error");
   Check(Throws([&] { r4dx_fwht128_f32(0, 4, 0, 0); }), "fwht128 null x accepted");
+  // The fused producers.
+  const auto silu = [&](int64_t gu, int64_t rows, int64_t I, int64_t stride, int64_t s, int64_t o, int p) {
+    r4dx_silu_mul_trellis_bf16(gu, rows, I, stride, s, o, p, 0);
+  };
+  Check(Throws([&] { silu(16, 1, 1000, 2000, 16, 16, 0); }), "silu_mul_trellis: I % 128 accepted");
+  Check(Throws([&] { silu(16, 1, 1024, 2047, 16, 16, 0); }), "silu_mul_trellis: stride < 2 I accepted");
+  Check(Throws([&] { silu(16, -1, 1024, 2048, 16, 16, 0); }), "silu_mul_trellis: rows = -1 accepted");
+  Check(Throws([&] { silu(16, 65536, 1024, 2048, 16, 16, 0); }), "silu_mul_trellis: rows = 65536 accepted");
+  Check(Throws([&] { silu(16, 1, 1024, 2048, 16, 16, -25); }), "silu_mul_trellis: prescale -25 accepted");
+  Check(Throws([&] { silu(0, 1, 1024, 2048, 16, 16, 0); }), "silu_mul_trellis: null gate_up accepted");
+  Check(Throws([&] { silu(16, 1, 1024, 2048, 0, 16, 0); }), "silu_mul_trellis: null suh accepted");
+  Check(Throws([&] { silu(16, 1, 1024, 2048, 16, 0, 0); }), "silu_mul_trellis: null out accepted");
+  Check(!Throws([&] { silu(16, 0, 1024, 2048, 16, 16, 0); }), "silu_mul_trellis: rows = 0 is a no-op");
+  const auto gmul = [&](int64_t a, int64_t g, int64_t rows, int64_t K, int64_t s, int64_t o, int p) {
+    r4dx_attn_gate_mul_trellis_bf16(a, g, rows, K, s, o, p, 0);
+  };
+  Check(Throws([&] { gmul(16, 16, 1, 6000, 16, 16, 0); }), "gate_mul_trellis: K % 128 accepted");
+  Check(Throws([&] { gmul(16, 16, -1, 6144, 16, 16, 0); }), "gate_mul_trellis: rows = -1 accepted");
+  Check(Throws([&] { gmul(16, 16, 1, 6144, 16, 16, 25); }), "gate_mul_trellis: prescale 25 accepted");
+  Check(Throws([&] { gmul(0, 16, 1, 6144, 16, 16, 0); }), "gate_mul_trellis: null attn_out accepted");
+  Check(Throws([&] { gmul(16, 0, 1, 6144, 16, 16, 0); }), "gate_mul_trellis: null gate accepted");
+  Check(Throws([&] { gmul(16, 16, 1, 6144, 0, 16, 0); }), "gate_mul_trellis: null suh accepted");
+  Check(Throws([&] { gmul(16, 16, 1, 6144, 16, 0, 0); }), "gate_mul_trellis: null out accepted");
+  Check(!Throws([&] { gmul(16, 16, 0, 6144, 16, 16, 0); }), "gate_mul_trellis: rows = 0 is a no-op");
+}
+
+// ---- fused producers against their v1 pairs --------------------------------------------------------
+// bf16 values of a pre-activation: row scales log-uniform in [2^-4, 2^4] (large enough to saturate
+// the sigmoid both ways), a few exact zeros.
+std::vector<uint16_t> RandomPreact(std::mt19937_64& rng, int64_t M, int64_t K) {
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::uniform_real_distribution<float> ud(-4.f, 4.f);
+  std::uniform_int_distribution<int64_t> kd(0, K - 1);
+  std::vector<uint16_t> x(static_cast<size_t>(M * K));
+  for (int64_t m = 0; m < M; ++m) {
+    const float s = std::exp2(ud(rng));
+    for (int64_t k = 0; k < K; ++k) x[static_cast<size_t>(m * K + k)] = FloatToBf16(nd(rng) * s);
+    for (int i = 0; i < 3; ++i) x[static_cast<size_t>(m * K + kd(rng))] = 0;
+  }
+  return x;
+}
+
+void TestFusedProducers(std::mt19937_64& rng) {
+  int configs = 0;
+  size_t bad_total = 0;
+  const int64_t Ms[] = {1, 4, 8, 16, 17, 64};
+  // silu_mul -> mlp.down: intermediate 17408 (TP = 1), 8704 (a TP = 2 rank), 1024.
+  for (int64_t I : {17408, 8704, 1024}) {
+    const std::vector<float> suh = RandomScales(rng, I, 5e-3, 4e-2);
+    DeviceBuffer<float> d_suh(suh.size());
+    d_suh.CopyFromHost(suh);
+    for (int64_t M : Ms) {
+      const std::vector<uint16_t> gu = RandomPreact(rng, M, 2 * I);
+      DeviceBuffer<uint16_t> d_gu(gu.size()), d_h(static_cast<size_t>(M * I)),
+          d_a1(static_cast<size_t>(M * I)), d_a2(static_cast<size_t>(M * I));
+      d_gu.CopyFromHost(gu);
+      for (int s : {0, 4, -3}) {
+        d_a2.Zero();
+        r4dx_silu_mul_wide_bf16(P(d_gu.data()), P(d_h.data()), M, I, 2 * I, 0);
+        const int64_t suh_p[1] = {P(d_suh.data())}, out_p[1] = {P(d_a1.data())};
+        r4dx_trellis_input_bf16(P(d_h.data()), M, I, 1, suh_p, out_p, s, 0);
+        r4dx_silu_mul_trellis_bf16(P(d_gu.data()), M, I, 2 * I, P(d_suh.data()), P(d_a2.data()), s, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const std::vector<uint16_t> a1 = d_a1.CopyToHost(), a2 = d_a2.CopyToHost();
+        const size_t bad = CountDiff(a1.data(), a2.data(), a1.size());
+        ++configs;
+        bad_total += bad;
+        Check(bad == 0, "silu_mul_trellis I=" + std::to_string(I) + " M=" + std::to_string(M) + " s=" +
+                            std::to_string(s) + ": " + std::to_string(bad) + " elements differ from the v1 pair");
+      }
+    }
+  }
+  // gate-mul -> attn.o: K 6144 (TP = 1), 3072 (a TP = 2 rank).
+  for (int64_t K : {6144, 3072}) {
+    const std::vector<float> suh = RandomScales(rng, K, 5e-3, 4e-2);
+    DeviceBuffer<float> d_suh(suh.size());
+    d_suh.CopyFromHost(suh);
+    for (int64_t M : Ms) {
+      const std::vector<uint16_t> ao = RandomPreact(rng, M, K), g = RandomPreact(rng, M, K);
+      DeviceBuffer<uint16_t> d_ao(ao.size()), d_g(g.size()), d_h(static_cast<size_t>(M * K)),
+          d_a1(static_cast<size_t>(M * K)), d_a2(static_cast<size_t>(M * K));
+      d_ao.CopyFromHost(ao);
+      d_g.CopyFromHost(g);
+      for (int s : {0, 4, -3}) {
+        d_a2.Zero();
+        r4dx_model_attn_gate_mul_bf16(P(d_ao.data()), P(d_g.data()), P(d_h.data()), M * K, 0);
+        const int64_t suh_p[1] = {P(d_suh.data())}, out_p[1] = {P(d_a1.data())};
+        r4dx_trellis_input_bf16(P(d_h.data()), M, K, 1, suh_p, out_p, s, 0);
+        r4dx_attn_gate_mul_trellis_bf16(P(d_ao.data()), P(d_g.data()), M, K, P(d_suh.data()),
+                                        P(d_a2.data()), s, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const std::vector<uint16_t> a1 = d_a1.CopyToHost(), a2 = d_a2.CopyToHost();
+        const size_t bad = CountDiff(a1.data(), a2.data(), a1.size());
+        ++configs;
+        bad_total += bad;
+        Check(bad == 0, "gate_mul_trellis K=" + std::to_string(K) + " M=" + std::to_string(M) + " s=" +
+                            std::to_string(s) + ": " + std::to_string(bad) + " elements differ from the v1 pair");
+      }
+    }
+  }
+  std::printf("  fused producers: %d configurations byte-identical to the v1 pair%s\n", configs,
+              bad_total ? " (NOT all)" : "");
 }
 
 // ---- goldens (trellis_golden.py) ---------------------------------------------------------------
@@ -331,6 +439,7 @@ int main() {
   TestPreconditions();
   TestFwht(rng);
   TestTransform(rng);
+  TestFusedProducers(rng);
 
   const bool golden = GoldenAvailable();
   if (golden) {

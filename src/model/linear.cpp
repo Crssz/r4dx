@@ -497,8 +497,44 @@ class TrellisAStats {
 
 }  // namespace
 
+bool TrellisFusionEnabled() {
+  static const bool kEnabled = [] {
+    const char* d = std::getenv("R4DX_DISABLE_EPILOGUE");
+    const char* a = std::getenv("R4DX_TRELLIS_A_STATS");
+    return !(d != nullptr && d[0] == '1') && !(a != nullptr && a[0] != '\0');
+  }();
+  return kEnabled;
+}
+
+bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* x, int64_t M,
+                        const QuantLinear* const* ws, int n, PreQuantizedActivation* pre) {
+  if (!TrellisFusionEnabled() || n < 2 || n > 3 || M < 1) return false;
+  const int64_t K = ws[0]->K;
+  for (int i = 0; i < n; ++i) {
+    const QuantLinear& w = *ws[i];
+    if (w.layout != Layout::kTrellis || w.K != K || w.trellis_parts != 1 ||
+        w.trellis_prescale_log2 != ws[0]->trellis_prescale_log2 ||
+        w.trellis_suh.size() != static_cast<size_t>(K)) {
+      return false;
+    }
+  }
+  int64_t suh[3] = {}, out[3] = {};
+  for (int i = 0; i < n; ++i) {
+    // 16-byte aligned, as ApplyLinear requires of a trellis `pre` (its GEMM reads A with 8-byte
+    // loads it does not check).
+    uint16_t* a = arena.Alloc<uint16_t>(static_cast<size_t>(M * K), /*align_bytes=*/16);
+    suh[i] = reinterpret_cast<int64_t>(ws[i]->trellis_suh.data());
+    out[i] = reinterpret_cast<int64_t>(a);
+    pre[i] = PreQuantizedActivation{r4dx_epilogue_none, a, nullptr, ws[i]->trellis_suh.data(), 0};
+  }
+  r4dx_trellis_input_bf16(reinterpret_cast<int64_t>(x), M, K, n, suh, out,
+                          ws[0]->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));
+  return true;
+}
+
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
-                  uint16_t* y, int64_t M, const PreQuantizedActivation* pre) {
+                  uint16_t* y, int64_t M, const PreQuantizedActivation* pre,
+                  bool temporal_weight_loads) {
   if (w.N <= 0 || w.K <= 0) throw std::runtime_error("r4dx::model::ApplyLinear: empty weight");
   const int64_t N = w.N, K = w.K;
   const hipStream_t s = stream;
@@ -614,9 +650,14 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
     // same (layout,N,K) -- PickTuning's table is keyed by the exact per-launch row count `m`, not
     // the caller's total `M` (see linear.h's PickTuning comment on M-band rounding). A trellis
     // chunk's pick is also checked against the linear's part boundary (TrellisChunkTuning).
-    const LinearTuning t = w.layout == Layout::kTrellis
-                               ? TrellisChunkTuning(w, m)
-                               : PickTuning(w.layout, N, K, m, w.w4a16_group);
+    LinearTuning t = w.layout == Layout::kTrellis
+                         ? TrellisChunkTuning(w, m)
+                         : PickTuning(w.layout, N, K, m, w.w4a16_group);
+    // linear.h: the caller asked for normal weight loads (a cache hint; the same bits).
+    if (temporal_weight_loads && w.layout == Layout::kTrellis) t.NT = 0;
+    // R4DX_PROFILE_LINEARS (debug_probe.h): the stamp between the input stage and the GEMM, inside
+    // an open "gemm:" span only; one static pointer test otherwise.
+    DebugProbe* const probe = DebugProbe::Linears();
 
     switch (w.layout) {
       case Layout::kBf16:
@@ -632,6 +673,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                        reinterpret_cast<int64_t>(f16_scratch),
                                        static_cast<int64_t>(m) * K, reinterpret_cast<int64_t>(s));
           a = f16_scratch;
+          if (probe != nullptr) probe->MarkInput(s);
         }
         // quant2 Q3 (docs/quant2.md section 5.1): a linear at the build's default group -- every
         // linear of a container without __metadata__.quant.w4a16.groups -- keeps the historical
@@ -659,6 +701,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
           core::r4d::QuantActI8(xc, i8_scratch, i8_scale_scratch, m, static_cast<int>(K), s);
           a = i8_scratch;
           a_scale = i8_scale_scratch;
+          if (probe != nullptr) probe->MarkInput(s);
         }
         core::r4d::GemmW4a8NtM64(a, a_scale, w.wq.data(), w.w4a8_ws.data(), yc, m,
                                   static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB,
@@ -678,6 +721,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                       static_cast<int>(K), reinterpret_cast<int64_t>(s));
           a = fp8_scratch;
           a_scale = fp8_scale_scratch;
+          if (probe != nullptr) probe->MarkInput(s);
         }
         core::r4d::GemmMxfp4a8NtM64(a, a_scale, w.mxfp4_wq.data(), w.mxfp4_ws.data(),
                                      w.mxfp4_wref.data(), yc, m, static_cast<int>(K),
@@ -707,12 +751,21 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
           if (TrellisAStats* st = TrellisAStats::Get()) {
             st->Record(w, f16_scratch, parts, m, K, part_stride, s);
           }
+          if (probe != nullptr) probe->MarkInput(s);
           a0 = f16_scratch;
           if (parts > 1) a1 = f16_scratch + part_stride;
         }
         const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) /
                                                    std::sqrt(128.0));
         const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);
+        // CONCURRENCY INVARIANT: w.trellis_tickets are this linear's own (trellis_ws is the
+        // caller's arena scratch), and the split-group path's last-block-finishes protocol counts arrivals on them assuming no two
+        // launches of THIS linear overlap. That holds because every launch of a Container's
+        // linears is ordered on its Model's one stream (each TP / emulated rank loads its own
+        // Container; the MTP head and lm_head are never trellis). Running a trellis linear on a
+        // side stream, or sharing one Container between concurrently-running Models, would
+        // miscount the tickets and corrupt the output silently -- key the tickets per stream
+        // first (container.cpp AssignTrellisTickets).
         core::r4d::GemmTrellisNtM64(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), yc,
                                     trellis_ws, w.trellis_tickets, m, static_cast<int>(K),
                                     static_cast<int>(N), w.trellis_bits, t.WV, t.SK, t.MB, t.NPW,

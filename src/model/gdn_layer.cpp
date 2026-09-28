@@ -102,10 +102,19 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   PreQuantizedActivation in_proj_pre{in_proj_epilogue, in_proj_pre_data, in_proj_pre_scale};
 
   // ---- in_proj_qkv / in_proj_z / in_proj_b / in_proj_a -----------------------------------------
+  // docs/trellis-kernel.md 4.9 / 5.4 (M5): trellis in_proj_qkv and in_proj_z read the same x_normed,
+  // so one input transform (nout = 2) serves both -- each output the same bytes as the linear's own
+  // -- and z's ApplyLinear runs no transform of its own. It runs inside qkv's span, where
+  // ApplyLinear's own transform would have been.
+  PreQuantizedActivation trellis_in[2];
+  const QuantLinear* const trellis_in_w[2] = {&w_.in_proj_qkv, &w_.in_proj_z};
+  bool trellis_shared = false;
   uint16_t* mixed_qkv = arena.Alloc<uint16_t>(static_cast<size_t>(T * conv_dim));
   ProfiledCall(prof, s, "gemm:gdn.in_proj_qkv", [&] {
+    trellis_shared = !have_in_proj_pre &&
+                     SharedTrellisInput(s, arena, x_normed, T, trellis_in_w, 2, trellis_in);
     ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T,
-                have_in_proj_pre ? &in_proj_pre : nullptr);
+                trellis_shared ? &trellis_in[0] : have_in_proj_pre ? &in_proj_pre : nullptr);
   });
   uint16_t* a_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
   // in_proj_a/in_proj_b are plain bf16 linears (never quantized -- docs/r9700.md R1: "too small to
@@ -133,7 +142,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
       have_in_proj_pre && (EpilogueForLayout(w_.in_proj_z.layout) == in_proj_epilogue);
   ProfiledCall(prof, s, "gemm:gdn.in_proj_z", [&] {
     ApplyLinear(stream, arena, w_.in_proj_z, x_normed, z_buf, T,
-                z_shares_pre ? &in_proj_pre : nullptr);
+                trellis_shared ? &trellis_in[1] : z_shares_pre ? &in_proj_pre : nullptr);
   });
 
   // ---- control arrays ---------------------------------------------------------------------------
@@ -248,8 +257,16 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
 
   // ---- out_proj + residual ----------------------------------------------------------------------
   uint16_t* gdn_out = arena.Alloc<uint16_t>(static_cast<size_t>(T * hidden));
+  // docs/trellis-kernel.md 10.6: out_proj is the first weight stream after the recurrent update,
+  // which left this layer's new state (3 MB per token) dirty in the L2. A trellis GEMM loads its
+  // weights non-temporally and evicts almost nothing, so those lines used to drain a few at a time
+  // through every GEMM up to the next attention layer, 5-7% slower each; out_proj's weights loaded
+  // normally (temporal_weight_loads, NT = 0: a cache hint, the same bits) flush them in one burst.
+  // Measured per step (GPU span), K4m (mix4.5m): -0.64 (-1.43) ms at decode, -0.93 (-1.69) at a
+  // 4-token and -0.72 (-1.74) at an 8-token verify window. w4a16 ignores the flag.
   ProfiledCall(prof, s, "gemm:gdn.out_proj", [&] {
-    ApplyLinear(stream, arena, w_.out_proj, out_core, gdn_out, T);
+    ApplyLinear(stream, arena, w_.out_proj, out_core, gdn_out, T, /*pre=*/nullptr,
+                /*temporal_weight_loads=*/true);
   });
   // Tensor parallel (docs/tp.md 6.2, site A1): out_proj is row-parallel, so each rank holds a
   // partial sum; sum it across ranks before the residual (and the fused next-norm epilogue).

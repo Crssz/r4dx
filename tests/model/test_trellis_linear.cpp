@@ -22,6 +22,10 @@
 //              (data or part stride) throw.
 //   row id.    at M = 2, 4, 8 and 16 (MTP and DFlash verify windows, one row tile), every row equals
 //              the M = 1 call on that row, byte for byte.
+//   M5         ApplyLinear's temporal_weight_loads (NT = 0, gdn.out_proj's) is byte-identical; and
+//              SharedTrellisInput's one transform for gdn.in_proj_qkv / in_proj_z and attn.qg / k / v
+//              then each linear on its A equals the linear's own call, at M 1, 4, 17 and 64, while a
+//              two-part linear, another K or a lone linear is declined.
 //   prescale   docs/trellis-kernel.md 4.8's s, which both tiny containers leave at 0: header-patched
 //              copies of tiny_k4 with s = 3 container-wide and s = -3 as one linear's own override
 //              load it per linear, match the fp64 linear at their s, and -- a power of two being
@@ -292,12 +296,13 @@ constexpr uint16_t kSentinel = 0x7FC1u;  // a bf16 NaN no linear of finite value
 
 std::vector<uint16_t> Run(hipStream_t s, r4dx::core::Arena& arena, const QuantLinear& q,
                           const DeviceBuffer<uint16_t>& x, int64_t M,
-                          const PreQuantizedActivation* pre = nullptr) {
+                          const PreQuantizedActivation* pre = nullptr,
+                          bool temporal_weight_loads = false) {
   DeviceBuffer<uint16_t> y(static_cast<size_t>(M * q.N));
   std::vector<uint16_t> sent(y.size(), kSentinel);
   y.CopyFromHost(sent);
   arena.Reset();
-  ApplyLinear(s, arena, q, x.data(), y.data(), M, pre);
+  ApplyLinear(s, arena, q, x.data(), y.data(), M, pre, temporal_weight_loads);
   R4DX_HIP_CHECK(hipStreamSynchronize(s));
   return y.CopyToHost();
 }
@@ -348,6 +353,9 @@ void CheckLinear(hipStream_t s, r4dx::core::Arena& arena, const QuantLinear& q,
     pre.part_stride = stride;
     ck.Expect(Run(s, arena, q, x_d, M, &pre) == y,
               w + ": pre (part stride " + std::to_string(stride) + ") byte-identical");
+    // temporal_weight_loads (M5, gdn.out_proj's): NT = 0 is a cache hint, the same bytes.
+    ck.Expect(Run(s, arena, q, x_d, M, nullptr, /*temporal_weight_loads=*/true) == y,
+              w + ": temporal weight loads byte-identical");
   }
 
   // Row identity: every row of an M <= 16 call is the M = 1 call on that row -- at the MTP verify
@@ -366,6 +374,56 @@ void CheckLinear(hipStream_t s, r4dx::core::Arena& arena, const QuantLinear& q,
     }
     ck.Expect(same, tag + " " + ref.base + " M=" + std::to_string(M) +
                         ": every row equals the M = 1 call (row identity)");
+  }
+}
+
+// M5 (docs/trellis-kernel.md 4.9 / 5.4): SharedTrellisInput's one transform for the linears that read
+// one activation -- gdn.in_proj_qkv / in_proj_z, attn.qg / k / v -- then each linear's ApplyLinear on
+// its A gives the bytes of the linear's own call; and it declines (false) a group it cannot serve.
+void CheckSharedInput(hipStream_t s, r4dx::core::Arena& arena, const Container& c,
+                      const std::string& tag, std::mt19937_64& rng, Checker& ck) {
+  for (int64_t i = 0; i < c.NumLoadedLayers(); ++i) {
+    const auto& lw = c.Layer(i);
+    std::vector<const QuantLinear*> ws;
+    if (lw.gdn) ws = {&lw.gdn->in_proj_qkv, &lw.gdn->in_proj_z};
+    else ws = {&lw.attn->qg, &lw.attn->k, &lw.attn->v};
+    const int n = static_cast<int>(ws.size());
+    const int64_t K = ws[0]->K;
+    for (int64_t M : {int64_t{1}, int64_t{4}, int64_t{17}, int64_t{64}}) {
+      const std::string w = tag + " layer " + std::to_string(i) + " shared input M=" + std::to_string(M);
+      const std::vector<uint16_t> x = RandomX(rng, M, K);
+      DeviceBuffer<uint16_t> x_d(x.size());
+      x_d.CopyFromHost(x);
+      std::vector<std::vector<uint16_t>> own;
+      for (const QuantLinear* q : ws) own.push_back(Run(s, arena, *q, x_d, M));
+      arena.Reset();
+      PreQuantizedActivation pre[3];
+      const bool ok = r4dx::model::SharedTrellisInput(s, arena, x_d.data(), M, ws.data(), n, pre);
+      ck.Expect(ok, w + ": served");
+      if (!ok) continue;
+      std::vector<DeviceBuffer<uint16_t>> ys;
+      for (int j = 0; j < n; ++j) {
+        ys.emplace_back(static_cast<size_t>(M * ws[j]->N));
+        ApplyLinear(s, arena, *ws[j], x_d.data(), ys.back().data(), M, &pre[j]);
+      }
+      R4DX_HIP_CHECK(hipStreamSynchronize(s));
+      for (int j = 0; j < n; ++j) {
+        ck.Expect(ys[j].CopyToHost() == own[static_cast<size_t>(j)],
+                  w + ": linear " + std::to_string(j) + " byte-identical to its own call");
+      }
+    }
+    // Declined: a two-part linear (gate_up), a different K (out_proj / o, mlp.down), one linear.
+    PreQuantizedActivation pre[3];
+    const QuantLinear* two_part[2] = {ws[0], &lw.mlp.gate_up};
+    const QuantLinear* other_k[2] = {ws[0], lw.gdn ? &lw.gdn->out_proj : &lw.attn->o};
+    arena.Reset();
+    DeviceBuffer<uint16_t> x_d(static_cast<size_t>(K));
+    ck.Expect(!r4dx::model::SharedTrellisInput(s, arena, x_d.data(), 1, two_part, 2, pre),
+              tag + " layer " + std::to_string(i) + ": a two-part linear is declined");
+    ck.Expect(!r4dx::model::SharedTrellisInput(s, arena, x_d.data(), 1, other_k, 2, pre),
+              tag + " layer " + std::to_string(i) + ": a linear of another K is declined");
+    ck.Expect(!r4dx::model::SharedTrellisInput(s, arena, x_d.data(), 1, ws.data(), 1, pre),
+              tag + " layer " + std::to_string(i) + ": a single linear is declined");
   }
 }
 
@@ -850,6 +908,7 @@ int RunTest() {
       CheckLinear(stream.get(), arena, *l.q, ReadRef(r, trellis, l.base, l.N, l.K), tag, rng, ck);
     }
     CheckTpRanks(stream.get(), arena, path, r, trellis, c, rng, ck);
+    CheckSharedInput(stream.get(), arena, c, tag, rng, ck);
     if (path == k4) {
       CheckPreRefusals(stream.get(), arena, c, ck);
       CheckTicketReset(stream.get(), arena, c, rng, ck);

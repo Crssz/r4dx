@@ -232,8 +232,10 @@ Split-KV at 4b04ece missed the lossless gate (mean KL <= 0.0005 and top-1 >= 99.
 dense dumps). It failed on prose_32k (0.00090, 97.7%), code_32k (0.00318, 98.0%) and prose_128k
 (0.00163, 96.9%). This section diagnoses why, adds a mode that is bit-identical, and re-validates
 both. Commits: libr4d `c9c0237` and `dec5a4f` (branch `prefill`), r4dx `d731bb8` and `b5e5eb9`.
-Raw outputs are in `D:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1 with
-the `b5e5eb9` build.
+Raw outputs are in `D:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1.
+- The exact-mode runs, ctest and the dense and split-KV TTFT reruns used the `b5e5eb9` build.
+- The split-KV task set, warm turns, first TTFT pair and identity used the `d731bb8` build. Its
+  split-KV and dense paths are the same code.
 
 ### Diagnosis: split-KV is differently rounded, not less accurate
 
@@ -394,7 +396,7 @@ vt calibration at 32k, with the same binary and the same 8 items:
 The vt-32k-03 answer is knife-edge: the split-8 run stopped after the first of five names. Two
 other equally accurate rounding members keep it.
 
-**Other checks (b5e5eb9 build):**
+**Other checks:**
 - `ctest -LE tp2gpu`: 92/92 passed. That includes `test_attn_prefill_splitkv` with the exact
   geometries, and `test_forward_smoke`, which failed on both main and 4b04ece in the earlier run
   with HIP error 719.

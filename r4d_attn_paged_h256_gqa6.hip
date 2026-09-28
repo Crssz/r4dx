@@ -85,12 +85,12 @@ extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s
 // speedup well below split-KV's.
 // a->splits picks the geometry for measurement (NW*10 + DS, e.g. 124 = 12 warps, 4 slices);
 // 0 = the default. fp8 cache only (its V stages in 4 d-groups of 64, so DS <= 4).
-template <int NW, int DS>
+template <int NW, int DS, int TL = P_TILE>
 static int prefill_exact_launch_g(const R4DArgs* a, hipStream_t s) {
     constexpr int BQ = (NW * 16) / A_GQA;
     static_assert(BQ * A_GQA == NW * 16 && 64 % BQ == 0, "q-blocks must tile the 24-warp block");
     dim3 grid(((a->q_len + BQ - 1) / BQ) * DS, a->kv_heads, a->num_seqs);
-    hipLaunchKernelGGL((r4d_attn_prefill_kernel<NW, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, 0,
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<NW, TL, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, 0,
                                                 P_OPT, 0, DS>),
                        grid, dim3(NW * 32), 0, s, *a, 1);
     CHK();
@@ -106,13 +106,19 @@ extern "C" int r4d_attn_prefill_exact_h256_gqa6_fp8kv(const R4DArgs* a, hipStrea
         case 244: return prefill_exact_launch_g<24, 4>(a, s);
         case 121: return prefill_exact_launch_g<12, 1>(a, s);
         case 122: return prefill_exact_launch_g<12, 2>(a, s);
-        // The default: 12 warps (32-row q-blocks) x 4 d-slices, 32 workgroups per 64-row chunk at 4
-        // KV heads. Measured (gfx1201, q_len 64): 2.6x at 8k, 2.2x at 32k, 2.0x at 123k over the
-        // plain launch, 2.2x at 2 KV heads (a TP=2 rank); the other geometries are slower.
-        case 0:
+        // 12 warps (32-row q-blocks) x 4 d-slices: 32 workgroups per 64-row chunk at 4 KV heads.
+        // Measured (gfx1201, q_len 64): 2.6x at 8k, 2.2x at 32k, 2.0x at 123k over the plain
+        // launch, 2.2x at 2 KV heads (a TP=2 rank).
         case 124: return prefill_exact_launch_g<12, 4>(a, s);
         case 62:  return prefill_exact_launch_g<6, 2>(a, s);
         case 64:  return prefill_exact_launch_g<6, 4>(a, s);
+        // 96-key tiles (the lazy-max check stays per 16-key m-tile, so the bits do not move): half
+        // the barriers per key. The default: 124 with 96-key tiles, 10-20% faster than 124 at depth
+        // (sK 50.7 KB + the 1/4 V slice 13.3 KB fit the 64 KB LDS).
+        case 0:
+        case 1124: return prefill_exact_launch_g<12, 4, 96>(a, s);
+        case 1244: return prefill_exact_launch_g<24, 4, 96>(a, s);
+        case 1064: return prefill_exact_launch_g<6, 4, 96>(a, s);
         default:  return -3;
     }
 }

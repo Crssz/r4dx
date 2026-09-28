@@ -4,6 +4,7 @@
 // rather than re-deriving bf16/f16 bit twiddling a third time.
 #include <hip/hip_runtime.h>
 
+#include "clock_probe_device.h"
 #include "r4dx/core/dtype.hpp"
 #include "model_kernels.h"
 
@@ -26,6 +27,12 @@ __global__ void WidenBf16ToF32Kernel(const uint16_t* __restrict__ in, float* __r
   if (i < n) out[i] = Bf16ToFloat(in[i]);
 }
 
+__global__ void WallStampKernel(unsigned long long* out) { r4dx_wall_stamp_device(out); }
+
+__global__ void ClockProbeKernel(unsigned long long* out, int iters) {
+  r4dx_clock_probe_device(out, iters);
+}
+
 }  // namespace
 
 extern "C" void r4dx_model_cast_bf16_to_f16(int64_t in, int64_t out, int64_t n, int64_t stream) {
@@ -42,4 +49,14 @@ extern "C" void r4dx_model_widen_bf16_to_f32(int64_t in, int64_t out, int64_t n,
   hipLaunchKernelGGL(WidenBf16ToF32Kernel, dim3(static_cast<unsigned int>(blocks)), dim3(kBlock), 0,
                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(in),
                       reinterpret_cast<float*>(out), n);
+}
+
+extern "C" void r4dx_model_wall_stamp(int64_t out, int64_t stream) {
+  hipLaunchKernelGGL(WallStampKernel, dim3(1), dim3(1), 0, reinterpret_cast<hipStream_t>(stream),
+                      reinterpret_cast<unsigned long long*>(out));
+}
+
+extern "C" void r4dx_model_clock_probe(int64_t out, int iters, int64_t stream) {
+  hipLaunchKernelGGL(ClockProbeKernel, dim3(1), dim3(32), 0, reinterpret_cast<hipStream_t>(stream),
+                      reinterpret_cast<unsigned long long*>(out), iters);
 }

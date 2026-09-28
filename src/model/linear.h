@@ -46,7 +46,8 @@ struct LinearTuning {
 // `rate` (trellis only, docs/trellis-kernel.md 5.3): the trellis bits per weight (KB, 4 or 5) the
 // row was measured at, part of the key like w4a16's group -- a row serves only linears at its
 // rate. The trellis rows live in src/model/gemm_tuning_table_trellis.inc (tests/kernels/
-// tool_trellis_gemm_bench.exe --joint --inc-out writes it), one M = 1 row per (N, K, KB).
+// tool_trellis_gemm_bench.exe --inc-out writes it): an M = 1 row per (N, K, KB) (--modes full
+// --joint) and, for prefill chunks, M = 32 and M = 64 rows (--modes ptune, milestone M5).
 struct GemmTuningRow {
   Layout layout;
   int64_t N, K, M;
@@ -67,11 +68,12 @@ struct GemmTuningRow {
 // resolve exactly as before per-tensor groups; 32/64/128 otherwise look up only rows measured at
 // that group (GemmTuningRow::group), then FallbackTuning. Every pick is legal for the kernel at
 // that group: K % (SK * max(group, 64)) == 0. For kTrellis it is the linear's rate
-// (QuantLinear::trellis_bits), matched against GemmTuningRow::rate; the trellis rows are consulted
-// after the TP table (on a TP thread) and the main table, then the M-aware fallback of
+// (QuantLinear::trellis_bits), matched against GemmTuningRow::rate; the trellis rows -- on a TP
+// thread its per-rank rows (gemm_tuning_table_trellis_tp2.inc) first, then the TP = 1 ones -- are
+// consulted after the TP table (on a TP thread) and the main table, then the M-aware fallback of
 // docs/trellis-kernel.md 4.4 -- an M <= 16 chunk gets the M = 1 pick whole (NT included, 10.1), an
-// M > 16 chunk an unsplit 128-column block with every row tile in it. Every other layout ignores
-// it.
+// M > 16 chunk the prefill row of the smallest M >= its own that fits it, else an unsplit
+// 128-column block with every row tile in it. Every other layout ignores it.
 LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int variant = 0);
 
 // The group an r4d_gemm_w4a16_nt_m64 launch for a QuantLinear with this w4a16_group runs at: 0
@@ -86,7 +88,9 @@ int EffectiveW4a16Group(int w4a16_group);
 // thread_local and keyed on the flag too. A TP=1 load sets it false, so a TP=1 Model consults the
 // main table alone, exactly as before, even on a thread that loaded a rank earlier. The
 // TP rows live in their own table because one per-rank key -- (w4a16, 17408, 5120) -- is also the
-// TP=1 DFlash drafter's gate_proj/up_proj, which the main table deliberately leaves untuned.
+// TP=1 DFlash drafter's gate_proj/up_proj, which the main table deliberately leaves untuned. The
+// trellis rows follow the same rule: src/model/gemm_tuning_table_trellis_tp2.inc on such a thread,
+// before the TP=1 trellis rows.
 void SetTp2TuningForThisThread(bool enabled);
 
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --

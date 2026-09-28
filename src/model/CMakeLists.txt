@@ -44,6 +44,7 @@ add_custom_command(
           "${R4DX_MODEL_HIPCC}" ${R4DX_MODEL_KERNELS_FLAGS} -c "${R4DX_MODEL_KERNELS_SRC}" -o "${R4DX_MODEL_KERNELS_OBJ}"
   DEPENDS "${R4DX_MODEL_KERNELS_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/kernels/model_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/kernels/clock_probe_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
   COMMENT "hipcc (${R4D_GFX_ARCH}) model_kernels.obj"
   VERBATIM
@@ -62,6 +63,9 @@ target_link_libraries(r4dx_model_kernels PUBLIC r4dx_hip_runtime)
 add_library(r4dx_model_linear STATIC
   quant_linear.cpp
   linear.cpp
+  # R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h): here because ApplyLinear and
+  # profile_span.h's ProfiledCall (every layer's linears) call into it.
+  debug_probe.cpp
 )
 target_include_directories(r4dx_model_linear PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(r4dx_model_linear PUBLIC

@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "debug_probe.h"
 #include "kernels/model_kernels.h"
 #include "r4d.h"
 #include "r4dx/core/dtype.hpp"
@@ -133,11 +134,20 @@ namespace tp2 {
 }  // namespace tp2
 
 // Trellis (docs/trellis-kernel.md 5.3, 10.2): tests/kernels/tool_trellis_gemm_bench.exe's joint
-// M = 1 / M = 8 pick, one M = 1 row per (N, K, KB) at TP = 1, into the same array name. Consulted
-// for kTrellis only, after the TP table and the main table (which carry no trellis rows today).
+// M = 1 / M = 8 pick, one M = 1 row per (N, K, KB) at TP = 1, and its prefill picks at M = 32 and
+// M = 64 (--modes ptune, M5), into the same array name. Consulted for kTrellis only, after the TP
+// table and the main table (which carry no trellis rows today).
 namespace trellis {
 #include "gemm_tuning_table_trellis.inc"
 }  // namespace trellis
+
+// Trellis at TP = 2 (M5): the same tool's --tp 2 picks for one rank's (N, K) -- M = 1 and the
+// M = 32 / 64 prefill rows -- consulted on a thread that called SetTp2TuningForThisThread(true),
+// before the TP = 1 trellis rows: a rank shape can equal a TP = 1 shape (the rank's attn.qg is
+// gdn.in_proj_z's 6144 x 5120) and must still get its own row.
+namespace trellis_tp2 {
+#include "gemm_tuning_table_trellis_tp2.inc"
+}  // namespace trellis_tp2
 
 thread_local bool t_tp2_tuning = false;
 
@@ -204,8 +214,8 @@ int EffectiveW4a16Group(int w4a16_group) {
 
 // Internal linkage (not declared in linear.h) -- the actual table scan, now called only on a
 // PickTuning cache miss (see below). `tp2`: the TP table first (docs/tp.md 2.7), then the main one,
-// then (kTrellis only) the trellis rows. `variant`: the effective group for kW4a16, the rate for
-// kTrellis, 0 for every other layout.
+// then (kTrellis only) the TP = 2 trellis rows (on a TP thread) and the TP = 1 trellis rows.
+// `variant`: the effective group for kW4a16, the rate for kTrellis, 0 for every other layout.
 static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M, bool tp2,
                                   int variant) {
   // Any chunk that fits in one row tile resolves through the M=1 band (kRowTile's comment): a
@@ -225,6 +235,12 @@ static LinearTuning ResolveTuning(Layout layout, int64_t N, int64_t K, int64_t M
     return row->tuning;
   }
   if (layout == Layout::kTrellis) {
+    if (tp2) {
+      if (const GemmTuningRow* row =
+              BestRow(trellis_tp2::kGemmTuningTable, layout, N, K, M, variant)) {
+        return row->tuning;
+      }
+    }
     if (const GemmTuningRow* row = BestRow(trellis::kGemmTuningTable, layout, N, K, M, variant)) {
       return row->tuning;
     }

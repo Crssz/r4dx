@@ -2,6 +2,7 @@
 
 #include "kernels/model_kernels.h"
 #include "linear.h"
+#include "profile_span.h"
 #include "r4dx/kernels/kernels.h"
 
 namespace r4dx::model {
@@ -18,7 +19,10 @@ void FinalLmHead::Forward(core::Stream& stream, core::Arena& arena, const uint16
                      reinterpret_cast<int64_t>(x_normed), T, hidden, eps, s);
 
   uint16_t* logits_bf16 = arena.Alloc<uint16_t>(static_cast<size_t>(T * vocab));
-  ApplyLinear(stream, arena, lm_head_, x_normed, logits_bf16, T);
+  // A span of its own only for R4DX_PROFILE_LINEARS (debug_probe.h); callers that profile with
+  // hipEvents wrap this whole method themselves.
+  ProfiledCall(nullptr, stream.get(), "gemm:lm_head",
+               [&] { ApplyLinear(stream, arena, lm_head_, x_normed, logits_bf16, T); });
 
   r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16),
                                 reinterpret_cast<int64_t>(logits_out), T * vocab, s);

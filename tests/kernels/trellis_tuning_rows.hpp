@@ -1,5 +1,6 @@
-// tests/kernels/trellis_tuning_rows.hpp -- src/model/gemm_tuning_table_trellis.inc (the trellis
-// rows linear.cpp's PickTuning reads, docs/trellis-kernel.md 5.3), readable from a kernel test that
+// tests/kernels/trellis_tuning_rows.hpp -- src/model/gemm_tuning_table_trellis.inc and its TP = 2
+// sibling gemm_tuning_table_trellis_tp2.inc (the trellis rows linear.cpp's PickTuning reads,
+// docs/trellis-kernel.md 5.3; the per-rank ones in trellis_rows::tp2), readable from a kernel test that
 // does not link r4dx_model_linear: this header declares the shapes the rows are written for --
 // quant_linear.h's Layout (kTrellis appended last, 5.1) and linear.h's LinearTuning / GemmTuningRow
 // (SKG, U, rate) -- in its own namespace and includes the table there, so test_trellis_gemm (row
@@ -30,5 +31,10 @@ struct GemmTuningRow {
 };
 
 #include "../../src/model/gemm_tuning_table_trellis.inc"
+
+// The TP = 2 per-rank rows (milestone M5), same types.
+namespace tp2 {
+#include "../../src/model/gemm_tuning_table_trellis_tp2.inc"
+}  // namespace tp2
 
 }  // namespace trellis_rows

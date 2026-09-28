@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "debug_probe.h"
 #include "r4dx/core/error.hpp"
 
 namespace r4dx::model {
@@ -86,11 +87,19 @@ class SpanAccumulator {
   std::vector<Pending> pending_;
 };
 
-// See file comment: nullptr `prof` calls `fn()` directly, no instrumentation overhead.
+// See file comment: nullptr `prof` calls `fn()` directly, no instrumentation overhead -- beyond one
+// static pointer test for R4DX_PROFILE_LINEARS (debug_probe.h), which, when set, stamps the span
+// with wall_clock64 kernels instead (every "gemm:" span, or every span with `all`) and sums it per
+// class; a hipEvent profiler, when attached, takes precedence.
 template <typename Fn>
 inline void ProfiledCall(SpanAccumulator* prof, hipStream_t stream, const char* name, Fn&& fn) {
   if (prof != nullptr) {
     prof->Add(stream, name, std::function<void()>(std::forward<Fn>(fn)));
+  } else if (DebugProbe* probe = DebugProbe::Linears();
+             probe != nullptr && probe->WantsSpan(name)) {
+    probe->BeginSpan(stream, name);
+    fn();
+    probe->EndSpan(stream);
   } else {
     fn();
   }

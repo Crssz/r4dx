@@ -19,16 +19,19 @@
 //     must get FallbackTuning's WV4/SK4/MB1/NPW1 (NT=0 on the M = 2..16 row tile, NT=1 otherwise).
 //
 // Trellis (docs/trellis-kernel.md 4.3, 4.4, 5.3, 6): src/model/gemm_tuning_table_trellis.inc's
-// rows, keyed by rate (KB) as well as (N, K):
+// rows and, on a TP = 2 rank thread first, gemm_tuning_table_trellis_tp2.inc's per-rank rows (M5),
+// keyed by rate (KB) as well as (N, K):
 //   - every pick for M = 1..64 is one r4d_gemm_trellis_nt_m64 accepts (TrellisLaunchable, the
 //     kernel's own r4d_trellis_check and instantiation table, transcribed), with the linear's part
-//     boundary (mlp.gate_up: n_split = N / 2), on every row's shape at TP = 1, on every per-rank
-//     shape of a TP = 2 thread (the TP table has no trellis rows, so the TP = 1 rows and the
-//     fallback serve them), and on the tiny test container's shapes (the fallback alone);
+//     boundary (mlp.gate_up: n_split = N / 2), on every row's shape, on every per-rank shape of a
+//     TP = 2 thread, and on the tiny test container's shapes (the fallback alone);
 //   - M = 2..16 get the M = 1 pick whole -- SK, SKG, block width, MT and U set the summation order,
 //     and trellis keeps NT too (10.1) -- so a verify row is bit-identical to the decode row;
-//   - the M = 1 pick is the row of the linear's own rate, and a shape without a row gets 4.4's
-//     M-aware fallback (SKG capped at 4; unsplit with every row tile in its block for M > 16).
+//   - every pick is the one ExpectedTrellis names, BestRow spelled out independently: the M = 1 row
+//     of the linear's own rate for M <= 16, and for M > 16 (prefill chunks, M5's rows at M = 32 and
+//     64) the row of the smallest M >= the chunk's that fits it -- the TP = 2 rows first on a TP
+//     thread, never on a TP = 1 one -- else 4.4's M-aware fallback (SKG capped at 4; unsplit with
+//     every row tile in its block for M > 16); every prefill row is the pick at its own M.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -48,10 +51,14 @@ namespace {
 namespace tp2 {
 #include "gemm_tuning_table_tp2.inc"
 }  // namespace tp2
-// And the trellis rows (docs/trellis-kernel.md 5.3).
+// And the trellis rows (docs/trellis-kernel.md 5.3), and their TP = 2 per-rank sibling (M5), which
+// a TP rank thread consults before them.
 namespace trellis {
 #include "gemm_tuning_table_trellis.inc"
 }  // namespace trellis
+namespace trellis_tp2 {
+#include "gemm_tuning_table_trellis_tp2.inc"
+}  // namespace trellis_tp2
 }  // namespace
 }  // namespace r4dx::model
 
@@ -97,18 +104,19 @@ static_assert(SameLayoutValue(trellis_rows::Layout::kBf16, r4dx::model::Layout::
                   SameLayoutValue(trellis_rows::Layout::kTrellis, r4dx::model::Layout::kTrellis),
               "tests/kernels/trellis_tuning_rows.hpp's Layout is not quant_linear.h's, value for value");
 
-// The copy's rows read by field name equal production's: the same file through both declarations.
-void CheckTrellisRowsCopy(int& checked, int& failures) {
-  const auto& prod = r4dx::model::trellis::kGemmTuningTable;
-  const auto& copy = trellis_rows::kGemmTuningTable;
+// The copy's rows read by field name equal production's: the same file through both declarations
+// (the TP = 1 table, then the TP = 2 one).
+template <size_t kProd, size_t kCopy>
+void CheckTrellisRowsCopy(const ModelRow (&prod)[kProd], const CopyRow (&copy)[kCopy],
+                          const char* which, int& checked, int& failures) {
   ++checked;
-  if (std::size(prod) != std::size(copy)) {
-    std::fprintf(stderr, "FAIL trellis_tuning_rows.hpp: %zu rows, production has %zu\n",
-                 std::size(copy), std::size(prod));
+  if (kProd != kCopy) {
+    std::fprintf(stderr, "FAIL trellis_tuning_rows.hpp (%s): %zu rows, production has %zu\n", which,
+                 kCopy, kProd);
     ++failures;
     return;
   }
-  for (size_t i = 0; i < std::size(prod); ++i) {
+  for (size_t i = 0; i < kProd; ++i) {
     const ModelRow& a = prod[i];
     const CopyRow& b = copy[i];
     const ModelTuning& t = a.tuning;
@@ -117,9 +125,9 @@ void CheckTrellisRowsCopy(int& checked, int& failures) {
     if (!SameLayoutValue(b.layout, a.layout) || a.N != b.N || a.K != b.K || a.M != b.M ||
         a.group != b.group || a.rate != b.rate || t.WV != u.WV || t.SK != u.SK || t.MB != u.MB ||
         t.NPW != u.NPW || t.NT != u.NT || t.SKG != u.SKG || t.U != u.U) {
-      std::fprintf(stderr, "FAIL trellis_tuning_rows.hpp row %zu (N=%lld K=%lld) differs from "
+      std::fprintf(stderr, "FAIL trellis_tuning_rows.hpp (%s) row %zu (N=%lld K=%lld) differs from "
                            "production's by field name\n",
-                   i, static_cast<long long>(a.N), static_cast<long long>(a.K));
+                   which, i, static_cast<long long>(a.N), static_cast<long long>(a.K));
       ++failures;
     }
   }
@@ -232,15 +240,54 @@ LinearTuning TrellisFallback(int64_t N, int64_t K, int64_t M) {
   return t;
 }
 
+// linear.cpp's BestRow over one trellis table, spelled out independently: the row of the smallest
+// M >= m at (N, K, KB) that fits an m-row chunk (whole Wc blocks, whole U-steps of every K slice, a
+// split 128-group only with every row tile in its block), or nullptr.
+template <size_t kRows>
+const GemmTuningRow* ExpectedRow(const GemmTuningRow (&table)[kRows], int64_t N, int64_t K, int kb,
+                                 int64_t m) {
+  const GemmTuningRow* best = nullptr;
+  for (const GemmTuningRow& row : table) {
+    if (row.layout != Layout::kTrellis || row.N != N || row.K != K || row.rate != kb || row.M < m) {
+      continue;
+    }
+    const LinearTuning& t = row.tuning;
+    const int64_t wc = static_cast<int64_t>(t.WV) * t.NPW * 32;
+    if (N % wc != 0 || (K / 16) % (static_cast<int64_t>(t.SK) * t.SKG * t.U) != 0) continue;
+    if ((t.SKG > 1 || wc < 128) && (m + 15) / 16 > t.MB) continue;
+    if (best == nullptr || row.M < best->M) best = &row;
+  }
+  return best;
+}
+
+// The pick for an m-row chunk: a chunk of <= 16 rows resolves through the M = 1 band; on a TP
+// thread the TP = 2 rows (M5) come first, then the TP = 1 rows (the M = 1 rows and M5's M = 32 / 64
+// prefill rows), then 4.4's fallback.
+LinearTuning ExpectedTrellis(int64_t N, int64_t K, int kb, int64_t m, bool tp2) {
+  const int64_t band = m <= 16 ? 1 : m;
+  if (tp2) {
+    if (const GemmTuningRow* row =
+            ExpectedRow(r4dx::model::trellis_tp2::kGemmTuningTable, N, K, kb, band)) {
+      return row->tuning;
+    }
+  }
+  if (const GemmTuningRow* row =
+          ExpectedRow(r4dx::model::trellis::kGemmTuningTable, N, K, kb, band)) {
+    return row->tuning;
+  }
+  return TrellisFallback(N, K, band);
+}
+
 struct TrellisShape {
   int64_t N, K, n_split;
   const char* what;
 };
 
-// One shape at one rate: M = 1..64 launchable, M = 2..16 the M = 1 pick whole, and (when `want1`
-// is given) the M = 1 pick equal to it; M > 16 equal to the fallback when `fallback_prefill`.
-void CheckTrellisShape(const TrellisShape& s, int kb, const LinearTuning* want1,
-                       bool fallback_prefill, const char* which, int& checked, int& failures) {
+// One shape at one rate, on a TP thread when `tp2` (the caller sets the flag): M = 1..64 launchable
+// and each the pick ExpectedTrellis names, M = 2..16 the M = 1 pick whole, and (when `want1` is
+// given) the M = 1 pick equal to it.
+void CheckTrellisShape(const TrellisShape& s, int kb, const LinearTuning* want1, bool tp2,
+                       const char* which, int& checked, int& failures) {
   const LinearTuning t1 = r4dx::model::PickTuning(Layout::kTrellis, s.N, s.K, 1, kb);
   const auto fail = [&](int64_t m, const LinearTuning& t, const char* why) {
     std::fprintf(stderr,
@@ -257,43 +304,74 @@ void CheckTrellisShape(const TrellisShape& s, int kb, const LinearTuning* want1,
     const LinearTuning t = r4dx::model::PickTuning(Layout::kTrellis, s.N, s.K, m, kb);
     ++checked;
     if (!TrellisLaunchable(s.N, s.K, s.n_split, m, kb, t)) fail(m, t, "not launchable");
+    ++checked;
+    if (!SameTrellis(t, ExpectedTrellis(s.N, s.K, kb, m, tp2))) {
+      fail(m, t, m <= 16 ? "not the M = 1 row (or 4.4's fallback)"
+                         : "not the prefill row (or 4.4's fallback) for this M");
+    }
     if (m <= 16) {
       ++checked;
       if (!SameTrellis(t, t1)) fail(m, t, "differs from the M = 1 pick (row identity)");
-    } else if (fallback_prefill) {
-      ++checked;
-      if (!SameTrellis(t, TrellisFallback(s.N, s.K, m))) fail(m, t, "not 4.4's M > 16 fallback");
     }
   }
 }
 
 void CheckTrellis(int& checked, int& failures) {
-  CheckTrellisRowsCopy(checked, failures);
+  CheckTrellisRowsCopy(r4dx::model::trellis::kGemmTuningTable, trellis_rows::kGemmTuningTable,
+                       "TP = 1 rows", checked, failures);
+  CheckTrellisRowsCopy(r4dx::model::trellis_tp2::kGemmTuningTable,
+                       trellis_rows::tp2::kGemmTuningTable, "TP = 2 rows", checked, failures);
   const auto n_split_for = [](int64_t N, int64_t K) {
-    // mlp.gate_up's two parts (gate | up): 34816 at TP = 1; a row of any other shape has one part.
-    return N == 34816 && K == 5120 ? N / 2 : N;
+    // mlp.gate_up's two parts (gate | up): 34816 at TP = 1, 17408 on a TP = 2 rank; a row of any
+    // other shape has one part.
+    return (N == 34816 || N == 17408) && K == 5120 ? N / 2 : N;
   };
-  // Every row of the table at its own rate: the M = 1 pick is the row, and M > 16 the fallback
-  // (the table has M = 1 rows only).
-  for (const GemmTuningRow& row : r4dx::model::trellis::kGemmTuningTable) {
-    ++checked;
-    if (row.layout != Layout::kTrellis || row.M != 1 || (row.rate != 4 && row.rate != 5)) {
-      std::fprintf(stderr,
-                   "FAIL trellis table row N=%lld K=%lld: not a kTrellis M = 1 row at KB 4/5\n",
-                   static_cast<long long>(row.N), static_cast<long long>(row.K));
-      ++failures;
-      continue;
+  // Every row of a table at its own rate, on the thread kind that reads it: an M = 1 row is the
+  // M = 1 pick, with every M checked as above; a prefill row (M5: M = 32 or 64) is launchable and
+  // the pick at its own M.
+  const auto check_rows = [&](const auto& table, bool tp2, const char* which) {
+    r4dx::model::SetTp2TuningForThisThread(tp2);
+    for (const GemmTuningRow& row : table) {
+      ++checked;
+      if (row.layout != Layout::kTrellis || (row.M != 1 && (row.M <= 16 || row.M > 64)) ||
+          (row.rate != 4 && row.rate != 5)) {
+        std::fprintf(stderr,
+                     "FAIL %s row N=%lld K=%lld M=%lld: not a kTrellis row at KB 4/5 and M = 1 or "
+                     "17..64\n",
+                     which, static_cast<long long>(row.N), static_cast<long long>(row.K),
+                     static_cast<long long>(row.M));
+        ++failures;
+        continue;
+      }
+      const TrellisShape s{row.N, row.K, n_split_for(row.N, row.K), "table row"};
+      if (row.M == 1) {
+        CheckTrellisShape(s, row.rate, &row.tuning, tp2, which, checked, failures);
+        continue;
+      }
+      ++checked;
+      const LinearTuning t =
+          r4dx::model::PickTuning(Layout::kTrellis, row.N, row.K, row.M, row.rate);
+      if (!TrellisLaunchable(s.N, s.K, s.n_split, row.M, row.rate, row.tuning) ||
+          !SameTrellis(t, row.tuning)) {
+        std::fprintf(stderr,
+                     "FAIL %s prefill row N=%lld K=%lld M=%lld KB=%d: not launchable at its M, or "
+                     "not the pick there\n",
+                     which, static_cast<long long>(row.N), static_cast<long long>(row.K),
+                     static_cast<long long>(row.M), row.rate);
+        ++failures;
+      }
     }
-    const TrellisShape s{row.N, row.K, n_split_for(row.N, row.K), "table row"};
-    CheckTrellisShape(s, row.rate, &row.tuning, true, "trellis table", checked, failures);
-  }
+    r4dx::model::SetTp2TuningForThisThread(false);
+  };
+  check_rows(r4dx::model::trellis::kGemmTuningTable, false, "trellis table");
+  check_rows(r4dx::model::trellis_tp2::kGemmTuningTable, true, "trellis TP = 2 table, tp thread");
   // The rate is part of the key: the gate_up shape's KB = 4 and KB = 5 rows differ, and each rate
   // gets its own.
   {
     const GemmTuningRow* r4 = nullptr;
     const GemmTuningRow* r5 = nullptr;
     for (const GemmTuningRow& row : r4dx::model::trellis::kGemmTuningTable) {
-      if (row.N == 34816 && row.K == 5120) (row.rate == 4 ? r4 : r5) = &row;
+      if (row.N == 34816 && row.K == 5120 && row.M == 1) (row.rate == 4 ? r4 : r5) = &row;
     }
     ++checked;
     if (r4 == nullptr || r5 == nullptr || SameTrellis(r4->tuning, r5->tuning)) {
@@ -324,12 +402,13 @@ void CheckTrellis(int& checked, int& failures) {
   for (const TrellisShape& s : tiny) {
     for (int kb : {4, 5}) {
       const LinearTuning want = TrellisFallback(s.N, s.K, 1);
-      CheckTrellisShape(s, kb, &want, true, "trellis fallback", checked, failures);
+      CheckTrellisShape(s, kb, &want, false, "trellis fallback", checked, failures);
     }
   }
-  // A TP = 2 rank thread (docs/tp.md 2.7): the per-rank shapes of every trellis linear (2.4), which
-  // the TP table does not cover -- the TP = 1 rows serve an equal (N, K) (the rank's attn.qg is
-  // 6144 x 5120, gdn.in_proj_z's TP = 1 shape) and the fallback the rest.
+  // A TP = 2 rank thread (docs/tp.md 2.7): the per-rank shapes of every trellis linear (2.4). The
+  // per-rank trellis rows serve them first (the rank's attn.qg, 6144 x 5120, gets its own rows even
+  // though gdn.in_proj_z's TP = 1 shape is the same), and every one of them must be what a TP
+  // thread is served, at every M.
   r4dx::model::SetTp2TuningForThisThread(true);
   const TrellisShape tp2[] = {
       {5120, 5120, 5120, "TP2 gdn.in_proj_qkv"}, {3072, 5120, 3072, "TP2 gdn.in_proj_z"},
@@ -338,10 +417,22 @@ void CheckTrellis(int& checked, int& failures) {
       {5120, 8704, 5120, "TP2 mlp.down"}};
   for (const TrellisShape& s : tp2) {
     for (int kb : {4, 5}) {
+      ++checked;
+      if (ExpectedRow(r4dx::model::trellis_tp2::kGemmTuningTable, s.N, s.K, kb, 1) == nullptr) {
+        std::fprintf(stderr, "FAIL trellis TP = 2 table: no M = 1 row for %s at KB %d\n", s.what,
+                     kb);
+        ++failures;
+      }
       CheckTrellisShape(s, kb, nullptr, true, "trellis, tp thread", checked, failures);
     }
   }
   r4dx::model::SetTp2TuningForThisThread(false);
+  // And a TP = 1 thread is never served a TP = 2 row: the shared shape (6144 x 5120) gets the
+  // TP = 1 gdn.in_proj_z rows at every M.
+  for (int kb : {4, 5}) {
+    const TrellisShape s{6144, 5120, 6144, "TP1 gdn.in_proj_z (a TP2 attn.qg shape)"};
+    CheckTrellisShape(s, kb, nullptr, false, "trellis, TP = 1 thread", checked, failures);
+  }
 }
 
 bool Same(const LinearTuning& a, const LinearTuning& b) {
@@ -539,7 +630,8 @@ int main() {
   int tq_failures = 0, tq_checked = 0;
   CheckTrellis(tq_checked, tq_failures);
   std::printf("test_pick_tuning: %d/%d trellis checks -- launchable at M = 1..64 (TP = 1 rows, "
-              "TP = 2 rank shapes, fallback), M = 2..16 the M = 1 pick, the rate in the key\n",
+              "TP = 2 rank shapes, fallback), M = 2..16 the M = 1 pick, M > 16 the prefill row, "
+              "the rate in the key\n",
               tq_checked - tq_failures, tq_checked);
   return failures == 0 && sk_failures == 0 && ex_failures == 0 && tq_failures == 0 ? 0 : 1;
 }

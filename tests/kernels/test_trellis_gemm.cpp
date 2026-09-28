@@ -25,6 +25,9 @@
 //                tuning (SKG up to 4; and up to 8, the first revision's rule, where that differs), at
 //                the row's real (N, K, KB): row r of an M-row call (M = 2..16) is bit-identical to
 //                the M = 1 call on that row;
+//                (M5: the TP = 2 per-rank table's M = 1 rows too, at their rank shapes);
+//   prefill rows every M > 16 row of both tables (M5) at both ends of the chunk sizes it serves, on
+//                its K and KB (N narrowed to 1024): within the accuracy tolerance (TestPrefillRows);
 //   determinism  100 repeats give identical bytes at SKG = 4 and at Wc = 32 on mlp.down's shape, and
 //                at SKG = 8 (128- and 32-wide blocks, 8 and 32 per group) on attn.k/v's, M = 8 and 16;
 //   tickets      tickets left non-zero (as a launch that never completed would leave them) make
@@ -51,6 +54,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -455,8 +459,11 @@ void TestInvariance(std::mt19937_64& rng) {
 }
 
 // ---- row identity -----------------------------------------------------------------------------------
+// mlp.gate_up's two parts: 34816 x 5120 at TP = 1, 17408 x 5120 on a TP = 2 rank.
+bool GateUp(int64_t N, int64_t K) { return (N == 34816 || N == 17408) && K == 5120; }
+
 void RowIdentity(std::mt19937_64& rng, int N, int K, int KB, const Tuning& t, const std::string& label) {
-  const int n_split = N == 34816 ? N / 2 : N;   // mlp.gate_up: two parts
+  const int n_split = GateUp(N, K) ? N / 2 : N;
   std::unique_ptr<Linear> L = RandomLinear(rng, K, N, KB, n_split, false);
   const std::vector<uint16_t> a0 = RandomA(rng, static_cast<size_t>(16) * K), a1 = RandomA(rng, static_cast<size_t>(16) * K);
   // M = 1 on each row alone.
@@ -483,13 +490,17 @@ void RowIdentity(std::mt19937_64& rng, int N, int K, int KB, const Tuning& t, co
 
 void TestRowIdentity(std::mt19937_64& rng) {
   int rows = 0;
-  for (const trellis_rows::GemmTuningRow& row : trellis_rows::kGemmTuningTable) {
-    if (row.layout != trellis_rows::Layout::kTrellis || row.M > 16) continue;
-    const trellis_rows::LinearTuning& lt = row.tuning;
-    const Tuning t{lt.WV, lt.SK, lt.MB, lt.NPW, lt.SKG, lt.U, lt.NT};
-    RowIdentity(rng, static_cast<int>(row.N), static_cast<int>(row.K), row.rate, t, "table row");
-    ++rows;
-  }
+  const auto table = [&](const auto& rows_of, const char* label) {
+    for (const trellis_rows::GemmTuningRow& row : rows_of) {
+      if (row.layout != trellis_rows::Layout::kTrellis || row.M > 16) continue;
+      const trellis_rows::LinearTuning& lt = row.tuning;
+      const Tuning t{lt.WV, lt.SK, lt.MB, lt.NPW, lt.SKG, lt.U, lt.NT};
+      RowIdentity(rng, static_cast<int>(row.N), static_cast<int>(row.K), row.rate, t, label);
+      ++rows;
+    }
+  };
+  table(trellis_rows::kGemmTuningTable, "table row");
+  table(trellis_rows::tp2::kGemmTuningTable, "TP = 2 table row");
   Check(rows > 0, "the trellis tuning table has no M <= 16 rows");
   const std::pair<int, int> shapes[] = {{10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120},
                                         {1024, 5120},  {34816, 5120}, {5120, 17408}};
@@ -498,6 +509,78 @@ void TestRowIdentity(std::mt19937_64& rng) {
     RowIdentity(rng, nk.first, nk.second, 4, f4, "4.4 fallback");
     if (f8.SKG != f4.SKG) RowIdentity(rng, nk.first, nk.second, 4, f8, "fallback at SKG <= 8");
   }
+}
+
+// ---- prefill rows ------------------------------------------------------------------------------------
+// Every M > 16 row of both tables (M5's prefill picks, which production runs for every prefill
+// chunk; the TP = 2 per-rank table's too) at the smallest and the largest chunk M it serves (17..32
+// for an M = 32 row, 33..64 for M = 64: linear.cpp's BestRow takes the smallest row M >= the
+// chunk's), on the row's K and KB and a narrower N of 1024 (every block width divides it;
+// mlp.gate_up keeps two parts, n_split 512):
+// within the accuracy tolerance of the fp64 linear of its f16 A, rows >= M untouched, tickets zero
+// after a split call.
+void TestPrefillRows(std::mt19937_64& rng) {
+  const int N = 1024;
+  struct Ref {
+    std::unique_ptr<Linear> L;
+    std::vector<double> ya;
+  };
+  std::map<std::tuple<int, int, int>, Ref> refs;   // (K, KB, parts)
+  int calls = 0;
+  double worst = 0.0;
+  // The TP = 1 table's rows, then the TP = 2 per-rank table's (M5), each at the M band its own
+  // table's rows give it.
+  std::vector<std::pair<const trellis_rows::GemmTuningRow*, const char*>> all;
+  for (const trellis_rows::GemmTuningRow& row : trellis_rows::kGemmTuningTable) all.push_back({&row, "TP1"});
+  for (const trellis_rows::GemmTuningRow& row : trellis_rows::tp2::kGemmTuningTable) all.push_back({&row, "TP2"});
+  for (const auto& entry : all) {
+    const trellis_rows::GemmTuningRow& row = *entry.first;
+    if (row.layout != trellis_rows::Layout::kTrellis || row.M <= 16) continue;
+    const int K = static_cast<int>(row.K), KB = row.rate, parts = GateUp(row.N, row.K) ? 2 : 1;
+    const int n_split = parts == 2 ? N / 2 : N;
+    Ref& ref = refs[{K, KB, parts}];
+    if (!ref.L) {
+      ref.L = RandomLinear(rng, K, N, KB, n_split, true);
+      const std::vector<uint16_t> a0 = RandomA(rng, static_cast<size_t>(64) * K);
+      const std::vector<uint16_t> a1 = RandomA(rng, static_cast<size_t>(64) * K);
+      ref.L->a0.CopyFromHost(a0);
+      ref.L->a1.CopyFromHost(a1);
+      std::vector<const uint16_t*> a_ptrs{a0.data()};
+      if (parts == 2) a_ptrs.push_back(a1.data());
+      ref.ya = trellis_ref::LinearFromA(a_ptrs, 64, K, N, n_split, ref.L->q, ref.L->svh.data(), 0);
+    }
+    int lo = 17;
+    for (const auto& other : all) {
+      const trellis_rows::GemmTuningRow& o = *other.first;
+      if (other.second == entry.second && o.N == row.N && o.K == row.K && o.rate == row.rate && o.M > 16 &&
+          o.M < row.M)
+        lo = std::max(lo, static_cast<int>(o.M) + 1);
+    }
+    const trellis_rows::LinearTuning& lt = row.tuning;
+    const Tuning t{lt.WV, lt.SK, lt.MB, lt.NPW, lt.SKG, lt.U, lt.NT};
+    for (int M : {lo, static_cast<int>(row.M)}) {
+      const std::string what = std::string(entry.second) + " prefill row N=" + std::to_string(row.N) + " K=" +
+                               std::to_string(K) + " KB=" + std::to_string(KB) + " M=" + std::to_string(M) + " " +
+                               t.Str();
+      std::vector<uint16_t> c;
+      try {
+        c = ref.L->Call(t, M);
+      } catch (const std::exception& e) {
+        Check(false, what + ": rejected (" + e.what() + ")");
+        continue;
+      }
+      ++calls;
+      const Tol r = CheckTolerance(c, M, N, ref.ya, {});
+      worst = std::max(worst, r.worst);
+      Check(r.bad == 0, what + ": " + std::to_string(r.bad) + " elements outside 4 bf16 ulp + 1e-4 rms");
+      Check(r.untouched_bad == 0, what + ": rows >= M written");
+      if (t.Split()) Check(ref.L->TicketsZero(), what + ": tickets not zero after the call");
+    }
+  }
+  std::printf("  prefill rows: %d calls (every M > 16 row of both tables at the ends of its M band, N = 1024), "
+              "worst element %.3f of the tolerance\n",
+              calls, worst);
+  Check(calls > 0, "the trellis tuning table has no M > 16 rows");
 }
 
 // ---- determinism --------------------------------------------------------------------------------------
@@ -692,6 +775,7 @@ int main() {
   TestEpilogueExact(rng);
   TestInvariance(rng);
   TestRowIdentity(rng);
+  TestPrefillRows(rng);
   TestDeterminism(rng);
 
   const bool golden = GoldenAvailable();

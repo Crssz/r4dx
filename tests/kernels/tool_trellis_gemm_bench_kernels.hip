@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "clock_probe_device.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_trellis_dq.h"
 
@@ -63,24 +64,19 @@ __device__ __forceinline__ uint32_t HwId1() {
 
 // out[0] = wall_clock64 when this one-thread kernel runs: the bench's timer. Kernels of one stream
 // run in order, so two stamps bracket everything launched between them.
-__global__ void StampKernel(unsigned long long* out) { out[0] = wall_clock64(); }
+__global__ void StampKernel(unsigned long long* out) { r4dx_wall_stamp_device(out); }
 
-// out[0..3] = clock64, wall_clock64 before and after a dependent chain of 8 * iters v_add.
+// M5 part 3 (mode disp): each workgroup's first lane writes where it ran (HW_ID1) -- a pad of k
+// workgroups, or with k = 1 a locator of the slot the dispatcher hands out next.
+__global__ void WhereKernel(uint32_t* out) {
+  if (threadIdx.x == 0) out[blockIdx.x] = HwId1();
+}
+
+// out[0..3] = clock64, wall_clock64 before and after a dependent chain of 8 * iters v_add. The
+// device code is src/model/kernels/clock_probe_device.h, which r4dx's in-model probe
+// (R4DX_CLOCK_PROBE, src/model/debug_probe.h) runs too: the two clocks are like for like.
 __global__ void ClockProbeKernel(unsigned long long* out, int iters) {
-  const unsigned long long c0 = clock64(), w0 = wall_clock64();
-  uint32_t x = threadIdx.x;
-  for (int i = 0; i < iters; ++i) {
-#pragma unroll
-    for (int j = 0; j < 8; ++j) asm volatile("v_add_nc_u32 %0, %0, 1" : "+v"(x));
-  }
-  const unsigned long long c1 = clock64(), w1 = wall_clock64();
-  if (threadIdx.x == 0) {
-    out[0] = c0;
-    out[1] = w0;
-    out[2] = c1;
-    out[3] = w1;
-    out[4] = x;
-  }
+  r4dx_clock_probe_device(out, iters);
 }
 
 // ---- op rates -----------------------------------------------------------------------------------
@@ -386,6 +382,10 @@ void r4dx_tq_bench_read(int64_t p, int64_t bytes, int64_t sink, int64_t stream) 
 
 void r4dx_tq_bench_stamp(int64_t out, int64_t stream) {
   hipLaunchKernelGGL(StampKernel, dim3(1), dim3(1), 0, (hipStream_t)stream, (unsigned long long*)out);
+}
+
+void r4dx_tq_bench_where(int64_t out, int wgs, int threads, int64_t stream) {
+  hipLaunchKernelGGL(WhereKernel, dim3(wgs), dim3(threads), 0, (hipStream_t)stream, (uint32_t*)out);
 }
 
 void r4dx_tq_bench_clock_probe(int64_t out, int iters, int64_t stream) {

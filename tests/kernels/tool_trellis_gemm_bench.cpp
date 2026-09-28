@@ -1,8 +1,9 @@
 // tests/kernels/tool_trellis_gemm_bench.cpp -- trellis weights, milestone M1's and M2's measurements
 // (docs/trellis-kernel.md 4.6, 6 "Benches", 7 M1/M2). HIP device 1 only; prints a summary and writes
 // every number to the JSON file named by --out. M1's four modes (the fifth, the in-model clock
-// probe, is an r4dx debug hook and not part of this tool; its median SCLK comes back in as
-// --in-model-sclk) and M2's full-linear replay:
+// probe, is r4dx's R4DX_CLOCK_PROBE debug hook, src/model/debug_probe.h -- the same probe kernel,
+// src/model/kernels/clock_probe_device.h; its median SCLK comes back in as --in-model-sclk), M2's
+// full-linear replay and M5's prefill tuning:
 //
 //   replay   One decode step's 336 body GEMMs (the 400 HF linears, gate/up fused) in layer order,
 //            at full size with random weights: trellis KB = 4 through r4d_gemm_trellis_nt_m64_raw
@@ -76,15 +77,30 @@
 //            best four per key are then compared on the WHOLE full-linear step chain (paired, both M),
 //            one key at a time. --tunings-out writes the result as JSON, --inc-out as the table
 //            include (every key of this run, plus any --tuning-file key this run did not have).
+//   ptune    Milestone M5: the prefill rows (M > 16) of the trellis table, per M of --ptune-m (default
+//            32, 64) -- PrefillTune's comment has the method: every legal tuning screened per key on
+//            flushed full-GEMM chains at that M, the best four (and each with NT flipped) compared on
+//            the whole prefill chunk, and the chunk timed at the fallback, at the picks and for q2ab's
+//            production path. A key that --tuning-file already gives a row at that M keeps it (unless
+//            --joint-all), so a --kb mix run after a --kb 4 run adds the KB = 5 rows only.
+//            --tunings-out / --inc-out write the M = 1 rows of --tuning-file with the prefill rows.
+//   disp     M5 part 3 (docs/trellis-kernel.md 10.6): gate_up and down (the table's M = 1 rows) timed
+//            after a pad of k one-wave workgroups and a one-workgroup locator that records the slot
+//            the dispatcher hands out next -- does a GEMM's speed depend on where its workgroups
+//            start? (It does not: +-0.1 us over every slot and k.) Per synchronize and back to back.
 //   --kb 4 | mix   the trellis rate: KB = 4 everywhere, or EXL3's 4.5 bpw allocation (KB = 5 on
 //            layers 0-15 and 48-63, KB = 4 on 16-47; --kb-manifest <mix4.5m weights_override.json>
 //            reads the exact per-tensor K instead and checks gate K == up K).
+//   --tp 2   one TP = 2 rank's shapes (ShardShapesTp2: the column-parallel linears split N, the
+//            row-parallel ones K), for the tuning modes (full --joint, ptune) only: their rows are
+//            the per-rank table (--inc-out: src/model/gemm_tuning_table_trellis_tp2.inc, which
+//            `--tuning-file table` then reads). q2ab's extras in --modes full stay at TP = 1 sizes.
 //
 //   $env:HIP_VISIBLE_DEVICES='1'; build\win-hip\tests\kernels\tool_trellis_gemm_bench.exe `
-//       --out <json> [--modes replay,ops,split,prefill,full] [--reps 10] [--layers 64] [--sweep]
+//       --out <json> [--modes replay,ops,split,prefill,full,ptune,disp] [--reps 10] [--layers 64] [--sweep]
 //       [--in-model-sclk <MHz>] [--alu-fraction <0..1>] [--kb 4|mix] [--kb-manifest <json>]
 //       [--tuning-file <json>|table]... [--joint] [--joint-all] [--tunings-out <json>]
-//       [--inc-out <path>]
+//       [--inc-out <path>] [--ptune-m 32,64] [--tp 1|2]
 //
 // TIMING is GPU-side: one-thread kernels write wall_clock64() before and after the launches (Timer
 // below; hip events proved unreliable for short intervals on this stack). The REALTIME counter's
@@ -129,6 +145,7 @@ void r4dx_tq_bench_fill_u32(int64_t p, int64_t n, uint32_t seed, uint32_t and_ma
                             int64_t stream);
 void r4dx_tq_bench_read(int64_t p, int64_t bytes, int64_t sink, int64_t stream);
 void r4dx_tq_bench_stamp(int64_t out, int64_t stream);
+void r4dx_tq_bench_where(int64_t out, int wgs, int threads, int64_t stream);
 void r4dx_tq_bench_clock_probe(int64_t out, int iters, int64_t stream);
 void r4dx_tq_bench_op_rate(int op, int dist, int delay, int wgs, int waves_per_wg, int iters, int64_t cyc,
                            int64_t hwid, int64_t sink, int64_t stream);
@@ -179,6 +196,9 @@ struct Args {
   int joint_top = 4;                        // candidates per key taken to the whole-chain stage
   int joint_reps = 6;                       // paired whole-chain reps per comparison
   std::string tunings_out, inc_out;
+  // M5 (mode ptune): the prefill chunk sizes to tune, and the shapes of one TP = 2 rank (--tp 2).
+  std::vector<int> ptune_m{32, 64};
+  int tp = 1;
 };
 
 double Quantile(std::vector<double> v, double q) {
@@ -267,11 +287,21 @@ struct Shape {
   const char* cls;
   int N, K;
 };
-const Shape kQkv{"gdn.in_proj_qkv", 10240, 5120}, kZ{"gdn.in_proj_z", 6144, 5120},
+// The body's shapes at TP = 1; --tp 2 makes them one rank's (ShardShapesTp2) before anything reads
+// them.
+Shape kQkv{"gdn.in_proj_qkv", 10240, 5120}, kZ{"gdn.in_proj_z", 6144, 5120},
     kOutProj{"gdn.out_proj", 5120, 6144}, kQg{"attn.qg", 12288, 5120}, kAttnK{"attn.k", 1024, 5120},
     kAttnV{"attn.v", 1024, 5120}, kAttnO{"attn.o", 5120, 6144}, kGateUp{"mlp.gate_up", 34816, 5120},
     kDown{"mlp.down", 5120, 17408};
 const Shape* const kShapes[] = {&kQkv, &kZ, &kOutProj, &kQg, &kAttnK, &kAttnV, &kAttnO, &kGateUp, &kDown};
+
+// One TP = 2 rank's shapes (docs/trellis-kernel.md 2.4, docs/tp.md 5.2): the column-parallel linears
+// keep half the rows, the row-parallel ones (gdn.out_proj, attn.o, mlp.down) half of K. gate_up
+// stays two parts, each half as wide (n_split = N / 2 = 8704).
+void ShardShapesTp2() {
+  for (Shape* s : {&kQkv, &kZ, &kQg, &kAttnK, &kAttnV, &kGateUp}) s->N /= 2;
+  for (Shape* s : {&kOutProj, &kAttnO, &kDown}) s->K /= 2;
+}
 
 // q2ab_hv2_q3's w4a16 group of each body linear (docs/quant2.md 7); 0 = kept bf16.
 int ProductionGroup(const Shape& s, int layer) {
@@ -451,8 +481,10 @@ class Bench {
                       {"w4a16_default_group", r4d_gemm_w4a16_nt_m64_group()}};
     out_["clock_calibration"] = cal;
     // A (f16 for trellis / w4a16, a second f16 part for trellis gate_up, bf16 for the bf16 k/v),
-    // C, workspace: sized for M = 64.
-    for (int K : {5120, 6144, 17408}) {
+    // C, workspace: sized for M = 64, per K of the shapes (a TP = 2 rank's with --tp 2).
+    std::set<int> ks;
+    for (const Shape* s : kShapes) ks.insert(s->K);
+    for (int K : ks) {
       a_f16_[K] = small_->Take<uint16_t>(static_cast<size_t>(64) * K * 2);
       a_f16b_[K] = small_->Take<uint16_t>(static_cast<size_t>(64) * K * 2);
       a_bf16_[K] = small_->Take<uint16_t>(static_cast<size_t>(64) * K * 2);
@@ -1135,27 +1167,52 @@ class Bench {
                  j.at("SKG").get<int>(), j.at("U").get<int>(), j.value("NT", 1)};
   }
 
-  // --tuning-file: JSON as --tunings-out writes it ({"tunings": [{N, K, KB, WV, ...}]}), or "table"
-  // for the M = 1 rows of src/model/gemm_tuning_table_trellis.inc as this binary was built.
-  KeyTunes LoadTunings() const {
-    KeyTunes out;
-    for (const std::string& f : args_.tuning_files) {
-      if (f == "table") {
-        for (const trellis_rows::GemmTuningRow& row : trellis_rows::kGemmTuningTable) {
-          if (row.layout != trellis_rows::Layout::kTrellis || row.M != 1) continue;
-          const trellis_rows::LinearTuning& t = row.tuning;
-          out[TKey{static_cast<int>(row.N), static_cast<int>(row.K), row.rate}] =
-              TTune{t.WV, t.SK, t.MB, t.NPW, t.SKG, t.U, t.NT};
-        }
+  // A prefill row (M5): its (N, K, KB) and the chunk M it was tuned at (> 16). The table serves a
+  // chunk of M rows from the smallest row M >= it (src/model/linear.cpp's BestRow).
+  using PKey = std::pair<TKey, int>;
+  using PrefillTunes = std::map<PKey, TTune>;
+
+  // --tuning-file: JSON as --tunings-out writes it ({"tunings": [{N, K, KB, [M,] WV, ...}]}, no M
+  // meaning 1), or "table" for the rows of src/model/gemm_tuning_table_trellis.inc as this binary was
+  // built (with --tp 2, gemm_tuning_table_trellis_tp2.inc's). Each tuning goes to `f` with its M.
+  void ForEachFileTuning(const std::function<void(const TKey&, int, const TTune&)>& f) const {
+    const auto rows = [&](const auto& table) {
+      for (const trellis_rows::GemmTuningRow& row : table) {
+        if (row.layout != trellis_rows::Layout::kTrellis) continue;
+        const trellis_rows::LinearTuning& t = row.tuning;
+        f(TKey{static_cast<int>(row.N), static_cast<int>(row.K), row.rate}, static_cast<int>(row.M),
+          TTune{t.WV, t.SK, t.MB, t.NPW, t.SKG, t.U, t.NT});
+      }
+    };
+    for (const std::string& file : args_.tuning_files) {
+      if (file == "table") {
+        if (args_.tp == 2) rows(trellis_rows::tp2::kGemmTuningTable);
+        else rows(trellis_rows::kGemmTuningTable);
         continue;
       }
-      std::ifstream in(f, std::ios::binary);
-      if (!in) throw std::runtime_error("cannot read --tuning-file " + f);
+      std::ifstream in(file, std::ios::binary);
+      if (!in) throw std::runtime_error("cannot read --tuning-file " + file);
       const json d = json::parse(in);
       const json& arr = d.contains("tunings") ? d.at("tunings") : d;
       for (const json& e : arr)
-        out[TKey{e.at("N").get<int>(), e.at("K").get<int>(), e.at("KB").get<int>()}] = TuneFromJson(e);
+        f(TKey{e.at("N").get<int>(), e.at("K").get<int>(), e.at("KB").get<int>()}, e.value("M", 1),
+          TuneFromJson(e));
     }
+  }
+  // The decode rows (M <= 16: one M = 1 row per key, row identity).
+  KeyTunes LoadTunings() const {
+    KeyTunes out;
+    ForEachFileTuning([&](const TKey& k, int M, const TTune& t) {
+      if (M <= 16) out[k] = t;
+    });
+    return out;
+  }
+  // The prefill rows (M > 16).
+  PrefillTunes LoadPrefillTunings() const {
+    PrefillTunes out;
+    ForEachFileTuning([&](const TKey& k, int M, const TTune& t) {
+      if (M > 16) out[{k, M}] = t;
+    });
     return out;
   }
 
@@ -1294,58 +1351,99 @@ class Bench {
     return tune;
   }
 
-  void WriteTunings(const KeyTunes& tune, const std::map<TKey, std::string>& source) const {
+  // --tunings-out (JSON) and --inc-out (the table include): the M = 1 rows in `tune` and the prefill
+  // rows in `prefill` (a key of another run keeps its rows when it came in through --tuning-file).
+  void WriteTunings(const KeyTunes& tune, const std::map<TKey, std::string>& source,
+                    const PrefillTunes& prefill = {}) const {
+    // Every row, sorted by KB, then the shapes' layer order, then M.
+    struct Row {
+      TKey k;
+      int M;
+      TTune t;
+      std::string src;
+    };
+    std::vector<Row> rows;
+    for (auto& kv : tune)
+      rows.push_back({kv.first, 1, kv.second, source.count(kv.first) ? source.at(kv.first) : "file"});
+    for (auto& kv : prefill) {
+      const auto s = prefill_source_.find(kv.first);
+      rows.push_back({kv.first.first, kv.first.second, kv.second, s == prefill_source_.end() ? "file" : s->second});
+    }
+    std::vector<std::pair<int, int>> shape_order;
+    for (const Shape* s : kShapes)
+      if (std::find(shape_order.begin(), shape_order.end(), std::make_pair(s->N, s->K)) == shape_order.end())
+        shape_order.push_back({s->N, s->K});
+    auto rank = [&](const Row& r) {
+      const auto it = std::find(shape_order.begin(), shape_order.end(),
+                                std::make_pair(std::get<0>(r.k), std::get<1>(r.k)));
+      return std::make_tuple(std::get<2>(r.k), static_cast<int>(it - shape_order.begin()), std::get<0>(r.k),
+                             std::get<1>(r.k), r.M);
+    };
+    std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) { return rank(a) < rank(b); });
+    // The linears every (N, K) serves: this run's, else the default names of the table's shapes.
+    std::map<std::pair<int, int>, std::string> names =
+        args_.tp == 1 ? std::map<std::pair<int, int>, std::string>{
+                            {{10240, 5120}, "gdn.in_proj_qkv"}, {{6144, 5120}, "gdn.in_proj_z"},
+                            {{5120, 6144}, "gdn.out_proj, attn.o"}, {{12288, 5120}, "attn.qg"},
+                            {{1024, 5120}, "attn.k, attn.v"}, {{34816, 5120}, "mlp.gate_up"},
+                            {{5120, 17408}, "mlp.down"}}
+                      : std::map<std::pair<int, int>, std::string>{
+                            {{5120, 5120}, "gdn.in_proj_qkv"}, {{3072, 5120}, "gdn.in_proj_z"},
+                            {{5120, 3072}, "gdn.out_proj, attn.o"}, {{6144, 5120}, "attn.qg"},
+                            {{512, 5120}, "attn.k, attn.v"}, {{17408, 5120}, "mlp.gate_up"},
+                            {{5120, 8704}, "mlp.down"}};
+    for (auto& kv : key_classes_) names[{std::get<0>(kv.first), std::get<1>(kv.first)}] = kv.second;
+
     if (!args_.tunings_out.empty()) {
       json arr = json::array();
-      for (auto& kv : tune) {
-        json e = kv.second.Json();
-        e["N"] = std::get<0>(kv.first);
-        e["K"] = std::get<1>(kv.first);
-        e["KB"] = std::get<2>(kv.first);
-        auto it = key_classes_.find(kv.first);
-        e["classes"] = it == key_classes_.end() ? "" : it->second;
-        e["source"] = source.count(kv.first) ? source.at(kv.first) : "file";
+      for (const Row& r : rows) {
+        json e = r.t.Json();
+        e["N"] = std::get<0>(r.k);
+        e["K"] = std::get<1>(r.k);
+        e["KB"] = std::get<2>(r.k);
+        e["M"] = r.M;
+        const auto nm = names.find({std::get<0>(r.k), std::get<1>(r.k)});
+        e["classes"] = nm == names.end() ? "" : nm->second;
+        e["source"] = r.src;
         arr.push_back(e);
       }
       std::ofstream f(args_.tunings_out, std::ios::binary);
       if (!f) throw std::runtime_error("cannot write " + args_.tunings_out);
-      f << json{{"format", "r4dx-trellis-tunings"}, {"version", 1}, {"tunings", arr}}.dump(1) << "\n";
+      f << json{{"format", "r4dx-trellis-tunings"}, {"version", 1}, {"tp", args_.tp}, {"tunings", arr}}.dump(1)
+        << "\n";
       std::printf("wrote %s\n", args_.tunings_out.c_str());
     }
     if (!args_.inc_out.empty()) {
-      // The shape names every (N, K) serves in this model (a key of another run keeps its row).
-      const std::map<std::pair<int, int>, const char*> names = {
-          {{10240, 5120}, "gdn.in_proj_qkv"}, {{6144, 5120}, "gdn.in_proj_z"},
-          {{5120, 6144}, "gdn.out_proj, attn.o"}, {{12288, 5120}, "attn.qg"},
-          {{1024, 5120}, "attn.k, attn.v"}, {{34816, 5120}, "mlp.gate_up"}, {{5120, 17408}, "mlp.down"}};
-      // Rows by KB, then in layer order of the shapes.
-      const std::vector<std::pair<int, int>> shape_order = {{10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120},
-                                                            {1024, 5120},  {34816, 5120}, {5120, 17408}};
-      auto rank = [&](const TKey& k) {
-        const auto it = std::find(shape_order.begin(), shape_order.end(),
-                                  std::make_pair(std::get<0>(k), std::get<1>(k)));
-        return std::make_pair(std::get<2>(k), static_cast<int>(it - shape_order.begin()));
-      };
-      std::vector<std::pair<TKey, TTune>> rows(tune.begin(), tune.end());
-      std::sort(rows.begin(), rows.end(), [&](const std::pair<TKey, TTune>& a, const std::pair<TKey, TTune>& b) {
-        return rank(a.first) < rank(b.first);
-      });
       std::ostringstream o;
-      o << "// GENERATED by tests/kernels/tool_trellis_gemm_bench.exe --modes full --joint (docs/trellis-kernel.md\n"
-           "// 7 M2, 10.1); --inc-out wrote this file. Measured on HIP device 1, R9700 (gfx1201), at full size\n"
-           "// with random weights: every legal tuning under 10.1's rules (NT 1, MT 1, SKG <= 4, >= 2 waves per\n"
-           "// SIMD) screened per (N, K, KB) on flushed chains by t(M = 1) + t(M = 8), the best four then\n"
-           "// compared on the whole full-linear decode step (input transforms + GEMMs with the epilogue), paired,\n"
-           "// at M = 1 and M = 8 together. KB = 4 rows from a --kb 4 run, KB = 5 rows from a --kb mix run\n"
-           "// (EXL3's 4.5 bpw allocation). The JSON beside the run has every candidate's time.\n"
+      o << "// GENERATED by tests/kernels/tool_trellis_gemm_bench.exe (docs/trellis-kernel.md 7 M2, M5, 10.1);\n"
+           "// --inc-out wrote this file. Measured on HIP device 1, R9700 (gfx1201), at full size with random\n"
+           "// weights. KB = 4 rows from --kb 4 runs, KB = 5 rows from --kb mix runs (EXL3's 4.5 bpw\n"
+           "// allocation); the JSON beside each run has every candidate's time.\n"
+           "//\n";
+      if (args_.tp == 2) {
+        o << "// TP = 2: one rank's (N, K) (docs/trellis-kernel.md 2.4, 5.5; the tool's --tp 2). linear.cpp\n"
+             "// includes this file inside namespace trellis_tp2, and a TP rank thread\n"
+             "// (SetTp2TuningForThisThread) reads it before the TP = 1 trellis rows, so a rank shape that equals\n"
+             "// a TP = 1 shape (the rank's attn.qg is gdn.in_proj_z's 6144 x 5120) still gets its own row.\n"
+             "//\n";
+      }
+      o << "// M = 1 rows (--modes full --joint): every legal tuning under 10.1's rules (NT 1, MT 1, SKG <= 4,\n"
+           "// >= 2 waves per SIMD) screened per (N, K, KB) on flushed chains by t(M = 1) + t(M = 8), the best\n"
+           "// four then compared on the whole full-linear decode step (input transforms + GEMMs with the\n"
+           "// epilogue), paired, at M = 1 and M = 8 together. A trellis chunk of M <= 16 rows always runs its\n"
+           "// M = 1 row (row identity, 4.3), so these serve decode, MTP verify and DFlash verify alike; NT = 1\n"
+           "// at every M <= 16 (10.1: trellis must not take w4a16's NT = 0 rule for M > 1).\n"
            "//\n"
-           "// Trellis rows of the GEMM tuning table (docs/trellis-kernel.md 5.3), one M = 1 row per (N, K, KB):\n"
-           "// a trellis chunk of M <= 16 rows always runs its M = 1 row (row identity, 4.3), so these serve\n"
-           "// decode, MTP verify and DFlash verify alike; NT = 1 at every M <= 16 (10.1: trellis must not take\n"
-           "// w4a16's NT = 0 rule for M > 1). M > 16 (prefill chunks) is 4.4's fallback until M5 sweeps it.\n"
+           "// M = 32 and M = 64 rows (--modes ptune, M5): prefill chunks. Every legal tuning (MT up to the\n"
+           "// chunk's row tiles, a split 128-group only with all of them in its block, >= 1 wave per SIMD)\n"
+           "// screened per (N, K, KB) on flushed chains of the full GEMM at that M, the best four and each of\n"
+           "// them with NT flipped then compared on the whole prefill chunk (input transforms + GEMMs), paired.\n"
+           "// linear.cpp's BestRow serves a chunk of M rows from the smallest row M >= it that fits it, so\n"
+           "// M = 17..32 run the M = 32 row and M = 33..64 the M = 64 row; a key without them takes 4.4's\n"
+           "// fallback.\n"
            "//\n"
            "// Row format, for the structs as docs/trellis-kernel.md 5.3 extends them (src/model/linear.h;\n"
-           "// linear.cpp includes this file inside namespace trellis and PickTuning reads it for every trellis\n"
+           "// linear.cpp includes this file inside its own namespace and PickTuning reads it for every trellis\n"
            "// linear; tests/kernels/trellis_tuning_rows.hpp reads the same file for test_trellis_gemm's\n"
            "// row-identity check and the bench's `--tuning-file table`):\n"
            "//   {Layout::kTrellis, N, K, M, {WV, SK, MB = MT, NPW = NP, NT, SKG, U}, group = 0, rate = KB}\n"
@@ -1353,14 +1451,12 @@ class Bench {
            "// The array has the main table's name, like gemm_tuning_table_tp2.inc: include it inside its own\n"
            "// namespace.\n"
            "static const GemmTuningRow kGemmTuningTable[] = {\n";
-      for (auto& rw : rows) {
-        const TKey& k = rw.first;
-        const TTune& t = rw.second;
-        const auto nm = names.find({std::get<0>(k), std::get<1>(k)});
+      for (const Row& r : rows) {
+        const auto nm = names.find({std::get<0>(r.k), std::get<1>(r.k)});
         char b[256];
-        std::snprintf(b, sizeof b, "    {Layout::kTrellis, %d, %d, 1, {%d, %d, %d, %d, %d, %d, %d}, 0, %d},  // %s Wc %d\n",
-                      std::get<0>(k), std::get<1>(k), t.WV, t.SK, t.MT, t.NP, t.NT, t.SKG, t.U, std::get<2>(k),
-                      nm == names.end() ? "?" : nm->second, t.Wc());
+        std::snprintf(b, sizeof b, "    {Layout::kTrellis, %d, %d, %d, {%d, %d, %d, %d, %d, %d, %d}, 0, %d},  // %s Wc %d\n",
+                      std::get<0>(r.k), std::get<1>(r.k), r.M, r.t.WV, r.t.SK, r.t.MT, r.t.NP, r.t.NT, r.t.SKG,
+                      r.t.U, std::get<2>(r.k), nm == names.end() ? "?" : nm->second.c_str(), r.t.Wc());
         o << b;
       }
       o << "};\n";
@@ -1604,9 +1700,161 @@ class Bench {
       tj[KeyName(k)] = {{"classes", key_classes_.at(k)}, {"instances", keys_.at(k).size()},
                         {"source", source.at(k)}, {"tuning", tune.at(k).Json()}};
     r["tunings"] = tj;
-    WriteTunings(tune, source);
+    WriteTunings(tune, source, LoadPrefillTunings());
     for (int M : {1, 8}) r["M" + std::to_string(M)] = ReplayFullAt(M, tune);
     out_["full"] = r;
+  }
+
+  // ---- prefill tuning (M5) -----------------------------------------------------------------------
+  // Rows for prefill chunks (M > 16; docs/trellis-kernel.md 4.7, 5.6), per M of --ptune-m and per
+  // (N, K, KB) that --tuning-file does not already give a row at that M (all of them with
+  // --joint-all). Stage 1 screens every legal tuning on flushed chains of the key's instances, full
+  // GEMM with its epilogue (the input transform does not depend on the tuning): MT a divisor of the
+  // chunk's row tiles (a larger one only idles rows), a split 128-group (SKG > 1 or Wc < 128) only
+  // with every row tile in its block (the kernel's rule), at least one wave per SIMD, NT 0; then the
+  // best joint_top again with NT 1. Stage 2 takes each key's best joint_top into the whole prefill
+  // chunk (every linear's transform and full GEMM at M), paired against the current pick, one key at
+  // a time (largest first), and keeps a candidate when the chunk gets faster (median < -5 us, upper
+  // quartile < 0), as the M = 1 joint pick does. Reports each key at the fallback (4.4) and at its
+  // pick, and the whole chunk at the fallback, at the picks and for q2ab_hv2_q3's production path at
+  // the same M (casts, w4a16 GEMMs at PickTuning's rows, GDN Hadamards and rotations: the linear-side
+  // prefill ratio of A3p). --tunings-out / --inc-out write these rows with the M = 1 rows and any other
+  // prefill rows that came in through --tuning-file.
+  void PrefillTune() {
+    json r;
+    const KeyTunes decode = LoadTunings();
+    PrefillTunes rows = LoadPrefillTunings();
+    std::map<TKey, std::string> source;
+    for (auto& kv : decode) source[kv.first] = "file";
+    for (const TKey& k : key_order_)
+      if (!decode.count(k))
+        std::printf("  note: --tuning-file has no M = 1 row for %s; none is written for it\n", KeyName(k).c_str());
+    const int simds = 4 * std::max(1, wgps_);
+    const std::vector<const Linear*> all = All();
+    Warm();
+    for (int M : args_.ptune_m) {
+      json jm;
+      const int mtiles = (M + 15) / 16;
+      KeyTunes fb, tune;
+      std::map<TKey, std::vector<std::pair<double, TTune>>> top;
+      std::map<TKey, double> weight;
+      for (const TKey& k : key_order_) {
+        fb[k] = FallbackTuning(std::get<0>(k), std::get<1>(k), M);
+        const auto have = rows.find({k, M});
+        if (have != rows.end() && !args_.joint_all) {
+          tune[k] = have->second;
+          jm["keys"][KeyName(k)] = {{"source", "file"}, {"tuning", have->second.Json()}};
+          continue;
+        }
+        const std::vector<const Linear*>& ls = keys_.at(k);
+        const int N = std::get<0>(k);
+        std::vector<std::pair<double, TTune>> scored;
+        json cand = json::array();
+        for (int WV : {1, 2, 4})
+          for (int NP : {1, 2, 4})
+            for (int U : {1, 2, 4})
+              for (int MT = 1; MT <= std::min(4, mtiles); ++MT)
+                for (int SK : {1, 2, 4, 8, 16})
+                  for (int SKG : {1, 2, 4}) {
+                    const TTune t{WV, SK, MT, NP, SKG, U, 0};
+                    const int Wc = t.Wc();
+                    if (mtiles % MT != 0 || Wc > 256 || N % Wc != 0) continue;
+                    if ((SKG > 1 || Wc < 128) && MT < mtiles) continue;
+                    if ((N / Wc) * SKG * (mtiles / MT) * WV * SK < simds) continue;
+                    const double ms = SweepTimeKey(ls, M, t);
+                    if (ms < 0) continue;
+                    scored.push_back({ms, t});
+                    cand.push_back({{"tuning", t.Json()}, {"us", 1000 * ms}});
+                  }
+        auto by_time = [](const std::pair<double, TTune>& a, const std::pair<double, TTune>& b) {
+          return a.first < b.first;
+        };
+        std::sort(scored.begin(), scored.end(), by_time);
+        if (static_cast<int>(scored.size()) > args_.joint_top) scored.resize(args_.joint_top);
+        for (size_t i = 0, n = scored.size(); i < n; ++i) {
+          TTune t = scored[i].second;
+          t.NT = 1;
+          const double ms = SweepTimeKey(ls, M, t);
+          if (ms < 0) continue;
+          scored.push_back({ms, t});
+          cand.push_back({{"tuning", t.Json()}, {"us", 1000 * ms}});
+        }
+        std::sort(scored.begin(), scored.end(), by_time);
+        if (static_cast<int>(scored.size()) > args_.joint_top) scored.resize(args_.joint_top);
+        const double t_fb = SweepTimeKey(ls, M, fb[k]);
+        if (scored.empty()) {
+          std::printf("  ptune %-18s M=%d: no legal tuning screened, keeping the fallback\n", KeyName(k).c_str(), M);
+          tune[k] = fb[k];
+          continue;
+        }
+        tune[k] = scored[0].second;
+        top[k] = scored;
+        weight[k] = scored[0].first * ls.size();
+        json best = json::array();
+        for (auto& s : scored) best.push_back({{"tuning", s.second.Json()}, {"us", 1000 * s.first}});
+        jm["keys"][KeyName(k)] = {{"source", "ptune"}, {"classes", key_classes_.at(k)}, {"instances", ls.size()},
+                                  {"fallback", {{"tuning", fb[k].Json()}, {"us", 1000 * t_fb}}},
+                                  {"screened", cand.size()}, {"best", best}, {"all", cand}};
+        std::printf("  ptune screen %-18s (%s) M=%d: %zu legal, best %s %.2f us per linear (fallback %s %.2f)\n",
+                    KeyName(k).c_str(), key_classes_.at(k).c_str(), M, cand.size(), scored[0].second.Str().c_str(),
+                    1000 * scored[0].first, fb[k].Str().c_str(), 1000 * t_fb);
+      }
+      // Stage 2: the whole prefill chunk.
+      auto chunk = [&](const KeyTunes& tn) {
+        return Must(Chain([&] { LaunchTChain(all, M, tn, TChain::kFull); }, "ptune chunk"), "ptune chunk");
+      };
+      std::vector<TKey> order;
+      for (auto& kv : top) order.push_back(kv.first);
+      std::sort(order.begin(), order.end(), [&](const TKey& a, const TKey& b) { return weight[a] > weight[b]; });
+      json stage2 = json::array();
+      for (const TKey& k : order) {
+        for (size_t i = 1; i < top[k].size(); ++i) {
+          KeyTunes alt = tune;
+          alt[k] = top[k][i].second;
+          if (alt[k] == tune[k]) continue;
+          std::vector<double> d;
+          for (int rep = 0; rep < args_.joint_reps; ++rep) {
+            double c, a;
+            if (rep % 2 == 0) c = chunk(tune), a = chunk(alt);
+            else a = chunk(alt), c = chunk(tune);
+            d.push_back(a - c);
+          }
+          const bool take = Median(d) < -0.005 && Quantile(d, 0.75) < 0.0;
+          stage2.push_back({{"key", KeyName(k)}, {"current", tune[k].Json()}, {"candidate", alt[k].Json()},
+                            {"delta_ms", Spread(d)}, {"taken", take}});
+          std::printf("  ptune chunk %-18s M=%d %s -> %s: %+.3f ms per chunk%s\n", KeyName(k).c_str(), M,
+                      tune[k].Str().c_str(), alt[k].Str().c_str(), Median(d), take ? "  TAKEN" : "");
+          if (take) tune[k] = alt[k];
+        }
+      }
+      jm["whole_chunk_stage"] = stage2;
+      for (const TKey& k : key_order_) {
+        if (top.count(k)) prefill_source_[{k, M}] = "ptune";
+        rows[{k, M}] = tune[k];
+        jm["picks"][KeyName(k)] = tune[k].Json();
+      }
+      // The whole chunk, paired: fallback, picks, q2ab.
+      std::vector<double> c_fb, c_tn, c_q2;
+      for (int rep = 0; rep < args_.reps; ++rep) {
+        for (int j = 0; j < 3; ++j) switch ((rep + j) % 3) {
+            case 0: c_fb.push_back(chunk(fb)); break;
+            case 1: c_tn.push_back(chunk(tune)); break;
+            case 2: c_q2.push_back(Must(Chain([&] { LaunchBChain(all, M, BChain::kFull); }, "q2ab chunk"), "q2ab chunk"));
+                    break;
+          }
+      }
+      jm["chunk_ms"] = {{"trellis_fallback", Spread(c_fb)}, {"trellis_tuned", Spread(c_tn)},
+                        {"q2ab_production", Spread(c_q2)},
+                        {"tuned_over_fallback", Median(c_tn) / Median(c_fb)},
+                        {"q2ab_over_tuned", Median(c_q2) / Median(c_tn)}};
+      std::printf("ptune M=%d: whole chunk (transforms + GEMMs, %zu linears) trellis fallback %.3f ms, tuned %.3f ms "
+                  "(%.3fx); q2ab production %.3f ms -> linear-side prefill speed %.3fx q2ab\n",
+                  M, all.size(), Median(c_fb), Median(c_tn), Median(c_tn) / Median(c_fb), Median(c_q2),
+                  Median(c_q2) / Median(c_tn));
+      r["M" + std::to_string(M)] = jm;
+    }
+    WriteTunings(decode, source, rows);
+    out_["ptune"] = r;
   }
 
   // ---- split tail ------------------------------------------------------------------------------
@@ -1929,6 +2177,82 @@ class Bench {
     out_["ops"] = j;
   }
 
+  // M5 part 3 (mode disp): does a trellis GEMM's time depend on where the dispatcher starts its
+  // workgroups? The in-model probe found the same GEMM 5-7% apart from layer to layer, in a pattern
+  // fixed by the launch sequence (not by weight addresses or time). Before every timed GEMM a pad
+  // of k one-wave workgroups (k drawn per rep) and a one-workgroup locator run; the locator records
+  // the HW_ID1 of the slot it got. `a`: one rep per synchronize (the Timer); `b`: 64 reps enqueued
+  // back to back, stamped, one synchronize (the model's shape). Rows: [k, hw_id1, us].
+  void Disp() {
+    json j;
+    uint32_t* hw = reinterpret_cast<uint32_t*>(clk_);   // [0, 256): the pads' writes; then locators
+    uint32_t rng = 12345;
+    const auto next_k = [&] {
+      rng = rng * 1664525u + 1013904223u;
+      return static_cast<int>((rng >> 8) % 97u);
+    };
+    for (const Shape* s : {&kGateUp, &kDown}) {
+      const std::vector<const Linear*> inst = Instances(s);
+      const Linear& l0 = *inst[0];
+      TTune t{};
+      bool found = false;
+      for (const trellis_rows::GemmTuningRow& row : trellis_rows::kGemmTuningTable) {
+        if (row.layout == trellis_rows::Layout::kTrellis && row.N == s->N && row.K == s->K && row.M == 1 &&
+            row.rate == l0.kb) {
+          const trellis_rows::LinearTuning& r = row.tuning;
+          t = TTune{r.WV, r.SK, r.MB, r.NPW, r.SKG, r.U, r.NT};
+          found = true;
+        }
+      }
+      if (!found) throw std::runtime_error(std::string("disp: no M = 1 table row for ") + s->cls);
+      json c;
+      c["tuning"] = t.Json();
+      c["instances"] = inst.size();
+      // Warm up.
+      for (int i = 0; i < 64; ++i) LaunchTrellisFull(*inst[i % inst.size()], 1, t);
+      R4DX_HIP_CHECK(hipStreamSynchronize(st_));
+      json a = json::array();
+      for (int rep = 0; rep < 1536; ++rep) {
+        const int k = next_k();
+        if (k > 0) r4dx_tq_bench_where(P(hw), k, 32, P(st_));
+        r4dx_tq_bench_where(P(hw + 256), 1, 32, P(st_));
+        const double ms = timer_.Ms([&] { LaunchTrellisFull(*inst[rep % inst.size()], 1, t); });
+        uint32_t id = 0;
+        R4DX_HIP_CHECK(hipMemcpy(&id, hw + 256, 4, hipMemcpyDeviceToHost));
+        a.push_back({k, id, ms * 1000.0});
+      }
+      c["a"] = a;
+      json b = json::array();
+      unsigned long long* st = probe_;   // 2 stamps per rep
+      for (int round = 0; round < 24; ++round) {
+        std::vector<int> ks;
+        for (int rep = 0; rep < 64; ++rep) {
+          const int k = next_k();
+          ks.push_back(k);
+          if (k > 0) r4dx_tq_bench_where(P(hw), k, 32, P(st_));
+          r4dx_tq_bench_where(P(hw + 256 + rep), 1, 32, P(st_));
+          r4dx_tq_bench_stamp(P(st + 2 * rep), P(st_));
+          LaunchTrellisFull(*inst[rep % inst.size()], 1, t);
+          r4dx_tq_bench_stamp(P(st + 2 * rep + 1), P(st_));
+        }
+        R4DX_HIP_CHECK(hipStreamSynchronize(st_));
+        std::vector<unsigned long long> sv(128);
+        std::vector<uint32_t> ids(64);
+        R4DX_HIP_CHECK(hipMemcpy(sv.data(), st, 128 * 8, hipMemcpyDeviceToHost));
+        R4DX_HIP_CHECK(hipMemcpy(ids.data(), hw + 256, 64 * 4, hipMemcpyDeviceToHost));
+        for (int rep = 0; rep < 64; ++rep) {
+          const double us = static_cast<double>(sv[2 * rep + 1] - sv[2 * rep]) / wall_mhz_ -
+                            timer_.OverheadMs() * 1000.0;
+          b.push_back({ks[rep], ids[rep], us});
+        }
+      }
+      c["b"] = b;
+      j[s->cls] = c;
+      std::printf("disp %s: %zu + %zu reps\n", s->cls, a.size(), b.size());
+    }
+    out_["disp"] = j;
+  }
+
   void Write() {
     std::ofstream f(args_.out, std::ios::binary);
     if (!f) throw std::runtime_error("cannot write " + args_.out);
@@ -1960,6 +2284,7 @@ class Bench {
   std::map<TKey, std::vector<const Linear*>> keys_;
   std::vector<TKey> key_order_;
   std::map<TKey, std::string> key_classes_;
+  std::map<PKey, std::string> prefill_source_;   // the prefill rows this run picked (ptune)
   float* c_f32_ = nullptr;
   uint16_t* c_bf16_ = nullptr;
   float* ws_ = nullptr;
@@ -1998,27 +2323,48 @@ Args ParseArgs(int argc, char** argv) {
     else if (k == "--joint-reps") a.joint_reps = std::stoi(next());
     else if (k == "--tunings-out") a.tunings_out = next();
     else if (k == "--inc-out") a.inc_out = next();
-    else if (k == "--modes") {
+    else if (k == "--tp") a.tp = std::stoi(next());
+    else if (k == "--ptune-m") {
+      a.ptune_m.clear();
+      std::string v = next();
+      size_t p = 0;
+      while (p <= v.size()) {
+        const size_t q = v.find(',', p);
+        const int m = std::stoi(v.substr(p, q == std::string::npos ? std::string::npos : q - p));
+        if (m <= 16 || m > 64) throw std::runtime_error("--ptune-m: every M must be 17..64 (M <= 16 is the M = 1 row)");
+        a.ptune_m.push_back(m);
+        if (q == std::string::npos) break;
+        p = q + 1;
+      }
+    } else if (k == "--modes") {
       a.modes.clear();
       std::string v = next();
       size_t p = 0;
       while (p <= v.size()) {
         const size_t q = v.find(',', p);
         const std::string m = v.substr(p, q == std::string::npos ? std::string::npos : q - p);
-        if (m != "replay" && m != "ops" && m != "split" && m != "prefill" && m != "full")
-          throw std::runtime_error("unknown mode '" + m + "' (replay, ops, split, prefill, full)");
+        if (m != "replay" && m != "ops" && m != "split" && m != "prefill" && m != "full" && m != "ptune" &&
+            m != "disp")
+          throw std::runtime_error("unknown mode '" + m + "' (replay, ops, split, prefill, full, ptune, disp)");
         a.modes.insert(m);
         if (q == std::string::npos) break;
         p = q + 1;
       }
     } else {
       throw std::runtime_error("unknown argument " + k +
-                               " (--out <json> [--modes replay,ops,split,prefill,full] [--reps N] "
+                               " (--out <json> [--modes replay,ops,split,prefill,full,ptune,disp] [--reps N] "
                                "[--layers N] [--sweep] [--sweep-reps N] [--probe-iters N] "
                                "[--in-model-sclk MHz] [--alu-fraction F] [--warmup-s S] [--kb 4|mix] "
                                "[--kb-manifest json] [--tuning-file json|table]... [--joint] [--joint-all] "
-                               "[--joint-top N] [--joint-reps N] [--tunings-out json] [--inc-out path])");
+                               "[--joint-top N] [--joint-reps N] [--tunings-out json] [--inc-out path] "
+                               "[--ptune-m 32,64] [--tp 1|2])");
     }
+  }
+  if (a.tp != 1 && a.tp != 2) throw std::runtime_error("--tp must be 1 or 2");
+  if (a.tp == 2) {
+    for (const std::string& m : a.modes)
+      if (m != "full" && m != "ptune")
+        throw std::runtime_error("--tp 2 serves the tuning modes only (full, ptune), not " + m);
   }
   if (a.out.empty()) throw std::runtime_error("--out <json> is required");
   if (a.kb != "4" && a.kb != "mix") throw std::runtime_error("--kb must be 4 or mix");
@@ -2039,10 +2385,11 @@ int main(int argc, char** argv) {
     R4DX_HIP_CHECK(hipSetDevice(0));
     hipStream_t st;
     R4DX_HIP_CHECK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
+    if (args.tp == 2) ShardShapesTp2();
     {
       Bench b(args, st);
       const bool model = args.modes.count("replay") || args.modes.count("split") || args.modes.count("prefill") ||
-                         args.modes.count("full");
+                         args.modes.count("full") || args.modes.count("ptune") || args.modes.count("disp");
       b.Setup();
       b.Out()["args"] = {{"reps", args.reps}, {"layers", args.layers}, {"sweep", args.sweep},
                          {"sweep_reps", args.sweep_reps}, {"in_model_sclk", args.in_model_sclk},
@@ -2050,14 +2397,16 @@ int main(int argc, char** argv) {
                          {"modes", std::vector<std::string>(args.modes.begin(), args.modes.end())},
                          {"kb", args.kb}, {"kb_manifest", args.kb_manifest}, {"tuning_files", args.tuning_files},
                          {"joint", args.joint}, {"joint_all", args.joint_all}, {"joint_top", args.joint_top},
-                         {"joint_reps", args.joint_reps}};
+                         {"joint_reps", args.joint_reps}, {"ptune_m", args.ptune_m}, {"tp", args.tp}};
       // The JSON is rewritten after every mode, so a later failure keeps the earlier numbers.
       if (args.modes.count("ops")) b.Ops(), b.Write();
       if (model) b.SetupModel();
       if (args.modes.count("full")) b.ReplayFull(), b.Write();
+      if (args.modes.count("ptune")) b.PrefillTune(), b.Write();
       if (args.modes.count("replay")) b.Replay(), b.Write();
       if (args.modes.count("split")) b.Split(), b.Write();
       if (args.modes.count("prefill")) b.Prefill(), b.Write();
+      if (args.modes.count("disp")) b.Disp(), b.Write();
       if (!model && !args.modes.count("ops")) b.Write();
     }
     R4DX_HIP_CHECK(hipStreamDestroy(st));

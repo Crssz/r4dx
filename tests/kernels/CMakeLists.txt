@@ -153,6 +153,8 @@ set(R4DX_TQ_BENCH_FLAGS
   -DNDEBUG
   -D_DLL -D_MT -Xclang --dependent-lib=msvcrt
   -I "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+  # clock_probe_device.h: the clock probe and timer stamp, shared with r4dx's in-model probe.
+  -I "${CMAKE_SOURCE_DIR}/src/model/kernels"
 )
 if(EXISTS "${R4D_ROCM_ROOT}/lib/llvm/amdgcn/bitcode")
   list(APPEND R4DX_TQ_BENCH_FLAGS --rocm-device-lib-path=${R4D_ROCM_ROOT}/lib/llvm/amdgcn/bitcode)
@@ -165,6 +167,7 @@ add_custom_command(
           -o "${R4DX_TQ_BENCH_OBJ}"
   DEPENDS "${R4DX_TQ_BENCH_SRC}" "${CMAKE_SOURCE_DIR}/third_party/libr4d/r4d_trellis_dq.h"
           "${CMAKE_SOURCE_DIR}/third_party/libr4d/r4d_gdn_wmma.h"
+          "${CMAKE_SOURCE_DIR}/src/model/kernels/clock_probe_device.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) tool_trellis_gemm_bench_kernels.obj"
   VERBATIM
 )

@@ -10,6 +10,8 @@
 //     .hip file's epilogue) writes its C operand as bf16 -- there is no fp32-output GEMM variant.
 //     The task's "final norm + lm_head -> fp32 logits on device" therefore needs one widen pass
 //     after the lm_head GEMM; this is it.
+//   - r4dx_model_wall_stamp / r4dx_model_clock_probe: debug measurement only, for
+//     src/model/debug_probe.h (see below).
 //
 // Same plain-C-ABI convention as r4d.h / src/kernels/include/r4dx/kernels/kernels.h: device
 // pointers and the stream travel as int64_t, shapes/strides in ELEMENTS. Implemented in
@@ -26,5 +28,13 @@ void r4dx_model_cast_bf16_to_f16(int64_t in, int64_t out, int64_t n, int64_t str
 
 // out[i] = bf16_to_float(in[i]), i in [0, n). in: bf16 (uint16). out: fp32.
 void r4dx_model_widen_bf16_to_f32(int64_t in, int64_t out, int64_t n, int64_t stream);
+
+// Debug measurement only (src/model/debug_probe.h; docs/trellis-kernel.md 6 "Benches"): the device
+// code of clock_probe_device.h, which tool_trellis_gemm_bench runs too. `out` is device uint64.
+// r4dx_model_wall_stamp: one thread writes wall_clock64() to out[0] (a GPU timer stamp).
+// r4dx_model_clock_probe: one wave writes clock64 / wall_clock64 before and after 8 * iters
+// dependent v_add to out[0..3] (and the chain's value to out[4]).
+void r4dx_model_wall_stamp(int64_t out, int64_t stream);
+void r4dx_model_clock_probe(int64_t out, int iters, int64_t stream);
 
 }  // extern "C"

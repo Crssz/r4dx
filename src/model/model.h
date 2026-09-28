@@ -60,6 +60,7 @@
 
 namespace r4dx::model {
 
+class DebugProbe;  // debug_probe.h
 
 // Tensor parallel (docs/tp.md 3.3): which rank of which world THIS Model is. Default-constructed ==
 // TP=1, i.e. exactly the pre-TP Model. With world > 1, Model::Load loads rank `rank`'s shard of the
@@ -1062,6 +1063,10 @@ class Model {
   // container_, and are passed to Encode per call, so moving this Model cannot leave the tower
   // pointing at a moved-from container.
   std::optional<vision::VisionTower> vision_;
+
+  // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h): the process's probe, or nullptr --
+  // always under tensor parallelism. Every hook below is one test of it.
+  DebugProbe* probe_ = nullptr;
 };
 
 }  // namespace r4dx::model

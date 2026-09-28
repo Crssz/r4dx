@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "attn_config.h"
+#include "debug_probe.h"
 #include "dflash_draft_weights.h"
 #include "embedding.h"
 #include "final_lm_head.h"
@@ -538,6 +539,11 @@ Model Model::Load(const ModelOptions& opts) {
               << " GiB (already included in kv+gdn_state above)\n";
   }
 
+  // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
+  // calibrates the probe's clocks, here where the device is idle. nullptr, and no work, when
+  // neither is set.
+  if (!is_tp_rank) m.probe_ = DebugProbe::Get();
+
   return m;
 }
 
@@ -781,6 +787,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     comm_->CheckLockstep(fingerprint);
     comm_->CheckHealthy();
   }
+  // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h): this call's GPU span, its clock probes
+  // and linear spans; inert (probe_ null) otherwise.
+  ProbeScope probe_call(probe_, stream_.get(), is_prefill_path ? "prefill" : "decode", T);
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
@@ -861,6 +870,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
     if (bounded && i > 0 && i % unit_layers == 0) submit_.EndUnit(stream_.get());
+    if (probe_ != nullptr) probe_->SetLayer(i);
     // Every GDN/attention layer in this architecture is immediately followed by its own Mlp, so
     // the sub-block's fused epilogue always targets THIS layer's post_attention_layernorm.
     const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
@@ -940,9 +950,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                 has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
+    if (probe_ != nullptr) probe_->AfterMlp(stream_.get());
 
     arena_.Reset();
   }
+  if (probe_ != nullptr) probe_->SetLayer(-1);
   // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
   // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
   // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
@@ -970,6 +982,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // reveals real "next tokens" for MTP's boundary/within-chunk (h_i, t_{i+1}) pairs). No-op at
   // exactly zero extra cost when mtp_ is unset (the overwhelming common case).
   if (mtp_) {
+    // The MTP head's own linears run here too: a call of its own, so they are not counted as the
+    // layer stack's (debug_probe.h).
+    ProbeScope probe_prime(probe_, stream_.get(), "mtp_prime", T);
     // MTP's own attention layer ropes at the same 3-axis positions the backbone just did -- and
     // unlike its draft loop, these positions are INSIDE the prompt, so they can land on image rows
     // where the three axes genuinely differ (docs/vision.md). Built on the host per call because
@@ -1016,6 +1031,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                                    hipMemcpyDeviceToDevice, stream_.get()));
     mtp_seed_valid_ = true;
     arena_.Reset();
+    probe_prime.End();
   }
 
   // Prefill discards every chunk's logits except the last (Prefill() below only keeps the final
@@ -1052,6 +1068,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     }
     arena_.Reset();
   }
+  probe_call.End();
 
   // stream_ is created with hipStreamNonBlocking (r4dx::core::Stream's default), which by design
   // does NOT implicitly synchronize against the legacy/null stream a plain (no-stream-argument)
@@ -1142,7 +1159,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       RopePositionsHost(pos_, T, &inject_rope3);
       inject_rope_t = inject_rope3.data();  // row 0 of [3, T] is the temporal row
     }
+    ProbeScope probe_inject(probe_, stream_.get(), "dflash_inject", T);
     dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_, inject_rope_t);
+    probe_inject.End();
     // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
     // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
     // arena_ in this codebase resets it when done -- InjectFeatures' own scratch allocations (the
@@ -1171,6 +1190,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // "device idle on return" contract for every caller, dflash or not.
     stream_.Synchronize();
   }
+  // The stream is idle here on every path: read the probe's stamps back (debug_probe.h).
+  if (probe_ != nullptr) probe_->Collect(stream_.get());
 
   pos_ += T;
   started_ = true;
@@ -1863,6 +1884,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     comm_->CheckLockstep(fingerprint);
     comm_->CheckHealthy();
   }
+  ProbeScope probe_call(probe_, stream_.get(), "verify", T);  // debug_probe.h; inert when off
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
@@ -1908,6 +1930,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
     const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
+    if (probe_ != nullptr) probe_->SetLayer(i);
 
     // DFlash2 target feature capture -- see RunChunk's identical call site/comment above. A verify
     // window's `cur` right here is the residual stream entering layer `i` for these <=
@@ -1968,9 +1991,11 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                 has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
+    if (probe_ != nullptr) probe_->AfterMlp(stream_.get());
 
     arena_.Reset();
   }
+  if (probe_ != nullptr) probe_->SetLayer(-1);
   // quant2 stack exit, as RunChunk's (docs/quant2.md section 3.1): all T rows, before FinalLmHead
   // (every row) and before mtp_last_hidden_ = cur below, which DecodeStepMtpImpl copies into
   // mtp_seed_hidden_.
@@ -2015,7 +2040,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 
   mtp_last_hidden_ = cur;  // valid until the next RunChunk/VerifyWindow's EmbedTokens overwrites it
 
+  probe_call.End();
   stream_.Synchronize();  // same hazard class as RunChunk's own D2H -- see that method's comment
+  if (probe_ != nullptr) probe_->Collect(stream_.get());
 
   std::vector<int32_t> preds(static_cast<size_t>(T));
   if (comm_ != nullptr) {
@@ -2185,6 +2212,10 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
   }
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
+  // R4DX_CLOCK_PROBE's round composition (debug_probe.h): the round, its drafter, and
+  // VerifyWindow's own call; inert when off.
+  ProbeScope probe_round(probe_, stream_.get(), "mtp_round", k);
+  ProbeScope probe_draft(probe_, stream_.get(), "mtp_draft", k);
 
   std::vector<int32_t> drafts;
   if (k > 0) {
@@ -2209,6 +2240,7 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                   {token_id}, container_.EmbedTokensHost(), cfg.vocab_size);
     arena_.Reset();
   }
+  probe_draft.End(/*host_done=*/true);
 
   // Verify [token_id, d1..dk] in one pass and resolve the round -- greedy (argmax acceptance) or
   // sampled (sample-and-match), in the one shared implementation. Commits nothing.
@@ -2216,6 +2248,7 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
   std::vector<int32_t> result =
       VerifyAndResolveRound(token_id, drafts, params, rng, &num_accepted_drafts);
   const int64_t num_committed = num_accepted_drafts + 1;  // +1 for token_id itself
+  if (probe_ != nullptr) probe_->SetCommitted(num_committed);
 
   // Thread this round's acceptance count into the NEXT GDN decode/verify call (gdn_state.h's file
   // comment) and advance pos_ by exactly what was committed -- NOT by candidates.size(), which
@@ -2231,7 +2264,9 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
   R4DX_HIP_CHECK(hipMemcpyAsync(
       mtp_seed_hidden_.data(), mtp_last_hidden_ + num_accepted_drafts * hidden,
       static_cast<size_t>(hidden) * sizeof(uint16_t), hipMemcpyDeviceToDevice, stream_.get()));
+  probe_round.End();
   stream_.Synchronize();
+  if (probe_ != nullptr) probe_->Collect(stream_.get());
 
   return result;
 }
@@ -2314,8 +2349,13 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
   const DflashEmbeddingProvider embed = MakeTargetEmbeddingProvider(container_);
   const DflashLmHeadProvider lm_head_provider = MakeTargetLmHeadProvider(container_);
 
+  // R4DX_CLOCK_PROBE's round composition (debug_probe.h): the round, its drafter, VerifyWindow's
+  // own call and the injection; inert when off.
+  ProbeScope probe_round(probe_, stream_.get(), "dflash_round", k);
+  ProbeScope probe_draft(probe_, stream_.get(), "dflash_draft", k);
   const DflashDraftResult draft = dflash_->DraftRound(stream_, arena_, token_id, k, p_min, n_min,
                                                        embed, lm_head_provider, trace_out);
+  probe_draft.End(/*host_done=*/true);
   arena_.Reset();
   if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
   if (drafted_tokens_out != nullptr) *drafted_tokens_out = draft.tokens;
@@ -2348,14 +2388,20 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
         std::to_string(DflashFeatureRows()) + ") than the accepted prefix (" +
         std::to_string(num_committed) + ")");
   }
+  ProbeScope probe_inject(probe_, stream_.get(), "dflash_inject", num_committed);
   dflash_->InjectFeatures(stream_, arena_, DflashFeatureBuffer(), num_committed,
                           dflash_->InjectedCount());
+  probe_inject.End(/*host_done=*/true);
   arena_.Reset();
 
   // Advances pos_ by exactly num_committed and threads the GDN acceptance count, identically to
   // DecodeStepMtpGreedy's own commit block above (this is exactly what CommitVerifiedWindow factors
   // out for a non-MTP drafter to call -- model.h's own doc comment on that method).
   CommitVerifiedWindow(num_committed);
+  if (probe_ != nullptr) probe_->SetCommitted(num_committed);
+  // No synchronize ends a DFlash round (the injection runs on while the caller takes the tokens):
+  // the round's host time ends here, and its stamps are read back by the next Collect.
+  probe_round.End(/*host_done=*/true);
 
   return result;
 }

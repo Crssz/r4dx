@@ -431,6 +431,7 @@ class MtpTaps:
         self.ref = ref
         self.result = result
         self.want_draft_head = want_draft_head
+        self.fc_hook = None  # optional (x, fc_out) -> fc_out, see hessian_capture.install_gemm_guard
         self.eps = float(ref.text_config.rms_norm_eps)
         # The MTP layer is a COMPLETE full-attention decoder layer (src/convert/main.cpp's own
         # verified note), so build it against a full_attention layer index of the text config.
@@ -493,7 +494,10 @@ class MtpTaps:
         emb = gather_embedding_rows(ref.index, list(token_ids[1:]), ref.device, ref.dtype)[0]
         x = torch.cat([zero_centered_rmsnorm(emb, self.pre_emb_w, self.eps),
                        zero_centered_rmsnorm(h, self.pre_hid_w, self.eps)], dim=-1)
-        fc_out = torch.nn.functional.linear(x, self.fc).unsqueeze(0)  # [1, n, hidden]
+        fc_out = torch.nn.functional.linear(x, self.fc)
+        if self.fc_hook is not None:  # hessian_capture's GemmGuard (a checked recompute)
+            fc_out = self.fc_hook(x, fc_out)
+        fc_out = fc_out.unsqueeze(0)  # [1, n, hidden]
         cos, sin = ref._manual_rope(n)
         out = self.layer(hidden_states=fc_out, position_embeddings=(cos, sin),
                          attention_mask=ref._manual_mask(n), position_ids=None,

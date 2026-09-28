@@ -1463,6 +1463,69 @@ class CaptureState:
     rms_written: dict[str, dict] = field(default_factory=dict)
     rms_eps: dict[str, float] = field(default_factory=dict)
     rms_scale: dict[str, np.ndarray] = field(default_factory=dict)
+    #: GemmGuard's record: recomputed linears (transient garbage outputs replaced), large outputs a
+    #: recompute confirmed as real, and the first events.
+    gemm_guard: dict = field(default_factory=lambda: {"recomputed": 0, "confirmed_large": 0,
+                                                      "failed": 0, "events": []})
+
+
+#: A linear output with a non-finite value or |y| above this is recomputed once (GemmGuard).
+GEMM_GUARD_LIMIT = 1e5
+
+
+def install_gemm_guard(module, st: "CaptureState", where: str) -> list:
+    """Forward hooks on every nn.Linear under `module`: an output that is non-finite or above
+    GEMM_GUARD_LIMIT is recomputed with the same F.linear; a bit-equal recompute means the values
+    are real and are kept, a different one replaces the output (and must itself be clean, else the
+    capture stops). Why: torch 2.9.1+rocmsdk20260116 on gfx1201 (both R9700s) sporadically returns
+    garbage tiles (|y| 1e7..1e36, 64 columns, rows of one sequence) from the k_proj / v_proj GEMM
+    (N=1024) inside the full-attention layer -- ~1 in 1000 layer calls in a stress test, never on a
+    recompute; the huihui capture of 2026-09-28 got inf in L03.out / L07.out / mtp.out from it.
+    Clean outputs are untouched, so a capture without events is byte-identical to one without the
+    guard."""
+    import torch
+    import torch.nn.functional as F
+
+    def make(name):
+        def hook(m, inputs, out):
+            fixed = guard_linear(inputs[0], m.weight, m.bias, out, st, f"{where}.{name}")
+            return None if fixed is out else fixed
+        return hook
+
+    return [m.register_forward_hook(make(n)) for n, m in module.named_modules()
+            if isinstance(m, torch.nn.Linear)]
+
+
+def guard_linear(x, weight, bias, out, st: "CaptureState", where: str):
+    """install_gemm_guard's check for one `out = F.linear(x, weight, bias)`: returns `out` itself
+    when it is clean or a recompute reproduces it bit for bit, else the (clean) recompute."""
+    import torch
+    import torch.nn.functional as F
+
+    g = st.gemm_guard
+
+    def suspicious(y) -> bool:
+        return bool((~torch.isfinite(y) | (y.abs() > GEMM_GUARD_LIMIT)).any())
+
+    if not suspicious(out):
+        return out
+    again = F.linear(x, weight, bias)
+    if torch.equal(again, out):
+        g["confirmed_large"] += 1
+        return out
+    ev = f"{where}: max |y| {out.float().abs().max().item():.3e} -> recomputed"
+    if suspicious(again):
+        third = F.linear(x, weight, bias)
+        if not torch.equal(third, again):
+            g["failed"] += 1
+            raise RuntimeError(f"[hessian] GemmGuard: {where} gave three different outputs; "
+                               f"refusing to accumulate")
+        ev += " (recompute confirmed large on a third run)"
+    g["recomputed"] += 1
+    if len(g["events"]) < 100:
+        g["events"].append(ev)
+    print(f"[hessian] GemmGuard: {ev}", flush=True)
+    return again
 
 
 def _write_accum(out_dir: Path, plan, acc: HessianAccum, st: CaptureState,
@@ -1556,6 +1619,7 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                 st.rms_scale[rp.file] = (1.0 + norm.weight.detach().float()).cpu().numpy()
                 handles.append(norm.register_forward_pre_hook(
                     lambda _m, inputs, _acc=acc, _eps=eps: _acc.update(rms_weightless(inputs[0], _eps))))
+            handles += install_gemm_guard(layer, st, f"L{i:02d}")
             gated = i in gate_layers
             if gated:
                 handles += st.shared_gate.install(layer, i, gate_layers[i])
@@ -1633,6 +1697,8 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                         anomalies.append(msg)
                         print(f"[hessian] MTP o_proj input anomaly: {msg}", flush=True)
                 watch = mtp.layer.self_attn.o_proj.register_forward_pre_hook(_watch)
+                guard = install_gemm_guard(mtp.layer, st, "mtp")
+                mtp.fc_hook = lambda x, y: guard_linear(x, mtp.fc, None, y, st, "mtp.fc")
             try:
                 for j, s in enumerate(seqs):
                     cur["j"] = j
@@ -1645,9 +1711,13 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
             finally:
                 if watch is not None:
                     watch.remove()
+                    for hd in guard:
+                        hd.remove()
                 if mtp is not None:
                     mtp.close()
             print(f"[hessian] MTP o_proj input anomalies: {len(anomalies)}", flush=True)
+            if anomalies:
+                raise RuntimeError(f"[hessian] MTP o_proj input anomalies after GemmGuard: {anomalies[:3]}")
             del mtp
             print(f"[hessian] lm_head/mtp pass: {time.perf_counter() - t_head:.1f}s", flush=True)
             for p in head_plans:
@@ -2601,6 +2671,10 @@ def main() -> int:
         "seconds": seconds,
         "peak_vram_gib": peak,
         "peak_vram_reserved_gib": reserved,
+        "gemm_guard": {"limit": GEMM_GUARD_LIMIT, **st.gemm_guard,
+                       "rule": "a linear output with a non-finite value or |y| > limit is recomputed; "
+                               "a bit-equal recompute is kept as real, a different one replaces it "
+                               "(install_gemm_guard)"},
         "caveat": CAVEAT,
     }
     # --rms-taps: the rms files enter the manifest ("files", "rms_keys", "rms_capture") only if their

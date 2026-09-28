@@ -14,6 +14,13 @@
 # (docs/trellis-kernel.md 1, A3 / A3p). The first entry, or -Baseline, is what the tables compare
 # against.
 #
+# Tensor parallel: an entry may end in !<tp> (name=path[@binary][#layout]!2), or -Tp sets the default
+# for every entry (1). A TP=1 entry runs on HIP device 1 as before; a --tp 2 entry passes --tp 2
+# --tp-mode real with HIP_VISIBLE_DEVICES unset (docs/tp.md 9.2: rank 0 on device 1, rank 1 on
+# device 0), and bench.json gets each rank's VRAM (vram_rank0/1_gib device-wide, buffers_rank0/1_gib
+# this process's). --tp 2 caps --mtp at 7. The same entry path can appear twice with different names
+# (e.g. mix=...#trellis and mix_tp2=...#trellis!2) to interleave TP=1 and TP=2 on one binary.
+#
 # -Modes: plain, dflash<k> (--dflash -Dflash --dflash-k <k>) and mtp<k> (--mtp <k>); the default is
 # A3's three, plain, dflash7 and mtp3. -NoDflash drops the dflash modes (a container without an MTP
 # head needs -Modes plain,dflash7).
@@ -41,6 +48,7 @@ param(
   [string]$PrefillPromptFile = '',
   [string]$Baseline = '',
   [int]$MaxCpuPct = 20,
+  [ValidateSet(1, 2)][int]$Tp = 1,
   [switch]$NoDflash,
   [switch]$NoPrefill,
   [switch]$NoIdleWait
@@ -90,14 +98,24 @@ function Wait-Quiet {
 
 $entries = foreach ($c in $Container) {
   $name, $rest = $c -split '=', 2
+  $rest, $tpStr = $rest -split '!', 2
   $rest, $lay = $rest -split '#', 2
   $path, $bin = $rest -split '@', 2
   if (-not $bin) { $bin = $defaultCli }
   if (-not $lay) { $lay = $Layout }
+  $tpN = if ($tpStr) { [int]$tpStr } else { $Tp }
+  if ($tpN -notin 1, 2) { throw "[bench] ${name}: tp must be 1 or 2, got '$tpStr'" }
   if (-not (Test-Path $path)) { throw "[bench] ${name}: container $path not found" }
   if (-not (Test-Path $bin)) { throw "[bench] ${name}: binary $bin not found" }
-  [pscustomobject]@{ name = $name; path = $path; bin = $bin; layout = $lay }
+  [pscustomobject]@{ name = $name; path = $path; bin = $bin; layout = $lay; tp = $tpN }
 }
+foreach ($e in $entries) {
+  foreach ($m in $Modes) {
+    if ($e.tp -eq 2 -and $m -match '^mtp(\d+)$' -and [int]$Matches[1] -gt 7) { throw "[bench] $($e.name): --tp 2 caps --mtp at 7 ($m)" }
+  }
+}
+# The extra flags and the device environment of one entry.
+function TpArgs($e) { if ($e.tp -eq 2) { return @('--tp', '2', '--tp-mode', 'real') } else { return @() } }
 if (-not $Baseline) { $Baseline = $entries[0].name }
 if (-not ($entries | Where-Object { $_.name -eq $Baseline })) { throw "[bench] -Baseline $Baseline is not an entry" }
 $modes = @($Modes | Where-Object { -not ($NoDflash -and $_ -match '^dflash') })
@@ -110,6 +128,8 @@ $results = @()
 # output -- error records, and under 'Stop' the first one would abort; judge by the exit code).
 function Invoke-Cli($e, [string[]]$cliArgs, [string[]]$stdin, [string]$log) {
   Wait-Quiet
+  if ($e.tp -eq 2) { Remove-Item Env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue } else { $env:HIP_VISIBLE_DEVICES = '1' }
+  $cliArgs = @($cliArgs) + @(TpArgs $e)
   $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
     if ($stdin) { $out = @($stdin | & $e.bin @cliArgs 2>&1 | ForEach-Object { "$_" }) }
@@ -132,7 +152,7 @@ for ($r = 1; $r -le $Runs; $r++) {
         $res = Invoke-Cli $e $cliArgs $null $log
         $code = $res.code; $out = $res.out
         $text = ($out | Where-Object { $_ -notmatch '^\[' -and $_ -notmatch 'NativeCommandError|CategoryInfo|^\s*At |^\s*\+ ' }) -join "`n"
-        $row = [ordered]@{ name = $e.name; layout = $e.layout; mode = $m; prompt = $p; run = $r; exit = $code
+        $row = [ordered]@{ name = $e.name; layout = $e.layout; tp = $e.tp; mode = $m; prompt = $p; run = $r; exit = $code
                            decode_tok_s = $null; tokens = $null; decode_s = $null; prefill_tokens = $null
                            prefill_s = $null; accept_pct = $null; tok_per_round = $null; vram_gib = $null
                            text_sha256 = [BitConverter]::ToString(
@@ -145,6 +165,14 @@ for ($r = 1; $r -le $Runs; $r++) {
         }
         if ($s -match '\[stats\] (?:dflash|mtp): .*\(([\d.]+)% acceptance, ([\d.]+) tok/round') {
           $row.accept_pct = [double]$Matches[1]; $row.tok_per_round = [double]$Matches[2]
+        }
+        if ($e.tp -eq 2) {
+          # One line per rank after load and again after generation; the last one of each rank counts.
+          foreach ($l in $out) {
+            if ($l -match '\[stats\] tp rank (\d) \(HIP device \d+\): VRAM used ([\d.]+) GiB.*buffers ([\d.]+) GiB') {
+              $row["vram_rank$($Matches[1])_gib"] = [double]$Matches[2]; $row["buffers_rank$($Matches[1])_gib"] = [double]$Matches[3]
+            }
+          }
         }
         $results += [pscustomobject]$row
         Write-Host ("[bench] run {0} {1,-10} p{2} {3,-8} {4,7} tok/s  {5} tok  exit {6}" -f $r, $e.name, $p, $m, $row.decode_tok_s, $row.tokens, $code)
@@ -161,7 +189,7 @@ for ($r = 1; $r -le $Runs; $r++) {
         $null = $_ -match '\[stats\] prefill: (\d+) tok in ([\d.]+)s'; , @([int]$Matches[1], [double]$Matches[2]) })
       $reprefill = [bool]($out | Where-Object { $_ -match 'did not extend the previous token prefix' })
       for ($t = 1; $t -lt $turns.Count; $t++) {   # turn 0 is the warm-up
-        $row = [ordered]@{ name = $e.name; layout = $e.layout; mode = 'prefill'; prompt = $t - 1; run = $r; exit = $code
+        $row = [ordered]@{ name = $e.name; layout = $e.layout; tp = $e.tp; mode = 'prefill'; prompt = $t - 1; run = $r; exit = $code
                            prefill_tokens = $turns[$t][0]; prefill_s = $turns[$t][1]
                            prefill_tok_s = $(if ($turns[$t][1] -gt 0) { [math]::Round($turns[$t][0] / $turns[$t][1], 2) } else { $null })
                            counted = ($turns[$t][0] -ge 256); reprefill_warning = $reprefill }
@@ -188,6 +216,7 @@ function RunRate($rows) {
   $sec = ($rows | Measure-Object decode_s -Sum).Sum
   if ($sec) { return ($rows | Measure-Object tokens -Sum).Sum / $sec } else { return $null }
 }
+function LayoutCell($e) { if ($e.tp -eq 2) { return "$($e.layout), tp 2" } else { return $e.layout } }
 $medRun = @{}
 foreach ($e in $entries) {
   foreach ($m in $modes) {
@@ -215,9 +244,24 @@ foreach ($e in $entries) {
     $med = $medRun["$($e.name)|$m"]
     $base = $medRun["$Baseline|$m"]
     $vs = if ($med -and $base) { '{0:+0.00;-0.00}%' -f (100 * ($med / $base - 1)) } else { '--' }
-    $md += "| $($e.name) | $($e.layout) | $m | $($cells -join ' | ') | **$(if ($agg) { [math]::Round($agg, 2) } else { '--' })** | $(if ($med) { [math]::Round($med, 2) } else { '--' }) | $vs | $stable |"
+    $md += "| $($e.name) | $(LayoutCell $e) | $m | $($cells -join ' | ') | **$(if ($agg) { [math]::Round($agg, 2) } else { '--' })** | $(if ($med) { [math]::Round($med, 2) } else { '--' }) | $vs | $stable |"
   }
 }
+$vramRows = @()
+foreach ($e in $entries) {
+  foreach ($m in $modes) {
+    $rs = @($results | Where-Object { $_.name -eq $e.name -and $_.mode -eq $m -and $_.decode_s })
+    if (-not $rs.Count) { continue }
+    $mx = { param($f) $v = @($rs | ForEach-Object { $_.$f } | Where-Object { $_ -ne $null }); if ($v.Count) { ($v | Measure-Object -Maximum).Maximum } else { '--' } }
+    if ($e.tp -eq 2) {
+      $vramRows += "| $($e.name) | $(LayoutCell $e) | $m | $(& $mx 'vram_rank0_gib') ($(& $mx 'buffers_rank0_gib')) | $(& $mx 'vram_rank1_gib') ($(& $mx 'buffers_rank1_gib')) |"
+    } else {
+      $vramRows += "| $($e.name) | $(LayoutCell $e) | $m | $(& $mx 'vram_gib') | -- |"
+    }
+  }
+}
+$md += @('', 'VRAM used, GiB (max over runs; tp 2: device-wide per rank, this process''s buffers in parentheses)', '',
+         '| container | layout | mode | device 1 (rank 0) | device 0 (rank 1) |', '|---|---|---|--:|--:|') + $vramRows
 if (-not $NoPrefill -and $prefillPrompts.Count) {
   $pre = @{}
   foreach ($e in $entries) {
@@ -236,7 +280,7 @@ if (-not $NoPrefill -and $prefillPrompts.Count) {
       $cells += if ($rs.Count) { "$($rs[0].prefill_tokens) tok: $([math]::Round((($rs | Measure-Object prefill_tok_s -Average).Average), 1))" } else { '--' }
     }
     $x = if ($pre[$e.name] -and $pre[$Baseline]) { '{0:0.000}' -f ($pre[$e.name] / $pre[$Baseline]) } else { '--' }
-    $md += "| $($e.name) | $($e.layout) | $($cells -join ' | ') | **$(if ($pre[$e.name]) { [math]::Round($pre[$e.name], 1) } else { '--' })** | $x |"
+    $md += "| $($e.name) | $(LayoutCell $e) | $($cells -join ' | ') | **$(if ($pre[$e.name]) { [math]::Round($pre[$e.name], 1) } else { '--' })** | $x |"
   }
 }
 $md | Set-Content -Encoding utf8 (Join-Path $OutDir 'bench.md')

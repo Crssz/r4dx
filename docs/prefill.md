@@ -25,11 +25,13 @@ are in `D:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and ar
 | 8k | 8145 | 7.23 / 7.28 | 1123 | - | - | - |
 | 32k | 32623 | 38.41 / 38.56 | 848 | 33.10 / 33.58 | 979 | 1.15x |
 | 64k | 65529 | 103.03 / 102.94 | 636 | - | - | - |
-| 128k | 130884 | 309.21 / 309.05 | 423 | 293.36 (1 run) | 446 | 1.05x |
+| 128k | 130884 | 309.21 / 309.05 | 423 | 293.36 / 316.13 | 429 | 1.01x |
 
 - **TP=1:** HIP device 1, binary built at 60e6fae. K4m gives 37.6 s at 32k and 304.3 s at 128k.
 - **TP=2:** `--tp 2 --tp-mode real` on both GPUs, with the dense pre-M1 binary. The `git` field of
-  that jsonl is only the worktree HEAD label, which says 4b04ece.
+  that jsonl is only the worktree HEAD label, which says 4b04ece. The 128k run 2 was lost to the
+  power-off below and rerun after M1 (`profile\ttft-dense-tp2\resume-run2`, whose jsonl says run 1).
+  It is 7.8% slower than run 1; the M1 final TP=2 table compares against the mean of the two.
 - **Why TP=2 barely helps at depth:** a TP=2 rank has 2 KV heads, so its attention call launches 2
   workgroups. The call takes as long as at TP=1 (10.71 vs 10.52 ms at 123k), so only the linears
   get faster.
@@ -413,7 +415,7 @@ other equally accurate rounding members keep it.
   bench (`validate\decode_bench.log`: dflash7 116.37 vs 116.15 main, plain 36.54 vs 36.61) covers
   the same decode code.
 
-**TP=2: not run.** TP=2 cold TTFT at 32k and 128k (split-KV and exact) and TP=2 short-prompt
+**TP=2: not run in this pass** (done later: see [M1 final](#m1-final-exact-by-default-split-kv-opt-in)). TP=2 cold TTFT at 32k and 128k (split-KV and exact) and TP=2 short-prompt
 identity against main TP=2 need device 0. Device 0 is held until M0's own TP=2 128k run 2 finishes
 and writes `D:\models\r4dx\prefill-m0\TP2_DONE`, and that marker did not appear during this pass.
 To run them afterwards (the phase script is in this session's scratchpad, and its steps are the
@@ -432,7 +434,8 @@ call at 123k, against 2.5x for exact.
 | split-KV (branch default) | **fails** on 3 of 9 segments | equal (slightly better at depth) | 128k equal; 32k one knife-edge vt flip, not seen at S=4/16 | 2.01x (target 2x: met) |
 | exact-wide (`=exact`) | **passes** (bit-identical) | identical | identical | 1.51x (target: missed) |
 
-No single variant meets both the lossless gate and the 2x target. Nothing is merged to main.
+No single variant meets both the lossless gate and the 2x target at TP=1. Nothing was merged to
+main at this point; option 1 was chosen (M1 final, below).
 Options:
 
 1. **Exact as the default, split-KV opt-in.** Lossless by construction, 1.5x at 128k, 1.3x at 64k.
@@ -471,9 +474,38 @@ prefill attention is the exact-wide launch, and split-KV stays one environment v
 - The parse is `ParsePrefillAttnMode` in `attention_layer.hpp`. `test_attn_layer` checks it on the
   CPU before its data-presence skip.
 
-**Checks with the new default** (this commit's build, HIP device 1, outputs in
+**Checks with the new default** (the `1af310d` build, HIP device 1, outputs in
 `D:\models\r4dx\prefill-m1\final\`):
 - `ctest -LE tp2gpu`: 95/95 passed, including `test_attn_prefill_splitkv` and the parse check in
   `test_attn_layer`.
 - Short-prompt greedy identity against main at TP=1 (plain, dflash7 and mtp3, 4 prompts each from
   `tests/model/mtp_prompts.txt`): 12/12 byte-identical text and token ids.
+
+### TP=2 (both GPUs, `--tp 2 --tp-mode real`)
+
+Cold TTFT (`ttft_cli.ps1 -Tp 2`, 2 runs, prefill seconds), the `1af310d` build; the dense column is
+M0's pre-M1 binary (128k run 2 measured the same evening as the M1 runs):
+
+| length | dense (M0) | exact (default) | split-KV (`=split`) | exact vs dense | split-KV vs dense |
+|---|---|---|---|---|---|
+| 32k | 33.10 / 33.58 | 26.23 / 26.35 | 23.16 / 23.49 | 1.27x | 1.43x |
+| 128k | 293.36 / 316.13 | 166.62 / 168.86 | 104.60 / 106.32 | 1.82x | 2.89x |
+
+TP=2 against TP=1 (the TP=1 M1 validation table, means of 2 runs):
+
+| length | exact TP=1 -> TP=2 | split-KV TP=1 -> TP=2 | dense TP=1 -> TP=2 (M0) |
+|---|---|---|---|
+| 32k | 33.78 -> 26.29 s (1.28x) | 31.24 -> 23.33 s (1.34x) | 38.49 -> 33.34 s (1.15x) |
+| 128k | 199.52 -> 167.74 s (1.19x) | 149.85 -> 105.46 s (1.42x) | 309.13 -> 304.74 s (1.01x) |
+
+- Exact gives a TP=2 rank 16 workgroups per call (2 KV heads x 8), so TP=2 now scales at depth
+  instead of being bound by a 2-workgroup attention call. Split-KV gives each rank 16 segments and
+  scales further.
+- Short-prompt greedy identity against main's TP=2 (plain, dflash7 and mtp3, 4 prompts each,
+  `--tp 2 --tp-mode real`): 12/12 byte-identical text and token ids.
+- Outputs: `D:\models\r4dx\prefill-m1\final\` (`ttft\`, `identity_tp2\`, `phases.log`, and the
+  runner `final.ps1`).
+
+**Final default:** exact-wide (lossless: bit-identical to dense at TP=1 and TP=2). 1.51x at 128k
+TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) stays opt-in for
+2.0x (TP=1) and 2.9x (TP=2) at 128k, with rounding-class drift against the dense bits.

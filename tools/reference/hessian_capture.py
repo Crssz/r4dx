@@ -1584,6 +1584,20 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                 _write_accum(out_dir, rp, rms_accs.pop(rp.file), st, rms=True)
             st.layer_seconds.append(time.perf_counter() - t_layer)
 
+        # Diagnostics (huihui capture, 2026-09-28: mtp.out.hess came out with inf in heads 12-17,
+        # dims 0-63, from activations ~1e20 that a synthetic MTP run does not reproduce).
+        # $env:R4DX_HESSIAN_SAVE_STACK=<dir> saves the stack's output (the pre-final-norm residual
+        # of every sequence, bf16) so the head pass can be re-run and studied without the stack.
+        save_stack = os.environ.get("R4DX_HESSIAN_SAVE_STACK")
+        if save_stack and n_run == ref.n_layers:
+            sdir = Path(save_stack)
+            sdir.mkdir(parents=True, exist_ok=True)
+            t_save = time.perf_counter()
+            torch.save({"hidden": [h.cpu() for h in hidden],
+                        "token_ids": [list(s.token_ids) for s in seqs]}, sdir / "stack_output.pt")
+            print(f"[hessian] saved the stack output to {sdir / 'stack_output.pt'} "
+                  f"({time.perf_counter() - t_save:.1f}s)", flush=True)
+
         # lm_head + MTP: both consume the stack's output, one pass over the sequences.
         head_plans = [p for p in plans if p.scope in ("lm_head", "mtp")]
         if head_plans:
@@ -1603,8 +1617,25 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
             if mtp_specs:
                 mtp = MtpTaps(ref, mtp_specs, result,
                               want_draft_head and "mtp.draft_head.lm_head" in result.accums)
+            # Report (never alter) any MTP o_proj input that is non-finite or above 1e4 in magnitude.
+            anomalies: list[str] = []
+            cur = {"j": -1}
+            watch = None
+            if mtp is not None:
+                def _watch(_m, inputs):
+                    x = inputs[0].detach()
+                    bad = ~torch.isfinite(x) | (x.abs() > 1e4)
+                    if bool(bad.any()):
+                        r = torch.nonzero(bad.reshape(-1, x.shape[-1]).any(-1)).flatten().tolist()
+                        c = torch.nonzero(bad.reshape(-1, x.shape[-1]).any(0)).flatten().tolist()
+                        msg = (f"seq {cur['j']}: {len(r)} row(s) {r[:8]}, {len(c)} channel(s) "
+                               f"{c[:4]}..{c[-4:]}, max |x| {x.float().abs().max().item():.3e}")
+                        anomalies.append(msg)
+                        print(f"[hessian] MTP o_proj input anomaly: {msg}", flush=True)
+                watch = mtp.layer.self_attn.o_proj.register_forward_pre_hook(_watch)
             try:
                 for j, s in enumerate(seqs):
+                    cur["j"] = j
                     pre = hidden[j].to(dev)  # [1, T, hidden], the PRE-final-norm residual
                     if lm_acc is not None:
                         lm_acc.update(ref.model.norm(pre))
@@ -1612,8 +1643,11 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                         mtp.run(pre[0], s.token_ids)
                     del pre
             finally:
+                if watch is not None:
+                    watch.remove()
                 if mtp is not None:
                     mtp.close()
+            print(f"[hessian] MTP o_proj input anomalies: {len(anomalies)}", flush=True)
             del mtp
             print(f"[hessian] lm_head/mtp pass: {time.perf_counter() - t_head:.1f}s", flush=True)
             for p in head_plans:

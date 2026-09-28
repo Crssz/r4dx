@@ -23,7 +23,9 @@
 //   R4DX_PROBE_TIMELINE=<file>  Also write every span as it is collected, one CSV line each: call
 //                           kind, T, call serial, span name, layer, start (us after the call's
 //                           first stamp), duration (us). What found docs/trellis-kernel.md 10.6's
-//                           pattern: which layers' GEMMs ran slow, step after step.
+//                           pattern: which layers' GEMMs ran slow, step after step. Every call
+//                           also gets one row of its own: span name "call", layer -1, start 0,
+//                           duration = the call's whole GPU span (so "other" = call - spans).
 //
 // Every model call that runs the layer stack is a "call" with its own GPU span (a stamp before its
 // first kernel and one after its last) and host times: prefill (a RunChunk prefill chunk), decode

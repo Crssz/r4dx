@@ -131,6 +131,12 @@ add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
 add_executable(tool_sampler_bench tool_sampler_bench.cpp)
 target_link_libraries(tool_sampler_bench PRIVATE r4dx_core r4dx_kernels r4d_core)
 
+# tool_attn_prefill_bench: prefill M0 (tools/prefill) -- the production prefill attention call at
+# context depth D, today's 64-row chunk against bigger chunks and an emulated split-KV partial pass.
+# Built, never add_test()'d, same convention as tool_sampler_bench.
+add_executable(tool_attn_prefill_bench tool_attn_prefill_bench.cpp)
+target_link_libraries(tool_attn_prefill_bench PRIVATE r4dx_core r4d_core)
+
 # tool_trellis_gemm_bench: trellis milestone M1's measurements (docs/trellis-kernel.md 4.6, 6
 # "Benches"): the 336-GEMM decode-step replay against production w4a16, op rates and WMMA/VALU/
 # memory overlap, the split-group tail and the M = 64 prefill shape; and M2's full-linear replay

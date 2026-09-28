@@ -23,6 +23,9 @@ committed.
 | `run_kl.ps1` | Runs `tool_teacher_forced_logprobs --tail-rows 256`. The prefix goes through one chunked `Prefill`, and only the 256 continuation rows are dumped (fp16, about 121 MiB per segment). |
 | `kl_compare.py` | Compares a reference dump with a variant dump: mean, median, p99 and max KL, top-1 and top-5 agreement, and perplexity. Reported per segment, per length and overall, with each side's prefill seconds. |
 | `ttft_cli.ps1` | Measures cold TTFT through `r4dx-cli --prompt-file ... --stats`, one fresh process per run. `-ProfilePrefill` prints the `--profile-prefill` per-op table (the attention-share profile). |
+| `warm_delta.py` / `warm_delta.ps1` | Warm-turn cost at depth: a cold 32k/64k prompt, then a ~4k-token user turn appended through the server's prefix reuse (plus the same 4k cold at offset 0). Writes `warm_delta.jsonl` with each request's `timings`. |
+| `probe_depth.py` | Per-chunk prefill time vs depth (linears by class, chunked GDN, attention core, other) from the in-model probe timeline: run the CLI with `R4DX_PROFILE_LINEARS=all` and `R4DX_PROBE_TIMELINE=<csv>` (src/model/debug_probe.h; about 1% overhead at 128k), then `probe_depth.py --timeline <csv> --out <json>`. |
+| `tests/kernels/tool_attn_prefill_bench` | The prefill attention kernel alone at depth D: today's 64-row call vs bigger q_len and an emulated split-KV partial pass (`--depths`, `--qlens`, `--splits`, `--out`). |
 
 Engine changes made for this kit:
 - `r4dx-cli --prompt-file <path>`: the Windows command line caps `--prompt` at 32767 characters, which is about 8k tokens.

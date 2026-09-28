@@ -268,6 +268,13 @@ void DebugProbe::Collect(hipStream_t s) {
     const Key key{c.kind, c.T};
     CallAgg& a = call_agg_[key];
     a.gpu_ms.push_back(gpu);
+    // The call's own GPU span as a timeline row (span name "call", layer -1, start 0), so a reader
+    // can take "other" = call - sum(spans) per call (tools/prefill/probe_depth.py).
+    if (timeline_ != nullptr) {
+      std::fprintf(timeline_, "%s,%lld,%llu,call,-1,0.000,%.3f\n", c.kind.c_str(),
+                   static_cast<long long>(c.T), static_cast<unsigned long long>(c.serial),
+                   gpu * 1000.0);
+    }
     a.host_ms.push_back(c.host_e - c.host_b);
     double gap = -1.0;
     if (c.parent < 0) {

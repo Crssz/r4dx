@@ -51,7 +51,9 @@ nlohmann::json ReadMetadata(const std::string& path) {
 //
 // A container written before the group was recorded has no `quant` block at all; those are group
 // 128 by construction (it was the only group that ever existed) and load unchanged on a group-128
-// build, so nothing that loads today stops loading.
+// build. This check skips them; on any other build CheckW4a16Shape (and the TP loader's part-size
+// check) refuses their scales instead, since both size them at the group the kernel will read
+// (W4a16LoadGroups::KernelGroup), not at the unrecorded default.
 //
 // SCOPE (adversarial-review fix): the check fires only when THIS load will actually read
 // `.w4a16.wsz` bytes, i.e. when one of the three layout selections below is `kW4a16`. The hazard
@@ -83,6 +85,16 @@ struct W4a16LoadGroups {
       CheckW4a16Group(groups.default_group, path);
     }
     return groups.QuantLinearGroup(base);
+  }
+
+  // The group the kernel will stride `base`'s scales at: its mapped group, else this build's
+  // default (QuantLinear::w4a16_group 0 -> r4d_gemm_w4a16_nt_m64_group()). The scale tensor's size
+  // is checked (CheckW4a16Shape) and its TP slice cut at THIS group, not at the container's
+  // recorded default: a container with no `quant.w4a16.group` parses to default 128 and skips
+  // CheckW4a16Group, so on a group-64 build only the size check stands between its N*K/128 scale
+  // dwords and a kernel that reads N*K/64 of them.
+  int KernelGroup(const std::string& base) const {
+    return groups.Mapped(base) ? groups.GroupFor(base) : r4d_gemm_w4a16_nt_m64_group();
   }
 };
 
@@ -360,7 +372,8 @@ core::DeviceBuffer<float> UploadWidenedF16(const SafetensorsReader& r, const std
   return UploadWidenedF16Bytes(r.Data(name), static_cast<size_t>(n) * 2);
 }
 
-// quant2 Q3: the byte sizes a w4a16 linear [N, K] at `group` must have on disk -- `.w4a16.wq`
+// quant2 Q3: the byte sizes a w4a16 linear [N, K] at `group` (the group the kernel will read it at,
+// W4a16LoadGroups::KernelGroup) must have on disk -- `.w4a16.wq`
 // N*K/2, the scales N*(K/group) dwords -- plus the kernel's shape rules at that group (K % group,
 // K % 64 for the packed block, N % 16). The tensor-parallel loader checks every part's size
 // against its [N, K] already (ShardLoader::Part); this is the TP=1 path's counterpart, so a scale
@@ -441,7 +454,7 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const LinearLoadMeta& me
       // quant2 Q3: the linear's own group and scale name (the bare `.w4a16.wsz` unless mapped).
       q.w4a16_group = w4a16.Resolve(base);
       const std::string wsz = w4a16.groups.WszName(base);
-      CheckW4a16Shape(r, base, wsz, N, K, w4a16.groups.GroupFor(base));
+      CheckW4a16Shape(r, base, wsz, N, K, w4a16.KernelGroup(base));
       q.wq = UploadRawU8(r, base + ".w4a16.wq");
       q.w4a16_wsz = UploadRawU32(r, wsz);
       break;
@@ -1131,7 +1144,7 @@ class ShardLoader {
         q.w4a16_group = w4a16_.Resolve(base);
         q.wq = Part<uint8_t>(base + ".w4a16.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
         q.w4a16_wsz = Part<uint32_t>(w4a16_.groups.WszName(base),
-                                     shape(tp::Part::kW4a16Wsz, w4a16_.groups.GroupFor(base)), rule,
+                                     shape(tp::Part::kW4a16Wsz, w4a16_.KernelGroup(base)), rule,
                                      rows, cols);
         break;
       case Layout::kW4a8:
@@ -1359,7 +1372,8 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   }
   // The groups the container's w4a16 scales were packed at -- the wsz stride per 16-row tile
   // (docs/tp.md 4.3) -- now per tensor (quant2 Q3): `w4a16` above. A container that predates the
-  // `quant` block is group 128, CheckQuantGroups' own rule (ParseW4a16Groups' default).
+  // `quant` block is group 128, CheckQuantGroups' own rule (ParseW4a16Groups' default); ShardLoader
+  // sizes and slices each scale tensor at W4a16LoadGroups::KernelGroup, the group the kernel reads.
   // quant2: the TP=1 path's parse, before any upload (docs/quant2.md section 3.1).
   const std::optional<RotationSpec> rotation =
       ParseRotationMetadata(metadata, c.global_config_, path);

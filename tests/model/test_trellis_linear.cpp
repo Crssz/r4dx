@@ -42,8 +42,9 @@
 //              prescale out of range, a reconstruction check that did not pass (pending, FAILED,
 //              failed != 0, checked != the HF tensors, no record), a .trellis tensor without an
 //              entry, an entry without its tensors, byte sizes / parts that do not match the shape,
-//              and a rotated trellis container; and, LoadShard only, a part boundary a rank's rows
-//              cross. (A rank range that is not whole 128-blocks cannot be reached by a header
+//              a rotated trellis container, and a w4a16 head whose unrecorded group hides scales
+//              sized for another group than the kernel reads; and, LoadShard only, a part
+//              boundary a rank's rows cross. (A rank range that is not whole 128-blocks cannot be reached by a header
 //              patch: every tiny shape splits into whole blocks.)
 //
 // GPU test on HIP device 1 (ctest sets HIP_VISIBLE_DEVICES=1); SKIPs (77) when the tiny containers
@@ -758,6 +759,22 @@ void CheckRefusals(const std::string& tiny, Checker& ck) {
              {"kind", "q2a"}, {"seed", 1}, {"hidden", 5120}, {"block", 1024}};
        },
        Layout::kTrellis, "mutually exclusive"},
+      // The w4a16 lm_head of a container that does not record quant.w4a16.group (so it parses to
+      // the historical default 128 and CheckW4a16Group is skipped) with scales half the size the
+      // build's group needs -- on a group-64 build, exactly a group-128 wsz. The kernel reads the
+      // build's group, so the size check must be made at THAT group (W4a16LoadGroups::KernelGroup),
+      // not at the unrecorded 128, or N*K/64 dwords are read from an N*K/128 buffer.
+      {"unrecorded w4a16 group, half-size scales",
+       [&](nlohmann::json& h) {
+         h["__metadata__"]["quant"]["w4a16"].erase("group");
+         nlohmann::json& t = h["lm_head.w4a16.wsz"];
+         const uint64_t begin = t["data_offsets"][0].get<uint64_t>();
+         const uint64_t end = t["data_offsets"][1].get<uint64_t>();
+         const uint64_t half = (end - begin) / 2;
+         t["data_offsets"][1] = begin + half;
+         t["shape"] = {half / 4, 4};
+       },
+       Layout::kTrellis, "lm_head.w4a16.wsz' is "},
       // docs/trellis-kernel.md 2.4: gate_up's TP = 2 rows are each part's halves, so parts of
       // 384 + 1664 put rank 0's gate rows [0, 512) across the boundary. Legal at TP = 1.
       {"a part boundary a rank's rows cross",

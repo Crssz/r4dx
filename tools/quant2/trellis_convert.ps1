@@ -42,13 +42,13 @@ param(
   [string]$KlRoot = 'D:\models\r4dx\kl-trellis',
   [string]$ManifestSha256 = '',
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
-  [string]$HessianDir = 'C:\AI\r4dx-hessian\hessian-v2',
+  [string]$HessianDir = 'D:\models\r4dx\hessian\hessian-v2',
   [string]$KvCalib = 'D:\models\r4dx\qwen38-27b.kvcalib-full.json',
   [string]$Imatrix = 'D:\models\r4dx\qwen38-27b.imatrix.npz',
   [string]$LogDir = 'D:\models\r4dx\trellis-m3',
   [string]$Exe = '',
   [int]$Threads = 32,
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe',
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string]$Compare = ''                                   # e.g. D:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx
 )
 $ErrorActionPreference = 'Stop'
@@ -57,8 +57,9 @@ $ErrorActionPreference = 'Stop'
 $PSDefaultParameterValues = @{ 'Out-File:Encoding' = 'utf8' }
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 # Everything this script runs in Python (the pin, decode_bytes.py, compare_containers.py) is stdlib
-# only, so any Python 3 does when the reference venv is absent.
-if (-not (Test-Path $Python)) {
+# only, so any Python 3 does: -Python defaults to $env:R4DX_REFERENCE_VENV's interpreter when that is
+# set, else python on PATH, and falls back to python on PATH when the one given is absent.
+if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
   $cmd = Get-Command python -ErrorAction SilentlyContinue
   if (-not $cmd) { throw "[trellis] no Python at $Python nor on PATH" }
   Write-Host "[trellis] $Python is absent: using $($cmd.Source)"

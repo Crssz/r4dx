@@ -158,9 +158,31 @@ thread_local bool t_tp2_tuning = false;
 // them for the requested chunk is skipped like a w4a16 row at the wrong group. The one rule that
 // needs the linear -- no block across a two-part linear's part boundary -- is not known to the
 // pick; ApplyLinear's TrellisChunkTuning checks it.
-bool TrellisRowFits(int64_t N, int64_t K, int64_t M, const LinearTuning& t) {
+//
+// The chunk-independent rules are mirrored too, so a regenerated .inc row outside what the kernel
+// instantiates is skipped here rather than thrown at its first launch mid-request: the parameter
+// sets, Wc <= 256, WV*SK waves <= 1024 threads, SK*Wc*32 B of LDS <= 64 KiB, and the (KB, NP, U,
+// MT) instantiation table -- a copy of libr4d's r4d_tq_max_mt (r4d_gemm_trellis_nt_m64.hip), which
+// must be kept in step with it (the kernel's own check still throws if they drift).
+int TrellisMaxMt(int kb, int np, int u) {
+  if (kb != 4 && kb != 5) return 0;
+  switch (np) {
+    case 1: return u == 1 || u == 2 || u == 4 ? 4 : 0;
+    case 2: return u == 1 ? 4 : u == 2 ? 3 : u == 4 ? (kb == 4 ? 3 : 2) : 0;
+    case 4: return u == 1 ? 2 : u == 2 ? 1 : 0;
+    default: return 0;
+  }
+}
+
+bool TrellisRowFits(int64_t N, int64_t K, int64_t M, int kb, const LinearTuning& t) {
+  const auto pow2_upto = [](int v, int hi) { return v >= 1 && v <= hi && (v & (v - 1)) == 0; };
+  if (!pow2_upto(t.WV, 4) || !pow2_upto(t.SK, 16) || !pow2_upto(t.SKG, 8)) return false;
+  if (t.NT != 0 && t.NT != 1) return false;
+  if (t.MB < 1 || t.MB > TrellisMaxMt(kb, t.NPW, t.U)) return false;
   const int64_t wc = static_cast<int64_t>(t.WV) * t.NPW * 32;
-  if (wc <= 0 || N % wc != 0) return false;
+  if (wc <= 0 || wc > 256 || N % wc != 0) return false;
+  if (static_cast<int64_t>(t.WV) * t.SK * 32 > 1024) return false;
+  if (static_cast<int64_t>(t.SK) * wc * 32 > 64 * 1024) return false;
   if ((K / 16) % (static_cast<int64_t>(t.SK) * t.SKG * t.U) != 0) return false;
   const bool split = t.SKG > 1 || wc < 128;
   return !split || (M + 15) / 16 <= t.MB;
@@ -197,7 +219,7 @@ const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout,
     }
     if (layout == Layout::kTrellis) {
       if (row.rate != variant) continue;
-      if (!TrellisRowFits(N, K, M, row.tuning)) continue;
+      if (!TrellisRowFits(N, K, M, row.rate, row.tuning)) continue;
     }
     if (best == nullptr || row.M < best->M) best = &row;
   }

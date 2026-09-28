@@ -10,13 +10,17 @@
 # A point is K<rate>[m] (a uniform rate; the m suffix = --hessian-basis matched) or mix<bpw>[m]
 # (EXL3's 4/5 allocation at that bpw over K4[m] + K5[m], e.g. mix4.5m or mix4.25m; a manifest only).
 # A mix quantizes its sources first.
+#
+# -Python defaults to $env:R4DX_REFERENCE_VENV\Scripts\python.exe when that is set, else python on
+# PATH. -HessianDir is hessian-v2 (docs/quant2.md 3.3), moved from C:\AI\r4dx-hessian on 2026-09-28.
 param(
   [string[]]$Points = @('K4m', 'mix4.5m', 'K3.5m', 'K4'),
   [string]$QDir = 'D:\models\r4dx\trellis-q',
+  [string]$HessianDir = 'D:\models\r4dx\hessian\hessian-v2',
   [string]$KlDir = 'D:\models\r4dx\kl-trellis',
   [string]$RefDir = 'D:\models\r4dx\kl-canon\ref',
   [string]$Tokens = 'tools\reference\kl_corpus\tokens_canon.json',
-  [string]$Python = 'C:\Users\pay20\dev\vLLM_for_AMD\.venv-rocm10\Scripts\python.exe'
+  [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -60,7 +64,7 @@ function Quantize([string]$point) {
   $basis = if ($Matches[2]) { 'matched' } else { 'exl3' }
   $k = $Matches[1]
   Assert-GpuFree
-  Run "quantize_$point" { & $Python tools\reference\trellis_quant.py quantize-model --device cuda --K $k --hessian-basis $basis --out-dir $dir }
+  Run "quantize_$point" { & $Python tools\reference\trellis_quant.py quantize-model --device cuda --K $k --hessian-basis $basis --hessian-dir $HessianDir --out-dir $dir }
   if (-not (Complete $dir)) { throw "[trellis] $dir incomplete after quantize-model" }
 }
 

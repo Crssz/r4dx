@@ -11,7 +11,8 @@
 //      (checked: split max-abs error <= 1.5 x unsplit's + 2e-3, and max-rel <= 5e-2 like
 //      test_attn_decode), and the split-vs-unsplit difference is printed for the record.
 //   3. deterministic: the same split launch twice gives the same bits (fixed-order merge).
-//   4. the exact-wide entry (r4d_attn_prefill_exact_h256_gqa6_fp8kv, R4DX_PREFILL_SPLITKV=exact)
+//   4. the exact-wide entry (r4d_attn_prefill_exact_h256_gqa6_fp8kv, the default prompt-prefill
+//      path: R4DX_PREFILL_SPLITKV unset or =exact)
 //      is the plain launch bit for bit in every geometry it offers.
 // Cases cover: chunk at depth 0 (causal diagonal only), depths that are not multiples of the
 // 16-token page or the 48-key tile (partial pages / partial tiles), a partial query block

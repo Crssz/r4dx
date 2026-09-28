@@ -1,8 +1,8 @@
 # tools/prefill: long-context evaluation kit (prefill M0)
 
 This kit measures prefill speed and long-context accuracy at 8k, 32k, 64k and 128k tokens. It is
-the measurement gate for the prefill work: M1 is lossless attention parallelism (split-KV or bigger
-chunks), and M2 adds opt-in lossy modes. Everything here is local. Prompts are built from this
+the measurement gate for the prefill work: M1 is lossless attention parallelism (the exact-wide
+launch by default, split-KV opt-in), and M2 adds opt-in lossy modes. Everything here is local. Prompts are built from this
 repository's own docs and sources with the checkpoint's own `tokenizer.json` and
 `chat_template.jinja`, and they are frozen to disk, so every variant is measured on byte-identical
 inputs. Nothing is downloaded.
@@ -32,7 +32,13 @@ Engine changes made for this kit:
 - `r4dx-cli --prompt-file <path>`: the Windows command line caps `--prompt` at 32767 characters, which is about 8k tokens.
 - `tool_teacher_forced_logprobs --tail-rows R [--tail-path decode|prefill]`: long-prefix mode. The sidecar records `first_row`, `prefix_tokens` and `prefill_seconds`.
 - (M1) `tool_teacher_forced_logprobs --prefix-split-at K`: prefills the prefix as two calls, which shifts every chunk boundary the way a prefix-cache restore does. This gives a rounding-level calibration for a variant's KL (`docs/prefill.md`). Pass it through `run_kl.ps1 -ExtraArgs`.
-- (M1) `R4DX_PREFILL_SPLITKV=0` turns split-KV prefill attention off. The result is the pre-M1 prefill, bit for bit. `=N` forces N segments on every call. `=exact` takes the exact-wide launch on every prompt-prefill call: the pre-M1 bits, about 1.5x faster at 128k.
+- (M1) `R4DX_PREFILL_SPLITKV` picks the prompt-prefill attention path:
+  - unset, empty or `exact` (the **default**): the exact-wide launch on every prompt-prefill call. Same bits as the pre-M1 prefill, about 1.5x faster at 128k.
+  - `split` (also `splitkv`, `auto`): split-KV by the split law. About 2x at 128k, with rounding-class drift against the dense bits (`docs/prefill.md`).
+  - `0`, `1`, `off` or `dense`: the old single-workgroup dense launch (the pre-M1 prefill: same bits, slower).
+  - `N` > 1: N split-KV segments on every prompt-prefill call, capped at 32.
+  - Anything else prints a warning and uses the default.
+  - Before the default changed (branch `prefill` up to `dd92f6d`), unset meant split-KV. Runs recorded as "split-KV (default law)" in `docs/prefill.md`'s M1 results are `=split` today.
 
 ## Tasks (`build_tasks.py`)
 

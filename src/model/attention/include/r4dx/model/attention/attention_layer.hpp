@@ -24,6 +24,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -65,22 +66,40 @@ inline int PrefillSplitKvSplits(int ctx, int q_len, int kv_heads) {
   return s;
 }
 
-// R4DX_PREFILL_SPLITKV (read once per process): unset or empty = PrefillSplitKvSplits' law; "0" or
-// "1" = never split (the pre-M1 prefill, bit for bit -- the kill switch); N > 1 = exactly N segments
-// on every prefill-kernel call a prompt prefill makes, at any depth (A/B and calibration runs),
-// capped at 32 (the fp32 partials are 64 x q_heads x N x 1032 B of the layer's 96 MiB arena).
-// "exact" = kPrefillAttnExact: every prompt-prefill call takes the exact-wide launch
-// (r4d_attn_prefill_exact_*), which is the plain launch's output bit for bit over 8x the
-// workgroups -- lossless by construction, about 2x on the attention call instead of split-KV's 5-6x.
+// R4DX_PREFILL_SPLITKV (read once per process) picks the prompt-prefill attention path:
+//   - unset, empty or "exact" = kPrefillAttnExact, THE DEFAULT: every prompt-prefill call takes
+//     the exact-wide launch (r4d_attn_prefill_exact_*), which is the plain launch's output bit for
+//     bit over 8x the workgroups -- lossless by construction, about 2x on the attention call.
+//   - "split" (or "splitkv" / "auto") = kPrefillAttnSplitLaw: split-KV by PrefillSplitKvSplits'
+//     law (opt-in: 5-6x on the attention call, rounding-class drift vs the dense bits).
+//   - "0", "1", "off" or "dense" = 1: never split, the plain single-workgroup-per-(q-block, kv-head)
+//     launch (the pre-M1 prefill, bit for bit -- same bits as exact, just slower).
+//   - N > 1 = exactly N split-KV segments on every prompt-prefill call, at any depth (A/B and
+//     calibration runs), capped at 32 (the fp32 partials are 64 x q_heads x N x 1032 B of the
+//     layer's 96 MiB arena).
+//   - anything else: a warning on stderr, then the default (exact).
+inline constexpr int kPrefillAttnSplitLaw = -1;
 inline constexpr int kPrefillAttnExact = -2;
+inline int ParsePrefillAttnMode(const char* e) {
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "exact") == 0) return kPrefillAttnExact;
+  if (std::strcmp(e, "split") == 0 || std::strcmp(e, "splitkv") == 0 || std::strcmp(e, "auto") == 0) {
+    return kPrefillAttnSplitLaw;
+  }
+  if (std::strcmp(e, "off") == 0 || std::strcmp(e, "dense") == 0) return 1;
+  bool digits = true;
+  for (const char* p = e; *p != '\0'; ++p) digits = digits && *p >= '0' && *p <= '9';
+  if (!digits) {
+    std::fprintf(stderr,
+                 "r4dx: R4DX_PREFILL_SPLITKV='%s' not recognized (exact|split|off|dense|N); "
+                 "using the default (exact)\n",
+                 e);
+    return kPrefillAttnExact;
+  }
+  const int n = std::atoi(e);
+  return n < 1 ? 1 : (n > 32 ? 32 : n);
+}
 inline int PrefillSplitKvOverride() {
-  static const int v = [] {
-    const char* e = std::getenv("R4DX_PREFILL_SPLITKV");
-    if (e == nullptr || *e == '\0') return -1;
-    if (std::strcmp(e, "exact") == 0) return kPrefillAttnExact;
-    const int n = std::atoi(e);
-    return n < 1 ? 1 : (n > 32 ? 32 : n);
-  }();
+  static const int v = ParsePrefillAttnMode(std::getenv("R4DX_PREFILL_SPLITKV"));
   return v;
 }
 
@@ -141,9 +160,9 @@ class AttentionLayer {
   //
   // `prefill_split_kv` (prefill M1, docs/prefill.md): true only from a PROMPT prefill chunk
   // (Model::RunChunk on its prefill path, Model::PrefillProfiled). It lets the prefill-kernel branch
-  // below split the KV range when the context is deep (PrefillSplitKvSplits); false -- the default,
-  // and every decode, verify-window (MTP/DFlash), MTP-priming and test caller -- keeps the plain
-  // launch, bit for bit.
+  // below take the R4DX_PREFILL_SPLITKV path (default: exact-wide, the plain launch's bits; opt-in:
+  // split-KV); false -- the default, and every decode, verify-window (MTP/DFlash), MTP-priming and
+  // test caller -- keeps the plain launch, bit for bit.
   void Forward(core::Arena& arena, const uint16_t* hidden_in, uint16_t* out, const AttnWeights& w,
                PagedKvCache& kv, int T, int start_pos, const int32_t* positions,
                const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
@@ -350,8 +369,9 @@ class AttentionLayer {
       ProfiledCall(prof, stream, "attn.core_decode",
                    [&] { r4dx::core::r4d::AttnDecodeFp8Kv(a, stream); });
     } else {
-      // prefill M1: a deep prefill chunk cuts the KV range into segments (PrefillSplitKvSplits);
-      // below its threshold, and on every non-prefill caller, this is the plain launch.
+      // prefill M1: a prompt-prefill chunk takes the exact-wide launch by default (the plain
+      // launch's bits); split-KV (PrefillSplitKvSplits) and the plain launch are opt-in via
+      // R4DX_PREFILL_SPLITKV. Every non-prefill caller takes the plain launch.
       const int forced = prefill_split_kv ? PrefillSplitKvOverride() : 1;
       const int splits = !prefill_split_kv ? 1
                          : forced > 0     ? forced

@@ -496,9 +496,33 @@ int Run() {
   return ok ? 0 : 1;
 }
 
+// prefill M1: R4DX_PREFILL_SPLITKV's parse (docs/prefill.md). Pure CPU, so it runs before the
+// data-presence skip. Unset/empty/"exact" = the exact-wide default; split-KV only when asked for.
+bool CheckPrefillAttnModeParse() {
+  namespace a = r4dx::model::attention;
+  struct C { const char* in; int want; };
+  const C cases[] = {{nullptr, a::kPrefillAttnExact}, {"", a::kPrefillAttnExact},
+                     {"exact", a::kPrefillAttnExact}, {"bogus", a::kPrefillAttnExact},
+                     {"split", a::kPrefillAttnSplitLaw}, {"splitkv", a::kPrefillAttnSplitLaw},
+                     {"auto", a::kPrefillAttnSplitLaw}, {"0", 1}, {"1", 1}, {"off", 1},
+                     {"dense", 1}, {"8", 8}, {"16", 16}, {"99", 32}};
+  bool ok = true;
+  for (const C& c : cases) {
+    const int got = a::ParsePrefillAttnMode(c.in);
+    if (got != c.want) {
+      std::fprintf(stderr, "prefill attn mode parse: '%s' -> %d, want %d\n",
+                   c.in ? c.in : "(unset)", got, c.want);
+      ok = false;
+    }
+  }
+  std::printf("prefill attn mode parse: %s\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
+  if (!CheckPrefillAttnModeParse()) return 1;
   // Same up-front presence checks every sibling in tests/model/ does (test_gdn_layer.cpp,
   // test_final_lm_head.cpp): both inputs are real, non-vendored data (docs/validation.md), so a
   // machine without them must SKIP (exit 77, tests/model/attention/CMakeLists.txt's

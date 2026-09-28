@@ -6,7 +6,9 @@ through `qwen38-27b-trellis-mix45m.r4dx` on 2x R9700.
 
 - **M0:** measure. A long-context eval kit, a profile of where prefill time goes, and dense accuracy
   baselines.
-- **M1:** lossless attention parallelism (below).
+- **M1:** lossless attention parallelism (below). The default prompt-prefill attention is the
+  exact-wide launch (bit-identical to the dense kernel); split-KV is opt-in with
+  `R4DX_PREFILL_SPLITKV=split`. See [M1 final](#m1-final-exact-by-default-split-kv-opt-in).
 - **M2:** opt-in lossy modes, gated on the M0 KL harness.
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs
@@ -162,8 +164,10 @@ reruns and prefix-reuse replays all agree:
   `PrefillProfiled`). Decode steps, verify windows (MTP and DFlash), MTP priming and the attention
   tests pass `prefill_split_kv = false` and keep the plain launch. Verify windows of at most 10 rows
   take the decode kernel anyway.
-- **`R4DX_PREFILL_SPLITKV`:** `0` or `1` means never split (the kill switch; checked bit-identical to
-  the pre-M1 build at 32k). `N` forces N segments on every prompt-prefill call, capped at 32.
+- **`R4DX_PREFILL_SPLITKV`:** at 4b04ece the law was the default. It is opt-in since
+  [M1 final](#m1-final-exact-by-default-split-kv-opt-in) (`=split`). `0` or `1` means never split
+  (checked bit-identical to the pre-M1 build at 32k). `N` forces N segments on every prompt-prefill
+  call, capped at 32.
 
 ### Lossless: definition and evidence
 
@@ -233,6 +237,8 @@ dense dumps). It failed on prose_32k (0.00090, 97.7%), code_32k (0.00318, 98.0%)
 (0.00163, 96.9%). This section diagnoses why, adds a mode that is bit-identical, and re-validates
 both. Commits: libr4d `c9c0237` and `dec5a4f` (branch `prefill`), r4dx `d731bb8` and `b5e5eb9`.
 Raw outputs are in `D:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1.
+These runs predate the default change: "split-KV (default law)" and "branch default" below mean
+`R4DX_PREFILL_SPLITKV` unset at the time, which is `=split` today.
 - The exact-mode runs, ctest and the dense and split-KV TTFT reruns used the `b5e5eb9` build.
 - The split-KV task set, warm turns, first TTFT pair and identity used the `d731bb8` build. Its
   split-KV and dense paths are the same code.
@@ -447,3 +453,27 @@ Options:
 
 Recommendation: option 1 if "M1 = lossless" is binding, and option 2 otherwise. The fp64 analysis
 says split-KV costs no accuracy, only reproducibility against the old bits.
+
+## M1 final: exact by default, split-KV opt-in
+
+Decision: option 1 of the gate decision above. "M1 = lossless" is binding, so the default prompt
+prefill attention is the exact-wide launch, and split-KV stays one environment variable away.
+
+| `R4DX_PREFILL_SPLITKV` | prompt-prefill attention | bits vs dense | 128k TTFT, TP=1 |
+|---|---|---|---|
+| unset, empty or `exact` (**default**) | exact-wide (`r4d_attn_prefill_exact_*`, 12 warps x 4 d-slices x 96-key tiles) | identical | 1.51x |
+| `split` (also `splitkv`, `auto`) | split-KV by the split law (S=8 at TP=1, 16 per rank at TP=2, from 8k context) | rounding-class drift (see above) | 2.01x |
+| `0`, `1`, `off` or `dense` | the old single-workgroup dense launch | identical (it is the dense kernel) | 1.00x |
+| `N` > 1 | N split-KV segments on every call, capped at 32 | rounding-class drift | - |
+| anything else | a warning on stderr, then the default | identical | 1.51x |
+
+- Only prompt prefill reads it. Decode, verify windows and MTP priming always take the plain launch.
+- The parse is `ParsePrefillAttnMode` in `attention_layer.hpp`. `test_attn_layer` checks it on the
+  CPU before its data-presence skip.
+
+**Checks with the new default** (this commit's build, HIP device 1, outputs in
+`D:\models\r4dx\prefill-m1\final\`):
+- `ctest -LE tp2gpu`: 95/95 passed, including `test_attn_prefill_splitkv` and the parse check in
+  `test_attn_layer`.
+- Short-prompt greedy identity against main at TP=1 (plain, dflash7 and mtp3, 4 prompts each from
+  `tests/model/mtp_prompts.txt`): 12/12 byte-identical text and token ids.

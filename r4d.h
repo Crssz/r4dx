@@ -49,12 +49,13 @@ struct R4DArgs {
     const float* k_descale;     // (num_seqs, kv_heads)
     const float* v_descale;     // (num_seqs, kv_heads)
     const float* q_descale;     // unused: the query is bf16
-    void*        scratch;       // split-KV partials (decode only), or null
+    void*        scratch;       // split-KV partials (decode, split-KV prefill), or null
     int num_seqs, q_len, q_heads, kv_heads, head_dim, block_size, max_blocks;
     int64_t kv_block_stride;       // elements between consecutive blocks
     int64_t kv_head_stride;        // elements between kv heads inside a block
     float scale;
-    int  splits;                // decode only; 0 = let the split law choose
+    int  splits;                // decode: 0 = let the split law choose; split-KV prefill: the
+                                //   segment count (<= 1 = unsplit); ignored by plain prefill
     int  max_ctx;               // host-visible context bound (seqused_k is device-side)
 };
 
@@ -71,6 +72,16 @@ int  r4d_attn_decode_h256_gqa6_bf16kv (const R4DArgs* a, hipStream_t stream);
 // Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
 // dtype: the partials are f16 either way.
 int64_t r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
+// Split-KV prefill: the prefill kernel with the KV tile range cut into a->splits segments (the
+// caller's count, clamped to 64; there is no split law), each writing fp32 partials to a->scratch,
+// then the decode path's fixed-order merge. For long contexts, where the plain launch has only
+// ceil(q_len/64) x kv_heads workgroups. splits <= 1 IS the plain prefill launch (same kernel, same
+// bits, no scratch). Split, the result differs from the unsplit launch only in where each segment's
+// softmax reference max starts and in the fp32 order of the merge. -5 if split and scratch is null.
+int  r4d_attn_prefill_splitkv_h256_gqa6_fp8kv (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t stream);
+// Bytes of fp32 partials one split-KV prefill launch of this shape needs (0 when unsplit).
+int64_t r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(const R4DArgs* a);
 // The geometry the attention kernels above are compiled for, so a caller can test a model against
 // it instead of discovering the mismatch at the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);

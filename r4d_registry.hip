@@ -153,6 +153,18 @@ static const R4DKernelInfo kKernels[] = {
      "head_dim 256, 6 queries per kv head, paged block 16, varlen",
      "bf16 query, bf16 kv cache, bf16 out",
      ROW(cAttnPrefillBf16)},
+    // Its own op: it needs a scratch buffer and a caller-chosen split count, so a caller selecting
+    // plain "attn_prefill_paged" is never handed it.
+    {"attn_prefill_splitkv_h256_gqa6_fp8kv", "attn", "attn_prefill_paged_splitkv",
+     "paged causal attention, query-tiled and split-KV (long-context prefill), fixed-order merge",
+     "head_dim 256, 6 queries per kv head, paged block 16, varlen, caller's split count <= 64",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, fp32 partials",
+     ROW(cAttnPrefillFp8)},
+    {"attn_prefill_splitkv_h256_gqa6_bf16kv", "attn", "attn_prefill_paged_splitkv",
+     "paged causal attention, query-tiled and split-KV (long-context prefill), fixed-order merge",
+     "head_dim 256, 6 queries per kv head, paged block 16, varlen, caller's split count <= 64",
+     "bf16 query, bf16 kv cache, bf16 out, fp32 partials",
+     ROW(cAttnPrefillBf16)},
     {"attn_decode_h256_gqa6_fp8kv", "attn", "attn_decode_paged",
      "paged causal attention, split-KV (decode / speculative verify)",
      "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",

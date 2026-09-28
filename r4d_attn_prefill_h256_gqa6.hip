@@ -80,9 +80,19 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
                  __builtin_bit_cast(float, w & 0xffff0000u) * s);
 }
 
-template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT>
+// SPLIT (split-KV prefill, r4d_attn_prefill_splitkv_*): a long context gives this kernel only
+// ceil(q_len/64) x kv_heads workgroups -- 4 on a 64-row chunk, an eighth of the device -- however
+// deep the cache is. SPLIT=1 cuts the KV tile range into `splits` segments of
+// ceil(tiles(ctx)/splits) tiles (the decode kernel's partition, so its merge applies unchanged),
+// grid.x = q_blocks * splits, and each workgroup writes its segment's UNNORMALISED fp32 accumulator
+// with its m_ref and row sum instead of bf16 output; r4d_attn_splitkv_combine_kernel<.., PF16=0>
+// then merges the segments in fixed index order. Per segment the arithmetic is the unsplit kernel's
+// own (same lazy reference max, same f16 P), so the split changes only where each segment's
+// reference max starts and the fp32 order of the final sum. SPLIT=0 is the original kernel: every
+// SPLIT term below folds to the unsplit expression at compile time.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int SPLIT>
 __global__ __launch_bounds__(NWARPS * 32)
-void r4d_attn_prefill_kernel(const R4DArgs a)
+void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
 {
     constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
     constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
@@ -122,7 +132,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int c = lane & 15, h = lane >> 4;
 
-    const int qb = blockIdx.x, kvh = blockIdx.y, seq = blockIdx.z;
+    const int qb = SPLIT ? (int)blockIdx.x / splits : (int)blockIdx.x;
+    const int sp = SPLIT ? (int)blockIdx.x - qb * splits : 0;
+    const int kvh = blockIdx.y, seq = blockIdx.z;
     const int ctx = a.seqused_k[seq];
     if (ctx <= 0) return;
 
@@ -167,6 +179,16 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, a.q_len - 1);
     const int klimit_cta = ctx - a.q_len + qmax_cta;
     const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
+    // This workgroup's tiles. The segment size is a function of ctx alone (not of this q-block's
+    // causal extent), because the merge recomputes it from ctx; a segment wholly past this block's
+    // last key has nothing to do, and no row that reads it back exists (see the merge's `u`).
+    int t_lo = 0, t_hi = ntiles;
+    if (SPLIT) {
+        const int tps = ((ctx + TILE - 1) / TILE + splits - 1) / splits;
+        t_lo = sp * tps;
+        t_hi = min(t_lo + tps, ntiles);
+        if (t_lo >= t_hi) return;    // block-uniform, before any barrier
+    }
 
     // ---- staging, split into a global FETCH (registers) and an LDS STORE ------------------------
     // Splitting them is what lets GPRE move the fetch out from between the barriers; without GPRE
@@ -285,14 +307,14 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
     int blk[NB];
     if (BTS) {
         #pragma unroll
-        for (int i = 0; i < NB; ++i) blk[i] = bt[i];
+        for (int i = 0; i < NB; ++i) blk[i] = bt[t_lo * NB + i];
     }
-    if (GPREV) fetchV(0, blk);
+    if (GPREV) fetchV(t_lo * TILE, blk);
 
-    for (int ti = 0; ti < ntiles; ++ti) {
+    for (int ti = t_lo; ti < t_hi; ++ti) {
         const int k0 = ti * TILE;
         int blkn[NB];
-        if (BTS && ti + 1 < ntiles) {
+        if (BTS && ti + 1 < t_hi) {
             const int tb = (ti + 1) * NB;
             #pragma unroll
             for (int i = 0; i < NB; ++i) blkn[i] = bt[tb + i];
@@ -305,7 +327,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
         if (LDSB) lds_barrier(); else __syncthreads();
         // The next tile's global loads are issued HERE, before the 96 WMMAs below, and the wait
         // that consumes them does not appear until after the next barrier.
-        if (GPREV && ti + 1 < ntiles) fetchV(k0 + TILE, blkn);
+        if (GPREV && ti + 1 < t_hi) fetchV(k0 + TILE, blkn);
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
@@ -418,6 +440,22 @@ void r4d_attn_prefill_kernel(const R4DArgs a)
 
     if (!live) return;
     l_i += swap16(l_i);
+    if (SPLIT) {
+        // The decode kernel's fp32 partial layout (its PF16=0 arm): [row][split] accumulators, then
+        // m_ref, then the row sum, row = (token, q head). fp32 on purpose: the partial is the
+        // accumulator itself, not a re-rounded copy of it.
+        const int tok = seq * a.q_len + qpos;
+        const size_t idx  = ((size_t)tok * a.q_heads + qhead) * splits + sp;
+        const size_t nrow = (size_t)a.num_seqs * a.q_len * a.q_heads * splits;
+        float* so = (float*)a.scratch;
+        float* sm = so + nrow * HEAD_DIM;
+        float* sl = sm + nrow;
+        float* op = so + idx * HEAD_DIM;
+        #pragma unroll
+        for (int dt = 0; dt < NKS; ++dt) *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
+        if (h == 0) { sm[idx] = m_ref; sl[idx] = l_i; }
+        return;
+    }
     const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
     uint16_t* op = (uint16_t*)a.out
                  + ((size_t)(seq * a.q_len + qpos) * a.q_heads + qhead) * HEAD_DIM;

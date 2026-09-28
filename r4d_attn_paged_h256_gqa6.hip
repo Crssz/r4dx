@@ -58,8 +58,8 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     constexpr int BQ = (P_NWARPS * 16) / A_GQA;
     dim3 grid((a->q_len + BQ - 1) / BQ, a->kv_heads, a->num_seqs);
     hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
-                                                KVP, P_OPT>),
-                       grid, dim3(P_NWARPS * 32), 0, s, *a);
+                                                KVP, P_OPT, 0>),
+                       grid, dim3(P_NWARPS * 32), 0, s, *a, 1);
     CHK();
     return 0;
 }
@@ -69,6 +69,53 @@ extern "C" int r4d_attn_prefill_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s)
 }
 extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<1>(a, s);
+}
+
+// ---- split-KV prefill ------------------------------------------------------------------------
+// The prefill kernel with its KV tile range cut into a->splits segments, then the decode path's
+// fp32 merge (r4d_attn_splitkv_combine_kernel, PF16=0, fixed segment order). splits <= 1 is the
+// plain prefill launch above -- the same kernel instantiation, so the same bits -- and needs no
+// scratch. The split count is the CALLER's (a->splits, no law here): it decides where the result
+// changes, and a caller that wants short prompts to stay bit-identical to the unsplit kernel must be
+// the one that says where "short" ends.
+#define P_MAX_SPLITS 64
+
+static int prefill_splits(const R4DArgs* a) {
+    return a->splits < 1 ? 1 : (a->splits > P_MAX_SPLITS ? P_MAX_SPLITS : a->splits);
+}
+
+extern "C" int64_t r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(const R4DArgs* a) {
+    const int splits = prefill_splits(a);
+    if (splits <= 1) return 0;
+    const int64_t rows = (int64_t)a->num_seqs * a->q_len * a->q_heads;
+    return rows * splits * (int64_t)(a->head_dim + 2) * 4;    // f32 O partials + m + l
+}
+
+template <int KVP>
+static int prefill_splitkv_launch(const R4DArgs* a, hipStream_t s) {
+    const int splits = prefill_splits(a);
+    if (splits <= 1) return prefill_launch<KVP>(a, s);
+    if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
+    if (a->q_heads / a->kv_heads != A_GQA) return -2;
+    if (a->scratch == nullptr) return -5;
+    constexpr int BQ = (P_NWARPS * 16) / A_GQA;
+    dim3 grid(((a->q_len + BQ - 1) / BQ) * splits, a->kv_heads, a->num_seqs);
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<P_NWARPS, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE,
+                                                KVP, P_OPT, 1>),
+                       grid, dim3(P_NWARPS * 32), 0, s, *a, splits);
+    CHK();
+    const int jobs = a->num_seqs * a->q_len * a->q_heads;
+    hipLaunchKernelGGL((r4d_attn_splitkv_combine_kernel<A_HEAD_DIM, 4, 0>), dim3(jobs),
+                       dim3(256), splits * sizeof(float), s, *a, splits, P_TILE);
+    CHK();
+    return 0;
+}
+
+extern "C" int r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_splitkv_launch<0>(a, s);
+}
+extern "C" int r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
+    return prefill_splitkv_launch<1>(a, s);
 }
 
 // ---- decode ----------------------------------------------------------------------------------

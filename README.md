@@ -27,6 +27,7 @@ constants and by `kernels()`.
 | entry point | what it is |
 | --- | --- |
 | `attn_prefill_h256_gqa6_fp8kv` / `..._bf16kv` | paged causal attention, query-tiled; head_dim 256, 6 queries per KV head, fp8-e4m3 or bf16 KV cache |
+| `attn_prefill_splitkv_h256_gqa6_fp8kv` / `..._bf16kv` | the prefill kernel with its KV range cut into a caller-chosen number of segments (fp32 partials, fixed-order merge) for long contexts; C ABI only |
 | `attn_decode_h256_gqa6_fp8kv` / `..._bf16kv` | the same geometry, split-KV, up to 64 query rows |
 | `attn_vit_h72_bf16` | dense non-causal vision-encoder attention, head_dim 72 native, varlen over images |
 | `gdn_conv_prep_w4_h128_bf16` | the gdn prefill preamble in one kernel: causal conv (width 4, silu, with its state cache), q/k/v split, qk l2norm, gating and the per-chunk gate cumsum |

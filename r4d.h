@@ -82,6 +82,10 @@ int  r4d_attn_prefill_splitkv_h256_gqa6_fp8kv (const R4DArgs* a, hipStream_t str
 int  r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t stream);
 // Bytes of fp32 partials one split-KV prefill launch of this shape needs (0 when unsplit).
 int64_t r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(const R4DArgs* a);
+// Exact-wide prefill (fp8 KV): the plain prefill's output bit for bit, over more workgroups (fewer
+// warps per q-block and/or the PV columns split across DS workgroups that each redo QK/softmax).
+// a->splits: 0 = default geometry, 1 = the plain launch, NW*10+DS = a measured geometry, else -3.
+int  r4d_attn_prefill_exact_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t stream);
 // The geometry the attention kernels above are compiled for, so a caller can test a model against
 // it instead of discovering the mismatch at the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);

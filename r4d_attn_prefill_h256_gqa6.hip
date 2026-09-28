@@ -90,7 +90,13 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
 // own (same lazy reference max, same f16 P), so the split changes only where each segment's
 // reference max starts and the fp32 order of the final sum. SPLIT=0 is the original kernel: every
 // SPLIT term below folds to the unsplit expression at compile time.
-template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int SPLIT>
+//
+// DSPLIT (exact-wide prefill, r4d_attn_prefill_exact_*): DSPLIT workgroups share one q-block. Each
+// runs the whole QK and softmax -- so the same m_ref sequence, f16 P and row sum as the unsplit
+// kernel -- but stages only its 1/DSPLIT slice of V and owns only those NKD output d-tiles. No
+// accumulator ever depends on another d-tile, so the output is the unsplit kernel's bit for bit.
+// DSPLIT=1 folds every DSPLIT term away.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int SPLIT, int DSPLIT = 1>
 __global__ __launch_bounds__(NWARPS * 32)
 void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
 {
@@ -111,6 +117,8 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
     constexpr int ROWS    = NWARPS * 16;
     constexpr int BLOCK_Q = ROWS / GQA;
     constexpr int NKS     = HEAD_DIM / 16;
+    constexpr int NKD     = NKS / DSPLIT;                    // output d-tiles this workgroup owns
+    constexpr int PFV     = PF < NKD ? PF : NKD;               // PV prefetch depth over those
     constexpr int MT      = TILE / 16;
     constexpr int KSTR    = HEAD_DIM + (CTG ? 8 : 4);
     constexpr int VSTR    = TILE + (CTG ? 8 : 4);
@@ -120,19 +128,25 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
     constexpr int KITEMS  = TILE * (HEAD_DIM / KEL);          // K passes needed for one tile
     constexpr int KPASS   = (KITEMS + NTHR - 1) / NTHR;        // passes per thread
     constexpr int KREGS   = KPASS * (KVP ? 2 : 1);             // uint4 of raw K per thread
-    constexpr int NTR     = (TILE / 8) * (HEAD_DIM / (KVP ? 32 : 64));
+    constexpr int DGA     = HEAD_DIM / (KVP ? 32 : 64);         // V d-groups of the whole head
+    constexpr int DGW     = DGA / DSPLIT;                      // ... that this workgroup stages
+    constexpr int NTR     = (TILE / 8) * DGW;
     constexpr int VREGS   = (NTR + NWARPS - 1) / NWARPS;        // uint4 of raw V per thread
     constexpr float PSHIFT = D::SHIFT;
     constexpr float PGROW  = D::GROW;
-    static_assert(!KWIDE || KPASS == 1, "the wide K fetch is one straight-line pass");
+    static_assert(!KWIDE || KITEMS % NTHR == 0, "the wide K fetch covers the tile in whole passes");
+    static_assert(DSPLIT == 1 || SPLIT == 0, "DSPLIT is a variant of the unsplit kernel only");
+    static_assert(DGW * DSPLIT == DGA && NKD * DSPLIT == NKS && NKD % PFV == 0,
+                  "DSPLIT divides the head into whole V d-groups");
 
     __shared__ uint16_t sK[TILE * KSTR];
-    __shared__ uint16_t sV16[HEAD_DIM * VSTR];
+    __shared__ uint16_t sV16[(HEAD_DIM / DSPLIT) * VSTR];
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int c = lane & 15, h = lane >> 4;
 
-    const int qb = SPLIT ? (int)blockIdx.x / splits : (int)blockIdx.x;
+    const int qb = SPLIT ? (int)blockIdx.x / splits : (int)blockIdx.x / DSPLIT;
+    const int ds = (DSPLIT > 1) ? (int)blockIdx.x - qb * DSPLIT : 0;   // this workgroup's d-slice
     const int sp = SPLIT ? (int)blockIdx.x - qb * splits : 0;
     const int kvh = blockIdx.y, seq = blockIdx.z;
     const int ctx = a.seqused_k[seq];
@@ -172,9 +186,9 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
-    v8f acc[NKS];
+    v8f acc[NKD];
     #pragma unroll
-    for (int t = 0; t < NKS; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
+    for (int t = 0; t < NKD; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
 
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, a.q_len - 1);
     const int klimit_cta = ctx - a.q_len + qmax_cta;
@@ -228,8 +242,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
-                const int kg = idx / DG, dg = idx - kg * DG;
+                const int kg = idx / DGW, dg = ds * DGW + (idx - kg * DGW);
                 const int kk = min(k0 + kg * 8 + vj, ctx - 1);
                 const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
                 const int blk = BTS ? blks[(kk - k0) / BS] : bt[kk / BS];
@@ -275,8 +288,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
         for (int r = 0; r < VREGS; ++r) {
             const int idx = warp + r * NWARPS;
             if (NTR % NWARPS == 0 || idx < NTR) {
-                constexpr int DG = HEAD_DIM / (KVP ? 32 : 64);
-                const int kg = idx / DG, dg = idx - kg * DG;
+                const int kg = idx / DGW, dg = idx - kg * DGW;          // d-group within the slice
                 const int d0 = dg * (KVP ? 32 : 64) + vg * (KVP ? 8 : 16);
                 const uint4 v = vreg[r];
                 if (KVP) {
@@ -373,7 +385,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
                 const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
                 const float alpha = ex2(m_ref - mnew);
                 #pragma unroll
-                for (int dt = 0; dt < NKS; ++dt)
+                for (int dt = 0; dt < NKD; ++dt)
                     #pragma unroll
                     for (int e = 0; e < 8; ++e) acc[dt][e] *= alpha;
                 l_i *= alpha;
@@ -413,10 +425,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
                 }
                 const uint16_t* vbase = &sV16[c * VSTR + mt * 16] + (CTG ? 8 * h : 0);
                 #pragma unroll
-                for (int g = 0; g < NKS; g += PF) {
-                    frag16 vb[PF];
+                for (int g = 0; g < NKD; g += PFV) {
+                    frag16 vb[PFV];
                     #pragma unroll
-                    for (int j = 0; j < PF; ++j) {
+                    for (int j = 0; j < PFV; ++j) {
                         const uint16_t* vp = vbase + (g + j) * 16 * VSTR;
                         if (CTG) {
                             const uint4 u = *(const uint4*)vp;
@@ -428,7 +440,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
                     }
                     if (SGB) sched_barrier();
                     #pragma unroll
-                    for (int j = 0; j < PF; ++j) acc[g + j] = D::wmma(vb[j], p16, acc[g + j]);
+                    for (int j = 0; j < PFV; ++j) acc[g + j] = D::wmma(vb[j], p16, acc[g + j]);
                 }
             }
         }
@@ -452,15 +464,15 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
         float* sl = sm + nrow;
         float* op = so + idx * HEAD_DIM;
         #pragma unroll
-        for (int dt = 0; dt < NKS; ++dt) *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
+        for (int dt = 0; dt < NKD; ++dt) *(v8f*)(op + dt * 16 + 8 * h) = acc[dt];
         if (h == 0) { sm[idx] = m_ref; sl[idx] = l_i; }
         return;
     }
     const float inv = (l_i > 0.0f) ? (vdesc / l_i) : 0.0f;
     uint16_t* op = (uint16_t*)a.out
-                 + ((size_t)(seq * a.q_len + qpos) * a.q_heads + qhead) * HEAD_DIM;
+                 + ((size_t)(seq * a.q_len + qpos) * a.q_heads + qhead) * HEAD_DIM + ds * NKD * 16;
     #pragma unroll
-    for (int dt = 0; dt < NKS; ++dt) {
+    for (int dt = 0; dt < NKD; ++dt) {
         uint32_t tw[4];
         #pragma unroll
         for (int e = 0; e < 8; e += 2)

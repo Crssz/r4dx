@@ -71,6 +71,52 @@ extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s
     return prefill_launch<1>(a, s);
 }
 
+// ---- exact-wide prefill ----------------------------------------------------------------------
+// The SAME per-row arithmetic as prefill_launch, spread over more workgroups, so the output is bit
+// for bit the plain launch's:
+//   - NW < P_NWARPS: fewer warps per workgroup, i.e. q-blocks of NW*16/6 rows. A wave's 16 rows
+//     are the same rows as in the 24-warp kernel (BLOCK_Q divides 64 exactly), so the wave-uniform
+//     lazy-max decisions are the same; tiles past a smaller block's causal limit are fully masked,
+//     and adding the exact 0 they contribute changes nothing.
+//   - DS > 1 (DSPLIT): DS workgroups per q-block, each the full QK and softmax (the same m_ref
+//     sequence, the same f16 P, the same row sum) and the PV matmul for 1/DS of the head's output
+//     columns, staging only that slice of V. A d-tile's accumulator never reads another d-tile.
+// The price is redundancy: every workgroup of a q-block recomputes QK and restages K. That caps the
+// speedup well below split-KV's.
+// a->splits picks the geometry for measurement (NW*10 + DS, e.g. 124 = 12 warps, 4 slices);
+// 0 = the default. fp8 cache only (its V stages in 4 d-groups of 64, so DS <= 4).
+template <int NW, int DS>
+static int prefill_exact_launch_g(const R4DArgs* a, hipStream_t s) {
+    constexpr int BQ = (NW * 16) / A_GQA;
+    static_assert(BQ * A_GQA == NW * 16 && 64 % BQ == 0, "q-blocks must tile the 24-warp block");
+    dim3 grid(((a->q_len + BQ - 1) / BQ) * DS, a->kv_heads, a->num_seqs);
+    hipLaunchKernelGGL((r4d_attn_prefill_kernel<NW, P_TILE, A_HEAD_DIM, A_GQA, A_BLOCK_SIZE, 0,
+                                                P_OPT, 0, DS>),
+                       grid, dim3(NW * 32), 0, s, *a, 1);
+    CHK();
+    return 0;
+}
+
+extern "C" int r4d_attn_prefill_exact_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
+    if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
+    if (a->q_heads / a->kv_heads != A_GQA) return -2;
+    switch (a->splits) {
+        case 1:   return prefill_launch<0>(a, s);
+        case 242: return prefill_exact_launch_g<24, 2>(a, s);
+        case 244: return prefill_exact_launch_g<24, 4>(a, s);
+        case 121: return prefill_exact_launch_g<12, 1>(a, s);
+        case 122: return prefill_exact_launch_g<12, 2>(a, s);
+        // The default: 12 warps (32-row q-blocks) x 4 d-slices, 32 workgroups per 64-row chunk at 4
+        // KV heads. Measured (gfx1201, q_len 64): 2.6x at 8k, 2.2x at 32k, 2.0x at 123k over the
+        // plain launch, 2.2x at 2 KV heads (a TP=2 rank); the other geometries are slower.
+        case 0:
+        case 124: return prefill_exact_launch_g<12, 4>(a, s);
+        case 62:  return prefill_exact_launch_g<6, 2>(a, s);
+        case 64:  return prefill_exact_launch_g<6, 4>(a, s);
+        default:  return -3;
+    }
+}
+
 // ---- split-KV prefill ------------------------------------------------------------------------
 // The prefill kernel with its KV tile range cut into a->splits segments, then the decode path's
 // fp32 merge (r4d_attn_splitkv_combine_kernel, PF16=0, fixed segment order). splits <= 1 is the

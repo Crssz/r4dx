@@ -16,6 +16,16 @@
 // The decode and its weight loads are amortised over RG * 64 rows; LDS traffic costs the WMMA nothing
 // (128 B/clk per WGP against the ~31 B/clk needed, docs/trellis-kernel.md 4.7 / linear A1).
 //
+// ANY SHIPPED SK (2, 4, 8, 16).  A workgroup is RG * SKW waves at most 32, so the K slices of a shipped row
+// with SK > 32 / RG (mlp.down KB 4: SK 16, SKG 2) cannot all be resident. The kernel therefore walks PH =
+// SK / SKW groups of SKW slices one after the other (slice = group * SKW + wave's K index, so every slice keeps
+// its own k-tile range and its own chain of 16-k WMMA restarted from zero). The shipped SK sum is a left fold
+// from 0.f in slice order; each group ends with the in-workgroup reduction (below) whose owner starts its sum
+// from the running sum of the earlier groups (parked in the owner's ws unit, the unit the final sum lands in)
+// instead of 0.f, which adds the same terms in the same order: the result is bit-identical to the shipped row.
+// A slice's k-tile count need not be a multiple of U: TAIL = ktw % U trailing k-tiles run as one short step in
+// which only the waves whose block index is below TAIL decode (mlp.down KB 4: 34 k-tiles, U 4, TAIL 2).
+//
 // EPILOGUE (all of it in the accumulator layout, so every LDS and global access is a lane-contiguous
 // b128). Wc = 32 NP columns per block, so a 128-column FWHT group is spread over NBLK = 128 / Wc
 // blocks (and SKG K-blocks): a "split" group in the stock kernel's words, finished by the LAST block to
@@ -32,6 +42,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 #define WAVE32 32
 
@@ -79,15 +90,23 @@ __device__ __forceinline__ void r4d_t256_bfly(v8f& lo, v8f& hi) {
   hi = a - b;
 }
 
-template <int KB, int NP, int U, int RG, int SK>
+// SK = SKW * PH is the K-slice count of the shipped M = 64 row this launch must reproduce; a workgroup holds
+// only SKW slices at a time (RG * SKW <= 32 waves) and walks the PH groups of SKW slices one after the
+// other. The shipped sum is a left fold over the SK slice partials from 0.f, so folding group by group
+// (the running sum handed from one group to the next through the ws unit the group's owner will finish in)
+// adds the very same terms in the very same order.
+template <int KB, int NP, int U, int RG, int SKW, int PH, int TAIL>
 __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
     const unsigned short* __restrict__ A0, const unsigned short* __restrict__ A1, int n_split,
     const unsigned* __restrict__ W, const float* __restrict__ svh, unsigned short* __restrict__ C,
     float* __restrict__ ws, unsigned* __restrict__ tickets, int K, int N, int SKG, float out_scale) {
   constexpr int MT = 4, BLK = 64 * KB, M = RG * 64, Wc = NP * 32, NBLK = 128 / Wc;
   constexpr int NQ = NP * 4;                              // b128 per lane per accumulator tile
+  constexpr int SK = SKW * PH;
   static_assert(NP * U == RG, "each wave of a K slice decodes exactly one block per step");
-  static_assert(SK == 2 || SK == 4 || SK == 8, "");
+  static_assert(SKW == 2 || SKW == 4 || SKW == 8, "");
+  static_assert(PH == 1 || PH == 2 || PH == 4, "");
+  static_assert(TAIL >= 0 && TAIL < U, "");
   extern __shared__ __attribute__((aligned(16))) unsigned char lds[];
   const int tid = threadIdx.x, lane = tid & 31;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
@@ -96,40 +115,48 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
   const int pair0 = n0 / 32;
   const int kt_total = K / 16;
   const int ktw = kt_total / (SK * SKG);
-  const int kt0 = ((int)blockIdx.y * SK + ks) * ktw;
-  const int steps = ktw / U;
+  const int steps = ktw / U;                              // main steps of U k-tiles; TAIL = ktw % U more k-tiles in one last step
   const int p_d = rg % NP, u_d = rg / NP;                 // the block this wave decodes each step
   constexpr unsigned slot_bytes = NP * U * 1024;          // one K slice's staging per buffer
-  constexpr unsigned buf_bytes = SK * slot_bytes;
+  constexpr unsigned buf_bytes = SKW * slot_bytes;
   const unsigned lds_w = ks * slot_bytes + rg * 1024 + lane * 16;   // own block's F0 (F1 at +512)
   const unsigned lds_r = ks * slot_bytes + lane * 16;               // block j's F0 at + j * 1024
   const unsigned short* A = n0 >= n_split ? A1 : A0;
+  float* wsy = ws + (size_t)blockIdx.y * M * N;
+  // the ws unit of (row group rg, tile i): the running sum lives here between groups, the final sum after
+  auto ws_unit = [&](int i) {
+    return wsy + ((size_t)(rg * 4 + i) * (N / Wc) + n0 / Wc) * (16 * Wc);
+  };
 
   v8f acc[NP][2][MT];
+#pragma unroll
+  for (int ph = 0; ph < PH; ++ph) {
 #pragma unroll
   for (int p = 0; p < NP; ++p)
 #pragma unroll
     for (int f = 0; f < 2; ++f)
 #pragma unroll
       for (int i = 0; i < MT; ++i) acc[p][f][i] = (v8f)(0.f);
+  const int kt0 = ((int)blockIdx.y * SK + ph * SKW + ks) * ktw;
 
   {
     r4d_g256byte wb = (r4d_g256byte)(const unsigned char*)W +
                       ((size_t)(pair0 + p_d) * kt_total + kt0 + u_d) * BLK;
     r4d_g256byte abase = (r4d_g256byte)(const unsigned char*)A + (size_t)kt0 * 32;
+    const int lane_o = lane;
     constexpr int NOFF = KB == 4 ? 2 : 5;
     unsigned woff[NOFF];
     if constexpr (KB == 4) {
-      woff[0] = r4d_trellis_k4_off_ab(lane);
-      woff[1] = r4d_trellis_k4_off_p(lane);
+      woff[0] = r4d_trellis_k4_off_ab(lane_o);
+      woff[1] = r4d_trellis_k4_off_p(lane_o);
     } else {
 #pragma unroll
-      for (int i = 0; i < 5; ++i) woff[i] = r4d_trellis_k5_word(lane, i) * 4u;
+      for (int i = 0; i < 5; ++i) woff[i] = r4d_trellis_k5_word(lane_o, i) * 4u;
     }
-    const unsigned k5sh = r4d_trellis_k5_shift(lane);
+    const unsigned k5sh = r4d_trellis_k5_shift(lane_o);
     unsigned aoff[MT];
 #pragma unroll
-    for (int i = 0; i < MT; ++i) aoff[i] = rowGo((unsigned)K, rg * 64 + i * 16, M - 1, lane) * 2u;
+    for (int i = 0; i < MT; ++i) aoff[i] = rowGo((unsigned)K, rg * 64 + i * 16, M - 1, lane_o) * 2u;
 
     // the lane's words of the wave's own block of a step
     unsigned long long ab;
@@ -148,14 +175,18 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
     };
     load_w(0);
     int buf = 0;
-    for (int st = 0; st < steps; ++st) {
+    // One step over UU k-tiles of the slice (UU = U for the main steps; the tail of a slice whose k-tile
+    // count is not a multiple of U runs one step of UU = ktw % U, in which only the waves whose block
+    // index is below UU decode). The k-tile order of every accumulator chain is the slice's own.
+    auto do_step = [&](auto ucst, int st, int nxt) {
+      constexpr int UU = decltype(ucst)::value;
       // phase D: this step's activation fragments, then decode the own block and publish it
-      v8h af[U][MT];
+      v8h af[UU][MT];
       {
         r4d_g256byte a = abase + (size_t)st * (U * 32);
         r4d_t256_opaque(a);
 #pragma unroll
-        for (int u = 0; u < U; ++u)
+        for (int u = 0; u < UU; ++u)
 #pragma unroll
           for (int i = 0; i < MT; ++i) {
             union { unsigned long long w[2]; v8h f; } x;
@@ -169,18 +200,20 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
       unsigned c5[5];
 #pragma unroll
       for (int i = 0; i < 5; ++i) c5[i] = w5[i];
-      load_w(st + 1 < steps ? 1 : 0);                     // next step's words (clamped)
+      if constexpr (UU == U) load_w(nxt);                 // next step's words (clamped)
       __builtin_amdgcn_sched_barrier(0);
-      v8h f0, f1;
-      if constexpr (KB == 4) r4d_trellis_k4_decode(pw_c, (unsigned)ab_c, (unsigned)(ab_c >> 32), f0, f1);
-      else r4d_trellis_k5_decode(c5, k5sh, f0, f1);
-      *(v8h*)(lds + buf * buf_bytes + lds_w) = f0;
-      *(v8h*)(lds + buf * buf_bytes + lds_w + 512) = f1;
+      if (UU == U || u_d < UU) {
+        v8h f0, f1;
+        if constexpr (KB == 4) r4d_trellis_k4_decode(pw_c, (unsigned)ab_c, (unsigned)(ab_c >> 32), f0, f1);
+        else r4d_trellis_k5_decode(c5, k5sh, f0, f1);
+        *(v8h*)(lds + buf * buf_bytes + lds_w) = f0;
+        *(v8h*)(lds + buf * buf_bytes + lds_w + 512) = f1;
+      }
       __builtin_amdgcn_sched_barrier(0);
       r4d_t256_sync_lds();
       // phase W: every block of the slice, all four row tiles
 #pragma unroll
-      for (int u = 0; u < U; ++u)
+      for (int u = 0; u < UU; ++u)
 #pragma unroll
         for (int p = 0; p < NP; ++p) {
           const unsigned rd = buf * buf_bytes + lds_r + (u * NP + p) * 1024;
@@ -200,19 +233,26 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
 #pragma unroll
       for (int i = 0; i < MT; ++i) r4d_t256_opaque_v(aoff[i]);
       __builtin_amdgcn_sched_barrier(0);
+    };
+    for (int st = 0; st < steps; ++st) {
+      // the last main step preloads the tail block (only the waves that will decode it), else re-reads
+      const bool more = st + 1 < steps || (TAIL > 0 && u_d < TAIL);
+      do_step(std::integral_constant<int, U>{}, st, more ? 1 : 0);
     }
+    if constexpr (TAIL > 0) do_step(std::integral_constant<int, TAIL>{}, steps, 0);
   }
 
-  // ---- 1. reduction over the SK slices, in the accumulator layout ---------------------------------
-  // pass i: slice i % SK owns tile i; the others hand it their acc[.][.][i]. Region of (rg, writer kw):
-  // NQ units of 512 B (32 lanes x 16 B).
+  // ---- 1. reduction over the group's SKW slices, in the accumulator layout ------------------------
+  // pass i: slice i % SKW owns tile i; the others hand it their acc[.][.][i]. Region of (rg, writer kw):
+  // NQ units of 512 B (32 lanes x 16 B). The owner's sum starts from 0.f (first group) or from the
+  // running sum of the earlier groups (read back from its own ws unit).
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
-    const int o = i % SK;
+    const int o = i % SKW;
     r4d_t256_sync_lds();
     if (ks != o) {
       const int kw = ks > o ? ks - 1 : ks;
-      unsigned char* dst = lds + ((rg * (SK - 1) + kw) * NQ) * 512 + lane * 16;
+      unsigned char* dst = lds + ((rg * (SKW - 1) + kw) * NQ) * 512 + lane * 16;
 #pragma unroll
       for (int p = 0; p < NP; ++p)
 #pragma unroll
@@ -225,15 +265,21 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
     }
     r4d_t256_sync_lds();
     if (ks == o) {
-      const unsigned char* src = lds + ((rg * (SK - 1)) * NQ) * 512 + lane * 16;
+      const unsigned char* src = lds + ((rg * (SKW - 1)) * NQ) * 512 + lane * 16;
+      const float* unit_prev = ws_unit(i);
 #pragma unroll
       for (int p = 0; p < NP; ++p)
 #pragma unroll
         for (int f = 0; f < 2; ++f) {
           const int q = (p * 2 + f) * 2;
           v8f s = (v8f)(0.f);
+          if (ph > 0) {
+            const r4d_t256_v4f lo = *(const r4d_t256_v4f*)(unit_prev + ((q + 0) * 32 + lane) * 4);
+            const r4d_t256_v4f hi = *(const r4d_t256_v4f*)(unit_prev + ((q + 1) * 32 + lane) * 4);
+            s = __builtin_shufflevector(lo, hi, 0, 1, 2, 3, 4, 5, 6, 7);
+          }
 #pragma unroll
-          for (int sl = 0; sl < SK; ++sl) {
+          for (int sl = 0; sl < SKW; ++sl) {
             v8f term;
             if (sl == o) {
               term = acc[p][f][i];
@@ -250,12 +296,11 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
     }
   }
 
-  // ---- 2. hand the sums to ws in lane order, take a ticket ----------------------------------------
-  float* wsy = ws + (size_t)blockIdx.y * M * N;
+  // ---- 2. hand the sums to ws in lane order (the running sum, or the final one), take a ticket -----
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
-    if (ks == i % SK) {
-      float* unit = wsy + ((size_t)(rg * 4 + i) * (N / Wc) + n0 / Wc) * (16 * Wc);
+    if (ks == i % SKW) {
+      float* unit = ws_unit(i);
 #pragma unroll
       for (int p = 0; p < NP; ++p)
 #pragma unroll
@@ -267,6 +312,13 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
         }
     }
   }
+  if (ph + 1 < PH) {
+    // the running sum is read back by the same lanes next group; the barrier also keeps the next group's
+    // staging stores behind every wave's reduction reads of the shared LDS
+    __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "workgroup");
+    r4d_t256_sync_lds();
+  }
+  }   // groups of SKW slices
   const int g0 = n0 / 128 * 128;
   const unsigned contributors = (unsigned)(SKG * NBLK);
   __threadfence();
@@ -294,7 +346,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
       for (int f = 0; f < 2; ++f) sv[b][p][f] = svh[g0 + b * Wc + p * 32 + 16 * t + 8 * f + c];
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
-    if (ks != i % SK) continue;
+    if (ks != i % SKW) continue;
     const int R = rg * 4 + i;
     v8f v[NBLK * NP * 2];                                 // index (b * NP + p) * 2 + f
 #pragma unroll
@@ -381,34 +433,46 @@ struct r4d_t256_args {
   float out_scale;
 };
 
-template <int KB, int NP, int U, int RG, int SK>
+template <int KB, int NP, int U, int RG, int SKW, int PH, int TAIL>
 static void r4d_t256_launch(const r4d_t256_args& a) {
-  hipLaunchKernelGGL((r4d_gemm_trellis_nt_m256_kernel<KB, NP, U, RG, SK>), a.grid, a.block, a.smem,
+  hipLaunchKernelGGL((r4d_gemm_trellis_nt_m256_kernel<KB, NP, U, RG, SKW, PH, TAIL>), a.grid, a.block, a.smem,
                      a.stream, a.a0, a.a1, a.n_split, a.w, a.svh, a.c, a.ws, a.tickets, a.K, a.N,
                      a.SKG, a.out_scale);
 }
 
+// (SKW, PH): SKW K slices resident per workgroup, PH groups of them walked in turn, SK = SKW PH slices
+// in all. SKW = 8 needs NP = 1 (NP = 2's LDS would not fit), and PH > 1 is instantiated for RG = 4 only.
+// TAIL = (K/16 / (SK SKG)) % U: k-tiles a slice has beyond whole steps of U. Only 0 is instantiated
+// everywhere; TAIL 2 (mlp.down KB 4's SK 16, SKG 2: 34 k-tiles, U 4) for the two (SKW, PH) it needs.
 template <int KB, int NP, int U, int RG>
-static void r4d_t256_launch_sk(const r4d_t256_args& a, int SK) {
-  if (SK == 2) r4d_t256_launch<KB, NP, U, RG, 2>(a);
-  else if (SK == 4) r4d_t256_launch<KB, NP, U, RG, 4>(a);
-  else if (SK == 8 && NP == 1) r4d_t256_launch<KB, NP, U, RG, 8>(a);   // 32 waves; NP = 2's LDS would not fit
-  else r4d_t256_fail("SK must be 2 or 4 (8 with NP = 1)");
+static void r4d_t256_launch_sk(const r4d_t256_args& a, int SKW, int PH, int TAIL) {
+#define R4D_T256_CASE(W_, P_) \
+  if (SKW == W_ && PH == P_ && TAIL == 0) { r4d_t256_launch<KB, NP, U, RG, W_, P_, 0>(a); return; }
+  R4D_T256_CASE(2, 1) R4D_T256_CASE(4, 1)
+  if constexpr (NP == 1) { R4D_T256_CASE(8, 1) }
+  if constexpr (RG == 4 && NP == 1) {
+    R4D_T256_CASE(2, 2) R4D_T256_CASE(2, 4) R4D_T256_CASE(4, 2) R4D_T256_CASE(4, 4) R4D_T256_CASE(8, 2)
+    if (TAIL == 2 && SKW == 4 && PH == 4) { r4d_t256_launch<KB, NP, U, RG, 4, 4, 2>(a); return; }
+    if (TAIL == 2 && SKW == 8 && PH == 2) { r4d_t256_launch<KB, NP, U, RG, 8, 2, 2>(a); return; }
+  }
+#undef R4D_T256_CASE
+  r4d_t256_fail("(SKW, PH, k-tile tail) not instantiated for this (RG, NP, U)");
 }
-
 template <int KB>
-static void r4d_t256_launch_kb(const r4d_t256_args& a, int RG, int NP, int U, int SK) {
+static void r4d_t256_launch_kb(const r4d_t256_args& a, int RG, int NP, int U, int SKW, int PH, int TAIL) {
   // (RG, NP, U) = (4, 2, 2) is not instantiated: measured 0-15% slower than (4, 1, 4) on every class,
   // and it spills (KB = 4: 24 B/lane at 192 VGPRs; KB = 5: 52-260 B/lane).
-  if (RG == 4 && NP == 1 && U == 4) r4d_t256_launch_sk<KB, 1, 4, 4>(a, SK);
-  else if (RG == 2 && NP == 2 && U == 1) r4d_t256_launch_sk<KB, 2, 1, 2>(a, SK);
-  else if (RG == 2 && NP == 1 && U == 2) r4d_t256_launch_sk<KB, 1, 2, 2>(a, SK);
+  if (RG == 4 && NP == 1 && U == 4) r4d_t256_launch_sk<KB, 1, 4, 4>(a, SKW, PH, TAIL);
+  else if (RG == 2 && NP == 2 && U == 1) r4d_t256_launch_sk<KB, 2, 1, 2>(a, SKW, PH, TAIL);
+  else if (RG == 2 && NP == 1 && U == 2) r4d_t256_launch_sk<KB, 1, 2, 2>(a, SKW, PH, TAIL);
   else r4d_t256_fail("(RG, NP, U) must be (4,1,4), (2,2,1) or (2,1,2)");
 }
 
 void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
                               int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
-                              int SKG, int U, float out_scale, int64_t stream) {
+                              int SKG, int U, float out_scale, int64_t stream, int skw) {
+  // SK is the shipped row's K-slice count. skw = K slices resident per workgroup (0 = the default,
+  // min(SK, 4)); SK / skw groups are walked in turn.
   if (M != 128 && M != 256) r4d_t256_fail("M must be 128 or 256");
   const int RG = M / 64;
   if (K <= 0 || N <= 0 || K % 128 || N % 128) r4d_t256_fail("K and N must be multiples of 128");
@@ -419,15 +483,21 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
   if (N % Wc) r4d_t256_fail("N must be a multiple of the block width 32 NP");
   if (n_split < 0 || n_split > N || n_split % 128) r4d_t256_fail("n_split must be in 0..N, a multiple of 128");
   if (NP * U != RG) r4d_t256_fail("NP * U must equal M / 64");
-  if ((K / 16) % (SK * SKG * U)) r4d_t256_fail("(K/16) must be divisible by SK*SKG*U");
+  if (SK != 2 && SK != 4 && SK != 8 && SK != 16) r4d_t256_fail("SK must be 2, 4, 8 or 16");
+  if ((K / 16) % (SK * SKG)) r4d_t256_fail("(K/16) must be divisible by SK*SKG");
+  if ((K / 16) / (SK * SKG) < U) r4d_t256_fail("a slice needs at least U k-tiles");
   if (!w || !c || !svh || !ws || !tickets || !a0) r4d_t256_fail("null buffer");
+  const int SKW = skw > 0 ? skw : (SK < 4 ? SK : 4);
+  if (SKW < 2 || SK % SKW) r4d_t256_fail("skw must divide SK");
+  const int PH = SK / SKW;
+  const int TAIL = ((K / 16) / (SK * SKG)) % U;
   r4d_t256_args a;
   a.grid = dim3(N / Wc, SKG, 1);
-  a.block = dim3(RG * SK * WAVE32);
-  const size_t stage = (size_t)2 * SK * NP * U * 1024;
-  const size_t red = (size_t)RG * (SK - 1) * NP * 4 * 512;
+  a.block = dim3(RG * SKW * WAVE32);
+  const size_t stage = (size_t)2 * SKW * NP * U * 1024;
+  const size_t red = (size_t)RG * (SKW - 1) * NP * 4 * 512;
   a.smem = stage > red ? stage : red;
-  if (a.smem > 64 * 1024 || RG * SK > 32) r4d_t256_fail("LDS > 64 KiB or more than 32 waves");
+  if (a.smem > 64 * 1024 || RG * SKW > 32) r4d_t256_fail("LDS > 64 KiB or more than 32 waves");
   a.stream = (hipStream_t)stream;
   a.a0 = (const unsigned short*)a0;
   a.a1 = (const unsigned short*)(a1 ? a1 : a0);
@@ -439,8 +509,8 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
   a.tickets = (unsigned*)tickets;
   a.K = K; a.N = N; a.SKG = SKG;
   a.out_scale = out_scale;
-  if (KB == 4) r4d_t256_launch_kb<4>(a, RG, NP, U, SK);
-  else r4d_t256_launch_kb<5>(a, RG, NP, U, SK);
+  if (KB == 4) r4d_t256_launch_kb<4>(a, RG, NP, U, SKW, PH, TAIL);
+  else r4d_t256_launch_kb<5>(a, RG, NP, U, SKW, PH, TAIL);
 }
 
 size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG) {

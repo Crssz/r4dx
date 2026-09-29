@@ -25,10 +25,6 @@
 #include "r4d.h"
 #include "trellis_tuning_rows.hpp"
 
-void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
-                              int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
-                              int SKG, int U, float out_scale, int64_t stream, int skw);
-
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
   std::fprintf(stderr, "HIP error %s at %d: %s\n", #x, __LINE__, hipGetErrorString(e_)); std::exit(1); } } while (0)
 
@@ -117,6 +113,8 @@ int main(int argc, char** argv) {
           for (size_t i = 0; i < h0.size(); ++i) { nz += (h0[i] & 0x7fff) == 0; nn += (h0[i] & 0x7f80) == 0x7f80; }
           for (int skw : {2, 4, 8}) {
             if (T.SK % skw || T.SK / skw > 4 || 4 * skw > 32) continue;
+            // only the instantiated configurations (r4d.h: KB 5 has no SK / skw > 1: 192 VGPRs)
+            if (r4d_gemm_trellis_nt_m256_check(256, K, N, n_split, KB, T.SK, 1, T.SKG, 4, skw) != nullptr) continue;
             ++checks;
             CK(hipMemset(dC1, 0xFF, (size_t)256 * N * 2));
             r4d_gemm_trellis_nt_m256((int64_t)dA, (int64_t)A1, n_split, (int64_t)dw, (int64_t)dsvh, (int64_t)dC1, (int64_t)ws, (int64_t)tk,

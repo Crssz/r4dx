@@ -962,6 +962,17 @@ class Model {
   GdnControlCache gdn_control_;  // shared by every GDN layer -- see gdn_state.h
 
   int64_t max_chunk_ = 64;
+  // 256-row prompt prefill (R4DX_PREFILL_CHUNK=256, prefill_chunk.h, docs/trellis-m256.md). wide_rows_
+  // is 256 when Load() sized the activation buffers, the position / seqused arrays and the arena for a
+  // 256-row super-chunk (the env var asked for it, TP=1, no MTP head, no drafter), else 0 -- and then
+  // nothing in this Model differs from before the option existed. prefill_wide_active_ is 256 only
+  // inside a Prefill call that decided to run super-chunks (RunChunk then accepts T == 256 on its
+  // prefill path), else 0. prefill_chunk_noted_: the one stderr line for a 256 request that falls back.
+  int64_t wide_rows_ = 0;
+  int64_t prefill_wide_active_ = 0;
+  bool prefill_chunk_noted_ = false;
+  // Rows per RunChunk call of THIS Prefill call: 256 or max_chunk_. Prints the fallback line once.
+  int64_t PrefillRowsForCall(bool has_chunk_callback);
   int64_t pos_ = 0;        // tokens already committed to KV/GDN state
   bool started_ = false;   // false only before the very first RunChunk call (GDN has_init gate)
 

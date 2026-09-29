@@ -3,6 +3,13 @@
 # 4.4's one-block decode).
 #
 #   cmake -DISA=<r4d_gemm_trellis_nt_m64-gfx1201.s> -DSTAMP=<file> -P check_trellis_isa.cmake
+#   cmake -DISA=<r4d_gemm_trellis_nt_m256-gfx1201.s> -DSTAMP=<file> \
+#         -DGEMM_KERNEL=r4d_gemm_trellis_nt_m256_kernel -P check_trellis_isa.cmake
+#
+# GEMM_KERNEL (default r4d_gemm_trellis_nt_m64_kernel) names the GEMM kernel template whose
+# instantiations the listing is checked for: the M <= 64 unit, or the M = 256 / 128 unit
+# (r4d_gemm_trellis_nt_m256.hip, whose instantiation table r4d_t256_inst lists only the combinations
+# that meet the same rules). MAX_VGPR (default 190) is the VGPR limit of the instantiations.
 #
 # Reads a device-only -S listing and fails the build unless
 #
@@ -33,8 +40,14 @@ endif()
 if(NOT DEFINED STAMP)
   message(FATAL_ERROR "check_trellis_isa: STAMP not set")
 endif()
+if(NOT DEFINED GEMM_KERNEL)
+  set(GEMM_KERNEL "r4d_gemm_trellis_nt_m64_kernel")
+endif()
+if(NOT DEFINED MAX_VGPR)
+  set(MAX_VGPR 190)
+endif()
 
-set(max_vgpr 190)
+set(max_vgpr ${MAX_VGPR})
 
 # One list element per line; `;` and square brackets are list syntax in CMake, so the listing's
 # comments start with `#` here and VGPR ranges read v<a:b>.
@@ -68,7 +81,7 @@ set(asm_valu 0)
 set(near 0)
 set(near_msgs "")
 foreach(line IN LISTS lines)
-  if(line MATCHES "^(_Z[0-9A-Za-z_]*r4d_gemm_trellis_nt_m64_kernel[0-9A-Za-z_]*):")
+  if(line MATCHES "^(_Z[0-9A-Za-z_]*${GEMM_KERNEL}[0-9A-Za-z_]*):")
     set(fn "${CMAKE_MATCH_1}")
     set(in_asm OFF)
     set(tail 0)
@@ -173,7 +186,7 @@ set(failures "")
 foreach(line IN LISTS lines)
   if(line MATCHES "^[ \t-]*\\.name:[ \t]+([^ \t]+)")
     set(name "${CMAKE_MATCH_1}")
-    if(NOT name MATCHES "r4d_gemm_trellis_nt_m64_kernel|r4d_trellis_reconstruct_f16_kernel")
+    if(NOT name MATCHES "${GEMM_KERNEL}|r4d_trellis_reconstruct_f16_kernel")
       set(name "")
     else()
       math(EXPR count "${count} + 1")
@@ -210,7 +223,8 @@ if(failures)
   string(REPLACE ";" "\n  " msg "${failures}")
   message(FATAL_ERROR "check_trellis_isa: ${ISA}:\n  ${msg}\n(every instantiation must fit "
                       "${max_vgpr} VGPRs with no scratch -- shrink r4d_tq_max_mt in "
-                      "third_party/libr4d/r4d_gemm_trellis_nt_m64.hip)")
+                      "third_party/libr4d/r4d_gemm_trellis_nt_m64.hip, or drop the combination from "
+                      "r4d_t256_inst in r4d_gemm_trellis_nt_m256.hip)")
 endif()
 if(near GREATER 0)
   string(REPLACE ";" "\n  " msg "${near_msgs}")

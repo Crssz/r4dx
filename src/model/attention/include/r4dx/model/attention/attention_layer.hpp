@@ -22,6 +22,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -171,8 +172,26 @@ class AttentionLayer {
                const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
                int next_epilogue = 0, void* next_epilogue_out = nullptr,
                float* next_epilogue_scale = nullptr, const int32_t* rope_pos3 = nullptr,
-               bool prefill_split_kv = false) {
-    if (T < 1 || T > 64) {
+               bool prefill_split_kv = false, int attn_slice = 0,
+               const int32_t* seqused_k_slices = nullptr) {
+    // `attn_slice` (256-row prefill chunk, Model's R4DX_PREFILL_CHUNK=256, docs/trellis-m256.md): 0 --
+    // the default, every caller before it -- is the T = 1..64 call as always. 64: T is a multiple of 64
+    // (up to 256) and everything row-independent (norms, the linears, split_qg, qk-norm, rope, the KV
+    // write, the gate, the residual) sees all T rows -- each kernel gives a row the same bits at any T --
+    // while the attention core runs once per 64-row sub-slice, in order: sub-slice j is exactly the launch
+    // a 64-row chunk at start_pos + 64 j makes (q_len 64, its own causal context). Its keys are already
+    // in the cache (the KV write covers all T rows first), and the causal mask hides the later
+    // sub-slices' rows from it, so the bytes equal T / 64 consecutive 64-row calls.
+    // `seqused_k_slices`: device int32 [T / 64], entry j = start_pos + 64 (j + 1), the caller's persistent
+    // buffer like `seqused_k`. `positions` then has T entries.
+    const bool sliced = attn_slice > 0 && T > attn_slice;
+    if (sliced) {
+      if (attn_slice != 64 || T % 64 != 0 || T > 256 || seqused_k_slices == nullptr) {
+        throw std::invalid_argument(
+            "AttentionLayer::Forward: attn_slice must be 64, T a multiple of 64 up to 256, and "
+            "seqused_k_slices set");
+      }
+    } else if (T < 1 || T > 64) {
       throw std::invalid_argument(
           "AttentionLayer::Forward: T must be 1..64 (interim skinny-GEMM/paged-attention band)");
     }
@@ -372,25 +391,46 @@ class AttentionLayer {
       // prefill M1: a prompt-prefill chunk takes the exact-wide launch by default (the plain
       // launch's bits); split-KV (PrefillSplitKvSplits) and the plain launch are opt-in via
       // R4DX_PREFILL_SPLITKV. Every non-prefill caller takes the plain launch.
+      // Sliced (attn_slice): one launch per 64-row sub-slice j, whose call is the 64-row chunk's own
+      // (q_len 64, ctx start_pos + 64 (j + 1), so a split law sees what it would see chunk by chunk).
       const int forced = prefill_split_kv ? PrefillSplitKvOverride() : 1;
-      const int splits = !prefill_split_kv ? 1
-                         : forced > 0     ? forced
-                         : forced == kPrefillAttnExact ? 1
-                                          : PrefillSplitKvSplits(start_pos + T, T, Hkv);
+      const int slice_rows = sliced ? attn_slice : T;
+      const int n_slices = T / slice_rows;
+      const auto splits_of = [&](int j) {
+        return !prefill_split_kv ? 1
+               : forced > 0     ? forced
+               : forced == kPrefillAttnExact ? 1
+                                : PrefillSplitKvSplits(start_pos + slice_rows * (j + 1), slice_rows, Hkv);
+      };
       a.scratch = nullptr;
-      if (forced == kPrefillAttnExact) {
-        a.splits = 0;  // the library's default exact-wide geometry
-        ProfiledCall(prof, stream, "attn.core_prefill",
-                     [&] { r4dx::core::r4d::AttnPrefillExactFp8Kv(a, stream); });
-      } else if (splits > 1) {
-        a.splits = splits;
-        const int64_t bytes = r4dx::core::r4d::AttnPrefillSplitKvScratchBytes(a);
-        a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(bytes), /*align_bytes=*/256);
-        ProfiledCall(prof, stream, "attn.core_prefill",
-                     [&] { r4dx::core::r4d::AttnPrefillSplitKvFp8Kv(a, stream); });
-      } else {
-        ProfiledCall(prof, stream, "attn.core_prefill",
-                     [&] { r4dx::core::r4d::AttnPrefillFp8Kv(a, stream); });
+      a.q_len = slice_rows;
+      if (forced != kPrefillAttnExact) {
+        int max_splits = 1;
+        for (int j = 0; j < n_slices; ++j) max_splits = std::max(max_splits, splits_of(j));
+        if (max_splits > 1) {  // one scratch for every sub-slice (each uses its own, smaller or equal, count)
+          a.splits = max_splits;
+          const int64_t bytes = r4dx::core::r4d::AttnPrefillSplitKvScratchBytes(a);
+          a.scratch = arena.Alloc<uint8_t>(static_cast<size_t>(bytes), /*align_bytes=*/256);
+        }
+      }
+      for (int j = 0; j < n_slices; ++j) {
+        a.q = q + static_cast<size_t>(j) * slice_rows * H * D;
+        a.out = attn_out + static_cast<size_t>(j) * slice_rows * H * D;
+        a.seqused_k = sliced ? seqused_k_slices + j : seqused_k;
+        const int splits = splits_of(j);
+        if (forced == kPrefillAttnExact) {
+          a.splits = 0;  // the library's default exact-wide geometry
+          ProfiledCall(prof, stream, "attn.core_prefill",
+                       [&] { r4dx::core::r4d::AttnPrefillExactFp8Kv(a, stream); });
+        } else if (splits > 1) {
+          a.splits = splits;
+          ProfiledCall(prof, stream, "attn.core_prefill",
+                       [&] { r4dx::core::r4d::AttnPrefillSplitKvFp8Kv(a, stream); });
+        } else {
+          a.splits = 0;
+          ProfiledCall(prof, stream, "attn.core_prefill",
+                       [&] { r4dx::core::r4d::AttnPrefillFp8Kv(a, stream); });
+        }
       }
     }
 

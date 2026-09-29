@@ -57,6 +57,11 @@ set(R4DX_KERNEL_TESTS
   # as test_trellis_decode.
   test_trellis_input
   test_trellis_gemm
+  # The M = 256 trellis GEMM (docs/trellis-m256.md, R4DX_PREFILL_CHUNK=256): one launch against four of
+  # the shipped M = 64 kernel, byte for byte, on synthetic data, for every class the model wires to it at
+  # both rates (plus run-to-run, ticket reset, a negative control and the refusal messages). Skips (77)
+  # only without a HIP device; needs no golden data.
+  test_trellis_m256
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -84,7 +89,7 @@ set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
 # has passed, and 1 if that part failed -- so a skip never hides a real regression.
 set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
                      test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 PROPERTIES SKIP_RETURN_CODE 77)
 
 # `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
 # to be able to CATCH anything at all.
@@ -111,6 +116,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
+                            test_trellis_m256.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -118,6 +124,9 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
 # fused gate-mul (M5).
 target_link_libraries(test_attn_gate_mul_hadamard PRIVATE r4dx_model_attention)
 target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
+# test_trellis_m256 asks src/model/linear.cpp for the shipped M = 64 row (PickTuning) and the plan
+# ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
+target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
 
 # test_rotation_ref_cpu: pure CPU (no HIP call, no kernel library) -- pins rotation_ref.hpp, the
 # fp64 reference the two tests above compare against, to the rotation contract's definitions

@@ -41,10 +41,6 @@
 #include "r4d.h"
 #include "trellis_tuning_rows.hpp"
 
-void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
-                              int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
-                              int SKG, int U, float out_scale, int64_t stream, int skw);
-
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
   std::fprintf(stderr, "HIP error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, hipGetErrorString(e_)); \
   std::exit(1); } } while (0)
@@ -144,20 +140,25 @@ static bool TableRow(const Shape& s, int kb, Stock& out) {
 static std::vector<Big> BigList(const Shape& s, int kb, bool m128, const Stock& table) {
   std::vector<Big> v;
   const int SK = table.SK;
+  // Only the instantiated configurations (r4d_gemm_trellis_nt_m256_check; e.g. KB 5 has none with SK / skw > 1).
+  auto ok = [&](const Big& g) {
+    return r4d_gemm_trellis_nt_m256_check(g.M, s.K, s.N, s.N, kb, g.SK, g.NP, g.SKG, g.U, g.SKW) == nullptr;
+  };
   for (int skw : {2, 4, 8}) {
     if (SK % skw || skw > SK) continue;
     const int ph = SK / skw;
     if (ph > 4) continue;
     if (!m128) {
       if (256 / 64 * skw > 32) continue;
-      v.push_back({256, 1, 4, SK, table.SKG, skw});
+      const Big g{256, 1, 4, SK, table.SKG, skw};
+      if (ok(g)) v.push_back(g);
     } else {
       if (ph > 1) continue;
-      v.push_back({128, 1, 2, SK, table.SKG, skw});
-      if (skw <= 4) v.push_back({128, 2, 1, SK, table.SKG, skw});
+      const Big g1{128, 1, 2, SK, table.SKG, skw}, g2{128, 2, 1, SK, table.SKG, skw};
+      if (ok(g1)) v.push_back(g1);
+      if (skw <= 4 && ok(g2)) v.push_back(g2);
     }
   }
-  (void)s; (void)kb;
   return v;
 }
 

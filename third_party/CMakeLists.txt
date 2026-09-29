@@ -1,6 +1,6 @@
 # third_party/CMakeLists.txt
 #
-# r4d_core: a static library built from 16 of libr4d's HIP translation units (attention, GDN,
+# r4d_core: a static library built from 17 of libr4d's HIP translation units (attention, GDN,
 # skinny/quantized GEMMs, the kernel registry -- NOT r4d_module.hip, the pybind11 glue, and NOT any
 # r4d_ar_* unit, the multi-GPU all-reduce kernels this single-GPU engine never calls).
 #
@@ -48,7 +48,7 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
 endif()
 
 # unit -> extra per-unit flags, mirroring libr4d/build_windows.ps1's $UNITS table, restricted to
-# the 16 units r4dx links (r4d_module.hip and every r4d_ar_* unit are excluded on purpose). One
+# the 17 units r4dx links (r4d_module.hip and every r4d_ar_* unit are excluded on purpose). One
 # deliberate deviation from that table: r4d_gemm_w4a16_nt_m64's group is an r4dx build option (see
 # below) rather than the kernel's own 128 default.
 set(R4D_UNITS
@@ -63,6 +63,7 @@ set(R4D_UNITS
   r4d_gemm_bf16_nt_m64
   r4d_gemm_w4a16_nt_m64
   r4d_gemm_trellis_nt_m64
+  r4d_gemm_trellis_nt_m256
   r4d_gemm_w4a8_nt_m64
   r4d_gemm_mxfp4a8_nt_m64
   r4d_quant_act_i8
@@ -138,7 +139,31 @@ add_custom_command(
   COMMENT "check_trellis_isa: r4d_gemm_trellis_nt_m64 VGPR/scratch"
   VERBATIM
 )
-add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}")
+# The same check for the M = 256 / 128 unit (docs/trellis-m256.md): every instantiation of
+# r4d_gemm_trellis_nt_m256_kernel (the combinations r4d_t256_inst lists, and only those) must fit 190
+# VGPRs with no scratch and no near dependency behind the decode's inline asm.
+set(R4D_TRELLIS256_ISA "${R4D_OBJ_DIR}/r4d_gemm_trellis_nt_m256-${R4D_GFX_ARCH}.s")
+set(R4D_TRELLIS256_ISA_STAMP "${R4D_OBJ_DIR}/r4d_gemm_trellis_nt_m256_isa.ok")
+add_custom_command(
+  OUTPUT "${R4D_TRELLIS256_ISA}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4D_HIPCC_PATH}"
+          "${R4D_HIPCC}" ${R4D_BASE_FLAGS} ${R4D_EXTRA_r4d_gemm_trellis_nt_m256} --cuda-device-only -S
+          -Wno-unused-command-line-argument "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip"
+          -o "${R4D_TRELLIS256_ISA}"
+  DEPENDS "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip" ${R4D_HEADERS}
+  COMMENT "hipcc -S (${R4D_GFX_ARCH}) r4d_gemm_trellis_nt_m256 ISA"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT "${R4D_TRELLIS256_ISA_STAMP}"
+  COMMAND "${CMAKE_COMMAND}" "-DISA=${R4D_TRELLIS256_ISA}" "-DSTAMP=${R4D_TRELLIS256_ISA_STAMP}"
+          -DGEMM_KERNEL=r4d_gemm_trellis_nt_m256_kernel
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+  DEPENDS "${R4D_TRELLIS256_ISA}" "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+  COMMENT "check_trellis_isa: r4d_gemm_trellis_nt_m256 VGPR/scratch"
+  VERBATIM
+)
+add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}" "${R4D_TRELLIS256_ISA_STAMP}")
 
 add_library(r4d_core STATIC ${R4D_OBJS})
 add_dependencies(r4d_core r4d_trellis_isa)

@@ -250,7 +250,7 @@ class AttentionLayer {
 
     // ---- fused q_proj + output gate, then split per-head-interleaved --------------------------
     // Dispatched through the shared r4dx::model::ApplyLinear (decode-perf pass, 2026-09-19) --
-    // whichever layout Container::Load loaded `w.qg` as (bf16/mxfp4/w4a16/w4a8), same as GDN's
+    // whichever layout Container::Load loaded `w.qg` as (bf16/w4a16/trellis), same as GDN's
     // in_proj_qkv/out_proj and MLP's gate_up/down. Replaces this component's own bf16-only Linear
     // (attention/linear.hpp) for this weight -- that wrapper is still used below for k/v, which
     // have no quantized on-disk form.

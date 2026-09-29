@@ -1039,7 +1039,7 @@ sections they live in carry the detail):
   (`tests/kernels/test_vision_kernels.cpp`): `r4dx_layernorm_bf16`, `r4dx_bias_add_bf16`,
   `r4dx_gelu_tanh_bf16`, `r4dx_gelu_erf_bf16`, `r4dx_vision_qkv_rope_bf16`,
   `r4dx_vision_pos_embed_bf16`.
-- **`r4d_attn_vit_h72_bf16` needed no submodule change.** It was already in
+- **`r4d_attn_vit_h72_bf16` needed no libr4d change.** It was already in
   `third_party/CMakeLists.txt`'s unit list and already compiled correctly for this Windows LLP64
   build; `block0_attn_proj_out` (downstream of it) matches at `rel_l2 = 2.30e-3`, the same order as
   its own input, i.e. the attention step amplifies nothing.

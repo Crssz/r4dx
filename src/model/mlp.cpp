@@ -26,8 +26,7 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
   // (tests/kernels/test_fused_quant.cpp) and mechanically wired through
   // GdnLayer::Forward/AttentionLayer::Forward/Mlp::Forward/ApplyLinear. EpilogueForLayout
   // (linear.cpp) returns r4dx_epilogue_none for every layout (w4a16's f16 regressed decode
-  // wall-clock; the w4a8/mxfp4 epilogues that changed the generated token stream are retired with
-  // their layouts, see docs/status.md's R2/P2 section), which makes
+  // wall-clock, see docs/status.md's R2/P2 section), which makes
   // x_normed_pre_epilogue/next_epilogue always 0 here too, so the code below always takes the plain
   // unfused path; the f16 wiring is left in place so a future pass only has to flip
   // EpilogueForLayout.

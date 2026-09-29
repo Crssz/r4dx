@@ -10,8 +10,9 @@ document decides **how**.
 container is now the Huihui abliterated trellis mix4.5m (`huihui-qwen38-27b-abl-trellis-mix45m.r4dx`,
 `docs/huihui.md`). Everything below that names a container, Hessian or KL reference of the BASE model
 (q2ab_hv2_q3, v6, `qwen38-27b-trellis-mix45m.r4dx`, K4m, `hessian\hessian-v2`, `trellis-q\K4m`,
-`kl-canon\ref`) describes the run that shipped the format; those base files were retired on
-2026-09-29 and every number stays as the historical record. **Gate A6 (no w4a16 regression) has lost
+`kl-canon\ref`) describes the run that shipped the format; the base containers, Hessians and oracle
+bits were retired on 2026-09-29 (`kl-canon\ref`, the base model's bf16 reference, is still on disk but
+has no base container left to score), and every number stays as the historical record. **Gate A6 (no w4a16 regression) has lost
 its 64-layer target** (v6 / q2ab_hv2_q3 were the only 64-layer w4a16 containers; the old Huihui v6 is
 the same recipe on the other model and is not kept either): from now on A6 is `tests/kernels` +
 `test_mtp` / `test_tp_loader` / `test_tp_emulation` / `test_tp_real_vs_emulation` / row 6 of

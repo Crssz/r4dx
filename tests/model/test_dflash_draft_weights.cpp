@@ -117,7 +117,7 @@ int main() {
 
   // ---- the w4a16 group guard, and its scope (Milestone 11 + adversarial-review fix) ------------
   // r4dx-convert writes __metadata__.quant unconditionally, so EVERY dflash2 container records a
-  // w4a16 group -- including one whose linears are bf16 or mxfp4 and which therefore contains no
+  // w4a16 group -- including one whose linears are all bf16 and which therefore contains no
   // .w4a16.* tensor at all. DflashDraftWeights::Open must refuse a group mismatch only when the
   // container actually carries w4a16 bytes; refusing the others rejects containers that this build
   // can read byte-for-byte correctly (qwen38-27b-dflash2-bf16.r4dx was one).

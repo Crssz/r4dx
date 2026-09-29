@@ -1,6 +1,6 @@
 // r4dx_convert::linear_layouts -- plans and emits the `.{layout}` tensor family
 // (docs/container-format.md "Quantized layout tensors") for one linear weight `W[N,K]`: `bf16`
-// always, plus `w4a16` when the run requested it (mxfp4 and w4a8 are retired).
+// always, plus `w4a16` when the run requested it.
 //
 // Two free functions mirroring ContainerWriter's two phases: PlanLinearLayouts() registers every
 // output tensor's name/shape/byte-size (pure function of N,K -- no data needed, so the whole

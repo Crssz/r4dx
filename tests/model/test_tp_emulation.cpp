@@ -282,7 +282,6 @@ Rows g_bf16_ref[2];
 // TP run of the 40-token script (the fault test's fresh-run reference for w4a16).
 //
 // The numerics gate is docs/tp.md 10.1's per-row relative L2 vs TP=1: <= 1e-2 for bf16 and w4a16.
-// (The mxfp4 and w4a8 layouts, with their own gates, are retired.)
 Rows TestLayout(const std::string& layout) {
   std::printf("==== layout %s ====\n", layout.c_str());
   const std::vector<int32_t> p40 = Tokens(40, 11), p70 = Tokens(70, 23), forced = Tokens(kDecodeRows, 37);

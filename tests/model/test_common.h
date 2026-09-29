@@ -81,7 +81,7 @@ inline r4dx::core::DeviceBuffer<uint16_t> UploadBf16(const std::vector<uint16_t>
 }
 
 // sqrt(sum((got-ref)^2)) / sqrt(sum(ref^2)) over the flattened tensor -- the same metric
-// tests/kernels/test_mxfp4_gemm.cpp and tools/reference/layer_golden.py's own TOLERANCES use.
+// tools/reference/layer_golden.py's own TOLERANCES use.
 inline double RelL2(const std::vector<float>& got, const std::vector<float>& ref) {
   if (got.size() != ref.size()) throw std::runtime_error("RelL2: size mismatch");
   double num = 0.0, den = 0.0;

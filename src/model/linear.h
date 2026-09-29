@@ -96,7 +96,7 @@ void SetTp2TuningForThisThread(bool enabled);
 
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
 // r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for
-// kW4a16 (the mxfp4/w4a8 layouts that used other epilogues are retired). Shared by
+// kW4a16. Shared by
 // every ApplyLinear caller that wants to pre-fuse its producer's cast epilogue (docs/r9700.md
 // R2/P2) so both sides of the wiring agree on the mapping in exactly one place.
 // kTrellis is r4dx_epilogue_none (docs/trellis-kernel.md 5.3): its input transform is per LINEAR

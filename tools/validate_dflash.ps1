@@ -19,8 +19,8 @@
   mismatch, a third CONTROL run `--mtp 7` (the existing, already-shipped MTP path, zero DFlash2 code
   involved at all) -- and compares SHA-256 of each pair's raw stdout.
 
-  KNOWN, DOCUMENTED PRECEDENT for a non-match that is NOT a bug (docs/mtp.md): mxfp4's `--mtp 3`
-  was already known to diverge from `--mtp 0` on the standard prompt because batched multi-row
+  KNOWN, DOCUMENTED PRECEDENT for a non-match that is NOT a bug (docs/mtp.md): `--mtp 3` was
+  already known to diverge from `--mtp 0` on the standard prompt because batched multi-row
   verification changes GEMM reduction order relative to sequential single-row decode, which is not
   bit-associative for floating point. THIS SCRIPT'S OWN FIRST RUN (2026-09-20) additionally found
   that w4a16 -- previously believed exempt (docs/mtp.md's own bf16-exact-arithmetic-style
@@ -32,7 +32,7 @@
   anything DFlash2-specific, on real hardware, not by assumption. `--dflash` verifies through the
   exact same Model::VerifyWindow batched path MTP's own `--mtp N` does (both go through the SAME
   generalized VerifyWindow -- docs/dflash2.md section 7 item 3), so this mechanism applies
-  identically to both, on every layout, not just mxfp4 -- this script's control run below makes
+  identically to both, on every layout -- this script's control run below makes
   that comparison directly, automatically, for every mismatch, rather than assuming it from a
   layout name.
 
@@ -62,7 +62,7 @@
   trellis container loads with no other) -- or, when -Model names another container explicitly,
   w4a16 (bf16 excluded, standing bf16-retired-from-perf-work rule -- docs/status.md). w4a16 at 64
   layers needs a multi-layout container; none is kept on disk since the base v6 was retired
-  (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries it. (mxfp4 and w4a8 are retired.)
+  (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries it.
 
 .PARAMETER MaxTokens
   --max-tokens for every generation. Default 40, matching validate_fusion.ps1's own default (long
@@ -428,12 +428,12 @@ $results | Format-Table -AutoSize | Out-String | Write-Output
 
 if ($failures -gt 0) {
     Write-Output "[validate_dflash] FAILED: $failures / $($results.Count) combinations diverged " +
-        "(not accepted as the known mxfp4 batched-reduction-order mechanism)"
+        "(not accepted as the known batched-reduction-order mechanism)"
     Exit-Validation 1
 }
 if ($warnings -gt 0) {
     Write-Output "[validate_dflash] PASSED WITH WARNINGS: $($results.Count - $warnings) byte-identical, " +
-        "$warnings accepted as the known mxfp4 divergence mechanism (docs/mtp.md)"
+        "$warnings accepted as the known batched-verify divergence mechanism (docs/mtp.md)"
     Exit-Validation 0
 }
 Write-Output "[validate_dflash] PASSED: $($results.Count) / $($results.Count) combinations byte-identical"

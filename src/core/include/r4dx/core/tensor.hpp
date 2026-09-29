@@ -1,6 +1,6 @@
 // r4dx::core::TensorView: a non-owning view over a device (or host) buffer -- pointer, dtype,
 // shape and strides in ELEMENTS (matching the convention every r4d.h struct/comment uses:
-// R4DArgs.kv_block_stride, r4d_quant_act_i8's row stride, etc. are all elements, never bytes).
+// R4DArgs.kv_block_stride, the GEMMs' row strides, etc. are all elements, never bytes).
 // Owns nothing; the DeviceBuffer/PinnedBuffer it points into must outlive it.
 #pragma once
 

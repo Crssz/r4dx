@@ -7,8 +7,7 @@
 //     Gather(pack(W), PlanRows/PlanCols(...)) == pack(W[rank rows or cols])   byte for byte
 //
 // i.e. the loader can cut a rank's shard straight out of the one converted container and get
-// exactly the bytes the converter would have written for the shard itself. (The mxfp4 layout's
-// K-slice `wref` exception is gone with the layout.)
+// exactly the bytes the converter would have written for the shard itself.
 //
 // Coverage:
 //   1. RuleFor on the REAL v6 config: every tensor family of docs/tp.md 4.2 (text layers, MTP head,
@@ -22,9 +21,8 @@
 //      both ranks, every layout, real packers on random W with outliers.
 //   4. docs/tp.md 10.2's explicit shapes (single segment, fused qkv/gate_up/qg-shaped, K = 1536
 //      and the 17 x 64 per-rank K that mirrors mlp.down's 8704 = 17 x 512).
-//   5. (retired: the mxfp4 wref exception.)
-//   6. Misalignment throws; Gather bounds.
-//   7. Trellis `.trellis.w` (docs/trellis-kernel.md 2.4) against the converter's RegridToPairGrid.
+//   5. Misalignment throws; Gather bounds.
+//   6. Trellis `.trellis.w` (docs/trellis-kernel.md 2.4) against the converter's RegridToPairGrid.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

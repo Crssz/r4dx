@@ -153,7 +153,7 @@ namespace {
 // per-layer GDN state + paged KV cache, then everything else: arena/staging/logits/MTP scratch)
 // give a real weights/KV/arena/free breakdown from what the driver actually reports, rather than
 // from summing this codebase's own byte-size arithmetic (which is exactly what Q13 flagged as
-// insufficient to explain w4a8's "identical 15.75 GiB to w4a16 despite 0.35 GiB smaller weights").
+// insufficient to explain a layout with 0.35 GiB smaller weights measuring the same 15.75 GiB).
 struct VramSnap {
   size_t free_bytes = 0, total_bytes = 0;
   bool ok = false;
@@ -508,8 +508,8 @@ Model Model::Load(const ModelOptions& opts) {
   // state (the per-layer paged-cache/recurrent-state loop above) / arena+activation scratch
   // (buf_a_/b_/logits_dev_/arena_/MTP scratch) / free, all from what the driver actually reports
   // at each phase boundary -- not from this codebase's own tensor-shape arithmetic (docs/r9700.md
-  // Q13's own point: that arithmetic could not explain why w4a8's 0.35 GiB-smaller weights still
-  // measured the identical 15.75 GiB as w4a16). Printed unconditionally (one line, stderr) rather
+  // Q13's own point: that arithmetic could not explain why a layout with 0.35 GiB-smaller weights
+  // still measured the same 15.75 GiB). Printed unconditionally (one line, stderr) rather
   // than gated behind a flag -- cheap, and exactly the diagnostic R14 asks every load to carry.
   // Stage S3: the dflash_drafter figure below (weights+KV-ring+draft-block-scratch, all allocated by
   // DflashDraft::Load above) is ALSO already included in kv_b's total (it was allocated between the

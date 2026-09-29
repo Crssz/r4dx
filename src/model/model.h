@@ -110,11 +110,11 @@ struct ModelOptions {
   // MTP head layout (docs/mtp.md "MTP head layout"): the layout for ONLY the MTP head's four
   // quantized linears (mtp.attn.qg/o, mtp.mlp.gate_up/down), independent of `layout`. nullopt
   // (default) tracks `layout` -- i.e. the head loads in whatever GEMM layout the body uses.
-  // Measured (docs/mtp.md's "MTP head layout" table, K=1..4 x w4a8/w4a16/mxfp4): the
+  // Measured (docs/mtp.md's "MTP head layout" table, K=1..4): the
   // layout-matched head is FASTER than a bf16 head in 23/24 configurations (smaller GEMMs, no
   // extra VRAM/load time) and acceptance is a wash -- often slightly HIGHER, never meaningfully
   // lower, because a bf16 head sitting on top of h_seed (already carrying the body's own
-  // quantization noise for w4a8/mxfp4) gains nothing from its own extra precision. Set explicitly
+  // quantization noise for a 4-bit layout) gains nothing from its own extra precision. Set explicitly
   // to Layout::kBf16 (CLI: `--mtp-head-layout bf16`) to force the exact-arithmetic head instead
   // (~0.5 GB extra VRAM). Ignored (no effect, no extra VRAM) when the container has no mtp.*
   // weights.
@@ -169,7 +169,7 @@ struct ModelOptions {
   // The container's own packed layout (its `__metadata__.dflash2.layout` field) is read directly
   // from the file and used to select which `<tensor>.{layout}.*` names to load -- this field does
   // NOT need to match ModelOptions::layout (the TARGET body's layout): a w4a16 target may run
-  // against a bf16, w4a16, w4a8 or mxfp4 DFlash2 draft container, independently, exactly like the
+  // against a bf16 or w4a16 DFlash2 draft container, independently, exactly like the
   // draft's own weights are a completely separate set of tensors from the target's.
   std::string dflash_container;
   // Vision tower (docs/vision.md "Load policy"). The 333 `vision.*` tensors are ~0.90 GiB of

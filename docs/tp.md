@@ -19,6 +19,12 @@ not catch), the exact condvar hand-off and a progress-based watchdog (2.2), the 
 (P2 split into P2a/P2b with P3 between them, section 11), the TP-only tuning table (2.7), the
 two-GPU test opt-in (10.1) and DFlash losslessness gates under TP (G12).
 
+**Status note.** Sections 0-11 describe the design as it stands: the shipped layouts are bf16, w4a16
+and trellis. Appendix B and C are the dated review record and decision log of the 2026-09-24 design
+and its measurements. They also cover two int8/fp8-activation layouts that were removed from the code
+later, so their layout names, numbers and file references are history, and the code and tests are
+authoritative where they differ.
+
 ---
 
 ## 0. Decisions at a glance
@@ -118,7 +124,7 @@ engine's port on the same definition (and reports the vs-stand-in value next to 
 
 | # | Gate | Threshold | Phase |
 |---|---|---|---|
-| G1 | CPU tests | `slice(pack(W)) == pack(slice(W))` for every layout/axis/fused tensor; mxfp4 K-slice `wref == full wref`; vocab merges; host exchange; rank-worker hand-off (1M commands through the condvar) | P1 |
+| G1 | CPU tests | `slice(pack(W)) == pack(slice(W))` for every layout/axis/fused tensor; vocab merges; host exchange; rank-worker hand-off (1M commands through the condvar) | P1 |
 | G2 | TP=1 byte identity | every row of the `tp1_identity.ps1` matrix SHA-256-equal to the frozen baseline | P2a (re-run P3, P2b, P4, P5) |
 | G3 | Per-rank step, no-op all-reduce, device 1 | median(rank r) <= **0.633 x** median(TP=1) for r = 0 AND 1, both measured by `tool_tp_step_bench` in the same session on the same device (v6, w4a16, greedy, `--max-ctx 2048`). 0.633 = 17.6 / 27.8. The absolute ms are recorded, not gated | P2a |
 | G4 | Emulated TP=2 numerics | mean KL(ref ‖ TP2emu) <= **0.0435** (TP=1: 0.03851) and top-1 >= **90.43%** (TP=1: 90.93%) on `tools/reference/kl_corpus` | P2b |
@@ -681,7 +687,7 @@ const vision::VisionConfig& VisionCfg() const;       // valid iff HasVisionConfi
 ### 4.2 Tensor table (text model, MTP head, vision, DFlash2)
 
 `{L}` = one of `bf16.w` (plus the bare pre-R1 form and `--keep-bf16` fallbacks, all bf16),
-`w4a16.wq/wsz`, `w4a8.wq/ws`, `mxfp4.wq/ws/wref`. Ranges are global row/col indices; r in {0,1}.
+`w4a16.wq/wsz`, `trellis.w/suh/svh`. Ranges are global row/col indices; r in {0,1}.
 
 **Text layers** (`text.layers.{i}.`), GDN layers (48):
 
@@ -751,31 +757,18 @@ loader already checks it against the kernel, `container.cpp:58-68`).
 | Part | Physical layout | Row range `[a, a+n)` | Col range `[k0, k0+k)` | Alignment required |
 |---|---|---|---|---|
 | bf16 `W` (`.bf16.w`, bare, 2-D raw) | row-major `[N, K]`, 2 B | bytes `[a*K*2, (a+n)*K*2)` -- contiguous | N chunks: for each row n, bytes `[(n*K + k0)*2, +2k)` | none |
-| `w4a16.wq`, `w4a8.wq` | `(t, kb, lh, r, s)`, 512 B per (16-row tile t, 64-K block kb); `PackW4Nibbles`, `quant_int4.hpp:221` | bytes `[a*K/2, (a+n)*K/2)` -- contiguous (tile-major) | N/16 chunks: for tile t, bytes `[(t*(K/64) + k0/64)*512, +(k/64)*512)` | rows: a, n % 16; cols: k0, k % 64 |
+| `w4a16.wq` | `(t, kb, lh, r, s)`, 512 B per (16-row tile t, 64-K block kb); `PackW4Nibbles`, `quant_int4.hpp:221` | bytes `[a*K/2, (a+n)*K/2)` -- contiguous (tile-major) | N/16 chunks: for tile t, bytes `[(t*(K/64) + k0/64)*512, +(k/64)*512)` | rows: a, n % 16; cols: k0, k % 64 |
 | `w4a16.wsz` | **uint32** per (t, g, r): dword `(t*(K/g) + gi)*16 + r`; `PackW4A16Scales` | dwords `[a*K/g, (a+n)*K/g)` -- contiguous | N/16 chunks: dwords `[(t*(K/g) + k0/g)*16, +(k/g)*16)` | rows % 16; cols % g |
-| `w4a8.ws` | **uint32** per (t, g, r) with g = 128 (NOT uint16; `PackW4A8Scales`, `container.cpp:154` `UploadRawU32`) | dwords `[a*K/128, (a+n)*K/128)` | N/16 chunks: dwords `[(t*(K/128) + k0/128)*16, +(k/128)*16)` | rows % 16; cols % 128 |
-| `mxfp4.wq` | `(nt, ks, lane)`, 128 B per (16-row tile, 16-K step); `PackMxfp4Wq` | bytes `[a*K/2, (a+n)*K/2)` -- contiguous | N/16 chunks: bytes `[(nt*(K/16) + k0/16)*128, +(k/16)*128)` | rows % 16; cols % 32 |
-| `mxfp4.ws` | uint8 `[K/32][N]` (`PackMxfp4Ws`) | K/32 chunks: for each kg, bytes `[kg*N + a, +n)` for every range, concatenated -> `[K/32][n_total]` | bytes `[(k0/32)*N, ((k0+k)/32)*N)` -- contiguous | rows: none; cols % 32 |
-| `mxfp4.wref` | int8 `[N]` | bytes `[a, a+n)` | **the FULL `[N]`, unchanged** (see below) | -- |
 | 1-D vectors (`A_log`, `dt_bias`, `*_descale` fp32; norms bf16) | `[N]` | elements `[a, a+n)` | -- | -- |
 | `conv1d_weight` | bf16 `[conv_dim][4]`, 8 B per row | bytes `[a*8, (a+n)*8)` per range | -- | -- |
 
 Multi-segment row slices are the concatenation of each segment's slice in segment order; for every
 tile-major part that is exactly `pack(W[rank rows])` because packing never mixes rows of different
-16-row tiles. For `mxfp4.ws` the concatenation happens inside each k-group row.
+16-row tiles.
 
-**The mxfp4 `wref` exception.** `QuantizeMxfp4` stores absolute E8M0 group exponents in `ws` and
-`wref = max over the row's groups` (`quant_mxfp4.hpp:79-110`); the kernel dequantizes with `dsh =
-clamp(wref - Ws, 0, 15)` and a per-row factor `2^(wref-127)` (`r4d_gemm_mxfp4a8_nt_m64.hip:190-192,
-225`). Keeping the **full-row** `wref` for a K-slice reproduces TP=1's dequantized value for every
-element bit-for-bit. `pack(slice_K(W)).wref` would be the shard's max instead, which can un-clamp
-groups TP=1 clamps. So the loader keeps the full `wref`, and the byte-exact test asserts
-`sliced.wref == full.wref` rather than `== pack(slice).wref`.
-
-**Row-parallel activations** (not a slicing rule, a numerics note): for w4a8/mxfp4, `QuantActI8` /
-`r4dx_quant_act_fp8e4m3_row` and the fused silu_mul epilogue compute per-row scales over the local K
-shard (3072 / 8704). That is deterministic and identical between emulation and real TP, but it moves
-w4a8/mxfp4 further from TP=1 than w4a16 moves (w4a16 casts to f16 with no scale).
+**Row-parallel activations** (not a slicing rule, a numerics note): w4a16 casts the activation to f16 with no
+scale, so a row-parallel K shard (3072 / 8704) sees the same per-element activations as TP=1; only the order
+of the sums changes.
 
 ### 4.4 Per-rank state
 
@@ -837,7 +830,7 @@ GiB, and with `--mtp 3` 9.84 / 9.14 GiB. The trellis rank shapes run `gemm_tunin
    - for each part of that form, compute the rank byte ranges with `tp::PlanRows`/`tp::PlanCols`;
    - if the plan is **one contiguous byte range**, upload straight from the mmap pointer
      (`CopyFromHost(reader.Data(name) + off, count)`) -- no staging copy (qg, z, k/v, lm_head, a/b,
-     A_log, dt_bias, descales, mxfp4 wq rows, mxfp4 ws cols);
+     A_log, dt_bias, descales);
    - otherwise gather into a per-rank reusable host staging `std::vector<uint8_t>` (grown to the
      largest gathered tensor, ~50 MB) and upload once (qkv, gate_up, conv1d, every K-slice);
    - set `QuantLinear::N/K` to the **rank** shape.
@@ -869,15 +862,15 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global);
 std::vector<Range> RankRows(const ShardRule& r, int world, int rank);  // concatenation order
 Range RankCols(const ShardRule& r, int world, int rank);
 
-enum class Part { kBf16, kW4Wq, kW4a16Wsz, kW4a8Ws, kMxWq, kMxWs, kMxWref, kElem };
+enum class Part { kBf16, kW4Wq, kW4a16Wsz, kElem, kTrellisW };
 struct PartShape {
   Part part; int64_t N = 0, K = 0;
-  int group = 0;            // kW4a16Wsz: container w4a16 group; kW4a8Ws: 128; kMxWs: 32
+  int group = 0;            // kW4a16Wsz: container w4a16 group
   int64_t row_bytes = 0;    // kElem: bytes per row (e.g. 8 for conv1d, 4 for fp32 vectors)
 };
 struct ByteRun { size_t src_off, bytes; };           // gather = concat of runs
 std::vector<ByteRun> PlanRows(const PartShape&, const std::vector<Range>& rows);  // throws on misalignment
-std::vector<ByteRun> PlanCols(const PartShape&, Range cols);                      // kMxWref -> full
+std::vector<ByteRun> PlanCols(const PartShape&, Range cols);
 std::vector<uint8_t> Gather(const uint8_t* full, size_t full_bytes, const std::vector<ByteRun>&);
 }
 ```
@@ -1572,12 +1565,12 @@ time in `TpModel::Load` (2.9 step 1), so tests and tools that bypass the arg par
 | `tests/model/test_tp_vocab_merge.cpp` | CPU | ctest | none | `MergeArgmax` (ties across the shard boundary, -inf rows); `MergeRowSummaries` vs a full-row CPU summary (ids/vals exact, lse within 1e-6) on random, tie-heavy, peaked, flat rows, V in {4096, 248320}; `SampleFromSummary(merged)` == `SampleCanonical(full)` for 100000 u x the six filter configs of `test_summary_sampler.cpp` whenever resolved; `MergeTop16` vs full top-16 with ties | P1 |
 | `tests/core/test_tp_host_exchange.cpp` | CPU (threads) | ctest | none | 2 threads x 1,000,000 all-gathers of varying sizes, contents verified; Abort wakes a waiter with `TpAbortedError`; timeout -> `TpTimeoutError`; `Reset` zeroes `arrive[]` and `gen_[]` (an asymmetric abort -- rank 0 aborted before its increment, rank 1 after -- followed by `Reset` gives correct contents on the next 1,000 gathers) | P1 |
 | `tests/model/test_tp_rank_worker.cpp` | CPU (threads) | ctest | none | `RankWorker` + `CompletionGroup` (2.2): 2 workers x **1,000,000 empty commands with `WorkerTiming{0 us, 0 us}`** (every hand-off goes through both condvars) and no hang (the test's own 120 s alarm); 10,000 commands with random 0-2 ms sleeps on one side; an exception in a command comes back through `TakeError()`; the progress-watchdog helper fires only when no heartbeat moves (fake clock); destructor with a busy worker waits for it and never overwrites `cmd_` | P1 |
-| `tests/model/test_tp_loader.cpp` | GPU | ctest, `HIP_VISIBLE_DEVICES=1`, SKIP 77 | dev 1 | load `qwen38-27b-l4-allmtp.r4dx` at `{world 2, rank r}` for r = 0,1 in each of the 4 layouts: every uploaded buffer D2H == `Gather(Plan(...))` of the file bytes; every `QuantLinear::N/K` == rank shape; bf16 layout: rank 0 ∪ rank 1 slices reassemble the full tensors exactly; `EmbedTokensHost()` of both ranks is the same pointer when shared | P2a |
-| `tests/model/test_tp_emulation.cpp` | GPU | ctest, dev 1, SKIP 77 | dev 1 | TP=1 `Model` vs `TpModel(emulate)` on `l4-allmtp`, all 4 layouts: prefill 40 and 70 tokens (1 and 2 chunks) + 16 teacher-forced `DecodeStep` rows, per-row rel L2 of logits <= 1e-2 (bf16, w4a16) / <= 5e-2 (w4a8, mxfp4); `DecodeStepGreedy` == argmax of `DecodeStep` path (exact); `DecodeStepSampled` vs `DecodeStep`+`SampleCanonical` on the same TpModel, 3 configs x 3 seeds, trajectories **exactly** equal (validates 7.4 end to end); one merged summary vs `r4dx_topk_lse_f32` over the gathered row (ids/vals exact, lse <= 1e-4); `Reset()` then rerun == first run byte for byte; fault injection (rank 1 throws at AR #37): the injected exception reaches the caller, the next forward call throws `TpStateError`, `SetDflashInjectionEnabled` and every cached accessor still work in `kNeedsRecovery`, `Reset()` recovers, both endpoints report equal `CallCounts()`, rerun == fresh run byte for byte; the same with an asymmetric fault (kind 1, stall -> peer timeout). Every case ends with `g_tp_collective_allocs == 0` (2.7) | P2b |
+| `tests/model/test_tp_loader.cpp` | GPU | ctest, `HIP_VISIBLE_DEVICES=1`, SKIP 77 | dev 1 | load `qwen38-27b-l4-allmtp.r4dx` at `{world 2, rank r}` for r = 0,1 in each of the 2 layouts (bf16, w4a16): every uploaded buffer D2H == `Gather(Plan(...))` of the file bytes; every `QuantLinear::N/K` == rank shape; bf16 layout: rank 0 ∪ rank 1 slices reassemble the full tensors exactly; `EmbedTokensHost()` of both ranks is the same pointer when shared | P2a |
+| `tests/model/test_tp_emulation.cpp` | GPU | ctest, dev 1, SKIP 77 | dev 1 | TP=1 `Model` vs `TpModel(emulate)` on `l4-allmtp`, both layouts (bf16, w4a16): prefill 40 and 70 tokens (1 and 2 chunks) + 16 teacher-forced `DecodeStep` rows, per-row rel L2 of logits <= 1e-2; `DecodeStepGreedy` == argmax of `DecodeStep` path (exact); `DecodeStepSampled` vs `DecodeStep`+`SampleCanonical` on the same TpModel, 3 configs x 3 seeds, trajectories **exactly** equal (validates 7.4 end to end); one merged summary vs `r4dx_topk_lse_f32` over the gathered row (ids/vals exact, lse <= 1e-4); `Reset()` then rerun == first run byte for byte; fault injection (rank 1 throws at AR #37): the injected exception reaches the caller, the next forward call throws `TpStateError`, `SetDflashInjectionEnabled` and every cached accessor still work in `kNeedsRecovery`, `Reset()` recovers, both endpoints report equal `CallCounts()`, rerun == fresh run byte for byte; the same with an asymmetric fault (kind 1, stall -> peer timeout). Every case ends with `g_tp_collective_allocs == 0` (2.7) | P2b |
 | `test_tp_emulation.cpp`, P5 additions | GPU | same | dev 1 | **MTP** K=3 greedy/sampled (bookkeeping lockstep: committed positions == emitted tokens each round; sampled rounds vs plain sampled decode via `tests/model/sampled_equality.hpp`'s classifier) and the reduced-vocab head on `l4-mtp-draftvocab`. **DFlash** k=7 on `l4-allmtp` + `ProductionDrafterPath()` (`test_container_path.h:131`), greedy and seeded sampled, 3 prompts: (a) **H7 exactness** -- a test hook (`Model::DflashDebugLastTop16()`, compiled only with `R4DX_TP_TESTING`) returns the merged `cand/unary` of the last round; the test gathers the drafter's full `[8, 248320]` logits through `GatherVocabRow`, computes the CPU top-16 with `r4dx_topk16_f32`'s total order, and requires exact equality; (b) **H6 exactness** for MTP full-vocab drafts the same way; (c) **lockstep bookkeeping** -- after every round `DflashInjectedCount() == PositionCount()` on both ranks and the drafts/`walk_len` agree (the facade already compares them); (d) **lossless-by-construction** -- every emitted greedy token equals the merged argmax of its verify row, recomputed from a gathered full row. **Tiny temperature**: `DecodeStepMtpSampled` and `DecodeStepDflashSampled` at `T = 0.005` (the `logits_out` path, H4) equal `SampleCanonical` over gathered rows. On the branch (Appendix B N72, N80): DFlash2 and a second MTP suite on v6, sampled rounds checked against their own verify rows, plus three comparisons with the TP=1 `Model` -- a verify / commit script (8-row windows committing 3, 8, 1, 5), a TP=1 replay of every speculative trajectory's windows and commits, and vision (two images, rank 0's encode, host-row splice) | P5 |
 | `tests/kernels/test_tp_allreduce_cpu_peer.cpp` | GPU | ctest, dev 1 | dev 1 | the engine AR kernel against a **CPU thread** acting as rank 1 through a real pinned mailbox: 100,000 ARs at {10240, 81920, 174080, 655360} B, bit-exact; timeout path (CPU peer silent) returns within timeout +10%, ABORT word set, next call skips (sticky); seq base `0xFFFFFF00` crosses the 2^32 wrap cleanly | P3 |
 | `tests/kernels/test_tp_allreduce_2gpu.cpp` | GPU | ctest, LABEL `tp2gpu`, **opt-in** (below) | dev 0+1 | `HostMailboxComm` end to end: 1,000,000 ARs, mixed sizes on both channels, interleaved with VRAM filler kernels that dirty L2, verified bit-exact every batch (tp_bench's hash pattern); abort propagation (rank 1 `Abort()` -> rank 0 kernel exits < 5 ms, both see `TpAbortedError`); `Recover()` then 10,000 more clean ARs | P3 |
-| `tests/model/test_tp_real_vs_emulation.cpp` | GPU | ctest, LABEL `tp2gpu`, opt-in | dev 0+1 | on `l4-allmtp` w4a16 and mxfp4: a fixed script (prefill 70, 16 full-logit steps, 16 greedy, 16 seeded sampled) run in emulate mode then real mode -> **byte-identical** outputs; P5 extends with MTP K=3 and DFlash k=7 (`ProductionDrafterPath()`) greedy and seeded-sampled rounds, byte-identical tokens, `walk_len` and final logits | P4, P5 |
+| `tests/model/test_tp_real_vs_emulation.cpp` | GPU | ctest, LABEL `tp2gpu`, opt-in | dev 0+1 | on `l4-allmtp` w4a16: a fixed script (prefill 70, 16 full-logit steps, 16 greedy, 16 seeded sampled) run in emulate mode then real mode -> **byte-identical** outputs; P5 extends with MTP K=3 and DFlash k=7 (`ProductionDrafterPath()`) greedy and seeded-sampled rounds, byte-identical tokens, `walk_len` and final logits | P4, P5 |
 | `tests/model/tool_tp_step_bench.cpp` | GPU tool | built, not `add_test`'d | dev 1 (G3), dev 0 (recorded cross-check) | per-rank decode ms/token with `NoopComm` and a bare `Model` (no `TpModel` needed), and the TP=1 baseline with `--tp1`, same prompt/protocol; prints both and the ratio; pre-flight VRAM check (9.2) | P2a |
 | `tests/kernels/tool_tp_ar_stress.cpp` | GPU tool | built only | dev 0+1 | `--count 10000000 --pattern isolated|decode` through `HostMailboxComm` (G5) | P3 |
 | `tests/kernels/tool_tp_ar_latency.cpp` | GPU tool | built only | dev 0+1 | tp_bench's decode pattern using the engine comm, with all three interleaved conditions -- (a) AR, (b) stand-in kernel on the same grid, (c) fillers only -- 128 ARs per token, 60 MiB filler, 4 MiB dirty; reports **`L_vs_no_ar_kernel = (T_a - T_c)/128`** (the G5 number) and `L_vs_standin = (T_a - T_b)/128` at 10 KiB, 80 KiB, 640 KiB, for nb in {4, 8, 16} on channel 1 | P3 |
@@ -1610,10 +1603,9 @@ plain `ctest --preset win-hip` would run them on the desktop GPU. Therefore:
 ### 10.2 CPU slicer tests (`test_tp_shard.cpp`) -- exact contents
 
 For each layout, using the converter's own header-only quantizers/packers
-(`QuantizeInt4Asymmetric` + `PackW4Nibbles` + `PackW4A16Scales` at g = 64 and 128;
-`QuantizeInt4SymmetricPinned8` + `PackW4A8Scales`; `QuantizeInt4AsymmetricSearch` with a random
-importance vector; `QuantizeMxfp4` and `QuantizeMxfp4Search` + `PackMxfp4Wq` + `PackMxfp4Ws`;
-`EncodeBf16`) on random `W` with outliers:
+(`QuantizeInt4Asymmetric` + `PackW4Nibbles` + `PackW4A16Scales` at g = 32 and 64;
+`QuantizeInt4AsymmetricSearch` with a random importance vector; `EncodeBf16`) on random `W` with
+outliers:
 
 - **rows**, single segment: N = 256, K = 1024, rank rows [0,128) / [128,256);
 - **rows, fused**: a qkv-shaped `N = 320` = segments {64, 64, 192} -> rank 0 {0-32, 64-96, 128-224};
@@ -1621,11 +1613,8 @@ importance vector; `QuantizeMxfp4` and `QuantizeMxfp4Search` + `PackMxfp4Wq` + `
 - **cols**: N = 64, K = 1536 (3 groups of 512) -> [0,768) / [768,1536); K = 1088 (= 17 x 64) at g=64
   (mirrors 17408 / 8704 legality);
 - assertion: `Gather(full, PlanRows/PlanCols(...)) == pack(W[rows or cols])` **byte for byte** for
-  every part, **except** mxfp4 K-slice `wref`, where the assertion is `== full.wref` and, separately,
-  a CPU dequant of `(sliced wq, sliced ws, full wref)` equals the matching columns of the dequant of
-  the full packed tensor element for element;
-- misalignment (row range not % 16, col range not % group) throws;
-- `w4a8.ws` stride is 4 B per (t, g, r) (a uint16 reading fails the test by construction).
+  every part;
+- misalignment (row range not % 16, col range not % group) throws.
 
 ### 10.3 TP=1 byte-identity guard (`tools/tp/tp1_identity.ps1`)
 
@@ -1646,7 +1635,7 @@ because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own tab
 | 3 | standard protocol + `--mtp 3` |
 | 4 | `--temperature 0.7 --top-k 20 --top-p 0.8 --seed 1` plain |
 | 5 | row 4 + `--dflash ... --dflash-k 7` |
-| 6 | `tool_teacher_forced_logprobs` on `qwen38-27b-l4-allmtp.r4dx`, layouts bf16/w4a16/w4a8/mxfp4, `--layers 4`, kl_corpus tokens -> SHA of every `*.logprobs.f16` |
+| 6 | `tool_teacher_forced_logprobs` on `qwen38-27b-l4-allmtp.r4dx`, layouts bf16/w4a16, `--layers 4`, kl_corpus tokens -> SHA of every `*.logprobs.f16` |
 | 7 | `--vision on --image tools\reference\golden_out\vision_test_image.png --prompt "What is in this picture?"` plain greedy (the golden image `tests/vision/test_preprocess.cpp` decodes; if the gitignored `golden_out` is absent, the script SKIPs this row and says so) |
 | 8 | row 4 + `--mtp 3` (added in P2a review, N26) |
 | 9 | `--chat`, two user turns through stdin, greedy (added in P2a review, N26) |
@@ -1719,7 +1708,7 @@ reported (expected mean KL ~1e-3). G6: no throw; the emulate and real dumps come
 against a stale reference.
 
 **G4 on the production container (2026-09-29, the Huihui trellis mix4.5m, `--layout trellis`).** The
-block above is the base v6 w4a16 record (its references, `kl_out\ref` and `kl-canon\ref`, are gone). The
+block above is the base v6 w4a16 record (its reference `kl_out\ref` is gone; `kl-canon\ref` is still on disk, but it is the base model's and no base container is left to score against it). The
 same measurement on the production container, `tokens_canon.json`, `--max-ctx 4096 --vision off`, against
 the model's own bf16 reference `D:\models\r4dx\huihui\kl-ref` (`tools\quant2\kl_rung4.ps1` is the TP=1
 gate, with `--tp 2 --tp-mode emulate` added to the tool call for the emulated one):
@@ -2012,7 +2001,7 @@ controls above. The pass rule itself is unchanged.
 | R7 | Implicit device syncs (hipFree, lazy hipMalloc) stalling a lockstepped rank | no allocation or free inside a collective command after warm-up (solo `EncodeImages` excepted, 6.3.7); `GdnControlCache::Freeze`; allocation guard counter must stay 0 in tests and soak; `ImageRows` pageable (no hipHostFree on the facade thread) |
 | R8 | Emulation not bit-identical to real because of a device-global resource | `topk_lse` workspace variant; audited: no other `__device__` globals in `src/kernels` or `third_party/libr4d`; G6 catches anything missed |
 | R9 | Host-side overhead of rendezvous and thread wake-ups on Windows | spin-then-block waits (20 ms rank, 200 us facade, 50 ms exchange); expected < 0.1 ms/token; `TpCommStats` reports max wait |
-| R10 | w4a8/mxfp4 numerics drift more under TP (local-K activation scales) | G4 is on the production layout (w4a16); w4a8/mxfp4 get the looser rel-L2 check in `test_tp_emulation` and an informational KL report |
+| R10 | Numerics drift under TP (row-parallel K shards change the order of the sums) | G4 is on the production layout; `test_tp_emulation` gates the per-row rel L2 vs TP=1 |
 | R11 | Prefill gains below projection (640 KiB ARs, 58 us x 128 per chunk) | channel 1 `nb` sweep in P3; long-context prefill is attention-bound and gains little by design (1.4) |
 | R12 | VRAM: two replicated drafters + replicated embedding + desktop on device 0 | 4.5 shows ~17 GiB/rank at 262k with everything on; the joint embed-residency decision falls back to host gather on both ranks if either is short |
 | R13 | Recovery cannot run (a stream stuck past the watchdog) | `kFatal`: every call throws; the server answers errors and must be restarted; logged with rank and Status; `/health` answers 503 `tp_fatal` from then on (N80) |

@@ -1076,7 +1076,8 @@ $py = 'python'
 & $py tools\reference\trellis_quant.py selftest --device cuda      # hip == cpu == torch
 & $py tools\reference\trellis_quant.py bench --device cuda --K 3.5,4,5 --tiles 8192
 # (the directories are the Huihui model's, the default of --hessian-dir / --model-dir; the base
-#  model's trellis-q / kl-trellis / kl-canon were retired on 2026-09-29, docs/huihui.md)
+#  model's trellis-q and hessian-v2 were retired on 2026-09-29, docs/huihui.md; its kl-canon\ref
+#  bf16 reference is still on disk but scores only base-model containers)
 $q = 'D:\models\r4dx\huihui\trellis-q'
 & $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --out-dir $q\K4
 & $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched `

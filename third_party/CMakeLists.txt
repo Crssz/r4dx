@@ -2,14 +2,12 @@
 #
 # r4d_core: a static library built from the 13 HIP translation units of the vendored libr4d
 # (third_party/libr4d: attention, GDN, the bf16 / w4a16 / trellis GEMMs, the DFlash conv, the kernel
-# registry). The w4a8 / mxfp4a8 GEMMs, the int8 activation quantiser, the M <= 16 bf16 GEMM, the
-# multi-GPU all-reduce kernels and the pybind11 module were cut from the vendored copy.
+# registry).
 #
 # CMake's HIP language support fights clang-cl on this toolchain, so each unit is compiled by
-# driving hipcc.exe directly through add_custom_command (the same recipe libr4d's own
-# build_windows.ps1 uses), and the resulting .obj files are handed to add_library() as pre-built
-# "external objects" -- a standard CMake pattern for objects that did not come from CMake's own
-# compile rules.
+# driving hipcc.exe directly through add_custom_command, and the resulting .obj files are handed to
+# add_library() as pre-built "external objects" -- a standard CMake pattern for objects that did not
+# come from CMake's own compile rules.
 #
 # r4dx_hip_runtime: an INTERFACE target carrying the HIP include dir and the amdhip64 import lib,
 # for any consumer (kernels, tests) that calls into the HIP runtime directly (hipMalloc,
@@ -48,9 +46,7 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags (libr4d's former build_windows.ps1 $UNITS table), restricted to
-# the 13 units r4dx links. One deliberate deviation from that table: r4d_gemm_w4a16_nt_m64's group
-# is an r4dx build option (see below) rather than the kernel's own 128 default.
+# unit -> extra per-unit flags, for the 13 units r4dx links.
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_vit_h72_bf16

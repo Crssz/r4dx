@@ -55,7 +55,7 @@ struct AttnConfig {
 //
 // qg/o (decode-perf pass, 2026-09-19) and k/v (R1, docs/r9700.md): non-owning pointers at the
 // caller's (Container-loaded) r4dx::model::QuantLinear -- whichever on-disk layout was requested
-// at load time (bf16/mxfp4/w4a16/w4a8), dispatched through the shared r4dx::model::ApplyLinear
+// at load time (bf16/w4a16/trellis), dispatched through the shared r4dx::model::ApplyLinear
 // (src/model/linear.h) the same way GDN's in_proj_qkv/out_proj and MLP's gate_up/down already do.
 // k/v used to be raw bf16 pointers (docs/container-format.md's attn.k/v tensors had no quantized
 // on-disk form) -- R1 gives them one; Container::Load falls back to bf16 (or the bare pre-R1

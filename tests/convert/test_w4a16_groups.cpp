@@ -132,8 +132,8 @@ Container ReadContainer(const std::string& path) {
 }
 
 // sha256 over every tensor (name, size, bytes; in name order), independent of __metadata__: the
-// (a) goldens below are digests of the tensors a build from before the mxfp4 / w4a8 layouts were
-// cut (bcebb21) wrote with the same arguments.
+// (a) goldens below are digests of the tensors the build of commit bcebb21 wrote with the same
+// arguments.
 std::string TensorDigest(const Container& c) {
   std::string all;
   for (const auto& kv : c.tensors) {

@@ -16,7 +16,7 @@
 // nets out to w = scale*(n - zero), where `zero` is whatever this converter wrote into `wsz`'s
 // high 16 bits. `zero` is free to be any of 0..15 -- that is the whole point of storing it. This
 // converter's quantizer computes a genuine per-(row,group) asymmetric zero from the data (0..15,
-// not pinned). (The w4a8 layout, which pinned the zero to 8, is retired.)
+// not pinned).
 #pragma once
 
 #include <algorithm>

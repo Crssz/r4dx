@@ -76,7 +76,7 @@ TOLERANCES = {
     "well-conditioned at fp32-comparable precision for hidden_size=1152). No layout variants: "
     "docs/container-format.md's vision.* tensors are bf16 passthrough only, never quantized, so "
     "there is exactly one numeric path to validate (bf16 compute vs this fp32/bf16 reference), "
-    "unlike the text side's mxfp4/w4a16/w4a8 fan-out. `pixel_values` is NOT covered by either "
+    "unlike the text side's trellis/w4a16 mix.`pixel_values` is NOT covered by either "
     "number: host-side preprocessing is integer-exact against this golden (the reference's own "
     "uint8 resampler is reproducible bit-for-bit -- see docs/vision.md 'Resampling'), so its test "
     "asserts equality, not a tolerance.",

@@ -17,7 +17,7 @@
 # from the q3 recipe: no --rotate; no --keep-bf16 of attn.k|v (the oracle quantized all 400 linears);
 # the q3 group rules on body linears are dropped (a trellis linear has no w4a16 layout), only
 # "^lm_head$=32" stays; --lm-head w4a16 instead of 4bit (--layout trellis loads the w4a16 head, so the
-# mxfp4/w4a8 copies would be dead weight). -LmHead bf16 writes the A2 twin (same body bytes).
+# other-layout copies of the head would be dead weight). -LmHead bf16 writes the A2 twin (same body bytes).
 #
 #   .\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
 #   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-k4m.r4dx

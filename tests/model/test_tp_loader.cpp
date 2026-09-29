@@ -2,7 +2,7 @@
 // 10.1 "test_tp_loader", phase P2a), on the real 4-layer container qwen38-27b-l4-allmtp.r4dx (every
 // layout, GDN and full-attention layers, the MTP head).
 //
-// For each layout in {bf16, w4a16} (the container's retired w4a8/mxfp4 forms are ignored), both ranks of world 2 are loaded side by side
+// For each layout in {bf16, w4a16}, both ranks of world 2 are loaded side by side
 // (Container::Load(path, ContainerLoadOptions{tp_world 2, tp_rank r})) and checked:
 //   * every uploaded device buffer, read back, equals tp::Gather(tp::Plan*(...)) of the file's own
 //     bytes for that rank -- which test_tp_shard proved equals pack(slice(W)) (docs/tp.md 10.2);

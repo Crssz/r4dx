@@ -35,9 +35,9 @@ byte-pair axis) and reconstituted by the loader from `__metadata__`.
   "config_sha256": "<sha256 of the source config.json, hex>",
   "produced_by": "r4dx-convert <git rev>",
   "quant_summary": {
-    "text.layers.*.mlp.gate_up": "mxfp4|w4a16|w4a8 (all three present; pick at load time)",
+    "text.layers.*.mlp.gate_up": "w4a16|trellis (and bf16 when requested; pick at load time)",
     "text.layers.*.attn.qg|k|v|o": "bf16",
-    "lm_head": "mxfp4|w4a16|w4a8|bf16 (all four present)"
+    "lm_head": "w4a16|bf16"
   },
   "model_config": { /* verbatim copy of the source config.json */ }
 }
@@ -81,11 +81,12 @@ rotation.mix5                                   fp32  [5, 5]               (rota
 rotation.had_{down,o,gdn_out}_signs             fp32  [K of that linear]   (q2ab containers only)
 ```
 
-`{layout}` is one of `mxfp4`, `w4a16`, `w4a8`, `bf16`, or -- for the 400 decoder body linears of a
-trellis container only -- `trellis` (see "Trellis body layout" below). Every linear that participates in the A/B
-(everything the milestone list benchmarks -- attention qg/k/v/o, GDN in/out proj, MLP gate_up/down,
-lm_head) is stored in **all three quantized layouts plus bf16**, so the server can switch layouts
-with a flag rather than a re-convert. `text.embed_tokens`, `text.*_norm`, `*.A_log`, `*.dt_bias`,
+`{layout}` is one of `w4a16`, `bf16`, or -- for the 400 decoder body linears of a
+trellis container only -- `trellis` (see "Trellis body layout" below). A converter run stores every
+linear that participates in the A/B (attention qg/k/v/o, GDN in/out proj, MLP gate_up/down, lm_head)
+in each layout it was asked for, so the server can switch layouts with a flag rather than a
+re-convert. (Older containers may also carry `w4a8` and `mxfp4` tensors; this build neither writes
+nor reads them, see "Retired layouts" below.) `text.embed_tokens`, `text.*_norm`, `*.A_log`, `*.dt_bias`,
 `*_descale`, `gdn.in_proj_a`/`gdn.in_proj_b`, `gdn.conv1d_weight`, and everything under `vision.*`
 have exactly one layout (bf16 or fp32) and drop the `.{layout}` suffix.
 
@@ -150,7 +151,6 @@ in `__metadata__.quant.w4a16.group` and checked against the kernel's own
 `r4d_gemm_w4a16_nt_m64_group()` at load. Everything below says 128 where it means `g`; at
 `g = 64` every `/ 128` becomes `/ 64` and the weight costs 4.5 bits instead of 4.25 (`4 + 32/g`),
 which is what `qwen38-27b-v6.r4dx` and every container packed by a default build now carry.
-`w4a8`'s group is a separate, fixed 128 and does **not** follow it.
   - `<name>.w4a16.wq` -- `uint8[N * K / 2]`, **pre-permuted into the WMMA fragment order** so a
     wave's 32 lanes read 512 contiguous bytes for a (n-tile, k-step): lane `l`'s dword holds
     element `e` of `W[n0 + (l&15)][16*ks + 8*(e>>2) + 4*(l>>4) + (e&3)]`, dword nibble `2e` (e<4)
@@ -169,7 +169,7 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     (`CheckW4a16Group`) rather than read at the wrong stride -- but only when the load actually
     selects `w4a16` for the body, the lm head or the MTP head. The `quant` block is written
     unconditionally, so a container's recorded w4a16 group says nothing about whether it holds a
-    `.w4a16.*` tensor, and a `--layout mxfp4` / `--layout w4a8` / `--layout bf16` run reads none.
+    `.w4a16.*` tensor, and a `--layout bf16` run reads none.
   - **Per-tensor groups** (docs/quant2.md section 5, Q3; `r4dx-convert --w4a16-group-rule
     "<regex>=<g>"`, `src/convert/include/r4dx_convert/w4a16_groups.hpp`). `quant.w4a16.group` stays
     the container's DEFAULT group -- the one it was packed with and the one a loading binary's
@@ -205,6 +205,12 @@ which is what `qwen38-27b-v6.r4dx` and every container packed by a default build
     `w4a16_group_extra_bytes` (the signed `.wsz` byte delta against packing those linears at the
     default) -- all three only when rules were given. The DFlash2 drafter container never carries
     a map (`--w4a16-group-rule` is refused with `--dflash-gguf`).
+
+### Retired layouts
+
+The two layouts below (`w4a8` and `mxfp4`) are documented as the record of their on-disk format only.
+`r4dx-convert` no longer writes them, this build has no kernel for them, and the loader ignores their
+tensors in older containers (a `--layout` naming one is refused by name).
 
 **`w4a8`** (`r4d_gemm_w4a8_nt_m64`, int8 activation): the same nibble *permutation* as `w4a16`
   (`r4d_registry.hip`: "SHARED byte for byte with gemm_w4a16_nt_m64"), but its own separately
@@ -590,7 +596,7 @@ absent from every container converted without that flag, including every contain
 this feature. `mtp.draft_head.lm_head` is a plain row-slice of `lm_head.weight` (same `K`=`hidden`,
 `N`=`draft_vocab_size` rows instead of the full vocab), planned/emitted through the exact same
 `PlanLinearLayouts`/`EmitLinearLayouts` helpers every other quantized linear uses, so it carries the
-same `{layout}` family (`mxfp4`/`w4a16`/`w4a8`/`bf16`) and the same `mtp_head_layout` load-time
+same `{layout}` family (`w4a16`/`bf16`) and the same `mtp_head_layout` load-time
 selection as `mtp.attn.qg/o` and `mtp.mlp.gate_up/down`. `mtp.draft_head.vocab_ids` is a raw on-disk
 int32 array (no dtype conversion, no permutation) -- element `i` is the REAL vocabulary id that
 subset-local index `i` represents; `src/model/mtp_head.cpp`'s `r4dx_gather_i32` kernel is the only
@@ -613,7 +619,7 @@ A DFlash2 speculative-decoding draft model (background: `docs/dflash2.md`, the "
 section of `docs/mtp.md`, `docs/status.md`) converts from its own GGUF v3 source (`D:\models\Qwen3.8-27B-DFlash2\Qwen3.8-27B-DFlash2-Q8_0.gguf`)
 into its OWN r4dx container -- a **separate file** from the main text-model container, never mixed
 into `text.*`/`vision.*`/`mtp.*`, so every existing loader/container is unaffected by this section.
-Written by `r4dx-convert --dflash-gguf <gguf> --out <container> --layout {w4a16,w4a8,mxfp4,bf16}`
+Written by `r4dx-convert --dflash-gguf <gguf> --out <container> --layout {w4a16,bf16}`
 (`src/convert/main.cpp`'s `RunDflashConvert`, `src/convert/include/r4dx_convert/gguf_reader.hpp` +
 `dflash2_container.hpp`). Same safetensors-shaped shell as every other r4dx container (8-byte
 header length + JSON header + raw tensor bytes, every tensor `dtype: "U8"`).
@@ -770,8 +776,8 @@ existing `QuantLinear`/`DeviceBuffer` path) and the DFlash2 forward pass itself 
 
 - `r4d.h` (this repo's `third_party/libr4d/r4d.h`): every kernel's parameter comment, cited above
   by line range against the `windows-llp64` checkout at commit `7675605`.
-- `third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip`, `r4d_gemm_mxfp4a8_nt_m64.hip`,
-  `r4d_gdn_wmma.h`, `r4d_registry.hip`, `mxfp4_layout.py`: exact permutation math.
+- `third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip`, `r4d_gdn_wmma.h`, `r4d_registry.hip`: exact
+  permutation math.
 - `transformers/models/qwen3_5/modeling_qwen3_5.py` (transformers 5.17.0, in the read-only reference
   venv of the time, since deleted): `Qwen3_5MLP.forward` (gate_up fusion),
   `Qwen3_5Attention.__init__`/`forward` (q/gate fusion), `Qwen3_5GatedDeltaNet.__init__`/`forward`

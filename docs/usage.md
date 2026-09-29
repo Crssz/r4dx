@@ -6,7 +6,7 @@
 # r4dx: detailed usage notes
 
 A from-scratch C++/HIP inference engine for Qwen/Qwen3.8-27B on a single AMD Radeon AI PRO R9700
-(gfx1201) on Windows 11, built on top of the [libr4d](https://github.com) kernel library (a
+(gfx1201) on Windows 11, built on top of the [libr4d](https://codeberg.org/StillDeadcode/libr4d) kernel library (a
 plain-C-ABI, torch-free HIP kernel set). MIT licensed.
 
 ## What this is
@@ -14,16 +14,16 @@ plain-C-ABI, torch-free HIP kernel set). MIT licensed.
 r4dx is its own weight container, its own C++ model graph, and its own server -- no vLLM, no
 ggml/GGUF. Third-party code is limited to header-only libraries vendored under `third_party/`
 (nlohmann/json, cpp-httplib, minja, stb_image). GPU kernels come from `third_party/libr4d`
-(vendored as plain sources, no submodule), compiled into the static library target `r4d_core`.
+(vendored as plain sources, credit in `NOTICE`), compiled into the static library target `r4d_core`.
 
 ## Decisions (summary)
 
 - **Model**: Qwen/Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`) -- 64 hybrid layers (48 Gated
   DeltaNet + 16 full attention), MTP head, vision tower carried in bf16.
 - **Weights**: a custom converter round-trips the BF16 checkpoint into a safetensors-compatible
-  container (see `docs/container-format.md`) in three quantized GEMM layouts so they can be A/B'd:
-  MXFP4 (e2m1 + e8m0), INT4 g128 W4A16, and INT4 g128 W4A8. Weights are pre-permuted into each
-  kernel's WMMA fragment order.
+  container (see `docs/container-format.md`) in the trellis layout (about 4.5 bits per weight, the
+  production body), the 4-bit group layout W4A16 (group 64, or 32 for the LM head), and bf16. Weights
+  are pre-permuted into each kernel's WMMA fragment order.
 - **KV cache**: fp8 e4m3, paged in 16-token HND blocks, per-layer per-head static descales.
 - **GPU rule**: only HIP device 1 (`$env:HIP_VISIBLE_DEVICES='1'`) is ever used on this machine,
   except by tensor parallel (`--tp 2`, below), which uses both cards.
@@ -57,8 +57,8 @@ the pre-v6 group of 128 into its own directory for reading older containers.
 
 Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 62 tests
 covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
-residual add, silu_mul, rope (including the 3-axis mrope partial-rotary kernel), fp8/int8
-activation quant, kv cache write, mxfp4 GEMM, attention decode, GDN chunk scan, sampler, the P6
+residual add, silu_mul, rope (including the 3-axis mrope partial-rotary kernel), kv cache write,
+attention decode, GDN chunk scan, sampler, the P6
 vectorized-kernel bandwidth golden, the P2 fused-quant-epilogue byte-diff harness, embedding-gather
 in-range/OOB-clamp, the R9 reduced-vocab-draft-head gather-by-index kernel's in-range/OOB-clamp
 golden, and the vision tower's six device primitives), the converter's quantizer
@@ -116,7 +116,7 @@ runs, on any checkpoint:
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
     --input D:\models\Huihui-Qwen3.8-27B-abliterated --output D:\models\r4dx\huihui-qwen38-27b-abl-v6.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
     --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json `
     --quant search --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
@@ -132,12 +132,11 @@ worth 9.6% of decode).
 
 **Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
 refuses `--layout w4a16` on a container packed at 128 -- `v5` and everything older -- by name, with
-both numbers and the fix in the message. (The other layouts are group-independent, so
-`--layout mxfp4` / `--layout w4a8` on those same containers still works.)
+both numbers and the fix in the message.
 `docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
 `win-hip-g128` escape hatch, and the trap that an existing build directory keeps its cached group.
 
-Produces a single container carrying every requested quantized GEMM layout (plus bf16 for
+Produces a single container carrying the requested GEMM layouts (plus bf16 for
 embeddings/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B them against the same
 file. `--layers N` converts only the first `N` transformer layers (useful for a small smoke-test
 container); omit it to convert all 64. `--kv-calib` fills the fp8 KV cache's per-head descales from
@@ -145,10 +144,9 @@ a `tools/reference/kv_calibrate.py` JSON (falls back to a `1.0` placeholder per-
 stderr warning, if omitted or if a layer is missing from the JSON). `--no-bf16` (docs/r9700.md R1)
 drops the full-model bf16 body layout and the bf16 `lm_head` variant entirely -- the production
 containers (the trellis one, and the w4a16 recipe above) are converted this way
-(w4a8/w4a16/mxfp4 or trellis only; bf16 appears only where `--keep-bf16` asks for it, and in the small 4-layer
+(w4a16 or trellis only; bf16 appears only where `--keep-bf16` asks for it, and in the small 4-layer
 test containers, which still pass `--layouts bf16,...` since bf16 is the numerical-reference layout
-rungs 1-3 of `docs/validation.md` need). Omitting `--no-bf16` produces an all-four-layouts container
-including a full bf16 body (~88 GB) -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of
+rungs 1-3 of `docs/validation.md` need). Omitting `--no-bf16` adds a full bf16 body (~88 GB) -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of
 scope for performance work. See `docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s
 header comment for the full flag list, including `--selftest` for the byte-exact packer self-check.
 
@@ -179,11 +177,11 @@ the search's error term by each input channel's mean activation energy, from the
 requires `--quant search`. The weighting is not a refinement, it is the whole mechanism -- measured
 on the real checkpoint against the bf16 reference (`docs/validation.md` "Milestone 10"):
 
-| mode | w4a16 mean KL / top-1 | w4a8 | mxfp4 |
-|---|---|---|---|
-| `--quant rtn` (default) | 0.0724 / 88.4% | 0.1434 / 82.72% | 0.0912 / 86.14% |
-| `--quant search` alone | 0.0713 / 87.71% | -- | -- |
-| `--quant search --imatrix` | **0.0534 / 89.30%** | **0.1164 / 84.78%** | **0.0797 / 86.09%** |
+| mode | w4a16 mean KL / top-1 |
+|---|---|
+| `--quant rtn` (default) | 0.0724 / 88.4% |
+| `--quant search` alone | 0.0713 / 87.71% |
+| `--quant search --imatrix` | **0.0534 / 89.30%** |
 
 The search alone lowers its own per-group objective on every single group and still buys nothing at
 model level (top-1 is 0.7 points *worse* than `rtn`), which is why `rtn` stays the default and why
@@ -214,7 +212,7 @@ a hard error.
 ```powershell
 .\build\win-hip\src\convert\r4dx-convert.exe `
     --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-ldlq-mlp.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
     --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
     --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
@@ -247,7 +245,7 @@ default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.
 ```powershell
 .\build\win-hip\src\convert\r4dx-convert.exe `
     --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-groups.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
+    --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
     --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
     --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
@@ -309,7 +307,7 @@ In `--chat`, attach an image to the NEXT turn with one or more leading `/image <
 into the REPL before the question itself.
 
 `--layout` selects which quantized (or `bf16`) body-weight variant baked into the container to run
-(`mxfp4` / `w4a16` / `w4a8` / `bf16`, or `trellis` for a trellis container -- the only layout one
+(`w4a16` / `bf16`, or `trellis` for a trellis container -- the only layout one
 loads with) -- as of the Milestone 2 performance pass this now includes
 attention's `qg`/`o` projections too (they used to always run bf16 regardless of `--layout`; see
 `docs/perf.md`'s "Known limitation", now resolved). `--prompt "..."` renders one turn through
@@ -343,29 +341,25 @@ diverging token is still a legitimate canonical sample of the round that actuall
 (`docs/sampling.md` sections 9.3, 11-12, `tools/validate_spec_sampling.ps1`). See `docs/mtp.md` for
 the full design, the container requirement (the container must carry
 `mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
-per layout (roughly +75-165% decode throughput over `--mtp 0` at each layout's best `K` -- w4a16
-`K=3`, w4a8 `K=4`, mxfp4 `K=3`, see `docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable
-default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput
-per layout.
+per layout (roughly +75-165% decode throughput over `--mtp 0` at its best `K` -- w4a16 `K=3`, see
+`docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable default). See `src/cli/cli_args.h` for
+the full flag list and `docs/perf.md` for measured throughput per layout.
 
 `--dflash <draft.r4dx>` (Milestone 5, docs/dflash2.md) enables DFlash2 block-diffusion
 self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, runs at any
 `--temperature` (same sample-and-match acceptance, lossless in distribution, as `--mtp` above --
 including the same batched-verify numeric caveat on a fixed-seed token-for-token match -- as of
 Milestone 6 stage S3), needs a separate DFlash2 draft container
-(`D:\models\r4dx\qwen38-27b-dflash2-{w4a16,w4a8,mxfp4,bf16}.r4dx`),
+(`D:\models\r4dx\qwen38-27b-dflash2-{w4a16-g64,bf16}.r4dx`),
 independent of the target's own `--layout`. `--dflash-k N` (1..7, default 7), `--dflash-p-min F`
 and `--dflash-n-min N` tune the selector walk's early-stop/discard gates. Best measured so far
 (docs/perf.md's Integrate-stage final confirmation sweep, each layout's own best `--dflash-k`
-vs. best `--mtp K`, twice each): on a ~270-token code prompt, DFlash2 **beats MTP on all three
-layouts** -- w4a16 **116.90/116.84 tok/s** (77.4% acceptance) vs MTP's 89.45/89.44 (+30.7%), w4a8
-**109.22/109.29** vs 87.53/87.71 (+24.6%), mxfp4 **94.30/94.30** vs 75.50/75.68 (+24.9%). On the
-standard haiku prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.62, +12.2%) and w4a8
-(64.79/64.76 vs 57.69/57.66, +12.3%), but MTP still leads on mxfp4 (64.91/64.91 vs 58.57/58.63,
--9.8%) -- prompt-dependent, not a fixed ranking. Best single cell (w4a16/code) is within 3% of the
-120 tok/s / 84% acceptance the reference ROCmFPX implementation reaches on this same card/draft. The
-`p_min` sweep, the w4a8/mxfp4 DRAFT containers, and the mxfp4/standard-prompt acceptance gap are
-still open (docs/dflash2.md section 7a, docs/perf.md's top section).
+vs. best `--mtp K`, twice each): on a ~270-token code prompt, DFlash2 **beats MTP** on w4a16 --
+**116.90/116.84 tok/s** (77.4% acceptance) vs MTP's 89.45/89.44 (+30.7%). On the standard haiku
+prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.62, +12.2%) -- prompt-dependent, not
+a fixed ranking. Best single cell (w4a16/code) is within 3% of the 120 tok/s / 84% acceptance the
+reference ROCmFPX implementation reaches on this same card/draft. The `p_min` sweep is still open
+(docs/dflash2.md section 7a, docs/perf.md's top section).
 
 **Sampled (`--temperature > 0`) traffic, Milestone 6 stage S3.** The numbers above were all greedy
 (`--temperature 0`) -- the setting real chat clients almost never use. As of this stage, `--mtp`/
@@ -377,7 +371,7 @@ trajectories on the real container. Measured, real 64-layer container: plain sam
 over greedy fell from 6.2-7.5% to statistical parity (within about -0.8% to +0.7%, re-confirmed by
 the Integrate stage), and w4a16's best sampled `--dflash k=7` cell reaches **154.28, 154.23 tok/s**
 on a code prompt (4.28x plain sampled decode's pre-stage cost) -- see `docs/perf.md`'s top section
-for the full matrix (all three sampling configs x both prompts x all three layouts, twice each) and
+for the full matrix (all three sampling configs x both prompts, twice each) and
 `docs/sampling.md` section 12.
 
 ### Tensor parallel across both GPUs (`--tp 2`)
@@ -634,12 +628,11 @@ self-speculative decode), Milestone 3 (quantized `gdn.in_proj_z`/`attn.k`/`attn.
 container, fused residual+rmsnorm (R3), vectorized rmsnorm/residual_rmsnorm/silu_mul kernels (P6), a
 configurable/measured MTP head layout, a device-resident embedding gather + MTP draft loop, and
 server-side `Model::Reset()`/MTP/prefix-reuse hardening), and **Milestone 4** are all complete and
-integrated. Milestone 4 (2026-09-20) root-caused and enabled the fused activation-quant epilogues
-(R2/P2) for w4a8/mxfp4 (an `r4dx::core::Arena::Alloc` end-alignment gap; w4a16 stays unfused, a
-separate measured wall-clock regression, not a correctness issue); re-swept
-`src/model/gemm_tuning_table.inc` with a Q5-fixed methodology that eliminates cache-flattery
-(mxfp4 decode improved, w4a16 flat, w4a8 `--mtp 3` regressed -- attributed to verify-band GEMM
-retiling + numerical reduction-order drift, not a correctness bug); root-caused the MTP acceptance
+integrated. Milestone 4 (2026-09-20) root-caused an `r4dx::core::Arena::Alloc` end-alignment gap
+behind the fused activation-quant epilogues' divergence (R2/P2; those epilogues were later removed
+together with the layouts that used them, and w4a16 stays unfused, a separate measured wall-clock
+regression, not a correctness issue); re-swept
+`src/model/gemm_tuning_table.inc` with a Q5-fixed methodology that eliminates cache-flattery; root-caused the MTP acceptance
 gap to h_seed drift on one outlier residual dimension (a measured, expected quantization effect, not
 a bug); built a reduced-vocab MTP draft head end to end (container format, loader, kernel, `K`
 widened to 16) -- mechanism verified lossless on real hardware, but its ~2.5-3x economic projection
@@ -653,7 +646,6 @@ review pass (8 findings, all fixed and regression-tested) -- see "Tool calls" be
 passes, known gaps, and the proposed next milestone (the tiled WMMA prefill GEMM kernel (R10/P9),
 then the vision tower's C++, then DFlash2 drafting).
 
-Headline decode throughput on the real 64-layer container (each layout's own best `--mtp K`, HIP
-device 1, post-Milestone-4 integration): **w4a16 68.73 tok/s (`K=3`, 46.3% acceptance), w4a8 57.86
-tok/s (`K=4`, 31.0%), mxfp4 65.04 tok/s (`K=3`, 52.9%)** -- see `docs/perf.md`'s consolidated
-Milestone 1 -> 2 -> 3 -> 4 table for the full progression.
+Headline decode throughput on the real 64-layer container at that milestone (w4a16, best `--mtp K`, HIP
+device 1, post-Milestone-4 integration): **68.73 tok/s (`K=3`, 46.3% acceptance)** -- see
+`docs/perf.md`'s consolidated Milestone 1 -> 2 -> 3 -> 4 table for the full progression.

@@ -3,8 +3,7 @@
 // before any wiring").
 //
 // For each producer (r4dx_rmsnorm_bf16, r4dx_residual_rmsnorm_bf16, r4dx_silu_mul_bf16) x the
-// epilogue r4dx_epilogue_f16 (the fp8 and int8 epilogues went with the mxfp4 and w4a8 layouts and
-// are now refused as unknown values, checked below) x M in {1,2,4,16,64} x K in
+// epilogue r4dx_epilogue_f16 (any other epilogue value is refused as unknown, checked below) x M in {1,2,4,16,64} x K in
 // {5120,6144,17408} (the task's own grid, and this model's three real hidden/intermediate sizes):
 // runs the producer TWICE on the SAME seeded random bf16 input --
 //   "old" path:   producer(epilogue=none) -> the existing STANDALONE cast kernel

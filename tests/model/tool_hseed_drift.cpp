@@ -19,8 +19,7 @@
 // Prints, per layout, per sampled position: cosine similarity and relative L2 vs the bf16
 // reference's h_seed, plus the worst-drifting components by absolute difference. Prints a final
 // summary table (mean cosine / mean rel L2 per layout) to correlate against the independently-
-// measured acceptance ranking (docs/mtp.md's K=3: w4a16 51.9-54.3%, mxfp4 40.0-41.9%, w4a8
-// 32.5-34.2%).
+// measured acceptance ranking (docs/mtp.md's "MTP head layout" table).
 //
 // CAVEAT: this container is a 4-layer truncation of the real 64-layer model (the only form a bf16
 // exact-arithmetic reference exists in, per this project's bf16-retirement rule). The RELATIVE

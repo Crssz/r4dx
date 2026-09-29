@@ -12,10 +12,10 @@
 // Tolerances: bf16 at the task's tight bound (2e-2, TOLERANCES.bf16_matmul_rel_err). The
 // quantized layouts measured ~1.0-1.3e-1 rel L2 on this real checkpoint's lm_head weights -- a
 // single (non-chained) GEMM, yet notably worse than test_gdn_layer.cpp's ~7-8e-2 for a FOUR-GEMM
-// chain, and well above tests/kernels/test_mxfp4_gemm.cpp's ~2e-2 on synthetic random weights.
+// chain, and well above the ~2e-2 the same kernel shows on synthetic random weights.
 // That gap (single real GEMM > chained real GEMMs > synthetic GEMM) points at the real lm_head
 // weight matrix's value distribution interacting badly with the per-(row,group) quantization grid
-// (src/convert/include/r4dx_convert/quant_int4.hpp / quant_mxfp4.hpp), not at anything in this
+// (src/convert/include/r4dx_convert/quant_int4.hpp), not at anything in this
 // file's GEMM dispatch -- the identical dispatch code passes at 1.1e-4 for bf16 immediately above.
 // kLooseTol=1.5e-1 is that measured number with headroom, reported honestly rather than tuned to
 // look tight; see this task's open_issues for the follow-up (src/convert's quantizer, or a

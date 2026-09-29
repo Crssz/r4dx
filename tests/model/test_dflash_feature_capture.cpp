@@ -56,7 +56,7 @@ using r4dx::model::ModelOptions;
 namespace {
 const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
 // Same 4-layer MTP-enabled container test_mtp.cpp uses (converted `--layers 4 --mtp on --layouts
-// bf16,w4a16,w4a8,mxfp4`) -- separately SKIPped below if absent so a machine missing it still runs
+// bf16,w4a16`) -- separately SKIPped below if absent so a machine missing it still runs
 // every other check in this file.
 const char* kMtpContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int64_t kDraftK = 3;

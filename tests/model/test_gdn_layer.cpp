@@ -10,23 +10,21 @@
 // out_proj, mlp.gate_up/down) runs at full bf16 precision, so the only error source is the same
 // bf16 accumulation drift the golden's own tolerance already budgets for.
 //
-// The quantized layouts (mxfp4/w4a16/w4a8) chain FOUR quantized GEMMs per block (in_proj_qkv,
+// The quantized layout (w4a16) chains FOUR quantized GEMMs per block (in_proj_qkv,
 // out_proj, gate_up, down) through two residual adds. Each individual quantized GEMM is within the
-// ~2e-2 rel-err gate tests/kernels/test_mxfp4_gemm.cpp and tools/convert_ref/kernel_crosscheck.py
-// hold it to in isolation, but chaining four of them nonlinearly (through conv/gating/chunk_scan
+// ~2e-2 rel-err gate tools/convert_ref/kernel_crosscheck.py holds it to in isolation, but chaining four of them nonlinearly (through conv/gating/chunk_scan
 // and silu_mul, not just four independent additions) measured out to ~7-8e-2 rel L2 on this real
 // checkpoint's layer 0 -- reported by a first pass at 5e-2 (the golden manifest's own
 // recurrent_state_rel_err tier, reused as a starting guess) failing outright. kLooseTol=1e-1 below
 // is that measured number with headroom, not an aspirational figure: it is loose enough to pass
 // what was actually observed and still catch a real regression (a broken quant path lands an order
-// of magnitude higher, not 20% higher -- see test_mxfp4_gemm.cpp's own single-GEMM failures for
-// comparison). Tightening this is future work for whoever improves the per-layer quantization
+// of magnitude higher, not 20% higher). Tightening this is future work for whoever improves the per-layer quantization
 // (calibration, mixed-precision residual paths, etc.), not a claim that 1e-1 is intrinsic.
 //
 // Needs two pieces of real data neither vendored into the repo (docs/validation.md): the golden
 // file itself (produced by layer_golden.py against the real checkpoint) and an r4dx test
 // container carrying every layout (produced by r4dx-convert --layers N --layouts
-// bf16,mxfp4,w4a16,w4a8 ...). Skips (CTest SKIPPED, not FAILED) if either is missing, exactly
+// bf16,w4a16 ...). Skips (CTest SKIPPED, not FAILED) if either is missing, exactly
 // like tests/tokenizer/golden_test.cpp's SKIP_RETURN_CODE convention. A layout the container
 // happens not to carry is reported and skipped individually rather than failing the whole test,
 // so a partial container (e.g. bf16-only) still exercises what it has.

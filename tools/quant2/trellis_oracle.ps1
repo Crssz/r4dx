@@ -14,8 +14,9 @@
 # -Python defaults to $env:R4DX_REFERENCE_VENV\Scripts\python.exe when that is set, else python on
 # PATH. The defaults below are the HUIHUI abliterated model's artifacts (docs/huihui.md, the default
 # container's recipe): its hessian-v2 (docs/quant2.md 3.3 settings), trellis-q, KL directory and bf16 KL
-# reference kl-ref, and its checkpoint dir (common.DEFAULT_MODEL_DIR). The base Qwen3.8-27B's files (trellis-q,
-# hessian\hessian-v2, kl-canon\ref) were retired on 2026-09-29; to oracle another model pass all of
+# reference kl-ref, and its checkpoint dir (common.DEFAULT_MODEL_DIR). The base Qwen3.8-27B's trellis-q
+# and hessian\hessian-v2 were retired on 2026-09-29 (its bf16 reference kl-canon\ref is still on disk, but
+# it scores only base-model containers, and none is left); to oracle another model pass all of
 # -QDir -HessianDir -KlDir -RefDir -ModelDir explicitly.
 param(
   [string[]]$Points = @('K4m', 'mix4.5m', 'K3.5m', 'K4'),

@@ -9,7 +9,8 @@
 #
 # A KL number is only meaningful against the bf16 reference of the SAME model: the default -RefDir is
 # huihui\kl-ref (tools/reference/full_logits_golden.py on the Huihui checkpoint, tokens_canon.json).
-# The base Qwen3.8-27B reference (kl-canon\ref) belongs to the retired base containers.
+# The base Qwen3.8-27B reference (kl-canon\ref, still on disk) scores only the base model's containers,
+# all of which were retired.
 #
 # The gate (exit 1 when it fails):
 #   1. mean KL rounds to -ExpectKl at 5 decimals and top-1 to -ExpectTop1 at 2 (kl_report.py's overall);

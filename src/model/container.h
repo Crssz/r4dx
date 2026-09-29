@@ -43,7 +43,7 @@ namespace r4dx::model {
 struct AttnWeights {
   QuantLinear qg;   // fused q_proj + output gate, [num_heads*head_dim*2, hidden]
   // k/v (R1, docs/r9700.md): now QuantLinear like every other layout-eligible linear --
-  // text.layers.{i}.attn.{k,v} carry mxfp4/w4a16/w4a8/bf16 like attn.qg/o when the container was
+  // text.layers.{i}.attn.{k,v} carry w4a16/trellis/bf16 like attn.qg/o when the container was
   // converted with the new converter; Container::Load falls back to bf16 (or, for the oldest
   // pre-R1 containers, the bare single-tensor form) when the requested layout's tensors are
   // absent -- see container.cpp's LoadQuantLinearWithFallback. mtp.attn.k/v are always loaded
@@ -58,7 +58,7 @@ struct AttnWeights {
 struct GdnWeights {
   QuantLinear in_proj_qkv;                         // [2*key_dim+value_dim, hidden]
   // in_proj_z (R1, docs/r9700.md): now QuantLinear -- 3.02 GB/token of what used to be forced
-  // bf16, now eligible for mxfp4/w4a16/w4a8 like in_proj_qkv/out_proj. Same
+  // bf16, now eligible for w4a16/trellis like in_proj_qkv/out_proj. Same
   // LoadQuantLinearWithFallback fallback chain as attn.k/v above.
   QuantLinear in_proj_z;                            // [value_dim, hidden]
   core::DeviceBuffer<uint16_t> in_proj_b, in_proj_a;  // bf16 [num_v_heads, hidden] -- deliberately

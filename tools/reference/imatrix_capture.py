@@ -137,7 +137,7 @@ class LinearSpec:
 
 def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool) -> list[LinearSpec]:
     """Every linear `src/convert/main.cpp` routes through `add_linear` (i.e. every linear that gets
-    `mxfp4`/`w4a16`/`w4a8` variants), in converter order, with the HF module whose INPUT feeds it.
+    quantized `w4a16` / trellis form), in converter order, with the HF module whose INPUT feeds it.
 
     Deliberately NOT included, because the converter never quantizes them: `gdn.in_proj_a`/`_b`,
     `gdn.conv1d_weight`, every `*_norm`, `text.embed_tokens`, `mtp.fc`, `mtp.norm`,

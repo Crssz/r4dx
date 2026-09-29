@@ -190,7 +190,7 @@ static int RunTest() {
     // Value-gated prefill/decode state-handoff equivalence (file header comment): Prefill(prompt)
     // vs Prefill(prompt[:-1]) + DecodeStep(prompt[-1]) must land on the same next-token logits.
     // Measured on the real 4-layer test container, HIP device 1 (2026-09-19): bf16=1.96e-3,
-    // mxfp4=6.99e-3, w4a16=2.09e-3, w4a8=3.86e-2 -- tolerances below are those numbers with
+    // w4a16=2.09e-3 -- tolerances below are those numbers with
     // headroom (same "measured, not aspirational" convention as test_gdn_layer.cpp's kLooseTol),
     // loose enough to pass what was actually observed while still catching a real regression (a
     // broken state handoff -- e.g. this stage's GDN conv-state depth blocker -- lands an order of

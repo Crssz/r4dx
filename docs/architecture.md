@@ -52,7 +52,7 @@ token id
 
 At M<=64 (the whole non-chunked-prefill decode/small-batch band) every GEMM above is one of the
 skinny `r4d_gemm_*_nt_m64` kernels; the model graph picks WV/SK/MB per shape once at layer-build
-time (mirroring libr4d's own `build-win/check_gemm_bf16.py` tuning) rather than per call.
+time (from the tuning table in `src/model/gemm_tuning_table.inc`) rather than per call.
 
 ### Attention layer (16 of 64 layers)
 
@@ -73,7 +73,7 @@ q, k = rope(q, k, cos, sin)                    -- partial_rotary_factor 0.25 of 
                                                    the KV slot index -- docs/vision.md
                                                    "Text-side splicing"
                                                                         [src/kernels: rope]
-o = r4d_attn_{prefill,decode}_h256_gqa6_{fp8kv,bf16kv}(q, k_cache, v_cache, ...)
+o = r4d_attn_{prefill,decode}_h256_gqa6_fp8kv(q, k_cache, v_cache, ...)
                                                 -- kv cache write happens BEFORE this call
                                                                         [src/kernels: kv cache write]
 o = o * sigmoid(gate)                          -- the output gate, applied post-attention
@@ -177,7 +177,7 @@ Architecturally unrelated to everything above: a different attention kernel, a r
 full head instead of a partial interleaved mrope, and a learned+interpolated position embedding with
 no text-side analogue. It is bf16 end to end -- `vision.*` is passthrough in the container, never
 quantized (docs/container-format.md), so there is one numeric path, not the text side's
-mxfp4/w4a16/w4a8 fan-out.
+trellis / w4a16 / bf16 mix.
 
 ```
 image bytes

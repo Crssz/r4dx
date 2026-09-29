@@ -572,7 +572,7 @@ void r4dx_vision_pos_embed_bf16(int64_t table, int64_t indices, int64_t weights,
 // incremented once per r4dx-owned kernel launch above (every r4dx_* entry point in this header,
 // AFTER its `rows/M/T <= 0` early-return check, so a no-op call does not count). Counts ONLY
 // r4dx-owned launches -- NOT the r4d_gemm_*/r4d_gdn_*/r4d_attn_* launches in third_party/libr4d,
-// which this project does not instrument (out of scope: a third_party submodule). Used by
+// which this project does not instrument (out of scope: vendored third_party code). Used by
 // Model::DecodeStepProfiled (model.cpp) to report "r4dx-owned kernel launches per token" before/
 // after the R3/P2 fusion pass -- see docs/mtp.md and docs/status.md for the measured before/after.
 void r4dx_kernel_launch_counter_reset();

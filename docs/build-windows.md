@@ -43,13 +43,11 @@ pattern for objects that did not come from CMake's own compile rules. Ninja trea
 invocation as an ordinary custom-command edge, so it parallelizes them like any other build step
 (the units compile in ~15s wall time with 32 janitor threads on this machine's Ninja default job
 count). The 13 units are the attention (paged, vit), 5 GDN, bf16 / w4a16 / trellis M<=64 / trellis
-M=256 GEMM, DFlash conv and registry units; the w4a8 / mxfp4a8 GEMMs, the int8 activation quantiser,
-the M<=16 bf16 GEMM, the all-reduce units and the pybind module were cut from the vendored libr4d.
+M=256 GEMM, DFlash conv and registry units.
 
 ### hipcc flags
 
-Base flags (mirrors libr4d's own former `build_windows.ps1`, which was dropped when libr4d was
-vendored, minus the Python/pybind11-specific bits that build needed and this one does not):
+Base flags:
 
 ```
 -O3 -std=c++17 --offload-arch=gfx1201 -Wno-unused-result -ffp-contract=off
@@ -88,8 +86,7 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
    when one of `--layout` / the lm-head layout / the MTP-head layout is `w4a16`,
    `DflashDraftWeights::Open` when the drafter carries a `.w4a16.*` tensor at all. `r4dx-convert`
    writes the `quant` metadata block unconditionally, so a bf16 container records a w4a16 group for a
-   layout it holds no tensor of. (The mxfp4 and w4a8 layouts, which older containers such as `v5`
-   also carry next to their group-128 `w4a16`, are retired: a build no longer reads them.)
+   layout it holds no tensor of.
 3. CMake rejects a group that is not a positive multiple of 64: the kernel packs
    `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
    128 are the only values libr4d accepts unmodified**.
@@ -190,8 +187,7 @@ The recipe for regenerating `g64\` (six containers, ~52 GiB, ~3 min of CPU) is:
 
 ```powershell
 $dir = 'D:\models\r4dx\g64'
-# (the mxfp4 / w4a8 layouts the existing g64 containers also carry are retired; a fresh convert writes
-#  only bf16 and w4a16)
+# (a convert writes only bf16 and w4a16 here)
 # qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp off --vision off
 # qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
@@ -210,8 +206,7 @@ production. There is no 64-layer container in `g64\` (not worth a 42 GiB copy): 
 build's real-container tests use the production Huihui trellis container instead, as above.
 
 A bf16 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
-does. (The `-mxfp4` drafter container is retired and refused by name; the root group-128 w4a16 one
-is refused by the group guard on a group-64 build.) `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is
+does. (The root group-128 w4a16 drafter container is refused by the group guard.) `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is
 redundant; the original `D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx` loads on either build.
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
@@ -225,25 +220,19 @@ hipcc's objects and clang-cl's objects have to agree on the MSVC CRT or the fina
 `LNK2038` (CRT version mismatch). The fix applied here: `CMakePresets.json`/root `CMakeLists.txt`
 set `cmake_policy(SET CMP0091 NEW)` + `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL` (the dynamic,
 `msvcrt.dll`-family CRT) for every CMake-compiled target, and `third_party/CMakeLists.txt` passes
-the matching `-D_DLL -D_MT -Xclang --dependent-lib=msvcrt` to every hipcc invocation -- the same
-flags libr4d's `build_windows.ps1` uses for its Python-extension build, for the same reason (there
-it is matching `python312.dll`; here it is matching r4dx's own clang-cl objects). This combination
-linked clean on the first try.
+the matching `-D_DLL -D_MT -Xclang --dependent-lib=msvcrt` to every hipcc invocation, so the hipcc
+objects match r4dx's own clang-cl objects. This combination linked clean on the first try.
 
-### libr4d is vendored (history note)
+### libr4d is vendored
 
-libr4d used to be a git submodule (`third_party/libr4d`, pinned to a commit of a local libr4d clone,
-which needed `-c protocol.file.allow=always` for a local-path `submodule add`). It is now vendored as
-plain sources under `third_party/libr4d`: the vendoring commit is a merge that carries libr4d's
-history (upstream commit `f47a8bc`, branch `linear`) and `git clone` needs no `--recurse-submodules`
-and no `submodule update`.
+The GPU kernels live as plain sources under `third_party/libr4d`, part of this repository: a plain
+`git clone` builds, with nothing to fetch. Credit for the library is in the top-level `NOTICE`, and
+`third_party/VERSIONS.md` records which upstream commit the tree came from.
 
 ### r4d_registry rows
 
-`r4d_registry.hip` lists only kernels that are still in the vendored libr4d: `smoke_r4d` prints its 18
-rows. It used to list 25 (the 7 `ar_*` rows, which referenced the all-reduce kernels only as data, plus
-rows for the bf16-KV attention, `gemm_bf16_nt_m16`, `gemm_w4a8_nt_m64`, `gemm_mxfp4a8_nt_m64` and
-`quant_act_i8`); those were removed with the units they described.
+`r4d_registry.hip` lists only the kernels that are in the vendored libr4d: `smoke_r4d` prints its 18
+rows.
 
 ## The test
 

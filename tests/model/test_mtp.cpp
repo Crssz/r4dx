@@ -43,13 +43,9 @@ using r4dx::model::Model;
 using r4dx::model::ModelOptions;
 
 namespace {
-// Review finding, 2026-09-20: this used to point at qwen38-27b-l4-mtp.r4dx (bf16+w4a16 only), so
-// CheckVerifyMatchesSequential/CheckRejectionRewind/CheckWideWindowRejectionRewind never ran for
-// w4a8/mxfp4 -- precisely the two layouts this milestone's fused-epilogue and GEMM-tuning-table
-// passes perturbed. qwen38-27b-l4-allmtp.r4dx (converted `--layers 4 --mtp on --layouts
-// bf16,w4a16,w4a8,mxfp4`, docs/status.md's "h_seed drift" section) already exists on disk and was
-// previously used only by the non-ctest tool_hseed_drift -- pointed at here instead so every check
-// in this file's main loop runs against all four layouts.
+// The 4-layer MTP container: qwen38-27b-l4-allmtp.r4dx (converted `--layers 4 --mtp on --layouts
+// bf16,w4a16`), so CheckVerifyMatchesSequential/CheckRejectionRewind/CheckWideWindowRejectionRewind
+// run against both layouts the build supports.
 const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int64_t kDraftK = 3;
 constexpr int kRejectionCheckRounds = 12;  // enough rounds to almost certainly see a rejection on
@@ -1305,8 +1301,7 @@ static int RunTest() {
     return SkipMissing(kContainerPath);
   }
 
-  // The layouts the allmtp container above carries and this build still supports (the w4a8 and
-  // mxfp4 layouts it also carries are retired).
+  // The layouts the allmtp container above carries and this build supports.
   const Layout layouts[] = {Layout::kBf16, Layout::kW4a16};
   const std::vector<int32_t> prompt = MakePromptTokens(24);
   int ran = 0;

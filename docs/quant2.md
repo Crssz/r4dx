@@ -148,10 +148,8 @@ for block [b0, b1):
   W_tile[:, b1:] -= E . U[b0:b1, b1:]       (SubMatMul)
 ```
 
-Per layout: w4a16 asymmetric (free zero), w4a8 zero pinned at 8, mxfp4 per-32 E8M0 exponent
-(round-up vs round-up-minus-one, as `QuantizeMxfp4Search`) then `EncodeE2M1`. Outputs are exactly
-the vectors `QuantizeInt4Asymmetric` / `QuantizeInt4SymmetricPinned8` / `QuantizeMxfp4` produce, fed
-to the unchanged packers.
+For w4a16 the quantizer is asymmetric (free zero); the output is exactly the vectors
+`QuantizeInt4Asymmetric` produces, fed to the unchanged packers.
 
 `hessian_store.hpp`: reads `hessian.json` + `.hess`, validates magic/K/trace, expands to a full
 symmetric `K x K`, and caches the last factorization (keyed by file and damp) so the linears that
@@ -269,7 +267,7 @@ site is listed as file: function.
 | X4 | `model.cpp: Model::PrefillProfiled`, per chunk, after the loop | `x Q^T` | `[0, T)` | span `rotate.exit`. Nothing reads the result; it keeps the profile at RunChunk's real cost |
 | D1 | `model.cpp: Model::RunChunk`, after X1, gated on `dflash_capture_active` | `x Q^T` | `dflash_features_dev_[0, T*cols)` | the captures are layer INPUTS, so they are rotated. They must be derotated before the observer, `dflash_->InjectFeatures` and `DflashFeatureBuffer()` read them (all after the synchronize). The gate is the capture's own: a chunk that did not capture must not rotate an earlier chunk's rows a second time |
 | D2 | `model.cpp: Model::VerifyWindow`, after X2, gated on `!dflash_target_layers_.empty()` | `x Q^T` | `dflash_features_dev_[0, T*cols)` | the same, with that capture's own gate, which is not `dflash_injection_enabled_`. Read by DecodeStepDflashImpl's `InjectFeatures` and by tests |
-| H1 | `mlp.cpp: Mlp::Forward` (`down_had_signs`, a ctor argument) | `(silu*up) Hb`, B 512 | `[T, intermediate]` | the backbone's only `silu_mul`, fused as `r4dx_silu_mul_hadamard_bf16`, with the w4a8/mxfp4 epilogue applied to the rotated row |
+| H1 | `mlp.cpp: Mlp::Forward` (`down_had_signs`, a ctor argument) | `(silu*up) Hb`, B 512 | `[T, intermediate]` | the backbone's only `silu_mul`, fused as `r4dx_silu_mul_hadamard_bf16`, with the epilogue (none or f16) applied to the rotated row |
 | H2 | `attention_layer.hpp: AttentionLayer::Forward` (`AttnWeights::o_had_signs`) | `(o*sigmoid(g)) Hb`, B = head_dim | `[T, H*D]` | fused as `r4dx_model_attn_gate_mul_hadamard_bf16`, on the prefill and decode/verify paths alike |
 | H3 | `gdn_layer.cpp: GdnLayer::Forward` (`GdnLayerParams::out_had_signs`), after the prefill/decode branches rejoin at `out_core` | `h Hb` in place, B = V | `[T, H*V]` | `r4dx_hadamard_inplace_bf16`. Decode's gated norm lives inside libr4d's recurrent kernel, so it cannot be fused |
 
@@ -774,7 +772,7 @@ That refusal depends on the linear having no `.bf16.w`. With a bf16 companion, t
 would silently load the bf16 copy: correct numbers, the wrong layout, about 3.5× the bytes, and only a
 fallback count in the log. So `r4dx-convert` refuses a non-default group on any linear that keeps
 `.bf16.w`. Use `--no-bf16`, plus an `--lm-head` spec without bf16. The v6 recipe already does both.
-Loads with `--layout mxfp4` or `w4a8` on an old binary are correct, because the map changes only
+Loads of any non-w4a16 layout on an old binary are correct, because the map changes only
 w4a16 tensors. `r4dx_format_version` is not a guard, because no reader checks it.
 
 **Costs and consequences.**
@@ -851,7 +849,7 @@ this run's in every field:
 | `converter.exe_sha256` | the running `r4dx-convert.exe` (r4d_core is linked statically) |
 | `converter.runtime_dlls` | ucrtbase / msvcp140 / vcruntime140 as loaded (`rotation.mix5` uses ucrt's log/cos/sin) |
 | `converter.cpu` | vendor, brand, family/model/stepping, FMA3/AVX/AVX2/AVX-512F, XCR0, `_get_FMA3_enable()`: ucrt picks its FMA3 or SSE2 transcendentals at run time, and they can differ in the last bit |
-| `converter.{w4a16,w4a8,mxfp4}_group`, `avx512` | build constants; the LDLQ microkernel path |
+| `converter.w4a16_group`, `avx512` | build constants; the LDLQ microkernel path |
 | `checkpoint` | sha256 of `config.json` and `model.safetensors.index.json`; length + sha256 of every shard the index names (whole files). The path is not compared. |
 | `args` | resolved `layers`, `vision`, `mtp`, the body and lm_head layout sets after `--no-bf16`, `quant`, `ldlq`, `ldlq_damp`, `rotate`, `rotation_seed` |
 | `inputs` | sha256 of `--imatrix`, `--kv-calib`, `--draft-vocab-ids` (when `--mtp` is on) and `hessian.json`; `hessian_files`: length + sha256 of every `.hess` file the `--ldlq` regex can make the run read (the selected bases' `keys` and `rms_keys` files) |

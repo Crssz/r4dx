@@ -6,7 +6,7 @@
 //     doc: "f16 A"), while every r4dx activation buffer is produced/consumed as bf16 -- this is
 //     the device-side dtype cast docs/architecture.md's "Own kernels" table would have listed had
 //     w4a16 existed when that table was written.
-//   - r4dx_model_widen_bf16_to_f32: every r4d GEMM kernel (bf16/w4a16/w4a8/mxfp4a8, see each
+//   - r4dx_model_widen_bf16_to_f32: every r4d GEMM kernel (bf16/w4a16/trellis, see each
 //     .hip file's epilogue) writes its C operand as bf16 -- there is no fp32-output GEMM variant.
 //     The task's "final norm + lm_head -> fp32 logits on device" therefore needs one widen pass
 //     after the lm_head GEMM; this is it.

@@ -14,9 +14,8 @@
                    the draft-dependent numbers; greedy verify and seeded sample-and-match emit
                    draft-independent tokens, so text and ids alone cannot see a drafter or MTP-head
                    byte change);
-    row 6          tool_teacher_forced_logprobs on the 4-layer container, layouts bf16/w4a16
-                   (w4a8/mxfp4 were retired with their kernels), --layers 4, the kl_corpus tokens:
-                   every *.logprobs.f16 it writes.
+    row 6          tool_teacher_forced_logprobs on the 4-layer container, layouts bf16/w4a16,
+                   --layers 4, the kl_corpus tokens: every *.logprobs.f16 it writes.
 
     1  standard protocol, plain greedy
     2  standard protocol + --dflash <drafter> --dflash-k 7
@@ -45,7 +44,7 @@
   SHA-256 of each exe):
     tp1-1099446  main 1099446, the first trellis-capable one: use it for the default container
                  (rows 1-5, 7-9) and for row 6.
-    tp1-f7d4927  pre-trellis (reads w4a16/w4a8/mxfp4/bf16 only): row 6 and any w4a16 container
+    tp1-f7d4927  pre-trellis (reads w4a16 and bf16 layouts only): row 6 and any w4a16 container
                  (-Model <a w4a16 container> -Layout w4a16).
   To confirm a baseline's determinism run it against itself (-Baseline X -Candidate X): every row
   must be EQUAL, i.e. a bit-identical repeat.

@@ -103,7 +103,7 @@ void TestArena() {
 }
 
 // Regression test for the arena-alignment finding (review, 2026-09-20): src/model/linear.cpp's
-// w4a8/mxfp4 quant scratch and src/model/attention/attention_layer.hpp's decode scratch pass an
+// activation-quant scratch and src/model/attention/attention_layer.hpp's decode scratch pass an
 // explicit align_bytes=16 to Arena::Alloc because they feed wide (16-byte) GPU loads -- but every
 // PRECEDING allocation in a real layer happens to already be 16-aligned, so a regression in
 // Arena::Alloc's own align_bytes handling would not be caught by exercising those call sites

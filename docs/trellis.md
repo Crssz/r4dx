@@ -1,7 +1,7 @@
 # EXL3 trellis quantization -- an implementable specification (oracle input)
 
 *Note 2026-09-29: the Hessians, oracle bits and KL references named in this document (`hessian-v2`,
-`trellis-q`, `kl-canon\ref`, `kl-trellis`) are the BASE model's and were retired with the base checkpoint;
+`trellis-q`, `kl-canon\ref`, `kl-trellis`) are the BASE model's: the Hessians and oracle bits were retired with the base checkpoint, `kl-canon\ref` is still on disk (scoring only base-model containers, none left) and `kl-trellis` keeps only its logs and json;
 the Huihui model's own live under `D:\models\r4dx\huihui\` and are the tools' defaults now
 ([huihui.md](huihui.md)). The numbers here stay as the record of the first run.*
 

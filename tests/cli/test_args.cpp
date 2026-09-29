@@ -26,12 +26,12 @@ std::vector<char*> ToArgv(std::vector<std::string>& storage) {
 }
 
 void TestMinimalPrompt() {
-  std::vector<std::string> storage = {"r4dx-cli", "--model", "model.r4dx", "--layout", "mxfp4",
+  std::vector<std::string> storage = {"r4dx-cli", "--model", "model.r4dx", "--layout", "w4a16",
                                        "--prompt", "hello"};
   auto argv = ToArgv(storage);
   const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
   CHECK(a.model_path == "model.r4dx");
-  CHECK(a.layout == "mxfp4");
+  CHECK(a.layout == "w4a16");
   CHECK(a.prompt == "hello");
   CHECK(!a.chat);
   CHECK(a.max_tokens == 128);

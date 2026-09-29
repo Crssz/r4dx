@@ -949,9 +949,7 @@ Container ReadContainer(const fs::path& path) {
 }
 
 // sha256 over every tensor (name, size, bytes; in name order): the container's DATA, independent of
-// its __metadata__ (which records where the test wrote its Hessians, and -- since the mxfp4 / w4a8
-// layouts were retired -- no longer lists those layouts, so the golden below is a digest of the
-// tensors a pre-retirement build wrote with the same arguments).
+// its __metadata__ (which records where the test wrote its Hessians).
 std::string Digest(const Container& c) {
   std::string all;
   for (const auto& kv : c.tensors) {
@@ -974,8 +972,8 @@ std::string CommonArgs(const fs::path& ckpt, const fs::path& out, const fs::path
 }
 
 // Digest() of `r4dx-convert CommonArgs(<ckpt>, <out>, <root>/hess_A, 1)` on --make-fixture's output,
-// taken with r4dx-convert built from bcebb21 (before the mxfp4 / w4a8 layouts were cut), whose
-// w4a16 / bf16 tensors are the ones this build must still write; R4DX_W4A16_GROUP=64. (The previous
+// taken with r4dx-convert built from bcebb21, whose w4a16 / bf16 tensors are the ones this build
+// must still write; w4a16 group 64. (The previous
 // golden, of the whole file with its header, was taken at 0190d80, before rms_keys existed; that
 // build's and bcebb21's tensors were identical.)
 const char* const kUnrotatedGolden = "02af5a27e54276c7d6bc88fea494941ce7c90c16e380b6e9ac0ab4c9265c4e92";

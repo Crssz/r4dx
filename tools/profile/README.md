@@ -26,13 +26,13 @@ GEMMs/kernels as separate, named function calls, so this is mechanical, not a re
 
 ## GEMM (WV,SK,MB,NPW,NT) tuning sweep
 
-`tune_gemm.py` sweeps the legal parameter grid for all four `r4d_gemm_*_nt_m64` kernel families
-(bf16/w4a16/w4a8/mxfp4) at this model's seven real (N,K) linear shapes (`gdn.in_proj_qkv`,
-`gdn.out_proj`, `attn.qg`, `attn.o`, `mlp.gate_up`, `mlp.down`, `lm_head`) for M in
-{1,2,4,8,16,32,64}, over the Python `r4d.pyd` binding + the read-only reference venv's torch (same
-route `third_party/libr4d/bench_mxfp4_gemm.py` already used for a narrower, mxfp4-only sweep) on
+`tune_gemm.py` sweeps the legal parameter grid for the two `r4d_gemm_*_nt_m64` kernel families
+r4dx tunes this way (bf16 and w4a16) at this model's seven real (N,K) linear shapes
+(`gdn.in_proj_qkv`, `gdn.out_proj`, `attn.qg`, `attn.o`, `mlp.gate_up`, `mlp.down`, `lm_head`) for M
+in {1,2,4,8,16,32,64}, over the Python `r4d.pyd` binding of a libr4d clone's own build (the vendored
+`third_party/libr4d` does not carry the pybind module) + the read-only reference venv's torch, on
 HIP device 1. Each kernel's legal-parameter constraints (K/N divisibility, `WV*SK*32<=1024`,
-`MB in 1..4`, the LDS-budget cap `WV*NPW*SK<=64` for the three quantized kernels) are read from that
+`MB in 1..4`, the LDS-budget cap `WV*NPW*SK<=64` for the quantized kernel) are read from that
 kernel's own `.hip` source (see `tune_gemm.py`'s own file comment for the exact file:line
 references) before generating candidates, not guessed; each launch is also wrapped in try/except as
 a redundant second check, since the kernel itself throws `std::runtime_error` on an out-of-range
@@ -46,8 +46,8 @@ python tools\profile\tune_gemm.py \
 **The pyd must be built at the r4dx build's w4a16 group.** `r4d_gemm_w4a16_nt_m64` is compiled at
 one group size; the r4dx build uses `R4DX_W4A16_GROUP` (default 64), but libr4d's own
 `build_windows.ps1` passes no group flag, so a stock `build-win\r4d.pyd` is group 128. The tuner
-prints the groups the loaded pyd reports (`r4d.GEMM_W4_GROUP` etc.), sizes the scale buffers from
-them, and refuses a w4a16 sweep unless the pyd's group equals `--w4a16-group` (default 64). The
+prints the group the loaded pyd reports (`r4d.GEMM_W4_GROUP`), sizes the scale buffers from
+it, and refuses a w4a16 sweep unless the pyd's group equals `--w4a16-group` (default 64). The
 three-line recipe for a group-64 pyd (`CCC_OVERRIDE_OPTIONS='+-DR4D_GEMM_W4_GROUP=64'` around
 `build_windows.ps1 -OutDir build-win\g64`, then `R4DX_LIBR4D_BUILD` pointed at it) is in
 `tune_gemm.py`'s module docstring, "W4A16 GROUP". `--layouts w4a16 --replace` re-tunes just the

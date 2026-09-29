@@ -313,8 +313,7 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
               name + ": row " + std::to_string(r) + " launched alone differs from the batch");
       }
 
-      // Epilogue: bf16 out unchanged; bytes == the standalone f16 cast of that bf16 out. (The fp8 and
-      // int8 epilogues went with the mxfp4 and w4a8 layouts.)
+      // Epilogue: bf16 out unchanged; bytes == the standalone f16 cast of that bf16 out.
       for (int epi : {r4dx_epilogue_f16}) {
         const std::string en = name + " epilogue=" + std::to_string(epi);
         std::vector<uint8_t> bytes;

@@ -18,7 +18,6 @@
 //   "nibble 2e (e<4) / 2(e-4)+1 (e>=4)" statement -- and that element's k is
 //     k = (kb*4+s)*16 + 8*(e>>2) + 4*(lane>>4) + (e&3)
 //   w4a16's dequant XORs the stored nibble by 8 to recover the 0..15 code.
-//   (The w4a8 and mxfp4 decodes that used to be checked here are retired with those layouts.)
 #include <cmath>
 #include <cstdio>
 #include <random>

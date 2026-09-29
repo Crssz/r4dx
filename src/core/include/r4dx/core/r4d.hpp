@@ -265,6 +265,31 @@ inline void GemmTrellisZeroTickets(void* tickets, size_t bytes, hipStream_t stre
   r4d_gemm_trellis_nt_m64_zero_tickets(reinterpret_cast<int64_t>(tickets), bytes,
                                        reinterpret_cast<int64_t>(stream));
 }
+// M = 256 (or 128) trellis GEMM (r4d.h: r4d_gemm_trellis_nt_m256; docs/trellis-m256.md): the same
+// linear as GemmTrellisNtM64 for M rows in one launch, bit-identical to what the M <= 64 kernel gives
+// each 64-row slice at the same (SK, SKG). `ws` (GemmTrellisM256WsBytes) is always required. SK, SKG
+// are the M = 64 tuning row's, NP / U the kernel's own ((1, 4) for M = 256), skw the K slices
+// resident per workgroup (0 = min(SK, 4)). Throws on an illegal or uninstantiated combination.
+inline void GemmTrellisNtM256(const void* a0, const void* a1, int n_split, const void* w,
+                               const void* svh, void* c, void* ws, void* tickets, int M, int K, int N,
+                               int KB, int SK, int NP, int SKG, int U, float out_scale, int skw,
+                               hipStream_t stream) {
+  r4d_gemm_trellis_nt_m256(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                           reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                           reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                           reinterpret_cast<int64_t>(tickets), M, K, N, KB, SK, NP, SKG, U, out_scale,
+                           reinterpret_cast<int64_t>(stream), skw);
+}
+// nullptr when the launch is legal, else the message naming the first rule it breaks (valid until
+// this thread's next call).
+inline const char* GemmTrellisM256Check(int M, int K, int N, int n_split, int KB, int SK, int NP,
+                                         int SKG, int U, int skw) {
+  return r4d_gemm_trellis_nt_m256_check(M, K, N, n_split, KB, SK, NP, SKG, U, skw);
+}
+// SKG * M * N fp32.
+inline size_t GemmTrellisM256WsBytes(int M, int N, int SKG) {
+  return r4d_gemm_trellis_nt_m256_ws_bytes(M, N, SKG);
+}
 inline void QuantActI8(const void* a, void* q, void* s, int M, int K, hipStream_t stream) {
   r4d_quant_act_i8(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(q),
                     reinterpret_cast<int64_t>(s), M, K, reinterpret_cast<int64_t>(stream));

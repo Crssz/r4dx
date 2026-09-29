@@ -388,14 +388,51 @@ namespace {
 // 4.4's fallback instead (Wc = 128, legal at every boundary the loader accepts; one tuning for every
 // m <= 16, so row identity holds). Today's table has Wc 32 and 128 rows only, and both boundaries
 // (17408, and 8704 on a TP = 2 rank) are multiples of 256, so the shipped rows never take it.
-LinearTuning TrellisChunkTuning(const QuantLinear& w, int64_t m) {
-  const LinearTuning t = PickTuning(Layout::kTrellis, w.N, w.K, m, w.trellis_bits);
+LinearTuning TrellisTuningFor(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, int64_t m) {
+  const LinearTuning t = PickTuning(Layout::kTrellis, N, K, m, kb);
   const int64_t wc = static_cast<int64_t>(t.WV) * t.NPW * 32;
-  if (w.trellis_parts > 1 && w.trellis_part_n[0] % wc != 0) {
-    return FallbackTuning(Layout::kTrellis, w.N, w.K, m, w.trellis_bits);
+  if (parts > 1 && part_n0 % wc != 0) {
+    return FallbackTuning(Layout::kTrellis, N, K, m, kb);
   }
   return t;
 }
+
+LinearTuning TrellisChunkTuning(const QuantLinear& w, int64_t m) {
+  return TrellisTuningFor(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], m);
+}
+
+// R4DX_M256_SHAPES (a debug and bisection aid, not a feature): a comma-separated list of "NxK" shapes,
+// e.g. "34816x5120,5120x17408". When set, only trellis linears of those shapes take the M = 256 kernel
+// (see PlanTrellisM256); every other one keeps the 64-row slicing. Unset (the default): every shape
+// whose (class, KB) has an exact M = 256 configuration.
+bool M256ShapeAllowed(int64_t N, int64_t K) {
+  static const std::vector<std::pair<int64_t, int64_t>> kOnly = [] {
+    std::vector<std::pair<int64_t, int64_t>> v;
+    const char* e = std::getenv("R4DX_M256_SHAPES");
+    if (e == nullptr || e[0] == '\0') return v;
+    std::string s(e);
+    size_t pos = 0;
+    while (pos < s.size()) {
+      size_t end = s.find(',', pos);
+      if (end == std::string::npos) end = s.size();
+      const std::string item = s.substr(pos, end - pos);
+      const size_t x = item.find('x');
+      if (x != std::string::npos) {
+        v.emplace_back(std::atoll(item.substr(0, x).c_str()), std::atoll(item.substr(x + 1).c_str()));
+      }
+      pos = end + 1;
+    }
+    if (v.empty()) v.emplace_back(-1, -1);  // set but unparsable: nothing matches
+    return v;
+  }();
+  if (kOnly.empty()) return true;
+  for (const auto& nk : kOnly) {
+    if (nk.first == N && nk.second == K) return true;
+  }
+  return false;
+}
+
+thread_local bool t_trellis_m256 = false;
 
 // docs/trellis-kernel.md 4.8's A-range study (milestone M4). With R4DX_TRELLIS_A_STATS=<file>, every
 // A the trellis input transform writes is copied back and tallied per linear -- elements, exact
@@ -528,6 +565,50 @@ bool TrellisFusionEnabled() {
   return kEnabled;
 }
 
+ScopedTrellisM256::ScopedTrellisM256(bool on) : prev_(t_trellis_m256) { t_trellis_m256 = on; }
+ScopedTrellisM256::~ScopedTrellisM256() { t_trellis_m256 = prev_; }
+bool TrellisM256Active() { return t_trellis_m256; }
+
+TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t part_n0) {
+  TrellisM256Plan plan;
+  const auto refuse = [&plan](std::string why) {
+    plan.ok = false;
+    plan.why = std::move(why);
+    return plan;
+  };
+  if (kb != 4 && kb != 5) return refuse("KB is not 4 or 5");
+  if (parts < 1 || parts > 2) return refuse("trellis parts is not 1 or 2");
+  if (N <= 0 || K <= 0 || N > 0x7FFFFFFF || K > 0x7FFFFFFF) return refuse("shape out of range");
+  if (!M256ShapeAllowed(N, K)) return refuse("shape excluded by R4DX_M256_SHAPES");
+  // The row the M = 64 chunks of this linear run today. A 64-row chunk (M > 32) gets the M = 64 band's
+  // row; whatever it names (or 4.4's fallback at a part boundary) is what the M = 256 kernel must
+  // reproduce, so its (SK, SKG) are read from that very pick, not from a copy of the table.
+  const LinearTuning t = TrellisTuningFor(N, K, kb, parts, parts > 1 ? part_n0 : N, kMaxChunkM);
+  plan.SK = t.SK;
+  plan.SKG = t.SKG;
+  const int n_split = static_cast<int>(parts > 1 ? part_n0 : N);
+  // K slices resident per workgroup, best first (docs/trellis-m256.md's speed table: SK 2 -> 2; SK 4 -> 4,
+  // 2 on mlp.gate_up at KB 4; SK 8 and 16 -> 4). The r4d check then picks the first one instantiated for
+  // this (KB, SK, SKG): KB 5 has no configuration that walks more than one group of slices, so its SK 8
+  // rows run all 8 slices at once and its SK 16 (no shipped row has one) has none.
+  const int pref = t.SK <= 2 ? 2 : (t.SK == 4 && kb == 4 && N == 34816) ? 2 : 4;
+  const int order[4] = {pref, 4, 8, 2};
+  std::string first_why;
+  for (int skw : order) {
+    if (skw > t.SK) continue;
+    const char* why = core::r4d::GemmTrellisM256Check(static_cast<int>(kTrellisM256Rows),
+                                                       static_cast<int>(K), static_cast<int>(N), n_split, kb,
+                                                       t.SK, /*NP=*/1, t.SKG, /*U=*/4, skw);
+    if (why == nullptr) {
+      plan.SKW = skw;
+      plan.ok = true;
+      return plan;
+    }
+    if (first_why.empty()) first_why = why;
+  }
+  return refuse(first_why.empty() ? "no K-slice grouping fits" : first_why);
+}
+
 bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* x, int64_t M,
                         const QuantLinear* const* ws, int n, PreQuantizedActivation* pre) {
   if (!TrellisFusionEnabled() || n < 2 || n > 3 || M < 1) return false;
@@ -605,6 +686,57 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
       throw std::runtime_error("r4dx::model::ApplyLinear: trellis PreQuantizedActivation needs "
                                "16-byte aligned data and, for two parts, a part_stride that is a "
                                "multiple of 8 elements");
+    }
+  }
+
+  // docs/trellis-m256.md: a 256-row call made inside a Model's 256-row prefill super-chunk
+  // (ScopedTrellisM256, R4DX_PREFILL_CHUNK=256) whose (class, KB) has an exact M = 256 configuration
+  // runs ONE launch of the M = 256 kernel instead of four 64-row ones. Every element gets the bits the
+  // shipped M = 64 row gives its 64-row slice (the plan's (SK, SKG) are that row's), the input
+  // transform is per row, so the call's bytes equal the four-slice loop below. A linear without such a
+  // configuration (or any M other than 256, or a call outside the scope) keeps the slicing.
+  if (w.layout == Layout::kTrellis && M == kTrellisM256Rows && TrellisM256Active()) {
+    const TrellisM256Plan plan =
+        PlanTrellisM256(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]);
+    if (plan.ok) {
+      const int parts = w.trellis_parts;
+      const uint16_t* a0;
+      const uint16_t* a1 = nullptr;
+      DebugProbe* const probe = DebugProbe::Linears();
+      if (trellis_pre) {
+        a0 = static_cast<const uint16_t*>(pre->data);
+        if (parts > 1) a1 = a0 + pre->part_stride;
+      } else {
+        const int64_t part_stride = M * K;
+        uint16_t* a_scratch =
+            arena.Alloc<uint16_t>(static_cast<size_t>(parts * part_stride), /*align_bytes=*/16);
+        const int64_t suh[2] = {reinterpret_cast<int64_t>(w.trellis_suh.data()),
+                                reinterpret_cast<int64_t>(w.trellis_suh.data() + K)};
+        const int64_t out[2] = {reinterpret_cast<int64_t>(a_scratch),
+                                reinterpret_cast<int64_t>(a_scratch + part_stride)};
+        r4dx_trellis_input_bf16(reinterpret_cast<int64_t>(x), M, K, parts, suh, out,
+                                w.trellis_prescale_log2, reinterpret_cast<int64_t>(s));
+        if (TrellisAStats* st = TrellisAStats::Get()) {
+          st->Record(w, a_scratch, parts, M, K, part_stride, s);
+        }
+        if (probe != nullptr) probe->MarkInput(s);
+        a0 = a_scratch;
+        if (parts > 1) a1 = a_scratch + part_stride;
+      }
+      // ws is always used (a 32-column block is a split 128-group); every slot is written before it is
+      // read. The tickets are this linear's own, as for the 64-row kernel (same protocol, same reset).
+      float* ws = arena.Alloc<float>(
+          core::r4d::GemmTrellisM256WsBytes(static_cast<int>(M), static_cast<int>(N), plan.SKG) /
+              sizeof(float),
+          /*align_bytes=*/16);
+      const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) /
+                                                 std::sqrt(128.0));
+      const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);
+      core::r4d::GemmTrellisNtM256(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), y, ws,
+                                   w.trellis_tickets, static_cast<int>(M), static_cast<int>(K),
+                                   static_cast<int>(N), w.trellis_bits, plan.SK, /*NP=*/1, plan.SKG,
+                                   /*U=*/4, out_scale, plan.SKW, s);
+      return;
     }
   }
 

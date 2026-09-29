@@ -22,6 +22,7 @@
 #include "linear.h"
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
+#include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/trellis-m256.md)
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
@@ -309,17 +310,25 @@ Model Model::Load(const ModelOptions& opts) {
   const int64_t max_decode_window = m.draft_window_;
 
   m.max_chunk_ = 64;
-  m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
-  m.embed_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
-  m.embed_ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
-  m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
-  m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
-  m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.max_chunk_ * hidden));
+  // R4DX_PREFILL_CHUNK=256 (prefill_chunk.h): a TP=1 Model with no MTP head and no drafter sizes the
+  // per-chunk activation buffers (and, below, the arena and the position / seqused arrays) for a
+  // 256-row prefill super-chunk. Everything else -- the default -- is sized exactly as before. The
+  // MTP / DFlash / TP / vision cases are decided again per Prefill call (PrefillRowsForCall).
+  const bool want_wide = PrefillChunkRequest() == kPrefillChunkWide && !is_tp_rank &&
+                         opts.mtp_draft_k == 0 && opts.dflash_container.empty();
+  m.wide_rows_ = want_wide ? kPrefillChunkWide : 0;
+  const int64_t buf_rows = want_wide ? m.wide_rows_ : m.max_chunk_;
+  m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
+  m.embed_ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(buf_rows));
+  m.embed_ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(buf_rows));
+  m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
+  m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
+  m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
   // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion (model.h's doc comment) --
   // 2 bytes/element covers the widest epilogue format (f16); fp8/int8 use the same allocation's
   // first half.
-  m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(m.max_chunk_ * hidden * 2));
-  m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(m.max_chunk_));
+  m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(buf_rows * hidden * 2));
+  m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(buf_rows));
   // R2/P2 (docs/r9700.md): the original correctness issue (an `r4dx::core::Arena::Alloc` gap that
   // never rounded an allocation's END up to a 16-byte boundary, silently misaligning every
   // default-aligned buffer allocated right after a fused epilogue's scale scratch) was root-caused
@@ -332,8 +341,9 @@ Model Model::Load(const ModelOptions& opts) {
   m.body_epilogue_ = EpilogueForLayout(opts.layout);
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
-  m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(m.max_chunk_));
-  m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(1);
+  m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(buf_rows));
+  // one seqused_k per 64-row sub-slice of a super-chunk (RunChunk); a single one otherwise
+  m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(buf_rows / m.max_chunk_));
   // 3-axis mrope companion (docs/vision.md): 3*64 int32 == 768 bytes, allocated unconditionally
   // rather than lazily -- a lazy hipMalloc would have to happen on the first multimodal chunk,
   // i.e. mid-request with the device live, which is exactly what every other per-chunk buffer in
@@ -343,7 +353,10 @@ Model Model::Load(const ModelOptions& opts) {
   // Per-layer activation scratch (rmsnorm output, gate_up, GDN conv/kkt/chunk-scan buffers,
   // activation-quant scratch): a few MB at T<=64 (see linear.h/gdn_layer.cpp's own buffer sizes).
   // 96MB gives headroom without materially affecting the ~15-35GB the weights themselves occupy.
-  m.arena_.Reserve(96ull * 1024 * 1024);
+  // A 256-row super-chunk needs about 90 MB for its widest layer (mlp: gate_up 17.8 MB, the M = 256
+  // GEMM's split-group partials 35.6 + 10.5 MB, h and the transformed A 8.9 MB each, ...; the GDN /
+  // attention scratch is dropped before the mlp): 224 MiB there, 96 MiB as always otherwise.
+  m.arena_.Reserve((want_wide ? 224ull : 96ull) * 1024 * 1024);
   const VramSnap vram2 = SnapVram();  // after activation scratch (buf_a_/b_/logits/arena/etc.)
 
   const auto adims = core::r4d::GetAttnDims();  // head_dim=256, gqa=6, block_size=16
@@ -770,7 +783,13 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                                     bool want_logits, int32_t* greedy_token_out,
                                     const SummaryRequest* summary_out) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
-  if (T < 1 || T > max_chunk_) {
+  // A 256-row prefill super-chunk (docs/trellis-m256.md): only Prefill() creates one, after deciding
+  // that this Model and call may (PrefillRowsForCall). Layer-major over all 256 rows: the trellis
+  // linears see 256 rows (the M = 256 GEMM where the (class, KB) has an exact configuration),
+  // everything sequence-dependent -- the GDN conv / scan, the attention core -- runs in 64-row
+  // sub-slices in order, so the result is what four consecutive 64-row chunks give, bit for bit.
+  const bool wide = is_prefill_path && prefill_wide_active_ > 0 && T == prefill_wide_active_;
+  if (T < 1 || (T > max_chunk_ && !wide)) {
     throw std::runtime_error("Model::RunChunk: token_ids.size() must be in [1, " +
                               std::to_string(max_chunk_) + "]");
   }
@@ -836,11 +855,22 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   std::vector<int32_t> positions_h(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
   attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
-  const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
-  attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  if (wide) {
+    // one seqused_k per 64-row sub-slice: the causal context of sub-slice j is pos_ + 64 (j + 1)
+    std::vector<int32_t> seqused_slices_h(static_cast<size_t>(T / max_chunk_));
+    for (size_t j = 0; j < seqused_slices_h.size(); ++j) {
+      seqused_slices_h[j] = static_cast<int32_t>(pos_ + max_chunk_ * static_cast<int64_t>(j + 1));
+    }
+    attn_seqused_k_.CopyFromHost(seqused_slices_h.data(), seqused_slices_h.size());
+  } else {
+    const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
+    attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  }
   // The 3-axis rope rows for the same window -- nullptr (and no upload at all) unless an image has
   // been spliced into this conversation, which is what keeps a text-only run byte-identical.
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
+  // The M = 256 trellis GEMM is reachable from ApplyLinear only inside a super-chunk's layers.
+  const ScopedTrellisM256 trellis_m256_scope(wide);
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
@@ -904,6 +934,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                             ? mtp_num_accepted_dev_.data()
                             : nullptr;
       p.out_had_signs = had.gdn_out;
+      p.seq_slice = wide ? max_chunk_ : 0;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -929,9 +960,14 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
                     buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3,
-                    /*prefill_split_kv=*/is_prefill_path);
+                    /*prefill_split_kv=*/is_prefill_path,
+                    /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, attn_seqused_k_.data());
       std::swap(cur, other);
     }
+    // A super-chunk's gdn / attention scratch is dead here (its results are in `cur` and buf_normed_,
+    // both persistent): drop it so the mlp's larger M = 256 scratch reuses the same arena bytes. Stream
+    // order makes the reuse safe, as at every layer boundary.
+    if (wide) arena_.Reset();
 
     Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
     // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
@@ -1324,11 +1360,25 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
   CollapseSpeculativeWindow();
   at_prefill_end_ = false;  // until the last chunk has landed
   std::vector<float> logits;
-  for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
-    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+  // R4DX_PREFILL_CHUNK=256 (docs/trellis-m256.md): `rows` is 256 only when this Model and call may run
+  // super-chunks. The chunk grid is anchored at the START OF THIS CALL: full 256-row super-chunks
+  // first, then whatever is left as ordinary 64-row chunks -- the same chunks today's grid makes for
+  // that remainder, so a call split anywhere (a prefix-cache restore) shifts nothing it did not shift.
+  const int64_t rows = PrefillRowsForCall(static_cast<bool>(on_chunk_captured));
+  struct WideGuard {
+    int64_t& slot;
+    ~WideGuard() { slot = 0; }
+  } wide_guard{prefill_wide_active_};
+  prefill_wide_active_ = rows > max_chunk_ ? rows : 0;
+  for (size_t off = 0; off < token_ids.size();) {
+    const size_t remaining = token_ids.size() - off;
+    const size_t n = (prefill_wide_active_ > 0 && remaining >= static_cast<size_t>(prefill_wide_active_))
+                         ? static_cast<size_t>(prefill_wide_active_)
+                         : std::min(static_cast<size_t>(max_chunk_), remaining);
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                       token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     const bool is_last_chunk = (off + n) == token_ids.size();
+    off += n;
     std::vector<float> chunk_logits = RunChunk(chunk, /*is_prefill_path=*/true,
                                                 /*want_logits=*/is_last_chunk);
     // DFlash2 target feature capture (review finding, 2026-09-20 -- see this method's own doc
@@ -1340,6 +1390,29 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
   }
   at_prefill_end_ = true;
   return logits;
+}
+
+int64_t Model::PrefillRowsForCall(bool has_chunk_callback) {
+  PrefillChunkInputs in;
+  in.requested = PrefillChunkRequest();
+  if (in.requested != kPrefillChunkWide) return max_chunk_;  // the default: silent, nothing to decide
+  in.buffers_wide = wide_rows_ == kPrefillChunkWide;
+  in.tensor_parallel = comm_ != nullptr;
+  in.mtp = mtp_.has_value();
+  in.dflash = dflash_.has_value();
+  in.dflash_capture = !dflash_target_layers_.empty();
+  in.mrope_active = mrope_active_;
+  in.rotated_container = container_.HasRotation() || HadSigns().gdn_out != nullptr ||
+                         HadSigns().o != nullptr || HadSigns().down != nullptr;
+  in.on_chunk_captured = has_chunk_callback;
+  const char* why = nullptr;
+  const int rows = DecidePrefillChunk(in, &why);
+  if (rows == kPrefillChunkWide) return rows;
+  if (!prefill_chunk_noted_) {
+    prefill_chunk_noted_ = true;
+    std::fprintf(stderr, "r4dx: R4DX_PREFILL_CHUNK=256 ignored: %s; using 64-row prefill chunks\n", why);
+  }
+  return max_chunk_;
 }
 
 void Model::CollapseSpeculativeWindow() {
@@ -1710,11 +1783,19 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
 
   SpanAccumulator acc;
 
-  for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
-    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+  // R4DX_PREFILL_CHUNK=256: the same chunk grid as Prefill() (super-chunks first, then 64-row chunks).
+  const int64_t wide_rows = PrefillRowsForCall(/*has_chunk_callback=*/false);
+  for (size_t off = 0; off < token_ids.size();) {
+    const size_t remaining = token_ids.size() - off;
+    const size_t n = (wide_rows > max_chunk_ && remaining >= static_cast<size_t>(wide_rows))
+                         ? static_cast<size_t>(wide_rows)
+                         : std::min(static_cast<size_t>(max_chunk_), remaining);
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                       token_ids.begin() + static_cast<ptrdiff_t>(off + n));
+    off += n;
     const int64_t T = static_cast<int64_t>(chunk.size());
+    const bool wide = wide_rows > max_chunk_ && T == wide_rows;
+    const ScopedTrellisM256 trellis_m256_scope(wide);
     const bool has_init = started_;
 
     // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's
@@ -1741,8 +1822,16 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
       positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
     }
     attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
-    const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
-    attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+    if (wide) {
+      std::vector<int32_t> seqused_slices_h(static_cast<size_t>(T / max_chunk_));
+      for (size_t j = 0; j < seqused_slices_h.size(); ++j) {
+        seqused_slices_h[j] = static_cast<int32_t>(pos_ + max_chunk_ * static_cast<int64_t>(j + 1));
+      }
+      attn_seqused_k_.CopyFromHost(seqused_slices_h.data(), seqused_slices_h.size());
+    } else {
+      const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
+      attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+    }
     const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);  // nullptr for a text-only run
 
     uint16_t* cur = buf_a_.data();
@@ -1763,6 +1852,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         p.is_prefill = true;
         p.has_init = has_init;
         p.out_had_signs = had.gdn_out;
+        p.seq_slice = wide ? max_chunk_ : 0;
         layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                       cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
                       normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
@@ -1787,9 +1877,11 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
                       attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
                       &acc, normed_in_epilogue, buf_normed_pre_.data(),
                       buf_normed_pre_scale_.data(), body_epilogue_, buf_normed_pre_.data(),
-                      buf_normed_pre_scale_.data(), rope_pos3, /*prefill_split_kv=*/true);
+                      buf_normed_pre_scale_.data(), rope_pos3, /*prefill_split_kv=*/true,
+                      /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, attn_seqused_k_.data());
         std::swap(cur, other);
       }
+      if (wide) arena_.Reset();  // as RunChunk: the gdn / attention scratch is dead
 
       {
         // x_normed_in must be buf_normed_.data() (this layer's Gdn/Attn call above just fused its

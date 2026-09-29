@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <string>
 
 #include "quant_linear.h"
 #include "r4dx/core/arena.hpp"
@@ -157,6 +158,42 @@ struct PreQuantizedActivation {
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
                   uint16_t* y, int64_t M, const PreQuantizedActivation* pre = nullptr,
                   bool temporal_weight_loads = false);
+
+// ---- the M = 256 trellis GEMM (docs/trellis-m256.md; R4DX_PREFILL_CHUNK=256) ----------------------
+// Rows of the wide launch: a 256-row call to ApplyLinear may run ONE launch of libr4d's
+// r4d_gemm_trellis_nt_m256 instead of four 64-row ones, with the same bytes (the kernel reproduces,
+// bit for bit, the shipped M = 64 tuning row's K-slice and SKG summation order).
+inline constexpr int64_t kTrellisM256Rows = 256;
+
+// Whether, and how, a trellis linear of this shape and rate runs through the M = 256 kernel: `SK` /
+// `SKG` are the slice counts of the row its 64-row chunks run today (PickTuning at M = 64, plus the
+// part-boundary fallback of ApplyLinear), `SKW` the K slices the kernel keeps resident per workgroup.
+// `ok` is false -- and `why` says so -- for a combination without an exact configuration (rate other
+// than 4 / 5, SK 16 at KB 5, a K that leaves a k-tile tail no instantiation covers, ...), which keeps the
+// 64-row slicing. `part_n0` is trellis_part_n[0] (ignored for parts == 1). A pure function of its
+// arguments (and R4DX_M256_SHAPES, a debug filter); tests/kernels/test_trellis_m256 and ApplyLinear share it.
+struct TrellisM256Plan {
+  bool ok = false;
+  int SK = 0, SKG = 0, SKW = 0;
+  std::string why;
+};
+TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t part_n0);
+
+// RAII: while alive on this thread, a 256-row ApplyLinear of a trellis linear with a plan takes the
+// M = 256 kernel. Off by default: Model turns it on around the layers of a 256-row prefill
+// super-chunk only, so no other caller of ApplyLinear (decode, verify windows, MTP, the drafter,
+// tests) can reach the wide kernel, whatever M it passes.
+class ScopedTrellisM256 {
+ public:
+  explicit ScopedTrellisM256(bool on);
+  ~ScopedTrellisM256();
+  ScopedTrellisM256(const ScopedTrellisM256&) = delete;
+  ScopedTrellisM256& operator=(const ScopedTrellisM256&) = delete;
+
+ private:
+  bool prev_;
+};
+bool TrellisM256Active();
 
 // docs/trellis-kernel.md 4.8 / 5.4 (M5): whether the layers use the trellis fused producers and
 // shared input transforms below -- on unless R4DX_DISABLE_EPILOGUE=1 (the same A/B switch

@@ -159,6 +159,12 @@ set_tests_properties(test_tp_real_vs_emulation PROPERTIES LABELS tp2gpu SKIP_RET
 add_executable(test_mtp_round test_mtp_round.cpp)
 target_include_directories(test_mtp_round PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_mtp_round COMMAND test_mtp_round)
+# test_prefill_chunk: pure CPU unit test for src/model/prefill_chunk.h (docs/trellis-m256.md): the
+# R4DX_PREFILL_CHUNK parser and the decision table for 256-row prefill super-chunks, including the
+# fallback for --tp 2, --mtp, --dflash and the other cases the wide path does not serve. No HIP.
+add_executable(test_prefill_chunk test_prefill_chunk.cpp)
+target_include_directories(test_prefill_chunk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_prefill_chunk COMMAND test_prefill_chunk)
 
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one

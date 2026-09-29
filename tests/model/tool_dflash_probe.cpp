@@ -12,7 +12,7 @@
 // docs/dflash2.md is right end to end on real activations.
 //
 // USAGE (HIP device 1, one GPU process at a time):
-//   tool_dflash_probe.exe [--target <container>] [--layout w4a16]
+//   tool_dflash_probe.exe [--target <container>] [--layout trellis]
 //                          [--draft <draft container>] [--draft-layout bf16]
 //                          [--tokenizer <dir>] [--out <dir>] [--rounds 50]
 //                          [--bench-tokens 512] [--no-bench] [--no-dump] [--wired]
@@ -31,7 +31,7 @@
 //
 // Then, per prompt:
 //   <reference venv>/python.exe tools/reference/dflash2_ref.py --real <that subdirectory> \
-//       --target-dir C:/AI/models/Qwen3.8-27B
+//       --target-dir D:/models/Huihui-Qwen3.8-27B-abliterated
 //
 // Built but deliberately NOT registered with add_test(): it prints numbers for a human/doc to read
 // and needs the full 27B checkpoint, the DFlash2 draft container AND the tokenizer -- the same
@@ -74,11 +74,13 @@ using r4dx_test::SkipMissing;
 
 namespace {
 
-// Default target: the production container matching this build's w4a16 group (v6 at 64, v3 at 128
-// -- tests/model/test_container_path.h). The bf16 drafter below is group-independent.
+// Default target: the production container matching this build's w4a16 group (the Huihui trellis
+// mix4.5m at 64, v3 at 128 -- tests/model/test_container_path.h), loaded with
+// ProductionLayoutName() unless --layout says otherwise. The bf16 drafter below is
+// group-independent.
 const char* kDefaultTarget = r4dx_test::ProductionTargetPath();
 const char* kDefaultDraft = "D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx";
-const char* kDefaultTokenizerDir = "C:/AI/models/Qwen3.8-27B";
+const char* kDefaultTokenizerDir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
 const char* kDefaultOutDir = "build/logs/dflash_probe";
 
 // The two short real prompts item 4 asks for: one natural-language, one code, so the captured
@@ -285,7 +287,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
 
   const std::string target_path = Arg(argc, argv, "--target", kDefaultTarget);
-  const std::string layout_name = Arg(argc, argv, "--layout", "w4a16");
+  const std::string layout_name = Arg(argc, argv, "--layout", r4dx_test::ProductionLayoutName());
   const std::string draft_path = Arg(argc, argv, "--draft", kDefaultDraft);
   const std::string draft_layout_name = Arg(argc, argv, "--draft-layout", "bf16");
   const std::string tok_dir = Arg(argc, argv, "--tokenizer", kDefaultTokenizerDir);

@@ -31,7 +31,7 @@
 // facade and makes no HIP call, 2.1) requires --need-gib free on every device the ranks will use.
 //
 // Built, never add_test()'d. Usage (HIP_VISIBLE_DEVICES unset, production server stopped):
-//   tool_tp_soak --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 60
+//   tool_tp_soak --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --minutes 60
 //                --max-ctx 8192 --json build\logs\tp_soak.jsonl [--seed 1] [--iterations N]
 //                [--tokens tools\reference\kl_corpus\tokens.json] [--canary-every 10]
 //                [--min-prompt 16] [--max-prompt 2048] [--min-decode 32] [--max-decode 512]
@@ -79,7 +79,7 @@ constexpr double kMaxVramDriftMiB = 64.0;
 
 struct Args {
   std::string model = r4dx_test::ProductionTargetPath();
-  std::string layout = "w4a16";
+  std::string layout = r4dx_test::ProductionLayoutName();
   std::string tokens = "tools/reference/kl_corpus/tokens.json";
   std::string json;
   double minutes = 60.0;

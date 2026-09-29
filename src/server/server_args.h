@@ -23,7 +23,9 @@ inline constexpr int64_t kMaxMtpDraftKTp = 7;
 struct ServerArgs {
   std::string model_path;
   std::string layout = "bf16";
-  std::string tokenizer_dir = "C:\\AI\\models\\Qwen3.8-27B";
+  // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
+  // chat-template files are byte-identical to the base Qwen3.8-27B's.
+  std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
   std::string host = "127.0.0.1";
   int port = 8080;
   // docs/r9700.md R13 (2026-09-20, measured): raised from 131072 -- the checkpoint's own

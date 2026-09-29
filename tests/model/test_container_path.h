@@ -29,12 +29,22 @@
 // somewhere else (it wins over the group, so pointing it at copies of the wrong group makes the
 // affected tests FAIL on the loader's group guard -- deliberately, not silently).
 //
-// ProductionTargetPath() / ProductionDrafterPath() -- the real 64-layer container and its w4a16
-// DFlash2 drafter, for test_dflash_e2e, test_vision_tower and the tool_* diagnostics' defaults. The
-// production pair is a different FILE per group, not a copy in another directory:
-//   group 64  -> qwen38-27b-v6.r4dx + qwen38-27b-dflash2-w4a16-g64.r4dx
-//   group 128 -> qwen38-27b-v3.r4dx + qwen38-27b-dflash2-w4a16.r4dx
-// both in D:/models/r4dx. R4DX_TEST_CONTAINER_DIR does NOT apply to them: its job is to point the
+// ProductionTargetPath() / ProductionDrafterPath() / ProductionLayoutName() -- the real 64-layer
+// container, the body layout it loads with, and its w4a16 DFlash2 drafter, for test_dflash_e2e,
+// test_vision_tower, test_tp_emulation / test_tp_real_vs_emulation's real-container cases and the
+// tool_* diagnostics' defaults. The production pair is a different FILE per group, not a copy in
+// another directory:
+//   group 64  -> huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout "trellis": the Huihui
+//                abliterated trellis mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx
+//   group 128 -> qwen38-27b-v3.r4dx (layout "w4a16") + qwen38-27b-dflash2-w4a16.r4dx -- a pre-v6
+//                container that no longer exists on this machine, so a win-hip-g128 build SKIPs
+//                every real-container test (exit 77); it has no group-128 trellis container
+// both in D:/models/r4dx. The trellis container's non-trellis tensors (heads, embeddings) are packed
+// at w4a16 group 64, so it is loadable by a group-64 build only (CheckW4a16Group refuses it
+// otherwise) -- exactly what the group-64 branch above says. The previous production container
+// (qwen38-27b-v6.r4dx, the base Qwen3.8-27B at w4a16 g64) and the base trellis mix4.5m were retired
+// with the base checkpoint (docs/huihui.md "Default container"). R4DX_TEST_CONTAINER_DIR does NOT
+// apply to them: its job is to point the
 // FIXED test containers at a set of same-basename copies, and the production pair is not copied
 // anywhere -- it is already a different file per group. (Honouring it here would turn the old
 // manual recipe, R4DX_TEST_CONTAINER_DIR=D:\models\r4dx\g64, into a silent SKIP of every
@@ -124,7 +134,13 @@ inline const char* ContainerPath(const char* default_path) {
 // The real 64-layer production container matching this build's w4a16 group.
 inline const char* ProductionTargetPath() {
   return BuildW4a16Group() == 128 ? "D:/models/r4dx/qwen38-27b-v3.r4dx"
-                                  : "D:/models/r4dx/qwen38-27b-v6.r4dx";
+                                  : "D:/models/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx";
+}
+
+// The body layout name (r4dx::model::LayoutFromName) ProductionTargetPath() loads with: a trellis
+// container loads only with "trellis" (Container::Load refuses every other layout by name).
+inline const char* ProductionLayoutName() {
+  return BuildW4a16Group() == 128 ? "w4a16" : "trellis";
 }
 
 // ProductionTargetPath()'s w4a16 DFlash2 drafter, packed at the same group.

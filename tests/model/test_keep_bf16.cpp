@@ -88,7 +88,9 @@ int RunCommand(const std::string& command_line) {
 }  // namespace
 
 int main() {
-  const std::string checkpoint = Env("R4DX_HF_CHECKPOINT", "C:/AI/models/Qwen3.8-27B");
+  // The 4 layers converted are layers 0-3, which the Huihui abliteration leaves untouched (it only
+  // changes layers 17..51's output projections), so the fine-tune's checkpoint gives the same container.
+  const std::string checkpoint = Env("R4DX_HF_CHECKPOINT", "D:/models/Huihui-Qwen3.8-27B-abliterated");
   if (!DirExists(checkpoint)) return r4dx_test::SkipMissing(checkpoint + "\\config.json");
 #ifndef R4DX_CONVERT_EXE
   std::fprintf(stderr, "[SKIP] this build has no r4dx-convert target (R4DX_BUILD_CONVERT=OFF)\n");

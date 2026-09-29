@@ -45,7 +45,7 @@
 #include "tokenizer.h"
 
 #ifndef R4DX_TOKENIZER_MODEL_DIR
-#define R4DX_TOKENIZER_MODEL_DIR "C:/AI/models/Qwen3.8-27B"
+#define R4DX_TOKENIZER_MODEL_DIR "D:/models/Huihui-Qwen3.8-27B-abliterated"
 #endif
 
 namespace {

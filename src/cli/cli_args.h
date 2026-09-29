@@ -28,7 +28,11 @@ inline constexpr int64_t kMaxMtpDraftKTp = 7;
 struct CliArgs {
   std::string model_path;
   std::string layout = "bf16";
-  std::string tokenizer_dir = "C:\\AI\\models\\Qwen3.8-27B";
+  // The Huihui abliterated checkpoint dir: its tokenizer.json / tokenizer_config.json /
+  // chat_template.jinja / generation_config.json (the four files r4dx reads) are byte-identical to the
+  // base Qwen3.8-27B's, so this default serves every Qwen3.8-27B-family container. The base checkpoint
+  // (C:\AI\models\Qwen3.8-27B) was retired with the base containers (docs/huihui.md).
+  std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
   std::string prompt;
   // --prompt-file <path>: the one-shot prompt read verbatim (UTF-8) from a file instead of the command
   // line, whose 32767-character Windows limit caps --prompt near 8k tokens (tools/prefill's long

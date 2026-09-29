@@ -21,7 +21,8 @@
 // position -- greedy, deterministic) and record the model's own argmax prediction for the NEXT
 // position. coverage(subset) = fraction of those predictions whose id falls inside `subset`.
 //
-// Usage: tool_vocab_calib.exe [container_path] [tokenizer_dir] [corpus_path] [out_json_path]
+// Usage: tool_vocab_calib.exe [container_path] [tokenizer_dir] [corpus_path] [out_json_path] [layout]
+// (layout defaults to r4dx_test::ProductionLayoutName(): trellis for the default container)
 // Defaults match this project's standard real-container/tokenizer/corpus locations (docs/r9700.md
 // task, D:/models/wikitext-2-raw -- a real calibration corpus already present on this machine).
 // SKIPs (prints and returns 77, same convention as every other real-data tool/test in this
@@ -49,7 +50,7 @@ namespace {
 
 // The production container matching this build's w4a16 group (tests/model/test_container_path.h).
 const char* kDefaultContainer = r4dx_test::ProductionTargetPath();
-const char* kDefaultTokenizerDir = "C:/AI/models/Qwen3.8-27B";
+const char* kDefaultTokenizerDir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
 const char* kDefaultCorpus = "D:/models/wikitext-2-raw/wiki.train.raw";
 const char* kDefaultOutJson = "build/logs/vocab_calib.json";
 
@@ -180,13 +181,16 @@ int main(int argc, char** argv) {
 
   ModelOptions opts;
   opts.container_path = container_path;
-  opts.layout = Layout::kW4a16;  // most accurate quantized layout (docs/r9700.md P1/status.md) --
-                                  // this tool measures the BODY model's own predictions, not a
-                                  // layout comparison, so use the layout closest to the reference.
+  // The production container's own layout: trellis for the Huihui trellis mix4.5m (a trellis
+  // container loads with no other), the most accurate quantized layout (docs/r9700.md P1/status.md)
+  // for a w4a16 container passed as argv[1] -- pass "w4a16" as argv[5] with such a container. This
+  // tool measures the BODY model's own predictions, not a layout comparison.
+  const std::string layout_name = argc > 5 ? argv[5] : std::string(r4dx_test::ProductionLayoutName());
+  opts.layout = r4dx::model::LayoutFromName(layout_name);
   opts.max_ctx = static_cast<int64_t>(ids.size()) + 64;
   opts.mtp_draft_k = 0;  // no MTP needed at all -- plain Prefill/DecodeStepGreedy teacher-forcing
 
-  std::fprintf(stderr, "[vocab_calib] loading %s (layout=w4a16, mtp=0)...\n", container_path.c_str());
+  std::fprintf(stderr, "[vocab_calib] loading %s (layout=%s, mtp=0)...\n", container_path.c_str(), layout_name.c_str());
   Model model = Model::Load(opts);
 
   const std::vector<int32_t> prompt(ids.begin(), ids.begin() + kPromptChunk);

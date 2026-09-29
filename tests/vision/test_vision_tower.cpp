@@ -41,8 +41,8 @@ using r4dx::vision::VisionWeights;
 
 namespace {
 
-// The production container matching this build's w4a16 group (v6 at 64, v3 at 128 --
-// tests/model/test_container_path.h). The vision.* tensors this test reads are bf16 and
+// The production container matching this build's w4a16 group (the Huihui trellis mix4.5m at 64, v3
+// at 128 -- tests/model/test_container_path.h). The vision.* tensors this test reads are bf16 and
 // group-independent, so either container would do numerically; the group-matched one is what the
 // server/CLI defaults would load next to it.
 const char* kContainerPath = r4dx_test::ProductionTargetPath();

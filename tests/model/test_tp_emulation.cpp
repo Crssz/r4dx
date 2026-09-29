@@ -32,7 +32,8 @@
 //
 // P5 (docs/tp.md 10.1 "P5 additions", 8.1, 8.2; G12's emulation half) -- the speculative rounds
 // under TP, through the R4DX_TP_TESTING hooks (this test links r4dx_model_tptest):
-//   7. MTP K=3 on l4-allmtp (w4a16) and on the real v6 container (which actually accepts drafts):
+//   7. MTP K=3 on l4-allmtp (w4a16) and on the real production container (ProductionTargetPath(),
+//      the Huihui trellis mix4.5m; it actually accepts drafts):
 //      greedy rounds -- H6 exactness (every draft step's merged token == the argmax of that step's
 //      gathered full row), accepted drafts == the drafted tokens, every emitted token == the argmax
 //      of its gathered verify row (lossless by construction), committed positions == emitted tokens
@@ -41,7 +42,7 @@
 //      its gathered verify row with the replayed draw, and the generator advanced by exactly one
 //      draw per emitted token. The reduced-vocab head on l4-mtp-draftvocab (replicated: with the
 //      capture on, no step merges, and every draft is a member of the head's vocabulary subset).
-//   8. DFlash2 k=7 on v6 + ProductionDrafterPath() (the drafter's target layers need the 64-layer
+//   8. DFlash2 k=7 on the production container + ProductionDrafterPath() (the drafter's target layers need the 64-layer
 //      target; docs/tp.md 10.1 names l4-allmtp, whose 4 layers cannot host them), greedy and seeded
 //      sampled, 3 prompts: H7 exactness (the merged cand/unary of every round == the CPU top-16 of
 //      the drafter's gathered [8, 248320] logits under r4dx_topk16_f32's total order), lockstep
@@ -49,14 +50,17 @@
 //      same per-row losslessness checks as MTP, and a Reset() rerun equal to the first run.
 //   Every MTP / DFlash2 trajectory but the reruns is then replayed on the TP=1 Model -- each round's
 //   VerifyWindow + CommitVerifiedWindow, the target's whole view of a round -- and the decode row
-//   after the last round must sit within 1e-2 (4 layers) / 5e-2 (v6) rel L2 of TP's (docs/tp.md
+//   after the last round must sit within 1e-2 (4 layers) / 5e-2 (production) rel L2 of TP's (docs/tp.md
 //   Appendix B N80): the per-round checks alone compare each round with its own rows only.
-//   9. vision on v6 (the 4-layer containers have no tower): two images of different grids through
+//   9. vision on the production container (the 4-layer containers have no tower): two images of different grids through
 //      one TpModel::EncodeImages (rank 0, host rows) and PrefillMultimodal + 3 decode steps against
 //      the TP=1 Model -- encoder rows within 1e-2 rel L2, logits within 5e-2 and within 0.5x of how
 //      far swapping one image moves TP=1's; the TP=1 host-row splice == its device-row splice byte
 //      for byte; a device span refused by TpModel.
-// The v6 cases SKIP (with a line saying so) when the production container (pair) is absent.
+// The production-container cases SKIP (with a line saying so) when the production container (pair) is
+// absent. Since 2026-09-29 that container is the Huihui abliterated trellis mix4.5m and these cases run
+// with layout "trellis" (r4dx_test::ProductionLayoutName()); the w4a16 g64 / w4a8 / mxfp4 paths stay
+// covered at 4 layers by l4-allmtp (TestLayout, the MTP and real-vs-emulation cases).
 //
 // Every case ends with core::g_tp_collective_allocs == 0 (docs/tp.md 2.7: no device allocation or
 // free inside a collective command after warm-up).
@@ -109,11 +113,16 @@ constexpr int64_t kLayers = 4;
 constexpr int kDecodeRows = 16;
 // The P5 comparisons with TP=1 (the verify / commit script, the speculative replays, vision; docs/tp.md
 // Appendix B N80), per-row rel L2 of the logits: on the 4-layer container the P2b w4a16 tolerance of
-// TestLayout; on the 64-layer v6 the TP=1 distance is larger with depth (measured up to 2.2e-2 over
-// ~200 positions), so 5e-2 there -- a TP-only commit error (rank 1 seeding its GDN heads one window
-// index early, tried as a mutation) put the v6 replays at 1.05e-1 .. 3.1e-1.
+// TestLayout; on the 64-layer production container (the Huihui trellis mix4.5m; the base v6 w4a16
+// before 2026-09-29) the TP=1 distance is larger with depth (measured up to 2.2e-2 over ~200
+// positions on v6 w4a16; the trellis numbers are in docs/tp.md "Production container = Huihui
+// trellis"), so 5e-2 there -- a TP-only commit error (rank 1 seeding its GDN heads one window index
+// early, tried as a mutation) put the v6 replays at 1.05e-1 .. 3.1e-1. On the trellis production
+// container (2026-09-29) the measured maxima are 4.02e-2 (MTP replays), 3.88e-2 (DFlash replays) and
+// 1.46e-2 (vision logits): larger than v6's 2.2e-2 (not investigated), still under 5e-2, and well
+// below the mutation's 1.05e-1 floor.
 constexpr double kVsTp1Tol = 1e-2;
-constexpr double kVsTp1TolV6 = 5e-2;
+constexpr double kVsTp1TolProd = 5e-2;
 
 int g_failures = 0;
 
@@ -1001,7 +1010,7 @@ std::vector<kernels::SampleParams> SpecSampleConfigs() {
   return v;
 }
 
-// docs/tp.md 9.2's pre-flight for the cases that put BOTH v6 ranks on this one device: a
+// docs/tp.md 9.2's pre-flight for the cases that put BOTH production-container ranks on this one device: a
 // shortfall is a failure naming the likely cause, not a skip (WDDM would page an over-committed
 // load over PCIe instead of failing it).
 bool EnoughVram(double need_gib, const char* what) {
@@ -1012,10 +1021,12 @@ bool EnoughVram(double need_gib, const char* what) {
         "server running?", what, need_gib, free_gib);
   return ok && free_gib >= need_gib;
 }
-// Measured (Appendix B N73): both emulated v6 w4a16 ranks use 20.29 GiB with the MTP head and 22.91
-// GiB with the DFlash2 drafters at --max-ctx 2048.
-constexpr double kNeedGiBV6Mtp = 22.0;
-constexpr double kNeedGiBV6Dflash = 24.0;
+// Measured (Appendix B N73): both emulated v6 w4a16 ranks used 20.29 GiB with the MTP head and 22.91
+// GiB with the DFlash2 drafters at --max-ctx 2048. Re-measured on the production container (the Huihui
+// trellis mix4.5m, 2026-09-29, --max-ctx 1024, device-wide used after the load): 19.96 GiB with the
+// MTP head and 22.58 GiB with the DFlash2 drafters; the budgets below (22 / 24) stay above both.
+constexpr double kNeedGiBProdMtp = 22.0;
+constexpr double kNeedGiBProdDflash = 24.0;
 
 void PrintTally(const char* label, const SpecTally& t) {
   std::printf("[%s] %d rounds checked, %d tokens emitted (longest round %d), %d H6 draft steps, %d H7 block rows\n",
@@ -1128,19 +1139,19 @@ void TestMtp() {
   }
   // The real container, whose MTP head does accept (multi-token rounds, the reseed after an accept).
   const char* target = r4dx_test::ProductionTargetPath();
-  if (r4dx_test::FileExists(target) && EnoughVram(kNeedGiBV6Mtp, "mtp v6")) {
+  if (r4dx_test::FileExists(target) && EnoughVram(kNeedGiBProdMtp, "mtp prod")) {
     ModelOptions o;
     o.container_path = target;
-    o.layout = r4dx::model::Layout::kW4a16;
+    o.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
     o.max_ctx = 1024;
     o.vision = ModelOptions::VisionMode::kOff;
     o.mtp_draft_k = kK;
     std::vector<Trajectory> trajs;
     {
       std::unique_ptr<TpModel> tpm = TpModel::Load(o, EmulateOptions());
-      SpecSuite(*tpm, "mtp v6", Drafter::kMtp, kK, {RepeatedPrompt(24, 3, 5), RepeatedPrompt(32, 2, 9)}, 6, &trajs);
+      SpecSuite(*tpm, "mtp prod", Drafter::kMtp, kK, {RepeatedPrompt(24, 3, 5), RepeatedPrompt(32, 2, 9)}, 6, &trajs);
     }
-    ReplayAtTp1(o, trajs, "mtp v6", kVsTp1TolV6);
+    ReplayAtTp1(o, trajs, "mtp prod", kVsTp1TolProd);
   } else if (!r4dx_test::FileExists(target)) {
     std::printf("SKIP (not a failure): %s missing -- no MTP case on the real container\n", target);
   }
@@ -1156,11 +1167,11 @@ void TestDflash() {
     std::printf("SKIP (not a failure): %s or %s missing -- no DFlash2 case\n", target, drafter);
     return;
   }
-  if (!EnoughVram(kNeedGiBV6Dflash, "dflash v6")) return;
+  if (!EnoughVram(kNeedGiBProdDflash, "dflash prod")) return;
   constexpr int64_t kK = 7;
   ModelOptions o;
   o.container_path = target;
-  o.layout = r4dx::model::Layout::kW4a16;
+  o.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
   o.max_ctx = 1024;
   o.vision = ModelOptions::VisionMode::kOff;
   o.dflash_container = drafter;
@@ -1169,10 +1180,10 @@ void TestDflash() {
   {
     std::unique_ptr<TpModel> tpm = TpModel::Load(o, EmulateOptions());
     CHECK(tpm->DflashEnabled(), "DFlash2 enabled");
-    SpecSuite(*tpm, "dflash v6", Drafter::kDflash, kK,
+    SpecSuite(*tpm, "dflash prod", Drafter::kDflash, kK,
               {RepeatedPrompt(24, 3, 5), RepeatedPrompt(32, 2, 9), Tokens(48, 77)}, 6, &trajs);
   }
-  ReplayAtTp1(o, trajs, "dflash v6", kVsTp1TolV6);
+  ReplayAtTp1(o, trajs, "dflash prod", kVsTp1TolProd);
   CheckNoCollectiveAllocs("dflash");
 }
 
@@ -1198,20 +1209,21 @@ r4dx::vision::DecodedImage SyntheticImage(int w, int h, uint32_t seed) {
   return im;
 }
 
-// Measured (Appendix B N73): both emulated v6 w4a16 ranks with the tower use 20.89 GiB at --max-ctx
-// 2048; the TP=1 load before them needs less.
-constexpr double kNeedGiBV6Vision = 22.0;
+// Measured (Appendix B N73): both emulated v6 w4a16 ranks with the tower used 20.89 GiB at --max-ctx
+// 2048; the trellis production container uses 20.50 GiB at --max-ctx 1024 (2026-09-29); the TP=1 load
+// before them needs less.
+constexpr double kNeedGiBProdVision = 22.0;
 
 // 9. Vision under TP: rank 0's solo EncodeImages (host rows), TpModel::PrefillMultimodal's copy and
 //    span rebasing, the host-to-device splice on both ranks, rank 1's merge size and 3-axis rope, and
 //    the rope delta the decode steps after the image use -- against the TP=1 Model on the real
 //    container (the 4-layer test containers carry no vision.* tensors). Two images with different
 //    grids go through ONE EncodeImages call (a multi-image turn), so both spans must land on the
-//    right rows. The TP-vs-TP=1 distance of the logits must stay within the v6 tolerance AND at most
+//    right rows. The TP-vs-TP=1 distance of the logits must stay within the production tolerance AND at most
 //    half of how far the TP=1 logits move when image 1 is swapped for another image of the same
 //    grid -- a TP error that dropped or misplaced an image's rows would be about that large.
 void TestVision() {
-  std::printf("==== vision under TP (v6 w4a16, two images) ====\n");
+  std::printf("==== vision under TP (production container, two images) ====\n");
   namespace vision = r4dx::vision;
   using r4dx::model::ImageRows;
   using r4dx::model::ImageSpan;
@@ -1220,7 +1232,7 @@ void TestVision() {
     std::printf("SKIP (not a failure): %s missing -- no vision case\n", target);
     return;
   }
-  if (!EnoughVram(kNeedGiBV6Vision, "vision v6")) return;
+  if (!EnoughVram(kNeedGiBProdVision, "vision prod")) return;
   const vision::ImageProcessorConfig pcfg;
   const vision::PreprocessedImages pre =
       vision::PreprocessImages({SyntheticImage(256, 256, 3), SyntheticImage(320, 256, 7)}, pcfg);
@@ -1229,7 +1241,7 @@ void TestVision() {
       vision::PreprocessImages({SyntheticImage(256, 256, 3), SyntheticImage(320, 256, 99)}, pcfg);
   ModelOptions o;
   o.container_path = target;
-  o.layout = r4dx::model::Layout::kW4a16;
+  o.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
   o.max_ctx = 1024;
   o.vision = ModelOptions::VisionMode::kOn;
   const std::vector<int32_t> forced = Tokens(3, 47);
@@ -1316,7 +1328,7 @@ void TestVision() {
     const double e = tp[i].size() == ref[i].size() ? RelL2(ref[i], tp[i]) : 1.0;
     worst = std::max(worst, e);
     yard = std::max(yard, RelL2(ref[i], ref_alt[i]));
-    CHECK(e <= kVsTp1TolV6, "vision row %zu: rel L2 vs TP=1 %.3e > %.0e", i, e, kVsTp1TolV6);
+    CHECK(e <= kVsTp1TolProd, "vision row %zu: rel L2 vs TP=1 %.3e > %.0e", i, e, kVsTp1TolProd);
   }
   CHECK(worst <= 0.5 * yard, "vision: TP sits %.3e from TP=1, a swapped image moves TP=1 only %.3e (limit x0.5)", worst,
         yard);
@@ -1337,7 +1349,7 @@ void TestVision() {
               "a %zu-token prompt + %zu decode steps: max rel L2 vs TP=1 %.3e (tol %.0e), a swapped image moves TP=1 "
               "%.3e (ratio %.2f, limit 0.5)\n",
               static_cast<long long>(spans[0].tokens), static_cast<long long>(spans[1].tokens), stats.encode_ms,
-              rows_exact ? "byte-identical to" : "differ from", rows_rel, ids.size(), forced.size(), worst, kVsTp1TolV6,
+              rows_exact ? "byte-identical to" : "differ from", rows_rel, ids.size(), forced.size(), worst, kVsTp1TolProd,
               yard, yard > 0 ? worst / yard : 0.0);
   CHECK(tpm->GetState() == TpModel::State::kReady, "group not ready after the vision checks");
   CheckNoCollectiveAllocs("vision");

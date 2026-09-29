@@ -18,8 +18,10 @@
 // Needs the REAL 64-layer target container AND the real w4a16 DFlash2 draft container (both ~GB-
 // scale, not vendored into the repo) -- SKIPs cleanly (CTest SKIPPED) if either is missing, same
 // convention as every other real-hardware-only test in this directory. Only ONE (target, draft)
-// layout pair (w4a16/w4a16) is exercised, not the full layout matrix test_mtp.cpp sweeps, to keep
-// this test's own real-45GB-container-load cost bounded to a single load per Model construction.
+// layout pair is exercised, not the full layout matrix test_mtp.cpp sweeps, to keep this test's own
+// real-container-load cost bounded to a single load per Model construction: the target loads with
+// r4dx_test::ProductionLayoutName() (trellis for the Huihui trellis mix4.5m production container;
+// w4a16 before 2026-09-29 when it was qwen38-27b-v6), the drafter is w4a16.
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -40,8 +42,8 @@ using r4dx::model::ModelOptions;
 namespace {
 
 // Real 64-layer container + real w4a16 DFlash2 draft container, the production pair packed at this
-// build's own w4a16 group (group 64: qwen38-27b-v6 + dflash2-w4a16-g64; group 128: qwen38-27b-v3 +
-// dflash2-w4a16) -- tests/model/test_container_path.h.
+// build's own w4a16 group (group 64: the Huihui trellis mix4.5m, layout trellis, + dflash2-w4a16-g64;
+// group 128: qwen38-27b-v3 + dflash2-w4a16, absent -> SKIP) -- tests/model/test_container_path.h.
 const char* kTargetContainerPath = r4dx_test::ProductionTargetPath();
 const char* kDflashContainerPath = r4dx_test::ProductionDrafterPath();
 constexpr int64_t kDflashK = 7;
@@ -751,8 +753,9 @@ static int RunTest() {
 
   ModelOptions opts;
   opts.container_path = kTargetContainerPath;
-  opts.layout = Layout::kW4a16;
+  opts.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
   opts.max_ctx = 512;
+  const std::string layout_name = r4dx_test::ProductionLayoutName();
 
   const std::vector<int32_t> prompt1 = MakePromptTokens(24);
   const std::vector<int32_t> prompt2_user = MakeSecondTurnUserTokens(12);
@@ -761,19 +764,19 @@ static int RunTest() {
     std::fprintf(stderr, "FAIL: CheckChatMultiTurnMidRoundStop\n");
     return 1;
   }
-  std::fprintf(stderr, "[PASS] CheckChatMultiTurnMidRoundStop (dflash, layout=w4a16)\n");
+  std::fprintf(stderr, "[PASS] CheckChatMultiTurnMidRoundStop (dflash, layout=%s)\n", layout_name.c_str());
 
   if (!CheckResetThenDflashContinuation(opts, prompt1, prompt2_user)) {
     std::fprintf(stderr, "FAIL: CheckResetThenDflashContinuation\n");
     return 1;
   }
-  std::fprintf(stderr, "[PASS] CheckResetThenDflashContinuation (dflash, layout=w4a16)\n");
+  std::fprintf(stderr, "[PASS] CheckResetThenDflashContinuation (dflash, layout=%s)\n", layout_name.c_str());
 
   if (!CheckInjectionToggleGap(opts, prompt1)) {
     std::fprintf(stderr, "FAIL: CheckInjectionToggleGap\n");
     return 1;
   }
-  std::fprintf(stderr, "[PASS] CheckInjectionToggleGap (dflash, layout=w4a16)\n");
+  std::fprintf(stderr, "[PASS] CheckInjectionToggleGap (dflash, layout=%s)\n", layout_name.c_str());
 
   // ---- Milestone 6 stage S2 item 3b: sampled DFlash2 rounds vs plain sampled decode -------------
   {
@@ -827,7 +830,7 @@ static int RunTest() {
       std::fprintf(stderr, "FAIL: CheckSampledPlainDecodeIsDrafterIndependent\n");
       return 1;
     }
-    std::fprintf(stderr, "[PASS] CheckSampledDflashMatchesPlain (dflash, layout=w4a16)\n");
+    std::fprintf(stderr, "[PASS] CheckSampledDflashMatchesPlain (dflash, layout=%s)\n", layout_name.c_str());
   }
   return 0;
 }

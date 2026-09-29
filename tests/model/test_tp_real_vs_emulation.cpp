@@ -35,7 +35,8 @@
 // one DecodeStep after the rounds (the state they committed):
 //   * MTP K=3 on l4-allmtp w4a16: 8 greedy rounds, then 8 seeded sampled rounds (T 0.7, top_k 20,
 //     top_p 0.8);
-//   * DFlash2 k=7 on the real v6 container + its w4a16 drafter (the production pair; the drafter's
+//   * DFlash2 k=7 on the real production container (the Huihui trellis mix4.5m, layout "trellis")
+//     + its w4a16 drafter (the production pair; the drafter's
 //     target layers need the 64-layer target): the same two scripts. Its emulate pass holds both
 //     ranks, drafters included, on device 1 (~23 GiB), so it has its own pre-flight; it SKIPs, with a
 //     line saying so, when the production pair is absent.
@@ -85,8 +86,9 @@ const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b
 constexpr int64_t kLayers = 4;
 constexpr int kRows = 16;
 constexpr double kNeedGiB = 8.0;  // both emulated ranks sit on one device (~3.5 GiB each)
-// The DFlash2 case on the production pair: emulate puts both v6 w4a16 ranks and both drafters on one
-// device (22.91 GiB used at --max-ctx 2048, Appendix B N73); a real rank needs about half.
+// The DFlash2 case on the production pair: emulate puts both ranks and both drafters on one device
+// (v6 w4a16: 22.91 GiB used at --max-ctx 2048, Appendix B N73; the production container is now the
+// trellis mix4.5m, smaller, so this v6 budget is a safe upper bound); a real rank needs about half.
 constexpr double kNeedGiBDflashEmulate = 24.0;
 constexpr double kNeedGiBDflashRank = 13.0;
 
@@ -518,7 +520,7 @@ int RunTest() {
     if (!r4dx_test::FileExists(target) || !r4dx_test::FileExists(drafter)) {
       std::printf("SKIP (not a failure): %s or %s missing -- no DFlash2 case\n", target, drafter);
     } else {
-      std::printf("==== DFlash2 k=7 (v6 w4a16 + drafter) ====\n");
+      std::printf("==== DFlash2 k=7 (production container + drafter) ====\n");
       // The emulate pass holds both ranks (drafters included) on the last visible ordinal, HIP
       // device 1; the real pass one rank per device.
       int vis = 0;
@@ -530,7 +532,7 @@ int RunTest() {
       }
       ModelOptions o;
       o.container_path = target;
-      o.layout = r4dx::model::Layout::kW4a16;
+      o.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
       o.max_ctx = 1024;
       o.vision = ModelOptions::VisionMode::kOff;
       o.dflash_container = drafter;

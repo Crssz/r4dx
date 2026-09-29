@@ -12,17 +12,22 @@
 # A mix quantizes its sources first.
 #
 # -Python defaults to $env:R4DX_REFERENCE_VENV\Scripts\python.exe when that is set, else python on
-# PATH. -HessianDir is hessian-v2 (docs/quant2.md 3.3), moved from C:\AI\r4dx-hessian on 2026-09-28.
+# PATH. The defaults below are the HUIHUI abliterated model's artifacts (docs/huihui.md, the default
+# container's recipe): its hessian-v2 (docs/quant2.md 3.3 settings), trellis-q, KL directory and bf16 KL
+# reference kl-ref, and its checkpoint dir (common.DEFAULT_MODEL_DIR). The base Qwen3.8-27B's files (trellis-q,
+# hessian\hessian-v2, kl-canon\ref) were retired on 2026-09-29; to oracle another model pass all of
+# -QDir -HessianDir -KlDir -RefDir -ModelDir explicitly.
 param(
   [string[]]$Points = @('K4m', 'mix4.5m', 'K3.5m', 'K4'),
-  [string]$QDir = 'D:\models\r4dx\trellis-q',
-  [string]$HessianDir = 'D:\models\r4dx\hessian\hessian-v2',
-  [string]$KlDir = 'D:\models\r4dx\kl-trellis',
-  [string]$RefDir = 'D:\models\r4dx\kl-canon\ref',
+  [string]$QDir = 'D:\models\r4dx\huihui\trellis-q',
+  [string]$HessianDir = 'D:\models\r4dx\huihui\hessian-v2',
+  [string]$KlDir = 'D:\models\r4dx\huihui\kl',
+  [string]$RefDir = 'D:\models\r4dx\huihui\kl-ref',
   [string]$Tokens = 'tools\reference\kl_corpus\tokens_canon.json',
   # The bf16 checkpoint quantize-model reads and the golden run streams; '' = the tools' default
-  # (common.DEFAULT_MODEL_DIR). A fine-tune with the base's config.json (e.g. Huihui abliterated) MUST
-  # pass it: config_sha256 cannot tell the two apart, so nothing else would refuse the base weights.
+  # (common.DEFAULT_MODEL_DIR = the Huihui abliterated checkpoint). A fine-tune with the base's
+  # config.json MUST always be named explicitly when it is not that default: config_sha256 cannot tell
+  # two Qwen3.8-27B-family checkpoints apart, so nothing else would refuse the wrong weights.
   [string]$ModelDir = '',
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )

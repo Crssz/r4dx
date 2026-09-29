@@ -11,6 +11,16 @@ Python: `C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe` (tok
 numpy). The scripts below call it `$py`. Outputs go to `D:\models\r4dx\prefill-m0\` and are never
 committed.
 
+Model: every `-Model` default is the production container, the Huihui abliterated trellis mix4.5m
+(`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `-Layout trellis`; before 2026-09-29 the
+base `qwen38-27b-trellis-mix45m.r4dx`), and the tokenizer is the Huihui checkpoint's
+(`common.DEFAULT_MODEL_DIR`; its tokenizer files are byte-identical to the base model's, so the
+frozen prompts and token files are unchanged). The M0 dense baselines under `prefill-m0\` (`kl\dense`,
+`ttft`, `profile`, the task-set results) were taken on the BASE container: an M2 comparison against
+them would compare two models, so re-take the dense KL dump and TTFT on the Huihui container first
+(`run_kl.ps1 -OutDir ...\kl\dense-huihui`, `ttft_cli.ps1`). M1's finding -- exact-wide attention is
+bit-identical to the dense kernel -- is a kernel property, not a per-model one.
+
 ## Files
 
 | File | What it does |

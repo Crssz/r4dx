@@ -1,3 +1,6 @@
+# HISTORICAL (Q1/Q2 experiment driver): its defaults name the base checkpoint, hessian-v1 and the kl-q1
+# reference, all removed (2026-09-29, docs/huihui.md "Retired files"); pass every path explicitly to
+# re-run it on another model.
 # quant2 experiment driver: for each variant, convert (CPU) then rung-4 KL (HIP device 1) against a
 # fixed bf16 reference, appending one row per variant to results.json. Sequential and resumable:
 # a variant whose kl_<name>.json exists is skipped; a container is reused only if its

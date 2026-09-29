@@ -39,7 +39,7 @@ class, per type x class). Exits 1 and prints every failure if anything is off.
 numpy only, CPU only, memory-mapped on both sides:
 
     <venv>\\Scripts\\python.exe tools\\reference\\gguf_validate.py `
-        --gguf D:\\...\\Qwen3.8-27B-UD-Q4_K_XL.gguf --model-dir C:\\AI\\models\\Qwen3.8-27B `
+        --gguf D:\\...\\Qwen3.8-27B-UD-Q4_K_XL.gguf --model-dir D:\\models\\Huihui-Qwen3.8-27B-abliterated `
         --out-dir D:\\models\\r4dx\\kl-gguf\\validation
 """
 
@@ -77,7 +77,7 @@ from gguf_dequant import (  # noqa: E402
     tensor_class,
 )
 
-DEFAULT_MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
+DEFAULT_MODEL_DIR = Path(r"D:\models\Huihui-Qwen3.8-27B-abliterated")
 #: A quantized tensor whose rel error exceeds this multiple of its type's median is an outlier.
 PEER_OUTLIER_FACTOR = 1.4
 #: Transform tags whose inverse is a permutation (reported with rel_no_inverse).

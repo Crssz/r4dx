@@ -81,7 +81,7 @@ import gen_corpus as gc  # noqa: E402
 
 TOOLS_REFERENCE_DIR = HERE.parent / "reference"
 #: The checkpoint (tools/reference/common.py's DEFAULT_MODEL_DIR; common is imported only by (k)).
-MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
+MODEL_DIR = Path(r"D:\models\Huihui-Qwen3.8-27B-abliterated")
 
 CHECKS = 0
 FAILURES: list[str] = []

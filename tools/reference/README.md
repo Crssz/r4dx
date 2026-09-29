@@ -14,10 +14,15 @@ Everything here is read-only against:
   `torch` 2.13.0+rocm10.0.0 in a venv that has since been deleted; later work (trellis) used a system
   Python 3.12 with torch 2.9.1 ROCm / transformers 5.5. Never `pip`/`uv install` into it -- these
   scripts only import from it.
-- `C:\AI\models\Qwen3.8-27B` -- the Qwen3.8-27B checkpoint. Shards may still be downloading; every
+- `D:\models\Huihui-Qwen3.8-27B-abliterated` -- the checkpoint (`common.DEFAULT_MODEL_DIR` since
+  2026-09-29; before that the base Qwen3.8-27B at `C:\AI\models\Qwen3.8-27B`, retired). Same
+  architecture, tokenizer and config; only 70 tensors in layers 17..51 differ from the base
+  (docs/huihui.md). Shards may still be downloading; every
   tensor read from it is allowed to fail and falls back to deterministic seeded random init
   instead (see "Weight fallback" below). As of this writing all 18 shards are fully downloaded and
-  every script below loads real weights.
+  every script below loads real weights. Golden files under `golden_out\` (layers 0 and 3, lm_head,
+  MTP, vision, rope) were cut from the base checkpoint and are valid for it unchanged. Tools that
+  take `--model-dir` accept any Qwen3.8-27B-family directory.
 
 Nothing in this directory writes outside the `--out-dir`/`--out` path you pass it (default:
 a `golden_out*`/`kv_calibrate_out` subdirectory of `tools/reference/` itself, gitignored -- see
@@ -1070,15 +1075,18 @@ $py = 'python'
 & $py tests\reference\test_trellis_quant.py                       # incl. the HIP encoder
 & $py tools\reference\trellis_quant.py selftest --device cuda      # hip == cpu == torch
 & $py tools\reference\trellis_quant.py bench --device cuda --K 3.5,4,5 --tiles 8192
-& $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --out-dir D:\models\r4dx\trellis-q\K4
+# (the directories are the Huihui model's, the default of --hessian-dir / --model-dir; the base
+#  model's trellis-q / kl-trellis / kl-canon were retired on 2026-09-29, docs/huihui.md)
+$q = 'D:\models\r4dx\huihui\trellis-q'
+& $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --out-dir $q\K4
 & $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched `
-    --out-dir D:\models\r4dx\trellis-q\K4m                            # the "what we would ship" basis
-& $py tools\reference\trellis_quant.py mix --bpw 4.5 --src D:\models\r4dx\trellis-q\K4 `
-    --src D:\models\r4dx\trellis-q\K5 --out-dir D:\models\r4dx\trellis-q\mix4.5
+    --out-dir $q\K4m                                                  # the "what we would ship" basis
+& $py tools\reference\trellis_quant.py mix --bpw 4.5 --src $q\K4 `
+    --src $q\K5 --out-dir $q\mix4.5
 & $py tools\reference\full_logits_golden.py --device cuda --tokens tools\reference\kl_corpus\tokens_canon.json `
-    --weights-override D:\models\r4dx\trellis-q\K4 --out-dir D:\models\r4dx\kl-trellis\4.0
-& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\kl-canon\ref --test-dir D:\models\r4dx\kl-trellis\4.0 `
-    --tokens tools\reference\kl_corpus\tokens_canon.json --out D:\models\r4dx\kl-trellis\4.0\kl_canon.json
+    --weights-override $q\K4 --out-dir D:\models\r4dx\huihui\kl\4.0
+& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\huihui\kl-ref --test-dir D:\models\r4dx\huihui\kl\4.0 `
+    --tokens tools\reference\kl_corpus\tokens_canon.json --out D:\models\r4dx\huihui\kl\4.0\kl_canon.json
 ```
 
 **Encoders.** The Viterbi is the only heavy part (2 x 256 x 65,536 candidate evaluations per

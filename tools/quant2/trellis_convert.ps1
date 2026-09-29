@@ -19,9 +19,13 @@
 # "^lm_head$=32" stays; --lm-head w4a16 instead of 4bit (--layout trellis loads the w4a16 head, so the
 # mxfp4/w4a8 copies would be dead weight). -LmHead bf16 writes the A2 twin (same body bytes).
 #
-#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -Output D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx
-#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -LmHead bf16 -Output D:\models\r4dx\qwen38-27b-trellis-k4m-lmbf16.r4dx
-#   .\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx
+#   .\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-k4m.r4dx
+#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -LmHead bf16 -Output <...>-k4m-lmbf16.r4dx
+#
+# Every default below is the HUIHUI abliterated model's (docs/huihui.md, D:\models\r4dx\huihui\RECIPE.md):
+# its checkpoint, hessian-v2, trellis-q oracle dir, KL runs and imatrix / kvcalib. The base Qwen3.8-27B
+# files were retired on 2026-09-29 (docs/huihui.md); another model needs every path passed explicitly.
 #
 # The log goes to -LogDir\<output name>.log; the run fails unless the converter exits 0 (its
 # --trellis-verify full reconstruction check included) and prints decode bytes at the end.
@@ -38,18 +42,18 @@ param(
   [Parameter(Mandatory = $true)][string]$Oracle,          # a directory under -OracleRoot, or a path
   [Parameter(Mandatory = $true)][string]$Output,
   [ValidateSet('w4a16', 'bf16')][string]$LmHead = 'w4a16',
-  [string]$OracleRoot = 'D:\models\r4dx\trellis-q',
-  [string]$KlRoot = 'D:\models\r4dx\kl-trellis',
+  [string]$OracleRoot = 'D:\models\r4dx\huihui\trellis-q',
+  [string]$KlRoot = 'D:\models\r4dx\huihui\kl',
   [string]$ManifestSha256 = '',
-  [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
-  [string]$HessianDir = 'D:\models\r4dx\hessian\hessian-v2',
-  [string]$KvCalib = 'D:\models\r4dx\qwen38-27b.kvcalib-full.json',
-  [string]$Imatrix = 'D:\models\r4dx\qwen38-27b.imatrix.npz',
-  [string]$LogDir = 'D:\models\r4dx\trellis-m3',
+  [string]$Checkpoint = 'D:\models\Huihui-Qwen3.8-27B-abliterated',
+  [string]$HessianDir = 'D:\models\r4dx\huihui\hessian-v2',
+  [string]$KvCalib = 'D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json',
+  [string]$Imatrix = 'D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz',
+  [string]$LogDir = 'D:\models\r4dx\huihui\logs',
   [string]$Exe = '',
   [int]$Threads = 32,
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
-  [string]$Compare = ''                                   # e.g. D:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx
+  [string]$Compare = ''                                   # a container to byte-compare the non-trellis tensors against (same model + calibration only)
 )
 $ErrorActionPreference = 'Stop'
 # Script scope: the log's *> redirection writes UTF-8 (PS 5.1's own default is UTF-16), so the

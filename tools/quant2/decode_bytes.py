@@ -11,8 +11,8 @@ Everything else under text.layers.* (norms, conv1d, A_log, dt_bias, descales, gd
 pre-R1 container's bare attn.k/v) counts as it is. `<base>.trellis.w|suh|svh` are one layout: the
 words and both scale vectors (docs/trellis-kernel.md 2.1, 2.5 "Bytes").
 
-  python tools/quant2/decode_bytes.py D:\\models\\r4dx\\qwen38-27b-q2ab_hv2_q3.r4dx `
-      D:\\models\\r4dx\\qwen38-27b-trellis-k4m.r4dx [--layout auto|w4a16|trellis|bf16] [--by-class] [--json-out f]
+  python tools/quant2/decode_bytes.py D:\\models\\r4dx\\huihui-qwen38-27b-abl-trellis-mix45m.r4dx `
+      [<another container>.r4dx ...] [--layout auto|w4a16|trellis|bf16] [--by-class] [--json-out f]
 
 `--layout auto` (default) is trellis for a container with __metadata__.quant.trellis, else w4a16.
 Python stdlib only.

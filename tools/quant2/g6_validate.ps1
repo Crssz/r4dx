@@ -2,19 +2,22 @@
 # must pass, each script's full output in -OutDir\<step>.log and a one-line verdict per step in
 # summary.json. Every step runs even when an earlier one fails; exit 1 if any failed.
 #
-#   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\qwen38-27b-q2ab_ldlq.r4dx
-#   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx -Layout trellis
+#   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+#   .\tools\quant2\g6_validate.ps1 -Model <a w4a16 container> -Layout w4a16
 #
-# -Layout (default w4a16) is the container's body layout: passed as -Layouts to both validators and
-# as -Layout to the three smoke steps (docs/trellis-kernel.md gate A4; a trellis container refuses
-# any other). The DFlash drafter keeps its own layout.
+# -Layout (default trellis, the production container's layout) is the container's body layout:
+# passed as -Layouts to both validators and as -Layout to the three smoke steps
+# (docs/trellis-kernel.md gate A4; a trellis container refuses any other). The DFlash drafter keeps
+# its own layout. -Model has no default (Mandatory); the production container is the Huihui abliterated
+# trellis mix4.5m above. G6 stores no expected values: its verdict is the exit codes and the
+# [PASS]/[FAIL] counts in summary.json (recorded for the production container in docs/huihui.md).
 #
 # TP=2 runs in --tp-mode emulate (both ranks on device 1): the byte-exact reference of the sharded
 # math, which is what a rotated container changes; real mode only adds the device-0 transport.
 param(
   [Parameter(Mandatory = $true)][string]$Model,
   [string]$Dflash = 'D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx',
-  [string]$Layout = 'w4a16',
+  [string]$Layout = 'trellis',
   [string]$OutDir = ''
 )
 $ErrorActionPreference = 'Stop'

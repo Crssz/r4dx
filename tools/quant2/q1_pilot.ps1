@@ -1,3 +1,6 @@
+# HISTORICAL (Q1 experiment driver): its defaults name the base checkpoint, the base v6, hessian-v1 and the
+# pilot container, all removed (2026-09-29, docs/huihui.md "Retired files"); pass every path explicitly to
+# re-run it on another model.
 # docs/quant2.md gate G3: the Q1 pilot. v6's recipe with LDLQ on the MLP linears only, against v6
 # itself, both measured by rung 4 (tool_teacher_forced_logprobs + kl_report.py) against a freshly
 # regenerated bf16 reference.

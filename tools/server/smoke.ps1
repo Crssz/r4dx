@@ -21,11 +21,13 @@
   D:\models\r4dx\g64\qwen38-27b-l4-bf16.r4dx, group 128 (-Preset win-hip-g128) ->
   D:\models\r4dx\qwen38-27b-l4-bf16.r4dx; R4DX_TEST_CONTAINER_DIR, when set, overrides the directory
   exactly as it does for ctest (tests/model/test_container_path.h). For a real-answer run pass the
-  production container matching the build: D:\models\r4dx\qwen38-27b-v6.r4dx on the default build,
-  D:\models\r4dx\qwen38-27b-v3.r4dx on win-hip-g128.
+  production container matching the build: D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+  (the Huihui abliterated trellis mix4.5m, with -Layout trellis) on the default build; the group-128
+  build has no production container any more.
 
 .PARAMETER Layout
-  Body layout. Default: w4a16.
+  Body layout. Default: w4a16 (the 4-layer default container). The 64-layer production container is
+  a trellis container and needs -Layout trellis.
 
 .PARAMETER Port
   Port to run r4dx-server on. Default: 8091 (unlikely to collide with a dev server).
@@ -53,7 +55,7 @@
 .PARAMETER Vision
   Exercises image content parts end to end (docs/vision.md, docs/server.md's "Images") against a
   REAL vision-capable container -- pass -Model/-Layout/-Layers -1 pointed at one (e.g.
-  D:\models\r4dx\qwen38-27b-v6.r4dx on the default build). Generates its own tiny synthetic PNGs
+  D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx with -Layout trellis on the default build). Generates its own tiny synthetic PNGs
   with System.Drawing (no files committed to the repo): a shapes image for a description check, a rendered-text image for
   an OCR check, then two-images-in-one-request, image+tools, image+thinking, streaming, multi-turn
   prefix reuse (turn 2 must NOT re-encode: no `timings.image_n` key), different-image-same-text
@@ -120,17 +122,17 @@
 .EXAMPLE
   .\tools\server\smoke.ps1 -Tp 2 -TpFault        # recovery after an injected all-reduce timeout
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Tp 2 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layers -1 -Dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -TpFault
+  .\tools\server\smoke.ps1 -Tp 2 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -TpFault
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layout w4a16 -Layers -1
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\g64\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layout w4a16 -Layers -1 -Mtp 3
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Mtp 3
 .EXAMPLE
   .\tools\server\smoke.ps1 -Preset win-hip-g128   # group-128 build: D:\models\r4dx\qwen38-27b-l4-bf16.r4dx
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v6.r4dx -Layout w4a16 -Layers -1 -ToolRoundTrip
+  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -ToolRoundTrip
 #>
 [CmdletBinding()]
 param(

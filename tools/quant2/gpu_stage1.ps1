@@ -1,3 +1,5 @@
+# HISTORICAL (quant2 stage-1 driver): its defaults name files that were removed before and on 2026-09-29
+# (docs/huihui.md "Retired files"); pass every path explicitly to re-run it.
 # quant2 GPU stage 1 (HIP device 1, run by the user): everything on the GPU that does not wait for
 # a CPU-built container. Each step logs to -OutDir and the exit codes go to summary.json, so the
 # results can be read back without the console. A failing test does NOT stop the Hessian capture

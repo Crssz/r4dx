@@ -1,3 +1,5 @@
+# HISTORICAL (quant2 stage-2 driver): its defaults name files that were removed before and on 2026-09-29
+# (docs/huihui.md "Retired files"); pass every path explicitly to re-run it.
 # quant2 GPU stage 2 (HIP device 1, run by the user). Logs + summary.json under -OutDir.
 #
 #   1. the three GPU tests stage 1 skipped for missing golden fixtures (now copied in)

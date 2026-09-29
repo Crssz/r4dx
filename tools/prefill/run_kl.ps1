@@ -22,7 +22,7 @@ param(
   [Parameter(Mandatory = $true)][string]$OutDir,
   [string[]]$Segment = @(),
   [ValidateSet('decode', 'prefill')][string]$TailPath = 'decode',
-  [string]$Model = 'D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx',
+  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
   [string]$Layout = 'trellis',
   [string]$Tool = '',
   [string[]]$ExtraArgs = @(),

@@ -21,7 +21,7 @@ param(
   [string[]]$Task = @(),
   [int]$Limit = 0,
   [int]$MaxTokens = 0,
-  [string]$Model = 'D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx',
+  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
   [string]$Layout = 'trellis',
   [string]$TasksDir = 'D:\models\r4dx\prefill-m0\tasks',
   [Parameter(Mandatory = $true)][string]$OutDir,

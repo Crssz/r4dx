@@ -5,9 +5,9 @@
   reproduce the frozen baseline binaries' bytes on every row of the matrix.
 
 .DESCRIPTION
-  Runs each row with the baseline binaries (build\baseline, frozen at aa54c20 -- BASELINE.txt) and
-  with the candidate build, both on HIP device 1 (HIP_VISIBLE_DEVICES=1) and without any --tp flag,
-  and compares SHA-256:
+  Runs each row with the baseline binaries (a flat directory of frozen executables + BASELINE.txt,
+  see "Baselines" below) and with the candidate build, both on HIP device 1 (HIP_VISIBLE_DEVICES=1)
+  and without any --tp flag, and compares SHA-256:
     rows 1-5, 7-9  r4dx-cli: stdout (the generated text, captured byte for byte), the
                    --dump-token-ids file, and the timing-free stderr lines
                    "[stats] mtp: / dflash: / sampled:" (rounds, drafted, accepted, fallback rows --
@@ -30,13 +30,27 @@
     9  --chat, two user turns fed through stdin, greedy (the second turn prefills a suffix at
        pos > 0 on top of the first turn's state)
 
-  Standard protocol (docs/perf.md): --layout w4a16 --vision off --think off --temperature 0
+  Standard protocol (docs/perf.md): --layout <-Layout> --vision off --think off --temperature 0
   --max-tokens 256 --max-ctx 2048 --stats, prompt "Write a haiku about GPUs, then explain what a
   GPU is in two sentences." (The rest of stderr -- timings, VRAM -- is kept for reference and not
   compared.)
 
+  Rows 1-5 and 7-9 run on -Model with -Layout. The default is the production container, the Huihui
+  abliterated trellis mix4.5m (D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx, layout
+  trellis), which needs a TRELLIS-CAPABLE baseline (below). Every run passes --tokenizer-dir
+  explicitly (-TokenizerDir), so a baseline binary's own compiled-in default never matters.
+
+  Baselines (C:\Users\pay20\dev\r4dx-baselines\, never rebuilt, BASELINE.txt = commit + libr4d +
+  SHA-256 of each exe):
+    tp1-1099446  main 1099446, the first trellis-capable one: use it for the default container
+                 (rows 1-5, 7-9) and for row 6.
+    tp1-f7d4927  pre-trellis (reads w4a16/w4a8/mxfp4/bf16 only): row 6 and any w4a16 container
+                 (-Model <a w4a16 container> -Layout w4a16).
+  To confirm a baseline's determinism run it against itself (-Baseline X -Candidate X): every row
+  must be EQUAL, i.e. a bit-identical repeat.
+
   Pre-flight (docs/tp.md 9.2): refuses to run while an r4dx-server process exists -- the production
-  server holds ~28 GiB of device 1, and every v6 row needs ~16-19 GiB.
+  server holds ~28 GiB of device 1, and every 64-layer row needs ~16-19 GiB.
 
   Exit code 0 when every requested row was compared and is equal; throws (exit 1) on any
   difference or failed run, and on a SKIPped row unless -AllowSkip is given.
@@ -65,7 +79,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Baseline,
     [Parameter(Mandatory = $true)][string]$Candidate,
     [int[]]$Rows = @(1, 2, 3, 4, 5, 6, 7, 8, 9),
-    [string]$Model = "D:\models\r4dx\qwen38-27b-v6.r4dx",
+    [string]$Model = "D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
+    [string]$Layout = "trellis",
+    [string]$TokenizerDir = "D:\models\Huihui-Qwen3.8-27B-abliterated",
     [string]$Dflash = "D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx",
     [string]$TestModel = "D:\models\r4dx\g64\qwen38-27b-l4-allmtp.r4dx",
     [string]$Tokens = "tools\reference\kl_corpus\tokens.json",
@@ -166,11 +182,11 @@ foreach ($side in "baseline", "candidate") {
 }
 
 $Prompt = "Write a haiku about GPUs, then explain what a GPU is in two sentences."
-$Std = @("--model", $Model, "--layout", "w4a16", "--vision", "off", "--think", "off",
-         "--temperature", "0", "--max-tokens", "256", "--max-ctx", "2048", "--stats",
+$Std = @("--model", $Model, "--layout", $Layout, "--tokenizer-dir", $TokenizerDir, "--vision", "off",
+         "--think", "off", "--temperature", "0", "--max-tokens", "256", "--max-ctx", "2048", "--stats",
          "--prompt", $Prompt)
-$Sampled = @("--model", $Model, "--layout", "w4a16", "--vision", "off", "--think", "off",
-             "--temperature", "0.7", "--top-k", "20", "--top-p", "0.8", "--seed", "1",
+$Sampled = @("--model", $Model, "--layout", $Layout, "--tokenizer-dir", $TokenizerDir, "--vision", "off",
+             "--think", "off", "--temperature", "0.7", "--top-k", "20", "--top-p", "0.8", "--seed", "1",
              "--max-tokens", "256", "--max-ctx", "2048", "--stats", "--prompt", $Prompt)
 $DflashArgs = @("--dflash", $Dflash, "--dflash-k", "7")
 $ImagePath = Resolve-Full $Image
@@ -180,12 +196,13 @@ $CliRows = @{
     3 = $Std + @("--mtp", "3")
     4 = $Sampled
     5 = $Sampled + $DflashArgs
-    7 = @("--model", $Model, "--layout", "w4a16", "--vision", "on", "--image", $ImagePath,
-          "--think", "off", "--temperature", "0", "--max-tokens", "256", "--max-ctx", "2048",
-          "--stats", "--prompt", "What is in this picture?")
+    7 = @("--model", $Model, "--layout", $Layout, "--tokenizer-dir", $TokenizerDir, "--vision", "on",
+          "--image", $ImagePath, "--think", "off", "--temperature", "0", "--max-tokens", "256",
+          "--max-ctx", "2048", "--stats", "--prompt", "What is in this picture?")
     8 = $Sampled + @("--mtp", "3")
-    9 = @("--model", $Model, "--layout", "w4a16", "--vision", "off", "--think", "off",
-          "--temperature", "0", "--max-tokens", "256", "--max-ctx", "2048", "--stats", "--chat")
+    9 = @("--model", $Model, "--layout", $Layout, "--tokenizer-dir", $TokenizerDir, "--vision", "off",
+          "--think", "off", "--temperature", "0", "--max-tokens", "256", "--max-ctx", "2048", "--stats",
+          "--chat")
 }
 # Row 9's two user turns, one per stdin line.
 $ChatStdin = "Write a haiku about GPUs.`nNow explain what a GPU is in two sentences.`n"
@@ -283,6 +300,6 @@ if ($skips.Count -gt 0) {
 } elseif ($full) {
     Write-Output "[tp1_identity] G2 PASS: every row is byte-identical to the baseline"
 } else {
-    Write-Output ("[tp1_identity] rows {0} byte-identical to the baseline (a partial run, not the " +
-                  "full G2 matrix)" -f ($Rows -join ','))
+    Write-Output (("[tp1_identity] rows {0} byte-identical to the baseline (a partial run, not the " +
+                   "full G2 matrix)") -f ($Rows -join ','))
 }

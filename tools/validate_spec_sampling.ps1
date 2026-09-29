@@ -51,7 +51,8 @@
 .PARAMETER Model
   Path to the real 64-layer target container. Default: the production container matching build\win-hip's w4a16 group,
   read from build\win-hip\CMakeCache.txt (R4DX_W4A16_GROUP) by tools\r4dx_containers.ps1: group 64
-  (the default build) -> D:\models\r4dx\qwen38-27b-v6.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx.
+  (the default build) -> D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated
+  trellis mix4.5m, layout trellis), group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx (no longer on disk).
 
 .PARAMETER Dflash
   Path to the DFlash2 draft container to test. Default: the w4a16 draft container matching the same group -- group 64 ->
@@ -68,8 +69,11 @@
   the mxfp4 draft container (independent of the w4a16 default above).
 
 .PARAMETER Layouts
-  Comma-separated TARGET body layouts. Default: w4a16,w4a8,mxfp4 (bf16 excluded, standing
-  bf16-retired-from-perf-work rule -- docs/status.md).
+  Comma-separated TARGET body layouts. Default: the production container's own layout (trellis: a
+  trellis container loads with no other) -- or, when -Model names another container explicitly,
+  w4a16,w4a8,mxfp4 as before (bf16 excluded, standing bf16-retired-from-perf-work rule --
+  docs/status.md). w4a16/w4a8/mxfp4 at 64 layers need a multi-layout container; none is kept on disk
+  since the base v6 was retired (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries all four.
 
 .PARAMETER Seeds
   Comma-separated seeds. Default: 1,2 (the task's own ask).
@@ -80,7 +84,8 @@
   modes = 108 generations) too slow to actually run.
 
 .PARAMETER Quick
-  Restricts Layouts to w4a16 only (a fast smoke pass -- CI/pre-flight use, not the mandatory gate).
+  Restricts Layouts to one layout (a fast smoke pass -- CI/pre-flight use, not the mandatory gate):
+  the production container's own layout (trellis), or w4a16 with an explicit -Model.
 
 .PARAMETER AllowBatchedVerifyDivergence
   If set, a mismatch is downgraded from FAILED to WARN IF AND ONLY IF one of the two controls (see
@@ -113,7 +118,7 @@ param(
     [string]$Model = "",   # "" = the group-matched production container (see .PARAMETER Model)
     [string]$Dflash = "",  # "" = the group-matched w4a16 drafter (see .PARAMETER Dflash)
     [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-mxfp4.r4dx",
-    [string]$Layouts = "w4a16,w4a8,mxfp4",
+    [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [string]$Seeds = "1,2",
     [int]$MaxTokens = 48,
     [switch]$Quick,
@@ -198,9 +203,16 @@ if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
 # Default containers follow build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an explicit
 # -Model/-Dflash wins.
 . (Join-Path $PSScriptRoot "r4dx_containers.ps1")
+$ModelWasExplicit = [bool]$Model
 if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
 if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter -BuildDir "build\win-hip" }
-Write-Output "[validate_spec_sampling] target=$Model draft=$Dflash"
+$DefaultLayout = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
+if (-not $Layouts) {
+    # The production container is a trellis container and loads with no other layout; an explicit
+    # -Model keeps the historical matrix (a multi-layout w4a16 / w4a8 / mxfp4 container).
+    $Layouts = if ($ModelWasExplicit) { "w4a16,w4a8,mxfp4" } else { $DefaultLayout }
+}
+Write-Output "[validate_spec_sampling] target=$Model draft=$Dflash layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "target container not found: $Model" }
 if (-not (Test-Path $Dflash)) { throw "dflash draft container not found: $Dflash" }
 $HasDflashAlt = Test-Path $DflashAlt
@@ -208,7 +220,7 @@ if (-not $HasDflashAlt) {
     Write-Output "[validate_spec_sampling] WARNING: grouping-control draft container not found ($DflashAlt) -- a --dflash mismatch whose cross-family control does not match exactly will have no second-tier control to try"
 }
 
-if ($Quick) { $Layouts = "w4a16" }
+if ($Quick) { $Layouts = $DefaultLayout }
 
 # Same standard prompt as tools/validate_dflash.ps1 and docs/perf.md's own measurement prompt.
 $StandardPrompt = "Write a haiku about GPUs, then explain what a GPU is in two sentences."

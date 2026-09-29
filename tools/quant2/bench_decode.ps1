@@ -5,8 +5,11 @@
 # the standard haiku prompt), then one prefill run over -PrefillPromptFile. Writes bench.json and
 # bench.md to -OutDir.
 #
-#   .\tools\quant2\bench_decode.ps1 -Container q2ab=D:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx,`
-#       k4m=D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx#trellis,mix=D:\...\trellis-mix45m.r4dx#trellis
+#   .\tools\quant2\bench_decode.ps1 -Container `
+#       huihui=D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx#trellis
+#   (-Layout defaults to trellis, the production container's layout, so #trellis is optional; a w4a16
+#   container needs #w4a16. Earlier records compared base w4a16 / K4m / mix4.5m containers, all
+#   retired with the base checkpoint -- docs/huihui.md.)
 #
 # Each entry is name=path[@binary][#layout]: @binary runs a different r4dx-cli.exe (e.g. main's build,
 # to check that the branch binary is speed-neutral on an unrotated container), #layout its own
@@ -42,7 +45,7 @@ param(
   [int]$Runs = 3,
   [string]$Dflash = 'D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx',
   [string]$OutDir = 'D:\models\r4dx\quant2-bench',
-  [string]$Layout = 'w4a16',
+  [string]$Layout = 'trellis',
   [string]$PromptFile = '',
   [string[]]$Modes = @('plain', 'dflash7', 'mtp3'),
   [string]$PrefillPromptFile = '',

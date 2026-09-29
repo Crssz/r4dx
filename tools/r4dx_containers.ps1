@@ -13,14 +13,22 @@
 # where it has one), which bypasses all of this.
 #
 # Same resolution rules as the C++ tests' tests/model/test_container_path.h:
-#   production pair (Get-R4dxProductionTarget / Get-R4dxProductionDrafter), in D:\models\r4dx:
-#     group 64  -> qwen38-27b-v6.r4dx + qwen38-27b-dflash2-w4a16-g64.r4dx
-#     group 128 -> qwen38-27b-v3.r4dx + qwen38-27b-dflash2-w4a16.r4dx
+#   production pair (Get-R4dxProductionTarget / Get-R4dxProductionDrafter) and the target's body
+#   layout (Get-R4dxProductionLayout), in D:\models\r4dx:
+#     group 64  -> huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout trellis: the Huihui abliterated
+#                  trellis mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx
+#     group 128 -> qwen38-27b-v3.r4dx (layout w4a16) + qwen38-27b-dflash2-w4a16.r4dx (v3 is gone from
+#                  this machine, so a g128 build has no production container; pass -Model explicitly)
+#   the tokenizer / chat-template directory (Get-R4dxTokenizerDir): the Huihui HF checkpoint dir, whose
+#   four tokenizer files are byte-identical to the base Qwen3.8-27B's (the base checkpoint was retired)
 #   fixed test containers (Get-R4dxTestContainer -Name <basename>):
 #     R4DX_TEST_CONTAINER_DIR\<basename> if that variable is set, else
 #     group 128 -> D:\models\r4dx\<basename>, any other -> D:\models\r4dx\g<group>\<basename>
 
 $script:R4dxModelRoot = "D:\models\r4dx"
+$script:R4dxTokenizerDir = "D:\models\Huihui-Qwen3.8-27B-abliterated"
+
+function Get-R4dxTokenizerDir { return $script:R4dxTokenizerDir }
 
 function Get-R4dxW4a16Group {
     param([Parameter(Mandatory = $true)][string]$BuildDir)
@@ -37,8 +45,14 @@ function Get-R4dxW4a16Group {
 
 function Get-R4dxProductionTarget {
     param([Parameter(Mandatory = $true)][string]$BuildDir)
-    $name = if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { "qwen38-27b-v3.r4dx" } else { "qwen38-27b-v6.r4dx" }
+    $name = if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { "qwen38-27b-v3.r4dx" } else { "huihui-qwen38-27b-abl-trellis-mix45m.r4dx" }
     return Join-Path $script:R4dxModelRoot $name
+}
+
+# The body layout Get-R4dxProductionTarget's container loads with (a trellis container refuses any other).
+function Get-R4dxProductionLayout {
+    param([Parameter(Mandatory = $true)][string]$BuildDir)
+    if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { return "w4a16" } else { return "trellis" }
 }
 
 function Get-R4dxProductionDrafter {

@@ -1079,6 +1079,16 @@ def test_make_tokens(canon, hf, model_dir: Path, tmp: Path) -> None:
             json.dump({k: v for k, v in doc.items() if k not in added}, f, indent=1)
         return p.read_bytes()
 
+    def norm(b: bytes) -> bytes:
+        """The committed token files name the checkpoint dir they were made from in their provenance
+        strings (the base Qwen3.8-27B, C:\\AI\\models\\Qwen3.8-27B); a run's output names --model-dir
+        (the Huihui checkpoint since 2026-09-29, whose tokenizer.json is byte-identical: the recorded
+        tokenizer_json_sha256 is compared unchanged). Both spellings are masked, so the comparison stays
+        byte for byte on everything else -- the token ids above all."""
+        for p in (str(model_dir), r"C:\AI\models\Qwen3.8-27B"):
+            b = b.replace(json.dumps(p)[1:-1].encode("utf-8"), b"<MODEL_DIR>")
+        return b
+
     thai = KL_DIR / "thai_prose.txt"
     out = d / "thai_canon.json"
     base = ["--model-dir", str(model_dir), "--file", f"thai_prose_canon={thai}", "--max-tokens", "1024",
@@ -1098,9 +1108,10 @@ def test_make_tokens(canon, hf, model_dir: Path, tmp: Path) -> None:
         # earlier, hand-made shape (no provenance) must equal the output minus those fields.
         lead_doc = json.loads(lead.read_text(encoding="utf-8"))
         if all(k in lead_doc for k in added):
-            same, how = out.read_bytes() == lead.read_bytes(), "byte for byte"
+            same, how = norm(out.read_bytes()) == norm(lead.read_bytes()), "byte for byte (checkpoint dir masked)"
         else:
-            same, how = without_added(doc) == lead.read_bytes(), "byte for byte, but for the two added fields"
+            same, how = (norm(without_added(doc)) == norm(lead.read_bytes()),
+                         "byte for byte, but for the two added fields (checkpoint dir masked)")
         check(same, f"(h) make_tokens_json reproduces tokens_thai_canon.json {how}")
     else:
         SKIPS.append("(h) make_tokens_json vs tokens_thai_canon.json")
@@ -1122,7 +1133,7 @@ def test_make_tokens(canon, hf, model_dir: Path, tmp: Path) -> None:
                                           str(KL_DIR), "--max-tokens", "1024", "--out", str(tj)]))
     doc = json.loads(tj.read_text(encoding="utf-8")) if tj.is_file() else {}
     committed = (KL_DIR / "tokens.json").read_bytes()
-    check(res == 0 and doc.get("tokenizer_mode") == "hf-auto" and without_added(doc) == committed,
+    check(res == 0 and doc.get("tokenizer_mode") == "hf-auto" and norm(without_added(doc)) == norm(committed),
           f"(h) make_tokens_json --tokenizer hf-auto reproduces tokens.json byte for byte, but for the two added "
           f"fields ({res!r})")
     shutil.copyfile(KL_DIR / "tokens.json", tj)

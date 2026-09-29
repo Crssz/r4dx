@@ -4,8 +4,11 @@ Everything under tools/reference/** is read-only against:
   - the reference Python (torch + transformers + numpy): $env:R4DX_REFERENCE_VENV's
     Scripts\\python.exe when that is set, else python on PATH -- never pip/uv install into it, we
     only import from it
-  - C:\\AI\\models\\Qwen3.8-27B                          (the checkpoint; shards may still be
-    downloading, so every tensor read here is allowed to fail and fall back to random init)
+  - D:\\models\\Huihui-Qwen3.8-27B-abliterated           (the checkpoint: DEFAULT_MODEL_DIR; shards may
+    still be downloading, so every tensor read here is allowed to fail and fall back to random init).
+    The base Qwen3.8-27B checkpoint (C:\\AI\\models\\Qwen3.8-27B) was retired on 2026-09-29; the Huihui
+    fine-tune's tokenizer / config files are byte-identical to it (docs/huihui.md), only layers 17..51's
+    o_proj / out_proj / down_proj weights differ
 
 Run these scripts with that interpreter, e.g.:
     python tools\\reference\\layer_golden.py
@@ -25,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
+DEFAULT_MODEL_DIR = Path(r"D:\models\Huihui-Qwen3.8-27B-abliterated")
 #: The reference venv when $env:R4DX_REFERENCE_VENV names one, else None (python on PATH).
 DEFAULT_REFERENCE_VENV = (Path(os.environ["R4DX_REFERENCE_VENV"])
                           if os.environ.get("R4DX_REFERENCE_VENV") else None)

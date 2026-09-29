@@ -29,7 +29,7 @@ Run with the reference venv (`tools/reference/README.md`'s convention), CPU only
     <reference venv>\\python.exe tools\\reference\\dflash2_ref.py --synthetic --anchor-id 7 \\
         --n-injected 40 --seed 0   # ad hoc single-round draft, prints the drafted tokens
     <reference venv>\\python.exe tools\\reference\\dflash2_ref.py --real captured.npz \\
-        --target-dir C:\\AI\\models\\Qwen3.8-27B   # docs/dflash2.md "npz schema"
+        --target-dir D:\\models\\Huihui-Qwen3.8-27B-abliterated   # docs/dflash2.md "npz schema"
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gguf_min import GGUFError, load_gguf  # noqa: E402
 
 DEFAULT_DFLASH2_GGUF = Path(r"D:\models\Qwen3.8-27B-DFlash2\Qwen3.8-27B-DFlash2-Q8_0.gguf")
-DEFAULT_TARGET_DIR = Path(r"C:\AI\models\Qwen3.8-27B")
+DEFAULT_TARGET_DIR = Path(r"D:\models\Huihui-Qwen3.8-27B-abliterated")
 
 
 # --------------------------------------------------------------------------------------------

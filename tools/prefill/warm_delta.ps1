@@ -6,7 +6,7 @@ param(
   [int]$Device = 1,
   [ValidateSet(1, 2)][int]$Tp = 1,
   [string]$Bases = '32k,64k',
-  [string]$Model = 'D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx',
+  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
   [string]$Layout = 'trellis',
   [Parameter(Mandatory = $true)][string]$OutDir,
   [int]$Port = 8094,

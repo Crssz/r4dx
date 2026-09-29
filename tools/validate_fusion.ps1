@@ -35,13 +35,18 @@
 .PARAMETER Model
   Path to a .r4dx container with mtp.* weights (required for the --mtp 3 rows). Default: the production container matching build\win-hip's w4a16 group,
   read from build\win-hip\CMakeCache.txt (R4DX_W4A16_GROUP) by tools\r4dx_containers.ps1: group 64
-  (the default build) -> D:\models\r4dx\qwen38-27b-v6.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx.
+  (the default build) -> D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated
+  trellis mix4.5m, layout trellis), group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx (no longer on disk).
 
 .PARAMETER Layouts
-  Comma-separated layout list. Default: w4a16,w4a8,mxfp4 (bf16 excluded, see above). `trellis`
-  (docs/trellis-kernel.md 5.4, M5) needs -Model to be a trellis container, alone in the list (a
-  trellis container carries no other body layout): R4DX_DISABLE_EPILOGUE=1 also turns off the
-  trellis fused producers and shared input transforms (TrellisFusionEnabled, src/model/linear.h).
+  Comma-separated layout list. Default: `trellis` for the production container (docs/trellis-kernel.md
+  5.4, M5: it needs -Model to be a trellis container, alone in the list -- a trellis container carries
+  no other body layout; R4DX_DISABLE_EPILOGUE=1 also turns off the trellis fused producers and shared
+  input transforms, TrellisFusionEnabled, src/model/linear.h), or, when -Model names another container
+  explicitly, w4a16,w4a8,mxfp4 as before (bf16 excluded, see above). The fused epilogues exist only for
+  w4a8/mxfp4 (w4a16 is a trivial row): their 64-layer end-to-end rows need a multi-layout container,
+  none is kept on disk since the base v6 was retired (docs/huihui.md "Coverage");
+  tests/kernels/test_fused_quant.cpp covers the epilogue kernels in isolation.
 
 .PARAMETER MaxTokens
   --max-tokens for every generation. Default 40 -- long enough to exercise several decode/MTP-verify
@@ -55,7 +60,7 @@
 [CmdletBinding()]
 param(
     [string]$Model = "",  # "" = the group-matched production container (see .PARAMETER Model)
-    [string]$Layouts = "w4a16,w4a8,mxfp4",
+    [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [int]$MaxTokens = 40
 )
 
@@ -68,8 +73,14 @@ if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
 # The default container follows build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an
 # explicit -Model wins.
 . (Join-Path $PSScriptRoot "r4dx_containers.ps1")
+$ModelWasExplicit = [bool]$Model
 if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
-Write-Output "[validate_fusion] model=$Model"
+if (-not $Layouts) {
+    # The production container is a trellis container and loads with no other layout; an explicit
+    # -Model keeps the historical matrix (a multi-layout w4a16 / w4a8 / mxfp4 container).
+    $Layouts = if ($ModelWasExplicit) { "w4a16,w4a8,mxfp4" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
+}
+Write-Output "[validate_fusion] model=$Model layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "model container not found: $Model" }
 
 # Three prompt lengths (task requirement): short single-chunk, ~100-token multi-chunk prefill,

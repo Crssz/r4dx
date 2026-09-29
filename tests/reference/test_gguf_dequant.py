@@ -61,7 +61,7 @@ REAL_GGUF = Path(os.environ.get(
     "R4DX_TEST_GGUF",
     r"D:\huggingface\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots"
     r"\4ca720788d1e01f1bff70c033e0d0028fd02e502\Qwen3.8-27B-UD-Q4_K_XL.gguf"))
-REAL_MODEL_DIR = Path(os.environ.get("R4DX_TEST_MODEL_DIR", r"C:\AI\models\Qwen3.8-27B"))
+REAL_MODEL_DIR = Path(os.environ.get("R4DX_TEST_MODEL_DIR", r"D:\models\Huihui-Qwen3.8-27B-abliterated"))
 GGUF_PY = Path(os.environ.get("R4DX_GGUF_PY", str(Path.home() / "dev" / "ROCmFPX" / "gguf-py")))
 
 CHECKS = 0

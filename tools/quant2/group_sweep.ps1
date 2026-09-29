@@ -1,3 +1,6 @@
+# HISTORICAL (Q3 experiment driver): its defaults name the base checkpoint, base imatrix/kvcalib, hessian-v1
+# and the q3-sweep reference (2026-09-29: the base checkpoint was removed, docs/huihui.md "Retired files");
+# pass every path explicitly to re-run it on another model.
 # docs/quant2.md sections 5 and 5.3 (Q3): the per-tensor precision sweep. Each candidate makes ONE
 # change to one set of linears on top of the v6-style recipe, and is measured on its own by rung 4
 # (tool_teacher_forced_logprobs + kl_report.py) against a bf16 reference:

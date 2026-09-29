@@ -152,8 +152,12 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v1
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --rms-only --code-rev <commit> `
         --out-dir D:\\models\\r4dx\\hessian-v1
-    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v2 `
-        --rms-taps --wikitext-seqs 128 --code-seqs 48 --gen-file D:\\models\\r4dx\\corpus-v2\\samples.jsonl
+    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py `
+        --out-dir D:\\models\\r4dx\\huihui\\hessian-v2 --rms-taps --wikitext-seqs 128 --code-seqs 48 `
+        --code-rev 714955f --gen-file D:\\models\\r4dx\\corpus-v2\\samples.jsonl
+    (--model-dir defaults to the Huihui checkpoint, common.DEFAULT_MODEL_DIR; the base hessian-v2 and the
+    base checkpoint were retired on 2026-09-29, docs/huihui.md. The example paths of the older hessian-v1
+    lines above are historical.)
 
 `--dry-run` and `--write-fixture` never touch the GPU. See tools/reference/README.md
 ("hessian_capture.py") for the option list, the corpus, the gates and the expected runtime.

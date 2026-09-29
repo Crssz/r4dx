@@ -13,7 +13,7 @@ Run directly:
 
     <reference venv>\\python.exe tools\\reference\\dflash2_selftest.py
     <reference venv>\\python.exe tools\\reference\\dflash2_selftest.py --with-real-sanity \\
-        --target-dir C:\\AI\\models\\Qwen3.8-27B   # opt-in, see "real-target sanity" below
+        --target-dir D:\\models\\Huihui-Qwen3.8-27B-abliterated   # opt-in, see "real-target sanity" below
 """
 
 from __future__ import annotations

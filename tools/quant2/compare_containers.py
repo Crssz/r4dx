@@ -31,7 +31,7 @@ depend on the rest of the file. --no-metadata skips __metadata__. That is how a 
 (docs/trellis-kernel.md; `<base>.trellis.w|suh|svh` body linears, __metadata__.quant.trellis) is
 held against the w4a16 container whose non-body tensors it must reproduce, e.g.
 
-  python tools/quant2/compare_containers.py qwen38-27b-trellis-k4m.r4dx qwen38-27b-q2ab_hv2_q3.r4dx `
+  python tools/quant2/compare_containers.py <trellis container>.r4dx <the w4a16 container of the SAME model>.r4dx `
       --tensors "^(lm_head\\.w4a16\\.|mtp\\.|vision\\.|text\\.embed_tokens$)" --no-metadata
 
 A container with __metadata__.quant.trellis also gets a one-line trellis summary (linears per KB,

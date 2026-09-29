@@ -15,7 +15,7 @@ param(
   [ValidateSet(1, 2)][int]$Tp = 1,
   [string[]]$Lengths = @('8k', '32k'),
   [int]$Runs = 1,
-  [string]$Model = 'D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx',
+  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
   [string]$Layout = 'trellis',
   [string]$TasksDir = 'D:\models\r4dx\prefill-m0\tasks',
   [string]$OutDir = 'D:\models\r4dx\prefill-m0\ttft',

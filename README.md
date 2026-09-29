@@ -126,7 +126,7 @@ docs/           design notes and measurements
 
 r4dx is released under the [MIT License](LICENSE).
 
-The GPU kernels in `third_party/libr4d` come from
+The GPU kernels in `third_party/libr4d` (vendored as plain sources) come from
 [libr4d](https://codeberg.org/StillDeadcode/libr4d) by StillDeadcode and contributors. That project does
 not state a licence, so its code is used here for experimentation, credited to its authors and removed
 on request; see [NOTICE](NOTICE). The trellis GEMM and other additions built on top of it are part of r4dx.

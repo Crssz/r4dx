@@ -230,22 +230,13 @@ flags libr4d's `build_windows.ps1` uses for its Python-extension build, for the 
 it is matching `python312.dll`; here it is matching r4dx's own clang-cl objects). This combination
 linked clean on the first try.
 
-### git submodule over a local path
+### libr4d is vendored (history note)
 
-`git submodule add C:/Users/user/dev/libr4d third_party/libr4d` fails on current git
-(`fatal: transport 'file' not allowed`) unless file-transport is explicitly allowed for that one
-invocation:
-
-```powershell
-git -c protocol.file.allow=always submodule add C:/Users/user/dev/libr4d third_party/libr4d
-cd third_party/libr4d
-git -c protocol.file.allow=always fetch origin windows-llp64
-git checkout windows-llp64
-```
-
-`.gitmodules` also pins `branch = windows-llp64` so `git submodule update --remote` (if ever run)
-tracks the right branch. Checked-out commit: `7675605` ("Windows LLP64 sweep + Windows build
-script for r4d.pyd"), matching the pinned commit in the task brief.
+libr4d used to be a git submodule (`third_party/libr4d`, pinned to a commit of a local libr4d clone,
+which needed `-c protocol.file.allow=always` for a local-path `submodule add`). It is now vendored as
+plain sources under `third_party/libr4d`: the vendoring commit is a merge that carries libr4d's
+history (upstream commit `f47a8bc`, branch `linear`) and `git clone` needs no `--recurse-submodules`
+and no `submodule update`.
 
 ### r4d_registry links without the AR units
 
@@ -253,7 +244,7 @@ script for r4d.pyd"), matching the pinned commit in the task brief.
 all 25 registry rows including the 7 `ar_*` ones) to reference the all-reduce kernels **only as
 data** -- string literals (`"ar_oneshot_2rank_exact"`, ...) and a compile-time `enum` constant
 (`R4D_AR_TWOSHOT_WIDE_MAX_ELEMS`) in its constraint tables, never as a linked symbol. So `r4d_core`
-links clean with the `r4d_ar_*.hip` units excluded and **no patch to the libr4d submodule was
+links clean with the `r4d_ar_*.hip` units excluded and **no patch to the libr4d sources was
 needed** -- the "guard AR rows on a new `r4dx` branch" contingency in the task brief did not apply.
 
 ## The test
@@ -272,9 +263,6 @@ this machine: `rel_err=1.6772e-03` (threshold `< 2e-2`), **PASS**.
 ## Full command reference
 
 ```powershell
-# one-time
-git -c protocol.file.allow=always submodule update --init third_party/libr4d
-
 # build
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build.ps1                 # or: .\build.ps1 -Clean

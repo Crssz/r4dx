@@ -29,8 +29,8 @@ endif()
 
 set(LIBR4D_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libr4d")
 if(NOT EXISTS "${LIBR4D_DIR}/r4d.h")
-  message(FATAL_ERROR "third_party/libr4d submodule is empty; run "
-                       "'git submodule update --init third_party/libr4d' (branch windows-llp64)")
+  message(FATAL_ERROR "third_party/libr4d/r4d.h is missing; libr4d is vendored as plain sources "
+                       "under third_party/libr4d, so the checkout is incomplete")
 endif()
 
 set(R4D_BASE_FLAGS

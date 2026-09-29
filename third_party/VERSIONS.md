@@ -11,6 +11,10 @@ where the upstream cuts one, else by commit SHA of the default branch at fetch t
 | minja | `third_party/minja/minja.hpp`, `chat-template.hpp` | github.com/google/minja | `021c2293c187789ef13d56c6cfd89c9b134fd80f` |
 | stb_image | `third_party/stb/stb_image.h` | github.com/nothings/stb | `2c980bb59875b0d32144a71867fbdebb2f77cd20` |
 
+libr4d (the GPU kernels) is not header-only: it is vendored as plain sources under
+`third_party/libr4d` (tree of upstream libr4d commit `f47a8bce908b062c7af77f8dbd18b760c1d199e6`,
+branch `linear`, merged in with its history). It has no licence file upstream; see `NOTICE`.
+
 To refresh a dependency: re-download the file(s) at a new tag/commit, update this table, and
 re-run the build + tests.
 

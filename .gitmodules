@@ -1,4 +1,0 @@
-[submodule "third_party/libr4d"]
-	path = third_party/libr4d
-	url = C:/Users/user/dev/libr4d
-	branch = trellis

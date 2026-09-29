@@ -14,7 +14,7 @@ plain-C-ABI, torch-free HIP kernel set). MIT licensed.
 r4dx is its own weight container, its own C++ model graph, and its own server -- no vLLM, no
 ggml/GGUF. Third-party code is limited to header-only libraries vendored under `third_party/`
 (nlohmann/json, cpp-httplib, minja, stb_image). GPU kernels come from `third_party/libr4d`
-(a git submodule, branch `windows-llp64`), compiled into the static library target `r4d_core`.
+(vendored as plain sources, no submodule), compiled into the static library target `r4d_core`.
 
 ## Decisions (summary)
 
@@ -509,7 +509,7 @@ container).
 ## Layout
 
 ```
-third_party/    r4d_core (libr4d submodule) + vendored header-only deps
+third_party/    r4d_core (vendored libr4d) + vendored header-only deps
 src/core/       device/stream/buffer plumbing
 src/kernels/    r4dx-owned HIP kernels (rmsnorm, rope, silu_mul, kv paging, sampling, ...)
 src/model/      layer graph / forward pass

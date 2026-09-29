@@ -17,7 +17,7 @@ src/vision/     the vision tower (docs/vision.md). TWO targets on purpose: r4dx_
 src/convert/    HF checkpoint (safetensors + config.json) -> r4dx container (docs/container-format.md).
 src/server/     OpenAI-compatible chat completions API (cpp-httplib + nlohmann/json), streaming.
 src/cli/        single-process text-generation entry point.
-third_party/    r4d_core (the libr4d submodule, static lib) + vendored header-only deps.
+third_party/    r4d_core (vendored libr4d sources, static lib) + vendored header-only deps.
 ```
 
 `r4d_core` sits under `src/model` and `src/kernels`: the layer graph calls straight into the C ABI

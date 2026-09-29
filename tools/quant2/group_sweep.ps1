@@ -5,7 +5,7 @@
 # change to one set of linears on top of the v6-style recipe, and is measured on its own by rung 4
 # (tool_teacher_forced_logprobs + kl_report.py) against a bf16 reference:
 #   kind 'group'   the set moves from the build's default w4a16 group to another (--w4a16-group-rule
-#                  "<bases_regex>=<group>"; default: 32 and 128) -- a tensor class in one depth half,
+#                  "<bases_regex>=<group>"; default: 32) -- a tensor class in one depth half,
 #                  or lm_head;
 #   kind 'keep'    the set is written in bf16 (added to the recipe's --keep-bf16): a byte SPENDER;
 #   kind 'unkeep'  the set, which the recipe keeps in bf16, is quantized like every other linear
@@ -85,7 +85,7 @@
 # and candidates.json carries the baseline's own convert_args as the recipe.
 #
 # -CandidateFile takes [{"name", "kind", "bases_regex", "group"}, ...] instead of the default list
-# below: kind "group" (the default when absent, i.e. every older file) needs group 32/64/128; "keep"
+# below: kind "group" (the default when absent, i.e. every older file) needs group 32 or 64; "keep"
 # takes no group; "unkeep" may give the group the un-kept linears must land at (default: the build
 # default).
 param(
@@ -102,7 +102,7 @@ param(
     '--quant', 'search', '--imatrix', 'D:\models\r4dx\qwen38-27b.imatrix.npz',
     '--keep-bf16', '^text\.layers\.[0-9]+\.attn\.[kv]$'),
   [string[]]$ExtraArgs = @(),   # appended to -Recipe for every container, baseline included
-  [int[]]$Groups = @(32, 128),
+  [int[]]$Groups = @(32),
   [string]$CandidateFile = '',
   [string]$Only = '',           # regex over candidate names; the baseline is always included
   [double]$BudgetGib = 0,       # alloc_groups.py --budget-gib; 0 = the baseline's own weights
@@ -146,14 +146,9 @@ function Run([string]$name, [scriptblock]$cmd) {
   if ($LASTEXITCODE -ne 0) { throw "[q3] $name failed (exit $LASTEXITCODE), see $log" }
 }
 
-# The build default group (the one a candidate at that group would not change): read from the same
-# CMakeCache.txt the converter and the tool were built from, like the other scripts' -Model lookup.
-$cache = Join-Path $repo 'build\win-hip\CMakeCache.txt'
+# The default w4a16 group (the one a candidate at that group would not change): r4dx_convert's
+# kW4A16Group.
 $defaultGroup = 64
-if (Test-Path $cache) {
-  $m = Select-String -Path $cache -Pattern '^R4DX_W4A16_GROUP:STRING=(\d+)' | Select-Object -First 1
-  if ($m) { $defaultGroup = [int]$m.Matches[0].Groups[1].Value }
-}
 
 # ---- the recipe's --keep-bf16 ------------------------------------------------------------------
 # r4dx-convert's --keep-bf16 is single-valued (the last one wins), so the recipe's effective keep regex
@@ -244,9 +239,9 @@ foreach ($c in $candidates) {
   $seen[$c.name] = $true
   if (-not $c.bases_regex) { throw "[q3] candidate $($c.name) has no bases_regex" }
   switch ($c.kind) {
-    'group' { if (@(32, 64, 128) -notcontains $c.group) { throw "[q3] candidate $($c.name): group $($c.group) is not 32/64/128" } }
+    'group' { if (@(32, 64) -notcontains $c.group) { throw "[q3] candidate $($c.name): group $($c.group) is not 32/64" } }
     'keep' { }
-    'unkeep' { if (@(32, 64, 128) -notcontains $c.group) { throw "[q3] candidate $($c.name): group $($c.group) is not 32/64/128" } }
+    'unkeep' { if (@(32, 64) -notcontains $c.group) { throw "[q3] candidate $($c.name): group $($c.group) is not 32/64" } }
     default { throw "[q3] candidate $($c.name): kind '$($c.kind)' is not group, keep or unkeep" }
   }
 }

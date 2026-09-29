@@ -2,7 +2,7 @@
 // (src/convert/include/r4dx_convert/w4a16_groups.hpp, docs/quant2.md section 5 "Q3"): the converter
 // half of per-tensor w4a16 groups. CPU-only, no checkpoint, no GPU. Gates:
 //
-//   1. PARSING: "<regex>=<g>" split at the last '=', g in {32, 64, 128}; everything else -- no '=',
+//   1. PARSING: "<regex>=<g>" split at the last '=', g in {32, 64}; everything else -- no '=',
 //      an empty half, a non-numeric or unsupported group, an invalid regex -- throws naming the flag.
 //   2. SELECTION: regex_search over the real container base names, FIRST matching rule wins, a rule
 //      may name the default group (an exception ahead of a broad rule), unmatched -> the default.
@@ -13,7 +13,7 @@
 //      --keep-bf16's "would have been" bytes follow the linear's resolved group.
 //   5. EMISSION: `<base>.w4a16.wsz.g<g>` at a non-default group, the bare name at the default, with
 //      exactly the quantizer+packer bytes at that group; the other layouts untouched; LDLQ at g32 and
-//      g128 through EmitLinearLayouts equals QuantizeInt4AsymmetricLdlq at that group.
+//      g64 through EmitLinearLayouts equals QuantizeInt4AsymmetricLdlq at that group.
 //   6. THE EXE (when r4dx-convert is built): --selftest without rules reproduces the pre-Q3
 //      containers byte for byte (sha256 of the whole file, golden values from the converter as of
 //      commit 95cc327 at the default group 64); with rules it writes the renamed tensor, the
@@ -73,8 +73,8 @@ LayoutSet Set(bool w4a16, bool bf16, int group = kW4A16Group) {
   return ls;
 }
 
-// The one non-default group every test below can rely on, whatever R4DX_W4A16_GROUP this build is.
-constexpr int kOther = kW4A16Group == 32 ? 64 : 32;
+// The one non-default group every test below relies on (the default is 64).
+constexpr int kOther = 32;
 
 std::vector<std::string> RealBaseNames() {
   return {
@@ -166,11 +166,11 @@ void TestParsing() {
           r.pattern == "mlp\\.down$" && r.group == 32 && r.spec == "mlp\\.down$=32");
   }
   {
-    const W4a16GroupRule r = ParseW4a16GroupRule("a=b=128");
-    Check("split at the LAST '=': 'a=b=128' -> pattern 'a=b', group 128",
-          r.pattern == "a=b" && r.group == 128);
+    const W4a16GroupRule r = ParseW4a16GroupRule("a=b=64");
+    Check("split at the LAST '=': 'a=b=64' -> pattern 'a=b', group 64",
+          r.pattern == "a=b" && r.group == 64);
   }
-  for (int g : {32, 64, 128}) {
+  for (int g : {32, 64}) {
     Check("group " + std::to_string(g) + " accepted",
           ParseW4a16GroupRule("x=" + std::to_string(g)).group == g);
   }
@@ -180,10 +180,10 @@ void TestParsing() {
     Check(std::string("malformed '") + s + "' throws naming the flag",
           Has(m, "--w4a16-group-rule") && Has(m, "<group>"));
   }
-  for (const char* s : {"mlp=16", "mlp=48", "mlp=96", "mlp=256", "mlp=0"}) {
+  for (const char* s : {"mlp=16", "mlp=48", "mlp=96", "mlp=128", "mlp=256", "mlp=0"}) {
     const std::string m = ThrowMessage([&] { ParseW4a16GroupRule(s); });
-    Check(std::string("unsupported group '") + s + "' throws naming 32, 64, 128",
-          Has(m, "--w4a16-group-rule") && Has(m, "32, 64, 128"));
+    Check(std::string("unsupported group '") + s + "' throws naming 32, 64",
+          Has(m, "--w4a16-group-rule") && Has(m, "32, 64"));
   }
   {
     const std::string m = ThrowMessage([] { ParseW4a16GroupRule("text\\.layers\\.[0-7=32"); });
@@ -215,15 +215,15 @@ void TestSelection() {
   std::printf("---- 2. selection (first match wins) ----\n");
   const W4a16GroupRules rules({"^text\\.layers\\.63\\.mlp\\.down$=" + std::to_string(kW4A16Group),
                                "^text\\.layers\\.([0-9]|[12][0-9]|3[01])\\.mlp\\.down$=32",
-                               "mlp\\.down$=128", "^lm_head$=128"});
+                               "mlp\\.down$=32", "^lm_head$=32"});
   const std::map<std::string, int> want = {
       {"text.layers.0.gdn.in_proj_qkv", kW4A16Group}, {"text.layers.0.gdn.in_proj_z", kW4A16Group},
       {"text.layers.0.gdn.out_proj", kW4A16Group},    {"text.layers.0.mlp.gate_up", kW4A16Group},
       {"text.layers.0.mlp.down", 32},                 {"text.layers.3.attn.qg", kW4A16Group},
       {"text.layers.3.attn.o", kW4A16Group},          {"text.layers.3.mlp.down", 32},
-      {"text.layers.31.mlp.down", 32},                {"text.layers.32.mlp.down", 128},
-      {"text.layers.63.mlp.down", kW4A16Group},       {"mtp.mlp.down", 128},
-      {"mtp.draft_head.lm_head", kW4A16Group},        {"lm_head", 128},
+      {"text.layers.31.mlp.down", 32},                {"text.layers.32.mlp.down", 32},
+      {"text.layers.63.mlp.down", kW4A16Group},       {"mtp.mlp.down", 32},
+      {"mtp.draft_head.lm_head", kW4A16Group},        {"lm_head", 32},
   };
   bool all = true;
   for (const auto& name : RealBaseNames()) {
@@ -235,12 +235,14 @@ void TestSelection() {
   }
   Check("depth-half rules + a default-group exception resolve as written", all);
   Check("MatchIndex: layer 63's exception is rule 0, not the broad rule 2",
-        rules.MatchIndex("text.layers.63.mlp.down") == 0);
+        rules.MatchIndex("text.layers.63.mlp.down") == 0 &&
+            rules.MatchIndex("text.layers.0.mlp.down") == 1 &&
+            rules.MatchIndex("text.layers.32.mlp.down") == 2);
   Check("MatchIndex: unmatched -> -1", rules.MatchIndex("text.layers.3.attn.o") == -1);
   // Order matters: the broad rule first shadows the narrow one.
-  const W4a16GroupRules shadowed({"mlp\\.down$=128", "^text\\.layers\\.0\\.mlp\\.down$=32"});
+  const W4a16GroupRules shadowed({"mlp\\.down$=64", "^text\\.layers\\.0\\.mlp\\.down$=32"});
   Check("broad rule first shadows a later narrow rule",
-        shadowed.GroupFor("text.layers.0.mlp.down") == 128);
+        shadowed.GroupFor("text.layers.0.mlp.down") == 64);
   // Apply touches only a w4a16 LayoutSet.
   const LayoutSet no_w4a16 = rules.Apply("text.layers.0.mlp.down", Set(false, true));
   Check("Apply on a set without w4a16 keeps the default group",
@@ -254,7 +256,7 @@ void TestSelection() {
 
 void TestPlanning() {
   std::printf("---- 3. planning ----\n");
-  W4a16GroupRules rules({"mlp\\.down$=" + std::to_string(kOther), "attn\\.o$=128",
+  W4a16GroupRules rules({"mlp\\.down$=" + std::to_string(kOther), "attn\\.o$=32",
                          "gdn\\.out_proj$=" + std::to_string(kW4A16Group), "nonesuch$=32"});
   const int N = 64, K = 512;
   auto plan = [&](const std::string& base, int64_t n, int64_t k, bool bf16, bool w4a16 = true) {
@@ -268,20 +270,19 @@ void TestPlanning() {
   plan("text.layers.0.gdn.in_proj_z", N, K, true);   // unmatched: bf16 is fine
   plan("text.layers.2.mlp.down", N, K, false, /*w4a16=*/false);  // e.g. --keep-bf16'd: skipped
 
-  std::map<std::string, int> want = {{"text.layers.0.mlp.down", kOther},
-                                     {"text.layers.1.mlp.down", kOther}};
-  if (kW4A16Group != 128) want["text.layers.3.attn.o"] = 128;
+  const std::map<std::string, int> want = {{"text.layers.0.mlp.down", kOther},
+                                           {"text.layers.1.mlp.down", kOther},
+                                           {"text.layers.3.attn.o", 32}};
   Check("map holds exactly the non-default linears", rules.Groups() == want);
   const nlohmann::json gj = rules.GroupsJson();
   Check("GroupsJson mirrors the map", gj.size() == want.size() &&
                                           gj.at("text.layers.0.mlp.down").get<int>() == kOther);
   const int64_t nk = static_cast<int64_t>(N) * K;
-  int64_t extra = 2 * (nk / kOther * 4 - nk / kW4A16Group * 4);
-  if (kW4A16Group != 128) extra += nk / 128 * 4 - nk / kW4A16Group * 4;
+  const int64_t extra = 3 * (nk / kOther * 4 - nk / kW4A16Group * 4);
   Check("ExtraBytes = sum of per-linear wsz deltas vs the default", rules.ExtraBytes() == extra);
   Check("RulesJson keeps the rules in order", rules.RulesJson().size() == 4 &&
                                                   rules.RulesJson()[1].get<std::string>() ==
-                                                      "attn\\.o$=128");
+                                                      "attn\\.o$=32");
   {
     std::ostringstream log, warn;
     rules.Report(log, warn);
@@ -307,12 +308,12 @@ void TestPlanning() {
   }
   // Shape checks name the rule. K = 96 is a multiple of 32 but not of the 64-K packed block.
   {
-    W4a16GroupRules r({"x$=32", "y$=128"});
+    W4a16GroupRules r({"x$=32", "y$=32"});
     const std::string m1 = ThrowMessage([&] { r.Plan("t.x", 64, 96, r.Apply("t.x", Set(true, false))); });
     Check("g32 with K % 64 != 0 is refused, naming the rule and the packed block",
           Has(m1, "'x$=32'") && Has(m1, "64-K packed block"));
-    const std::string m2 = ThrowMessage([&] { r.Plan("t.y", 64, 192, r.Apply("t.y", Set(true, false))); });
-    Check("g128 with K % 128 != 0 is refused", Has(m2, "'y$=128'") && Has(m2, "group 128"));
+    const std::string m2 = ThrowMessage([&] { r.Plan("t.y", 64, 48, r.Apply("t.y", Set(true, false))); });
+    Check("g32 with K % 32 != 0 is refused", Has(m2, "'y$=32'") && Has(m2, "multiple of the group 32"));
     const std::string m3 = ThrowMessage([&] { r.Plan("t.x", 40, 256, r.Apply("t.x", Set(true, false))); });
     Check("N % 16 != 0 is refused", Has(m3, "N is not a multiple of 16"));
     // PlanLinearLayouts is the backstop for any caller that bypasses the rules.
@@ -322,7 +323,7 @@ void TestPlanning() {
     Check("PlanLinearLayouts refuses g32 at K % 64 != 0 too", Has(m4, "not divisible by 64"));
     const std::string m5 =
         ThrowMessage([&] { PlanLinearLayouts(w, "t", 64, 512, Set(true, false, 48)); });
-    Check("PlanLinearLayouts refuses an uninstantiated group", Has(m5, "32, 64, 128"));
+    Check("PlanLinearLayouts refuses an uninstantiated group", Has(m5, "32, 64"));
   }
 }
 
@@ -332,7 +333,7 @@ void TestAccounting() {
   std::printf("---- 4. byte accounting with mixed groups ----\n");
   const int N = 64, K = 512;
   bool all = true;
-  for (int g : {32, 64, 128}) {
+  for (int g : {32, 64}) {
     const LayoutSet sets[] = {Set(true, false, g), Set(true, true, g)};
     for (const LayoutSet& ls : sets) {
       ContainerWriter w;
@@ -345,12 +346,12 @@ void TestAccounting() {
       }
     }
   }
-  Check("LinearLayoutBytes == PlannedDataBytes at g32/g64/g128 (6 sets)", all);
+  Check("LinearLayoutBytes == PlannedDataBytes at g32/g64 (4 sets)", all);
   // A whole mixed-group "model" planned into ONE writer: the sum still agrees.
   {
     ContainerWriter w;
     uint64_t predicted = 0;
-    const int groups[] = {32, 64, 128, kW4A16Group};
+    const int groups[] = {32, 64, 32, kW4A16Group};
     for (int i = 0; i < 4; ++i) {
       const LayoutSet ls = Set(true, false, groups[i]);
       PlanLinearLayouts(w, "l" + std::to_string(i), N, K, ls);
@@ -362,8 +363,8 @@ void TestAccounting() {
   const uint64_t nk = static_cast<uint64_t>(N) * K;
   Check("w4a16 at g32 = 4.0 + 1.0 bits/weight",
         LinearLayoutBytes(N, K, Set(true, false, 32)) == nk / 2 + nk / 8);
-  Check("w4a16 at g128 = 4.0 + 0.25 bits/weight",
-        LinearLayoutBytes(N, K, Set(true, false, 128)) == nk / 2 + nk / 32);
+  Check("w4a16 at g64 = 4.0 + 0.5 bits/weight",
+        LinearLayoutBytes(N, K, Set(true, false, 64)) == nk / 2 + nk / 16);
   // --keep-bf16's "would have been" is priced at the linear's resolved group.
   {
     W4a16GroupRules rules({"attn\\.o$=32"});
@@ -375,9 +376,9 @@ void TestAccounting() {
     Check("keep-bf16 ExtraBytes against a g32 linear is bf16 - (wq + N*K/32 dwords)",
           sel.ExtraBytes() == want);
     KeepBf16Selector sel2("attn\\.o$");
-    sel2.Record("text.layers.3.attn.o", N, K, Set(true, false, 128), log);
-    Check("...and differs from the same linear at g128 by exactly the wsz delta",
-          sel2.ExtraBytes() - sel.ExtraBytes() == static_cast<int64_t>(nk / 8 - nk / 32));
+    sel2.Record("text.layers.3.attn.o", N, K, Set(true, false, 64), log);
+    Check("...and differs from the same linear at g64 by exactly the wsz delta",
+          sel2.ExtraBytes() - sel.ExtraBytes() == static_cast<int64_t>(nk / 8 - nk / 16));
   }
 }
 
@@ -388,14 +389,12 @@ void TestEmission() {
   Check("W4a16WszName at the default group is the historical name",
         W4a16WszName("t", kW4A16Group) == "t.w4a16.wsz");
   Check("W4a16WszName at another group carries .g<g>",
-        W4a16WszName("t", 32) == (kW4A16Group == 32 ? "t.w4a16.wsz" : "t.w4a16.wsz.g32") &&
-            W4a16WszName("t.x", 128) ==
-                (kW4A16Group == 128 ? "t.x.w4a16.wsz" : "t.x.w4a16.wsz.g128"));
+        W4a16WszName("t", 32) == "t.w4a16.wsz.g32" && W4a16WszName("t.x", 32) == "t.x.w4a16.wsz.g32");
 
-  const int N = 48, K = 256;  // 3 row tiles; K a multiple of 32, 64 and 128
+  const int N = 48, K = 256;  // 3 row tiles; K a multiple of 32 and 64
   const std::vector<float> w = RandomNormal(static_cast<size_t>(N) * K, 17);
 
-  for (int g : {32, 64, 128}) {
+  for (int g : {32, 64}) {
     const std::string tag = " g" + std::to_string(g);
     const std::string path = TempPath("r4dx_test_w4a16_groups_g.r4dx");
     const LayoutSet ls = Set(true, false, g);
@@ -425,7 +424,7 @@ void TestEmission() {
     std::remove(path.c_str());
   }
 
-  // LDLQ through EmitLinearLayouts at g32 and g128: the linear's own group reaches the quantizer.
+  // LDLQ through EmitLinearLayouts at g32 and g64: the linear's own group reaches the quantizer.
   {
     // H = X^T X / rows on AR(1)-correlated inputs, so error feedback has something to act on.
     const int rows = 1024;
@@ -444,7 +443,7 @@ void TestEmission() {
       }
     }
     const LdlqFactor f = FactorHessian(H, K, 0.01f, 4);
-    for (int g : {32, 128}) {
+    for (int g : {32, 64}) {
       const std::string tag = " g" + std::to_string(g);
       const std::string path = TempPath("r4dx_test_w4a16_groups_ldlq.r4dx");
       const LayoutSet ls = Set(true, false, g);
@@ -470,13 +469,13 @@ void TestEmission() {
                 c.tensors.at(wsz_name) == Bytes(PackW4A16Scales(scale, zero, N, K, g)));
       std::remove(path.c_str());
     }
-    std::vector<uint8_t> q32, z32, q128, z128;
-    std::vector<float> s32, s128;
+    std::vector<uint8_t> q32, z32, q64, z64;
+    std::vector<float> s32, s64;
     QuantizeInt4AsymmetricLdlq(w.data(), N, K, 32, f, 3, q32, s32, z32);
-    QuantizeInt4AsymmetricLdlq(w.data(), N, K, 128, f, 3, q128, s128, z128);
-    Check("LDLQ g32 and g128 produce different codes and N*K/g scales",
-          q32 != q128 && s32.size() == static_cast<size_t>(N) * K / 32 &&
-              s128.size() == static_cast<size_t>(N) * K / 128);
+    QuantizeInt4AsymmetricLdlq(w.data(), N, K, 64, f, 3, q64, s64, z64);
+    Check("LDLQ g32 and g64 produce different codes and N*K/g scales",
+          q32 != q64 && s32.size() == static_cast<size_t>(N) * K / 32 &&
+              s64.size() == static_cast<size_t>(N) * K / 64);
   }
 }
 
@@ -523,10 +522,10 @@ void TestExe(const std::string& fixtures) {
 
   // (a) No rules: the whole file is what the converter wrote before per-tensor groups existed.
   // TensorDigest of `r4dx-convert --selftest ... --threads 3 <args>` on fixtures/input.safetensors,
-  // from the build of commit bcebb21 (R4DX_W4A16_GROUP=64, run with the equivalent w4a16-only
+  // from the build of commit bcebb21 (w4a16 group 64, run with the equivalent w4a16-only
   // arguments: that build's default also wrote the retired layouts). The earlier whole-file sha256s
   // were taken at 95cc327, before per-tensor groups were written.
-  if (kW4A16Group == 64) {
+  {
     const struct {
       const char* name;
       std::string args;
@@ -548,9 +547,6 @@ void TestExe(const std::string& fixtures) {
             rc == 0 && sha == gcase.sha);
       if (sha != gcase.sha) std::printf("  rc=%d sha=%s\n%s", rc, sha.c_str(), ReadText(log).c_str());
     }
-  } else {
-    std::printf("SKIP (a) pre-Q3 golden sha256s were taken at group 64; this build is %d\n",
-                kW4A16Group);
   }
 
   // (b) A rule at a non-default group, --no-bf16: renamed wsz, the map, the run record.
@@ -597,9 +593,8 @@ void TestExe(const std::string& fixtures) {
           rc == 0 && c.ok && plain.ok && c.tensors == plain.tensors &&
               !c.header["__metadata__"]["quant"]["w4a16"].contains("groups"));
   }
-  // (d) LDLQ + a g32 / g128 rule end to end.
-  for (int g : {32, 128}) {
-    if (g == kW4A16Group) continue;
+  // (d) LDLQ + a g32 rule end to end.
+  for (int g : {32}) {
     const int rc = Run(base_args + " --layouts w4a16 --no-bf16 --hessian-dir \"" + hdir +
                            "\" --ldlq .* --w4a16-group-rule \"selftest=" + std::to_string(g) + "\"",
                        log);
@@ -614,7 +609,9 @@ void TestExe(const std::string& fixtures) {
     Check("(e) non-default group with the bf16 companion: nonzero exit, names --no-bf16",
           rc != 0 && Has(ReadText(log), "--no-bf16"));
     rc = Run(base_args + " --layouts w4a16 --no-bf16 --w4a16-group-rule \"selftest=48\"", log);
-    Check("(e) group 48: nonzero exit", rc != 0 && Has(ReadText(log), "32, 64, 128"));
+    Check("(e) group 48: nonzero exit", rc != 0 && Has(ReadText(log), "32, 64"));
+    rc = Run(base_args + " --layouts w4a16 --no-bf16 --w4a16-group-rule \"selftest=128\"", log);
+    Check("(e) group 128: nonzero exit", rc != 0 && Has(ReadText(log), "32, 64"));
     rc = Run("--dflash-gguf \"" + fixtures + "/dflash_mini.gguf\" --out \"" + out +
                  "\" --w4a16-group-rule \"x=32\"",
              log);

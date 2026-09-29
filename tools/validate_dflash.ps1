@@ -47,14 +47,13 @@
   requires -AllowBatchedVerifyDivergence -- a human decision, not a default).
 
 .PARAMETER Model
-  Path to the real 64-layer target container. Default: the production container matching build\win-hip's w4a16 group,
-  read from build\win-hip\CMakeCache.txt (R4DX_W4A16_GROUP) by tools\r4dx_containers.ps1: group 64
-  (the default build) -> D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated
-  trellis mix4.5m, layout trellis), group 128 -> D:\models\r4dx\qwen38-27b-v3.r4dx (no longer on disk).
+  Path to the real 64-layer target container. Default: the production container, chosen by
+  tools\r4dx_containers.ps1: D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui
+  abliterated trellis mix4.5m, layout trellis).
 
 .PARAMETER Dflash
-  Path to the DFlash2 draft container to test. Default: the w4a16 draft container matching the same group -- group 64 ->
-  D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx, group 128 -> D:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx.
+  Path to the DFlash2 draft container to test. Default: the w4a16 group-64 draft container,
+  D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx.
   (w4a16 is the task's own primary ask -- item 4 says "w4a16 draft" explicitly.)
 
 .PARAMETER Layouts
@@ -189,16 +188,15 @@ function Exit-Validation([int]$code) {
 
 $Cli = "build\win-hip\src\cli\r4dx-cli.exe"
 if (-not (Test-Path $Cli)) { throw "$Cli not found -- run .\build.ps1 first" }
-# Default containers follow build\win-hip's w4a16 group (tools\r4dx_containers.ps1); an explicit
-# -Model/-Dflash wins.
+# Default containers come from tools\r4dx_containers.ps1; an explicit -Model/-Dflash wins.
 . (Join-Path $PSScriptRoot "r4dx_containers.ps1")
 $ModelWasExplicit = [bool]$Model
-if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
-if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter -BuildDir "build\win-hip" }
+if (-not $Model) { $Model = Get-R4dxProductionTarget }
+if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter }
 if (-not $Layouts) {
     # The production container is a trellis container and loads with no other layout; an explicit
     # -Model keeps the historical matrix (a multi-layout w4a16 container).
-    $Layouts = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
+    $Layouts = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout }
 }
 Write-Output "[validate_dflash] target=$Model draft=$Dflash layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "target container not found: $Model" }

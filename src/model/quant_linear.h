@@ -23,10 +23,9 @@ enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4 };
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
 
-// The w4a16 group size (K per (scale, zero) pair) is a BUILD OPTION -- R4DX_W4A16_GROUP, which
-// reaches r4d_gemm_w4a16_nt_m64 as -DR4D_GEMM_W4_GROUP and r4dx-convert as kW4A16Group (root
-// CMakeLists.txt has the full story). The kernel derives the .w4a16.wsz stride from the group it
-// was COMPILED with; a container carries the group it was PACKED with in
+// The w4a16 default group size (K per (scale, zero) pair) is 64, a compile-time constant of
+// r4d_gemm_w4a16_nt_m64 (R4D_GEMM_W4_GROUP) and of r4dx-convert (kW4A16Group; root CMakeLists.txt has
+// the full story). The kernel derives the .w4a16.wsz stride from the group it was COMPILED with; a container carries the group it was PACKED with in
 // __metadata__.quant.w4a16.group. If the two disagree every w4a16 GEMM silently reads scales for
 // the wrong K range -- no crash, no NaN, just wrong numbers -- so every container loader calls
 // this before touching a byte and it throws naming BOTH numbers. Callers gate it on the w4a16
@@ -55,8 +54,7 @@ inline void CheckW4a16Group(int container_group, const std::string& what) {
       " but this build's r4d_gemm_w4a16_nt_m64 kernel reads group=" +
       std::to_string(kernel_group) +
       " -- the .w4a16.wsz scales would be read at the wrong stride, producing wrong numbers with "
-      "no other symptom. Reconfigure with -DR4DX_W4A16_GROUP=" + std::to_string(container_group) +
-      " in its own build directory, or re-convert the container with this build's r4dx-convert.");
+      "no other symptom. Re-convert the container with this build's r4dx-convert.");
 }
 
 // quant2 Q3 (docs/quant2.md section 5.1): a linear named in __metadata__.quant.w4a16.groups is packed
@@ -97,9 +95,8 @@ struct QuantLinear {
   // layout == kW4a16: nibble-packed, WMMA-fragment-permuted weight, uint8[N*K/2].
   core::DeviceBuffer<uint8_t> wq;
   // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is
-  // w4a16_group below -- by default the group this build was configured with (R4DX_W4A16_GROUP,
-  // default 64 since Milestone 11); see CheckW4a16Group above, which is what guarantees the
-  // container agrees with the kernel.
+  // w4a16_group below -- by default the group this build's kernel is compiled for (64); see
+  // CheckW4a16Group above, which is what guarantees the container agrees with the kernel.
   core::DeviceBuffer<uint32_t> w4a16_wsz;
   // layout == kW4a16: this linear's own group (docs/quant2.md section 5.1), or 0 = "this build's
   // default", r4d_gemm_w4a16_nt_m64_group(). 0 is what every QuantLinear built before per-tensor

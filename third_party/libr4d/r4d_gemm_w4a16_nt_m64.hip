@@ -58,9 +58,9 @@
 // exact.  Both parameters live in one dword per (row, group): the f16 scale in the low half and the
 // f16 of -(1024 + zero) in the high half, ready to be broadcast into a v_pk_add_f16.
 //
-// THE GROUP IS A TEMPLATE PARAMETER.  G is 32, 64 or 128 through r4d_gemm_w4a16_nt_m64_g, and the
-// build default R4D_GEMM_W4_GROUP through r4d_gemm_w4a16_nt_m64, which is the same template at that
-// G -- so a caller that never asks for a group gets the instruction stream it always got.  The
+// THE GROUP IS A TEMPLATE PARAMETER.  G is 32 or 64 through r4d_gemm_w4a16_nt_m64_g, and the
+// build default R4D_GEMM_W4_GROUP (64) through r4d_gemm_w4a16_nt_m64, which is the same template at
+// that G -- so a caller that never asks for a group gets the instruction stream it always got.  The
 // packed weight does not depend on G at all (a 64-K block is 64 K whatever the group), only the
 // Wsz stride does, which is what lets one model mix groups tensor by tensor.  G >= 64 is the
 // original loop: a group is bpg = G/64 whole packed blocks.  G = 32 splits a block instead -- k
@@ -77,7 +77,7 @@
 
 #define R4D_GEMM_W4_MAX_M 64
 #ifndef R4D_GEMM_W4_GROUP
-#define R4D_GEMM_W4_GROUP 128        // build default K per (scale, zero) pair: what the ungrouped
+#define R4D_GEMM_W4_GROUP 64         // build default K per (scale, zero) pair: what the ungrouped
 #endif                               // entry point and _group() serve
 #define R4D_GEMM_W4_KPB   64         // K per packed block: 4 k steps, 16 bytes per lane
 #define WAVE32 32
@@ -412,11 +412,11 @@ void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M,
 
 // Any instantiated group, chosen per call -- one model can carry tensors packed at different
 // groups, and the packed weight is the same bytes whichever group its scales were fitted at.
-// Exactly 32, 64 and 128: a build default outside that set (192, 256, ...) is served by
+// Exactly 32 and 64: a build default outside that set (128, 192, ...) is served by
 // r4d_gemm_w4a16_nt_m64 alone, not here.  Asking for the build default here, when it is one of the
-// three, runs the same kernel r4d_gemm_w4a16_nt_m64 does.
+// two, runs the same kernel r4d_gemm_w4a16_nt_m64 does.
 int r4d_gemm_w4a16_nt_m64_has_group(int group) {
-  return group == 32 || group == 64 || group == 128;
+  return group == 32 || group == 64;
 }
 
 void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K,
@@ -426,12 +426,11 @@ void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int6
   switch (group) {
     case 32: LAUNCH_G(32); return;
     case 64: LAUNCH_G(64); return;
-    case 128: LAUNCH_G(128); return;
     default: break;
   }
 #undef LAUNCH_G
   throw std::runtime_error("r4d gemm_w4a16_nt_m64_g: group " + std::to_string(group) +
-                           " is not instantiated (32, 64, 128; the build default " +
+                           " is not instantiated (32, 64; the build default " +
                            std::to_string(R4D_GEMM_W4_GROUP) +
                            " is r4d_gemm_w4a16_nt_m64's)");
 }

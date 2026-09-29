@@ -20,10 +20,10 @@ not catch), the exact condvar hand-off and a progress-based watchdog (2.2), the 
 two-GPU test opt-in (10.1) and DFlash losslessness gates under TP (G12).
 
 **Status note.** Sections 0-11 describe the design as it stands: the shipped layouts are bf16, w4a16
-and trellis. Appendix B and C are the dated review record and decision log of the 2026-09-24 design
-and its measurements. They also cover two int8/fp8-activation layouts that were removed from the code
-later, so their layout names, numbers and file references are history, and the code and tests are
-authoritative where they differ.
+(group 32 or 64) and trellis. Appendix B and C are the dated review record and decision log of the
+2026-09-24 design and its measurements. They also cover two int8/fp8-activation layouts and a
+group-128 build that were removed from the code later, so their layout names, numbers and file
+references are history, and the code and tests are authoritative where they differ.
 
 ---
 

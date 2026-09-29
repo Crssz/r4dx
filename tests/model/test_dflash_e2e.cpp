@@ -41,9 +41,8 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-// Real 64-layer container + real w4a16 DFlash2 draft container, the production pair packed at this
-// build's own w4a16 group (group 64: the Huihui trellis mix4.5m, layout trellis, + dflash2-w4a16-g64;
-// group 128: qwen38-27b-v3 + dflash2-w4a16, absent -> SKIP) -- tests/model/test_container_path.h.
+// Real 64-layer container + real w4a16 DFlash2 draft container, the production pair (the Huihui
+// trellis mix4.5m, layout trellis, + dflash2-w4a16-g64) -- tests/model/test_container_path.h.
 const char* kTargetContainerPath = r4dx_test::ProductionTargetPath();
 const char* kDflashContainerPath = r4dx_test::ProductionDrafterPath();
 constexpr int64_t kDflashK = 7;

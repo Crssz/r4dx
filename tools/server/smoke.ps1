@@ -8,7 +8,7 @@
   Only HIP device 1 may be used (project GPU rule) -- sets HIP_VISIBLE_DEVICES=1 before starting
   r4dx-server.exe; the one exception is -Tp 2 in real mode, which uses both GPUs by design (docs/tp.md
   9.2) under a TDR watch (see -Tp). Defaults to the 4-layer test container (qwen38-27b-l4-bf16.r4dx, --layout
-  w4a16, in the directory matching build\<Preset>'s w4a16 group -- see -Model) -- that model's
+  w4a16, the group-64 copy in D:\models\r4dx\g64 -- see -Model) -- that model's
   text is nonsense (4 of 64 layers, arbitrary quantized-layout weights on a model that was never actually trained/converted for real use at 4 layers), so this
   script only checks response/SSE *shapes* and token counts, never the generated text itself.
   Pass -Model/-Layout to point at the real 64-layer container instead for a real-answer smoke run
@@ -16,14 +16,11 @@
 
 .PARAMETER Model
   Path to a .r4dx container. Default: the 4-layer test container qwen38-27b-l4-bf16.r4dx packed at
-  build\<Preset>'s w4a16 group, which tools\r4dx_containers.ps1 reads from
-  build\<Preset>\CMakeCache.txt (R4DX_W4A16_GROUP): group 64 (the default build) ->
-  D:\models\r4dx\g64\qwen38-27b-l4-bf16.r4dx, group 128 (-Preset win-hip-g128) ->
-  D:\models\r4dx\qwen38-27b-l4-bf16.r4dx; R4DX_TEST_CONTAINER_DIR, when set, overrides the directory
-  exactly as it does for ctest (tests/model/test_container_path.h). For a real-answer run pass the
-  production container matching the build: D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
-  (the Huihui abliterated trellis mix4.5m, with -Layout trellis) on the default build; the group-128
-  build has no production container any more.
+  w4a16 group 64, D:\models\r4dx\g64\qwen38-27b-l4-bf16.r4dx (tools\r4dx_containers.ps1);
+  R4DX_TEST_CONTAINER_DIR, when set, overrides the directory exactly as it does for ctest
+  (tests/model/test_container_path.h). For a real-answer run pass the production container:
+  D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated trellis mix4.5m,
+  with -Layout trellis).
 
 .PARAMETER Layout
   Body layout. Default: w4a16 (the 4-layer default container). The 64-layer production container is
@@ -41,8 +38,8 @@
 .PARAMETER Mtp
   Passed to r4dx-server's --mtp (r4dx::model::ModelOptions::mtp_draft_k). 0 (default) disables MTP
   entirely. >0 requires -Model to be an MTP-converted container (docs/mtp.md's mtp.* weights) --
-  e.g. D:\models\r4dx\g64\qwen38-27b-l4-mtp.r4dx (4-layer test container, default group-64 build;
-  D:\models\r4dx\qwen38-27b-l4-mtp.r4dx on win-hip-g128) or the real 64-layer container with
+  e.g. D:\models\r4dx\g64\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
+  container with
   -Mtp 3 (this stage's own required verification runs).
 
 .PARAMETER Dflash
@@ -130,13 +127,11 @@
 .EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Mtp 3
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Preset win-hip-g128   # group-128 build: D:\models\r4dx\qwen38-27b-l4-bf16.r4dx
-.EXAMPLE
   .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -ToolRoundTrip
 #>
 [CmdletBinding()]
 param(
-    [string]$Model = "",  # "" = the group-matched 4-layer test container (see .PARAMETER Model)
+    [string]$Model = "",  # "" = the group-64 4-layer test container (see .PARAMETER Model)
     [string]$Layout = "w4a16",
     [int]$Port = 8091,
     [int]$Layers = 4,
@@ -210,10 +205,10 @@ Set-Location $PSScriptRoot\..\..
 $RepoRoot = (Get-Location).Path
 $ServerExe = Join-Path $RepoRoot "build\$Preset\src\server\r4dx-server.exe"
 if (-not (Test-Path $ServerExe)) { throw "r4dx-server.exe not found at $ServerExe -- run .\build.ps1 first" }
-# Default container follows build\<Preset>'s w4a16 group (tools\r4dx_containers.ps1); -Model wins.
+# Default container from tools\r4dx_containers.ps1; -Model wins.
 . (Join-Path $RepoRoot "tools\r4dx_containers.ps1")
 if (-not $Model) {
-    $Model = Get-R4dxTestContainer -BuildDir (Join-Path $RepoRoot "build\$Preset") -Name "qwen38-27b-l4-bf16.r4dx"
+    $Model = Get-R4dxTestContainer -Name "qwen38-27b-l4-bf16.r4dx"
 }
 if (-not (Test-Path $Model)) { throw "model container not found: $Model" }
 

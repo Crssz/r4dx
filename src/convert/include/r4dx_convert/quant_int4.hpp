@@ -31,39 +31,26 @@
 
 namespace r4dx_convert {
 
-// ---- group size: driven by the w4a16 kernel's build flag ---------------------------------------
+// ---- group size: the w4a16 kernel's compiled group -------------------------------------------
 //
 // The constant is asserted against the kernel export at startup (src/convert/main.cpp
 // ValidateKernelGroupSizes).
 //
-// w4a16's group is a BUILD OPTION: the CMake cache variable R4DX_W4A16_GROUP (root
-// CMakeLists.txt, default 64 since Milestone 11 -- 128 before it) is passed both to the kernel as
-// -DR4D_GEMM_W4_GROUP and to this header as -DR4DX_W4A16_GROUP (src/convert/CMakeLists.txt), so
-// one switch moves both sides at once. The kernel packs R4D_GEMM_W4_KPB=64 contiguous K per weight
-// block and derives `bpg = R4D_GEMM_W4_GROUP / R4D_GEMM_W4_KPB`, so the group must be a multiple
-// of 64 -- i.e. 64 and 128 are the whole set the kernel accepts as-is. Smaller group = more
-// (scale,zero) dwords per row = more bits per weight: 4 + 32/group bits, so 4.25 at 128 and 4.5
-// at 64.
-//
-// The fallback below is for a translation unit compiled outside the r4dx_convert CMake target
-// (which always passes the define); it MIRRORS the CMake default on purpose, so the two cannot
-// disagree about what "default" means -- the failure mode this whole knob exists to prevent.
-#ifndef R4DX_W4A16_GROUP
-#define R4DX_W4A16_GROUP 64
-#endif
-inline constexpr int kW4A16Group = R4DX_W4A16_GROUP;
-static_assert(kW4A16Group > 0 && kW4A16Group % 64 == 0,
-              "R4DX_W4A16_GROUP must be a positive multiple of R4D_GEMM_W4_KPB (64)");
+// w4a16's default group is 64, the group r4d_gemm_w4a16_nt_m64 is compiled for
+// (R4D_GEMM_W4_GROUP in third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip); the two constants are
+// asserted equal at startup (src/convert/main.cpp's ValidateKernelGroupSizes). The kernel packs R4D_GEMM_W4_KPB=64
+// contiguous K per weight block. Smaller group = more (scale,zero) dwords per row = more bits per
+// weight: 4 + 32/group bits, so 4.5 at 64 and 5 at 32.
+inline constexpr int kW4A16Group = 64;
 
 // Per-tensor w4a16 groups (docs/quant2.md section 5, Q3): r4d_gemm_w4a16_nt_m64_g instantiates the
-// kernel at exactly these three groups, independently of the build default above, and a container
-// may carry any of them tensor by tensor (__metadata__.quant.w4a16.groups, w4a16_groups.hpp). 32
-// is half a packed 64-K block -- the kernel has a separate loop body for it -- which is why the
-// static_assert above still speaks for the DEFAULT only: a per-tensor 32 is validated at run time
-// (K % 64 as well as K % 32, see PlanLinearLayouts), not at build time. All three divide the LDLQ
+// kernel at exactly these two groups, independently of the build default above, and a container
+// may carry either of them tensor by tensor (__metadata__.quant.w4a16.groups, w4a16_groups.hpp). 32
+// is half a packed 64-K block -- the kernel has a separate loop body for it -- so a per-tensor 32
+// is validated at run time (K % 64 as well as K % 32, see PlanLinearLayouts). Both divide the LDLQ
 // block width (128), so --ldlq works at each of them.
 inline bool IsW4A16GroupSupported(int group) {
-  return group == 32 || group == 64 || group == 128;
+  return group == 32 || group == 64;
 }
 
 // k-offset (within a 16-wide WMMA step, before the lane's own 4*(lane>>4) term) of fragment

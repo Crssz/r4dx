@@ -42,11 +42,11 @@ re-sweeping bf16.
 
 W4A16 GROUP. r4d_gemm_w4a16_nt_m64 is compiled at one group size (R4D_GEMM_W4_GROUP: K per
 (scale, zero) dword), and the group decides both which SK are legal and how big the `wsz` buffer is
-(N*K/group dwords). The r4dx build compiles the kernel at its R4DX_W4A16_GROUP option (default 64
-since Milestone 11; third_party/CMakeLists.txt passes -DR4D_GEMM_W4_GROUP). r4d.pyd is built
-separately, by libr4d's own build_windows.ps1, which passes no such flag -- so a stock
-build-win\\r4d.pyd carries the kernel source's default, 128, and sweeping it tunes a kernel the
-default r4dx build does not run. So main() prints the groups the loaded pyd was compiled with
+(N*K/group dwords). The r4dx build compiles the vendored kernel at group 64 (R4D_GEMM_W4_GROUP's
+default in third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip). r4d.pyd is built separately, by a libr4d
+clone's own build_windows.ps1, which passes no such flag -- so a stock build-win\\r4d.pyd carries
+that clone's source default, 128, and sweeping it tunes a kernel r4dx does not run. So main()
+prints the group the loaded pyd was compiled with
 (r4d.GEMM_W4_GROUP), sizes every scale buffer from it (a buffer sized for another group is either
 too short, and read past, or never fully read), and refuses to sweep w4a16 when the pyd group
 differs from the r4dx build's: --w4a16-group (default 64).
@@ -311,9 +311,10 @@ def main():
                           "sweeps -- matched on (layout, N, K, M, shape name) -- leaving every other "
                           "row and the header untouched. Every swept row must already exist there.")
     ap.add_argument("--w4a16-group", type=int, default=64,
-                     help="the R4DX_W4A16_GROUP of the r4dx build this table is for (default 64, "
-                          "that option's default). A w4a16 sweep refuses an r4d.pyd compiled at any "
-                          "other group -- see the module docstring's \"W4A16 GROUP\".")
+                     help="the w4a16 group of the r4dx build this table is for (default 64, the "
+                          "group the vendored kernel is compiled at). A w4a16 sweep refuses an "
+                          "r4d.pyd compiled at any other group -- see the module docstring's "
+                          "\"W4A16 GROUP\".")
     args = ap.parse_args()
     if args.append and args.replace:
         raise SystemExit("--append and --replace are mutually exclusive")

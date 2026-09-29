@@ -58,7 +58,7 @@ bool CompareBytes(const std::string& label, const std::vector<uint8_t>& got,
 // (its bytes are the ground truth every earlier milestone was gated against and must not move),
 // every other group gets "_g{group}" -- tools/convert_ref/gen_fixtures.py's `gsfx`.
 std::string GroupSuffix(int group) {
-  return group == 128 ? std::string() : "_g" + std::to_string(group);
+  return "_g" + std::to_string(group);
 }
 
 }  // namespace
@@ -82,9 +82,8 @@ int main() {
 
   bool ok = true;
 
-  // Every int4 group r4d_gemm_w4a16_nt_m64 can be built with (manifest.json's "int4_groups", from
-  // gen_fixtures.py). Gating both here rather than only at kW4A16Group means the DEFAULT build
-  // still proves the group-64 packer byte-exact against the Python reference.
+  // Every int4 group with a fixture (manifest.json's "int4_groups", from gen_fixtures.py): the
+  // default group, 64, proves the packer byte-exact against the Python reference.
   for (const auto& gj : manifest.at("int4_groups")) {
     const int group = gj.get<int>();
     const std::string g = GroupSuffix(group), tag = " g" + std::to_string(group);

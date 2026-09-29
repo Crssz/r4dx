@@ -806,8 +806,9 @@ void TestProxyAndPackers() {
       CheckAgainstRef(kt + " " + what, ref, codes, p_ldlq, Proxy(W, ref.deq, Hd, N, K));
     };
 
-    // 32 is a per-tensor w4a16 group (--w4a16-group-rule, docs/quant2.md section 5); 64 / 128 the
-    // two build defaults.
+    // 32 is a per-tensor w4a16 group (--w4a16-group-rule, docs/quant2.md section 5) and 64 the
+    // default; 128 is not a served group, but it is the LDLQ block width, so it keeps the
+    // group == block edge covered (the quantizers take any group).
     for (int group : {32, 64, 128}) {
       const std::string what = Fmt("w4a16 g%d", group);
       std::vector<uint8_t> q0, z0, q1, z1, q2, z2;

@@ -7,7 +7,7 @@
 //
 // w4a16 ROWS (2026-09-24, group-64 re-sweep): the 70 kW4a16 rows were re-swept on their own
 // (`tune_gemm.py --layouts w4a16 --replace`, same Q5 ring-rotation harness as below) against
-// r4d_gemm_w4a16_nt_m64 compiled at group 64 -- the R4DX_W4A16_GROUP default since Milestone 11
+// r4d_gemm_w4a16_nt_m64 compiled at group 64 -- the default group since Milestone 11
 // and the group qwen38-27b-v6.r4dx is packed at. The Milestone 4 sweep below had timed the
 // group-128 kernel for them. 64/70 rows picked a different tuning, and 30 of those picks are SK=16
 // at K=5120/17408, legal at group 64 only; linear.cpp's ResolveTuning skips them on a group-128

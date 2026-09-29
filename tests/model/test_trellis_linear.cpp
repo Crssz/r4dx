@@ -761,7 +761,7 @@ void CheckRefusals(const std::string& tiny, Checker& ck) {
        Layout::kTrellis, "mutually exclusive"},
       // The w4a16 lm_head of a container that does not record quant.w4a16.group (so it parses to
       // the historical default 128 and CheckW4a16Group is skipped) with scales half the size the
-      // build's group needs -- on a group-64 build, exactly a group-128 wsz. The kernel reads the
+      // build's group needs -- exactly a group-128 wsz. The kernel reads the
       // build's group, so the size check must be made at THAT group (W4a16LoadGroups::KernelGroup),
       // not at the unrecorded 128, or N*K/64 dwords are read from an N*K/128 buffer.
       {"unrecorded w4a16 group, half-size scales",

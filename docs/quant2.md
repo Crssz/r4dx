@@ -28,7 +28,7 @@ before any kernel work.
 | Q2a rotation | one orthogonal `Q` on the 5120-wide residual stream, folded into every in-projection (K side) and out-projection (N side); norm weights folded into the next linear; **online `Q` at stack entry and `Q^T` at stack exit** | embedding table, vision rows, lm_head, MTP and the DFlash2 drafter stay byte-identical and un-rotated |
 | Q2a `Q` | `Q = D . (I_5 (x) H_1024/32) . (R_5 (x) I_1024)`: random signs, 5 blockwise normalized Hadamards, a random 5x5 orthogonal mix | 5120 = 5 x 1024 has no Hadamard; this is exact, orthogonal and O(n log n) |
 | Q2b online Hadamards | `mlp.down` input: block 512, fused into `silu_mul`; `attn.o` input: block 256 per head, fused into the output-gate multiply; `gdn.out_proj` input: block 128 per head, one extra kernel | block sizes divide both the full and the TP=2 per-rank K, so no block straddles a rank |
-| Q3 | libr4d `r4d_gemm_w4a16_nt_m64` group becomes a template parameter (32/64/128 instantiated); group recorded per tensor; allocation by the Milestone 11 nats-per-GiB rule, with bf16 keeps (and un-keeps of the recipe's attn.k/v) priced in the same currency (5.3) | makes depth/class-aware precision possible without a second format |
+| Q3 | libr4d `r4d_gemm_w4a16_nt_m64` group becomes a template parameter (32 and 64 instantiated); group recorded per tensor; allocation by the Milestone 11 nats-per-GiB rule, with bf16 keeps (and un-keeps of the recipe's attn.k/v) priced in the same currency (5.3) | makes depth/class-aware precision possible without a second format |
 | GPU work | every GPU run is handed to the user as an exact command (repo rule); CPU/convert work proceeds without asking | `gpu-runs-need-approval` |
 
 ---
@@ -670,17 +670,17 @@ Cost gate G7 decides whether `gdn.out_proj`'s extra launch stays.
 ## 5. Q3 -- per-tensor w4a16 group
 
 - libr4d: `R4D_GEMM_W4_GROUP` becomes a template parameter; one new entry point
-  `r4d_gemm_w4a16_nt_m64_g(int group, ...)` (32/64/128 instantiated) plus
+  `r4d_gemm_w4a16_nt_m64_g(int group, ...)` (32/64 instantiated) plus
   `r4d_gemm_w4a16_nt_m64_has_group(int)`, and the existing entry (build default) unchanged for
   compatibility.
 - Container: `__metadata__.quant.w4a16.groups` maps base name -> group when not all equal; the
   loader dispatches per `QuantLinear`; the tuning table gains a group column; the TP slicer
   already takes the group per tensor (`ShardLoader`'s `w4a16_group_` becomes per call).
 - Allocation: the Milestone 11 method, automated -- measure per (class, depth half) the KL
-  recovered by g32 / g64 / g128 (one class at a time, rung 4), then fill the byte budget greedily by
+  recovered by g32 / g64 (one class at a time, rung 4), then fill the byte budget greedily by
   nats per GiB and stop at the cliff. The same sweep also measures bf16 keeps of a few sensitive
   linear sets and un-keeps of the recipe's bf16 attn.k/v (5.3), so every option is one precision
-  (g32 / g64 / g128 / bf16) for one set of linears, and sets that overlap exclude each other.
+  (g32 / g64 / bf16) for one set of linears, and sets that overlap exclude each other.
 
 ### 5.1 Q3 implementation note (runtime)
 
@@ -705,7 +705,7 @@ container decides.
   the path, when:
   - `groups` is not an object, or is present without `group`;
   - a key is empty;
-  - a value is not an integer, not 32/64/128, or equal to the default.
+  - a value is not an integer, not 32 or 64, or equal to the default.
 
   `W4a16Groups::GroupFor`/`WszName`/`QuantLinearGroup` are the only places that turn a base name into
   a group, a scale-tensor name or a `QuantLinear::w4a16_group`.
@@ -731,7 +731,7 @@ container decides.
 - TP: `ShardLoader` holds the `W4a16LoadGroups` instead of one int. It cuts each linear's wsz at the
   linear's own group (`tp::PartShape::group`), under the linear's own name. `tp_shard.cpp` needed
   no change, because `PlanRows`/`PlanCols` were already generic in the group. A rank's K range is
-  whole 64-K blocks (wq's rule), so it is whole groups at 32, 64 and 128. mlp.down's per-rank
+  whole 64-K blocks (wq's rule), so it is whole groups at 32 and 64. mlp.down's per-rank
   8704 = 136 × 64 = 272 × 32.
 - The DFlash2 drafter refuses a container that carries a non-empty map
   (`dflash_draft_weights.h`). The converter never writes one for a drafter.
@@ -752,7 +752,7 @@ container decides.
     `test_pick_tuning` checks this against a verbatim copy of the pre-Q3 resolution, for every row,
     both tables and M = 1..64.
   - At a non-default group no row matches yet, because `tune_gemm.py` writes group 0. The pick
-    falls back to `FallbackTuning` (WV4/SK4/MB1/NPW1). That tuning is legal at 32, 64 and 128 for
+    falls back to `FallbackTuning` (WV4/SK4/MB1/NPW1). That tuning is legal at 32 and 64 for
     every K this model has, TP ranks included, since `K % 512` covers `4·max(g, 64)`. It gets the
     same kRowTile treatment (M <= 16 shares M=1's SK, NT=0 on M = 2..16). The PickTuning cache key
     carries the effective group in bits 53 and up.
@@ -790,10 +790,10 @@ w4a16 tensors. `r4dx_format_version` is not a guard, because no reader checks it
   - the parse and 16 refusal cases;
   - the scale-tensor names;
   - a round trip through the converter's own `W4a16GroupRules`;
-  - every real linear's TP=2 wsz slice at 32/64/128.
+  - every real linear's TP=2 wsz slice at 32 and 64.
 - `test_tp_shard`'s variants gain w4a16 g32, byte-exact against the converter's packers, with a
   pinned rank-1 mlp.down g32 offset.
-- `test_pick_tuning` covers groups 0/32/64/128 for launchability, the pre-Q3 pick at the default,
+- `test_pick_tuning` covers groups 0/32/64 for launchability, the pre-Q3 pick at the default,
   the fallback at other groups, the row-tile SK, and `has_group`.
 
 `test_tp_loader`, a GPU test, now resolves each linear's wsz name and group through the map. The

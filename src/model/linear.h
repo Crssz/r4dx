@@ -40,7 +40,7 @@ struct LinearTuning {
 // `group` (quant2 Q3, docs/quant2.md section 5.1) is the w4a16 group the row was measured at, and
 // is part of the key for w4a16: 0 -- what every row generated before per-tensor groups leaves it at
 // -- means "this build's default group", so those rows serve exactly the linears they served
-// before and nothing else; a row naming 32/64/128 serves only linears at that group. A w4a16
+// before and nothing else; a row naming 32 or 64 serves only linears at that group. A w4a16
 // linear at a non-default group with no row of its own falls back to FallbackTuning, like an
 // untuned shape. Ignored for every other layout.
 //
@@ -66,7 +66,7 @@ struct GemmTuningRow {
 // PickTuning ever sees during normal operation IS covered by the table once tune_gemm.py has run;
 // the fallback exists for robustness, not because it is expected to fire in production).
 // `variant`: the w4a16 group for kW4a16 (QuantLinear::w4a16_group): 0 or this build's default group
-// resolve exactly as before per-tensor groups; 32/64/128 otherwise look up only rows measured at
+// resolve exactly as before per-tensor groups; 32/64 otherwise look up only rows measured at
 // that group (GemmTuningRow::group), then FallbackTuning. Every pick is legal for the kernel at
 // that group: K % (SK * max(group, 64)) == 0. For kTrellis it is the linear's rate
 // (QuantLinear::trellis_bits), matched against GemmTuningRow::rate; the trellis rows -- on a TP

@@ -1,13 +1,13 @@
 // tests/model/test_pick_tuning.cpp -- every tuning PickTuning can hand out, for every (layout, N, K)
 // the GEMM tuning table covers and every chunk M in 1..64, must be one this build's r4d_gemm_*
-// kernels accept. The table is swept at ONE w4a16 group (tools/profile/tune_gemm.py) but compiled
-// into both R4DX_W4A16_GROUP builds, and r4d_gemm_w4a16_nt_m64 throws when K % (SK * group) != 0:
-// a group-64 row with SK=16 at K=5120 is exactly that on a group-128 build, so ResolveTuning
-// (src/model/linear.cpp) must skip it. And every chunk of M <= 16 rows must get the SK the M=1
+// kernels accept. The table is swept at ONE w4a16 group (tools/profile/tune_gemm.py, 64), and
+// r4d_gemm_w4a16_nt_m64 throws when K % (SK * max(group, 64)) != 0, so ResolveTuning
+// (src/model/linear.cpp) must skip a row that breaks that at the launch's group. And every chunk
+// of M <= 16 rows must get the SK the M=1
 // band gets (CheckRowTileSk below). Host-only -- PickTuning and the *_group() exports are plain
 // host functions, no HIP call is made -- so it runs on every build, like test_mtp_round.
 //
-// quant2 Q3 (docs/quant2.md section 5.1): a w4a16 linear may carry its own group (32, 64 or 128,
+// quant2 Q3 (docs/quant2.md section 5.1): a w4a16 linear may carry its own group (32 or 64,
 // QuantLinear::w4a16_group), and the group is part of the tuning key. So, for every w4a16 shape:
 //   - at the build default (w4a16_group 0 or the default itself) PickTuning must return exactly
 //     what the pre-Q3 resolution returned (LegacyPick below is that code, verbatim) -- the default
@@ -140,8 +140,8 @@ using r4dx::model::Layout;
 using r4dx::model::LinearTuning;
 
 // Every w4a16 group the checks below run at: 0 is "the build default" (QuantLinear's default),
-// then the three per-tensor groups r4d_gemm_w4a16_nt_m64_g instantiates.
-constexpr int kW4a16Groups[] = {0, 32, 64, 128};
+// then the two per-tensor groups r4d_gemm_w4a16_nt_m64_g instantiates.
+constexpr int kW4a16Groups[] = {0, 32, 64};
 
 int EffectiveGroup(int g) { return g == 0 ? r4d_gemm_w4a16_nt_m64_group() : g; }
 
@@ -561,19 +561,18 @@ void CheckGroupExports(int& checked, int& failures) {
       ++failures;
     }
   };
-  expect(r4d_gemm_w4a16_nt_m64_has_group(32) == 1 && r4d_gemm_w4a16_nt_m64_has_group(64) == 1 &&
-             r4d_gemm_w4a16_nt_m64_has_group(128) == 1,
-         "r4d_gemm_w4a16_nt_m64_has_group(32/64/128) == 1");
-  // Exactly 32/64/128 (r4d.h): a build default outside them (192, 256) is the ungrouped entry's
-  // alone, so has_group() must not answer for it.
+  expect(r4d_gemm_w4a16_nt_m64_has_group(32) == 1 && r4d_gemm_w4a16_nt_m64_has_group(64) == 1,
+         "r4d_gemm_w4a16_nt_m64_has_group(32/64) == 1");
+  // Exactly 32 and 64 (r4d.h): nothing else is instantiated, so has_group() must not answer for it.
   expect(r4d_gemm_w4a16_nt_m64_has_group(16) == 0 && r4d_gemm_w4a16_nt_m64_has_group(48) == 0 &&
              r4d_gemm_w4a16_nt_m64_has_group(96) == 0 && r4d_gemm_w4a16_nt_m64_has_group(0) == 0 &&
              r4d_gemm_w4a16_nt_m64_has_group(-64) == 0 &&
-             r4d_gemm_w4a16_nt_m64_has_group(192) == 0 && r4d_gemm_w4a16_nt_m64_has_group(256) == 0,
-         "r4d_gemm_w4a16_nt_m64_has_group(16/48/96/0/-64/192/256) == 0");
+             r4d_gemm_w4a16_nt_m64_has_group(128) == 0 && r4d_gemm_w4a16_nt_m64_has_group(192) == 0 &&
+             r4d_gemm_w4a16_nt_m64_has_group(256) == 0,
+         "r4d_gemm_w4a16_nt_m64_has_group(16/48/96/0/-64/128/192/256) == 0");
   expect(r4dx::model::EffectiveW4a16Group(0) == r4d_gemm_w4a16_nt_m64_group() &&
              r4dx::model::EffectiveW4a16Group(32) == 32 &&
-             r4dx::model::EffectiveW4a16Group(128) == 128,
+             r4dx::model::EffectiveW4a16Group(64) == 64,
          "EffectiveW4a16Group: 0 -> the build default, any other group unchanged");
   // PickTuning's cache is keyed on the effective group: the default spelled 0 and spelled out must
   // agree with the pre-Q3 pick, and neither may be served a non-default group's entry cached first.
@@ -599,7 +598,7 @@ int main() {
   CheckTable(r4dx::model::kGemmTuningTable, "main table, tp thread", true, checked, failures);
   r4dx::model::SetTp2TuningForThisThread(false);
   std::printf("test_pick_tuning: %d/%d PickTuning checks passed -- launchable, and the pre-Q3 pick "
-              "at the default w4a16 group %d (w4a16 probed at groups 0/32/64/128)\n",
+              "at the default w4a16 group %d (w4a16 probed at groups 0/32/64)\n",
               checked - failures, checked, r4d_gemm_w4a16_nt_m64_group());
 
   int sk_failures = 0, sk_checked = 0;

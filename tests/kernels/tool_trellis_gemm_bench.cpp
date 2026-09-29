@@ -14,7 +14,7 @@
 //            (src/model/linear.cpp's PickTuning: the M = 1 tuning for every M <= 16, NT = 0 at
 //            M > 1; the default-group entry at g64). The JSON says which (shape, group) classes
 //            production serves from its tuning table and which from the fallback (the table has no
-//            g32 / g128 rows). With --sweep there is also a TUNED w4a16 baseline: every class swept
+//            g32 rows). With --sweep there is also a TUNED w4a16 baseline: every class swept
 //            by the same method as trellis, so the comparison is not swept trellis against untuned
 //            w4a16. Both formats' weights are resident at once (~24 GiB); the chains alternate
 //            rep by rep in one process, at M = 1 and M = 8.
@@ -1916,7 +1916,7 @@ class Bench {
   // ---- prefill ---------------------------------------------------------------------------------
   // Trellis: the best (WV, SK, SKG) per (MT, NP) over all of the shape's instances; then that best,
   // production's w4a16 and (with --sweep) a tuned w4a16, per w4a16 group (production runs each group
-  // with its own tuning, and the g32 / g128 ones fall back).
+  // with its own tuning, and the g32 one falls back).
   void Prefill() {
     json j;
     const int M = 64;

@@ -44,11 +44,13 @@ constexpr int64_t kRowTile = 16;
 // Hand-derived fallback, legal for every (layout,N,K) shape this model has (used only when
 // gemm_tuning_table.inc has no row for the requested shape -- see PickTuning below and linear.h's
 // comment). Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16:
-// group 16, w4a16: 64 or 128 (R4DX_W4A16_GROUP)) and N divisible by
+// group 16, w4a16: 64) and N divisible by
 // 16. This model's only K values are hidden_size=5120, intermediate_size=17408, and
 // value_dim=6144 (attn.o's K = num_heads*head_dim = 6144 too) -- all three are multiples of 512
-// (5120/512=10, 17408/512=34, 6144/512=12), which is the tightest of the group requirements
-// (SK=4 * group=128), so SK=4 clears every layout at once. WV=4/SK=4 keeps the block at 512
+// (5120/512=10, 17408/512=34, 6144/512=12), which clears the tightest of the group requirements
+// (SK=4 * group=64 = 256) with room to spare, so SK=4 clears every layout at once. The fallback
+// keeps requiring K % 512 (the multiple the tensor-parallel rank-K rule in model_config.h is
+// written against) rather than the bare 256. WV=4/SK=4 keeps the block at 512
 // threads (WV*SK*32, under the 1024 cap every kernel enforces) and the LDS reduction buffer at 16
 // KiB (under the 64 KiB cap); MB=1
 // and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16) and NT=1 takes the non-temporal weight-load path
@@ -58,7 +60,7 @@ constexpr int64_t kRowTile = 16;
 // quant2 Q3 (docs/quant2.md section 5.1): this is also the tuning of every w4a16 linear at a
 // per-tensor group the table has no row for. The kernel's rule at group g is K % (SK * max(g, 64))
 // -- a split must start on a 64-K packed block, which a group of 32 does not guarantee -- so SK=4
-// needs K % 256 at g32/g64 and K % 512 at g128: the K % 512 check below already covers all three.
+// needs K % 256 at g32 and g64: the K % 512 check below covers both.
 // `w4a16_group` is the EFFECTIVE group (EffectiveW4a16Group); the explicit check only keeps a future
 // edit of SK from quietly breaking the per-tensor groups.
 //
@@ -96,7 +98,7 @@ LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int 
   const int w4a16_group = variant;
   if (K % 512 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " is not a multiple of 512 (SK=4 * w4a16 group 128) -- this "
+                              " is not a multiple of 512 (SK=4 * 128, the fallback's rule) -- this "
                               "model shape was not anticipated, pick a smaller SK");
   }
   if (N % 16 != 0) {
@@ -188,16 +190,15 @@ bool TrellisRowFits(int64_t N, int64_t K, int64_t M, int kb, const LinearTuning&
 }
 
 // The best row of `table` for (layout, N, K, M), or nullptr. The table's w4a16 rows are swept at
-// one R4DX_W4A16_GROUP (tools/profile/tune_gemm.py), but one table serves every build: a row that
-// splits K into SK slices of whole groups at 64 need not at 128 (SK=16 at K=5120), and the kernel
-// throws on it. Such a row is skipped here, so this build falls through to the next wider M-band's
+// group 64 (tools/profile/tune_gemm.py). A row must be legal for the kernel at the launch's group
+// (K % (SK * max(g, 64)) == 0, e.g. SK=16 at K=5120 needs whole groups) and the kernel throws on one
+// that is not. Such a row is skipped here, so the launch falls through to the next wider M-band's
 // row, then the next table / FallbackTuning, never an illegal launch.
 //
 // quant2 Q3: for w4a16 the group is part of the key. `w4a16_group` is the EFFECTIVE group of the
 // launch (EffectiveW4a16Group); a row's is its GemmTuningRow::group, 0 meaning the build default.
-// At the default group every existing row matches and the legality test is the one above
-// (max(g, 64) == g for every default a build accepts), so the default path picks what it always
-// picked. At another group only rows measured there match, and the test is the kernel's own
+// At the default group every existing row matches and the legality test is the one above, so
+// the default path picks what it always picked. At another group only rows measured there match, and the test is the kernel's own
 // K % (SK * max(g, 64)).
 //
 // Trellis (docs/trellis-kernel.md 5.3): `variant` is the linear's rate, matched against

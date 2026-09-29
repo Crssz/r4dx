@@ -2,69 +2,41 @@
 # paths from. Dot-source it:
 #
 #   . (Join-Path $PSScriptRoot "r4dx_containers.ps1")
-#   if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
+#   if (-not $Model) { $Model = Get-R4dxProductionTarget }
 #
 # A container and the binaries that read it are a matched pair: `--layout w4a16` on a container
-# packed at a different w4a16 group than the build's R4DX_W4A16_GROUP is refused at load
-# (docs/build-windows.md "w4a16 group size"). A script cannot know that group from the source tree
-# -- it is a per-build-directory CMake cache value -- so these functions read it from the
-# CMakeCache.txt of the build directory whose r4dx-cli.exe / r4dx-server.exe the script is about to
-# run, and pick the matching container. Every script still takes an explicit -Model (and -Dflash
+# packed at a different w4a16 group than the binary's (64) is refused at load
+# (docs/build-windows.md "w4a16 group size"). Every script still takes an explicit -Model (and -Dflash
 # where it has one), which bypasses all of this.
 #
 # Same resolution rules as the C++ tests' tests/model/test_container_path.h:
 #   production pair (Get-R4dxProductionTarget / Get-R4dxProductionDrafter) and the target's body
 #   layout (Get-R4dxProductionLayout), in D:\models\r4dx:
-#     group 64  -> huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout trellis: the Huihui abliterated
-#                  trellis mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx
-#     group 128 -> qwen38-27b-v3.r4dx (layout w4a16) + qwen38-27b-dflash2-w4a16.r4dx (v3 is gone from
-#                  this machine, so a g128 build has no production container; pass -Model explicitly)
+#     huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout trellis: the Huihui abliterated trellis
+#     mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx
 #   the tokenizer / chat-template directory (Get-R4dxTokenizerDir): the Huihui HF checkpoint dir, whose
 #   four tokenizer files are byte-identical to the base Qwen3.8-27B's (the base checkpoint was retired)
 #   fixed test containers (Get-R4dxTestContainer -Name <basename>):
-#     R4DX_TEST_CONTAINER_DIR\<basename> if that variable is set, else
-#     group 128 -> D:\models\r4dx\<basename>, any other -> D:\models\r4dx\g<group>\<basename>
+#     R4DX_TEST_CONTAINER_DIR\<basename> if that variable is set, else D:\models\r4dx\g64\<basename>
 
 $script:R4dxModelRoot = "D:\models\r4dx"
 $script:R4dxTokenizerDir = "D:\models\Huihui-Qwen3.8-27B-abliterated"
 
 function Get-R4dxTokenizerDir { return $script:R4dxTokenizerDir }
 
-function Get-R4dxW4a16Group {
-    param([Parameter(Mandatory = $true)][string]$BuildDir)
-    $cache = Join-Path $BuildDir "CMakeCache.txt"
-    if (-not (Test-Path $cache)) {
-        throw "cannot pick a default container: $cache not found (run .\build.ps1 first, or pass -Model explicitly)"
-    }
-    $hit = Select-String -Path $cache -Pattern '^R4DX_W4A16_GROUP:[A-Z]*=(\d+)\s*$' | Select-Object -First 1
-    if (-not $hit) {
-        throw "cannot pick a default container: no R4DX_W4A16_GROUP entry in $cache (pass -Model explicitly)"
-    }
-    return [int]$hit.Matches[0].Groups[1].Value
-}
-
 function Get-R4dxProductionTarget {
-    param([Parameter(Mandatory = $true)][string]$BuildDir)
-    $name = if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { "qwen38-27b-v3.r4dx" } else { "huihui-qwen38-27b-abl-trellis-mix45m.r4dx" }
-    return Join-Path $script:R4dxModelRoot $name
+    return Join-Path $script:R4dxModelRoot "huihui-qwen38-27b-abl-trellis-mix45m.r4dx"
 }
 
 # The body layout Get-R4dxProductionTarget's container loads with (a trellis container refuses any other).
-function Get-R4dxProductionLayout {
-    param([Parameter(Mandatory = $true)][string]$BuildDir)
-    if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { return "w4a16" } else { return "trellis" }
-}
+function Get-R4dxProductionLayout { return "trellis" }
 
 function Get-R4dxProductionDrafter {
-    param([Parameter(Mandatory = $true)][string]$BuildDir)
-    $name = if ((Get-R4dxW4a16Group -BuildDir $BuildDir) -eq 128) { "qwen38-27b-dflash2-w4a16.r4dx" } else { "qwen38-27b-dflash2-w4a16-g64.r4dx" }
-    return Join-Path $script:R4dxModelRoot $name
+    return Join-Path $script:R4dxModelRoot "qwen38-27b-dflash2-w4a16-g64.r4dx"
 }
 
 function Get-R4dxTestContainer {
-    param([Parameter(Mandatory = $true)][string]$BuildDir, [Parameter(Mandatory = $true)][string]$Name)
+    param([Parameter(Mandatory = $true)][string]$Name)
     if ($env:R4DX_TEST_CONTAINER_DIR) { return Join-Path $env:R4DX_TEST_CONTAINER_DIR $Name }
-    $group = Get-R4dxW4a16Group -BuildDir $BuildDir
-    if ($group -eq 128) { return Join-Path $script:R4dxModelRoot $Name }
-    return Join-Path (Join-Path $script:R4dxModelRoot "g$group") $Name
+    return Join-Path (Join-Path $script:R4dxModelRoot "g64") $Name
 }

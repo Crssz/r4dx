@@ -125,7 +125,7 @@ void TestNoMap() {
 
 void TestMap() {
   const char* text = R"({"quant": {"w4a16": {"group": 64, "groups": {
-      "text.layers.0.mlp.down": 32, "text.layers.3.attn.o": 128, "lm_head": 128,
+      "text.layers.0.mlp.down": 32, "text.layers.3.attn.o": 32, "lm_head": 32,
       "mtp.draft_head.lm_head": 32}}}})";
   const W4a16Groups g = ParseW4a16Groups(nlohmann::json::parse(text), "p");
   Check(g.default_group == 64 && g.mapped.size() == 4, "map: default 64, four entries");
@@ -133,9 +133,9 @@ void TestMap() {
             g.WszName("text.layers.0.mlp.down") == "text.layers.0.mlp.down.w4a16.wsz.g32" &&
             g.QuantLinearGroup("text.layers.0.mlp.down") == 32,
         "map: mlp.down at 32, .w4a16.wsz.g32, QuantLinear group 32");
-  Check(g.GroupFor("lm_head") == 128 && g.WszName("lm_head") == "lm_head.w4a16.wsz.g128" &&
-            g.QuantLinearGroup("lm_head") == 128,
-        "map: lm_head at 128, .w4a16.wsz.g128");
+  Check(g.GroupFor("lm_head") == 32 && g.WszName("lm_head") == "lm_head.w4a16.wsz.g32" &&
+            g.QuantLinearGroup("lm_head") == 32,
+        "map: lm_head at 32, .w4a16.wsz.g32");
   Check(g.WszName("mtp.draft_head.lm_head") == "mtp.draft_head.lm_head.w4a16.wsz.g32",
         "map: the MTP draft head is an ordinary base");
   // Unmapped neighbours -- including a base that merely CONTAINS a mapped one -- keep the default.
@@ -172,6 +172,7 @@ void TestRefusals() {
       {"group 16", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 16}}}})"},
       {"group 48", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 48}}}})"},
       {"group 96", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 96}}}})"},
+      {"group 128", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 128}}}})"},
       {"group 256", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 256}}}})"},
       {"group 0", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": 0}}}})"},
       {"group -32", R"({"quant": {"w4a16": {"group": 64, "groups": {"lm_head": -32}}}})"},
@@ -206,7 +207,7 @@ void TestRefusals() {
 void TestConverterRoundTrip() {
   using r4dx_convert::kW4A16Group;
   using r4dx_convert::LayoutSet;
-  for (int g : {32, 64, 128}) {
+  for (int g : {32, 64}) {
     Check(r4dx_convert::W4a16WszName("text.layers.7.mlp.down", g) ==
               W4a16WszName("text.layers.7.mlp.down", g, kW4A16Group),
           "converter and loader name the g" + std::to_string(g) + " scale tensor alike");
@@ -215,7 +216,7 @@ void TestConverterRoundTrip() {
   const std::vector<std::string> specs = {
       R"(^text\.layers\.63\.mlp\.down$=)" + std::to_string(kW4A16Group),
       R"(^text\.layers\.([0-9]|[12][0-9]|3[01])\.mlp\.down$=32)",
-      R"(mlp\.down$=128)",
+      R"(mlp\.down$=64)",
       R"(^lm_head$=32)",
   };
   r4dx_convert::W4a16GroupRules rules(specs);
@@ -245,11 +246,11 @@ void TestConverterRoundTrip() {
   bool all = true;
   for (const std::string& b : bases) all = all && g.GroupFor(b) == rules.GroupFor(b);
   Check(all, "every base resolves to the group the converter packed it at");
-  Check(g.GroupFor("text.layers.5.mlp.down") == 32 && g.GroupFor("text.layers.40.mlp.down") == 128 &&
+  Check(g.GroupFor("text.layers.5.mlp.down") == 32 && g.GroupFor("text.layers.40.mlp.down") == 64 &&
             g.GroupFor("text.layers.63.mlp.down") == kW4A16Group && !g.Mapped("text.layers.63.mlp.down") &&
             g.GroupFor("lm_head") == 32 && !g.Mapped("text.layers.0.mlp.gate_up"),
         "first match wins; a rule naming the default leaves its base out of the map");
-  const size_t want_mapped = 32 + (kW4A16Group == 128 ? 0 : 31) + 1;
+  const size_t want_mapped = 32 + 1;  // layers 0-31 at g32, lm_head; layers 32-63 are the default
   Check(g.mapped.size() == want_mapped, "map size " + std::to_string(g.mapped.size()) + " == " +
                                             std::to_string(want_mapped));
 }
@@ -272,7 +273,7 @@ void TestTpSlices() {
       {"mtp.mlp.gate_up", 34816, 5120},               {"mtp.mlp.down", 5120, 17408},
   };
   int plans = 0;
-  for (int gsel : {32, 64, 128}) {
+  for (int gsel : {32, 64}) {
     // One container mapping every one of these linears to gsel (unless gsel is the default).
     nlohmann::json meta;
     meta["quant"]["w4a16"]["group"] = r4dx_convert::kW4A16Group;

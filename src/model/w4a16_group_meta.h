@@ -11,10 +11,11 @@
 //
 // The contract, in the loader's words:
 //   - `quant.w4a16.group` is the container's DEFAULT group (128 when the `quant` block predates the
-//     recorded group, CheckQuantGroups' historical rule). Every w4a16 linear NOT named in the map
+//     recorded group, CheckQuantGroups' historical rule; such a container is refused by
+//     CheckW4a16Group). Every w4a16 linear NOT named in the map
 //     is at that group and keeps the historical scale tensor `<base>.w4a16.wsz`.
 //   - `quant.w4a16.groups` (optional) = {"<container base>": g, ...} names ONLY the linears whose
-//     group differs from the default; g is 32, 64 or 128. Such a linear's scales are
+//     group differs from the default; g is 32 or 64. Such a linear's scales are
 //     `<base>.w4a16.wsz.g<g>` and its `.w4a16.wq` is unchanged.
 //   - No key, or an empty object: the container is exactly what it was before per-tensor groups, and
 //     every call site below degrades to the pre-Q3 name and group.
@@ -31,7 +32,7 @@ namespace r4dx::model {
 // The groups a map entry may name: the ones r4d_gemm_w4a16_nt_m64_g instantiates (r4d.h). The
 // kernel's own has_group() is still asked at load time (CheckW4a16MappedGroup); this is the
 // format's rule, checked on every load whether or not it reads w4a16.
-inline bool IsW4a16MapGroup(int g) { return g == 32 || g == 64 || g == 128; }
+inline bool IsW4a16MapGroup(int g) { return g == 32 || g == 64; }
 
 // `<base>.w4a16.wsz` at the container's default group, `<base>.w4a16.wsz.g<group>` at any other --
 // byte for byte the converter's W4a16WszName (linear_layouts.hpp), with the container's recorded

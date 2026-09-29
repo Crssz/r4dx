@@ -168,7 +168,7 @@ static const R4DKernelInfo kKernels[] = {
      "skinny GEMM C[M,N] = A[M,K] @ dequant(Wq)[N,K]^T with a 4-bit weight, 16x16x16 WMMA, "
      "split-K reduced in LDS",
      "M <= 64; N a multiple of 16; K divisible by SK*max(group,64); weight pre-permuted into "
-     "fragment order; group = the build default (gemm_w4a16_nt_m64_group), or 32/64/128 per call "
+     "fragment order; group = the build default (gemm_w4a16_nt_m64_group), or 32/64 per call "
      "through gemm_w4a16_nt_m64_g",
      "f16 A, 4-bit W with an f16 scale and integer zero per group of K, bf16 C, fp32 accumulate",
      ROW(cGemmNtW4)},

@@ -20,15 +20,15 @@
 //       reduced-vocab draft head, two vision tensors; hidden 5120, row counts shrunk) with the Q3
 //       sweep's recipe (--layouts w4a16 --lm-head w4a16 --no-bf16 --mtp on --vision on, --kv-calib,
 //       --quant search --imatrix, --keep-bf16 attn.k/v, plus --draft-vocab-ids): rule R =
-//       "mlp\.down$=32" + "draft_head=128". The premise (a full run with R differs from the no-rule
+//       "mlp\.down$=32" + "draft_head=32". The premise (a full run with R differs from the no-rule
 //       full run ONLY in R's four linears), then full(R) == reuse(R) from the no-rule baseline, with
 //       reused_from naming exactly those four linears; a full run without --record-reuse-guard is
 //       the guarded one minus reuse_guard; the guard's emit_complete is 1 on disk and its
 //       data_sha256 the digest of the file's own tensors (reuse == full; reused_from carries the
 //       baseline's).
 //   (b) the reverse (the baseline has R, this run has no rule) == the no-rule full run; the same from
-//       the reuse output of (a) (a reuse output is itself a baseline); a rule at another group
-//       (=128 over a =32 baseline) == its full run; a rule naming the default group recomputes
+//       the reuse output of (a) (a reuse output is itself a baseline); a rule on other linears
+//       (gdn.out_proj=32 over R) == its full run; a rule naming the default group recomputes
 //       nothing; a moved (copied) checkpoint and another --threads are accepted.
 //   (c) the guard: every real flag / input file / checkpoint file / binary difference is refused
 //       before an output file exists, naming its reuse_guard field; every leaf of a recorded guard,
@@ -250,14 +250,14 @@ void TestLibrary() {
       g32.w4a16_group = 32;
       LayoutSet all = g32;
       all.bf16 = true;
-      all.w4a16_group = 128;
+      all.w4a16_group = 32;
       LayoutSet none;
       none.bf16 = false;
       const std::vector<std::pair<LayoutSet, std::string>> sets = {
           {KeptBf16LayoutSet(), "bf16"},
           {q, "w4a16.g" + std::to_string(kW4A16Group)},
           {g32, "w4a16.g32"},
-          {all, "bf16+w4a16.g128"},
+          {all, "bf16+w4a16.g32"},
           {none, "none"}};
       bool ids = true, names = true;
       for (const auto& s : sets) {
@@ -273,7 +273,7 @@ void TestLibrary() {
         names = names && planned == LinearLayoutTensorNames("x.y", s.first);
       }
       Gate(ids, "(0) LayoutSetId: bf16 / w4a16.g<default> / w4a16.g32 / "
-                "bf16+w4a16.g128 / none, and ParseLayoutSetId round-trips each");
+                "bf16+w4a16.g32 / none, and ParseLayoutSetId round-trips each");
       Gate(names, "(0) LinearLayoutTensorNames == the names PlanLinearLayouts plans, for each set");
       bool refused = true;
       std::string accepted;
@@ -920,7 +920,7 @@ void TestExe(const Fixture& f) {
   std::string why;
   const std::string exe = R4DX_CONVERT_EXE;
   const Opts recipe = RecipeOpts(f);
-  const std::string rule_r = " --w4a16-group-rule \"mlp\\.down$=32\" --w4a16-group-rule \"draft_head=128\"";
+  const std::string rule_r = " --w4a16-group-rule \"mlp\\.down$=32\" --w4a16-group-rule \"draft_head=32\"";
   const std::set<std::string> r_bases = {"text.layers.0.mlp.down", "text.layers.1.mlp.down",
                                          "mtp.mlp.down", "mtp.draft_head.lm_head"};
   const std::set<std::string> down_bases = {"text.layers.0.mlp.down", "text.layers.1.mlp.down",
@@ -946,7 +946,7 @@ void TestExe(const Fixture& f) {
     bool only_r = !d.empty();
     for (const auto& t : d) only_r = only_r && OwnedBy(t, r_bases);
     Gate(only_r && d.count("text.layers.0.mlp.down.w4a16.wsz.g32") &&
-             d.count("mtp.draft_head.lm_head.w4a16.wsz.g128"),
+             d.count("mtp.draft_head.lm_head.w4a16.wsz.g32"),
          "(a) premise: full(R) differs from the no-rule full run in " + std::to_string(d.size()) +
              " tensor(s), all of them R's four linears' (the test is not vacuous)");
   }
@@ -994,12 +994,12 @@ void TestExe(const Fixture& f) {
              lin0.value("mtp.draft_head.lm_head", "") == gdef &&
              linr.value("text.layers.0.mlp.down", "") == "w4a16.g32" &&
              linr.value("mtp.mlp.down", "") == "w4a16.g32" &&
-             linr.value("mtp.draft_head.lm_head", "") == "w4a16.g128" &&
+             linr.value("mtp.draft_head.lm_head", "") == "w4a16.g32" &&
              linr.value("text.layers.0.mlp.gate_up", "") == gdef &&
              RunField(b0.c, "/reuse_guard/args").is_object() &&
              !RunField(b0.c, "/reuse_guard/args").contains("keep_bf16"),
          "(a) reuse_guard.linears records all 17 linears' resolved layout sets (k/v bf16, R's four at "
-         "32 / 128 in full(R)); args has no keep_bf16 -- " + lin0.dump());
+         "32 in full(R)); args has no keep_bf16 -- " + lin0.dump());
   }
   const Result ng = run.Convert("full: no rule, no guard", recipe, noguard);
   {
@@ -1025,15 +1025,20 @@ void TestExe(const Fixture& f) {
        "(b) a reuse output is itself a baseline: reuse(no rule) from reuse(R) == the no-rule full run" +
            (why.empty() ? "" : " -- " + why));
   why.clear();
-  const std::string rule_128 = " --w4a16-group-rule \"mlp\\.down$=128\"";
-  const Result f128 = run.Convert("full: mlp.down=128, --record-reuse-guard", recipe,
-                                  root / "full_128.r4dx", rule_128 + " --record-reuse-guard");
-  const Result r128 = run.Convert("reuse: mlp.down=128 from full(R) (mlp.down=32 there)", recipe,
-                                  root / "reuse_128.r4dx", rule_128 + " --reuse-tensors-from " + Q(full_r));
-  Gate(f128.rc == 0 && r128.rc == 0 && SameAsFull(r128.c, f128.c, &why) &&
-           RecomputedSet(r128.c) == r_bases,
-       "(b) another group on both sides (32 -> 128 on mlp.down) plus a baseline-only rule (the draft "
-       "head) == the full run; all four recomputed" + (why.empty() ? "" : " -- " + why));
+  const std::string rule_alt = " --w4a16-group-rule \"gdn\\.out_proj$=32\"";
+  const Result f_alt = run.Convert("full: gdn.out_proj=32, --record-reuse-guard", recipe,
+                                   root / "full_alt.r4dx", rule_alt + " --record-reuse-guard");
+  const Result r_alt = run.Convert("reuse: gdn.out_proj=32 from full(R)", recipe,
+                                   root / "reuse_alt.r4dx", rule_alt + " --reuse-tensors-from " + Q(full_r));
+  {
+    std::set<std::string> alt_bases = r_bases;
+    alt_bases.insert("text.layers.0.gdn.out_proj");
+    Gate(f_alt.rc == 0 && r_alt.rc == 0 && SameAsFull(r_alt.c, f_alt.c, &why) &&
+             RecomputedSet(r_alt.c) == alt_bases,
+         "(b) a rule on other linears (gdn.out_proj=32) over a baseline with R == the full run; R's "
+         "four (g32 -> default) and the out_proj (default -> g32) recomputed" +
+             (why.empty() ? "" : " -- " + why));
+  }
   why.clear();
   const std::string rule_def = " --w4a16-group-rule \"lm_head$=" + std::to_string(kW4A16Group) + "\"";
   const Result rdef = run.Convert("reuse: a rule naming the default group", recipe,
@@ -1198,7 +1203,7 @@ void TestExe(const Fixture& f) {
   }
   {
     json h = b0.c.header;
-    h["__metadata__"]["quant"]["w4a16"]["group"] = kW4A16Group == 64 ? 128 : 64;
+    h["__metadata__"]["quant"]["w4a16"]["group"] = 32;
     mutated(b0.c, h, "quant block of another build", "__metadata__.quant");
   }
   {
@@ -1236,13 +1241,13 @@ void TestExe(const Fixture& f) {
     run.Refused("group map without a linear the record has at g32", recipe,
                 " --reuse-tensors-from " + Q(mut),
                 "quant.w4a16.groups maps 'text.layers.0.mlp.down' to nothing (the default group");
-    // ... and saying 128 where the record (and the tensor) say g32.
+    // ... and saying 64 where the record (and the tensor) say g32.
     h = fr.c.header;
-    h["__metadata__"]["quant"]["w4a16"]["groups"]["text.layers.0.mlp.down"] = 128;
+    h["__metadata__"]["quant"]["w4a16"]["groups"]["text.layers.0.mlp.down"] = 64;
     WriteWithHeader(fr.c, h, mut);
     run.Refused("group map disagreeing with the record's group", recipe,
                 " --reuse-tensors-from " + Q(mut),
-                "maps 'text.layers.0.mlp.down' to group 128 but its reuse_guard.linears records "
+                "maps 'text.layers.0.mlp.down' to group 64 but its reuse_guard.linears records "
                 "\"w4a16.g32\"");
   }
   {
@@ -1413,9 +1418,9 @@ void TestKeep(const Fixture& f) {
   Gate(SameAsFull(rkrr.c, fkr.c, &why) &&
            RecomputedSet(rkrr.c) == std::set<std::string>{l0down, "mtp.draft_head.lm_head"} &&
            Contains(rkrr.log, "reuse: recompute " + l0down + " (baseline w4a16.g32 -> bf16)") &&
-           Contains(rkrr.log, "reuse: recompute mtp.draft_head.lm_head (baseline w4a16.g128 -> " + gdef + ")"),
+           Contains(rkrr.log, "reuse: recompute mtp.draft_head.lm_head (baseline w4a16.g32 -> " + gdef + ")"),
        "(e-iii) keep + rule from full(R) == full: layer 0 mlp.down (g32 -> bf16) and the draft head "
-       "(R's g128 -> default) recomputed, layer 1 / MTP mlp.down (g32 both) copied" +
+       "(R's g32 -> default) recomputed, layer 1 / MTP mlp.down (g32 both) copied" +
            (why.empty() ? "" : " -- " + why));
   why.clear();
   // A keep change does not open the guard for anything else.

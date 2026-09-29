@@ -195,10 +195,11 @@ void r4d_gemm_w4a16_nt_m64(int64_t a, int64_t wq, int64_t wsz, int64_t c, int M,
                            int WV, int SK, int MB, int NPW, int NT, int64_t stream);
 int  r4d_gemm_w4a16_nt_m64_max_m(void);
 int  r4d_gemm_w4a16_nt_m64_group(void);
-// The same kernel at a group chosen per call. has_group() is 1 for 32, 64 and 128, 0 otherwise --
-// a build default outside those three is served by r4d_gemm_w4a16_nt_m64 only. The packed Wq is
-// the same bytes at every group; Wsz has K/group dwords per row. K must be divisible by SK * max(group, 64) -- a split has to start on a 64-K packed
-// block -- and an uninstantiated group throws, like any other rejected shape.
+// The same kernel at a group chosen per call. has_group() is 1 for 32 and 64, 0 otherwise --
+// a build default outside those two is served by r4d_gemm_w4a16_nt_m64 only. The packed Wq is
+// the same bytes at every group; Wsz has K/group dwords per row. K must be divisible by
+// SK * max(group, 64) -- a split has to start on a 64-K packed block -- and an uninstantiated group
+// throws, like any other rejected shape.
 int  r4d_gemm_w4a16_nt_m64_has_group(int group);
 void r4d_gemm_w4a16_nt_m64_g(int group, int64_t a, int64_t wq, int64_t wsz, int64_t c, int M, int K,
                              int N, int WV, int SK, int MB, int NPW, int NT, int64_t stream);

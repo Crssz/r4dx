@@ -12,7 +12,7 @@
 //                [--hessian-dir <tools/reference/hessian_capture.py output dir>
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
-//                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64|128>"]...
+//                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64>"]...
 //                [--record-reuse-guard] [--reuse-tensors-from <baseline container>]
 //                [--trellis-from <oracle dir or its weights_override.json>
 //                 [--trellis-manifest-sha256 <hex>] [--trellis-verify full|none]
@@ -73,7 +73,7 @@
 // header and data are byte-identical to a full run's with --record-reuse-guard.
 //
 // --w4a16-group-rule (docs/quant2.md section 5, w4a16_groups.hpp; repeatable, first matching rule
-// wins, unmatched linears keep the build default R4DX_W4A16_GROUP) packs the w4a16 layout of every
+// wins, unmatched linears keep the default group, kW4A16Group = 64) packs the w4a16 layout of every
 // linear whose container base name the regex matches (regex_SEARCH, like --keep-bf16) at that group
 // instead: its scale tensor becomes `<base>.w4a16.wsz.g<g>` and __metadata__.quant.w4a16.groups
 // lists it, so the runtime dispatches r4d_gemm_w4a16_nt_m64_g for it and a binary that predates
@@ -96,7 +96,7 @@
 // --quant selects HOW the 4-bit values are chosen; it does NOT change a single byte of the on-disk
 // layout (docs/container-format.md, "How the quantized values are chosen"). `rtn` (the DEFAULT) is
 // the historical min/max grid + round-to-nearest and reproduces any pre-existing container byte for
-// byte; `search` minimizes the squared reconstruction error per (row, 128-K group) over a small
+// byte; `search` minimizes the squared reconstruction error per (row, K group) over a small
 // candidate grid (src/convert/include/r4dx_convert/quant_search.hpp). --imatrix additionally weights
 // that error by each input channel's mean activation energy, from the .npz
 // tools/reference/imatrix_capture.py writes (keyed by these same container base names); it requires
@@ -244,18 +244,18 @@ size_t Count(const std::string& hay, const std::string& needle) {
 
 // Review finding (major, quant_int4.hpp): the group size this converter packs with
 // (r4dx_convert::kW4A16Group) is a compile-time constant that must match the group size the GPU
-// kernel was actually built with (w4a16's R4D_GEMM_W4_GROUP is the R4DX_W4A16_GROUP build option).
+// kernel was actually built with (w4a16's R4D_GEMM_W4_GROUP).
 // A silent mismatch here produces a container that GEMMs read at the wrong stride with no error,
 // ever. r4d_core exports the group the kernel was actually compiled with, so assert against it once
-// at startup instead of trusting the -D flags stayed in sync.
+// at startup instead of trusting the two constants stayed in sync.
 void ValidateKernelGroupSizes() {
   auto check = [](const char* label, int expected, int actual) {
     if (actual != expected) {
       throw std::runtime_error(
           std::string("r4dx-convert: group size mismatch for ") + label + ": this converter packs "
           "with group=" + std::to_string(expected) + " but r4d_core's kernel was built with group=" +
-          std::to_string(actual) + " (check third_party/CMakeLists.txt's R4D_EXTRA_* -D flags and "
-          "the R4DX_W4A16_GROUP cache variable against "
+          std::to_string(actual) + " (check R4D_GEMM_W4_GROUP in "
+          "third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip against "
           "src/convert/include/r4dx_convert/quant_int4.hpp's kW4A16Group)");
     }
   };
@@ -796,8 +796,7 @@ class LdlqSource {
     }
     // quant_ldlq.hpp also needs every emitted layout's group to tile the block (a group never
     // straddles two blocks). w4a16's group is this linear's
-    // own (`ls.w4a16_group`: a --w4a16-group-rule's 32/64/128, all fine, or the build's
-    // R4DX_W4A16_GROUP, which may be any multiple of 64 -- 192, 256, ... do not divide 128).
+    // own (`ls.w4a16_group`: 32 or 64, both of which divide 128).
     auto require_group = [&](bool on, int group, const char* layout) {
       if (on && kBlock % group != 0) {
         throw std::runtime_error("--ldlq: '" + container_base + "' emits " + layout +
@@ -1210,7 +1209,7 @@ nlohmann::json BuildReuseGuard(const AppArgs& args, const std::string& config_te
   g[kReuseCompleteKey] = 0;
   g[kReuseDataKey] = ReuseDataPlaceholder();
   // The binary itself, not a version string: a rebuild from any other source, with other build
-  // options (R4DX_W4A16_GROUP, the vendored r4d_core it links statically) or none at all hashes
+  // options (the vendored r4d_core it links statically) or none at all hashes
   // differently, and is refused. Deliberately no override: a baseline costs one conversion, while a
   // container mixing two converters' tensors would measure as a group-rule effect.
   g["converter"] = {{"exe_sha256", Sha256File(ExecutablePath())},

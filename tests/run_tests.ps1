@@ -8,8 +8,8 @@
   GPU rule in README.md / docs/build-windows.md. Sets HIP_VISIBLE_DEVICES=1 (so device index 0
   inside the test process is physical device 1) and runs ctest against the 'win-hip' preset's build
   directory with the venv's CMake (or the one on PATH when the venv is absent). No other
-  environment variable is needed: the tests pick the containers matching the build's w4a16 group
-  themselves (tests/model/test_container_path.h).
+  environment variable is needed: the tests find their containers themselves
+  (tests/model/test_container_path.h).
 
   The Python reference tests are registered, or not, when build.ps1 configures (tests/CMakeLists.txt
   says which interpreter it found, or why none): set $env:R4DX_REFERENCE_PYTHON (or

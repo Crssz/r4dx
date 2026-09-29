@@ -50,10 +50,10 @@ nlohmann::json ReadMetadata(const std::string& path) {
 // why a mismatch is silent-wrong-numbers rather than a crash.
 //
 // A container written before the group was recorded has no `quant` block at all; those are group
-// 128 by construction (it was the only group that ever existed) and load unchanged on a group-128
-// build. This check skips them; on any other build CheckW4a16Shape (and the TP loader's part-size
-// check) refuses their scales instead, since both size them at the group the kernel will read
-// (W4a16LoadGroups::KernelGroup), not at the unrecorded default.
+// 128 by construction (it was the only group that ever existed), which no build reads any more.
+// This check skips them; CheckW4a16Shape (and the TP loader's part-size check) refuses their scales
+// instead, since both size them at the group the kernel will read (W4a16LoadGroups::KernelGroup),
+// not at the unrecorded default.
 //
 // SCOPE (adversarial-review fix): the check fires only when THIS load will actually read
 // `.w4a16.wsz` bytes, i.e. when one of the three layout selections below is `kW4a16`. The hazard
@@ -89,7 +89,7 @@ struct W4a16LoadGroups {
   // default (QuantLinear::w4a16_group 0 -> r4d_gemm_w4a16_nt_m64_group()). The scale tensor's size
   // is checked (CheckW4a16Shape) and its TP slice cut at THIS group, not at the container's
   // recorded default: a container with no `quant.w4a16.group` parses to default 128 and skips
-  // CheckW4a16Group, so on a group-64 build only the size check stands between its N*K/128 scale
+  // CheckW4a16Group, so only the size check stands between its N*K/128 scale
   // dwords and a kernel that reads N*K/64 of them.
   int KernelGroup(const std::string& base) const {
     return groups.Mapped(base) ? groups.GroupFor(base) : r4d_gemm_w4a16_nt_m64_group();
@@ -1115,7 +1115,7 @@ class ShardLoader {
       case Layout::kW4a16:
         // quant2 Q3: the linear's own group sets both the scale tensor's name and the dword
         // stride its K slice is cut at; a rank's K range is whole 64-K blocks (wq's rule), so it
-        // is whole groups at 32, 64 and 128 alike.
+        // is whole groups at 32 and 64 alike.
         q.w4a16_group = w4a16_.Resolve(base);
         q.wq = Part<uint8_t>(base + ".w4a16.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
         q.w4a16_wsz = Part<uint32_t>(w4a16_.groups.WszName(base),

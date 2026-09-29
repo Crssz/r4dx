@@ -13,15 +13,13 @@ Covers all three ways r4dx-convert can choose its quantized values, on the same 
 The byte LAYOUT is identical in all three; only the values differ, which is exactly what makes a
 byte-for-byte diff the right gate for the search.
 
-The w4a16 group size is a build option (R4DX_W4A16_GROUP, root CMakeLists.txt), so this script
-takes the group as a parameter -- defaulting to whatever the container under test says it was
-packed with, which makes the same invocation the right gate for a group-64 build's exe as for the
-default build's.
+The w4a16 group size is a compile-time constant of the exe (kW4A16Group, 64), so this script takes
+the group as a parameter -- defaulting to whatever the container under test says it was packed with.
 
 Usage (from the reference venv):
   python selftest_compare.py
       [--exe <path to r4dx-convert.exe>] [--n 48] [--k 384] [--seed 7]
-      [--w4a16-group 128|64]
+      [--w4a16-group 64]
 """
 import argparse
 import json
@@ -88,7 +86,7 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=48)
     ap.add_argument("--k", type=int, default=384)
     ap.add_argument("--seed", type=int, default=7)
-    # The w4a16 group is a BUILD OPTION (R4DX_W4A16_GROUP, root CMakeLists.txt), so the group this
+    # The w4a16 group is a compile-time constant of the exe (kW4A16Group), so the group this
     # --exe packs with is a property of the exe, not of this script. Default: read it back out of
     # the container the exe just wrote (__metadata__.quant.w4a16.group), which also gates
     # that the exe RECORDS the group it used. Override only to prove a deliberate mismatch fails.

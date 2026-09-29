@@ -22,7 +22,7 @@
 
 namespace r4dx_convert {
 
-// kW4A16Group (quant_int4.hpp) is the w4a16 group size, a build option (R4DX_W4A16_GROUP). It is
+// kW4A16Group (quant_int4.hpp) is the default w4a16 group size (64). It is
 // additionally PER LINEAR: LayoutSet::w4a16_group, the build default unless r4dx-convert's
 // --w4a16-group-rule (w4a16_groups.hpp) resolved another one for this base.
 
@@ -121,7 +121,7 @@ inline std::string LayoutSetId(const LayoutSet& ls) {
 }
 
 // The inverse of LayoutSetId, strict: only the canonical spelling of a layout set this build can write
-// (a w4a16 group of 32/64/128 or the build default) parses; anything else returns false.
+// (a w4a16 group of 32 or 64) parses; anything else returns false.
 inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
   LayoutSet ls;
   ls.bf16 = false;
@@ -160,7 +160,7 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
 // formulas, derived once: --keep-bf16's "extra bytes vs 4-bit" accounting has to answer "what would
 // this linear have cost in the layouts it is NOT being written in", and a second hand-written copy
 // of these expressions would silently drift the moment a layout's scale tensor changes shape (as
-// w4a16.wsz just did when R4DX_W4A16_GROUP became a build option).
+// w4a16.wsz just did when the group became per linear).
 inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   const uint64_t NK = static_cast<uint64_t>(N) * static_cast<uint64_t>(K);
   uint64_t bytes = 0;
@@ -242,7 +242,7 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
     // startup); any other group must be one r4d_gemm_w4a16_nt_m64_g instantiates.
     if (g16 != kW4A16Group && !IsW4A16GroupSupported(g16)) {
       throw std::runtime_error("r4dx_convert: w4a16 group " + std::to_string(g16) + " for " + base +
-                               " is not one the kernel instantiates (32, 64, 128) nor this "
+                               " is not one the kernel instantiates (32, 64) nor this "
                                "build's default (" + std::to_string(kW4A16Group) + ")");
     }
     RequireDivisible(K, g16, "K", base.c_str());

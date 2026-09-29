@@ -42,12 +42,10 @@ This configures and builds with the `win-hip` CMake preset (Ninja + CMake from
 SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the exact toolchain versions, flags, and
 gotchas.
 
-One build option changes what containers this binary can read: **`R4DX_W4A16_GROUP`** (default
-**64** since Milestone 11) is how many contiguous `K` share one w4a16 `(scale, zero)` pair -- 4.5
-bits/weight at 64, 4.25 at 128. It reaches both the kernel and the converter from one cache
-variable, every container records the group it was packed with, and a loader refuses a mismatch
-rather than silently reading scales at the wrong stride. `.\build.ps1 -Preset win-hip-g128` builds
-the pre-v6 group of 128 into its own directory for reading older containers.
+The w4a16 group -- how many contiguous `K` share one `(scale, zero)` pair -- is **64** (4.5
+bits/weight; 32 for the LM head, 5 bits). It is a compile-time constant of both the kernel and the
+converter, every container records the group it was packed with, and a loader refuses a mismatch
+rather than silently reading scales at the wrong stride.
 
 ## Test
 
@@ -84,11 +82,10 @@ CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, ru
 `ctest` invocation). 71 tests are registered without the reference venv (73 with it). The last
 full run, at 64 before `test_pick_tuning` was added, passed all but 1, which skips
 (`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP device 1 (2026-09-23,
-default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
-either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
-production container (the Huihui trellis mix4.5m, loaded with `--layout trellis`; its w4a16 parts
-are packed at group 64, so it needs the default group-64 build) (`docs/build-windows.md` "w4a16
-group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are
+default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed: the tests open
+the test containers and the production container (the Huihui trellis mix4.5m, loaded with `--layout
+trellis`; its w4a16 parts are packed at groups 32 and 64) (`docs/build-windows.md` "w4a16 group
+size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are
 registered only when the reference venv's `python.exe` exists at configure time; otherwise CMake
 prints a STATUS line saying they were skipped. See `docs/status.md` for
 the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
@@ -132,9 +129,8 @@ worth 9.6% of decode).
 
 **Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
 refuses `--layout w4a16` on a container packed at 128 -- `v5` and everything older -- by name, with
-both numbers and the fix in the message.
-`docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
-`win-hip-g128` escape hatch, and the trap that an existing build directory keeps its cached group.
+both numbers and the fix in the message (re-convert).
+`docs/build-windows.md` "w4a16 group size" covers where the group is set and how it is checked.
 
 Produces a single container carrying the requested GEMM layouts (plus bf16 for
 embeddings/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B them against the same
@@ -166,7 +162,7 @@ layers 0-3's `mlp.down`; `docs/quant2.md` 5.3 prices such keeps).
 the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
 which `q` / `scale` / `zero` values land in those bytes, so any container is readable by any loader
 either way, at exactly the same decode speed. `--quant search` replaces the historical min/max +
-round-to-nearest grid with a per-`(row, 128-K group)` search over 21 candidate scales
+round-to-nearest grid with a per-`(row, K group)` search over 21 candidate scales
 (`0.85x .. 1.15x`) and three candidate integer zeros, plus a weighted least-squares refit of the
 scale. `--quant rtn` is the **default** and is the historical behaviour byte for byte.
 
@@ -237,10 +233,10 @@ example output directory, not an existing capture.)
 
 **`--w4a16-group-rule "<regex>=<g>"` -- per-tensor w4a16 group (experimental, `docs/quant2.md`
 Q3).** Repeatable. Every linear whose container base name the regex matches (`regex_search`,
-ECMAScript, like `--keep-bf16`) is packed in w4a16 at group `g` (32, 64 or 128) instead of the
-build's `R4DX_W4A16_GROUP`. Rules are tried in the order given and the first match wins, so an
-exception goes before a broad rule (a rule may name the default group); unmatched linears keep the
-default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.5 at 64, 4.25 at 128.
+ECMAScript, like `--keep-bf16`) is packed in w4a16 at group `g` (32 or 64) instead of the default,
+64. Rules are tried in the order given and the first match wins, so an exception goes before a broad
+rule (a rule may name the default group); unmatched linears keep the default. A smaller group costs
+bytes and buys accuracy: 5 bits per weight at 32, 4.5 at 64.
 
 ```powershell
 .\build\win-hip\src\convert\r4dx-convert.exe `
@@ -448,10 +444,10 @@ $env:HIP_VISIBLE_DEVICES = '1'
     --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 ```
 
-`--dflash` is optional (drop the last line for plain decode). On a default (w4a16 group 64) build the
-w4a16 drafter must be the group-64 one, `qwen38-27b-dflash2-w4a16-g64.r4dx`; the group-128
-`qwen38-27b-dflash2-w4a16.r4dx`, and group-128 main containers such as `qwen38-27b-v5.r4dx`, are
-refused at load with an error naming both groups (a `-DR4DX_W4A16_GROUP=128` build reads them).
+`--dflash` is optional (drop the last line for plain decode). The w4a16 drafter must be the
+group-64 one, `qwen38-27b-dflash2-w4a16-g64.r4dx`; the group-128 `qwen38-27b-dflash2-w4a16.r4dx`,
+and group-128 main containers such as `qwen38-27b-v5.r4dx`, are refused at load with an error naming
+both groups.
 
 Exposes `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming via `"stream":
 true` or non-streaming JSON), and `POST /v1/completions` (raw prompt, no chat template) -- a subset

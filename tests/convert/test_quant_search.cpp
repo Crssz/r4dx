@@ -11,9 +11,8 @@
 //         quantize_*_search) on a random matrix, via the fixtures
 //         tools/convert_ref/gen_fixtures.py writes. Same gate shape as test_pack_bytes.cpp.
 //
-// All three are checked at BOTH int4 group sizes r4d_gemm_w4a16_nt_m64 can be built with
-// (R4DX_W4A16_GROUP = 64 or 128, root CMakeLists.txt), so the default build gates the group-64
-// path as well as its own.
+// (i) and (ii) are checked at both int4 group sizes r4d_gemm_w4a16_nt_m64_g serves (64, the default,
+// and 32); (iii) at the group that has a fixture, 64.
 //
 // R4DX_CONVERT_FIXTURES_DIR is injected by tests/convert/CMakeLists.txt as an absolute path.
 #include <cmath>
@@ -85,12 +84,12 @@ double GroupError(const float* x, const float* wt, int group, float scale, const
 
 // Fixture filename suffix for an int4 group -- see test_pack_bytes.cpp's GroupSuffix.
 std::string GroupSuffix(int group) {
-  return group == 128 ? std::string() : "_g" + std::to_string(group);
+  return "_g" + std::to_string(group);
 }
 
 // ---- (i) search <= RTN on every group --------------------------------------------------------
 // `int4_group` is the w4a16 group under test: property (i) is a claim about the SEARCH, not
-// about one group, so it is checked at every group the kernel can be built with.
+// about one group, so it is checked at every group the kernel serves.
 bool NeverWorseThanRtn(const std::string& label, const std::vector<float>& w, int N, int K,
                        const std::vector<float>& imatrix, bool weighted, int int4_group) {
   const float* wt_all = weighted ? imatrix.data() : nullptr;
@@ -142,11 +141,11 @@ int main() {
   const std::string dir = R4DX_CONVERT_FIXTURES_DIR;
   bool ok = true;
 
-  // Every int4 group r4d_gemm_w4a16_nt_m64 can be built with (R4DX_W4A16_GROUP must be a multiple
-  // of the kernel's 64-wide packed block, so 64 and 128 are the whole set). All three properties
-  // below are claims about the SEARCH, not about one group, so each is checked at both -- and the
-  // default build therefore gates the group-64 path too.
-  const int kInt4Groups[] = {128, 64};
+  // Every int4 group r4d_gemm_w4a16_nt_m64_g serves. Properties (i) and (ii) below are claims about
+  // the SEARCH, not about one group, so each is checked at both; (iii) needs a fixture, which
+  // exists at the default group only.
+  const int kInt4Groups[] = {64, 32};
+  const int kFixtureGroups[] = {64};
 
   // ---- (i) on a random Gaussian matrix, unweighted and imatrix-weighted ----------------------
   {
@@ -270,7 +269,7 @@ int main() {
         imp.data = imatrix.data();
         imp.size = K;
       }
-      for (int int4_group : kInt4Groups) {
+      for (int int4_group : kFixtureGroups) {
         const std::string g = GroupSuffix(int4_group), tag = " g" + std::to_string(int4_group);
         {
           std::vector<uint8_t> q, zero;

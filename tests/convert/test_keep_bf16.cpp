@@ -13,8 +13,7 @@
 //      layout leaked through, the loader (container.cpp's LoadQuantLinearWithFallback tier 1)
 //      would silently pick it and the whole experiment would measure the baseline again.
 //   3. ACCOUNTING: the reported byte delta is the real one -- LinearLayoutBytes must agree with
-//      what ContainerWriter actually plans, for every LayoutSet, at whatever R4DX_W4A16_GROUP this
-//      build uses.
+//      what ContainerWriter actually plans, for every LayoutSet, at the default w4a16 group.
 //
 // Plus the two failure modes the CLI contract names: an invalid regex is a hard error, and a valid
 // regex that matches nothing is a WARNING (a scripted sweep over a list of class regexes must not
@@ -181,8 +180,8 @@ int main() {
   }
 
   // ---- 3. accounting ------------------------------------------------------------------------
-  // LinearLayoutBytes must equal what ContainerWriter really plans, for every LayoutSet -- at this
-  // build's R4DX_W4A16_GROUP, whatever it is. N,K chosen divisible by 16 and by every group size.
+  // LinearLayoutBytes must equal what ContainerWriter really plans, for every LayoutSet -- at the
+  // default w4a16 group. N,K chosen divisible by 16 and by every group size.
   {
     const int N = 64, K = 512;
     const LayoutSet sets[] = {

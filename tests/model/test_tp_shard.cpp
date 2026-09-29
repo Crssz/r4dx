@@ -125,9 +125,7 @@ const Variant kVariants[] = {
     {"w4a16 g32", Scheme::kW4a16, 32},
     {"w4a16 search+imatrix g32", Scheme::kW4a16Search, 32},
     {"w4a16 g64", Scheme::kW4a16, 64},
-    {"w4a16 g128", Scheme::kW4a16, 128},
     {"w4a16 search+imatrix g64", Scheme::kW4a16Search, 64},
-    {"w4a16 search+imatrix g128", Scheme::kW4a16Search, 128},
 };
 
 struct PackedPart {
@@ -289,7 +287,7 @@ void CheckRowSlice(const std::string& what, const std::vector<float>& w, int64_t
 }
 
 // Column slice of W[N, K] to `cols`, every packable layout. When the range breaks the alignment of
-// any part of a layout (e.g. a 17 x 64 K range against group-128 scales), that layout cannot be
+// any part of a layout (e.g. a K range that is not whole scale groups), that layout cannot be
 // split at all: every misaligned part must make PlanCols throw, and the layout is skipped.
 // Returns the number of layouts refused.
 int CheckColSlice(const std::string& what, const std::vector<float>& w, int64_t N, int64_t K,
@@ -576,7 +574,6 @@ void TestRealPlans() {
       {"bf16", {{Part::kBf16, 0}}},
       {"w4a16 g32", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 32}}},  // quant2 Q3 per-tensor group
       {"w4a16 g64", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 64}}},
-      {"w4a16 g128", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 128}}},
   };
   struct Linear {
     const char* base;
@@ -857,13 +854,13 @@ void TestDesignCases() {
           "10.2 K=1536: every layout splits at 768");
   }
   // cols: per-rank K = 1088 = 17 x 64 (full K 2176), mirroring mlp.down's per-rank 8704 = 17 x 512:
-  // legal for bf16 and w4a16 at g=64; the two group-128 layouts (w4a16 g128 RTN/search) must
-  // refuse.
+  // legal for bf16 and w4a16 at g=32 and g=64. A scale group wider than the rank K (128 is no
+  // group any layout uses; the slicer takes any) cannot split there.
   {
     const auto w = RandomW(64, 2176, 24);
-    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 2 &&
-              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 2,
-          "10.2 rank K 17 x 64: exactly the two group-128 layouts are refused");
+    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 0 &&
+              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 0,
+          "10.2 rank K 17 x 64: every layout splits");
     Check(Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {0, 1088}); }) &&
               Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {1088, 1088}); }),
           "10.2: a 17 x 64 rank K cannot split a group-128 scale tensor");
@@ -995,7 +992,7 @@ void TestTrellisPlans() {
 
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
-  std::printf("r4dx_convert::kW4A16Group = %d (build default); packing at g=64 and g=128 below\n",
+  std::printf("r4dx_convert::kW4A16Group = %d (build default); packing at g=32 and g=64 below\n",
               r4dx_convert::kW4A16Group);
   TestRuleForReal();
   TestRealPlans();

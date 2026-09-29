@@ -78,14 +78,9 @@ int main() {
   // ---- build a real (mini) container through the same helpers main.cpp's --dflash-gguf uses ----
   LayoutSet layouts;
   layouts.bf16 = true;
-  layouts.w4a16 = true;  // exercise one quantized layout too (K=64 divisible by 128? NO -- see below)
-  // kInt4Group is 128; this mini's K's (64, 128) -- 64 is NOT divisible by 128, so w4a16 would
-  // fail PlanLinearLayouts's RequireDivisible for the K=64 linears (q_proj/conv_proj/etc). The
-  // real model's every quantizable K (5120/17408/25600/1280) is a multiple of 128; this mini
-  // fixture's whole point is to be small, which conflicts with that constraint for a genuine
-  // 4-bit-layout round trip. bf16-only is therefore what this container-shape/orientation test
-  // exercises for the GEMM-style linears; the w4a16 packer already has its
-  // own dedicated byte-exactness coverage (test_pack_bytes.cpp, test_kernel_decode.cpp) against
+  // bf16-only is what this container-shape/orientation test exercises for the GEMM-style linears
+  // (this mini fixture's whole point is to be small); the w4a16 packer already has its own
+  // dedicated byte-exactness coverage (test_pack_bytes.cpp, test_kernel_decode.cpp) against
   // real-sized fixtures, so re-deriving that here would duplicate coverage rather than add any.
   layouts.w4a16 = false;
 

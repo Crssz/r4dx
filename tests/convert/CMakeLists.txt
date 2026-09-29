@@ -139,7 +139,7 @@ add_test(NAME convert_keep_bf16 COMMAND convert_keep_bf16)
 # --w4a16-group-rule (docs/quant2.md section 5, Q3; w4a16_groups.hpp): rule parsing and first-match
 # selection over real base names, planning checks (K % g, K % 64, N % 16, the bf16-companion guard),
 # byte accounting at mixed groups (LinearLayoutBytes, --keep-bf16's extra bytes), the renamed
-# `.w4a16.wsz.g<g>` tensor and its bytes, LDLQ at g32/g128 through EmitLinearLayouts, and -- when
+# `.w4a16.wsz.g<g>` tensor and its bytes, LDLQ at g32/g64 through EmitLinearLayouts, and -- when
 # r4dx-convert is built -- the exe's --selftest: byte-identical to pre-Q3 without rules, the
 # __metadata__ map and run record with them, and the refusals. CPU-only (the exe only asks r4d_core
 # which groups it instantiates).

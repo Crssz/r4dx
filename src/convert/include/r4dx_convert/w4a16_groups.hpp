@@ -19,7 +19,7 @@
 // A container converted without the flag is byte-identical to one converted before it existed.
 //
 // Failure modes, all deliberate:
-//   - a malformed rule, an invalid regex or a group other than 32/64/128 is an argument error before
+//   - a malformed rule, an invalid regex or a group other than 32/64 is an argument error before
 //     any shard is read;
 //   - a linear whose K is not a multiple of its group and of 64 (the packed block), or whose N is
 //     not a multiple of 16, is a PLANNING error naming the rule -- before the header is written;
@@ -35,7 +35,7 @@
 //     a sweep scripted over a candidate list must not die on a class this checkpoint lacks;
 //   - with --dflash-gguf the flag is an argument error (the drafter loader reads one group).
 // --keep-bf16 wins over a rule (a kept linear has no w4a16 layout); --ldlq composes (LDLQ rounds at
-// the linear's own group -- 32, 64 and 128 all divide its 128-column block).
+// the linear's own group -- 32 and 64 both divide its 128-column block).
 #pragma once
 
 #include <cctype>
@@ -64,7 +64,7 @@ struct W4a16GroupRule {
 inline W4a16GroupRule ParseW4a16GroupRule(const std::string& spec) {
   const size_t eq = spec.rfind('=');
   const std::string usage = "--w4a16-group-rule: expected \"<ECMAScript regex>=<group>\" with group "
-                            "32, 64 or 128, got '" + spec + "'";
+                            "32 or 64, got '" + spec + "'";
   if (eq == std::string::npos || eq == 0 || eq + 1 >= spec.size()) throw std::runtime_error(usage);
   W4a16GroupRule r;
   r.spec = spec;
@@ -77,7 +77,7 @@ inline W4a16GroupRule ParseW4a16GroupRule(const std::string& spec) {
   r.group = std::stoi(g);
   if (!IsW4A16GroupSupported(r.group)) {
     throw std::runtime_error("--w4a16-group-rule '" + spec + "': group " + g +
-                             " is not one r4d_gemm_w4a16_nt_m64_g instantiates (32, 64, 128)");
+                             " is not one r4d_gemm_w4a16_nt_m64_g instantiates (32, 64)");
   }
   try {
     r.re = std::regex(r.pattern, std::regex::ECMAScript);

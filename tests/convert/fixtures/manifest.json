@@ -1,9 +1,8 @@
 {
   "N": 32,
   "K": 256,
-  "int4_group": 128,
+  "int4_group": 64,
   "int4_groups": [
-    128,
     64
   ]
 }

@@ -167,9 +167,8 @@ target_include_directories(test_prefill_chunk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 add_test(NAME test_prefill_chunk COMMAND test_prefill_chunk)
 
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
-# covers must be launchable at THIS build's kernel groups -- the table is swept at one
-# R4DX_W4A16_GROUP but compiled into both builds (linear.cpp's ResolveTuning skips the rows that
-# are not). Host-only (no HIP call, no container), so it always runs; HIP_VISIBLE_DEVICES=1 only
+# covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group
+# (linear.cpp's ResolveTuning skips the rows that are not launchable at another). Host-only (no HIP call, no container), so it always runs; HIP_VISIBLE_DEVICES=1 only
 # because linking r4dx_model loads the HIP runtime, which must never see device 0.
 add_executable(test_pick_tuning test_pick_tuning.cpp)
 target_include_directories(test_pick_tuning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
@@ -203,7 +202,7 @@ add_test(NAME test_rotation_meta COMMAND test_rotation_meta)
 # test_w4a16_group_meta: quant2 Q3's `__metadata__.quant.w4a16.groups` parse and scale-tensor names
 # (src/model/w4a16_group_meta.h, header-only and HIP-free), read back from r4dx-convert's own
 # W4a16GroupRules, and each group's TP=2 wsz slices (docs/quant2.md section 5.1). CPU-only, like
-# test_rotation_meta; r4dx_convert supplies the converter headers and its R4DX_W4A16_GROUP.
+# test_rotation_meta; r4dx_convert supplies the converter headers and its kW4A16Group.
 add_executable(test_w4a16_group_meta test_w4a16_group_meta.cpp)
 target_link_libraries(test_w4a16_group_meta PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_w4a16_group_meta COMMAND test_w4a16_group_meta)

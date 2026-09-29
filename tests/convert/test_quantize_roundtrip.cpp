@@ -31,12 +31,9 @@ bool CheckBound(const std::string& label, double rel_err, double bound) {
   return true;
 }
 
-// The int4 quantizers take the group as a plain argument, so both grids are exercised at every
-// group r4d_gemm_w4a16_nt_m64 can be built with (R4DX_W4A16_GROUP; the kernel needs a multiple of
-// its 64-wide packed block, so 64 and 128 are the whole set). Running both HERE rather than only
-// at whatever group this build happens to be configured with means the default build gates the
-// group-64 path too.
-const int kGroups[] = {128, 64};
+// The int4 quantizer takes the group as a plain argument, so the grid is exercised at every group
+// r4d_gemm_w4a16_nt_m64_g serves: the default, 64, and 32.
+const int kGroups[] = {64, 32};
 
 bool CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
   using namespace r4dx_convert;
@@ -55,8 +52,8 @@ bool CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
   }
   // Bound tightened from 0.25 to ~1.3x the observed 0.0999 (review finding, minor: 0.25 was
   // ~2.5x observed, loose enough that a regression doubling quantization error would still pass).
-  // A smaller group only ever lowers the error (0.0999 at 128, 0.0836 at 64), so one bound covers
-  // both -- it is the loosest group that has to clear it.
+  // A smaller group only ever lowers the error (0.0836 at 64), so one bound covers both -- it is
+  // the loosest group that has to clear it.
   return CheckBound("w4a16 asymmetric g" + std::to_string(group), RelL2Error(w, recon), 0.13);
 }
 

@@ -55,8 +55,7 @@ def main() -> None:
     out_dir = pathlib.Path(__file__).resolve().parents[2] / "tests" / "convert" / "fixtures"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    N, K = 32, 256  # N multiple of 16 (2 row-tiles); K multiple of 128, 64 and 32 (both int4
-                    # groups)
+    N, K = 32, 256  # N multiple of 16 (2 row-tiles); K multiple of 64 and 32 (the int4 groups)
     rng = np.random.default_rng(1234)
     raw = rng.normal(0.0, 1.0, size=(N, K)).astype(np.float32)
     bf16_u16 = float_to_bf16_u16(raw).reshape(N, K)
@@ -64,17 +63,14 @@ def main() -> None:
 
     write_bf16_safetensors(str(out_dir / "input.safetensors"), "w", bf16_u16, (N, K))
 
-    # The int4 fixtures exist at every group r4d_gemm_w4a16_nt_m64 can be built with
-    # (R4DX_W4A16_GROUP: a multiple of the kernel's 64-wide packed block, so 64 and 128 are the
-    # whole set). The 128 set keeps its historical unsuffixed filenames -- it is the ground truth
-    # every earlier milestone was gated against and its bytes must not move -- and each other group
-    # g gets a "_g{g}" suffix.
-    int4_groups = [128, 64]
-    manifest = {"N": N, "K": K, "int4_group": w4_ref.GROUP, "int4_groups": int4_groups}
+    # The int4 fixtures exist at the default w4a16 group, 64 (kW4A16Group); each group g gets a
+    # "_g{g}" suffix.
+    int4_groups = [64]
+    manifest = {"N": N, "K": K, "int4_group": 64, "int4_groups": int4_groups}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     def gsfx(group: int) -> str:
-        return "" if group == w4_ref.GROUP else f"_g{group}"
+        return f"_g{group}"
 
     for group in int4_groups:
         g = gsfx(group)

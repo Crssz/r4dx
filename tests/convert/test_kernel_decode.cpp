@@ -99,19 +99,16 @@ void CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
 }  // namespace
 
 int main() {
-  const int N = 64, K = 512;  // N multiple of 16; K multiple of 64, 128 and 32
+  const int N = 64, K = 512;  // N multiple of 16; K multiple of 64 and 32
   std::mt19937 rng(7);
   std::normal_distribution<float> dist(0.0f, 1.0f);
   std::vector<float> w(static_cast<size_t>(N) * K);
   for (auto& v : w) v = dist(rng);
 
-  // Both w4a16 groups r4d_gemm_w4a16_nt_m64 can be built with (R4DX_W4A16_GROUP: a multiple of the
-  // kernel's 64-wide packed block, so 64 and 128 are the whole set). The decode below re-derives
-  // the kernel's own indexing from R4D_GEMM_W4_GROUP-parameterized source, so it is exactly the
-  // group-64 wsz stride (`t*nsz + kbase/GROUP`, `bpg = GROUP/64`) that has to be gated here.
-  for (int group : {128, 64}) {
-    CheckW4A16(w, N, K, group);
-  }
+  // The default w4a16 group. The decode below re-derives the kernel's own indexing from
+  // R4D_GEMM_W4_GROUP-parameterized source, so it is exactly the group-64 wsz stride
+  // (`t*nsz + kbase/GROUP`, `bpg = GROUP/64`) that has to be gated here.
+  CheckW4A16(w, N, K, 64);
   // Per-tensor w4a16 group 32 (docs/quant2.md section 5, --w4a16-group-rule): the kernel's G = 32
   // body splits each packed 64-K block into two groups -- k steps 0,1 read (scale, zero) dword
   // `t*nsz + kbase/32 + 2b`, k steps 2,3 dword `... + 2b + 1` -- which is k / 32 for every k of the

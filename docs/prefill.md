@@ -1,8 +1,13 @@
 # Prefill: long-prompt TTFT
 
 **Goal:** cut cold time-to-first-token for long prompts (8k to 128k) on Qwen3.8-27B. The model is a
-hybrid of 48 GDN and 16 full-attention layers, with fp8 paged KV, head 256 and gqa 6. Work runs
-through `qwen38-27b-trellis-mix45m.r4dx` on 2x R9700.
+hybrid of 48 GDN and 16 full-attention layers, with fp8 paged KV, head 256 and gqa 6. The M0 and M1
+work below ran through the base `qwen38-27b-trellis-mix45m.r4dx` on 2x R9700; since 2026-09-29 the
+default of `tools/prefill/*.ps1` is the Huihui abliterated `huihui-qwen38-27b-abl-trellis-mix45m.r4dx`
+(same recipe and shapes, so the M1 conclusions -- exact-wide is bit-identical to the dense kernel --
+are properties of the kernels and carry over; the base container and the M0 dense KL/TTFT dumps
+under `D:\models\r4dx\prefill-m0` are historical: a lossy M2 mode would need its dense baseline
+re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
 
 - **M0:** measure. A long-context eval kit, a profile of where prefill time goes, and dense accuracy
   baselines.

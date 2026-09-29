@@ -118,7 +118,7 @@ its own build directory, or re-convert the container with this build's r4dx-conv
 ```
 
 The two ways out are exactly the two the message names: re-convert (the production container is now
-`qwen38-27b-v6.r4dx`, packed at 64 -- README's convert command), or build group 128 in its own build
+the Huihui trellis mix4.5m, whose w4a16 parts are packed at 64 -- README's convert commands), or build group 128 in its own build
 directory with the `win-hip-g128` preset:
 
 ```powershell
@@ -153,20 +153,26 @@ its path through `r4dx_test::ContainerPath` (`tests/model/test_container_path.h`
    `r4d_gemm_w4a16_nt_m64_group()` -- the same number the loader checks the container against:
    group 128 -> `D:\models\r4dx\<name>` (unchanged), group 64 -> `D:\models\r4dx\g64\<name>`.
 
-The tests that need the **real 64-layer container** (`test_dflash_e2e`, `test_vision_tower`, and
-the defaults of the `tool_*` diagnostics) use `ProductionTargetPath()` / `ProductionDrafterPath()`
-from the same header, which pick the production pair packed at the build's group:
-`qwen38-27b-v6.r4dx` + `qwen38-27b-dflash2-w4a16-g64.r4dx` at 64, `qwen38-27b-v3.r4dx` +
-`qwen38-27b-dflash2-w4a16.r4dx` at 128, both in `D:\models\r4dx\`. `R4DX_TEST_CONTAINER_DIR` does
-not apply to that pair (no 64-layer container is copied into `g64\`).
+The tests that need the **real 64-layer container** (`test_dflash_e2e`, `test_vision_tower`, the
+real-container cases of `test_tp_emulation` / `test_tp_real_vs_emulation`, and the defaults of the
+`tool_*` diagnostics) use `ProductionTargetPath()` / `ProductionDrafterPath()` /
+`ProductionLayoutName()` from the same header, which pick the production pair packed at the build's
+group: the Huihui abliterated trellis mix4.5m `huihui-qwen38-27b-abl-trellis-mix45m.r4dx` (layout
+`trellis`) + `qwen38-27b-dflash2-w4a16-g64.r4dx` at 64, `qwen38-27b-v3.r4dx` (w4a16) +
+`qwen38-27b-dflash2-w4a16.r4dx` at 128 (v3 no longer exists, so those tests SKIP on a `win-hip-g128`
+build), both in `D:\models\r4dx\`. The previous production container, the base `qwen38-27b-v6.r4dx`
+(w4a16), was retired on 2026-09-29 with the base checkpoint; the tokenizer tests
+(`R4DX_TOKENIZER_MODEL_DIR`) and `test_keep_bf16` (`R4DX_HF_CHECKPOINT`) read the Huihui checkpoint dir
+`D:\models\Huihui-Qwen3.8-27B-abliterated` (byte-identical tokenizer files; layers 0-3 unchanged).
+`R4DX_TEST_CONTAINER_DIR` does not apply to that pair (no 64-layer container is copied into `g64\`).
 
 So **no environment variable is needed on either build** -- plain `ctest --preset win-hip` and
 `ctest --preset win-hip-g128` (or `ctest --test-dir build\win-hip[-g128]` with
 `HIP_VISIBLE_DEVICES=1`) each read the containers of their own group:
 
 ```powershell
-.\build.ps1;                         ctest --preset win-hip        # group 64: g64\ + v6
-.\build.ps1 -Preset win-hip-g128;    ctest --preset win-hip-g128   # group 128: D:\models\r4dx\ + v3
+.\build.ps1;                         ctest --preset win-hip        # group 64: g64\ + the Huihui trellis container
+.\build.ps1 -Preset win-hip-g128;    ctest --preset win-hip-g128   # group 128: D:\models\r4dx\ (no production container)
 $env:R4DX_TEST_CONTAINER_DIR = 'E:\elsewhere'; ctest --preset win-hip   # optional override
 ```
 
@@ -178,8 +184,10 @@ catches what would otherwise escape `main()` and end the process as `0xc0000409`
 `tools/server/smoke.ps1` follow the same rules through `tools/r4dx_containers.ps1`: with no
 `-Model`/`-Dflash` they read `R4DX_W4A16_GROUP` from the `CMakeCache.txt` of the build directory
 whose executable they run (`build\win-hip`, or `build\<Preset>` for `smoke.ps1`) and pick the
-matching production pair (the validators) or 4-layer test container (`smoke.ps1`). An explicit
-`-Model` / `-Dflash` always wins.
+matching production pair (the validators; the layout too, `Get-R4dxProductionLayout`) or 4-layer
+test container (`smoke.ps1`). An explicit `-Model` / `-Dflash` always wins. The validators' `-Layouts`
+default is the production container's layout (`trellis`), or `w4a16,w4a8,mxfp4` when `-Model` is given
+explicitly.
 
 The recipe for regenerating `g64\` (six containers, ~52 GiB, ~3 min of CPU) is:
 
@@ -190,7 +198,7 @@ $dir = 'D:\models\r4dx\g64'
 # qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16,w4a8,mxfp4 --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-mtp-draftvocab.r4dx: as -l4-mtp plus --draft-vocab-ids <ids.json> (see below)
 # the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --out ... --layout {bf16,w4a16}
-.\build\win-hip\src\convert\r4dx-convert.exe --input C:\AI\models\Qwen3.8-27B --output "$dir\..." ...
+.\build\win-hip\src\convert\r4dx-convert.exe --input D:\models\Huihui-Qwen3.8-27B-abliterated --output "$dir\..." ...
 ```
 
 `qwen38-27b-l4-mtp-draftvocab.r4dx` **is** in `g64\`, and it is the one container whose regeneration
@@ -200,7 +208,7 @@ longer on disk, so it was rebuilt from a fresh arbitrary 4096-id subset (the 141
 correctness plumbing, not about which ids, so any 4096-id list does. Without it `test_mtp`'s
 reduced-vocab cases drop to `[SKIP]` on a default build even though that path is on by default in
 production. There is no 64-layer container in `g64\` (not worth a 42 GiB copy): the group-64
-build's real-container tests use the production `qwen38-27b-v6.r4dx` instead, as above.
+build's real-container tests use the production Huihui trellis container instead, as above.
 
 A bf16 or mxfp4 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
 does. `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is

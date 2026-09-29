@@ -6,6 +6,20 @@ EXL3/QTIP trellis format specified in `docs/trellis.md` into something that can 
 (`tools/reference/trellis_quant.py`, currently running on GPU 1) decides **whether** it ships; this
 document decides **how**.
 
+**Update 2026-09-29 (after the fact, the rest of this file is unchanged history).** The default
+container is now the Huihui abliterated trellis mix4.5m (`huihui-qwen38-27b-abl-trellis-mix45m.r4dx`,
+`docs/huihui.md`). Everything below that names a container, Hessian or KL reference of the BASE model
+(q2ab_hv2_q3, v6, `qwen38-27b-trellis-mix45m.r4dx`, K4m, `hessian\hessian-v2`, `trellis-q\K4m`,
+`kl-canon\ref`) describes the run that shipped the format; those base files were retired on
+2026-09-29 and every number stays as the historical record. **Gate A6 (no w4a16 regression) has lost
+its 64-layer target** (v6 / q2ab_hv2_q3 were the only 64-layer w4a16 containers; the old Huihui v6 is
+the same recipe on the other model and is not kept either): from now on A6 is `tests/kernels` +
+`test_mtp` / `test_tp_loader` / `test_tp_emulation` / `test_tp_real_vs_emulation` / row 6 of
+`tools/tp/tp1_identity.ps1` on the 4-layer `l4-allmtp` (bf16, w4a16 g64, w4a8 g128, mxfp4 g32, MTP,
+byte-identical against the frozen `tp1-f7d4927` and `tp1-1099446` baselines), which cover the w4a16
+kernel and loader at 4 layers only. `docs/huihui.md` "Coverage" lists exactly what that leaves
+untested at depth.
+
 **Notation.** `K` means in_features and `N` means out_features, using r4dx's `W[N, K]`. `KB` is the
 number of trellis bits per weight, which `docs/trellis.md` calls K. A tile is 16 k × 16 n.
 "Oracle bits" are the `.trellis` / `.suh` / `.svh` tensors written by `quantize-model`

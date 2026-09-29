@@ -1,6 +1,31 @@
 # Status
 
+## Default container: the Huihui abliterated trellis mix4.5m; base files retired, 2026-09-29
+
+`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx` with `--layout trellis` (details, frozen
+regression values and coverage: [huihui.md](huihui.md)). It is the same recipe as the base trellis
+mix4.5m below with every calibration artifact taken from the Huihui model. Against its own bf16
+reference: runtime KL **0.00788**, top-1 **95.70%** (oracle 0.00575 / 96.48%); TP=1 plain 36.67 tok/s,
+`--dflash k=7` 108.21 (the drafter was trained for the base model, so it accepts less), prefill 1131
+tok/s; G6 `-Layout trellis` 5/5; TP=2 real smoke with vision + DFlash 207 PASS.
+
+- **What "default" now means in the repo:** `ProductionTargetPath()` / `Get-R4dxProductionTarget`
+  return this container (with `ProductionLayoutName()` / `Get-R4dxProductionLayout` = `trellis`),
+  `--tokenizer-dir` and every tokenizer / checkpoint default point at
+  `D:\models\Huihui-Qwen3.8-27B-abliterated` (its tokenizer files are byte-identical to the base's),
+  `tools/prefill/*.ps1`, `g6_validate.ps1`, `bench_decode.ps1`, `trellis_oracle.ps1`,
+  `trellis_convert.ps1` and `trellis_quant.py --hessian-dir` default to the Huihui files.
+- **Retired (base model):** `qwen38-27b-v6.r4dx`, the base trellis mix4.5m / K4m containers, the base
+  Hessians and trellis bits, the base HF checkpoint and the old `huihui-qwen38-27b-abl-v6.r4dx`. Every
+  base number below (KL 0.00747, K4m's speed option, v6's 0.03851) is a historical record of the first
+  run of the recipe, not a recommendation.
+- **Coverage note:** the 64-layer w4a16 / w4a8 / mxfp4 containers went with them; those layouts stay
+  covered at 4 layers by `l4-allmtp` (bf16, w4a16 g64, w4a8 g128, mxfp4 g32, MTP). See
+  [huihui.md](huihui.md) "Coverage" for exactly what that leaves untested at depth.
+
 ## Trellis weights pass every ship gate (branch `quant2`, landed on main), 2026-09-28
+
+*Base-model measurements; the containers in this table were retired on 2026-09-29 (see above).*
 
 The 400 decoder linears in EXL3/QTIP's trellis format, run by a native RDNA4 WMMA kernel (libr4d
 branch `trellis`, `r4d_gemm_trellis_nt_m64`; `--layout trellis`). Design, gates and measurements:
@@ -14,9 +39,10 @@ speed: [perf.md](perf.md) top section.
 | **trellis-mix45m (recommended)** | 13.55 GiB | **0.00747** | 96.26% | 36.69 / 116.55 / 77.65 | A0-A2, A4-A6; A3 misses `--mtp 3` by 1.8% (acceptance), inside D1's 4% |
 | trellis-k4m (speed) | 12.13 GiB | 0.01004 | 95.53% | 40.34 / 123.52 / 81.98 | all, A3 +11% / +13% / +4% |
 
-- **Recommended container:** `D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx` with `--layout trellis`
-  (accuracy first, then speed, native RDNA4). Prefill is 1.55x q2ab's (K4m 1.60x). Speed option:
-  `D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx`.
+- **Recommended container (then, base model):** `D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx` with
+  `--layout trellis` (accuracy first, then speed, native RDNA4). Prefill is 1.55x q2ab's (K4m 1.60x).
+  Speed option: `D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx`. Both were retired on 2026-09-29; the
+  recommendation is now the Huihui trellis mix4.5m above.
 - **q2ab is retired.** q2ab_hv2_q3 is no longer a recommendation or kept on disk; its row above is
   the historical baseline the gates were measured against. The w4a16 path itself is unchanged and
   supported.

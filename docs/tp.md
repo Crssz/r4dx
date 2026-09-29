@@ -1639,7 +1639,7 @@ stderr lines (N26). The baseline stays valid for the whole branch
 because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own table (2.7), and the
 `PrefixState` fix only touches the server's error path.
 
-| Row | Command (v6 unless noted) |
+| Row | Command (production container = the Huihui trellis mix4.5m with `-Layout trellis` since 2026-09-29, base v6 w4a16 before; row 6 always the 4-layer `l4-allmtp`) |
 |---|---|
 | 1 | standard protocol, plain greedy |
 | 2 | standard protocol + `--dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` |
@@ -1659,6 +1659,34 @@ attention rescales per row past 16 x segments keys. So the `aa54c20` baseline no
 TP=1 output byte for byte. The same three binaries, built at `f7d4927` (libr4d `a30b186`), now live
 outside any worktree at `%USERPROFILE%\dev\r4dx-baselines\tp1-f7d4927\` with their hashes in
 `BASELINE.txt`; pass that directory as `-Baseline`. The old `aa54c20` copy is archived, not deleted.
+
+**Second baseline, 2026-09-29, `1099446` (trellis-capable).** `tp1-f7d4927` predates the trellis
+loader, so it cannot run the production container (the Huihui trellis mix4.5m since 2026-09-29; the
+w4a16 base v6 it used to run was retired). The three binaries built at main `1099446` (libr4d
+`dec5a4f`; the C++ tree of branch `huihui` `b512207` is identical) are frozen in
+`%USERPROFILE%\dev\r4dx-baselines\tp1-1099446\` (hashes in `BASELINE.txt`, never rebuilt). Use it as
+`-Baseline` for rows 1-5 and 7-9 on the default container (the script now takes `-Layout`, default
+`trellis`, and passes `--tokenizer-dir` explicitly, so a baseline binary's compiled-in default never
+matters); `tp1-f7d4927` stays valid for row 6 and for any w4a16 container (`-Model <w4a16> -Layout
+w4a16`). Determinism was confirmed before freezing: the baseline binaries run against themselves on the
+container (`-Baseline X -Candidate X`) reproduced every row byte for byte, and the post-change build
+(the default-container / tokenizer-dir commits of branch `huihui`) matched them on every row. The
+frozen values (full SHA-256 in `FROZEN_HASHES.txt` next to the binaries, 12-character prefixes here):
+
+| row | text | token ids | `[stats]` lines |
+|---|---|---|---|
+| 1 plain greedy | `07D20D19DC15` | `86365620ADF5` | -- |
+| 2 `--dflash` k=7 | `07D20D19DC15` | `942E071DFBC1` | 1 |
+| 3 `--mtp 3` | `07D20D19DC15` | `942E071DFBC1` | 1 |
+| 4 sampled (seed 1) | `5EA4E8ECCC66` | `BC99FABA783A` | 1 |
+| 5 sampled + `--dflash` | `5EA4E8ECCC66` | `FDBC0EEC9397` | 2 |
+| 7 vision | `010D526E5CFB` | `7C2A846E3717` | -- |
+| 8 sampled + `--mtp 3` | `5EA4E8ECCC66` | `C8EE6419987F` | 2 |
+| 9 `--chat`, 2 turns | `FB7DBF6BE6BC` | `92120A1F749F` | -- |
+
+Greedy text is the same under plain, DFlash and MTP (rows 1-3), and the sampled text the same under
+plain, DFlash and MTP (rows 4, 5, 8): speculation is lossless on the trellis container too. Row 6 (all
+four layouts) is EQUAL against both baselines.
 
 ### 10.4 Emulation vs real, KL vs TP=1
 
@@ -1689,6 +1717,24 @@ G4: `kl_v6_tp2emu.json` overall mean KL <= 0.0435, top-1 >= 90.43%; `kl_tp1_vs_t
 reported (expected mean KL ~1e-3). G6: no throw; the emulate and real dumps come from one binary
 (hash recorded), so a P3/P4 change to kernels, tunings or defaults can never make G6 compare
 against a stale reference.
+
+**G4 on the production container (2026-09-29, the Huihui trellis mix4.5m, `--layout trellis`).** The
+block above is the base v6 w4a16 record (its references, `kl_out\ref` and `kl-canon\ref`, are gone). The
+same measurement on the production container, `tokens_canon.json`, `--max-ctx 4096 --vision off`, against
+the model's own bf16 reference `D:\models\r4dx\huihui\kl-ref` (`tools\quant2\kl_rung4.ps1` is the TP=1
+gate, with `--tp 2 --tp-mode emulate` added to the tool call for the emulated one):
+
+| run | mean KL vs bf16 | top-1 |
+|---|--:|--:|
+| TP=1 | 0.00788 | 95.70% |
+| TP=2 emulated (both ranks on one device) | **0.00806** (+2.3%) | 96.04% |
+| TP=2 emulated against the TP=1 dump | 0.00089 | 98.85% agreement |
+
+The v6 gate (KL <= 1.13 x TP=1's, top-1 >= TP=1 - 0.5 points) holds by this measure too; the emulate dump is
+at `D:\models\r4dx\huihui\rebase\kl-tp2emu-gpu0` (run on device 0, tool + kl_report logs alongside). The
+frozen `tests/model/test_tp_emulation.cpp` distances on this container (MTP replays 4.02e-2, DFlash
+replays 3.88e-2, vision logits 1.46e-2 against 5e-2) and the VRAM the emulated ranks use (19.96 / 22.58 /
+20.50 GiB) are recorded in that file's constants.
 
 ### 10.5 Soak (`tool_tp_soak`)
 

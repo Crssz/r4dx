@@ -1321,7 +1321,11 @@ above -- mutually exclusive with `--mtp N>0`.
 follow-up whose replayed reply does not re-tokenize still reuses the prompt before it -- see
 "Prefix cache, image-aware" above. `off` reclaims its VRAM.
 
-`--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B`, same as `r4dx-cli`. `--think` sets the
+`--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated`, same as `r4dx-cli` (its
+`tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` are
+byte-identical to the base Qwen3.8-27B's, whose `C:\AI\models\Qwen3.8-27B` was the default until
+2026-09-29; the `C:\AI\models\Qwen3.8-27B\chat_template.jinja` references in this document name that
+same file). `--think` sets the
 server-wide default for the chat template's `enable_thinking` when a request's
 `chat_template_kwargs` does not itself set it. `--layers N` loads only the first `N` layers
 (`r4dx::model::ModelOptions::layer_limit`) -- required for a test container that physically carries

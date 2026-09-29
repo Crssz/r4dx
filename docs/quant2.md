@@ -1293,7 +1293,20 @@ hashes equal to the 2026-09-26 run; `tp1_identity.ps1` G2 PASS against the froze
 pre-trellis quant2 binary (2ff3a52) in 12 / 12 cells (4 prompts x plain, `--dflash k=7`,
 `--mtp 3`). Details: trellis-kernel.md 10.7.
 
-**Recommendation: `qwen38-27b-trellis-mix45m.r4dx`, `--layout trellis`.** By the user's rule
+**Default container since 2026-09-29: the Huihui abliterated trellis mix4.5m,
+`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout trellis`** (`docs/huihui.md`).
+The same recipe as the base mix4.5m below, every calibration artifact taken from the Huihui model:
+its Hessians (`D:\models\r4dx\huihui\hessian-v2`, hessian-v2 settings), K4m + K5m and the mix
+(`huihui\trellis-q`), its own bf16 KL reference (`huihui\kl-ref`) and imatrix / kvcalib files. Against
+that reference: oracle (weights only) mean KL 0.00575 / top-1 96.48%, runtime (gate A1 command above)
+**0.00788 / 95.70%** (cpp 0.00583, en 0.00975, py 0.00778, thai 0.00814; base container 0.00747 /
+96.26% against the base reference), 13.546 GiB of decode bytes, G6 `-Layout trellis` 5/5. **The base
+Qwen3.8-27B checkpoint and every container, Hessian and trellis-bit file made from it were retired on
+2026-09-29** (v6, base mix4.5m, K4m, `trellis-q`, `hessian\hessian-v2`); the base figures in this
+section are the record of the recipe's first run, not a recommendation. KL numbers are only comparable
+against the bf16 reference of the SAME model: the base `kl-canon\ref` belongs to the base model.
+
+**Recommendation on the base model (2026-09-28; superseded by the Huihui container above): `qwen38-27b-trellis-mix45m.r4dx`, `--layout trellis`.** By the user's rule
 (accuracy first, then speed, native RDNA4; D1 in trellis-kernel.md 1) it is the most accurate
 container r4dx has -- half q2ab_hv2_q3's KL (0.00747 against 0.01559), top-1 +1.3 points -- at
 slightly fewer decode bytes (13.55 against 13.68 GiB), on a WMMA kernel. It passes A0-A2 and
@@ -1304,41 +1317,53 @@ DFlash, 1.5 GiB smaller, KL 0.01004 -- still 36% below q2ab_hv2_q3) and passes e
 **q2ab is retired (2026-09-28).** The q2ab_hv2_q3 container (and the q2ab + LDLQ w4a16 body recipe
 of sections 4-7) is no longer the baseline or a recommendation, and its containers are no longer
 kept; every q2ab figure in this document is a historical comparison. The default recommendation is
-mix4.5m (`D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx`, `--layout trellis`), K4m
-(`qwen38-27b-trellis-k4m.r4dx`) the speed option. The runtime's w4a16 path, rotation kinds and
+mix4.5m on the Huihui model (`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout
+trellis`, above); the base model's K4m speed option (`qwen38-27b-trellis-k4m.r4dx`) went away with the
+base files -- the Huihui K4m oracle bits exist (`huihui\trellis-q\K4m`) but no Huihui K4m container has
+been built or measured. The runtime's w4a16 path, rotation kinds and
 converter flags stay supported for any container that uses them (and for the trellis containers'
 w4a16 lm_head and MTP head).
 
 **Recipe** (mix4.5m; K4m is the same without steps 2-3 and with `-Oracle K4m`). The reference Python
 is `$env:R4DX_REFERENCE_VENV\Scripts\python.exe` or `python` on PATH (torch ROCm, transformers,
-numpy); the Hessians are hessian-v2 (3.3), now at `D:\models\r4dx\hessian\hessian-v2`.
+numpy; `quantize-model` needs torch 2.13+rocm10 for the MAGMA cholesky, `D:\models\r4dx\huihui\venv-rocm10`);
+the Hessians are hessian-v2 (3.3) of the model being quantized. The paths below are the production
+(Huihui) container's, and they are every default of `trellis_oracle.ps1` / `trellis_convert.ps1` /
+`trellis_quant.py --hessian-dir` / `common.DEFAULT_MODEL_DIR`; the full step-by-step run, with the
+Hessian capture and the bf16 reference, is `D:\models\r4dx\huihui\RECIPE.md`. Another model needs
+`--model-dir` and every directory below passed explicitly (config.json cannot tell two Qwen3.8-27B
+family checkpoints apart).
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-$h = 'D:\models\r4dx\hessian\hessian-v2'
+$m = 'D:\models\Huihui-Qwen3.8-27B-abliterated'
+$h = 'D:\models\r4dx\huihui\hessian-v2'; $q = 'D:\models\r4dx\huihui\trellis-q'
 # 1-3. the oracle's bits (GPU, ~75 min per rate), then EXL3's 4/5 allocation at 4.5 bpw (a manifest)
-python tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched --hessian-dir $h --out-dir D:\models\r4dx\trellis-q\K4m
-python tools\reference\trellis_quant.py quantize-model --device cuda --K 5 --hessian-basis matched --hessian-dir $h --out-dir D:\models\r4dx\trellis-q\K5m
-python tools\reference\trellis_quant.py mix --bpw 4.5 --src D:\models\r4dx\trellis-q\K4m --src D:\models\r4dx\trellis-q\K5m --out-dir D:\models\r4dx\trellis-q\mix4.5m
+python tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched --model-dir $m --hessian-dir $h --out-dir $q\K4m
+python tools\reference\trellis_quant.py quantize-model --device cuda --K 5 --hessian-basis matched --model-dir $m --hessian-dir $h --out-dir $q\K5m
+python tools\reference\trellis_quant.py mix --bpw 4.5 --src $q\K4m --src $q\K5m --out-dir $q\mix4.5m
 # (tools\quant2\trellis_oracle.ps1 -Points mix4.5m runs 1-3 plus the weights-only KL, whose
 #  reference_run.json the next step takes its manifest pin from)
 # 4. the container (CPU, ~2 min, full reconstruction check)
-.\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx
+.\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
 ```
 
 Step 4 runs:
 
 ```
-r4dx-convert --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx
-  --trellis-from D:\models\r4dx\trellis-q\mix4.5m
-  --trellis-manifest-sha256 48a2eacb3f103aad8ed27880ddc16bf4ed1ebe9388a58d7cecbcd93e3f3f7712
+r4dx-convert --input D:\models\Huihui-Qwen3.8-27B-abliterated
+  --output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+  --trellis-from D:\models\r4dx\huihui\trellis-q\mix4.5m
+  --trellis-manifest-sha256 da89573b8d41972bc5a2d971f495b25e2846d29ab400e3687d41f252990d948c
   --trellis-verify full --layouts w4a16 --lm-head w4a16 --no-bf16 --mtp on --vision on
-  --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json --quant search
-  --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz --hessian-dir D:\models\r4dx\hessian\hessian-v2
+  --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json --quant search
+  --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz --hessian-dir D:\models\r4dx\huihui\hessian-v2
   --ldlq . --w4a16-group-rule "^lm_head$=32" --threads 32
 ```
 
-(K4m's pin is `7e9037f4...`, the full value in its `kl-trellis\K4m\reference_run.json`.) The body
+(The base model's first run of this recipe pinned `48a2eacb3f10...` for its mix4.5m and `7e9037f4...` for
+K4m, `kl-trellis\...\reference_run.json`; those manifests were retired with the base files. The Huihui
+pin above is `huihui\kl\mix4.5m\reference_run.json`'s `weights_override.manifest_sha256`.) The body
 flags apply only to the non-trellis linears (lm_head, the MTP head): no `--rotate`, no body group
 rules, no attn.k/v keep. Serve it with `r4dx-server --model <container> --layout trellis` plus the
 usual `--dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` or `--mtp 3`; a

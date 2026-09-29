@@ -1,8 +1,37 @@
 # r4dx end-to-end performance and correctness (assembly + CLI milestone)
 
+**Which model the tables say.** Since 2026-09-29 the default container is the **Huihui abliterated
+trellis mix4.5m** (`huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `docs/huihui.md`). Every measurement in
+this file dated before that -- the base `qwen38-27b-v6.r4dx`, q2ab, the base trellis mix4.5m and K4m,
+and the M0/M1 prefill dumps -- was taken on the BASE Qwen3.8-27B containers, which were retired with
+the base checkpoint; those numbers stay as the historical record (same architecture and kernels, so
+speeds transfer closely, KL numbers do not: a KL is only meaningful against the bf16 reference of
+its own model).
+
+## Huihui trellis mix4.5m: decode and prefill against the base container (2026-09-29)
+
+`tools/quant2/bench_decode.ps1 -Runs 3`, HIP device 1, TP=1, the huihui and base trellis mix4.5m
+containers interleaved run by run on one binary (main 1099446), the protocol of the section below
+(four `tests/model/mtp_prompts.txt` prompts, `--vision off --think off --temperature 0 --max-tokens
+256 --max-ctx 2048`, DFlash2 = `qwen38-27b-dflash2-w4a16-g64.r4dx` at k = 7; prefill = warm >= 256-token
+`--chat` turns). Record: `D:\models\r4dx\huihui\bench\bench.md`.
+
+| mode | base trellis mix4.5m (retired) | **Huihui trellis mix4.5m (default)** | vs base |
+|---|--:|--:|--:|
+| plain | 36.65 | **36.67** | +0.06% |
+| `--dflash k=7` | 116.10 | **108.21** | -6.8% |
+| prefill tok/s | 1116.1 | **1131** | 1.013x |
+
+- Plain decode and prefill are the same speed (same bytes, same kernels; VRAM 16.87 GiB plain, 18.96
+  GiB with DFlash2 on both). The DFlash gap is acceptance, not speed: the per-round time is the same
+  36.4 ms, but the drafter was trained on the base model's features, so it accepts fewer tokens on the
+  abliterated one (prompt by prompt 31.0 / 66.4 / 20.8 / 56.1% against 31.5 / 70.7 / 25.7 / 59.4%).
+- The TP=2 numbers of the next section are the base container's; the Huihui container's TP=2 checks
+  (real smoke with vision and DFlash: 207 PASS / 0 FAIL, no TDR) are in `docs/huihui.md`.
+
 ## Trellis at TP=2 (2026-09-28)
 
-main's build of `88d3b75` (quant2 merged; `build\win-hip`), `--layout trellis --tp 2 --tp-mode real`,
+Base-model containers (mix4.5m and K4m; retired 2026-09-29). main's build of `88d3b75` (quant2 merged; `build\win-hip`), `--layout trellis --tp 2 --tp-mode real`,
 `HIP_VISIBLE_DEVICES` unset: rank 0 on HIP device 1, rank 1 on device 0 with the desktop live,
 production server stopped. The protocol is the one the section below uses:
 `tools/quant2/bench_decode.ps1 -Runs 3` with both containers interleaved run by run. Each entry ends
@@ -65,8 +94,9 @@ three containers interleaved run by run on one binary, four `tests/model/mtp_pro
 mode, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048`, median of the
 per-run token-weighted aggregates; prefill is the warm >= 256-token `--chat` turns of
 `tools/quant2/prefill_prompts.txt`. Every run reproduced its text. (docs/trellis-kernel.md 10.6,
-`D:\models\r4dx\trellis-m5\part3\bench\`.) mix4.5m is the default recommended container, K4m the
-speed option; q2ab_hv2_q3 has since been retired and is kept here as the historical baseline.
+`D:\models\r4dx\trellis-m5\part3\bench\`.) These are the BASE model's containers: mix4.5m and K4m were
+retired on 2026-09-29 (the default is now the Huihui trellis mix4.5m, section above); q2ab_hv2_q3 had
+already been retired and is kept here as the historical baseline.
 
 | mode | q2ab_hv2_q3 (w4a16) | trellis-k4m | vs q2ab | trellis-mix45m | vs q2ab |
 |---|--:|--:|--:|--:|--:|

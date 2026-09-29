@@ -81,7 +81,8 @@ full run, at 64 before `test_pick_tuning` was added, passed all but 1, which ski
 (`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP device 1 (2026-09-23,
 default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
 either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
-production v6/v3 container packed at their own build's w4a16 group (`docs/build-windows.md` "w4a16
+production container (the Huihui trellis mix4.5m, loaded with `--layout trellis`; its w4a16 parts
+are packed at group 64, so it needs the default group-64 build) (`docs/build-windows.md` "w4a16
 group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are
 registered only when the reference venv's `python.exe` exists at configure time; otherwise CMake
 prints a STATUS line saying they were skipped. See `docs/status.md` for
@@ -95,22 +96,34 @@ smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- a
 
 ### Convert a checkpoint to a container
 
+**The default (production) container is the Huihui abliterated trellis mix4.5m,
+`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, run with `--layout trellis`** (since
+2026-09-29; `docs/huihui.md`). It is made with `tools\quant2\trellis_convert.ps1` from the Huihui
+checkpoint `D:\models\Huihui-Qwen3.8-27B-abliterated` and the Hessians, trellis bits and calibration
+files under `D:\models\r4dx\huihui\` (recipe: `D:\models\r4dx\huihui\RECIPE.md`); every default of
+that script names them. The base Qwen3.8-27B checkpoint and every container made from it (v6, the
+base trellis mix4.5m / K4m) were retired on 2026-09-29 -- the Huihui checkpoint has the same
+architecture, tokenizer and chat template (its four tokenizer files are byte-identical), so
+`--tokenizer-dir` defaults to it. The w4a16 recipe below (Milestone 11's v6) still converts and
+runs, on any checkpoint:
+
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v6.r4dx `
+    --input D:\models\Huihui-Qwen3.8-27B-abliterated --output D:\models\r4dx\huihui-qwen38-27b-abl-v6.r4dx `
     --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json `
+    --quant search --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
 ```
 
-That is the **current production container**, `qwen38-27b-v6.r4dx` (42.74 GiB, 418 s): mean KL
-0.03851 / top-1 90.93% against the bf16 reference, 35.96 tok/s plain and 72.93 tok/s on
-`--dflash k=7`. The `--keep-bf16` and the build's w4a16 group of 64 are Milestone 11's two chosen
-levers -- `docs/validation.md` "Milestone 11 / recipe" has why those two and nothing else. Its
-DFlash2 drafter is `qwen38-27b-dflash2-w4a16-g64.r4dx`, converted with `--dflash-gguf ... --quant
-search` (on the drafter, unlike the main model, `search` is worth 9.6% of decode).
+On the base model that command made `qwen38-27b-v6.r4dx` (42.74 GiB, 418 s), the production container
+until 2026-09-29: mean KL 0.03851 / top-1 90.93% against the bf16 reference, 35.96 tok/s plain and
+72.93 tok/s on `--dflash k=7`. The `--keep-bf16` and the build's w4a16 group of 64 are Milestone
+11's two chosen levers -- `docs/validation.md` "Milestone 11 / recipe" has why those two and nothing
+else. The DFlash2 drafter, still the production one, is `qwen38-27b-dflash2-w4a16-g64.r4dx`,
+converted with `--dflash-gguf ... --quant search` (on the drafter, unlike the main model, `search` is
+worth 9.6% of decode).
 
 **Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
 refuses `--layout w4a16` on a container packed at 128 -- `v5` and everything older -- by name, with
@@ -126,8 +139,8 @@ container); omit it to convert all 64. `--kv-calib` fills the fp8 KV cache's per
 a `tools/reference/kv_calibrate.py` JSON (falls back to a `1.0` placeholder per-layer, with a
 stderr warning, if omitted or if a layer is missing from the JSON). `--no-bf16` (docs/r9700.md R1)
 drops the full-model bf16 body layout and the bf16 `lm_head` variant entirely -- the production
-container, `D:\models\r4dx\qwen38-27b-v6.r4dx` (command above), is converted this way
-(w4a8/w4a16/mxfp4 only; bf16 appears only where `--keep-bf16` asks for it, and in the small 4-layer
+containers (the trellis one, and the w4a16 recipe above) are converted this way
+(w4a8/w4a16/mxfp4 or trellis only; bf16 appears only where `--keep-bf16` asks for it, and in the small 4-layer
 test containers, which still pass `--layouts bf16,...` since bf16 is the numerical-reference layout
 rungs 1-3 of `docs/validation.md` need). Omitting `--no-bf16` produces an all-four-layouts container
 including a full bf16 body (~88 GB) -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of
@@ -274,7 +287,7 @@ default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 `
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 128 --temperature 0 --stats
 ```
@@ -283,7 +296,7 @@ Add `--image <path>` (repeatable, any container the vision tower loaded from) to
 picture (docs/vision.md):
 
 ```powershell
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 `
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --image photo.png --prompt "What is in this picture?" --max-tokens 128 --temperature 0 --stats
 ```
 
@@ -291,13 +304,15 @@ In `--chat`, attach an image to the NEXT turn with one or more leading `/image <
 into the REPL before the question itself.
 
 `--layout` selects which quantized (or `bf16`) body-weight variant baked into the container to run
-(`mxfp4` / `w4a16` / `w4a8` / `bf16`) -- as of the Milestone 2 performance pass this now includes
+(`mxfp4` / `w4a16` / `w4a8` / `bf16`, or `trellis` for a trellis container -- the only layout one
+loads with) -- as of the Milestone 2 performance pass this now includes
 attention's `qg`/`o` projections too (they used to always run bf16 regardless of `--layout`; see
 `docs/perf.md`'s "Known limitation", now resolved). `--prompt "..."` renders one turn through
 the real chat template and generates once; `--chat` instead starts an interactive multi-turn REPL
 (re-rendering the whole conversation each turn, feeding only the new tail tokens to the model).
-`--tokenizer-dir` defaults to `C:\AI\models\Qwen3.8-27B` (where `tokenizer.json` /
-`chat_template.jinja` / `generation_config.json` live); `--think {on|off}` toggles the chat
+`--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated` (where `tokenizer.json` /
+`chat_template.jinja` / `generation_config.json` live; byte-identical to the base Qwen3.8-27B's, whose
+checkpoint dir `C:\AI\models\Qwen3.8-27B` was the default until 2026-09-29); `--think {on|off}` toggles the chat
 template's `enable_thinking`; `--temperature 0` selects greedy argmax decoding, otherwise
 temperature/top-k/top-p/min-p sampling with `--seed` applies. `--max-ctx` bounds the KV cache and
 GDN state allocation (default **262144**, matching the checkpoint's own `max_position_embeddings`
@@ -373,7 +388,7 @@ to TP=1: the split changes the order of the sums. Design, gates and measurements
 
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --tp 2 `
+.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --tp 2 `
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 256 --max-ctx 2048 --temperature 0 --stats
 ```
@@ -401,13 +416,15 @@ the group and runs normally:
 
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 `
+.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --host 127.0.0.1 --port 8080 --tp 2 `
     --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 ```
 
 Decode speed, standard protocol, one fresh process per run, TP=1 on device 1 in the same session
-(2026-09-25; the plain row is from the P4 gates, the other two from P5's):
+(2026-09-25, on the base `qwen38-27b-v6.r4dx` at w4a16 -- retired; the plain row is from the P4
+gates, the other two from P5's; the Huihui trellis container's TP=1 numbers are in
+`docs/huihui.md`):
 
 | Path | TP=1 | TP=2 |
 |---|--:|--:|
@@ -427,7 +444,7 @@ has the P5 gates.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 `
+.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --host 127.0.0.1 --port 8080 `
     --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 ```
@@ -502,15 +519,29 @@ tools/          Python reference/validation tooling (read-only against the HF tr
 
 ## Status
 
-**Trellis weights (2026-09-28): `qwen38-27b-trellis-mix45m.r4dx` with `--layout trellis` is the
-default recommended container.** Canonical rung-4 KL 0.00747 (top-1 96.26%) against
-q2ab_hv2_q3's 0.01559 (94.92%) at 13.55 against 13.68 GiB of decode bytes, on a native RDNA4 WMMA
-trellis kernel; decode +1.1% plain, +6.3% `--dflash k=7`, -1.8% `--mtp 3` (acceptance), prefill
-1.55x. `qwen38-27b-trellis-k4m.r4dx` (KL 0.01004, 12.13 GiB) is the speed option: +11% plain, +13%
-DFlash, +3.7% `--mtp 3`, prefill 1.60x. **q2ab is retired**: q2ab_hv2_q3 is quoted only as the
-historical baseline these gains were measured against. Recipe and numbers: `docs/quant2.md` 7.1; gates: `docs/trellis-kernel.md` section 1 and 10;
+**Default container (2026-09-29): the Huihui abliterated trellis mix4.5m,
+`huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, with `--layout trellis`.** Canonical rung-4 KL 0.00788
+(top-1 95.70%) against the Huihui model's own bf16 reference, 13.55 GiB of decode bytes, on a native
+RDNA4 WMMA trellis kernel; TP=1 plain 36.67 tok/s, `--dflash k=7` 108.21 tok/s (lower acceptance
+than on the base model: the DFlash2 drafter was trained for the base), prefill 1131 tok/s. It has the
+base model's trellis mix4.5m recipe (below), every calibration artifact taken from the Huihui model
+itself. Details, the frozen regression baselines and the coverage notes: `docs/huihui.md`. **The base
+Qwen3.8-27B checkpoint and every container made from it are retired** (v6, the base trellis mix4.5m
+and K4m, its Hessians and trellis bits): the numbers below that name them (KL 0.00747, the K4m speed
+option, v6's 0.03851) are historical measurements on the base model, kept as the record of the recipe
+and of the w4a16 path. Recipe and numbers: `docs/quant2.md` 7.1; gates: `docs/trellis-kernel.md` section 1 and 10;
 format: `docs/container-format.md` "Trellis body layout". Everything below about v6 and w4a16 still
 holds for `--layout w4a16` containers.
+
+*Historical (base model, 2026-09-28):* `qwen38-27b-trellis-mix45m.r4dx` had canonical rung-4 KL 0.00747
+(top-1 96.26%) against q2ab_hv2_q3's 0.01559 (94.92%) at 13.55 against 13.68 GiB of decode bytes;
+decode +1.1% plain, +6.3% `--dflash k=7`, -1.8% `--mtp 3` (acceptance), prefill 1.55x.
+`qwen38-27b-trellis-k4m.r4dx` (KL 0.01004, 12.13 GiB) was the speed option: +11% plain, +13% DFlash,
++3.7% `--mtp 3`, prefill 1.60x. Only the base K4m container is gone: the Huihui model's own K4m
+oracle bits exist (`D:\models\r4dx\huihui\trellis-q\K4m`) and `trellis_convert.ps1 -Oracle K4m` would
+build a container from them, but that container has not been built or measured, so none of the base
+K4m figures is claimed for it. **q2ab is retired**: q2ab_hv2_q3 is quoted only as the historical
+baseline these gains were measured against.
 
 **Milestone 11 done: `qwen38-27b-v6.r4dx` is the production container (2026-09-22).** Mean KL
 **0.05342 -> 0.03851** (-27.9%) and top-1 **89.30% -> 90.93%** against the bf16 reference, bought

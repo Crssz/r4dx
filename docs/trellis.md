@@ -1,5 +1,10 @@
 # EXL3 trellis quantization -- an implementable specification (oracle input)
 
+*Note 2026-09-29: the Hessians, oracle bits and KL references named in this document (`hessian-v2`,
+`trellis-q`, `kl-canon\ref`, `kl-trellis`) are the BASE model's and were retired with the base checkpoint;
+the Huihui model's own live under `D:\models\r4dx\huihui\` and are the tools' defaults now
+([huihui.md](huihui.md)). The numbers here stay as the record of the first run.*
+
 Branch `quant2` (worktree `%USERPROFILE%\dev\r4dx-quant2`). Written 2026-09-26. This is the spec the
 **EXL3 oracle** is built from: the KL of EXL3-style trellis quantization on Qwen3.8-27B and the rung-4
 tokens (`tools/reference/kl_corpus/tokens_canon.json`), weights only, at 3.5 / 4.0 / 4.5 / 5.0 bpw.

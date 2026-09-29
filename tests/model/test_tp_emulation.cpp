@@ -1,11 +1,10 @@
 // tests/model/test_tp_emulation.cpp -- tensor parallel P2b (docs/tp.md 10.1): the TP=2 facade
 // (r4dx::model::TpModel) in --tp-mode emulate -- both ranks on ONE device, EmulatedComm's
 // host-synchronized exact add at every all-reduce -- against the TP=1 Model, on the 4-layer
-// container qwen38-27b-l4-allmtp.r4dx, all four layouts:
+// container qwen38-27b-l4-allmtp.r4dx, bf16 and w4a16:
 //
 //   1. numerics: prefill 40 and 70 tokens (one and two chunks) + 16 teacher-forced DecodeStep rows,
-//      per-row relative L2 of the logits vs TP=1 <= 1e-2 (bf16, w4a16) / 5e-2 (mxfp4); w4a8 against
-//      the TP=1 bf16 yardstick instead (see TestLayout, docs/tp.md Appendix B N50);
+//      per-row relative L2 of the logits vs TP=1 <= 1e-2 (bf16, w4a16);
 //   2. DecodeStepGreedy == the argmax of the DecodeStep row it replaces, exactly;
 //   3. DecodeStepSampled vs DecodeStep + the full-vocab canonical sampler on the SAME TpModel, three
 //      filter configs x three seeds (plus one sub-0.01 temperature), trajectories exactly equal --
@@ -59,7 +58,7 @@
 //      for byte; a device span refused by TpModel.
 // The production-container cases SKIP (with a line saying so) when the production container (pair) is
 // absent. Since 2026-09-29 that container is the Huihui abliterated trellis mix4.5m and these cases run
-// with layout "trellis" (r4dx_test::ProductionLayoutName()); the w4a16 g64 / w4a8 / mxfp4 paths stay
+// with layout "trellis" (r4dx_test::ProductionLayoutName()); the w4a16 g64 path stays
 // covered at 4 layers by l4-allmtp (TestLayout, the MTP and real-vs-emulation cases).
 //
 // Every case ends with core::g_tp_collective_allocs == 0 (docs/tp.md 2.7: no device allocation or
@@ -282,19 +281,12 @@ Rows g_bf16_ref[2];
 // Numerics vs TP=1, greedy == argmax, sampled == canonical, Reset rerun byte identity. Returns the
 // TP run of the 40-token script (the fault test's fresh-run reference for w4a16).
 //
-// The numerics gate is docs/tp.md 10.1's per-row relative L2 vs TP=1: <= 1e-2 for bf16 and w4a16,
-// <= 5e-2 for mxfp4. w4a8 is gated differently (docs/tp.md Appendix B N50): its int8 activation
-// scales are taken per row over the rank's LOCAL K on the row-parallel layers (docs/tp.md 4.3), and
-// on this container that alone moves the logits ~8% from TP=1 -- while moving them CLOSER to the
-// bf16 run, not further. So for w4a8 the TP run must (a) stay within 1e-1 of TP=1 per row and (b)
-// be no further from the TP=1 bf16 run than TP=1 w4a8 itself is (max over the script's rows; ratio
-// <= 1.0, measured 0.86 / 0.82 -- an independent TP-only error of ~5e-2 rel L2 on top of the
-// measured one already fails it, docs/tp.md Appendix B N50/N53).
+// The numerics gate is docs/tp.md 10.1's per-row relative L2 vs TP=1: <= 1e-2 for bf16 and w4a16.
+// (The mxfp4 and w4a8 layouts, with their own gates, are retired.)
 Rows TestLayout(const std::string& layout) {
   std::printf("==== layout %s ====\n", layout.c_str());
   const std::vector<int32_t> p40 = Tokens(40, 11), p70 = Tokens(70, 23), forced = Tokens(kDecodeRows, 37);
-  const bool yardstick_gate = layout == "w4a8";
-  const double tol = (layout == "bf16" || layout == "w4a16") ? 1e-2 : (yardstick_gate ? 1e-1 : 5e-2);
+  const double tol = 1e-2;
 
   Rows ref[2];
   {
@@ -348,11 +340,6 @@ Rows TestLayout(const std::string& layout) {
                 "TP=2 emulated %.3e (ratio %.3f)\n",
                 layout.c_str(), plen, kDecodeRows, worst, tol, tp1_vs_bf16, tp_vs_bf16,
                 tp1_vs_bf16 > 0 ? tp_vs_bf16 / tp1_vs_bf16 : 0.0);
-    if (yardstick_gate) {
-      CHECK(!g_bf16_ref[which].empty() && tp_vs_bf16 <= tp1_vs_bf16,
-            "[%s] prompt %d: TP=2 sits %.3e from TP=1 bf16, TP=1 %s only %.3e (limit x1.0)", layout.c_str(), plen,
-            tp_vs_bf16, layout.c_str(), tp1_vs_bf16);
-    }
   }
   const Rows& tp40 = tp[0];
   const Rows& tp70 = tp[1];
@@ -1373,7 +1360,7 @@ int RunTest() {
   if (!r4dx_test::FileExists(kContainerPath)) return r4dx_test::SkipMissing(kContainerPath);
   std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep stdout in order with the facade's stderr lines
   Rows fresh40_w4a16;
-  for (const char* layout : {"bf16", "w4a16", "w4a8", "mxfp4"}) {
+  for (const char* layout : {"bf16", "w4a16"}) {
     Rows r = TestLayout(layout);
     if (std::string(layout) == "w4a16") fresh40_w4a16 = std::move(r);
   }

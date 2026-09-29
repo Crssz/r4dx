@@ -1,9 +1,8 @@
-"""Python reference for the w4a16 / w4a8 quantizer and packer -- the byte-exact ground truth
+"""Python reference for the w4a16 quantizer and packer -- the byte-exact ground truth
 tools/convert_ref/selftest_compare.py diffs r4dx-convert's C++ output against.
 
 Mirrors src/convert/include/r4dx_convert/quant_int4.hpp function-for-function; see that header's
-comment block for why w4a16 (asymmetric, free zero) and w4a8 (symmetric, zero pinned to 8) are
-quantized independently rather than sharing one packed weight, and for the provenance of the
+comment block for the w4a16 dequant (asymmetric, free zero) and for the provenance of the
 `_KOFF` fragment-order table (third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip's dequant(),
 cross-checked against C:\\Users\\user\\dev\\vllm-radiance\\radiance_w4.py's pack()).
 """
@@ -34,19 +33,6 @@ def quantize_asymmetric(w: np.ndarray, group: int = GROUP):
     rq = round_half_away_from_zero((w3 / scale[:, :, None]).astype(F32))
     q = np.clip(rq + zero[:, :, None].astype(np.int32), 0, 15).astype(np.uint8).reshape(N, K)
     return q, scale, zero
-
-
-def quantize_symmetric_pinned8(w: np.ndarray, group: int = GROUP):
-    """w [N,K] float32 -> (q uint8 [N,K] in 0..15 offset-binary, scale f32 [N,K/group])."""
-    w = w.astype(F32)
-    N, K = w.shape
-    gpr = K // group
-    w3 = w.reshape(N, gpr, group)
-    amax = np.abs(w3).max(axis=2).astype(F32)
-    scale = (np.maximum(amax, F32(1e-12)) / F32(7.0)).astype(F32)
-    qs = np.clip(round_half_away_from_zero((w3 / scale[:, :, None]).astype(F32)), -8, 7)
-    q = (qs + 8).astype(np.uint8).reshape(N, K)
-    return q, scale
 
 
 # ---- error-minimizing search (r4dx-convert --quant search) -------------------------------------
@@ -173,44 +159,6 @@ def quantize_asymmetric_search(w: np.ndarray, group: int = GROUP, imatrix=None):
     return q_out, scale, zero
 
 
-def quantize_symmetric_pinned8_search(w: np.ndarray, group: int = GROUP, imatrix=None):
-    """w [N,K] float32 (+ optional float32 [K] importance) -> (q, scale). Zero stays PINNED to 8 --
-    r4d_gemm_w4a8_nt_m64's dequant8() has no zero-point input -- so only the scale is searched."""
-    w = w.astype(F32)
-    N, K = w.shape
-    gpr = K // group
-    x = w.reshape(N * gpr, group).astype(F32)
-    wt = _weights(imatrix, N, K, group)
-    z8 = np.full(x.shape[0], 8, dtype=np.int32)
-
-    amax = np.abs(x).max(axis=1).astype(F32)
-    all_zero = amax <= F32(0.0)
-    s0 = (np.maximum(amax, F32(1e-12)) / F32(7.0)).astype(F32)
-
-    best_sc = s0.copy()
-    best_q = (np.clip(round_half_away_from_zero((x / s0[:, None]).astype(F32)), -8, 7)
-              + 8).astype(np.int32)
-    best_err = _werr(x, wt, best_sc, best_q, z8)
-
-    for step in range(SEARCH_STEPS):
-        sc = (s0 * search_scale_mult(step)).astype(F32)
-        q = (np.clip(round_half_away_from_zero((x / sc[:, None]).astype(F32)), -8, 7)
-             + 8).astype(np.int32)
-        err = _werr(x, wt, sc, q, z8)
-        better = err < best_err
-        best_err = np.where(better, err, best_err).astype(F32)
-        best_sc = np.where(better, sc, best_sc).astype(F32)
-        best_q = np.where(better[:, None], q, best_q).astype(np.int32)
-
-    best_sc = _refit(x, wt, best_sc, best_q, z8, best_err)
-
-    if all_zero.any():  # every code is 8 and the scale stays at the 1e-12 floor, as in RTN
-        best_sc = np.where(all_zero, s0, best_sc).astype(F32)
-        best_q = np.where(all_zero[:, None], 8, best_q).astype(np.int32)
-
-    return best_q.astype(np.uint8).reshape(N, K), best_sc.reshape(N, gpr).astype(F32)
-
-
 def pack_nibbles(q: np.ndarray, N: int, K: int) -> np.ndarray:
     """q [N,K] uint8 in 0..15 (offset-binary) -> wq uint32[N*K/8], fragment order."""
     ntiles, kblocks = N // 16, K // KPB
@@ -247,15 +195,3 @@ def pack_w4a16_scales(scale: np.ndarray, zero: np.ndarray, N: int, K: int, group
                 idx += 1
     return wsz
 
-
-def pack_w4a8_scales(scale: np.ndarray, N: int, K: int, group: int = GROUP) -> np.ndarray:
-    ntiles, gpr = N // 16, K // group
-    ws = np.zeros(ntiles * gpr * 16, dtype=np.uint32)
-    idx = 0
-    for t in range(ntiles):
-        for g in range(gpr):
-            for r in range(16):
-                row = t * 16 + r
-                ws[idx] = f16_bits(scale[row, g]) & 0xFFFF
-                idx += 1
-    return ws

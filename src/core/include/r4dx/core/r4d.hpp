@@ -220,22 +220,6 @@ inline void GemmW4a16NtM64G(int group, const void* a, const void* wq, const void
                            reinterpret_cast<int64_t>(wsz), reinterpret_cast<int64_t>(c), M, K, N,
                            WV, SK, MB, NPW, NT, reinterpret_cast<int64_t>(stream));
 }
-inline void GemmW4a8NtM64(const void* a, const void* ascale, const void* wq, const void* ws,
-                           void* c, int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
-                           hipStream_t stream) {
-  r4d_gemm_w4a8_nt_m64(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(ascale),
-                        reinterpret_cast<int64_t>(wq), reinterpret_cast<int64_t>(ws),
-                        reinterpret_cast<int64_t>(c), M, K, N, WV, SK, MB, NPW, NT,
-                        reinterpret_cast<int64_t>(stream));
-}
-inline void GemmMxfp4a8NtM64(const void* a, const void* ascale, const void* wq, const void* ws,
-                              const void* wref, void* c, int M, int K, int N, int WV, int SK,
-                              int MB, int NPW, hipStream_t stream) {
-  r4d_gemm_mxfp4a8_nt_m64(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(ascale),
-                          reinterpret_cast<int64_t>(wq), reinterpret_cast<int64_t>(ws),
-                          reinterpret_cast<int64_t>(wref), reinterpret_cast<int64_t>(c), M, K, N,
-                          WV, SK, MB, NPW, reinterpret_cast<int64_t>(stream));
-}
 // Trellis-coded weight (docs/trellis-kernel.md 4.3-4.5; r4d.h has the whole contract): C[M][N]
 // bf16 = bf16((FWHT128(A_p @ Q)[m][n] * svh[n]) * out_scale). a0 / a1: f16 [M][K], row stride K,
 // ALREADY input-transformed (r4dx_trellis_input_bf16); output columns >= n_split read a1 (a1
@@ -289,10 +273,6 @@ inline const char* GemmTrellisM256Check(int M, int K, int N, int n_split, int KB
 // SKG * M * N fp32.
 inline size_t GemmTrellisM256WsBytes(int M, int N, int SKG) {
   return r4d_gemm_trellis_nt_m256_ws_bytes(M, N, SKG);
-}
-inline void QuantActI8(const void* a, void* q, void* s, int M, int K, hipStream_t stream) {
-  r4d_quant_act_i8(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(q),
-                    reinterpret_cast<int64_t>(s), M, K, reinterpret_cast<int64_t>(stream));
 }
 
 inline void DflashConvT2G16Bf16(const void* x, const void* delta, const void* base, void* out,

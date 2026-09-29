@@ -224,7 +224,7 @@ void TestCodebookAndRing() {
 void TestLayoutSet() {
   std::printf("---- (a) trellis LayoutSet ----\n");
   const LayoutSet one = TrellisLayoutSet(4), two = TrellisLayoutSet(5, {256, 256});
-  Gate(one.trellis && !one.bf16 && !one.w4a16 && !one.w4a8 && !one.mxfp4 &&
+  Gate(one.trellis && !one.bf16 && !one.w4a16 &&
            TrellisPartCount(one) == 1 && TrellisPartCount(two) == 2,
        "TrellisLayoutSet: the trellis layout only, no bf16 (the old-binary guard)");
   LayoutSet back;

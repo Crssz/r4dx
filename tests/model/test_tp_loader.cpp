@@ -2,7 +2,7 @@
 // 10.1 "test_tp_loader", phase P2a), on the real 4-layer container qwen38-27b-l4-allmtp.r4dx (every
 // layout, GDN and full-attention layers, the MTP head).
 //
-// For each layout in {bf16, w4a16, w4a8, mxfp4}, both ranks of world 2 are loaded side by side
+// For each layout in {bf16, w4a16} (the container's retired w4a8/mxfp4 forms are ignored), both ranks of world 2 are loaded side by side
 // (Container::Load(path, ContainerLoadOptions{tp_world 2, tp_rank r})) and checked:
 //   * every uploaded device buffer, read back, equals tp::Gather(tp::Plan*(...)) of the file's own
 //     bytes for that rank -- which test_tp_shard proved equals pack(slice(W)) (docs/tp.md 10.2);
@@ -184,18 +184,6 @@ class RankChecker {
         ck_.Expect(q.w4a16_group == groups_.QuantLinearGroup(base),
                    Where(base) + ": w4a16_group " + std::to_string(q.w4a16_group));
         break;
-      case Layout::kW4a8:
-        part(base + ".w4a8.wq", tp::Part::kW4Wq, 0, DeviceBytes(q.wq));
-        part(base + ".w4a8.ws", tp::Part::kW4a8Ws, 128, DeviceBytes(q.w4a8_ws));
-        break;
-      case Layout::kMxfp4:
-        part(base + ".mxfp4.wq", tp::Part::kMxWq, 0, DeviceBytes(q.mxfp4_wq));
-        part(base + ".mxfp4.ws", tp::Part::kMxWs, 32, DeviceBytes(q.mxfp4_ws));
-        part(base + ".mxfp4.wref", tp::Part::kMxWref, 0, DeviceBytes(q.mxfp4_wref));
-        if (rule.split == tp::Split::kCols) {  // docs/tp.md 4.3: the FULL-row wref on a K slice
-          ck_.Expect(q.mxfp4_wref.size() == static_cast<size_t>(N), Where(base) + ": full wref");
-        }
-        break;
       case Layout::kTrellis:  // never requested here; CheckTrellisTp covers the trellis slices
         ck_.Expect(false, Where(base) + ": loaded as trellis from a non-trellis container");
         break;
@@ -207,10 +195,6 @@ class RankChecker {
     switch (l) {
       case Layout::kBf16: return f_.Has(base + ".bf16.w");
       case Layout::kW4a16: return f_.Has(base + ".w4a16.wq") && f_.Has(groups_.WszName(base));
-      case Layout::kW4a8: return f_.Has(base + ".w4a8.wq") && f_.Has(base + ".w4a8.ws");
-      case Layout::kMxfp4:
-        return f_.Has(base + ".mxfp4.wq") && f_.Has(base + ".mxfp4.ws") &&
-               f_.Has(base + ".mxfp4.wref");
       case Layout::kTrellis:
         return false;
     }
@@ -685,7 +669,7 @@ int RunTest() {
   Checker ck;
   CheckRefusals(shared, ck);
 
-  const Layout layouts[] = {Layout::kBf16, Layout::kW4a16, Layout::kW4a8, Layout::kMxfp4};
+  const Layout layouts[] = {Layout::kBf16, Layout::kW4a16};
   for (Layout layout : layouts) {
     // Exercise both embedding-mirror decisions: mirrored on the w4a16 pass (the production
     // layout), host-only on the others (which also keeps the bf16 pass's peak VRAM down).

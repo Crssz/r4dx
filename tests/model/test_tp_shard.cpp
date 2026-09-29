@@ -1,17 +1,14 @@
 // tests/model/test_tp_shard.cpp -- CPU-only (no GPU, no container). docs/tp.md 4, 5.2, 10.2.
 //
 // The tensor-parallel slicer (src/model/tp/tp_shard.{h,cpp}) against the CONVERTER'S OWN packers
-// (src/convert/include/r4dx_convert/quant_int4.hpp, quant_mxfp4.hpp, quant_search.hpp,
+// (src/convert/include/r4dx_convert/quant_int4.hpp, quant_search.hpp,
 // tensor_codec.hpp's EncodeBf16). The contract under test, for every layout and every on-disk part:
 //
 //     Gather(pack(W), PlanRows/PlanCols(...)) == pack(W[rank rows or cols])   byte for byte
 //
 // i.e. the loader can cut a rank's shard straight out of the one converted container and get
-// exactly the bytes the converter would have written for the shard itself -- with ONE deliberate
-// exception, the mxfp4 K-slice `wref`, which keeps the FULL row's exponent (docs/tp.md 4.3); there
-// the assertion is `== full.wref`, plus a CPU dequant, by the kernel's own formula
-// (r4d_gemm_mxfp4a8_nt_m64.hip: dsh = clamp(wref - ws, 0, 15), factor 2^(wref-127)), of
-// (sliced wq, sliced ws, full wref) == the matching columns of the full tensor's dequant.
+// exactly the bytes the converter would have written for the shard itself. (The mxfp4 layout's
+// K-slice `wref` exception is gone with the layout.)
 //
 // Coverage:
 //   1. RuleFor on the REAL v6 config: every tensor family of docs/tp.md 4.2 (text layers, MTP head,
@@ -25,8 +22,7 @@
 //      both ranks, every layout, real packers on random W with outliers.
 //   4. docs/tp.md 10.2's explicit shapes (single segment, fused qkv/gate_up/qg-shaped, K = 1536
 //      and the 17 x 64 per-rank K that mirrors mlp.down's 8704 = 17 x 512).
-//   5. The mxfp4 wref exception, with rows built so the full-row wref clamps a group the shard's
-//      own wref would not.
+//   5. (retired: the mxfp4 wref exception.)
 //   6. Misalignment throws; Gather bounds.
 //   7. Trellis `.trellis.w` (docs/trellis-kernel.md 2.4) against the converter's RegridToPairGrid.
 #include <algorithm>
@@ -41,7 +37,6 @@
 #include <vector>
 
 #include "r4dx_convert/quant_int4.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 #include "r4dx_convert/trellis_import.hpp"  // RegridToPairGrid: the trellis packer (7. below)
@@ -119,7 +114,7 @@ ModelConfig SmallConfig() {
 
 // ---- layouts: the converter's packers -----------------------------------------------------------
 
-enum class Scheme { kBf16, kW4a16, kW4a16Search, kW4a8, kW4a8Search, kMxfp4, kMxfp4Search };
+enum class Scheme { kBf16, kW4a16, kW4a16Search };
 struct Variant {
   const char* name;
   Scheme scheme;
@@ -135,10 +130,6 @@ const Variant kVariants[] = {
     {"w4a16 g128", Scheme::kW4a16, 128},
     {"w4a16 search+imatrix g64", Scheme::kW4a16Search, 64},
     {"w4a16 search+imatrix g128", Scheme::kW4a16Search, 128},
-    {"w4a8", Scheme::kW4a8, r4dx_convert::kW4A8Group},
-    {"w4a8 search+imatrix", Scheme::kW4a8Search, r4dx_convert::kW4A8Group},
-    {"mxfp4", Scheme::kMxfp4, r4dx_convert::kMxfp4Group},
-    {"mxfp4 search+imatrix", Scheme::kMxfp4Search, r4dx_convert::kMxfp4Group},
 };
 
 struct PackedPart {
@@ -157,7 +148,6 @@ std::vector<uint8_t> AsBytes(const std::vector<uint32_t>& v) {
 bool Packable(const Variant& v, int64_t N, int64_t K) {
   if (v.scheme == Scheme::kBf16) return true;
   if (N % 16 != 0) return false;
-  if (v.scheme == Scheme::kMxfp4 || v.scheme == Scheme::kMxfp4Search) return K % 32 == 0;
   return K % 64 == 0 && K % v.group == 0;
 }
 
@@ -186,29 +176,6 @@ std::vector<PackedPart> Pack(const Variant& v, const std::vector<float>& w, int 
           {Part::kW4a16Wsz, v.group, AsBytes(PackW4A16Scales(scale, zero, N, K, v.group))});
       break;
     }
-    case Scheme::kW4a8:
-    case Scheme::kW4a8Search: {
-      std::vector<uint8_t> q;
-      std::vector<float> scale;
-      if (v.scheme == Scheme::kW4a8Search) {
-        QuantizeInt4Pinned8Search(w.data(), N, K, v.group, iv, kThreads, q, scale);
-      } else {
-        QuantizeInt4SymmetricPinned8(w.data(), N, K, v.group, kThreads, q, scale);
-      }
-      out.push_back({Part::kW4Wq, 0, AsBytes(PackW4Nibbles(q, N, K, kThreads))});
-      out.push_back({Part::kW4a8Ws, v.group, AsBytes(PackW4A8Scales(scale, N, K, v.group))});
-      break;
-    }
-    case Scheme::kMxfp4:
-    case Scheme::kMxfp4Search: {
-      const Mxfp4Quantized mq = (v.scheme == Scheme::kMxfp4Search)
-                                    ? QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, iv, kThreads)
-                                    : QuantizeMxfp4(w.data(), N, K, kMxfp4Group, kThreads);
-      out.push_back({Part::kMxWq, kMxfp4Group, PackMxfp4Wq(mq.packed, N, K, kThreads)});
-      out.push_back({Part::kMxWs, kMxfp4Group, PackMxfp4Ws(mq.escale, N, K, kMxfp4Group)});
-      out.push_back({Part::kMxWref, kMxfp4Group, mq.wref});
-      break;
-    }
   }
   return out;
 }
@@ -217,10 +184,7 @@ std::vector<PackedPart> Pack(const Variant& v, const std::vector<float>& w, int 
 int64_t ColAlign(const PackedPart& p) {
   switch (p.part) {
     case Part::kW4Wq: return 64;
-    case Part::kW4a16Wsz:
-    case Part::kW4a8Ws:
-    case Part::kMxWs: return p.group;
-    case Part::kMxWq: return 32;
+    case Part::kW4a16Wsz: return p.group;
     default: return 1;
   }
 }
@@ -365,12 +329,8 @@ int CheckColSlice(const std::string& what, const std::vector<float>& w, int64_t 
       const std::string tag = what + range + " " + v.name + " part " + std::to_string(i);
       const auto got = Gather(full[i].bytes.data(), full[i].bytes.size(), PlanCols(shape, cols));
       std::string why;
-      if (full[i].part == Part::kMxWref) {
-        Check(SameBytes(got, full[i].bytes, &why), tag + ": wref K-slice == FULL wref -- " + why);
-      } else {
-        Check(SameBytes(got, want[i].bytes, &why),
-              tag + ": Gather(PlanCols(pack(W))) == pack(W[:, cols]) -- " + why);
-      }
+      Check(SameBytes(got, want[i].bytes, &why),
+            tag + ": Gather(PlanCols(pack(W))) == pack(W[:, cols]) -- " + why);
       ++exact;
     }
   }
@@ -516,7 +476,7 @@ void TestRuleForReal() {
   const char* must_throw[] = {
       "text.layers.0.gdn.in_proj_qkv.w4a16.wq",  // layout suffix not stripped
       "text.layers.63.attn.k.bf16.w",            // likewise the `.bf16.w` form
-      "lm_head.mxfp4.wref",
+      "lm_head.w4a8.ws",  // a retired layout's suffix is still refused by name
       "text.layers.0.attn.qg",       // layer 0 is GDN
       "text.layers.3.gdn.out_proj",  // layer 3 is full attention
       "text.layers.64.mlp.down",     // out of range
@@ -531,7 +491,7 @@ void TestRuleForReal() {
       "mtp.draft_head.vocab",             // only the two known draft_head tensors replicate
       "dflash.fc.w4a16.wq",
       "dflash.layers.0.self_attn.q_proj.bf16.w",
-      "vision.blocks.0.attn.qkv.mxfp4.ws",
+      "vision.blocks.0.attn.qkv.w4a16.wsz",
       "text.norm",
       "rotation.had_up_signs",  // only the five named rotation.* tensors are known
       "rotation.signs.bf16.w",
@@ -619,8 +579,6 @@ void TestRealPlans() {
       {"w4a16 g32", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 32}}},  // quant2 Q3 per-tensor group
       {"w4a16 g64", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 64}}},
       {"w4a16 g128", {{Part::kW4Wq, 0}, {Part::kW4a16Wsz, 128}}},
-      {"w4a8", {{Part::kW4Wq, 0}, {Part::kW4a8Ws, 128}}},
-      {"mxfp4", {{Part::kMxWq, 32}, {Part::kMxWs, 32}, {Part::kMxWref, 32}}},
   };
   struct Linear {
     const char* base;
@@ -672,22 +630,12 @@ void TestRealPlans() {
               want_runs = segs ? segs : static_cast<size_t>(lin.N);
               break;
             case Part::kW4Wq:
-            case Part::kMxWq:
               want = rn * rk / 2;
               want_runs = segs ? segs : static_cast<size_t>(lin.N / 16);
               break;
             case Part::kW4a16Wsz:
-            case Part::kW4a8Ws:
               want = rn * rk / group * 4;  // 4 B per (t, g, r) dword, never a uint16 stride
               want_runs = segs ? segs : static_cast<size_t>(lin.N / 16);
-              break;
-            case Part::kMxWs:
-              want = rk / 32 * rn;
-              want_runs = segs ? segs * static_cast<size_t>(lin.K / 32) : 1;
-              break;
-            case Part::kMxWref:
-              want = segs ? rn : lin.N;  // a K-slice keeps the full row's wref
-              want_runs = segs ? segs : 1;
               break;
             default:
               break;
@@ -700,12 +648,8 @@ void TestRealPlans() {
           int64_t full = 0;  // the whole on-disk part
           switch (part) {
             case Part::kBf16: full = lin.N * lin.K * 2; break;
-            case Part::kW4Wq:
-            case Part::kMxWq: full = lin.N * lin.K / 2; break;
-            case Part::kW4a16Wsz:
-            case Part::kW4a8Ws: full = lin.N * (lin.K / group) * 4; break;
-            case Part::kMxWs: full = lin.K / 32 * lin.N; break;
-            case Part::kMxWref: full = lin.N; break;
+            case Part::kW4Wq: full = lin.N * lin.K / 2; break;
+            case Part::kW4a16Wsz: full = lin.N * (lin.K / group) * 4; break;
             default: break;
           }
           bool ordered = true;
@@ -722,7 +666,7 @@ void TestRealPlans() {
     }
   }
   // docs/tp.md 5.1's "no staging copy" list is exactly the single-run plans: qg, z, k/v, lm_head
-  // (every part but mxfp4 ws), a/b, A_log, dt_bias, descales, mxfp4 ws cols.
+  // a/b, A_log, dt_bias, descales.
   const auto single = [&](const char* base, const PartShape& shape) {
     const ShardRule rule = RuleFor(base, g);
     for (int r = 0; r < 2; ++r) {
@@ -735,9 +679,8 @@ void TestRealPlans() {
   Check(single("text.layers.0.gdn.in_proj_a", {Part::kBf16, 48, 5120, 0, 0}) &&
             single("text.layers.0.gdn.A_log", {Part::kElem, 48, 0, 0, 4}) &&
             single("text.layers.0.gdn.dt_bias", {Part::kElem, 48, 0, 0, 4}) &&
-            single("text.layers.3.attn.k_descale", {Part::kElem, 4, 0, 0, 4}) &&
-            single("text.layers.0.gdn.out_proj", {Part::kMxWs, 5120, 6144, 32, 0}),
-        "a/b, A_log, dt_bias, descales and mxfp4 ws K-slices are one contiguous range");
+            single("text.layers.3.attn.k_descale", {Part::kElem, 4, 0, 0, 4}),
+        "a/b, A_log, dt_bias and descales are one contiguous range");
   Check(!single("text.layers.0.gdn.conv1d_weight", {Part::kElem, 10240, 0, 0, 8}),
         "conv1d_weight's 3 channel ranges go through staging");
 
@@ -758,9 +701,6 @@ void TestRealPlans() {
   const size_t lm_bf16 = size_t{124160} * 5120 * 2;
   Check(ends(plan1("lm_head", {Part::kBf16, 248320, 5120, 0, 0}), 1, lm_bf16, lm_bf16, lm_bf16),
         "real offsets: lm_head bf16 rank 1 = [124160*5120*2, +124160*5120*2)");
-  Check(ends(plan1("lm_head", {Part::kMxWs, 248320, 5120, 32, 0}), 160, 124160,
-             size_t{159} * 248320 + 124160, 124160),
-        "real offsets: lm_head mxfp4 ws rank 1 = [kg*248320 + 124160, +124160), kg = 0..159");
   // mlp.down K = 17408: 272 64-K blocks per tile, rank 1 takes blocks [136, 272) of each of the
   // 320 tiles -- 512 B per (tile, block) in wq, 64 B per (tile, g64 group) in wsz.
   Check(ends(plan1("text.layers.0.mlp.down", {Part::kW4Wq, 5120, 17408, 0, 0}), 320, 136 * 512,
@@ -774,17 +714,13 @@ void TestRealPlans() {
   Check(ends(plan1("text.layers.0.mlp.down", {Part::kW4a16Wsz, 5120, 17408, 32, 0}), 320,
              272 * 64, (size_t{319} * 544 + 272) * 64, 272 * 64),
         "real offsets: mlp.down w4a16 g32 wsz rank 1 = [(t*544 + 272)*64, +272*64), t = 0..319");
-  // mlp.gate_up rank 1 rows [8704, +8704) u [26112, +8704): 160 B per row of w4a8 ws (40 groups x
-  // 4 B), 2560 B per row of mxfp4 wq.
-  Check(ends(plan1("text.layers.0.mlp.gate_up", {Part::kW4a8Ws, 34816, 5120, 128, 0}), 2,
-             size_t{8704} * 160, size_t{26112} * 160, size_t{8704} * 160),
-        "real offsets: mlp.gate_up w4a8 ws rank 1 = rows 8704.. and 26112.. at 160 B per row");
-  Check(ends(plan1("text.layers.0.mlp.gate_up", {Part::kMxWq, 34816, 5120, 32, 0}), 2,
+  // mlp.gate_up rank 1 rows [8704, +8704) u [26112, +8704): 2560 B per row of w4 wq (K / 2).
+  Check(ends(plan1("text.layers.0.mlp.gate_up", {Part::kW4Wq, 34816, 5120, 0, 0}), 2,
              size_t{8704} * 2560, size_t{26112} * 2560, size_t{8704} * 2560),
-        "real offsets: mlp.gate_up mxfp4 wq rank 1 = rows 8704.. and 26112.. at 2560 B per row");
+        "real offsets: mlp.gate_up w4 wq rank 1 = rows 8704.. and 26112.. at 2560 B per row");
   Pass("real shapes: " + std::to_string(plans) +
        " (tensor, rank, layout, part) plans legal, exact size, ascending and in bounds, contiguous "
-       "exactly where 5.1 says; 7 rank-1 offsets pinned to 4.3's formulas");
+       "exactly where 5.1 says; 5 rank-1 offsets pinned to 4.3's formulas");
 }
 
 // ---- 3. end to end on the small config ----------------------------------------------------------
@@ -923,110 +859,17 @@ void TestDesignCases() {
           "10.2 K=1536: every layout splits at 768");
   }
   // cols: per-rank K = 1088 = 17 x 64 (full K 2176), mirroring mlp.down's per-rank 8704 = 17 x 512:
-  // legal for bf16, w4a16 at g=64 and mxfp4; the four group-128 layouts (w4a16 g128 RTN/search,
-  // w4a8 RTN/search) must refuse.
+  // legal for bf16 and w4a16 at g=64; the two group-128 layouts (w4a16 g128 RTN/search) must
+  // refuse.
   {
     const auto w = RandomW(64, 2176, 24);
-    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 4 &&
-              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 4,
-          "10.2 rank K 17 x 64: exactly the four group-128 layouts are refused");
-    Check(Throws([&] { PlanCols({Part::kW4a8Ws, 64, 2176, 128, 0}, {0, 1088}); }) &&
+    Check(CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {0, 1088}) == 2 &&
+              CheckColSlice("10.2 N=64 K=2176 (rank K 17x64)", w, 64, 2176, {1088, 1088}) == 2,
+          "10.2 rank K 17 x 64: exactly the two group-128 layouts are refused");
+    Check(Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {0, 1088}); }) &&
               Throws([&] { PlanCols({Part::kW4a16Wsz, 64, 2176, 128, 0}, {1088, 1088}); }),
           "10.2: a 17 x 64 rank K cannot split a group-128 scale tensor");
   }
-}
-
-// ---- 5. the mxfp4 wref exception ----------------------------------------------------------------
-
-// Dequant of packed mxfp4 by the kernel's own arithmetic (r4d_gemm_mxfp4a8_nt_m64.hip lines
-// 190-192, 225): the lane word of (tile nt, k-step ks) holds k = ks*16 + 8*(lane>>4) + 2j (+1);
-// dsh = clamp(wref[n] - ws[k/32][n], 0, 15); value = e2m1 * 2^-dsh * 2^(wref[n]-127).
-std::vector<double> DequantMxfp4(const std::vector<uint8_t>& wq, const std::vector<uint8_t>& ws,
-                                 const std::vector<uint8_t>& wref, int64_t N, int64_t K) {
-  std::vector<double> out(static_cast<size_t>(N * K));
-  const int64_t ksteps = K / 16;
-  for (int64_t nt = 0; nt < N / 16; ++nt) {
-    for (int64_t ks = 0; ks < ksteps; ++ks) {
-      for (int lane = 0; lane < 32; ++lane) {
-        const int64_t row = nt * 16 + (lane & 15);
-        const size_t base = static_cast<size_t>(((nt * ksteps + ks) * 32 + lane) * 4);
-        for (int j = 0; j < 4; ++j) {
-          for (int half = 0; half < 2; ++half) {
-            const uint8_t code = half ? (wq[base + j] >> 4) & 0xF : wq[base + j] & 0xF;
-            const int64_t k = ks * 16 + 8 * (lane >> 4) + 2 * j + half;
-            const int ref = wref[static_cast<size_t>(row)];
-            int dsh = ref - ws[static_cast<size_t>((k / 32) * N + row)];
-            dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
-            const double mag = r4dx_convert::kE2M1Magnitude[code & 0x7];
-            out[static_cast<size_t>(row * K + k)] =
-                ((code & 0x8) ? -1.0 : 1.0) * std::ldexp(mag, ref - 127 - dsh);
-          }
-        }
-      }
-    }
-  }
-  return out;
-}
-
-void TestMxfp4WrefException() {
-  const int64_t N = 32, K = 1024, half = 512;
-  std::vector<float> w = RandomW(N, K, 31);
-  // Row 5: rank 0's K half is ~1e-7 (E8M0 ~103) against ~0.02-0.5 in rank 1's half (~121-124):
-  // TP=1 clamps rank 0's groups at dsh 15; the shard's own wref (~103) would not. Row 20: reverse.
-  std::mt19937 rng(32);
-  std::normal_distribution<float> tiny(0.0f, 1e-7f);
-  for (int64_t k = 0; k < half; ++k) w[static_cast<size_t>(5 * K + k)] = tiny(rng);
-  for (int64_t k = half; k < K; ++k) w[static_cast<size_t>(20 * K + k)] = tiny(rng);
-  const std::vector<float> imp = RandomImportance(K, 33);
-
-  for (const Variant& v : kVariants) {
-    if (v.scheme != Scheme::kMxfp4 && v.scheme != Scheme::kMxfp4Search) continue;
-    const auto full = Pack(v, w, N, K, imp);  // wq, ws, wref
-    const auto dq_full = DequantMxfp4(full[0].bytes, full[1].bytes, full[2].bytes, N, K);
-    for (int r = 0; r < 2; ++r) {
-      const Range cols{r * half, half};
-      const std::string p = std::string(v.name) + " rank " + std::to_string(r) + ": ";
-      std::vector<std::vector<uint8_t>> sliced;
-      for (int i = 0; i < 3; ++i) {
-        const PartShape shape{full[i].part, N, K, full[i].group, 0};
-        sliced.push_back(Gather(full[i].bytes.data(), full[i].bytes.size(), PlanCols(shape, cols)));
-      }
-      Check(sliced[2] == full[2].bytes, p + "the K-slice keeps the FULL wref");
-      const auto dq = DequantMxfp4(sliced[0], sliced[1], sliced[2], N, half);
-      bool equal = true;
-      for (int64_t n = 0; n < N; ++n) {
-        for (int64_t k = 0; k < half; ++k) {
-          equal = equal && dq[static_cast<size_t>(n * half + k)] ==
-                               dq_full[static_cast<size_t>(n * K + cols.begin + k)];
-        }
-      }
-      Check(equal, p + "dequant(sliced wq, sliced ws, full wref) == the full dequant's columns, "
-                       "every element");
-
-      // Why the exception exists: the shard's own pack has a smaller wref on the tiny row and
-      // un-clamps groups TP=1 clamps.
-      const std::vector<float> imp_s(imp.begin() + cols.begin, imp.begin() + cols.begin + half);
-      const auto own = Pack(v, SliceCols(w, N, K, cols), N, half, imp_s);
-      const size_t tiny_row = r == 0 ? 5 : 20;
-      Check(own[0].bytes == sliced[0] && own[1].bytes == sliced[1],
-            p + "wq and ws K-slices are the shard's own bytes");
-      const int own_ref = own[2].bytes[tiny_row], full_ref = full[2].bytes[tiny_row];
-      Check(full_ref - own_ref > 15, p + "the shard's own wref on row " +
-                                         std::to_string(tiny_row) + " (" +
-                                         std::to_string(own_ref) + ") is > 15 below the full "
-                                         "row's (" + std::to_string(full_ref) +
-                                         "): TP=1 clamps there (test setup)");
-      const auto dq_own = DequantMxfp4(own[0].bytes, own[1].bytes, own[2].bytes, N, half);
-      bool differs = false;
-      for (int64_t k = 0; k < half; ++k) {
-        differs = differs || dq_own[tiny_row * half + static_cast<size_t>(k)] !=
-                                 dq_full[tiny_row * K + static_cast<size_t>(cols.begin + k)];
-      }
-      Check(differs, p + "dequant with the shard's own wref would differ from TP=1 on row " +
-                         std::to_string(tiny_row));
-    }
-  }
-  Pass("mxfp4 wref exception: K-slices keep the full wref and dequantize exactly like TP=1");
 }
 
 // ---- 6. misalignment, bounds --------------------------------------------------------------------
@@ -1035,19 +878,17 @@ void TestMisalignment() {
   const int64_t N = 256, K = 1024;
   const std::vector<Range> bad_rows = {{0, 120}};  // not whole 16-row tiles
   const std::vector<Range> bad_begin = {{8, 128}};
-  for (Part p : {Part::kW4Wq, Part::kMxWq, Part::kW4a16Wsz, Part::kW4a8Ws}) {
+  for (Part p : {Part::kW4Wq, Part::kW4a16Wsz}) {
     const PartShape s{p, N, K, 128, 0};
     Check(Throws([&] { PlanRows(s, bad_rows); }) && Throws([&] { PlanRows(s, bad_begin); }),
           "PlanRows: a tile part refuses a row range not % 16 (part " +
               std::to_string(static_cast<int>(p)) + ")");
   }
-  // bf16 / mxfp4 ws / wref / elem rows need no tile alignment.
+  // bf16 / elem rows need no tile alignment.
   Check(!Throws([&] { PlanRows({Part::kBf16, N, K, 0, 0}, bad_rows); }) &&
-            !Throws([&] { PlanRows({Part::kMxWs, N, K, 32, 0}, bad_rows); }) &&
-            !Throws([&] { PlanRows({Part::kMxWref, N, K, 32, 0}, bad_rows); }) &&
             !Throws([&] { PlanRows({Part::kElem, N, 0, 0, 4}, bad_rows); }),
-        "PlanRows: bf16 / mxfp4 ws / wref / elem accept any row range");
-  // Column alignment: w4 wq % 64, scale dwords % group, mxfp4 wq/ws % 32.
+        "PlanRows: bf16 / elem accept any row range");
+  // Column alignment: w4 wq % 64, scale dwords % group.
   Check(Throws([&] { PlanCols({Part::kW4Wq, N, K, 0, 0}, {32, 512}); }) &&
             !Throws([&] { PlanCols({Part::kW4Wq, N, K, 0, 0}, {64, 512}); }),
         "PlanCols: w4 wq needs % 64");
@@ -1055,12 +896,6 @@ void TestMisalignment() {
             !Throws([&] { PlanCols({Part::kW4a16Wsz, N, K, 64, 0}, {64, 512}); }) &&
             Throws([&] { PlanCols({Part::kW4a16Wsz, N, K, 128, 0}, {64, 512}); }),
         "PlanCols: w4a16 wsz needs % group (64 or 128)");
-  Check(Throws([&] { PlanCols({Part::kW4a8Ws, N, K, 128, 0}, {64, 512}); }),
-        "PlanCols: w4a8 ws needs % 128");
-  Check(Throws([&] { PlanCols({Part::kMxWq, N, K, 32, 0}, {16, 512}); }) &&
-            Throws([&] { PlanCols({Part::kMxWs, N, K, 32, 0}, {16, 512}); }) &&
-            !Throws([&] { PlanCols({Part::kMxWq, N, K, 32, 0}, {32, 512}); }),
-        "PlanCols: mxfp4 wq/ws need % 32");
   Check(!Throws([&] { PlanCols({Part::kBf16, N, K, 0, 0}, {3, 5}); }),
         "PlanCols: bf16 accepts any column range");
   // Bounds and impossible shapes.
@@ -1168,7 +1003,6 @@ int main() {
   TestRealPlans();
   TestSmallModelSlices();
   TestDesignCases();
-  TestMxfp4WrefException();
   TestMisalignment();
   TestTrellisPlans();
   if (g_failures > 0) {

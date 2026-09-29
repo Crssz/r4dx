@@ -14,15 +14,16 @@
                    the draft-dependent numbers; greedy verify and seeded sample-and-match emit
                    draft-independent tokens, so text and ids alone cannot see a drafter or MTP-head
                    byte change);
-    row 6          tool_teacher_forced_logprobs on the 4-layer container, layouts bf16/w4a16/w4a8/
-                   mxfp4, --layers 4, the kl_corpus tokens: every *.logprobs.f16 it writes.
+    row 6          tool_teacher_forced_logprobs on the 4-layer container, layouts bf16/w4a16
+                   (w4a8/mxfp4 were retired with their kernels), --layers 4, the kl_corpus tokens:
+                   every *.logprobs.f16 it writes.
 
     1  standard protocol, plain greedy
     2  standard protocol + --dflash <drafter> --dflash-k 7
     3  standard protocol + --mtp 3
     4  --temperature 0.7 --top-k 20 --top-p 0.8 --seed 1, plain
     5  row 4 + --dflash <drafter> --dflash-k 7
-    6  tool_teacher_forced_logprobs, 4-layer container, all four layouts
+    6  tool_teacher_forced_logprobs, 4-layer container, bf16 and w4a16
     7  --vision on --image tools\reference\golden_out\vision_test_image.png
        --prompt "What is in this picture?", plain greedy (SKIPped when the gitignored golden image
        is absent -- pass -Image to point at another copy)
@@ -221,7 +222,7 @@ $results = New-Object System.Collections.Generic.List[object]
 try {
     foreach ($row in $Rows) {
         if ($row -eq 6) {
-            foreach ($layout in "bf16", "w4a16", "w4a8", "mxfp4") {
+            foreach ($layout in "bf16", "w4a16") {
                 $name = "row6_$layout"
                 $dirs = @{}
                 foreach ($side in "baseline", "candidate") {

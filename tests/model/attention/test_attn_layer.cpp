@@ -179,7 +179,7 @@ std::vector<uint16_t> ExpectedResidualSum(const std::vector<uint16_t>& residual,
 void ReportQuantizedLayouts(const SafetensorsReader& container) {
   const char* bases[] = {"text.layers.3.attn.qg", "text.layers.3.attn.o", "text.layers.3.attn.k",
                           "text.layers.3.attn.v"};
-  const char* layouts[] = {"bf16.w", "mxfp4.wq", "w4a16.wq", "w4a8.wq"};
+  const char* layouts[] = {"bf16.w", "w4a16.wq"};
   std::printf("quantized layouts present in %s (informational; the quantized layouts below are "
               "now actually dispatched through AttentionLayer/ApplyLinear and rel-err REPORTED, "
               "not just gated bf16-tight -- see main()'s quantized pass):\n",
@@ -202,11 +202,6 @@ std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const 
   auto upload_u8 = [&](const std::string& name) {
     DeviceBuffer<uint8_t> d(static_cast<size_t>(r.Meta(name).ElemCount()));
     d.CopyFromHost(reinterpret_cast<const uint8_t*>(r.Data(name)), d.size());
-    return d;
-  };
-  auto upload_i8 = [&](const std::string& name) {
-    DeviceBuffer<int8_t> d(static_cast<size_t>(r.Meta(name).ElemCount()));
-    d.CopyFromHost(reinterpret_cast<const int8_t*>(r.Data(name)), d.size());
     return d;
   };
   auto upload_u32 = [&](const std::string& name) {
@@ -235,21 +230,6 @@ std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const 
       q.w4a16_wsz = upload_u32(wsz);
       break;
     }
-    case Layout::kW4a8: {
-      const std::string wq = base + ".w4a8.wq", ws = base + ".w4a8.ws";
-      if (!r.Has(wq) || !r.Has(ws)) return std::nullopt;
-      q.wq = upload_u8(wq);
-      q.w4a8_ws = upload_u32(ws);
-      break;
-    }
-    case Layout::kMxfp4: {
-      const std::string wq = base + ".mxfp4.wq", ws = base + ".mxfp4.ws", wref = base + ".mxfp4.wref";
-      if (!r.Has(wq) || !r.Has(ws) || !r.Has(wref)) return std::nullopt;
-      q.mxfp4_wq = upload_u8(wq);
-      q.mxfp4_ws = upload_u8(ws);
-      q.mxfp4_wref = upload_i8(wref);
-      break;
-    }
     case Layout::kBf16:
       return std::nullopt;  // caller already has the bf16 path
     case Layout::kTrellis:
@@ -265,7 +245,7 @@ std::optional<QuantLinear> TryLoadQuantLinear(const SafetensorsReader& r, const 
 // ~6.5e-2..8.5e-2 ballpark docs/perf.md already documents for GDN/MLP/lm_head's own quantized
 // linears (this component's own "bf16 layout tight; quantized layouts reported" scope, task
 // brief). Review finding, 2026-09-19: this function used to only PRINT the rel-err and return
-// void, so a regression in the w4a16/w4a8/mxfp4 dispatch through ApplyLinear would still print
+// void, so a regression in the w4a16 dispatch through ApplyLinear would still print
 // PASS -- returns bool now, folded into main()'s own `ok`.
 bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfig& cfg,
                               const AttnWeights& bf16_w, const std::vector<uint16_t>& prefill_hidden_h,
@@ -274,15 +254,14 @@ bool RunQuantizedLayoutSmoke(const SafetensorsReader& container, const AttnConfi
                               const std::vector<uint16_t>& decode_expected, int T_prefill,
                               int T_decode) {
   // Deliberately loose but real bound -- roughly 2x the worst measured baseline (w4a16 prefill
-  // 7.1698e-02 / decode 6.5744e-02, w4a8 8.4888e-02 / 7.5489e-02, mxfp4 8.2541e-02 / 7.3365e-02, all
-  // measured on HIP device 1 against the real bf16 container during this pass) so today's numbers
+  // 7.1698e-02 / decode 6.5744e-02, measured on HIP device 1 against the real bf16 container during this pass) so today's numbers
   // cannot silently drift without tripping this test, without being tight enough to false-positive
   // on ordinary run-to-run quantization noise.
   constexpr double kQuantTol = 1.5e-1;
   bool ok = true;
   const int hidden = cfg.hidden, H = cfg.num_heads, Hkv = cfg.kv_heads, D = cfg.head_dim;
   const r4d::AttnDims dims = r4d::GetAttnDims();
-  for (Layout layout : {Layout::kW4a16, Layout::kW4a8, Layout::kMxfp4}) {
+  for (Layout layout : {Layout::kW4a16}) {
     auto qg_ql = TryLoadQuantLinear(container, "text.layers.3.attn.qg", layout,
                                      static_cast<int64_t>(2) * H * D, hidden);
     auto o_ql = TryLoadQuantLinear(container, "text.layers.3.attn.o", layout, hidden,

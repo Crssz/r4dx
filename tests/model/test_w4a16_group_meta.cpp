@@ -95,7 +95,7 @@ void TestNoMap() {
   // JSON number types are what a container actually carries).
   for (int d : {64, 128}) {
     const std::string text = R"({"quant": {"w4a16": {"group": )" + std::to_string(d) +
-                             R"(, "kind": "asym"}, "w4a8": {"group": 128}, "mxfp4": {"group": 32}}})";
+                             R"(, "kind": "asym"}}})";
     const W4a16Groups g = ParseW4a16Groups(nlohmann::json::parse(text), "p");
     Check(g.default_group == d && g.default_recorded && g.mapped.empty(),
           "converter quant block, default " + std::to_string(d) + ": parsed, no map");
@@ -112,7 +112,7 @@ void TestNoMap() {
   // `quant` without w4a16, and a w4a16 block without a group: the old read's defaults.
   {
     const W4a16Groups a =
-        ParseW4a16Groups(nlohmann::json::parse(R"({"quant": {"w4a8": {"group": 128}}})"), "p");
+        ParseW4a16Groups(nlohmann::json::parse(R"({"quant": {"other": {"group": 128}}})"), "p");
     const W4a16Groups b =
         ParseW4a16Groups(nlohmann::json::parse(R"({"quant": {"w4a16": {"kind": "asym"}}})"), "p");
     Check(a.default_group == 128 && !a.default_recorded && b.default_group == 128 &&

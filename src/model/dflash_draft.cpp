@@ -99,13 +99,6 @@ core::DeviceBuffer<uint32_t> UploadRawU32(const DflashDraftWeights& w, const std
   return buf;
 }
 
-core::DeviceBuffer<int8_t> UploadRawI8(const DflashDraftWeights& w, const std::string& name) {
-  const int64_t n = ElemCountBySize(w, name, 1);
-  core::DeviceBuffer<int8_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const int8_t*>(w.TensorData(name)), static_cast<size_t>(n));
-  return buf;
-}
-
 // Every DFlash2 norm weight is stored FP32 on disk (docs/container-format.md's tensor table: the
 // GGUF source keeps `*_norm.weight` in f32 and the converter passes it through unchanged), while
 // `r4dx_rmsnorm_plain_bf16` takes a bf16 weight like every other norm in this repo. Round once
@@ -147,20 +140,11 @@ QuantLinear LoadQuantLinear(const DflashDraftWeights& w, const std::string& base
       q.wq = UploadRawU8(w, base + ".w4a16.wq");
       q.w4a16_wsz = UploadRawU32(w, base + ".w4a16.wsz");
       break;
-    case Layout::kW4a8:
-      q.wq = UploadRawU8(w, base + ".w4a8.wq");
-      q.w4a8_ws = UploadRawU32(w, base + ".w4a8.ws");
-      break;
-    case Layout::kMxfp4:
-      q.mxfp4_wq = UploadRawU8(w, base + ".mxfp4.wq");
-      q.mxfp4_ws = UploadRawU8(w, base + ".mxfp4.ws");
-      q.mxfp4_wref = UploadRawI8(w, base + ".mxfp4.wref");
-      break;
     case Layout::kTrellis:
       // docs/trellis-kernel.md 2.2, 5.1: the drafter is never trellis (no converter writes one).
       throw std::runtime_error("r4dx::model::DflashDraft: '" + base +
                                "' requested as trellis -- a DFlash2 draft container has no trellis "
-                               "layout (w4a16, w4a8, mxfp4 or bf16)");
+                               "layout (w4a16 or bf16)");
   }
   return q;
 }

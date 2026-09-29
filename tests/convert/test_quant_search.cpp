@@ -1,14 +1,14 @@
 ﻿// r4dx-convert --quant search (src/convert/include/r4dx_convert/quant_search.hpp): the three
 // properties the search has to have.
 //
-//   (i)   never worse than RTN, per (row, group), for every layout and both weightings. This is a
+//   (i)   never worse than RTN, per (row, group), for both weightings. This is a
 //         STRUCTURAL claim (the RTN grid is candidate 0 and later candidates must win strictly),
 //         so the test checks it group by group rather than in aggregate.
 //   (ii)  an outlier-dominated group -- one big value among the rest, all small, which drags the
 //         min/max grid so wide that the whole bulk collapses onto two or three codes -- is
 //         measurably recovered, especially once an imatrix says the outlier channel barely matters.
 //   (iii) bit-exact agreement with the Python reference (tools/convert_ref/w4_ref.py's
-//         quantize_*_search, mxfp4_ref.py's quantize_search) on a random matrix, via the fixtures
+//         quantize_*_search) on a random matrix, via the fixtures
 //         tools/convert_ref/gen_fixtures.py writes. Same gate shape as test_pack_bytes.cpp.
 //
 // All three are checked at BOTH int4 group sizes r4d_gemm_w4a16_nt_m64 can be built with
@@ -26,7 +26,6 @@
 
 #include "nlohmann/json.hpp"
 #include "r4dx_convert/quant_int4.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
@@ -84,33 +83,16 @@ double GroupError(const float* x, const float* wt, int group, float scale, const
   return e;
 }
 
-double Mxfp4GroupError(const float* x, const float* wt, int group, uint8_t raw,
-                       const uint8_t* packed_row, int kbase) {
-  const double scale = std::ldexp(1.0, static_cast<int>(raw) - 127);
-  double e = 0.0;
-  for (int k = 0; k < group; ++k) {
-    const int kk = kbase + k;
-    const uint8_t byte = packed_row[kk / 2];
-    const uint8_t code = (kk % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-    const double mag = static_cast<double>(kE2M1Magnitude[code & 0x7]);
-    const double recon = ((code & 0x8) ? -mag : mag) * scale;
-    const double d = static_cast<double>(x[k]) - recon;
-    e += static_cast<double>(wt ? wt[k] : 1.0f) * d * d;
-  }
-  return e;
-}
-
 // Fixture filename suffix for an int4 group -- see test_pack_bytes.cpp's GroupSuffix.
 std::string GroupSuffix(int group) {
   return group == 128 ? std::string() : "_g" + std::to_string(group);
 }
 
 // ---- (i) search <= RTN on every group --------------------------------------------------------
-// `int4_group` is the w4a16/w4a8 group under test: property (i) is a claim about the SEARCH, not
+// `int4_group` is the w4a16 group under test: property (i) is a claim about the SEARCH, not
 // about one group, so it is checked at every group the kernel can be built with.
 bool NeverWorseThanRtn(const std::string& label, const std::vector<float>& w, int N, int K,
-                       const std::vector<float>& imatrix, bool weighted, int int4_group,
-                       bool include_mxfp4) {
+                       const std::vector<float>& imatrix, bool weighted, int int4_group) {
   const float* wt_all = weighted ? imatrix.data() : nullptr;
   ImportanceVector imp;
   if (weighted) {
@@ -140,57 +122,6 @@ bool NeverWorseThanRtn(const std::string& label, const std::vector<float>& w, in
         if (es < er) ++improved;
         if (es > er) {
           std::fprintf(stderr, "FAIL %s w4a16 row %d group %d: search err %.9g > rtn err %.9g\n",
-                       label.c_str(), r, g, es, er);
-          ok = false;
-        }
-      }
-    }
-  }
-  {  // w4a8 (zero pinned to 8)
-    std::vector<uint8_t> rq, sq;
-    std::vector<float> rs, ss;
-    QuantizeInt4SymmetricPinned8(w.data(), N, K, int4_group, 1, rq, rs);
-    QuantizeInt4Pinned8Search(w.data(), N, K, int4_group, imp, 1, sq, ss);
-    for (int r = 0; r < N; ++r) {
-      for (int g = 0; g < gpr4; ++g) {
-        const size_t gi = static_cast<size_t>(r) * gpr4 + g;
-        const size_t off = static_cast<size_t>(r) * K + static_cast<size_t>(g) * int4_group;
-        const float* wtg = wt_all ? wt_all + static_cast<size_t>(g) * int4_group : nullptr;
-        const double er = GroupError(w.data() + off, wtg, int4_group, rs[gi], rq.data() + off, 8);
-        const double es = GroupError(w.data() + off, wtg, int4_group, ss[gi], sq.data() + off, 8);
-        ++groups;
-        rtn_total += er;
-        search_total += es;
-        if (es < er) ++improved;
-        if (es > er) {
-          std::fprintf(stderr, "FAIL %s w4a8 row %d group %d: search err %.9g > rtn err %.9g\n",
-                       label.c_str(), r, g, es, er);
-          ok = false;
-        }
-      }
-    }
-  }
-  if (include_mxfp4) {  // mxfp4 -- its group is its own constant, so it is checked once, not once
-                        // per int4 group
-    const int gprm = K / kMxfp4Group;
-    Mxfp4Quantized rm = QuantizeMxfp4(w.data(), N, K, kMxfp4Group, 1);
-    Mxfp4Quantized sm = QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, imp, 1);
-    for (int r = 0; r < N; ++r) {
-      const uint8_t* rrow = rm.packed.data() + static_cast<size_t>(r) * (K / 2);
-      const uint8_t* srow = sm.packed.data() + static_cast<size_t>(r) * (K / 2);
-      for (int g = 0; g < gprm; ++g) {
-        const size_t gi = static_cast<size_t>(r) * gprm + g;
-        const int kbase = g * kMxfp4Group;
-        const float* xg = w.data() + static_cast<size_t>(r) * K + kbase;
-        const float* wtg = wt_all ? wt_all + kbase : nullptr;
-        const double er = Mxfp4GroupError(xg, wtg, kMxfp4Group, rm.escale[gi], rrow, kbase);
-        const double es = Mxfp4GroupError(xg, wtg, kMxfp4Group, sm.escale[gi], srow, kbase);
-        ++groups;
-        rtn_total += er;
-        search_total += es;
-        if (es < er) ++improved;
-        if (es > er) {
-          std::fprintf(stderr, "FAIL %s mxfp4 row %d group %d: search err %.9g > rtn err %.9g\n",
                        label.c_str(), r, g, es, er);
           ok = false;
         }
@@ -230,11 +161,10 @@ int main() {
 
     for (int group : kInt4Groups) {
       const std::string tag = " g" + std::to_string(group);
-      const bool first = (group == kInt4Groups[0]);
       ok &= NeverWorseThanRtn("(i) random unweighted" + tag, w, N, K, imatrix, /*weighted=*/false,
-                              group, /*include_mxfp4=*/first);
+                              group);
       ok &= NeverWorseThanRtn("(i) random imatrix" + tag, w, N, K, imatrix, /*weighted=*/true,
-                              group, /*include_mxfp4=*/first);
+                              group);
     }
   }
 
@@ -352,25 +282,6 @@ int main() {
                              AsBytes(PackW4A16Scales(scale, zero, N, K, int4_group)),
                              ReadFileBytes(dir + "/" + sfx + "_w4a16_wsz" + g + ".bin"));
         }
-        {
-          std::vector<uint8_t> q;
-          std::vector<float> scale;
-          QuantizeInt4Pinned8Search(w.data(), N, K, int4_group, imp, 1, q, scale);
-          ok &= CompareBytes(sfx + " w4a8.wq" + tag, AsBytes(PackW4Nibbles(q, N, K, 1)),
-                             ReadFileBytes(dir + "/" + sfx + "_w4a8_wq" + g + ".bin"));
-          ok &= CompareBytes(sfx + " w4a8.ws" + tag,
-                             AsBytes(PackW4A8Scales(scale, N, K, int4_group)),
-                             ReadFileBytes(dir + "/" + sfx + "_w4a8_ws" + g + ".bin"));
-        }
-      }
-      {
-        Mxfp4Quantized mq = QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, imp, 1);
-        ok &= CompareBytes(sfx + " mxfp4.wq", PackMxfp4Wq(mq.packed, N, K, 1),
-                           ReadFileBytes(dir + "/" + sfx + "_mxfp4_wq.bin"));
-        ok &= CompareBytes(sfx + " mxfp4.ws", PackMxfp4Ws(mq.escale, N, K, kMxfp4Group),
-                           ReadFileBytes(dir + "/" + sfx + "_mxfp4_ws.bin"));
-        ok &= CompareBytes(sfx + " mxfp4.wref", mq.wref,
-                           ReadFileBytes(dir + "/" + sfx + "_mxfp4_wref.bin"));
       }
     }
   }

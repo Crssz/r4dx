@@ -21,7 +21,7 @@ add_test(NAME convert_pack_bytes COMMAND convert_pack_bytes)
 # not by inverting the packer) -- CPU-only, always runs.
 # --quant search (src/convert/include/r4dx_convert/quant_search.hpp): never worse than RTN on any
 # group, a large win on an outlier-dominated group once an imatrix de-weights the outlier channel,
-# and bit-exact agreement with tools/convert_ref/{w4_ref,mxfp4_ref}.py's search on the shared
+# and bit-exact agreement with tools/convert_ref/w4_ref.py's search on the shared
 # random fixture. Needs the fixtures directory for the last part.
 add_executable(convert_quant_search test_quant_search.cpp)
 target_link_libraries(convert_quant_search PRIVATE r4dx_convert)

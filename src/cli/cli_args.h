@@ -52,7 +52,7 @@ struct CliArgs {
   // positions are natively in-distribution for this model. The old 131072 default was a
   // self-imposed cap at half the model's real capability, inherited from an early design decision
   // and never revisited. Real hardware measurement (this same pass) shows the full 262144-token
-  // paged KV cache + GDN state costs 8.34 GiB (w4a16/w4a8) / 8.28 GiB (mxfp4) against a 31.86 GiB
+  // paged KV cache + GDN state costs 8.34 GiB (w4a16) against a 31.86 GiB
   // card that already holds ~15.5 GiB of weights (embedding mirror included) -- total 23.9-24.1
   // GiB used, ~7.75 GiB (24%) still free at `--mtp 0`, ~6.83 GiB (21%) free at `--mtp 3`. Real
   // end-to-end generation at 262144 tokens of actual prefilled context (haiku prompt + a needle
@@ -233,7 +233,7 @@ struct CliUsageError : std::runtime_error {
 
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
-         " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16|trellis} "
+         " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
          "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
          "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "

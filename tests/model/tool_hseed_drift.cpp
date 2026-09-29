@@ -113,7 +113,7 @@ int main() {
   Model bf16_ref = Model::Load(bf16_opts);
   const std::vector<std::vector<float>> ref_traj = SampleHSeedTrajectory(bf16_ref, tokens, kChunk);
 
-  const Layout layouts[] = {Layout::kW4a16, Layout::kW4a8, Layout::kMxfp4};
+  const Layout layouts[] = {Layout::kW4a16};
   std::fprintf(stderr, "[hseed_drift] container=%s, %zu positions sampled every %d tokens\n",
                kContainerPath, ref_traj.size(), kChunk);
 

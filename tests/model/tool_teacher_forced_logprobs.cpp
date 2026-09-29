@@ -21,7 +21,7 @@
 //                         production trellis container and every g64 container on the default
 //                         group-64 build; a group-128 container needs win-hip-g128 -- or --layout
 //                         w4a16 is refused at load)
-//   --layout <name>       body layout: bf16 | w4a16 | w4a8 | mxfp4 | trellis   (default w4a16;
+//   --layout <name>       body layout: bf16 | w4a16 | trellis   (default w4a16;
 //                         trellis for a trellis container -- the production container -- whose
 //                         heads then load w4a16 or bf16)
 //   --tokens <path>       tokens.json in the shared format (required):

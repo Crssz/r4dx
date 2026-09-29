@@ -1,6 +1,6 @@
 """Generates tests/convert/fixtures/: a small random bf16 weight (as a one-tensor .safetensors
 file r4dx-convert's --selftest / the CTest packer test can both read) plus every reference
-quantized/packed byte blob (w4a16, w4a8, mxfp4), computed by the Python references in this
+quantized/packed byte blob (w4a16), computed by the Python references in this
 directory. tests/convert/test_pack_bytes.cpp loads input.safetensors, runs the C++ quantizer/
 packer on it, and memcmp's the result against these files -- byte-exactness is the gate (task item
 3 / item 5).
@@ -21,7 +21,6 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import mxfp4_ref
 import w4_ref
 
 
@@ -57,7 +56,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     N, K = 32, 256  # N multiple of 16 (2 row-tiles); K multiple of 128, 64 and 32 (both int4
-                    # groups + the mxfp4 group)
+                    # groups)
     rng = np.random.default_rng(1234)
     raw = rng.normal(0.0, 1.0, size=(N, K)).astype(np.float32)
     bf16_u16 = float_to_bf16_u16(raw).reshape(N, K)
@@ -69,11 +68,9 @@ def main() -> None:
     # (R4DX_W4A16_GROUP: a multiple of the kernel's 64-wide packed block, so 64 and 128 are the
     # whole set). The 128 set keeps its historical unsuffixed filenames -- it is the ground truth
     # every earlier milestone was gated against and its bytes must not move -- and each other group
-    # g gets a "_g{g}" suffix. Only the w4* blobs are group-dependent; mxfp4's group is its own
-    # constant and is written once.
+    # g gets a "_g{g}" suffix.
     int4_groups = [128, 64]
-    manifest = {"N": N, "K": K, "int4_group": w4_ref.GROUP, "int4_groups": int4_groups,
-                "mxfp4_group": mxfp4_ref.GROUP}
+    manifest = {"N": N, "K": K, "int4_group": w4_ref.GROUP, "int4_groups": int4_groups}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     def gsfx(group: int) -> str:
@@ -85,15 +82,6 @@ def main() -> None:
         w4_ref.pack_nibbles(q16, N, K).tofile(str(out_dir / f"w4a16_wq{g}.bin"))
         w4_ref.pack_w4a16_scales(sc16, z16, N, K, group=group).tofile(
             str(out_dir / f"w4a16_wsz{g}.bin"))
-
-        q8, sc8 = w4_ref.quantize_symmetric_pinned8(w, group=group)
-        w4_ref.pack_nibbles(q8, N, K).tofile(str(out_dir / f"w4a8_wq{g}.bin"))
-        w4_ref.pack_w4a8_scales(sc8, N, K, group=group).tofile(str(out_dir / f"w4a8_ws{g}.bin"))
-
-    packed, escale, wref = mxfp4_ref.quantize(w)
-    mxfp4_ref.permute_wq(packed, N, K).tofile(str(out_dir / "mxfp4_wq.bin"))
-    mxfp4_ref.pack_ws(escale, N, K).tofile(str(out_dir / "mxfp4_ws.bin"))
-    wref.tofile(str(out_dir / "mxfp4_wref.bin"))
 
     # ---- --quant search fixtures (tests/convert/test_quant_search.cpp) ------------------------
     # Same input tensor, both weightings. `search_imatrix.bin` is the float32[K] importance vector
@@ -110,16 +98,6 @@ def main() -> None:
                 str(out_dir / f"search{suffix}_w4a16_wq{g}.bin"))
             w4_ref.pack_w4a16_scales(sc16s, z16s, N, K, group=group).tofile(
                 str(out_dir / f"search{suffix}_w4a16_wsz{g}.bin"))
-
-            q8s, sc8s = w4_ref.quantize_symmetric_pinned8_search(w, group=group, imatrix=im)
-            w4_ref.pack_nibbles(q8s, N, K).tofile(str(out_dir / f"search{suffix}_w4a8_wq{g}.bin"))
-            w4_ref.pack_w4a8_scales(sc8s, N, K, group=group).tofile(
-                str(out_dir / f"search{suffix}_w4a8_ws{g}.bin"))
-
-        ps, es, wr = mxfp4_ref.quantize_search(w, imatrix=im)
-        mxfp4_ref.permute_wq(ps, N, K).tofile(str(out_dir / f"search{suffix}_mxfp4_wq.bin"))
-        mxfp4_ref.pack_ws(es, N, K).tofile(str(out_dir / f"search{suffix}_mxfp4_ws.bin"))
-        wr.tofile(str(out_dir / f"search{suffix}_mxfp4_wref.bin"))
 
     print("fixtures written to", out_dir)
 

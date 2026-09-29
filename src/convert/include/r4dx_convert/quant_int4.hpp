@@ -1,37 +1,22 @@
-// r4dx_convert::quant_int4 -- the w4a16 / w4a8 quantizer and packer.
+// r4dx_convert::quant_int4 -- the w4a16 quantizer and packer.
 //
 // GROUND TRUTH for the byte layout (cited in full in docs/container-format.md and re-derived here
 // from the kernel sources, not assumed):
 //   - third_party/libr4d/r4d_gemm_w4a16_nt_m64.hip ("LAYOUT" / "QUANTIZER" comments, dequant())
-//   - third_party/libr4d/r4d_gemm_w4a8_nt_m64.hip (dequant8(), the Ws pointer type)
 //   - C:\Users\user\dev\vllm-radiance\radiance_w4.py pack() -- the reference packer for a
 //     SYMMETRIC grid; this file generalizes it to an ASYMMETRIC per-group zero (task requirement)
 //     and re-derives, element by element, that radiance's `_KOFF` table and nibble order are
 //     exactly r4d_gemm_w4a16_nt_m64.hip's fragment map, independent of symmetric-vs-asymmetric.
 //
-// ---- Why w4a16 and w4a8 do NOT share wq bytes here (a deliberate deviation from
-// docs/container-format.md, flagged for the loader/doc owners) ------------------------------
+// ---- The w4a16 dequant --------------------------------------------------------------------------
 //
 // r4d_gemm_w4a16_nt_m64's dequant() always XORs the stored nibble with 0x8 before use (
 // R4D_GEMM_W4_TWOS=1, the flag this build compiles with), i.e. it decodes
 // n = stored_nibble ^ 8, then computes w = scale*n - scale*(1024+zero) worth of arithmetic that
 // nets out to w = scale*(n - zero), where `zero` is whatever this converter wrote into `wsz`'s
-// high 16 bits. `zero` is free to be any of 0..15 -- that is the whole point of storing it.
-//
-// r4d_gemm_w4a8_nt_m64's dequant8() has NO zero input at all: it reads the stored nibble directly
-// as a two's-complement nibble (`nibble<<4` as a signed byte, /16 at the store). That is only
-// correct when the value the stored nibble represents was produced with zero PINNED to 8 (the
-// kernel comment says so explicitly: "one quantised weight feeds both... when its integer zero
-// point is the constant 8"). XOR-by-8 and "subtract 8 mod 16" are the identical operation on a
-// 4-bit code (verified: (q^8) == (q-8)&0xF for every q in 0..15), so sharing bytes is EXACT only
-// when w4a16's zero happens to equal 8 for that group.
-//
-// This converter's w4a16 quantizer computes a genuine per-(row,group) asymmetric zero from the
-// data (0..15, not pinned) -- that is what the task brief asks for and it is measurably more
-// accurate than a symmetric grid. So w4a16.wq and w4a8.wq are quantized SEPARATELY: w4a16 with a
-// free zero, w4a8 with zero pinned to 8 (a plain symmetric grid, scale = amax/7, exactly
-// radiance_w4.py's `_grid`). Both still use the identical fragment permutation (PackW4Nibbles
-// below), because that part of the byte layout has nothing to do with the quantization grid.
+// high 16 bits. `zero` is free to be any of 0..15 -- that is the whole point of storing it. This
+// converter's quantizer computes a genuine per-(row,group) asymmetric zero from the data (0..15,
+// not pinned). (The w4a8 layout, which pinned the zero to 8, is retired.)
 #pragma once
 
 #include <algorithm>
@@ -46,12 +31,10 @@
 
 namespace r4dx_convert {
 
-// ---- group sizes: one constant PER KERNEL, each driven by that kernel's own build flag ---------
+// ---- group size: driven by the w4a16 kernel's build flag ---------------------------------------
 //
-// These two used to be a single `kInt4Group = 128`, which was only correct because both kernels
-// happened to be built with 128. They are separate knobs in libr4d (R4D_GEMM_W4_GROUP for w4a16,
-// R4D_GEMM_W4A8_GROUP for w4a8) and they are separate constants here, each asserted against its
-// own kernel export at startup (src/convert/main.cpp ValidateKernelGroupSizes).
+// The constant is asserted against the kernel export at startup (src/convert/main.cpp
+// ValidateKernelGroupSizes).
 //
 // w4a16's group is a BUILD OPTION: the CMake cache variable R4DX_W4A16_GROUP (root
 // CMakeLists.txt, default 64 since Milestone 11 -- 128 before it) is passed both to the kernel as
@@ -82,11 +65,6 @@ static_assert(kW4A16Group > 0 && kW4A16Group % 64 == 0,
 inline bool IsW4A16GroupSupported(int group) {
   return group == 32 || group == 64 || group == 128;
 }
-
-// w4a8's group is NOT an option: third_party/CMakeLists.txt pins the kernel to
-// -DR4D_GEMM_W4A8_GROUP=128 (its in-kernel default is 256). Change one and the startup assert in
-// src/convert/main.cpp fires naming both numbers.
-inline constexpr int kW4A8Group = 128;
 
 // k-offset (within a 16-wide WMMA step, before the lane's own 4*(lane>>4) term) of fragment
 // element e = 0..7, i.e. the inverse of r4d_gemm_w4a16_nt_m64.hip's "nibble 2e (e<4) / 2(e-4)+1
@@ -189,44 +167,11 @@ inline void QuantizeInt4Asymmetric(const float* w, int N, int K, int group, int 
   });
 }
 
-// Symmetric, zero pinned to 8: scale = max(|w|)/7 per (row,group), q_signed = clamp(round(w/scale),
-// -8,7), q = q_signed+8 (0..15, the "offset binary" code PackW4Nibbles expects). This is w4a8's
-// grid -- identical formula to radiance_w4.py's `_grid` (without its clip search: the task's
-// self-test uses small random matrices where a single min/max/7 grid already round-trips inside
-// the harness's 2e-2 tolerance, and the clip search is a serving-time quality knob, not a byte
-// layout requirement).
-inline void QuantizeInt4SymmetricPinned8(const float* w, int N, int K, int group, int nthreads,
-                                          std::vector<uint8_t>& q, std::vector<float>& scale) {
-  RequireDivisible(K, group, "K", "QuantizeInt4SymmetricPinned8");
-  const int groups_per_row = K / group;
-  q.assign(static_cast<size_t>(N) * K, 0);
-  scale.assign(static_cast<size_t>(N) * groups_per_row, 0.0f);
-
-  ParallelFor(0, N, nthreads, [&](int64_t r0, int64_t r1) {
-    for (int64_t row = r0; row < r1; ++row) {
-      const float* wr = w + row * K;
-      for (int g = 0; g < groups_per_row; ++g) {
-        const float* wg = wr + static_cast<int64_t>(g) * group;
-        float amax = std::fabs(wg[0]);
-        for (int k = 1; k < group; ++k) amax = std::max(amax, std::fabs(wg[k]));
-        const float sc = std::max(amax, 1e-12f) / 7.0f;
-        scale[static_cast<size_t>(row) * groups_per_row + g] = sc;
-        uint8_t* qg = q.data() + row * static_cast<int64_t>(K) + static_cast<int64_t>(g) * group;
-        for (int k = 0; k < group; ++k) {
-          const int qs = ClampInt(RoundHalfAwayFromZero(wg[k] / sc), -8, 7);
-          qg[k] = static_cast<uint8_t>(qs + 8);
-        }
-      }
-    }
-  });
-}
-
 // ---- packer -------------------------------------------------------------------------------
 //
 // `q` [N,K] in 0..15 is the OFFSET-BINARY code the kernel's dequant produces after its own
-// internal XOR-by-8 (i.e. exactly QuantizeInt4Asymmetric's or QuantizeInt4SymmetricPinned8's `q`,
-// unmodified). Output `wq` is uint32[N*K/8], in the fragment order both r4d_gemm_w4a16_nt_m64 and
-// r4d_gemm_w4a8_nt_m64 read: outer-to-inner (row-tile t, k-block kb of 64, lane-half lh, row-in-
+// internal XOR-by-8 (i.e. exactly QuantizeInt4Asymmetric's `q`, unmodified). Output `wq` is
+// uint32[N*K/8], in the fragment order r4d_gemm_w4a16_nt_m64 reads: outer-to-inner (row-tile t, k-block kb of 64, lane-half lh, row-in-
 // tile r, k-step s), 8 nibbles per dword (nibble i = element e=kNibbleToElement[i], stored as
 // q[row,k]^8 so the kernel's XOR undoes it back to q[row,k]).
 inline std::vector<uint32_t> PackW4Nibbles(const std::vector<uint8_t>& q, int N, int K,
@@ -310,29 +255,4 @@ inline std::vector<uint32_t> PackW4A16Scales(const std::vector<float>& scale,
   }
   return wsz;
 }
-
-// ws for w4a8: uint32[N*K/group] (same (t,g,r) order and same 4-byte stride as wsz -- the kernel
-// reads `Ws` through an `unsigned*`, `sz & 0xFFFF` only, see r4d_gemm_w4a8_nt_m64.hip). The f16
-// scale is the only content; high 16 bits are 0 (unread).
-inline std::vector<uint32_t> PackW4A8Scales(const std::vector<float>& scale, int N, int K,
-                                             int group) {
-  RequireDivisible(N, 16, "N", "PackW4A8Scales");
-  RequireDivisible(K, group, "K", "PackW4A8Scales");
-  const int ntiles = N / 16;
-  const int groups_per_row = K / group;
-  std::vector<uint32_t> ws(static_cast<size_t>(ntiles) * groups_per_row * 16);
-  size_t out = 0;
-  for (int t = 0; t < ntiles; ++t) {
-    for (int g = 0; g < groups_per_row; ++g) {
-      for (int r = 0; r < 16; ++r, ++out) {
-        const int row = t * 16 + r;
-        const uint16_t sc16 = EncodeScaleF16Checked(scale[static_cast<size_t>(row) * groups_per_row + g],
-                                                      "w4a8.ws");
-        ws[out] = static_cast<uint32_t>(sc16);
-      }
-    }
-  }
-  return ws;
-}
-
 }  // namespace r4dx_convert

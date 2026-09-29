@@ -1,6 +1,6 @@
 // Quantizer round-trip error bounds on random data (task item 5). Not a byte-exactness test (that
 // is test_pack_bytes.cpp) -- this catches a quantizer regression (e.g. a broken scale/zero
-// formula) by checking the dequantized reconstruction stays within the error a 4-bit / OCP-MXFP4
+// formula) by checking the dequantized reconstruction stays within the error a 4-bit
 // grid is expected to produce on Gaussian data, generously bounded so the test isn't flaky.
 #include <cmath>
 #include <cstdio>
@@ -9,7 +9,6 @@
 #include <vector>
 
 #include "r4dx_convert/quant_int4.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 
 namespace {
 
@@ -61,25 +60,6 @@ bool CheckW4A16(const std::vector<float>& w, int N, int K, int group) {
   return CheckBound("w4a16 asymmetric g" + std::to_string(group), RelL2Error(w, recon), 0.13);
 }
 
-bool CheckW4A8(const std::vector<float>& w, int N, int K, int group) {
-  using namespace r4dx_convert;
-  std::vector<uint8_t> q;
-  std::vector<float> scale;
-  QuantizeInt4SymmetricPinned8(w.data(), N, K, group, /*nthreads=*/4, q, scale);
-  std::vector<float> recon(w.size());
-  const int gpr = K / group;
-  for (int r = 0; r < N; ++r) {
-    for (int k = 0; k < K; ++k) {
-      const int g = k / group;
-      const size_t gi = static_cast<size_t>(r) * gpr + g;
-      recon[static_cast<size_t>(r) * K + k] =
-          scale[gi] * (static_cast<float>(q[static_cast<size_t>(r) * K + k]) - 8.0f);
-    }
-  }
-  // Tightened from 0.25 to ~1.3x observed (0.1167) -- same reasoning as w4a16 above.
-  return CheckBound("w4a8 pinned8 g" + std::to_string(group), RelL2Error(w, recon), 0.15);
-}
-
 }  // namespace
 
 int main() {
@@ -93,45 +73,11 @@ int main() {
 
   bool ok = true;
 
-  // ---- w4a16 (asymmetric, free zero) and w4a8 (symmetric, zero pinned to 8), at every group ---
+  // ---- w4a16 (asymmetric, free zero), at every group ---------------------------------------------
   for (int group : kGroups) {
     ok &= CheckW4A16(w, N, K, group);
-    ok &= CheckW4A8(w, N, K, group);
   }
 
-  // ---- mxfp4 --------------------------------------------------------------------------------
-  {
-    Mxfp4Quantized mq = QuantizeMxfp4(w.data(), N, K, kMxfp4Group, /*nthreads=*/4);
-    std::vector<float> recon(w.size());
-    const int gpr = K / kMxfp4Group;
-    for (int r = 0; r < N; ++r) {
-      // Review finding (minor): this reconstruction previously used the group's own escale
-      // directly and never modeled the KERNEL's actual computation, which folds
-      // dsh = Wref[row]-escale, CLAMPED to 0..15, into a fp8 lookup table (r4d_gemm_mxfp4a8_nt_m64
-      // .hip's r4d_mxfp4_unpack8) -- so a group whose escale is more than 15 below the row's max
-      // (wref) would clamp and dequantize to a DIFFERENT (larger) value on the real kernel than
-      // the group's own escale implies. Nothing in this checkpoint hits that today (review
-      // measured max dsh=5), but the escale-only reconstruction couldn't have caught it if it did.
-      // Fold the same clamp in here so a future outlier-channel regression shows up as a bound
-      // failure instead of silently passing.
-      const uint8_t wref = mq.wref[r];
-      for (int k = 0; k < K; ++k) {
-        const int g = k / kMxfp4Group;
-        const uint8_t raw = mq.escale[static_cast<size_t>(r) * gpr + g];
-        int dsh = static_cast<int>(wref) - static_cast<int>(raw);
-        dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
-        const int effective_raw = static_cast<int>(wref) - dsh;  // == raw unless clamped
-        const float scale = std::ldexp(1.0f, effective_raw - 127);
-        const uint8_t byte = mq.packed[static_cast<size_t>(r) * (K / 2) + k / 2];
-        const uint8_t code = (k % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-        const float mag = kE2M1Magnitude[code & 0x7];
-        const float sign = (code & 0x8) ? -1.0f : 1.0f;
-        recon[static_cast<size_t>(r) * K + k] = sign * mag * scale;
-      }
-    }
-    // Tightened from 0.35 to ~1.3x observed (0.1146).
-    ok &= CheckBound("mxfp4", RelL2Error(w, recon), 0.15);
-  }
 
   if (!ok) return 1;
   std::printf("PASS\n");

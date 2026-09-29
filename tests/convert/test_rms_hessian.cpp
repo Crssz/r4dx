@@ -36,8 +36,8 @@
 //       rms_keys for all seven in-projections), C (rms_keys for the two mlp.gate_up only). The
 //       K = 5120 factorizations dominate the run time, so the runs that do not need layer 1 use
 //       --layers 1.
-//         unrotated A (--layers 1): the container's digest equals the golden taken with the build
-//             from before this path existed -- unrotated output is byte-identical;
+//         unrotated A (--layers 1): the container's tensor digest equals the golden taken with the
+//             build from before this path existed -- unrotated output is byte-identical;
 //         unrotated B (--layers 1): every tensor byte-identical to A's, the header identical except
 //             hessian_dir / hessian_manifest_sha256, no ldlq_rms_linears key;
 //         q2ab A: refused during PLANNING (no output file), naming text.layers.0.mlp.gate_up,
@@ -948,13 +948,20 @@ Container ReadContainer(const fs::path& path) {
   return c;
 }
 
-// sha256 of the header (hessian_dir, the one path it records, replaced by a placeholder) and every
-// data byte: the whole container, independent of where the test wrote its Hessians.
+// sha256 over every tensor (name, size, bytes; in name order): the container's DATA, independent of
+// its __metadata__ (which records where the test wrote its Hessians, and -- since the mxfp4 / w4a8
+// layouts were retired -- no longer lists those layouts, so the golden below is a digest of the
+// tensors a pre-retirement build wrote with the same arguments).
 std::string Digest(const Container& c) {
-  nlohmann::json h = c.header;
-  auto& run = h["__metadata__"]["r4dx_convert_run"];
-  if (run.contains("hessian_dir")) run["hessian_dir"] = "<hessian_dir>";
-  return Sha256Hex(h.dump() + c.data);
+  std::string all;
+  for (const auto& kv : c.tensors) {
+    all += kv.first;
+    all.push_back('\0');
+    all += std::to_string(kv.second.size());
+    all.push_back('\0');
+    all += kv.second;
+  }
+  return Sha256Hex(all);
 }
 
 // Every conversion (d) runs: w4a16 only, every quantized linear LDLQ'd. `layers` 1 converts the GDN
@@ -967,9 +974,11 @@ std::string CommonArgs(const fs::path& ckpt, const fs::path& out, const fs::path
 }
 
 // Digest() of `r4dx-convert CommonArgs(<ckpt>, <out>, <root>/hess_A, 1)` on --make-fixture's output,
-// taken with r4dx-convert built at 0190d80 (src/convert as of c0435d1), before rms_keys existed;
-// R4DX_W4A16_GROUP=64. (That build's and this one's outputs were also sha256-identical files.)
-const char* const kUnrotatedGolden = "c91331a02dd3d8ff06f3a90c9e265d9bd7b96d7e6bb74b54c9a594d99dcd6008";
+// taken with r4dx-convert built from bcebb21 (before the mxfp4 / w4a8 layouts were cut), whose
+// w4a16 / bf16 tensors are the ones this build must still write; R4DX_W4A16_GROUP=64. (The previous
+// golden, of the whole file with its header, was taken at 0190d80, before rms_keys existed; that
+// build's and bcebb21's tensors were identical.)
+const char* const kUnrotatedGolden = "02af5a27e54276c7d6bc88fea494941ce7c90c16e380b6e9ac0ab4c9265c4e92";
 
 std::string W4a16Bytes(const std::vector<uint32_t>& v) {
   return std::string(reinterpret_cast<const char*>(v.data()), v.size() * 4);

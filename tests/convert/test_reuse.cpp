@@ -246,31 +246,25 @@ void TestLibrary() {
       LayoutSet q;
       q.bf16 = false;
       q.w4a16 = true;
-      LayoutSet v6 = q;
-      v6.w4a8 = v6.mxfp4 = true;
-      v6.w4a16_group = 32;
-      LayoutSet all = v6;
+      LayoutSet g32 = q;
+      g32.w4a16_group = 32;
+      LayoutSet all = g32;
       all.bf16 = true;
       all.w4a16_group = 128;
       LayoutSet none;
       none.bf16 = false;
-      LayoutSet w8;
-      w8.bf16 = false;
-      w8.w4a8 = true;
       const std::vector<std::pair<LayoutSet, std::string>> sets = {
           {KeptBf16LayoutSet(), "bf16"},
           {q, "w4a16.g" + std::to_string(kW4A16Group)},
-          {v6, "w4a16.g32+w4a8+mxfp4"},
-          {all, "bf16+w4a16.g128+w4a8+mxfp4"},
-          {w8, "w4a8"},
+          {g32, "w4a16.g32"},
+          {all, "bf16+w4a16.g128"},
           {none, "none"}};
       bool ids = true, names = true;
       for (const auto& s : sets) {
         LayoutSet back;
         ids = ids && LayoutSetId(s.first) == s.second && ParseLayoutSetId(s.second, &back) &&
               LayoutSetId(back) == s.second && back.bf16 == s.first.bf16 &&
-              back.w4a16 == s.first.w4a16 && back.w4a8 == s.first.w4a8 &&
-              back.mxfp4 == s.first.mxfp4 &&
+              back.w4a16 == s.first.w4a16 &&
               (!back.w4a16 || back.w4a16_group == s.first.w4a16_group);
         ContainerWriter w;
         PlanLinearLayouts(w, "x.y", 32, 256, s.first);
@@ -278,14 +272,15 @@ void TestLibrary() {
         for (size_t i = 0; i < w.PlannedTensorCount(); ++i) planned.push_back(w.PlannedName(i));
         names = names && planned == LinearLayoutTensorNames("x.y", s.first);
       }
-      Gate(ids, "(0) LayoutSetId: bf16 / w4a16.g<default> / w4a16.g32+w4a8+mxfp4 / "
-                "bf16+w4a16.g128+w4a8+mxfp4 / w4a8 / none, and ParseLayoutSetId round-trips each");
+      Gate(ids, "(0) LayoutSetId: bf16 / w4a16.g<default> / w4a16.g32 / "
+                "bf16+w4a16.g128 / none, and ParseLayoutSetId round-trips each");
       Gate(names, "(0) LinearLayoutTensorNames == the names PlanLinearLayouts plans, for each set");
       bool refused = true;
       std::string accepted;
       for (const char* bad : {"", "bf16+", "+bf16", "w4a8+bf16", "bf16+bf16", "w4a16.g48",
                               "w4a16.g064", "w4a16.g", "w4a16", "w4a16.g99999", "fp8", "none+bf16",
-                              "bf16 ", "BF16", "mxfp4+w4a8"}) {
+                              "bf16 ", "BF16", "mxfp4+w4a8", "w4a8", "mxfp4",
+                              "w4a16.g32+w4a8+mxfp4"}) {
         LayoutSet ls;
         if (ParseLayoutSetId(bad, &ls)) {
           refused = false;
@@ -1066,10 +1061,8 @@ void TestExe(const Fixture& f) {
   run.Refused("--layers 1", With(recipe, "--layers", "1"), from0, "reuse_guard.args.layers:");
   run.Refused("--vision off", With(recipe, "--vision", "off"), from0, "reuse_guard.args.vision:");
   run.Refused("--mtp off", With(recipe, "--mtp", "off"), from0, "reuse_guard.args.mtp:");
-  run.Refused("--layouts w4a16,w4a8", With(recipe, "--layouts", "w4a16,w4a8"), from0,
-              "reuse_guard.args.layouts.w4a8:");
-  run.Refused("--lm-head w4a16,mxfp4", With(recipe, "--lm-head", "w4a16,mxfp4"), from0,
-              "reuse_guard.args.lm_head.mxfp4:");
+  run.Refused("--lm-head w4a16,bf16", With(recipe, "--lm-head", "w4a16,bf16"), from0,
+              "reuse_guard.args.lm_head.bf16:");
   run.Refused("without --no-bf16", Without(recipe, "--no-bf16"), from0, "reuse_guard.args.layouts.bf16:");
   run.Refused("--quant rtn (no --imatrix)", Without(With(recipe, "--quant", "rtn"), "--imatrix"), from0,
               "reuse_guard.args.quant:");

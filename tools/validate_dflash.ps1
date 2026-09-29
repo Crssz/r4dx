@@ -60,9 +60,9 @@
 .PARAMETER Layouts
   Comma-separated TARGET body layouts. Default: the production container's own layout (trellis: a
   trellis container loads with no other) -- or, when -Model names another container explicitly,
-  w4a16,w4a8,mxfp4 as before (bf16 excluded, standing bf16-retired-from-perf-work rule --
-  docs/status.md). w4a16/w4a8/mxfp4 at 64 layers need a multi-layout container; none is kept on disk
-  since the base v6 was retired (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries all four.
+  w4a16 (bf16 excluded, standing bf16-retired-from-perf-work rule -- docs/status.md). w4a16 at 64
+  layers needs a multi-layout container; none is kept on disk since the base v6 was retired
+  (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries it. (mxfp4 and w4a8 are retired.)
 
 .PARAMETER MaxTokens
   --max-tokens for every generation. Default 40, matching validate_fusion.ps1's own default (long
@@ -105,7 +105,7 @@ param(
     # switching to it alone makes the row match --mtp 0 again, the divergence is pure verify-window
     # grouping (same class as the documented MTP mechanism), not a dflash bookkeeping bug -- a
     # bookkeeping/lifecycle bug cannot be switched off by re-quantizing the draft container.
-    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-mxfp4.r4dx",
+    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx",
     [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [int]$MaxTokens = 40,
     [switch]$AllowBatchedVerifyDivergence,
@@ -197,8 +197,8 @@ if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
 if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter -BuildDir "build\win-hip" }
 if (-not $Layouts) {
     # The production container is a trellis container and loads with no other layout; an explicit
-    # -Model keeps the historical matrix (a multi-layout w4a16 / w4a8 / mxfp4 container).
-    $Layouts = if ($ModelWasExplicit) { "w4a16,w4a8,mxfp4" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
+    # -Model keeps the historical matrix (a multi-layout w4a16 container).
+    $Layouts = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
 }
 Write-Output "[validate_dflash] target=$Model draft=$Dflash layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "target container not found: $Model" }

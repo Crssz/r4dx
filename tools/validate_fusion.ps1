@@ -77,8 +77,8 @@ $ModelWasExplicit = [bool]$Model
 if (-not $Model) { $Model = Get-R4dxProductionTarget -BuildDir "build\win-hip" }
 if (-not $Layouts) {
     # The production container is a trellis container and loads with no other layout; an explicit
-    # -Model keeps the historical matrix (a multi-layout w4a16 / w4a8 / mxfp4 container).
-    $Layouts = if ($ModelWasExplicit) { "w4a16,w4a8,mxfp4" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
+    # -Model keeps the historical matrix (a multi-layout w4a16 container).
+    $Layouts = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
 }
 Write-Output "[validate_fusion] model=$Model layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "model container not found: $Model" }

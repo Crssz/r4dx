@@ -98,9 +98,7 @@ constexpr bool SameLayoutValue(trellis_rows::Layout a, r4dx::model::Layout b) {
   return static_cast<int>(a) == static_cast<int>(b);
 }
 static_assert(SameLayoutValue(trellis_rows::Layout::kBf16, r4dx::model::Layout::kBf16) &&
-                  SameLayoutValue(trellis_rows::Layout::kMxfp4, r4dx::model::Layout::kMxfp4) &&
                   SameLayoutValue(trellis_rows::Layout::kW4a16, r4dx::model::Layout::kW4a16) &&
-                  SameLayoutValue(trellis_rows::Layout::kW4a8, r4dx::model::Layout::kW4a8) &&
                   SameLayoutValue(trellis_rows::Layout::kTrellis, r4dx::model::Layout::kTrellis),
               "tests/kernels/trellis_tuning_rows.hpp's Layout is not quant_linear.h's, value for value");
 
@@ -163,12 +161,6 @@ bool Launchable(Layout layout, int64_t K, const LinearTuning& t, int w4a16_group
       return served && K % (t.SK * std::max(g, 64)) == 0 &&
              (t.NPW == 1 || t.NPW == 4) && t.WV * t.NPW * t.SK <= 64;
     }
-    case Layout::kW4a8:
-      return K % (t.SK * r4d_gemm_w4a8_nt_m64_group()) == 0 &&
-             (t.NPW == 1 || t.NPW == 2 || t.NPW == 4 || t.NPW == 8) && t.WV * t.NPW * t.SK <= 64;
-    case Layout::kMxfp4:
-      return K % (t.SK * r4d_gemm_mxfp4a8_nt_m64_group()) == 0 &&
-             (t.NPW == 1 || t.NPW == 2 || t.NPW == 4 || t.NPW == 8) && t.WV * t.NPW * t.SK <= 64;
     case Layout::kTrellis:
       return false;  // TrellisLaunchable below: it needs the chunk M, rate and part boundary
   }
@@ -495,12 +487,10 @@ void CheckTable(const GemmTuningRow (&table)[kRows], const char* which, bool tp2
         if (!Launchable(row.layout, row.K, t, g)) {
           std::fprintf(stderr,
                        "FAIL (%s) layout=%d N=%lld K=%lld M=%lld w4a16_group=%d -> WV=%d SK=%d "
-                       "MB=%d NPW=%d is not launchable at this build's groups (w4a16 default=%d "
-                       "w4a8=%d mxfp4=%d)\n",
+                       "MB=%d NPW=%d is not launchable at this build's groups (w4a16 default=%d)\n",
                        which, static_cast<int>(row.layout), static_cast<long long>(row.N),
                        static_cast<long long>(row.K), static_cast<long long>(m), g, t.WV, t.SK,
-                       t.MB, t.NPW, r4d_gemm_w4a16_nt_m64_group(), r4d_gemm_w4a8_nt_m64_group(),
-                       r4d_gemm_mxfp4a8_nt_m64_group());
+                       t.MB, t.NPW, r4d_gemm_w4a16_nt_m64_group());
           ++failures;
         }
         ++checked;

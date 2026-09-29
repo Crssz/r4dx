@@ -8,10 +8,10 @@ Checks:
   1. bf16-layout container: EVERY tensor's bytes are bit-exact to Q8_0-dequant-RTNE-bf16 (or
      F32/F16/BF16-dequant-RTNE-bf16, whichever the source tensor's own dtype is) of the GGUF.
      Fully vectorized (numpy), so this covers the real, full-size container in seconds.
-  2. Quantized layouts (w4a16/w4a8/mxfp4): reuses this repo's existing byte-exact Python references
-     (w4_ref.py, mxfp4_ref.py -- the SAME ones tools/convert_ref/selftest_compare.py diffs the main
+  2. Quantized layout (w4a16): reuses this repo's existing byte-exact Python reference
+     (w4_ref.py -- the SAME one tools/convert_ref/selftest_compare.py diffs the main
      model's converter against) to re-quantize+re-pack each linear's FIRST tile (16 rows x one
-     k-block: 64 cols for w4a16/w4a8, 32 cols for mxfp4) and byte-compare against the container's
+     k-block: 64 cols for w4a16) and byte-compare against the container's
      own bytes at that tile's offset. A full-tensor byte-exact re-pack in pure Python is not
      tractable at these tensor sizes (w4_ref.pack_nibbles is an O(N*K) nested Python loop, written
      for selftest_compare.py's tiny 48x384 fixture) -- the first-tile spot check exercises the
@@ -22,7 +22,7 @@ Checks:
      printed caveat and the task's open_issues.
 
 Usage:
-  python dflash2_container_check.py --gguf <DFlash2 gguf> --container <....r4dx> [--layout {bf16,w4a16,w4a8,mxfp4}]
+  python dflash2_container_check.py --gguf <DFlash2 gguf> --container <....r4dx> [--layout {bf16,w4a16}]
 """
 import argparse
 import json
@@ -33,7 +33,6 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import mxfp4_ref
 import w4_ref
 from common import F32
 
@@ -231,7 +230,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
     ap.add_argument("--container", required=True)
-    ap.add_argument("--layout", required=True, choices=["bf16", "w4a16", "w4a8", "mxfp4"])
+    ap.add_argument("--layout", required=True, choices=["bf16", "w4a16"])
     args = ap.parse_args()
 
     gguf = GgufFile(args.gguf)
@@ -280,34 +279,21 @@ def main():
             continue
 
         # Quantized layouts: first-tile spot check (see file header comment). The slice width MUST
-        # equal the real quantization group size (w4a16/w4a8: 128, mxfp4: 32) -- quantization scale
+        # equal the real quantization group size (w4a16: 128) -- quantization scale
         # is computed per (row, full group), so a narrower slice would compute a DIFFERENT scale
         # than the real converter did for that row's actual group 0, breaking byte-exactness for a
         # reason that has nothing to do with a real bug. A slice exactly one group wide starting at
         # column 0 reproduces the real row's own group-0 scale exactly (same float values, same
-        # group boundary), and PackW4Nibbles/PackMxfp4Wq's tile-major loop order guarantees tile
+        # group boundary), and PackW4Nibbles' tile-major loop order guarantees tile
         # (t=0, kb=0[, kb=1]) is emitted first and is independent of how many tiles/k-blocks the
         # full tensor has -- so this slice's packed bytes are bit-identical to the real container's
         # own first bytes for this tensor.
         n_checked += 1
-        if args.layout == "w4a16":
-            tile = w[0:16, 0:128]
-            q, sc, zero = w4_ref.quantize_asymmetric(tile)  # default group=128
-            want_wq = w4_ref.pack_nibbles(q, 16, 128).tobytes()
-            got_wq = container.bytes(f"dflash.{name}.w4a16.wq")[0:len(want_wq)]
-            ok = got_wq == want_wq
-        elif args.layout == "w4a8":
-            tile = w[0:16, 0:128]
-            q, sc = w4_ref.quantize_symmetric_pinned8(tile)  # default group=128
-            want_wq = w4_ref.pack_nibbles(q, 16, 128).tobytes()
-            got_wq = container.bytes(f"dflash.{name}.w4a8.wq")[0:len(want_wq)]
-            ok = got_wq == want_wq
-        else:  # mxfp4
-            tile = w[0:16, 0:32]
-            packed, escale, wref = mxfp4_ref.quantize(tile)  # default group=32
-            want_wq = mxfp4_ref.permute_wq(packed, 16, 32).tobytes()
-            got_wq = container.bytes(f"dflash.{name}.mxfp4.wq")[0:len(want_wq)]
-            ok = got_wq == want_wq
+        tile = w[0:16, 0:128]
+        q, sc, zero = w4_ref.quantize_asymmetric(tile)  # default group=128
+        want_wq = w4_ref.pack_nibbles(q, 16, 128).tobytes()
+        got_wq = container.bytes(f"dflash.{name}.w4a16.wq")[0:len(want_wq)]
+        ok = got_wq == want_wq
         n_ok += ok
         n_fail += not ok
         print(f"{'OK  ' if ok else 'FAIL'} {args.layout:5s} {name} [{N},{K}] (first-tile spot check, "

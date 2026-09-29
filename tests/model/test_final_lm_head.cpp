@@ -124,9 +124,7 @@ static int RunTest() {
   struct Case { Layout layout; double tol; };
   const Case cases[] = {
       {Layout::kBf16, kTightTol},
-      {Layout::kMxfp4, kLooseTol},
       {Layout::kW4a16, kLooseTol},
-      {Layout::kW4a8, kLooseTol},
   };
 
   bool all_ok = true, any_ran = false;

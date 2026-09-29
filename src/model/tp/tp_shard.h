@@ -5,7 +5,7 @@
 // CPU-only and HIP-free on purpose (target r4dx_tp_shard): the loader (Container::Load with
 // tp_world > 1) is the only production caller, and tests/model/test_tp_shard.cpp proves
 // `Gather(full, Plan*(...)) == pack(slice(W))` byte for byte against the converter's real packers
-// (src/convert/include/r4dx_convert/quant_int4.hpp / quant_mxfp4.hpp) without a device.
+// (src/convert/include/r4dx_convert/quant_int4.hpp) without a device.
 //
 // Two layers:
 //   * RuleFor/RankRows/RankCols -- LOGICAL: the global row/col indices of a rank's slice of
@@ -13,8 +13,7 @@
 //     q|k|v, gate_up = gate|up, ...); each segment is split into `world` equal contiguous parts
 //     and rank r takes part r of every segment, concatenated in segment order.
 //   * PlanRows/PlanCols/Gather -- PHYSICAL: the byte runs of one on-disk part (bf16 row-major, the
-//     w4 fragment-order wq, the per-(tile, group, row) uint32 scale dwords, mxfp4's [K/32][N] ws,
-//     ...) whose concatenation is the rank's packed slice, in the order that slice stores them.
+//     w4 fragment-order wq, the per-(tile, group, row) uint32 scale dwords, ...) whose concatenation is the rank's packed slice, in the order that slice stores them.
 #pragma once
 
 #include <cstddef>
@@ -53,7 +52,7 @@ struct ShardRule {
 // bare pre-R1 form and its `.bf16.w` form share one base, so one rule covers every on-disk form.
 // `global`: the UNSHARDED config. Throws std::invalid_argument for a name it does not know (a new
 // tensor must be classified, never silently replicated) -- including any name, on every path, that
-// still carries its ".{bf16|w4a16|w4a8|mxfp4}.{part}" suffix -- for a layer index out of range,
+// still carries its ".{bf16|w4a16|trellis}.{part}" suffix (or a retired w4a8 / mxfp4 one) -- for a layer index out of range,
 // and for a GDN tensor on a full-attention layer or the reverse. The two exceptions are
 // whole-prefix rules by design (docs/tp.md 4.2): every other `vision.*` name is rank-0-only and
 // every other `dflash.*` name (a separate, fully replicated container) is replicated. The five
@@ -71,12 +70,8 @@ Range RankCols(const ShardRule& r, int world, int rank);
 // One on-disk part of a tensor (docs/tp.md 4.3 has the physical layout of each).
 enum class Part {
   kBf16,      // row-major [N, K] bf16: `.bf16.w`, the bare pre-R1 form, 2-D raw bf16 (in_proj_a/b)
-  kW4Wq,      // w4a16.wq / w4a8.wq: (t, kb, lh, r, s), 512 B per (16-row tile, 64-K block)
+  kW4Wq,      // w4a16.wq: (t, kb, lh, r, s), 512 B per (16-row tile, 64-K block)
   kW4a16Wsz,  // uint32 per (t, g, r), g = the container's w4a16 group
-  kW4a8Ws,    // uint32 per (t, g, r), g = 128 -- the same 4-byte stride as wsz, NOT uint16
-  kMxWq,      // (nt, ks, lane), 128 B per (16-row tile, 16-K step)
-  kMxWs,      // uint8 [K/32][N]
-  kMxWref,    // int8 [N], each row's max E8M0 exponent
   kElem,      // [N] rows of `row_bytes` each: 1-D vectors, conv1d_weight ([conv_dim][4] bf16)
   // `.trellis.w` (docs/trellis-kernel.md 2.1, 2.4): the pair grid, 64*rate bytes per (32-row tile
   // pair, 16-K tile), pair-row-major -- so a run of rows is one byte range and a K range is one run
@@ -87,7 +82,7 @@ enum class Part {
 struct PartShape {
   Part part = Part::kBf16;
   int64_t N = 0, K = 0;   // the FULL logical W[N, K] the part belongs to (kElem: N rows, K unused)
-  int group = 0;          // kW4a16Wsz: container w4a16 group; kW4a8Ws: 128; kMxWs: 32
+  int group = 0;          // kW4a16Wsz: the w4a16 group the scales are cut at
   int64_t row_bytes = 0;  // kElem only: bytes per row (8 for conv1d_weight, 4 for fp32 vectors)
   int rate = 0;           // kTrellisW only: trellis bits per weight (KB)
 };
@@ -102,10 +97,9 @@ struct ByteRun {
 // shape the part cannot have, a range out of bounds, or a range misaligned for the part (the
 // 16-row-tile parts need begin and count % 16, kTrellisW % 128).
 std::vector<ByteRun> PlanRows(const PartShape& shape, const std::vector<Range>& rows);
-// Byte runs whose concatenation is that part of W[:, cols]. kMxWref returns the FULL [N]
-// (docs/tp.md 4.3 "The mxfp4 wref exception"). kElem has no column axis and throws. Throws
-// std::invalid_argument on a misaligned range (w4 wq: % 64; w4 scale dwords: % group; mxfp4 wq
-// and ws: % 32; trellis w: % 128).
+// Byte runs whose concatenation is that part of W[:, cols]. kElem has no column axis and throws.
+// Throws std::invalid_argument on a misaligned range (w4 wq: % 64; w4 scale dwords: % group;
+// trellis w: % 128).
 std::vector<ByteRun> PlanCols(const PartShape& shape, Range cols);
 // Concatenation of `runs` out of `full` (`full_bytes` long). Throws std::out_of_range if a run
 // reaches past the end.

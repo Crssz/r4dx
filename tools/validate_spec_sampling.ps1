@@ -66,13 +66,13 @@
   different verify-window contents), so if switching to it reproduces the ORIGINAL --dflash run's
   own hash, the divergence is pure verify-window grouping, not a dflash-specific bookkeeping bug --
   a bookkeeping/lifecycle bug cannot be switched off by re-quantizing the draft container. Default:
-  the mxfp4 draft container (independent of the w4a16 default above).
+  the bf16 draft container (independent of the w4a16 default above).
 
 .PARAMETER Layouts
   Comma-separated TARGET body layouts. Default: the production container's own layout (trellis: a
   trellis container loads with no other) -- or, when -Model names another container explicitly,
-  w4a16,w4a8,mxfp4 as before (bf16 excluded, standing bf16-retired-from-perf-work rule --
-  docs/status.md). w4a16/w4a8/mxfp4 at 64 layers need a multi-layout container; none is kept on disk
+  w4a16 (bf16 excluded, standing bf16-retired-from-perf-work rule --
+  docs/status.md). w4a16 at 64 layers needs a multi-layout container; none is kept on disk
   since the base v6 was retired (docs/huihui.md "Coverage"), the 4-layer l4-allmtp carries all four.
 
 .PARAMETER Seeds
@@ -117,7 +117,7 @@
 param(
     [string]$Model = "",   # "" = the group-matched production container (see .PARAMETER Model)
     [string]$Dflash = "",  # "" = the group-matched w4a16 drafter (see .PARAMETER Dflash)
-    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-mxfp4.r4dx",
+    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx",
     [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [string]$Seeds = "1,2",
     [int]$MaxTokens = 48,
@@ -209,8 +209,8 @@ if (-not $Dflash) { $Dflash = Get-R4dxProductionDrafter -BuildDir "build\win-hip
 $DefaultLayout = if ($ModelWasExplicit) { "w4a16" } else { Get-R4dxProductionLayout -BuildDir "build\win-hip" }
 if (-not $Layouts) {
     # The production container is a trellis container and loads with no other layout; an explicit
-    # -Model keeps the historical matrix (a multi-layout w4a16 / w4a8 / mxfp4 container).
-    $Layouts = if ($ModelWasExplicit) { "w4a16,w4a8,mxfp4" } else { $DefaultLayout }
+    # -Model keeps the historical matrix (a multi-layout w4a16 container).
+    $Layouts = if ($ModelWasExplicit) { "w4a16" } else { $DefaultLayout }
 }
 Write-Output "[validate_spec_sampling] target=$Model draft=$Dflash layouts=$Layouts"
 if (-not (Test-Path $Model)) { throw "target container not found: $Model" }

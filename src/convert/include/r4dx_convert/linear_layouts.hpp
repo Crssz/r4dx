@@ -1,6 +1,6 @@
 // r4dx_convert::linear_layouts -- plans and emits the `.{layout}` tensor family
 // (docs/container-format.md "Quantized layout tensors") for one linear weight `W[N,K]`: `bf16`
-// always, plus whichever of `mxfp4` / `w4a16` / `w4a8` the run requested.
+// always, plus `w4a16` when the run requested it (mxfp4 and w4a8 are retired).
 //
 // Two free functions mirroring ContainerWriter's two phases: PlanLinearLayouts() registers every
 // output tensor's name/shape/byte-size (pure function of N,K -- no data needed, so the whole
@@ -17,20 +17,17 @@
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/quant_int4.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 
 namespace r4dx_convert {
 
-// kW4A16Group / kW4A8Group (quant_int4.hpp) and kMxfp4Group (quant_mxfp4.hpp) are the group sizes
-// used below. w4a16's is a build option (R4DX_W4A16_GROUP) and need NOT equal w4a8's, so every
-// site below names the one belonging to the layout it is emitting. w4a16's is additionally
-// PER LINEAR: LayoutSet::w4a16_group, the build default unless r4dx-convert's
+// kW4A16Group (quant_int4.hpp) is the w4a16 group size, a build option (R4DX_W4A16_GROUP). It is
+// additionally PER LINEAR: LayoutSet::w4a16_group, the build default unless r4dx-convert's
 // --w4a16-group-rule (w4a16_groups.hpp) resolved another one for this base.
 
 struct LayoutSet {
-  bool mxfp4 = false, w4a16 = false, w4a8 = false, bf16 = true;
+  bool w4a16 = false, bf16 = true;
   // K per (scale, zero) pair of THIS linear's w4a16 layout (docs/quant2.md section 5). Anything but
   // kW4A16Group -- the container's default, __metadata__.quant.w4a16.group -- also renames the
   // scale tensor (W4a16WszName) and must be listed in __metadata__.quant.w4a16.groups. Ignored
@@ -50,7 +47,7 @@ struct LayoutSet {
 // The trellis LayoutSet of one imported linear: that layout and nothing else.
 inline LayoutSet TrellisLayoutSet(int bits, std::vector<int64_t> parts = {}) {
   LayoutSet ls;
-  ls.mxfp4 = ls.w4a16 = ls.w4a8 = ls.bf16 = false;
+  ls.w4a16 = ls.bf16 = false;
   ls.trellis = true;
   ls.trellis_bits = bits;
   ls.trellis_parts = std::move(parts);
@@ -82,7 +79,7 @@ inline std::string W4a16WszName(const std::string& base, int group) {
 // other linear in the same container still loads in the requested quantized layout.
 inline LayoutSet KeptBf16LayoutSet() {
   LayoutSet ls;
-  ls.mxfp4 = ls.w4a16 = ls.w4a8 = false;
+  ls.w4a16 = false;
   ls.bf16 = true;
   return ls;
 }
@@ -99,15 +96,6 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
     n.push_back(base + ".w4a16.wq");
     n.push_back(W4a16WszName(base, layouts.w4a16_group));
   }
-  if (layouts.w4a8) {
-    n.push_back(base + ".w4a8.wq");
-    n.push_back(base + ".w4a8.ws");
-  }
-  if (layouts.mxfp4) {
-    n.push_back(base + ".mxfp4.wq");
-    n.push_back(base + ".mxfp4.ws");
-    n.push_back(base + ".mxfp4.wref");
-  }
   if (layouts.trellis) {
     n.push_back(base + ".trellis.w");
     n.push_back(base + ".trellis.suh");
@@ -118,9 +106,8 @@ inline std::vector<std::string> LinearLayoutTensorNames(const std::string& base,
 
 // One linear's RESOLVED layout set as a canonical string -- what r4dx-convert's reuse guard records
 // per linear (reuse_guard.linears, docs/quant2.md 5.2): the layouts in the fixed order bf16, w4a16
-// (with its own group, always spelled out), w4a8, mxfp4, joined by '+', or "none". So a
-// --keep-bf16 linear is "bf16", the Q3 sweep recipe's quantized linear "w4a16.g64", a v6-recipe one
-// "w4a16.g64+w4a8+mxfp4". Everything a linear's tensors depend on beyond the run-wide flags is in it:
+// (with its own group, always spelled out), joined by '+', or "none". So a
+// --keep-bf16 linear is "bf16", the Q3 sweep recipe's quantized linear "w4a16.g64". Everything a linear's tensors depend on beyond the run-wide flags is in it:
 // its tensor names and sizes, which quantizers run (LDLQ applies iff a 4-bit layout is present), and
 // at which w4a16 group. A trellis linear is "trellis.k4" / "trellis.k5" (its parts follow from its
 // HF names, not from a flag, so they are not part of the id).
@@ -129,8 +116,6 @@ inline std::string LayoutSetId(const LayoutSet& ls) {
   auto add = [&](const std::string& t) { s += (s.empty() ? "" : "+") + t; };
   if (ls.bf16) add("bf16");
   if (ls.w4a16) add("w4a16.g" + std::to_string(ls.w4a16_group));
-  if (ls.w4a8) add("w4a8");
-  if (ls.mxfp4) add("mxfp4");
   if (ls.trellis) add("trellis.k" + std::to_string(ls.trellis_bits));
   return s.empty() ? std::string("none") : s;
 }
@@ -147,10 +132,6 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
       const std::string t = id.substr(pos, plus == std::string::npos ? std::string::npos : plus - pos);
       if (t == "bf16") {
         ls.bf16 = true;
-      } else if (t == "w4a8") {
-        ls.w4a8 = true;
-      } else if (t == "mxfp4") {
-        ls.mxfp4 = true;
       } else if (t.compare(0, 7, "w4a16.g") == 0 && t.size() > 7 && t.size() <= 10) {
         for (size_t i = 7; i < t.size(); ++i)
           if (t[i] < '0' || t[i] > '9') return false;
@@ -170,7 +151,7 @@ inline bool ParseLayoutSetId(const std::string& id, LayoutSet* out) {
   // Canonical only: the fixed order, each layout once, no empty token, no leading zeros.
   if (LayoutSetId(ls) != id) return false;
   // Trellis is exclusive (TrellisLayoutSet): "bf16+trellis.k4" is not a set this converter writes.
-  if (ls.trellis && (ls.bf16 || ls.w4a16 || ls.w4a8 || ls.mxfp4)) return false;
+  if (ls.trellis && (ls.bf16 || ls.w4a16)) return false;
   *out = ls;
   return true;
 }
@@ -185,11 +166,6 @@ inline uint64_t LinearLayoutBytes(int N, int K, const LayoutSet& layouts) {
   uint64_t bytes = 0;
   if (layouts.bf16) bytes += NK * 2;
   if (layouts.w4a16) bytes += NK / 2 + NK / layouts.w4a16_group * 4;
-  if (layouts.w4a8) bytes += NK / 2 + NK / kW4A8Group * 4;
-  if (layouts.mxfp4) {
-    bytes += NK / 2 + static_cast<uint64_t>(K) / kMxfp4Group * static_cast<uint64_t>(N) +
-             static_cast<uint64_t>(N);
-  }
   if (layouts.trellis) {
     bytes += NK * static_cast<uint64_t>(layouts.trellis_bits) / 8 +
              static_cast<uint64_t>(TrellisPartCount(layouts)) * static_cast<uint64_t>(K) * 2 +
@@ -229,7 +205,7 @@ inline void CheckTrellisLayout(const std::string& base, int64_t N, int64_t K, co
     throw std::runtime_error("r4dx_convert: trellis linear " + base + " [" + std::to_string(N) +
                              "," + std::to_string(K) + "]: " + why);
   };
-  if (ls.bf16 || ls.w4a16 || ls.w4a8 || ls.mxfp4)
+  if (ls.bf16 || ls.w4a16)
     fail("a trellis linear is written in the trellis layout only (docs/trellis-kernel.md 3.4)");
   if (ls.trellis_bits != 4 && ls.trellis_bits != 5)
     fail("KB=" + std::to_string(ls.trellis_bits) + " is not a rate the kernel instantiates (4, 5)");
@@ -259,7 +235,7 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
   }
   // Fail before planning a single byte rather than truncating silently in the quantizers/packers
   // later (review finding, minor -- see quant_int4.hpp's RequireDivisible).
-  if (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) RequireDivisible(N, 16, "N", base.c_str());
+  if (layouts.w4a16) RequireDivisible(N, 16, "N", base.c_str());
   const int g16 = layouts.w4a16_group;
   if (layouts.w4a16) {
     // The build default is whatever this converter was compiled for (checked against the kernel at
@@ -273,8 +249,6 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
     // PackW4Nibbles' 64-K block: implied by the line above for any group >= 64, NOT for 32.
     RequireDivisible(K, 64, "K", base.c_str());
   }
-  if (layouts.w4a8) RequireDivisible(K, kW4A8Group, "K", base.c_str());
-  if (layouts.mxfp4) RequireDivisible(K, kMxfp4Group, "K", base.c_str());
   if (layouts.bf16)
     writer.Plan(base + ".bf16.w", {N, K, 2}, static_cast<uint64_t>(N) * K * 2);
   if (layouts.w4a16) {
@@ -282,19 +256,6 @@ inline void PlanLinearLayouts(ContainerWriter& writer, const std::string& base, 
                 static_cast<uint64_t>(N) * K / 2);
     writer.Plan(W4a16WszName(base, g16), {static_cast<int64_t>(N) * K / g16, 4},
                 static_cast<uint64_t>(N) * K / g16 * 4);
-  }
-  if (layouts.w4a8) {
-    writer.Plan(base + ".w4a8.wq", {static_cast<int64_t>(N) * K / 2},
-                static_cast<uint64_t>(N) * K / 2);
-    writer.Plan(base + ".w4a8.ws", {static_cast<int64_t>(N) * K / kW4A8Group, 4},
-                static_cast<uint64_t>(N) * K / kW4A8Group * 4);
-  }
-  if (layouts.mxfp4) {
-    writer.Plan(base + ".mxfp4.wq", {static_cast<int64_t>(N) * K / 2},
-                static_cast<uint64_t>(N) * K / 2);
-    writer.Plan(base + ".mxfp4.ws", {static_cast<int64_t>(K) / kMxfp4Group * N},
-                static_cast<uint64_t>(K) / kMxfp4Group * N);
-    writer.Plan(base + ".mxfp4.wref", {N}, static_cast<uint64_t>(N));
   }
 }
 
@@ -312,7 +273,7 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
   // A factor for a different K would read U out of bounds (or, worse, in bounds with the wrong
   // stride). The CLI already checks the manifest's K during planning; this is the backstop for any
   // other caller.
-  if (ldlq != nullptr && (layouts.w4a16 || layouts.w4a8 || layouts.mxfp4) && ldlq->K != K) {
+  if (ldlq != nullptr && layouts.w4a16 && ldlq->K != K) {
     throw std::runtime_error("EmitLinearLayouts: '" + base + "' has K=" + std::to_string(K) +
                              " but its LDLQ factor was built for K=" + std::to_string(ldlq->K));
   }
@@ -334,32 +295,6 @@ inline void EmitLinearLayouts(ContainerWriter& writer, const std::string& base,
     auto wsz = PackW4A16Scales(scale, zero, N, K, g16);
     writer.WriteTensor(base + ".w4a16.wq", wq.data(), wq.size() * 4);
     writer.WriteTensor(W4a16WszName(base, g16), wsz.data(), wsz.size() * 4);
-  }
-  if (layouts.w4a8) {
-    std::vector<uint8_t> q;
-    std::vector<float> scale;
-    if (ldlq != nullptr)
-      QuantizeInt4Pinned8Ldlq(w.data(), N, K, kW4A8Group, *ldlq, nthreads, q, scale);
-    else if (search)
-      QuantizeInt4Pinned8Search(w.data(), N, K, kW4A8Group, opts.importance, nthreads, q, scale);
-    else
-      QuantizeInt4SymmetricPinned8(w.data(), N, K, kW4A8Group, nthreads, q, scale);
-    auto wq = PackW4Nibbles(q, N, K, nthreads);
-    auto ws = PackW4A8Scales(scale, N, K, kW4A8Group);
-    writer.WriteTensor(base + ".w4a8.wq", wq.data(), wq.size() * 4);
-    writer.WriteTensor(base + ".w4a8.ws", ws.data(), ws.size() * 4);
-  }
-  if (layouts.mxfp4) {
-    Mxfp4Quantized mq =
-        ldlq != nullptr ? QuantizeMxfp4Ldlq(w.data(), N, K, kMxfp4Group, *ldlq, nthreads)
-        : search        ? QuantizeMxfp4Search(w.data(), N, K, kMxfp4Group, opts.importance,
-                                              nthreads)
-                        : QuantizeMxfp4(w.data(), N, K, kMxfp4Group, nthreads);
-    auto wq = PackMxfp4Wq(mq.packed, N, K, nthreads);
-    auto ws = PackMxfp4Ws(mq.escale, N, K, kMxfp4Group);
-    writer.WriteTensor(base + ".mxfp4.wq", wq.data(), wq.size());
-    writer.WriteTensor(base + ".mxfp4.ws", ws.data(), ws.size());
-    writer.WriteTensor(base + ".mxfp4.wref", mq.wref.data(), mq.wref.size());
   }
 }
 

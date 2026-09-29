@@ -1,5 +1,5 @@
 """Drives `r4dx-convert --selftest` on a random bf16 weight and diffs its output byte-for-byte
-against the Python references (tools/convert_ref/w4_ref.py, mxfp4_ref.py) -- the task item 3 gate,
+against the Python reference (tools/convert_ref/w4_ref.py) -- the task item 3 gate,
 run through the actual CLI rather than the CTest-internal comparison (tests/convert/
 test_pack_bytes.cpp exercises the same headers in-process; this script is the end-to-end version
 against the built r4dx-convert.exe, on a freshly generated random input each run).
@@ -21,7 +21,7 @@ default build's.
 Usage (from the reference venv):
   python selftest_compare.py
       [--exe <path to r4dx-convert.exe>] [--n 48] [--k 384] [--seed 7]
-      [--w4a16-group 128|64] [--w4a8-group 128]
+      [--w4a16-group 128|64]
 """
 import argparse
 import json
@@ -34,7 +34,6 @@ import tempfile
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-import mxfp4_ref
 import w4_ref
 from gen_fixtures import bf16_u16_to_float, float_to_bf16_u16, write_bf16_safetensors
 
@@ -91,12 +90,10 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=7)
     # The w4a16 group is a BUILD OPTION (R4DX_W4A16_GROUP, root CMakeLists.txt), so the group this
     # --exe packs with is a property of the exe, not of this script. Default: read it back out of
-    # the container the exe just wrote (__metadata__.quant.{w4a16,w4a8}.group), which also gates
+    # the container the exe just wrote (__metadata__.quant.w4a16.group), which also gates
     # that the exe RECORDS the group it used. Override only to prove a deliberate mismatch fails.
     ap.add_argument("--w4a16-group", type=int, default=None,
                     help="expected w4a16 group; default: the container's own metadata")
-    ap.add_argument("--w4a8-group", type=int, default=None,
-                    help="expected w4a8 group; default: the container's own metadata")
     args = ap.parse_args()
 
     if not pathlib.Path(args.exe).exists():
@@ -131,7 +128,7 @@ def main() -> int:
             out_path = str(pathlib.Path(tmp) / f"selftest_output_{len(extra_args)}_{expect}.r4dx")
             proc = subprocess.run(
                 [args.exe, "--selftest", "--selftest-input", in_path,
-                 "--selftest-output", out_path, "--layouts", "mxfp4,w4a16,w4a8", "--threads", "4"]
+                 "--selftest-output", out_path, "--layouts", "w4a16", "--threads", "4"]
                 + extra_args,
                 capture_output=True, text=True)
             print(proc.stdout, end="")
@@ -144,35 +141,19 @@ def main() -> int:
             g16 = args.w4a16_group
             if g16 is None:
                 g16 = int(quant_meta.get("w4a16", {}).get("group", w4_ref.GROUP))
-            g8 = args.w4a8_group
-            if g8 is None:
-                g8 = int(quant_meta.get("w4a8", {}).get("group", w4_ref.GROUP))
-            print(f"groups: w4a16={g16} w4a8={g8}"
+            print(f"groups: w4a16={g16}"
                   f"{' (from the container metadata)' if args.w4a16_group is None else ''}")
 
             if expect is None:
                 q16, sc16, z16 = w4_ref.quantize_asymmetric(w, group=g16)
-                q8, sc8 = w4_ref.quantize_symmetric_pinned8(w, group=g8)
-                packed, escale, wref = mxfp4_ref.quantize(w)
             else:
                 im = imat if expect == "imat" else None
                 q16, sc16, z16 = w4_ref.quantize_asymmetric_search(w, group=g16, imatrix=im)
-                q8, sc8 = w4_ref.quantize_symmetric_pinned8_search(w, group=g8, imatrix=im)
-                packed, escale, wref = mxfp4_ref.quantize_search(w, imatrix=im)
 
             ok &= compare("w4a16.wq", container["selftest.w4a16.wq"],
                           w4_ref.pack_nibbles(q16, args.n, args.k).tobytes())
             ok &= compare("w4a16.wsz", container["selftest.w4a16.wsz"],
                           w4_ref.pack_w4a16_scales(sc16, z16, args.n, args.k, group=g16).tobytes())
-            ok &= compare("w4a8.wq", container["selftest.w4a8.wq"],
-                          w4_ref.pack_nibbles(q8, args.n, args.k).tobytes())
-            ok &= compare("w4a8.ws", container["selftest.w4a8.ws"],
-                          w4_ref.pack_w4a8_scales(sc8, args.n, args.k, group=g8).tobytes())
-            ok &= compare("mxfp4.wq", container["selftest.mxfp4.wq"],
-                          mxfp4_ref.permute_wq(packed, args.n, args.k).tobytes())
-            ok &= compare("mxfp4.ws", container["selftest.mxfp4.ws"],
-                          mxfp4_ref.pack_ws(escale, args.n, args.k).tobytes())
-            ok &= compare("mxfp4.wref", container["selftest.mxfp4.wref"], wref.tobytes())
 
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1

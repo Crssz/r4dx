@@ -96,7 +96,7 @@ void SetTp2TuningForThisThread(bool enabled);
 
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
 // r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for
-// kW4a16, r4dx_epilogue_int8_fraga8 for kW4a8, r4dx_epilogue_fp8_e4m3_row for kMxfp4. Shared by
+// kW4a16 (the mxfp4/w4a8 layouts that used other epilogues are retired). Shared by
 // every ApplyLinear caller that wants to pre-fuse its producer's quant epilogue (docs/r9700.md
 // R2/P2) so both sides of the wiring agree on the mapping in exactly one place.
 // kTrellis is r4dx_epilogue_none (docs/trellis-kernel.md 5.3): its input transform is per LINEAR
@@ -129,8 +129,8 @@ struct PreQuantizedActivation {
 // x: device bf16 [M, K], row-major, CONTIGUOUS (row stride exactly K -- every r4d_gemm_*_nt_m64
 // entry point reads its A/C operands at a hardcoded stride of K/N respectively; there is no
 // strided-view form to call into). y: device bf16 [M, N], row-major, contiguous, disjoint from x.
-// `arena` supplies this call's activation-quant scratch (w4a16's f16 cast, w4a8's int8 quant,
-// mxfp4's fp8 quant, trellis's transformed parts and split-group partials -- at most 2 * 64 * K
+// `arena` supplies this call's activation-quant scratch (w4a16's f16 cast,
+// trellis's transformed parts and split-group partials -- at most 2 * 64 * K
 // f16 plus SKG * 64 * N fp32) for up to a 64-row chunk; the caller is responsible for giving the
 // arena enough headroom and Reset()-ing it between top-level forward-pass steps (Arena's own
 // contract -- see r4dx/core/arena.hpp), not between individual ApplyLinear calls (this function

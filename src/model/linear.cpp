@@ -44,15 +44,14 @@ constexpr int64_t kRowTile = 16;
 // Hand-derived fallback, legal for every (layout,N,K) shape this model has (used only when
 // gemm_tuning_table.inc has no row for the requested shape -- see PickTuning below and linear.h's
 // comment). Every quantized GEMM family this model calls needs K divisible by SK*group() (bf16:
-// group 16, w4a16: 64 or 128 (R4DX_W4A16_GROUP), w4a8: 128, mxfp4: group 32) and N divisible by
+// group 16, w4a16: 64 or 128 (R4DX_W4A16_GROUP)) and N divisible by
 // 16. This model's only K values are hidden_size=5120, intermediate_size=17408, and
 // value_dim=6144 (attn.o's K = num_heads*head_dim = 6144 too) -- all three are multiples of 512
 // (5120/512=10, 17408/512=34, 6144/512=12), which is the tightest of the group requirements
 // (SK=4 * group=128), so SK=4 clears every layout at once. WV=4/SK=4 keeps the block at 512
 // threads (WV*SK*32, under the 1024 cap every kernel enforces) and the LDS reduction buffer at 16
 // KiB (under the 64 KiB cap); MB=1
-// and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16 /
-// {1,2,4,8} for w4a8/mxfp4) and NT=1 takes the non-temporal weight-load path
+// and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16) and NT=1 takes the non-temporal weight-load path
 // r4d_gemm_w4a16_nt_m64.hip's own comment recommends for a weight that is read once per step and
 // never reused.
 //
@@ -97,7 +96,7 @@ LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int 
   const int w4a16_group = variant;
   if (K % 512 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " is not a multiple of 512 (SK=4 * w4a16/w4a8 group 128) -- this "
+                              " is not a multiple of 512 (SK=4 * w4a16 group 128) -- this "
                               "model shape was not anticipated, pick a smaller SK");
   }
   if (N % 16 != 0) {
@@ -306,55 +305,20 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int vari
 }
 
 int EpilogueForLayout(Layout layout) {
-  // Milestone 4 follow-up to docs/r9700.md R2/P2 (2026-09-20): root-caused and re-enabled for
-  // w4a8/mxfp4. History: the fused epilogues (kernels.h's r4dx_epilogue: f16, fp8 row-major, int8
-  // fragA8) were built and verified BYTE-EXACT in isolation (tests/kernels/test_fused_quant.cpp,
-  // 135/135, M in {1,2,4,16,64} x K in {5120,6144,17408}), but wiring them into the model changed
-  // w4a8/mxfp4's real generated text even though an in-model diagnostic showed zero differing
-  // elements on the fused GEMMs' own outputs -- shipped disabled pending root-cause (see git log
-  // on this file / docs/status.md's original R2/P2 section for the full incident writeup this pass
-  // inherited).
+  // Every remaining layout takes r4dx_epilogue_none. History: the fused int8_fraga8 (w4a8) and
+  // fp8_e4m3_row (mxfp4) epilogues were the only non-none mappings; both layouts are retired, and the
+  // epilogue machinery itself (kernels.h's r4dx_epilogue) is kept only until its own removal commit.
   //
-  // ROOT CAUSE (this pass): not the epilogue kernels' own math (already independently verified),
-  // and not which GEMM consumed a fused buffer. It is `r4dx::core::Arena::Alloc`
-  // (r4dx/core/arena.hpp): it only aligned each allocation's OWN start to the caller-requested
-  // alignment, never its END. A fused epilogue's per-row fp32 scale scratch is exactly `T` floats
-  // (T = chunk row count, 1..64) -- 4*T bytes, a multiple of 16 only when T%4==0 -- so at decode
-  // (T=1) and MTP verify (T=2..4) the NEXT default-aligned allocation in the same layer (e.g.
-  // GdnLayer::Forward's `mixed_qkv`) starts a few bytes short of 16-byte alignment, and every
-  // allocation after it inherits the same drift for the rest of the layer. Every third_party/libr4d
-  // kernel this arena feeds (GDN conv/kkt/chunk-scan, every quantized GEMM family, attention's
-  // decode scratch) reads its operands with unchecked wide (16-byte) vector loads and silently
-  // reads the wrong bytes when handed a misaligned pointer -- unlike this project's OWN
-  // P6-rewritten rmsnorm/residual_rmsnorm/silu_mul kernels, which fall back to a scalar loop when
-  // misaligned. Before this fusion pass every arena allocation's SIZE happened to already be a
-  // multiple of 16 bytes (hidden/conv_dim/intermediate are all multiples of 8 bf16 elements), so
-  // `offset_` was always incidentally 16-aligned and this was never triggered -- several call
-  // sites' own comments already flagged that invariant as "incidental, not enforced" (gdn_layer.cpp,
-  // attention_layer.hpp, this file's i8_scratch/fp8_scratch allocations). FIX (arena.hpp): every
-  // Alloc call now rounds its own END up to 16 bytes too, so every FUTURE allocation starts
-  // 16-aligned again regardless of what alignment it individually requests. Covered by a new
-  // host-side ArenaAlignmentInvariant check in tests/kernels/test_fused_quant.cpp (reproduces the
-  // exact odd-T scale-then-buffer allocation sequence GdnLayer/AttentionLayer/Mlp use, T=1..64, and
-  // asserts every subsequent pointer is 16-aligned) and re-verified end-to-end BYTE-IDENTICAL
-  // generated text (SHA-256), fusion-on vs fusion-off, for w4a8 and mxfp4 across three prompt
-  // lengths x `--mtp {0,3}` (tools/validate_fusion.ps1 -- also usable as a standing regression gate;
-  // docs/status.md's R2/P2 section has the full run log).
+  // The ROOT CAUSE note that used to sit here still holds for the arena: `r4dx::core::Arena::Alloc`
+  // rounds each allocation's END up to 16 bytes (arena.hpp), because every third_party/libr4d kernel
+  // this arena feeds reads its operands with unchecked wide (16-byte) vector loads and silently reads
+  // the wrong bytes when handed a misaligned pointer.
   //
-  // w4a16's r4dx_epilogue_f16 is a SEPARATE, unrelated issue: it is equally CORRECT now (verified
-  // the same way) but still REGRESSES decode wall-clock (-4.3%, reproducible, unchanged from the
-  // original incident): r4dx_model_cast_bf16_to_f16 launches a FLAT elementwise grid
-  // (blocks=ceil(M*K/256), ~20 independent workgroups at decode T=1/K=5120), while fusing it into
-  // rmsnorm/residual_rmsnorm/silu_mul's own one-workgroup-per-row epilogue collapses that work onto
-  // a SINGLE workgroup -- a real parallelism loss the saved launch does not cover. Per this task's
-  // own instruction ("do not re-enable in that form"), w4a16 stays r4dx_epilogue_none until a
-  // wide-grid f16 cast or a prefill-only fusion (dim3(rows)=dim3(T), no parallelism loss at T>1) is
-  // built -- Milestone 5+ work, not part of this pass.
+  // w4a16's r4dx_epilogue_f16 is correct but regressed decode wall-clock (-4.3%: the fused cast
+  // collapses a wide elementwise grid onto a single workgroup per row), so w4a16 stays none.
   //
-  // R4DX_DISABLE_EPILOGUE=1 forces every layout back to r4dx_epilogue_none regardless of the mapping
-  // below -- the A/B toggle tools/validate_fusion.ps1 uses to regenerate the "fusion off" baseline
-  // every run from the SAME binary rather than requiring a second build. Unset in every other
-  // caller (every ctest binary, every plain CLI/server invocation), which see the mapping directly.
+  // R4DX_DISABLE_EPILOGUE=1 forces every layout back to r4dx_epilogue_none -- the A/B toggle
+  // tools/validate_fusion.ps1 uses (it also gates the trellis fusion, TrellisFusionEnabled).
   static const bool kDisabled = [] {
     const char* e = std::getenv("R4DX_DISABLE_EPILOGUE");
     return e != nullptr && e[0] == '1';
@@ -364,11 +328,7 @@ int EpilogueForLayout(Layout layout) {
     case Layout::kBf16:
       return r4dx_epilogue_none;  // never quantizes its activation input -- nothing to fuse.
     case Layout::kW4a16:
-      return r4dx_epilogue_none;  // Problem B: parallelism loss at decode, see comment above.
-    case Layout::kW4a8:
-      return r4dx_epilogue_int8_fraga8;
-    case Layout::kMxfp4:
-      return r4dx_epilogue_fp8_e4m3_row;
+      return r4dx_epilogue_none;  // parallelism loss at decode, see comment above.
     case Layout::kTrellis:
       // docs/trellis-kernel.md 5.3: the input transform is per linear (x * suh, then H), which no
       // producer epilogue can name -- ApplyLinear runs it (v1), or a fused producer hands it over
@@ -744,10 +704,6 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   // every chunk this call makes -- one arena bump, not one per chunk. Skipped entirely when a
   // pre-quantized buffer for this layout was provided (nothing to compute).
   uint16_t* f16_scratch = nullptr;   // w4a16; trellis: its parts, kMaxChunkM * K apart
-  int8_t* i8_scratch = nullptr;      // w4a8
-  float* i8_scale_scratch = nullptr;
-  uint8_t* fp8_scratch = nullptr;    // mxfp4
-  float* fp8_scale_scratch = nullptr;
   float* trellis_ws = nullptr;       // trellis: split-group partials
   if (!have_pre) {
     switch (w.layout) {
@@ -779,19 +735,6 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
         }
         break;
       }
-      case Layout::kW4a8:
-        // align_bytes=16 (review finding, 2026-09-20): r4d_gemm_w4a8's fragment read
-        // (global_load_b64) reads this buffer with a wide load -- same alignment class as
-        // attention_layer.hpp's own decode scratch fix. Every preceding arena allocation in a
-        // layer happens to be 16-aligned today (hidden/conv_dim/intermediate are all multiples of
-        // 16 at 2 bytes/element), which is incidental, not enforced -- pass it explicitly instead.
-        i8_scratch = arena.Alloc<int8_t>(static_cast<size_t>(kMaxChunkM * K), /*align_bytes=*/16);
-        i8_scale_scratch = arena.Alloc<float>(static_cast<size_t>(kMaxChunkM));
-        break;
-      case Layout::kMxfp4:
-        fp8_scratch = arena.Alloc<uint8_t>(static_cast<size_t>(kMaxChunkM * K), /*align_bytes=*/16);
-        fp8_scale_scratch = arena.Alloc<float>(static_cast<size_t>(kMaxChunkM));
-        break;
     }
   }
 
@@ -843,43 +786,6 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                       static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB,
                                       t.NPW, t.NT, s);
         }
-        break;
-      }
-      case Layout::kW4a8: {
-        const int8_t* a;
-        const float* a_scale;
-        if (have_pre) {
-          a = reinterpret_cast<const int8_t*>(pre->data) + m0 * K;
-          a_scale = pre->scale + m0;
-        } else {
-          core::r4d::QuantActI8(xc, i8_scratch, i8_scale_scratch, m, static_cast<int>(K), s);
-          a = i8_scratch;
-          a_scale = i8_scale_scratch;
-          if (probe != nullptr) probe->MarkInput(s);
-        }
-        core::r4d::GemmW4a8NtM64(a, a_scale, w.wq.data(), w.w4a8_ws.data(), yc, m,
-                                  static_cast<int>(K), static_cast<int>(N), t.WV, t.SK, t.MB,
-                                  t.NPW, t.NT, s);
-        break;
-      }
-      case Layout::kMxfp4: {
-        const uint8_t* a;
-        const float* a_scale;
-        if (have_pre) {
-          a = reinterpret_cast<const uint8_t*>(pre->data) + m0 * K;
-          a_scale = pre->scale + m0;
-        } else {
-          r4dx_quant_act_fp8e4m3_row(reinterpret_cast<int64_t>(xc),
-                                      reinterpret_cast<int64_t>(fp8_scratch),
-                                      reinterpret_cast<int64_t>(fp8_scale_scratch), m,
-                                      static_cast<int>(K), reinterpret_cast<int64_t>(s));
-          a = fp8_scratch;
-          a_scale = fp8_scale_scratch;
-          if (probe != nullptr) probe->MarkInput(s);
-        }
-        core::r4d::GemmMxfp4a8NtM64(a, a_scale, w.mxfp4_wq.data(), w.mxfp4_ws.data(),
-                                     w.mxfp4_wref.data(), yc, m, static_cast<int>(K),
-                                     static_cast<int>(N), t.WV, t.SK, t.MB, t.NPW, s);
         break;
       }
       case Layout::kTrellis: {

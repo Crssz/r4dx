@@ -3,12 +3,13 @@
 // before any wiring").
 //
 // For each producer (r4dx_rmsnorm_bf16, r4dx_residual_rmsnorm_bf16, r4dx_silu_mul_bf16) x each
-// epilogue (r4dx_epilogue_f16 / _fp8_e4m3_row / _int8_fraga8) x M in {1,2,4,16,64} x K in
+// epilogue (r4dx_epilogue_f16 / _fp8_e4m3_row; _int8_fraga8 is checked only for being accepted --
+// its standalone twin, libr4d's r4d_quant_act_i8, was cut with the w4a8 layout) x M in {1,2,4,16,64} x K in
 // {5120,6144,17408} (the task's own grid, and this model's three real hidden/intermediate sizes):
 // runs the producer TWICE on the SAME seeded random bf16 input --
 //   "old" path:   producer(epilogue=none) -> the existing STANDALONE quant kernel
-//                 (r4dx_model_cast_bf16_to_f16 / r4dx_quant_act_fp8e4m3_row /
-//                 third_party/libr4d's r4d_quant_act_i8) applied to that producer's bf16 output.
+//                 (r4dx_model_cast_bf16_to_f16 / r4dx_quant_act_fp8e4m3_row) applied to that
+//                 producer's bf16 output.
 //   "fused" path: producer(epilogue=X) -- the new in-kernel epilogue.
 // and asserts the two paths' bytes (and, for fp8/int8, their per-row scales) are BYTE-IDENTICAL,
 // plus that the producer's own plain bf16 output is unaffected by requesting an epilogue. Per the
@@ -73,11 +74,6 @@ void OldQuantFp8(const DeviceBuffer<uint16_t>& in, int M, int K, DeviceBuffer<ui
                               reinterpret_cast<int64_t>(out->data()),
                               reinterpret_cast<int64_t>(scale->data()), M, K, 0);
 }
-void OldQuantI8(const DeviceBuffer<uint16_t>& in, int M, int K, DeviceBuffer<int8_t>* out,
-                 DeviceBuffer<float>* scale) {
-  r4d_quant_act_i8(reinterpret_cast<int64_t>(in.data()), reinterpret_cast<int64_t>(out->data()),
-                    reinterpret_cast<int64_t>(scale->data()), M, K, 0);
-}
 
 // Compares one (producer, epilogue) combination at a given (M,K). `RunProducer` runs the producer
 // under test with the given epilogue mode and epilogue output buffers (nullptr epilogue buffers
@@ -107,15 +103,6 @@ void CheckOne(const std::string& label, int epilogue, int M, int K, ProducerFn r
     OldQuantFp8(base_d, M, K, &out_d, &scale_d);
     R4DX_HIP_CHECK(hipDeviceSynchronize());
     old_bytes = out_d.CopyToHost();
-    old_scale = scale_d.CopyToHost();
-  } else if (epilogue == r4dx_epilogue_int8_fraga8) {
-    DeviceBuffer<int8_t> out_d(static_cast<size_t>(M) * K);
-    DeviceBuffer<float> scale_d(static_cast<size_t>(M));
-    OldQuantI8(base_d, M, K, &out_d, &scale_d);
-    R4DX_HIP_CHECK(hipDeviceSynchronize());
-    std::vector<int8_t> h = out_d.CopyToHost();
-    old_bytes.resize(h.size());
-    std::memcpy(old_bytes.data(), h.data(), h.size());
     old_scale = scale_d.CopyToHost();
   }
 
@@ -270,8 +257,7 @@ int main() {
 
   const int Ms[] = {1, 2, 4, 16, 64};
   const int64_t Ks[] = {5120, 6144, 17408};
-  const int epilogues[] = {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row,
-                            r4dx_epilogue_int8_fraga8};
+  const int epilogues[] = {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row};
   const char* epilogue_names[] = {"", "f16", "fp8_e4m3_row", "int8_fraga8"};
 
   for (int M : Ms) {

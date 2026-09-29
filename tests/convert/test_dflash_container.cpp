@@ -84,7 +84,7 @@ int main() {
   // real model's every quantizable K (5120/17408/25600/1280) is a multiple of 128; this mini
   // fixture's whole point is to be small, which conflicts with that constraint for a genuine
   // 4-bit-layout round trip. bf16-only is therefore what this container-shape/orientation test
-  // exercises for the GEMM-style linears; w4a16/w4a8/mxfp4 packers themselves already have their
+  // exercises for the GEMM-style linears; the w4a16 packer already has its
   // own dedicated byte-exactness coverage (test_pack_bytes.cpp, test_kernel_decode.cpp) against
   // real-sized fixtures, so re-deriving that here would duplicate coverage rather than add any.
   layouts.w4a16 = false;

@@ -57,12 +57,10 @@ nlohmann::json ReadMetadata(const std::string& path) {
 //
 // SCOPE (adversarial-review fix): the check fires only when THIS load will actually read
 // `.w4a16.wsz` bytes, i.e. when one of the three layout selections below is `kW4a16`. The hazard
-// the guard exists to stop is a w4a16 GEMM striding the scales wrongly; a `--layout mxfp4` or
-// `--layout w4a8` run never touches a `.w4a16.*` tensor (LoadQuantLinear reads only the requested
-// layout's tensors, and LoadQuantLinearWithFallback's fallback chain is requested -> bf16 -> bare,
-// never -> w4a16), and w4a8's and mxfp4's own groups do not move with R4DX_W4A16_GROUP. Refusing
-// those runs bought no safety and cost real capability: `qwen38-27b-v5.r4dx` carries perfectly
-// valid w4a8 and mxfp4 layouts that a group-64 build can read byte-for-byte correctly.
+// the guard exists to stop is a w4a16 GEMM striding the scales wrongly; a `--layout bf16` run
+// never touches a `.w4a16.*` tensor (LoadQuantLinear reads only the requested layout's tensors,
+// and LoadQuantLinearWithFallback's fallback chain is requested -> bf16 -> bare, never -> w4a16).
+// Refusing those runs bought no safety and cost real capability.
 //
 // quant2 Q3 (docs/quant2.md section 5.1): per-tensor groups. The map (`quant.w4a16.groups`) is
 // parsed on every load -- ParseW4a16Groups is structural and never throws for a container without
@@ -318,13 +316,6 @@ core::DeviceBuffer<uint8_t> UploadRawU8(const SafetensorsReader& r, const std::s
   return buf;
 }
 
-core::DeviceBuffer<int8_t> UploadRawI8(const SafetensorsReader& r, const std::string& name) {
-  const int64_t n = ElemCountBySize(r, name, 1);
-  core::DeviceBuffer<int8_t> buf(static_cast<size_t>(n));
-  buf.CopyFromHost(reinterpret_cast<const int8_t*>(r.Data(name)), static_cast<size_t>(n));
-  return buf;
-}
-
 core::DeviceBuffer<uint32_t> UploadRawU32(const SafetensorsReader& r, const std::string& name) {
   const int64_t n = ElemCountBySize(r, name, 4);
   core::DeviceBuffer<uint32_t> buf(static_cast<size_t>(n));
@@ -471,15 +462,6 @@ QuantLinear LoadQuantLinear(const SafetensorsReader& r, const LinearLoadMeta& me
       q.trellis_svh = UploadWidenedF16(r, base + ".trellis.svh");
       break;
     }
-    case Layout::kW4a8:
-      q.wq = UploadRawU8(r, base + ".w4a8.wq");
-      q.w4a8_ws = UploadRawU32(r, base + ".w4a8.ws");
-      break;
-    case Layout::kMxfp4:
-      q.mxfp4_wq = UploadRawU8(r, base + ".mxfp4.wq");
-      q.mxfp4_ws = UploadRawU8(r, base + ".mxfp4.ws");
-      q.mxfp4_wref = UploadRawI8(r, base + ".mxfp4.wref");
-      break;
   }
   return q;
 }
@@ -493,9 +475,6 @@ bool HasLayout(const SafetensorsReader& r, const LinearLoadMeta& meta, const std
   switch (layout) {
     case Layout::kBf16: return r.Has(base + ".bf16.w");
     case Layout::kW4a16: return r.Has(base + ".w4a16.wq") && r.Has(groups.WszName(base));
-    case Layout::kW4a8: return r.Has(base + ".w4a8.wq") && r.Has(base + ".w4a8.ws");
-    case Layout::kMxfp4:
-      return r.Has(base + ".mxfp4.wq") && r.Has(base + ".mxfp4.ws") && r.Has(base + ".mxfp4.wref");
     case Layout::kTrellis:
       return meta.trellis && meta.trellis->Find(base) != nullptr && r.Has(base + ".trellis.w") &&
              r.Has(base + ".trellis.suh") && r.Has(base + ".trellis.svh");
@@ -1002,12 +981,8 @@ uint64_t PartBytes(const tp::PartShape& s) {
   const uint64_t N = static_cast<uint64_t>(s.N), K = static_cast<uint64_t>(s.K);
   switch (s.part) {
     case tp::Part::kBf16: return N * K * 2;
-    case tp::Part::kW4Wq:
-    case tp::Part::kMxWq: return N * K / 2;
-    case tp::Part::kW4a16Wsz:
-    case tp::Part::kW4a8Ws: return N * (K / static_cast<uint64_t>(s.group)) * 4;
-    case tp::Part::kMxWs: return (K / static_cast<uint64_t>(s.group)) * N;
-    case tp::Part::kMxWref: return N;
+    case tp::Part::kW4Wq: return N * K / 2;
+    case tp::Part::kW4a16Wsz: return N * (K / static_cast<uint64_t>(s.group)) * 4;
     case tp::Part::kElem: return N * static_cast<uint64_t>(s.row_bytes);
     case tp::Part::kTrellisW: return N * K * static_cast<uint64_t>(s.rate) / 8;
   }
@@ -1146,19 +1121,6 @@ class ShardLoader {
         q.w4a16_wsz = Part<uint32_t>(w4a16_.groups.WszName(base),
                                      shape(tp::Part::kW4a16Wsz, w4a16_.KernelGroup(base)), rule,
                                      rows, cols);
-        break;
-      case Layout::kW4a8:
-        q.wq = Part<uint8_t>(base + ".w4a8.wq", shape(tp::Part::kW4Wq, 0), rule, rows, cols);
-        q.w4a8_ws = Part<uint32_t>(base + ".w4a8.ws", shape(tp::Part::kW4a8Ws, 128), rule, rows,
-                                   cols);
-        break;
-      case Layout::kMxfp4:
-        q.mxfp4_wq = Part<uint8_t>(base + ".mxfp4.wq", shape(tp::Part::kMxWq, 0), rule, rows, cols);
-        q.mxfp4_ws = Part<uint8_t>(base + ".mxfp4.ws", shape(tp::Part::kMxWs, 32), rule, rows, cols);
-        // K-slice: the FULL-row wref (docs/tp.md 4.3 "The mxfp4 wref exception"), which PlanCols
-        // returns for this part.
-        q.mxfp4_wref = Part<int8_t>(base + ".mxfp4.wref", shape(tp::Part::kMxWref, 0), rule, rows,
-                                    cols);
         break;
       case Layout::kTrellis:
         TrellisSlice(q, base, rule, rows, cols, N, K);

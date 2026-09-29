@@ -1305,9 +1305,9 @@ static int RunTest() {
     return SkipMissing(kContainerPath);
   }
 
-  // Review finding, 2026-09-20: widened from {kBf16, kW4a16} to all four layouts the allmtp
-  // container above actually carries -- w4a8/mxfp4 previously had zero coverage from this file.
-  const Layout layouts[] = {Layout::kBf16, Layout::kW4a16, Layout::kW4a8, Layout::kMxfp4};
+  // The layouts the allmtp container above carries and this build still supports (the w4a8 and
+  // mxfp4 layouts it also carries are retired).
+  const Layout layouts[] = {Layout::kBf16, Layout::kW4a16};
   const std::vector<int32_t> prompt = MakePromptTokens(24);
   int ran = 0;
   for (Layout layout : layouts) {
@@ -1416,12 +1416,8 @@ static int RunTest() {
                  "container).\n",
                  kDraftVocabContainerPath);
   } else {
-    // kDraftVocabContainerPath is its OWN, separately-converted container -- confirmed (crash
-    // reproduced, then fixed here) that it does NOT carry all four of `layouts` above's entries,
-    // only the original {bf16, w4a16} pair this loop was written against; reusing the now-widened
-    // `layouts` array crashed the process (STATUS_STACK_BUFFER_OVERRUN) attempting w4a8/mxfp4
-    // against tensors this container doesn't have (review finding, 2026-09-20 -- widening the MAIN
-    // loop's `layouts` must not silently widen this unrelated loop too).
+    // kDraftVocabContainerPath is its OWN, separately-converted container that carries only the
+    // {bf16, w4a16} pair; keep its layout list separate from the main loop's `layouts` above.
     const Layout draft_vocab_layouts[] = {Layout::kBf16, Layout::kW4a16};
     for (Layout layout : draft_vocab_layouts) {
       if (!CheckReducedVocabDraftHeadLossless(kDraftVocabContainerPath, layout, prompt)) {

@@ -116,7 +116,7 @@ static int RunTest() {
     return SkipMissing(kContainerPath);
   }
 
-  const Layout layouts[] = {Layout::kBf16, Layout::kMxfp4, Layout::kW4a16, Layout::kW4a8};
+  const Layout layouts[] = {Layout::kBf16, Layout::kW4a16};
   int ran = 0;
   for (Layout layout : layouts) {
     ModelOptions opts;

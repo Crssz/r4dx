@@ -1,4 +1,4 @@
-// r4dx::model::Layout / QuantLinear -- the on-disk-layout tag and one quantized linear weight's
+﻿// r4dx::model::Layout / QuantLinear -- the on-disk-layout tag and one quantized linear weight's
 // device buffers (docs/container-format.md "Quantized layout tensors"). Split out of container.h
 // (decode-perf pass, 2026-09-19) so this type can be shared by both r4dx_model (Container/linear.h)
 // and r4dx_model_attention (AttentionLayer's qg/o linears) without either depending on the other's
@@ -15,9 +15,10 @@
 
 namespace r4dx::model {
 
-// kTrellis (docs/trellis-kernel.md 5.1) is appended LAST, so the values the other four are keyed
-// under in PickTuning's cache (linear.cpp) do not move.
-enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8, kTrellis };
+// The numeric values are load-bearing (PickTuning's cache key in linear.cpp, the tuning tables,
+// TP part serialisation) and predate the retirement of the mxfp4 (1) and w4a8 (3) layouts, so
+// they are pinned explicitly: kBf16 = 0, kW4a16 = 2, kTrellis = 4. Do not renumber.
+enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4 };
 
 const char* LayoutName(Layout l);
 Layout LayoutFromName(const std::string& name);  // throws on an unrecognized name
@@ -31,7 +32,7 @@ Layout LayoutFromName(const std::string& name);  // throws on an unrecognized na
 // this before touching a byte and it throws naming BOTH numbers. Callers gate it on the w4a16
 // bytes actually being read: Container::Load only when a requested layout is kW4a16,
 // DflashDraftWeights::Open only when the container carries a `.w4a16.*` tensor. A load that never
-// touches a `.w4a16.wsz` (a `--layout mxfp4`/`w4a8`/`bf16` run, a bf16 drafter) has no stride to
+// touches a `.w4a16.wsz` (a `--layout bf16` run, a bf16 drafter) has no stride to
 // get wrong, and refusing it would reject containers this build reads correctly. `what` identifies
 // the container in the message. Takes the already-extracted int rather than the JSON so this
 // header stays free of nlohmann/json (r4dx_model_attention links this target too), and is inline
@@ -82,7 +83,7 @@ inline void CheckTrellisRate(int bits, const std::string& base, const std::strin
                            "build's r4d_gemm_trellis_nt_m64 does not instantiate");
 }
 
-// One linear weight W[N,K], uploaded in exactly one of the five on-disk layouts
+// One linear weight W[N,K], uploaded in exactly one of the three on-disk layouts
 // (docs/container-format.md "Quantized layout tensors"). linear.cpp's ApplyLinear is the only
 // thing that reads the layout-specific buffers below; Container's job stops at "the right bytes
 // are on the device in the container's documented byte order".
@@ -93,10 +94,7 @@ struct QuantLinear {
   // layout == kBf16: W itself, row-major [N, K], bf16.
   core::DeviceBuffer<uint16_t> bf16_w;
 
-  // layout == kW4a16 or kW4a8: nibble-packed, WMMA-fragment-permuted weight, uint8[N*K/2].
-  // Byte-identical between the two layouts is NOT assumed here (src/convert's quant_int4.hpp
-  // quantizes w4a16 and w4a8 separately -- see its file comment) -- each QuantLinear holds only
-  // the one layout it was loaded as.
+  // layout == kW4a16: nibble-packed, WMMA-fragment-permuted weight, uint8[N*K/2].
   core::DeviceBuffer<uint8_t> wq;
   // layout == kW4a16: uint32[N*K/g], low16 = f16 scale, high16 = f16(-(1024+zero)), where g is
   // w4a16_group below -- by default the group this build was configured with (R4DX_W4A16_GROUP,
@@ -109,15 +107,6 @@ struct QuantLinear {
   // ApplyLinear on the historical r4d_gemm_w4a16_nt_m64 entry. A non-zero group other than the
   // default dispatches r4d_gemm_w4a16_nt_m64_g (linear.cpp).
   int w4a16_group = 0;
-  // layout == kW4a8: uint32[N*K/128], low16 = f16 scale (high16 unused). w4a8's group is fixed at
-  // 128 by third_party/CMakeLists.txt and is NOT tied to w4a16's.
-  core::DeviceBuffer<uint32_t> w4a8_ws;
-
-  // layout == kMxfp4: OCP MXFP4 weight.
-  core::DeviceBuffer<uint8_t> mxfp4_wq;    // uint8[N*K/2], fragment-permuted e2m1 pairs
-  core::DeviceBuffer<uint8_t> mxfp4_ws;    // uint8[(K/32)*N], E8M0 exponent per (group, row)
-  core::DeviceBuffer<int8_t> mxfp4_wref;   // int8[N], per-row reference exponent
-
   // layout == kTrellis (docs/trellis-kernel.md 2.1, 5.1): W^T = diag(suh) H Q H diag(svh), Q the
   // decoded trellis tiles, H the natural-order 128-point Hadamard / sqrt(128). Every size here is
   // the RANK's under tensor parallelism (N, K and part N are the rank-local shape).

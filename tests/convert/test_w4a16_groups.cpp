@@ -65,11 +65,9 @@ std::string ThrowMessage(Fn&& fn) {
 
 bool Has(const std::string& s, const std::string& sub) { return s.find(sub) != std::string::npos; }
 
-LayoutSet Set(bool mxfp4, bool w4a16, bool w4a8, bool bf16, int group = kW4A16Group) {
+LayoutSet Set(bool w4a16, bool bf16, int group = kW4A16Group) {
   LayoutSet ls;
-  ls.mxfp4 = mxfp4;
   ls.w4a16 = w4a16;
-  ls.w4a8 = w4a8;
   ls.bf16 = bf16;
   ls.w4a16_group = group;
   return ls;
@@ -133,6 +131,21 @@ Container ReadContainer(const std::string& path) {
   return c;
 }
 
+// sha256 over every tensor (name, size, bytes; in name order), independent of __metadata__: the
+// (a) goldens below are digests of the tensors a build from before the mxfp4 / w4a8 layouts were
+// cut (bcebb21) wrote with the same arguments.
+std::string TensorDigest(const Container& c) {
+  std::string all;
+  for (const auto& kv : c.tensors) {
+    all += kv.first;
+    all.push_back('\0');
+    all += std::to_string(kv.second.size());
+    all.push_back('\0');
+    all += kv.second;
+  }
+  return Sha256Hex(all);
+}
+
 std::vector<std::string> Names(const Container& c) {
   std::vector<std::string> v;
   for (const auto& kv : c.tensors) v.push_back(kv.first);
@@ -186,7 +199,7 @@ void TestParsing() {
   {
     W4a16GroupRules off({});
     Check("no rules -> disabled", !off.Enabled());
-    const LayoutSet in = Set(true, true, true, false);
+    const LayoutSet in = Set(true, false);
     const LayoutSet out = off.Apply("text.layers.0.mlp.down", in);
     Check("disabled: Apply leaves the default group", out.w4a16_group == kW4A16Group);
     std::ostringstream log, warn;
@@ -229,12 +242,12 @@ void TestSelection() {
   Check("broad rule first shadows a later narrow rule",
         shadowed.GroupFor("text.layers.0.mlp.down") == 128);
   // Apply touches only a w4a16 LayoutSet.
-  const LayoutSet no_w4a16 = rules.Apply("text.layers.0.mlp.down", Set(true, false, true, false));
+  const LayoutSet no_w4a16 = rules.Apply("text.layers.0.mlp.down", Set(false, true));
   Check("Apply on a set without w4a16 keeps the default group",
         no_w4a16.w4a16_group == kW4A16Group);
-  const LayoutSet with = rules.Apply("text.layers.0.mlp.down", Set(true, true, true, false));
+  const LayoutSet with = rules.Apply("text.layers.0.mlp.down", Set(true, false));
   Check("Apply sets the rule's group and nothing else",
-        with.w4a16_group == 32 && with.mxfp4 && with.w4a16 && with.w4a8 && !with.bf16);
+        with.w4a16_group == 32 && with.w4a16 && !with.bf16);
 }
 
 // ---- 3. planning ---------------------------------------------------------------------------------
@@ -245,7 +258,7 @@ void TestPlanning() {
                          "gdn\\.out_proj$=" + std::to_string(kW4A16Group), "nonesuch$=32"});
   const int N = 64, K = 512;
   auto plan = [&](const std::string& base, int64_t n, int64_t k, bool bf16, bool w4a16 = true) {
-    const LayoutSet ls = rules.Apply(base, Set(false, w4a16, false, bf16));
+    const LayoutSet ls = rules.Apply(base, Set(w4a16, bf16));
     rules.Plan(base, n, k, ls);
   };
   plan("text.layers.0.mlp.down", N, K, false);
@@ -281,34 +294,34 @@ void TestPlanning() {
   // The guard: a non-default group next to a .bf16.w.
   {
     W4a16GroupRules r({"mlp\\.down$=" + std::to_string(kOther)});
-    const LayoutSet ls = r.Apply("text.layers.0.mlp.down", Set(true, true, true, true));
+    const LayoutSet ls = r.Apply("text.layers.0.mlp.down", Set(true, true));
     const std::string m = ThrowMessage([&] { r.Plan("text.layers.0.mlp.down", N, K, ls); });
     Check("non-default group + bf16 companion is refused at planning",
           Has(m, "--w4a16-group-rule") && Has(m, "text.layers.0.mlp.down") && Has(m, "--no-bf16"));
     std::printf("  %s\n", m.c_str());
     // ...but a rule naming the DEFAULT group writes the historical names, so bf16 is harmless.
     W4a16GroupRules d({"mlp\\.down$=" + std::to_string(kW4A16Group)});
-    const LayoutSet lsd = d.Apply("text.layers.0.mlp.down", Set(true, true, true, true));
+    const LayoutSet lsd = d.Apply("text.layers.0.mlp.down", Set(true, true));
     Check("default-group rule + bf16 companion is accepted",
           ThrowMessage([&] { d.Plan("text.layers.0.mlp.down", N, K, lsd); }).empty());
   }
   // Shape checks name the rule. K = 96 is a multiple of 32 but not of the 64-K packed block.
   {
     W4a16GroupRules r({"x$=32", "y$=128"});
-    const std::string m1 = ThrowMessage([&] { r.Plan("t.x", 64, 96, r.Apply("t.x", Set(0, 1, 0, 0))); });
+    const std::string m1 = ThrowMessage([&] { r.Plan("t.x", 64, 96, r.Apply("t.x", Set(true, false))); });
     Check("g32 with K % 64 != 0 is refused, naming the rule and the packed block",
           Has(m1, "'x$=32'") && Has(m1, "64-K packed block"));
-    const std::string m2 = ThrowMessage([&] { r.Plan("t.y", 64, 192, r.Apply("t.y", Set(0, 1, 0, 0))); });
+    const std::string m2 = ThrowMessage([&] { r.Plan("t.y", 64, 192, r.Apply("t.y", Set(true, false))); });
     Check("g128 with K % 128 != 0 is refused", Has(m2, "'y$=128'") && Has(m2, "group 128"));
-    const std::string m3 = ThrowMessage([&] { r.Plan("t.x", 40, 256, r.Apply("t.x", Set(0, 1, 0, 0))); });
+    const std::string m3 = ThrowMessage([&] { r.Plan("t.x", 40, 256, r.Apply("t.x", Set(true, false))); });
     Check("N % 16 != 0 is refused", Has(m3, "N is not a multiple of 16"));
     // PlanLinearLayouts is the backstop for any caller that bypasses the rules.
     ContainerWriter w;
     const std::string m4 =
-        ThrowMessage([&] { PlanLinearLayouts(w, "t", 64, 96, Set(false, true, false, false, 32)); });
+        ThrowMessage([&] { PlanLinearLayouts(w, "t", 64, 96, Set(true, false, 32)); });
     Check("PlanLinearLayouts refuses g32 at K % 64 != 0 too", Has(m4, "not divisible by 64"));
     const std::string m5 =
-        ThrowMessage([&] { PlanLinearLayouts(w, "t", 64, 512, Set(false, true, false, false, 48)); });
+        ThrowMessage([&] { PlanLinearLayouts(w, "t", 64, 512, Set(true, false, 48)); });
     Check("PlanLinearLayouts refuses an uninstantiated group", Has(m5, "32, 64, 128"));
   }
 }
@@ -320,8 +333,7 @@ void TestAccounting() {
   const int N = 64, K = 512;
   bool all = true;
   for (int g : {32, 64, 128}) {
-    const LayoutSet sets[] = {Set(false, true, false, false, g), Set(true, true, true, false, g),
-                              Set(true, true, true, true, g), Set(false, true, true, false, g)};
+    const LayoutSet sets[] = {Set(true, false, g), Set(true, true, g)};
     for (const LayoutSet& ls : sets) {
       ContainerWriter w;
       PlanLinearLayouts(w, "t", N, K, ls);
@@ -333,14 +345,14 @@ void TestAccounting() {
       }
     }
   }
-  Check("LinearLayoutBytes == PlannedDataBytes at g32/g64/g128 (12 sets)", all);
+  Check("LinearLayoutBytes == PlannedDataBytes at g32/g64/g128 (6 sets)", all);
   // A whole mixed-group "model" planned into ONE writer: the sum still agrees.
   {
     ContainerWriter w;
     uint64_t predicted = 0;
     const int groups[] = {32, 64, 128, kW4A16Group};
     for (int i = 0; i < 4; ++i) {
-      const LayoutSet ls = Set(true, true, true, false, groups[i]);
+      const LayoutSet ls = Set(true, false, groups[i]);
       PlanLinearLayouts(w, "l" + std::to_string(i), N, K, ls);
       predicted += LinearLayoutBytes(N, K, ls);
     }
@@ -349,13 +361,13 @@ void TestAccounting() {
   }
   const uint64_t nk = static_cast<uint64_t>(N) * K;
   Check("w4a16 at g32 = 4.0 + 1.0 bits/weight",
-        LinearLayoutBytes(N, K, Set(false, true, false, false, 32)) == nk / 2 + nk / 8);
+        LinearLayoutBytes(N, K, Set(true, false, 32)) == nk / 2 + nk / 8);
   Check("w4a16 at g128 = 4.0 + 0.25 bits/weight",
-        LinearLayoutBytes(N, K, Set(false, true, false, false, 128)) == nk / 2 + nk / 32);
+        LinearLayoutBytes(N, K, Set(true, false, 128)) == nk / 2 + nk / 32);
   // --keep-bf16's "would have been" is priced at the linear's resolved group.
   {
     W4a16GroupRules rules({"attn\\.o$=32"});
-    const LayoutSet requested = rules.Apply("text.layers.3.attn.o", Set(false, true, false, false));
+    const LayoutSet requested = rules.Apply("text.layers.3.attn.o", Set(true, false));
     KeepBf16Selector sel("attn\\.o$");
     std::ostringstream log;
     sel.Record("text.layers.3.attn.o", N, K, requested, log);
@@ -363,7 +375,7 @@ void TestAccounting() {
     Check("keep-bf16 ExtraBytes against a g32 linear is bf16 - (wq + N*K/32 dwords)",
           sel.ExtraBytes() == want);
     KeepBf16Selector sel2("attn\\.o$");
-    sel2.Record("text.layers.3.attn.o", N, K, Set(false, true, false, false, 128), log);
+    sel2.Record("text.layers.3.attn.o", N, K, Set(true, false, 128), log);
     Check("...and differs from the same linear at g128 by exactly the wsz delta",
           sel2.ExtraBytes() - sel.ExtraBytes() == static_cast<int64_t>(nk / 8 - nk / 32));
   }
@@ -383,22 +395,10 @@ void TestEmission() {
   const int N = 48, K = 256;  // 3 row tiles; K a multiple of 32, 64 and 128
   const std::vector<float> w = RandomNormal(static_cast<size_t>(N) * K, 17);
 
-  // Reference: the same linear at the default group, all three quantized layouts.
-  const std::string ref_path = TempPath("r4dx_test_w4a16_groups_ref.r4dx");
-  {
-    ContainerWriter writer;
-    const LayoutSet ls = Set(true, true, true, false);
-    PlanLinearLayouts(writer, "t", N, K, ls);
-    writer.FinalizeHeader(ref_path, nlohmann::json{{"r4dx_format_version", "1"}});
-    EmitLinearLayouts(writer, "t", w, N, K, ls, 3);
-    writer.Finish();
-  }
-  const Container ref = ReadContainer(ref_path);
-
   for (int g : {32, 64, 128}) {
     const std::string tag = " g" + std::to_string(g);
     const std::string path = TempPath("r4dx_test_w4a16_groups_g.r4dx");
-    const LayoutSet ls = Set(true, true, true, false, g);
+    const LayoutSet ls = Set(true, false, g);
     {
       ContainerWriter writer;
       PlanLinearLayouts(writer, "t", N, K, ls);
@@ -408,8 +408,7 @@ void TestEmission() {
     }
     const Container c = ReadContainer(path);
     const std::string wsz_name = W4a16WszName("t", g);
-    const std::vector<std::string> want_names = {"t.mxfp4.wq", "t.mxfp4.wref", "t.mxfp4.ws",
-                                                 "t.w4a16.wq", wsz_name, "t.w4a8.wq", "t.w4a8.ws"};
+    const std::vector<std::string> want_names = {"t.w4a16.wq", wsz_name};
     std::vector<std::string> sorted_want = want_names;
     std::sort(sorted_want.begin(), sorted_want.end());
     Check("tensor set" + tag + " (wsz named " + wsz_name + ")", c.ok && Names(c) == sorted_want);
@@ -423,13 +422,8 @@ void TestEmission() {
     Check("wsz" + tag + " == PackW4A16Scales(g), N*K/g dwords",
           c.tensors.at(wsz_name) == Bytes(PackW4A16Scales(scale, zero, N, K, g)) &&
               c.tensors.at(wsz_name).size() == static_cast<size_t>(N) * K / g * 4);
-    bool others = true;
-    for (const char* n : {"t.mxfp4.wq", "t.mxfp4.wref", "t.mxfp4.ws", "t.w4a8.wq", "t.w4a8.ws"})
-      others = others && ref.tensors.count(n) && c.tensors.at(n) == ref.tensors.at(n);
-    Check("mxfp4 / w4a8 tensors" + tag + " byte-identical to the default-group run", others);
     std::remove(path.c_str());
   }
-  std::remove(ref_path.c_str());
 
   // LDLQ through EmitLinearLayouts at g32 and g128: the linear's own group reaches the quantizer.
   {
@@ -453,7 +447,7 @@ void TestEmission() {
     for (int g : {32, 128}) {
       const std::string tag = " g" + std::to_string(g);
       const std::string path = TempPath("r4dx_test_w4a16_groups_ldlq.r4dx");
-      const LayoutSet ls = Set(false, true, false, false, g);
+      const LayoutSet ls = Set(true, false, g);
       QuantOptions opts;
       opts.ldlq = &f;
       {
@@ -528,29 +522,28 @@ void TestExe(const std::string& fixtures) {
   }
 
   // (a) No rules: the whole file is what the converter wrote before per-tensor groups existed.
-  // sha256 of `r4dx-convert --selftest ... --threads 3 <args>` on fixtures/input.safetensors, from
-  // the build of commit 95cc327 (R4DX_W4A16_GROUP=64), taken before this feature was written.
+  // TensorDigest of `r4dx-convert --selftest ... --threads 3 <args>` on fixtures/input.safetensors,
+  // from the build of commit bcebb21 (R4DX_W4A16_GROUP=64, run with the equivalent w4a16-only
+  // arguments: that build's default also wrote the retired layouts). The earlier whole-file sha256s
+  // were taken at 95cc327, before per-tensor groups were written.
   if (kW4A16Group == 64) {
     const struct {
       const char* name;
       std::string args;
       const char* sha;
     } golden[] = {
-        {"default layouts", "", "70c1ce9cc6bfdd130b1e2ef9f5ae1fd7a1c14e1580a3705e8efba4a56ca448ea"},
-        {"--layouts w4a16", "--layouts w4a16",
-         "3e51c60300359a2d2b60af041ab3da9cb6f7a26c420c2bdb2894eef984d7d86c"},
-        {"--quant search", "--quant search",
-         "796376de11ca1c9a8f72b50429a77769bce59f169ee9945ab263831c565ba0b9"},
-        {"--keep-bf16 selftest", "--keep-bf16 selftest",
-         "e196d19335ec2a5595c41c126e1f8d2623a88469c20bae58ae6660788f2b8926"},
-        {"--ldlq .* (w4a16,w4a8,mxfp4)",
-         "--layouts w4a16,w4a8,mxfp4 --hessian-dir \"" + hdir + "\" --ldlq .*",
-         "cb1989e5fffa8013a664810ea0c64d6e229d6918268dd104fcb89127dfdbe2a3"},
+        {"default layouts", "", "c93f078b596882914184d475367150ff3410055f84deaa80da0b34dbd931b796"},
+        {"--layouts w4a16", "--layouts w4a16", "c93f078b596882914184d475367150ff3410055f84deaa80da0b34dbd931b796"},
+        {"--quant search", "--quant search", "f5524e9f2f2dc1c76732925cb6956a2dd4a86751a8df73d15611b6f26ea536e8"},
+        {"--keep-bf16 selftest", "--keep-bf16 selftest", "774dbead1bd3f01391c96d87b1ca2eb02a1e806dec176af777148a85293917ed"},
+        {"--ldlq .* (w4a16)",
+         "--layouts w4a16 --hessian-dir \"" + hdir + "\" --ldlq .*",
+         "ce402c80fe09529c535ebf5f3c21dc8702928a818c718475f8e7a7ca9f6a2851"},
     };
     for (const auto& gcase : golden) {
       const int rc = Run(base_args + " " + gcase.args, log);
       const Container c = ReadContainer(out);
-      const std::string sha = c.ok ? Sha256Hex(c.file) : std::string("(unreadable)");
+      const std::string sha = c.ok ? TensorDigest(c) : std::string("(unreadable)");
       Check(std::string("(a) no rules, ") + gcase.name + ": byte-identical to pre-Q3",
             rc == 0 && sha == gcase.sha);
       if (sha != gcase.sha) std::printf("  rc=%d sha=%s\n%s", rc, sha.c_str(), ReadText(log).c_str());
@@ -561,11 +554,11 @@ void TestExe(const std::string& fixtures) {
   }
 
   // (b) A rule at a non-default group, --no-bf16: renamed wsz, the map, the run record.
-  Run(base_args + " --layouts w4a16,w4a8,mxfp4 --no-bf16", log);
+  Run(base_args + " --layouts w4a16 --no-bf16", log);
   const Container plain = ReadContainer(out);
   const std::string rule = "^selftest$=" + std::to_string(kOther);
   {
-    const int rc = Run(base_args + " --layouts w4a16,w4a8,mxfp4 --no-bf16 --w4a16-group-rule \"" +
+    const int rc = Run(base_args + " --layouts w4a16 --no-bf16 --w4a16-group-rule \"" +
                            rule + "\"",
                        log);
     const Container c = ReadContainer(out);
@@ -590,19 +583,13 @@ void TestExe(const std::string& fixtures) {
               md["r4dx_convert_run"]["w4a16_group_extra_bytes"].get<int64_t>() ==
                   static_cast<int64_t>(32 * 256 / kOther * 4) -
                       static_cast<int64_t>(32 * 256 / kW4A16Group * 4));
-    bool others = plain.ok && c.ok;
-    for (const char* n : {"selftest.w4a8.wq", "selftest.w4a8.ws", "selftest.mxfp4.wq",
-                          "selftest.mxfp4.ws", "selftest.mxfp4.wref"})
-      others = others && c.tensors.count(n) && plain.tensors.count(n) &&
-               c.tensors.at(n) == plain.tensors.at(n);
-    Check("(b) w4a8 / mxfp4 bytes identical to the no-rule run", others);
     Check("(b) no-rule run has no groups map and no run record",
           plain.ok && !plain.header["__metadata__"]["quant"]["w4a16"].contains("groups") &&
               !plain.header["__metadata__"].contains("r4dx_convert_run"));
   }
   // (c) A rule naming the default group: historical tensor name, no map, same tensor bytes.
   {
-    const int rc = Run(base_args + " --layouts w4a16,w4a8,mxfp4 --no-bf16 --w4a16-group-rule "
+    const int rc = Run(base_args + " --layouts w4a16 --no-bf16 --w4a16-group-rule "
                                    "\"^selftest$=" + std::to_string(kW4A16Group) + "\"",
                        log);
     const Container c = ReadContainer(out);

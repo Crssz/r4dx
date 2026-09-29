@@ -2,7 +2,7 @@
 // tp2gpu, OPT-IN): the same binary and inputs through TpModel in --tp-mode emulate (both ranks on one
 // device, EmulatedComm) and in --tp-mode real (one rank per GPU, HostMailboxComm) must give
 // BYTE-IDENTICAL results (docs/tp.md 1.1 goal 4: same kernels, same tunings, the same exact fp32
-// add). On qwen38-27b-l4-allmtp.r4dx, layouts w4a16 and mxfp4, one fixed script:
+// add). On qwen38-27b-l4-allmtp.r4dx, layout w4a16, one fixed script:
 //
 //   1. Reset, Prefill 70 tokens (two chunks), 16 teacher-forced DecodeStep rows (full gathered
 //      logits);
@@ -482,7 +482,7 @@ int RunTest() {
   }
 
   using M = TpOptions::Mode;
-  for (const char* layout : {"w4a16", "mxfp4"}) {
+  for (const char* layout : {"w4a16"}) {
     std::printf("==== layout %s ====\n", layout);
     const ScriptOut emu = RunMode(layout, M::kEmulate, 1, 1);
     std::unique_ptr<TpModel> real_group;

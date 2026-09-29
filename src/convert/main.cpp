@@ -3,7 +3,7 @@
 // project. Usage:
 //
 //   r4dx-convert --input <HF checkpoint dir> --output <container path>
-//                [--layouts mxfp4,w4a16,w4a8] [--lm-head 4bit+bf16]
+//                [--layouts w4a16] [--lm-head 4bit+bf16]
 //                [--layers N] [--threads T] [--vision on|off] [--mtp on|off] [--no-bf16]
 //                [--kv-calib <tools/reference/kv_calibrate.py JSON>]
 //                [--draft-vocab-ids <tests/model/tool_vocab_calib.cpp output JSON>]
@@ -168,7 +168,7 @@
 // was ever requested, so there is nothing to warn about).
 //
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
-//                --selftest-output <container path> [--layouts mxfp4,w4a16,w4a8] [--threads T]
+//                --selftest-output <container path> [--layouts w4a16] [--threads T]
 //                [--no-bf16] [--w4a16-group-rule "<regex>=<g>"]...
 //
 // --selftest packs exactly one tensor through every requested layout and writes it as
@@ -177,7 +177,7 @@
 // "selftest", which --keep-bf16 / --ldlq / --w4a16-group-rule match against like any other.
 //
 //   r4dx-convert --dflash-gguf <DFlash2 draft .gguf> --out <container path>
-//                [--layout {w4a16,w4a8,mxfp4,bf16}] [--threads T]
+//                [--layout {w4a16,bf16}] [--threads T]
 //
 // Converts a DFlash2 speculative-decoding draft model (docs/container-format.md "DFlash2 draft
 // container") from its GGUF v3 source into its own r4dx container (container_kind
@@ -207,9 +207,8 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
-#include "r4d.h"  // r4d_gemm_{w4a16,w4a8,mxfp4a8}_nt_m64_group() -- cross-checked against this
-                  // converter's own kW4A16Group/kW4A8Group/kMxfp4Group at startup
-                  // (ValidateKernelGroupSizes).
+#include "r4d.h"  // r4d_gemm_w4a16_nt_m64_group() -- cross-checked against this converter's own
+                  // kW4A16Group at startup (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
@@ -243,15 +242,12 @@ size_t Count(const std::string& hay, const std::string& needle) {
   return n;
 }
 
-// Review finding (major, quant_int4.hpp): the group sizes this converter packs with
-// (r4dx_convert::kW4A16Group, kW4A8Group, kMxfp4Group) are compile-time constants that must match
-// the group sizes the GPU kernels were actually built with (r4d_gemm_w4a8_nt_m64.hip's
-// R4D_GEMM_W4A8_GROUP default is 256; third_party/CMakeLists.txt overrides it to 128, and w4a16's
-// R4D_GEMM_W4_GROUP is the R4DX_W4A16_GROUP build option). A silent mismatch here produces a
-// container that GEMMs read at the wrong stride with no error, ever. r4d_core exports the group
-// each kernel was actually compiled with, so assert against it once at startup instead of trusting
-// the -D flags stayed in sync. Each layout is checked against ITS OWN kernel export -- w4a16 and
-// w4a8 no longer share a constant, precisely so R4DX_W4A16_GROUP can move on its own.
+// Review finding (major, quant_int4.hpp): the group size this converter packs with
+// (r4dx_convert::kW4A16Group) is a compile-time constant that must match the group size the GPU
+// kernel was actually built with (w4a16's R4D_GEMM_W4_GROUP is the R4DX_W4A16_GROUP build option).
+// A silent mismatch here produces a container that GEMMs read at the wrong stride with no error,
+// ever. r4d_core exports the group the kernel was actually compiled with, so assert against it once
+// at startup instead of trusting the -D flags stayed in sync.
 void ValidateKernelGroupSizes() {
   auto check = [](const char* label, int expected, int actual) {
     if (actual != expected) {
@@ -260,13 +256,10 @@ void ValidateKernelGroupSizes() {
           "with group=" + std::to_string(expected) + " but r4d_core's kernel was built with group=" +
           std::to_string(actual) + " (check third_party/CMakeLists.txt's R4D_EXTRA_* -D flags and "
           "the R4DX_W4A16_GROUP cache variable against "
-          "src/convert/include/r4dx_convert/quant_{int4,mxfp4}.hpp's kW4A16Group/kW4A8Group/"
-          "kMxfp4Group)");
+          "src/convert/include/r4dx_convert/quant_int4.hpp's kW4A16Group)");
     }
   };
   check("w4a16", r4dx_convert::kW4A16Group, r4d_gemm_w4a16_nt_m64_group());
-  check("w4a8", r4dx_convert::kW4A8Group, r4d_gemm_w4a8_nt_m64_group());
-  check("mxfp4", r4dx_convert::kMxfp4Group, r4d_gemm_mxfp4a8_nt_m64_group());
 }
 
 // --w4a16-group-rule: every group a rule can hand out must be one this build's
@@ -297,23 +290,14 @@ nlohmann::json BuildQuantMetadata(const nlohmann::json& w4a16_groups = nlohmann:
         {"zero_mode", "free_0_15"},
         {"nibble_encoding", "offset_binary_xor8"},
         {"fragment_permutation", "wmma16x16x16_lane16_koff_0_8_1_9_2_10_3_11"}}},
-      {"w4a8",
-       {{"group", r4dx_convert::kW4A8Group},
-        {"zero_mode", "pinned_8"},
-        {"nibble_encoding", "offset_binary_xor8"},
-        {"fragment_permutation", "wmma16x16x16_lane16_koff_0_8_1_9_2_10_3_11"}}},
-      {"mxfp4",
-       {{"group", r4dx_convert::kMxfp4Group},
-        {"scale_encoding", "e8m0"},
-        {"fragment_permutation", "mxfp4_layout_permute_w"}}},
   };
   if (!w4a16_groups.empty()) q["w4a16"]["groups"] = w4a16_groups;
   return q;
 }
 
-// Parses a comma/plus-separated list of layout tokens ("mxfp4", "w4a16", "w4a8", "bf16", "4bit"
-// meaning all three quantized layouts, and "none"/"" meaning bf16 only). Unknown tokens are a
-// hard error -- silently ignoring a typo'd --layouts value would produce a container missing a
+// Parses a comma/plus-separated list of layout tokens ("w4a16", "bf16", "4bit" meaning the
+// quantized layout (w4a16), and "none"/"" meaning bf16 only). The retired "mxfp4" / "w4a8" tokens
+// and any unknown token are a hard error -- silently ignoring a typo'd --layouts value would produce a container missing a
 // layout the caller thinks it asked for.
 LayoutSet ParseLayoutList(const std::string& spec, bool bf16_default_on) {
   LayoutSet ls;
@@ -330,12 +314,13 @@ LayoutSet ParseLayoutList(const std::string& spec, bool bf16_default_on) {
   }
   if (!cur.empty()) tokens.push_back(cur);
   for (auto& t : tokens) {
-    if (t == "mxfp4") ls.mxfp4 = true;
-    else if (t == "w4a16") ls.w4a16 = true;
-    else if (t == "w4a8") ls.w4a8 = true;
+    if (t == "w4a16") ls.w4a16 = true;
     else if (t == "bf16") ls.bf16 = true;
-    else if (t == "4bit") { ls.mxfp4 = ls.w4a16 = ls.w4a8 = true; }
+    else if (t == "4bit") { ls.w4a16 = true; }
     else if (t == "none" || t.empty()) { /* no-op */ }
+    else if (t == "mxfp4" || t == "w4a8")
+      throw std::runtime_error("layout token '" + t + "' was retired (supported: w4a16, bf16, "
+                               "trellis via --trellis-from)");
     else throw std::runtime_error("unknown layout token: " + t);
   }
   return ls;
@@ -345,7 +330,7 @@ struct AppArgs {
   bool selftest = false;
   std::string input, output;
   std::string selftest_input, selftest_output, selftest_name = "w";
-  std::string layouts_spec = "mxfp4,w4a16,w4a8";
+  std::string layouts_spec = "w4a16";
   std::string lm_head_spec = "4bit+bf16";
   bool lm_head_spec_explicit = false;  // --lm-head was given: --no-bf16 then leaves it alone
   int layers = -1;  // -1 = every text layer
@@ -370,7 +355,7 @@ struct AppArgs {
   // exact-precision container), not the HF mode's "every layout side by side" model.
   std::string dflash_gguf;
   std::string dflash_out;
-  std::string dflash_layout = "w4a16";  // one of w4a16, w4a8, mxfp4, bf16
+  std::string dflash_layout = "w4a16";  // one of w4a16, bf16
 
   // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
   // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "rtn" (default) is
@@ -704,7 +689,7 @@ class ImatrixSource {
   int64_t hit_ = 0, missing_ = 0;
 };
 
-bool HasQuantizedLayout(const LayoutSet& ls) { return ls.w4a16 || ls.w4a8 || ls.mxfp4; }
+bool HasQuantizedLayout(const LayoutSet& ls) { return ls.w4a16; }
 
 double SecondsBetween(std::chrono::steady_clock::time_point a,
                       std::chrono::steady_clock::time_point b) {
@@ -810,7 +795,7 @@ class LdlqSource {
                                std::to_string(kBlock));
     }
     // quant_ldlq.hpp also needs every emitted layout's group to tile the block (a group never
-    // straddles two blocks). w4a8 (128) and mxfp4 (32) always do; w4a16's group is this linear's
+    // straddles two blocks). w4a16's group is this linear's
     // own (`ls.w4a16_group`: a --w4a16-group-rule's 32/64/128, all fine, or the build's
     // R4DX_W4A16_GROUP, which may be any multiple of 64 -- 192, 256, ... do not divide 128).
     auto require_group = [&](bool on, int group, const char* layout) {
@@ -823,8 +808,6 @@ class LdlqSource {
       }
     };
     require_group(ls.w4a16, ls.w4a16_group, "w4a16");
-    require_group(ls.w4a8, r4dx_convert::kW4A8Group, "w4a8");
-    require_group(ls.mxfp4, r4dx_convert::kMxfp4Group, "mxfp4");
     // The file itself (header, size, K/rows vs the manifest), each distinct file once.
     store_->CheckFile(container_base);
     if (rms) {
@@ -1198,7 +1181,7 @@ std::string ReadFile(const std::string& path) {
 nlohmann::json LayoutSetJson(const LayoutSet& ls) {
   // Without w4a16_group: the group is the one thing a reuse may change, and it is resolved per
   // linear (the per-tensor decision in RunConvert), never at the LayoutSet the flags give.
-  return {{"bf16", ls.bf16}, {"mxfp4", ls.mxfp4}, {"w4a16", ls.w4a16}, {"w4a8", ls.w4a8}};
+  return {{"bf16", ls.bf16}, {"w4a16", ls.w4a16}};
 }
 
 // __metadata__.r4dx_convert_run.reuse_guard: everything this run's bytes can depend on EXCEPT the
@@ -1238,8 +1221,6 @@ nlohmann::json BuildReuseGuard(const AppArgs& args, const std::string& config_te
                     // dense_linalg's path) at run time
                     {"cpu", CpuIdentity()},
                     {"w4a16_group", kW4A16Group},
-                    {"w4a8_group", kW4A8Group},
-                    {"mxfp4_group", kMxfp4Group},
                     // bit-identical by construction and gated (dense_linalg.hpp), recorded anyway
                     {"avx512", linalg::UseAvx512()}};
   // The two large file sets -- the checkpoint's shards and the .hess files LDLQ can read, often on
@@ -2023,7 +2004,7 @@ int RunConvert(const AppArgs& args) {
     // self_attn.{q,k,v,o}_proj (q_proj [12288,5120], fused q+gate exactly like a text full-
     // attention layer), q_norm/k_norm, mlp.{gate,up,down}_proj ([17408,5120]x2,[5120,17408]), both
     // layernorms. It is NOT a small bespoke head, so it gets the identical add_linear/add_bf16
-    // routing a text full_attention layer gets (mxfp4/w4a16/w4a8/bf16 on qg/o and the MLP, bf16 on
+    // routing a text full_attention layer gets (w4a16/bf16 on qg/o and the MLP, bf16 on
     // k/v/norms) rather than a blanket bf16-only passthrough -- the whole point of the 4-bit
     // layouts is to serve the M=1..64 band MTP self-speculation runs in.
     const int mtp_layers = text_cfg.value("mtp_num_hidden_layers", 1);
@@ -2207,23 +2188,23 @@ int RunConvert(const AppArgs& args) {
       // is factually wrong for qg/o (they go through add_linear with the full LayoutSet, same as
       // mlp.gate_up/down) -- only k/v are bf16-only. A loader trusting the old string would pick
       // bf16 for attn.o and silently lose the 4-bit A/B the container exists to enable.
-      {"text.layers.*.mlp.gate_up|down", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
-      {"text.layers.*.attn.qg|o", "mxfp4|w4a16|w4a8|bf16 (all four present)"},
+      {"text.layers.*.mlp.gate_up|down", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
+      {"text.layers.*.attn.qg|o", "w4a16|bf16 (as requested by --layouts)"},
       // R1 (docs/r9700.md): attn.k/v and gdn.in_proj_z now join the quantized-linear family (were
       // "bf16" unconditionally before this pass) -- old containers built before this change still
       // have the bare, unsuffixed bf16-only tensor; src/model/container.cpp's
       // LoadQuantLinearWithFallback handles both on-disk forms.
-      {"text.layers.*.attn.k|v", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
-      {"text.layers.*.gdn.in_proj_z", "mxfp4|w4a16|w4a8|bf16 (all four present; pick at load time)"},
+      {"text.layers.*.attn.k|v", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
+      {"text.layers.*.gdn.in_proj_z", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
       {"text.layers.*.gdn.in_proj_a|b", "bf16 (never quantized -- feeds the decay path)"},
-      {"mtp.attn.qg|o", "mxfp4|w4a16|w4a8|bf16 (all four present, when --mtp on)"},
+      {"mtp.attn.qg|o", "w4a16|bf16 (as requested by --layouts, when --mtp on)"},
       {"mtp.attn.k|v", "bf16 (when --mtp on)"},
-      {"mtp.mlp.gate_up|down", "mxfp4|w4a16|w4a8|bf16 (all four present, when --mtp on)"},
+      {"mtp.mlp.gate_up|down", "w4a16|bf16 (as requested by --layouts, when --mtp on)"},
       {"mtp.fc|norm|pre_fc_norm_embedding|pre_fc_norm_hidden", "bf16 (when --mtp on)"},
-      {"mtp.draft_head.lm_head", "mxfp4|w4a16|w4a8|bf16 (all four present, OPTIONAL -- only when "
+      {"mtp.draft_head.lm_head", "w4a16|bf16 (as requested by --layouts, OPTIONAL -- only when "
                                   "--draft-vocab-ids was given, docs/r9700.md R9)"},
       {"mtp.draft_head.vocab_ids", "raw int32[draft_vocab_size] (OPTIONAL, same condition)"},
-      {"lm_head", "mxfp4|w4a16|w4a8|bf16 (all four present)"},
+      {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head)"},
   };
   // --rotate: every key below is written ONLY for a rotated container, so an unrotated one keeps
   // exactly the header bytes it had before the flag existed.
@@ -2572,7 +2553,7 @@ int RunSelftest(const AppArgs& args) {
 LayoutSet DflashLayoutSet(const std::string& layout_name) {
   // Exactly the ONE requested layout, no automatic bf16 side-by-side copy (deliberately UNLIKE
   // the main text-model container's "every layout side by side in one file" convention) -- the
-  // task spec's own expected container sizes (~1.2 GB each for w4a16/w4a8/mxfp4, ~3.9 GB for
+  // task spec's own expected container sizes (~1.2 GB for w4a16, ~3.9 GB for
   // bf16) only make sense as single-layout files; `--dflash-gguf ... --layout X` produces ONE
   // container per invocation, matching `r4dx-cli --layout`'s per-run layout selection rather than
   // `r4dx-convert`'s (HF-mode) `--layouts a,b,c` side-by-side list.
@@ -2580,9 +2561,7 @@ LayoutSet DflashLayoutSet(const std::string& layout_name) {
   ls.bf16 = false;
   if (layout_name == "bf16") ls.bf16 = true;
   else if (layout_name == "w4a16") ls.w4a16 = true;
-  else if (layout_name == "w4a8") ls.w4a8 = true;
-  else if (layout_name == "mxfp4") ls.mxfp4 = true;
-  else throw std::runtime_error("--layout must be one of w4a16, w4a8, mxfp4, bf16 (got '" + layout_name + "')");
+  else throw std::runtime_error("--layout must be one of w4a16, bf16 (mxfp4 and w4a8 were retired; got '" + layout_name + "')");
   return ls;
 }
 

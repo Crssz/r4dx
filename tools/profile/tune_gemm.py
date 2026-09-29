@@ -350,8 +350,10 @@ def sweep_shape(layout, name, n, k, m_bands, iters):
     return results
 
 
-LAYOUT_ENUM = {"bf16": "Layout::kBf16", "w4a16": "Layout::kW4a16", "w4a8": "Layout::kW4a8",
-               "mxfp4": "Layout::kMxfp4"}
+# The w4a8 / mxfp4 layouts are retired from r4dx (their Layout enumerators no longer exist); the
+# sweep code for them below is kept only so an old r4d.pyd can still be exercised, and is refused
+# at the command line.
+LAYOUT_ENUM = {"bf16": "Layout::kBf16", "w4a16": "Layout::kW4a16"}
 # One emitted row: `    {Layout::kW4a16, 10240, 5120, 1, {1, 2, 1, 1, 1}},  // gdn.in_proj_qkv 45.76us`
 # -> (layout enum, N, K, M, shape name), the key --replace matches on.
 ROW_RE = re.compile(r"^\s*\{(Layout::\w+), (\d+), (\d+), (\d+), \{[^}]*\}\},\s*// (\S+) ")
@@ -364,7 +366,7 @@ def main():
                      help="comma-separated M values overriding --quick/the default full band list "
                           "(docs/r9700.md Q5: e.g. --m-bands 1 for a fast single-row re-run).")
     ap.add_argument("--out", default=r"src\model\gemm_tuning_table.inc")
-    ap.add_argument("--layouts", default="bf16,w4a16,w4a8,mxfp4")
+    ap.add_argument("--layouts", default="bf16,w4a16")
     ap.add_argument("--shapes", default="",
                      help="comma-separated subset of SHAPES' names to sweep (default: all but the "
                           "tp2.* ones, which run only when named and only into "
@@ -395,6 +397,10 @@ def main():
         m_bands = M_BANDS_QUICK if args.quick else M_BANDS_FULL
     iters = 15 if args.quick else 40
     layouts = args.layouts.split(",")
+    retired = [l for l in layouts if l not in LAYOUT_ENUM]
+    if retired:
+        raise SystemExit(f"--layouts: {retired} are not tunable any more -- r4dx supports only "
+                         f"bf16 and w4a16 here (trellis rows come from tool_trellis_gemm_bench)")
     shape_filter = set(s for s in args.shapes.split(",") if s)
     # The default set leaves out the TP=2 per-rank shapes: they are swept only when named, and only
     # into their own table (docs/tp.md 2.7; see SHAPES).

@@ -15,6 +15,7 @@ namespace {
 bool StartsWith(const std::string& s, const char* prefix) { return s.rfind(prefix, 0) == 0; }
 
 // True iff `base` still ends in an on-disk ".{layout}.{part}" tail (".w4a16.wq", ".bf16.w", ...).
+// The retired "w4a8" / "mxfp4" tails stay recognised so a leftover suffix is refused by name.
 bool HasLayoutSuffix(const std::string& base) {
   const size_t last = base.rfind('.');
   if (last == std::string::npos || last == 0) return false;
@@ -113,10 +114,6 @@ const char* PartName(Part p) {
     case Part::kBf16: return "bf16";
     case Part::kW4Wq: return "w4 wq";
     case Part::kW4a16Wsz: return "w4a16 wsz";
-    case Part::kW4a8Ws: return "w4a8 ws";
-    case Part::kMxWq: return "mxfp4 wq";
-    case Part::kMxWs: return "mxfp4 ws";
-    case Part::kMxWref: return "mxfp4 wref";
     case Part::kElem: return "elem";
     case Part::kTrellisW: return "trellis w";
   }
@@ -130,7 +127,7 @@ constexpr int64_t kTrellisAlign = 128;
 int64_t TrellisBlockBytes(const PartShape& sh) { return 64 * static_cast<int64_t>(sh.rate); }
 
 bool IsTilePart(Part p) {
-  return p == Part::kW4Wq || p == Part::kW4a16Wsz || p == Part::kW4a8Ws || p == Part::kMxWq;
+  return p == Part::kW4Wq || p == Part::kW4a16Wsz;
 }
 
 void RequireDiv(const char* fn, const PartShape& sh, const char* what, int64_t value,
@@ -156,15 +153,7 @@ void CheckShape(const char* fn, const PartShape& sh) {
       RequireDiv(fn, sh, "K", sh.K, 64);
       break;
     case Part::kW4a16Wsz:
-    case Part::kW4a8Ws:
       RequireDiv(fn, sh, "N", sh.N, 16);
-      RequireDiv(fn, sh, "K", sh.K, sh.group);
-      break;
-    case Part::kMxWq:
-      RequireDiv(fn, sh, "N", sh.N, 16);
-      RequireDiv(fn, sh, "K", sh.K, 32);
-      break;
-    case Part::kMxWs:
       RequireDiv(fn, sh, "K", sh.K, sh.group);
       break;
     case Part::kTrellisW:
@@ -318,15 +307,10 @@ std::vector<ByteRun> PlanRows(const PartShape& sh, const std::vector<Range>& row
         Append(runs, a * K * 2, n * K * 2);
         break;
       case Part::kW4Wq:  // tile-major, K/2 bytes per row: rows [a, a+n) are one byte range
-      case Part::kMxWq:
         Append(runs, a * K / 2, n * K / 2);
         break;
       case Part::kW4a16Wsz:  // (t, g, r) dwords, K/g per row, tile-major
-      case Part::kW4a8Ws:
         Append(runs, a * (K / sh.group) * 4, n * (K / sh.group) * 4);
-        break;
-      case Part::kMxWref:
-        Append(runs, a, n);
         break;
       case Part::kElem:
         Append(runs, a * sh.row_bytes, n * sh.row_bytes);
@@ -335,13 +319,6 @@ std::vector<ByteRun> PlanRows(const PartShape& sh, const std::vector<Range>& row
         Append(runs, (a / 32) * (K / 16) * TrellisBlockBytes(sh),
                (n / 32) * (K / 16) * TrellisBlockBytes(sh));
         break;
-      case Part::kMxWs:
-        break;  // below: the row ranges are gathered inside every k-group row
-    }
-  }
-  if (sh.part == Part::kMxWs) {
-    for (int64_t kg = 0; kg < K / sh.group; ++kg) {
-      for (const Range& r : rows) Append(runs, kg * N + r.begin, r.count);
     }
   }
   return runs;
@@ -355,10 +332,7 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
   int64_t align = 1;
   switch (sh.part) {
     case Part::kW4Wq: align = 64; break;
-    case Part::kW4a16Wsz:
-    case Part::kW4a8Ws:
-    case Part::kMxWs: align = sh.group; break;
-    case Part::kMxWq: align = 32; break;
+    case Part::kW4a16Wsz: align = sh.group; break;
     case Part::kTrellisW: align = kTrellisAlign; break;
     default: break;
   }
@@ -378,25 +352,13 @@ std::vector<ByteRun> PlanCols(const PartShape& sh, Range cols) {
         Append(runs, (t * (K / 64) + k0 / 64) * 512, (k / 64) * 512);
       }
       break;
-    case Part::kW4a16Wsz:  // 16 dwords per (tile, group)
-    case Part::kW4a8Ws: {
+    case Part::kW4a16Wsz: {  // 16 dwords per (tile, group)
       const int64_t g = sh.group;
       for (int64_t t = 0; t < N / 16; ++t) {
         Append(runs, (t * (K / g) + k0 / g) * 16 * 4, (k / g) * 16 * 4);
       }
       break;
     }
-    case Part::kMxWq:  // 128 B per (tile, 16-K step)
-      for (int64_t t = 0; t < N / 16; ++t) {
-        Append(runs, (t * (K / 16) + k0 / 16) * 128, (k / 16) * 128);
-      }
-      break;
-    case Part::kMxWs:  // [K/32][N]: a K range is a contiguous block of k-group rows
-      Append(runs, (k0 / sh.group) * N, (k / sh.group) * N);
-      break;
-    case Part::kMxWref:  // the FULL row max, see the header
-      Append(runs, 0, N);
-      break;
     case Part::kTrellisW:  // per pair row, the k-tiles [k0/16, (k0+k)/16): N/32 runs
       for (int64_t pr = 0; pr < N / 32; ++pr) {
         Append(runs, (pr * (K / 16) + k0 / 16) * TrellisBlockBytes(sh),

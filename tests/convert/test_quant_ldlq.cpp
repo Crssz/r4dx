@@ -15,10 +15,9 @@
 //       succeeds at damp 0.01, and at damp 0 it succeeds only through a retry (an exactly-zero pivot
 //       is guaranteed to fail the first attempt). A NaN anywhere in H, or a wrong-sized H, throws.
 //   (c) identity Hessian. With H = I and damp = 0, U is exactly I, so the error feedback is exactly
-//       zero. QuantizeInt4AsymmetricLdlq / QuantizeInt4Pinned8Ldlq must then equal, byte for byte,
-//       a per-(row, group) application of SearchInt4AsymGroup / SearchInt4Pinned8Group with
-//       refit = false and unit weights, at groups 32, 64 and 128. QuantizeMxfp4Ldlq must equal
-//       SearchMxfp4Group, which is also QuantizeMxfp4Search with no imatrix. Rows span a partial
+//       zero. QuantizeInt4AsymmetricLdlq must then equal, byte for byte,
+//       a per-(row, group) application of SearchInt4AsymGroup with
+//       refit = false and unit weights, at groups 32, 64 and 128. Rows span a partial
 //       128-row tile, and the matrix carries an all-zero group, a constant group and an outlier, so
 //       the degenerate branches are covered too.
 //   (d) proxy loss. X has strongly correlated columns: AR(1) along the channels, a shared low-rank
@@ -27,7 +26,7 @@
 //       double. The LDLQ proxy must be <= 0.2x that of the search quantizer weighted by diag(H)
 //       (the --quant search --imatrix path; docs/quant2.md's G1 floor is 0.8, this data leaves the
 //       correct loop at ~0.1), for w4a16 at groups 32, 64 and 128 (32: a per-tensor group,
-//       docs/quant2.md section 5), w4a8 and mxfp4. RTN is printed
+//       docs/quant2.md section 5). RTN is printed
 //       alongside for scale. The ratio cannot see a broken lazy-block update on its own, so each
 //       layout is also checked against an UNBLOCKED per-row GPTQ reference (full-row feedback after
 //       every column, group parameters chosen from the current weights with the no-refit search;
@@ -45,11 +44,11 @@
 //       throw on a K mismatch. Corrupted copies (magic, flags, trace, truncation) are rejected, as
 //       are manifests with a bad version, a key naming an unlisted file, or a K the file header
 //       contradicts.
-//   (g) packers. PackW4Nibbles / PackW4A16Scales / PackW4A8Scales / PackMxfp4Wq / PackMxfp4Ws accept
+//   (g) packers. PackW4Nibbles / PackW4A16Scales accept
 //       the (d) LDLQ outputs. The bytes are then decoded by the kernels' own literal indexing (the
 //       same derivation as test_kernel_decode.cpp) and must give back exactly the LDLQ codes, zeros
-//       and exponents. The kernel-side dequant (f16 scales, mxfp4 Wref / dsh fold) must agree with
-//       the fp32 dequant to f16 precision (exactly, for mxfp4), and the proxy loss recomputed from
+//       and zeros. The kernel-side dequant (f16 scales) must agree with
+//       the fp32 dequant to f16 precision, and the proxy loss recomputed from
 //       the packed bytes must agree with (d)'s to 2%.
 //
 // R4DX_CONVERT_FIXTURES_DIR is injected by tests/convert/CMakeLists.txt as an absolute path.
@@ -75,7 +74,6 @@
 #include "r4dx_convert/hessian_store.hpp"
 #include "r4dx_convert/quant_int4.hpp"
 #include "r4dx_convert/quant_ldlq.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/sha256.hpp"
 #include "r4dx_convert/threadpool.hpp"
@@ -342,38 +340,6 @@ std::vector<double> DeqAsym(const std::vector<uint8_t>& q, const std::vector<flo
       out[static_cast<size_t>(r) * K + k] =
           static_cast<double>(scale[gi]) *
           (static_cast<double>(q[static_cast<size_t>(r) * K + k]) - static_cast<double>(zero[gi]));
-    }
-  return out;
-}
-
-std::vector<double> DeqPinned8(const std::vector<uint8_t>& q, const std::vector<float>& scale, int N,
-                               int K, int group) {
-  const int gpr = K / group;
-  std::vector<double> out(static_cast<size_t>(N) * K);
-  for (int r = 0; r < N; ++r)
-    for (int k = 0; k < K; ++k) {
-      const size_t gi = static_cast<size_t>(r) * gpr + k / group;
-      out[static_cast<size_t>(r) * K + k] =
-          static_cast<double>(scale[gi]) *
-          (static_cast<double>(q[static_cast<size_t>(r) * K + k]) - 8.0);
-    }
-  return out;
-}
-
-double E2M1Value(uint8_t code, int raw) {
-  const double mag = static_cast<double>(kE2M1Magnitude[code & 0x7]);
-  return ((code & 0x8) ? -mag : mag) * std::ldexp(1.0, raw - 127);
-}
-
-std::vector<double> DeqMxfp4(const Mxfp4Quantized& m, int N, int K, int group) {
-  const int gpr = K / group;
-  std::vector<double> out(static_cast<size_t>(N) * K);
-  for (int r = 0; r < N; ++r)
-    for (int k = 0; k < K; ++k) {
-      const uint8_t byte = m.packed[static_cast<size_t>(r) * (K / 2) + k / 2];
-      const uint8_t code = (k % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-      out[static_cast<size_t>(r) * K + k] =
-          E2M1Value(code, m.escale[static_cast<size_t>(r) * gpr + k / group]);
     }
   return out;
 }
@@ -675,52 +641,6 @@ void TestIdentity() {
       SameVec("(c) w4a16" + tag + " scale", scale, rs_ref);
       SameVec("(c) w4a16" + tag + " zero", zero, rz_ref);
     }
-    {  // w4a8
-      std::vector<uint8_t> q, rq_ref(static_cast<size_t>(N) * K);
-      std::vector<float> scale, rs_ref(static_cast<size_t>(N) * gpr);
-      QuantizeInt4Pinned8Ldlq(w.data(), N, K, group, f, 4, q, scale);
-      std::vector<uint8_t> best(static_cast<size_t>(group));
-      for (int r = 0; r < N; ++r)
-        for (int g = 0; g < gpr; ++g) {
-          const size_t gi = static_cast<size_t>(r) * gpr + g;
-          const size_t off = static_cast<size_t>(r) * K + static_cast<size_t>(g) * group;
-          SearchInt4Pinned8Group(w.data() + off, nullptr, group, /*refit=*/false, best.data(),
-                                 rq_ref.data() + off, &rs_ref[gi]);
-        }
-      SameVec("(c) w4a8" + tag + " q == SearchInt4Pinned8Group(refit=false)", q, rq_ref);
-      SameVec("(c) w4a8" + tag + " scale", scale, rs_ref);
-    }
-  }
-
-  {  // mxfp4 (its group is its own constant, 32)
-    const int group = kMxfp4Group, gpr = K / group;
-    const Mxfp4Quantized m = QuantizeMxfp4Ldlq(w.data(), N, K, group, f, 4);
-    Mxfp4Quantized ref;
-    ref.packed.assign(static_cast<size_t>(N) * (K / 2), 0);
-    ref.escale.assign(static_cast<size_t>(N) * gpr, 0);
-    ref.wref.assign(static_cast<size_t>(N), 0);
-    std::vector<uint8_t> codes(static_cast<size_t>(group)), best(static_cast<size_t>(group));
-    for (int r = 0; r < N; ++r) {
-      for (int g = 0; g < gpr; ++g) {
-        int raw = 0;
-        SearchMxfp4Group(w.data() + static_cast<size_t>(r) * K + static_cast<size_t>(g) * group,
-                         nullptr, group, codes.data(), best.data(), &raw);
-        ref.escale[static_cast<size_t>(r) * gpr + g] = static_cast<uint8_t>(raw);
-        ref.wref[r] = std::max(ref.wref[r], static_cast<uint8_t>(raw));
-        for (int k = 0; k < group; ++k) {
-          const int kk = g * group + k;
-          uint8_t& byte = ref.packed[static_cast<size_t>(r) * (K / 2) + kk / 2];
-          byte = (kk % 2 == 0) ? static_cast<uint8_t>((byte & 0xF0u) | (best[k] & 0x0Fu))
-                               : static_cast<uint8_t>((byte & 0x0Fu) | ((best[k] & 0x0Fu) << 4));
-        }
-      }
-    }
-    SameVec("(c) mxfp4 packed == SearchMxfp4Group", m.packed, ref.packed);
-    SameVec("(c) mxfp4 escale", m.escale, ref.escale);
-    SameVec("(c) mxfp4 wref", m.wref, ref.wref);
-    const Mxfp4Quantized s = QuantizeMxfp4Search(w.data(), N, K, group, ImportanceVector{}, 4);
-    SameVec("(c) mxfp4 packed == QuantizeMxfp4Search (no imatrix)", m.packed, s.packed);
-    SameVec("(c) mxfp4 escale == QuantizeMxfp4Search", m.escale, s.escale);
   }
 }
 
@@ -776,99 +696,6 @@ void CheckPackedW4A16(const std::string& label, const std::vector<float>& W,
        label + Fmt(": proxy from packed bytes %.6g vs %.6g (within 2%%)", pp, proxy32));
 }
 
-void CheckPackedW4A8(const std::string& label, const std::vector<float>& W,
-                     const std::vector<double>& Hd, const std::vector<uint8_t>& q,
-                     const std::vector<float>& scale, int N, int K, int group,
-                     const std::vector<double>& deq32, double proxy32) {
-  std::vector<uint32_t> wq, ws;
-  try {
-    wq = PackW4Nibbles(q, N, K, 4);
-    ws = PackW4A8Scales(scale, N, K, group);
-  } catch (const std::exception& e) {
-    Gate(false, label + ": packers threw: " + e.what());
-    return;
-  }
-  const int ntiles = N / 16, kblocks = K / 64, gpr = K / group;
-  std::vector<double> deqp(static_cast<size_t>(N) * K);
-  bool codes_ok = true, hi_ok = true;
-  for (int t = 0; t < ntiles; ++t)
-    for (int kb = 0; kb < kblocks; ++kb)
-      for (int lane = 0; lane < 32; ++lane)
-        for (int s = 0; s < 4; ++s) {
-          const uint32_t dword = wq[((static_cast<size_t>(t) * kblocks + kb) * 32 + lane) * 4 + s];
-          const int row = DecodeRow(t, lane);
-          for (int e = 0; e < 8; ++e) {
-            const uint32_t nibble = (dword >> (4 * NibblePos(e))) & 0xFu;
-            const int sv = static_cast<int8_t>(nibble << 4) / 16;  // dequant8's two's-complement read
-            const int k = DecodeK(kb, s, e, lane);
-            if (sv != static_cast<int>(q[static_cast<size_t>(row) * K + k]) - 8) codes_ok = false;
-            const uint32_t word = ws[(static_cast<size_t>(t) * gpr + k / group) * 16 + (lane & 15)];
-            if ((word >> 16) != 0) hi_ok = false;
-            const float sc = r4dx::core::F16ToFloat(static_cast<uint16_t>(word & 0xFFFFu));
-            deqp[static_cast<size_t>(row) * K + k] = static_cast<double>(sc) * sv;
-          }
-        }
-  Gate(codes_ok && hi_ok, label + ": PackW4Nibbles / PackW4A8Scales decode to the LDLQ codes");
-  const double rel = RelL2(deqp, deq32);
-  Gate(rel <= 1e-3, label + Fmt(": f16-scale dequant vs fp32 dequant rel diff %.3g <= 1e-3", rel));
-  const double pp = Proxy(W, deqp, Hd, N, K);
-  Gate(std::fabs(pp / proxy32 - 1.0) <= 0.02,
-       label + Fmt(": proxy from packed bytes %.6g vs %.6g (within 2%%)", pp, proxy32));
-}
-
-void CheckPackedMxfp4(const std::string& label, const Mxfp4Quantized& m, int N, int K,
-                      const std::vector<double>& deq32) {
-  const int group = kMxfp4Group, gpr = K / group;
-  std::vector<uint8_t> wq, ws;
-  try {
-    wq = PackMxfp4Wq(m.packed, N, K, 4);
-    ws = PackMxfp4Ws(m.escale, N, K, group);
-  } catch (const std::exception& e) {
-    Gate(false, label + ": packers threw: " + e.what());
-    return;
-  }
-  bool wref_ok = true;
-  int max_dsh = 0;
-  for (int r = 0; r < N; ++r) {
-    uint8_t mx = 0;
-    for (int g = 0; g < gpr; ++g) {
-      const uint8_t raw = m.escale[static_cast<size_t>(r) * gpr + g];
-      mx = std::max(mx, raw);
-    }
-    if (mx != m.wref[r]) wref_ok = false;
-    for (int g = 0; g < gpr; ++g)
-      max_dsh = std::max(max_dsh, static_cast<int>(m.wref[r]) - m.escale[static_cast<size_t>(r) * gpr + g]);
-  }
-  Gate(wref_ok, label + ": wref == max escale per row");
-  Gate(max_dsh <= 15, label + Fmt(": max Wref - escale = %d fits the kernel's 0..15 dsh clamp", max_dsh));
-
-  const int ntiles = N / 16, ksteps = K / 16;
-  bool codes_ok = true, values_ok = true;
-  for (int nt = 0; nt < ntiles; ++nt)
-    for (int ks = 0; ks < ksteps; ++ks)
-      for (int lane = 0; lane < 32; ++lane) {
-        const int row = nt * 16 + (lane & 15), h = lane >> 4;
-        const size_t base = (static_cast<size_t>(nt) * ksteps + ks) * 32 * 4 + static_cast<size_t>(lane) * 4;
-        for (int j = 0; j < 4; ++j)
-          for (int half = 0; half < 2; ++half) {
-            const uint8_t byte = wq[base + j];
-            const uint8_t code = half == 0 ? (byte & 0xF) : ((byte >> 4) & 0xF);
-            const int k = ks * 16 + 8 * h + 2 * j + half;
-            const uint8_t src = m.packed[static_cast<size_t>(row) * (K / 2) + k / 2];
-            if (code != ((k % 2 == 0) ? (src & 0xF) : ((src >> 4) & 0xF))) codes_ok = false;
-            const uint8_t escale = ws[static_cast<size_t>(k / group) * N + row];
-            if (escale != m.escale[static_cast<size_t>(row) * gpr + k / group]) codes_ok = false;
-            // the kernel's Wref / clamped-dsh fold (test_quantize_roundtrip.cpp's mxfp4 comment)
-            int dsh = static_cast<int>(m.wref[row]) - static_cast<int>(escale);
-            dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
-            const double v = E2M1Value(code, static_cast<int>(m.wref[row]) - dsh);
-            if (v != deq32[static_cast<size_t>(row) * K + k]) values_ok = false;
-          }
-      }
-  Gate(codes_ok, label + ": PackMxfp4Wq / PackMxfp4Ws decode to the LDLQ codes and exponents");
-  Gate(values_ok, label + ": kernel-side dequant (Wref/dsh fold) == fp32 dequant exactly");
-}
-
 // ---- (d) proxy loss, and (g) on the same outputs ------------------------------------------------
 
 // The unblocked reference for (d): textbook per-row GPTQ / LDLQ with NO lazy batching. After every
@@ -879,10 +706,10 @@ void CheckPackedMxfp4(const std::string& label, const Mxfp4Quantized& m, int N, 
 // per-block GEMM there), so a few codes sitting on a rounding knife-edge may differ and nothing else.
 // The ratio gate alone cannot see a broken block update: dropping it entirely still leaves LDLQ at
 // ~0.3-0.6x the search baseline on this data, because the in-block feedback carries most of the gain.
-enum class RefLayout { kAsym, kPinned8, kMxfp4 };
+enum class RefLayout { kAsym };
 
 struct RefResult {
-  std::vector<uint8_t> codes;  // one unpacked code per element (w4a16 q, w4a8 q, mxfp4 nibble)
+  std::vector<uint8_t> codes;  // one unpacked code per element (w4a16 q)
   std::vector<double> deq;     // the fp32 dequantized value the reference rounded to
 };
 
@@ -904,36 +731,19 @@ RefResult UnblockedLdlqRef(RefLayout layout, const std::vector<float>& W, int N,
         if (i % group == 0) {
           const float* wg = w.data() + i;
           const float* wt = f.diag_h.data() + i;
-          if (layout == RefLayout::kAsym) {
-            SearchInt4AsymGroup(wg, wt, group, /*refit=*/false, rq.data(), bq.data(), qg.data(), &sc,
-                                &zp);
-          } else if (layout == RefLayout::kPinned8) {
-            SearchInt4Pinned8Group(wg, wt, group, /*refit=*/false, bq.data(), qg.data(), &sc);
-          } else {
-            int raw = 0;
-            SearchMxfp4Group(wg, wt, group, bq.data(), qg.data(), &raw);
-            sc = std::ldexp(1.0f, raw - 127);
-          }
+          (void)layout;
+          SearchInt4AsymGroup(wg, wt, group, /*refit=*/false, rq.data(), bq.data(), qg.data(), &sc,
+                              &zp);
         }
         const float x = w[i];
         uint8_t code = 0;
         float dq = 0.0f;
-        if (layout == RefLayout::kAsym) {
-          if (sc == 0.0f) {
-            code = static_cast<uint8_t>(zp);
-          } else {
-            const int qi = ClampInt(RoundHalfAwayFromZero(x / sc) + zp, 0, 15);
-            code = static_cast<uint8_t>(qi);
-            dq = sc * (static_cast<float>(qi) - static_cast<float>(zp));
-          }
-        } else if (layout == RefLayout::kPinned8) {
-          const int qs = ClampInt(RoundHalfAwayFromZero(x / sc), -8, 7);
-          code = static_cast<uint8_t>(qs + 8);
-          dq = sc * static_cast<float>(qs);
+        if (sc == 0.0f) {
+          code = static_cast<uint8_t>(zp);
         } else {
-          code = EncodeE2M1(x / sc);
-          const float mag = kE2M1Magnitude[code & 0x7];
-          dq = ((code & 0x8) ? -mag : mag) * sc;
+          const int qi = ClampInt(RoundHalfAwayFromZero(x / sc) + zp, 0, 15);
+          code = static_cast<uint8_t>(qi);
+          dq = sc * (static_cast<float>(qi) - static_cast<float>(zp));
         }
         out.codes[static_cast<size_t>(r) * K + i] = code;
         out.deq[static_cast<size_t>(r) * K + i] = static_cast<double>(dq);
@@ -944,15 +754,6 @@ RefResult UnblockedLdlqRef(RefLayout layout, const std::vector<float>& W, int N,
     }
   });
   return out;
-}
-
-std::vector<uint8_t> UnpackMxfp4Codes(const Mxfp4Quantized& m, int N, int K) {
-  std::vector<uint8_t> c(static_cast<size_t>(N) * K);
-  for (size_t e = 0; e < c.size(); ++e) {
-    const uint8_t byte = m.packed[e / 2];
-    c[e] = (e % 2 == 0) ? (byte & 0xF) : ((byte >> 4) & 0xF);
-  }
-  return c;
 }
 
 // The blocked LDLQ output against UnblockedLdlqRef: code mismatch rate <= 0.1% and proxy within
@@ -1021,33 +822,6 @@ void TestProxyAndPackers() {
       vs_ref(what, RefLayout::kAsym, group, q2, p2);
       CheckPackedW4A16("(g) " + kt + " " + what, W, Hd, q2, s2, z2, N, K, group, d2, p2);
     }
-    {
-      const int group = kW4A8Group;
-      const std::string what = Fmt("w4a8 g%d", group);
-      std::vector<uint8_t> q0, q1, q2;
-      std::vector<float> s0, s1, s2;
-      QuantizeInt4SymmetricPinned8(W.data(), N, K, group, 16, q0, s0);
-      QuantizeInt4Pinned8Search(W.data(), N, K, group, imp, 16, q1, s1);
-      QuantizeInt4Pinned8Ldlq(W.data(), N, K, group, f, 16, q2, s2);
-      const std::vector<double> d2 = DeqPinned8(q2, s2, N, K, group);
-      const double p2 = Proxy(W, d2, Hd, N, K);
-      report(what, Proxy(W, DeqPinned8(q0, s0, N, K, group), Hd, N, K),
-             Proxy(W, DeqPinned8(q1, s1, N, K, group), Hd, N, K), p2);
-      vs_ref(what, RefLayout::kPinned8, group, q2, p2);
-      CheckPackedW4A8("(g) " + kt + " " + what, W, Hd, q2, s2, N, K, group, d2, p2);
-    }
-    {
-      const int group = kMxfp4Group;
-      const Mxfp4Quantized m0 = QuantizeMxfp4(W.data(), N, K, group, 16);
-      const Mxfp4Quantized m1 = QuantizeMxfp4Search(W.data(), N, K, group, imp, 16);
-      const Mxfp4Quantized m2 = QuantizeMxfp4Ldlq(W.data(), N, K, group, f, 16);
-      const std::vector<double> d2 = DeqMxfp4(m2, N, K, group);
-      const double p2 = Proxy(W, d2, Hd, N, K);
-      report("mxfp4", Proxy(W, DeqMxfp4(m0, N, K, group), Hd, N, K),
-             Proxy(W, DeqMxfp4(m1, N, K, group), Hd, N, K), p2);
-      vs_ref("mxfp4", RefLayout::kMxfp4, group, UnpackMxfp4Codes(m2, N, K), p2);
-      CheckPackedMxfp4("(g) " + kt + " mxfp4", m2, N, K, d2);
-    }
   }
 }
 
@@ -1087,40 +861,6 @@ void TestDeterminism() {
       SameVec(l + " q", q, q16);
       SameVec(l + " scale", s, s16);
       SameVec(l + " zero", z, z16);
-    };
-    check("1 thread == 16", 1);
-    check("3 threads == 16", 3);
-    if (avx) {
-      ScopedForceScalar s(true);
-      check("scalar path == AVX-512 path", 3);
-    }
-  }
-  {
-    const int group = kW4A8Group;
-    std::vector<uint8_t> q16;
-    std::vector<float> s16;
-    QuantizeInt4Pinned8Ldlq(W.data(), N, K, group, f, 16, q16, s16);
-    auto check = [&](const std::string& how, int t) {
-      std::vector<uint8_t> q;
-      std::vector<float> s;
-      QuantizeInt4Pinned8Ldlq(W.data(), N, K, group, f, t, q, s);
-      SameVec("(e) w4a8 " + how + " q", q, q16);
-      SameVec("(e) w4a8 " + how + " scale", s, s16);
-    };
-    check("1 thread == 16", 1);
-    check("3 threads == 16", 3);
-    if (avx) {
-      ScopedForceScalar s(true);
-      check("scalar path == AVX-512 path", 3);
-    }
-  }
-  {
-    const Mxfp4Quantized m16 = QuantizeMxfp4Ldlq(W.data(), N, K, kMxfp4Group, f, 16);
-    auto check = [&](const std::string& how, int t) {
-      const Mxfp4Quantized m = QuantizeMxfp4Ldlq(W.data(), N, K, kMxfp4Group, f, t);
-      SameVec("(e) mxfp4 " + how + " packed", m.packed, m16.packed);
-      SameVec("(e) mxfp4 " + how + " escale", m.escale, m16.escale);
-      SameVec("(e) mxfp4 " + how + " wref", m.wref, m16.wref);
     };
     check("1 thread == 16", 1);
     check("3 threads == 16", 3);

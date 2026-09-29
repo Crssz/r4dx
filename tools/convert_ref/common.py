@@ -1,7 +1,7 @@
 """Shared float32-exact helpers for the r4dx-convert Python reference implementations.
 
 Every function here is written to match r4dx-convert's C++ (src/convert/include/r4dx_convert/
-quant_int4.hpp, quant_mxfp4.hpp) bit-for-bit: same dtype (float32 throughout, never float64,
+quant_int4.hpp) bit-for-bit: same dtype (float32 throughout, never float64,
 because a stray Python-float promotion changes the last bit of a division or a round) and the same
 round-half-away-from-zero tie-break (NOT numpy's default round-half-to-even), because that is what
 C++'s `std::floor(x+0.5f)` / `std::ceil(x-0.5f)` computes.

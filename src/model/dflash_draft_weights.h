@@ -77,12 +77,23 @@ class DflashDraftWeights {
     }
     w.reader_ = std::make_unique<r4dx_convert::SafetensorsReader>(r4dx_convert::Utf8ToWide(path));
     w.config_ = ParseConfig(w.metadata_.at("dflash2"));
+    // The mxfp4 and w4a8 layouts are retired (their GEMMs are no longer built): a drafter packed in
+    // one of them carries no tensor this build can read. Refuse it up front, by name, rather than
+    // failing later on a missing `.w4a16.wq` / `.bf16.w`.
+    if (w.config_.layout == "mxfp4" || w.config_.layout == "w4a8" ||
+        w.reader_->Has("dflash.fc.mxfp4.wq") || w.reader_->Has("dflash.fc.w4a8.wq")) {
+      throw std::runtime_error(
+          "DflashDraftWeights::Open: '" + path +
+          "' is a DFlash2 drafter packed in a retired layout (mxfp4 or w4a8), which this build no "
+          "longer supports; use the bf16 or the w4a16 (group " +
+          std::to_string(r4d_gemm_w4a16_nt_m64_group()) + ") drafter container instead");
+    }
     // Same group guard the main container gets (Container::Load -> CheckW4a16Group): a drafter
     // packed at a different w4a16 group than this build's kernel reads would produce silently
     // wrong draft logits, i.e. a collapsed acceptance rate with nothing else to see.
     //
     // Gated on the container actually CARRYING w4a16 bytes (adversarial-review fix). r4dx-convert
-    // writes the `quant` metadata block unconditionally, so a `--layout bf16` or `--layout mxfp4`
+    // writes the `quant` metadata block unconditionally, so a `--layout bf16`
     // drafter records a w4a16 group for a layout it does not contain a single tensor of; checking
     // it refused `qwen38-27b-dflash2-bf16.r4dx` on a group-64 build for a number nothing reads.
     // `dflash.fc` is the first linear every dflash2 container has (src/convert/main.cpp's

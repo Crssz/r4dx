@@ -1,9 +1,8 @@
-// r4dx_convert::quant_ldlq -- LDLQ / GPTQ error-feedback rounding for the w4a16 / w4a8 / mxfp4
-// layouts (docs/quant2.md section 2.2, "Q1").
+// r4dx_convert::quant_ldlq -- LDLQ / GPTQ error-feedback rounding for the w4a16 layout
+// (docs/quant2.md section 2.2, "Q1").
 //
 // THE BYTE LAYOUT IS UNCHANGED. Like quant_search.hpp, everything here produces exactly the `q` /
-// `scale` / `zero` (and mxfp4 `packed` / `escale` / `wref`) vectors QuantizeInt4Asymmetric /
-// QuantizeInt4SymmetricPinned8 / QuantizeMxfp4 produce, for the same packers. Only the values
+// `scale` / `zero` vectors QuantizeInt4Asymmetric produces, for the same packers. Only the values
 // chosen differ: instead of rounding each weight to its own nearest grid point, the rounding error
 // of column i is pushed onto the not-yet-quantized columns j > i in the direction that the layer's
 // input statistics say cancels it, minimizing the proxy loss
@@ -54,7 +53,7 @@
 // no-refit search); its retries use 1e-3 and 1e-2, since 10 x 0 would retry the same failure.
 //
 // ---- Per-group parameters: chosen late, from the updated weights, WITHOUT the refit ------------
-// Every (row, group) still carries one (scale, zero) / scale / E8M0 exponent. They are chosen at the
+// Every (row, group) still carries one (scale, zero) pair. They are chosen at the
 // group's FIRST column, from the group's CURRENT weights (all error feedback from earlier columns
 // already applied -- choosing from the original weights would fit a grid to values the loop no
 // longer rounds), by the measured Milestone 10 grid search in quant_search.hpp weighted by the
@@ -68,11 +67,7 @@
 // Per-column rounding, given the group's parameters (identical formulas to the RTN quantizers):
 //   w4a16: q = clamp(round_half_away(w / sc) + z, 0, 15), dequant sc * (q - z);
 //          a degenerate all-zero group (sc == 0) stores q = z and dequantizes to 0.
-//   w4a8:  q = clamp(round_half_away(w / sc), -8, 7) + 8, dequant sc * (q - 8).
-//   mxfp4: code = EncodeE2M1(w / 2^(raw-127)), dequant sign * |e2m1| * 2^(raw-127) (exact in fp32);
-//          wref = max raw over the row's groups, as QuantizeMxfp4Search.
-// The dequantized value uses the fp32 scale, not the f16 value PackW4A16Scales / PackW4A8Scales
-// store (a relative 2^-11 difference, far below the 4-bit step), like the search's error model.
+// The dequantized value uses the fp32 scale, not the f16 value PackW4A16Scales stores (a relative 2^-11 difference, far below the 4-bit step), like the search's error model.
 //
 // ---- Determinism -----------------------------------------------------------------------------
 // Output bytes do not depend on nthreads. Tile boundaries are fixed (128 rows), tiles share nothing
@@ -82,9 +77,6 @@
 // linalg::SubMatMulSerial, whose accumulation order is fixed (dense_linalg.hpp). FactorHessian's
 // Cholesky / inverse are likewise thread-count independent. fp contraction is disabled in the
 // scalar arithmetic here so no compiler-chosen FMA changes a rounding on one build only.
-// (One sub-bit nit, harmless: fma(-err, 0, -0.0f) can yield +0.0f when err < 0, so with an exactly
-// diagonal H a weight that is exactly -0.0 may encode as mxfp4 code +0 instead of -0. Both decode
-// to 0; no other layout distinguishes the sign of zero.)
 #pragma once
 
 #include <algorithm>
@@ -99,7 +91,6 @@
 
 #include "r4dx_convert/dense_linalg.hpp"
 #include "r4dx_convert/quant_int4.hpp"
-#include "r4dx_convert/quant_mxfp4.hpp"
 #include "r4dx_convert/quant_search.hpp"
 #include "r4dx_convert/threadpool.hpp"
 
@@ -249,56 +240,6 @@ struct AsymPolicy {
   }
 };
 
-struct Pinned8Policy {
-  int64_t K = 0;
-  int group = 0, groups_per_row = 0;
-  uint8_t* q = nullptr;
-  float* scale = nullptr;
-  std::vector<uint8_t> best_q, qg;
-  float sc[kTileRows] = {};
-
-  void Choose(int64_t row, int r, int g, const float* wg, const float* wt) {
-    SearchInt4Pinned8Group(wg, wt, group, /*refit=*/false, best_q.data(), qg.data(), &sc[r]);
-    scale[static_cast<size_t>(row) * groups_per_row + g] = sc[r];
-  }
-  float Quant(int64_t row, int r, int64_t k, float x) {
-    R4DX_NO_FP_CONTRACT
-    const float s = sc[r];
-    const int qs = ClampInt(RoundHalfAwayFromZero(x / s), -8, 7);
-    q[row * K + k] = static_cast<uint8_t>(qs + 8);
-    return s * static_cast<float>(qs);
-  }
-};
-
-struct Mxfp4Policy {
-  int64_t K = 0;
-  int group = 0, groups_per_row = 0;
-  uint8_t* packed = nullptr;
-  uint8_t* escale = nullptr;
-  std::vector<uint8_t> codes, best_codes;
-  float sf[kTileRows] = {};
-
-  void Choose(int64_t row, int r, int g, const float* wg, const float* wt) {
-    int raw = 0;
-    SearchMxfp4Group(wg, wt, group, codes.data(), best_codes.data(), &raw);
-    escale[static_cast<size_t>(row) * groups_per_row + g] = static_cast<uint8_t>(raw);
-    sf[r] = std::ldexp(1.0f, raw - 127);
-  }
-  float Quant(int64_t row, int r, int64_t k, float x) {
-    R4DX_NO_FP_CONTRACT
-    const float s = sf[r];
-    const uint8_t code = EncodeE2M1(x / s);
-    uint8_t& byte = packed[row * (K / 2) + k / 2];
-    if (k % 2 == 0) {
-      byte = static_cast<uint8_t>((byte & 0xF0u) | (code & 0x0Fu));
-    } else {
-      byte = static_cast<uint8_t>((byte & 0x0Fu) | ((code & 0x0Fu) << 4));
-    }
-    const float mag = kE2M1Magnitude[code & 0x7];
-    return ((code & 0x8) ? -mag : mag) * s;  // exact: <= 3 significant bits times a power of two
-  }
-};
-
 // Flat reversal of a K*K array (== J M J), parallel over mirrored row pairs.
 inline void ReverseSquareInPlace(std::vector<float>& a, int64_t K, int nthreads) {
   const int64_t n = K * K;
@@ -402,7 +343,7 @@ inline LdlqFactor FactorHessian(std::vector<float> H, int64_t K, float damp, int
                            std::to_string(damps[1]) + " and " + std::to_string(damps[2]));
 }
 
-// ---- the three layouts: same outputs/argument order as the RTN quantizers, plus the factor ----
+// ---- the w4a16 layout: same outputs/argument order as the RTN quantizer, plus the factor -------
 
 inline void QuantizeInt4AsymmetricLdlq(const float* w, int N, int K, int group,
                                        const LdlqFactor& f, int nthreads, std::vector<uint8_t>& q,
@@ -424,51 +365,6 @@ inline void QuantizeInt4AsymmetricLdlq(const float* w, int N, int K, int group,
   p.best_q.resize(static_cast<size_t>(group));
   p.qg.resize(static_cast<size_t>(group));
   ldlq_detail::Run(w, N, K, group, f, nthreads, p);
-}
-
-inline void QuantizeInt4Pinned8Ldlq(const float* w, int N, int K, int group, const LdlqFactor& f,
-                                    int nthreads, std::vector<uint8_t>& q,
-                                    std::vector<float>& scale) {
-  ldlq_detail::CheckArgs("QuantizeInt4Pinned8Ldlq", N, K, group, f);
-  const int groups_per_row = K / group;
-  q.assign(static_cast<size_t>(N) * K, 0);
-  scale.assign(static_cast<size_t>(N) * groups_per_row, 0.0f);
-
-  ldlq_detail::Pinned8Policy p;
-  p.K = K;
-  p.group = group;
-  p.groups_per_row = groups_per_row;
-  p.q = q.data();
-  p.scale = scale.data();
-  p.best_q.resize(static_cast<size_t>(group));
-  p.qg.resize(static_cast<size_t>(group));
-  ldlq_detail::Run(w, N, K, group, f, nthreads, p);
-}
-
-inline Mxfp4Quantized QuantizeMxfp4Ldlq(const float* w, int N, int K, int group,
-                                        const LdlqFactor& f, int nthreads) {
-  ldlq_detail::CheckArgs("QuantizeMxfp4Ldlq", N, K, group, f);
-  const int groups_per_row = K / group;
-  Mxfp4Quantized out;
-  out.packed.assign(static_cast<size_t>(N) * (K / 2), 0);
-  out.escale.assign(static_cast<size_t>(N) * groups_per_row, 0);
-  out.wref.assign(static_cast<size_t>(N), 0);
-
-  ldlq_detail::Mxfp4Policy p;
-  p.K = K;
-  p.group = group;
-  p.groups_per_row = groups_per_row;
-  p.packed = out.packed.data();
-  p.escale = out.escale.data();
-  p.codes.resize(static_cast<size_t>(group));
-  p.best_codes.resize(static_cast<size_t>(group));
-  ldlq_detail::Run(w, N, K, group, f, nthreads, p);
-
-  for (int64_t row = 0; row < N; ++row) {
-    const uint8_t* e = out.escale.data() + row * groups_per_row;
-    out.wref[static_cast<size_t>(row)] = *std::max_element(e, e + groups_per_row);
-  }
-  return out;
 }
 
 }  // namespace r4dx_convert

@@ -50,11 +50,9 @@ bool Check(const std::string& label, bool cond) {
   return cond;
 }
 
-LayoutSet Set(bool mxfp4, bool w4a16, bool w4a8, bool bf16) {
+LayoutSet Set(bool w4a16, bool bf16) {
   LayoutSet ls;
-  ls.mxfp4 = mxfp4;
   ls.w4a16 = w4a16;
-  ls.w4a8 = w4a8;
   ls.bf16 = bf16;
   return ls;
 }
@@ -188,9 +186,8 @@ int main() {
   {
     const int N = 64, K = 512;
     const LayoutSet sets[] = {
-        Set(false, false, false, true),  Set(false, true, false, false),
-        Set(false, false, true, false),  Set(true, false, false, false),
-        Set(true, true, true, true),     Set(false, true, false, true),
+        Set(false, true),  Set(true, false),
+        Set(true, true),   Set(false, false),
     };
     bool all_agree = true;
     for (const LayoutSet& ls : sets) {
@@ -204,14 +201,13 @@ int main() {
         all_agree = false;
       }
     }
-    Check("LinearLayoutBytes == ContainerWriter::PlannedDataBytes (6 sets)", all_agree);
-    std::printf("  w4a16 group=%d, w4a8 group=%d, mxfp4 group=%d\n", r4dx_convert::kW4A16Group,
-                r4dx_convert::kW4A8Group, r4dx_convert::kMxfp4Group);
+    Check("LinearLayoutBytes == ContainerWriter::PlannedDataBytes (4 sets)", all_agree);
+    std::printf("  w4a16 group=%d\n", r4dx_convert::kW4A16Group);
   }
   {
     // The delta a sensitivity run pays: bf16 instead of the requested quantized set.
     const int N = 64, K = 512;
-    const LayoutSet requested = Set(false, true, false, false);  // --layouts w4a16 --no-bf16
+    const LayoutSet requested = Set(true, false);  // --layouts w4a16 --no-bf16
     KeepBf16Selector sel("attn\\.o$");
     std::ostringstream log, warn;
     sel.Record("text.layers.3.attn.o", N, K, requested, log);
@@ -240,11 +236,11 @@ int main() {
 
     // Ask for everything, then let the selector override it -- the situation in a real run
     // (`--layouts w4a16 --lm-head 4bit --keep-bf16 ...`).
-    const LayoutSet requested = Set(true, true, true, false);
+    const LayoutSet requested = Set(true, false);
     KeepBf16Selector sel("^t$");
     const LayoutSet effective = sel.Matches("t") ? KeptBf16LayoutSet() : requested;
     Check("selector overrides the requested set",
-          effective.bf16 && !effective.w4a16 && !effective.w4a8 && !effective.mxfp4);
+          effective.bf16 && !effective.w4a16);
 
     const std::string path = TempPath("r4dx_test_keep_bf16.r4dx");
     {

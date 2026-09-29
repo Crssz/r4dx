@@ -138,7 +138,7 @@ struct ServerUsageError : std::runtime_error {
 
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
-         " --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16|trellis} "
+         " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
          "[--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "

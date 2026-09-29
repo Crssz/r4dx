@@ -14,7 +14,8 @@
 
 namespace trellis_rows {
 
-enum class Layout { kBf16, kMxfp4, kW4a16, kW4a8, kTrellis };
+// Values pinned to quant_linear.h's (the retired mxfp4 = 1 and w4a8 = 3 leave gaps).
+enum class Layout { kBf16 = 0, kW4a16 = 2, kTrellis = 4 };
 
 struct LinearTuning {
   int WV, SK, MB, NPW, NT;

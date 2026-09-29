@@ -29,7 +29,6 @@
 #include <string>
 #include <vector>
 
-#include "r4d.h"  // r4d_quant_act_i8: the int8_fraga8 epilogue's standalone twin
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
@@ -319,11 +318,12 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
               name + ": row " + std::to_string(r) + " launched alone differs from the batch");
       }
 
-      // Epilogues: bf16 out unchanged; bytes == the standalone quant of that bf16 out. The fp8 /
-      // int8 cases also exercise the one-workgroup-per-row launch shape against the per-block one.
+      // Epilogues: bf16 out unchanged; bytes == the standalone quant of that bf16 out. The fp8
+      // case also exercises the one-workgroup-per-row launch shape against the per-block one. (The
+      // int8 twin, libr4d's r4d_quant_act_i8, was cut with the w4a8 layout.)
       DeviceBuffer<uint16_t> base_d(base.size());
       base_d.CopyFromHost(base);
-      for (int epi : {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row, r4dx_epilogue_int8_fraga8}) {
+      for (int epi : {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row}) {
         const std::string en = name + " epilogue=" + std::to_string(epi);
         std::vector<uint8_t> bytes;
         std::vector<float> scale;
@@ -341,13 +341,8 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
         } else {
           DeviceBuffer<uint8_t> q_d(base.size());
           DeviceBuffer<float> sc_d(static_cast<size_t>(rows));
-          if (epi == r4dx_epilogue_fp8_e4m3_row) {
-            r4dx_quant_act_fp8e4m3_row(P(base_d.data()), P(q_d.data()), P(sc_d.data()),
-                                        static_cast<int>(rows), static_cast<int>(c.I), 0);
-          } else {
-            r4d_quant_act_i8(P(base_d.data()), P(q_d.data()), P(sc_d.data()), static_cast<int>(rows),
-                             static_cast<int>(c.I), 0);
-          }
+          r4dx_quant_act_fp8e4m3_row(P(base_d.data()), P(q_d.data()), P(sc_d.data()),
+                                      static_cast<int>(rows), static_cast<int>(c.I), 0);
           R4DX_HIP_CHECK(hipDeviceSynchronize());
           want = q_d.CopyToHost();
           want_scale = sc_d.CopyToHost();

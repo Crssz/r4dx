@@ -37,7 +37,7 @@ int main() {
 
   LayoutSet layouts;
   layouts.bf16 = true;
-  layouts.mxfp4 = layouts.w4a16 = layouts.w4a8 = false;
+  layouts.w4a16 = false;
 
   bool ok = true;
   const std::string tmp_path = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") +

@@ -140,9 +140,7 @@ static int RunTest() {
   constexpr double kLooseTol = 1e-1;  // measured ~7-8e-2 for the 4-quantized-GEMM chain; see file comment
   const LayoutCase cases[] = {
       {Layout::kBf16, kTightTol},
-      {Layout::kMxfp4, kLooseTol},
       {Layout::kW4a16, kLooseTol},
-      {Layout::kW4a8, kLooseTol},
   };
 
   bool all_ok = true;

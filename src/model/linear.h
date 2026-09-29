@@ -97,7 +97,7 @@ void SetTp2TuningForThisThread(bool enabled);
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
 // r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for
 // kW4a16 (the mxfp4/w4a8 layouts that used other epilogues are retired). Shared by
-// every ApplyLinear caller that wants to pre-fuse its producer's quant epilogue (docs/r9700.md
+// every ApplyLinear caller that wants to pre-fuse its producer's cast epilogue (docs/r9700.md
 // R2/P2) so both sides of the wiring agree on the mapping in exactly one place.
 // kTrellis is r4dx_epilogue_none (docs/trellis-kernel.md 5.3): its input transform is per LINEAR
 // (x * suh, then a Hadamard), which no producer epilogue value can name, so every layer runs its
@@ -105,12 +105,11 @@ void SetTp2TuningForThisThread(bool enabled);
 // PreQuantizedActivation with transform_id instead (below), never through this function.
 int EpilogueForLayout(Layout layout);
 
-// A producer's already-quantized activation (docs/r9700.md R2/P2's fused epilogue output,
-// kernels.h's r4dx_epilogue), ready to feed `w`'s GEMM directly. `epilogue` must equal
+// A producer's already-cast activation (docs/r9700.md R2/P2's fused epilogue output, kernels.h's
+// r4dx_epilogue), ready to feed `w`'s GEMM directly. `epilogue` must equal
 // EpilogueForLayout(w.layout) exactly -- ApplyLinear throws otherwise, rather than silently
 // reinterpreting bytes in the wrong format. `data` is [M,K] contiguous in the format `epilogue`
-// selects (f16 uint16_t, fp8e4m3 uint8_t, or int8 fragA8-permuted int8_t); `scale` is [M] fp32,
-// unused (may be nullptr) for r4dx_epilogue_f16.
+// selects (f16 uint16_t).
 //
 // Trellis (docs/trellis-kernel.md 5.3): an already input-transformed A (r4dx_trellis_input_bf16's
 // output for THIS linear) is passed with `transform_id` = w.trellis_suh.data() (the transform is
@@ -121,7 +120,6 @@ int EpilogueForLayout(Layout layout);
 struct PreQuantizedActivation {
   int epilogue = 0;  // r4dx_epilogue_none means "no pre-quantized input provided"
   const void* data = nullptr;
-  const float* scale = nullptr;
   const void* transform_id = nullptr;  // trellis only: the linear's trellis_suh.data()
   int64_t part_stride = 0;             // trellis only: elements between the parts in `data`
 };
@@ -142,8 +140,8 @@ struct PreQuantizedActivation {
 // r4dx::core::Stream converts implicitly (operator hipStream_t()), so every existing call site
 // that passes a core::Stream& is unaffected.
 // `pre`, when non-null and pre->epilogue != r4dx_epilogue_none, skips this call's own internal
-// quant/cast launch entirely and feeds `pre->data`/`pre->scale` (offset per <=64-row chunk exactly
-// like `x` is) straight to the GEMM -- see PreQuantizedActivation's doc above. `x` is still
+// quant/cast launch entirely and feeds `pre->data` (offset per <=64-row chunk exactly like `x` is)
+// straight to the GEMM -- see PreQuantizedActivation's doc above. `x` is still
 // required even when `pre` is given (kBf16 always reads it directly; a caller that only produced a
 // quantized epilogue for a NON-bf16 layout does not need to also keep the plain bf16 buffer alive
 // for THIS call, but ApplyLinear does not special-case that -- every existing caller already has

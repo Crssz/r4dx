@@ -871,14 +871,12 @@ class Model {
   // (overwritten) at every fusion boundary in stream order, never read after being superseded, so
   // one buffer suffices -- see RunChunk/DecodeStepGreedy/DecodeStepMtpGreedy's per-layer loops.
   core::DeviceBuffer<uint16_t> buf_normed_;
-  // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion, same persistent
+  // R2/P2 (docs/r9700.md): buf_normed_'s fused cast-epilogue companion, same persistent
   // (not-arena) reuse-in-stream-order lifetime as buf_normed_ itself -- whichever layer boundary
   // most recently wrote buf_normed_ also writes its epilogue here (when body_epilogue_ !=
   // r4dx_epilogue_none), for the very next Forward call to consume as its x_normed_pre. Sized for
-  // the widest epilogue format (f16, 2 bytes/element) at hidden width; a narrower format (fp8/int8,
-  // 1 byte/element) just uses the buffer's first half.
+  // the f16 epilogue format (2 bytes/element) at hidden width.
   core::DeviceBuffer<uint8_t> buf_normed_pre_;        // [max_chunk_, hidden] bytes (f16-sized)
-  core::DeviceBuffer<float> buf_normed_pre_scale_;    // [max_chunk_]
   // r4dx_epilogue (kernels.h) this Model's body layout wants every fused producer epilogue to
   // emit -- r4dx_epilogue_none for a bf16 body. Computed once in Load() from ModelOptions::layout;
   // every per-weight fusion site still independently verifies it against that specific weight's

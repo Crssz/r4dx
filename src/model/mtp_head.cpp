@@ -200,9 +200,8 @@ std::vector<int32_t> MtpHead::Draft(core::Stream& stream, core::Arena& arena,
                          positions_dev_.data() + step, seqused_dev_.data() + step, s,
                          /*x_normed_in=*/nullptr, /*next_norm_weight=*/nullptr,
                          /*x_normed_out=*/nullptr, /*prof=*/nullptr, /*x_normed_pre_epilogue=*/0,
-                         /*x_normed_pre_data=*/nullptr, /*x_normed_pre_scale=*/nullptr,
-                         /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr,
-                         /*next_epilogue_scale=*/nullptr,
+                         /*x_normed_pre_data=*/nullptr, /*next_epilogue=*/0,
+                         /*next_epilogue_out=*/nullptr,
                          mrope_active ? rope3_dev_.data() + 3 * step : nullptr);
 
     uint16_t* h_out = arena.Alloc<uint16_t>(static_cast<size_t>(hidden));
@@ -415,8 +414,7 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
                        prime_seqused_dev_.data(), s, /*x_normed_in=*/nullptr,
                        /*next_norm_weight=*/nullptr, /*x_normed_out=*/nullptr, /*prof=*/nullptr,
                        /*x_normed_pre_epilogue=*/0, /*x_normed_pre_data=*/nullptr,
-                       /*x_normed_pre_scale=*/nullptr, /*next_epilogue=*/0,
-                       /*next_epilogue_out=*/nullptr, /*next_epilogue_scale=*/nullptr,
+                       /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr,
                        rope3_host != nullptr ? prime_rope3_dev_.data() : nullptr);
 }
 

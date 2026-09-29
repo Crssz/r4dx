@@ -4,7 +4,7 @@
 //   r4dx_rotate_residual_bf16      x <- x Q and x <- x Q^T, rows 1 / 3 / 7, plus the round trip
 //   r4dx_hadamard_inplace_bf16     gdn.out_proj's input: K 6144 (TP=1) and 3072 (TP=2 rank), B 128
 //   r4dx_silu_mul_hadamard_bf16    mlp.down's input: intermediate 17408 (TP=1) and 8704 (TP=2
-//                                  rank), B 512, every epilogue
+//                                  rank), B 512, both epilogues (none, f16)
 //
 // and the properties the model relies on beyond the values themselves, all BIT-exact:
 //   - row independence: a row's output is identical whether it is launched alone or with others
@@ -12,7 +12,7 @@
 //   - TP slicing: a TP=2 rank running its own K-slice with its own sign slice reproduces exactly
 //     its slice of the full-K output (no Hadamard block straddles the rank boundary);
 //   - epilogues: silu_mul_hadamard's bf16 output does not change when an epilogue is requested,
-//     and each epilogue's bytes equal the standalone quant kernel run on that bf16 output (the
+//     and the f16 epilogue's bytes equal the standalone cast of that bf16 output (the
 //     r4dx_epilogue contract, kernels.h -- as tests/kernels/test_fused_quant.cpp does for silu_mul);
 //   - launch accounting: each call adds exactly one to r4dx_kernel_launch_counter_get();
 //   - precondition throws (hence /EHc- in CMakeLists.txt).
@@ -257,25 +257,20 @@ std::vector<double> SiluMulRow(const std::vector<uint16_t>& gate_up, int64_t row
   return out;
 }
 
-// Runs the kernel; returns the bf16 out and (for epilogue != none) the epilogue bytes / scales.
+// Runs the kernel; returns the bf16 out and (for epilogue != none) the epilogue bytes.
 std::vector<uint16_t> RunSiluHad(const DeviceBuffer<uint16_t>& gu_d, int64_t rows, int64_t I,
                                  int64_t stride, const float* signs_dev, int block, int epilogue,
-                                 std::vector<uint8_t>* epi_bytes, std::vector<float>* epi_scale) {
+                                 std::vector<uint8_t>* epi_bytes) {
   DeviceBuffer<uint16_t> out_d(static_cast<size_t>(rows * I));
-  const int elem = (epilogue == r4dx_epilogue_f16) ? 2 : 1;
+  const int elem = 2;  // f16, the only epilogue with an output
   DeviceBuffer<uint8_t> eo_d(epilogue != r4dx_epilogue_none ? static_cast<size_t>(rows * I * elem) : 0);
-  DeviceBuffer<float> es_d(epilogue != r4dx_epilogue_none ? static_cast<size_t>(rows) : 0);
   const int64_t before = r4dx_kernel_launch_counter_get();
   r4dx_silu_mul_hadamard_bf16(P(const_cast<uint16_t*>(gu_d.data())), P(out_d.data()), rows, I,
-                               stride, 0, epilogue, P(eo_d.data()), P(es_d.data()),
+                               stride, 0, epilogue, P(eo_d.data()),
                                P(const_cast<float*>(signs_dev)), block);
   R4DX_HIP_CHECK(hipDeviceSynchronize());
   Check(r4dx_kernel_launch_counter_get() - before == 1, "silu_mul_hadamard: launch count != 1");
   if (epi_bytes != nullptr && epilogue != r4dx_epilogue_none) *epi_bytes = eo_d.CopyToHost();
-  if (epi_scale != nullptr && epilogue != r4dx_epilogue_none &&
-      epilogue != r4dx_epilogue_f16) {
-    *epi_scale = es_d.CopyToHost();
-  }
   return out_d.CopyToHost();
 }
 
@@ -300,7 +295,7 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
       gu_d.CopyFromHost(gu);
 
       const std::vector<uint16_t> base =
-          RunSiluHad(gu_d, rows, c.I, stride, s_d.data(), kBlockDown, r4dx_epilogue_none, nullptr, nullptr);
+          RunSiluHad(gu_d, rows, c.I, stride, s_d.data(), kBlockDown, r4dx_epilogue_none, nullptr);
       for (int64_t r = 0; r < rows; ++r) {
         CheckRowAgainstRef(base, r, c.I,
                            rotation_ref::ApplyHb(SiluMulRow(gu, r, c.I, stride), s.data(), kBlockDown),
@@ -313,44 +308,25 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
         DeviceBuffer<uint16_t> one_d(one.size());
         one_d.CopyFromHost(one);
         const std::vector<uint16_t> o =
-            RunSiluHad(one_d, 1, c.I, stride, s_d.data(), kBlockDown, r4dx_epilogue_none, nullptr, nullptr);
+            RunSiluHad(one_d, 1, c.I, stride, s_d.data(), kBlockDown, r4dx_epilogue_none, nullptr);
         Check(std::memcmp(o.data(), &base[r * c.I], sizeof(uint16_t) * c.I) == 0,
               name + ": row " + std::to_string(r) + " launched alone differs from the batch");
       }
 
-      // Epilogues: bf16 out unchanged; bytes == the standalone quant of that bf16 out. The fp8
-      // case also exercises the one-workgroup-per-row launch shape against the per-block one. (The
-      // int8 twin, libr4d's r4d_quant_act_i8, was cut with the w4a8 layout.)
-      DeviceBuffer<uint16_t> base_d(base.size());
-      base_d.CopyFromHost(base);
-      for (int epi : {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row}) {
+      // Epilogue: bf16 out unchanged; bytes == the standalone f16 cast of that bf16 out. (The fp8 and
+      // int8 epilogues went with the mxfp4 and w4a8 layouts.)
+      for (int epi : {r4dx_epilogue_f16}) {
         const std::string en = name + " epilogue=" + std::to_string(epi);
         std::vector<uint8_t> bytes;
-        std::vector<float> scale;
         const std::vector<uint16_t> out =
-            RunSiluHad(gu_d, rows, c.I, stride, s_d.data(), kBlockDown, epi, &bytes, &scale);
+            RunSiluHad(gu_d, rows, c.I, stride, s_d.data(), kBlockDown, epi, &bytes);
         Check(out == base, en + ": bf16 output changed when an epilogue was requested");
-        std::vector<uint8_t> want;
-        std::vector<float> want_scale;
-        if (epi == r4dx_epilogue_f16) {
-          want.resize(base.size() * 2);
-          for (size_t i = 0; i < base.size(); ++i) {
-            const uint16_t h = FloatToF16(Bf16ToFloat(base[i]));
-            std::memcpy(&want[2 * i], &h, 2);
-          }
-        } else {
-          DeviceBuffer<uint8_t> q_d(base.size());
-          DeviceBuffer<float> sc_d(static_cast<size_t>(rows));
-          r4dx_quant_act_fp8e4m3_row(P(base_d.data()), P(q_d.data()), P(sc_d.data()),
-                                      static_cast<int>(rows), static_cast<int>(c.I), 0);
-          R4DX_HIP_CHECK(hipDeviceSynchronize());
-          want = q_d.CopyToHost();
-          want_scale = sc_d.CopyToHost();
+        std::vector<uint8_t> want(base.size() * 2);
+        for (size_t i = 0; i < base.size(); ++i) {
+          const uint16_t h = FloatToF16(Bf16ToFloat(base[i]));
+          std::memcpy(&want[2 * i], &h, 2);
         }
-        Check(bytes == want, en + ": epilogue bytes differ from the standalone quant of the bf16 out");
-        if (epi != r4dx_epilogue_f16) {
-          Check(scale == want_scale, en + ": epilogue scales differ from the standalone quant");
-        }
+        Check(bytes == want, en + ": epilogue bytes differ from the standalone cast of the bf16 out");
       }
 
       // TP=2 slicing: rank 1 holds gate[I/2:] | up[I/2:] per row and the sign slice [I/2, I).
@@ -364,7 +340,7 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
         DeviceBuffer<uint16_t> gr_d(gr.size());
         gr_d.CopyFromHost(gr);
         const std::vector<uint16_t> part = RunSiluHad(gr_d, rows, half, 2 * half, s_d.data() + half,
-                                                      kBlockDown, r4dx_epilogue_none, nullptr, nullptr);
+                                                      kBlockDown, r4dx_epilogue_none, nullptr);
         bool same = true;
         for (int64_t r = 0; r < rows && same; ++r) {
           same = std::memcmp(&part[r * half], &base[r * c.I + half], sizeof(uint16_t) * half) == 0;
@@ -376,13 +352,13 @@ void TestSiluMulHadamard(std::mt19937_64& rng) {
 
   DeviceBuffer<float> s_d(17408);
   Check(Throws([&] {
-          r4dx_silu_mul_hadamard_bf16(1, 1, 1, 17408, 2 * 17408, 0, r4dx_epilogue_none, 0, 0,
+          r4dx_silu_mul_hadamard_bf16(1, 1, 1, 17408, 2 * 17408, 0, r4dx_epilogue_none, 0,
                                        P(s_d.data()), 384);
         }),
         "silu_mul_hadamard: non-power-of-two block must throw");
   Check(Throws([&] {
           r4dx_silu_mul_hadamard_bf16(1, 1, 1, 17408 + 256, 2 * (17408 + 256), 0,
-                                       r4dx_epilogue_none, 0, 0, P(s_d.data()), 512);
+                                       r4dx_epilogue_none, 0, P(s_d.data()), 512);
         }),
         "silu_mul_hadamard: intermediate % block != 0 must throw");
 }

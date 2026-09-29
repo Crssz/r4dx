@@ -1582,7 +1582,7 @@ class Bench {
           {"transform_count", all.size()}};
       const double sh = med([&] {
         for (int i = 0; i < n_mlp; ++i)
-          r4dx_silu_mul_hadamard_bf16(P(silu_in_), P(silu_out_), M, 17408, 34816, P(st_), r4dx_epilogue_none, 0, 0,
+          r4dx_silu_mul_hadamard_bf16(P(silu_in_), P(silu_out_), M, 17408, 34816, P(st_), r4dx_epilogue_none, 0,
                                       P(silu_signs_), 512);
       });
       const double sp = med([&] {

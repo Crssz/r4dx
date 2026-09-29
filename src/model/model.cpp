@@ -324,20 +324,15 @@ Model Model::Load(const ModelOptions& opts) {
   m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
   m.buf_b_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
   m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
-  // R2/P2 (docs/r9700.md): buf_normed_'s fused quant-epilogue companion (model.h's doc comment) --
-  // 2 bytes/element covers the widest epilogue format (f16); fp8/int8 use the same allocation's
-  // first half.
+  // R2/P2 (docs/r9700.md): buf_normed_'s fused cast-epilogue companion (model.h's doc comment) --
+  // 2 bytes/element (f16).
   m.buf_normed_pre_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(buf_rows * hidden * 2));
-  m.buf_normed_pre_scale_ = core::DeviceBuffer<float>(static_cast<size_t>(buf_rows));
   // R2/P2 (docs/r9700.md): the original correctness issue (an `r4dx::core::Arena::Alloc` gap that
   // never rounded an allocation's END up to a 16-byte boundary, silently misaligning every
-  // default-aligned buffer allocated right after a fused epilogue's scale scratch) was root-caused
-  // and fixed in `arena.hpp` (docs/status.md's "R2/P2 fused activation-quant epilogues:
-  // root-caused and enabled for w4a8/mxfp4" section). EpilogueForLayout (linear.cpp) now returns
-  // `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4 (verified byte-identical
-  // end to end against the fusion-disabled baseline, `tools/validate_fusion.ps1`) and still
-  // `r4dx_epilogue_none` for w4a16/bf16 (w4a16's own separate, understood wall-clock regression --
-  // see linear.cpp's own doc comment -- and bf16 never quantizes its activation input at all).
+  // default-aligned buffer allocated right after a fused epilogue's scratch) was root-caused and
+  // fixed in `arena.hpp`. EpilogueForLayout (linear.cpp) returns `r4dx_epilogue_none` for every
+  // layout (w4a16's f16 epilogue has its own separate, understood wall-clock regression -- see
+  // linear.cpp's own doc comment -- and bf16 never quantizes its activation input at all).
   m.body_epilogue_ = EpilogueForLayout(opts.layout);
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
@@ -937,8 +932,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       p.seq_slice = wide ? max_chunk_ : 0;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
-                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
-                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data());
     } else {
       attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
@@ -958,8 +953,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3,
+                    buf_normed_pre_.data(), body_epilogue_, buf_normed_pre_.data(), rope_pos3,
                     /*prefill_split_kv=*/is_prefill_path,
                     /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, attn_seqused_k_.data());
       std::swap(cur, other);
@@ -973,18 +967,17 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // R3 fusion: x_normed_in is always buf_normed_ (this layer's Gdn/Attn just fused its own
     // rmsnorm epilogue into it above); next_norm_weight is null for the last layer (Mlp falls
     // back to a plain residual add, and FinalLmHead below applies its own final_norm separately).
-    // R2/P2: normed_in_epilogue/buf_normed_pre_* is that SAME fused output's quant epilogue
+    // R2/P2: normed_in_epilogue/buf_normed_pre_ is that SAME fused output's cast epilogue
     // companion (always body_epilogue_ by this point, since the Gdn/Attn call above always
-    // requests it); next_epilogue/buf_normed_pre_* (output side) requests this Mlp's own
-    // residual+rmsnorm epilogue ALSO emit x_normed_out's fused quant epilogue, for layer i+1's
+    // requests it); next_epilogue/buf_normed_pre_ (output side) requests this Mlp's own
+    // residual+rmsnorm epilogue ALSO emit x_normed_out's fused cast epilogue, for layer i+1's
     // Gdn/Attn sub-block to consume, unless this is the last layer.
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
-                normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                normed_in_epilogue, buf_normed_pre_.data(),
                 has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
-                has_next_layer ? buf_normed_pre_.data() : nullptr,
-                has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
+                has_next_layer ? buf_normed_pre_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
     if (probe_ != nullptr) probe_->AfterMlp(stream_.get());
@@ -1686,8 +1679,8 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                     cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
-                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
-                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data());
     } else {
       attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
@@ -1706,8 +1699,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)], 1,
                     static_cast<int>(pos_), attn_positions_.data(), attn_seqused_k_.data(), s,
                     normed_in, mlp_norm_weight, buf_normed_.data(), &acc, normed_in_epilogue,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
+                    buf_normed_pre_.data(), body_epilogue_, buf_normed_pre_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -1716,10 +1708,9 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
                   has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                   has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
-                  buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                  buf_normed_pre_.data(),
                   has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
-                  has_next_layer ? buf_normed_pre_.data() : nullptr,
-                  has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
+                  has_next_layer ? buf_normed_pre_.data() : nullptr);
     }
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
@@ -1855,8 +1846,8 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         p.seq_slice = wide ? max_chunk_ : 0;
         layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                       cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
-                      normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
-                      body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                      normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                      buf_normed_pre_.data());
       } else {
         attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
@@ -1875,9 +1866,8 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
                       static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                       attn_seqused_k_.data(), s, normed_in, mlp_norm_weight, buf_normed_.data(),
-                      &acc, normed_in_epilogue, buf_normed_pre_.data(),
-                      buf_normed_pre_scale_.data(), body_epilogue_, buf_normed_pre_.data(),
-                      buf_normed_pre_scale_.data(), rope_pos3, /*prefill_split_kv=*/true,
+                      &acc, normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                      buf_normed_pre_.data(), rope_pos3, /*prefill_split_kv=*/true,
                       /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, attn_seqused_k_.data());
         std::swap(cur, other);
       }
@@ -1895,10 +1885,9 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                     has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                     has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                    buf_normed_pre_.data(),
                     has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
-                    has_next_layer ? buf_normed_pre_.data() : nullptr,
-                    has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
+                    has_next_layer ? buf_normed_pre_.data() : nullptr);
       }
       normed_in = has_next_layer ? buf_normed_.data() : nullptr;
       normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
@@ -2041,8 +2030,8 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
-                    normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
-                    body_epilogue_, buf_normed_pre_.data(), buf_normed_pre_scale_.data());
+                    normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data());
     } else {
       attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
 
@@ -2069,8 +2058,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                     static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
                     attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
                     buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), body_epilogue_,
-                    buf_normed_pre_.data(), buf_normed_pre_scale_.data(), rope_pos3);
+                    buf_normed_pre_.data(), body_epilogue_, buf_normed_pre_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -2078,10 +2066,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
                 has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
-                normed_in_epilogue, buf_normed_pre_.data(), buf_normed_pre_scale_.data(),
+                normed_in_epilogue, buf_normed_pre_.data(),
                 has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
-                has_next_layer ? buf_normed_pre_.data() : nullptr,
-                has_next_layer ? buf_normed_pre_scale_.data() : nullptr);
+                has_next_layer ? buf_normed_pre_.data() : nullptr);
     normed_in = has_next_layer ? buf_normed_.data() : nullptr;
     normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
     if (probe_ != nullptr) probe_->AfterMlp(stream_.get());

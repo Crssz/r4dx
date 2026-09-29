@@ -3,7 +3,6 @@ set(R4DX_KERNEL_TESTS
   test_residual_add
   test_silu_mul
   test_rope
-  test_quant_act_fp8
   test_kv_write
   test_sampler
   test_attn_decode

@@ -306,8 +306,10 @@ LinearTuning PickTuning(Layout layout, int64_t N, int64_t K, int64_t M, int vari
 
 int EpilogueForLayout(Layout layout) {
   // Every remaining layout takes r4dx_epilogue_none. History: the fused int8_fraga8 (w4a8) and
-  // fp8_e4m3_row (mxfp4) epilogues were the only non-none mappings; both layouts are retired, and the
-  // epilogue machinery itself (kernels.h's r4dx_epilogue) is kept only until its own removal commit.
+  // fp8_e4m3_row (mxfp4) epilogues were the only non-none mappings; both layouts are retired, and so
+  // are the two epilogue values and their per-row scale plumbing. What is left of kernels.h's
+  // r4dx_epilogue is none and f16 (the w4a16 GEMM's f16 activation), and the layers' pre-cast
+  // plumbing for it, which no layout selects today.
   //
   // The ROOT CAUSE note that used to sit here still holds for the arena: `r4dx::core::Arena::Alloc`
   // rounds each allocation's END up to 16 bytes (arena.hpp), because every third_party/libr4d kernel
@@ -588,7 +590,7 @@ bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* 
     uint16_t* a = arena.Alloc<uint16_t>(static_cast<size_t>(M * K), /*align_bytes=*/16);
     suh[i] = reinterpret_cast<int64_t>(ws[i]->trellis_suh.data());
     out[i] = reinterpret_cast<int64_t>(a);
-    pre[i] = PreQuantizedActivation{r4dx_epilogue_none, a, nullptr, ws[i]->trellis_suh.data(), 0};
+    pre[i] = PreQuantizedActivation{r4dx_epilogue_none, a, ws[i]->trellis_suh.data(), 0};
   }
   r4dx_trellis_input_bf16(reinterpret_cast<int64_t>(x), M, K, n, suh, out,
                           ws[0]->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));

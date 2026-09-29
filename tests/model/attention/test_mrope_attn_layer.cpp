@@ -259,8 +259,7 @@ int Run() {
                   static_cast<int>(st.lo), pos_d.data(), seq_d.data(), nullptr,
                   /*x_normed_in=*/nullptr, /*next_norm_weight=*/nullptr, /*x_normed_out=*/nullptr,
                   /*prof=*/nullptr, /*x_normed_pre_epilogue=*/0, /*x_normed_pre_data=*/nullptr,
-                  /*x_normed_pre_scale=*/nullptr, /*next_epilogue=*/0,
-                  /*next_epilogue_out=*/nullptr, /*next_epilogue_scale=*/nullptr, rope_d.data());
+                  /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr, rope_d.data());
     R4DX_HIP_CHECK(hipDeviceSynchronize());
     arena.Reset();
 

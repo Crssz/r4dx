@@ -145,11 +145,11 @@ class AttentionLayer {
   // --profile -- see profile_span.h's file comment for the naming convention ("gemm:" prefix) and
   // the zero-overhead guarantee when nullptr (every real decode/prefill call site).
   // R2/P2 (docs/r9700.md), appended after `prof`, mirrors GdnLayer::Forward's identical trailing
-  // params: `x_normed_pre_epilogue`/`_data`/`_scale` reuse a fused quant epilogue the producer of
-  // `x_normed_in` already computed (skipping this call's own qg/k/v quant launches when the format
+  // params: `x_normed_pre_epilogue`/`_data` reuse a fused cast epilogue the producer of
+  // `x_normed_in` already computed (skipping this call's own qg/k/v cast launches when the format
   // matches, checked per-weight -- see k_shares_pre/v_shares_pre below); `next_epilogue`/
-  // `next_epilogue_out`/`next_epilogue_scale` request this call's own residual+rmsnorm epilogue
-  // also emit x_normed_out's fused quant epilogue for the immediately-following Mlp.
+  // `next_epilogue_out` request this call's own residual+rmsnorm epilogue also emit x_normed_out's
+  // fused cast epilogue for the immediately-following Mlp.
   //
   // `rope_pos3` (vision milestone, docs/vision.md "Text-side splicing"): device int32[3, T]
   // (contiguous, t row then h then w) giving this chunk's 3-axis mrope ROPE positions, which a
@@ -169,9 +169,8 @@ class AttentionLayer {
                const int32_t* seqused_k, hipStream_t stream, const uint16_t* x_normed_in = nullptr,
                const uint16_t* next_norm_weight = nullptr, uint16_t* x_normed_out = nullptr,
                SpanAccumulator* prof = nullptr, int x_normed_pre_epilogue = 0,
-               const void* x_normed_pre_data = nullptr, const float* x_normed_pre_scale = nullptr,
-               int next_epilogue = 0, void* next_epilogue_out = nullptr,
-               float* next_epilogue_scale = nullptr, const int32_t* rope_pos3 = nullptr,
+               const void* x_normed_pre_data = nullptr, int next_epilogue = 0,
+               void* next_epilogue_out = nullptr, const int32_t* rope_pos3 = nullptr,
                bool prefill_split_kv = false, int attn_slice = 0,
                const int32_t* seqused_k_slices = nullptr) {
     // `attn_slice` (256-row prefill chunk, Model's R4DX_PREFILL_CHUNK=256, docs/trellis-m256.md): 0 --
@@ -206,7 +205,7 @@ class AttentionLayer {
     // ---- input rmsnorm ------------------------------------------------------------------------
     // R3 (docs/r9700.md): skip this launch when the previous layer's Mlp already fused it.
     // R2/P2: when THIS call computes its own rmsnorm (x_normed_in==nullptr), it can fuse w.qg's
-    // quant epilogue into the same launch (self-contained, like GdnLayer/Mlp's identical comment)
+    // cast epilogue into the same launch (self-contained, like GdnLayer/Mlp's identical comment)
     // -- and since `normed` also feeds w.k/w.v below at the SAME K=hidden, the one fused buffer is
     // reused for all three GEMMs whenever they agree on layout (checked per-weight below, not
     // assumed, since Container::LoadQuantLinearWithFallback can fall an individual tensor back to
@@ -215,49 +214,39 @@ class AttentionLayer {
     uint16_t* normed_scratch = nullptr;
     int qg_epilogue = x_normed_pre_epilogue;
     const void* qg_pre_data = x_normed_pre_data;
-    const float* qg_pre_scale = x_normed_pre_scale;
     // Cross-boundary reuse only valid if it matches THIS layer's own w.qg layout -- see
     // gdn_layer.cpp's identical defensive comment.
     if (normed != nullptr && qg_epilogue != EpilogueForLayout(w.qg->layout)) {
       qg_epilogue = r4dx_epilogue_none;
       qg_pre_data = nullptr;
-      qg_pre_scale = nullptr;
     }
     if (normed == nullptr) {
       qg_epilogue = EpilogueForLayout(w.qg->layout);
       normed_scratch = arena.Alloc<uint16_t>(static_cast<size_t>(T) * hidden);
       uint8_t* qg_pre_data_local = nullptr;
-      float* qg_pre_scale_local = nullptr;
       if (qg_epilogue != r4dx_epilogue_none) {
-        const int elem_size = (qg_epilogue == r4dx_epilogue_f16) ? 2 : 1;
-        // 16-byte alignment (not uint8_t's default 1): the w4a8 GEMM's A-operand read is a
-        // global_load_b64 fragment read (r4d_quant_act_i8.hip's own file comment) -- the ORIGINAL
-        // i8_scratch (linear.cpp) happens to land 8-aligned because it is allocated immediately
-        // after arena.Reset(), but an epilogue buffer allocated later in a layer's own scratch
-        // sequence (after GdnLayer/AttentionLayer/Mlp's other T/H/K/V-shaped allocations, several
-        // of which are not multiples of 8 bytes) is not guaranteed to be -- an unaligned wide GPU
-        // load silently reads garbage rather than faulting. Found by a real generated-text
-        // divergence (docs/status.md's R2/P2 section), not by any tolerance-based golden test.
+        // f16: 2 bytes per element. 16-byte alignment (not uint8_t's default 1): a GEMM's
+        // A-operand read is a global_load_b64 fragment read -- an epilogue buffer allocated later
+        // in a layer's own scratch sequence (after GdnLayer/AttentionLayer/Mlp's other
+        // T/H/K/V-shaped allocations, several of which are not multiples of 8 bytes) is not
+        // guaranteed to be 8-aligned, and an unaligned wide GPU load silently reads garbage rather
+        // than faulting. Found by a real generated-text divergence (docs/status.md's R2/P2
+        // section), not by any tolerance-based golden test.
         qg_pre_data_local =
-            arena.Alloc<uint8_t>(static_cast<size_t>(T) * hidden * elem_size, /*align_bytes=*/16);
-        if (qg_epilogue != r4dx_epilogue_f16) {
-          qg_pre_scale_local = arena.Alloc<float>(static_cast<size_t>(T));
-        }
+            arena.Alloc<uint8_t>(static_cast<size_t>(T) * hidden * 2, /*align_bytes=*/16);
       }
       ProfiledCall(prof, stream, "attn.rmsnorm", [&] {
         r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(hidden_in),
                            reinterpret_cast<int64_t>(w.input_layernorm),
                            reinterpret_cast<int64_t>(normed_scratch), T, hidden, cfg_.rms_eps,
                            reinterpret_cast<int64_t>(stream), qg_epilogue,
-                           reinterpret_cast<int64_t>(qg_pre_data_local),
-                           reinterpret_cast<int64_t>(qg_pre_scale_local));
+                           reinterpret_cast<int64_t>(qg_pre_data_local));
       });
       normed = normed_scratch;
       qg_pre_data = qg_pre_data_local;
-      qg_pre_scale = qg_pre_scale_local;
     }
     const bool have_qg_pre = qg_epilogue != r4dx_epilogue_none;
-    PreQuantizedActivation normed_pre{qg_epilogue, qg_pre_data, qg_pre_scale};
+    PreQuantizedActivation normed_pre{qg_epilogue, qg_pre_data};
 
     // ---- fused q_proj + output gate, then split per-head-interleaved --------------------------
     // Dispatched through the shared r4dx::model::ApplyLinear (decode-perf pass, 2026-09-19) --
@@ -454,7 +443,7 @@ class AttentionLayer {
                                         reinterpret_cast<int64_t>(a_o), w.o->trellis_prescale_log2,
                                         reinterpret_cast<int64_t>(stream));
       });
-      o_pre = PreQuantizedActivation{r4dx_epilogue_none, a_o, nullptr, w.o->trellis_suh.data(), 0};
+      o_pre = PreQuantizedActivation{r4dx_epilogue_none, a_o, w.o->trellis_suh.data(), 0};
     } else if (w.o_had_signs != nullptr) {
       // quant2 Q2b (docs/quant2.md section 4): gated = (attn_out * sigmoid(gate)) Hb, one launch,
       // block = D (one head); o_proj's K order is head * D + d, the row layout of [T, H, D].
@@ -498,8 +487,7 @@ class AttentionLayer {
                                     reinterpret_cast<int64_t>(out),
                                     reinterpret_cast<int64_t>(x_normed_out), T, hidden, cfg_.rms_eps,
                                     reinterpret_cast<int64_t>(stream), next_epilogue,
-                                    reinterpret_cast<int64_t>(next_epilogue_out),
-                                    reinterpret_cast<int64_t>(next_epilogue_scale));
+                                    reinterpret_cast<int64_t>(next_epilogue_out));
       } else {
         r4dx_residual_add_bf16(reinterpret_cast<int64_t>(hidden_in), reinterpret_cast<int64_t>(o_out),
                                 reinterpret_cast<int64_t>(out), static_cast<int64_t>(T) * hidden,

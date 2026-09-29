@@ -2,22 +2,21 @@
 // call site was wired to use the fused epilogues (task step 2, "the byte-diff harness comes FIRST,
 // before any wiring").
 //
-// For each producer (r4dx_rmsnorm_bf16, r4dx_residual_rmsnorm_bf16, r4dx_silu_mul_bf16) x each
-// epilogue (r4dx_epilogue_f16 / _fp8_e4m3_row; _int8_fraga8 is checked only for being accepted --
-// its standalone twin, libr4d's r4d_quant_act_i8, was cut with the w4a8 layout) x M in {1,2,4,16,64} x K in
+// For each producer (r4dx_rmsnorm_bf16, r4dx_residual_rmsnorm_bf16, r4dx_silu_mul_bf16) x the
+// epilogue r4dx_epilogue_f16 (the fp8 and int8 epilogues went with the mxfp4 and w4a8 layouts and
+// are now refused as unknown values, checked below) x M in {1,2,4,16,64} x K in
 // {5120,6144,17408} (the task's own grid, and this model's three real hidden/intermediate sizes):
 // runs the producer TWICE on the SAME seeded random bf16 input --
-//   "old" path:   producer(epilogue=none) -> the existing STANDALONE quant kernel
-//                 (r4dx_model_cast_bf16_to_f16 / r4dx_quant_act_fp8e4m3_row) applied to that
-//                 producer's bf16 output.
+//   "old" path:   producer(epilogue=none) -> the existing STANDALONE cast kernel
+//                 (r4dx_model_cast_bf16_to_f16) applied to that producer's bf16 output.
 //   "fused" path: producer(epilogue=X) -- the new in-kernel epilogue.
-// and asserts the two paths' bytes (and, for fp8/int8, their per-row scales) are BYTE-IDENTICAL,
-// plus that the producer's own plain bf16 output is unaffected by requesting an epilogue. Per the
-// task's explicit instruction, any difference is a hard failure -- this test never loosens to a
-// tolerance for the quantized outputs (the plain bf16 output already has its own tolerance-checked
-// coverage in test_rmsnorm.cpp/test_kernel_bandwidth.cpp; this test only compares old-vs-fused,
-// which is exact-integer-byte comparable by construction since both paths run the identical
-// reduction+quantize algorithm on bit-identical bf16 inputs -- see kernels.h's r4dx_epilogue doc).
+// and asserts the two paths' bytes are BYTE-IDENTICAL, plus that the producer's own plain bf16
+// output is unaffected by requesting an epilogue. Per the task's explicit instruction, any
+// difference is a hard failure -- this test never loosens to a tolerance for the cast outputs (the
+// plain bf16 output already has its own tolerance-checked coverage in
+// test_rmsnorm.cpp/test_kernel_bandwidth.cpp; this test only compares old-vs-fused, which is
+// exact-integer-byte comparable by construction since both paths run the identical algorithm on
+// bit-identical bf16 inputs -- see kernels.h's r4dx_epilogue doc).
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
@@ -62,56 +61,40 @@ std::vector<uint16_t> RandomBf16(std::mt19937& rng, size_t n, float lo, float hi
   return v;
 }
 
-// Runs the existing STANDALONE quant kernel/entry point on a device bf16 buffer, matching exactly
+// Runs the existing STANDALONE cast kernel/entry point on a device bf16 buffer, matching exactly
 // what a pre-R2/P2 ApplyLinear call site would have launched.
-void OldQuantF16(const DeviceBuffer<uint16_t>& in, int64_t n, DeviceBuffer<uint16_t>* out) {
+void OldCastF16(const DeviceBuffer<uint16_t>& in, int64_t n, DeviceBuffer<uint16_t>* out) {
   r4dx_model_cast_bf16_to_f16(reinterpret_cast<int64_t>(in.data()),
                                reinterpret_cast<int64_t>(out->data()), n, 0);
 }
-void OldQuantFp8(const DeviceBuffer<uint16_t>& in, int M, int K, DeviceBuffer<uint8_t>* out,
-                  DeviceBuffer<float>* scale) {
-  r4dx_quant_act_fp8e4m3_row(reinterpret_cast<int64_t>(in.data()),
-                              reinterpret_cast<int64_t>(out->data()),
-                              reinterpret_cast<int64_t>(scale->data()), M, K, 0);
-}
 
 // Compares one (producer, epilogue) combination at a given (M,K). `RunProducer` runs the producer
-// under test with the given epilogue mode and epilogue output buffers (nullptr epilogue buffers
-// when epilogue==none); it must also return the producer's own plain bf16 output for the
+// under test with the given epilogue mode and epilogue output buffer (nullptr epilogue buffer when
+// epilogue==none); it must also return the producer's own plain bf16 output for the
 // bf16-unaffected-by-epilogue check.
 template <typename ProducerFn>
 void CheckOne(const std::string& label, int epilogue, int M, int K, ProducerFn run_producer) {
   // Baseline: epilogue=none.
-  std::vector<uint16_t> base_bf16 = run_producer(r4dx_epilogue_none, nullptr, nullptr);
+  std::vector<uint16_t> base_bf16 = run_producer(r4dx_epilogue_none, nullptr);
 
-  // "Old" path: apply the existing standalone quant kernel to the baseline bf16 output.
+  // "Old" path: apply the existing standalone cast kernel to the baseline bf16 output.
   DeviceBuffer<uint16_t> base_d(base_bf16.size());
   base_d.CopyFromHost(base_bf16);
 
   std::vector<uint8_t> old_bytes;
-  std::vector<float> old_scale;
   if (epilogue == r4dx_epilogue_f16) {
     DeviceBuffer<uint16_t> out_d(base_bf16.size());
-    OldQuantF16(base_d, static_cast<int64_t>(M) * K, &out_d);
+    OldCastF16(base_d, static_cast<int64_t>(M) * K, &out_d);
     R4DX_HIP_CHECK(hipDeviceSynchronize());
     std::vector<uint16_t> h = out_d.CopyToHost();
     old_bytes.resize(h.size() * 2);
     std::memcpy(old_bytes.data(), h.data(), old_bytes.size());
-  } else if (epilogue == r4dx_epilogue_fp8_e4m3_row) {
-    DeviceBuffer<uint8_t> out_d(static_cast<size_t>(M) * K);
-    DeviceBuffer<float> scale_d(static_cast<size_t>(M));
-    OldQuantFp8(base_d, M, K, &out_d, &scale_d);
-    R4DX_HIP_CHECK(hipDeviceSynchronize());
-    old_bytes = out_d.CopyToHost();
-    old_scale = scale_d.CopyToHost();
   }
 
   // "Fused" path: producer's own epilogue.
-  int elem_size = (epilogue == r4dx_epilogue_f16) ? 2 : 1;
+  const int elem_size = 2;  // f16
   DeviceBuffer<uint8_t> fused_out_d(static_cast<size_t>(M) * K * elem_size);
-  DeviceBuffer<float> fused_scale_d(static_cast<size_t>(M));
-  std::vector<uint16_t> fused_bf16 =
-      run_producer(epilogue, fused_out_d.data(), fused_scale_d.data());
+  std::vector<uint16_t> fused_bf16 = run_producer(epilogue, fused_out_d.data());
   R4DX_HIP_CHECK(hipDeviceSynchronize());
 
   // The plain bf16 output must be bit-identical whether or not an epilogue was requested.
@@ -119,22 +102,6 @@ void CheckOne(const std::string& label, int epilogue, int M, int K, ProducerFn r
 
   std::vector<uint8_t> fused_bytes = fused_out_d.CopyToHost();
   Check(fused_bytes == old_bytes, label + ": epilogue bytes differ from old (standalone-kernel) path");
-
-  if (epilogue != r4dx_epilogue_f16) {
-    std::vector<float> fused_scale = fused_scale_d.CopyToHost();
-    bool scale_ok = (fused_scale.size() == old_scale.size());
-    if (scale_ok) {
-      for (size_t i = 0; i < fused_scale.size(); ++i) {
-        // Exact float compare: both paths compute scale = fmaxf(absmax,1e-8f)/divisor from the
-        // SAME bf16 row via the SAME reduction -- must be bit-identical, not merely close.
-        if (std::memcmp(&fused_scale[i], &old_scale[i], sizeof(float)) != 0) {
-          scale_ok = false;
-          break;
-        }
-      }
-    }
-    Check(scale_ok, label + ": epilogue scale differs from old (standalone-kernel) path");
-  }
 
   if (g_failures == 0) {
     std::printf("  ok: %s (M=%d,K=%d)\n", label.c_str(), M, K);
@@ -193,9 +160,10 @@ void CheckArenaAlignmentInvariant() {
 
 // docs/trellis-kernel.md 5.3: an epilogue value the kernels do not know must throw at the host
 // entry (rmsnorm, residual_rmsnorm, silu_mul, silu_mul_hadamard), never reach ApplyEpilogueRow --
-// which writes nothing for it and would leave the caller's pre-quantized buffer uninitialized.
-// Checked before any launch, so the (valid) buffers are never touched. Needs /EHc-
-// (tests/kernels/CMakeLists.txt): the entries are extern "C".
+// which writes nothing for it and would leave the caller's pre-cast buffer uninitialized. The
+// retired fp8 (2) and int8 (3) values are among the refused ones. Checked before any launch, so the
+// (valid) buffers are never touched. Needs /EHc- (tests/kernels/CMakeLists.txt): the entries are
+// extern "C".
 template <typename Fn>
 bool Throws(Fn fn) {
   try {
@@ -209,35 +177,31 @@ bool Throws(Fn fn) {
 void CheckUnknownEpilogueThrows() {
   constexpr int64_t K = 256;
   DeviceBuffer<uint16_t> a(2 * K), b(2 * K), w(K), o1(2 * K), o2(2 * K), eo(2 * K);
-  DeviceBuffer<float> es(2), signs(K);
+  DeviceBuffer<float> signs(K);
   const auto p = [](const auto& buf) { return reinterpret_cast<int64_t>(buf.data()); };
-  for (int bad : {-1, 4, 7, 1000}) {
+  for (int bad : {-1, 2, 3, 4, 7, 1000}) {
     const std::string tag = " rejects epilogue " + std::to_string(bad);
     Check(Throws([&] {
-            r4dx_rmsnorm_bf16(p(a), p(w), p(o1), 1, K, 1e-6f, 0, bad, p(eo), p(es));
+            r4dx_rmsnorm_bf16(p(a), p(w), p(o1), 1, K, 1e-6f, 0, bad, p(eo));
           }),
           "rmsnorm" + tag);
     Check(Throws([&] {
-            r4dx_residual_rmsnorm_bf16(p(a), p(b), p(w), p(o1), p(o2), 1, K, 1e-6f, 0, bad, p(eo),
-                                       p(es));
+            r4dx_residual_rmsnorm_bf16(p(a), p(b), p(w), p(o1), p(o2), 1, K, 1e-6f, 0, bad, p(eo));
           }),
           "residual_rmsnorm" + tag);
     Check(Throws([&] {
-            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo), p(es));
+            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo));
           }),
           "silu_mul" + tag);
     Check(Throws([&] {
-            r4dx_silu_mul_hadamard_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo), p(es), p(signs),
-                                        128);
+            r4dx_silu_mul_hadamard_bf16(p(a), p(o1), 1, K, 2 * K, 0, bad, p(eo), p(signs), 128);
           }),
           "silu_mul_hadamard" + tag);
   }
-  // The four values the kernels know still pass the check (one row; the byte checks are below).
-  for (int good : {static_cast<int>(r4dx_epilogue_none), static_cast<int>(r4dx_epilogue_f16),
-                   static_cast<int>(r4dx_epilogue_fp8_e4m3_row),
-                   static_cast<int>(r4dx_epilogue_int8_fraga8)}) {
+  // The two values the kernels know still pass the check (one row; the byte checks are below).
+  for (int good : {static_cast<int>(r4dx_epilogue_none), static_cast<int>(r4dx_epilogue_f16)}) {
     Check(!Throws([&] {
-            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, good, p(eo), p(es));
+            r4dx_silu_mul_bf16(p(a), p(o1), 1, K, 2 * K, 0, good, p(eo));
           }),
           "silu_mul accepts epilogue " + std::to_string(good));
   }
@@ -257,8 +221,8 @@ int main() {
 
   const int Ms[] = {1, 2, 4, 16, 64};
   const int64_t Ks[] = {5120, 6144, 17408};
-  const int epilogues[] = {r4dx_epilogue_f16, r4dx_epilogue_fp8_e4m3_row};
-  const char* epilogue_names[] = {"", "f16", "fp8_e4m3_row", "int8_fraga8"};
+  const int epilogues[] = {r4dx_epilogue_f16};
+  const char* epilogue_names[] = {"", "f16"};
 
   for (int M : Ms) {
     for (int64_t K : Ks) {
@@ -275,20 +239,19 @@ int main() {
 
         // ---- rmsnorm ----
         CheckOne(std::string("rmsnorm/") + en, epilogue, M, static_cast<int>(K),
-                 [&](int ep, void* eo, float* es) {
+                 [&](int ep, void* eo) {
                    DeviceBuffer<uint16_t> out_d(x_h.size());
                    r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(x_d.data()),
                                       reinterpret_cast<int64_t>(w_d.data()),
                                       reinterpret_cast<int64_t>(out_d.data()), M, K, eps, 0, ep,
-                                      reinterpret_cast<int64_t>(eo),
-                                      reinterpret_cast<int64_t>(es));
+                                      reinterpret_cast<int64_t>(eo));
                    R4DX_HIP_CHECK(hipDeviceSynchronize());
                    return out_d.CopyToHost();
                  });
 
         // ---- residual_rmsnorm (epilogue applies to out_normed only) ----
         CheckOne(std::string("residual_rmsnorm/") + en, epilogue, M, static_cast<int>(K),
-                 [&](int ep, void* eo, float* es) {
+                 [&](int ep, void* eo) {
                    DeviceBuffer<uint16_t> out_resid_d(x_h.size()), out_norm_d(x_h.size());
                    r4dx_residual_rmsnorm_bf16(
                        reinterpret_cast<int64_t>(x_d.data()),
@@ -296,7 +259,7 @@ int main() {
                        reinterpret_cast<int64_t>(w_d.data()),
                        reinterpret_cast<int64_t>(out_resid_d.data()),
                        reinterpret_cast<int64_t>(out_norm_d.data()), M, K, eps, 0, ep,
-                       reinterpret_cast<int64_t>(eo), reinterpret_cast<int64_t>(es));
+                       reinterpret_cast<int64_t>(eo));
                    R4DX_HIP_CHECK(hipDeviceSynchronize());
                    return out_norm_d.CopyToHost();
                  });
@@ -306,13 +269,12 @@ int main() {
         DeviceBuffer<uint16_t> gate_up_d(gate_up_h.size());
         gate_up_d.CopyFromHost(gate_up_h);
         CheckOne(std::string("silu_mul/") + en, epilogue, M, static_cast<int>(K),
-                 [&](int ep, void* eo, float* es) {
+                 [&](int ep, void* eo) {
                    DeviceBuffer<uint16_t> out_d(static_cast<size_t>(M) * K);
                    r4dx_silu_mul_bf16(reinterpret_cast<int64_t>(gate_up_d.data()),
                                        reinterpret_cast<int64_t>(out_d.data()), M, K,
                                        /*in_row_stride=*/2 * K, 0, ep,
-                                       reinterpret_cast<int64_t>(eo),
-                                       reinterpret_cast<int64_t>(es));
+                                       reinterpret_cast<int64_t>(eo));
                    R4DX_HIP_CHECK(hipDeviceSynchronize());
                    return out_d.CopyToHost();
                  });

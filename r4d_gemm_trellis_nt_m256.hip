@@ -87,7 +87,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
   constexpr int MT = 4, BLK = 64 * KB, M = RG * 64, Wc = NP * 32, NBLK = 128 / Wc;
   constexpr int NQ = NP * 4;                              // b128 per lane per accumulator tile
   static_assert(NP * U == RG, "each wave of a K slice decodes exactly one block per step");
-  static_assert(SK == 2 || SK == 4, "");
+  static_assert(SK == 2 || SK == 4 || SK == 8, "");
   extern __shared__ __attribute__((aligned(16))) unsigned char lds[];
   const int tid = threadIdx.x, lane = tid & 31;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
@@ -208,8 +208,6 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
   // NQ units of 512 B (32 lanes x 16 B).
 #pragma unroll
   for (int i = 0; i < MT; ++i) {
-    constexpr int dummy = 0;
-    (void)dummy;
     const int o = i % SK;
     r4d_t256_sync_lds();
     if (ks != o) {
@@ -394,16 +392,18 @@ template <int KB, int NP, int U, int RG>
 static void r4d_t256_launch_sk(const r4d_t256_args& a, int SK) {
   if (SK == 2) r4d_t256_launch<KB, NP, U, RG, 2>(a);
   else if (SK == 4) r4d_t256_launch<KB, NP, U, RG, 4>(a);
-  else r4d_t256_fail("SK must be 2 or 4");
+  else if (SK == 8 && NP == 1) r4d_t256_launch<KB, NP, U, RG, 8>(a);   // 32 waves; NP = 2's LDS would not fit
+  else r4d_t256_fail("SK must be 2 or 4 (8 with NP = 1)");
 }
 
 template <int KB>
 static void r4d_t256_launch_kb(const r4d_t256_args& a, int RG, int NP, int U, int SK) {
-  if (RG == 4 && NP == 2 && U == 2) r4d_t256_launch_sk<KB, 2, 2, 4>(a, SK);
-  else if (RG == 4 && NP == 1 && U == 4) r4d_t256_launch_sk<KB, 1, 4, 4>(a, SK);
+  // (RG, NP, U) = (4, 2, 2) is not instantiated: measured 0-15% slower than (4, 1, 4) on every class,
+  // and it spills (KB = 4: 24 B/lane at 192 VGPRs; KB = 5: 52-260 B/lane).
+  if (RG == 4 && NP == 1 && U == 4) r4d_t256_launch_sk<KB, 1, 4, 4>(a, SK);
   else if (RG == 2 && NP == 2 && U == 1) r4d_t256_launch_sk<KB, 2, 1, 2>(a, SK);
   else if (RG == 2 && NP == 1 && U == 2) r4d_t256_launch_sk<KB, 1, 2, 2>(a, SK);
-  else r4d_t256_fail("(RG, NP, U) must be (4,2,2), (4,1,4), (2,2,1) or (2,1,2)");
+  else r4d_t256_fail("(RG, NP, U) must be (4,1,4), (2,2,1) or (2,1,2)");
 }
 
 void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
@@ -427,6 +427,7 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
   const size_t stage = (size_t)2 * SK * NP * U * 1024;
   const size_t red = (size_t)RG * (SK - 1) * NP * 4 * 512;
   a.smem = stage > red ? stage : red;
+  if (a.smem > 64 * 1024 || RG * SK > 32) r4d_t256_fail("LDS > 64 KiB or more than 32 waves");
   a.stream = (hipStream_t)stream;
   a.a0 = (const unsigned short*)a0;
   a.a1 = (const unsigned short*)(a1 ? a1 : a0);

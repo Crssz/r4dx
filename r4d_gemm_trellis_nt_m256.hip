@@ -1,10 +1,12 @@
-// r4d_gemm_trellis_nt_m256.hip - PROTOTYPE bigger-M sibling of r4d_gemm_trellis_nt_m64.hip: the same
+// r4d_gemm_trellis_nt_m256.hip - bigger-M sibling of r4d_gemm_trellis_nt_m64.hip (in R4D_UNITS since the
+// 256-row prefill chunk spike, R4DX_PREFILL_CHUNK; r4d.h has the contract): the same
 // trellis linear (C = bf16( (FWHT128(A @ Q) * svh) * out_scale )) for M = 64 RG rows in ONE launch,
 // RG = 2 or 4, that gives every output element the bits the M = 64 kernel gives it at the same
 // (SK, SKG): the K loop keeps each accumulator's chain of 16-k WMMA in k order, the SK partial sums are
 // added in slice order from 0.f, the SKG partials in y order from 0.f, and the FWHT stages, svh, out
 // scale and the one bf16 rounding are the stock ones. Row tiles are independent in WMMA, so nothing
-// else can differ. Bench-only: nothing in r4dx calls it (tests/kernels/tool_trellis_m256_bench.hip).
+// else can differ. Bench and check tools: tests/kernels/tool_trellis_m256_bench.hip, tool_trellis_m256_real_check.hip;
+// ctest: tests/kernels/test_trellis_m256.cpp.
 //
 // WHY IT IS FASTER.  The M = 64 kernel is not DRAM-bound: it is the decode (62 VALU per weight block at
 // KB = 4, 75 at KB = 5) plus the WMMA, whose times ADD (VALU and WMMA do not overlap on a SIMD). The
@@ -40,6 +42,7 @@
 #include "r4d_gdn_wmma.h"
 #include "r4d_trellis_dq.h"
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -412,6 +415,7 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m256_kernel(
   }
 }
 
+
 // ---- host ------------------------------------------------------------------------------------
 
 static void r4d_t256_fail(const std::string& what) {
@@ -440,32 +444,96 @@ static void r4d_t256_launch(const r4d_t256_args& a) {
                      a.SKG, a.out_scale);
 }
 
-// (SKW, PH): SKW K slices resident per workgroup, PH groups of them walked in turn, SK = SKW PH slices
-// in all. SKW = 8 needs NP = 1 (NP = 2's LDS would not fit), and PH > 1 is instantiated for RG = 4 only.
-// TAIL = (K/16 / (SK SKG)) % U: k-tiles a slice has beyond whole steps of U. Only 0 is instantiated
-// everywhere; TAIL 2 (mlp.down KB 4's SK 16, SKG 2: 34 k-tiles, U 4) for the two (SKW, PH) it needs.
-template <int KB, int NP, int U, int RG>
-static void r4d_t256_launch_sk(const r4d_t256_args& a, int SKW, int PH, int TAIL) {
-#define R4D_T256_CASE(W_, P_) \
-  if (SKW == W_ && PH == P_ && TAIL == 0) { r4d_t256_launch<KB, NP, U, RG, W_, P_, 0>(a); return; }
-  R4D_T256_CASE(2, 1) R4D_T256_CASE(4, 1)
-  if constexpr (NP == 1) { R4D_T256_CASE(8, 1) }
-  if constexpr (RG == 4 && NP == 1) {
-    R4D_T256_CASE(2, 2) R4D_T256_CASE(2, 4) R4D_T256_CASE(4, 2) R4D_T256_CASE(4, 4) R4D_T256_CASE(8, 2)
-    if (TAIL == 2 && SKW == 4 && PH == 4) { r4d_t256_launch<KB, NP, U, RG, 4, 4, 2>(a); return; }
-    if (TAIL == 2 && SKW == 8 && PH == 2) { r4d_t256_launch<KB, NP, U, RG, 8, 2, 2>(a); return; }
-  }
-#undef R4D_T256_CASE
-  r4d_t256_fail("(SKW, PH, k-tile tail) not instantiated for this (RG, NP, U)");
+// THE instantiation table: which (KB, RG, NP, U, SKW, PH, TAIL) exist. One predicate serves the launch and
+// the host check, so they cannot disagree, and it is the only place a kernel gets instantiated -- the build
+// (third_party/check_trellis_isa.cmake) requires every instantiation of this unit to fit 190 VGPRs with no
+// scratch, so a combination that does not (measured, resource report of docs/trellis-m256.md) is not listed:
+//   * (RG, NP, U) = (4, 1, 4) for M = 256; (2, 2, 1) and (2, 1, 2) for M = 128 ((4, 2, 2) spills).
+//   * SKW = 8 needs NP = 1 (the LDS of NP = 2 would not fit); PH > 1 exists for (RG 4, NP 1) only.
+//   * PH = 1: any KB, TAIL 0.
+//   * PH > 1 (SK = SKW PH > SKW: the shipped rows with SK 8 and 16, and SK 4 at SKW 2): KB 4 only, because
+//     the KB 5 decode adds registers (192 VGPRs at PH 2 and 4, scratch at (4, 4)); (2,2), (2,4), (4,2),
+//     (8,2) with TAIL 0 and the two k-tile-tail ones mlp.down KB 4 needs: (4,4) and (8,2) with TAIL 2
+//     (34 k-tiles per slice = 8 steps of U = 4 and a tail of 2). (4,4) with TAIL 0 spills (192 VGPRs, 8 B
+//     scratch) and is not used by any shape of the model, so it is not instantiated either.
+template <int KB, int NP, int U, int RG, int SKW, int PH, int TAIL>
+static constexpr bool r4d_t256_inst() {
+  if (!((RG == 4 && NP == 1 && U == 4) || (RG == 2 && NP == 2 && U == 1) || (RG == 2 && NP == 1 && U == 2)))
+    return false;
+  if (SKW == 8 && NP != 1) return false;
+  if (PH == 1) return TAIL == 0;
+  if (!(RG == 4 && NP == 1) || KB != 4) return false;
+  if (PH == 2) return TAIL == 0 || (SKW == 8 && TAIL == 2);
+  return (SKW == 2 && TAIL == 0) || (SKW == 4 && TAIL == 2);   // PH == 4
 }
-template <int KB>
-static void r4d_t256_launch_kb(const r4d_t256_args& a, int RG, int NP, int U, int SKW, int PH, int TAIL) {
-  // (RG, NP, U) = (4, 2, 2) is not instantiated: measured 0-15% slower than (4, 1, 4) on every class,
-  // and it spills (KB = 4: 24 B/lane at 192 VGPRs; KB = 5: 52-260 B/lane).
-  if (RG == 4 && NP == 1 && U == 4) r4d_t256_launch_sk<KB, 1, 4, 4>(a, SKW, PH, TAIL);
-  else if (RG == 2 && NP == 2 && U == 1) r4d_t256_launch_sk<KB, 2, 1, 2>(a, SKW, PH, TAIL);
-  else if (RG == 2 && NP == 1 && U == 2) r4d_t256_launch_sk<KB, 1, 2, 2>(a, SKW, PH, TAIL);
-  else r4d_t256_fail("(RG, NP, U) must be (4,1,4), (2,2,1) or (2,1,2)");
+template <int KB, int NP, int U, int RG, int SKW, int PH, int TAIL>
+struct r4d_t256_cfg {
+  static void launch(const r4d_t256_args& a) { r4d_t256_launch<KB, NP, U, RG, SKW, PH, TAIL>(a); }
+};
+
+// f(r4d_t256_cfg<...>{}) is called for the instantiated combination, if there is one (returns true), so the
+// launch (f = launch) and the check (f = nothing) share the table above.
+template <int KB, int NP, int U, int RG, class F>
+static bool r4d_t256_dispatch_sk(int SKW, int PH, int TAIL, F& f) {
+#define R4D_T256_CASE(W_, P_, T_)                                                                       \
+  if (SKW == W_ && PH == P_ && TAIL == T_) {                                                            \
+    if constexpr (r4d_t256_inst<KB, NP, U, RG, W_, P_, T_>()) {                                         \
+      f(r4d_t256_cfg<KB, NP, U, RG, W_, P_, T_>{});                                                     \
+      return true;                                                                                      \
+    } else {                                                                                            \
+      return false;                                                                                     \
+    }                                                                                                   \
+  }
+  R4D_T256_CASE(2, 1, 0) R4D_T256_CASE(4, 1, 0) R4D_T256_CASE(8, 1, 0)
+  R4D_T256_CASE(2, 2, 0) R4D_T256_CASE(4, 2, 0) R4D_T256_CASE(8, 2, 0) R4D_T256_CASE(8, 2, 2)
+  R4D_T256_CASE(2, 4, 0) R4D_T256_CASE(4, 4, 0) R4D_T256_CASE(4, 4, 2)
+#undef R4D_T256_CASE
+  return false;
+}
+template <int KB, class F>
+static bool r4d_t256_dispatch_kb(int RG, int NP, int U, int SKW, int PH, int TAIL, F& f) {
+  if (RG == 4 && NP == 1 && U == 4) return r4d_t256_dispatch_sk<KB, 1, 4, 4>(SKW, PH, TAIL, f);
+  if (RG == 2 && NP == 2 && U == 1) return r4d_t256_dispatch_sk<KB, 2, 1, 2>(SKW, PH, TAIL, f);
+  if (RG == 2 && NP == 1 && U == 2) return r4d_t256_dispatch_sk<KB, 1, 2, 2>(SKW, PH, TAIL, f);
+  return false;
+}
+template <class F>
+static bool r4d_t256_dispatch(int KB, int RG, int NP, int U, int SKW, int PH, int TAIL, F&& f) {
+  return KB == 4 ? r4d_t256_dispatch_kb<4>(RG, NP, U, SKW, PH, TAIL, f)
+                 : r4d_t256_dispatch_kb<5>(RG, NP, U, SKW, PH, TAIL, f);
+}
+
+const char* r4d_gemm_trellis_nt_m256_check(int M, int K, int N, int n_split, int KB, int SK, int NP,
+                                           int SKG, int U, int skw) {
+  static thread_local char msg[320];
+#define R4D_T256_BAD(...) do { std::snprintf(msg, sizeof msg, __VA_ARGS__); return msg; } while (0)
+  if (M != 128 && M != 256) R4D_T256_BAD("M must be 128 or 256, got %d", M);
+  const int RG = M / 64;
+  if (K <= 0 || N <= 0 || K % 128 || N % 128) R4D_T256_BAD("K and N must be multiples of 128, got K %d N %d", K, N);
+  if (KB != 4 && KB != 5) R4D_T256_BAD("KB must be 4 or 5, got %d", KB);
+  if (SKG != 1 && SKG != 2 && SKG != 4 && SKG != 8) R4D_T256_BAD("SKG must be 1, 2, 4 or 8, got %d", SKG);
+  if (NP != 1 && NP != 2) R4D_T256_BAD("NP must be 1 or 2, got %d", NP);
+  if (N % (NP * 32)) R4D_T256_BAD("N %d must be a multiple of the block width 32 NP = %d", N, NP * 32);
+  if (n_split < 0 || n_split > N || n_split % 128)
+    R4D_T256_BAD("n_split %d must be in 0..N (%d) and a multiple of 128", n_split, N);
+  if (NP * U != RG) R4D_T256_BAD("NP * U (%d) must equal M / 64 (%d)", NP * U, RG);
+  if (SK != 2 && SK != 4 && SK != 8 && SK != 16) R4D_T256_BAD("SK must be 2, 4, 8 or 16, got %d", SK);
+  if ((K / 16) % (SK * SKG)) R4D_T256_BAD("(K/16) = %d must be divisible by SK*SKG = %d", K / 16, SK * SKG);
+  const int ktw = (K / 16) / (SK * SKG);
+  if (ktw < U) R4D_T256_BAD("a K slice has %d k-tiles, fewer than U = %d", ktw, U);
+  const int SKW = skw > 0 ? skw : (SK < 4 ? SK : 4);
+  if (SKW < 2 || SK % SKW) R4D_T256_BAD("skw %d must be 2, 4 or 8 and divide SK %d", SKW, SK);
+  if (RG * SKW > 32) R4D_T256_BAD("RG * skw = %d waves exceed the 32-wave workgroup", RG * SKW);
+  const size_t stage = (size_t)2 * SKW * NP * U * 1024;
+  const size_t red = (size_t)RG * (SKW - 1) * NP * 4 * 512;
+  if ((stage > red ? stage : red) > 64 * 1024) R4D_T256_BAD("LDS %zu B exceeds 64 KiB", stage > red ? stage : red);
+  const int PH = SK / SKW, TAIL = ktw % U;
+  if (!r4d_t256_dispatch(KB, RG, NP, U, SKW, PH, TAIL, [](auto) {}))
+    R4D_T256_BAD("(KB %d, RG %d, NP %d, U %d, skw %d x %d groups, k-tile tail %d) is not instantiated "
+                 "(see r4d_t256_inst: PH > 1 only at KB 4, RG 4, NP 1; tails only (4,4,2) and (8,2,2))",
+                 KB, RG, NP, U, SKW, PH, TAIL);
+#undef R4D_T256_BAD
+  return nullptr;
 }
 
 void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
@@ -473,22 +541,10 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
                               int SKG, int U, float out_scale, int64_t stream, int skw) {
   // SK is the shipped row's K-slice count. skw = K slices resident per workgroup (0 = the default,
   // min(SK, 4)); SK / skw groups are walked in turn.
-  if (M != 128 && M != 256) r4d_t256_fail("M must be 128 or 256");
-  const int RG = M / 64;
-  if (K <= 0 || N <= 0 || K % 128 || N % 128) r4d_t256_fail("K and N must be multiples of 128");
-  if (KB != 4 && KB != 5) r4d_t256_fail("KB must be 4 or 5");
-  if (SKG != 1 && SKG != 2 && SKG != 4 && SKG != 8) r4d_t256_fail("SKG must be 1, 2, 4 or 8");
-  if (NP != 1 && NP != 2) r4d_t256_fail("NP must be 1 or 2");
-  const int Wc = NP * 32;
-  if (N % Wc) r4d_t256_fail("N must be a multiple of the block width 32 NP");
-  if (n_split < 0 || n_split > N || n_split % 128) r4d_t256_fail("n_split must be in 0..N, a multiple of 128");
-  if (NP * U != RG) r4d_t256_fail("NP * U must equal M / 64");
-  if (SK != 2 && SK != 4 && SK != 8 && SK != 16) r4d_t256_fail("SK must be 2, 4, 8 or 16");
-  if ((K / 16) % (SK * SKG)) r4d_t256_fail("(K/16) must be divisible by SK*SKG");
-  if ((K / 16) / (SK * SKG) < U) r4d_t256_fail("a slice needs at least U k-tiles");
+  if (const char* why = r4d_gemm_trellis_nt_m256_check(M, K, N, n_split, KB, SK, NP, SKG, U, skw)) r4d_t256_fail(why);
   if (!w || !c || !svh || !ws || !tickets || !a0) r4d_t256_fail("null buffer");
+  const int RG = M / 64, Wc = NP * 32;
   const int SKW = skw > 0 ? skw : (SK < 4 ? SK : 4);
-  if (SKW < 2 || SK % SKW) r4d_t256_fail("skw must divide SK");
   const int PH = SK / SKW;
   const int TAIL = ((K / 16) / (SK * SKG)) % U;
   r4d_t256_args a;
@@ -497,7 +553,6 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
   const size_t stage = (size_t)2 * SKW * NP * U * 1024;
   const size_t red = (size_t)RG * (SKW - 1) * NP * 4 * 512;
   a.smem = stage > red ? stage : red;
-  if (a.smem > 64 * 1024 || RG * SKW > 32) r4d_t256_fail("LDS > 64 KiB or more than 32 waves");
   a.stream = (hipStream_t)stream;
   a.a0 = (const unsigned short*)a0;
   a.a1 = (const unsigned short*)(a1 ? a1 : a0);
@@ -509,8 +564,9 @@ void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, in
   a.tickets = (unsigned*)tickets;
   a.K = K; a.N = N; a.SKG = SKG;
   a.out_scale = out_scale;
-  if (KB == 4) r4d_t256_launch_kb<4>(a, RG, NP, U, SKW, PH, TAIL);
-  else r4d_t256_launch_kb<5>(a, RG, NP, U, SKW, PH, TAIL);
+  r4d_t256_dispatch(KB, RG, NP, U, SKW, PH, TAIL, [&](auto cfg) { decltype(cfg)::launch(a); });
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) r4d_t256_fail(std::string("launch failed: ") + hipGetErrorString(e));
 }
 
 size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG) {

@@ -133,6 +133,11 @@ static const R4DConstraint cGemmNtTrellisRaw[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 128),
     C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
 };
+// The M = 128 / 256 sibling is its own op: a caller selecting "gemm_nt" (M <= 64) is never handed it.
+static const R4DConstraint cGemmNtTrellisM256[] = {
+    C_DIV("M", 128), C_LE("M", 256), C_DIV("K", 128), C_DIV("N", 128),
+    C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+};
 static const R4DConstraint cTrellisReconstruct[] = {
     C_DIV("K", 16), C_DIV("N", 32), C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
 };
@@ -322,6 +327,20 @@ static const R4DKernelInfo kKernels[] = {
      "f16 A (already input-transformed), mul1 trellis W at KB bits per weight, fp32 C, fp32 "
      "accumulate, deterministic reduction",
      ROW(cGemmNtTrellisRaw)},
+    {"gemm_trellis_nt_m256", "gemm", "gemm_nt_m256",
+     "the trellis linear of gemm_trellis_nt_m64 for M = 256 (or 128) rows in one launch: the decoded "
+     "weights are staged once in LDS for RG = M / 64 row groups; every output element gets, bit for "
+     "bit, the bits the M <= 64 kernel gives a 64-row slice at the same (SK, SKG) (K-slice sum in "
+     "slice order from 0.f, SKG partials in y order, then the stock FWHT / svh / out_scale / one bf16 "
+     "rounding), so it replaces 4 (or 2) M = 64 launches without changing a bit",
+     "M 256 (or 128); K, N multiples of 128; (K/16) divisible by SK*SKG, SK in {2,4,8,16} the M = 64 "
+     "row's slice count, at least U = 4 k-tiles per slice; block width 32 columns (ws always used: "
+     "M*N*SKG fp32); only the instantiated (KB, skw, SK/skw, k-tile tail) combinations "
+     "(gemm_trellis_nt_m256_check); up to two A parts split at a 128-column boundary",
+     "f16 A (x * suh, FWHT-128, prescaled), mul1 trellis W at KB bits per weight, fp32 svh, bf16 "
+     "C, fp32 accumulate and transform, one rounding, deterministic reduction, <= 190 VGPRs and no "
+     "scratch in every instantiation (build-checked)",
+     ROW(cGemmNtTrellisM256)},
     {"trellis_reconstruct_f16", "quant", "trellis_reconstruct",
      "the whole decoded trellis weight Q[K,N] as f16, with the GEMM's own device decode",
      "K a multiple of 16, N of 32 (tile pairs); KB 4 or 5",

@@ -178,6 +178,7 @@ $UNITS = [ordered]@{
     "r4d_gemm_bf16_nt_m64"                                   = @()
     "r4d_gemm_w4a16_nt_m64"                                  = @()
     "r4d_gemm_trellis_nt_m64"                                = @()
+    "r4d_gemm_trellis_nt_m256"                               = @()
     "r4d_gemm_w4a8_nt_m64"                                   = @("-DR4D_GEMM_W4A8_GROUP=128")
     "r4d_gemm_mxfp4a8_nt_m64"                                = @()
     "r4d_quant_act_i8"                                       = @()

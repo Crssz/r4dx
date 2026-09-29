@@ -351,6 +351,36 @@ void   r4d_gemm_trellis_nt_m64_zero_tickets(int64_t tickets, size_t bytes, int64
 // multiple of 16, N of 32.
 void   r4d_trellis_reconstruct_f16(int64_t w, int64_t q, int K, int N, int KB, int64_t stream);
 
+// M = 256 (or 128) trellis GEMM (r4d_gemm_trellis_nt_m256.hip; docs/trellis-m256.md): the trellis
+// linear of r4d_gemm_trellis_nt_m64 for 64 * RG rows in ONE launch, RG = M / 64 = 4 (M = 256) or 2
+// (M = 128), with the decoded weights staged once in LDS for every row group. It is NOT a new tuning
+// of the M <= 64 kernel: every output element gets, bit for bit, the bits the M <= 64 kernel gives it
+// for the M = 64 tuning row with the same (SK, SKG) -- the K-slice sum is a left fold from 0.f in
+// slice order, the SKG partials are summed in y order from 0.f, then the stock FWHT stages, svh,
+// out_scale and one bf16 rounding -- so a caller that runs 64-row chunks through its shipped M = 64
+// row may replace four of them (or two) by one call without changing a bit. Nothing else about the
+// M <= 64 kernel, its rows or the M <= 16 decode / verify rows changes.
+//   a0 / a1 / n_split / w / svh / c / tickets / out_scale: as r4d_gemm_trellis_nt_m64, with M rows.
+//   ws: fp32, r4d_gemm_trellis_nt_m256_ws_bytes(M, N, SKG) -- ALWAYS required (a 32-column block is
+//       always a split 128-group), every slot written before it is read.
+//   SK: the K-slice count of the M = 64 row to reproduce (2, 4, 8 or 16); SKG likewise (1, 2, 4, 8);
+//       NP = tile pairs per wave and U = k-tiles per step, (RG, NP, U) = (4, 1, 4) for M = 256,
+//       (2, 2, 1) or (2, 1, 2) for M = 128; skw = K slices resident per workgroup (0 = min(SK, 4)),
+//       SK / skw groups of them are walked in turn. Only the (KB, RG, NP, U, skw, SK / skw, k-tile
+//       tail) combinations that are instantiated are legal (the build checks each one's 190-VGPR /
+//       zero-scratch fit): r4d_gemm_trellis_nt_m256_check says which, without launching.
+//   Legal only when K and N are multiples of 128, N of 32 NP, n_split of 128, (K/16) of SK * SKG, a
+//   slice has at least U k-tiles, and the instantiation exists; anything else throws (extern "C"
+//   entry, like the M <= 64 one), after r4d_gemm_trellis_nt_m256_check has already named the reason.
+void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
+                              int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
+                              int SKG, int U, float out_scale, int64_t stream, int skw);
+// nullptr when (M, K, N, n_split, KB, SK, NP, SKG, U, skw) is a launch r4d_gemm_trellis_nt_m256 would
+// accept, else a message (valid until this thread's next call) naming the first rule it breaks.
+const char* r4d_gemm_trellis_nt_m256_check(int M, int K, int N, int n_split, int KB, int SK, int NP,
+                                           int SKG, int U, int skw);
+size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
+
 // 4-bit weight, 8-bit activation. Signed 4-bit codes, per-row activation scale, int8 WMMA.
 void r4d_gemm_w4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t c, int M, int K, int N,
                           int WV, int SK, int MB, int NPW, int NT, int64_t stream);

@@ -693,6 +693,21 @@ PYBIND11_MODULE(r4d, m) {
   m.def("gemm_trellis_nt_m64_ws_bytes", &r4d_gemm_trellis_nt_m64_ws_bytes, py::arg("M"),
         py::arg("N"), py::arg("SKG"));
   m.attr("GEMM_TRELLIS_MAX_M") = r4d_gemm_trellis_nt_m64_max_m();
+  m.def("gemm_trellis_nt_m256", &r4d_gemm_trellis_nt_m256, py::arg("a0"), py::arg("a1"),
+        py::arg("n_split"), py::arg("w"), py::arg("svh"), py::arg("c"), py::arg("ws"),
+        py::arg("tickets"), py::arg("M"), py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("SK"),
+        py::arg("NP"), py::arg("SKG"), py::arg("U"), py::arg("out_scale"), py::arg("stream"),
+        py::arg("skw") = 0);
+  // None when the launch is legal, else the message naming the rule it breaks.
+  m.def("gemm_trellis_nt_m256_check",
+        [](int M, int K, int N, int n_split, int KB, int SK, int NP, int SKG, int U, int skw) {
+          const char* why = r4d_gemm_trellis_nt_m256_check(M, K, N, n_split, KB, SK, NP, SKG, U, skw);
+          return why ? py::object(py::str(why)) : py::object(py::none());
+        },
+        py::arg("M"), py::arg("K"), py::arg("N"), py::arg("n_split"), py::arg("KB"), py::arg("SK"),
+        py::arg("NP"), py::arg("SKG"), py::arg("U"), py::arg("skw") = 0);
+  m.def("gemm_trellis_nt_m256_ws_bytes", &r4d_gemm_trellis_nt_m256_ws_bytes, py::arg("M"),
+        py::arg("N"), py::arg("SKG"));
   m.def("trellis_reconstruct_f16", &r4d_trellis_reconstruct_f16, py::arg("w"), py::arg("q"),
         py::arg("K"), py::arg("N"), py::arg("KB"), py::arg("stream"));
   m.def("gemm_w4a8_nt_m64", &r4d_gemm_w4a8_nt_m64, py::arg("a"), py::arg("ascale"), py::arg("wq"),

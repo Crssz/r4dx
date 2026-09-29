@@ -1,654 +1,134 @@
 # r4dx
 
-A from-scratch C++/HIP inference engine for Qwen/Qwen3.8-27B on a single AMD Radeon AI PRO R9700
-(gfx1201) on Windows 11, built on top of the [libr4d](https://github.com) kernel library (a
-plain-C-ABI, torch-free HIP kernel set). MIT licensed.
+A from-scratch C++/HIP inference engine for **Qwen3.8-27B** on AMD RDNA4 (Radeon AI PRO R9700,
+gfx1201) under Windows. It has its own weight container, model graph, tokenizer, CLI and an
+OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
 
-## What this is
+> **Experimental.** This is a personal research project, developed and tested on one machine
+> (Windows 11, two R9700 cards, ROCm SDK at `C:\opt\rocm`). Expect hard-coded paths, formats and
+> flags that change without notice, and no support or stability guarantees. Quantized containers are
+> tied to the binary that reads them. Sustained load on both GPUs has caused Windows display resets
+> and, once, a suspected power-supply shutdown on this machine, so watch your PSU headroom.
 
-r4dx is its own weight container, its own C++ model graph, and its own server -- no vLLM, no
-ggml/GGUF. Third-party code is limited to header-only libraries vendored under `third_party/`
-(nlohmann/json, cpp-httplib, minja, stb_image). GPU kernels come from `third_party/libr4d`
-(a git submodule, branch `windows-llp64`), compiled into the static library target `r4d_core`.
+## Features
 
-## Decisions (summary)
+- **Hybrid model support:** 64 layers = 48 Gated DeltaNet + 16 full-attention layers, MTP head and
+  vision tower.
+- **Trellis quantization (QTIP/EXL3-style):** about 4.5 bits per weight (mixed 4/5-bit), rounded with
+  LDLQ against per-layer Hessians and a random Hadamard rotation, decoded inside a native RDNA4
+  WMMA GEMM. 4-bit group layouts (w4a16, w4a8, mxfp4) are also supported.
+- **KV cache:** fp8 e4m3, paged in 16-token blocks, up to the model's native 262144-token context.
+- **Speculative decoding:** MTP and DFlash2 (block-diffusion drafter), lossless in distribution.
+- **Prefill:** chunked prefill with a fused, exact-wide attention kernel; a faster split-KV variant is
+  opt-in (`R4DX_PREFILL_SPLITKV=split`).
+- **Tensor parallel across two GPUs (`--tp 2`):** all-reduce through pinned host memory, since the
+  cards have no peer-to-peer path.
+- **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
+  images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
 
-- **Model**: Qwen/Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`) -- 64 hybrid layers (48 Gated
-  DeltaNet + 16 full attention), MTP head, vision tower carried in bf16.
-- **Weights**: a custom converter round-trips the BF16 checkpoint into a safetensors-compatible
-  container (see `docs/container-format.md`) in three quantized GEMM layouts so they can be A/B'd:
-  MXFP4 (e2m1 + e8m0), INT4 g128 W4A16, and INT4 g128 W4A8. Weights are pre-permuted into each
-  kernel's WMMA fragment order.
-- **KV cache**: fp8 e4m3, paged in 16-token HND blocks, per-layer per-head static descales.
-- **GPU rule**: only HIP device 1 (`$env:HIP_VISIBLE_DEVICES='1'`) is ever used on this machine,
-  except by tensor parallel (`--tp 2`, below), which uses both cards.
-- See `docs/architecture.md` for the forward-pass module map and `docs/container-format.md` for
-  the weight container spec.
+## Performance
 
-## Build (Windows, HIP/gfx1201)
+Huihui trellis mix4.5m container, one R9700, greedy decoding:
+
+| | |
+|---|---|
+| Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70% |
+| Weights | about 17 GiB |
+| Decode, plain | 36.7 tok/s |
+| Decode, DFlash2 `k=7` | 108 tok/s |
+| Prefill, short prompts | about 1130 tok/s |
+| Cold prefill (time to first token) | 6.9 s at 8k, 32 s at 32k, 74 s at 64k, 194 s at 128k tokens |
+
+With `--tp 2` on an earlier container, plain decode reached about 1.65x the single-GPU speed.
+Methodology and more numbers: [docs/perf.md](docs/perf.md), [docs/huihui.md](docs/huihui.md),
+[docs/prefill.md](docs/prefill.md).
+
+## Requirements
+
+- Windows 11, the AMD HIP SDK (default location `C:\opt\rocm`) and an RDNA4 GPU (gfx1201). It is
+  tested on 32 GB cards; the 27B container alone takes about 17 GiB, plus KV cache that scales with
+  `--max-ctx`.
+- CMake, Ninja and clang-cl. The exact toolchain, flags and known gotchas are in
+  [docs/build-windows.md](docs/build-windows.md).
+- A Qwen3.8-27B-family checkpoint. Weights are not distributed here. The default container was made from
+  the community `Huihui-Qwen3.8-27B-abliterated` variant, which has its refusal behaviour removed; the
+  engine itself works with any checkpoint of the same architecture.
+
+## Build
 
 ```powershell
-$env:HIP_VISIBLE_DEVICES = '1'
+git clone <repo-url> r4dx
+cd r4dx
 .\build.ps1
 ```
 
-This configures and builds with the `win-hip` CMake preset (Ninja + CMake from
-`$env:R4DX_REFERENCE_VENV\Scripts` when that is set, else the cmake/ninja on PATH) against the ROCm
-SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the exact toolchain versions, flags, and
-gotchas.
-
-One build option changes what containers this binary can read: **`R4DX_W4A16_GROUP`** (default
-**64** since Milestone 11) is how many contiguous `K` share one w4a16 `(scale, zero)` pair -- 4.5
-bits/weight at 64, 4.25 at 128. It reaches both the kernel and the converter from one cache
-variable, every container records the group it was packed with, and a loader refuses a mismatch
-rather than silently reading scales at the wrong stride. `.\build.ps1 -Preset win-hip-g128` builds
-the pre-v6 group of 128 into its own directory for reading older containers.
-
-## Test
-
-```powershell
-.\tests\run_tests.ps1
-```
-
-Sets `HIP_VISIBLE_DEVICES=1` and runs `ctest` against the `win-hip` build directory: 62 tests
-covering `r4d_core` smoke, `src/core`/`src/kernels` device-buffer and kernel unit tests (rmsnorm,
-residual add, silu_mul, rope (including the 3-axis mrope partial-rotary kernel), fp8/int8
-activation quant, kv cache write, mxfp4 GEMM, attention decode, GDN chunk scan, sampler, the P6
-vectorized-kernel bandwidth golden, the P2 fused-quant-epilogue byte-diff harness, embedding-gather
-in-range/OOB-clamp, the R9 reduced-vocab-draft-head gather-by-index kernel's in-range/OOB-clamp
-golden, and the vision tower's six device primitives), the converter's quantizer
-round-trip / byte-packer / kernel-decode / KV-calibration / bf16-layout tests, the tokenizer's
-golden-case suite, `src/model`'s per-layer tests (GDN layer, full-attention layer,
-final-norm+lm_head, the mrope-carrying attention layer, assembled-`Model` forward-pass smoke
-including a prefill/decode state-handoff equivalence check and a `Model::Reset()` byte-identity
-check, MTP's verify/rejection-rewind/mid-round-commit/K=16-wide-window/reduced-vocab-draft-head-
-lossless tests, the pure-CPU `mtp_round` commit-bookkeeping tests, including a K=16 wide-round
-case, and `test_pick_tuning`, which checks every GEMM tuning the table hands out is launchable at
-the build's kernel groups), `src/cli`'s argument-parsing tests (including `--mtp-draft-head` and `--image`), `src/server`'s
-CPU-only tests (CLI args including `--mtp-draft-head`, OpenAI request/response JSON shapes including
-`tools`/`tool_choice`/`role: "tool"`/`"function"` parsing and image content parts, SSE framing,
-buffering/streaming sinks including the tool-calls streaming chunk shape, the bounded request queue,
-`PrefixState` including its image-aware key, and the tool-call surface-syntax parser --
-`docs/server.md`'s "Tool calls"), the vision tower's tests (the CPU-only preprocessing / mrope /
-index-math goldens, the whole tower against the real checkpoint's forward, and the shared
-`ExpandImagePlaceholders` image-prompt-splicing tests -- `docs/vision.md`), the tensor-parallel
-building blocks' CPU-only tests (`test_tp_config`, `test_tp_shard`, `test_tp_vocab_merge`,
-`test_tp_host_exchange`, `test_tp_rank_worker` -- `docs/tp.md` 10.1) and the sharded loader's
-device-1 test (`test_tp_loader`), and a
-CPU-only Python reference-manifest check (`tests/reference/test_manifest.py`, run through the same
-`ctest` invocation). 71 tests are registered without the reference venv (73 with it). The last
-full run, at 64 before `test_pick_tuning` was added, passed all but 1, which skips
-(`test_kernel_bandwidth`, whose golden is gitignored), ~665s wall on HIP device 1 (2026-09-23,
-default build). No environment variable beyond `HIP_VISIBLE_DEVICES` is needed on
-either the default (group-64) build or `win-hip-g128`: the tests open the test containers and the
-production container (the Huihui trellis mix4.5m, loaded with `--layout trellis`; its w4a16 parts
-are packed at group 64, so it needs the default group-64 build) (`docs/build-windows.md` "w4a16
-group size"). The Python reference checks (`reference_manifest`, `reference_dflash2`) are
-registered only when the reference venv's `python.exe` exists at configure time; otherwise CMake
-prints a STATUS line saying they were skipped. See `docs/status.md` for
-the full breakdown and known gaps, and `tools/convert_ref/` / `tools/reference/` for the additional
-GPU-device-1 Python self-tests (kernel cross-checks and HF `transformers` goldens) that run outside
-`ctest` -- see their READMEs for invocation. `tools/server/smoke.ps1` is a separate GPU integration
-smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- also not part of
-`ctest`, since it needs a live HTTP server and a real container.
+This configures and builds the `win-hip` preset. Run the tests with `.\tests\run_tests.ps1`
+(GPU tests use the device set in `HIP_VISIBLE_DEVICES`; several need converted containers and skip
+without them).
 
 ## Usage
 
-### Convert a checkpoint to a container
-
-**The default (production) container is the Huihui abliterated trellis mix4.5m,
-`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, run with `--layout trellis`** (since
-2026-09-29; `docs/huihui.md`). It is made with `tools\quant2\trellis_convert.ps1` from the Huihui
-checkpoint `D:\models\Huihui-Qwen3.8-27B-abliterated` and the Hessians, trellis bits and calibration
-files under `D:\models\r4dx\huihui\` (recipe: `D:\models\r4dx\huihui\RECIPE.md`); every default of
-that script names them. The base Qwen3.8-27B checkpoint and every container made from it (v6, the
-base trellis mix4.5m / K4m) were retired on 2026-09-29 -- the Huihui checkpoint has the same
-architecture, tokenizer and chat template (its four tokenizer files are byte-identical), so
-`--tokenizer-dir` defaults to it. The w4a16 recipe below (Milestone 11's v6) still converts and
-runs, on any checkpoint:
+Convert a checkpoint into a container (trellis recipe, see [docs/quant2.md](docs/quant2.md) and
+`tools/quant2/trellis_convert.ps1`), then run it:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\convert\r4dx-convert.exe `
-    --input D:\models\Huihui-Qwen3.8-27B-abliterated --output D:\models\r4dx\huihui-qwen38-27b-abl-v6.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz `
-    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
+
+# one-shot generation
+.\build\win-hip\src\cli\r4dx-cli.exe --model <container.r4dx> --layout trellis `
+    --prompt "Write a haiku about GPUs." --max-tokens 128 --temperature 0 --stats
+
+# OpenAI-compatible server with DFlash2 speculative decoding
+.\build\win-hip\src\server\r4dx-server.exe --model <container.r4dx> --layout trellis `
+    --dflash <drafter.r4dx> --dflash-k 7 --host 127.0.0.1 --port 8080
 ```
 
-On the base model that command made `qwen38-27b-v6.r4dx` (42.74 GiB, 418 s), the production container
-until 2026-09-29: mean KL 0.03851 / top-1 90.93% against the bf16 reference, 35.96 tok/s plain and
-72.93 tok/s on `--dflash k=7`. The `--keep-bf16` and the build's w4a16 group of 64 are Milestone
-11's two chosen levers -- `docs/validation.md` "Milestone 11 / recipe" has why those two and nothing
-else. The DFlash2 drafter, still the production one, is `qwen38-27b-dflash2-w4a16-g64.r4dx`,
-converted with `--dflash-gguf ... --quant search` (on the drafter, unlike the main model, `search` is
-worth 9.6% of decode).
+Useful flags: `--think on|off`, `--mtp K`, `--max-ctx N`, `--tokenizer-dir <dir>` (needs
+`tokenizer.json`, `chat_template.jinja` and `generation_config.json`), `--image <path>` and
+`--tp 2` (unset `HIP_VISIBLE_DEVICES` so both cards are visible). `--help` lists everything. The full
+reference for the converter, CLI, server and tensor parallelism is in [docs/usage.md](docs/usage.md)
+and [docs/server.md](docs/server.md).
 
-**Containers and binaries are a matched pair.** This build packs and reads w4a16 at group 64 and
-refuses `--layout w4a16` on a container packed at 128 -- `v5` and everything older -- by name, with
-both numbers and the fix in the message. (The other layouts are group-independent, so
-`--layout mxfp4` / `--layout w4a8` on those same containers still works.)
-`docs/build-windows.md` "w4a16 group size" covers `R4DX_W4A16_GROUP`, the
-`win-hip-g128` escape hatch, and the trap that an existing build directory keeps its cached group.
-
-Produces a single container carrying every requested quantized GEMM layout (plus bf16 for
-embeddings/vision/MTP tensors) side by side, so `r4dx-cli --layout` can A/B them against the same
-file. `--layers N` converts only the first `N` transformer layers (useful for a small smoke-test
-container); omit it to convert all 64. `--kv-calib` fills the fp8 KV cache's per-head descales from
-a `tools/reference/kv_calibrate.py` JSON (falls back to a `1.0` placeholder per-layer, with a
-stderr warning, if omitted or if a layer is missing from the JSON). `--no-bf16` (docs/r9700.md R1)
-drops the full-model bf16 body layout and the bf16 `lm_head` variant entirely -- the production
-containers (the trellis one, and the w4a16 recipe above) are converted this way
-(w4a8/w4a16/mxfp4 or trellis only; bf16 appears only where `--keep-bf16` asks for it, and in the small 4-layer
-test containers, which still pass `--layouts bf16,...` since bf16 is the numerical-reference layout
-rungs 1-3 of `docs/validation.md` need). Omitting `--no-bf16` produces an all-four-layouts container
-including a full bf16 body (~88 GB) -- see `docs/perf.md`/`docs/r9700.md` for why bf16 is out of
-scope for performance work. See `docs/container-format.md` for the on-disk layout and `src/convert/main.cpp`'s
-header comment for the full flag list, including `--selftest` for the byte-exact packer self-check.
-
-**`--keep-bf16 <regex>` -- one tensor class left un-quantized.** Every linear whose container base
-name the ECMAScript regex matches (a `regex_search`, so `"attn\.o$"` selects every layer's attention
-output projection and `"^text\.layers\.[0-7]\."` selects the first eight layers) is written as
-`<base>.bf16.w` alone, and `Container::Load` falls exactly those linears back to bf16 while the rest
-of the container loads in the requested layout. It exists for the per-tensor-class sensitivity sweep
-in `docs/validation.md` "Milestone 11 / sensitivity" -- convert one class in bf16, re-run the KL
-harness, and the KL that disappears is that class's share of the quantization error. A regex that
-matches nothing warns and converts normally; an invalid one is a hard error before the first shard
-is read. The flag takes ONE regex -- a second `--keep-bf16` replaces the first -- so combine sets by
-alternation, e.g. `"^text\.layers\.(?:[0-9]+\.attn\.[kv]|[0-3]\.mlp\.down)$"` (the recipe's k/v plus
-layers 0-3's `mlp.down`; `docs/quant2.md` 5.3 prices such keeps).
-
-**`--quant` / `--imatrix` -- how the 4-bit values are chosen.** Neither flag changes a single byte of
-the on-disk *layout* (docs/container-format.md, "How the quantized values are chosen"); they change
-which `q` / `scale` / `zero` values land in those bytes, so any container is readable by any loader
-either way, at exactly the same decode speed. `--quant search` replaces the historical min/max +
-round-to-nearest grid with a per-`(row, 128-K group)` search over 21 candidate scales
-(`0.85x .. 1.15x`) and three candidate integer zeros, plus a weighted least-squares refit of the
-scale. `--quant rtn` is the **default** and is the historical behaviour byte for byte.
-
-**Use them as a pair: `--quant search --imatrix <npz>`, or not at all.** `--imatrix <npz>` weights
-the search's error term by each input channel's mean activation energy, from the importance matrix
-`tools/reference/imatrix_capture.py` captures over the calibration corpus
-(`D:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names); it
-requires `--quant search`. The weighting is not a refinement, it is the whole mechanism -- measured
-on the real checkpoint against the bf16 reference (`docs/validation.md` "Milestone 10"):
-
-| mode | w4a16 mean KL / top-1 | w4a8 | mxfp4 |
-|---|---|---|---|
-| `--quant rtn` (default) | 0.0724 / 88.4% | 0.1434 / 82.72% | 0.0912 / 86.14% |
-| `--quant search` alone | 0.0713 / 87.71% | -- | -- |
-| `--quant search --imatrix` | **0.0534 / 89.30%** | **0.1164 / 84.78%** | **0.0797 / 86.09%** |
-
-The search alone lowers its own per-group objective on every single group and still buys nothing at
-model level (top-1 is 0.7 points *worse* than `rtn`), which is why `rtn` stays the default and why
-`--quant search` without `--imatrix` is not worth its ~2x conversion wall time (4-layer container:
-18.9 s -> 41.0 s; the full 64-layer search+imatrix container takes 276 s). The "search is never
-worse than rtn" property that `tests/convert/test_quant_search.cpp` gates is a statement about the
-weighted squared reconstruction error of one `(row, group)`, not about KL or top-1.
-
-The run logs how many linears it weighted and how many fell back to unweighted MSE; on this
-checkpoint that is `341 weighted, 0 fell back`. Anything else means the `.npz` is stale for this
-checkpoint and part of the model was quantized unweighted -- the coverage line says `WARNING` and
-goes to stderr in that case.
-
-**`--ldlq <regex>` / `--hessian-dir <dir>` / `--ldlq-damp <f>` -- error-feedback rounding
-(experimental, `docs/quant2.md` Q1).** A third way of choosing the values, again with the byte
-layout, kernels, loader and decode speed untouched. Every linear whose container base name the regex
-matches (`regex_search`, ECMAScript, exactly like `--keep-bf16`; `".*"` = all of them) is rounded by
-GPTQ/LDLQ against its input Hessian `H = E[x x^T]`: columns are quantized one at a time and each
-column's rounding error is pushed onto the not-yet-quantized columns through `chol(H^-1)`, so later
-columns compensate for earlier ones instead of every value being rounded in isolation. Each group's
-scale/zero is the `--quant search` grid weighted by `diag(H)`, picked on the error-updated weights.
-The Hessians come from `tools/reference/hessian_capture.py`: `--hessian-dir` is the directory it
-writes (`hessian.json` + one `.hess` file per distinct linear input, keyed by these same container
-base names). `--ldlq-damp` (default `0.01`) adds `damp x mean(diag H)` to the diagonal before
-factoring; a failed Cholesky is retried at 10x and then 100x the damp, logged, and a third failure is
-a hard error.
-
-```powershell
-.\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-ldlq-mlp.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
-    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
-    --hessian-dir D:\models\r4dx\qwen38-27b.hessian --ldlq "mlp\."
-```
-
-- Linears the regex does not match follow `--quant` / `--imatrix` exactly as without the flag; the
-  matched ones ignore both.
-- `--keep-bf16` wins for a linear both regexes match (it is not quantized at all).
-- A matched linear with no key in `hessian.json`, or whose `K` there differs from the checkpoint's,
-  is a hard error while *planning* -- before the header is written or a shard is read. A valid regex
-  that matches nothing warns and converts normally. `--ldlq` needs `--hessian-dir`, and neither
-  applies to `--dflash-gguf` (no Hessians are captured for the drafter).
-- The container's `__metadata__.r4dx_convert_run` records `ldlq` (the pattern), `ldlq_damp`,
-  `hessian_dir`, `hessian_manifest_sha256` and `ldlq_linears` (the resolved list). The log has one
-  `ldlq:` line per linear (factor and quantize seconds, `damp_used`, `retries`) and a total at the
-  end; linears sharing an input (`gdn.in_proj_qkv`/`_z`, `attn.qg`/`k`/`v`) reuse one factorization.
-
-No KL number yet: the pilot (`--ldlq "mlp\."` on top of v6) is gate G3 in `docs/quant2.md`, and Q1
-stops there if it does not cut mean KL by at least 10%. (`D:\models\r4dx\qwen38-27b.hessian` is an
-example output directory, not an existing capture.)
-
-**`--w4a16-group-rule "<regex>=<g>"` -- per-tensor w4a16 group (experimental, `docs/quant2.md`
-Q3).** Repeatable. Every linear whose container base name the regex matches (`regex_search`,
-ECMAScript, like `--keep-bf16`) is packed in w4a16 at group `g` (32, 64 or 128) instead of the
-build's `R4DX_W4A16_GROUP`. Rules are tried in the order given and the first match wins, so an
-exception goes before a broad rule (a rule may name the default group); unmatched linears keep the
-default. Smaller groups cost bytes and buy accuracy: 5 bits per weight at 32, 4.5 at 64, 4.25 at 128.
-
-```powershell
-.\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-groups.r4dx `
-    --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
-    --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
-    --w4a16-group-rule "^text\.layers\.([0-9]|[12][0-9]|3[01])\.mlp\.down$=32" `
-    --w4a16-group-rule "gdn\.in_proj_z$=128"
-```
-
-- A matched linear's scale tensor is written as `<base>.w4a16.wsz.g<g>` and listed in
-  `__metadata__.quant.w4a16.groups` (docs/container-format.md "Per-tensor groups"); nothing else
-  changes. A binary built before per-tensor groups refuses such a container rather than reading
-  the scales at the wrong stride -- which is why a non-default group on a linear that also keeps a
-  `.bf16.w` is a hard error: use `--no-bf16`, and an `--lm-head` spec without bf16.
-- `K` must be a multiple of the group and of 64, `N` of 16 -- checked while planning, before the
-  header is written. A malformed rule, an invalid regex or another group is an argument error; a
-  rule that decides no w4a16 linear warns and converts normally. `--keep-bf16` wins over a rule;
-  `--ldlq` rounds at the linear's own group. Not accepted with `--dflash-gguf`.
-- The log has one line per rule and a total (`.w4a16.wsz` bytes against the default);
-  `__metadata__.r4dx_convert_run` records `w4a16_group_rules`, `w4a16_groups` and
-  `w4a16_group_extra_bytes`. Without the flag the container is byte-identical to before.
-- Choosing the rules: `tools/quant2/group_sweep.ps1 -Convert -Kl` converts and measures (rung 4, HIP
-  device 1) one candidate per tensor class x depth half x group, plus bf16 keeps of a few sensitive
-  linear sets and un-keeps of the recipe's bf16 attn.k/v (`docs/quant2.md` 5.3, which gives the
-  `-ExtraArgs` for the q2ab + LDLQ recipe, now retired in favour of the trellis body; the default `-Recipe` alone is unrotated), and
-  `tools/quant2/alloc_groups.py` ranks them by nats of KL per GiB, fills a byte budget (default:
-  equal bytes; candidates whose linear sets overlap exclude each other, and an exchange pass plus an
-  exhaustive check settle which one by first-order KL, not by order), reports the cliff and
-  prints the flags for the chosen set -- the rules plus, when a keep or un-keep was picked, ONE
-  `--keep-bf16` that replaces the recipe's (the flag is single-valued: the last one wins). The
-  runtime side (`r4d_gemm_w4a16_nt_m64_g`, the loader and the tuning table) must be built from the
-  same tree.
-- `--reuse-tensors-from <baseline.r4dx>` writes the same container, but copies every tensor except
-  the linears whose resolved layout set differs from the baseline's: another w4a16 group, or bf16
-  (`--keep-bf16`) on one side only. Neither flag's regex is compared; both runs record every
-  linear's resolved layout in the guard. The baseline must have been converted with
-  `--record-reuse-guard` by the same binary on the same CPU, from the same checkpoint and input
-  files (all hashed, `.hess` files included), with the same flags apart from `--w4a16-group-rule`
-  and `--keep-bf16`. Its data must still match the digest it recorded. Anything else is refused,
-  naming the field. `group_sweep.ps1` does this by default (`-NoReuse` for full conversions). See
-  `docs/quant2.md` 5.2.
-
-### Generate text
-
-```powershell
-$env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
-    --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
-    --max-tokens 128 --temperature 0 --stats
-```
-
-Add `--image <path>` (repeatable, any container the vision tower loaded from) to ask about a
-picture (docs/vision.md):
-
-```powershell
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
-    --image photo.png --prompt "What is in this picture?" --max-tokens 128 --temperature 0 --stats
-```
-
-In `--chat`, attach an image to the NEXT turn with one or more leading `/image <path>` lines typed
-into the REPL before the question itself.
-
-`--layout` selects which quantized (or `bf16`) body-weight variant baked into the container to run
-(`mxfp4` / `w4a16` / `w4a8` / `bf16`, or `trellis` for a trellis container -- the only layout one
-loads with) -- as of the Milestone 2 performance pass this now includes
-attention's `qg`/`o` projections too (they used to always run bf16 regardless of `--layout`; see
-`docs/perf.md`'s "Known limitation", now resolved). `--prompt "..."` renders one turn through
-the real chat template and generates once; `--chat` instead starts an interactive multi-turn REPL
-(re-rendering the whole conversation each turn, feeding only the new tail tokens to the model).
-`--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated` (where `tokenizer.json` /
-`chat_template.jinja` / `generation_config.json` live; byte-identical to the base Qwen3.8-27B's, whose
-checkpoint dir `C:\AI\models\Qwen3.8-27B` was the default until 2026-09-29); `--think {on|off}` toggles the chat
-template's `enable_thinking`; `--temperature 0` selects greedy argmax decoding, otherwise
-temperature/top-k/top-p/min-p sampling with `--seed` applies. `--max-ctx` bounds the KV cache and
-GDN state allocation (default **262144**, matching the checkpoint's own `max_position_embeddings`
--- raised from a stale 131072 self-imposed cap, docs/r9700.md R13, 2026-09-20: real hardware
-measurement shows the full 262144-token KV+GDN allocation still leaves 21-24% of the R9700's 32 GiB
-free, and generation at 262144 real prefilled tokens is coherent and correct, see
-`docs/perf.md`'s "Long-context validation"; the bf16 layout needs a much smaller value regardless,
-since its 47.73 GiB of weights alone do not fit on this card -- see `docs/perf.md`). `--stats`
-prints container-load time, prefill/decode tokens/s, and VRAM used, plus
-(when `--mtp K>0`) an MTP acceptance-rate line. `--mtp K` (default 0) enables MTP self-speculative
-decode: each decode round drafts up to `K` tokens via the checkpoint's own `mtp.*` weights, verifies
-them against the real model in one batched call, and commits the accepted prefix (plus one corrected/
-bonus token) -- **runs at any `--temperature` as of Milestone 6 stage S3**: `--temperature <= 0`
-accepts a draft iff it equals the target's argmax (unchanged); `--temperature > 0` accepts it by
-"sample-and-match" rejection sampling, which is lossless IN DISTRIBUTION (exactly one uniform draw
-per emitted token, against the request's own post-filter distribution). For a fixed `--seed` the
-emitted tokens match plain sampled decode's only up to a pre-existing, unrelated numeric mechanism:
-a speculative round's logits come from one batched GEMM pass whose reduction order differs from
-single-row decode's, which a CDF walk (unlike a greedy argmax) can be sensitive to on near-tie
-candidates -- on the real 64-layer container this makes most sampled trajectories diverge from
-plain decode's own text somewhere (measured 6/8 96-token trajectories in one sweep), though every
-diverging token is still a legitimate canonical sample of the round that actually ran
-(`docs/sampling.md` sections 9.3, 11-12, `tools/validate_spec_sampling.ps1`). See `docs/mtp.md` for
-the full design, the container requirement (the container must carry
-`mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
-per layout (roughly +75-165% decode throughput over `--mtp 0` at each layout's best `K` -- w4a16
-`K=3`, w4a8 `K=4`, mxfp4 `K=3`, see `docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable
-default). See `src/cli/cli_args.h` for the full flag list and `docs/perf.md` for measured throughput
-per layout.
-
-`--dflash <draft.r4dx>` (Milestone 5, docs/dflash2.md) enables DFlash2 block-diffusion
-self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, runs at any
-`--temperature` (same sample-and-match acceptance, lossless in distribution, as `--mtp` above --
-including the same batched-verify numeric caveat on a fixed-seed token-for-token match -- as of
-Milestone 6 stage S3), needs a separate DFlash2 draft container
-(`D:\models\r4dx\qwen38-27b-dflash2-{w4a16,w4a8,mxfp4,bf16}.r4dx`),
-independent of the target's own `--layout`. `--dflash-k N` (1..7, default 7), `--dflash-p-min F`
-and `--dflash-n-min N` tune the selector walk's early-stop/discard gates. Best measured so far
-(docs/perf.md's Integrate-stage final confirmation sweep, each layout's own best `--dflash-k`
-vs. best `--mtp K`, twice each): on a ~270-token code prompt, DFlash2 **beats MTP on all three
-layouts** -- w4a16 **116.90/116.84 tok/s** (77.4% acceptance) vs MTP's 89.45/89.44 (+30.7%), w4a8
-**109.22/109.29** vs 87.53/87.71 (+24.6%), mxfp4 **94.30/94.30** vs 75.50/75.68 (+24.9%). On the
-standard haiku prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.62, +12.2%) and w4a8
-(64.79/64.76 vs 57.69/57.66, +12.3%), but MTP still leads on mxfp4 (64.91/64.91 vs 58.57/58.63,
--9.8%) -- prompt-dependent, not a fixed ranking. Best single cell (w4a16/code) is within 3% of the
-120 tok/s / 84% acceptance the reference ROCmFPX implementation reaches on this same card/draft. The
-`p_min` sweep, the w4a8/mxfp4 DRAFT containers, and the mxfp4/standard-prompt acceptance gap are
-still open (docs/dflash2.md section 7a, docs/perf.md's top section).
-
-**Sampled (`--temperature > 0`) traffic, Milestone 6 stage S3.** The numbers above were all greedy
-(`--temperature 0`) -- the setting real chat clients almost never use. As of this stage, `--mtp`/
-`--dflash` speculation and the plain decode path's device-row-summary sampler
-([sampling.md](docs/sampling.md)) both run at any temperature, lossless IN DISTRIBUTION -- a
-fixed-seed sampled speculative request's text matches plain sampled decode's only up to the
-pre-existing batched-verify numeric mechanism described above, which in practice moves most
-trajectories on the real container. Measured, real 64-layer container: plain sampled decode's tax
-over greedy fell from 6.2-7.5% to statistical parity (within about -0.8% to +0.7%, re-confirmed by
-the Integrate stage), and w4a16's best sampled `--dflash k=7` cell reaches **154.28, 154.23 tok/s**
-on a code prompt (4.28x plain sampled decode's pre-stage cost) -- see `docs/perf.md`'s top section
-for the full matrix (all three sampling configs x both prompts x all three layouts, twice each) and
-`docs/sampling.md` section 12.
-
-### Tensor parallel across both GPUs (`--tp 2`)
-
-`--tp 2` splits the model over this machine's two R9700s: each card holds half of every layer
-(about 10 GiB of VRAM per card at `--max-ctx 2048`, against 17 GiB at TP=1; the 262144 default
-adds KV cache, ~16-17 GiB per card), one process drives both with a thread per
-card, and the two all-reduces per layer go through pinned host memory (the cards have no
-peer-to-peer path). Its output is byte-identical to `--tp-mode emulate` (both halves on one card)
-and its KL against the bf16 reference matches TP=1's (0.03853 vs 0.03856). It is not bit-identical
-to TP=1: the split changes the order of the sums. Design, gates and measurements: `docs/tp.md`
-(Appendix B N65 for the P4 gates).
-
-```powershell
-Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --tp 2 `
-    --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
-    --max-tokens 256 --max-ctx 2048 --temperature 0 --stats
-```
-
-Flags: `--tp 2` (`--tp-mode real` by default; `emulate` puts both halves on one card), `--tp-devices
-a,b` (default: rank 0 on HIP device 1, rank 1 on device 0), `--tp-ar-timeout-ms` (500), and
-`--tp-submit-layers` / `--tp-max-inflight` (32 / 1: how finely a prefill chunk's GPU work is
-submitted and capped). `--stats` adds per-card VRAM and a `[stats] tp:` line.
-
-Requirements and caveats:
-- Two visible HIP devices: unset `HIP_VISIBLE_DEVICES` (with it set to `1`, `--tp 2` is refused).
-- The production `r4dx-server` stopped: it holds ~28 GiB of device 1.
-- HIP device 0 drives the desktop and cannot preempt compute, so `--tp 2` puts sustained load on the
-  display card. An unbounded all-reduce stress there caused Windows TDRs (GPU resets) in P3
-  (`docs/tp.md` N44). With the submission bounding on, a 60-minute soak and a 10M all-reduce stress
-  ran with the desktop live and no TDR (N65). Long runs go through `tools\tp\soak.ps1`, which stops
-  at the first TDR.
-- `--mtp` is at most 7 under `--tp 2` (63 at TP=1).
-
-`--dflash <drafter> --dflash-k 7`, `--mtp 3`, `--vision on --image <png>` and `r4dx-server` all
-take `--tp 2` with the same flags as at TP=1. Every rank holds a full copy of the DFlash2 drafter, and
-the vision tower runs on rank 0. The server needs `HIP_VISIBLE_DEVICES` unset and no other
-`r4dx-server` running; after a failed request (e.g. an all-reduce timeout) the next request resets
-the group and runs normally:
-
-```powershell
-Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
-    --host 127.0.0.1 --port 8080 --tp 2 `
-    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
-```
-
-Decode speed, standard protocol, one fresh process per run, TP=1 on device 1 in the same session
-(2026-09-25, on the base `qwen38-27b-v6.r4dx` at w4a16 -- retired; the plain row is from the P4
-gates, the other two from P5's; the Huihui trellis container's TP=1 numbers are in
-`docs/huihui.md`):
-
-| Path | TP=1 | TP=2 |
-|---|--:|--:|
-| plain greedy | 36.06 tok/s | **59.65 / 59.33** (1.65x) |
-| `--dflash <g64 drafter> --dflash-k 7` | 74.73 | **118.75 / 119.96** (1.59x / 1.61x) |
-| `--mtp 3` | 68.74 | **107.90 / 107.92** (1.57x) |
-
-DFlash2's tokens per round over the four `tests/model/mtp_prompts.txt` prompts average 4.135 at TP=2
-against 4.028 at TP=1. The server's smoke passes at `--tp 2` with DFlash2, MTP, images and an injected
-all-reduce fault. As at TP=1, sampled speculative text can differ from plain sampled text through the
-batched-verify mechanism. `tools/validate_spec_sampling.ps1 -Layouts w4a16` leaves 3 of 24 rows
-unresolved at TP=2 and 5 at TP=1, all of them `--mtp 3` and the TP=2 three among the TP=1 five, so
-it exits 1 at both and gate G12 is not met. docs/perf.md has the rest; `docs/tp.md` Appendix B N82
-has the P5 gates.
-
-## Run the OpenAI-compatible server
-
-```powershell
-$env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
-    --host 127.0.0.1 --port 8080 `
-    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
-```
-
-`--dflash` is optional (drop the last line for plain decode). On a default (w4a16 group 64) build the
-w4a16 drafter must be the group-64 one, `qwen38-27b-dflash2-w4a16-g64.r4dx`; the group-128
-`qwen38-27b-dflash2-w4a16.r4dx`, and group-128 main containers such as `qwen38-27b-v5.r4dx`, are
-refused at load with an error naming both groups (a `-DR4DX_W4A16_GROUP=128` build reads them).
-
-Exposes `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming via `"stream":
-true` or non-streaming JSON), and `POST /v1/completions` (raw prompt, no chat template) -- a subset
-of the OpenAI chat/completions API, single model, single GPU, one request processed at a time by a
-dedicated worker thread (see `docs/server.md`'s "Concurrency model"). Multi-turn conversations reuse
-the KV/GDN cache across requests the same way `r4dx-cli --chat` does, by matching each request's
-full re-tokenized prompt against the tokens already committed to the model's state and re-prefilling
-only the new tail (via a cheap `Model::Reset()`, not a full reload, on any state-handling boundary
-where the engine must catch up), or reloading from scratch only on a genuine prefix mismatch.
-`--mtp N` (Milestone 3) enables server-side MTP self-speculative decode identically to `r4dx-cli
---mtp`: a request takes the MTP path iff the server was started with `--mtp N>0` against an
-MTP-converted container AND that request is greedy (`temperature <= 0`); every accepted token still
-streams as soon as it is committed. `--mtp-head-layout {bf16,layout}` is also a server-side flag now (mirrors the CLI), as is
-`--mtp-draft-head {reduced,full}` (docs/r9700.md R9, "reduced-vocab draft head" -- see docs/mtp.md
-for the design, measured coverage, and K-sweep). `--dflash <draft.r4dx>` (Milestone 5,
-docs/dflash2.md) is the same server-side passthrough for DFlash2 as the CLI's own flag above,
-mutually exclusive with `--mtp`; `tools/server/smoke.ps1 -Dflash <path>` verified it end to end
-against the real container (streaming and tool-call mode both unaffected). Tool calls (OpenAI `tools`/`tool_choice`/
-`message.tool_calls`/`role: "tool"` multi-turn round trips) are fully supported -- `tools` are
-rendered into the prompt and a model-emitted `<tool_call>` is parsed back into a structured
-`message.tool_calls` response (JSON-encoded `arguments` string, stable generated `id`s,
-`finish_reason: "tool_calls"`), with malformed/unknown-tool output degrading to plain content
-rather than erroring; see `docs/server.md`'s "Tool calls" section for the confirmed model surface
-syntax, `tool_choice` coverage, and the streaming (buffer-whole) decision. Images (Milestone 8
-stage 5, docs/server.md's "Images"): standard OpenAI `image_url`/`input_image` content parts, any
-number of images in any position across a conversation, against a container whose vision tower is
-loaded --
-
-```powershell
-$b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("photo.png"))
-curl.exe -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d @"
-{"messages":[{"role":"user","content":[
-  {"type":"image_url","image_url":{"url":"data:image/png;base64,$b64"}},
-  {"type":"text","text":"What is in this picture?"}]}],
- "max_tokens":128,"temperature":0}
-"@
-```
-
-A remote (`http://`/`https://`) `image_url` is never fetched (a clean `400`); an image against a
-container with no vision tower loaded is also a clean `400` naming the reason. See `docs/server.md`
-for the full endpoint/field reference and a captured real streamed answer, and
-`tools/server/smoke.ps1` for the GPU integration smoke test (`.\tools\server\smoke.ps1` against the
-small 4-layer test container by default; pass `-Model`/`-Layout`/`-Layers -1`/`-Mtp N` to point it
-at a real container with MTP enabled, `-ToolRoundTrip` to exercise a real tool call/result/answer
-round trip, and `-Vision` to exercise the full image suite -- description, OCR, multi-image,
-image+tools, image+thinking, streaming, and multi-turn prefix reuse -- against a vision-capable
-container).
-
-## Layout
+## Repository layout
 
 ```
-third_party/    r4d_core (libr4d submodule) + vendored header-only deps
-src/core/       device/stream/buffer plumbing
-src/kernels/    r4dx-owned HIP kernels (rmsnorm, rope, silu_mul, kv paging, sampling, ...)
-src/model/      layer graph / forward pass
-src/tokenizer/  tokenizer
-src/convert/    weight converter (HF checkpoint -> r4dx container)
-src/server/     OpenAI-compatible chat API (r4dx-server)
-src/cli/        text-generation CLI (r4dx-cli)
-tests/          smoke + unit tests
-docs/           architecture, container format, build notes, status
-tools/          Python reference/validation tooling (read-only against the HF transformers venv)
+src/core/       device, stream, buffer and all-reduce plumbing
+src/kernels/    r4dx-owned HIP kernels (norms, rope, sampling, tensor-parallel, ...)
+src/model/      layer graph and forward pass
+src/tokenizer/  tokenizer and chat template
+src/convert/    checkpoint -> container converter
+src/vision/     vision tower
+src/server/     OpenAI-compatible server (r4dx-server)
+src/cli/        command-line generator (r4dx-cli)
+third_party/    libr4d GPU kernels and vendored header-only libraries
+tests/          unit, integration and GPU tests
+tools/          quantization, validation, benchmarking and reference scripts
+docs/           design notes and measurements
 ```
 
-## Status
+## Documentation
 
-**Default container (2026-09-29): the Huihui abliterated trellis mix4.5m,
-`huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, with `--layout trellis`.** Canonical rung-4 KL 0.00788
-(top-1 95.70%) against the Huihui model's own bf16 reference, 13.55 GiB of decode bytes, on a native
-RDNA4 WMMA trellis kernel; TP=1 plain 36.67 tok/s, `--dflash k=7` 108.21 tok/s (lower acceptance
-than on the base model: the DFlash2 drafter was trained for the base), prefill 1131 tok/s. It has the
-base model's trellis mix4.5m recipe (below), every calibration artifact taken from the Huihui model
-itself. Details, the frozen regression baselines and the coverage notes: `docs/huihui.md`. **The base
-Qwen3.8-27B checkpoint and every container made from it are retired** (v6, the base trellis mix4.5m
-and K4m, its Hessians and trellis bits): the numbers below that name them (KL 0.00747, the K4m speed
-option, v6's 0.03851) are historical measurements on the base model, kept as the record of the recipe
-and of the w4a16 path. Recipe and numbers: `docs/quant2.md` 7.1; gates: `docs/trellis-kernel.md` section 1 and 10;
-format: `docs/container-format.md` "Trellis body layout". Everything below about v6 and w4a16 still
-holds for `--layout w4a16` containers.
+| Topic | Page |
+|---|---|
+| Architecture and module map | [docs/architecture.md](docs/architecture.md) |
+| Container format | [docs/container-format.md](docs/container-format.md) |
+| Building on Windows | [docs/build-windows.md](docs/build-windows.md) |
+| Trellis quantization and kernel | [docs/quant2.md](docs/quant2.md), [docs/trellis-kernel.md](docs/trellis-kernel.md) |
+| Default model and baselines | [docs/huihui.md](docs/huihui.md) |
+| Speculative decoding | [docs/mtp.md](docs/mtp.md), [docs/dflash2.md](docs/dflash2.md), [docs/sampling.md](docs/sampling.md) |
+| Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
+| Tensor parallelism | [docs/tp.md](docs/tp.md) |
+| Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
+| Hardware notes | [docs/r9700.md](docs/r9700.md) |
+| Detailed usage and history | [docs/usage.md](docs/usage.md), [docs/status.md](docs/status.md) |
 
-*Historical (base model, 2026-09-28):* `qwen38-27b-trellis-mix45m.r4dx` had canonical rung-4 KL 0.00747
-(top-1 96.26%) against q2ab_hv2_q3's 0.01559 (94.92%) at 13.55 against 13.68 GiB of decode bytes;
-decode +1.1% plain, +6.3% `--dflash k=7`, -1.8% `--mtp 3` (acceptance), prefill 1.55x.
-`qwen38-27b-trellis-k4m.r4dx` (KL 0.01004, 12.13 GiB) was the speed option: +11% plain, +13% DFlash,
-+3.7% `--mtp 3`, prefill 1.60x. Only the base K4m container is gone: the Huihui model's own K4m
-oracle bits exist (`D:\models\r4dx\huihui\trellis-q\K4m`) and `trellis_convert.ps1 -Oracle K4m` would
-build a container from them, but that container has not been built or measured, so none of the base
-K4m figures is claimed for it. **q2ab is retired**: q2ab_hv2_q3 is quoted only as the historical
-baseline these gains were measured against.
+## License and credits
 
-**Milestone 11 done: `qwen38-27b-v6.r4dx` is the production container (2026-09-22).** Mean KL
-**0.05342 -> 0.03851** (-27.9%) and top-1 **89.30% -> 90.93%** against the bf16 reference, bought
-with +0.8989 GiB of weights (`weights=16.4065 GiB`) for **-7.2% plain decode** (35.96 tok/s) and
-**-4.8% on `--dflash k=7`** (72.93 tok/s, 24.9% acceptance). The two levers -- w4a16 group **64**
-(now the build default) and `--keep-bf16` on `attn.k`/`attn.v` -- were picked by ranking every
-candidate on nats-of-KL-per-GiB; they are the only two above 0.015, the third-best is 4.4x worse
-per byte, and 0.56 GiB of the +1.5 GiB budget was left unspent on purpose. Costed on paper first,
-and the prediction held to 1.5% on KL and 0.23% on VRAM. **This is a breaking change for older
-containers** -- see the matched-pair note under "Convert a checkpoint to a container" above.
-`docs/validation.md` "Milestone 11 / recipe", `docs/perf.md`'s Milestone 11 entry.
+r4dx is released under the [MIT License](LICENSE).
 
-**Rung 4 (teacher-forced KL vs bf16) measured and audited (2026-09-22).** `w4a16` overall mean KL
-0.08794 nats / 87.00% top-1 agreement vs the original bf16 checkpoint on a held-out 4-segment
-corpus. The number survived an adversarial audit (`tools/reference/kl_audit.py`,
-`tools/reference/reference_selfcheck.py`): the bf16 reference matches a plain `transformers`
-forward to one bf16 ulp per position, its own self-noise at 64 layers is 3.9e-04 nats, and the
-`thai_prose` outlier is the extended-vocabulary tail of the 4-bit `lm_head`, not a measurement bug
--- see `docs/validation.md`'s "Rung 4 measurement: w4a16" and "Auditing this measurement".
-
-**Milestone 8 done, integrated and measured (2026-09-22, stage 8).** Every gate green on a clean
-`build.ps1 -Clean`: `ctest` 62 registered/61 passed/1 skipped, `tools/validate_dflash.ps1
--AllowBatchedVerifyDivergence` passed with the same 4-identical/5-known-divergence result as
-before, and `tools/server/smoke.ps1` clean on the default 4-layer container, the real container with
-`-Dflash -ToolRoundTrip`, and the real container with `-Vision -Dflash` (191 PASS, 0 FAIL). Headline
-numbers, real 64-layer container, `w4a16`, `--dflash k=7` server config, greedy, twice each:
-
-| | 448x448 | 1024x1024 | 1536x1536 (default cap) |
-|---|---|---|---|
-| Image tokens | 196 | 1024 | 1024 (downsized) |
-| Encode ms | 33-34 | 159-160 | 160-161 |
-
-Prefill with an image: ~995-1003 tok/s (same rate as text). Decode + acceptance on a 1024x1024
-image prompt: plain 38.5-38.6 tok/s, `--mtp 3` 79.4-79.5 tok/s (58.5% acceptance), `--dflash k=7`
-86.9 tok/s (33.1% acceptance). VRAM: `--vision off` 16.17 GiB vs `--vision auto` 17.03-17.04 GiB
-(+0.86-0.87 GiB). Text-only decode with the tower resident: 38.75-38.81 tok/s -- no regression
-against this project's own w4a16 baseline range. Full table: `docs/perf.md`'s "Milestone 8, stage
-8" section. Known gaps (video input, remote/webp images, a real-photograph end-to-end check, the
-non-ASCII prefix-cache round-trip gap): `docs/status.md`'s Milestone 8 stage 8 entry.
-
-**User-facing image input shipped (2026-09-22, stage 5).** `--image <path>` (repeatable) on
-`r4dx-cli`, `/image <path>` lines in `--chat`, and OpenAI-shaped `image_url`/`input_image` content
-parts on `r4dx-server`'s `/v1/chat/completions` -- real-hardware verified: describing a synthetic
-image, reading a rendered string back off an OCR image exactly, two images in one request, image +
-tools, image + thinking, streaming, and an image-aware prefix cache (a turn that reuses an earlier
-turn's own image does not re-encode it; a different image at the same conversation position never
-reuses the wrong turn's KV state). A container with no vision tower now answers a clean `400`
-naming the reason instead of the old blanket "not implemented". Full detail:
-`docs/vision.md`'s "User-facing wiring: --image and image_url", `docs/server.md`'s "Images".
-
-**The model answers questions about a picture (2026-09-22).** The vision tower's merged rows are
-now spliced into the text embedding sequence at the image-placeholder positions, and 3-axis
-`(t, h, w)` mrope position ids reach every rope call site in the decode stack -- prefill (chunked
-included), plain decode, MTP verify and draft, DFlash2 injection and draft blocks. With an image in
-the prompt a token's rope position and its KV slot index stop being the same number, permanently
-for the rest of the conversation, so `Model::PrefillMultimodal` records the mrope delta and every
-later step ropes at `sequence index + delta` while its slot stays the sequence index. Greedy, on
-the real container: the synthetic golden image is described correctly (gradient, checkerboard,
-circle); a three-bar chart's count, colours and ordering are all correct; five circles are counted
-as `5`; `R4DX7391` is read exactly off a rendered text image. `--mtp 3` and `--dflash k=7` produce
-byte-identical output to plain decode with acceptance *higher* than the same question asked
-without a picture (2.91 vs 2.21 and 3.14 vs 2.52 tokens/round). Text-only generation is
-byte-identical to a build of the last pre-vision commit on all three paths. ~~`--image` on the CLI
-and `image_url` on the server are the next stage; `image_url` is still rejected with `400`.~~
-**Done, 2026-09-22, stage 5 -- see the entry above.** Full
-detail, including why the ring slot and the rope position deliberately part company for DFlash2:
-`docs/vision.md`.
-
-**Vision tower, on the GPU (2026-09-21).** `Qwen3_5VisionModel`'s forward now runs on device:
-`src/vision` loads the container's 333 `vision.*` bf16 tensors (0.9154 GiB measured) and runs patch
-embed -> the learned 48x48 position grid -> 27 encoder blocks over `r4d_attn_vit_h72_bf16` -> the
-2x2 patch merger, validated tensor by tensor against the real checkpoint's own forward (56 tensors
-across three golden cases, including every encoder block's output and a two-image batch). Encode
-cost, real container, best of 3: **27.7 ms for 448x448, 149.5 ms for 1024x1024, 396.7 ms for
-1536x1536** -- and 2048x2048 still fits next to the loaded 27B at the full 262144-token KV
-allocation with 6.5 GiB free. `--vision {auto|on|off}` decides whether the 0.9 GiB is paid at all
-(text-only output is byte-identical either way) and `--image-max-pixels N` (default 1024x1024)
-downsizes a large attachment through the reference's own `smart_resize` rather than rejecting it.
-Full detail, including why the deep-block numeric disagreement is the reference's own bf16
-attention rather than an r4dx error: `docs/vision.md`.
-
-Milestone 1 (container loader, GDN + attention layers, model forward, `r4dx-cli` text generation),
-Milestone 2 (`r4dx-server` OpenAI-compatible chat API, a decode/prefill performance pass, and MTP
-self-speculative decode), Milestone 3 (quantized `gdn.in_proj_z`/`attn.k`/`attn.v` + a 45 GiB real
-container, fused residual+rmsnorm (R3), vectorized rmsnorm/residual_rmsnorm/silu_mul kernels (P6), a
-configurable/measured MTP head layout, a device-resident embedding gather + MTP draft loop, and
-server-side `Model::Reset()`/MTP/prefix-reuse hardening), and **Milestone 4** are all complete and
-integrated. Milestone 4 (2026-09-20) root-caused and enabled the fused activation-quant epilogues
-(R2/P2) for w4a8/mxfp4 (an `r4dx::core::Arena::Alloc` end-alignment gap; w4a16 stays unfused, a
-separate measured wall-clock regression, not a correctness issue); re-swept
-`src/model/gemm_tuning_table.inc` with a Q5-fixed methodology that eliminates cache-flattery
-(mxfp4 decode improved, w4a16 flat, w4a8 `--mtp 3` regressed -- attributed to verify-band GEMM
-retiling + numerical reduction-order drift, not a correctness bug); root-caused the MTP acceptance
-gap to h_seed drift on one outlier residual dimension (a measured, expected quantization effect, not
-a bug); built a reduced-vocab MTP draft head end to end (container format, loader, kernel, `K`
-widened to 16) -- mechanism verified lossless on real hardware, but its ~2.5-3x economic projection
-was not realized because this machine's only calibration corpus (WikiText-2) is too small; validated
-long-context generation to the model's own native 262144-token ceiling and raised `--max-ctx`'s
-default accordingly; documented the vision tower's full architecture against real `transformers`
-source with real-hardware validation goldens (`docs/vision.md`) but did not implement its C++; and
-shipped full OpenAI `tools`/`tool_choice`/`role:"tool"`/`"function"` support, hardened by a dedicated
-review pass (8 findings, all fixed and regression-tested) -- see "Tool calls" below and
-`docs/server.md`. See `docs/status.md` for the full Milestone 4 work-item table, what exists, what
-passes, known gaps, and the proposed next milestone (the tiled WMMA prefill GEMM kernel (R10/P9),
-then the vision tower's C++, then DFlash2 drafting).
-
-Headline decode throughput on the real 64-layer container (each layout's own best `--mtp K`, HIP
-device 1, post-Milestone-4 integration): **w4a16 68.73 tok/s (`K=3`, 46.3% acceptance), w4a8 57.86
-tok/s (`K=4`, 31.0%), mxfp4 65.04 tok/s (`K=3`, 52.9%)** -- see `docs/perf.md`'s consolidated
-Milestone 1 -> 2 -> 3 -> 4 table for the full progression.
+The GPU kernels in `third_party/libr4d` come from
+[libr4d](https://codeberg.org/StillDeadcode/libr4d) by StillDeadcode and contributors. That project does
+not state a licence, so its code is used here for experimentation, credited to its authors and removed
+on request; see [NOTICE](NOTICE). The trellis GEMM and other additions built on top of it are part of r4dx.
+Vendored header-only libraries (nlohmann/json, cpp-httplib, minja, stb_image) keep their own licences;
+versions are listed in `third_party/VERSIONS.md`.

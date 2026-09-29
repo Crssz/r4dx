@@ -1,0 +1,26 @@
+r4dx third-party notices
+========================
+
+libr4d
+------
+r4dx builds against the HIP kernel library libr4d (RDNA4 / gfx1201 attention, Gated DeltaNet and GEMM
+kernels), written by StillDeadcode and contributors:
+
+    https://codeberg.org/StillDeadcode/libr4d
+
+The upstream repository does not state a licence. The kernels are used in r4dx for experimentation and
+all credit for them belongs to their authors. If an author would like them removed, or would like different
+attribution, please open an issue and they will be changed or removed promptly.
+
+Additions and changes made in this repository on top of libr4d (for example the trellis GEMM kernels, the
+exact-wide and split-KV prefill attention launches and the M=256 GEMM prototype) are part of r4dx and covered
+by its MIT licence. That licence does not extend to the unmodified upstream code.
+
+Vendored header-only libraries
+------------------------------
+Each keeps its own licence, stored next to the file under third_party/ (see third_party/VERSIONS.md):
+
+    nlohmann/json   https://github.com/nlohmann/json
+    cpp-httplib     https://github.com/yhirose/cpp-httplib
+    minja           https://github.com/google/minja
+    stb_image       https://github.com/nothings/stb

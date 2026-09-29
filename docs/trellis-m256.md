@@ -3,7 +3,10 @@
 Status: a measured prototype on branch `linear`. Nothing in r4dx calls it: it is not in `R4D_UNITS`, not in
 `ApplyLinear`, no shipped kernel, tuning row or default changed. Kernel `third_party/libr4d/
 r4d_gemm_trellis_nt_m256.hip` (libr4d branch `linear`), bench `tests/kernels/tool_trellis_m256_bench.hip`
-(`build_m256_bench.ps1`, hipcc, no CMake target).
+and real-weight check `tests/kernels/tool_trellis_m256_real_check.hip` (`build_m256_bench.ps1 [-Tool
+real_check]`, hipcc, no CMake target). Since stage S1 the kernel reproduces EVERY shipped M = 64 tuning row
+(all seven classes x KB 4/5, including mlp.down KB 4's SK 16) bit for bit; there is no row left that would
+need re-pinning.
 
 ## What it is
 
@@ -12,57 +15,103 @@ each 64-row slice at the same (SK, SKG). Every accumulator keeps its k-ordered c
 slices are summed in slice order from 0.f, the SKG partials in y order from 0.f, then the stock FWHT stages,
 svh, out_scale and one bf16 rounding. Row tiles are independent in WMMA, so nothing else can differ.
 
-* Decode shared through LDS (the "M8" idea, docs/trellis-kernel.md 4.7). A workgroup is RG x SK waves
-  (RG = M / 64). Wave (rg, ks) owns rows 64 rg.. and K slice ks with the stock MT = 4 accumulator tile. Per
-  step of U k-tiles the RG waves of one K slice each decode ONE of the slice's NP x U (tile pair, k-tile)
-  blocks, store the two f16 fragments (ds_store_b128) to a double-buffered LDS slot, one workgroup barrier,
-  then every wave reads all of them (ds_load_b128) and runs NP U 2 4 WMMA. Decode and weight loads are
-  amortised over 256 rows. Shipped configuration: RG 4, NP 1, U 4 (Wc = 32 columns per block, 16 waves for
-  SK 4), 174 VGPRs at KB 4 and 186 at KB 5, no scratch, LDS 32 KB staging / 48 KB reduction.
+* Decode shared through LDS (the "M8" idea, docs/trellis-kernel.md 4.7). A workgroup is RG x SKW waves
+  (RG = M / 64, SKW = K slices resident, at most 32 waves). Wave (rg, ks) owns rows 64 rg.. and K slice ks of
+  the current group with the stock MT = 4 accumulator tile. Per step of U k-tiles the RG waves of one K slice
+  each decode ONE of the slice's NP x U (tile pair, k-tile) blocks, store the two f16 fragments (ds_store_b128)
+  to a double-buffered LDS slot, one workgroup barrier, then every wave reads all of them (ds_load_b128) and
+  runs NP U 2 4 WMMA. Decode and weight loads are amortised over 256 rows. Shipped configuration: RG 4, NP 1,
+  U 4 (Wc = 32 columns per block), 172 VGPRs at KB 4 and 184 at KB 5 (183-192 for the phased ones), no
+  scratch in any configuration the model's shapes use, LDS 32 KB staging / 24-48 KB reduction.
+* SK 16 and every other SK > SKW: PH = SK / SKW groups of SKW slices are walked one after the other by the same
+  workgroup (`skw` argument; default min(SK, 4)). Slice = group * SKW + ks keeps its own k-tile range, its chain
+  of 16-k WMMA restarts from zero, so each slice partial is exactly the shipped one. The shipped SK sum is a
+  LEFT FOLD from 0.f in slice order (m64 kernel: `v = 0.f; for s < SK: v += red[s]`), so it can be cut into
+  groups: at the end of group g the owner of tile i (slice i % SKW of the group) sums the group's SKW partials
+  in slice order starting from the running sum of groups 0..g-1 instead of 0.f (group 0 starts from 0.f, as the
+  shipped kernel), and parks the result in its own ws unit (the unit the final sum lands in; same lanes read it
+  back, a workgroup fence and barrier between). The added terms and their order are the shipped ones, so the
+  bits are. Cost: PH x (LDS reduction, barrier, one ws round trip), no extra accumulators. The phase loop is
+  fully unrolled (a rolled loop spilled 28-80 B/lane: the compiler hoists the lane offsets out of it).
+* A slice's k-tile count need not be a multiple of U: TAIL = ktw % U trailing k-tiles run as one short step in
+  which only the waves whose block index is below TAIL decode (the last full step preloads exactly those
+  waves' tail blocks; the others re-read their current block, so nothing is read outside the slice). mlp.down
+  KB 4 is 34 k-tiles per slice (SK 16, SKG 2, K = 17408): 8 steps of 4 + a tail of 2. TAIL is a template
+  parameter (0 everywhere; 2 instantiated for (SKW, PH) = (4, 4) and (8, 2)); another value fails with a clear
+  message. k-tile order per accumulator is unchanged, hence bit identity.
 * Epilogue in the accumulator layout (all lane-contiguous b128, no transposes):
-  (1) SK reduction: tile i is owned by slice i % SK; the other slices store their acc[.][.][i] to LDS, the
+  (1) group reduction: tile i is owned by slice i % SKW; the other slices store their acc[.][.][i] to LDS, the
   owner sums in slice order taking its own term from registers; (2) the owner writes the sum to ws in lane
-  order and takes a ticket (the stock scheme: the last of the SKG x 128/Wc contributors finishes, tickets
-  reset themselves, no inter-block wait); (3) the last block y-sums the ws units, runs all seven FWHT stages
-  in registers (lane bits 0-2, the f pair, lane bit 3, then the block index), scales and stores bf16.
+  order and, after the last group, takes a ticket (the stock scheme: the last of the SKG x 128/Wc contributors
+  finishes, tickets reset themselves, no inter-block wait); (3) the last block y-sums the ws units, runs all
+  seven FWHT stages in registers (lane bits 0-2, the f pair, lane bit 3, then the block index), scales and
+  stores bf16.
 * ws is SKG M N x 4 B (gate_up 35.6 MB, down 10.5 MB at M = 256); tickets N/128 words, as the stock kernel.
 
-## Bit identity (MEASURED, `tool_trellis_m256_bench --mode verify`)
+## Bit identity against the SHIPPED rows (MEASURED, S1: logs under D:\models\r4dx\linear\S1\logs)
 
-C[256][N] bf16 of one launch equals, byte for byte, four M = 64 launches of the shipped kernel on the same
-inputs, against EVERY legal stock tuning of the same (SK, SKG) (WV 1/2/4, NP 1/2, U 1/2/4, NT 0/1: 24-25 of
-them per shape, including the shipped table row), for all seven linear classes x KB 4/5, 6 seeds, with the
-n_split (two activation matrices) pass, M = 128 against two launches (4 seeds). Zero differing bytes, tickets
-reset every time. Negative control: against a stock tuning of a different SK the same comparison finds
-206-13345 differing bf16 per shape (0.08-0.15%), so it does detect an accumulation-order change.
-Coverage limit: random weights (any 32-bit words decode), random f16 A, M a multiple of 64.
+The comparison target is the shipped M = 64 tuning-table row of each (class, KB), read from
+`src/model/gemm_tuning_table_trellis.inc` (M = 64 band): mlp.gate_up SK 4; mlp.down SK 16 (KB 4) / SK 4
+(KB 5), both SKG 2; qkv SK 2; z SK 4 (KB 4) / 8 (KB 5); out and attn.o SK 4 / 8; qg SK 4; attn.k, attn.v SK 8.
 
-## Speed (MEASURED, device 1, final_m256_run1/2.log, rounds 15, batch 6 weight copies)
+* Random weights (`tool_trellis_m256_bench --mode verify --seeds 6`, verify_all_s6_final.log): C[256][N] bf16
+  of one launch equals, byte for byte, four launches of the shipped kernel against the shipped row AND every
+  other legal stock tuning of the same (SK, SKG) (12-25 of them per shape), for all seven classes x KB 4/5,
+  EVERY (SKW, SK / SKW) the kernel has for that SK (SK 16: W4 x4, W8 x2; SK 8: W2 x4, W4 x2, W8 x1; SK 4:
+  W2 x2, W4 x1; SK 2: W2), 6 seeds, one activation matrix and the n_split pass (two activation matrices,
+  columns split N/2): 360 of 360 comparisons SHIPPED ROW IDENTICAL, 0 differing bytes, tickets reset every
+  time. Each M = 256 launch is repeated 8 more times and must give the same bytes (a race in the running-sum
+  handoff would show). M = 128 against two launches (4 seeds, `--m128`, verify_m128.log): 176 of 176 identical;
+  SK 16 has no M = 128 configuration (skipped, printed).
+* Real container weights (`tool_trellis_m256_real_check --dir D:\models\r4dx\linear\A2verify\real`, the
+  verifier's extracted slices of the Huihui mix4.5m container, 9 tensor classes x KB 4/5 = 18 files, N(0,1)
+  f16 activations, 3 seeds, one-A and two-part, each launch repeated 12 times; real_check_final.log): 246
+  M = 256 launches, 0 of N x 256 bf16 differ from four shipped-row launches, 0 run-to-run differences,
+  tickets reset. mlp.down KB 4 (the row that was 0.17% different at SK 4) is identical at both SK16
+  configurations; a 300-repeat stress of mlp.down on real weights (real_check_down_repeat300.log): 0
+  run-to-run diffs for W4 x4 and W8 x2 (KB 4) and W2 x2 / W4 x1 (KB 5), both forms.
+* Negative controls: the same comparison against a stock tuning of a different SK finds 96-13626 differing
+  bf16 per shape (random weights 206-13345, real weights e.g. SK 16 vs SK 4: 2236 = 0.17%), so the
+  comparison does detect an accumulation-order change (every file printed a control, all > 0).
+* Coverage limit: activations are random / Gaussian, not the model's; M a multiple of 64; n_split cases test
+  the two-matrix path with random second matrices.
 
-Speedup of one M = 256 launch against 4 x the shipped M = 64 row on cold weights (each launch on a copy no
-launch of the batch has read), median of per-round ratios; run 1 / run 2.
+## Speed (MEASURED, device 1, time_final_run1/2.log, rounds 15, batch 6 weight copies, interleaved)
+
+Speedup of one M = 256 launch against 4 x the SHIPPED M = 64 row on cold weights (each launch on a copy no
+launch of the batch has read), median of per-round ratios; run 1 / run 2. Best (SKW x PH) per class, all of
+them bit-identical to the shipped row.
 
 | class (layers) | KB 4 | KB 5 |
 |---|---|---|
-| mlp.gate_up (64) | 1.49 / 1.49 | 1.49 / 1.49 |
-| mlp.down (64) | 1.70 / 1.71 (SK 4: shipped row is SK 16) | 1.70 / 1.66 |
-| gdn.in_proj_qkv (48) | 1.63 / 1.58 (SK 2) | 1.66 / 1.66 (SK 2) |
-| gdn.in_proj_z (48) | 1.58 / 1.56 | 1.56 / 1.57 (SK 8; SK 4: 1.71 / 1.77) |
-| gdn.out_proj, attn.o (64) | 1.58 / 1.59 | 1.70 / 1.70 (SK 8; SK 4: 1.73 / 1.75) |
-| attn.qg (16) | 1.45 / 1.49 | 1.53 / 1.52 |
-| attn.k, attn.v (32) | 1.83 / 1.88 (SK 8) | 2.02 / 2.08 (SK 8) |
-| **MLP pair** | **1.555 / 1.556** | **1.548 / 1.546** |
-| all seven classes, layer-weighted | 1.564 / 1.562 | 1.587 / 1.572 |
+| mlp.gate_up (64) | 1.555 / 1.575 (W2 x2; W4 x1 1.52 / 1.50) | 1.554 / 1.558 (W4 x1) |
+| mlp.down (64) | 1.298 / 1.311 (SK 16, W4 x4; W8 x2 1.20 / 1.21) | 1.716 / 1.714 (SK 4, W4 x1) |
+| gdn.in_proj_qkv (48) | 1.562 / 1.566 (SK 2) | 1.628 / 1.635 (SK 2) |
+| gdn.in_proj_z (48) | 1.589 / 1.562 (SK 4, W4 x1) | 1.636 / 1.672 (SK 8, W4 x2; W8 x1 1.54 / 1.57) |
+| gdn.out_proj, attn.o (64) | 1.632 / 1.684 (SK 4, W4 x1) | 1.812 / 1.845 (SK 8, W4 x2; W8 x1 1.73 / 1.71) |
+| attn.qg (16) | 1.466 / 1.457 (SK 4, W4 x1) | 1.560 / 1.578 (SK 4, W4 x1) |
+| attn.k, attn.v (32) | 1.91 / 1.92 (SK 8, W4 x2; W8 x1 1.79 / 1.94) | 2.18 / 2.07 (SK 8, W8 x1; W4 x2 2.15 / 2.07) |
+| **MLP pair** | **1.457 / 1.477** | **1.608 / 1.600** |
+| all seven classes, layer-weighted | 1.500 / 1.508 | 1.633 / 1.634 |
 
-The MLP pair against four M = 64 launches on the SAME weights (a Model chunk of 256 with today's kernel) is
-1.519 / 1.493 (KB 4) and 1.551 / 1.532 (KB 5). Run-to-run spread of one shape is about +-3% (GPU state);
-per-round pair ratios span 1.44-1.63. M = 128 (RG 2, 8 waves for SK 4): pair 1.13 (KB 4), 1.14 (KB 5);
-all classes 1.13 / 1.15. Not worth a kernel of its own except for a 128-row tail.
-Sum over the model's layers, bench-derived (DERIVED, excludes in_proj_a/b and the transforms): the seven
-classes cost 0.70-0.72 (KB 4) and 0.76-0.78 (KB 5) ms/token at M = 64 and 0.45-0.46 / 0.48-0.49 ms/token at
-M = 256 (two runs), i.e. about 0.25-0.28 ms/token saved (the probe's whole-chunk GEMM time is 46 ms / 64 rows
-= 0.72 ms/token).
+Model-layer sums (DERIVED from the bench, excludes in_proj_a/b and the transforms): seven classes cost 0.717 /
+0.735 (KB 4) and 0.780 / 0.788 (KB 5) ms/token at the shipped M = 64 rows, and 0.476 / 0.488 (KB 4), 0.477 /
+0.484 (KB 5) ms/token with the M = 256 kernel, i.e. 0.241 / 0.247 (KB 4) and 0.302 / 0.304 (KB 5) ms/token
+saved. Run-to-run spread of one shape is about +-3%; per-round MLP pair ratios span 1.29-1.55 (KB 4).
 
+What the exact SK 16 cost: the earlier prototype's non-identical SK 4 down KB 4 (485 us in the verifier's
+protocol) is replaced by SK 16 in W4 x 4 (about 516-524 us here): the KB 4 down class drops from about 1.45 to
+1.30 vs the shipped row, the KB 4 MLP pair from 1.55 to 1.46-1.48. Where it goes: 4 groups each pay a tail step
+(34 k-tiles = 8 x 4 + 2), a fresh weight-load pipeline, a 4-pass LDS reduction with 8 barriers and a ws round
+trip. W8 x 2 (32-wave workgroups) is 8% slower still.
+
+Also measured, not on the shipped rows: the earlier M = 128 kernel (RG 2) pair 1.13, unchanged.
+
+Regression note (MEASURED, 3 interleaved ABAB runs, gate_up KB 4): the W4 x 1 instantiation (16-wave
+workgroup, the old prototype's SK 4 configuration) is about 4% slower than the previous prototype's kernel
+(860-900 us vs 825-860) after the phase/tail restructuring; W2 x 2 (8-wave workgroups, two groups) equals the
+old kernel (827-848 us) and is the best gate_up KB 4 pick above. Other classes' W4 x 1 timings match the old
+prototype within noise (z KB 4: 148-153 vs 149 us). Cause not found (172 vs 174 VGPRs, same LDS, no scratch).
 ## Where the time goes (MEASURED with ablation builds, gate_up KB 4)
 
 Loop alone 721 us, whole kernel 790 us: epilogue 69 us = SK reduction 14 + ws stores and ticket 15 + the last
@@ -75,20 +124,27 @@ that ablation is not clean: the stand-ins cost about the VALU they replace.)
 
 * (RG 4, NP 2, U 2): 0-15% slower than NP 1, U 4 on every class and it spills (24 B/lane at KB 4, 52-260 at
   KB 5). Removed.
-* M = 128: above. 32-wave workgroups (SK 8): slower than SK 4 (z KB 5: 175 vs 159 us); kept only because
-  the shipped KB 5 z / out rows are SK 8.
+* M = 128: above. 32-wave workgroups (SKW 8): slower than SKW 4 with two groups (z KB 5 SK 8: 179 vs 167 us,
+  mlp.down KB 4 SK 16: 562 vs 516 us).
+* Rolled phase loop: spilled 28-80 B/lane (hoisted lane offsets); an sm volatile fence on the lane value fixed
+  most of it but cost ~3% on the PH = 1 instantiations, so the loop is unrolled. A runtime tail (instead of the
+  TAIL template parameter) cost +7 VGPRs and ~4-5% on every PH = 1 kernel.
 * Non-temporal weight loads: within noise.
 
 ## Not done / limits for whoever wires it
 
-* mlp.down KB 4's shipped M = 64 row is SK 16 (WV1, SKG 2). 16 slices x 4 row groups is 64 waves, so the
-  kernel cannot reproduce it: the M = 256 numbers use SK 4, which is bit-identical to the SK 4 stock tunings
-  but not to today's KB 4 down row (the down GEMM is 5% slower at SK 4 in stock). Using it in production means
-  re-pinning that row's M = 64 band to SK 4 (the bits of M = 33..64 chunks change once).
+* Instantiation limits: SKW 8 needs NP 1; PH > 1 exists for (RG 4, NP 1, U 4) only, so M = 128 has no SK 16;
+  TAIL 2 only for (SKW, PH) = (4, 4) and (8, 2) (other k-tile counts per slice fail loudly). A model with other
+  K would need more instantiations. Three instantiations spill (KB 4 W4 x 4 TAIL 0: 8 B/lane, KB 5 W4 x 4 TAIL 0 / TAIL 2: 12 / 16 B/lane);
+  none is used by the model's shapes (KB 4 SK 16 needs W4 x 4 TAIL 2, 190 VGPRs, 0 scratch).
+* The shipped rows in this file are the M = 64 band of the table; the M = 32 / M = 1 rows and every
+  M <= 16 decode / verify path stay on the shipped kernels (docs/trellis-kernel.md 538-543).
+* A per-(class, KB) (SKW, PH) choice belongs in a tuning table when this is wired: the best pick per class is
+  the table above; W4 x 1 vs W2 x 2 differ by up to 10% on out / z KB 4.
 * Not wired: ApplyLinear still slices any M into 64-row launches; the Model chunk is still 64; attention,
   GDN, transforms and scratch at 256 rows are untested. Tail chunks would use this kernel at 128 and the M = 64
   kernel below that.
 * The build's zero-scratch / 190-VGPR check (third_party/check_trellis_isa.cmake) does not cover this unit yet;
-  compile report: every shipped instantiation is 151-190 VGPRs, 0 scratch.
+  compile report (-Rpass-analysis=kernel-resource-usage, D:\models\r4dx\linear\S1\logs\resource.txt): the instantiations the model's shapes use are 151-192 VGPRs, 0 scratch (KB 4 PH 1: 172, KB 5 PH 1: 184).
 * A-layout: fragment-contiguous activations (a prefill-only input-transform change, measured -5..-8% on the
   M = 64 kernel) were not tried here.

@@ -2,8 +2,9 @@
 # the shipped M = 64 trellis kernel unit and the prototype M = 256 unit are compiled from libr4d's
 # sources with third_party/CMakeLists.txt's R4D_BASE_FLAGS (so the M = 64 side is the object r4d_core
 # holds, flag for flag), the bench with the same flags, and the three linked.
-#   powershell -File tests\kernels\build_m256_bench.ps1 [-Out D:\models\r4dx\linear\A2\obj]
-param([string]$Out = "D:\models\r4dx\linear\A2\obj", [string]$Rocm = "C:/opt/rocm", [string[]]$Define = @(), [string]$M256 = "")
+#   powershell -File tests\kernels\build_m256_bench.ps1 [-Out D:\models\r4dx\linear\A2\obj] [-Tool bench|real_check]
+param([string]$Out = "D:\models\r4dx\linear\A2\obj", [string]$Rocm = "C:/opt/rocm", [string[]]$Define = @(), [string]$M256 = "",
+      [ValidateSet("bench", "real_check")][string]$Tool = "bench")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 New-Item -ItemType Directory -Force $Out | Out-Null
@@ -19,8 +20,9 @@ function Compile($src, $obj) {
 Compile (Join-Path $inc "r4d_gemm_trellis_nt_m64.hip") (Join-Path $Out "m64.obj")
 $m256src = if ($M256) { $M256 } else { Join-Path $inc "r4d_gemm_trellis_nt_m256.hip" }
 Compile $m256src (Join-Path $Out "m256.obj")
-Compile (Join-Path $PSScriptRoot "tool_trellis_m256_bench.hip") (Join-Path $Out "bench.obj")
-& "$Rocm/bin/hipcc.exe" (Join-Path $Out "bench.obj") (Join-Path $Out "m64.obj") (Join-Path $Out "m256.obj") `
-  "--rocm-path=$Rocm" "-o" (Join-Path $Out "tool_trellis_m256_bench.exe")
+$exe = if ($Tool -eq "real_check") { "tool_trellis_m256_real_check.exe" } else { "tool_trellis_m256_bench.exe" }
+Compile (Join-Path $PSScriptRoot ($exe -replace "\.exe$", ".hip")) (Join-Path $Out "$Tool.obj")
+& "$Rocm/bin/hipcc.exe" (Join-Path $Out "$Tool.obj") (Join-Path $Out "m64.obj") (Join-Path $Out "m256.obj") `
+  "--rocm-path=$Rocm" "-o" (Join-Path $Out $exe)
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
-Write-Host "built $(Join-Path $Out 'tool_trellis_m256_bench.exe')"
+Write-Host "built $(Join-Path $Out $exe)"

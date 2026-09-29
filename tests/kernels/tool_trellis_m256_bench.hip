@@ -43,7 +43,7 @@
 
 void r4d_gemm_trellis_nt_m256(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
                               int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
-                              int SKG, int U, float out_scale, int64_t stream);
+                              int SKG, int U, float out_scale, int64_t stream, int skw);
 
 #define CK(x) do { hipError_t e_ = (x); if (e_ != hipSuccess) { \
   std::fprintf(stderr, "HIP error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, hipGetErrorString(e_)); \
@@ -78,7 +78,7 @@ __global__ void FillSvh(float* p, int64_t n, uint32_t seed) {
 
 struct Shape { const char* name; int N, K; int count; };   // count: layers per model using this linear class
 struct Stock { int WV, SK, NP, SKG, U, NT, MT; };
-struct Big { int M, NP, U, SK, SKG; };
+struct Big { int M, NP, U, SK, SKG, SKW; };   // SK = the shipped slice count, SKW = slices resident per workgroup
 static bool operator==(const Stock& a, const Stock& b) {
   return a.WV == b.WV && a.SK == b.SK && a.NP == b.NP && a.SKG == b.SKG && a.U == b.U && a.NT == b.NT && a.MT == b.MT;
 }
@@ -115,7 +115,7 @@ static void LaunchStock(const Bufs& b, const Stock& t, const unsigned char* w, i
 static void LaunchBig(const Bufs& b, const Big& g, const unsigned char* w) {
   r4d_gemm_trellis_nt_m256((int64_t)b.a, (int64_t)b.a1, b.n_split, (int64_t)w, (int64_t)b.svh, (int64_t)b.c_big,
                            (int64_t)b.ws_big, (int64_t)b.tk_big, g.M, b.K, b.N, b.KB, g.SK, g.NP, g.SKG, g.U,
-                           kOutScale, 0);
+                           kOutScale, 0, g.SKW);
 }
 
 static std::string StockName(const Stock& t) {
@@ -125,7 +125,7 @@ static std::string StockName(const Stock& t) {
 }
 static std::string BigName(const Big& g) {
   char nm[96];
-  std::snprintf(nm, sizeof nm, "M%d NP%d U%d SK%d SKG%d", g.M, g.NP, g.U, g.SK, g.SKG);
+  std::snprintf(nm, sizeof nm, "M%d NP%d U%d SK%d(W%d x%d) SKG%d", g.M, g.NP, g.U, g.SK, g.SKW, g.SK / g.SKW, g.SKG);
   return nm;
 }
 
@@ -139,18 +139,22 @@ static bool TableRow(const Shape& s, int kb, Stock& out) {
   return false;
 }
 
-// M = 256 (or 128) configurations: the table row's (SK, SKG) first, then SK = 4 at the same SKG.
+// M = 256 (or 128) configurations: every (SKW, SK / SKW) the kernel has for the shipped row's (SK, SKG), the
+// only family that is bit-identical to the SHIPPED M = 64 row.
 static std::vector<Big> BigList(const Shape& s, int kb, bool m128, const Stock& table) {
   std::vector<Big> v;
-  std::vector<std::pair<int, int>> fam = {{table.SK, table.SKG}};
-  if (table.SK != 4) fam.push_back({4, table.SKG});
-  for (auto& f : fam) {
-    if (f.first > 8 || f.first < 2) continue;
+  const int SK = table.SK;
+  for (int skw : {2, 4, 8}) {
+    if (SK % skw || skw > SK) continue;
+    const int ph = SK / skw;
+    if (ph > 4) continue;
     if (!m128) {
-      v.push_back({256, 1, 4, f.first, f.second});
+      if (256 / 64 * skw > 32) continue;
+      v.push_back({256, 1, 4, SK, table.SKG, skw});
     } else {
-      v.push_back({128, 1, 2, f.first, f.second});
-      if (f.first <= 4) v.push_back({128, 2, 1, f.first, f.second});
+      if (ph > 1) continue;
+      v.push_back({128, 1, 2, SK, table.SKG, skw});
+      if (skw <= 4) v.push_back({128, 2, 1, SK, table.SKG, skw});
     }
   }
   (void)s; (void)kb;
@@ -214,7 +218,7 @@ static std::vector<Stock> Candidates(Bufs& b, const Stock* table, const std::vec
 
 // ---- verify ------------------------------------------------------------------------------------------
 static int VerifyOne(Bufs& b, const Shape& s, int kb, uint32_t seed, bool m128, const std::vector<Big>& bigs,
-                     const std::vector<Stock>& stocks, const char* tag, FILE* json, bool& first) {
+                     const std::vector<Stock>& stocks, const Stock* table, const char* tag, FILE* json, bool& first) {
   Fill(b, seed);
   const int rows = m128 ? 128 : 256;
   const size_t bytes = (size_t)rows * s.N * 2;
@@ -237,12 +241,14 @@ static int VerifyOne(Bufs& b, const Shape& s, int kb, uint32_t seed, bool m128, 
     CK(hipMemcpy(hb.data(), b.c_big, bytes, hipMemcpyDeviceToHost));
     int same = 0, fam = 0;
     std::string bad;
+    const char* shipped = "no shipped row";
     for (size_t i = 0; i < stocks.size(); ++i) {
       if (stocks[i].SK != g.SK || stocks[i].SKG != g.SKG) continue;
       ++fam;
       size_t ndiff = 0, first_bad = (size_t)-1;
       for (size_t k = 0; k < hb.size(); ++k)
         if (hb[k] != ref[i][k]) { if (first_bad == (size_t)-1) first_bad = k; ++ndiff; }
+      if (table && stocks[i] == *table) shipped = ndiff == 0 ? "SHIPPED ROW IDENTICAL" : "SHIPPED ROW DIFFERS";
       if (ndiff == 0) ++same;
       else {
         bad += "    DIFFER vs " + StockName(stocks[i]) + ": " + std::to_string(ndiff) + " of " + std::to_string(hb.size()) +
@@ -255,9 +261,17 @@ static int VerifyOne(Bufs& b, const Shape& s, int kb, uint32_t seed, bool m128, 
         first = false;
       }
     }
+    // run-to-run: the running-sum handoff through ws (SK / SKW > 1) must not race; 8 more launches, same bytes
+    for (int rep = 0; rep < 8; ++rep) {
+      std::vector<unsigned short> hr(hb.size());
+      LaunchBig(b, g, b.w);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(hr.data(), b.c_big, bytes, hipMemcpyDeviceToHost));
+      if (hr != hb) { std::printf("  REPEAT DIFFERS %s\n", BigName(g).c_str()); ++fails; break; }
+    }
     if (fam == 0) { std::printf("  seed %u %-8s KB%d %-8s %-24s: NO stock tuning of this (SK, SKG) to compare with\n", seed, s.name, kb, tag, BigName(g).c_str()); ++fails; }
-    else std::printf("  seed %u %-8s KB%d %-8s %-24s: %s (%d of %d stock tunings of (SK%d,SKG%d) byte-identical; %lld zero outputs)\n",
-                     seed, s.name, kb, tag, BigName(g).c_str(), same == fam ? "IDENTICAL" : "DIFFER", same, fam, g.SK, g.SKG, zero);
+    else std::printf("  seed %u %-8s KB%d %-8s %-32s: %s (%d of %d stock tunings of (SK%d,SKG%d) byte-identical; %s; %lld zero outputs)\n",
+                     seed, s.name, kb, tag, BigName(g).c_str(), same == fam ? "IDENTICAL" : "DIFFER", same, fam, g.SK, g.SKG, shipped, zero);
     std::fputs(bad.c_str(), stdout);
   }
   const int tk = TicketsNonZero(b.tk_stock, s.N / 128) + TicketsNonZero(b.tk_big, s.N / 128);
@@ -275,9 +289,9 @@ static int Verify(Bufs& b, const Shape& s, int kb, int seeds, bool m128, FILE* j
   int fails = 0;
   for (int seed = 1; seed <= seeds; ++seed) {
     b.n_split = s.N; b.a1 = nullptr;
-    fails += VerifyOne(b, s, kb, (uint32_t)seed, m128, bigs, stocks, "one-A", json, first);
+    fails += VerifyOne(b, s, kb, (uint32_t)seed, m128, bigs, stocks, have ? &table : nullptr, "one-A", json, first);
     b.n_split = s.N / 2; b.a1 = b.a + (size_t)256 * s.K;     // the second half of the columns reads A1
-    fails += VerifyOne(b, s, kb, (uint32_t)seed, m128, bigs, stocks, "n_split", json, first);
+    fails += VerifyOne(b, s, kb, (uint32_t)seed, m128, bigs, stocks, have ? &table : nullptr, "n_split", json, first);
     b.n_split = s.N; b.a1 = nullptr;
   }
   // Negative control: the same comparison against a shipped tuning of a DIFFERENT SK must find differing
@@ -567,6 +581,13 @@ int main(int argc, char** argv) {
   for (int kb : kbl) {
     std::map<std::string, ShapeResult> res;
     for (const Shape& s : shapes) {
+      {   // M = 128 has no configuration for a shipped SK 16 (RG 2 x 16 slices needs PH > 1, instantiated for RG 4 only)
+        Stock tr{};
+        if (m128 && (!TableRow(s, kb, tr) || BigList(s, kb, m128, tr).empty())) {
+          std::printf("---- %s KB%d: no M=128 configuration for the shipped row's SK (skipped)\n", s.name, kb);
+          continue;
+        }
+      }
       Bufs b;
       Alloc(b, s, kb, mode == "verify" ? 1 : batch);
       if (mode == "verify" || mode == "both") fails += Verify(b, s, kb, seeds, m128, json, first);

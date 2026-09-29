@@ -49,6 +49,7 @@ Engine changes made for this kit:
   - `N` > 1: N split-KV segments on every prompt-prefill call, capped at 32.
   - Anything else prints a warning and uses the default.
   - Before the default changed (branch `prefill` up to `dd92f6d`), unset meant split-KV. Runs recorded as "split-KV (default law)" in `docs/prefill.md`'s M1 results are `=split` today.
+- (branch `linear`, spike) `R4DX_PREFILL_CHUNK` picks the prompt-prefill chunk size: unset or `64` is today's (the default); `256` runs 256-row super-chunks (libr4d's M = 256 trellis GEMM for the linears, 64-row sub-slices for the GDN scan and the attention core), bit-identical to the 64-row path, about 1.3x cold TTFT at 8k and 32k. It applies only to a TP=1 Model with no `--mtp`, no `--dflash` and no image; every other case prints one stderr line and runs 64-row chunks. Anything but `64|256` warns and uses 64. Details and the measurements: `docs/trellis-m256.md`. It reaches these scripts through the environment (`$env:R4DX_PREFILL_CHUNK = '256'`); the KL dumps and TTFT runs under `D:\models\r4dx\linear\spike` were made that way.
 
 ## Tasks (`build_tasks.py`)
 

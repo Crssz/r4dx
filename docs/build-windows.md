@@ -35,19 +35,21 @@ one clang toolchain and one CRT selection with the HIP-compiled objects.
 CMake's `HIP` language support fights `clang-cl` on this box (this is why `env_windows_rocm.cmd`
 in the sibling `vLLM_for_AMD` project needs a full `vcvars64` + `CMAKE_HIP_COMPILER` dance for its
 own build). r4dx sidesteps it entirely: the project is `CXX`-only, and
-`third_party/CMakeLists.txt` drives `hipcc.exe` directly through 15 `add_custom_command(OUTPUT
+`third_party/CMakeLists.txt` drives `hipcc.exe` directly through 13 `add_custom_command(OUTPUT
 <unit>.obj COMMAND ... hipcc.exe ...)` rules -- one per libr4d translation unit r4dx links -- then
 hands the resulting `.obj` files to `add_library(r4d_core STATIC ...)` as pre-built "external
 objects" (`set_source_files_properties(... EXTERNAL_OBJECT TRUE GENERATED TRUE)`), a standard CMake
 pattern for objects that did not come from CMake's own compile rules. Ninja treats each hipcc
 invocation as an ordinary custom-command edge, so it parallelizes them like any other build step
-(15 units compiled in ~15s wall time with 32 janitor threads on this machine's Ninja default job
-count).
+(the units compile in ~15s wall time with 32 janitor threads on this machine's Ninja default job
+count). The 13 units are the attention (paged, vit), 5 GDN, bf16 / w4a16 / trellis M<=64 / trellis
+M=256 GEMM, DFlash conv and registry units; the w4a8 / mxfp4a8 GEMMs, the int8 activation quantiser,
+the M<=16 bf16 GEMM, the all-reduce units and the pybind module were cut from the vendored libr4d.
 
 ### hipcc flags
 
-Base flags (mirrors libr4d's own proven `build_windows.ps1`, minus the Python/pybind11-specific
-bits that build needs and this one does not):
+Base flags (mirrors libr4d's own former `build_windows.ps1`, which was dropped when libr4d was
+vendored, minus the Python/pybind11-specific bits that build needed and this one does not):
 
 ```
 -O3 -std=c++17 --offload-arch=gfx1201 -Wno-unused-result -ffp-contract=off
@@ -55,11 +57,9 @@ bits that build needs and this one does not):
 -DNDEBUG -D_DLL -D_MT -Xclang --dependent-lib=msvcrt
 ```
 
-Per-unit extras: `r4d_gdn_chunk_scan_k128_v128_c64_bf16` gets `-mcumode`;
-`r4d_gemm_w4a8_nt_m64` gets `-DR4D_GEMM_W4A8_GROUP=128` (both match libr4d's own
-`build_windows.ps1` `$UNITS` table); `r4d_gemm_w4a16_nt_m64` gets
-`-DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP}`, which is the one deliberate deviation from that table
--- see the next section.
+Per-unit extras: `r4d_gdn_chunk_scan_k128_v128_c64_bf16` gets `-mcumode` (matching libr4d's own
+`$UNITS` table); `r4d_gemm_w4a16_nt_m64` gets `-DR4D_GEMM_W4_GROUP=${R4DX_W4A16_GROUP}`, which is the
+one deliberate deviation from that table -- see the next section.
 
 ### w4a16 group size (`R4DX_W4A16_GROUP`)
 
@@ -76,9 +76,7 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
 -- no crash, no NaN, no warning:
 
 1. `r4dx-convert` asserts `kW4A16Group == r4d_gemm_w4a16_nt_m64_group()` at startup
-   (`ValidateKernelGroupSizes`). w4a8 and mxfp4 are checked the same way, each against its own
-   kernel export -- w4a16 and w4a8 have **separate** converter constants (`kW4A16Group`,
-   `kW4A8Group`) precisely so this one can move on its own.
+   (`ValidateKernelGroupSizes`).
 2. Every container records the group it was packed with in `__metadata__.quant.w4a16.group`, and
    `Container::Load` / `DflashDraftWeights::Open` refuse a container whose group differs from the
    kernel this binary was built with (`CheckW4a16Group`, `src/model/quant_linear.h`), naming both
@@ -89,10 +87,9 @@ Three layers check that they agree, because a mismatch produces **wrong numbers 
    The guard fires only when the load will actually **read** `.w4a16.wsz` bytes: `Container::Load`
    when one of `--layout` / the lm-head layout / the MTP-head layout is `w4a16`,
    `DflashDraftWeights::Open` when the drafter carries a `.w4a16.*` tensor at all. `r4dx-convert`
-   writes the `quant` metadata block unconditionally, so a bf16 or mxfp4 container records a w4a16
-   group for a layout it holds no tensor of, and `v5` holds valid group-independent `w4a8`/`mxfp4`
-   layouts next to its group-128 `w4a16` -- `r4dx-cli --model ...v5.r4dx --layout mxfp4` is correct
-   on a group-64 build and is allowed. Only `--layout w4a16` on `v5` is refused.
+   writes the `quant` metadata block unconditionally, so a bf16 container records a w4a16 group for a
+   layout it holds no tensor of. (The mxfp4 and w4a8 layouts, which older containers such as `v5`
+   also carry next to their group-128 `w4a16`, are retired: a build no longer reads them.)
 3. CMake rejects a group that is not a positive multiple of 64: the kernel packs
    `R4D_GEMM_W4_KPB = 64` contiguous K per weight block and derives `bpg = group / 64`, so **64 and
    128 are the only values libr4d accepts unmodified**.
@@ -137,7 +134,7 @@ reconfigure one into the other in place.
 The `tests/convert` suite is group-agnostic: it runs every int4 quantizer, packer and search at
 **both** 64 and 128 whatever `R4DX_W4A16_GROUP` this build is, against
 `tests/convert/fixtures/*_g64.bin` (the group-128 fixtures keep their historical unsuffixed names).
-`tools/convert_ref/selftest_compare.py` takes `--w4a16-group` / `--w4a8-group` and, by default,
+`tools/convert_ref/selftest_compare.py` takes `--w4a16-group` and, by default,
 reads the group back out of the container the exe under test just wrote.
 
 The `tests/model` and `tests/model/attention` tests are different: they open fixed 4-layer test
@@ -186,16 +183,18 @@ catches what would otherwise escape `main()` and end the process as `0xc0000409`
 whose executable they run (`build\win-hip`, or `build\<Preset>` for `smoke.ps1`) and pick the
 matching production pair (the validators; the layout too, `Get-R4dxProductionLayout`) or 4-layer
 test container (`smoke.ps1`). An explicit `-Model` / `-Dflash` always wins. The validators' `-Layouts`
-default is the production container's layout (`trellis`), or `w4a16,w4a8,mxfp4` when `-Model` is given
+default is the production container's layout (`trellis`), or `w4a16` when `-Model` is given
 explicitly.
 
 The recipe for regenerating `g64\` (six containers, ~52 GiB, ~3 min of CPU) is:
 
 ```powershell
 $dir = 'D:\models\r4dx\g64'
-# qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,mxfp4,w4a16,w4a8 --lm-head 4bit+bf16 --mtp off --vision off
-# qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16            --lm-head 4bit+bf16 --mtp on  --vision off
-# qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16,w4a8,mxfp4 --lm-head 4bit+bf16 --mtp on  --vision off
+# (the mxfp4 / w4a8 layouts the existing g64 containers also carry are retired; a fresh convert writes
+#  only bf16 and w4a16)
+# qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp off --vision off
+# qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
+# qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-mtp-draftvocab.r4dx: as -l4-mtp plus --draft-vocab-ids <ids.json> (see below)
 # the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --out ... --layout {bf16,w4a16}
 .\build\win-hip\src\convert\r4dx-convert.exe --input D:\models\Huihui-Qwen3.8-27B-abliterated --output "$dir\..." ...
@@ -210,8 +209,9 @@ reduced-vocab cases drop to `[SKIP]` on a default build even though that path is
 production. There is no 64-layer container in `g64\` (not worth a 42 GiB copy): the group-64
 build's real-container tests use the production Huihui trellis container instead, as above.
 
-A bf16 or mxfp4 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
-does. `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is
+A bf16 drafter does **not** need a group-64 copy (layer 2 above): only the `w4a16` one
+does. (The `-mxfp4` drafter container is retired and refused by name; the root group-128 w4a16 one
+is refused by the group guard on a group-64 build.) `g64\qwen38-27b-dflash2-bf16.r4dx` was converted before that scope was narrowed and is
 redundant; the original `D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx` loads on either build.
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
@@ -238,14 +238,12 @@ plain sources under `third_party/libr4d`: the vendoring commit is a merge that c
 history (upstream commit `f47a8bc`, branch `linear`) and `git clone` needs no `--recurse-submodules`
 and no `submodule update`.
 
-### r4d_registry links without the AR units
+### r4d_registry rows
 
-`r4d_registry.hip` was confirmed (by building and linking, then running `smoke_r4d`, which prints
-all 25 registry rows including the 7 `ar_*` ones) to reference the all-reduce kernels **only as
-data** -- string literals (`"ar_oneshot_2rank_exact"`, ...) and a compile-time `enum` constant
-(`R4D_AR_TWOSHOT_WIDE_MAX_ELEMS`) in its constraint tables, never as a linked symbol. So `r4d_core`
-links clean with the `r4d_ar_*.hip` units excluded and **no patch to the libr4d sources was
-needed** -- the "guard AR rows on a new `r4dx` branch" contingency in the task brief did not apply.
+`r4d_registry.hip` lists only kernels that are still in the vendored libr4d: `smoke_r4d` prints its 18
+rows. It used to list 25 (the 7 `ar_*` rows, which referenced the all-reduce kernels only as data, plus
+rows for the bf16-KV attention, `gemm_bf16_nt_m16`, `gemm_w4a8_nt_m64`, `gemm_mxfp4a8_nt_m64` and
+`quant_act_i8`); those were removed with the units they described.
 
 ## The test
 

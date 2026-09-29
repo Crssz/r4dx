@@ -1,5 +1,7 @@
 # HISTORICAL (quant2 stage-1 driver): its defaults name files that were removed before and on 2026-09-29
-# (docs/huihui.md "Retired files"); pass every path explicitly to re-run it.
+# (docs/huihui.md "Retired files"); pass every path explicitly to re-run it. Its libr4d_w4a16_groups
+# step ran third_party/libr4d/test_w4a16_gemm_groups.py, which was removed with libr4d's Python/build
+# scripts when libr4d was vendored (it needs an r4d.pyd from the canonical libr4d clone).
 # quant2 GPU stage 1 (HIP device 1, run by the user): everything on the GPU that does not wait for
 # a CPU-built container. Each step logs to -OutDir and the exit codes go to summary.json, so the
 # results can be read back without the console. A failing test does NOT stop the Hessian capture

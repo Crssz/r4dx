@@ -1,8 +1,9 @@
 # third_party/CMakeLists.txt
 #
-# r4d_core: a static library built from 17 of libr4d's HIP translation units (attention, GDN,
-# skinny/quantized GEMMs, the kernel registry -- NOT r4d_module.hip, the pybind11 glue, and NOT any
-# r4d_ar_* unit, the multi-GPU all-reduce kernels this single-GPU engine never calls).
+# r4d_core: a static library built from the 13 HIP translation units of the vendored libr4d
+# (third_party/libr4d: attention, GDN, the bf16 / w4a16 / trellis GEMMs, the DFlash conv, the kernel
+# registry). The w4a8 / mxfp4a8 GEMMs, the int8 activation quantiser, the M <= 16 bf16 GEMM, the
+# multi-GPU all-reduce kernels and the pybind11 module were cut from the vendored copy.
 #
 # CMake's HIP language support fights clang-cl on this toolchain, so each unit is compiled by
 # driving hipcc.exe directly through add_custom_command (the same recipe libr4d's own
@@ -47,10 +48,9 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags, mirroring libr4d/build_windows.ps1's $UNITS table, restricted to
-# the 17 units r4dx links (r4d_module.hip and every r4d_ar_* unit are excluded on purpose). One
-# deliberate deviation from that table: r4d_gemm_w4a16_nt_m64's group is an r4dx build option (see
-# below) rather than the kernel's own 128 default.
+# unit -> extra per-unit flags (libr4d's former build_windows.ps1 $UNITS table), restricted to
+# the 13 units r4dx links. One deliberate deviation from that table: r4d_gemm_w4a16_nt_m64's group
+# is an r4dx build option (see below) rather than the kernel's own 128 default.
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_vit_h72_bf16
@@ -59,19 +59,14 @@ set(R4D_UNITS
   r4d_gdn_kkt_solve_k128_c64_bf16
   r4d_gdn_recurrent_update_k128_v128_bf16_fp32state
   r4d_gdn_gated_rmsnorm_h128_bf16
-  r4d_gemm_bf16_nt_m16
   r4d_gemm_bf16_nt_m64
   r4d_gemm_w4a16_nt_m64
   r4d_gemm_trellis_nt_m64
   r4d_gemm_trellis_nt_m256
-  r4d_gemm_w4a8_nt_m64
-  r4d_gemm_mxfp4a8_nt_m64
-  r4d_quant_act_i8
   r4d_dflash_conv_t2_g16_bf16
   r4d_registry
 )
 set(R4D_EXTRA_r4d_gdn_chunk_scan_k128_v128_c64_bf16 -mcumode)
-set(R4D_EXTRA_r4d_gemm_w4a8_nt_m64 -DR4D_GEMM_W4A8_GROUP=128)
 # w4a16's group is the R4DX_W4A16_GROUP build option (root CMakeLists.txt, which also validates
 # it). The SAME number reaches r4dx_convert's kW4A16Group through src/convert/CMakeLists.txt; the
 # converter asserts this kernel's _group() export against it at startup, and Container::Load

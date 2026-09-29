@@ -1,5 +1,5 @@
-// R4D -- the RDNA4 (gfx1201) kernel library: attention, gated delta net, all-reduce and a skinny
-// bf16 GEMM, compiled into one shared object. Plain C ABI: every entry point takes raw device
+// R4D -- the RDNA4 (gfx1201) kernel library: attention, gated delta net and skinny GEMMs (bf16,
+// w4a16, trellis), compiled into one static library in r4dx. Plain C ABI: every entry point takes raw device
 // pointers and a stream, so the driver can be a pybind module or ctypes with no torch/C++ ABI
 // coupling. Nothing on the launch paths allocates or synchronises, so any of them can be recorded
 // into a HIP graph.
@@ -28,8 +28,7 @@
 // provides none.
 //
 // Where a shape is unsupported the attention and GDN entry points return a negative code; the
-// all-reduce and GEMM throw std::runtime_error (they are only reachable from the pybind surface,
-// which turns that into a Python exception at the call site).
+// GEMMs throw std::runtime_error.
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
@@ -41,7 +40,7 @@
 
 struct R4DArgs {
     const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16
-    const void*  kv;            // (num_blocks, kv_heads, block_size, 2*head_dim)  fp8 e4m3 or bf16
+    const void*  kv;            // (num_blocks, kv_heads, block_size, 2*head_dim)  fp8 e4m3
                                 //   strides below are in ELEMENTS of that dtype; K then V per slot
     const int*   block_table;   // (num_seqs, max_blocks)            int32
     const int*   seqused_k;     // (num_seqs,)                       int32
@@ -66,11 +65,8 @@ extern "C" {
 // (q_len * gqa), the band a speculative-decode verify step falls in.
 // Return 0 on success, negative on a shape this instantiation does not serve.
 int  r4d_attn_prefill_h256_gqa6_fp8kv (const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa6_fp8kv  (const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_decode_h256_gqa6_bf16kv (const R4DArgs* a, hipStream_t stream);
-// Bytes of split-KV partial buffer one decode launch of this shape needs. Independent of the cache
-// dtype: the partials are f16 either way.
+// Bytes of split-KV partial buffer one decode launch of this shape needs (f16 partials).
 int64_t r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
 // Split-KV prefill: the prefill kernel with the KV tile range cut into a->splits segments (the
 // caller's count, clamped to 64; there is no split law), each writing fp32 partials to a->scratch,
@@ -79,7 +75,6 @@ int64_t r4d_attn_decode_h256_gqa6_scratch_bytes(const R4DArgs* a);
 // bits, no scratch). Split, the result differs from the unsplit launch only in where each segment's
 // softmax reference max starts and in the fp32 order of the merge. -5 if split and scratch is null.
 int  r4d_attn_prefill_splitkv_h256_gqa6_fp8kv (const R4DArgs* a, hipStream_t stream);
-int  r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t stream);
 // Bytes of fp32 partials one split-KV prefill launch of this shape needs (0 when unsplit).
 int64_t r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(const R4DArgs* a);
 // Exact-wide prefill (fp8 KV): the plain prefill's output bit for bit, over more workgroups (fewer
@@ -179,104 +174,12 @@ int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
         const void* z_gate, const void* norm_weight, float norm_eps, int norm_act,
         int N, int H, int Hg, int K, int V, float scale, float softplus_thr, void* stream);
 
-// ---- all-reduce: one-shot, push, 2 ranks over P2P ------------------------------------------
-// One-shot means each rank pushes its whole input into the peer's IPC scratch and then reduces
-// locally -- no ring, no two-shot reduce-scatter, so the scratch is sized by the full message.
-// Exactly 2 ranks: the handshake is a single peer flag, not a tree.
-enum { R4D_AR_HANDLE_BYTES = 64 };
-// IPC scratch helpers. Startup-only, and not kernels: alloc returns the device pointer and writes
-// the IPC handle (up to HANDLE_BYTES) into out_handle.
-int64_t r4d_ar_ipc_alloc(int64_t size, int finegrained, char* out_handle, int* out_len);
-int64_t r4d_ar_ipc_open(const char* handle, int len);
-void r4d_ar_ipc_free(int64_t p);
-void r4d_ar_ipc_memzero(int64_t p, int64_t size);
-void r4d_ar_ipc_enable_peer(int64_t peer);
-// Exact sum, fp32 accumulate, bf16 / fp16 / fp32 payload (dtype 0 / 1 / 2).
-void r4d_ar_oneshot_2rank_exact(int64_t peer_scratch, int64_t my_scratch, int64_t peer_flags, int64_t my_flags,
-                                int64_t seq_ctrs, int64_t slot_stride16, int64_t inp, int64_t out, int64_t n_elem,
-                                int64_t dtype, int64_t stream, int64_t nblocks, int64_t nthreads, int64_t drain,
-                                int64_t acq);
-// Same topology, but the wire payload is Walsh-Hadamard rotated and quantised to 6 bits per element
-// over groups of 64 (plus a bf16 scale per group). Lossy, and bf16 / fp16 payload only. Takes this
-// rank's own packed copy (loc_pack) as well, so the reduce folds exactly the bytes it sent.
-void r4d_ar_oneshot_2rank_wht6(int64_t peer_scratch, int64_t my_scratch, int64_t peer_flags, int64_t my_flags,
-                               int64_t seq_ctrs, int64_t loc_pack, int64_t slot_stride_bytes,
-                               int64_t scale_off_bytes, int64_t inp, int64_t out, int64_t n_elem, int64_t dtype,
-                               int64_t stream, int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq);
-int  r4d_ar_max_blocks(void);                                   // the two 2-rank kernels
-void r4d_ar_wht6_dims(int* group, int* bits, int* chunk_elems); // rotated-6-bit payload only
-
-// ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
-// The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). The peer arguments are ascending
-// global rank with the current rank removed. Scratch is 2*world size slots of slot_stride16 16B 
-// words parity x source rank, this rank's own slot unused); flags are max_blocks*ws words indexed 
-// [block][source rank]; seq_ctrs is one word per block.
-void r4d_ar_oneshot_4rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
-                                int64_t peer_flags0, int64_t peer_flags1, int64_t peer_flags2,
-                                int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16,
-                                int64_t inp, int64_t out, int64_t n_elem, int64_t dtype, int64_t rank,
-                                int64_t stream, int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq,
-                                int64_t pub);
-void r4d_ar_oneshot_8rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
-                                int64_t peer_scratch3, int64_t peer_scratch4, int64_t peer_scratch5,
-                                int64_t peer_scratch6, int64_t peer_flags0, int64_t peer_flags1,
-                                int64_t peer_flags2, int64_t peer_flags3, int64_t peer_flags4,
-                                int64_t peer_flags5, int64_t peer_flags6, int64_t my_scratch,
-                                int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16, int64_t inp,
-                                int64_t out, int64_t n_elem, int64_t dtype, int64_t rank, int64_t stream,
-                                int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq, int64_t pub);
-void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
-
-// ---- all-reduce: two-shot, 4 or 8 ranks over P2P -------------------------------------------
-// Reduce-scatter + all-gather on the same buffer trio and peer-argument order as the wide
-// one-shot (r4d_ar_twoshot_Nrank_exact.hip): shard s, a contiguous 1/ws of the message, is
-// reduced by rank s (fp32, ascending rank order), then gathered. Sends 2*(ws-1)/ws*N bytes
-// per rank in two hops. Covers the sizes where the one-shot's (ws-1)*N send is too heavy.
-// Regions A
-// and B at 0 and shard16, so the slot stride must hold 2*shard16. Above this bound the caller
-// falls back:
-enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 20971520 };  // a 4096-token hidden-5120 prefill chunk
-void r4d_ar_twoshot_4rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
-                                int64_t peer_flags0, int64_t peer_flags1, int64_t peer_flags2,
-                                int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs,
-                                int64_t slot_stride16, int64_t inp, int64_t out, int64_t n_elem, int64_t dtype,
-                                int64_t rank, int64_t stream, int64_t nblocks, int64_t nthreads, int64_t drain,
-                                int64_t acq, int64_t pub);
-void r4d_ar_twoshot_8rank_exact(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
-                                int64_t peer_scratch3, int64_t peer_scratch4, int64_t peer_scratch5,
-                                int64_t peer_scratch6, int64_t peer_flags0, int64_t peer_flags1,
-                                int64_t peer_flags2, int64_t peer_flags3, int64_t peer_flags4,
-                                int64_t peer_flags5, int64_t peer_flags6, int64_t my_scratch,
-                                int64_t my_flags, int64_t seq_ctrs, int64_t slot_stride16, int64_t inp,
-                                int64_t out, int64_t n_elem, int64_t dtype, int64_t rank, int64_t stream,
-                                int64_t nblocks, int64_t nthreads, int64_t drain, int64_t acq, int64_t pub);
-// The tiered int8 wire on both of the two-shot's hops (r4d_ar_twoshot_Nrank_ti8.hip; codec
-// in r4d_ar_ti8.h), 4 ranks only. The wire: int8 groups of 32 with an fp16 scale and a
-// per-group record (T1 plain, T2 top-1-exact, T3 wht32) 38 bytes/group, deterministic
-// tiering, bit-identical across ranks. Same peer-argument order and flag layout as the exact
-// pair; slot stride in bytes (the wire is not 16B-aligned), holding two wire images; the 
-// encoder writes its own slot too (no loc_pack). numel must tile 32-elem groups over the ws
-// shards (numel % 128).
-void r4d_ar_twoshot_4rank_ti8(int64_t peer_scratch0, int64_t peer_scratch1, int64_t peer_scratch2,
-                              int64_t peer_flags0, int64_t peer_flags1, int64_t peer_flags2,
-                              int64_t my_scratch, int64_t my_flags, int64_t seq_ctrs,
-                              int64_t slot_stride_bytes, int64_t inp, int64_t out, int64_t n_elem,
-                              int64_t dtype, int64_t rank, int64_t stream, int64_t nblocks,
-                              int64_t nthreads, int64_t drain, int64_t acq, int64_t pub);
-void r4d_ar_ti8_dims(int* group, int* group_bytes);  // tiered-int8 wire only
-
 // ---- GEMM ----------------------------------------------------------------------------------
-// C[M,N] = A[M,K] @ W[N,K]^T, bf16 throughout: a torch Linear with the weight stored (N,K), which
-// is the "nt" in the name. Specialised for skinny M -- M <= 16, the band a small projection such
-// as an MoE router gate produces -- where the weight read dominates and rocBLAS does poorly.
+// Skinny bf16 GEMM for M up to 64: C[M,N] = A[M,K] @ W[N,K]^T, bf16 throughout -- a torch Linear
+// with the weight stored (N,K), which is the "nt" in the name. Where the weight read dominates and
+// rocBLAS does poorly. Computed with 16x16x16 WMMA so a 16-wide step of K costs ceil(M/16)
+// activation fragments and one weight fragment, instead of one weight load and M activation loads.
 // WV columns per block x SK k-splits, reduced in LDS.
-void r4d_gemm_bf16_nt_m16(int64_t a, int64_t w, int64_t c, int M, int K, int N, int WV, int SK,
-                          int64_t stream);
-int  r4d_gemm_bf16_nt_m16_max_m(void);
-
-// Skinny bf16 GEMM for M up to 64: the same C[M,N] = A[M,K] @ W[N,K]^T, computed with
-// 16x16x16 WMMA so a 16-wide step of K costs ceil(M/16) activation fragments and one weight
-// fragment, instead of one weight load and M activation loads.
 void r4d_gemm_bf16_nt_m64(int64_t a, int64_t w, int64_t c, int M, int K, int N, int WV, int SK, int MB,
                           int64_t stream);
 int  r4d_gemm_bf16_nt_m64_max_m(void);
@@ -381,23 +284,6 @@ const char* r4d_gemm_trellis_nt_m256_check(int M, int K, int N, int n_split, int
                                            int SKG, int U, int skw);
 size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
 
-// 4-bit weight, 8-bit activation. Signed 4-bit codes, per-row activation scale, int8 WMMA.
-void r4d_gemm_w4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t c, int M, int K, int N,
-                          int WV, int SK, int MB, int NPW, int NT, int64_t stream);
-int  r4d_gemm_w4a8_nt_m64_max_m(void);
-int  r4d_gemm_w4a8_nt_m64_group(void);
-int  r4d_gemm_w4a8_nt_m64_aperm(void);
-
-// OCP-MXFP4 weight, fp8 activation. e2m1 elements with one E8M0 exponent per 32 K, folded
-// against a per-row reference exponent so the inner loop has no rescale; fp8 WMMA.
-void r4d_gemm_mxfp4a8_nt_m64(int64_t a, int64_t ascale, int64_t wq, int64_t ws, int64_t wref, int64_t c,
-                             int M, int K, int N, int WV, int SK, int MB, int NPW, int64_t stream);
-int  r4d_gemm_mxfp4a8_nt_m64_max_m(void);
-int  r4d_gemm_mxfp4a8_nt_m64_group(void);
-
-// Per-row symmetric int8 quantisation of a bf16 activation, in the A-fragment byte order.
-void r4d_quant_act_i8(int64_t a, int64_t q, int64_t s, int M, int K, int64_t stream);
-
 // ---- registry ------------------------------------------------------------------------------
 // Every kernel in the library, with the constraints its name encodes spelled out. A caller that
 // wants to know whether R4D covers a model can read this instead of hardcoding what it remembers.
@@ -425,10 +311,9 @@ struct R4DConstraint {
 };
 struct R4DKernelInfo {
     const char* name;      // entry point, without the r4d_ prefix
-    const char* family;    // attn | gdn | ar | gemm
+    const char* family;    // attn | gdn | gemm | quant | dflash
     const char* op;        // the operation it implements -- the key callers select on, and the
-                           // one thing several kernels may share (fp8 and bf16 KV, exact and
-                           // lossy all-reduce)
+                           // one thing several kernels may share (the GEMM families)
     const char* computes;  // what it computes, for a human
     const char* shape;     // the geometry it is compiled for, for a human
     const char* dtypes;    // operand dtypes

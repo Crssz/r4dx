@@ -23,7 +23,8 @@ not this directory.
 
 ## Rung 2 -- kernel vs CPU/torch
 
-Each of the 15 linked `libr4d` units, in isolation, against a plain fp32 CPU reference
+Each of the linked `libr4d` units (15 at the time; 13 now that the w4a8 / mxfp4a8 GEMMs, the int8
+quantiser and the M<=16 GEMM are gone), in isolation, against a plain fp32 CPU reference
 implementation of the same math (`tests/smoke_r4d.cpp`'s `r4d_gemm_bf16_nt_m64` check --
 `rel_err < 2e-2` against a CPU fp32 matmul -- is the first instance of this rung; every other
 kernel needs its own). This is pure C++ (or the `r4d.pyd` Python extension cross-check

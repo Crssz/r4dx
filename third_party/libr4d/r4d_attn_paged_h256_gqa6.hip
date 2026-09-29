@@ -6,8 +6,8 @@
 // The query is bf16 in every variant. Quantising it measured an order of magnitude worse against
 // the fp32 oracle (2.58e-02 vs ~2.3e-03), and the two-term e4m3 form that DOES reach f16 accuracy
 // is 4-10% slower end to end -- so the 8-bit query arms are gone rather than kept behind a flag.
-// What ships is the two families that differ only in KV cache dtype: bf16 KV (all 16-bit) and fp8
-// KV (16/8 mixed, the production configuration).
+// What ships is the fp8 KV family (16/8 mixed, the production configuration). The bf16-KV entry
+// points that used to sit beside it (KVP = 1 below) were removed from r4dx: nothing called them.
 //
 // `opt` is a bitmask of the measured optimisation steps, all of them on:
 //     prefill 3955211 = f16 operands | mask skip | folded query scale | contiguous-k fragments
@@ -50,7 +50,7 @@ extern "C" void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max
 #define P_TILE   48
 #define P_OPT    3955211
 
-// KVP: 0 = fp8 e4m3 cache, 1 = bf16 cache. Reached only through the two named wrappers below.
+// KVP: 0 = fp8 e4m3 cache (the only one instantiated here), 1 = bf16 cache.
 template <int KVP>
 static int prefill_launch(const R4DArgs* a, hipStream_t s) {
     if (a->head_dim != A_HEAD_DIM || a->block_size != A_BLOCK_SIZE) return -1;
@@ -66,9 +66,6 @@ static int prefill_launch(const R4DArgs* a, hipStream_t s) {
 
 extern "C" int r4d_attn_prefill_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
     return prefill_launch<0>(a, s);
-}
-extern "C" int r4d_attn_prefill_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
-    return prefill_launch<1>(a, s);
 }
 
 // ---- exact-wide prefill ----------------------------------------------------------------------
@@ -166,9 +163,6 @@ static int prefill_splitkv_launch(const R4DArgs* a, hipStream_t s) {
 extern "C" int r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
     return prefill_splitkv_launch<0>(a, s);
 }
-extern "C" int r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
-    return prefill_splitkv_launch<1>(a, s);
-}
 
 // ---- decode ----------------------------------------------------------------------------------
 #define D_TILE 16
@@ -239,7 +233,4 @@ static int decode_launch(const R4DArgs* a, hipStream_t s) {
 
 extern "C" int r4d_attn_decode_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t s) {
     return decode_launch<0>(a, s);
-}
-extern "C" int r4d_attn_decode_h256_gqa6_bf16kv(const R4DArgs* a, hipStream_t s) {
-    return decode_launch<1>(a, s);
 }

@@ -16,7 +16,7 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   vision tower.
 - **Trellis quantization (QTIP/EXL3-style):** about 4.5 bits per weight (mixed 4/5-bit), rounded with
   LDLQ against per-layer Hessians and a random Hadamard rotation, decoded inside a native RDNA4
-  WMMA GEMM. 4-bit group layouts (w4a16, w4a8, mxfp4) are also supported.
+  WMMA GEMM. The 4-bit group layout w4a16 is also supported (the w4a8 and mxfp4 layouts were retired).
 - **KV cache:** fp8 e4m3, paged in 16-token blocks, up to the model's native 262144-token context.
 - **Speculative decoding:** MTP and DFlash2 (block-diffusion drafter), lossless in distribution.
 - **Prefill:** chunked prefill with a fused, exact-wide attention kernel; a faster split-KV variant is

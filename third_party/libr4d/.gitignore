@@ -1,4 +1,0 @@
-*.o
-*.so
-build-win/
-libr4d-buildenv/

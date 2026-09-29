@@ -13,7 +13,10 @@ where the upstream cuts one, else by commit SHA of the default branch at fetch t
 
 libr4d (the GPU kernels) is not header-only: it is vendored as plain sources under
 `third_party/libr4d` (tree of upstream libr4d commit `f47a8bce908b062c7af77f8dbd18b760c1d199e6`,
-branch `linear`, merged in with its history). It has no licence file upstream; see `NOTICE`.
+branch `linear`, merged in with its history), then cut down to the units r4dx uses: the w4a8 and
+mxfp4a8 GEMMs, `r4d_quant_act_i8`, `r4d_gemm_bf16_nt_m16`, the four bf16-KV attention entry points,
+the `r4d_ar_*` all-reduce files, the pybind module, its Python / build scripts and its README were
+removed (the credit lives in `NOTICE`). It has no licence file upstream; see `NOTICE`.
 
 To refresh a dependency: re-download the file(s) at a new tag/commit, update this table, and
 re-run the build + tests.

@@ -63,19 +63,12 @@ using Args = R4DArgs;
 inline void AttnPrefillFp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_prefill_h256_gqa6_fp8kv", r4d_attn_prefill_h256_gqa6_fp8kv(&a, stream));
 }
-inline void AttnPrefillBf16Kv(const Args& a, hipStream_t stream) {
-  R4DX_R4D_CHECK("attn_prefill_h256_gqa6_bf16kv", r4d_attn_prefill_h256_gqa6_bf16kv(&a, stream));
-}
 // Split-KV prefill (prefill M1): Args::splits segments of the KV range, fp32 partials in
 // Args::scratch (AttnPrefillSplitKvScratchBytes), fixed-order merge. splits <= 1 is exactly
 // AttnPrefill*Kv above (same kernel, same bits, no scratch).
 inline void AttnPrefillSplitKvFp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa6_fp8kv",
                  r4d_attn_prefill_splitkv_h256_gqa6_fp8kv(&a, stream));
-}
-inline void AttnPrefillSplitKvBf16Kv(const Args& a, hipStream_t stream) {
-  R4DX_R4D_CHECK("attn_prefill_splitkv_h256_gqa6_bf16kv",
-                 r4d_attn_prefill_splitkv_h256_gqa6_bf16kv(&a, stream));
 }
 inline int64_t AttnPrefillSplitKvScratchBytes(const Args& a) {
   return r4d_attn_prefill_splitkv_h256_gqa6_scratch_bytes(&a);
@@ -88,9 +81,6 @@ inline void AttnPrefillExactFp8Kv(const Args& a, hipStream_t stream) {
 }
 inline void AttnDecodeFp8Kv(const Args& a, hipStream_t stream) {
   R4DX_R4D_CHECK("attn_decode_h256_gqa6_fp8kv", r4d_attn_decode_h256_gqa6_fp8kv(&a, stream));
-}
-inline void AttnDecodeBf16Kv(const Args& a, hipStream_t stream) {
-  R4DX_R4D_CHECK("attn_decode_h256_gqa6_bf16kv", r4d_attn_decode_h256_gqa6_bf16kv(&a, stream));
 }
 // Bytes of split-KV decode scratch this shape needs; allocate and set Args::scratch before
 // calling AttnDecode*.
@@ -193,12 +183,6 @@ inline int64_t GdnConvStateElems(int64_t num_seqs, int64_t conv_dim, int64_t wid
 }
 
 // ---- GEMM -----------------------------------------------------------------------------------
-inline void GemmBf16NtM16(const void* a, const void* w, void* c, int M, int K, int N, int WV,
-                           int SK, hipStream_t stream) {
-  r4d_gemm_bf16_nt_m16(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(w),
-                        reinterpret_cast<int64_t>(c), M, K, N, WV, SK,
-                        reinterpret_cast<int64_t>(stream));
-}
 inline void GemmBf16NtM64(const void* a, const void* w, void* c, int M, int K, int N, int WV,
                            int SK, int MB, hipStream_t stream) {
   r4d_gemm_bf16_nt_m64(reinterpret_cast<int64_t>(a), reinterpret_cast<int64_t>(w),

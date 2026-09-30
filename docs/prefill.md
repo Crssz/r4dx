@@ -549,8 +549,15 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   the DFlash ring) for single calls of 1, 63, 64, 65, 255, 256, 257, 511 (and 8145 on the 4-layer
   container) rows and for prefix-reuse shapes (300 + 333, 64 + 511, 257 + 1, 1 + 255 + 257: the grid is
   anchored at each call). A negative control shows the digest does change when the chunk grid moves.
-- VRAM: the wide buffers and arena add 0.22 GiB per Model (`arena+scratch=0.21875 GiB` in the load line,
-  0.09375 with `=0`).
+- VRAM (MEASURED 2026-09-30, device 1, Huihui trellis mix4.5m, `--max-ctx 131072`, vision auto, prompt
+  checkpoint on, 8k prompt; `D:\models\r4dx\chunk\implement\mem`): the 256-row activation buffers, the
+  DFlash feature buffer and the 224 MiB arena (96 MiB with `=0`) cost 0.13 to 0.20 GiB more per Model.
+  Used VRAM at the end of an `r4dx-cli` run, default vs `R4DX_PREFILL_CHUNK=0`: plain 21.86 vs 21.73
+  GiB, `--dflash` 23.96 vs 23.76, `--mtp 3` 22.59 vs 22.41 (`arena+scratch` in the load line 0.2312 vs
+  0.1062 GiB; a load without the vision tower shows 0.21875 vs 0.09375). `r4dx-server --max-ctx 131072
+  --dflash` (the largest setup) loads with 7.71 GiB free of 31.86 (7.91 with `=0`), serves an 8k
+  request, and its greedy answer, `draft_n` (21) and `draft_n_accepted` (5) equal the kill-switch
+  run's. Every buffer is allocated at load; nothing grows during a request.
 - **MTP and DFlash** run the wide path, bit-identical, by working in the 64-row slices of a super-chunk:
   the MTP head primes its KV per slice with exactly the pair of `PrimeKv` calls a 64-row chunk makes
   (a 1-row boundary call seeded by the previous slice's last hidden row, then 63 within-slice rows; the

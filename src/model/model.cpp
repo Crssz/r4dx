@@ -1071,7 +1071,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // unlike its draft loop, these positions are INSIDE the prompt, so they can land on image rows
       // where the three axes genuinely differ (docs/vision.md). Built on the host per call because
       // the two PrimeKv calls below cover different, non-contiguous position windows. (A super-chunk
-      // never runs with an image in the conversation: mrope_active_ is false there.)
+      // can carry image rows too: each slice takes the positions of its own window, pos_ + row0.)
       std::vector<int32_t> prime_rope3;
       const int32_t* boundary_rope3 = nullptr;
       const int32_t* within_rope3 = nullptr;

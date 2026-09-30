@@ -232,7 +232,8 @@ bool RunConfig(const Config& cfg) {
     std::fprintf(stderr, "FAIL %s: %zu of %zu observables differ\n", cfg.name.c_str(), bad, narrow.size());
     ok = false;
   }
-  // The wide path really ran (the capture configuration loads wide but its callback still falls back at\n  // the call level until the callback is served, so the launch check is for the plain one): a scenario that prefills at least 256 rows in one call launches fewer
+  // The wide path really ran (the super-chunk counts above cover every mode; this launch check is for
+  // the plain one): a scenario that prefills at least 256 rows in one call launches fewer
   // kernels wide than narrow (embedding, norms, rope, ... are one launch per 256 rows instead of four).
   if (cfg.expect_wide && cfg.mode == Mode::kPlain) {
     for (size_t s = 0; s < cfg.scenarios.size(); ++s) {

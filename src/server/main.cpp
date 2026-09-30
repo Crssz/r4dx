@@ -36,6 +36,19 @@ int main(int argc, char** argv) {
   }
 
   r4dx::server::EngineOptions opts;
+  // --request-log: opened first, before the (slow) model load, so an unwritable path fails in
+  // milliseconds. Not given = nothing is opened and the engine's log pointer stays null.
+  if (!args.request_log.empty()) {
+    std::string log_error;
+    std::shared_ptr<r4dx::server::RequestLog> log = r4dx::server::RequestLog::Open(args.request_log, &log_error);
+    if (!log) {
+      std::fprintf(stderr, "error: %s\n", log_error.c_str());
+      return 1;
+    }
+    std::fprintf(stderr, "[r4dx-server] request log: appending one JSON line per request to %s\n",
+                 args.request_log.c_str());
+    opts.request_log = std::move(log);
+  }
   opts.model_opts.container_path = args.model_path;
   try {
     opts.model_opts.layout = r4dx::model::LayoutFromName(args.layout);

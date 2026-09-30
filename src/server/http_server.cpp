@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <optional>
 
 #include "httplib.h"
 #include "openai_types.h"
@@ -56,6 +57,27 @@ void RespondError(httplib::Response& res, int status, const std::string& type,
 // convention (<500 is the caller's fault, >=500 is ours).
 const char* ErrorTypeForStatus(int status) {
   return status < 500 ? "invalid_request_error" : "server_error";
+}
+
+// --request-log: one line for a request this layer answered itself, before (or instead of) the
+// worker -- a malformed or invalid body (4xx), a full queue (429), a failure building the response.
+// Everything Engine::RunRequest logs for a request it ran is NOT repeated here. `id` empty = the body
+// never parsed far enough to earn one, so a fresh id stands in. Null log = off = does nothing. Only
+// the status and what is already known: no body text.
+void LogRejected(Engine& engine, const char* endpoint, const char* id_prefix, const std::string& id,
+                 std::optional<bool> stream, int status) {
+  RequestLog* log = engine.GetRequestLog();
+  if (log == nullptr) return;
+  try {
+    RequestLogRecord rec;
+    rec.endpoint = endpoint;
+    rec.request_id = id.empty() ? GenerateRequestId(id_prefix) : id;
+    rec.stream = stream;
+    rec.http_status = status;
+    log->Write(std::move(rec));
+  } catch (...) {
+    // Logging must never change what the client is told.
+  }
 }
 
 // Parses the request body as JSON, mapping a malformed body to the same ApiError shape
@@ -158,6 +180,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 
   svr.Post("/v1/chat/completions", [&engine_ref](const httplib::Request& httpreq,
                                                    httplib::Response& res) {
+    bool submitted = false;  // the worker owns the request (and its log line) from Submit on
     try {
       const nlohmann::json body = ParseJsonBody(httpreq);
       ChatCompletionRequest req = ParseChatCompletionRequest(body, engine_ref.SamplingDefaults(),
@@ -202,17 +225,21 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                                                      emit_reasoning);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
+          LogRejected(engine_ref, "chat/completions", "chatcmpl-", id, true, 429);
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
           return;
         }
+        submitted = true;
         ServeStream(res, sink);
       } else {
         auto sink = std::make_shared<BufferingSink>(enable_thinking, emit_reasoning);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
+          LogRejected(engine_ref, "chat/completions", "chatcmpl-", id, false, 429);
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
           return;
         }
+        submitted = true;
         sink->Wait();
         if (sink->errored) {
           RespondError(res, sink->error_status, ErrorTypeForStatus(sink->error_status),
@@ -238,13 +265,16 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                          kJsonContentType);
       }
     } catch (const ApiError& err) {
+      if (!submitted) LogRejected(engine_ref, "chat/completions", "chatcmpl-", "", std::nullopt, err.http_status);
       RespondError(res, err);
     } catch (const std::exception& e) {
+      if (!submitted) LogRejected(engine_ref, "chat/completions", "chatcmpl-", "", std::nullopt, 500);
       RespondError(res, 500, "server_error", e.what());
     }
   });
 
   svr.Post("/v1/completions", [&engine_ref](const httplib::Request& httpreq, httplib::Response& res) {
+    bool submitted = false;  // as above
     try {
       const nlohmann::json body = ParseJsonBody(httpreq);
       CompletionRequest req = ParseCompletionRequest(body, engine_ref.SamplingDefaults());
@@ -267,17 +297,21 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
                                                      created, req.stream_options_include_usage);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
+          LogRejected(engine_ref, "completions", "cmpl-", id, true, 429);
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
           return;
         }
+        submitted = true;
         ServeStream(res, sink);
       } else {
         auto sink = std::make_shared<BufferingSink>();
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
+          LogRejected(engine_ref, "completions", "cmpl-", id, false, 429);
           RespondError(res, 429, "rate_limit_error", "server request queue is full, try again shortly");
           return;
         }
+        submitted = true;
         sink->Wait();
         if (sink->errored) {
           RespondError(res, sink->error_status, ErrorTypeForStatus(sink->error_status),
@@ -292,8 +326,10 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
             kJsonContentType);
       }
     } catch (const ApiError& err) {
+      if (!submitted) LogRejected(engine_ref, "completions", "cmpl-", "", std::nullopt, err.http_status);
       RespondError(res, err);
     } catch (const std::exception& e) {
+      if (!submitted) LogRejected(engine_ref, "completions", "cmpl-", "", std::nullopt, 500);
       RespondError(res, 500, "server_error", e.what());
     }
   });

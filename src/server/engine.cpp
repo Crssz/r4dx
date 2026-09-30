@@ -59,6 +59,25 @@ size_t FindEarliestStop(const std::string& text, const std::vector<std::string>&
   return best;
 }
 
+// --request-log: owns one request's log record and writes it when RunRequest leaves -- by any
+// return or by the catch -- so every request that reaches the worker gets exactly one line whatever
+// path it took. Inert (record() is null, the destructor does nothing) when the log is off. The write
+// runs after the request's sink has been finished, so it cannot delay the client's response.
+class RequestLogScope {
+ public:
+  explicit RequestLogScope(RequestLog* log) : log_(log) {}
+  ~RequestLogScope() {
+    if (log_ != nullptr) log_->Write(std::move(rec_));  // noexcept
+  }
+  RequestLogScope(const RequestLogScope&) = delete;
+  RequestLogScope& operator=(const RequestLogScope&) = delete;
+  RequestLogRecord* record() { return log_ != nullptr ? &rec_ : nullptr; }
+
+ private:
+  RequestLog* log_;
+  RequestLogRecord rec_;
+};
+
 }  // namespace
 
 // Decodes `tok` into text, applies --stop trimming (identical semantics/lookback window to
@@ -138,7 +157,11 @@ void Engine::LoadAndStart() {
   worker_ = std::thread(&Engine::WorkerLoop, this);
 }
 
-bool Engine::Submit(std::shared_ptr<PendingRequest> req) { return queue_.TryPush(std::move(req)); }
+bool Engine::Submit(std::shared_ptr<PendingRequest> req) {
+  // Before the push: the worker may pop (and read) it the instant it is queued.
+  if (opts_.request_log) req->enqueued_at = Clock::now();
+  return queue_.TryPush(std::move(req));
+}
 
 void Engine::Shutdown() {
   const bool already_stopping = stop_.exchange(true);
@@ -159,6 +182,28 @@ void Engine::WorkerLoop() {
 }
 
 void Engine::RunRequest(PendingRequest& req) {
+  // --request-log (docs/server.md "Request log"): `rec` is null unless the flag was given, and every
+  // use below is guarded on it. Token counts and timings only -- nothing the caller wrote.
+  RequestLogScope log_scope(opts_.request_log.get());
+  RequestLogRecord* const rec = log_scope.record();
+  if (rec != nullptr) {
+    rec->endpoint = req.kind == RequestKind::kChat ? "chat/completions" : "completions";
+    rec->request_id = req.request_id;
+    rec->stream = req.stream;
+    rec->max_tokens = req.max_tokens;
+    rec->temperature = static_cast<double>(req.sampling.temperature);
+    rec->tools_count = static_cast<int64_t>(req.tools.size());
+    rec->image_count = 0;
+    if (req.enqueued_at != Clock::time_point{}) rec->queue_wait_ms = Seconds(req.enqueued_at, Clock::now()) * 1000.0;
+    rec->http_status = 500;  // until a success or a reported failure says otherwise
+  }
+  // A failure this request reports through the sink: a streamed response's headers (200) are already
+  // out by now, so only a non-streamed one carries the error as its HTTP status.
+  auto note_error = [&](int status) {
+    if (rec == nullptr) return;
+    rec->error_status = status;
+    rec->http_status = req.stream ? 200 : status;
+  };
   try {
     // The (possibly image-EXPANDED) prompt token sequence -- see the vision block below for why
     // this is int32 rather than r4dx::TokenId from the start (ExpandImagePlaceholders and every
@@ -189,6 +234,7 @@ void Engine::RunRequest(PendingRequest& req) {
     const bool enable_thinking = req.kind == RequestKind::kChat
                                       ? ResolveEnableThinking(req.thinking, opts_.default_thinking)
                                       : false;
+    if (rec != nullptr) rec->thinking = enable_thinking;
     if (req.kind == RequestKind::kChat) {
       // Vision (docs/vision.md, docs/server.md "Images"): every image content part across the
       // WHOLE conversation, in the order the client's `messages` array carries them -- a client
@@ -210,7 +256,9 @@ void Engine::RunRequest(PendingRequest& req) {
           image_ptrs.push_back(&part.image);
         }
       }
+      if (rec != nullptr) rec->image_count = static_cast<int64_t>(placeholders_in.size());
       if (!placeholders_in.empty() && !model_->HasVision()) {
+        note_error(400);
         req.sink->OnError(400, "this model/container has no vision tower (loaded without "
                                 "vision.* tensors, or started with --vision off)");
         return;
@@ -304,6 +352,7 @@ void Engine::RunRequest(PendingRequest& req) {
         // as a 400 rather than falling through to the generic catch below, which would invalidate
         // the prefix-reuse cache and return an uninformative 500 for what is really a bad request
         // (review finding, 2026-09-20).
+        note_error(400);
         req.sink->OnError(400, std::string("messages could not be rendered by this checkpoint's "
                                             "chat template: ") + e.what());
         return;
@@ -338,6 +387,7 @@ void Engine::RunRequest(PendingRequest& req) {
           expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id,
                                                             placeholders_in, merge_size);
         } catch (const std::exception& e) {
+          note_error(400);
           req.sink->OnError(400,
                              std::string("image content parts do not match the rendered prompt's "
                                          "own placeholders: ") + e.what());
@@ -363,11 +413,14 @@ void Engine::RunRequest(PendingRequest& req) {
       full_tokens_i32.assign(raw_tokens.begin(), raw_tokens.end());
     }
 
+    if (rec != nullptr) rec->prompt_tokens = static_cast<int64_t>(full_tokens_i32.size());
     if (full_tokens_i32.empty()) {
+      note_error(400);
       req.sink->OnError(400, "prompt rendered to zero tokens");
       return;
     }
     if (static_cast<int64_t>(full_tokens_i32.size()) > MaxCtx()) {
+      note_error(400);
       req.sink->OnError(400, "prompt (" + std::to_string(full_tokens_i32.size()) +
                                   " tokens, including any spliced image tokens) exceeds --max-ctx ("
                                   + std::to_string(MaxCtx()) + ")");
@@ -441,6 +494,17 @@ void Engine::RunRequest(PendingRequest& req) {
       prefix_.Clear();
       new_tokens_i32.assign(full_tokens_i32.begin(), full_tokens_i32.end());
       skip = 0;
+    }
+    if (rec != nullptr) {
+      // cached_tokens = the prompt's leading tokens the model state already held (`skip`);
+      // prompt_n = the rest, what Prefill is fed -- timings.prompt_n, below.
+      rec->cached_tokens = skip;
+      rec->prompt_n = static_cast<int64_t>(new_tokens_i32.size());
+      rec->full_reset = reset_ms >= 0.0;
+      rec->checkpoint_restore = restore_ms >= 0.0;
+      if (reset_ms >= 0.0) rec->reset_ms = reset_ms;
+      if (restore_ms >= 0.0) rec->restore_ms = restore_ms;
+      rec->speculative = use_dflash ? "dflash" : (model_->MtpEnabled() ? "mtp" : "none");
     }
 
     // Vision: only a span AT OR PAST the already-fed prefix boundary needs its rows spliced THIS
@@ -901,6 +965,9 @@ void Engine::RunRequest(PendingRequest& req) {
     if (live_tool_stream) FlushGated(/*finishing=*/true);
     const auto d1 = Clock::now();
     const double decode_seconds = Seconds(d0, d1);
+    // The client's disconnect flag, read BEFORE OnDone: a StreamingSink is Cancel()ed again by the
+    // HTTP layer once a finished stream is released, which is not a disconnect.
+    const bool client_gone = rec != nullptr && req.sink->IsCancelled();
 
     prefix_.Commit(full_tokens_i32, committed_tokens, image_keys,
                    checkpointed ? std::optional<size_t>(ckpt_len) : std::nullopt);
@@ -1022,6 +1089,20 @@ void Engine::RunRequest(PendingRequest& req) {
       timings.image_ms = image_encode_ms_total;
     }
 
+    if (rec != nullptr) {
+      rec->http_status = 200;
+      rec->finish_reason = finish_reason;
+      rec->cancelled = client_gone || finish_reason == "cancelled";
+      rec->completion_tokens = static_cast<int64_t>(generated_tokens.size());
+      if (enable_thinking) rec->reasoning_tokens = reasoning_tokens;
+      rec->prompt_ms = timings.prompt_ms;
+      rec->predicted_ms = timings.predicted_ms;
+      rec->draft_n = timings.draft_n;
+      rec->draft_n_accepted = timings.draft_n_accepted;
+      rec->image_n = timings.image_n;
+      rec->image_ms = timings.image_ms;
+    }
+
     req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings,
                      reasoning_tokens);
 
@@ -1132,6 +1213,8 @@ void Engine::RunRequest(PendingRequest& req) {
       if (state == r4dx::model::TpModel::State::kFatal) tp_fatal_.store(true, std::memory_order_release);
     }
     LogLine(opts_.log_level, "error", "request " + req.request_id + ": " + what + tp_note);
+    note_error(500);
+    if (rec != nullptr) rec->finish_reason.reset();  // a failure that struck mid-way has no verdict
     req.sink->OnError(500, what);
   }
 }

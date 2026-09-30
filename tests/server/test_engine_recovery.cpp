@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <random>
@@ -243,9 +244,14 @@ struct Harness {
 };
 
 Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool checkpoint = false,
-                   bool thinking = false) {
+                   bool thinking = false, const std::string& request_log_path = "") {
   Harness e;
   r4dx::server::EngineOptions opts;
+  if (!request_log_path.empty()) {  // --request-log
+    std::string err;
+    opts.request_log = r4dx::server::RequestLog::Open(request_log_path, &err);
+    if (!opts.request_log) throw std::runtime_error(err);
+  }
   opts.tokenizer_dir = tokenizer_dir;
   opts.model_opts.max_ctx = 4096;
   opts.model_opts.prompt_checkpoint = checkpoint;  // --prompt-checkpoint
@@ -496,6 +502,55 @@ void CheckpointThinkingScenario(const std::string& tokenizer_dir, bool tp) {
   }
 }
 
+// --request-log through RunRequest's failure path (docs/server.md "Request log"): a request that
+// faults mid-decode still gets exactly one line -- status 500, what was known when it failed, no
+// verdict -- and the request after it, which takes the recovery Reset(), logs full_reset + reset_ms.
+// The speculative mode is the engine's ("dflash" here). Numbers only, in every line.
+void RequestLogFaultScenario(const std::string& tokenizer_dir) {
+  const int failures_before = g_failures;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "r4dx_engine_request_log_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string log_path = (dir / "requests.jsonl").string();
+  {
+    Harness e = MakeEngine(tokenizer_dir, /*dflash=*/true, /*tp=*/false, false, false, log_path);
+    const auto turn1 = Run(e, {Msg("user", "What is 2 plus 2?")}, 6);
+    CHECK(!turn1->errored, "turn 1 failed: %s", turn1->error_message.c_str());
+    const std::vector<r4dx::server::ChatMessage> turn2 = {Msg("user", "What is 2 plus 2?"), Msg("assistant", turn1->text),
+                                                           Msg("user", "And 3 plus 3?")};
+    e.fake->ArmFault(3);
+    const auto a = Run(e, turn2, 16);
+    CHECK(a->errored && a->error_status == 500, "the fault request answered errored=%d", static_cast<int>(a->errored));
+    const auto b = Run(e, turn2, 16);
+    CHECK(!b->errored, "the request after the fault failed: %s", b->error_message.c_str());
+    e.engine->Shutdown();
+  }
+  std::ifstream in(log_path, std::ios::binary);
+  std::vector<nlohmann::json> lines;
+  for (std::string l; std::getline(in, l);) lines.push_back(nlohmann::json::parse(l));
+  in.close();
+  CHECK(lines.size() == 3, "%zu log lines for 3 requests", lines.size());
+  if (lines.size() == 3) {
+    CHECK(lines[0]["http_status"] == 200 && lines[0]["speculative"] == "dflash" && lines[0]["finish_reason"] == "length" &&
+              lines[0]["cached_tokens"] == 0 && lines[0]["completion_tokens"] == 6 && lines[0]["draft_n"].is_number(),
+          "%s", lines[0].dump().c_str());
+    CHECK(lines[1]["http_status"] == 500 && lines[1]["error_status"] == 500 && lines[1]["finish_reason"].is_null() &&
+              lines[1]["completion_tokens"].is_null() && lines[1]["prompt_tokens"].is_number() &&
+              lines[1]["cancelled"] == false,
+          "%s", lines[1].dump().c_str());
+    // turn 2 extended turn 1's state, so the faulting request had cached tokens when it died.
+    CHECK(lines[1]["cached_tokens"].get<int64_t>() > 0 && lines[1]["full_reset"] == false, "%s", lines[1].dump().c_str());
+    CHECK(lines[2]["http_status"] == 200 && lines[2]["full_reset"] == true && lines[2]["reset_ms"].is_number() &&
+              lines[2]["cached_tokens"] == 0 && lines[2]["prompt_n"] == lines[2]["prompt_tokens"],
+          "the request after a fault resets and prefills everything: %s", lines[2].dump().c_str());
+  }
+  std::filesystem::remove_all(dir);
+  if (g_failures == failures_before) {
+    std::printf("[request log] a mid-decode fault logs one 500 line with no verdict; the recovery request logs "
+                "full_reset + reset_ms; dflash mode and draft_n recorded\n");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -512,6 +567,7 @@ int main() {
       CheckpointScenario(tokenizer_dir, tp);
       CheckpointThinkingScenario(tokenizer_dir, tp);
     }
+    RequestLogFaultScenario(tokenizer_dir);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "unexpected exception: %s\n", e.what());
     return 1;

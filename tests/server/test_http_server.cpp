@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -56,7 +58,7 @@ int g_failures = 0;
   do {                                                                     \
     if (!(cond)) {                                                         \
       std::fprintf(stderr, "CHECK failed at %s:%d: %s -- ", __FILE__, __LINE__, #cond); \
-      std::fprintf(stderr, __VA_ARGS__);                                   \
+      std::fprintf(stderr, "" __VA_ARGS__);                                \
       std::fprintf(stderr, "\n");                                          \
       ++g_failures;                                                        \
     }                                                                      \
@@ -174,8 +176,15 @@ class ScriptedTextModel final : public r4dx::model::TextModel {
 // A real Engine + HttpServer listening on 127.0.0.1, torn down in the destructor.
 class LiveServer {
  public:
-  LiveServer(const std::string& tokenizer_dir, std::vector<int32_t> script, std::vector<int64_t> round_sizes) {
+  // `request_log_path` non-empty: the server runs with `--request-log <path>` (RequestLogScenario).
+  LiveServer(const std::string& tokenizer_dir, std::vector<int32_t> script, std::vector<int64_t> round_sizes,
+             const std::string& request_log_path = "") {
     r4dx::server::EngineOptions opts;
+    if (!request_log_path.empty()) {
+      std::string err;
+      opts.request_log = r4dx::server::RequestLog::Open(request_log_path, &err);
+      if (!opts.request_log) throw std::runtime_error(err);
+    }
     opts.tokenizer_dir = tokenizer_dir;
     opts.model_opts.max_ctx = 4096;
     opts.model_opts.mtp_draft_k = round_sizes.empty() ? 0 : 3;  // the engine's round size, as --mtp 3
@@ -393,6 +402,221 @@ void OtherRoutesScenario(const std::string& tokenizer_dir, const std::vector<int
   }
 }
 
+// ---- --request-log (docs/server.md "Request log") --------------------------------------------------
+
+// A response with what differs from run to run removed: the random id, the clock, and the timings
+// (wall-clock measurements). Everything else -- choices, usage, every SSE chunk's shape and order --
+// is what the flag must never change.
+nlohmann::json StripVolatile(nlohmann::json j) {
+  j.erase("id");
+  j.erase("created");
+  j.erase("timings");
+  return j;
+}
+
+std::string NormalizeBody(const std::string& body, bool sse) {
+  if (!sse) return StripVolatile(nlohmann::json::parse(body)).dump();
+  std::string out;
+  size_t pos = 0;
+  while (pos < body.size()) {
+    size_t end = body.find("\n\n", pos);
+    if (end == std::string::npos) end = body.size();
+    const std::string ev = body.substr(pos, end - pos);
+    pos = end + 2;
+    if (ev.rfind("data: ", 0) == 0 && ev.substr(6) != "[DONE]") {
+      out += "data: " + StripVolatile(nlohmann::json::parse(ev.substr(6))).dump() + "\n\n";
+    } else {
+      out += ev + "\n\n";
+    }
+  }
+  return out;
+}
+
+struct Exchange {
+  std::string path, body, response;
+  int status = 0;
+  bool sse = false;
+};
+
+std::vector<Exchange> RunRequestLogRequests(httplib::Client& cli, const std::string& second_completion_prompt) {
+  const nlohmann::json tool = {{"type", "function"},
+                               {"function",
+                                {{"name", "get_current_weather"},
+                                 {"description", "Get the current weather."},
+                                 {"parameters", {{"type", "object"}, {"properties", {{"location", {{"type", "string"}}}}}}}}}};
+  std::vector<Exchange> out;
+  auto post = [&](const char* path, const nlohmann::json& body, bool sse) {
+    Exchange e;
+    e.path = path;
+    e.body = body.dump();
+    e.sse = sse;
+    const auto r = cli.Post(path, e.body, "application/json");
+    e.status = r ? r->status : -1;
+    e.response = r ? r->body : "";
+    out.push_back(e);
+  };
+  auto post_raw = [&](const char* path, const std::string& raw) {
+    Exchange e;
+    e.path = path;
+    e.body = raw;
+    const auto r = cli.Post(path, raw, "application/json");
+    e.status = r ? r->status : -1;
+    e.response = r ? r->body : "";
+    out.push_back(e);
+  };
+  const nlohmann::json user = {{"role", "user"}, {"content", "SECRET-PROMPT-TEXT what is 12 plus 30?"}};
+  post("/v1/chat/completions", {{"messages", {user}}, {"max_tokens", 12}, {"temperature", 0}}, false);  // 0
+  post("/v1/chat/completions", {{"messages", {{{"role", "user"}, {"content", "a different first turn"}}}},
+                                 {"max_tokens", 12}, {"temperature", 0}, {"stream", true},
+                                 {"stream_options", {{"include_usage", true}}}}, true);                   // 1
+  post("/v1/chat/completions", {{"messages", {user}}, {"tools", {tool}}, {"reasoning_effort", "high"},
+                                 {"max_tokens", 12}, {"temperature", 0}}, false);                         // 2
+  post("/v1/completions", {{"prompt", "12 plus 30 is\n"}, {"max_tokens", 8}, {"temperature", 0}}, false);   // 3
+  post("/v1/completions", {{"prompt", second_completion_prompt}, {"max_tokens", 4}, {"temperature", 0}}, false);  // 4
+  post_raw("/v1/chat/completions", "{not json");                                                           // 5
+  post("/v1/chat/completions", {{"model", "x"}}, false);                                                   // 6: no messages
+  return out;
+}
+
+void RequestLogScenario(const std::string& tokenizer_dir, const std::vector<int32_t>& script) {
+  const int failures_before = g_failures;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "r4dx_http_request_log_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string log_path = (dir / "requests.jsonl").string();
+
+  // The second /v1/completions request's prompt is the first one's prompt plus what the fake model
+  // generated for it, so its tokens extend the model's state and the prefix-reuse path is taken.
+  std::vector<Exchange> off, on;
+  std::string second_prompt;
+  {
+    LiveServer server(tokenizer_dir, script, {});
+    httplib::Client cli = server.Client();
+    // Probe for the first completion's text, then run the real list against a fresh server below.
+    const auto probe = cli.Post("/v1/completions",
+                                nlohmann::json({{"prompt", "12 plus 30 is\n"}, {"max_tokens", 8}, {"temperature", 0}}).dump(),
+                                "application/json");
+    CHECK(probe && probe->status == 200, "completions probe failed");
+    if (!probe || probe->status != 200) return;
+    second_prompt = "12 plus 30 is\n" + nlohmann::json::parse(probe->body)["choices"][0]["text"].get<std::string>() + " more";
+  }
+  {
+    LiveServer server(tokenizer_dir, script, {});  // flag absent
+    httplib::Client cli = server.Client();
+    off = RunRequestLogRequests(cli, second_prompt);
+  }
+  CHECK(!std::filesystem::exists(log_path), "no flag: no file");
+  {
+    LiveServer server(tokenizer_dir, script, {}, log_path);  // flag present
+    httplib::Client cli = server.Client();
+    on = RunRequestLogRequests(cli, second_prompt);
+  }
+
+  // 1. Byte-identical responses (id/created/timings aside) with the flag on and off, status included.
+  CHECK(off.size() == on.size() && on.size() == 7);
+  for (size_t i = 0; i < on.size() && i < off.size(); ++i) {
+    CHECK(off[i].status == on[i].status, "request %zu: status %d (off) vs %d (on)", i, off[i].status, on[i].status);
+    if (on[i].status == 200) {
+      CHECK(NormalizeBody(off[i].response, off[i].sse) == NormalizeBody(on[i].response, on[i].sse),
+            "request %zu: response differs with --request-log on", i);
+    } else {
+      CHECK(nlohmann::json::parse(off[i].response) == nlohmann::json::parse(on[i].response),
+            "request %zu: error body differs with --request-log on", i);
+    }
+  }
+
+  // 2. One line per request, in order, carrying what the response itself reported.
+  std::ifstream in(log_path, std::ios::binary);
+  const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  std::vector<nlohmann::json> lines;
+  {
+    size_t pos = 0;
+    while (pos < raw.size()) {
+      const size_t nl = raw.find('\n', pos);
+      CHECK(nl != std::string::npos, "the last line ends in a newline");
+      if (nl == std::string::npos) break;
+      lines.push_back(nlohmann::json::parse(raw.substr(pos, nl - pos)));
+      pos = nl + 1;
+    }
+  }
+  CHECK(raw.size() > 0 && raw[0] == '{', "no BOM");
+  CHECK(lines.size() == 7, "%zu log lines for 7 requests", lines.size());
+  if (lines.size() != 7) return;
+
+  // ids: the same id the client saw (chat/completion bodies; a stream's first chunk).
+  auto response_id = [&](const Exchange& e) {
+    if (!e.sse) return nlohmann::json::parse(e.response)["id"].get<std::string>();
+    return nlohmann::json::parse(e.response.substr(6, e.response.find("\n\n") - 6))["id"].get<std::string>();
+  };
+  auto usage_of = [&](const Exchange& e) {
+    if (!e.sse) return nlohmann::json::parse(e.response);
+    size_t pos = 0;
+    nlohmann::json last;
+    while (pos < e.response.size()) {  // the dedicated usage chunk
+      size_t end = e.response.find("\n\n", pos);
+      if (end == std::string::npos) end = e.response.size();
+      const std::string ev = e.response.substr(pos, end - pos);
+      pos = end + 2;
+      if (ev.rfind("data: {", 0) == 0) {
+        const nlohmann::json c = nlohmann::json::parse(ev.substr(6));
+        if (c.contains("usage") && c["usage"].is_object()) last = c;
+      }
+    }
+    return last;
+  };
+  for (size_t i = 0; i < 5; ++i) {
+    const nlohmann::json& l = lines[i];
+    const nlohmann::json body = usage_of(on[i]);
+    CHECK(l["request_id"] == response_id(on[i]), "request %zu: log id %s", i, l["request_id"].dump().c_str());
+    CHECK(l["http_status"] == 200 && l["error_status"].is_null() && l["cancelled"] == false);
+    CHECK(l["prompt_tokens"] == body["usage"]["prompt_tokens"], "request %zu prompt_tokens", i);
+    CHECK(l["completion_tokens"] == body["usage"]["completion_tokens"], "request %zu completion_tokens", i);
+    CHECK(l["prompt_n"] == body["timings"]["prompt_n"], "request %zu prompt_n %s vs timings %s", i,
+          l["prompt_n"].dump().c_str(), body["timings"]["prompt_n"].dump().c_str());
+    CHECK(l["prompt_tokens"].get<int64_t>() == l["prompt_n"].get<int64_t>() + l["cached_tokens"].get<int64_t>());
+    CHECK(l["finish_reason"] == "length", "request %zu finish %s", i, l["finish_reason"].dump().c_str());
+    CHECK(l["queue_wait_ms"].is_number() && l["queue_wait_ms"].get<double>() >= 0.0);
+    CHECK(l["prompt_ms"] == body["timings"]["prompt_ms"] || l["prompt_ms"].is_number());
+    CHECK(l["predicted_ms"].is_number() && l["prompt_per_second"].is_number());
+    CHECK(l["speculative"] == "none" && l["draft_n"].is_null());
+    CHECK(l["ts"].get<std::string>().size() == 29);
+  }
+  CHECK(lines[0]["endpoint"] == "chat/completions" && lines[0]["stream"] == false && lines[0]["thinking"] == false &&
+        lines[0]["tools_present"] == false && lines[0]["tools_count"] == 0 && lines[0]["image_count"] == 0);
+  CHECK(lines[0]["max_tokens"] == 12 && lines[0]["temperature"] == 0.0);
+  CHECK(lines[0]["cached_tokens"] == 0 && lines[0]["full_reset"] == false, "first request on a fresh model: nothing cached, no reset");
+  CHECK(lines[1]["stream"] == true && lines[1]["full_reset"] == true && lines[1]["cached_tokens"] == 0 &&
+        lines[1]["reset_ms"].is_number(), "a different conversation resets the model");
+  CHECK(lines[2]["thinking"] == true && lines[2]["tools_present"] == true && lines[2]["tools_count"] == 1 &&
+        lines[2]["reasoning_tokens"].is_number(), "reasoning_effort turns thinking on; tools counted");
+  CHECK(lines[3]["endpoint"] == "completions" && lines[3]["thinking"] == false && lines[3]["tools_count"] == 0 &&
+        lines[3]["reasoning_tokens"].is_null());
+  CHECK(lines[3]["full_reset"] == true, "an unrelated prompt resets");
+  CHECK(lines[4]["cached_tokens"].get<int64_t>() > 0 && lines[4]["full_reset"] == false &&
+        lines[4]["prompt_n"].get<int64_t>() < lines[4]["prompt_tokens"].get<int64_t>(),
+        "the follow-up extends the previous state: cached=%s prompt_n=%s", lines[4]["cached_tokens"].dump().c_str(),
+        lines[4]["prompt_n"].dump().c_str());
+  // The two rejected requests: 400, an id, no engine numbers.
+  for (size_t i = 5; i < 7; ++i) {
+    CHECK(lines[i]["http_status"] == 400 && lines[i]["request_id"].is_string() && lines[i]["prompt_tokens"].is_null() &&
+              lines[i]["finish_reason"].is_null(),
+          "rejected request %zu: %s", i, lines[i].dump().c_str());
+  }
+
+  // 3. Privacy: nothing the client wrote, and nothing the model wrote, is in the file.
+  for (const char* secret : {"SECRET-PROMPT-TEXT", "different first turn", "get_current_weather", "12 plus 30", "The user is"}) {
+    CHECK(raw.find(secret) == std::string::npos, "the log must not contain caller text: '%s'", secret);
+  }
+  if (g_failures == failures_before) {
+    std::printf("[request log] off: no file; on: 7 requests -> 7 lines, responses identical with the flag on and off, "
+                "second completion cached %lld of %lld prompt tokens, no prompt text in the file\n",
+                static_cast<long long>(lines[4]["cached_tokens"].get<int64_t>()),
+                static_cast<long long>(lines[4]["prompt_tokens"].get<int64_t>()));
+  }
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 
 int main() {
@@ -433,6 +657,7 @@ int main() {
     ThinkToolsScenario(tokenizer_dir, script, {4, 2, 1, 3, 4, 4, 1, 2, 3}, "mtp k=3");
     ThinkToolsScenario(tokenizer_dir, script, {}, "plain");
     OtherRoutesScenario(tokenizer_dir, script);
+    RequestLogScenario(tokenizer_dir, script);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "unexpected exception: %s\n", e.what());
     return 1;

@@ -19,6 +19,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -31,6 +32,7 @@
 #include "openai_types.h"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
 #include "prefix_state.h"
+#include "request_log.h"
 #include "request_queue.h"
 #include "response_sink.h"
 #include "text_model.h"  // r4dx::model::TextModel / TpOptions (docs/tp.md 2.8)
@@ -72,6 +74,11 @@ struct EngineOptions {
   // checkpoint's own preprocessor_config.json ceiling; r4dx::vision::MakeImageProcessorConfig
   // turns it into the ImageProcessorConfig the decode path uses.
   int64_t image_max_pixels = 1048576;
+  // `--request-log <path>` (docs/server.md "Request log"): null (the default, and always unless the
+  // flag was given) = off -- every log site in Engine/HttpServer is then one pointer test and nothing
+  // else runs. Shared with HttpServer (via Engine::GetRequestLog) for the requests it rejects before
+  // they reach the worker; RequestLog::Write is thread-safe.
+  std::shared_ptr<RequestLog> request_log;
 };
 
 enum class RequestKind { kChat, kCompletion };
@@ -101,6 +108,11 @@ struct PendingRequest {
   bool stream = false;
 
   std::shared_ptr<ResponseSink> sink;
+
+  // Stamped by Engine::Submit, and only when the request log is on: the request log's
+  // queue_wait_ms. A default-constructed time_point means "not stamped" (log off, or a request built
+  // without Submit, as the tests do).
+  std::chrono::steady_clock::time_point enqueued_at{};
 };
 
 class Engine {
@@ -141,6 +153,9 @@ class Engine {
   // http_server.cpp's /health reports it (503) instead of "ok" (docs/tp.md 2.4, R13; Appendix B N80).
   // Set only by the worker thread; any thread may read it. Always false at `--tp 1`.
   bool TpFatal() const { return tp_fatal_.load(std::memory_order_acquire); }
+
+  // The request log, or null when `--request-log` was not given.
+  RequestLog* GetRequestLog() const { return opts_.request_log.get(); }
 
   // Enqueues `req` for the worker thread. Returns false (queue already at --max-queue) if the
   // caller should answer 429 instead.

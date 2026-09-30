@@ -27,13 +27,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "model.h"
 #include "r4dx/kernels/kernels.h"
+#include "tp_model.h"
 #include "test_common.h"
 
 using namespace r4dx_test;
@@ -281,6 +284,98 @@ bool CheckDigestSensitivity(const Config& cfg) {
                cfg.name.c_str(), differing);
   return true;
 }
+// ---- tensor parallel (both ranks on device 1, --tp-mode emulate) ---------------------------------------
+// The same comparison through r4dx::model::TpModel: a 256-row super-chunk's all-reduces are four 64-row
+// calls (TpComm::AllReduceSumBf16Rows), so the logits and the tokens must be bit-identical to the 64-row
+// TP model's, and the number of all-reduces each rank makes for a scenario must be EQUAL (the same calls,
+// not just the same sums). The real two-GPU comparison is tools/prefill (docs/prefill.md "TP = 2").
+bool RunTpEmulate(const std::string& name, const ModelOptions& base, Mode mode,
+                   const std::vector<Scenario>& scenarios) {
+  if (const char* only = std::getenv("R4DX_TEST_ONLY")) {
+    if (*only != '\0' && name.find(only) == std::string::npos) return true;
+  }
+  std::fprintf(stderr, "[chunk-identity] %s\n", name.c_str());
+  Trace side[2];
+  for (int s = 0; s < 2; ++s) {
+    ModelOptions o = base;
+    o.prefill_chunk = s == 0 ? 64 : 256;
+    r4dx::model::TpOptions t;
+    t.world = 2;
+    t.mode = r4dx::model::TpOptions::Mode::kEmulate;
+    std::unique_ptr<r4dx::model::TpModel> tpm = r4dx::model::TpModel::Load(o, t);
+    std::vector<uint64_t> per_scenario_calls;
+    for (const Scenario& sc : scenarios) {
+      tpm->Reset();
+      const auto before = tpm->CallCounts();
+      const auto wide_before = tpm->PrefillWideChunksRun();
+      int total = 0;
+      for (int c : sc.calls) total += c;
+      const std::vector<int32_t> ids = Tokens(total, /*salt=*/1);
+      size_t off = 0;
+      std::vector<float> logits;
+      int k = 0;
+      for (int c : sc.calls) {
+        const std::vector<int32_t> part(ids.begin() + static_cast<ptrdiff_t>(off),
+                                        ids.begin() + static_cast<ptrdiff_t>(off + static_cast<size_t>(c)));
+        logits = tpm->Prefill(part);
+        off += static_cast<size_t>(c);
+        side[s].emplace_back(sc.name + "/call" + std::to_string(k++) + "/logits", HashLogits(logits));
+      }
+      int32_t tok = Argmax(logits);
+      std::vector<int32_t> toks;
+      for (int i = 0; i < 3; ++i) {
+        toks.push_back(tpm->DecodeStepGreedy(tok));
+        tok = toks.back();
+      }
+      if (mode == Mode::kMtp) {
+        for (int i = 0; i < 2; ++i) {
+          const std::vector<int32_t> round = tpm->DecodeStepMtpGreedy(tok, 3);
+          toks.insert(toks.end(), round.begin(), round.end());
+          tok = round.back();
+        }
+      }
+      side[s].emplace_back(sc.name + "/tokens", HashTokens(toks));
+      const auto after = tpm->CallCounts();
+      const auto wide_after = tpm->PrefillWideChunksRun();
+      int64_t expect_wide = 0;
+      for (int c : sc.calls) expect_wide += c / 256;
+      for (size_t r = 0; r < wide_after.size(); ++r) {
+        const int64_t got = wide_after[r] - wide_before[r];
+        if (got != (s == 1 ? expect_wide : 0)) {
+          std::fprintf(stderr, "FAIL %s: %s: TP rank %zu ran %lld super-chunks with prefill_chunk = %d, expected %lld\n",
+                       name.c_str(), sc.name.c_str(), r, static_cast<long long>(got), s == 1 ? 256 : 64,
+                       static_cast<long long>(s == 1 ? expect_wide : 0));
+          side[s].emplace_back(sc.name + "/wide-chunks-wrong", 1);
+        }
+      }
+      for (size_t r = 0; r < after.size(); ++r) {
+        for (int ch = 0; ch < 2; ++ch) {
+          side[s].emplace_back(sc.name + "/allreduce_calls/rank" + std::to_string(r) + "/ch" + std::to_string(ch),
+                               after[r][static_cast<size_t>(ch)] - before[r][static_cast<size_t>(ch)]);
+        }
+      }
+    }
+  }
+  bool ok = side[0].size() == side[1].size();
+  size_t bad = 0;
+  for (size_t i = 0; ok && i < side[0].size(); ++i) {
+    if (side[0][i] != side[1][i]) {
+      if (bad++ < 12) {
+        std::fprintf(stderr, "FAIL %s: %s differs: 64-row %016llx, 256-row %016llx\n", name.c_str(),
+                     side[0][i].first.c_str(), static_cast<unsigned long long>(side[0][i].second),
+                     static_cast<unsigned long long>(side[1][i].second));
+      }
+    }
+  }
+  if (bad != 0 || !ok) {
+    std::fprintf(stderr, "FAIL %s: %zu of %zu observables differ\n", name.c_str(), bad, side[0].size());
+    return false;
+  }
+  std::fprintf(stderr, "[PASS] %s: %zu observables (logits, tokens, all-reduce call counts) identical, TP=2 64-row vs "
+                       "256-row\n", name.c_str(), side[0].size());
+  return true;
+}
+
 std::vector<Scenario> TailScenarios(bool with_8k) {
   std::vector<Scenario> s;
   for (int n : {1, 63, 64, 65, 255, 256, 257, 511}) s.push_back({"len" + std::to_string(n), {n}});
@@ -322,6 +417,24 @@ static int RunTest() {
     std::fprintf(stderr, "[SKIP] %s not found -- the 4-layer part did not run\n", kL4Container);
   }
 
+  if (FileExists(kL4Container)) {
+    // TP = 2, both ranks on device 1 (--tp-mode emulate): the 4-layer container, plain and --mtp 3.
+    ModelOptions t;
+    t.container_path = kL4Container;
+    t.layout = Layout::kW4a16;
+    t.max_ctx = 1024;
+    t.layer_limit = 4;
+    t.vision = ModelOptions::VisionMode::kOff;
+    const std::vector<Scenario> tp_sc = {{"len64", {64}},   {"len255", {255}}, {"len256", {256}},
+                                         {"len257", {257}}, {"len511", {511}}, {"len600", {600}},
+                                         {"split300+333", {300, 333}}, {"split257+1", {257, 1}}};
+    ++ran;
+    if (!RunTpEmulate("tp2-emulate/l4/w4a16/plain", t, Mode::kPlain, tp_sc)) ++fails;
+    t.mtp_draft_k = 3;
+    ++ran;
+    if (!RunTpEmulate("tp2-emulate/l4/w4a16/mtp3", t, Mode::kMtp, tp_sc)) ++fails;
+  }
+
   const char* real = r4dx_test::ProductionTargetPath();
   const char* drafter = r4dx_test::ProductionDrafterPath();
   if (FileExists(real)) {
@@ -344,6 +457,14 @@ static int RunTest() {
     ++ran;
     if (!RunConfig(mtp)) ++fails;
 
+    {
+      // TP = 2 emulated on one device, real trellis container: the M = 256 GEMM at the rank-shard shapes.
+      ModelOptions t = base;
+      t.vision = ModelOptions::VisionMode::kOff;
+      const std::vector<Scenario> tp_sc = {{"len257", {257}}, {"len511", {511}}, {"split300+333", {300, 333}}};
+      ++ran;
+      if (!RunTpEmulate("tp2-emulate/real/plain", t, Mode::kPlain, tp_sc)) ++fails;
+    }
     if (FileExists(drafter)) {
       ModelOptions dof = base;
       dof.dflash_container = drafter;

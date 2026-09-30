@@ -136,6 +136,9 @@ class TpModel final : public TextModel {
   // Per rank thread, in rank order: the endpoint's CallCounts() / Stats(). Host-side counters, read
   // on the rank threads; legal in kReady and kNeedsRecovery.
   std::vector<std::array<uint64_t, 2>> CallCounts();
+  // Per rank, in rank order: Model::PrefillWideChunksRun() -- the 256-row prefill super-chunks that rank has
+  // run since load (a test / diagnostic: proof that the wide path, not its fallback, produced a result).
+  std::vector<int64_t> PrefillWideChunksRun();
   std::vector<core::TpCommStats> CommStats();
   // Per rank thread: the prefill submission bounding's counters (Model::TpSubmitStats). Same rules.
   std::vector<tp::SubmitBounder::Stats> SubmitStats();

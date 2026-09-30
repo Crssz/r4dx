@@ -858,6 +858,14 @@ std::vector<std::array<uint64_t, 2>> TpModel::CallCounts() {
   return *out;
 }
 
+std::vector<int64_t> TpModel::PrefillWideChunksRun() {
+  if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
+  auto out = std::make_shared<std::vector<int64_t>>(ranks_.size());
+  Run(AllSlots(), [out](RankSlot& s) { (*out)[static_cast<size_t>(s.index)] = s.model->PrefillWideChunksRun(); },
+      CmdKind::kPlain);
+  return *out;
+}
+
 std::vector<core::TpCommStats> TpModel::CommStats() {
   if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
   auto out = std::make_shared<std::vector<core::TpCommStats>>(ranks_.size());

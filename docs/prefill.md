@@ -560,5 +560,15 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   64-row run does. `Prefill`'s `on_chunk_captured` callback runs once per 64-row slice with
   `DflashFeatureBuffer()` / `DflashFeatureRows()` showing that slice. `test_prefill_chunk_identity`
   compares the MTP KV, the DFlash ring, the captured feature bytes and the speculative rounds' tokens.
-- Falls back to 64 rows with a stderr reason: tensor parallelism, a quant2 (rotated) container and,
-  per Prefill call, a conversation that has had an image spliced into it.
+- **TP = 2** runs the wide path too. The all-reduce mailbox holds 64 rows (`kMaxAllReduceBytes`); a
+  256-row row-parallel activation is all-reduced by `TpComm::AllReduceSumBf16Rows` as four ordinary
+  64-row calls (each element is the sum of the same two ranks' values, so slicing changes no byte, and
+  each call keeps the 500 ms spin timeout and the abort protocol untouched; both ranks make the same
+  calls). `TpWarmup` runs a 256-row prefill first, so the M = 256 GEMM's first launch at the shard
+  shapes and the sliced all-reduces are warm before the first request; the submission bounding's unit
+  (`Model::RunChunk`) is a quarter of its layers for a 256-row chunk, so the GPU time between forced
+  submissions on the display card is what it was. `test_prefill_chunk_identity` compares TpModel in
+  emulate mode (both ranks on one device, the real trellis container included) 64-row against 256-row:
+  logits, tokens and the per-rank all-reduce call counts are equal.
+- Falls back to 64 rows with a stderr reason: a quant2 (rotated) container and, per Prefill call, a
+  conversation that has had an image spliced into it.

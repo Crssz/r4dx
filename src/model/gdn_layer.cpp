@@ -291,7 +291,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   // Tensor parallel (docs/tp.md 6.2, site A1): out_proj is row-parallel, so each rank holds a
   // partial sum; sum it across ranks before the residual (and the fused next-norm epilogue).
   if (comm_ != nullptr) {
-    ProfiledCall(prof, s, "tp.allreduce", [&] { comm_->AllReduceSumBf16(gdn_out, T * hidden, s); });
+    ProfiledCall(prof, s, "tp.allreduce", [&] { comm_->AllReduceSumBf16Rows(gdn_out, T, hidden, s); });
   }
   ProfiledCall(prof, s, "gdn.residual", [&] {
     if (next_norm_weight != nullptr) {

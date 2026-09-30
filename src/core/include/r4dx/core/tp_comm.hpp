@@ -65,6 +65,21 @@ class TpComm {
   // of 16 and <= MaxAllReduceBytes(). Every rank must make the same sequence of calls with the same
   // n.
   virtual void AllReduceSumBf16(uint16_t* buf, int64_t n, hipStream_t stream) = 0;
+  // The same sum for a [rows, row_elems] activation of ANY number of rows: one AllReduceSumBf16 call per
+  // slice of whole rows that fits MaxAllReduceBytes() (64 rows of a 5120-wide row), in order. A 64-row
+  // prefill chunk or a decode step is one call, exactly as before; a 256-row prefill super-chunk
+  // (docs/prefill.md) is four, the four calls its four 64-row chunks would make. The result is
+  // bit-identical however the rows are sliced -- each element is the sum of the same two ranks' values --
+  // and every rank makes the same calls (lockstep), so the mailbox, its 500 ms spin timeout and its abort
+  // protocol are untouched: each call is an ordinary one.
+  void AllReduceSumBf16Rows(uint16_t* buf, int64_t rows, int64_t row_elems, hipStream_t stream) {
+    const int64_t max_rows = (static_cast<int64_t>(MaxAllReduceBytes()) / 2) / row_elems;
+    const int64_t per = max_rows > 0 ? max_rows : 1;  // a row wider than the mailbox is refused by the call
+    for (int64_t r0 = 0; r0 < rows; r0 += per) {
+      const int64_t n = rows - r0 < per ? rows - r0 : per;
+      AllReduceSumBf16(buf + r0 * row_elems, n * row_elems, stream);
+    }
+  }
   // Blocking host rendezvous: out[r*bytes .. (r+1)*bytes) = rank r's `mine`, for every r, in rank
   // order. Same `bytes` on every rank. Call only with this rank's device work synchronized.
   virtual void HostAllGather(const void* mine, size_t bytes, void* out) = 0;

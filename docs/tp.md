@@ -1177,6 +1177,17 @@ all-reduce timeout -- never as a hang past 500 ms or silently wrong output.
 Prefill chunk: 64 rows x 5120 x 2 B = 655,360 B = 640 KiB (channel 1). Verify: DFlash k=7 -> 8 rows =
 80 KiB; MTP K=16 -> 17 rows = 170 KiB (channel 0); MTP K up to 63 -> channel 1. Everything fits.
 
+The 256-row prefill chunk (default since 2026-09-30, docs/prefill.md) does not enlarge the mailbox: its
+row-parallel activations are all-reduced by `TpComm::AllReduceSumBf16Rows`, which makes one ordinary
+`AllReduceSumBf16` call per slice of whole rows that fits `MaxAllReduceBytes()` -- four 64-row calls for a
+256-row super-chunk, the calls its four 64-row chunks would make (channel 1, the same `nb`, the same
+500 ms spin timeout and abort protocol per call). Every element is the sum of the same two rank values, so
+the bytes do not depend on the slicing, and both ranks make the same calls (lockstep). A 64-row chunk or a
+decode step is still one call. `TpWarmup` runs a 256-row prefill first (when the KV cache holds one) so the
+M = 256 GEMM's first launch at the shard shapes and the sliced all-reduces are not first touched inside a
+request; the submission bounding's unit is a quarter of its layers for a 256-row chunk
+(`Model::RunChunk`), which keeps the GPU time between forced submissions on the display card unchanged.
+
 #### 6.3.9 `SelfTest()` (load time and after every recovery)
 
 For each channel and for n in {1, 8, 17 rows} (ch0) / {18, 64 rows} (ch1), 16 iterations k: rank r

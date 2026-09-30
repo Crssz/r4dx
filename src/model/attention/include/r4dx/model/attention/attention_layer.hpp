@@ -474,7 +474,7 @@ class AttentionLayer {
     // epilogue) consumes it. Absent at TP=1 (comm == nullptr).
     if (cfg_.comm != nullptr) {
       ProfiledCall(prof, stream, "tp.allreduce", [&] {
-        cfg_.comm->AllReduceSumBf16(o_out, static_cast<int64_t>(T) * hidden, stream);
+        cfg_.comm->AllReduceSumBf16Rows(o_out, static_cast<int64_t>(T), static_cast<int64_t>(hidden), stream);
       });
     }
 

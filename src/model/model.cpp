@@ -330,7 +330,6 @@ Model Model::Load(const ModelOptions& opts) {
   PrefillChunkInputs chunk_in;
   chunk_in.requested = m.prefill_chunk_request_;
   chunk_in.rotated_container = m.container_.HasRotation();
-  chunk_in.tensor_parallel = is_tp_rank;
   const char* chunk_why = nullptr;
   const bool want_wide = DecidePrefillChunk(chunk_in, &chunk_why) == kPrefillChunkWide;
   m.wide_rows_ = want_wide ? kPrefillChunkWide : 0;
@@ -924,7 +923,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // tp::kMaxUnsplitDraftK, N80) are not split; every call already ends in the stream synchronize
   // below. The previous call ended synchronized, so no unit is outstanding here.
   const bool bounded = comm_ != nullptr && is_prefill_path && submit_.Active();
-  const int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
+  // A 256-row super-chunk costs about four times a 64-row chunk per layer, so its unit is a quarter of the
+  // layers (at least one): the GPU time between two forced submissions -- what the display card waits
+  // behind -- stays what UnitLayersForContext sized it for.
+  int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
+  if (bounded && T > max_chunk_) unit_layers = std::max<int64_t>(1, unit_layers * max_chunk_ / T);
   if (bounded) submit_.Reset();
   // quant2 Q2b (docs/quant2.md section 4): all nullptr unless the container is q2ab.
   const BackboneHadSigns had = HadSigns();
@@ -1472,7 +1475,6 @@ int64_t Model::PrefillRowsForCall() {
   PrefillChunkInputs in;
   in.requested = prefill_chunk_request_;
   in.buffers_wide = true;
-  in.tensor_parallel = comm_ != nullptr;
   in.mrope_active = mrope_active_;
   in.rotated_container = container_.HasRotation();
   const char* why = nullptr;
@@ -2667,6 +2669,27 @@ void Model::TpWarmup() {
   // The real paths once, through the public methods (2.9 step 9): a full 64-row prefill chunk (the
   // channel-1 all-reduce size) and a greedy decode step (channel 0). Fixed ids 0..63: the warm-up
   // is a lockstep collective, so every rank must feed the same tokens.
+  // A wide (256-row prefill super-chunk, docs/prefill.md) Model warms that up first, when its KV cache can
+  // hold one: the first launch of the M = 256 trellis GEMM at this rank's shard shapes, the four sliced
+  // 64-row all-reduces per collective site and the 256-row activations must not meet their first touch
+  // inside a request, where a rank stalled in a first-use kernel load would let its peer's 500 ms spin
+  // timeout fire. Reset() then returns to an empty sequence for the 64-row warm-up below (a prompt tail
+  // and the decode / speculative paths), which is the whole warm-up of a 64-row Model.
+  if (wide_rows_ > 0 && !kv_caches_.empty()) {
+    int64_t capacity = 0;
+    for (const auto& kv : kv_caches_) {
+      if (kv) {
+        capacity = kv->CapacityTokens();
+        break;
+      }
+    }
+    if (capacity >= wide_rows_) {
+      std::vector<int32_t> wide_ids(static_cast<size_t>(wide_rows_));
+      for (int64_t i = 0; i < wide_rows_; ++i) wide_ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+      (void)Prefill(wide_ids);
+      Reset();
+    }
+  }
   std::vector<int32_t> ids(static_cast<size_t>(max_chunk_));
   for (int64_t i = 0; i < max_chunk_; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
   (void)Prefill(ids);

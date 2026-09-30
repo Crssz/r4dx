@@ -141,7 +141,7 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
   // sum; sum it across ranks before the residual (and the fused next-norm epilogue).
   if (comm_ != nullptr) {
     ProfiledCall(prof, s_raw, "tp.allreduce",
-                 [&] { comm_->AllReduceSumBf16(down_out, T * hidden, s_raw); });
+                 [&] { comm_->AllReduceSumBf16Rows(down_out, T, hidden, s_raw); });
   }
 
   ProfiledCall(prof, s_raw, "mlp.residual", [&] {

@@ -44,19 +44,19 @@ struct PrefillChunkInputs {
   bool buffers_wide = true;           // Load() sized the activation buffers and arena for 256 rows
   bool mrope_active = false;          // an image has been spliced into this conversation (3-axis rope rows)
   bool rotated_container = false;     // a quant2 container (residual rotation / Hadamard signs)
-  bool tensor_parallel = false;       // this Model is a TP rank (comm != nullptr)
 };
 
 // kPrefillChunkWide when this Model / call may run 256-row super-chunks, else kPrefillChunkBase. `*why` (if
 // non-null) names the reason a 256 request could not be honoured (a string literal); nullptr when 256 is
 // used, and when 64 is what was asked for (the kill switch is a choice, not a fallback). Never throws.
 //
-// What the wide path serves (docs/prefill.md): TP = 1 prompt prefill, including the prompt-checkpoint and
-// prefix-reuse suffix prefills (the chunk grid is anchored at the call start), --mtp (the MTP head primes
-// its KV per 64-row slice of a super-chunk), --dflash and a target feature capture (the capture, the
-// drafter injection and the per-chunk callback run per 64-row slice). It falls back, with a one-line
-// reason, for tensor parallelism, a quant2 (rotated) container and a conversation that has had an image
-// spliced in (its rope rows are 3-axis; PrefillMultimodal with images is 64-row anyway).
+// What the wide path serves (docs/prefill.md): TP = 1 and TP = 2 prompt prefill (a 256-row all-reduce is
+// four 64-row ones over the same bytes), including the prompt-checkpoint and prefix-reuse suffix prefills
+// (the chunk grid is anchored at the call start), --mtp (the MTP head primes its KV per 64-row slice of a
+// super-chunk), --dflash and a target feature capture (the capture, the drafter injection and the
+// per-chunk callback run per 64-row slice). It falls back, with a one-line reason, for a quant2 (rotated)
+// container and for a conversation that has had an image spliced in (its rope rows are 3-axis;
+// PrefillMultimodal with images is 64-row anyway).
 struct PrefillChunkReasons {
   static constexpr const char* kMrope = "an image was spliced into this conversation (3-axis rope rows)";
   static constexpr const char* kRotated = "a quant2 (rotated) container";
@@ -66,8 +66,7 @@ inline int DecidePrefillChunk(const PrefillChunkInputs& in, const char** why = n
   if (why != nullptr) *why = nullptr;
   if (in.requested != kPrefillChunkWide) return kPrefillChunkBase;
   const char* reason = nullptr;
-  if (in.tensor_parallel) reason = "tensor parallelism (--tp 2): the all-reduce buffer is sized for 64 rows";
-  else if (in.rotated_container) reason = PrefillChunkReasons::kRotated;
+  if (in.rotated_container) reason = PrefillChunkReasons::kRotated;
   else if (in.mrope_active) reason = PrefillChunkReasons::kMrope;
   else if (!in.buffers_wide) reason = PrefillChunkReasons::kNotWide;
   if (reason != nullptr) {

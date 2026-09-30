@@ -58,7 +58,7 @@ int main() {
   off.requested = 64;
   CHECK(DecidePrefillChunk(off, &why) == 64 && why == nullptr, "kill switch -> 64, no reason (a choice)");
   PrefillChunkInputs off_tp = off;
-  off_tp.tensor_parallel = true;
+  off_tp.rotated_container = true;
   off_tp.mrope_active = true;
   CHECK(DecidePrefillChunk(off_tp, &why) == 64 && why == nullptr,
         "kill switch wins over every other input, silently");
@@ -69,7 +69,6 @@ int main() {
     const char* reason_part;
   };
   const Case cases[] = {
-      {"--tp 2", [](PrefillChunkInputs& i) { i.tensor_parallel = true; }, "tensor parallel"},
       {"image spliced", [](PrefillChunkInputs& i) { i.mrope_active = true; }, "image"},
       {"quant2 container", [](PrefillChunkInputs& i) { i.rotated_container = true; }, "quant2"},
       {"buffers not wide", [](PrefillChunkInputs& i) { i.buffers_wide = false; }, "64 rows at load"},
@@ -84,17 +83,17 @@ int main() {
           c.name, why ? why : "(none)", c.reason_part);
     CHECK(DecidePrefillChunk(in) == 64, "%s: also without a reason out-parameter", c.name);
   }
-  // several at once (a TP rank after an image): still 64, with a reason
+  // several at once (an image in a quant2 conversation): still 64, with a reason
   {
     PrefillChunkInputs in = ok;
-    in.tensor_parallel = true;
+    in.rotated_container = true;
     in.mrope_active = true;
     why = nullptr;
-    CHECK(DecidePrefillChunk(in, &why) == 64 && why != nullptr, "TP + image -> 64 with a reason");
+    CHECK(DecidePrefillChunk(in, &why) == 64 && why != nullptr, "quant2 + image -> 64 with a reason");
   }
-  // What is served: MTP, DFlash, a feature capture and a per-chunk callback are not inputs of the decision
-  // any more (docs/prefill.md); the Model serves them per 64-row slice, and test_prefill_chunk_identity
-  // proves the bytes.
+  // What is served: tensor parallelism (each 256-row all-reduce is four 64-row ones), MTP, DFlash, a
+  // feature capture and a per-chunk callback are not inputs of the decision (docs/prefill.md); the Model
+  // serves them per 64-row slice, and test_prefill_chunk_identity proves the bytes.
 
   // ---- the chunk grid of one Prefill call: anchored at the call start ----
   // (the lengths of the docs/prefill.md tail tests: 1, 63, 64, 65, 255, 256, 257, 511, 8145)

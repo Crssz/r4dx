@@ -577,6 +577,26 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   submissions on the display card is what it was. `test_prefill_chunk_identity` compares TpModel in
   emulate mode (both ranks on one device, the real trellis container included) 64-row against 256-row:
   logits, tokens and the per-rank all-reduce call counts are equal.
+- **Validation of the default-on change** (MEASURED 2026-09-30, branch `chunk-default`, clean build in a
+  new build directory, HIP device 1 and TP = 2 as stated; logs and scratch under
+  `D:\models\r4dx\chunk\gates`, nothing else changed on disk):
+
+  | check | result |
+  |---|---|
+  | dense KL, 12 segments (prose / code / recall x 8k / 32k / 64k / 128k), default (no env) and `R4DX_PREFILL_CHUNK=0` | 12 of 12 `logprobs.f16` sha256-identical to `pflash\baseline\kl-dense-huihui`, both runs (whole-run wall, which includes the 256 teacher-forced decode rows of every segment: 926 s default vs 1109 s off; 8k prefix prefill 5.31 vs 7.27 s, 32k 26.60 vs 34.85 s) |
+  | `g6_validate.ps1` (validate_dflash, validate_spec_sampling, three smokes) | 5 of 5 steps exit 0 (smoke PASS counts 217 / 168 / 170, FAIL 0) |
+  | `kl_rung4.ps1` | mean KL 0.00788, top-1 95.70%, all four segments byte-identical to `huihui\kl\rt-mix45m` |
+  | `tp1_identity.ps1` against the frozen `tp1-1099446` binaries | rows 1-6, 8, 9 EQUAL (text, token ids, `[stats]` lines; row 6 bf16 and w4a16 logprobs); row 7 SKIP (the vision test image is absent from this tree) |
+  | `ctest -LE tp2gpu`, no env | 93 of 93 passed in 16.5 min: 73 ran, 20 skipped for gitignored goldens / fixtures (convert_trellis_import, test_kernel_bandwidth, test_rope_neox, test_topk16, test_dflash_attn, test_dflash_conv, test_rmsnorm_plain, test_trellis_decode / input / gemm, test_gdn_layer, test_final_lm_head, test_dflash_draft, test_trellis_linear, test_attn_layer, test_mrope_attn_layer, test_preprocess, test_position_ids, test_vision_index, test_vision_tower); `test_prefill_chunk` and `test_prefill_chunk_identity` (15 configurations) among the passes |
+  | `r4dx-cli`, 8k prompts (needle, CWE, code-QA), default vs `=0`: plain, `--mtp 3`, `--dflash --dflash-k 7` | text, token ids and the `[stats] mtp / dflash` lines identical in all 9 pairs (e.g. CWE `--dflash`: 7 rounds, 49 drafted, 15 accepted, both) |
+  | cold TTFT, TP = 1, prefill seconds (one discarded warm-up) | 8k: OFF 7.656 / 7.664, ON 5.711 / 5.699 = **1.343x** (pairs 1.341, 1.345); 32k: OFF 35.186, ON 26.667 = **1.319x** |
+  | TP = 2 (both GPUs): `ctest -L tp2gpu` | 2 of 2 passed (`test_tp_allreduce_2gpu`, `test_tp_real_vs_emulation`); `tdr_check.ps1`: no TDR over all the TP = 2 runs |
+  | TP = 2: KL prose_8k, greedy on an 8k needle and CWE prompt | logprobs sha256 identical with and without the chunk; both greedy outputs (text and ids) byte-identical |
+  | TP = 2 cold TTFT, 8k (one discarded warm-up) | OFF 5.382 / 5.400, ON 3.982 / 3.985 = **1.353x** |
+
+  TP = 2 with `--mtp` / `--dflash` was validated with both ranks emulated on one device
+  (`test_prefill_chunk_identity`, `smoke_tp2_emulate_dflash`), not on the two cards: only the
+  transport differs, and its calls are the ordinary 64-row ones.
 - **Image prompts** run the wide path too: `PrefillMultimodal` walks the same grid. The image splice and
   the 3-axis rope rows are functions of the absolute position (the rope buffers are sized for 256
   rows), so a super-chunk that straddles an image run splices and ropes what four 64-row chunks do, and

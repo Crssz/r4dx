@@ -20,8 +20,9 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   DFlash2 drafter.
 - **KV cache:** fp8 e4m3, paged in 16-token blocks, up to the model's native 262144-token context.
 - **Speculative decoding:** MTP and DFlash2 (block-diffusion drafter), lossless in distribution.
-- **Prefill:** chunked prefill with a fused, exact-wide attention kernel; a faster split-KV variant is
-  opt-in (`R4DX_PREFILL_SPLITKV=split`).
+- **Prefill:** 256-row chunks (the M = 256 trellis GEMM; bit-identical to 64-row chunks, kill switch
+  `R4DX_PREFILL_CHUNK=0`) with a fused, exact-wide attention kernel; a faster split-KV variant is opt-in
+  (`R4DX_PREFILL_SPLITKV=split`).
 - **Tensor parallel across two GPUs (`--tp 2`):** all-reduce through pinned host memory, since the
   cards have no peer-to-peer path.
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
@@ -38,7 +39,7 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Decode, plain | 36.7 tok/s |
 | Decode, DFlash2 `k=7` | 108 tok/s |
 | Prefill, short prompts | about 1130 tok/s |
-| Cold prefill (time to first token) | 6.9 s at 8k, 32 s at 32k, 74 s at 64k, 194 s at 128k tokens |
+| Cold prefill (time to first token) | 5.7 s at 8k, 26.7 s at 32k tokens (256-row chunks, HIP device 1; 7.7 s and 35.2 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
 With `--tp 2` on an earlier container, plain decode reached about 1.65x the single-GPU speed.
 Methodology and more numbers: [docs/perf.md](docs/perf.md), [docs/huihui.md](docs/huihui.md),

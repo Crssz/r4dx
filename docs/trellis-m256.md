@@ -61,6 +61,12 @@ Result (MEASURED, HIP device 1, TP = 1, Huihui mix4.5m, main dd38f8b + branch `l
 
 ### What runs where
 
+(Spike wording. Since the default-on work (2026-09-30) the decision is made once at load,
+`DecidePrefillChunk`: 256 rows unless `R4DX_PREFILL_CHUNK` is `0` / `64` or the container is quant2.
+TP = 2, `--mtp`, `--dflash`, the feature capture, the per-chunk callback and image prompts all run
+super-chunks now, bit-identical, as docs/prefill.md describes; only the mechanism of the table below is
+unchanged.)
+
 `Model::Prefill` decides once per call (`PrefillRowsForCall`, `prefill_chunk.h`): 256 rows only for a Model
 whose buffers were sized wide at load (flag on, TP = 1, no MTP head, no drafter), with no feature capture, no
 image ever spliced (3-axis rope rows), no quant2 container, and no per-chunk callback. Anything else prints one
@@ -149,7 +155,7 @@ a 0-6% loss on those classes (S1 numbers, not re-measured here).
 * `PlanTrellisM256` refuses (and ApplyLinear then slices as today) a KB 5 SK 16 row, an odd k-tile tail, and any
   shape outside K, N multiples of 128; no shape of this model hits that.
 * MTP, DFlash, TP = 2, vision and the server's other prefill entry points are not wired (out of scope): they fall
-  back to 64 rows.
+  back to 64 rows. (Superseded 2026-09-30: all of them run the 256-row chunk now, docs/prefill.md.)
 * `git`: `ctest -LE tp2gpu` skipped 20 tests for gitignored goldens; the trellis row-identity / golden tests
   (`test_trellis_gemm`, `test_trellis_input`, `test_trellis_decode`) among them, so the shipped M = 64 rows were
   checked here only through `test_trellis_m256` and the KL runs.
@@ -292,7 +298,8 @@ that ablation is not clean: the stand-ins cost about the VALU they replace.)
   best pick per class from the S1 table, first instantiated one wins; W4 x 1 vs W2 x 2 differ by up to 10% on
   out / z KB 4 (z and out use W4 x 1, mlp.gate_up KB 4 W2 x 2).
 * Tail chunks (fewer than 256 rows left) use today's 64-row kernels; the M = 128 kernel is not used (S1: about
-  1.13x, not worth a second path).
+  1.13x, not worth a second path; it saves well under 1% of a prompt, and it has no SK 16 configuration for
+  mlp.down KB 4). The tail lengths and prefix-reuse suffixes are bit-tested by `test_prefill_chunk_identity`.
 * The build's zero-scratch / 190-VGPR check (third_party/check_trellis_isa.cmake) covers this unit since S2:
   22 instantiations, max 190 VGPRs, no scratch (the S1 compile report,
   D:\models\r4dx\linear\S1\logs\resource.txt, lists the ones since removed).

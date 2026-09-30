@@ -132,10 +132,10 @@ void TestFormatUnknownsAreNull() {
   for (const char* k : {"prompt_tokens", "prompt_n", "cached_tokens", "completion_tokens", "reasoning_tokens",
                         "prompt_ms", "predicted_ms", "prompt_per_second", "predicted_per_second", "queue_wait_ms",
                         "draft_n", "full_reset", "tools_present", "tools_count", "image_count", "finish_reason",
-                        "thinking", "max_tokens", "temperature"}) {
+                        "thinking", "max_tokens", "temperature", "speculative"}) {
     CHECK(j[k].is_null(), "%s should be null", k);
   }
-  CHECK(j["speculative"] == "none" && j["cancelled"] == false);
+  CHECK(j["speculative"].is_null() && j["cancelled"] == false);
   CHECK(j.size() == kKeys.size());
 }
 

@@ -109,7 +109,7 @@ std::string FormatRequestLogLine(const RequestLogRecord& rec) {
   } else {
     o["predicted_per_second"] = nullptr;
   }
-  o["speculative"] = rec.speculative;
+  o["speculative"] = Opt(rec.speculative);
   o["draft_n"] = Opt(rec.draft_n);
   o["draft_n_accepted"] = Opt(rec.draft_n_accepted);
   o["full_reset"] = Opt(rec.full_reset);

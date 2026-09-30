@@ -71,7 +71,9 @@ struct RequestLogRecord {
   // timings.draft_n / draft_n_accepted: set only when a speculative round ran.
   std::optional<int64_t> draft_n;
   std::optional<int64_t> draft_n_accepted;
-  std::string speculative = "none";  // "none" | "mtp" | "dflash": the server's configured mode
+  // "none" | "mtp" | "dflash": the server's configured mode. Unset for a request that never reached
+  // the engine.
+  std::optional<std::string> speculative;
 
   // The client went away (streamed request: its connection dropped) before generation finished.
   bool cancelled = false;

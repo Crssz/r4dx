@@ -316,6 +316,11 @@ class Model {
   // attached, or one that only cares about the tail chunk, may pass nullptr (the default) exactly as
   // before -- zero cost, byte-identical to pre-this-fix behavior (a null std::function is a single
   // pointer compare per chunk, never invoked).
+  //
+  // 256-row prefill chunks (docs/prefill.md): a super-chunk is still drained in 64-row pieces -- the
+  // callback runs four times for it, and DflashFeatureBuffer() / DflashFeatureRows() show the 64 rows of
+  // the piece being drained (a view into the 256-row capture; after Prefill returns they show the last
+  // piece, as the last 64-row chunk would leave them).
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids,
                               const std::function<void()>& on_chunk_captured = nullptr);
 
@@ -760,6 +765,9 @@ class Model {
 #endif
   // 256 when this Model runs 256-row prefill super-chunks (buffers sized for them at load), else 64.
   int PrefillChunkRows() const { return wide_rows_ > 0 ? kPrefillChunkWide : kPrefillChunkBase; }
+  // How many 256-row super-chunks this Model has run since Load (tests and diagnostics: proof that the wide
+  // path, not its fallback, produced a result).
+  int64_t PrefillWideChunksRun() const { return wide_chunks_run_; }
 
  private:
   Model() = default;
@@ -989,9 +997,16 @@ class Model {
   int prefill_chunk_request_ = 64;
   int64_t wide_rows_ = 0;
   int64_t prefill_wide_active_ = 0;
+  int64_t wide_chunks_run_ = 0;  // super-chunks run since Load (PrefillWideChunksRun)
   bool prefill_chunk_noted_ = false;
   // Rows per RunChunk call of THIS Prefill call: 256 or max_chunk_. Prints the fallback line once.
-  int64_t PrefillRowsForCall(bool has_chunk_callback);
+  int64_t PrefillRowsForCall();
+  // The DFlash feature-row bookkeeping in one place: DflashFeatureRows() and the slice the public buffer
+  // accessor shows (0 unless a wide Prefill is draining a 256-row chunk's capture, 64 rows at a time).
+  void SetDflashFeatureRows(int64_t rows, int64_t view_row0 = 0) {
+    dflash_feature_rows_ = rows;
+    dflash_view_row0_ = view_row0;
+  }
   // The 64-row slices of a 256-row super-chunk's capture (DFlash): the first row of the slice the public
   // DflashFeatureBuffer() currently shows. 0 except while a wide Prefill drains its callback slice by slice
   // and after such a Prefill (then the last slice, which is what a 64-row chunk would have left).

@@ -551,6 +551,14 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   anchored at each call). A negative control shows the digest does change when the chunk grid moves.
 - VRAM: the wide buffers and arena add 0.22 GiB per Model (`arena+scratch=0.21875 GiB` in the load line,
   0.09375 with `=0`).
-- Falls back to 64 rows with a stderr reason: tensor parallelism, an MTP head, a DFlash drafter or
-  feature capture, a per-chunk callback, a quant2 (rotated) container and, per Prefill call, a
-  conversation that has had an image spliced into it.
+- **MTP and DFlash** run the wide path, bit-identical, by working in the 64-row slices of a super-chunk:
+  the MTP head primes its KV per slice with exactly the pair of `PrimeKv` calls a 64-row chunk makes
+  (a 1-row boundary call seeded by the previous slice's last hidden row, then 63 within-slice rows; the
+  pinned host staging of `MtpHead` has 256 rows so the slices' back-to-back calls stay disjoint), and the
+  DFlash feature capture (a 256-row buffer) is handed to `SetDflashCaptureObserver` observers and the
+  drafter's `InjectFeatures` (`max_inject_rows` 64) slice by slice, each injection synchronized as the
+  64-row run does. `Prefill`'s `on_chunk_captured` callback runs once per 64-row slice with
+  `DflashFeatureBuffer()` / `DflashFeatureRows()` showing that slice. `test_prefill_chunk_identity`
+  compares the MTP KV, the DFlash ring, the captured feature bytes and the speculative rounds' tokens.
+- Falls back to 64 rows with a stderr reason: tensor parallelism, a quant2 (rotated) container and,
+  per Prefill call, a conversation that has had an image spliced into it.

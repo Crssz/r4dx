@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -155,7 +156,8 @@ void RunScenario(Model& m, const Config& cfg, const Scenario& sc, Trace* tr) {
 // Loads `cfg` with ModelOptions::prefill_chunk = chunk, runs every scenario, returns the trace. Also fills
 // `launches` with the kernel launch count of the prefill in `count_scenario` (the last scenario's first
 // call) when non-null.
-bool RunConfigSide(const Config& cfg, int chunk, Trace* tr, std::vector<int64_t>* launches, bool* wide_out) {
+bool RunConfigSide(const Config& cfg, int chunk, Trace* tr, std::vector<int64_t>* launches, std::vector<int64_t>* wide_chunks,
+                   bool* wide_out) {
   ModelOptions o = cfg.opts;
   o.prefill_chunk = chunk;
   Model m = Model::Load(o);
@@ -163,20 +165,43 @@ bool RunConfigSide(const Config& cfg, int chunk, Trace* tr, std::vector<int64_t>
   if (cfg.mode == Mode::kCapture) m.AttachDflashFeatureCapture({0, 1, 2, 3});
   for (const Scenario& sc : cfg.scenarios) {
     r4dx_kernel_launch_counter_reset();
+    const int64_t before = m.PrefillWideChunksRun();
     RunScenario(m, cfg, sc, tr);
     if (launches != nullptr) launches->push_back(r4dx_kernel_launch_counter_get());
+    if (wide_chunks != nullptr) wide_chunks->push_back(m.PrefillWideChunksRun() - before);
   }
   return true;
 }
 
 bool RunConfig(const Config& cfg) {
+  // R4DX_TEST_ONLY=<substring>: run only the configurations whose name contains it (a debugging aid).
+  if (const char* only = std::getenv("R4DX_TEST_ONLY")) {
+    if (*only != '\0' && cfg.name.find(only) == std::string::npos) return true;
+  }
   std::fprintf(stderr, "[chunk-identity] %s: %zu scenarios\n", cfg.name.c_str(), cfg.scenarios.size());
   Trace narrow, wide;
-  std::vector<int64_t> narrow_launches, wide_launches;
+  std::vector<int64_t> narrow_launches, wide_launches, narrow_chunks, wide_chunks;
   bool narrow_wide = false, wide_wide = false;
-  RunConfigSide(cfg, 64, &narrow, &narrow_launches, &narrow_wide);
-  RunConfigSide(cfg, 256, &wide, &wide_launches, &wide_wide);
+  RunConfigSide(cfg, 64, &narrow, &narrow_launches, &narrow_chunks, &narrow_wide);
+  RunConfigSide(cfg, 256, &wide, &wide_launches, &wide_chunks, &wide_wide);
   bool ok = true;
+  // The wide path really ran, in every configuration: super-chunks were run exactly where a call has
+  // 256 rows or more (the grid: floor(rows / 256) per call), never by the 64-row Model.
+  for (size_t s = 0; s < cfg.scenarios.size(); ++s) {
+    int64_t expect = 0;
+    for (int c : cfg.scenarios[s].calls) expect += c / 256;
+    if (narrow_chunks[s] != 0) {
+      std::fprintf(stderr, "FAIL %s: %s: the 64-row Model ran %lld super-chunks\n", cfg.name.c_str(),
+                   cfg.scenarios[s].name.c_str(), static_cast<long long>(narrow_chunks[s]));
+      ok = false;
+    }
+    if (wide_chunks[s] != (cfg.expect_wide ? expect : 0)) {
+      std::fprintf(stderr, "FAIL %s: %s: the 256-row Model ran %lld super-chunks, expected %lld\n", cfg.name.c_str(),
+                   cfg.scenarios[s].name.c_str(), static_cast<long long>(wide_chunks[s]),
+                   static_cast<long long>(cfg.expect_wide ? expect : 0));
+      ok = false;
+    }
+  }
   if (narrow_wide) {
     std::fprintf(stderr, "FAIL %s: prefill_chunk = 64 loaded a 256-row Model (the kill switch)\n", cfg.name.c_str());
     ok = false;
@@ -286,7 +311,7 @@ static int RunTest() {
       Config capture{"l4/" + ln + "/capture", base, Mode::kCapture, 0, /*expect_wide=*/true, TailScenarios(false)};
       ModelOptions mo = base;
       mo.mtp_draft_k = 3;
-      Config mtp{"l4/" + ln + "/mtp3", mo, Mode::kMtp, 3, /*expect_wide=*/false, TailScenarios(false)};
+      Config mtp{"l4/" + ln + "/mtp3", mo, Mode::kMtp, 3, /*expect_wide=*/true, TailScenarios(false)};
       for (const Config* c : {&plain, &capture, &mtp}) {
         ++ran;
         if (!RunConfig(*c)) ++fails;
@@ -315,7 +340,7 @@ static int RunTest() {
     std::vector<Scenario> spec_sc = {{"len257", {257}}, {"len511", {511}}, {"split300+333", {300, 333}}};
     ModelOptions mo = base;
     mo.mtp_draft_k = 3;
-    Config mtp{"real/mtp3", mo, Mode::kMtp, 3, /*expect_wide=*/false, spec_sc};
+    Config mtp{"real/mtp3", mo, Mode::kMtp, 3, /*expect_wide=*/true, spec_sc};
     ++ran;
     if (!RunConfig(mtp)) ++fails;
 
@@ -323,7 +348,7 @@ static int RunTest() {
       ModelOptions dof = base;
       dof.dflash_container = drafter;
       dof.dflash_draft_k = 7;
-      Config dflash{"real/dflash7", dof, Mode::kDflash, 7, /*expect_wide=*/false, spec_sc};
+      Config dflash{"real/dflash7", dof, Mode::kDflash, 7, /*expect_wide=*/true, spec_sc};
       ++ran;
       if (!RunConfig(dflash)) ++fails;
     } else {

@@ -183,7 +183,9 @@ class MtpHead {
   // (prime_positions_dev_/prime_seqused_dev_/prime_embed_dev_) is NOT offset -- it is safely
   // reused at a fixed address across calls because HIP's stream-order guarantee DOES apply there
   // (each call's own kernels consume its device data before the next call's H2D can overwrite it).
-  // Caller must ensure host_staging_offset + n <= kMaxPrime; PrimeKv throws otherwise.
+  // Caller must ensure n <= kMaxPrime (64) and host_staging_offset + n <= kStagingRows (256: room for the
+  // four 64-row slices of a prefill super-chunk, each with its own disjoint pair); PrimeKv throws
+  // otherwise.
   //
   // rope3_host (vision milestone, docs/vision.md): host int32[3, n] (compact, t row then h then w)
   // giving these n positions' 3-axis mrope rope positions. Unlike Draft's, THESE positions can
@@ -281,16 +283,21 @@ class MtpHead {
   // PrimeKv's own .h doc comment above and its .cpp comment for the incident this fixed.
   int64_t max_draft_ = 0;  // sizes positions_dev_/seqused_dev_/draft_ids_dev_ above
 
+  // kMaxPrime: the most rows one PrimeKv call takes (the device scratch below). kStagingRows: the rows
+  // of pinned HOST staging -- a 256-row prefill super-chunk (docs/prefill.md) issues four 64-row slices'
+  // pairs of calls back to back with no synchronize in between, so their host slices must be disjoint
+  // (the boundary + within pair of slice j uses offsets 64 j and 64 j + 1).
   static constexpr int64_t kMaxPrime = 64;
-  core::PinnedBuffer<int32_t> prime_positions_host_;  // [kMaxPrime], sliced by host_staging_offset
+  static constexpr int64_t kStagingRows = 256;
+  core::PinnedBuffer<int32_t> prime_positions_host_;  // [kStagingRows], sliced by host_staging_offset
   core::DeviceBuffer<int32_t> prime_positions_dev_;   // [kMaxPrime], dest always offset 0
-  core::PinnedBuffer<int32_t> prime_seqused_host_;    // [kMaxPrime], sliced by host_staging_offset
+  core::PinnedBuffer<int32_t> prime_seqused_host_;    // [kStagingRows], sliced by host_staging_offset
   core::DeviceBuffer<int32_t> prime_seqused_dev_;     // [1], dest always offset 0
-  core::PinnedBuffer<uint16_t> prime_embed_host_;     // [kMaxPrime * hidden]
+  core::PinnedBuffer<uint16_t> prime_embed_host_;     // [kStagingRows * hidden]
   core::DeviceBuffer<uint16_t> prime_embed_dev_;      // [kMaxPrime * hidden]
   // PrimeKv's 3-axis rope rows, [3, n] compact at device offset 0; the host side is sliced by
   // 3*host_staging_offset for the same in-flight-H2D reason prime_positions_host_ is.
-  core::PinnedBuffer<int32_t> prime_rope3_host_;      // [3 * kMaxPrime]
+  core::PinnedBuffer<int32_t> prime_rope3_host_;      // [3 * kStagingRows]
   core::DeviceBuffer<int32_t> prime_rope3_dev_;       // [3 * kMaxPrime]
 
 #ifdef R4DX_TP_TESTING

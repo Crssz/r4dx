@@ -49,17 +49,18 @@ MtpHead::MtpHead(const ModelConfig& cfg, const MtpWeights& w, int64_t max_draft,
       rope3_dev_(static_cast<size_t>(3 * max_draft)),
       rope3_host_(static_cast<size_t>(3 * max_draft)),
       max_draft_(max_draft),
-      prime_positions_host_(static_cast<size_t>(kMaxPrime)),
+      prime_positions_host_(static_cast<size_t>(kStagingRows)),
       prime_positions_dev_(static_cast<size_t>(kMaxPrime)),
-      // Sized to kMaxPrime (not 1) so host_staging_offset can address a disjoint scalar slot per
-      // back-to-back call (RunChunk's boundary + within-chunk pair) -- see PrimeKv's .h doc
+      // Sized to kStagingRows (not 1) so host_staging_offset can address a disjoint scalar slot per
+      // back-to-back call (RunChunk's boundary + within-chunk pair, per 64-row slice of a 256-row
+      // super-chunk) -- see PrimeKv's .h doc
       // comment. prime_seqused_dev_ stays size 1: its destination is always offset 0 (device-side
       // reuse across calls is safe via HIP's own stream-issue-order guarantee).
-      prime_seqused_host_(static_cast<size_t>(kMaxPrime)),
+      prime_seqused_host_(static_cast<size_t>(kStagingRows)),
       prime_seqused_dev_(1),
-      prime_embed_host_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
+      prime_embed_host_(static_cast<size_t>(kStagingRows * cfg.hidden_size)),
       prime_embed_dev_(static_cast<size_t>(kMaxPrime * cfg.hidden_size)),
-      prime_rope3_host_(static_cast<size_t>(3 * kMaxPrime)),
+      prime_rope3_host_(static_cast<size_t>(3 * kStagingRows)),
       prime_rope3_dev_(static_cast<size_t>(3 * kMaxPrime)) {
   (void)w;  // cfg/w size this object's buffers above; neither is stored -- see mtp_head.h
 }
@@ -323,9 +324,9 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
   if (n > kMaxPrime) {
     throw std::runtime_error("MtpHead::PrimeKv: n must be <= " + std::to_string(kMaxPrime));
   }
-  if (host_staging_offset < 0 || host_staging_offset + n > kMaxPrime) {
+  if (host_staging_offset < 0 || host_staging_offset + n > kStagingRows) {
     throw std::runtime_error(
-        "MtpHead::PrimeKv: host_staging_offset + n must be <= " + std::to_string(kMaxPrime) +
+        "MtpHead::PrimeKv: host_staging_offset + n must be <= " + std::to_string(kStagingRows) +
         " (see PrimeKv's own .h doc comment: back-to-back calls must use disjoint offsets)");
   }
   const int64_t hidden = cfg.hidden_size;
@@ -387,7 +388,7 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
 
   // 3-axis rope rows (docs/vision.md), same disjoint-host-slice discipline as the two uploads
   // above -- 3 elements per position, so this call's slice starts at 3*host_staging_offset and is
-  // 3*n long, which still fits 3*kMaxPrime for RunChunk's (0, 1) offset pair.
+  // 3*n long, which still fits 3*kStagingRows for RunChunk's (row0, row0 + 1) offset pairs.
   if (rope3_host != nullptr) {
     std::copy(rope3_host, rope3_host + 3 * n, prime_rope3_host_.begin() + 3 * host_staging_offset);
     prime_rope3_dev_.CopyFromHostAsync(prime_rope3_host_.data() + 3 * host_staging_offset,

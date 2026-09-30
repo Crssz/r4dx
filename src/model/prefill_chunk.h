@@ -45,21 +45,18 @@ struct PrefillChunkInputs {
   bool mrope_active = false;          // an image has been spliced into this conversation (3-axis rope rows)
   bool rotated_container = false;     // a quant2 container (residual rotation / Hadamard signs)
   bool tensor_parallel = false;       // this Model is a TP rank (comm != nullptr)
-  bool mtp = false;                   // an MTP head is attached (its KV priming reads <= 64 rows)
-  bool dflash = false;                // a DFlash2 drafter is attached (feature injection <= 64 rows)
-  bool dflash_capture = false;        // a feature capture is attached (per-64-row chunk drain)
-  bool on_chunk_captured = false;     // the caller wants a callback after every 64-row chunk
 };
 
 // kPrefillChunkWide when this Model / call may run 256-row super-chunks, else kPrefillChunkBase. `*why` (if
 // non-null) names the reason a 256 request could not be honoured (a string literal); nullptr when 256 is
 // used, and when 64 is what was asked for (the kill switch is a choice, not a fallback). Never throws.
 //
-// What the wide path serves (docs/prefill.md): plain TP = 1 prompt prefill, including the prompt-checkpoint
-// and prefix-reuse suffix prefills (the chunk grid is anchored at the call start). It falls back, with a
-// one-line reason, for tensor parallelism, an MTP head, a DFlash drafter or feature capture, a per-chunk
-// callback, a quant2 (rotated) container and a conversation that has had an image spliced in (its rope
-// rows are 3-axis; PrefillMultimodal with images is 64-row anyway).
+// What the wide path serves (docs/prefill.md): TP = 1 prompt prefill, including the prompt-checkpoint and
+// prefix-reuse suffix prefills (the chunk grid is anchored at the call start), --mtp (the MTP head primes
+// its KV per 64-row slice of a super-chunk), --dflash and a target feature capture (the capture, the
+// drafter injection and the per-chunk callback run per 64-row slice). It falls back, with a one-line
+// reason, for tensor parallelism, a quant2 (rotated) container and a conversation that has had an image
+// spliced in (its rope rows are 3-axis; PrefillMultimodal with images is 64-row anyway).
 struct PrefillChunkReasons {
   static constexpr const char* kMrope = "an image was spliced into this conversation (3-axis rope rows)";
   static constexpr const char* kRotated = "a quant2 (rotated) container";
@@ -70,10 +67,6 @@ inline int DecidePrefillChunk(const PrefillChunkInputs& in, const char** why = n
   if (in.requested != kPrefillChunkWide) return kPrefillChunkBase;
   const char* reason = nullptr;
   if (in.tensor_parallel) reason = "tensor parallelism (--tp 2): the all-reduce buffer is sized for 64 rows";
-  else if (in.mtp) reason = "an MTP head is attached (--mtp): its KV priming is limited to 64 rows";
-  else if (in.dflash) reason = "a DFlash drafter is attached (--dflash): its feature injection is limited to 64 rows";
-  else if (in.dflash_capture) reason = "a target feature capture is attached: it drains once per 64-row chunk";
-  else if (in.on_chunk_captured) reason = "the caller asked for a callback after every 64-row chunk";
   else if (in.rotated_container) reason = PrefillChunkReasons::kRotated;
   else if (in.mrope_active) reason = PrefillChunkReasons::kMrope;
   else if (!in.buffers_wide) reason = PrefillChunkReasons::kNotWide;

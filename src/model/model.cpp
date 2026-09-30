@@ -117,16 +117,18 @@ void Model::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
   }
   dflash_target_layers_ = std::move(target_layers);
   const int64_t hidden = container_.Config().hidden_size;
-  dflash_features_dev_.Resize(static_cast<size_t>(max_chunk_) *
+  // A 256-row prefill super-chunk captures all 256 rows at once (RunChunk hands them over in 64-row
+  // slices, so the drafter and every observer still see at most 64).
+  dflash_features_dev_.Resize(static_cast<size_t>(wide_rows_ > 0 ? wide_rows_ : max_chunk_) *
                                static_cast<size_t>(dflash_target_layers_.size()) *
                                static_cast<size_t>(hidden));
-  dflash_feature_rows_ = 0;
+  SetDflashFeatureRows(0);
 }
 
 void Model::DetachDflashFeatureCapture() {
   dflash_target_layers_.clear();
   dflash_features_dev_.Resize(0);
-  dflash_feature_rows_ = 0;
+  SetDflashFeatureRows(0);
 }
 
 // quant2 (docs/quant2.md section 3.1 lists every call site and why the list is complete).
@@ -329,8 +331,6 @@ Model Model::Load(const ModelOptions& opts) {
   chunk_in.requested = m.prefill_chunk_request_;
   chunk_in.rotated_container = m.container_.HasRotation();
   chunk_in.tensor_parallel = is_tp_rank;
-  chunk_in.mtp = opts.mtp_draft_k > 0;
-  chunk_in.dflash = !opts.dflash_container.empty();
   const char* chunk_why = nullptr;
   const bool want_wide = DecidePrefillChunk(chunk_in, &chunk_why) == kPrefillChunkWide;
   m.wide_rows_ = want_wide ? kPrefillChunkWide : 0;
@@ -675,7 +675,7 @@ void Model::Reset() {
   // mtp_seed_hidden_'s bytes above are -- dflash_feature_rows_==0 means DflashFeatureRows() reports
   // "nothing captured yet" until the next RunChunk/VerifyWindow overwrites both the buffer and this
   // count together, so a caller cannot observe a stale row count pointing at stale data.
-  dflash_feature_rows_ = 0;
+  SetDflashFeatureRows(0);
   // DFlash2's own KV ring (stage S3): drop every injected position -- the ring's bytes are left
   // alone (same self-correcting-via-position-overwrite argument DflashDraft::Reset()'s own comment
   // makes), so this is a cheap host-only counter reset, not a device zero/sync. This also clears
@@ -742,7 +742,7 @@ void Model::RestoreCheckpoint() {
   mtp_seed_valid_ = ckpt_mtp_seed_valid_;
   mtp_num_accepted_valid_ = false;
   mtp_last_hidden_ = nullptr;
-  dflash_feature_rows_ = 0;
+  SetDflashFeatureRows(0);
   if (dflash_.has_value()) {
     // A drafter whose injection lagged (toggled off) is already at or behind pos_: the next RunChunk
     // turns that into a cold-ring gap as usual.
@@ -903,6 +903,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
   // The M = 256 trellis GEMM is reachable from ApplyLinear only inside a super-chunk's layers.
   const ScopedTrellisM256 trellis_m256_scope(wide);
+  if (wide) ++wide_chunks_run_;
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
@@ -1041,7 +1042,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // chunk actually captured. When injection is disabled the buffer still holds whatever the last
   // capturing call left there, so report 0 rows rather than let a caller mistake stale rows for
   // this chunk's (same reasoning as Reset()'s own zeroing of this counter).
-  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = dflash_capture_active ? T : 0;
+  if (!dflash_target_layers_.empty()) SetDflashFeatureRows(dflash_capture_active ? T : 0);
 
   // ---- MTP lockstep KV priming (docs/mtp.md, mtp_head.h's PrimeKv comment) ----------------------
   // Extends MtpHead's own KV cache by exactly the real positions THIS call just made knowable --
@@ -1052,46 +1053,62 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     // The MTP head's own linears run here too: a call of its own, so they are not counted as the
     // layer stack's (debug_probe.h).
     ProbeScope probe_prime(probe_, stream_.get(), "mtp_prime", T);
-    // MTP's own attention layer ropes at the same 3-axis positions the backbone just did -- and
-    // unlike its draft loop, these positions are INSIDE the prompt, so they can land on image rows
-    // where the three axes genuinely differ (docs/vision.md). Built on the host per call because
-    // the two PrimeKv calls below cover different, non-contiguous position windows.
-    std::vector<int32_t> prime_rope3;
-    const int32_t* boundary_rope3 = nullptr;
-    const int32_t* within_rope3 = nullptr;
-    std::vector<int32_t> boundary_rope3_rows;
-    if (mrope_active_) {
-      if (mtp_seed_valid_) {
-        RopePositionsHost(pos_ - 1, 1, &boundary_rope3_rows);
-        boundary_rope3 = boundary_rope3_rows.data();
+    // A 256-row super-chunk (docs/prefill.md) primes the head in its 64-row slices, in order: slice j
+    // makes exactly the pair of PrimeKv calls a 64-row chunk at that position makes (a boundary call of 1
+    // row, then a within-slice call of 63), fed the same rows -- the backbone rows of `cur` are the bytes
+    // the 64-row chunks would have produced, and the previous slice's last row, which a 64-row run holds in
+    // mtp_seed_hidden_, is `cur` row 64 j - 1 -- so the head's KV cache is byte for byte what 64-row prefill
+    // leaves. The head's KV is its own state, so priming after the whole super-chunk's layers instead of
+    // between chunks changes nothing the backbone reads. A 64-row chunk is one slice (S == T, row0 == 0).
+    const int64_t mtp_slice = wide ? max_chunk_ : T;
+    for (int64_t row0 = 0; row0 < T; row0 += mtp_slice) {
+      const int64_t S = std::min(mtp_slice, T - row0);
+      const bool have_boundary = row0 > 0 || mtp_seed_valid_;
+      // MTP's own attention layer ropes at the same 3-axis positions the backbone just did -- and
+      // unlike its draft loop, these positions are INSIDE the prompt, so they can land on image rows
+      // where the three axes genuinely differ (docs/vision.md). Built on the host per call because
+      // the two PrimeKv calls below cover different, non-contiguous position windows. (A super-chunk
+      // never runs with an image in the conversation: mrope_active_ is false there.)
+      std::vector<int32_t> prime_rope3;
+      const int32_t* boundary_rope3 = nullptr;
+      const int32_t* within_rope3 = nullptr;
+      std::vector<int32_t> boundary_rope3_rows;
+      if (mrope_active_) {
+        if (have_boundary) {
+          RopePositionsHost(pos_ + row0 - 1, 1, &boundary_rope3_rows);
+          boundary_rope3 = boundary_rope3_rows.data();
+        }
+        if (S > 1) {
+          RopePositionsHost(pos_ + row0, S - 1, &prime_rope3);
+          within_rope3 = prime_rope3.data();
+        }
       }
-      if (T > 1) {
-        RopePositionsHost(pos_, T - 1, &prime_rope3);
-        within_rope3 = prime_rope3.data();
+      if (have_boundary) {
+        // The ONE position left dangling by the previous RunChunk/DecodeStepMtpGreedy call (or the
+        // previous slice): h_i = that call's own last-row hidden state (mtp_seed_hidden_; `cur` row
+        // row0 - 1 for a later slice of this super-chunk), t_{i+1} = THIS slice's own first input token.
+        // host_staging_offset=row0: the FIRST of the two PrimeKv calls of this slice (see mtp_head.h's
+        // PrimeKv doc comment for why the calls need disjoint offsets into MtpHead's own pinned host
+        // scratch; the slices of a super-chunk get disjoint ones too, which is why that scratch has
+        // MtpHead::kStagingRows rows).
+        mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_ + row0 - 1,
+                      row0 > 0 ? cur + (row0 - 1) * hidden : mtp_seed_hidden_.data(),
+                      {token_ids[static_cast<size_t>(row0)]}, container_.EmbedTokensHost(),
+                      cfg.vocab_size, /*host_staging_offset=*/row0, boundary_rope3);
       }
-    }
-    if (mtp_seed_valid_) {
-      // The ONE position left dangling by the previous RunChunk/DecodeStepMtpGreedy call: h_i =
-      // that call's own last-row hidden state (mtp_seed_hidden_), t_{i+1} = THIS call's own first
-      // input token.
-      // host_staging_offset=0: this is the FIRST of up to two PrimeKv calls in this RunChunk
-      // invocation (see mtp_head.h's PrimeKv doc comment for why the two calls need disjoint
-      // offsets into MtpHead's own pinned host scratch).
-      mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_ - 1, mtp_seed_hidden_.data(),
-                    {token_ids[0]}, container_.EmbedTokensHost(), cfg.vocab_size,
-                    /*host_staging_offset=*/0, boundary_rope3);
-    }
-    if (T > 1) {
-      // Within-chunk pairs: h_i = this chunk's own rows 0..T-2 (`cur`, unmodified since the layer
-      // loop above finished), t_{i+1} = this chunk's own token_ids[1..T-1]. Row T-1 is left
-      // dangling for the NEXT call, exactly like the boundary case above.
-      // host_staging_offset=1: the SECOND of up to two calls this invocation -- the boundary call
-      // above (n=1) used offset 0, so offset 1 keeps this call's host source disjoint from it while
-      // it may still be in flight. 1 + (T-1) == T <= max_chunk_ == MtpHead::kMaxPrime always.
-      const std::vector<int32_t> next_toks(token_ids.begin() + 1, token_ids.end());
-      mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_, cur, next_toks,
-                    container_.EmbedTokensHost(), cfg.vocab_size, /*host_staging_offset=*/1,
-                    within_rope3);
+      if (S > 1) {
+        // Within-slice pairs: h_i = this slice's own rows 0..S-2 (`cur`, unmodified since the layer
+        // loop above finished), t_{i+1} = this slice's own token_ids[1..S-1]. Row S-1 is left
+        // dangling for the NEXT slice or call, exactly like the boundary case above.
+        // host_staging_offset=row0 + 1: the SECOND of the slice's calls -- the boundary call above
+        // (n=1) used offset row0, so row0 + 1 keeps this call's host source disjoint from it while it
+        // may still be in flight. row0 + 1 + (S-1) <= T <= MtpHead::kStagingRows always.
+        const std::vector<int32_t> next_toks(token_ids.begin() + row0 + 1, token_ids.begin() + row0 + S);
+        mtp_->PrimeKv(stream_, arena_, cfg, container_.Mtp(), pos_ + row0, cur + row0 * hidden,
+                      next_toks, container_.EmbedTokensHost(), cfg.vocab_size,
+                      /*host_staging_offset=*/row0 + 1, within_rope3);
+      }
+      if (wide) arena_.Reset();  // a 64-row chunk resets once, below; each slice starts on a clean arena
     }
     R4DX_HIP_CHECK(hipMemcpyAsync(mtp_seed_hidden_.data(), cur + (T - 1) * hidden,
                                    static_cast<size_t>(hidden) * sizeof(uint16_t),
@@ -1201,61 +1218,76 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // complete on the device (the stream_.Synchronize() above already waited for them) and before any
   // later call can overwrite dflash_features_dev_ at row 0. `pos_` is still this chunk's own start
   // position here, which is exactly the absolute position of captured row 0.
-  if (dflash_observer_ && dflash_capture_active) {
-    dflash_observer_(dflash_features_dev_.data(), T, pos_);
-  }
   // Stage S3: when THIS Model owns its own drafter (ModelOptions::dflash_container), feed it
-  // directly -- a plain member call, not the external dflash_observer_ mechanism above (model.h's
-  // dflash_ field comment explains why: dflash_observer_ closures are for a caller-owned drafter
-  // object with its own, separately-managed lifetime; dflash_ is a member of this very Model, so a
-  // direct call needs no captured pointer that a future Model move could invalidate). `pos_` is
-  // still this chunk's own start position here, exactly InjectFeatures' own `start_pos` contract
-  // (monotonic, >= DflashDraft::InjectedCount()). It EQUALS InjectedCount() whenever injection has
-  // been on continuously, because Prefill/DecodeStep* never skip a chunk's worth of positions and
-  // this call always injects every one of them; it is strictly GREATER exactly once after a caller
-  // re-enables injection (model.h's SetDflashInjectionEnabled), which InjectFeatures turns into a
-  // cold-ring gap. Either way `InjectedCount() == pos_` holds again on return.
-  if (dflash_.has_value() && dflash_capture_active) {
-    // The drafter ropes on the mrope TEMPORAL axis only (docs/dflash2.md "RoPE": sections
-    // [64,0,0,0]) while its ring stays keyed on the sequence position -- so it gets the t row of
-    // this chunk's rows, not the whole [3, T] block. `rope_delta_` covers its own draft blocks,
-    // which are always past the prompt; injection can straddle an image, so it gets the real row.
-    std::vector<int32_t> inject_rope3;
-    const int32_t* inject_rope_t = nullptr;
-    if (mrope_active_) {
-      RopePositionsHost(pos_, T, &inject_rope3);
-      inject_rope_t = inject_rope3.data();  // row 0 of [3, T] is the temporal row
+  // directly -- a plain member call, not the external dflash_observer_ mechanism (model.h's dflash_
+  // field comment explains why: dflash_observer_ closures are for a caller-owned drafter object with
+  // its own, separately-managed lifetime; dflash_ is a member of this very Model, so a direct call
+  // needs no captured pointer that a future Model move could invalidate). `pos_` is still this
+  // chunk's own start position here, exactly InjectFeatures' own `start_pos` contract (monotonic,
+  // >= DflashDraft::InjectedCount()). It EQUALS InjectedCount() whenever injection has been on
+  // continuously, because Prefill/DecodeStep* never skip a chunk's worth of positions and this call
+  // always injects every one of them; it is strictly GREATER exactly once after a caller re-enables
+  // injection (model.h's SetDflashInjectionEnabled), which InjectFeatures turns into a cold-ring gap.
+  // Either way `InjectedCount() == pos_` holds again on return.
+  //
+  // A 256-row super-chunk (docs/prefill.md) hands over its capture in the 64-row slices a 64-row run
+  // would have: rows [64 j, 64 j + 64) of dflash_features_dev_ are byte for byte the rows the 64-row
+  // chunk at that position captures (a row's layer inputs do not depend on the chunking), and both the
+  // observer (<= 64 rows, its documented contract) and InjectFeatures (max_inject_rows == 64) take them
+  // slice by slice, in order, each slice's observer call followed by its own injection -- the sequence
+  // of calls, and of rows in them, of the 64-row run. A 64-row chunk (or a decode step) is one slice.
+  if (dflash_capture_active && (dflash_observer_ || dflash_.has_value())) {
+    const int64_t feat_slice = wide ? max_chunk_ : T;
+    const int64_t feat_cols = static_cast<int64_t>(dflash_target_layers_.size()) * hidden;
+    for (int64_t row0 = 0; row0 < T; row0 += feat_slice) {
+      const int64_t S = std::min(feat_slice, T - row0);
+      const uint16_t* slice_features = dflash_features_dev_.data() + row0 * feat_cols;
+      if (dflash_observer_) dflash_observer_(slice_features, S, pos_ + row0);
+      if (!dflash_.has_value()) continue;
+      // The drafter ropes on the mrope TEMPORAL axis only (docs/dflash2.md "RoPE": sections
+      // [64,0,0,0]) while its ring stays keyed on the sequence position -- so it gets the t row of
+      // this chunk's rows, not the whole [3, S] block. `rope_delta_` covers its own draft blocks,
+      // which are always past the prompt; injection can straddle an image, so it gets the real row.
+      std::vector<int32_t> inject_rope3;
+      const int32_t* inject_rope_t = nullptr;
+      if (mrope_active_) {
+        RopePositionsHost(pos_ + row0, S, &inject_rope3);
+        inject_rope_t = inject_rope3.data();  // row 0 of [3, S] is the temporal row
+      }
+      ProbeScope probe_inject(probe_, stream_.get(), "dflash_inject", S);
+      dflash_->InjectFeatures(stream_, arena_, slice_features, S, pos_ + row0, inject_rope_t);
+      probe_inject.End();
+      // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
+      // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
+      // arena_ in this codebase resets it when done -- InjectFeatures' own scratch allocations (the
+      // fc encoder GEMM etc.) are the ONE exception, because leaving them un-reset means the NEXT
+      // RunChunk call (the next prefill chunk, or the next plain decode step) starts ITS OWN layer
+      // loop from a non-zero, dirty arena offset instead of the clean one every other code path
+      // (including the `--mtp 0` baseline this must stay byte-identical to) always starts from.
+      // FOUND BY validate_dflash.ps1 (docs/dflash2.md section 7 item 4): a >64-token prompt (>1
+      // prefill chunk) diverged from `--mtp 0` on EVERY target layout including w4a16 (which has no
+      // known batched-verify reduction-order sensitivity, ruling that mechanism out), while a
+      // <=64-token (single-chunk) prompt matched exactly -- the single-chunk case only "worked" by
+      // accident, because DecodeStepDflashGreedy's own first arena_.Reset() (after its DraftRound
+      // call) wipes the leftover before anything reads it, which nothing does between two prefill
+      // chunks of the SAME Prefill() call.
+      arena_.Reset();
+      // Review finding (2026-09-21, blocker-adjacent major): InjectFeatures enqueues real kernels
+      // (the fc encoder GEMM, per-layer k/v projections, norms, rope, and the ring's D2D copies) on
+      // stream_ AFTER the stream_.Synchronize() above (this function's one and only sync point until
+      // now) -- so RunChunk was returning with the device NOT idle whenever a drafter is attached.
+      // That breaks the invariant the top-of-function comment on attn_positions_/attn_seqused_k_
+      // documents as load-bearing: "the previous RunChunk call (if any) ended with stream_.Synchronize()
+      // ... so the device is guaranteed idle here" backs a plain (blocking, null-stream) hipMemcpy that
+      // races an in-flight non-blocking-stream kernel if that invariant is false. No corruption was
+      // observed because InjectFeatures happens not to touch those two buffers, but the invariant
+      // itself was silently false with --dflash. Re-synchronize here so RunChunk keeps its documented
+      // "device idle on return" contract for every caller, dflash or not. A super-chunk synchronizes
+      // after EVERY slice, not once at the end: InjectFeatures stages the slice's positions in one
+      // pinned host array (ipos_host_) that the next slice's call would overwrite before the first
+      // one's async H2D ran, exactly the race the 64-row run avoids by syncing between chunks.
+      stream_.Synchronize();
     }
-    ProbeScope probe_inject(probe_, stream_.get(), "dflash_inject", T);
-    dflash_->InjectFeatures(stream_, arena_, dflash_features_dev_.data(), T, pos_, inject_rope_t);
-    probe_inject.End();
-    // MUST reset arena_ before returning: the per-layer loop above already left arena_ clean (its
-    // own last iteration calls arena_.Reset() unconditionally), and every other terminal user of
-    // arena_ in this codebase resets it when done -- InjectFeatures' own scratch allocations (the
-    // fc encoder GEMM etc.) are the ONE exception, because leaving them un-reset means the NEXT
-    // RunChunk call (the next prefill chunk, or the next plain decode step) starts ITS OWN layer
-    // loop from a non-zero, dirty arena offset instead of the clean one every other code path
-    // (including the `--mtp 0` baseline this must stay byte-identical to) always starts from.
-    // FOUND BY validate_dflash.ps1 (docs/dflash2.md section 7 item 4): a >64-token prompt (>1
-    // prefill chunk) diverged from `--mtp 0` on EVERY target layout including w4a16 (which has no
-    // known batched-verify reduction-order sensitivity, ruling that mechanism out), while a
-    // <=64-token (single-chunk) prompt matched exactly -- the single-chunk case only "worked" by
-    // accident, because DecodeStepDflashGreedy's own first arena_.Reset() (after its DraftRound
-    // call) wipes the leftover before anything reads it, which nothing does between two prefill
-    // chunks of the SAME Prefill() call.
-    arena_.Reset();
-    // Review finding (2026-09-21, blocker-adjacent major): InjectFeatures enqueues real kernels
-    // (the fc encoder GEMM, per-layer k/v projections, norms, rope, and the ring's D2D copies) on
-    // stream_ AFTER the stream_.Synchronize() above (this function's one and only sync point until
-    // now) -- so RunChunk was returning with the device NOT idle whenever a drafter is attached.
-    // That breaks the invariant the top-of-function comment on attn_positions_/attn_seqused_k_
-    // documents as load-bearing: "the previous RunChunk call (if any) ended with stream_.Synchronize()
-    // ... so the device is guaranteed idle here" backs a plain (blocking, null-stream) hipMemcpy that
-    // races an in-flight non-blocking-stream kernel if that invariant is false. No corruption was
-    // observed because InjectFeatures happens not to touch those two buffers, but the invariant
-    // itself was silently false with --dflash. Re-synchronize here so RunChunk keeps its documented
-    // "device idle on return" contract for every caller, dflash or not.
-    stream_.Synchronize();
   }
   // The stream is idle here on every path: read the probe's stamps back (debug_probe.h).
   if (probe_ != nullptr) probe_->Collect(stream_.get());
@@ -1395,7 +1427,7 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
   // 256-row super-chunks first, then whatever is left (fewer than 256 rows) as ordinary 64-row chunks --
   // the same chunks the 64-row grid makes for that remainder, so a call split anywhere (a prefix-cache
   // restore, a warm-turn suffix) shifts nothing it did not shift before.
-  const int64_t rows = PrefillRowsForCall(static_cast<bool>(on_chunk_captured));
+  const int64_t rows = PrefillRowsForCall();
   struct WideGuard {
     int64_t& slot;
     ~WideGuard() { slot = 0; }
@@ -1414,14 +1446,26 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
     // comment in model.h): drain THIS chunk's captured rows before the next iteration's RunChunk
     // call overwrites dflash_features_dev_ starting at row 0 again. No-op cost when the caller
     // passed nullptr (the default) or no capture is attached.
-    if (on_chunk_captured) on_chunk_captured();
+    if (n > static_cast<size_t>(max_chunk_)) {
+      // A 256-row super-chunk: the callback is invoked once per 64-row slice, in order, as it would be
+      // for the four 64-row chunks -- with DflashFeatureBuffer() / DflashFeatureRows() showing that
+      // slice (rows 64 j .. 64 j + 63 of the capture, 64 of them, or 0 while no capture is active).
+      // After the loop the view stays on the last slice, which is what the last 64-row chunk leaves.
+      const bool captured = dflash_feature_rows_ > 0;
+      for (int64_t row0 = 0; row0 < static_cast<int64_t>(n); row0 += max_chunk_) {
+        SetDflashFeatureRows(captured ? max_chunk_ : 0, captured ? row0 : 0);
+        if (on_chunk_captured) on_chunk_captured();
+      }
+    } else if (on_chunk_captured) {
+      on_chunk_captured();
+    }
     if (is_last_chunk) logits = std::move(chunk_logits);
   }
   at_prefill_end_ = true;
   return logits;
 }
 
-int64_t Model::PrefillRowsForCall(bool has_chunk_callback) {
+int64_t Model::PrefillRowsForCall() {
   // A Model that loaded 64-row (the kill switch, or a container / configuration the wide path does not
   // serve) said so at load and has nothing to decide here.
   if (wide_rows_ != kPrefillChunkWide) return max_chunk_;
@@ -1429,12 +1473,8 @@ int64_t Model::PrefillRowsForCall(bool has_chunk_callback) {
   in.requested = prefill_chunk_request_;
   in.buffers_wide = true;
   in.tensor_parallel = comm_ != nullptr;
-  in.mtp = mtp_.has_value();
-  in.dflash = dflash_.has_value();
-  in.dflash_capture = !dflash_target_layers_.empty();
   in.mrope_active = mrope_active_;
   in.rotated_container = container_.HasRotation();
-  in.on_chunk_captured = has_chunk_callback;
   const char* why = nullptr;
   const int rows = DecidePrefillChunk(in, &why);
   if (rows == kPrefillChunkWide) return rows;
@@ -1813,7 +1853,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
   SpanAccumulator acc;
 
   // The same chunk grid as Prefill() (super-chunks first, then 64-row chunks).
-  const int64_t wide_rows = PrefillRowsForCall(/*has_chunk_callback=*/false);
+  const int64_t wide_rows = PrefillRowsForCall();
   for (size_t off = 0; off < token_ids.size();) {
     const size_t n = static_cast<size_t>(PrefillNextChunk(static_cast<long long>(token_ids.size() - off),
                                                            static_cast<int>(wide_rows)));
@@ -2123,7 +2163,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     RotateResidual(dflash_features_dev_.data(),
                    T * static_cast<int64_t>(dflash_target_layers_.size()), /*inverse=*/true);
   }
-  if (!dflash_target_layers_.empty()) dflash_feature_rows_ = T;
+  if (!dflash_target_layers_.empty()) SetDflashFeatureRows(T);
 
   // Per-position logits + greedy argmax, for every one of the T candidate positions (not just the
   // last -- this is what distinguishes a verify window from Prefill/DecodeStep's own tail-only

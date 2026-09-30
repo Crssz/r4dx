@@ -49,7 +49,10 @@ OJson Opt(const std::optional<T>& v) {
 OJson OptMs(const std::optional<double>& v) { return v ? OJson(Round(*v, 1000.0)) : OJson(nullptr); }
 
 std::FILE* OpenAppend(const std::string& path) {
-  const std::filesystem::path p = std::filesystem::u8path(path);
+  // The path arrives as argv does: narrow, in the process's own code page on Windows (which is what
+  // path(std::string) assumes there too), so a non-ASCII folder name survives where u8path would
+  // misread it.
+  const std::filesystem::path p(path);
 #ifdef _WIN32
   // "ab": binary, so a "\n" stays one byte (no CRLF translation), and append, so the file is created
   // when missing and never truncated. _SH_DENYNO (what fopen itself uses, unlike fopen_s's deny-write)
@@ -155,7 +158,7 @@ std::unique_ptr<RequestLog> RequestLog::Open(const std::string& path, std::strin
     errno = 0;
     f = OpenAppend(path);
     err = errno;
-  } catch (const std::exception& e) {  // u8path on a malformed path
+  } catch (const std::exception& e) {  // a path the filesystem layer refuses to convert
     if (error) *error = std::string("cannot open request log '") + path + "' for append: " + e.what();
     return nullptr;
   }

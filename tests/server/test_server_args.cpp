@@ -252,6 +252,40 @@ void TestPromptCheckpointFlag() {
   }
 }
 
+// --request-log (docs/server.md "Request log"): absent = "" (off, no file is ever named), present =
+// the path verbatim (spaces and all), and a missing or empty value is a usage error -- an empty path
+// must not silently mean "off".
+void TestRequestLogFlag() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.request_log.empty());
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--request-log",
+                                        "D:\\logs dir\\requests.jsonl", "--port", "18080"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.request_log == "D:\\logs dir\\requests.jsonl");
+    CHECK(a.port == 18080);  // the flag consumed exactly its one value
+  }
+  for (const std::vector<std::string>& tail : {std::vector<std::string>{"--request-log"},
+                                                std::vector<std::string>{"--request-log", ""}}) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    storage.insert(storage.end(), tail.begin(), tail.end());
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError&) {
+      threw = true;
+    }
+    CHECK(threw);
+  }
+  CHECK(r4dx::server::ServerUsageText("r4dx-server").find("--request-log <path>") != std::string::npos);
+}
+
 // --mtp upper bound (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own kMaxMtpDraftK
 // check -- Model::VerifyWindow requires mtp+1 candidates to fit in a <=64-row chunk, so 63 is the
 // real ceiling; previously only `>= 0` was checked here.
@@ -463,6 +497,7 @@ int main() {
   TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();
   TestPromptCheckpointFlag();
+  TestRequestLogFlag();
   TestMtpUpperBound();
   TestDflashFlags();
   TestVisionFlags();

@@ -15,6 +15,7 @@ set(R4DX_SERVER_TESTS
   test_tool_call_parser
   test_tool_stream_gate
   test_reasoning_splitter
+  test_request_log
 )
 
 foreach(t ${R4DX_SERVER_TESTS})

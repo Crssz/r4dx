@@ -51,6 +51,10 @@ struct ServerArgs {
   float default_min_p = 0.0f;
 
   std::string log_level = "info";  // one of debug|info|warn|error
+  // --request-log <path> (docs/server.md "Request log"): empty (default) = off, no file is touched.
+  // Otherwise the JSON Lines file every completed request is appended to. Only the path is parsed
+  // here (this header stays filesystem-free); main.cpp opens it and exits non-zero when it cannot.
+  std::string request_log;
 
   // MTP self-speculative decode (docs/mtp.md), same semantics/default as src/cli/cli_args.h's
   // --mtp: 0 (disabled) unless the loaded --model container was converted with --mtp on. Used by
@@ -147,7 +151,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
-         "[--image-max-pixels N] "
+         "[--image-max-pixels N] [--request-log <path>] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K]";
@@ -229,6 +233,11 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--default-top-k") a.default_top_k = ServerParseInt("--default-top-k", NextServerArg(argc, argv, i, "--default-top-k"));
     else if (arg == "--default-min-p") a.default_min_p = ServerParseFloat("--default-min-p", NextServerArg(argc, argv, i, "--default-min-p"));
     else if (arg == "--log-level") a.log_level = NextServerArg(argc, argv, i, "--log-level");
+    else if (arg == "--request-log") {
+      a.request_log = NextServerArg(argc, argv, i, "--request-log");
+      // Given but empty is a mistake, not "off": off is omitting the flag.
+      if (a.request_log.empty()) throw ServerUsageError("--request-log requires a non-empty path (omit the flag to keep the log off)");
+    }
     else if (arg == "--mtp") a.mtp = ServerParseI64("--mtp", NextServerArg(argc, argv, i, "--mtp"));
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextServerArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextServerArg(argc, argv, i, "--mtp-draft-head");

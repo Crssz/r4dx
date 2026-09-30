@@ -18,6 +18,7 @@ add_library(r4dx_server_core STATIC
   tool_call_parser.cpp
   tool_stream_gate.cpp
   reasoning_splitter.cpp
+  request_log.cpp
 )
 target_include_directories(r4dx_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # nlohmann/json.hpp is vendored under third_party/nlohmann/, so third_party/ itself is the include

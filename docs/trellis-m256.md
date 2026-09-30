@@ -116,9 +116,9 @@ a 0-6% loss on those classes (S1 numbers, not re-measured here).
 
 ### libr4d and build
 
-* `r4d_gemm_trellis_nt_m256` is in `R4D_UNITS` (`r4d_core`, 17 units), declared in `r4d.h` with its contract,
+* `r4d_gemm_trellis_nt_m256` is in `R4D_UNITS` (`r4d_core`, 17 units when this was written; the cut later left 13), declared in `r4d.h` with its contract,
   wrapped as `core::r4d::GemmTrellisNtM256`, in `r4d_registry.hip` (op `gemm_nt_m256`, never returned for a
-  `gemm_nt` request), in `r4d_module.hip` (pybind), `build_windows.ps1`, `build.sh` and the README table.
+  `gemm_nt` request), and (when this was written) in `r4d_module.hip` (pybind), `build_windows.ps1`, `build.sh` and the README table; those files are no longer vendored.
 * Host legality: `r4d_gemm_trellis_nt_m256_check(M, K, N, n_split, KB, SK, NP, SKG, U, skw)` returns nullptr or a
   message naming the first broken rule (M, K / N multiples, KB, SKG, NP, n_split, NP * U == M / 64, SK, the
   k-tile divisibility, slice length, skw, waves, LDS, and "not instantiated"); the launch throws with that

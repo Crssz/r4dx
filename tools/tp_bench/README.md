@@ -3,8 +3,8 @@
 `ar_bench.exe` decides whether tensor parallel TP=2 across the box's two R9700s (gfx1201, no peer
 access, isLargeBar 0) is worth building. The only fast all-reduce without P2P is a kernel-driven,
 zero-copy, one-shot PUSH through pinned host memory that both GPUs map. This tool measures that
-path hop by hop, and then inside an emulated decode step. It is a hardened fork of libr4d's
-`third_party/libr4d/r4d_ar_oneshot_2rank_exact.hip`. The top-of-file comment in `ar_bench.hip` has
+path hop by hop, and then inside an emulated decode step. It is a hardened fork of upstream libr4d's
+`r4d_ar_oneshot_2rank_exact.hip` (removed from the vendored tree: it needs peer access). The top-of-file comment in `ar_bench.hip` has
 the protocol, the memory-ordering argument for each variant and the safety properties.
 
 Targets from the TP=2 plan: 1.5x needs the in-engine latency `L(10 KiB) <= ~7-12 us`, DFlash2

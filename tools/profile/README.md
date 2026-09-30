@@ -45,7 +45,7 @@ python tools\profile\tune_gemm.py \
 
 **The pyd must be built at the r4dx build's w4a16 group.** `r4d_gemm_w4a16_nt_m64` is compiled at
 one group size; r4dx compiles the vendored kernel at group 64, but a libr4d clone's own
-`build_windows.ps1` passes no group flag, so a stock `build-win\r4d.pyd` is group 128. The tuner
+`build_windows.ps1` (upstream's, not vendored here) passes no group flag, so a stock `build-win\r4d.pyd` is group 128. The tuner
 prints the group the loaded pyd reports (`r4d.GEMM_W4_GROUP`), sizes the scale buffers from
 it, and refuses a w4a16 sweep unless the pyd's group equals `--w4a16-group` (default 64). The
 three-line recipe for a group-64 pyd (`CCC_OVERRIDE_OPTIONS='+-DR4D_GEMM_W4_GROUP=64'` around

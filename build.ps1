@@ -7,7 +7,7 @@
   Uses $env:R4DX_REFERENCE_VENV's CMake / Ninja when that variable names a venv that has them,
   otherwise the cmake/ninja on PATH (CMake 3.31 + Ninja from PATH configure and build the 'win-hip'
   preset too, verified 2026-09-22), against the ROCm SDK at C:\opt\rocm.
-  r4d_core's 16 libr4d translation units are compiled by hipcc.exe directly (see
+  r4d_core's 13 libr4d translation units are compiled by hipcc.exe directly (see
   third_party/CMakeLists.txt); everything else is plain clang-cl C++.
 
 .PARAMETER Preset

@@ -1283,7 +1283,7 @@ See [sampling.md](sampling.md) section 12 for the measured cost/acceptance table
 ## CLI flags
 
 ```
-r4dx-server --model <container.r4dx> --layout {mxfp4|w4a16|w4a8|bf16}
+r4dx-server --model <container.r4dx> --layout {trellis|w4a16|bf16}
     [--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N]
     [--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N]
     [--default-temperature F] [--default-top-p F] [--default-top-k N]

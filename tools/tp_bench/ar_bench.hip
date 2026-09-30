@@ -36,7 +36,7 @@
 //   * REDUCE: out = bf16_rne(f32(in) + f32(peer)). fp32 add is commutative, so both ranks produce
 //     bit-identical outputs.
 //
-//   Variant FLAG (libr4d's r4d_ar_oneshot_2rank_exact protocol, hardened):
+//   Variant FLAG (upstream libr4d's r4d_ar_oneshot_2rank_exact protocol, hardened; not vendored):
 //     push with plain 16-B stores; DRAIN; __syncthreads; tid0: system-scope RELEASE store
 //     peer.FLAGS[b] = s; tid0: spin until (int)(FLAGS[b] - s) >= 0 (--spin rlx, the default: system-
 //     scope RELAXED polls, then ONE system-scope acquire fence after success; --spin acq: an ACQUIRE

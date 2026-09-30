@@ -137,7 +137,7 @@ Only 8k is measured: 7.2–7.4 s of prefill (about 1120 tok/s). The larger lengt
 | KL, 3 kinds per length (prefix + 256 tail rows at ~57 ms per row) | ~1 min | ~2.5 min | ~6 min | ~16 min | ~26 min in one process; 1.45 GB of dumps |
 | TTFT, CLI, 1 run | ~16 s wall | ~55 s | ~2 min | ~5.2 min | ~8.5 min per run |
 
-- **TP=2:** short prompts run about 1.3× faster (about 1530 tok/s). Long-context scaling at TP=2 is not measured.
+- **TP=2:** short prompts run about 1.3× faster (about 1530 tok/s on the older w4a16 container). On the Huihui trellis container, cold TTFT at TP=2 is 3.9 s at 8k, 19.1 s at 32k and 49.0 s at 64k tokens, 1.33× to 1.44× faster than one card (docs/perf.md, 2026-09-30); 128k at TP=2 is not measured.
 - **Memory:** `--max-ctx` is sized automatically (for example 132096 at 128k), which adds about 4.3 GiB of KV and state to 17 GiB of weights and fits on one card.
 - **Keeping runs affordable:** for iteration, run 8k and 32k in full, and 64k and 128k with `-Limit 1` (7 items each).
 

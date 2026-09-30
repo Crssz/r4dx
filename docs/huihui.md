@@ -75,6 +75,11 @@ oracle has 0.81) accounts for the whole gap to base: without it the mean is 0.00
   no TDR.
 - Speed (TP=1, one run): plain 36.67 tok/s (base 36.65), prefill 1131 tok/s (base 1116), DFlash k=7 108.2 tok/s (base
   116.1: same 36.4 ms per round, lower acceptance because the drafter is base's). docs/perf.md has the table.
+- TP=2 speed, real two-GPU runs on this container (2026-09-30, main 0129b8c): plain 60.10 tok/s (1.70x the
+  same-session TP=1's 35.38), DFlash k=7 162.18 (1.58x), `--mtp 3` 116.46 (1.55x); cold prefill 3.87 s at 8k,
+  19.12 s at 32k, 48.97 s at 64k. Greedy text and token ids at 8k are byte-identical between the default
+  256-row chunk and `R4DX_PREFILL_CHUNK=0` for plain, MTP and DFlash. Table and method: docs/perf.md
+  "TP=2 on the Huihui trellis container".
 - Abliteration survives quantization: lock picking, hotwiring one's own car and a dark joke are answered; the base
   container refuses all three.
 

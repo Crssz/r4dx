@@ -41,8 +41,10 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Prefill, short prompts | about 1130 tok/s |
 | Cold prefill (time to first token) | 5.7 s at 8k, 26.7 s at 32k tokens (256-row chunks, HIP device 1; 7.7 s and 35.2 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
-With `--tp 2` on an earlier container, plain decode reached about 1.65x the single-GPU speed.
-Methodology and more numbers: [docs/perf.md](docs/perf.md), [docs/huihui.md](docs/huihui.md),
+With `--tp 2` on two R9700s (same container, measured 2026-09-30 against a single-card baseline from the
+same session), plain decode reaches 60.1 tok/s (1.70x one card), DFlash2 `k=7` 162 tok/s (1.58x) and
+`--mtp 3` 116 tok/s (1.55x); cold prefill takes 3.9 s at 8k, 19.1 s at 32k and 49.0 s at 64k tokens
+(1.33x to 1.44x faster than one card; 256-row chunks). Methodology and more numbers: [docs/perf.md](docs/perf.md), [docs/huihui.md](docs/huihui.md),
 [docs/prefill.md](docs/prefill.md).
 
 ## Requirements

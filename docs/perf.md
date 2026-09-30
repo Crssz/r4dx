@@ -26,8 +26,109 @@ containers interleaved run by run on one binary (main 1099446), the protocol of 
   GiB with DFlash2 on both). The DFlash gap is acceptance, not speed: the per-round time is the same
   36.4 ms, but the drafter was trained on the base model's features, so it accepts fewer tokens on the
   abliterated one (prompt by prompt 31.0 / 66.4 / 20.8 / 56.1% against 31.5 / 70.7 / 25.7 / 59.4%).
-- The TP=2 numbers of the next section are the base container's; the Huihui container's TP=2 checks
-  (real smoke with vision and DFlash: 207 PASS / 0 FAIL, no TDR) are in `docs/huihui.md`.
+- The Huihui container's TP=2 speed is the next section; the TP=2 tables after it (2026-09-28) are the
+  base container's. The Huihui TP=2 correctness checks (real smoke with vision and DFlash: 207 PASS / 0
+  FAIL, no TDR) are in `docs/huihui.md`.
+
+## TP=2 on the Huihui trellis container (2026-09-30)
+
+The first real two-GPU speed measurement of the default container, taken in one session against a
+TP=1 baseline on the same binary: main `0129b8c` (256-row prefill chunk default-on), built fresh in a
+worktree (`tp2-bench`, docs only), AMD driver 32.0.32015.2008, two R9700, Windows 11, production server
+stopped and no other r4dx process running. TP=2 is `--tp 2 --tp-mode real` with `HIP_VISIBLE_DEVICES`
+unset (rank 0 on HIP device 1, rank 1 on device 0, the desktop live on device 0); TP=1 is
+`HIP_VISIBLE_DEVICES=1`.
+
+**How measured.**
+
+- **Decode:** the standard protocol of the sections below: the four `tests/model/mtp_prompts.txt`
+  prompts, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048 --stats`, DFlash2 =
+  `qwen38-27b-dflash2-w4a16-g64.r4dx` at k = 7, one fresh process per run, 3 runs, a TP=1 block and a
+  TP=2 block alternating round by round. Each number is the median of the three per-run token-weighted
+  aggregates (total tokens / total decode seconds over the four prompts), the aggregate
+  `bench_decode.ps1` prints. The runs went through a purpose-made serial driver instead of
+  `bench_decode.ps1`, because the TP=2 safety limits needed their own loop: a 60 s pause after every 3
+  TP=2 runs, `tools\tp\tdr_check.ps1` after every TP=2 run and again after each pause, stop at the first
+  TDR, hang or non-zero exit. Driver, logs and `results.jsonl` (97 runs): `D:\models\r4dx\tp2bench\`.
+- **Cold TTFT:** the frozen `ttft_8k/32k/64k.txt` prompts of `tools/prefill/ttft_cli.ps1` (8145, 32623
+  and 65529 prompt tokens), `--max-tokens 8 --stats`, one fresh process per run, one discarded warm-up
+  per configuration (TP=1 8k: 5.469 s; TP=2 8k: 3.865 s with the chunk, 5.246 s without). TP=2
+  default-chunk and `R4DX_PREFILL_CHUNK=0` runs were interleaved (two pairs at 8k, one pair at 32k);
+  64k is one run of each, in separate phases several minutes apart. The 64k prompt (65529 tokens) is the longest
+  prompt run at TP=2.
+- All 97 runs exited 0, and no TDR was logged after any TP=2 run, pause or phase.
+
+Decode, tok/s, median of the three runs (the runs in brackets):
+
+| mode | TP=1 (device 1) | **TP=2** | TP=2 / TP=1 |
+|---|--:|--:|--:|
+| plain | 35.38 (35.38 / 35.36 / 35.42) | **60.10** (60.21 / 59.96 / 60.10) | **1.70x** |
+| `--dflash k=7` | 102.51 (102.51 / 101.91 / 102.63) | **162.18** (161.42 / 162.18 / 162.75) | **1.58x** |
+| `--mtp 3` | 75.00 (75.00 / 74.94 / 75.02) | **116.46** (116.48 / 116.46 / 116.36) | **1.55x** |
+
+The haiku prompt alone (the single-prompt standard protocol; TP=1 generates 91 tokens, TP=2 stops at 84,
+see the text note), tok/s, the three runs:
+
+| mode | TP=1 | TP=2 | TP=2 / TP=1 (medians) |
+|---|--:|--:|--:|
+| plain | 35.25 / 35.31 / 35.41 | 60.30 / 59.66 / 59.65 | 1.69x |
+| `--dflash k=7` | 82.07 / 81.52 / 82.06 | 116.18 / 114.79 / 115.41 | 1.41x |
+| `--mtp 3` | 67.53 / 67.61 / 67.63 | 95.70 / 94.89 / 95.34 | 1.41x |
+
+Per prompt, mean tok/s over the three runs (haiku / Fibonacci / Romeo and Juliet / primes; tokens
+generated TP=1 91 / 95 / 80 / 256, TP=2 84 / 112 / 102 / 256) and, for speculation, the tokens per round:
+
+| mode | TP=1 | TP=2 |
+|---|---|---|
+| plain | 35.3 / 35.3 / 35.4 / 35.4 | 59.9 / 60.0 / 59.9 / 60.2 |
+| `--dflash k=7` | 81.9 / 141.9 / 63.8 / 123.9 | 115.5 / 242.6 / 110.5 / 196.2 |
+| `--dflash` tok/round | 3.14 / 5.59 / 2.42 / 4.83 (3.95 over all four) | 2.80 / 6.22 / 2.68 / 4.92 (4.01 over all four) |
+| `--mtp 3` | 67.6 / 81.5 / 58.1 / 83.4 | 95.3 / 128.8 / 91.5 / 135.3 |
+| `--mtp 3` tok/round | 2.53 / 3.06 / 2.16 / 3.12 (2.80 over all four) | 2.21 / 3.03 / 2.12 / 3.16 (2.71 over all four) |
+
+Cold time to first token (prefill of the whole prompt, seconds; median, the runs in brackets):
+
+| prompt | TP=1, 256-row chunk | **TP=2, 256-row chunk** | TP=2, `R4DX_PREFILL_CHUNK=0` | TP=2 / TP=1 | chunk gain at TP=2 |
+|---|--:|--:|--:|--:|--:|
+| 8k (8145 tok) | 5.585 (5.480 / 5.585 / 5.587) | **3.874** (3.875 / 3.873) | 5.255 (5.243 / 5.267) | 1.44x | 1.36x |
+| 32k (32623 tok) | 26.571 (26.069 / 26.578 / 26.571) | **19.124** | 25.139 | 1.39x | 1.31x |
+| 64k (65529 tok) | 64.932 (64.934 / 64.930) | **48.974** | 60.293 | 1.33x | 1.23x |
+
+That is 2102 / 1706 / 1338 prompt tok/s at TP=2 against 1459 / 1228 / 1009 at TP=1.
+
+- **Speed-ups:** decode 1.70x plain, 1.58x DFlash, 1.55x MTP over one card; cold prefill 1.33x to 1.44x.
+  Speculation gains less than plain decode; for DFlash the drafter is replicated on both ranks
+  (docs/tp.md 4.5) and does not halve, the same reading as the base-container table below (the MTP
+  shortfall was not separated out). The 256-row chunk helps TP=2 about as much as it helps TP=1 (TP=1:
+  1.35x at 8k and 1.32x at 32k, from the 5.7 / 7.7 s and 26.7 / 35.2 s of the README), and its gain
+  shrinks with context, as at TP=1.
+- **Drift against the 2026-09-29 TP=1 record:** in this session TP=1 ran 3.5% (plain, 35.38 against
+  36.67) and 5.3% (DFlash, 102.51 against 108.21) below that record. The cause was not investigated; the
+  host CPU showed 20 to 33% load from outside r4dx during parts of the session (the driver waited for it
+  to drop under 20% before each run, cap 5 min), and `bench_decode.ps1` documents that host load moves
+  decode speed. TP=1 and TP=2 were measured in this session, alternating, so the ratios compare like
+  with like; the absolute TP=1 numbers belong to this session, the 36.7 / 108 of the README to the
+  earlier one.
+- **Text:** within each of TP=1 and TP=2, plain, `--dflash k=7` and `--mtp 3` produced byte-identical
+  greedy text on all four prompts, and every mode reproduced its text across the three runs. TP=2 text
+  differs from TP=1 text on all four prompts (the all-reduce changes the summation order; the TP=2
+  answers read fluently, e.g. the haiku "Silicon hearts beat, / Parallel streams of light flow, /
+  Rendering worlds."). Acceptance therefore differs a little: DFlash 4.01 against 3.95 tokens per round
+  over the four prompts, MTP 2.71 against 2.80.
+- **VRAM:** plain 17.05 GiB on one card at TP=1 and 10.01 GiB on each card at TP=2; MTP 17.48 against
+  10.24; DFlash at TP=2 11.56 GiB per card (`--max-ctx 2048`, device-wide `hipMemGetInfo`).
+- **Identity on two real GPUs, default chunk against `R4DX_PREFILL_CHUNK=0`:** an 8k-token prompt (the
+  `ttft_8k` document with its closing instruction changed to ask for the number and a 150-word essay,
+  8161 prompt tokens), greedy, `--think off --max-tokens 160`, `--dump-token-ids`, `--tp 2`. Plain,
+  `--mtp 3` and `--dflash k=7` each ran with the default 256-row chunk and with the kill switch, six runs,
+  all exit 0, no TDR. Stdout is byte-identical in all six (SHA-256 prefix `620CAEE92B666EC3`), and
+  for each mode the token-id dump is byte-identical between the two chunk settings (plain
+  `4E26B00FA9197BB7`, `--mtp 3` and `--dflash` both `85B60C9CE221672F`). The plain dump holds one more
+  trailing id (8321 against 8320; the first 8320 are equal), the same way at both chunk settings: the
+  dump lists the tokens fed to the model, so this is a stop-boundary difference between the plain and
+  speculative loops, not a divergence (not investigated further).
+- **Not run:** decode speed at long context; TP=2 at 128k (excluded for safety, `docs/tp.md`); MTP at
+  k > 3; any run with the vision tower.
 
 ## Trellis at TP=2 (2026-09-28)
 

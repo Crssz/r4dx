@@ -1004,7 +1004,8 @@ own best DFlash `K` vs. its own best MTP `K`, standard + code prompt, twice each
 Headline: DFlash2 beats MTP on **all three layouts on the code prompt** (w4a16 +30.7%, w4a8 +24.6%,
 mxfp4 +24.9%) and on **w4a16/w4a8 on the standard prompt** (+12.2%/+12.3%); MTP still leads on
 **mxfp4/standard** (DFlash2 -9.8%) -- the one cell carried into Milestone 6 as an open, not
-root-caused, gap. The `p_min` sweep and the w4a8/mxfp4 DRAFT containers remain unmeasured.
+root-caused, gap. The `p_min` sweep and the w4a8/mxfp4 DRAFT containers remain unmeasured (the `p_min` / `k`
+sweep was later measured, greedy and thinking on, on the Huihui trellis container: section 10b).
 
 ## 8. `--real` mode input schema
 
@@ -1172,6 +1173,157 @@ divergence, on hardware, by recovering both logits rows -- see [sampling.md](sam
 > prompt at TP=1 and on all four `tests/model/mtp_prompts.txt` prompts at TP=2 (HEAD differed on
 > three). The class survives only where a window straddles a change of the attention split's segment
 > width (context 512, 1024, ... at `--max-ctx` >= 1024).
+
+## 10b. DFlash k / p_min sweep, thinking on (2026-09-30)
+
+**Result: the current default (`--dflash-k 7`, `--dflash-p-min 0`, `--dflash-n-min 0`) is the best or tied-best
+setting for coding-agent turns with thinking on. Nothing in the grid beats it.** Every smaller `k` and every
+`p_min >= 0.5` is slower; `p_min` 0.2 and 0.3 are within measurement noise of the default; `p_min` 0.05 and 0.1
+never fire. No flag change is recommended and nothing in the code was changed.
+
+**Setup.** `r4dx-cli` built from main `1c75fcf` (fresh build dir, worktree `r4dx-sweep`, branch `dflash-sweep`), the
+Huihui trellis mix4.5m container plus the `qwen38-27b-dflash2-w4a16-g64.r4dx` drafter, `--layout trellis --vision off
+--think on --temperature 0 --max-ctx 2048 --stats`, TP=1 on HIP device 1 only (`HIP_VISIBLE_DEVICES=1`), one fresh
+`r4dx-cli` process per run, one run at a time, nothing else of ours on either GPU (the runner polled for other
+`r4dx-cli`/`r4dx-server`/`ctest`/`test_*`/`tool_*` processes before and during every run; none appeared, 0 of 768 rows
+contaminated). Prompts are the 39 agent-shaped prompts of the Track B acceptance study (12 short corpus_v2 chat/code
+prompts plus 27 written coding-agent prompts, 39-557 prompt tokens; `D:\models\r4dx\linear\B\agent_prompts.txt`,
+copied unchanged). `--max-tokens 512`, so each run is the first 512 tokens of a thinking trace (38 of 39 prompts hit the
+cap). Order: seeded shuffle by run index (never by clock), one default-config canary (k7 p0, prompt 18) every 24 runs of
+the coarse stage. Tables are pooled as sum(tokens) / sum(decode seconds) over all runs of a config ("token-weighted
+tok/s"); "tok/rnd" is tokens per round (accepted + 1); "acc" is accepted / drafted (it rises with `p_min` only because
+the denominator shrinks); "round ms" is decode time / rounds. The "vs default" column is the ratio of pooled tok/s to the
+default with a 95% bootstrap CI over prompts (4000 resamples, paired). Greedy acceptance is deterministic: rounds and
+tokens were identical across all 3 repetitions of every (config, prompt), and k7 p0 reproduces Track B's think-on record
+exactly (3.810 tok/round pooled, e.g. prompt 17 = 94 rounds), so the only run-to-run noise is timing: 0.5-0.6% mean, 1.1-1.9%
+worst prompt between repetitions, no drift (the canary stayed 106.5-107.8 tok/s for the whole coarse stage; the default
+config's tok/s by thirds of the final stage was 1.0013 / 0.9993 / 0.9994 of its own per-prompt mean).
+
+What `p_min` and `k` do here (source: section 4.3): `k` caps the selector walk at `k` tokens (1..7; 8 is refused, the
+block is 8 wide); `p_min` stops the walk early at the first position whose arg-max softmax probability (over that
+position's 16 candidates) is below `p_min`; `n_min` throws a whole walk away when fewer than `n_min` tokens survived. There is
+no other accepted-length knob in `--help` or in this document.
+
+### Stage 1, coarse: 12 prompts, 1 run per config (225 runs, 58 min)
+
+Prompts 1, 4, 9, 12, 15, 17, 18, 25, 26, 30, 32, 38 (3 corpus + 9 agent, per-prompt tok/round from 2.6 to 5.5). Plain
+decode on the same 12 prompts in the same session: **35.3 tok/s**.
+
+| config (k, p_min, n_min) | tok/s | per-prompt median | tok/rnd | acc | drafted/rnd | round ms | vs plain | vs default [95% CI] |
+|---|---|---|---|---|---|---|---|---|
+| 7, 0.3, 0 | 86.6 | 83.1 | 3.330 | 45.6% | 5.13 | 38.44 | 2.45x | 1.002 [0.988, 1.016] |
+| 7, 0.2, 0 | 86.6 | 83.0 | 3.427 | 36.5% | 6.67 | 39.56 | 2.45x | 1.002 [0.997, 1.006] |
+| 7, 0.1, 0 | 86.5 | 82.8 | 3.442 | 35.0% | 7.00 | 39.81 | 2.45x | 1.000 [0.999, 1.001] |
+| 7, 0.05, 0 | 86.5 | 82.9 | 3.442 | 35.0% | 7.00 | 39.81 | 2.45x | 1.000 [0.999, 1.001] |
+| **7, 0, 0 (default)** | **86.5** | 82.9 | 3.442 | 35.0% | 7.00 | 39.81 | 2.45x | 1 |
+| 7, 0.2, 2 | 86.0 | 82.6 | 3.402 | 36.2% | 6.66 | 39.54 | 2.43x | 0.995 [0.990, 1.000] |
+| 6, 0, 0 | 85.7 | 82.1 | 3.336 | 39.0% | 6.00 | 38.94 | 2.42x | 0.991 [0.975, 1.004] |
+| 6, 0.1, 0 | 85.6 | 82.2 | 3.336 | 39.0% | 6.00 | 38.97 | 2.42x | 0.990 [0.974, 1.003] |
+| 6, 0.3, 0 | 85.6 | 81.8 | 3.242 | 49.2% | 4.57 | 37.89 | 2.42x | 0.990 [0.969, 1.009] |
+| 5, 0, 0 | 85.4 | 84.3 | 3.244 | 44.9% | 5.00 | 38.01 | 2.42x | 0.987 [0.957, 1.013] |
+| 5, 0.1, 0 | 85.3 | 84.2 | 3.244 | 44.9% | 5.00 | 38.03 | 2.41x | 0.987 [0.957, 1.012] |
+| 5, 0.3, 0 | 84.3 | 83.5 | 3.151 | 54.2% | 3.97 | 37.37 | 2.39x | 0.975 [0.944, 1.004] |
+| 4, 0, 0 | 82.6 | 81.7 | 3.092 | 52.3% | 4.00 | 37.42 | 2.34x | 0.956 [0.903, 0.998] |
+| 7, 0.5, 0 | 77.2 | 78.5 | 2.824 | 71.8% | 2.55 | 36.57 | 2.18x | 0.893 [0.871, 0.920] |
+| 3, 0, 0 | 77.1 | 77.9 | 2.833 | 61.1% | 3.00 | 36.73 | 2.18x | 0.892 [0.835, 0.940] |
+| 7, 0.5, 2 | 69.6 | 71.6 | 2.526 | 65.0% | 2.36 | 36.29 | 1.97x | 0.805 [0.781, 0.835] |
+| 7, 0.7, 0 | 65.0 | 67.9 | 2.327 | 88.8% | 1.50 | 35.80 | 1.84x | 0.752 [0.724, 0.786] |
+| plain | 35.3 | 35.3 | | | | | 1x | |
+
+The mechanism is in the round-time column: a round costs 36.7 ms at k=3 and 39.8 ms at k=7, i.e. about 0.8 ms per
+extra draft row, while each extra row adds 0.1-0.3 tokens per round, so the widest window always wins on tok/s. `p_min`
+cannot buy that time back: stopping the walk early saves under 1 ms per round but costs far more tokens than it saves
+(0.5 drops 18% of tokens per round for 8% of the round time). With thinking on, the arg-max probability is high
+enough at almost every position that `p_min` <= 0.1 never triggers (the 0.05 and 0.1 rows are identical to the
+default, round for round), and 0.2 shortens the walk by only 4% (6.67 of 7 tokens drafted per round). `n_min` 2 only throws away drafts that are already
+short, and is slightly negative.
+
+Per-prompt view (percent vs the default on the same prompt, tok/s): the smaller windows help only the lowest-acceptance
+prompts and then by little (k=5: +4.1% on stack-java at 2.63 tok/round, +6.3% on commit-message, +2.3% on tool-call JSON), and hurt the
+high-acceptance ones a lot (k=5: -11% on refactor-js at 5.45 tok/round, -6.6% on fix-test-rust; k=3: -30% and -28%).
+`p_min` 0.3 is the same trade in a milder form (+4.3% on corpus chat/015, -3.8% on stack-java, -2.4% on concurrency-bug).
+No single prompt favours anything by more than 8%, and on no prompt class does a smaller window win consistently.
+
+### Stage 2, final: default plus the top 3 configs, all 39 prompts, 3 runs each (507 runs, 2 h 7 min)
+
+The three challengers are the top of stage 1 that differ from the default (`p_min` 0.05 and 0.1 are the default in
+disguise, and 7/0.2/n2 is dominated by its own n_min-free twin, so it was replaced by a different window size): 7/0.3,
+7/0.2, and 6/0.3. Plain decode on all 39 prompts, one run each, same session: **35.3 tok/s** (35.11-35.62 over the stage).
+
+| config (k, p_min) | runs | tok/s (token-weighted) | per-prompt median (of 3) | tok/rnd | acc | drafted/rnd | round ms | vs plain | vs default [95% CI] |
+|---|---|---|---|---|---|---|---|---|---|
+| **7, 0 (default)** | 117 | **95.7** | 98.7 | 3.810 | 40.2% | 7.00 | 39.82 | 2.71x | 1 |
+| 7, 0.2 | 117 | 95.7 | 98.2 | 3.789 | 41.7% | 6.71 | 39.61 | 2.71x | 1.000 [0.996, 1.003] |
+| 7, 0.3 | 117 | 95.2 | 98.8 | 3.677 | 50.2% | 5.35 | 38.61 | 2.70x | 0.996 [0.988, 1.003] |
+| 6, 0.3 | 117 | 93.0 | 95.3 | 3.537 | 53.9% | 4.72 | 38.04 | 2.63x | 0.972 [0.960, 0.984] |
+| plain | 39 | 35.3 | 35.3 | | | | 28.3 per token | 1x | |
+
+Paired per prompt (median of 3 against the default): 7/0.2 is within +-1% on 33 of 39 prompts (mean ratio 0.9999); 7/0.3 is better
+by more than 1% on 8, worse by more than 1% on 14 (worst 0.935 on toolcall-json-2, best 1.042 on corpus chat/015); 6/0.3 is
+worse by more than 1% on 24 (worst 0.864 on fix-test-pytest).
+
+Token-weighted tok/s by prompt class (same runs; classes by the default's tok/round on that prompt):
+
+| prompt class | n | plain | default 7/0 | 7/0.2 | 7/0.3 | 6/0.3 |
+|---|---|---|---|---|---|---|
+| all | 39 | 35.3 | 95.7 | 95.7 | 95.2 | 93.0 |
+| agent-shaped (p12-38) | 27 | 35.3 | 101.4 | 101.4 | 100.6 | 97.5 |
+| corpus chat/code (p0-11) | 12 | 35.4 | 84.7 | 84.7 | 84.9 | 84.2 |
+| tool-call JSON (p30, p31) | 2 | 35.3 | 88.6 | 89.1 | 86.3 | 86.6 |
+| low acceptance (< 3.4 tok/round) | 11 | 35.3 | 75.6 | 75.8 | 75.9 | 75.5 |
+| mid (3.4-4.5) | 18 | 35.3 | 99.3 | 99.2 | 98.6 | 96.0 |
+| high (>= 4.5) | 10 | 35.3 | 123.5 | 123.3 | 122.1 | 116.3 |
+
+Only on the low-acceptance class (+0.4%) and the corpus prompts (+0.2%) do the `p_min` configs edge the default, both inside the noise above. The
+default's per-prompt range is 65.9 tok/s (stack-java) to 135.0 (refactor-js).
+
+### Is DFlash ever slower than plain with thinking on?
+
+**No, not in anything measured.** The lowest default-over-plain ratio over the 39 prompts is **1.86x** (stack-java, 2.63
+tok/round, 65.9 vs 35.3 tok/s); 0 of 39 prompts were below 1.0. Two extra probes (one run each, plain / 7/0 / 7/0.3, same session,
+logs under `D:\models\r4dx\dflash-sweep\probe`):
+
+- Very short completions, thinking on (256-token cap, `max-ctx` 2048): "Reply with the single word OK." (29 tokens, EOS) **5.13x**, "What is
+  17 times 23?" (46 tokens) **4.68x**, a French translation (56 tokens) **2.30x**, a JSON edit (71 tokens) **4.24x**. Thinking closed and the
+  completion ended (EOS) inside 29-71 tokens on all four; with only 4-18 rounds each the ratios are noisy but nowhere near 1.
+  The per-process fixed cost is outside `decode`, so this says nothing about time-to-first-token.
+- Long completions, 1536-token cap, `max-ctx` 4096, 8 prompts: default 87.6 tok/s pooled vs 35.3 plain (2.48x), ratios 1.91x (stack-java,
+  the lowest acceptance of the set) to 3.22x; 7/0.3 was 87.1. On 6 of the 8 the thinking was still open at 1536 tokens (the
+  `</think>` was only seen on corpus chat/021 at 434 tokens and on toolcall-json-1 at 838 tokens), so the answer and tool-call
+  phases are barely covered; on the two that reached them, tok/round was 4.47 (chat/021, answer after thinking, 3.22x) and 3.33
+  (toolcall-json-1, 2.32x), in line with the thinking phase. The one large paired gap was toolcall-json-2, where 7/0.3
+  fell to 81.4 from 93.4 tok/s (tok/round 3.86 -> 3.28), a single prompt, one run, not explained further.
+  Acceptance also falls later in a trace (refactor-js: 5.45 tok/round over the first 512 tokens, 4.12 over 1536 with the default),
+  so 512-token figures are somewhat optimistic for long thinking traces; the ranking of the configs did not change.
+
+### Recommended launch line for the OpenCode server
+
+Flags only, unchanged from the current default:
+
+    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
+
+(`--dflash-p-min` and `--dflash-n-min` left at 0; `--dflash-p-min 0.2` is equivalent within noise and is not worth a change.)
+**Expected gain over the current default: none (+0.0%, 95% CI about -0.4% to +0.3% for the best alternative, 7/0.2).** The
+tuning space of these two flags is exhausted for this workload: a DFlash decode on the Huihui container is 95.7 tok/s token-weighted (101.4
+on the 27 agent-shaped prompts) against 35.3 plain, 2.71x (2.87x agent-shaped), and further gains have to come from
+acceptance (tok/round) or the per-round cost, not from `k` or `p_min`.
+
+### Method limits and what was not covered
+
+- **Greedy only** (`--temperature 0`), as specified. OpenCode normally samples; under sampling acceptance drops (section 10a),
+  which tilts toward smaller windows, but the round-time column says that has to be a large drop to matter. Not measured.
+- **Short context.** Prompts are 39-557 tokens and completions 512 tokens (1536 in the probe); a real OpenCode session has a system
+  prompt, tool schemas and tens of thousands of context tokens, where the drafter's 2048-token sliding window and the target's
+  attention cost per round both change. Whether the round-time slope per draft row (0.8 ms here) stays flat at long
+  context is unmeasured; if it grows, a smaller `k` could become competitive there.
+- **Thinking phase only.** At 512 tokens the runs are almost all reasoning text; the answer/tool-call phase was sampled on two prompts.
+- **What was dropped.** `k` = 8 (not allowed, the block is 8 wide); every `p_min` x `k` corner with `k` <= 4 and `p_min` > 0, `p_min` 0.4 / 0.6 (between
+  0.3, which is a wash, and 0.5, which is a clear loss), `n_min` other than 0 and 2 and any `n_min` with `k` < 7, more than 1 repetition in the coarse stage,
+  and a coarse-grid run on all 39 prompts. 18 configs x 12 prompts were run coarse; 4 configs x 39 x 3 final (plain 39 x 1).
+- Prompts are synthetic; there are 39, not the 36 of the task text (the Track B set was not trimmed).
+- Total GPU time about 3 h 20 min (coarse 58 min, final 2 h 7 min, probes 15 min, smoke runs under 2 min).
+- Files: `D:\models\r4dx\dflash-sweep\` (`run_sweep.ps1`, `make_schedule.py`, `analyze_sweep.py`, `extra_final.py`,
+  `schedule_*.jsonl`, `results_{coarse,final}.jsonl`, `logs\`, `coarse_table.txt`, `final_table.txt`, `final_extra.txt`, `probe\`).
 
 ## 11. Files
 

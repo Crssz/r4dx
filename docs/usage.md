@@ -354,8 +354,9 @@ vs. best `--mtp K`, twice each): on a ~270-token code prompt, DFlash2 **beats MT
 **116.90/116.84 tok/s** (77.4% acceptance) vs MTP's 89.45/89.44 (+30.7%). On the standard haiku
 prompt DFlash2 still beats MTP on w4a16 (77.08/77.05 vs 68.72/68.62, +12.2%) -- prompt-dependent, not
 a fixed ranking. Best single cell (w4a16/code) is within 3% of the 120 tok/s / 84% acceptance the
-reference ROCmFPX implementation reaches on this same card/draft. The `p_min` sweep is still open
-(docs/dflash2.md section 7a, docs/perf.md's top section).
+reference ROCmFPX implementation reaches on this same card/draft. The `p_min` / `k` sweep was later measured on the Huihui trellis
+container with thinking on: `k=7`, `p_min=0` (the defaults) is best or tied-best
+(docs/dflash2.md section 10b).
 
 **Sampled (`--temperature > 0`) traffic, Milestone 6 stage S3.** The numbers above were all greedy
 (`--temperature 0`) -- the setting real chat clients almost never use. As of this stage, `--mtp`/

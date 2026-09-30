@@ -138,7 +138,8 @@ TurnResult RunTurn(r4dx::model::TextModel& model, const r4dx::Tokenizer& tok,
     const auto t1 = Clock::now();
     const int64_t num_chunks = (static_cast<int64_t>(new_tokens.size()) + 63) / 64;  // max_chunk_=64
     std::fprintf(stderr,
-                 "[profile-prefill] %zu prompt tokens, %lld chunks (T<=64 each), layout=%s:\n",
+                 "[profile-prefill] %zu prompt tokens, %lld 64-row chunk equivalents (the prompt runs in 256-row "
+                 "chunks unless R4DX_PREFILL_CHUNK=0), layout=%s:\n",
                  new_tokens.size(), static_cast<long long>(num_chunks), args.layout.c_str());
     PrintProfileTable(prof, static_cast<double>(num_chunks), "ms/chunk");
     std::fprintf(stderr, "  %-55s %10.4f\n", "wall (host, whole prefill)", prof.wall_ms);

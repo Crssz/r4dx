@@ -50,7 +50,7 @@ int main() {
   CHECK(ParsePrefillChunk("abc") == 64, "abc -> 64");
 
   // ---- decision ----
-  PrefillChunkInputs ok;  // a plain TP=1 text-only Model whose buffers are wide
+  PrefillChunkInputs ok;  // an ordinary (not quant2) container, the default request
   const char* why = "unset";
   CHECK(DecidePrefillChunk(ok, &why) == 256 && why == nullptr, "default request, plain Model -> 256");
 
@@ -59,7 +59,6 @@ int main() {
   CHECK(DecidePrefillChunk(off, &why) == 64 && why == nullptr, "kill switch -> 64, no reason (a choice)");
   PrefillChunkInputs off_tp = off;
   off_tp.rotated_container = true;
-  off_tp.mrope_active = true;
   CHECK(DecidePrefillChunk(off_tp, &why) == 64 && why == nullptr,
         "kill switch wins over every other input, silently");
 
@@ -69,9 +68,7 @@ int main() {
     const char* reason_part;
   };
   const Case cases[] = {
-      {"image spliced", [](PrefillChunkInputs& i) { i.mrope_active = true; }, "image"},
       {"quant2 container", [](PrefillChunkInputs& i) { i.rotated_container = true; }, "quant2"},
-      {"buffers not wide", [](PrefillChunkInputs& i) { i.buffers_wide = false; }, "64 rows at load"},
   };
   for (const Case& c : cases) {
     PrefillChunkInputs in = ok;
@@ -83,17 +80,10 @@ int main() {
           c.name, why ? why : "(none)", c.reason_part);
     CHECK(DecidePrefillChunk(in) == 64, "%s: also without a reason out-parameter", c.name);
   }
-  // several at once (an image in a quant2 conversation): still 64, with a reason
-  {
-    PrefillChunkInputs in = ok;
-    in.rotated_container = true;
-    in.mrope_active = true;
-    why = nullptr;
-    CHECK(DecidePrefillChunk(in, &why) == 64 && why != nullptr, "quant2 + image -> 64 with a reason");
-  }
   // What is served: tensor parallelism (each 256-row all-reduce is four 64-row ones), MTP, DFlash, a
-  // feature capture and a per-chunk callback are not inputs of the decision (docs/prefill.md); the Model
-  // serves them per 64-row slice, and test_prefill_chunk_identity proves the bytes.
+  // feature capture, a per-chunk callback and image prompts are not inputs of the decision
+  // (docs/prefill.md); the Model serves them per 64-row slice or position-wise, and
+  // test_prefill_chunk_identity proves the bytes.
 
   // ---- the chunk grid of one Prefill call: anchored at the call start ----
   // (the lengths of the docs/prefill.md tail tests: 1, 63, 64, 65, 255, 256, 257, 511, 8145)

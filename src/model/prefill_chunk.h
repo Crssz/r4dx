@@ -38,15 +38,13 @@ inline int PrefillChunkRequest() {
   return v;
 }
 
-// What decides it, for one Model (at load, then at every Prefill call).
+// What decides it, for one Model, once at load (the buffers are sized by it).
 struct PrefillChunkInputs {
   int requested = kPrefillChunkWide;  // ModelOptions::prefill_chunk, else PrefillChunkRequest()
-  bool buffers_wide = true;           // Load() sized the activation buffers and arena for 256 rows
-  bool mrope_active = false;          // an image has been spliced into this conversation (3-axis rope rows)
   bool rotated_container = false;     // a quant2 container (residual rotation / Hadamard signs)
 };
 
-// kPrefillChunkWide when this Model / call may run 256-row super-chunks, else kPrefillChunkBase. `*why` (if
+// kPrefillChunkWide when this Model may run 256-row super-chunks, else kPrefillChunkBase. `*why` (if
 // non-null) names the reason a 256 request could not be honoured (a string literal); nullptr when 256 is
 // used, and when 64 is what was asked for (the kill switch is a choice, not a fallback). Never throws.
 //
@@ -54,23 +52,14 @@ struct PrefillChunkInputs {
 // four 64-row ones over the same bytes), including the prompt-checkpoint and prefix-reuse suffix prefills
 // (the chunk grid is anchored at the call start), --mtp (the MTP head primes its KV per 64-row slice of a
 // super-chunk), --dflash and a target feature capture (the capture, the drafter injection and the
-// per-chunk callback run per 64-row slice). It falls back, with a one-line reason, for a quant2 (rotated)
-// container and for a conversation that has had an image spliced in (its rope rows are 3-axis;
-// PrefillMultimodal with images is 64-row anyway).
-struct PrefillChunkReasons {
-  static constexpr const char* kMrope = "an image was spliced into this conversation (3-axis rope rows)";
-  static constexpr const char* kRotated = "a quant2 (rotated) container";
-  static constexpr const char* kNotWide = "this Model's buffers were sized for 64 rows at load";
-};
+// per-chunk callback run per 64-row slice), and image prompts (PrefillMultimodal walks the same grid; the
+// splice and the 3-axis rope rows are functions of the absolute position). It falls back, with a one-line
+// reason, only for a quant2 (rotated) container.
 inline int DecidePrefillChunk(const PrefillChunkInputs& in, const char** why = nullptr) {
   if (why != nullptr) *why = nullptr;
   if (in.requested != kPrefillChunkWide) return kPrefillChunkBase;
-  const char* reason = nullptr;
-  if (in.rotated_container) reason = PrefillChunkReasons::kRotated;
-  else if (in.mrope_active) reason = PrefillChunkReasons::kMrope;
-  else if (!in.buffers_wide) reason = PrefillChunkReasons::kNotWide;
-  if (reason != nullptr) {
-    if (why != nullptr) *why = reason;
+  if (in.rotated_container) {
+    if (why != nullptr) *why = "a quant2 (rotated) container";
     return kPrefillChunkBase;
   }
   return kPrefillChunkWide;

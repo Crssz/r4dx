@@ -377,7 +377,12 @@ pointer at that image's rows of `EncodeImages`' output. The call:
    current chunk is one D2D `hipMemcpyAsync` -- both sides are contiguous `[rows, hidden]` bf16
    (the placeholder run is contiguous in the prompt, the merger's rows are contiguous in
    `EncodeImages`' output), so there is no kernel and no per-row loop. Chunked prefill needs no
-   special case: a span that straddles a 64-token boundary simply intersects two chunks.
+   special case: a span that straddles a chunk boundary simply intersects two chunks. That holds for the
+   256-row prefill chunk too (docs/prefill.md, the default since 2026-09-30): the splice and the 3-axis
+   rope rows are functions of the absolute position, so a super-chunk that straddles an image run
+   splices and ropes what four 64-row chunks would (`test_prefill_chunk_identity`, synthetic image rows:
+   an image mid-prompt, at position 0, and a conversation with text continuations, plain / `--mtp` /
+   `--dflash`, state digests bit-identical to the 64-row run).
 3. **Feeds 3-axis positions.** `BuildMropePositionIds` gained `(seq_start, mrope_start)` so it can
    walk a CONTINUATION block, and its returned `mrope_position_delta` is now stated as "what a
    token at absolute sequence index `s` adds to get its mrope position", which is the same number

@@ -359,8 +359,8 @@ Model Model::Load(const ModelOptions& opts) {
   // rather than lazily -- a lazy hipMalloc would have to happen on the first multimodal chunk,
   // i.e. mid-request with the device live, which is exactly what every other per-chunk buffer in
   // this class is persistent to avoid.
-  m.attn_rope_pos_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(3 * m.max_chunk_));
-  m.rope_pos_host_.assign(static_cast<size_t>(3 * m.max_chunk_), 0);
+  m.attn_rope_pos_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(3 * buf_rows));
+  m.rope_pos_host_.assign(static_cast<size_t>(3 * buf_rows), 0);
   // Per-layer activation scratch (rmsnorm output, gate_up, GDN conv/kkt/chunk-scan buffers,
   // activation-quant scratch): a few MB at T<=64 (see linear.h/gdn_layer.cpp's own buffer sizes).
   // 96MB gives headroom without materially affecting the ~15-35GB the weights themselves occupy.
@@ -1392,14 +1392,26 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
   CollapseSpeculativeWindow();  // same reasoning as Prefill()'s own call
   at_prefill_end_ = false;      // until the last chunk has landed (set again at the end)
   std::vector<float> logits;
-  for (size_t off = 0; off < token_ids.size(); off += static_cast<size_t>(max_chunk_)) {
-    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+  // The same chunk grid as Prefill() (docs/prefill.md): 256-row super-chunks while at least 256 rows
+  // remain, then 64-row chunks. An image row is an embedding like any other once spliced (the splice and
+  // the 3-axis rope rows are functions of the absolute position, so a super-chunk that straddles an image
+  // run splices and ropes exactly the rows four 64-row chunks would).
+  const int64_t rows = PrefillRowsForCall();
+  struct WideGuard {
+    int64_t& slot;
+    ~WideGuard() { slot = 0; }
+  } wide_guard{prefill_wide_active_};
+  prefill_wide_active_ = rows > max_chunk_ ? rows : 0;
+  for (size_t off = 0; off < token_ids.size();) {
+    const size_t n = static_cast<size_t>(PrefillNextChunk(static_cast<long long>(token_ids.size() - off),
+                                                           static_cast<int>(rows)));
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                       token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     const bool is_last_chunk = (off + n) == token_ids.size();
+    off += n;
     std::vector<float> chunk_logits =
         RunChunk(chunk, /*is_prefill_path=*/true, /*want_logits=*/is_last_chunk);
-    if (on_chunk_captured) on_chunk_captured();
+    DrainPrefillChunk(n, on_chunk_captured);
     if (is_last_chunk) logits = std::move(chunk_logits);
   }
   // Only now: until this point the block's own explicit rows are what every chunk read, and the
@@ -1449,45 +1461,35 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
     // comment in model.h): drain THIS chunk's captured rows before the next iteration's RunChunk
     // call overwrites dflash_features_dev_ starting at row 0 again. No-op cost when the caller
     // passed nullptr (the default) or no capture is attached.
-    if (n > static_cast<size_t>(max_chunk_)) {
-      // A 256-row super-chunk: the callback is invoked once per 64-row slice, in order, as it would be
-      // for the four 64-row chunks -- with DflashFeatureBuffer() / DflashFeatureRows() showing that
-      // slice (rows 64 j .. 64 j + 63 of the capture, 64 of them, or 0 while no capture is active).
-      // After the loop the view stays on the last slice, which is what the last 64-row chunk leaves.
-      const bool captured = dflash_feature_rows_ > 0;
-      for (int64_t row0 = 0; row0 < static_cast<int64_t>(n); row0 += max_chunk_) {
-        SetDflashFeatureRows(captured ? max_chunk_ : 0, captured ? row0 : 0);
-        if (on_chunk_captured) on_chunk_captured();
-      }
-    } else if (on_chunk_captured) {
-      on_chunk_captured();
-    }
+    DrainPrefillChunk(n, on_chunk_captured);
     if (is_last_chunk) logits = std::move(chunk_logits);
   }
   at_prefill_end_ = true;
   return logits;
 }
 
-int64_t Model::PrefillRowsForCall() {
-  // A Model that loaded 64-row (the kill switch, or a container / configuration the wide path does not
-  // serve) said so at load and has nothing to decide here.
-  if (wide_rows_ != kPrefillChunkWide) return max_chunk_;
-  PrefillChunkInputs in;
-  in.requested = prefill_chunk_request_;
-  in.buffers_wide = true;
-  in.mrope_active = mrope_active_;
-  in.rotated_container = container_.HasRotation();
-  const char* why = nullptr;
-  const int rows = DecidePrefillChunk(in, &why);
-  if (rows == kPrefillChunkWide) return rows;
-  if (!prefill_chunk_noted_) {
-    prefill_chunk_noted_ = true;
-    std::fprintf(stderr, "r4dx: prefill chunk: 256 rows not used from here: %s; using 64-row prefill chunks\n",
-                 why);
+void Model::DrainPrefillChunk(size_t rows, const std::function<void()>& on_chunk_captured) {
+  if (rows > static_cast<size_t>(max_chunk_)) {
+    // A 256-row super-chunk: the callback is invoked once per 64-row slice, in order, as it would be for
+    // the four 64-row chunks -- with DflashFeatureBuffer() / DflashFeatureRows() showing that slice (rows
+    // 64 j .. 64 j + 63 of the capture, 64 of them, or 0 while no capture is active). After the loop the
+    // view stays on the last slice, which is what the last 64-row chunk leaves.
+    const bool captured = dflash_feature_rows_ > 0;
+    for (int64_t row0 = 0; row0 < static_cast<int64_t>(rows); row0 += max_chunk_) {
+      SetDflashFeatureRows(captured ? max_chunk_ : 0, captured ? row0 : 0);
+      if (on_chunk_captured) on_chunk_captured();
+    }
+  } else if (on_chunk_captured) {
+    on_chunk_captured();
   }
-  return max_chunk_;
 }
 
+int64_t Model::PrefillRowsForCall() {
+  // Decided once, at load (prefill_chunk.h's DecidePrefillChunk, logged there): the wide path serves every
+  // configuration of a Model that sized its buffers for it -- TP, MTP, DFlash, images, prefix reuse -- so
+  // a Prefill call has nothing left to decide.
+  return wide_rows_ > 0 ? wide_rows_ : max_chunk_;
+}
 void Model::CollapseSpeculativeWindow() {
   if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
     // Enqueued on stream_, so ordered before the prefill's own kernels; no other buffer is touched.

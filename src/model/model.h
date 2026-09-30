@@ -991,16 +991,17 @@ class Model {
   // wide_rows_ is 256 when Load() sized the activation buffers, the position / seqused arrays, the DFlash
   // feature buffer and the arena for a 256-row super-chunk (256 was requested and the container allows
   // it), else 0 -- and then nothing in this Model differs from the 64-row engine. prefill_wide_active_ is
-  // 256 only inside a Prefill call that decided to run super-chunks (RunChunk then accepts T == 256 on its
-  // prefill path), else 0. prefill_chunk_noted_: the one stderr line for a 256 request that falls back
-  // after load (an image spliced into the conversation).
+  // 256 only inside a Prefill / PrefillMultimodal call that runs super-chunks (RunChunk then accepts
+  // T == 256 on its prefill path), else 0.
   int prefill_chunk_request_ = 64;
   int64_t wide_rows_ = 0;
   int64_t prefill_wide_active_ = 0;
   int64_t wide_chunks_run_ = 0;  // super-chunks run since Load (PrefillWideChunksRun)
-  bool prefill_chunk_noted_ = false;
-  // Rows per RunChunk call of THIS Prefill call: 256 or max_chunk_. Prints the fallback line once.
+  // Rows per RunChunk call of a Prefill call of this Model: 256 or max_chunk_ (decided once, at load).
   int64_t PrefillRowsForCall();
+  // After the RunChunk of a `rows`-row prefill chunk: the caller's per-chunk callback, once per 64-row
+  // slice of a super-chunk (DflashFeatureBuffer / Rows show the slice).
+  void DrainPrefillChunk(size_t rows, const std::function<void()>& on_chunk_captured);
   // The DFlash feature-row bookkeeping in one place: DflashFeatureRows() and the slice the public buffer
   // accessor shows (0 unless a wide Prefill is draining a 256-row chunk's capture, 64 rows at a time).
   void SetDflashFeatureRows(int64_t rows, int64_t view_row0 = 0) {

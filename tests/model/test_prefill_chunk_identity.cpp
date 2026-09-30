@@ -376,6 +376,146 @@ bool RunTpEmulate(const std::string& name, const ModelOptions& base, Mode mode,
   return true;
 }
 
+// ---- image prompts ---------------------------------------------------------------------------------
+// PrefillMultimodal walks the same chunk grid; the splice of the image rows and the 3-axis rope rows are
+// functions of the absolute position, so a super-chunk that straddles an image run must splice and rope
+// exactly what four 64-row chunks do. Synthetic image spans (deterministic pseudo-random bf16 rows in
+// place of the vision tower's output -- the splice does not care where the rows came from), on the real
+// container (its vision config supplies the merge size and the placeholder id). Scenarios: an image in the
+// middle of a text prompt, an image at position 0, and a conversation -- image prompt, a text-only
+// continuation through Prefill (mrope_active_), a text-only PrefillMultimodal -- then decode.
+struct ImageRows {
+  r4dx::core::DeviceBuffer<uint16_t> dev;
+  int64_t tokens = 0;
+  int64_t side = 0;  // patch grid h == w
+};
+
+ImageRows MakeImageRows(int64_t merge, int64_t tokens_side, int64_t hidden, int salt) {
+  ImageRows r;
+  r.side = tokens_side * merge;
+  r.tokens = tokens_side * tokens_side;
+  std::vector<uint16_t> host(static_cast<size_t>(r.tokens * hidden));
+  uint32_t x = 12345u + static_cast<uint32_t>(salt);
+  for (auto& v : host) {
+    x = x * 1664525u + 1013904223u;
+    v = r4dx::core::FloatToBf16((static_cast<float>(x >> 9) / static_cast<float>(1u << 23) - 0.5f) * 0.5f);
+  }
+  r.dev = r4dx::core::DeviceBuffer<uint16_t>(host.size());
+  r.dev.CopyFromHost(host);
+  return r;
+}
+
+void RunVisionScenarios(Model& m, Mode mode, int64_t spec_k, Trace* tr) {
+  const int64_t hidden = m.Config().hidden_size;
+  const int64_t merge = m.GetContainer().VisionCfg().spatial_merge_size;
+  const int32_t image_id = static_cast<int32_t>(m.GetContainer().ImageTokenId());
+  const auto add = [&](const std::string& n, uint64_t v) { tr->emplace_back(n, v); };
+  const auto add_state = [&](const std::string& tag) {
+    for (const auto& kv : m.DebugStateDigest()) add(tag + "/" + kv.first, kv.second);
+  };
+  const auto image_span = [&](const ImageRows& rows, int64_t offset) {
+    Model::ImageSpan sp;
+    sp.offset = offset;
+    sp.tokens = rows.tokens;
+    sp.grid.t = 1;
+    sp.grid.h = rows.side;
+    sp.grid.w = rows.side;
+    sp.embeds = rows.dev.data();
+    sp.embeds_on_host = false;
+    return sp;
+  };
+  const auto tail_steps = [&](const std::string& tag, const std::vector<float>& logits) {
+    int32_t tok = Argmax(logits);
+    std::vector<int32_t> toks;
+    for (int i = 0; i < 2; ++i) {
+      toks.push_back(m.DecodeStepGreedy(tok));
+      tok = toks.back();
+    }
+    for (int i = 0; i < 2 && mode != Mode::kPlain; ++i) {
+      const std::vector<int32_t> round = mode == Mode::kMtp ? m.DecodeStepMtpGreedy(tok, spec_k)
+                                                            : m.DecodeStepDflashGreedy(tok, spec_k, 0.0f, 0);
+      toks.insert(toks.end(), round.begin(), round.end());
+      tok = round.back();
+    }
+    add(tag + "/tokens", HashTokens(toks));
+    add_state(tag + "/end");
+  };
+  const auto build = [&](int text_before, const ImageRows* img, int text_after, std::vector<int32_t>* ids,
+                         int64_t* offset) {
+    const std::vector<int32_t> a = Tokens(text_before, 3), b = Tokens(text_after, 5);
+    ids->assign(a.begin(), a.end());
+    *offset = static_cast<int64_t>(ids->size());
+    if (img != nullptr) ids->insert(ids->end(), static_cast<size_t>(img->tokens), image_id);
+    ids->insert(ids->end(), b.begin(), b.end());
+  };
+
+  const ImageRows big = MakeImageRows(merge, 16, hidden, 1);    // 256 tokens
+  const ImageRows small = MakeImageRows(merge, 12, hidden, 2);  // 144 tokens
+  std::vector<int32_t> ids;
+  int64_t off = 0;
+
+  m.Reset();  // A: text 100 + image 256 + text 200
+  build(100, &big, 200, &ids, &off);
+  tail_steps("img-mid", m.PrefillMultimodal(ids, {image_span(big, off)}));
+
+  m.Reset();  // B: image at position 0 + text 300
+  build(0, &small, 300, &ids, &off);
+  tail_steps("img-first", m.PrefillMultimodal(ids, {image_span(small, off)}));
+
+  m.Reset();  // C: a conversation -- image prompt, text continuation, text-only multimodal call
+  build(60, &small, 100, &ids, &off);
+  std::vector<float> logits = m.PrefillMultimodal(ids, {image_span(small, off)});
+  add("conv/call0/logits", HashLogits(logits));
+  add_state("conv/call0");
+  logits = m.Prefill(Tokens(300, 7));  // rope rows now carry the image's delta
+  add("conv/call1/logits", HashLogits(logits));
+  add_state("conv/call1");
+  logits = m.PrefillMultimodal(Tokens(270, 9), {});
+  add("conv/call2/logits", HashLogits(logits));
+  tail_steps("conv", logits);
+}
+
+bool RunVision(const std::string& name, const ModelOptions& base, Mode mode, int64_t spec_k) {
+  if (const char* only = std::getenv("R4DX_TEST_ONLY")) {
+    if (*only != '\0' && name.find(only) == std::string::npos) return true;
+  }
+  std::fprintf(stderr, "[chunk-identity] %s\n", name.c_str());
+  Trace side[2];
+  int64_t wide_chunks[2] = {0, 0};
+  for (int s = 0; s < 2; ++s) {
+    ModelOptions o = base;
+    o.prefill_chunk = s == 0 ? 64 : 256;
+    Model m = Model::Load(o);
+    if (!m.GetContainer().HasVisionConfig()) {
+      std::fprintf(stderr, "[SKIP] %s: the container has no vision config\n", name.c_str());
+      return true;
+    }
+    RunVisionScenarios(m, mode, spec_k, &side[s]);
+    wide_chunks[s] = m.PrefillWideChunksRun();
+  }
+  bool ok = side[0].size() == side[1].size();
+  size_t bad = 0;
+  for (size_t i = 0; ok && i < side[0].size(); ++i) {
+    if (side[0][i] != side[1][i] && bad++ < 12) {
+      std::fprintf(stderr, "FAIL %s: %s differs: 64-row %016llx, 256-row %016llx\n", name.c_str(),
+                   side[0][i].first.c_str(), static_cast<unsigned long long>(side[0][i].second),
+                   static_cast<unsigned long long>(side[1][i].second));
+    }
+  }
+  if (bad != 0 || !ok) {
+    std::fprintf(stderr, "FAIL %s: %zu of %zu observables differ\n", name.c_str(), bad, side[0].size());
+    return false;
+  }
+  if (wide_chunks[0] != 0 || wide_chunks[1] <= 0) {
+    std::fprintf(stderr, "FAIL %s: super-chunks run: 64-row Model %lld (expected 0), 256-row Model %lld (expected > 0)\n",
+                 name.c_str(), static_cast<long long>(wide_chunks[0]), static_cast<long long>(wide_chunks[1]));
+    return false;
+  }
+  std::fprintf(stderr, "[PASS] %s: %zu observables bit-identical, 64-row vs 256-row (%lld super-chunks)\n",
+               name.c_str(), side[0].size(), static_cast<long long>(wide_chunks[1]));
+  return true;
+}
+
 std::vector<Scenario> TailScenarios(bool with_8k) {
   std::vector<Scenario> s;
   for (int n : {1, 63, 64, 65, 255, 256, 257, 511}) s.push_back({"len" + std::to_string(n), {n}});
@@ -464,6 +604,23 @@ static int RunTest() {
       const std::vector<Scenario> tp_sc = {{"len257", {257}}, {"len511", {511}}, {"split300+333", {300, 333}}};
       ++ran;
       if (!RunTpEmulate("tp2-emulate/real/plain", t, Mode::kPlain, tp_sc)) ++fails;
+    }
+    {
+      // Image prompts on the real container (vision tower loaded: the splice needs its config), plain,
+      // --mtp 3 and --dflash: synthetic image rows spliced through PrefillMultimodal.
+      ModelOptions v = base;
+      ++ran;
+      if (!RunVision("real/vision/plain", v, Mode::kPlain, 0)) ++fails;
+      v.mtp_draft_k = 3;
+      ++ran;
+      if (!RunVision("real/vision/mtp3", v, Mode::kMtp, 3)) ++fails;
+      if (FileExists(drafter)) {
+        ModelOptions vd = base;
+        vd.dflash_container = drafter;
+        vd.dflash_draft_k = 7;
+        ++ran;
+        if (!RunVision("real/vision/dflash7", vd, Mode::kDflash, 7)) ++fails;
+      }
     }
     if (FileExists(drafter)) {
       ModelOptions dof = base;

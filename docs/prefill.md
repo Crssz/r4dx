@@ -570,5 +570,12 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   submissions on the display card is what it was. `test_prefill_chunk_identity` compares TpModel in
   emulate mode (both ranks on one device, the real trellis container included) 64-row against 256-row:
   logits, tokens and the per-rank all-reduce call counts are equal.
-- Falls back to 64 rows with a stderr reason: a quant2 (rotated) container and, per Prefill call, a
-  conversation that has had an image spliced into it.
+- **Image prompts** run the wide path too: `PrefillMultimodal` walks the same grid. The image splice and
+  the 3-axis rope rows are functions of the absolute position (the rope buffers are sized for 256
+  rows), so a super-chunk that straddles an image run splices and ropes what four 64-row chunks do, and
+  the text-only continuations of an image conversation are wide as well. `test_prefill_chunk_identity`
+  feeds synthetic image rows (the tree has no vision test image; row 7 of `tp1_identity` skips): an
+  image mid-prompt, at position 0, and a conversation (image prompt, text `Prefill`, text-only
+  `PrefillMultimodal`, decode), plain / `--mtp 3` / `--dflash`, state digests bit-identical.
+- Falls back to 64 rows, with a stderr line at load, only for a quant2 (rotated) container (its residual
+  rotation and Hadamard epilogues were not validated at 256 rows).

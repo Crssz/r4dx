@@ -15,6 +15,8 @@ re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
   exact-wide launch (bit-identical to the dense kernel); split-KV is opt-in with
   `R4DX_PREFILL_SPLITKV=split`. See [M1 final](#m1-final-exact-by-default-split-kv-opt-in).
 - **M2:** opt-in lossy modes, gated on the M0 KL harness.
+- **256-row chunk:** lossless, default on since 2026-09-30; `R4DX_PREFILL_CHUNK=0` is the kill switch. See
+  [The 256-row prefill chunk](#the-256-row-prefill-chunk-default-on-r4dx_prefill_chunk).
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs
 are in `D:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and are never committed.
@@ -514,3 +516,34 @@ TP=2 against TP=1 (the TP=1 M1 validation table, means of 2 runs):
 **Final default:** exact-wide (lossless: bit-identical to dense at TP=1 and TP=2). 1.51x at 128k
 TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) stays opt-in for
 2.0x (TP=1) and 2.9x (TP=2) at 128k, with rounding-class drift against the dense bits.
+
+## The 256-row prefill chunk (default on, `R4DX_PREFILL_CHUNK`)
+
+Prompt prefill runs in 256-row super-chunks by default: the trellis linears see 256 rows through libr4d's
+M = 256 GEMM (one weight pass per 256 rows instead of four), and everything sequence-dependent (the GDN
+conv / scan, the attention core) still runs in 64-row sub-slices in order. The result is bit-identical to
+the 64-row path, so no accuracy number moves; the design, the identity coverage and the kernel are in
+[docs/trellis-m256.md](trellis-m256.md).
+
+| `R4DX_PREFILL_CHUNK` | prompt-prefill chunk |
+|---|---|
+| unset, empty or `256` (**default**) | 256-row super-chunks where the configuration allows it (below), else 64-row chunks |
+| `0` or `64` (**kill switch**) | 64-row chunks exactly as before: the activation buffers and the arena keep their 64-row sizes (no extra VRAM) |
+| anything else | a warning on stderr, then `64` |
+
+- The variable is read once per process. `ModelOptions::prefill_chunk` (0 = follow the environment) forces
+  64 or 256 for a test that needs both in one process.
+- Every model load prints one line, e.g. `[r4dx::model::Model] prefill chunk: 256 rows (default;
+  R4DX_PREFILL_CHUNK=0 restores 64-row chunks)`, or `64 rows (... asked for 256, not used: <reason>)`
+  when a 256 request could not be honoured.
+- The chunk grid is anchored at the start of each `Prefill` call: full 256-row super-chunks while at least
+  256 rows remain, then the ordinary 64-row chunks for the rest (the last one holds 1..64 rows). The tail
+  therefore runs the very chunks the 64-row grid makes for it, and a call split anywhere (a prefix-cache
+  restore, a warm-turn suffix) shifts nothing it did not shift before. `test_prefill_chunk` walks the grid
+  for the tail lengths 1, 63, 64, 65, 255, 256, 257, 511 and 8145. No 128-row super-chunk exists: the
+  tail is under 256 rows, and the M = 128 kernel would save well under 1% of a prompt.
+- VRAM: the wide buffers and arena add 0.22 GiB per Model (`arena+scratch=0.21875 GiB` in the load line,
+  0.09375 with `=0`).
+- Falls back to 64 rows with a stderr reason: tensor parallelism, an MTP head, a DFlash drafter or
+  feature capture, a per-chunk callback, a quant2 (rotated) container and, per Prefill call, a
+  conversation that has had an image spliced into it.

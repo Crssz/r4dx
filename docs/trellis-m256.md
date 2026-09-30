@@ -1,11 +1,14 @@
 # M = 256 trellis GEMM and the 256-row prefill chunk
 
-Status: the kernel (`third_party/libr4d/r4d_gemm_trellis_nt_m256.hip`, libr4d branch `linear`) is in
-`R4D_UNITS`, has its `r4d.h` / `r4d.hpp` entry, its registry row and pybind binding, a host legality check and
-a ctest, and `ApplyLinear` can call it. A Model runs it only when **`R4DX_PREFILL_CHUNK=256`** is set (default
-OFF, nothing changes when it is unset) for a prompt `Prefill` call at TP = 1 with no MTP head, no DFlash
-drafter and no image. It is a spike on branch `linear` (not merged, not pushed): the design is in "The 256-row
-prefill chunk" below, the kernel in "What it is". Since stage S1 the kernel reproduces EVERY shipped M = 64
+Status (2026-09-30, branch `chunk-default`): **the 256-row chunk is the default** (`R4DX_PREFILL_CHUNK`
+unset means 256; `0` or `64` is the kill switch that restores the 64-row engine exactly; see
+[docs/prefill.md](prefill.md) "The 256-row prefill chunk" for the switch, the load line, the chunk grid and
+the fallbacks). The sections below are the spike's record (stages S1 / S2, when the flag was opt-in and
+TP = 1 only); where they say "ignored", "opt-in" or "not wired", the default-on work supersedes them.
+The kernel (`third_party/libr4d/r4d_gemm_trellis_nt_m256.hip`) is in
+`R4D_UNITS`, has its `r4d.h` / `r4d.hpp` entry, its registry row, a host legality check and
+a ctest, and `ApplyLinear` calls it inside a Model's 256-row prefill super-chunk. The design is in "The
+256-row prefill chunk" below, the kernel in "What it is". Since stage S1 the kernel reproduces EVERY shipped M = 64
 tuning row (all seven classes x KB 4/5, including mlp.down KB 4's SK 16) bit for bit; the bench
 (`tests/kernels/tool_trellis_m256_bench.hip`) and real-weight check (`tool_trellis_m256_real_check.hip`,
 `build_m256_bench.ps1 [-Tool real_check]`, hipcc, no CMake target) are unchanged in purpose.

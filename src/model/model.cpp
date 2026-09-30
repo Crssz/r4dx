@@ -309,13 +309,27 @@ Model Model::Load(const ModelOptions& opts) {
   m.draft_window_ = 1 + std::max(opts.mtp_draft_k, opts.dflash_draft_k);
   const int64_t max_decode_window = m.draft_window_;
 
-  m.max_chunk_ = 64;
-  // R4DX_PREFILL_CHUNK=256 (prefill_chunk.h): a TP=1 Model with no MTP head and no drafter sizes the
-  // per-chunk activation buffers (and, below, the arena and the position / seqused arrays) for a
-  // 256-row prefill super-chunk. Everything else -- the default -- is sized exactly as before. The
-  // MTP / DFlash / TP / vision cases are decided again per Prefill call (PrefillRowsForCall).
-  const bool want_wide = PrefillChunkRequest() == kPrefillChunkWide && !is_tp_rank &&
-                         opts.mtp_draft_k == 0 && opts.dflash_container.empty();
+  m.max_chunk_ = kPrefillChunkBase;
+  // The prompt-prefill chunk (prefill_chunk.h, docs/prefill.md): 256 rows by default. A Model that runs
+  // 256-row super-chunks sizes the per-chunk activation buffers (and, below, the arena, the position /
+  // seqused arrays and the DFlash feature buffer) for them at load; R4DX_PREFILL_CHUNK=0 (or 64), or
+  // ModelOptions::prefill_chunk = 64, sizes everything as the 64-row engine always did. Whatever cannot be
+  // served falls back here (logged once below) or, for an image spliced in later, per Prefill call
+  // (PrefillRowsForCall).
+  if (opts.prefill_chunk != 0 && opts.prefill_chunk != kPrefillChunkBase &&
+      opts.prefill_chunk != kPrefillChunkWide) {
+    throw std::invalid_argument("Model::Load: ModelOptions::prefill_chunk must be 0, 64 or 256, got " +
+                                std::to_string(opts.prefill_chunk));
+  }
+  m.prefill_chunk_request_ = opts.prefill_chunk != 0 ? opts.prefill_chunk : PrefillChunkRequest();
+  PrefillChunkInputs chunk_in;
+  chunk_in.requested = m.prefill_chunk_request_;
+  chunk_in.rotated_container = m.container_.HasRotation();
+  chunk_in.tensor_parallel = is_tp_rank;
+  chunk_in.mtp = opts.mtp_draft_k > 0;
+  chunk_in.dflash = !opts.dflash_container.empty();
+  const char* chunk_why = nullptr;
+  const bool want_wide = DecidePrefillChunk(chunk_in, &chunk_why) == kPrefillChunkWide;
   m.wide_rows_ = want_wide ? kPrefillChunkWide : 0;
   const int64_t buf_rows = want_wide ? m.wide_rows_ : m.max_chunk_;
   m.embed_staging_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(buf_rows * hidden));
@@ -545,6 +559,26 @@ Model Model::Load(const ModelOptions& opts) {
     // The summed buffer sizes, like the vision line above.
     std::cerr << "[r4dx::model::Model] prompt checkpoint VRAM: " << GiB(ckpt_bytes)
               << " GiB (already included in kv+gdn_state above)\n";
+  }
+
+  // The prompt-prefill chunk this Model runs (docs/prefill.md): one line per load, with the reason when a
+  // 256-row request could not be honoured and how to turn the wide path off when it is in use.
+  {
+    const char* env = std::getenv("R4DX_PREFILL_CHUNK");
+    const std::string source = opts.prefill_chunk != 0
+                                   ? "ModelOptions::prefill_chunk=" + std::to_string(opts.prefill_chunk)
+                                   : (env != nullptr && *env != '\0')
+                                         ? std::string("R4DX_PREFILL_CHUNK=") + env
+                                         : std::string("default");
+    if (m.wide_rows_ > 0) {
+      std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkWide << " rows (" << source
+                << "; R4DX_PREFILL_CHUNK=0 restores 64-row chunks)\n";
+    } else if (chunk_why != nullptr) {
+      std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkBase << " rows (" << source
+                << " asked for " << kPrefillChunkWide << ", not used: " << chunk_why << ")\n";
+    } else {
+      std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkBase << " rows (" << source << ")\n";
+    }
   }
 
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
@@ -1353,10 +1387,11 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
   CollapseSpeculativeWindow();
   at_prefill_end_ = false;  // until the last chunk has landed
   std::vector<float> logits;
-  // R4DX_PREFILL_CHUNK=256 (docs/trellis-m256.md): `rows` is 256 only when this Model and call may run
-  // super-chunks. The chunk grid is anchored at the START OF THIS CALL: full 256-row super-chunks
-  // first, then whatever is left as ordinary 64-row chunks -- the same chunks today's grid makes for
-  // that remainder, so a call split anywhere (a prefix-cache restore) shifts nothing it did not shift.
+  // The 256-row prefill chunk (docs/prefill.md, docs/trellis-m256.md): `rows` is 256 when this Model and
+  // call run super-chunks. The chunk grid is anchored at the START OF THIS CALL (PrefillNextChunk): full
+  // 256-row super-chunks first, then whatever is left (fewer than 256 rows) as ordinary 64-row chunks --
+  // the same chunks the 64-row grid makes for that remainder, so a call split anywhere (a prefix-cache
+  // restore, a warm-turn suffix) shifts nothing it did not shift before.
   const int64_t rows = PrefillRowsForCall(static_cast<bool>(on_chunk_captured));
   struct WideGuard {
     int64_t& slot;
@@ -1364,10 +1399,8 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
   } wide_guard{prefill_wide_active_};
   prefill_wide_active_ = rows > max_chunk_ ? rows : 0;
   for (size_t off = 0; off < token_ids.size();) {
-    const size_t remaining = token_ids.size() - off;
-    const size_t n = (prefill_wide_active_ > 0 && remaining >= static_cast<size_t>(prefill_wide_active_))
-                         ? static_cast<size_t>(prefill_wide_active_)
-                         : std::min(static_cast<size_t>(max_chunk_), remaining);
+    const size_t n = static_cast<size_t>(PrefillNextChunk(static_cast<long long>(token_ids.size() - off),
+                                                           static_cast<int>(rows)));
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                       token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     const bool is_last_chunk = (off + n) == token_ids.size();
@@ -1386,24 +1419,26 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
 }
 
 int64_t Model::PrefillRowsForCall(bool has_chunk_callback) {
+  // A Model that loaded 64-row (the kill switch, or a container / configuration the wide path does not
+  // serve) said so at load and has nothing to decide here.
+  if (wide_rows_ != kPrefillChunkWide) return max_chunk_;
   PrefillChunkInputs in;
-  in.requested = PrefillChunkRequest();
-  if (in.requested != kPrefillChunkWide) return max_chunk_;  // the default: silent, nothing to decide
-  in.buffers_wide = wide_rows_ == kPrefillChunkWide;
+  in.requested = prefill_chunk_request_;
+  in.buffers_wide = true;
   in.tensor_parallel = comm_ != nullptr;
   in.mtp = mtp_.has_value();
   in.dflash = dflash_.has_value();
   in.dflash_capture = !dflash_target_layers_.empty();
   in.mrope_active = mrope_active_;
-  in.rotated_container = container_.HasRotation() || HadSigns().gdn_out != nullptr ||
-                         HadSigns().o != nullptr || HadSigns().down != nullptr;
+  in.rotated_container = container_.HasRotation();
   in.on_chunk_captured = has_chunk_callback;
   const char* why = nullptr;
   const int rows = DecidePrefillChunk(in, &why);
   if (rows == kPrefillChunkWide) return rows;
   if (!prefill_chunk_noted_) {
     prefill_chunk_noted_ = true;
-    std::fprintf(stderr, "r4dx: R4DX_PREFILL_CHUNK=256 ignored: %s; using 64-row prefill chunks\n", why);
+    std::fprintf(stderr, "r4dx: prefill chunk: 256 rows not used from here: %s; using 64-row prefill chunks\n",
+                 why);
   }
   return max_chunk_;
 }
@@ -1774,13 +1809,11 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
 
   SpanAccumulator acc;
 
-  // R4DX_PREFILL_CHUNK=256: the same chunk grid as Prefill() (super-chunks first, then 64-row chunks).
+  // The same chunk grid as Prefill() (super-chunks first, then 64-row chunks).
   const int64_t wide_rows = PrefillRowsForCall(/*has_chunk_callback=*/false);
   for (size_t off = 0; off < token_ids.size();) {
-    const size_t remaining = token_ids.size() - off;
-    const size_t n = (wide_rows > max_chunk_ && remaining >= static_cast<size_t>(wide_rows))
-                         ? static_cast<size_t>(wide_rows)
-                         : std::min(static_cast<size_t>(max_chunk_), remaining);
+    const size_t n = static_cast<size_t>(PrefillNextChunk(static_cast<long long>(token_ids.size() - off),
+                                                           static_cast<int>(wide_rows)));
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                       token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     off += n;

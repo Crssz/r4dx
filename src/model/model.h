@@ -192,6 +192,12 @@ struct ModelOptions {
   // recurrent + the conv line)); halved per rank under TP. Off by default: r4dx-server turns it on
   // (--prompt-checkpoint), nothing else calls it.
   bool prompt_checkpoint = false;
+  // Prompt-prefill chunk size (prefill_chunk.h, docs/prefill.md): 0 (default) follows the environment
+  // (R4DX_PREFILL_CHUNK: unset = 256, "0" / "64" = the 64-row kill switch); 64 and 256 force the choice
+  // whatever the environment says (the identity tests load one Model of each). 256 sizes the activation
+  // buffers, the arena and the DFlash feature buffer for 256 rows at load (+0.22 GiB), and is honoured at
+  // every Prefill call unless the conversation has an image in it; a quant2 container loads 64-row.
+  int prefill_chunk = 0;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -572,7 +578,9 @@ class Model {
   // UNDEFINED (do not read) after Reset() and before the next RunChunk/VerifyWindow call of the new
   // sequence: Reset() zeroes DflashFeatureRows() to 0 precisely so a caller cannot mistake the
   // previous sequence's stale buffer contents for the new sequence's -- see Reset()'s own comment.
-  const uint16_t* DflashFeatureBuffer() const { return dflash_features_dev_.data(); }
+  const uint16_t* DflashFeatureBuffer() const {
+    return dflash_features_dev_.data() + dflash_view_row0_ * DflashFeatureCols();
+  }
   // 0 immediately after Load()/Reset(), before this Model has run any RunChunk/VerifyWindow call
   // for the current sequence.
   int64_t DflashFeatureRows() const { return dflash_feature_rows_; }
@@ -960,17 +968,24 @@ class Model {
   GdnControlCache gdn_control_;  // shared by every GDN layer -- see gdn_state.h
 
   int64_t max_chunk_ = 64;
-  // 256-row prompt prefill (R4DX_PREFILL_CHUNK=256, prefill_chunk.h, docs/trellis-m256.md). wide_rows_
-  // is 256 when Load() sized the activation buffers, the position / seqused arrays and the arena for a
-  // 256-row super-chunk (the env var asked for it, TP=1, no MTP head, no drafter), else 0 -- and then
-  // nothing in this Model differs from before the option existed. prefill_wide_active_ is 256 only
-  // inside a Prefill call that decided to run super-chunks (RunChunk then accepts T == 256 on its
-  // prefill path), else 0. prefill_chunk_noted_: the one stderr line for a 256 request that falls back.
+  // 256-row prompt prefill (default on; R4DX_PREFILL_CHUNK / ModelOptions::prefill_chunk, prefill_chunk.h,
+  // docs/prefill.md, docs/trellis-m256.md). prefill_chunk_request_ is what was asked for (64 or 256).
+  // wide_rows_ is 256 when Load() sized the activation buffers, the position / seqused arrays, the DFlash
+  // feature buffer and the arena for a 256-row super-chunk (256 was requested and the container allows
+  // it), else 0 -- and then nothing in this Model differs from the 64-row engine. prefill_wide_active_ is
+  // 256 only inside a Prefill call that decided to run super-chunks (RunChunk then accepts T == 256 on its
+  // prefill path), else 0. prefill_chunk_noted_: the one stderr line for a 256 request that falls back
+  // after load (an image spliced into the conversation).
+  int prefill_chunk_request_ = 64;
   int64_t wide_rows_ = 0;
   int64_t prefill_wide_active_ = 0;
   bool prefill_chunk_noted_ = false;
   // Rows per RunChunk call of THIS Prefill call: 256 or max_chunk_. Prints the fallback line once.
   int64_t PrefillRowsForCall(bool has_chunk_callback);
+  // The 64-row slices of a 256-row super-chunk's capture (DFlash): the first row of the slice the public
+  // DflashFeatureBuffer() currently shows. 0 except while a wide Prefill drains its callback slice by slice
+  // and after such a Prefill (then the last slice, which is what a 64-row chunk would have left).
+  int64_t dflash_view_row0_ = 0;
   int64_t pos_ = 0;        // tokens already committed to KV/GDN state
   bool started_ = false;   // false only before the very first RunChunk call (GDN has_init gate)
 

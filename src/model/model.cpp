@@ -22,7 +22,10 @@
 #include "linear.h"
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
-#include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/trellis-m256.md)
+#include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/prefill.md)
+#ifdef R4DX_TP_TESTING
+#include "state_digest.h"
+#endif
 #include "profile_span.h"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
@@ -2667,6 +2670,42 @@ void Model::MtpDebugLastDraft(std::vector<float>* rows, std::vector<int32_t>* to
 void Model::DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const {
   if (!dflash_.has_value()) throw std::runtime_error("Model::DflashDebugLastTop16: requires DflashEnabled()");
   dflash_->DebugLastTop16(cand, unary);
+}
+
+std::vector<std::pair<std::string, uint64_t>> Model::DebugStateDigest() {
+  stream_.Synchronize();
+  std::vector<std::pair<std::string, uint64_t>> out;
+  out.emplace_back("pos", static_cast<uint64_t>(pos_));
+  const size_t n = gdn_states_.size();
+  for (size_t i = 0; i < n; ++i) {
+    if (kv_caches_[i]) {
+      attention::PagedKvCache& kv = *kv_caches_[i];
+      out.emplace_back("kv." + std::to_string(i),
+                       DigestDeviceBytes(kv.Data(), static_cast<size_t>(kv.MaxBlocks()) *
+                                                        static_cast<size_t>(kv.KvBlockStride())));
+    }
+    if (gdn_states_[i]) {
+      GdnStateManager& gs = *gdn_states_[i];
+      out.emplace_back("gdn.rec." + std::to_string(i),
+                       DigestDeviceBytes(gs.RecurrentBase(), gs.RecurrentElems() * sizeof(float)));
+      out.emplace_back("gdn.conv." + std::to_string(i),
+                       DigestDeviceBytes(gs.ConvBase(), gs.ConvElems() * sizeof(uint16_t)));
+    }
+  }
+  if (mtp_) out.emplace_back("mtp.kv", mtp_->DebugKvDigest(stream_));
+  if (dflash_.has_value()) {
+    const int64_t count = std::min<int64_t>(dflash_->InjectedCount(), 2048);
+    for (int64_t l = 0; l < dflash_->Config().block_count; ++l) {
+      const std::vector<uint16_t> k = dflash_->DebugStoreK(stream_, l, 0, count);
+      const std::vector<uint16_t> v = dflash_->DebugStoreV(stream_, l, 0, count);
+      out.emplace_back("dflash.k." + std::to_string(l),
+                       Fnv1a64Bytes(reinterpret_cast<const uint8_t*>(k.data()), k.size() * 2));
+      out.emplace_back("dflash.v." + std::to_string(l),
+                       Fnv1a64Bytes(reinterpret_cast<const uint8_t*>(v.data()), v.size() * 2));
+    }
+    out.emplace_back("dflash.injected", static_cast<uint64_t>(dflash_->InjectedCount()));
+  }
+  return out;
 }
 
 void Model::DflashDebugGatherDraftLogits(std::vector<float>* out) {

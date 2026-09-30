@@ -209,6 +209,9 @@ class MtpHead {
   const std::vector<int32_t>& DebugDrafts() const { return debug_drafts_; }
   const std::vector<float>& DebugRows() const { return debug_rows_; }
   const std::vector<int32_t>& DebugTokens() const { return debug_tokens_; }
+  // FNV-1a 64 of the head's whole KV cache (D2H, synchronizes `stream`): the byte-identity check of the
+  // 256-row prefill chunk's per-slice priming (tests/model/test_prefill_chunk_identity.cpp).
+  uint64_t DebugKvDigest(core::Stream& stream);
 #endif
 
  private:

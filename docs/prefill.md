@@ -542,6 +542,13 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   restore, a warm-turn suffix) shifts nothing it did not shift before. `test_prefill_chunk` walks the grid
   for the tail lengths 1, 63, 64, 65, 255, 256, 257, 511 and 8145. No 128-row super-chunk exists: the
   tail is under 256 rows, and the M = 128 kernel would save well under 1% of a prompt.
+- `test_prefill_chunk_identity` (device 1, needs the 4-layer container for its fast part and the trellis
+  container for the real part) loads a 64-row and a 256-row Model one after the other and compares
+  every observable bit for bit: the last-row logits, the greedy tokens after, and a digest of all
+  per-sequence state (each KV cache, each GDN recurrent / conv state; with a drafter also the MTP KV and
+  the DFlash ring) for single calls of 1, 63, 64, 65, 255, 256, 257, 511 (and 8145 on the 4-layer
+  container) rows and for prefix-reuse shapes (300 + 333, 64 + 511, 257 + 1, 1 + 255 + 257: the grid is
+  anchored at each call). A negative control shows the digest does change when the chunk grid moves.
 - VRAM: the wide buffers and arena add 0.22 GiB per Model (`arena+scratch=0.21875 GiB` in the load line,
   0.09375 with `=0`).
 - Falls back to 64 rows with a stderr reason: tensor parallelism, an MTP head, a DFlash drafter or

@@ -14,6 +14,7 @@
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/embedding.hpp"
 #include "r4dx/kernels/kernels.h"
+#include "state_digest.h"
 #include "tp/tp_vocab.h"  // tp::ArgmaxPair / MergeArgmax (docs/tp.md 7.3, H6)
 
 namespace r4dx::model {
@@ -417,5 +418,13 @@ void MtpHead::PrimeKv(core::Stream& stream, core::Arena& arena, const ModelConfi
                        /*next_epilogue=*/0, /*next_epilogue_out=*/nullptr,
                        rope3_host != nullptr ? prime_rope3_dev_.data() : nullptr);
 }
+
+#ifdef R4DX_TP_TESTING
+uint64_t MtpHead::DebugKvDigest(core::Stream& stream) {
+  stream.Synchronize();
+  return DigestDeviceBytes(kv_.Data(), static_cast<size_t>(kv_.MaxBlocks()) *
+                                            static_cast<size_t>(kv_.KvBlockStride()));
+}
+#endif
 
 }  // namespace r4dx::model

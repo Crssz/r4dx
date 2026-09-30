@@ -31,13 +31,19 @@ set(R4DX_MODEL_TESTS
   # trellis_ref.hpp, the pre-transformed path, row identity, the ticket reset and every loader
   # refusal of 2.5 at TP=1 and TP=2. Device 1, SKIP 77 without the tiny containers.
   test_trellis_linear
+  # The 256-row prefill chunk (docs/prefill.md) against the 64-row one, bit for bit: last-row logits,
+  # greedy / MTP / DFlash tokens, the digest of every piece of per-sequence state, the tail lengths of the
+  # chunk grid and prefix-reuse suffixes; on the 4-layer container (bf16, w4a16) and the real trellis
+  # container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library variant for
+  # Model::DebugStateDigest.
+  test_prefill_chunk_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
   add_executable(${t} ${t}.cpp)
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
-  if(t STREQUAL "test_tp_emulation")
+  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)

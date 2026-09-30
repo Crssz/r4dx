@@ -73,6 +73,10 @@ class GdnStateManager {
   int64_t ConvTokStride() const { return 1; }                           // cs_tok
   int64_t StateLenMax() const { return state_len_max_; }
   uint16_t* ConvBase() { return conv_.data(); }
+  // The two state buffers whole (every physical slot), for a test that digests them (Model::
+  // DebugStateDigest, R4DX_TP_TESTING).
+  size_t RecurrentElems() const { return recurrent_.size(); }
+  size_t ConvElems() const { return conv_.size(); }
 
   void ZeroAll(core::Stream& stream) {
     recurrent_.ZeroAsync(stream);

@@ -44,6 +44,7 @@
 #include "model_config.h"
 #include "model_types.h"  // ImageSpan, ImageRows, ProfileEntry, StepProfile (docs/tp.md 2.8)
 #include "mtp_head.h"
+#include "prefill_chunk.h"  // kPrefillChunkBase / kPrefillChunkWide (docs/prefill.md)
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
@@ -749,7 +750,16 @@ class Model {
   // Valid until the next DraftRound. Require DflashEnabled().
   void DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const;
   void DflashDebugGatherDraftLogits(std::vector<float>* out);
+  // A digest (FNV-1a 64) of every piece of per-sequence state this Model holds, named: each attention
+  // layer's whole KV cache ("kv.<layer>"), each GDN layer's recurrent and conv state ("gdn.rec.<layer>",
+  // "gdn.conv.<layer>"), the MTP head's KV cache ("mtp.kv") and the DFlash2 drafter's K / V ring over the
+  // injected positions ("dflash.k.<layer>", "dflash.v.<layer>", the first min(injected, 2048) positions).
+  // Synchronizes the stream and copies everything to the host, so it is a test tool: the byte-identity
+  // check that two prefill chunkings left the same state (tests/model/test_prefill_chunk_identity.cpp).
+  std::vector<std::pair<std::string, uint64_t>> DebugStateDigest();
 #endif
+  // 256 when this Model runs 256-row prefill super-chunks (buffers sized for them at load), else 64.
+  int PrefillChunkRows() const { return wide_rows_ > 0 ? kPrefillChunkWide : kPrefillChunkBase; }
 
  private:
   Model() = default;

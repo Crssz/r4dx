@@ -1292,7 +1292,7 @@ r4dx-server --model <container.r4dx> --layout {trellis|w4a16|bf16}
     [--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}]
     [--dflash <draft.r4dx>] [--dflash-k N]
     [--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}]
-    [--image-max-pixels N]
+    [--image-max-pixels N] [--request-log <path>]
     [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
     [--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N]
     [--tp-max-inflight K]
@@ -1321,6 +1321,9 @@ above -- mutually exclusive with `--mtp N>0`.
 follow-up whose replayed reply does not re-tokenize still reuses the prompt before it -- see
 "Prefix cache, image-aware" above. `off` reclaims its VRAM.
 
+`--request-log <path>` (default: off): append one JSON line per request -- token counts and timings
+only -- to `<path>`; see "Request log" below. Omitting the flag changes nothing at all.
+
 `--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated`, same as `r4dx-cli` (its
 `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` are
 byte-identical to the base Qwen3.8-27B's, whose `C:\AI\models\Qwen3.8-27B` was the default until
@@ -1334,6 +1337,88 @@ fewer layers than its (verbatim-copied) `config.json` declares, e.g.
 `--log-level` gates the one-line-per-request log (`debug` also gets extra detail; `info` -- the
 default -- prints exactly the required prompt/generated/prefill/decode-tok/s line; `warn`/`error`
 quiet it down).
+
+## Request log (`--request-log <path>`)
+
+Off by default. With `--request-log D:\logs\r4dx-requests.jsonl` the server appends **one JSON object
+per line** (JSON Lines) for every request it answers, so a few days of real client traffic (an editor
+agent that resends a growing conversation every turn) can be analysed afterwards: how long each
+prompt was, how much of it the prefix cache saved, and what the prefill and decode cost.
+
+```
+r4dx-server --model <container> --layout trellis --request-log D:\logs\r4dx-requests.jsonl
+```
+
+**What is (not) written.** Token counts and timings only. The record type has no field that could
+carry message text, tool definitions or arguments, file contents, a prompt or a completion, and its
+only strings are the server-generated request id, the endpoint name, the finish reason and the
+speculation mode. The file is opened for **append** (created when missing, never truncated, so a
+restart keeps adding to it), UTF-8 **without BOM**, every line ends in a bare `\n`, and each line is
+`fflush`ed, so `Get-Content -Wait` can follow it. If the file cannot be opened the server prints
+`error: cannot open request log '...' for append: <reason>` and exits 1 **before** loading the model.
+A write that fails later (disk full) is counted and warned about once on stderr; it never fails or
+delays a request. One mutex serialises writers (the worker thread and the HTTP threads that reject a
+request before it is queued). Without the flag every log site is a null-pointer test (and an empty
+record on the worker's stack): no file, no clock read, no allocation, and the response bodies, SSE streams, tokens and scheduling are unchanged
+(checked byte for byte below).
+
+**One line per request that got an answer**, written after the client's response was handed off, so
+the line is the request's completion time (`ts`). A request the HTTP layer rejects itself (malformed
+or invalid body, queue full) gets a short line too, with everything the server did not know as
+`null`.
+
+| field | meaning |
+|---|---|
+| `ts` | ISO-8601 local time with UTC offset and milliseconds, when the line was written (`2026-09-30T18:49:08.996+07:00`) |
+| `request_id` | the response's `id` (`chatcmpl-...` / `cmpl-...`); a request rejected before it had one gets a fresh id |
+| `endpoint` | `chat/completions` or `completions` |
+| `stream` | `true` / `false`; `null` when the body never parsed |
+| `http_status` | the status the HTTP response carried. A **streamed** request the engine accepted is always `200`: its headers are out before the engine runs, so an engine failure travels as an SSE error event (see `error_status`) |
+| `error_status` | the status the engine assigned a request it failed (400 bad prompt, 500 internal); `null` on success and for requests rejected before the engine |
+| `finish_reason` | `stop`, `length`, `tool_calls` or `cancelled`; `null` on an error |
+| `cancelled` | the client disconnected before generation finished (streamed requests only: a non-streamed request has no way to see it leave) |
+| `thinking` | the resolved `enable_thinking` (`--think`, or what `reasoning_effort` / `chat_template_kwargs` / ... asked for) |
+| `max_tokens`, `temperature` | as the request resolved them (server defaults filled in) |
+| `tools_present`, `tools_count` | whether the request offered tool definitions, and how many |
+| `image_count` | image content parts in the whole conversation (an earlier turn's image counts again; `image_n` counts only the ones encoded this request) |
+| `prompt_tokens` | `usage.prompt_tokens`: the **whole** rendered prompt in tokens (chat template applied, image tokens included) |
+| `prompt_n` | `timings.prompt_n`, llama.cpp's field: the tokens **actually fed to prefill** this request, i.e. after prefix reuse. Always `prompt_tokens - cached_tokens` |
+| `cached_tokens` | the leading prompt tokens that were **not** prefilled because the model's state already held them: the previous request's tokens, or its prompt checkpoint. The server's responses do not report this (no `prompt_tokens_details.cached_tokens`); llama.cpp's `cache_n` is the same idea |
+| `completion_tokens` | `usage.completion_tokens` (the tokens shown to the client, the reasoning included) |
+| `reasoning_tokens` | `usage.completion_tokens_details.reasoning_tokens`; `null` when thinking was off |
+| `queue_wait_ms` | `Submit()` until the worker picked the request up |
+| `prompt_ms`, `predicted_ms` | `timings.prompt_ms` (time inside prefill calls; **not** the reset/restore/checkpoint-save, the template render or the tokenization) and `timings.predicted_ms` (the decode loop). The log's names for "prefill_ms" / "decode_ms" follow the `timings` object |
+| `prompt_per_second`, `predicted_per_second` | prefill and decode tok/s, computed exactly as `timings` does: `prompt_n / prompt_ms`, `completion_tokens / predicted_ms` (`0` over zero time). `prompt_per_second` is noisy when `prompt_n` is tiny (one small chunk) |
+| `speculative` | the server's mode: `none`, `mtp` or `dflash`; `null` for a request that never reached the engine |
+| `draft_n`, `draft_n_accepted` | `timings.draft_n` / `draft_n_accepted`: drafted and accepted tokens, only when at least one speculative round ran |
+| `full_reset` | prefix reuse gave up: the new prompt did not **strictly extend** the model's state (a different conversation, an edited earlier turn, or a byte-identical repeat) so `Model::Reset()` ran and the whole prompt was prefilled (`cached_tokens` is 0) |
+| `checkpoint_restore` | the prompt-checkpoint path was taken instead (the replayed reply did not re-tokenize to what was generated, but the prompt before it was reused) |
+| `reset_ms`, `restore_ms` | what the reset / the checkpoint restore cost; `null` when it did not happen |
+| `image_n`, `image_ms` | `timings.image_n` / `image_ms`: images this request encoded itself; `null` with none |
+
+`null` means "not known or not applicable", never a fabricated `0`. A first request on a fresh server
+has `full_reset: false` and `cached_tokens: 0` (nothing to reuse, but nothing to reset).
+
+Sample lines (real, 2026-09-30, Huihui trellis mix4.5m, HIP device 1; a follow-up turn that reused 28
+of 51 prompt tokens, a client that dropped mid-stream, and a rejected body):
+
+```
+{"ts":"2026-09-30T18:49:08.996+07:00","request_id":"chatcmpl-d0fca822b15605a5","endpoint":"chat/completions","stream":false,"http_status":200,"error_status":null,"finish_reason":"stop","cancelled":false,"thinking":false,"max_tokens":48,"temperature":0.0,"tools_present":false,"tools_count":0,"image_count":0,"prompt_tokens":51,"prompt_n":23,"cached_tokens":28,"completion_tokens":3,"reasoning_tokens":null,"queue_wait_ms":0.014,"prompt_ms":34.957,"predicted_ms":82.699,"prompt_per_second":657.96,"predicted_per_second":36.28,"speculative":"none","draft_n":null,"draft_n_accepted":null,"full_reset":false,"checkpoint_restore":false,"reset_ms":null,"restore_ms":null,"image_n":null,"image_ms":null}
+{"ts":"2026-09-30T18:49:15.549+07:00","request_id":"chatcmpl-0011378825d6cdd0","endpoint":"chat/completions","stream":true,"http_status":200,"error_status":null,"finish_reason":"cancelled","cancelled":true,"thinking":false,"max_tokens":3000,"temperature":0.0,"tools_present":false,"tools_count":0,"image_count":0,"prompt_tokens":24,"prompt_n":24,"cached_tokens":0,"completion_tokens":145,"reasoning_tokens":null,"queue_wait_ms":0.013,"prompt_ms":34.807,"predicted_ms":4012.23,"prompt_per_second":689.51,"predicted_per_second":36.14,"speculative":"none","draft_n":null,"draft_n_accepted":null,"full_reset":true,"checkpoint_restore":false,"reset_ms":1.221,"restore_ms":null,"image_n":null,"image_ms":null}
+{"ts":"2026-09-30T18:49:11.471+07:00","request_id":"chatcmpl-aeaadde56e208964","endpoint":"chat/completions","stream":null,"http_status":400,"error_status":null,"finish_reason":null,"cancelled":false,"thinking":null,"max_tokens":null,"temperature":null,"tools_present":null,"tools_count":null,"image_count":null,"prompt_tokens":null,"prompt_n":null,"cached_tokens":null,"completion_tokens":null,"reasoning_tokens":null,"queue_wait_ms":null,"prompt_ms":null,"predicted_ms":null,"prompt_per_second":null,"predicted_per_second":null,"speculative":null,"draft_n":null,"draft_n_accepted":null,"full_reset":null,"checkpoint_restore":null,"reset_ms":null,"restore_ms":null,"image_n":null,"image_ms":null}
+```
+
+Reading it with PowerShell: `Get-Content D:\logs\r4dx-requests.jsonl | ForEach-Object { $_ | ConvertFrom-Json } |
+Where-Object endpoint -eq 'chat/completions' | Measure-Object prompt_tokens, prompt_n, cached_tokens -Sum`
+(the cache saving is `sum(cached_tokens) / sum(prompt_tokens)`).
+
+**Measured on the smoke (2026-09-30, `D:\models\r4dx\reqlog\smoke`):** the same 7 greedy requests (plain
+chat, a stream with `include_usage`, `reasoning_effort: "high"`, the two turns of one conversation, a
+`/v1/completions`, a request with a tool) answered by a server started with and without the flag give
+responses identical byte for byte once the random `id`, `created` and the wall-clock `timings` values
+are masked (the masked lengths are equal too); a `--dflash` server's responses match as well. 12
+requests (the 7, a streamed thinking turn, two rejected bodies, a stream the client dropped after 4 s,
+and one request after it) made 12 lines.
 
 ## Tensor parallel (`--tp 2`, docs/tp.md P5)
 
@@ -1391,7 +1476,10 @@ and "Images"), `test_tool_call_parser` (see
 "Tool calls" above -- real-capture and malformed-input cases for the model's surface syntax),
 `test_tool_stream_gate` (the live tool-call stream gate and its "streamed content == non-streamed
 content" property over every chunking of a dozen representative generations),
-`test_reasoning_splitter` (the `</think>` split), `test_engine_recovery` (the engine's error and
+`test_reasoning_splitter` (the `</think>` split), `test_request_log` (the request log's JSON Lines
+formatting and field order, `null` for unknowns, the ISO-8601 stamp, append without BOM or CRLF, an
+unopenable path, a failing stream, concurrent writers; `test_server_args` covers the flag itself; see
+"Request log"), `test_engine_recovery` (the engine's error and
 recovery path through `engine.cpp` itself, against CPU fakes of the tensor-parallel model's state
 machine and of the TP=1 model, where a skipped `Reset()` would silently reuse a failed request's
 state; `CheckpointScenario` and `CheckpointThinkingScenario` drive `--prompt-checkpoint`'s restore
@@ -1401,7 +1489,12 @@ the server's libraries but makes no GPU call, and skips without the tokenizer di
 a scripted CPU fake of the TP=1 model and httplib's own client. It checks every route's
 `charset=utf-8`. It also replays the real `--mtp 3` thinking+tools answer through MTP-shaped rounds
 and through plain decode, and checks that streamed and non-streamed content agree in bytes and as a
-charset-honouring client reads them. Same GPU-free setup and skip as `test_engine_recovery`, except
+charset-honouring client reads them. Its `RequestLogScenario` runs seven requests against a server
+with and without `--request-log`: equal responses (id/created/timings masked), seven lines whose
+token counts equal the responses' own `usage`/`timings`, `cached_tokens > 0` on a follow-up, the two
+rejected bodies logged as 400, and none of the prompt text in the file; `test_engine_recovery`'s
+`RequestLogFaultScenario` checks that a mid-decode fault logs one 500 line and the recovery request
+`full_reset`. Same GPU-free setup and skip as `test_engine_recovery`, except
 that it checks `http_server.h`'s two content-type constants before the skip, so a revert to a bare
 type fails even without the tokenizer).
 `test_openai_types` also covers every image

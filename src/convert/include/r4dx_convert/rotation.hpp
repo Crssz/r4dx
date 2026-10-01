@@ -81,7 +81,10 @@
 //        double (two passes -- "twice is enough" -- so fp64 orthogonality is at the rounding floor),
 //        rounded to fp32, and used as R[c][b] = G[c][b].
 //   3. (q2ab only) rotation.had_down_signs[K_down], rotation.had_o_signs[K_o],
-//      rotation.had_gdn_out_signs[K_gdn_out], top bit as in 1.
+//      rotation.had_gdn_out_signs[K_gdn_out] (skipped when K_gdn_out == 0: Gemma),
+//      rotation.had_o_full_signs[K_o_full] (only when K_o_full > 0: Gemma), top bit as in 1.
+//      mix: for any hidden, block = ChooseRotationBlock(hidden) and nblk = hidden / block; the
+//      tensor is rotation.mix5 when nblk == 5 and rotation.mix otherwise (RotationMixName).
 // q2ab's signs / mix5 are therefore identical to q2a's for the same seed. Every fold here uses the
 // fp32 values exactly as stored, so the runtime (which reads those tensors) and the folded weights
 // agree on Q to the last bit of R; R's fp32 rounding makes Q orthogonal to ~1e-7, far below the
@@ -101,10 +104,24 @@
 namespace r4dx_convert {
 
 inline constexpr uint64_t kDefaultRotationSeed = 0x5EED2025ull;
-inline constexpr int64_t kRotationBlock = 1024;   // Q's Hadamard block (5120 = 5 x 1024)
+inline constexpr int64_t kRotationBlock = 1024;   // Q's Hadamard block cap (5120 = 5 x 1024)
 inline constexpr int64_t kHadBlockDown = 512;     // mlp.down input
 inline constexpr int64_t kHadBlockO = 256;        // attn.o input (one head)
 inline constexpr int64_t kHadBlockGdnOut = 128;   // gdn.out_proj input (one head)
+
+// Q's Hadamard block for a residual of width `hidden`: the largest power of two dividing it, capped
+// at kRotationBlock. 5120 -> 1024 (nblk 5, exactly the Qwen geometry, same bytes as before this
+// function existed); 3840 -> 256 (nblk 15); 768 -> 256 (nblk 3). Throws for hidden <= 0.
+inline int64_t ChooseRotationBlock(int64_t hidden) {
+  if (hidden <= 0)
+    throw std::runtime_error("ChooseRotationBlock: hidden=" + std::to_string(hidden) + " must be positive");
+  const int64_t low_bit = hidden & -hidden;  // largest power of two dividing hidden
+  return std::min(low_bit, kRotationBlock);
+}
+
+// Container tensor name of the nblk x nblk block-mixing matrix R: Qwen's 5-block geometry keeps its
+// historical `rotation.mix5`; every other nblk uses `rotation.mix` (docs/container-format.md).
+inline const char* RotationMixName(int64_t nblk) { return nblk == 5 ? "rotation.mix5" : "rotation.mix"; }
 
 enum class RotationKind { kNone, kQ2a, kQ2ab };
 
@@ -306,6 +323,10 @@ struct RotationShape {
   int64_t k_down = 0, b_down = kHadBlockDown;
   int64_t k_o = 0, b_o = kHadBlockO;
   int64_t k_gdn_out = 0, b_gdn_out = kHadBlockGdnOut;
+  // Gemma 4 has two attention widths: had_o is the SLIDING layers' o_proj (o_swa, K = 4096) and
+  // had_o_full the full layers' (K = 8192). k_o_full == 0 (Qwen) draws nothing for it, and
+  // k_gdn_out == 0 (Gemma has no GDN) likewise, so the Qwen stream is unchanged.
+  int64_t k_o_full = 0, b_o_full = kHadBlockO;
 };
 
 struct RotationSet {
@@ -313,6 +334,7 @@ struct RotationSet {
   uint64_t seed = 0;
   ResidualRotation q;
   BlockHadamard had_down, had_o, had_gdn_out;  // Empty() unless kind == kQ2ab
+  BlockHadamard had_o_full;                     // Empty() unless q2ab with shape.k_o_full > 0
 };
 
 inline RotationSet GenerateRotationSet(RotationKind kind, uint64_t seed, const RotationShape& shape) {
@@ -325,7 +347,10 @@ inline RotationSet GenerateRotationSet(RotationKind kind, uint64_t seed, const R
   if (kind == RotationKind::kQ2ab) {
     set.had_down = GenerateBlockHadamard(state, shape.k_down, shape.b_down);
     set.had_o = GenerateBlockHadamard(state, shape.k_o, shape.b_o);
-    set.had_gdn_out = GenerateBlockHadamard(state, shape.k_gdn_out, shape.b_gdn_out);
+    if (shape.k_gdn_out > 0)
+      set.had_gdn_out = GenerateBlockHadamard(state, shape.k_gdn_out, shape.b_gdn_out);
+    if (shape.k_o_full > 0)
+      set.had_o_full = GenerateBlockHadamard(state, shape.k_o_full, shape.b_o_full);
   }
   return set;
 }
@@ -375,15 +400,18 @@ void ApplyToColumns(float* W, int64_t N, int64_t K, int nthreads, const Op& op) 
 // ---- weight folds ------------------------------------------------------------------------------
 
 // In-projection, W [N, hidden] row-major: every row r -> (r * (1 + norm_w)) Q. norm_w == nullptr
-// folds Q alone (D = I).
+// folds Q alone (D = I). `norm_offset` is the constant in D = diag(norm_offset + w): 1.0 for Qwen's
+// zero-centred norms (the default, bit-identical to before the parameter existed), 0.0 for Gemma's
+// plain `x * rsqrt(..) * w` norms. The same offset goes to CheckNormInvertible, TransformHessianQ and
+// TransformImportanceQ.
 inline void FoldRowsQ(std::vector<float>& W, int64_t N, int64_t K, const float* norm_w,
-                      const ResidualRotation& q, int nthreads) {
+                      const ResidualRotation& q, int nthreads, double norm_offset = 1.0) {
   if (K != q.hidden || W.size() != static_cast<size_t>(N * K))
     throw std::runtime_error("FoldRowsQ: W is [" + std::to_string(N) + ", " + std::to_string(K) +
                              "] but Q is " + std::to_string(q.hidden) + " wide");
   ApplyToRows(W.data(), N, K, nthreads, [&](double* v, double* tmp) {
     if (norm_w) {
-      for (int64_t k = 0; k < K; ++k) v[k] *= 1.0 + static_cast<double>(norm_w[k]);
+      for (int64_t k = 0; k < K; ++k) v[k] *= norm_offset + static_cast<double>(norm_w[k]);
     }
     q.Apply(v, tmp);
   });
@@ -422,11 +450,12 @@ inline constexpr const char* kRmsHessianHint =
 // (a norm weight of exactly -1 zeroes the channel, and no finite H' represents that). `hint`
 // (nullable) is appended to the message.
 inline void CheckNormInvertible(const float* norm_w, int64_t K, const std::string& who,
-                                const char* hint = nullptr) {
+                                const char* hint = nullptr, double norm_offset = 1.0) {
   for (int64_t k = 0; k < K; ++k) {
-    const double d = 1.0 + static_cast<double>(norm_w[k]);
+    const double d = norm_offset + static_cast<double>(norm_w[k]);
     if (!(std::fabs(d) >= 1e-3)) {
-      throw std::runtime_error(who + ": |1 + norm_weight[" + std::to_string(k) + "]| = " +
+      throw std::runtime_error(who + ": |" + (norm_offset == 0.0 ? "" : "1 + ") + "norm_weight[" +
+                               std::to_string(k) + "]| = " +
                                std::to_string(std::fabs(d)) +
                                " < 1e-3 -- the norm cannot be divided out of this linear's Hessian" +
                                (hint ? std::string(" -- ") + hint : std::string()));
@@ -481,16 +510,16 @@ inline void QtHQInPlace(std::vector<float>& H, int64_t K, const double* dinv,
 // In-projection tap, from the captured POST-norm H: H' = Q^T D^-1 H D^-1 Q, D = diag(1 + norm_w)
 // (nullptr: D = I). Refuses a norm with any |1 + w| < 1e-3 (kRmsHessianHint says what to do).
 inline void TransformHessianQ(std::vector<float>& H, int64_t K, const float* norm_w,
-                              const ResidualRotation& q, int nthreads) {
+                              const ResidualRotation& q, int nthreads, double norm_offset = 1.0) {
   if (K != q.hidden || H.size() != static_cast<size_t>(K * K))
     throw std::runtime_error("TransformHessianQ: H is " + std::to_string(K) + "^2 but Q is " +
                              std::to_string(q.hidden) + " wide");
   std::vector<double> dinv;
   if (norm_w) {
-    CheckNormInvertible(norm_w, K, "TransformHessianQ", kRmsHessianHint);
+    CheckNormInvertible(norm_w, K, "TransformHessianQ", kRmsHessianHint, norm_offset);
     dinv.resize(static_cast<size_t>(K));
     for (int64_t k = 0; k < K; ++k)
-      dinv[static_cast<size_t>(k)] = 1.0 / (1.0 + static_cast<double>(norm_w[k]));
+      dinv[static_cast<size_t>(k)] = 1.0 / (norm_offset + static_cast<double>(norm_w[k]));
   }
   rotation_detail::QtHQInPlace(H, K, norm_w ? dinv.data() : nullptr, q, nthreads);
 }
@@ -522,11 +551,11 @@ inline void TransformHessianHadamard(std::vector<float>& H, int64_t K, const Blo
 // ---- importance vectors (the diagonal model, see the header) --------------------------------------
 
 inline std::vector<float> TransformImportanceQ(const float* v, int64_t K, const float* norm_w,
-                                               const ResidualRotation& q) {
+                                               const ResidualRotation& q, double norm_offset = 1.0) {
   if (K != q.hidden)
     throw std::runtime_error("TransformImportanceQ: K=" + std::to_string(K) + " but Q is " +
                              std::to_string(q.hidden) + " wide");
-  if (norm_w) CheckNormInvertible(norm_w, K, "TransformImportanceQ");
+  if (norm_w) CheckNormInvertible(norm_w, K, "TransformImportanceQ", nullptr, norm_offset);
   std::vector<double> block_mean(static_cast<size_t>(q.nblk), 0.0);
   for (int64_t c = 0; c < q.nblk; ++c) {
     double s = 0.0;
@@ -534,7 +563,7 @@ inline std::vector<float> TransformImportanceQ(const float* v, int64_t K, const 
       const int64_t m = c * q.block + i;
       double e = v[m];
       if (norm_w) {
-        const double d = 1.0 + static_cast<double>(norm_w[m]);
+        const double d = norm_offset + static_cast<double>(norm_w[m]);
         e /= d * d;
       }
       s += e;

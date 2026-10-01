@@ -2,7 +2,7 @@
 // CPU reference in rotation_ref.hpp (itself pinned to the contract by test_rotation_ref_cpu):
 //
 //   r4dx_rotate_residual_bf16      x <- x Q and x <- x Q^T, rows 1 / 3 / 7, plus the round trip
-//   r4dx_hadamard_inplace_bf16     gdn.out_proj's input: K 6144 (TP=1) and 3072 (TP=2 rank), B 128
+//   any hidden                      rotate + r4dx_post_rmsnorm_rotate_add_bf16 at 3840 = 15 x 256 (Gemma 4),\n//                                  768, 1280, 4096, 1024, 5120 (Gemma 4 option A, docs/gemma4-plan.md 4.4)\n//   r4dx_hadamard_inplace_bf16     gdn.out_proj's input: K 6144 (TP=1) and 3072 (TP=2 rank), B 128
 //   r4dx_silu_mul_hadamard_bf16    mlp.down's input: intermediate 17408 (TP=1) and 8704 (TP=2
 //                                  rank), B 512, both epilogues (none, f16)
 //
@@ -174,9 +174,13 @@ void TestRotateResidual(std::mt19937_64& rng) {
   }
 
   Check(Throws([&] {
-          r4dx_rotate_residual_bf16(0, 1, 4096, P(d_d.data()), P(R_d.data()), 0, 0);
+          r4dx_rotate_residual_bf16(0, 1, 4099, P(d_d.data()), P(R_d.data()), 0, 0);
         }),
-        "rotate: hidden != 5120 must throw");
+        "rotate: hidden with a block < 2 (odd) must throw");
+  Check(Throws([&] {
+          r4dx_rotate_residual_bf16(0, 1, 64 * 33, P(d_d.data()), P(R_d.data()), 0, 0);
+        }),
+        "rotate: nblk > 32 must throw");
   Check(Throws([&] { r4dx_rotate_residual_bf16(1, 1, kHidden, 0, P(R_d.data()), 0, 0); }),
         "rotate: null signs must throw");
   // rows = 0 is a no-op, not a launch.
@@ -185,6 +189,130 @@ void TestRotateResidual(std::mt19937_64& rng) {
   Check(r4dx_kernel_launch_counter_get() == before, "rotate: rows=0 counted a launch");
 }
 
+// ---- any hidden: Gemma 4's 3840 = 15 x 256 and the other shapes the entry accepts ----------------
+// Both rotate and the fused post-norm kernel, per hidden: values against rotation_ref's fp64
+// reference, row independence (bit-exact), and for the fused one the unfused chain
+// rmsnorm_plain -> rotate -> add as a sanity bound (two extra bf16 roundings).
+void TestAnyHidden(std::mt19937_64& rng) {
+  for (int64_t hidden : {int64_t{3840}, int64_t{768}, int64_t{1280}, int64_t{4096}, int64_t{1024},
+                         int64_t{5120}}) {
+    const int64_t block = rotation_ref::ChooseBlock(hidden);
+    const int nblk = static_cast<int>(hidden / block);
+    const std::string tag = "hidden " + std::to_string(hidden) + " (" + std::to_string(nblk) + " x " +
+                            std::to_string(block) + ")";
+    const std::vector<float> d = rotation_ref::RandomSigns(rng, hidden);
+    const std::vector<float> R = rotation_ref::RandomOrthogonal(rng, nblk);
+    DeviceBuffer<float> d_d(d.size()), R_d(R.size());
+    d_d.CopyFromHost(d);
+    R_d.CopyFromHost(R);
+
+    for (int64_t rows : {1, 4}) {
+      const std::vector<uint16_t> x = RandomResidualBf16(rng, rows, hidden);
+      // rotate Q / Q^T
+      std::vector<uint16_t> fwd;
+      for (int inverse = 0; inverse < 2; ++inverse) {
+        const std::string name = tag + (inverse ? " rotate Q^T" : " rotate Q") + " rows=" + std::to_string(rows);
+        DeviceBuffer<uint16_t> x_d(x.size());
+        x_d.CopyFromHost(x);
+        r4dx_rotate_residual_bf16(P(x_d.data()), rows, hidden, P(d_d.data()), P(R_d.data()), inverse, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const std::vector<uint16_t> got = x_d.CopyToHost();
+        if (!inverse) fwd = got;
+        for (int64_t r = 0; r < rows; ++r) {
+          CheckRowAgainstRef(got, r, hidden,
+                             rotation_ref::ApplyQGeneral(RowToDouble(x, r, hidden), block, d.data(),
+                                                         R.data(), inverse != 0),
+                             name);
+        }
+        DeviceBuffer<uint16_t> y_d(x.size());
+        y_d.CopyFromHost(x);
+        for (int64_t r = 0; r < rows; ++r) {
+          r4dx_rotate_residual_bf16(P(y_d.data() + r * hidden), 1, hidden, P(d_d.data()), P(R_d.data()), inverse, 0);
+        }
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        Check(y_d.CopyToHost() == got, name + ": rows launched one at a time differ from the batch");
+      }
+
+      // fused post-norm + rotate + residual add
+      for (float layer_scale : {1.0f, 0.73f}) {
+        const std::string name = tag + " post_rmsnorm_rotate_add scale=" + std::to_string(layer_scale) +
+                                 " rows=" + std::to_string(rows);
+        const std::vector<uint16_t> resid = RandomResidualBf16(rng, rows, hidden);
+        std::vector<uint16_t> y = RandomResidualBf16(rng, rows, hidden);
+        for (auto& v : y) v = FloatToBf16(Bf16ToFloat(v) * 3.0f);  // sublayer outputs are not unit scale
+        std::vector<uint16_t> w = RandomUniformBf16(rng, static_cast<size_t>(hidden), 0.4f, 1.8f);
+        std::vector<double> wd(static_cast<size_t>(hidden));
+        for (int64_t k = 0; k < hidden; ++k) wd[k] = Bf16ToFloat(w[k]);
+        DeviceBuffer<uint16_t> r_d(resid.size()), y_d(y.size()), w_d(w.size());
+        r_d.CopyFromHost(resid);
+        y_d.CopyFromHost(y);
+        w_d.CopyFromHost(w);
+        const int64_t before = r4dx_kernel_launch_counter_get();
+        r4dx_post_rmsnorm_rotate_add_bf16(P(r_d.data()), P(y_d.data()), P(w_d.data()), P(d_d.data()),
+                                           P(R_d.data()), rows, hidden, 1e-6f, layer_scale, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        Check(r4dx_kernel_launch_counter_get() - before == 1, name + ": launch count != 1");
+        const std::vector<uint16_t> got = r_d.CopyToHost();
+        for (int64_t r = 0; r < rows; ++r) {
+          CheckRowAgainstRef(got, r, hidden,
+                             rotation_ref::PostNormRotateAddRef(RowToDouble(resid, r, hidden),
+                                                                RowToDouble(y, r, hidden), wd, block,
+                                                                d.data(), R.data(), 1e-6, layer_scale),
+                             name);
+        }
+        // row independence
+        DeviceBuffer<uint16_t> r1_d(resid.size());
+        r1_d.CopyFromHost(resid);
+        for (int64_t r = 0; r < rows; ++r) {
+          r4dx_post_rmsnorm_rotate_add_bf16(P(r1_d.data() + r * hidden), P(y_d.data() + r * hidden),
+                                             P(w_d.data()), P(d_d.data()), P(R_d.data()), 1, hidden,
+                                             1e-6f, layer_scale, 0);
+        }
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        Check(r1_d.CopyToHost() == got, name + ": rows launched one at a time differ from the batch");
+
+        // the unfused chain: rmsnorm_plain (bf16 out) -> rotate Q -> host add + scale
+        DeviceBuffer<uint16_t> t_d(y.size());
+        r4dx_rmsnorm_plain_bf16(P(y_d.data()), P(w_d.data()), P(t_d.data()), rows, hidden, 1e-6f, 0, 0);
+        r4dx_rotate_residual_bf16(P(t_d.data()), rows, hidden, P(d_d.data()), P(R_d.data()), 0, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const std::vector<uint16_t> t = t_d.CopyToHost();
+        double num = 0.0, den = 0.0;
+        for (int64_t i = 0; i < rows * hidden; ++i) {
+          const double u = (static_cast<double>(Bf16ToFloat(resid[i])) + Bf16ToFloat(t[i])) * layer_scale;
+          const double f = Bf16ToFloat(got[i]);
+          num += (f - u) * (f - u);
+          den += u * u;
+        }
+        const double rel = std::sqrt(num / den);
+        if (rows == 1) std::printf("  %-52s vs unfused chain rel L2 %.3e\n", name.c_str(), rel);
+        Check(rel < 8e-3, name + ": fused result vs unfused chain rel L2 " + std::to_string(rel));
+      }
+    }
+  }
+
+  // fused kernel preconditions
+  DeviceBuffer<float> d_d(3840), R_d(225);
+  DeviceBuffer<uint16_t> a_d(3840), b_d(3840);
+  Check(Throws([&] {
+          r4dx_post_rmsnorm_rotate_add_bf16(P(a_d.data()), P(a_d.data()), P(b_d.data()), P(d_d.data()),
+                                             P(R_d.data()), 1, 3840, 1e-6f, 1.0f, 0);
+        }),
+        "post_rmsnorm_rotate_add: resid aliasing y must throw");
+  Check(Throws([&] {
+          r4dx_post_rmsnorm_rotate_add_bf16(P(a_d.data()), 0, P(b_d.data()), P(d_d.data()), P(R_d.data()),
+                                             1, 3840, 1e-6f, 1.0f, 0);
+        }),
+        "post_rmsnorm_rotate_add: null y must throw");
+  Check(Throws([&] {
+          r4dx_post_rmsnorm_rotate_add_bf16(P(a_d.data()), P(b_d.data()), P(b_d.data()), P(d_d.data()),
+                                             P(R_d.data()), 1, 3841, 1e-6f, 1.0f, 0);
+        }),
+        "post_rmsnorm_rotate_add: unsupported hidden must throw");
+  const int64_t before = r4dx_kernel_launch_counter_get();
+  r4dx_post_rmsnorm_rotate_add_bf16(0, 0, 0, 0, 0, 0, 3840, 1e-6f, 1.0f, 0);
+  Check(r4dx_kernel_launch_counter_get() == before, "post_rmsnorm_rotate_add: rows=0 counted a launch");
+}
 // ---- r4dx_hadamard_inplace_bf16 ------------------------------------------------------------------
 void TestHadamardInplace(std::mt19937_64& rng) {
   struct Case {
@@ -370,6 +498,8 @@ int main() {
 
   std::printf("r4dx_rotate_residual_bf16\n");
   TestRotateResidual(rng);
+  std::printf("any hidden: rotate + post_rmsnorm_rotate_add\n");
+  TestAnyHidden(rng);
   std::printf("r4dx_hadamard_inplace_bf16\n");
   TestHadamardInplace(rng);
   std::printf("r4dx_silu_mul_hadamard_bf16\n");

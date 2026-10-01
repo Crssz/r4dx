@@ -248,7 +248,7 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
   // replicate. Each q2ab Hadamard sign vector is indexed by the K column of the linear whose input it
   // rotates, so it splits exactly like that linear's K: one row segment of K single-element rows
   // gives rank r [r*K/world, K/world), the range RankCols gives the linear's Cols(K) rule.
-  if (base == "rotation.signs" || base == "rotation.mix5") return Replicate();
+  if (base == "rotation.signs" || base == "rotation.mix5" || base == "rotation.mix") return Replicate();
   if (base == "rotation.had_down_signs") return Rows({global.intermediate_size});  // mlp.down
   if (base == "rotation.had_o_signs") {
     return Rows({global.num_attention_heads * global.head_dim});  // attn.o

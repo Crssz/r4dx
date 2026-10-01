@@ -953,3 +953,44 @@ bf16 bytes, its manifest is imported and verified by `r4dx-convert`), `test_tp_s
   `mlp.down`; `quantize-model --dry-run` (CPU, no encoder) lists the tap groups, Hessian headers and rotation folds.
 - Caveat: `trellis_quant.py`'s source hash is part of its resume key, so Qwen oracle directories written before
   this change are reported stale by a new `quantize-model` run (their manifests still import fine).
+
+## 11. Gemma mix4.5m ranking (branch g4-mix-ranking; decisions 9.12 / 9.13)
+
+**What Qwen does.** `trellis_quant.allocate` is EXL3's `create_q_strategy`: qgroups (q/k/v, gate+up, o, down) start
+at K4 and are promoted to K5 whole, in a fixed order `(min(layer, last-layer), layer, idx)` (edges first, priority
+0 everywhere), until `int(bpw * sum numel)` is spent. It uses no measurement. Qwen's mix4.5m measures 4.5045 bpw
+(4.5 K-bits plus scales and markers).
+
+**What Gemma does.** Same budget, units, floor/next rates and whole-group rule; only the ORDER changes
+(`tools/reference/gemma_mix.py`). A group's score is the numel-weighted mean of `prior x gap`:
+- `gap` = the oracle's Hessian proxy `tr(E H E^T)/tr(W H W^T)` of the K4 run minus the K5 run, per tensor (the
+  manifests already record `proxy`), i.e. the relative error the promotion removes, measured on the ROTATED weights
+  against the rotated Hessians. Without the proxies (`--ranking prior`, or `quantize-model --bpw`) gap = 1.
+- `prior` = layer weight x kind weight. Layer: amplification sites L10/L23/L29/L41 x1.5; full-attention layers
+  x1.25; edge layers 0, 1, 46, 47 x1.5; massive-activation band L9-L40 x1.1. Kind: full-layer `k_proj` x1.5
+  (k_eq_v: its error is both key and value); `down_proj` x1.25 (writes the massive residual channels); the rest 1.
+  Rationale and the evidence files are in the module docstring. These constants are priors, not measurements; the
+  proxy gap varies far more than they do, so they mostly tilt the order (and decide it alone in prior-only mode).
+  Ranking by score is relative-output-error removed per bit, assuming a linear's output energy is proportional to
+  its parameter count (a heuristic; the KL gate on the assembled container is the arbiter, so re-mix with other
+  constants or `--ranking exl3` if the increment misses 0.01).
+
+**Flow (all CPU except the two encoder runs).**
+`tools\gemma\trellis_oracle_gemma.ps1` = rotation file (`r4dx-convert --rotate q2ab --rotation-seed S
+--rotation-out`) -> `quantize-model --arch gemma4_unified --rotation ... --K 4` and `--K 5` (`--hessian-basis
+matched`; GPU, refused without `-Gpu`) -> `trellis_quant.py mix --bpw 4.5 --src K4m --src K5m` (`--ranking
+auto|exl3|prior|gemma`) which writes `weights_override.json` and `mix_ranking.json` (every group, score, final K).
+`tools\gemma\trellis_convert_gemma.ps1` = `r4dx-convert --rotate q2ab --trellis-from <mix> ... --trellis-verify full`,
+pinned to the sha256 of the mix manifest (there is no Gemma weights-override KL run to take it from; the container's
+KL is measured on the container with `kl_report.py --gate gemma-fp32 --base-dir`).
+Qwen is unchanged: `allocate_ranked` returns `allocate` for `qwen3_5`, its manifests keep their old rule text and
+fields, and `trellis_oracle.ps1` / `trellis_convert.ps1` are untouched.
+
+**Budget on the real shapes** (`tests\reference\test_gemma_mix.py`, ctest `reference_gemma_mix`): 328 linears
+(40 sliding x 7 + 8 full x 6), 10,899,947,520 weights, 192 qgroups. Target 4.5 gives exactly 4.500000 K-bits
+average, 50.0% of the weights at K5 (93 of 192 groups in prior-only mode); the K5 fraction is the whole story
+because only K4/K5 occur. Measured size adds ~0.005-0.01 bpw for scales/markers as for Qwen.
+
+**Not done / needs the user.** The K4 and K5 oracle runs (GPU) and therefore the real data-driven mix, its KL
+increment, and the lm_head / kvcalib inputs of the convert script; the runtime Gemma loader for rotated trellis
+(plan 10.2 item 5).

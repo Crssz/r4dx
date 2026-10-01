@@ -202,7 +202,8 @@ void TestTransform(std::mt19937_64& rng) {
   int configs = 0;
   size_t bad_total = 0;
   int64_t subnormals = 0;
-  const int64_t Ks[] = {3072, 5120, 6144, 8704, 17408};
+  // 3840 / 4096 / 8192 / 15360: Gemma 4 12B hidden, o_proj sliding / full, down (docs/gemma4-plan.md 3.7).
+  const int64_t Ks[] = {3072, 5120, 6144, 8704, 17408, 3840, 4096, 8192, 15360};
   const int64_t Ms[] = {1, 3, 8, 16, 17, 64};
   for (int64_t K : Ks) {
     std::vector<std::vector<float>> suh;

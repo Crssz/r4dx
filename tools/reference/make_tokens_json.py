@@ -47,6 +47,22 @@ Usage:
         --file thai_prose_canon=tools\\reference\\kl_corpus\\thai_prose.txt --max-tokens 1024 `
         --out tools\\reference\\kl_corpus\\tokens_thai_canon.json
 
+`--arch gemma4` (docs/gemma4-plan.md M0-7; default `qwen` changes nothing above): tokenizes with the
+Gemma tokenizer dir (`--tokenizer-dir`, default D:\\models\\Huihui-gemma-4-12B-it-abliterated-tok), and
+every segment is `[BOS=2] + text ids` (HF adds no BOS to raw text, so it is explicit here and must
+also be the first token teacher-forced on the r4dx side); `--max-tokens` counts the BOS. The ids are
+checked against both `transformers.AutoTokenizer` and `tokenizers.Tokenizer.from_file` (r4dx's
+reference), which must agree. Recorded in the file: "add_bos": true, "bos_token_id": 2. Never reuse
+the Qwen ids for Gemma. The files used by the plan:
+
+    <gemma venv>\\Scripts\\python.exe tools\\reference\\make_tokens_json.py --arch gemma4 `
+        --corpus-dir tools\\reference\\kl_corpus --max-tokens 1024 `
+        --out tools\\reference\\kl_corpus\\tokens_gemma.json
+    <gemma venv>\\Scripts\\python.exe tools\\reference\\make_tokens_json.py --arch gemma4 `
+        --file python_source_long=tools\\reference\\kl_corpus\\python_source.txt `
+        --file cpp_source_long=tools\\reference\\kl_corpus\\cpp_source.txt --max-tokens 1600 `
+        --out tools\\reference\\kl_corpus\\tokens_gemma_long.json
+
 No GPU, no model weights -- only the tokenizer files under `--model-dir` are read.
 """
 
@@ -78,6 +94,71 @@ def token_ids_sha256(token_ids) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def main_gemma(args) -> int:
+    """`--arch gemma4`: [BOS] + ids from the Gemma tokenizer, cross-checked against tokenizers."""
+    from gemma.common_gemma import GemmaRefTokenizer
+
+    if args.file:
+        sources = []
+        for spec in args.file:
+            if "=" not in spec:
+                raise SystemExit(f"--file expects NAME=PATH, got {spec!r}")
+            name, path = spec.split("=", 1)
+            sources.append((name, Path(path)))
+    else:
+        sources = sorted((p.stem, p) for p in args.corpus_dir.glob("*.txt"))
+    if not sources:
+        raise SystemExit(f"no .txt files found in {args.corpus_dir}")
+    if args.tokenizer != DEFAULT_TOKENIZER_MODE:
+        raise SystemExit("--tokenizer hf-auto is a Qwen legacy mode; --arch gemma4 has one tokenization")
+    if args.out.exists() and not args.force:
+        with open(args.out, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        if old.get("tokenizer_arch") != "gemma4":
+            raise SystemExit(f"[make_tokens] {args.out} is not a gemma4 tokens file; --force to replace it")
+
+    tok = GemmaRefTokenizer(args.tokenizer_dir)
+    print(f"[make_tokens] tokenizer: gemma4 ({tok.describe()}), BOS={tok.bos_id} prepended")
+    max_tokens = args.max_tokens
+    min_tokens = max_tokens if args.min_tokens is None else args.min_tokens
+    segments = []
+    for name, path in sources:
+        text = path.read_text(encoding="utf-8")
+        ids = tok.encode(text)
+        if ids != tok.encode_raw(text):
+            raise SystemExit(f"segment {name!r}: AutoTokenizer and tokenizers.Tokenizer.from_file disagree")
+        if ids and ids[0] == tok.bos_id:
+            raise SystemExit(f"segment {name!r}: the text already starts with BOS; refusing a double BOS")
+        full = len(ids) + 1
+        if full < min_tokens:
+            raise SystemExit(f"segment {name!r} ({path}) tokenizes to {full} tokens with BOS, fewer than "
+                             f"the required minimum {min_tokens}")
+        ids = tok.with_bos(ids)
+        if max_tokens:
+            ids = ids[:max_tokens]
+        segments.append({"name": name, "token_ids": [int(i) for i in ids]})
+        print(f"[make_tokens] {name:<20} {path.name:<20} {full:>6} tokens (incl. BOS) -> {len(ids)} "
+              f"(sha256 {token_ids_sha256(ids)[:16]}...)")
+    doc = {
+        "tokenizer": tok.describe(),
+        "tokenizer_mode": "canonical",
+        "tokenizer_arch": "gemma4",
+        "tokenizer_provenance": tok.provenance(),
+        "autotokenizer_matches_tokenizers_json": True,
+        "add_special_tokens": False,
+        "add_bos": True,
+        "bos_token_id": tok.bos_id,
+        "chat_template": False,
+        "max_tokens": max_tokens,
+        "segments": segments,
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=1)
+    print(f"[make_tokens] wrote {args.out} ({args.out.stat().st_size / 1024:.1f} KiB, {len(segments)} segments)")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR,
@@ -97,7 +178,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="replace an existing --out whose tokenizer mode differs from this run's "
                          "or cannot be determined")
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "kl_corpus" / "tokens.json")
+    ap.add_argument("--arch", choices=("qwen", "gemma4"), default="qwen",
+                    help="gemma4: Gemma tokenizer, BOS=2 prepended to every segment (see the docstring)")
+    ap.add_argument("--tokenizer-dir", type=Path, default=None,
+                    help="--arch gemma4: the assembled tokenizer directory (default "
+                         "gemma.common_gemma.DEFAULT_TOKENIZER_DIR)")
     args = ap.parse_args(argv)
+    if args.arch == "gemma4":
+        return main_gemma(args)
 
     if args.file:
         sources = []

@@ -9,7 +9,7 @@
 //   (a) unrotated: the oracle covers exactly the HF tensors Gemma has (7 on the sliding layer, 6 on the full
 //       layer -- no v_proj, k_eq_v), every `.trellis.w|suh|svh` equals the pair-grid regrid of the oracle's
 //       words / the parts' scales (gate before up for mlp.gate_up), no other layout for a body linear,
-//       __metadata__.quant.trellis, the verify pass 13/13, lm_head written w4a16 (group 32 by rule, with the
+//       __metadata__.quant.trellis, the verify pass 41/41, lm_head written w4a16 (group 32 by rule, with the
 //       bf16 companion) -- also LDLQ'd against a Hessian for the tied head -- and --kv-calib descales per
 //       layer (2 sliding heads, 1 full).
 //   (b) rotated (q2ab, and q2a): `r4dx-convert --rotation-out` writes the exact Q / Hb the container gets
@@ -85,9 +85,11 @@ bool Contains(const std::string& hay, const std::string& needle) { return hay.fi
 
 constexpr int64_t kHidden = 768;  // rotation block 256 x 3
 constexpr int64_t kHeads = 4, kKvS = 2, kKvF = 1;
-constexpr int64_t kHdS = 64, kHdF = 128;
+constexpr int64_t kHdS = 256, kHdF = 512;  // the real head dims: the runtime's per-head 256 Hadamard needs them (rotation_meta.h)
 constexpr int64_t kInter = 512;
 constexpr int64_t kVocab = 64;
+constexpr int kLayers = 6;  // 5 sliding + 1 full (Gemma's 5:1 pattern: GemmaContainer::Inspect needs it)
+constexpr int kFull = 5;   // the full layer
 constexpr int kKb = 4;  // every oracle tensor at K = 4 (32 words per tile)
 
 float Bf16Round(float x) { return r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(x)); }
@@ -109,7 +111,7 @@ struct Ckpt {
 
 std::string L(int i) { return "model.language_model.layers." + std::to_string(i) + "."; }
 
-// Builds the checkpoint's norms / embeddings now; the 13 body weights are filled later (they depend on
+// Builds the checkpoint's norms / embeddings now; the 41 body weights are filled later (they depend on
 // the oracle's reconstruction), so `lins` records their names and shapes.
 Ckpt MakeSkeleton() {
   Ckpt c;
@@ -124,8 +126,8 @@ Ckpt MakeSkeleton() {
     for (auto& x : v) x = Bf16Round(static_cast<float>(mu + sigma * nd(rng)));
     return v;
   };
-  for (int i = 0; i < 2; ++i) {
-    const bool full = i == 1;
+  for (int i = 0; i < kLayers; ++i) {
+    const bool full = i == kFull;
     const int64_t hd = full ? kHdF : kHdS, kv = full ? kKvF : kKvS;
     for (const char* n : {"input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
                           "post_feedforward_layernorm"})
@@ -153,8 +155,8 @@ Ckpt MakeSkeleton() {
               {"text_config",
                {{"model_type", "gemma4_unified_text"},
                 {"hidden_size", kHidden},
-                {"num_hidden_layers", 2},
-                {"layer_types", {"sliding_attention", "full_attention"}},
+                {"num_hidden_layers", kLayers},
+                {"layer_types", {"sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"}},
                 {"num_attention_heads", kHeads},
                 {"num_key_value_heads", kKvS},
                 {"num_global_key_value_heads", kKvF},
@@ -163,7 +165,15 @@ Ckpt MakeSkeleton() {
                 {"intermediate_size", kInter},
                 {"vocab_size", kVocab},
                 {"attention_k_eq_v", true},
-                {"tie_word_embeddings", true}}}};
+                {"tie_word_embeddings", true},
+                {"sliding_window", 8},
+                {"max_position_embeddings", 256},
+                {"rms_norm_eps", 1e-6},
+                {"final_logit_softcapping", 30.0},
+                {"hidden_activation", "gelu_pytorch_tanh"},
+                {"rope_parameters",
+                 {{"sliding_attention", {{"rope_type", "default"}, {"rope_theta", 10000.0}}},
+                  {"full_attention", {{"rope_type", "proportional"}, {"rope_theta", 1000000.0}, {"partial_rotary_factor", 0.25}}}}}}}};
   return c;
 }
 
@@ -324,7 +334,7 @@ FoldSpec SpecFor(const Rot& r, const Ckpt& c, const Lin& l) {
     s.norm = &c.t.at(L(l.layer) + (mlp_in ? "pre_feedforward_layernorm.weight" : "input_layernorm.weight")).second;
   } else if (r.kind == rc::RotationKind::kQ2ab) {
     s.which = 2;
-    s.hb = l.module == "mlp.down_proj" ? &r.set.had_down : (l.layer == 1 ? &r.set.had_o_full : &r.set.had_o);
+    s.hb = l.module == "mlp.down_proj" ? &r.set.had_down : (l.layer == kFull ? &r.set.had_o_full : &r.set.had_o);
   }
   return s;
 }
@@ -430,7 +440,7 @@ void WriteOracle(const Fixture& f, const json& rotation, const std::set<std::str
   std::vector<std::string> hf_all;
   for (const Lin& l : f.ckpt.lins) hf_all.push_back(l.hf);
   for (const auto& e : extra) hf_all.push_back(e);
-  for (int layer = 0; layer < 2; ++layer) {
+  for (int layer = 0; layer < kLayers; ++layer) {
     std::vector<std::tuple<std::string, std::string, std::vector<int64_t>, std::string>> ts;
     std::vector<std::string> in_file;
     for (const std::string& hf : hf_all) {
@@ -476,7 +486,7 @@ void WriteOracle(const Fixture& f, const json& rotation, const std::set<std::str
   json man = {{"format", "r4dx-weights-override"}, {"version", 1}, {"encoding", "trellis-exl3"},
               {"complete", true}, {"missing", json::array()}, {"missing_count", 0},
               {"bpw_target", nullptr}, {"K_uniform", static_cast<double>(kKb)},
-              {"layers_done", {0, 1}}, {"stale_layers", json::array()},
+              {"layers_done", {0, 1, 2, 3, 4, 5}}, {"stale_layers", json::array()},
               {"model_dir", f.ckpt_dir.u8string()}, {"config_sha256", config_sha},
               {"hessian_dir", "(synthetic)"}, {"hessian_manifest_sha256", std::string(64, '2')},
               {"hessian_basis", "matched"}, {"codebook", "mul1"},
@@ -546,7 +556,7 @@ std::string Q(const fs::path& p) { return "\"" + p.u8string() + "\""; }
 void CheckTrellisContainer(const Container& c, const Fixture& f, const std::string& what, bool lm_bf16 = true) {
   std::map<std::string, std::vector<const Lin*>> by_base;
   for (const Lin& l : f.ckpt.lins) by_base[l.base].push_back(&l);
-  Check(by_base.size() == 11, what + ": 11 body bases (6 sliding incl. v, 5 full without v: k_eq_v)");
+  Check(by_base.size() == 35, what + ": 35 body bases (5 sliding x 6 incl. v, 1 full x 5 without v: k_eq_v)");
   bool bytes_ok = true, no_other_layout = true;
   const tr::RingTables& unused = tr::Ring(kKb);
   (void)unused;
@@ -572,7 +582,7 @@ void CheckTrellisContainer(const Container& c, const Fixture& f, const std::stri
   }
   Check(bytes_ok, what + ": every .trellis.w / .suh / .svh is the oracle's regrid / the parts' scales (gate before up)");
   Check(no_other_layout, what + ": no .bf16.w / .w4a16.* next to a trellis linear");
-  Check(!c.Has("text.layers.1.attn.v.trellis.w") && !c.Has("text.layers.1.attn.v.bf16.w"),
+  Check(!c.Has("text.layers.5.attn.v.trellis.w") && !c.Has("text.layers.5.attn.v.bf16.w"),
         what + ": no attn.v on the full layer");
   const json q = c.Meta().at("quant").at("trellis");
   std::set<std::string> in_meta;
@@ -581,11 +591,11 @@ void CheckTrellisContainer(const Container& c, const Fixture& f, const std::stri
   for (const auto& kv : by_base) want_meta.insert(kv.first);
   Check(q.value("format", "") == "r4dx-trellis" && in_meta == want_meta &&
             q.at("linears").at("text.layers.0.mlp.gate_up").at("parts") == json::array({kInter, kInter}),
-        what + ": __metadata__.quant.trellis lists the 11 bases (gate_up with parts [512, 512])");
+        what + ": __metadata__.quant.trellis lists the 35 bases (gate_up with parts [512, 512])");
   const json run = c.Meta().at("r4dx_convert_run").at("trellis");
-  Check(run.value("hf_tensors", 0) == 13 && run.at("verify").value("result", "").rfind("pass 13/13", 0) == 0 &&
+  Check(run.value("hf_tensors", 0) == 41 && run.at("verify").value("result", "").rfind("pass 41/41", 0) == 0 &&
             run.at("verify").value("failed", -1) == 0 && run.at("verify").value("worst", 1.0) <= 1e-4,
-        what + ": the reconstruction check passed 13/13 (worst |rel - rec| / rec <= 1e-4): " +
+        what + ": the reconstruction check passed 41/41 (worst |rel - rec| / rec <= 1e-4): " +
             run.at("verify").value("result", ""));
   // lm_head: the tied head is not a body linear; it stays w4a16 (+ the default bf16 companion).
   Check(c.Has("lm_head.bf16.w") == lm_bf16 && !c.Has("lm_head.trellis.w"),
@@ -593,7 +603,11 @@ void CheckTrellisContainer(const Container& c, const Fixture& f, const std::stri
 }
 
 void TestAll() {
-  const fs::path root = fs::temp_directory_path() / "r4dx_test_gemma_trellis";
+  // R4DX_GEMMA_TRELLIS_KEEP=<dir>: build under <dir>/r4dx_test_gemma_trellis and keep it, so test_gemma_container
+  // (docs/gemma4-plan.md M1-31) can Inspect the real rot-q2ab.r4dx / rot-q2a.r4dx this test converts.
+  const char* keep_env = std::getenv("R4DX_GEMMA_TRELLIS_KEEP");
+  const bool keep = keep_env != nullptr && *keep_env != '\0';
+  const fs::path root = (keep ? fs::path(keep_env) : fs::temp_directory_path()) / "r4dx_test_gemma_trellis";
   std::error_code ec;
   fs::remove_all(root, ec);
   fs::create_directories(root);
@@ -615,8 +629,9 @@ void TestAll() {
   WriteOracle(fa, nullptr);
   {
     // --kv-calib: per-layer head counts (2 sliding, 1 full). lm_head: LDLQ at group 32 against a Hessian.
-    json calib = {{"0", {{"k_amax", {4.48, 8.96}}, {"v_amax", {44.8, 89.6}}}},
-                  {"1", {{"k_amax", {13.44}}, {"v_amax", {22.4}}}}};
+    json calib = json::object();
+    for (int i = 0; i < kFull; ++i) calib[std::to_string(i)] = {{"k_amax", {4.48, 8.96}}, {"v_amax", {44.8, 89.6}}};
+    calib[std::to_string(kFull)] = {{"k_amax", {13.44}}, {"v_amax", {22.4}}};
     WriteWhole(root / "kvcalib.json", calib.dump());
     fs::create_directories(root / "hess");
     {
@@ -672,11 +687,11 @@ void TestAll() {
       };
       Check(approx(c.Floats("text.layers.0.attn.k_descale"), {4.48f / 448.0f, 8.96f / 448.0f}) &&
                 approx(c.Floats("text.layers.0.attn.v_descale"), {44.8f / 448.0f, 89.6f / 448.0f}) &&
-                approx(c.Floats("text.layers.1.attn.k_descale"), {13.44f / 448.0f}) &&
-                approx(c.Floats("text.layers.1.attn.v_descale"), {22.4f / 448.0f}),
+                approx(c.Floats("text.layers.5.attn.k_descale"), {13.44f / 448.0f}) &&
+                approx(c.Floats("text.layers.5.attn.v_descale"), {22.4f / 448.0f}),
             "plain: --kv-calib k/v descale per layer (2 sliding heads, 1 full)");
       Check(c.Floats("text.layers.0.layer_scalar") == std::vector<float>({0.375f}), "plain: layer_scalar widened");
-      Check(c.Has("text.layers.1.input_layernorm") && !c.Has("text.layers.1.input_layernorm.rotated"),
+      Check(c.Has("text.layers.5.input_layernorm") && !c.Has("text.layers.5.input_layernorm.rotated"),
             "plain: norms stored raw, not folded");
     }
   }
@@ -733,7 +748,7 @@ void TestAll() {
         tensors_same = tensors_same && c.Floats("rotation.had_o_full_signs") == r.set.had_o_full.signs;
       Check(tensors_same, "rotated " + tag + ": the container's rotation tensors are the --rotation-out ones");
       Check(c.Has("text.layers.0.input_layernorm.rotated") && !c.Has("text.layers.0.input_layernorm") &&
-                c.Has("text.layers.1.pre_feedforward_layernorm.rotated") && c.Has("text.layers.0.post_attention_layernorm"),
+                c.Has("text.layers.5.pre_feedforward_layernorm.rotated") && c.Has("text.layers.0.post_attention_layernorm"),
             "rotated " + tag + ": folded norms stored as ones under .rotated; the post-norms (not folded) stay");
     }
 
@@ -777,20 +792,20 @@ void TestAll() {
     const Fixture fx = MakeFixture(root, "vproj", none);
     // A manifest that lists a v_proj of the FULL layer: the checkpoint has none, so the entry is unused (a
     // warning), never imported as a body linear.
-    WriteOracle(fx, nullptr, {}, {L(1) + "self_attn.v_proj.weight"});
+    WriteOracle(fx, nullptr, {}, {L(kFull) + "self_attn.v_proj.weight"});
     const fs::path out = root / "vproj.r4dx";
     const int rcode = convert(fx, out, "--trellis-from " + Q(fx.oracle_dir));
     Check(rcode == 0 && Contains(log_text(), "not used by this conversion") && Contains(log_text(), "self_attn.v_proj"),
           "a manifest entry for the full layer's v_proj (k_eq_v) is reported unused, not imported");
     const Container c = ReadContainer(out);
-    Check(c.ok && !c.Has("text.layers.1.attn.v.trellis.w"), "no attn.v is written for the full layer");
+    Check(c.ok && !c.Has("text.layers.5.attn.v.trellis.w"), "no attn.v is written for the full layer");
   }
   {
     const Fixture fx = MakeFixture(root, "missing", none);
-    WriteOracle(fx, nullptr, {L(1) + "self_attn.k_proj.weight"});
+    WriteOracle(fx, nullptr, {L(kFull) + "self_attn.k_proj.weight"});
     const fs::path out = root / "missing.r4dx";
     const int rcode = convert(fx, out, "--trellis-from " + Q(fx.oracle_dir));
-    Check(rcode != 0 && Contains(log_text(), "not (fully) covered") && Contains(log_text(), "text.layers.1.attn.k") && no_output(out),
+    Check(rcode != 0 && Contains(log_text(), "not (fully) covered") && Contains(log_text(), "text.layers.5.attn.k") && no_output(out),
           "a missing Gemma body linear (full layer's k_proj) is refused before an output exists");
   }
   {
@@ -802,7 +817,7 @@ void TestAll() {
     const int rc2 = Run("--input " + Q(fa.ckpt_dir) + " --output " + Q(root / "y.r4dx") + " --rotate q2ab --rotation-out " + Q(root / "x.safetensors"), log);
     Check(rc2 != 0 && Contains(log_text(), "--rotation-out takes --input and --rotate only"), "--rotation-out with --output is refused");
   }
-  fs::remove_all(root, ec);
+  if (!keep) fs::remove_all(root, ec);
 }
 
 #endif  // R4DX_CONVERT_EXE

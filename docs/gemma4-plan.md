@@ -755,7 +755,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
 | M1-23/26/27/28 pipeline | CPU-verified, GPU pending | section 11: 	ools\gemma\trellis_pipeline.ps1 (kvcalib, merge, hessian, oracle-k4/k5, mix, convert, gate), gemma\kv_calibrate_full.py, gen_samples.py --merge hardened, Gemma proxy-gain mix ranking; waits for shard 0 |
-| M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader accepting rotated trellis containers and the GPU tests are open |
+| M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader now accepts rotated trellis containers (`CheckTrellisChoice(..., allow_rotated=true)`; `test_gemma_container` part (d) Inspects the real rot-q2ab / rot-q2a containers of `convert_gemma_trellis`); default KV is bf16; the GPU test `gemma_rot_trellis` (`tests/model/test_gemma_rot_trellis.cpp`) is written, NOT run |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
 | M1-33..M1-36 | pending | |
 
@@ -932,7 +932,7 @@ source of truth of Q.**
    `__metadata__.rotation` (`out_fold: had_only`), exactly as a w4a16 rotated container does.
 5. **Runtime:** the Qwen loader refuses trellis with rotation; the Gemma loader (M1-19) must accept the pair
    (the trellis kernel's own RHT runs on the already-rotated activation, which is exact) and the M1-31 entry /
-   exit ops apply. Not done here (no GPU, no loader yet).
+   exit ops apply. Done in M1-31: the loader accepts the pair; the embedding (tied, bf16, original basis) is gathered then rotated at entry, the exit un-rotation precedes the final norm so lm_head (w4a16 g32) stays in the original basis; a rotated trellis `mlp.down` skips the fused gelu-mul producer when the Hadamard is on (q2ab), q2a keeps it. GPU verification pending (`gemma_rot_trellis`).
 
 Tests: `convert_gemma_trellis` (all C++, CPU: plain, q2ab, q2a, every refusal), `reference_arch_gemma` (the
 Python oracle against the converter end to end on a tiny checkpoint: its fold equals the converter's folded

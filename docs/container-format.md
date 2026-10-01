@@ -587,7 +587,7 @@ The runtime applies `H_K(suh * x)` as the GEMM's input transform (f16, times `2^
 not instantiate; a `linears` field other than `bits`, `parts`, `prescale_log2`; a `.trellis.*`
 tensor without a `linears` entry (or in a container without the block) and an entry without its
 three tensors; byte sizes other than `N*K*bits/8`, `P*K*2`, `N*2`; any `K`, part or `N` (and, under
-TP, any rank range) not a multiple of 128; `rotation` together with `trellis`; a `verify` record
+TP, any rank range) not a multiple of 128; `rotation` together with `trellis` (a Qwen container; a gemma4_unified one may carry both, docs/gemma4-plan.md 10.2); a `verify` record
 that is missing or does not pass; and **any `--layout` other than `trellis`** on such a container
 (and `--layout trellis` on one without the block). A trellis `--lm-head`/MTP-head layout request is
 mapped to w4a16. A binary that predates the format finds neither `.w4a16.*` nor `.bf16.w` for a body

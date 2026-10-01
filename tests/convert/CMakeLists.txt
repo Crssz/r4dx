@@ -72,7 +72,9 @@ if(TARGET r4dx-convert)
   add_dependencies(convert_gemma_trellis r4dx-convert)
 endif()
 add_test(NAME convert_gemma_trellis COMMAND convert_gemma_trellis)
-set_tests_properties(convert_gemma_trellis PROPERTIES SKIP_RETURN_CODE 77)
+# Keeps its converted containers under the build tree for test_gemma_container (M1-31, rotated trellis Inspect).
+set_tests_properties(convert_gemma_trellis PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP gemma_trellis_containers
+  ENVIRONMENT "R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep")
 
 add_executable(convert_rotation test_rotation.cpp)
 target_link_libraries(convert_rotation PRIVATE r4dx_convert)

@@ -97,8 +97,10 @@ struct LinearLoadMeta {
 };
 
 // docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body layout.
+// `allow_rotated`: the Gemma loader accepts trellis + __metadata__.rotation (option A, docs/gemma4-plan.md 10.2);
+// Qwen's refuses the pair (docs/trellis-kernel.md 3.4).
 void CheckTrellisChoice(const std::optional<TrellisSpec>& trellis, bool rotated, Layout layout,
-                        const std::string& path);
+                        const std::string& path, bool allow_rotated = false);
 // Every `.trellis.*` tensor belongs to a `linears` entry and every entry has its three tensors.
 void CheckTrellisTensors(const SafetensorsReader& r, const std::optional<TrellisSpec>& trellis,
                          const std::string& path);

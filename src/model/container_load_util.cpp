@@ -53,8 +53,8 @@ W4a16LoadGroups CheckQuantGroups(const nlohmann::json& metadata, const std::stri
 // docs/trellis-kernel.md 2.5, the refusals that need only the metadata and the requested body
 // layout -- run by both loaders right after the parse, before any upload.
 void CheckTrellisChoice(const std::optional<TrellisSpec>& trellis, bool rotated, Layout layout,
-                        const std::string& path) {
-  if (trellis && rotated) {
+                        const std::string& path, bool allow_rotated) {
+  if (trellis && rotated && !allow_rotated) {
     throw std::runtime_error("r4dx::model::Container: " + path +
                              " carries both __metadata__.rotation and __metadata__.quant.trellis; "
                              "the two are mutually exclusive (docs/trellis-kernel.md 3.4)");

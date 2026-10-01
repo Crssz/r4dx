@@ -18,7 +18,8 @@
 // x Q after the scaled embedding gather, the fused r4dx_post_rmsnorm_rotate_add_bf16 for both post-norm
 // residual adds, the Hadamard on the o_proj / down_proj inputs, x Q^T before the final norm (and on captures).
 //
-// KV: fp8 e4m3 with the container's static descales for every layer (default); GemmaKvMode::kBf16Full keeps
+// KV: bf16 by default (R4DX_GEMMA_KV unset); GemmaKvMode::kFp8 (R4DX_GEMMA_KV=fp8) is fp8 e4m3 with the container's
+// static descales for every layer; GemmaKvMode::kBf16Full keeps
 // the 8 full layers bf16 (docs/gemma4-plan.md section 9.5, the fallback if the fp8 KL gate fails); kBf16 is the
 // all-bf16 reference run. Sliding layers share ONE block table and each owns a ring of 1536 tokens.
 //
@@ -58,7 +59,7 @@ struct GemmaModelOptions {
   int64_t layer_limit = -1;     // tiny fixtures
   int64_t max_ctx = 0;          // <= 0: the config's max_position_embeddings (131072)
   bool allow_extended_ctx = false;  // opt-in to 262144
-  GemmaKvMode kv = GemmaKvMode::kFp8;
+  GemmaKvMode kv = GemmaKvMode::kBf16;  // default bf16 (fp8 only when R4DX_GEMMA_KV=fp8, docs/gemma4-plan.md 9)
   attention::GemmaAttnBackend attn = attention::GemmaAttnBackend::kReference;
   int prefill_chunk = 256;      // rows per prefill chunk (<= 256: the ring holds window + 288)
   GemmaResid resid = GemmaResid::kFp32;

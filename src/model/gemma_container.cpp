@@ -42,7 +42,8 @@ GemmaContainer GemmaContainer::Load(const std::string& path, const GemmaLoadOpti
   meta.w4a16 = CheckQuantGroups(metadata, path, o.layout, o.lm_head_layout, Layout::kBf16);
   meta.path = path;
   meta.trellis = ParseTrellisMetadata(metadata, path);
-  CheckTrellisChoice(meta.trellis, c.info_.rotation.has_value(), o.layout, path);
+  CheckTrellisChoice(meta.trellis, c.info_.rotation.has_value(), o.layout, path,
+                     /*allow_rotated=*/true);
 
   SafetensorsReader reader(Utf8ToWide(path));
   CheckW4a16GroupTensors(reader, meta.w4a16.groups, path);

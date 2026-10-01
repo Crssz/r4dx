@@ -127,6 +127,11 @@ target_link_libraries(tool_sampled_bench PRIVATE r4dx_model r4dx_convert r4dx_co
 # tool_vocab_calib / tool_dflash_probe / tool_sampled_bench above. The contract IS asserted, on the
 # 4-layer container, by test_teacher_forced_logprobs in R4DX_MODEL_TESTS above -- both drive the
 # same pass (tests/model/teacher_forced.h), so the tool's numbers are the ones ctest checks.
+# test_tf_truncate: CPU-only (no GPU/container) check that --max-tokens' truncation + sha256 agree with
+# kl_report.py's raw truncation.
+add_executable(test_tf_truncate test_tf_truncate.cpp)
+target_link_libraries(test_tf_truncate PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME test_tf_truncate COMMAND test_tf_truncate)
 add_executable(tool_teacher_forced_logprobs tool_teacher_forced_logprobs.cpp)
 target_link_libraries(tool_teacher_forced_logprobs PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 

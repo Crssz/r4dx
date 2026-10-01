@@ -26,6 +26,7 @@
 #include "container.h"  // MlpWeights, RotationWeights
 #include "gemma_config.h"
 #include "gemma_container_info.h"
+#include "gemma_vision_embedder.h"
 #include "quant_linear.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "trellis_meta.h"
@@ -50,12 +51,17 @@ struct GemmaLayerWeights {
   float layer_scalar = 1.0f;  // applied once, after the MLP residual add
 };
 
+// Vision embedder (docs/gemma4-plan.md M2): kAuto loads the vision.* tensors iff the container carries them,
+// kOn requires them (throws when absent), kOff never reads them (~0.1 GB of VRAM saved).
+enum class GemmaVisionLoad { kOff, kAuto, kOn };
+
 struct GemmaLoadOptions {
   Layout layout = Layout::kBf16;          // body linears (trellis needs a trellis container)
   Layout lm_head_layout = Layout::kBf16;  // a trellis body's head loads as w4a16 / bf16
   int64_t layer_limit = -1;               // >= 0: load layers [0, layer_limit) (tiny fixtures)
   int tp_world = 1;                       // 1 or 2 (docs/gemma4-plan.md M1b-1)
   int tp_rank = 0;
+  GemmaVisionLoad vision = GemmaVisionLoad::kOff;
 };
 
 class GemmaContainer {
@@ -85,6 +91,8 @@ class GemmaContainer {
   const core::DeviceBuffer<uint16_t>& FinalNorm() const { return final_norm_; }
   const QuantLinear& LmHead() const { return lm_head_; }
 
+  bool HasVision() const { return vision_.has_value(); }
+  const GemmaVisionWeights& Vision() const { return vision_.value(); }
   bool HasRotation() const { return rotation_.has_value(); }
   const RotationWeights& Rotation() const { return rotation_.value(); }
   bool HasTrellis() const { return trellis_.has_value(); }
@@ -103,6 +111,7 @@ class GemmaContainer {
   QuantLinear lm_head_;
   std::vector<GemmaLayerWeights> layers_;
   std::optional<RotationWeights> rotation_;
+  std::optional<GemmaVisionWeights> vision_;
   std::optional<TrellisSpec> trellis_;
   core::DeviceBuffer<uint32_t> trellis_tickets_;
 };

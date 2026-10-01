@@ -7,8 +7,11 @@
 #include <stdexcept>
 #include <string>
 
+#include <chrono>
+
 #include "gemma_tp_model.h"
 #include "model.h"  // ModelOptions
+#include "vision_tower.h"  // vision::VisionEncodeStats
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 
@@ -28,17 +31,23 @@ std::vector<VramReport> GemmaLocalTextModel::Vram() const {
   return {r};
 }
 
-void GemmaLocalTextModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
-                                       vision::VisionEncodeStats*) {
-  throw std::runtime_error("GemmaLocalTextModel::EncodeImages: Gemma 4 vision is not implemented yet (docs/gemma4-plan.md M2)");
+void GemmaLocalTextModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                       const std::vector<vision::GridThw>& grids, ImageRows* out,
+                                       vision::VisionEncodeStats* stats) {
+  const auto t0 = std::chrono::steady_clock::now();
+  m_.EncodeImages(pixel_values, total_patches, grids, &out->dev);
+  out->SetFilled(/*on_host=*/false, total_patches);
+  if (stats != nullptr) {
+    stats->total_patches = total_patches;
+    stats->merged_tokens = total_patches;
+    stats->num_segments = static_cast<int64_t>(grids.size());
+    stats->encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  }
 }
 
 std::vector<float> GemmaLocalTextModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                                           const std::vector<ImageSpan>& images) {
-  if (!images.empty()) {
-    throw std::runtime_error("GemmaLocalTextModel::PrefillMultimodal: Gemma 4 vision is not implemented yet (M2)");
-  }
-  return m_.Prefill(token_ids);
+  return m_.PrefillMultimodal(token_ids, images);  // empty `images` is Prefill()
 }
 
 std::vector<uint16_t> GemmaLocalTextModel::EncodeAudio(const float* frames, int64_t n) {
@@ -85,6 +94,11 @@ GemmaModelOptions MakeGemmaModelOptions(const ModelOptions& opts) {
   g.layout = opts.layout;
   g.layer_limit = opts.layer_limit;
   g.prompt_checkpoint = opts.prompt_checkpoint;
+  // --vision auto|on|off (docs/gemma4-plan.md M2): the encoder-free embedder's ~0.1 GB of vision.* tensors, from a
+  // container converted with `r4dx-convert --vision on`; `on` requires them, `auto` loads them when present.
+  g.vision = opts.vision == ModelOptions::VisionMode::kOn    ? GemmaVisionLoad::kOn
+             : opts.vision == ModelOptions::VisionMode::kOff ? GemmaVisionLoad::kOff
+                                                             : GemmaVisionLoad::kAuto;
   const char* ext = std::getenv("R4DX_GEMMA_EXTENDED_CTX");
   g.allow_extended_ctx = ext != nullptr && std::string(ext) == "1";
   const ModelOptions defaults;

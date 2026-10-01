@@ -11,6 +11,7 @@
 add_library(r4dx_vision STATIC
   image_decode.cpp
   preprocess.cpp
+  gemma_vision.cpp
   position_ids.cpp
   vision_index.cpp
 )

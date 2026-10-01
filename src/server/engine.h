@@ -78,6 +78,9 @@ struct EngineOptions {
   // checkpoint's own preprocessor_config.json ceiling; r4dx::vision::MakeImageProcessorConfig
   // turns it into the ImageProcessorConfig the decode path uses.
   int64_t image_max_pixels = 1048576;
+  // Gemma 4 only (--image-soft-tokens): the Gemma4UnifiedImageProcessor budget, soft tokens per image (70 | 140 |
+  // 280; an image is one <= 288-row prefill chunk). Ignored by Qwen.
+  int image_soft_tokens = 280;
   // `--request-log <path>` (docs/server.md "Request log"): null (the default, and always unless the
   // flag was given) = off -- every log site in Engine/HttpServer is then one pointer test and nothing
   // else runs. Shared with HttpServer (via Engine::GetRequestLog) for the requests it rejects before

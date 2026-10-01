@@ -262,6 +262,15 @@ add_executable(test_gemma_audio test_gemma_audio.cpp)
 target_link_libraries(test_gemma_audio PRIVATE r4dx_model r4dx_audio r4dx_convert r4dx_core r4d_core)
 add_test(NAME gemma_audio COMMAND test_gemma_audio)
 set_tests_properties(gemma_audio PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+# test_gemma_vision_gpu (docs/gemma4-plan.md M2-3): the Gemma 4 vision path on an UNROTATED bf16 container converted with
+# `r4dx-convert --vision on` (R4DX_GEMMA_VISION_CONTAINER) against tools/reference/gemma/vision_golden_gemma.py's golden
+# (R4DX_GEMMA_VISION_GOLDEN): the embedder, layers 0 / 5 with an image block, and the multimodal prefill. NOT RUN by its
+# author (GPU). SKIP 77 while the container or the golden is missing. ctest -R gemma_vision_gpu.
+add_executable(test_gemma_vision_gpu test_gemma_vision_gpu.cpp)
+target_link_libraries(test_gemma_vision_gpu PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_vision_gpu PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME gemma_vision_gpu COMMAND test_gemma_vision_gpu)
+set_tests_properties(gemma_vision_gpu PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
 # test_gemma_rot_trellis (docs/gemma4-plan.md M1-31): GemmaModel on the rotated trellis containers convert_gemma_trellis
 # keeps (R4DX_GEMMA_TRELLIS_KEEP), against the same checkpoint unrotated bf16 (converted here by r4dx-convert): the

@@ -129,6 +129,8 @@ struct ServerArgs {
   // src/cli/cli_args.h's --image-max-pixels: an image above this is DOWNSIZED via the reference's
   // own smart_resize rule rather than rejected. 0 means the checkpoint's own 16777216 ceiling.
   int64_t image_max_pixels = 1048576;
+  // Gemma 4 (docs/gemma4-plan.md M2): soft tokens per image, 70 | 140 | 280. Ignored for Qwen.
+  int64_t image_soft_tokens = 280;
 
   // ---- tensor parallel (docs/tp.md 9.1) -----------------------------------------------------------
   // The same flags, defaults, ranges and usage errors as src/cli/cli_args.h's --tp* (the two headers
@@ -169,7 +171,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
-         "[--image-max-pixels N] [--request-log <path>] "
+         "[--image-max-pixels N] [--image-soft-tokens {70|140|280}] [--request-log <path>] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K]";
@@ -269,6 +271,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--dflash-n-min") a.dflash_n_min = ServerParseI64("--dflash-n-min", NextServerArg(argc, argv, i, "--dflash-n-min"));
     else if (arg == "--vision") a.vision = NextServerArg(argc, argv, i, "--vision");
     else if (arg == "--image-max-pixels") a.image_max_pixels = ServerParseI64("--image-max-pixels", NextServerArg(argc, argv, i, "--image-max-pixels"));
+    else if (arg == "--image-soft-tokens") a.image_soft_tokens = ServerParseI64("--image-soft-tokens", NextServerArg(argc, argv, i, "--image-soft-tokens"));
     else if (arg == "--tp") a.tp = ServerParseInt("--tp", NextServerArg(argc, argv, i, "--tp"));
     else if (arg == "--tp-mode") { a.tp_mode = NextServerArg(argc, argv, i, "--tp-mode"); a.tp_options_given = true; }
     else if (arg == "--tp-devices") { a.tp_devices = ParseServerTpDevices(NextServerArg(argc, argv, i, "--tp-devices")); a.tp_options_given = true; }
@@ -315,6 +318,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   }
   if (a.vision != "auto" && a.vision != "on" && a.vision != "off") {
     throw ServerUsageError("--vision must be 'auto', 'on' or 'off'");
+  }
+  if (a.image_soft_tokens != 70 && a.image_soft_tokens != 140 && a.image_soft_tokens != 280) {
+    throw ServerUsageError("--image-soft-tokens must be 70, 140 or 280 (Gemma 4: an image is one 288-row chunk)");
   }
   if (a.image_max_pixels != 0 && a.image_max_pixels < 1024) {
     throw ServerUsageError("--image-max-pixels must be 0 (the checkpoint's own ceiling) or >= 1024");

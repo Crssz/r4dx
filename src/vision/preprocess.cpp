@@ -1,5 +1,7 @@
 #include "preprocess.h"
 
+#include "gemma_vision.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -278,8 +280,23 @@ ImageProcessorConfig MakeImageProcessorConfig(int64_t image_max_pixels) {
 PreprocessedImages PreprocessImages(const std::vector<DecodedImage>& images,
                                      const ImageProcessorConfig& cfg) {
   PreprocessedImages out;
-  out.patch_dim = cfg.PatchDim();
   out.grid_thw.reserve(images.size());
+  if (cfg.gemma) {
+    GemmaImageConfig gc;
+    gc.max_soft_tokens = cfg.gemma_soft_tokens;
+    out.patch_dim = gc.PatchDim();
+    for (const DecodedImage& img : images) {
+      const GemmaPreprocessed g = PreprocessGemmaImage(img, gc);
+      out.pixel_values.insert(out.pixel_values.end(), g.pixel_values.begin(), g.pixel_values.end());
+      GridThw grid;
+      grid.t = 1;
+      grid.h = g.grid_h;
+      grid.w = g.grid_w;
+      out.grid_thw.push_back(grid);
+    }
+    return out;
+  }
+  out.patch_dim = cfg.PatchDim();
   for (const DecodedImage& img : images) {
     if (img.rgb.size() != img.PixelCount() * 3) {
       throw std::runtime_error("PreprocessImages: DecodedImage buffer size does not match w*h*3");

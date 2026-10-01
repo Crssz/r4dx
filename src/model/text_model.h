@@ -92,6 +92,11 @@ class TextModel {
   virtual int64_t ImageTokenId() const = 0;
   virtual int64_t VisionMergeSize() const = 0;  // vision_config.spatial_merge_size, 2 if no vision
   virtual bool HasVision() const = 0;
+  // Gemma 4 wraps every image's soft tokens as <|image> (boi) ... <image|> (eoi); the server then expands one
+  // chat-template placeholder into boi + N x ImageTokenId + eoi (src/vision/gemma_vision.h). -1 = no wrapper
+  // (Qwen: its template emits the vision_start / vision_end tokens itself).
+  virtual int64_t ImageBoiTokenId() const { return -1; }
+  virtual int64_t ImageEoiTokenId() const { return -1; }
   virtual bool MtpEnabled() const = 0;
   virtual bool MtpUsingReducedVocabDraft() const = 0;
   virtual bool DflashEnabled() const = 0;

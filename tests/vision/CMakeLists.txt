@@ -57,3 +57,16 @@ add_executable(tool_vision_chat tool_vision_chat.cpp)
 target_include_directories(tool_vision_chat PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(tool_vision_chat PRIVATE r4dx_model r4dx_vision_tower r4dx_tokenizer
                                                 r4dx_convert r4dx_core)
+
+# Gemma 4 vision (docs/gemma4-plan.md M2), host side. Link r4dx_vision ONLY (no r4dx_core / r4dx_convert), so
+# they build without the hipcc-compiled r4d_core and run on a machine with no GPU. The two *_golden tests read
+# tools/reference/gemma/vision_{preproc,embedder}_golden.py's output and exit 77 (SKIPPED) when it is absent;
+# test_gemma_vision_cpu also compares masks with vision_masks_golden.py's output when present.
+foreach(t test_gemma_vision_cpu test_gemma_preprocess_golden test_gemma_embedder_golden)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_vision)
+  target_compile_definitions(${t} PRIVATE
+    R4DX_GEMMA_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/gemma")
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()

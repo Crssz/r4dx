@@ -1321,6 +1321,16 @@ part is now decoded/preprocessed with (`ParseChatCompletionRequest`, see "Images
 request against a server started with `--vision off`, or against a container with no `vision.*`
 tensors at all, still gets a clean `400` naming that reason.
 
+**Gemma 4** (`gemma4_unified`, docs/gemma4-plan.md M2): the same `image_url` data-URI content parts and
+`--vision` flag, but the "tower" is the encoder-free embedder (10 `vision.*` tensors, ~0.1 GB, from a
+container converted with `r4dx-convert --vision on`; `auto` loads them iff present). `--image-max-pixels` is
+ignored; `--image-soft-tokens {70|140|280}` (default 280) is the Gemma4UnifiedImageProcessor budget: an image
+is resized (grown or shrunk) to the largest multiple-of-48 size with at most that many 48x48 patches, and each
+patch is one soft token. The chat template's single `<|image|>` per image is expanded to `<|image>` + N x
+`<|image|>` + `<image|>`. Prefill feeds an image as one chunk of up to 288 rows; inside it the sliding layers
+attend bidirectionally (full layers and decode stay causal). 560 / 1120 soft tokens are refused (a block must
+fit one chunk and the sliding ring). Not GPU-validated yet: see the M2 notes in docs/gemma4-plan.md.
+
 `--dflash <draft.r4dx>` (default empty, disabled): see the "New (Milestone 5 stage S3...)" note
 above -- mutually exclusive with `--mtp N>0`.
 

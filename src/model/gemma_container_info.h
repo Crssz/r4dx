@@ -30,6 +30,8 @@ struct GemmaContainerInfo {
   std::optional<RotationSpec> rotation;  // Gemma option A (post_norm_rotate) when present
   bool has_trellis = false;
   int64_t image_token_id = 258880;  // top-level config key; the Huihui / google default (docs/gemma4-plan.md 2)
+  int64_t boi_token_id = 255999;    // <|image>; config.json boi_token_id
+  int64_t eoi_token_id = 258882;    // <image|>; config.json eoi_token_id
   int64_t full_attn_out_elems = 0;  // heads * global_head_dim: the o_full Hadamard sign vector's length
 };
 
@@ -56,6 +58,12 @@ inline GemmaContainerInfo ParseGemmaContainerMetadata(const nlohmann::json& meta
     const nlohmann::json& mc = metadata.at("model_config");
     if (mc.contains("image_token_id") && mc.at("image_token_id").is_number_integer()) {
       info.image_token_id = mc.at("image_token_id").get<int64_t>();
+    }
+    if (mc.contains("boi_token_id") && mc.at("boi_token_id").is_number_integer()) {
+      info.boi_token_id = mc.at("boi_token_id").get<int64_t>();
+    }
+    if (mc.contains("eoi_token_id") && mc.at("eoi_token_id").is_number_integer()) {
+      info.eoi_token_id = mc.at("eoi_token_id").get<int64_t>();
     }
   }
   info.config = GemmaConfig::FromModelConfig(metadata.at("model_config"));

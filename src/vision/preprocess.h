@@ -61,6 +61,13 @@ struct ImageProcessorConfig {
   // it is narrowed. Storing 1/255 as a float instead lands the fused mean on 127.499992 rather
   // than exactly 127.5 -- one fp32 ulp off on ~95% of pixels.
   double rescale_factor = 1.0 / 255.0;
+  // Gemma 4 (gemma4_unified, docs/gemma4-plan.md M2): PreprocessImages then runs gemma_vision.h's
+  // Gemma4UnifiedImageProcessor port instead of the Qwen2-VL one, and everything above (patch/merge/min/max
+  // pixels, mean/std) is ignored. The result keeps this header's shapes: pixel_values is [soft_tokens, 6912],
+  // grid_thw is {t = 1, h = merged rows, w = merged cols} so PatchCount() == MergedTokenCount(1) == tokens
+  // (the Gemma TextModel reports VisionMergeSize() == 1). Default false: the Qwen path is untouched.
+  bool gemma = false;
+  int gemma_soft_tokens = 280;  // 70 | 140 | 280 | 560 | 1120
 
   int Factor() const { return patch_size * merge_size; }
   int64_t PatchDim() const {

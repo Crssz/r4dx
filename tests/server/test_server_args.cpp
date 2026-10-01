@@ -421,6 +421,14 @@ void TestVisionFlags() {
   CHECK(rejects({"--image-max-pixels", "512"}));
   CHECK(rejects({"--image-max-pixels", "-4"}));
   CHECK(rejects({"--image-max-pixels", "big"}));
+  // Gemma 4 (docs/gemma4-plan.md M2): the soft-token budget; 560 / 1120 are valid processor budgets but exceed the
+  // 288-row image chunk, so the server refuses them.
+  CHECK(parse({}).image_soft_tokens == 280);
+  CHECK(parse({"--image-soft-tokens", "70"}).image_soft_tokens == 70);
+  CHECK(parse({"--image-soft-tokens", "140"}).image_soft_tokens == 140);
+  CHECK(rejects({"--image-soft-tokens", "560"}));
+  CHECK(rejects({"--image-soft-tokens", "100"}));
+  CHECK(rejects({"--image-soft-tokens", "many"}));
 }
 
 // --tp and --tp-* (docs/tp.md 9.1): the same flags, ranges and usage errors as r4dx-cli's, which

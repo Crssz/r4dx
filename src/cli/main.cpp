@@ -539,8 +539,12 @@ int RunMain(int argc, char** argv) {
   // Image preprocessing policy (docs/vision.md "Large images"). Validated and reported at startup
   // rather than at the first image, so `--image-max-pixels 0.5` fails here instead of mid-session.
   // `--image` (and `--chat`'s own `/image <path>` lines) feed it below.
-  const r4dx::vision::ImageProcessorConfig image_preproc =
+  r4dx::vision::ImageProcessorConfig image_preproc_cfg =
       r4dx::vision::MakeImageProcessorConfig(args.image_max_pixels);
+  // Gemma 4 (ImageBoiTokenId() >= 0, docs/gemma4-plan.md M2): the Gemma4UnifiedImageProcessor at its default 280
+  // soft-token budget (the server's --image-soft-tokens equivalent is not a CLI flag); Qwen is untouched.
+  if (model->ImageBoiTokenId() >= 0) image_preproc_cfg.gemma = true;
+  const r4dx::vision::ImageProcessorConfig image_preproc = image_preproc_cfg;
   if (model->HasVision()) {
     std::fprintf(stderr,
                  "[r4dx-cli] vision tower ready (image_max_pixels=%lld, an image above that is "
@@ -640,8 +644,9 @@ int RunMain(int argc, char** argv) {
           row += g.MergedTokenCount(merge_size);
         }
       }
-      auto expanded =
-          r4dx::vision::ExpandImagePlaceholders(full_tokens, image_token_id, spans_in, merge_size);
+      auto expanded = r4dx::vision::ExpandImagePlaceholders(
+          full_tokens, image_token_id, spans_in, merge_size, static_cast<int32_t>(model->ImageBoiTokenId()),
+          static_cast<int32_t>(model->ImageEoiTokenId()));
       full_tokens = std::move(expanded.tokens);
       expanded_spans = std::move(expanded.spans);
     }

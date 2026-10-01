@@ -167,6 +167,19 @@
 // error -- omitting --kv-calib entirely also yields the 1.0 placeholder, silently (no calibration
 // was ever requested, so there is nothing to warn about).
 //
+// Gemma 4 (docs/gemma4-plan.md 4.2 / 4.3): a checkpoint whose config.json says model_type
+// "gemma4_unified" takes the Gemma branch (src/convert/gemma_layout.{hpp,cpp}); the Qwen path above
+// is untouched. A single model.safetensors (no index) is fine. The container gets
+// __metadata__.model_arch "gemma4_unified" and norm_kind "plain", text.layers.{i}.attn.{q,k,v,o} (no
+// `v` on full layers), the four sandwich norms, mlp.gate_up / mlp.down, layer_scalar (fp32 [1, 4]),
+// per-layer k/v descale tables (8 KV heads sliding, 1 full) and a tied lm_head written untied.
+// --vision on (default off) and --audio on (default off; Gemma only) copy model.vision_embedder.* /
+// model.embed_vision.* / model.embed_audio.* as vision.* / audio.* bf16. --mtp on is refused. Every
+// checkpoint tensor must be consumed or allow-listed (--layers, vision/audio off): an unconsumed one
+// fails the run before the header is written. --rotate works (--rotate q2ab: Hadamard-only o / down,
+// folded in-norms stored as ones under `.rotated`); --trellis-from, --record-reuse-guard and
+// --reuse-tensors-from are refused for Gemma for now.
+//
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts w4a16] [--threads T]
 //                [--no-bf16] [--w4a16-group-rule "<regex>=<g>"]...
@@ -225,6 +238,8 @@
 #include "r4dx_convert/tensor_codec.hpp"
 #include "r4dx_convert/trellis_import.hpp"
 #include "r4dx_convert/w4a16_groups.hpp"
+
+#include "gemma_layout.hpp"
 
 namespace {
 
@@ -335,8 +350,9 @@ struct AppArgs {
   bool lm_head_spec_explicit = false;  // --lm-head was given: --no-bf16 then leaves it alone
   int layers = -1;  // -1 = every text layer
   int threads = 0;  // 0 = hardware_concurrency
-  int vision = -1;  // -1 auto (on iff full run), 0 off, 1 on
+  int vision = -1;  // -1 auto (on iff full run; Gemma: off unless 1), 0 off, 1 on
   int mtp = -1;
+  int audio = -1;   // Gemma only (--audio on|off, default off); -1 and 0 are both off
   bool no_bf16 = false;  // drop the bf16 layout for body weights even if --layouts/--lm-head asked
   std::string kv_calib;  // path to tools/reference/kv_calibrate.py's merged JSON; empty = no calib
   // Reduced-vocab MTP draft head (docs/r9700.md R9): path to a JSON file `{"vocab_ids": [...]}`
@@ -466,6 +482,7 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--threads") a.threads = std::stoi(next(i));
     else if (arg == "--vision") a.vision = ParseOnOff(next(i), "--vision");
     else if (arg == "--mtp") a.mtp = ParseOnOff(next(i), "--mtp");
+    else if (arg == "--audio") a.audio = ParseOnOff(next(i), "--audio");
     else if (arg == "--no-bf16") a.no_bf16 = true;
     else if (arg == "--kv-calib") a.kv_calib = next(i);
     else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
@@ -1182,7 +1199,8 @@ class RotationSource {
   void ReportRun(std::ostream& log) const {
     if (!Enabled()) return;
     log << "[r4dx-convert] rotate " << KindName() << ": folded " << folded_in_
-        << " in-projection(s) (W diag(1+w) Q), " << folded_out_ << " out-projection(s) (Q^T W)";
+        << " in-projection(s) (" << (gemma_ ? "W diag(w) Q" : "W diag(1+w) Q") << "), " << folded_out_
+        << " out-projection(s) (Q^T W)";
     if (Hadamard()) log << ", " << folded_had_ << " of them also W Hb on the K side";
     log << "; " << ldlq_rotated_ << " LDLQ Hessian(s) and " << imatrix_rotated_
         << " imatrix vector(s) carried into the rotated basis";
@@ -1575,8 +1593,22 @@ int RunConvert(const AppArgs& args) {
       text_cfg.at("layer_types").get<std::vector<std::string>>();
   const int layers = args.layers > 0 ? std::min(args.layers, num_layers_total) : num_layers_total;
   const bool full_run = (layers == num_layers_total);
-  const bool do_vision = args.vision >= 0 ? (args.vision == 1) : full_run;
-  const bool do_mtp = args.mtp >= 0 ? (args.mtp == 1) : full_run;
+  // Gemma 4 (gemma_layout.hpp): the Gemma branch below registers its own tensors; the Qwen code that
+  // follows is reached only when this is false, so a Qwen run is exactly what it was.
+  const bool is_gemma = config.value("model_type", std::string()) == r4dx_convert::gemma::kModelArch;
+  if (!is_gemma && args.audio == 1)
+    throw std::runtime_error("--audio applies to Gemma 4 checkpoints only (this one is not gemma4_unified)");
+  if (is_gemma && args.mtp == 1)
+    throw std::runtime_error("--mtp on: a gemma4_unified checkpoint has no MTP head");
+  if (is_gemma && !args.trellis.from.empty())
+    throw std::runtime_error("--trellis-from is not supported for gemma4_unified yet (trellis_import.hpp is "
+                             "keyed by the Qwen container's base names; docs/gemma4-plan.md M1-28)");
+  if (is_gemma && (args.record_reuse_guard || !args.reuse_from.empty()))
+    throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for gemma4_unified "
+                             "yet (the guard reads model.safetensors.index.json)");
+  const bool do_audio = is_gemma && args.audio == 1;
+  const bool do_vision = is_gemma ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
+  const bool do_mtp = is_gemma ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   LayoutSet lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*bf16_default_on=*/false);
@@ -1595,6 +1627,9 @@ int RunConvert(const AppArgs& args) {
             << "[r4dx-convert] hidden=" << hidden << " layers=" << layers << "/" << num_layers_total
             << " threads=" << threads << " vision=" << (do_vision ? "on" : "off")
             << " mtp=" << (do_mtp ? "on" : "off") << "\n";
+  if (is_gemma)
+    std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
+              << " audio=" << (do_audio ? "on" : "off") << "\n";
 
   // The BYTE LAYOUT is identical in both modes (docs/container-format.md "How the quantized values
   // are chosen"); only the (scale, zero) values differ.
@@ -1636,8 +1671,8 @@ int RunConvert(const AppArgs& args) {
   RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit, text_cfg);
   if (rot.Enabled()) {
     std::cout << "[r4dx-convert] rotate=" << rot.KindName() << " seed=0x" << std::hex << rot.Seed()
-              << std::dec << " (text layers folded; norms stored as 0; rotation.* tensors + "
-              << "__metadata__.rotation written)\n";
+              << std::dec << " (text layers folded; norms stored as " << (rot.Gemma() ? "1" : "0")
+              << "; rotation.* tensors + __metadata__.rotation written)\n";
     if (!args.imatrix.empty())
       std::cout << "[r4dx-convert] rotate: --imatrix vectors of rotated linears are carried into the "
                    "new basis under the diagonal model (rotation.hpp) -- use --ldlq for the exact "
@@ -1962,7 +1997,75 @@ int RunConvert(const AppArgs& args) {
     });
   };
 
-  for (int i = 0; i < layers; ++i) {
+  // ---- Gemma 4 branch (gemma_layout.cpp): the whole text stack, embeddings, head and the optional
+  // vision/audio passthrough, through the same closures the Qwen loop below uses ----------------------
+  if (is_gemma) {
+    namespace gm = r4dx_convert::gemma;
+    const gm::TextShape gshape = gm::ParseTextConfig(text_cfg);
+    gm::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    // A norm --rotate folds into the next linears: the bf16 copy without it; with it plain ones (the
+    // plain-weight analogue of Qwen's zeros: rms(x) * 1 commutes with Q), under `<name>.rotated` so a
+    // binary that predates the rotation refuses the container by the missing bare name.
+    kit.add_folded_norm = [&](const std::string& hf_name, const std::string& container_name) {
+      if (!rot.Enabled()) {
+        add_bf16(hf_name, container_name);
+        return;
+      }
+      const std::string name = container_name + ".rotated";
+      plan_jobs.push_back([&writer, &model, hf_name, name]() {
+        const auto& meta = model.Meta(hf_name);
+        std::vector<int64_t> shape = meta.shape;
+        shape.push_back(2);
+        writer.Plan(name, shape, static_cast<uint64_t>(meta.ElemCount()) * 2);
+      });
+      emit_jobs.push_back([&writer, &model, hf_name, name]() {
+        std::vector<uint8_t> ones(static_cast<size_t>(model.Meta(hf_name).ElemCount()) * 2, 0);
+        for (size_t k = 0; k < ones.size(); k += 2) {  // bf16 1.0 = 0x3F80, little-endian
+          ones[k] = 0x80;
+          ones[k + 1] = 0x3F;
+        }
+        writer.WriteTensor(name, ones.data(), ones.size());
+      });
+    };
+    kit.add_fp32_widen = add_fp32_widen;
+    kit.add_descale = [&](const std::string& container_name, int n_kv, int layer_idx, const char* kind) {
+      add_descale(container_name, n_kv, layer_idx, kind, /*calib_applicable=*/true);
+    };
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base,
+                         const gm::Fold& f) {
+      // What --rotate does to this linear (all kNone without it; under q2a Gemma's out-projections are
+      // not folded at all, under q2ab they take only the Hadamard: RotationSource::Out).
+      LinearFold fold;
+      if (!f.in_norm_hf.empty()) {
+        fold = rot.In(f.in_norm_hf);
+      } else if (f.out == gm::OutSite::kDown) {
+        fold = rot.Out(HadSite::kDown);
+      } else if (f.out == gm::OutSite::kOSliding) {
+        fold = rot.Out(HadSite::kOSliding);
+      } else if (f.out == gm::OutSite::kOFull) {
+        fold = rot.Out(HadSite::kOFull);
+      }
+      add_linear(hf_names, base, f.head ? lm_head_layouts : layouts, fold);
+    };
+    const std::set<std::string> consumed = gm::AddTextStack(kit, gshape, layers, do_vision, do_audio);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container.
+    const std::vector<std::string> unconsumed =
+        gm::UnconsumedTensors(model.AllNames(), consumed, layers, do_vision, do_audio);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (gemma4_unified): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not allow-listed (a mis-guessed tensor "
+                        "name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+  }
+
+  for (int i = 0; i < (is_gemma ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -2018,9 +2121,11 @@ int RunConvert(const AppArgs& args) {
 
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
-  add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
-  add_bf16("model.language_model.norm.weight", "text.final_norm");
-  add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
+  if (!is_gemma) {  // (the Gemma branch above registered these, the head from the tied embedding)
+    add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
+    add_bf16("model.language_model.norm.weight", "text.final_norm");
+    add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
+  }
 
   // --rotate: the transforms themselves, fp32, exactly the values every fold above used (the runtime
   // reads these; it never regenerates them from the seed). No .{layout} suffix, like every other
@@ -2040,7 +2145,7 @@ int RunConvert(const AppArgs& args) {
     }
   }
 
-  if (do_vision) {
+  if (do_vision && !is_gemma) {
     for (const auto& name : model.AllNames()) {
       if (StartsWith(name, "model.visual.")) {
         add_bf16(name, "vision." + name.substr(std::string("model.visual.").size()));
@@ -2266,6 +2371,33 @@ int RunConvert(const AppArgs& args) {
                     : "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
     metadata["rotation"] = rot.Metadata();
   }
+  // Gemma 4: the Qwen summary above does not describe this container. model_arch / norm_kind are what
+  // model::DetectArch and the loader read (docs/gemma4-plan.md 4.2); written ONLY for Gemma, so every
+  // Qwen container keeps its header byte for byte.
+  if (is_gemma) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();  // e.g. Huihui-gemma-4-12B-it-abliterated
+    metadata["model_arch"] = r4dx_convert::gemma::kModelArch;
+    metadata["norm_kind"] = "plain";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.q|k|v|o", "w4a16|bf16 (as requested by --layouts; no v on full layers: V is the raw k_proj output)"},
+        {"text.layers.*.mlp.gate_up|down", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
+        {"text.layers.*.attn.q_norm|k_norm, *_layernorm (x4), text.final_norm", "bf16 raw plain weights (x * w, not 1 + w)"},
+        {"text.layers.*.attn.k_descale|v_descale", "fp32 [kv_heads of the layer: 8 sliding, 1 full] (--kv-calib or 1.0)"},
+        {"text.layers.*.layer_scalar", "fp32 [1, 4] (the [1] bf16 buffer widened; applied once after the MLP residual add)"},
+        {"text.embed_tokens", "bf16 [vocab, hidden]; sqrt(hidden) scale is a runtime op"},
+        {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), the tied embedding written untied"},
+        {"vision.*, audio.*", "bf16 passthrough (--vision on / --audio on; default off)"},
+    };
+    if (rot.Enabled()) {
+      metadata["quant_summary"]["text.layers.*.input_layernorm|pre_feedforward_layernorm"] =
+          "bf16 ones as <name>.rotated: rotated container, w folded into the next linears (__metadata__.rotation)";
+      metadata["quant_summary"]["rotation.*"] =
+          "fp32 (signs, mix; q2ab also had_down/o/o_full_signs) -- see __metadata__.rotation";
+    }
+  }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above
   // describe the multi-layout body, which a trellis container does not have), and
   // __metadata__.quant.trellis is what the loader parses (docs/trellis-kernel.md 2.3, 2.5). Only
@@ -2318,6 +2450,10 @@ int RunConvert(const AppArgs& args) {
        ldlq.Enabled() ? ldlq.ManifestSha256() : std::string("none")},
       {"ldlq_linears", ldlq.Linears()},
   };
+  if (is_gemma) {
+    metadata["r4dx_convert_run"]["arch"] = r4dx_convert::gemma::kModelArch;
+    metadata["r4dx_convert_run"]["audio"] = do_audio;
+  }
   if (rot.Enabled()) {
     metadata["r4dx_convert_run"]["rotate"] = rot.KindName();
     metadata["r4dx_convert_run"]["rotation_seed"] = rot.Seed();

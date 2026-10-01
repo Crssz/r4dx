@@ -47,6 +47,20 @@ add_test(NAME convert_quant_ldlq COMMAND convert_quant_ldlq)
 # norm folded, out-projection, and the q2ab down / o / gdn_out K side), the Hessian change of basis
 # against a direct capture on the folded input plus the tr(W H W^T) invariance, HessianStore's
 # transform hook and cache key on fixtures/hess_small, and the imatrix diagonal model. CPU-only.
+# Gemma 4 converter branch (src/convert/gemma_layout.{hpp,cpp}, docs/gemma4-plan.md M1-6): the layout over
+# the real 677-tensor Huihui header (tools/reference/gemma/tensor_names.json) through a recording kit, and
+# -- when r4dx-convert is built -- the exe on a tiny synthetic single-file gemma4_unified checkpoint: the
+# exact tensor set / shapes / bytes, per-layer descale, vision/audio passthrough, --layers, --rotate
+# q2ab/q2a, and every refusal (the coverage audit names an unconsumed tensor). CPU-only; writes a few MB
+# under %TEMP% and removes them.
+add_executable(convert_gemma_layout test_gemma_layout.cpp)
+target_link_libraries(convert_gemma_layout PRIVATE r4dx_convert_gemma)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_gemma_layout PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_gemma_layout r4dx-convert)
+endif()
+add_test(NAME convert_gemma_layout COMMAND convert_gemma_layout)
+
 add_executable(convert_rotation test_rotation.cpp)
 target_link_libraries(convert_rotation PRIVATE r4dx_convert)
 target_compile_definitions(convert_rotation PRIVATE

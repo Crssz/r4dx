@@ -1312,6 +1312,25 @@ def allocate(tensors: list[dict], bpw: float) -> dict[str, float]:
     return rate
 
 
+def allocate_ranked(tensors: list[dict], bpw: float, arch: ArchSpec, gaps: dict | None = None,
+                    ranking: str = "auto") -> tuple[dict[str, float], list | None, str]:
+    """(rates, report, ranking used). ranking: auto = the arch's own (Gemma 4: gemma_mix, the data-driven
+    score when `gaps` is given, else prior-only; Qwen: EXL3's `allocate`, untouched), exl3 = `allocate`
+    for any arch, prior = gemma_mix without the oracle data (docs/gemma4-plan.md 11)."""
+    if ranking not in ("auto", "exl3", "prior", "gemma"):
+        raise ValueError(f"unknown ranking {ranking!r}")
+    use_gemma = ranking in ("prior", "gemma") or (ranking == "auto" and arch.is_gemma)
+    if not use_gemma:
+        return allocate(tensors, bpw), None, "exl3"
+    if not arch.is_gemma:
+        raise ValueError(f"--ranking {ranking} is the gemma4_unified ranking; arch is {arch.name}")
+    import gemma_mix
+
+    use_gaps = None if ranking == "prior" else gaps
+    rates, report = gemma_mix.allocate(tensors, bpw, rate_floor, rate_next, use_gaps)
+    return rates, report, "gemma-proxy" if use_gaps is not None else "gemma-prior"
+
+
 def model_linears(model_dir: Path, arch: ArchSpec | None = None) -> list[dict]:
     """Every quantized decoder linear: name, layer, idx (module order), module, qgroup, numel, k, n.
     `arch` (default: config.json's model_type, Qwen3.5 when it is not Gemma 4). A single-file checkpoint
@@ -1505,7 +1524,9 @@ def cmd_quantize_model(args) -> int:
     rms_keys = hman.get("rms_keys") or {}
     linears = model_linears(model_dir, arch)
     if args.bpw is not None:
-        rates = allocate(linears, args.bpw)
+        # no oracle data exists yet at this point: a Gemma --bpw run uses the prior-only ranking
+        # (the production flow is K4 + K5 oracles, then `mix`, which has the proxies)
+        rates = allocate_ranked(linears, args.bpw, arch)[0]
     else:
         rates = {t["name"]: float(args.K) for t in linears}
     layers = sorted({t["layer"] for t in linears})
@@ -1740,8 +1761,22 @@ def cmd_mix(args) -> int:
     if len({json.dumps(v, sort_keys=True) for v in code.values()}) > 1:
         print(f"[trellis] WARNING: the source directories were written by different trellis_quant.py / "
               f"trellis_viterbi.hip versions (recorded in the manifest): {code}", flush=True)
-    linears = model_linears(Path(base["model_dir"]), get_arch(base.get("arch")))
-    rates = allocate(linears, args.bpw)
+    arch = get_arch(base.get("arch"))
+    linears = model_linears(Path(base["model_dir"]), arch)
+    gaps = None
+    lo = min(srcs)
+    hi = rate_next(lo)
+    if arch.is_gemma and args.ranking != "prior" and hi in srcs:
+        # the data term: the Hessian proxy the promotion lo -> hi removes, per tensor (docs/gemma4-plan.md 11)
+        try:
+            gaps = {t["name"]: srcs[lo]["tensors"][t["name"]]["proxy"] - srcs[hi]["tensors"][t["name"]]["proxy"]
+                    for t in linears}
+        except KeyError as e:
+            raise SystemExit(f"[trellis] --ranking {args.ranking}: a source manifest lacks the proxy of {e}; "
+                             f"use --ranking prior")
+    elif args.ranking == "gemma":
+        raise SystemExit(f"[trellis] --ranking gemma needs the K{lo:g} and K{hi:g} sources (arch gemma4_unified)")
+    rates, report, ranking_used = allocate_ranked(linears, args.bpw, arch, gaps, args.ranking)
     need = sorted(set(rates.values()))
     lacking = [r for r in need if r not in srcs]
     if lacking:
@@ -1761,14 +1796,20 @@ def cmd_mix(args) -> int:
            "complete": True, "missing": [], "missing_count": 0, "bpw_target": args.bpw,
            "K_uniform": None, **{k: base.get(k) for k in job_keys + opt_keys}, "recipe": base.get("recipe"),
            "hessian_dir": base.get("hessian_dir"),
-           "allocation": {"rule": "docs/trellis.md 9 (AL::create_q_strategy) with EXL3's qgroups (q/k/v, "
-                                  "in_proj_qkv + in_proj_z, gate + up promoted as units; o/out/down "
-                                  "alone), every priority 0", "tensors_per_K": counts,
+           "allocation": {"rule": ("docs/trellis.md 9 (AL::create_q_strategy) with EXL3's qgroups (q/k/v, "
+                                   "in_proj_qkv + in_proj_z, gate + up promoted as units; o/out/down "
+                                   "alone), every priority 0") if ranking_used == "exl3" else
+                                  ("tools/reference/gemma_mix.py: EXL3's budget and whole-group rule, groups "
+                                   "promoted by descending prior x oracle-proxy-gap score (docs/gemma4-plan.md 11)"),
+                          **({"ranking": ranking_used} if ranking_used != "exl3" else {}),
+                          "tensors_per_K": counts,
                           "sources": {str(K): m["_path"] for K, m in srcs.items()},
                           "source_code_sha256": code},
            "summary": summarize_tensors(tensors), "tensors": tensors,
            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), "provenance": provenance()}
     write_json_atomic(out_dir / MANIFEST_NAME, man)
+    if report is not None:  # the audit trail of the Gemma ranking: every group, its score, its final K
+        write_json_atomic(out_dir / "mix_ranking.json", {"ranking": ranking_used, "bpw": args.bpw, "groups": report})
     s = man["summary"]
     print(f"[trellis] mix {args.bpw} bpw: {counts} -> {s['bpw']:.4f} bpw measured, "
           f"{s['decode_gib']:.3f} GiB -> {out_dir / MANIFEST_NAME}")
@@ -2027,6 +2068,11 @@ def main() -> int:
     p.add_argument("--bpw", type=float, required=True)
     p.add_argument("--src", action="append", required=True, help="a finished --K directory (repeat)")
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--ranking", default="auto", choices=["auto", "exl3", "prior", "gemma"],
+                   help="which promotion order: auto = the arch's own (qwen3_5: EXL3's, unchanged; "
+                        "gemma4_unified: tools/reference/gemma_mix.py, scored by the K4-vs-K5 oracle proxy gap "
+                        "times position/kind priors); exl3 = EXL3's for any arch; prior = Gemma's priors only, "
+                        "no oracle data; gemma = Gemma's, refuses to run without the proxy data")
     p.set_defaults(fn=cmd_mix)
 
     p = sub.add_parser("gaussian", help="validation (a): iid N(0,1) MSE per K")

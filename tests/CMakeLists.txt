@@ -152,6 +152,15 @@ if(_r4dx_ref_ok)
   if(TARGET r4dx-convert)
     set_property(TEST reference_arch_gemma APPEND PROPERTY ENVIRONMENT "R4DX_CONVERT_EXE=$<TARGET_FILE:r4dx-convert>")
   endif()
+
+  # tools/reference/gemma_mix.py: the Gemma mix4.5m ranking and its budget math on the real 328 linears
+  # (docs/gemma4-plan.md 11). CPU only; the trellis_quant wiring part skips without torch.
+  add_test(
+      NAME reference_gemma_mix
+      COMMAND "${_r4dx_ref_python}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_gemma_mix.py"
+  )
+  set_tests_properties(reference_gemma_mix PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8;CUDA_VISIBLE_DEVICES=")
 endif()
 
 if(_r4dx_ref_canonical)

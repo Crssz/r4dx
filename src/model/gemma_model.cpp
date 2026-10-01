@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "dflash_draft_weights.h"
 #include "kernels/model_kernels.h"
 #include "linear.h"
 #include "profile_span.h"
@@ -144,6 +145,60 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
     ac.v_norm = cfg.v_norm_all_layers;
     m.attn_.emplace_back(ac, opts.attn);
   }
+  // ---- DFlash drafter (docs/gemma4-plan.md 6.4): its own weights + ring, fed by the feature capture ----------------
+  if (opts.dflash_draft_k < 0) throw std::invalid_argument("GemmaModel::Load: dflash_draft_k must be >= 0");
+  if (!opts.dflash_container.empty()) {
+    if (opts.dflash_draft_k <= 0) {
+      throw std::invalid_argument("GemmaModel::Load: dflash_container is set but dflash_draft_k <= 0");
+    }
+    if (m.max_chunk_ < 16) {
+      throw std::invalid_argument("GemmaModel::Load: DFlash needs prefill_chunk >= 16 (the verify window / capture rows)");
+    }
+    const DflashDraftWeights peek = DflashDraftWeights::Open(opts.dflash_container);  // CPU: metadata + directory only
+    const Dflash2Config& dc = peek.Config();
+    if (dc.layout.empty()) {
+      throw std::runtime_error("GemmaModel::Load: dflash container has no layout in its __metadata__.dflash2 block");
+    }
+    if (dc.hidden_size != hidden) {
+      throw std::runtime_error("GemmaModel::Load: dflash container hidden_size " + std::to_string(dc.hidden_size) +
+                               " != the target's " + std::to_string(hidden));
+    }
+    if (dc.vocab_size != cfg.vocab_size) {
+      throw std::runtime_error("GemmaModel::Load: dflash container vocab_size " + std::to_string(dc.vocab_size) +
+                               " != the target's " + std::to_string(cfg.vocab_size) + " (it shares the target embedding)");
+    }
+    if (opts.dflash_draft_k > dc.block_size - 1) {
+      throw std::invalid_argument("GemmaModel::Load: dflash_draft_k " + std::to_string(opts.dflash_draft_k) +
+                                  " exceeds the drafter's block_size - 1 = " + std::to_string(dc.block_size - 1));
+    }
+    // target_layers are layer-INPUT indices (the converter stored z-lab's hidden_states[id + 1] as id + 1);
+    // AttachFeatureCapture's own convention is the same: "the residual stream ENTERING layer L".
+    for (int64_t l : dc.target_layers) {
+      if (l < 0 || l > layers) {
+        throw std::runtime_error("GemmaModel::Load: dflash target layer " + std::to_string(l) + " is outside [0, " +
+                                 std::to_string(layers) + "]");
+      }
+    }
+    DflashDraftOptions d;
+    d.container_path = opts.dflash_container;
+    d.layout = LayoutFromName(dc.layout);
+    d.max_inject_rows = 64;
+    d.lm_head_vocab = cfg.vocab_size;
+    m.dflash_ = DflashDraft::Load(d);
+    m.dflash_draft_k_ = opts.dflash_draft_k;
+    m.dflash_embed_scale_ = dc.embed_scale;
+    if (const char* e = std::getenv("R4DX_DFLASH_EMBED_SCALE"); e != nullptr && *e != '\0') {
+      // The A/B knob of docs/gemma4-plan.md D-7: the drafter's embed scale {1 = raw rows (z-lab default), 62 =
+      // Gemma's sqrt(hidden)-scaled rows} without reconverting. Not a flag: it never changes a shipped default.
+      m.dflash_embed_scale_ = std::stod(e);
+      if (!(m.dflash_embed_scale_ > 0.0)) throw std::invalid_argument("R4DX_DFLASH_EMBED_SCALE must be > 0");
+    }
+    m.AttachFeatureCapture(dc.target_layers);
+    std::cerr << "[r4dx::model::GemmaModel] DFlash drafter loaded: " << opts.dflash_container << " (layout " << dc.layout
+              << ", block " << dc.block_size << ", k " << opts.dflash_draft_k << ", target layers [";
+    for (size_t i = 0; i < dc.target_layers.size(); ++i) std::cerr << (i ? "," : "") << dc.target_layers[i];
+    std::cerr << "], softcap " << dc.logit_softcap << ", embed scale " << m.dflash_embed_scale_ << ")\n";
+  }
   m.stream_.Synchronize();
   std::cerr << "[r4dx::model::GemmaModel] " << layers << " layers, max_ctx " << m.max_ctx_ << ", KV "
             << (opts.kv == GemmaKvMode::kFp8 ? "fp8" : opts.kv == GemmaKvMode::kBf16Full ? "bf16 (full layers) + fp8 (sliding)" : "bf16")
@@ -168,6 +223,8 @@ void GemmaModel::Reset() {
   arena_.Reset();
   ckpt_pos_ = -1;
   feature_rows_ = 0;
+  verified_rows_ = 0;
+  if (dflash_.has_value()) dflash_->Reset();
 }
 
 void GemmaModel::SaveCheckpoint() {
@@ -193,6 +250,8 @@ void GemmaModel::RestoreCheckpoint() {
   started_ = true;
   arena_.Reset();
   feature_rows_ = 0;
+  verified_rows_ = 0;
+  if (dflash_.has_value() && dflash_->InjectedCount() > pos_) dflash_->Rewind(pos_);
 }
 
 void GemmaModel::AttachFeatureCapture(std::vector<int64_t> layers) {
@@ -368,8 +427,12 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   return out;
 }
 std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                                        const SummaryRequest* summary_out, SpanAccumulator* prof) {
+                                        const SummaryRequest* summary_out, SpanAccumulator* prof,
+                                        std::vector<int32_t>* verify_argmax) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
+  if (verify_argmax != nullptr && (T > 16 || prof != nullptr || want_logits || greedy_out != nullptr || summary_out != nullptr)) {
+    throw std::logic_error("GemmaModel::RunChunk: a verify window is 1..16 rows, unprofiled, with no other logits request");
+  }
   if (T < 1 || T > max_chunk_) {
     throw std::runtime_error("GemmaModel::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
   }
@@ -450,6 +513,25 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
                      T * static_cast<int64_t>(feature_layers_.size()) * hidden, s);
   }
 
+  // ---- verify window: final norm + lm_head + softcap + argmax on EVERY row (VerifyWindow) ---------------------------
+  if (verify_argmax != nullptr) {
+    const int64_t vocab = cfg.vocab_size;
+    uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hidden), 16);
+    uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vocab), 16);
+    plain_norm(cur, container_.FinalNorm().data(), xn);  // T rows
+    ApplyLinear(stream_, arena_, container_.LmHead(), xn, logits_bf16, T);
+    if (cfg.final_logit_softcapping > 0.0) {
+      r4dx_model_widen_softcap_bf16_to_f32(P(logits_bf16), P(verify_logits_dev_.data()), T * vocab,
+                                           static_cast<float>(cfg.final_logit_softcapping), s);
+    } else {
+      r4dx_model_widen_bf16_to_f32(P(logits_bf16), P(verify_logits_dev_.data()), T * vocab, s);
+    }
+    for (int64_t t = 0; t < T; ++t) {
+      r4dx_argmax_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_argmax_dev_.data() + t), vocab, s);
+    }
+    arena_.Reset();
+  }
+
   // ---- final norm + tied lm_head + softcap on the LAST row only ----------------------------------------------
   if (want_logits) {
     const char* last = static_cast<const char*>(cur) + (T - 1) * hidden * static_cast<int64_t>(elem);
@@ -489,10 +571,23 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
       logits_dev_.CopyToHost(logits.data(), logits.size());
     }
   }
+  if (verify_argmax != nullptr) {
+    verify_argmax->resize(static_cast<size_t>(T));
+    verify_argmax_dev_.CopyToHost(verify_argmax->data(), static_cast<size_t>(T));
+  }
   if (capture) {
     feature_rows_ = T;
     feature_pos_ = pos_;
   }
+  if (verify_argmax != nullptr) {
+    // A verify window commits nothing: pos_ stays put until CommitVerifiedWindow. Its K/V rows are written, and
+    // (see VerifyWindow) the rejected ones are simply overwritten by whatever is fed next.
+    started_ = true;
+    return logits;
+  }
+  // Feed the drafter every committed row (a plain decode step, a prefill chunk). Skipped for a profiled call
+  // (the stream is still busy there) and while injection is off (the drafter then sees a gap, later).
+  if (capture && dflash_.has_value() && dflash_injection_enabled_ && prof == nullptr) InjectDflashRows(T, pos_);
   pos_ += T;
   started_ = true;
   return logits;
@@ -617,6 +712,97 @@ StepProfile GemmaModel::PrefillProfiled(const std::vector<int32_t>& token_ids) {
   sp.wall_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
   sp.r4dx_kernel_launches = r4dx_kernel_launch_counter_get();
   return sp;
+}
+
+// ---- speculative verification + DFlash decode (docs/gemma4-plan.md D-6) -----------------------------------------
+
+void GemmaModel::InjectDflashRows(int64_t rows, int64_t start_pos) {
+  const int64_t cols = static_cast<int64_t>(feature_layers_.size()) * container_.Config().hidden_size;
+  for (int64_t row0 = 0; row0 < rows; row0 += 64) {
+    const int64_t S = std::min<int64_t>(64, rows - row0);
+    dflash_->InjectFeatures(stream_, arena_, features_dev_.data() + row0 * cols, S, start_pos + row0);
+  }
+  // RunChunk's contract is "device idle on return" (the next call's plain copies need it).
+  stream_.Synchronize();
+  arena_.Reset();
+}
+
+void GemmaModel::SetDflashInjectionEnabled(bool enabled) { dflash_injection_enabled_ = enabled; }
+
+std::vector<int32_t> GemmaModel::VerifyWindow(const std::vector<int32_t>& candidates) {
+  const int64_t W = static_cast<int64_t>(candidates.size());
+  if (W < 1 || W > 16) throw std::invalid_argument("GemmaModel::VerifyWindow: 1..16 candidates");
+  if (W > max_chunk_) throw std::invalid_argument("GemmaModel::VerifyWindow: window exceeds prefill_chunk");
+  const int64_t vocab = container_.Config().vocab_size;
+  if (verify_logits_dev_.size() < static_cast<size_t>(16 * vocab)) {
+    verify_logits_dev_.Resize(static_cast<size_t>(16 * vocab));
+    verify_argmax_dev_.Resize(16);
+  }
+  std::vector<int32_t> argmax;
+  RunChunk(candidates, /*want_logits=*/false, nullptr, nullptr, nullptr, &argmax);
+  verified_rows_ = W;
+  return argmax;
+}
+
+void GemmaModel::CommitVerifiedWindow(int64_t n) {
+  if (verified_rows_ < 1 || n < 1 || n > verified_rows_) {
+    throw std::invalid_argument("GemmaModel::CommitVerifiedWindow: n must be in [1, rows of the last VerifyWindow]");
+  }
+  pos_ += n;
+  verified_rows_ = 0;
+}
+
+std::vector<int32_t> GemmaModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                        int64_t* walk_len_out) {
+  if (!dflash_.has_value()) throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: no drafter (GemmaModelOptions::dflash_container)");
+  if (k < 0 || k > dflash_draft_k_) {
+    throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: k must be in [0, " + std::to_string(dflash_draft_k_) + "]");
+  }
+  if (!dflash_injection_enabled_) {
+    throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: drafter injection is disabled (SetDflashInjectionEnabled(false))");
+  }
+  if (dflash_->InjectedCount() != pos_) {
+    throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: drafter frontier (" + std::to_string(dflash_->InjectedCount()) +
+                             ") != PositionCount() (" + std::to_string(pos_) + ")");
+  }
+  const GemmaConfig& cfg = container_.Config();
+  const DflashEmbeddingProvider embed = MakeEmbeddingProviderFromTable(
+      container_.EmbedTokensDevice().data(), cfg.hidden_size, cfg.vocab_size, static_cast<float>(dflash_embed_scale_));
+  const DflashLmHeadProvider lm_head = MakeLmHeadProviderFromLinear(&container_.LmHead());
+
+  const DflashDraftResult draft = dflash_->DraftRound(stream_, arena_, token_id, k, p_min, n_min, embed, lm_head);
+  arena_.Reset();
+  if (walk_len_out != nullptr) *walk_len_out = draft.walk_len;
+
+  std::vector<int32_t> cands;
+  cands.reserve(draft.tokens.size() + 1);
+  cands.push_back(token_id);
+  cands.insert(cands.end(), draft.tokens.begin(), draft.tokens.end());
+  const std::vector<int32_t> argmax = VerifyWindow(cands);
+
+  // Greedy acceptance: draft i (candidates[i + 1]) is confirmed iff the target's argmax after candidates[i] equals it.
+  int64_t accepted = 0;
+  while (accepted < static_cast<int64_t>(draft.tokens.size()) && argmax[static_cast<size_t>(accepted)] == draft.tokens[static_cast<size_t>(accepted)]) {
+    ++accepted;
+  }
+  const int64_t committed = accepted + 1;  // the anchor + the accepted drafts
+  std::vector<int32_t> result(argmax.begin(), argmax.begin() + committed);  // accepted drafts, then the bonus token
+
+  // Inject the committed rows' features (rows 0..committed-1 of the window just captured) at the drafter's frontier,
+  // THEN commit. The rejected rows' features are never injected.
+  if (feature_rows_ < committed) throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: internal error, capture short");
+  InjectDflashRows(committed, dflash_->InjectedCount());
+  CommitVerifiedWindow(committed);
+  return result;
+}
+
+std::vector<int32_t> GemmaModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                         const kernels::SampleParams& params, std::mt19937_64&,
+                                                         int64_t* walk_len_out) {
+  if (params.temperature > 0.0f) {
+    throw std::runtime_error("GemmaModel::DecodeStepDflashSampled: a sampled DFlash round is not implemented for Gemma 4 (temperature > 0)");
+  }
+  return DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
 }
 
 }  // namespace r4dx::model

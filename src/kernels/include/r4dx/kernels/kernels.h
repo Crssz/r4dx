@@ -426,7 +426,7 @@ int64_t r4dx_topk_lse_workspace_bytes();
 //   is why they need not be cleared, exactly the "self-correcting via position overwrite" argument
 //   the append-only case already relies on. Slot mapping stays `p % slots` over TRUE absolute
 //   positions either way, so nothing about rope or the ring geometry changes.
-// Preconditions (throw, not silently wrong): 1 <= T <= 8; head_dim <= 128 and head_dim % 32 == 0;
+// Preconditions (throw, not silently wrong): 1 <= T <= 16 (block 8 for Qwen DFlash2, 16 for Gemma DFlash v1); head_dim <= 128 and head_dim % 32 == 0;
 // heads_q % heads_kv == 0 and the ratio <= 4; 1 <= window <= 2048; window <= slots (so the visible
 // store range can never alias itself in the ring); 0 <= store_begin <= n_injected.
 void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,

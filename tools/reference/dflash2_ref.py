@@ -593,6 +593,8 @@ def draft_round(
     p_min: float = 0.0,
     capture_layer0: bool = False,
     mask_token_id: int | None = None,
+    embed_scale: float = 1.0,
+    logit_softcap: float = 0.0,
 ) -> DraftRoundResult:
     cfg = weights.cfg
     block_size = cfg.block_size
@@ -604,6 +606,8 @@ def draft_round(
     mask_id = cfg.mask_token_id if mask_token_id is None else mask_token_id
     token_ids = np.array([anchor_id] + [mask_id] * (block_size - 1), dtype=np.int64)
     x = target.embed_rows(token_ids).astype(np.float32)  # [block_size, n_embd]
+    if embed_scale != 1.0:  # Gemma 4 DFlash v1 container: `dflash2.embed_scale` (z-lab: 1.0 == the raw rows)
+        x = (x * np.float32(embed_scale)).astype(np.float32)
     pos = (n_injected + np.arange(block_size)).astype(np.int64)
 
     inter: dict[str, np.ndarray] = {"inp_noise_embd": x.copy(), "positions": pos.copy()}
@@ -689,6 +693,8 @@ def draft_round(
     lm_head = target.lm_head()
     vocab = lm_head.shape[0]
     logits = linear(x_final, lm_head)  # [block_size, vocab]
+    if logit_softcap > 0.0:  # `dflash2.logit_softcap` (Gemma 4: 30): cap * tanh(l / cap), monotone
+        logits = (logit_softcap * np.tanh(logits.astype(np.float64) / logit_softcap)).astype(np.float32)
     inter["logits"] = logits.copy()
 
     top_k = cfg.selector_top_k

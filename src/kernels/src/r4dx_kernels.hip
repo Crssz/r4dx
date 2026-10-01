@@ -1,4 +1,4 @@
-﻿// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
+// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
 // compiled as one hipcc translation unit (mirrors third_party/CMakeLists.txt's per-unit recipe
 // for r4d_core; see docs/build-windows.md). One row per workgroup for the row-reduction kernels
 // (rmsnorm and its fused residual form).
@@ -1169,10 +1169,11 @@ __global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restri
 //   accumulating all `ratio` q-heads' outputs in registers.
 //
 // This is a two-pass (materialise-then-normalise) softmax rather than a streaming online one: the
-// whole visible row is at most 2055 scores (window 2048 + an 8-wide block), which fits LDS
+// whole visible row is at most 2063 scores (window 2048 - 1 + a 16-wide block), which fits LDS
 // comfortably, and it is the numerically identical max-subtracted fp32 softmax with less state.
 constexpr int kAttnThreads = 128;
-constexpr int kAttnMaxKeys = 2056;   // (window - 1) + T <= 2047 + 8
+constexpr int kAttnMaxT = 16;        // the block size: 8 (Qwen DFlash2) or 16 (Gemma 4 / DFlash v1)
+constexpr int kAttnMaxKeys = 2048 - 1 + kAttnMaxT + 1;  // (window - 1) + T <= 2047 + 16 (2064 floats x 4 q-heads = 33 KB LDS)
 constexpr int kAttnMaxRatio = 4;     // heads_q / heads_kv
 constexpr int kAttnMaxHeadDim = 128;
 
@@ -1736,8 +1737,8 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
   if (T <= 0 || heads_kv <= 0) return;
   // Every one of these is a HARD precondition of the kernel's fixed LDS geometry: violating one
   // would read/write outside s_q/s_sc rather than merely produce a slow answer.
-  if (T > 8) {
-    throw std::runtime_error("r4dx_dflash_attn_bf16: T must be <= 8 (the DFlash2 block size), got " +
+  if (T > kAttnMaxT) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: T must be <= 16 (the DFlash block size), got " +
                               std::to_string(T));
   }
   if (head_dim <= 0 || head_dim > kAttnMaxHeadDim || (head_dim % 32) != 0) {
@@ -1750,7 +1751,7 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
         "r4dx_dflash_attn_bf16: heads_q must be a multiple of heads_kv with ratio <= 4, got " +
         std::to_string(heads_q) + "/" + std::to_string(heads_kv));
   }
-  if (window <= 0 || window > kAttnMaxKeys - 8) {
+  if (window <= 0 || window > kAttnMaxKeys - kAttnMaxT) {
     throw std::runtime_error("r4dx_dflash_attn_bf16: window must be in [1, 2048], got " +
                               std::to_string(window));
   }

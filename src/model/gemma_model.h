@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "dflash_draft.h"
 #include "gemma_container.h"
 #include "gemma_mlp.h"
 #include "model_types.h"
@@ -64,6 +65,12 @@ struct GemmaModelOptions {
   int prefill_chunk = 256;      // rows per prefill chunk (<= 256: the ring holds window + 288)
   GemmaResid resid = GemmaResid::kFp32;
   bool prompt_checkpoint = false;  // spare copies of the sliding rings for SaveCheckpoint/RestoreCheckpoint
+  // DFlash drafter (docs/gemma4-plan.md section 6.4, D-6). Non-empty: load this dflash2 container (a DFlash v1
+  // checkpoint converted with `r4dx-convert --dflash-hf`), attach the target feature capture at its
+  // `target_layers` and inject every committed row into the drafter. `dflash_draft_k` (1..block_size-1) is the
+  // most tokens one round drafts. Both are inert at their defaults.
+  std::string dflash_container;
+  int64_t dflash_draft_k = 0;
 };
 
 // Reads R4DX_GEMMA_KV (fp8|bf16_full|bf16), R4DX_GEMMA_ATTN (ref|r4d) and R4DX_GEMMA_RESID (fp32|bf16) over the
@@ -120,6 +127,41 @@ class GemmaModel {
   void AttachFeatureCapture(std::vector<int64_t> layers);
   void DetachFeatureCapture();
   const uint16_t* FeatureBuffer() const { return features_dev_.data(); }
+  // ---- speculative verification + DFlash decode (docs/gemma4-plan.md D-6) ------------------------------------
+  // Runs `candidates` (W = 1..16 rows: [anchor, d1..dk]) as ONE chunk at PositionCount() WITHOUT committing, and
+  // returns the target's greedy argmax of every row (softcapped fp32 logits, the same kernel DecodeStepGreedy
+  // uses): row i's argmax is the token that follows candidates[i]. K/V of ALL W rows are written (sliding rings
+  // and full layers); the feature capture (if attached) holds all W rows. Follow with CommitVerifiedWindow(n).
+  //
+  // ROLLBACK. Rejected rows need no undo, on either kind of layer: a verify row at position p writes slot
+  // p % ring and clobbers position p - ring, which lies below frontier - window for every ring of at least
+  // window + W - 1 slots (Gemma: 1536 >= 1024 + 15), so a clobbered key is outside every future query's window;
+  // the stale bytes of the rejected positions are overwritten by the next window's own chunk write before any
+  // query can read them (a query only reads kpos <= its own position). Full layers are positional. Proved by
+  // simulation in tests/kernels/test_ring_verify_rollback.cpp. The one thing that DOES need care is bookkeeping:
+  // PositionCount() and the drafter's frontier advance only in CommitVerifiedWindow / the injection.
+  std::vector<int32_t> VerifyWindow(const std::vector<int32_t>& candidates);
+  // Commits the first `n` rows (1..rows of the last VerifyWindow): PositionCount() += n. Nothing else.
+  void CommitVerifiedWindow(int64_t n);
+  bool DflashEnabled() const { return dflash_.has_value(); }
+  int64_t DflashDraftK() const { return dflash_draft_k_; }
+  const DflashDraft& Drafter() const { return dflash_.value(); }
+  // Off: the feature capture and the drafter injection are skipped together (a request that never drafts);
+  // the next injection then opens a gap in the drafter's ring (DflashDraft::InjectFeatures), correct but cold.
+  void SetDflashInjectionEnabled(bool enabled);
+  // One DFlash round, greedy: draft up to `k` tokens from `token_id` (the last committed token, NOT yet fed to
+  // the target), verify [token_id, drafts] in one window, commit the longest prefix the target's own argmax
+  // confirms plus the bonus token, inject the committed rows' features into the drafter. Returns the committed
+  // tokens that FOLLOW token_id: accepted drafts then the bonus (1..k+1 tokens), byte-identical to as many plain
+  // DecodeStepGreedy calls (up to the verify-vs-decode GEMM numerics, a GPU gate). `walk_len_out`: tokens the
+  // selector walk produced before the n_min discard.
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                              int64_t* walk_len_out = nullptr);
+  // temperature <= 0 is DecodeStepDflashGreedy; a sampled DFlash round is not implemented for Gemma (throws).
+  std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                               const kernels::SampleParams& params, std::mt19937_64& rng,
+                                               int64_t* walk_len_out = nullptr);
+
   int64_t FeatureRows() const { return feature_rows_; }
   int64_t FeatureStartPosition() const { return feature_pos_; }
   const std::vector<int64_t>& FeatureLayers() const { return feature_layers_; }
@@ -130,8 +172,11 @@ class GemmaModel {
     float inv_temperature = 1.0f;
     kernels::RowSummary* out = nullptr;
   };
+  // `verify_argmax` non-null: a verify window (VerifyWindow) -- per-row argmax of all rows into it, pos_ NOT advanced.
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                              const SummaryRequest* summary_out, SpanAccumulator* prof);
+                              const SummaryRequest* summary_out, SpanAccumulator* prof,
+                              std::vector<int32_t>* verify_argmax = nullptr);
+  void InjectDflashRows(int64_t rows, int64_t start_pos);  // feeds features_dev_ rows [0, rows) to the drafter
   void RotateResidual(void* x, int64_t rows, bool inverse);  // x is fp32 or bf16 per opts_.resid
   void UploadChunkMeta(int64_t start_pos, int64_t T);
   void RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
@@ -169,6 +214,14 @@ class GemmaModel {
   core::DeviceBuffer<uint16_t> features_dev_;
   core::DeviceBuffer<float> features_f32_;  // fp32 resid mode: capture staging (rotated basis), un-rotated then narrowed
   int64_t feature_rows_ = 0, feature_pos_ = 0;
+
+  std::optional<DflashDraft> dflash_;
+  int64_t dflash_draft_k_ = 0;
+  bool dflash_injection_enabled_ = true;
+  double dflash_embed_scale_ = 1.0;  // the drafter container's embed_scale (R4DX_DFLASH_EMBED_SCALE overrides, A/B)
+  core::DeviceBuffer<float> verify_logits_dev_;    // [16, vocab] softcapped fp32 (lazily sized by VerifyWindow)
+  core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [16]
+  int64_t verified_rows_ = 0;                      // rows of the last VerifyWindow not yet committed (0 == none)
 };
 
 }  // namespace r4dx::model

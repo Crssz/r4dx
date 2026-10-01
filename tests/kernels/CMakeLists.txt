@@ -168,6 +168,11 @@ add_executable(test_ring_math test_ring_math.cpp)
 target_include_directories(test_ring_math PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d"
                            "${CMAKE_SOURCE_DIR}/src/model/attention/include")
 add_test(NAME test_ring_math COMMAND test_ring_math)
+# The verify-window lifecycle on the sliding ring (docs/gemma4-plan.md D-6): rejected rows need no rollback. CPU-only.
+add_executable(test_ring_verify_rollback test_ring_verify_rollback.cpp)
+target_include_directories(test_ring_verify_rollback PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+                           "${CMAKE_SOURCE_DIR}/src/model/attention/include")
+add_test(NAME test_ring_verify_rollback COMMAND test_ring_verify_rollback)
 
 # test_widen_softcap: r4dx_model_widen_softcap_bf16_to_f32 lives in r4dx_model_kernels (model_kernels.hip).
 target_include_directories(test_widen_softcap PRIVATE "${CMAKE_SOURCE_DIR}/src/model")

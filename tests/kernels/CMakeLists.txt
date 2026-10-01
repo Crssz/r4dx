@@ -136,6 +136,25 @@ target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 # ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
 target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
 
+# Gemma 4 stage-0 reference attention (docs/gemma4-plan.md 3.3, task M1-17; GPU step M1-18:
+# `ctest -R attn_ref_gemma`). The kernel lives in r4dx_model_attention (src/model/attention/src/
+# attn_ref.hip); the test also uses its SlidingKvCache / SlidingRingGeometry headers.
+add_executable(test_attn_ref_gemma test_attn_ref_gemma.cpp)
+target_link_libraries(test_attn_ref_gemma PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_attn_ref_gemma COMMAND test_attn_ref_gemma)
+set_tests_properties(test_attn_ref_gemma PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+
+# Pure CPU (no HIP call, no kernel library): the sliding-window / ring arithmetic of
+# third_party/libr4d/r4d_attn_window.h and SlidingRingGeometry against brute force and a simulated
+# ring (task M1-17; M1-32's kernels call the same header). Plain add_test(): they always run.
+add_executable(test_attn_window_math test_attn_window_math.cpp)
+target_include_directories(test_attn_window_math PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d")
+add_test(NAME test_attn_window_math COMMAND test_attn_window_math)
+add_executable(test_ring_math test_ring_math.cpp)
+target_include_directories(test_ring_math PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+                           "${CMAKE_SOURCE_DIR}/src/model/attention/include")
+add_test(NAME test_ring_math COMMAND test_ring_math)
+
 # test_widen_softcap: r4dx_model_widen_softcap_bf16_to_f32 lives in r4dx_model_kernels (model_kernels.hip).
 target_include_directories(test_widen_softcap PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
 target_link_libraries(test_widen_softcap PRIVATE r4dx_model_kernels)

@@ -72,14 +72,6 @@ std::vector<int32_t> GemmaLocalTextModel::DecodeStepMtpSampled(int32_t, int64_t,
                                                                std::mt19937_64&) {
   throw std::runtime_error("GemmaLocalTextModel: MTP is not available for Gemma 4 (the container carries no mtp.* head)");
 }
-std::vector<int32_t> GemmaLocalTextModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("GemmaLocalTextModel: DFlash is not wired for Gemma 4 yet (drafter track D-6)");
-}
-std::vector<int32_t> GemmaLocalTextModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t,
-                                                                  const kernels::SampleParams&, std::mt19937_64&,
-                                                                  int64_t*) {
-  throw std::runtime_error("GemmaLocalTextModel: DFlash is not wired for Gemma 4 yet (drafter track D-6)");
-}
 
 // The Gemma branch of LoadTextModel (text_model.h): TP=1 -> GemmaLocalTextModel, TP=2 -> GemmaTpModel (M1b-1).
 //
@@ -107,9 +99,11 @@ GemmaModelOptions MakeGemmaModelOptions(const ModelOptions& opts) {
   } else if (opts.max_ctx != defaults.max_ctx) {
     g.max_ctx = opts.max_ctx;  // an explicit request: ResolveMaxCtx refuses anything above the native context
   }
-  if (opts.mtp_draft_k > 0 || opts.dflash_draft_k > 0 || !opts.dflash_container.empty()) {
-    throw std::invalid_argument("LoadTextModel: MTP and DFlash are not available for Gemma 4 yet");
+  if (opts.mtp_draft_k > 0) {
+    throw std::invalid_argument("LoadTextModel: MTP is not available for Gemma 4 (the container carries no mtp.* head)");
   }
+  g.dflash_container = opts.dflash_container;
+  g.dflash_draft_k = opts.dflash_draft_k;
   ApplyGemmaEnv(&g);
   return g;
 }

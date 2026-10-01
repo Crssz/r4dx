@@ -1,7 +1,7 @@
 // r4dx::model::GemmaLocalTextModel -- the TP=1 TextModel of a gemma4_unified container (docs/gemma4-plan.md 3.2,
 // task M1-20): one GemmaModel on the calling thread's current HIP device, every method a forward to the
-// GemmaModel method of the same name. MTP, DFlash (until the drafter track lands its hooks) and images (M2)
-// throw std::runtime_error naming the feature; MtpEnabled() / DflashEnabled() / HasVision() are false.
+// GemmaModel method of the same name. MTP and images (M2) throw std::runtime_error naming the
+// feature (MtpEnabled() / HasVision() are false); DFlash forwards to GemmaModel's drafter when one was loaded.
 // LoadGemmaTextModel (gemma_local_text_model.cpp) is the Gemma branch of LoadTextModel.
 #pragma once
 
@@ -37,7 +37,7 @@ class GemmaLocalTextModel final : public TextModel {
   int64_t ImageEoiTokenId() const override { return m_.GetContainer().Info().eoi_token_id; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return m_.DflashEnabled(); }
   int64_t SampledFallbackRows() const override { return m_.SampledFallbackRows(); }
   int64_t PositionCount() const override { return m_.PositionCount(); }
   int64_t NumLoadedLayers() const override { return m_.GetContainer().NumLoadedLayers(); }
@@ -45,7 +45,7 @@ class GemmaLocalTextModel final : public TextModel {
   std::vector<VramReport> Vram() const override;
 
   void Reset() override { m_.Reset(); }
-  void SetDflashInjectionEnabled(bool) override {}
+  void SetDflashInjectionEnabled(bool enabled) override { m_.SetDflashInjectionEnabled(enabled); }
   void SaveCheckpoint() override { m_.SaveCheckpoint(); }
   void RestoreCheckpoint() override { m_.RestoreCheckpoint(); }
 
@@ -69,9 +69,15 @@ class GemmaLocalTextModel final : public TextModel {
   }
   std::vector<int32_t> DecodeStepMtpGreedy(int32_t, int64_t) override;
   std::vector<int32_t> DecodeStepMtpSampled(int32_t, int64_t, const kernels::SampleParams&, std::mt19937_64&) override;
-  std::vector<int32_t> DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t* = nullptr) override;
-  std::vector<int32_t> DecodeStepDflashSampled(int32_t, int64_t, float, int64_t, const kernels::SampleParams&,
-                                               std::mt19937_64&, int64_t* = nullptr) override;
+  std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                              int64_t* walk_len_out = nullptr) override {
+    return m_.DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
+  }
+  std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                               const kernels::SampleParams& params, std::mt19937_64& rng,
+                                               int64_t* walk_len_out = nullptr) override {
+    return m_.DecodeStepDflashSampled(token_id, k, p_min, n_min, params, rng, walk_len_out);
+  }
 
   StepProfile DecodeStepProfiled(int32_t token_id) override { return m_.DecodeStepProfiled(token_id); }
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) override { return m_.PrefillProfiled(token_ids); }

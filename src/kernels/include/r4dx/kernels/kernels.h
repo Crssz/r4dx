@@ -426,13 +426,19 @@ int64_t r4dx_topk_lse_workspace_bytes();
 //   is why they need not be cleared, exactly the "self-correcting via position overwrite" argument
 //   the append-only case already relies on. Slot mapping stays `p % slots` over TRUE absolute
 //   positions either way, so nothing about rope or the ring geometry changes.
-// Preconditions (throw, not silently wrong): 1 <= T <= 8; head_dim <= 128 and head_dim % 32 == 0;
+// Preconditions (throw, not silently wrong): 1 <= T <= 16 (block 8 for Qwen DFlash2, 16 for Gemma DFlash v1); head_dim <= 128 and head_dim % 32 == 0;
 // heads_q % heads_kv == 0 and the ratio <= 4; 1 <= window <= 2048; window <= slots (so the visible
 // store range can never alias itself in the ring); 0 <= store_begin <= n_injected.
 void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
                             int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
                             int head_dim, int n_injected, int store_begin, int window, int slots,
                             float scale, int64_t stream);
+// Same, with causal_block != 0: block row t sees only block keys 0..t (z-lab DFlash v1 sliding layers,
+// is_causal = layer_type == sliding_attention). causal_block == 0 is exactly r4dx_dflash_attn_bf16.
+void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                                   int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                                   int head_dim, int n_injected, int store_begin, int window,
+                                   int slots, float scale, int causal_block, int64_t stream);
 
 // ---- DFlash2 grouped dynamic depthwise conv (thin wrapper over libr4d) -------------------------
 // out[t,c] = (base[side,0,c] + dyn[t, side*taps*NG + 0*NG + g]) * x[t,c]

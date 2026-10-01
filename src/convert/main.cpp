@@ -239,6 +239,7 @@
                   // kW4A16Group at startup (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
+#include "r4dx_convert/dflash2_hf.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
 #include "r4dx_convert/hessian_store.hpp"
 #include "r4dx_convert/keep_bf16.hpp"
@@ -386,7 +387,14 @@ struct AppArgs {
   // exact-precision container), not the HF mode's "every layout side by side" model.
   std::string dflash_gguf;
   std::string dflash_out;
-  std::string dflash_layout = "w4a16";  // one of w4a16, bf16
+  std::string dflash_layout = "w4a16";  // one of w4a16, bf16 (--dflash-hf defaults to bf16 instead)
+  bool dflash_layout_set = false;
+  // --dflash-hf <HF DFlash v1 dir> --out <container> [--layout {bf16,w4a16}] (dflash2_hf.hpp): converts a
+  // z-lab DFlash v1 checkpoint with a synthesized identity conv and zero selector.
+  std::string dflash_hf;
+  int64_t dflash_layer_offset = 1;  // stored target_layers = target_layer_ids + this (z-lab: hidden_states[id + 1])
+  bool dflash_layer_offset_set = false;
+  double dflash_embed_scale = 0.0;  // <= 0: the checkpoint's input_embedding_scale (1.0 when absent)
 
   // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
   // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "rtn" (default) is
@@ -508,7 +516,23 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
     else if (arg == "--dflash-gguf") a.dflash_gguf = next(i);
     else if (arg == "--out") a.dflash_out = next(i);
-    else if (arg == "--layout") a.dflash_layout = next(i);
+    else if (arg == "--layout") { a.dflash_layout = next(i); a.dflash_layout_set = true; }
+    else if (arg == "--dflash-hf") a.dflash_hf = next(i);
+    else if (arg == "--dflash-target-layer-offset") {
+      const std::string v = next(i);
+      if (v != "0" && v != "1") throw std::runtime_error("--dflash-target-layer-offset must be 0 or 1, got '" + v + "'");
+      a.dflash_layer_offset = v == "1" ? 1 : 0;
+      a.dflash_layer_offset_set = true;
+    }
+    else if (arg == "--dflash-embed-scale") {
+      const std::string v = next(i);
+      size_t used = 0;
+      double s = 0.0;
+      try { s = std::stod(v, &used); } catch (const std::exception&) { used = 0; }
+      if (used != v.size() || !(s > 0.0) || !std::isfinite(s))
+        throw std::runtime_error("--dflash-embed-scale must be a finite number > 0, got '" + v + "'");
+      a.dflash_embed_scale = s;
+    }
     else if (arg == "--quant") a.quant = next(i);
     else if (arg == "--imatrix") a.imatrix = next(i);
     else if (arg == "--keep-bf16") a.keep_bf16 = next(i);
@@ -587,13 +611,18 @@ AppArgs ParseArgs(int argc, char** argv) {
     }
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  const bool dflash_mode = !a.dflash_gguf.empty() || !a.dflash_hf.empty();
+  if (!a.dflash_gguf.empty() && !a.dflash_hf.empty())
+    throw std::runtime_error("--dflash-gguf and --dflash-hf are mutually exclusive");
+  if (a.dflash_hf.empty() && (a.dflash_layer_offset_set || a.dflash_embed_scale > 0.0))
+    throw std::runtime_error("--dflash-target-layer-offset / --dflash-embed-scale need --dflash-hf");
   // --trellis-from (docs/trellis-kernel.md 3.3 step 6): an import of oracle bits into the Qwen
   // body. The selftest and the drafter have no body to import into; a reuse has nothing to reuse
   // (an import is I/O-bound) and its guard does not cover the oracle files (refused in v1, 3.4).
   if (a.trellis_options && a.trellis.from.empty())
     throw std::runtime_error("--trellis-manifest-sha256 / --trellis-verify / --trellis-allow-basis "
                              "/ --trellis-prescale-log2 need --trellis-from");
-  if (!a.trellis.from.empty() && (a.selftest || !a.dflash_gguf.empty()))
+  if (!a.trellis.from.empty() && (a.selftest || dflash_mode))
     throw std::runtime_error("--trellis-from applies only to the HF-checkpoint conversion "
                              "(--input/--output), not to --selftest or --dflash-gguf");
   if (!a.trellis.from.empty() && (!a.reuse_from.empty() || a.record_reuse_guard))
@@ -603,7 +632,7 @@ AppArgs ParseArgs(int argc, char** argv) {
                              "reuse)");
   // The guard describes an HF-checkpoint conversion (checkpoint files, its flags); the selftest and
   // the drafter have neither a sweep to share a baseline across nor a guard to check one against.
-  if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || !a.dflash_gguf.empty()))
+  if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || dflash_mode))
     throw std::runtime_error("--reuse-tensors-from / --record-reuse-guard apply only to the "
                              "HF-checkpoint conversion (--input/--output), not to --selftest or "
                              "--dflash-gguf");
@@ -613,7 +642,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // The DFlash2 drafter's loader (src/model/dflash_draft.cpp) reads every w4a16 linear at the
   // container's one default group, and its tensors share none of the Qwen base names the rules are
   // written against -- reject the combination rather than build a drafter it silently ignored.
-  if (!a.w4a16_group_rules.empty() && !a.dflash_gguf.empty())
+  if (!a.w4a16_group_rules.empty() && dflash_mode)
     throw std::runtime_error("--w4a16-group-rule does not apply to --dflash-gguf (the drafter is "
                              "packed at the build's default w4a16 group only)");
   const r4dx_convert::RotationKind rotate_kind = r4dx_convert::ParseRotationKind(a.rotate);
@@ -621,7 +650,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // undone at its exit by the runtime): the selftest's one bare tensor has no residual stream to
   // rotate and no runtime to undo it, and the DFlash2 drafter is un-rotated by design
   // (docs/quant2.md 1.2) -- a rotated drafter would be silently wrong, so both are argument errors.
-  if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || !a.dflash_gguf.empty()))
+  if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || dflash_mode))
     throw std::runtime_error("--rotate applies only to the HF-checkpoint conversion (--input/--output), "
                              "not to --selftest or --dflash-gguf");
   // A Qwen trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with
@@ -632,7 +661,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   if (!a.rotation_out.empty()) {
     if (rotate_kind == r4dx_convert::RotationKind::kNone)
       throw std::runtime_error("--rotation-out needs --rotate q2a|q2ab (there is no rotation to write)");
-    if (a.input.empty() || !a.output.empty() || a.selftest || !a.dflash_gguf.empty() ||
+    if (a.input.empty() || !a.output.empty() || a.selftest || dflash_mode ||
         !a.trellis.from.empty())
       throw std::runtime_error("--rotation-out takes --input and --rotate only (no --output, "
                                "--selftest, --dflash-gguf or --trellis-from)");
@@ -645,7 +674,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // (tools/reference/imatrix_capture.py); the DFlash2 drafter's tensors share none of them, so an
   // --imatrix passed alongside --dflash-gguf could only ever be a no-op. Reject it instead of
   // silently converting the drafter with unweighted MSE and reporting "imatrix-weighted".
-  if (!a.imatrix.empty() && !a.dflash_gguf.empty())
+  if (!a.imatrix.empty() && dflash_mode)
     throw std::runtime_error(
         "--imatrix does not apply to --dflash-gguf (the drafter has no importance matrix; "
         "tools/reference/imatrix_capture.py only captures the main model's linears)");
@@ -654,7 +683,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // exact failure mode the "matched nothing" warning exists to make visible, so reject it outright
   // rather than emit a warning nobody reads in a sweep log. (--layout bf16 is how you get a bf16
   // drafter.)
-  if (!a.keep_bf16.empty() && !a.dflash_gguf.empty())
+  if (!a.keep_bf16.empty() && dflash_mode)
     throw std::runtime_error("--keep-bf16 does not apply to --dflash-gguf (use --layout bf16 for a "
                              "bf16 drafter container)");
   // --ldlq has nothing to round against without the Hessians; failing here rather than at the first
@@ -666,7 +695,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // the DFlash2 drafter" is a non-goal), and its keys are the Qwen container's base names -- the
   // drafter shares none of them, so the flags could only ever be a no-op there. Same reasoning as
   // --imatrix/--keep-bf16 above.
-  if ((!a.ldlq.empty() || !a.hessian_dir.empty()) && !a.dflash_gguf.empty())
+  if ((!a.ldlq.empty() || !a.hessian_dir.empty()) && dflash_mode)
     throw std::runtime_error("--ldlq/--hessian-dir do not apply to --dflash-gguf (no Hessians are "
                              "captured for the drafter; tools/reference/hessian_capture.py only "
                              "covers the main model's linears)");
@@ -3022,6 +3051,28 @@ int RunDflashConvert(const AppArgs& args) {
   return 0;
 }
 
+// ---- --dflash-hf mode (docs/gemma4-plan.md D-3): HF DFlash v1 -> dflash2 container, identity conv --------
+int RunDflashHfConvert(const AppArgs& args) {
+  using namespace r4dx_convert;
+  DflashHfOptions o;
+  o.input_dir = args.dflash_hf;
+  o.output_path = args.dflash_out;
+  o.layout = args.dflash_layout_set ? args.dflash_layout : "bf16";
+  o.target_layer_offset = args.dflash_layer_offset;
+  o.embed_scale = args.dflash_embed_scale;
+  o.threads = ResolveThreads(args.threads);
+  o.quant.mode = ParseQuantMode(args.quant);
+  o.quant_metadata = BuildQuantMetadata();
+  std::cout << "[r4dx-convert --dflash-hf] input=" << o.input_dir << " out=" << o.output_path
+            << " layout=" << o.layout << " target_layer_offset=" << o.target_layer_offset
+            << " threads=" << o.threads << "\n";
+  const auto t0 = std::chrono::steady_clock::now();
+  ConvertDflashHf(o);
+  std::cout << "[r4dx-convert --dflash-hf] wrote " << o.output_path << " in "
+            << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3029,6 +3080,7 @@ int main(int argc, char** argv) {
     ValidateKernelGroupSizes();
     AppArgs args = ParseArgs(argc, argv);
     if (!args.dflash_gguf.empty()) return RunDflashConvert(args);
+    if (!args.dflash_hf.empty()) return RunDflashHfConvert(args);
     if (args.selftest) {
       if (args.selftest_input.empty() || args.selftest_output.empty())
         throw std::runtime_error("--selftest requires --selftest-input and --selftest-output");

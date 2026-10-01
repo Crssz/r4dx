@@ -16,6 +16,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/embedding.hpp"
+#include "r4dx/kernels/gemma_kernels.h"  // r4dx_embedding_gather_scaled_bf16 (a non-unit embed_scale)
 #include "r4dx/kernels/kernels.h"
 #include "tp/tp_vocab.h"  // tp::MergeTop16 (docs/tp.md 7.2, 8.2 H7)
 
@@ -59,6 +60,33 @@ DflashLmHeadProvider MakeTargetLmHeadProvider(const Container& container) {
     r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16),
                                  reinterpret_cast<int64_t>(logits_out), T * vocab,
                                  reinterpret_cast<int64_t>(stream.get()));
+  };
+}
+
+DflashEmbeddingProvider MakeEmbeddingProviderFromTable(const uint16_t* table_dev, int64_t hidden, int64_t vocab,
+                                                       float scale) {
+  return [table_dev, hidden, vocab, scale](core::Stream& stream, const int32_t*, const int32_t* ids_dev,
+                                           int64_t n, uint16_t* out_dev) {
+    if (scale == 1.0f) {
+      r4dx_embedding_gather_bf16(reinterpret_cast<int64_t>(table_dev), reinterpret_cast<int64_t>(ids_dev),
+                                 reinterpret_cast<int64_t>(out_dev), n, hidden, vocab,
+                                 reinterpret_cast<int64_t>(stream.get()));
+    } else {
+      r4dx_embedding_gather_scaled_bf16(reinterpret_cast<int64_t>(table_dev),
+                                        reinterpret_cast<int64_t>(ids_dev),
+                                        reinterpret_cast<int64_t>(out_dev), n, hidden, vocab, scale,
+                                        reinterpret_cast<int64_t>(stream.get()));
+    }
+  };
+}
+
+DflashLmHeadProvider MakeLmHeadProviderFromLinear(const QuantLinear* lm_head) {
+  return [lm_head](core::Stream& stream, core::Arena& arena, const uint16_t* x_dev, float* logits_out, int64_t T) {
+    const int64_t vocab = lm_head->N;
+    uint16_t* logits_bf16 = arena.Alloc<uint16_t>(static_cast<size_t>(T * vocab));
+    ApplyLinear(stream, arena, *lm_head, x_dev, logits_bf16, T);
+    r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(logits_out),
+                                 T * vocab, reinterpret_cast<int64_t>(stream.get()));
   };
 }
 
@@ -196,6 +224,14 @@ DflashDraft DflashDraft::Load(const DflashDraftOptions& opts) {
   }
   if (c.selector_top_k != 16) {
     throw std::runtime_error("DflashDraft: only selector_top_k=16 is built (r4dx_topk16_f32)");
+  }
+  // The block is 8 (Qwen DFlash2) or 16 (Gemma 4, DFlash v1): the attention kernel serves T <= 16 and the conv
+  // kernel needs a power-of-two block (its `t & (block - 1)` shift mask).
+  if (B < 2 || B > 16 || (B & (B - 1)) != 0) {
+    throw std::runtime_error("DflashDraft: block_size must be a power of two in [2, 16], got " + std::to_string(B));
+  }
+  if (c.attention.sliding_window < 1 || c.attention.sliding_window > 2048) {
+    throw std::runtime_error("DflashDraft: sliding_window must be in [1, 2048] (the attention kernel LDS score row)");
   }
   if (opts.max_inject_rows < 1 || opts.max_inject_rows > 64) {
     throw std::runtime_error("DflashDraft: max_inject_rows must be in [1, 64]");
@@ -461,7 +497,13 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
   // [valid_from_, n_injected_) intersected with the window, so an injection gap's stale bytes are
   // never read (docs/dflash2.md section 5, InjectFeatures' own doc comment).
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-  r4dx_dflash_attn_bf16(
+  // z-lab DFlash v1 (variant v1_identity): sliding layers are causal WITHIN the block (is_causal ==
+  // layer_type == sliding_attention, verified by tools/reference/gemma/dflash_hf_golden.py); the full layer and
+  // every native DFlash2 layer are non-causal.
+  const bool causal_block = cfg_.variant == "v1_identity" &&
+                            static_cast<size_t>(il) < cfg_.attention.sliding_window_pattern.size() &&
+                            cfg_.attention.sliding_window_pattern[static_cast<size_t>(il)];
+  r4dx_dflash_attn_causal_bf16(
       reinterpret_cast<int64_t>(q_.data()), reinterpret_cast<int64_t>(k_.data()),
       reinterpret_cast<int64_t>(v_.data()),
       reinterpret_cast<int64_t>(k_store_.data() + il * slots_ * kv_row),
@@ -469,7 +511,7 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
       reinterpret_cast<int64_t>(attn_.data()), static_cast<int>(B), static_cast<int>(heads_q),
       static_cast<int>(heads_kv), static_cast<int>(head_dim), static_cast<int>(n_injected_),
       static_cast<int>(valid_from_), static_cast<int>(cfg_.attention.sliding_window),
-      static_cast<int>(slots_), scale, s);
+      static_cast<int>(slots_), scale, causal_block ? 1 : 0, s);
 
   ApplyLinear(stream, arena, lw.o_proj, attn_.data(), proj_.data(), B);
   r4dx_dflash_conv_bf16(reinterpret_cast<int64_t>(proj_.data()),
@@ -625,6 +667,16 @@ DflashDraftResult DflashDraft::DraftRound(core::Stream& stream, core::Arena& are
     MergeTop16AcrossRanks();
     cand = merged_cand_.data();
     unary = merged_unary_.data();
+  }
+
+  // Final logit softcap (Gemma 4 DFlash: cap 30). cap * tanh(v / cap) is strictly increasing, so the top-16
+  // ids and their order from the RAW logits are exactly the capped logits' top-16; only the 16 values the
+  // selector walk adds its codebook terms to (and the p_min softmax) need the cap, applied here on the host
+  // after the one readback -- no kernel change, and nothing for a Qwen drafter (logit_softcap == 0).
+  if (cfg_.logit_softcap > 0.0) {
+    const float cap = static_cast<float>(cfg_.logit_softcap);
+    float* u = const_cast<float*>(unary);
+    for (int64_t i = 0; i < B * topk; ++i) u[i] = cap * std::tanh(u[i] / cap);
   }
 
   if (trace != nullptr) {

@@ -246,6 +246,15 @@ target_compile_definitions(test_gemma_forward_smoke PRIVATE R4DX_SOURCE_DIR_STR=
 add_test(NAME gemma_forward_smoke COMMAND test_gemma_forward_smoke)
 set_tests_properties(gemma_forward_smoke PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
+# test_gemma_audio (docs/gemma4-audio.md M3-2): the audio splice (GemmaModel::PrefillAudio) on a container converted with
+# --audio on -- finite non-flat logits for a synthetic clip, the audio changes the output, a 30 s / 750-token clip, a
+# prefill split inside the span agrees with the one-call one. GPU test (device 1); SKIP 77 while the container is missing
+# (R4DX_GEMMA_AUDIO_CONTAINER). The CPU half is tests/audio. ctest -R gemma_audio.
+add_executable(test_gemma_audio test_gemma_audio.cpp)
+target_link_libraries(test_gemma_audio PRIVATE r4dx_model r4dx_audio r4dx_convert r4dx_core r4d_core)
+add_test(NAME gemma_audio COMMAND test_gemma_audio)
+set_tests_properties(gemma_audio PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
 # test_gemma_rot_trellis (docs/gemma4-plan.md M1-31): GemmaModel on the rotated trellis containers convert_gemma_trellis
 # keeps (R4DX_GEMMA_TRELLIS_KEEP), against the same checkpoint unrotated bf16 (converted here by r4dx-convert): the
 # loader accepts the pair, default KV is bf16, logits track the reference, fp8 KV is finite. GPU test (device 1); NOT RUN

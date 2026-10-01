@@ -402,6 +402,30 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
                                         hidden, cfg.vocab_size, cfg.EmbedScale(), s);
     }
   });
+  // Audio soft-token rows (PrefillAudio): overwrite the gather result, unscaled, before the rotation.
+  if (splice_spans_ != nullptr) {
+    bool spliced = false;
+    for (const AudioRowSpan& sp : *splice_spans_) {
+      const int64_t lo = std::max<int64_t>(sp.offset, splice_chunk_off_);
+      const int64_t hi = std::min<int64_t>(sp.offset + sp.tokens, splice_chunk_off_ + T);
+      if (lo >= hi) continue;
+      const int64_t rows = hi - lo;
+      const uint16_t* src = sp.rows + (lo - sp.offset) * hidden;
+      const int64_t dst_row = lo - splice_chunk_off_;
+      if (f32) {
+        std::vector<float> wide(static_cast<size_t>(rows * hidden));
+        for (size_t k = 0; k < wide.size(); ++k) wide[k] = Bf16ToF32(src[k]);
+        R4DX_HIP_CHECK(hipMemcpyAsync(static_cast<char*>(cur) + dst_row * hidden * 4, wide.data(), wide.size() * 4,
+                                      hipMemcpyHostToDevice, s_raw));
+        stream_.Synchronize();  // `wide` is pageable host memory: finish the copy before it goes out of scope
+      } else {
+        R4DX_HIP_CHECK(hipMemcpyAsync(static_cast<char*>(cur) + dst_row * hidden * 2, src,
+                                      static_cast<size_t>(rows * hidden) * 2, hipMemcpyHostToDevice, s_raw));
+        spliced = true;
+      }
+    }
+    if (spliced) stream_.Synchronize();  // the bf16 path copies straight from the caller's rows
+  }
   // Residual rotation: x Q after the (text-row) scale, before layer 0 (docs/gemma4-plan.md 4.4).
   if (rotated) ProfiledCall(prof, s_raw, "rotate.entry", [&] { RotateResidual(cur, T, false); });
 
@@ -524,6 +548,37 @@ std::vector<float> GemmaModel::Prefill(const std::vector<int32_t>& token_ids,
     const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
                                      token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     const bool last = off + n == token_ids.size();
+    off += n;
+    std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr);
+    if (on_chunk_captured) on_chunk_captured();
+    if (last) logits = std::move(l);
+  }
+  return logits;
+}
+
+std::vector<float> GemmaModel::PrefillAudio(const std::vector<int32_t>& token_ids, const std::vector<AudioRowSpan>& spans,
+                                            const std::function<void()>& on_chunk_captured) {
+  if (spans.empty()) return Prefill(token_ids, on_chunk_captured);
+  if (token_ids.empty()) throw std::runtime_error("GemmaModel::PrefillAudio: token_ids is empty");
+  const int64_t total = static_cast<int64_t>(token_ids.size());
+  for (const AudioRowSpan& sp : spans) {
+    if (sp.rows == nullptr || sp.tokens < 1 || sp.offset < 0 || sp.offset + sp.tokens > total) {
+      throw std::runtime_error("GemmaModel::PrefillAudio: audio span [" + std::to_string(sp.offset) + ", +" +
+                               std::to_string(sp.tokens) + ") is outside the " + std::to_string(total) + " tokens fed");
+    }
+  }
+  struct SpliceGuard {  // the pointer must never outlive the caller's spans, even on a throw
+    GemmaModel* m;
+    ~SpliceGuard() { m->splice_spans_ = nullptr; m->splice_chunk_off_ = 0; }
+  } guard{this};
+  splice_spans_ = &spans;
+  std::vector<float> logits;
+  for (size_t off = 0; off < token_ids.size();) {
+    const size_t n = std::min(static_cast<size_t>(max_chunk_), token_ids.size() - off);
+    const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(off),
+                                     token_ids.begin() + static_cast<ptrdiff_t>(off + n));
+    const bool last = off + n == token_ids.size();
+    splice_chunk_off_ = static_cast<int64_t>(off);
     off += n;
     std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr);
     if (on_chunk_captured) on_chunk_captured();

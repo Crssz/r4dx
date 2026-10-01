@@ -35,6 +35,7 @@ add_subdirectory(model)
 # tests/vision/**, docs/vision.md); this add_subdirectory() line is the only touch that component
 # makes outside those paths (plus its own src/vision entry in the root CMakeLists.txt).
 add_subdirectory(vision)
+add_subdirectory(audio)
 
 # tests/cli/: r4dx-cli argument-parsing unit test (src/cli/**).
 add_subdirectory(cli)

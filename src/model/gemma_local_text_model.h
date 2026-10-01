@@ -6,10 +6,12 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "audio_embed.h"  // src/audio
 #include "gemma_model.h"
 #include "text_model.h"
 
@@ -44,6 +46,13 @@ class GemmaLocalTextModel final : public TextModel {
   void EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
                     vision::VisionEncodeStats* = nullptr) override;
 
+  // Audio (docs/gemma4-audio.md): the container's audio projection, read on the host (LoadGemmaTextModel sets it
+  // when the container carries one). EncodeAudio is CPU-only; PrefillAudio splices its rows.
+  void SetAudio(audio::AudioEmbedder embedder) { audio_.emplace(std::move(embedder)); }
+  bool HasAudio() const override { return audio_.has_value(); }
+  std::vector<uint16_t> EncodeAudio(const float* frames, int64_t n) override;
+  std::vector<float> PrefillAudio(const std::vector<int32_t>& token_ids, const std::vector<AudioRowSpan>& spans) override;
+
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids) override { return m_.Prefill(token_ids); }
   std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                        const std::vector<ImageSpan>& images) override;
@@ -63,6 +72,7 @@ class GemmaLocalTextModel final : public TextModel {
 
  private:
   GemmaModel m_;
+  std::optional<audio::AudioEmbedder> audio_;
 };
 
 }  // namespace r4dx::model

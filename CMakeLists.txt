@@ -47,6 +47,7 @@ add_subdirectory(src/tokenizer)
 # r4dx_vision_tower (Container owns the loaded vision.* weights -- docs/vision.md "Load policy").
 add_subdirectory(src/convert)
 add_subdirectory(src/vision)
+add_subdirectory(src/audio)
 add_subdirectory(src/model)
 add_subdirectory(src/server)
 add_subdirectory(src/cli)

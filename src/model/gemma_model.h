@@ -96,6 +96,12 @@ class GemmaModel {
   // `on_chunk_captured` runs once per chunk after it finished (the feature rows of that chunk are valid).
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids,
                              const std::function<void()>& on_chunk_captured = nullptr);
+  // Prefill() with host-computed soft-token rows (audio, docs/gemma4-audio.md) spliced over the scaled embedding
+  // gather: every span's [offset, offset + tokens) rows (offsets relative to `token_ids`) are replaced, unscaled,
+  // by `rows` (host bf16 [tokens, hidden]) before the residual rotation, chunk by chunk (a span may straddle
+  // chunks). With an empty `spans` this is exactly Prefill(). Throws on a span outside `token_ids`.
+  std::vector<float> PrefillAudio(const std::vector<int32_t>& token_ids, const std::vector<AudioRowSpan>& spans,
+                                  const std::function<void()>& on_chunk_captured = nullptr);
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
@@ -164,6 +170,10 @@ class GemmaModel {
   core::DeviceBuffer<int32_t> argmax_dev_, summary_ids_dev_;
   core::DeviceBuffer<float> summary_vals_dev_, summary_lse_dev_;
   std::vector<float> sampled_row_scratch_;
+  // PrefillAudio's current chunk: the spans of the whole call and the index of this chunk's first token in it
+  // (RunChunk splices the overlap after the embedding gather); null outside PrefillAudio.
+  const std::vector<AudioRowSpan>* splice_spans_ = nullptr;
+  int64_t splice_chunk_off_ = 0;
 
   std::vector<int64_t> feature_layers_;
   core::DeviceBuffer<uint16_t> features_dev_;

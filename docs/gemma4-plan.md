@@ -1,4 +1,4 @@
-﻿# Gemma 4 12B support for r4dx -- design and task plan
+# Gemma 4 12B support for r4dx -- design and task plan
 
 Branch `gemma4` (from `main` at `9063730`). Written 2026-10-01. This is a **design only**: no source
 file was edited, no GPU workload was run and no package was installed while writing it. Where it says
@@ -756,6 +756,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
 | M1-23/26/27/28 pipeline | CPU-verified, GPU pending | section 11: 	ools\gemma\trellis_pipeline.ps1 (kvcalib, merge, hessian, oracle-k4/k5, mix, convert, gate), gemma\kv_calibrate_full.py, gen_samples.py --merge hardened, Gemma proxy-gain mix ranking; waits for shard 0 |
 | M1-29 | partial | CPU plan legality test (test_trellis_gemma_plan) passes, 243 checks; M256 plans ok for all 16 Gemma shapes at KB4/5 via the SK2/SKG1 fallback; Gemma cases added to test_trellis_{decode,input,gemm,m256} (built, NOT run); tune_gemm.py has a gemma group; trellis bench rows still to produce on GPU |
+| M3 audio | partial (CPU done, GPU pending) | `docs/gemma4-audio.md`; `audio_golden_gemma.py` verifies frames / embedder / processor / chat template / causality vs transformers 5.18; `src/audio` (WAV, framing, CPU embedder), `GemmaModel::PrefillAudio` splice, server `input_audio` parts (wav, 16 kHz only, <= 30 s), converter `--audio on` verified; CPU tests `test_audio`, `test_audio_golden`, `test_openai_types`, `convert_gemma_layout` pass; GPU `gemma_audio` (`test_gemma_audio`) written, compiled, NOT run; HF transcript-agreement gate open; no CLI `--audio`, no audio+image request |
 | M1-load | done (CPU) | crash-robust loading merged (g4-load-crash): ShardIndex reads single-file checkpoints without mmap; commit-headroom guard for from_pretrained; test_load_robust.py CPU-tested. Recommend ~30 GB free commit before GPU jobs |
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader now accepts rotated trellis containers (`CheckTrellisChoice(..., allow_rotated=true)`; `test_gemma_container` part (d) Inspects the real rot-q2ab / rot-q2a containers of `convert_gemma_trellis`); default KV is bf16; the GPU test `gemma_rot_trellis` (`tests/model/test_gemma_rot_trellis.cpp`) is written, NOT run |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
@@ -841,9 +842,9 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 
 ### M3: audio
 
-- **M3-0 Audio design pass.** Scope: 16 kHz decode, pad to a multiple of 640, RMSNorm(640) and Linear, causal, max 750 tokens, content parts, `<|audio>` expansion. Deps: M2-3. Done: design doc.
-- **M3-1 `audio_golden_gemma.py`, CPU.** Includes a causality check. Deps: M0-6.
-- **M3-2 Implement and gate [GPU].** Same pattern as M2-3. Deps: M3-0, M3-1, M2-2.
+- **M3-0 Audio design pass (done: `docs/gemma4-audio.md`).** Scope: 16 kHz decode, pad to a multiple of 640, RMSNorm(640) and Linear, causal, max 750 tokens, content parts, `<|audio>` expansion. Deps: M2-3. Done: design doc.
+- **M3-1 `audio_golden_gemma.py`, CPU (done).** Includes a causality check. Deps: M0-6.
+- **M3-2 Implement and gate [GPU] (implemented and CPU-tested; the GPU test `gemma_audio` and the HF transcript gate are pending).** Same pattern as M2-3. Deps: M3-0, M3-1, M2-2.
 
 ### D: drafter (parallel, non-blocking)
 

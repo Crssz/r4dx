@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -114,6 +115,19 @@ class TextModel {
   virtual void EncodeImages(const float* pixel_values, int64_t total_patches,
                             const std::vector<vision::GridThw>& grids, ImageRows* out,
                             vision::VisionEncodeStats* stats = nullptr) = 0;
+
+  // ---- audio (Gemma 4 only, docs/gemma4-audio.md; Qwen's models keep these defaults) ---------------
+  // True iff the container carries the audio projection (converted with `--audio on`). EncodeAudio runs the
+  // CPU embedder (RMSNorm + Linear) over `n` frames of [n, 640] f32 and returns host bf16 rows [n, hidden];
+  // PrefillAudio is Prefill with those rows spliced (AudioRowSpan). Both throw unless HasAudio().
+  virtual bool HasAudio() const { return false; }
+  virtual std::vector<uint16_t> EncodeAudio(const float* /*frames*/, int64_t /*n*/) {
+    throw std::runtime_error("this model has no audio embedder (audio input is Gemma 4 only, container converted with --audio on)");
+  }
+  virtual std::vector<float> PrefillAudio(const std::vector<int32_t>& /*token_ids*/,
+                                          const std::vector<AudioRowSpan>& /*spans*/) {
+    throw std::runtime_error("this model has no audio embedder (audio input is Gemma 4 only, container converted with --audio on)");
+  }
 
   // ---- forward (identical contracts to Model's methods of the same name) ----------------------
   virtual std::vector<float> Prefill(const std::vector<int32_t>& token_ids) = 0;

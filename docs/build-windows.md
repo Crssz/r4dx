@@ -35,14 +35,14 @@ one clang toolchain and one CRT selection with the HIP-compiled objects.
 CMake's `HIP` language support fights `clang-cl` on this box (this is why `env_windows_rocm.cmd`
 in the sibling `vLLM_for_AMD` project needs a full `vcvars64` + `CMAKE_HIP_COMPILER` dance for its
 own build). r4dx sidesteps it entirely: the project is `CXX`-only, and
-`third_party/CMakeLists.txt` drives `hipcc.exe` directly through 13 `add_custom_command(OUTPUT
+`third_party/CMakeLists.txt` drives `hipcc.exe` directly through 14 `add_custom_command(OUTPUT
 <unit>.obj COMMAND ... hipcc.exe ...)` rules -- one per libr4d translation unit r4dx links -- then
 hands the resulting `.obj` files to `add_library(r4d_core STATIC ...)` as pre-built "external
 objects" (`set_source_files_properties(... EXTERNAL_OBJECT TRUE GENERATED TRUE)`), a standard CMake
 pattern for objects that did not come from CMake's own compile rules. Ninja treats each hipcc
 invocation as an ordinary custom-command edge, so it parallelizes them like any other build step
 (the units compile in ~15s wall time with 32 janitor threads on this machine's Ninja default job
-count). The 13 units are the attention (paged, vit), 5 GDN, bf16 / w4a16 / trellis M<=64 / trellis
+count). The 14 units are the attention (paged gqa6, paged gqa2 sliding-window, vit), 5 GDN, bf16 / w4a16 / trellis M<=64 / trellis
 M=256 GEMM, DFlash conv and registry units.
 
 ### hipcc flags

@@ -144,6 +144,17 @@ target_link_libraries(test_attn_ref_gemma PRIVATE r4dx_model_attention r4dx_core
 add_test(NAME test_attn_ref_gemma COMMAND test_attn_ref_gemma)
 set_tests_properties(test_attn_ref_gemma PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 
+# libr4d's sliding-window attention (docs/gemma4-plan.md 3.3, task M1-32; the GPU step is
+# `ctest -R "attn_.*gqa2"`): r4d_attn_{prefill,decode}_h256_gqa2_fp8kv against the stage-0 reference
+# kernel above, on the same fp8 ring bytes (gemma_attn_fixture.hpp). Window 1024 on the 1536-token
+# ring past its wrap, verify windows, small windows, klimit_ext, refusals.
+foreach(t test_attn_prefill_gqa2 test_attn_decode_gqa2)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+endforeach()
+
 # Pure CPU (no HIP call, no kernel library): the sliding-window / ring arithmetic of
 # third_party/libr4d/r4d_attn_window.h and SlidingRingGeometry against brute force and a simulated
 # ring (task M1-17; M1-32's kernels call the same header). Plain add_test(): they always run.

@@ -50,8 +50,13 @@ class SlidingRingGeometry {
   int RingBlocks() const { return ring_tokens_ / bs_; }
   int MaxChunkRows() const { return r4d_ring_max_chunk(ring_tokens_, window_); }
   bool ChunkFits(int rows) const { return r4d_ring_fits(ring_tokens_, window_, rows); }
-  // Entries of the shared block table: it indexes bt[kpos / block_size] for every key below max_ctx.
-  int BlockTableEntries() const { return (max_ctx_ + bs_ - 1) / bs_; }
+  // Entries of the shared block table: bt[kpos / block_size] for every key below max_ctx, plus
+  // kTableSlackEntries. The attention kernels prefetch the block-table entries of a whole tile (up to
+  // 48 keys = 3 blocks) one tile ahead, so the last tile of a context that ends mid-tile reads up to
+  // 2 entries past the last block; those values are never used, but the read must stay inside the
+  // allocation (a table that is an exact multiple of the allocator's page would fault).
+  static constexpr int kTableSlackEntries = 4;
+  int BlockTableEntries() const { return (max_ctx_ + bs_ - 1) / bs_ + kTableSlackEntries; }
 
   // T[i] = i % RingBlocks(): block i of the sequence lives in ring block i % RB.
   std::vector<int32_t> BuildBlockTable() const {

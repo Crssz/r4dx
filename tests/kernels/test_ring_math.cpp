@@ -51,8 +51,9 @@ void TestGemmaNumbers() {
   CHECK(g.MaxChunkRows() == 512, "512 rows of chunk headroom");
   CHECK(g.ChunkFits(288) && g.ChunkFits(256) && g.ChunkFits(16) && g.ChunkFits(512), "image / prefill / verify chunks fit");
   CHECK(!g.ChunkFits(513), "513 rows do not fit");
-  CHECK(g.BlockTableEntries() == 16384, "block table indexes 262144 / 16 blocks");
-  CHECK(g.BlockTableEntries() * 4 == 65536, "the shared block table is 64 KiB");
+  CHECK(g.BlockTableEntries() == 16384 + SlidingRingGeometry::kTableSlackEntries,
+        "block table indexes 262144 / 16 blocks plus the tile-prefetch slack");
+  CHECK(g.BlockTableEntries() * 4 == 65536 + 16, "the shared block table is 64 KiB (+ 16 B of slack)");
   const int64_t per_layer = int64_t{g.RingBlocks()} * 8 /*kv heads*/ * 16 * 2 * 256;
   CHECK(per_layer * 40 == 251658240, "40 sliding layers x 8 kv heads x 1536 tokens x 512 B = 252 MB fp8");
   const SlidingRingGeometry h(1024, 16, 16, 131072);   // a verify-only geometry still gets slack

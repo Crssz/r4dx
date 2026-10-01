@@ -46,12 +46,16 @@
 
 #include <cstddef>
 #include <string>
+#include <utility>
 
 namespace r4dx::server {
 
 class ToolStreamGate {
  public:
   ToolStreamGate() = default;
+  // Dialect opener (ModelDialect::tool_open): Qwen "<tool_call>" (the default), Gemma 4
+  // "<|tool_call>" (holdback len-1 == 11). Must be non-empty and match the parser's own opener.
+  explicit ToolStreamGate(std::string opener) : opener_(std::move(opener)) {}
 
   // True once a literal "<tool_call>" has been seen. Terminal: a closed gate never streams another
   // byte, because everything from the opener onward belongs to a span only the end-of-generation
@@ -78,8 +82,9 @@ class ToolStreamGate {
   std::string Finish();
 
  private:
+  std::string opener_ = "<tool_call>";
   bool closed_ = false;
-  std::string hold_;    // bytes that could still extend into "<tool_call>"
+  std::string hold_;    // bytes that could still extend into the opener
   size_t streamed_ = 0;
 };
 

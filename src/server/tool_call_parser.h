@@ -69,6 +69,8 @@
 #include <string>
 #include <vector>
 
+#include "dialect.h"
+
 namespace r4dx::server {
 
 struct ParsedToolCall {
@@ -101,6 +103,12 @@ struct ToolCallParseResult {
 // at all returns `{content == text, tool_calls == {}, had_malformed_call == false}` unchanged --
 // the overwhelmingly common case (no tool was called), so this is cheap to call unconditionally.
 ToolCallParseResult ParseToolCalls(const std::string& text);
+
+// Dialect-aware entry point: Qwen35 forwards to ParseToolCalls(text) unchanged; Gemma4 parses
+// `<|tool_call>call:NAME{k:v,...}<tool_call|>` spans (gemma_tool_call_parser.cpp). Same contract
+// (never throws, malformed spans degrade to content with had_malformed_call).
+ToolCallParseResult ParseToolCalls(const std::string& text, const ModelDialect& dialect);
+ToolCallParseResult ParseGemmaToolCalls(const std::string& text, const ModelDialect& dialect);
 
 // Drops any parsed tool call whose name is not in `known_names` (case-sensitive, matching OpenAI
 // function-name semantics). tool_choice: "none" already removes every tool definition from the

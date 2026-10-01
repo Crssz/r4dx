@@ -143,6 +143,11 @@ ToolCallParseResult ParseToolCalls(const std::string& text) {
   return result;
 }
 
+ToolCallParseResult ParseToolCalls(const std::string& text, const ModelDialect& dialect) {
+  if (dialect.kind == DialectKind::kGemma4) return ParseGemmaToolCalls(text, dialect);
+  return ParseToolCalls(text);
+}
+
 int DropUnknownToolCalls(ToolCallParseResult& result, const std::vector<std::string>& known_names) {
   if (known_names.empty() || result.tool_calls.empty()) return 0;
   std::vector<ParsedToolCall> kept;

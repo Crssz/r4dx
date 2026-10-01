@@ -169,7 +169,9 @@ def main(argv: list[str] | None = None) -> int:
     kw = {"dtype": torch.bfloat16, "attn_implementation": args.attn}
     if device.type == "cuda":
         kw["device_map"] = {"": 0}
-    model = Gemma4UnifiedForConditionalGeneration.from_pretrained(str(args.model_dir), **kw)
+    from gemma.common_gemma import guarded_from_pretrained
+
+    model = guarded_from_pretrained(Gemma4UnifiedForConditionalGeneration, args.model_dir, **kw)
     if device.type != "cuda":
         model.to(device)
     model.eval()

@@ -1340,7 +1340,8 @@ def model_linears(model_dir: Path, arch: ArchSpec | None = None) -> list[dict]:
     arch = resolve_arch(None, model_dir) if arch is None else arch
     from common import ShardIndex
 
-    wm = ShardIndex.load(Path(model_dir)).weight_map
+    sidx = ShardIndex.load(Path(model_dir))
+    wm = sidx.weight_map
     if not wm:
         raise FileNotFoundError(f"{model_dir}: no model.safetensors.index.json / model.safetensors")
     from safetensors import safe_open
@@ -1355,6 +1356,10 @@ def model_linears(model_dir: Path, arch: ArchSpec | None = None) -> list[dict]:
             out.append({"name": name, "layer": layer, "idx": idx, "module": mod, "layer_type": lt,
                         "qgroup": arch.qgroups[mod]})
     for shard, names in by_shard.items():
+        if sidx.single_file is not None:  # header only, no whole-file mmap (g4-load-crash)
+            for nm in names:
+                shapes[nm] = list(sidx._hdr[0][nm]["shape"])
+            continue
         with safe_open(str(Path(model_dir) / shard), framework="pt", device="cpu") as f:
             for nm in names:
                 shapes[nm] = list(f.get_slice(nm).get_shape())

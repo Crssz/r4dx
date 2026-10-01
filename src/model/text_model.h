@@ -144,4 +144,9 @@ class TextModel {
 // tp_model.cpp.
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp);
 
+// The Gemma 4 branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kGemma4). Defined in
+// tp_model.cpp as a throwing placeholder until M1-20 lands GemmaLocalTextModel (TP=1) and, later,
+// GemmaTpModel. TextModel::Config().arch is Arch::kGemma4 for what it returns.
+std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp);
+
 }  // namespace r4dx::model

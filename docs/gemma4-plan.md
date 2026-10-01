@@ -663,8 +663,8 @@ rather than forked; the Qwen scripts stay frozen.
   `hidden_states[id+1]`, the inputs are [2,11,20,28,37,46] (offset 1, matching the Qwen precedent;
   UNVERIFIED). `--dflash-target-layer-offset {0,1}` (default 1); the A/B acceptance run is decisive.
   Capture buffer `[64, 6*3840]` bf16; `fc` K = 23040 = 45 x 512.
-- **Embed scale and softcap:** embed scale (UNVERIFIED) lives in the embedding provider as `embed_scale`
-  (reuse the target's scaled gather); softcap 30 is strictly monotone so top-16 over raw logits is
+- **Embed scale and softcap:** embed scale lives in the embedding provider as `embed_scale`
+  (RESOLVED vs raw z-lab model.py: the drafter feeds RAW table rows, scale 1.0, NOT the target's scaled gather; 62 kept only as an A/B arm, docs/dflash2.md 13.1; causality of the sliding layers also corrected there); softcap 30 is strictly monotone so top-16 over raw logits is
   identical: apply `30*tanh(v/30)` to the 16 `unary` values on the host after the readback in `DraftRound`
   (guarded by `> 0`; no kernel change); the lm_head provider is the bare GEMM (no final norm, no softcap).
 - **Runtime changes:** (a) block 16: raise the `T <= 8` limit (kernel body unread: possibly a rewrite),

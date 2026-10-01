@@ -1182,7 +1182,7 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
     const __hip_bfloat16* __restrict__ v_block, const __hip_bfloat16* __restrict__ k_store,
     const __hip_bfloat16* __restrict__ v_store, __hip_bfloat16* __restrict__ out, int T,
     int heads_q, int heads_kv, int head_dim, int n_injected, int store_begin, int window, int slots,
-    float scale) {
+    float scale, int causal_block) {
   const int t = blockIdx.x;
   const int kvh = blockIdx.y;
   const int ratio = heads_q / heads_kv;
@@ -1200,7 +1200,9 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
   int lo = q_pos - window + 1;
   if (lo < store_begin) lo = store_begin;
   const int n_store = n_injected > lo ? n_injected - lo : 0;
-  const int total = n_store + T;  // + the block's own T keys, all unconditionally visible
+  // + the block's own keys: all T when non-causal (Qwen DFlash2, z-lab full layer), or only keys 0..t when
+  // causal_block (z-lab v1 sliding layers: is_causal = layer_type == sliding_attention).
+  const int total = n_store + (causal_block ? t + 1 : T);
 
   __shared__ float s_q[kAttnMaxRatio][kAttnMaxHeadDim];
   __shared__ float s_sc[kAttnMaxRatio][kAttnMaxKeys];
@@ -1730,10 +1732,10 @@ void r4dx_topk_lse_f32_ws(int64_t logits, int64_t out_ids, int64_t out_vals, int
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
-void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
-                            int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
-                            int head_dim, int n_injected, int store_begin, int window, int slots,
-                            float scale, int64_t stream) {
+void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                                   int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                                   int head_dim, int n_injected, int store_begin, int window,
+                                   int slots, float scale, int causal_block, int64_t stream) {
   if (T <= 0 || heads_kv <= 0) return;
   // Every one of these is a HARD precondition of the kernel's fixed LDS geometry: violating one
   // would read/write outside s_q/s_sc rather than merely produce a slow answer.
@@ -1781,8 +1783,16 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
                      (const __hip_bfloat16*)k_block, (const __hip_bfloat16*)v_block,
                      (const __hip_bfloat16*)k_store, (const __hip_bfloat16*)v_store,
                      (__hip_bfloat16*)out, T, heads_q, heads_kv, head_dim, n_injected, store_begin,
-                     window, slots, scale);
+                     window, slots, scale, causal_block ? 1 : 0);
   R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                           int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                           int head_dim, int n_injected, int store_begin, int window, int slots,
+                           float scale, int64_t stream) {
+  r4dx_dflash_attn_causal_bf16(q, k_block, v_block, k_store, v_store, out, T, heads_q, heads_kv, head_dim,
+                               n_injected, store_begin, window, slots, scale, /*causal_block=*/0, stream);
 }
 
 void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, int T, int H,

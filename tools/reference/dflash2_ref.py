@@ -595,6 +595,7 @@ def draft_round(
     mask_token_id: int | None = None,
     embed_scale: float = 1.0,
     logit_softcap: float = 0.0,
+    block_causal_layers: list[bool] | None = None,
 ) -> DraftRoundResult:
     cfg = weights.cfg
     block_size = cfg.block_size
@@ -640,6 +641,8 @@ def draft_round(
         full_v = np.concatenate([kv_cache.v, v], axis=0)
         full_pos = np.concatenate([kv_cache.pos, pos], axis=0)
         mask = swa_visible(pos, full_pos, cfg.sliding_window)
+        if block_causal_layers is not None and block_causal_layers[il]:  # z-lab v1 sliding layers (is_causal)
+            mask = mask & (full_pos[None, :] <= pos[:, None])
 
         scale = 1.0 / np.sqrt(cfg.head_dim)
         attn_out = attention_gqa(q, full_k, full_v, mask, scale)

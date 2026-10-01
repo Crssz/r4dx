@@ -433,6 +433,12 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
                             int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
                             int head_dim, int n_injected, int store_begin, int window, int slots,
                             float scale, int64_t stream);
+// Same, with causal_block != 0: block row t sees only block keys 0..t (z-lab DFlash v1 sliding layers,
+// is_causal = layer_type == sliding_attention). causal_block == 0 is exactly r4dx_dflash_attn_bf16.
+void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                                   int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                                   int head_dim, int n_injected, int store_begin, int window,
+                                   int slots, float scale, int causal_block, int64_t stream);
 
 // ---- DFlash2 grouped dynamic depthwise conv (thin wrapper over libr4d) -------------------------
 // out[t,c] = (base[side,0,c] + dyn[t, side*taps*NG + 0*NG + g]) * x[t,c]

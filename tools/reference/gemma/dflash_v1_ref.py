@@ -11,8 +11,8 @@ v1 semantics encoded here (read from z-lab/dflash/model.py, recorded in src/conv
     input_layernorm; K = rope(k_norm(k_proj g)), V = v_proj g, at the feature's absolute position;
   * draft block:   x = embed(ids) * input_embedding_scale (default 1.0: the RAW target table rows);
     per layer: h = input_layernorm(x); q,k,v = proj(h); q_norm/k_norm (per head, plain RMS); rope(q at the block
-    positions, k at [ctx positions ; block positions]); NON-causal attention over [ctx ; block] keys, sliding
-    layers restricted to `q_pos - k_pos < sliding_window`, then o_proj, residual; post_attention_layernorm,
+    positions, k at [ctx positions ; block positions]); attention over [ctx ; block] keys: sliding layers CAUSAL within the block (z-lab is_causal), full layer
+    unrestricted; sliding layers restricted to `q_pos - k_pos < sliding_window`, then o_proj, residual; post_attention_layernorm,
     SwiGLU MLP, residual;
   * output:        norm -> target lm_head -> optional `cap * tanh(l / cap)` (final_logit_softcapping);
     draft token i (block position i >= 1) = argmax of row i.
@@ -72,7 +72,7 @@ def make_v1_weights(rng, hidden, layers, ffn, heads, kv_heads, hd, n_feat_layers
     return sd
 
 
-def v1_draft_tokens(sd, cfg, embed, lm_head, feats, ctx_pos, anchor_id, windows, softcap, embed_scale):
+def v1_draft_tokens(sd, cfg, embed, lm_head, feats, ctx_pos, anchor_id, windows, softcap, embed_scale, causal=None):
     """The v1 block forward. Returns (drafted tokens for block positions 1.., final-normed [B, H], logits [B, V])."""
     H, nh, nkv, hd, B = cfg["hidden"], cfg["heads"], cfg["kv_heads"], cfg["hd"], cfg["block"]
     eps, theta, mask_id = cfg["eps"], cfg["theta"], cfg["mask_id"]
@@ -97,6 +97,8 @@ def v1_draft_tokens(sd, cfg, embed, lm_head, feats, ctx_pos, anchor_id, windows,
         v = np.concatenate([v_ctx, v_noise], axis=0)
         win = windows[il]
         mask = np.ones((B, n + B), dtype=bool) if win is None else (bpos[:, None] - kpos[None, :] < win)
+        if causal is not None and causal[il]:  # z-lab: is_causal = (layer_type == "sliding_attention")
+            mask = mask & (kpos[None, :] <= bpos[:, None])
         a = d2.attention_gqa(q, k, v, mask, 1.0 / np.sqrt(hd))
         x = x + a @ sd[p + "self_attn.o_proj.weight"].T
         h2 = rms(x, sd[p + "post_attention_layernorm.weight"], eps)
@@ -188,14 +190,15 @@ def run_case(seed, n_ctx, window, softcap, embed_scale, full_layer_window="same"
     # `full_layer_window="same"` gives the v1 reference the same finite window so the two are comparable, None
     # models true full attention (documented difference once n_ctx + block > window).
     windows = [window, window, window if full_layer_window == "same" else None]
+    causal = [True, True, False]  # z-lab: is_causal = (layer_type == sliding_attention); see dflash_hf_golden.py
     toks_v1, xf_v1, logits_v1 = v1_draft_tokens(sd, cfg, embed, embed, feats, np.arange(n_ctx), anchor, windows,
-                                                softcap, embed_scale)
+                                                softcap, embed_scale, causal=causal)
 
     w = v1_to_dflash2(sd, cfg, cfg["vocab"])
     cache = d2.DraftKvCache.empty(cfg["layers"], cfg["kv_heads"], cfg["hd"])
     d2.inject(w, cache, d2.encode_features(w, feats), np.arange(n_ctx))
     res = d2.draft_round(w, TiedTarget(embed), cache, anchor, p_min=0.0, capture_layer0=True, embed_scale=embed_scale,
-                         logit_softcap=softcap)
+                         logit_softcap=softcap, block_causal_layers=causal)
     return toks_v1, xf_v1, res
 
 
@@ -250,3 +253,4 @@ if __name__ == "__main__":
     test_softcap_is_monotone_top1_unchanged()
     test_known_gap_true_full_layer_vs_finite_window()
     print("PASS")
+

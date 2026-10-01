@@ -497,7 +497,13 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
   // [valid_from_, n_injected_) intersected with the window, so an injection gap's stale bytes are
   // never read (docs/dflash2.md section 5, InjectFeatures' own doc comment).
   const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-  r4dx_dflash_attn_bf16(
+  // z-lab DFlash v1 (variant v1_identity): sliding layers are causal WITHIN the block (is_causal ==
+  // layer_type == sliding_attention, verified by tools/reference/gemma/dflash_hf_golden.py); the full layer and
+  // every native DFlash2 layer are non-causal.
+  const bool causal_block = cfg_.variant == "v1_identity" &&
+                            static_cast<size_t>(il) < cfg_.attention.sliding_window_pattern.size() &&
+                            cfg_.attention.sliding_window_pattern[static_cast<size_t>(il)];
+  r4dx_dflash_attn_causal_bf16(
       reinterpret_cast<int64_t>(q_.data()), reinterpret_cast<int64_t>(k_.data()),
       reinterpret_cast<int64_t>(v_.data()),
       reinterpret_cast<int64_t>(k_store_.data() + il * slots_ * kv_row),
@@ -505,7 +511,7 @@ void DflashDraft::ForwardLayer(core::Stream& stream, core::Arena& arena, int64_t
       reinterpret_cast<int64_t>(attn_.data()), static_cast<int>(B), static_cast<int>(heads_q),
       static_cast<int>(heads_kv), static_cast<int>(head_dim), static_cast<int>(n_injected_),
       static_cast<int>(valid_from_), static_cast<int>(cfg_.attention.sliding_window),
-      static_cast<int>(slots_), scale, s);
+      static_cast<int>(slots_), scale, causal_block ? 1 : 0, s);
 
   ApplyLinear(stream, arena, lw.o_proj, attn_.data(), proj_.data(), B);
   r4dx_dflash_conv_bf16(reinterpret_cast<int64_t>(proj_.data()),

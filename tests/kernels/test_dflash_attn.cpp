@@ -49,13 +49,14 @@ constexpr int kSlots = 2048;
 // for a store key and -(1+j) for block key j, so the caller needs no second lookup.
 // `store_begin` is the first VALID injected position (0 == all of them), i.e. the low end of the
 // range is clamped to it and not to 0 -- the cold-ring gap the kernel's own contract describes.
-std::vector<int> VisibleKeys(int t, int n_injected, int T, int window, int slots, int store_begin) {
+std::vector<int> VisibleKeys(int t, int n_injected, int T, int window, int slots, int store_begin,
+                            bool causal = false) {
   const int q_pos = n_injected + t;
   int lo = q_pos - window + 1;
   if (lo < store_begin) lo = store_begin;
   std::vector<int> keys;
   for (int p = lo; p < n_injected; ++p) keys.push_back(p % slots);
-  for (int j = 0; j < T; ++j) keys.push_back(-(1 + j));
+  for (int j = 0; j < (causal ? t + 1 : T); ++j) keys.push_back(-(1 + j));
   return keys;
 }
 
@@ -64,12 +65,13 @@ std::vector<float> AttnRef(const std::vector<uint16_t>& q, const std::vector<uin
                            const std::vector<uint16_t>& v_block,
                            const std::vector<uint16_t>& k_store,
                            const std::vector<uint16_t>& v_store, int T, int n_injected,
-                           int store_begin, int window, int slots, double scale) {
+                           int store_begin, int window, int slots, double scale,
+                           bool causal = false) {
   const int ratio = kHeadsQ / kHeadsKv;
   std::vector<float> out(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
   std::vector<double> scores;
   for (int t = 0; t < T; ++t) {
-    const std::vector<int> keys = VisibleKeys(t, n_injected, T, window, slots, store_begin);
+    const std::vector<int> keys = VisibleKeys(t, n_injected, T, window, slots, store_begin, causal);
     for (int hq = 0; hq < kHeadsQ; ++hq) {
       const int kvh = hq / ratio;
       const uint16_t* qp = q.data() + (static_cast<size_t>(t) * kHeadsQ + hq) * kHeadDim;
@@ -176,6 +178,45 @@ int main() {
         const bool pass = s.norm_rel < 4e-3 && s.max_abs < 2e-2;
         std::printf("  n=%-5d T=%d  max_abs=%.3e max_rel=%.3e norm_rel=%.3e  %s\n", n, T,
                     s.max_abs, s.max_rel, s.norm_rel, pass ? "PASS" : "FAIL");
+        ok = ok && pass;
+      }
+    }
+  }
+
+  // ---- 1a. causal_block (z-lab DFlash v1 sliding layers): row t sees block keys 0..t only ----
+  {
+    std::mt19937 rng(77);
+    const std::vector<uint16_t> k_store =
+        RandomBf16(static_cast<size_t>(kSlots) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+    const std::vector<uint16_t> v_store =
+        RandomBf16(static_cast<size_t>(kSlots) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+    DeviceBuffer<uint16_t> ks_d(k_store.size()), vs_d(v_store.size());
+    ks_d.CopyFromHost(k_store);
+    vs_d.CopyFromHost(v_store);
+    std::printf("[1a] causal_block sweep\n");
+    for (int n : {0, 40, 2100}) {
+      for (int T : {1, 8, 16}) {
+        const std::vector<uint16_t> q =
+            RandomBf16(static_cast<size_t>(T) * kHeadsQ * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<uint16_t> kb =
+            RandomBf16(static_cast<size_t>(T) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<uint16_t> vb =
+            RandomBf16(static_cast<size_t>(T) * kHeadsKv * kHeadDim, &rng, -1.5f, 1.5f);
+        const std::vector<float> ref = AttnRef(q, kb, vb, k_store, v_store, T, n, 0, kWindow, kSlots, scale, true);
+        DeviceBuffer<uint16_t> q_d(q.size()), kb_d(kb.size()), vb_d(vb.size());
+        DeviceBuffer<uint16_t> out_d(static_cast<size_t>(T) * kHeadsQ * kHeadDim);
+        q_d.CopyFromHost(q);
+        kb_d.CopyFromHost(kb);
+        vb_d.CopyFromHost(vb);
+        r4dx_dflash_attn_causal_bf16(reinterpret_cast<int64_t>(q_d.data()), reinterpret_cast<int64_t>(kb_d.data()),
+                                     reinterpret_cast<int64_t>(vb_d.data()), reinterpret_cast<int64_t>(ks_d.data()),
+                                     reinterpret_cast<int64_t>(vs_d.data()), reinterpret_cast<int64_t>(out_d.data()),
+                                     T, kHeadsQ, kHeadsKv, kHeadDim, n, 0, kWindow, kSlots, scale, 1, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const ErrStats s = CompareToRef(out_d.CopyToHost(), ref);
+        const bool pass = s.norm_rel < 4e-3 && s.max_abs < 2e-2;
+        std::printf("  n=%-5d T=%d causal  max_abs=%.3e norm_rel=%.3e  %s\n", n, T, s.max_abs, s.norm_rel,
+                    pass ? "PASS" : "FAIL");
         ok = ok && pass;
       }
     }

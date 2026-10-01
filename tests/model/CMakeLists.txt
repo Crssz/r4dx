@@ -214,6 +214,16 @@ endif()
 add_test(NAME test_gemma_container COMMAND test_gemma_container)
 set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=")
 
+# test_gemma_forward_smoke (docs/gemma4-plan.md M1-20 / M1-22 smoke): the whole Gemma 4 stack on the real bf16.r4dx
+# against the M0-8 reference log-probs (full_logits_gemma.py's .logprobs.f16) over the first tokens of the first KL
+# segment -- KL / top-1 per KV mode, DecodeStepGreedy vs argmax(DecodeStep), a sampled step, Reset. GPU test (device 1);
+# SKIP 77 while the M0-8 outputs (R4DX_GEMMA_KL_REF_DIR) or the container are missing. ctest -R gemma_forward.
+add_executable(test_gemma_forward_smoke test_gemma_forward_smoke.cpp)
+target_link_libraries(test_gemma_forward_smoke PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_forward_smoke PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME gemma_forward_smoke COMMAND test_gemma_forward_smoke)
+set_tests_properties(gemma_forward_smoke PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
 add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)

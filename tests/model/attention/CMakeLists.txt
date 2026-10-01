@@ -39,3 +39,19 @@ set_tests_properties(test_mrope_attn_layer PROPERTIES
   ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
   SKIP_RETURN_CODE 77
 )
+
+# test_gemma_attn_layer (docs/gemma4-plan.md M1-21, rung 3): the Gemma 4 decoder layer (GemmaAttnLayer + GemmaMlp +
+# the sandwich norms, layers 0 and 5, the ring wrap, the scaled embedding, the softcap) against
+# tools/reference/gemma/layer_golden_gemma.py's goldens (tools/reference/golden_out/gemma/manifest.json, M0-8) on the
+# real bf16.r4dx weights. GPU test (device 1); SKIP 77 while the goldens or the container are missing. R4DX_GEMMA_GOLDEN_DIR
+# and R4DX_GEMMA_BF16_CONTAINER override the paths. Run: ctest -R gemma_layer (HIP_VISIBLE_DEVICES=1).
+add_executable(test_gemma_attn_layer test_gemma_attn_layer.cpp)
+target_include_directories(test_gemma_attn_layer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_SOURCE_DIR}/src/model)
+target_link_libraries(test_gemma_attn_layer PRIVATE r4dx_model r4dx_model_attention r4dx_core r4dx_kernels r4d_core r4dx_convert)
+target_compile_definitions(test_gemma_attn_layer PRIVATE
+  R4DX_GEMMA_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/gemma")
+add_test(NAME gemma_layer_golden COMMAND test_gemma_attn_layer)
+set_tests_properties(gemma_layer_golden PROPERTIES
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+  SKIP_RETURN_CODE 77
+)

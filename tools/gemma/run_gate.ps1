@@ -28,6 +28,9 @@ param(
   [string]$Raw = 'tools\reference\kl_corpus\tokens_gemma.json',
   [string]$Tool = '',
   [string]$Python = '',
+  # Extra arguments for tool_teacher_forced_logprobs, e.g. -ToolArgs '--tp','2','--tp-mode','real' for the TP=2 run of the gate
+  # (M1b-2; with --tp 2 real leave -Device unset so both GPUs are visible).
+  [string[]]$ToolArgs = @(),
   [switch]$SkipDump
 )
 $ErrorActionPreference = 'Stop'
@@ -51,7 +54,7 @@ Write-Host "[run_gate] KV=$env:R4DX_GEMMA_KV RESID=$env:R4DX_GEMMA_RESID ATTN=$e
 if (-not $SkipDump) {
   if (-not $Model) { throw '[run_gate] -Model is required (unless -SkipDump)' }
   foreach ($p in $Tool, $Model) { if (-not (Test-Path $p)) { throw "[run_gate] $p not found" } }
-  $common = @('--model', $Model, '--layout', $Layout, '--out-dir', $OutDir, '--max-ctx', $MaxCtx, '--vision', 'off', '--quiet')
+  $common = @('--model', $Model, '--layout', $Layout, '--out-dir', $OutDir, '--max-ctx', $MaxCtx, '--vision', 'off', '--quiet') + $ToolArgs
   & $Tool @common --tokens $Chat
   if ($LASTEXITCODE -ne 0) { throw "[run_gate] tool failed on the chat corpus (exit $LASTEXITCODE)" }
   & $Tool @common --tokens $Raw --max-tokens $RawMaxTokens

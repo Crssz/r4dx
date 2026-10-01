@@ -15,6 +15,8 @@
 
 namespace r4dx::model {
 
+struct ModelOptions;  // model.h
+
 class GemmaLocalTextModel final : public TextModel {
  public:
   explicit GemmaLocalTextModel(GemmaModel m) : m_(std::move(m)) {}
@@ -64,5 +66,10 @@ class GemmaLocalTextModel final : public TextModel {
  private:
   GemmaModel m_;
 };
+
+// ModelOptions + the R4DX_GEMMA_* environment (KV mode, attention backend, residual dtype, R4DX_GEMMA_EXTENDED_CTX) -> the
+// engine's options, with the Qwen-only requests (MTP, DFlash) refused. Shared by the TP=1 wrapper and GemmaTpModel (which
+// then fills in the per-rank tp_* fields). Defined in gemma_local_text_model.cpp.
+GemmaModelOptions MakeGemmaModelOptions(const ModelOptions& opts);
 
 }  // namespace r4dx::model

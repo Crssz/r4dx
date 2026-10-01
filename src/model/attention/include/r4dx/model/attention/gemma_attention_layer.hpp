@@ -41,6 +41,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/gemma_kernels.h"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/rotate_residual.h"
@@ -182,7 +183,7 @@ class GemmaAttnLayer {
   void Forward(core::Arena& arena, const uint16_t* x_normed, uint16_t* o_out, const GemmaAttnWeights& w,
                GemmaKvCache& kv, int T, int start_pos, const int32_t* positions, const int32_t* slots,
                const int32_t* seqused_k, hipStream_t stream, SpanAccumulator* prof = nullptr,
-               const int32_t* klimit_ext = nullptr) {
+               const int32_t* klimit_ext = nullptr, core::TpComm* comm = nullptr) {
     const int H = cfg_.heads, Hk = cfg_.kv_heads, D = cfg_.head_dim;
     if (T < 1) throw std::invalid_argument("GemmaAttnLayer::Forward: T must be >= 1");
     if (kv.KvHeads() != Hk || kv.HeadDim() != D) throw std::invalid_argument("GemmaAttnLayer::Forward: cache geometry mismatch");
@@ -291,6 +292,11 @@ class GemmaAttnLayer {
       });
     }
     ProfiledCall(prof, stream, "gemm:attn.o_proj", [&] { ApplyLinear(stream, arena, *w.o, attn_out, o_out, T); });
+    // Tensor parallel (docs/gemma4-plan.md M1b-1): o_proj is row-parallel (K = this rank's heads), so o_out is a partial
+    // sum; the bf16 sublayer output is summed across ranks BEFORE the (fp32) post-norm and residual add.
+    if (comm != nullptr) {
+      ProfiledCall(prof, stream, "tp.allreduce", [&] { comm->AllReduceSumBf16Rows(o_out, T, cfg_.hidden, stream); });
+    }
   }
 
   const GemmaAttnConfig& Config() const { return cfg_; }

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "gemma_tp_model.h"
 #include "model.h"  // ModelOptions
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
@@ -56,17 +57,14 @@ std::vector<int32_t> GemmaLocalTextModel::DecodeStepDflashSampled(int32_t, int64
   throw std::runtime_error("GemmaLocalTextModel: DFlash is not wired for Gemma 4 yet (drafter track D-6)");
 }
 
-// The Gemma branch of LoadTextModel (text_model.h). TP=1 only: GemmaTpModel is M1b.
+// The Gemma branch of LoadTextModel (text_model.h): TP=1 -> GemmaLocalTextModel, TP=2 -> GemmaTpModel (M1b-1).
 //
 // ModelOptions carries the Qwen knobs; the Gemma-specific ones come from the environment until the engine
 // wiring (M1-14) adds flags: R4DX_GEMMA_KV=fp8|bf16_full|bf16, R4DX_GEMMA_ATTN=ref|r4d, and
 // R4DX_GEMMA_EXTENDED_CTX=1 (the 262144 opt-in). Context: ModelOptions::max_ctx is honoured when it differs
 // from its Qwen default (262144); the default itself is read as "not asked" and means the checkpoint's native
 // 131072 (docs/gemma4-plan.md section 9.1) -- so `--max-ctx 262144` needs R4DX_GEMMA_EXTENDED_CTX=1 until M1-14.
-std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp) {
-  if (tp.world != 1) {
-    throw std::invalid_argument("LoadTextModel: Gemma 4 runs at --tp 1 only (GemmaTpModel is M1b)");
-  }
+GemmaModelOptions MakeGemmaModelOptions(const ModelOptions& opts) {
   GemmaModelOptions g;
   g.container_path = opts.container_path;
   g.layout = opts.layout;
@@ -84,7 +82,15 @@ std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const Tp
     throw std::invalid_argument("LoadTextModel: MTP and DFlash are not available for Gemma 4 yet");
   }
   ApplyGemmaEnv(&g);
-  return std::make_unique<GemmaLocalTextModel>(GemmaModel::Load(g));
+  return g;
+}
+
+std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp) {
+  if (tp.world == 2) return GemmaTpModel::Load(opts, tp);
+  if (tp.world != 1) {
+    throw std::invalid_argument("LoadTextModel: TpOptions::world must be 1 or 2, got " + std::to_string(tp.world));
+  }
+  return std::make_unique<GemmaLocalTextModel>(GemmaModel::Load(MakeGemmaModelOptions(opts)));
 }
 
 }  // namespace r4dx::model

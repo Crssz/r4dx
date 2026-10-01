@@ -55,7 +55,7 @@
 
 namespace r4dx::model {
 
-class TpModel final : public TextModel {
+class TpModel final : public TextModel, public TpDiagnostics {
  public:
   enum class State { kReady, kNeedsRecovery, kFatal };
 
@@ -127,6 +127,11 @@ class TpModel final : public TextModel {
   // Profiling is not supported under tensor parallelism (docs/tp.md 1.2): core::TpUnsupportedError.
   StepProfile DecodeStepProfiled(int32_t token_id) override;
   StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) override;
+
+  // TpDiagnostics (text_model.h): the same three facts through the shared interface (State's enumerators have the same order).
+  Health GroupHealth() const override { return static_cast<Health>(static_cast<int>(state_)); }
+  const TpOptions& GroupOptions() const override { return tp_; }
+  std::string GroupStatsLine() override { return StatsLine(); }
 
   // ---- tensor-parallel diagnostics (tests, tools, --stats) --------------------------------------
   State GetState() const { return state_; }

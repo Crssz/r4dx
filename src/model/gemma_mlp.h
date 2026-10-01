@@ -17,6 +17,7 @@
 #include "gemma_config.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/stream.hpp"
+#include "r4dx/core/tp_comm.hpp"
 
 namespace r4dx::model {
 
@@ -26,8 +27,12 @@ class GemmaMlp {
  public:
   // `down_had_signs`: non-owning device fp32 [intermediate_size] (+-1), a rotated container's
   // rotation.had_down_signs; nullptr (every unrotated container) is the plain path.
-  GemmaMlp(const GemmaConfig& cfg, const MlpWeights& w, const float* down_had_signs = nullptr)
-      : cfg_(cfg), w_(w), down_had_signs_(down_had_signs) {}
+  // `comm`: non-null under tensor parallelism (docs/gemma4-plan.md M1b-1): mlp.down is row-parallel, so its bf16 output
+  // is a per-rank partial sum, all-reduced inside Forward before the caller's fp32 post-norm + residual add. `cfg` is the
+  // RANK-LOCAL config (intermediate_size / world); nullptr (TP=1) is the unchanged path.
+  GemmaMlp(const GemmaConfig& cfg, const MlpWeights& w, const float* down_had_signs = nullptr,
+           core::TpComm* comm = nullptr)
+      : cfg_(cfg), w_(w), down_had_signs_(down_had_signs), comm_(comm) {}
 
   // x_normed: device bf16 [T, hidden]. down_out: device bf16 [T, hidden] (disjoint from x_normed).
   void Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x_normed, uint16_t* down_out, int64_t T,
@@ -37,6 +42,7 @@ class GemmaMlp {
   const GemmaConfig& cfg_;
   const MlpWeights& w_;
   const float* down_had_signs_;
+  core::TpComm* comm_;
 };
 
 }  // namespace r4dx::model

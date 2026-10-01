@@ -102,6 +102,45 @@ bool LookupLayerRule(const std::string& s, const ModelConfig& g, ShardRule* rule
   return true;
 }
 
+// Gemma 4 (docs/gemma4-plan.md 3.2, 3.7, M1b-1): the per-layer table, keyed by the suffix after
+// `text.layers.{i}.`. `g` is GemmaConfig::ToModelConfig() of the UNSHARDED config: num_attention_heads,
+// num_key_value_heads / head_dim (the SLIDING geometry), global_head_dim (the full layers' width) and
+// intermediate_size. The full layers have ONE kv head (k_eq_v, no v_proj): attn.k and its descale
+// REPLICATE (every rank computes the same K = V), the heads of q split 8 / 8. Returns false for a name the
+// table does not know; throws for attn.v on a full layer (the converter never writes one).
+bool LookupGemmaLayerRule(const std::string& s, const ModelConfig& g, int64_t layer, ShardRule* rule) {
+  const bool full = g.layer_types.at(static_cast<size_t>(layer)) == "full_attention";
+  const int64_t hd = full ? g.global_head_dim : g.head_dim;
+  const int64_t q_rows = g.num_attention_heads * hd;
+  if (s == "input_layernorm" || s == "post_attention_layernorm" || s == "pre_feedforward_layernorm" ||
+      s == "post_feedforward_layernorm" || s == "input_layernorm.rotated" ||
+      s == "pre_feedforward_layernorm.rotated" || s == "layer_scalar" || s == "attn.q_norm" ||
+      s == "attn.k_norm") {
+    *rule = Replicate();
+  } else if (s == "mlp.gate_up") {
+    *rule = Rows({g.intermediate_size, g.intermediate_size});
+  } else if (s == "mlp.down") {
+    *rule = Cols(g.intermediate_size);
+  } else if (s == "attn.q") {
+    *rule = Rows({q_rows});
+  } else if (s == "attn.k") {
+    *rule = full ? Replicate() : Rows({g.num_key_value_heads * g.head_dim});
+  } else if (s == "attn.v") {
+    if (full) {
+      Fail("RuleFor: 'attn.v' on a full-attention Gemma layer (k_eq_v: V is the raw k_proj output, there is no "
+           "v_proj)");
+    }
+    *rule = Rows({g.num_key_value_heads * g.head_dim});
+  } else if (s == "attn.k_descale" || s == "attn.v_descale") {
+    *rule = full ? Replicate() : Rows({g.num_key_value_heads});
+  } else if (s == "attn.o") {
+    *rule = Cols(q_rows);
+  } else {
+    return false;
+  }
+  return true;
+}
+
 void CheckWorldRank(const char* fn, int world, int rank) {
   if (world < 1 || rank < 0 || rank >= world) {
     Fail(std::string(fn) + ": need world >= 1 and 0 <= rank < world, got world " +
@@ -211,6 +250,10 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
            std::to_string(global.num_hidden_layers) + "-layer model");
     }
     ShardRule rule;
+    if (global.arch == Arch::kGemma4) {
+      if (!LookupGemmaLayerRule(base.substr(q + 1), global, layer, &rule)) unknown();
+      return rule;
+    }
     LayerKind kind;
     if (!LookupLayerRule(base.substr(q + 1), global, &rule, &kind)) unknown();
     const bool gdn_layer = global.IsGdnLayer(layer);

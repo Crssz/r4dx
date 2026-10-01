@@ -41,9 +41,12 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "r4dx/core/tp_comm.hpp"
 #include "r4dx/kernels/summary_sampler.hpp"
 #include "r4dx/model/attention/gemma_attention_layer.hpp"
 #include "r4dx/model/attention/sliding_kv_cache.hpp"
+#include "tp/tp_submit.h"  // tp::SubmitBounder (inert at TP=1)
+#include "tp/tp_vocab.h"   // tp::ArgmaxPair, the vocab-split merges (header-only, HIP-free)
 
 namespace r4dx::model {
 
@@ -64,6 +67,15 @@ struct GemmaModelOptions {
   int prefill_chunk = 256;      // rows per prefill chunk (<= 256: the ring holds window + 288)
   GemmaResid resid = GemmaResid::kFp32;
   bool prompt_checkpoint = false;  // spare copies of the sliding rings for SaveCheckpoint/RestoreCheckpoint
+  // Tensor parallel (docs/gemma4-plan.md M1b-1; GemmaTpModel fills these in per rank, nothing else should): this Model is
+  // rank `tp_rank` of `tp_world` (1 or 2) and all-reduces its row-parallel sublayer outputs (attn.o, mlp.down) through
+  // `tp_comm` (non-owning; non-null iff tp_world == 2). Every rank's Model must be driven with the same sequence of calls.
+  int tp_world = 1;
+  int tp_rank = 0;
+  core::TpComm* tp_comm = nullptr;
+  // Bounded prefill submission (tp/tp_submit.h, docs/tp.md Appendix B N57): both 0 at TP=1.
+  int tp_submit_layers = 0;
+  int tp_max_inflight_units = 0;
 };
 
 // Reads R4DX_GEMMA_KV (fp8|bf16_full|bf16), R4DX_GEMMA_ATTN (ref|r4d) and R4DX_GEMMA_RESID (fp32|bf16) over the
@@ -86,6 +98,19 @@ class GemmaModel {
   GemmaResid ResidDtype() const { return opts_.resid; }
   // Bytes of KV the load allocated (sliding rings + full layers), for the load log and tests.
   int64_t KvBytes() const { return kv_bytes_; }
+  int TpWorld() const { return opts_.tp_world; }
+  int TpRank() const { return opts_.tp_rank; }
+
+  // TP only (comm != nullptr, else std::logic_error): the load-time warm-up of docs/tp.md 2.9 step 9 for this model -- one
+  // full prefill chunk (the M = 256 GEMMs and the sliced all-reduces), a 64-row prefill, a greedy, a sampled and a
+  // full-logits decode step -- so no first-use kernel load lands inside a request, where a rank stalled in it would let
+  // its peer's spin timeout fire. Ends with Reset(). A lockstep collective: every rank must call it.
+  void TpWarmup();
+  // The positions TpWarmup() needs in the KV caches (max_ctx must be at least this under TP).
+  static int64_t WarmupPositions(const GemmaModelOptions& o);
+  // Prefill submission bounding counters (TP; zeros at TP=1).
+  tp::SubmitBounder::Stats TpSubmitStats() const { return submit_.GetStats(); }
+  int64_t VocabLocal() const { return vocab_local_; }
 
   void Reset();
   void SaveCheckpoint();     // needs prompt_checkpoint; D2D copies of the sliding rings
@@ -131,12 +156,18 @@ class GemmaModel {
     kernels::RowSummary* out = nullptr;
   };
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                              const SummaryRequest* summary_out, SpanAccumulator* prof);
+                              const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill = false);
+  // Tensor parallel (docs/tp.md 7.2-7.4): the vocab-split merges of RunChunk's result, in global id order. Host
+  // rendezvous (HostAllGather): the device must be synchronized. Every rank ends with the same answer.
+  int32_t MergeGreedyPair();
+  void MergeSummary(kernels::RowSummary* out);
+  void GatherVocabRow(std::vector<float>* full);
+  void RequireNotTp(const char* what) const;
   void RotateResidual(void* x, int64_t rows, bool inverse);  // x is fp32 or bf16 per opts_.resid
   void UploadChunkMeta(int64_t start_pos, int64_t T);
   void RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
                 SpanAccumulator* prof);
-  void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
+  void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);  // device -> host; LOCAL ids / vocab under TP
 
   GemmaModelOptions opts_;
   GemmaContainer container_;
@@ -148,6 +179,15 @@ class GemmaModel {
   bool started_ = false;
   int64_t sampled_fallback_rows_ = 0;
   int64_t kv_bytes_ = 0;
+
+  // Tensor parallel: this rank's lm_head rows (== vocab_size at TP=1) and their first global id; the comm endpoint.
+  core::TpComm* comm_ = nullptr;
+  int64_t vocab_local_ = 0, vocab_offset_ = 0;
+  tp::SubmitBounder submit_;
+  int submit_layers_ = 0;
+  core::DeviceBuffer<int32_t> argmax_pair_dev_;  // TP greedy: {local idx, float bits of the value}
+  core::DeviceBuffer<uint8_t> topk_lse_ws_;      // TP: this rank's own r4dx_topk_lse_f32_ws workspace
+  std::vector<float> gather_shard_host_;
 
   std::vector<attention::GemmaAttnLayer> attn_;                  // per layer
   std::optional<attention::SlidingRingGeometry> geo_;

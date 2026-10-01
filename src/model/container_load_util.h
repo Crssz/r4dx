@@ -152,9 +152,12 @@ template <class UploadF32>
 RotationWeights LoadRotationWeights(const SafetensorsReader& r, const RotationSpec& spec,
                                     const ModelConfig& global, const ModelConfig& local,
                                     const std::string& path, UploadF32&& upload,
-                                    int64_t o_full_elems = 0) {
+                                    int64_t o_full_elems = 0, int64_t o_full_elems_local = -1) {
+  // `o_full_elems_local` (Gemma TP, M1b-1): the o_full sign vector's length on this rank (heads/world * global_head_dim);
+  // -1 = the global length, i.e. TP=1 and every Qwen caller.
   const std::vector<RotationTensor> want = RotationTensors(spec, global, o_full_elems);
-  const std::vector<RotationTensor> want_local = RotationTensors(spec, local, o_full_elems);
+  const std::vector<RotationTensor> want_local =
+      RotationTensors(spec, local, o_full_elems_local >= 0 ? o_full_elems_local : o_full_elems);
   RotationWeights w;
   w.spec = spec;
   // Destination per tensor name (RotationTensors' list is signs, mix, then the q2ab sign vectors the

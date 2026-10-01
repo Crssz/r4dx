@@ -274,6 +274,13 @@ add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)
 
+# test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
+# Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model
+# algebra check that the sharded forward equals the unsharded one. CPU only, no HIP, no container.
+add_executable(test_gemma_tp_shard test_gemma_tp_shard.cpp)
+target_link_libraries(test_gemma_tp_shard PRIVATE r4dx_tp_shard)
+add_test(NAME test_gemma_tp_shard COMMAND test_gemma_tp_shard)
+
 # test_rotation_meta: quant2's `__metadata__.rotation` parse (src/model/rotation_meta.h, header-only
 # and HIP-free) and the TP slicing of the rotation.* tensors (docs/quant2.md section 3.1). CPU-only
 # like the TP tests above; r4dx_tp_shard supplies src/model + third_party on the include path.

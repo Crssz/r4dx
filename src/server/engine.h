@@ -40,10 +40,6 @@
 #include "text_model.h"  // r4dx::model::TextModel / TpOptions (docs/tp.md 2.8)
 #include "tokenizer.h"
 
-namespace r4dx::model {
-class TpModel;
-}
-
 namespace r4dx::server {
 
 struct EngineOptions {
@@ -220,10 +216,10 @@ class Engine {
   std::unique_ptr<r4dx::Tokenizer> tok_;
   std::unique_ptr<r4dx::ChatTemplate> tmpl_;
   std::unique_ptr<r4dx::model::TextModel> model_;
-  // model_ itself when it is a TpModel (`--tp 2`), else null: the TP diagnostics (the group state
-  // around a recovery, the `--log-level debug` stats line) are not part of TextModel (docs/tp.md
-  // 2.8), the same reason r4dx-cli reaches the facade through a dynamic_cast.
-  r4dx::model::TpModel* tp_model_ = nullptr;
+  // model_ itself when it is a tensor-parallel facade (`--tp 2`: TpModel, or GemmaTpModel for a Gemma container), else
+  // null: the TP diagnostics (the group state around a recovery, the `--log-level debug` stats line) are not part of
+  // TextModel (docs/tp.md 2.8), the same reason r4dx-cli reaches the facade through a dynamic_cast.
+  r4dx::model::TpDiagnostics* tp_model_ = nullptr;
 
   // Image preprocessing policy, built once in LoadAndStart from EngineOptions::image_max_pixels
   // (docs/vision.md "Large images"). Read back out through ImagePreprocessing() above, which is
@@ -243,7 +239,7 @@ class Engine {
   BoundedQueue<std::shared_ptr<PendingRequest>> queue_;
   std::thread worker_;
   std::atomic<bool> stop_{false};
-  // TpFatal(): the worker thread's copy of `tp_model_->GetState() == kFatal`, taken after every
+  // TpFatal(): the worker thread's copy of `tp_model_->GroupHealth() == kFatal`, taken after every
   // failed request -- TpModel's own state is facade-thread-only, so the HTTP threads read this.
   std::atomic<bool> tp_fatal_{false};
 };

@@ -24,6 +24,9 @@ constexpr int64_t kMaxAudioSamples = int64_t{kMaxAudioTokens} * kSamplesPerToken
 // Token ids (config.json: audio_token_id / boa_token_id / eoa_token_index; the tokenizer's <|audio|> /
 // <|audio> / <audio|>).
 constexpr int32_t kBoaTokenId = 256000;
+// The chat template only matches `type == 'audio'` content parts (HF's apply_chat_template normalizes OpenAI
+// `input_audio` to it; the engine must do so itself, or the placeholder is silently dropped).
+constexpr const char* kAudioTemplatePartType = "audio";
 constexpr int32_t kAudioTokenId = 258881;
 constexpr int32_t kEoaTokenId = 258883;
 

@@ -362,7 +362,7 @@ void Engine::RunRequest(PendingRequest& req) {
           r4dx::ChatJson content = r4dx::ChatJson::array();
           for (const auto& part : m.content_parts) {
             content.push_back(part.is_image   ? r4dx::ChatJson{{"type", "image"}}
-                              : part.is_audio ? r4dx::ChatJson{{"type", "input_audio"}}
+                              : part.is_audio ? r4dx::ChatJson{{"type", r4dx::audio::kAudioTemplatePartType}}
                                               : r4dx::ChatJson{{"type", "text"}, {"text", part.text}});
           }
           entry["content"] = content;

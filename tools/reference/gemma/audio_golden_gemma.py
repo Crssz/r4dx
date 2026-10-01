@@ -195,7 +195,7 @@ def main():
         findings["processor"] = {"ids": ids, "audio_seq_length": proc.audio_seq_length,
                                  "audio_ms_per_token": proc.audio_ms_per_token, "cases": proc_rows,
                                  "template_text_example": text,
-                                 "rule": "template emits one <|audio|> per audio part; processor replaces it with "
+                                 "rule": "template emits one <|audio|> per type==audio part (HF normalizes input_audio -> audio; the r4dx engine must map it itself); processor replaces it with "
                                          "<|audio> + n*<|audio|> + <audio|>, n = ceil(samples/640)",
                                  "cap": "750 is only audio_seq_length (an upper bound the processor never enforces: "
                                         "480001 samples -> 751 tokens expand fine); r4dx enforces it as a 400"}

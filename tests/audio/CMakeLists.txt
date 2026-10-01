@@ -13,3 +13,8 @@ target_compile_definitions(test_audio_golden PRIVATE
   R4DX_AUDIO_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/gemma")
 add_test(NAME test_audio_golden COMMAND test_audio_golden)
 set_tests_properties(test_audio_golden PROPERTIES SKIP_RETURN_CODE 77)
+
+# Engine audio part JSON -> real Gemma chat template -> one <|audio|> per clip (real-template part needs the model dir; skipped otherwise).
+add_executable(test_audio_template test_audio_template.cpp)
+target_link_libraries(test_audio_template PRIVATE r4dx_audio r4dx_tokenizer)
+add_test(NAME test_audio_template COMMAND test_audio_template)

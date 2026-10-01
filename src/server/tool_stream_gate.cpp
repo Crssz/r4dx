@@ -7,21 +7,17 @@ namespace r4dx::server {
 
 namespace {
 
-// Byte-for-byte tool_call_parser.cpp's own `kOpen`/`kOpenLen` -- see this file's header for why the
-// gate and the parser must agree on this literal exactly.
-constexpr char kOpen[] = "<tool_call>";
-constexpr size_t kOpenLen = 11;  // strlen(kOpen), fixed at compile time -- no runtime strlen call
 
-// Longest k (0 <= k <= kOpenLen-1) such that the last k bytes of `buf` equal the first k bytes of
+// Longest k (0 <= k <= open.size()-1) such that the last k bytes of `buf` equal the first k bytes of
 // kOpen -- i.e. the longest suffix of `buf` that could still grow into a full opener given more
 // input. 0 means no suffix of `buf` could possibly be an opener prefix. Same helper, same shape, as
 // reasoning_splitter.cpp's LongestTagPrefixSuffix (including the signed loop variable: `k` counts
 // down to 0 and must not wrap the way an unsigned `k >= 1` loop would on its final iteration).
-size_t LongestOpenPrefixSuffix(const std::string& buf) {
-  const size_t max_k = std::min(kOpenLen - 1, buf.size());
+size_t LongestOpenPrefixSuffix(const std::string& buf, const std::string& open) {
+  const size_t max_k = std::min(open.size() - 1, buf.size());
   for (int64_t k = static_cast<int64_t>(max_k); k >= 1; --k) {
     const size_t uk = static_cast<size_t>(k);
-    if (buf.compare(buf.size() - uk, uk, kOpen, 0, uk) == 0) return uk;
+    if (buf.compare(buf.size() - uk, uk, open, 0, uk) == 0) return uk;
   }
   return 0;
 }
@@ -34,7 +30,7 @@ std::string ToolStreamGate::Push(const std::string& piece) {
   std::string buf = hold_ + piece;
   hold_.clear();
 
-  const size_t p = buf.find(kOpen);
+  const size_t p = buf.find(opener_);
   std::string out;
   if (p != std::string::npos) {
     // From the opener on, nothing else this generation is streamable -- the rest is buffered by the
@@ -42,7 +38,7 @@ std::string ToolStreamGate::Push(const std::string& piece) {
     closed_ = true;
     out = buf.substr(0, p);
   } else {
-    const size_t hold_len = LongestOpenPrefixSuffix(buf);
+    const size_t hold_len = LongestOpenPrefixSuffix(buf, opener_);
     out = buf.substr(0, buf.size() - hold_len);
     hold_ = buf.substr(buf.size() - hold_len);
   }

@@ -16,6 +16,10 @@ set(R4DX_SERVER_TESTS
   test_tool_stream_gate
   test_reasoning_splitter
   test_request_log
+  test_dialect
+  test_gemma_reasoning_splitter
+  test_gemma_tool_call_parser
+  test_gemma_tool_stream_gate
 )
 
 foreach(t ${R4DX_SERVER_TESTS})

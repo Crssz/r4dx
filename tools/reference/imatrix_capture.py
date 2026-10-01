@@ -135,7 +135,35 @@ class LinearSpec:
         return self.key.split(".")[-1] if "." in self.key else self.key
 
 
-def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool) -> list[LinearSpec]:
+def enumerate_gemma_linears(text_config, do_mtp: bool = False, do_draft_head: bool = False) -> list[LinearSpec]:
+    """The Gemma 4 counterpart (src/convert/gemma_layout.cpp's `linear(...)` calls, in converter order):
+    attn.q / attn.k / attn.v (sliding layers only: a full layer has no v_proj, V is the raw k_proj output) /
+    attn.o, mlp.gate_up (gate rows first), mlp.down, then the tied `lm_head` (the embedding table, fed by
+    the post-final-norm hidden). The taps keep the HF module names (`layer{i}:self_attn.q_proj` ...), so
+    hessian_capture's table (arch_table.GEMMA) maps them: mlp.gate_proj reads pre_feedforward_layernorm's
+    output. No MTP head exists (the converter refuses --mtp on)."""
+    if do_mtp or do_draft_head:
+        raise SystemExit("[imatrix] gemma4_unified has no MTP head (pass --no-mtp; no --draft-head)")
+    from arch_table import GEMMA
+
+    specs: list[LinearSpec] = []
+    for i, kind in enumerate(text_config.layer_types):
+        hf = f"{TEXT_LAYER_PREFIX}{i}."
+        base = f"text.layers.{i}."
+        for module in GEMMA.module_list(kind):
+            if module in ("mlp.up_proj", "mlp.gate_proj", "mlp.down_proj"):
+                continue
+            specs.append(LinearSpec(base + GEMMA.linears[module][0], [hf + module + ".weight"],
+                                    f"layer{i}:{module}"))
+        specs.append(LinearSpec(base + "mlp.gate_up", [hf + "mlp.gate_proj.weight", hf + "mlp.up_proj.weight"],
+                                f"layer{i}:mlp.gate_proj"))
+        specs.append(LinearSpec(base + "mlp.down", [hf + "mlp.down_proj.weight"], f"layer{i}:mlp.down_proj"))
+    specs.append(LinearSpec("lm_head", [GEMMA.lm_head_name], "final_norm_out"))
+    return specs
+
+
+def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool,
+                                arch=None) -> list[LinearSpec]:
     """Every linear `src/convert/main.cpp` routes through `add_linear` (i.e. every linear that gets
     quantized `w4a16` / trellis form), in converter order, with the HF module whose INPUT feeds it.
 
@@ -144,7 +172,11 @@ def enumerate_quantized_linears(text_config, do_mtp: bool, do_draft_head: bool) 
     `mtp.pre_fc_norm_*`, and `mtp.attn.k`/`mtp.attn.v` (those four `add_bf16`, see
     docs/container-format.md: "the MTP head stays bf16-only"). `audit_converter_source()` re-derives
     this list's shape from main.cpp's text so a new `add_linear` cannot slip past it silently.
+
+    `arch` (an arch_table.ArchSpec, default Qwen3.5): gemma4_unified takes enumerate_gemma_linears.
     """
+    if arch is not None and arch.is_gemma:
+        return enumerate_gemma_linears(text_config, do_mtp, do_draft_head)
     specs: list[LinearSpec] = []
     for i, kind in enumerate(text_config.layer_types):
         hf = f"{TEXT_LAYER_PREFIX}{i}."
@@ -765,10 +797,64 @@ def compare_runs(a: CaptureResult, b: CaptureResult) -> tuple[bool, dict]:
 # --------------------------------------------------------------------------------------------
 
 
+def _gemma_unsupported() -> int:
+    raise SystemExit("[imatrix] --arch gemma4_unified: an activation-importance capture for Gemma is not "
+                     "implemented (the trellis path needs Hessians: tools/reference/hessian_capture.py "
+                     "--arch gemma4_unified; a Gemma w4a16 imatrix would need a GemmaReference tap, "
+                     "docs/gemma4-plan.md M1-25 'if w4a16 is wanted'). --dry-run works.")
+
+
+def dry_run_arch(args, arch) -> int:
+    """--dry-run (CPU, no GPU rule, no tokenizer, no corpus): the converter audit for `arch`, the
+    quantized-linear list its table enumerates, every shape against the checkpoint's safetensors
+    headers (no K-concat), and the tap plan hessian_capture would build from it."""
+    from arch_table import text_config_view
+
+    audit = audit_converter_source(arch.converter_source(), arch=arch.converter_arch)
+    print(f"[imatrix] --dry-run, arch {arch.name}: converter audit ({audit['path']}): "
+          f"text={len(audit['found']['text'])} mtp={len(audit['found']['mtp'])} add_linear shapes")
+    for kind in ("missing", "unexpected", "mismatched"):
+        if audit[kind]:
+            print(f"[imatrix] converter audit {kind.upper()}: {audit[kind]}")
+    text_config = text_config_view(arch, args.model_dir)
+    do_mtp = arch.has_mtp and not args.no_mtp
+    specs = enumerate_quantized_linears(text_config, do_mtp, args.draft_head, arch=arch)
+    index = ShardIndex.load(args.model_dir)
+    shapes = tensor_shapes(index, sorted({n for s in specs for n in s.hf_names}))
+    expect_k = verify_no_k_concat(specs, shapes)
+    from hessian_capture import build_tap_plan
+
+    plans = build_tap_plan(specs, expect_k, arch)
+    n_text = sum(1 for s in specs if s.key.startswith("text."))
+    print(f"[imatrix] {len(specs)} quantized linears ({n_text} text, "
+          f"{sum(1 for s in specs if s.key.startswith('mtp'))} mtp, lm_head) over "
+          f"{text_config.num_hidden_layers} layers; K checked against the headers, no K-concat; "
+          f"{len(plans)} Hessian tap(s)")
+    by_type: dict[str, list[str]] = {}
+    for i, kind in enumerate(text_config.layer_types):
+        mods = [s.key.split(f"text.layers.{i}.", 1)[1] for s in specs if s.key.startswith(f"text.layers.{i}.")]
+        by_type.setdefault(kind, mods)
+    for kind, mods in by_type.items():
+        print(f"    {kind:<18} {', '.join(mods)}")
+    print(f"[imatrix] --dry-run: {'PASS' if audit['ok'] else 'FAIL'} (nothing captured, nothing written)")
+    return 0 if audit["ok"] else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    ap.add_argument("--model-dir", type=Path, default=None,
+                    help="checkpoint (default: the Qwen3.5 default of common.py, or the Huihui Gemma "
+                         "directory with --arch gemma4_unified)")
+    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
+                    help="which family's linears / taps (tools/reference/arch_table.py); auto reads "
+                         "--model-dir's config.json model_type. gemma4_unified supports --dry-run only "
+                         "here: the Gemma Hessians (hessian_capture.py --arch gemma4_unified) are what "
+                         "the trellis path needs, and a Gemma w4a16 imatrix is not implemented")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="CPU only: run the converter audit, enumerate the quantized linears and check "
+                         "their shapes against the checkpoint's headers (for --arch gemma4_unified: "
+                         "against the Gemma tap table too), print the plan, capture nothing")
     ap.add_argument("--corpus-dir", type=Path, default=DEFAULT_CORPUS_DIR,
                     help="directory of *.txt and *.messages.json calibration files; 'none' to skip")
     ap.add_argument("--calib-txt", type=Path, default=DEFAULT_CALIB_TXT,
@@ -797,6 +883,21 @@ def main() -> int:
                          "(the default --out is the hf-auto imatrix)")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     args = ap.parse_args()
+
+    from arch_table import GEMMA, resolve_arch, text_config_view
+
+    if args.model_dir is None:
+        if args.arch == "gemma4_unified":
+            from gemma.common_gemma import DEFAULT_MODEL_DIR as GEMMA_MODEL_DIR
+
+            args.model_dir = GEMMA_MODEL_DIR
+        else:
+            args.model_dir = DEFAULT_MODEL_DIR
+    arch = resolve_arch(args.arch, args.model_dir)
+    if arch.is_gemma:
+        return dry_run_arch(args, arch) if args.dry_run else _gemma_unsupported()
+    if args.dry_run:
+        return dry_run_arch(args, arch)
 
     # Never silently replace an artifact of the other tokenizer mode (docs/quant2.md 3.4): the
     # default --out is the pre-switch (hf-auto) imatrix. Checked before anything touches the GPU.

@@ -122,6 +122,11 @@ Full data: `tools/reference/gemma/tensor_names.json`, `config_diff.json`.
 
 ## 5. Corrections to the plan text (for whoever edits it next)
 
+**Status: all seven are applied to `docs/gemma4-plan.md`** (branch g4-convert-trellis): the 4.2 `layer_scalar`
+and vision/audio rows, 5.2 / 5.3 `bos_on_raw_prompt` (false), 3.1 and section 7 item 3 (image mask: sliding
+only), 6.3 `full_logits_gemma.py` (softcap dtype), the tensor-name bullet, the 2.1 `max_position_embeddings`
+note and the rope denominator. The plan's 3.1 "UNVERIFIED" list is now the settled list.
+
 1. `layer_scalar` is `[1]` BF16, not fp32 `[1,4]` (4.2 table).
 2. Raw HF tokenization does not add BOS (`bos_on_raw_prompt` for parity = false); section 5.2/5.3 and the dialect table say true.
 3. Image bidirectional attention: sliding only (settled, with the direct-forward caveat above).

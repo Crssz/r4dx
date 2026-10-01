@@ -146,6 +146,7 @@ struct GemmaConfig {
     m.num_attention_heads = num_attention_heads;
     m.num_key_value_heads = num_kv_heads_sliding;
     m.head_dim = head_dim_sliding;
+    m.global_head_dim = head_dim_full;
     m.attn_output_gate = false;
     m.intermediate_size = intermediate_size;
     m.partial_rotary_factor = 1.0;  // sliding layers; the full layers' 0.25 is partial_rotary_factor_full

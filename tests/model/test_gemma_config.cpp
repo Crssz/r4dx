@@ -280,6 +280,8 @@ void TestArchOnConfig() {
             !m.attn_output_gate,
         "ToModelConfig: GDN / MTP / output-gate fields are 0");
   Check(m.num_attention_heads == 16 && m.num_key_value_heads == 8 && m.head_dim == 256, "ToModelConfig: sliding geometry");
+  Check(m.global_head_dim == 512 && ModelConfig{}.global_head_dim == 0,
+        "ToModelConfig: global_head_dim 512 (tp::RuleFor's rotation.had_o_full_signs K = heads x it); Qwen's is 0");
   const ModelConfig r = GemmaConfig::Shard(g, 2, 1).ToModelConfig();
   Check(r.tp_world == 2 && r.tp_rank == 1 && r.arch == Arch::kGemma4, "ToModelConfig of a shard carries tp_world/rank");
 

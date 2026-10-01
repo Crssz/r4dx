@@ -61,6 +61,19 @@ if(TARGET r4dx-convert)
 endif()
 add_test(NAME convert_gemma_layout COMMAND convert_gemma_layout)
 
+# --trellis-from / --kv-calib on gemma4_unified, plain and rotated (docs/gemma4-plan.md M1-28 prerequisites;
+# trellis_import.hpp's rotation fingerprint and folded reconstruction check, r4dx-convert --rotation-out):
+# generated tiny checkpoint + synthetic oracle directories, all in C++ (no Python, no fixture, no GPU).
+# Needs r4dx-convert (SKIPs, exit 77, without it). ~20 MB under %TEMP%, removed.
+add_executable(convert_gemma_trellis test_gemma_trellis.cpp)
+target_link_libraries(convert_gemma_trellis PRIVATE r4dx_convert)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_gemma_trellis PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_gemma_trellis r4dx-convert)
+endif()
+add_test(NAME convert_gemma_trellis COMMAND convert_gemma_trellis)
+set_tests_properties(convert_gemma_trellis PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(convert_rotation test_rotation.cpp)
 target_link_libraries(convert_rotation PRIVATE r4dx_convert)
 target_compile_definitions(convert_rotation PRIVATE

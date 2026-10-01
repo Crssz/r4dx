@@ -254,6 +254,14 @@ ShardRule RuleFor(const std::string& base, const ModelConfig& global) {
     return Rows({global.num_attention_heads * global.head_dim});  // attn.o
   }
   if (base == "rotation.had_gdn_out_signs") return Rows({global.ValueDim()});  // gdn.out_proj
+  if (base == "rotation.had_o_full_signs") {
+    // Gemma 4 option A (docs/gemma4-plan.md 4.4): the FULL-attention o_proj's K = heads * global_head_dim
+    // (8192 on the 12B). A config that does not know global_head_dim (Qwen: 0) has no such tensor.
+    if (global.global_head_dim <= 0) {
+      Fail("RuleFor: 'rotation.had_o_full_signs' needs a Gemma config (global_head_dim is 0)");
+    }
+    return Rows({global.num_attention_heads * global.global_head_dim});  // attn.o on the full layers
+  }
   unknown();
   return {};  // unreachable
 }

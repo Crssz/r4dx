@@ -12,6 +12,8 @@
 //                [--hessian-dir <tools/reference/hessian_capture.py output dir>
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
+//                [--rotation-out <file.safetensors>]  (with --input and --rotate, NO --output: writes the
+//                 rotation tensors + fingerprint only and exits; see the Gemma --trellis-from note)
 //                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64>"]...
 //                [--record-reuse-guard] [--reuse-tensors-from <baseline container>]
 //                [--trellis-from <oracle dir or its weights_override.json>
@@ -32,7 +34,7 @@
 // stale_layers, hessian_basis other than "matched" (unless --trellis-allow-basis exl3),
 // config_sha256 other than this checkpoint's, a used tensor with K not in {4, 5}, a shape other
 // than the checkpoint's, gate K != up K, any body linear not (fully) covered, an oracle file whose
-// sha256 differs from its record, --rotate other than none, and the combination with --selftest /
+// sha256 differs from its record, --rotate other than none (Qwen; see the Gemma note below), and the combination with --selftest /
 // --dflash-gguf / --reuse-tensors-from / --record-reuse-guard.
 // The container is written as <output>.partial and gets its name only once it is complete and
 // checked: --trellis-verify full (the default; `none` is accepted by debug builds only)
@@ -177,8 +179,21 @@
 // model.embed_vision.* / model.embed_audio.* as vision.* / audio.* bf16. --mtp on is refused. Every
 // checkpoint tensor must be consumed or allow-listed (--layers, vision/audio off): an unconsumed one
 // fails the run before the header is written. --rotate works (--rotate q2ab: Hadamard-only o / down,
-// folded in-norms stored as ones under `.rotated`); --trellis-from, --record-reuse-guard and
-// --reuse-tensors-from are refused for Gemma for now.
+// folded in-norms stored as ones under `.rotated`); --record-reuse-guard and --reuse-tensors-from are
+// refused for Gemma for now.
+//
+// --trellis-from on Gemma (docs/gemma4-plan.md M1-28; tests/convert/test_gemma_trellis.cpp): the oracle's
+// tensors are keyed by HF name, so the Gemma body (attn.q/k/v/o -- no v on the 8 full layers, k_eq_v --,
+// mlp.gate_up/down) imports exactly as Qwen's; the tied lm_head is not a body linear and stays on the
+// w4a16 path (e.g. `--no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --ldlq "^lm_head$"
+// --hessian-dir <lm_head.hess>`); --kv-calib fills the per-layer descales (8 sliding heads, 1 full).
+// ROTATED trellis (--rotate q2a|q2ab together with --trellis-from) is Gemma-only: the oracle must have
+// quantized the FOLDED weights against the rotated Hessians (trellis_quant.py --rotation <file>, the file
+// being `r4dx-convert --input <ckpt> --rotate <kind> [--rotation-seed S] --rotation-out <file>`, which
+// writes the exact Q / Hb tensors and their fingerprint and exits), and its manifest carries that
+// fingerprint under "rotation" ({kind, seed, tensors_sha256}); a rotated run refuses an unrotated manifest
+// and an unrotated run a rotated one, and the reconstruction check compares against fold(W). Qwen keeps
+// the `--trellis-from needs --rotate none` refusal.
 //
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts w4a16] [--threads T]
@@ -407,6 +422,11 @@ struct AppArgs {
   std::string rotate = "none";
   uint64_t rotation_seed = r4dx_convert::kDefaultRotationSeed;
   bool rotation_seed_explicit = false;
+  // --rotation-out <file.safetensors> (with --input and --rotate q2a|q2ab; no --output): writes only
+  // the rotation tensors the run would put in a container (+ their fingerprint) and exits. This is how
+  // tools/reference/trellis_quant.py --rotation gets the exact Q the converter folds with, so the
+  // oracle quantizes the weights and Hessians of the SAME rotated basis (docs/gemma4-plan.md 4.6).
+  std::string rotation_out;
 
   // Per-tensor w4a16 groups (docs/quant2.md section 5; w4a16_groups.hpp): every
   // --w4a16-group-rule "<regex>=<g>" in command-line order, first match wins. Empty (default) =
@@ -506,6 +526,7 @@ AppArgs ParseArgs(int argc, char** argv) {
         throw std::runtime_error("--ldlq-damp must be a finite number >= 0, got '" + v + "'");
     }
     else if (arg == "--rotate") a.rotate = next(i);
+    else if (arg == "--rotation-out") a.rotation_out = next(i);
     else if (arg == "--rotation-seed") {
       a.rotation_seed = ParseSeed(next(i));
       a.rotation_seed_explicit = true;
@@ -603,13 +624,19 @@ AppArgs ParseArgs(int argc, char** argv) {
   if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || !a.dflash_gguf.empty()))
     throw std::runtime_error("--rotate applies only to the HF-checkpoint conversion (--input/--output), "
                              "not to --selftest or --dflash-gguf");
-  // A trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with the
-  // norms removed it would be garbage, and the runtime cannot rotate per linear
-  // (docs/trellis-kernel.md 3.4). The loader refuses the combination too.
-  if (rotate_kind != r4dx_convert::RotationKind::kNone && !a.trellis.from.empty())
-    throw std::runtime_error("--trellis-from needs --rotate none (got --rotate " + a.rotate +
-                             "): the oracle quantized the unrotated weights, and a rotated "
-                             "container would feed them x Q with the norms folded away");
+  // A Qwen trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with
+  // the norms removed it would be garbage, and the runtime cannot rotate per linear
+  // (docs/trellis-kernel.md 3.4). The loader refuses the combination too. That refusal is Qwen's:
+  // RunConvert applies it once config.json says which family this is, because a Gemma oracle run may
+  // quantize the FOLDED weights (trellis_quant.py --rotation; TrellisSource::CheckRotation).
+  if (!a.rotation_out.empty()) {
+    if (rotate_kind == r4dx_convert::RotationKind::kNone)
+      throw std::runtime_error("--rotation-out needs --rotate q2a|q2ab (there is no rotation to write)");
+    if (a.input.empty() || !a.output.empty() || a.selftest || !a.dflash_gguf.empty() ||
+        !a.trellis.from.empty())
+      throw std::runtime_error("--rotation-out takes --input and --rotate only (no --output, "
+                               "--selftest, --dflash-gguf or --trellis-from)");
+  }
   if (a.quant != "rtn" && a.quant != "search")
     throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
   if (!a.imatrix.empty() && a.quant != "search")
@@ -1111,6 +1138,58 @@ class RotationSource {
     }
   }
 
+  // The same row-wise fold as Fold(), const, single-threaded and WITHOUT the counters: what the
+  // --trellis-from reconstruction check applies to a 128-row block of the checkpoint weight, from
+  // several worker threads at once. Only the folds that act on rows independently (an in-projection's
+  // W diag(w) Q, a Hadamard-only out-projection's W Hb -- everything Gemma folds); Qwen's Q^T W mixes
+  // rows and is refused (rotated trellis is Gemma-only, RunConvert checks).
+  void FoldRowsBlock(const LinearFold& f, const std::vector<float>& norm, std::vector<float>& w,
+                     int64_t N, int64_t K) const {
+    using namespace r4dx_convert;
+    if (f.kind == LinearFold::kIn) {
+      FoldRowsQ(w, N, K, norm.data(), set_.q, 1, norm_offset_);
+    } else if (f.kind == LinearFold::kHadOnly) {
+      FoldRowsHadamard(w, N, K, Had(f.had), 1);
+    } else if (f.kind != LinearFold::kNone) {
+      throw std::logic_error("RotationSource::FoldRowsBlock: Q^T W folds act on columns");
+    }
+  }
+
+  // The rotation tensors in container order (signs, mix, then the q2ab sign vectors that exist): the
+  // exact values every fold above used. Written to the container (add_fp32_values below) and by
+  // --rotation-out, hashed by Fingerprint().
+  std::vector<std::pair<std::string, const std::vector<float>*>> Tensors() const {
+    std::vector<std::pair<std::string, const std::vector<float>*>> t;
+    if (!Enabled()) return t;
+    t.emplace_back("rotation.signs", &set_.q.signs);
+    t.emplace_back(r4dx_convert::RotationMixName(set_.q.nblk), &set_.q.mix);
+    if (Hadamard()) {
+      t.emplace_back("rotation.had_down_signs", &set_.had_down.signs);
+      t.emplace_back("rotation.had_o_signs", &set_.had_o.signs);
+      if (!set_.had_gdn_out.Empty()) t.emplace_back("rotation.had_gdn_out_signs", &set_.had_gdn_out.signs);
+      if (!set_.had_o_full.Empty()) t.emplace_back("rotation.had_o_full_signs", &set_.had_o_full.signs);
+    }
+    return t;
+  }
+
+  // What ties a rotated --trellis-from manifest to this run's Q (TrellisOptions::rotation): the kind,
+  // the seed and the sha256 of "r4dx-rotation-v1\n" + per tensor (name, "\n", u64le element count, the
+  // fp32 little-endian bytes). trellis_quant.py --rotation recomputes it from the --rotation-out file.
+  nlohmann::json Fingerprint() const {
+    std::string blob = "r4dx-rotation-v1\n";
+    for (const auto& [name, vals] : Tensors()) {
+      blob += name + "\n";
+      const uint64_t n = vals->size();
+      blob.append(reinterpret_cast<const char*>(&n), sizeof(n));
+      blob.append(reinterpret_cast<const char*>(vals->data()), vals->size() * sizeof(float));
+    }
+    return {{"kind", KindName()},
+            {"seed", set_.seed},
+            {"tensors_sha256", r4dx_convert::Sha256Hex(blob)},
+            {"hidden", set_.q.hidden},
+            {"block", set_.q.block}};
+  }
+
   // The --imatrix vector carried into the folded linear's input basis under the diagonal model
   // (rotation.hpp). Only called for f.RotatesInput().
   std::vector<float> Importance(const LinearFold& f, const std::vector<float>& norm,
@@ -1578,6 +1657,53 @@ ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWri
   return p;
 }
 
+// ---- --rotation-out ------------------------------------------------------------------------------
+
+// Writes the rotation tensors a `--rotate` run of this checkpoint would put in its container, as a
+// plain safetensors file (F32, natural shapes: signs [hidden], mix [nblk, nblk], had_* [K]), with
+// __metadata__ {format "r4dx-rotation", rotation (the container's __metadata__.rotation), fingerprint
+// (what a rotated --trellis-from manifest must carry), config_sha256}. tools/reference/trellis_quant.py
+// --rotation reads it: the oracle then folds weights and Hessians with exactly the converter's Q / Hb,
+// not a re-implementation of the seed's generator. Reads config.json only.
+int RunRotationOut(const AppArgs& args) {
+  const std::string config_text = ReadFile(args.input + "\\config.json");
+  const nlohmann::json config = nlohmann::json::parse(config_text);
+  RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit,
+                     config.at("text_config"));
+  const auto tensors = rot.Tensors();
+  const r4dx_convert::RotationSet& rs = rot.Set();
+  nlohmann::json header = nlohmann::json::object();
+  header["__metadata__"] = {{"format", "r4dx-rotation"},
+                            {"rotation", rot.Metadata().dump()},
+                            {"fingerprint", rot.Fingerprint().dump()},
+                            {"config_sha256", r4dx_convert::Sha256Hex(config_text)}};
+  uint64_t off = 0;
+  for (const auto& [name, vals] : tensors) {
+    const std::vector<int64_t> shape = vals == &rs.q.mix
+                                           ? std::vector<int64_t>{rs.q.nblk, rs.q.nblk}
+                                           : std::vector<int64_t>{static_cast<int64_t>(vals->size())};
+    const uint64_t bytes = vals->size() * sizeof(float);
+    header[name] = {{"dtype", "F32"}, {"shape", shape}, {"data_offsets", {off, off + bytes}}};
+    off += bytes;
+  }
+  std::string h = header.dump();
+  h.append((8 - h.size() % 8) % 8, ' ');
+  std::ofstream f(r4dx_convert::Utf8ToWide(args.rotation_out).c_str(), std::ios::binary | std::ios::trunc);
+  if (!f) throw std::runtime_error("--rotation-out: cannot open " + args.rotation_out + " for writing");
+  const uint64_t hlen = h.size();
+  f.write(reinterpret_cast<const char*>(&hlen), 8);
+  f.write(h.data(), static_cast<std::streamsize>(h.size()));
+  for (const auto& [name, vals] : tensors)
+    f.write(reinterpret_cast<const char*>(vals->data()),
+            static_cast<std::streamsize>(vals->size() * sizeof(float)));
+  f.close();
+  if (!f) throw std::runtime_error("--rotation-out: writing " + args.rotation_out + " failed");
+  std::cout << "[r4dx-convert] rotation-out: " << rot.KindName() << " seed=0x" << std::hex << rot.Seed()
+            << std::dec << ", " << tensors.size() << " tensor(s) -> " << args.rotation_out
+            << "\n[r4dx-convert] fingerprint " << rot.Fingerprint().dump() << "\n";
+  return 0;
+}
+
 // ---- normal mode --------------------------------------------------------------------------
 
 int RunConvert(const AppArgs& args) {
@@ -1600,9 +1726,14 @@ int RunConvert(const AppArgs& args) {
     throw std::runtime_error("--audio applies to Gemma 4 checkpoints only (this one is not gemma4_unified)");
   if (is_gemma && args.mtp == 1)
     throw std::runtime_error("--mtp on: a gemma4_unified checkpoint has no MTP head");
-  if (is_gemma && !args.trellis.from.empty())
-    throw std::runtime_error("--trellis-from is not supported for gemma4_unified yet (trellis_import.hpp is "
-                             "keyed by the Qwen container's base names; docs/gemma4-plan.md M1-28)");
+  // Qwen: a trellis linear quantizes the unrotated W (see ParseArgs). Gemma may import a rotated oracle
+  // run (TrellisSource::CheckRotation ties it to this run's Q); the Gemma trellis import is keyed by HF
+  // names (every body base is text.layers.*), which is all trellis_import.hpp reads.
+  if (!is_gemma && !args.trellis.from.empty() &&
+      r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone)
+    throw std::runtime_error("--trellis-from needs --rotate none (got --rotate " + args.rotate +
+                             "): the oracle quantized the unrotated weights, and a rotated "
+                             "container would feed them x Q with the norms folded away");
   if (is_gemma && (args.record_reuse_guard || !args.reuse_from.empty()))
     throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for gemma4_unified "
                              "yet (the guard reads model.safetensors.index.json)");
@@ -1684,7 +1815,15 @@ int RunConvert(const AppArgs& args) {
   // --trellis-manifest-sha256 pin) run here, before the first shard is opened; the per-linear
   // checks run as add_linear resolves each body linear and in the planning pass, the file hashes
   // right after it.
-  r4dx_convert::trellis::TrellisSource trellis(args.trellis, config_text);
+  // A rotated Gemma run hands TrellisSource its Q's fingerprint: the manifest must carry the same one
+  // (the oracle folded this Q), and an unrotated run refuses a manifest that carries any.
+  r4dx_convert::trellis::TrellisOptions trellis_opt = args.trellis;
+  if (rot.Enabled() && !args.trellis.from.empty()) {
+    trellis_opt.rotation = rot.Fingerprint();
+    std::cout << "[r4dx-convert] rotated trellis: the manifest must carry rotation "
+              << trellis_opt.rotation.dump() << " (trellis_quant.py --rotation)\n";
+  }
+  r4dx_convert::trellis::TrellisSource trellis(trellis_opt, config_text);
   if (trellis.Enabled()) {
     std::cout << "[r4dx-convert] trellis-from=" << trellis.ManifestPath() << " (sha256 "
               << trellis.ManifestSha256() << ", " << (trellis.IsMix() ? "mix" : "quantize-model")
@@ -1901,6 +2040,12 @@ int RunConvert(const AppArgs& args) {
                 std::cout, use_rms);
   };
 
+  struct VerifyFold {
+    LinearFold fold;
+    std::vector<float> norm;
+  };
+  std::map<std::string, VerifyFold> verify_folds;  // HF name -> its fold (rotated trellis imports)
+
   // `fold` is what --rotate does to this linear (RotationSource::In / Out); the default, kNone, is
   // what every call outside the text-layer loop -- and every call without --rotate -- gets.
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
@@ -1924,6 +2069,13 @@ int RunConvert(const AppArgs& args) {
       LayoutSet tls;
       imported = trellis.Resolve(container_base, hf_names, kept, &tls, std::cout);
       if (tls.trellis) requested = tls;
+    }
+    // A rotated trellis import (Gemma): the oracle quantized fold(W), so the reconstruction check
+    // must compare against the same fold of the checkpoint weight (the fold and its norm, per HF
+    // tensor; the norm is read here, single-threaded, for the worker threads of the check).
+    if (imported && fold.kind != LinearFold::kNone) {
+      const std::vector<float> norm = rot.ReadNorm(fold, model);
+      for (const auto& n : hf_names) verify_folds[n] = {fold, norm};
     }
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
@@ -2586,8 +2738,16 @@ int RunConvert(const AppArgs& args) {
     if (trellis.VerifyFull()) {
       const auto tv = std::chrono::steady_clock::now();
       r4dx_convert::trellis::TrellisVerifySummary vs;
+      // Rotated import: compare against fold(W) (the weight the oracle quantized), per 128-row block.
+      r4dx_convert::trellis::VerifyFoldFn verify_fold;
+      if (!verify_folds.empty())
+        verify_fold = [&verify_folds, &rot](const std::string& hf, std::vector<float>& rows, int64_t n,
+                                            int64_t K) {
+          const auto it = verify_folds.find(hf);
+          if (it != verify_folds.end()) rot.FoldRowsBlock(it->second.fold, it->second.norm, rows, n, K);
+        };
       try {
-        vs = trellis.Verify(write_path, model, threads, std::cout);
+        vs = trellis.Verify(write_path, model, threads, std::cout, verify_fold);
         r4dx_convert::trellis::PatchContainerHeader(write_path, trellis.VerifyNeedle(),
                                                     trellis.VerifyPatch(vs));
       } catch (const std::exception& e) {
@@ -2874,6 +3034,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error("--selftest requires --selftest-input and --selftest-output");
       return RunSelftest(args);
     }
+    if (!args.rotation_out.empty()) return RunRotationOut(args);
     if (args.input.empty() || args.output.empty())
       throw std::runtime_error("--input and --output are required (or pass --selftest or --dflash-gguf)");
     return RunConvert(args);

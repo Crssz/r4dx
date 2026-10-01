@@ -36,6 +36,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -318,7 +319,20 @@ struct TrellisOptions {
   std::string verify = "full";  // --trellis-verify full|none
   std::string allow_basis;      // --trellis-allow-basis ("" or "exl3")
   int prescale_log2 = 0;        // --trellis-prescale-log2
+  // The run's own rotation (Gemma rotated trellis, docs/gemma4-plan.md 9.7 and 4.6): null for an
+  // unrotated run, else {"kind", "seed", "tensors_sha256"} -- what RotationSource::Fingerprint() says
+  // about the Q / Hb this conversion folds. The oracle quantized the FOLDED weights against the
+  // rotated Hessians (trellis_quant.py --rotation), so the manifest must carry exactly this
+  // fingerprint under "rotation"; an unrotated run refuses a manifest that carries one and vice versa.
+  nlohmann::json rotation = nullptr;
 };
+
+// Per-linear fold the reconstruction check applies to the CHECKPOINT weight before comparing it with
+// the container's W_hat, for a rotated run: `rows` is a [nrows, K] row block of the HF tensor `hf`
+// (rows are independent under every fold the converter has: W diag(w) Q on the K side, W Hb), folded
+// in place. Called from worker threads: must be thread-safe. Null = compare against the raw weight.
+using VerifyFoldFn =
+    std::function<void(const std::string& hf, std::vector<float>& rows, int64_t nrows, int64_t K)>;
 
 // One HF tensor's manifest record, checked (3.3 step 4, minus the checkpoint shape:
 // TrellisSource::Plan).
@@ -734,6 +748,8 @@ class TrellisSource {
     };
     if (man_.contains("allocation") && man_["allocation"].is_object())
       j["allocation_sources"] = man_["allocation"].value("sources", nlohmann::json(nullptr));
+    // Rotated trellis only: the fingerprint the manifest and this run agreed on (CheckRotation).
+    if (!opt_.rotation.is_null()) j["rotation"] = opt_.rotation;
     return j;
   }
 
@@ -776,7 +792,7 @@ class TrellisSource {
   // in a fixed order and the items are added in row order, so the result does not depend on
   // `threads`.
   TrellisVerifySummary Verify(const std::string& container, ShardedModel& model, int threads,
-                              std::ostream& log) const {
+                              std::ostream& log, const VerifyFoldFn& fold = nullptr) const {
     const SafetensorsReader c(Utf8ToWide(container));
     struct Item {
       size_t li, part;
@@ -831,6 +847,25 @@ class TrellisSource {
       uint32_t words[40];
       float vals[kTile];
       double e2 = 0.0, w2 = 0.0;
+      // Rotated run: the weight the oracle quantized is fold(W), so the 128-row block is read whole,
+      // folded (rows are independent) and compared from this buffer; an unrotated run reads W as is.
+      std::vector<float> folded;
+      if (fold) {
+        folded.resize(static_cast<size_t>(kHad * K));
+        for (int64_t row = 0; row < kHad; ++row) {
+          const int64_t wrow = it.block * kHad + row;
+          for (int64_t k = 0; k < K; ++k) {
+            if (src.bf16) {
+              uint16_t b;
+              std::memcpy(&b, src.data + (wrow * K + k) * 2, 2);
+              folded[static_cast<size_t>(row * K + k)] = r4dx::core::Bf16ToFloat(b);
+            } else {
+              std::memcpy(&folded[static_cast<size_t>(row * K + k)], src.data + (wrow * K + k) * 4, 4);
+            }
+          }
+        }
+        fold(L.recs[it.part].name, folded, kHad, K);
+      }
       for (int64_t k0 = 0; k0 < K; k0 += kHad) {
         for (int64_t t8 = 0; t8 < kHad / 16; ++t8) {
           const int64_t tn = row0 / 16 + t8;
@@ -859,7 +894,9 @@ class TrellisSource {
           const float* br = blk.data() + row * kHad;
           for (int64_t k = 0; k < kHad; ++k) {
             float wv;
-            if (src.bf16) {
+            if (fold) {
+              wv = folded[static_cast<size_t>(row * K + k0 + k)];
+            } else if (src.bf16) {
               uint16_t b;
               std::memcpy(&b, src.data + (wrow * K + k0 + k) * 2, 2);
               wv = r4dx::core::Bf16ToFloat(b);
@@ -1013,6 +1050,7 @@ class TrellisSource {
           Who() + ": hessian_basis is '" + basis_ + "': only 'matched' is imported (" +
           "docs/trellis.md 14 (b) measured it 7-73% better on q/k/v); 'exl3' needs "
           "--trellis-allow-basis exl3");
+    CheckRotation();
     const std::string cs = StrOr(man_, "config_sha256", "(absent)");
     if (cs != config_sha256)
       throw std::runtime_error(Who() + ": config_sha256 " + cs +
@@ -1023,6 +1061,35 @@ class TrellisSource {
     // The two forms (trellis_quant.py write_manifest / cmd_mix): a mix carries `allocation` and
     // none of stale_layers / layers_done / top-level code_sha256.
     mix_ = man_.contains("allocation") && !man_.contains("layers_done");
+  }
+
+  // Rotated trellis (Gemma): the oracle's "rotation" fingerprint against this run's. Neither side may
+  // have one the other lacks: rotated bits fed to an unrotated container (or the reverse) are
+  // garbage, and a different seed or different sign tensors is a different Q.
+  void CheckRotation() const {
+    const bool want = !opt_.rotation.is_null();
+    const bool have = man_.contains("rotation") && !man_["rotation"].is_null();
+    if (!want && !have) return;
+    if (want && !have)
+      throw std::runtime_error(Who() + ": this run folds a rotation (--rotate " +
+                               StrOr(opt_.rotation, "kind", "?") +
+                               ") but the manifest has none: its bits quantized the UNROTATED weights "
+                               "(re-run trellis_quant.py with --rotation <r4dx-convert --rotation-out file>)");
+    if (!want)
+      throw std::runtime_error(Who() + ": the manifest quantized ROTATED weights (rotation " +
+                               JsonShort(man_["rotation"]) +
+                               ") but this run has no --rotate: pass the same --rotate / --rotation-seed");
+    const nlohmann::json& r = man_["rotation"];
+    if (!r.is_object()) throw std::runtime_error(Who() + ": rotation is not an object");
+    for (const char* key : {"kind", "seed", "tensors_sha256"}) {
+      if (!r.contains(key) || r[key] != opt_.rotation[key])
+        throw std::runtime_error(Who() + ": rotation." + key + " is " +
+                                 (r.contains(key) ? r[key].dump() : std::string("(absent)")) +
+                                 " in the manifest but " + opt_.rotation[key].dump() +
+                                 " in this run -- the oracle folded another Q (same --rotate kind, "
+                                 "--rotation-seed and checkpoint config are needed; compare "
+                                 "`r4dx-convert --rotation-out`'s tensors_sha256)");
+    }
   }
 
   // Step 4 for one HF tensor, before its checkpoint shape is known.

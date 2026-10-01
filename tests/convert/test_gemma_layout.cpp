@@ -12,7 +12,8 @@
 //     --kv-calib, the vision/audio passthrough, --layers, --rotate q2ab (Hadamard-only o / down,
 //     folded in-norms stored as ones, rotation.* tensors and metadata, the folded q and o bytes against
 //     an independent fold), and every refusal (an unconsumed tensor, a wrong shape, a missing
-//     layer_scalar, v_proj on a k_eq_v layer, --mtp on, --trellis-from, an untied head).
+//     layer_scalar, v_proj on a k_eq_v layer, --mtp on, --trellis-from without a manifest, an untied head;
+//     --trellis-from itself is test_gemma_trellis.cpp).
 // The Qwen byte-identity guards are the existing convert_* tests; this file never runs a Qwen
 // conversion.
 #include <algorithm>
@@ -771,8 +772,10 @@ void TestExe() {
             },
             "--vision on", "no vision tensors");
   fail_case("--mtp on is refused", "mtp", [](Ckpt&) {}, "--mtp on", "no MTP head");
-  fail_case("--trellis-from is refused", "trellis", [](Ckpt&) {}, "--trellis-from \"" + (root / "nowhere").u8string() + "\"",
-            "not supported for gemma4_unified");
+  // --trellis-from is supported for Gemma now (tests/convert/test_gemma_trellis.cpp); a manifest that is not
+  // there is an ordinary refusal of the import, not of the arch.
+  fail_case("--trellis-from without a manifest is refused", "trellis", [](Ckpt&) {},
+            "--trellis-from \"" + (root / "nowhere").u8string() + "\"", "no weights_override.json there");
   fail_case("--record-reuse-guard is refused", "guard", [](Ckpt&) {}, "--record-reuse-guard", "not supported for gemma4_unified");
 
   std::error_code ec;

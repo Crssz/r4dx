@@ -76,6 +76,10 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+# The architecture table (docs/gemma4-plan.md 4.5 / M1-25): LINEARS / QGROUPS / module_list below are the
+# Qwen3.5 entry (unchanged values); quantize-model / mix take `--arch` (auto: config.json's model_type).
+from arch_table import QWEN, ArchSpec, get_arch, resolve_arch  # noqa: E402
+
 # --------------------------------------------------------------------------------------------
 # Constants (docs/trellis.md)
 # --------------------------------------------------------------------------------------------
@@ -98,33 +102,13 @@ LAYER_PREFIX = "model.language_model.layers."
 
 #: HF module (under a decoder layer) -> (hessian-v2 container key suffix, the tap it reads, the
 #: tensor class used in reports). Order = EXL3's module order inside a layer (the allocator's idx).
-LINEARS = {
-    "self_attn.q_proj": ("attn.qg", "in"),
-    "self_attn.k_proj": ("attn.k", "in"),
-    "self_attn.v_proj": ("attn.v", "in"),
-    "self_attn.o_proj": ("attn.o", "out"),
-    "linear_attn.in_proj_qkv": ("gdn.in_proj_qkv", "in"),
-    "linear_attn.in_proj_z": ("gdn.in_proj_z", "in"),
-    "linear_attn.out_proj": ("gdn.out_proj", "out"),
-    "mlp.gate_proj": ("mlp.gate_up", "mlp_in"),
-    "mlp.up_proj": ("mlp.gate_up", "mlp_in"),
-    "mlp.down_proj": ("mlp.down", "mlp_mid"),
-}
+#: (Gemma 4's is arch_table.GEMMA.linears: attn.q instead of attn.qg, no gdn.*, taps in / out / mlp_in /
+#: mlp_mid with mlp_in = pre_feedforward_layernorm's output.)
+LINEARS = QWEN.linears
 #: HF module -> EXL3's qgroup suffix (exllamav3 6b84a21 modules/attn.py `key + ".qkv"` / `".o"`,
 #: modules/gated_delta_net.py `key + ".qkvz"` / `".o"`, modules/mlp.py GatedMLP `key + ".gu"` /
 #: `".d"`): the allocator promotes a group only as a whole (docs/trellis.md 9).
-QGROUPS = {
-    "self_attn.q_proj": "self_attn.qkv",
-    "self_attn.k_proj": "self_attn.qkv",
-    "self_attn.v_proj": "self_attn.qkv",
-    "self_attn.o_proj": "self_attn.o",
-    "linear_attn.in_proj_qkv": "linear_attn.qkvz",
-    "linear_attn.in_proj_z": "linear_attn.qkvz",
-    "linear_attn.out_proj": "linear_attn.o",
-    "mlp.gate_proj": "mlp.gu",
-    "mlp.up_proj": "mlp.gu",
-    "mlp.down_proj": "mlp.d",
-}
+QGROUPS = QWEN.qgroups
 ATTN_MODULES = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]
 GDN_MODULES = ["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj"]
 MLP_MODULES = ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
@@ -136,8 +120,11 @@ ENCODING_TRELLIS = "trellis-exl3"
 ENCODING_DENSE = "dense"
 
 
-def module_list(layer_type: str) -> list[str]:
-    return (ATTN_MODULES if layer_type == "full_attention" else GDN_MODULES) + MLP_MODULES
+def module_list(layer_type: str, arch: ArchSpec = QWEN) -> list[str]:
+    """The HF modules of a layer of `layer_type`, in the allocator's (EXL3's) module order. Qwen3.5:
+    attention (q, k, v, o) or GDN + MLP; Gemma 4: sliding (q, k, v, o) / full (q, k, o: k_eq_v, no
+    v_proj) + MLP."""
+    return arch.module_list(layer_type)
 
 
 def hf_name(layer: int, module: str) -> str:
@@ -1325,23 +1312,29 @@ def allocate(tensors: list[dict], bpw: float) -> dict[str, float]:
     return rate
 
 
-def model_linears(model_dir: Path) -> list[dict]:
-    """Every quantized decoder linear: name, layer, idx (module order), module, qgroup, numel, k, n."""
+def model_linears(model_dir: Path, arch: ArchSpec | None = None) -> list[dict]:
+    """Every quantized decoder linear: name, layer, idx (module order), module, qgroup, numel, k, n.
+    `arch` (default: config.json's model_type, Qwen3.5 when it is not Gemma 4). A single-file checkpoint
+    (Gemma's one model.safetensors, no index) is read through common.ShardIndex."""
     cfg = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
     tc = cfg.get("text_config", cfg)
-    idx_path = Path(model_dir) / "model.safetensors.index.json"
-    wm = json.loads(idx_path.read_text(encoding="utf-8"))["weight_map"]
+    arch = resolve_arch(None, model_dir) if arch is None else arch
+    from common import ShardIndex
+
+    wm = ShardIndex.load(Path(model_dir)).weight_map
+    if not wm:
+        raise FileNotFoundError(f"{model_dir}: no model.safetensors.index.json / model.safetensors")
     from safetensors import safe_open
 
     shapes: dict[str, list[int]] = {}
     by_shard: dict[str, list[str]] = {}
     out = []
     for layer, lt in enumerate(tc["layer_types"]):
-        for idx, mod in enumerate(module_list(lt)):
+        for idx, mod in enumerate(module_list(lt, arch)):
             name = hf_name(layer, mod)
             by_shard.setdefault(wm[name], []).append(name)
             out.append({"name": name, "layer": layer, "idx": idx, "module": mod, "layer_type": lt,
-                        "qgroup": QGROUPS[mod]})
+                        "qgroup": arch.qgroups[mod]})
     for shard, names in by_shard.items():
         with safe_open(str(Path(model_dir) / shard), framework="pt", device="cpu") as f:
             for nm in names:
@@ -1484,26 +1477,33 @@ RECIPE = {
 # --------------------------------------------------------------------------------------------
 
 
-def _layer_groups(layer: int, layer_type: str) -> list[tuple[str, list[str]]]:
+def _layer_groups(layer: int, layer_type: str, arch: ArchSpec = QWEN) -> list[tuple[str, list[str]]]:
     """(tap, modules) per shared-H group of a layer."""
     groups: dict[str, list[str]] = {}
-    for mod in module_list(layer_type):
-        groups.setdefault(LINEARS[mod][1], []).append(mod)
+    for mod in module_list(layer_type, arch):
+        groups.setdefault(arch.linears[mod][1], []).append(mod)
     return list(groups.items())
 
 
 def cmd_quantize_model(args) -> int:
     from common import ShardIndex, resolve_device, sha256_file  # noqa: E402
-    from full_logits_golden import get_tensors_grouped  # noqa: E402
 
-    device = resolve_device(args.device)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     model_dir = Path(args.model_dir)
     hdir = Path(args.hessian_dir)
+    arch = resolve_arch(args.arch, model_dir)
+    rot = None
+    if args.rotation is not None:
+        if not arch.is_gemma:
+            raise SystemExit("[trellis] --rotation: rotated trellis is Gemma 4 only (the converter refuses "
+                             "--rotate with --trellis-from for Qwen: its oracle quantizes the unrotated weights)")
+        from rotation_oracle import RotationSpec
+
+        rot = RotationSpec(args.rotation)
     hman = json.loads((hdir / "hessian.json").read_text(encoding="utf-8"))
     keys = hman["keys"]
-    linears = model_linears(model_dir)
+    rms_keys = hman.get("rms_keys") or {}
+    linears = model_linears(model_dir, arch)
     if args.bpw is not None:
         rates = allocate(linears, args.bpw)
     else:
@@ -1515,23 +1515,33 @@ def cmd_quantize_model(args) -> int:
             a, _, b = part.partition("-")
             want.update(range(int(a), int(b or a) + 1))
         layers = [i for i in layers if i in want]
-    enc = TrellisEncoder(args.backend, device, threads=args.threads, grid=args.grid)
-    print(f"[trellis] encoder {enc.describe()}", flush=True)
-    enc.check_against_reference(set(rates.values()))
     config_sha = sha256_file(model_dir / "config.json")
     hman_sha = sha256_file(hdir / "hessian.json")
-    index = ShardIndex.load(model_dir)
     # The resume key: a layer written by other code (quantizer or encoder source) is redone, not
     # kept. The encoder backend is not part of it (hip, cpu and torch give identical states).
     job = {"model_dir": str(model_dir), "config_sha256": config_sha, "hessian_dir": str(hdir),
            "hessian_manifest_sha256": hman_sha, "hessian_basis": args.hessian_basis,
            "codebook": "mul1", "recipe": RECIPE, "code_sha256": code_sha256()}
+    if arch.is_gemma:  # a Qwen job keeps exactly its old fields: existing Qwen oracle directories stay resumable
+        job["arch"] = arch.name
+    if rot is not None:
+        job["rotation"] = rot.fingerprint()  # kind, seed, tensors_sha256: r4dx-convert checks it (CheckRotation)
+    if args.dry_run:
+        return dry_run_quantize(args, arch, rot, linears, rates, layers, keys, rms_keys, hdir, job)
+    device = resolve_device(args.device)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    from common import get_tensors_grouped
+
+    enc = TrellisEncoder(args.backend, device, threads=args.threads, grid=args.grid)
+    print(f"[trellis] encoder {enc.describe()}", flush=True)
+    enc.check_against_reference(set(rates.values()))
+    index = ShardIndex.load(model_dir)
     t_all = time.perf_counter()
     for layer in layers:
         lt = next(t["layer_type"] for t in linears if t["layer"] == layer)
         rec_path = out_dir / f"L{layer:02d}.json"
         st_path = out_dir / f"L{layer:02d}.safetensors"
-        want_k = {hf_name(layer, m): rates[hf_name(layer, m)] for m in module_list(lt)}
+        want_k = {hf_name(layer, m): rates[hf_name(layer, m)] for m in module_list(lt, arch)}
         if rec_path.exists() and st_path.exists():
             old = json.loads(rec_path.read_text(encoding="utf-8"))
             if (layer_record_usable(old, job, rates)
@@ -1541,19 +1551,25 @@ def cmd_quantize_model(args) -> int:
             print(f"[trellis] L{layer:02d}: existing output is for another job, code or rate; redoing",
                   flush=True)
         t_layer = time.perf_counter()
-        names = [hf_name(layer, m) for m in module_list(lt)]
+        names = [hf_name(layer, m) for m in module_list(lt, arch)]
         raw = get_tensors_grouped(index, names)
         tensors_out: dict[str, torch.Tensor] = {}
         records: dict[str, dict] = {}
-        for tap, mods in _layer_groups(layer, lt):
-            ckey = f"text.layers.{layer}.{LINEARS[mods[0]][0]}"
+        for tap, mods in _layer_groups(layer, lt, arch):
+            ckey = f"text.layers.{layer}.{arch.linears[mods[0]][0]}"
             hfile = hdir / keys[ckey]
             t0 = time.perf_counter()
-            H, rows = read_hess(hfile, device)
-            print(f"[trellis] L{layer:02d} {tap}: {', '.join(mods)} <- {hfile.name} "
-                  f"(K={H.shape[0]}, read {time.perf_counter() - t0:.1f}s)", flush=True)
             names_g = [hf_name(layer, m) for m in mods]
-            res = quantize_group({n: raw[n] for n in names_g}, H, {n: rates[n] for n in names_g}, enc,
+            weights = {n: raw[n] for n in names_g}
+            H, rows = read_hess(hfile, device)
+            hrec = {"file": hfile.name, "rows": rows, "key": ckey}
+            if rot is not None:
+                H, weights, hrec = rotate_group(rot, arch, index, layer, lt, mods, weights, H, hrec,
+                                                hdir, rms_keys, ckey, device)
+            print(f"[trellis] L{layer:02d} {tap}: {', '.join(mods)} <- {hfile.name} "
+                  f"(K={H.shape[0]}, read {time.perf_counter() - t0:.1f}s)"
+                  f"{' [rotated ' + rot.kind + ']' if rot is not None else ''}", flush=True)
+            res = quantize_group(weights, H, {n: rates[n] for n in names_g}, enc,
                                  seed_group=stable_seed("su", layer, tap),
                                  seeds={n: stable_seed("sv", n) for n in names_g},
                                  hessian_basis=args.hessian_basis)
@@ -1561,7 +1577,7 @@ def cmd_quantize_model(args) -> int:
                 tensors_out[n + ".trellis"] = r["words"].contiguous()
                 tensors_out[n + ".suh"] = r["suh"].contiguous()
                 tensors_out[n + ".svh"] = r["svh"].contiguous()
-                r["record"]["hessian"] = {"file": hfile.name, "rows": rows, "key": ckey}
+                r["record"]["hessian"] = hrec
                 r["record"]["file"] = st_path.name
                 records[n] = r["record"]
             del H
@@ -1583,6 +1599,80 @@ def cmd_quantize_model(args) -> int:
               f"{enc.tiles / max(enc.seconds, 1e-9):.0f} tiles/s)", flush=True)
         write_manifest(out_dir, job, rates, args, enc)
     write_manifest(out_dir, job, rates, args, enc)
+    return 0
+
+
+def rotate_group(rot, arch: ArchSpec, index, layer: int, layer_type: str, mods: list[str], weights: dict,
+                 H, hrec: dict, hdir: Path, rms_keys: dict, ckey: str, device):
+    """Rotated trellis (rotation_oracle.py): fold every weight of the shared-Hessian group and move its Hessian
+    into the folded basis. An in-projection group (q/k/v, gate/up) takes (W diag(w_norm)) Q with the plain norm
+    weight of the norm in front of it, and Q^T H_rms Q from the weightless rms tap when hessian.json has one for
+    it ("rms_keys"), else Q^T D^-1 H D^-1 Q from the post-norm tap; an out-projection (o, down) takes W Hb and
+    Hb^T H Hb under q2ab (Gemma's option A) and nothing under q2a. Returns (H', weights', record')."""
+    rep = mods[0]
+    norm_w, is_rms = None, False
+    if rot.is_in_proj(rep):
+        norm = arch.norm_before[rep]  # input_layernorm (q/k/v) or pre_feedforward_layernorm (gate/up)
+        norm_w = index.get_tensor(f"{LAYER_PREFIX}{layer}.{norm}.weight").to(torch.float32).to(device)
+        rkey = rms_keys.get(ckey)
+        if rkey is not None:
+            H, rows_rms = read_hess(Path(hdir) / rkey, device)
+            is_rms = True
+            hrec = dict(hrec, file=rkey, rms=True, post_file=hrec["file"], rows=rows_rms)
+    new_w = {n: rot.fold_weight(w.to(device), layer_type, m, norm_w, arch.norm_offset)
+             for (n, w), m in zip(weights.items(), mods)}
+    H = rot.transform_hessian(H, layer_type, rep, norm_w, arch.norm_offset, is_rms=is_rms)
+    return H, new_w, dict(hrec, rotated=rot.kind)
+
+
+def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rms_keys, hdir: Path, job) -> int:
+    """quantize-model --dry-run (CPU, no encoder, no device rule): what a run would quantize, the Hessian it
+    would read for each tap group (file present, K and rows from its header), the rate of every tensor, the
+    rotation fold, and the job record that keys resumption and the manifest."""
+    print(f"[trellis] --dry-run: arch {arch.name}, {len(linears)} linears over {len(layers)} layer(s) of "
+          f"{max(t['layer'] for t in linears) + 1}, hessian basis {args.hessian_basis}"
+          f"{', rotation ' + rot.kind + ' seed ' + str(rot.seed) + ' (' + rot.tensors_sha256[:12] + ')' if rot else ''}")
+    problems = []
+    n_groups = 0
+    kinds_seen = set()
+    for layer in layers:
+        lt = next(t["layer_type"] for t in linears if t["layer"] == layer)
+        for tap, mods in _layer_groups(layer, lt, arch):
+            ckey = f"text.layers.{layer}.{arch.linears[mods[0]][0]}"
+            n_groups += 1
+            if ckey not in keys:
+                problems.append(f"hessian.json has no key {ckey}")
+                continue
+            hfile = hdir / keys[ckey]
+            line = f"    L{layer:02d} {lt[:7]:<7} {tap:<7} {','.join(m.split('.')[-1][:-5] for m in mods):<10}"
+            try:
+                with open(hfile, "rb") as f:
+                    hdr = f.read(HESS_HEADER.size)
+                magic, k, flags, rows, _ = HESS_HEADER.unpack(hdr)
+                ok = magic == b"R4DXHES1"
+                line += f" <- {hfile.name} K={k} rows={rows}{'' if ok else ' BAD MAGIC'}"
+                if not ok:
+                    problems.append(f"{hfile}: bad magic")
+                want_k = next(t["k"] for t in linears if t["name"] == hf_name(layer, mods[0]))
+                if k != want_k:
+                    problems.append(f"{hfile}: K={k} but {hf_name(layer, mods[0])} has in_features {want_k}")
+            except OSError as e:
+                line += f" <- {hfile.name} MISSING ({e.strerror})"
+                problems.append(f"{hfile}: not readable")
+            if rot is not None and rot.is_in_proj(mods[0]):
+                rk = rms_keys.get(ckey)
+                line += f"  H' = Q^T H_rms Q ({rk})" if rk else "  H' = Q^T D^-1 H D^-1 Q (no rms tap)"
+                kinds_seen.add("rms" if rk else "divide")
+            elif rot is not None and rot.had_site(lt, mods[0]):
+                line += f"  H' = Hb^T H Hb ({rot.had_site(lt, mods[0])})"
+            print(line)
+    print(f"[trellis] {n_groups} Hessian group(s); job key {json.dumps({k: job[k] for k in job if k not in ('recipe',)}, default=str)[:300]}")
+    if problems:
+        for p in problems[:20]:
+            print(f"[trellis] PROBLEM: {p}")
+        print(f"[trellis] --dry-run: FAILED ({len(problems)} problem(s)); nothing written")
+        return 1
+    print("[trellis] --dry-run: OK (nothing quantized, nothing written)")
     return 0
 
 
@@ -1639,15 +1729,18 @@ def cmd_mix(args) -> int:
         srcs[ks.pop()] = man
     base = next(iter(srcs.values()))
     job_keys = ("model_dir", "config_sha256", "hessian_manifest_sha256", "hessian_basis", "codebook")
+    # Gemma / rotated directories carry "arch" and "rotation" (a Qwen manifest has neither, and its mix
+    # keeps exactly its old fields): the sources must agree on them and the mix carries them on.
+    opt_keys = tuple(k for k in ("arch", "rotation") if any(k in m for m in srcs.values()))
     for man in srcs.values():
-        for key in job_keys:
+        for key in job_keys + opt_keys:
             if man.get(key) != base.get(key):
                 raise SystemExit(f"[trellis] source directories differ in {key}")
     code = {str(K): m.get("code_sha256") for K, m in srcs.items()}
     if len({json.dumps(v, sort_keys=True) for v in code.values()}) > 1:
         print(f"[trellis] WARNING: the source directories were written by different trellis_quant.py / "
               f"trellis_viterbi.hip versions (recorded in the manifest): {code}", flush=True)
-    linears = model_linears(Path(base["model_dir"]))
+    linears = model_linears(Path(base["model_dir"]), get_arch(base.get("arch")))
     rates = allocate(linears, args.bpw)
     need = sorted(set(rates.values()))
     lacking = [r for r in need if r not in srcs]
@@ -1666,7 +1759,7 @@ def cmd_mix(args) -> int:
         counts[str(K)] = counts.get(str(K), 0) + 1
     man = {"format": OVERRIDE_FORMAT, "version": OVERRIDE_VERSION, "encoding": ENCODING_TRELLIS,
            "complete": True, "missing": [], "missing_count": 0, "bpw_target": args.bpw,
-           "K_uniform": None, **{k: base.get(k) for k in job_keys}, "recipe": base.get("recipe"),
+           "K_uniform": None, **{k: base.get(k) for k in job_keys + opt_keys}, "recipe": base.get("recipe"),
            "hessian_dir": base.get("hessian_dir"),
            "allocation": {"rule": "docs/trellis.md 9 (AL::create_q_strategy) with EXL3's qgroups (q/k/v, "
                                   "in_proj_qkv + in_proj_z, gate + up promoted as units; o/out/down "
@@ -1902,6 +1995,22 @@ def main() -> int:
     p = sub.add_parser("quantize-model", help="quantize every decoder linear into an override dir")
     enc_args(p)
     p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    p.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
+                   help="which family's linears / taps / container keys (tools/reference/arch_table.py); "
+                        "auto reads --model-dir's config.json model_type. gemma4_unified: q/k/v/o (no v on "
+                        "the 8 full layers) + gate/up/down, hessian keys attn.q / attn.k / attn.v / attn.o / "
+                        "mlp.gate_up / mlp.down; lm_head and the embedding stay bf16 (the converter's w4a16 "
+                        "path takes lm_head)")
+    p.add_argument("--rotation", type=Path, default=None, metavar="ROT.safetensors",
+                   help="ROTATED trellis (Gemma 4 only): the file `r4dx-convert --input <ckpt> --rotate "
+                        "q2a|q2ab [--rotation-seed S] --rotation-out ROT.safetensors` wrote. Every weight is "
+                        "folded with the converter's own Q / Hb and every Hessian moved into the folded "
+                        "basis before quantization (tools/reference/rotation_oracle.py); the manifest "
+                        "records the rotation's fingerprint, which r4dx-convert --rotate ... --trellis-from "
+                        "checks")
+    p.add_argument("--dry-run", action="store_true",
+                   help="CPU only, no encoder, no device: list the tap groups, the Hessian files they would "
+                        "read (header check), the rates and the rotation fold, and exit")
     p.add_argument("--hessian-dir", type=Path, default=Path(r"D:\models\r4dx\huihui\hessian-v2"))
     p.add_argument("--out-dir", type=Path, required=True)
     g = p.add_mutually_exclusive_group(required=True)

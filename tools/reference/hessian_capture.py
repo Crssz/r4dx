@@ -189,6 +189,12 @@ import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_REF = Path(__file__).resolve().parent
+if str(TOOLS_REF) not in sys.path:
+    sys.path.insert(0, str(TOOLS_REF))
+# The architecture table (docs/gemma4-plan.md M1-25): which modules are tapped, which norm feeds them, how
+# the container names them. The module-level constants below are the Qwen3.5 entry (unchanged values);
+# every function takes `arch=` (default QWEN) so a Gemma 4 run uses arch_table.GEMMA.
+from arch_table import GEMMA, QWEN, ArchSpec  # noqa: E402
 DEFAULT_CORPUS_DIR = TOOLS_REF / "kv_calib_corpus"
 DEFAULT_CALIB_TXT = TOOLS_REF / "calib.txt"
 DEFAULT_WIKITEXT = Path("D:/models/wikitext-2-raw/wiki.train.raw")
@@ -262,53 +268,29 @@ MAX_REPORTED_CHANNELS = 64
 #: the checkpoint (e.g. layer 7 post_attention_layernorm channel 3994), not a capture bug. LDLQ is
 #: unaffected -- damping keeps the factorization defined and the weight column sees a constant-zero
 #: input. The diagonal gate therefore allows exactly those channels and nothing else.
-NORM_BEFORE = {
-    "linear_attn.in_proj_qkv": "input_layernorm",
-    "self_attn.q_proj": "input_layernorm",
-    "mlp.gate_proj": "post_attention_layernorm",
-}
+#: (Gemma's is arch_table.GEMMA.norm_before: gate_proj reads pre_feedforward_layernorm's output, the
+#: scale is `w`, not `1 + w`, so no channel is structurally dead unless w is exactly 0.)
+NORM_BEFORE = QWEN.norm_before
 
 #: Modules whose input is ANOTHER module's input (same tensor), and the representative that is
 #: actually hooked for it. Anything a converter spec names that is neither here nor in TAP_OF is a
 #: hard error (the converter audit should have caught it first).
-SHARED_WITH = {
-    "linear_attn.in_proj_z": "linear_attn.in_proj_qkv",
-    "self_attn.k_proj": "self_attn.q_proj",
-    "self_attn.v_proj": "self_attn.q_proj",
-}
-TAP_OF = {
-    "linear_attn.in_proj_qkv": "in",
-    "self_attn.q_proj": "in",
-    "linear_attn.out_proj": "out",
-    "self_attn.o_proj": "out",
-    "mlp.gate_proj": "mlp_in",
-    "mlp.down_proj": "mlp_mid",
-}
-MTP_TAP_OF = {
-    "self_attn.q_proj": "in",
-    "self_attn.o_proj": "out",
-    "mlp.gate_proj": "mlp_in",
-    "mlp.down_proj": "mlp_mid",
-}
+SHARED_WITH = QWEN.shared_with
+TAP_OF = QWEN.tap_of
+MTP_TAP_OF = QWEN.mtp_tap_of
 #: Shared-input gate: representative -> companions, per layer type, checked on the first layer of
 #: each type. `up_proj` is the companion of `gate_proj` on both types.
-SHARED_GATE = {
-    "linear_attention": [("linear_attn.in_proj_qkv", ["linear_attn.in_proj_z"]),
-                         ("mlp.gate_proj", ["mlp.up_proj"])],
-    "full_attention": [("self_attn.q_proj", ["self_attn.k_proj", "self_attn.v_proj"]),
-                       ("mlp.gate_proj", ["mlp.up_proj"])],
-}
+SHARED_GATE = QWEN.shared_gate
 
 #: --rms-taps / --rms-only: per text layer, (the zero-centred norm whose INPUT is hooked, the tap
 #: name). The rms file is L{i:02d}.<tap>.rms.hess; the post-norm file of the same activations is
 #: L{i:02d}.<tap>.hess (the table above: in_proj_qkv / q_proj read input_layernorm's output, gate_proj
 #: reads post_attention_layernorm's).
-RMS_NORMS = (("input_layernorm", "in"), ("post_attention_layernorm", "mlp_in"))
+RMS_NORMS = QWEN.rms_norms
 #: The container keys (after "text.layers.{i}.") an rms tap may serve: the LDLQ'd in-projections a
 #: rotated container feeds from that norm. gdn.in_proj_a/b read the same input but stay bf16 in the
 #: container and are never LDLQ'd, so they have no key at all.
-RMS_KEY_SUFFIXES = {"in": ("gdn.in_proj_qkv", "gdn.in_proj_z", "attn.qg", "attn.k", "attn.v"),
-                    "mlp_in": ("mlp.gate_up",)}
+RMS_KEY_SUFFIXES = QWEN.rms_key_suffixes
 #: A post-norm tap file an rms tap can pair with.
 RMS_POST_FILE_RE = re.compile(r"L(\d{2,})\.(in|mlp_in)\.hess")
 #: Where a failed rms capture's report goes: the manifest is left exactly as it was.
@@ -567,8 +549,10 @@ class TapPlan:
     describe: str = ""
 
 
-def build_tap_plan(specs, expect_k: dict[str, int]) -> list[TapPlan]:
-    """Group `imatrix_capture.enumerate_quantized_linears`' specs by the input they read."""
+def build_tap_plan(specs, expect_k: dict[str, int], arch: ArchSpec = QWEN) -> list[TapPlan]:
+    """Group `imatrix_capture.enumerate_quantized_linears`' specs by the input they read (`arch`: the
+    tables of arch_table.py; Gemma has no MTP specs, so its mtp branches never run)."""
+    SHARED_WITH, TAP_OF, MTP_TAP_OF = arch.shared_with, arch.tap_of, arch.mtp_tap_of  # noqa: N806
     plans: dict[str, TapPlan] = {}
     for s in specs:
         if s.tap == "final_norm_out":
@@ -614,18 +598,19 @@ class RmsTapPlan:
     keys: list[str] = field(default_factory=list)
 
 
-def build_rms_plans(post_keys: dict[str, list[str]], n_run: int, hidden: int) -> list[RmsTapPlan]:
-    """One weightless rms tap per text layer < n_run and norm (RMS_NORMS) whose post-norm tap file is
+def build_rms_plans(post_keys: dict[str, list[str]], n_run: int, hidden: int,
+                    arch: ArchSpec = QWEN) -> list[RmsTapPlan]:
+    """One weightless rms tap per text layer < n_run and norm (arch.rms_norms) whose post-norm tap file is
     in `post_keys` (file -> the container keys reading it); those keys become its `rms_keys`. Refuses
-    a key the rotated container does not feed from that norm (RMS_KEY_SUFFIXES)."""
+    a key the rotated container does not feed from that norm (arch.rms_key_suffixes)."""
     plans = []
     for i in range(n_run):
-        for norm, tap in RMS_NORMS:
+        for norm, tap in arch.rms_norms:
             post = f"L{i:02d}.{tap}.hess"
             keys = post_keys.get(post)
             if not keys:
                 continue
-            want = {f"text.layers.{i}.{s}" for s in RMS_KEY_SUFFIXES[tap]}
+            want = {f"text.layers.{i}.{s}" for s in arch.rms_key_suffixes[tap]}
             bad = sorted(set(keys) - want)
             if bad:
                 raise SystemExit(f"[hessian] {post} serves {bad}: not an in-projection fed by layer "
@@ -1411,13 +1396,14 @@ class SharedInputGate:
     as its representative, on every sequence. Inputs are held only until `check()` runs after each
     layer call, then dropped."""
 
-    def __init__(self):
+    def __init__(self, arch: ArchSpec = QWEN):
         self.results: dict[str, dict] = {}
         self._seen: dict[str, object] = {}
+        self.arch = arch
 
     def install(self, layer, layer_idx: int, layer_type: str) -> list:
         handles = []
-        for rep, comps in SHARED_GATE[layer_type]:
+        for rep, comps in self.arch.shared_gate[layer_type]:
             for path in [rep] + comps:
                 mod = layer
                 for part in path.split("."):
@@ -1432,7 +1418,7 @@ class SharedInputGate:
     def check(self) -> None:
         import torch
 
-        for rep, comps in SHARED_GATE[self._type]:
+        for rep, comps in self.arch.shared_gate[self._type]:
             r = self._seen.get(rep)
             for c in comps:
                 t = self._seen.get(c)
@@ -1557,18 +1543,25 @@ def _write_accum(out_dir: Path, plan, acc: HessianAccum, st: CaptureState,
 
 def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, out_dir: Path,
                 hidden_device, want_draft_head: bool, rms_plans: list[RmsTapPlan] = (),
-                shared_gate: bool = True) -> CaptureState:
+                shared_gate: bool = True, arch: ArchSpec = QWEN) -> CaptureState:
     """The layer-major pass. `rms_plans` adds the weightless rms taps (a forward_pre_hook on the
     layer's norm module, see rms_weightless); `--rms-only` passes no `plans` and `shared_gate=False`,
-    so only those are hooked."""
+    so only those are hooked.
+
+    `ref` is a full_logits_golden.StreamingReference (Qwen) or anything with the same surface: `device`,
+    `layer_types`, `n_layers`, `embed(ids) -> [1, T, hidden]`, `build_layer(i)` and, instead of the Qwen
+    rope/mask plumbing, `capture_layer_forward(layer, i, x) -> out` and `final_norm_hidden(h)` (the
+    Gemma 4 adapter `GemmaCaptureRef`)."""
     import torch
 
     st = CaptureState()
+    st.shared_gate = SharedInputGate(arch)
     dev = ref.device
     layer_types = ref.layer_types
+    layer_fwd = getattr(ref, "capture_layer_forward", None)
     gate_layers = {}
     if shared_gate:
-        for t in ("linear_attention", "full_attention"):
+        for t in arch.shared_gate:
             if t in layer_types[:n_run]:
                 gate_layers[layer_types.index(t)] = t
     by_layer: dict[int, list[TapPlan]] = {}
@@ -1591,6 +1584,16 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
         if T not in mask_cache:
             mask_cache[T] = ref._manual_mask(T)
         return mask_cache[T]
+
+    def run_layer(layer, i, x):
+        """One decoder layer over `x` [1, T, hidden]: Gemma's adapter owns its per-layer-type rope / mask
+        (and the shared-kv dict); Qwen's is the StreamingReference._forward_manual call."""
+        if layer_fwd is not None:
+            return layer_fwd(layer, i, x)
+        T = x.shape[1]
+        return layer(hidden_states=x, position_embeddings=rope(T),
+                     attention_mask=None if layer_types[i] == "linear_attention" else mask(T),
+                     position_ids=None, past_key_values=None)
 
     with torch.no_grad():
         t0 = time.perf_counter()
@@ -1620,21 +1623,21 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                 acc = HessianAccum(rp.k, dev)
                 rms_accs[rp.file] = acc
                 st.rms_eps[rp.file] = eps
-                st.rms_scale[rp.file] = (1.0 + norm.weight.detach().float()).cpu().numpy()
+                st.rms_scale[rp.file] = (arch.norm_offset + norm.weight.detach().float()).cpu().numpy()
+                # Gemma 4's own `_norm` (x * pow(mean(x^2) + eps, -0.5), fp32) is the exact weightless
+                # form; Qwen's is rms_weightless (rsqrt), which the Qwen tests pin bit for bit.
                 handles.append(norm.register_forward_pre_hook(
-                    lambda _m, inputs, _acc=acc, _eps=eps: _acc.update(rms_weightless(inputs[0], _eps))))
+                    lambda _m, inputs, _acc=acc, _eps=eps, _norm=norm:
+                    _acc.update(_norm._norm(inputs[0].float()) if arch.is_gemma
+                                else rms_weightless(inputs[0], _eps))))
             handles += install_gemm_guard(layer, st, f"L{i:02d}")
             gated = i in gate_layers
             if gated:
                 handles += st.shared_gate.install(layer, i, gate_layers[i])
-            attn_is_linear = layer_types[i] == "linear_attention"
             try:
                 for j, h in enumerate(hidden):
                     x = h.to(dev)
-                    T = x.shape[1]
-                    out = layer(hidden_states=x, position_embeddings=rope(T),
-                                attention_mask=None if attn_is_linear else mask(T),
-                                position_ids=None, past_key_values=None)
+                    out = run_layer(layer, i, x)
                     if gated:
                         st.shared_gate.check()
                     hidden[j] = out.to(hidden_device)
@@ -1708,7 +1711,8 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
                     cur["j"] = j
                     pre = hidden[j].to(dev)  # [1, T, hidden], the PRE-final-norm residual
                     if lm_acc is not None:
-                        lm_acc.update(ref.model.norm(pre))
+                        lm_acc.update(ref.final_norm_hidden(pre) if layer_fwd is not None
+                                      else ref.model.norm(pre))
                     if mtp is not None:
                         mtp.run(pre[0], s.token_ids)
                     del pre
@@ -1739,35 +1743,36 @@ def run_capture(ref, seqs: list[Seq], plans: list[TapPlan], specs, n_run: int, o
 # --------------------------------------------------------------------------------------------
 
 
-def norm_weight_name(scope: str, layer: int | None, module: str) -> str | None:
-    """HF name of the zero-centred norm whose output a tap's representative module reads, or None
-    for taps not fed by a norm (out_proj / o_proj / down_proj inputs)."""
+def norm_weight_name(scope: str, layer: int | None, module: str, arch: ArchSpec = QWEN) -> str | None:
+    """HF name of the norm whose output a tap's representative module reads, or None for taps not fed
+    by a norm (out_proj / o_proj / down_proj inputs)."""
     if scope == "lm_head":
         return "model.language_model.norm.weight"
     if scope == "mtp":
         if module == "mtp:norm_out":
             return "mtp.norm.weight"
-        n = NORM_BEFORE.get(module.split(":", 1)[1])
+        n = arch.norm_before.get(module.split(":", 1)[1])
         return f"mtp.layers.0.{n}.weight" if n else None
-    n = NORM_BEFORE.get(module)
+    n = arch.norm_before.get(module)
     return f"model.language_model.layers.{layer}.{n}.weight" if n else None
 
 
-def structural_zero_channels(model_dir: Path, taps: dict[str, tuple]) -> dict[str, list[int]]:
-    """{file: channels whose preceding norm scale (1 + w) is exactly 0}. `taps` maps each file to
-    (scope, layer, module). CPU only: reads the norm vectors from the checkpoint's shards."""
+def structural_zero_channels(model_dir: Path, taps: dict[str, tuple],
+                             arch: ArchSpec = QWEN) -> dict[str, list[int]]:
+    """{file: channels whose preceding norm scale (offset + w: 1 + w for Qwen, w for Gemma) is exactly
+    0}. `taps` maps each file to (scope, layer, module). CPU only: reads the norm vectors from the
+    checkpoint's shards (a single-file checkpoint, like Gemma's, included)."""
     import torch
-    from safetensors import safe_open
+    from common import ShardIndex
 
-    weight_map = json.loads((model_dir / "model.safetensors.index.json").read_text())["weight_map"]
+    index = ShardIndex.load(model_dir)
     out: dict[str, list[int]] = {}
     for f, (scope, layer, module) in taps.items():
-        name = norm_weight_name(scope, layer, module)
+        name = norm_weight_name(scope, layer, module, arch)
         if name is None:
             continue
-        with safe_open(str(model_dir / weight_map[name]), framework="pt", device="cpu") as sf:
-            w = sf.get_tensor(name).to(torch.float32)
-        out[f] = torch.nonzero(1.0 + w == 0.0).flatten().tolist()
+        w = index.get_tensor(name).to(torch.float32)
+        out[f] = torch.nonzero(arch.norm_offset + w == 0.0).flatten().tolist()
     return out
 
 
@@ -2009,7 +2014,7 @@ def _existing_anchor(p: Path) -> Path:
     return p
 
 
-def regate(out_dir: Path, model_dir: Path) -> int:
+def regate(out_dir: Path, model_dir: Path | None) -> int:
     """CPU only: re-run the diagonal gate over a set a capture already wrote (reading each file's
     diagonal from disk and the norm vectors from the checkpoint), keep every other recorded gate,
     and promote hessian.failed.json to hessian.json if everything now passes. For a set written
@@ -2030,7 +2035,13 @@ def regate(out_dir: Path, model_dir: Path) -> int:
     # Only the post-norm taps are in "taps", so only they can be exempted by a dead (1 + w) == 0
     # channel; the rms files (listed in "files" too) are re-gated with no exemption.
     taps = {f: (t["scope"], t["layer"], t["module"]) for f, t in doc["taps"].items()}
-    structural = structural_zero_channels(model_dir, taps)
+    from arch_table import get_arch
+    from common import DEFAULT_MODEL_DIR
+
+    arch = get_arch(doc.get("arch"))  # a Qwen manifest records no "arch"; Gemma's says gemma4_unified
+    if model_dir is None:
+        model_dir = Path(doc["model_dir"]) if arch.is_gemma else DEFAULT_MODEL_DIR
+    structural = structural_zero_channels(model_dir, taps, arch)
     gates.pop("nonpositive_diag_files", None)
     gates.update(diag_gate(nonpos, structural))
     gates["ok"] = all(gates[g] for g in ("converter_audit_ok", "keys_selected_ok", "k_ok",
@@ -2193,6 +2204,40 @@ def rms_capture_record(tool: str, rms_plans: list[RmsTapPlan], st: CaptureState,
 
 
 
+def _tokens_corpus_tokenizer():
+    from gemma.capture import TokenIdsCorpus
+
+    return TokenIdsCorpus()
+
+
+def build_corpus_for(args, arch: ArchSpec, tokenizer) -> tuple[list[Seq], list[dict]]:
+    """The calibration corpus of `arch`: Qwen's is build_corpus (text sources tokenized with the
+    RefTokenizer); Gemma's is the token-id JSONL of tools/reference/gemma/gen_samples.py (--gen-file,
+    docs/gemma4-plan.md 4.6 / M0-9), one sequence per non-rejected sample."""
+    if not arch.is_gemma:
+        return build_corpus(args, tokenizer)
+    from gemma.capture import build_tokens_corpus
+
+    if getattr(args, "gen_file", None) is None or str(args.gen_file).lower() == "none":
+        raise SystemExit("[hessian] --arch gemma4_unified: the corpus is gen_samples.py's token-id JSONL "
+                         "(tools/reference/gemma/gen_samples.py --out samples.jsonl): pass it as --gen-file")
+    return build_tokens_corpus(Path(args.gen_file), args.seq_len, getattr(args, "gen_max_seqs", None))
+
+
+def make_reference(arch: ArchSpec, model_dir: Path, device):
+    """The streaming reference run_capture drives: full_logits_golden.StreamingReference for Qwen, the
+    GemmaCaptureRef adapter (over gemma.ref.GemmaReference) for Gemma 4."""
+    import torch
+
+    if arch.is_gemma:
+        from gemma.capture import GemmaCaptureRef
+
+        return GemmaCaptureRef(model_dir, device, dtype=torch.bfloat16)
+    from full_logits_golden import StreamingReference
+
+    return StreamingReference(model_dir, device, dtype=torch.bfloat16)
+
+
 def _pick_hidden_device(args, device, hidden_bytes: int):
     import torch
 
@@ -2212,9 +2257,9 @@ def run_rms_only(args) -> int:
     manifest did not change meanwhile; otherwise it is left byte-identical and the report goes to
     hessian_rms.failed.json."""
     sys.path.insert(0, str(TOOLS_REF))
-    from common import DEFAULT_MODEL_DIR, load_text_config, sha256_file
+    from arch_table import get_arch, text_config_view
+    from common import DEFAULT_MODEL_DIR, sha256_file
 
-    model_dir = args.model_dir or DEFAULT_MODEL_DIR
     out_dir = args.out_dir
     manifest_path = out_dir / MANIFEST_NAME
     if not manifest_path.exists():
@@ -2227,6 +2272,12 @@ def run_rms_only(args) -> int:
     if doc.get("format") != MANIFEST_FORMAT or doc.get("version") != MANIFEST_VERSION:
         raise SystemExit(f"[hessian] --rms-only: {manifest_path} is not an {MANIFEST_FORMAT} "
                          f"v{MANIFEST_VERSION} manifest")
+    # The set's own family (a Qwen manifest records no "arch"): the rms taps must follow the arch of the
+    # post-norm taps they pair with.
+    arch = get_arch(doc.get("arch"))
+    if args.arch not in ("auto", None) and get_arch(args.arch).name != arch.name:
+        raise SystemExit(f"[hessian] --rms-only: --arch {args.arch}, but {manifest_path} is a {arch.name} set")
+    model_dir = args.model_dir or (Path(doc["model_dir"]) if arch.is_gemma else DEFAULT_MODEL_DIR)
     cfg_sha = sha256_file(model_dir / "config.json")
     if doc.get("config_sha256") != cfg_sha:
         raise SystemExit(f"[hessian] --rms-only: {model_dir}\\config.json sha256 {cfg_sha} is not "
@@ -2237,7 +2288,7 @@ def run_rms_only(args) -> int:
                          f"({len(doc['rms_keys'])} keys); pass --force to recapture them (the old "
                          f"rms entries are removed from it before the capture starts)")
 
-    _, text_config = load_text_config(model_dir)
+    text_config = text_config_view(arch, model_dir)
     n_layers = int(text_config.num_hidden_layers)
     hidden = int(text_config.hidden_size)
     n_run = n_layers if args.layers is None else max(1, min(args.layers, n_layers))
@@ -2246,7 +2297,7 @@ def run_rms_only(args) -> int:
     for k, f in doc["keys"].items():
         if RMS_POST_FILE_RE.fullmatch(f) and (key_re is None or key_re.search(k)):
             post_keys.setdefault(f, []).append(k)
-    rms_plans = build_rms_plans(post_keys, n_run, hidden)
+    rms_plans = build_rms_plans(post_keys, n_run, hidden, arch)
     if not rms_plans:
         raise SystemExit("[hessian] --rms-only: the manifest has no norm-fed tap "
                          "(L{i}.in / L{i}.mlp_in) selected by --layers/--keys")
@@ -2255,16 +2306,21 @@ def run_rms_only(args) -> int:
             raise SystemExit(f"[hessian] {rp.post_file} has K={doc['files'][rp.post_file]['K']}, "
                              f"not hidden_size {hidden}")
 
-    from common import load_ref_tokenizer
+    if arch.is_gemma:
+        # The corpus is token ids (gen_samples.py's JSONL): no tokenizer mode to follow or compare.
+        tokenizer, mode, mode_how = _tokens_corpus_tokenizer(), None, "token-ids corpus"
+        print(f"[hessian] corpus tokenizer: {tokenizer.describe()}")
+    else:
+        from common import load_ref_tokenizer
 
-    mode, mode_how = rms_only_tokenizer_mode(doc, getattr(args, "tokenizer", None))
-    tokenizer = load_ref_tokenizer(model_dir, mode)
-    print(f"[hessian] tokenizer: {mode} ({mode_how})")
+        mode, mode_how = rms_only_tokenizer_mode(doc, getattr(args, "tokenizer", None))
+        tokenizer = load_ref_tokenizer(model_dir, mode)
+        print(f"[hessian] tokenizer: {mode} ({mode_how})")
     t0 = time.perf_counter()
-    seqs, sources = build_corpus(args, tokenizer)
+    seqs, sources = build_corpus_for(args, arch, tokenizer)
     total_tokens = sum(len(s.token_ids) for s in seqs)
     print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
-          f"({time.perf_counter() - t0:.1f}s to tokenize)")
+          f"({time.perf_counter() - t0:.1f}s to {'load' if arch.is_gemma else 'tokenize'})")
     print_corpus_sources(sources)
     diffs = corpus_mismatches(doc.get("corpus", {}), sources, len(seqs), total_tokens, args.seq_len,
                               tokenizer_mode=mode)
@@ -2286,6 +2342,7 @@ def run_rms_only(args) -> int:
                          f"activations. Pass that capture's corpus options.{hint}")
     print(f"[hessian] corpus matches {manifest_path.name} (sha256s, token counts, windows, "
           f"tokenizer mode {mode})")
+    # (a Gemma set records its corpus as token ids; "tokenizer mode None" above means exactly that)
 
     n_fwd = max(rp.layer for rp in rms_plans) + 1
     estimate = sum(hess_file_bytes(rp.k) for rp in rms_plans) + (1 << 20)
@@ -2320,18 +2377,17 @@ def run_rms_only(args) -> int:
     import torch
     import transformers
     from common import resolve_device
-    from full_logits_golden import StreamingReference
 
     device = resolve_device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     hidden_bytes = total_tokens * hidden * 2
     hidden_device = _pick_hidden_device(args, device, hidden_bytes)
-    ref = StreamingReference(model_dir, device, dtype=torch.bfloat16)
+    ref = make_reference(arch, model_dir, device)
     torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
     st = run_capture(ref, seqs, [], [], n_fwd, out_dir, hidden_device, False,
-                     rms_plans=rms_plans, shared_gate=False)
+                     rms_plans=rms_plans, shared_gate=False, arch=arch)
     seconds = time.perf_counter() - t_start
     peak = torch.cuda.max_memory_allocated() / 2**30
     print(f"[hessian] rms capture done: {seconds:.1f}s, peak VRAM {peak:.3f} GiB")
@@ -2399,7 +2455,15 @@ def main() -> int:
                     help="CPU only, no checkpoint: write the tiny deterministic test set "
                          "(tests/convert/fixtures/hess_small) and exit")
     ap.add_argument("--model-dir", type=Path, default=None,
-                    help="checkpoint (default: common.DEFAULT_MODEL_DIR)")
+                    help="checkpoint (default: common.DEFAULT_MODEL_DIR; the Huihui Gemma directory "
+                         "with --arch gemma4_unified)")
+    ap.add_argument("--arch", default="auto", choices=["auto", "qwen3_5", "gemma4_unified"],
+                    help="which family's taps and corpus (tools/reference/arch_table.py). auto: read "
+                         "--model-dir's config.json model_type (--rms-only / --regate: the set's own "
+                         "manifest). gemma4_unified: taps q/k/v (+ no v on the 8 full layers) / o / "
+                         "mlp_in = pre_feedforward_layernorm / down / lm_head (post-final-norm, before "
+                         "the softcap); the corpus is --gen-file's token-id JSONL "
+                         "(tools/reference/gemma/gen_samples.py), one sequence per sample")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--force", action="store_true",
                     help="allow an --out-dir that already holds a hessian.json (it is deleted "
@@ -2464,8 +2528,7 @@ def main() -> int:
         return write_fixture(args.write_fixture)
     if args.regate:
         sys.path.insert(0, str(TOOLS_REF))
-        from common import DEFAULT_MODEL_DIR
-        return regate(args.out_dir, args.model_dir or DEFAULT_MODEL_DIR)
+        return regate(args.out_dir, args.model_dir)  # None: the Qwen default, or a Gemma set's own model_dir
 
     # The GPU rule, before anything expensive (common.resolve_device re-checks it). --dry-run never
     # touches the GPU, so it is exempt.
@@ -2479,44 +2542,58 @@ def main() -> int:
         return run_rms_only(args)
 
     sys.path.insert(0, str(TOOLS_REF))
-    from common import DEFAULT_MODEL_DIR, ShardIndex, load_text_config, sha256_file
+    from arch_table import resolve_arch, text_config_view
+    from common import DEFAULT_MODEL_DIR, ShardIndex, sha256_file
     from imatrix_capture import (CONVERTER_MAIN, audit_converter_source,
                                  enumerate_quantized_linears, tensor_shapes, verify_no_k_concat)
 
-    model_dir = args.model_dir or DEFAULT_MODEL_DIR
+    if args.model_dir is None and args.arch == "gemma4_unified":
+        from gemma.common_gemma import DEFAULT_MODEL_DIR as GEMMA_MODEL_DIR
 
-    audit = audit_converter_source(CONVERTER_MAIN)
-    print(f"[hessian] converter audit ({audit['path']}): "
+        args.model_dir = GEMMA_MODEL_DIR
+    model_dir = args.model_dir or DEFAULT_MODEL_DIR
+    arch = resolve_arch(args.arch, model_dir)
+    if arch.is_gemma and args.tokenizer is not None:
+        raise SystemExit("[hessian] --tokenizer does not apply to --arch gemma4_unified (the corpus is "
+                         "token ids from gen_samples.py)")
+
+    audit = audit_converter_source(arch.converter_source() if arch.is_gemma else CONVERTER_MAIN,
+                                   arch=arch.converter_arch)
+    print(f"[hessian] arch {arch.name}: converter audit ({audit['path']}): "
           f"text={len(audit['found']['text'])} mtp={len(audit['found']['mtp'])} add_linear shapes, "
           f"direct PlanLinearLayouts={audit['direct_plan_linear_layouts']}")
     for kind in ("missing", "unexpected", "mismatched"):
         if audit[kind]:
             print(f"[hessian] converter audit {kind.upper()}: {audit[kind]}")
     if not audit["ok"]:
-        raise SystemExit("[hessian] src/convert/main.cpp's add_linear set no longer matches "
+        raise SystemExit(f"[hessian] {audit['path']}'s add_linear set no longer matches "
                          "imatrix_capture.enumerate_quantized_linears() -- update it first")
 
-    from common import load_ref_tokenizer
+    if arch.is_gemma:
+        tokenizer = _tokens_corpus_tokenizer()
+        print(f"[hessian] corpus tokenizer: {tokenizer.describe()}")
+    else:
+        from common import load_ref_tokenizer
 
-    tokenizer = load_ref_tokenizer(model_dir, args.tokenizer or DEFAULT_TOKENIZER_MODE)
-    print(f"[hessian] tokenizer: {tokenizer.mode} ({tokenizer.describe()})")
+        tokenizer = load_ref_tokenizer(model_dir, args.tokenizer or DEFAULT_TOKENIZER_MODE)
+        print(f"[hessian] tokenizer: {tokenizer.mode} ({tokenizer.describe()})")
     t0 = time.perf_counter()
-    seqs, sources = build_corpus(args, tokenizer)
+    seqs, sources = build_corpus_for(args, arch, tokenizer)
     total_tokens = sum(len(s.token_ids) for s in seqs)
     print(f"[hessian] corpus: {len(seqs)} sequences, {total_tokens} tokens "
-          f"({time.perf_counter() - t0:.1f}s to tokenize)")
+          f"({time.perf_counter() - t0:.1f}s to {'load' if arch.is_gemma else 'tokenize'})")
     print_corpus_sources(sources)
 
-    _, text_config = load_text_config(model_dir)
+    text_config = text_config_view(arch, model_dir)
     n_layers = int(text_config.num_hidden_layers)
     n_run = n_layers if args.layers is None else max(1, min(args.layers, n_layers))
-    do_mtp = not args.no_mtp
-    specs = enumerate_quantized_linears(text_config, do_mtp, args.draft_head)
+    do_mtp = arch.has_mtp and not args.no_mtp
+    specs = enumerate_quantized_linears(text_config, do_mtp, args.draft_head, arch=arch)
     index = ShardIndex.load(model_dir)
     shapes = tensor_shapes(index, sorted({n for s in specs for n in s.hf_names}))
     expect_k = verify_no_k_concat(specs, shapes)
     all_keys = [s.key for s in specs]
-    plans_all = build_tap_plan(specs, expect_k)
+    plans_all = build_tap_plan(specs, expect_k, arch)
 
     key_re = re.compile(args.keys) if args.keys else None
     plans: list[TapPlan] = []
@@ -2531,7 +2608,7 @@ def main() -> int:
         raise SystemExit("[hessian] --keys/--layers select no tap at all")
     # --rms-taps: one weightless rms tap per selected norm-fed post-norm tap (same layer, same keys).
     rms_plans = (build_rms_plans({p.file: p.keys for p in plans if p.scope == "layer"}, n_run,
-                                 int(text_config.hidden_size)) if args.rms_taps else [])
+                                 int(text_config.hidden_size), arch) if args.rms_taps else [])
     if args.rms_taps and not rms_plans:
         raise SystemExit("[hessian] --rms-taps: --keys/--layers select no norm-fed tap (L{i}.in / "
                          "L{i}.mlp_in)")
@@ -2596,7 +2673,6 @@ def main() -> int:
     import torch
     import transformers
     from common import resolve_device
-    from full_logits_golden import StreamingReference
 
     device = resolve_device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -2605,7 +2681,7 @@ def main() -> int:
     hidden_device = _pick_hidden_device(args, device, hidden_bytes)
 
     t0 = time.perf_counter()
-    ref = StreamingReference(model_dir, device, dtype=torch.bfloat16)
+    ref = make_reference(arch, model_dir, device)
     print(f"[hessian] streaming skeleton ready in {time.perf_counter() - t0:.1f}s: {ref.n_layers} "
           f"layers, hidden={ref.text_config.hidden_size}; hidden states "
           f"{hidden_bytes / 2**30:.2f} GiB on {hidden_device}", flush=True)
@@ -2616,7 +2692,7 @@ def main() -> int:
     torch.cuda.reset_peak_memory_stats()
     t_start = time.perf_counter()
     st = run_capture(ref, seqs, plans, specs, n_run, args.out_dir, hidden_device,
-                     args.draft_head, rms_plans=rms_plans)
+                     args.draft_head, rms_plans=rms_plans, arch=arch)
     seconds = time.perf_counter() - t_start
     peak = torch.cuda.max_memory_allocated() / 2**30
     reserved = torch.cuda.max_memory_reserved() / 2**30
@@ -2625,9 +2701,9 @@ def main() -> int:
 
     # The first layer of each type, over the WHOLE stack: a --layers smoke that stops before the
     # first attention layer reports the shared-input check as incomplete.
-    shared_expected = [ref.layer_types.index(t) for t in SHARED_GATE if t in ref.layer_types]
+    shared_expected = [ref.layer_types.index(t) for t in arch.shared_gate if t in ref.layer_types]
     structural = structural_zero_channels(model_dir, {p.file: (p.scope, p.layer, p.module)
-                                                      for p in plans if p.file in st.written})
+                                                      for p in plans if p.file in st.written}, arch)
     gates = evaluate_gates(audit, all_keys, plans, st, selected_keys, shared_expected, structural)
     print_gates(gates)
 
@@ -2681,6 +2757,14 @@ def main() -> int:
                                "(install_gemm_guard)"},
         "caveat": CAVEAT,
     }
+    if arch.is_gemma:  # a Qwen manifest keeps exactly its old fields (hessian-v1/v2 stay reproducible)
+        extra["arch"] = arch.name
+        extra["arch_notes"] = ("gemma4_unified taps (tools/reference/arch_table.py): in = input of q_proj "
+                               "(k_proj and, on the 40 sliding layers, v_proj share it; the 8 full layers "
+                               "have no v_proj), out = o_proj input, mlp_in = gate_proj input = "
+                               "pre_feedforward_layernorm's output (up_proj shares it), mlp_mid = down_proj "
+                               "input, lm_head = the post-final-norm hidden before the softcap (tied head). "
+                               "Norm scale is w (plain), not 1 + w.")
     # --rms-taps: the rms files enter the manifest ("files", "rms_keys", "rms_capture") only if their
     # own gates pass -- whichever manifest name the post-norm gates choose, so --regate keeps them.
     # Otherwise the post-norm set is written without them and the rms report goes to

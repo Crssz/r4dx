@@ -137,6 +137,21 @@ if(_r4dx_ref_ok)
               "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_trellis_quant.py"
   )
   set_tests_properties(reference_trellis_quant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
+
+  # tools/reference/arch_table.py and the Gemma 4 port of hessian_capture / imatrix_capture / trellis_quant
+  # (docs/gemma4-plan.md M1-25 / M1-28): the tables against the real 677-tensor header, the token-id corpus,
+  # the --dry-run CLIs, a real CPU capture checked against hooks on the HF layers, rotation_oracle's folds and,
+  # with r4dx-convert built, the whole rotated chain (oracle -> r4dx-convert --rotate --trellis-from). CPU only;
+  # prints SKIP and exits 0 when the interpreter's transformers has no gemma4_unified.
+  add_test(
+      NAME reference_arch_gemma
+      COMMAND "${_r4dx_ref_python}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_arch_gemma.py"
+  )
+  set_tests_properties(reference_arch_gemma PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8;CUDA_VISIBLE_DEVICES=")
+  if(TARGET r4dx-convert)
+    set_property(TEST reference_arch_gemma APPEND PROPERTY ENVIRONMENT "R4DX_CONVERT_EXE=$<TARGET_FILE:r4dx-convert>")
+  endif()
 endif()
 
 if(_r4dx_ref_canonical)

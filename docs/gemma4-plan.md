@@ -176,6 +176,21 @@ Bidirectional image block: a per-query absolute key-limit override array (null f
 block of 280+2 tokens exceeds a 256-row chunk, so the chunk planner makes an image block its own chunk
 of up to 288 rows; size `buf_a_`, `buf_b_` and the arena for 320 rows (M2 decision).
 
+#### 3.2.1 fp32 residual stream (decision 2026-10-01)
+
+bf16 HF is not a stable yardstick for Gemma 4 (residual 100-300, bf16 rounding amplified), so `GemmaModel` keeps the
+residual in fp32 (`GemmaResid::kFp32`, default; `R4DX_GEMMA_RESID=bf16` restores the bf16 stream for A/B):
+- embedding gather writes fp32 (`bf16(sqrt(3840)) = 62.0`; the product is exact in fp32);
+- pre-norms (`input_layernorm`, `pre_feedforward_layernorm`) and the final norm read the fp32 residual and emit the
+  bf16 GEMM input (`r4dx_rmsnorm_plain_f32in_bf16`); GEMM outputs (sublayer outputs) stay bf16;
+- post-norm + residual add + `layer_scalar` run in fp32 with no intermediate bf16 rounding
+  (`r4dx_gemma_postnorm_residual_rmsnorm_f32res`; rotated: `r4dx_post_rmsnorm_rotate_add_f32res`; entry/exit
+  rotation `r4dx_rotate_residual_f32`). The bf16 kernels are untouched (Qwen unchanged);
+- the drafter hidden-state capture stays **bf16** `[rows, layers * hidden]` in the original basis: it is staged in fp32,
+  un-rotated in fp32, then rounded once (`r4dx_f32_to_bf16`);
+- prefill chunking, decode and checkpoint/restore are unaffected (the residual is per-chunk scratch, not state; KV
+  holds only K/V). TP: the all-reduce acts on the bf16 sublayer outputs (o_proj / down_proj), never on the residual,
+  which stays replicated fp32 on each rank, so no fp32 comms are needed.
 ### 3.3 Attention
 
 | | Sliding (40 layers) | Full (8 layers; TP=1 / TP=2 rank) |
@@ -298,6 +313,8 @@ Memory budget at TP=1, 262144 context:
 | KV full layers fp8 | 2.15 GB | 2.15 GB | 2.15 GB |
 | KV sliding rings (+ spare) | 0.25 (+0.25) GB | same | same |
 | activations + arena + logits | ~0.4 GB | ~0.4 GB | ~0.4 GB |
+
+_Residual dtype note:_ the residual stream is fp32 by default (`R4DX_GEMMA_RESID=fp32`, `bf16` selects the old stream for A/B). `buf_a32_` is [256, 3840] x 4 B = 3.9 MB (was 2.0 MB bf16); with feature capture of L layers an fp32 staging buffer adds 256 x L x 3840 x 4 B (19.7 MB at L = 5) next to the bf16 feature buffer. Both are inside the ~0.4 GB activations line.
 | **Total** | **~29 GB** | **~11 GB** | **~13 GB** |
 
 ### 3.8 Files, tests, risks

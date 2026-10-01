@@ -69,6 +69,9 @@ set(R4DX_KERNEL_TESTS
   test_gemma_postnorm
   test_embed_scaled
   test_widen_softcap
+  # fp32-residual variants (GemmaModel R4DX_GEMMA_RESID=fp32): GPU tests written, NOT yet run.
+  test_gemma_resid_f32
+  test_rotate_residual_f32
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -124,7 +127,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
                             test_trellis_m256.cpp test_rope_proportional.cpp
-                            test_gemma_postnorm.cpp
+                            test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -180,6 +183,11 @@ add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
 # (dense Sylvester FWHT, the closed-form rows of Q, norms/inverses, TP K-slicing).
 add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
 add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
+
+# test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
+# rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.
+add_executable(test_gemma_resid_f32_cpu test_gemma_resid_f32_cpu.cpp)
+add_test(NAME test_gemma_resid_f32_cpu COMMAND test_gemma_resid_f32_cpu)
 
 # tool_sampler_bench: Milestone 6 S1 item 4 -- r4dx_topk_lse_f32's kernel time (hip events) and the
 # host cost of SampleFromSummary vs the full-vocab SampleCanonical/SampleLegacy per token. Prints

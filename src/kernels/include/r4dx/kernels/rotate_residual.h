@@ -53,6 +53,17 @@ void r4dx_rotate_residual_bf16(int64_t x, int64_t rows, int64_t hidden, int64_t 
 void r4dx_post_rmsnorm_rotate_add_bf16(int64_t resid, int64_t y, int64_t weight, int64_t signs,
                                         int64_t mix, int64_t rows, int64_t hidden, float eps,
                                         float layer_scale, int64_t stream);
+// ---- fp32-residual twins (Gemma 4, R4DX_GEMMA_RESID=fp32) ---------------------------------------
+// r4dx_rotate_residual_f32: x is [rows, hidden] FP32, in place, same contract / geometry / throws as
+// r4dx_rotate_residual_bf16 but the result is not rounded to bf16.
+// r4dx_post_rmsnorm_rotate_add_f32res: resid FP32 [rows, hidden] (rotated basis), y bf16 (original basis),
+// resid <- (resid + Q(rmsnorm_plain(y, weight))) * layer_scale entirely in fp32, fp32 store. resid and y
+// are different types, so they cannot alias. Qwen's bf16 kernels are unchanged.
+void r4dx_rotate_residual_f32(int64_t x, int64_t rows, int64_t hidden, int64_t signs, int64_t mix,
+                               int inverse, int64_t stream);
+void r4dx_post_rmsnorm_rotate_add_f32res(int64_t resid, int64_t y, int64_t weight, int64_t signs,
+                                          int64_t mix, int64_t rows, int64_t hidden, float eps,
+                                          float layer_scale, int64_t stream);
 // ---- blockwise Hadamard Hb, in place -----------------------------------------------------------
 // x <- x Hb on each row: h Hb := (h * s) then FWHT / sqrt(block) on each contiguous block of
 // `block` elements. x: [rows, K] bf16, row-major, contiguous. signs: fp32 [K] (+-1), indexed by the

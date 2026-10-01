@@ -30,6 +30,7 @@ param(
     "Explain how a hash map handles collisions, with a short Python example.",
     "Write a C++ function that reverses a singly linked list and explain its complexity.",
     "Summarise the causes of the French Revolution in five bullet points."),
+  [ValidateSet(0, 1)][int]$Device = 1,  # HIP device for the GPU step
   [switch]$RunGpu
 )
 $ErrorActionPreference = "Stop"
@@ -44,7 +45,9 @@ if (-not (Test-Path $Out)) {
 }
 Write-Output "[ab] drafter container: $Out (layer offset $LayerOffset, embed scales $($EmbedScale -join ','), k $K)"
 
-$common = @("--model", $Model, "--chat", "--temperature", "0", "--max-tokens", "$MaxTokens", "--stats")
+# PowerShell 5.1 turns a native program's stderr lines (r4dx-cli's load log) into terminating errors under "Stop".
+$ErrorActionPreference = "Continue"
+$common = @("--model", $Model, "--temperature", "0", "--max-tokens", "$MaxTokens", "--stats")  # --prompt is a one-shot chat turn
 $i = 0
 foreach ($p in $Prompts) {
   $i++
@@ -52,13 +55,13 @@ foreach ($p in $Prompts) {
   $spec = @($common + @("--prompt", $p, "--dflash", $Out, "--dflash-k", "$K"))
   if (-not $RunGpu) {
     Write-Output "[ab] prompt $i (GPU, not run; pass -RunGpu):"
-    Write-Output ("  `$env:HIP_VISIBLE_DEVICES='1'; $Cli " + ($plain -join " "))
+    Write-Output ("  `$env:HIP_VISIBLE_DEVICES='$Device'; $Cli " + ($plain -join " "))
     foreach ($sc in $EmbedScale) {
-      Write-Output ("  `$env:HIP_VISIBLE_DEVICES='1'; `$env:R4DX_DFLASH_EMBED_SCALE='$sc'; $Cli " + ($spec -join " "))
+      Write-Output ("  `$env:HIP_VISIBLE_DEVICES='$Device'; `$env:R4DX_DFLASH_EMBED_SCALE='$sc'; $Cli " + ($spec -join " "))
     }
     continue
   }
-  $env:HIP_VISIBLE_DEVICES = "1"
+  $env:HIP_VISIBLE_DEVICES = "$Device"
   $a = & $Cli @plain 2>$null
   $ha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(($a -join "`n")))).Replace("-", "")
   foreach ($sc in $EmbedScale) {

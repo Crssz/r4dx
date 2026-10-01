@@ -149,6 +149,8 @@ foreach(lib r4dx_model r4dx_model_tptest)
     r4dx_convert   # header-only: SafetensorsReader (container.cpp) + nlohmann/json (model_config.h)
     # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
     # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
+    # Gemma 4 audio (docs/gemma4-audio.md): the CPU embedder + container weight reader GemmaLocalTextModel uses.
+    r4dx_audio
     r4dx_vision_tower
     # Tensor parallel (docs/tp.md): the sharded Container::Load path plans every rank slice with
     # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.

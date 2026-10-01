@@ -41,6 +41,21 @@ std::vector<float> GemmaLocalTextModel::PrefillMultimodal(const std::vector<int3
   return m_.Prefill(token_ids);
 }
 
+std::vector<uint16_t> GemmaLocalTextModel::EncodeAudio(const float* frames, int64_t n) {
+  if (!audio_) {
+    throw std::runtime_error("GemmaLocalTextModel::EncodeAudio: the container carries no audio projection (convert with --audio on)");
+  }
+  return audio_->Embed(frames, n);
+}
+
+std::vector<float> GemmaLocalTextModel::PrefillAudio(const std::vector<int32_t>& token_ids,
+                                                     const std::vector<AudioRowSpan>& spans) {
+  if (!spans.empty() && !audio_) {
+    throw std::runtime_error("GemmaLocalTextModel::PrefillAudio: the container carries no audio projection (convert with --audio on)");
+  }
+  return m_.PrefillAudio(token_ids, spans);
+}
+
 std::vector<int32_t> GemmaLocalTextModel::DecodeStepMtpGreedy(int32_t, int64_t) {
   throw std::runtime_error("GemmaLocalTextModel: MTP is not available for Gemma 4 (the container carries no mtp.* head)");
 }
@@ -90,7 +105,13 @@ std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const Tp
   if (tp.world != 1) {
     throw std::invalid_argument("LoadTextModel: TpOptions::world must be 1 or 2, got " + std::to_string(tp.world));
   }
-  return std::make_unique<GemmaLocalTextModel>(GemmaModel::Load(MakeGemmaModelOptions(opts)));
+  auto local = std::make_unique<GemmaLocalTextModel>(GemmaModel::Load(MakeGemmaModelOptions(opts)));
+  // Audio (docs/gemma4-audio.md): a container converted with `--audio on` carries the 640 -> 3840 projection;
+  // it is read to the host here (4.9 MB) and the embedder runs on the CPU, so no VRAM and no kernel.
+  if (audio::ContainerHasAudio(opts.container_path)) {
+    local->SetAudio(audio::LoadAudioEmbedder(opts.container_path));
+  }
+  return local;
 }
 
 }  // namespace r4dx::model

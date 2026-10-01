@@ -9,6 +9,7 @@
 #include <string_view>
 
 #include "arch.h"  // r4dx::model::Arch / ReadContainerMetadata / DetectArch (dialect selection)
+#include "audio_frames.h"  // src/audio: ExpandAudioPlaceholders (docs/gemma4-audio.md)
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md)
 #include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
@@ -254,6 +255,11 @@ void Engine::RunRequest(PendingRequest& req) {
     // the prefix-reuse decision (further down) reveals which of them are actually NEW.
     std::vector<r4dx::vision::ImagePlaceholderSpan> pending_image_spans;
     std::vector<const ImagePart*> pending_image_ptrs;  // parallel to pending_image_spans
+    // Audio (docs/gemma4-audio.md): the same, for `input_audio` parts. Offsets are relative to `full_tokens_i32`.
+    std::vector<r4dx::audio::AudioPlaceholderSpan> pending_audio_spans;
+    std::vector<const AudioPart*> pending_audio_ptrs;  // parallel to pending_audio_spans
+    std::vector<r4dx::model::AudioRowSpan> audio_row_spans;  // offsets relative to new_tokens_i32
+    std::vector<std::vector<uint16_t>> audio_rows_owned;     // host bf16 rows the spans point at
     // --prompt-checkpoint: how many of the prompt's LAST tokens the checkpoint leaves out (see where
     // the chat branch below sets it).
     int64_t ckpt_back = 0;
@@ -297,6 +303,26 @@ void Engine::RunRequest(PendingRequest& req) {
                                 "vision.* tensors, or started with --vision off)");
         return;
       }
+      // Audio (docs/gemma4-audio.md): every `input_audio` part, in order. Only a Gemma 4 container converted with
+      // `--audio on` can take them; mixing them with images waits for the Gemma vision splice (M2), which
+      // owns the one multimodal prefill call.
+      std::vector<const AudioPart*> audio_ptrs;
+      for (const auto& m : req.messages) {
+        for (const auto& part : m.content_parts) {
+          if (part.is_audio) audio_ptrs.push_back(&part.audio);
+        }
+      }
+      if (!audio_ptrs.empty() && !model_->HasAudio()) {
+        note_error(400);
+        req.sink->OnError(400, "this model/container has no audio embedder (audio input needs a Gemma 4 "
+                                "container converted with `--audio on`)");
+        return;
+      }
+      if (!audio_ptrs.empty() && !placeholders_in.empty()) {
+        note_error(400);
+        req.sink->OnError(400, "image and audio content parts in the same request are not supported yet");
+        return;
+      }
 
       // Gemma 4's template silently DROPS a tool-role message that has no assistant `tool_calls` message
       // before it (docs/gemma4-plan.md 5.3), which would answer a different conversation than the one
@@ -335,8 +361,9 @@ void Engine::RunRequest(PendingRequest& req) {
         if (!m.content_parts.empty()) {
           r4dx::ChatJson content = r4dx::ChatJson::array();
           for (const auto& part : m.content_parts) {
-            content.push_back(part.is_image ? r4dx::ChatJson{{"type", "image"}}
-                                             : r4dx::ChatJson{{"type", "text"}, {"text", part.text}});
+            content.push_back(part.is_image   ? r4dx::ChatJson{{"type", "image"}}
+                              : part.is_audio ? r4dx::ChatJson{{"type", r4dx::audio::kAudioTemplatePartType}}
+                                              : r4dx::ChatJson{{"type", "text"}, {"text", part.text}});
           }
           entry["content"] = content;
         } else {
@@ -467,6 +494,34 @@ void Engine::RunRequest(PendingRequest& req) {
           key.grid_t = expanded.spans[i].grid.t;
           key.grid_h = expanded.spans[i].grid.h;
           key.grid_w = expanded.spans[i].grid.w;
+          key.token_offset = expanded.spans[i].offset;
+          image_keys.push_back(key);
+        }
+      }
+      // Audio: the template emitted one `<|audio|>` per clip; each becomes <|audio> + n x <|audio|> + <audio|>
+      // (n = the clip's token count). The prefix-reuse key reuses ImageKey with grid_t = -1 marking audio and
+      // grid_h = the token count, so a different clip of the same length never reuses a cached prefix.
+      if (!audio_ptrs.empty()) {
+        std::vector<int64_t> counts;
+        for (const AudioPart* a : audio_ptrs) counts.push_back(a->tokens);
+        r4dx::audio::ExpandedAudioPrompt expanded;
+        try {
+          expanded = r4dx::audio::ExpandAudioPlaceholders(full_tokens_i32, counts);
+        } catch (const std::exception& e) {
+          note_error(400);
+          req.sink->OnError(400, std::string("audio content parts do not match the rendered prompt's own "
+                                              "placeholders: ") + e.what());
+          return;
+        }
+        full_tokens_i32 = std::move(expanded.tokens);
+        pending_audio_spans = expanded.spans;
+        pending_audio_ptrs = audio_ptrs;
+        for (size_t i = 0; i < expanded.spans.size(); ++i) {
+          r4dx::server::ImageKey key;
+          key.content_hash = audio_ptrs[i]->content_hash;
+          key.grid_t = -1;
+          key.grid_h = expanded.spans[i].tokens;
+          key.grid_w = 0;
           key.token_offset = expanded.spans[i].offset;
           image_keys.push_back(key);
         }
@@ -607,6 +662,20 @@ void Engine::RunRequest(PendingRequest& req) {
       image_embeds_owned.push_back(std::move(embeds));
     }
 
+    // Audio: embed (CPU RMSNorm + Linear, ~0.3 s for a 30 s clip) every clip that starts in the tail this request
+    // feeds; a clip inside the reused prefix already sits in the KV cache.
+    audio_rows_owned.reserve(pending_audio_spans.size());
+    for (size_t i = 0; i < pending_audio_spans.size(); ++i) {
+      const auto& sp = pending_audio_spans[i];
+      if (sp.offset < skip) continue;
+      audio_rows_owned.push_back(model_->EncodeAudio(pending_audio_ptrs[i]->frames.data(), sp.tokens));
+      r4dx::model::AudioRowSpan as;
+      as.offset = sp.offset - skip;
+      as.tokens = sp.tokens;
+      as.rows = audio_rows_owned.back().data();
+      audio_row_spans.push_back(as);
+    }
+
     int64_t max_tokens = req.max_tokens;
     const int64_t ctx_budget = MaxCtx() - static_cast<int64_t>(full_tokens_i32.size());
     if (max_tokens > ctx_budget) max_tokens = std::max<int64_t>(0, ctx_budget);
@@ -642,6 +711,9 @@ void Engine::RunRequest(PendingRequest& req) {
     for (const auto& s : image_spans) {
       if (static_cast<size_t>(s.offset + s.tokens) > head_n()) back = 0;
     }
+    for (const auto& s : audio_row_spans) {
+      if (static_cast<size_t>(s.offset + s.tokens) > head_n()) back = 0;
+    }
     const size_t ckpt_len =
         keep_checkpoint ? prefix_.checkpoint().size() : full_tokens_i32.size() - static_cast<size_t>(back);
     double prefill_seconds = 0.0;
@@ -650,9 +722,12 @@ void Engine::RunRequest(PendingRequest& req) {
     // doc comment: the exact pre-vision code path, no extra upload, no extra kernel, the single-row
     // rope entry point) -- so this call-site unification carries no text-only-behavior regression
     // risk. A text-only second half after an image goes through Prefill, as any text-only tail does.
-    auto prefill = [&](const std::vector<int32_t>& ids, const std::vector<r4dx::model::ImageSpan>& spans) {
+    auto prefill = [&](const std::vector<int32_t>& ids, const std::vector<r4dx::model::ImageSpan>& spans,
+                       const std::vector<r4dx::model::AudioRowSpan>& aspans) {
       const auto a = Clock::now();
-      std::vector<float> out = spans.empty() ? model_->Prefill(ids) : model_->PrefillMultimodal(ids, spans);
+      std::vector<float> out = !aspans.empty() ? model_->PrefillAudio(ids, aspans)
+                               : spans.empty() ? model_->Prefill(ids)
+                                               : model_->PrefillMultimodal(ids, spans);
       prefill_seconds += Seconds(a, Clock::now());
       return out;
     };
@@ -664,11 +739,11 @@ void Engine::RunRequest(PendingRequest& req) {
     std::vector<float> logits;
     if (back > 0) {
       const auto split = new_tokens_i32.begin() + static_cast<ptrdiff_t>(head_n());
-      prefill(std::vector<int32_t>(new_tokens_i32.begin(), split), image_spans);
+      prefill(std::vector<int32_t>(new_tokens_i32.begin(), split), image_spans, audio_row_spans);
       save();
-      logits = prefill(std::vector<int32_t>(split, new_tokens_i32.end()), {});
+      logits = prefill(std::vector<int32_t>(split, new_tokens_i32.end()), {}, {});
     } else {
-      logits = prefill(new_tokens_i32, image_spans);
+      logits = prefill(new_tokens_i32, image_spans, audio_row_spans);
       if (checkpointed && !keep_checkpoint) save();
     }
 

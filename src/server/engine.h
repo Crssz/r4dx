@@ -155,6 +155,8 @@ class Engine {
   // reassigned to a different model after that (Reset() reuses the same object in place), and
   // TextModel::HasVision is a value cached at load under TP (docs/tp.md 2.4's host-only table).
   bool HasVision() const { return model_ && model_->HasVision(); }
+  // Gemma 4 container converted with `--audio on` (docs/gemma4-audio.md): `input_audio` parts are accepted.
+  bool HasAudio() const { return model_ && model_->HasAudio(); }
   // True once a `--tp 2` request has left the TP group kFatal (its recovery failed, or a rank got
   // stuck inside a HIP call): every later request answers 500 until the process is restarted, so
   // http_server.cpp's /health reports it (503) instead of "ok" (docs/tp.md 2.4, R13; Appendix B N80).

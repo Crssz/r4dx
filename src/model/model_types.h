@@ -41,6 +41,16 @@ struct ImageSpan {
   bool embeds_on_host = false;
 };
 
+// One audio clip's soft-token rows inside a PrefillAudio call's OWN token vector (docs/gemma4-audio.md).
+// The rows are computed on the HOST (audio::AudioEmbedder, bf16) and overwrite the scaled embedding gather at
+// [offset, offset + tokens) UNSCALED, like Gemma's image rows. Audio has no extra position ids: every
+// audio token takes the next plain 1D rope position and attends causally.
+struct AudioRowSpan {
+  int64_t offset = 0;                // index of the first `<|audio|>` soft token within THIS call's token_ids
+  int64_t tokens = 0;                // run length (the clip's token count)
+  const uint16_t* rows = nullptr;    // HOST bf16 [tokens, hidden]
+};
+
 // Owner of one EncodeImages result (docs/tp.md 2.8). TP=1: device rows in `dev` (exactly the
 // DeviceBuffer Model::EncodeImages writes). TP: pageable host rows in `host`, copied to each rank's
 // device at splice time (docs/tp.md 8.3) -- pageable so that releasing it on the facade thread is

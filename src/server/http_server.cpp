@@ -148,7 +148,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
 
   svr.Get("/v1/models", [&engine_ref](const httplib::Request&, httplib::Response& res) {
     res.set_content(BuildModelsResponse(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
-                                         engine_ref.DefaultThinking(), engine_ref.HasVision())
+                                         engine_ref.DefaultThinking(), engine_ref.HasVision(), engine_ref.HasAudio())
                          .dump(),
                      kJsonContentType);
   });
@@ -173,7 +173,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       return;
     }
     res.set_content(BuildModelEntryJson(engine_ref.ModelId(), NowUnix(), engine_ref.MaxCtx(),
-                                         engine_ref.DefaultThinking(), engine_ref.HasVision())
+                                         engine_ref.DefaultThinking(), engine_ref.HasVision(), engine_ref.HasAudio())
                          .dump(),
                      kJsonContentType);
   });

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "nlohmann/json.hpp"
 #include "openai_types.h"
@@ -213,6 +214,111 @@ void TestChatImageAlternateShapesAccepted() {
   CHECK(req_input.messages[0].HasImages());
 }
 
+// ---- audio content parts (docs/gemma4-audio.md) ------------------------------------------------
+
+std::string B64(const std::vector<uint8_t>& in) {
+  static const char* k = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (size_t i = 0; i < in.size(); i += 3) {
+    const uint32_t v = (uint32_t{in[i]} << 16) | (i + 1 < in.size() ? uint32_t{in[i + 1]} << 8 : 0) |
+                       (i + 2 < in.size() ? uint32_t{in[i + 2]} : 0);
+    out += k[(v >> 18) & 63];
+    out += k[(v >> 12) & 63];
+    out += i + 1 < in.size() ? k[(v >> 6) & 63] : '=';
+    out += i + 2 < in.size() ? k[v & 63] : '=';
+  }
+  return out;
+}
+
+// A mono PCM16 WAV of `samples` samples (a ramp) at `rate`.
+std::vector<uint8_t> MakePcm16Wav(int samples, int rate, int channels = 1) {
+  std::vector<uint8_t> b;
+  auto p32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back((v >> (8 * i)) & 0xFF); };
+  auto p16 = [&](uint16_t v) { b.push_back(v & 0xFF); b.push_back(v >> 8); };
+  const uint32_t data_bytes = static_cast<uint32_t>(samples * channels * 2);
+  b.insert(b.end(), {'R', 'I', 'F', 'F'});
+  p32(36 + data_bytes);
+  b.insert(b.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
+  p32(16);
+  p16(1);
+  p16(static_cast<uint16_t>(channels));
+  p32(static_cast<uint32_t>(rate));
+  p32(static_cast<uint32_t>(rate * channels * 2));
+  p16(static_cast<uint16_t>(channels * 2));
+  p16(16);
+  b.insert(b.end(), {'d', 'a', 't', 'a'});
+  p32(data_bytes);
+  for (int i = 0; i < samples * channels; ++i) p16(static_cast<uint16_t>((i % 2000) * 8 - 8000));
+  return b;
+}
+
+json AudioBody(const json& input_audio) {
+  return {{"messages", json::array({{{"role", "user"},
+                                      {"content", json::array({{{"type", "text"}, {"text", "Transcribe:"}},
+                                                                {{"type", "input_audio"}, {"input_audio", input_audio}}})}}})}};
+}
+
+json WavPart(int samples, int rate = 16000, int channels = 1) {
+  return {{"data", B64(MakePcm16Wav(samples, rate, channels))}, {"format", "wav"}};
+}
+
+void TestChatAudioPartAccepted() {
+  const auto req = ParseChatCompletionRequest(AudioBody(WavPart(641)));
+  CHECK(req.messages.size() == 1);
+  const ChatMessage& m = req.messages[0];
+  CHECK(m.HasAudio() && !m.HasImages());
+  CHECK(m.content_parts.size() == 2 && !m.content_parts[0].is_audio && m.content_parts[1].is_audio);
+  CHECK(m.content && *m.content == "Transcribe:");  // the text parts only, as for images
+  const AudioPart& a = m.content_parts[1].audio;
+  CHECK(a.tokens == 2 && a.frames.size() == 2 * 640);     // ceil(641 / 640), right zero-padded
+  CHECK(a.frames[640] != 0.0f || a.frames[641] != 0.0f);  // the real 641st sample is there ...
+  CHECK(a.frames[642] == 0.0f && a.frames[1279] == 0.0f);  // ... and the rest is padding
+  // The same clip hashes the same; a different one differs.
+  const auto again = ParseChatCompletionRequest(AudioBody(WavPart(641)));
+  CHECK(again.messages[0].content_parts[1].audio.content_hash == a.content_hash);
+  const auto other = ParseChatCompletionRequest(AudioBody(WavPart(642)));
+  CHECK(other.messages[0].content_parts[1].audio.content_hash != a.content_hash);
+  // The exact cap: 30 s = 750 tokens is fine; a "data:audio/wav;base64," prefix and an absent format are tolerated.
+  const auto cap = ParseChatCompletionRequest(AudioBody(WavPart(480000)));
+  CHECK(cap.messages[0].content_parts[1].audio.tokens == 750);
+  json uri = json::object({{"data", "data:audio/wav;base64," + B64(MakePcm16Wav(100, 16000))}});
+  CHECK(ParseChatCompletionRequest(AudioBody(uri)).messages[0].content_parts[1].audio.tokens == 1);
+  // Stereo is averaged to mono, so it parses to the same token count.
+  CHECK(ParseChatCompletionRequest(AudioBody(WavPart(1000, 16000, 2))).messages[0].content_parts[1].audio.tokens == 2);
+  // /v1/models advertises audio only when the container carries the embedder.
+  const json with = BuildModelEntryJson("m", 0, 1024, true, false, true), without = BuildModelEntryJson("m", 0, 1024, true, false);
+  CHECK(with.at("modalities") == json::array({"text", "audio"}) && without.at("modalities") == json::array({"text"}));
+}
+
+void TestChatAudioRejections() {
+  auto rejects = [&](const json& ia, const char* what) {
+    if (!ThrowsApiError([&] { ParseChatCompletionRequest(AudioBody(ia)); }, 400)) {
+      std::fprintf(stderr, "audio case not rejected with 400: %s\n", what);
+      ++g_failures;
+    }
+  };
+  rejects(WavPart(16000, 44100), "44.1 kHz (not resampled)");
+  rejects(WavPart(16000, 8000), "8 kHz");
+  rejects(WavPart(480001), "30.00006 s (751 tokens)");
+  rejects({{"data", B64(MakePcm16Wav(100, 16000))}, {"format", "mp3"}}, "format mp3");
+  rejects({{"data", "!!!not base64!!!"}, {"format", "wav"}}, "malformed base64");
+  rejects({{"data", B64({'I', 'D', '3', 3, 0, 0, 0, 0, 0, 0, 0, 0})}, {"format", "wav"}}, "an mp3 labelled wav");
+  rejects({{"data", ""}, {"format", "wav"}}, "empty data");
+  rejects(json::object({{"format", "wav"}}), "missing data");
+  rejects({{"data", B64(MakePcm16Wav(0, 16000))}, {"format", "wav"}}, "no samples");
+  rejects(json::object({{"data", "data:audio/mpeg;base64,AAAA"}}), "data URI of another type");
+  CHECK(ThrowsApiError([&] {
+    ParseChatCompletionRequest(json{{"messages", json::array({{{"role", "user"},
+                                                               {"content", json::array({{{"type", "input_audio"},
+                                                                                         {"input_audio", "x"}}})}}})}});
+  }, 400));
+  // More than kMaxAudioPerRequest clips in one request.
+  json parts = json::array();
+  for (size_t i = 0; i <= kMaxAudioPerRequest; ++i) parts.push_back({{"type", "input_audio"}, {"input_audio", WavPart(100)}});
+  CHECK(ThrowsApiError([&] {
+    ParseChatCompletionRequest(json{{"messages", json::array({{{"role", "user"}, {"content", parts}}})}});
+  }, 400));
+}
 void TestChatMissingMessagesThrows() {
   json body = json::object();
   CHECK(ThrowsApiError([&] { ParseChatCompletionRequest(body); }, 400));
@@ -1134,6 +1240,8 @@ int main() {
   TestChatImageOversizeBase64Rejected();
   TestChatTooManyImagesRejected();
   TestChatImageAlternateShapesAccepted();
+  TestChatAudioPartAccepted();
+  TestChatAudioRejections();
   TestChatMissingMessagesThrows();
   TestChatEmptyMessagesThrows();
   TestChatUnsupportedRoleThrows();

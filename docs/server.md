@@ -991,6 +991,13 @@ against the 4-layer container, which has no vision tensors, instead asserts the 
 ALWAYS hold -- a well-formed local image against a non-vision container is a clean 400 naming the
 real reason).
 
+## Audio (Gemma 4 only)
+
+`{"type":"input_audio","input_audio":{"data":"<base64 wav>","format":"wav"}}` content parts are accepted when the
+loaded container is a Gemma 4 one converted with `--audio on` (`/v1/models` then lists `audio`). 16 kHz WAV only
+(PCM 8/16/24/32 or float; stereo is averaged), at most 30 s (750 tokens) and 4 clips per request; anything else is a
+400 with a message saying what to change (the server never resamples: `ffmpeg -i in.wav -ar 16000 -ac 1 out.wav`).
+Audio and image parts cannot be mixed in one request yet. Design, verification and tests: `docs/gemma4-audio.md`.
 ## Deferred / known gaps
 - **Sampling defaults vs. explicit values**: `--default-temperature`/`--default-top-p`/
   `--default-top-k`/`--default-min-p` seed every sampling field a request does not itself set

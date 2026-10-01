@@ -39,6 +39,9 @@
 //                         this same container+layout, so assert argmax(row i) == token_ids[i+1] for
 //                         every row that predicts one of them. Nonzero mismatches make the tool
 //                         exit 1.
+//   --max-tokens N        keep only the first N token ids of every segment (0 = all). The sidecar's T,
+//                         rows and sha256 are those of the truncated ids, i.e. what kl_report.py
+//                         expects for --raw-max-tokens N (tools/gemma/run_gate.ps1 uses 512)
 //   --no-write            run the whole pass and print the checks, write nothing
 //   --quiet               no per-row progress lines
 //   --embed-device-resident {on|off}   text.embed_tokens VRAM mirror (default on, like the CLI)
@@ -77,6 +80,8 @@
 #include <memory>
 #include <sstream>
 
+#include "arch.h"
+#include "gemma_model.h"
 #include "model.h"
 #include "teacher_forced.h"
 #include "test_common.h"
@@ -126,7 +131,7 @@ int main(int argc, char** argv) {
   int tp = 1, tp_rank = 0;
   int tp_submit_layers = -1, tp_max_inflight = -1;  // -1: TpOptions' default
   bool tp_options_given = false;
-  int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0, prefix_split_at = 0;
+  int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0, prefix_split_at = 0, max_tokens = 0;
   std::string tail_path = "decode";
   bool no_write = false, quiet = false;
 
@@ -149,6 +154,7 @@ int main(int argc, char** argv) {
       else if (a == "--tail-rows") tail_rows = std::stoll(next());
       else if (a == "--tail-path") tail_path = next();
       else if (a == "--prefix-split-at") prefix_split_at = std::stoll(next());
+      else if (a == "--max-tokens") max_tokens = std::stoll(next());
       else if (a == "--no-write") no_write = true;
       else if (a == "--quiet") quiet = true;
       else if (a == "--embed-device-resident") embed_resident = next();
@@ -167,7 +173,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "usage: tool_teacher_forced_logprobs --model <container.r4dx> "
                             "--layout w4a16 --tokens <tokens.json> --out-dir <dir> "
                             "[--segment <name>] [--max-ctx N] [--layers N] [--vision off] "
-                            "[--check-greedy N] [--no-write] [--quiet] "
+                            "[--check-greedy N] [--max-tokens N] [--no-write] [--quiet] "
                             "[--embed-device-resident {on|off}] [--tp {1|2}] "
                             "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
                             "[--tp-submit-layers N] [--tp-max-inflight K] [--tail-rows R] "
@@ -176,6 +182,10 @@ int main(int argc, char** argv) {
     }
     if (tail_rows < 0 || (tail_path != "decode" && tail_path != "prefill")) {
       std::fprintf(stderr, "--tail-rows must be >= 0 and --tail-path 'decode' or 'prefill'\n");
+      return 2;
+    }
+    if (max_tokens < 0 || max_tokens == 1) {
+      std::fprintf(stderr, "--max-tokens must be 0 (off) or >= 2\n");
       return 2;
     }
     if (embed_resident != "on" && embed_resident != "off") {
@@ -205,7 +215,10 @@ int main(int argc, char** argv) {
     if (!FileExists(model_path)) return SkipMissing(model_path);
     if (!FileExists(tokens_path)) return SkipMissing(tokens_path);
 
-    const r4dx_tf::TokensFile tf = r4dx_tf::ReadTokensJson(tokens_path);
+    r4dx_tf::TokensFile tf = r4dx_tf::ReadTokensJson(tokens_path);
+    if (max_tokens > 0) {
+      for (r4dx_tf::Segment& s : tf.segments) r4dx_tf::TruncateSegment(s, max_tokens);
+    }
     std::printf("[tokens] %s: tokenizer=%s, %zu segment(s)\n", tokens_path.c_str(),
                 tf.tokenizer.c_str(), tf.segments.size());
 
@@ -245,6 +258,17 @@ int main(int argc, char** argv) {
                 static_cast<long long>(model.Config().num_hidden_layers),
                 static_cast<long long>(vocab), static_cast<long long>(max_ctx),
                 tp == 2 ? (" tp=2 mode=" + tp_mode).c_str() : "");
+    if (max_tokens > 0) std::printf("[tokens] --max-tokens %lld: each segment truncated to its first N ids\n", static_cast<long long>(max_tokens));
+    if (model.Config().arch == r4dx::model::Arch::kGemma4) {
+      r4dx::model::GemmaModelOptions g;  // same env parse as LoadGemmaTextModel
+      r4dx::model::ApplyGemmaEnv(&g);
+      const char* kv = g.kv == r4dx::model::GemmaKvMode::kFp8 ? "fp8"
+                       : g.kv == r4dx::model::GemmaKvMode::kBf16Full ? "bf16_full" : "bf16";
+      const char* rs = g.resid == r4dx::model::GemmaResid::kFp32 ? "fp32" : "bf16";
+      const char* at = std::getenv("R4DX_GEMMA_ATTN");
+      std::printf("[gemma] kv=%s resid=%s attn=%s (R4DX_GEMMA_KV/RESID/ATTN)\n", kv, rs,
+                  at != nullptr && *at != '\0' ? at : "default");
+    }
     if (tp == 1) {
       std::printf("[vram]  %.2f GiB after load (delta %.2f GiB)\n", vram_after_load,
                   vram_after_load - vram_before);

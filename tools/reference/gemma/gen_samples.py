@@ -134,7 +134,9 @@ class HFGenerator:
         kw = {"dtype": torch.bfloat16, "attn_implementation": attn}
         if device.type == "cuda":
             kw["device_map"] = {"": 0}
-        self.model = Gemma4UnifiedForConditionalGeneration.from_pretrained(str(model_dir), **kw)
+        from gemma.common_gemma import guarded_from_pretrained
+
+        self.model = guarded_from_pretrained(Gemma4UnifiedForConditionalGeneration, model_dir, **kw)
         if device.type != "cuda":
             self.model.to(device)
         self.model.eval()

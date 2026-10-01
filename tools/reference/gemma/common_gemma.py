@@ -46,6 +46,66 @@ DEFAULT_MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-gem
 DEFAULT_TOKENIZER_DIR = Path(os.environ.get("R4DX_TOKENIZER_DIR",
                                             r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok"))
 DEFAULT_ALLOWED_DEVICES = "1"
+
+
+def free_commit_bytes() -> int | None:
+    """System commit charge still available (ullAvailPageFile = commit limit - committed), Windows only."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class _MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+            (n, ctypes.c_ulonglong) for n in ("tp", "ap", "tpf", "apf", "tv", "av", "aev")]
+
+    ms = _MS()
+    ms.dwLength = ctypes.sizeof(ms)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+        return None
+    return int(ms.apf)
+
+
+def wait_for_commit(need_bytes: int, what: str = "model load", timeout_s: float = 900.0,
+                    margin_bytes: int = 4 << 30, poll_s: float = 15.0, free_fn=None) -> bool:
+    """Block until free commit >= need_bytes + margin (or timeout). Returns True when there is headroom.
+
+    safetensors' torch path maps the whole checkpoint copy-on-write, which Windows charges to commit in full;
+    with too little commit left, torch dereferences the failed mapping and the process dies with 0xC0000005
+    (g4-load-crash). Waiting is the only in-process defence for the transformers from_pretrained path."""
+    import time
+
+    free_fn = free_fn or free_commit_bytes
+    t0 = time.time()
+    while True:
+        free = free_fn()
+        if free is None or free >= need_bytes + margin_bytes:
+            return True
+        msg = (f"[load-guard] {what}: free commit {free / 2**30:.1f} GiB < need "
+               f"{(need_bytes + margin_bytes) / 2**30:.1f} GiB")
+        if time.time() - t0 >= timeout_s:
+            print(msg + " -- timed out, proceeding (a native crash is possible)", file=sys.stderr, flush=True)
+            return False
+        print(msg + f" -- waiting {poll_s:.0f}s", file=sys.stderr, flush=True)
+        time.sleep(poll_s)
+
+
+def guarded_from_pretrained(cls, model_dir, retries: int = 1, **kw):
+    """`cls.from_pretrained(model_dir, **kw)` after waiting for commit headroom of the checkpoint size; a
+    Python-level failure is retried `retries` times with a log line (an access violation cannot be caught)."""
+    import time
+
+    mdir = Path(model_dir)
+    need = sum(p.stat().st_size for p in mdir.glob("*.safetensors"))
+    for attempt in range(retries + 1):
+        wait_for_commit(need, what=f"from_pretrained({mdir.name})")
+        try:
+            return cls.from_pretrained(str(mdir), **kw)
+        except (OSError, RuntimeError, MemoryError) as e:
+            if attempt >= retries:
+                raise
+            print(f"[load-guard] from_pretrained failed ({type(e).__name__}: {e}); retry {attempt + 1}/{retries}",
+                  file=sys.stderr, flush=True)
+            time.sleep(10)
 GOLDEN_DIR = _REF_DIR / "golden_out" / "gemma"
 KL_CORPUS_DIR = _REF_DIR / "kl_corpus"
 PROMPTS_PATH = _REF_DIR.parents[1] / "tools" / "quant2" / "corpus_v2_prompts.json"

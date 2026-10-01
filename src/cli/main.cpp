@@ -797,8 +797,8 @@ int RunMain(int argc, char** argv) {
                        "process's buffers %.2f GiB\n",
                        v.rank, v.device, v.used_gib, v.free_gib, v.total_gib, v.buffers_gib);
         }
-        if (auto* tpm = dynamic_cast<r4dx::model::TpModel*>(model.get())) {
-          std::fprintf(stderr, "[stats] %s\n", tpm->StatsLine().c_str());
+        if (auto* tpm = dynamic_cast<r4dx::model::TpDiagnostics*>(model.get())) {  // TpModel or GemmaTpModel
+          std::fprintf(stderr, "[stats] %s\n", tpm->GroupStatsLine().c_str());
         }
       }
       if (!args.dflash.empty()) {

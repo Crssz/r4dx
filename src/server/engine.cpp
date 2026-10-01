@@ -160,7 +160,7 @@ void Engine::LoadAndStart() {
         CheckDialectAgainstArch(*dialect_, r4dx::model::ArchName(model_->Config().arch));
     if (!err.empty()) throw std::runtime_error(err);
   }
-  tp_model_ = dynamic_cast<r4dx::model::TpModel*>(model_.get());
+  tp_model_ = dynamic_cast<r4dx::model::TpDiagnostics*>(model_.get());
   if (tp_model_ != nullptr) {
     // One line per rank (docs/tp.md 9.1's --stats VRAM lines): which HIP device each rank landed on
     // is the first thing to check when a --tp 2 server misbehaves.
@@ -555,7 +555,7 @@ void Engine::RunRequest(PendingRequest& req) {
       new_tokens_i32 = std::move(reuse->tail);
     } else {
       tp_recovered = tp_model_ != nullptr &&
-                     tp_model_->GetState() == r4dx::model::TpModel::State::kNeedsRecovery;
+                     tp_model_->GroupHealth() == r4dx::model::TpDiagnostics::Health::kNeedsRecovery;
       const auto r0 = Clock::now();
       model_->Reset();
       const auto r1 = Clock::now();
@@ -1233,7 +1233,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // `tp_recovery=yes`: this request's reset= also recovered the group after an earlier failure
     // (docs/tp.md 2.5; tools/server/smoke.ps1 -TpFault reads it).
     if (tp_model_ != nullptr && n > 0 && n < static_cast<int>(sizeof(buf))) {
-      const auto mode = tp_model_->Options().mode;
+      const auto mode = tp_model_->GroupOptions().mode;
       n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " tp=%d%s%s", model_->TpWorld(),
                          mode == r4dx::model::TpOptions::Mode::kEmulate ? " tp_mode=emulate"
                          : mode == r4dx::model::TpOptions::Mode::kNoop  ? " tp_mode=noop"
@@ -1270,7 +1270,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // failure must not reach the catch below (which would report the finished request a second time).
     if (tp_model_ != nullptr && opts_.log_level == "debug") {
       try {
-        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": " + tp_model_->StatsLine());
+        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": " + tp_model_->GroupStatsLine());
       } catch (const std::exception& e) {
         LogLine(opts_.log_level, "debug", "request " + req.request_id + ": tp stats unavailable: " + e.what());
       }
@@ -1291,13 +1291,13 @@ void Engine::RunRequest(PendingRequest& req) {
     std::string what = e.what();
     std::string tp_note;
     if (tp_model_ != nullptr) {
-      const auto state = tp_model_->GetState();
-      tp_note = state == r4dx::model::TpModel::State::kNeedsRecovery
+      const auto state = tp_model_->GroupHealth();
+      tp_note = state == r4dx::model::TpDiagnostics::Health::kNeedsRecovery
                     ? " (tp: group needs recovery; the next request resets it)"
-                : state == r4dx::model::TpModel::State::kFatal ? " (tp: fatal, restart the server)"
-                                                                : "";
+                : state == r4dx::model::TpDiagnostics::Health::kFatal ? " (tp: fatal, restart the server)"
+                                                                       : "";
       // kFatal never clears: /health turns 503 from here on (TpFatal(), engine.h).
-      if (state == r4dx::model::TpModel::State::kFatal) tp_fatal_.store(true, std::memory_order_release);
+      if (state == r4dx::model::TpDiagnostics::Health::kFatal) tp_fatal_.store(true, std::memory_order_release);
     }
     LogLine(opts_.log_level, "error", "request " + req.request_id + ": " + what + tp_note);
     note_error(500);

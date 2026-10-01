@@ -1,4 +1,4 @@
-﻿# Gemma 4 12B support for r4dx -- design and task plan
+# Gemma 4 12B support for r4dx -- design and task plan
 
 Branch `gemma4` (from `main` at `9063730`). Written 2026-10-01. This is a **design only**: no source
 file was edited, no GPU workload was run and no package was installed while writing it. Where it says
@@ -831,6 +831,46 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M1b-1 `GemmaTpModel` and `GemmaConfig::Shard` wiring.** Scope: tied lm_head vocab slice, the `tp::RuleFor` Gemma rules, per-rank ring checkpoint, replicated full-layer k_proj and KV head. Deps: M1-30. Done: it builds; shapes per rank pass.
 - **M1b-2 TP KL gate [GPU].** Command: `tool_teacher_forced_logprobs.exe --tp 2 ...`, then `kl_report.py` TP2 vs TP1, plus `gemma_tp_identity.ps1`. Gate: TP=1 byte-identical to the frozen baseline, and TP2-vs-TP1 mean KL <= 3x the noise floor with top-1 agreement >= 99.5% (proposed thresholds). Also run the M1 gate in TP=2. Deps: M1b-1, M1-36. Done: passes.
 - **M1b-3 TP tuning rows.** Scope: the `tp2.*` shapes. Deps: M1b-2. Done: tuning rows are added.
+
+#### M1b-1 status (branch `g4-tp2`): implemented, builds, CPU-verified; NEVER RUN on a GPU
+
+What exists (all Qwen paths unchanged; `Model` / `TpModel` / `Mlp` / `AttentionLayer` are untouched except `TpModel` gaining the
+`TpDiagnostics` base):
+- `tp::RuleFor` has a Gemma table (selected by `ModelConfig::arch == kGemma4`): q / sliding k, v / `gate_up` (gate | up segments) column-parallel,
+  o / down row-parallel, the full layers' single `attn.k` and its descales **replicated**, `attn.v` on a full layer refused, norms and
+  `layer_scalar` replicated, `lm_head` the rank's vocab slice (rows `[r*131072, (r+1)*131072)`), the three Hadamard sign vectors split with their
+  linear's K. CPU test `test_gemma_tp_shard` (real 12B config: 808 layer tensors x 2 ranks vs `GemmaConfig::Shard`, 64 byte-plan partitions across
+  bf16 / w4a16 g64+g128 / trellis KB4+KB5, and a tiny-model algebra check that column-parallel outputs concatenate and the row-parallel / GeGLU partial
+  sums add up) passes with `test_tp_shard` (949 checks) and `test_tp_config` unchanged.
+- `container_util::ShardLoader` (moved verbatim out of `container.cpp` into `shard_loader.h`, shared) loads a Gemma rank: `GemmaLoadOptions::{tp_world,
+  tp_rank}`, `GemmaContainer::Config()` is the rank config (`GlobalConfig()` the global), the embedding table is replicated on every rank's device,
+  rotation sign vectors are checked against the rank config (`LoadRotationWeights` got `o_full_elems_local`).
+- `GemmaModel` runs a rank: `GemmaModelOptions::{tp_world, tp_rank, tp_comm, tp_submit_layers, tp_max_inflight_units}`; the bf16 `o_proj` and `down_proj`
+  outputs are all-reduced (`AllReduceSumBf16Rows`, 85-row slices at hidden 3840) **before** the fp32 post-norm / residual add, which stays replicated;
+  vocab-split head with the existing merges (greedy `{idx, value}` pair, 64-entry row summary via `r4dx_topk_lse_f32_ws` with the rank's own workspace,
+  full row by `HostAllGather`); bounded prefill submission as `Model` does (unit scaled by 64/T for the 256-row chunk); `TpWarmup()`; profiling and
+  `DebugLayerForward` throw under TP. TP=1 takes the old code paths (`r4dx_topk_lse_f32_ws` with workspace 0 is the module scratch).
+- `GemmaTpModel` (`gemma_tp_model.{h,cpp}`): the `TpModel` state machine (rank threads, `TpGroup` / `TpEndpoint`, watchdog, kNeedsRecovery / kFatal,
+  recovery in `Reset()`, result and rng reconciliation) specialised to `GemmaModel`; `--tp-mode real | emulate | noop`; MTP, DFlash, vision (M2) and
+  profiling refused by name. `LoadTextModel` -> `LoadGemmaTextModel` dispatches `tp.world == 2` here; `tool_teacher_forced_logprobs --tp 2` and
+  `r4dx-server --tp 2` need no change (both go through `LoadTextModel`); the server's group-state handling and `r4dx-cli --stats` reach the
+  facade through the new `TpDiagnostics` interface (`text_model.h`).
+- Per-rank VRAM at TP=2 (trellis KB4/5 body): ~2.7-3.4 GB body + 2.0 GB embedding (replicated) + ~0.3-0.5 GB head slice + KV (sliding rings 126 MB, full
+  layers 1 kv head, replicated: the same 2.15 GB at 262144 as TP=1) -- the embedding and the full-layer KV are the two things TP does not shrink.
+
+Not done / known limits: no GPU run of anything above; `emulate` mode puts both ranks on one device (2 x embedding + 2 x KV), so it needs a trellis
+container; no `tp2.*` tuning rows (M1b-3: the per-rank shapes fall back to the generic `FallbackTuning`, `SetTp2TuningForThisThread(true)` is set so the TP2
+table is consulted first once rows exist); per-rank full-layer attention is the reference kernel (head_dim 512, gqa 8) as at TP=1; MTP / DFlash under
+TP wait for the drafter track; vision (M2) under TP: `EncodeImages` throws.
+
+GPU steps (ask first; one command each is in `tools/tp/gemma_tp_identity.ps1`):
+1. `ctest -R "test_gemma_tp_shard|test_tp_shard|test_tp_config"` is CPU and already green.
+2. M1b-1 smoke, one GPU (`HIP_VISIBLE_DEVICES=1`), trellis container: `build\win-hip\tests\model\tool_teacher_forced_logprobs.exe --model <rot-trellis>.r4dx
+   --layout trellis --tokens tools\reference\kl_corpus\chat_gemma.json --out-dir <dir>\tp2e --max-ctx 4096 --vision off --tp 2 --tp-mode emulate --max-tokens 64`.
+3. M1b-2: `powershell -File tools\tp\gemma_tp_identity.ps1 -Model <container> -Layout <bf16|trellis> -OutDir <dir> [-Baseline <frozen pre-TP dir>] [-TpMode real|emulate]`
+   (dumps TP=1 and TP=2, byte-compares TP=1 with the frozen baseline, scores TP2 vs TP1: KL <= 3x the HF-bf16-vs-fp32 noise floor, top-1 >= 99.5 %). Then the M1
+   gate itself at TP=2: `tools\gemma\run_gate.ps1 ... -ToolArgs '--tp','2','--tp-mode','real'` (leave `-Device` unset so both GPUs are visible).
+4. Server: `r4dx-server.exe --model <container> --layout trellis --tp 2 --tp-mode real ...` (HIP_VISIBLE_DEVICES unset) and `tools\server\smoke.ps1` with `-Tp 2`.
 
 ### M2: vision (no design section exists; needs a design pass first)
 

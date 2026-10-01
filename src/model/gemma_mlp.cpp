@@ -49,6 +49,9 @@ void GemmaMlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t*
   ProfiledCall(prof, s_raw, "gemm:mlp.down", [&] {
     ApplyLinear(stream, arena, w_.down, h, down_out, T, trellis_fused ? &pre : nullptr);
   });
+  if (comm_ != nullptr) {
+    ProfiledCall(prof, s_raw, "tp.allreduce", [&] { comm_->AllReduceSumBf16Rows(down_out, T, hidden, s_raw); });
+  }
 }
 
 }  // namespace r4dx::model

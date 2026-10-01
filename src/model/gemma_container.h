@@ -4,7 +4,10 @@
 // the trellis / w4a16 checks and the rotation.* loader are the SAME code Container::Load runs (they were
 // moved verbatim to container_load_util.{h,cpp}).
 //
-// What it loads (TP=1; a rank shard is M1b):
+// What it loads (TP=1, or with GemmaLoadOptions::tp_world 2 one rank's shard, M1b-1: container_util::ShardLoader cuts
+// every tensor by tp::RuleFor's Gemma table -- q / sliding k, v / gate_up column-parallel, o / down row-parallel, the full
+// layers' single k head and its descale replicated, lm_head the rank's vocab slice, the q2ab sign vectors split with their
+// linear's K; embed_tokens and every norm replicate):
 //   text.embed_tokens        bf16 [vocab, hidden], DEVICE-resident always (the scaled gather and the tied head)
 //   text.final_norm          bf16 [hidden] (plain weight)
 //   lm_head                  QuantLinear [vocab, hidden] (the tied head, written untied; its own layout)
@@ -51,6 +54,8 @@ struct GemmaLoadOptions {
   Layout layout = Layout::kBf16;          // body linears (trellis needs a trellis container)
   Layout lm_head_layout = Layout::kBf16;  // a trellis body's head loads as w4a16 / bf16
   int64_t layer_limit = -1;               // >= 0: load layers [0, layer_limit) (tiny fixtures)
+  int tp_world = 1;                       // 1 or 2 (docs/gemma4-plan.md M1b-1)
+  int tp_rank = 0;
 };
 
 class GemmaContainer {
@@ -65,7 +70,12 @@ class GemmaContainer {
   GemmaContainer& operator=(GemmaContainer&&) = default;
 
   const GemmaContainerInfo& Info() const { return info_; }
-  const GemmaConfig& Config() const { return info_.config; }
+  // The config the loaded weights have: GemmaConfig::Shard(global, tp_world, tp_rank) under TP (vocab_size stays global;
+  // VocabShardSize() is the head's rows), else the global one. Info().config is always the GLOBAL config.
+  const GemmaConfig& Config() const { return local_config_; }
+  const GemmaConfig& GlobalConfig() const { return info_.config; }
+  int TpWorld() const { return local_config_.tp_world; }
+  int TpRank() const { return local_config_.tp_rank; }
   const ModelConfig& GenericConfig() const { return info_.model_config; }  // thin view for TextModel::Config()
   const std::string& ModelId() const { return info_.model_id; }
 
@@ -88,6 +98,7 @@ class GemmaContainer {
   void AssignTrellisTickets();
 
   GemmaContainerInfo info_;
+  GemmaConfig local_config_;  // == info_.config at TP=1
   core::DeviceBuffer<uint16_t> embed_tokens_, final_norm_;
   QuantLinear lm_head_;
   std::vector<GemmaLayerWeights> layers_;

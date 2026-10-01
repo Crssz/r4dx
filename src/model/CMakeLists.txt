@@ -119,6 +119,8 @@ set(R4DX_MODEL_SOURCES
   gemma_mlp.cpp
   gemma_model.cpp
   gemma_local_text_model.cpp
+  # M1b-1: the tensor-parallel (--tp 2) Gemma TextModel (rank threads + TpComm, docs/tp.md 2.1-2.9 specialised to GemmaModel).
+  gemma_tp_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

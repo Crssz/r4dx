@@ -1,6 +1,7 @@
 #include "gemma_model.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #include "kernels/model_kernels.h"
 #include "linear.h"
@@ -72,19 +74,54 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   if (opts.prefill_chunk < 1 || opts.prefill_chunk > 256) {
     throw std::invalid_argument("GemmaModel::Load: prefill_chunk must be in [1, 256] (the sliding ring holds window + 288)");
   }
+  // ---- tensor parallel (docs/gemma4-plan.md M1b-1): validate this rank's options ----------------------------------------
+  const bool is_tp = opts.tp_world > 1;
+  if (opts.tp_world < 1 || opts.tp_world > 2 || opts.tp_rank < 0 || opts.tp_rank >= opts.tp_world) {
+    throw std::invalid_argument("GemmaModel::Load: tp_world must be 1 or 2 and 0 <= tp_rank < tp_world, got " +
+                                std::to_string(opts.tp_world) + ", " + std::to_string(opts.tp_rank));
+  }
+  if (!is_tp && (opts.tp_comm != nullptr || opts.tp_submit_layers != 0 || opts.tp_max_inflight_units != 0)) {
+    throw std::invalid_argument("GemmaModel::Load: tp_comm / tp_submit_layers / tp_max_inflight_units are tensor-parallel "
+                                "options (tp_world > 1 only)");
+  }
+  if (is_tp && (opts.tp_comm == nullptr || opts.tp_comm->World() != opts.tp_world || opts.tp_comm->Rank() != opts.tp_rank)) {
+    throw std::invalid_argument("GemmaModel::Load: tp_world > 1 needs a TpComm endpoint of the same world and rank");
+  }
+  if (opts.tp_submit_layers < 0 || opts.tp_submit_layers > 64 || opts.tp_max_inflight_units < 0 ||
+      opts.tp_max_inflight_units > 64) {
+    throw std::invalid_argument("GemmaModel::Load: tp_submit_layers and tp_max_inflight_units must be in [0, 64]");
+  }
+  // A TP rank's thread consults the per-rank tuning table first (docs/tp.md 2.7); set on EVERY load so the flag follows this
+  // thread's latest load, and cleared again if this one throws (Model::Load's Tp2FlagOnThrow).
+  SetTp2TuningForThisThread(is_tp);
+  struct Tp2FlagOnThrow {
+    int uncaught = std::uncaught_exceptions();
+    ~Tp2FlagOnThrow() {
+      if (std::uncaught_exceptions() > uncaught) SetTp2TuningForThisThread(false);
+    }
+  } tp2_flag_on_throw;
   GemmaModel m;
   m.opts_ = opts;
+  m.comm_ = opts.tp_comm;
   GemmaLoadOptions lo;
   lo.layout = opts.layout;
   lo.lm_head_layout = opts.layout;
   lo.layer_limit = opts.layer_limit;
+  lo.tp_world = opts.tp_world;
+  lo.tp_rank = opts.tp_rank;
   m.container_ = GemmaContainer::Load(opts.container_path, lo);
   const GemmaConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t layers = m.container_.NumLoadedLayers();
   m.max_ctx_ = cfg.ResolveMaxCtx(opts.max_ctx, opts.allow_extended_ctx);
   m.max_chunk_ = opts.prefill_chunk;
-  if (m.container_.LmHead().N != cfg.vocab_size) throw std::runtime_error("GemmaModel::Load: lm_head rows != vocab_size");
+  // This rank's lm_head rows and their first global id: the whole vocabulary and 0 at TP=1 (docs/tp.md 7.2).
+  m.vocab_local_ = m.container_.LmHead().N;
+  m.vocab_offset_ = cfg.VocabShardBegin();
+  if (m.vocab_local_ * opts.tp_world != cfg.vocab_size) {
+    throw std::runtime_error("GemmaModel::Load: lm_head has " + std::to_string(m.vocab_local_) +
+                             " rows, not vocab_size / tp_world = " + std::to_string(cfg.vocab_size / opts.tp_world));
+  }
 
   // Per-chunk buffers.
   const int64_t rows = m.max_chunk_;
@@ -97,8 +134,19 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   if (opts.resid == GemmaResid::kFp32) m.buf_a32_ = core::DeviceBuffer<float>(static_cast<size_t>(rows * hidden));
   else m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
   m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
-  m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
+  m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));  // this rank's vocab shard under TP
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
+  if (is_tp) {
+    // Allocated here, never inside a collective (docs/tp.md 6.3.7): the greedy {idx, value} pair, this rank's own
+    // row-summary workspace (two rank threads -- one device under emulation -- must not share the module scratch), and the
+    // prefill submission bounding's events.
+    m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(2);
+    m.topk_lse_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
+    if (opts.tp_submit_layers > 0) {
+      m.submit_ = tp::SubmitBounder(opts.tp_max_inflight_units);
+      m.submit_layers_ = opts.tp_submit_layers;
+    }
+  }
   m.summary_ids_dev_ = core::DeviceBuffer<int32_t>(R4DX_TOPK_LSE_K);
   m.summary_vals_dev_ = core::DeviceBuffer<float>(R4DX_TOPK_LSE_K);
   m.summary_lse_dev_ = core::DeviceBuffer<float>(1);
@@ -153,7 +201,9 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
                     ? " [R4DX_GEMMA_KV set]" : " [default; R4DX_GEMMA_KV=fp8 for fp8]")
             << (m.container_.HasRotation() ? ", rotated residual" : "") << (m.container_.HasTrellis() ? ", trellis body" : "")
             << ", residual "
-            << (opts.resid == GemmaResid::kFp32 ? "fp32" : "bf16") << "\n";
+            << (opts.resid == GemmaResid::kFp32 ? "fp32" : "bf16");
+  if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (vocab shard " << m.vocab_local_ << ")";
+  std::cerr << "\n";
   return m;
 }
 
@@ -168,6 +218,7 @@ void GemmaModel::Reset() {
   arena_.Reset();
   ckpt_pos_ = -1;
   feature_rows_ = 0;
+  submit_.Reset();  // no unit is outstanding after the synchronize above
 }
 
 void GemmaModel::SaveCheckpoint() {
@@ -276,7 +327,7 @@ void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int
   attn_[static_cast<size_t>(i)].Forward(arena_, normed, o_out, aw, *kv_[static_cast<size_t>(i)], static_cast<int>(T),
                                         static_cast<int>(start_pos), positions_dev_.data(),
                                         lw.full ? positions_dev_.data() : ring_slots_dev_.data(), seqused_dev_.data(),
-                                        s_raw, prof);
+                                        s_raw, prof, /*klimit_ext=*/nullptr, comm_);
   ProfiledCall(prof, s_raw, "layer.post_attn", [&] {
     if (rotated) {
       if (f32) {
@@ -302,7 +353,7 @@ void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int
 
   // ---- MLP half ----
   uint16_t* mlp_out = o_out;  // the attention output is dead: reuse its arena slot
-  GemmaMlp mlp(cfg, lw.mlp, rot_had ? rot->had_down_signs.data() : nullptr);
+  GemmaMlp mlp(cfg, lw.mlp, rot_had ? rot->had_down_signs.data() : nullptr, comm_);
   mlp.Forward(stream_, arena_, normed, mlp_out, T, prof);
   ProfiledCall(prof, s_raw, "layer.post_mlp", [&] {
     if (rotated) {
@@ -332,6 +383,7 @@ void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int
 
 std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::vector<uint16_t>& x_rows, int64_t T,
                                                     int64_t start_pos) {
+  RequireNotTp("DebugLayerForward");
   const int64_t hidden = container_.Config().hidden_size;
   if (layer < 0 || layer >= container_.NumLoadedLayers()) throw std::out_of_range("GemmaModel::DebugLayerForward: layer");
   if (T < 1 || T > max_chunk_ || static_cast<int64_t>(x_rows.size()) != T * hidden) {
@@ -368,7 +420,7 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   return out;
 }
 std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                                        const SummaryRequest* summary_out, SpanAccumulator* prof) {
+                                        const SummaryRequest* summary_out, SpanAccumulator* prof, bool is_prefill) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   if (T < 1 || T > max_chunk_) {
     throw std::runtime_error("GemmaModel::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
@@ -432,7 +484,16 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   ProfiledCall(prof, s_raw, "layer0.input_norm",
                [&] { plain_norm(cur, container_.Layer(0).input_layernorm.data(), normed); });
 
+  // Tensor parallel: bounded submission of a prefill chunk (tp/tp_submit.h, docs/tp.md Appendix B N57): every `unit_layers`
+  // layers force a submission and wait until at most max_inflight_units - 1 earlier units are unfinished. Decode steps are
+  // not split. A 256-row chunk costs ~4x a 64-row one per layer, so its unit is scaled down (at least one layer), exactly as
+  // Model::RunChunk does. Both ranks see the same positions, so they cut the same units.
+  const bool bounded = comm_ != nullptr && is_prefill && submit_.Active();
+  int64_t unit_layers = bounded ? tp::UnitLayersForContext(submit_layers_, pos_ + T) : 0;
+  if (bounded && T > 64) unit_layers = std::max<int64_t>(1, unit_layers * 64 / T);
+  if (bounded) submit_.Reset();
   for (int64_t i = 0; i < num_layers; ++i) {
+    if (bounded && i > 0 && i % unit_layers == 0) submit_.EndUnit(s_raw);
     capture_layer_input(i);
     RunLayer(i, cur, normed, T, pos_, /*has_next=*/i + 1 < num_layers, prof);
   }
@@ -454,24 +515,29 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   if (want_logits) {
     const char* last = static_cast<const char*>(cur) + (T - 1) * hidden * static_cast<int64_t>(elem);
     uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(hidden), 16);
-    uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(cfg.vocab_size), 16);
+    uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(vocab_local_), 16);  // this rank's shard under TP
     ProfiledCall(prof, s_raw, "final_norm", [&] {
       plain_norm(last, container_.FinalNorm().data(), xn);
     });
     ProfiledCall(prof, s_raw, "gemm:lm_head", [&] { ApplyLinear(stream_, arena_, container_.LmHead(), xn, logits_bf16, 1); });
     ProfiledCall(prof, s_raw, "lm_head.softcap", [&] {
       if (cfg.final_logit_softcapping > 0.0) {
-        r4dx_model_widen_softcap_bf16_to_f32(P(logits_bf16), P(logits_dev_.data()), cfg.vocab_size,
+        r4dx_model_widen_softcap_bf16_to_f32(P(logits_bf16), P(logits_dev_.data()), vocab_local_,
                                              static_cast<float>(cfg.final_logit_softcapping), s);
       } else {
-        r4dx_model_widen_bf16_to_f32(P(logits_bf16), P(logits_dev_.data()), cfg.vocab_size, s);
+        r4dx_model_widen_bf16_to_f32(P(logits_bf16), P(logits_dev_.data()), vocab_local_, s);
       }
     });
-    if (greedy_out != nullptr) {
+    if (greedy_out != nullptr && comm_ != nullptr) {
+      // TP (docs/tp.md 7.3): argmax THIS rank's shard, keeping the winning value too; the host merges the pairs below.
+      r4dx_argmax_val_f32(P(logits_dev_.data()), P(argmax_pair_dev_.data()), P(argmax_pair_dev_.data() + 1), vocab_local_, s);
+    } else if (greedy_out != nullptr) {
       r4dx_argmax_f32(P(logits_dev_.data()), P(argmax_dev_.data()), cfg.vocab_size, s);
     } else if (summary_out != nullptr) {
-      r4dx_topk_lse_f32(P(logits_dev_.data()), P(summary_ids_dev_.data()), P(summary_vals_dev_.data()),
-                        P(summary_lse_dev_.data()), 1, cfg.vocab_size, summary_out->inv_temperature, s);
+      // workspace 0 == the module scratch (exactly r4dx_topk_lse_f32); a TP rank uses its own.
+      r4dx_topk_lse_f32_ws(P(logits_dev_.data()), P(summary_ids_dev_.data()), P(summary_vals_dev_.data()),
+                           P(summary_lse_dev_.data()), 1, vocab_local_, summary_out->inv_temperature, s,
+                           comm_ != nullptr ? P(topk_lse_ws_.data()) : 0);
     }
     arena_.Reset();
   }
@@ -479,7 +545,18 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   if (prof == nullptr) stream_.Synchronize();
 
   std::vector<float> logits;
-  if (want_logits && prof == nullptr) {
+  if (want_logits && prof == nullptr && comm_ != nullptr) {
+    // Tensor parallel, H3 (docs/tp.md 6.2, 7.3-7.5): merge the vocab shards on the host -- the greedy pair (8 B per rank), the
+    // row summary (536 B per rank) or the full row in global id order. Every rank ends with the same answer.
+    if (greedy_out != nullptr) {
+      *greedy_out = MergeGreedyPair();
+    } else if (summary_out != nullptr) {
+      FetchRowSummary(summary_out->inv_temperature, summary_out->out);
+      MergeSummary(summary_out->out);
+    } else {
+      GatherVocabRow(&logits);
+    }
+  } else if (want_logits && prof == nullptr) {
     if (greedy_out != nullptr) {
       argmax_dev_.CopyToHost(greedy_out, 1);
     } else if (summary_out != nullptr) {
@@ -506,7 +583,7 @@ void GemmaModel::FetchRowSummary(float inv_temperature, kernels::RowSummary* out
   summary_vals_dev_.CopyToHost(vals.data(), vals.size());
   summary_lse_dev_.CopyToHost(&lse, 1);
   out->k = R4DX_TOPK_LSE_K;
-  out->vocab = container_.Config().vocab_size;
+  out->vocab = vocab_local_;  // the width the device summarized (this rank's shard under TP; MergeSummary makes it global)
   out->inv_temperature = inv_temperature;
   out->lse = lse;
   for (int j = 0; j < R4DX_TOPK_LSE_K; ++j) {
@@ -525,7 +602,7 @@ std::vector<float> GemmaModel::Prefill(const std::vector<int32_t>& token_ids,
                                      token_ids.begin() + static_cast<ptrdiff_t>(off + n));
     const bool last = off + n == token_ids.size();
     off += n;
-    std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr);
+    std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr, /*is_prefill=*/true);
     if (on_chunk_captured) on_chunk_captured();
     if (last) logits = std::move(l);
   }
@@ -556,9 +633,83 @@ int32_t GemmaModel::DecodeStepSampled(int32_t token_id, const kernels::SamplePar
   if (r.resolved) return r.token;
   // Unresolved row: the step's own fp32 row is still in logits_dev_ (no second lm_head pass).
   ++sampled_fallback_rows_;
-  sampled_row_scratch_.resize(static_cast<size_t>(vocab));
-  logits_dev_.CopyToHost(sampled_row_scratch_.data(), static_cast<size_t>(vocab));
+  if (comm_ != nullptr) {
+    // TP, H5 (docs/tp.md 7.4 "unresolved row"): gather this step's full row in global id order. The merged summary is
+    // identical on every rank, so every rank takes this branch together; SampleCanonical with the SAME u.
+    GatherVocabRow(&sampled_row_scratch_);
+  } else {
+    sampled_row_scratch_.resize(static_cast<size_t>(vocab));
+    logits_dev_.CopyToHost(sampled_row_scratch_.data(), static_cast<size_t>(vocab));
+  }
   return kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, params, u);
+}
+
+// ---- tensor parallel (docs/tp.md 7.2-7.5; docs/gemma4-plan.md M1b-1) ---------------------------------------------------
+
+void GemmaModel::RequireNotTp(const char* what) const {
+  if (comm_ != nullptr) {
+    throw core::TpUnsupportedError(std::string("GemmaModel::") + what + ": not supported under tensor parallelism");
+  }
+}
+
+int32_t GemmaModel::MergeGreedyPair() {
+  tp::ArgmaxPair mine{};
+  static_assert(sizeof(tp::ArgmaxPair) == 2 * sizeof(int32_t), "{idx, value} pair is two 32-bit words");
+  R4DX_HIP_CHECK(hipMemcpy(&mine, argmax_pair_dev_.data(), sizeof(mine), hipMemcpyDeviceToHost));
+  mine.idx += static_cast<int32_t>(vocab_offset_);  // local -> global id
+  std::array<tp::ArgmaxPair, 2> all{};              // world <= 2 (Load)
+  comm_->HostAllGather(&mine, sizeof(mine), all.data());
+  return tp::MergeArgmax(all.data(), comm_->World());
+}
+
+void GemmaModel::MergeSummary(kernels::RowSummary* out) {
+  static_assert(std::is_trivially_copyable_v<kernels::RowSummary>,
+                "row summaries cross the host exchange as raw bytes (same process, same layout)");
+  const int world = comm_->World();
+  for (int j = 0; j < out->k; ++j) out->ids[j] += static_cast<int32_t>(vocab_offset_);  // local -> global ids first
+  std::array<kernels::RowSummary, 2> all{};
+  comm_->HostAllGather(out, sizeof(kernels::RowSummary), all.data());
+  *out = tp::MergeRowSummaries(all.data(), world, container_.Config().vocab_size);
+}
+
+void GemmaModel::GatherVocabRow(std::vector<float>* full) {
+  // Plain (blocking, null-stream) D2H of this rank's shard: the caller has synchronized stream_ (RunChunk's rule). Staged in
+  // a separate vector so the all-gather's source and destination never alias.
+  gather_shard_host_.resize(static_cast<size_t>(vocab_local_));
+  R4DX_HIP_CHECK(hipMemcpy(gather_shard_host_.data(), logits_dev_.data(), static_cast<size_t>(vocab_local_) * sizeof(float),
+                           hipMemcpyDeviceToHost));
+  full->resize(static_cast<size_t>(container_.Config().vocab_size));
+  comm_->HostAllGather(gather_shard_host_.data(), static_cast<size_t>(vocab_local_) * sizeof(float), full->data());
+}
+
+int64_t GemmaModel::WarmupPositions(const GemmaModelOptions& o) {
+  // TpWarmup: one full chunk, then (after a Reset) a 64-row chunk and three decode steps.
+  return std::max<int64_t>(o.prefill_chunk, 64 + 3);
+}
+
+void GemmaModel::TpWarmup() {
+  if (comm_ == nullptr) throw std::logic_error("GemmaModel::TpWarmup: only a tensor-parallel rank (tp_world > 1) warms up");
+  if (max_ctx_ < WarmupPositions(opts_)) {
+    throw std::invalid_argument("GemmaModel::TpWarmup: max_ctx " + std::to_string(max_ctx_) + " < " +
+                                std::to_string(WarmupPositions(opts_)) + " warm-up positions");
+  }
+  // A full-width chunk first: the first launch of the M = 256 GEMMs at this rank's shard shapes, the sliced 85-row
+  // all-reduces per collective site and the 256-row activations must not meet their first touch inside a request. Fixed ids
+  // 0..n-1: the warm-up is a lockstep collective, so every rank must feed the same tokens.
+  const auto ids = [](int64_t n) {
+    std::vector<int32_t> v(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i) v[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    return v;
+  };
+  (void)Prefill(ids(max_chunk_));
+  Reset();
+  (void)Prefill(ids(64));
+  (void)DecodeStepGreedy(0);                       // channel 0 all-reduces + the greedy pair merge
+  kernels::SampleParams sp;                         // temperature 1: the summary path and its merge
+  std::mt19937_64 rng(0x7e57);
+  (void)DecodeStepSampled(1, sp, rng);
+  (void)DecodeStep(2);                              // the full-row gather
+  Reset();
 }
 
 namespace {
@@ -571,6 +722,7 @@ std::vector<ProfileEntry> ToEntries(std::vector<SpanEntry> raw) {
 }  // namespace
 
 StepProfile GemmaModel::DecodeStepProfiled(int32_t token_id) {
+  RequireNotTp("DecodeStepProfiled");
   using Clock = std::chrono::steady_clock;
   const auto t0 = Clock::now();
   r4dx_kernel_launch_counter_reset();
@@ -589,6 +741,7 @@ StepProfile GemmaModel::DecodeStepProfiled(int32_t token_id) {
 }
 
 StepProfile GemmaModel::PrefillProfiled(const std::vector<int32_t>& token_ids) {
+  RequireNotTp("PrefillProfiled");
   using Clock = std::chrono::steady_clock;
   if (token_ids.empty()) throw std::runtime_error("GemmaModel::PrefillProfiled: token_ids is empty");
   const auto t0 = Clock::now();

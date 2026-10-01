@@ -139,14 +139,26 @@ class TextModel {
   virtual StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) = 0;
 };
 
+// Diagnostics of a tensor-parallel facade (TpModel, GemmaTpModel): not part of TextModel (docs/tp.md 2.8), reached by a
+// dynamic_cast from the TextModel -- r4dx-cli's `--stats` lines and the server's group-state handling (docs/tp.md 2.4, 9.1).
+// Facade-thread-only, like the facades themselves.
+class TpDiagnostics {
+ public:
+  enum class Health { kReady, kNeedsRecovery, kFatal };
+  virtual ~TpDiagnostics() = default;
+  virtual Health GroupHealth() const = 0;
+  virtual const TpOptions& GroupOptions() const = 0;
+  virtual std::string GroupStatsLine() = 0;  // the `--stats` "tp: ..." line without its "[stats] " prefix
+};
+
 // tp.world == 1 => LocalTextModel(Model::Load(opts)) -- exactly today's Model; every other TpOptions
 // field must then keep its default. tp.world == 2 => TpModel::Load(opts, tp). Defined in
 // tp_model.cpp.
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp);
 
 // The Gemma 4 branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kGemma4). Defined in
-// tp_model.cpp as a throwing placeholder until M1-20 lands GemmaLocalTextModel (TP=1) and, later,
-// GemmaTpModel. TextModel::Config().arch is Arch::kGemma4 for what it returns.
+// gemma_local_text_model.cpp: tp.world == 1 -> GemmaLocalTextModel, tp.world == 2 -> GemmaTpModel (M1b-1).
+// TextModel::Config().arch is Arch::kGemma4 for what it returns.
 std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp);
 
 }  // namespace r4dx::model

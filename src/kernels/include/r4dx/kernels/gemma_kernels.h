@@ -85,4 +85,31 @@ void r4dx_gemma_postnorm_residual_rmsnorm_bf16(int64_t res, int64_t y, int64_t w
                                                 int64_t out_normed, float scalar, int64_t rows,
                                                 int64_t hidden, int64_t stream);
 
+// ==== fp32-residual variants (GemmaModel's default residual dtype; R4DX_GEMMA_RESID=bf16 uses the
+// kernels above) ============================================================================================
+// HF-bf16 is not a stable yardstick for Gemma 4 (the residual reaches 100-300 and bf16 rounding is
+// amplified), so r4dx keeps the residual stream in fp32 and only the GEMM inputs (norm outputs) are bf16.
+// The residual is [rows, hidden] fp32; sublayer outputs y stay bf16 (GEMM outputs). Under TP the later
+// all-reduce operates on those bf16 sublayer outputs, never on the residual.
+
+// out fp32 = float(table[ids[i],:]) * scale (scale = bf16(sqrt(hidden)), 62.0 for 3840; the product is exact).
+void r4dx_embedding_gather_scaled_f32(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
+                                       int64_t vocab, float scale, int64_t stream);
+
+// out bf16 = bf16(x * rsqrt(mean(x^2) + eps) * w), x fp32 [rows, hidden], w bf16 [hidden]. The pre-norms and
+// the final norm. Not in place.
+void r4dx_rmsnorm_plain_f32in_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
+                                    float eps, int64_t stream);
+
+// r4dx_gemma_postnorm_residual_rmsnorm_bf16 with an fp32 residual, all in fp32 with no intermediate bf16
+// rounding:  out_res = (res + y * rsqrt(mean(y^2)+eps) * w_post) * scalar   (scalar == 1 skips the multiply)
+//            out_normed (bf16, optional) = bf16(rms(out_res) * w_next)
+// res, out_res fp32 (may alias); y bf16; out_normed bf16.
+void r4dx_gemma_postnorm_residual_rmsnorm_f32res(int64_t res, int64_t y, int64_t w_post, int64_t w_next,
+                                                  float eps, int64_t out_res, int64_t out_normed, float scalar,
+                                                  int64_t rows, int64_t hidden, int64_t stream);
+
+// out[i] = bf16(x[i]) for n elements (RNE). Used for the drafter feature capture.
+void r4dx_f32_to_bf16(int64_t x, int64_t out, int64_t n, int64_t stream);
+
 }  // extern "C"

@@ -73,4 +73,41 @@ inline double GeluTanh(double x) {
   return 0.5 * x * (1.0 + std::tanh(k * (x + 0.044715 * x * x * x)));
 }
 
+// ---- fp32-residual references (R4DX_GEMMA_RESID=fp32) ----------------------------------------------------
+// fp64 spelling of r4dx_gemma_postnorm_residual_rmsnorm_f32res: no intermediate bf16 rounding anywhere;
+// the only rounding is the optional bf16 of the norm output that feeds a GEMM (out_normed).
+struct PostnormF32Out {
+  std::vector<double> out_res;    // fp32 residual after the sublayer (the kernel stores it as fp32)
+  std::vector<double> out_normed; // un-rounded next-norm output (the kernel rounds it to bf16)
+};
+inline PostnormF32Out PostnormResidualF32Ref(const std::vector<double>& res, const std::vector<double>& y,
+                                             const std::vector<double>& w_post, const std::vector<double>* w_next,
+                                             double eps, double scalar) {
+  const size_t n = y.size();
+  double ssy = 0.0;
+  for (double v : y) ssy += v * v;
+  const double rstd_y = 1.0 / std::sqrt(ssy / static_cast<double>(n) + eps);
+  PostnormF32Out o;
+  o.out_res.resize(n);
+  for (size_t i = 0; i < n; ++i) o.out_res[i] = (res[i] + y[i] * rstd_y * w_post[i]) * scalar;
+  if (w_next != nullptr) {
+    double ss = 0.0;
+    for (double v : o.out_res) ss += v * v;
+    const double rstd = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
+    o.out_normed.resize(n);
+    for (size_t i = 0; i < n; ++i) o.out_normed[i] = o.out_res[i] * rstd * (*w_next)[i];
+  }
+  return o;
+}
+
+// out = x * rsqrt(mean(x^2) + eps) * w for an fp32 x row (the pre-norms / final norm of the fp32 stream), fp64.
+inline std::vector<double> RmsNormF32InRef(const std::vector<double>& x, const std::vector<double>& w, double eps) {
+  double ss = 0.0;
+  for (double v : x) ss += v * v;
+  const double rstd = 1.0 / std::sqrt(ss / static_cast<double>(x.size()) + eps);
+  std::vector<double> out(x.size());
+  for (size_t i = 0; i < x.size(); ++i) out[i] = x[i] * rstd * w[i];
+  return out;
+}
+
 }  // namespace gemma_ref

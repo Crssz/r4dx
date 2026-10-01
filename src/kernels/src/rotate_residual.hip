@@ -206,6 +206,127 @@ __global__ __launch_bounds__(512) void PostRmsnormRotateAddKernel(__hip_bfloat16
     }
   }
 }
+// ---- fp32-residual twins (Gemma 4 R4DX_GEMMA_RESID=fp32) -------------------------------------------
+// Same arithmetic as the two kernels above with the residual x / resid stored as fp32: no bf16 rounding of
+// the rotated value. Copies, not templates, so the Qwen kernels' instruction streams are untouched.
+template <int NBLK_CT>
+__global__ __launch_bounds__(512) void RotateResidualF32Kernel(float* __restrict__ x, const float* __restrict__ signs,
+                                     const float* __restrict__ mix, int inverse, int hidden_rt,
+                                     int block_rt, int nblk_rt, int log2_block, float scale) {
+  constexpr int kMaxN = NBLK_CT > 0 ? NBLK_CT : kRotMaxNblk;
+  const int nblk = NBLK_CT > 0 ? NBLK_CT : nblk_rt;
+  const int block = block_rt;
+  const int hidden = hidden_rt;
+  extern __shared__ float lds[];
+  float* v = lds;
+  float* r = lds + hidden;
+  float* xr = x + static_cast<int64_t>(blockIdx.x) * hidden;
+  for (int i = threadIdx.x; i < nblk * nblk; i += blockDim.x) r[i] = mix[i];
+  __syncthreads();
+
+  if (!inverse) {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) v[i] = xr[i] * signs[i];
+  } else {
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+      float xin[kMaxN];
+#pragma unroll
+      for (int b = 0; b < kMaxN; ++b) {
+        if (b < nblk) xin[b] = xr[b * block + i];
+      }
+      for (int c = 0; c < nblk; ++c) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int b = 0; b < kMaxN; ++b) {
+          if (b < nblk) acc += xin[b] * r[c * nblk + b];
+        }
+        v[c * block + i] = acc;
+      }
+    }
+  }
+  __syncthreads();
+
+  r4dx::kernels::hadamard::FwhtLds(v, hidden, log2_block);
+
+  if (!inverse) {
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+      float y[kMaxN];
+#pragma unroll
+      for (int c = 0; c < kMaxN; ++c) {
+        if (c < nblk) y[c] = v[c * block + i] * scale;
+      }
+      for (int b = 0; b < nblk; ++b) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kMaxN; ++c) {
+          if (c < nblk) acc += y[c] * r[c * nblk + b];
+        }
+        xr[b * block + i] = acc;
+      }
+    }
+  } else {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) xr[i] = v[i] * scale * signs[i];
+  }
+}
+
+template <int NBLK_CT>
+__global__ __launch_bounds__(512) void PostRmsnormRotateAddF32Kernel(float* __restrict__ resid,
+                                           const __hip_bfloat16* __restrict__ y,
+                                           const __hip_bfloat16* __restrict__ w,
+                                           const float* __restrict__ signs,
+                                           const float* __restrict__ mix, int hidden_rt, int block_rt,
+                                           int nblk_rt, int log2_block, float scale, float eps,
+                                           float layer_scale) {
+  constexpr int kMaxN = NBLK_CT > 0 ? NBLK_CT : kRotMaxNblk;
+  const int nblk = NBLK_CT > 0 ? NBLK_CT : nblk_rt;
+  const int block = block_rt;
+  const int hidden = hidden_rt;
+  extern __shared__ float lds[];
+  float* v = lds;
+  float* r = lds + hidden;
+  float* red = r + nblk * nblk;
+  const int64_t row = blockIdx.x;
+  const __hip_bfloat16* yr = y + row * hidden;
+  float* xr = resid + row * hidden;
+
+  for (int i = threadIdx.x; i < nblk * nblk; i += blockDim.x) r[i] = mix[i];
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    const float t = __bfloat162float(yr[i]);
+    ss += t * t;
+  }
+  red[threadIdx.x] = ss;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (static_cast<int>(threadIdx.x) < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  const float rstd = rsqrtf(red[0] / static_cast<float>(hidden) + eps);
+
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    v[i] = (__bfloat162float(yr[i]) * rstd * __bfloat162float(w[i])) * signs[i];
+  }
+  __syncthreads();
+
+  r4dx::kernels::hadamard::FwhtLds(v, hidden, log2_block);
+
+  for (int i = threadIdx.x; i < block; i += blockDim.x) {
+    float t[kMaxN];
+#pragma unroll
+    for (int c = 0; c < kMaxN; ++c) {
+      if (c < nblk) t[c] = v[c * block + i] * scale;
+    }
+    for (int b = 0; b < nblk; ++b) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int c = 0; c < kMaxN; ++c) {
+        if (c < nblk) acc += t[c] * r[c * nblk + b];
+      }
+      const int64_t idx = static_cast<int64_t>(b) * block + i;
+      xr[idx] = (xr[idx] + acc) * layer_scale;
+    }
+  }
+}
+
 // x <- x Hb, one (row, block) per workgroup: grid = dim3(rows, K / block). A workgroup reads its
 // whole block into LDS before its first barrier and writes it back after the last, so in place is
 // safe; blocks never overlap.
@@ -243,9 +364,62 @@ void LaunchPostNormRotateAdd(const RotGeom& g, int64_t resid, int64_t y, int64_t
                      layer_scale);
 }
 
+template <int NBLK_CT>
+void LaunchRotateF32(const RotGeom& g, int64_t x, int64_t rows, int64_t signs, int64_t mix, int inverse,
+                     int64_t stream) {
+  hipLaunchKernelGGL(RotateResidualF32Kernel<NBLK_CT>, dim3(static_cast<unsigned>(rows)),
+                     dim3(g.threads), RotLdsBytes(g), (hipStream_t)stream, (float*)x,
+                     (const float*)signs, (const float*)mix, inverse, g.hidden, g.block, g.nblk,
+                     g.log2_block, g.scale);
+}
+
+template <int NBLK_CT>
+void LaunchPostNormRotateAddF32(const RotGeom& g, int64_t resid, int64_t y, int64_t w, int64_t signs,
+                                int64_t mix, int64_t rows, float eps, float layer_scale, int64_t stream) {
+  hipLaunchKernelGGL(PostRmsnormRotateAddF32Kernel<NBLK_CT>, dim3(static_cast<unsigned>(rows)),
+                     dim3(g.threads), RotLdsBytes(g), (hipStream_t)stream, (float*)resid,
+                     (const __hip_bfloat16*)y, (const __hip_bfloat16*)w, (const float*)signs,
+                     (const float*)mix, g.hidden, g.block, g.nblk, g.log2_block, g.scale, eps,
+                     layer_scale);
+}
+
 }  // namespace
 
 extern "C" {
+
+void r4dx_rotate_residual_f32(int64_t x, int64_t rows, int64_t hidden, int64_t signs, int64_t mix,
+                               int inverse, int64_t stream) {
+  const RotGeom g = MakeRotGeom("r4dx_rotate_residual_f32", hidden);
+  if (rows <= 0) return;
+  if (x == 0 || signs == 0 || mix == 0) {
+    throw std::runtime_error("r4dx_rotate_residual_f32: x, signs and mix must be non-null");
+  }
+  r4dx_kernel_launch_counter_add(1);
+  switch (g.nblk) {
+    case 5: LaunchRotateF32<5>(g, x, rows, signs, mix, inverse, stream); break;
+    case 15: LaunchRotateF32<15>(g, x, rows, signs, mix, inverse, stream); break;
+    default: LaunchRotateF32<0>(g, x, rows, signs, mix, inverse, stream); break;
+  }
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_post_rmsnorm_rotate_add_f32res(int64_t resid, int64_t y, int64_t weight, int64_t signs,
+                                          int64_t mix, int64_t rows, int64_t hidden, float eps,
+                                          float layer_scale, int64_t stream) {
+  const RotGeom g = MakeRotGeom("r4dx_post_rmsnorm_rotate_add_f32res", hidden);
+  if (rows <= 0) return;
+  if (resid == 0 || y == 0 || weight == 0 || signs == 0 || mix == 0) {
+    throw std::runtime_error(
+        "r4dx_post_rmsnorm_rotate_add_f32res: resid, y, weight, signs and mix must be non-null");
+  }
+  r4dx_kernel_launch_counter_add(1);
+  switch (g.nblk) {
+    case 5: LaunchPostNormRotateAddF32<5>(g, resid, y, weight, signs, mix, rows, eps, layer_scale, stream); break;
+    case 15: LaunchPostNormRotateAddF32<15>(g, resid, y, weight, signs, mix, rows, eps, layer_scale, stream); break;
+    default: LaunchPostNormRotateAddF32<0>(g, resid, y, weight, signs, mix, rows, eps, layer_scale, stream); break;
+  }
+  R4DX_HIP_CHECK(hipGetLastError());
+}
 
 void r4dx_rotate_residual_bf16(int64_t x, int64_t rows, int64_t hidden, int64_t signs,
                                 int64_t mix5, int inverse, int64_t stream) {

@@ -179,9 +179,144 @@ __global__ __launch_bounds__(kThreads) void PostnormResidualKernel(
   }
 }
 
+// ==== fp32-residual variants (R4DX_GEMMA_RESID=fp32, the default) =========================================
+// The residual stream is fp32 [rows, hidden]; every GEMM input stays bf16. Nothing below rounds to bf16
+// except the norm outputs that feed a GEMM (the `out_normed` / rmsnorm outputs). The bf16 kernels above
+// are untouched and remain the R4DX_GEMMA_RESID=bf16 path.
+
+// out (fp32) = float(table row) * scale. A bf16 value times the bf16-representable scale (62.0 = 31 * 2)
+// is exact in fp32, so no rounding exists to skip or keep.
+__global__ __launch_bounds__(kThreads) void EmbeddingGatherScaledF32Kernel(
+    const __hip_bfloat16* __restrict__ table, const int32_t* __restrict__ ids, float* __restrict__ out,
+    int64_t hidden, int64_t vocab, float scale) {
+  const int64_t row = blockIdx.x;
+  int32_t id = ids[row];
+  if (id < 0 || id >= vocab) id = 0;
+  const __hip_bfloat16* src = table + static_cast<int64_t>(id) * hidden;
+  float* dst = out + row * hidden;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    dst[i] = __bfloat162float(src[i]) * scale;
+  }
+}
+
+// out (bf16) = bf16(x * rsqrt(mean(x^2) + eps) * w), x fp32. Not in place (different element types).
+__global__ __launch_bounds__(kThreads) void RmsNormPlainF32InKernel(const float* __restrict__ x,
+                                                                      const __hip_bfloat16* __restrict__ w,
+                                                                      __hip_bfloat16* __restrict__ out,
+                                                                      int64_t hidden, float eps) {
+  const int64_t row = blockIdx.x;
+  const float* xr = x + row * hidden;
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float v = xr[i];
+    ss += v * v;
+  }
+  ss = BlockReduceSum(ss);
+  const float rstd = rsqrtf(ss / static_cast<float>(hidden) + eps);
+  __hip_bfloat16* outr = out + row * hidden;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    outr[i] = __float2bfloat16(xr[i] * rstd * __bfloat162float(w[i]));
+  }
+}
+
+// PostnormResidualKernel with an fp32 residual: sum = res + y*rstd_y*w_post (fp32, unrounded), times
+// scalar when != 1, stored fp32; out_normed (bf16) is the next norm of the fp32 out_res. res and out_res
+// may alias (same thread reads then writes index i; pass 3 reads back this thread's own stores).
+__global__ __launch_bounds__(kThreads) void PostnormResidualF32Kernel(
+    const float* res, const __hip_bfloat16* __restrict__ y, const __hip_bfloat16* __restrict__ w_post,
+    const __hip_bfloat16* __restrict__ w_next, float* out_res, __hip_bfloat16* __restrict__ out_normed,
+    int64_t hidden, float eps, float scalar) {
+  const int64_t row = blockIdx.x;
+  const float* rr = res + row * hidden;
+  const __hip_bfloat16* yr = y + row * hidden;
+  float* orr = out_res + row * hidden;
+
+  float ssy = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    const float v = __bfloat162float(yr[i]);
+    ssy += v * v;
+  }
+  ssy = BlockReduceSum(ssy);
+  const float rstd_y = rsqrtf(ssy / static_cast<float>(hidden) + eps);
+
+  const bool scaled = scalar != 1.0f;
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    float sum = rr[i] + __bfloat162float(yr[i]) * rstd_y * __bfloat162float(w_post[i]);
+    if (scaled) sum = sum * scalar;
+    orr[i] = sum;
+    ss += sum * sum;
+  }
+  if (out_normed == nullptr) return;
+  ss = BlockReduceSum(ss);
+  const float rstd = rsqrtf(ss / static_cast<float>(hidden) + eps);
+  __hip_bfloat16* onr = out_normed + row * hidden;
+  for (int64_t i = threadIdx.x; i < hidden; i += kThreads) {
+    onr[i] = __float2bfloat16(orr[i] * rstd * __bfloat162float(w_next[i]));
+  }
+}
+
+__global__ __launch_bounds__(kThreads) void F32ToBf16Kernel(const float* __restrict__ x,
+                                                              __hip_bfloat16* __restrict__ out, int64_t n) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < n; i += stride) {
+    out[i] = __float2bfloat16(x[i]);
+  }
+}
+
 }  // namespace
 
 extern "C" {
+
+void r4dx_embedding_gather_scaled_f32(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,
+                                       int64_t vocab, float scale, int64_t stream) {
+  if (n <= 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(EmbeddingGatherScaledF32Kernel, dim3(static_cast<unsigned>(n)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const __hip_bfloat16*)table, (const int32_t*)ids, (float*)out,
+                     hidden, vocab, scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_rmsnorm_plain_f32in_bf16(int64_t x, int64_t weight, int64_t out, int64_t rows, int64_t hidden,
+                                    float eps, int64_t stream) {
+  if (rows <= 0 || hidden <= 0) return;
+  if (x == 0 || weight == 0 || out == 0) Fail("r4dx_rmsnorm_plain_f32in_bf16", "x, weight and out must be non-null");
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(RmsNormPlainF32InKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const float*)x, (const __hip_bfloat16*)weight, (__hip_bfloat16*)out,
+                     hidden, eps);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_gemma_postnorm_residual_rmsnorm_f32res(int64_t res, int64_t y, int64_t w_post, int64_t w_next,
+                                                  float eps, int64_t out_res, int64_t out_normed, float scalar,
+                                                  int64_t rows, int64_t hidden, int64_t stream) {
+  constexpr const char* kWho = "r4dx_gemma_postnorm_residual_rmsnorm_f32res";
+  if (rows <= 0 || hidden <= 0) return;
+  if (res == 0 || y == 0 || w_post == 0 || out_res == 0) {
+    Fail(kWho, "res, y, w_post and out_res must be non-null");
+  }
+  if ((out_normed == 0) != (w_next == 0)) {
+    Fail(kWho, "out_normed and w_next must be given together (or both null)");
+  }
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(PostnormResidualF32Kernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const float*)res, (const __hip_bfloat16*)y,
+                     (const __hip_bfloat16*)w_post, (const __hip_bfloat16*)w_next, (float*)out_res,
+                     (__hip_bfloat16*)out_normed, hidden, eps, scalar);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_f32_to_bf16(int64_t x, int64_t out, int64_t n, int64_t stream) {
+  if (n <= 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  int64_t blocks = (n + kThreads - 1) / kThreads;
+  if (blocks > 65535) blocks = 65535;
+  hipLaunchKernelGGL(F32ToBf16Kernel, dim3(static_cast<unsigned>(blocks)), dim3(kThreads), 0,
+                     (hipStream_t)stream, (const float*)x, (__hip_bfloat16*)out, n);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
 
 void r4dx_rope_proportional_bf16(int64_t q, int64_t k, int64_t pos, int tokens, int heads_q,
                                   int heads_k, int head_dim, int n_pairs, int freq_dim, float theta,

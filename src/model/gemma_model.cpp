@@ -35,6 +35,20 @@ float SummaryInvTemperature(const kernels::SampleParams& params) {
   return inv;
 }
 
+float Bf16ToF32(uint16_t b) {
+  const uint32_t u = static_cast<uint32_t>(b) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+uint16_t F32ToBf16(float f) {  // RNE, finite inputs
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u += 0x7FFFu + ((u >> 16) & 1u);
+  return static_cast<uint16_t>(u >> 16);
+}
+
 }  // namespace
 
 void ApplyGemmaEnv(GemmaModelOptions* o) {
@@ -46,6 +60,11 @@ void ApplyGemmaEnv(GemmaModelOptions* o) {
   }
   if (const char* e = std::getenv("R4DX_GEMMA_ATTN"); e != nullptr && *e != '\0') {
     o->attn = attention::ParseGemmaAttnBackend(e);
+  }
+  if (const char* e = std::getenv("R4DX_GEMMA_RESID"); e != nullptr && *e != '\0') {
+    if (std::strcmp(e, "fp32") == 0) o->resid = GemmaResid::kFp32;
+    else if (std::strcmp(e, "bf16") == 0) o->resid = GemmaResid::kBf16;
+    else throw std::invalid_argument(std::string("R4DX_GEMMA_RESID='") + e + "' (want fp32|bf16)");
   }
 }
 
@@ -74,7 +93,9 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   m.positions_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.ring_slots_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.seqused_dev_ = core::DeviceBuffer<int32_t>(1);
-  m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
+  // Residual stream: fp32 (4 B/elem, rows x hidden = 3.9 MB at 256 rows) by default, bf16 for A/B (R4DX_GEMMA_RESID).
+  if (opts.resid == GemmaResid::kFp32) m.buf_a32_ = core::DeviceBuffer<float>(static_cast<size_t>(rows * hidden));
+  else m.buf_a_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
   m.buf_normed_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(rows * hidden));
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(cfg.vocab_size));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
@@ -128,7 +149,8 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
             << (opts.kv == GemmaKvMode::kFp8 ? "fp8" : opts.kv == GemmaKvMode::kBf16Full ? "bf16 (full layers) + fp8 (sliding)" : "bf16")
             << " = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0)) << " GiB, attention "
             << (opts.attn == attention::GemmaAttnBackend::kReference ? "reference" : "libr4d (sliding) + reference (full)")
-            << (m.container_.HasRotation() ? ", rotated residual" : "") << "\n";
+            << (m.container_.HasRotation() ? ", rotated residual" : "") << ", residual "
+            << (opts.resid == GemmaResid::kFp32 ? "fp32" : "bf16") << "\n";
   return m;
 }
 
@@ -181,21 +203,29 @@ void GemmaModel::AttachFeatureCapture(std::vector<int64_t> layers) {
     if (i > 0 && layers[i] <= layers[i - 1]) throw std::invalid_argument("GemmaModel::AttachFeatureCapture: layers must be strictly ascending");
   }
   feature_layers_ = std::move(layers);
-  features_dev_.Resize(static_cast<size_t>(max_chunk_) * feature_layers_.size() * static_cast<size_t>(container_.Config().hidden_size));
+  const size_t feat_elems = static_cast<size_t>(max_chunk_) * feature_layers_.size() * static_cast<size_t>(container_.Config().hidden_size);
+  features_dev_.Resize(feat_elems);
+  if (opts_.resid == GemmaResid::kFp32) features_f32_.Resize(feat_elems);
   feature_rows_ = 0;
 }
 
 void GemmaModel::DetachFeatureCapture() {
   feature_layers_.clear();
   features_dev_.Resize(0);
+  features_f32_.Resize(0);
   feature_rows_ = 0;
 }
 
-void GemmaModel::RotateResidual(uint16_t* x, int64_t rows, bool inverse) {
+void GemmaModel::RotateResidual(void* x, int64_t rows, bool inverse) {
   if (!container_.HasRotation() || rows <= 0) return;
   const RotationWeights& r = container_.Rotation();
-  r4dx_rotate_residual_bf16(P(x), rows, container_.Config().hidden_size, P(r.signs.data()), P(r.mix5.data()),
-                            inverse ? 1 : 0, P(stream_.get()));
+  if (opts_.resid == GemmaResid::kFp32) {
+    r4dx_rotate_residual_f32(P(x), rows, container_.Config().hidden_size, P(r.signs.data()), P(r.mix5.data()),
+                             inverse ? 1 : 0, P(stream_.get()));
+  } else {
+    r4dx_rotate_residual_bf16(P(x), rows, container_.Config().hidden_size, P(r.signs.data()), P(r.mix5.data()),
+                              inverse ? 1 : 0, P(stream_.get()));
+  }
 }
 
 void GemmaModel::UploadChunkMeta(int64_t start_pos, int64_t T) {
@@ -210,7 +240,7 @@ void GemmaModel::UploadChunkMeta(int64_t start_pos, int64_t T) {
 
 // One decoder layer over `cur` (the residual stream, updated in place) whose input_layernorm output `normed` is
 // already computed. Leaves the NEXT layer's input norm in `normed` when has_next.
-void GemmaModel::RunLayer(int64_t i, uint16_t* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
+void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
                           SpanAccumulator* prof) {
   const GemmaConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
@@ -221,8 +251,11 @@ void GemmaModel::RunLayer(int64_t i, uint16_t* cur, uint16_t* normed, int64_t T,
   const RotationWeights* rot = rotated ? &container_.Rotation() : nullptr;
   const bool rot_had = rotated && rot->spec.Hadamard();
   const GemmaLayerWeights& lw = container_.Layer(i);
-  const auto plain_norm = [&](const uint16_t* x, const uint16_t* w, uint16_t* out) {
-    r4dx_rmsnorm_plain_bf16(P(x), P(w), P(out), T, hidden, eps, 0, s);
+  const bool f32 = opts_.resid == GemmaResid::kFp32;
+  // Pre-norms read the residual (fp32 or bf16) and emit the bf16 GEMM input.
+  const auto plain_norm = [&](const void* x, const uint16_t* w, uint16_t* out) {
+    if (f32) r4dx_rmsnorm_plain_f32in_bf16(P(x), P(w), P(out), T, hidden, eps, s);
+    else r4dx_rmsnorm_plain_bf16(P(x), P(w), P(out), T, hidden, eps, 0, s);
   };
 
   // ---- attention half ----
@@ -243,9 +276,18 @@ void GemmaModel::RunLayer(int64_t i, uint16_t* cur, uint16_t* normed, int64_t T,
                                         s_raw, prof);
   ProfiledCall(prof, s_raw, "layer.post_attn", [&] {
     if (rotated) {
-      r4dx_post_rmsnorm_rotate_add_bf16(P(cur), P(o_out), P(lw.post_attention_layernorm.data()), P(rot->signs.data()),
-                                        P(rot->mix5.data()), T, hidden, eps, 1.0f, s);
+      if (f32) {
+        r4dx_post_rmsnorm_rotate_add_f32res(P(cur), P(o_out), P(lw.post_attention_layernorm.data()), P(rot->signs.data()),
+                                            P(rot->mix5.data()), T, hidden, eps, 1.0f, s);
+      } else {
+        r4dx_post_rmsnorm_rotate_add_bf16(P(cur), P(o_out), P(lw.post_attention_layernorm.data()), P(rot->signs.data()),
+                                          P(rot->mix5.data()), T, hidden, eps, 1.0f, s);
+      }
       plain_norm(cur, lw.pre_feedforward_layernorm.data(), normed);
+    } else if (f32) {
+      r4dx_gemma_postnorm_residual_rmsnorm_f32res(P(cur), P(o_out), P(lw.post_attention_layernorm.data()),
+                                                  P(lw.pre_feedforward_layernorm.data()), eps, P(cur), P(normed),
+                                                  1.0f, T, hidden, s);
     } else {
       // h = h + post_attention_layernorm(o); normed = pre_feedforward_layernorm(h). scalar 1.0: layer_scalar
       // is applied once, after the MLP residual add.
@@ -261,9 +303,19 @@ void GemmaModel::RunLayer(int64_t i, uint16_t* cur, uint16_t* normed, int64_t T,
   mlp.Forward(stream_, arena_, normed, mlp_out, T, prof);
   ProfiledCall(prof, s_raw, "layer.post_mlp", [&] {
     if (rotated) {
-      r4dx_post_rmsnorm_rotate_add_bf16(P(cur), P(mlp_out), P(lw.post_feedforward_layernorm.data()), P(rot->signs.data()),
-                                        P(rot->mix5.data()), T, hidden, eps, lw.layer_scalar, s);
+      if (f32) {
+        r4dx_post_rmsnorm_rotate_add_f32res(P(cur), P(mlp_out), P(lw.post_feedforward_layernorm.data()), P(rot->signs.data()),
+                                            P(rot->mix5.data()), T, hidden, eps, lw.layer_scalar, s);
+      } else {
+        r4dx_post_rmsnorm_rotate_add_bf16(P(cur), P(mlp_out), P(lw.post_feedforward_layernorm.data()), P(rot->signs.data()),
+                                          P(rot->mix5.data()), T, hidden, eps, lw.layer_scalar, s);
+      }
       if (has_next) plain_norm(cur, container_.Layer(i + 1).input_layernorm.data(), normed);
+    } else if (f32) {
+      r4dx_gemma_postnorm_residual_rmsnorm_f32res(
+          P(cur), P(mlp_out), P(lw.post_feedforward_layernorm.data()),
+          has_next ? P(container_.Layer(i + 1).input_layernorm.data()) : 0, eps, P(cur), has_next ? P(normed) : 0,
+          lw.layer_scalar, T, hidden, s);
     } else {
       // h = (h + post_feedforward_layernorm(m)) * layer_scalar; normed = next layer's input_layernorm(h).
       r4dx_gemma_postnorm_residual_rmsnorm_bf16(
@@ -283,15 +335,33 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
     throw std::invalid_argument("GemmaModel::DebugLayerForward: x_rows must be [T, hidden] with T <= prefill_chunk");
   }
   stream_.Synchronize();
-  buf_a_.CopyFromHost(x_rows.data(), x_rows.size());
+  const bool f32 = opts_.resid == GemmaResid::kFp32;
+  void* cur = f32 ? static_cast<void*>(buf_a32_.data()) : static_cast<void*>(buf_a_.data());
+  if (f32) {
+    std::vector<float> xf(x_rows.size());
+    for (size_t k = 0; k < xf.size(); ++k) xf[k] = Bf16ToF32(x_rows[k]);
+    buf_a32_.CopyFromHost(xf.data(), xf.size());
+  } else {
+    buf_a_.CopyFromHost(x_rows.data(), x_rows.size());
+  }
   UploadChunkMeta(start_pos, T);
   const GemmaLayerWeights& lw = container_.Layer(layer);
-  r4dx_rmsnorm_plain_bf16(P(buf_a_.data()), P(lw.input_layernorm.data()), P(buf_normed_.data()), T, hidden,
-                          static_cast<float>(container_.Config().rms_norm_eps), 0, P(stream_.get()));
-  RunLayer(layer, buf_a_.data(), buf_normed_.data(), T, start_pos, /*has_next=*/false, nullptr);
+  const float eps = static_cast<float>(container_.Config().rms_norm_eps);
+  if (f32) {
+    r4dx_rmsnorm_plain_f32in_bf16(P(cur), P(lw.input_layernorm.data()), P(buf_normed_.data()), T, hidden, eps, P(stream_.get()));
+  } else {
+    r4dx_rmsnorm_plain_bf16(P(cur), P(lw.input_layernorm.data()), P(buf_normed_.data()), T, hidden, eps, 0, P(stream_.get()));
+  }
+  RunLayer(layer, cur, buf_normed_.data(), T, start_pos, /*has_next=*/false, nullptr);
   stream_.Synchronize();
   std::vector<uint16_t> out(x_rows.size());
-  buf_a_.CopyToHost(out.data(), out.size());
+  if (f32) {
+    std::vector<float> of(x_rows.size());
+    buf_a32_.CopyToHost(of.data(), of.size());
+    for (size_t k = 0; k < of.size(); ++k) out[k] = F32ToBf16(of[k]);  // the layer output, rounded once for the API
+  } else {
+    buf_a_.CopyToHost(out.data(), out.size());
+  }
   return out;
 }
 std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
@@ -318,20 +388,28 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   // ---- scaled embedding gather (device table, always) ---------------------------------------------------
   std::copy(token_ids.begin(), token_ids.end(), ids_host_.data());
   ids_dev_.CopyFromHostAsync(ids_host_.data(), static_cast<size_t>(T), stream_);
+  const bool f32 = opts_.resid == GemmaResid::kFp32;
+  void* cur = f32 ? static_cast<void*>(buf_a32_.data()) : static_cast<void*>(buf_a_.data());
   ProfiledCall(prof, s_raw, "embed", [&] {
-    r4dx_embedding_gather_scaled_bf16(P(container_.EmbedTokensDevice().data()), P(ids_dev_.data()), P(buf_a_.data()), T,
-                                      hidden, cfg.vocab_size, cfg.EmbedScale(), s);
+    if (f32) {
+      r4dx_embedding_gather_scaled_f32(P(container_.EmbedTokensDevice().data()), P(ids_dev_.data()), P(cur), T, hidden,
+                                       cfg.vocab_size, cfg.EmbedScale(), s);
+    } else {
+      r4dx_embedding_gather_scaled_bf16(P(container_.EmbedTokensDevice().data()), P(ids_dev_.data()), P(cur), T,
+                                        hidden, cfg.vocab_size, cfg.EmbedScale(), s);
+    }
   });
   // Residual rotation: x Q after the (text-row) scale, before layer 0 (docs/gemma4-plan.md 4.4).
-  if (rotated) ProfiledCall(prof, s_raw, "rotate.entry", [&] { RotateResidual(buf_a_.data(), T, false); });
+  if (rotated) ProfiledCall(prof, s_raw, "rotate.entry", [&] { RotateResidual(cur, T, false); });
 
   // ---- per-chunk metadata (the device is idle here: the previous call ended synchronized) ------------------
   UploadChunkMeta(pos_, T);
 
-  uint16_t* cur = buf_a_.data();
   uint16_t* normed = buf_normed_.data();
-  const auto plain_norm = [&](const uint16_t* x, const uint16_t* w, uint16_t* out) {
-    r4dx_rmsnorm_plain_bf16(P(x), P(w), P(out), T, hidden, eps, 0, s);
+  const size_t elem = f32 ? sizeof(float) : sizeof(uint16_t);
+  const auto plain_norm = [&](const void* x, const uint16_t* w, uint16_t* out) {
+    if (f32) r4dx_rmsnorm_plain_f32in_bf16(P(x), P(w), P(out), T, hidden, eps, s);
+    else r4dx_rmsnorm_plain_bf16(P(x), P(w), P(out), T, hidden, eps, 0, s);
   };
   const auto capture_layer_input = [&](int64_t layer) {
     if (!capture) return;
@@ -339,8 +417,11 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
     if (it == feature_layers_.end()) return;
     const int64_t col = std::distance(feature_layers_.begin(), it);
     const int64_t ncols = static_cast<int64_t>(feature_layers_.size());
-    R4DX_HIP_CHECK(hipMemcpy2DAsync(features_dev_.data() + col * hidden, static_cast<size_t>(ncols * hidden) * 2, cur,
-                                    static_cast<size_t>(hidden) * 2, static_cast<size_t>(hidden) * 2,
+    // fp32 mode stages the capture in fp32 (rotated basis); it is un-rotated and narrowed once after the last layer.
+    void* dst = f32 ? static_cast<void*>(features_f32_.data() + col * hidden)
+                    : static_cast<void*>(features_dev_.data() + col * hidden);
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(dst, static_cast<size_t>(ncols * hidden) * elem, cur,
+                                    static_cast<size_t>(hidden) * elem, static_cast<size_t>(hidden) * elem,
                                     static_cast<size_t>(T), hipMemcpyDeviceToDevice, s_raw));
   };
 
@@ -356,16 +437,23 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   // Residual rotation exit: x Q^T before the final norm (and on the captured features).
   if (rotated) {
     ProfiledCall(prof, s_raw, "rotate.exit", [&] { RotateResidual(cur, T, true); });
-    if (capture) RotateResidual(features_dev_.data(), T * static_cast<int64_t>(feature_layers_.size()), true);
+    if (capture) {
+      RotateResidual(f32 ? static_cast<void*>(features_f32_.data()) : static_cast<void*>(features_dev_.data()),
+                     T * static_cast<int64_t>(feature_layers_.size()), true);
+    }
+  }
+  if (capture && f32) {
+    r4dx_f32_to_bf16(P(features_f32_.data()), P(features_dev_.data()),
+                     T * static_cast<int64_t>(feature_layers_.size()) * hidden, s);
   }
 
   // ---- final norm + tied lm_head + softcap on the LAST row only ----------------------------------------------
   if (want_logits) {
-    const uint16_t* last = cur + (T - 1) * hidden;
+    const char* last = static_cast<const char*>(cur) + (T - 1) * hidden * static_cast<int64_t>(elem);
     uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(hidden), 16);
     uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(cfg.vocab_size), 16);
     ProfiledCall(prof, s_raw, "final_norm", [&] {
-      r4dx_rmsnorm_plain_bf16(P(last), P(container_.FinalNorm().data()), P(xn), 1, hidden, eps, 0, s);
+      plain_norm(last, container_.FinalNorm().data(), xn);
     });
     ProfiledCall(prof, s_raw, "gemm:lm_head", [&] { ApplyLinear(stream_, arena_, container_.LmHead(), xn, logits_bf16, 1); });
     ProfiledCall(prof, s_raw, "lm_head.softcap", [&] {

@@ -48,6 +48,14 @@ using TokenId = int32_t;
 // tokenizer_config.json has `bos_token: null`, `add_bos_token: false`).
 constexpr TokenId kNoToken = -1;
 
+// Which tokenizer.json shape was loaded (selected automatically from the file, not by a flag).
+//   kByteLevelRegex: Qwen-style GPT-2 byte-level BPE with a regex pre-tokenizer (everything above).
+//   kSpmByteFallback: Gemma-style SentencePiece-like BPE: normalizer Replace(" " -> U+2581), no
+//     regex split, `byte_fallback` (<0xNN> tokens for codepoints missing from the vocab), decoder
+//     Replace(U+2581 -> " ") + ByteFallback + Fuse, no NFC and no automatic BOS. The loader
+//     accepts exactly that shape and throws on any deviation.
+enum class TokenizerKind { kByteLevelRegex, kSpmByteFallback };
+
 // Load-time behavior toggles for Tokenizer::from_directory()/from_files(). Defaults reproduce the
 // checkpoint's own on-disk declarations, not transformers 5.17.0's runtime behavior where the two
 // disagree (see the file comment above `class Tokenizer` for why that disagreement is a
@@ -70,6 +78,14 @@ struct TokenizerOptions {
     // load anyway, accepting that text mixing decomposed Unicode sequences will silently
     // mis-tokenize relative to the reference tokenizer.
     bool allow_unimplemented_normalizer = false;
+
+    // Surface texts of special added tokens that decode() / StreamDecoder keep (render as their
+    // literal text) even when skip_special_tokens=true. Empty (default) = skip every special.
+    // Gemma 4 sets "<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|\"|>": all 24 of
+    // its added tokens are flagged special, so a plain skip would erase the reasoning / tool-call
+    // markers before the server's splitter and parser ever see them. Each text must name a special
+    // added token or loading throws.
+    std::vector<std::string> keep_special_on_decode;
 };
 
 // Byte-level BPE tokenizer. Thread-safe for concurrent encode()/decode() calls on the same
@@ -85,6 +101,9 @@ public:
     Tokenizer& operator=(const Tokenizer&) = delete;
 
     using Options = TokenizerOptions;
+    using Kind = TokenizerKind;
+
+    Kind kind() const;
 
     // Loads `<model_dir>/tokenizer.json` (required) plus `tokenizer_config.json` and
     // `generation_config.json` from the same directory if present (used for bos/eos/pad ids and

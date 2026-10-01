@@ -8,7 +8,7 @@
 //      types are what a container actually carries) parse, with the right tensor list and lengths.
 //   3. Every refusal: unknown kinds (including the design draft's "hadamard1024x5"), missing or
 //      mistyped fields, geometry other than the contract's, a model shape the kernels cannot serve.
-//   4. TP=2: signs/mix5 replicate; each q2ab sign vector's rank range is EXACTLY the K range of the
+//   5. Gemma 4 option A (hidden 3840 = 15 x 256, out_fold had_only, no gdn_out, had.o_full): parse,\n//      tensor list, the Qwen loader's refusal, and every refusal specific to it.\n//   4. TP=2: signs/mix5 replicate; each q2ab sign vector's rank range is EXACTLY the K range of the
 //      linear whose input it rotates, a whole number of Hadamard blocks, and as long as
 //      RotationTensors says the rank config needs (what LoadRotationWeights checks after the upload).
 #include <cstdio>
@@ -177,6 +177,116 @@ void TestParse() {
   }
 }
 
+// Gemma 4 (docs/gemma4-plan.md 4.4, option A): hidden 3840 = 15 x 256, post-norm rotate, no GDN, two o sites.
+ModelConfig GemmaConfig() {
+  ModelConfig c;
+  c.hidden_size = 3840;
+  c.num_hidden_layers = 48;
+  c.num_attention_heads = 16;
+  c.num_key_value_heads = 8;
+  c.head_dim = 256;
+  c.intermediate_size = 15360;
+  c.vocab_size = 262144;
+  return c;
+}
+
+const char* kGemmaQ2ab = R"({"rotation": {"kind": "q2ab", "seed": 1592598565, "hidden": 3840,
+                                          "block": 256, "nblk": 15, "out_fold": "had_only",
+                                          "had": {"down": 512, "o": 256, "o_full": 256}}})";
+const char* kGemmaQ2a = R"({"rotation": {"kind": "q2a", "seed": 7, "hidden": 3840, "block": 256,
+                                         "nblk": 15, "out_fold": "had_only"}})";
+
+void TestGemma() {
+  const ModelConfig g = GemmaConfig();
+  const auto parse = [&](const nlohmann::json& m, bool allow = true) {
+    return ParseRotationMetadata(m, g, "gemma.r4dx", allow, 512);
+  };
+  Check(RotationBlockFor(5120) == 1024 && RotationBlockFor(3840) == 256 && RotationBlockFor(768) == 256 &&
+            RotationBlockFor(4096) == 1024 && RotationBlockFor(0) == 0,
+        "RotationBlockFor: 5120 -> 1024, 3840 -> 256, 768 -> 256, 4096 -> 1024 (cap)");
+
+  const auto ab = parse(nlohmann::json::parse(kGemmaQ2ab));
+  Check(ab && ab->Hadamard() && ab->post_norm_rotate && ab->hidden == 3840 && ab->block == 256 &&
+            ab->nblk == 15 && !ab->has_gdn_out && ab->has_o_full && std::string(ab->MixName()) == "rotation.mix",
+        "Gemma q2ab parses: 15 x 256, option A, no gdn_out, o_full, rotation.mix");
+  if (ab) {
+    const auto t = RotationTensors(*ab, g, 16 * 512);
+    Check(t.size() == 5 && std::string(t[0].name) == "rotation.signs" && t[0].elems == 3840 &&
+              std::string(t[1].name) == "rotation.mix" && t[1].elems == 225 &&
+              std::string(t[2].name) == "rotation.had_down_signs" && t[2].elems == 15360 &&
+              std::string(t[3].name) == "rotation.had_o_signs" && t[3].elems == 4096 &&
+              std::string(t[4].name) == "rotation.had_o_full_signs" && t[4].elems == 8192,
+          "Gemma q2ab tensors: signs 3840, mix 225, down 15360, o 4096, o_full 8192");
+  }
+  const auto a = parse(nlohmann::json::parse(kGemmaQ2a));
+  Check(a && !a->Hadamard() && a->post_norm_rotate && RotationTensors(*a, g).size() == 2,
+        "Gemma q2a parses (signs + mix only, still option A)");
+
+  // The Qwen loader's default refuses option A outright.
+  bool refused_by_default = false;
+  try {
+    ParseRotationMetadata(nlohmann::json::parse(kGemmaQ2ab), g, "gemma.r4dx");
+  } catch (const std::runtime_error& e) {
+    refused_by_default = std::string(e.what()).find("option A") != std::string::npos;
+  }
+  Check(refused_by_default, "default (Qwen) loader refuses out_fold had_only, naming option A");
+
+  const auto with = [&](const char* base, const std::function<void(nlohmann::json&)>& edit) {
+    nlohmann::json j = nlohmann::json::parse(base);
+    edit(j["rotation"]);
+    return j;
+  };
+  const auto refuses = [&](const char* what, const nlohmann::json& m) {
+    bool t = false;
+    try {
+      parse(m);
+    } catch (const std::runtime_error&) {
+      t = true;
+    }
+    Check(t, std::string("Gemma refuses: ") + what);
+  };
+  refuses("block 512 for hidden 3840", with(kGemmaQ2ab, [](nlohmann::json& r) { r["block"] = 512; }));
+  refuses("block 128 for hidden 3840", with(kGemmaQ2ab, [](nlohmann::json& r) { r["block"] = 128; }));
+  refuses("nblk 5", with(kGemmaQ2ab, [](nlohmann::json& r) { r["nblk"] = 5; }));
+  refuses("no nblk (only 5 blocks may omit it)", with(kGemmaQ2ab, [](nlohmann::json& r) { r.erase("nblk"); }));
+  refuses("out_fold other than had_only", with(kGemmaQ2ab, [](nlohmann::json& r) { r["out_fold"] = "q"; }));
+  refuses("numeric out_fold", with(kGemmaQ2ab, [](nlohmann::json& r) { r["out_fold"] = 1; }));
+  refuses("option A with gdn_out", with(kGemmaQ2ab, [](nlohmann::json& r) { r["had"]["gdn_out"] = 128; }));
+  refuses("option A without o_full", with(kGemmaQ2ab, [](nlohmann::json& r) { r["had"].erase("o_full"); }));
+  refuses("o_full 512", with(kGemmaQ2ab, [](nlohmann::json& r) { r["had"]["o_full"] = 512; }));
+  refuses("hidden 3840 container on a 5120 model", with(kGemmaQ2ab, [](nlohmann::json& r) { r["hidden"] = 5120; }));
+  refuses("nblk above 32 (hidden 64 * 40)", with(kGemmaQ2a, [](nlohmann::json& r) {
+            r["hidden"] = 64 * 40;
+            r["block"] = 64;
+            r["nblk"] = 40;
+          }));
+  {
+    ModelConfig hd = g;
+    hd.head_dim = 128;
+    bool t = false;
+    try {
+      ParseRotationMetadata(nlohmann::json::parse(kGemmaQ2ab), hd, "g", true, 512);
+    } catch (const std::runtime_error&) {
+      t = true;
+    }
+    Check(t, "Gemma q2ab refuses head_dim != 256");
+  }
+  // o_full on a Qwen (non-option-A) q2ab block is refused.
+  {
+    nlohmann::json j = nlohmann::json::parse(kQ2ab);
+    j["rotation"]["had"]["o_full"] = 256;
+    Check(Refuses(j, RealConfig()), "Qwen q2ab refuses a had.o_full block");
+  }
+  // Qwen's own mix tensor name / geometry through the generalized spec is unchanged.
+  const auto q = ParseRotationMetadata(nlohmann::json::parse(kQ2ab), RealConfig(), "q");
+  Check(q && q->nblk == 5 && q->block == 1024 && std::string(q->MixName()) == "rotation.mix5" &&
+            !q->post_norm_rotate && q->has_gdn_out && !q->has_o_full,
+        "Qwen q2ab: nblk 5, rotation.mix5, not option A, gdn_out present");
+  // an explicit, consistent nblk 5 is also fine for Qwen
+  nlohmann::json explicit5 = nlohmann::json::parse(kQ2a);
+  explicit5["rotation"]["nblk"] = 5;
+  Check(!Refuses(explicit5, RealConfig()), "Qwen metadata with an explicit nblk 5 is accepted");
+}
 void TestTpSlices() {
   using namespace r4dx::model::tp;
   const ModelConfig g = RealConfig();
@@ -219,6 +329,7 @@ void TestTpSlices() {
 
 int main() {
   TestParse();
+  TestGemma();
   TestTpSlices();
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

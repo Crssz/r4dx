@@ -9,7 +9,7 @@
 //   3. Q and Hb preserve norms, Q^T / Hb^T invert them.
 //   4. TP slicing: a rank's K-slice of h Hb equals the slice of the full-K result (block-aligned
 //      halves never share a Hadamard block), which is what lets a rank use its own sign slice.
-// No GPU, no container: always on.
+//   5. Any hidden = nblk * block (ApplyQGeneral, PostNormRotateAddRef): Gemma 4's 3840 = 15 x 256 and\n//      others, against the same closed form; ApplyQGeneral(5120) == ApplyQ.\n// No GPU, no container: always on.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -149,6 +149,79 @@ void CheckTpSlices(std::mt19937_64& rng) {
   }
 }
 
+// Any hidden = nblk * block (docs/gemma4-plan.md 4.4): ApplyQGeneral at (5120, 1024) is ApplyQ, at
+// Gemma's (3840, 256 x 15) and a few other shapes it matches the closed form on sampled rows, is norm
+// preserving and inverts; PostNormRotateAddRef is its three pieces composed.
+void CheckGeneralHidden(std::mt19937_64& rng, const std::vector<float>& d5120, const std::vector<float>& R5) {
+  {
+    const std::vector<double> x = RandomVec(rng, rotation_ref::kHidden);
+    Check(MaxAbsDiff(rotation_ref::ApplyQGeneral(x, 1024, d5120.data(), R5.data(), false),
+                     rotation_ref::ApplyQ(x, d5120.data(), R5.data(), false)) < 1e-12,
+          "ApplyQGeneral(5120, 1024) != ApplyQ");
+    Check(MaxAbsDiff(rotation_ref::ApplyQGeneral(x, 1024, d5120.data(), R5.data(), true),
+                     rotation_ref::ApplyQ(x, d5120.data(), R5.data(), true)) < 1e-12,
+          "ApplyQGeneral(5120, 1024, inverse) != ApplyQ inverse");
+  }
+  Check(rotation_ref::ChooseBlock(5120) == 1024 && rotation_ref::ChooseBlock(3840) == 256 &&
+            rotation_ref::ChooseBlock(768) == 256 && rotation_ref::ChooseBlock(1280) == 256 &&
+            rotation_ref::ChooseBlock(4096) == 1024 && rotation_ref::ChooseBlock(1024) == 1024,
+        "ChooseBlock table");
+  for (int64_t hidden : {3840, 768, 1280, 4096, 1024, 48}) {
+    const int64_t block = rotation_ref::ChooseBlock(hidden);
+    const int64_t nblk = hidden / block;
+    const std::vector<float> d = rotation_ref::RandomSigns(rng, hidden);
+    const std::vector<float> R = rotation_ref::RandomOrthogonal(rng, static_cast<int>(nblk));
+    const std::string tag = "hidden " + std::to_string(hidden) + " (" + std::to_string(nblk) + " x " +
+                            std::to_string(block) + ")";
+    // closed form Q[c*B+i][b*B+j] = d[c*B+i] (-1)^popcount(i&j) / sqrt(B) R[c][b], sampled rows
+    double err = 0.0;
+    for (int64_t k : {int64_t{0}, int64_t{1}, block - 1, block, hidden / 2 + 3, hidden - 1}) {
+      if (k < 0 || k >= hidden) continue;
+      std::vector<double> e(static_cast<size_t>(hidden), 0.0);
+      e[static_cast<size_t>(k)] = 1.0;
+      const std::vector<double> row = rotation_ref::ApplyQGeneral(e, block, d.data(), R.data(), false);
+      const int64_t c = k / block, i = k % block;
+      for (int64_t b = 0; b < nblk; ++b)
+        for (int64_t j = 0; j < block; ++j) {
+          const double want = static_cast<double>(d[k]) * ((Popcount(i & j) & 1) ? -1.0 : 1.0) /
+                              std::sqrt(static_cast<double>(block)) *
+                              static_cast<double>(R[c * nblk + b]);
+          err = std::fmax(err, std::fabs(row[b * block + j] - want));
+        }
+    }
+    Check(err < 1e-12, tag + ": ApplyQGeneral rows != closed form, max err " + std::to_string(err));
+    const std::vector<double> x = RandomVec(rng, hidden);
+    const std::vector<double> y = rotation_ref::ApplyQGeneral(x, block, d.data(), R.data(), false);
+    Check(std::fabs(Norm(y) / Norm(x) - 1.0) < 1e-6, tag + ": ||x Q|| != ||x||");
+    Check(MaxAbsDiff(rotation_ref::ApplyQGeneral(y, block, d.data(), R.data(), true), x) < 1e-5,
+          tag + ": x Q Q^T != x");
+
+    // PostNormRotateAddRef == resid + Q(norm(y) * w), scaled
+    const std::vector<double> resid = RandomVec(rng, hidden), yy = RandomVec(rng, hidden);
+    std::vector<double> w = RandomVec(rng, hidden);
+    for (auto& v : w) v = 1.0 + 0.3 * v;
+    const double eps = 1e-6, ls = 0.7;
+    double ss = 0.0;
+    for (double v : yy) ss += v * v;
+    std::vector<double> normed(static_cast<size_t>(hidden));
+    for (int64_t k = 0; k < hidden; ++k)
+      normed[k] = yy[k] / std::sqrt(ss / static_cast<double>(hidden) + eps) * w[k];
+    std::vector<double> want = rotation_ref::ApplyQGeneral(normed, block, d.data(), R.data(), false);
+    for (int64_t k = 0; k < hidden; ++k) want[k] = (resid[k] + want[k]) * ls;
+    Check(MaxAbsDiff(rotation_ref::PostNormRotateAddRef(resid, yy, w, block, d.data(), R.data(), eps, ls),
+                     want) < 1e-12,
+          tag + ": PostNormRotateAddRef != its pieces");
+    // option A identity: Q^T of the fused result == (resid Q^T + norm(y) w) * scale, i.e. the add
+    // happens in the original basis.
+    const std::vector<double> rq = rotation_ref::ApplyQGeneral(resid, block, d.data(), R.data(), false);
+    const std::vector<double> fused = rotation_ref::PostNormRotateAddRef(rq, yy, w, block, d.data(), R.data(), eps, ls);
+    std::vector<double> orig(static_cast<size_t>(hidden));
+    for (int64_t k = 0; k < hidden; ++k) orig[k] = (resid[k] + normed[k]) * ls;
+    Check(MaxAbsDiff(rotation_ref::ApplyQGeneral(fused, block, d.data(), R.data(), true), orig) < 1e-5,
+          tag + ": Q^T(fused(r Q, y)) != (r + norm(y) w) * scale");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -173,6 +246,7 @@ int main() {
   CheckQClosedForm(d, R);
   CheckNormsAndInverses(rng, d, R);
   CheckTpSlices(rng);
+  CheckGeneralHidden(rng, d, R);
 
   if (g_failures == 0) {
     std::printf("PASS (%d checks)\n", g_checks);

@@ -553,12 +553,21 @@ RotationWeights LoadRotationWeights(const SafetensorsReader& r, const RotationSp
   const std::vector<RotationTensor> want_local = RotationTensors(spec, local);
   RotationWeights w;
   w.spec = spec;
-  // RotationTensors' order: signs, mix5, then (q2ab) had_down, had_o, had_gdn_out.
-  core::DeviceBuffer<float>* const dst[] = {&w.signs, &w.mix5, &w.had_down_signs, &w.had_o_signs,
-                                            &w.had_gdn_out_signs};
+  // Destination per tensor name (RotationTensors' list is signs, mix, then the q2ab sign vectors the
+  // spec carries; the mix tensor is rotation.mix5 or rotation.mix by nblk).
+  const auto dest = [&w](const std::string& name) -> core::DeviceBuffer<float>* {
+    if (name == kRotationSigns) return &w.signs;
+    if (name == kRotationMix5 || name == kRotationMix) return &w.mix5;
+    if (name == kRotationHadDownSigns) return &w.had_down_signs;
+    if (name == kRotationHadOSigns) return &w.had_o_signs;
+    if (name == kRotationHadGdnOutSigns) return &w.had_gdn_out_signs;
+    if (name == kRotationHadOFullSigns) return &w.had_o_full_signs;
+    throw std::logic_error("LoadRotationWeights: no destination for '" + name + "'");
+  };
   const std::string kind = RotationKindName(spec.kind);
   for (size_t i = 0; i < want.size(); ++i) {
     const std::string name = want[i].name;
+    core::DeviceBuffer<float>* const dst_i = dest(name);
     if (!r.Has(name)) {
       throw std::runtime_error("r4dx::model::Container: " + path + " has __metadata__.rotation kind " +
                                kind + " but no tensor '" + name + "'");
@@ -571,13 +580,16 @@ RotationWeights LoadRotationWeights(const SafetensorsReader& r, const RotationSp
     }
     std::vector<float> host(static_cast<size_t>(n));
     std::memcpy(host.data(), r.Data(name), static_cast<size_t>(n) * sizeof(float));
-    if (name == kRotationMix5) {
-      for (int a = 0; a < 5; ++a) {
-        for (int b = 0; b < 5; ++b) {
+    if (name == kRotationMix5 || name == kRotationMix) {
+      const int64_t nb = spec.nblk;
+      for (int64_t a = 0; a < nb; ++a) {
+        for (int64_t b = 0; b < nb; ++b) {
           double dot = 0.0;
-          for (int k = 0; k < 5; ++k) dot += static_cast<double>(host[a * 5 + k]) * host[b * 5 + k];
+          for (int64_t k = 0; k < nb; ++k) {
+            dot += static_cast<double>(host[a * nb + k]) * host[b * nb + k];
+          }
           if (!(std::fabs(dot - (a == b ? 1.0 : 0.0)) <= 1e-5)) {
-            throw std::runtime_error("r4dx::model::Container: rotation.mix5 in " + path +
+            throw std::runtime_error("r4dx::model::Container: " + name + " in " + path +
                                      " is not orthogonal (R R^T deviates from I by more than 1e-5)");
           }
         }
@@ -592,10 +604,10 @@ RotationWeights LoadRotationWeights(const SafetensorsReader& r, const RotationSp
         }
       }
     }
-    *dst[i] = upload(name);
-    if (static_cast<int64_t>(dst[i]->size()) != want_local[i].elems) {
+    *dst_i = upload(name);
+    if (static_cast<int64_t>(dst_i->size()) != want_local[i].elems) {
       throw std::logic_error("r4dx::model::Container: this rank's slice of '" + name + "' has " +
-                             std::to_string(dst[i]->size()) + " elements, the rank config needs " +
+                             std::to_string(dst_i->size()) + " elements, the rank config needs " +
                              std::to_string(want_local[i].elems));
     }
   }

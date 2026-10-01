@@ -134,7 +134,9 @@ struct MtpWeights {
 struct RotationWeights {
   RotationSpec spec;
   core::DeviceBuffer<float> signs;  // fp32 [hidden] (+-1): Q's diagonal D. Replicated under TP
-  core::DeviceBuffer<float> mix5;   // fp32 [25], R[c][b] at c*5 + b. Replicated under TP
+  // fp32 [nblk * nblk], R[c][b] at c*nblk + b (rotation.mix5 when nblk == 5, rotation.mix otherwise;
+  // the member keeps its historical name). Replicated under TP
+  core::DeviceBuffer<float> mix5;
   // q2ab only; empty (data() == nullptr) for q2a. Under tensor parallelism each is this RANK's
   // slice, cut with exactly the K range the slicer gives the matching linear's columns (tp::RuleFor's
   // rotation.* rules), so a kernel indexes it with the rank-local column: [Config().intermediate_size]
@@ -142,6 +144,7 @@ struct RotationWeights {
   core::DeviceBuffer<float> had_down_signs;
   core::DeviceBuffer<float> had_o_signs;
   core::DeviceBuffer<float> had_gdn_out_signs;
+  core::DeviceBuffer<float> had_o_full_signs;  // Gemma 4 option A only (spec.has_o_full)
 };
 
 // Every Container::Load knob in one struct (docs/tp.md 3.3). The positional Load below forwards to

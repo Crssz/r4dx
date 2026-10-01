@@ -143,8 +143,18 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
                                   "rank's options itself");
     }
   }
-  // The Gemma option mapping (R4DX_GEMMA_* environment, MTP / DFlash refused) -- the same one TP=1 runs.
+  // DFlash and vision are TP=1-only for Gemma 4 (this facade's DFlash methods throw and HasVision() is false). Refuse
+  // them here: MakeGemmaModelOptions forwards both, and every rank would otherwise load a drafter / the vision tensors
+  // it can never use and fail per request instead of at load.
+  if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0) {
+    throw std::invalid_argument("GemmaTpModel::Load: DFlash is not available for Gemma 4 under --tp 2 (use --tp 1)");
+  }
+  if (opts.vision == ModelOptions::VisionMode::kOn) {
+    throw std::invalid_argument("GemmaTpModel::Load: vision is not available for Gemma 4 under --tp 2 (use --tp 1)");
+  }
+  // The Gemma option mapping (R4DX_GEMMA_* environment, MTP refused) -- the same one TP=1 runs.
   GemmaModelOptions g = MakeGemmaModelOptions(opts);
+  g.vision = GemmaVisionLoad::kOff;  // --vision auto: text only under TP
   const int64_t warmup_positions = GemmaModel::WarmupPositions(g);
   if (g.max_ctx > 0 && g.max_ctx < warmup_positions) {
     throw std::invalid_argument("GemmaTpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +

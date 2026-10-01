@@ -1054,9 +1054,11 @@ void GemmaModel::InjectDflashRows(int64_t rows, int64_t start_pos) {
   for (int64_t row0 = 0; row0 < rows; row0 += 64) {
     const int64_t S = std::min<int64_t>(64, rows - row0);
     dflash_->InjectFeatures(stream_, arena_, features_dev_.data() + row0 * cols, S, start_pos + row0);
+    // InjectFeatures stages the slice's rope positions in ONE pinned host array and uploads them asynchronously:
+    // the next slice must not overwrite it before this copy ran (as Model::RunChunk does). Also keeps RunChunk's
+    // "device idle on return" contract.
+    stream_.Synchronize();
   }
-  // RunChunk's contract is "device idle on return" (the next call's plain copies need it).
-  stream_.Synchronize();
   arena_.Reset();
 }
 
@@ -1100,6 +1102,12 @@ std::vector<int32_t> GemmaModel::DecodeStepDflashGreedy(int32_t token_id, int64_
     throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: drafter frontier (" + std::to_string(dflash_->InjectedCount()) +
                              ") != PositionCount() (" + std::to_string(pos_) + ")");
   }
+  // The verify window is k + 1 rows: near the end of the context, draft fewer (k = 0 still verifies the anchor).
+  if (pos_ + 1 > max_ctx_) {
+    throw std::runtime_error("GemmaModel::DecodeStepDflashGreedy: position " + std::to_string(pos_ + 1) +
+                             " exceeds max_ctx " + std::to_string(max_ctx_));
+  }
+  k = std::min<int64_t>(k, max_ctx_ - pos_ - 1);
   const GemmaConfig& cfg = container_.Config();
   const DflashEmbeddingProvider embed = MakeEmbeddingProviderFromTable(
       container_.EmbedTokensDevice().data(), cfg.hidden_size, cfg.vocab_size, static_cast<float>(dflash_embed_scale_));
@@ -1132,10 +1140,14 @@ std::vector<int32_t> GemmaModel::DecodeStepDflashGreedy(int32_t token_id, int64_
 }
 
 std::vector<int32_t> GemmaModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
-                                                         const kernels::SampleParams& params, std::mt19937_64&,
+                                                         const kernels::SampleParams& params, std::mt19937_64& rng,
                                                          int64_t* walk_len_out) {
   if (params.temperature > 0.0f) {
-    throw std::runtime_error("GemmaModel::DecodeStepDflashSampled: a sampled DFlash round is not implemented for Gemma 4 (temperature > 0)");
+    // A sampled DFlash round (rejection sampling over the drafter) is not implemented for Gemma 4 yet: take one plain
+    // sampled step instead. It commits one row and RunChunk injects it, so the drafter frontier stays == pos_ and a
+    // later greedy round on the same request still works. Correct output, no speculation speedup.
+    if (walk_len_out != nullptr) *walk_len_out = 0;
+    return {DecodeStepSampled(token_id, params, rng)};
   }
   return DecodeStepDflashGreedy(token_id, k, p_min, n_min, walk_len_out);
 }

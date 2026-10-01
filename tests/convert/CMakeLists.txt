@@ -206,3 +206,9 @@ target_link_libraries(convert_dflash_container PRIVATE r4dx_convert)
 target_compile_definitions(convert_dflash_container PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME convert_dflash_container COMMAND convert_dflash_container)
+
+# --dflash-hf (docs/gemma4-plan.md D-3): HF DFlash v1 -> dflash2 container with the synthesized identity conv and zero selector,
+# on a generated tiny z-lab-shaped checkpoint: tensor mapping, metadata (offset, softcap, embed scale), both layouts, refusals. CPU-only.
+add_executable(convert_dflash_hf test_dflash_hf.cpp)
+target_link_libraries(convert_dflash_hf PRIVATE r4dx_convert)
+add_test(NAME convert_dflash_hf COMMAND convert_dflash_hf)

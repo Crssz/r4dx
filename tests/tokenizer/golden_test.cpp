@@ -2,7 +2,16 @@
 // tools/tok_ref/gen_golden.py against the real HF tokenizer for
 // C:\AI\models\Qwen3.8-27B) through r4dx's own Tokenizer + ChatTemplate and asserts exact
 // agreement. Exits non-zero (and prints every mismatch, not just the first) on any divergence.
+//
+// CTest 'tokenizer_golden_gemma' is the same executable run as
+//   tokenizer_golden --golden <tests/tokenizer/golden_gemma.json> --model-dir <gemma tokenizer dir>
+// (golden_gemma.json is produced by tools/tok_ref/gen_golden_gemma.py). The golden header may carry
+// `keep_special_on_decode` (Tokenizer::Options) and `apply_polyfills` (ChatTemplateOptions) and the
+// case list may carry "decode" / "chat_error" cases; golden.json has none of those, so the Qwen
+// run is unchanged.
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -111,15 +120,58 @@ void check_chat_case(const Tokenizer& tok, const r4dx::ChatTemplate& tmpl, const
     }
 }
 
+// A "decode" case: ids -> text, optionally keeping the header's keep_special_on_decode list.
+// `keep_special` cases need a tokenizer loaded with that list; `tok_keep` is that tokenizer.
+void check_decode_case(const Tokenizer& tok, const Tokenizer& tok_keep, const json& c) {
+    const std::string name = c.at("name").get<std::string>();
+    const std::vector<TokenId> ids = ids_from_json(c.at("ids"));
+    const std::string expected = c.at("expected").get<std::string>();
+    const bool skip = c.at("skip_special_tokens").get<bool>();
+    const bool keep = c.at("keep_special").get<bool>();
+    const Tokenizer& t = keep ? tok_keep : tok;
+
+    const std::string got = t.decode(ids, skip);
+    if (got != expected) {
+        fail(name, "decode mismatch\n  expected : " + expected + "\n  got      : " + got);
+        return;
+    }
+    if (c.value("stream", false)) {
+        auto dec = t.make_stream_decoder(skip);
+        std::string streamed;
+        for (const TokenId id : ids) streamed += dec.push(id);
+        streamed += dec.flush();
+        if (streamed != expected) {
+            fail(name + " (stream)", "streaming decode mismatch\n  expected : " + expected + "\n  got      : " + streamed);
+        }
+    }
+}
+
+// Every "encode" case of an SPM-style tokenizer is also streamed token by token (byte-fallback
+// runs are the interesting part), plus the "chat_error" kind: render must throw.
+void check_chat_error_case(const r4dx::ChatTemplate& tmpl, const json& c) {
+    const std::string name = c.at("name").get<std::string>();
+    const ChatJson messages = c.at("messages");
+    const ChatJson tools = c.contains("tools") && !c.at("tools").is_null() ? ChatJson(c.at("tools")) : ChatJson::array();
+    ChatJson extra = ChatJson::object();
+    if (c.contains("extra_context")) extra = c.at("extra_context");
+    try {
+        tmpl.render(messages, c.at("add_generation_prompt").get<bool>(), tools, extra);
+    } catch (const std::exception&) {
+        return;  // expected
+    }
+    fail(name, "render did not throw (HF raised: " + c.value("hf_error", std::string()) + ")");
+}
+
 // Exercises StreamDecoder against a handful of the multi-byte-heavy golden cases (emoji, CJK,
 // Thai) to check it reproduces the one-shot decode() when fed one token at a time, including a
 // mid-codepoint flush() at the very end.
 void check_stream_decoder(const Tokenizer& tok, const json& doc) {
+    const bool all_cases = tok.kind() == Tokenizer::Kind::kSpmByteFallback;
     for (const auto& c : doc.at("cases")) {
         if (c.at("kind") != "encode") continue;
         const std::string name = c.at("name").get<std::string>();
-        if (name.rfind("emoji_", 0) != 0 && name.rfind("thai_", 0) != 0 && name.rfind("chinese_", 0) != 0 &&
-            name.rfind("japanese_", 0) != 0) {
+        if (!all_cases && name.rfind("emoji_", 0) != 0 && name.rfind("thai_", 0) != 0 &&
+            name.rfind("chinese_", 0) != 0 && name.rfind("japanese_", 0) != 0) {
             continue;
         }
         const std::vector<TokenId> ids = ids_from_json(c.at("ids"));
@@ -181,44 +233,73 @@ void check_compat_cases(const std::string& model_dir, const json& doc) {
 
 }  // namespace
 
-int main() {
-    const std::string model_dir = R4DX_TOKENIZER_MODEL_DIR;
-    const std::string golden_path = std::string(TOKENIZER_TEST_DIR) + "/golden.json";
+int main(int argc, char** argv) {
+    std::string model_dir = R4DX_TOKENIZER_MODEL_DIR;
+    std::string golden_path = std::string(TOKENIZER_TEST_DIR) + "/golden.json";
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--golden") == 0 && i + 1 < argc) {
+            golden_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--model-dir") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
+        } else {
+            std::fprintf(stderr, "usage: tokenizer_golden [--golden FILE] [--model-dir DIR]\n");
+            return 2;
+        }
+    }
 
     if (!file_exists(model_dir + "/tokenizer.json")) {
         std::fprintf(stderr,
                       "tokenizer_golden: SKIPPED -- %s/tokenizer.json not found (set "
-                      "-DR4DX_TOKENIZER_MODEL_DIR=... to point at the Qwen3.8-27B checkout)\n",
+                      "-DR4DX_TOKENIZER_MODEL_DIR=... / -DR4DX_GEMMA_TOKENIZER_DIR=... to point at the "
+                      "model's tokenizer files)\n",
                       model_dir.c_str());
         return kSkipReturnCode;
     }
 
+    json doc = json::parse(read_file(golden_path), /*cb=*/nullptr, /*allow_exceptions=*/true);
+
     // Qwen3.8-27B declares normalizer.type=NFC, which this implementation does not apply (see the
     // KNOWN GAP comment in tokenizer.h); the golden corpus is NFC-normalized by construction (see
     // tools/tok_ref/gen_golden.py), so this known, already-accounted-for gap is explicitly
-    // acknowledged here rather than silently ignored.
+    // acknowledged here rather than silently ignored. (Ignored by the SPM-style backend, which has
+    // no such gap.)
     Tokenizer::Options default_options;
     default_options.allow_unimplemented_normalizer = true;
+    Tokenizer::Options keep_options = default_options;
+    if (doc.contains("keep_special_on_decode")) {
+        keep_options.keep_special_on_decode = doc.at("keep_special_on_decode").get<std::vector<std::string>>();
+    }
+    r4dx::ChatTemplateOptions template_options;
+    if (doc.contains("apply_polyfills")) template_options.apply_polyfills = doc.at("apply_polyfills").get<bool>();
 
-    Tokenizer tok;
+    Tokenizer tok, tok_keep;
     r4dx::ChatTemplate tmpl;
     try {
         tok = Tokenizer::from_directory(model_dir, default_options);
-        tmpl = r4dx::ChatTemplate::from_directory(model_dir);
+        tok_keep = Tokenizer::from_directory(model_dir, keep_options);
+        tmpl = r4dx::ChatTemplate::from_directory(model_dir, template_options);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "golden_test: failed to load tokenizer/chat template from %s: %s\n", model_dir.c_str(),
                      e.what());
         return 1;
     }
 
-    json doc = json::parse(read_file(golden_path), /*cb=*/nullptr, /*allow_exceptions=*/true);
-
+    if (doc.contains("kind")) {
+        const bool want_spm = doc.at("kind").get<std::string>() == "spm_byte_fallback";
+        if (want_spm != (tok.kind() == Tokenizer::Kind::kSpmByteFallback)) {
+            fail("header.kind", "tokenizer backend kind does not match the golden file");
+        }
+    }
     check_id_field("vocab_size", doc, static_cast<TokenId>(tok.vocab_size()));
     check_id_field("bos_token_id", doc, tok.bos_id());
     check_id_field("eos_token_id", doc, tok.eos_id());
     check_id_field("pad_token_id", doc, tok.pad_id());
+    if (doc.contains("eos_token_ids") && tok.eos_ids() != ids_from_json(doc.at("eos_token_ids"))) {
+        fail("header.eos_token_ids", "expected " + ids_to_string(ids_from_json(doc.at("eos_token_ids"))) + ", got " +
+                                          ids_to_string(tok.eos_ids()));
+    }
 
-    size_t n_encode = 0, n_chat = 0;
+    size_t n_encode = 0, n_chat = 0, n_decode = 0, n_chat_error = 0;
     for (const auto& c : doc.at("cases")) {
         const std::string kind = c.at("kind").get<std::string>();
         if (kind == "encode") {
@@ -227,6 +308,12 @@ int main() {
         } else if (kind == "chat") {
             check_chat_case(tok, tmpl, c);
             n_chat++;
+        } else if (kind == "decode") {
+            check_decode_case(tok, tok_keep, c);
+            n_decode++;
+        } else if (kind == "chat_error") {
+            check_chat_error_case(tmpl, c);
+            n_chat_error++;
         } else {
             fail("<unknown>", "unrecognized case kind: " + kind);
         }
@@ -234,6 +321,8 @@ int main() {
     check_stream_decoder(tok, doc);
     check_compat_cases(model_dir, doc);
 
-    std::printf("tokenizer_golden: %zu encode cases, %zu chat cases, %d failure(s)\n", n_encode, n_chat, g_failures);
+    std::printf("tokenizer_golden: %zu encode cases, %zu chat cases, %zu decode cases, %zu chat-error cases, "
+                "%d failure(s)\n",
+                n_encode, n_chat, n_decode, n_chat_error, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

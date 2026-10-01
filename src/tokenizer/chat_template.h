@@ -21,6 +21,17 @@ namespace r4dx {
 // the order the caller supplied them, not alphabetically).
 using ChatJson = nlohmann::ordered_json;
 
+// Load-time behavior toggles for ChatTemplate::from_directory()/from_source().
+struct ChatTemplateOptions {
+    // true (default, Qwen): minja rewrites messages for templates whose probed capabilities lack
+    // system role / tools / tool calls / tool responses (a no-op for Qwen3.8-27B, whose template
+    // supports all of them). false (Gemma 4): render the messages exactly as given. Gemma's
+    // template has its own tool-call format, but minja's caps probe reports
+    // supports_tool_calls=false for it, and the default polyfill would then rewrite assistant
+    // `tool_calls` into JSON content and destroy that format.
+    bool apply_polyfills = true;
+};
+
 class ChatTemplate {
 public:
     // Reads `<model_dir>/chat_template.jinja` if present, else falls back to the
@@ -29,10 +40,10 @@ public:
     // `bos_token`/`eos_token` globals (Qwen3.8-27B's template does not reference them directly,
     // but generic Jinja chat templates may). Throws std::runtime_error if no template source can
     // be found or it fails to parse.
-    static ChatTemplate from_directory(const std::string& model_dir);
+    static ChatTemplate from_directory(const std::string& model_dir, const ChatTemplateOptions& options = {});
 
     static ChatTemplate from_source(const std::string& jinja_source, const std::string& bos_token,
-                                     const std::string& eos_token);
+                                     const std::string& eos_token, const ChatTemplateOptions& options = {});
 
     ChatTemplate();
     ~ChatTemplate();

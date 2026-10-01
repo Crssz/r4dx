@@ -239,15 +239,67 @@ EXPECTED_ADD_LINEAR = {
 #: at all, so no activation exists for it and none is captured.
 EXPECTED_DIRECT_LAYOUTS = {"mtp.draft_head.lm_head", "selftest"}
 
+#: The Gemma 4 branch's scope (docs/gemma4-plan.md 4.3): `(hf suffixes, container suffix)` pairs of the
+#: `linear({...}, "<base>", fold, shape)` calls in `src/convert/gemma_layout.cpp` (AddTextStack's local
+#: helper over Kit::add_linear). The tied head is the embedding table.
+CONVERTER_GEMMA = REPO_ROOT / "src" / "convert" / "gemma_layout.cpp"
+EXPECTED_ADD_LINEAR_GEMMA = {
+    ("self_attn.q_proj.weight",): "attn.q",
+    ("self_attn.k_proj.weight",): "attn.k",
+    ("self_attn.v_proj.weight",): "attn.v",
+    ("self_attn.o_proj.weight",): "attn.o",
+    ("mlp.gate_proj.weight", "mlp.up_proj.weight"): "mlp.gate_up",
+    ("mlp.down_proj.weight",): "mlp.down",
+    ("embed_tokens.weight",): "lm_head",
+}
+
 _QUOTED = re.compile(r'"([^"]*)"')
 
 
-def audit_converter_source(path: Path) -> dict:
+def audit_gemma_layout_source(path: Path) -> dict:
+    """The Gemma scope of `audit_converter_source`: re-derive gemma_layout.cpp's linear set from its
+    text and diff it against `EXPECTED_ADD_LINEAR_GEMMA`. Same result shape as the Qwen audit (the
+    Gemma file has no MTP block and no direct PlanLinearLayouts, so those parts are empty)."""
+    src = path.read_text(encoding="utf-8")
+    found: dict[tuple, str] = {}
+    # `linear(` as a whole word: `add_linear(` does not match (the `_` before it is a word character), so
+    # only AddTextStack's local helper calls, whose first argument is a `{...}` list of HF names.
+    for m in re.finditer(r"\blinear\(\{([^{}]*)\}\s*,(.*?)\);", src, re.S):
+        hf = tuple(_QUOTED.findall(m.group(1)))
+        cont = _QUOTED.findall(m.group(2))
+        if len(cont) != 1:
+            raise SystemExit(f"[imatrix] unparsable gemma linear container name at offset {m.start()}: "
+                             f"{m.group(2)!r}")
+        found[hf] = cont[0]
+    missing, unexpected, mismatched = [], [], []
+    for hf, cont in found.items():
+        want = EXPECTED_ADD_LINEAR_GEMMA.get(hf)
+        if want is None:
+            unexpected.append(("gemma", hf, cont))
+        elif want != cont:
+            mismatched.append(("gemma", hf, cont, want))
+    for hf, cont in EXPECTED_ADD_LINEAR_GEMMA.items():
+        if hf not in found:
+            missing.append(("gemma", hf, cont))
+    ok = not (missing or unexpected or mismatched)
+    return {"path": repo_relative(path), "sha256": sha256_file(path), "found": {"text": found, "mtp": {}},
+            "direct_plan_linear_layouts": [], "missing": missing, "unexpected": unexpected,
+            "mismatched": mismatched, "ok": ok}
+
+
+def audit_converter_source(path: Path, arch: str = "qwen35") -> dict:
     """Re-derive main.cpp's `add_linear` call set from its text and diff it against
     `EXPECTED_ADD_LINEAR`. Only calls whose FIRST argument is a `{...}` initializer list are the
     Qwen container's (`add_linear(std::vector<std::string>, std::string, LayoutSet)`); the DFlash2
     draft container further down the file has its own `add_linear(std::string, std::string)` lambda
-    for a completely different model, which this pattern skips by construction."""
+    for a completely different model, which this pattern skips by construction.
+
+    `arch="gemma4_unified"` audits the Gemma branch instead: pass CONVERTER_GEMMA
+    (src/convert/gemma_layout.cpp) and `EXPECTED_ADD_LINEAR_GEMMA` is the reference."""
+    if arch == "gemma4_unified":
+        return audit_gemma_layout_source(path)
+    if arch != "qwen35":
+        raise SystemExit(f"[imatrix] unknown converter arch {arch!r} (qwen35 | gemma4_unified)")
     src = path.read_text(encoding="utf-8")
     mtp_at = src.find("if (do_mtp)")
     if mtp_at < 0:

@@ -84,6 +84,13 @@ add_library(r4dx_tp_shard STATIC tp/tp_shard.cpp)
 target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                                 ${CMAKE_SOURCE_DIR}/third_party)
 
+# ---- r4dx_model_arch: DetectArch (arch.h) -- which model family a container holds ---------------
+# CPU-only like r4dx_tp_shard: it reads the safetensors-shell header and nothing else. LoadTextModel
+# (tp_model.cpp) calls it first; model_config.h carries the result as ModelConfig::arch. M1-1.
+add_library(r4dx_model_arch STATIC arch.cpp)
+target_include_directories(r4dx_model_arch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                                  ${CMAKE_SOURCE_DIR}/third_party)
+
 # ---- r4dx_tp: the TpComm implementations (docs/tp.md 6.1, Appendix A) ----------------------------
 # NoopComm (tp/tp_comm_noop.cpp, docs/tp.md 6.4); P3: TpGroup (tp/tp_group.cpp -- the pinned host
 # mailbox, seq base, recovery) and HostMailboxComm (tp/tp_comm_host_mailbox.cpp -- the two-GPU
@@ -138,6 +145,7 @@ foreach(lib r4dx_model r4dx_model_tptest)
     # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.
     r4dx_tp_shard
     r4dx_tp
+    r4dx_model_arch
   )
 endforeach()
 target_compile_definitions(r4dx_model_tptest PUBLIC R4DX_TP_TESTING=1)

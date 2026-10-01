@@ -194,6 +194,13 @@ add_executable(test_tp_config test_tp_config.cpp)
 target_link_libraries(test_tp_config PRIVATE r4dx_tp_shard)
 add_test(NAME test_tp_config COMMAND test_tp_config)
 
+# test_gemma_config (docs/gemma4-plan.md M1-1): GemmaConfig::FromJson on the real Huihui text_config
+# (5:1 pattern asserted, every refusal), GemmaConfig::Shard rules, ModelConfig::arch, DetectArch on
+# synthetic safetensors-shell headers. CPU-only, header + arch.cpp only.
+add_executable(test_gemma_config test_gemma_config.cpp)
+target_link_libraries(test_gemma_config PRIVATE r4dx_model_arch)
+add_test(NAME test_gemma_config COMMAND test_gemma_config)
+
 add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)

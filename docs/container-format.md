@@ -481,6 +481,33 @@ A Gemma 4 container (`model_arch` `gemma4_unified`, plain-weight norms) differs 
   `rotation.had_down_signs` `[15360]`, `rotation.had_o_signs` `[4096]` (sliding layers' o_proj) and
   `rotation.had_o_full_signs` `[8192]` (full layers'). Draw order after `signs` / `mix`: down, o, o_full.
 
+## Gemma 4 container (`model_arch` `gemma4_unified`)
+
+Written by `r4dx-convert` when `config.json` says `model_type` `gemma4_unified` (`src/convert/gemma_layout.{hpp,cpp}`;
+`tests/convert/test_gemma_layout.cpp`, ctest `convert_gemma_layout`). The checkpoint is one `model.safetensors`
+(no index). `__metadata__` gains `"model_arch": "gemma4_unified"` and `"norm_kind": "plain"` (written only for
+Gemma; `model::DetectArch` reads them, falling back to `model_config.model_type`); `model_config` is the verbatim
+`config.json`; `model_id` is the checkpoint directory's name. No `mtp.*` (`--mtp on` is refused).
+
+| Container tensor | HF source | Notes |
+|---|---|---|
+| `text.embed_tokens` | `model.language_model.embed_tokens.weight` | bf16 `[vocab, hidden]`; the `sqrt(hidden)` scale is a runtime op, never folded |
+| `text.final_norm` | `model.language_model.norm.weight` | bf16 `[hidden]`, a plain weight (`x * w`) |
+| `lm_head.{layout}` | the same embedding (tied) | written untied, like Qwen's, in the `--lm-head` layouts |
+| `text.layers.{i}.input_layernorm`, `post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm` | same names | bf16 `[hidden]`, raw. Under `--rotate` the first and third are folded away and stored as bf16 **ones** as `<name>.rotated` |
+| `text.layers.{i}.attn.{q,k,o}.{layout}`, `attn.v.{layout}` | `self_attn.{q,k,o,v}_proj.weight` | `q` has no output gate. **No `attn.v` on full layers** (V is the raw `k_proj` output, `attention_k_eq_v`) |
+| `text.layers.{i}.attn.{q_norm,k_norm}` | `self_attn.{q,k}_norm.weight` | bf16 `[head_dim]`: 256 sliding, 512 full; `v_norm` has no weight and stores nothing |
+| `text.layers.{i}.attn.{k,v}_descale` | `--kv-calib` (else 1.0) | fp32 `[kv_heads of the layer]`: **8 on sliding layers, 1 on full layers** |
+| `text.layers.{i}.mlp.gate_up.{layout}`, `mlp.down.{layout}` | `mlp.{gate,up,down}_proj.weight` | gate rows first |
+| `text.layers.{i}.layer_scalar` | `layer_scalar` | the `[1]` bf16 buffer widened to fp32 `[1, 4]` (applied once, after the MLP residual add) |
+| `vision.vision_embedder.*`, `vision.embed_vision.*`, `audio.embed_audio.*` | `model.vision_embedder.*`, `model.embed_vision.*`, `model.embed_audio.*` | bf16 passthrough, `model.` stripped; only with `--vision on` / `--audio on` (both default off) |
+
+Shapes come from the safetensors headers and are cross-checked against `text_config` before anything is written. The
+converter's **coverage audit**: every checkpoint tensor must be consumed by the table above or allow-listed (layers
+past `--layers`; vision / audio tensors while their flag is off). Anything else -- a tensor the converter does not
+know, a stray `lm_head.weight` -- fails the run before the header is written. `--trellis-from`,
+`--record-reuse-guard` and `--reuse-tensors-from` are refused for Gemma for now.
+
 ## Trellis body layout (`__metadata__.quant.trellis`, `<base>.trellis.*`)
 
 `r4dx-convert --trellis-from <oracle dir>` (docs/trellis-kernel.md sections 2-3; the format itself

@@ -15,11 +15,17 @@
 #include <string>
 #include <vector>
 
+#include "arch.h"
 #include "nlohmann/json.hpp"
 
 namespace r4dx::model {
 
 struct ModelConfig {
+  // Which family this config describes (arch.h). FromJson parses Qwen's text_config and leaves the
+  // default; GemmaConfig::ToModelConfig sets kGemma4, so TextModel::Config().arch tells the server
+  // what was loaded (docs/gemma4-plan.md M1-24).
+  Arch arch = Arch::kQwen35;
+
   int64_t hidden_size = 0;
   int64_t num_hidden_layers = 0;
   std::vector<std::string> layer_types;  // "linear_attention" | "full_attention", per layer

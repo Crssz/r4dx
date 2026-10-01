@@ -14,6 +14,7 @@
 #include <thread>
 #include <utility>
 
+#include "arch.h"
 #include "local_text_model.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
@@ -1144,7 +1145,20 @@ std::vector<int32_t> TpModel::DecodeStepDflashSampled(int32_t token_id, int64_t 
 
 // ---- factory ------------------------------------------------------------------------------------
 
+// Placeholder for task M1-20 (GemmaModel / GemmaLocalTextModel), which replaces this definition. Until
+// then a Gemma container fails fast and by name instead of reaching Container::Load, whose Qwen
+// config parser would die on a missing GDN field.
+std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& /*tp*/) {
+  throw std::runtime_error("LoadTextModel: " + opts.container_path +
+                           " is a gemma4_unified container; the Gemma 4 text model is not implemented "
+                           "in this build yet (docs/gemma4-plan.md M1-20)");
+}
+
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp) {
+  // Arch dispatch (docs/gemma4-plan.md 3.2): the container header alone decides. DetectArch answers
+  // kQwen35 for every container without a `model_arch` / Gemma model_config -- including a file it
+  // cannot read -- so the Qwen branches below see exactly what they saw before.
+  if (DetectArch(opts.container_path) == Arch::kGemma4) return LoadGemmaTextModel(opts, tp);
   if (tp.world == 1) {
     const TpOptions d;
     if (tp.mode != d.mode || !tp.devices.empty() || tp.noop_rank != d.noop_rank || tp.ar_timeout_ms != d.ar_timeout_ms ||

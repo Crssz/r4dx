@@ -1145,14 +1145,7 @@ std::vector<int32_t> TpModel::DecodeStepDflashSampled(int32_t token_id, int64_t 
 
 // ---- factory ------------------------------------------------------------------------------------
 
-// Placeholder for task M1-20 (GemmaModel / GemmaLocalTextModel), which replaces this definition. Until
-// then a Gemma container fails fast and by name instead of reaching Container::Load, whose Qwen
-// config parser would die on a missing GDN field.
-std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& /*tp*/) {
-  throw std::runtime_error("LoadTextModel: " + opts.container_path +
-                           " is a gemma4_unified container; the Gemma 4 text model is not implemented "
-                           "in this build yet (docs/gemma4-plan.md M1-20)");
-}
+// LoadGemmaTextModel (the Gemma 4 branch below) is defined in gemma_local_text_model.cpp (M1-20).
 
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp) {
   // Arch dispatch (docs/gemma4-plan.md 3.2): the container header alone decides. DetectArch answers

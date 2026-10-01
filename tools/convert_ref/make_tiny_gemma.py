@@ -89,6 +89,19 @@ def config(layers):
             "vocab_size": VOCAB,
             "attention_k_eq_v": True,
             "tie_word_embeddings": True,
+            # The keys GemmaConfig::FromJson (src/model/gemma_config.h) requires, so the converted container
+            # loads through GemmaContainer (M1-19). The 5:1 layer pattern is asserted there: use --layers 6
+            # (or 12, ...) to get a full-attention layer; the default 2 layers are both sliding.
+            "sliding_window": 8,
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6,
+            "final_logit_softcapping": 30.0,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rope_parameters": {
+                "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+                "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0,
+                                   "partial_rotary_factor": 0.25},
+            },
         },
     }
 

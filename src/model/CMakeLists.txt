@@ -112,6 +112,13 @@ set_source_files_properties(tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp tp/tp_co
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 set(R4DX_MODEL_SOURCES
   container.cpp
+  # M1-19: helpers shared by Container::Load and GemmaContainer::Load (moved verbatim out of container.cpp).
+  container_load_util.cpp
+  # Gemma 4 (docs/gemma4-plan.md M1-19/M1-20): loader, GeGLU MLP, engine, TP=1 TextModel + the LoadGemmaTextModel dispatch.
+  gemma_container.cpp
+  gemma_mlp.cpp
+  gemma_model.cpp
+  gemma_local_text_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp

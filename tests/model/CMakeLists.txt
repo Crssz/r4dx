@@ -201,6 +201,19 @@ add_executable(test_gemma_config test_gemma_config.cpp)
 target_link_libraries(test_gemma_config PRIVATE r4dx_model_arch)
 add_test(NAME test_gemma_config COMMAND test_gemma_config)
 
+# test_gemma_container (docs/gemma4-plan.md M1-19): GemmaContainer::Inspect (the CPU half of the Gemma loader --
+# `__metadata__` + the tensor directory, no HIP call) on a tiny 6-layer fixture converted by the real r4dx-convert
+# (when built), the real Huihui bf16.r4dx header (SKIP when absent), and option-A rotation metadata. CPU only:
+# HIP_VISIBLE_DEVICES is set EMPTY, so the process cannot see a GPU at all (linking r4dx_model loads the runtime).
+add_executable(test_gemma_container test_gemma_container.cpp)
+target_link_libraries(test_gemma_container PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_gemma_container PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_gemma_container r4dx-convert)
+endif()
+add_test(NAME test_gemma_container COMMAND test_gemma_container)
+set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=")
+
 add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)

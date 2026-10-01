@@ -763,6 +763,7 @@ class Bench {
   // per-group entry otherwise; bf16 through r4d_gemm_bf16_nt_m64.
   void LaunchBaseline(const Linear& l, int M, const LinearTuning& t) {
     if (l.group == 0) {
+      if (!l.wbf) throw std::runtime_error("LaunchBaseline: bf16 baseline weight not allocated (--group gemma is trellis-only)");
       r4d_gemm_bf16_nt_m64(P(a_bf16_.at(l.s->K)), P(l.wbf), P(c_bf16_), M, l.s->K, l.s->N, t.WV, t.SK,
                            t.MB, P(st_));
     } else if (l.group == r4d_gemm_w4a16_nt_m64_group()) {
@@ -899,7 +900,7 @@ class Bench {
       ms += Must(Chain([&] {
         for (const Linear* l : all) LaunchTrellis(*l, 1, FallbackTuning(l->s->N, l->s->K, 1), nullptr);
       }, "warm-up"), "warm-up trellis");
-      ms += Must(ChainBaseline(all, 1, nullptr), "warm-up w4a16");
+      if (!g_gemma) ms += Must(ChainBaseline(all, 1, nullptr), "warm-up w4a16");   // gemma: trellis only, no baseline weights
     }
   }
 

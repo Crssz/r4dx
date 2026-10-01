@@ -91,6 +91,12 @@
 //   --kb 4 | mix   the trellis rate: KB = 4 everywhere, or EXL3's 4.5 bpw allocation (KB = 5 on
 //            layers 0-15 and 48-63, KB = 4 on 16-47; --kb-manifest <mix4.5m weights_override.json>
 //            reads the exact per-tensor K instead and checks gate K == up K).
+//   --group qwen | gemma   whose linears: qwen (default, the 64-layer body below) or gemma, Huihui
+//            Gemma-4-12B's eight trellis shapes (48 layers, 5 sliding : 1 full; with --tp 2 its rank
+//            shapes, GemmaConfig::Shard) for the tuning modes (full, ptune; `full` when --modes is not
+//            given), trellis only, KB 4. Write the rows with --inc-out / --tunings-out and merge them
+//            into the trellis tables:
+//              --group gemma --modes full,ptune --joint --ptune-m 32,64 --inc-out gemma_rows.inc
 //   --tp 2   one TP = 2 rank's shapes (ShardShapesTp2: the column-parallel linears split N, the
 //            row-parallel ones K), for the tuning modes (full --joint, ptune) only: their rows are
 //            the per-rank table (--inc-out: src/model/gemm_tuning_table_trellis_tp2.inc, which
@@ -138,6 +144,7 @@
 #include "r4dx/kernels/kernels.h"           // r4dx_trellis_input_bf16, the silu_mul pair
 #include "r4dx/kernels/rotate_residual.h"   // q2ab's residual rotation and GDN Hadamard
 #include "r4dx/model/attention/attn_kernels.h"   // the attention gate-mul pair (info)
+#include "trellis_bench_shapes.hpp"   // the --group gemma shapes (host-tested)
 #include "trellis_tuning_rows.hpp"          // src/model/gemm_tuning_table_trellis.inc, as built
 
 extern "C" {
@@ -199,6 +206,8 @@ struct Args {
   // M5 (mode ptune): the prefill chunk sizes to tune, and the shapes of one TP = 2 rank (--tp 2).
   std::vector<int> ptune_m{32, 64};
   int tp = 1;
+  std::string group = "qwen";               // --group qwen | gemma: which model's linears
+  bool modes_given = false, layers_given = false;
 };
 
 double Quantile(std::vector<double> v, double q) {
@@ -286,14 +295,46 @@ class Timer {
 struct Shape {
   const char* cls;
   int N, K;
+  int parts = 1;   // 2: a fused gate_up (production runs it as two parts)
 };
 // The body's shapes at TP = 1; --tp 2 makes them one rank's (ShardShapesTp2) before anything reads
 // them.
 Shape kQkv{"gdn.in_proj_qkv", 10240, 5120}, kZ{"gdn.in_proj_z", 6144, 5120},
     kOutProj{"gdn.out_proj", 5120, 6144}, kQg{"attn.qg", 12288, 5120}, kAttnK{"attn.k", 1024, 5120},
-    kAttnV{"attn.v", 1024, 5120}, kAttnO{"attn.o", 5120, 6144}, kGateUp{"mlp.gate_up", 34816, 5120},
+    kAttnV{"attn.v", 1024, 5120}, kAttnO{"attn.o", 5120, 6144}, kGateUp{"mlp.gate_up", 34816, 5120, 2},
     kDown{"mlp.down", 5120, 17408};
-const Shape* const kShapes[] = {&kQkv, &kZ, &kOutProj, &kQg, &kAttnK, &kAttnV, &kAttnO, &kGateUp, &kDown};
+
+// --group gemma: Huihui Gemma-4-12B (hidden 3840, intermediate 15360, 16 q heads; sliding 8 KV heads
+// x 256, full 1 KV head x 512 with k_eq_v, so a full layer has no v). The same eight linear classes
+// as tools/profile/tune_gemm.py's `gemma.*` group (kv_sliding is attn.k and attn.v, one shape each
+// here) and test_trellis_gemma_plan.cpp.
+// (rows of trellis_bench::kGemmaShapes, in this order)
+constexpr Shape GemmaShapeAt(int i) {
+  return Shape{trellis_bench::kGemmaShapes[i].cls, trellis_bench::kGemmaShapes[i].N1,
+               trellis_bench::kGemmaShapes[i].K1, trellis_bench::kGemmaShapes[i].parts};
+}
+Shape kGQSl = GemmaShapeAt(0), kGKSl = GemmaShapeAt(1), kGVSl = GemmaShapeAt(2), kGOSl = GemmaShapeAt(3),
+      kGQFu = GemmaShapeAt(4), kGKFu = GemmaShapeAt(5), kGOFu = GemmaShapeAt(6), kGGateUp = GemmaShapeAt(7),
+      kGDown = GemmaShapeAt(8);
+using trellis_bench::kGemmaLayers;
+using trellis_bench::GemmaFullLayer;
+
+// The shapes the run uses (set in main by --group / --tp, before anything reads them).
+std::vector<const Shape*> g_shapes{&kQkv, &kZ, &kOutProj, &kQg, &kAttnK, &kAttnV, &kAttnO, &kGateUp, &kDown};
+bool g_gemma = false;
+void SelectGemmaShapes() {
+  g_gemma = true;
+  g_shapes = {&kGQSl, &kGKSl, &kGVSl, &kGOSl, &kGQFu, &kGKFu, &kGOFu, &kGGateUp, &kGDown};
+}
+// GemmaConfig::Shard at TP = 2: column-parallel linears split N, row-parallel ones K; the single
+// full-layer KV head is replicated (k_full stays 512).
+void ShardGemmaTp2() {
+  Shape* const all[] = {&kGQSl, &kGKSl, &kGVSl, &kGOSl, &kGQFu, &kGKFu, &kGOFu, &kGGateUp, &kGDown};
+  for (int i = 0; i < trellis_bench::kNumGemmaShapes; ++i) {
+    all[i]->N = trellis_bench::kGemmaShapes[i].N2;
+    all[i]->K = trellis_bench::kGemmaShapes[i].K2;
+  }
+}
 
 // One TP = 2 rank's shapes (docs/trellis-kernel.md 2.4, docs/tp.md 5.2): the column-parallel linears
 // keep half the rows, the row-parallel ones (gdn.out_proj, attn.o, mlp.down) half of K. gate_up
@@ -383,7 +424,7 @@ struct Linear {
   uint8_t* wq = nullptr;      // w4a16 packed weight
   uint32_t* wsz = nullptr;    // w4a16 (scale, zero) dwords
   uint16_t* wbf = nullptr;    // bf16 weight
-  int Parts() const { return s == &kGateUp ? 2 : 1; }   // mlp.gate_up: gate and up
+  int Parts() const { return s->parts; }   // mlp.gate_up: gate and up
   size_t TrellisBytes() const { return static_cast<size_t>(s->N) * s->K / 8 * kb; }
   // What a container stores besides the words: fp16 suh [parts][K] and svh [N].
   size_t TrellisScaleBytes() const { return static_cast<size_t>(Parts()) * s->K * 2 + static_cast<size_t>(s->N) * 2; }
@@ -483,7 +524,7 @@ class Bench {
     // A (f16 for trellis / w4a16, a second f16 part for trellis gate_up, bf16 for the bf16 k/v),
     // C, workspace: sized for M = 64, per K of the shapes (a TP = 2 rank's with --tp 2).
     std::set<int> ks;
-    for (const Shape* s : kShapes) ks.insert(s->K);
+    for (const Shape* s : g_shapes) ks.insert(s->K);
     for (int K : ks) {
       a_f16_[K] = small_->Take<uint16_t>(static_cast<size_t>(64) * K * 2);
       a_f16b_[K] = small_->Take<uint16_t>(static_cast<size_t>(64) * K * 2);
@@ -584,8 +625,15 @@ class Bench {
   // for its own stream buffer).
   void SetupModel() {
     for (int L = 0; L < args_.layers; ++L) {
-      const bool attn = L % 4 == 3;
       std::vector<const Shape*> order;
+      if (g_gemma) {
+        // Trellis-only: no w4a16 / bf16 baseline weights (group 0 and none allocated below).
+        if (GemmaFullLayer(L)) order = {&kGQFu, &kGKFu, &kGOFu, &kGGateUp, &kGDown};
+        else order = {&kGQSl, &kGKSl, &kGVSl, &kGOSl, &kGGateUp, &kGDown};
+        for (const Shape* s : order) linears_.push_back(Linear{L, s, 0});
+        continue;
+      }
+      const bool attn = L % 4 == 3;
       if (attn) order = {&kQg, &kAttnK, &kAttnV, &kAttnO};
       else order = {&kQkv, &kZ, &kOutProj};
       order.push_back(&kGateUp);
@@ -611,6 +659,7 @@ class Bench {
       tb += Round256(l.TrellisBytes());
       sb += Round256(static_cast<size_t>(l.Parts()) * l.s->K * 4) + Round256(static_cast<size_t>(l.s->N) * 4);
       tk += Round256(static_cast<size_t>(l.s->N / 128) * 4);
+      if (g_gemma) continue;
       if (l.group == 0) wb += Round256(l.BaselineBytes());
       else wb += Round256(static_cast<size_t>(l.s->N) * l.s->K / 2) +
                  Round256(static_cast<size_t>(l.s->N) * (l.s->K / l.group) * 4);
@@ -637,6 +686,7 @@ class Bench {
       l.svh = scales_->Take<float>(static_cast<size_t>(l.s->N) * 4);
       Fill(l.suh, static_cast<size_t>(l.Parts()) * l.s->K, seed++, 0x807FFFFFu, 0x3C000000u);
       Fill(l.svh, static_cast<size_t>(l.s->N), seed++, 0x807FFFFFu, 0x3F800000u);
+      if (g_gemma) continue;
       if (l.group == 0) {
         l.wbf = base_->Take<uint16_t>(l.BaselineBytes());
         Fill(l.wbf, l.BaselineBytes() / 4, seed++, 0x807F807Fu, 0x3C003C00u);
@@ -667,7 +717,7 @@ class Bench {
   // ---- launches --------------------------------------------------------------------------------
   // gate_up runs as production's two parts: output columns >= 17408 (up) read their own A.
   void LaunchTrellis(const Linear& l, int M, const TTune& t, unsigned long long* clk) {
-    const bool two = l.s == &kGateUp;
+    const bool two = l.s->parts == 2;
     r4d_gemm_trellis_nt_m64_raw(P(a_f16_.at(l.s->K)), two ? P(a_f16b_.at(l.s->K)) : 0,
                                 two ? l.s->N / 2 : l.s->N, P(l.tw), P(c_f32_), P(ws_), P(l.tickets), M,
                                 l.s->K, l.s->N, l.kb, t.WV, t.SK, t.MT, t.NP, t.SKG, t.U, t.NT, P(clk),
@@ -675,7 +725,7 @@ class Bench {
   }
   // M2: the linear's GEMM with its output transform (bf16 C), prescale 0.
   void LaunchTrellisFull(const Linear& l, int M, const TTune& t) {
-    const bool two = l.s == &kGateUp;
+    const bool two = l.s->parts == 2;
     r4d_gemm_trellis_nt_m64(P(a_f16_.at(l.s->K)), two ? P(a_f16b_.at(l.s->K)) : 0,
                             two ? l.s->N / 2 : l.s->N, P(l.tw), P(l.svh), P(c_bf16_), P(ws_), P(l.tickets),
                             M, l.s->K, l.s->N, l.kb, t.WV, t.SK, t.MT, t.NP, t.SKG, t.U, t.NT, kOutScale,
@@ -713,6 +763,7 @@ class Bench {
   // per-group entry otherwise; bf16 through r4d_gemm_bf16_nt_m64.
   void LaunchBaseline(const Linear& l, int M, const LinearTuning& t) {
     if (l.group == 0) {
+      if (!l.wbf) throw std::runtime_error("LaunchBaseline: bf16 baseline weight not allocated (--group gemma is trellis-only)");
       r4d_gemm_bf16_nt_m64(P(a_bf16_.at(l.s->K)), P(l.wbf), P(c_bf16_), M, l.s->K, l.s->N, t.WV, t.SK,
                            t.MB, P(st_));
     } else if (l.group == r4d_gemm_w4a16_nt_m64_group()) {
@@ -778,12 +829,12 @@ class Bench {
   void Replay() {
     json r;
     TrellisTunes tune1;
-    for (const Shape* s : kShapes) tune1[s] = FallbackTuning(s->N, s->K, 1);
+    for (const Shape* s : g_shapes) tune1[s] = FallbackTuning(s->N, s->K, 1);
     BaseTunes base1;                                  // tuned w4a16 / bf16 at M <= 16 (--sweep)
     Warm();
     if (args_.sweep) {
       json sw, bw;
-      for (const Shape* s : kShapes) {
+      for (const Shape* s : g_shapes) {
         if (Instances(s).empty()) continue;
         tune1[s] = Sweep(s, 1, sw[s->cls]);
       }
@@ -809,7 +860,7 @@ class Bench {
       BaseTunes base = base1;
       if (args_.sweep && M > 1) {
         json sw, bw;
-        for (const Shape* s : kShapes) {
+        for (const Shape* s : g_shapes) {
           if (Instances(s).empty()) continue;
           double best = 1e30;
           for (int nt : {0, 1}) {
@@ -849,7 +900,7 @@ class Bench {
       ms += Must(Chain([&] {
         for (const Linear* l : all) LaunchTrellis(*l, 1, FallbackTuning(l->s->N, l->s->K, 1), nullptr);
       }, "warm-up"), "warm-up trellis");
-      ms += Must(ChainBaseline(all, 1, nullptr), "warm-up w4a16");
+      if (!g_gemma) ms += Must(ChainBaseline(all, 1, nullptr), "warm-up w4a16");   // gemma: trellis only, no baseline weights
     }
   }
 
@@ -1370,7 +1421,7 @@ class Bench {
       rows.push_back({kv.first.first, kv.first.second, kv.second, s == prefill_source_.end() ? "file" : s->second});
     }
     std::vector<std::pair<int, int>> shape_order;
-    for (const Shape* s : kShapes)
+    for (const Shape* s : g_shapes)
       if (std::find(shape_order.begin(), shape_order.end(), std::make_pair(s->N, s->K)) == shape_order.end())
         shape_order.push_back({s->N, s->K});
     auto rank = [&](const Row& r) {
@@ -1382,7 +1433,19 @@ class Bench {
     std::sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) { return rank(a) < rank(b); });
     // The linears every (N, K) serves: this run's, else the default names of the table's shapes.
     std::map<std::pair<int, int>, std::string> names =
-        args_.tp == 1 ? std::map<std::pair<int, int>, std::string>{
+        g_gemma ? (args_.tp == 1 ? std::map<std::pair<int, int>, std::string>{
+                                       {{4096, 3840}, "gemma.q_sliding"}, {{8192, 3840}, "gemma.q_full"},
+                                       {{2048, 3840}, "gemma.k_sliding, gemma.v_sliding"},
+                                       {{512, 3840}, "gemma.k_full"}, {{3840, 4096}, "gemma.o_sliding"},
+                                       {{3840, 8192}, "gemma.o_full"}, {{30720, 3840}, "gemma.gate_up"},
+                                       {{3840, 15360}, "gemma.down"}}
+                                 : std::map<std::pair<int, int>, std::string>{
+                                       {{2048, 3840}, "gemma.q_sliding"}, {{4096, 3840}, "gemma.q_full"},
+                                       {{1024, 3840}, "gemma.k_sliding, gemma.v_sliding"},
+                                       {{512, 3840}, "gemma.k_full"}, {{3840, 2048}, "gemma.o_sliding"},
+                                       {{3840, 4096}, "gemma.o_full"}, {{15360, 3840}, "gemma.gate_up"},
+                                       {{3840, 7680}, "gemma.down"}})
+        : args_.tp == 1 ? std::map<std::pair<int, int>, std::string>{
                             {{10240, 5120}, "gdn.in_proj_qkv"}, {{6144, 5120}, "gdn.in_proj_z"},
                             {{5120, 6144}, "gdn.out_proj, attn.o"}, {{12288, 5120}, "attn.qg"},
                             {{1024, 5120}, "attn.k, attn.v"}, {{34816, 5120}, "mlp.gate_up"},
@@ -1420,6 +1483,12 @@ class Bench {
            "// weights. KB = 4 rows from --kb 4 runs, KB = 5 rows from --kb mix runs (EXL3's 4.5 bpw\n"
            "// allocation); the JSON beside each run has every candidate's time.\n"
            "//\n";
+      if (g_gemma) {
+        o << "// --group gemma: Huihui Gemma-4-12B's linears (hidden 3840, intermediate 15360; 48 layers, 5 sliding : 1\n"
+             "// full), trellis only. These are candidate rows to merge into the trellis tables, not a table that\n"
+             "// replaces them.\n"
+             "//\n";
+      }
       if (args_.tp == 2) {
         o << "// TP = 2: one rank's (N, K) (docs/trellis-kernel.md 2.4, 5.5; the tool's --tp 2). linear.cpp\n"
              "// includes this file inside namespace trellis_tp2, and a TP rank thread\n"
@@ -1701,7 +1770,9 @@ class Bench {
                         {"source", source.at(k)}, {"tuning", tune.at(k).Json()}};
     r["tunings"] = tj;
     WriteTunings(tune, source, LoadPrefillTunings());
-    for (int M : {1, 8}) r["M" + std::to_string(M)] = ReplayFullAt(M, tune);
+    // --group gemma has no w4a16 baseline to compare against: the rows are the product.
+    if (!g_gemma)
+      for (int M : {1, 8}) r["M" + std::to_string(M)] = ReplayFullAt(M, tune);
     out_["full"] = r;
   }
 
@@ -1835,6 +1906,18 @@ class Bench {
       }
       // The whole chunk, paired: fallback, picks, q2ab.
       std::vector<double> c_fb, c_tn, c_q2;
+      if (g_gemma) {   // trellis only: fallback against picks, no q2ab production chain
+        for (int rep = 0; rep < args_.reps; ++rep) {
+          if (rep % 2 == 0) c_fb.push_back(chunk(fb)), c_tn.push_back(chunk(tune));
+          else c_tn.push_back(chunk(tune)), c_fb.push_back(chunk(fb));
+        }
+        jm["chunk_ms"] = {{"trellis_fallback", Spread(c_fb)}, {"trellis_tuned", Spread(c_tn)},
+                          {"tuned_over_fallback", Median(c_tn) / Median(c_fb)}};
+        std::printf("ptune M=%d: whole chunk (%zu linears) trellis fallback %.3f ms, tuned %.3f ms (%.3fx)\n", M,
+                    all.size(), Median(c_fb), Median(c_tn), Median(c_tn) / Median(c_fb));
+        r["M" + std::to_string(M)] = jm;
+        continue;
+      }
       for (int rep = 0; rep < args_.reps; ++rep) {
         for (int j = 0; j < 3; ++j) switch ((rep + j) % 3) {
             case 0: c_fb.push_back(chunk(fb)); break;
@@ -2307,7 +2390,8 @@ Args ParseArgs(int argc, char** argv) {
     };
     if (k == "--out") a.out = next();
     else if (k == "--reps") a.reps = std::stoi(next());
-    else if (k == "--layers") a.layers = std::stoi(next());
+    else if (k == "--layers") a.layers = std::stoi(next()), a.layers_given = true;
+    else if (k == "--group") a.group = next();
     else if (k == "--sweep") a.sweep = true;
     else if (k == "--sweep-reps") a.sweep_reps = std::stoi(next());
     else if (k == "--probe-iters") a.probe_iters = std::stoi(next());
@@ -2338,6 +2422,7 @@ Args ParseArgs(int argc, char** argv) {
       }
     } else if (k == "--modes") {
       a.modes.clear();
+      a.modes_given = true;
       std::string v = next();
       size_t p = 0;
       while (p <= v.size()) {
@@ -2357,8 +2442,20 @@ Args ParseArgs(int argc, char** argv) {
                                "[--in-model-sclk MHz] [--alu-fraction F] [--warmup-s S] [--kb 4|mix] "
                                "[--kb-manifest json] [--tuning-file json|table]... [--joint] [--joint-all] "
                                "[--joint-top N] [--joint-reps N] [--tunings-out json] [--inc-out path] "
-                               "[--ptune-m 32,64] [--tp 1|2])");
+                               "[--ptune-m 32,64] [--tp 1|2] [--group qwen|gemma])");
     }
+  }
+  if (a.group != "qwen" && a.group != "gemma") throw std::runtime_error("--group must be qwen or gemma");
+  if (a.group == "gemma") {
+    // Trellis tuning rows only: the other modes compare against Qwen's w4a16 body and its extras.
+    if (!a.modes_given) a.modes = {"full"};
+    for (const std::string& m : a.modes)
+      if (m != "full" && m != "ptune")
+        throw std::runtime_error("--group gemma serves the tuning modes only (full, ptune), not " + m);
+    if (a.kb != "4" || !a.kb_manifest.empty())
+      throw std::runtime_error("--group gemma: --kb 4 only (no 4.5 bpw allocation is defined for it)");
+    if (!a.layers_given) a.layers = kGemmaLayers;
+    if (a.layers > kGemmaLayers) throw std::runtime_error("--group gemma: --layers must be 1..48");
   }
   if (a.tp != 1 && a.tp != 2) throw std::runtime_error("--tp must be 1 or 2");
   if (a.tp == 2) {
@@ -2385,7 +2482,11 @@ int main(int argc, char** argv) {
     R4DX_HIP_CHECK(hipSetDevice(0));
     hipStream_t st;
     R4DX_HIP_CHECK(hipStreamCreateWithFlags(&st, hipStreamNonBlocking));
-    if (args.tp == 2) ShardShapesTp2();
+    if (args.group == "gemma") SelectGemmaShapes();
+    if (args.tp == 2) {
+      if (g_gemma) ShardGemmaTp2();
+      else ShardShapesTp2();
+    }
     {
       Bench b(args, st);
       const bool model = args.modes.count("replay") || args.modes.count("split") || args.modes.count("prefill") ||
@@ -2397,7 +2498,8 @@ int main(int argc, char** argv) {
                          {"modes", std::vector<std::string>(args.modes.begin(), args.modes.end())},
                          {"kb", args.kb}, {"kb_manifest", args.kb_manifest}, {"tuning_files", args.tuning_files},
                          {"joint", args.joint}, {"joint_all", args.joint_all}, {"joint_top", args.joint_top},
-                         {"joint_reps", args.joint_reps}, {"ptune_m", args.ptune_m}, {"tp", args.tp}};
+                         {"joint_reps", args.joint_reps}, {"ptune_m", args.ptune_m}, {"tp", args.tp},
+                         {"group", args.group}};
       // The JSON is rewritten after every mode, so a later failure keeps the earlier numbers.
       if (args.modes.count("ops")) b.Ops(), b.Write();
       if (model) b.SetupModel();

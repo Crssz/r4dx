@@ -198,6 +198,14 @@ set_tests_properties(test_trellis_gemma_plan PROPERTIES ENVIRONMENT "HIP_VISIBLE
 # /EHc-: see tests/kernels/CMakeLists.txt (an extern "C" throw is otherwise uncatchable).
 set_source_files_properties(test_trellis_gemma_plan.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
 
+# test_trellis_bench_shapes: host-only check of the Gemma shape table tool_trellis_gemm_bench's
+# `--group gemma` tunes (tests/kernels/trellis_bench_shapes.hpp) against the plan / tune_gemm.py shapes.
+add_executable(test_trellis_bench_shapes test_trellis_bench_shapes.cpp)
+target_link_libraries(test_trellis_bench_shapes PRIVATE r4dx_model_linear)
+add_test(NAME test_trellis_bench_shapes COMMAND test_trellis_bench_shapes)
+set_tests_properties(test_trellis_bench_shapes PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+set_source_files_properties(test_trellis_bench_shapes.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
 # Tensor-parallel P1 (docs/tp.md 10.1): four CPU-only tests of the TP building blocks under
 # src/model/tp/ -- no HIP call, no device, no container -- so, like test_mtp_round above, plain
 # add_test() with no ENVIRONMENT / SKIP_RETURN_CODE: they always run.

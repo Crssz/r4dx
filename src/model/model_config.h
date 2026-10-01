@@ -33,6 +33,10 @@ struct ModelConfig {
   int64_t num_attention_heads = 0;
   int64_t num_key_value_heads = 0;
   int64_t head_dim = 0;
+  // Gemma 4 only (GemmaConfig::ToModelConfig): the full-attention layers' head width (global_head_dim),
+  // which `head_dim` (the sliding layers') cannot also be. 0 for Qwen. tp::RuleFor reads it to size
+  // rotation.had_o_full_signs (K = num_attention_heads * global_head_dim).
+  int64_t global_head_dim = 0;
   bool attn_output_gate = true;
 
   int64_t intermediate_size = 0;

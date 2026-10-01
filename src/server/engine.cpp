@@ -177,11 +177,29 @@ void Engine::LoadAndStart() {
   // and building it at load time is also what makes a bad value fail at startup rather than on the
   // first request with an image.
   image_preproc_ = r4dx::vision::MakeImageProcessorConfig(opts_.image_max_pixels);
+  if (model_->ImageBoiTokenId() >= 0) {
+    // Gemma 4 (docs/gemma4-plan.md M2): Gemma4UnifiedImageProcessor, sized by a soft-token budget instead of a
+    // pixel cap. 70 / 140 / 280 only: an image is one prefill chunk of <= 288 rows.
+    if (opts_.image_soft_tokens != 70 && opts_.image_soft_tokens != 140 && opts_.image_soft_tokens != 280) {
+      throw std::runtime_error("--image-soft-tokens must be 70, 140 or 280 (560 / 1120 are processor budgets but "
+                               "an image block is limited to 288 soft tokens: one prefill chunk, sliding ring = "
+                               "window + 288)");
+    }
+    image_preproc_.gemma = true;
+    image_preproc_.gemma_soft_tokens = opts_.image_soft_tokens;
+  }
   if (model_->HasVision()) {
-    std::fprintf(stderr,
-                 "[r4dx-server] vision tower ready (image_max_pixels=%lld, an image above that is "
-                 "downsized by smart_resize, not rejected)\n",
-                 static_cast<long long>(image_preproc_.max_pixels));
+    if (image_preproc_.gemma) {
+      std::fprintf(stderr,
+                   "[r4dx-server] vision embedder ready (Gemma 4, %d soft tokens per image at most; an image is "
+                   "resized to the largest 48-multiple size inside that budget)\n",
+                   opts_.image_soft_tokens);
+    } else {
+      std::fprintf(stderr,
+                   "[r4dx-server] vision tower ready (image_max_pixels=%lld, an image above that is "
+                   "downsized by smart_resize, not rejected)\n",
+                   static_cast<long long>(image_preproc_.max_pixels));
+    }
   }
 
   worker_ = std::thread(&Engine::WorkerLoop, this);
@@ -448,8 +466,12 @@ void Engine::RunRequest(PendingRequest& req) {
         const int merge_size = static_cast<int>(model_->VisionMergeSize());
         r4dx::vision::ExpandedImagePrompt expanded;
         try {
-          expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id,
-                                                            placeholders_in, merge_size);
+          // Gemma 4 (ImageBoiTokenId() >= 0): one `<|image|>` per image becomes boi + N soft tokens + eoi;
+          // merge_size is 1 there (grids are in merged cells). Qwen: -1 / -1, unchanged.
+          expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id, placeholders_in,
+                                                            merge_size,
+                                                            static_cast<int32_t>(model_->ImageBoiTokenId()),
+                                                            static_cast<int32_t>(model_->ImageEoiTokenId()));
         } catch (const std::exception& e) {
           note_error(400);
           req.sink->OnError(400,

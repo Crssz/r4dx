@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
   opts.dflash_p_min = args.dflash_p_min;
   opts.dflash_n_min = args.dflash_n_min;
   opts.image_max_pixels = args.image_max_pixels;
+  opts.image_soft_tokens = static_cast<int>(args.image_soft_tokens);
   // Empty unless --tokenizer-dir was given: the engine then resolves the dialect's default directory.
   opts.tokenizer_dir = args.tokenizer_dir_given ? args.tokenizer_dir : std::string();
   if (args.dialect != "auto") {

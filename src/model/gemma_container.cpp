@@ -98,6 +98,15 @@ GemmaContainer GemmaContainer::Load(const std::string& path, const GemmaLoadOpti
         [&](const std::string& name) { return UploadRawF32(reader, name); }, c.info_.full_attn_out_elems);
     LogRotation(*c.info_.rotation, path);
   }
+  if (o.vision != GemmaVisionLoad::kOff) {
+    if (GemmaContainerHasVisionTensors(reader)) {
+      c.vision_.emplace(LoadGemmaVisionWeights(reader, hidden, path));
+    } else if (o.vision == GemmaVisionLoad::kOn) {
+      throw std::runtime_error("r4dx::model::GemmaContainer: " + path +
+                               ": vision requested but the container has no vision.* tensors (convert with "
+                               "r4dx-convert --vision on)");
+    }
+  }
   if (fallbacks > 0) {
     std::fprintf(stderr,
                  "r4dx: %d linear(s) in %s do not carry the requested layout and were loaded as bf16\n",

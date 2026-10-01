@@ -12,6 +12,7 @@
 
 #include "gemma_test_util.h"
 #include "gemma_vision.h"
+#include "image_prompt.h"
 
 using namespace r4dx::vision;
 
@@ -71,6 +72,20 @@ void TestExpansion() {
     threw = true;
   }
   GCHECK(threw);
+  // image_prompt.h's ExpandImagePlaceholders (what the server calls) with the boi / eoi wrapper agrees, with the
+  // Gemma grid convention: merge_size 1, grid in merged cells.
+  {
+    std::vector<ImagePlaceholderSpan> in(2);
+    in[0].grid = GridThw{1, 1, 3};
+    in[1].grid = GridThw{1, 2, 1};
+    const ExpandedImagePrompt q = ExpandImagePlaceholders(raw, kGemmaImageTokenId, in, 1, kGemmaBoiTokenId, kGemmaEoiTokenId);
+    GCHECK(q.tokens == want);
+    GCHECK(q.spans.size() == 2 && q.spans[0].offset == 3 && q.spans[0].tokens == 3 && q.spans[1].offset == 9 &&
+           q.spans[1].tokens == 2);
+    // Qwen default (no wrapper) is unchanged.
+    const ExpandedImagePrompt plain = ExpandImagePlaceholders(raw, kGemmaImageTokenId, in, 1);
+    GCHECK(plain.tokens.size() == raw.size() - 2 + 3 + 2);
+  }
   // The blocks found in the expansion are the spans (boi / eoi are not part of a block).
   const std::vector<ImageBlock> blocks = FindImageBlocks(e.tokens, kGemmaImageTokenId, 0);
   GCHECK(blocks.size() == 2 && blocks[0].start == 3 && blocks[0].end == 6 && blocks[1].start == 9 && blocks[1].end == 11);

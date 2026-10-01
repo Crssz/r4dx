@@ -51,10 +51,16 @@ struct ExpandedImagePrompt {
 // Throws std::runtime_error if the placeholder count in `raw_tokens` does not exactly match
 // `images.size()` -- a caller-bookkeeping mismatch (a rendered prompt that doesn't agree with how
 // many images were actually decoded) that must never silently splice the wrong image's rows.
+//
+// `boi_id` / `eoi_id` (Gemma 4, docs/gemma4-plan.md M2; default -1 = none, the Qwen behavior): when >= 0 the run
+// is wrapped `<|image>` + N x placeholder + `<image|>` -- the Gemma processor's expansion of its one `<|image|>`
+// per image -- and `offset` is the index of the first PLACEHOLDER (after the boi), which is what the bidirectional
+// block and the splice use.
 inline ExpandedImagePrompt ExpandImagePlaceholders(const std::vector<int32_t>& raw_tokens,
                                                     int32_t image_token_id,
                                                     const std::vector<ImagePlaceholderSpan>& images,
-                                                    int merge_size) {
+                                                    int merge_size, int32_t boi_id = -1,
+                                                    int32_t eoi_id = -1) {
   ExpandedImagePrompt out;
   out.tokens.reserve(raw_tokens.size());
   size_t next_image = 0;
@@ -68,10 +74,12 @@ inline ExpandedImagePrompt ExpandImagePlaceholders(const std::vector<int32_t>& r
           "rendered prompt has more image placeholders than images were supplied");
     }
     ImagePlaceholderSpan sp = images[next_image];
+    if (boi_id >= 0) out.tokens.push_back(boi_id);
     sp.offset = static_cast<int64_t>(out.tokens.size());
     sp.tokens = sp.grid.MergedTokenCount(merge_size);
     out.spans.push_back(sp);
     out.tokens.insert(out.tokens.end(), static_cast<size_t>(sp.tokens), image_token_id);
+    if (eoi_id >= 0) out.tokens.push_back(eoi_id);
     ++next_image;
   }
   if (next_image != images.size()) {

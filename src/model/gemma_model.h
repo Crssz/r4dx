@@ -64,7 +64,14 @@ struct GemmaModelOptions {
   int prefill_chunk = 256;      // rows per prefill chunk (<= 256: the ring holds window + 288)
   GemmaResid resid = GemmaResid::kFp32;
   bool prompt_checkpoint = false;  // spare copies of the sliding rings for SaveCheckpoint/RestoreCheckpoint
+  // Vision embedder (docs/gemma4-plan.md M2). kAuto: load vision.* iff the container has it; kOn: require it;
+  // kOff: never (the buffers then stay at prefill_chunk rows, the exact pre-M2 sizes).
+  GemmaVisionLoad vision = GemmaVisionLoad::kOff;
 };
+
+// Rows the per-chunk buffers hold when vision is loaded: an image block (<= 288 soft tokens, the sliding ring
+// holds window + 288) is one chunk, never split (docs/gemma4-plan.md 3.2 "Bidirectional image block").
+constexpr int64_t kGemmaVisionBufferRows = 320;
 
 // Reads R4DX_GEMMA_KV (fp8|bf16_full|bf16), R4DX_GEMMA_ATTN (ref|r4d) and R4DX_GEMMA_RESID (fp32|bf16) over the
 // defaults; throws on junk.
@@ -96,6 +103,23 @@ class GemmaModel {
   // `on_chunk_captured` runs once per chunk after it finished (the feature rows of that chunk are valid).
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids,
                              const std::function<void()>& on_chunk_captured = nullptr);
+  // ---- vision (M2; needs the container's vision.* tensors, GemmaModelOptions::vision) --------------------------
+  bool HasVision() const { return container_.HasVision(); }
+  // `pixel_values`: [total_patches, 6912] fp32 on the host (r4dx::vision::PreprocessImages with
+  // ImageProcessorConfig::gemma, or PreprocessGemmaImage); `grids`: one {t=1, h, w} per image in MERGED-grid
+  // cells, h*w rows each, summing to total_patches. Writes [total_patches, hidden] bf16 UNSCALED rows to `out`
+  // (device) and returns synchronized. Each image must have <= 288 soft tokens (one prefill chunk).
+  void EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
+                    core::DeviceBuffer<uint16_t>* out);
+  // Prefill with image blocks. `images`: spans in `token_ids` (offset = first soft token, relative to this
+  // call's tokens), in order and non-overlapping; the placeholder tokens there must be the config's image token.
+  // Their `embeds` rows (device bf16, [tokens, hidden]) overwrite the gathered embedding rows UNSCALED, before the
+  // residual rotation. Each block is one prefill chunk (never split) and, on the SLIDING layers only, is
+  // attended bidirectionally (klimit_ext = the block's last position); full layers and every later decode step
+  // stay causal. Empty `images` is Prefill().
+  std::vector<float> PrefillMultimodal(const std::vector<int32_t>& token_ids, const std::vector<ImageSpan>& images,
+                                       const std::function<void()>& on_chunk_captured = nullptr);
+
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
@@ -106,9 +130,11 @@ class GemmaModel {
   // Runs decoder layer `layer` alone on `x_rows` ([T, hidden] bf16 host, T <= prefill_chunk) as the chunk at
   // absolute position `start_pos` of that layer's own KV cache (successive calls with start_pos = the rows fed
   // so far continue it; call Reset-free, the layer's cache is only ever written at its own positions), and
-  // returns the layer output [T, hidden]. Does not touch PositionCount().
+  // returns the layer output [T, hidden]. Does not touch PositionCount(). `klimit_ext` (optional, [T] absolute
+  // key limits, -1 = causal) is passed to a SLIDING layer's attention only, as PrefillMultimodal does; T may be
+  // up to the vision buffer rows (320) when vision is loaded.
   std::vector<uint16_t> DebugLayerForward(int64_t layer, const std::vector<uint16_t>& x_rows, int64_t T,
-                                          int64_t start_pos);
+                                          int64_t start_pos, const std::vector<int32_t>* klimit_ext = nullptr);
 
   // ---- target hidden-state capture (the DFlash drafter's input, later) ---------------------------------
   // Captures the residual stream ENTERING each listed layer (index == num_layers: the last layer's output,
@@ -130,12 +156,24 @@ class GemmaModel {
     float inv_temperature = 1.0f;
     kernels::RowSummary* out = nullptr;
   };
+  // What a chunk that carries an image block adds: the rows to overwrite with image embeddings (chunk-relative)
+  // and the per-row bidirectional key limit for the sliding layers.
+  struct ChunkVision {
+    struct Splice {
+      int64_t row = 0;
+      int64_t rows = 0;
+      const uint16_t* embeds = nullptr;  // device bf16 [rows, hidden]
+    };
+    std::vector<Splice> splices;
+    std::vector<int32_t> klimit_ext;  // [T] absolute key limit, -1 = causal
+  };
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                              const SummaryRequest* summary_out, SpanAccumulator* prof);
+                              const SummaryRequest* summary_out, SpanAccumulator* prof,
+                              const ChunkVision* vision = nullptr);
   void RotateResidual(void* x, int64_t rows, bool inverse);  // x is fp32 or bf16 per opts_.resid
-  void UploadChunkMeta(int64_t start_pos, int64_t T);
+  void UploadChunkMeta(int64_t start_pos, int64_t T, const std::vector<int32_t>* klimit_ext = nullptr);
   void RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
-                SpanAccumulator* prof);
+                SpanAccumulator* prof, const int32_t* klimit_ext = nullptr);
   void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
 
   GemmaModelOptions opts_;
@@ -143,7 +181,8 @@ class GemmaModel {
   core::Stream stream_;
   core::Arena arena_;
   int64_t max_ctx_ = 0;
-  int max_chunk_ = 256;
+  int max_chunk_ = 256;       // rows per ordinary prefill chunk
+  int64_t buf_rows_ = 256;    // rows the per-chunk buffers hold: max_chunk_, or 320 with vision loaded
   int64_t pos_ = 0;
   bool started_ = false;
   int64_t sampled_fallback_rows_ = 0;
@@ -157,7 +196,7 @@ class GemmaModel {
   int64_t ckpt_pos_ = -1;
 
   core::PinnedBuffer<int32_t> ids_host_;
-  core::DeviceBuffer<int32_t> ids_dev_, positions_dev_, ring_slots_dev_, seqused_dev_;
+  core::DeviceBuffer<int32_t> ids_dev_, positions_dev_, ring_slots_dev_, seqused_dev_, klimit_dev_;
   core::DeviceBuffer<uint16_t> buf_a_, buf_normed_;  // buf_a_: bf16 residual (R4DX_GEMMA_RESID=bf16 only)
   core::DeviceBuffer<float> buf_a32_;                // fp32 residual [max_chunk, hidden] (default; 4 B/elem)
   core::DeviceBuffer<float> logits_dev_;

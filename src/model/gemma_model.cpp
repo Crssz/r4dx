@@ -16,6 +16,7 @@
 #include "r4dx/kernels/gemma_kernels.h"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/rotate_residual.h"
+#include "gemma_vision.h"  // src/vision: image blocks, chunk planner, klimit_ext
 
 namespace r4dx::model {
 
@@ -78,6 +79,7 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   lo.layout = opts.layout;
   lo.lm_head_layout = opts.layout;
   lo.layer_limit = opts.layer_limit;
+  lo.vision = opts.vision;
   m.container_ = GemmaContainer::Load(opts.container_path, lo);
   const GemmaConfig& cfg = m.container_.Config();
   const int64_t hidden = cfg.hidden_size;
@@ -86,12 +88,15 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   m.max_chunk_ = opts.prefill_chunk;
   if (m.container_.LmHead().N != cfg.vocab_size) throw std::runtime_error("GemmaModel::Load: lm_head rows != vocab_size");
 
-  // Per-chunk buffers.
-  const int64_t rows = m.max_chunk_;
+  // Per-chunk buffers. With the vision embedder loaded they hold kGemmaVisionBufferRows (320) rows so that an
+  // image block of up to 288 soft tokens is one chunk; without it they are exactly the prefill_chunk rows.
+  m.buf_rows_ = m.container_.HasVision() ? std::max<int64_t>(m.max_chunk_, kGemmaVisionBufferRows) : m.max_chunk_;
+  const int64_t rows = m.buf_rows_;
   m.ids_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(rows));
   m.ids_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.positions_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.ring_slots_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
+  if (m.container_.HasVision()) m.klimit_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(rows));
   m.seqused_dev_ = core::DeviceBuffer<int32_t>(1);
   // Residual stream: fp32 (4 B/elem, rows x hidden = 3.9 MB at 256 rows) by default, bf16 for A/B (R4DX_GEMMA_RESID).
   if (opts.resid == GemmaResid::kFp32) m.buf_a32_ = core::DeviceBuffer<float>(static_cast<size_t>(rows * hidden));
@@ -206,7 +211,7 @@ void GemmaModel::AttachFeatureCapture(std::vector<int64_t> layers) {
     if (i > 0 && layers[i] <= layers[i - 1]) throw std::invalid_argument("GemmaModel::AttachFeatureCapture: layers must be strictly ascending");
   }
   feature_layers_ = std::move(layers);
-  const size_t feat_elems = static_cast<size_t>(max_chunk_) * feature_layers_.size() * static_cast<size_t>(container_.Config().hidden_size);
+  const size_t feat_elems = static_cast<size_t>(buf_rows_) * feature_layers_.size() * static_cast<size_t>(container_.Config().hidden_size);
   features_dev_.Resize(feat_elems);
   if (opts_.resid == GemmaResid::kFp32) features_f32_.Resize(feat_elems);
   feature_rows_ = 0;
@@ -231,7 +236,7 @@ void GemmaModel::RotateResidual(void* x, int64_t rows, bool inverse) {
   }
 }
 
-void GemmaModel::UploadChunkMeta(int64_t start_pos, int64_t T) {
+void GemmaModel::UploadChunkMeta(int64_t start_pos, int64_t T, const std::vector<int32_t>* klimit_ext) {
   std::vector<int32_t> positions_h(static_cast<size_t>(T));
   for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(start_pos + t);
   positions_dev_.CopyFromHost(positions_h.data(), positions_h.size());
@@ -239,12 +244,18 @@ void GemmaModel::UploadChunkMeta(int64_t start_pos, int64_t T) {
   ring_slots_dev_.CopyFromHost(ring_slots.data(), ring_slots.size());
   const int32_t seqused_h = static_cast<int32_t>(start_pos + T);
   seqused_dev_.CopyFromHost(&seqused_h, 1);
+  if (klimit_ext != nullptr) {
+    if (static_cast<int64_t>(klimit_ext->size()) != T || klimit_dev_.size() < static_cast<size_t>(T)) {
+      throw std::runtime_error("GemmaModel: klimit_ext needs the vision buffers and exactly one entry per row");
+    }
+    klimit_dev_.CopyFromHost(klimit_ext->data(), klimit_ext->size());
+  }
 }
 
 // One decoder layer over `cur` (the residual stream, updated in place) whose input_layernorm output `normed` is
 // already computed. Leaves the NEXT layer's input norm in `normed` when has_next.
 void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
-                          SpanAccumulator* prof) {
+                          SpanAccumulator* prof, const int32_t* klimit_ext) {
   const GemmaConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const float eps = static_cast<float>(cfg.rms_norm_eps);
@@ -276,7 +287,7 @@ void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int
   attn_[static_cast<size_t>(i)].Forward(arena_, normed, o_out, aw, *kv_[static_cast<size_t>(i)], static_cast<int>(T),
                                         static_cast<int>(start_pos), positions_dev_.data(),
                                         lw.full ? positions_dev_.data() : ring_slots_dev_.data(), seqused_dev_.data(),
-                                        s_raw, prof);
+                                        s_raw, prof, lw.full ? nullptr : klimit_ext);  // bidirectional: sliding only
   ProfiledCall(prof, s_raw, "layer.post_attn", [&] {
     if (rotated) {
       if (f32) {
@@ -331,11 +342,11 @@ void GemmaModel::RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int
 }
 
 std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::vector<uint16_t>& x_rows, int64_t T,
-                                                    int64_t start_pos) {
+                                                    int64_t start_pos, const std::vector<int32_t>* klimit_ext) {
   const int64_t hidden = container_.Config().hidden_size;
   if (layer < 0 || layer >= container_.NumLoadedLayers()) throw std::out_of_range("GemmaModel::DebugLayerForward: layer");
-  if (T < 1 || T > max_chunk_ || static_cast<int64_t>(x_rows.size()) != T * hidden) {
-    throw std::invalid_argument("GemmaModel::DebugLayerForward: x_rows must be [T, hidden] with T <= prefill_chunk");
+  if (T < 1 || T > buf_rows_ || static_cast<int64_t>(x_rows.size()) != T * hidden) {
+    throw std::invalid_argument("GemmaModel::DebugLayerForward: x_rows must be [T, hidden] with T <= the chunk buffer rows");
   }
   stream_.Synchronize();
   const bool f32 = opts_.resid == GemmaResid::kFp32;
@@ -347,7 +358,7 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   } else {
     buf_a_.CopyFromHost(x_rows.data(), x_rows.size());
   }
-  UploadChunkMeta(start_pos, T);
+  UploadChunkMeta(start_pos, T, klimit_ext);
   const GemmaLayerWeights& lw = container_.Layer(layer);
   const float eps = static_cast<float>(container_.Config().rms_norm_eps);
   if (f32) {
@@ -355,7 +366,8 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   } else {
     r4dx_rmsnorm_plain_bf16(P(cur), P(lw.input_layernorm.data()), P(buf_normed_.data()), T, hidden, eps, 0, P(stream_.get()));
   }
-  RunLayer(layer, cur, buf_normed_.data(), T, start_pos, /*has_next=*/false, nullptr);
+  RunLayer(layer, cur, buf_normed_.data(), T, start_pos, /*has_next=*/false, nullptr,
+           klimit_ext != nullptr ? klimit_dev_.data() : nullptr);
   stream_.Synchronize();
   std::vector<uint16_t> out(x_rows.size());
   if (f32) {
@@ -368,10 +380,12 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   return out;
 }
 std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
-                                        const SummaryRequest* summary_out, SpanAccumulator* prof) {
+                                        const SummaryRequest* summary_out, SpanAccumulator* prof,
+                                        const ChunkVision* vision) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
-  if (T < 1 || T > max_chunk_) {
-    throw std::runtime_error("GemmaModel::RunChunk: token_ids.size() must be in [1, " + std::to_string(max_chunk_) + "]");
+  if (T < 1 || T > buf_rows_ || (vision == nullptr && T > max_chunk_)) {
+    throw std::runtime_error("GemmaModel::RunChunk: token_ids.size() must be in [1, " +
+                             std::to_string(vision != nullptr ? buf_rows_ : max_chunk_) + "]");
   }
   if (pos_ + T > max_ctx_) {
     throw std::runtime_error("GemmaModel::RunChunk: position " + std::to_string(pos_ + T) + " exceeds max_ctx " +
@@ -402,11 +416,31 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
                                         hidden, cfg.vocab_size, cfg.EmbedScale(), s);
     }
   });
-  // Residual rotation: x Q after the (text-row) scale, before layer 0 (docs/gemma4-plan.md 4.4).
+  // ---- image rows over the gather result (UNSCALED: only text rows carry the sqrt(hidden) scale) -------------
+  // The placeholder rows were gathered from the embedding table above (any in-vocab id is harmless) and are now
+  // overwritten, as HF's masked_scatter does. bf16 [rows, hidden] -> the residual dtype, contiguous per block.
+  if (vision != nullptr) {
+    for (const ChunkVision::Splice& sp : vision->splices) {
+      if (sp.row < 0 || sp.rows < 1 || sp.row + sp.rows > T || sp.embeds == nullptr) {
+        throw std::runtime_error("GemmaModel::RunChunk: bad image splice");
+      }
+      ProfiledCall(prof, s_raw, "embed.image_splice", [&] {
+        if (f32) {
+          r4dx_model_widen_bf16_to_f32(P(sp.embeds), P(static_cast<float*>(cur) + sp.row * hidden), sp.rows * hidden, s);
+        } else {
+          R4DX_HIP_CHECK(hipMemcpyAsync(static_cast<uint16_t*>(cur) + sp.row * hidden, sp.embeds,
+                                        static_cast<size_t>(sp.rows * hidden) * sizeof(uint16_t),
+                                        hipMemcpyDeviceToDevice, s_raw));
+        }
+      });
+    }
+  }
+  // Residual rotation: x Q after the (text-row) scale and the image splice, before layer 0 (docs/gemma4-plan.md 4.4).
   if (rotated) ProfiledCall(prof, s_raw, "rotate.entry", [&] { RotateResidual(cur, T, false); });
 
   // ---- per-chunk metadata (the device is idle here: the previous call ended synchronized) ------------------
-  UploadChunkMeta(pos_, T);
+  UploadChunkMeta(pos_, T, vision != nullptr && !vision->klimit_ext.empty() ? &vision->klimit_ext : nullptr);
+  const int32_t* klimit_dev = vision != nullptr && !vision->klimit_ext.empty() ? klimit_dev_.data() : nullptr;
 
   uint16_t* normed = buf_normed_.data();
   const size_t elem = f32 ? sizeof(float) : sizeof(uint16_t);
@@ -434,7 +468,7 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
 
   for (int64_t i = 0; i < num_layers; ++i) {
     capture_layer_input(i);
-    RunLayer(i, cur, normed, T, pos_, /*has_next=*/i + 1 < num_layers, prof);
+    RunLayer(i, cur, normed, T, pos_, /*has_next=*/i + 1 < num_layers, prof, klimit_dev);
   }
   capture_layer_input(num_layers);
   // Residual rotation exit: x Q^T before the final norm (and on the captured features).
@@ -526,6 +560,95 @@ std::vector<float> GemmaModel::Prefill(const std::vector<int32_t>& token_ids,
     const bool last = off + n == token_ids.size();
     off += n;
     std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr);
+    if (on_chunk_captured) on_chunk_captured();
+    if (last) logits = std::move(l);
+  }
+  return logits;
+}
+
+void GemmaModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                              const std::vector<vision::GridThw>& grids, core::DeviceBuffer<uint16_t>* out) {
+  if (!container_.HasVision()) {
+    throw std::runtime_error("GemmaModel::EncodeImages: no vision embedder loaded (container without vision.* "
+                             "tensors, or loaded with vision off)");
+  }
+  if (grids.empty() || pixel_values == nullptr || out == nullptr) {
+    throw std::invalid_argument("GemmaModel::EncodeImages: need pixel values, at least one grid and an output");
+  }
+  int64_t sum = 0;
+  std::vector<int32_t> pos;
+  for (const vision::GridThw& g : grids) {
+    const int64_t n = g.h * g.w;
+    if (g.t != 1 || g.h < 1 || g.w < 1) throw std::invalid_argument("GemmaModel::EncodeImages: bad grid");
+    if (n > vision::kGemmaMaxImageBlockTokens) {
+      throw std::invalid_argument("GemmaModel::EncodeImages: an image of " + std::to_string(n) + " soft tokens exceeds the " +
+                                  std::to_string(vision::kGemmaMaxImageBlockTokens) +
+                                  "-token block limit (one prefill chunk, sliding ring = window + 288); use at most "
+                                  "280 soft tokens per image");
+    }
+    const std::vector<int32_t> p = GemmaGridPositions(g.h, g.w);
+    pos.insert(pos.end(), p.begin(), p.end());
+    sum += n;
+  }
+  if (sum != total_patches) throw std::invalid_argument("GemmaModel::EncodeImages: total_patches != sum of grid sizes");
+  stream_.Synchronize();
+  GemmaVisionEmbed(stream_, arena_, container_.Vision(), pixel_values, pos.data(), sum, out);
+}
+
+std::vector<float> GemmaModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
+                                                 const std::vector<ImageSpan>& images,
+                                                 const std::function<void()>& on_chunk_captured) {
+  if (images.empty()) return Prefill(token_ids, on_chunk_captured);
+  if (token_ids.empty()) throw std::runtime_error("GemmaModel::PrefillMultimodal: token_ids is empty");
+  if (!container_.HasVision()) {
+    throw std::runtime_error("GemmaModel::PrefillMultimodal: image spans given but no vision embedder is loaded "
+                             "(its buffers hold the 288-row image chunk)");
+  }
+  const int64_t total = static_cast<int64_t>(token_ids.size());
+  const int32_t image_id = static_cast<int32_t>(container_.Info().image_token_id);
+  std::vector<vision::ImageBlock> blocks;
+  int64_t prev_end = 0;
+  for (const ImageSpan& sp : images) {
+    if (sp.embeds == nullptr || sp.embeds_on_host) {
+      throw std::runtime_error("GemmaModel::PrefillMultimodal: an image span needs device embeds");
+    }
+    if (sp.tokens < 1 || sp.tokens > vision::kGemmaMaxImageBlockTokens || sp.offset < prev_end ||
+        sp.offset + sp.tokens > total) {
+      throw std::runtime_error("GemmaModel::PrefillMultimodal: image span [" + std::to_string(sp.offset) + ", +" +
+                               std::to_string(sp.tokens) + ") is out of order, empty, over " +
+                               std::to_string(vision::kGemmaMaxImageBlockTokens) + " tokens, or outside the call's tokens");
+    }
+    blocks.push_back({sp.offset, sp.offset + sp.tokens});
+    prev_end = sp.offset + sp.tokens;
+  }
+  // Every maximal run of image placeholders must be exactly one span (a placeholder without rows would read the
+  // embedding table row of a control token; a span shorter than its run would leave placeholders behind).
+  const std::vector<vision::ImageBlock> runs = vision::FindImageBlocks(token_ids, image_id, 0);
+  bool same = runs.size() == blocks.size();
+  for (size_t i = 0; same && i < runs.size(); ++i) same = runs[i].start == blocks[i].start && runs[i].end == blocks[i].end;
+  if (!same) {
+    throw std::runtime_error("GemmaModel::PrefillMultimodal: the image placeholder runs in token_ids do not match the "
+                             "image spans one to one");
+  }
+  const std::vector<vision::PrefillChunk> chunks =
+      vision::PlanPrefillChunks(total, blocks, max_chunk_, vision::kGemmaMaxImageBlockTokens);
+  std::vector<float> logits;
+  size_t next_block = 0;
+  for (size_t ci = 0; ci < chunks.size(); ++ci) {
+    const vision::PrefillChunk& c = chunks[ci];
+    const std::vector<int32_t> chunk(token_ids.begin() + static_cast<ptrdiff_t>(c.start),
+                                     token_ids.begin() + static_cast<ptrdiff_t>(c.start + c.len));
+    ChunkVision cv;
+    std::vector<vision::ImageBlock> abs_blocks;  // this chunk's blocks in ABSOLUTE positions
+    while (next_block < blocks.size() && blocks[next_block].start < c.start + c.len) {
+      const vision::ImageBlock& b = blocks[next_block];
+      cv.splices.push_back({b.start - c.start, b.end - b.start, images[next_block].embeds});
+      abs_blocks.push_back({pos_ + (b.start - c.start), pos_ + (b.end - c.start)});
+      ++next_block;
+    }
+    if (!abs_blocks.empty()) cv.klimit_ext = vision::BuildKlimitExt(pos_, c.len, abs_blocks);
+    const bool last = ci + 1 == chunks.size();
+    std::vector<float> l = RunChunk(chunk, last, nullptr, nullptr, nullptr, cv.splices.empty() ? nullptr : &cv);
     if (on_chunk_captured) on_chunk_captured();
     if (last) logits = std::move(l);
   }

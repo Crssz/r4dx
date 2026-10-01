@@ -251,7 +251,9 @@ class GemmaAttnLayer {
       a.max_ctx = ctx;
       a.window = cfg_.window;
       a.klimit_ext = klimit_ext;
-      if (T <= 32) {
+      // The split-KV decode kernel has no klimit_ext (prefill only, r4d.h): a short image chunk takes the
+      // prefill kernel, which handles any q_len (rows past q_len are clamped and dropped).
+      if (T <= 32 && klimit_ext == nullptr) {
         const int64_t sb = core::r4d::AttnDecodeWindowScratchBytes(a);
         a.scratch = sb > 0 ? arena.Alloc<uint8_t>(static_cast<size_t>(sb), 16) : nullptr;
         ProfiledCall(prof, stream, "attn.core_decode", [&] { core::r4d::AttnDecodeWindowFp8Kv(a, stream); });

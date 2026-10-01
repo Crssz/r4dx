@@ -1776,6 +1776,51 @@ def structural_zero_channels(model_dir: Path, taps: dict[str, tuple],
     return out
 
 
+#: Gemma's mlp_mid taps (down_proj's input = gelu_tanh(gate x) * up x): a channel whose gate pre-activation is
+#: always very negative saturates tanh to exactly -1 in fp32, so its activation is EXACTLY 0 for every token
+#: (Huihui-gemma-4-12B layer 0: 29 of 15360 channels over the whole 458K-token corpus; the weights are ordinary,
+#: HF computes the same zeros). Not a capture bug, and harmless for LDLQ (damping keeps it defined; the down_proj
+#: column sees a constant-zero input) -- but only exempt when the WHOLE Hessian row is exactly zero, which a hook
+#: that captured garbage could not produce.
+ACTIVATION_DEAD_SUFFIX = ".mlp_mid.hess"
+ACTIVATION_DEAD_RULE = ("Gemma mlp_mid only: channels whose Hessian diagonal AND whole row are exactly 0 "
+                        "(gelu_tanh saturated to 0 on every calibration token)")
+
+
+def activation_dead_channels(out_dir: Path, files: list[str], arch: ArchSpec = QWEN) -> dict[str, list[int]]:
+    """{file: channels with an exactly-zero Hessian row} for Gemma's mlp_mid files (ACTIVATION_DEAD_SUFFIX).
+    Reads only the needed entries of the packed upper triangle (memory-mapped). Empty for Qwen."""
+    if not getattr(arch, "is_gemma", False):
+        return {}
+    out: dict[str, list[int]] = {}
+    for f in files:
+        if not f.endswith(ACTIVATION_DEAD_SUFFIX):
+            continue
+        path = out_dir / f
+        with open(path, "rb") as fh:
+            magic, k, flags, _rows, _trace = HESS_HEADER.unpack(fh.read(HESS_HEADER.size))
+        if magic != HESS_MAGIC or flags != HESS_FLAG_PACKED_UPPER:
+            raise ValueError(f"{path}: not a v1 packed .hess file")
+        tri = np.memmap(path, dtype="<f4", mode="r", offset=HESS_HEADER.size)
+        start = lambda r: r * k - r * (r - 1) // 2  # noqa: E731  (row r's first element, H[r, r])
+        diag = np.asarray(tri[start(np.arange(k, dtype=np.int64))], dtype=np.float64)
+        dead = []
+        for i in np.flatnonzero(diag == 0.0)[:MAX_REPORTED_CHANNELS]:
+            i = int(i)
+            right = np.asarray(tri[start(i): start(i) + (k - i)])                    # H[i, i..K)
+            j = np.arange(i, dtype=np.int64)
+            left = np.asarray(tri[start(j) + (i - j)]) if i else np.zeros(0, np.float32)  # H[0..i, i]
+            if not right.any() and not left.any():
+                dead.append(i)
+        if dead:
+            out[f] = dead
+    return out
+
+
+def merge_exempt(a: dict[str, list[int]], b: dict[str, list[int]]) -> dict[str, list[int]]:
+    return {f: sorted(set(a.get(f, [])) | set(b.get(f, []))) for f in set(a) | set(b)}
+
+
 def read_hess_diag(path: Path) -> np.ndarray:
     """The stored fp32 diagonal of a .hess file (row i of the packed upper triangle starts at
     element i*K - i*(i-1)/2), memory-mapped: no full read."""
@@ -2042,6 +2087,9 @@ def regate(out_dir: Path, model_dir: Path | None) -> int:
     if model_dir is None:
         model_dir = Path(doc["model_dir"]) if arch.is_gemma else DEFAULT_MODEL_DIR
     structural = structural_zero_channels(model_dir, taps, arch)
+    act_dead = activation_dead_channels(out_dir, [f for f in doc["files"] if f in taps], arch)
+    structural = merge_exempt(structural, act_dead)
+    gates["activation_dead_channels"] = act_dead
     gates.pop("nonpositive_diag_files", None)
     gates.update(diag_gate(nonpos, structural))
     gates["ok"] = all(gates[g] for g in ("converter_audit_ok", "keys_selected_ok", "k_ok",
@@ -2055,7 +2103,8 @@ def regate(out_dir: Path, model_dir: Path | None) -> int:
     extra["gates"] = gates
     extra["regated"] = {"at": dt.datetime.now(dt.timezone.utc).isoformat(),
                         "rule": "non-positive diagonal allowed only on channels whose preceding "
-                                "norm scale (1 + w) is exactly 0 (never on an rms file)"}
+                                "norm scale (1 + w) is exactly 0 (never on an rms file); "
+                                + ACTIVATION_DEAD_RULE}
     path = write_manifest(out_dir, doc["files"], doc["keys"], extra, rms_keys=doc.get("rms_keys"))
     failed.unlink()
     print(f"[hessian] --regate: gates pass; wrote {path}")
@@ -2704,7 +2753,10 @@ def main() -> int:
     shared_expected = [ref.layer_types.index(t) for t in arch.shared_gate if t in ref.layer_types]
     structural = structural_zero_channels(model_dir, {p.file: (p.scope, p.layer, p.module)
                                                       for p in plans if p.file in st.written}, arch)
+    act_dead = activation_dead_channels(args.out_dir, [p.file for p in plans if p.file in st.written], arch)
+    structural = merge_exempt(structural, act_dead)
     gates = evaluate_gates(audit, all_keys, plans, st, selected_keys, shared_expected, structural)
+    gates["activation_dead_channels"] = act_dead
     print_gates(gates)
 
     files = {f: w for f, w in st.written.items()}

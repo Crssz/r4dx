@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "dialect.h"  // kQwenDefaultTokenizerDir
+
 namespace r4dx::server {
 
 // See src/cli/cli_args.h's kMaxMtpDraftK for the derivation (Model::VerifyWindow requires
@@ -25,7 +27,15 @@ struct ServerArgs {
   std::string layout = "bf16";
   // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
   // chat-template files are byte-identical to the base Qwen3.8-27B's.
-  std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
+  std::string tokenizer_dir = kQwenDefaultTokenizerDir;  // dialect.h
+  // True iff --tokenizer-dir was given. When it was not, main.cpp hands Engine an EMPTY tokenizer_dir
+  // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
+  // tokenizer dir, or the Qwen default above (unchanged).
+  bool tokenizer_dir_given = false;
+  // --dialect {auto|qwen35|gemma4} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
+  // (reasoning markers, tool-call syntax, EOS list, BOS on raw prompts). auto reads the tokenizer
+  // dir (tokenizer_config.json / vocab), then cross-checks the loaded model's architecture.
+  std::string dialect = "auto";
   std::string host = "127.0.0.1";
   int port = 8080;
   // docs/r9700.md R13 (2026-09-20, measured): raised from 131072 -- the checkpoint's own
@@ -34,6 +44,13 @@ struct ServerArgs {
   // 21-24% of the card's VRAM free (see src/cli/cli_args.h's matching comment and docs/r9700.md's
   // R13/Q17 entries for the full measurement).
   int64_t max_ctx = 262144;
+  // True iff --max-ctx was given. A Gemma container's default is the checkpoint's own
+  // max_position_embeddings (131072, docs/gemma4-plan.md 9.1) via GemmaConfig::ResolveMaxCtx -- the 262144
+  // above stays the Qwen default, untouched.
+  bool max_ctx_given = false;
+  // --extended-ctx: the opt-in for a Gemma context above the checkpoint's 131072 (up to 262144): with no
+  // --max-ctx it selects 262144, with one it allows a value above 131072. No effect on Qwen.
+  bool extended_ctx = false;
   // -1 (default): load every layer Config().num_hidden_layers declares (the real 64-layer
   // container). >=0: load only the first N layers -- required for a smaller test container that
   // physically carries fewer layers than its (verbatim-copied) config.json declares, e.g.
@@ -143,7 +160,8 @@ struct ServerUsageError : std::runtime_error {
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "[--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N] "
+         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--host <addr>] [--port N] "
+         "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
@@ -220,10 +238,12 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
     else if (arg == "--layout") a.layout = NextServerArg(argc, argv, i, "--layout");
-    else if (arg == "--tokenizer-dir") a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir");
+    else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
+    else if (arg == "--dialect") a.dialect = NextServerArg(argc, argv, i, "--dialect");
+    else if (arg == "--extended-ctx") a.extended_ctx = true;
     else if (arg == "--host") a.host = NextServerArg(argc, argv, i, "--host");
     else if (arg == "--port") a.port = ServerParseInt("--port", NextServerArg(argc, argv, i, "--port"));
-    else if (arg == "--max-ctx") a.max_ctx = ServerParseI64("--max-ctx", NextServerArg(argc, argv, i, "--max-ctx"));
+    else if (arg == "--max-ctx") { a.max_ctx = ServerParseI64("--max-ctx", NextServerArg(argc, argv, i, "--max-ctx")); a.max_ctx_given = true; }
     else if (arg == "--max-tokens-default") a.max_tokens_default = ServerParseI64("--max-tokens-default", NextServerArg(argc, argv, i, "--max-tokens-default"));
     else if (arg == "--max-queue") a.max_queue = ServerParseInt("--max-queue", NextServerArg(argc, argv, i, "--max-queue"));
     else if (arg == "--layers") a.layers = ServerParseI64("--layers", NextServerArg(argc, argv, i, "--layers"));
@@ -264,6 +284,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.model_path.empty()) throw ServerUsageError("--model is required");
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  }
   if (a.max_tokens_default < 0) throw ServerUsageError("--max-tokens-default must be >= 0");
   if (a.max_queue <= 0) throw ServerUsageError("--max-queue must be > 0");
   if (a.layers < -1) throw ServerUsageError("--layers must be >= 0 (or omitted for the full model)");

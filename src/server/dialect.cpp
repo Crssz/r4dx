@@ -1,5 +1,8 @@
 #include "dialect.h"
 
+#include <fstream>
+#include <iterator>
+
 #include "nlohmann/json.hpp"
 
 namespace r4dx::server {
@@ -85,6 +88,39 @@ DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_
     if (it != j.end() && it->is_string() && it->get<std::string>() == "GemmaTokenizer") gemma = true;
   }
   return gemma ? DialectKind::kGemma4 : DialectKind::kQwen35;
+}
+
+namespace {
+
+std::string ReadFileIfPresent(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return "";
+  return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+std::string JoinPath(const std::string& dir, const char* name) {
+  if (dir.empty()) return name;
+  const char last = dir.back();
+  return (last == '/' || last == '\\') ? dir + name : dir + "/" + name;
+}
+
+}  // namespace
+
+DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
+                               bool container_is_gemma) {
+  if (requested) return *requested;
+  if (tokenizer_dir.empty()) return container_is_gemma ? DialectKind::kGemma4 : DialectKind::kQwen35;
+  const std::string config = ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer_config.json"));
+  // The (tens of MB) vocab is only scanned when the config alone did not say Gemma.
+  if (DetectDialect(config, /*has_turn_token=*/false) == DialectKind::kGemma4) return DialectKind::kGemma4;
+  const bool has_turn_token =
+      ReadFileIfPresent(JoinPath(tokenizer_dir, "tokenizer.json")).find("\"<|turn>\"") != std::string::npos;
+  return DetectDialect(config, has_turn_token);
+}
+
+std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& requested) {
+  if (!requested.empty()) return requested;
+  return d.default_tokenizer_dir.empty() ? std::string(kQwenDefaultTokenizerDir) : d.default_tokenizer_dir;
 }
 
 std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view model_arch) {

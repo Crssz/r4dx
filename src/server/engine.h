@@ -23,11 +23,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "chat_template.h"
+#include "dialect.h"
 #include "model.h"  // ModelOptions
 #include "openai_types.h"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
@@ -54,7 +56,13 @@ struct EngineOptions {
   std::function<std::unique_ptr<r4dx::model::TextModel>(const r4dx::model::ModelOptions&,
                                                         const r4dx::model::TpOptions&)>
       model_loader;
+  // Empty (main.cpp passes empty unless --tokenizer-dir was given) = the dialect's default directory
+  // (ModelDialect::default_tokenizer_dir; kQwenDefaultTokenizerDir for Qwen).
   std::string tokenizer_dir;
+  // `--dialect` (docs/gemma4-plan.md 5.3, task M1-14): nullopt = auto (tokenizer_config.json /
+  // vocab, else -- with no --tokenizer-dir -- the container's architecture). Resolved once in
+  // LoadAndStart, then cross-checked against TextModel::Config().arch (fail fast on a mismatch).
+  std::optional<DialectKind> dialect;
   int64_t max_tokens_default = 128;
   int max_queue = 16;
   SamplingParams sampling_defaults;
@@ -132,6 +140,9 @@ class Engine {
   void LoadAndStart();
 
   const std::string& ModelId() const { return model_id_; }
+  // The resolved dialect (Qwen3.5 until LoadAndStart picked one). Static storage: the pointer
+  // http_server.cpp hands its sinks stays valid for the process.
+  const ModelDialect& Dialect() const { return *dialect_; }
   int64_t MaxCtx() const { return opts_.model_opts.max_ctx; }
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
@@ -203,6 +214,8 @@ class Engine {
 
   EngineOptions opts_;
   std::string model_id_;
+  const ModelDialect* dialect_ = &Qwen35Dialect();
+  std::string tokenizer_dir_;  // opts_.tokenizer_dir after the default was resolved
 
   std::unique_ptr<r4dx::Tokenizer> tok_;
   std::unique_ptr<r4dx::ChatTemplate> tmpl_;

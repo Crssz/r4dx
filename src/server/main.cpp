@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstdio>
 
+#include "arch.h"
 #include "engine.h"
 #include "http_server.h"
 #include "model.h"
@@ -56,7 +57,17 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;
   }
-  opts.model_opts.max_ctx = args.max_ctx;
+  // max_ctx (docs/gemma4-plan.md 9.1, task M1-14): Qwen keeps args.max_ctx exactly (262144 unless
+  // --max-ctx); a Gemma container defaults to its config's max_position_embeddings (131072) via
+  // GemmaConfig::ResolveMaxCtx, with --extended-ctx the opt-in for up to 262144.
+  try {
+    opts.model_opts.max_ctx = r4dx::model::ResolveContainerMaxCtx(
+        args.model_path, r4dx::model::DetectArch(args.model_path), args.max_ctx_given, args.max_ctx,
+        args.extended_ctx);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "error: %s\n", e.what());
+    return 2;
+  }
   opts.model_opts.layer_limit = args.layers;
   opts.model_opts.mtp_draft_k = args.mtp;
   opts.model_opts.mtp_head_layout = (args.mtp_head_layout == "bf16")
@@ -74,7 +85,12 @@ int main(int argc, char** argv) {
   opts.dflash_p_min = args.dflash_p_min;
   opts.dflash_n_min = args.dflash_n_min;
   opts.image_max_pixels = args.image_max_pixels;
-  opts.tokenizer_dir = args.tokenizer_dir;
+  // Empty unless --tokenizer-dir was given: the engine then resolves the dialect's default directory.
+  opts.tokenizer_dir = args.tokenizer_dir_given ? args.tokenizer_dir : std::string();
+  if (args.dialect != "auto") {
+    r4dx::server::DialectKind kind;
+    if (r4dx::server::ParseDialectName(args.dialect, &kind)) opts.dialect = kind;
+  }
   opts.max_tokens_default = args.max_tokens_default;
   opts.max_queue = args.max_queue;
   opts.default_thinking = args.think;

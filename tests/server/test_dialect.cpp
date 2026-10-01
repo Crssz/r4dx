@@ -1,6 +1,9 @@
 // tests/server/test_dialect.cpp -- ModelDialect table, selection, arch cross-check and the
 // prompt-state helpers the engine wiring (M1-14) will call.
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 #include <string>
 
 #include "dialect.h"
@@ -92,9 +95,48 @@ void TestPromptState() {
   CHECK(g.CheckpointSuffix(true, after_tool).empty());
 }
 
+// ResolveDialectKind / ResolveTokenizerDir (task M1-14), over throwaway tokenizer directories.
+void TestResolve() {
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "r4dx_test_dialect_resolve";
+  fs::remove_all(root);
+  auto make_dir = [&](const std::string& name, const std::string& config, const std::string& tokenizer_json) {
+    const fs::path d = root / name;
+    fs::create_directories(d);
+    if (!config.empty()) std::ofstream(d / "tokenizer_config.json") << config;
+    if (!tokenizer_json.empty()) std::ofstream(d / "tokenizer.json") << tokenizer_json;
+    return d.string();
+  };
+  const std::string gemma_cfg = make_dir("gemma_cfg", "{\"tokenizer_class\":\"GemmaTokenizer\"}", "");
+  const std::string gemma_vocab = make_dir("gemma_vocab", "{\"tokenizer_class\":\"TokenizersBackend\"}",
+                                           "{\"added_tokens\":[{\"id\":105,\"content\":\"<|turn>\"}]}");
+  const std::string qwen = make_dir("qwen", "{\"tokenizer_class\":\"Qwen2Tokenizer\"}",
+                                    "{\"added_tokens\":[{\"id\":1,\"content\":\"<|im_start|>\"}]}");
+  const std::string empty_dir = make_dir("empty", "", "");
+
+  // an explicit request always wins, whatever the directory says
+  CHECK(ResolveDialectKind(DialectKind::kQwen35, gemma_cfg, true) == DialectKind::kQwen35);
+  CHECK(ResolveDialectKind(DialectKind::kGemma4, qwen, false) == DialectKind::kGemma4);
+  // auto with a directory: tokenizer_config.json, then the vocab
+  CHECK(ResolveDialectKind(std::nullopt, gemma_cfg, false) == DialectKind::kGemma4);
+  CHECK(ResolveDialectKind(std::nullopt, gemma_vocab, false) == DialectKind::kGemma4);
+  CHECK(ResolveDialectKind(std::nullopt, qwen, true) == DialectKind::kQwen35);  // the dir outranks the arch
+  CHECK(ResolveDialectKind(std::nullopt, empty_dir, false) == DialectKind::kQwen35);
+  // auto without a directory: the container's architecture
+  CHECK(ResolveDialectKind(std::nullopt, "", true) == DialectKind::kGemma4);
+  CHECK(ResolveDialectKind(std::nullopt, "", false) == DialectKind::kQwen35);
+
+  CHECK(ResolveTokenizerDir(Qwen35Dialect(), "") == kQwenDefaultTokenizerDir);
+  CHECK(ResolveTokenizerDir(Gemma4Dialect(), "") == Gemma4Dialect().default_tokenizer_dir);
+  CHECK(!Gemma4Dialect().default_tokenizer_dir.empty());
+  CHECK(ResolveTokenizerDir(Gemma4Dialect(), "X:\\tok") == "X:\\tok");
+  fs::remove_all(root);
+}
+
 }  // namespace
 
 int main() {
+  TestResolve();
   TestTables();
   TestParseName();
   TestDetect();

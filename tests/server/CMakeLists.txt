@@ -44,6 +44,7 @@ if(R4DX_BUILD_SERVER)
   )
   target_compile_definitions(test_engine_recovery PRIVATE
     R4DX_TOKENIZER_MODEL_DIR="${R4DX_TOKENIZER_MODEL_DIR}"
+    R4DX_GEMMA_TOKENIZER_DIR="${R4DX_GEMMA_TOKENIZER_DIR}"
   )
   target_link_libraries(test_engine_recovery PRIVATE
     r4dx_server_core

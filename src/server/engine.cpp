@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "arch.h"  // r4dx::model::Arch / ReadContainerMetadata / DetectArch (dialect selection)
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md)
 #include "mtp_round.hpp"
 #include "r4dx/kernels/sampler.hpp"
@@ -121,15 +122,44 @@ void Engine::LoadAndStart() {
   // normalizer this tokenizer doesn't implement (tokenizer.h's KNOWN GAP comment) -- without this
   // flag, from_directory() refuses to load this exact checkpoint's tokenizer.json at all.
   tok_options.allow_unimplemented_normalizer = true;
-  tok_ = std::make_unique<r4dx::Tokenizer>(
-      r4dx::Tokenizer::from_directory(opts_.tokenizer_dir, tok_options));
-  tmpl_ = std::make_unique<r4dx::ChatTemplate>(r4dx::ChatTemplate::from_directory(opts_.tokenizer_dir));
+
+  // Dialect (docs/gemma4-plan.md 5.3, task M1-14), resolved once, BEFORE the tokenizer/template load
+  // because it decides their options and the default directory: an explicit --dialect wins; auto looks
+  // at the tokenizer directory when one was given, else at the container's architecture.
+  const DialectKind kind = ResolveDialectKind(
+      opts_.dialect, opts_.tokenizer_dir,
+      r4dx::model::DetectArch(opts_.model_opts.container_path) == r4dx::model::Arch::kGemma4);
+  dialect_ = &DialectFor(kind);
+  // Fail fast, before a multi-GB model load, when the container's header already says the dialect is
+  // wrong. A container that cannot be read (a test's fake model path) says nothing here; the check
+  // against the loaded model's own Config().arch below covers it.
+  {
+    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(opts_.model_opts.container_path);
+    if (meta.is_object()) {
+      const std::string err = CheckDialectAgainstArch(
+          *dialect_, r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(meta)));
+      if (!err.empty()) throw std::runtime_error(err);
+    }
+  }
+  tokenizer_dir_ = ResolveTokenizerDir(*dialect_, opts_.tokenizer_dir);
+  // Both stay at their defaults for Qwen (empty keep-list, polyfills on): byte-identical loading.
+  tok_options.keep_special_on_decode = dialect_->keep_special_on_decode;
+  r4dx::ChatTemplateOptions tmpl_options;
+  tmpl_options.apply_polyfills = dialect_->chat_template_polyfills;
+  tok_ = std::make_unique<r4dx::Tokenizer>(r4dx::Tokenizer::from_directory(tokenizer_dir_, tok_options));
+  tmpl_ = std::make_unique<r4dx::ChatTemplate>(r4dx::ChatTemplate::from_directory(tokenizer_dir_, tmpl_options));
+  std::fprintf(stderr, "[r4dx-server] dialect: %s (tokenizer dir %s)\n", dialect_->name, tokenizer_dir_.c_str());
 
   // docs/tp.md 2.8: --tp 1 is a LocalTextModel (Model::Load, exactly the pre-TP call); --tp 2 a
   // TpModel.
   model_ = opts_.model_loader ? opts_.model_loader(opts_.model_opts, opts_.tp)
                               : r4dx::model::LoadTextModel(opts_.model_opts, opts_.tp);
   model_id_ = model_->ModelId();
+  {
+    const std::string err =
+        CheckDialectAgainstArch(*dialect_, r4dx::model::ArchName(model_->Config().arch));
+    if (!err.empty()) throw std::runtime_error(err);
+  }
   tp_model_ = dynamic_cast<r4dx::model::TpModel*>(model_.get());
   if (tp_model_ != nullptr) {
     // One line per rank (docs/tp.md 9.1's --stats VRAM lines): which HIP device each rank landed on
@@ -235,6 +265,10 @@ void Engine::RunRequest(PendingRequest& req) {
                                       ? ResolveEnableThinking(req.thinking, opts_.default_thinking)
                                       : false;
     if (rec != nullptr) rec->thinking = enable_thinking;
+    const ModelDialect& dialect = *dialect_;
+    // The chat template's output, kept past the chat branch: the dialect decides from its tail where
+    // generated text starts relative to reasoning, and what the checkpoint must stay clear of.
+    std::string rendered;
     if (req.kind == RequestKind::kChat) {
       // Vision (docs/vision.md, docs/server.md "Images"): every image content part across the
       // WHOLE conversation, in the order the client's `messages` array carries them -- a client
@@ -262,6 +296,22 @@ void Engine::RunRequest(PendingRequest& req) {
         req.sink->OnError(400, "this model/container has no vision tower (loaded without "
                                 "vision.* tensors, or started with --vision off)");
         return;
+      }
+
+      // Gemma 4's template silently DROPS a tool-role message that has no assistant `tool_calls` message
+      // before it (docs/gemma4-plan.md 5.3), which would answer a different conversation than the one
+      // sent: refuse it as a 400 instead. The Qwen template has no such rule and is not checked.
+      if (dialect.kind == DialectKind::kGemma4) {
+        bool seen_tool_calls = false;
+        for (const auto& m : req.messages) {
+          if (m.role == "assistant" && !m.tool_calls.empty()) seen_tool_calls = true;
+          if ((m.role == "tool" || m.role == "function") && !seen_tool_calls) {
+            note_error(400);
+            req.sink->OnError(400, "a tool message must follow an assistant message carrying tool_calls "
+                                    "(this model's chat template would drop it)");
+            return;
+          }
+        }
       }
 
       r4dx::ChatJson messages = r4dx::ChatJson::array();
@@ -336,10 +386,15 @@ void Engine::RunRequest(PendingRequest& req) {
       // (ThinkingControls::template_effort). An explicit `chat_template_kwargs.reasoning_effort`
       // still wins, same passthrough rule as above; absent both, the template applies its own
       // default ("xhigh").
-      if (req.thinking.template_effort && !extra_context.contains("reasoning_effort")) {
-        extra_context["reasoning_effort"] = *req.thinking.template_effort;
+      if (dialect.has_reasoning_effort) {
+        if (req.thinking.template_effort && !extra_context.contains("reasoning_effort")) {
+          extra_context["reasoning_effort"] = *req.thinking.template_effort;
+        }
+      } else {
+        // Gemma 4's template has no effort levels: `reasoning_effort` (a request field or a
+        // chat_template_kwargs entry) is ignored rather than passed to a template that never reads it.
+        extra_context.erase("reasoning_effort");
       }
-      std::string rendered;
       try {
         rendered = tmpl_->render(messages, /*add_generation_prompt=*/true, req.tools, extra_context);
       } catch (const std::exception& e) {
@@ -368,10 +423,19 @@ void Engine::RunRequest(PendingRequest& req) {
       // "<think>\n" + "" + "\n</think>\n\n...", and "\n\n" is ONE token: the replay diverges AT this
       // prompt's last token, so a checkpoint at the prompt's end would never be its prefix. One
       // token earlier it is (docs/server.md "Prefix cache", prompt checkpoint).
-      static constexpr std::string_view kThinkOpen = "<think>\n";
-      if (rendered.size() >= kThinkOpen.size() &&
-          std::string_view(rendered).substr(rendered.size() - kThinkOpen.size()) == kThinkOpen) {
-        ckpt_back = 1;
+      //
+      // Dialect-driven (task M1-14): ModelDialect::CheckpointSuffix names the text the checkpoint must
+      // stay clear of. Qwen: "<think>\n" when thinking is on, held back as exactly ONE token (the
+      // "\n", as before). Gemma: with thinking off the prompt ends with the empty pre-closed span
+      // "<|channel>thought\n<channel|>", which the template does NOT re-render for the replayed turn --
+      // the whole suffix (4 tokens) is held back, counted by encoding it.
+      {
+        const std::string suffix = dialect.CheckpointSuffix(enable_thinking, rendered);
+        if (!suffix.empty()) {
+          ckpt_back = dialect.kind == DialectKind::kQwen35
+                          ? 1
+                          : static_cast<int64_t>(tok_->encode(suffix, /*parse_special=*/true).size());
+        }
       }
 
       // Vision: expand every `<|image_pad|>` placeholder the template just emitted (one per image
@@ -410,7 +474,12 @@ void Engine::RunRequest(PendingRequest& req) {
     } else {
       // Raw prompt: never trust literal special-token surface forms in caller-supplied text.
       const std::vector<r4dx::TokenId> raw_tokens = tok_->encode(req.raw_prompt, /*parse_special=*/false);
-      full_tokens_i32.assign(raw_tokens.begin(), raw_tokens.end());
+      // Gemma 4 trains with a leading <bos> (docs/gemma4-semantics.md; the chat template emits it as
+      // text, a raw prompt has no template): prepend it once. Qwen: nothing is added.
+      if (dialect.bos_on_raw_prompt && tok_->bos_id() != r4dx::kNoToken) {
+        full_tokens_i32.push_back(static_cast<int32_t>(tok_->bos_id()));
+      }
+      full_tokens_i32.insert(full_tokens_i32.end(), raw_tokens.begin(), raw_tokens.end());
     }
 
     if (rec != nullptr) rec->prompt_tokens = static_cast<int64_t>(full_tokens_i32.size());
@@ -542,7 +611,16 @@ void Engine::RunRequest(PendingRequest& req) {
     const int64_t ctx_budget = MaxCtx() - static_cast<int64_t>(full_tokens_i32.size());
     if (max_tokens > ctx_budget) max_tokens = std::max<int64_t>(0, ctx_budget);
 
-    req.sink->OnStart(static_cast<int64_t>(full_tokens_i32.size()));
+    // Where generated text starts relative to reasoning (task M1-14): the dialect decides from the
+    // resolved thinking flag and the rendered prompt's tail. Qwen: in reasoning when thinking is on
+    // (the prompt ends "<think>\n"), else answer -- exactly the old `enable_thinking` rule. Gemma: the
+    // model opens its own span unless the prompt already did (thinking on after a tool response).
+    // /v1/completions renders nothing and never splits.
+    const ReasoningSplitter::StartState reasoning_start =
+        req.kind == RequestKind::kChat ? dialect.ReasoningStart(enable_thinking, rendered)
+                                       : ReasoningSplitter::StartState::kAnswer;
+    req.sink->OnStart(static_cast<int64_t>(full_tokens_i32.size()),
+                      req.kind == RequestKind::kChat && dialect.ReasoningOpenInPrompt(enable_thinking, rendered));
 
     // --prompt-checkpoint: the state after the first `ckpt_len` tokens of this prompt is saved for
     // the next request's Plan() -- after a prefill, before any decode step moves the GDN state into a
@@ -610,7 +688,9 @@ void Engine::RunRequest(PendingRequest& req) {
     const bool greedy = req.sampling.temperature <= 0.0f;
 
     auto decoder = tok_->make_stream_decoder(/*skip_special_tokens=*/true);
-    const auto& eos_ids = tok_->eos_ids();
+    // Gemma 4: generation_config.json's [1, 106, 50] (<eos>, <turn|>, <|tool_response>); Qwen: the
+    // tokenizer's own list, as before.
+    const std::vector<int32_t>& eos_ids = dialect.eos_ids.empty() ? tok_->eos_ids() : dialect.eos_ids;
     auto is_eos = [&](int32_t id) {
       for (int32_t e : eos_ids) {
         if (e == id) return true;
@@ -642,23 +722,31 @@ void Engine::RunRequest(PendingRequest& req) {
     // count tokens itself). `stop_search_floor` starts at `npos` (skip stop matching entirely) for
     // a thinking-enabled request and 0 (no restriction) otherwise, byte-for-byte preserving
     // today's behavior when thinking is off.
-    bool reasoning_open = enable_thinking;
+    //
+    // Dialect-aware (task M1-14): a ReasoningLocator over the dialect's syntax replaces the literal
+    // "</think>" / `+ 8` arithmetic. For Qwen it is the same computation (start in reasoning when
+    // thinking is on, the close tag's end position, answer-from-byte-0 when thinking is off). For
+    // Gemma the start may be undecided (kPending: the generated text is still a proper prefix of
+    // "<|channel>thought\n"), which counts as "reasoning may be open" until the first bytes decide it.
+    ReasoningLocator locator(dialect.reasoning, reasoning_start);
+    bool reasoning_open = locator.reasoning_open();
     int64_t reasoning_tokens = 0;
-    size_t stop_search_floor = enable_thinking ? std::string::npos : 0;
+    size_t stop_search_floor = reasoning_open ? std::string::npos : 0;
     // The offset in `accumulated` of the first byte AFTER "</think>" -- the same position
     // `stop_search_floor` ends up holding, tracked separately because the two answer very different
     // questions (one bounds the stop-string search, the other tells the tool-call stream gate below
     // where the ANSWER text it may gate actually starts) and nothing should silently couple them.
     // `0` from the start when thinking is off: the whole generation is answer text then.
-    size_t think_end = enable_thinking ? std::string::npos : 0;
+    size_t think_end = reasoning_open ? std::string::npos : 0;
     auto NoteReasoningProgress = [&]() {
       if (!reasoning_open) return;
-      const size_t p = accumulated.find("</think>");
-      if (p == std::string::npos) return;
+      locator.Update(accumulated);
+      if (locator.reasoning_open()) return;
       reasoning_open = false;
-      reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
-      stop_search_floor = p + 8;  // strlen("</think>")
-      think_end = p + 8;
+      // 0 = no reasoning span at all (Gemma answered directly): nothing to count.
+      reasoning_tokens = locator.reasoning_end() == 0 ? 0 : static_cast<int64_t>(generated_tokens.size());
+      stop_search_floor = locator.reasoning_end();  // Qwen: the end of "</think>", as before
+      think_end = locator.reasoning_end();
     };
 
     // Tool calls (docs/server.md's "Tool calls" streaming decision): a request that offers tool
@@ -694,9 +782,9 @@ void Engine::RunRequest(PendingRequest& req) {
     // (no tag, no blank-line skip, the whole generation is answer text and the sinks append it
     // verbatim); with thinking on it is only known once the tag AND the first byte that survives
     // ReasoningSplitter's leading-blank-line skip have both arrived.
-    size_t answer_begin = enable_thinking ? std::string::npos : 0;
+    size_t answer_begin = reasoning_open ? std::string::npos : 0;
     size_t gate_fed = 0;     // answer bytes already pushed into `gate`
-    ToolStreamGate gate;
+    ToolStreamGate gate(dialect.tool_open);  // Qwen: "<tool_call>", the gate's own default
     auto FlushGated = [&](bool finishing) {
       // Keep `think_end` current before using it: a single decoded piece can carry the close tag
       // AND answer text (even an entire "<tool_call>" opener) at once, so waiting for the call
@@ -709,10 +797,9 @@ void Engine::RunRequest(PendingRequest& req) {
           // Skip the blank lines right after the tag exactly as ReasoningSplitter does, so the gate
           // is fed the same `rest` string the end-of-generation split produces. The skip is only
           // final once a non-newline byte shows up; until then every byte so far is one the sink's
-          // own splitter will drop, so forwarding it raw is free.
-          size_t i = think_end;
-          while (i < streamable && (accumulated[i] == '\n' || accumulated[i] == '\r')) ++i;
-          if (i < streamable) answer_begin = i;
+          // own splitter will drop, so forwarding it raw is free. (ReasoningLocator::AnswerBegin: the
+          // same skip, and none when the answer began without a close tag.)
+          answer_begin = locator.AnswerBegin(accumulated, streamable);
         }
         if (answer_begin != std::string::npos) {
           if (streamable > answer_begin + gate_fed) {
@@ -1002,8 +1089,8 @@ void Engine::RunRequest(PendingRequest& req) {
       // per-piece `reasoning_content` deltas through the sink's own splitter (which saw the raw
       // "</think>" bytes the router forwarded), so calling the one-shot OnReasoningContent here too
       // would duplicate it.
-      if (enable_thinking) {
-        ReasoningSplitter splitter;
+      if (reasoning_start != ReasoningSplitter::StartState::kAnswer) {
+        ReasoningSplitter splitter(dialect.reasoning, reasoning_start);
         std::string reasoning_raw;
         std::string rest;
         auto collect = [&](const std::vector<ReasoningSplitter::Event>& events) {
@@ -1015,7 +1102,7 @@ void Engine::RunRequest(PendingRequest& req) {
         tool_parse_source = std::move(rest);
       }
 
-      r4dx::server::ToolCallParseResult parsed = r4dx::server::ParseToolCalls(tool_parse_source);
+      r4dx::server::ToolCallParseResult parsed = r4dx::server::ParseToolCalls(tool_parse_source, dialect);
       std::vector<std::string> known_names;
       for (const auto& t : req.tools) {
         if (t.is_object() && t.contains("function") && t.at("function").is_object() &&
@@ -1061,7 +1148,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // --stop, cancellation, or max_tokens) before "</think>" ever appeared, every generated token
     // was reasoning -- matches the sinks' own Finish()-flush contract (ReasoningSplitter's own doc
     // comment), which puts all of it in reasoning_content and leaves content empty.
-    if (enable_thinking && reasoning_open) reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
+    if (enable_thinking && locator.state() == ReasoningLocator::State::kReasoning) reasoning_tokens = static_cast<int64_t>(generated_tokens.size());
 
     // `timings` (task point 1, llama.cpp-compatible field names): `prompt_n` is the tokens
     // actually fed to THIS request's Prefill (`new_tokens_i32`, excludes whatever prefix reuse

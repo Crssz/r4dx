@@ -10,6 +10,7 @@
 // a tensor.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include "nlohmann/json.hpp"
@@ -38,5 +39,21 @@ Arch DetectArchFromMetadata(const nlohmann::json& metadata);
 // a safetensors shell, or has no `__metadata__` yields kQwen35: that is today's behaviour, and the
 // Qwen loader then reports its own (unchanged) error for the same file.
 Arch DetectArch(const std::string& container_path);
+
+// `container_path`'s `__metadata__` object (the safetensors-shell header only, never a tensor), or a
+// null json when the file cannot be opened / is not a shell / has no `__metadata__`.
+nlohmann::json ReadContainerMetadata(const std::string& container_path);
+
+// The `max_ctx` a run on `container_path` gets (docs/gemma4-plan.md section 9.1, task M1-14), shared by
+// r4dx-cli and r4dx-server so the two cannot drift:
+//   * kQwen35: `requested` unchanged -- the callers' own default (262144) and every explicit value
+//     behave exactly as before this function existed;
+//   * kGemma4: GemmaConfig::ResolveMaxCtx on the container's text_config. `requested_given` false means
+//     the user passed no --max-ctx: the default is the checkpoint's max_position_embeddings (131072
+//     for Huihui), or kExtendedMaxCtx (262144) when `extended_ctx` (the opt-in flag) is set. An explicit
+//     value above the checkpoint's own limit throws std::invalid_argument unless `extended_ctx`.
+// Throws std::runtime_error when a Gemma container's model_config does not parse.
+int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, bool requested_given,
+                               int64_t requested, bool extended_ctx);
 
 }  // namespace r4dx::model

@@ -351,9 +351,47 @@ void TestDetectArch() {
   Check(DetectArch(junk.string()) == Arch::kQwen35, "file: junk (absurd header length) is kQwen35");
 }
 
+// ResolveContainerMaxCtx (task M1-14): the max_ctx r4dx-cli / r4dx-server hand ModelOptions. Qwen
+// containers are untouched; a Gemma container defaults to 131072, with 262144 an explicit opt-in.
+void TestResolveContainerMaxCtx() {
+  using r4dx::model::ReadContainerMetadata;
+  using r4dx::model::ResolveContainerMaxCtx;
+  json gemma_hdr = {{"__metadata__", {{"model_arch", "gemma4_unified"}, {"model_config", RealModelConfig()}}},
+                    {"text.final_norm", {{"dtype", "U8"}, {"shape", {2}}, {"data_offsets", {0, 2}}}}};
+  const std::string g = WriteShell("r4dx_ctx_gemma.r4dx", gemma_hdr);
+  json qwen_hdr = {{"__metadata__", {{"model_config", {{"model_type", "qwen3_5"}, {"text_config", json::object()}}}}}};
+  const std::string q = WriteShell("r4dx_ctx_qwen.r4dx", qwen_hdr);
+
+  Check(ReadContainerMetadata(g).is_object() && ReadContainerMetadata(g).contains("model_config"),
+        "ReadContainerMetadata returns __metadata__");
+  Check(ReadContainerMetadata((std::filesystem::temp_directory_path() / "r4dx_ctx_missing.r4dx").string()).is_null(),
+        "ReadContainerMetadata: a missing file is null");
+
+  // Qwen: whatever the caller passed, unchanged (262144 default, an explicit value, no opt-in needed).
+  Check(ResolveContainerMaxCtx(q, Arch::kQwen35, false, 262144, false) == 262144, "qwen: default untouched");
+  Check(ResolveContainerMaxCtx(q, Arch::kQwen35, true, 4096, false) == 4096, "qwen: explicit untouched");
+  Check(ResolveContainerMaxCtx("no/such/file.r4dx", Arch::kQwen35, false, 262144, true) == 262144,
+        "qwen: never reads the file");
+
+  // Gemma.
+  Check(ResolveContainerMaxCtx(g, Arch::kGemma4, false, 262144, false) == 131072,
+        "gemma: no --max-ctx -> the checkpoint's 131072 (the CLI/server default 262144 is NOT used)");
+  Check(ResolveContainerMaxCtx(g, Arch::kGemma4, true, 8192, false) == 8192, "gemma: explicit smaller value");
+  Check(ResolveContainerMaxCtx(g, Arch::kGemma4, false, 262144, true) == 262144, "gemma: --extended-ctx alone -> 262144");
+  Check(ResolveContainerMaxCtx(g, Arch::kGemma4, true, 200000, true) == 200000, "gemma: explicit value above 131072 with the opt-in");
+  Check(Throws([&] { ResolveContainerMaxCtx(g, Arch::kGemma4, true, 262144, false); }, "opt-in"),
+        "gemma: 262144 without the opt-in is refused");
+  Check(Throws([&] { ResolveContainerMaxCtx(g, Arch::kGemma4, true, 300000, true); }, "supported maximum"),
+        "gemma: above 262144 is refused even with the opt-in");
+  Check(Throws([&] { ResolveContainerMaxCtx(WriteShell("r4dx_ctx_nocfg.r4dx", json::object()), Arch::kGemma4, false, 0, false); },
+               "model_config"),
+        "gemma: a container without model_config is refused");
+}
+
 }  // namespace
 
 int main() {
+  TestResolveContainerMaxCtx();
   TestRealConfig();
   TestRefusals();
   TestShard();

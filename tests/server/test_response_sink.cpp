@@ -536,9 +536,73 @@ void TestStreamingSinkErrorEmitsAndCloses() {
   CHECK(!sink.Next(event));
 }
 
+// Gemma-dialect sinks (task M1-14): they split reasoning from content whether or not thinking was
+// requested, and OnStart's `reasoning_open_in_prompt` picks the splitter's start state. A Qwen dialect
+// (or none) leaves a sink exactly as before.
+void TestGemmaBufferingSink() {
+  const auto& g = r4dx::server::Gemma4Dialect();
+  const std::string kOpen = "<|channel>thought\n", kClose = "<channel|>";
+  {  // thinking on: the model opens the span itself, pieces split at awkward places
+    BufferingSink sink(/*enable_thinking=*/true, /*emit_reasoning=*/true, &g);
+    sink.OnStart(5, /*reasoning_open_in_prompt=*/false);
+    for (const std::string& p : {std::string("<|chan"), std::string("nel>thought\nPl"), std::string("an.<chan"),
+                                 std::string("nel|>\n\nAnswer.")})
+      sink.OnToken(p);
+    sink.OnDone("stop", 9, {}, 4);
+    CHECK(sink.text == "Answer.");
+    CHECK(sink.reasoning_text == "Plan.");
+    CHECK(sink.prompt_tokens == 5);
+  }
+  {  // thinking on after a tool response: the prompt already opened the span
+    BufferingSink sink(true, true, &g);
+    sink.OnStart(5, /*reasoning_open_in_prompt=*/true);
+    sink.OnToken("Plan." + kClose + "Done.");
+    sink.OnDone("stop", 3);
+    CHECK(sink.text == "Done." && sink.reasoning_text == "Plan.");
+  }
+  {  // thinking off, direct answer: no reasoning at all, text byte-for-byte
+    BufferingSink sink(false, false, &g);
+    sink.OnStart(5, false);
+    sink.OnToken("Hello ");
+    sink.OnToken("<tool_call|> stays.");
+    sink.OnDone("stop", 2);
+    CHECK(sink.text == "Hello <tool_call|> stays." && sink.reasoning_text.empty());
+  }
+  {  // thinking off but the model thinks anyway, reasoning excluded: only the answer survives
+    BufferingSink sink(false, false, &g);
+    sink.OnStart(5, false);
+    sink.OnToken(kOpen + "hm" + kClose + "Yes.");
+    sink.OnDone("stop", 4);
+    CHECK(sink.text == "Yes." && sink.reasoning_text.empty());
+  }
+  {  // a Qwen dialect pointer changes nothing: no thinking, no splitting
+    BufferingSink sink(false, true, &r4dx::server::Qwen35Dialect());
+    sink.OnStart(1, false);
+    sink.OnToken("a</think>b");
+    sink.OnDone("stop", 1);
+    CHECK(sink.text == "a</think>b");
+  }
+}
+
+void TestGemmaStreamingSink() {
+  const auto& g = r4dx::server::Gemma4Dialect();
+  StreamingSink sink(StreamingSink::Kind::kChat, "chatcmpl-g", "m", 1, false, /*enable_thinking=*/true, true, &g);
+  sink.OnStart(3, /*reasoning_open_in_prompt=*/false);
+  sink.OnToken("<|channel>thought\nWhy");
+  sink.OnToken("<channel|>Because.");
+  sink.OnDone("stop", 4);
+  std::string all, event;
+  while (sink.Next(event)) all += event;
+  CHECK(all.find("\"reasoning_content\":\"Why\"") != std::string::npos);
+  CHECK(all.find("\"content\":\"Because.\"") != std::string::npos);
+  CHECK(all.find("<|channel>") == std::string::npos);  // the opener never reaches the client
+}
+
 }  // namespace
 
 int main() {
+  TestGemmaBufferingSink();
+  TestGemmaStreamingSink();
   TestBufferingSinkHappyPath();
   TestBufferingSinkError();
   TestBufferingSinkWaitBlocksUntilDone();

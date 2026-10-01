@@ -698,7 +698,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-6 | done | converter Gemma branch; `--trellis-from` / reuse guard refused for Gemma |
 | M1-7 | done | `bf16.r4dx` written on D: (text-only, kv descale placeholder 1.0) |
 | M1-8..M1-13 | done | minja, goldens, SPM tokenizer, dialect and server parsers (CPU tests pass); M1-11 bench recorded status unverified |
-| M1-14 | pending | engine/sink wiring and Gemma max_ctx plumbing (131072 default) not done |
+| M1-14 | partial | engine/sink wiring, `--dialect`, per-dialect default tokenizer dir, EOS [1,106,50], BOS on raw prompts, dialect `ckpt_back`, tool-without-call 400, `reasoning_effort` ignored, `OnStart(prompt, reasoning_open_in_prompt)`, `--extended-ctx` + `ResolveContainerMaxCtx` (CLI and server; Gemma default 131072, Qwen unchanged) done and building; CPU unit tests pass; `test_engine_recovery` Gemma scenario written but NOT yet run (needs the HIP-linked binary: run it on the GPU lane) |
 | M1-15 | done (compiles) | GPU step is M1-16 |
 | M1-16 | pending-GPU | `test_gemma_postnorm` was run once by accident; rerun properly |
 | M1-17 | done | CPU ring/window tests pass, kernel compiles |

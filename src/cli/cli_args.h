@@ -33,6 +33,11 @@ struct CliArgs {
   // base Qwen3.8-27B's, so this default serves every Qwen3.8-27B-family container. The base checkpoint
   // (C:\AI\models\Qwen3.8-27B) was retired with the base containers (docs/huihui.md).
   std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
+  // True iff --tokenizer-dir was given. When it was not, main.cpp resolves the default from the dialect
+  // (docs/gemma4-plan.md 5.3, task M1-14): Gemma's assembled tokenizer dir, or the Qwen one above.
+  bool tokenizer_dir_given = false;
+  // --dialect {auto|qwen35|gemma4}: same meaning as r4dx-server's (src/server/dialect.h).
+  std::string dialect = "auto";
   std::string prompt;
   // --prompt-file <path>: the one-shot prompt read verbatim (UTF-8) from a file instead of the command
   // line, whose 32767-character Windows limit caps --prompt near 8k tokens (tools/prefill's long
@@ -60,6 +65,11 @@ struct CliArgs {
   // confirmed on real hardware, not capacity arithmetic. See docs/r9700.md's R13/Q17 entries and
   // docs/perf.md's "Long-context validation" section for the full measurement.
   int64_t max_ctx = 262144;
+  // Gemma context plumbing (docs/gemma4-plan.md 9.1, task M1-14), as in r4dx-server: a Gemma container
+  // defaults to its checkpoint's max_position_embeddings (131072) unless --max-ctx is given;
+  // --extended-ctx opts in to up to 262144. Qwen keeps max_ctx above, untouched.
+  bool max_ctx_given = false;
+  bool extended_ctx = false;
   bool stats = false;
   // tools/profile pass (2026-09-19): profiles exactly ONE decode step (Model::DecodeStepProfiled,
   // hipEvent-timed per op-family) right after the prompt's prefill, prints a table to stderr, then
@@ -234,9 +244,9 @@ struct CliUsageError : std::runtime_error {
 inline std::string CliUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--system \"...\"] "
+         "(--prompt \"...\" | --prompt-file <path> | --chat) [--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--system \"...\"] "
          "[--think {on|off}] [--max-tokens N] [--temperature F] [--top-k N] [--top-p F] "
-         "[--min-p F] [--seed N] [--max-ctx N] [--stats] [--profile] [--profile-token N] "
+         "[--min-p F] [--seed N] [--max-ctx N] [--extended-ctx] [--stats] [--profile] [--profile-token N] "
          "[--profile-prefill] [--mtp N] [--mtp-head-layout {bf16|layout}] "
          "[--mtp-draft-head {reduced|full}] [--embed-device-resident {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] [--dflash-p-min F] [--dflash-n-min N] "
@@ -317,7 +327,9 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextCliArg(argc, argv, i, "--model");
     else if (arg == "--layout") a.layout = NextCliArg(argc, argv, i, "--layout");
-    else if (arg == "--tokenizer-dir") a.tokenizer_dir = NextCliArg(argc, argv, i, "--tokenizer-dir");
+    else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextCliArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
+    else if (arg == "--dialect") a.dialect = NextCliArg(argc, argv, i, "--dialect");
+    else if (arg == "--extended-ctx") a.extended_ctx = true;
     else if (arg == "--prompt") a.prompt = NextCliArg(argc, argv, i, "--prompt");
     else if (arg == "--prompt-file") a.prompt_file = NextCliArg(argc, argv, i, "--prompt-file");
     else if (arg == "--chat") a.chat = true;
@@ -329,7 +341,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--top-p") a.top_p = ParseFloat("--top-p", NextCliArg(argc, argv, i, "--top-p"));
     else if (arg == "--min-p") a.min_p = ParseFloat("--min-p", NextCliArg(argc, argv, i, "--min-p"));
     else if (arg == "--seed") a.seed = ParseU64("--seed", NextCliArg(argc, argv, i, "--seed"));
-    else if (arg == "--max-ctx") a.max_ctx = ParseI64("--max-ctx", NextCliArg(argc, argv, i, "--max-ctx"));
+    else if (arg == "--max-ctx") { a.max_ctx = ParseI64("--max-ctx", NextCliArg(argc, argv, i, "--max-ctx")); a.max_ctx_given = true; }
     else if (arg == "--stats") a.stats = true;
     else if (arg == "--profile") a.profile = true;
     else if (arg == "--profile-token") a.profile_token = ParseI64("--profile-token", NextCliArg(argc, argv, i, "--profile-token"));
@@ -377,6 +389,9 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.top_p < 0.0f || a.top_p > 1.0f) throw CliUsageError("--top-p must be in [0, 1]");
   if (a.min_p < 0.0f || a.min_p > 1.0f) throw CliUsageError("--min-p must be in [0, 1]");
   if (a.max_ctx <= 0) throw CliUsageError("--max-ctx must be > 0");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
+    throw CliUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  }
   if (a.layers == 0 || a.layers < -1) throw CliUsageError("--layers must be -1 (every layer) or > 0");
   if (a.top_k < 0) throw CliUsageError("--top-k must be >= 0");
   if (a.mtp < 0 || a.mtp > kMaxMtpDraftK) {

@@ -198,7 +198,12 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       // "think, but do not return the thought" question (reasoning.exclude / include_reasoning,
       // docs/server.md's "Thinking controls").
       const bool enable_thinking = ResolveEnableThinking(req.thinking, engine_ref.DefaultThinking());
-      const bool emit_reasoning = enable_thinking && req.thinking.include_reasoning;
+      // Gemma 4 (task M1-14): the model opens a thought span by itself, thinking requested or not, and
+      // the sink always splits it off; with thinking off a stray span is still returned as
+      // reasoning_content unless the client excluded it (an empty one is not put on the wire below).
+      const ModelDialect& dialect = engine_ref.Dialect();
+      const bool gemma = dialect.kind == DialectKind::kGemma4;
+      const bool emit_reasoning = (enable_thinking || gemma) && req.thinking.include_reasoning;
 
       auto pending = std::make_shared<PendingRequest>();
       pending->kind = RequestKind::kChat;
@@ -222,7 +227,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
       if (req.stream) {
         auto sink = std::make_shared<StreamingSink>(StreamingSink::Kind::kChat, id, model_id, created,
                                                      req.stream_options_include_usage, enable_thinking,
-                                                     emit_reasoning);
+                                                     emit_reasoning, &dialect);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           LogRejected(engine_ref, "chat/completions", "chatcmpl-", id, true, 429);
@@ -232,7 +237,7 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
         submitted = true;
         ServeStream(res, sink);
       } else {
-        auto sink = std::make_shared<BufferingSink>(enable_thinking, emit_reasoning);
+        auto sink = std::make_shared<BufferingSink>(enable_thinking, emit_reasoning, &dialect);
         pending->sink = sink;
         if (!engine_ref.Submit(pending)) {
           LogRejected(engine_ref, "chat/completions", "chatcmpl-", id, false, 429);
@@ -257,7 +262,9 @@ HttpServer::HttpServer(Engine& engine) : impl_(std::make_unique<Impl>(engine)) {
             (!sink->tool_calls.empty() && sink->text.empty()) ? std::nullopt
                                                                 : std::optional<std::string>(sink->text);
         const std::optional<std::string> reasoning_content =
-            emit_reasoning ? std::optional<std::string>(sink->reasoning_text) : std::nullopt;
+            (emit_reasoning && (enable_thinking || !sink->reasoning_text.empty()))
+                ? std::optional<std::string>(sink->reasoning_text)
+                : std::nullopt;
         res.set_content(BuildChatCompletionResponse(id, model_id, created, content, sink->tool_calls,
                                                      sink->finish_reason, usage, sink->timings,
                                                      reasoning_content)

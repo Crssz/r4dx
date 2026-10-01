@@ -9,6 +9,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -18,6 +19,10 @@
 namespace r4dx::server {
 
 enum class DialectKind { kQwen35, kGemma4 };
+
+// The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults): what an empty
+// --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
+inline constexpr const char* kQwenDefaultTokenizerDir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
 
 struct ModelDialect {
   DialectKind kind = DialectKind::kQwen35;
@@ -77,6 +82,17 @@ bool ParseDialectName(std::string_view s, DialectKind* out);
 // `has_turn_token` (the vocab contains "<|turn>"); otherwise Qwen. Malformed JSON counts as "no
 // information" (falls back on `has_turn_token`).
 DialectKind DetectDialect(std::string_view tokenizer_config_json, bool has_turn_token);
+
+// The dialect a run uses (shared by r4dx-server's Engine and r4dx-cli, task M1-14): `requested` (an
+// explicit --dialect) wins; otherwise, when `tokenizer_dir` is non-empty, DetectDialect over its
+// tokenizer_config.json and a scan of tokenizer.json for the "<|turn>" token; otherwise (no tokenizer
+// dir given) `container_is_gemma` -- the container header's architecture.
+DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::string& tokenizer_dir,
+                               bool container_is_gemma);
+
+// `requested` when non-empty; else the dialect's default_tokenizer_dir, else (Qwen) the historical
+// kQwenDefaultTokenizerDir.
+std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& requested);
 
 // Cross-check a chosen dialect against the loaded model's architecture string (TextModel::Config(),
 // task M1-24; empty means unknown and always passes). Returns "" when consistent, otherwise a

@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
@@ -38,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include "dialect.h"
 #include "engine.h"
 #include "model_config.h"
 #include "model_types.h"
@@ -48,6 +50,11 @@
 
 #ifndef R4DX_TOKENIZER_MODEL_DIR
 #define R4DX_TOKENIZER_MODEL_DIR "D:/models/Huihui-Qwen3.8-27B-abliterated"
+#endif
+// The assembled Gemma 4 tokenizer directory (tests/tokenizer's cache variable of the same name); the
+// Gemma scenario below is skipped (not failed) without it.
+#ifndef R4DX_GEMMA_TOKENIZER_DIR
+#define R4DX_GEMMA_TOKENIZER_DIR "D:/models/Huihui-gemma-4-12B-it-abliterated-tok"
 #endif
 
 namespace {
@@ -69,14 +76,24 @@ using r4dx::model::ImageSpan;
 using r4dx::model::StepProfile;
 using r4dx::model::VramReport;
 
-constexpr int64_t kVocab = 248320;  // the checkpoint's vocabulary: the engine samples over logits.size()
+// The engine samples over logits.size(). 262144 covers both vocabularies (Qwen 248320, Gemma 262144), so a
+// scripted reply token of either tokenizer is always in range.
+constexpr int64_t kVocab = 262144;
 
 class FakeTextModel final : public r4dx::model::TextModel {
  public:
   enum class State { kReady, kNeedsRecovery };
 
   // tp: TpModel's state machine (see the file comment); false: LocalTextModel's TP=1 behaviour.
-  FakeTextModel(bool dflash, bool tp) : dflash_(dflash), tp_(tp) {}
+  FakeTextModel(bool dflash, bool tp, r4dx::model::Arch arch = r4dx::model::Arch::kQwen35)
+      : dflash_(dflash), tp_(tp) {
+    cfg_.arch = arch;  // TextModel::Config().arch: what the engine cross-checks its dialect against
+  }
+
+  // Every Prefill call's row count since construction, and the first prefill's tokens after the last
+  // Reset(): the Gemma scenario reads the checkpoint split (ckpt_back) and the BOS off them.
+  std::vector<size_t> prefill_sizes;
+  std::vector<int32_t> first_prefill;
 
   // The n-th forward command from now fails, after it has fed its tokens (a real mid-forward failure
   // leaves the KV/GDN state dirty too).
@@ -141,6 +158,8 @@ class FakeTextModel final : public r4dx::model::TextModel {
     throw std::logic_error("FakeTextModel: no vision");
   }
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids) override {
+    prefill_sizes.push_back(token_ids.size());
+    if (fed_.empty()) first_prefill = token_ids;
     Forward(token_ids);
     if (!pending_reply_.empty()) {  // armed until the first decode step (Decode below)
       script_prompt_ = fed_;
@@ -244,7 +263,9 @@ struct Harness {
 };
 
 Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool checkpoint = false,
-                   bool thinking = false, const std::string& request_log_path = "") {
+                   bool thinking = false, const std::string& request_log_path = "",
+                   r4dx::model::Arch arch = r4dx::model::Arch::kQwen35,
+                   std::optional<r4dx::server::DialectKind> dialect = std::nullopt) {
   Harness e;
   r4dx::server::EngineOptions opts;
   if (!request_log_path.empty()) {  // --request-log
@@ -253,6 +274,7 @@ Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool 
     if (!opts.request_log) throw std::runtime_error(err);
   }
   opts.tokenizer_dir = tokenizer_dir;
+  opts.dialect = dialect;  // nullopt = auto, from the tokenizer directory
   opts.model_opts.max_ctx = 4096;
   opts.model_opts.prompt_checkpoint = checkpoint;  // --prompt-checkpoint
   opts.default_thinking = thinking;                // --think on
@@ -263,8 +285,8 @@ Harness MakeEngine(const std::string& tokenizer_dir, bool dflash, bool tp, bool 
     opts.model_opts.dflash_draft_k = 7;
   }
   FakeTextModel** slot = &e.fake;
-  opts.model_loader = [slot, dflash, tp](const r4dx::model::ModelOptions&, const r4dx::model::TpOptions&) {
-    auto m = std::make_unique<FakeTextModel>(dflash, tp);
+  opts.model_loader = [slot, dflash, tp, arch](const r4dx::model::ModelOptions&, const r4dx::model::TpOptions&) {
+    auto m = std::make_unique<FakeTextModel>(dflash, tp, arch);
     *slot = m.get();
     return std::unique_ptr<r4dx::model::TextModel>(std::move(m));
   };
@@ -281,16 +303,25 @@ r4dx::server::ChatMessage Msg(const std::string& role, const std::string& conten
 }
 
 std::shared_ptr<r4dx::server::BufferingSink> Run(Harness& e, const std::vector<r4dx::server::ChatMessage>& messages,
-                                                 int64_t max_tokens, bool thinking = false) {
+                                                 int64_t max_tokens, bool thinking = false,
+                                                 const nlohmann::json& tools = nlohmann::json::array(),
+                                                 bool raw_completion = false, const std::string& raw_prompt = "",
+                                                 const std::function<void(r4dx::server::PendingRequest&)>& tweak = nullptr) {
   auto req = std::make_shared<r4dx::server::PendingRequest>();
-  req->kind = r4dx::server::RequestKind::kChat;
+  req->kind = raw_completion ? r4dx::server::RequestKind::kCompletion : r4dx::server::RequestKind::kChat;
   req->request_id = r4dx::server::GenerateRequestId("chatcmpl-");
   req->messages = messages;
+  req->raw_prompt = raw_prompt;
+  req->tools = tools;
+  if (tweak) tweak(*req);
   req->sampling.temperature = 0.0f;
   req->max_tokens = max_tokens;
   // `thinking`: split the reply into `text` (the answer) and `reasoning_text`, as http_server.cpp
-  // builds the sink for a thinking request.
-  auto sink = std::make_shared<r4dx::server::BufferingSink>(thinking);
+  // builds the sink for a thinking request. The engine's dialect goes to the sink the way http_server.cpp
+  // hands it (a Qwen dialect leaves the sink exactly as before; a Gemma one always splits).
+  const bool chat = !raw_completion;
+  auto sink = std::make_shared<r4dx::server::BufferingSink>(thinking && chat, true,
+                                                            chat ? &e.engine->Dialect() : nullptr);
   req->sink = sink;
   if (!e.engine->Submit(req)) throw std::runtime_error("queue full");
   sink->Wait();
@@ -551,6 +582,136 @@ void RequestLogFaultScenario(const std::string& tokenizer_dir) {
   }
 }
 
+// The Gemma 4 dialect through RunRequest itself (docs/gemma4-plan.md 5.3, task M1-14), against a CPU fake
+// whose Config().arch is kGemma4 and the assembled Gemma tokenizer directory. Every reply is scripted
+// (ScriptReplyToNextPrompt), so what is checked is the engine's own wiring:
+//   * dialect auto-detected from the tokenizer dir, and a forced dialect that contradicts the model's
+//     architecture fails the load;
+//   * generation stops on EOS 106 and on 50 (the dialect's [1, 106, 50]; neither is decoded);
+//   * thinking off, direct answer: no reasoning; thinking on: "<|channel>thought\n...<channel|>" is split
+//     into reasoning_content / content (the sink's start state comes from OnStart);
+//   * a parsed call stops on 50 with finish_reason "tool_calls";
+//   * a tool message with no earlier assistant tool_calls is a 400; reasoning_effort is ignored;
+//   * a raw /v1/completions prompt gets exactly one BOS, a chat prompt the template's one;
+//   * --prompt-checkpoint holds back the whole "<|channel>thought\n<channel|>" suffix (4 tokens) with
+//     thinking off, and nothing with thinking on.
+void GemmaScenario(const std::string& dir) {
+  using r4dx::model::Arch;
+  using r4dx::server::DialectKind;
+  const int failures_before = g_failures;
+  r4dx::Tokenizer::Options topt;
+  topt.allow_unimplemented_normalizer = true;
+  const r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(dir, topt);
+  auto ids = [&](const std::string& s) {
+    const std::vector<r4dx::TokenId> v = tok.encode(s, /*parse_special=*/true);
+    return std::vector<int32_t>(v.begin(), v.end());
+  };
+  auto with = [](std::vector<int32_t> v, int32_t last) {
+    v.push_back(last);
+    return v;
+  };
+  auto thinking_on = [](r4dx::server::PendingRequest& r) { r.thinking.enabled = true; };
+  auto thinking_off = [](r4dx::server::PendingRequest& r) { r.thinking.enabled = false; };
+  const std::vector<r4dx::server::ChatMessage> user = {Msg("user", "Say hi.")};
+  const nlohmann::json no_tools = nlohmann::json::array();
+
+  {
+    Harness e = MakeEngine(dir, /*dflash=*/false, /*tp=*/false, false, false, "", Arch::kGemma4);
+    CHECK(e.engine->Dialect().kind == DialectKind::kGemma4, "[gemma] dialect not auto-detected as gemma4");
+
+    // thinking off, direct answer, stop on <turn|> (106)
+    e.fake->ScriptReplyToNextPrompt(with(ids("Hi there."), 106));
+    const auto a = Run(e, user, 16, false, no_tools, false, "", thinking_off);
+    CHECK(!a->errored && a->text == "Hi there." && a->reasoning_text.empty() && a->finish_reason == "stop" &&
+              a->completion_tokens == static_cast<int64_t>(ids("Hi there.").size()),
+          "[gemma] direct answer: errored=%d '%s' reasoning '%s' finish '%s' n=%lld", static_cast<int>(a->errored),
+          a->text.c_str(), a->reasoning_text.c_str(), a->finish_reason.c_str(), static_cast<long long>(a->completion_tokens));
+    CHECK(e.fake->first_prefill.size() > 1 && e.fake->first_prefill[0] == 2 && e.fake->first_prefill[1] != 2,
+          "[gemma] a chat prompt must start with exactly the template's one <bos> (first ids %d, %d)",
+          e.fake->first_prefill.size() > 0 ? e.fake->first_prefill[0] : -1,
+          e.fake->first_prefill.size() > 1 ? e.fake->first_prefill[1] : -1);
+
+    // thinking on: the model opens the span itself
+    e.fake->ScriptReplyToNextPrompt(with(ids("<|channel>thought\nPlan it.<channel|>Done."), 106));
+    const auto b = Run(e, user, 32, true, no_tools, false, "", thinking_on);
+    CHECK(!b->errored && b->text == "Done." && b->reasoning_text == "Plan it." && b->reasoning_tokens > 0,
+          "[gemma] thinking on: errored=%d text '%s' reasoning '%s' reasoning_tokens %lld", static_cast<int>(b->errored),
+          b->text.c_str(), b->reasoning_text.c_str(), static_cast<long long>(b->reasoning_tokens));
+
+    // EOS 50 (<|tool_response>) with a well-formed call: finish_reason tool_calls
+    const nlohmann::json tools = nlohmann::json::parse(
+        R"([{"type":"function","function":{"name":"get_weather","description":"Current weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
+    e.fake->ScriptReplyToNextPrompt(
+        with(ids("<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"), 50));
+    const auto c = Run(e, {Msg("user", "What is the weather in Paris?")}, 48, false, tools, false, "", thinking_off);
+    CHECK(!c->errored && c->tool_calls.size() == 1 && c->tool_calls[0].name == "get_weather" &&
+              c->tool_calls[0].arguments_json.find("Paris") != std::string::npos && c->finish_reason == "tool_calls",
+          "[gemma] tool call: errored=%d calls=%zu finish '%s' text '%s'", static_cast<int>(c->errored), c->tool_calls.size(),
+          c->finish_reason.c_str(), c->text.c_str());
+
+    // a tool message nobody asked for: 400
+    r4dx::server::ChatMessage tool_msg = Msg("tool", "{\"temp\": 20}");
+    tool_msg.tool_call_id = "call_1";
+    const auto d = Run(e, {Msg("user", "hi"), tool_msg}, 8, false, no_tools, false, "", thinking_off);
+    CHECK(d->errored && d->error_status == 400, "[gemma] tool message without tool_calls: errored=%d status=%d",
+          static_cast<int>(d->errored), d->error_status);
+
+    // reasoning_effort (field and kwarg) is ignored, not an error
+    const auto f = Run(e, user, 4, false, no_tools, false, "", [](r4dx::server::PendingRequest& r) {
+      r.thinking.enabled = false;
+      r.thinking.template_effort = "low";
+      r.chat_template_kwargs = nlohmann::json{{"reasoning_effort", "low"}};
+    });
+    CHECK(!f->errored, "[gemma] reasoning_effort must be ignored: %s", f->error_message.c_str());
+
+    // raw completion: one BOS in front of the plain tokens
+    const auto g = Run(e, {}, 4, false, no_tools, /*raw_completion=*/true, "Hello world");
+    const std::vector<r4dx::TokenId> plain = tok.encode("Hello world", /*parse_special=*/false);
+    CHECK(!g->errored && e.fake->first_prefill.size() == plain.size() + 1 && e.fake->first_prefill[0] == 2 &&
+              std::equal(plain.begin(), plain.end(), e.fake->first_prefill.begin() + 1),
+          "[gemma] raw prompt: %zu prefill ids, want BOS + %zu", e.fake->first_prefill.size(), plain.size());
+    e.engine->Shutdown();
+  }
+
+  // --prompt-checkpoint: the closed-span suffix is held back whole
+  {
+    const size_t suffix_tokens = ids("<|channel>thought\n<channel|>").size();
+    CHECK(suffix_tokens == 4, "[gemma] the closed reasoning span is %zu tokens, expected 4", suffix_tokens);
+    Harness e = MakeEngine(dir, false, false, /*checkpoint=*/true, false, "", Arch::kGemma4);
+    e.fake->ScriptReplyToNextPrompt(with(ids("Ok."), 106));
+    const auto a = Run(e, user, 8, false, no_tools, false, "", thinking_off);
+    CHECK(!a->errored && e.fake->prefill_sizes.size() == 2 && e.fake->prefill_sizes[1] == suffix_tokens &&
+              e.fake->saves == 1,
+          "[gemma] thinking off: prefill split %zu calls (last %zu), saves %d; want 2 calls ending in %zu tokens, 1 save",
+          e.fake->prefill_sizes.size(), e.fake->prefill_sizes.empty() ? size_t{0} : e.fake->prefill_sizes.back(),
+          e.fake->saves, suffix_tokens);
+    e.engine->Shutdown();
+    Harness t = MakeEngine(dir, false, false, /*checkpoint=*/true, true, "", Arch::kGemma4);
+    t.fake->ScriptReplyToNextPrompt(with(ids("<|channel>thought\nHm.<channel|>Ok."), 106));
+    const auto b = Run(t, user, 16, true, no_tools, false, "", thinking_on);
+    CHECK(!b->errored && t.fake->prefill_sizes.size() == 1 && t.fake->saves == 1,
+          "[gemma] thinking on: prefill calls %zu (want 1), saves %d (want 1)", t.fake->prefill_sizes.size(), t.fake->saves);
+    t.engine->Shutdown();
+  }
+
+  // a forced dialect that contradicts the model's architecture fails the load, before any request
+  {
+    bool threw = false;
+    try {
+      Harness e = MakeEngine(dir, false, false, false, false, "", Arch::kGemma4, DialectKind::kQwen35);
+      e.engine->Shutdown();
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    CHECK(threw, "[gemma] --dialect qwen35 against a gemma4 model must fail LoadAndStart");
+  }
+  if (g_failures == failures_before) {
+    std::printf("[gemma] dialect auto-detected and arch-checked; EOS 106/50; direct and thought-wrapped replies "
+                "split; tool call on EOS 50; tool-without-call 400; BOS once; checkpoint holds back 4 tokens\n");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -568,6 +729,12 @@ int main() {
       CheckpointThinkingScenario(tokenizer_dir, tp);
     }
     RequestLogFaultScenario(tokenizer_dir);
+    const std::string gemma_dir = R4DX_GEMMA_TOKENIZER_DIR;
+    if (std::filesystem::exists(std::filesystem::path(gemma_dir) / "tokenizer.json")) {
+      GemmaScenario(gemma_dir);
+    } else {
+      std::fprintf(stderr, "NOTE: %s/tokenizer.json not found; the Gemma scenario was skipped\n", gemma_dir.c_str());
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "unexpected exception: %s\n", e.what());
     return 1;

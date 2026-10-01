@@ -49,8 +49,9 @@ constexpr int64_t kRowTile = 16;
 // value_dim=6144 (attn.o's K = num_heads*head_dim = 6144 too) -- all three are multiples of 512
 // (5120/512=10, 17408/512=34, 6144/512=12), which clears the tightest of the group requirements
 // (SK=4 * group=64 = 256) with room to spare, so SK=4 clears every layout at once. The fallback
-// keeps requiring K % 512 (the multiple the tensor-parallel rank-K rule in model_config.h is
-// written against) rather than the bare 256. WV=4/SK=4 keeps the block at 512
+// requires K % 256 (SK=4 * 64, the tightest kernel rule; Gemma 4's K=3840 = 15 * 256 is not a
+// multiple of 512 -- docs/gemma4-plan.md 3.7). SK stays 4 at every legal K, so every Qwen shape
+// (all K % 512 == 0) gets exactly the pick it always did. WV=4/SK=4 keeps the block at 512
 // threads (WV*SK*32, under the 1024 cap every kernel enforces) and the LDS reduction buffer at 16
 // KiB (under the 64 KiB cap); MB=1
 // and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16) and NT=1 takes the non-temporal weight-load path
@@ -60,7 +61,7 @@ constexpr int64_t kRowTile = 16;
 // quant2 Q3 (docs/quant2.md section 5.1): this is also the tuning of every w4a16 linear at a
 // per-tensor group the table has no row for. The kernel's rule at group g is K % (SK * max(g, 64))
 // -- a split must start on a 64-K packed block, which a group of 32 does not guarantee -- so SK=4
-// needs K % 256 at g32 and g64: the K % 512 check below covers both.
+// needs K % 256 at g32 and g64: the K % 256 check below covers both.
 // `w4a16_group` is the EFFECTIVE group (EffectiveW4a16Group); the explicit check only keeps a future
 // edit of SK from quietly breaking the per-tensor groups.
 //
@@ -96,9 +97,9 @@ LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int 
     return t;
   }
   const int w4a16_group = variant;
-  if (K % 512 != 0) {
+  if (K <= 0 || K % 256 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " is not a multiple of 512 (SK=4 * 128, the fallback's rule) -- this "
+                              " is not a multiple of 256 (SK=4 * 64, the fallback's rule) -- this "
                               "model shape was not anticipated, pick a smaller SK");
   }
   if (N % 16 != 0) {

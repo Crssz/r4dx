@@ -112,7 +112,7 @@ class GemmaReference:
 
     def __init__(self, model_dir: Path | str, device, dtype=None, max_layers: int | None = None,
                  resident: bool = True, attn: str = "eager", verbose: bool = True,
-                 gemm_guard: GemmGuardState | None = None):
+                 gemm_guard: GemmGuardState | None = None, load_table: bool = True):
         import torch
         import transformers.models.gemma4_unified.modeling_gemma4_unified as modeling
         from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedConfig
@@ -143,11 +143,14 @@ class GemmaReference:
         self.final_norm_w = self.index.get_tensor(FINAL_NORM_NAME).to(device=device, dtype=self.dtype)
         self._layers: dict[int, object] = {}
         # The (tied) embedding table: 262144 x 3840 bf16 = 1.9 GB, on the device when resident.
-        table = self.index.get_tensor(EMBED_NAME).to(dtype=self.dtype)
-        if table.shape != (self.arch.vocab, self.arch.hidden):
-            raise RuntimeError(f"{EMBED_NAME} shape {tuple(table.shape)} != config "
-                               f"{(self.arch.vocab, self.arch.hidden)}")
-        self.table = table.to(device) if resident else table
+        # `load_table=False` (the layer goldens) skips it; embed()/logits then raise.
+        self.table = None
+        if load_table:
+            table = self.index.get_tensor(EMBED_NAME).to(dtype=self.dtype)
+            if table.shape != (self.arch.vocab, self.arch.hidden):
+                raise RuntimeError(f"{EMBED_NAME} shape {tuple(table.shape)} != config "
+                                   f"{(self.arch.vocab, self.arch.hidden)}")
+            self.table = table.to(device) if resident else table
         self.embed_scale = torch.tensor(self.arch.hidden ** 0.5).to(self.dtype)  # bf16(sqrt(H)): 62.0 for 3840
 
     # -- weights ------------------------------------------------------------------------------
@@ -184,6 +187,8 @@ class GemmaReference:
     def embed(self, token_ids) -> "torch.Tensor":
         import torch
 
+        if self.table is None:
+            raise RuntimeError("GemmaReference(load_table=False) has no embedding table")
         ids = torch.as_tensor([int(t) for t in token_ids], dtype=torch.long)
         rows = self.table[ids.to(self.table.device)].to(self.device)
         return rows * self.embed_scale.to(self.device)  # HF: embedding(ids) * embed_scale.to(weight.dtype)
@@ -342,6 +347,15 @@ def build_tiny_checkpoint(out_dir: Path | str, seed: int = 0, window: int = 4, l
         {"bos_token_id": 2, "do_sample": True, "eos_token_id": [1, 3], "pad_token_id": 0,
          "temperature": 1.0, "top_k": 8, "top_p": 0.95}), encoding="utf-8")
     return out
+
+
+def add_tiny_args(ap) -> None:
+    """The `--tiny` switch every script of this package has: build a tiny random checkpoint in a temp
+    dir and run the whole script on CPU with the stub tokenizer (the M0-6 CPU smoke path)."""
+    ap.add_argument("--tiny", action="store_true",
+                    help="CPU smoke: run on a tiny random-config checkpoint built in a temp dir (never "
+                         "touches the real weights or a GPU; outputs go to --out-dir/--out, default a temp dir)")
+    ap.add_argument("--tiny-seed", type=int, default=0)
 
 
 def selftest_tiny(tmp_dir: Path | str, seed: int = 0) -> dict:

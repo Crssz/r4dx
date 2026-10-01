@@ -2078,3 +2078,26 @@ of streamed weights, i.e. free), plus **14.4-21.6 s** per `kl_report.py` pairing
 eight reports: **~21 minutes** end to end, one GPU process at a time. Peak VRAM **1.56 GiB**
 allocated / 3.42 GiB reserved, unchanged from `full_logits_golden.py`. Each run writes 4 x 484.5 MiB
 under `kl_out/` (gitignored).
+
+
+## Gemma 4 (tools/reference/gemma/)
+
+One package for the Gemma 4 12B (`gemma4_unified`) reference work (docs/gemma4-plan.md 6.3; semantics in
+docs/gemma4-semantics.md). Run everything with `D:\venvs\r4dx-gemma-ref\Scripts\python.exe`. The Qwen tools above
+stay frozen; only the model-agnostic helpers of `common.py` are re-used.
+
+- `common_gemma.py`: paths, the tokenizer (`GemmaRefTokenizer`: AutoTokenizer == tokenizers, BOS explicit), and the
+  device rule: GPU work only touches the HIP devices in `$env:R4DX_REF_ALLOWED_DEVICES` (default `1`), and
+  `$env:HIP_VISIBLE_DEVICES` must be a subset of them. The override is only for runs the user launched on purpose
+  (two generation shards: `0,1`; the drafter trainer: `0,1`).
+- `arch.py` (layer table, per-layer geometry, checkpoint names, quantization taps), `ref.py` (`GemmaReference`:
+  resident = mode A / streaming = mode B bf16 stack, tiny random checkpoint builder).
+- M0-7: `kl_corpus/tokens_gemma.json` (4 x 1024) and `tokens_gemma_long.json` (2 x 1600, the 1024 sliding ring
+  wraps) from `make_tokens_json.py --arch gemma4`; every segment is `[BOS=2] + ids`, teacher-forced on both sides.
+- M0-8 `layer_golden_gemma.py` (layers 0 and 5, ring wrap, embed scale, final softcap; fp32-twin error floor) and
+  `full_logits_gemma.py` (the KL reference, same f16 `[T-1, V]` format as `full_logits_golden.py`; `--noise-floor-out`).
+- M0-9 `gen_samples.py` (HF generate over `tools/quant2/corpus_v2_prompts.json`, token-id JSONL, `--shard K/N`),
+  M0-10 `greedy_smoke.py` (64-token greedy on 3 prompts + a `<|think|>` one with top-2 gaps; `--compare`).
+- CPU tests (no GPU, tiny random checkpoint; also each script's `--tiny`):
+  `python -m pytest tools\reference\gemma\test_ref_tiny.py tools\reference\gemma\test_tokens_gemma.py tools\reference\gemma\test_scripts_tiny.py -q`
+  with `$env:HIP_VISIBLE_DEVICES=''`. The GPU commands are in each script's docstring.

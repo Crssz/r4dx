@@ -2,8 +2,8 @@
 know about a gemma4_unified text stack, derived from a HF config.json (no torch, no transformers).
 
 Facts are the VERIFIED ones of docs/gemma4-semantics.md. Checkpoint tensor names are the on-disk
-names (tools/reference/gemma/tensor_names.json): `model.language_model.*`; the HF module path of the
-same tensor is the same string minus the leading `model.` plus ... see `hf_param_name`.
+names (tools/reference/gemma/tensor_names.json): `model.language_model.*`; `check_against_header`
+verifies this table against that header (test_ref_tiny.py).
 """
 
 from __future__ import annotations

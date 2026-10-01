@@ -754,6 +754,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | GATE-FP32 | done (CPU) | fp32 truth + HF bf16 sdpa noise dumps, chat_gemma.json corpus, kl_report gate; per-group thresholds in sec. 9 (chat-ALL KL <= 0.00599, top-1 >= 97.85%); group granularity (english/thai/code/ALL) awaits user confirmation |
 | M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
+| M1-23/26/27/28 pipeline | CPU-verified, GPU pending | section 11: 	ools\gemma\trellis_pipeline.ps1 (kvcalib, merge, hessian, oracle-k4/k5, mix, convert, gate), gemma\kv_calibrate_full.py, gen_samples.py --merge hardened, Gemma proxy-gain mix ranking; waits for shard 0 |
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader accepting rotated trellis containers and the GPU tests are open |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
 | M1-33..M1-36 | pending | |
@@ -953,3 +954,48 @@ bf16 bytes, its manifest is imported and verified by `r4dx-convert`), `test_tp_s
   `mlp.down`; `quantize-model --dry-run` (CPU, no encoder) lists the tap groups, Hessian headers and rotation folds.
 - Caveat: `trellis_quant.py`'s source hash is part of its resume key, so Qwen oracle directories written before
   this change are reported stale by a new `quantize-model` run (their manifests still import fine).
+
+## 11. The GPU pipeline after the corpus (branch g4-pipeline-dry)
+
+One script runs the whole chain, `tools\gemma\trellis_pipeline.ps1 -Stage <rotation|merge|kvcalib|hessian|oracle-k4|oracle-k5|mix|convert|gate|all> [-Run]`.
+Without `-Run` nothing executes: each stage prints its exact command (with its environment), whether its inputs are
+ready, and a GPU stage then reports `REFUSED` and the script exits 3. With `-Run` a stage throws before touching
+anything if a prerequisite fails (corpus generation still running, no merged complete corpus, device other than 1
+without `-AllowGpu0`, a stub or smoke Hessian set, no rotation file, low disk), skips itself when its output is
+already complete (`-Force` redoes it) and logs to `D:\models\r4dx\huihui-gemma\logs\pipeline_<stage>_<time>.log`.
+Artifacts live under `D:\models\r4dx\huihui-gemma`: `corpus\samples.jsonl`, `kvcalib.json`, `hessian-v1`,
+`trellis\rot-q2ab.safetensors`, `trellis\q\{K4mr,K5mr,mix4.5mr}`, `huihui-gemma-trellis-mix45mr.r4dx`, `kl\r4dx-trellis-mix45mr-kv<kv>`.
+
+| stage | device | what | verified on CPU |
+|---|---|---|---|
+| rotation | CPU | `r4dx-convert --input <huihui> --rotate q2ab --rotation-out rot-q2ab.safetensors` (reads config.json only; seed 0x5EED2025) | run for real: 5 tensors, fingerprint `tensors_sha256 2669a86f...` |
+| merge | CPU | `gen_samples.py --merge shard0 shard1 --out samples.jsonl --require-complete`: read-only on the shards (a torn last line of a running shard is skipped), checks every `prompt_sha256` against the prompt file, refuses duplicate ids and a partial corpus, writes `samples.merge.json` (`complete`, shard sha256s, summary) | real shards merged to a temp dir: 211 of 390 prompts so far (shard 0 is at ~27) |
+| kvcalib | GPU 1 | `gemma\kv_calibrate_full.py --gen-file samples.jsonl --max-seq-len 4096`, layer-major over the whole stack | tiny config (full-layer k_eq_v) vs an independent recompute; real weights, 8 samples x 512 tokens, all 48 layers, CPU, 38 s |
+| hessian | GPU 1 | `hessian_capture.py --arch gemma4_unified --rms-taps --gen-file samples.jsonl --seq-len 4096` | `--dry-run`: 289 files, 28.7 GiB (D: has 231 GiB free) |
+| oracle-k4 / k5 | GPU 1 (or 0 with `-AllowGpu0`) | `trellis_quant.py quantize-model --arch gemma4_unified --K {4,5} --hessian-basis matched --hessian-dir hessian-v1 --rotation rot-q2ab.safetensors`, run with the torch 2.13 venv | `--dry-run` against a header-only stub Hessian set (`tools\gemma\make_stub_hessian.py`): 328 linears, 192 groups, `Q^T H_rms Q` / `Hb^T H Hb` folds |
+| mix | CPU | `trellis_quant.py mix --bpw 4.5 --rank auto`: Gemma ranks promotion groups by Hessian-proxy gain per extra bit between the K4 and K5 oracle records (`group_scores`), not EXL3's edge-first order; Qwen keeps `--rank exl3` | `test_pipeline_tiny.py::test_mix_gemma_proxy_rank`, Qwen `test_trellis_quant.py` unchanged |
+| convert | CPU | `r4dx-convert --input <huihui> --output ... --trellis-from mix4.5mr --trellis-manifest-sha256 <sha of weights_override.json> --trellis-verify full --rotate q2ab --kv-calib kvcalib.json --no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --hessian-dir hessian-v1 --ldlq "^lm_head$"`; then `check_kvcalib_container.py` and `decode_bytes.py` | `convert_gemma_trellis` (69 checks); a real 6-layer `--rotate q2ab --kv-calib` conversion whose k/v descales equal `amax/448` |
+| gate | GPU 1 + CPU | `tool_teacher_forced_logprobs --layout trellis --tokens chat_gemma.json` with `R4DX_GEMMA_KV=fp8`, then `kl_report.py --gate gemma-fp32 --base-dir r4dx-bf16kv-f32res` | the report half on the existing bf16 dump (increment 0, PASS) |
+
+Decisions and findings recorded while building it:
+
+- **kvcalib.** `kv_calibrate_full.py` for Gemma taps K after `k_norm` and rope (the rope call that follows `k_norm`),
+  and V at the `v_norm` output on every layer, so a full layer's V is `v_norm(raw k_proj)` while its K is
+  `rope(k_norm(k_proj))`; the geometry (8x256 sliding, 1x512 full) is read off the layer module and cross-checked
+  against the arch table. The JSON is the converter's (`{"<layer>": {k_amax, v_amax, ...}}`, all 48 layers; the
+  converter writes `amax / 448` and warns and falls back to 1.0 on a missing layer, so the script refuses a partial
+  file without `--allow-partial`). Extra fields: `k_descale`, `v_descale`, p99.99 tails (exact buffer), an `f16`
+  range check and a per-layer self-check. **V is bounded by construction**: `v_norm` has rms 1, so `|V| <= sqrt(head_dim)`
+  (16 sliding, 22.6 full); the CPU sample already reaches 16.0 and 21.4. The calibration therefore cannot clip V by
+  being unlucky with data; K amax is ~1-2 (the `k_norm` weights) and is the part that needs the corpus.
+  The stack is the HF bf16 reference (bf16 residual); K and V are post-RMSNorm, so this matters less than for logits.
+  The per-layer-type fake-quant KL study of M1-23 (`kv_fakequant_golden.py`) is not written; the end-to-end KL with
+  and without `R4DX_GEMMA_KV` is the measurement the gate stage gives.
+- **Hessian sequence length** 4096 (not Qwen's 2048): the corpus samples are single sequences up to several thousand
+  tokens, and 2048 would drop 6% of the tokens and every position past it.
+- **Oracle Python.** The reference venv's torch 2.9.1+rocmsdk has no CUDA `cholesky_ex` (MAGMA; RECIPE.md addendum
+  of the Qwen huihui run), so the oracle uses `D:\models\r4dx\huihui\venv-rocm10` (torch 2.13); the dry-run passes with it.
+- `trellis_quant.py`'s source hash changed (the `--rank` option), so Qwen oracle directories written before this
+  commit are reported stale by a new `quantize-model` run; their manifests still mix and import.
+- **Runtime still open for the gate stage:** the Gemma loader must accept a rotated trellis container (M1-31) and the
+  trellis GEMM must be built for K=3840/15360 (M1-29); the converter side and the container are ready first.

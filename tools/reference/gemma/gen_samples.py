@@ -283,15 +283,53 @@ def shard_of(order: list[dict], spec: str) -> list[dict]:
     return [e for i, e in enumerate(order) if i % n == k]
 
 
-def merge(paths: list[Path], out: Path) -> int:
+def merge(paths: list[Path], out: Path, prompts: Path | None = None, kl_dir: Path | None = None,
+          require_complete: bool = False) -> int:
+    """Merge shard files into `out` (sorted by id). READ-ONLY on the shards, so it is safe while a shard is
+    still being generated: a torn last line (a record mid-write) is skipped with a warning, never repaired.
+    Checks every record's prompt_sha256 against the prompt file (a shard from another prompt set is
+    refused), refuses an id present in two shards, and reports which prompts are still missing; with
+    `require_complete` a missing prompt is an error (the Hessian corpus should be the whole set). Writes
+    `<out stem>.merge.json` (shard sha256s, counts, summary) next to `out`."""
     recs: dict[str, dict] = {}
+    shard_info = []
     for p in paths:
-        for line in p.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                r = json.loads(line)
-                if r["id"] in recs:
-                    raise SystemExit(f"duplicate id {r['id']} across shards")
-                recs[r["id"]] = r
+        raw = p.read_bytes()
+        lines = raw.split(b"\n")
+        last_k = max((k for k, ln in enumerate(lines) if ln.strip()), default=-1)
+        torn = 0
+        n = 0
+        for k, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line.decode("utf-8"))
+            except ValueError:
+                if k == last_k and not raw.endswith(b"\n"):
+                    torn += 1
+                    print(f"[gen_samples] WARNING {p}: torn last line skipped (shard still being written?)")
+                    continue
+                raise SystemExit(f"[gen_samples] {p}: line {k + 1} is not valid JSON")
+            if r["id"] in recs:
+                raise SystemExit(f"duplicate id {r['id']} across shards")
+            recs[r["id"]] = r
+            n += 1
+        shard_info.append({"path": str(p), "sha256": sha256_bytes(raw), "samples": n, "torn_lines_skipped": torn})
+    missing: list[str] = []
+    if prompts is not None:
+        entries, _ = gc.load_prompts(prompts, kl_dir or KL_CORPUS_DIR)
+        by_id = {e["id"]: e for e in entries}
+        for sid, r in recs.items():
+            if sid not in by_id:
+                raise SystemExit(f"[gen_samples] merge: id {sid!r} is not in the prompt file {prompts}")
+            if r.get("prompt_sha256") != gc.entry_sha256(by_id[sid]):
+                raise SystemExit(f"[gen_samples] merge: {sid} was generated from a different prompt "
+                                 "(prompt_sha256 differs)")
+        missing = sorted(set(by_id) - set(recs))
+        print(f"[gen_samples] {len(recs)} of {len(by_id)} prompts present; {len(missing)} missing")
+        if missing and require_complete:
+            raise SystemExit(f"[gen_samples] merge: --require-complete and {len(missing)} prompts have no "
+                             f"sample yet (first: {missing[:5]}); is a shard still running?")
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "wb") as f:
         for sid in sorted(recs):
@@ -299,6 +337,12 @@ def merge(paths: list[Path], out: Path) -> int:
     acc = [r for r in recs.values() if not r["rejected"]]
     print(f"[gen_samples] merged {len(recs)} samples ({len(acc)} accepted, "
           f"{sum(len(r['token_ids']) for r in acc):,} calibration tokens) -> {out}")
+    info = {"format": "r4dx-gemma-corpus-merge", "version": 1, "out": str(out), "samples_sha256": sha256_file(out),
+            "shards": shard_info, "complete": not missing and prompts is not None,
+            "missing_prompt_ids": missing, "summary": summarize(recs)}
+    mp = out.with_name(out.stem + ".merge.json")
+    mp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    print(f"[gen_samples] merge record {mp}")
     return 0
 
 
@@ -382,6 +426,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--shard", default=None, help="K/N: every N-th entry of the processing order (one per GPU)")
     ap.add_argument("--merge", nargs="+", type=Path, default=None, metavar="SHARD.jsonl",
                     help="merge shard files into --out (sorted by id) and exit")
+    ap.add_argument("--require-complete", action="store_true",
+                    help="with --merge: fail unless every prompt of --prompts has a sample (all shards finished)")
+    ap.add_argument("--no-prompt-check", action="store_true", help="with --merge: skip the prompt-file validation")
     ap.add_argument("--limit", type=int, default=0, help="generate at most N samples this run")
     ap.add_argument("--only-category", choices=gc.CATEGORIES, default=None)
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
@@ -394,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.merge:
-        return merge(args.merge, args.out)
+        return merge(args.merge, args.out, None if args.no_prompt_check else args.prompts, args.kl_dir,
+                     args.require_complete)
 
     tmp = None
     if args.tiny:

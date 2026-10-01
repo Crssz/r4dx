@@ -1278,8 +1278,10 @@ def rate_next(r: float) -> float | None:
     return None if nr > 8 else nr
 
 
-def allocate(tensors: list[dict], bpw: float) -> dict[str, float]:
-    """AL::create_q_strategy (docs/trellis.md 9). Tensors are grouped by (layer, qgroup) -- EXL3's
+def allocate(tensors: list[dict], bpw: float, score: dict | None = None) -> dict[str, float]:
+    """AL::create_q_strategy (docs/trellis.md 9). `score` (Gemma's ranking, see group_scores): group key
+    (layer, qgroup or name) -> a number, higher = promoted earlier; without it (every Qwen run) the order below
+    is exactly EXL3's. Tensors are grouped by (layer, qgroup) -- EXL3's
     qgroups: q/k/v one group, GDN in_proj_qkv + in_proj_z one, gate + up one, o_proj / out_proj /
     down_proj each alone (QGROUPS; a tensor without a "qgroup" is its own group) -- and every group
     has priority 0 (no qwen3_5 module sets q_priority). All start at rate_floor(bpw); then,
@@ -1294,6 +1296,9 @@ def allocate(tensors: list[dict], bpw: float) -> dict[str, float]:
         groups.setdefault((t["layer"], t.get("qgroup") or t["name"]), []).append(t)
     order = sorted(groups.values(), key=lambda g: (min(g[0]["layer"], last - g[0]["layer"]),
                                                    g[0]["layer"], g[0]["idx"]))
+    if score is not None:
+        # stable: equal scores keep EXL3's order
+        order = sorted(order, key=lambda g: -score[(g[0]["layer"], g[0].get("qgroup") or g[0]["name"])])
     changed = True
     while changed:
         changed = False
@@ -1714,6 +1719,25 @@ def write_manifest(out_dir: Path, job: dict, rates: dict, args, enc=None) -> dic
 # --------------------------------------------------------------------------------------------
 
 
+def group_scores(tensors: list[dict], lo: dict, hi: dict) -> dict:
+    """Gemma's mix ranking (docs/gemma4-plan.md 9.12, replacing EXL3's qwen3_5 edge-first order, which has no
+    data behind it for this model): per promotion group, the Hessian-proxy error that the K=lo -> K=hi step
+    removes, per extra stored bit. `lo` / `hi`: name -> oracle record of the lower / higher uniform-rate run (same
+    weights, same Hessians, same rotation), whose `proxy` is tr(E^T H E) / tr(W^T H W) in the basis the tensor
+    was quantized in (the rotated one for a rotated oracle). Score = sum_t (proxy_lo - proxy_hi) / sum_t
+    (bits_hi - bits_lo): relative output error saved per bit, so a small k/v tensor with a bad proxy outranks a
+    big MLP tensor that was already fine, and a tensor the extra bit does not help ranks last."""
+    groups: dict[tuple, list[dict]] = {}
+    for t in tensors:
+        groups.setdefault((t["layer"], t.get("qgroup") or t["name"]), []).append(t)
+    out = {}
+    for key, g in groups.items():
+        gain = sum(lo[t["name"]]["proxy"] - hi[t["name"]]["proxy"] for t in g)
+        bits = sum(hi[t["name"]]["bits"]["total"] - lo[t["name"]]["bits"]["total"] for t in g)
+        out[key] = gain / bits if bits > 0 else float("-inf")
+    return out
+
+
 def cmd_mix(args) -> int:
     """A bpw target from finished integer-rate directories: EXL3's allocation (section 9) decides
     each tensor's K; its record/file is taken from the directory quantized at that K (the trellis
@@ -1740,8 +1764,23 @@ def cmd_mix(args) -> int:
     if len({json.dumps(v, sort_keys=True) for v in code.values()}) > 1:
         print(f"[trellis] WARNING: the source directories were written by different trellis_quant.py / "
               f"trellis_viterbi.hip versions (recorded in the manifest): {code}", flush=True)
-    linears = model_linears(Path(base["model_dir"]), get_arch(base.get("arch")))
-    rates = allocate(linears, args.bpw)
+    arch_m = get_arch(base.get("arch"))
+    linears = model_linears(Path(base["model_dir"]), arch_m)
+    rank = getattr(args, "rank", "auto")
+    if rank == "auto":
+        rank = "proxy" if arch_m.is_gemma else "exl3"
+    scores = None
+    if rank == "proxy":
+        lo_k, hi_k = rate_floor(args.bpw), rate_next(rate_floor(args.bpw))
+        if lo_k not in srcs or hi_k not in srcs:
+            raise SystemExit(f"[trellis] --rank proxy at {args.bpw} bpw needs the sources K={lo_k} and K={hi_k}, "
+                             f"got {sorted(srcs)}")
+        for K, m in ((lo_k, srcs[lo_k]), (hi_k, srcs[hi_k])):
+            noproxy = [n for n, r in m["tensors"].items() if "proxy" not in r]
+            if noproxy:
+                raise SystemExit(f"[trellis] K={K} source has no `proxy` on {len(noproxy)} tensor(s), e.g. {noproxy[0]}")
+        scores = group_scores(linears, srcs[lo_k]["tensors"], srcs[hi_k]["tensors"])
+    rates = allocate(linears, args.bpw, scores)
     need = sorted(set(rates.values()))
     lacking = [r for r in need if r not in srcs]
     if lacking:
@@ -1763,7 +1802,12 @@ def cmd_mix(args) -> int:
            "hessian_dir": base.get("hessian_dir"),
            "allocation": {"rule": "docs/trellis.md 9 (AL::create_q_strategy) with EXL3's qgroups (q/k/v, "
                                   "in_proj_qkv + in_proj_z, gate + up promoted as units; o/out/down "
-                                  "alone), every priority 0", "tensors_per_K": counts,
+                                  "alone), every priority 0"
+                                  + ("; promotion order = proxy gain per extra bit (group_scores), not EXL3's "
+                                     "edge-first order" if scores is not None else ""),
+                          "rank": "proxy-gain-per-bit" if scores is not None else "exl3-edges-first",
+                          **({"group_scores": {f"L{k[0]:02d}:{k[1]}": v for k, v in sorted(scores.items())}}
+                             if scores is not None else {}), "tensors_per_K": counts,
                           "sources": {str(K): m["_path"] for K, m in srcs.items()},
                           "source_code_sha256": code},
            "summary": summarize_tensors(tensors), "tensors": tensors,
@@ -2025,6 +2069,10 @@ def main() -> int:
 
     p = sub.add_parser("mix", help="a bpw mix from finished uniform-rate directories")
     p.add_argument("--bpw", type=float, required=True)
+    p.add_argument("--rank", default="auto", choices=["auto", "exl3", "proxy"],
+                   help="which groups get the higher rate first. exl3: EXL3's edge-first order (the Qwen "
+                        "default, unchanged). proxy: Hessian-proxy gain per extra bit measured by the two source "
+                        "runs (the Gemma default; docs/gemma4-plan.md 9.12). auto: proxy for Gemma, exl3 otherwise")
     p.add_argument("--src", action="append", required=True, help="a finished --K directory (repeat)")
     p.add_argument("--out-dir", type=Path, required=True)
     p.set_defaults(fn=cmd_mix)

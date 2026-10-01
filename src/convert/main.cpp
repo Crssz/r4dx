@@ -913,13 +913,17 @@ class LdlqSource {
 // default (kNone) -- and handed to add_linear as a VARIABLE, never as a string literal:
 // tools/reference/imatrix_capture.py's audit_converter_source parses every add_linear call and
 // requires exactly one quoted string after the HF-name list.
-enum class HadSite { kNone, kDown, kO, kGdnOut };
+// kOSliding / kOFull are Gemma 4's two attention widths (o_swa K=4096, o_full K=8192).
+enum class HadSite { kNone, kDown, kO, kGdnOut, kOSliding, kOFull };
 
 struct LinearFold {
-  enum Kind { kNone, kIn, kOut };
+  // kHadOnly: Gemma's "option A" out-projections (docs/gemma4-plan.md 4.4) -- only W Hb on the K side,
+  // no Q^T on the output rows, because the post-norm between the projection and the residual add
+  // does not commute with Q; the runtime rotates AFTER that norm (post_rmsnorm_rotate_add).
+  enum Kind { kNone, kIn, kOut, kHadOnly };
   Kind kind = kNone;
-  std::string norm_hf;           // kIn: the HF zero-centred norm whose (1 + w) folds into this linear
-  HadSite had = HadSite::kNone;  // kOut under q2ab: the block Hadamard folded into the K side
+  std::string norm_hf;           // kIn: the HF norm whose weight folds into this linear
+  HadSite had = HadSite::kNone;  // kOut under q2ab / kHadOnly: the block Hadamard folded into the K side
   // The linear's INPUT basis changes (so its Hessian / imatrix vector must follow it).
   bool RotatesInput() const { return kind == kIn || had != HadSite::kNone; }
 };
@@ -929,6 +933,8 @@ const char* HadSiteName(HadSite s) {
     case HadSite::kDown: return "down";
     case HadSite::kO: return "o";
     case HadSite::kGdnOut: return "gdn_out";
+    case HadSite::kOSliding: return "o_swa";
+    case HadSite::kOFull: return "o_full";
     default: return "none";
   }
 }
@@ -951,13 +957,27 @@ class RotationSource {
     }
     RotationShape shape;
     shape.hidden = text_cfg.at("hidden_size").get<int64_t>();
-    // The runtime's online op (src/kernels, one workgroup per 5120-wide row) and the tensor name
-    // rotation.mix5 are both this exact factorization, so anything else is refused here rather than
-    // written as a container no binary can run.
-    if (shape.hidden != 5 * kRotationBlock)
+    // Any hidden width: block = the largest power of two dividing it, capped at 1024 (5120 -> 1024 x 5,
+    // exactly the Qwen bytes; Gemma's 3840 -> 256 x 15). Below 64 the Hadamard stops mixing anything.
+    shape.block = ChooseRotationBlock(shape.hidden);
+    if (shape.block < 64)
       throw std::runtime_error("--rotate: hidden_size=" + std::to_string(shape.hidden) +
-                               ", but the rotation is defined for 5120 = 5 x 1024 only");
-    if (kind_ == RotationKind::kQ2ab) {
+                               " has a power-of-two block of only " + std::to_string(shape.block) +
+                               " (need >= 64)");
+    // Gemma 4 (nested text config carries global_head_dim): plain-weight norms (offset 0), option-A
+    // out-projections (Hadamard-only, docs/gemma4-plan.md 4.4), three sign sites, no GDN.
+    gemma_ = text_cfg.contains("global_head_dim");
+    norm_offset_ = gemma_ ? 0.0 : 1.0;
+    if (gemma_ && kind_ == RotationKind::kQ2ab) {
+      const int64_t head_dim = text_cfg.at("head_dim").get<int64_t>();
+      const int64_t global_head_dim = text_cfg.at("global_head_dim").get<int64_t>();
+      const int64_t heads = text_cfg.at("num_attention_heads").get<int64_t>();
+      shape.k_down = text_cfg.at("intermediate_size").get<int64_t>();
+      shape.k_o = heads * head_dim;
+      shape.k_o_full = heads * global_head_dim;
+      shape.b_o = kHadBlockO;
+      shape.b_o_full = kHadBlockO;
+    } else if (kind_ == RotationKind::kQ2ab) {
       const int64_t head_dim = text_cfg.at("head_dim").get<int64_t>();
       const int64_t v_head_dim = text_cfg.at("linear_value_head_dim").get<int64_t>();
       // attn.o's and gdn.out_proj's Hadamard block IS one head (the runtime's fused kernels run one
@@ -988,20 +1008,32 @@ class RotationSource {
     }
     return f;
   }
+  // Gemma (option A): kHadOnly under q2ab; under q2a the out-projections are not folded at all (the
+  // post-norm blocks Q^T W) and Out() returns kNone. Qwen: kOut (Q^T W, plus Hb under q2ab).
   LinearFold Out(HadSite site) const {
     LinearFold f;
-    if (Enabled()) {
+    if (Enabled() && gemma_) {
+      if (Hadamard()) {
+        f.kind = LinearFold::kHadOnly;
+        f.had = site;
+      }
+    } else if (Enabled()) {
       f.kind = LinearFold::kOut;
       if (Hadamard()) f.had = site;
     }
     return f;
   }
 
+  bool Gemma() const { return gemma_; }
+  double NormOffset() const { return norm_offset_; }
+
   const r4dx_convert::BlockHadamard& Had(HadSite s) const {
     switch (s) {
       case HadSite::kDown: return set_.had_down;
-      case HadSite::kO: return set_.had_o;
+      case HadSite::kO:
+      case HadSite::kOSliding: return set_.had_o;
       case HadSite::kGdnOut: return set_.had_gdn_out;
+      case HadSite::kOFull: return set_.had_o_full;
       default: throw std::logic_error("RotationSource::Had(kNone)");
     }
   }
@@ -1022,7 +1054,8 @@ class RotationSource {
                                  "' is not a [" + std::to_string(hidden) + "] vector");
       return;
     }
-    if (N != hidden)
+    // kHadOnly leaves the output rows alone, so only kOut needs N == hidden.
+    if (f.kind == LinearFold::kOut && N != hidden)
       throw std::runtime_error("--rotate: out-projection '" + base + "' has N=" + std::to_string(N) +
                                ", expected hidden=" + std::to_string(hidden));
     if (f.had != HadSite::kNone && K != Had(f.had).K)
@@ -1046,7 +1079,7 @@ class RotationSource {
             int64_t K, int threads) {
     using namespace r4dx_convert;
     if (f.kind == LinearFold::kIn) {
-      FoldRowsQ(w, N, K, norm.data(), set_.q, threads);
+      FoldRowsQ(w, N, K, norm.data(), set_.q, threads, norm_offset_);
       ++folded_in_;
     } else if (f.kind == LinearFold::kOut) {
       FoldColumnsQt(w, N, K, set_.q, threads);
@@ -1055,6 +1088,9 @@ class RotationSource {
         FoldRowsHadamard(w, N, K, Had(f.had), threads);
         ++folded_had_;
       }
+    } else if (f.kind == LinearFold::kHadOnly) {
+      FoldRowsHadamard(w, N, K, Had(f.had), threads);
+      ++folded_had_;
     }
   }
 
@@ -1064,7 +1100,7 @@ class RotationSource {
                                 const r4dx_convert::ImportanceVector& v, int64_t K) {
     ++imatrix_rotated_;
     if (f.kind == LinearFold::kIn)
-      return r4dx_convert::TransformImportanceQ(v.data, K, norm.data(), set_.q);
+      return r4dx_convert::TransformImportanceQ(v.data, K, norm.data(), set_.q, norm_offset_);
     return r4dx_convert::TransformImportanceHadamard(v.data, K, Had(f.had));
   }
 
@@ -1080,7 +1116,7 @@ class RotationSource {
         norm.data(), static_cast<int64_t>(norm.size()),
         "--rotate " + std::string(KindName()) + " --ldlq: '" + base + "' (norm '" + f.norm_hf +
             "') has no rms Hessian in hessian.json, and its post-norm Hessian cannot be used",
-        r4dx_convert::kRmsHessianHint);
+        r4dx_convert::kRmsHessianHint, norm_offset_);
     ++ldlq_divided_;
   }
 
@@ -1108,9 +1144,11 @@ class RotationSource {
     } else if (f.kind == LinearFold::kIn) {
       const std::string bytes(reinterpret_cast<const char*>(norm.data()), norm.size() * sizeof(float));
       xf->id = prefix + "in:" + f.norm_hf + ":" + r4dx_convert::Sha256Hex(bytes);
+      if (norm_offset_ != 1.0) xf->id += ":off=" + std::to_string(norm_offset_);  // Qwen's id unchanged
       const r4dx_convert::ResidualRotation* q = &set_.q;
-      xf->apply = [q, norm](std::vector<float>& H, int64_t K, int t) {
-        r4dx_convert::TransformHessianQ(H, K, norm.data(), *q, t);
+      const double off = norm_offset_;
+      xf->apply = [q, norm, off](std::vector<float>& H, int64_t K, int t) {
+        r4dx_convert::TransformHessianQ(H, K, norm.data(), *q, t, off);
       };
     } else {
       xf->id = prefix + "had:" + HadSiteName(f.had);
@@ -1128,9 +1166,16 @@ class RotationSource {
                         {"seed", set_.seed},
                         {"hidden", set_.q.hidden},
                         {"block", set_.q.block}};
-    if (Hadamard())
-      j["had"] = {{"down", set_.had_down.block}, {"o", set_.had_o.block},
-                  {"gdn_out", set_.had_gdn_out.block}};
+    // Qwen's header keeps exactly its old keys (5 blocks, Q^T-folded outputs, three Hadamard sites).
+    if (set_.q.nblk != 5) j["nblk"] = set_.q.nblk;
+    if (Hadamard()) {
+      j["had"] = {{"down", set_.had_down.block}, {"o", set_.had_o.block}};
+      if (!set_.had_gdn_out.Empty()) j["had"]["gdn_out"] = set_.had_gdn_out.block;
+      if (!set_.had_o_full.Empty()) j["had"]["o_full"] = set_.had_o_full.block;
+    }
+    // Gemma option A: outputs of o / down stay in the original basis; the runtime rotates after the
+    // post-norm. A runtime that predates it must refuse the container (it would add unrotated output).
+    if (gemma_) j["out_fold"] = "had_only";
     return j;
   }
 
@@ -1150,6 +1195,8 @@ class RotationSource {
  private:
   r4dx_convert::RotationKind kind_;
   r4dx_convert::RotationSet set_;
+  bool gemma_ = false;
+  double norm_offset_ = 1.0;  // Qwen zero-centred norms fold (1 + w); Gemma's plain norms fold w
   int64_t folded_in_ = 0, folded_out_ = 0, folded_had_ = 0, ldlq_rotated_ = 0,
           imatrix_rotated_ = 0, ldlq_divided_ = 0;
 };
@@ -1981,11 +2028,15 @@ int RunConvert(const AppArgs& args) {
   if (rot.Enabled()) {
     const r4dx_convert::RotationSet& rs = rot.Set();
     add_fp32_values("rotation.signs", {rs.q.hidden}, &rs.q.signs);
-    add_fp32_values("rotation.mix5", {rs.q.nblk, rs.q.nblk}, &rs.q.mix);
+    // rotation.mix5 for the 5-block (Qwen) geometry, rotation.mix for every other nblk.
+    add_fp32_values(r4dx_convert::RotationMixName(rs.q.nblk), {rs.q.nblk, rs.q.nblk}, &rs.q.mix);
     if (rot.Hadamard()) {
       add_fp32_values("rotation.had_down_signs", {rs.had_down.K}, &rs.had_down.signs);
       add_fp32_values("rotation.had_o_signs", {rs.had_o.K}, &rs.had_o.signs);
-      add_fp32_values("rotation.had_gdn_out_signs", {rs.had_gdn_out.K}, &rs.had_gdn_out.signs);
+      if (!rs.had_gdn_out.Empty())
+        add_fp32_values("rotation.had_gdn_out_signs", {rs.had_gdn_out.K}, &rs.had_gdn_out.signs);
+      if (!rs.had_o_full.Empty())
+        add_fp32_values("rotation.had_o_full_signs", {rs.had_o_full.K}, &rs.had_o_full.signs);
     }
   }
 
@@ -2211,7 +2262,8 @@ int RunConvert(const AppArgs& args) {
     metadata["quant_summary"]["text.layers.*.input_layernorm|post_attention_layernorm"] =
         "bf16 zeros: rotated container, (1 + w) folded into the next linear (__metadata__.rotation)";
     metadata["quant_summary"]["rotation.*"] =
-        "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
+        rot.Gemma() ? "fp32 (signs, mix; q2ab also had_down/o/o_full_signs) -- see __metadata__.rotation"
+                    : "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
     metadata["rotation"] = rot.Metadata();
   }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above

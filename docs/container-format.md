@@ -459,6 +459,28 @@ given); `quant_summary` gains a note for the zeroed norms and the `rotation.*` t
 their closed forms and for orthogonality, the fold identities on a miniature layer, and the Hessian
 change of basis against a direct capture on the folded input.
 
+### Any hidden size, and the Gemma 4 variant (option A)
+
+`hidden` is no longer fixed at 5120. `block = ChooseRotationBlock(hidden)` (largest power of two
+dividing `hidden`, capped at 1024) and `nblk = hidden / block`: 5120 -> 1024 x 5 (byte-identical to
+the Qwen containers above, pinned by `convert_rotation`'s golden hash), Gemma 4's 3840 -> 256 x 15.
+`__metadata__.rotation` gains `"nblk"` **only when it is not 5**, and the mixing matrix is
+`rotation.mix5` `[5, 5]` for `nblk == 5` and `rotation.mix` `[nblk, nblk]` otherwise.
+
+A Gemma 4 container (`model_arch` `gemma4_unified`, plain-weight norms) differs in three ways:
+
+- `input_layernorm` and `pre_feedforward_layernorm` fold as `W' = W diag(w) Q` (norm offset 0, not
+  `1 + w`); the folded norm tensors are then stored as ones (plain `rms(x) * 1`, which commutes with `Q`; naming of
+  those tensors is the Gemma converter branch's call).
+- `post_attention_layernorm` / `post_feedforward_layernorm` do **not** fold (`Q^T` does not commute with
+  the channelwise weight). `attn.o` and `mlp.down` get only `W Hb` on the K side (`LinearFold::kHadOnly`);
+  their outputs stay in the original basis and the runtime computes
+  `r' = r' + Q( post_norm(sublayer_out) )` (`r4dx_post_rmsnorm_rotate_add_bf16`). The metadata says so
+  with `"out_fold": "had_only"`; a runtime that does not implement it must refuse the container.
+- Hadamard sites: `had` is `{down: 512, o: 256, o_full: 256}` (no `gdn_out`), tensors
+  `rotation.had_down_signs` `[15360]`, `rotation.had_o_signs` `[4096]` (sliding layers' o_proj) and
+  `rotation.had_o_full_signs` `[8192]` (full layers'). Draw order after `signs` / `mix`: down, o, o_full.
+
 ## Trellis body layout (`__metadata__.quant.trellis`, `<base>.trellis.*`)
 
 `r4dx-convert --trellis-from <oracle dir>` (docs/trellis-kernel.md sections 2-3; the format itself

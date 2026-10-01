@@ -724,11 +724,12 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-16 | pending-GPU | `test_gemma_postnorm` was run once by accident; rerun properly |
 | M1-17 | done | CPU ring/window tests pass, kernel compiles |
 | M1-18 | pending-GPU | |
-| M1-19, M1-20 | pending | loader and `GemmaModel` not started |
-| M1-21, M1-22 | pending | blocked on M1-20 and M0-8 |
+| M1-19, M1-20 | done (build + CPU) | `GemmaContainer` (CPU `Inspect` tested on the tiny fixture and the real bf16 header; device `Load`), `container_load_util`, `GemmaMlp`, `GemmaAttnLayer`/KV cache (fp8, bf16, bf16-full), `GemmaModel`, `GemmaLocalTextModel`, `LoadGemmaTextModel`; GPU forward path never executed; Qwen builds unchanged |
+| M1-21 | partial (authored) | `gemma_layer_golden` and `gemma_forward_smoke` compile; they SKIP until M0-8 goldens exist; GPU run pending |
+| M1-22 | pending | needs M0-8 and M1-21 passing |
 | M1-23 | pending | |
 | M1-24 | done | `ModelConfig::arch`; `GemmaLocalTextModel` does not exist yet |
-| M1-25..M1-30 | pending | blocked on M0-9, M1-20 |
+| M1-26..M1-30 | pending | blocked on M0-9, M1-23 (GPU runs) |
 | M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader accepting rotated trellis containers and the GPU tests are open |

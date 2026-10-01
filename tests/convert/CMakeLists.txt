@@ -123,6 +123,12 @@ add_executable(convert_kv_calib test_kv_calib.cpp)
 target_link_libraries(convert_kv_calib PRIVATE r4dx_convert)
 add_test(NAME convert_kv_calib COMMAND convert_kv_calib)
 
+# ShardedModel single-file fallback (docs/gemma4-plan.md M1-3): no index + one model.safetensors opens
+# it; the index still wins; neither throws. Writes its own tiny safetensors into a temp dir. CPU-only.
+add_executable(convert_sharded_single_file test_sharded_single_file.cpp)
+target_link_libraries(convert_sharded_single_file PRIVATE r4dx_convert)
+add_test(NAME convert_sharded_single_file COMMAND convert_sharded_single_file)
+
 # bf16 linear-weight layout (task item 2: --layouts bf16 for all linear weights): plain row-major
 # on-disk bytes, no WMMA-fragment permutation, plan/emit byte-size agreement.
 add_executable(convert_bf16_layout test_bf16_layout.cpp)

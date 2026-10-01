@@ -174,7 +174,8 @@ inline std::wstring Utf8ToWide(const std::string& s) {
 }
 
 // Follows model.safetensors.index.json across every shard it names, opening each shard's mapping
-// the first time one of its tensors is requested.
+// the first time one of its tensors is requested. A directory with no index but a single
+// model.safetensors opens that file instead (all tensors, mapped at construction).
 class ShardedModel {
  public:
   explicit ShardedModel(const std::string& model_dir) : model_dir_(model_dir) {
@@ -183,7 +184,21 @@ class ShardedModel {
     // non-UTF-8 ANSI codepage).
     const std::string index_path = model_dir + "\\model.safetensors.index.json";
     std::ifstream f(Utf8ToWide(index_path).c_str());
-    if (!f) throw std::runtime_error("ShardedModel: model.safetensors.index.json not found in " + model_dir);
+    if (!f) {
+      // No index: a checkpoint small enough to be one file (Huihui Gemma 4 12B is a single 23.9 GB
+      // model.safetensors) has no model.safetensors.index.json. Map every tensor of that file to it;
+      // the reader stays open as the one shard.
+      const std::string single = "model.safetensors";
+      const std::wstring single_path = Utf8ToWide(model_dir + "\\" + single);
+      if (GetFileAttributesW(single_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        throw std::runtime_error("ShardedModel: neither model.safetensors.index.json nor model.safetensors "
+                                 "found in " + model_dir);
+      }
+      auto reader = std::make_unique<SafetensorsReader>(single_path);  // a corrupt file throws its own error
+      for (const std::string& n : reader->Names()) name_to_shard_[n] = single;
+      open_shards_.emplace(single, std::move(reader));
+      return;
+    }
     nlohmann::json j;
     f >> j;
     const auto& weight_map = j.at("weight_map");

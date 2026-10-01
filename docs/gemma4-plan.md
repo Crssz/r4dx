@@ -679,6 +679,39 @@ expansion), so M2 and M3 start with a design pass; whether libr4d is editable at
 Legend: **[CPU]** needs no GPU. **[GPU]** is a handoff command for the user. Build dir `build\win-hip`
 and exe names are unverified placeholders.
 
+### Status (as of merge of g4-refpkg and g4-config-convert into `gemma4`)
+
+done = merged, CPU tests pass. partial = authored/merged, part still open. pending-GPU = code ready, needs the user's GPU run.
+Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernels) are taken from the earlier integration report; recheck against lane notes if in doubt.
+
+| Task | Status | Note |
+|---|---|---|
+| M0-1..M0-5 | done | branch, venv, tokenizer dir, header dump, semantics doc (doc section 5 corrections still open) |
+| M0-6 | done | tiny CPU smoke bit-exact vs HF; `R4DX_REF_ALLOWED_DEVICES` in |
+| M0-7 | done | `tokens_gemma.json`, `tokens_gemma_long.json` |
+| M0-8 | pending-GPU | scripts authored, validated on tiny CPU path only |
+| M0-9 | pending-GPU | dry-run passes; corpus has 390 prompts, not 385 |
+| M0-10 | pending-GPU | `--compare` mode verified on CPU |
+| M1-1 | done | `GemmaConfig`, `DetectArch`, dispatch hook; `LoadGemmaTextModel` is a throwing placeholder |
+| M1-2, M1-3 | done | |
+| M1-4, M1-5 | done | rotation generalization CPU + numpy selftest |
+| M1-6 | done | converter Gemma branch; `--trellis-from` / reuse guard refused for Gemma |
+| M1-7 | done | `bf16.r4dx` written on D: (text-only, kv descale placeholder 1.0) |
+| M1-8..M1-13 | done | minja, goldens, SPM tokenizer, dialect and server parsers (CPU tests pass); M1-11 bench recorded status unverified |
+| M1-14 | pending | engine/sink wiring and Gemma max_ctx plumbing (131072 default) not done |
+| M1-15 | done (compiles) | GPU step is M1-16 |
+| M1-16 | pending-GPU | `test_gemma_postnorm` was run once by accident; rerun properly |
+| M1-17 | done | CPU ring/window tests pass, kernel compiles |
+| M1-18 | pending-GPU | |
+| M1-19, M1-20 | pending | loader and `GemmaModel` not started |
+| M1-21, M1-22 | pending | blocked on M1-20 and M0-8 |
+| M1-23 | pending | |
+| M1-24 | done | `ModelConfig::arch`; `GemmaLocalTextModel` does not exist yet |
+| M1-25..M1-30 | pending | blocked on M0-9, M1-20 |
+| M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested, `tp_shard` row-split for `rotation.had_o_full_signs` and GPU tests open |
+| M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
+| M1-33..M1-36 | pending | |
+
 ### M0: setup, reference data
 
 - **M0-1 Branch and docs stub [CPU].** Files: branch `gemma4`, `docs/gemma4-plan.md`. Deps: none. Done: branch exists from main.

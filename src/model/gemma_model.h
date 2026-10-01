@@ -10,6 +10,10 @@
 //     m        = mlp(normed)                  GemmaMlp (GeGLU)
 //     h        = (h + post_feedforward_layernorm(m)) * layer_scalar;  normed = next input_layernorm(h)
 // layer_scalar is applied ONCE, after the MLP residual add (the attention half passes 1.0).
+// Residual dtype (GemmaResid, R4DX_GEMMA_RESID, default fp32): the stream h is fp32; norm outputs (GEMM inputs) and
+// sublayer outputs are bf16, and the post-norm / add / layer_scalar are fp32 with no intermediate bf16 rounding
+// (so the bf16 rounding points listed above apply only to R4DX_GEMMA_RESID=bf16). Under TP the all-reduce acts
+// on the bf16 sublayer outputs (o_proj / down_proj), never on the fp32 residual, which stays replicated.
 // A rotated container (`__metadata__.rotation`, Gemma option A) runs the residual stream in the rotated basis:
 // x Q after the scaled embedding gather, the fused r4dx_post_rmsnorm_rotate_add_bf16 for both post-norm
 // residual adds, the Hadamard on the o_proj / down_proj inputs, x Q^T before the final norm (and on captures).
@@ -43,6 +47,10 @@
 namespace r4dx::model {
 
 enum class GemmaKvMode { kFp8, kBf16Full, kBf16 };
+// Residual-stream dtype. kFp32 (default): the residual is fp32 [rows, hidden], GEMM inputs (norm outputs) and
+// sublayer outputs stay bf16. kBf16: the original all-bf16 stream, kept for A/B measurement
+// (R4DX_GEMMA_RESID=bf16).
+enum class GemmaResid { kFp32, kBf16 };
 
 struct GemmaModelOptions {
   std::string container_path;
@@ -53,10 +61,12 @@ struct GemmaModelOptions {
   GemmaKvMode kv = GemmaKvMode::kFp8;
   attention::GemmaAttnBackend attn = attention::GemmaAttnBackend::kReference;
   int prefill_chunk = 256;      // rows per prefill chunk (<= 256: the ring holds window + 288)
+  GemmaResid resid = GemmaResid::kFp32;
   bool prompt_checkpoint = false;  // spare copies of the sliding rings for SaveCheckpoint/RestoreCheckpoint
 };
 
-// Reads R4DX_GEMMA_KV (fp8|bf16_full|bf16) and R4DX_GEMMA_ATTN (ref|r4d) over the defaults; throws on junk.
+// Reads R4DX_GEMMA_KV (fp8|bf16_full|bf16), R4DX_GEMMA_ATTN (ref|r4d) and R4DX_GEMMA_RESID (fp32|bf16) over the
+// defaults; throws on junk.
 void ApplyGemmaEnv(GemmaModelOptions* o);
 
 class GemmaModel {
@@ -72,6 +82,7 @@ class GemmaModel {
   int64_t PositionCount() const { return pos_; }
   int64_t SampledFallbackRows() const { return sampled_fallback_rows_; }
   GemmaKvMode KvMode() const { return opts_.kv; }
+  GemmaResid ResidDtype() const { return opts_.resid; }
   // Bytes of KV the load allocated (sliding rings + full layers), for the load log and tests.
   int64_t KvBytes() const { return kv_bytes_; }
 
@@ -101,7 +112,8 @@ class GemmaModel {
   // ---- target hidden-state capture (the DFlash drafter's input, later) ---------------------------------
   // Captures the residual stream ENTERING each listed layer (index == num_layers: the last layer's output,
   // i.e. the final-norm input) for every row of every chunk, in the original (un-rotated) basis, into
-  // FeatureBuffer(): [rows, layers.size() * hidden] bf16, row-major, rows = FeatureRows() <= prefill_chunk.
+  // FeatureBuffer(): [rows, layers.size() * hidden] bf16 (always bf16, in both residual modes: the drafter consumes bf16;
+  // with the fp32 residual the capture is taken in fp32, un-rotated in fp32, then rounded once to bf16), row-major, rows = FeatureRows() <= prefill_chunk.
   // Valid after a Prefill chunk callback / after a decode step; rewritten from row 0 by the next chunk.
   // `layers` must be sorted strictly ascending and in [0, num_layers].
   void AttachFeatureCapture(std::vector<int64_t> layers);
@@ -119,9 +131,9 @@ class GemmaModel {
   };
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool want_logits, int32_t* greedy_out,
                               const SummaryRequest* summary_out, SpanAccumulator* prof);
-  void RotateResidual(uint16_t* x, int64_t rows, bool inverse);
+  void RotateResidual(void* x, int64_t rows, bool inverse);  // x is fp32 or bf16 per opts_.resid
   void UploadChunkMeta(int64_t start_pos, int64_t T);
-  void RunLayer(int64_t i, uint16_t* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
+  void RunLayer(int64_t i, void* cur, uint16_t* normed, int64_t T, int64_t start_pos, bool has_next,
                 SpanAccumulator* prof);
   void FetchRowSummary(float inv_temperature, kernels::RowSummary* out);
 
@@ -145,7 +157,8 @@ class GemmaModel {
 
   core::PinnedBuffer<int32_t> ids_host_;
   core::DeviceBuffer<int32_t> ids_dev_, positions_dev_, ring_slots_dev_, seqused_dev_;
-  core::DeviceBuffer<uint16_t> buf_a_, buf_normed_;
+  core::DeviceBuffer<uint16_t> buf_a_, buf_normed_;  // buf_a_: bf16 residual (R4DX_GEMMA_RESID=bf16 only)
+  core::DeviceBuffer<float> buf_a32_;                // fp32 residual [max_chunk, hidden] (default; 4 B/elem)
   core::DeviceBuffer<float> logits_dev_;
   core::DeviceBuffer<int32_t> argmax_dev_, summary_ids_dev_;
   core::DeviceBuffer<float> summary_vals_dev_, summary_lse_dev_;
@@ -153,6 +166,7 @@ class GemmaModel {
 
   std::vector<int64_t> feature_layers_;
   core::DeviceBuffer<uint16_t> features_dev_;
+  core::DeviceBuffer<float> features_f32_;  // fp32 resid mode: capture staging (rotated basis), un-rotated then narrowed
   int64_t feature_rows_ = 0, feature_pos_ = 0;
 };
 

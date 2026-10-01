@@ -27,6 +27,12 @@ __global__ void WidenBf16ToF32Kernel(const uint16_t* __restrict__ in, float* __r
   if (i < n) out[i] = Bf16ToFloat(in[i]);
 }
 
+__global__ void WidenSoftcapBf16ToF32Kernel(const uint16_t* __restrict__ in, float* __restrict__ out,
+                                             int64_t n, float cap) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = cap * tanhf(Bf16ToFloat(in[i]) / cap);
+}
+
 __global__ void WallStampKernel(unsigned long long* out) { r4dx_wall_stamp_device(out); }
 
 __global__ void ClockProbeKernel(unsigned long long* out, int iters) {
@@ -49,6 +55,15 @@ extern "C" void r4dx_model_widen_bf16_to_f32(int64_t in, int64_t out, int64_t n,
   hipLaunchKernelGGL(WidenBf16ToF32Kernel, dim3(static_cast<unsigned int>(blocks)), dim3(kBlock), 0,
                       reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(in),
                       reinterpret_cast<float*>(out), n);
+}
+
+extern "C" void r4dx_model_widen_softcap_bf16_to_f32(int64_t in, int64_t out, int64_t n, float cap,
+                                                       int64_t stream) {
+  if (n <= 0) return;
+  const int64_t blocks = (n + kBlock - 1) / kBlock;
+  hipLaunchKernelGGL(WidenSoftcapBf16ToF32Kernel, dim3(static_cast<unsigned int>(blocks)),
+                      dim3(kBlock), 0, reinterpret_cast<hipStream_t>(stream),
+                      reinterpret_cast<const uint16_t*>(in), reinterpret_cast<float*>(out), n, cap);
 }
 
 extern "C" void r4dx_model_wall_stamp(int64_t out, int64_t stream) {

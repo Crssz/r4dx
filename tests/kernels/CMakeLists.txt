@@ -60,6 +60,15 @@ set(R4DX_KERNEL_TESTS
   # both rates (plus run-to-run, ticket reset, a negative control and the refusal messages). Skips (77)
   # only without a HIP device; needs no golden data.
   test_trellis_m256
+  # Gemma 4 device pieces (docs/gemma4-plan.md 3.4 / 3.5, task M1-15; the GPU step is M1-16:
+  #   ctest -R "rope_proportional|rmsnorm_noscale|gelu_mul|postnorm|softcap|embed_scaled").
+  # CPU references live in gemma_ref.hpp; always-on GPU tests, no golden data.
+  test_rope_proportional
+  test_rmsnorm_noscale
+  test_gelu_mul
+  test_gemma_postnorm
+  test_embed_scaled
+  test_widen_softcap
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -114,7 +123,8 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
-                            test_trellis_m256.cpp
+                            test_trellis_m256.cpp test_rope_proportional.cpp
+                            test_gemma_postnorm.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -125,6 +135,15 @@ target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 # test_trellis_m256 asks src/model/linear.cpp for the shipped M = 64 row (PickTuning) and the plan
 # ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
 target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
+
+# test_widen_softcap: r4dx_model_widen_softcap_bf16_to_f32 lives in r4dx_model_kernels (model_kernels.hip).
+target_include_directories(test_widen_softcap PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
+target_link_libraries(test_widen_softcap PRIVATE r4dx_model_kernels)
+
+# test_rope_proportional_cpu: pure CPU (no HIP call, no kernel library) -- pins gemma_ref.hpp's HF
+# rope construction against the kernel's pair loop (the geometry r4dx_rope_proportional_bf16 runs).
+add_executable(test_rope_proportional_cpu test_rope_proportional_cpu.cpp)
+add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
 
 # test_rotation_ref_cpu: pure CPU (no HIP call, no kernel library) -- pins rotation_ref.hpp, the
 # fp64 reference the two tests above compare against, to the rotation contract's definitions

@@ -40,8 +40,9 @@ Every GPU step is a command handed to the user.
   normalizer, newline-run rule); validate with `tests/tokenizer/golden_test.cpp` +
   `tools/tok_ref/gen_golden.py`; microbench vs HF tokenizers.
 - **Server in M1.** Per-model pluggable reasoning splitter and tool-call parser.
-- **Gate.** Per-layer bf16 goldens vs HF (rung 3) + teacher-forced KL vs bf16 HF Huihui on
-  `tools/reference/kl_corpus`: mean KL <= 0.01, top-1 >= 95%, plus greedy smoke.
+- **Gate.** Per-layer bf16 goldens vs HF (rung 3) + teacher-forced KL vs the **fp32 truth**, noise-relative,
+  on `kl_corpus/chat_gemma.json` (section 9.9-9.11; supersedes the earlier "mean KL <= 0.01, top-1 >= 95% vs
+  bf16 HF"), plus greedy smoke.
 - **Drafter (parallel, non-blocking).** Convert `z-lab/gemma4-12B-it-DFlash` (DFlash v1) into the
   DFlash2 container with identity conv and zero selector, measure acceptance, then warm-start fine-tune
   conv + selector on 20-100K Huihui samples with an own plain-PyTorch trainer (target bf16 GPU0,
@@ -607,7 +608,9 @@ rather than forked; the Qwen scripts stay frozen.
   HF, which softcaps the lm_head output in bf16: `--logits-mode hf-bf16` records the HF-faithful variant so
   the noise floor is known); mode B ports the
   streaming reference if VRAM is tight. Output format unchanged (`<segment>.logprobs.f16`, `meta.json`,
-  -1e4 clamp). Record the bf16 self-KL noise floor by running twice.
+  -1e4 clamp). Record the bf16 self-KL noise floor by running twice. (Superseded as the gate reference by
+  the fp32 truth of section 9.9: `full_logits_gemma_cpu.py --variant truth|bf16sdpa`; the bf16 eager dumps are
+  diagnostic only.)
 - **KL tokens:** new `tokens_gemma.json` via `make_tokens_json.py` (never reuse the Qwen ids); **teacher-force
   with BOS=2 first on both HF and r4dx sides** and record it; add `tokens_gemma_long.json` with a 1536+
   token segment so the ring wraps; add a 6-layer test container `gemma12b-l6.r4dx` (layers 0-5).
@@ -779,7 +782,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M1-19 `GemmaContainer` loader.** Files: `src/model/gemma_container.{h,cpp}`, `container_load_util.{h,cpp}` (mechanical extraction of the helpers), `gemma_mlp`, `gemma_attention_layer.hpp`. Deps: M1-1, M1-6, M1-15. Done: loads the tiny fixture container.
 - **M1-20 `GemmaModel`, `GemmaLayer`, `GemmaLocalTextModel`, `LoadTextModel` dispatch.** Scope: prefill, decode, greedy, sampled, ring checkpoint (D2D) and restore, `*Profiled`, and the MTP throw. The fp8 KV path and descale loading are in. Deps: M1-17, M1-19. Done: it builds; the Qwen binaries are unchanged (build-only ISA-diff check).
 - **M1-21 Rung-3 per-layer goldens in C++ [GPU].** Files: `test_gemma_attn_layer.cpp`. Command: `ctest -R gemma_layer`, comparing against the M0-8 goldens; KV off first, then on. Deps: M0-8, M1-7, M1-20. Done: layers 0 and 5 match within the manifest tolerance.
-- **M1-22 bf16-weight KL [GPU].** Command: `$env:HIP_VISIBLE_DEVICES='1'; tool_teacher_forced_logprobs.exe --model ...bf16.r4dx --tokens kl_corpus\tokens_gemma.json --kv-dtype bf16`, then again with fp8 KV, then `kl_report.py`; also run on the long segment. Deps: M0-8, M1-20, M1-21. Done: the ring wraps with no divergence and KL is within a small multiple of the noise floor. This is the bisecting rung before trellis.
+- **M1-22 bf16-weight KL [GPU].** Command: `$env:HIP_VISIBLE_DEVICES='1'; tool_teacher_forced_logprobs.exe --model ...bf16.r4dx --tokens kl_corpus\tokens_gemma.json --kv-dtype bf16`, then again with fp8 KV, then `kl_report.py --gate gemma-fp32 --truth-dir D:\models\r4dx\huihui-gemma\kl\fp32\truth --noise-dir ...\fp32\bf16sdpa --test-dir <r4dx dump> --tokens kl_corpus\chat_gemma.json --raw-tokens kl_corpus\tokens_gemma.json --raw-max-tokens 512` (the r4dx dump covers `chat_gemma.json` in full and the raw segments truncated to 512 tokens; tokens for the long-segment ring-wrap check stay on `tokens_gemma_long.json`, no KL pass/fail there beyond no divergence). Deps: M0-8, M1-20, M1-21. Done: the ring wraps with no divergence and every chat group passes the fp32-truth gate of section 9.9 (KL <= 1.5 x noise + 0.005, top-1 >= noise - 1 pt; current thresholds: pooled chat KL <= 0.0060, top-1 >= 97.85%). This is the bisecting rung before trellis.
 - **M1-23 KV calibration port and fake-quant study.** Files: `tools/reference/gemma/{kv_calibrate_full,kv_fakequant_golden}.py`. Scope: per-layer-type head counts, V as cached, long sequences, f16 range check. Command: `$env:HIP_VISIBLE_DEVICES='1'; python tools\reference\gemma\kv_calibrate_full.py ...`. Deps: M0-6, M0-9. Done: `kvcalib.json` plus a per-layer-type KL contribution. Decision: fp8 vs bf16 KV for full layers.
 - **M1-24 Expose arch on `TextModel::Config()`.** Deps: M1-1. Done: the server can cross-check dialect against the model.
 
@@ -789,7 +792,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M1-27 Trellis oracle [GPU].** Command: `python tools\reference\trellis_quant.py quantize-model --arch gemma4_unified --device cuda --K 4 --hessian-basis matched --hessian-dir <hessian-v1> --out-dir <trellis-q\K4m>`. Deps: M1-26. Done: a quantized weight directory.
 - **M1-28 `gemma_trellis_convert.ps1` and trellis container.** Settings: `--rotate none` (the first container) or the rotated variant of section 10 (`--rotate q2ab` + the oracle's `--rotation`), lm_head w4a16 g32 (`--no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --ldlq "^lm_head$" --hessian-dir <hessian-v1>`), `--kv-calib`, `--trellis-from`. The converter side is done and tested (`convert_gemma_trellis`). Deps: M1-23, M1-27, M1-7. Done: `huihui-gemma-trellis.r4dx` is written.
 - **M1-29 Trellis tests and tuning.** Part a: add K=3840, K=15360 and the N set to the `test_trellis_input` lists; command (GPU): `ctest -R trellis`. Part b: add Gemma shapes to `tune_gemm.py` and run `tool_trellis_gemm_bench.exe` for them; command: `$env:HIP_VISIBLE_DEVICES='1'; python tools\profile\tune_gemm.py --shapes gemma.*`. Check `PlanTrellisM256` for each shape, because a failed plan silently falls back to 64-row slicing. Deps: M1-20, M1-28. Done: tests pass and tuning rows are added.
-- **M1-30 M1 KL gate and greedy smoke [GPU].** Command: `tool_teacher_forced_logprobs.exe --model ...trellis.r4dx --tokens tokens_gemma.json` plus the long segment, then `kl_report.py`. Gate: mean KL <= 0.01 and top-1 >= 95% against the bf16 HF reference, and the greedy smoke common prefix >= 16 tokens, or the divergence is at a near-tie. Deps: M0-8, M0-10, M1-29. Done: the gate passes. If it misses, run the rotated trellis variant (section 10; its runtime is M1-31, already in M1) or use bf16 KV for the full layers (9.5).
+- **M1-30 M1 KL gate and greedy smoke [GPU].** Command: `tool_teacher_forced_logprobs.exe --model ...trellis.r4dx --tokens kl_corpus\chat_gemma.json` (plus the raw segments truncated to 512 and the long segment), then `kl_report.py --gate gemma-fp32 --base-dir <M1-22 r4dx bf16-container dump> ...` (arguments as in M1-22). Gate (section 9.9): against the fp32 truth, the mean-KL INCREMENT over the r4dx bf16 container is <= 0.01 in every chat group (english, thai, code, chat-ALL); the absolute noise-relative rule (KL <= 1.5 x noise + 0.005, top-1 >= noise - 1 pt) is reported alongside. Raw groups are reported only. Plus the greedy smoke common prefix >= 16 tokens, or the divergence is at a near-tie. Deps: M0-8, M0-10, M1-29. Done: the gate passes. If it misses, run the rotated trellis variant (section 10; its runtime is M1-31, already in M1) or use bf16 KV for the full layers (9.5).
 - **M1-31 Rotation runtime (in M1, not conditional; section 9.7).** Files: `rotation_meta.h`, the rotate kernel generalization, the fused `post_rmsnorm_rotate_add` kernel, the entry (`x Q` after the embedding gather and the vision/audio splice) and exit (`x Q^T` before `final_norm` and before DFlash captures) ops, the `tp::RuleFor` row split of `rotation.had_o_full_signs` (done: `ModelConfig::global_head_dim`). Deps: M1-5. Done: the runtime applies the converter's rotation to w4a16 containers and, by section 10, to rotated trellis containers; the rotated-vs-unrotated bf16 gate and the rotated trellis KL gate are measured in M1.
 
 **Long-context perf kernels**
@@ -846,6 +849,20 @@ Decided with the user on 2026-10-01. These override anything earlier in this doc
 6. **Torch.** The new venv may use a newer ROCm torch wheel. Python312 stays untouched.
 7. **Rotation.** Generalize it fully in M1, the runtime fused post-norm-rotate-add kernel included. Rotated trellis Gemma is run and measured against the KL gate in M1.
 8. **Drafter training data.** Prompts are 20–100K subsampled from Nemotron Post-Training v2 and CodeAlpaca. Responses are generated by Huihui-Gemma through r4dx once M1 passes. Trellis calibration data still comes from HF on the existing 385-prompt corpus (M0-9).
+9. **KL gate = fp32 truth, noise-relative.** bf16 HF is not a stable yardstick for Gemma 4: the residual stream reaches 100-300 (L9-L40) and bf16 rounding is amplified (position 1 at L10, full layers L23/L29/L41). Measured on English raw text against the fp32 truth: HF bf16 sdpa KL 0.05 (top-1 96%), HF bf16 eager KL 0.23 (top-1 87%); fp32 eager == fp32 sdpa (KL 9e-9), so there is no reference bug (`tools/reference/gemma/investigate/`). The M1 gate is therefore: per sequence group, `KL(fp32 || r4dx) <= 1.5 x KL(fp32 || HF-bf16-sdpa) + 0.005` (mean over scored rows) and `top-1(fp32, r4dx) >= top-1(fp32, HF-bf16-sdpa) - 1 pt`; median and p99 KL and the worst rows are reported too. For quantized (trellis) containers the 0.01 target applies to the INCREMENT over the r4dx bf16 container, `KL(fp32||quant) - KL(fp32||r4dx-bf16) <= 0.01`, not to the absolute KL. Tool: `kl_report.py --gate gemma-fp32 [--base-dir <r4dx bf16 dump>]`; the truth and noise dumps are in `D:\models\r4dx\huihui-gemma\kl\fp32\{truth,bf16sdpa}` (made on CPU by `full_logits_gemma_cpu.py`).
+10. **Gate corpus.** PRIMARY: `tools/reference/kl_corpus/chat_gemma.json`, 10 chat-templated sequences (8 thinking off, 2 thinking on; English, Thai, Python, C++; one user turn plus a natural model answer, rendered with the Gemma chat template, BOS once), scored on model-turn tokens only through the per-token `score_mask` (thinking on: thought span and answer; both include the closing `<turn|>`). Gate groups are english, thai, code (python + cpp) and the pooled chat-ALL; every group must pass. SECONDARY: the raw segments of `tokens_gemma.json` (cpp_source, thai_prose, english_prose, python_source) truncated to 512 tokens, reported with no pass/fail: raw BOS-only text is off-distribution (ppl 200-1000 for both Huihui and official Gemma; chat model-turn ppl is ~13), so it measures noise amplification rather than model quality. r4dx runs must score the same ids (raw truncated to 512).
+11. **r4dx Gemma keeps its residual stream in fp32.** GEMM inputs stay bf16 (or quantized); only the residual accumulator and its adds/norm inputs are fp32. This removes the bf16 residual rounding that dominates the noise above. Old bf16 eager KL references (`kl\ref`, `kl\ref-noise`, `kl\ref-long`, `kl\ref-long-noise`) are DIAGNOSTIC ONLY and must not be used as a gate; the gate references are the fp32 dumps of item 9.
+
+   Measured noise term (HF bf16 sdpa, hf-bf16 lm_head, vs fp32 truth, chat corpus, model-turn rows; `fp32\noise_term.json`) and the resulting gate thresholds:
+
+   | group | rows | noise mean KL | noise median / p99 | noise top-1 | gate: KL <= | gate: top-1 >= |
+   |---|---:|---:|---|---:|---:|---:|
+   | chat-english | 1197 | 0.00069 | 0.00018 / 0.0053 | 98.66% | 0.00604 | 97.66% |
+   | chat-thai | 1003 | 0.00087 | 0.00004 / 0.0076 | 98.50% | 0.00630 | 97.50% |
+   | chat-code | 1099 | 0.00044 | 0.00000 / 0.0063 | 99.36% | 0.00566 | 98.36% |
+   | chat-ALL | 3299 | 0.00066 | 0.00004 / 0.0063 | 98.85% | 0.00599 | 97.85% |
+
+   Raw segments (512 tokens, report only) have a far larger noise term: cpp_source 0.0053, python_source 0.017, thai_prose 0.032, english_prose 0.106 (top-1 93-97%). On chat text the noise is small, so the `+ 0.005` slack dominates the KL threshold.
 
 ## 10. Rotated trellis, and the quantization tool ports (branch g4-convert-trellis)
 

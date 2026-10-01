@@ -27,6 +27,19 @@ Usage:
 
     <venv>\\Scripts\\python.exe tools\\reference\\kl_report.py --self-test
 
+Score-mask mode (`--use-score-mask`): segments of --tokens that carry a `score_mask` (chat_gemma.json) are
+aggregated over the rows predicting model-turn tokens only.
+
+Gemma M1 gate (docs/gemma4-plan.md 9.9), against the fp32 truth and relative to the noise of stock HF bf16 sdpa:
+
+    <venv>\\Scripts\\python.exe tools\\reference\\kl_report.py --gate gemma-fp32 `
+        --truth-dir D:\\models\\r4dx\\huihui-gemma\\kl\\fp32\\truth --noise-dir ...\\fp32\\bf16sdpa `
+        --test-dir <r4dx dump dir> --tokens tools\\reference\\kl_corpus\\chat_gemma.json `
+        --raw-tokens tools\\reference\\kl_corpus\\tokens_gemma.json --raw-max-tokens 512 --out gate.json
+    (+ --base-dir <r4dx bf16-container dump> for a quantized container: judged by the KL increment <= 0.01)
+
+Exit status 0 iff every primary (chat) group passes. Test: tools\\reference\\test_kl_report_gate.py.
+
 No GPU, no checkpoint, no torch -- numpy only.
 """
 
@@ -169,10 +182,26 @@ def open_rows(directory: Path, name: str, rows: int, vocab: int) -> np.memmap:
     return np.memmap(path, dtype="<f2", mode="r", shape=(rows, vocab))
 
 
+def row_mask_from_score_mask(score_mask) -> np.ndarray:
+    """Row i of a log-prob file predicts token i+1, so it is scored iff `score_mask[i+1]` is set
+    (the chat corpus' score_mask marks the model-turn TOKENS). Returns a bool array of T-1 rows."""
+    m = np.asarray(score_mask, dtype=bool)
+    return m[1:]
+
+
 def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Path,
-                    row_chunk: int, strict: bool) -> dict:
+                    row_chunk: int, strict: bool, row_mask: np.ndarray | None = None) -> dict:
+    """`row_mask` (bool, T-1 rows; see row_mask_from_score_mask): when given only those rows are read and
+    aggregated; "rows" is then the scored-row count, "rows_total" T-1, and `_pos` the original row index
+    of every scored row."""
     total_len = len(token_ids)
     rows = total_len - 1
+    if row_mask is not None:
+        row_mask = np.asarray(row_mask, dtype=bool)
+        if row_mask.shape != (rows,):
+            raise ValueError(f"segment {name!r}: row_mask has shape {row_mask.shape}, expected ({rows},)")
+        if not row_mask.any():
+            raise ValueError(f"segment {name!r}: row_mask selects no rows")
     ref_meta = read_meta(ref_dir, name)
     test_meta = read_meta(test_dir, name)
 
@@ -212,36 +241,51 @@ def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Pa
     test = open_rows(test_dir, name, rows, vocab)
     next_ids = np.asarray(token_ids[1:], dtype=np.int64)
 
-    kl = np.empty(rows, dtype=np.float64)
-    nll_ref = np.empty(rows, dtype=np.float64)
-    nll_test = np.empty(rows, dtype=np.float64)
-    top1 = np.empty(rows, dtype=bool)
-    top5 = np.empty(rows, dtype=bool)
+    kl = np.full(rows, np.nan, dtype=np.float64)
+    nll_ref = np.full(rows, np.nan, dtype=np.float64)
+    nll_test = np.full(rows, np.nan, dtype=np.float64)
+    top1 = np.zeros(rows, dtype=bool)
+    top5 = np.zeros(rows, dtype=bool)
     p_sum_dev = 0.0
     for start in range(0, rows, row_chunk):
         stop = min(start + row_chunk, rows)
-        st = chunk_stats(ref[start:stop], test[start:stop], next_ids[start:stop])
-        kl[start:stop] = st["kl"]
-        nll_ref[start:stop] = st["nll_ref"]
-        nll_test[start:stop] = st["nll_test"]
-        top1[start:stop] = st["top1_agree"]
-        top5[start:stop] = st["top5_contain"]
+        if row_mask is None:
+            idx = np.arange(start, stop)
+        else:
+            idx = start + np.flatnonzero(row_mask[start:stop])
+            if idx.size == 0:
+                continue
+        contiguous = idx.size == stop - start
+        st = chunk_stats(ref[start:stop] if contiguous else ref[idx],
+                         test[start:stop] if contiguous else test[idx], next_ids[idx])
+        kl[idx] = st["kl"]
+        nll_ref[idx] = st["nll_ref"]
+        nll_test[idx] = st["nll_test"]
+        top1[idx] = st["top1_agree"]
+        top5[idx] = st["top5_contain"]
         p_sum_dev = max(p_sum_dev, float(np.abs(st["p_ref_sum"] - 1.0).max()))
 
+    pos = np.arange(rows) if row_mask is None else np.flatnonzero(row_mask)
+    kl, nll_ref, nll_test, top1, top5 = kl[pos], nll_ref[pos], nll_test[pos], top1[pos], top5[pos]
+    rows_total = rows
+    rows = int(pos.size)
     worst = int(kl.argmax())
+    worst_row = int(pos[worst])
     return {
         "name": name,
         "T": total_len,
         "V": vocab,
         "rows": rows,
+        "rows_total": rows_total,
+        "scored_rows_only": row_mask is not None,
         "sha256_of_token_ids_json": sha,
         "mean_kl": float(kl.mean()),
         "median_kl": float(np.median(kl)),
         "p99_kl": float(np.percentile(kl, 99)),
         "max_kl": float(kl[worst]),
-        "max_kl_position": worst,
-        "max_kl_context_token": int(token_ids[worst]),
-        "max_kl_next_token": int(token_ids[worst + 1]),
+        "max_kl_position": worst_row,
+        "max_kl_context_token": int(token_ids[worst_row]),
+        "max_kl_next_token": int(token_ids[worst_row + 1]),
         "top1_agreement_pct": 100.0 * float(top1.mean()),
         "top5_containment_pct": 100.0 * float(top5.mean()),
         "nll_ref": float(nll_ref.mean()),
@@ -253,6 +297,7 @@ def compare_segment(name: str, token_ids: list[int], ref_dir: Path, test_dir: Pa
         "problems": problems,
         "ref_identity": ref_id,
         "test_identity": test_id,
+        "_pos": pos,
         "_kl": kl,
         "_nll_ref": nll_ref,
         "_nll_test": nll_test,
@@ -273,7 +318,7 @@ def overall(segs: list[dict]) -> dict:
     worst_seg, worst_pos = segs[0]["name"], 0
     for s in segs:
         if worst < off + s["rows"]:
-            worst_seg, worst_pos = s["name"], worst - off
+            worst_seg, worst_pos = s["name"], int(s["_pos"][worst - off])
             break
         off += s["rows"]
     return {
@@ -340,6 +385,175 @@ def markdown(segs: list[dict], total: dict, ref_dir: Path, test_dir: Path) -> st
     for s in segs:
         lines.append(f"- `{s['name']}`: {s['max_abs_p_ref_sum_minus_1']:.3e}")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------------------------
+# Gemma M1 gate against the fp32 truth (docs/gemma4-plan.md 9.9)
+# --------------------------------------------------------------------------------------------
+#
+# The bf16 HF stack is not a stable yardstick for Gemma 4 (residual stream 100-300, bf16 rounding
+# amplified), so the reference is an fp32-truth dump and the allowance is the NOISE of stock HF bf16 sdpa
+# against that truth, measured on the same rows:
+#
+#     per group:  KL(truth||r4dx)  <= 1.5 * KL(truth||HF-bf16-sdpa) + 0.005          (mean over scored rows)
+#                 top-1(truth,r4dx) >= top-1(truth,HF-bf16-sdpa) - 1 percentage point
+#
+# Quantized (trellis) containers are judged by the INCREMENT over the r4dx bf16 container instead
+# (--base-dir): KL(truth||quant) - KL(truth||r4dx-bf16) <= 0.01 per group.
+# Primary corpus: chat-templated sequences scored on model-turn tokens only (score_mask); groups are
+# english / thai / code (python + cpp) and the pooled chat-ALL. Secondary: raw segments, REPORTED ONLY.
+
+GATE_KL_FACTOR = 1.5
+GATE_KL_SLACK = 0.005
+GATE_TOP1_SLACK_PTS = 1.0
+GATE_QUANT_INCREMENT = 0.01
+CHAT_GATE_GROUPS = {"english": "english", "thai": "thai", "python": "code", "cpp": "code"}
+
+
+def pool_stats(segs: list[dict]) -> dict:
+    """Row-weighted statistics over the scored rows of several compare_segment() results."""
+    kl = np.concatenate([s["_kl"] for s in segs])
+    top1 = np.concatenate([s["_top1"] for s in segs])
+    top5 = np.concatenate([s["_top5"] for s in segs])
+    nll_ref = np.concatenate([s["_nll_ref"] for s in segs])
+    nll_test = np.concatenate([s["_nll_test"] for s in segs])
+    return {"rows": int(kl.size), "mean_kl": float(kl.mean()), "median_kl": float(np.median(kl)),
+            "p99_kl": float(np.percentile(kl, 99)), "max_kl": float(kl.max()),
+            "top1_pct": 100.0 * float(top1.mean()), "top5_pct": 100.0 * float(top5.mean()),
+            "nll_ref": float(nll_ref.mean()), "nll_test": float(nll_test.mean())}
+
+
+def gate_thresholds(noise: dict) -> dict:
+    """The thresholds r4dx must meet, from the noise term (pool_stats of KL(truth||HF-bf16-sdpa))."""
+    return {"kl_max": GATE_KL_FACTOR * noise["mean_kl"] + GATE_KL_SLACK,
+            "top1_min_pct": noise["top1_pct"] - GATE_TOP1_SLACK_PTS}
+
+
+def worst_rows(segs: list[dict], n: int = 5) -> list[dict]:
+    rows = []
+    for s in segs:
+        k = np.argsort(s["_kl"])[::-1][:n]
+        for j in k:
+            p = int(s["_pos"][j])
+            rows.append({"segment": s["name"], "row": p, "kl": float(s["_kl"][j]),
+                         "context_token": int(s["_ids"][p]), "next_token": int(s["_ids"][p + 1])})
+    rows.sort(key=lambda r: -r["kl"])
+    return rows[:n]
+
+
+def evaluate_group(test: list[dict], noise: list[dict], base: list[dict] | None, gated: bool) -> dict:
+    t, nz = pool_stats(test), pool_stats(noise)
+    thr = gate_thresholds(nz)
+    out = {"rows": t["rows"], "test": t, "noise": nz, "thresholds": thr, "worst_rows": worst_rows(test),
+           "kl_ok": t["mean_kl"] <= thr["kl_max"], "top1_ok": t["top1_pct"] >= thr["top1_min_pct"]}
+    if base is not None:
+        b = pool_stats(base)
+        out["base"] = b
+        out["increment_kl"] = t["mean_kl"] - b["mean_kl"]
+        out["increment_top1_pts"] = t["top1_pct"] - b["top1_pct"]
+        out["increment_ok"] = out["increment_kl"] <= GATE_QUANT_INCREMENT
+        out["pass"] = out["increment_ok"] if gated else None
+    else:
+        out["pass"] = (out["kl_ok"] and out["top1_ok"]) if gated else None
+    return out
+
+
+def build_gate_groups(chat_items: list[dict], raw_items: list[dict]) -> list[tuple[str, bool, list[dict]]]:
+    """[(group name, gated, items)]; an item is {"name","group","test","noise","base"}."""
+    groups: dict[str, list[dict]] = {}
+    for it in chat_items:
+        groups.setdefault("chat-" + CHAT_GATE_GROUPS.get(it["group"], it["group"]), []).append(it)
+    out = [(g, True, v) for g, v in sorted(groups.items())]
+    if chat_items:
+        out.append(("chat-ALL", True, list(chat_items)))
+    for it in raw_items:
+        out.append(("raw:" + it["name"], False, [it]))
+    if raw_items:
+        out.append(("raw-ALL", False, list(raw_items)))
+    return out
+
+
+def gate_gemma_fp32_markdown(res: dict) -> str:
+    quant = res["mode"] == "quantized-increment"
+    L = [f"# Gemma fp32-truth gate -- test `{res['test_dir']}`",
+         f"- truth `{res['truth_dir']}`; noise (HF bf16 sdpa) `{res['noise_dir']}`"
+         + (f"; base (r4dx bf16) `{res['base_dir']}`" if quant else ""),
+         "- rule: " + ("KL(truth||quant) - KL(truth||r4dx-bf16) <= 0.01 per group (quantized: increment)" if quant else
+                      f"mean KL <= {GATE_KL_FACTOR} x noise KL + {GATE_KL_SLACK}; top-1 >= noise top-1 - "
+                      f"{GATE_TOP1_SLACK_PTS:g} pt"),
+         "- chat groups are scored on model-turn tokens only; raw groups are REPORTED, no pass/fail", ""]
+    head = ("| group | rows | test mean KL | median | p99 | noise mean KL | noise median | noise p99 | KL max (gate) | "
+            "test top-1 | noise top-1 | top-1 min (gate) |" + (" incr KL | " if quant else " ") + "verdict |")
+    L += [head, "|" + "---|" * (head.count("|") - 1)]
+    for g in res["groups"]:
+        t, n, th = g["test"], g["noise"], g["thresholds"]
+        verdict = "info" if g["pass"] is None else ("PASS" if g["pass"] else "FAIL")
+        if g["pass"] is not None and not quant:
+            verdict += f" (KL {'ok' if g['kl_ok'] else 'X'}, top-1 {'ok' if g['top1_ok'] else 'X'})"
+        L.append(f"| {g['name']} | {g['rows']} | {t['mean_kl']:.5f} | {t['median_kl']:.5f} | {t['p99_kl']:.5f} | "
+                 f"{n['mean_kl']:.5f} | {n['median_kl']:.5f} | {n['p99_kl']:.5f} | {th['kl_max']:.5f} | "
+                 f"{t['top1_pct']:.2f}% | {n['top1_pct']:.2f}% | {th['top1_min_pct']:.2f}% | "
+                 + (f"{g['increment_kl']:+.5f} | " if quant else "") + f"{verdict} |")
+    L += ["", "Worst rows per group (KL(truth||test), nats):"]
+    for g in res["groups"]:
+        w = ", ".join(f"{r['segment']}@{r['row']}={r['kl']:.3f}" for r in g["worst_rows"][:3])
+        L.append(f"- {g['name']}: {w}")
+    L += ["", f"**Overall (primary groups): {'PASS' if res['pass'] else 'FAIL'}**"]
+    return "\n".join(L)
+
+
+def gate_gemma_fp32(truth_dir: Path, noise_dir: Path, test_dir: Path, chat_tokens: Path,
+                    raw_tokens: Path | None = None, raw_max_tokens: int = 512, raw_names: list[str] | None = None,
+                    base_dir: Path | None = None, row_chunk: int = 32, strict: bool = True) -> dict:
+    chat_doc = json.loads(Path(chat_tokens).read_text(encoding="utf-8"))
+    chat_items, raw_items = [], []
+
+    def run(name, ids, mask):
+        r = {}
+        for key, d in (("test", test_dir), ("noise", noise_dir), ("base", base_dir)):
+            if d is None:
+                r[key] = None
+                continue
+            r[key] = compare_segment(name, ids, truth_dir, d, row_chunk, strict, row_mask=mask)
+            r[key]["_ids"] = ids
+        return r
+
+    for s in chat_doc["segments"]:
+        if "score_mask" not in s:
+            raise SystemExit(f"{chat_tokens}: segment {s['name']} has no score_mask (not a chat corpus)")
+        assert len(s["score_mask"]) == len(s["token_ids"]), "score_mask length != token_ids length"
+        r = run(s["name"], s["token_ids"], row_mask_from_score_mask(s["score_mask"]))
+        chat_items.append({"name": s["name"], "group": s.get("group", "chat"), **r})
+    if raw_tokens is not None:
+        raw_doc = json.loads(Path(raw_tokens).read_text(encoding="utf-8"))
+        for s in raw_doc["segments"]:
+            if raw_names is not None and s["name"] not in raw_names:
+                continue
+            if not (Path(truth_dir) / f"{s['name']}.meta.json").exists():
+                print(f"[kl_report] raw segment {s['name']}: no truth dump, skipped")
+                continue
+            ids = s["token_ids"][:raw_max_tokens] if raw_max_tokens else s["token_ids"]
+            r = run(s["name"], ids, None)
+            raw_items.append({"name": s["name"], "group": "raw", **r})
+    groups = []
+    for gname, gated, items in build_gate_groups(chat_items, raw_items):
+        g = evaluate_group([i["test"] for i in items], [i["noise"] for i in items],
+                           [i["base"] for i in items] if base_dir is not None else None, gated)
+        g["name"], g["gated"], g["segments"] = gname, gated, [i["name"] for i in items]
+        groups.append(g)
+    primary = [g["pass"] for g in groups if g["gated"]]
+    return {"gate": "gemma-fp32", "mode": "quantized-increment" if base_dir is not None else "bf16",
+            "truth_dir": str(truth_dir), "noise_dir": str(noise_dir), "test_dir": str(test_dir),
+            "base_dir": None if base_dir is None else str(base_dir), "chat_tokens": str(chat_tokens),
+            "raw_tokens": None if raw_tokens is None else str(raw_tokens), "raw_max_tokens": raw_max_tokens,
+            "rule": {"kl_factor": GATE_KL_FACTOR, "kl_slack": GATE_KL_SLACK, "top1_slack_pts": GATE_TOP1_SLACK_PTS,
+                     "quant_increment": GATE_QUANT_INCREMENT},
+            "groups": groups, "pass": bool(primary) and all(primary),
+            "per_segment": [{"name": i["name"], "group": i["group"],
+                             "test_mean_kl": float(i["test"]["mean_kl"]), "noise_mean_kl": float(i["noise"]["mean_kl"]),
+                             "test_top1_pct": i["test"]["top1_agreement_pct"],
+                             "noise_top1_pct": i["noise"]["top1_agreement_pct"], "rows": i["test"]["rows"]}
+                            for i in chat_items + raw_items]}
 
 
 # --------------------------------------------------------------------------------------------
@@ -471,10 +685,39 @@ def main() -> int:
     ap.add_argument("--allow-mismatch", action="store_true",
                     help="warn instead of aborting when a sidecar disagrees with the tokens file")
     ap.add_argument("--self-test", action="store_true", help="run the analytic self-test and exit")
+    ap.add_argument("--use-score-mask", action="store_true",
+                    help="score-mask aware mode for the plain report: segments of --tokens that carry a "
+                         "`score_mask` are aggregated over the model-turn rows only")
+    ap.add_argument("--gate", choices=["gemma-fp32"], default=None,
+                    help="gemma-fp32: the M1 gate against the fp32 truth (see the section comment above "
+                         "gate_gemma_fp32); needs --truth-dir --noise-dir --test-dir and --tokens=chat_gemma.json")
+    ap.add_argument("--truth-dir", type=Path, help="gate: fp32-truth dump dir")
+    ap.add_argument("--noise-dir", type=Path, help="gate: HF bf16 sdpa dump dir (the noise term)")
+    ap.add_argument("--base-dir", type=Path, default=None,
+                    help="gate: r4dx bf16-container dump; with it --test-dir is a quantized container judged by "
+                         "the KL increment over this base (<= 0.01) instead of the noise-relative rule")
+    ap.add_argument("--raw-tokens", type=Path, default=None, help="gate: raw segments (secondary, report only)")
+    ap.add_argument("--raw-max-tokens", type=int, default=512)
+    ap.add_argument("--raw-segment", default=None, help="gate: comma list of raw segment names")
     args = ap.parse_args()
 
     if args.self_test:
         return self_test()
+    if args.gate == "gemma-fp32":
+        missing = [n for n, v in (("--truth-dir", args.truth_dir), ("--noise-dir", args.noise_dir),
+                                  ("--test-dir", args.test_dir), ("--tokens", args.tokens)) if v is None]
+        if missing:
+            raise SystemExit(f"[kl_report] --gate gemma-fp32 needs {', '.join(missing)}")
+        res = gate_gemma_fp32(args.truth_dir, args.noise_dir, args.test_dir, args.tokens, args.raw_tokens,
+                              args.raw_max_tokens, None if args.raw_segment is None else args.raw_segment.split(","),
+                              args.base_dir, args.row_chunk, strict=not args.allow_mismatch)
+        print(gate_gemma_fp32_markdown(res))
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps({"generated_at": dt.datetime.now(dt.timezone.utc).isoformat(), **res},
+                                           indent=2), encoding="utf-8")
+            print(f"\n[kl_report] wrote {args.out}")
+        return 0 if res["pass"] else 1
     missing = [n for n, v in (("--ref-dir", args.ref_dir), ("--test-dir", args.test_dir),
                               ("--tokens", args.tokens)) if v is None]
     if missing:
@@ -492,8 +735,10 @@ def main() -> int:
 
     results = []
     for seg in segments:
+        rmask = (row_mask_from_score_mask(seg["score_mask"])
+                 if args.use_score_mask and "score_mask" in seg else None)
         results.append(compare_segment(seg["name"], seg["token_ids"], args.ref_dir, args.test_dir,
-                                       args.row_chunk, strict=not args.allow_mismatch))
+                                       args.row_chunk, strict=not args.allow_mismatch, row_mask=rmask))
     side_problems = check_sides(results, strict=not args.allow_mismatch)
     total = overall(results)
     print(markdown(results, total, args.ref_dir, args.test_dir))

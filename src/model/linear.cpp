@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -543,6 +545,12 @@ TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t
   if (kb != 4 && kb != 5) return refuse("KB is not 4 or 5");
   if (parts < 1 || parts > 2) return refuse("trellis parts is not 1 or 2");
   if (N <= 0 || K <= 0 || N > 0x7FFFFFFF || K > 0x7FFFFFFF) return refuse("shape out of range");
+  // Whole 128-blocks (the loader's rule, and the kernel's): refuse here, with a reason, rather than let
+  // TrellisTuningFor throw on a shape the plan was only asked about.
+  if (N % 128 != 0 || K % 128 != 0) return refuse("N and K must be whole 128-blocks");
+  if (parts > 1 && (part_n0 <= 0 || part_n0 >= N || part_n0 % 128 != 0)) {
+    return refuse("part boundary is not a whole 128-block inside N");
+  }
   if (!M256ShapeAllowed(N, K)) return refuse("shape excluded by R4DX_M256_SHAPES");
   // The row the M = 64 chunks of this linear run today. A 64-row chunk (M > 32) gets the M = 64 band's
   // row; whatever it names (or 4.4's fallback at a part boundary) is what the M = 256 kernel must
@@ -662,6 +670,18 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   if (w.layout == Layout::kTrellis && M == kTrellisM256Rows && TrellisM256Active()) {
     const TrellisM256Plan plan =
         PlanTrellisM256(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]);
+    if (!plan.ok && plan.why.rfind("shape excluded", 0) != 0) {
+      // Explicit, not silent (docs/gemma4-plan.md 3.7, M1-29): a shape with no M = 256 configuration takes
+      // the four-launch 64-row path below -- correct, slower. Say so once per shape and rate.
+      static thread_local std::set<std::tuple<int64_t, int64_t, int, int>> warned;
+      if (warned.emplace(N, K, w.trellis_bits, w.trellis_parts).second) {
+        std::fprintf(stderr,
+                     "r4dx: trellis [%lld x %lld] KB%d parts %d has no M = 256 plan (%s); 256-row calls "
+                     "slice into four 64-row launches\n",
+                     static_cast<long long>(N), static_cast<long long>(K), w.trellis_bits,
+                     w.trellis_parts, plan.why.c_str());
+      }
+    }
     if (plan.ok) {
       const int parts = w.trellis_parts;
       const uint16_t* a0;

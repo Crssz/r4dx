@@ -187,6 +187,17 @@ target_link_libraries(test_pick_tuning PRIVATE r4dx_model r4dx_convert r4dx_core
 add_test(NAME test_pick_tuning COMMAND test_pick_tuning)
 set_tests_properties(test_pick_tuning PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 
+# test_trellis_gemma_plan (docs/gemma4-plan.md 3.7, M1-29): host-only legality of every Gemma 4 12B trellis
+# linear shape (TP = 1 and a TP = 2 rank, KB 4 and 5): the 64-row tuning is legal, PlanTrellisM256 says ok
+# and agrees with libr4d's own M = 256 check. No HIP call; HIP_VISIBLE_DEVICES=-1 hides every device from
+# the runtime that linking r4dx_model_linear loads.
+add_executable(test_trellis_gemma_plan test_trellis_gemma_plan.cpp)
+target_link_libraries(test_trellis_gemma_plan PRIVATE r4dx_model_linear)
+add_test(NAME test_trellis_gemma_plan COMMAND test_trellis_gemma_plan)
+set_tests_properties(test_trellis_gemma_plan PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# /EHc-: see tests/kernels/CMakeLists.txt (an extern "C" throw is otherwise uncatchable).
+set_source_files_properties(test_trellis_gemma_plan.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
 # Tensor-parallel P1 (docs/tp.md 10.1): four CPU-only tests of the TP building blocks under
 # src/model/tp/ -- no HIP call, no device, no container -- so, like test_mtp_round above, plain
 # add_test() with no ENVIRONMENT / SKIP_RETURN_CODE: they always run.

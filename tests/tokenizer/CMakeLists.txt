@@ -24,6 +24,11 @@ target_compile_definitions(tokenizer_golden PRIVATE
 add_test(NAME tokenizer_golden COMMAND tokenizer_golden)
 set_tests_properties(tokenizer_golden PROPERTIES SKIP_RETURN_CODE 77)
 
+# Microbench + large-corpus HF agreement check; not a CTest test (needs a corpus written by
+# tools/tok_ref/bench_hf.py or check_hf_equiv.py --emit-jsonl). First measured numbers: header of bench_tokenizer.cpp.
+add_executable(bench_tokenizer bench_tokenizer.cpp)
+target_link_libraries(bench_tokenizer PRIVATE r4dx_tokenizer)
+
 # Model-free checks of the local minja patches + ChatTemplateOptions (Gemma 4 chat template needs them).
 add_executable(tokenizer_minja_patches test_minja_patches.cpp)
 target_link_libraries(tokenizer_minja_patches PRIVATE r4dx_tokenizer)

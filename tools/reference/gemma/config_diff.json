@@ -1,0 +1,9 @@
+{
+ "google_current_vs_huihui": [
+  {
+   "path": "text_config.max_position_embeddings",
+   "google": 262144,
+   "huihui": 131072
+  }
+ ]
+}

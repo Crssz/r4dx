@@ -1,0 +1,27 @@
+{
+ "tokenizer.json": {
+  "source_repo": "huihui-ai/Huihui-gemma-4-12B-it-abliterated",
+  "bytes": 32169626,
+  "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+ },
+ "tokenizer_config.json": {
+  "source_repo": "google/gemma-4-12B-it",
+  "bytes": 3089,
+  "sha256": "a62f4e85a47c0c136edaaa3a4f591fd6783717299a9def47e5ad03a49f6a5eb9"
+ },
+ "chat_template.jinja": {
+  "source_repo": "google/gemma-4-12B-it",
+  "bytes": 18683,
+  "sha256": "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4"
+ },
+ "generation_config.json": {
+  "source_repo": "google/gemma-4-12B-it",
+  "bytes": 260,
+  "sha256": "a8349d9bd64cc5841297fcb5002f0fdc4749c473c8f1b10ea337f9ce4ee7014e"
+ },
+ "processor_config.json": {
+  "source_repo": "google/gemma-4-12B-it",
+  "bytes": 1382,
+  "sha256": "6b938e76555b3e9946890770e1abcd442a4718f34041a58e8139dc8ad34545c9"
+ }
+}

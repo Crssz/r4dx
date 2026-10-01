@@ -37,6 +37,9 @@ set(R4DX_MODEL_ATTN_FLAGS
   # src/kernels' hadamard_device.h (device-only FwhtLds, shared with r4dx_kernels' quant2 kernels)
   # for r4dx_model_attn_gate_mul_hadamard_bf16.
   -I "${CMAKE_CURRENT_SOURCE_DIR}/../../kernels/include"
+  # third_party/libr4d/r4d_attn_window.h: the sliding-window / ring arithmetic attn_ref.hip shares
+  # with the windowed libr4d kernels (a pure header).
+  -I "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/libr4d"
 )
 if(EXISTS "${R4DX_MODEL_ATTN_DEVICE_LIB_PATH}")
   list(APPEND R4DX_MODEL_ATTN_FLAGS --rocm-device-lib-path=${R4DX_MODEL_ATTN_DEVICE_LIB_PATH})
@@ -62,7 +65,25 @@ add_custom_command(
 )
 set_source_files_properties("${R4DX_MODEL_ATTN_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
-add_library(r4dx_model_attention STATIC "${R4DX_MODEL_ATTN_OBJ}")
+# Gemma 4's stage-0 reference attention (docs/gemma4-plan.md 3.3; attn_ref.h): a second object,
+# same flags.
+set(R4DX_MODEL_ATTN_REF_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/attn_ref.hip")
+set(R4DX_MODEL_ATTN_REF_OBJ "${R4DX_MODEL_ATTN_OBJ_DIR}/attn_ref.obj")
+add_custom_command(
+  OUTPUT "${R4DX_MODEL_ATTN_REF_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_MODEL_ATTN_HIPCC_PATH}"
+          "${R4DX_MODEL_ATTN_HIPCC}" ${R4DX_MODEL_ATTN_FLAGS} -c "${R4DX_MODEL_ATTN_REF_SRC}"
+          -o "${R4DX_MODEL_ATTN_REF_OBJ}"
+  DEPENDS "${R4DX_MODEL_ATTN_REF_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/model/attention/attn_ref.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../core/include/r4dx/core/dtype.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/libr4d/r4d_attn_window.h"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) r4dx_model_attention attn_ref.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_MODEL_ATTN_REF_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
+add_library(r4dx_model_attention STATIC "${R4DX_MODEL_ATTN_OBJ}" "${R4DX_MODEL_ATTN_REF_OBJ}")
 set_target_properties(r4dx_model_attention PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(r4dx_model_attention PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 # r4dx_model_linear (../CMakeLists.txt, defined before this add_subdirectory() runs): gives

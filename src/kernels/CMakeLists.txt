@@ -98,6 +98,8 @@ add_custom_command(
           "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_TRELLIS_SRC}" -o "${R4DX_TRELLIS_OBJ}"
   DEPENDS "${R4DX_TRELLIS_SRC}"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
@@ -106,6 +108,27 @@ add_custom_command(
   VERBATIM
 )
 set_source_files_properties("${R4DX_TRELLIS_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
+# ---- Gemma 4 device pieces (docs/gemma4-plan.md 3.4 / 3.5, task M1-15) ----------------------------
+# gemma_kernels.hip: proportional rope, weightless rmsnorm, GeGLU (+ wide), the scaled embedding
+# gather and the fused sandwich post-norm + residual (include/r4dx/kernels/gemma_kernels.h). Same
+# flags as r4dx_kernels.hip. (The GeGLU trellis producer lives in trellis_transform.hip, beside its
+# silu twin.)
+set(R4DX_GEMMA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/gemma_kernels.hip")
+set(R4DX_GEMMA_OBJ "${R4DX_KERNELS_OBJ_DIR}/gemma_kernels.obj")
+add_custom_command(
+  OUTPUT "${R4DX_GEMMA_OBJ}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4DX_KERNELS_HIPCC_PATH}"
+          "${R4DX_HIPCC}" ${R4DX_KERNELS_FLAGS} -c "${R4DX_GEMMA_SRC}" -o "${R4DX_GEMMA_OBJ}"
+  DEPENDS "${R4DX_GEMMA_SRC}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/gemma_device.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/kernels.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+  COMMENT "hipcc (${R4D_GFX_ARCH}) gemma_kernels.obj"
+  VERBATIM
+)
+set_source_files_properties("${R4DX_GEMMA_OBJ}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
 # ---- second hipcc object: the tensor-parallel all-reduce (docs/tp.md 6.3.1) ----------------------
 # r4dx_tp_kernels.hip is a port of tools/tp_bench's flag(drain 3, acq 0) kernel. It is built with
@@ -160,7 +183,7 @@ add_custom_command(
 add_custom_target(r4dx_tp_kernels_isa ALL DEPENDS "${R4DX_TP_KERNELS_ISA_STAMP}")
 
 add_library(r4dx_kernels STATIC "${R4DX_KERNELS_OBJ}" "${R4DX_TP_KERNELS_OBJ}" "${R4DX_ROTATE_OBJ}"
-            "${R4DX_TRELLIS_OBJ}")
+            "${R4DX_TRELLIS_OBJ}" "${R4DX_GEMMA_OBJ}")
 set_target_properties(r4dx_kernels PROPERTIES LINKER_LANGUAGE CXX)
 add_dependencies(r4dx_kernels r4dx_tp_kernels_isa)
 target_include_directories(r4dx_kernels PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")

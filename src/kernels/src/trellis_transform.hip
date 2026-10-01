@@ -28,6 +28,8 @@
 #include "r4d_fwht128.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
+#include "r4dx/kernels/gemma_device.h"
+#include "r4dx/kernels/gemma_kernels.h"
 #include "r4dx/kernels/hadamard_device.h"
 #include "r4dx/kernels/kernels.h"
 
@@ -113,6 +115,28 @@ __global__ __launch_bounds__(kTqWave) void SiluMulTrellisKernel(const uint16_t* 
     const float u = Bf16BitsToFloat(gu[intermediate + k_off + kTqWave * r]);
     const __hip_bfloat16 h = __float2bfloat16(g * TqSigmoid(g) * u);
     xv[r] = __bfloat162float(h);
+  }
+  TransformBlock(xv, suh, out, static_cast<int64_t>(blockIdx.y) * intermediate + k_off, k_off, scale,
+                 lane);
+}
+
+// Gemma 4's GeGLU (r4dx_gelu_tanh_mul_wide_bf16's element, gemma_device.h's GeGluElement), same shape
+// as SiluMulTrellisKernel above.
+__global__ __launch_bounds__(kTqWave) void GeluMulTrellisKernel(const uint16_t* __restrict__ gate_up,
+                                                                 int64_t intermediate,
+                                                                 int64_t in_row_stride,
+                                                                 const float* __restrict__ suh,
+                                                                 uint16_t* __restrict__ out,
+                                                                 float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int64_t k_off = static_cast<int64_t>(blockIdx.x) * kTqBlock + lane;
+  const uint16_t* gu = gate_up + static_cast<int64_t>(blockIdx.y) * in_row_stride;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float g = Bf16BitsToFloat(gu[k_off + kTqWave * r]);
+    const float u = Bf16BitsToFloat(gu[intermediate + k_off + kTqWave * r]);
+    xv[r] = __bfloat162float(r4dx::kernels::gemma::GeGluElement(g, u));
   }
   TransformBlock(xv, suh, out, static_cast<int64_t>(blockIdx.y) * intermediate + k_off, k_off, scale,
                  lane);
@@ -222,6 +246,25 @@ void r4dx_silu_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermedi
   if (rows == 0) return;
   r4dx_kernel_launch_counter_add(1);
   hipLaunchKernelGGL(SiluMulTrellisKernel,
+                     dim3(static_cast<unsigned>(intermediate / kTqBlock), static_cast<unsigned>(rows)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(gate_up), intermediate, in_row_stride,
+                     reinterpret_cast<const float*>(suh), reinterpret_cast<uint16_t*>(out), scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_gelu_tanh_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermediate,
+                                      int64_t in_row_stride, int64_t suh, int64_t out,
+                                      int prescale_log2, int64_t stream) {
+  const float scale =
+      ProducerScale("r4dx_gelu_tanh_mul_trellis_bf16", rows, intermediate, suh, out, prescale_log2);
+  if (gate_up == 0) throw std::runtime_error("r4dx_gelu_tanh_mul_trellis_bf16: gate_up is null");
+  if (in_row_stride < 2 * intermediate) {
+    throw std::runtime_error("r4dx_gelu_tanh_mul_trellis_bf16: in_row_stride must be >= 2 * intermediate");
+  }
+  if (rows == 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(GeluMulTrellisKernel,
                      dim3(static_cast<unsigned>(intermediate / kTqBlock), static_cast<unsigned>(rows)),
                      dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
                      reinterpret_cast<const uint16_t*>(gate_up), intermediate, in_row_stride,

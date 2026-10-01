@@ -37,6 +37,16 @@ static const R4DConstraint cAttnDecodeFp8[] = {
     C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16), C_EQ("causal", 1),
     C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
 };
+// The sliding-window family (r4d_attn_paged_h256_gqa2.hip): the same kernels at gqa 2, plus a window.
+// `window` >= 1 is a constraint a caller selects with; q_len <= 32 is the q_len*gqa <= 64 of the prose.
+static const R4DConstraint cAttnPrefillWinFp8[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16), C_EQ("causal", 1),
+    C_GE("window", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
+static const R4DConstraint cAttnDecodeWinFp8[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("block_size", 16), C_EQ("causal", 1),
+    C_GE("window", 1), C_LE("q_len", 32), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
+};
 static const R4DConstraint cAttnVit[] = {
     C_EQ("head_dim", 72), C_EQ("gqa", 1), C_EQ("causal", 0),
     C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
@@ -122,6 +132,22 @@ static const R4DKernelInfo kKernels[] = {
      "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",
      "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
      ROW(cAttnDecodeFp8)},
+    // Own ops: they take R4DArgsW (a window, and klimit_ext on prefill), so a caller selecting plain
+    // "attn_prefill_paged" / "attn_decode_paged" is never handed them.
+    {"attn_prefill_h256_gqa2_fp8kv", "attn", "attn_prefill_paged_window",
+     "paged causal sliding-window attention, query-tiled (prefill / chunked prefill), optional "
+     "per-row bidirectional key limit (klimit_ext)",
+     "head_dim 256, 2 queries per kv head, paged block 16, varlen, window W >= 1; a sliding KV ring "
+     "is a block table whose entries repeat; the cache must be zero-initialised",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out",
+     ROW(cAttnPrefillWinFp8)},
+    {"attn_decode_h256_gqa2_fp8kv", "attn", "attn_decode_paged_window",
+     "paged causal sliding-window attention, split-KV over the window's tiles (decode / speculative "
+     "verify)",
+     "head_dim 256, 2 queries per kv head, paged block 16, q_len*gqa <= 64, window W >= 1, scratch "
+     "required; the split law sees min(max_ctx, W + q_len + 16)",
+     "bf16 query, fp8-e4m3 kv cache with per-(seq,head) descales, bf16 out, f16 partials",
+     ROW(cAttnDecodeWinFp8)},
     {"attn_vit_h72_bf16", "attn", "attn_vit",
      "dense non-causal vision-encoder attention, varlen over images / windows",
      "head_dim 72 native (no padding to 128), multi-head (no GQA), contiguous q/k/v/o, "
@@ -221,6 +247,23 @@ static const R4DKernelInfo kKernels[] = {
      "bf16 x / delta / base / out, fp32 accumulate",
      ROW(cDflashConv)},
 };
+
+// The attention geometries this build serves (r4d.h's R4DAttnGeom), in the order the units are listed
+// in third_party/CMakeLists.txt. The numbers restate each unit's own #defines (A_* in
+// r4d_attn_paged_h256_gqa6.hip, W_* in r4d_attn_paged_h256_gqa2.hip).
+static const R4DAttnGeom kAttnGeoms[] = {
+    {"h256_gqa6", 256, 6, 16, 64, 0},
+    {"h256_gqa2", 256, 2, 16, 64, 1},
+};
+
+extern "C" int r4d_attn_geom_count(void) {
+    return (int)(sizeof(kAttnGeoms) / sizeof(kAttnGeoms[0]));
+}
+
+extern "C" const R4DAttnGeom* r4d_attn_geom_at(int i) {
+    if (i < 0 || i >= r4d_attn_geom_count()) return nullptr;
+    return &kAttnGeoms[i];
+}
 
 extern "C" int r4d_kernel_count(void) {
     return (int)(sizeof(kKernels) / sizeof(kKernels[0]));

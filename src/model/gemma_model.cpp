@@ -149,7 +149,10 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
             << (opts.kv == GemmaKvMode::kFp8 ? "fp8" : opts.kv == GemmaKvMode::kBf16Full ? "bf16 (full layers) + fp8 (sliding)" : "bf16")
             << " = " << (static_cast<double>(m.kv_bytes_) / (1024.0 * 1024.0 * 1024.0)) << " GiB, attention "
             << (opts.attn == attention::GemmaAttnBackend::kReference ? "reference" : "libr4d (sliding) + reference (full)")
-            << (m.container_.HasRotation() ? ", rotated residual" : "") << ", residual "
+            << (std::getenv("R4DX_GEMMA_KV") != nullptr && *std::getenv("R4DX_GEMMA_KV") != '\0'
+                    ? " [R4DX_GEMMA_KV set]" : " [default; R4DX_GEMMA_KV=fp8 for fp8]")
+            << (m.container_.HasRotation() ? ", rotated residual" : "") << (m.container_.HasTrellis() ? ", trellis body" : "")
+            << ", residual "
             << (opts.resid == GemmaResid::kFp32 ? "fp32" : "bf16") << "\n";
   return m;
 }

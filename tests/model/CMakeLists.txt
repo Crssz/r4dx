@@ -217,7 +217,13 @@ if(TARGET r4dx-convert)
   add_dependencies(test_gemma_container r4dx-convert)
 endif()
 add_test(NAME test_gemma_container COMMAND test_gemma_container)
-set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=")
+if(TARGET convert_gemma_trellis)
+  # part (d): the rotated trellis containers convert_gemma_trellis leaves behind (SKIP when absent).
+  set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT
+    "HIP_VISIBLE_DEVICES=;R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep" FIXTURES_REQUIRED gemma_trellis_containers)
+else()
+  set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=")
+endif()
 
 # test_gemma_forward_smoke (docs/gemma4-plan.md M1-20 / M1-22 smoke): the whole Gemma 4 stack on the real bf16.r4dx
 # against the M0-8 reference log-probs (full_logits_gemma.py's .logprobs.f16) over the first tokens of the first KL
@@ -229,6 +235,22 @@ target_compile_definitions(test_gemma_forward_smoke PRIVATE R4DX_SOURCE_DIR_STR=
 add_test(NAME gemma_forward_smoke COMMAND test_gemma_forward_smoke)
 set_tests_properties(gemma_forward_smoke PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
 
+# test_gemma_rot_trellis (docs/gemma4-plan.md M1-31): GemmaModel on the rotated trellis containers convert_gemma_trellis
+# keeps (R4DX_GEMMA_TRELLIS_KEEP), against the same checkpoint unrotated bf16 (converted here by r4dx-convert): the
+# loader accepts the pair, default KV is bf16, logits track the reference, fp8 KV is finite. GPU test (device 1); NOT RUN
+# by its author. SKIP 77 while the kept containers are missing. ctest -R gemma_rot_trellis.
+add_executable(test_gemma_rot_trellis test_gemma_rot_trellis.cpp)
+target_link_libraries(test_gemma_rot_trellis PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_gemma_rot_trellis PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_gemma_rot_trellis r4dx-convert)
+endif()
+add_test(NAME gemma_rot_trellis COMMAND test_gemma_rot_trellis)
+set_tests_properties(gemma_rot_trellis PROPERTIES SKIP_RETURN_CODE 77
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1;R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep")
+if(TARGET convert_gemma_trellis)
+  set_tests_properties(gemma_rot_trellis PROPERTIES FIXTURES_REQUIRED gemma_trellis_containers)
+endif()
 add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)

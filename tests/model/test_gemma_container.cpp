@@ -12,7 +12,7 @@
 //       default context and the 262144 opt-in;
 //   (c) rotation metadata: the real config with a Gemma option-A rotation block (hidden 3840 = 15 x 256) parses
 //       to post_norm_rotate / has_o_full, with o_full_elems 8192, and a Qwen-style (no out_fold) block is refused.
-// No GPU work: nothing here calls a HIP function.
+//   (d) rotated TRELLIS (docs/gemma4-plan.md M1-31): the loader's CheckTrellisChoice accepts trellis + rotation for Gemma\r\n//       (allow_rotated) and still refuses it by default (Qwen); and, from the rot-q2ab / rot-q2a containers the real\r\n//       r4dx-convert wrote in convert_gemma_trellis (R4DX_GEMMA_TRELLIS_KEEP), Inspect + the trellis metadata /\r\n//       tensor checks pass with both blocks present. SKIP when those files are absent.\r\n// No GPU work: nothing here calls a HIP function.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "gemma_container.h"
+#include "container_load_util.h"
 #include "gemma_container_info.h"
 #include "nlohmann/json.hpp"
 
@@ -345,6 +346,54 @@ void TestRotationMetadata() {
   Check(ParseGemmaContainerMetadata(trellis, "synthetic.r4dx").has_trellis, "a trellis block is detected");
 }
 
+// ---- (d) rotated trellis ----------------------------------------------------------------------------------
+void TestRotatedTrellis() {
+  std::printf("---- (d) rotated trellis container (M1-31) ----\n");
+  using namespace r4dx::model::container_util;
+  // The choice rules, on a minimal spec (no file needed).
+  std::optional<TrellisSpec> spec = TrellisSpec{};
+  Check(Throws([&] { CheckTrellisChoice(spec, /*rotated=*/true, Layout::kTrellis, "x.r4dx"); }, "mutually exclusive"),
+        "default (Qwen) loader: trellis + rotation is refused");
+  Check(!Throws([&] { CheckTrellisChoice(spec, true, Layout::kTrellis, "x.r4dx", /*allow_rotated=*/true); }),
+        "Gemma loader (allow_rotated): trellis + rotation is accepted");
+  Check(Throws([&] { CheckTrellisChoice(spec, true, Layout::kBf16, "x.r4dx", true); }, "--layout trellis"),
+        "rotated trellis container with --layout bf16 is refused (run with --layout trellis)");
+  Check(Throws([&] { CheckTrellisChoice(std::nullopt, true, Layout::kTrellis, "x.r4dx", true); }, "has none"),
+        "--layout trellis on a rotated non-trellis container is refused");
+  Check(!Throws([&] { CheckTrellisChoice(std::nullopt, true, Layout::kBf16, "x.r4dx", true); }),
+        "a rotated w4a16 / bf16 container still loads (allow_rotated changes nothing for it)");
+
+  const char* keep = std::getenv("R4DX_GEMMA_TRELLIS_KEEP");
+  if (keep == nullptr || *keep == '\0') {
+    std::printf("SKIP: R4DX_GEMMA_TRELLIS_KEEP not set (container part of (d) not run)\n");
+    return;
+  }
+  for (const char* tag : {"q2ab", "q2a"}) {
+    const fs::path p = fs::path(keep) / "r4dx_test_gemma_trellis" / (std::string("rot-") + tag + ".r4dx");
+    if (!fs::exists(p)) {
+      std::printf("SKIP: %s not present (run convert_gemma_trellis first)\n", p.string().c_str());
+      continue;
+    }
+    const std::string path = p.u8string();
+    const std::string what = std::string("rotated trellis ") + tag + ": ";
+    const GemmaContainerInfo info = GemmaContainer::Inspect(path);
+    Check(info.rotation && info.rotation->post_norm_rotate && info.has_trellis && info.rotation->nblk == 3 &&
+              info.rotation->Hadamard() == (std::string(tag) == "q2ab"),
+          what + "Inspect: option-A rotation and a trellis block together (3 x 256, Hadamard iff q2ab)");
+    r4dx_convert::SafetensorsReader r(r4dx_convert::Utf8ToWide(path));
+    Check(GemmaTensorTableProblems(r, info, info.config.num_hidden_layers, /*bf16_body=*/false).empty(),
+          what + "the tensor table (.rotated norms, rotation.*, trellis linears, head) matches");
+    const std::optional<TrellisSpec> ts = ParseTrellisMetadata(info.metadata, path);
+    Check(ts && ts->linears.size() == 35 && ts->Find("text.layers.0.mlp.gate_up") != nullptr, what + "the 35 trellis linears parse (6 layers: 5 x 6 + 5)");
+    Check(!Throws([&] { CheckTrellisChoice(ts, true, Layout::kTrellis, path, true); }) &&
+              Throws([&] { CheckTrellisChoice(ts, true, Layout::kTrellis, path); }, "mutually exclusive"),
+          what + "CheckTrellisChoice: Gemma accepts it, the Qwen default refuses it");
+    Check(!Throws([&] { CheckTrellisTensors(r, ts, path); }), what + "every .trellis.* tensor has its linears entry and back");
+    Check(r.Has("lm_head.w4a16.wq") || r.Has("lm_head.bf16.w"), what + "lm_head is w4a16 / bf16, never trellis");
+    Check(r.Has("text.embed_tokens") && !r.Has("text.embed_tokens.rotated"),
+          what + "the tied embedding is stored once, bf16, in the original basis (entry rotation is a runtime op)");
+  }
+}
 }  // namespace
 
 int main() {
@@ -356,6 +405,7 @@ int main() {
 #endif
     TestRealContainer();
     TestRotationMetadata();
+    TestRotatedTrellis();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL: uncaught exception: %s\n", e.what());
     return 1;

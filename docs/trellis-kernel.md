@@ -59,7 +59,7 @@ whose own evidence had to be corrected.
 | gate/up with different suh | One `mlp.gate_up` linear with **2 parts**. The GEMM reads a different A per part, and each 128-column group lies inside one part. |
 | TP = 2 | **Supported.** Every rank slice is 128-aligned. The output transform runs per rank, before the all-reduce, which is valid because the transform is linear. |
 | lm_head, MTP head, DFlash drafter, vision | Stay w4a16 (the q2ab_hv2_q3 recipe) or bf16. `Container::Load` maps a requested trellis head layout to w4a16, so every caller gets the same answer. |
-| q2ab rotation | Mutually exclusive with trellis. The converter and the loader both refuse the combination. |
+| q2ab rotation | Mutually exclusive with trellis for QWEN: its converter and loader refuse the combination. GEMMA accepts it (docs/gemma4-plan.md 10.2, M1-31): the Gemma loader passes `allow_rotated` to `CheckTrellisChoice`, and the converter writes `--rotate q2ab/q2a --trellis-from` containers. |
 | **Speed outlook** | **Marginal, and the expected case fails A3.** With no WMMA/VALU overlap at a sagged clock the model gives a 0-4% plain-decode loss; trellis wins (up to +11%) only if most of its ALU time hides behind memory. M1 is a real kill gate and measures exactly that (4.6). |
 | Prefill | Expected 0.74-0.84× of q2ab. M8 (tiled prefill) is planned work, not a contingency. |
 

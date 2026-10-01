@@ -443,6 +443,25 @@ class ShardIndex:
             return sl[start:stop, :].clone()  # same dangling-mmap risk as get_tensor above
 
 
+def get_tensors_grouped(index: ShardIndex, names: list[str]) -> dict[str, torch.Tensor]:
+    """`ShardIndex.get_tensor` for many names, opening each shard file once (a single-file checkpoint
+    included). The same function as full_logits_golden.get_tensors_grouped, here so the Gemma tools do not
+    need full_logits_golden's Qwen reference just to read weights."""
+    from safetensors import safe_open
+
+    by_shard: dict[str, list[str]] = {}
+    for n in names:
+        if n not in index.weight_map:
+            raise KeyError(f"{n!r} is not in this checkpoint's weight map")
+        by_shard.setdefault(index.weight_map[n], []).append(n)
+    out: dict[str, torch.Tensor] = {}
+    for shard, shard_names in by_shard.items():
+        with safe_open(str(index.model_dir / shard), framework="pt", device="cpu") as f:
+            for n in shard_names:
+                out[n] = f.get_tensor(n).clone()  # clone inside the `with`: see ShardIndex.get_tensor
+    return out
+
+
 def load_module_state(
     module: torch.nn.Module, index: ShardIndex, hf_prefix: str
 ) -> tuple[bool, list[str], str | None]:

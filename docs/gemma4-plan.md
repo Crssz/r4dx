@@ -55,8 +55,9 @@ Every GPU step is a command handed to the user.
 - **Sliding:** head_dim 256, 8 KV heads (GQA 2), window 1024, RoPE default theta 1e4 full-rotary.
 - **Full:** head_dim 512, 1 KV head (GQA 16), `attention_k_eq_v` (no v_proj; V = raw k_proj output ->
   v_norm (RMSNorm, no weight); K = k_proj -> k_norm -> rope). RoPE "proportional", theta 1e6,
-  partial_rotary_factor 0.25: `inv_freq[i] = 1/base^(2i/head_dim)` for i < 64, remaining frequencies
-  zero (NoPE dims), rotate-half layout. q_norm/k_norm are RMSNorm with weight.
+  partial_rotary_factor 0.25: `inv_freq[i] = 1/base^(2i/head_dim)` for i < 64 with `head_dim` = 512 in the
+  exponent's denominator (the full width, not the 128 rotated dims), remaining frequencies zero (NoPE dims),
+  rotate-half layout (pairs `i, i+256`). q_norm/k_norm are RMSNorm with weight.
 - Attention scaling = 1.0 (no 1/sqrt(d)); no attention softcap.
 - RMSNorm is `x*rsqrt(mean(x^2)+eps)*weight` in fp32 (NOT 1+w), eps 1e-6.
 - Decoder layer: input_layernorm -> attn -> post_attention_layernorm -> +res; pre_feedforward_layernorm
@@ -69,14 +70,16 @@ Every GPU step is a command handed to the user.
   Embedder: LayerNorm(6912, eps 1e-5, bias) -> Linear(6912->3840, bias) -> LayerNorm(3840) ->
   + pos_embedding[x,0] + pos_embedding[y,1] (shape [1120,2,3840]) -> LayerNorm(3840) (pos_norm) ->
   RMSNorm no weight eps 1e-6 -> Linear(3840->3840, no bias). <= 280 soft tokens. Image tokens are
-  bidirectional within a contiguous image block (which layer types: **UNVERIFIED**, see 3.1).
+  bidirectional within a contiguous image block on the **sliding layers only**; full layers stay causal
+  (settled by M0-5: docs/gemma4-semantics.md section 2).
   Ids: image 258880, boi 255999, eoi 258882.
 - **Audio (12B):** 16 kHz raw waveform, right-pad to a multiple of 640, [n,640] -> RMSNorm(640, no
   weight) -> Linear(640->3840, no bias); causal; max 750 tokens. Ids: audio 258881, boa 256000, eoa 258883.
-- **Tensor names (inferred, moderate confidence; verify with M0-4):** `model.language_model.{embed_tokens,norm}`,
+- **Tensor names (confirmed by M0-4, `tools/reference/gemma/tensor_names.json`):** `model.language_model.{embed_tokens,norm}`,
   `model.language_model.layers.{i}.self_attn.{q,k,v,o}_proj` (no v_proj on full layers),
   `self_attn.{q_norm,k_norm}`, the four layernorms, `mlp.{gate,up,down}_proj`, `layer_scalar`;
-  `model.embed_vision.*` (maybe `model.vision_embedder.*`); `model.embed_audio.embedding_projection`.
+  `model.vision_embedder.*`, `model.embed_vision.embedding_projection`, `model.embed_audio.embedding_projection`
+  (prefixes confirmed by M0-4 / M0-5); there is no `lm_head` tensor (tied) and no `v_norm` tensor.
 - **Known r4dx constraints:** attention kernels compiled per geometry (`third_party/libr4d/r4d.h`: only
   `h256_gqa6_fp8kv`, block 16); trellis needs N,K % 128; w4a16/bf16 GEMM fallback K % 512 (3840 fails,
   see 4.5); `ModelConfig::FromJson` requires GDN fields; `ModelConfig::Shard` forbids tied embeddings;
@@ -93,8 +96,10 @@ Every GPU step is a command handed to the user.
   Text keys: `global_head_dim` 512, `head_dim` 256, `num_global_key_value_heads` 1,
   `num_key_value_heads` 8, `attention_k_eq_v` true, `final_logit_softcapping` 30, `sliding_window` 1024,
   `hidden_activation` gelu_pytorch_tanh, `tie_word_embeddings` true, `rope_parameters` per layer type.
-- **`max_position_embeddings` is 131072, not 262144.** "Native 262k" needs rope scaling or a config
-  override (open question 1). All sizing below is for 262144.
+- **`max_position_embeddings` is 131072, not 262144.** There is no rope scaling to add: 262144 is a
+  metadata-only difference, so running at 262144 is a runtime / KV-sizing opt-in, not a numerics change
+  (semantics doc items 9 and 5.6; resolved question 9.1: default 131072, 262144 opt-in). The sizing below
+  is for 262144.
 - EOS: `generation_config.json` gives `[1, 106, 50]` (50 = `<|tool_response>`, a tool-call stop);
   `config.json` says `[1, 106]` (open question 4). `suppress_tokens` = `[258883, 258882]`.
 
@@ -113,18 +118,27 @@ Verified in the repo:
   window parameter. `AttentionLayer` hard-codes `scale = 1/sqrt(D)`, the q|gate split and mrope.
 - `tests/kernels/*` call `hipSetDevice(0)`: every kernel test is GPU work and needs approval.
 
-UNVERIFIED (settle in M0-5; each is also gated by a rung-3 golden):
-- `v_norm` applied on every layer's V (design: implement on all layers behind a config flag).
+Settled by M0-5 (every item is VERIFIED against the HF source in docs/gemma4-semantics.md; each is still
+gated by a rung-3 golden):
+- `v_norm` is applied on every layer's V (sliding: `v_proj`; full: the raw `k_proj` output, before `k_norm`
+  and rope); no `v_norm` tensor exists.
 - `scaling = 1.0`.
-- Embed scale is `sqrt(3840)` cast to the weight dtype: in bf16 that is **62.0**, not 61.968 (flag).
+- Embed scale is `sqrt(3840)` cast to the weight dtype: in bf16 that is **62.0**, not 61.968.
 - Sliding mask is `dist < sliding_window` (a query sees 1024 keys including itself).
-- **Image-token bidirectional masking applies to both layer types** (model section) versus sliding only
-  (brief). Unresolved; M0-5 settles it with a CPU tiny-config test of the HF mask functions. The
-  attention hook (`klimit_ext`) is built into the sliding kernel in M1 so M2 needs no kernel rework.
-- Proportional rope pair layout (rotate pairs `i, i+256` for `i<64`, identity elsewhere).
+- **Image-token bidirectional masking: sliding layers only** (full layers stay causal; the generate path and
+  the HF docstring agree, a bare `forward()` with `mm_token_type_ids` differs on the 8 full layers: the
+  reference must use the mask dict of `generate`). The attention hook (`klimit_ext`) is built into the
+  sliding kernel in M1 so M2 needs no kernel rework.
+- Proportional rope pair layout (rotate pairs `i, i+256` for `i<64`, identity elsewhere; frequency
+  denominator 512).
 - `layer_types` (parse generically, assert the 5:1 pattern with full at 5, 11, ..., 47).
-- **`layer_scalar` placement:** HF applies it once per layer after the MLP residual add. The fused
-  post-norm kernel takes a scalar; the attention-half call MUST pass 1.0 and the golden pins this.
+- **`layer_scalar` placement:** HF applies it once per layer after the MLP residual add; the buffer is bf16
+  `[1]`. The fused post-norm kernel takes a scalar; the attention-half call MUST pass 1.0 and the golden
+  pins this.
+- **BOS:** HF adds no BOS to raw text (`tok("hi").input_ids == [2202]`); `<bos>` appears only as text in
+  the chat template. KL tokens add BOS=2 explicitly on both sides.
+- **Final softcap** is applied by HF to the lm_head output in its own dtype (bf16 for the bf16 model).
+- `max_position_embeddings` (131072 Huihui, 262144 google) is metadata only: no rope scaling exists.
 
 ### 3.2 Architecture dispatch and TextModel fit
 
@@ -310,11 +324,13 @@ libr4d `R4D_VERSION` bump (ISA-diff is the Qwen guard).
 
 ### 4.1 Decisions that need attention
 
-1. **Trellis and rotation do not combine today.** `--trellis-from` throws unless `--rotate none`
-   (`src/convert/main.cpp:592-594`); `docs/quant2.md` 7.1 says trellis incoherence processing replaces
-   q2ab; the default Qwen trellis container is unrotated. Generalizing rotation to 3840 is cheap CPU
-   work (`rotation.hpp` is already parametric in `(block, nblk)`) and is done now with tests; the Gemma
-   rotation **runtime** is deferred until trellis misses the KL gate or a w4a16 container is wanted.
+1. **Trellis and rotation.** For Qwen `--trellis-from` still throws unless `--rotate none`
+   (`docs/quant2.md` 7.1 says trellis incoherence processing replaces q2ab; the default Qwen trellis
+   container is unrotated). For Gemma they combine (section 10): the oracle quantizes the folded weights
+   against the rotated Hessians and the converter checks the oracle's rotation fingerprint and verifies
+   against fold(W). Generalizing rotation to 3840 was cheap CPU work (`rotation.hpp` is parametric in
+   `(block, nblk)`) and is done with tests; the Gemma rotation **runtime** is part of M1, not conditional
+   (section 9.7, M1-31).
 2. **Post-norms block the Qwen fold.** Out-projections cannot take `W' = Q^T W` (see 4.4).
 3. **K=3840 is not a kernel problem** (see 3.7): relax `FallbackTuning` to K % 256.
 4. **The converter cannot read the checkpoint yet:** C++ `ShardedModel` requires
@@ -340,8 +356,8 @@ Same safetensors-compatible shell as `docs/container-format.md`; new `__metadata
 | `...attn.k_descale` / `v_descale` | `--kv-calib` | fp32 [kv_heads]: 8 sliding, 1 full; `add_descale` takes per-layer `n_kv` (today global, `main.cpp:1947`) |
 | `...post_attention_layernorm`, `pre_feedforward_layernorm`, `post_feedforward_layernorm` | same | bf16 [3840] (sandwich; two are new) |
 | `...mlp.gate_up.{layout}`, `mlp.down.{layout}` | gate+up (gate rows first), down | [30720,3840], [3840,15360] |
-| `...layer_scalar` | `layer_scalar` buffer | fp32 [1,4] via `add_fp32_widen` (shape/rank **UNVERIFIED**) |
-| `vision.<rest>` / `audio.<rest>` | `model.embed_vision.*` / `model.embed_audio.*` | bf16 passthrough (prefix **UNVERIFIED**) |
+| `...layer_scalar` | `layer_scalar` buffer | the checkpoint buffer is bf16 `[1]` (VERIFIED, semantics doc item 11); stored widened to fp32 `[1,4]` via `add_fp32_widen` |
+| `vision.<rest>` / `audio.<rest>` | `model.vision_embedder.*` + `model.embed_vision.*` / `model.embed_audio.*` | bf16 passthrough; on-disk prefixes VERIFIED (semantics doc 3), `model.` stripped |
 
 Norms are stored raw (runtime uses `r4dx_rmsnorm_plain_bf16`). No `mtp.*`: the converter forces
 `do_mtp=false` for Gemma and rejects `--mtp on`. New `--audio on|off` (default off; vision also off
@@ -388,8 +404,9 @@ only `W Hb` on the K side (`LinearFold::kHadOnly`); their outputs stay in the or
 fuses `post_norm(plain w) -> rotate Q -> residual add (-> layer_scalar)` (kernel `post_rmsnorm_rotate_add`,
 block 256 / nblk 15): one transform per sublayer. Option B (online `Q^T -> w -> Q`, two transforms) is
 rejected. Embedding: gather, scale (text rows only), splice vision/audio, then `x Q`; un-rotate before
-final_norm and before DFlash captures. Option A is numerically UNVERIFIED until the numpy selftest
-(M1-5) passes. Rotation only reaches the w4a16 path; the runtime kernel is M1-31 (conditional).
+final_norm and before DFlash captures. Option A is numerically verified by the numpy selftest (M1-5,
+`tools/reference/gemma/rotation_selftest.py`). Rotation reaches the w4a16 path and, via section 10, the
+trellis path; the runtime (fused kernel, entry/exit ops) is M1-31, in M1 (section 9.7).
 
 ### 4.5 Quantization tool ports (Python)
 
@@ -404,8 +421,9 @@ final_norm and before DFlash captures. Option A is numerically UNVERIFIED until 
 - `trellis_quant.py`: `LINEARS` keys `attn.q/k/v/o`; qgroups sliding `{q,k,v}`, full `{q,k}`;
   single-file `model_linears`; lm_head/embeddings stay bf16 in the oracle; quantizer core unchanged
   (all K, N multiples of 128).
-- `tools/quant2/gemma_trellis_convert.ps1`: `--rotate none`, lm_head w4a16 g32 with LDLQ against the Gemma
-  `lm_head.hess`, no mtp, bf16 norms/embeddings, `--kv-calib` plus `--trellis-from`.
+- `tools/quant2/gemma_trellis_convert.ps1`: `--rotate none` (or the rotated variant, section 10.2), lm_head w4a16
+  g32 with LDLQ against the Gemma `lm_head.hess`, no mtp, bf16 norms/embeddings, `--kv-calib` plus
+  `--trellis-from` (command shape in 10.1).
 - Trellis tests: add K = 3840, 15360 and N in {512, 2048, 3840, 4096, 8192, 30720} to `test_trellis_input`.
   Tuning: add Gemma and `tp2.*` shapes to `tools/profile/tune_gemm.py` and run `tool_trellis_gemm_bench`.
 - The lm_head Hessian for a tied head is captured at the post-final-norm hidden, before the softcap.
@@ -461,8 +479,9 @@ Body linears ~ 10.9 B params (40 sliding layers at 224M, 8 full at 242M); trelli
 
 A second backend inside `Tokenizer::Impl`, selected at load; the Qwen byte-level path stays untouched.
 - `tokenizer.h`: `enum class Kind { kByteLevelRegex, kSpmByteFallback }`,
-  `TokenizerOptions::keep_special_on_decode`, `bos_on_raw_prompt()` (UNVERIFIED: confirm with HF
-  `tok("hi").input_ids[0] == 2`).
+  `TokenizerOptions::keep_special_on_decode`, `bos_on_raw_prompt()` (VERIFIED **false** for HF parity: `tok("hi")`
+  gives `[2202]`, no BOS; `<bos>` only appears when the text contains it, e.g. the rendered chat template. If
+  r4dx prepends BOS to raw `/v1/completions` prompts that is a deliberate deviation).
 - `bpe_tokenizer.cpp`: split `validate_pretokenizer` into `detect_kind`; for `byte_fallback` require the
   exact shape above or throw. Add `byte_tok[256]` (`<0x00>`=238...`<0xFF>`=493), `unk`, `decoded_piece[id]`,
   `keep_special[id]`, and an id-keyed `pair_table` (open-addressing hash `(left<<32)|right -> (rank,
@@ -489,7 +508,7 @@ A second backend inside `Tokenizer::Impl`, selected at load; the Qwen byte-level
 | tool open/close | `<tool_call>` / `</tool_call>` | `<|tool_call>` / `<tool_call|>` |
 | keep-special on decode | none | `<|channel>`, `<channel|>`, `<|tool_call>`, `<tool_call|>`, `<|"|>` |
 | chat-template polyfills | true | false |
-| bos on raw prompt | false | true |
+| bos on raw prompt | false | false (HF parity; `<bos>` is text in the chat template; prepending is a deviation) |
 | thinking template vars | `enable_thinking`, `reasoning_effort` | `enable_thinking` only (`preserve_thinking` pass-through) |
 
   Selection by `--dialect {auto|qwen35|gemma4}`; `auto` checks `tokenizer_config.json`
@@ -511,7 +530,7 @@ A second backend inside `Tokenizer::Impl`, selected at load; the Qwen byte-level
 - **Engine:** all edits behind the dialect so Qwen stays byte-identical. Template vars (no
   `reasoning_effort` for Gemma); a `tool` message with no preceding assistant `tool_calls` message is
   silently dropped by the template, so return 400 in the Gemma dialect; raw `/v1/completions` prepends
-  `bos_id()` when `bos_on_raw_prompt`; `ckpt_back` computed by encoding the dialect suffix (Gemma
+  `bos_id()` only when `bos_on_raw_prompt` (false for Gemma: HF adds none); `ckpt_back` computed by encoding the dialect suffix (Gemma
   thinking off: `<|channel>thought\n<channel|>`, expected 4 tokens; thinking on: 0); replace the literal
   `"</think>"`/`8` bookkeeping with a CPU-testable `ReasoningLocator`; EOS uses `tok_->eos_ids()`
   (a stop on 50 with a parsed call gives `finish_reason="tool_calls"`). Question for the model section:
@@ -584,7 +603,9 @@ rather than forked; the Qwen scripts stay frozen.
   weights with seeded noise (a missing `w` would otherwise be undetected); record fp32 `inv_freq` and
   `layer_scalar`. Per-layer fp32-vs-bf16 error floor in the tolerance table.
 - **`full_logits_gemma.py` (rung 4 / KL reference):** mode A loads the whole bf16 model on one GPU
-  (23.9 GB), logits in lm_head chunks of 32768 rows, softcap in fp32 before log_softmax; mode B ports the
+  (23.9 GB), logits in lm_head chunks of 32768 rows, softcap in fp32 before log_softmax (more accurate than
+  HF, which softcaps the lm_head output in bf16: `--logits-mode hf-bf16` records the HF-faithful variant so
+  the noise floor is known); mode B ports the
   streaming reference if VRAM is tight. Output format unchanged (`<segment>.logprobs.f16`, `meta.json`,
   -1e4 clamp). Record the bf16 self-KL noise floor by running twice.
 - **KL tokens:** new `tokens_gemma.json` via `make_tokens_json.py` (never reuse the Qwen ids); **teacher-force
@@ -656,11 +677,11 @@ rather than forked; the Qwen scripts stay frozen.
 
 ## 7. Cross-section conflicts and resolutions
 
-1. **Rotation with sandwich norms:** option A (Hadamard-only o/down, fused post-norm-rotate-add); runtime
-   deferred; generalization of converter/tests now.
+1. **Rotation with sandwich norms:** option A (Hadamard-only o/down, fused post-norm-rotate-add); the
+   runtime is in M1 (section 9.7), converter and tests generalized (M1-4).
 2. **K % 512:** relax `FallbackTuning` to K % 256 only; no K-padding mechanism for the drafter.
-3. **Image bidirectional mask:** unresolved between sections; M0-5 settles it from HF source before M2;
-   `klimit_ext` built into the sliding kernel in M1.
+3. **Image bidirectional mask:** settled by M0-5 (docs/gemma4-semantics.md section 2): sliding layers only,
+   full layers stay causal; `klimit_ext` is built into the sliding kernel in M1.
 4. **Embedding residency:** device-resident with scaled gather.
 5. **Python reference stack:** one package `tools/reference/gemma/` with one `GemmaStreamingReference`.
 6. **Venv:** `D:\venvs\r4dx-gemma-ref`, from Python312.
@@ -686,7 +707,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 
 | Task | Status | Note |
 |---|---|---|
-| M0-1..M0-5 | done | branch, venv, tokenizer dir, header dump, semantics doc (doc section 5 corrections still open) |
+| M0-1..M0-5 | done | branch, venv, tokenizer dir, header dump, semantics doc (the semantics doc's section 5 corrections are applied to this plan) |
 | M0-6 | done | tiny CPU smoke bit-exact vs HF; `R4DX_REF_ALLOWED_DEVICES` in |
 | M0-7 | done | `tokens_gemma.json`, `tokens_gemma_long.json` |
 | M0-8 | pending-GPU | scripts authored, validated on tiny CPU path only |
@@ -708,7 +729,9 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-23 | pending | |
 | M1-24 | done | `ModelConfig::arch`; `GemmaLocalTextModel` does not exist yet |
 | M1-25..M1-30 | pending | blocked on M0-9, M1-20 |
-| M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested, `tp_shard` row-split for `rotation.had_o_full_signs` and GPU tests open |
+| M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
+| M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
+| M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader accepting rotated trellis containers and the GPU tests are open |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
 | M1-33..M1-36 | pending | |
 
@@ -763,10 +786,10 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M1-25 Port Hessian, imatrix and trellis scripts to the arch table.** Files: `hessian_capture.py`, `trellis_quant.py`, `imatrix_capture.py` (if w4a16 is wanted), the `tokens` gen format, and Gemma taps (`mlp_in` is `pre_feedforward_layernorm`; no `v_proj` on full layers). Deps: M0-6, M0-9. Done: `--dry-run` passes on the corpus.
 - **M1-26 Hessian capture [GPU].** Command: `$env:HIP_VISIBLE_DEVICES='1'; python tools\reference\hessian_capture.py --arch gemma4_unified --model-dir <huihui> --out-dir D:\models\r4dx\huihui-gemma\hessian-v1 --rms-taps --gen-file <samples.jsonl>`. Check free disk space on D: first; the estimate is 60-90 GiB. Deps: M1-25, M0-9. Done: rows/K gate satisfied.
 - **M1-27 Trellis oracle [GPU].** Command: `python tools\reference\trellis_quant.py quantize-model --arch gemma4_unified --device cuda --K 4 --hessian-basis matched --hessian-dir <hessian-v1> --out-dir <trellis-q\K4m>`. Deps: M1-26. Done: a quantized weight directory.
-- **M1-28 `gemma_trellis_convert.ps1` and trellis container.** Settings: `--rotate none`, lm_head w4a16 g32, `--kv-calib`, `--trellis-from`. Deps: M1-23, M1-27, M1-7. Done: `huihui-gemma-trellis.r4dx` is written.
+- **M1-28 `gemma_trellis_convert.ps1` and trellis container.** Settings: `--rotate none` (the first container) or the rotated variant of section 10 (`--rotate q2ab` + the oracle's `--rotation`), lm_head w4a16 g32 (`--no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --ldlq "^lm_head$" --hessian-dir <hessian-v1>`), `--kv-calib`, `--trellis-from`. The converter side is done and tested (`convert_gemma_trellis`). Deps: M1-23, M1-27, M1-7. Done: `huihui-gemma-trellis.r4dx` is written.
 - **M1-29 Trellis tests and tuning.** Part a: add K=3840, K=15360 and the N set to the `test_trellis_input` lists; command (GPU): `ctest -R trellis`. Part b: add Gemma shapes to `tune_gemm.py` and run `tool_trellis_gemm_bench.exe` for them; command: `$env:HIP_VISIBLE_DEVICES='1'; python tools\profile\tune_gemm.py --shapes gemma.*`. Check `PlanTrellisM256` for each shape, because a failed plan silently falls back to 64-row slicing. Deps: M1-20, M1-28. Done: tests pass and tuning rows are added.
-- **M1-30 M1 KL gate and greedy smoke [GPU].** Command: `tool_teacher_forced_logprobs.exe --model ...trellis.r4dx --tokens tokens_gemma.json` plus the long segment, then `kl_report.py`. Gate: mean KL <= 0.01 and top-1 >= 95% against the bf16 HF reference, and the greedy smoke common prefix >= 16 tokens, or the divergence is at a near-tie. Deps: M0-8, M0-10, M1-29. Done: the gate passes. If it misses, fall back to M1-31 (rotation runtime) or bf16 KV for the full layers.
-- **M1-31 (conditional) Rotation runtime.** Files: `rotation_meta.h`, the rotate kernel generalization, the fused `post_rmsnorm_rotate_add` kernel. Deps: M1-5, M1-30 missing the gate. Done: only if the trellis gate misses or a w4a16 container is wanted.
+- **M1-30 M1 KL gate and greedy smoke [GPU].** Command: `tool_teacher_forced_logprobs.exe --model ...trellis.r4dx --tokens tokens_gemma.json` plus the long segment, then `kl_report.py`. Gate: mean KL <= 0.01 and top-1 >= 95% against the bf16 HF reference, and the greedy smoke common prefix >= 16 tokens, or the divergence is at a near-tie. Deps: M0-8, M0-10, M1-29. Done: the gate passes. If it misses, run the rotated trellis variant (section 10; its runtime is M1-31, already in M1) or use bf16 KV for the full layers (9.5).
+- **M1-31 Rotation runtime (in M1, not conditional; section 9.7).** Files: `rotation_meta.h`, the rotate kernel generalization, the fused `post_rmsnorm_rotate_add` kernel, the entry (`x Q` after the embedding gather and the vision/audio splice) and exit (`x Q^T` before `final_norm` and before DFlash captures) ops, the `tp::RuleFor` row split of `rotation.had_o_full_signs` (done: `ModelConfig::global_head_dim`). Deps: M1-5. Done: the runtime applies the converter's rotation to w4a16 containers and, by section 10, to rotated trellis containers; the rotated-vs-unrotated bf16 gate and the rotated trellis KL gate are measured in M1.
 
 **Long-context perf kernels**
 - **M1-32 Sliding `h256_gqa2` windowed kernels (libr4d).** Files: `third_party/libr4d/r4d_attn_paged_h256_gqa2.hip`, `r4d_attn_window.h`, the registry, `R4D_VERSION`, `r4d.hpp`, a Qwen ISA-diff check, and tests. `klimit_ext` is built in. Deps: M1-17, M1-18, open question 2. Done: the ISA diff is clean for Qwen; GPU step `ctest -R attn_.*gqa2` covers window 1024, ring aliasing beyond 1536 and verify windows.
@@ -822,3 +845,72 @@ Decided with the user on 2026-10-01. These override anything earlier in this doc
 6. **Torch.** The new venv may use a newer ROCm torch wheel. Python312 stays untouched.
 7. **Rotation.** Generalize it fully in M1, the runtime fused post-norm-rotate-add kernel included. Rotated trellis Gemma is run and measured against the KL gate in M1.
 8. **Drafter training data.** Prompts are 20–100K subsampled from Nemotron Post-Training v2 and CodeAlpaca. Responses are generated by Huihui-Gemma through r4dx once M1 passes. Trellis calibration data still comes from HF on the existing 385-prompt corpus (M0-9).
+
+## 10. Rotated trellis, and the quantization tool ports (branch g4-convert-trellis)
+
+Decisions taken while implementing M1-25 / the M1-28 prerequisites. They refine 4.4 / 4.5 and section 9.7.
+
+### 10.1 Converter: `--trellis-from` on Gemma
+
+- The oracle manifest is keyed by HF tensor names, which is all `trellis_import.hpp` reads; every Gemma body
+  base starts with `text.layers.`, so the import is Qwen's code unchanged. The oracle must not list a `v_proj`
+  for a full layer (k_eq_v; a stray entry is reported as unused, never imported) and must cover every other
+  linear (a missing one is refused before an output exists).
+- The tied `lm_head` is not a body linear: it stays on the w4a16 path. Command shape (the linear is LDLQ'd
+  against `lm_head.hess`, captured at the post-final-norm hidden before the softcap):
+  `r4dx-convert --input <huihui> --output <out> --trellis-from <oracle-dir> --kv-calib <kvcalib.json> --no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --hessian-dir <hessian-v1> --ldlq "^lm_head$"`
+  (`--no-bf16` is needed because a group rule refuses a linear that also keeps a bf16 companion).
+- `--kv-calib` already worked for Gemma (per-layer head counts, 8 sliding / 1 full); `convert_gemma_trellis`
+  covers it with a trellis container.
+
+### 10.2 Rotated trellis: how the oracle's basis and the converter's agree
+
+Decision: **the oracle quantizes the folded weights against the rotated Hessians; the converter is the single
+source of truth of Q.**
+
+1. `r4dx-convert --input <huihui> --rotate q2ab [--rotation-seed S] --rotation-out rot.safetensors` writes
+   only the fp32 rotation tensors (`rotation.signs`, `rotation.mix`, `rotation.had_down_signs`,
+   `rotation.had_o_signs`, `rotation.had_o_full_signs`) plus a fingerprint `{kind, seed, tensors_sha256,
+   hidden, block}` (sha256 of `"r4dx-rotation-v1\n"` + per tensor name, u64 count and fp32 bytes) and exits.
+   The oracle never re-derives Q from the seed.
+2. `trellis_quant.py quantize-model --arch gemma4_unified --rotation rot.safetensors ...`
+   (`tools/reference/rotation_oracle.py`) folds each shared-Hessian group before quantizing it:
+   - in-projections (q, k, v, gate, up): `W' = (W diag(w_norm)) Q` with the PLAIN norm weight (offset 0) of
+     `input_layernorm` / `pre_feedforward_layernorm`; Hessian `H' = Q^T H_rms Q` from the weightless rms tap
+     (`hessian_capture.py --rms-taps`, `hessian.json` `rms_keys`), else `Q^T D^-1 H D^-1 Q` from the post-norm
+     tap (refused where `|w| < 1e-3`);
+   - out-projections under q2ab (Gemma option A): `W' = W Hb` with `H' = Hb^T H Hb`; under q2a they are not folded;
+   - `lm_head`, embeddings and norms are never folded.
+   The manifest (and every per-layer record, so resumption is keyed on it) carries `rotation` = the file's
+   fingerprint and `arch`.
+3. `r4dx-convert --rotate q2ab --trellis-from <oracle>` refuses a manifest whose fingerprint is not this run's
+   (kind, seed, tensors_sha256), refuses a rotated manifest without `--rotate` and an unrotated one with it, and
+   its reconstruction check compares against `fold(W)` (per 128-row block, the converter's own fold), not W.
+   Qwen keeps the `--trellis-from needs --rotate none` refusal. The result is recorded in
+   `r4dx_convert_run.trellis.rotation`.
+4. The folded norms are stored as ones under `.rotated`, the container carries `rotation.*` tensors and
+   `__metadata__.rotation` (`out_fold: had_only`), exactly as a w4a16 rotated container does.
+5. **Runtime:** the Qwen loader refuses trellis with rotation; the Gemma loader (M1-19) must accept the pair
+   (the trellis kernel's own RHT runs on the already-rotated activation, which is exact) and the M1-31 entry /
+   exit ops apply. Not done here (no GPU, no loader yet).
+
+Tests: `convert_gemma_trellis` (all C++, CPU: plain, q2ab, q2a, every refusal), `reference_arch_gemma` (the
+Python oracle against the converter end to end on a tiny checkpoint: its fold equals the converter's folded
+bf16 bytes, its manifest is imported and verified by `r4dx-convert`), `test_tp_shard` (row split of
+`rotation.had_o_full_signs`).
+
+### 10.3 Tool ports (M1-25)
+
+- `tools/reference/arch_table.py`: one `ArchSpec` per `model_type` (`qwen3_5`, `gemma4_unified`); the module-level
+  tables of `hessian_capture.py` and `trellis_quant.py` are aliases of the Qwen entry (a Qwen run is unchanged:
+  `reference_hessian_rms` and `reference_trellis_quant` pass). Gemma taps: `in` (q/k/v input; no v on the 8 full
+  layers), `out`, `mlp_in` = `pre_feedforward_layernorm`'s output, `mlp_mid`, `lm_head` = post-final-norm hidden.
+- `hessian_capture.py --arch gemma4_unified`: corpus = `gen_samples.py`'s token-id JSONL via `--gen-file` (one
+  sequence per non-rejected sample, first `--seq-len` ids; no tokenizer), `GemmaCaptureRef` (per-layer-type rope,
+  mask and shared-kv dict), rms scale `w + 0`, the manifest records `arch`. `--dry-run`, `--rms-taps`,
+  `--rms-only`, `--regate` follow the set's arch.
+- `imatrix_capture.py --arch gemma4_unified --dry-run` only (a Gemma w4a16 imatrix is not implemented).
+- `trellis_quant.py --arch gemma4_unified`: single-file `model_linears`, keys `attn.q|k|v|o`, `mlp.gate_up`,
+  `mlp.down`; `quantize-model --dry-run` (CPU, no encoder) lists the tap groups, Hessian headers and rotation folds.
+- Caveat: `trellis_quant.py`'s source hash is part of its resume key, so Qwen oracle directories written before
+  this change are reported stale by a new `quantize-model` run (their manifests still import fine).

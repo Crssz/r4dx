@@ -39,11 +39,17 @@ def bf16_exact(f):
     return struct.unpack("<f", struct.pack("<I", f32_to_bf16(f) << 16))[0]
 
 
-def tensor_specs(layers):
+def is_full(i, full_every=6):
+    """Layer i is full attention when i % full_every == full_every - 1 (default 6: the real 5:1 pattern;
+    --full-every 2 gives sliding, full, sliding, full, ... for tests that need both kinds in 2 layers)."""
+    return i % full_every == full_every - 1
+
+
+def tensor_specs(layers, full_every=6):
     """[(name, shape, kind)] with kind in {"w", "norm", "scalar"}."""
     specs = []
     for i in range(layers):
-        full = i % 6 == 5
+        full = is_full(i, full_every)
         L = f"model.language_model.layers.{i}."
         hd, kv = (HD_F, KV_F) if full else (HD_S, KV_S)
         for n in ("input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
@@ -70,7 +76,7 @@ def tensor_specs(layers):
     return specs
 
 
-def config(layers):
+def config(layers, full_every=6):
     return {
         "architectures": ["Gemma4UnifiedForConditionalGeneration"],
         "model_type": "gemma4_unified",
@@ -79,7 +85,7 @@ def config(layers):
             "model_type": "gemma4_unified_text",
             "hidden_size": HIDDEN,
             "num_hidden_layers": layers,
-            "layer_types": ["full_attention" if i % 6 == 5 else "sliding_attention" for i in range(layers)],
+            "layer_types": ["full_attention" if is_full(i, full_every) else "sliding_attention" for i in range(layers)],
             "num_attention_heads": HEADS,
             "num_key_value_heads": KV_S,
             "num_global_key_value_heads": KV_F,
@@ -98,9 +104,10 @@ def main():
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--full-every", type=int, default=6, help="layer i is full attention when i %% N == N - 1")
     ap.add_argument("--list", action="store_true", help="print the tensor names and shapes and exit")
     a = ap.parse_args()
-    specs = tensor_specs(a.layers)
+    specs = tensor_specs(a.layers, a.full_every)
     if a.list:
         for name, shape, _ in specs:
             print(name, shape)
@@ -126,7 +133,7 @@ def main():
     h = json.dumps(header).encode("utf-8")
     a.out_dir.mkdir(parents=True, exist_ok=True)
     (a.out_dir / "model.safetensors").write_bytes(struct.pack("<Q", len(h)) + h + bytes(data))
-    (a.out_dir / "config.json").write_text(json.dumps(config(a.layers), indent=2))
+    (a.out_dir / "config.json").write_text(json.dumps(config(a.layers, a.full_every), indent=2))
     print(f"wrote {a.out_dir} ({len(specs)} tensors, {len(data)} data bytes)")
 
 

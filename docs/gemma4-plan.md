@@ -1,4 +1,4 @@
-# Gemma 4 12B support for r4dx -- design and task plan
+﻿# Gemma 4 12B support for r4dx -- design and task plan
 
 Branch `gemma4` (from `main` at `9063730`). Written 2026-10-01. This is a **design only**: no source
 file was edited, no GPU workload was run and no package was installed while writing it. Where it says
@@ -755,6 +755,8 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
 | M1-23/26/27/28 pipeline | CPU-verified, GPU pending | section 11: 	ools\gemma\trellis_pipeline.ps1 (kvcalib, merge, hessian, oracle-k4/k5, mix, convert, gate), gemma\kv_calibrate_full.py, gen_samples.py --merge hardened, Gemma proxy-gain mix ranking; waits for shard 0 |
+| M1-29 | partial | CPU plan legality test (test_trellis_gemma_plan) passes, 243 checks; M256 plans ok for all 16 Gemma shapes at KB4/5 via the SK2/SKG1 fallback; Gemma cases added to test_trellis_{decode,input,gemm,m256} (built, NOT run); tune_gemm.py has a gemma group; trellis bench rows still to produce on GPU |
+| M1-load | done (CPU) | crash-robust loading merged (g4-load-crash): ShardIndex reads single-file checkpoints without mmap; commit-headroom guard for from_pretrained; test_load_robust.py CPU-tested. Recommend ~30 GB free commit before GPU jobs |
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader now accepts rotated trellis containers (`CheckTrellisChoice(..., allow_rotated=true)`; `test_gemma_container` part (d) Inspects the real rot-q2ab / rot-q2a containers of `convert_gemma_trellis`); default KV is bf16; the GPU test `gemma_rot_trellis` (`tests/model/test_gemma_rot_trellis.cpp`) is written, NOT run |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
 | M1-33..M1-36 | pending | |

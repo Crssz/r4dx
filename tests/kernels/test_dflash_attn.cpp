@@ -144,7 +144,7 @@ int main() {
     std::printf("[1] cpu fp64 reference, n_injected x T sweep (window=%d, slots=%d)\n", kWindow,
                 kSlots);
     for (int n : {0, 3, 40, 2047, 2048, 2049, 2100, 5000}) {
-      for (int T : {1, 4, 8}) {
+      for (int T : {1, 4, 8, 16}) {  // 16: the Gemma 4 / DFlash v1 block (docs/gemma4-plan.md D-4)
         const std::vector<uint16_t> q =
             RandomBf16(static_cast<size_t>(T) * kHeadsQ * kHeadDim, &rng, -1.5f, 1.5f);
         const std::vector<uint16_t> kb =
@@ -252,7 +252,7 @@ int main() {
 
   // ---- 2. Preconditions must throw, not silently read out of the kernel's fixed LDS geometry ----
   {
-    DeviceBuffer<uint16_t> dummy(static_cast<size_t>(8) * kHeadsQ * kHeadDim);
+    DeviceBuffer<uint16_t> dummy(static_cast<size_t>(17) * kHeadsQ * kHeadDim);
     DeviceBuffer<uint16_t> store(static_cast<size_t>(kSlots) * kHeadsKv * kHeadDim);
     const int64_t p = reinterpret_cast<int64_t>(dummy.data());
     const int64_t sp = reinterpret_cast<int64_t>(store.data());
@@ -261,7 +261,7 @@ int main() {
       int T, hq, hkv, hd, n_injected, store_begin, window, slots;
     };
     const Case cases[] = {
-        {"T=9 (> block size 8)", 9, 32, 8, 128, 0, 0, 2048, 2048},
+        {"T=17 (> block size 16)", 17, 32, 8, 128, 0, 0, 2048, 2048},
         {"head_dim=160 (> 128)", 8, 32, 8, 160, 0, 0, 2048, 2048},
         {"head_dim=100 (not a multiple of 32)", 8, 32, 8, 100, 0, 0, 2048, 2048},
         {"heads_q/heads_kv = 8 (> 4)", 8, 64, 8, 128, 0, 0, 2048, 2048},

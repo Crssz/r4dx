@@ -308,6 +308,13 @@ target_compile_definitions(test_dflash_draft_weights PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../convert/fixtures")
 add_test(NAME test_dflash_draft_weights COMMAND test_dflash_draft_weights)
 
+# test_dflash_hf_weights (docs/gemma4-plan.md D-3 / D-5): the loader reads a `r4dx-convert --dflash-hf` container --
+# block 16, 6 target layers, softcap / embed_scale / variant, per-layer pattern -- and defaults when they are absent. CPU-only.
+add_executable(test_dflash_hf_weights test_dflash_hf_weights.cpp)
+target_include_directories(test_dflash_hf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_link_libraries(test_dflash_hf_weights PRIVATE r4dx_convert r4dx_core)
+add_test(NAME test_dflash_hf_weights COMMAND test_dflash_hf_weights)
+
 # test_keep_bf16 (Milestone 11, docs/validation.md "Milestone 11 / sensitivity"): converts a real
 # 4-layer container with `r4dx-convert --keep-bf16 <regex>` and checks that exactly the matched
 # linears load as bf16 while the rest load as w4a16, and that the mixed-layout model generates. Not

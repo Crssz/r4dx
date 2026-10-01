@@ -1,4 +1,4 @@
-﻿// tests/kernels/test_dflash_conv.cpp -- r4dx_dflash_conv_bf16 (docs/dflash2.md "Kernels"), the
+// tests/kernels/test_dflash_conv.cpp -- r4dx_dflash_conv_bf16 (docs/dflash2.md "Kernels"), the
 // thin r4dx-side wrapper that turns the DFlash2 container's own tensor layouts into
 // r4d_dflash_conv_t2_g16_bf16's (x, delta, base, dpitch, NG) contract.
 //
@@ -121,6 +121,48 @@ int main() {
         // bf16 value. bf16's relative step is 2^-9 = 1.95e-3, so 3e-3 sits just above that floor
         // (measured: 1.66e-3) -- and 100x below where a wrong tap, side, group or pitch lands.
         ok = RunSide(label, x, dyn, base, ref, T, H, side, 8, 3e-3) && ok;
+      }
+    }
+  }
+
+  // ---- 1b. Gemma 4 / DFlash v1 geometry (docs/gemma4-plan.md D-4): H=3840 (NG=240, dyn_n=960), block 16.
+  //          T=16 is a whole block, T=11 a partial one; the identity conv (base[s][0]=1, base[s][1]=0,
+  //          dyn=0) must reproduce x exactly on every row, block-start row included. ----
+  {
+    std::mt19937 rng(37);
+    const int H = 3840;
+    const int NG = H / kGroup;
+    std::printf("[1b] cpu reference, H=%d block=16\n", H);
+    for (int T : {16, 11}) {
+      const std::vector<uint16_t> x = RandomBf16(static_cast<size_t>(T) * H, &rng, -2.0f, 2.0f);
+      const std::vector<uint16_t> dyn =
+          RandomBf16(static_cast<size_t>(T) * 2 * kTaps * NG, &rng, -0.5f, 0.5f);
+      const std::vector<uint16_t> base = RandomBf16(2 * kTaps * H, &rng, -1.0f, 1.0f);
+      for (int side = 0; side < 2; ++side) {
+        const std::vector<float> ref = ConvRef(x, dyn, base, T, H, side);
+        char label[64];
+        std::snprintf(label, sizeof(label), "T=%d block=16 H=3840", T);
+        ok = RunSide(label, x, dyn, base, ref, T, H, side, 16, 3e-3) && ok;
+      }
+      // identity conv: exactly x (no tolerance)
+      std::vector<uint16_t> ibase(2 * kTaps * H, 0);
+      for (int side = 0; side < 2; ++side)
+        for (int c = 0; c < H; ++c) ibase[(static_cast<size_t>(side) * kTaps + 0) * H + c] = FloatToBf16(1.0f);
+      const std::vector<uint16_t> zdyn(static_cast<size_t>(T) * 2 * kTaps * NG, 0);
+      for (int side = 0; side < 2; ++side) {
+        DeviceBuffer<uint16_t> x_d(x.size()), dyn_d(zdyn.size()), base_d(ibase.size()), out_d(x.size());
+        x_d.CopyFromHost(x);
+        dyn_d.CopyFromHost(zdyn);
+        base_d.CopyFromHost(ibase);
+        r4dx_dflash_conv_bf16(reinterpret_cast<int64_t>(x_d.data()), reinterpret_cast<int64_t>(dyn_d.data()),
+                              reinterpret_cast<int64_t>(base_d.data()), reinterpret_cast<int64_t>(out_d.data()), T, H,
+                              side, 16, 0);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        const std::vector<uint16_t> got = out_d.CopyToHost();
+        bool same = got.size() == x.size();
+        for (size_t i = 0; same && i < x.size(); ++i) same = got[i] == x[i];
+        std::printf("  identity conv T=%d side=%d: bit-exact x  %s\n", T, side, same ? "PASS" : "FAIL");
+        ok = ok && same;
       }
     }
   }

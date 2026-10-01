@@ -1336,3 +1336,97 @@ acceptance (tok/round) or the per-round cost, not from `k` or `p_min`.
 - `tools/reference/dflash2_selftest.py` -- the determinism gate described in section 10.
 - `tools/reference/golden_out/dflash2/{fixture_a,fixture_b,fixture_c}/` -- the golden fixtures
   (section 9).
+## 13. Gemma 4 / z-lab DFlash v1 drafter (branch g4-dflash; docs/gemma4-plan.md D-1 .. D-6)
+
+Status: converter, loader keys, kernel limits, the CPU references and the Gemma verify/decode path are written and
+CPU-tested; **no GPU run has happened** (see "GPU gates" below for the exact commands).
+
+### 13.1 Conventions (D-1), read from z-lab/dflash `dflash/model.py` and the checkpoint
+
+| Question | Resolution |
+|---|---|
+| Checkpoint | `z-lab/gemma4-12B-it-DFlash`, 1.46 GB `model.safetensors` (bf16) + `config.json`, at `D:\models\z-lab-gemma4-12B-it-DFlash`. 5 layers, hidden 3840, ffn 7680, 32 q / 8 kv heads, head_dim 128, block 16, window 2048, rope theta 1e6, rms eps 1e-6, vocab 262144, tied (no embed / lm_head in the file), `layer_types` = 4 x sliding + 1 x full (in that order), `dflash_config.target_layer_ids` [1,10,19,27,36,45], `mask_token_id` 4, `final_logit_softcapping` 30. |
+| Tensor names | Plain Qwen3 `DFlashDraftModel`: `fc.weight` [3840, 6*3840], `hidden_norm.weight`, `norm.weight`, `layers.i.{input_layernorm,post_attention_layernorm}.weight`, `layers.i.self_attn.{q,k,v,o}_proj.weight`, `{q,k}_norm.weight` [128], `layers.i.mlp.{gate,up,down}_proj.weight`. 81 container tensors after conversion. |
+| Target layer index | z-lab: `hidden_states[layer_id + offset]`, `offset = 1`. HF `hidden_states[j+1]` is the OUTPUT of layer j == the INPUT of layer j+1. The container stores layer-INPUT indices (the Qwen precedent), so `target_layers = ids + 1 = [2,11,20,28,37,46]`. `GemmaModel::AttachFeatureCapture(L)` captures "the residual stream ENTERING layer L" after the previous layer's `layer_scalar` (== HF `hidden_states[L]`), un-rotated, bf16: the convention matches with no further +1. `--dflash-target-layer-offset 0` stores the ids unchanged (the A/B knob). Index 46 < 48, so no entry hits the post-final-norm slot. |
+| Embedding scale | The draft block is `F.embedding(ids, target_embed_weight) * input_embedding_scale`, default 1.0, ABSENT from this config: the RAW table rows, NOT Gemma's `sqrt(3840) = 62` scaled ones (the target's own gather is scaled; the drafter's is not). Stored as `dflash2.embed_scale` (1.0). `R4DX_DFLASH_EMBED_SCALE=62` overrides it at load for the D-7 A/B with no reconversion. |
+| Logits / softcap | target lm_head over `norm(x)`, then `cap * tanh(l / cap)` (cap 30) when `final_logit_softcapping` is set; `output_multiplier` (default 1) is refused if != 1. The cap is strictly monotone, so the top-16 ids/order from the raw logits are unchanged; `DflashDraft::DraftRound` applies it to the 16 `unary` values on the host after the one readback (the lm_head provider stays the bare GEMM). Qwen drafters (`logit_softcap` absent == 0) are untouched. |
+| Context path | `k_proj` / `v_proj` applied directly to `hidden_norm(fc(concat features))` (no input layernorm), then `k_norm`, rope: exactly `DflashDraft::InjectFeatures` (`hidden_norm` -> `dflash.enc_output_norm`). |
+| Block path | `input_layernorm` -> q/k/v -> q_norm/k_norm -> rope -> non-causal attention over [ctx ; block] (sliding layers `q_pos - k_pos < 2048`) -> `o_proj` -> residual -> `post_attention_layernorm` -> SwiGLU -> residual; draft token i = argmax of row i (i >= 1). |
+
+### 13.2 Converter (D-3): `r4dx-convert --dflash-hf`
+
+`r4dx-convert --dflash-hf <hf dir> --out <container> [--layout bf16|w4a16] [--dflash-target-layer-offset 0|1]
+[--dflash-embed-scale X]` (`src/convert/include/r4dx_convert/dflash2_hf.hpp`, test `convert_dflash_hf`). Default layout is
+bf16 (w4a16 works; its K = 3840 is not a multiple of 512, so the GEMM tuning relaxation of plan 7.2 would be needed to RUN it).
+Refuses `--ldlq/--hessian-dir/--imatrix/--w4a16-group-rule/--keep-bf16/--rotate/--trellis-from`. It writes every tensor of the
+dflash2 container and SYNTHESIZES the dflash2-only ones so the dflash2 forward is exactly the v1 forward:
+
+* identity conv: `conv.base[side][tap0][:] = 1.0`, `[side][tap1][:] = 0`, `conv.proj = 0` (dyn = 0) -> `out = x` bit for bit;
+* zero selector: `selector.hidden = 0`, both codebooks 0 -> gate 0, `score[a,b] = unary[b]` -> the walk emits each position's top-1,
+  i.e. the v1 per-position argmax (the cost of phase 1: 2 x 134 MB zero codebooks + wasted conv / selector GEMMs; phase 2 skip flags
+  only if profiling shows it matters).
+New OPTIONAL `__metadata__.dflash2` keys (written only when set; Qwen containers are byte-identical): `logit_softcap`,
+`embed_scale`, `variant` (`v1_identity`), `target_layer_offset`. `DflashDraftWeights` parses them with defaults 0 / 1.0 / "".
+The real container was written to `D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx` (2 s, 1.80 GB, 81 tensors) and spot-verified
+against the HF file (every linear byte-equal, identity conv, norms) with a Python reader.
+
+### 13.3 Runtime changes (D-4 / D-5)
+
+* `r4dx_dflash_attn_bf16`: `T <= 16` (was 8), LDS score row 2064 (was 2056). The kernel body was read: one workgroup per (row, kv head),
+  its geometry does not depend on T except the score row, so no rewrite was needed. window <= 2048 still (LDS).
+* `DflashDraft::Load`: block must be a power of two in [2, 16] (the conv's `t & (block - 1)` mask).
+  `r4dx_dflash_conv_bf16` (libr4d) is generic in T / block (checked in the kernel body).
+* The full layer (`layer_types[4] == full_attention`) uses the SAME 2048 window and 2048-slot ring as the sliding layers: a true
+  full-context layer needs a split-K / online-softmax kernel (the 2064-float LDS row is the cap). The effect is quality only (the
+  drafter sees at most the last 2048 positions on its one full layer; verification stays exact). `sliding_window_pattern` is
+  recorded faithfully in the metadata for the day the kernel lands. `dflash_v1_ref.py::test_known_gap_*` marks the difference.
+* `DflashDraft::MakeEmbeddingProviderFromTable(table, hidden, vocab, scale)` / `MakeLmHeadProviderFromLinear(lm_head)`: the providers
+  for a non-`Container` target (GemmaModel).
+
+### 13.4 Gemma target side (D-6): `GemmaModel::VerifyWindow` and `DecodeStepDflashGreedy`
+
+`GemmaModelOptions::{dflash_container, dflash_draft_k}` (the CLI's `--dflash <container> --dflash-k K` reaches them through
+`LoadGemmaTextModel`): load the drafter, attach the feature capture at its `target_layers`, inject every committed row (a prefill chunk
+in slices of <= 64, a plain decode step, an accepted verify prefix) into the drafter at its frontier.
+
+* `VerifyWindow(candidates)` (1..16 rows): ONE chunk at `PositionCount()` that does NOT advance it, final norm + lm_head + softcap +
+  argmax on EVERY row (`[16, vocab]` fp32 scratch, per-row `r4dx_argmax_f32`: the kernel plain greedy uses). `CommitVerifiedWindow(n)`
+  does `pos += n`. `DecodeStepDflashGreedy` = draft round -> verify `[anchor, d1..dk]` -> accept the longest prefix the target's argmax
+  confirms (+ bonus) -> inject the committed rows' features -> commit.
+* **Rollback of rejected rows is a no-op, by design and by proof.** A verify row at position p writes ring slot `p % R` and
+  clobbers position `p - R`; for `R >= window + W - 1` that is below `frontier - window` for every later query (Gemma: R = 1536,
+  window 1024, W <= 16: 1536 >= 1039; the ring is built for window + 288), and the stale bytes of the rejected positions are overwritten by the next
+  chunk's own write before any query can read them (a query only reads `kpos <= qpos`). Full layers are positional, so the same
+  overwrite argument applies. Proof by randomized simulation (the real `SlidingRingGeometry`, 20k rounds x 3 accept patterns, a negative
+  control with no headroom): `tests/kernels/test_ring_verify_rollback.cpp` (`ctest -R test_ring_verify_rollback`, CPU). Only the BOOKKEEPING
+  needs care: `PositionCount()` and the drafter frontier advance only on commit / injection, and `SaveCheckpoint`'s whole-ring copy is unaffected.
+  The drafter's own ring needs none either (docs/dflash2.md section 5: the block K/V is scratch).
+* `DecodeStepDflashSampled` for temperature > 0 is NOT implemented on Gemma (throws); a temperature-0 call is the greedy path. The
+  server turns injection off for sampled requests, which leaves a cold-ring gap that `InjectFeatures` handles.
+* TP: not touched (GemmaTpModel is M1b).
+
+### 13.5 CPU tests
+
+`convert_dflash_hf` (mapping, identity conv, zero selector, metadata, both layouts, refusals), `test_dflash_hf_weights` (loader keys and
+defaults), `test_ring_verify_rollback`, and `tools/reference/gemma/dflash_v1_ref.py` (numpy: a z-lab v1 block forward written from the
+semantics above vs `dflash2_ref.draft_round` on the identity / zero-selector weights: identical argmax tokens on 15 positions across
+window / softcap / embed-scale cases, hidden state within 2e-4). The Qwen `dflash2_selftest.py` fixtures are unchanged
+(`draft_round` gained `embed_scale` / `logit_softcap` parameters, defaulting to the old behaviour).
+
+### 13.6 GPU gates (NOT run; ask before running)
+
+Build, then (device 1, one process, nothing else on the GPU):
+
+```
+# kernel tests: T = 16 attention (all edges), H = 3840 / block 16 identity conv, theta 1e6 rope, 3840 / 7680 rmsnorm
+ctest --preset win-hip -R "test_dflash_attn|test_dflash_conv|test_rope_neox|test_rmsnorm_plain|test_topk16"
+# acceptance A/B vs plain decode on chat prompts (greedy; compare the two outputs byte for byte and read the [stats] dflash line)
+$env:HIP_VISIBLE_DEVICES='1'
+r4dx-cli --model <gemma trellis or D:\models\r4dx\huihui-gemma\bf16.r4dx> --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
+r4dx-cli --model <same> --dflash D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx --dflash-k 7 --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
+# layer-offset {1 (default), 0} x embed-scale {1 (default), 62}: reconvert with --dflash-target-layer-offset 0 for the first, set
+# R4DX_DFLASH_EMBED_SCALE=62 for the second.
+```
+`tools/gemma_dflash_ab.ps1` wraps these. Known risk to expect: verify rows run a different GEMM shape than single-row decode, so a rare
+near-tie can flip an argmax (the precedent of docs/mtp.md / tools/validate_dflash.ps1's control run); a divergence is a real bug only if the
+plain-MTP-style control does not show it. The bar to justify the fine-tune (plan D-7) is >= 2.0 tokens per round at k = 7.

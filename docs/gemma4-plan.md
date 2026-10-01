@@ -1,4 +1,4 @@
-﻿# Gemma 4 12B support for r4dx -- design and task plan
+# Gemma 4 12B support for r4dx -- design and task plan
 
 Branch `gemma4` (from `main` at `9063730`). Written 2026-10-01. This is a **design only**: no source
 file was edited, no GPU workload was run and no package was installed while writing it. Where it says
@@ -846,6 +846,8 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M3-2 Implement and gate [GPU].** Same pattern as M2-3. Deps: M3-0, M3-1, M2-2.
 
 ### D: drafter (parallel, non-blocking)
+
+Status (branch g4-dflash, CPU only, no GPU run yet; details docs/dflash2.md section 13): D-1 DONE (conventions: offset 1 -> target_layers [2,11,20,28,37,46] as layer INPUTS, raw unscaled embedding rows (`embed_scale` 1.0, 62 is the A/B), softcap 30 on the 16 unary values, 4 sliding + 1 full layers, plain Qwen3 tensor names). D-2 DONE as `tools/reference/gemma/dflash_v1_ref.py` (v1 block forward vs the dflash2 reference with identity conv / zero selector, block 16). D-3 DONE (`r4dx-convert --dflash-hf`, test `convert_dflash_hf`, real container `D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx` written and spot-verified). D-4 PARTIAL: attention kernel T <= 16 (body read: no rewrite), tests extended (T = 16, H = 3840 block-16 identity conv, theta 1e6, 3840 / 7680 norms), compiled but NOT RUN; the full layer still has the 2048 window cap (needs a split-K kernel for true full context). D-5 DONE except GPU: optional metadata keys, host softcap, embed-scale provider; per-layer window / slot arrays were NOT needed (every layer uses 2048). D-6 DONE except GPU: `GemmaModel::VerifyWindow` / `CommitVerifiedWindow` / `DecodeStepDflashGreedy` / injection; ring rollback needs no undo (proof: `test_ring_verify_rollback`); sampled DFlash and TP not implemented. D-7 is the GPU step: `tools/gemma_dflash_ab.ps1`.
 
 - **D-1 Read z-lab/gemma4-12B-it-DFlash conventions [CPU].** Scope: target-layer offset (the ids' +1 convention), embed scale, softcap site, layer-type order, tensor names. Deps: M0-2. Done: documented.
 - **D-2 `dflash_v1_ref.py` [CPU].** Files: `tools/reference/gemma/dflash_v1_ref.py` with block-16 fixtures and `dflash2_ref.py` parametrized by block size. Deps: D-1. Done: fixtures generated.

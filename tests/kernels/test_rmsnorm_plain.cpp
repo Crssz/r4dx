@@ -70,7 +70,7 @@ int main() {
   // 5120 = draft hidden; 17408 = draft ffn; 128 = per-head q_norm/k_norm width; 8 rows = the
   // draft block; 40 rows = a fixture-sized injection batch.
   std::printf("[1] cpu fp64 reference (eps=%g)\n", eps);
-  for (int64_t hidden : {int64_t(128), int64_t(5120), int64_t(17408)}) {
+  for (int64_t hidden : {int64_t(128), int64_t(3840), int64_t(5120), int64_t(7680), int64_t(17408)}) {  // 3840 / 7680: the Gemma 4 DFlash drafter hidden / ffn
     for (int64_t rows : {int64_t(1), int64_t(8), int64_t(40)}) {
       const std::vector<uint16_t> x =
           RandomBf16(static_cast<size_t>(rows * hidden), &rng, -3.0f, 3.0f);

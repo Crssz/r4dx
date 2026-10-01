@@ -201,7 +201,10 @@ void TestRingWrap(const Golden& g, GemmaModel& m, attention::GemmaKvDtype dt, do
   last = m.DebugLayerForward(layer, Rows(x, hidden, body, T), decode, body);  // the decode rows
   const std::vector<float> want_tail(want.begin() + static_cast<int64_t>(T - decode) * hidden, want.end());
   const double e = RelL2(r4dx_test::WidenBf16(last), want_tail);
-  const double tol = FloorTol(meta, "layer_out") + extra_tol + 5e-3;
+  // The ring component carries no fp32_floor of its own; use the floor of the same layer's short golden.
+  const json& floor_meta =
+      meta.contains("fp32_floor") || !g.Has("layer_000_sliding") ? meta : g.Component("layer_000_sliding");
+  const double tol = FloorTol(floor_meta, "layer_out") + extra_tol + 5e-3;
   std::printf("  ring wrap (%d positions, ring 1536): last %d rows rel L2 %.3e (tol %.3e)\n", T, decode, e, tol);
   Check(e <= tol, std::string("sliding_ring_wrap") + (dt == attention::GemmaKvDtype::kBf16 ? " [bf16 KV]" : " [fp8 KV]") +
                       ": the rows past the ring wrap match the golden");

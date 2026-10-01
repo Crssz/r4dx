@@ -760,6 +760,7 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader now accepts rotated trellis containers (`CheckTrellisChoice(..., allow_rotated=true)`; `test_gemma_container` part (d) Inspects the real rot-q2ab / rot-q2a containers of `convert_gemma_trellis`); default KV is bf16; the GPU test `gemma_rot_trellis` (`tests/model/test_gemma_rot_trellis.cpp`) is written, NOT run |
 | M1-32 | partial / pending-GPU | `ctest -R attn_.*gqa2` |
 | M1-33..M1-36 | pending | |
+| M2-0..M2-2 | done (CPU + builds) / M2-3 pending-GPU | branch `g4-vision`: see "M2: vision" below. Preprocessing bit-identical to HF (11 cases), embedder host reference bit-identical to HF bf16 on random weights, mask / chunk-planner / klimit_ext tests against `create_masks_for_generate` (8 layouts); device embedder, `GemmaModel::EncodeImages` / `PrefillMultimodal`, server image parts + `--vision` / `--image-soft-tokens` written and syntax-checked (clang `-fsyntax-only`), full HIP build and every GPU test NOT run |
 
 ### M0: setup, reference data
 
@@ -832,7 +833,41 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 - **M1b-2 TP KL gate [GPU].** Command: `tool_teacher_forced_logprobs.exe --tp 2 ...`, then `kl_report.py` TP2 vs TP1, plus `gemma_tp_identity.ps1`. Gate: TP=1 byte-identical to the frozen baseline, and TP2-vs-TP1 mean KL <= 3x the noise floor with top-1 agreement >= 99.5% (proposed thresholds). Also run the M1 gate in TP=2. Deps: M1b-1, M1-36. Done: passes.
 - **M1b-3 TP tuning rows.** Scope: the `tp2.*` shapes. Deps: M1b-2. Done: tuning rows are added.
 
-### M2: vision (no design section exists; needs a design pass first)
+### M2: vision (implemented on `g4-vision`; design below)
+
+**Design as built** (semantics doc sections 2-3 are the authority; this is how they are implemented):
+
+- **Preprocessing** (`src/vision/gemma_vision.{h,cpp}`, CPU, no HIP): `PreprocessGemmaImage` = HF `Gemma4UnifiedImageProcessor`
+  (Qwen's `ResizeU8` is the torch uint8 antialiased bicubic kernel, reused; target = the largest 48-multiple size with
+  h*w <= soft_tokens*2304, **images are grown as well as shrunk**; rescale = `float32(u8) * float32(1/255)`; merged patch = the
+  plain 48x48 HWC raster of its merged-grid cell, row-major over the merged grid; positions (x, y)). Bit-identical to HF on
+  11 synthetic images (noise / gradient, 48x48 up to 1080x1920, a 64x2000 strip, budgets 70 / 140 / 280 / 560). The server reaches it
+  through `ImageProcessorConfig::gemma` so `ParseChatCompletionRequest` and the Qwen path are unchanged; grids are
+  `{t=1, h, w}` in MERGED cells and `GemmaLocalTextModel::VisionMergeSize() == 1`.
+- **Embedder** (`src/model/gemma_vision_embedder.{h,cpp}`, device): `vision.vision_embedder.*` + `vision.embed_vision.embedding_projection.weight`
+  (written by `r4dx-convert --vision on`, bf16 passthrough, ~0.1 GB; loaded by `GemmaContainer` with `GemmaVisionLoad`) run as
+  LayerNorm(6912) -> Linear(+bias) -> LayerNorm -> `r4dx_vision_pos_embed_bf16` (the existing Qwen kernel with two taps of weight 1.0 over
+  the `[1120,2,3840]` table viewed as 2240 rows: row `2x` and `2y+1`) -> LayerNorm -> `r4dx_rmsnorm_noscale_bf16` -> Linear. **No new GPU
+  kernel.** Output is spliced UNSCALED. Deviation: the Linear bias is added after the GEMM's bf16 rounding (one extra rounding, ~2^-9).
+  CPU oracle: `GemmaEmbedHost` (bit-identical to the HF bf16 module on random weights, `vision_embedder_golden.py`).
+- **Splice and chunking** (`GemmaModel::PrefillMultimodal`): gather (scaled) -> overwrite image rows (bf16 -> fp32 widen) -> rotate ->
+  layers. `PlanPrefillChunks` never splits a block: a block is one chunk of up to 288 rows, per-chunk buffers hold 320 rows when vision is
+  loaded (256 otherwise, so a text-only server is byte-for-byte as before). A soft-token budget above 280 is refused at runtime
+  (`--image-soft-tokens` 70 | 140 | 280; 560 / 1120 are valid processor budgets only).
+- **Mask**: sliding layers only (semantics doc section 2 decision): `klimit_ext[row]` = last absolute position of the row's block, -1 elsewhere
+  (`BuildKlimitExt`), passed to the sliding attention (reference kernel, and libr4d prefill kernel in fp8-KV mode; a short image chunk with
+  `T <= 32` takes the prefill kernel because the split-KV decode kernel has no `klimit_ext`). Full layers and every decode step stay causal.
+  `BuildDenseMask` is the CPU oracle; `klimit_ext` + window reproduces HF's `create_masks_for_generate` sliding mask on 8 layouts, and
+  `vision_golden_gemma.py` asserts it on a real two-image sequence. The one-line A/B switch (full layers bidirectional too) is the
+  `layer5_full_if_bidir` golden.
+- **Prompt**: the chat template renders one `<|image|>` per image; the engine expands it to `<|image>` + N x `<|image|>` + `<image|>`
+  (`ExpandImagePlaceholders(..., boi, eoi)`; `TextModel::ImageBoiTokenId/EoiTokenId`, -1 for Qwen). Positions are plain 1-D.
+- **Server**: `image_url` data-URI content parts (as for Qwen), `--vision auto|on|off` (Gemma: `auto` loads the embedder iff the container has
+  it), `--image-soft-tokens`. `HasVision()` flips the advertised modalities.
+- **GPU handoff**: convert with `r4dx-convert --input D:\models\Huihui-gemma-4-12B-it-abliterated --output D:\models\r4dx\huihui-gemma\bf16-vision.r4dx --vision on`
+  (CPU, writes 24 GB: mind RAM / commit), run `vision_golden_gemma.py` (CPU is fine), then
+  `$env:HIP_VISIBLE_DEVICES='1'; ctest -R gemma_vision_gpu --output-on-failure` and a server request with an `image_url` part.
+  Still open: whole-model real-image logits vs HF (`vision_golden_gemma.py --device cuda --full-logits`).
 
 - **M2-0 Vision design pass [CPU].** Scope: embedder kernels (LayerNorm 6912/3840, pos-embedding, RMSNorm no weight, Linear), the preprocessor (resize to a multiple of 48), the chunk planner for image blocks of up to 288 rows with buffers sized to 320, `EncodeImages`, API content parts, and the prompt expansion (`<|image>`, N x `<|image|>`, `<image|>`) in `image_prompt.h`. Deps: M0-5 (mask semantics), M1-30. Done: design doc approved.
 - **M2-1 Vision golden.** Files: `vision_golden_gemma.py`, covering a non-square image and two images. CPU-runnable. Deps: M0-6. Done: golden written.

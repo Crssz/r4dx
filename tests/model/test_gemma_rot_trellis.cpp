@@ -85,9 +85,14 @@ int main() {
 
     Check(GemmaModelOptions{}.kv == GemmaKvMode::kBf16, "the default KV mode is bf16 (fp8 only when R4DX_GEMMA_KV=fp8)");
 
-    for (const char* kind : {"q2ab", "q2a"}) {
+    // "plain" first: the UNROTATED trellis container of the same fixture recipe (its own checkpoint, the same 1%
+    // perturbation) is the control. Its cosine to its own bf16 reference measures what trellis + perturbation cost on
+    // this tiny random model; a rotated container must track its reference about as well (rotation adds ~nothing).
+    double control_worst = -1.0;
+    for (const char* kind : {"plain", "q2ab", "q2a"}) {
+      const bool is_control = std::string(kind) == "plain";
       const fs::path ckpt = dir / (std::string("ckpt-") + kind);
-      const fs::path rot = dir / (std::string("rot-") + kind + ".r4dx");
+      const fs::path rot = dir / (is_control ? std::string("plain.r4dx") : std::string("rot-") + kind + ".r4dx");
       if (!fs::exists(ckpt) || !fs::exists(rot)) return r4dx_test::SkipMissing(rot.string());
       const fs::path ref = dir / (std::string("ref-") + kind + ".r4dx");
       {
@@ -120,24 +125,32 @@ int main() {
         o.max_ctx = 256;
         if (fp8) o.kv = GemmaKvMode::kFp8;  // default (unset) is bf16
         GemmaModel m = GemmaModel::Load(o);
-        if (!fp8) {
+        if (!fp8 && !is_control) {
           Check(m.GetContainer().HasRotation() && m.GetContainer().HasTrellis(),
                 std::string(kind) + ": GemmaModel accepted the rotated trellis container");
           Check(m.GetContainer().Rotation().spec.Hadamard() == (std::string(kind) == "q2ab"), std::string(kind) + ": option-A Hadamard iff q2ab");
           Check(m.KvMode() == GemmaKvMode::kBf16, std::string(kind) + ": KV mode is bf16 by default");
         }
+        if (!fp8 && is_control) Check(!m.GetContainer().HasRotation() && m.GetContainer().HasTrellis(), "plain: the control is unrotated trellis");
         const std::vector<std::vector<float>> rows = Rows(m, ids, P);
-        bool fin = true, cos_ok = true;
+        bool fin = true;
         double worst = 1.0;
         for (size_t r = 0; r < rows.size(); ++r) {
           fin = fin && Finite(rows[r]);
-          const double c = Cosine(rows[r], ref_rows[r]);
-          worst = std::min(worst, c);
-          cos_ok = cos_ok && c >= (fp8 ? 0.90 : 0.95);
+          worst = std::min(worst, Cosine(rows[r], ref_rows[r]));
         }
         std::printf("  KV %s: %zu rows, worst cosine to the unrotated bf16 model %.4f\n", fp8 ? "fp8" : "bf16", rows.size(), worst);
         Check(fin, std::string(kind) + (fp8 ? " fp8" : " bf16") + " KV: every logit is finite");
-        Check(cos_ok, std::string(kind) + (fp8 ? " fp8" : " bf16") + " KV: logits track the unrotated bf16 model");
+        // fp8 here runs on the fixture's placeholder descales (1.0): a finiteness smoke only (the real fp8 gate is M1-30).
+        if (!fp8) {
+          if (is_control) {
+            control_worst = worst;
+          } else {
+            Check(control_worst > 0 && worst >= control_worst - 0.02,
+                  std::string(kind) + " bf16 KV: tracks its bf16 reference as well as the unrotated trellis control (" +
+                      std::to_string(worst) + " vs control " + std::to_string(control_worst) + " - 0.02)");
+          }
+        }
         // Reset + the same prefill reproduces row P-1 (the trellis tickets are re-zeroed by Reset).
         if (!fp8) {
           m.Reset();

@@ -720,7 +720,7 @@ expansion), so M2 and M3 start with a design pass; whether libr4d is editable at
 Legend: **[CPU]** needs no GPU. **[GPU]** is a handoff command for the user. Build dir `build\win-hip`
 and exe names are unverified placeholders.
 
-### Status (as of merge of g4-refpkg and g4-config-convert into `gemma4`)
+### Status (as of merge of g4-fp32resid and the fp32-truth gate lane into `gemma4`)
 
 done = merged, CPU tests pass. partial = authored/merged, part still open. pending-GPU = code ready, needs the user's GPU run.
 Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernels) are taken from the earlier integration report; recheck against lane notes if in doubt.
@@ -746,10 +746,12 @@ Rows for lanes merged earlier (env, loader, tokenizer, dialect, rotation, kernel
 | M1-18 | pending-GPU | |
 | M1-19, M1-20 | done (build + CPU) | `GemmaContainer` (CPU `Inspect` tested on the tiny fixture and the real bf16 header; device `Load`), `container_load_util`, `GemmaMlp`, `GemmaAttnLayer`/KV cache (fp8, bf16, bf16-full), `GemmaModel`, `GemmaLocalTextModel`, `LoadGemmaTextModel`; GPU forward path never executed; Qwen builds unchanged |
 | M1-21 | partial (authored) | `gemma_layer_golden` and `gemma_forward_smoke` compile; they SKIP until M0-8 goldens exist; GPU run pending |
-| M1-22 | pending | needs M0-8 and M1-21 passing |
+| M1-22 | pending-GPU | needs M0-8 and M1-21 passing. Gate is now fp32-truth noise-relative (sec. 9 items 9-11); truth/bf16sdpa dumps for chat_gemma.json + raw@512 are done on CPU (`D:\models\r4dx\huihui-gemma\kl\fp32\`); `kl_report.py --gate gemma-fp32` and its test pass. r4dx dump must run with `R4DX_GEMMA_RESID=fp32` (default) and bf16 for A/B |
 | M1-23 | pending | |
 | M1-24 | done | `ModelConfig::arch`; `GemmaLocalTextModel` does not exist yet |
-| M1-26..M1-30 | pending | blocked on M0-9, M1-23 (GPU runs) |
+| M1-26..M1-30 | pending | blocked on M0-9, M1-23 (GPU runs); M1-30 uses the fp32-truth gate with `--base-dir` increment <= 0.01 |
+| FP32-RESID | pending-GPU | merged (`e46da64`): fp32 residual stream is the GemmaModel default (`R4DX_GEMMA_RESID=bf16` for A/B), new f32 kernels, CPU test `test_gemma_resid_f32_cpu` passes; GPU tests `test_gemma_resid_f32`, `test_rotate_residual_f32` and re-check of gemma_forward_smoke / gemma_attn_layer tolerances not yet run |
+| GATE-FP32 | done (CPU) | fp32 truth + HF bf16 sdpa noise dumps, chat_gemma.json corpus, kl_report gate; per-group thresholds in sec. 9 (chat-ALL KL <= 0.00599, top-1 >= 97.85%); group granularity (english/thai/code/ALL) awaits user confirmation |
 | M1-25 | partial (CPU done) | `tools/reference/arch_table.py`; `hessian_capture.py` / `imatrix_capture.py` / `trellis_quant.py` take `--arch gemma4_unified` (taps, token-id corpus, `--dry-run` on CPU, real capture verified against hooks on a tiny CPU model); GPU run is M1-26 / M1-27. `imatrix_capture.py` supports `--dry-run` only for Gemma (a Gemma w4a16 imatrix is not implemented) |
 | M1-28 prereqs | done (CPU) | converter `--trellis-from` / `--kv-calib` for Gemma, rotated trellis (section 10), `--rotation-out`; `convert_gemma_trellis`, `reference_arch_gemma`; the container itself waits on M1-23 / M1-27 |
 | M1-31 | partial | rotation runtime is IN M1 (section 9); kernels merged and CPU-tested; `tp_shard` row-split for `rotation.had_o_full_signs` done (`test_tp_shard`); the Gemma loader accepting rotated trellis containers and the GPU tests are open |

@@ -964,6 +964,11 @@ Decided with the user on 2026-10-01. These override anything earlier in this doc
     TP=2 (user, 2026-10-02): ACCEPTED on the fp32-truth gate -- mix4.5m-sensall at --tp 2 real: ALL +0.0074 PASS,
     74.7 tok/s decode (TP=1 52.6), 7.8 GiB per card; TP2-vs-TP1 mean KL 0.0003-0.0014 per segment (<= 3x noise).
     The proposed 99.5% TP2-vs-TP1 top-1 rule is dropped (98.9-100% measured: near-tie flips from all-reduce order).
+    DFlash v1 (z-lab drafter -> r4dx dflash2 container, no fine-tune) on mix4.5m-sensall, TP=1: greedy output
+    byte-identical to plain decode on 3 prompts; 2.6-4.0 tok/round; 129-149 tok/s vs 54-55 plain (2.4-2.7x).
+    Vision + audio on the trellis container (`huihui-gemma-trellis-mix45m-sensall-va.r4dx`, --vision on --audio on):
+    server smoke describes two synthetic images correctly; audio answers as HF bf16 does (the model's own limit on
+    pure tones). Vision/audio/DFlash are TP=1 only (GemmaTpModel refuses them at load).
     Original item 12 follows for the record:
 12. **Trellis format: mix4.5m, like Qwen production** (user, 2026-10-02). This replaces the K4m default in M1-27/M1-28. The oracle runs K4 and K5, and a Gemma-specific tensor ranking replaces EXL3's qwen3_5 ranking in `trellis_quant.py` to choose the per-tensor 4/5 mix. The target is about 4.5 bits average. K4m is not built unless asked.
 13. **SUPERSEDED 2026-10-02 08:40 -- M1 ships UNROTATED trellis mix4.5m** (user). The rotated recipe was measured and

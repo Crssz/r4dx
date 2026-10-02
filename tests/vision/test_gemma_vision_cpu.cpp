@@ -252,12 +252,48 @@ int TestHfMasks() {
   return 0;
 }
 
+void TestFacadeSpanChecks() {
+  const int32_t I = 7;
+  const auto throws = [&](const std::vector<int32_t>& t, std::vector<ImageBlock> b, int64_t mx = 288) {
+    try {
+      CheckImageSpans(t, I, b, mx);
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  const std::vector<int32_t> ok = {1, 2, I, I, I, 3, I, I, 4};
+  GCHECK(!throws(ok, {{2, 5}, {6, 8}}));
+  GCHECK(!throws({1, 2}, {}));
+  GCHECK(throws({}, {}));                        // empty token_ids
+  GCHECK(throws(ok, {{2, 5}}));                  // missing span for the second run
+  GCHECK(throws(ok, {{2, 5}, {6, 8}, {8, 9}}));  // extra span
+  GCHECK(throws(ok, {{6, 8}, {2, 5}}));          // out of order
+  GCHECK(throws(ok, {{2, 4}, {6, 8}}));          // shorter than its run
+  GCHECK(throws(ok, {{2, 5}, {6, 10}}));         // outside tokens
+  GCHECK(throws(ok, {{2, 5}, {6, 8}}, 2));       // over max_block
+  GCHECK(throws(ok, {{2, 2}, {6, 8}}));          // empty block
+  const auto athrows = [&](int64_t total, std::vector<ImageBlock> b) {
+    try {
+      CheckAudioSpans(total, b);
+    } catch (const std::invalid_argument&) {
+      return true;
+    }
+    return false;
+  };
+  GCHECK(!athrows(10, {{0, 3}, {3, 10}}));
+  GCHECK(athrows(0, {}));
+  GCHECK(athrows(10, {{-1, 3}}));
+  GCHECK(athrows(10, {{8, 11}}));
+  GCHECK(athrows(10, {{4, 4}}));
+}
 }  // namespace
 
 int main() {
   TestTargetSize();
   TestExpansion();
   TestPlanner();
+  TestFacadeSpanChecks();
   TestKlimit();
   TestKernelContractMatchesDense();
   TestDocTable();

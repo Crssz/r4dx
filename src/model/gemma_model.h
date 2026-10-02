@@ -124,7 +124,9 @@ class GemmaModel {
   // its peer's spin timeout fire. Ends with Reset(). A lockstep collective: every rank must call it.
   void TpWarmup();
   // The positions TpWarmup() needs in the KV caches (max_ctx must be at least this under TP).
-  static int64_t WarmupPositions(const GemmaModelOptions& o);
+  // `has_vision`: the container actually carries the vision embedder (adds the 284-row image block of the warm-up); a
+  // caller that cannot know yet (--vision auto before the container is open) passes false and the rank's TpWarmup re-checks.
+  static int64_t WarmupPositions(const GemmaModelOptions& o, bool has_vision);
   // Prefill submission bounding counters (TP; zeros at TP=1).
   tp::SubmitBounder::Stats TpSubmitStats() const { return submit_.GetStats(); }
   int64_t VocabLocal() const { return vocab_local_; }

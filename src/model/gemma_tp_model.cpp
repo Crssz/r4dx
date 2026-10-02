@@ -1,4 +1,4 @@
-﻿#include "gemma_tp_model.h"
+#include "gemma_tp_model.h"
 
 #include <hip/hip_runtime.h>
 
@@ -160,7 +160,9 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   }
   // The Gemma option mapping (R4DX_GEMMA_* environment, MTP refused) -- the same one TP=1 runs.
   GemmaModelOptions g = MakeGemmaModelOptions(opts);
-  const int64_t warmup_positions = GemmaModel::WarmupPositions(g);
+  // kOn demands vision (the load fails without it), so its 284-row floor is known now; kAuto on a text-only container
+  // runs no image warm-up, and a vision-carrying one is re-checked by each rank's TpWarmup against the real container.
+  const int64_t warmup_positions = GemmaModel::WarmupPositions(g, g.vision == GemmaVisionLoad::kOn);
   if (g.max_ctx > 0 && g.max_ctx < warmup_positions) {
     throw std::invalid_argument("GemmaTpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +
                                 " under tensor parallelism (the load-time warm-up prefills a full chunk and decodes), got " +
@@ -904,6 +906,13 @@ std::vector<float> GemmaTpModel::PrefillMultimodal(const std::vector<int32_t>& t
   const int64_t hidden = global_config_.hidden_size;
   auto owned = std::make_shared<OwnedRows>();
   size_t total = 0;
+  // Client errors are rejected here, before any rank command (a throw on the rank threads puts the group into
+  // kNeedsRecovery): spans in order and within the 288-token block limit, placeholder runs == spans one to one.
+  {
+    std::vector<vision::ImageBlock> blocks;
+    for (const ImageSpan& sp : images) blocks.push_back({sp.offset, sp.offset + sp.tokens});
+    vision::CheckImageSpans(token_ids, static_cast<int32_t>(image_token_id_), blocks, vision::kGemmaMaxImageBlockTokens);
+  }
   for (const ImageSpan& sp : images) {
     if (!sp.embeds_on_host) {
       throw std::invalid_argument("GemmaTpModel::PrefillMultimodal: image rows must be host-resident under tensor "
@@ -946,6 +955,11 @@ std::vector<float> GemmaTpModel::PrefillAudio(const std::vector<int32_t>& token_
   const int64_t hidden = global_config_.hidden_size;
   auto owned = std::make_shared<OwnedRows>();
   size_t total = 0;
+  {  // facade-side bounds check (see PrefillMultimodal)
+    std::vector<vision::ImageBlock> blocks;
+    for (const AudioRowSpan& sp : spans) blocks.push_back({sp.offset, sp.offset + sp.tokens});
+    vision::CheckAudioSpans(static_cast<int64_t>(token_ids.size()), blocks);
+  }
   for (const AudioRowSpan& sp : spans) {
     if (sp.rows == nullptr || sp.tokens <= 0) {
       throw std::invalid_argument("GemmaTpModel::PrefillAudio: an audio span has no rows");

@@ -2083,7 +2083,11 @@ Same approach as Qwen (section 8.3): the embedder is not sharded, the rows trave
   `image_url` / `input_audio` routes read them from the `TextModel` and need no TP-specific code.
 - **Warm-up.** With vision loaded, `TpWarmup` also runs one 4 + 280-row image block (zero rows) so the 288-row GEMM / all-reduce
   shapes, the klimit path and the host splice are touched under the relaxed timeout (`WarmupPositions` then needs 284
-  positions).
+  positions; only when the container really carries vision -- `--vision on` is checked at facade load, `auto` on a
+  text-only container pays no floor). The 288-row chunk needs no larger comm: `TpComm::AllReduceSumBf16Rows` slices any
+  row count into calls of at most `MaxAllReduceBytes()` (85 rows of the 3840-wide residual), independent of the chunk size.
+  `PrefillMultimodal` / `PrefillAudio` validate span order, bounds, the 288 limit and placeholder-run agreement on the facade
+  (`vision::CheckImageSpans` / `CheckAudioSpans`) so a client error never reaches a rank.
 - **Tests.** GPU, two cards, written and not yet run: `test_gemma_vision_tp` (`R4DX_TP2GPU=1`): rows bitwise equal to TP=1,
   multimodal / audio prefill logits cosine >= 0.9995 and KL <= 2e-3 vs TP=1, the first 8 greedy tokens identical, DFlash rounds
   after an image == plain greedy (with `R4DX_GEMMA_VISION_TP_DRAFTER`). CPU: `test_cli_args` accepts `--tp 2 --vision on

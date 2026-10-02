@@ -471,6 +471,9 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
     buf_a_.CopyFromHost(x_rows.data(), x_rows.size());
   }
   UploadChunkMeta(start_pos, T, klimit_ext);
+  // Basis-agnostic: `x_rows` and the result are in the ORIGINAL basis; a rotated container runs the layer on x Q
+  // and the output is rotated back (so the HF layer goldens apply unchanged).
+  RotateResidual(cur, T, /*inverse=*/false);
   const GemmaLayerWeights& lw = container_.Layer(layer);
   const float eps = static_cast<float>(container_.Config().rms_norm_eps);
   if (f32) {
@@ -480,6 +483,7 @@ std::vector<uint16_t> GemmaModel::DebugLayerForward(int64_t layer, const std::ve
   }
   RunLayer(layer, cur, buf_normed_.data(), T, start_pos, /*has_next=*/false, nullptr,
            klimit_ext != nullptr ? klimit_dev_.data() : nullptr);
+  RotateResidual(cur, T, /*inverse=*/true);
   stream_.Synchronize();
   std::vector<uint16_t> out(x_rows.size());
   if (f32) {

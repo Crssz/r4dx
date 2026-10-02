@@ -248,6 +248,11 @@ endif()
 # against the M0-8 reference log-probs (full_logits_gemma.py's .logprobs.f16) over the first tokens of the first KL
 # segment -- KL / top-1 per KV mode, DecodeStepGreedy vs argmax(DecodeStep), a sampled step, Reset. GPU test (device 1);
 # SKIP 77 while the M0-8 outputs (R4DX_GEMMA_KL_REF_DIR) or the container are missing. ctest -R gemma_forward.
+# tool_gemma_rot_probe: per-layer rel L2 of a rotated Gemma container vs the unrotated one on the same layer input
+# (debugging tool, not a test; GPU, one device).
+add_executable(tool_gemma_rot_probe tool_gemma_rot_probe.cpp)
+target_link_libraries(tool_gemma_rot_probe PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
 add_executable(test_gemma_forward_smoke test_gemma_forward_smoke.cpp)
 target_link_libraries(test_gemma_forward_smoke PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 target_compile_definitions(test_gemma_forward_smoke PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")

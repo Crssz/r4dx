@@ -25,7 +25,13 @@
 //   the embedding table is replicated on every rank's device (the scaled gather runs locally); rotation tensors replicate
 //   except the Hadamard sign vectors, which split with their linear's K.
 //
-// Not supported here (throws, naming the feature): MTP, DFlash (the drafter track), vision (M2), profiling.
+// DFlash (docs/tp.md Gemma section): the converted DFlash v1 drafter is REPLICATED on both ranks (one shared host copy of its
+// codebooks), the feature capture is replicated, the draft head's per-rank top-16s and the verify window's per-row argmax
+// pairs are merged on the host inside GemmaModel; the facade forwards DecodeStepDflash* through RunCollective and compares
+// the committed tokens / walk_len across ranks. The injection policy (SetDflashInjectionEnabled) is host-only state applied
+// per command and after Reset/recovery, as TpModel's.
+//
+// Not supported here (throws, naming the feature): MTP, vision (M2), profiling.
 //
 // This class deliberately duplicates the TpModel state machine instead of templating it (docs/gemma4-plan.md 3.8's
 // listed risk): TpModel (tp_model.h) is wired to Model and is untouched, so Qwen behaviour cannot change.
@@ -81,7 +87,7 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
   bool HasVision() const override { return false; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
-  bool DflashEnabled() const override { return false; }
+  bool DflashEnabled() const override { return dflash_enabled_; }
   int64_t SampledFallbackRows() const override { return cached_fallback_rows_; }
   int64_t PositionCount() const override { return cached_position_; }
   int64_t NumLoadedLayers() const override { return num_loaded_layers_; }
@@ -90,7 +96,9 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
 
   // ---- sequence state -------------------------------------------------------------------------
   void Reset() override;
-  void SetDflashInjectionEnabled(bool) override {}
+  // Host-only (as TpModel's): stores the policy on the facade; every forward command applies it on each rank before it runs
+  // and Reset() applies it after recovery. Legal in every state.
+  void SetDflashInjectionEnabled(bool enabled) override { dflash_injection_ = enabled; }
   void SaveCheckpoint() override;     // each rank D2D-copies its own sliding rings (needs ModelOptions::prompt_checkpoint)
   void RestoreCheckpoint() override;
 
@@ -192,6 +200,7 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
     std::decay_t<Fn> fn;
     std::vector<Slot> out;
     int64_t pos0 = 0, fallback0 = 0;
+    bool inject = true;  // the facade's DFlash injection policy at the time the command was posted
     auto Take() {
       std::vector<std::conditional_t<std::is_void_v<R>, char, R>> v;
       v.reserve(out.size());
@@ -209,9 +218,11 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
     using St = CmdState<Fn>;
     RequireReady();
     auto st = std::make_shared<St>(std::forward<Fn>(fn), ranks_.size());
+    st->inject = dflash_injection_;
     RunGuarded(AllSlots(),
                [st](RankSlot& s) {
                  core::TpCollectiveScope scope;
+                 s.model->SetDflashInjectionEnabled(st->inject);
                  if constexpr (std::is_void_v<typename St::R>) {
                    st->fn(*s.model, s.index);
                  } else {
@@ -270,6 +281,8 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
   int64_t num_loaded_layers_ = 0;
   int64_t cached_position_ = 0;
   int64_t cached_fallback_rows_ = 0;
+  bool dflash_enabled_ = false;    // every rank loaded the drafter (cached at load)
+  bool dflash_injection_ = true;   // the GemmaModel default (gemma_model.h's SetDflashInjectionEnabled)
   mutable std::vector<VramReport> cached_vram_;
 };
 

@@ -2026,6 +2026,36 @@ controls above. The pass rule itself is unchanged.
 
 ---
 
+## 13. Gemma 4 under TP (GemmaTpModel): DFlash
+
+`GemmaTpModel` (src/model/gemma_tp_model.{h,cpp}, docs/gemma4-plan.md M1b-1 and section 13) is the Gemma facade of sections 2.1-2.9;
+this section records only what DFlash adds, which mirrors section 8.2 / 8.4 exactly.
+
+- **Drafter replicated.** Every rank loads the whole converted DFlash v1 drafter (`GemmaModelOptions::dflash_container`);
+  the two selector codebooks are read once on the facade thread (`DflashDraft::LoadHostCodebooks`) and shared
+  (`GemmaModelOptions::dflash_codebooks`). The drafter is given the rank's lm_head slice (`lm_head_vocab` = 131072,
+  `vocab_offset`, `global_vocab`, `comm`), so `DraftRound` merges the per-rank top-16s (H7) under the kernel's own total
+  order; the Gemma softcap is applied to the merged 16 values (monotone, ids unchanged).
+- **Features replicated.** The captured residual rows are identical on both ranks: the fp32 (or bf16) residual is rebuilt on
+  every rank from the same all-reduced bf16 o_proj / down_proj outputs (a two-term sum is commutative, bit-identical on both
+  ranks), the un-rotation is deterministic. Both drafters therefore inject the same rows and their rings stay identical.
+- **Verify window.** `GemmaModel::VerifyWindow` runs the final norm + lm_head GEMM on every row against the rank's vocab slice,
+  `r4dx_argmax_val_f32` per row ({local idx, value}), then ONE host all-gather of up to 16 pairs per rank and
+  `tp::MergeArgmaxRows` (tp_vocab.h): the lowest global id wins ties, exactly `r4dx_argmax_f32`'s lowest-index semantics over
+  the full row (rank 0's ids are all below rank 1's, so rank 1 wins only with a strictly larger value). Every rank ends with
+  the same global ids, hence the same acceptance length, commit count and injection, with no further exchange. Commit /
+  ring rollback are per-rank bookkeeping in lockstep (the ring argument of docs/gemma4-plan.md D-6 is per rank: 1536 >= 1024 + 15).
+- **Facade.** `DecodeStepDflashGreedy/Sampled` are `RunCollective` commands; results and `walk_len` are compared across ranks
+  (`RequireAllEqual`), the sampled variant also the rngs. `DflashEnabled()` is cached from the ranks at load.
+  `SetDflashInjectionEnabled` is host-only policy stored on the facade, applied on every rank before each forward command
+  and after `Reset()` / recovery (as `TpModel`). A sampled request on Gemma takes one plain sampled step (as TP=1).
+- **Warm-up.** `GemmaModel::TpWarmup` ends with one `DecodeStepDflashGreedy` round (k = draft_k, n_min 0), so the drafter's
+  first-use kernels and both merges are touched under the relaxed all-reduce timeout, not inside a request.
+- **Still refused:** vision under `--tp 2` (kOn throws at load), MTP, profiling.
+- **Tests.** CPU: `test_tp_vocab_merge` (`MergeArgmaxRows` vs the full-row argmax, ties, the boundary ids half-1 / half, all
+  -inf). GPU, two cards, written and not yet run: `test_gemma_dflash_tp` (TP=2 DFlash byte-identical to TP=2 plain greedy,
+  acceptance within 5% of TP=1, sampled / injection-off / Reset lifecycle) and `tools/gemma_dflash_ab.ps1 -Tp 2 -RunGpu`.
+
 ## Appendix A -- file map
 
 New: `src/core/include/r4dx/core/tp_comm.hpp`, `tp_host_exchange.hpp`, `tp_alloc_guard.hpp`;

@@ -304,6 +304,14 @@ add_executable(test_gemma_tp_shard test_gemma_tp_shard.cpp)
 target_link_libraries(test_gemma_tp_shard PRIVATE r4dx_tp_shard)
 add_test(NAME test_gemma_tp_shard COMMAND test_gemma_tp_shard)
 
+# test_gemma_dflash_tp (docs/gemma4-plan.md, docs/tp.md Gemma section): Gemma DFlash under --tp 2. BOTH GPUs, LABEL tp2gpu, opt-in
+# like test_tp_real_vs_emulation (SKIP 77 unless R4DX_TP2GPU=1 and two devices are visible). Never run while another job owns a GPU.
+add_executable(test_gemma_dflash_tp test_gemma_dflash_tp.cpp)
+target_link_libraries(test_gemma_dflash_tp PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_dflash_tp PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_gemma_dflash_tp COMMAND test_gemma_dflash_tp)
+set_tests_properties(test_gemma_dflash_tp PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
+
 # test_rotation_meta: quant2's `__metadata__.rotation` parse (src/model/rotation_meta.h, header-only
 # and HIP-free) and the TP slicing of the rotation.* tensors (docs/quant2.md section 3.1). CPU-only
 # like the TP tests above; r4dx_tp_shard supplies src/model + third_party on the include path.

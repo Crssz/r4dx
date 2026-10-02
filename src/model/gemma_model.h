@@ -86,6 +86,9 @@ struct GemmaModelOptions {
   // most tokens one round drafts. Both are inert at their defaults.
   std::string dflash_container;
   int64_t dflash_draft_k = 0;
+  // TP only: the process's one host copy of the drafter's selector codebooks (DflashDraft::LoadHostCodebooks, read once by
+  // GemmaTpModel::Load) shared by both ranks' drafters; null => each drafter reads its own.
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;
 };
 
 // Rows the per-chunk buffers hold when vision is loaded: an image block (<= 288 soft tokens, the sliding ring
@@ -214,7 +217,15 @@ class GemmaModel {
   // selector walk produced before the n_min discard.
   std::vector<int32_t> DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
                                               int64_t* walk_len_out = nullptr);
-  // temperature <= 0 is DecodeStepDflashGreedy; a sampled DFlash round is not implemented for Gemma (throws).
+  // temperature <= 0 is DecodeStepDflashGreedy; temperature > 0 takes one plain sampled step (no speculation).
+  //
+  // TENSOR PARALLEL (docs/tp.md Gemma section). Every rank loads the whole drafter and runs this method in lockstep. The
+  // captured features are replicated: the residual stream (fp32 or bf16) is rebuilt on every rank from the same all-reduced
+  // bf16 o_proj/down_proj outputs (a two-term sum is commutative, so both ranks hold identical bits), the rotation un-rotate
+  // is deterministic, so both drafters inject identical rows and their rings stay identical. Only the target lm_head is
+  // vocab-split: the drafter merges its per-rank top-16s on the host (DflashDraftOptions::comm), and VerifyWindow merges
+  // each row's {value, global idx} pair (lowest global id on ties, as r4dx_argmax_f32). Both merges leave every rank with
+  // the same result, so acceptance, commit and injection decisions are identical on both ranks without further exchange.
   std::vector<int32_t> DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
                                                const kernels::SampleParams& params, std::mt19937_64& rng,
                                                int64_t* walk_len_out = nullptr);
@@ -249,6 +260,9 @@ class GemmaModel {
   int32_t MergeGreedyPair();
   void MergeSummary(kernels::RowSummary* out);
   void GatherVocabRow(std::vector<float>* full);
+  // TP verify window: the `rows` {local idx, value} pairs left in verify_pair_dev_ -> global ids (offset, one host all-gather,
+  // tp::MergeArgmaxRows). Device synchronized.
+  void MergeVerifyPairs(int64_t rows, std::vector<int32_t>* out);
   void RequireNotTp(const char* what) const;
   void InjectDflashRows(int64_t rows, int64_t start_pos);  // feeds features_dev_ rows [0, rows) to the drafter
   void RotateResidual(void* x, int64_t rows, bool inverse);  // x is fp32 or bf16 per opts_.resid
@@ -307,8 +321,9 @@ class GemmaModel {
   int64_t dflash_draft_k_ = 0;
   bool dflash_injection_enabled_ = true;
   double dflash_embed_scale_ = 1.0;  // the drafter container's embed_scale (R4DX_DFLASH_EMBED_SCALE overrides, A/B)
-  core::DeviceBuffer<float> verify_logits_dev_;    // [16, vocab] softcapped fp32 (lazily sized by VerifyWindow)
-  core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [16]
+  core::DeviceBuffer<float> verify_logits_dev_;    // [16, vocab_local_] softcapped fp32 (lazily sized by VerifyWindow)
+  core::DeviceBuffer<int32_t> verify_argmax_dev_;  // [16] (TP=1)
+  core::DeviceBuffer<int32_t> verify_pair_dev_;    // [16, 2] {local idx, value bits} (TP: r4dx_argmax_val_f32 per row)
   int64_t verified_rows_ = 0;                      // rows of the last VerifyWindow not yet committed (0 == none)
 };
 

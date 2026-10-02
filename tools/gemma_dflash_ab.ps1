@@ -21,6 +21,7 @@ param(
   [string]$Cli = "",      # r4dx-cli.exe;     default: build\win-hip\src\cli\r4dx-cli.exe
   [string]$HfDir = "D:\models\z-lab-gemma4-12B-it-DFlash",
   [string]$Model = "D:\models\r4dx\huihui-gemma\bf16.r4dx",
+  [string]$Layout = "bf16",  # trellis for a trellis container
   [string]$Out = "D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx",
   [int]$K = 7,
   [int]$MaxTokens = 256,
@@ -47,7 +48,7 @@ Write-Output "[ab] drafter container: $Out (layer offset $LayerOffset, embed sca
 
 # PowerShell 5.1 turns a native program's stderr lines (r4dx-cli's load log) into terminating errors under "Stop".
 $ErrorActionPreference = "Continue"
-$common = @("--model", $Model, "--temperature", "0", "--max-tokens", "$MaxTokens", "--stats")  # --prompt is a one-shot chat turn
+$common = @("--model", $Model, "--layout", $Layout, "--temperature", "0", "--max-tokens", "$MaxTokens", "--stats")  # --prompt is a one-shot chat turn
 $i = 0
 foreach ($p in $Prompts) {
   $i++

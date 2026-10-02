@@ -112,6 +112,37 @@ std::vector<ImageBlock> FindImageBlocks(const std::vector<int32_t>& tokens, int3
   return blocks;
 }
 
+void CheckImageSpans(const std::vector<int32_t>& tokens, int32_t image_token_id, const std::vector<ImageBlock>& blocks,
+                     int64_t max_block) {
+  if (tokens.empty()) throw std::invalid_argument("image spans: token_ids is empty");
+  const int64_t total = static_cast<int64_t>(tokens.size());
+  int64_t prev_end = 0;
+  for (const ImageBlock& b : blocks) {
+    if (b.end <= b.start || b.end - b.start > max_block || b.start < prev_end || b.end > total) {
+      throw std::invalid_argument("image span [" + std::to_string(b.start) + ", " + std::to_string(b.end) +
+                                  ") is out of order, empty, over " + std::to_string(max_block) +
+                                  " tokens, or outside the call's tokens");
+    }
+    prev_end = b.end;
+  }
+  const std::vector<ImageBlock> runs = FindImageBlocks(tokens, image_token_id, 0);
+  bool same = runs.size() == blocks.size();
+  for (size_t i = 0; same && i < runs.size(); ++i) same = runs[i].start == blocks[i].start && runs[i].end == blocks[i].end;
+  if (!same) {
+    throw std::invalid_argument("the image placeholder runs in token_ids do not match the image spans one to one");
+  }
+}
+
+void CheckAudioSpans(int64_t total, const std::vector<ImageBlock>& blocks) {
+  if (total <= 0) throw std::invalid_argument("audio spans: token_ids is empty");
+  for (const ImageBlock& b : blocks) {
+    if (b.start < 0 || b.end <= b.start || b.end > total) {
+      throw std::invalid_argument("audio span [" + std::to_string(b.start) + ", " + std::to_string(b.end) +
+                                  ") is empty or outside the " + std::to_string(total) + " tokens fed");
+    }
+  }
+}
+
 std::vector<PrefillChunk> PlanPrefillChunks(int64_t total, const std::vector<ImageBlock>& blocks, int64_t max_rows,
                                             int64_t max_block) {
   if (total < 0 || max_rows < 1) throw std::invalid_argument("PlanPrefillChunks: bad total / max_rows");

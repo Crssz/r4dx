@@ -579,6 +579,24 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
       if (sp.row < 0 || sp.rows < 1 || sp.row + sp.rows > T || sp.embeds == nullptr) {
         throw std::runtime_error("GemmaModel::RunChunk: bad image splice");
       }
+      if (sp.host) {
+        // TP (docs/tp.md 8.3): the rows are host bf16 (GemmaTpModel's ImageRows::host, one copy every rank splices). Same
+        // pageable-host path as the audio rows above: widen on the host for the fp32 residual, H2D, finish before the
+        // buffer can go away. No device allocation, so it is legal inside a collective.
+        const uint16_t* src = sp.embeds;
+        const size_t n = static_cast<size_t>(sp.rows * hidden);
+        if (f32) {
+          std::vector<float> wide(n);
+          for (size_t k = 0; k < n; ++k) wide[k] = Bf16ToF32(src[k]);
+          R4DX_HIP_CHECK(hipMemcpyAsync(static_cast<char*>(cur) + sp.row * hidden * 4, wide.data(), n * 4,
+                                        hipMemcpyHostToDevice, s_raw));
+        } else {
+          R4DX_HIP_CHECK(hipMemcpyAsync(static_cast<char*>(cur) + sp.row * hidden * 2, src, n * 2, hipMemcpyHostToDevice,
+                                        s_raw));
+        }
+        stream_.Synchronize();
+        continue;
+      }
       ProfiledCall(prof, s_raw, "embed.image_splice", [&] {
         if (f32) {
           r4dx_model_widen_bf16_to_f32(P(sp.embeds), P(static_cast<float*>(cur) + sp.row * hidden), sp.rows * hidden, s);
@@ -862,8 +880,14 @@ std::vector<float> GemmaModel::PrefillMultimodal(const std::vector<int32_t>& tok
   std::vector<vision::ImageBlock> blocks;
   int64_t prev_end = 0;
   for (const ImageSpan& sp : images) {
-    if (sp.embeds == nullptr || sp.embeds_on_host) {
-      throw std::runtime_error("GemmaModel::PrefillMultimodal: an image span needs device embeds");
+    if (sp.embeds == nullptr) {
+      throw std::runtime_error("GemmaModel::PrefillMultimodal: an image span has no embeds");
+    }
+    if (sp.embeds_on_host != (comm_ != nullptr)) {
+      // TP: host rows (one copy, every rank's H2D splice); TP=1: device rows (the D2D splice, unchanged).
+      throw std::runtime_error(comm_ != nullptr ? "GemmaModel::PrefillMultimodal: image rows must be host-resident under "
+                                                  "tensor parallelism (ImageSpan::embeds_on_host)"
+                                                : "GemmaModel::PrefillMultimodal: an image span needs device embeds");
     }
     if (sp.tokens < 1 || sp.tokens > vision::kGemmaMaxImageBlockTokens || sp.offset < prev_end ||
         sp.offset + sp.tokens > total) {
@@ -895,7 +919,8 @@ std::vector<float> GemmaModel::PrefillMultimodal(const std::vector<int32_t>& tok
     std::vector<vision::ImageBlock> abs_blocks;  // this chunk's blocks in ABSOLUTE positions
     while (next_block < blocks.size() && blocks[next_block].start < c.start + c.len) {
       const vision::ImageBlock& b = blocks[next_block];
-      cv.splices.push_back({b.start - c.start, b.end - b.start, images[next_block].embeds});
+      cv.splices.push_back(
+          {b.start - c.start, b.end - b.start, images[next_block].embeds, images[next_block].embeds_on_host});
       abs_blocks.push_back({pos_ + (b.start - c.start), pos_ + (b.end - c.start)});
       ++next_block;
     }
@@ -1003,17 +1028,21 @@ void GemmaModel::GatherVocabRow(std::vector<float>* full) {
   comm_->HostAllGather(gather_shard_host_.data(), static_cast<size_t>(vocab_local_) * sizeof(float), full->data());
 }
 
-int64_t GemmaModel::WarmupPositions(const GemmaModelOptions& o) {
+int64_t GemmaModel::WarmupPositions(const GemmaModelOptions& o, bool has_vision) {
   // TpWarmup: one full chunk, then (after a Reset) a 64-row chunk and three decode steps.
   // With a drafter, one more greedy DFlash round (a draft + a 16-row verify window) runs after them.
-  return std::max<int64_t>(o.prefill_chunk, 64 + 3 + (o.dflash_container.empty() ? 0 : 16));
+  // A vision-loaded model (the container really has vision.* and the load is not off) also warms one 4 + 280-row image
+  // block; a text-only container under kAuto pays no floor.
+  const int64_t vision_rows = has_vision && o.vision != GemmaVisionLoad::kOff ? 4 + 280 : 0;
+  return std::max<int64_t>({o.prefill_chunk, 64 + 3 + (o.dflash_container.empty() ? 0 : 16), vision_rows});
 }
 
 void GemmaModel::TpWarmup() {
   if (comm_ == nullptr) throw std::logic_error("GemmaModel::TpWarmup: only a tensor-parallel rank (tp_world > 1) warms up");
-  if (max_ctx_ < WarmupPositions(opts_)) {
+  const int64_t warm_positions = WarmupPositions(opts_, container_.HasVision());
+  if (max_ctx_ < warm_positions) {
     throw std::invalid_argument("GemmaModel::TpWarmup: max_ctx " + std::to_string(max_ctx_) + " < " +
-                                std::to_string(WarmupPositions(opts_)) + " warm-up positions");
+                                std::to_string(warm_positions) + " warm-up positions");
   }
   // A full-width chunk first: the first launch of the M = 256 GEMMs at this rank's shard shapes, the sliced 85-row
   // all-reduces per collective site and the 256-row activations must not meet their first touch inside a request. Fixed ids
@@ -1025,6 +1054,23 @@ void GemmaModel::TpWarmup() {
   };
   (void)Prefill(ids(max_chunk_));
   Reset();
+  if (container_.HasVision()) {
+    // One full-width image block (4 text rows + 280 soft tokens, the processor's maximum): the 288-row chunk's GEMM / sliced
+    // all-reduce shapes, the klimit_ext sliding-attention path and the host-row splice, all first-use otherwise. Zero rows
+    // (a lockstep collective: every rank feeds the same ones).
+    constexpr int64_t kWarmImageTokens = 280, kWarmTextRows = 4;
+    std::vector<int32_t> toks = ids(kWarmTextRows);
+    toks.insert(toks.end(), static_cast<size_t>(kWarmImageTokens), static_cast<int32_t>(container_.Info().image_token_id));
+    const std::vector<uint16_t> zero_rows(static_cast<size_t>(kWarmImageTokens * container_.Config().hidden_size), 0);
+    ImageSpan sp;
+    sp.offset = kWarmTextRows;
+    sp.tokens = kWarmImageTokens;
+    sp.grid = vision::GridThw{1, 1, kWarmImageTokens};
+    sp.embeds = zero_rows.data();
+    sp.embeds_on_host = true;
+    (void)PrefillMultimodal(toks, {sp});
+    Reset();
+  }
   (void)Prefill(ids(64));
   (void)DecodeStepGreedy(0);                       // channel 0 all-reduces + the greedy pair merge
   kernels::SampleParams sp;                         // temperature 1: the summary path and its merge

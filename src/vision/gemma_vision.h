@@ -75,6 +75,13 @@ struct ImageBlock {
 // Blocks of a token vector: maximal runs of `image_token_id`. Positions are indices into `tokens` + base.
 std::vector<ImageBlock> FindImageBlocks(const std::vector<int32_t>& tokens, int32_t image_token_id, int64_t base = 0);
 
+// Facade-side validation of a multimodal call (pure CPU, so a TP facade rejects a client error before any rank command
+// runs). Throws std::invalid_argument when `tokens` is empty, a block is empty, longer than `max_block`, out of order /
+// overlapping or outside [0, tokens.size()], or the maximal image_token_id runs of `tokens` are not exactly `blocks`.
+void CheckImageSpans(const std::vector<int32_t>& tokens, int32_t image_token_id, const std::vector<ImageBlock>& blocks,
+                     int64_t max_block);
+// Audio: `tokens` non-empty and every [start, end) non-empty and inside [0, total].
+void CheckAudioSpans(int64_t total, const std::vector<ImageBlock>& blocks);
 // One prefill chunk: rows [start, start + len) of the call's token vector (relative indices).
 struct PrefillChunk {
   int64_t start = 0;

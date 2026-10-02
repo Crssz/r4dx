@@ -143,12 +143,9 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
                                   "rank's options itself");
     }
   }
-  // DFlash and vision are TP=1-only for Gemma 4 (this facade's DFlash methods throw and HasVision() is false). Refuse
-  // them here: MakeGemmaModelOptions forwards both, and every rank would otherwise load a drafter / the vision tensors
-  // it can never use and fail per request instead of at load.
-  if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0) {
-    throw std::invalid_argument("GemmaTpModel::Load: DFlash is not available for Gemma 4 under --tp 2 (use --tp 1)");
-  }
+  // DFlash is supported (the drafter is replicated per rank, GemmaModel merges the vocab-split results); vision is still
+  // TP=1-only (HasVision() is false here): refuse it at load rather than per request.
+  // (GemmaModel::Load validates the container / dflash_draft_k pair on every rank.)
   if (opts.vision == ModelOptions::VisionMode::kOn) {
     throw std::invalid_argument("GemmaTpModel::Load: vision is not available for Gemma 4 under --tp 2 (use --tp 1)");
   }
@@ -253,6 +250,13 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   };
   std::vector<Caps> caps(static_cast<size_t>(n_slots));
   ModelConfig rank0_global_config;
+
+  // The drafter's two selector codebooks, read ONCE here on the facade thread (no HIP call) and shared by both ranks'
+  // drafters (the Qwen path's way, tp_model.cpp step 6). Declared before `m` like every load-closure capture (N53).
+  std::shared_ptr<const DflashHostCodebooks> dflash_codebooks;
+  if (!g.dflash_container.empty()) dflash_codebooks = DflashDraft::LoadHostCodebooks(g.dflash_container);
+  g.dflash_codebooks = dflash_codebooks;
+  std::vector<char> rank_dflash(static_cast<size_t>(n_slots), 0);
 
   std::unique_ptr<GemmaTpModel> m(new GemmaTpModel());
   m->gopts_ = g;
@@ -412,6 +416,7 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
            c.layers = mm.GetContainer().NumLoadedLayers();
            c.vocab = mm.Config().vocab_size;
            c.hidden = mm.Config().hidden_size;
+           rank_dflash[static_cast<size_t>(s.index)] = mm.DflashEnabled() ? 1 : 0;
            if (s.index == 0) rank0_global_config = mm.GetContainer().GenericConfig();
          },
          CmdKind::kPlain, kNoStall);
@@ -423,6 +428,13 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
       throw core::TpDivergenceError("GemmaTpModel::Load: the ranks disagree on the loaded model's identity");
     }
   }
+  for (size_t i = 1; i < rank_dflash.size(); ++i) {
+    if (rank_dflash[i] != rank_dflash[0]) {
+      throw core::TpDivergenceError("GemmaTpModel::Load: the ranks disagree on whether the DFlash drafter is loaded");
+    }
+  }
+  m->dflash_enabled_ = rank_dflash[0] != 0;
+  m->dflash_injection_ = true;  // the GemmaModel default
   m->model_id_ = caps[0].id;
   m->image_token_id_ = caps[0].image_token;
   m->num_loaded_layers_ = caps[0].layers;
@@ -656,7 +668,14 @@ void GemmaTpModel::Recover() {
 void GemmaTpModel::Reset() {
   if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
   // GemmaModel::Reset on every rank (no collectives).
-  const auto reset_ranks = [this] { RunAll([](GemmaModel& m, int) { m.Reset(); }); };
+  // GemmaModel::Reset on every rank (no collectives) and the cached DFlash injection policy (docs/tp.md 8.4's rule).
+  const bool inject = dflash_injection_;
+  const auto reset_ranks = [this, inject] {
+    RunAll([inject](GemmaModel& m, int) {
+      m.Reset();
+      m.SetDflashInjectionEnabled(inject);
+    });
+  };
   if (state_ == State::kNeedsRecovery) {
     try {
       Recover();
@@ -802,12 +821,40 @@ std::vector<int32_t> GemmaTpModel::DecodeStepMtpSampled(int32_t, int64_t, const 
                                                         std::mt19937_64&) {
   throw std::runtime_error("GemmaTpModel: MTP is not available for Gemma 4 (the container carries no mtp.* head)");
 }
-std::vector<int32_t> GemmaTpModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
-  throw std::runtime_error("GemmaTpModel: DFlash is not wired for Gemma 4 yet (drafter track D-6)");
+std::vector<int32_t> GemmaTpModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                          int64_t* walk_len_out) {
+  RequireReady();
+  if (!dflash_enabled_) throw std::runtime_error("GemmaTpModel::DecodeStepDflash{Greedy,Sampled}: DFlash is not enabled on this model");
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, p_min, n_min, walks](GemmaModel& m, int slot) {
+    return m.DecodeStepDflashGreedy(token_id, k, p_min, n_min, &(*walks)[static_cast<size_t>(slot)]);
+  });
+  RequireAllEqual(r, "DecodeStepDflashGreedy round");
+  RequireAllEqual(*walks, "DecodeStepDflashGreedy walk_len");
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return std::move(r[0]);
 }
-std::vector<int32_t> GemmaTpModel::DecodeStepDflashSampled(int32_t, int64_t, float, int64_t,
-                                                           const kernels::SampleParams&, std::mt19937_64&, int64_t*) {
-  throw std::runtime_error("GemmaTpModel: DFlash is not wired for Gemma 4 yet (drafter track D-6)");
+
+std::vector<int32_t> GemmaTpModel::DecodeStepDflashSampled(int32_t token_id, int64_t k, float p_min, int64_t n_min,
+                                                           const kernels::SampleParams& params, std::mt19937_64& rng,
+                                                           int64_t* walk_len_out) {
+  RequireReady();
+  if (!dflash_enabled_) throw std::runtime_error("GemmaTpModel::DecodeStepDflash{Greedy,Sampled}: DFlash is not enabled on this model");
+  // GemmaModel falls back to one plain sampled step for temperature > 0 (same as TP=1); every rank draws from its own copy of
+  // the caller's generator and the copies must end in the same state.
+  auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
+  auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
+  std::vector<std::vector<int32_t>> r =
+      RunCollective([token_id, k, p_min, n_min, params, rngs, walks](GemmaModel& m, int slot) {
+        return m.DecodeStepDflashSampled(token_id, k, p_min, n_min, params, (*rngs)[static_cast<size_t>(slot)],
+                                         &(*walks)[static_cast<size_t>(slot)]);
+      });
+  RequireAllEqual(r, "DecodeStepDflashSampled round");
+  RequireAllEqual(*walks, "DecodeStepDflashSampled walk_len");
+  RequireRngsEqual(*rngs, "DecodeStepDflashSampled");
+  rng = (*rngs)[0];
+  if (walk_len_out != nullptr) *walk_len_out = (*walks)[0];
+  return std::move(r[0]);
 }
 
 StepProfile GemmaTpModel::DecodeStepProfiled(int32_t) {

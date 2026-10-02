@@ -13,6 +13,8 @@
   A byte mismatch is not automatically a bug: verify rows use a different GEMM shape than single-row decode (the
   docs/mtp.md / tools/validate_dflash.ps1 precedent). Read the diff position: one token flipping to a coherent
   continuation is the near-tie signature; dropped / duplicated / garbage tokens are a bookkeeping bug.
+  -Tp 2 runs both arms under tensor parallelism (--tp 2 --tp-mode real, both GPUs); the DFlash arm must stay byte-identical
+  to the plain TP=2 arm (docs/tp.md, Gemma DFlash under TP).
   A/B knobs: -LayerOffset 0 reconverts with --dflash-target-layer-offset 0; -EmbedScale takes a list (default 1,62: both arms; set via R4DX_DFLASH_EMBED_SCALE).
 #>
 [CmdletBinding()]
@@ -31,7 +33,8 @@ param(
     "Explain how a hash map handles collisions, with a short Python example.",
     "Write a C++ function that reverses a singly linked list and explain its complexity.",
     "Summarise the causes of the French Revolution in five bullet points."),
-  [ValidateSet(0, 1)][int]$Device = 1,  # HIP device for the GPU step
+  [ValidateSet(0, 1)][int]$Device = 1,  # HIP device for the GPU step (TP=1 only; ignored with -Tp 2)
+  [ValidateSet(1, 2)][int]$Tp = 1,       # 2: r4dx-cli --tp 2 --tp-mode real on BOTH GPUs (no HIP_VISIBLE_DEVICES restriction)
   [switch]$RunGpu
 )
 $ErrorActionPreference = "Stop"
@@ -49,6 +52,9 @@ Write-Output "[ab] drafter container: $Out (layer offset $LayerOffset, embed sca
 # PowerShell 5.1 turns a native program's stderr lines (r4dx-cli's load log) into terminating errors under "Stop".
 $ErrorActionPreference = "Continue"
 $common = @("--model", $Model, "--layout", $Layout, "--temperature", "0", "--max-tokens", "$MaxTokens", "--stats")  # --prompt is a one-shot chat turn
+if ($Tp -eq 2) { $common += @("--tp", "2", "--tp-mode", "real") }
+# TP=1 pins one device; TP=2 needs both visible, so HIP_VISIBLE_DEVICES is left unset (cleared below if inherited).
+$pin = if ($Tp -eq 2) { "" } else { "`$env:HIP_VISIBLE_DEVICES='$Device'; " }
 $i = 0
 foreach ($p in $Prompts) {
   $i++
@@ -56,13 +62,13 @@ foreach ($p in $Prompts) {
   $spec = @($common + @("--prompt", $p, "--dflash", $Out, "--dflash-k", "$K"))
   if (-not $RunGpu) {
     Write-Output "[ab] prompt $i (GPU, not run; pass -RunGpu):"
-    Write-Output ("  `$env:HIP_VISIBLE_DEVICES='$Device'; $Cli " + ($plain -join " "))
+    Write-Output ("  $pin$Cli " + ($plain -join " "))
     foreach ($sc in $EmbedScale) {
-      Write-Output ("  `$env:HIP_VISIBLE_DEVICES='$Device'; `$env:R4DX_DFLASH_EMBED_SCALE='$sc'; $Cli " + ($spec -join " "))
+      Write-Output ("  $pin`$env:R4DX_DFLASH_EMBED_SCALE='$sc'; $Cli " + ($spec -join " "))
     }
     continue
   }
-  $env:HIP_VISIBLE_DEVICES = "$Device"
+  if ($Tp -eq 2) { Remove-Item Env:\HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue } else { $env:HIP_VISIBLE_DEVICES = "$Device" }
   $a = & $Cli @plain 2>$null
   $ha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(($a -join "`n")))).Replace("-", "")
   foreach ($sc in $EmbedScale) {

@@ -1145,3 +1145,23 @@ Decisions and findings recorded while building it:
   commit are reported stale by a new `quantize-model` run; their manifests still mix and import.
 - **Runtime still open for the gate stage:** the Gemma loader must accept a rotated trellis container (M1-31) and the
   trellis GEMM must be built for K=3840/15360 (M1-29); the converter side and the container are ready first.
+
+## 13. DFlash under TP=2 (branch g4-dflash-tp2)
+
+Gemma DFlash (D-6/D-7) now runs under `--tp 2`, mirroring the Qwen design of docs/tp.md 8.2 (details: tp.md section 13).
+
+- `GemmaModel` is the rank: the converted DFlash v1 drafter loads on every rank (replicated, one shared host copy of the
+  codebooks); the feature capture is replicated (the residual is rebuilt identically on both ranks), so both drafters inject
+  the same rows. The draft head runs on the rank's lm_head slice and `DraftRound` merges the per-rank top-16s on the host
+  (exact, the kernel's total order, so with the zero selector the walk is the same per-position argmax as TP=1).
+- `VerifyWindow` under TP: per-row `r4dx_argmax_val_f32` over the rank's 131072 rows, one host all-gather, `tp::MergeArgmaxRows`
+  (lowest global id on ties, as `r4dx_argmax_f32`); `RequireNotTp` is gone from it. The verify buffers are sized by the
+  rank's vocab slice (`vocab_local_`, == vocab_size at TP=1, so TP=1 is unchanged).
+- `GemmaTpModel` accepts `--dflash` (vision stays refused), forwards `DecodeStepDflash*` through `RunCollective` with result /
+  `walk_len` comparison, caches `DflashEnabled()`, applies `SetDflashInjectionEnabled` per command and after Reset / recovery.
+  `TpWarmup` ends with one DFlash round. Sampled requests take a plain sampled step, as at TP=1.
+- `tools/gemma_dflash_ab.ps1 -Tp 2` prints / runs the A/B with `--tp 2 --tp-mode real` on both GPUs.
+- **Gates (GPU, not yet run):** `test_gemma_dflash_tp` (`R4DX_TP2GPU=1`, label tp2gpu): TP=2 DFlash byte-identical to TP=2
+  plain greedy; tokens/round within 5% of TP=1 DFlash; TP=2 vs TP=1 DFlash divergence position reported (a near-tie flip is
+  expected at most, the TP=2 vs TP=1 plain numerics already differ). Speed is a measurement, not a gate: per round the TP
+  path adds two small host exchanges (draft top-16, verify pairs) on top of the 48-layer all-reduces of the verify window.

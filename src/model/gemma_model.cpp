@@ -220,6 +220,9 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
       throw std::runtime_error("GemmaModel::Load: dflash container vocab_size " + std::to_string(dc.vocab_size) +
                                " != the target's " + std::to_string(cfg.vocab_size) + " (it shares the target embedding)");
     }
+    if (opts.dflash_draft_k > 15) {
+      throw std::invalid_argument("GemmaModel::Load: dflash_draft_k must be <= 15 (the verify window is k + 1 <= 16 rows)");
+    }
     if (opts.dflash_draft_k > dc.block_size - 1) {
       throw std::invalid_argument("GemmaModel::Load: dflash_draft_k " + std::to_string(opts.dflash_draft_k) +
                                   " exceeds the drafter's block_size - 1 = " + std::to_string(dc.block_size - 1));
@@ -236,7 +239,15 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
     d.container_path = opts.dflash_container;
     d.layout = LayoutFromName(dc.layout);
     d.max_inject_rows = 64;
-    d.lm_head_vocab = cfg.vocab_size;
+    // The TARGET lm_head's rows: the whole vocabulary at TP=1, this rank's slice under TP, where the drafter merges its
+    // per-rank top-16s with the peer's (docs/tp.md 8.2) -- exactly Model::Load's wiring.
+    d.lm_head_vocab = m.vocab_local_;
+    if (is_tp) {
+      d.vocab_offset = m.vocab_offset_;
+      d.global_vocab = cfg.vocab_size;
+      d.comm = m.comm_;
+      d.shared_codebooks = opts.dflash_codebooks;
+    }
     m.dflash_ = DflashDraft::Load(d);
     m.dflash_draft_k_ = opts.dflash_draft_k;
     m.dflash_embed_scale_ = dc.embed_scale;
@@ -639,7 +650,7 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
 
   // ---- verify window: final norm + lm_head + softcap + argmax on EVERY row (VerifyWindow) ---------------------------
   if (verify_argmax != nullptr) {
-    const int64_t vocab = cfg.vocab_size;
+    const int64_t vocab = vocab_local_;  // this rank's lm_head rows (== vocab_size at TP=1)
     uint16_t* xn = arena_.Alloc<uint16_t>(static_cast<size_t>(T * hidden), 16);
     uint16_t* logits_bf16 = arena_.Alloc<uint16_t>(static_cast<size_t>(T * vocab), 16);
     plain_norm(cur, container_.FinalNorm().data(), xn);  // T rows
@@ -651,7 +662,13 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
       r4dx_model_widen_bf16_to_f32(P(logits_bf16), P(verify_logits_dev_.data()), T * vocab, s);
     }
     for (int64_t t = 0; t < T; ++t) {
-      r4dx_argmax_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_argmax_dev_.data() + t), vocab, s);
+      if (comm_ != nullptr) {
+        // TP: argmax this rank's slice of row t keeping the winning value; MergeVerifyPairs merges across ranks below.
+        r4dx_argmax_val_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_pair_dev_.data() + 2 * t),
+                            P(verify_pair_dev_.data() + 2 * t + 1), vocab, s);
+      } else {
+        r4dx_argmax_f32(P(verify_logits_dev_.data() + t * vocab), P(verify_argmax_dev_.data() + t), vocab, s);
+      }
     }
     arena_.Reset();
   }
@@ -713,7 +730,11 @@ std::vector<float> GemmaModel::RunChunk(const std::vector<int32_t>& token_ids, b
   }
   if (verify_argmax != nullptr) {
     verify_argmax->resize(static_cast<size_t>(T));
-    verify_argmax_dev_.CopyToHost(verify_argmax->data(), static_cast<size_t>(T));
+    if (comm_ != nullptr) {
+      MergeVerifyPairs(T, verify_argmax);  // collective: every rank reaches here with the same T
+    } else {
+      verify_argmax_dev_.CopyToHost(verify_argmax->data(), static_cast<size_t>(T));
+    }
   }
   if (capture) {
     feature_rows_ = T;
@@ -941,6 +962,27 @@ int32_t GemmaModel::MergeGreedyPair() {
   return tp::MergeArgmax(all.data(), comm_->World());
 }
 
+void GemmaModel::MergeVerifyPairs(int64_t rows, std::vector<int32_t>* out) {
+  static_assert(sizeof(tp::ArgmaxPair) == 8, "8 B per greedy row (docs/tp.md 7.3)");
+  if (rows < 1 || rows > 16) throw std::logic_error("GemmaModel::MergeVerifyPairs: 1..16 rows");
+  std::array<tp::ArgmaxPair, 16> mine{};
+  R4DX_HIP_CHECK(hipMemcpy(mine.data(), verify_pair_dev_.data(), static_cast<size_t>(rows) * sizeof(tp::ArgmaxPair),
+                           hipMemcpyDeviceToHost));
+  for (int64_t t = 0; t < rows; ++t) mine[static_cast<size_t>(t)].idx += static_cast<int32_t>(vocab_offset_);  // local -> global
+  const int world = comm_->World();
+  std::array<tp::ArgmaxPair, 32> all{};  // [world <= 2][16]: every rank contributes a fixed 16-pair block
+  comm_->HostAllGather(mine.data(), mine.size() * sizeof(tp::ArgmaxPair), all.data());
+  // Repack to [world][rows] (the gathered blocks are 16 wide) and merge each row exactly (lowest global id on ties).
+  std::array<tp::ArgmaxPair, 32> packed{};
+  for (int r = 0; r < world; ++r) {
+    for (int64_t t = 0; t < rows; ++t) {
+      packed[static_cast<size_t>(r * rows + t)] = all[static_cast<size_t>(r * 16 + t)];
+    }
+  }
+  out->resize(static_cast<size_t>(rows));
+  tp::MergeArgmaxRows(packed.data(), world, static_cast<int>(rows), out->data());
+}
+
 void GemmaModel::MergeSummary(kernels::RowSummary* out) {
   static_assert(std::is_trivially_copyable_v<kernels::RowSummary>,
                 "row summaries cross the host exchange as raw bytes (same process, same layout)");
@@ -963,7 +1005,8 @@ void GemmaModel::GatherVocabRow(std::vector<float>* full) {
 
 int64_t GemmaModel::WarmupPositions(const GemmaModelOptions& o) {
   // TpWarmup: one full chunk, then (after a Reset) a 64-row chunk and three decode steps.
-  return std::max<int64_t>(o.prefill_chunk, 64 + 3);
+  // With a drafter, one more greedy DFlash round (a draft + a 16-row verify window) runs after them.
+  return std::max<int64_t>(o.prefill_chunk, 64 + 3 + (o.dflash_container.empty() ? 0 : 16));
 }
 
 void GemmaModel::TpWarmup() {
@@ -988,6 +1031,11 @@ void GemmaModel::TpWarmup() {
   std::mt19937_64 rng(0x7e57);
   (void)DecodeStepSampled(1, sp, rng);
   (void)DecodeStep(2);                              // the full-row gather
+  if (dflash_.has_value()) {
+    // The drafter's first-use kernels, the per-round top-16 host merge and the verify window's pair merge (the mirror of
+    // Model::TpWarmup's DFlash round); n_min 0 so the walk always drafts dflash_draft_k_ tokens.
+    (void)DecodeStepDflashGreedy(3, dflash_draft_k_, /*p_min=*/0.0f, /*n_min=*/0);
+  }
   Reset();
 }
 
@@ -1070,13 +1118,14 @@ void GemmaModel::SetDflashInjectionEnabled(bool enabled) { dflash_injection_enab
 
 std::vector<int32_t> GemmaModel::VerifyWindow(const std::vector<int32_t>& candidates) {
   const int64_t W = static_cast<int64_t>(candidates.size());
-  RequireNotTp("VerifyWindow");  // the verify window's per-row argmax is a LOCAL-vocab argmax under TP
+  // Under TP the per-row argmax is over this rank's vocab slice; RunChunk merges it across ranks (MergeVerifyPairs).
   if (W < 1 || W > 16) throw std::invalid_argument("GemmaModel::VerifyWindow: 1..16 candidates");
   if (W > max_chunk_) throw std::invalid_argument("GemmaModel::VerifyWindow: window exceeds prefill_chunk");
-  const int64_t vocab = container_.Config().vocab_size;
+  const int64_t vocab = vocab_local_;
   if (verify_logits_dev_.size() < static_cast<size_t>(16 * vocab)) {
     verify_logits_dev_.Resize(static_cast<size_t>(16 * vocab));
     verify_argmax_dev_.Resize(16);
+    verify_pair_dev_.Resize(32);
   }
   std::vector<int32_t> argmax;
   RunChunk(candidates, /*want_logits=*/false, nullptr, nullptr, nullptr, /*is_prefill=*/false, /*vision=*/nullptr,

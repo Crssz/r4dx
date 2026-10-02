@@ -505,6 +505,8 @@ void TestTpFlags() {
   CHECK(!TpThrows({"--tp", "2", "--vision", "on"}));
   CHECK(!TpThrows({"--tp", "2", "--image", "a.png"}));
   CHECK(!TpThrows({"--tp", "2", "--tp-mode", "emulate", "--vision", "auto"}));
+  // Gemma vision (+ DFlash) under TP: image rows are spliced on both ranks and injected into the drafter, no flag conflict.
+  CHECK(!TpThrows({"--tp", "2", "--vision", "on", "--dflash", "d.r4dx", "--dflash-k", "7", "--image", "a.png"}));
   // ... while the rules that hold at --tp 1 still hold at --tp 2.
   CHECK(TpThrows({"--tp", "2", "--mtp", "3", "--dflash", "d.r4dx"}));
   CHECK(TpThrows({"--tp", "2", "--dflash", "d.r4dx", "--dflash-k", "8"}));

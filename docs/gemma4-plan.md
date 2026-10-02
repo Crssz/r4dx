@@ -1157,7 +1157,7 @@ Gemma DFlash (D-6/D-7) now runs under `--tp 2`, mirroring the Qwen design of doc
 - `VerifyWindow` under TP: per-row `r4dx_argmax_val_f32` over the rank's 131072 rows, one host all-gather, `tp::MergeArgmaxRows`
   (lowest global id on ties, as `r4dx_argmax_f32`); `RequireNotTp` is gone from it. The verify buffers are sized by the
   rank's vocab slice (`vocab_local_`, == vocab_size at TP=1, so TP=1 is unchanged).
-- `GemmaTpModel` accepts `--dflash` (vision stays refused), forwards `DecodeStepDflash*` through `RunCollective` with result /
+- `GemmaTpModel` accepts `--dflash`, forwards `DecodeStepDflash*` through `RunCollective` with result /
   `walk_len` comparison, caches `DflashEnabled()`, applies `SetDflashInjectionEnabled` per command and after Reset / recovery.
   `TpWarmup` ends with one DFlash round. Sampled requests take a plain sampled step, as at TP=1.
 - `tools/gemma_dflash_ab.ps1 -Tp 2` prints / runs the A/B with `--tp 2 --tp-mode real` on both GPUs.
@@ -1165,3 +1165,8 @@ Gemma DFlash (D-6/D-7) now runs under `--tp 2`, mirroring the Qwen design of doc
   plain greedy; tokens/round within 5% of TP=1 DFlash; TP=2 vs TP=1 DFlash divergence position reported (a near-tie flip is
   expected at most, the TP=2 vs TP=1 plain numerics already differ). Speed is a measurement, not a gate: per round the TP
   path adds two small host exchanges (draft top-16, verify pairs) on top of the 48-layer all-reduces of the verify window.
+- **Vision and audio under TP (branch g4-vision-tp2; GPU gate not yet run).** `GemmaTpModel` now accepts `--vision on|auto` and audio:
+  the embedder is loaded on every rank (buffer sizing), `EncodeImages` is a solo rank-0 command returning host rows (Qwen's
+  way), `PrefillMultimodal` / `PrefillAudio` broadcast one host copy that every rank splices (H2D), `klimit_ext` stays per rank on
+  the sliding layers, DFlash injection covers the image rows as at TP=1, `TpWarmup` warms one 280-token image block. Details:
+  docs/tp.md 13.1. Gate: `test_gemma_vision_tp` (`R4DX_TP2GPU=1`, label tp2gpu).

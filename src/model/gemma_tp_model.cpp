@@ -19,6 +19,8 @@
 #include "r4dx/core/error.hpp"
 #include "tp/tp_comm_noop.h"
 #include "tp/tp_submit.h"  // kMaxUnsplitDraftK
+#include "gemma_vision.h"  // vision::kGemmaMaxImageBlockTokens
+#include "vision_tower.h"  // vision::VisionEncodeStats
 
 // Thread names for the debugger / ETW (docs/tp.md 2.2: "r4dx-tp-rank<r>"), declared by hand rather than through
 // <windows.h> (same as tp_model.cpp).
@@ -144,12 +146,9 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
                                   "rank's options itself");
     }
   }
-  // DFlash is supported (the drafter is replicated per rank, GemmaModel merges the vocab-split results); vision is still
-  // TP=1-only (HasVision() is false here): refuse it at load rather than per request.
+  // DFlash is supported (the drafter is replicated per rank, GemmaModel merges the vocab-split results); so is vision
+  // (--vision on|auto: every rank loads the ~0.1 GB embedder, rank 0 encodes) and audio (host-side projection on the facade).
   // (GemmaModel::Load validates the container / dflash_draft_k pair on every rank.)
-  if (opts.vision == ModelOptions::VisionMode::kOn) {
-    throw std::invalid_argument("GemmaTpModel::Load: vision is not available for Gemma 4 under --tp 2 (use --tp 1)");
-  }
   // A TP verify window is never split into submission units, so it must stay decode-sized: at most 8 rows
   // (tp_submit.h kMaxUnsplitDraftK, docs/tp.md Appendix B N80; the CLI/server already cap --dflash-k at 7, this
   // covers direct ModelOptions callers). TpWarmup's full-k round is bounded by the same k.
@@ -161,7 +160,6 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   }
   // The Gemma option mapping (R4DX_GEMMA_* environment, MTP refused) -- the same one TP=1 runs.
   GemmaModelOptions g = MakeGemmaModelOptions(opts);
-  g.vision = GemmaVisionLoad::kOff;  // --vision auto: text only under TP
   const int64_t warmup_positions = GemmaModel::WarmupPositions(g);
   if (g.max_ctx > 0 && g.max_ctx < warmup_positions) {
     throw std::invalid_argument("GemmaTpModel::Load: --max-ctx must be at least " + std::to_string(warmup_positions) +
@@ -257,7 +255,13 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   struct Caps {
     std::string id;
     int64_t image_token = 0, layers = 0, vocab = 0, hidden = 0;
+    int64_t boi_token = 0, eoi_token = 0, vision_patch_dim = 0;
+    bool vision = false;
   };
+  // Audio (docs/gemma4-audio.md): the 4.9 MB projection is read once here, on the facade thread (CPU only, no HIP), and the
+  // embedder runs there too, exactly as LoadGemmaTextModel does at TP=1.
+  std::optional<audio::AudioEmbedder> audio_emb;
+  if (audio::ContainerHasAudio(opts.container_path)) audio_emb.emplace(audio::LoadAudioEmbedder(opts.container_path));
   std::vector<Caps> caps(static_cast<size_t>(n_slots));
   ModelConfig rank0_global_config;
 
@@ -426,6 +430,10 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
            c.layers = mm.GetContainer().NumLoadedLayers();
            c.vocab = mm.Config().vocab_size;
            c.hidden = mm.Config().hidden_size;
+           c.boi_token = mm.GetContainer().Info().boi_token_id;
+           c.eoi_token = mm.GetContainer().Info().eoi_token_id;
+           c.vision = mm.HasVision();
+           c.vision_patch_dim = c.vision ? mm.GetContainer().Vision().patch_dim : 0;
            rank_dflash[static_cast<size_t>(s.index)] = mm.DflashEnabled() ? 1 : 0;
            if (s.index == 0) rank0_global_config = mm.GetContainer().GenericConfig();
          },
@@ -434,7 +442,8 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   for (size_t i = 1; i < caps.size(); ++i) {
     const Caps &a = caps[0], &b = caps[i];
     if (a.id != b.id || a.image_token != b.image_token || a.layers != b.layers || a.vocab != b.vocab ||
-        a.hidden != b.hidden) {
+        a.hidden != b.hidden || a.boi_token != b.boi_token || a.eoi_token != b.eoi_token || a.vision != b.vision ||
+        a.vision_patch_dim != b.vision_patch_dim) {
       throw core::TpDivergenceError("GemmaTpModel::Load: the ranks disagree on the loaded model's identity");
     }
   }
@@ -447,6 +456,11 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   m->dflash_injection_ = true;  // the GemmaModel default
   m->model_id_ = caps[0].id;
   m->image_token_id_ = caps[0].image_token;
+  m->image_boi_token_id_ = caps[0].boi_token;
+  m->image_eoi_token_id_ = caps[0].eoi_token;
+  m->has_vision_ = caps[0].vision;
+  m->vision_patch_dim_ = caps[0].vision_patch_dim;
+  m->audio_ = std::move(audio_emb);
   m->num_loaded_layers_ = caps[0].layers;
   m->cached_position_ = 0;
   m->cached_fallback_rows_ = 0;
@@ -811,17 +825,148 @@ void GemmaTpModel::RunCollectiveForTest(const std::function<void(GemmaModel&, in
 
 // ---- unsupported features / profiling -----------------------------------------------------------
 
-void GemmaTpModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,
-                                vision::VisionEncodeStats*) {
-  throw std::runtime_error("GemmaTpModel::EncodeImages: Gemma 4 vision is not implemented yet (docs/gemma4-plan.md M2)");
+void GemmaTpModel::EncodeImages(const float* pixel_values, int64_t total_patches,
+                                const std::vector<vision::GridThw>& grids, ImageRows* out,
+                                vision::VisionEncodeStats* stats) {
+  RequireReady();
+  if (!has_vision_) {
+    throw std::runtime_error("GemmaTpModel::EncodeImages: this model has no vision embedder (the container carries no "
+                             "vision.* tensors, or it was loaded with --vision off)");
+  }
+  // Validated here, on the facade, so a bad request never reaches a rank: a failing command would put the group into
+  // kNeedsRecovery for what is only a client error. (GemmaModel::EncodeImages repeats the same checks.)
+  if (grids.empty() || pixel_values == nullptr || out == nullptr) {
+    throw std::invalid_argument("GemmaTpModel::EncodeImages: need pixel values, at least one grid and an output");
+  }
+  int64_t sum = 0;
+  for (const vision::GridThw& g : grids) {
+    const int64_t n = g.h * g.w;
+    if (g.t != 1 || g.h < 1 || g.w < 1) throw std::invalid_argument("GemmaTpModel::EncodeImages: bad grid");
+    if (n > vision::kGemmaMaxImageBlockTokens) {
+      throw std::invalid_argument("GemmaTpModel::EncodeImages: an image of " + std::to_string(n) + " soft tokens exceeds the " +
+                                  std::to_string(vision::kGemmaMaxImageBlockTokens) + "-token block limit");
+    }
+    sum += n;
+  }
+  if (sum != total_patches) {
+    throw std::invalid_argument("GemmaTpModel::EncodeImages: total_patches != sum of grid sizes");
+  }
+  // A SOLO command on rank 0 (docs/tp.md 8.3, as TpModel::EncodeImages): the embedder runs no all-reduce, so no heartbeat moves
+  // and the watchdog times the whole command with the long limit. Both ranks hold the same weights, so which rank encodes
+  // does not matter; the merged rows come back as pageable host bf16 (ImageRows::host) and every rank's PrefillMultimodal
+  // splices that one copy -- the ranks agree on the image rows by construction, with no comparison. The closure owns what it
+  // reads or writes (Appendix B N53).
+  struct EncodeState {
+    std::vector<float> pixels;
+    std::vector<vision::GridThw> grids;
+    std::vector<uint16_t> rows;
+    int64_t merged_tokens = 0;
+  };
+  auto st = std::make_shared<EncodeState>();
+  st->pixels.assign(pixel_values, pixel_values + total_patches * vision_patch_dim_);
+  st->grids = grids;
+  const auto t0 = std::chrono::steady_clock::now();
+  constexpr std::chrono::milliseconds kEncodeStallLimit{10 * 60 * 1000};
+  RunGuarded({0},
+             [st, total_patches](RankSlot& s) {
+               core::DeviceBuffer<uint16_t> dev;  // freed on this rank's thread
+               s.model->EncodeImages(st->pixels.data(), total_patches, st->grids, &dev);
+               st->rows.resize(dev.size());
+               if (!dev.empty()) dev.CopyToHost(st->rows.data(), dev.size());  // EncodeImages ended synchronized
+               st->merged_tokens = static_cast<int64_t>(dev.size()) / s.model->Config().hidden_size;
+             },
+             CmdKind::kPlain, std::max(stall_limit_, kEncodeStallLimit));
+  out->host = std::move(st->rows);
+  out->SetFilled(/*on_host=*/true, st->merged_tokens);
+  if (stats != nullptr) {
+    stats->total_patches = total_patches;
+    stats->merged_tokens = st->merged_tokens;
+    stats->num_segments = static_cast<int64_t>(grids.size());
+    stats->encode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  }
 }
+
+namespace {
+// The rows a multimodal / audio call splices, copied once into one heap block the rank closures co-own (Appendix B N53: a
+// rank still running after a watchdog stall must never read the caller's buffer).
+struct OwnedRows {
+  std::vector<uint16_t> data;
+  std::vector<size_t> at;  // start (in elements) of span i
+};
+}  // namespace
 
 std::vector<float> GemmaTpModel::PrefillMultimodal(const std::vector<int32_t>& token_ids,
                                                    const std::vector<ImageSpan>& images) {
-  if (!images.empty()) {
-    throw std::runtime_error("GemmaTpModel::PrefillMultimodal: Gemma 4 vision is not implemented yet (M2)");
+  if (images.empty()) return Prefill(token_ids);
+  if (!has_vision_) {
+    throw std::runtime_error("GemmaTpModel::PrefillMultimodal: image spans given but this model has no vision embedder");
   }
-  return Prefill(token_ids);
+  const int64_t hidden = global_config_.hidden_size;
+  auto owned = std::make_shared<OwnedRows>();
+  size_t total = 0;
+  for (const ImageSpan& sp : images) {
+    if (!sp.embeds_on_host) {
+      throw std::invalid_argument("GemmaTpModel::PrefillMultimodal: image rows must be host-resident under tensor "
+                                  "parallelism (ImageSpan::embeds_on_host, from GemmaTpModel::EncodeImages)");
+    }
+    if (sp.embeds == nullptr || sp.tokens <= 0) {
+      throw std::invalid_argument("GemmaTpModel::PrefillMultimodal: an image span has no rows");
+    }
+    owned->at.push_back(total);
+    total += static_cast<size_t>(sp.tokens * hidden);
+  }
+  owned->data.resize(total);
+  std::vector<ImageSpan> spans = images;
+  for (size_t i = 0; i < spans.size(); ++i) {
+    std::memcpy(owned->data.data() + owned->at[i], spans[i].embeds,
+                static_cast<size_t>(spans[i].tokens * hidden) * sizeof(uint16_t));
+    spans[i].embeds = owned->data.data() + owned->at[i];
+  }
+  std::vector<std::vector<float>> r =
+      RunCollective([ids = token_ids, spans = std::move(spans), owned](GemmaModel& m, int) {
+        (void)owned;  // co-owned: `spans` point into it
+        return m.PrefillMultimodal(ids, spans);
+      });
+  RequireAllEqual(r, "PrefillMultimodal logits");
+  return std::move(r[0]);
+}
+
+std::vector<uint16_t> GemmaTpModel::EncodeAudio(const float* frames, int64_t n) {
+  if (!audio_) {
+    throw std::runtime_error("GemmaTpModel::EncodeAudio: the container carries no audio projection (convert with --audio on)");
+  }
+  return audio_->Embed(frames, n);  // CPU, facade thread: no rank command, no group state involved
+}
+
+std::vector<float> GemmaTpModel::PrefillAudio(const std::vector<int32_t>& token_ids, const std::vector<AudioRowSpan>& spans) {
+  if (spans.empty()) return Prefill(token_ids);
+  if (!audio_) {
+    throw std::runtime_error("GemmaTpModel::PrefillAudio: the container carries no audio projection (convert with --audio on)");
+  }
+  const int64_t hidden = global_config_.hidden_size;
+  auto owned = std::make_shared<OwnedRows>();
+  size_t total = 0;
+  for (const AudioRowSpan& sp : spans) {
+    if (sp.rows == nullptr || sp.tokens <= 0) {
+      throw std::invalid_argument("GemmaTpModel::PrefillAudio: an audio span has no rows");
+    }
+    owned->at.push_back(total);
+    total += static_cast<size_t>(sp.tokens * hidden);
+  }
+  owned->data.resize(total);
+  std::vector<AudioRowSpan> own_spans = spans;
+  for (size_t i = 0; i < own_spans.size(); ++i) {
+    std::memcpy(owned->data.data() + owned->at[i], own_spans[i].rows,
+                static_cast<size_t>(own_spans[i].tokens * hidden) * sizeof(uint16_t));
+    own_spans[i].rows = owned->data.data() + owned->at[i];
+  }
+  std::vector<std::vector<float>> r =
+      RunCollective([ids = token_ids, own_spans = std::move(own_spans), owned](GemmaModel& m, int) {
+        (void)owned;
+        return m.PrefillAudio(ids, own_spans);
+      });
+  RequireAllEqual(r, "PrefillAudio logits");
+  return std::move(r[0]);
 }
 
 std::vector<int32_t> GemmaTpModel::DecodeStepMtpGreedy(int32_t, int64_t) {

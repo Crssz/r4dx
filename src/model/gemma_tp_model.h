@@ -31,7 +31,7 @@
 // the committed tokens / walk_len across ranks. The injection policy (SetDflashInjectionEnabled) is host-only state applied
 // per command and after Reset/recovery, as TpModel's.
 //
-// Not supported here (throws, naming the feature): MTP, vision (M2), profiling.
+// Vision and audio: see EncodeImages / EncodeAudio below. Not supported here (throws, naming the feature): MTP, profiling.
 //
 // This class deliberately duplicates the TpModel state machine instead of templating it (docs/gemma4-plan.md 3.8's
 // listed risk): TpModel (tp_model.h) is wired to Model and is untouched, so Qwen behaviour cannot change.
@@ -53,6 +53,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "audio_embed.h"  // src/audio
 #include "gemma_model.h"
 #include "model_config.h"
 #include "r4dx/core/stream.hpp"
@@ -83,8 +84,10 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
   const ModelConfig& Config() const override { return global_config_; }
   const std::string& ModelId() const override { return model_id_; }
   int64_t ImageTokenId() const override { return image_token_id_; }
-  int64_t VisionMergeSize() const override { return 2; }  // no vision until M2
-  bool HasVision() const override { return false; }
+  int64_t VisionMergeSize() const override { return 1; }  // the Gemma processor already merges 3x3 patches (as at TP=1)
+  bool HasVision() const override { return has_vision_; }
+  int64_t ImageBoiTokenId() const override { return image_boi_token_id_; }
+  int64_t ImageEoiTokenId() const override { return image_eoi_token_id_; }
   bool MtpEnabled() const override { return false; }
   bool MtpUsingReducedVocabDraft() const override { return false; }
   bool DflashEnabled() const override { return dflash_enabled_; }
@@ -102,8 +105,18 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
   void SaveCheckpoint() override;     // each rank D2D-copies its own sliding rings (needs ModelOptions::prompt_checkpoint)
   void RestoreCheckpoint() override;
 
+  // Vision (docs/tp.md Gemma section): EncodeImages is a SOLO command on rank 0 (Qwen's way: no TpComm, host rows out in
+  // ImageRows::host); every rank holds the ~0.1 GB embedder only so its chunk buffers fit a 288-row image block.
+  // PrefillMultimodal broadcasts the host rows (copied into a heap block the rank closures co-own) and every rank splices
+  // them with an H2D copy; the sliding-layer klimit_ext mask is built per rank from the same positions.
   void EncodeImages(const float* pixel_values, int64_t total_patches, const std::vector<vision::GridThw>& grids,
                     ImageRows* out, vision::VisionEncodeStats* stats = nullptr) override;
+
+  // Audio: the 640 -> 3840 projection runs on the CPU on the FACADE thread (HIP-free, as at TP=1); PrefillAudio broadcasts
+  // the host rows exactly like image rows.
+  bool HasAudio() const override { return audio_.has_value(); }
+  std::vector<uint16_t> EncodeAudio(const float* frames, int64_t n) override;
+  std::vector<float> PrefillAudio(const std::vector<int32_t>& token_ids, const std::vector<AudioRowSpan>& spans) override;
 
   // ---- forward: one collective command each; results compared across ranks ------------------------
   std::vector<float> Prefill(const std::vector<int32_t>& token_ids) override;
@@ -278,6 +291,10 @@ class GemmaTpModel final : public TextModel, public TpDiagnostics {
 
   std::string model_id_;
   int64_t image_token_id_ = -1;
+  int64_t image_boi_token_id_ = -1, image_eoi_token_id_ = -1;
+  bool has_vision_ = false;        // every rank loaded the vision embedder (cached at load)
+  int64_t vision_patch_dim_ = 0;   // 6912: floats per merged patch of EncodeImages' input
+  std::optional<audio::AudioEmbedder> audio_;  // facade-side, CPU
   int64_t num_loaded_layers_ = 0;
   int64_t cached_position_ = 0;
   int64_t cached_fallback_rows_ = 0;

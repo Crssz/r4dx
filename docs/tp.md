@@ -2051,11 +2051,43 @@ this section records only what DFlash adds, which mirrors section 8.2 / 8.4 exac
   and after `Reset()` / recovery (as `TpModel`). A sampled request on Gemma takes one plain sampled step (as TP=1).
 - **Warm-up.** `GemmaModel::TpWarmup` ends with one `DecodeStepDflashGreedy` round (k = draft_k, n_min 0), so the drafter's
   first-use kernels and both merges are touched under the relaxed all-reduce timeout, not inside a request.
-- **Still refused:** vision under `--tp 2` (kOn throws at load), MTP, profiling.
+- **Still refused:** MTP, profiling.
 - **Tests.** CPU: `test_tp_vocab_merge` (`MergeArgmaxRows` vs the full-row argmax, ties, the boundary ids half-1 / half, all
   -inf). GPU, two cards, written and not yet run: `test_gemma_dflash_tp` (TP=2 DFlash byte-identical to TP=2 plain greedy,
   acceptance within 5% of TP=1, sampled / injection-off / Reset lifecycle) and `tools/gemma_dflash_ab.ps1 -Tp 2 -RunGpu`.
 
+### 13.1 Vision and audio under TP
+
+Same approach as Qwen (section 8.3): the embedder is not sharded, the rows travel as host bf16.
+
+- **Weights.** `--vision on|auto` loads the ~0.1 GB Gemma embedder (`vision.*`: LayerNorm / Linear 6912->3840 / pos table /
+  Linear 3840x3840, all bf16) on EVERY rank, not only rank 0: `GemmaModel` sizes its per-chunk buffers (320 rows) and the
+  `klimit_ext` buffer from `HasVision()`, and a 288-row image block must be one chunk on both ranks. (Qwen's 0.92 GiB tower is
+  rank-0 only; replicating 0.1 GB is cheaper than a second flag.)
+- **EncodeImages** is a SOLO command on rank 0 (no TpComm, long watchdog limit, 10 min, as `TpModel::EncodeImages`): the merged
+  rows come back to pageable host memory (`ImageRows::host`, `embeds_on_host`). No cross-rank comparison is needed: every
+  rank splices that one copy, so they agree by construction. Grid / pixel validation runs on the facade first, so a bad
+  request does not flip the group to kNeedsRecovery.
+- **PrefillMultimodal** copies the rows into a heap block the rank closures co-own (N53) and runs `GemmaModel::PrefillMultimodal`
+  on every rank as one `RunCollective` command. Image spans are accepted as HOST rows under TP (device rows are still required
+  at TP=1, `GemmaModel::RunChunk`'s splice takes either): widen on the host for the fp32 residual, H2D, synchronize. Chunking,
+  bounded submission (`is_prefill = true`) and the bidirectional `klimit_ext` mask on the SLIDING layers only are per rank and
+  identical (the mask depends on positions, not heads); the full layers and decode stay causal. Logits are compared across ranks.
+- **DFlash + vision.** Unchanged: the feature capture covers every row of the (<= 320-row) chunk, image rows included, and the
+  rows are spliced identically on both ranks, so both drafters inject the same features.
+- **Audio.** The 640->3840 projection is CPU-only (`audio::AudioEmbedder`); `GemmaTpModel::Load` reads it once and
+  `EncodeAudio` runs on the facade thread (no rank command). `PrefillAudio` broadcasts the host rows like image rows
+  (`GemmaModel::PrefillAudio` splices per chunk) and compares the logits.
+- **Capabilities.** `HasVision()`, `HasAudio()`, `VisionMergeSize()` (1), `ImageBoiTokenId()` / `ImageEoiTokenId()`
+  match `GemmaLocalTextModel`; the ranks must agree on them at load. The server's `/v1/models` `input_modalities` and the
+  `image_url` / `input_audio` routes read them from the `TextModel` and need no TP-specific code.
+- **Warm-up.** With vision loaded, `TpWarmup` also runs one 4 + 280-row image block (zero rows) so the 288-row GEMM / all-reduce
+  shapes, the klimit path and the host splice are touched under the relaxed timeout (`WarmupPositions` then needs 284
+  positions).
+- **Tests.** GPU, two cards, written and not yet run: `test_gemma_vision_tp` (`R4DX_TP2GPU=1`): rows bitwise equal to TP=1,
+  multimodal / audio prefill logits cosine >= 0.9995 and KL <= 2e-3 vs TP=1, the first 8 greedy tokens identical, DFlash rounds
+  after an image == plain greedy (with `R4DX_GEMMA_VISION_TP_DRAFTER`). CPU: `test_cli_args` accepts `--tp 2 --vision on
+  --image` with `--dflash`.
 ## Appendix A -- file map
 
 New: `src/core/include/r4dx/core/tp_comm.hpp`, `tp_host_exchange.hpp`, `tp_alloc_guard.hpp`;

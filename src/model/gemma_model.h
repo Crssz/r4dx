@@ -246,7 +246,8 @@ class GemmaModel {
     struct Splice {
       int64_t row = 0;
       int64_t rows = 0;
-      const uint16_t* embeds = nullptr;  // device bf16 [rows, hidden]
+      const uint16_t* embeds = nullptr;  // device bf16 [rows, hidden] (host bf16 when `host`: TP, H2D splice)
+      bool host = false;
     };
     std::vector<Splice> splices;
     std::vector<int32_t> klimit_ext;  // [T] absolute key limit, -1 = causal

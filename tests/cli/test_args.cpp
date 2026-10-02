@@ -1,4 +1,4 @@
-// tests/cli/test_args.cpp -- pure CPU unit test for r4dx::cli::ParseArgs (src/cli/cli_args.h).
+﻿// tests/cli/test_args.cpp -- pure CPU unit test for r4dx::cli::ParseArgs (src/cli/cli_args.h).
 // No HIP device needed (registered as a plain CTest COMMAND, not ENVIRONMENT-gated to a device).
 #include <cstdio>
 #include <cstring>
@@ -319,6 +319,21 @@ void TestDflashFlags() {
       threw = true;
     }
     CHECK(threw);
+  }
+  {  // --tp 2 --dflash-k: 7 is the ceiling (a TP verify window is at most 8 rows, N80); 8 is refused
+    for (const char* k : {"7", "8"}) {
+      std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",
+                                           "--prompt", "hi",      "--dflash", "draft.r4dx",
+                                           "--dflash-k", k,       "--tp", "2"};
+      auto argv = ToArgv(storage);
+      bool threw = false;
+      try {
+        r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+      } catch (const r4dx::cli::CliUsageError&) {
+        threw = true;
+      }
+      CHECK(threw == (std::string(k) == "8"));
+    }
   }
   {  // --dflash-k 0 is also out of range with --dflash set
     std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "bf16",

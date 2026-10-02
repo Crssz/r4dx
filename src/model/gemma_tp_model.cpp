@@ -1,4 +1,4 @@
-#include "gemma_tp_model.h"
+﻿#include "gemma_tp_model.h"
 
 #include <hip/hip_runtime.h>
 
@@ -18,6 +18,7 @@
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 #include "tp/tp_comm_noop.h"
+#include "tp/tp_submit.h"  // kMaxUnsplitDraftK
 
 // Thread names for the debugger / ETW (docs/tp.md 2.2: "r4dx-tp-rank<r>"), declared by hand rather than through
 // <windows.h> (same as tp_model.cpp).
@@ -148,6 +149,15 @@ std::unique_ptr<GemmaTpModel> GemmaTpModel::Load(const ModelOptions& opts, const
   // (GemmaModel::Load validates the container / dflash_draft_k pair on every rank.)
   if (opts.vision == ModelOptions::VisionMode::kOn) {
     throw std::invalid_argument("GemmaTpModel::Load: vision is not available for Gemma 4 under --tp 2 (use --tp 1)");
+  }
+  // A TP verify window is never split into submission units, so it must stay decode-sized: at most 8 rows
+  // (tp_submit.h kMaxUnsplitDraftK, docs/tp.md Appendix B N80; the CLI/server already cap --dflash-k at 7, this
+  // covers direct ModelOptions callers). TpWarmup's full-k round is bounded by the same k.
+  if (!opts.dflash_container.empty() && opts.dflash_draft_k > tp::kMaxUnsplitDraftK) {
+    throw std::invalid_argument("GemmaTpModel::Load: dflash_draft_k must be at most " +
+                                std::to_string(tp::kMaxUnsplitDraftK) +
+                                " under tensor parallelism (verify windows of at most 8 rows), got " +
+                                std::to_string(opts.dflash_draft_k));
   }
   // The Gemma option mapping (R4DX_GEMMA_* environment, MTP refused) -- the same one TP=1 runs.
   GemmaModelOptions g = MakeGemmaModelOptions(opts);

@@ -60,6 +60,18 @@ set(R4DX_KERNEL_TESTS
   # both rates (plus run-to-run, ticket reset, a negative control and the refusal messages). Skips (77)
   # only without a HIP device; needs no golden data.
   test_trellis_m256
+  # Gemma 4 device pieces (docs/gemma4-plan.md 3.4 / 3.5, task M1-15; the GPU step is M1-16:
+  #   ctest -R "rope_proportional|rmsnorm_noscale|gelu_mul|postnorm|softcap|embed_scaled").
+  # CPU references live in gemma_ref.hpp; always-on GPU tests, no golden data.
+  test_rope_proportional
+  test_rmsnorm_noscale
+  test_gelu_mul
+  test_gemma_postnorm
+  test_embed_scaled
+  test_widen_softcap
+  # fp32-residual variants (GemmaModel R4DX_GEMMA_RESID=fp32): GPU tests written, NOT yet run.
+  test_gemma_resid_f32
+  test_rotate_residual_f32
 )
 
 foreach(t ${R4DX_KERNEL_TESTS})
@@ -114,7 +126,8 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
-                            test_trellis_m256.cpp
+                            test_trellis_m256.cpp test_rope_proportional.cpp
+                            test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
 # test_attn_gate_mul_hadamard's kernel lives in r4dx_model_attention (src/model/attention), not
@@ -126,11 +139,60 @@ target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 # ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
 target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
 
+# Gemma 4 stage-0 reference attention (docs/gemma4-plan.md 3.3, task M1-17; GPU step M1-18:
+# `ctest -R attn_ref_gemma`). The kernel lives in r4dx_model_attention (src/model/attention/src/
+# attn_ref.hip); the test also uses its SlidingKvCache / SlidingRingGeometry headers.
+add_executable(test_attn_ref_gemma test_attn_ref_gemma.cpp)
+target_link_libraries(test_attn_ref_gemma PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+add_test(NAME test_attn_ref_gemma COMMAND test_attn_ref_gemma)
+set_tests_properties(test_attn_ref_gemma PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+
+# libr4d's sliding-window attention (docs/gemma4-plan.md 3.3, task M1-32; the GPU step is
+# `ctest -R "attn_.*gqa2"`): r4d_attn_{prefill,decode}_h256_gqa2_fp8kv against the stage-0 reference
+# kernel above, on the same fp8 ring bytes (gemma_attn_fixture.hpp). Window 1024 on the 1536-token
+# ring past its wrap, verify windows, small windows, klimit_ext, refusals.
+foreach(t test_attn_prefill_gqa2 test_attn_decode_gqa2)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core)
+  add_test(NAME ${t} COMMAND ${t})
+  set_tests_properties(${t} PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
+endforeach()
+
+# Pure CPU (no HIP call, no kernel library): the sliding-window / ring arithmetic of
+# third_party/libr4d/r4d_attn_window.h and SlidingRingGeometry against brute force and a simulated
+# ring (task M1-17; M1-32's kernels call the same header). Plain add_test(): they always run.
+add_executable(test_attn_window_math test_attn_window_math.cpp)
+target_include_directories(test_attn_window_math PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d")
+add_test(NAME test_attn_window_math COMMAND test_attn_window_math)
+add_executable(test_ring_math test_ring_math.cpp)
+target_include_directories(test_ring_math PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+                           "${CMAKE_SOURCE_DIR}/src/model/attention/include")
+add_test(NAME test_ring_math COMMAND test_ring_math)
+# The verify-window lifecycle on the sliding ring (docs/gemma4-plan.md D-6): rejected rows need no rollback. CPU-only.
+add_executable(test_ring_verify_rollback test_ring_verify_rollback.cpp)
+target_include_directories(test_ring_verify_rollback PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d"
+                           "${CMAKE_SOURCE_DIR}/src/model/attention/include")
+add_test(NAME test_ring_verify_rollback COMMAND test_ring_verify_rollback)
+
+# test_widen_softcap: r4dx_model_widen_softcap_bf16_to_f32 lives in r4dx_model_kernels (model_kernels.hip).
+target_include_directories(test_widen_softcap PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
+target_link_libraries(test_widen_softcap PRIVATE r4dx_model_kernels)
+
+# test_rope_proportional_cpu: pure CPU (no HIP call, no kernel library) -- pins gemma_ref.hpp's HF
+# rope construction against the kernel's pair loop (the geometry r4dx_rope_proportional_bf16 runs).
+add_executable(test_rope_proportional_cpu test_rope_proportional_cpu.cpp)
+add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
+
 # test_rotation_ref_cpu: pure CPU (no HIP call, no kernel library) -- pins rotation_ref.hpp, the
 # fp64 reference the two tests above compare against, to the rotation contract's definitions
 # (dense Sylvester FWHT, the closed-form rows of Q, norms/inverses, TP K-slicing).
 add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
 add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
+
+# test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
+# rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.
+add_executable(test_gemma_resid_f32_cpu test_gemma_resid_f32_cpu.cpp)
+add_test(NAME test_gemma_resid_f32_cpu COMMAND test_gemma_resid_f32_cpu)
 
 # tool_sampler_bench: Milestone 6 S1 item 4 -- r4dx_topk_lse_f32's kernel time (hip events) and the
 # host cost of SampleFromSummary vs the full-vocab SampleCanonical/SampleLegacy per token. Prints

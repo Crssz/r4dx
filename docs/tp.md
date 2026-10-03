@@ -2026,6 +2026,72 @@ controls above. The pass rule itself is unchanged.
 
 ---
 
+## 13. Gemma 4 under TP (GemmaTpModel): DFlash
+
+`GemmaTpModel` (src/model/gemma_tp_model.{h,cpp}, docs/gemma4-plan.md M1b-1 and section 13) is the Gemma facade of sections 2.1-2.9;
+this section records only what DFlash adds, which mirrors section 8.2 / 8.4 exactly.
+
+- **Drafter replicated.** Every rank loads the whole converted DFlash v1 drafter (`GemmaModelOptions::dflash_container`);
+  the two selector codebooks are read once on the facade thread (`DflashDraft::LoadHostCodebooks`) and shared
+  (`GemmaModelOptions::dflash_codebooks`). The drafter is given the rank's lm_head slice (`lm_head_vocab` = 131072,
+  `vocab_offset`, `global_vocab`, `comm`), so `DraftRound` merges the per-rank top-16s (H7) under the kernel's own total
+  order; the Gemma softcap is applied to the merged 16 values (monotone, ids unchanged).
+- **Features replicated.** The captured residual rows are identical on both ranks: the fp32 (or bf16) residual is rebuilt on
+  every rank from the same all-reduced bf16 o_proj / down_proj outputs (a two-term sum is commutative, bit-identical on both
+  ranks), the un-rotation is deterministic. Both drafters therefore inject the same rows and their rings stay identical.
+- **Verify window.** `GemmaModel::VerifyWindow` runs the final norm + lm_head GEMM on every row against the rank's vocab slice,
+  `r4dx_argmax_val_f32` per row ({local idx, value}), then ONE host all-gather of up to 16 pairs per rank and
+  `tp::MergeArgmaxRows` (tp_vocab.h): the lowest global id wins ties, exactly `r4dx_argmax_f32`'s lowest-index semantics over
+  the full row (rank 0's ids are all below rank 1's, so rank 1 wins only with a strictly larger value). Every rank ends with
+  the same global ids, hence the same acceptance length, commit count and injection, with no further exchange. Commit /
+  ring rollback are per-rank bookkeeping in lockstep (the ring argument of docs/gemma4-plan.md D-6 is per rank: 1536 >= 1024 + 15).
+- **Facade.** `DecodeStepDflashGreedy/Sampled` are `RunCollective` commands; results and `walk_len` are compared across ranks
+  (`RequireAllEqual`), the sampled variant also the rngs. `DflashEnabled()` is cached from the ranks at load.
+  `SetDflashInjectionEnabled` is host-only policy stored on the facade, applied on every rank before each forward command
+  and after `Reset()` / recovery (as `TpModel`). A sampled request on Gemma takes one plain sampled step (as TP=1).
+- **Warm-up.** `GemmaModel::TpWarmup` ends with one `DecodeStepDflashGreedy` round (k = draft_k, n_min 0), so the drafter's
+  first-use kernels and both merges are touched under the relaxed all-reduce timeout, not inside a request.
+- **Still refused:** MTP, profiling.
+- **Tests.** CPU: `test_tp_vocab_merge` (`MergeArgmaxRows` vs the full-row argmax, ties, the boundary ids half-1 / half, all
+  -inf). GPU, two cards, written and not yet run: `test_gemma_dflash_tp` (TP=2 DFlash byte-identical to TP=2 plain greedy,
+  acceptance within 5% of TP=1, sampled / injection-off / Reset lifecycle) and `tools/gemma_dflash_ab.ps1 -Tp 2 -RunGpu`.
+
+### 13.1 Vision and audio under TP
+
+Same approach as Qwen (section 8.3): the embedder is not sharded, the rows travel as host bf16.
+
+- **Weights.** `--vision on|auto` loads the ~0.1 GB Gemma embedder (`vision.*`: LayerNorm / Linear 6912->3840 / pos table /
+  Linear 3840x3840, all bf16) on EVERY rank, not only rank 0: `GemmaModel` sizes its per-chunk buffers (320 rows) and the
+  `klimit_ext` buffer from `HasVision()`, and a 288-row image block must be one chunk on both ranks. (Qwen's 0.92 GiB tower is
+  rank-0 only; replicating 0.1 GB is cheaper than a second flag.)
+- **EncodeImages** is a SOLO command on rank 0 (no TpComm, long watchdog limit, 10 min, as `TpModel::EncodeImages`): the merged
+  rows come back to pageable host memory (`ImageRows::host`, `embeds_on_host`). No cross-rank comparison is needed: every
+  rank splices that one copy, so they agree by construction. Grid / pixel validation runs on the facade first, so a bad
+  request does not flip the group to kNeedsRecovery.
+- **PrefillMultimodal** copies the rows into a heap block the rank closures co-own (N53) and runs `GemmaModel::PrefillMultimodal`
+  on every rank as one `RunCollective` command. Image spans are accepted as HOST rows under TP (device rows are still required
+  at TP=1, `GemmaModel::RunChunk`'s splice takes either): widen on the host for the fp32 residual, H2D, synchronize. Chunking,
+  bounded submission (`is_prefill = true`) and the bidirectional `klimit_ext` mask on the SLIDING layers only are per rank and
+  identical (the mask depends on positions, not heads); the full layers and decode stay causal. Logits are compared across ranks.
+- **DFlash + vision.** Unchanged: the feature capture covers every row of the (<= 320-row) chunk, image rows included, and the
+  rows are spliced identically on both ranks, so both drafters inject the same features.
+- **Audio.** The 640->3840 projection is CPU-only (`audio::AudioEmbedder`); `GemmaTpModel::Load` reads it once and
+  `EncodeAudio` runs on the facade thread (no rank command). `PrefillAudio` broadcasts the host rows like image rows
+  (`GemmaModel::PrefillAudio` splices per chunk) and compares the logits.
+- **Capabilities.** `HasVision()`, `HasAudio()`, `VisionMergeSize()` (1), `ImageBoiTokenId()` / `ImageEoiTokenId()`
+  match `GemmaLocalTextModel`; the ranks must agree on them at load. The server's `/v1/models` `input_modalities` and the
+  `image_url` / `input_audio` routes read them from the `TextModel` and need no TP-specific code.
+- **Warm-up.** With vision loaded, `TpWarmup` also runs one 4 + 280-row image block (zero rows) so the 288-row GEMM / all-reduce
+  shapes, the klimit path and the host splice are touched under the relaxed timeout (`WarmupPositions` then needs 284
+  positions; only when the container really carries vision -- `--vision on` is checked at facade load, `auto` on a
+  text-only container pays no floor). The 288-row chunk needs no larger comm: `TpComm::AllReduceSumBf16Rows` slices any
+  row count into calls of at most `MaxAllReduceBytes()` (85 rows of the 3840-wide residual), independent of the chunk size.
+  `PrefillMultimodal` / `PrefillAudio` validate span order, bounds, the 288 limit and placeholder-run agreement on the facade
+  (`vision::CheckImageSpans` / `CheckAudioSpans`) so a client error never reaches a rank.
+- **Tests.** GPU, two cards, written and not yet run: `test_gemma_vision_tp` (`R4DX_TP2GPU=1`): rows bitwise equal to TP=1,
+  multimodal / audio prefill logits cosine >= 0.9995 and KL <= 2e-3 vs TP=1, the first 8 greedy tokens identical, DFlash rounds
+  after an image == plain greedy (with `R4DX_GEMMA_VISION_TP_DRAFTER`). CPU: `test_cli_args` accepts `--tp 2 --vision on
+  --image` with `--dflash`.
 ## Appendix A -- file map
 
 New: `src/core/include/r4dx/core/tp_comm.hpp`, `tp_host_exchange.hpp`, `tp_alloc_guard.hpp`;

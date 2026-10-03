@@ -16,6 +16,8 @@ add_library(r4dx_server_core STATIC
   sse.cpp
   response_sink.cpp
   tool_call_parser.cpp
+  gemma_tool_call_parser.cpp
+  dialect.cpp
   tool_stream_gate.cpp
   reasoning_splitter.cpp
   request_log.cpp
@@ -26,7 +28,7 @@ target_include_directories(r4dx_server_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # src/tokenizer/CMakeLists.txt). PUBLIC: openai_types.h (a public header of this target) includes
 # it, so consumers linking r4dx_server_core need this path too.
 target_include_directories(r4dx_server_core PUBLIC ${CMAKE_SOURCE_DIR}/third_party)
-target_link_libraries(r4dx_server_core PUBLIC r4dx_vision)
+target_link_libraries(r4dx_server_core PUBLIC r4dx_vision r4dx_audio)  # r4dx_audio: input_audio parts (docs/gemma4-audio.md)
 target_compile_features(r4dx_server_core PUBLIC cxx_std_17)
 
 if(R4DX_BUILD_SERVER)

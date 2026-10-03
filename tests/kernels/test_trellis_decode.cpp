@@ -530,6 +530,35 @@ void TestGoldens() {
   }
 }
 
+// Gemma 4 12B (docs/gemma4-plan.md 3.7, M1-29): the K it adds (hidden 3840, o_proj sliding 4096 and
+// full 8192, down 15360) at the narrow N its full-attention k has (512 = 4 128-groups) and at the
+// hidden N 3840 (30 groups, o / down), every k of the weight through one-hot calls, at the two
+// shapes the model's no-table fallback gives (4.4: the M <= 16 split tuning with SKG from
+// 128 / (N / 128), and the M > 16 unsplit MT 4 one) -- both rates.
+void TestGemmaShapes(std::mt19937_64& rng) {
+  const struct { int K, N; } shapes[] = {{3840, 512}, {4096, 512}, {8192, 512}, {15360, 512},
+                                          {4096, 3840}, {3840, 3840}};
+  int cases = 0;
+  for (int KB : {4, 5})
+    for (const auto& s : shapes) {
+      std::vector<uint32_t> words = RandomWords(rng, static_cast<size_t>(s.K / 16) * (s.N / 16) * 8 * KB);
+      std::vector<uint32_t> grid = trellis_ref::ToPairGrid(words, s.K, s.N, KB);
+      Gemm g(grid, trellis_ref::DecodePairGrid(grid, s.K, s.N, KB), s.K, s.N, KB);
+      int skg = std::max(1, std::min(4, 128 / (s.N / 128)));
+      int p = 1;
+      while (p * 2 <= skg) p *= 2;
+      skg = p;
+      while (skg > 1 && (s.K / 16) % (2 * skg * 2) != 0) skg /= 2;
+      const Tuning decode{4, 2, 1, 1, skg, 2, 1}, prefill{4, 2, 4, 1, 1, 2, 0};
+      for (const Tuning& t : {decode, prefill}) {
+        FullCoverage(g, t, false, s.N, "gemma K=" + std::to_string(s.K) + " N=" + std::to_string(s.N) +
+                                           " KB=" + std::to_string(KB));
+        ++cases;
+      }
+    }
+  std::printf("  gemma shapes: %d (K, N, KB, tuning) cases, every k, bit-exact\n", cases);
+}
+
 }  // namespace
 
 int main() {
@@ -542,6 +571,7 @@ int main() {
   TestRawFullCoverage(rng);
   TestRawSweep(rng);
   TestRawOrder(rng);
+  TestGemmaShapes(rng);
 
   const bool golden = GoldenAvailable();
   if (golden) {

@@ -105,6 +105,8 @@ void TestNonsensicalValuesThrow() {
       {"r4dx-server", "--model", "m.r4dx", "--default-min-p", "-0.1"},
       {"r4dx-server", "--model", "m.r4dx", "--default-top-k", "-5"},
       {"r4dx-server", "--model", "m.r4dx", "--log-level", "verbose"},
+      {"r4dx-server", "--model", "m.r4dx", "--dialect", "llama"},
+      {"r4dx-server", "--model", "m.r4dx", "--dialect", "Gemma4"},
   };
   for (auto storage : cases) {
     auto argv = ToArgv(storage);
@@ -115,6 +117,32 @@ void TestNonsensicalValuesThrow() {
       threw = true;
     }
     CHECK(threw);
+  }
+}
+
+// --dialect / --extended-ctx and the "was it given" markers main.cpp reads (docs/gemma4-plan.md 5.3 and
+// 9.1, task M1-14): the Qwen defaults stay exactly as before.
+void TestDialectAndContextFlags() {
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.dialect == "auto" && !a.tokenizer_dir_given && !a.max_ctx_given && !a.extended_ctx);
+    CHECK(a.tokenizer_dir == "D:\\models\\Huihui-Qwen3.8-27B-abliterated");
+    CHECK(a.max_ctx == 262144);
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "g.r4dx", "--dialect", "gemma4",
+                                        "--tokenizer-dir", "C:\\gtok", "--max-ctx", "65536", "--extended-ctx"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.dialect == "gemma4" && a.tokenizer_dir_given && a.tokenizer_dir == "C:\\gtok");
+    CHECK(a.max_ctx_given && a.max_ctx == 65536 && a.extended_ctx);
+  }
+  for (const char* d : {"auto", "qwen35", "gemma4"}) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--dialect", d};
+    auto argv = ToArgv(storage);
+    CHECK(r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data()).dialect == d);
   }
 }
 
@@ -393,6 +421,14 @@ void TestVisionFlags() {
   CHECK(rejects({"--image-max-pixels", "512"}));
   CHECK(rejects({"--image-max-pixels", "-4"}));
   CHECK(rejects({"--image-max-pixels", "big"}));
+  // Gemma 4 (docs/gemma4-plan.md M2): the soft-token budget; 560 / 1120 are valid processor budgets but exceed the
+  // 288-row image chunk, so the server refuses them.
+  CHECK(parse({}).image_soft_tokens == 280);
+  CHECK(parse({"--image-soft-tokens", "70"}).image_soft_tokens == 70);
+  CHECK(parse({"--image-soft-tokens", "140"}).image_soft_tokens == 140);
+  CHECK(rejects({"--image-soft-tokens", "560"}));
+  CHECK(rejects({"--image-soft-tokens", "100"}));
+  CHECK(rejects({"--image-soft-tokens", "many"}));
 }
 
 // --tp and --tp-* (docs/tp.md 9.1): the same flags, ranges and usage errors as r4dx-cli's, which
@@ -493,6 +529,7 @@ int main() {
   TestUnrecognizedFlagThrows();
   TestNonsensicalValuesThrow();
   TestUnparseableNumberThrowsServerUsageError();
+  TestDialectAndContextFlags();
   TestMtpHeadLayoutFlag();
   TestMtpDraftHeadFlag();
   TestEmbedDeviceResidentFlag();

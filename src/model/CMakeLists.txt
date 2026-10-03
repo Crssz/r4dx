@@ -84,6 +84,13 @@ add_library(r4dx_tp_shard STATIC tp/tp_shard.cpp)
 target_include_directories(r4dx_tp_shard PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                                 ${CMAKE_SOURCE_DIR}/third_party)
 
+# ---- r4dx_model_arch: DetectArch (arch.h) -- which model family a container holds ---------------
+# CPU-only like r4dx_tp_shard: it reads the safetensors-shell header and nothing else. LoadTextModel
+# (tp_model.cpp) calls it first; model_config.h carries the result as ModelConfig::arch. M1-1.
+add_library(r4dx_model_arch STATIC arch.cpp)
+target_include_directories(r4dx_model_arch PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+                                                  ${CMAKE_SOURCE_DIR}/third_party)
+
 # ---- r4dx_tp: the TpComm implementations (docs/tp.md 6.1, Appendix A) ----------------------------
 # NoopComm (tp/tp_comm_noop.cpp, docs/tp.md 6.4); P3: TpGroup (tp/tp_group.cpp -- the pinned host
 # mailbox, seq base, recovery) and HostMailboxComm (tp/tp_comm_host_mailbox.cpp -- the two-GPU
@@ -105,6 +112,16 @@ set_source_files_properties(tp/tp_group.cpp tp/tp_comm_host_mailbox.cpp tp/tp_co
 # ---- r4dx_model: the layer graph itself -------------------------------------------------------
 set(R4DX_MODEL_SOURCES
   container.cpp
+  # M1-19: helpers shared by Container::Load and GemmaContainer::Load (moved verbatim out of container.cpp).
+  container_load_util.cpp
+  # Gemma 4 (docs/gemma4-plan.md M1-19/M1-20): loader, GeGLU MLP, engine, TP=1 TextModel + the LoadGemmaTextModel dispatch.
+  gemma_container.cpp
+  gemma_vision_embedder.cpp
+  gemma_mlp.cpp
+  gemma_model.cpp
+  gemma_local_text_model.cpp
+  # M1b-1: the tensor-parallel (--tp 2) Gemma TextModel (rank threads + TpComm, docs/tp.md 2.1-2.9 specialised to GemmaModel).
+  gemma_tp_model.cpp
   gdn_layer.cpp
   mlp.cpp
   final_lm_head.cpp
@@ -133,11 +150,14 @@ foreach(lib r4dx_model r4dx_model_tptest)
     r4dx_convert   # header-only: SafetensorsReader (container.cpp) + nlohmann/json (model_config.h)
     # The vision tower (docs/vision.md): Container owns the loaded vision.* weights and Model owns
     # the VisionTower built on them, so the dependency edge runs src/model -> src/vision, never back.
+    # Gemma 4 audio (docs/gemma4-audio.md): the CPU embedder + container weight reader GemmaLocalTextModel uses.
+    r4dx_audio
     r4dx_vision_tower
     # Tensor parallel (docs/tp.md): the sharded Container::Load path plans every rank slice with
     # r4dx_tp_shard; Model reaches its communicator through r4dx_tp.
     r4dx_tp_shard
     r4dx_tp
+    r4dx_model_arch
   )
 endforeach()
 target_compile_definitions(r4dx_model_tptest PUBLIC R4DX_TP_TESTING=1)

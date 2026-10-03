@@ -24,6 +24,27 @@ target_compile_definitions(tokenizer_golden PRIVATE
 add_test(NAME tokenizer_golden COMMAND tokenizer_golden)
 set_tests_properties(tokenizer_golden PROPERTIES SKIP_RETURN_CODE 77)
 
+# Microbench + large-corpus HF agreement check; not a CTest test (needs a corpus written by
+# tools/tok_ref/bench_hf.py or check_hf_equiv.py --emit-jsonl). First measured numbers: header of bench_tokenizer.cpp.
+add_executable(bench_tokenizer bench_tokenizer.cpp)
+target_link_libraries(bench_tokenizer PRIVATE r4dx_tokenizer)
+
+# Model-free checks of the local minja patches + ChatTemplateOptions (Gemma 4 chat template needs them).
+add_executable(tokenizer_minja_patches test_minja_patches.cpp)
+target_link_libraries(tokenizer_minja_patches PRIVATE r4dx_tokenizer)
+add_test(NAME tokenizer_minja_patches COMMAND tokenizer_minja_patches)
+
+# Gemma 4 (SPM-style byte_fallback backend + Gemma chat template): the same executable replays
+# golden_gemma.json (tools/tok_ref/gen_golden_gemma.py) against the assembled tokenizer dir --
+# google/gemma-4-12B-it's tokenizer.json (identical in the Huihui repo), tokenizer_config.json,
+# chat_template.jinja, generation_config.json. Skipped (77) when the directory is absent.
+set(R4DX_GEMMA_TOKENIZER_DIR "D:/models/Huihui-gemma-4-12B-it-abliterated-tok" CACHE PATH
+    "Directory containing the Gemma 4 tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
+add_test(NAME tokenizer_golden_gemma
+         COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden_gemma.json
+                                  --model-dir ${R4DX_GEMMA_TOKENIZER_DIR})
+set_tests_properties(tokenizer_golden_gemma PROPERTIES SKIP_RETURN_CODE 77)
+
 if(NOT EXISTS "${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json")
   message(WARNING "tests/tokenizer: ${R4DX_TOKENIZER_MODEL_DIR}/tokenizer.json not found; "
                    "'tokenizer_golden' is registered but will report SKIPPED at run time. Set "

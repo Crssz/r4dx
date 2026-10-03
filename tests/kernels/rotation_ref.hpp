@@ -102,6 +102,94 @@ inline std::vector<double> ApplyQ(const std::vector<double>& x, const float* d, 
   return y;
 }
 
+// ---- any hidden = nblk * block (Gemma 4: 3840 = 15 x 256) ------------------------------------------
+// The converter's block rule: the largest power of two dividing hidden, capped at 1024.
+inline int64_t ChooseBlock(int64_t hidden) {
+  const int64_t low = hidden & -hidden;
+  return low < 1024 ? low : 1024;
+}
+
+// x Q / x Q^T for any hidden = nblk * block, written from the same contract (R: nblk*nblk floats,
+// R[c*nblk + b]); equals ApplyQ at (5120, 1024).
+inline std::vector<double> ApplyQGeneral(const std::vector<double>& x, int64_t block, const float* d,
+                                         const float* R, bool inverse) {
+  const int64_t hidden = static_cast<int64_t>(x.size());
+  const int64_t nblk = hidden / block;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(block));
+  std::vector<double> y(static_cast<size_t>(hidden));
+  if (!inverse) {
+    for (int64_t k = 0; k < hidden; ++k) y[k] = x[k] * static_cast<double>(d[k]);
+    for (int64_t b = 0; b < nblk; ++b) {
+      Fwht(y.data() + b * block, block);
+      for (int64_t i = 0; i < block; ++i) y[b * block + i] *= scale;
+    }
+    std::vector<double> z(static_cast<size_t>(hidden));
+    for (int64_t b = 0; b < nblk; ++b) {
+      for (int64_t i = 0; i < block; ++i) {
+        double acc = 0.0;
+        for (int64_t c = 0; c < nblk; ++c) acc += y[c * block + i] * static_cast<double>(R[c * nblk + b]);
+        z[b * block + i] = acc;
+      }
+    }
+    return z;
+  }
+  for (int64_t c = 0; c < nblk; ++c) {
+    for (int64_t i = 0; i < block; ++i) {
+      double acc = 0.0;
+      for (int64_t b = 0; b < nblk; ++b) acc += x[b * block + i] * static_cast<double>(R[c * nblk + b]);
+      y[c * block + i] = acc;
+    }
+  }
+  for (int64_t c = 0; c < nblk; ++c) {
+    Fwht(y.data() + c * block, block);
+    for (int64_t i = 0; i < block; ++i) y[c * block + i] *= scale;
+  }
+  for (int64_t k = 0; k < hidden; ++k) y[k] *= static_cast<double>(d[k]);
+  return y;
+}
+
+// resid + Q(rmsnorm_plain(y, w)), times layer_scale, for one row: the contract of
+// r4dx_post_rmsnorm_rotate_add_bf16 (rmsnorm_plain = y * rsqrt(mean(y^2) + eps) * w, no 1 + w).
+inline std::vector<double> PostNormRotateAddRef(const std::vector<double>& resid,
+                                                const std::vector<double>& y,
+                                                const std::vector<double>& w, int64_t block,
+                                                const float* d, const float* R, double eps,
+                                                double layer_scale) {
+  const size_t n = y.size();
+  double ss = 0.0;
+  for (double v : y) ss += v * v;
+  const double rstd = 1.0 / std::sqrt(ss / static_cast<double>(n) + eps);
+  std::vector<double> normed(n);
+  for (size_t k = 0; k < n; ++k) normed[k] = y[k] * rstd * w[k];
+  std::vector<double> rot = ApplyQGeneral(normed, block, d, R, false);
+  for (size_t k = 0; k < n; ++k) rot[k] = (resid[k] + rot[k]) * layer_scale;
+  return rot;
+}
+
+// A random n x n orthogonal matrix, row-major (Gram-Schmidt of a Gaussian matrix, rows in order,
+// twice). RandomOrthogonal5 is the n = 5 original; this one has no symmetry either.
+inline std::vector<float> RandomOrthogonal(std::mt19937_64& rng, int n) {
+  std::normal_distribution<double> nd(0.0, 1.0);
+  std::vector<double> m(static_cast<size_t>(n) * n);
+  for (double& v : m) v = nd(rng);
+  for (int r = 0; r < n; ++r) {
+    for (int pass = 0; pass < 2; ++pass) {
+      for (int p = 0; p < r; ++p) {
+        double dot = 0.0;
+        for (int c = 0; c < n; ++c) dot += m[r * n + c] * m[p * n + c];
+        for (int c = 0; c < n; ++c) m[r * n + c] -= dot * m[p * n + c];
+      }
+      double nrm = 0.0;
+      for (int c = 0; c < n; ++c) nrm += m[r * n + c] * m[r * n + c];
+      nrm = std::sqrt(nrm);
+      for (int c = 0; c < n; ++c) m[r * n + c] /= nrm;
+    }
+  }
+  std::vector<float> R(m.size());
+  for (size_t i = 0; i < m.size(); ++i) R[i] = static_cast<float>(m[i]);
+  return R;
+}
+
 // n random +-1 signs.
 inline std::vector<float> RandomSigns(std::mt19937_64& rng, int64_t n) {
   std::vector<float> s(static_cast<size_t>(n));

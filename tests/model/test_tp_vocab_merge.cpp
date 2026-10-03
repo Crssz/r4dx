@@ -480,9 +480,66 @@ void TestMergeTop16() {
 
 }  // namespace
 
+// MergeArgmaxRows (Gemma DFlash under TP: a verify window's up-to-16 per-row greedy pairs in ONE merge) == the full row's
+// kernels::Argmax for every row, on random rows, tie-heavy rows (values from a 3-element set, so ties are everywhere,
+// including across the shard boundary), rows whose maximum sits on either side of the boundary and exactly at ids
+// half-1 / half, and all -inf rows. The gathered layout is [world][rows] with GLOBAL ids, as MergeVerifyPairs builds it.
+void TestMergeArgmaxRows() {
+  std::mt19937 rng(20261002);
+  const int64_t V = 4096, half = V / 2;
+  int bad = 0, total = 0;
+  for (int trial = 0; trial < 400; ++trial) {
+    const int rows = 1 + static_cast<int>(rng() % 16);
+    std::vector<std::vector<float>> full(static_cast<size_t>(rows), std::vector<float>(static_cast<size_t>(V)));
+    for (int t = 0; t < rows; ++t) {
+      std::vector<float>& row = full[static_cast<size_t>(t)];
+      const int kind = static_cast<int>(rng() % 5);
+      for (int64_t i = 0; i < V; ++i) {
+        if (kind == 0) row[static_cast<size_t>(i)] = static_cast<float>(rng() % 100000) / 100.0f;
+        else if (kind == 1) row[static_cast<size_t>(i)] = static_cast<float>(rng() % 3);  // ties everywhere
+        else row[static_cast<size_t>(i)] = -1.0f;
+      }
+      if (kind == 2) {  // equal maxima exactly at the boundary: the lower global id (half - 1, rank 0) must win
+        row[static_cast<size_t>(half - 1)] = 5.0f;
+        row[static_cast<size_t>(half)] = 5.0f;
+      } else if (kind == 3) {  // maximum only on the second shard, at its first id
+        row[static_cast<size_t>(half)] = 7.0f;
+      } else if (kind == 4) {  // all -inf: rank 0's id 0
+        std::fill(row.begin(), row.end(), kNegInf);
+      }
+    }
+    std::vector<ArgmaxPair> gathered(static_cast<size_t>(2 * rows));
+    for (int t = 0; t < rows; ++t) {
+      const std::vector<float>& row = full[static_cast<size_t>(t)];
+      gathered[static_cast<size_t>(0 * rows + t)] = ShardArgmax(row.data(), half, 0);
+      gathered[static_cast<size_t>(1 * rows + t)] = ShardArgmax(row.data() + half, half, half);
+    }
+    std::vector<int32_t> out(static_cast<size_t>(rows));
+    MergeArgmaxRows(gathered.data(), 2, rows, out.data());
+    for (int t = 0; t < rows; ++t) {
+      ++total;
+      if (out[static_cast<size_t>(t)] != r4dx::kernels::Argmax(full[static_cast<size_t>(t)].data(), V)) ++bad;
+    }
+  }
+  Check(bad == 0, "MergeArgmaxRows == per-row full-vocabulary Argmax (" + std::to_string(total) + " rows, ties, boundary, -inf)");
+  // A single-rank world is the identity; a world outside [1, 8] throws.
+  ArgmaxPair one[2] = {{3, 1.0f}, {9, 2.0f}};
+  int32_t o1[2] = {};
+  MergeArgmaxRows(one, 1, 2, o1);
+  Check(o1[0] == 3 && o1[1] == 9, "MergeArgmaxRows world 1 is the identity");
+  bool threw = false;
+  try {
+    MergeArgmaxRows(one, 9, 1, o1);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  Check(threw, "MergeArgmaxRows rejects world 9");
+}
+
 int main() {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   TestMergeArgmax();
+  TestMergeArgmaxRows();
   TestLogAddExp();
   TestMergeRowSummaries();
   TestMergeTop16();

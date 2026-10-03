@@ -16,6 +16,7 @@
 
 #include "nlohmann/json.hpp"
 #include "openai_types.h"
+#include "dialect.h"
 #include "reasoning_splitter.h"
 #include "request_queue.h"
 
@@ -28,6 +29,13 @@ class ResponseSink {
   // Called once, before the first generated token, with the full prompt token count (for the
   // response's `usage.prompt_tokens`).
   virtual void OnStart(int64_t prompt_tokens) = 0;
+
+  // The dialect-aware form Engine::RunRequest calls (docs/gemma4-plan.md 5.3, task M1-14):
+  // `reasoning_open_in_prompt` is true iff the rendered prompt itself ends with an OPEN reasoning span
+  // (ModelDialect::ReasoningOpenInPrompt -- Gemma thinking on after a tool response), which is only
+  // known after the chat template ran. A sink whose splitter start state depends on it (a Gemma-dialect
+  // chat sink) creates it here; every other sink just forwards to the one-argument form.
+  virtual void OnStart(int64_t prompt_tokens, bool /*reasoning_open_in_prompt*/) { OnStart(prompt_tokens); }
 
   // Called once per newly-decoded piece of text (Tokenizer::StreamDecoder::push's return value --
   // may span more or less than one token, see tokenizer.h).
@@ -97,10 +105,21 @@ class ResponseSink {
 // unaffected.
 class BufferingSink : public ResponseSink {
  public:
-  explicit BufferingSink(bool enable_thinking = false, bool emit_reasoning = true)
-      : enable_thinking_(enable_thinking), emit_reasoning_(emit_reasoning) {}
+  // `dialect` (task M1-14): null (the default) is the legacy Qwen behavior, byte for byte. A Gemma-4
+  // dialect makes the sink split reasoning from content ALWAYS (the model opens its own span, thinking
+  // on or off; the start state comes from OnStart's `reasoning_open_in_prompt`); `emit_reasoning`
+  // then decides whether the thought is returned.
+  explicit BufferingSink(bool enable_thinking = false, bool emit_reasoning = true,
+                         const ModelDialect* dialect = nullptr)
+      : enable_thinking_(enable_thinking), emit_reasoning_(emit_reasoning), dialect_(dialect),
+        split_active_(enable_thinking || (dialect != nullptr && dialect->kind == DialectKind::kGemma4)) {
+    if (dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
+      splitter_ = ReasoningSplitter(dialect_->reasoning, ReasoningSplitter::StartState::kExpectOpener);
+    }
+  }
 
   void OnStart(int64_t prompt_tokens) override;
+  void OnStart(int64_t prompt_tokens, bool reasoning_open_in_prompt) override;
   void OnToken(const std::string& piece) override;
   void OnDone(const std::string& finish_reason, int64_t completion_tokens,
               const TimingStats& timings = {}, int64_t reasoning_tokens = 0) override;
@@ -132,8 +151,10 @@ class BufferingSink : public ResponseSink {
  private:
   const bool enable_thinking_;
   const bool emit_reasoning_;
+  const ModelDialect* dialect_;
+  const bool split_active_;  // enable_thinking_, or a Gemma dialect (always splits)
   ReasoningSplitter splitter_;
-  std::string reasoning_raw_;      // un-trimmed accumulation of every kReasoning event
+  std::string reasoning_raw_;     // un-trimmed accumulation of every kReasoning event
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
                                        // then bypasses the splitter entirely, see OnToken's body
   std::mutex mu_;
@@ -164,9 +185,10 @@ class StreamingSink : public ResponseSink {
   // existing call site is unaffected.
   StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
                 bool include_usage = false, bool enable_thinking = false,
-                bool emit_reasoning = true);
+                bool emit_reasoning = true, const ModelDialect* dialect = nullptr);
 
   void OnStart(int64_t prompt_tokens) override;
+  void OnStart(int64_t prompt_tokens, bool reasoning_open_in_prompt) override;
   void OnToken(const std::string& piece) override;
   void OnDone(const std::string& finish_reason, int64_t completion_tokens,
               const TimingStats& timings = {}, int64_t reasoning_tokens = 0) override;
@@ -196,6 +218,8 @@ class StreamingSink : public ResponseSink {
   bool include_usage_;
   bool enable_thinking_;
   bool emit_reasoning_;
+  const ModelDialect* dialect_;
+  bool split_active_;  // chat && (enable_thinking_ || Gemma dialect)
   ReasoningSplitter splitter_;
   bool reasoning_delivered_ = false;  // true once OnReasoningContent ran (tool_mode) -- OnToken
                                        // then bypasses the splitter entirely, see OnToken's body

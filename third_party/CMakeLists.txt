@@ -1,6 +1,6 @@
 # third_party/CMakeLists.txt
 #
-# r4d_core: a static library built from the 13 HIP translation units of the vendored libr4d
+# r4d_core: a static library built from the 14 HIP translation units of the vendored libr4d
 # (third_party/libr4d: attention, GDN, the bf16 / w4a16 / trellis GEMMs, the DFlash conv, the kernel
 # registry).
 #
@@ -46,9 +46,10 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags, for the 13 units r4dx links.
+# unit -> extra per-unit flags, for the 14 units r4dx links.
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
+  r4d_attn_paged_h256_gqa2
   r4d_attn_vit_h72_bf16
   r4d_gdn_chunk_scan_k128_v128_c64_bf16
   r4d_gdn_conv_w4_h128_bf16
@@ -75,6 +76,8 @@ set(R4D_EXTRA_r4d_gdn_chunk_scan_k128_v128_c64_bf16 -mcumode)
 file(GLOB R4D_HEADERS CONFIGURE_DEPENDS "${LIBR4D_DIR}/*.h")
 set(R4D_DEPS_r4d_attn_paged_h256_gqa6
   "${LIBR4D_DIR}/r4d_attn_decode_h256_gqa6.hip" "${LIBR4D_DIR}/r4d_attn_prefill_h256_gqa6.hip")
+# The sliding-window unit instantiates the same two kernel files (WIN = 1).
+set(R4D_DEPS_r4d_attn_paged_h256_gqa2 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
 
 set(R4D_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/r4d_objs")
 file(MAKE_DIRECTORY "${R4D_OBJ_DIR}")
@@ -151,8 +154,41 @@ add_custom_command(
 )
 add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}" "${R4D_TRELLIS256_ISA_STAMP}")
 
+# Qwen-unchanged guard for the sliding-window attention extension (docs/gemma4-plan.md 3.3, M1-32): the
+# Qwen attention unit (r4d_attn_paged_h256_gqa6, which instantiates the prefill / decode templates the
+# gqa2 unit also uses, with their new defaulted WIN / EXT parameters) compiled device-only -S with the
+# unit's own flags must hash (names and CUID normalised) to qwen_attn_isa.sha256, the hash of the
+# listing built before those parameters existed. check_qwen_attn_isa.cmake documents how to compare
+# and when to move the baseline. The windowed unit's listing is built too, for its resource report.
+set(R4D_QWEN_ATTN_ISA "${R4D_OBJ_DIR}/r4d_attn_paged_h256_gqa6-${R4D_GFX_ARCH}.s")
+set(R4D_GQA2_ATTN_ISA "${R4D_OBJ_DIR}/r4d_attn_paged_h256_gqa2-${R4D_GFX_ARCH}.s")
+set(R4D_QWEN_ATTN_ISA_STAMP "${R4D_OBJ_DIR}/r4d_attn_qwen_isa.ok")
+foreach(unit r4d_attn_paged_h256_gqa6 r4d_attn_paged_h256_gqa2)
+  add_custom_command(
+    OUTPUT "${R4D_OBJ_DIR}/${unit}-${R4D_GFX_ARCH}.s"
+    COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4D_HIPCC_PATH}"
+            "${R4D_HIPCC}" ${R4D_BASE_FLAGS} ${R4D_EXTRA_${unit}} --cuda-device-only -S
+            -Wno-unused-command-line-argument "${LIBR4D_DIR}/${unit}.hip"
+            -o "${R4D_OBJ_DIR}/${unit}-${R4D_GFX_ARCH}.s"
+    DEPENDS "${LIBR4D_DIR}/${unit}.hip" ${R4D_HEADERS} ${R4D_DEPS_${unit}}
+    COMMENT "hipcc -S (${R4D_GFX_ARCH}) ${unit} ISA"
+    VERBATIM
+  )
+endforeach()
+add_custom_command(
+  OUTPUT "${R4D_QWEN_ATTN_ISA_STAMP}"
+  COMMAND "${CMAKE_COMMAND}" "-DISA=${R4D_QWEN_ATTN_ISA}" "-DGQA2_ISA=${R4D_GQA2_ATTN_ISA}"
+          "-DBASELINE=${CMAKE_CURRENT_SOURCE_DIR}/qwen_attn_isa.sha256" "-DSTAMP=${R4D_QWEN_ATTN_ISA_STAMP}"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/check_qwen_attn_isa.cmake"
+  DEPENDS "${R4D_QWEN_ATTN_ISA}" "${R4D_GQA2_ATTN_ISA}" "${CMAKE_CURRENT_SOURCE_DIR}/check_qwen_attn_isa.cmake"
+          "${CMAKE_CURRENT_SOURCE_DIR}/qwen_attn_isa.sha256"
+  COMMENT "check_qwen_attn_isa: Qwen attention instantiations unchanged"
+  VERBATIM
+)
+add_custom_target(r4d_qwen_attn_isa ALL DEPENDS "${R4D_QWEN_ATTN_ISA_STAMP}")
+
 add_library(r4d_core STATIC ${R4D_OBJS})
-add_dependencies(r4d_core r4d_trellis_isa)
+add_dependencies(r4d_core r4d_trellis_isa r4d_qwen_attn_isa)
 set_target_properties(r4d_core PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(r4d_core PUBLIC "${LIBR4D_DIR}")
 target_link_libraries(r4d_core PUBLIC "${R4D_HIP_LIB}")

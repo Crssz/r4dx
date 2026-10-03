@@ -1,4 +1,4 @@
-﻿// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
+// r4dx_kernels.hip -- every r4dx-owned device kernel (docs/architecture.md "Own kernels"),
 // compiled as one hipcc translation unit (mirrors third_party/CMakeLists.txt's per-unit recipe
 // for r4d_core; see docs/build-windows.md). One row per workgroup for the row-reduction kernels
 // (rmsnorm and its fused residual form).
@@ -1169,10 +1169,11 @@ __global__ __launch_bounds__(kThreads) void TopkLseMergeKernel(int32_t* __restri
 //   accumulating all `ratio` q-heads' outputs in registers.
 //
 // This is a two-pass (materialise-then-normalise) softmax rather than a streaming online one: the
-// whole visible row is at most 2055 scores (window 2048 + an 8-wide block), which fits LDS
+// whole visible row is at most 2063 scores (window 2048 - 1 + a 16-wide block), which fits LDS
 // comfortably, and it is the numerically identical max-subtracted fp32 softmax with less state.
 constexpr int kAttnThreads = 128;
-constexpr int kAttnMaxKeys = 2056;   // (window - 1) + T <= 2047 + 8
+constexpr int kAttnMaxT = 16;        // the block size: 8 (Qwen DFlash2) or 16 (Gemma 4 / DFlash v1)
+constexpr int kAttnMaxKeys = 2048 - 1 + kAttnMaxT + 1;  // (window - 1) + T <= 2047 + 16 (2064 floats x 4 q-heads = 33 KB LDS)
 constexpr int kAttnMaxRatio = 4;     // heads_q / heads_kv
 constexpr int kAttnMaxHeadDim = 128;
 
@@ -1181,7 +1182,7 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
     const __hip_bfloat16* __restrict__ v_block, const __hip_bfloat16* __restrict__ k_store,
     const __hip_bfloat16* __restrict__ v_store, __hip_bfloat16* __restrict__ out, int T,
     int heads_q, int heads_kv, int head_dim, int n_injected, int store_begin, int window, int slots,
-    float scale) {
+    float scale, int causal_block) {
   const int t = blockIdx.x;
   const int kvh = blockIdx.y;
   const int ratio = heads_q / heads_kv;
@@ -1199,7 +1200,9 @@ __global__ __launch_bounds__(kAttnThreads) void DflashAttnKernel(
   int lo = q_pos - window + 1;
   if (lo < store_begin) lo = store_begin;
   const int n_store = n_injected > lo ? n_injected - lo : 0;
-  const int total = n_store + T;  // + the block's own T keys, all unconditionally visible
+  // + the block's own keys: all T when non-causal (Qwen DFlash2, z-lab full layer), or only keys 0..t when
+  // causal_block (z-lab v1 sliding layers: is_causal = layer_type == sliding_attention).
+  const int total = n_store + (causal_block ? t + 1 : T);
 
   __shared__ float s_q[kAttnMaxRatio][kAttnMaxHeadDim];
   __shared__ float s_sc[kAttnMaxRatio][kAttnMaxKeys];
@@ -1729,15 +1732,15 @@ void r4dx_topk_lse_f32_ws(int64_t logits, int64_t out_ids, int64_t out_vals, int
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
-void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
-                            int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
-                            int head_dim, int n_injected, int store_begin, int window, int slots,
-                            float scale, int64_t stream) {
+void r4dx_dflash_attn_causal_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                                   int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                                   int head_dim, int n_injected, int store_begin, int window,
+                                   int slots, float scale, int causal_block, int64_t stream) {
   if (T <= 0 || heads_kv <= 0) return;
   // Every one of these is a HARD precondition of the kernel's fixed LDS geometry: violating one
   // would read/write outside s_q/s_sc rather than merely produce a slow answer.
-  if (T > 8) {
-    throw std::runtime_error("r4dx_dflash_attn_bf16: T must be <= 8 (the DFlash2 block size), got " +
+  if (T > kAttnMaxT) {
+    throw std::runtime_error("r4dx_dflash_attn_bf16: T must be <= 16 (the DFlash block size), got " +
                               std::to_string(T));
   }
   if (head_dim <= 0 || head_dim > kAttnMaxHeadDim || (head_dim % 32) != 0) {
@@ -1750,7 +1753,7 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
         "r4dx_dflash_attn_bf16: heads_q must be a multiple of heads_kv with ratio <= 4, got " +
         std::to_string(heads_q) + "/" + std::to_string(heads_kv));
   }
-  if (window <= 0 || window > kAttnMaxKeys - 8) {
+  if (window <= 0 || window > kAttnMaxKeys - kAttnMaxT) {
     throw std::runtime_error("r4dx_dflash_attn_bf16: window must be in [1, 2048], got " +
                               std::to_string(window));
   }
@@ -1780,8 +1783,16 @@ void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t 
                      (const __hip_bfloat16*)k_block, (const __hip_bfloat16*)v_block,
                      (const __hip_bfloat16*)k_store, (const __hip_bfloat16*)v_store,
                      (__hip_bfloat16*)out, T, heads_q, heads_kv, head_dim, n_injected, store_begin,
-                     window, slots, scale);
+                     window, slots, scale, causal_block ? 1 : 0);
   R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_dflash_attn_bf16(int64_t q, int64_t k_block, int64_t v_block, int64_t k_store,
+                           int64_t v_store, int64_t out, int T, int heads_q, int heads_kv,
+                           int head_dim, int n_injected, int store_begin, int window, int slots,
+                           float scale, int64_t stream) {
+  r4dx_dflash_attn_causal_bf16(q, k_block, v_block, k_store, v_store, out, T, heads_q, heads_kv, head_dim,
+                               n_injected, store_begin, window, slots, scale, /*causal_block=*/0, stream);
 }
 
 void r4dx_dflash_conv_bf16(int64_t x, int64_t dyn, int64_t base, int64_t out, int T, int H,

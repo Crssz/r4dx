@@ -25,9 +25,11 @@ std::string read_file(const std::string& path) {
 
 struct ChatTemplate::Impl {
     minja::chat_template tpl;
+    ChatTemplateOptions options;
 
-    Impl(const std::string& source, const std::string& bos, const std::string& eos)
-        : tpl(source, bos, eos) {}
+    Impl(const std::string& source, const std::string& bos, const std::string& eos,
+         const ChatTemplateOptions& opts)
+        : tpl(source, bos, eos), options(opts) {}
 };
 
 ChatTemplate::ChatTemplate() = default;
@@ -40,18 +42,18 @@ ChatTemplate& ChatTemplate::operator=(const ChatTemplate&) = default;
 ChatTemplate::ChatTemplate(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
 
 ChatTemplate ChatTemplate::from_source(const std::string& jinja_source, const std::string& bos_token,
-                                        const std::string& eos_token) {
+                                        const std::string& eos_token, const ChatTemplateOptions& options) {
     if (jinja_source.empty()) {
         throw std::runtime_error("ChatTemplate::from_source: empty jinja source");
     }
     try {
-        return ChatTemplate(std::make_shared<Impl>(jinja_source, bos_token, eos_token));
+        return ChatTemplate(std::make_shared<Impl>(jinja_source, bos_token, eos_token, options));
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("ChatTemplate: failed to parse jinja template: ") + e.what());
     }
 }
 
-ChatTemplate ChatTemplate::from_directory(const std::string& model_dir) {
+ChatTemplate ChatTemplate::from_directory(const std::string& model_dir, const ChatTemplateOptions& options) {
     const std::string sep = (!model_dir.empty() && (model_dir.back() == '/' || model_dir.back() == '\\'))
                                  ? ""
                                  : "/";
@@ -94,7 +96,7 @@ ChatTemplate ChatTemplate::from_directory(const std::string& model_dir) {
                                   model_dir);
     }
 
-    return from_source(source, bos_token, eos_token);
+    return from_source(source, bos_token, eos_token, options);
 }
 
 std::string ChatTemplate::render(const ChatJson& messages, bool add_generation_prompt, const ChatJson& tools,
@@ -111,6 +113,7 @@ std::string ChatTemplate::render(const ChatJson& messages, bool add_generation_p
     minja::chat_template_options opts;  // defaults: polyfills on, but Qwen3.8-27B's template
                                          // natively supports system role + tools, so caps
                                          // detection should make every polyfill a no-op.
+    opts.apply_polyfills = impl_->options.apply_polyfills;
     try {
         return impl_->tpl.apply(inputs, opts);
     } catch (const std::exception& e) {

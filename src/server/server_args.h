@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "dialect.h"  // kQwenDefaultTokenizerDir
+
 namespace r4dx::server {
 
 // See src/cli/cli_args.h's kMaxMtpDraftK for the derivation (Model::VerifyWindow requires
@@ -25,7 +27,15 @@ struct ServerArgs {
   std::string layout = "bf16";
   // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
   // chat-template files are byte-identical to the base Qwen3.8-27B's.
-  std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
+  std::string tokenizer_dir = kQwenDefaultTokenizerDir;  // dialect.h
+  // True iff --tokenizer-dir was given. When it was not, main.cpp hands Engine an EMPTY tokenizer_dir
+  // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
+  // tokenizer dir, or the Qwen default above (unchanged).
+  bool tokenizer_dir_given = false;
+  // --dialect {auto|qwen35|gemma4} (docs/gemma4-plan.md 5.3, task M1-14): the per-family text surface
+  // (reasoning markers, tool-call syntax, EOS list, BOS on raw prompts). auto reads the tokenizer
+  // dir (tokenizer_config.json / vocab), then cross-checks the loaded model's architecture.
+  std::string dialect = "auto";
   std::string host = "127.0.0.1";
   int port = 8080;
   // docs/r9700.md R13 (2026-09-20, measured): raised from 131072 -- the checkpoint's own
@@ -34,6 +44,13 @@ struct ServerArgs {
   // 21-24% of the card's VRAM free (see src/cli/cli_args.h's matching comment and docs/r9700.md's
   // R13/Q17 entries for the full measurement).
   int64_t max_ctx = 262144;
+  // True iff --max-ctx was given. A Gemma container's default is the checkpoint's own
+  // max_position_embeddings (131072, docs/gemma4-plan.md 9.1) via GemmaConfig::ResolveMaxCtx -- the 262144
+  // above stays the Qwen default, untouched.
+  bool max_ctx_given = false;
+  // --extended-ctx: the opt-in for a Gemma context above the checkpoint's 131072 (up to 262144): with no
+  // --max-ctx it selects 262144, with one it allows a value above 131072. No effect on Qwen.
+  bool extended_ctx = false;
   // -1 (default): load every layer Config().num_hidden_layers declares (the real 64-layer
   // container). >=0: load only the first N layers -- required for a smaller test container that
   // physically carries fewer layers than its (verbatim-copied) config.json declares, e.g.
@@ -112,6 +129,8 @@ struct ServerArgs {
   // src/cli/cli_args.h's --image-max-pixels: an image above this is DOWNSIZED via the reference's
   // own smart_resize rule rather than rejected. 0 means the checkpoint's own 16777216 ceiling.
   int64_t image_max_pixels = 1048576;
+  // Gemma 4 (docs/gemma4-plan.md M2): soft tokens per image, 70 | 140 | 280. Ignored for Qwen.
+  int64_t image_soft_tokens = 280;
 
   // ---- tensor parallel (docs/tp.md 9.1) -----------------------------------------------------------
   // The same flags, defaults, ranges and usage errors as src/cli/cli_args.h's --tp* (the two headers
@@ -143,7 +162,8 @@ struct ServerUsageError : std::runtime_error {
 inline std::string ServerUsageText(const char* argv0) {
   return std::string("usage: ") + argv0 +
          " --model <container.r4dx> --layout {w4a16|bf16|trellis} "
-         "[--tokenizer-dir <dir>] [--host <addr>] [--port N] [--max-ctx N] "
+         "[--tokenizer-dir <dir>] [--dialect {auto|qwen35|gemma4}] [--host <addr>] [--port N] "
+         "[--max-ctx N] [--extended-ctx] "
          "[--max-tokens-default N] [--max-queue N] [--think {on|off}] [--layers N] "
          "[--default-temperature F] [--default-top-p F] [--default-top-k N] "
          "[--default-min-p F] [--log-level {debug|info|warn|error}] [--mtp N] "
@@ -151,7 +171,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}] "
          "[--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
-         "[--image-max-pixels N] [--request-log <path>] "
+         "[--image-max-pixels N] [--image-soft-tokens {70|140|280}] [--request-log <path>] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K]";
@@ -220,10 +240,12 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
     else if (arg == "--layout") a.layout = NextServerArg(argc, argv, i, "--layout");
-    else if (arg == "--tokenizer-dir") a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir");
+    else if (arg == "--tokenizer-dir") { a.tokenizer_dir = NextServerArg(argc, argv, i, "--tokenizer-dir"); a.tokenizer_dir_given = true; }
+    else if (arg == "--dialect") a.dialect = NextServerArg(argc, argv, i, "--dialect");
+    else if (arg == "--extended-ctx") a.extended_ctx = true;
     else if (arg == "--host") a.host = NextServerArg(argc, argv, i, "--host");
     else if (arg == "--port") a.port = ServerParseInt("--port", NextServerArg(argc, argv, i, "--port"));
-    else if (arg == "--max-ctx") a.max_ctx = ServerParseI64("--max-ctx", NextServerArg(argc, argv, i, "--max-ctx"));
+    else if (arg == "--max-ctx") { a.max_ctx = ServerParseI64("--max-ctx", NextServerArg(argc, argv, i, "--max-ctx")); a.max_ctx_given = true; }
     else if (arg == "--max-tokens-default") a.max_tokens_default = ServerParseI64("--max-tokens-default", NextServerArg(argc, argv, i, "--max-tokens-default"));
     else if (arg == "--max-queue") a.max_queue = ServerParseInt("--max-queue", NextServerArg(argc, argv, i, "--max-queue"));
     else if (arg == "--layers") a.layers = ServerParseI64("--layers", NextServerArg(argc, argv, i, "--layers"));
@@ -249,6 +271,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--dflash-n-min") a.dflash_n_min = ServerParseI64("--dflash-n-min", NextServerArg(argc, argv, i, "--dflash-n-min"));
     else if (arg == "--vision") a.vision = NextServerArg(argc, argv, i, "--vision");
     else if (arg == "--image-max-pixels") a.image_max_pixels = ServerParseI64("--image-max-pixels", NextServerArg(argc, argv, i, "--image-max-pixels"));
+    else if (arg == "--image-soft-tokens") a.image_soft_tokens = ServerParseI64("--image-soft-tokens", NextServerArg(argc, argv, i, "--image-soft-tokens"));
     else if (arg == "--tp") a.tp = ServerParseInt("--tp", NextServerArg(argc, argv, i, "--tp"));
     else if (arg == "--tp-mode") { a.tp_mode = NextServerArg(argc, argv, i, "--tp-mode"); a.tp_options_given = true; }
     else if (arg == "--tp-devices") { a.tp_devices = ParseServerTpDevices(NextServerArg(argc, argv, i, "--tp-devices")); a.tp_options_given = true; }
@@ -264,6 +287,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.model_path.empty()) throw ServerUsageError("--model is required");
   if (a.port <= 0 || a.port > 65535) throw ServerUsageError("--port must be in 1..65535");
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
+  if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
+    throw ServerUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  }
   if (a.max_tokens_default < 0) throw ServerUsageError("--max-tokens-default must be >= 0");
   if (a.max_queue <= 0) throw ServerUsageError("--max-queue must be > 0");
   if (a.layers < -1) throw ServerUsageError("--layers must be >= 0 (or omitted for the full model)");
@@ -292,6 +318,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   }
   if (a.vision != "auto" && a.vision != "on" && a.vision != "off") {
     throw ServerUsageError("--vision must be 'auto', 'on' or 'off'");
+  }
+  if (a.image_soft_tokens != 70 && a.image_soft_tokens != 140 && a.image_soft_tokens != 280) {
+    throw ServerUsageError("--image-soft-tokens must be 70, 140 or 280 (Gemma 4: an image is one 288-row chunk)");
   }
   if (a.image_max_pixels != 0 && a.image_max_pixels < 1024) {
     throw ServerUsageError("--image-max-pixels must be 0 (the checkpoint's own ceiling) or >= 1024");

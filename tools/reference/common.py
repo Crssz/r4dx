@@ -380,6 +380,72 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+_ST_DTYPES = {  # safetensors dtype tag -> torch dtype attribute name
+    "BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64",
+    "I8": "int8", "U8": "uint8", "I16": "int16", "I32": "int32", "I64": "int64", "BOOL": "bool",
+    "F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2",
+}
+
+
+def raw_safetensors_header(path) -> tuple[dict, int]:
+    """(header dict without __metadata__, data-section offset) of one .safetensors file, by plain file reads."""
+    import struct
+
+    with open(path, "rb") as fh:
+        (n,) = struct.unpack("<Q", fh.read(8))
+        if n <= 0 or n > 100_000_000:
+            raise ValueError(f"{path}: implausible safetensors header length {n}")
+        hdr = json.loads(fh.read(n).decode("utf-8"))
+    hdr.pop("__metadata__", None)
+    return hdr, 8 + n
+
+
+def raw_safetensors_read(path, name: str, header: tuple[dict, int] | None = None,
+                         rows: tuple[int, int] | None = None) -> "torch.Tensor":
+    """Read one tensor (or rows [a, b) of a >=1-D tensor) with seek+readinto into a fresh buffer: no mmap.
+
+    Why this exists (docs: g4-load-crash): safetensors 0.8's torch path maps the WHOLE file with
+    torch.UntypedStorage.from_file(shared=False), a copy-on-write view. On Windows that is PAGE_WRITECOPY and
+    is charged against the system commit limit in full (23.9 GB for Gemma's single model.safetensors) on every
+    open. When commit is near the limit (other jobs, big pagefile use) the mapping comes back unusable and
+    torch dereferences it in Tensor::item<uint8> (0xC0000005 inside the Rust loader). Reading the bytes
+    directly needs commit only for the tensor itself.
+    """
+    import math
+
+    import torch
+
+    hdr, off = header if header is not None else raw_safetensors_header(path)
+    ent = hdr[name]
+    dt = getattr(torch, _ST_DTYPES[ent["dtype"]])
+    shape = list(ent["shape"])
+    lo, hi = ent["data_offsets"]
+    esz = torch.empty(0, dtype=dt).element_size()
+    start = off + lo
+    if rows is not None:
+        if not shape:
+            raise ValueError(f"{name}: scalar tensor cannot be row-sliced")
+        r0, r1 = max(0, rows[0]), min(shape[0], rows[1])
+        inner = math.prod(shape[1:])
+        start += r0 * inner * esz
+        nbytes = max(0, r1 - r0) * inner * esz
+        shape = [max(0, r1 - r0)] + shape[1:]
+    else:
+        nbytes = hi - lo
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dt)
+    buf = bytearray(nbytes)
+    with open(path, "rb", buffering=0) as fh:
+        fh.seek(start)
+        mv, got = memoryview(buf), 0
+        while got < nbytes:
+            n = fh.readinto(mv[got:got + (1 << 28)])
+            if not n:
+                raise EOFError(f"{path}: {name}: short read ({got}/{nbytes} bytes)")
+            got += n
+    return torch.frombuffer(buf, dtype=dt).reshape(shape)
+
+
 @dataclass
 class ShardIndex:
     """Lazy per-tensor lookup across a HF safetensors shard set, via model.safetensors.index.json.
@@ -392,6 +458,7 @@ class ShardIndex:
     model_dir: Path
     weight_map: dict[str, str] = field(default_factory=dict)
     single_file: Path | None = None  # set if the checkpoint is a single model.safetensors, no index
+    _hdr: tuple | None = None  # cached (header, data offset) of single_file
 
     @classmethod
     def load(cls, model_dir: Path) -> "ShardIndex":
@@ -402,11 +469,9 @@ class ShardIndex:
             return cls(model_dir=model_dir, weight_map=weight_map)
         single = model_dir / "model.safetensors"
         if single.exists():
-            from safetensors import safe_open
-
-            with safe_open(str(single), framework="pt", device="cpu") as f:
-                weight_map = {k: "model.safetensors" for k in f.keys()}
-            return cls(model_dir=model_dir, weight_map=weight_map, single_file=single)
+            hdr = raw_safetensors_header(single)  # no mmap: see raw_safetensors_read
+            weight_map = {k: "model.safetensors" for k in hdr[0]}
+            return cls(model_dir=model_dir, weight_map=weight_map, single_file=single, _hdr=hdr)
         return cls(model_dir=model_dir, weight_map={})
 
     def available(self, name: str) -> bool:
@@ -422,6 +487,8 @@ class ShardIndex:
         from safetensors import safe_open
 
         shard = self.weight_map[name]
+        if self.single_file is not None:  # Gemma's one huge file: plain reads, never a whole-file mmap
+            return raw_safetensors_read(self.single_file, name, self._hdr)
         # .clone(): this venv's safetensors/torch build returns a tensor whose storage aliases the
         # `safe_open` context manager's own mmap -- once `with` exits and unmaps the file, that
         # storage is dangling. Reading a handful of tensors (layer_golden.py's ~14-20 per component)
@@ -438,9 +505,32 @@ class ShardIndex:
         from safetensors import safe_open
 
         shard = self.weight_map[name]
+        if self.single_file is not None:
+            return raw_safetensors_read(self.single_file, name, self._hdr, rows=(start, stop))
         with safe_open(str(self.model_dir / shard), framework="pt", device="cpu") as f:
             sl = f.get_slice(name)
             return sl[start:stop, :].clone()  # same dangling-mmap risk as get_tensor above
+
+
+def get_tensors_grouped(index: ShardIndex, names: list[str]) -> dict[str, torch.Tensor]:
+    """`ShardIndex.get_tensor` for many names, opening each shard file once (a single-file checkpoint
+    included). The same function as full_logits_golden.get_tensors_grouped, here so the Gemma tools do not
+    need full_logits_golden's Qwen reference just to read weights."""
+    from safetensors import safe_open
+
+    by_shard: dict[str, list[str]] = {}
+    for n in names:
+        if n not in index.weight_map:
+            raise KeyError(f"{n!r} is not in this checkpoint's weight map")
+        by_shard.setdefault(index.weight_map[n], []).append(n)
+    out: dict[str, torch.Tensor] = {}
+    if index.single_file is not None:
+        return {n: index.get_tensor(n) for n in names}
+    for shard, shard_names in by_shard.items():
+        with safe_open(str(index.model_dir / shard), framework="pt", device="cpu") as f:
+            for n in shard_names:
+                out[n] = f.get_tensor(n).clone()  # clone inside the `with`: see ShardIndex.get_tensor
+    return out
 
 
 def load_module_state(

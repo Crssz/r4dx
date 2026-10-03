@@ -586,6 +586,120 @@ void CheckGroupExports(int& checked, int& failures) {
          "PickTuning: mlp.down at g32 gets FallbackTuning, not the group-0 row");
 }
 
+// FallbackTuning's legality rule is K % 256 (SK=4 * 64), relaxed from K % 512 for Gemma 4's
+// K = 3840 (docs/gemma4-plan.md 3.7, M1-2). Two halves:
+//   (a) Qwen: every (N, K) cross product of the Qwen shape set, at every layout / group / M, is
+//       exactly what the K % 512 code picked (LegacyPick: the table row, else {4,4,1,1,NT}) -- the
+//       relaxation moves no Qwen pick;
+//   (b) Gemma: every Gemma 4 12B (N, K) at TP = 1 and TP = 2 is launchable for bf16 and w4a16 at
+//       groups 0/32/64 and M = 1..64, with SK=4; and a K that is not a multiple of 256 still throws.
+void CheckFallbackRelaxation(int& checked, int& failures) {
+  const auto expect = [&](bool ok, const char* what) {
+    ++checked;
+    if (!ok) {
+      std::fprintf(stderr, "FAIL: %s\n", what);
+      ++failures;
+    }
+  };
+  // Qwen3.5-27B hidden 5120, intermediate 17408, value_dim / attn.o K 6144, and the TP = 2 per-rank
+  // halves (docs/tp.md 2.4); N spans every linear's output width at TP = 1 and TP = 2, the table's
+  // own shapes included.
+  const int64_t qwen_k[] = {5120, 17408, 6144, 8704, 3072, 2560};
+  const int64_t qwen_n[] = {5120, 6144, 12288, 10240, 1024, 512, 2048, 4096, 34816, 17408, 8704,
+                            3072, 248320, 124160, 128, 16};
+  for (Layout layout : {Layout::kBf16, Layout::kW4a16}) {
+    for (int64_t K : qwen_k) {
+      for (int64_t N : qwen_n) {
+        for (bool tp2 : {false, true}) {
+          r4dx::model::SetTp2TuningForThisThread(tp2);
+          ForEachGroup(layout, [&](int g) {
+            for (int64_t m = 1; m <= 64; ++m) {
+              const LinearTuning t = r4dx::model::PickTuning(layout, N, K, m, g);
+              const LinearTuning want =
+                  layout != Layout::kW4a16 || EffectiveGroup(g) == r4d_gemm_w4a16_nt_m64_group()
+                      ? LegacyPick(layout, N, K, m, tp2)
+                      : LinearTuning{4, 4, 1, 1, (m > 1 && m <= 16) ? 0 : 1};
+              ++checked;
+              if (!Same(t, want)) {
+                std::fprintf(stderr,
+                             "FAIL qwen pick moved: layout=%d N=%lld K=%lld M=%lld g=%d tp2=%d -> "
+                             "WV=%d SK=%d MB=%d NPW=%d NT=%d, was WV=%d SK=%d MB=%d NPW=%d NT=%d\n",
+                             static_cast<int>(layout), static_cast<long long>(N),
+                             static_cast<long long>(K), static_cast<long long>(m), g, tp2 ? 1 : 0,
+                             t.WV, t.SK, t.MB, t.NPW, t.NT, want.WV, want.SK, want.MB, want.NPW,
+                             want.NT);
+                ++failures;
+              }
+            }
+          });
+        }
+      }
+    }
+  }
+  r4dx::model::SetTp2TuningForThisThread(false);
+
+  // Gemma 4 12B (hidden 3840, intermediate 15360, 16 heads): sliding q/k/v/o, full q/k/o, gate_up,
+  // down, lm_head; the TP = 2 per-rank shapes (K = 2048 / 4096 / 7680 for the row-parallel ones).
+  struct Shape {
+    int64_t N, K;
+  };
+  const Shape gemma[] = {{4096, 3840},  {2048, 3840},  {3840, 4096},  {8192, 3840}, {512, 3840},
+                         {3840, 8192},  {30720, 3840}, {3840, 15360}, {262144, 3840},
+                         {2048, 3840},  {1024, 3840},  {3840, 2048},  {4096, 3840}, {512, 3840},
+                         {3840, 4096},  {15360, 3840}, {3840, 7680},  {131072, 3840}};
+  for (Layout layout : {Layout::kBf16, Layout::kW4a16}) {
+    for (const Shape& s : gemma) {
+      for (bool tp2 : {false, true}) {
+        r4dx::model::SetTp2TuningForThisThread(tp2);
+        ForEachGroup(layout, [&](int g) {
+          for (int64_t m = 1; m <= 64; ++m) {
+            LinearTuning t{};
+            try {
+              t = r4dx::model::PickTuning(layout, s.N, s.K, m, g);
+            } catch (const std::exception& e) {
+              ++checked;
+              ++failures;
+              std::fprintf(stderr, "FAIL gemma shape threw: layout=%d N=%lld K=%lld M=%lld g=%d: %s\n",
+                           static_cast<int>(layout), static_cast<long long>(s.N),
+                           static_cast<long long>(s.K), static_cast<long long>(m), g, e.what());
+              continue;
+            }
+            ++checked;
+            if (!Launchable(layout, s.K, t, g)) {
+              std::fprintf(stderr,
+                           "FAIL gemma shape not launchable: layout=%d N=%lld K=%lld M=%lld g=%d "
+                           "-> WV=%d SK=%d MB=%d NPW=%d\n",
+                           static_cast<int>(layout), static_cast<long long>(s.N),
+                           static_cast<long long>(s.K), static_cast<long long>(m), g, t.WV, t.SK,
+                           t.MB, t.NPW);
+              ++failures;
+            }
+          }
+        });
+      }
+    }
+  }
+  r4dx::model::SetTp2TuningForThisThread(false);
+
+  // The relaxed rule is exactly K % 256: K = 3840 (not a multiple of 512) takes SK = 4, and a K that
+  // is not a multiple of 256 (or N not of 16) still throws rather than launching illegally.
+  const auto throws = [](Layout layout, int64_t N, int64_t K) {
+    try {
+      (void)r4dx::model::PickTuning(layout, N, K, 1, 0);
+    } catch (const std::runtime_error&) {
+      return true;
+    }
+    return false;
+  };
+  expect(r4dx::model::PickTuning(Layout::kBf16, 4096, 3840, 1, 0).SK == 4 &&
+             r4dx::model::PickTuning(Layout::kW4a16, 4096, 3840, 1, 0).SK == 4,
+         "K = 3840 takes the fallback SK = 4");
+  expect(throws(Layout::kBf16, 4096, 3840 + 128) && throws(Layout::kW4a16, 4096, 3840 + 128),
+         "K = 3968 (not a multiple of 256) still throws");
+  expect(throws(Layout::kBf16, 4096, 0), "K = 0 throws");
+  expect(throws(Layout::kBf16, 4104, 3840), "N not a multiple of 16 still throws");
+}
+
 }  // namespace
 
 int main() {
@@ -616,11 +730,20 @@ int main() {
   std::printf("test_pick_tuning: %d/%d per-group export checks\n", ex_checked - ex_failures,
               ex_checked);
 
+  int fb_failures = 0, fb_checked = 0;
+  CheckFallbackRelaxation(fb_checked, fb_failures);
+  std::printf("test_pick_tuning: %d/%d FallbackTuning K %% 256 checks -- Qwen picks unchanged, Gemma "
+              "shapes legal\n",
+              fb_checked - fb_failures, fb_checked);
+
   int tq_failures = 0, tq_checked = 0;
   CheckTrellis(tq_checked, tq_failures);
   std::printf("test_pick_tuning: %d/%d trellis checks -- launchable at M = 1..64 (TP = 1 rows, "
               "TP = 2 rank shapes, fallback), M = 2..16 the M = 1 pick, M > 16 the prefill row, "
               "the rate in the key\n",
               tq_checked - tq_failures, tq_checked);
-  return failures == 0 && sk_failures == 0 && ex_failures == 0 && tq_failures == 0 ? 0 : 1;
+  return failures == 0 && sk_failures == 0 && ex_failures == 0 && fb_failures == 0 &&
+                 tq_failures == 0
+             ? 0
+             : 1;
 }

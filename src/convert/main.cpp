@@ -12,6 +12,8 @@
 //                [--hessian-dir <tools/reference/hessian_capture.py output dir>
 //                 --ldlq <ECMAScript regex over container base names> [--ldlq-damp 0.01]]
 //                [--rotate {none,q2a,q2ab}] [--rotation-seed <u64, decimal or 0x hex>]
+//                [--rotation-out <file.safetensors>]  (with --input and --rotate, NO --output: writes the
+//                 rotation tensors + fingerprint only and exits; see the Gemma --trellis-from note)
 //                [--w4a16-group-rule "<ECMAScript regex over container base names>=<32|64>"]...
 //                [--record-reuse-guard] [--reuse-tensors-from <baseline container>]
 //                [--trellis-from <oracle dir or its weights_override.json>
@@ -32,7 +34,7 @@
 // stale_layers, hessian_basis other than "matched" (unless --trellis-allow-basis exl3),
 // config_sha256 other than this checkpoint's, a used tensor with K not in {4, 5}, a shape other
 // than the checkpoint's, gate K != up K, any body linear not (fully) covered, an oracle file whose
-// sha256 differs from its record, --rotate other than none, and the combination with --selftest /
+// sha256 differs from its record, --rotate other than none (Qwen; see the Gemma note below), and the combination with --selftest /
 // --dflash-gguf / --reuse-tensors-from / --record-reuse-guard.
 // The container is written as <output>.partial and gets its name only once it is complete and
 // checked: --trellis-verify full (the default; `none` is accepted by debug builds only)
@@ -167,6 +169,32 @@
 // error -- omitting --kv-calib entirely also yields the 1.0 placeholder, silently (no calibration
 // was ever requested, so there is nothing to warn about).
 //
+// Gemma 4 (docs/gemma4-plan.md 4.2 / 4.3): a checkpoint whose config.json says model_type
+// "gemma4_unified" takes the Gemma branch (src/convert/gemma_layout.{hpp,cpp}); the Qwen path above
+// is untouched. A single model.safetensors (no index) is fine. The container gets
+// __metadata__.model_arch "gemma4_unified" and norm_kind "plain", text.layers.{i}.attn.{q,k,v,o} (no
+// `v` on full layers), the four sandwich norms, mlp.gate_up / mlp.down, layer_scalar (fp32 [1, 4]),
+// per-layer k/v descale tables (8 KV heads sliding, 1 full) and a tied lm_head written untied.
+// --vision on (default off) and --audio on (default off; Gemma only) copy model.vision_embedder.* /
+// model.embed_vision.* / model.embed_audio.* as vision.* / audio.* bf16. --mtp on is refused. Every
+// checkpoint tensor must be consumed or allow-listed (--layers, vision/audio off): an unconsumed one
+// fails the run before the header is written. --rotate works (--rotate q2ab: Hadamard-only o / down,
+// folded in-norms stored as ones under `.rotated`); --record-reuse-guard and --reuse-tensors-from are
+// refused for Gemma for now.
+//
+// --trellis-from on Gemma (docs/gemma4-plan.md M1-28; tests/convert/test_gemma_trellis.cpp): the oracle's
+// tensors are keyed by HF name, so the Gemma body (attn.q/k/v/o -- no v on the 8 full layers, k_eq_v --,
+// mlp.gate_up/down) imports exactly as Qwen's; the tied lm_head is not a body linear and stays on the
+// w4a16 path (e.g. `--no-bf16 --lm-head w4a16 --w4a16-group-rule "^lm_head$=32" --ldlq "^lm_head$"
+// --hessian-dir <lm_head.hess>`); --kv-calib fills the per-layer descales (8 sliding heads, 1 full).
+// ROTATED trellis (--rotate q2a|q2ab together with --trellis-from) is Gemma-only: the oracle must have
+// quantized the FOLDED weights against the rotated Hessians (trellis_quant.py --rotation <file>, the file
+// being `r4dx-convert --input <ckpt> --rotate <kind> [--rotation-seed S] --rotation-out <file>`, which
+// writes the exact Q / Hb tensors and their fingerprint and exits), and its manifest carries that
+// fingerprint under "rotation" ({kind, seed, tensors_sha256}); a rotated run refuses an unrotated manifest
+// and an unrotated run a rotated one, and the reconstruction check compares against fold(W). Qwen keeps
+// the `--trellis-from needs --rotate none` refusal.
+//
 //   r4dx-convert --selftest --selftest-input <small .safetensors, one 2D bf16 tensor "w">
 //                --selftest-output <container path> [--layouts w4a16] [--threads T]
 //                [--no-bf16] [--w4a16-group-rule "<regex>=<g>"]...
@@ -211,6 +239,7 @@
                   // kW4A16Group at startup (ValidateKernelGroupSizes).
 #include "r4dx_convert/container_writer.hpp"
 #include "r4dx_convert/dflash2_container.hpp"
+#include "r4dx_convert/dflash2_hf.hpp"
 #include "r4dx_convert/gguf_reader.hpp"
 #include "r4dx_convert/hessian_store.hpp"
 #include "r4dx_convert/keep_bf16.hpp"
@@ -225,6 +254,8 @@
 #include "r4dx_convert/tensor_codec.hpp"
 #include "r4dx_convert/trellis_import.hpp"
 #include "r4dx_convert/w4a16_groups.hpp"
+
+#include "gemma_layout.hpp"
 
 namespace {
 
@@ -335,8 +366,9 @@ struct AppArgs {
   bool lm_head_spec_explicit = false;  // --lm-head was given: --no-bf16 then leaves it alone
   int layers = -1;  // -1 = every text layer
   int threads = 0;  // 0 = hardware_concurrency
-  int vision = -1;  // -1 auto (on iff full run), 0 off, 1 on
+  int vision = -1;  // -1 auto (on iff full run; Gemma: off unless 1), 0 off, 1 on
   int mtp = -1;
+  int audio = -1;   // Gemma only (--audio on|off, default off); -1 and 0 are both off
   bool no_bf16 = false;  // drop the bf16 layout for body weights even if --layouts/--lm-head asked
   std::string kv_calib;  // path to tools/reference/kv_calibrate.py's merged JSON; empty = no calib
   // Reduced-vocab MTP draft head (docs/r9700.md R9): path to a JSON file `{"vocab_ids": [...]}`
@@ -355,7 +387,14 @@ struct AppArgs {
   // exact-precision container), not the HF mode's "every layout side by side" model.
   std::string dflash_gguf;
   std::string dflash_out;
-  std::string dflash_layout = "w4a16";  // one of w4a16, bf16
+  std::string dflash_layout = "w4a16";  // one of w4a16, bf16 (--dflash-hf defaults to bf16 instead)
+  bool dflash_layout_set = false;
+  // --dflash-hf <HF DFlash v1 dir> --out <container> [--layout {bf16,w4a16}] (dflash2_hf.hpp): converts a
+  // z-lab DFlash v1 checkpoint with a synthesized identity conv and zero selector.
+  std::string dflash_hf;
+  int64_t dflash_layer_offset = 1;  // stored target_layers = target_layer_ids + this (z-lab: hidden_states[id + 1])
+  bool dflash_layer_offset_set = false;
+  double dflash_embed_scale = 0.0;  // <= 0: the checkpoint's input_embedding_scale (1.0 when absent)
 
   // How the 4-bit quantizers choose their (scale, zero) values -- the on-disk BYTE LAYOUT is
   // identical either way (src/convert/include/r4dx_convert/quant_search.hpp). "rtn" (default) is
@@ -391,6 +430,11 @@ struct AppArgs {
   std::string rotate = "none";
   uint64_t rotation_seed = r4dx_convert::kDefaultRotationSeed;
   bool rotation_seed_explicit = false;
+  // --rotation-out <file.safetensors> (with --input and --rotate q2a|q2ab; no --output): writes only
+  // the rotation tensors the run would put in a container (+ their fingerprint) and exits. This is how
+  // tools/reference/trellis_quant.py --rotation gets the exact Q the converter folds with, so the
+  // oracle quantizes the weights and Hessians of the SAME rotated basis (docs/gemma4-plan.md 4.6).
+  std::string rotation_out;
 
   // Per-tensor w4a16 groups (docs/quant2.md section 5; w4a16_groups.hpp): every
   // --w4a16-group-rule "<regex>=<g>" in command-line order, first match wins. Empty (default) =
@@ -466,12 +510,29 @@ AppArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--threads") a.threads = std::stoi(next(i));
     else if (arg == "--vision") a.vision = ParseOnOff(next(i), "--vision");
     else if (arg == "--mtp") a.mtp = ParseOnOff(next(i), "--mtp");
+    else if (arg == "--audio") a.audio = ParseOnOff(next(i), "--audio");
     else if (arg == "--no-bf16") a.no_bf16 = true;
     else if (arg == "--kv-calib") a.kv_calib = next(i);
     else if (arg == "--draft-vocab-ids") a.draft_vocab_ids = next(i);
     else if (arg == "--dflash-gguf") a.dflash_gguf = next(i);
     else if (arg == "--out") a.dflash_out = next(i);
-    else if (arg == "--layout") a.dflash_layout = next(i);
+    else if (arg == "--layout") { a.dflash_layout = next(i); a.dflash_layout_set = true; }
+    else if (arg == "--dflash-hf") a.dflash_hf = next(i);
+    else if (arg == "--dflash-target-layer-offset") {
+      const std::string v = next(i);
+      if (v != "0" && v != "1") throw std::runtime_error("--dflash-target-layer-offset must be 0 or 1, got '" + v + "'");
+      a.dflash_layer_offset = v == "1" ? 1 : 0;
+      a.dflash_layer_offset_set = true;
+    }
+    else if (arg == "--dflash-embed-scale") {
+      const std::string v = next(i);
+      size_t used = 0;
+      double s = 0.0;
+      try { s = std::stod(v, &used); } catch (const std::exception&) { used = 0; }
+      if (used != v.size() || !(s > 0.0) || !std::isfinite(s))
+        throw std::runtime_error("--dflash-embed-scale must be a finite number > 0, got '" + v + "'");
+      a.dflash_embed_scale = s;
+    }
     else if (arg == "--quant") a.quant = next(i);
     else if (arg == "--imatrix") a.imatrix = next(i);
     else if (arg == "--keep-bf16") a.keep_bf16 = next(i);
@@ -489,6 +550,7 @@ AppArgs ParseArgs(int argc, char** argv) {
         throw std::runtime_error("--ldlq-damp must be a finite number >= 0, got '" + v + "'");
     }
     else if (arg == "--rotate") a.rotate = next(i);
+    else if (arg == "--rotation-out") a.rotation_out = next(i);
     else if (arg == "--rotation-seed") {
       a.rotation_seed = ParseSeed(next(i));
       a.rotation_seed_explicit = true;
@@ -549,13 +611,18 @@ AppArgs ParseArgs(int argc, char** argv) {
     }
     else throw std::runtime_error("unknown argument: " + arg);
   }
+  const bool dflash_mode = !a.dflash_gguf.empty() || !a.dflash_hf.empty();
+  if (!a.dflash_gguf.empty() && !a.dflash_hf.empty())
+    throw std::runtime_error("--dflash-gguf and --dflash-hf are mutually exclusive");
+  if (a.dflash_hf.empty() && (a.dflash_layer_offset_set || a.dflash_embed_scale > 0.0))
+    throw std::runtime_error("--dflash-target-layer-offset / --dflash-embed-scale need --dflash-hf");
   // --trellis-from (docs/trellis-kernel.md 3.3 step 6): an import of oracle bits into the Qwen
   // body. The selftest and the drafter have no body to import into; a reuse has nothing to reuse
   // (an import is I/O-bound) and its guard does not cover the oracle files (refused in v1, 3.4).
   if (a.trellis_options && a.trellis.from.empty())
     throw std::runtime_error("--trellis-manifest-sha256 / --trellis-verify / --trellis-allow-basis "
                              "/ --trellis-prescale-log2 need --trellis-from");
-  if (!a.trellis.from.empty() && (a.selftest || !a.dflash_gguf.empty()))
+  if (!a.trellis.from.empty() && (a.selftest || dflash_mode))
     throw std::runtime_error("--trellis-from applies only to the HF-checkpoint conversion "
                              "(--input/--output), not to --selftest or --dflash-gguf");
   if (!a.trellis.from.empty() && (!a.reuse_from.empty() || a.record_reuse_guard))
@@ -565,7 +632,7 @@ AppArgs ParseArgs(int argc, char** argv) {
                              "reuse)");
   // The guard describes an HF-checkpoint conversion (checkpoint files, its flags); the selftest and
   // the drafter have neither a sweep to share a baseline across nor a guard to check one against.
-  if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || !a.dflash_gguf.empty()))
+  if ((!a.reuse_from.empty() || a.record_reuse_guard) && (a.selftest || dflash_mode))
     throw std::runtime_error("--reuse-tensors-from / --record-reuse-guard apply only to the "
                              "HF-checkpoint conversion (--input/--output), not to --selftest or "
                              "--dflash-gguf");
@@ -575,7 +642,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // The DFlash2 drafter's loader (src/model/dflash_draft.cpp) reads every w4a16 linear at the
   // container's one default group, and its tensors share none of the Qwen base names the rules are
   // written against -- reject the combination rather than build a drafter it silently ignored.
-  if (!a.w4a16_group_rules.empty() && !a.dflash_gguf.empty())
+  if (!a.w4a16_group_rules.empty() && dflash_mode)
     throw std::runtime_error("--w4a16-group-rule does not apply to --dflash-gguf (the drafter is "
                              "packed at the build's default w4a16 group only)");
   const r4dx_convert::RotationKind rotate_kind = r4dx_convert::ParseRotationKind(a.rotate);
@@ -583,16 +650,22 @@ AppArgs ParseArgs(int argc, char** argv) {
   // undone at its exit by the runtime): the selftest's one bare tensor has no residual stream to
   // rotate and no runtime to undo it, and the DFlash2 drafter is un-rotated by design
   // (docs/quant2.md 1.2) -- a rotated drafter would be silently wrong, so both are argument errors.
-  if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || !a.dflash_gguf.empty()))
+  if (rotate_kind != r4dx_convert::RotationKind::kNone && (a.selftest || dflash_mode))
     throw std::runtime_error("--rotate applies only to the HF-checkpoint conversion (--input/--output), "
                              "not to --selftest or --dflash-gguf");
-  // A trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with the
-  // norms removed it would be garbage, and the runtime cannot rotate per linear
-  // (docs/trellis-kernel.md 3.4). The loader refuses the combination too.
-  if (rotate_kind != r4dx_convert::RotationKind::kNone && !a.trellis.from.empty())
-    throw std::runtime_error("--trellis-from needs --rotate none (got --rotate " + a.rotate +
-                             "): the oracle quantized the unrotated weights, and a rotated "
-                             "container would feed them x Q with the norms folded away");
+  // A Qwen trellis linear quantizes the UNROTATED W (its own RHT does the incoherence); fed x Q with
+  // the norms removed it would be garbage, and the runtime cannot rotate per linear
+  // (docs/trellis-kernel.md 3.4). The loader refuses the combination too. That refusal is Qwen's:
+  // RunConvert applies it once config.json says which family this is, because a Gemma oracle run may
+  // quantize the FOLDED weights (trellis_quant.py --rotation; TrellisSource::CheckRotation).
+  if (!a.rotation_out.empty()) {
+    if (rotate_kind == r4dx_convert::RotationKind::kNone)
+      throw std::runtime_error("--rotation-out needs --rotate q2a|q2ab (there is no rotation to write)");
+    if (a.input.empty() || !a.output.empty() || a.selftest || dflash_mode ||
+        !a.trellis.from.empty())
+      throw std::runtime_error("--rotation-out takes --input and --rotate only (no --output, "
+                               "--selftest, --dflash-gguf or --trellis-from)");
+  }
   if (a.quant != "rtn" && a.quant != "search")
     throw std::runtime_error("--quant must be 'rtn' or 'search', got '" + a.quant + "'");
   if (!a.imatrix.empty() && a.quant != "search")
@@ -601,7 +674,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // (tools/reference/imatrix_capture.py); the DFlash2 drafter's tensors share none of them, so an
   // --imatrix passed alongside --dflash-gguf could only ever be a no-op. Reject it instead of
   // silently converting the drafter with unweighted MSE and reporting "imatrix-weighted".
-  if (!a.imatrix.empty() && !a.dflash_gguf.empty())
+  if (!a.imatrix.empty() && dflash_mode)
     throw std::runtime_error(
         "--imatrix does not apply to --dflash-gguf (the drafter has no importance matrix; "
         "tools/reference/imatrix_capture.py only captures the main model's linears)");
@@ -610,7 +683,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // exact failure mode the "matched nothing" warning exists to make visible, so reject it outright
   // rather than emit a warning nobody reads in a sweep log. (--layout bf16 is how you get a bf16
   // drafter.)
-  if (!a.keep_bf16.empty() && !a.dflash_gguf.empty())
+  if (!a.keep_bf16.empty() && dflash_mode)
     throw std::runtime_error("--keep-bf16 does not apply to --dflash-gguf (use --layout bf16 for a "
                              "bf16 drafter container)");
   // --ldlq has nothing to round against without the Hessians; failing here rather than at the first
@@ -622,7 +695,7 @@ AppArgs ParseArgs(int argc, char** argv) {
   // the DFlash2 drafter" is a non-goal), and its keys are the Qwen container's base names -- the
   // drafter shares none of them, so the flags could only ever be a no-op there. Same reasoning as
   // --imatrix/--keep-bf16 above.
-  if ((!a.ldlq.empty() || !a.hessian_dir.empty()) && !a.dflash_gguf.empty())
+  if ((!a.ldlq.empty() || !a.hessian_dir.empty()) && dflash_mode)
     throw std::runtime_error("--ldlq/--hessian-dir do not apply to --dflash-gguf (no Hessians are "
                              "captured for the drafter; tools/reference/hessian_capture.py only "
                              "covers the main model's linears)");
@@ -913,13 +986,17 @@ class LdlqSource {
 // default (kNone) -- and handed to add_linear as a VARIABLE, never as a string literal:
 // tools/reference/imatrix_capture.py's audit_converter_source parses every add_linear call and
 // requires exactly one quoted string after the HF-name list.
-enum class HadSite { kNone, kDown, kO, kGdnOut };
+// kOSliding / kOFull are Gemma 4's two attention widths (o_swa K=4096, o_full K=8192).
+enum class HadSite { kNone, kDown, kO, kGdnOut, kOSliding, kOFull };
 
 struct LinearFold {
-  enum Kind { kNone, kIn, kOut };
+  // kHadOnly: Gemma's "option A" out-projections (docs/gemma4-plan.md 4.4) -- only W Hb on the K side,
+  // no Q^T on the output rows, because the post-norm between the projection and the residual add
+  // does not commute with Q; the runtime rotates AFTER that norm (post_rmsnorm_rotate_add).
+  enum Kind { kNone, kIn, kOut, kHadOnly };
   Kind kind = kNone;
-  std::string norm_hf;           // kIn: the HF zero-centred norm whose (1 + w) folds into this linear
-  HadSite had = HadSite::kNone;  // kOut under q2ab: the block Hadamard folded into the K side
+  std::string norm_hf;           // kIn: the HF norm whose weight folds into this linear
+  HadSite had = HadSite::kNone;  // kOut under q2ab / kHadOnly: the block Hadamard folded into the K side
   // The linear's INPUT basis changes (so its Hessian / imatrix vector must follow it).
   bool RotatesInput() const { return kind == kIn || had != HadSite::kNone; }
 };
@@ -929,6 +1006,8 @@ const char* HadSiteName(HadSite s) {
     case HadSite::kDown: return "down";
     case HadSite::kO: return "o";
     case HadSite::kGdnOut: return "gdn_out";
+    case HadSite::kOSliding: return "o_swa";
+    case HadSite::kOFull: return "o_full";
     default: return "none";
   }
 }
@@ -951,13 +1030,27 @@ class RotationSource {
     }
     RotationShape shape;
     shape.hidden = text_cfg.at("hidden_size").get<int64_t>();
-    // The runtime's online op (src/kernels, one workgroup per 5120-wide row) and the tensor name
-    // rotation.mix5 are both this exact factorization, so anything else is refused here rather than
-    // written as a container no binary can run.
-    if (shape.hidden != 5 * kRotationBlock)
+    // Any hidden width: block = the largest power of two dividing it, capped at 1024 (5120 -> 1024 x 5,
+    // exactly the Qwen bytes; Gemma's 3840 -> 256 x 15). Below 64 the Hadamard stops mixing anything.
+    shape.block = ChooseRotationBlock(shape.hidden);
+    if (shape.block < 64)
       throw std::runtime_error("--rotate: hidden_size=" + std::to_string(shape.hidden) +
-                               ", but the rotation is defined for 5120 = 5 x 1024 only");
-    if (kind_ == RotationKind::kQ2ab) {
+                               " has a power-of-two block of only " + std::to_string(shape.block) +
+                               " (need >= 64)");
+    // Gemma 4 (nested text config carries global_head_dim): plain-weight norms (offset 0), option-A
+    // out-projections (Hadamard-only, docs/gemma4-plan.md 4.4), three sign sites, no GDN.
+    gemma_ = text_cfg.contains("global_head_dim");
+    norm_offset_ = gemma_ ? 0.0 : 1.0;
+    if (gemma_ && kind_ == RotationKind::kQ2ab) {
+      const int64_t head_dim = text_cfg.at("head_dim").get<int64_t>();
+      const int64_t global_head_dim = text_cfg.at("global_head_dim").get<int64_t>();
+      const int64_t heads = text_cfg.at("num_attention_heads").get<int64_t>();
+      shape.k_down = text_cfg.at("intermediate_size").get<int64_t>();
+      shape.k_o = heads * head_dim;
+      shape.k_o_full = heads * global_head_dim;
+      shape.b_o = kHadBlockO;
+      shape.b_o_full = kHadBlockO;
+    } else if (kind_ == RotationKind::kQ2ab) {
       const int64_t head_dim = text_cfg.at("head_dim").get<int64_t>();
       const int64_t v_head_dim = text_cfg.at("linear_value_head_dim").get<int64_t>();
       // attn.o's and gdn.out_proj's Hadamard block IS one head (the runtime's fused kernels run one
@@ -988,20 +1081,32 @@ class RotationSource {
     }
     return f;
   }
+  // Gemma (option A): kHadOnly under q2ab; under q2a the out-projections are not folded at all (the
+  // post-norm blocks Q^T W) and Out() returns kNone. Qwen: kOut (Q^T W, plus Hb under q2ab).
   LinearFold Out(HadSite site) const {
     LinearFold f;
-    if (Enabled()) {
+    if (Enabled() && gemma_) {
+      if (Hadamard()) {
+        f.kind = LinearFold::kHadOnly;
+        f.had = site;
+      }
+    } else if (Enabled()) {
       f.kind = LinearFold::kOut;
       if (Hadamard()) f.had = site;
     }
     return f;
   }
 
+  bool Gemma() const { return gemma_; }
+  double NormOffset() const { return norm_offset_; }
+
   const r4dx_convert::BlockHadamard& Had(HadSite s) const {
     switch (s) {
       case HadSite::kDown: return set_.had_down;
-      case HadSite::kO: return set_.had_o;
+      case HadSite::kO:
+      case HadSite::kOSliding: return set_.had_o;
       case HadSite::kGdnOut: return set_.had_gdn_out;
+      case HadSite::kOFull: return set_.had_o_full;
       default: throw std::logic_error("RotationSource::Had(kNone)");
     }
   }
@@ -1022,7 +1127,8 @@ class RotationSource {
                                  "' is not a [" + std::to_string(hidden) + "] vector");
       return;
     }
-    if (N != hidden)
+    // kHadOnly leaves the output rows alone, so only kOut needs N == hidden.
+    if (f.kind == LinearFold::kOut && N != hidden)
       throw std::runtime_error("--rotate: out-projection '" + base + "' has N=" + std::to_string(N) +
                                ", expected hidden=" + std::to_string(hidden));
     if (f.had != HadSite::kNone && K != Had(f.had).K)
@@ -1046,7 +1152,7 @@ class RotationSource {
             int64_t K, int threads) {
     using namespace r4dx_convert;
     if (f.kind == LinearFold::kIn) {
-      FoldRowsQ(w, N, K, norm.data(), set_.q, threads);
+      FoldRowsQ(w, N, K, norm.data(), set_.q, threads, norm_offset_);
       ++folded_in_;
     } else if (f.kind == LinearFold::kOut) {
       FoldColumnsQt(w, N, K, set_.q, threads);
@@ -1055,7 +1161,62 @@ class RotationSource {
         FoldRowsHadamard(w, N, K, Had(f.had), threads);
         ++folded_had_;
       }
+    } else if (f.kind == LinearFold::kHadOnly) {
+      FoldRowsHadamard(w, N, K, Had(f.had), threads);
+      ++folded_had_;
     }
+  }
+
+  // The same row-wise fold as Fold(), const, single-threaded and WITHOUT the counters: what the
+  // --trellis-from reconstruction check applies to a 128-row block of the checkpoint weight, from
+  // several worker threads at once. Only the folds that act on rows independently (an in-projection's
+  // W diag(w) Q, a Hadamard-only out-projection's W Hb -- everything Gemma folds); Qwen's Q^T W mixes
+  // rows and is refused (rotated trellis is Gemma-only, RunConvert checks).
+  void FoldRowsBlock(const LinearFold& f, const std::vector<float>& norm, std::vector<float>& w,
+                     int64_t N, int64_t K) const {
+    using namespace r4dx_convert;
+    if (f.kind == LinearFold::kIn) {
+      FoldRowsQ(w, N, K, norm.data(), set_.q, 1, norm_offset_);
+    } else if (f.kind == LinearFold::kHadOnly) {
+      FoldRowsHadamard(w, N, K, Had(f.had), 1);
+    } else if (f.kind != LinearFold::kNone) {
+      throw std::logic_error("RotationSource::FoldRowsBlock: Q^T W folds act on columns");
+    }
+  }
+
+  // The rotation tensors in container order (signs, mix, then the q2ab sign vectors that exist): the
+  // exact values every fold above used. Written to the container (add_fp32_values below) and by
+  // --rotation-out, hashed by Fingerprint().
+  std::vector<std::pair<std::string, const std::vector<float>*>> Tensors() const {
+    std::vector<std::pair<std::string, const std::vector<float>*>> t;
+    if (!Enabled()) return t;
+    t.emplace_back("rotation.signs", &set_.q.signs);
+    t.emplace_back(r4dx_convert::RotationMixName(set_.q.nblk), &set_.q.mix);
+    if (Hadamard()) {
+      t.emplace_back("rotation.had_down_signs", &set_.had_down.signs);
+      t.emplace_back("rotation.had_o_signs", &set_.had_o.signs);
+      if (!set_.had_gdn_out.Empty()) t.emplace_back("rotation.had_gdn_out_signs", &set_.had_gdn_out.signs);
+      if (!set_.had_o_full.Empty()) t.emplace_back("rotation.had_o_full_signs", &set_.had_o_full.signs);
+    }
+    return t;
+  }
+
+  // What ties a rotated --trellis-from manifest to this run's Q (TrellisOptions::rotation): the kind,
+  // the seed and the sha256 of "r4dx-rotation-v1\n" + per tensor (name, "\n", u64le element count, the
+  // fp32 little-endian bytes). trellis_quant.py --rotation recomputes it from the --rotation-out file.
+  nlohmann::json Fingerprint() const {
+    std::string blob = "r4dx-rotation-v1\n";
+    for (const auto& [name, vals] : Tensors()) {
+      blob += name + "\n";
+      const uint64_t n = vals->size();
+      blob.append(reinterpret_cast<const char*>(&n), sizeof(n));
+      blob.append(reinterpret_cast<const char*>(vals->data()), vals->size() * sizeof(float));
+    }
+    return {{"kind", KindName()},
+            {"seed", set_.seed},
+            {"tensors_sha256", r4dx_convert::Sha256Hex(blob)},
+            {"hidden", set_.q.hidden},
+            {"block", set_.q.block}};
   }
 
   // The --imatrix vector carried into the folded linear's input basis under the diagonal model
@@ -1064,7 +1225,7 @@ class RotationSource {
                                 const r4dx_convert::ImportanceVector& v, int64_t K) {
     ++imatrix_rotated_;
     if (f.kind == LinearFold::kIn)
-      return r4dx_convert::TransformImportanceQ(v.data, K, norm.data(), set_.q);
+      return r4dx_convert::TransformImportanceQ(v.data, K, norm.data(), set_.q, norm_offset_);
     return r4dx_convert::TransformImportanceHadamard(v.data, K, Had(f.had));
   }
 
@@ -1080,7 +1241,7 @@ class RotationSource {
         norm.data(), static_cast<int64_t>(norm.size()),
         "--rotate " + std::string(KindName()) + " --ldlq: '" + base + "' (norm '" + f.norm_hf +
             "') has no rms Hessian in hessian.json, and its post-norm Hessian cannot be used",
-        r4dx_convert::kRmsHessianHint);
+        r4dx_convert::kRmsHessianHint, norm_offset_);
     ++ldlq_divided_;
   }
 
@@ -1108,9 +1269,11 @@ class RotationSource {
     } else if (f.kind == LinearFold::kIn) {
       const std::string bytes(reinterpret_cast<const char*>(norm.data()), norm.size() * sizeof(float));
       xf->id = prefix + "in:" + f.norm_hf + ":" + r4dx_convert::Sha256Hex(bytes);
+      if (norm_offset_ != 1.0) xf->id += ":off=" + std::to_string(norm_offset_);  // Qwen's id unchanged
       const r4dx_convert::ResidualRotation* q = &set_.q;
-      xf->apply = [q, norm](std::vector<float>& H, int64_t K, int t) {
-        r4dx_convert::TransformHessianQ(H, K, norm.data(), *q, t);
+      const double off = norm_offset_;
+      xf->apply = [q, norm, off](std::vector<float>& H, int64_t K, int t) {
+        r4dx_convert::TransformHessianQ(H, K, norm.data(), *q, t, off);
       };
     } else {
       xf->id = prefix + "had:" + HadSiteName(f.had);
@@ -1128,16 +1291,24 @@ class RotationSource {
                         {"seed", set_.seed},
                         {"hidden", set_.q.hidden},
                         {"block", set_.q.block}};
-    if (Hadamard())
-      j["had"] = {{"down", set_.had_down.block}, {"o", set_.had_o.block},
-                  {"gdn_out", set_.had_gdn_out.block}};
+    // Qwen's header keeps exactly its old keys (5 blocks, Q^T-folded outputs, three Hadamard sites).
+    if (set_.q.nblk != 5) j["nblk"] = set_.q.nblk;
+    if (Hadamard()) {
+      j["had"] = {{"down", set_.had_down.block}, {"o", set_.had_o.block}};
+      if (!set_.had_gdn_out.Empty()) j["had"]["gdn_out"] = set_.had_gdn_out.block;
+      if (!set_.had_o_full.Empty()) j["had"]["o_full"] = set_.had_o_full.block;
+    }
+    // Gemma option A: outputs of o / down stay in the original basis; the runtime rotates after the
+    // post-norm. A runtime that predates it must refuse the container (it would add unrotated output).
+    if (gemma_) j["out_fold"] = "had_only";
     return j;
   }
 
   void ReportRun(std::ostream& log) const {
     if (!Enabled()) return;
     log << "[r4dx-convert] rotate " << KindName() << ": folded " << folded_in_
-        << " in-projection(s) (W diag(1+w) Q), " << folded_out_ << " out-projection(s) (Q^T W)";
+        << " in-projection(s) (" << (gemma_ ? "W diag(w) Q" : "W diag(1+w) Q") << "), " << folded_out_
+        << " out-projection(s) (Q^T W)";
     if (Hadamard()) log << ", " << folded_had_ << " of them also W Hb on the K side";
     log << "; " << ldlq_rotated_ << " LDLQ Hessian(s) and " << imatrix_rotated_
         << " imatrix vector(s) carried into the rotated basis";
@@ -1150,6 +1321,8 @@ class RotationSource {
  private:
   r4dx_convert::RotationKind kind_;
   r4dx_convert::RotationSet set_;
+  bool gemma_ = false;
+  double norm_offset_ = 1.0;  // Qwen zero-centred norms fold (1 + w); Gemma's plain norms fold w
   int64_t folded_in_ = 0, folded_out_ = 0, folded_had_ = 0, ldlq_rotated_ = 0,
           imatrix_rotated_ = 0, ldlq_divided_ = 0;
 };
@@ -1513,6 +1686,53 @@ ReusePlan PlanReuse(const r4dx_convert::BaselineContainer& b, const ContainerWri
   return p;
 }
 
+// ---- --rotation-out ------------------------------------------------------------------------------
+
+// Writes the rotation tensors a `--rotate` run of this checkpoint would put in its container, as a
+// plain safetensors file (F32, natural shapes: signs [hidden], mix [nblk, nblk], had_* [K]), with
+// __metadata__ {format "r4dx-rotation", rotation (the container's __metadata__.rotation), fingerprint
+// (what a rotated --trellis-from manifest must carry), config_sha256}. tools/reference/trellis_quant.py
+// --rotation reads it: the oracle then folds weights and Hessians with exactly the converter's Q / Hb,
+// not a re-implementation of the seed's generator. Reads config.json only.
+int RunRotationOut(const AppArgs& args) {
+  const std::string config_text = ReadFile(args.input + "\\config.json");
+  const nlohmann::json config = nlohmann::json::parse(config_text);
+  RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit,
+                     config.at("text_config"));
+  const auto tensors = rot.Tensors();
+  const r4dx_convert::RotationSet& rs = rot.Set();
+  nlohmann::json header = nlohmann::json::object();
+  header["__metadata__"] = {{"format", "r4dx-rotation"},
+                            {"rotation", rot.Metadata().dump()},
+                            {"fingerprint", rot.Fingerprint().dump()},
+                            {"config_sha256", r4dx_convert::Sha256Hex(config_text)}};
+  uint64_t off = 0;
+  for (const auto& [name, vals] : tensors) {
+    const std::vector<int64_t> shape = vals == &rs.q.mix
+                                           ? std::vector<int64_t>{rs.q.nblk, rs.q.nblk}
+                                           : std::vector<int64_t>{static_cast<int64_t>(vals->size())};
+    const uint64_t bytes = vals->size() * sizeof(float);
+    header[name] = {{"dtype", "F32"}, {"shape", shape}, {"data_offsets", {off, off + bytes}}};
+    off += bytes;
+  }
+  std::string h = header.dump();
+  h.append((8 - h.size() % 8) % 8, ' ');
+  std::ofstream f(r4dx_convert::Utf8ToWide(args.rotation_out).c_str(), std::ios::binary | std::ios::trunc);
+  if (!f) throw std::runtime_error("--rotation-out: cannot open " + args.rotation_out + " for writing");
+  const uint64_t hlen = h.size();
+  f.write(reinterpret_cast<const char*>(&hlen), 8);
+  f.write(h.data(), static_cast<std::streamsize>(h.size()));
+  for (const auto& [name, vals] : tensors)
+    f.write(reinterpret_cast<const char*>(vals->data()),
+            static_cast<std::streamsize>(vals->size() * sizeof(float)));
+  f.close();
+  if (!f) throw std::runtime_error("--rotation-out: writing " + args.rotation_out + " failed");
+  std::cout << "[r4dx-convert] rotation-out: " << rot.KindName() << " seed=0x" << std::hex << rot.Seed()
+            << std::dec << ", " << tensors.size() << " tensor(s) -> " << args.rotation_out
+            << "\n[r4dx-convert] fingerprint " << rot.Fingerprint().dump() << "\n";
+  return 0;
+}
+
 // ---- normal mode --------------------------------------------------------------------------
 
 int RunConvert(const AppArgs& args) {
@@ -1528,8 +1748,27 @@ int RunConvert(const AppArgs& args) {
       text_cfg.at("layer_types").get<std::vector<std::string>>();
   const int layers = args.layers > 0 ? std::min(args.layers, num_layers_total) : num_layers_total;
   const bool full_run = (layers == num_layers_total);
-  const bool do_vision = args.vision >= 0 ? (args.vision == 1) : full_run;
-  const bool do_mtp = args.mtp >= 0 ? (args.mtp == 1) : full_run;
+  // Gemma 4 (gemma_layout.hpp): the Gemma branch below registers its own tensors; the Qwen code that
+  // follows is reached only when this is false, so a Qwen run is exactly what it was.
+  const bool is_gemma = config.value("model_type", std::string()) == r4dx_convert::gemma::kModelArch;
+  if (!is_gemma && args.audio == 1)
+    throw std::runtime_error("--audio applies to Gemma 4 checkpoints only (this one is not gemma4_unified)");
+  if (is_gemma && args.mtp == 1)
+    throw std::runtime_error("--mtp on: a gemma4_unified checkpoint has no MTP head");
+  // Qwen: a trellis linear quantizes the unrotated W (see ParseArgs). Gemma may import a rotated oracle
+  // run (TrellisSource::CheckRotation ties it to this run's Q); the Gemma trellis import is keyed by HF
+  // names (every body base is text.layers.*), which is all trellis_import.hpp reads.
+  if (!is_gemma && !args.trellis.from.empty() &&
+      r4dx_convert::ParseRotationKind(args.rotate) != r4dx_convert::RotationKind::kNone)
+    throw std::runtime_error("--trellis-from needs --rotate none (got --rotate " + args.rotate +
+                             "): the oracle quantized the unrotated weights, and a rotated "
+                             "container would feed them x Q with the norms folded away");
+  if (is_gemma && (args.record_reuse_guard || !args.reuse_from.empty()))
+    throw std::runtime_error("--record-reuse-guard / --reuse-tensors-from are not supported for gemma4_unified "
+                             "yet (the guard reads model.safetensors.index.json)");
+  const bool do_audio = is_gemma && args.audio == 1;
+  const bool do_vision = is_gemma ? (args.vision == 1) : (args.vision >= 0 ? (args.vision == 1) : full_run);
+  const bool do_mtp = is_gemma ? false : (args.mtp >= 0 ? (args.mtp == 1) : full_run);
 
   LayoutSet layouts = ParseLayoutList(args.layouts_spec, /*bf16_default_on=*/true);
   LayoutSet lm_head_layouts = ParseLayoutList(args.lm_head_spec, /*bf16_default_on=*/false);
@@ -1548,6 +1787,9 @@ int RunConvert(const AppArgs& args) {
             << "[r4dx-convert] hidden=" << hidden << " layers=" << layers << "/" << num_layers_total
             << " threads=" << threads << " vision=" << (do_vision ? "on" : "off")
             << " mtp=" << (do_mtp ? "on" : "off") << "\n";
+  if (is_gemma)
+    std::cout << "[r4dx-convert] arch=" << r4dx_convert::gemma::kModelArch
+              << " audio=" << (do_audio ? "on" : "off") << "\n";
 
   // The BYTE LAYOUT is identical in both modes (docs/container-format.md "How the quantized values
   // are chosen"); only the (scale, zero) values differ.
@@ -1589,8 +1831,8 @@ int RunConvert(const AppArgs& args) {
   RotationSource rot(args.rotate, args.rotation_seed, args.rotation_seed_explicit, text_cfg);
   if (rot.Enabled()) {
     std::cout << "[r4dx-convert] rotate=" << rot.KindName() << " seed=0x" << std::hex << rot.Seed()
-              << std::dec << " (text layers folded; norms stored as 0; rotation.* tensors + "
-              << "__metadata__.rotation written)\n";
+              << std::dec << " (text layers folded; norms stored as " << (rot.Gemma() ? "1" : "0")
+              << "; rotation.* tensors + __metadata__.rotation written)\n";
     if (!args.imatrix.empty())
       std::cout << "[r4dx-convert] rotate: --imatrix vectors of rotated linears are carried into the "
                    "new basis under the diagonal model (rotation.hpp) -- use --ldlq for the exact "
@@ -1602,7 +1844,15 @@ int RunConvert(const AppArgs& args) {
   // --trellis-manifest-sha256 pin) run here, before the first shard is opened; the per-linear
   // checks run as add_linear resolves each body linear and in the planning pass, the file hashes
   // right after it.
-  r4dx_convert::trellis::TrellisSource trellis(args.trellis, config_text);
+  // A rotated Gemma run hands TrellisSource its Q's fingerprint: the manifest must carry the same one
+  // (the oracle folded this Q), and an unrotated run refuses a manifest that carries any.
+  r4dx_convert::trellis::TrellisOptions trellis_opt = args.trellis;
+  if (rot.Enabled() && !args.trellis.from.empty()) {
+    trellis_opt.rotation = rot.Fingerprint();
+    std::cout << "[r4dx-convert] rotated trellis: the manifest must carry rotation "
+              << trellis_opt.rotation.dump() << " (trellis_quant.py --rotation)\n";
+  }
+  r4dx_convert::trellis::TrellisSource trellis(trellis_opt, config_text);
   if (trellis.Enabled()) {
     std::cout << "[r4dx-convert] trellis-from=" << trellis.ManifestPath() << " (sha256 "
               << trellis.ManifestSha256() << ", " << (trellis.IsMix() ? "mix" : "quantize-model")
@@ -1819,6 +2069,12 @@ int RunConvert(const AppArgs& args) {
                 std::cout, use_rms);
   };
 
+  struct VerifyFold {
+    LinearFold fold;
+    std::vector<float> norm;
+  };
+  std::map<std::string, VerifyFold> verify_folds;  // HF name -> its fold (rotated trellis imports)
+
   // `fold` is what --rotate does to this linear (RotationSource::In / Out); the default, kNone, is
   // what every call outside the text-layer loop -- and every call without --rotate -- gets.
   auto add_linear = [&](std::vector<std::string> hf_names, std::string container_base,
@@ -1842,6 +2098,13 @@ int RunConvert(const AppArgs& args) {
       LayoutSet tls;
       imported = trellis.Resolve(container_base, hf_names, kept, &tls, std::cout);
       if (tls.trellis) requested = tls;
+    }
+    // A rotated trellis import (Gemma): the oracle quantized fold(W), so the reconstruction check
+    // must compare against the same fold of the checkpoint weight (the fold and its norm, per HF
+    // tensor; the norm is read here, single-threaded, for the worker threads of the check).
+    if (imported && fold.kind != LinearFold::kNone) {
+      const std::vector<float> norm = rot.ReadNorm(fold, model);
+      for (const auto& n : hf_names) verify_folds[n] = {fold, norm};
     }
     const LayoutSet ls = kept ? r4dx_convert::KeptBf16LayoutSet() : requested;
     const bool ldlq_matched = ldlq.Matches(container_base);
@@ -1915,7 +2178,75 @@ int RunConvert(const AppArgs& args) {
     });
   };
 
-  for (int i = 0; i < layers; ++i) {
+  // ---- Gemma 4 branch (gemma_layout.cpp): the whole text stack, embeddings, head and the optional
+  // vision/audio passthrough, through the same closures the Qwen loop below uses ----------------------
+  if (is_gemma) {
+    namespace gm = r4dx_convert::gemma;
+    const gm::TextShape gshape = gm::ParseTextConfig(text_cfg);
+    gm::Kit kit;
+    kit.all_names = [&model]() { return model.AllNames(); };
+    kit.has = [&model](const std::string& n) { return model.Has(n); };
+    kit.shape = [&model](const std::string& n) { return model.Meta(n).shape; };
+    kit.add_bf16 = add_bf16;
+    // A norm --rotate folds into the next linears: the bf16 copy without it; with it plain ones (the
+    // plain-weight analogue of Qwen's zeros: rms(x) * 1 commutes with Q), under `<name>.rotated` so a
+    // binary that predates the rotation refuses the container by the missing bare name.
+    kit.add_folded_norm = [&](const std::string& hf_name, const std::string& container_name) {
+      if (!rot.Enabled()) {
+        add_bf16(hf_name, container_name);
+        return;
+      }
+      const std::string name = container_name + ".rotated";
+      plan_jobs.push_back([&writer, &model, hf_name, name]() {
+        const auto& meta = model.Meta(hf_name);
+        std::vector<int64_t> shape = meta.shape;
+        shape.push_back(2);
+        writer.Plan(name, shape, static_cast<uint64_t>(meta.ElemCount()) * 2);
+      });
+      emit_jobs.push_back([&writer, &model, hf_name, name]() {
+        std::vector<uint8_t> ones(static_cast<size_t>(model.Meta(hf_name).ElemCount()) * 2, 0);
+        for (size_t k = 0; k < ones.size(); k += 2) {  // bf16 1.0 = 0x3F80, little-endian
+          ones[k] = 0x80;
+          ones[k + 1] = 0x3F;
+        }
+        writer.WriteTensor(name, ones.data(), ones.size());
+      });
+    };
+    kit.add_fp32_widen = add_fp32_widen;
+    kit.add_descale = [&](const std::string& container_name, int n_kv, int layer_idx, const char* kind) {
+      add_descale(container_name, n_kv, layer_idx, kind, /*calib_applicable=*/true);
+    };
+    kit.add_linear = [&](const std::vector<std::string>& hf_names, const std::string& base,
+                         const gm::Fold& f) {
+      // What --rotate does to this linear (all kNone without it; under q2a Gemma's out-projections are
+      // not folded at all, under q2ab they take only the Hadamard: RotationSource::Out).
+      LinearFold fold;
+      if (!f.in_norm_hf.empty()) {
+        fold = rot.In(f.in_norm_hf);
+      } else if (f.out == gm::OutSite::kDown) {
+        fold = rot.Out(HadSite::kDown);
+      } else if (f.out == gm::OutSite::kOSliding) {
+        fold = rot.Out(HadSite::kOSliding);
+      } else if (f.out == gm::OutSite::kOFull) {
+        fold = rot.Out(HadSite::kOFull);
+      }
+      add_linear(hf_names, base, f.head ? lm_head_layouts : layouts, fold);
+    };
+    const std::set<std::string> consumed = gm::AddTextStack(kit, gshape, layers, do_vision, do_audio);
+    // The coverage audit: nothing in the checkpoint may be silently left out of the container.
+    const std::vector<std::string> unconsumed =
+        gm::UnconsumedTensors(model.AllNames(), consumed, layers, do_vision, do_audio);
+    if (!unconsumed.empty()) {
+      std::string msg = "r4dx-convert (gemma4_unified): " + std::to_string(unconsumed.size()) +
+                        " checkpoint tensor(s) are not converted and not allow-listed (a mis-guessed tensor "
+                        "name, or a tensor this converter does not know):";
+      for (size_t k = 0; k < unconsumed.size() && k < 20; ++k) msg += "\n  " + unconsumed[k];
+      if (unconsumed.size() > 20) msg += "\n  ... and " + std::to_string(unconsumed.size() - 20) + " more";
+      throw std::runtime_error(msg);
+    }
+  }
+
+  for (int i = 0; i < (is_gemma ? 0 : layers); ++i) {
     const std::string hf = "model.language_model.layers." + std::to_string(i) + ".";
     const std::string base = "text.layers." + std::to_string(i) + ".";
     // --rotate folds (all kNone without it): input_layernorm's (1 + w) goes into this layer's token
@@ -1971,9 +2302,11 @@ int RunConvert(const AppArgs& args) {
 
   // Everything from here on is outside the rotated stack and is never folded: the runtime applies
   // x Q after the embedding gather and x Q^T before final_norm (docs/quant2.md section 3).
-  add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
-  add_bf16("model.language_model.norm.weight", "text.final_norm");
-  add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
+  if (!is_gemma) {  // (the Gemma branch above registered these, the head from the tied embedding)
+    add_bf16("model.language_model.embed_tokens.weight", "text.embed_tokens");
+    add_bf16("model.language_model.norm.weight", "text.final_norm");
+    add_linear({"lm_head.weight"}, "lm_head", lm_head_layouts);
+  }
 
   // --rotate: the transforms themselves, fp32, exactly the values every fold above used (the runtime
   // reads these; it never regenerates them from the seed). No .{layout} suffix, like every other
@@ -1981,15 +2314,19 @@ int RunConvert(const AppArgs& args) {
   if (rot.Enabled()) {
     const r4dx_convert::RotationSet& rs = rot.Set();
     add_fp32_values("rotation.signs", {rs.q.hidden}, &rs.q.signs);
-    add_fp32_values("rotation.mix5", {rs.q.nblk, rs.q.nblk}, &rs.q.mix);
+    // rotation.mix5 for the 5-block (Qwen) geometry, rotation.mix for every other nblk.
+    add_fp32_values(r4dx_convert::RotationMixName(rs.q.nblk), {rs.q.nblk, rs.q.nblk}, &rs.q.mix);
     if (rot.Hadamard()) {
       add_fp32_values("rotation.had_down_signs", {rs.had_down.K}, &rs.had_down.signs);
       add_fp32_values("rotation.had_o_signs", {rs.had_o.K}, &rs.had_o.signs);
-      add_fp32_values("rotation.had_gdn_out_signs", {rs.had_gdn_out.K}, &rs.had_gdn_out.signs);
+      if (!rs.had_gdn_out.Empty())
+        add_fp32_values("rotation.had_gdn_out_signs", {rs.had_gdn_out.K}, &rs.had_gdn_out.signs);
+      if (!rs.had_o_full.Empty())
+        add_fp32_values("rotation.had_o_full_signs", {rs.had_o_full.K}, &rs.had_o_full.signs);
     }
   }
 
-  if (do_vision) {
+  if (do_vision && !is_gemma) {
     for (const auto& name : model.AllNames()) {
       if (StartsWith(name, "model.visual.")) {
         add_bf16(name, "vision." + name.substr(std::string("model.visual.").size()));
@@ -2211,8 +2548,36 @@ int RunConvert(const AppArgs& args) {
     metadata["quant_summary"]["text.layers.*.input_layernorm|post_attention_layernorm"] =
         "bf16 zeros: rotated container, (1 + w) folded into the next linear (__metadata__.rotation)";
     metadata["quant_summary"]["rotation.*"] =
-        "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
+        rot.Gemma() ? "fp32 (signs, mix; q2ab also had_down/o/o_full_signs) -- see __metadata__.rotation"
+                    : "fp32 (signs, mix5; q2ab also had_down/o/gdn_out_signs) -- see __metadata__.rotation";
     metadata["rotation"] = rot.Metadata();
+  }
+  // Gemma 4: the Qwen summary above does not describe this container. model_arch / norm_kind are what
+  // model::DetectArch and the loader read (docs/gemma4-plan.md 4.2); written ONLY for Gemma, so every
+  // Qwen container keeps its header byte for byte.
+  if (is_gemma) {
+    namespace fs = std::filesystem;
+    fs::path in = fs::u8path(args.input).lexically_normal();
+    if (!in.has_filename()) in = in.parent_path();
+    metadata["model_id"] = in.filename().u8string();  // e.g. Huihui-gemma-4-12B-it-abliterated
+    metadata["model_arch"] = r4dx_convert::gemma::kModelArch;
+    metadata["norm_kind"] = "plain";
+    metadata["quant_summary"] = {
+        {"text.layers.*.attn.q|k|v|o", "w4a16|bf16 (as requested by --layouts; no v on full layers: V is the raw k_proj output)"},
+        {"text.layers.*.mlp.gate_up|down", "w4a16|bf16 (as requested by --layouts; pick at load time)"},
+        {"text.layers.*.attn.q_norm|k_norm, *_layernorm (x4), text.final_norm", "bf16 raw plain weights (x * w, not 1 + w)"},
+        {"text.layers.*.attn.k_descale|v_descale", "fp32 [kv_heads of the layer: 8 sliding, 1 full] (--kv-calib or 1.0)"},
+        {"text.layers.*.layer_scalar", "fp32 [1, 4] (the [1] bf16 buffer widened; applied once after the MLP residual add)"},
+        {"text.embed_tokens", "bf16 [vocab, hidden]; sqrt(hidden) scale is a runtime op"},
+        {"lm_head", "w4a16|bf16 (as requested by --layouts / --lm-head), the tied embedding written untied"},
+        {"vision.*, audio.*", "bf16 passthrough (--vision on / --audio on; default off)"},
+    };
+    if (rot.Enabled()) {
+      metadata["quant_summary"]["text.layers.*.input_layernorm|pre_feedforward_layernorm"] =
+          "bf16 ones as <name>.rotated: rotated container, w folded into the next linears (__metadata__.rotation)";
+      metadata["quant_summary"]["rotation.*"] =
+          "fp32 (signs, mix; q2ab also had_down/o/o_full_signs) -- see __metadata__.rotation";
+    }
   }
   // --trellis-from: the body's summary lines say what the body now is (the four entries above
   // describe the multi-layout body, which a trellis container does not have), and
@@ -2266,6 +2631,10 @@ int RunConvert(const AppArgs& args) {
        ldlq.Enabled() ? ldlq.ManifestSha256() : std::string("none")},
       {"ldlq_linears", ldlq.Linears()},
   };
+  if (is_gemma) {
+    metadata["r4dx_convert_run"]["arch"] = r4dx_convert::gemma::kModelArch;
+    metadata["r4dx_convert_run"]["audio"] = do_audio;
+  }
   if (rot.Enabled()) {
     metadata["r4dx_convert_run"]["rotate"] = rot.KindName();
     metadata["r4dx_convert_run"]["rotation_seed"] = rot.Seed();
@@ -2398,8 +2767,16 @@ int RunConvert(const AppArgs& args) {
     if (trellis.VerifyFull()) {
       const auto tv = std::chrono::steady_clock::now();
       r4dx_convert::trellis::TrellisVerifySummary vs;
+      // Rotated import: compare against fold(W) (the weight the oracle quantized), per 128-row block.
+      r4dx_convert::trellis::VerifyFoldFn verify_fold;
+      if (!verify_folds.empty())
+        verify_fold = [&verify_folds, &rot](const std::string& hf, std::vector<float>& rows, int64_t n,
+                                            int64_t K) {
+          const auto it = verify_folds.find(hf);
+          if (it != verify_folds.end()) rot.FoldRowsBlock(it->second.fold, it->second.norm, rows, n, K);
+        };
       try {
-        vs = trellis.Verify(write_path, model, threads, std::cout);
+        vs = trellis.Verify(write_path, model, threads, std::cout, verify_fold);
         r4dx_convert::trellis::PatchContainerHeader(write_path, trellis.VerifyNeedle(),
                                                     trellis.VerifyPatch(vs));
       } catch (const std::exception& e) {
@@ -2674,6 +3051,28 @@ int RunDflashConvert(const AppArgs& args) {
   return 0;
 }
 
+// ---- --dflash-hf mode (docs/gemma4-plan.md D-3): HF DFlash v1 -> dflash2 container, identity conv --------
+int RunDflashHfConvert(const AppArgs& args) {
+  using namespace r4dx_convert;
+  DflashHfOptions o;
+  o.input_dir = args.dflash_hf;
+  o.output_path = args.dflash_out;
+  o.layout = args.dflash_layout_set ? args.dflash_layout : "bf16";
+  o.target_layer_offset = args.dflash_layer_offset;
+  o.embed_scale = args.dflash_embed_scale;
+  o.threads = ResolveThreads(args.threads);
+  o.quant.mode = ParseQuantMode(args.quant);
+  o.quant_metadata = BuildQuantMetadata();
+  std::cout << "[r4dx-convert --dflash-hf] input=" << o.input_dir << " out=" << o.output_path
+            << " layout=" << o.layout << " target_layer_offset=" << o.target_layer_offset
+            << " threads=" << o.threads << "\n";
+  const auto t0 = std::chrono::steady_clock::now();
+  ConvertDflashHf(o);
+  std::cout << "[r4dx-convert --dflash-hf] wrote " << o.output_path << " in "
+            << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s\n";
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2681,11 +3080,13 @@ int main(int argc, char** argv) {
     ValidateKernelGroupSizes();
     AppArgs args = ParseArgs(argc, argv);
     if (!args.dflash_gguf.empty()) return RunDflashConvert(args);
+    if (!args.dflash_hf.empty()) return RunDflashHfConvert(args);
     if (args.selftest) {
       if (args.selftest_input.empty() || args.selftest_output.empty())
         throw std::runtime_error("--selftest requires --selftest-input and --selftest-output");
       return RunSelftest(args);
     }
+    if (!args.rotation_out.empty()) return RunRotationOut(args);
     if (args.input.empty() || args.output.empty())
       throw std::runtime_error("--input and --output are required (or pass --selftest or --dflash-gguf)");
     return RunConvert(args);

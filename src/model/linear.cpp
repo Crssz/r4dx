@@ -6,8 +6,10 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -49,8 +51,9 @@ constexpr int64_t kRowTile = 16;
 // value_dim=6144 (attn.o's K = num_heads*head_dim = 6144 too) -- all three are multiples of 512
 // (5120/512=10, 17408/512=34, 6144/512=12), which clears the tightest of the group requirements
 // (SK=4 * group=64 = 256) with room to spare, so SK=4 clears every layout at once. The fallback
-// keeps requiring K % 512 (the multiple the tensor-parallel rank-K rule in model_config.h is
-// written against) rather than the bare 256. WV=4/SK=4 keeps the block at 512
+// requires K % 256 (SK=4 * 64, the tightest kernel rule; Gemma 4's K=3840 = 15 * 256 is not a
+// multiple of 512 -- docs/gemma4-plan.md 3.7). SK stays 4 at every legal K, so every Qwen shape
+// (all K % 512 == 0) gets exactly the pick it always did. WV=4/SK=4 keeps the block at 512
 // threads (WV*SK*32, under the 1024 cap every kernel enforces) and the LDS reduction buffer at 16
 // KiB (under the 64 KiB cap); MB=1
 // and NPW=1 are the simplest legal choice for every kernel (MB in 1..4, NPW in {1,4} for w4a16) and NT=1 takes the non-temporal weight-load path
@@ -60,7 +63,7 @@ constexpr int64_t kRowTile = 16;
 // quant2 Q3 (docs/quant2.md section 5.1): this is also the tuning of every w4a16 linear at a
 // per-tensor group the table has no row for. The kernel's rule at group g is K % (SK * max(g, 64))
 // -- a split must start on a 64-K packed block, which a group of 32 does not guarantee -- so SK=4
-// needs K % 256 at g32 and g64: the K % 512 check below covers both.
+// needs K % 256 at g32 and g64: the K % 256 check below covers both.
 // `w4a16_group` is the EFFECTIVE group (EffectiveW4a16Group); the explicit check only keeps a future
 // edit of SK from quietly breaking the per-tensor groups.
 //
@@ -96,9 +99,9 @@ LinearTuning FallbackTuning(Layout layout, int64_t N, int64_t K, int64_t M, int 
     return t;
   }
   const int w4a16_group = variant;
-  if (K % 512 != 0) {
+  if (K <= 0 || K % 256 != 0) {
     throw std::runtime_error("r4dx::model::PickTuning: K=" + std::to_string(K) +
-                              " is not a multiple of 512 (SK=4 * 128, the fallback's rule) -- this "
+                              " is not a multiple of 256 (SK=4 * 64, the fallback's rule) -- this "
                               "model shape was not anticipated, pick a smaller SK");
   }
   if (N % 16 != 0) {
@@ -542,6 +545,12 @@ TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t
   if (kb != 4 && kb != 5) return refuse("KB is not 4 or 5");
   if (parts < 1 || parts > 2) return refuse("trellis parts is not 1 or 2");
   if (N <= 0 || K <= 0 || N > 0x7FFFFFFF || K > 0x7FFFFFFF) return refuse("shape out of range");
+  // Whole 128-blocks (the loader's rule, and the kernel's): refuse here, with a reason, rather than let
+  // TrellisTuningFor throw on a shape the plan was only asked about.
+  if (N % 128 != 0 || K % 128 != 0) return refuse("N and K must be whole 128-blocks");
+  if (parts > 1 && (part_n0 <= 0 || part_n0 >= N || part_n0 % 128 != 0)) {
+    return refuse("part boundary is not a whole 128-block inside N");
+  }
   if (!M256ShapeAllowed(N, K)) return refuse("shape excluded by R4DX_M256_SHAPES");
   // The row the M = 64 chunks of this linear run today. A 64-row chunk (M > 32) gets the M = 64 band's
   // row; whatever it names (or 4.4's fallback at a part boundary) is what the M = 256 kernel must
@@ -661,6 +670,18 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   if (w.layout == Layout::kTrellis && M == kTrellisM256Rows && TrellisM256Active()) {
     const TrellisM256Plan plan =
         PlanTrellisM256(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]);
+    if (!plan.ok && plan.why.rfind("shape excluded", 0) != 0) {
+      // Explicit, not silent (docs/gemma4-plan.md 3.7, M1-29): a shape with no M = 256 configuration takes
+      // the four-launch 64-row path below -- correct, slower. Say so once per shape and rate.
+      static thread_local std::set<std::tuple<int64_t, int64_t, int, int>> warned;
+      if (warned.emplace(N, K, w.trellis_bits, w.trellis_parts).second) {
+        std::fprintf(stderr,
+                     "r4dx: trellis [%lld x %lld] KB%d parts %d has no M = 256 plan (%s); 256-row calls "
+                     "slice into four 64-row launches\n",
+                     static_cast<long long>(N), static_cast<long long>(K), w.trellis_bits,
+                     w.trellis_parts, plan.why.c_str());
+      }
+    }
     if (plan.ok) {
       const int parts = w.trellis_parts;
       const uint16_t* a0;

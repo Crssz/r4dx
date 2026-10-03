@@ -32,3 +32,22 @@ re-run the build + tests.
   -- the natural complement of the existing `"defined"` line, since minja represents an undefined
   Jinja variable as a null `Value`. On a future re-vendor from upstream, re-apply this one line if
   upstream still hasn't picked it up (worth upstreaming to google/minja).
+
+- **minja.hpp, Gemma 4 patches (3 local changes, all needed by google/gemma-4-12B-it's
+  `chat_template.jinja`; covered by `tests/tokenizer/test_minja_patches.cpp` and the
+  `tokenizer_golden_gemma` chat cases):**
+  1. *Adjacent string literals concatenate* (`Parser::parseConstant`): after a string literal, further
+     quote-started literals (whitespace/newlines between) are appended, as in Python/Jinja. The
+     template's `raise_exception("..." "..." "...")` (lines 258-262) made `ChatTemplate::from_source`
+     throw at parse time without it.
+  2. *`dictsort` is case-insensitive* (the `dictsort` global): Jinja's default is
+     `case_sensitive=False`; upstream minja sorted keys byte-wise, so mixed-case tool-parameter names
+     (`Zone` vs `city`) rendered in a different order than HF. ASCII lowercase compare, stable sort.
+  3. *An empty dict is falsy* (`Value::to_bool`): upstream returned true for every object, so
+     `{%- if params['properties'] -%}` on `{}` emitted `properties:{}` where HF omits it.
+  The Qwen3.8-27B goldens (`tokenizer_golden`) are unchanged by all three. On a re-vendor, re-apply
+  them if upstream still lacks them (each is a few lines).
+
+  Related, not a minja patch: Gemma's template needs `ChatTemplateOptions{.apply_polyfills = false}`
+  (src/tokenizer/chat_template.h). minja's caps probe reports `supports_tool_calls=false` for it and
+  the default polyfills would rewrite assistant `tool_calls` into JSON content.

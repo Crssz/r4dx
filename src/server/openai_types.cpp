@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <random>
 
 #include "image_decode.h"  // src/vision: DecodeImageBytes (docs/vision.md)
+#include "audio_wav.h"     // src/audio: DecodeWav (docs/gemma4-audio.md)
 
 namespace r4dx::server {
 
@@ -190,6 +192,79 @@ ImagePart DecodeImageUrl(const std::string& url, const vision::ImageProcessorCon
   return out;
 }
 
+// Decodes one `input_audio` content part (docs/gemma4-audio.md): `{"type":"input_audio","input_audio":
+// {"data":"<base64>","format":"wav"}}` (OpenAI's shape; `data` may also carry a "data:audio/wav;base64," prefix).
+// WAV only (PCM 8/16/24/32 or float, any channel count -> mono mean). The model hears exactly 16 kHz, so any
+// other sample rate is REFUSED with a clear 400 instead of being resampled behind the client's back; so is a
+// clip longer than 30 s (750 tokens, the processor's audio_seq_length) or an undecodable one.
+AudioPart DecodeInputAudio(const nlohmann::json& part) {
+  const char* ctx = "messages[].content (input_audio)";
+  if (!part.contains("input_audio") || !part.at("input_audio").is_object()) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string(ctx) + ": 'input_audio' must be an object {\"data\": <base64 wav>, \"format\": \"wav\"}"};
+  }
+  const nlohmann::json& ia = part.at("input_audio");
+  std::string data = RequireString(ia, "data", ctx);
+  if (ia.contains("format") && !ia.at("format").is_null()) {
+    if (!ia.at("format").is_string()) {
+      throw ApiError{400, "invalid_request_error", std::string(ctx) + ": 'format' must be a string"};
+    }
+    const std::string fmt = ia.at("format").get<std::string>();
+    if (fmt != "wav" && fmt != "wave" && fmt != "x-wav") {
+      throw ApiError{400, "invalid_request_error",
+                      std::string(ctx) + ": unsupported audio format '" + fmt +
+                          "' (only \"wav\" -- 16 kHz PCM or float WAV -- is supported; mp3/ogg/flac are not decoded)"};
+    }
+  }
+  if (data.rfind("data:", 0) == 0) {
+    const size_t comma = data.find(',');
+    if (comma == std::string::npos || data.compare(0, comma, "data:audio/wav;base64") != 0) {
+      throw ApiError{400, "invalid_request_error",
+                      std::string(ctx) + ": a data: URI must be \"data:audio/wav;base64,<payload>\""};
+    }
+    data = data.substr(comma + 1);
+  }
+  if (data.size() > kMaxAudioBase64Chars) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string(ctx) + ": audio data too large (" + std::to_string(data.size()) +
+                        " base64 chars, max " + std::to_string(kMaxAudioBase64Chars) + ")"};
+  }
+  const std::vector<uint8_t> raw = Base64Decode(data, "messages[].content.input_audio.data");
+  if (raw.empty()) {
+    throw ApiError{400, "invalid_request_error", std::string(ctx) + ": audio data decoded to zero bytes"};
+  }
+  audio::WavAudio wav;
+  try {
+    wav = audio::DecodeWav(raw.data(), raw.size());
+  } catch (const std::exception& e) {
+    throw ApiError{400, "invalid_request_error", std::string(ctx) + ": " + e.what()};
+  }
+  if (wav.sample_rate != audio::kSampleRate) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string(ctx) + ": the audio is " + std::to_string(wav.sample_rate) +
+                        " Hz; this model takes exactly 16000 Hz mono audio and the server does not resample -- "
+                        "convert it first (e.g. ffmpeg -i in.wav -ar 16000 -ac 1 out.wav)"};
+  }
+  if (static_cast<int64_t>(wav.samples.size()) > audio::kMaxAudioSamples) {
+    throw ApiError{400, "invalid_request_error",
+                    std::string(ctx) + ": the audio is " +
+                        std::to_string(static_cast<double>(wav.samples.size()) / audio::kSampleRate) +
+                        " s; the maximum is 30 s (" + std::to_string(audio::kMaxAudioTokens) + " audio tokens)"};
+  }
+  AudioPart out;
+  out.frames = audio::FrameWaveform(wav.samples, &out.tokens);
+  uint64_t h = 1469598103934665603ULL;  // FNV-1a over the decoded samples (see Fnv1a64)
+  for (float s : wav.samples) {
+    uint32_t u;
+    std::memcpy(&u, &s, 4);
+    for (int i = 0; i < 4; ++i) {
+      h ^= (u >> (8 * i)) & 0xFF;
+      h *= 1099511628211ULL;
+    }
+  }
+  out.content_hash = h;
+  return out;
+}
 // Parses a message's `content` field, which OpenAI allows as either a plain string or an array of
 // typed parts. `text_out` receives the concatenation of every text part (unchanged meaning from
 // before image parts existed); `parts_out` receives the ordered part list but is left EMPTY unless
@@ -199,7 +274,7 @@ ImagePart DecodeImageUrl(const std::string& url, const vision::ImageProcessorCon
 // just within one.
 void ParseMessageContent(const nlohmann::json& content, const std::string& role,
                           const vision::ImageProcessorConfig& image_cfg, size_t* image_count,
-                          std::string* text_out, std::vector<ContentPart>* parts_out) {
+                          size_t* audio_count, std::string* text_out, std::vector<ContentPart>* parts_out) {
   if (content.is_string()) {
     *text_out = content.get<std::string>();
     return;
@@ -207,7 +282,7 @@ void ParseMessageContent(const nlohmann::json& content, const std::string& role,
   if (content.is_array()) {
     std::string out;
     std::vector<ContentPart> parts;
-    bool has_image = false;
+    bool has_image = false, has_audio = false;
     for (const auto& part : content) {
       if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
         throw ApiError{400, "invalid_request_error",
@@ -236,14 +311,25 @@ void ParseMessageContent(const nlohmann::json& content, const std::string& role,
         cp.image = DecodeImageUrl(url, image_cfg);
         parts.push_back(std::move(cp));
         has_image = true;
+      } else if (type == "input_audio") {
+        if (++*audio_count > kMaxAudioPerRequest) {
+          throw ApiError{400, "invalid_request_error",
+                          "too many audio clips in this request (max " +
+                              std::to_string(kMaxAudioPerRequest) + ")"};
+        }
+        ContentPart cp;
+        cp.is_audio = true;
+        cp.audio = DecodeInputAudio(part);
+        parts.push_back(std::move(cp));
+        has_audio = true;
       } else {
         throw ApiError{400, "invalid_request_error",
                         "messages[].content: part type '" + type + "' is not supported "
-                        "(supported: 'text', 'image_url', 'input_image')"};
+                        "(supported: 'text', 'image_url', 'input_image', 'input_audio')"};
       }
     }
     *text_out = out;
-    if (has_image) *parts_out = std::move(parts);
+    if (has_image || has_audio) *parts_out = std::move(parts);
     return;
   }
   throw ApiError{400, "invalid_request_error",
@@ -667,7 +753,7 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
   }
   // Counts every image content part across the WHOLE request (every message), not per-message --
   // kMaxImagesPerRequest is a request-wide cap (docs/server.md's "Images").
-  size_t image_count = 0;
+  size_t image_count = 0, audio_count = 0;
   for (const auto& m : messages) {
     if (!m.is_object()) throw ApiError{400, "invalid_request_error", "messages[] entries must be objects"};
     const std::string role = RequireString(m, "role", "messages[]");
@@ -699,7 +785,7 @@ ChatCompletionRequest ParseChatCompletionRequest(const nlohmann::json& body,
     } else {
       std::string text;
       std::vector<ContentPart> parts;
-      ParseMessageContent(m.at("content"), role, image_cfg, &image_count, &text, &parts);
+      ParseMessageContent(m.at("content"), role, image_cfg, &image_count, &audio_count, &text, &parts);
       cm.content = std::move(text);
       cm.content_parts = std::move(parts);
     }
@@ -850,8 +936,11 @@ nlohmann::json BuildUsageJson(const UsageStats& usage) {
 //     form several clients (and Unsloth Studio's own openrouter_model_capabilities mapper) already
 //     know how to read: context/output limits and whether thinking is supported, default-on
 //     (`--think`) and optional. See docs/server.md's "Client compatibility: Unsloth Studio".
-nlohmann::json ModelInputModalities(bool has_vision) {
-  return has_vision ? nlohmann::json::array({"text", "image"}) : nlohmann::json::array({"text"});
+nlohmann::json ModelInputModalities(bool has_vision, bool has_audio) {
+  nlohmann::json out = nlohmann::json::array({"text"});
+  if (has_vision) out.push_back("image");
+  if (has_audio) out.push_back("audio");
+  return out;
 }
 
 nlohmann::json ModelSupportedReasoningEfforts() {
@@ -863,10 +952,12 @@ nlohmann::json ModelSupportedReasoningEfforts() {
 }
 
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
-                                    int64_t max_ctx, bool default_thinking, bool has_vision) {
+                                    int64_t max_ctx, bool default_thinking, bool has_vision,
+                                    bool has_audio) {
   nlohmann::json capabilities =
       nlohmann::json::array({"completion", "chat", "tool_use", "reasoning"});
   if (has_vision) capabilities.push_back("image");
+  if (has_audio) capabilities.push_back("audio");
   return {{"id", model_id},
           {"object", "model"},
           {"created", created_unix},
@@ -878,7 +969,7 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
           {"capabilities", capabilities},
           // `modalities` -- a second, plainer spelling of the same "image" answer several clients
           // probe instead of (or in addition to) `architecture.input_modalities` (docs/vision.md).
-          {"modalities", ModelInputModalities(has_vision)},
+          {"modalities", ModelInputModalities(has_vision, has_audio)},
           {"supported_parameters",
            nlohmann::json::array({"temperature", "top_p", "top_k", "min_p", "seed", "max_tokens",
                                   "max_completion_tokens", "stop", "stream", "stream_options",
@@ -892,15 +983,15 @@ nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_
            {{"supported_efforts", ModelSupportedReasoningEfforts()},
             {"default_enabled", default_thinking},
             {"mandatory", false}}},
-          {"architecture", {{"input_modalities", ModelInputModalities(has_vision)},
+          {"architecture", {{"input_modalities", ModelInputModalities(has_vision, has_audio)},
                             {"output_modalities", nlohmann::json::array({"text"})}}}};
 }
 
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix, int64_t max_ctx,
-                                    bool default_thinking, bool has_vision) {
+                                    bool default_thinking, bool has_vision, bool has_audio) {
   return {{"object", "list"},
           {"data", nlohmann::json::array({BuildModelEntryJson(model_id, created_unix, max_ctx,
-                                                               default_thinking, has_vision)})}};
+                                                               default_thinking, has_vision, has_audio)})}};
 }
 
 nlohmann::json BuildTimingsJson(const TimingStats& timings) {

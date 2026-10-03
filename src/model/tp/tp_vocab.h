@@ -43,6 +43,21 @@ inline int32_t MergeArgmax(const ArgmaxPair* per_rank, int world) {
   return per_rank[best].idx;
 }
 
+// MergeArgmax over `rows` rows at once (a verify window's per-row greedy pairs, docs/tp.md 7.6; Gemma DFlash under TP).
+// `gathered` is laid out [world][rows] (each rank's pairs in row order, ids already GLOBAL, i.e. what one HostAllGather of
+// the per-rank [rows] pair arrays yields); out[row] is that row's full-vocabulary argmax, ties to the lowest global id.
+inline void MergeArgmaxRows(const ArgmaxPair* gathered, int world, int rows, int32_t* out) {
+  constexpr int kMaxWorld = 8;
+  if (world < 1 || world > kMaxWorld) {
+    throw std::invalid_argument("tp::MergeArgmaxRows: world " + std::to_string(world) + " outside [1, 8]");
+  }
+  ArgmaxPair row[kMaxWorld];
+  for (int t = 0; t < rows; ++t) {
+    for (int r = 0; r < world; ++r) row[r] = gathered[static_cast<size_t>(r) * static_cast<size_t>(rows) + static_cast<size_t>(t)];
+    out[t] = MergeArgmax(row, world);
+  }
+}
+
 // log(exp(a) + exp(b)) in double, stable, with -inf as the identity. Callers pass the per-rank
 // values in rank order so every rank computes the same bits.
 inline double LogAddExp(double a, double b) {

@@ -80,6 +80,7 @@ stay single-allocated -- at M<=64 they are at most ~1.3 MiB, small enough that r
 nothing and would only slow the sweep down).
 """
 import argparse
+import fnmatch
 import itertools
 import math
 import os
@@ -133,7 +134,32 @@ SHAPES = [
     ("tp2.mlp.down", 5120, 8704),         # hidden, intermediate/2
     ("tp2.lm_head", 124160, 5120),        # vocab/2 (vocab-split lm_head), hidden
     ("tp2.attn.kv", 512, 5120),           # kv_heads/2*head_dim, hidden (attn.k and attn.v)
+    # The 'gemma' group (docs/gemma4-plan.md 3.7, M1-29): Huihui Gemma-4-12B at TP = 1 -- hidden 3840,
+    # intermediate 15360, sliding 16 q / 8 kv heads x 256, full 16 q / 1 kv x 512 (k_eq_v: no v_proj).
+    # Swept only when named (`--shapes "gemma.*"`; shell-style globs are accepted), never by a default
+    # run, and into the main table (--out src\model\gemm_tuning_table.inc) like the Qwen shapes. The
+    # trellis rows of these shapes come from tool_trellis_gemm_bench, not this script.
+    ("gemma.q_sliding", 4096, 3840),      # 16 * 256, hidden
+    ("gemma.q_full", 8192, 3840),         # 16 * 512, hidden
+    ("gemma.kv_sliding", 2048, 3840),     # 8 * 256, hidden (attn.k and attn.v)
+    ("gemma.k_full", 512, 3840),          # 1 * 512, hidden (v = k)
+    ("gemma.o_sliding", 3840, 4096),      # hidden, 16 * 256
+    ("gemma.o_full", 3840, 8192),         # hidden, 16 * 512
+    ("gemma.gate_up", 30720, 3840),       # 2 * intermediate, hidden
+    ("gemma.down", 3840, 15360),          # hidden, intermediate
+    # Its TP = 2 rank shapes (GemmaConfig::Shard): tp2 table only, like the tp2.* ones above
+    # (`--out src\model\gemm_tuning_table_tp2.inc --shapes "tp2.gemma.*"`).
+    ("tp2.gemma.q_sliding", 2048, 3840),
+    ("tp2.gemma.q_full", 4096, 3840),
+    ("tp2.gemma.kv_sliding", 1024, 3840),
+    ("tp2.gemma.k_full", 512, 3840),      # replicated at TP = 2 (one kv head)
+    ("tp2.gemma.o_sliding", 3840, 2048),
+    ("tp2.gemma.o_full", 3840, 4096),
+    ("tp2.gemma.gate_up", 15360, 3840),
+    ("tp2.gemma.down", 3840, 7680),
 ]
+GEMMA_PREFIX = "gemma."
+GEMMA_GROUP = "gemma.*"
 
 TP2_PREFIX = "tp2."
 TP2_TABLE = "gemm_tuning_table_tp2.inc"
@@ -329,14 +355,19 @@ def main():
     if unknown:
         raise SystemExit(f"--layouts: {unknown} cannot be tuned here -- only bf16 and w4a16 "
                          f"(trellis rows come from tool_trellis_gemm_bench)")
-    shape_filter = set(s for s in args.shapes.split(",") if s)
+    shape_filter = set()
+    for pat in (s for s in args.shapes.split(",") if s):
+        # a name, or a shell-style glob over SHAPES' names ("gemma.*", "tp2.gemma.*")
+        hit = [s[0] for s in SHAPES if fnmatch.fnmatchcase(s[0], pat)]
+        if not hit:
+            raise SystemExit(f"--shapes named unknown shape(s): {[pat]}")
+        shape_filter.update(hit)
     # The default set leaves out the TP=2 per-rank shapes: they are swept only when named, and only
     # into their own table (docs/tp.md 2.7; see SHAPES).
+    # (and the gemma.* group: named only, so a default run's bytes are the Qwen table's as before)
     shapes = [s for s in SHAPES
-              if (s[0] in shape_filter if shape_filter else not s[0].startswith(TP2_PREFIX))]
-    if shape_filter and len(shapes) != len(shape_filter):
-        missing = shape_filter - {s[0] for s in shapes}
-        raise SystemExit(f"--shapes named unknown shape(s): {sorted(missing)}")
+              if (s[0] in shape_filter if shape_filter
+                  else not (s[0].startswith(TP2_PREFIX) or s[0].startswith(GEMMA_PREFIX)))]
     out_is_tp2 = Path(args.out).name == TP2_TABLE
     wrong_table = [s[0] for s in shapes if s[0].startswith(TP2_PREFIX) != out_is_tp2]
     if wrong_table:

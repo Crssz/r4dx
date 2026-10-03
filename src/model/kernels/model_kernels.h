@@ -29,6 +29,21 @@ void r4dx_model_cast_bf16_to_f16(int64_t in, int64_t out, int64_t n, int64_t str
 // out[i] = bf16_to_float(in[i]), i in [0, n). in: bf16 (uint16). out: fp32.
 void r4dx_model_widen_bf16_to_f32(int64_t in, int64_t out, int64_t n, int64_t stream);
 
+// Gemma 4's final logit softcap fused into the widen (docs/gemma4-plan.md 3.5; M1-15):
+// out[i] = cap * tanh(bf16_to_float(in[i]) / cap), fp32 math. Replaces r4dx_model_widen_bf16_to_f32 in
+// the Gemma FinalLmHead; elementwise, so a TP rank passes its own vocab shard. in: bf16, out: fp32.
+void r4dx_model_widen_softcap_bf16_to_f32(int64_t in, int64_t out, int64_t n, float cap,
+                                           int64_t stream);
+
+// Gemma 4 bf16 KV write (docs/gemma4-plan.md 9.5: the bf16 fallback for the 8 full layers, and the
+// `--kv bf16` reference path): the bf16 twin of r4dx_kv_write_paged_fp8_hnd, no descale. k_new, v_new:
+// [T, kv_heads, head_dim] bf16. slot_mapping: [T] int32 (>= 0, or exactly -1 to skip the row).
+// kv_cache: (num_blocks, kv_heads, block_size, 2*head_dim) bf16 (uint16), K at columns [0, head_dim) and V at
+// [head_dim, 2*head_dim) of each slot; strides in ELEMENTS (uint16), exactly the fp8 writer's layout.
+void r4dx_model_kv_write_paged_bf16_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapping,
+                                         int64_t kv_cache, int T, int kv_heads, int head_dim,
+                                         int block_size, int64_t kv_block_stride,
+                                         int64_t kv_head_stride, int64_t stream);
 // Debug measurement only (src/model/debug_probe.h; docs/trellis-kernel.md 6 "Benches"): the device
 // code of clock_probe_device.h, which tool_trellis_gemm_bench runs too. `out` is device uint64.
 // r4dx_model_wall_stamp: one thread writes wall_clock64() to out[0] (a GPU timer stamp).

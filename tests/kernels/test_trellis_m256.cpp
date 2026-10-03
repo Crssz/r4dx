@@ -73,6 +73,11 @@ const Cls kClasses[] = {
     {"gdn.in_proj_qkv", 10240, 5120, 1, 0}, {"gdn.in_proj_z", 6144, 5120, 1, 0},
     {"gdn.out_proj/attn.o", 5120, 6144, 1, 0}, {"attn.qg", 12288, 5120, 1, 0},
     {"attn.k/attn.v", 1024, 5120, 1, 0},
+    // Gemma 4 12B at TP = 1 (docs/gemma4-plan.md 3.7; the CPU legality test is test_trellis_gemma_plan):
+    {"g.gate_up", 30720, 3840, 2, 15360}, {"g.down", 3840, 15360, 1, 0},
+    {"g.q_sliding", 4096, 3840, 1, 0},    {"g.q_full", 8192, 3840, 1, 0},
+    {"g.kv_sliding", 2048, 3840, 1, 0},   {"g.k_full", 512, 3840, 1, 0},
+    {"g.o_sliding", 3840, 4096, 1, 0},    {"g.o_full", 3840, 8192, 1, 0},
 };
 
 constexpr float kOutScale = 0.0883883f;  // 1 / sqrt(128), prescale 0
@@ -278,6 +283,7 @@ int main() {
     std::printf("test_trellis_m256: %d FAILED\n", g_fail);
     return 1;
   }
-  std::printf("test_trellis_m256: PASS (7 classes x KB 4/5: one M=256 launch == four shipped M=64 launches, byte for byte)\n");
+  std::printf("test_trellis_m256: PASS (%zu classes x KB 4/5: one M=256 launch == four shipped M=64 launches, byte for byte)\n",
+              sizeof(kClasses) / sizeof(kClasses[0]));
   return 0;
 }

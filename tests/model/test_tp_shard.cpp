@@ -40,6 +40,7 @@
 #include "r4dx_convert/trellis_import.hpp"  // RegridToPairGrid: the trellis packer (7. below)
 #include "tp/tp_shard.h"
 
+using r4dx::model::Arch;
 using r4dx::model::ModelConfig;
 using namespace r4dx::model::tp;
 
@@ -561,6 +562,69 @@ void TestRuleForReal() {
   Pass("RankRows/RankCols on the real shapes match docs/tp.md 4.2 and ModelConfig::Shard");
 }
 
+// ---- 1b. Gemma 4 rotation tensors (docs/gemma4-plan.md 4.4 option A, M1-31) ------------------------
+
+// The 12B's rotation geometry as GemmaConfig::ToModelConfig hands it to RuleFor: 16 heads, sliding
+// head_dim 256, global_head_dim 512, intermediate 15360, hidden 3840 (15 x 256). All the Hadamard sign
+// vectors are indexed by the K column of the linear whose input they rotate, so each splits like that
+// linear's K: rank r gets [r*K/world, K/world). Q itself (signs, mix) replicates.
+void TestGemmaRotationRules() {
+  ModelConfig g;
+  g.arch = Arch::kGemma4;
+  g.hidden_size = 3840;
+  g.num_hidden_layers = 6;
+  g.layer_types = {"sliding_attention", "sliding_attention", "sliding_attention",
+                   "sliding_attention", "sliding_attention", "full_attention"};
+  g.num_attention_heads = 16;
+  g.num_key_value_heads = 8;
+  g.head_dim = 256;
+  g.global_head_dim = 512;
+  g.intermediate_size = 15360;
+  g.vocab_size = 262144;
+
+  const Split R = Split::kReplicate, ROWS = Split::kRows;
+  const std::vector<RuleCase> cases = {
+      {"rotation.signs", R, {}, 0},
+      {"rotation.mix", R, {}, 0},
+      {"rotation.had_down_signs", ROWS, {{0, 15360}}, 0},
+      {"rotation.had_o_signs", ROWS, {{0, 4096}}, 0},        // o_swa: 16 x 256
+      {"rotation.had_o_full_signs", ROWS, {{0, 8192}}, 0},   // o_full: 16 x 512
+  };
+  for (const RuleCase& c : cases) {
+    bool same = false;
+    std::string err;
+    try {
+      same = SameRule(RuleFor(c.base, g), c);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+    Check(same, "Gemma RuleFor(" + c.base + ") " + err);
+  }
+  for (int r = 0; r < 2; ++r) {
+    const std::string p = "Gemma rank " + std::to_string(r) + ": ";
+    Check(SameRanges(RankRows(RuleFor("rotation.had_o_full_signs", g), 2, r), {{4096 * r, 4096}}),
+          p + "had_o_full_signs [4096r,+4096) = heads 8r.. of the full o_proj's K = 8192");
+    Check(SameRanges(RankRows(RuleFor("rotation.had_o_signs", g), 2, r), {{2048 * r, 2048}}),
+          p + "had_o_signs [2048r,+2048)");
+    Check(SameRanges(RankRows(RuleFor("rotation.had_down_signs", g), 2, r), {{7680 * r, 7680}}),
+          p + "had_down_signs [7680r,+7680)");
+    // Whole blocks of 256 per rank for the two o sites, 512 for down (the runtime's Hadamard blocks).
+    const Range full = RankRows(RuleFor("rotation.had_o_full_signs", g), 2, r)[0];
+    const Range down = RankRows(RuleFor("rotation.had_down_signs", g), 2, r)[0];
+    Check(full.count % 256 == 0 && down.count % 512 == 0,
+          p + "rank slices hold whole Hadamard blocks (256 for o_full, 512 for down)");
+  }
+  // Qwen carries no full-attention Hadamard site: a config without global_head_dim refuses the name
+  // instead of inventing a size.
+  Check(Throws([&] { RuleFor("rotation.had_o_full_signs", RealConfig()); }),
+        "RuleFor('rotation.had_o_full_signs') throws on a config without global_head_dim (Qwen)");
+  ModelConfig rank_cfg = g;
+  rank_cfg.tp_world = 2;
+  Check(Throws([&] { RuleFor("rotation.had_o_full_signs", rank_cfg); }),
+        "RuleFor refuses a Gemma rank config for the new tensor too (it needs the global one)");
+  Pass("RuleFor: Gemma rotation tensors (had_o_full_signs row split [8192]) classified");
+}
+
 // ---- 2. plans on the real per-layer shapes ------------------------------------------------------
 
 struct LayoutParts {
@@ -995,6 +1059,7 @@ int main() {
   std::printf("r4dx_convert::kW4A16Group = %d (build default); packing at g=32 and g=64 below\n",
               r4dx_convert::kW4A16Group);
   TestRuleForReal();
+  TestGemmaRotationRules();
   TestRealPlans();
   TestSmallModelSlices();
   TestDesignCases();

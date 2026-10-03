@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,11 @@ class TextModel {
   virtual int64_t ImageTokenId() const = 0;
   virtual int64_t VisionMergeSize() const = 0;  // vision_config.spatial_merge_size, 2 if no vision
   virtual bool HasVision() const = 0;
+  // Gemma 4 wraps every image's soft tokens as <|image> (boi) ... <image|> (eoi); the server then expands one
+  // chat-template placeholder into boi + N x ImageTokenId + eoi (src/vision/gemma_vision.h). -1 = no wrapper
+  // (Qwen: its template emits the vision_start / vision_end tokens itself).
+  virtual int64_t ImageBoiTokenId() const { return -1; }
+  virtual int64_t ImageEoiTokenId() const { return -1; }
   virtual bool MtpEnabled() const = 0;
   virtual bool MtpUsingReducedVocabDraft() const = 0;
   virtual bool DflashEnabled() const = 0;
@@ -114,6 +120,19 @@ class TextModel {
   virtual void EncodeImages(const float* pixel_values, int64_t total_patches,
                             const std::vector<vision::GridThw>& grids, ImageRows* out,
                             vision::VisionEncodeStats* stats = nullptr) = 0;
+
+  // ---- audio (Gemma 4 only, docs/gemma4-audio.md; Qwen's models keep these defaults) ---------------
+  // True iff the container carries the audio projection (converted with `--audio on`). EncodeAudio runs the
+  // CPU embedder (RMSNorm + Linear) over `n` frames of [n, 640] f32 and returns host bf16 rows [n, hidden];
+  // PrefillAudio is Prefill with those rows spliced (AudioRowSpan). Both throw unless HasAudio().
+  virtual bool HasAudio() const { return false; }
+  virtual std::vector<uint16_t> EncodeAudio(const float* /*frames*/, int64_t /*n*/) {
+    throw std::runtime_error("this model has no audio embedder (audio input is Gemma 4 only, container converted with --audio on)");
+  }
+  virtual std::vector<float> PrefillAudio(const std::vector<int32_t>& /*token_ids*/,
+                                          const std::vector<AudioRowSpan>& /*spans*/) {
+    throw std::runtime_error("this model has no audio embedder (audio input is Gemma 4 only, container converted with --audio on)");
+  }
 
   // ---- forward (identical contracts to Model's methods of the same name) ----------------------
   virtual std::vector<float> Prefill(const std::vector<int32_t>& token_ids) = 0;
@@ -139,9 +158,26 @@ class TextModel {
   virtual StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) = 0;
 };
 
+// Diagnostics of a tensor-parallel facade (TpModel, GemmaTpModel): not part of TextModel (docs/tp.md 2.8), reached by a
+// dynamic_cast from the TextModel -- r4dx-cli's `--stats` lines and the server's group-state handling (docs/tp.md 2.4, 9.1).
+// Facade-thread-only, like the facades themselves.
+class TpDiagnostics {
+ public:
+  enum class Health { kReady, kNeedsRecovery, kFatal };
+  virtual ~TpDiagnostics() = default;
+  virtual Health GroupHealth() const = 0;
+  virtual const TpOptions& GroupOptions() const = 0;
+  virtual std::string GroupStatsLine() = 0;  // the `--stats` "tp: ..." line without its "[stats] " prefix
+};
+
 // tp.world == 1 => LocalTextModel(Model::Load(opts)) -- exactly today's Model; every other TpOptions
 // field must then keep its default. tp.world == 2 => TpModel::Load(opts, tp). Defined in
 // tp_model.cpp.
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp);
+
+// The Gemma 4 branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kGemma4). Defined in
+// gemma_local_text_model.cpp: tp.world == 1 -> GemmaLocalTextModel, tp.world == 2 -> GemmaTpModel (M1b-1).
+// TextModel::Config().arch is Arch::kGemma4 for what it returns.
+std::unique_ptr<TextModel> LoadGemmaTextModel(const ModelOptions& opts, const TpOptions& tp);
 
 }  // namespace r4dx::model

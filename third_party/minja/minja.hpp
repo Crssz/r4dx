@@ -321,6 +321,9 @@ public:
     if (is_number()) return get<double>() != 0;
     if (is_string()) return !get<std::string>().empty();
     if (is_array()) return !empty();
+    // r4dx patch: an empty dict is falsy in Jinja/Python (upstream minja treated every object as
+    // true); Gemma 4's template tests `{%- if params['properties'] -%}` on an empty dict.
+    if (is_object()) return !empty();
     return true;
   }
 
@@ -1813,7 +1816,19 @@ private:
       if (it == end) return nullptr;
       if (*it == '"' || *it == '\'') {
         auto str = parseString();
-        if (str) return std::make_shared<Value>(*str);
+        if (str) {
+          // r4dx patch: adjacent string literals concatenate, as in Python/Jinja
+          // ("a" "b" == "ab"); Gemma 4's chat template uses this in a raise_exception message.
+          while (true) {
+            auto before = it;
+            consumeSpaces();
+            if (it == end || (*it != '"' && *it != '\'')) { it = before; break; }
+            auto next = parseString();
+            if (!next) { it = before; break; }
+            *str += *next;
+          }
+          return std::make_shared<Value>(*str);
+        }
       }
       static std::regex prim_tok(R"(true\b|True\b|false\b|False\b|None\b)");
       auto token = consumeToken(prim_tok);
@@ -2809,7 +2824,17 @@ inline std::shared_ptr<Context> Context::builtins() {
     if (args.size() != 1) throw std::runtime_error("dictsort expects exactly 1 argument (TODO: fix implementation)");
     auto & value = args.at("value");
     auto keys = value.keys();
-    std::sort(keys.begin(), keys.end());
+    // r4dx patch: Jinja's dictsort defaults to case_sensitive=False (compare the lowercased key);
+    // upstream minja sorted byte-wise. ASCII lowercase only; stable so keys differing only in case
+    // keep insertion order, as in Python's sort.
+    auto lower_key = [](const Value & k) {
+      std::string s = k.is_string() ? k.get<std::string>() : k.dump();
+      for (auto & c : s) if (c >= 'A' && c <= 'Z') c = (char) (c - 'A' + 'a');
+      return s;
+    };
+    std::stable_sort(keys.begin(), keys.end(), [&](const Value & a, const Value & b) {
+      return lower_key(a) < lower_key(b);
+    });
     auto res = Value::array();
     for (auto & key : keys) {
       res.push_back(Value::array({key, value.at(key)}));

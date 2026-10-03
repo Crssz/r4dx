@@ -59,7 +59,7 @@ whose own evidence had to be corrected.
 | gate/up with different suh | One `mlp.gate_up` linear with **2 parts**. The GEMM reads a different A per part, and each 128-column group lies inside one part. |
 | TP = 2 | **Supported.** Every rank slice is 128-aligned. The output transform runs per rank, before the all-reduce, which is valid because the transform is linear. |
 | lm_head, MTP head, DFlash drafter, vision | Stay w4a16 (the q2ab_hv2_q3 recipe) or bf16. `Container::Load` maps a requested trellis head layout to w4a16, so every caller gets the same answer. |
-| q2ab rotation | Mutually exclusive with trellis. The converter and the loader both refuse the combination. |
+| q2ab rotation | Mutually exclusive with trellis for QWEN: its converter and loader refuse the combination. GEMMA accepts it (docs/gemma4-plan.md 10.2, M1-31): the Gemma loader passes `allow_rotated` to `CheckTrellisChoice`, and the converter writes `--rotate q2ab/q2a --trellis-from` containers. |
 | **Speed outlook** | **Marginal, and the expected case fails A3.** With no WMMA/VALU overlap at a sagged clock the model gives a 0-4% plain-decode loss; trellis wins (up to +11%) only if most of its ALU time hides behind memory. M1 is a real kill gate and measures exactly that (4.6). |
 | Prefill | Expected 0.74-0.84× of q2ab. M8 (tiled prefill) is planned work, not a contingency. |
 
@@ -304,7 +304,8 @@ does not cover: `lm_head`, `mtp.*` and the draft head.
    - A base matched by `--keep-bf16` is logged and skipped.
    - Partial coverage is refused: there is no mixed w4a16/trellis body in v1. A mixed body is a
      possible later speed lever (4.6), behind an explicit flag and its own KL run.
-6. `--rotate` must be `none`. `--trellis-from` with `--selftest`, `--dflash-gguf`,
+6. `--rotate` must be `none` (Qwen; for gemma4_unified a rotated import is allowed when the oracle
+   quantized the folded weights, see docs/gemma4-plan.md 10.2). `--trellis-from` with `--selftest`, `--dflash-gguf`,
    `--reuse-tensors-from` or `--record-reuse-guard` is an argument error.
 
 **Emit phase:**
@@ -339,9 +340,11 @@ themselves and step 10 checks them.
 
 ### 3.4 Interplay and code changes
 
-- **`--rotate q2ab` is refused.** A trellis linear built from the unrotated W would be fed `x·Q`
+- **`--rotate q2ab` is refused (Qwen).** A trellis linear built from the unrotated W would be fed `x·Q`
   with the norms removed, which is garbage. The runtime cannot rotate per linear (`container.h:241`;
-  `model.cpp:128-145`). Trellis's own RHT takes over q2ab's incoherence role.
+  `model.cpp:128-145`). Trellis's own RHT takes over q2ab's incoherence role. (Gemma 4: the oracle may
+  quantize fold(W) against the rotated Hessians, the manifest carries the rotation fingerprint and the
+  converter checks it, docs/gemma4-plan.md 10.2; the combination is then consistent: x Q meets W' = fold(W).)
 - **`--keep-bf16`.** The kept linear gets `KeptBf16LayoutSet()` (`linear_layouts.hpp:58`) and its
   manifest entry is skipped. At load, the tier-2 fallback serves it (`container.cpp:325-327`).
 - **`--no-bf16` is implied for trellis linears.** Their `LayoutSet` is `{trellis}` only, whatever

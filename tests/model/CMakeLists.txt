@@ -127,6 +127,11 @@ target_link_libraries(tool_sampled_bench PRIVATE r4dx_model r4dx_convert r4dx_co
 # tool_vocab_calib / tool_dflash_probe / tool_sampled_bench above. The contract IS asserted, on the
 # 4-layer container, by test_teacher_forced_logprobs in R4DX_MODEL_TESTS above -- both drive the
 # same pass (tests/model/teacher_forced.h), so the tool's numbers are the ones ctest checks.
+# test_tf_truncate: CPU-only (no GPU/container) check that --max-tokens' truncation + sha256 agree with
+# kl_report.py's raw truncation.
+add_executable(test_tf_truncate test_tf_truncate.cpp)
+target_link_libraries(test_tf_truncate PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_test(NAME test_tf_truncate COMMAND test_tf_truncate)
 add_executable(tool_teacher_forced_logprobs tool_teacher_forced_logprobs.cpp)
 target_link_libraries(tool_teacher_forced_logprobs PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 
@@ -182,6 +187,25 @@ target_link_libraries(test_pick_tuning PRIVATE r4dx_model r4dx_convert r4dx_core
 add_test(NAME test_pick_tuning COMMAND test_pick_tuning)
 set_tests_properties(test_pick_tuning PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1")
 
+# test_trellis_gemma_plan (docs/gemma4-plan.md 3.7, M1-29): host-only legality of every Gemma 4 12B trellis
+# linear shape (TP = 1 and a TP = 2 rank, KB 4 and 5): the 64-row tuning is legal, PlanTrellisM256 says ok
+# and agrees with libr4d's own M = 256 check. No HIP call; HIP_VISIBLE_DEVICES=-1 hides every device from
+# the runtime that linking r4dx_model_linear loads.
+add_executable(test_trellis_gemma_plan test_trellis_gemma_plan.cpp)
+target_link_libraries(test_trellis_gemma_plan PRIVATE r4dx_model_linear)
+add_test(NAME test_trellis_gemma_plan COMMAND test_trellis_gemma_plan)
+set_tests_properties(test_trellis_gemma_plan PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# /EHc-: see tests/kernels/CMakeLists.txt (an extern "C" throw is otherwise uncatchable).
+set_source_files_properties(test_trellis_gemma_plan.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
+# test_trellis_bench_shapes: host-only check of the Gemma shape table tool_trellis_gemm_bench's
+# `--group gemma` tunes (tests/kernels/trellis_bench_shapes.hpp) against the plan / tune_gemm.py shapes.
+add_executable(test_trellis_bench_shapes test_trellis_bench_shapes.cpp)
+target_link_libraries(test_trellis_bench_shapes PRIVATE r4dx_model_linear)
+add_test(NAME test_trellis_bench_shapes COMMAND test_trellis_bench_shapes)
+set_tests_properties(test_trellis_bench_shapes PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+set_source_files_properties(test_trellis_bench_shapes.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
 # Tensor-parallel P1 (docs/tp.md 10.1): four CPU-only tests of the TP building blocks under
 # src/model/tp/ -- no HIP call, no device, no container -- so, like test_mtp_round above, plain
 # add_test() with no ENVIRONMENT / SKIP_RETURN_CODE: they always run.
@@ -194,9 +218,106 @@ add_executable(test_tp_config test_tp_config.cpp)
 target_link_libraries(test_tp_config PRIVATE r4dx_tp_shard)
 add_test(NAME test_tp_config COMMAND test_tp_config)
 
+# test_gemma_config (docs/gemma4-plan.md M1-1): GemmaConfig::FromJson on the real Huihui text_config
+# (5:1 pattern asserted, every refusal), GemmaConfig::Shard rules, ModelConfig::arch, DetectArch on
+# synthetic safetensors-shell headers. CPU-only, header + arch.cpp only.
+add_executable(test_gemma_config test_gemma_config.cpp)
+target_link_libraries(test_gemma_config PRIVATE r4dx_model_arch)
+add_test(NAME test_gemma_config COMMAND test_gemma_config)
+
+# test_gemma_container (docs/gemma4-plan.md M1-19): GemmaContainer::Inspect (the CPU half of the Gemma loader --
+# `__metadata__` + the tensor directory, no HIP call) on a tiny 6-layer fixture converted by the real r4dx-convert
+# (when built), the real Huihui bf16.r4dx header (SKIP when absent), and option-A rotation metadata. CPU only:
+# HIP_VISIBLE_DEVICES is set EMPTY, so the process cannot see a GPU at all (linking r4dx_model loads the runtime).
+add_executable(test_gemma_container test_gemma_container.cpp)
+target_link_libraries(test_gemma_container PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_gemma_container PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_gemma_container r4dx-convert)
+endif()
+add_test(NAME test_gemma_container COMMAND test_gemma_container)
+if(TARGET convert_gemma_trellis)
+  # part (d): the rotated trellis containers convert_gemma_trellis leaves behind (SKIP when absent).
+  set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT
+    "HIP_VISIBLE_DEVICES=;R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep" FIXTURES_REQUIRED gemma_trellis_containers)
+else()
+  set_tests_properties(test_gemma_container PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=")
+endif()
+
+# test_gemma_forward_smoke (docs/gemma4-plan.md M1-20 / M1-22 smoke): the whole Gemma 4 stack on the real bf16.r4dx
+# against the M0-8 reference log-probs (full_logits_gemma.py's .logprobs.f16) over the first tokens of the first KL
+# segment -- KL / top-1 per KV mode, DecodeStepGreedy vs argmax(DecodeStep), a sampled step, Reset. GPU test (device 1);
+# SKIP 77 while the M0-8 outputs (R4DX_GEMMA_KL_REF_DIR) or the container are missing. ctest -R gemma_forward.
+# tool_gemma_rot_probe: per-layer rel L2 of a rotated Gemma container vs the unrotated one on the same layer input
+# (debugging tool, not a test; GPU, one device).
+add_executable(tool_gemma_rot_probe tool_gemma_rot_probe.cpp)
+target_link_libraries(tool_gemma_rot_probe PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
+add_executable(test_gemma_forward_smoke test_gemma_forward_smoke.cpp)
+target_link_libraries(test_gemma_forward_smoke PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_forward_smoke PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME gemma_forward_smoke COMMAND test_gemma_forward_smoke)
+set_tests_properties(gemma_forward_smoke PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
+# test_gemma_audio (docs/gemma4-audio.md M3-2): the audio splice (GemmaModel::PrefillAudio) on a container converted with
+# --audio on -- finite non-flat logits for a synthetic clip, the audio changes the output, a 30 s / 750-token clip, a
+# prefill split inside the span agrees with the one-call one. GPU test (device 1); SKIP 77 while the container is missing
+# (R4DX_GEMMA_AUDIO_CONTAINER). The CPU half is tests/audio. ctest -R gemma_audio.
+add_executable(test_gemma_audio test_gemma_audio.cpp)
+target_link_libraries(test_gemma_audio PRIVATE r4dx_model r4dx_audio r4dx_convert r4dx_core r4d_core)
+add_test(NAME gemma_audio COMMAND test_gemma_audio)
+set_tests_properties(gemma_audio PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+# test_gemma_vision_gpu (docs/gemma4-plan.md M2-3): the Gemma 4 vision path on an UNROTATED bf16 container converted with
+# `r4dx-convert --vision on` (R4DX_GEMMA_VISION_CONTAINER) against tools/reference/gemma/vision_golden_gemma.py's golden
+# (R4DX_GEMMA_VISION_GOLDEN): the embedder, layers 0 / 5 with an image block, and the multimodal prefill. NOT RUN by its
+# author (GPU). SKIP 77 while the container or the golden is missing. ctest -R gemma_vision_gpu.
+add_executable(test_gemma_vision_gpu test_gemma_vision_gpu.cpp)
+target_link_libraries(test_gemma_vision_gpu PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_vision_gpu PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME gemma_vision_gpu COMMAND test_gemma_vision_gpu)
+set_tests_properties(gemma_vision_gpu PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1" SKIP_RETURN_CODE 77)
+
+# test_gemma_rot_trellis (docs/gemma4-plan.md M1-31): GemmaModel on the rotated trellis containers convert_gemma_trellis
+# keeps (R4DX_GEMMA_TRELLIS_KEEP), against the same checkpoint unrotated bf16 (converted here by r4dx-convert): the
+# loader accepts the pair, default KV is bf16, logits track the reference, fp8 KV is finite. GPU test (device 1); NOT RUN
+# by its author. SKIP 77 while the kept containers are missing. ctest -R gemma_rot_trellis.
+add_executable(test_gemma_rot_trellis test_gemma_rot_trellis.cpp)
+target_link_libraries(test_gemma_rot_trellis PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+if(TARGET r4dx-convert)
+  target_compile_definitions(test_gemma_rot_trellis PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(test_gemma_rot_trellis r4dx-convert)
+endif()
+add_test(NAME gemma_rot_trellis COMMAND test_gemma_rot_trellis)
+set_tests_properties(gemma_rot_trellis PROPERTIES SKIP_RETURN_CODE 77
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1;R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep")
+if(TARGET convert_gemma_trellis)
+  set_tests_properties(gemma_rot_trellis PROPERTIES FIXTURES_REQUIRED gemma_trellis_containers)
+endif()
 add_executable(test_tp_shard test_tp_shard.cpp)
 target_link_libraries(test_tp_shard PRIVATE r4dx_tp_shard r4dx_convert)
 add_test(NAME test_tp_shard COMMAND test_tp_shard)
+
+# test_gemma_tp_shard (docs/gemma4-plan.md M1b-1): the Gemma 4 TP=2 sharding contract on the real 12B config -- tp::RuleFor's
+# Gemma table vs GemmaConfig::Shard, the byte plans (bf16 / w4a16 / trellis) partition every linear, and a tiny-model
+# algebra check that the sharded forward equals the unsharded one. CPU only, no HIP, no container.
+add_executable(test_gemma_tp_shard test_gemma_tp_shard.cpp)
+target_link_libraries(test_gemma_tp_shard PRIVATE r4dx_tp_shard)
+add_test(NAME test_gemma_tp_shard COMMAND test_gemma_tp_shard)
+
+# test_gemma_dflash_tp (docs/gemma4-plan.md, docs/tp.md Gemma section): Gemma DFlash under --tp 2. BOTH GPUs, LABEL tp2gpu, opt-in
+# like test_tp_real_vs_emulation (SKIP 77 unless R4DX_TP2GPU=1 and two devices are visible). Never run while another job owns a GPU.
+add_executable(test_gemma_dflash_tp test_gemma_dflash_tp.cpp)
+target_link_libraries(test_gemma_dflash_tp PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+target_compile_definitions(test_gemma_dflash_tp PRIVATE R4DX_SOURCE_DIR_STR="${CMAKE_SOURCE_DIR}")
+add_test(NAME test_gemma_dflash_tp COMMAND test_gemma_dflash_tp)
+set_tests_properties(test_gemma_dflash_tp PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
+
+# test_gemma_vision_tp (docs/gemma4-plan.md, docs/tp.md Gemma section): Gemma vision + audio under --tp 2 vs TP=1. BOTH GPUs, LABEL
+# tp2gpu, opt-in (SKIP 77 unless R4DX_TP2GPU=1 and two devices are visible). Written, not run by its author.
+add_executable(test_gemma_vision_tp test_gemma_vision_tp.cpp)
+target_link_libraries(test_gemma_vision_tp PRIVATE r4dx_model r4dx_audio r4dx_convert r4dx_core r4d_core)
+add_test(NAME test_gemma_vision_tp COMMAND test_gemma_vision_tp)
+set_tests_properties(test_gemma_vision_tp PROPERTIES LABELS tp2gpu SKIP_RETURN_CODE 77)
 
 # test_rotation_meta: quant2's `__metadata__.rotation` parse (src/model/rotation_meta.h, header-only
 # and HIP-free) and the TP slicing of the rotation.* tensors (docs/quant2.md section 3.1). CPU-only
@@ -239,6 +360,13 @@ target_link_libraries(test_dflash_draft_weights PRIVATE r4dx_convert r4dx_core)
 target_compile_definitions(test_dflash_draft_weights PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../convert/fixtures")
 add_test(NAME test_dflash_draft_weights COMMAND test_dflash_draft_weights)
+
+# test_dflash_hf_weights (docs/gemma4-plan.md D-3 / D-5): the loader reads a `r4dx-convert --dflash-hf` container --
+# block 16, 6 target layers, softcap / embed_scale / variant, per-layer pattern -- and defaults when they are absent. CPU-only.
+add_executable(test_dflash_hf_weights test_dflash_hf_weights.cpp)
+target_include_directories(test_dflash_hf_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_link_libraries(test_dflash_hf_weights PRIVATE r4dx_convert r4dx_core)
+add_test(NAME test_dflash_hf_weights COMMAND test_dflash_hf_weights)
 
 # test_keep_bf16 (Milestone 11, docs/validation.md "Milestone 11 / sensitivity"): converts a real
 # 4-layer container with `r4dx-convert --keep-bf16 <regex>` and checks that exactly the matched

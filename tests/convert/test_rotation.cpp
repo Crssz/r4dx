@@ -354,7 +354,8 @@ void TestQProduction(const RotationSet& rs) {
   double worst;
   const uint64_t wb = worst_bits.load();
   std::memcpy(&worst, &wb, 8);
-  Gate(bad.load() == 0, Fmt("(b) 5120: fast x Q == closed form on all 26,214,400 entries (%.2e)", worst));
+  Gate(bad.load() == 0, Fmt("(b) %lld: fast x Q == closed form on all %lld entries (%.2e)", (long long)n,
+                            (long long)(n * n), worst));
 
   std::mt19937_64 rng(7);
   std::vector<double> tmp(static_cast<size_t>(n));
@@ -373,7 +374,8 @@ void TestQProduction(const RotationSet& rs) {
     rt2 = std::max(rt2, RelErr(z, x));
   }
   Gate(rt < 1e-5 && rt2 < 1e-5 && nm < 1e-5,
-       Fmt("(b) 5120: x Q Q^T = x (%.2e), x Q^T Q = x (%.2e), ||x Q|| = ||x|| (%.2e)", rt, rt2, nm));
+       Fmt("(b) %lld: x Q Q^T = x (%.2e), x Q^T Q = x (%.2e), ||x Q|| = ||x|| (%.2e)", (long long)n, rt,
+           rt2, nm));
 }
 
 // ---- (c) Hb ------------------------------------------------------------------------------------
@@ -437,7 +439,7 @@ void TestHbProduction(const BlockHadamard& hb, const char* name) {
 
 // y[t][n] = sum_k (x[t][k] / rms(x_t)) * g[k] * W[n][k]; g == nullptr means 1.
 std::vector<double> NormedLinear(const std::vector<double>& x, int64_t T, int64_t K, const float* w_norm,
-                                 const std::vector<float>& W, int64_t N) {
+                                 const std::vector<float>& W, int64_t N, double off = 1.0) {
   std::vector<double> y(static_cast<size_t>(T * N), 0.0);
   for (int64_t t = 0; t < T; ++t) {
     const double* xt = x.data() + t * K;
@@ -447,7 +449,7 @@ std::vector<double> NormedLinear(const std::vector<double>& x, int64_t T, int64_
     for (int64_t n = 0; n < N; ++n) {
       double s = 0.0;
       for (int64_t k = 0; k < K; ++k) {
-        const double g = w_norm ? 1.0 + static_cast<double>(w_norm[k]) : 1.0;
+        const double g = w_norm ? off + static_cast<double>(w_norm[k]) : 1.0;
         s += xt[k] * inv * g * W[static_cast<size_t>(n * K + k)];
       }
       y[static_cast<size_t>(t * N + n)] = s;
@@ -468,17 +470,20 @@ std::vector<double> ResidualAdd(const std::vector<double>& r, const std::vector<
   return z;
 }
 
-void TestFoldIn(const ResidualRotation& q, int64_t N, const char* label) {
+// off = 1.0: Qwen zero-centred norm (1 + w); off = 0.0: Gemma plain norm (w, drawn around 1).
+void TestFoldIn(const ResidualRotation& q, int64_t N, const char* label, double off = 1.0) {
   const int64_t K = q.hidden, T = 3;
   std::mt19937_64 rng(21 + K);
   std::vector<double> x = RandomVec(rng, T * K);
   x[5] = 80.0;  // outlier
-  const std::vector<float> w = RandomVecF(rng, K, 0.3);
+  std::vector<float> w = RandomVecF(rng, K, 0.3);
+  if (off == 0.0)
+    for (auto& v : w) v += 1.0f;
   const std::vector<float> W = RandomVecF(rng, N * K, 0.05);
-  const std::vector<double> y = NormedLinear(x, T, K, w.data(), W, N);
+  const std::vector<double> y = NormedLinear(x, T, K, w.data(), W, N, off);
 
   std::vector<float> Wf = W;
-  FoldRowsQ(Wf, N, K, w.data(), q, 4);
+  FoldRowsQ(Wf, N, K, w.data(), q, 4, off);
   std::vector<double> xr = x, tmp(static_cast<size_t>(K));
   for (int64_t t = 0; t < T; ++t) q.Apply(xr.data() + t * K, tmp.data());
   const std::vector<double> yr = NormedLinear(xr, T, K, /*stored norm = 0*/ nullptr, Wf, N);
@@ -489,8 +494,8 @@ void TestFoldIn(const ResidualRotation& q, int64_t N, const char* label) {
   // row fusion (mlp.gate_up = [gate; up]) and thread-count independence
   const int64_t Na = N / 2;
   std::vector<float> A(W.begin(), W.begin() + Na * K), B(W.begin() + Na * K, W.end());
-  FoldRowsQ(A, Na, K, w.data(), q, 1);
-  FoldRowsQ(B, N - Na, K, w.data(), q, 7);
+  FoldRowsQ(A, Na, K, w.data(), q, 1, off);
+  FoldRowsQ(B, N - Na, K, w.data(), q, 7, off);
   std::vector<float> cat = A;
   cat.insert(cat.end(), B.begin(), B.end());
   Gate(cat == Wf, Fmt("(d) %s: fold of a row-concatenation == concatenated folds, 1 vs 4 vs 7 threads "
@@ -618,11 +623,14 @@ std::vector<double> CorrelatedRows(std::mt19937_64& rng, int64_t rows, int64_t K
   return X;
 }
 
-void TestHessianIn(const ResidualRotation& q, int64_t rows, int64_t N, const char* label, int threads) {
+void TestHessianIn(const ResidualRotation& q, int64_t rows, int64_t N, const char* label, int threads,
+                   double off = 1.0) {
   const int64_t K = q.hidden;
   std::mt19937_64 rng(41 + K);
   const std::vector<double> x = CorrelatedRows(rng, rows, K);  // raw residual rows
-  const std::vector<float> w = RandomVecF(rng, K, 0.3);
+  std::vector<float> w = RandomVecF(rng, K, 0.3);
+  if (off == 0.0)
+    for (auto& v : w) v += 1.0f;  // plain norm weights sit around 1
   // HF's linear input: x_n = x / rms(x) * (1 + w). The folded linear's input: x_n' = (x / rms) Q.
   std::vector<double> xn(x.size()), xr(x.size()), tmp(static_cast<size_t>(K));
   for (int64_t r = 0; r < rows; ++r) {
@@ -631,7 +639,7 @@ void TestHessianIn(const ResidualRotation& q, int64_t rows, int64_t N, const cha
     for (int64_t k = 0; k < K; ++k) ss += xt[k] * xt[k];
     const double inv = 1.0 / std::sqrt(ss / static_cast<double>(K));
     for (int64_t k = 0; k < K; ++k) {
-      xn[static_cast<size_t>(r * K + k)] = xt[k] * inv * (1.0 + static_cast<double>(w[static_cast<size_t>(k)]));
+      xn[static_cast<size_t>(r * K + k)] = xt[k] * inv * (off + static_cast<double>(w[static_cast<size_t>(k)]));
       xr[static_cast<size_t>(r * K + k)] = xt[k] * inv;
     }
     q.Apply(xr.data() + r * K, tmp.data());
@@ -639,7 +647,7 @@ void TestHessianIn(const ResidualRotation& q, int64_t rows, int64_t N, const cha
   const std::vector<float> H = Capture(xn, rows, K, threads);
   const std::vector<float> H_direct = Capture(xr, rows, K, threads);
   std::vector<float> Ht = H;
-  TransformHessianQ(Ht, K, w.data(), q, threads);
+  TransformHessianQ(Ht, K, w.data(), q, threads, off);
   const double ed = RelErr(Ht, H_direct);
   Gate(ed < 1e-4, Fmt("(e) %s: TransformHessianQ(H) == H captured on the folded input (x/rms) Q (%.2e)",
                       label, ed));
@@ -647,12 +655,12 @@ void TestHessianIn(const ResidualRotation& q, int64_t rows, int64_t N, const cha
 
   const std::vector<float> W = RandomVecF(rng, N * K, 0.05);
   std::vector<float> Wf = W;
-  FoldRowsQ(Wf, N, K, w.data(), q, threads);
+  FoldRowsQ(Wf, N, K, w.data(), q, threads, off);
   const double p0 = Proxy(W, H, N, K, threads), p1 = Proxy(Wf, Ht, N, K, threads);
   // A quantization-like error, mapped into the folded basis the way the weight is: dW' = dW D Q.
   std::vector<float> dW = RandomVecF(rng, N * K, 0.004);
   std::vector<float> dWf = dW;
-  FoldRowsQ(dWf, N, K, w.data(), q, threads);
+  FoldRowsQ(dWf, N, K, w.data(), q, threads, off);
   const double e0 = Proxy(dW, H, N, K, threads), e1 = Proxy(dWf, Ht, N, K, threads);
   Gate(std::fabs(p1 - p0) <= 1e-4 * std::fabs(p0) && std::fabs(e1 - e0) <= 1e-4 * std::fabs(e0),
        Fmt("(e) %s: tr(W' H' W'^T) = tr(W H W^T) (%.6g vs %.6g), same for an error dW (%.6g vs %.6g)",
@@ -833,6 +841,215 @@ void TestImportance() {
   }
 }
 
+// ---- (h) any hidden size: Gemma 3840 = 15 x 256, 768 = 3 x 256, and 5120 unchanged ----------------
+
+uint64_t g_fnv = 1469598103934665603ull;
+void FnvMix(const std::vector<float>& v) {
+  const auto* b = reinterpret_cast<const unsigned char*>(v.data());
+  for (size_t i = 0; i < v.size() * sizeof(float); ++i) {
+    g_fnv ^= b[i];
+    g_fnv *= 1099511628211ull;
+  }
+}
+
+// FNV-1a over the production-shape tensors and every fold / transform applied to deterministic data,
+// computed by the generation and fold code exactly as it stood BEFORE ChooseRotationBlock / norm_offset
+// existed (HEAD of gemma4, 33c404e): the Qwen 5120 path must stay bit-identical. ucrt's log / cos feed
+// mix5, so like the rest of this file the value is pinned to this toolchain.
+void Test5120Golden() {
+  RotationShape s = ProductionShape();
+  const RotationSet rs = GenerateRotationSet(RotationKind::kQ2ab, kDefaultRotationSeed, s);
+  FnvMix(rs.q.signs);
+  FnvMix(rs.q.mix);
+  FnvMix(rs.had_down.signs);
+  FnvMix(rs.had_o.signs);
+  FnvMix(rs.had_gdn_out.signs);
+  uint64_t st = 12345;
+  auto rnd = [&]() {
+    st = st * 6364136223846793005ull + 1442695040888963407ull;
+    return static_cast<float>(static_cast<int64_t>(st >> 40) - (1 << 23)) / (1 << 24);
+  };
+  std::vector<float> w(5120);
+  for (auto& x : w) x = rnd();
+  std::vector<float> W(8 * 5120);
+  for (auto& x : W) x = rnd();
+  FoldRowsQ(W, 8, 5120, w.data(), rs.q, 4);
+  FnvMix(W);
+  std::vector<float> O(5120 * 6);
+  for (auto& x : O) x = rnd();
+  FoldColumnsQt(O, 5120, 6, rs.q, 4);
+  FnvMix(O);
+  std::vector<float> D(3 * 17408);
+  for (auto& x : D) x = rnd();
+  FoldRowsHadamard(D, 3, 17408, rs.had_down, 4);
+  FnvMix(D);
+  std::vector<float> v(5120);
+  for (auto& x : v) x = rnd() * rnd() + 0.01f;
+  FnvMix(TransformImportanceQ(v.data(), 5120, w.data(), rs.q));
+  uint64_t s2 = 9;
+  const ResidualRotation q4 = GenerateResidualRotation(s2, 64, 16);
+  std::vector<float> Hm(64 * 64);
+  for (auto& x : Hm) x = rnd();
+  for (int i = 0; i < 64; ++i)
+    for (int j = 0; j < i; ++j) Hm[i * 64 + j] = Hm[j * 64 + i];
+  std::vector<float> w64(64);
+  for (auto& x : w64) x = rnd() * 0.3f;
+  TransformHessianQ(Hm, 64, w64.data(), q4, 2);
+  FnvMix(Hm);
+  Gate(g_fnv == 0xded7c3bab9dc8723ull,
+       Fmt("(h) 5120 default-seed q2ab tensors and folds bit-identical to the pre-generalization code "
+           "(fnv %016llx)", (unsigned long long)g_fnv));
+}
+
+// Option A (docs/gemma4-plan.md 4.4) at a miniature Gemma geometry, as the runtime executes it:
+//   residual r' = r Q;  h -> (h Hb) W''^T with W'' = W Hb (NO Q^T);  post-norm with plain weight p;
+//   rotate the normed sublayer output by Q;  add.   Result must equal ((r + postnorm(h W^T)) Q).
+void TestOptionA() {
+  const int64_t hidden = 48, K = 64, T = 3;
+  const int64_t block = ChooseRotationBlock(hidden);
+  uint64_t st = 0xA11CE;
+  const ResidualRotation q = GenerateResidualRotation(st, hidden, block);
+  const BlockHadamard hb = GenerateBlockHadamard(st, K, 32);
+  std::mt19937_64 rng(77);
+  const std::vector<float> W = RandomVecF(rng, hidden * K, 0.2);
+  std::vector<float> p = RandomVecF(rng, hidden, 0.3);
+  for (auto& x : p) x += 1.0f;
+  std::vector<float> Wh = W;
+  FoldRowsHadamard(Wh, hidden, K, hb, 3);  // kHadOnly: W Hb only
+  double worst = 0.0, worst_wrong = 1e30;
+  std::vector<double> tmp(static_cast<size_t>(hidden));
+  for (int64_t t = 0; t < T; ++t) {
+    const std::vector<double> r = RandomVec(rng, hidden, 2.0);
+    const std::vector<double> h = RandomVec(rng, K);
+    auto postnorm = [&](std::vector<double> y) {
+      double ss = 0.0;
+      for (double v : y) ss += v * v;
+      const double inv = 1.0 / std::sqrt(ss / static_cast<double>(hidden) + 1e-6);
+      for (int64_t k = 0; k < hidden; ++k) y[static_cast<size_t>(k)] *= inv * p[static_cast<size_t>(k)];
+      return y;
+    };
+    // plain layer
+    std::vector<double> o(static_cast<size_t>(hidden), 0.0);
+    for (int64_t n = 0; n < hidden; ++n)
+      for (int64_t k = 0; k < K; ++k) o[static_cast<size_t>(n)] += h[static_cast<size_t>(k)] * W[static_cast<size_t>(n * K + k)];
+    std::vector<double> want = r, y = postnorm(o);
+    for (int64_t k = 0; k < hidden; ++k) want[static_cast<size_t>(k)] += y[static_cast<size_t>(k)];
+    q.Apply(want.data(), tmp.data());  // the rotated-basis expectation
+    // option A
+    std::vector<double> hin = h;
+    hb.Apply(hin.data());
+    std::vector<double> o2(static_cast<size_t>(hidden), 0.0);
+    for (int64_t n = 0; n < hidden; ++n)
+      for (int64_t k = 0; k < K; ++k) o2[static_cast<size_t>(n)] += hin[static_cast<size_t>(k)] * Wh[static_cast<size_t>(n * K + k)];
+    std::vector<double> y2 = postnorm(o2);
+    q.Apply(y2.data(), tmp.data());
+    std::vector<double> got = r;
+    q.Apply(got.data(), tmp.data());
+    for (int64_t k = 0; k < hidden; ++k) got[static_cast<size_t>(k)] += y2[static_cast<size_t>(k)];
+    worst = std::max(worst, RelErr(got, want));
+    // the rejected alternative, Q^T folded into W with the post-norm after it, must NOT match
+    std::vector<float> Wq = Wh;
+    FoldColumnsQt(Wq, hidden, K, q, 1);
+    std::vector<double> o3(static_cast<size_t>(hidden), 0.0);
+    for (int64_t n = 0; n < hidden; ++n)
+      for (int64_t k = 0; k < K; ++k) o3[static_cast<size_t>(n)] += hin[static_cast<size_t>(k)] * Wq[static_cast<size_t>(n * K + k)];
+    std::vector<double> y3 = postnorm(o3), got3 = r;
+    q.Apply(got3.data(), tmp.data());
+    for (int64_t k = 0; k < hidden; ++k) got3[static_cast<size_t>(k)] += y3[static_cast<size_t>(k)];
+    worst_wrong = std::min(worst_wrong, RelErr(got3, want));
+  }
+  Gate(worst < 1e-5, Fmt("(h) option A (W Hb only, post-norm, rotate, add) == plain layer in the rotated "
+                         "basis, hidden 48 = 3 x 16 (%.2e)", worst));
+  Gate(worst_wrong > 1e-2, Fmt("(h) folding Q^T into o/down under a post-norm is NOT equivalent (%.2e off): "
+                               "why option A exists", worst_wrong));
+}
+
+void TestAnyHidden() {
+  std::printf("---- (h) any hidden size ----\n");
+  Gate(ChooseRotationBlock(5120) == 1024 && ChooseRotationBlock(3840) == 256 &&
+           ChooseRotationBlock(768) == 256 && ChooseRotationBlock(4096) == 1024 &&
+           ChooseRotationBlock(8192) == 1024 && ChooseRotationBlock(48) == 16 &&
+           ChooseRotationBlock(5) == 1,
+       "(h) ChooseRotationBlock: 5120->1024, 3840->256, 768->256, 4096/8192->1024 (cap), 48->16");
+  ExpectThrow("(h) ChooseRotationBlock(0) throws", []() { ChooseRotationBlock(0); });
+  Gate(std::string(RotationMixName(5)) == "rotation.mix5" && std::string(RotationMixName(15)) == "rotation.mix" &&
+           std::string(RotationMixName(3)) == "rotation.mix",
+       "(h) RotationMixName: nblk 5 keeps rotation.mix5, any other nblk is rotation.mix");
+
+  Test5120Golden();
+
+  // Gemma geometry: hidden 3840, down K=15360/512, o_swa K=4096/256, o_full K=8192/256, no GDN.
+  RotationShape gs;
+  gs.hidden = 3840;
+  gs.block = ChooseRotationBlock(3840);
+  gs.k_down = 15360;
+  gs.k_o = 4096;
+  gs.k_o_full = 8192;
+  const RotationSet g = GenerateRotationSet(RotationKind::kQ2ab, kDefaultRotationSeed, gs);
+  const RotationSet ga = GenerateRotationSet(RotationKind::kQ2a, kDefaultRotationSeed, gs);
+  Gate(g.q.hidden == 3840 && g.q.block == 256 && g.q.nblk == 15 && g.q.signs.size() == 3840 &&
+           g.q.mix.size() == 225 && g.had_down.K == 15360 && g.had_down.block == 512 &&
+           g.had_o.K == 4096 && g.had_o.block == 256 && g.had_o_full.K == 8192 &&
+           g.had_o_full.block == 256 && g.had_gdn_out.Empty(),
+       "(h) Gemma shapes: signs[3840], mix[15x15], had_down[15360]/512, had_o[4096]/256, "
+       "had_o_full[8192]/256, no gdn_out");
+  Gate(ga.q.signs == g.q.signs && ga.q.mix == g.q.mix && ga.had_o_full.Empty(),
+       "(h) Gemma q2a's signs / mix equal q2ab's; q2a has no Hadamards");
+  double rr = 0.0;
+  for (int c = 0; c < 15; ++c)
+    for (int d = 0; d < 15; ++d) {
+      double s = 0.0;
+      for (int b = 0; b < 15; ++b)
+        s += static_cast<double>(g.q.mix[static_cast<size_t>(c * 15 + b)]) * g.q.mix[static_cast<size_t>(d * 15 + b)];
+      rr = std::max(rr, std::fabs(s - (c == d ? 1.0 : 0.0)));
+    }
+  Gate(rr < 1e-6, Fmt("(h) R R^T = I for the 15 x 15 mix (max err %.2e)", rr));
+  Gate(g.had_o.signs != g.had_o_full.signs || g.had_o.K != g.had_o_full.K,
+       "(h) had_o and had_o_full are separate draws");
+
+  TestQMiniature(3, 256, 0x768);
+  TestQMiniature(15, 16, 0x3840);
+  TestQProduction(g);
+  TestHbProduction(g.had_down, "gemma had_down");
+  TestHbProduction(g.had_o, "gemma had_o_swa");
+  TestHbProduction(g.had_o_full, "gemma had_o_full");
+
+  // plain-norm folds (norm_offset 0)
+  uint64_t st = 0x4242;
+  const ResidualRotation q48 = GenerateResidualRotation(st, 48, 16);
+  TestFoldIn(q48, 12, "mini 3x16 plain-norm", 0.0);
+  TestFoldIn(g.q, 16, "3840 plain-norm", 0.0);
+  TestFoldIn(g.q, 16, "3840 zero-centred norm", 1.0);
+  TestFoldOut(q48, nullptr, 40, "mini 3x16 q2a out-projection");
+  TestHessianIn(q48, 300, 6, "mini 3x16 plain-norm in-projection", 4, 0.0);
+  TestHessianIn(g.q, 48, 4, "3840 plain-norm in-projection", 16, 0.0);
+  ExpectThrow("(h) TransformHessianQ throws on a plain-norm weight |w| < 1e-3", [&]() {
+    std::vector<float> H(48 * 48, 0.0f);
+    for (int64_t i = 0; i < 48; ++i) H[static_cast<size_t>(i * 48 + i)] = 1.0f;
+    std::vector<float> w(48, 1.0f);
+    w[9] = 0.0004f;
+    TransformHessianQ(H, 48, w.data(), q48, 1, 0.0);
+  });
+  {
+    // diagonal-model imatrix with offset 0 == diag(M^T diag(v) M) of M = D^-1 Q, D = diag(w)
+    const int64_t K = q48.hidden;
+    std::mt19937_64 rng(31);
+    std::vector<float> v = RandomVecF(rng, K), w = RandomVecF(rng, K, 0.3);
+    for (auto& x : v) x = x * x + 0.01f;
+    for (auto& x : w) x += 1.0f;
+    const std::vector<double> Q = DenseFromRowOp(K, [&](double* x, double* t) { q48.Apply(x, t); });
+    std::vector<double> ref(static_cast<size_t>(K), 0.0);
+    for (int64_t k = 0; k < K; ++k)
+      for (int64_t m = 0; m < K; ++m) {
+        const double mk = Q[static_cast<size_t>(m * K + k)] / w[static_cast<size_t>(m)];
+        ref[static_cast<size_t>(k)] += mk * mk * v[static_cast<size_t>(m)];
+      }
+    const double e = RelErr(TransformImportanceQ(v.data(), K, w.data(), q48, 0.0), ref);
+    Gate(e < 1e-6, Fmt("(h) TransformImportanceQ with norm_offset 0 == diag((D^-1 Q)^T diag(v) D^-1 Q) (%.2e)", e));
+  }
+  TestOptionA();
+}
+
 }  // namespace
 
 int main() {
@@ -852,6 +1069,7 @@ int main() {
     TestHessians();
     TestStoreHook(R4DX_CONVERT_FIXTURES_DIR);
     TestImportance();
+    TestAnyHidden();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "FAIL unexpected exception: %s\n", e.what());
     ++g_failures;

@@ -13,9 +13,19 @@ void BufferingSink::OnStart(int64_t prompt_tokens_in) {
   prompt_tokens = prompt_tokens_in;
 }
 
+void BufferingSink::OnStart(int64_t prompt_tokens_in, bool reasoning_open_in_prompt) {
+  OnStart(prompt_tokens_in);
+  if (dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
+    std::lock_guard<std::mutex> lock(mu_);
+    splitter_ = ReasoningSplitter(dialect_->reasoning,
+                                  reasoning_open_in_prompt ? ReasoningSplitter::StartState::kInReasoning
+                                                           : ReasoningSplitter::StartState::kExpectOpener);
+  }
+}
+
 void BufferingSink::OnToken(const std::string& piece) {
   std::lock_guard<std::mutex> lock(mu_);
-  if (!enable_thinking_ || reasoning_delivered_) {
+  if (!split_active_ || reasoning_delivered_) {
     // Byte-identical to before this field existed (task item 5c) -- and also the NON-streaming
     // tool-call path once OnReasoningContent has already delivered the (pre-split) reasoning span,
     // since `piece`/`text` at that point is `parsed.content`, which cannot contain the tag any more.
@@ -34,7 +44,7 @@ void BufferingSink::OnToken(const std::string& piece) {
 void BufferingSink::OnDone(const std::string& finish_reason_in, int64_t completion_tokens_in,
                             const TimingStats& timings_in, int64_t reasoning_tokens_in) {
   std::lock_guard<std::mutex> lock(mu_);
-  if (enable_thinking_ && !reasoning_delivered_) {
+  if (split_active_ && !reasoning_delivered_) {
     for (const auto& ev : splitter_.Finish()) {
       if (ev.is_reasoning) {
         reasoning_raw_ += ev.text;
@@ -83,10 +93,27 @@ void BufferingSink::OnReasoningContent(const std::string& text_in) {
 // ---- StreamingSink ---------------------------------------------------------------------------
 
 StreamingSink::StreamingSink(Kind kind, std::string id, std::string model_id, int64_t created_unix,
-                             bool include_usage, bool enable_thinking, bool emit_reasoning)
+                             bool include_usage, bool enable_thinking, bool emit_reasoning,
+                             const ModelDialect* dialect)
     : kind_(kind), id_(std::move(id)), model_id_(std::move(model_id)), created_unix_(created_unix),
       include_usage_(include_usage), enable_thinking_(enable_thinking && kind == Kind::kChat),
-      emit_reasoning_(emit_reasoning), queue_(/*max_size=*/256) {}
+      emit_reasoning_(emit_reasoning), dialect_(dialect),
+      split_active_(kind == Kind::kChat &&
+                    (enable_thinking || (dialect != nullptr && dialect->kind == DialectKind::kGemma4))),
+      queue_(/*max_size=*/256) {
+  if (kind == Kind::kChat && dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
+    splitter_ = ReasoningSplitter(dialect_->reasoning, ReasoningSplitter::StartState::kExpectOpener);
+  }
+}
+
+void StreamingSink::OnStart(int64_t prompt_tokens, bool reasoning_open_in_prompt) {
+  if (kind_ == Kind::kChat && dialect_ != nullptr && dialect_->kind == DialectKind::kGemma4) {
+    splitter_ = ReasoningSplitter(dialect_->reasoning,
+                                  reasoning_open_in_prompt ? ReasoningSplitter::StartState::kInReasoning
+                                                           : ReasoningSplitter::StartState::kExpectOpener);
+  }
+  OnStart(prompt_tokens);
+}
 
 void StreamingSink::OnStart(int64_t prompt_tokens) {
   prompt_tokens_ = prompt_tokens;
@@ -116,7 +143,7 @@ void StreamingSink::OnToken(const std::string& piece) {
         BuildCompletionChunk(id_, model_id_, created_unix_, piece, std::nullopt, include_usage_)));
     return;
   }
-  if (!enable_thinking_ || reasoning_delivered_) {
+  if (!split_active_ || reasoning_delivered_) {
     // Byte-identical to before this field existed (task item 5c) -- and also the NON-streaming
     // tool-call path once OnReasoningContent already delivered the (pre-split) reasoning span,
     // since `piece` at that point is `parsed.content`, which cannot contain the tag any more.
@@ -148,7 +175,7 @@ void StreamingSink::OnReasoningContent(const std::string& text) {
 
 void StreamingSink::OnDone(const std::string& finish_reason, int64_t completion_tokens,
                            const TimingStats& timings_in, int64_t reasoning_tokens) {
-  if (enable_thinking_ && !reasoning_delivered_) {
+  if (split_active_ && !reasoning_delivered_) {
     // Flush whatever the splitter is still holding back -- the never-closed reasoning tail, or
     // (silently, correctly) nothing at all if generation ended inside the answer's leading blank
     // lines. Must happen before the finish_reason chunk: task item 5b's "nothing may be lost".

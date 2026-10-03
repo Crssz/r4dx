@@ -53,6 +53,13 @@ struct Dflash2Metadata {
   int64_t mask_token_id = -1;
   int64_t vocab_size = 0;  // derived from selector_predecessor's tensor shape, see below
   int64_t file_type = -1;
+  // OPTIONAL keys (docs/gemma4-plan.md 6.4). Written to `__metadata__.dflash2` only when set, so a Qwen
+  // drafter container stays byte-identical. 0 / empty == absent.
+  double logit_softcap = 0.0;  // cap * tanh(logit / cap) on the drafter's lm_head logits (Gemma: 30)
+  double embed_scale = 0.0;    // multiplier on the TARGET's raw embedding rows fed to the draft block
+                               // (z-lab DFlash: input_embedding_scale, default 1.0 == unscaled rows)
+  std::string variant;         // "v1_identity": converted from an HF DFlash v1 checkpoint
+  int64_t target_layer_offset = -1;  // provenance: z-lab target_layer_ids + offset == target_layers
 };
 
 inline Dflash2Metadata ReadDflash2Metadata(const GgufReader& g) {
@@ -165,6 +172,10 @@ inline nlohmann::json BuildDflash2MetadataJson(const Dflash2Metadata& m) {
   j["mask_token_id"] = m.mask_token_id;
   j["vocab_size"] = m.vocab_size;
   j["source_file_type"] = m.file_type;
+  if (m.logit_softcap > 0.0) j["logit_softcap"] = m.logit_softcap;
+  if (m.embed_scale > 0.0) j["embed_scale"] = m.embed_scale;
+  if (!m.variant.empty()) j["variant"] = m.variant;
+  if (m.target_layer_offset >= 0) j["target_layer_offset"] = m.target_layer_offset;
   return j;
 }
 

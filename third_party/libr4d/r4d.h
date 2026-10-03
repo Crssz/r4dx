@@ -36,7 +36,7 @@
 // Library version. The module exposes it as r4d.__version__, and the git tag it was built from is
 // expected to match -- which is what lets a consumer assert it linked the sources it pinned rather
 // than whatever a stale clone happened to hold.
-#define R4D_VERSION "0.5.0"
+#define R4D_VERSION "0.6.0"
 
 struct R4DArgs {
     const void*  q;             // (num_seqs*q_len, q_heads, head_dim)  bf16
@@ -57,6 +57,22 @@ struct R4DArgs {
                                 //   segment count (<= 1 = unsplit); ignored by plain prefill
     int  max_ctx;               // host-visible context bound (seqused_k is device-side)
 };
+
+// The windowed (sliding-attention) entry points' arguments: an R4DArgs plus the window. A struct that
+// DERIVES from R4DArgs, so `R4DArgs` itself -- and every Qwen entry point and instantiation -- is
+// untouched, and a windowed kernel reads `a.q`, `a.seqused_k`, ... exactly as the unwindowed one does.
+struct R4DArgsW : R4DArgs {
+    int         window;         // sliding window W >= 1: a query at position p sees keys (p - W, p]
+    const int*  klimit_ext;     // prefill only: (num_seqs * q_len,) absolute key limit per query row for
+                                //   a bidirectional block (an image), < 0 or the whole pointer null =
+                                //   causal. Raises a row's upper bound only; the effective bound must be
+                                //   non-decreasing in the row (r4d_attn_window.h). Decode ignores it.
+};
+
+// Kernel-argument type selector for the attention templates: the windowed instantiations take an
+// R4DArgsW, every other one the R4DArgs it always took (so their kernel signature is unchanged).
+template <bool WINDOWED> struct R4DKernelArgs        { typedef R4DArgs  type; };
+template <>              struct R4DKernelArgs<true>  { typedef R4DArgsW type; };
 
 extern "C" {
 // ---- attention: paged, causal, varlen ------------------------------------------------------
@@ -84,6 +100,33 @@ int  r4d_attn_prefill_exact_h256_gqa6_fp8kv(const R4DArgs* a, hipStream_t stream
 // The geometry the attention kernels above are compiled for, so a caller can test a model against
 // it instead of discovering the mismatch at the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
+
+// ---- attention: sliding window (r4d_attn_paged_h256_gqa2.hip) ----------------------------------
+// The same kernels as the gqa6 family, compiled for head_dim 256 with 2 queries per KV head and a
+// sliding window: key kpos is visible to the query at qpos iff kpos <= qpos and kpos > qpos - W
+// (a->window = W; R4DArgsW, above). Everything else is the family's contract: paged block 16, bf16
+// query, fp8-e4m3 KV with per-(seq, head) descales, causal, varlen, the ring being nothing but a
+// block table whose entries repeat (T[i] = i % RB; r4d_attn_window.h) -- the kernels address keys as
+// block_table[kpos / 16] and never know. The KV cache MUST be zero-initialised: a tile can start up
+// to 47 keys below the window and stages slots that alias newer keys (masked, but they must be finite).
+// Prefill: 64 query rows per workgroup (8 warps x 16 rows / gqa 2), 48-key tiles; takes a->klimit_ext.
+// Decode: split-KV over the window's tiles only, at most 64 query rows (q_len <= 32 at gqa 2); the
+// split law sees min(max_ctx, W + q_len + 16), so its cost does not grow with the context. Needs a->scratch
+// (r4d_attn_decode_h256_gqa2_scratch_bytes). Return 0 on success, negative on a shape this
+// instantiation does not serve (-1 head_dim / block_size, -2 gqa, -4 too many query rows, -5 scratch
+// missing, -6 window < 1).
+int  r4d_attn_prefill_h256_gqa2_fp8kv (const R4DArgsW* a, hipStream_t stream);
+int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgsW* a, hipStream_t stream);
+int64_t r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgsW* a);
+// Every attention geometry this build serves, so a model can be validated against all of them at
+// load (r4d_attn_dims reports the gqa6 one only).
+struct R4DAttnGeom {
+    const char* name;           // the entry-point family, e.g. "h256_gqa6"
+    int head_dim, gqa, block_size, max_decode_rows;
+    int windowed;               // 1: takes R4DArgsW (a sliding window and klimit_ext)
+};
+int r4d_attn_geom_count(void);
+const struct R4DAttnGeom* r4d_attn_geom_at(int i);
 
 // ---- attention: vision encoder -------------------------------------------------------------
 // Dense, non-causal, multi-head attention at the vision tower's head_dim of 72, bf16 throughout.

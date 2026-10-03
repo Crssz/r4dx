@@ -118,6 +118,17 @@ using DflashLmHeadProvider = std::function<void(core::Stream& stream, core::Aren
 DflashEmbeddingProvider MakeTargetEmbeddingProvider(const Container& container);
 DflashLmHeadProvider MakeTargetLmHeadProvider(const Container& container);
 
+// The same two providers over a bare table / head, for a target that is not a `Container` (GemmaModel,
+// docs/gemma4-plan.md 6.4). `table_dev` is the target's RAW bf16 [vocab, hidden] embedding table in the
+// ORIGINAL basis (a rotated Gemma container keeps it so); `scale` multiplies the gathered rows
+// (the drafter's `embed_scale`: z-lab DFlash uses 1.0, the raw rows, NOT Gemma's sqrt(hidden)-scaled
+// ones; 1.0 takes the plain gather kernel, anything else the scaled one). The lm_head provider is the
+// bare GEMM + widen; the softcap is applied by DraftRound to the 16 candidate values (monotone, so
+// the top-16 ids are unchanged), never here.
+DflashEmbeddingProvider MakeEmbeddingProviderFromTable(const uint16_t* table_dev, int64_t hidden, int64_t vocab,
+                                                       float scale);
+DflashLmHeadProvider MakeLmHeadProviderFromLinear(const QuantLinear* lm_head);
+
 struct DflashDraftOptions {
   std::string container_path;
   Layout layout = Layout::kW4a16;  // which packed layout of this container's linears to load
@@ -192,6 +203,8 @@ class DflashDraft {
 
   const Dflash2Config& Config() const { return cfg_; }
   int64_t BlockSize() const { return cfg_.block_size; }
+  double LogitSoftcap() const { return cfg_.logit_softcap; }
+  double EmbedScale() const { return cfg_.embed_scale; }
   int64_t FeatureCols() const {
     return static_cast<int64_t>(cfg_.target_layers.size()) * cfg_.hidden_size;
   }

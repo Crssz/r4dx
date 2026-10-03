@@ -991,6 +991,13 @@ against the 4-layer container, which has no vision tensors, instead asserts the 
 ALWAYS hold -- a well-formed local image against a non-vision container is a clean 400 naming the
 real reason).
 
+## Audio (Gemma 4 only)
+
+`{"type":"input_audio","input_audio":{"data":"<base64 wav>","format":"wav"}}` content parts are accepted when the
+loaded container is a Gemma 4 one converted with `--audio on` (`/v1/models` then lists `audio`). 16 kHz WAV only
+(PCM 8/16/24/32 or float; stereo is averaged), at most 30 s (750 tokens) and 4 clips per request; anything else is a
+400 with a message saying what to change (the server never resamples: `ffmpeg -i in.wav -ar 16000 -ac 1 out.wav`).
+Audio and image parts cannot be mixed in one request yet. Design, verification and tests: `docs/gemma4-audio.md`.
 ## Deferred / known gaps
 - **Sampling defaults vs. explicit values**: `--default-temperature`/`--default-top-p`/
   `--default-top-k`/`--default-min-p` seed every sampling field a request does not itself set
@@ -1313,6 +1320,16 @@ reported at startup, and `--image-max-pixels` is exactly the `image_cfg` every `
 part is now decoded/preprocessed with (`ParseChatCompletionRequest`, see "Images" above) -- a
 request against a server started with `--vision off`, or against a container with no `vision.*`
 tensors at all, still gets a clean `400` naming that reason.
+
+**Gemma 4** (`gemma4_unified`, docs/gemma4-plan.md M2): the same `image_url` data-URI content parts and
+`--vision` flag, but the "tower" is the encoder-free embedder (10 `vision.*` tensors, ~0.1 GB, from a
+container converted with `r4dx-convert --vision on`; `auto` loads them iff present). `--image-max-pixels` is
+ignored; `--image-soft-tokens {70|140|280}` (default 280) is the Gemma4UnifiedImageProcessor budget: an image
+is resized (grown or shrunk) to the largest multiple-of-48 size with at most that many 48x48 patches, and each
+patch is one soft token. The chat template's single `<|image|>` per image is expanded to `<|image>` + N x
+`<|image|>` + `<image|>`. Prefill feeds an image as one chunk of up to 288 rows; inside it the sliding layers
+attend bidirectionally (full layers and decode stay causal). 560 / 1120 soft tokens are refused (a block must
+fit one chunk and the sliding ring). Not GPU-validated yet: see the M2 notes in docs/gemma4-plan.md.
 
 `--dflash <draft.r4dx>` (default empty, disabled): see the "New (Milestone 5 stage S3...)" note
 above -- mutually exclusive with `--mtp N>0`.

@@ -33,6 +33,7 @@
 //         becomes the p values the PV matmul actually used.
 //   BTS/KWIDE/GPRE  the tile-staging set -- see the comments on each define.
 #include "r4d.h"
+#include "r4d_attn_window.h"
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 
@@ -96,9 +97,20 @@ __device__ __forceinline__ uint32_t r4d_qcvt(uint32_t w, float s) {
 // kernel -- but stages only its 1/DSPLIT slice of V and owns only those NKD output d-tiles. No
 // accumulator ever depends on another d-tile, so the output is the unsplit kernel's bit for bit.
 // DSPLIT=1 folds every DSPLIT term away.
-template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int SPLIT, int DSPLIT = 1>
+//
+// WIN (sliding window, r4d_attn_paged_h256_gqa2.hip): the kernel takes an R4DArgsW and a key is
+// visible to the query at absolute position qpos (this file's `klimit`) iff klow <= key <= klimit,
+// klow = qpos - W + 1 (r4d_attn_window.h). The tile range starts at the CTA's lowest row's first
+// visible key instead of 0, and the mask also cuts the low side. EXT (also R4DArgsW): a row's upper
+// bound is raised to a->klimit_ext[row] when that is larger -- a bidirectional image block; the window's
+// lower bound stays the causal one. Both default to 0, and with both 0 every WIN / EXT term below
+// folds away (`if constexpr` / constant folding), the kernel argument is the plain R4DArgs and
+// the instantiation is the one this file always built (tools: third_party/check_qwen_attn_isa.cmake).
+// Neither composes with SPLIT / DSPLIT.
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int SPLIT, int DSPLIT = 1,
+         int WIN = 0, int EXT = 0>
 __global__ __launch_bounds__(NWARPS * 32)
-void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
+void r4d_attn_prefill_kernel(const typename R4DKernelArgs<(WIN || EXT) != 0>::type a, int splits)
 {
     constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
     constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
@@ -136,6 +148,7 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
     constexpr float PGROW  = D::GROW;
     static_assert(!KWIDE || KITEMS % NTHR == 0, "the wide K fetch covers the tile in whole passes");
     static_assert(DSPLIT == 1 || SPLIT == 0, "DSPLIT is a variant of the unsplit kernel only");
+    static_assert(!(WIN || EXT) || (SPLIT == 0 && DSPLIT == 1), "WIN / EXT are the plain kernel only");
     static_assert(DGW * DSPLIT == DGA && NKD * DSPLIT == NKS && NKD % PFV == 0,
                   "DSPLIT divides the head into whole V d-groups");
 
@@ -181,7 +194,18 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
         }
     }
 
-    const int klimit = ctx - a.q_len + qpos;
+    // The causal limit is this row's absolute position; with WIN the window's low end hangs off it,
+    // and with EXT the upper bound may be raised (clamped to the last key).
+    const int qabs = ctx - a.q_len + qpos;
+    int klimit = qabs;
+    int klow = 0;
+    if constexpr (WIN) klow = qabs - a.window + 1;
+    if constexpr (EXT) {
+        if (live && a.klimit_ext != nullptr) {
+            const int e = a.klimit_ext[(size_t)seq * a.q_len + qpos];
+            klimit = min(r4d_win_khigh(qabs, e), ctx - 1);
+        }
+    }
 
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
@@ -191,12 +215,21 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
     for (int t = 0; t < NKD; ++t) acc[t] = (v8f){0,0,0,0,0,0,0,0};
 
     const int qmax_cta   = min(qb * BLOCK_Q + BLOCK_Q - 1, a.q_len - 1);
-    const int klimit_cta = ctx - a.q_len + qmax_cta;
+    int klimit_cta = ctx - a.q_len + qmax_cta;
+    if constexpr (EXT) {
+        // The effective upper bound is non-decreasing in the row (the klimit_ext contract), so the
+        // CTA's last row bounds every row's keys.
+        if (a.klimit_ext != nullptr)
+            klimit_cta = r4d_win_khigh(klimit_cta, a.klimit_ext[(size_t)seq * a.q_len + qmax_cta]);
+    }
     const int ntiles = (min(klimit_cta + 1, ctx) + TILE - 1) / TILE;
     // This workgroup's tiles. The segment size is a function of ctx alone (not of this q-block's
     // causal extent), because the merge recomputes it from ctx; a segment wholly past this block's
     // last key has nothing to do, and no row that reads it back exists (see the merge's `u`).
     int t_lo = 0, t_hi = ntiles;
+    // WIN: start at the first tile holding the CTA's lowest row's first visible key. That tile can
+    // begin up to TILE-1 keys below the window; those keys are staged and masked below.
+    if constexpr (WIN) t_lo = r4d_win_first_tile(ctx - a.q_len + qb * BLOCK_Q, a.window, TILE);
     if (SPLIT) {
         const int tps = ((ctx + TILE - 1) / TILE + splits - 1) / splits;
         t_lo = sp * tps;
@@ -372,9 +405,10 @@ void r4d_attn_prefill_kernel(const R4DArgs a, int splits)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            if (!MSKIP || wave_any(kbase + 7 > klimit)) {
+            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < klow))) {
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) sc[e] = (kbase + e <= klimit) ? sc[e] : -INFINITY;
+                for (int e = 0; e < 8; ++e)
+                    sc[e] = (kbase + e <= klimit && (!WIN || kbase + e >= klow)) ? sc[e] : -INFINITY;
             }
 
             float smax = sc[0];

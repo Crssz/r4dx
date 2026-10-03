@@ -22,8 +22,10 @@
 
 #include <hip/hip_runtime.h>
 
+#include "arch.h"  // DetectArch / ReadContainerMetadata / ResolveContainerMaxCtx (task M1-14)
 #include "chat_template.h"
 #include "cli_args.h"
+#include "dialect.h"  // src/server: ModelDialect (CPU-only; task M1-14)
 #include "image_decode.h"  // src/vision: DecodeImageFile (docs/vision.md, --image)
 #include "image_prompt.h"  // src/vision: ExpandImagePlaceholders (docs/vision.md, --image)
 #include "model.h"         // ModelOptions, LayoutFromName
@@ -124,6 +126,7 @@ void PrintProfileTable(const r4dx::model::StepProfile& prof, double divisor,
 
 TurnResult RunTurn(r4dx::model::TextModel& model, const r4dx::Tokenizer& tok,
                     const std::vector<int32_t>& new_tokens, const CliArgs& args,
+                    const std::vector<int32_t>& eos_ids,
                     const std::vector<r4dx::model::ImageSpan>& image_spans = {}) {
   TurnResult result;
   result.prefill_tokens = static_cast<int64_t>(new_tokens.size());
@@ -202,7 +205,6 @@ TurnResult RunTurn(r4dx::model::TextModel& model, const r4dx::Tokenizer& tok,
   std::mt19937_64 rng = r4dx::kernels::MakeRng(args.seed);
 
   auto decoder = tok.make_stream_decoder(/*skip_special_tokens=*/true);
-  const auto& eos_ids = tok.eos_ids();
   auto is_eos = [&](int32_t id) {
     for (int32_t e : eos_ids) if (e == id) return true;
     return false;
@@ -415,7 +417,17 @@ int RunMain(int argc, char** argv) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;
   }
-  opts.max_ctx = args.max_ctx;
+  // docs/gemma4-plan.md 9.1 (task M1-14), shared with r4dx-server: Qwen keeps args.max_ctx exactly; a
+  // Gemma container defaults to its config's 131072 (GemmaConfig::ResolveMaxCtx), --extended-ctx opts
+  // in to up to 262144.
+  try {
+    opts.max_ctx = r4dx::model::ResolveContainerMaxCtx(args.model_path,
+                                                        r4dx::model::DetectArch(args.model_path),
+                                                        args.max_ctx_given, args.max_ctx, args.extended_ctx);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 2;
+  }
   opts.layer_limit = args.layers;  // -1 (default) == the container's own num_hidden_layers
   // --mtp K and --dflash now both run at ANY temperature (docs/sampling.md section 9/10, Milestone 6
   // stage S3: DecodeStepMtpSampled / DecodeStepDflashSampled implement lossless sample-and-match
@@ -443,8 +455,35 @@ int RunMain(int argc, char** argv) {
   // default_options sets (its golden corpus is NFC-normalized by construction to route around it).
   r4dx::Tokenizer::Options tok_options;
   tok_options.allow_unimplemented_normalizer = true;
-  r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(args.tokenizer_dir, tok_options);
-  r4dx::ChatTemplate tmpl = r4dx::ChatTemplate::from_directory(args.tokenizer_dir);
+  // Dialect (task M1-14): decides the tokenizer directory default, the decode keep-list, the template's
+  // polyfills and the EOS list. Qwen leaves every one of them at today's value.
+  std::optional<r4dx::server::DialectKind> requested_dialect;
+  if (args.dialect != "auto") {
+    r4dx::server::DialectKind k;
+    if (r4dx::server::ParseDialectName(args.dialect, &k)) requested_dialect = k;
+  }
+  const r4dx::server::ModelDialect& dialect = r4dx::server::DialectFor(r4dx::server::ResolveDialectKind(
+      requested_dialect, args.tokenizer_dir_given ? args.tokenizer_dir : std::string(),
+      r4dx::model::DetectArch(args.model_path) == r4dx::model::Arch::kGemma4));
+  {
+    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(args.model_path);
+    if (meta.is_object()) {
+      const std::string err = r4dx::server::CheckDialectAgainstArch(
+          dialect, r4dx::model::ArchName(r4dx::model::DetectArchFromMetadata(meta)));
+      if (!err.empty()) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 2;
+      }
+    }
+  }
+  const std::string tokenizer_dir =
+      r4dx::server::ResolveTokenizerDir(dialect, args.tokenizer_dir_given ? args.tokenizer_dir : std::string());
+  tok_options.keep_special_on_decode = dialect.keep_special_on_decode;
+  r4dx::ChatTemplateOptions tmpl_options;
+  tmpl_options.apply_polyfills = dialect.chat_template_polyfills;
+  r4dx::Tokenizer tok = r4dx::Tokenizer::from_directory(tokenizer_dir, tok_options);
+  r4dx::ChatTemplate tmpl = r4dx::ChatTemplate::from_directory(tokenizer_dir, tmpl_options);
+  const std::vector<int32_t>& eos_ids = dialect.eos_ids.empty() ? tok.eos_ids() : dialect.eos_ids;
 
   // Tensor parallel (docs/tp.md 9.1): --tp 1 is today's single Model (r4dx::model::LocalTextModel);
   // --tp 2 is r4dx::model::TpModel (MTP, DFlash2 and images included, docs/tp.md P5); cli_args.h
@@ -500,8 +539,12 @@ int RunMain(int argc, char** argv) {
   // Image preprocessing policy (docs/vision.md "Large images"). Validated and reported at startup
   // rather than at the first image, so `--image-max-pixels 0.5` fails here instead of mid-session.
   // `--image` (and `--chat`'s own `/image <path>` lines) feed it below.
-  const r4dx::vision::ImageProcessorConfig image_preproc =
+  r4dx::vision::ImageProcessorConfig image_preproc_cfg =
       r4dx::vision::MakeImageProcessorConfig(args.image_max_pixels);
+  // Gemma 4 (ImageBoiTokenId() >= 0, docs/gemma4-plan.md M2): the Gemma4UnifiedImageProcessor at its default 280
+  // soft-token budget (the server's --image-soft-tokens equivalent is not a CLI flag); Qwen is untouched.
+  if (model->ImageBoiTokenId() >= 0) image_preproc_cfg.gemma = true;
+  const r4dx::vision::ImageProcessorConfig image_preproc = image_preproc_cfg;
   if (model->HasVision()) {
     std::fprintf(stderr,
                  "[r4dx-cli] vision tower ready (image_max_pixels=%lld, an image above that is "
@@ -601,8 +644,9 @@ int RunMain(int argc, char** argv) {
           row += g.MergedTokenCount(merge_size);
         }
       }
-      auto expanded =
-          r4dx::vision::ExpandImagePlaceholders(full_tokens, image_token_id, spans_in, merge_size);
+      auto expanded = r4dx::vision::ExpandImagePlaceholders(
+          full_tokens, image_token_id, spans_in, merge_size, static_cast<int32_t>(model->ImageBoiTokenId()),
+          static_cast<int32_t>(model->ImageEoiTokenId()));
       full_tokens = std::move(expanded.tokens);
       expanded_spans = std::move(expanded.spans);
     }
@@ -660,7 +704,7 @@ int RunMain(int argc, char** argv) {
     // a temperature>0 turn (a greedy one never calls SampleFromSummary at all, so the delta is
     // always 0 there).
     const int64_t fallback_rows_before = model->SampledFallbackRows();
-    const TurnResult r = RunTurn(*model, tok, new_tokens, args, image_spans);
+    const TurnResult r = RunTurn(*model, tok, new_tokens, args, eos_ids, image_spans);
     const int64_t fallback_rows_this_turn = model->SampledFallbackRows() - fallback_rows_before;
     std::cout << std::endl;
 
@@ -683,7 +727,7 @@ int RunMain(int argc, char** argv) {
         std::fprintf(stderr, "warning: cannot write --dump-token-ids %s\n",
                      args.dump_token_ids.c_str());
       } else {
-        std::string tok_dir_json = r4dx::ChatJson(args.tokenizer_dir).dump();
+        std::string tok_dir_json = r4dx::ChatJson(tokenizer_dir).dump();
         std::fprintf(f, "{\n  \"tokenizer\": %s,\n  \"segments\": [\n    {\n", tok_dir_json.c_str());
         std::fprintf(f, "      \"name\": \"cli\",\n      \"token_ids\": [");
         for (size_t i = 0; i < fed_tokens.size(); ++i) {
@@ -758,8 +802,8 @@ int RunMain(int argc, char** argv) {
                        "process's buffers %.2f GiB\n",
                        v.rank, v.device, v.used_gib, v.free_gib, v.total_gib, v.buffers_gib);
         }
-        if (auto* tpm = dynamic_cast<r4dx::model::TpModel*>(model.get())) {
-          std::fprintf(stderr, "[stats] %s\n", tpm->StatsLine().c_str());
+        if (auto* tpm = dynamic_cast<r4dx::model::TpDiagnostics*>(model.get())) {  // TpModel or GemmaTpModel
+          std::fprintf(stderr, "[stats] %s\n", tpm->GroupStatsLine().c_str());
         }
       }
       if (!args.dflash.empty()) {

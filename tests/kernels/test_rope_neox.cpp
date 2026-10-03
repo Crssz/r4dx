@@ -101,9 +101,13 @@ int main() {
     int max_pos;
     double max_abs_tol;   // 2 bf16 steps at the output's magnitude range
     double norm_rel_tol;  // aggregate gate
+    float theta;          // rope base: 1e7 (Qwen DFlash2) or 1e6 (Gemma 4 DFlash v1, docs/gemma4-plan.md D-4)
   };
-  for (const Regime& reg : {Regime{"pos <= 4096 (drafter window)", 4096, 6.3e-2, 1e-3},
-                            Regime{"pos <= 300000 (full context)", 300000, 6.3e-2, 1e-3}}) {
+  for (const Regime& reg : {Regime{"pos <= 4096 (drafter window)", 4096, 6.3e-2, 1e-3, 1.0e7f},
+                            Regime{"pos <= 300000 (full context)", 300000, 6.3e-2, 1e-3, 1.0e7f},
+                            Regime{"theta 1e6, pos <= 4096", 4096, 6.3e-2, 1e-3, 1.0e6f},
+                            Regime{"theta 1e6, pos <= 131072", 131072, 6.3e-2, 1e-3, 1.0e6f}}) {
+    const float theta = reg.theta;  // shadows the outer 1e7
     const int rows = 13, heads_q = 32, heads_k = 8;
     std::vector<uint16_t> q_h(static_cast<size_t>(rows) * heads_q * head_dim);
     std::vector<uint16_t> k_h(static_cast<size_t>(rows) * heads_k * head_dim);

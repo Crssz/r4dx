@@ -15,6 +15,7 @@ add_executable(r4dx-cli main.cpp)
 # symbol (json_abi_v3_12_0 vs json_abi_v3_11_3).
 target_include_directories(r4dx-cli PRIVATE ${CMAKE_SOURCE_DIR}/third_party)
 target_link_libraries(r4dx-cli PRIVATE
+  r4dx_server_core  # dialect.h/.cpp only (CPU-only ModelDialect table, task M1-14)
   r4dx_model
   r4dx_tokenizer
   r4dx_core

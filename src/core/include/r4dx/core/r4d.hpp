@@ -88,6 +88,31 @@ inline int64_t AttnDecodeScratchBytes(const Args& a) {
   return r4d_attn_decode_h256_gqa6_scratch_bytes(&a);
 }
 
+// ---- attention: sliding window (Gemma 4's sliding layers; r4d_attn_paged_h256_gqa2.hip) ------
+// ArgsW = Args + the window and the prefill-only klimit_ext (r4d.h's R4DArgsW). head_dim 256, 2 q per
+// kv head, block 16, fp8 KV; a sliding KV ring is a block table whose entries repeat, and its cache must
+// be zero-initialised (r4d.h). Decode needs ArgsW::scratch (AttnDecodeWindowScratchBytes); a negative
+// return throws, naming the kernel.
+using ArgsW = R4DArgsW;
+
+inline void AttnPrefillWindowFp8Kv(const ArgsW& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_prefill_h256_gqa2_fp8kv", r4d_attn_prefill_h256_gqa2_fp8kv(&a, stream));
+}
+inline void AttnDecodeWindowFp8Kv(const ArgsW& a, hipStream_t stream) {
+  R4DX_R4D_CHECK("attn_decode_h256_gqa2_fp8kv", r4d_attn_decode_h256_gqa2_fp8kv(&a, stream));
+}
+inline int64_t AttnDecodeWindowScratchBytes(const ArgsW& a) {
+  return r4d_attn_decode_h256_gqa2_scratch_bytes(&a);
+}
+
+// Every attention geometry the build serves (r4d_attn_dims reports the gqa6 one only), for validating
+// a model's layer types against all of them at load.
+inline std::vector<R4DAttnGeom> GetAttnGeoms() {
+  std::vector<R4DAttnGeom> g;
+  for (int i = 0; i < r4d_attn_geom_count(); ++i) g.push_back(*r4d_attn_geom_at(i));
+  return g;
+}
+
 // ---- attention: vision encoder ----------------------------------------------------------
 // q,k,v,o: [total_tokens, heads, head_dim] bf16, contiguous. cu_seqlens: device int32[num_seqs+1].
 inline void AttnVitBf16(const void* q, const void* k, const void* v, void* o,

@@ -47,6 +47,35 @@ add_test(NAME convert_quant_ldlq COMMAND convert_quant_ldlq)
 # norm folded, out-projection, and the q2ab down / o / gdn_out K side), the Hessian change of basis
 # against a direct capture on the folded input plus the tr(W H W^T) invariance, HessianStore's
 # transform hook and cache key on fixtures/hess_small, and the imatrix diagonal model. CPU-only.
+# Gemma 4 converter branch (src/convert/gemma_layout.{hpp,cpp}, docs/gemma4-plan.md M1-6): the layout over
+# the real 677-tensor Huihui header (tools/reference/gemma/tensor_names.json) through a recording kit, and
+# -- when r4dx-convert is built -- the exe on a tiny synthetic single-file gemma4_unified checkpoint: the
+# exact tensor set / shapes / bytes, per-layer descale, vision/audio passthrough, --layers, --rotate
+# q2ab/q2a, and every refusal (the coverage audit names an unconsumed tensor). CPU-only; writes a few MB
+# under %TEMP% and removes them.
+add_executable(convert_gemma_layout test_gemma_layout.cpp)
+target_link_libraries(convert_gemma_layout PRIVATE r4dx_convert_gemma)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_gemma_layout PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_gemma_layout r4dx-convert)
+endif()
+add_test(NAME convert_gemma_layout COMMAND convert_gemma_layout)
+
+# --trellis-from / --kv-calib on gemma4_unified, plain and rotated (docs/gemma4-plan.md M1-28 prerequisites;
+# trellis_import.hpp's rotation fingerprint and folded reconstruction check, r4dx-convert --rotation-out):
+# generated tiny checkpoint + synthetic oracle directories, all in C++ (no Python, no fixture, no GPU).
+# Needs r4dx-convert (SKIPs, exit 77, without it). ~20 MB under %TEMP%, removed.
+add_executable(convert_gemma_trellis test_gemma_trellis.cpp)
+target_link_libraries(convert_gemma_trellis PRIVATE r4dx_convert)
+if(TARGET r4dx-convert)
+  target_compile_definitions(convert_gemma_trellis PRIVATE R4DX_CONVERT_EXE="$<TARGET_FILE:r4dx-convert>")
+  add_dependencies(convert_gemma_trellis r4dx-convert)
+endif()
+add_test(NAME convert_gemma_trellis COMMAND convert_gemma_trellis)
+# Keeps its converted containers under the build tree for test_gemma_container (M1-31, rotated trellis Inspect).
+set_tests_properties(convert_gemma_trellis PROPERTIES SKIP_RETURN_CODE 77 FIXTURES_SETUP gemma_trellis_containers
+  ENVIRONMENT "R4DX_GEMMA_TRELLIS_KEEP=${CMAKE_BINARY_DIR}/gemma_trellis_keep")
+
 add_executable(convert_rotation test_rotation.cpp)
 target_link_libraries(convert_rotation PRIVATE r4dx_convert)
 target_compile_definitions(convert_rotation PRIVATE
@@ -123,6 +152,12 @@ add_executable(convert_kv_calib test_kv_calib.cpp)
 target_link_libraries(convert_kv_calib PRIVATE r4dx_convert)
 add_test(NAME convert_kv_calib COMMAND convert_kv_calib)
 
+# ShardedModel single-file fallback (docs/gemma4-plan.md M1-3): no index + one model.safetensors opens
+# it; the index still wins; neither throws. Writes its own tiny safetensors into a temp dir. CPU-only.
+add_executable(convert_sharded_single_file test_sharded_single_file.cpp)
+target_link_libraries(convert_sharded_single_file PRIVATE r4dx_convert)
+add_test(NAME convert_sharded_single_file COMMAND convert_sharded_single_file)
+
 # bf16 linear-weight layout (task item 2: --layouts bf16 for all linear weights): plain row-major
 # on-disk bytes, no WMMA-fragment permutation, plan/emit byte-size agreement.
 add_executable(convert_bf16_layout test_bf16_layout.cpp)
@@ -171,3 +206,9 @@ target_link_libraries(convert_dflash_container PRIVATE r4dx_convert)
 target_compile_definitions(convert_dflash_container PRIVATE
   R4DX_CONVERT_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_test(NAME convert_dflash_container COMMAND convert_dflash_container)
+
+# --dflash-hf (docs/gemma4-plan.md D-3): HF DFlash v1 -> dflash2 container with the synthesized identity conv and zero selector,
+# on a generated tiny z-lab-shaped checkpoint: tensor mapping, metadata (offset, softcap, embed scale), both layouts, refusals. CPU-only.
+add_executable(convert_dflash_hf test_dflash_hf.cpp)
+target_link_libraries(convert_dflash_hf PRIVATE r4dx_convert)
+add_test(NAME convert_dflash_hf COMMAND convert_dflash_hf)

@@ -228,6 +228,16 @@ inline TokensFile ReadTokensJson(const std::string& path) {
   return out;
 }
 
+// Keep only the first `max_tokens` token ids (0 = no truncation). Everything downstream (T, rows, the
+// sidecar's sha256_of_token_ids_json) is derived from the truncated ids, so it agrees with
+// kl_report.py's `token_ids[:raw_max_tokens]` + token_ids_sha256 (`--raw-max-tokens N`) exactly.
+inline void TruncateSegment(Segment& seg, int64_t max_tokens) {
+  if (max_tokens < 0) throw std::invalid_argument("TruncateSegment: max_tokens must be >= 0");
+  if (max_tokens == 0 || static_cast<size_t>(max_tokens) >= seg.token_ids.size()) return;
+  if (max_tokens < 2) throw std::invalid_argument("TruncateSegment: max_tokens must be >= 2");
+  seg.token_ids.resize(static_cast<size_t>(max_tokens));
+}
+
 // ---- the pass ----------------------------------------------------------------------------------
 struct SegmentResult {
   int64_t T = 0;

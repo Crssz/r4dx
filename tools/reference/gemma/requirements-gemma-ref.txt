@@ -1,0 +1,70 @@
+# D:\venvs\r4dx-gemma-ref (Python 3.12, Windows, ROCm 7.2 torch wheels from repo.radeon.com, same as Python312). pip freeze 2026-10-01.
+# Install: pip install -r this file (the rocm/torch lines are direct URLs).
+accelerate==1.15.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+anyio==4.15.1
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.2
+click==8.5.0
+colorama==0.4.6
+datasets==5.0.1
+dill==0.4.1
+filelock==4.0.8
+frozenlist==1.8.0
+fsspec==2026.6.0
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.33.0
+idna==3.20
+iniconfig==2.3.0
+Jinja2==3.1.6
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+mdurl==0.1.2
+mpmath==1.3.0
+multidict==6.9.1
+multiprocess==0.70.19
+networkx==3.7
+numpy==2.5.3
+packaging==26.3
+pandas==3.0.6
+pillow==12.3.0
+pluggy==1.6.0
+propcache==0.5.4
+psutil==7.2.2
+pyarrow==25.0.1
+Pygments==2.21.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+regex==2026.9.29
+requests==2.34.2
+rich==15.0.0
+rocm @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm-7.2.0.dev0.tar.gz#sha256=18cec156ac620c1a2ad84266fbb9a376d98f2a80b35f73bf98ac12032b0fd3d2
+rocm-sdk-core @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_core-7.2.0.dev0-py3-none-win_amd64.whl#sha256=f8dac46ea54d570dd73a694e9f6793e80889a8168dd484be57b0d2f65079dde3
+rocm-sdk-devel @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_devel-7.2.0.dev0-py3-none-win_amd64.whl#sha256=c1cfaf90dc1405f4ace20a74ba21e3160e630bcbf3b464c29a66865a9e0b1625
+rocm-sdk-libraries-custom @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/rocm_sdk_libraries_custom-7.2.0.dev0-py3-none-win_amd64.whl#sha256=29a155b8f0da7b4ea05481ba665dc08749462a66bfc7cee27a6976bdea41f0cc
+safetensors==0.8.0
+sentencepiece==0.2.2
+setuptools==84.0.0
+shellingham==1.5.4
+six==1.17.0
+sympy==1.14.0
+tokenizers==0.23.2
+torch @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torch-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl#sha256=acd7a029ad3e9f86c36b6a1c9baf191231487be85b35675a17c08d68dd8c9475
+torchaudio @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchaudio-2.9.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl#sha256=e755c5827f571183cf54ded0b025e3dc349e49351fa345b8f05d4732ffa27107
+torchvision @ https://repo.radeon.com/rocm/windows/rocm-rel-7.2/torchvision-0.24.1%2Brocmsdk20260116-cp312-cp312-win_amd64.whl#sha256=3b19af6d42e1ff39d8e202f81f2751545bf11a62366cff2d1bd7ab592552522f
+tqdm==4.70.1
+transformers==5.18.0
+typer==0.27.2
+typing_extensions==4.16.0
+tzdata==2026.4
+urllib3==2.8.0
+xxhash==4.0.1
+yarl==1.25.1

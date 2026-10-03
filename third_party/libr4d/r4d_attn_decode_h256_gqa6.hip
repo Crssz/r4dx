@@ -14,6 +14,7 @@
 // The fp8-P leg and the layout permutation CONTIG replaced are gone from this file too; see
 // r4d_attn_prefill_h256_gqa6.hip for the option set and the reasoning behind each bit.
 #include "r4d.h"
+#include "r4d_attn_window.h"
 #include "r4d_common.h"
 #include "r4d_dt16.h"
 
@@ -46,9 +47,15 @@ __host__ __device__ __forceinline__ int r4d_attn_used(int ctx, int tile, int spl
     int t = r4d_attn_tiles(ctx, tile), tps = r4d_attn_tps(ctx, tile, splits); return (t + tps - 1) / tps;
 }
 
-template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT>
+// WIN (sliding window, r4d_attn_paged_h256_gqa2.hip): the kernel takes an R4DArgsW; the KV tile range
+// is the window's, [t0, ntl) with t0 the first tile of the EARLIEST row's window, cut into `splits`
+// segments of r4d_win_decode_tps tiles from t0 (the combine kernel recomputes the same geometry from
+// ctx, q_len and the window, r4d_attn_window.h); the mask also cuts the low side, kpos >= qabs - W + 1.
+// WIN = 0 folds every WIN term away: the kernel argument is the plain R4DArgs and the instantiation is
+// the one this file always built (third_party/check_qwen_attn_isa.cmake).
+template<int NWARPS, int TILE, int HEAD_DIM, int GQA, int BS, int KVP, int OPT, int WIN = 0>
 __global__ __launch_bounds__(NWARPS * 32)
-void r4d_attn_decode_kernel(const R4DArgs a, int splits)
+void r4d_attn_decode_kernel(const typename R4DKernelArgs<WIN != 0>::type a, int splits)
 {
     constexpr int F16   = (OPT & O_F16)   ? 1 : 0;
     constexpr int MSKIP = (OPT & O_MSKIP) ? 1 : 0;
@@ -91,8 +98,12 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     if (ctx <= 0) return;
 
     const int ntl  = r4d_attn_tiles(ctx, TILE);
-    const int tps  = r4d_attn_tps(ctx, TILE, splits);
-    const int t_lo = sp * tps;
+    int t0 = 0, tps = r4d_attn_tps(ctx, TILE, splits);
+    if constexpr (WIN) {
+        t0  = r4d_win_decode_t0(ctx, a.q_len, a.window, TILE);
+        tps = r4d_win_decode_tps(ctx, a.q_len, a.window, TILE, splits);
+    }
+    const int t_lo = t0 + sp * tps;
     if (t_lo >= ntl) return;
     const int t_hi = min(t_lo + tps, ntl);
 
@@ -122,6 +133,8 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
     }
 
     const int klimit = ctx - a.q_len + qrow;
+    int klow = 0;
+    if constexpr (WIN) klow = klimit - a.window + 1;
     float m_ref = -3.0e38f;
     float off   = PSHIFT + 3.0e38f;
     float l_i   = 0.0f;
@@ -276,9 +289,10 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
             for (int e = 0; e < 8; ++e) sc[e] = FOLDQ ? s[e] : s[e] * mul;
 
             const int kbase = k0 + mt * 16 + 8 * h;
-            if (!MSKIP || wave_any(kbase + 7 > klimit)) {
+            if (!MSKIP || wave_any(kbase + 7 > klimit) || (WIN && wave_any(kbase < klow))) {
                 #pragma unroll
-                for (int e = 0; e < 8; ++e) sc[e] = (kbase + e <= klimit) ? sc[e] : -INFINITY;
+                for (int e = 0; e < 8; ++e)
+                    sc[e] = (kbase + e <= klimit && (!WIN || kbase + e >= klow)) ? sc[e] : -INFINITY;
             }
             float smax = sc[0];
             #pragma unroll
@@ -395,9 +409,11 @@ void r4d_attn_decode_kernel(const R4DArgs a, int splits)
 // Merge. PF16=1 reads normalised f16 partials and folds l into the weight; PF16=0 is the plain
 // path (unnormalised f32 partials, l summed separately). Both walk the segments in FIXED INDEX
 // ORDER so a request's rounding never depends on CTA scheduling.
-template<int HEAD_DIM, int CHAINS, int PF16>
+// WIN: the segments are the window's (see the decode kernel), so `u` is r4d_win_decode_row_used. The
+// kernel argument is then an R4DArgsW; WIN = 0 is the instantiation this file always built.
+template<int HEAD_DIM, int CHAINS, int PF16, int WIN = 0>
 __global__ __launch_bounds__(HEAD_DIM)
-void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
+void r4d_attn_splitkv_combine_kernel(const typename R4DKernelArgs<WIN != 0>::type a, int splits, int tile)
 {
     extern __shared__ float sw[];
     __shared__ float red[HEAD_DIM];
@@ -415,8 +431,13 @@ void r4d_attn_splitkv_combine_kernel(const R4DArgs a, int splits, int tile)
     // own position. With the row's own count every segment lands in the chain that launch puts it
     // in. At q_len=1 this is r4d_attn_used(ctx).
     const int qrow = tok - seq * a.q_len;
-    const int rtps = r4d_attn_tps(ctx, tile, splits);
-    const int u = (r4d_attn_tiles(ctx - a.q_len + 1 + qrow, tile) + rtps - 1) / rtps;
+    int u;
+    if constexpr (WIN) {
+        u = r4d_win_decode_row_used(ctx, a.q_len, qrow, a.window, tile, splits);
+    } else {
+        const int rtps = r4d_attn_tps(ctx, tile, splits);
+        u = (r4d_attn_tiles(ctx - a.q_len + 1 + qrow, tile) + rtps - 1) / rtps;
+    }
     const size_t nrow = (size_t)a.num_seqs * a.q_len * a.q_heads * splits;
     const size_t base = (size_t)job * splits;
 

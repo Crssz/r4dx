@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "audio_frames.h"  // src/audio: constants (the decode itself is in openai_types.cpp)
 #include "nlohmann/json.hpp"
 #include "preprocess.h"  // src/vision: GridThw, ImageProcessorConfig, PreprocessImages
 
@@ -116,10 +117,23 @@ struct ImagePart {
 // in any position, interleaved with text). A message whose `content` was a plain string, or an
 // array with no image part at all, never populates `ChatMessage::content_parts` at all -- see that
 // field's own doc comment for why that keeps every pre-vision code path byte-identical.
+// One decoded audio content part (`{"type":"input_audio","input_audio":{"data":<base64 wav>,"format":"wav"}}`,
+// docs/gemma4-audio.md): the mono 16 kHz float waveform and its soft-token count (ceil(samples / 640), at most
+// 750 = 30 s). The CPU embedder runs later, in the engine, on `frames` -- the zero-padded [tokens, 640] layout
+// (audio::FrameWaveform) -- so parse time only decodes and validates. `content_hash` fingerprints the decoded
+// SAMPLES (FNV-1a), the audio analogue of ImagePart::content_hash for prefix reuse.
+struct AudioPart {
+  std::vector<float> frames;  // [tokens, 640], right zero-padded
+  int64_t tokens = 0;
+  uint64_t content_hash = 0;
+};
+
 struct ContentPart {
   bool is_image = false;
-  std::string text;    // valid iff !is_image
+  bool is_audio = false;  // exclusive with is_image
+  std::string text;     // valid iff !is_image && !is_audio
   ImagePart image;      // valid iff is_image
+  AudioPart audio;      // valid iff is_audio
 };
 
 struct ChatMessage {
@@ -139,6 +153,12 @@ struct ChatMessage {
   bool HasImages() const {
     for (const auto& p : content_parts) {
       if (p.is_image) return true;
+    }
+    return false;
+  }
+  bool HasAudio() const {
+    for (const auto& p : content_parts) {
+      if (p.is_audio) return true;
     }
     return false;
   }
@@ -213,6 +233,11 @@ inline constexpr size_t kMaxImagesPerRequest = 8;
 // any real photo/screenshot attachment and still small next to the request body size httplib
 // itself will buffer in memory regardless.
 inline constexpr size_t kMaxImageBase64Chars = 32 * 1024 * 1024;
+// Audio (docs/gemma4-audio.md): at most this many clips per request, and at most this many base64 characters per
+// clip (a 30 s stereo float32 WAV is 3.84 MB = 5.1 M chars; longer clips are refused by DURATION after decode,
+// the cap only bounds what is decoded at all).
+inline constexpr size_t kMaxAudioPerRequest = 4;
+inline constexpr size_t kMaxAudioBase64Chars = 8 * 1024 * 1024;
 
 // Throws ApiError on any structurally or semantically invalid request body (missing/mistyped
 // field, an unsupported role, a malformed/oversize/unsupported/remote image content part, an
@@ -283,7 +308,7 @@ bool ResolveEnableThinking(const ThinkingControls& thinking, bool default_thinki
 // `vision.*` tensors at all), `["text","image"]` when it is true (docs/vision.md, docs/server.md's
 // "Images" section) -- the one-line switch stage 1 prepared, now flipped by whoever calls this
 // (BuildModelEntryJson, from `Model::HasVision()`).
-nlohmann::json ModelInputModalities(bool has_vision = false);
+nlohmann::json ModelInputModalities(bool has_vision = false, bool has_audio = false);
 
 // The `reasoning.supported_efforts` list `/v1/models` advertises, and the exact set of effort
 // strings ParseThinkingControls maps onto a template level. See ThinkingControls::template_effort
@@ -310,13 +335,13 @@ inline constexpr int64_t kModelNativeContextLength = 262144;
 // and adds `"image"` to `capabilities` (a client checking either shape sees the same answer).
 nlohmann::json BuildModelEntryJson(const std::string& model_id, int64_t created_unix,
                                     int64_t max_ctx, bool default_thinking = false,
-                                    bool has_vision = false);
+                                    bool has_vision = false, bool has_audio = false);
 
 // `{"object": "list", "data": [BuildModelEntryJson(...)]}` -- GET /v1/models's shape. This server
 // ever loads exactly one model, so `data` always has exactly one entry (task design point 2).
 nlohmann::json BuildModelsResponse(const std::string& model_id, int64_t created_unix,
                                     int64_t max_ctx, bool default_thinking = false,
-                                    bool has_vision = false);
+                                    bool has_vision = false, bool has_audio = false);
 
 struct UsageStats {
   int64_t prompt_tokens = 0;

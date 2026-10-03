@@ -63,6 +63,10 @@ struct Dflash2Config {
   int64_t mask_token_id = -1;
   int64_t vocab_size = 0;
   std::string layout;  // the quantized layout this container's linears were packed with
+  // OPTIONAL keys (absent in every Qwen drafter container; docs/gemma4-plan.md 6.4).
+  double logit_softcap = 0.0;  // > 0: cap * tanh(v / cap) on the drafter logits (Gemma 4: 30)
+  double embed_scale = 1.0;    // multiplier on the target's RAW embedding rows (1.0 == unscaled)
+  std::string variant;         // "" (a native DFlash2) or "v1_identity"
 };
 
 class DflashDraftWeights {
@@ -183,6 +187,12 @@ class DflashDraftWeights {
     c.mask_token_id = d.at("mask_token_id").get<int64_t>();
     c.vocab_size = d.at("vocab_size").get<int64_t>();
     if (d.contains("layout")) c.layout = d.at("layout").get<std::string>();
+    if (d.contains("logit_softcap")) c.logit_softcap = d.at("logit_softcap").get<double>();
+    if (d.contains("embed_scale")) c.embed_scale = d.at("embed_scale").get<double>();
+    if (d.contains("variant")) c.variant = d.at("variant").get<std::string>();
+    if (!(c.embed_scale > 0.0) || c.logit_softcap < 0.0) {
+      throw std::runtime_error("DflashDraftWeights: dflash2.embed_scale must be > 0 and logit_softcap >= 0");
+    }
     return c;
   }
 

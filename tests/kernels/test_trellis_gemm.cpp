@@ -246,8 +246,12 @@ struct Tol {
   double worst = 0.0;   // max err / (4 ulp + floor)
   double fro = 0.0;     // ||C - y|| / ||y||
 };
+// `k_scale`: the 4-ulp + floor limit was calibrated at K = 5120 (M0); fp32 accumulation error grows ~sqrt(K), so
+// longer reductions (Gemma's o_full K 8192, down K 15360) get the limit times sqrt(K / 5120). K <= 5120 is unchanged.
+double KScale(int K) { return std::max(1.0, std::sqrt(K / 5120.0)); }
+
 Tol CheckTolerance(const std::vector<uint16_t>& c, int M, int N, const std::vector<double>& ya,
-                   const std::vector<double>& y) {
+                   const std::vector<double>& y, double k_scale = 1.0) {
   Tol r;
   double num = 0.0, den = 0.0;
   for (int m = 0; m < 64; ++m) {
@@ -261,7 +265,7 @@ Tol CheckTolerance(const std::vector<uint16_t>& c, int M, int N, const std::vect
     for (int n = 0; n < N; ++n) {
       const size_t i = static_cast<size_t>(m) * N + n;
       const double got = Bf16ToFloat(c[i]);
-      const double lim = 4.0 * trellis_ref::Bf16Ulp(ya[i]) + floor;
+      const double lim = (4.0 * trellis_ref::Bf16Ulp(ya[i]) + floor) * k_scale;
       const double err = std::fabs(got - ya[i]);
       if (!(err <= lim)) ++r.bad;
       r.worst = std::max(r.worst, err / lim);
@@ -286,8 +290,7 @@ const Tuning kAccTunings[] = {
     {1, 8, 1, 1, 4, 2, 1},    // Wc 32, SKG 4
 };
 
-void TestAccuracy(std::mt19937_64& rng) {
-  const int K = 5120, N = 1024;
+void TestAccuracyAt(std::mt19937_64& rng, int K, int N, int min_calls) {
   const int Ms[] = {1, 3, 8, 16, 17, 64};
   double worst = 0.0, worst_fro = 0.0;
   int calls = 0, skipped = 0;
@@ -335,12 +338,14 @@ void TestAccuracy(std::mt19937_64& rng) {
               continue;
             }
             ++calls;
-            const Tol r = CheckTolerance(c, M, N, ya, y);
+            const Tol r = CheckTolerance(c, M, N, ya, y, KScale(K));
             worst = std::max(worst, r.worst);
             worst_fro = std::max(worst_fro, r.fro);
-            const std::string what = "accuracy KB=" + std::to_string(KB) + " P=" + std::to_string(parts) +
-                                     " s=" + std::to_string(s) + " M=" + std::to_string(M) + " " + t.Str();
-            Check(r.bad == 0, what + ": " + std::to_string(r.bad) + " elements outside 4 bf16 ulp + 1e-4 rms");
+            const std::string what = "accuracy K=" + std::to_string(K) + " KB=" + std::to_string(KB) + " P=" +
+                                     std::to_string(parts) + " s=" + std::to_string(s) + " M=" + std::to_string(M) +
+                                     " " + t.Str();
+            Check(r.bad == 0, what + ": " + std::to_string(r.bad) + " elements outside (4 bf16 ulp + 1e-4 rms) x " +
+                                  std::to_string(KScale(K)));
             Check(r.fro <= 2e-3, what + ": ||C-y||/||y|| = " + std::to_string(r.fro));
             Check(r.untouched_bad == 0, what + ": rows >= M written");
             if (t.Split()) Check(L->TicketsZero(), what + ": tickets not zero after the call");
@@ -351,7 +356,19 @@ void TestAccuracy(std::mt19937_64& rng) {
   std::printf("  accuracy K=%d N=%d, KB 4/5, P 1/2, prescale 0/4, M 1..64, %zu tunings: %d calls (%d not "
               "instantiated), worst element %.3f of the tolerance, worst ||C-y||/||y|| %.2e\n",
               K, N, sizeof(kAccTunings) / sizeof(kAccTunings[0]), calls, skipped, worst, worst_fro);
-  Check(calls >= 150, "accuracy: too few calls ran (" + std::to_string(calls) + ")");
+  Check(calls >= min_calls, "accuracy: too few calls ran (" + std::to_string(calls) + ")");
+}
+
+void TestAccuracy(std::mt19937_64& rng) {
+  TestAccuracyAt(rng, 5120, 1024, 150);
+  // Gemma 4 12B (docs/gemma4-plan.md 3.7) K and narrow-N edges: hidden 3840 (full-attention k is N = 512),
+  // o_proj sliding 4096 and full 8192, down 15360. A tuning the kernel does not instantiate at a K is
+  // skipped (and counted), so the floor is lower than at 5120.
+  TestAccuracyAt(rng, 3840, 512, 40);
+  TestAccuracyAt(rng, 3840, 1024, 40);
+  TestAccuracyAt(rng, 4096, 1024, 40);
+  TestAccuracyAt(rng, 8192, 1024, 40);
+  TestAccuracyAt(rng, 15360, 1024, 40);
 }
 
 // ---- epilogue, bit for bit ----------------------------------------------------------------------------
@@ -460,9 +477,23 @@ void TestInvariance(std::mt19937_64& rng) {
 
 // ---- row identity -----------------------------------------------------------------------------------
 // mlp.gate_up's two parts: 34816 x 5120 at TP = 1, 17408 x 5120 on a TP = 2 rank.
-bool GateUp(int64_t N, int64_t K) { return (N == 34816 || N == 17408) && K == 5120; }
+bool GateUp(int64_t N, int64_t K) {
+  // Qwen: 34816 (TP = 1) / 17408 (a TP = 2 rank) x 5120; Gemma 4 12B: 30720 / 15360 x 3840.
+  return ((N == 34816 || N == 17408) && K == 5120) || ((N == 30720 || N == 15360) && K == 3840);
+}
+
+void RowIdentityImpl(std::mt19937_64& rng, int N, int K, int KB, const Tuning& t, const std::string& label);
 
 void RowIdentity(std::mt19937_64& rng, int N, int K, int KB, const Tuning& t, const std::string& label) {
+  try {
+    RowIdentityImpl(rng, N, K, KB, t, label);
+  } catch (const std::exception& e) {  // a rejected tuning is a failure to report, not a reason to abort the run
+    Check(false, "row identity " + label + " N=" + std::to_string(N) + " K=" + std::to_string(K) + " " + t.Str() +
+                     ": rejected (" + e.what() + ")");
+  }
+}
+
+void RowIdentityImpl(std::mt19937_64& rng, int N, int K, int KB, const Tuning& t, const std::string& label) {
   const int n_split = GateUp(N, K) ? N / 2 : N;
   std::unique_ptr<Linear> L = RandomLinear(rng, K, N, KB, n_split, false);
   const std::vector<uint16_t> a0 = RandomA(rng, static_cast<size_t>(16) * K), a1 = RandomA(rng, static_cast<size_t>(16) * K);
@@ -503,7 +534,12 @@ void TestRowIdentity(std::mt19937_64& rng) {
   table(trellis_rows::tp2::kGemmTuningTable, "TP = 2 table row");
   Check(rows > 0, "the trellis tuning table has no M <= 16 rows");
   const std::pair<int, int> shapes[] = {{10240, 5120}, {6144, 5120}, {5120, 6144}, {12288, 5120},
-                                        {1024, 5120},  {34816, 5120}, {5120, 17408}};
+                                        {1024, 5120},  {34816, 5120}, {5120, 17408},
+                                        // Gemma 4 12B at TP = 1 (docs/gemma4-plan.md 3.7): sliding q/k/v/o, full
+                                        // q/k/o, gate_up (two parts), down; then the TP = 2 rank shapes.
+                                        {4096, 3840},  {2048, 3840},  {512, 3840},   {8192, 3840},
+                                        {3840, 4096},  {3840, 8192},  {30720, 3840}, {3840, 15360},
+                                        {15360, 3840}, {3840, 7680},  {1024, 3840},  {3840, 2048}};
   for (auto nk : shapes) {
     const Tuning f4 = Fallback(nk.first, nk.second), f8 = Fallback(nk.first, nk.second, 8);
     RowIdentity(rng, nk.first, nk.second, 4, f4, "4.4 fallback");
@@ -596,6 +632,10 @@ void TestDeterminism(std::mt19937_64& rng) {
       // SKG 8, the kernel's largest (the first revision's fallback for this shape: 8 blocks per
       // group), and Wc 32 at SKG 8 (32 per group).
       {"attn.k/v", 1024, 5120, {Fallback(1024, 5120, 8), {1, 4, 1, 1, 8, 2, 1}}},
+      // Gemma 4 12B: full-attention k (N 512, K 3840) and down (N 3840, K 15360).
+      // (SK 1 at SKG 8: K/16 = 240 must divide by SK*SKG*U, so SK 4 / U 2 would be illegal at K 3840.)
+      {"g.k_full", 512, 3840, {Fallback(512, 3840, 8), {1, 1, 1, 1, 8, 2, 1}}},
+      {"g.down", 3840, 15360, {Fallback(3840, 15360), {1, 4, 1, 1, 2, 4, 1}}},
   };
   for (const Case& cs : cases)
     for (int KB : {4, 5}) {

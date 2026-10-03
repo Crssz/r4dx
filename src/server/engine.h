@@ -23,11 +23,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "chat_template.h"
+#include "dialect.h"
 #include "model.h"  // ModelOptions
 #include "openai_types.h"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
@@ -37,10 +39,6 @@
 #include "response_sink.h"
 #include "text_model.h"  // r4dx::model::TextModel / TpOptions (docs/tp.md 2.8)
 #include "tokenizer.h"
-
-namespace r4dx::model {
-class TpModel;
-}
 
 namespace r4dx::server {
 
@@ -54,7 +52,13 @@ struct EngineOptions {
   std::function<std::unique_ptr<r4dx::model::TextModel>(const r4dx::model::ModelOptions&,
                                                         const r4dx::model::TpOptions&)>
       model_loader;
+  // Empty (main.cpp passes empty unless --tokenizer-dir was given) = the dialect's default directory
+  // (ModelDialect::default_tokenizer_dir; kQwenDefaultTokenizerDir for Qwen).
   std::string tokenizer_dir;
+  // `--dialect` (docs/gemma4-plan.md 5.3, task M1-14): nullopt = auto (tokenizer_config.json /
+  // vocab, else -- with no --tokenizer-dir -- the container's architecture). Resolved once in
+  // LoadAndStart, then cross-checked against TextModel::Config().arch (fail fast on a mismatch).
+  std::optional<DialectKind> dialect;
   int64_t max_tokens_default = 128;
   int max_queue = 16;
   SamplingParams sampling_defaults;
@@ -74,6 +78,9 @@ struct EngineOptions {
   // checkpoint's own preprocessor_config.json ceiling; r4dx::vision::MakeImageProcessorConfig
   // turns it into the ImageProcessorConfig the decode path uses.
   int64_t image_max_pixels = 1048576;
+  // Gemma 4 only (--image-soft-tokens): the Gemma4UnifiedImageProcessor budget, soft tokens per image (70 | 140 |
+  // 280; an image is one <= 288-row prefill chunk). Ignored by Qwen.
+  int image_soft_tokens = 280;
   // `--request-log <path>` (docs/server.md "Request log"): null (the default, and always unless the
   // flag was given) = off -- every log site in Engine/HttpServer is then one pointer test and nothing
   // else runs. Shared with HttpServer (via Engine::GetRequestLog) for the requests it rejects before
@@ -132,6 +139,9 @@ class Engine {
   void LoadAndStart();
 
   const std::string& ModelId() const { return model_id_; }
+  // The resolved dialect (Qwen3.5 until LoadAndStart picked one). Static storage: the pointer
+  // http_server.cpp hands its sinks stays valid for the process.
+  const ModelDialect& Dialect() const { return *dialect_; }
   int64_t MaxCtx() const { return opts_.model_opts.max_ctx; }
   int64_t MaxTokensDefault() const { return opts_.max_tokens_default; }
   const SamplingParams& SamplingDefaults() const { return opts_.sampling_defaults; }
@@ -148,6 +158,8 @@ class Engine {
   // reassigned to a different model after that (Reset() reuses the same object in place), and
   // TextModel::HasVision is a value cached at load under TP (docs/tp.md 2.4's host-only table).
   bool HasVision() const { return model_ && model_->HasVision(); }
+  // Gemma 4 container converted with `--audio on` (docs/gemma4-audio.md): `input_audio` parts are accepted.
+  bool HasAudio() const { return model_ && model_->HasAudio(); }
   // True once a `--tp 2` request has left the TP group kFatal (its recovery failed, or a rank got
   // stuck inside a HIP call): every later request answers 500 until the process is restarted, so
   // http_server.cpp's /health reports it (503) instead of "ok" (docs/tp.md 2.4, R13; Appendix B N80).
@@ -203,14 +215,16 @@ class Engine {
 
   EngineOptions opts_;
   std::string model_id_;
+  const ModelDialect* dialect_ = &Qwen35Dialect();
+  std::string tokenizer_dir_;  // opts_.tokenizer_dir after the default was resolved
 
   std::unique_ptr<r4dx::Tokenizer> tok_;
   std::unique_ptr<r4dx::ChatTemplate> tmpl_;
   std::unique_ptr<r4dx::model::TextModel> model_;
-  // model_ itself when it is a TpModel (`--tp 2`), else null: the TP diagnostics (the group state
-  // around a recovery, the `--log-level debug` stats line) are not part of TextModel (docs/tp.md
-  // 2.8), the same reason r4dx-cli reaches the facade through a dynamic_cast.
-  r4dx::model::TpModel* tp_model_ = nullptr;
+  // model_ itself when it is a tensor-parallel facade (`--tp 2`: TpModel, or GemmaTpModel for a Gemma container), else
+  // null: the TP diagnostics (the group state around a recovery, the `--log-level debug` stats line) are not part of
+  // TextModel (docs/tp.md 2.8), the same reason r4dx-cli reaches the facade through a dynamic_cast.
+  r4dx::model::TpDiagnostics* tp_model_ = nullptr;
 
   // Image preprocessing policy, built once in LoadAndStart from EngineOptions::image_max_pixels
   // (docs/vision.md "Large images"). Read back out through ImagePreprocessing() above, which is
@@ -230,7 +244,7 @@ class Engine {
   BoundedQueue<std::shared_ptr<PendingRequest>> queue_;
   std::thread worker_;
   std::atomic<bool> stop_{false};
-  // TpFatal(): the worker thread's copy of `tp_model_->GetState() == kFatal`, taken after every
+  // TpFatal(): the worker thread's copy of `tp_model_->GroupHealth() == kFatal`, taken after every
   // failed request -- TpModel's own state is facade-thread-only, so the HTTP threads read this.
   std::atomic<bool> tp_fatal_{false};
 };

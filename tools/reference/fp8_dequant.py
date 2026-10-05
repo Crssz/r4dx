@@ -411,7 +411,7 @@ def cmd_diff(a) -> int:
         if sha_ != shb_:
             shape_mm.append({"name": n, "a": sha_, "b": shb_})
         if da_ != db_:
-            rec = {"name": n, "a": da_, "b": shb_ and db_}
+            rec = {"name": n, "a": da_, "b": db_}
             (fp8_exp if (da_ in FP8_TAGS) != (db_ in FP8_TAGS) else dtype_mm).append(rec)
     unresolved = sorted((na & nb) - (set(ia) & set(ib)))   # named on both sides, header not available yet
     cfg_a = json.loads((da / "config.json").read_text(encoding="utf-8")) if (da / "config.json").is_file() else None

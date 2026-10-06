@@ -204,6 +204,15 @@ add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
 add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
 add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
 
+# test_int8_gemm_proto_cpu: pure CPU (no HIP call) -- the int8 x int8 prefill GEMM prototype's layouts,
+# quantizers and software-WMMA emulation of the kernel's fragment chain (docs/int8-gemm-proto.md). The device
+# bench is tool_int8_gemm_proto (tests/kernels/build_int8_gemm_proto.ps1, hipcc, no CMake target).
+add_executable(test_int8_gemm_proto_cpu test_int8_gemm_proto_cpu.cpp)
+# trellis_ref.hpp's dtype.hpp wants the HIP headers (host-only use: nothing links amdhip64, nothing runs on a device).
+target_include_directories(test_int8_gemm_proto_cpu PRIVATE "${R4D_ROCM_ROOT}/include")
+target_compile_definitions(test_int8_gemm_proto_cpu PRIVATE __HIP_PLATFORM_AMD__)
+add_test(NAME test_int8_gemm_proto_cpu COMMAND test_int8_gemm_proto_cpu)
+
 # test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
 # rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.
 add_executable(test_gemma_resid_f32_cpu test_gemma_resid_f32_cpu.cpp)

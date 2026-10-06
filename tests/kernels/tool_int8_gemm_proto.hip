@@ -551,7 +551,7 @@ static void SelftestGemms(int KB) {
     raw[mask].resize((size_t)M * N);
     i8p::RefGemmInt8(Ap.data(), sa.data(), Wp.data(), sw.data(), M, N, K, mask, raw[mask].data());
   }
-  int ran = 0, bad = 0, bitdiff = 0;
+  int ran = 0, bad = 0, bitdiff = 0, refused = 0;
   for (int kind = 0; kind < 3; ++kind) {   // 0 dense+fwht, 1 dense plain, 2 trellis
     for (int resc = 0; resc < (kind == 2 ? 4 : 2); ++resc) {
       for (int skw : {2, 4, 8})
@@ -562,7 +562,15 @@ static void SelftestGemms(int KB) {
           const void* w = g.trellis ? (const void*)d_words : (const void*)d_w8;
           const float os = g.fwht ? kOutScale : 1.0f;
           CK(hipMemset(d_c, 0xFF, (size_t)M * N * 2));
-          I8gRun(g, d_a8, d_sa, w, d_sw, d_svh, d_c, d_ws, d_tk, K, N, os, 0);
+          try {
+            I8gRun(g, d_a8, d_sa, w, d_sw, d_svh, d_c, d_ws, d_tk, K, N, os, 0);
+          } catch (const std::exception& e) {
+            // a launch the runtime refuses (a resource limit of this part) is not a wrong answer: report it, skip it
+            // (the timing phase drops the same configuration), and let the rest of the selftest run
+            ++refused;
+            std::printf("    REFUSED by the runtime (not run, not timed): %s: %s\n", CfgName(g).c_str(), e.what());
+            continue;
+          }
           CK(hipDeviceSynchronize());
           std::vector<unsigned short> C((size_t)M * N);
           CK(hipMemcpy(C.data(), d_c, C.size() * 2, hipMemcpyDeviceToHost));
@@ -593,7 +601,13 @@ static void SelftestGemms(int KB) {
             I8gCfg dcfg = g;
             dcfg.trellis = false;
             CK(hipMemset(d_c, 0xFF, (size_t)M * N * 2));
-            I8gRun(dcfg, d_a8, d_sa, d_w8, d_sw, d_svh, d_c, d_ws, d_tk, K, N, os, 0);
+            try {
+              I8gRun(dcfg, d_a8, d_sa, d_w8, d_sw, d_svh, d_c, d_ws, d_tk, K, N, os, 0);
+            } catch (const std::exception& e) {
+              ++refused;
+              std::printf("    REFUSED by the runtime (dense twin, not compared): %s: %s\n", CfgName(dcfg).c_str(), e.what());
+              continue;
+            }
             CK(hipDeviceSynchronize());
             std::vector<unsigned short> D((size_t)M * N);
             CK(hipMemcpy(D.data(), d_c, D.size() * 2, hipMemcpyDeviceToHost));
@@ -604,6 +618,7 @@ static void SelftestGemms(int KB) {
   }
   std::snprintf(what, sizeof what, "KB %d: %d GEMM configurations (dense / dense plain / trellis x RESC 0..3 x skw, skg) match the exact reference", KB, ran);
   SCheck(bad == 0 && ran > 0, what);
+  if (refused) std::printf("    NOTE: %d configuration(s) were refused by the runtime and are not covered by the line above\n", refused);
   std::snprintf(what, sizeof what, "KB %d: the trellis kernel is byte-identical to the dense kernel on the same int8 weights", KB);
   SCheck(bitdiff == 0, what);
   CK(hipFree(d_x)); CK(hipFree(d_a8)); CK(hipFree(d_ap)); CK(hipFree(d_sa)); CK(hipFree(d_words)); CK(hipFree(d_sw)); CK(hipFree(d_w8));
@@ -624,15 +639,22 @@ static void RunJobs(std::vector<Job>& jobs, int batch, int rounds) {
   CK(hipEventCreate(&e1));
   for (Job& j : jobs) for (int i = 0; i < 2; ++i) j.launch(i % batch);
   CK(hipDeviceSynchronize());
-  for (int r = 0; r < rounds; ++r)
-    for (Job& j : jobs) {
+  // Round -1 is a whole untimed round (the clocks and the caches settle on the real mix), and the job order ROTATES
+  // by one every round: with a fixed order the f16 baseline would always run first after the previous job's cool-down
+  // and the same job would always follow the same neighbour (clock ramp, thermal and MALL residue would then land
+  // on the same side of every ratio). Every job still gets exactly one entry per round, so the per-round ratios
+  // stay paired.
+  const size_t nj = jobs.size();
+  for (int r = -1; r < rounds; ++r)
+    for (size_t kk = 0; kk < nj; ++kk) {
+      Job& j = jobs[(kk + (size_t)(r + 1)) % nj];
       CK(hipEventRecord(e0, 0));
       for (int i = 0; i < batch; ++i) j.launch(i);
       CK(hipEventRecord(e1, 0));
       CK(hipEventSynchronize(e1));
       float ms = 0;
       CK(hipEventElapsedTime(&ms, e0, e1));
-      j.t.push_back(1000.0 * ms / batch);
+      if (r >= 0) j.t.push_back(1000.0 * ms / batch);
     }
   CK(hipEventDestroy(e0));
   CK(hipEventDestroy(e1));
@@ -705,10 +727,14 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
       if (g.trellis) {
         if (g.resc <= 1) {
           I8gCfg d = g; d.trellis = false;
-          LaunchI8(c, d, 0, c.c_b);
-          CK(hipDeviceSynchronize());
-          const std::vector<unsigned short> D = ReadC(c.c_b, s.N);
-          if (D != C) { ++nbit; std::printf("    trellis != dense (same int8 weights): %s\n", CfgName(g).c_str()); }
+          try {
+            LaunchI8(c, d, 0, c.c_b);
+            CK(hipDeviceSynchronize());
+            const std::vector<unsigned short> D = ReadC(c.c_b, s.N);
+            if (D != C) { ++nbit; std::printf("    trellis != dense (same int8 weights): %s\n", CfgName(g).c_str()); }
+          } catch (const std::exception& e) {
+            std::printf("    dense twin of %s refused by the runtime (byte comparison skipped): %s\n", CfgName(g).c_str(), e.what());
+          }
         }
         if (g.resc == 0) {
           const double rel = V.RelDiff(C, Cf16);
@@ -721,6 +747,13 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
                 nrun, nbad ? "FAILURES" : "all pass", nbit ? "NO" : "yes");
     if (best_rel < 1e8)
       std::printf("  trellis int8 vs shipped f16 trellis output: relative RMS difference %.4f .. %.4f (w8a8 fake-quant level; ~0.5-2%% expected for Gaussian data)\n", best_rel, worst_rel);
+    // an end-to-end gate the exact-reference check cannot give (it shares the quantized operands with the kernel): a
+    // layout or k-order mistake common to the kernel and the reference shows as an output far from the f16 product
+    // (the w8a8 error of Gaussian data is about 1%, 0.92% in the CPU test; 5% is a wide margin)
+    if (best_rel < 1e8 && worst_rel > 0.05) {
+      ++nbad;
+      std::printf("    VERIFY FAIL: a trellis int8 output is %.4f (relative RMS) away from the shipped f16 output, expected about 0.01\n", worst_rel);
+    }
     fails += nbad + nbit;
     // the shipped kernel itself against the f16 exact? (not the subject) -- sanity: not all zero
     double nz = 0;
@@ -736,15 +769,20 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
     Job j; j.name = "f16 shipped plan"; j.kind = "f16ship";
     j.launch = [&, plan](int copy) { LaunchShipped(c, plan, copy, c.c_f16); };
     jobs.push_back(j);
-    // the other legal skw for the shipped (SK, SKG): the best-of sweep that keeps the baseline honest
-    for (int skw : {2, 4, 8}) {
-      if (skw == plan.skw || skw > plan.SK || plan.SK % skw) continue;
-      if (r4d_gemm_trellis_nt_m256_check(256, s.K, s.N, s.N, kb, plan.SK, 1, plan.SKG, 4, skw)) continue;
-      Plan p2 = plan; p2.skw = skw;
-      Job a; a.name = "f16 alt skw" + std::to_string(skw); a.kind = "f16alt";
-      a.launch = [&, p2](int copy) { LaunchShipped(c, p2, copy, c.c_f16); };
-      jobs.push_back(a);
-    }
+    // Every other legal (SK, SKG, skw) of the shipped M = 256 unit: the f16 side gets the same free (slice count,
+    // grid split) sweep the int8 kernels get, so "vs best f16 config" is a like-for-like bound. These are NOT bit
+    // identical to the M = 64 rows (a different SK / SKG changes the summation order), which is why the decision rule
+    // stays on the shipped plan; they only show how much headroom the f16 kernel itself has.
+    for (int SK : {2, 4, 8, 16})
+      for (int SKG : {1, 2, 4, 8})
+        for (int skw : {2, 4, 8}) {
+          if ((SK == plan.SK && SKG == plan.SKG && skw == plan.skw) || skw > SK || SK % skw) continue;
+          if (r4d_gemm_trellis_nt_m256_check(256, s.K, s.N, s.N, kb, SK, 1, SKG, 4, skw)) continue;
+          Plan p2 = plan; p2.SK = SK; p2.SKG = SKG; p2.skw = skw;
+          Job a; a.name = "f16 alt sk" + std::to_string(SK) + " skg" + std::to_string(SKG) + " skw" + std::to_string(skw); a.kind = "f16alt";
+          a.launch = [&, p2](int copy) { LaunchShipped(c, p2, copy, c.c_f16); };
+          jobs.push_back(a);
+        }
   }
   auto add = [&](const std::vector<I8gCfg>& cfgs, const char* kind) {
     for (const I8gCfg& g : cfgs) {
@@ -855,7 +893,11 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
   bool haveC = true;
   for (const std::string& n : names) {
     auto it = res.find(n + "/" + std::to_string(kb));
-    if (it == res.end() || !it->second.ok) return;
+    if (it == res.end() || !it->second.ok) {
+      std::printf("==== %s KB%d: no summary (class %s %s)\n", title, kb, n.c_str(),
+                  it == res.end() ? "was not run" : "has no verified dense / dense-plain / trellis kernel");
+      return;
+    }
     const ClassResult& r = it->second;
     ship.push_back(&r.ship); f16b.push_back(&r.f16best); dn.push_back(&r.dense); dp.push_back(&r.denseplain); tr.push_back(&r.trellis); qa.push_back(&r.quant);
     if (r.denseC.empty() || r.trellisC.empty() || r.trellisA.empty() || r.trellisW.empty()) haveC = false;
@@ -888,6 +930,12 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
     const double sd = Median(r_dp);
     std::printf("     dense ceiling rule: dense int8 (plain) >= 1.5x shipped?  %s (x%.3f; with the trellis epilogue x%.3f)\n",
                 sd >= 1.5 ? "yes" : "NO -- the idea is dead whatever the decode costs", sd, Median(r_d));
+    // the decision table of docs/int8-gemm-proto.md, in its order: the dense gate first, then the trellis thresholds
+    const char* verdict = sd < 1.5 ? "STOP (dense ceiling below 1.5x)" : sp >= 1.40 ? "GO" : sp < 1.15 ? "STOP" : "INCONCLUSIVE (read the speed bounds)";
+    std::printf("     VERDICT KB%d: %s  [trellis int8 x%.3f vs shipped plan, x%.3f vs the best f16 config of the sweep, x%.3f with the unfused A quantizer; dense plain x%.3f]\n",
+                kb, verdict, sp, Median(r_tb), Median(r_tq), sd);
+    if (sd >= 1.5 && sp >= 1.40 && Median(r_tb) < 1.40)
+      std::printf("     CAUTION: the GO is against the shipped plan only; a better f16 configuration of the same unit already closes the gap to x%.3f\n", Median(r_tb));
   }
   if (json) {
     std::fprintf(json, "%s {\"kind\":\"combined\",\"title\":\"%s\",\"kb\":%d,\"shipped_us\":%.2f,\"trellis_int8_us\":%.2f,\"speedup\":%.4f,\"speedup_with_aquant\":%.4f,\"speedup_vs_best_f16\":%.4f,\"dense_plain_speedup\":%.4f,\"dense_epi_speedup\":%.4f,\"coarse_trellis_speedup\":%.4f,\"coarse_dense_speedup\":%.4f,\"act_row_only_speedup\":%.4f,\"wgt_col_only_speedup\":%.4f}\n",

@@ -145,11 +145,20 @@ per-round ratios), `--noverify`, `--no-resc` (skip the speed-bound variants), `-
 `--simds 128` (for the clk-per-WMMA print). Run the probe first and alone: its TOPS and clock are the yardstick.
 
 What the bench prints per (class, KB): the shipped f16 plan (the configuration `PlanTrellisM256` picks, rebuilt
-from the tuning table and the host check) and the best of the other legal ones; the best dense int8 kernel with
-the trellis epilogue and without; the best trellis int8 kernel; the speed-bound variants; the activation
-quantizer; time, TF/s (2 M N K / t), and the speedup against the shipped plan. A job marked `!` failed its
-verification and is excluded from every summary. Then the MLP pair and all-class (layer-weighted) summaries and
-the decision rule.
+from the tuning table and the host check) and the best of every other legal (SK, SKG, skw) of the same unit (the
+int8 kernels get a free (skw, skg) sweep, so the f16 side gets the free sweep too; those f16 variants are not
+bit-identical to the M = 64 rows, so the decision rule stays on the shipped plan and the best-f16 ratio is the
+guard printed next to it); the best dense int8 kernel with the trellis epilogue and without; the best trellis
+int8 kernel; the speed-bound variants; the activation quantizer; time, TF/s (2 M N K / t, the same for every
+kernel), and the speedup against the shipped plan. A job marked `!` failed its verification and is excluded from
+every summary. Then the MLP pair and all-class (layer-weighted) summaries, the decision rule and one VERDICT
+line per KB (the decision table below, in its order: the dense gate first).
+
+Timing protocol (after the independent review of 2026-10-07): one whole untimed round first, then `rounds` timed
+rounds in which the job order ROTATES by one position every round (a fixed order would put the f16 baseline in the
+same clock / cache position of every ratio); every job still has exactly one entry per round, so per-round ratios
+stay paired. Both sides read the same activations (warm), `batch` cold weight copies, the same `ws`, and are
+launched through the same event-timed batch.
 
 **Verification inside the bench** (so a number is never reported for a wrong kernel): `selftest` runs the single
 iu8 WMMA against a software tile, the activation quantizer, scale table and int8 matrix against the CPU decode
@@ -159,7 +168,12 @@ configuration on the real shapes on five whole 128-column groups (first, last, t
 rows) against the GPU's exact-integer reference (`i8g_ref_cols`, int32 sums per 128 K, fp64 scaling), requires
 the trellis kernel to equal the dense kernel on the same int8 weights BYTE FOR BYTE (same summation order, same
 weights), and prints the relative RMS difference to the shipped f16 trellis output (the fake-quant level:
-about 0.5 to 2%).
+about 0.5 to 2%; above 5% it FAILS the run, since a layout or k-order mistake shared by the kernel and its
+reference would pass every exact check but not this one). The exact checks compare a bf16 output with an
+fp64 expectation, so their tolerance is bf16's own (0.85% of the value plus 1e-4 of the group RMS, about twice
+bf16's worst half-ulp); what is bit-exact is the trellis-versus-dense comparison and the CPU-versus-GPU quantizer,
+scale-table and int8-matrix comparisons. A configuration the runtime refuses to launch (a resource limit of the
+part) is reported as REFUSED and skipped, in the selftest as in the timing phase, instead of aborting the run.
 
 ## Predictions (a cycle-budget model, to be compared with the measurement, NOT a result)
 
@@ -253,4 +267,15 @@ x____), KB 4 and KB 5.
   24 VGPRs, and VALU and WMMA do not overlap on a SIMD anyway), M = 512 (the chunk is 256). The model says the
   decode and the rescale VALU, not the WMMA, set the speed, so those would be worth trying only after a first
   measurement says which of them dominates.
-* The probe's "clk per WMMA per SIMD" assumes 128 SIMDs (64 CUs x 2); `--simds` overrides.
+* The probe's "clk per WMMA per SIMD" assumes 128 SIMDs (64 CUs x 2 = 32 WGPs x 4; the m256 bench labels
+  `multiProcessorCount` as WGPs, so the probe's grid is 8 blocks per WGP); `--simds` overrides.
+* From the independent review (2026-10-07): (a) the probe runs 8 independent accumulators per wave at up to 16 waves
+  per SIMD, the kernel's pass runs 2 dependent chains of 8 WMMA per wave at 8 waves per SIMD, so the probe peak is
+  the ceiling of the instruction, not of the kernel's schedule; a low TF/s next to a good probe says look there
+  first (four row tiles per pass would give 4 chains for 16 more VGPRs); (b) "best of the sweep" picks the minimum of
+  per-config medians, which flatters the int8 side by a fraction of a percent against a fixed baseline, small next to
+  the 1.15 / 1.40 thresholds; the f16 side now gets a sweep too; (c) the shipped baseline is the M = 256 unit of this
+  branch (`int8q`), whose non-WQ instantiations are the shipped ones (`main` has the same code without the WQ
+  template parameter); (d) the A quantizer is not in the decision rule (it fuses into a producer in production);
+  its unfused time is printed and added in the "with the unfused A quantizer" ratio; (e) random trellis words and
+  Gaussian activations: the clock under WMMA load depends on the data, so the TF/s are for this data.

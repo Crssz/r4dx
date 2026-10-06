@@ -22,7 +22,7 @@
 // therefore skipped by starting the check one row later -- see kGeneratedTokens/check_greedy_last_n
 // below.)
 //
-// Needs the 4-layer test container (D:/models/r4dx/qwen38-27b-l4-mtp.r4dx, bf16 + w4a16) and HIP
+// Needs the 4-layer test container (<R4DX_MODELS_ROOT>/r4dx/qwen38-27b-l4-mtp.r4dx, bf16 + w4a16) and HIP
 // device 1; exits 77 (CTest SKIPPED, not FAILED) when the container is absent, the convention every
 // real-container test in this directory uses. Deliberately uses hand-picked token IDS rather than a
 // tokenizer, so it links nothing beyond what the other tests/model targets already do.
@@ -45,7 +45,7 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-mtp.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-mtp.r4dx");
 constexpr int64_t kLayers = 4;      // the container is a --layers 4 truncation; its config.json
                                      // still declares the full 64 (see test_forward_smoke.cpp)
 constexpr int64_t kGeneratedTokens = 64;

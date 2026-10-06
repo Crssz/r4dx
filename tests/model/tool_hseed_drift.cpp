@@ -9,7 +9,7 @@
 // (exact-arithmetic reference, per this codebase's own convention -- docs/status.md: "bf16 survives
 // only as the exact-arithmetic reference in the 4-layer test containers") Model and to each
 // quantized layout's Model, all against the SAME newly-converted 4-layer, all-4-layout, mtp-on
-// container (D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx -- the 4-layer container this investigation
+// container (<R4DX_MODELS_ROOT>/r4dx/qwen38-27b-l4-allmtp.r4dx -- the 4-layer container this investigation
 // needed but that did not previously exist side by side in one file; the pre-existing
 // qwen38-27b-l4-mtp.r4dx only has bf16+w4a16). Feeding the SAME fixed token ids to every layout
 // (rather than each layout's own greedy continuation) keeps the comparison apples-to-apples -- a
@@ -47,7 +47,7 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-allmtp.r4dx");
 
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   double dot = 0, na = 0, nb = 0;

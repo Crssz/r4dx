@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include "r4dx/models_root.h"
+
 namespace r4dx::cli {
 
 // Real ceiling for --mtp: Model::VerifyWindow (src/model/model.cpp) requires `candidates.size()
@@ -32,7 +34,7 @@ struct CliArgs {
   // chat_template.jinja / generation_config.json (the four files r4dx reads) are byte-identical to the
   // base Qwen3.8-27B's, so this default serves every Qwen3.8-27B-family container. The base checkpoint
   // (C:\AI\models\Qwen3.8-27B) was retired with the base containers (docs/huihui.md).
-  std::string tokenizer_dir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
+  std::string tokenizer_dir = r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated");
   // True iff --tokenizer-dir was given. When it was not, main.cpp resolves the default from the dialect
   // (docs/gemma4-plan.md 5.3, task M1-14): Gemma's assembled tokenizer dir, or the Qwen one above.
   bool tokenizer_dir_given = false;
@@ -122,7 +124,7 @@ struct CliArgs {
   // at ITS own best K (53.35 vs 65.02 tok/s, different K values each -- docs/mtp.md's K-sweep
   // table), and a later matched-K=3 re-measurement (review finding, 2026-09-20 -- the K-sweep
   // comparison above was NOT apples-to-apples) confirms the same conclusion at FIXED K: real
-  // hardware, D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx, w4a16, docs/perf.md's standard
+  // hardware, <R4DX_MODELS_ROOT>/r4dx/qwen38-27b-v3-draftvocab.r4dx, w4a16, docs/perf.md's standard
   // prompt/flags, `--mtp 3`, two runs each -- full head 68.20/68.64 tok/s (46.3% acceptance, 2.31
   // tok/round) vs reduced head 53.59/54.17 tok/s (20.9% acceptance, 1.63 tok/round), generated text
   // byte-identical either way (confirms the flip changes only speed, never correctness). "reduced"
@@ -199,7 +201,7 @@ struct CliArgs {
   // --layers N: load only the first N decoder layers (r4dx::model::ModelOptions::layer_limit).
   // -1 (default) loads the container's own config.json `num_hidden_layers`, i.e. every layer --
   // byte-identical to before this flag existed for every real container. It exists for the 4-layer
-  // TEST containers (D:/models/r4dx/qwen38-27b-l4-*.r4dx, converted with `r4dx-convert --layers 4`),
+  // TEST containers (<R4DX_MODELS_ROOT>/r4dx/qwen38-27b-l4-*.r4dx, converted with `r4dx-convert --layers 4`),
   // whose config.json still declares the full 64, so loading them without this flag fails looking
   // for `text.layers.4.*`. tests/model's own tests have always set ModelOptions::layer_limit
   // directly (see tests/model/test_forward_smoke.cpp); this is the same knob from the CLI, needed

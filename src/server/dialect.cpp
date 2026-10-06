@@ -47,7 +47,7 @@ ModelDialect MakeGemma4() {
   d.bos_on_raw_prompt = true;
   d.has_reasoning_effort = false;
   d.eos_ids = {1, 106, 50};  // generation_config.json: <eos>, <turn|>, <|tool_response>
-  d.default_tokenizer_dir = "D:\\models\\Huihui-gemma-4-12B-it-abliterated-tok";
+  d.default_tokenizer_dir = r4dx::ModelsPath("Huihui-gemma-4-12B-it-abliterated-tok");
   return d;
 }
 
@@ -120,7 +120,7 @@ DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::
 
 std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& requested) {
   if (!requested.empty()) return requested;
-  return d.default_tokenizer_dir.empty() ? std::string(kQwenDefaultTokenizerDir) : d.default_tokenizer_dir;
+  return d.default_tokenizer_dir.empty() ? QwenDefaultTokenizerDir() : d.default_tokenizer_dir;
 }
 
 std::string CheckDialectAgainstArch(const ModelDialect& d, std::string_view model_arch) {

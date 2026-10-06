@@ -8,11 +8,12 @@
 // matched pair: the w4a16 group a container was PACKED with (__metadata__.quant.w4a16.group) must
 // equal the group this build's r4d_gemm_w4a16_nt_m64 was COMPILED with (64), or Container::Load /
 // DflashDraftWeights::Open refuse it (CheckW4a16Group, src/model/quant_linear.h). The fixed test
-// containers are therefore the group-64 ones, D:\models\r4dx\g64\<name>.
+// containers are therefore the group-64 ones, <R4DX_MODELS_ROOT>\r4dx\g64\<name> (root default E:\models).
 //
 // RESOLUTION ORDER -- ContainerPath(default_path), for a fixed test container:
 //   1. R4DX_TEST_CONTAINER_DIR, if set and non-empty: <that dir>/<basename of default_path>.
-//   2. otherwise D:/models/r4dx/g64/<basename of default_path>.
+//   2. otherwise <R4DX_MODELS_ROOT>/r4dx/g64/<basename of default_path>. (Only the basename of
+//      default_path is used, so callers pass "r4dx/<name>.r4dx" -- no root literal anywhere.)
 // So `ctest` needs NO environment variable; R4DX_TEST_CONTAINER_DIR is only for pointing the fixed
 // test containers somewhere else (pointing it at copies of the wrong group makes the affected tests
 // FAIL on the loader's group guard -- deliberately, not silently).
@@ -22,13 +23,13 @@
 // test_vision_tower, test_tp_emulation / test_tp_real_vs_emulation's real-container cases and the
 // tool_* diagnostics' defaults:
 //   huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout "trellis": the Huihui abliterated trellis
-//   mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx, both in D:/models/r4dx. The
+//   mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx, both in <R4DX_MODELS_ROOT>/r4dx. The
 // trellis container's non-trellis tensors (heads, embeddings) are packed at w4a16 group 64. The
 // previous production container (qwen38-27b-v6.r4dx, the base Qwen3.8-27B at w4a16 g64) and the base
 // trellis mix4.5m were retired with the base checkpoint (docs/huihui.md "Default container").
 // R4DX_TEST_CONTAINER_DIR does NOT apply to the production pair: its job is to point the FIXED test
 // containers at a set of same-basename copies, and the production pair is not copied anywhere.
-// (Honouring it here would turn the manual recipe, R4DX_TEST_CONTAINER_DIR=D:\models\r4dx\g64, into
+// (Honouring it here would turn the manual recipe, R4DX_TEST_CONTAINER_DIR=<root>\r4dx\g64, into
 // a silent SKIP of every real-container test, since no 64-layer container lives in g64\.) Tools take
 // --model instead.
 //
@@ -51,11 +52,13 @@
 #include <string>
 #include <utility>
 
+#include "r4dx/models_root.h"
 
 namespace r4dx_test {
 
 // Where every container this repo's tests and tools default to lives on this machine.
-inline constexpr const char* kModelRoot = "D:/models/r4dx";
+// <R4DX_MODELS_ROOT>/r4dx (r4dx/models_root.h; the root defaults to E:\models).
+inline std::string ContainerRoot() { return r4dx::ModelsPath("r4dx"); }
 
 namespace detail {
 
@@ -98,12 +101,12 @@ inline std::string Join(std::string dir, const std::string& name) {
 inline const char* ContainerPath(const char* default_path) {
   const std::string override_dir = detail::OverrideDir();
   if (!override_dir.empty()) return detail::Own(detail::Join(override_dir, detail::Basename(default_path)));
-  return detail::Own(detail::Join(std::string(kModelRoot) + "/g64", detail::Basename(default_path)));
+  return detail::Own(detail::Join(ContainerRoot() + "/g64", detail::Basename(default_path)));
 }
 
 // The real 64-layer production container.
 inline const char* ProductionTargetPath() {
-  return "D:/models/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx";
+  return detail::Own(detail::Join(ContainerRoot(), "huihui-qwen38-27b-abl-trellis-mix45m.r4dx"));
 }
 
 // The body layout name (r4dx::model::LayoutFromName) ProductionTargetPath() loads with: a trellis
@@ -112,7 +115,7 @@ inline const char* ProductionLayoutName() { return "trellis"; }
 
 // ProductionTargetPath()'s w4a16 DFlash2 drafter, packed at group 64.
 inline const char* ProductionDrafterPath() {
-  return "D:/models/r4dx/qwen38-27b-dflash2-w4a16-g64.r4dx";
+  return detail::Own(detail::Join(ContainerRoot(), "qwen38-27b-dflash2-w4a16-g64.r4dx"));
 }
 
 // Runs a test's body, turning an exception that would otherwise escape main() into a FAIL that

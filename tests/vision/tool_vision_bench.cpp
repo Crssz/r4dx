@@ -8,7 +8,7 @@
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
 //   build\win-hip\tests\vision\tool_vision_bench.exe
-//       [--model D:/models/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx]
+//       [--model <R4DX_MODELS_ROOT>/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx]
 //       --layout trellis [--sizes 448,1024,1536] [--no-model] [--image-max-pixels N] [--runs 3]
 //
 // `--no-model` skips loading the text model and measures the tower alone; the default loads the

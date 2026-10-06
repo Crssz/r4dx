@@ -126,7 +126,7 @@ void TestResolve() {
   CHECK(ResolveDialectKind(std::nullopt, "", true) == DialectKind::kGemma4);
   CHECK(ResolveDialectKind(std::nullopt, "", false) == DialectKind::kQwen35);
 
-  CHECK(ResolveTokenizerDir(Qwen35Dialect(), "") == kQwenDefaultTokenizerDir);
+  CHECK(ResolveTokenizerDir(Qwen35Dialect(), "") == QwenDefaultTokenizerDir());
   CHECK(ResolveTokenizerDir(Gemma4Dialect(), "") == Gemma4Dialect().default_tokenizer_dir);
   CHECK(!Gemma4Dialect().default_tokenizer_dir.empty());
   CHECK(ResolveTokenizerDir(Gemma4Dialect(), "X:\\tok") == "X:\\tok");

@@ -46,7 +46,7 @@ using r4dx::model::ModelOptions;
 
 namespace {
 
-const char* kL4Container = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
+const char* kL4Container = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-allmtp.r4dx");
 
 using Trace = std::vector<std::pair<std::string, uint64_t>>;
 

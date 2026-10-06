@@ -39,7 +39,7 @@ using r4dx::model::Model;
 using r4dx::model::ModelOptions;
 
 namespace {
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-bf16.r4dx");
 
 bool AllFinite(const std::vector<float>& v) {
   for (float x : v) {

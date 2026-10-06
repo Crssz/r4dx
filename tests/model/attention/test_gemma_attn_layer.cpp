@@ -1,6 +1,6 @@
 // tests/model/attention/test_gemma_attn_layer.cpp -- docs/gemma4-plan.md M1-21, rung 3 (docs/validation.md):
 // the C++ Gemma 4 decoder layer against the per-layer bf16 goldens of tools/reference/gemma/layer_golden_gemma.py
-// (M0-8) on the REAL Huihui weights (D:\models\r4dx\huihui-gemma\bf16.r4dx). GPU test, HIP device 1 only.
+// (M0-8) on the REAL Huihui weights (<R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16.r4dx). GPU test, HIP device 1 only.
 //
 // NOT RUN BY THE AUTHOR (no GPU work was allowed): it compiles, and is the user's command to run once the M0-8
 // goldens exist (tools/reference/golden_out/gemma/manifest.json). It exits 77 (SKIPPED) while the manifest or the
@@ -27,6 +27,7 @@
 // Tolerances: a multiple (kFloorMultiple = 4, the manifest's own suggestion) of the manifest's bf16-vs-fp32 twin
 // floor for the tensor, never below kMinTol.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -271,7 +272,7 @@ int main() {
                                                                               : std::string(R4DX_GEMMA_GOLDEN_DIR);
     const std::string container = std::getenv("R4DX_GEMMA_BF16_CONTAINER") != nullptr
                                       ? std::getenv("R4DX_GEMMA_BF16_CONTAINER")
-                                      : std::string("D:\\models\\r4dx\\huihui-gemma\\bf16.r4dx");
+                                      : r4dx::ModelsPath("r4dx/huihui-gemma/bf16.r4dx");
     if (!r4dx_test::FileExists(dir + "/manifest.json")) return r4dx_test::SkipMissing(dir + "/manifest.json (M0-8 layer_golden_gemma.py)");
     if (!r4dx_test::FileExists(container)) return r4dx_test::SkipMissing(container);
 

@@ -21,6 +21,7 @@
 // R4DX_TEST_SCRATCH_DIR (where the ~3 GiB throwaway container is written; %TEMP% by default). The
 // container this test writes is deleted before it returns, whether it passes or fails.
 #include <cmath>
+#include "r4dx/models_root.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -90,7 +91,7 @@ int RunCommand(const std::string& command_line) {
 int main() {
   // The 4 layers converted are layers 0-3, which the Huihui abliteration leaves untouched (it only
   // changes layers 17..51's output projections), so the fine-tune's checkpoint gives the same container.
-  const std::string checkpoint = Env("R4DX_HF_CHECKPOINT", "D:/models/Huihui-Qwen3.8-27B-abliterated");
+  const std::string checkpoint = Env("R4DX_HF_CHECKPOINT", r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated"));
   if (!DirExists(checkpoint)) return r4dx_test::SkipMissing(checkpoint + "\\config.json");
 #ifndef R4DX_CONVERT_EXE
   std::fprintf(stderr, "[SKIP] this build has no r4dx-convert target (R4DX_BUILD_CONVERT=OFF)\n");

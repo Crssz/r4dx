@@ -2,8 +2,8 @@
 # the shipped M = 64 trellis kernel unit and the prototype M = 256 unit are compiled from libr4d's
 # sources with third_party/CMakeLists.txt's R4D_BASE_FLAGS (so the M = 64 side is the object r4d_core
 # holds, flag for flag), the bench with the same flags, and the three linked.
-#   powershell -File tests\kernels\build_m256_bench.ps1 [-Out D:\models\r4dx\linear\A2\obj] [-Tool bench|real_check]
-param([string]$Out = "D:\models\r4dx\linear\A2\obj", [string]$Rocm = "C:/opt/rocm", [string[]]$Define = @(), [string]$M256 = "",
+#   powershell -File tests\kernels\build_m256_bench.ps1 [-Out <R4DX_MODELS_ROOT>\r4dx\linear\A2\obj] [-Tool bench|real_check]
+param([string]$Out = (Join-Path $(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { "E:\models" }) "r4dx\linear\A2\obj"), [string]$Rocm = "C:/opt/rocm", [string[]]$Define = @(), [string]$M256 = "",
       [ValidateSet("bench", "real_check")][string]$Tool = "bench")
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)

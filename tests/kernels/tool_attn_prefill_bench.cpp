@@ -1,4 +1,4 @@
-// tests/kernels/tool_attn_prefill_bench.cpp -- prefill M0 (tools/prefill, D:\models\r4dx\prefill-m0):
+// tests/kernels/tool_attn_prefill_bench.cpp -- prefill M0 (tools/prefill, <R4DX_MODELS_ROOT>\r4dx\prefill-m0):
 // what the production prefill attention call (r4d_attn_prefill_h256_gqa6_fp8kv, the kernel every
 // full-attention layer runs once per 64-row prefill chunk) costs at context depth D, and what it
 // WOULD cost with more parallelism, without changing any kernel.

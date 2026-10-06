@@ -18,6 +18,7 @@
 //   * a sampled step at temperature 1 returns a token inside the top-64 summary or the full-row fallback (no throw).
 // R4DX_GEMMA_KL_REF_DIR / R4DX_GEMMA_BF16_CONTAINER / R4DX_GEMMA_SMOKE_TOKENS (default 96) override the inputs.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -87,8 +88,8 @@ int64_t Argmax(const std::vector<float>& v) { return std::max_element(v.begin(),
 int main() {
   return r4dx_test::RunGuardedMain("test_gemma_forward_smoke", []() -> int {
     const auto env = [](const char* k, const std::string& d) { const char* v = std::getenv(k); return v && *v ? std::string(v) : d; };
-    const std::string container = env("R4DX_GEMMA_BF16_CONTAINER", "D:\\models\\r4dx\\huihui-gemma\\bf16.r4dx");
-    const std::string ref_dir = env("R4DX_GEMMA_KL_REF_DIR", "D:\\models\\r4dx\\huihui-gemma\\kl\\ref");
+    const std::string container = env("R4DX_GEMMA_BF16_CONTAINER", r4dx::ModelsPath("r4dx/huihui-gemma/bf16.r4dx"));
+    const std::string ref_dir = env("R4DX_GEMMA_KL_REF_DIR", r4dx::ModelsPath("r4dx/huihui-gemma/kl/ref"));
     const std::string tokens_path = env("R4DX_GEMMA_TOKENS", std::string(R4DX_SOURCE_DIR_STR) + "/tools/reference/kl_corpus/tokens_gemma.json");
     const int64_t kTokens = std::atoll(env("R4DX_GEMMA_SMOKE_TOKENS", "96").c_str());
     if (!r4dx_test::FileExists(container)) return r4dx_test::SkipMissing(container);

@@ -1,7 +1,7 @@
 // tests/server/test_tool_call_parser.cpp -- pure CPU unit test for src/server/tool_call_parser.h.
 //
 // The "real capture" fixtures below are byte-for-byte what the real 64-layer container
-// (D:\models\r4dx\qwen38-27b-v3.r4dx, w4a16, HIP device 1) actually emitted for a
+// (<R4DX_MODELS_ROOT>\r4dx\qwen38-27b-v3.r4dx, w4a16, HIP device 1) actually emitted for a
 // get_current_weather tool definition, greedy decode, captured via a live r4dx-server request
 // during this task's own investigation step (docs/server.md's "Tool calls" section has the full
 // request/response transcripts) -- not hand-invented text. The malformed-input cases are

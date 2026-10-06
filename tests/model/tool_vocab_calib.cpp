@@ -24,10 +24,11 @@
 // Usage: tool_vocab_calib.exe [container_path] [tokenizer_dir] [corpus_path] [out_json_path] [layout]
 // (layout defaults to r4dx_test::ProductionLayoutName(): trellis for the default container)
 // Defaults match this project's standard real-container/tokenizer/corpus locations (docs/r9700.md
-// task, D:/models/wikitext-2-raw -- a real calibration corpus already present on this machine).
+// task, <R4DX_MODELS_ROOT>/wikitext-2-raw -- a real calibration corpus already present on this machine).
 // SKIPs (prints and returns 77, same convention as every other real-data tool/test in this
 // directory) if the container, tokenizer directory, or corpus file is missing.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -50,8 +51,8 @@ namespace {
 
 // The production container matching this build's w4a16 group (tests/model/test_container_path.h).
 const char* kDefaultContainer = r4dx_test::ProductionTargetPath();
-const char* kDefaultTokenizerDir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
-const char* kDefaultCorpus = "D:/models/wikitext-2-raw/wiki.train.raw";
+const std::string kDefaultTokenizerDir = r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated");
+const std::string kDefaultCorpus = r4dx::ModelsPath("wikitext-2-raw/wiki.train.raw");
 const char* kDefaultOutJson = "build/logs/vocab_calib.json";
 
 // Only the first this-many bytes of the corpus are tokenized -- enough for kCalibTokens positions

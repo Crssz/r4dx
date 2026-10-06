@@ -1,6 +1,6 @@
 # tests/model/attention: golden test for r4dx::model::attention::AttentionLayer
 # (src/model/attention/**) against tools/reference/layer_golden.py's layer 3 golden and the real
-# Qwen3.8-27B checkpoint's bf16 weights (D:/models/r4dx/qwen38-27b-l4-bf16.r4dx). GPU test (HIP
+# Qwen3.8-27B checkpoint's bf16 weights (<R4DX_MODELS_ROOT>/r4dx/qwen38-27b-l4-bf16.r4dx). GPU test (HIP
 # device 1 only), same ENVIRONMENT convention as tests/kernels/CMakeLists.txt.
 #
 # NOTE: tests/model/CMakeLists.txt did not exist when this component started (only
@@ -13,7 +13,7 @@ add_executable(test_attn_layer test_attn_layer.cpp)
 target_link_libraries(test_attn_layer PRIVATE r4dx_model_attention r4dx_core r4dx_kernels r4d_core r4dx_convert)
 target_compile_definitions(test_attn_layer PRIVATE
   R4DX_GOLDEN_ATTN_PATH="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/layer_003_full_attention.safetensors"
-  R4DX_BF16_CONTAINER_PATH="D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
+  R4DX_BF16_CONTAINER_PATH="${R4DX_MODELS_ROOT}/r4dx/qwen38-27b-l4-bf16.r4dx"
 )
 add_test(NAME test_attn_layer COMMAND test_attn_layer)
 # SKIP_RETURN_CODE 77: the test exits 77 (CTest SKIPPED, not FAILED) when its golden safetensors or
@@ -32,7 +32,7 @@ target_link_libraries(test_mrope_attn_layer PRIVATE r4dx_model_attention r4dx_co
                                                      r4d_core r4dx_convert)
 target_compile_definitions(test_mrope_attn_layer PRIVATE
   R4DX_GOLDEN_MROPE_PATH="${CMAKE_SOURCE_DIR}/tools/reference/golden_out/mrope_layer_003.safetensors"
-  R4DX_BF16_CONTAINER_PATH="D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
+  R4DX_BF16_CONTAINER_PATH="${R4DX_MODELS_ROOT}/r4dx/qwen38-27b-l4-bf16.r4dx"
 )
 add_test(NAME test_mrope_attn_layer COMMAND test_mrope_attn_layer)
 set_tests_properties(test_mrope_attn_layer PROPERTIES

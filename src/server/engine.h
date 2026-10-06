@@ -53,7 +53,7 @@ struct EngineOptions {
                                                         const r4dx::model::TpOptions&)>
       model_loader;
   // Empty (main.cpp passes empty unless --tokenizer-dir was given) = the dialect's default directory
-  // (ModelDialect::default_tokenizer_dir; kQwenDefaultTokenizerDir for Qwen).
+  // (ModelDialect::default_tokenizer_dir; QwenDefaultTokenizerDir() for Qwen).
   std::string tokenizer_dir;
   // `--dialect` (docs/gemma4-plan.md 5.3, task M1-14): nullopt = auto (tokenizer_config.json /
   // vocab, else -- with no --tokenizer-dir -- the container's architecture). Resolved once in

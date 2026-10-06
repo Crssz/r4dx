@@ -13,7 +13,7 @@
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
 //   build\win-hip\tests\model\tool_teacher_forced_logprobs.exe `
-//       --model D:/models/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
+//       --model <R4DX_MODELS_ROOT>/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
 //       --tokens tokens.json --out-dir logprobs_out
 //
 // Options:

@@ -11,7 +11,7 @@
 #include <string>
 #include <vector>
 
-#include "dialect.h"  // kQwenDefaultTokenizerDir
+#include "dialect.h"  // QwenDefaultTokenizerDir
 
 namespace r4dx::server {
 
@@ -27,7 +27,7 @@ struct ServerArgs {
   std::string layout = "bf16";
   // Same default as src/cli/cli_args.h: the Huihui abliterated checkpoint dir, whose four tokenizer /
   // chat-template files are byte-identical to the base Qwen3.8-27B's.
-  std::string tokenizer_dir = kQwenDefaultTokenizerDir;  // dialect.h
+  std::string tokenizer_dir = QwenDefaultTokenizerDir();  // dialect.h
   // True iff --tokenizer-dir was given. When it was not, main.cpp hands Engine an EMPTY tokenizer_dir
   // and the engine resolves the default from the dialect (docs/gemma4-plan.md 5.3): Gemma's assembled
   // tokenizer dir, or the Qwen default above (unchanged).
@@ -54,7 +54,7 @@ struct ServerArgs {
   // -1 (default): load every layer Config().num_hidden_layers declares (the real 64-layer
   // container). >=0: load only the first N layers -- required for a smaller test container that
   // physically carries fewer layers than its (verbatim-copied) config.json declares, e.g.
-  // D:\models\r4dx\qwen38-27b-l4-bf16.r4dx (mirrors r4dx-convert's own --layers N and
+  // <R4DX_MODELS_ROOT>\r4dx\qwen38-27b-l4-bf16.r4dx (root default E:\models) (mirrors r4dx-convert's own --layers N and
   // r4dx::model::ModelOptions::layer_limit; see tools/server/smoke.ps1).
   int64_t layers = -1;
   int64_t max_tokens_default = 128;

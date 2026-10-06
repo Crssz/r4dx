@@ -48,7 +48,7 @@ using r4dx::model::ModelOptions;
 using r4dx::model::TextModel;
 using r4dx::model::TpOptions;
 
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int64_t kDraftK = 3;
 constexpr int kContinue = 8;  // greedy tokens compared after Prefill(T)
 

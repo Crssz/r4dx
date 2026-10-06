@@ -128,7 +128,7 @@ void TestDialectAndContextFlags() {
     auto argv = ToArgv(storage);
     const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
     CHECK(a.dialect == "auto" && !a.tokenizer_dir_given && !a.max_ctx_given && !a.extended_ctx);
-    CHECK(a.tokenizer_dir == "D:\\models\\Huihui-Qwen3.8-27B-abliterated");
+    CHECK(a.tokenizer_dir == r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated"));
     CHECK(a.max_ctx == 262144);
   }
   {

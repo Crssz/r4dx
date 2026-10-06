@@ -3,7 +3,7 @@
 // vision embedder weights, and layers 0 / 5 with an image block). GPU test, HIP device 1 only. NOT RUN BY ITS AUTHOR
 // (no GPU work was allowed); exits 77 (SKIPPED) while the container or the golden is missing.
 //
-//   container  R4DX_GEMMA_VISION_CONTAINER (default D:\models\r4dx\huihui-gemma\bf16-vision.r4dx): an UNROTATED bf16
+//   container  R4DX_GEMMA_VISION_CONTAINER (default <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16-vision.r4dx): an UNROTATED bf16
 //              container converted with `r4dx-convert --vision on` (a rotated one runs the layer in the rotated
 //              basis, which this test's direct layer calls do not model).
 //   golden     R4DX_GEMMA_VISION_GOLDEN (default tools/reference/golden_out/gemma/vision_golden_gemma.safetensors)
@@ -19,6 +19,7 @@
 //      and continuation are consistent); a decode step afterwards is finite. PrefillMultimodal({}) == Prefill
 //      bit for bit (the text path is untouched).
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +61,7 @@ std::vector<float> Widen(const std::vector<uint16_t>& v) { return r4dx_test::Wid
 int main() {
   return r4dx_test::RunGuardedMain("test_gemma_vision_gpu", []() -> int {
     const auto env = [](const char* k, const std::string& d) { const char* v = std::getenv(k); return v && *v ? std::string(v) : d; };
-    const std::string container = env("R4DX_GEMMA_VISION_CONTAINER", "D:\\models\\r4dx\\huihui-gemma\\bf16-vision.r4dx");
+    const std::string container = env("R4DX_GEMMA_VISION_CONTAINER", r4dx::ModelsPath("r4dx/huihui-gemma/bf16-vision.r4dx"));
     const std::string golden_path = env("R4DX_GEMMA_VISION_GOLDEN", std::string(R4DX_SOURCE_DIR_STR) +
                                         "/tools/reference/golden_out/gemma/vision_golden_gemma.safetensors");
     if (!r4dx_test::FileExists(container)) return r4dx_test::SkipMissing(container);

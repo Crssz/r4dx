@@ -1,6 +1,6 @@
 ﻿// tests/model/attention/test_attn_layer.cpp -- r4dx::model::attention::AttentionLayer against
 // tools/reference/layer_golden.py's layer 3 (full-attention) golden: real Qwen3.8-27B weights
-// (D:\models\r4dx\qwen38-27b-l4-bf16.r4dx, bf16 layout, layers 0-3) and real transformers
+// (<R4DX_MODELS_ROOT>\r4dx\qwen38-27b-l4-bf16.r4dx, bf16 layout, layers 0-3) and real transformers
 // activations (tools/reference/golden_out/layer_003_full_attention.safetensors). Runs a T=64
 // prefill (fresh KV cache) then a T=4 decode continuing the same cache (matching the golden's own
 // "decode reuses the prefill Cache" note), and diffs AttentionLayer::Forward's residual-added
@@ -41,7 +41,7 @@
 #define R4DX_GOLDEN_ATTN_PATH "tools/reference/golden_out/layer_003_full_attention.safetensors"
 #endif
 #ifndef R4DX_BF16_CONTAINER_PATH
-#define R4DX_BF16_CONTAINER_PATH "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
+#define R4DX_BF16_CONTAINER_PATH "r4dx/qwen38-27b-l4-bf16.r4dx"
 #endif
 
 // The container path arrives as a string literal (this file's #ifndef default, or the -D in

@@ -20,12 +20,13 @@
 //
 // Built, never add_test()'d (prints numbers for G3, asserts nothing), like tool_sampled_bench.
 // Usage (HIP_VISIBLE_DEVICES=1):
-//   tool_tp_step_bench --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis
+//   tool_tp_step_bench --model <R4DX_MODELS_ROOT>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis
 //                      --max-ctx 2048 (--tp1 | --rank 0|1) [--tokens 128] [--repeats 3] [--json out.json]
-//                      [--tokenizer-dir D:\models\Huihui-Qwen3.8-27B-abliterated] [--prompt "..."] [--need-gib X]
+//                      [--tokenizer-dir <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated] [--prompt "..."] [--need-gib X]
 //   (--model / --layout default to the production container and its layout, r4dx_test::Production*)
 //                      [--layers N]   (layer_limit, for the 4-layer test containers; G3 omits it)
 #include <hip/hip_runtime.h>
+#include "r4dx/models_root.h"
 
 #include <algorithm>
 #include <chrono>
@@ -58,7 +59,7 @@ constexpr const char* kStandardPrompt =
 struct Args {
   std::string model = r4dx_test::ProductionTargetPath();
   std::string layout = r4dx_test::ProductionLayoutName();
-  std::string tokenizer_dir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
+  std::string tokenizer_dir = r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated");
   std::string prompt = kStandardPrompt;
   std::string json;
   int64_t max_ctx = 2048;

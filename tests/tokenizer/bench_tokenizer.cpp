@@ -25,6 +25,7 @@
 // single-thread (>= ~9 MB/s here) and decode / stream_decode >= 10x. Re-measure on the same corpus
 // after any change to bpe_tokenizer.cpp; numbers are machine-dependent, compare ratios.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -65,8 +66,8 @@ double best_of(int repeats, F&& fn) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model_dir = "D:/models/Huihui-gemma-4-12B-it-abliterated-tok";
-    std::string corpus_path = "D:/models/r4dx/tok_bench/corpus_gemma.jsonl";
+    std::string model_dir = r4dx::ModelsPath("Huihui-gemma-4-12B-it-abliterated-tok");
+    std::string corpus_path = r4dx::ModelsPath("r4dx/tok_bench/corpus_gemma.jsonl");
     int repeats = 5;
     bool check = false, bench = true;
     for (int i = 1; i < argc; ++i) {

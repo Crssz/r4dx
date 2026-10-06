@@ -46,8 +46,10 @@
 #include "text_model.h"
 #include "tokenizer.h"
 
+#include "r4dx/models_root.h"
+
 #ifndef R4DX_TOKENIZER_MODEL_DIR
-#define R4DX_TOKENIZER_MODEL_DIR "D:/models/Huihui-Qwen3.8-27B-abliterated"
+#define R4DX_TOKENIZER_MODEL_DIR (r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated"))
 #endif
 
 namespace {

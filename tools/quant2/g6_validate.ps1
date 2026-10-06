@@ -2,7 +2,7 @@
 # must pass, each script's full output in -OutDir\<step>.log and a one-line verdict per step in
 # summary.json. Every step runs even when an earlier one fails; exit 1 if any failed.
 #
-#   .\tools\quant2\g6_validate.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+#   .\tools\quant2\g6_validate.ps1 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
 #   .\tools\quant2\g6_validate.ps1 -Model <a w4a16 container> -Layout w4a16
 #
 # -Layout (default trellis, the production container's layout) is the container's body layout:
@@ -16,7 +16,7 @@
 # math, which is what a rotated container changes; real mode only adds the device-0 transport.
 param(
   [Parameter(Mandatory = $true)][string]$Model,
-  [string]$Dflash = 'D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx',
+  [string]$Dflash = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx",
   [string]$Layout = 'trellis',
   [string]$OutDir = ''
 )

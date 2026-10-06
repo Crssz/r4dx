@@ -15,9 +15,9 @@
 # set, so this script captures hf-auto by default. A canonical capture needs -Tokenizer canonical AND
 # another -HessianDir; a canonical set under the hessian-v1 name is refused.
 param(
-  [string]$OutDir = 'D:\models\r4dx\quant2-gpu',
+  [string]$OutDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\quant2-gpu",
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
-  [string]$HessianDir = 'D:\models\r4dx\hessian-v1',
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\hessian-v1",
   [ValidateSet('hf-auto', 'canonical')][string]$Tokenizer = 'hf-auto',
   [switch]$SkipCapture
 )

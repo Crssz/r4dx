@@ -31,7 +31,7 @@
 // facade and makes no HIP call, 2.1) requires --need-gib free on every device the ranks will use.
 //
 // Built, never add_test()'d. Usage (HIP_VISIBLE_DEVICES unset, production server stopped):
-//   tool_tp_soak --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --minutes 60
+//   tool_tp_soak --model <R4DX_MODELS_ROOT>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --minutes 60
 //                --max-ctx 8192 --json build\logs\tp_soak.jsonl [--seed 1] [--iterations N]
 //                [--tokens tools\reference\kl_corpus\tokens.json] [--canary-every 10]
 //                [--min-prompt 16] [--max-prompt 2048] [--min-decode 32] [--max-decode 512]

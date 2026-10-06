@@ -95,7 +95,7 @@ target_link_libraries(tool_hseed_drift PRIVATE r4dx_model r4dx_convert r4dx_core
 
 # tool_vocab_calib: one-off diagnostic for docs/r9700.md R9's "reduced-vocab draft head" -- chooses
 # and measures coverage for the MTP draft head's vocabulary subset against a real calibration
-# corpus (D:/models/wikitext-2-raw) run through the real 64-layer container. Same "built but never
+# corpus (<R4DX_MODELS_ROOT>/wikitext-2-raw) run through the real 64-layer container. Same "built but never
 # add_test()'d" convention as tool_hseed_drift above (prints numbers + writes a JSON file for a
 # human/converter run to consume, no pass/fail contract). Needs r4dx_tokenizer for the real BPE
 # tokenizer, unlike tool_hseed_drift.

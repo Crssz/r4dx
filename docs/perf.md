@@ -14,7 +14,7 @@ its own model).
 containers interleaved run by run on one binary (main 1099446), the protocol of the section below
 (four `tests/model/mtp_prompts.txt` prompts, `--vision off --think off --temperature 0 --max-tokens
 256 --max-ctx 2048`, DFlash2 = `qwen38-27b-dflash2-w4a16-g64.r4dx` at k = 7; prefill = warm >= 256-token
-`--chat` turns). Record: `D:\models\r4dx\huihui\bench\bench.md`.
+`--chat` turns). Record: `E:\models\r4dx\huihui\bench\bench.md`.
 
 | mode | base trellis mix4.5m (retired) | **Huihui trellis mix4.5m (default)** | vs base |
 |---|--:|--:|--:|
@@ -49,7 +49,7 @@ unset (rank 0 on HIP device 1, rank 1 on device 0, the desktop live on device 0)
   `bench_decode.ps1` prints. The runs went through a purpose-made serial driver instead of
   `bench_decode.ps1`, because the TP=2 safety limits needed their own loop: a 60 s pause after every 3
   TP=2 runs, `tools\tp\tdr_check.ps1` after every TP=2 run and again after each pause, stop at the first
-  TDR, hang or non-zero exit. Driver, logs and `results.jsonl` (97 runs): `D:\models\r4dx\tp2bench\`.
+  TDR, hang or non-zero exit. Driver, logs and `results.jsonl` (97 runs): `E:\models\r4dx\tp2bench\`.
 - **Cold TTFT:** the frozen `ttft_8k/32k/64k.txt` prompts of `tools/prefill/ttft_cli.ps1` (8145, 32623
   and 65529 prompt tokens), `--max-tokens 8 --stats`, one fresh process per run, one discarded warm-up
   per configuration (TP=1 8k: 5.469 s; TP=2 8k: 3.865 s with the chunk, 5.246 s without). TP=2
@@ -142,7 +142,7 @@ mode, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048`
 token-weighted aggregates. Prefill is the warm >= 256-token `--chat` turns. The TP=1 column is the
 section below (M5 part 3, HIP device 1). It was not re-run: that build was the quant2 checkout of the
 same source, and TP=1 is not TP work. `tools\tp\tdr_check.ps1` found no TDR. Logs are in
-`D:\models\r4dx\trellis-tp2\bench\`.
+`E:\models\r4dx\trellis-tp2\bench\`.
 
 | mode | mix4.5m TP=1 | **mix4.5m TP=2** | TP=2 / TP=1 | K4m TP=1 | **K4m TP=2** | TP=2 / TP=1 |
 |---|--:|--:|--:|--:|--:|--:|
@@ -185,7 +185,7 @@ in parentheses) against TP=1's single card:
   each. The row is **slower**: `gate_up` KB5 costs 93.3 us per call against 91.2, and the full-linear
   step costs 12.228 ms against 12.169 at M = 1 (+0.06 ms) and 12.524 against 12.480 at M = 8. M5's
   TP=2 joint run had already made WV4 SK1 U2 its pick over every screened alternative, and no
-  candidate came near the 0.1 ms/step bar for an in-model A/B (`D:\models\r4dx\trellis-tp2\tune\`).
+  candidate came near the 0.1 ms/step bar for an in-model A/B (`E:\models\r4dx\trellis-tp2\tune\`).
 
 ## Trellis weights (`--layout trellis`): decode and prefill against q2ab_hv2_q3 (2026-09-28)
 
@@ -195,7 +195,7 @@ three containers interleaved run by run on one binary, four `tests/model/mtp_pro
 mode, `--vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048`, median of the
 per-run token-weighted aggregates; prefill is the warm >= 256-token `--chat` turns of
 `tools/quant2/prefill_prompts.txt`. Every run reproduced its text. (docs/trellis-kernel.md 10.6,
-`D:\models\r4dx\trellis-m5\part3\bench\`.) These are the BASE model's containers: mix4.5m and K4m were
+`E:\models\r4dx\trellis-m5\part3\bench\`.) These are the BASE model's containers: mix4.5m and K4m were
 retired on 2026-09-29 (the default is now the Huihui trellis mix4.5m, section above); q2ab_hv2_q3 had
 already been retired and is kept here as the historical baseline.
 
@@ -420,7 +420,7 @@ documented below. The weights, the kernel and the arithmetic are unchanged.
 
 ## Milestone 11: what the v6 container costs in tok/s (2026-09-22)
 
-`D:\models\r4dx\qwen38-27b-v6.r4dx` buys **-27.9% mean KL** (0.05342 -> 0.03851) and **+1.64 points
+`E:\models\r4dx\qwen38-27b-v6.r4dx` buys **-27.9% mean KL** (0.05342 -> 0.03851) and **+1.64 points
 of top-1** over `v5` by spending +0.8989 GiB of weights: w4a16 group 64 instead of 128, plus
 `attn.k`/`attn.v` left in bf16. `docs/validation.md` "Milestone 11 / recipe" has the full decision,
 the arithmetic it was made on and the KL tables; this entry is the speed half.
@@ -447,7 +447,7 @@ over the weight stream across 2.4-2.7 accepted tokens.
 group-128 drafter. Re-converting it with the converter's *default* `--quant rtn` silently costs
 **6.4 tok/s** (66.27/66.32 tok/s at 21.4% acceptance vs 72.93/72.71 at 24.9%) -- unlike the main
 model, where Milestone 10 found `search` without an imatrix worth nothing. The shipped drafter is
-`D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx`, `--quant search`.
+`E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx`, `--quant search`.
 
 ## Milestone 8, stage 8: vision + speculation, integrated headline (2026-09-22)
 
@@ -500,7 +500,7 @@ regression**.
 
 ## Milestone 6, stage S3: sampled speculative decode -- current headline (2026-09-21)
 
-Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx` (+ real w4a16 DFlash2 draft container
+Real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx` (+ real w4a16 DFlash2 draft container
 for every `--dflash` cell), `--max-ctx 2048`, `--think off`, `--seed 42`, HIP device 1, one process
 at a time. Every cell measured twice; every pair agrees to <=0.3 tok/s (well under the 3%
 "report both" threshold) except where noted. Prompts: the standard haiku prompt (`--max-tokens
@@ -575,8 +575,8 @@ continuing Milestone 5's own open item); a long-context sampled point.
 
 ## Milestone 5: Integrate stage final confirmation sweep (2026-09-21) -- current headline
 
-Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, real w4a16 DFlash2 draft container
-(`D:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx`), `--max-ctx 2048`, greedy (`--temperature 0`), HIP
+Real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, real w4a16 DFlash2 draft container
+(`E:\models\r4dx\qwen38-27b-dflash2-w4a16.r4dx`), `--max-ctx 2048`, greedy (`--temperature 0`), HIP
 device 1, one process at a time. Each cell measured twice; all pairs agree to <=0.1 tok/s (well
 under the 3% "report both" threshold). Each layout's own best DFlash `K` and best MTP `K` (from the
 stage S3 sweep, `docs/dflash2.md` section 7a) is used in both prompts below -- this is the exact
@@ -625,7 +625,7 @@ tokens); an explicit prefill-with/without-`--dflash` A/B.
 
 ## Milestone 5, stage S3: DFlash2 vs MTP headline (2026-09-20)
 
-Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, standard haiku prompt, `--max-ctx
+Real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, standard haiku prompt, `--max-ctx
 2048`, greedy, HIP device 1, one process at a time. Full accounting (what was and was not
 measured, and why): `docs/dflash2.md` section 7a; `docs/status.md`'s Milestone 5 stage S3 entry.
 
@@ -701,7 +701,7 @@ container (`-Mtp 3`) **29/29** (MTP path confirmed taken), real 64-layer contain
 -ToolRoundTrip`) **34/34** (full tool call/result/answer round trip against real weights). All three
 smoke runs and the sweep below were run sequentially, one process at a time, HIP device 1 only.
 
-**Fresh confirmation sweep**, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this
+**Fresh confirmation sweep**, real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, this
 file's standard prompt/flags (`--max-tokens 128 --temperature 0 --max-ctx 2048 --stats`), each
 layout at `--mtp 0` and its own best `K` (re-checked against neighboring `K` values post the Q5
 GEMM re-sweep, not assumed from the pre-re-sweep numbers below):
@@ -856,7 +856,7 @@ This pass added one more dated blockquote to §2.6 with a per-shape breakdown (b
 R10 roadmap row "STILL NOT IMPLEMENTED" rather than re-writing the already-correct ranking text.
 
 **Item 2: per-op-family and per-shape profile at the current 64-row cap** (real hardware, HIP device
-1, `D:\models\r4dx\qwen38-27b-v3.r4dx`, the standard 29-token haiku prompt, one 64-row chunk,
+1, `E:\models\r4dx\qwen38-27b-v3.r4dx`, the standard 29-token haiku prompt, one 64-row chunk,
 `--profile-prefill`; full output: `build/logs/r10_profileprefill_{w4a16,w4a8,mxfp4}.txt`, gitignored):
 
 | GEMM family | w4a16 % gpu_sum | w4a8 % gpu_sum | mxfp4 % gpu_sum | Shape (N, K) |
@@ -933,9 +933,9 @@ capability, inherited from an early design decision and never revisited or measu
 measured decode, prefill, VRAM, and long-context correctness for real, on real hardware, at 2k, 8k,
 32k, 131072, and 262144 (the model's own native ceiling), and raised the default accordingly.
 
-**Method.** Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one process
+**Method.** Real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one process
 at a time. This file's standard haiku prompt/flags (`--max-tokens 128 --temperature 0 --stats`)
-padded with real corpus text (`D:/models/wikitext-2-raw/wiki.train.raw`, the only large text corpus
+padded with real corpus text (`E:/models/wikitext-2-raw/wiki.train.raw`, the only large text corpus
 on this machine) to reach each target context length -- no natural document of 131k-262k tokens
 exists on this machine, so the padding is unavoidably synthetic in *origin*, but it is real English
 text run through the real tokenizer (`tokenizers.Tokenizer.from_file` against the checkpoint's own
@@ -994,7 +994,7 @@ corrected in `docs/r9700.md` with this section's measured table.
 
 ### Decode and prefill: the §2.3 curve, confirmed and extended
 
-Real generation (not a synthetic decode-only loop), w4a16, `D:\models\r4dx\qwen38-27b-v3.r4dx`:
+Real generation (not a synthetic decode-only loop), w4a16, `E:\models\r4dx\qwen38-27b-v3.r4dx`:
 
 | Context | `--mtp 0` prefill tok/s | `--mtp 0` decode tok/s | Ceiling tok/s (13.975 GB base + `ctx`x32 KiB KV @604 GB/s) | % of ceiling | `--mtp 3` decode tok/s (full head, K=3) | MTP acceptance |
 |---|---|---|---|---|---|---|
@@ -1178,7 +1178,7 @@ methodology and this pass's findings -- see the file itself). Raw sweep output:
 
 **Item 4 (end-to-end re-measurement, decide whether the table is worth shipping): done, mixed
 result, reported honestly per the task's own instruction.** Real 64-layer container
-`D:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP device 1, one process at
+`E:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP device 1, one process at
 a time, each config run twice (both runs agreed within 0.1-0.2%, well under the 3% reporting
 threshold):
 
@@ -1255,7 +1255,7 @@ real hardware). This section only records the measured performance delta. w4a16 
 regression, not a correctness issue) and is not re-listed below; its M3 numbers three sections down
 stand unchanged.
 
-Real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP
+Real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, this file's standard prompt/flags, HIP
 device 1, each config run twice (both runs agreed within 0.1%, well under the task's own 3%
 threshold for reporting both):
 
@@ -1298,7 +1298,7 @@ or reported for the 64-layer model at any point in Milestone 3 -- it appears onl
 golden-test containers as the exact-arithmetic correctness reference (`docs/validation.md`). Every
 table below is w4a8/w4a16/mxfp4 only.
 
-Fresh confirmation sweep, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, clean
+Fresh confirmation sweep, real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, clean
 `build.ps1 -Clean` rebuild, HIP device 1, one process at a time, this file's standard prompt/flags
 (`--prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." --max-tokens 128
 --temperature 0 --max-ctx 2048 --stats`):
@@ -1349,7 +1349,7 @@ three milestones even though the raw GiB number is not monotonically decreasing.
 
 ## Milestone 3 profiling truth (2026-09-20, docs/r9700.md R5 + Q2/Q3/Q5/Q7/Q8)
 
-Real hardware, real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one
+Real hardware, real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, HIP device 1, one
 process at a time, w4a8/w4a16/mxfp4 only (bf16 excluded per standing rule). Full `ctest --preset
 win-hip` was 33/33 green before and after this pass (no engine-behavior code changed -- the
 profiling instrumentation this section reports on was already present, uncommitted, in the working
@@ -1362,7 +1362,7 @@ see docs/status.md for the full accounting of what was and was not code-changed 
 
 ### Q2 -- why is the profiled step longer than the steady-state step, and by how much now
 
-Command: `r4dx-cli --model D:\models\r4dx\qwen38-27b-v3.r4dx --layout <L> --prompt "Write a haiku
+Command: `r4dx-cli --model E:\models\r4dx\qwen38-27b-v3.r4dx --layout <L> --prompt "Write a haiku
 about GPUs, then explain what a GPU is in two sentences." --max-tokens 128 --temperature 0 --max-ctx
 2048 --profile` (steady-state, default `--profile-token 32`) vs the same command with `--stats` (no
 `--profile`, real generation, real `tok/s`) vs `--profile --profile-token 1` (first generated token,
@@ -1622,7 +1622,7 @@ evidence either way, and it was measured on a device-saturating kernel, not a re
 > two M rows. Full data: `build\logs\p6-capture-before.log` (before, captured against the unmodified
 > kernel prior to any edit) and `build\logs\p6-check-after2.log` (after).
 >
-> **Full-model decode tok/s** (real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`, this
+> **Full-model decode tok/s** (real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`, this
 > file's standard prompt/flags, HIP device 1, each config run once except w4a16 `--mtp 0` run twice
 > to confirm reproducibility -- 38.58 vs 38.59 tok/s, within the 3% re-report threshold):
 >
@@ -1685,7 +1685,7 @@ evidence either way, and it was measured on a device-saturating kernel, not a re
 > **Update (2026-09-20, R1 pass -- quantize `gdn.in_proj_z` + `attn.k`/`attn.v`, docs/r9700.md)**:
 > `gdn.in_proj_z`, `attn.k`, `attn.v` (20.6% of every token, previously bf16-only regardless of
 > `--layout`) now join the quantized-linear family. Reconverted the real 64-layer checkpoint to
-> `D:\models\r4dx\qwen38-27b-v3.r4dx` (w4a8/w4a16/mxfp4 body + 4-bit `lm_head` only, `--no-bf16`,
+> `E:\models\r4dx\qwen38-27b-v3.r4dx` (w4a8/w4a16/mxfp4 body + 4-bit `lm_head` only, `--no-bf16`,
 > `--mtp on --vision on`, same `qwen38-27b.kvcalib.json` calibration) -- **45.02 GiB on disk vs the
 > old container's 87.79 GiB (-48.7%)**, converted in 150.2s. Full `ctest --preset win-hip` 30/30
 > passing (HIP device 1). Measured against this file, same prompt/flags as every table below, each
@@ -1756,7 +1756,7 @@ evidence either way, and it was measured on a device-saturating kernel, not a re
 > `build.ps1 -Clean` rebuild (HIP device 1, 107/107 build steps) -- full `ctest --preset win-hip`
 > 30/30 passing in 93.50s, `tools/server/smoke.ps1` all 20 checks passing against the 4-layer test
 > container, then one `r4dx-cli` generation per quantized layout at both `--mtp 0` and `--mtp 3`
-> against the real, unmodified 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`), same prompt as
+> against the real, unmodified 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`), same prompt as
 > every table below. Numbers matched the FIX pass's own measurements within run-to-run noise,
 > confirming Milestone 2 is reproducible end to end from a clean checkout:
 >
@@ -1792,7 +1792,7 @@ evidence either way, and it was measured on a device-saturating kernel, not a re
 
 > **Update (2026-09-19, decode performance pass)**: `src/model/**` (incl. `src/model/attention/**`),
 > `src/kernels/**`, `tools/profile/**`. All six items measured against the real 64-layer container
-> (`D:\models\r4dx\qwen38-27b.r4dx`), same prompt/settings as the table below, HIP device 1.
+> (`E:\models\r4dx\qwen38-27b.r4dx`), same prompt/settings as the table below, HIP device 1.
 >
 > 1. **Quantized attention projections**: `AttentionLayer` now takes `QuantLinear` for `attn.qg`/
 >    `attn.o` and dispatches both through the shared `r4dx::model::ApplyLinear` (`src/model/linear.h`)
@@ -2040,7 +2040,7 @@ intentional precision change, compounded by item 4's retune), not garbling or tr
 > **Update (2026-09-19, Milestone 1 integration pass)**: reran the full pipeline from a clean
 > `build.ps1 -Clean` rebuild (HIP device 1, 84/84 build steps) -- full `ctest --preset win-hip`
 > 24/24 passing in 59.50s, then one `r4dx-cli` generation per layout against the real, unmodified
-> 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`), same prompt/settings as the review-fix
+> 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`), same prompt/settings as the review-fix
 > pass below. Numbers matched within run-to-run noise and generated text was byte-for-byte
 > identical to the review-fix pass's own output (greedy/deterministic): mxfp4 load 9.73s / prefill
 > 400.21 tok/s / decode 24.90 tok/s / 17.79 GiB; w4a16 load 16.01s / prefill 419.44 / decode 29.08
@@ -2078,7 +2078,7 @@ intentional precision change, compounded by item 4's retune), not garbling or tr
 
 Measured 2026-09-19 on the real, complete pipeline: `r4dx-cli` (src/cli/main.cpp) driving
 `r4dx::model::Model` (src/model/model.{h,cpp}) against the real 64-layer, full-vocab container
-`D:\models\r4dx\qwen38-27b.r4dx` (87.79 GiB on disk, all four quantized body layouts plus bf16 for
+`E:\models\r4dx\qwen38-27b.r4dx` (87.79 GiB on disk, all four quantized body layouts plus bf16 for
 every linear, MTP + vision passthrough tensors present but unused by this milestone), built from
 the real `C:\AI\models\Qwen3.8-27B` checkpoint. All runs on HIP device 1 (`$env:HIP_VISIBLE_DEVICES
 ='1'`) on the single AMD Radeon AI PRO R9700 (gfx1201, 31.86 GiB VRAM reported by `hipInfo`).
@@ -2088,7 +2088,7 @@ below):
 
 ```
 $env:HIP_VISIBLE_DEVICES='1'
-build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b.r4dx --layout <layout> ^
+build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\qwen38-27b.r4dx --layout <layout> ^
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." ^
     --max-tokens 128 --temperature 0 --max-ctx 2048 --stats
 ```
@@ -2297,7 +2297,7 @@ anticipated) but was not done here given the time budget -- see this Attention c
 `AttnConfig`/`AttnWeights` structs would need to grow to carry `QuantLinear` instead of raw
 `const uint16_t*`, and `tests/model/attention/test_attn_layer`'s own link graph (it does not
 currently link `r4dx_model`) would need adjusting too. Every layout's real container does carry
-the bf16 tensors for these two linears (confirmed against `D:\models\r4dx\qwen38-27b.r4dx`'s own
+the bf16 tensors for these two linears (confirmed against `E:\models\r4dx\qwen38-27b.r4dx`'s own
 tensor names), so this is a precision/throughput interim choice, not a missing-data bug -- 16 of
 64 layers' attention projections run at full bf16 precision under every `--layout`, which likely
 also explains part of why the quantized layouts' generated text stays as fluent as bf16's above
@@ -2344,7 +2344,7 @@ blocker-severity bugs (a swapped `fc` input concat order, and an MTP KV cache re
 round instead of built in lockstep with the real sequence) that explained the original pass's
 0-1.2% acceptance and "net slowdown" conclusion; both are now fixed (`docs/mtp.md`'s "Incident"
 section has the full writeup). Summary here for cross-reference with the tables above: `--mtp
-{0,1,2,3,4}`, real 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`, which already carries
+{0,1,2,3,4}`, real 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`, which already carries
 `mtp.*` weights in all four layouts -- no reconversion needed), greedy, this file's own
 prompt/settings:
 

@@ -36,7 +36,7 @@ cover every layer unless `--allow-partial` (a missing layer silently becomes des
 Usage (reference venv; GPU runs need the user's go-ahead, device 1 by default):
 
     $env:HIP_VISIBLE_DEVICES='1'; D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe tools\\reference\\gemma\\kv_calibrate_full.py `
-        --gen-file D:\\models\\r4dx\\huihui-gemma\\corpus\\samples.jsonl --out D:\\models\\r4dx\\huihui-gemma\\kvcalib.json
+        --gen-file <models root>\\r4dx\\huihui-gemma\\corpus\\samples.jsonl --out <models root>\\r4dx\\huihui-gemma\\kvcalib.json
 
 CPU dry runs (no GPU; `--device cpu` hides every GPU before torch is imported):
 
@@ -70,6 +70,7 @@ import torch  # noqa: E402
 from gemma.arch import FULL, GemmaArch  # noqa: E402
 from gemma.common_gemma import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    GEMMA_OUT_DIR,
     resolve_device,
     sha256_file,
 )
@@ -82,8 +83,8 @@ TAIL_PERCENTILE = 99.99
 #: Largest |values| kept per (layer, head, tensor) so the 99.99th percentile is exact: it needs 0.01% of the
 #: N = tokens x head_dim elements of a head (full layers: 4096 x 512 x ~100 sequences = 2e8 -> 2e4 values).
 TOP_BUFFER = 65536
-DEFAULT_GEN = Path(r"D:\models\r4dx\huihui-gemma\corpus\samples.jsonl")
-DEFAULT_OUT = Path(r"D:\models\r4dx\huihui-gemma\kvcalib.json")
+DEFAULT_GEN = GEMMA_OUT_DIR / "corpus" / "samples.jsonl"
+DEFAULT_OUT = GEMMA_OUT_DIR / "kvcalib.json"
 
 
 class HeadStats:

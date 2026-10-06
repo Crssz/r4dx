@@ -1,12 +1,12 @@
 # tools/prefill/warm_delta.ps1 -- starts r4dx-server on one device (or -Tp 2), runs warm_delta.py
 # (cold 32k/64k prompt, then a ~4k-token user turn appended through prefix reuse) and stops the server.
 #
-#   .\tools\prefill\warm_delta.ps1 -Device 1 -OutDir D:\models\r4dx\prefill-m0\profile\warm-tp1
+#   .\tools\prefill\warm_delta.ps1 -Device 1 -OutDir <models-root>\r4dx\prefill-m0\profile\warm-tp1
 param(
   [int]$Device = 1,
   [ValidateSet(1, 2)][int]$Tp = 1,
   [string]$Bases = '32k,64k',
-  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
   [string]$Layout = 'trellis',
   [Parameter(Mandatory = $true)][string]$OutDir,
   [int]$Port = 8094,

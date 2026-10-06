@@ -1642,7 +1642,7 @@ because no phase changes a TP=1 byte: the TP=2 tuning rows live in their own tab
 | Row | Command (production container = the Huihui trellis mix4.5m with `-Layout trellis` since 2026-09-29, base v6 w4a16 before; row 6 always the 4-layer `l4-allmtp`) |
 |---|---|
 | 1 | standard protocol, plain greedy |
-| 2 | standard protocol + `--dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` |
+| 2 | standard protocol + `--dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` |
 | 3 | standard protocol + `--mtp 3` |
 | 4 | `--temperature 0.7 --top-k 20 --top-p 0.8 --seed 1` plain |
 | 5 | row 4 + `--dflash ... --dflash-k 7` |
@@ -1693,7 +1693,7 @@ four layouts) is EQUAL against both baselines.
 ```powershell
 $py = "<reference venv>\Scripts\python.exe"
 $tf = "build\win-hip\tests\model\tool_teacher_forced_logprobs.exe"
-$m  = "D:/models/r4dx/qwen38-27b-v6.r4dx"
+$m  = "E:/models/r4dx/qwen38-27b-v6.r4dx"
 $tok = "tools\reference\kl_corpus\tokens.json"
 # TP=1 (device 1)
 $env:HIP_VISIBLE_DEVICES='1'
@@ -1721,7 +1721,7 @@ against a stale reference.
 **G4 on the production container (2026-09-29, the Huihui trellis mix4.5m, `--layout trellis`).** The
 block above is the base v6 w4a16 record (its reference `kl_out\ref` is gone; `kl-canon\ref` is still on disk, but it is the base model's and no base container is left to score against it). The
 same measurement on the production container, `tokens_canon.json`, `--max-ctx 4096 --vision off`, against
-the model's own bf16 reference `D:\models\r4dx\huihui\kl-ref` (`tools\quant2\kl_rung4.ps1` is the TP=1
+the model's own bf16 reference `E:\models\r4dx\huihui\kl-ref` (`tools\quant2\kl_rung4.ps1` is the TP=1
 gate, with `--tp 2 --tp-mode emulate` added to the tool call for the emulated one):
 
 | run | mean KL vs bf16 | top-1 |
@@ -1731,7 +1731,7 @@ gate, with `--tp 2 --tp-mode emulate` added to the tool call for the emulated on
 | TP=2 emulated against the TP=1 dump | 0.00089 | 98.85% agreement |
 
 The v6 gate (KL <= 1.13 x TP=1's, top-1 >= TP=1 - 0.5 points) holds by this measure too; the emulate dump is
-at `D:\models\r4dx\huihui\rebase\kl-tp2emu-gpu0` (run on device 0, tool + kl_report logs alongside). The
+at `E:\models\r4dx\huihui\rebase\kl-tp2emu-gpu0` (run on device 0, tool + kl_report logs alongside). The
 frozen `tests/model/test_tp_emulation.cpp` distances on this container (MTP replays 4.02e-2, DFlash
 replays 3.88e-2, vision logits 1.46e-2 against 5e-2) and the VRAM the emulated ranks use (19.96 / 22.58 /
 20.50 GiB) are recorded in that file's constants.
@@ -1831,7 +1831,7 @@ Gates (production server stopped):
 .\tests\run_tests.ps1                                              # incl. test_tp_loader
 powershell -File tools\tp\tp1_identity.ps1 -Baseline build\baseline -Candidate build\win-hip   # G2
 $env:HIP_VISIBLE_DEVICES='1'
-$m  = "D:\models\r4dx\qwen38-27b-v6.r4dx"; $sb = "build\win-hip\tests\model\tool_tp_step_bench.exe"
+$m  = "E:\models\r4dx\qwen38-27b-v6.r4dx"; $sb = "build\win-hip\tests\model\tool_tp_step_bench.exe"
 & $sb --model $m --layout w4a16 --max-ctx 2048 --tp1 --tokens 128 --repeats 3 --json build\logs\tp_step_tp1.json
 foreach ($r in 0,1) { & $sb --model $m --layout w4a16 --max-ctx 2048 --rank $r --tokens 128 --repeats 3 `
     --json build\logs\tp_step_r$r.json }
@@ -1904,7 +1904,7 @@ Gates (production server stopped):
 powershell -File tools\tp\tp1_identity.ps1 -Baseline build\baseline -Candidate build\win-hip   # G2
 # G4: section 10.4 commands (TP=1 and emulate)
 $env:HIP_VISIBLE_DEVICES='1'
-build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --vision off `
+build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --vision off `
   --think off --temperature 0 --max-tokens 64 --max-ctx 2048 --tp 2 --tp-mode emulate `
   --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences."   # smoke: coherent text
 ```
@@ -1926,14 +1926,14 @@ Gates (production server on device 1 stopped):
 Remove-Item env:HIP_VISIBLE_DEVICES
 # G6: section 10.4 "G6 [P4]" block (regenerates the emulation reference with this binary)
 # G7 (twice; plus 3 identical greedy SHA-256):
-build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --vision off `
+build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --vision off `
   --think off --temperature 0 --max-tokens 256 --max-ctx 2048 --stats --tp 2 `
   --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences."
 # sampled reproducibility: same seed twice -> same text
 build\win-hip\src\cli\r4dx-cli.exe <same> --temperature 0.7 --top-k 20 --top-p 0.8 --seed 1
 # G8, staged (10.5; soak.ps1 stops at the first TDR): 5 minutes, then 60, each with its own log
-.\tools\tp\soak.ps1 --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 5 --max-ctx 8192 --json build\logs\tp_soak_5min.jsonl
-.\tools\tp\soak.ps1 --model D:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 60 --max-ctx 8192 --json build\logs\tp_soak_60min.jsonl
+.\tools\tp\soak.ps1 --model E:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 5 --max-ctx 8192 --json build\logs\tp_soak_5min.jsonl
+.\tools\tp\soak.ps1 --model E:\models\r4dx\qwen38-27b-v6.r4dx --layout w4a16 --minutes 60 --max-ctx 8192 --json build\logs\tp_soak_60min.jsonl
 $env:HIP_VISIBLE_DEVICES='1'; powershell -File tools\tp\tp1_identity.ps1 -Baseline build\baseline -Candidate build\win-hip  # G2
 ```
 Pass: G6 all hashes equal; decode >= 52.2 tok/s in both runs; 3/3 greedy SHA equal; seeded sampled
@@ -1965,8 +1965,8 @@ Done (N75: identical tokens at TP=1 and TP=2; the server is not in G2's matrix).
 Gates:
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES
-$cli = "build\win-hip\src\cli\r4dx-cli.exe"; $m = "D:\models\r4dx\qwen38-27b-v6.r4dx"
-$d = "D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx"
+$cli = "build\win-hip\src\cli\r4dx-cli.exe"; $m = "E:\models\r4dx\qwen38-27b-v6.r4dx"
+$d = "E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx"
 # G9 (twice)
 & $cli --model $m --layout w4a16 --vision off --think off --temperature 0 --max-tokens 256 --max-ctx 2048 `
   --stats --tp 2 --dflash $d --dflash-k 7 --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences."
@@ -3249,8 +3249,8 @@ it refines.
   - **Prefill, 2048-token prompt (N57):** 1520-1560 tok/s unbounded, -0.5% with the default.
   - **`tool_teacher_forced_logprobs --tp 2` (real)** on the g64 `l4-allmtp`, `english_prose`:
     1,023 rows in 3.98 s (3.9 ms/row), max |logsumexp| 4.8e-7. (The group-128 container under
-    `D:\models\r4dx` is refused by name by this g64 build; the tests' `ContainerPath` picks
-    `D:\models\r4dx\g64`.)
+    `E:\models\r4dx` is refused by name by this g64 build; the tests' `ContainerPath` picks
+    `E:\models\r4dx\g64`.)
   - **Soak smoke:** v6, 3 iterations of 2048-token prompts: PASS (prefill 1442-1456 tok/s, decode
     58.3-60.5 tok/s, canary equal, VRAM drift 0 MiB, 0 collective allocations). `soak.ps1` end to end
     on the 4-layer container (4 iterations): PASS, TDR check clean; and its failure path (a soak

@@ -58,7 +58,7 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
 
     $env:HIP_VISIBLE_DEVICES = '1'
     <venv>\\Scripts\\python.exe tools\\reference\\kv_fakequant_golden.py `
-        --kv-calib D:\\models\\r4dx\\qwen38-27b.kvcalib-full.json --mode both `
+        --kv-calib <models root>\\r4dx\\qwen38-27b.kvcalib-full.json --mode both `
         --tokens tools\\reference\\kl_corpus\\tokens.json `
         --out-dir tools\\reference\\kl_out\\kvfq-full-both
 
@@ -80,6 +80,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    MODELS_ROOT,
     load_ref_tokenizer,
     resolve_device,
     sha256_file,
@@ -97,7 +98,7 @@ FP8_E4M3_MIN_NORMAL_EXP = -6
 FP8_E4M3_MANTISSA_BITS = 3
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_KV_CALIB = Path(r"D:\models\r4dx\qwen38-27b.kvcalib-full.json")
+DEFAULT_KV_CALIB = MODELS_ROOT / "r4dx" / "qwen38-27b.kvcalib-full.json"
 
 
 def repo_relative(path: Path) -> str:

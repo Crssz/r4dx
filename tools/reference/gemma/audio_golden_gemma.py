@@ -42,10 +42,10 @@ import torch  # noqa: E402
 assert not torch.cuda.is_available(), "audio_golden_gemma.py is CPU-only; a GPU is visible"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import raw_safetensors_header, raw_safetensors_read, save_golden  # noqa: E402
+from common import MODELS_ROOT, raw_safetensors_header, raw_safetensors_read, save_golden  # noqa: E402
 
-MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated"))
-TOK_DIR = Path(os.environ.get("R4DX_TOKENIZER_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok"))
+MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR", str(MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated")))
+TOK_DIR = Path(os.environ.get("R4DX_TOKENIZER_DIR", str(MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated-tok")))
 W_NAME = "model.embed_audio.embedding_projection.weight"
 SPT = 640
 BOA, AUDIO, EOA = 256000, 258881, 258883

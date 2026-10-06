@@ -3,7 +3,7 @@
 Reads only the header: from a local model.safetensors, or from the HF hub with an
 HTTP range request (no weights downloaded). CPU only, no torch needed.
 
-  python dump_header.py --local D:\\models\\Huihui-gemma-4-12B-it-abliterated --out tensor_names.json
+  python dump_header.py --local <models root>\\Huihui-gemma-4-12B-it-abliterated --out tensor_names.json
   python dump_header.py --repo huihui-ai/Huihui-gemma-4-12B-it-abliterated --out tensor_names.json
 """
 import argparse

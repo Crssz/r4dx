@@ -3,8 +3,8 @@
 # tools\quant2\trellis_convert.ps1 (Qwen-only, unchanged). CPU only (the converter's reconstruction check is
 # --trellis-verify full); it never launches a GPU kernel.
 #
-#   .\tools\gemma\trellis_convert_gemma.ps1 -Oracle D:\models\r4dx\huihui-gemma\trellis-q\mix4.5m `
-#       -Output D:\models\r4dx\huihui-gemma\trellis-mix45m.r4dx
+#   .\tools\gemma\trellis_convert_gemma.ps1 -Oracle <models-root>\r4dx\huihui-gemma\trellis-q\mix4.5m `
+#       -Output <models-root>\r4dx\huihui-gemma\trellis-mix45m.r4dx
 #
 # -Rotate / -RotationSeed / -RotationFile MUST be the ones the oracle was quantized with: the converter
 # refuses a manifest whose rotation fingerprint (kind, seed, tensors_sha256) differs, and a rotated manifest
@@ -16,13 +16,13 @@
 param(
   [Parameter(Mandatory = $true)][string]$Oracle,
   [Parameter(Mandatory = $true)][string]$Output,
-  [string]$Checkpoint = 'D:\models\Huihui-gemma-4-12B-it-abliterated',
-  [string]$HessianDir = 'D:\models\r4dx\huihui-gemma\hessian-v1',
-  [string]$KvCalib = 'D:\models\r4dx\huihui-gemma\kvcalib.json',
-  [string]$RotationFile = 'D:\models\r4dx\huihui-gemma\rotation-q2ab.safetensors',
+  [string]$Checkpoint = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\Huihui-gemma-4-12B-it-abliterated",
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\hessian-v1",
+  [string]$KvCalib = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\kvcalib.json",
+  [string]$RotationFile = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\rotation-q2ab.safetensors",
   [string]$Rotate = 'q2ab',
   [int]$RotationSeed = 1,
-  [string]$LogDir = 'D:\models\r4dx\huihui-gemma\logs',
+  [string]$LogDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\logs",
   [string]$Exe = '',
   [int]$Threads = 32,
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })

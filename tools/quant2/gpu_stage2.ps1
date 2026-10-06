@@ -9,8 +9,8 @@
 #      reference's own self-noise (3.9e-4 nats, docs/validation.md) = 7.8e-4.
 #   3. gate G3, the Q1 pilot: tools/quant2/q1_pilot.ps1 -Kl (bf16 reference dump, v6, pilot)
 param(
-  [string]$OutDir = 'D:\models\r4dx\quant2-gpu2',
-  [string]$L4Dir = 'D:\models\r4dx\quant2-l4',
+  [string]$OutDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\quant2-gpu2",
+  [string]$L4Dir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\quant2-l4",
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' })
 )
 $ErrorActionPreference = 'Continue'
@@ -58,7 +58,7 @@ foreach ($r in 'q2a', 'q2ab') {
 
 Step 'q1_pilot_kl' { & (Join-Path $PSScriptRoot 'q1_pilot.ps1') -Kl -Tool $tool }
 foreach ($n in 'v6', 'q1pilot') {
-  $f = "D:\models\r4dx\kl-q1\kl_$n.json"
+  $f = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\kl-q1\kl_$n.json"
   if (Test-Path $f) {
     $o = (Get-Content $f -Raw | ConvertFrom-Json).overall
     $summary["q1_$n"] = [ordered]@{ mean_kl = $o.mean_kl; top1_pct = $o.top1_agreement_pct }

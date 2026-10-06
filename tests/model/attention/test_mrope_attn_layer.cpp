@@ -42,7 +42,7 @@
 #define R4DX_GOLDEN_MROPE_PATH "tools/reference/golden_out/mrope_layer_003.safetensors"
 #endif
 #ifndef R4DX_BF16_CONTAINER_PATH
-#define R4DX_BF16_CONTAINER_PATH "D:/models/r4dx/qwen38-27b-l4-bf16.r4dx"
+#define R4DX_BF16_CONTAINER_PATH "r4dx/qwen38-27b-l4-bf16.r4dx"
 #endif
 
 // The container path arrives as a string literal (this file's #ifndef default, or the -D in

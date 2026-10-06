@@ -28,7 +28,7 @@
 .PARAMETER Model
   Path to a .r4dx container with mtp.* weights (required for the --mtp 3 rows). Default: the
   production container, chosen by tools\r4dx_containers.ps1:
-  D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated trellis mix4.5m,
+  <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated trellis mix4.5m,
   layout trellis).
 
 .PARAMETER Layouts

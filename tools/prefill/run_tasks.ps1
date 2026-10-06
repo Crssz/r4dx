@@ -6,8 +6,8 @@
 # off, waits for /health, runs run_tasks.py (resumable: results.jsonl in -OutDir), prints the score
 # table, and always stops the server it started. Server stdout/stderr go to -OutDir\server.*.log.
 #
-#   .\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k,32k -OutDir D:\models\r4dx\prefill-m0\runs\dense-8k32k
-#   .\tools\prefill\run_tasks.ps1 -Tp 2 -Lengths 128k -OutDir D:\models\r4dx\prefill-m0\runs\dense-tp2-128k
+#   .\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k,32k -OutDir <models-root>\r4dx\prefill-m0\runs\dense-8k32k
+#   .\tools\prefill\run_tasks.ps1 -Tp 2 -Lengths 128k -OutDir <models-root>\r4dx\prefill-m0\runs\dense-tp2-128k
 #   .\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k -Limit 1 -OutDir ...\smoke      (1 item per task)
 #   .\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k,32k,64k,128k -MaxTokens 1 -Task niah_single `
 #       -OutDir ...\ttft     (a pure TTFT sweep: one generated token per item)
@@ -21,9 +21,9 @@ param(
   [string[]]$Task = @(),
   [int]$Limit = 0,
   [int]$MaxTokens = 0,
-  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
   [string]$Layout = 'trellis',
-  [string]$TasksDir = 'D:\models\r4dx\prefill-m0\tasks',
+  [string]$TasksDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\prefill-m0\tasks",
   [Parameter(Mandatory = $true)][string]$OutDir,
   [int]$Port = 8093,
   [string]$Server = '',

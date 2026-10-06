@@ -72,7 +72,7 @@ Input JSON (group_sweep.ps1's candidates.json):
 linears land at. Extra keys are ignored. `budget_gib` is the TOTAL weight budget (docs/quant2.md gate
 G8: weight bytes <= v6), so the default -- the baseline's own weights -- is "equal bytes".
 
-  python tools/quant2/alloc_groups.py D:\\models\\r4dx\\q3-sweep\\candidates.json
+  python tools/quant2/alloc_groups.py <models root>\\r4dx\\q3-sweep\\candidates.json
   python tools/quant2/alloc_groups.py candidates.json --budget-gib 16.5 --cliff-ratio 4 --json-out picks.json
   python tools/quant2/alloc_groups.py --self-test
 """

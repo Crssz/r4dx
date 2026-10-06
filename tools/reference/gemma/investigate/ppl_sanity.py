@@ -27,7 +27,9 @@ import torch  # noqa: E402
 
 assert torch.cuda.is_available() is False, "GPU visible: refusing to run"
 
-TOK_DIR = r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok"
+from gemma.common_gemma import DEFAULT_TOKENIZER_DIR, GEMMA_OUT_DIR  # noqa: E402
+
+TOK_DIR = str(DEFAULT_TOKENIZER_DIR)
 CORPUS = Path(__file__).resolve().parents[2] / "kl_corpus" / "tokens_gemma.json"
 
 PROSE = (
@@ -132,7 +134,7 @@ def main():
             r["ppl_excl_last2"] = math.exp(float(nll[s - 1:-2].mean()))
         out["cases"][name] = r
         print(f"{a.impl} {name}: T={len(ids)} scored={sel.numel()} ppl={ppl:.2f} ({time.perf_counter()-t1:.0f}s)", flush=True)
-    p = a.out or Path(f"D:/models/r4dx/huihui-gemma/kl/ppl_sanity_{a.impl}_{a.tag}.json")
+    p = a.out or GEMMA_OUT_DIR / "kl" / f"ppl_sanity_{a.impl}_{a.tag}.json"
     p.parent.mkdir(parents=True, exist_ok=True)
     json.dump(out, open(p, "w"))
     print("wrote", p)

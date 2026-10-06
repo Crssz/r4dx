@@ -33,7 +33,7 @@ aggregated over the rows predicting model-turn tokens only.
 Gemma M1 gate (docs/gemma4-plan.md 9.9), against the fp32 truth and relative to the noise of stock HF bf16 sdpa:
 
     <venv>\\Scripts\\python.exe tools\\reference\\kl_report.py --gate gemma-fp32 `
-        --truth-dir D:\\models\\r4dx\\huihui-gemma\\kl\\fp32\\truth --noise-dir ...\\fp32\\bf16sdpa `
+        --truth-dir <models root>\\r4dx\\huihui-gemma\\kl\\fp32\\truth --noise-dir ...\\fp32\\bf16sdpa `
         --test-dir <r4dx dump dir> --tokens tools\\reference\\kl_corpus\\chat_gemma.json `
         --raw-tokens tools\\reference\\kl_corpus\\tokens_gemma.json --raw-max-tokens 512 --out gate.json
     (+ --base-dir <r4dx bf16-container dump> for a quantized container: judged by the KL increment <= 0.01)

@@ -7,13 +7,14 @@
 //       parses, the config / layer geometry / EmbedScale are right, the tensor table matches, and every
 //       refusal names its cause (a missing tensor, a wrong shape, a stray attn.v on a full layer, a Qwen-style
 //       metadata, a non-plain norm_kind, --layer limits);
-//   (b) the real D:\models\r4dx\huihui-gemma\bf16.r4dx header (R4DX_GEMMA_BF16_CONTAINER overrides; SKIP when
+//   (b) the real <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16.r4dx header (R4DX_GEMMA_BF16_CONTAINER overrides; SKIP when
 //       absent): 48 layers, 715 tensors, every table entry, the 8 full layers without attn.v, the 131072
 //       default context and the 262144 opt-in;
 //   (c) rotation metadata: the real config with a Gemma option-A rotation block (hidden 3840 = 15 x 256) parses
 //       to post_norm_rotate / has_o_full, with o_full_elems 8192, and a Qwen-style (no out_fold) block is refused.
 //   (d) rotated TRELLIS (docs/gemma4-plan.md M1-31): the loader's CheckTrellisChoice accepts trellis + rotation for Gemma\r\n//       (allow_rotated) and still refuses it by default (Qwen); and, from the rot-q2ab / rot-q2a containers the real\r\n//       r4dx-convert wrote in convert_gemma_trellis (R4DX_GEMMA_TRELLIS_KEEP), Inspect + the trellis metadata /\r\n//       tensor checks pass with both blocks present. SKIP when those files are absent.\r\n// No GPU work: nothing here calls a HIP function.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -265,7 +266,7 @@ void TestTinyConverted() {
 void TestRealContainer() {
   std::printf("---- (b) the real Huihui bf16.r4dx ----\n");
   const char* env = std::getenv("R4DX_GEMMA_BF16_CONTAINER");
-  const std::string path = env != nullptr && *env != '\0' ? env : "D:\\models\\r4dx\\huihui-gemma\\bf16.r4dx";
+  const std::string path = env != nullptr && *env != '\0' ? env : r4dx::ModelsPath("r4dx/huihui-gemma/bf16.r4dx");
   if (!fs::exists(path)) {
     std::printf("SKIP: %s not present (part (b) not run)\n", path.c_str());
     return;

@@ -16,7 +16,7 @@ Raw text, no chat template, no BOS (the checkpoint adds none), canonical tokeniz
 
 Usage:
   python tools\\prefill\\make_kl_tokens.py --lengths 8k,32k,64k,128k `
-      --out D:\\models\\r4dx\\prefill-m0\\kl\\tokens_long.json
+      --out <models root>\\r4dx\\prefill-m0\\kl\\tokens_long.json
 """
 
 from __future__ import annotations

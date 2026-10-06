@@ -8,7 +8,7 @@
   Only HIP device 1 may be used (project GPU rule) -- sets HIP_VISIBLE_DEVICES=1 before starting
   r4dx-server.exe; the one exception is -Tp 2 in real mode, which uses both GPUs by design (docs/tp.md
   9.2) under a TDR watch (see -Tp). Defaults to the 4-layer test container (qwen38-27b-l4-bf16.r4dx, --layout
-  w4a16, the group-64 copy in D:\models\r4dx\g64 -- see -Model) -- that model's
+  w4a16, the group-64 copy in <models-root>\r4dx\g64 -- see -Model) -- that model's
   text is nonsense (4 of 64 layers, arbitrary quantized-layout weights on a model that was never actually trained/converted for real use at 4 layers), so this
   script only checks response/SSE *shapes* and token counts, never the generated text itself.
   Pass -Model/-Layout to point at the real 64-layer container instead for a real-answer smoke run
@@ -16,10 +16,10 @@
 
 .PARAMETER Model
   Path to a .r4dx container. Default: the 4-layer test container qwen38-27b-l4-bf16.r4dx packed at
-  w4a16 group 64, D:\models\r4dx\g64\qwen38-27b-l4-bf16.r4dx (tools\r4dx_containers.ps1);
+  w4a16 group 64, <models-root>\r4dx\g64\qwen38-27b-l4-bf16.r4dx (tools\r4dx_containers.ps1);
   R4DX_TEST_CONTAINER_DIR, when set, overrides the directory exactly as it does for ctest
   (tests/model/test_container_path.h). For a real-answer run pass the production container:
-  D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated trellis mix4.5m,
+  <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui abliterated trellis mix4.5m,
   with -Layout trellis).
 
 .PARAMETER Layout
@@ -38,7 +38,7 @@
 .PARAMETER Mtp
   Passed to r4dx-server's --mtp (r4dx::model::ModelOptions::mtp_draft_k). 0 (default) disables MTP
   entirely. >0 requires -Model to be an MTP-converted container (docs/mtp.md's mtp.* weights) --
-  e.g. D:\models\r4dx\g64\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
+  e.g. <models-root>\r4dx\g64\qwen38-27b-l4-mtp.r4dx (4-layer test container) or the real 64-layer
   container with
   -Mtp 3 (this stage's own required verification runs).
 
@@ -52,7 +52,7 @@
 .PARAMETER Vision
   Exercises image content parts end to end (docs/vision.md, docs/server.md's "Images") against a
   REAL vision-capable container -- pass -Model/-Layout/-Layers -1 pointed at one (e.g.
-  D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx with -Layout trellis on the default build). Generates its own tiny synthetic PNGs
+  <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx with -Layout trellis on the default build). Generates its own tiny synthetic PNGs
   with System.Drawing (no files committed to the repo): a shapes image for a description check, a rendered-text image for
   an OCR check, then two-images-in-one-request, image+tools, image+thinking, streaming, multi-turn
   prefix reuse (turn 2 must NOT re-encode: no `timings.image_n` key), different-image-same-text
@@ -119,15 +119,15 @@
 .EXAMPLE
   .\tools\server\smoke.ps1 -Tp 2 -TpFault        # recovery after an injected all-reduce timeout
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Tp 2 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -TpFault
+  .\tools\server\smoke.ps1 -Tp 2 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Dflash <models-root>\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -TpFault
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1
+  .\tools\server\smoke.ps1 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\g64\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3
+  .\tools\server\smoke.ps1 -Model <models-root>\r4dx\g64\qwen38-27b-l4-mtp.r4dx -Layout w4a16 -Mtp 3
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Mtp 3
+  .\tools\server\smoke.ps1 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Mtp 3
 .EXAMPLE
-  .\tools\server\smoke.ps1 -Model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -ToolRoundTrip
+  .\tools\server\smoke.ps1 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -ToolRoundTrip
 #>
 [CmdletBinding()]
 param(

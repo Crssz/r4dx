@@ -9,7 +9,7 @@
 //
 // Zip64 matters here: numpy writes `allowZip64=True`, so even a 10 MiB archive carries 0xFFFFFFFF
 // size placeholders in the local file header with the real 64-bit sizes in the 0x0001 extra field
-// (verified against D:\models\r4dx\qwen38-27b.imatrix.npz, whose very first member is written that
+// (verified against <R4DX_MODELS_ROOT>\r4dx\qwen38-27b.imatrix.npz, whose very first member is written that
 // way). Reading only the 32-bit fields would produce a 4 GiB "size" and a nonsense walk.
 #pragma once
 

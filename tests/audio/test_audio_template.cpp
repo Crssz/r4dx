@@ -2,8 +2,9 @@
 // <|audio|> (258881) per clip. Regression for the review finding that the engine emitted type "input_audio" which
 // the real chat_template.jinja ignores (it only matches 'audio'), so every audio request got a 400.
 // Part 1 (always): a minimal template with the real template's matching rule. Part 2: the real template + tokenizer
-// from R4DX_GEMMA_TOKENIZER_DIR (default D:/models/Huihui-gemma-4-12B-it-abliterated); skipped if absent.
+// from R4DX_GEMMA_TOKENIZER_DIR (default <R4DX_MODELS_ROOT>/Huihui-gemma-4-12B-it-abliterated); skipped if absent.
 #include <cstdio>
+#include "r4dx/models_root.h"
 #include <cstdlib>
 #include <fstream>
 #include <string>
@@ -48,7 +49,7 @@ int main() {
   bad[0]["content"][1]["type"] = "input_audio";
   CHECK(Count(t.render(bad, false), "<|audio|>") == 0, "input_audio is dropped by the template");
 
-  std::string dir = "D:/models/Huihui-gemma-4-12B-it-abliterated";
+  std::string dir = r4dx::ModelsPath("Huihui-gemma-4-12B-it-abliterated");
   if (const char* e = std::getenv("R4DX_GEMMA_TOKENIZER_DIR")) dir = e;
   std::ifstream probe(dir + "/chat_template.jinja");
   if (!probe) {

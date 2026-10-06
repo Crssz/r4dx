@@ -12,9 +12,9 @@ Both sides must have scored the same tokens (sidecar sha256_of_token_ids_json) w
 first_row/rows; mismatches are refused.
 
 Usage:
-  python tools\\prefill\\kl_compare.py --ref D:\\models\\r4dx\\prefill-m0\\kl\\dense `
-      --test D:\\models\\r4dx\\prefill-m0\\kl\\variant `
-      --tokens D:\\models\\r4dx\\prefill-m0\\kl\\tokens_long.json [--json out.json]
+  python tools\\prefill\\kl_compare.py --ref <models root>\\r4dx\\prefill-m0\\kl\\dense `
+      --test <models root>\\r4dx\\prefill-m0\\kl\\variant `
+      --tokens <models root>\\r4dx\\prefill-m0\\kl\\tokens_long.json [--json out.json]
 A dense-vs-dense rerun gives the run-to-run noise floor (0 when the engine is deterministic).
 """
 

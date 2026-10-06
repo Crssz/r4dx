@@ -19,11 +19,11 @@
 # "^lm_head$=32" stays; --lm-head w4a16 instead of 4bit (--layout trellis loads the w4a16 head, so the
 # other-layout copies of the head would be dead weight). -LmHead bf16 writes the A2 twin (same body bytes).
 #
-#   .\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
-#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-k4m.r4dx
+#   .\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+#   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -Output <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-k4m.r4dx
 #   .\tools\quant2\trellis_convert.ps1 -Oracle K4m -LmHead bf16 -Output <...>-k4m-lmbf16.r4dx
 #
-# Every default below is the HUIHUI abliterated model's (docs/huihui.md, D:\models\r4dx\huihui\RECIPE.md):
+# Every default below is the HUIHUI abliterated model's (docs/huihui.md, <models-root>\r4dx\huihui\RECIPE.md):
 # its checkpoint, hessian-v2, trellis-q oracle dir, KL runs and imatrix / kvcalib. The base Qwen3.8-27B
 # files were retired on 2026-09-29 (docs/huihui.md); another model needs every path passed explicitly.
 #
@@ -42,14 +42,14 @@ param(
   [Parameter(Mandatory = $true)][string]$Oracle,          # a directory under -OracleRoot, or a path
   [Parameter(Mandatory = $true)][string]$Output,
   [ValidateSet('w4a16', 'bf16')][string]$LmHead = 'w4a16',
-  [string]$OracleRoot = 'D:\models\r4dx\huihui\trellis-q',
-  [string]$KlRoot = 'D:\models\r4dx\huihui\kl',
+  [string]$OracleRoot = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\trellis-q",
+  [string]$KlRoot = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl",
   [string]$ManifestSha256 = '',
-  [string]$Checkpoint = 'D:\models\Huihui-Qwen3.8-27B-abliterated',
-  [string]$HessianDir = 'D:\models\r4dx\huihui\hessian-v2',
-  [string]$KvCalib = 'D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json',
-  [string]$Imatrix = 'D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz',
-  [string]$LogDir = 'D:\models\r4dx\huihui\logs',
+  [string]$Checkpoint = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\Huihui-Qwen3.8-27B-abliterated",
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\hessian-v2",
+  [string]$KvCalib = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json",
+  [string]$Imatrix = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl.imatrix.npz",
+  [string]$LogDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\logs",
   [string]$Exe = '',
   [int]$Threads = 32,
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
@@ -92,7 +92,10 @@ wo = json.load(open(sys.argv[1], encoding="utf-8")).get("weights_override") or {
 m, s = wo.get("manifest"), wo.get("manifest_sha256")
 if not s or not m:
     sys.exit("reference_run.json has no weights_override.manifest / manifest_sha256")
-if os.path.normcase(os.path.abspath(m)) != os.path.normcase(os.path.abspath(sys.argv[2])):
+def canon(p):
+    # junction-aware: a manifest recorded under the old D:\models junction still matches its E:\models target
+    return os.path.normcase(os.path.realpath(p))
+if canon(m) != canon(sys.argv[2]):
     sys.exit("its KL run measured " + m + ", not " + sys.argv[2])
 print(s)
 '@

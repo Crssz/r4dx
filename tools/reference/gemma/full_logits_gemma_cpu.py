@@ -24,7 +24,7 @@ GPU on Windows; "-1" does) and `torch.cuda.is_available()` must be False.
     D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe tools\\reference\\gemma\\full_logits_gemma_cpu.py `
         --variant truth --tokens tools\\reference\\kl_corpus\\chat_gemma.json `
         --tokens tools\\reference\\kl_corpus\\tokens_gemma.json --max-tokens 512 `
-        --segment-raw cpp_source,thai_prose --out-dir D:\\models\\r4dx\\huihui-gemma\\kl\\fp32\\truth
+        --segment-raw cpp_source,thai_prose --out-dir <models root>\\r4dx\\huihui-gemma\\kl\\fp32\\truth
 """
 
 from __future__ import annotations

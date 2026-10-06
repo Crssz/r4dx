@@ -10,8 +10,8 @@
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
 //   build\win-hip\tests\vision\tool_vision_chat.exe
-//       [--model D:/models/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx]
-//       --tokenizer D:/models/Huihui-Qwen3.8-27B-abliterated --layout trellis --image pic.png
+//       [--model <R4DX_MODELS_ROOT>/r4dx/huihui-qwen38-27b-abl-trellis-mix45m.r4dx]
+//       --tokenizer <R4DX_MODELS_ROOT>/Huihui-Qwen3.8-27B-abliterated --layout trellis --image pic.png
 //       --prompt "Describe this image." [--max-tokens 128] [--mtp 3] [--dflash <container> --k 7]
 //       [--turn2 "..."] [--show-positions] [--dump-prompt out.json]
 //
@@ -27,6 +27,7 @@
 //   * `--mtp` / `--dflash`, whose draft and verify steps have to rope at `sequence index + delta`
 //     while their KV slots stay the sequence index.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -137,7 +138,7 @@ void PrintPositions(const std::vector<int32_t>& tokens,
 
 int main(int argc, char** argv) {
   std::string model_path = r4dx_test::ProductionTargetPath();  // group-matched production container
-  std::string tokenizer_dir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
+  std::string tokenizer_dir = r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated");
   std::string layout = r4dx_test::ProductionLayoutName();
   std::string prompt = "Describe this image.";
   std::string turn2;

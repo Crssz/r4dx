@@ -81,8 +81,8 @@ using r4dx::model::QuantLinear;
 
 namespace {
 
-const char* kDraftBf16 = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx");
-const char* kDraftW4a16 = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-dflash2-w4a16.r4dx");
+const char* kDraftBf16 = r4dx_test::ContainerPath("r4dx/qwen38-27b-dflash2-bf16.r4dx");
+const char* kDraftW4a16 = r4dx_test::ContainerPath("r4dx/qwen38-27b-dflash2-w4a16.r4dx");
 
 int g_failures = 0;
 

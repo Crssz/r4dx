@@ -111,7 +111,7 @@ file, the corpus (names, sha256, token counts), the checkpoint's `config.json` s
 converter audit (reused from `imatrix_capture.audit_converter_source`) and the gate results.
 
 Corpus (defaults): `calib.txt` + `kv_calib_corpus/` (as today) + the first 64 non-overlapping
-2048-token windows of `D:/models/wikitext-2-raw/wiki.train.raw` + 16 x 2048 tokens of this repo's
+2048-token windows of `E:/models/wikitext-2-raw/wiki.train.raw` + 16 x 2048 tokens of this repo's
 C++/HIP/Python sources, **excluding** `src/model/model.cpp` and
 `tools/reference/layer_golden.py` (the `kl_corpus/` excerpts' sources). ~172k tokens. Disk:
 ~51 GiB for the 64 layers (the down tap is 578 MiB packed), + lm_head + MTP. The script prints the
@@ -377,7 +377,7 @@ no entry.
   `--dry-run`) unless the checkpoint's `config.json` sha256 matches the set's and this run's corpus
   matches the recorded one: every source's sha256, token counts, windows and file list. The
   repo-source windows come from the working tree, so a set captured at an older checkout needs
-  `--code-rev <commit>`, which reads them from that commit's tree. `D:\models\r4dx\hessian-v1`
+  `--code-rev <commit>`, which reads them from that commit's tree. `E:\models\r4dx\hessian-v1`
   matches at `--code-rev 34d381a`. The run also refuses a manifest that already has `rms_keys`
   unless `--force` is given, and then it removes the old rms entries before capturing. It refuses
   to merge if `hessian.json` changed during the capture. With `--rms-taps`, a full capture lists the
@@ -444,9 +444,9 @@ tiny random 2-layer Qwen3_5 stack, with a dead channel, through the tool's own `
 
 **GPU run (handed to the user).** With `$env:HIP_VISIBLE_DEVICES = '1'`, the merge into the existing
 set is
-`python tools\reference\hessian_capture.py --rms-only --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1`
+`python tools\reference\hessian_capture.py --rms-only --code-rev 34d381a --out-dir E:\models\r4dx\hessian-v1`
 (128 files, 6.25 GiB, one layer-major forward with nothing else hooked; `--dry-run` first checks the
-corpus without the GPU). After that, `r4dx-convert --rotate q2ab --hessian-dir D:\models\r4dx\hessian-v1
+corpus without the GPU). After that, `r4dx-convert --rotate q2ab --hessian-dir E:\models\r4dx\hessian-v1
 --ldlq .` no longer needs the division path.
 
 ### 3.3 Corpus v2: more windows plus self-generated text
@@ -555,7 +555,7 @@ still reports "corpus matches": it follows the set's tokenizer, hf-auto for hess
 ```
 python tools\reference\hessian_capture.py --out-dir C:\AI\r4dx-hessian\hessian-v2 --rms-taps `
     --wikitext-seqs 128 --code-seqs 48 --code-rev 714955f `
-    --gen-file D:\models\r4dx\corpus-v2\samples.jsonl
+    --gen-file E:\models\r4dx\corpus-v2\samples.jsonl
 ```
 
 This writes 389 files and about 54 GiB. Expect roughly 5x v1's 15 minutes. The hidden states
@@ -940,7 +940,7 @@ Hessians. It checks:
   reuse == full both ways, and un-keeping them LDLQs exactly those three (`attn.k`'s factor fresh
   where the full run took it from the cache).
 
-**Measured on the 27B (2026-09-26, `D:\models\r4dx\q3-reuse-test`, recipe `run_variants.ps1`'s base +
+**Measured on the 27B (2026-09-26, `E:\models\r4dx\q3-reuse-test`, recipe `run_variants.ps1`'s base +
 `--rotate q2ab --hessian-dir hessian-v1 --ldlq .`, while corpus v2 generation ran on the GPU):** the
 guarded no-rule baseline took 25.8 min. Candidate A (`mlp.down` in layers 0-31 at group 32)
 took **8.7 min** by reuse (64 tensors / 1.78 GB recomputed, 1423 / 18.2 GB copied) against **23.4 min**
@@ -975,7 +975,7 @@ unrotated v6 recipe, so the Q3 round runs:
 
 ```powershell
 .\tools\quant2\group_sweep.ps1 -Convert -Kl `
-    -ExtraArgs '--rotate','q2ab','--hessian-dir','D:\models\r4dx\hessian-v1','--ldlq','.'
+    -ExtraArgs '--rotate','q2ab','--hessian-dir','E:\models\r4dx\hessian-v1','--ldlq','.'
 ```
 
 Every later run on that `-OutDir` (a bare `-Kl` re-collect included) passes the same `-ExtraArgs`.
@@ -1113,15 +1113,15 @@ Caveats:
 3. Q2a: bf16 rotated vs unrotated KL (G5), then the quantized KL; ctest + validate/smoke scripts
    (G6); TP=2 check (pre-approved standing permission).
 4. Q2b and Q3: KL + decode per candidate.
-5. Corpus v2 Hessian capture (3.3) into `D:\models\r4dx\hessian-v2`, after the generator has written
-   `D:\models\r4dx\corpus-v2\samples.jsonl`.
+5. Corpus v2 Hessian capture (3.3) into `E:\models\r4dx\hessian-v2`, after the generator has written
+   `E:\models\r4dx\corpus-v2\samples.jsonl`.
 
 ## 7. Results (2026-09-25/26, device 1)
 
-Rung 4 against one fresh bf16 reference (`D:\models\r4dx\kl-q1\ref`, `full_logits_golden.py`),
+Rung 4 against one fresh bf16 reference (`E:\models\r4dx\kl-q1\ref`, `full_logits_golden.py`),
 `--layout w4a16`, every candidate converted by `tools/quant2/run_variants.ps1` from the v6 recipe
 (`--no-bf16 --mtp on --vision on`, KV calib, `search` + imatrix, attn.k/v kept bf16) plus its own
-flags; Hessians `D:\models\r4dx\hessian-v1` (172k tokens, with the rms taps of 3.2).
+flags; Hessians `E:\models\r4dx\hessian-v1` (172k tokens, with the rms taps of 3.2).
 
 | container | extra flags | mean KL | top-1 | cpp | english | python | thai |
 |---|---|--:|--:|--:|--:|--:|--:|
@@ -1152,7 +1152,7 @@ per-token cost the gates mean.
 **Thai, tokenized as the model is served (3.4).** `tokens.json`'s `thai_prose` segment is the
 AutoTokenizer split-mark form (1024 of 2325 tokens; the same text is 1220 canonical tokens), a token
 stream r4dx never produces. Re-measured on `kl_corpus/tokens_thai_canon.json` (the same text, first
-1024 canonical tokens, its own bf16 reference `D:\models\r4dx\kl-thai-canon\ref`):
+1024 canonical tokens, its own bf16 reference `E:\models\r4dx\kl-thai-canon\ref`):
 
 | container | thai (split, above) | **thai (canonical)** | top-1 canonical | 4-segment mean with canonical thai |
 |---|--:|--:|--:|--:|
@@ -1168,7 +1168,7 @@ quoted since Milestone 11 (0.011-0.014, docs/validation.md) is llama.cpp's publi
 comparable with any row here until a Q4_K_M model is scored on the same tokens.
 
 **Corpus v2, the Q3 sweep, and a GGUF on the same tokens (2026-09-26).** All KL below is on the
-canonical four segments (`tokens_canon.json`, reference `D:\models\r4dx\kl-canon\ref`); "decode
+canonical four segments (`tokens_canon.json`, reference `E:\models\r4dx\kl-canon\ref`); "decode
 bytes" is every text-layer weight plus `lm_head` (what one decode step streams; the embedding is a
 row gather), measured from the files.
 
@@ -1201,7 +1201,7 @@ row gather), measured from the files.
   device-0/bandwidth skips; reference_dflash2 needed its gitignored fixtures regenerated after the
   2026-09-25 venv rebuild); G6 5/5 -- validate_dflash 3/3, validate_spec_sampling 24/24, smoke
   dflash+tools+vision 217/0 (the prompt checkpoint fixes the " yes" multi-turn case), MTP 168/0,
-  TP=2 emulate 170/0. Decode (`D:\models\r4dx\quant2-bench-final`, 4 prompts x 2 runs,
+  TP=2 emulate 170/0. Decode (`E:\models\r4dx\quant2-bench-final`, 4 prompts x 2 runs,
   interleaved): plain 35.94 tok/s vs v6 35.95 and q2ab_hv2 35.93 -- speed-neutral; dflash k=7
   108.28 vs 108.94 / 103.94 (text-dependent); VRAM 17.07 vs 17.01 GiB.
 
@@ -1213,7 +1213,7 @@ v6; plain decode -0.3%). Damping 0.1 is worse than 0.01. Quantizing attn.k/v cos
 -0.23 GiB and +1.3% plain decode. Thai stays the worst segment (2x English) and is ~1% of the
 hessian-v1 corpus, which is what corpus v2 targets.
 
-G6 on q2ab_ldlq (`tools/quant2/g6_validate.ps1`, logs `D:\models\r4dx\g6-qwen38-27b-q2ab_ldlq`):
+G6 on q2ab_ldlq (`tools/quant2/g6_validate.ps1`, logs `E:\models\r4dx\g6-qwen38-27b-q2ab_ldlq`):
 validate_dflash w4a16 3/3 byte-identical; validate_spec_sampling w4a16 24/24 (plain vs `--mtp 3` vs
 `--dflash k=7`, sampled); smoke `-Mtp 3` 160/0; smoke `-Tp 2 -TpMode emulate -Dflash` 162/0 (real TP=2
 not run: it needs device 0); smoke `-Dflash -ToolRoundTrip -Vision` 203/2. Both FAILs are the
@@ -1280,7 +1280,7 @@ tok/s, change vs q2ab; `docs/perf.md` top section, trellis-kernel.md 10.6):
 | prefill (>= 256-token turns) | 757.2 | 1.60x | 1.55x |
 
 **G6 on the trellis containers** (gate A4, `g6_validate.ps1 -Layout trellis`, M6,
-`D:\models\r4dx\trellis-m6\g6-k4m`, `g6-mix45m`): **5/5 on both** -- validate_dflash 3/3
+`E:\models\r4dx\trellis-m6\g6-k4m`, `g6-mix45m`): **5/5 on both** -- validate_dflash 3/3
 byte-identical, validate_spec_sampling 24/24 (plain vs `--mtp 3` vs `--dflash k=7`, sampled,
 bit-exact), smoke dflash + tools + vision 217/0, smoke MTP 3 168/0, smoke TP = 2 emulate + DFlash
 170/0 -- the same counts as q2ab_hv2_q3. A5 (TP = 2 supported): that emulate smoke plus
@@ -1292,9 +1292,9 @@ pre-trellis quant2 binary (2ff3a52) in 12 / 12 cells (4 prompts x plain, `--dfla
 `--mtp 3`). Details: trellis-kernel.md 10.7.
 
 **Default container since 2026-09-29: the Huihui abliterated trellis mix4.5m,
-`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout trellis`** (`docs/huihui.md`).
+`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout trellis`** (`docs/huihui.md`).
 The same recipe as the base mix4.5m below, every calibration artifact taken from the Huihui model:
-its Hessians (`D:\models\r4dx\huihui\hessian-v2`, hessian-v2 settings), K4m + K5m and the mix
+its Hessians (`E:\models\r4dx\huihui\hessian-v2`, hessian-v2 settings), K4m + K5m and the mix
 (`huihui\trellis-q`), its own bf16 KL reference (`huihui\kl-ref`) and imatrix / kvcalib files. Against
 that reference: oracle (weights only) mean KL 0.00575 / top-1 96.48%, runtime (gate A1 command above)
 **0.00788 / 95.70%** (cpp 0.00583, en 0.00975, py 0.00778, thai 0.00814; base container 0.00747 /
@@ -1315,7 +1315,7 @@ DFlash, 1.5 GiB smaller, KL 0.01004 -- still 36% below q2ab_hv2_q3) and passes e
 **q2ab is retired (2026-09-28).** The q2ab_hv2_q3 container (and the q2ab + LDLQ w4a16 body recipe
 of sections 4-7) is no longer the baseline or a recommendation, and its containers are no longer
 kept; every q2ab figure in this document is a historical comparison. The default recommendation is
-mix4.5m on the Huihui model (`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout
+mix4.5m on the Huihui model (`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout
 trellis`, above); the base model's K4m speed option (`qwen38-27b-trellis-k4m.r4dx`) went away with the
 base files -- the Huihui K4m oracle bits exist (`huihui\trellis-q\K4m`) but no Huihui K4m container has
 been built or measured. The runtime's w4a16 path, rotation kinds and
@@ -1324,18 +1324,18 @@ w4a16 lm_head and MTP head).
 
 **Recipe** (mix4.5m; K4m is the same without steps 2-3 and with `-Oracle K4m`). The reference Python
 is `$env:R4DX_REFERENCE_VENV\Scripts\python.exe` or `python` on PATH (torch ROCm, transformers,
-numpy; `quantize-model` needs torch 2.13+rocm10 for the MAGMA cholesky, `D:\models\r4dx\huihui\venv-rocm10`);
+numpy; `quantize-model` needs torch 2.13+rocm10 for the MAGMA cholesky, `E:\models\r4dx\huihui\venv-rocm10`);
 the Hessians are hessian-v2 (3.3) of the model being quantized. The paths below are the production
 (Huihui) container's, and they are every default of `trellis_oracle.ps1` / `trellis_convert.ps1` /
 `trellis_quant.py --hessian-dir` / `common.DEFAULT_MODEL_DIR`; the full step-by-step run, with the
-Hessian capture and the bf16 reference, is `D:\models\r4dx\huihui\RECIPE.md`. Another model needs
+Hessian capture and the bf16 reference, is `E:\models\r4dx\huihui\RECIPE.md`. Another model needs
 `--model-dir` and every directory below passed explicitly (config.json cannot tell two Qwen3.8-27B
 family checkpoints apart).
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-$m = 'D:\models\Huihui-Qwen3.8-27B-abliterated'
-$h = 'D:\models\r4dx\huihui\hessian-v2'; $q = 'D:\models\r4dx\huihui\trellis-q'
+$m = 'E:\models\Huihui-Qwen3.8-27B-abliterated'
+$h = 'E:\models\r4dx\huihui\hessian-v2'; $q = 'E:\models\r4dx\huihui\trellis-q'
 # 1-3. the oracle's bits (GPU, ~75 min per rate), then EXL3's 4/5 allocation at 4.5 bpw (a manifest)
 python tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched --model-dir $m --hessian-dir $h --out-dir $q\K4m
 python tools\reference\trellis_quant.py quantize-model --device cuda --K 5 --hessian-basis matched --model-dir $m --hessian-dir $h --out-dir $q\K5m
@@ -1343,19 +1343,19 @@ python tools\reference\trellis_quant.py mix --bpw 4.5 --src $q\K4m --src $q\K5m 
 # (tools\quant2\trellis_oracle.ps1 -Points mix4.5m runs 1-3 plus the weights-only KL, whose
 #  reference_run.json the next step takes its manifest pin from)
 # 4. the container (CPU, ~2 min, full reconstruction check)
-.\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+.\tools\quant2\trellis_convert.ps1 -Oracle mix4.5m -Output E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
 ```
 
 Step 4 runs:
 
 ```
-r4dx-convert --input D:\models\Huihui-Qwen3.8-27B-abliterated
-  --output D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
-  --trellis-from D:\models\r4dx\huihui\trellis-q\mix4.5m
+r4dx-convert --input E:\models\Huihui-Qwen3.8-27B-abliterated
+  --output E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx
+  --trellis-from E:\models\r4dx\huihui\trellis-q\mix4.5m
   --trellis-manifest-sha256 da89573b8d41972bc5a2d971f495b25e2846d29ab400e3687d41f252990d948c
   --trellis-verify full --layouts w4a16 --lm-head w4a16 --no-bf16 --mtp on --vision on
-  --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json --quant search
-  --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz --hessian-dir D:\models\r4dx\huihui\hessian-v2
+  --kv-calib E:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json --quant search
+  --imatrix E:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz --hessian-dir E:\models\r4dx\huihui\hessian-v2
   --ldlq . --w4a16-group-rule "^lm_head$=32" --threads 32
 ```
 
@@ -1364,5 +1364,5 @@ K4m, `kl-trellis\...\reference_run.json`; those manifests were retired with the 
 pin above is `huihui\kl\mix4.5m\reference_run.json`'s `weights_override.manifest_sha256`.) The body
 flags apply only to the non-trellis linears (lm_head, the MTP head): no `--rotate`, no body group
 rules, no attn.k/v keep. Serve it with `r4dx-server --model <container> --layout trellis` plus the
-usual `--dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` or `--mtp 3`; a
+usual `--dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7` or `--mtp 3`; a
 trellis container refuses every other `--layout`, and a pre-trellis binary refuses the container.

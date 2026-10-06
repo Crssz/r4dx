@@ -14,10 +14,11 @@
 //          (injection covers the image rows exactly as TP=1: features are replicated)
 //   A  audio (only when R4DX_GEMMA_VISION_TP_AUDIO or the main container carries audio.*): a 2 s tone through EncodeAudio
 //        (bitwise equal to TP=1: the CPU embedder on the facade) and PrefillAudio logits / greedy as for V.
-// Env: R4DX_GEMMA_VISION_TP_CONTAINER (default D:\models\r4dx\huihui-gemma\bf16-vision.r4dx), R4DX_GEMMA_VISION_TP_LAYOUT
+// Env: R4DX_GEMMA_VISION_TP_CONTAINER (default <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16-vision.r4dx), R4DX_GEMMA_VISION_TP_LAYOUT
 // (default bf16; trellis for a trellis container), R4DX_GEMMA_VISION_TP_AUDIO (default: the main container),
 // R4DX_GEMMA_VISION_TP_DRAFTER (optional dflash2 container).
 #include <hip/hip_runtime.h>
+#include "r4dx/models_root.h"
 
 #include <algorithm>
 #include <cmath>
@@ -248,7 +249,7 @@ int main() {
     std::printf("SKIP: two-GPU test; run tests\\run_tests.ps1 -TwoGpu\n");
     return 77;
   }
-  const std::string target = Env("R4DX_GEMMA_VISION_TP_CONTAINER", "D:\\models\\r4dx\\huihui-gemma\\bf16-vision.r4dx");
+  const std::string target = Env("R4DX_GEMMA_VISION_TP_CONTAINER", r4dx::ModelsPath("r4dx/huihui-gemma/bf16-vision.r4dx").c_str());
   const std::string layout = Env("R4DX_GEMMA_VISION_TP_LAYOUT", "bf16");
   const std::string drafter = Env("R4DX_GEMMA_VISION_TP_DRAFTER", "");
   if (!r4dx_test::FileExists(target)) return r4dx_test::SkipMissing(target);

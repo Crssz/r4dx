@@ -47,14 +47,14 @@
 # and is redone, never measured or collected. Stops at the first failure.
 #
 #   .\tools\quant2\group_sweep.ps1 -Convert -Kl
-#   .\tools\quant2\group_sweep.ps1 -Convert -Kl -Only '^mlp\.down' -RefDir D:\models\r4dx\kl-q1\ref
+#   .\tools\quant2\group_sweep.ps1 -Convert -Kl -Only '^mlp\.down' -RefDir <models-root>\r4dx\kl-q1\ref
 #   .\tools\quant2\group_sweep.ps1 -Kl      # re-collect candidates.json + rerun the allocation
 #                                           # (measures any converted, unmeasured one; skips the rest)
 #   .\tools\quant2\group_sweep.ps1 -ListCandidates
 #
 # The default -Recipe alone is the UNROTATED v6 recipe. The Q3 round (docs/quant2.md 5.3) measures on
 # the current one, q2ab rotation + LDLQ (section 7's q2ab_ldlq), whose sensitivities differ -- so it runs
-#   .\tools\quant2\group_sweep.ps1 -Convert -Kl -ExtraArgs '--rotate','q2ab','--hessian-dir','D:\models\r4dx\hessian-v1','--ldlq','.'
+#   .\tools\quant2\group_sweep.ps1 -Convert -Kl -ExtraArgs '--rotate','q2ab','--hessian-dir','<models-root>\r4dx\hessian-v1','--ldlq','.'
 # and every later run on that -OutDir passes the same -Recipe / -ExtraArgs (-Kl refuses one whose
 # --keep-bf16 is not the measured baseline's; a -Convert would fail its candidates' verification).
 #
@@ -93,13 +93,13 @@ param(
   [switch]$Kl,
   [switch]$ListCandidates,
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
-  [string]$OutDir = 'D:\models\r4dx\q3-sweep',
+  [string]$OutDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\q3-sweep",
   [string]$ContainerDir = '',   # default: -OutDir
   [string]$RefDir = '',         # default: <OutDir>\ref; point it at an existing rung-4 ref to reuse it
   [string[]]$Recipe = @(
     '--layouts', 'w4a16', '--lm-head', 'w4a16', '--no-bf16', '--mtp', 'on', '--vision', 'on',
-    '--kv-calib', 'D:\models\r4dx\qwen38-27b.kvcalib-full.json',
-    '--quant', 'search', '--imatrix', 'D:\models\r4dx\qwen38-27b.imatrix.npz',
+    '--kv-calib', "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.kvcalib-full.json",
+    '--quant', 'search', '--imatrix', "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.imatrix.npz",
     '--keep-bf16', '^text\.layers\.[0-9]+\.attn\.[kv]$'),
   [string[]]$ExtraArgs = @(),   # appended to -Recipe for every container, baseline included
   [int[]]$Groups = @(32),

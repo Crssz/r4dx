@@ -106,8 +106,8 @@ using r4dx::model::TpOptions;
 namespace core = r4dx::core;
 namespace kernels = r4dx::kernels;
 
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
-const char* kDraftVocabPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-mtp-draftvocab.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-allmtp.r4dx");
+const char* kDraftVocabPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-mtp-draftvocab.r4dx");
 constexpr int64_t kLayers = 4;
 constexpr int kDecodeRows = 16;
 // The P5 comparisons with TP=1 (the verify / commit script, the speculative replays, vision; docs/tp.md

@@ -20,7 +20,7 @@
 //           shapes they need have run.
 // It never touches the tuning table (no --inc-out here) and writes nothing but the --out JSON.
 //
-// Build: tests/kernels/build_m256_bench.ps1 (hipcc, objects under D:\models\r4dx\linear\A2\obj).
+// Build: tests/kernels/build_m256_bench.ps1 (hipcc, objects under <R4DX_MODELS_ROOT>\r4dx\linear\A2\obj).
 // Run (one device; HIP_VISIBLE_DEVICES set by the caller; every set is bounded):
 //   tool_trellis_m256_bench.exe [--shape gate_up|down|qkv|z|out|qg|kv|all] [--kb 4|5|both]
 //                               [--mode verify|time|both] [--seeds 4] [--rounds 11] [--batch 6]

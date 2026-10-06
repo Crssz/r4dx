@@ -33,7 +33,7 @@ GPU (hand this to the user; never run by an agent):
 
     $env:HIP_VISIBLE_DEVICES='1'; D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe `
         tools\\reference\\gemma\\full_logits_gemma.py --tokens tools\\reference\\kl_corpus\\tokens_gemma.json `
-        --out-dir D:\\models\\r4dx\\huihui-gemma\\kl\\ref --noise-floor-out D:\\models\\r4dx\\huihui-gemma\\kl\\ref-noise
+        --out-dir <models root>\\r4dx\\huihui-gemma\\kl\\ref --noise-floor-out <models root>\\r4dx\\huihui-gemma\\kl\\ref-noise
 
 `--tiny` runs the same code on a tiny random checkpoint on CPU (the M0-6 smoke).
 """

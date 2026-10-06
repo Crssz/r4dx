@@ -31,12 +31,13 @@
 //
 // Then, per prompt:
 //   <reference venv>/python.exe tools/reference/dflash2_ref.py --real <that subdirectory> \
-//       --target-dir D:/models/Huihui-Qwen3.8-27B-abliterated
+//       --target-dir <R4DX_MODELS_ROOT>/Huihui-Qwen3.8-27B-abliterated
 //
 // Built but deliberately NOT registered with add_test(): it prints numbers for a human/doc to read
 // and needs the full 27B checkpoint, the DFlash2 draft container AND the tokenizer -- the same
 // "built, never add_test()'d" convention tool_hseed_drift.cpp and tool_vocab_calib.cpp use.
 #include <hip/hip_runtime.h>
+#include "r4dx/models_root.h"
 
 #include <algorithm>
 #include <chrono>
@@ -79,8 +80,8 @@ namespace {
 // ProductionLayoutName() unless --layout says otherwise. The bf16 drafter below is
 // group-independent.
 const char* kDefaultTarget = r4dx_test::ProductionTargetPath();
-const char* kDefaultDraft = "D:/models/r4dx/qwen38-27b-dflash2-bf16.r4dx";
-const char* kDefaultTokenizerDir = "D:/models/Huihui-Qwen3.8-27B-abliterated";
+const std::string kDefaultDraft = r4dx::ModelsPath("r4dx/qwen38-27b-dflash2-bf16.r4dx");
+const std::string kDefaultTokenizerDir = r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated");
 const char* kDefaultOutDir = "build/logs/dflash_probe";
 
 // The two short real prompts item 4 asks for: one natural-language, one code, so the captured

@@ -53,7 +53,7 @@ namespace tp = r4dx::model::tp;
 
 namespace {
 
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-allmtp.r4dx");
 constexpr int kWorld = 2;
 constexpr int64_t kLayers = 4;
 

@@ -1702,10 +1702,22 @@ def dry_run_quantize(args, arch: ArchSpec, rot, linears, rates, layers, keys, rm
     return 0
 
 
+_JOB_PATH_KEYS = ("model_dir", "hessian_dir")
+
+
+def jobs_equal(a: dict | None, b: dict) -> bool:
+    """a == b, except the recorded paths (_JOB_PATH_KEYS) are compared as locations: junction- and
+    case-aware, so a record made through a junction alias of the models root still matches."""
+    from common import same_path
+    if not isinstance(a, dict) or a.keys() != b.keys():
+        return False
+    return all(same_path(a[k], b[k]) if k in _JOB_PATH_KEYS else a[k] == b[k] for k in a)
+
+
 def layer_record_usable(doc: dict, job: dict, rates: dict) -> bool:
     """An L<ii>.json belongs to this run: same job (checkpoint, Hessians, basis, recipe, code) and
     every tensor it holds is one this run quantizes, at exactly the K this run gives it."""
-    if doc.get("job") != job:
+    if not jobs_equal(doc.get("job"), job):
         return False
     tens = doc.get("tensors") or {}
     return bool(tens) and all(n in rates and float(r.get("K")) == float(rates[n]) for n, r in tens.items())
@@ -1744,6 +1756,7 @@ def cmd_mix(args) -> int:
     """A bpw target from finished integer-rate directories: EXL3's allocation (section 9) decides
     each tensor's K; its record/file is taken from the directory quantized at that K (the trellis
     of a tensor depends only on the tensor, its H, K and seeds, so no requantization)."""
+    from common import same_path  # noqa: E402
     srcs: dict[float, dict] = {}
     for s in args.src:
         man = load_manifest(Path(s))
@@ -1760,7 +1773,9 @@ def cmd_mix(args) -> int:
     opt_keys = tuple(k for k in ("arch", "rotation") if any(k in m for m in srcs.values()))
     for man in srcs.values():
         for key in job_keys + opt_keys:
-            if man.get(key) != base.get(key):
+            same = (same_path(man.get(key), base.get(key)) if key in _JOB_PATH_KEYS
+                    else man.get(key) == base.get(key))
+            if not same:
                 raise SystemExit(f"[trellis] source directories differ in {key}")
     code = {str(K): m.get("code_sha256") for K, m in srcs.items()}
     if len({json.dumps(v, sort_keys=True) for v in code.values()}) > 1:
@@ -2027,7 +2042,7 @@ def cmd_selftest(args) -> int:
 
 
 def main() -> int:
-    from common import DEFAULT_MODEL_DIR
+    from common import DEFAULT_MODEL_DIR, MODELS_ROOT
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2057,7 +2072,7 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="CPU only, no encoder, no device: list the tap groups, the Hessian files they would "
                         "read (header check), the rates and the rotation fold, and exit")
-    p.add_argument("--hessian-dir", type=Path, default=Path(r"D:\models\r4dx\huihui\hessian-v2"))
+    p.add_argument("--hessian-dir", type=Path, default=MODELS_ROOT / "r4dx" / "huihui" / "hessian-v2")
     p.add_argument("--out-dir", type=Path, required=True)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--K", type=float, help="one rate for every linear (3.5, 4, 5, ...)")
@@ -2095,7 +2110,7 @@ def main() -> int:
     p = sub.add_parser("linear", help="validation (b): proxy loss of real linears")
     enc_args(p)
     p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
-    p.add_argument("--hessian-dir", type=Path, default=Path(r"D:\models\r4dx\huihui\hessian-v2"))
+    p.add_argument("--hessian-dir", type=Path, default=MODELS_ROOT / "r4dx" / "huihui" / "hessian-v2")
     p.add_argument("--tensor", action="append", required=True, help="LAYER:module, e.g. 10:mlp.down_proj")
     p.add_argument("--K", default="4")
     p.add_argument("--basis", default="exl3,matched", help="exl3, matched or exl3,matched")

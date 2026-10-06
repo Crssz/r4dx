@@ -6,9 +6,9 @@
 # with -TailPath prefill) and only the tail's rows are written ([tail, V] fp16 per segment, ~121 MiB
 # at tail 256) plus a sidecar with prefill_seconds. Compare two such directories with kl_compare.py.
 #
-#   .\tools\prefill\run_kl.ps1 -Device 1 -OutDir D:\models\r4dx\prefill-m0\kl\dense
+#   .\tools\prefill\run_kl.ps1 -Device 1 -OutDir <models-root>\r4dx\prefill-m0\kl\dense
 #   .\tools\prefill\run_kl.ps1 -Device 1 -Segment prose_8k,recall_8k -OutDir ...\kl\smoke
-#   .\tools\prefill\run_kl.ps1 -Tp 2 -OutDir D:\models\r4dx\prefill-m0\kl\dense-tp2
+#   .\tools\prefill\run_kl.ps1 -Tp 2 -OutDir <models-root>\r4dx\prefill-m0\kl\dense-tp2
 #   .\tools\prefill\run_kl.ps1 -Device 0 -Tool <other build>\tool_teacher_forced_logprobs.exe -OutDir ...\kl\variant
 #
 # HIP_VISIBLE_DEVICES is set explicitly: -Device N at TP=1, '0,1' with -Tp 2. Without -Segment one
@@ -18,11 +18,11 @@
 param(
   [int]$Device = 1,
   [ValidateSet(1, 2)][int]$Tp = 1,
-  [string]$Tokens = 'D:\models\r4dx\prefill-m0\kl\tokens_long.json',
+  [string]$Tokens = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\prefill-m0\kl\tokens_long.json",
   [Parameter(Mandatory = $true)][string]$OutDir,
   [string[]]$Segment = @(),
   [ValidateSet('decode', 'prefill')][string]$TailPath = 'decode',
-  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
   [string]$Layout = 'trellis',
   [string]$Tool = '',
   [string[]]$ExtraArgs = @(),

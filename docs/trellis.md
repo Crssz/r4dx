@@ -2,7 +2,7 @@
 
 *Note 2026-09-29: the Hessians, oracle bits and KL references named in this document (`hessian-v2`,
 `trellis-q`, `kl-canon\ref`, `kl-trellis`) are the BASE model's: the Hessians and oracle bits were retired with the base checkpoint, `kl-canon\ref` is still on disk (scoring only base-model containers, none left) and `kl-trellis` keeps only its logs and json;
-the Huihui model's own live under `D:\models\r4dx\huihui\` and are the tools' defaults now
+the Huihui model's own live under `E:\models\r4dx\huihui\` and are the tools' defaults now
 ([huihui.md](huihui.md)). The numbers here stay as the record of the first run.*
 
 Branch `quant2` (worktree `%USERPROFILE%\dev\r4dx-quant2`). Written 2026-09-26. This is the spec the
@@ -844,9 +844,9 @@ quantizes all 400 decoder linears; the K=4 run took 73 min at about 28,000 tiles
 `mix` over K4m and K5m. Scoring used the same weights-only
 reference forward (`full_logits_golden.py --weights-override`) with the same tokens
 (`tokens_canon.json`, 4 segments, canonical Thai) and the same bf16 reference
-(`D:\models\r4dx\kl-canon\ref`) as the UD-Q4_K_XL row. Every run checked 400/400 tensors, and each
+(`E:\models\r4dx\kl-canon\ref`) as the UD-Q4_K_XL row. Every run checked 400/400 tensors, and each
 point's measured bpw equals its target plus 0.0045 for suh/svh. Results are in
-`D:\models\r4dx\kl-trellis\summary.json`.
+`E:\models\r4dx\kl-trellis\summary.json`.
 
 | model | bpw (decoder linears) | decoder GiB | mean KL | top-1 | p99 KL | cpp | en | py | thai |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|

@@ -48,12 +48,12 @@
 
 .PARAMETER Model
   Path to the real 64-layer target container. Default: the production container, chosen by
-  tools\r4dx_containers.ps1: D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui
+  tools\r4dx_containers.ps1: <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui
   abliterated trellis mix4.5m, layout trellis).
 
 .PARAMETER Dflash
   Path to the DFlash2 draft container to test. Default: the w4a16 group-64 draft container,
-  D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx.
+  <models-root>\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx.
   (w4a16 is the task's own primary ask -- item 4 says "w4a16 draft" explicitly.)
 
 .PARAMETER Layouts
@@ -104,7 +104,7 @@ param(
     # switching to it alone makes the row match --mtp 0 again, the divergence is pure verify-window
     # grouping (same class as the documented MTP mechanism), not a dflash bookkeeping bug -- a
     # bookkeeping/lifecycle bug cannot be switched off by re-quantizing the draft container.
-    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx",
+    [string]$DflashAlt = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-dflash2-bf16.r4dx",
     [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [int]$MaxTokens = 40,
     [switch]$AllowBatchedVerifyDivergence,

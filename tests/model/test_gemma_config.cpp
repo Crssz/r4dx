@@ -1,7 +1,7 @@
 // tests/model/test_gemma_config.cpp -- CPU-only (no GPU, no container). docs/gemma4-plan.md M1-1, M1-24.
 //
 //   * GemmaConfig::FromJson on the real Huihui-gemma-4-12B-it-abliterated text_config (values inlined
-//     so the test is hermetic; if D:\models\Huihui-gemma-4-12B-it-abliterated\config.json exists it
+//     so the test is hermetic; if <R4DX_MODELS_ROOT>\Huihui-gemma-4-12B-it-abliterated\config.json exists it
 //     is parsed too and must agree), through FromModelConfig's nesting as well;
 //   * the 5:1 layer pattern is asserted (a swapped layer, a wrong length, an unknown type all throw);
 //   * every refusal of an unsupported variant names its field;
@@ -12,6 +12,7 @@
 //   * ToModelConfig / ModelConfig::arch (what TextModel::Config() exposes), Qwen's default kQwen35;
 //   * DetectArch / DetectArchFromMetadata on synthetic safetensors-shell headers.
 #include <cstdint>
+#include "r4dx/models_root.h"
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -154,7 +155,7 @@ void TestRealConfig() {
   Check(Throws([&] { c.ResolveMaxCtx(262145, true); }, "supported maximum"), "max ctx: above 262144 refused");
 
   // The real file, when present: must parse and match the inlined copy field for field.
-  const std::string path = "D:\\models\\Huihui-gemma-4-12B-it-abliterated\\config.json";
+  const std::string path = r4dx::ModelsPath("Huihui-gemma-4-12B-it-abliterated/config.json");
   std::ifstream f(path);
   if (f) {
     const json real = json::parse(f);

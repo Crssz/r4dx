@@ -1,6 +1,6 @@
 """Build a whole-layer K4/K5 mix manifest from the sens_sweep results (docs/gemma4-plan.md item 12, re-rank).
 
-  python tools/gemma/sens_mix.py --mode all|worst --bpw 4.5 --out D:\\models\\r4dx\\huihui-gemma\\trellis\\q\\mix4.5m-sensA
+  python tools/gemma/sens_mix.py --mode all|worst --bpw 4.5 --out <models root>\\r4dx\\huihui-gemma\\trellis\\q\\mix4.5m-sensA
 
 all:   promote layers in order of their measured chat-ALL KL gain.
 worst: greedy -- each step promotes the layer that most lowers the WORST group's predicted KL (additive model from the
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from sens_sweep import Q  # noqa: E402
+from sens_sweep import HG, Q  # noqa: E402
 
 GROUPS = ("chat-code", "chat-english", "chat-thai")
 
@@ -22,7 +22,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=("all", "worst"), required=True)
     ap.add_argument("--bpw", type=float, default=4.5)
-    ap.add_argument("--sens", default=r"D:\models\r4dx\huihui-gemma\sens")
+    ap.add_argument("--sens", default=str(HG / "sens"))
     ap.add_argument("--out", required=True, type=Path)
     a = ap.parse_args()
     rows = [json.loads(l) for f in glob.glob(str(Path(a.sens) / "results_dev*.jsonl")) for l in open(f) if l.strip()]

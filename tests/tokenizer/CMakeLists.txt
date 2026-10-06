@@ -1,12 +1,12 @@
 # tokenizer_golden: replays tests/tokenizer/golden.json (produced offline by
 # tools/tok_ref/gen_golden.py against the real HF tokenizer, CPU-only, no GPU) through r4dx's own
 # Tokenizer + ChatTemplate and diffs every case. Needs the real model directory on disk
-# (D:\models\Huihui-Qwen3.8-27B-abliterated: tokenizer.json, tokenizer_config.json,
+# (<R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated: tokenizer.json, tokenizer_config.json,
 # chat_template.jinja, generation_config.json) -- it is not vendored into the repo (12+ MB
 # tokenizer.json), so this test is skipped rather than failed if that directory is absent. The
 # fine-tune's tokenizer files are byte-identical (SHA-256) to the base Qwen3.8-27B's that
 # golden.json was cut from (docs/huihui.md), so any Qwen3.8-27B-family checkpoint dir works.
-set(R4DX_TOKENIZER_MODEL_DIR "D:/models/Huihui-Qwen3.8-27B-abliterated" CACHE PATH
+set(R4DX_TOKENIZER_MODEL_DIR "${R4DX_MODELS_ROOT}/Huihui-Qwen3.8-27B-abliterated" CACHE PATH
     "Directory containing tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
 
 add_executable(tokenizer_golden golden_test.cpp)
@@ -38,7 +38,7 @@ add_test(NAME tokenizer_minja_patches COMMAND tokenizer_minja_patches)
 # golden_gemma.json (tools/tok_ref/gen_golden_gemma.py) against the assembled tokenizer dir --
 # google/gemma-4-12B-it's tokenizer.json (identical in the Huihui repo), tokenizer_config.json,
 # chat_template.jinja, generation_config.json. Skipped (77) when the directory is absent.
-set(R4DX_GEMMA_TOKENIZER_DIR "D:/models/Huihui-gemma-4-12B-it-abliterated-tok" CACHE PATH
+set(R4DX_GEMMA_TOKENIZER_DIR "${R4DX_MODELS_ROOT}/Huihui-gemma-4-12B-it-abliterated-tok" CACHE PATH
     "Directory containing the Gemma 4 tokenizer.json/tokenizer_config.json/chat_template.jinja/generation_config.json")
 add_test(NAME tokenizer_golden_gemma
          COMMAND tokenizer_golden --golden ${CMAKE_CURRENT_SOURCE_DIR}/golden_gemma.json

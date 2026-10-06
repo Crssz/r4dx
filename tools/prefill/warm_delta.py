@@ -10,7 +10,7 @@ Also a cold run of the same ~4k delta on its own (offset 0) as the shallow refer
 timings.prompt_n / prompt_ms of each request are recorded to <out>/warm_delta.jsonl.
 
 Usage (server already up, e.g. started by warm_delta.ps1):
-  python tools\\prefill\\warm_delta.py --port 8094 --bases 32k,64k --out D:\\models\\r4dx\\prefill-m0\\profile\\warm
+  python tools\\prefill\\warm_delta.py --port 8094 --bases 32k,64k --out <models root>\\r4dx\\prefill-m0\\profile\\warm
 """
 
 from __future__ import annotations

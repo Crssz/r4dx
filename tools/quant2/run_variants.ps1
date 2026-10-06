@@ -10,7 +10,7 @@
 # Every variant starts from the v6 recipe (w4a16 only, --no-bf16, MTP + vision, KV calib,
 # search+imatrix, attn.k/v kept bf16) and appends its own converter flags:
 #
-#   .\tools\quant2\run_variants.ps1 -Variant 'q2ab_ldlq=--rotate q2ab --hessian-dir D:\models\r4dx\hessian-v1 --ldlq .'
+#   .\tools\quant2\run_variants.ps1 -Variant 'q2ab_ldlq=--rotate q2ab --hessian-dir <models-root>\r4dx\hessian-v1 --ldlq .'
 #
 # -ExtraKl name=tokens.json=refdir (repeatable) also scores each container on another tokens file
 # against its own bf16 reference, stored as extra.<name> on the row (kl_<variant>.<name>.json). The
@@ -18,12 +18,12 @@
 # segment is the AutoTokenizer (split-mark) form, kept for comparability with earlier rows.
 param(
   [Parameter(Mandatory = $true)][string[]]$Variant,
-  [string]$OutDir = 'D:\models\r4dx\kl-q2',
-  [string]$RefDir = 'D:\models\r4dx\kl-q1\ref',
-  [string]$ContainerDir = 'D:\models\r4dx',
+  [string]$OutDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\kl-q2",
+  [string]$RefDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\kl-q1\ref",
+  [string]$ContainerDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx",
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
-  [string[]]$ExtraKl = @('thai_canon=tools\reference\kl_corpus\tokens_thai_canon.json=D:\models\r4dx\kl-thai-canon\ref'),
+  [string[]]$ExtraKl = @("thai_canon=tools\reference\kl_corpus\tokens_thai_canon.json=$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\kl-thai-canon\ref"),
   # Where the per-variant log-prob dumps go while kl_report.py reads them (~2 GB for 4 segments,
   # deleted right after): a drive with room, when -OutDir's is full of containers.
   [string]$ScratchDir = '',
@@ -41,8 +41,8 @@ $tokens = 'tools\reference\kl_corpus\tokens.json'
 if (-not (Test-Path (Join-Path $RefDir 'reference_run.json'))) { throw "[var] no reference in $RefDir" }
 
 $base = @('--input', $Checkpoint, '--layouts', 'w4a16', '--lm-head', '4bit', '--no-bf16', '--mtp', 'on',
-          '--vision', 'on', '--kv-calib', 'D:\models\r4dx\qwen38-27b.kvcalib-full.json',
-          '--quant', 'search', '--imatrix', 'D:\models\r4dx\qwen38-27b.imatrix.npz',
+          '--vision', 'on', '--kv-calib', "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.kvcalib-full.json",
+          '--quant', 'search', '--imatrix', "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.imatrix.npz",
           '--keep-bf16', '^text\.layers\.[0-9]+\.attn\.[kv]$')
 
 function Run([string]$name, [scriptblock]$cmd) {

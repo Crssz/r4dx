@@ -4,9 +4,9 @@
 //
 //   $env:HIP_VISIBLE_DEVICES='1'
 //   build\win-hip\tests\model\test_gemma_audio.exe          (or: ctest -R gemma_audio)
-//   R4DX_GEMMA_AUDIO_CONTAINER=<container>   default D:\models\r4dx\huihui-gemma\bf16-audio.r4dx
-//   (convert it first:  r4dx-convert --model-dir D:\models\Huihui-gemma-4-12B-it-abliterated
-//                        --out D:\models\r4dx\huihui-gemma\bf16-audio.r4dx --audio on)
+//   R4DX_GEMMA_AUDIO_CONTAINER=<container>   default <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16-audio.r4dx
+//   (convert it first:  r4dx-convert --model-dir <R4DX_MODELS_ROOT>\Huihui-gemma-4-12B-it-abliterated
+//                        --out <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16-audio.r4dx --audio on)
 //
 // The CPU half (framing, WAV, the embedder vs HF) is tests/audio; this is the device half, with the prompt layout
 // tools/reference/gemma/audio_golden_gemma.py recorded from the real chat template + processor:
@@ -21,6 +21,7 @@
 //      (top-1 equal, max |logit diff| < 1.0 -- different chunk boundaries move bf16 rounding a little).
 //   4. A span outside the call's tokens is refused.
 #include <algorithm>
+#include "r4dx/models_root.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -75,7 +76,7 @@ bool Finite(const std::vector<float>& v) {
 int main() {
   return r4dx_test::RunGuardedMain("test_gemma_audio", []() -> int {
     const char* e = std::getenv("R4DX_GEMMA_AUDIO_CONTAINER");
-    const std::string container = e && *e ? e : "D:\\models\\r4dx\\huihui-gemma\\bf16-audio.r4dx";
+    const std::string container = e && *e ? e : r4dx::ModelsPath("r4dx/huihui-gemma/bf16-audio.r4dx");
     if (!r4dx_test::FileExists(container)) return r4dx_test::SkipMissing(container);
     if (!audio::ContainerHasAudio(container)) return r4dx_test::SkipMissing(container + " (converted without --audio on)");
 

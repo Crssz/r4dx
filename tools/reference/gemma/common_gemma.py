@@ -1,7 +1,7 @@
 """Shared helpers of the Gemma 4 reference package (docs/gemma4-plan.md 6.3).
 
-Everything here is read-only against D:\\models\\Huihui-gemma-4-12B-it-abliterated (the checkpoint,
-`R4DX_MODEL_DIR` overrides) and D:\\models\\Huihui-gemma-4-12B-it-abliterated-tok (google's tokenizer
+Everything here is read-only against <models root>\\Huihui-gemma-4-12B-it-abliterated (the checkpoint,
+`R4DX_MODEL_DIR` overrides) and <models root>\\Huihui-gemma-4-12B-it-abliterated-tok (google's tokenizer
 files over Huihui's tokenizer.json, `R4DX_TOKENIZER_DIR` overrides). Run the scripts with the
 reference venv:
 
@@ -33,6 +33,7 @@ if str(_REF_DIR) not in sys.path:
     sys.path.insert(0, str(_REF_DIR))
 
 from common import (  # noqa: E402,F401  (re-exported)
+    MODELS_ROOT,
     ShardIndex,
     save_golden,
     set_seed,
@@ -42,9 +43,11 @@ from common import (  # noqa: E402,F401  (re-exported)
 )
 from gemma.arch import GemmaArch  # noqa: E402,F401
 
-DEFAULT_MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated"))
+DEFAULT_MODEL_DIR = Path(os.environ.get("R4DX_MODEL_DIR", str(MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated")))
 DEFAULT_TOKENIZER_DIR = Path(os.environ.get("R4DX_TOKENIZER_DIR",
-                                            r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok"))
+                                            str(MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated-tok")))
+#: Derived artifacts of the Gemma track (corpus, kvcalib, kl dumps, hessians, trellis dirs).
+GEMMA_OUT_DIR = MODELS_ROOT / "r4dx" / "huihui-gemma"
 DEFAULT_ALLOWED_DEVICES = "1"
 
 

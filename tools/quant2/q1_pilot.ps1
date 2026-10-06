@@ -13,10 +13,10 @@ param(
   [switch]$Convert,
   [switch]$Kl,
   [string]$Checkpoint = 'C:\AI\models\Qwen3.8-27B',
-  [string]$HessianDir = 'D:\models\r4dx\hessian-v1',
-  [string]$Pilot = 'D:\models\r4dx\qwen38-27b-q1pilot.r4dx',
-  [string]$V6 = 'D:\models\r4dx\qwen38-27b-v6.r4dx',
-  [string]$OutDir = 'D:\models\r4dx\kl-q1',
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\hessian-v1",
+  [string]$Pilot = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-q1pilot.r4dx",
+  [string]$V6 = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-v6.r4dx",
+  [string]$OutDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\kl-q1",
   [string]$Python = $(if ($env:R4DX_REFERENCE_VENV) { Join-Path $env:R4DX_REFERENCE_VENV 'Scripts\python.exe' } else { 'python' }),
   [string]$Tool = 'C:\Users\pay20\dev\r4dx\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe'
 )
@@ -47,8 +47,8 @@ if ($Convert) {
   Run 'convert_pilot' {
     & $conv --input $Checkpoint --output $Pilot `
       --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
-      --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-      --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+      --kv-calib "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.kvcalib-full.json" `
+      --quant search --imatrix "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b.imatrix.npz" `
       --keep-bf16 '^text\.layers\.[0-9]+\.attn\.[kv]$' `
       --hessian-dir $HessianDir --ldlq 'mlp\.'
   }

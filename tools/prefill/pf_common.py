@@ -24,9 +24,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools" / "reference"))
-from common import DEFAULT_MODEL_DIR, load_ref_tokenizer  # noqa: E402
+from common import DEFAULT_MODEL_DIR, MODELS_ROOT, load_ref_tokenizer  # noqa: E402
 
-DEFAULT_OUT = Path(r"D:\models\r4dx\prefill-m0")
+DEFAULT_OUT = MODELS_ROOT / "r4dx" / "prefill-m0"
 
 #: Length tags -> target prompt length in tokens (the whole chat-templated prompt).
 LENGTHS = {"4k": 4096, "8k": 8192, "16k": 16384, "32k": 32768, "64k": 65536, "128k": 131072}

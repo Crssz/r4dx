@@ -34,8 +34,8 @@
 
 .EXAMPLE
   # both GPUs (HIP_VISIBLE_DEVICES unset for the tp2 step; the script manages it):
-  powershell -File tools\tp\gemma_tp_identity.ps1 -Model D:\models\r4dx\huihui-gemma\bf16.r4dx -Layout bf16 `
-      -OutDir D:\models\r4dx\huihui-gemma\kl\tp -Baseline C:\Users\pay20\dev\r4dx-baselines\gemma-tp1-<commit>
+  powershell -File tools\tp\gemma_tp_identity.ps1 -Model <models-root>\r4dx\huihui-gemma\bf16.r4dx -Layout bf16 `
+      -OutDir <models-root>\r4dx\huihui-gemma\kl\tp -Baseline C:\Users\pay20\dev\r4dx-baselines\gemma-tp1-<commit>
   # one GPU, both ranks on it (needs a body that fits twice: a trellis container):
   powershell -File tools\tp\gemma_tp_identity.ps1 -Model <trellis>.r4dx -Layout trellis -TpMode emulate -OutDir <dir>
 #>
@@ -50,8 +50,8 @@ param(
     [int]$Device = 1,
     [int]$MaxCtx = 4096,
     [string]$Chat = "tools\reference\kl_corpus\chat_gemma.json",
-    [string]$TruthDir = "D:\models\r4dx\huihui-gemma\kl\fp32\truth",
-    [string]$NoiseDir = "D:\models\r4dx\huihui-gemma\kl\fp32\bf16sdpa",
+    [string]$TruthDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\kl\fp32\truth",
+    [string]$NoiseDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\kl\fp32\bf16sdpa",
     [double]$KlFactor = 3.0,
     [double]$Top1MinPct = 99.5,
     [string]$Python = "",

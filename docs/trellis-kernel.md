@@ -77,8 +77,8 @@ and must not slow decode.
 | # | Gate | Pass condition |
 |---|---|---|
 | A0 | Oracle pre-gate (`docs/trellis.md:6-7`) | Matched-basis oracle weights-only KL ≤ ~0.008 at `K4m` or `mix4.5m`. If this fails, **nothing below M0 is started.** |
-| A1 | Quality | Rung-4 canonical KL (`tool_teacher_forced_logprobs --layout trellis` + `kl_report.py` against `D:\models\r4dx\kl-canon\ref` on `tokens_canon.json`) **≤ 0.0117** (0.75 × [0.01555]), at decode bytes ≤ [13.68 GiB]. Try `K4m` (about 12.13 GiB) first, then `mix4.5m` (about 13.55 GiB). A result between 0.0117 and 0.01555 is a real but small gain that does not justify a second weight format; report it and do not ship. |
-| A2 | Implementation fidelity | On a `--lm-head bf16` twin of the container (same body bytes): the runtime's KL measured **from the oracle's own dump** of the same point (`kl_report.py --allow-mismatch --ref-dir D:\models\r4dx\kl-trellis\<point>`, section 6 step 3) − 0.0012 (fp8 KV, `docs/quant2.md:1194`) must lie within **±8e-4**, which is 2× the reference self-noise of 3.9e-4 (`docs/quant2.md:64`). Top-1 against the bf16 reference must be within 0.3 points of the oracle's. Measured on v1 (M4); M5's fused producers are byte-identical to v1 by construction and by test (5.4), so A2 carries over. *Revised at M4 (10.4):* the first wording took runtime KL − oracle KL, both from the bf16 reference, which assumes the two KLs add; they do not (the cross term measured −8.4e-4, as large as the bound). |
+| A1 | Quality | Rung-4 canonical KL (`tool_teacher_forced_logprobs --layout trellis` + `kl_report.py` against `E:\models\r4dx\kl-canon\ref` on `tokens_canon.json`) **≤ 0.0117** (0.75 × [0.01555]), at decode bytes ≤ [13.68 GiB]. Try `K4m` (about 12.13 GiB) first, then `mix4.5m` (about 13.55 GiB). A result between 0.0117 and 0.01555 is a real but small gain that does not justify a second weight format; report it and do not ship. |
+| A2 | Implementation fidelity | On a `--lm-head bf16` twin of the container (same body bytes): the runtime's KL measured **from the oracle's own dump** of the same point (`kl_report.py --allow-mismatch --ref-dir E:\models\r4dx\kl-trellis\<point>`, section 6 step 3) − 0.0012 (fp8 KV, `docs/quant2.md:1194`) must lie within **±8e-4**, which is 2× the reference self-noise of 3.9e-4 (`docs/quant2.md:64`). Top-1 against the bf16 reference must be within 0.3 points of the oracle's. Measured on v1 (M4); M5's fused producers are byte-identical to v1 by construction and by test (5.4), so A2 carries over. *Revised at M4 (10.4):* the first wording took runtime KL − oracle KL, both from the bf16 reference, which assumes the two KLs add; they do not (the cross term measured −8.4e-4, as large as the bound). |
 | A3 | Decode speed | `tools/quant2/bench_decode.ps1`, interleaved with q2ab_hv2_q3 in the same run, both on the new binary (A6 shows its w4a16 path is unchanged). Median tok/s must be ≥ q2ab's median − 0.5% for plain [35.9], `--dflash k=7` [108.3] and `--mtp 3` [65.9]. Each mode is predicted from its own round composition (4.6): the drafter is unaffected, and the per-row transform and epilogue scale with M. |
 | A3p | Prefill | Tokens/s on the ≥ 256-token prompts of the same run, compared with q2ab: **≥ 0.80×**. The expected value is 0.74-0.84× (4.7), so M8 is planned. |
 | A4 | G6 | `tools/quant2/g6_validate.ps1 -Layout trellis` 5/5 (`g6_validate.ps1:25-36`): `validate_dflash`, `validate_spec_sampling` (plain vs `--mtp 3` vs `--dflash k=7`, sampled, bit-exact), smoke `-Dflash -ToolRoundTrip -Vision`, smoke `-Mtp 3`, and smoke `-Tp 2 -TpMode emulate -Dflash`. `g6_validate.ps1` gains a `-Layout` parameter (default `w4a16`) that it passes as `-Layouts` to both validators and as `-Layout` to all three smoke steps; today it hardcodes `w4a16` (`:27`, `:29`) and the smoke steps fall back to `smoke.ps1`'s default (`:138`). The validators and `smoke.ps1` need no change. |
@@ -259,13 +259,13 @@ M3 measures the container with the same method used for the 13.68 figure.
 ### 3.2 CLI
 
 ```
-r4dx-convert --input <HF dir> --output D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx `
-  --trellis-from D:\models\r4dx\trellis-q\K4m            # override dir or its weights_override.json
+r4dx-convert --input <HF dir> --output E:\models\r4dx\qwen38-27b-trellis-k4m.r4dx `
+  --trellis-from E:\models\r4dx\trellis-q\K4m            # override dir or its weights_override.json
   [--trellis-manifest-sha256 <hex>]                      # pin: refuse if the manifest hashes otherwise
   [--trellis-verify full|none]                           # default full (3.3 step 10)
   [--trellis-allow-basis exl3]                           # default: refuse hessian_basis != "matched"
   [--trellis-prescale-log2 <int>]                        # default 0 (2.3, 4.8)
-  --rotate none --no-bf16 --mtp on --vision on --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+  --rotate none --no-bf16 --mtp on --vision on --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
   --layouts w4a16 --lm-head w4a16 <q2ab_hv2_q3's lm_head/MTP flags: --quant search, --ldlq, --hessian-dir,
   --w4a16-group-rule "^lm_head$=32", ...>
 ```
@@ -1090,7 +1090,7 @@ sharded as today (`tp_shard.cpp:222-234`).
 - their `decode_words` f16 Q;
 - random A and suh, the fp32-emulated transform outputs (same butterfly order) and the fp64 full
   linear;
-- **real tiles** when `D:\models\r4dx\trellis-q\K4m` exists: a 256×256 block of L03 `attn.k`, L10
+- **real tiles** when `E:\models\r4dx\trellis-q\K4m` exists: a 256×256 block of L03 `attn.k`, L10
   `mlp.down` and L07 `mlp.gate_up` (gate and up), cut from the oracle files with their `suh`/`svh`
   slices.
 
@@ -1111,8 +1111,8 @@ sharded as today (`tp_shard.cpp:222-234`).
 
 1. Convert `qwen38-27b-trellis-k4m.r4dx`, plus its `--lm-head bf16` twin for A2.
 2. `tool_teacher_forced_logprobs --layout trellis --tokens tools\reference\kl_corpus\tokens_canon.json`,
-   then `kl_report.py --ref-dir D:\models\r4dx\kl-canon\ref`. This gives A1.
-3. `kl_report.py --allow-mismatch --ref-dir <oracle golden dump D:\models\r4dx\kl-trellis\K4m>`
+   then `kl_report.py --ref-dir E:\models\r4dx\kl-canon\ref`. This gives A1.
+3. `kl_report.py --allow-mismatch --ref-dir <oracle golden dump E:\models\r4dx\kl-trellis\K4m>`
    against the twin's runtime dump. This gives A2 (as revised at M4, 10.4).
 4. Greedy sanity check: `r4dx-cli` on the haiku prompt.
 5. **A6 (w4a16 regression)** on the final binary with q2ab_hv2_q3: full ctest, `g6_validate.ps1`
@@ -1300,7 +1300,7 @@ rejected outright. Where a finding's own evidence was off, the doc follows the c
 
 ### 10.1 M1 (2026-09-26, device 1; libr4d `67528dd`)
 
-Full data is in `D:\models\r4dx\trellis-m1\` (start with `m1_report.md`).
+Full data is in `E:\models\r4dx\trellis-m1\` (start with `m1_report.md`).
 
 **Tests.**
 - `test_trellis_decode`: 2957 checks, all bit-exact.
@@ -1345,7 +1345,7 @@ byte ratio of 0.879.
 
 ### 10.2 M2 (2026-09-27, device 1; libr4d `67528dd` plus the uncommitted M2 tree)
 
-Full data is in `D:\models\r4dx\trellis-m2\` (start with `m2_report.md`).
+Full data is in `E:\models\r4dx\trellis-m2\` (start with `m2_report.md`).
 
 **Built.**
 - libr4d: `r4d_gemm_trellis_nt_m64`, the whole linear (4.5: 8-row LDS reduction, tickets, the fp32
@@ -1418,7 +1418,7 @@ The bars were X ≤ 0.30 ms and X − S ≤ 0.14 ms. Both chains ran at 3187-323
 
 ### 10.3 M3 (2026-09-27, CPU only; converter)
 
-Logs are in `D:\models\r4dx\trellis-m3\`. The recipe is `tools/quant2/trellis_convert.ps1`.
+Logs are in `E:\models\r4dx\trellis-m3\`. The recipe is `tools/quant2/trellis_convert.ps1`.
 
 **Built** as section 3 specifies: `r4dx-convert --trellis-from` in `src/convert/main.cpp` and
 `trellis_import.hpp`, with the `trellis` `LayoutSet` in `linear_layouts.hpp`. Changes to the plan
@@ -1469,7 +1469,7 @@ With these flags:
 - The lm_head is `w4a16` rather than `4bit`, because `--layout trellis` loads the w4a16 head.
 
 The script pins the manifest to the one whose KL was measured: `weights_override.manifest_sha256` of
-the A0 run's `D:\models\r4dx\kl-trellis\<oracle>\reference_run.json` (K4m `7e9037f4…`, mix4.5m
+the A0 run's `E:\models\r4dx\kl-trellis\<oracle>\reference_run.json` (K4m `7e9037f4…`, mix4.5m
 `48a2eacb…`), so a manifest changed since then is refused. `-ManifestSha256` overrides the pin. The
 log records the converter's path, time and sha256.
 
@@ -1522,7 +1522,7 @@ KB = 4 and 5, down with K = 17408, and attn.k/v with N = 1024.
 
 ### 10.4 M4 (2026-09-27, device 1; runtime v1)
 
-Outputs are in `D:\models\r4dx\trellis-m4\`.
+Outputs are in `E:\models\r4dx\trellis-m4\`.
 
 **Built** as 5.1-5.3 and 5.5-5.6. A trellis container runs in r4dx-cli, r4dx-server and
 `tool_teacher_forced_logprobs` with `--layout trellis`. Changes to the plan:
@@ -1621,8 +1621,8 @@ about A3.
 
 **Measured M4: gates A1 and A2.** These runs used the post-review binary on device 1:
 `tool_teacher_forced_logprobs --max-ctx 4096 --vision off` on `tokens_canon.json`, then `kl_report.py`
-against `D:\models\r4dx\kl-canon\ref`, the same scoring as `docs/trellis.md` 14.1. Each run took 2-3
-minutes. The results are in `D:\models\r4dx\trellis-m4\m4_report.md`, which also has per-segment
+against `E:\models\r4dx\kl-canon\ref`, the same scoring as `docs/trellis.md` 14.1. Each run took 2-3
+minutes. The results are in `E:\models\r4dx\trellis-m4\m4_report.md`, which also has per-segment
 top-1 and p99, and in `m4_gates.json`. KL is in nats.
 
 | container | layout | mean KL | cpp | en | py | thai | top-1 | p99 |
@@ -1721,7 +1721,7 @@ with A2 re-run.
 
 ### 10.5 M5, part 1 (2026-09-27, device 1; tooling, prefill and TP = 2 rows)
 
-Outputs are in `D:\models\r4dx\trellis-m5\`: the probe runs in `probe\` (one JSON and log per
+Outputs are in `E:\models\r4dx\trellis-m5\`: the probe runs in `probe\` (one JSON and log per
 container, mode and probe; `probe\analysis.txt` has the tables below), the tuning runs as
 `ptune_*` and `tp2_*` (JSON and text), the test logs as `ctest_*.log`.
 
@@ -1894,10 +1894,10 @@ against K4m):
 A3 itself is the interleaved multi-prompt run of M5 part 2:
 
 ```
-.\tools\quant2\bench_decode.ps1 -OutDir D:\models\r4dx\trellis-m5\bench -Container `
-    q2ab=D:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx,`
-    k4m=D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx#trellis,`
-    mix=D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx#trellis
+.\tools\quant2\bench_decode.ps1 -OutDir E:\models\r4dx\trellis-m5\bench -Container `
+    q2ab=E:\models\r4dx\qwen38-27b-q2ab_hv2_q3.r4dx,`
+    k4m=E:\models\r4dx\qwen38-27b-trellis-k4m.r4dx#trellis,`
+    mix=E:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx#trellis
 ```
 
 **Tests** (device 1, the final tree):
@@ -1924,7 +1924,7 @@ A3 itself is the interleaved multi-prompt run of M5 part 2:
 
 ### 10.6 M5, parts 2 and 3 (2026-09-28, device 1; the A3 bench, the slow layers found and fixed)
 
-Outputs are in `D:\models\r4dx\trellis-m5\`: part 2's bench in `bench\` and its probes in
+Outputs are in `E:\models\r4dx\trellis-m5\`: part 2's bench in `bench\` and its probes in
 `part2_probe\`; part 3's probes in `part3\probe\` (one JSON, log and, where taken, span timeline per
 run), the fusion A/B in `part3\fusion\`, the final bench in `part3\bench\`, and every script in
 `part3\scripts\`. All runs: prompt p3 of `tests/model/mtp_prompts.txt`, 256 greedy tokens, unless a
@@ -2108,7 +2108,7 @@ q2ab's tokens per round):
 
 The final binary is M5's tree (the M5 work on top of f197269; libr4d `ddc410f` on `trellis`),
 rebuilt with nothing to do; M6 changed only scripts, the tests' CMake and docs. Outputs are in
-`D:\models\r4dx\trellis-m6\` (`scripts\` holds the A6 driver and the text comparison).
+`E:\models\r4dx\trellis-m6\` (`scripts\` holds the A6 driver and the text comparison).
 
 **A4: G6 on both trellis containers** (`g6_validate.ps1 -Layout trellis`, `g6-k4m\`, `g6-mix45m\`):
 
@@ -2136,7 +2136,7 @@ Real TP = 2 needs device 0 and was not run, as for q2ab.
   registered: no interpreter that imports torch/transformers/numpy is configured (below).
 - **G6, default `-Layout w4a16`** on q2ab_hv2_q3: 5/5 (table above). All 30 output hashes of both
   validators equal the 2026-09-26 G6 run on the pre-trellis binary
-  (`D:\models\r4dx\g6-qwen38-27b-q2ab_hv2_q3\`), in order.
+  (`E:\models\r4dx\g6-qwen38-27b-q2ab_hv2_q3\`), in order.
 - **`tools/tp/tp1_identity.ps1`** against the frozen baseline `%USERPROFILE%\dev\r4dx-baselines\tp1-f7d4927`
   (docs/tp.md 10.3; its default v6 container, since the f7d4927 binaries predate rotation and cannot
   read q2ab): **G2 PASS**, rows 1-9 byte-identical, row 6 in all four layouts, row 7 on the golden
@@ -2161,7 +2161,7 @@ Real TP = 2 needs device 0 and was not run, as for q2ab.
 `-DR4DX_REFERENCE_PYTHON`, the venv, the `R4DX_REFERENCE_PYTHON` environment variable and `python`
 on PATH (10.8). Usage lines in the Python tools and `tools/reference/README.md` say `python`.
 `trellis_convert.ps1`, `trellis_oracle.ps1` and `trellis_quant.py` default to hessian-v2's new home,
-`D:\models\r4dx\hessian\hessian-v2` (moved from `C:\AI\r4dx-hessian` on 2026-09-28).
+`E:\models\r4dx\hessian\hessian-v2` (moved from `C:\AI\r4dx-hessian` on 2026-09-28).
 
 **Verdicts.** **A4 PASS** (5/5 on K4m and mix4.5m), **A5 PASS**, **A6 PASS** (ctest green, G6 w4a16 5/5, G2 identity, text 12/12). With
 M4's A0-A2 and M5's A3/A3p, both containers are shippable under D1: K4m passes every gate; mix4.5m
@@ -2201,6 +2201,6 @@ Two reviews of the branch (correctness; merge readiness). Fixed:
 
 **Tests** (`build.ps1` with `$env:R4DX_REFERENCE_PYTHON` = Python 3.12, then `tests\run_tests.ps1`):
 94 registered, 93 pass, 0 fail, `test_kernel_bandwidth` skipped (absent golden) -- the three
-portable reference tests now among them (`D:\models\r4dx\trellis-m6\review\ctest.log`). G6 steps
+portable reference tests now among them (`E:\models\r4dx\trellis-m6\review\ctest.log`). G6 steps
 that load through the changed code, on mix4.5m: `validate_dflash` 3/3 byte-identical, with the same
 three hashes as M6's `g6-mix45m`; `smoke -Tp 2 -TpMode emulate -Dflash` all checks passed.

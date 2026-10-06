@@ -288,7 +288,7 @@ HIP device 1:
    alongside its existing `mtp_seed_valid_`/`mtp_num_accepted_valid_` invalidations.
 2. **The `VerifyWindow` capture call site had zero test coverage** (only the `RunChunk`/`Prefill`
    half was tested) -- fixed: `tests/model/test_dflash_feature_capture.cpp`'s new Part 3 attaches a
-   capture on an MTP-enabled `Model` (`D:/models/r4dx/qwen38-27b-l4-allmtp.r4dx`, `--mtp 3`), drives
+   capture on an MTP-enabled `Model` (`E:/models/r4dx/qwen38-27b-l4-allmtp.r4dx`, `--mtp 3`), drives
    one `VerifyWindow` call, and asserts `DflashFeatureRows()==candidates.size()` and bit-exactness
    against `EmbeddingGatherHost` -- **[PASS]**, real hardware.
 3. **Multi-chunk `Prefill()` silently discarded every chunk's captured rows except the last** --
@@ -1187,7 +1187,7 @@ Huihui trellis mix4.5m container plus the `qwen38-27b-dflash2-w4a16-g64.r4dx` dr
 `r4dx-cli` process per run, one run at a time, nothing else of ours on either GPU (the runner polled for other
 `r4dx-cli`/`r4dx-server`/`ctest`/`test_*`/`tool_*` processes before and during every run; none appeared, 0 of 768 rows
 contaminated). Prompts are the 39 agent-shaped prompts of the Track B acceptance study (12 short corpus_v2 chat/code
-prompts plus 27 written coding-agent prompts, 39-557 prompt tokens; `D:\models\r4dx\linear\B\agent_prompts.txt`,
+prompts plus 27 written coding-agent prompts, 39-557 prompt tokens; `E:\models\r4dx\linear\B\agent_prompts.txt`,
 copied unchanged). `--max-tokens 512`, so each run is the first 512 tokens of a thinking trace (38 of 39 prompts hit the
 cap). Order: seeded shuffle by run index (never by clock), one default-config canary (k7 p0, prompt 18) every 24 runs of
 the coarse stage. Tables are pooled as sum(tokens) / sum(decode seconds) over all runs of a config ("token-weighted
@@ -1281,7 +1281,7 @@ default's per-prompt range is 65.9 tok/s (stack-java) to 135.0 (refactor-js).
 
 **No, not in anything measured.** The lowest default-over-plain ratio over the 39 prompts is **1.86x** (stack-java, 2.63
 tok/round, 65.9 vs 35.3 tok/s); 0 of 39 prompts were below 1.0. Two extra probes (one run each, plain / 7/0 / 7/0.3, same session,
-logs under `D:\models\r4dx\dflash-sweep\probe`):
+logs under `E:\models\r4dx\dflash-sweep\probe`):
 
 - Very short completions, thinking on (256-token cap, `max-ctx` 2048): "Reply with the single word OK." (29 tokens, EOS) **5.13x**, "What is
   17 times 23?" (46 tokens) **4.68x**, a French translation (56 tokens) **2.30x**, a JSON edit (71 tokens) **4.24x**. Thinking closed and the
@@ -1300,7 +1300,7 @@ logs under `D:\models\r4dx\dflash-sweep\probe`):
 
 Flags only, unchanged from the current default:
 
-    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
+    --dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 
 (`--dflash-p-min` and `--dflash-n-min` left at 0; `--dflash-p-min 0.2` is equivalent within noise and is not worth a change.)
 **Expected gain over the current default: none (+0.0%, 95% CI about -0.4% to +0.3% for the best alternative, 7/0.2).** The
@@ -1322,7 +1322,7 @@ acceptance (tok/round) or the per-round cost, not from `k` or `p_min`.
   and a coarse-grid run on all 39 prompts. 18 configs x 12 prompts were run coarse; 4 configs x 39 x 3 final (plain 39 x 1).
 - Prompts are synthetic; there are 39, not the 36 of the task text (the Track B set was not trimmed).
 - Total GPU time about 3 h 20 min (coarse 58 min, final 2 h 7 min, probes 15 min, smoke runs under 2 min).
-- Files: `D:\models\r4dx\dflash-sweep\` (`run_sweep.ps1`, `make_schedule.py`, `analyze_sweep.py`, `extra_final.py`,
+- Files: `E:\models\r4dx\dflash-sweep\` (`run_sweep.ps1`, `make_schedule.py`, `analyze_sweep.py`, `extra_final.py`,
   `schedule_*.jsonl`, `results_{coarse,final}.jsonl`, `logs\`, `coarse_table.txt`, `final_table.txt`, `final_extra.txt`, `probe\`).
 
 ## 11. Files
@@ -1345,7 +1345,7 @@ CPU-tested; **no GPU run has happened** (see "GPU gates" below for the exact com
 
 | Question | Resolution |
 |---|---|
-| Checkpoint | `z-lab/gemma4-12B-it-DFlash`, 1.46 GB `model.safetensors` (bf16) + `config.json`, at `D:\models\z-lab-gemma4-12B-it-DFlash`. 5 layers, hidden 3840, ffn 7680, 32 q / 8 kv heads, head_dim 128, block 16, window 2048, rope theta 1e6, rms eps 1e-6, vocab 262144, tied (no embed / lm_head in the file), `layer_types` = 4 x sliding + 1 x full (in that order), `dflash_config.target_layer_ids` [1,10,19,27,36,45], `mask_token_id` 4, `final_logit_softcapping` 30. |
+| Checkpoint | `z-lab/gemma4-12B-it-DFlash`, 1.46 GB `model.safetensors` (bf16) + `config.json`, at `E:\models\z-lab-gemma4-12B-it-DFlash`. 5 layers, hidden 3840, ffn 7680, 32 q / 8 kv heads, head_dim 128, block 16, window 2048, rope theta 1e6, rms eps 1e-6, vocab 262144, tied (no embed / lm_head in the file), `layer_types` = 4 x sliding + 1 x full (in that order), `dflash_config.target_layer_ids` [1,10,19,27,36,45], `mask_token_id` 4, `final_logit_softcapping` 30. |
 | Tensor names | Plain Qwen3 `DFlashDraftModel`: `fc.weight` [3840, 6*3840], `hidden_norm.weight`, `norm.weight`, `layers.i.{input_layernorm,post_attention_layernorm}.weight`, `layers.i.self_attn.{q,k,v,o}_proj.weight`, `{q,k}_norm.weight` [128], `layers.i.mlp.{gate,up,down}_proj.weight`. 81 container tensors after conversion. |
 | Target layer index | z-lab: `hidden_states[layer_id + offset]`, `offset = 1`. HF `hidden_states[j+1]` is the OUTPUT of layer j == the INPUT of layer j+1. The container stores layer-INPUT indices (the Qwen precedent), so `target_layers = ids + 1 = [2,11,20,28,37,46]`. `GemmaModel::AttachFeatureCapture(L)` captures "the residual stream ENTERING layer L" after the previous layer's `layer_scalar` (== HF `hidden_states[L]`), un-rotated, bf16: the convention matches with no further +1. `--dflash-target-layer-offset 0` stores the ids unchanged (the A/B knob). Index 46 < 48, so no entry hits the post-final-norm slot. |
 | Embedding scale | **VERIFIED against the raw source** (z-lab/dflash `dflash/model.py` @ 07ebd93, vendored verbatim as `tools/reference/gemma/zlab_dflash_model.py`; the first reading came from a summary and was re-checked against the raw file): `dflash_generate` builds the block with `_raw_input_embeddings(target, ids, input_embedding_scale)` = `F.embedding(ids, target.get_input_embeddings().weight) * scale`, default 1.0. It reads the table WEIGHT directly, so it bypasses `Gemma4TextScaledWordEmbedding.forward` (which would multiply by 62). Whether the checkpoint was TRAINED with raw rows is the one thing the code cannot say; the config has no `input_embedding_scale`, so 1.0 is what z-lab's own inference path feeds. Scale 62 stays an A/B arm only (`tools/gemma_dflash_ab.ps1` runs both by default). Original note: The draft block is `F.embedding(ids, target_embed_weight) * input_embedding_scale`, default 1.0, ABSENT from this config: the RAW table rows, NOT Gemma's `sqrt(3840) = 62` scaled ones (the target's own gather is scaled; the drafter's is not). Stored as `dflash2.embed_scale` (1.0). `R4DX_DFLASH_EMBED_SCALE=62` overrides it at load for the D-7 A/B with no reconversion. |
@@ -1367,7 +1367,7 @@ dflash2 container and SYNTHESIZES the dflash2-only ones so the dflash2 forward i
   only if profiling shows it matters).
 New OPTIONAL `__metadata__.dflash2` keys (written only when set; Qwen containers are byte-identical): `logit_softcap`,
 `embed_scale`, `variant` (`v1_identity`), `target_layer_offset`. `DflashDraftWeights` parses them with defaults 0 / 1.0 / "".
-The real container was written to `D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx` (2 s, 1.80 GB, 81 tensors) and spot-verified
+The real container was written to `E:\models\r4dx\gemma4-12b-dflash-bf16.r4dx` (2 s, 1.80 GB, 81 tensors) and spot-verified
 against the HF file (every linear byte-equal, identity conv, norms) with a Python reader.
 
 ### 13.3 Runtime changes (D-4 / D-5)
@@ -1424,8 +1424,8 @@ Build, then (device 1, one process, nothing else on the GPU):
 ctest --preset win-hip -R "test_dflash_attn|test_dflash_conv|test_rope_neox|test_rmsnorm_plain|test_topk16"
 # acceptance A/B vs plain decode on chat prompts (greedy; compare the two outputs byte for byte and read the [stats] dflash line)
 $env:HIP_VISIBLE_DEVICES='1'
-r4dx-cli --model <gemma trellis or D:\models\r4dx\huihui-gemma\bf16.r4dx> --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
-r4dx-cli --model <same> --dflash D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx --dflash-k 7 --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
+r4dx-cli --model <gemma trellis or E:\models\r4dx\huihui-gemma\bf16.r4dx> --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
+r4dx-cli --model <same> --dflash E:\models\r4dx\gemma4-12b-dflash-bf16.r4dx --dflash-k 7 --chat --prompt "..." --temperature 0 --max-tokens 256 --stats
 # layer-offset {1 (default), 0} x embed-scale {1 (default), 62}: reconvert with --dflash-target-layer-offset 0 for the first, set
 # R4DX_DFLASH_EMBED_SCALE=62 for the second.
 ```

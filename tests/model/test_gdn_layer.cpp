@@ -53,7 +53,7 @@ using r4dx::model::LayoutName;
 using r4dx::model::Mlp;
 
 namespace {
-const char* kContainerPath = r4dx_test::ContainerPath("D:/models/r4dx/qwen38-27b-l4-bf16.r4dx");
+const char* kContainerPath = r4dx_test::ContainerPath("r4dx/qwen38-27b-l4-bf16.r4dx");
 // R4DX_SOURCE_DIR is defined by tests/CMakeLists.txt from ${CMAKE_SOURCE_DIR}.
 const char* kGoldenPath = R4DX_SOURCE_DIR "/tools/reference/golden_out/layer_000_gdn.safetensors";
 

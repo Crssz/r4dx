@@ -5,7 +5,8 @@ dumped on the chat gate corpus (GPU, --device), scored against the fp32 truth (k
 container and the log-prob dump deleted. Layer -1 is the all-K4 baseline. One JSON line per run in
 <out>/results.jsonl: {"layer", "groups": {name: mean_kl}, "top1": {...}, "bits_extra"}.
 
-  python tools/gemma/sens_sweep.py --device 1 --layers -1,0,2,4,... --out D:\\models\\r4dx\\huihui-gemma\\sens
+  python tools/gemma/sens_sweep.py --device 1 --layers -1,0,2,4,... --out <models root>\\r4dx\\huihui-gemma\\sens
+(<models root> = $env:R4DX_MODELS_ROOT)
 """
 import argparse
 import hashlib
@@ -17,11 +18,13 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-Q = Path(r"D:\models\r4dx\huihui-gemma\trellis\q")
-MODEL = r"D:\models\Huihui-gemma-4-12B-it-abliterated"
+MODELS_ROOT = Path(os.environ.get("R4DX_MODELS_ROOT", r"E:\models"))
+HG = MODELS_ROOT / "r4dx" / "huihui-gemma"
+Q = HG / "trellis" / "q"
+MODEL = str(MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated")
 CONVERT = REPO / r"build\win-hip-merge\src\convert\r4dx-convert.exe"
 TOOL = REPO / r"build\win-hip-merge\tests\model\tool_teacher_forced_logprobs.exe"
-KL = Path(r"D:\models\r4dx\huihui-gemma\kl")
+KL = HG / "kl"
 PY = r"D:\venvs\r4dx-gemma-ref\Scripts\python.exe"
 
 
@@ -88,9 +91,9 @@ def main() -> int:
         sha = hashlib.sha256(man.read_bytes()).hexdigest()
         cont = d / "c.r4dx"
         run([str(CONVERT), "--input", MODEL, "--output", str(cont), "--trellis-from", str(d), "--trellis-manifest-sha256",
-             sha, "--trellis-verify", "full", "--kv-calib", r"D:\models\r4dx\huihui-gemma\kvcalib.json", "--no-bf16",
+             sha, "--trellis-verify", "full", "--kv-calib", str(HG / "kvcalib.json"), "--no-bf16",
              "--lm-head", "w4a16", "--w4a16-group-rule", "^lm_head$=32", "--hessian-dir",
-             r"D:\models\r4dx\huihui-gemma\hessian-v1", "--ldlq", "^lm_head$", "--threads", "12"], "-1", log)
+             str(HG / "hessian-v1"), "--ldlq", "^lm_head$", "--threads", "12"], "-1", log)
         dump = d / "dump"
         dump.mkdir(exist_ok=True)
         run([str(TOOL), "--model", str(cont), "--layout", "trellis", "--tokens", str(REPO / r"tools\reference\kl_corpus\chat_gemma.json"),

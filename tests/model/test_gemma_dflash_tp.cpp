@@ -17,9 +17,10 @@
 //                                                                numerics of the vocab-split GEMM may move it)
 //   D  TP=2 real, lifecycle: a sampled request takes one plain step (walk_len 0); with injection off DecodeStepDflashGreedy
 //      throws and plain decode still works; Reset() + injection on drafts again and still equals A's prefix.
-// Env: R4DX_GEMMA_DFLASH_TARGET (default D:\models\r4dx\huihui-gemma\bf16.r4dx), R4DX_GEMMA_DFLASH_DRAFTER (default
-// D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx), R4DX_GEMMA_DFLASH_LAYOUT (default bf16; trellis for a trellis container).
+// Env: R4DX_GEMMA_DFLASH_TARGET (default <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16.r4dx), R4DX_GEMMA_DFLASH_DRAFTER (default
+// <R4DX_MODELS_ROOT>\r4dx\gemma4-12b-dflash-bf16.r4dx), R4DX_GEMMA_DFLASH_LAYOUT (default bf16; trellis for a trellis container).
 #include <hip/hip_runtime.h>
+#include "r4dx/models_root.h"
 
 #include <algorithm>
 #include <cmath>
@@ -136,8 +137,8 @@ int main() {
     std::printf("SKIP: two-GPU test; run tests\\run_tests.ps1 -TwoGpu\n");
     return 77;
   }
-  const std::string target = Env("R4DX_GEMMA_DFLASH_TARGET", "D:\\models\\r4dx\\huihui-gemma\\bf16.r4dx");
-  const std::string drafter = Env("R4DX_GEMMA_DFLASH_DRAFTER", "D:\\models\\r4dx\\gemma4-12b-dflash-bf16.r4dx");
+  const std::string target = Env("R4DX_GEMMA_DFLASH_TARGET", r4dx::ModelsPath("r4dx/huihui-gemma/bf16.r4dx").c_str());
+  const std::string drafter = Env("R4DX_GEMMA_DFLASH_DRAFTER", r4dx::ModelsPath("r4dx/gemma4-12b-dflash-bf16.r4dx").c_str());
   const std::string layout = Env("R4DX_GEMMA_DFLASH_LAYOUT", "bf16");
   if (!r4dx_test::FileExists(target)) return r4dx_test::SkipMissing(target);
   if (!r4dx_test::FileExists(drafter)) return r4dx_test::SkipMissing(drafter);

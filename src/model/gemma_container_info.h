@@ -2,7 +2,7 @@
 // M1-19): everything that can be decided from `__metadata__` and the safetensors tensor DIRECTORY, with no
 // HIP call and no tensor byte read. GemmaContainer::Load (gemma_container.cpp) runs these checks first and
 // then uploads; tests/model/test_gemma_container.cpp runs them alone on the tiny converter fixtures and on
-// the real D:\models\r4dx\huihui-gemma\bf16.r4dx header.
+// the real <R4DX_MODELS_ROOT>\r4dx\huihui-gemma\bf16.r4dx header.
 //
 // Header-only and HIP-free (like gemma_config.h / rotation_meta.h).
 #pragma once

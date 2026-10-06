@@ -35,9 +35,9 @@ Shards (two GPUs, no P2P needed): `--shard K/N` takes every N-th entry of the pr
 device and merge with `--merge a.jsonl b.jsonl --out samples.jsonl`:
 
     $env:HIP_VISIBLE_DEVICES='0'; $env:R4DX_REF_ALLOWED_DEVICES='0,1'; D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe `
-        tools\\reference\\gemma\\gen_samples.py --shard 0/2 --out D:\\models\\r4dx\\huihui-gemma\\corpus\\samples.shard0.jsonl
+        tools\\reference\\gemma\\gen_samples.py --shard 0/2 --out <models root>\\r4dx\\huihui-gemma\\corpus\\samples.shard0.jsonl
     $env:HIP_VISIBLE_DEVICES='1'; $env:R4DX_REF_ALLOWED_DEVICES='0,1'; D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe `
-        tools\\reference\\gemma\\gen_samples.py --shard 1/2 --out D:\\models\\r4dx\\huihui-gemma\\corpus\\samples.shard1.jsonl
+        tools\\reference\\gemma\\gen_samples.py --shard 1/2 --out <models root>\\r4dx\\huihui-gemma\\corpus\\samples.shard1.jsonl
 
 (device 0 drives the desktop: only with the user's go-ahead for that run.) `--dry-run` needs no model and no GPU:
 it validates the prompt file, renders every prompt with both thinking settings and prints the token budget.
@@ -67,6 +67,7 @@ from gemma.common_gemma import (  # noqa: E402
     BOS_ID,
     DEFAULT_MODEL_DIR,
     EOS_IDS,
+    GEMMA_OUT_DIR,
     KL_CORPUS_DIR,
     PROMPTS_PATH,
     load_generation_config,
@@ -423,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     ap.add_argument("--tokenizer-dir", type=Path, default=None)
     ap.add_argument("--prompts", type=Path, default=PROMPTS_PATH)
-    ap.add_argument("--out", type=Path, default=Path(r"D:\models\r4dx\huihui-gemma\corpus\samples.jsonl"))
+    ap.add_argument("--out", type=Path, default=GEMMA_OUT_DIR / "corpus" / "samples.jsonl")
     ap.add_argument("--manifest", type=Path, default=None, help="default gen_manifest.json next to --out")
     ap.add_argument("--shard", default=None, help="K/N: every N-th entry of the processing order (one per GPU)")
     ap.add_argument("--merge", nargs="+", type=Path, default=None, metavar="SHARD.jsonl",

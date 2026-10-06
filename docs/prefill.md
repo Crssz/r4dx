@@ -6,7 +6,7 @@ work below ran through the base `qwen38-27b-trellis-mix45m.r4dx` on 2x R9700; si
 default of `tools/prefill/*.ps1` is the Huihui abliterated `huihui-qwen38-27b-abl-trellis-mix45m.r4dx`
 (same recipe and shapes, so the M1 conclusions -- exact-wide is bit-identical to the dense kernel --
 are properties of the kernels and carry over; the base container and the M0 dense KL/TTFT dumps
-under `D:\models\r4dx\prefill-m0` are historical: a lossy M2 mode would need its dense baseline
+under `E:\models\r4dx\prefill-m0` are historical: a lossy M2 mode would need its dense baseline
 re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
 
 - **M0:** measure. A long-context eval kit, a profile of where prefill time goes, and dense accuracy
@@ -19,7 +19,7 @@ re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
   [The 256-row prefill chunk](#the-256-row-prefill-chunk-default-on-r4dx_prefill_chunk).
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs
-are in `D:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and are never committed.
+are in `E:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and are never committed.
 
 ## M0: baseline and profile (dense prefill, 64-row chunks)
 
@@ -245,7 +245,7 @@ Split-KV at 4b04ece missed the lossless gate (mean KL <= 0.0005 and top-1 >= 99.
 dense dumps). It failed on prose_32k (0.00090, 97.7%), code_32k (0.00318, 98.0%) and prose_128k
 (0.00163, 96.9%). This section diagnoses why, adds a mode that is bit-identical, and re-validates
 both. Commits: libr4d `c9c0237` and `dec5a4f` (branch `prefill`), r4dx `d731bb8` and `b5e5eb9`.
-Raw outputs are in `D:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1.
+Raw outputs are in `E:\models\r4dx\prefill-m1\fix\`. Everything ran at TP=1 on HIP device 1.
 These runs predate the default change: "split-KV (default law)" and "branch default" below mean
 `R4DX_PREFILL_SPLITKV` unset at the time, which is `=split` today.
 - The exact-mode runs, ctest and the dense and split-KV TTFT reruns used the `b5e5eb9` build.
@@ -424,7 +424,7 @@ other equally accurate rounding members keep it.
 
 **TP=2: not run in this pass** (done later: see [M1 final](#m1-final-exact-by-default-split-kv-opt-in)). TP=2 cold TTFT at 32k and 128k (split-KV and exact) and TP=2 short-prompt
 identity against main TP=2 need device 0. Device 0 is held until M0's own TP=2 128k run 2 finishes
-and writes `D:\models\r4dx\prefill-m0\TP2_DONE`, and that marker did not appear during this pass.
+and writes `E:\models\r4dx\prefill-m0\TP2_DONE`, and that marker did not appear during this pass.
 To run them afterwards (the phase script is in this session's scratchpad, and its steps are the
 plain `ttft_cli.ps1 -Tp 2` calls):
 - `ttft_cli.ps1 -Tp 2 -Lengths 32k,128k -Runs 2 -Cli <b5e5eb9 build>\src\cli\r4dx-cli.exe`, once with
@@ -482,7 +482,7 @@ prefill attention is the exact-wide launch, and split-KV stays one environment v
   CPU before its data-presence skip.
 
 **Checks with the new default** (the `1af310d` build, HIP device 1, outputs in
-`D:\models\r4dx\prefill-m1\final\`):
+`E:\models\r4dx\prefill-m1\final\`):
 - `ctest -LE tp2gpu`: 95/95 passed, including `test_attn_prefill_splitkv` and the parse check in
   `test_attn_layer`.
 - Short-prompt greedy identity against main at TP=1 (plain, dflash7 and mtp3, 4 prompts each from
@@ -510,7 +510,7 @@ TP=2 against TP=1 (the TP=1 M1 validation table, means of 2 runs):
   scales further.
 - Short-prompt greedy identity against main's TP=2 (plain, dflash7 and mtp3, 4 prompts each,
   `--tp 2 --tp-mode real`): 12/12 byte-identical text and token ids.
-- Outputs: `D:\models\r4dx\prefill-m1\final\` (`ttft\`, `identity_tp2\`, `phases.log`, and the
+- Outputs: `E:\models\r4dx\prefill-m1\final\` (`ttft\`, `identity_tp2\`, `phases.log`, and the
   runner `final.ps1`).
 
 **Final default:** exact-wide (lossless: bit-identical to dense at TP=1 and TP=2). 1.51x at 128k
@@ -550,7 +550,7 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   container) rows and for prefix-reuse shapes (300 + 333, 64 + 511, 257 + 1, 1 + 255 + 257: the grid is
   anchored at each call). A negative control shows the digest does change when the chunk grid moves.
 - VRAM (MEASURED 2026-09-30, device 1, Huihui trellis mix4.5m, `--max-ctx 131072`, vision auto, prompt
-  checkpoint on, 8k prompt; `D:\models\r4dx\chunk\implement\mem`): the 256-row activation buffers, the
+  checkpoint on, 8k prompt; `E:\models\r4dx\chunk\implement\mem`): the 256-row activation buffers, the
   DFlash feature buffer and the 224 MiB arena (96 MiB with `=0`) cost 0.13 to 0.20 GiB more per Model.
   Used VRAM at the end of an `r4dx-cli` run, default vs `R4DX_PREFILL_CHUNK=0`: plain 21.86 vs 21.73
   GiB, `--dflash` 23.96 vs 23.76, `--mtp 3` 22.59 vs 22.41 (`arena+scratch` in the load line 0.2312 vs
@@ -579,7 +579,7 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
   logits, tokens and the per-rank all-reduce call counts are equal.
 - **Validation of the default-on change** (MEASURED 2026-09-30, branch `chunk-default`, clean build in a
   new build directory, HIP device 1 and TP = 2 as stated; logs and scratch under
-  `D:\models\r4dx\chunk\gates`, nothing else changed on disk):
+  `E:\models\r4dx\chunk\gates`, nothing else changed on disk):
 
   | check | result |
   |---|---|

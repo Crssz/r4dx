@@ -1,18 +1,18 @@
 # Huihui abliterated: the default trellis mix4.5m container
 
 Since 2026-09-29 this is r4dx's default (production) container. Source:
-`D:\models\Huihui-Qwen3.8-27B-abliterated` (same architecture, tokenizer and config as `Qwen3.8-27B`; 70 of
+`E:\models\Huihui-Qwen3.8-27B-abliterated` (same architecture, tokenizer and config as `Qwen3.8-27B`; 70 of
 1199 tensors differ from base: `mlp.down_proj` x35, `linear_attn.out_proj` x26, `self_attn.o_proj` x9 in layers
 17..51).
 
 ## Container
 
-`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout trellis`, 18,338,486,923 B, decode 13.546 GiB.
+`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `--layout trellis`, 18,338,486,923 B, decode 13.546 GiB.
 The same recipe as the base `qwen38-27b-trellis-mix45m.r4dx` (docs/quant2.md 7.1, docs/trellis.md), with every
 calibration artifact taken from huihui itself: new Hessians (hessian-v2 settings,
 `tools/reference/hessian_capture.py` with GemmGuard), K4m + K5m on huihui, mix 4.5 (allocation identical to
 base's), huihui imatrix and kvcalib for the lm_head / MTP head / fp8 KV. The full run, with every command and the
-torch 2.13+rocm10 venv `quantize-model` needs (MAGMA cholesky), is `D:\models\r4dx\huihui\RECIPE.md`; its
+torch 2.13+rocm10 venv `quantize-model` needs (MAGMA cholesky), is `E:\models\r4dx\huihui\RECIPE.md`; its
 artifacts (`huihui\hessian-v2`, `huihui\trellis-q\{K4m,K5m,mix4.5m}`, `huihui\kl-ref`, `huihui\kl\*`,
 `huihui-qwen38-27b-abl.{imatrix.npz,kvcalib-full.json}`) are what the container's metadata records and what
 `trellis_oracle.ps1` / `trellis_convert.ps1` now default to. The DFlash2 drafter is unchanged
@@ -26,7 +26,7 @@ artifacts (`huihui\hessian-v2`, `huihui\trellis-q\{K4m,K5m,mix4.5m}`, `huihui\kl
   A win-hip-g128 build has no production container (v3 is gone), so its real-container tests SKIP.
 - `--tokenizer-dir` of `r4dx-cli` / `r4dx-server`, the tokenizer / http-server / engine-recovery tests
   (`R4DX_TOKENIZER_MODEL_DIR`), `test_keep_bf16` (`R4DX_HF_CHECKPOINT`) and `tools/reference/common.py`
-  `DEFAULT_MODEL_DIR` (~20 Python tools) name `D:\models\Huihui-Qwen3.8-27B-abliterated`. Its `tokenizer.json`,
+  `DEFAULT_MODEL_DIR` (~20 Python tools) name `E:\models\Huihui-Qwen3.8-27B-abliterated`. Its `tokenizer.json`,
   `tokenizer_config.json`, `chat_template.jinja`, `generation_config.json`, `config.json`, `vocab.json`,
   `merges.txt` and the preprocessor configs are SHA-256 identical to the base's (10/10), so tokenization,
   `tests/tokenizer/golden.json` and the `kl_corpus` token files are unchanged.
@@ -43,12 +43,12 @@ artifacts (`huihui\hessian-v2`, `huihui\trellis-q\{K4m,K5m,mix4.5m}`, `huihui\kl
 
 Removed after this container validated (KL, G6, TP=2, and the regression baselines below re-frozen on it):
 `qwen38-27b-trellis-mix45m.r4dx`, `qwen38-27b-trellis-k4m.r4dx`, `qwen38-27b-trellis-k4m-lmbf16.r4dx`,
-`qwen38-27b-v6.r4dx`, `huihui-qwen38-27b-abl-v6.r4dx` (all in `D:\models\r4dx`), the base oracle bits
-`D:\models\r4dx\trellis-q\`, the base Hessians `D:\models\r4dx\hessian\hessian-v2`, and the base HF checkpoint
-`C:\AI\models\Qwen3.8-27B`. **Name collision:** `D:\models\r4dx\huihui\trellis-q` and `...\huihui\hessian-v2`
+`qwen38-27b-v6.r4dx`, `huihui-qwen38-27b-abl-v6.r4dx` (all in `E:\models\r4dx`), the base oracle bits
+`E:\models\r4dx\trellis-q\`, the base Hessians `E:\models\r4dx\hessian\hessian-v2`, and the base HF checkpoint
+`C:\AI\models\Qwen3.8-27B`. **Name collision:** `E:\models\r4dx\huihui\trellis-q` and `...\huihui\hessian-v2`
 are this container's inputs and stay. Kept: the `l4-*` test containers (4 layers, layers 0-3 are the same in
 either model), the DFlash2 drafters, `kl-canon` / `kl-thai-canon` (the base model's bf16 references),
-`corpus-v2`, the base imatrix / kvcalib files, `D:\models\Qwen3.8-27B-DFlash2`, `D:\models\wikitext-2-raw`, and
+`corpus-v2`, the base imatrix / kvcalib files, `E:\models\Qwen3.8-27B-DFlash2`, `E:\models\wikitext-2-raw`, and
 everything under `huihui\`.
 
 What remains true about the retired variants: the base numbers quoted across the docs (KL 0.00747, K4m's
@@ -90,10 +90,10 @@ the repeat was bit-identical before it was written down.
 
 | what | frozen value | where / how to re-check |
 |---|---|---|
-| Rung-4 KL | mean **0.00788**, top-1 **95.70%**, segments cpp 0.00583 / en 0.00975 / py 0.00778 / thai 0.00814; the four `*.logprobs.f16` are byte-identical between the 2026-09-28 run (`huihui\kl\rt-mix45m`, device 1) and a run of the merged build on device 0 (`rebase\kl-rt-mix45m-new-gpu0`) and on device 1 (`rebase\kl-rt-mix45m-final-gpu1`, the final tree) | `tools\quant2\kl_rung4.ps1 -OutDir <dir>` (gate: KL / top-1 / byte equality); reference `D:\models\r4dx\huihui\kl-ref` |
+| Rung-4 KL | mean **0.00788**, top-1 **95.70%**, segments cpp 0.00583 / en 0.00975 / py 0.00778 / thai 0.00814; the four `*.logprobs.f16` are byte-identical between the 2026-09-28 run (`huihui\kl\rt-mix45m`, device 1) and a run of the merged build on device 0 (`rebase\kl-rt-mix45m-new-gpu0`) and on device 1 (`rebase\kl-rt-mix45m-final-gpu1`, the final tree) | `tools\quant2\kl_rung4.ps1 -OutDir <dir>` (gate: KL / top-1 / byte equality); reference `E:\models\r4dx\huihui\kl-ref` |
 | TP=1 identity, rows 1-5, 7-9 | see the table in docs/tp.md 10.3 (plain / `--dflash` k=7 / `--mtp 3` text and token ids, sampled text and ids, vision, chat); full SHA-256 in `%USERPROFILE%\dev\r4dx-baselines\tp1-1099446\FROZEN_HASHES.txt` | `tools\tp\tp1_identity.ps1 -Baseline tp1-1099446 -Candidate build\win-hip`; baseline binaries frozen from main 1099446 (libr4d dec5a4f), the C++ tree of `huihui` `b512207` |
 | TP=1 identity, row 6 (4-layer `l4-allmtp`, bf16 / w4a16 / w4a8 / mxfp4) | EQUAL against both baselines: `tp1-1099446` and the pre-trellis `tp1-f7d4927` (16 dump hashes in `FROZEN_HASHES.txt`) | same script, `-Rows 6` |
-| G6 (`g6_validate.ps1 -Layout trellis`) | 5/5, identical hash for hash to the pre-rebase run (`D:\models\r4dx\huihui\g6`): validate_dflash 3/3 byte-identical (short `ecf1855ec1b7`, medium `184cde8ff01d`, long `b646012990bb`); validate_spec_sampling 24/24 (12 prompt x sampling cells, plain = `--mtp 3` = `--dflash k=7` in each; 11 distinct text hashes in log order `8262ca0b617f c04f67b116bd ae6fccdcbfc4 0ddb6076f345 5eb007b3edd5 63a92b473d1d b4b44a03ac4d 485d7a312bcf aca3b132db5b dbc0811d2071 de91177f46c1`); smoke dflash + tools + vision 217/0; smoke MTP 3 168/0; smoke TP=2 emulate + DFlash 170/0 (log: `D:\models\r4dx\huihui\rebase\g6-final`). TP=2 **real** smoke with vision and DFlash (`smoke.ps1 -Tp 2 -Layout trellis -Layers -1 -Dflash ... -Vision`): 207 PASS / 0 FAIL, no TDR | G6 stores no expected values: verdict = exit codes and `[PASS]` / `[FAIL]` counts in `summary.json` |
+| G6 (`g6_validate.ps1 -Layout trellis`) | 5/5, identical hash for hash to the pre-rebase run (`E:\models\r4dx\huihui\g6`): validate_dflash 3/3 byte-identical (short `ecf1855ec1b7`, medium `184cde8ff01d`, long `b646012990bb`); validate_spec_sampling 24/24 (12 prompt x sampling cells, plain = `--mtp 3` = `--dflash k=7` in each; 11 distinct text hashes in log order `8262ca0b617f c04f67b116bd ae6fccdcbfc4 0ddb6076f345 5eb007b3edd5 63a92b473d1d b4b44a03ac4d 485d7a312bcf aca3b132db5b dbc0811d2071 de91177f46c1`); smoke dflash + tools + vision 217/0; smoke MTP 3 168/0; smoke TP=2 emulate + DFlash 170/0 (log: `E:\models\r4dx\huihui\rebase\g6-final`). TP=2 **real** smoke with vision and DFlash (`smoke.ps1 -Tp 2 -Layout trellis -Layers -1 -Dflash ... -Vision`): 207 PASS / 0 FAIL, no TDR | G6 stores no expected values: verdict = exit codes and `[PASS]` / `[FAIL]` counts in `summary.json` |
 | ctest | `tests\run_tests.ps1`: **95 / 95 passed, 0 skipped** (833 s; every real-container test ran on this container: `test_dflash_e2e`, `test_vision_tower`, `test_tp_emulation`, `tokenizer_golden`, `test_http_server`, `test_engine_recovery`, `test_keep_bf16`, `reference_gguf_dequant`, `reference_trellis_quant`), `tests\run_tests.ps1 -TwoGpu`: 2 / 2 passed (`test_tp_allreduce_2gpu`, `test_tp_real_vs_emulation`), no TDR. The Python reference interpreter is the system Python 3.12 (transformers 5.5.0), which registers `reference_hessian_rms`, `reference_gguf_dequant`, `reference_trellis_quant`; `reference_manifest`, `reference_dflash2` and `reference_hessian_corpus` need transformers 5.17.0 (only `huihui\venv-rocm10` has it): there `reference_manifest` and `reference_hessian_corpus` (after masking the checkpoint dir in its provenance comparison) pass, and `reference_dflash2` fails 62 numeric-determinism checks (2e-6 .. 1 max_abs_diff) identically on main's untouched tree with that interpreter, i.e. an interpreter effect, not this change | `tests\run_tests.ps1`, `tests\run_tests.ps1 -TwoGpu` |
 | TP=2 KL (G4, emulated, device 0) | mean KL **0.00806**, top-1 96.04% against the bf16 reference (TP=1: 0.00788 / 95.70%); against the TP=1 dump 0.00089 / 98.85% agreement | docs/tp.md 10.4; dump ebase\kl-tp2emu-gpu0 |
 | test_tp_emulation, production-container cases | max rel L2 vs TP=1: MTP replays 4.02e-2, DFlash replays 3.88e-2, vision logits 1.46e-2 (tolerance 5e-2, unchanged; v6 w4a16 measured up to 2.2e-2); both emulated ranks use 19.96 GiB (MTP), 22.58 GiB (DFlash2), 20.50 GiB (vision) at `--max-ctx` 1024 (budgets 22 / 24 / 22 unchanged) | constants and comments in `tests/model/test_tp_emulation.cpp` |
@@ -118,7 +118,7 @@ container, and the old Huihui v6 was the same recipe on this model. Nothing else
 | **w4a8 g128 and mxfp4 g32 at 64 layers** | v6 via `validate_dflash` / `validate_spec_sampling` / `validate_fusion` (manual, layouts `w4a16,w4a8,mxfp4`) | **not covered.** Fused epilogues exist only for w4a8/mxfp4: `tests/kernels/test_fused_quant.cpp` covers the kernels (135-check byte-diff grid), the end-to-end 64-layer fusion gate is gone. |
 
 Last full-depth evidence, taken with the merged build while the old Huihui v6 still existed (nothing was deleted
-by the rebase job), on `huihui-qwen38-27b-abl-v6.r4dx` (w4a16 g64 + w4a8 g128 + mxfp4 g32, 64 layers, vision, MTP; `D:\models\r4dx\huihui\rebase\`):
+by the rebase job), on `huihui-qwen38-27b-abl-v6.r4dx` (w4a16 g64 + w4a8 g128 + mxfp4 g32, 64 layers, vision, MTP; `E:\models\r4dx\huihui\rebase\`):
 
 - `tp1_identity.ps1 -Model <it> -Layout w4a16` rows 1-5 and 7-9 (plain, DFlash, MTP, sampled, vision, chat) of the merged build are EQUAL, text / token ids / stats lines, to the pre-trellis `tp1-f7d4927` binaries: the w4a16 path at depth is byte-identical to before the trellis work.
 - `validate_fusion.ps1 -Model <it>` (w4a16, w4a8, mxfp4 x 3 prompts x `--mtp` 0 / 3): 18 / 18 fused = unfused byte-identical.

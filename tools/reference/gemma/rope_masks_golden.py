@@ -28,6 +28,8 @@ from transformers.models.gemma4_unified.configuration_gemma4_unified import (  #
 
 T = 8
 WINDOW = 4
+MODELS_ROOT = Path(os.environ.get("R4DX_MODELS_ROOT", r"E:\models"))
+DEFAULT_MODEL_DIR = MODELS_ROOT / "Huihui-gemma-4-12B-it-abliterated"
 
 
 def tiny_config(sliding_window=WINDOW):
@@ -84,7 +86,7 @@ def masks_forward_path(cfg, mm_ids):
 
 def real_rope_and_scale():
     """12B text config: inv_freq per layer type, proportional layout check, embed-scale dtype."""
-    cfgj = json.load(open(Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated")) / "config.json"))
+    cfgj = json.load(open(Path(os.environ.get("R4DX_MODEL_DIR", str(DEFAULT_MODEL_DIR))) / "config.json"))
     text = Gemma4UnifiedTextConfig(**cfgj["text_config"])
     rot = M.Gemma4UnifiedTextRotaryEmbedding(text)
     res = {"rope_type": dict(rot.rope_type), "max_position_embeddings": text.max_position_embeddings}
@@ -127,7 +129,7 @@ def real_rope_and_scale():
 
 def bos_and_layer_types():
     """BOS behaviour of the assembled tokenizer dir and the 5:1 layer pattern in config.json."""
-    mdir = Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated"))
+    mdir = Path(os.environ.get("R4DX_MODEL_DIR", str(DEFAULT_MODEL_DIR)))
     tdir = Path(os.environ.get("R4DX_TOKENIZER_DIR", str(mdir) + "-tok"))
     res = {}
     cfgj = json.load(open(mdir / "config.json"))

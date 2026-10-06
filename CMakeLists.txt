@@ -16,6 +16,22 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Models root: where model checkpoints, containers and corpora live. One configurable root for the whole
+# tree (C++: src/core/include/r4dx/models_root.h, same env var and default). Used below for the tests'
+# tokenizer-dir cache variables and compile definitions.
+if(NOT DEFINED R4DX_MODELS_ROOT)
+  if(DEFINED ENV{R4DX_MODELS_ROOT} AND NOT "$ENV{R4DX_MODELS_ROOT}" STREQUAL "")
+    set(R4DX_MODELS_ROOT "$ENV{R4DX_MODELS_ROOT}")
+  else()
+    set(R4DX_MODELS_ROOT "E:/models")
+  endif()
+endif()
+file(TO_CMAKE_PATH "${R4DX_MODELS_ROOT}" R4DX_MODELS_ROOT)
+string(REGEX REPLACE "/+$" "" R4DX_MODELS_ROOT "${R4DX_MODELS_ROOT}")
+
+# r4dx/models_root.h (ModelsRoot()/ModelsPath()) is used by src/ and tests/ alike.
+include_directories(${CMAKE_SOURCE_DIR}/src/core/include)
+
 option(R4DX_BUILD_TESTS "Build tests" ON)
 option(R4DX_BUILD_SERVER "Build the OpenAI-compatible chat server" ON)
 option(R4DX_BUILD_CONVERT "Build the HF -> r4dx weight converter" ON)

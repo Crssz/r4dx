@@ -14,15 +14,16 @@
 #include <string_view>
 #include <vector>
 
+#include "r4dx/models_root.h"
 #include "reasoning_splitter.h"
 
 namespace r4dx::server {
 
 enum class DialectKind { kQwen35, kGemma4 };
 
-// The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults): what an empty
+// The historical tokenizer directory (server_args.h / src/cli/cli_args.h defaults), <R4DX_MODELS_ROOT>\Huihui-Qwen3.8-27B-abliterated (root default E:\models): what an empty
 // --tokenizer-dir resolves to for the Qwen dialect, whose ModelDialect::default_tokenizer_dir is empty.
-inline constexpr const char* kQwenDefaultTokenizerDir = "D:\\models\\Huihui-Qwen3.8-27B-abliterated";
+inline std::string QwenDefaultTokenizerDir() { return r4dx::ModelsPath("Huihui-Qwen3.8-27B-abliterated"); }
 
 struct ModelDialect {
   DialectKind kind = DialectKind::kQwen35;
@@ -91,7 +92,7 @@ DialectKind ResolveDialectKind(std::optional<DialectKind> requested, const std::
                                bool container_is_gemma);
 
 // `requested` when non-empty; else the dialect's default_tokenizer_dir, else (Qwen) the historical
-// kQwenDefaultTokenizerDir.
+// QwenDefaultTokenizerDir().
 std::string ResolveTokenizerDir(const ModelDialect& d, const std::string& requested);
 
 // Cross-check a chosen dialect against the loaded model's architecture string (TextModel::Config(),

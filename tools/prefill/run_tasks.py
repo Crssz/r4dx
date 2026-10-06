@@ -9,8 +9,8 @@ file are skipped). The server's usage.prompt_tokens is checked against the build
 the same templated prompt (a mismatch means the tokenizer/template disagree and is reported).
 
 Usage:
-  python tools\\prefill\\run_tasks.py --port 8093 --tasks-dir D:\\models\\r4dx\\prefill-m0\\tasks `
-      --lengths 8k,32k --out D:\\models\\r4dx\\prefill-m0\\runs\\dense-tp1
+  python tools\\prefill\\run_tasks.py --port 8093 --tasks-dir <models root>\\r4dx\\prefill-m0\\tasks `
+      --lengths 8k,32k --out <models root>\\r4dx\\prefill-m0\\runs\\dense-tp1
 Options: --task niah_single,vt (subset), --limit N (first N items per task per length), --max-tokens N
 (override every item's, e.g. 1 for a pure TTFT sweep).
 """

@@ -5,7 +5,7 @@
   docs/gemma4-plan.md D-7, docs/dflash2.md section 13.6.
 
 .DESCRIPTION
-  Step 1 (CPU, always): r4dx-convert --dflash-hf D:\models\z-lab-gemma4-12B-it-DFlash -> the dflash2 container
+  Step 1 (CPU, always): r4dx-convert --dflash-hf <models-root>\z-lab-gemma4-12B-it-DFlash -> the dflash2 container
   (identity conv, zero selector). Skipped when the output exists.
   Step 2 (GPU, ONLY with -RunGpu; never run it while another job owns the device): for every prompt, r4dx-cli
   --temperature 0 once WITHOUT --dflash (ground truth) and once WITH it, SHA-256 of the raw stdout compared, and the
@@ -21,10 +21,10 @@
 param(
   [string]$Convert = "",  # r4dx-convert.exe; default: build\win-hip\src\convert\r4dx-convert.exe
   [string]$Cli = "",      # r4dx-cli.exe;     default: build\win-hip\src\cli\r4dx-cli.exe
-  [string]$HfDir = "D:\models\z-lab-gemma4-12B-it-DFlash",
-  [string]$Model = "D:\models\r4dx\huihui-gemma\bf16.r4dx",
+  [string]$HfDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\z-lab-gemma4-12B-it-DFlash",
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\bf16.r4dx",
   [string]$Layout = "bf16",  # trellis for a trellis container
-  [string]$Out = "D:\models\r4dx\gemma4-12b-dflash-bf16.r4dx",
+  [string]$Out = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\gemma4-12b-dflash-bf16.r4dx",
   [int]$K = 7,
   [int]$MaxTokens = 256,
   [ValidateSet(0, 1)][int]$LayerOffset = 1,

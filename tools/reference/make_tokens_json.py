@@ -48,7 +48,7 @@ Usage:
         --out tools\\reference\\kl_corpus\\tokens_thai_canon.json
 
 `--arch gemma4` (docs/gemma4-plan.md M0-7; default `qwen` changes nothing above): tokenizes with the
-Gemma tokenizer dir (`--tokenizer-dir`, default D:\\models\\Huihui-gemma-4-12B-it-abliterated-tok), and
+Gemma tokenizer dir (`--tokenizer-dir`, default <models root>\\Huihui-gemma-4-12B-it-abliterated-tok), and
 every segment is `[BOS=2] + text ids` (HF adds no BOS to raw text, so it is explicit here and must
 also be the first token teacher-forced on the r4dx side); `--max-tokens` counts the BOS. The ids are
 checked against both `transformers.AutoTokenizer` and `tokenizers.Tokenizer.from_file` (r4dx's

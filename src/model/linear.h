@@ -193,6 +193,24 @@ class ScopedTrellisM256 {
 };
 bool TrellisM256Active();
 
+// RAII: while alive on this thread, every trellis linear's ApplyLinear rounds its transformed f16 A to int8
+// and back in place right before the GEMM (fake_quant_act.h's `mode`, kernels.h's r4dx_fake_quant_act_f16;
+// docs/int8-prefill.md). Mode 0 (kFakeQuantOff) does nothing at all. Model turns it on around the layers of
+// a prompt-prefill chunk only (R4DX_FAKEQ_ACT), so decode, verify windows, the MTP / DFlash heads and the
+// vision tower never see it. End() restores the previous mode early (idempotent).
+class ScopedFakeQuantAct {
+ public:
+  explicit ScopedFakeQuantAct(int mode);
+  ~ScopedFakeQuantAct() { End(); }
+  ScopedFakeQuantAct(const ScopedFakeQuantAct&) = delete;
+  ScopedFakeQuantAct& operator=(const ScopedFakeQuantAct&) = delete;
+  void End();
+
+ private:
+  int prev_;
+  bool live_;
+};
+
 // docs/trellis-kernel.md 4.8 / 5.4 (M5): whether the layers use the trellis fused producers and
 // shared input transforms below -- on unless R4DX_DISABLE_EPILOGUE=1 (the same A/B switch
 // tools/validate_fusion.ps1 uses for the other layouts' fused epilogues, EpilogueForLayout) or

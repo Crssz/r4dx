@@ -17,6 +17,9 @@
 //
 // The fused producers (M5, docs/trellis-kernel.md 4.8 / 5.4) run the same transform on a value they
 // compute themselves -- silu_mul's or the attention gate-mul's bf16 product -- instead of loading x.
+//
+// r4dx_fake_quant_act_f16 (below) is not part of the transform: the R4DX_FAKEQ_ACT diagnostic that rounds
+// the transform's f16 output to int8 and back in place (docs/int8-prefill.md).
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
@@ -184,6 +187,91 @@ __global__ __launch_bounds__(64) void Fwht128LdsKernel(float* __restrict__ x) {
   for (int i = static_cast<int>(threadIdx.x); i < kTqBlock; i += static_cast<int>(blockDim.x)) b[i] = v[i];
 }
 
+// ---- fake int8 activation quantization (r4dx_fake_quant_act_f16; docs/int8-prefill.md) ----------------
+// In place on a trellis linear's f16 A (the operand after the rotation): v = rint(x / s) * s, s = max|x| / 127
+// over a scale group, fp32 arithmetic, written back as f16. src/model/fake_quant_act.h's FakeQuantGroupRef is
+// the reference. Off the production path: only a Model with R4DX_FAKEQ_ACT set ever launches these.
+constexpr int kFqRow = 1;
+constexpr int kFqBlk128 = 2;
+constexpr int kFqBlk32 = 3;
+constexpr int kFqRowThreads = 256;
+
+__device__ __forceinline__ float F16BitsToFloat(uint16_t b) {
+  return static_cast<float>(__builtin_bit_cast(_Float16, b));
+}
+
+// |x| of an f16 value, or inf for a non-finite one (NaN included), so one max flags a group to leave alone.
+__device__ __forceinline__ float FqKey(uint16_t b) {
+  const float ax = fabsf(F16BitsToFloat(b));
+  return ax <= 65504.0f ? ax : INFINITY;
+}
+
+// One element given its group's key max: zeros for an all-zero group, the input bits for a group with a
+// non-finite element, else f16(rint(x / s) * s) with the product rounded to fp32 first (the empty asm keeps
+// the multiply and the conversion apart, as TransformBlock does: a fused v_fma_mix would round once).
+__device__ __forceinline__ uint16_t FqElement(uint16_t b, float amax) {
+  if (amax == INFINITY) return b;
+  if (amax == 0.0f) return 0;
+  const float s = amax / 127.0f;
+  float q = rintf(F16BitsToFloat(b) / s);
+  q = fminf(fmaxf(q, -127.0f), 127.0f);
+  float prod = q * s;
+  asm("" : "+v"(prod));
+  return __builtin_bit_cast(uint16_t, static_cast<_Float16>(prod));
+}
+
+__device__ __forceinline__ float WaveMax32(float v) {
+#pragma unroll
+  for (int o = kTqWave / 2; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, kTqWave));
+  return v;
+}
+
+// blk128 / blk32: grid (K / 128, rows, parts), one wave32 per 128-block of one row; lane l holds elements
+// l + 32 r (r = 0..3). blk128 reduces all four, blk32 each r on its own (the lanes of one r are 32
+// consecutive columns).
+template <bool kBlk32>
+__global__ __launch_bounds__(kTqWave) void FakeQuantBlkKernel(uint16_t* __restrict__ a, int64_t K,
+                                                              int64_t part_stride) {
+  const int lane = static_cast<int>(threadIdx.x);
+  uint16_t* p = a + static_cast<int64_t>(blockIdx.z) * part_stride +
+                static_cast<int64_t>(blockIdx.y) * K + static_cast<int64_t>(blockIdx.x) * kTqBlock + lane;
+  uint16_t b[4];
+  float key[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    b[r] = p[kTqWave * r];
+    key[r] = FqKey(b[r]);
+  }
+  float amax[4];
+  if (kBlk32) {
+#pragma unroll
+    for (int r = 0; r < 4; ++r) amax[r] = WaveMax32(key[r]);
+  } else {
+    const float m = WaveMax32(fmaxf(fmaxf(key[0], key[1]), fmaxf(key[2], key[3])));
+#pragma unroll
+    for (int r = 0; r < 4; ++r) amax[r] = m;
+  }
+#pragma unroll
+  for (int r = 0; r < 4; ++r) p[kTqWave * r] = FqElement(b[r], amax[r]);
+}
+
+// row: grid (rows, parts), 256 threads; the row's max through LDS, then every element.
+__global__ __launch_bounds__(kFqRowThreads) void FakeQuantRowKernel(uint16_t* __restrict__ a, int64_t K,
+                                                                    int64_t part_stride) {
+  __shared__ float red[kFqRowThreads / kTqWave];
+  uint16_t* row = a + static_cast<int64_t>(blockIdx.y) * part_stride + static_cast<int64_t>(blockIdx.x) * K;
+  const int t = static_cast<int>(threadIdx.x);
+  float m = 0.0f;
+  for (int64_t k = t; k < K; k += kFqRowThreads) m = fmaxf(m, FqKey(row[k]));
+  m = WaveMax32(m);
+  if ((t & (kTqWave - 1)) == 0) red[t / kTqWave] = m;
+  __syncthreads();
+  float amax = red[0];
+#pragma unroll
+  for (int w = 1; w < kFqRowThreads / kTqWave; ++w) amax = fmaxf(amax, red[w]);
+  for (int64_t k = t; k < K; k += kFqRowThreads) row[k] = FqElement(row[k], amax);
+}
+
 [[noreturn]] void TqFail(const std::string& what) {
   throw std::runtime_error("r4dx_trellis_input_bf16: " + what);
 }
@@ -285,6 +373,35 @@ void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t row
                      dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
                      reinterpret_cast<const uint16_t*>(attn_out), reinterpret_cast<const uint16_t*>(gate),
                      K, reinterpret_cast<const float*>(suh), reinterpret_cast<uint16_t*>(out), scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_fake_quant_act_f16(int64_t a, int64_t rows, int64_t K, int parts, int64_t part_stride, int mode,
+                              int64_t stream) {
+  const auto fail = [](const std::string& what) {
+    throw std::runtime_error("r4dx_fake_quant_act_f16: " + what);
+  };
+  if (mode < kFqRow || mode > kFqBlk32) fail("mode must be 1 (row), 2 (blk128) or 3 (blk32), got " + std::to_string(mode));
+  if (K <= 0 || K % kTqBlock != 0) fail("K must be a positive multiple of 128, got " + std::to_string(K));
+  if (rows < 0 || rows > 65535) fail("rows must be 0..65535, got " + std::to_string(rows));
+  if (parts < 1 || parts > 2) fail("parts must be 1 or 2, got " + std::to_string(parts));
+  if (parts > 1 && part_stride < rows * K) fail("part_stride must be >= rows * K for two parts");
+  if (a == 0) fail("a is null");
+  if (rows == 0) return;
+  r4dx_kernel_launch_counter_add(1);
+  hipStream_t s = reinterpret_cast<hipStream_t>(stream);
+  uint16_t* p = reinterpret_cast<uint16_t*>(a);
+  if (mode == kFqRow) {
+    hipLaunchKernelGGL(FakeQuantRowKernel, dim3(static_cast<unsigned>(rows), static_cast<unsigned>(parts)),
+                       dim3(kFqRowThreads), 0, s, p, K, part_stride);
+  } else {
+    const dim3 grid(static_cast<unsigned>(K / kTqBlock), static_cast<unsigned>(rows), static_cast<unsigned>(parts));
+    if (mode == kFqBlk32) {
+      hipLaunchKernelGGL(FakeQuantBlkKernel<true>, grid, dim3(kTqWave), 0, s, p, K, part_stride);
+    } else {
+      hipLaunchKernelGGL(FakeQuantBlkKernel<false>, grid, dim3(kTqWave), 0, s, p, K, part_stride);
+    }
+  }
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

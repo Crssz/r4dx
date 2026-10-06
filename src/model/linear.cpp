@@ -399,6 +399,7 @@ bool M256ShapeAllowed(int64_t N, int64_t K) {
 }
 
 thread_local bool t_trellis_m256 = false;
+thread_local int t_fake_quant_act = 0;  // fake_quant_act.h's mode; 0 off (ScopedFakeQuantAct)
 
 // docs/trellis-kernel.md 4.8's A-range study (milestone M4). With R4DX_TRELLIS_A_STATS=<file>, every
 // A the trellis input transform writes is copied back and tallied per linear -- elements, exact
@@ -535,6 +536,15 @@ ScopedTrellisM256::ScopedTrellisM256(bool on) : prev_(t_trellis_m256) { t_trelli
 ScopedTrellisM256::~ScopedTrellisM256() { t_trellis_m256 = prev_; }
 bool TrellisM256Active() { return t_trellis_m256; }
 
+ScopedFakeQuantAct::ScopedFakeQuantAct(int mode) : prev_(t_fake_quant_act), live_(true) {
+  t_fake_quant_act = mode;
+}
+void ScopedFakeQuantAct::End() {
+  if (!live_) return;
+  live_ = false;
+  t_fake_quant_act = prev_;
+}
+
 TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t part_n0) {
   TrellisM256Plan plan;
   const auto refuse = [&plan](std::string why) {
@@ -605,6 +615,16 @@ bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* 
   r4dx_trellis_input_bf16(reinterpret_cast<int64_t>(x), M, K, n, suh, out,
                           ws[0]->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));
   return true;
+}
+
+// R4DX_FAKEQ_ACT: round a trellis linear's A (a0, and the second part a1 when parts == 2, `rows` rows of K)
+// to int8 and back, in place. The parts sit a1 - a0 elements apart in every layout ApplyLinear sees. A is
+// this call's own buffer (a fused producer's or the transform's; no other linear reads it), so rewriting
+// it is safe.
+static void FakeQuantA(hipStream_t stream, const uint16_t* a0, const uint16_t* a1, int64_t rows, int64_t K,
+                       int parts, int mode) {
+  r4dx_fake_quant_act_f16(reinterpret_cast<int64_t>(a0), rows, K, parts, parts > 1 ? a1 - a0 : 0, mode,
+                          reinterpret_cast<int64_t>(stream));
 }
 
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
@@ -713,6 +733,8 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
           core::r4d::GemmTrellisM256WsBytes(static_cast<int>(M), static_cast<int>(N), plan.SKG) /
               sizeof(float),
           /*align_bytes=*/16);
+      // R4DX_FAKEQ_ACT (fake_quant_act.h): the operand the GEMM reads, int8-rounded in place.
+      if (t_fake_quant_act != 0) FakeQuantA(s, a0, a1, M, K, parts, t_fake_quant_act);
       const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) /
                                                  std::sqrt(128.0));
       const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);
@@ -839,6 +861,9 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
           a0 = f16_scratch;
           if (parts > 1) a1 = f16_scratch + part_stride;
         }
+        // R4DX_FAKEQ_ACT (fake_quant_act.h): this chunk's operand, int8-rounded in place (per row, so the
+        // chunking does not matter).
+        if (t_fake_quant_act != 0) FakeQuantA(s, a0, a1, m, K, parts, t_fake_quant_act);
         const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) /
                                                    std::sqrt(128.0));
         const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);

@@ -183,6 +183,12 @@ add_executable(test_prefill_chunk test_prefill_chunk.cpp)
 target_include_directories(test_prefill_chunk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_prefill_chunk COMMAND test_prefill_chunk)
 
+# test_fake_quant_act_cpu: pure CPU unit test for src/model/fake_quant_act.h (docs/int8-prefill.md): the
+# R4DX_FAKEQ_ACT parser and the fp32 reference of the int8 round trip, by hand values. No HIP.
+add_executable(test_fake_quant_act_cpu test_fake_quant_act_cpu.cpp)
+target_include_directories(test_fake_quant_act_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_fake_quant_act_cpu COMMAND test_fake_quant_act_cpu)
+
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group
 # (linear.cpp's ResolveTuning skips the rows that are not launchable at another). Host-only (no HIP call, no container), so it always runs; HIP_VISIBLE_DEVICES=1 only

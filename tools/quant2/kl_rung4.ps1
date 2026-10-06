@@ -7,6 +7,13 @@
 #   .\tools\quant2\kl_rung4.ps1 -Device 0 -OutDir <dir>       # HIP device 0 (the desktop card; ~3 min)
 #   .\tools\quant2\kl_rung4.ps1 -Model <other.r4dx> -Layout w4a16 -RefDir <its bf16 ref> -ExpectKl 0 -NoGate ...
 #
+# -ToolArgs appends extra arguments to the tool's command line (default none: the command line is unchanged).
+# The default pass feeds ids[1..] through DecodeStep, i.e. the DECODE path; to score the prefill path -- what
+# R4DX_FAKEQ_ACT (docs/int8-prefill.md) changes -- pass -ToolArgs '--tail-rows','1023','--tail-path','prefill'
+# (every row through a one-token Prefill call; 1023 = T - 1 of the 1024-token canon segments, so the dump is
+# still [T-1, V] and scoreable here). Such a run is a different path from the frozen numbers: use -NoGate
+# -CompareDir '' and read it against an unquantized run of the same arguments.
+#
 # A KL number is only meaningful against the bf16 reference of the SAME model: the default -RefDir is
 # huihui\kl-ref (tools/reference/full_logits_golden.py on the Huihui checkpoint, tokens_canon.json).
 # The base Qwen3.8-27B reference (kl-canon\ref, still on disk) scores only the base model's containers,
@@ -29,6 +36,7 @@ param(
   [double]$ExpectTop1 = 95.70,
   [string]$CompareDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl\rt-mix45m",
   [string]$Tool = '',
+  [string[]]$ToolArgs = @(),
   [string]$Python = 'C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe',
   [switch]$NoGate
 )
@@ -49,7 +57,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 Write-Host ("[kl_rung4] {0:HH:mm:ss} tool_teacher_forced_logprobs on device {1}: {2} ({3})" -f (Get-Date), $Device, $Model, $Layout)
 $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 try {
-  & $Tool --model $Model --layout $Layout --tokens $Tokens --out-dir $OutDir --max-ctx 4096 --vision off *> (Join-Path $OutDir 'tool.log')
+  & $Tool --model $Model --layout $Layout --tokens $Tokens --out-dir $OutDir --max-ctx 4096 --vision off @ToolArgs *> (Join-Path $OutDir 'tool.log')
   $rc = $LASTEXITCODE
 } finally { $ErrorActionPreference = $prev }
 if ($rc -ne 0) { throw "[kl_rung4] tool_teacher_forced_logprobs exited $rc (see $OutDir\tool.log)" }

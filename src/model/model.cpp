@@ -22,6 +22,7 @@
 #include "linear.h"
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
+#include "fake_quant_act.h"  // R4DX_FAKEQ_ACT (docs/int8-prefill.md)
 #include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/prefill.md)
 #ifdef R4DX_TP_TESTING
 #include "state_digest.h"
@@ -193,6 +194,7 @@ Model Model::Load(const ModelOptions& opts) {
     throw std::invalid_argument("Model::Load: tp.submit_layers and tp.max_inflight_units must be in [0, 64]");
   }
   const ModelOptions::VisionMode vision_mode = opts.vision;
+  (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
   if (is_tp_rank) {
     if (tp.comm == nullptr || tp.comm->World() != tp.world || tp.comm->Rank() != tp.rank) {
       throw std::invalid_argument(
@@ -594,6 +596,19 @@ Model Model::Load(const ModelOptions& opts) {
                              : "r4d_gdn_conv_prep (R4DX_GDN_CONV=1)"))
               << "\n";
   }
+  // R4DX_FAKEQ_ACT (docs/int8-prefill.md): parsed here (an unrecognized value throws), one line per process,
+  // and nothing at all when it is unset. Only the Qwen Model's prompt-prefill chunks read it.
+  if (const int fq = FakeQuantActRequest(); fq != kFakeQuantOff) {
+    static const bool once = [fq] {
+      std::cerr << "[r4dx::model::Model] R4DX_FAKEQ_ACT=" << FakeQuantActName(fq)
+                << ": the f16 A of every trellis linear is rounded to int8 and back (scale per "
+                << (FakeQuantActGroup(fq) == 0 ? std::string("row")
+                                               : "row x " + std::to_string(FakeQuantActGroup(fq)) + " columns")
+                << ") in prompt prefill only; accuracy experiment, not a production setting\n";
+      return true;
+    }();
+    (void)once;
+  }
 
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
   // calibrates the probe's clocks, here where the device is idle. nullptr, and no work, when
@@ -916,6 +931,10 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
   // The M = 256 trellis GEMM is reachable from ApplyLinear only inside a super-chunk's layers.
   const ScopedTrellisM256 trellis_m256_scope(wide);
+  // R4DX_FAKEQ_ACT (docs/int8-prefill.md): int8-rounded trellis A in the layers of a prompt-prefill chunk
+  // (any row count, tails included) and nowhere else -- not decode, and ended below before the MTP head's
+  // priming, the DFlash drafter's injection and the lm_head. Mode 0 (unset) touches nothing.
+  ScopedFakeQuantAct fakeq_scope(is_prefill_path ? FakeQuantActRequest() : kFakeQuantOff);
   if (wide) ++wide_chunks_run_;
 
   uint16_t* cur = buf_a_.data();
@@ -1043,6 +1062,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     arena_.Reset();
   }
   if (probe_ != nullptr) probe_->SetLayer(-1);
+  fakeq_scope.End();
   // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
   // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
   // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
@@ -1884,6 +1904,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     const int64_t T = static_cast<int64_t>(chunk.size());
     const bool wide = wide_rows > max_chunk_ && T == wide_rows;
     const ScopedTrellisM256 trellis_m256_scope(wide);
+    const ScopedFakeQuantAct fakeq_scope(FakeQuantActRequest());  // R4DX_FAKEQ_ACT, as RunChunk
     const bool has_init = started_;
 
     // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's

@@ -1,9 +1,9 @@
 # MTP self-speculative decode
 
 Status: implemented, correctness-tested, and **now a genuine, measured speedup** on HIP device 1
-against the real 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`, which already carries
+against the real 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`, which already carries
 `mtp.*` weights -- see "Container" below) and the 4-layer MTP test container
-(`D:\models\r4dx\qwen38-27b-l4-mtp.r4dx`). This revision (2026-09-19 review-fix pass) corrects two
+(`E:\models\r4dx\qwen38-27b-l4-mtp.r4dx`). This revision (2026-09-19 review-fix pass) corrects two
 blocker-severity bugs an Opus review found in the original implementation -- a swapped `fc` input
 concat order, and an MTP KV cache that was reset to empty every round instead of built in lockstep
 with the real sequence -- which together explained the prior revision's 0-1.2% measured acceptance
@@ -288,7 +288,7 @@ change or above 10 rows. Cost: [perf.md](perf.md) "Sampled speculation bit-exact
 
 ## Container
 
-`D:\models\r4dx\qwen38-27b.r4dx` (the real 64-layer container used throughout `docs/perf.md`)
+`E:\models\r4dx\qwen38-27b.r4dx` (the real 64-layer container used throughout `docs/perf.md`)
 **already carries `mtp.*` weights in all four layouts** (verified directly against its header by
 this pass -- `mtp.norm`, `mtp.fc`, `mtp.pre_fc_norm_hidden`, `mtp.pre_fc_norm_embedding`,
 `mtp.attn.qg.{bf16,mxfp4,w4a16,w4a8}.*`, etc. are all present), so no reconversion of the full
@@ -296,7 +296,7 @@ checkpoint was needed for this task. The 4-layer test container from the origina
 reused unchanged for `tests/model/test_mtp.cpp`:
 
 ```
-r4dx-convert --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-l4-mtp.r4dx ^
+r4dx-convert --input C:\AI\models\Qwen3.8-27B --output E:\models\r4dx\qwen38-27b-l4-mtp.r4dx ^
     --layers 4 --mtp on --vision off --layouts bf16,w4a16 --lm-head 4bit+bf16
 ```
 (24.0s, 11.95 GB, 117 tensors.) `tests/model/test_forward_smoke.cpp`'s existing
@@ -553,7 +553,7 @@ mechanism was not isolated yet -- a direct golden-referenced comparison of `h_se
 ### h_seed drift (Milestone 4 follow-up, 2026-09-20): measured, and it explains the ordering
 
 Built the one route the pass above named but never had: a 4-layer container carrying **all four**
-layouts plus `mtp.*` weights side by side (`D:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted via
+layouts plus `mtp.*` weights side by side (`E:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted via
 `r4dx-convert --layers 4 --mtp on --layouts bf16,w4a16,w4a8,mxfp4` -- the pre-existing
 `qwen38-27b-l4-mtp.r4dx` only carries bf16+w4a16). Added a diagnostic-only accessor,
 `Model::DebugSeedHiddenBf16()` (`src/model/model.h`/`.cpp`), that reads back `mtp_seed_hidden_` --
@@ -693,9 +693,9 @@ same argument spelled out at the code site.
 
 **Vocabulary subset choice and coverage.** `tests/model/tool_vocab_calib.cpp` (a diagnostic tool,
 not a ctest test, same convention as `tool_hseed_drift.cpp`) measures two candidate methods against
-a real calibration run: the real 64-layer container (`D:/models/r4dx/qwen38-27b-v3.r4dx`, `--layout
+a real calibration run: the real 64-layer container (`E:/models/r4dx/qwen38-27b-v3.r4dx`, `--layout
 w4a16`, `--mtp 0`) teacher-forced (real corpus tokens fed one at a time via `Prefill`+`DecodeStep`,
-never the model's own chained output) over the first ~6000 tokens of `D:/models/wikitext-2-raw/
+never the model's own chained output) over the first ~6000 tokens of `E:/models/wikitext-2-raw/
 wiki.train.raw`, recording the model's own greedy argmax prediction at every position.
 
 - **Method A ("frequency")**: top-N tokens by frequency IN THE CALIBRATION CORPUS TEXT ITSELF (a
@@ -711,8 +711,8 @@ match the real model (a draft outside the subset is a guaranteed rejection; a dr
 subset still has to beat the reduced head's own approximation error to be accepted, so measured
 acceptance is always <= this number).
 
-**Measured** (`tests/model/tool_vocab_calib.cpp`, real hardware, `D:/models/r4dx/qwen38-27b-v3.r4dx`,
-`--layout w4a16 --mtp 0`, `D:/models/wikitext-2-raw/wiki.train.raw`, 20000 calibration positions:
+**Measured** (`tests/model/tool_vocab_calib.cpp`, real hardware, `E:/models/r4dx/qwen38-27b-v3.r4dx`,
+`--layout w4a16 --mtp 0`, `E:/models/wikitext-2-raw/wiki.train.raw`, 20000 calibration positions:
 15000 TRAIN -- subset built from these only -- + 5000 HELD-OUT -- coverage measured against these
 only, so the number below is genuinely out-of-sample, not "does a subset cover the exact data it was
 built from"): top-1 self-teacher-forced accuracy over the whole run was 57.73% (an informative
@@ -745,7 +745,7 @@ IDENTICAL (2446/3198/2977 distinct ids, 76.80%/78.92% coverage, to four decimal 
 out "the sample happened to land in one narrow topic" as the cause and instead points at WikiText-2
 itself: a small (10.9 MB), intentionally curated benchmark corpus with a genuinely narrow effective
 vocabulary at any sampled size, not a large diverse natural-text corpus. This machine has no larger
-general-text corpus available (checked: only `D:/models/wikitext-2-raw` exists under `D:/models`) --
+general-text corpus available (checked: only `E:/models/wikitext-2-raw` exists under `E:/models`) --
 a real, larger corpus (or several-hundred-thousand-token synthetic generation from the model itself)
 is the concrete next step, flagged in "Known gaps" below, not attempted this pass.
 
@@ -814,7 +814,7 @@ candidate positions already span multiple blocks the same way any >16-token pref
 
 **Measured K sweep and headline numbers.**
 
-**Measured** (real hardware, HIP device 1, `D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx` -- the real
+**Measured** (real hardware, HIP device 1, `E:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx` -- the real
 64-layer container, vision on, reconverted with the shipped N=2992 draft head baked in --
 docs/perf.md's standard prompt/flags, `--max-tokens 128 --max-ctx 2048 --temperature 0`, one run per
 cell, `tools/`-adjacent scratch script `build/logs/sweep_r9.ps1`):
@@ -900,7 +900,7 @@ given here was not a matched-K comparison.** 65.02 tok/s above is w4a16 **K=4** 
 run, not this section's reduced-vs-full container/run); no K=3 full-vocab-draft-head datapoint
 existed in either table at the time this recommendation was written. Re-measured directly instead
 of citing across sweeps: real hardware, HIP device 1,
-`D:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx`, w4a16, this file's standard prompt/flags, `--mtp 3`,
+`E:/models/r4dx/qwen38-27b-v3-draftvocab.r4dx`, w4a16, this file's standard prompt/flags, `--mtp 3`,
 two runs each, uncontended --
 
 | Draft head | Decode tok/s (run 1, run 2) | Acceptance | Tok/round | Generated text |
@@ -930,7 +930,7 @@ or once a higher-coverage calibration corpus justifies it).
 
 ## DFlash2 assessment
 
-`D:/models/Qwen3.8-27B-DFlash2/{Qwen3.8-27B-DFlash2-Q8_0.gguf (1.91 GB), Qwen3.8-27B-DFlash2-Q4_0_
+`E:/models/Qwen3.8-27B-DFlash2/{Qwen3.8-27B-DFlash2-Q8_0.gguf (1.91 GB), Qwen3.8-27B-DFlash2-Q4_0_
 ROCMFP4_FAST.gguf (1.03 GB)}` are real, already-downloaded checkpoints from the user's ROCmFPX setup
 (`z-lab/Qwen3.8-27B-DFlash2` on HuggingFace, per the GGUF metadata read directly off these files:
 `general.architecture=dflash`, `general.finetune=DFlash2`, `general.base_model.0.name=Qwen3.8 27B`,

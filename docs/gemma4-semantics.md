@@ -8,7 +8,7 @@ scattered tags in sections 2, 4, 5) is settled here from the installed source, w
   `MU` = `masking_utils.py`, `RU` = `modeling_rope_utils.py`, `CFG` = `models\gemma4_unified\configuration_gemma4_unified.py`,
   `IMG` = `models\gemma4_unified\image_processing_gemma4_unified.py`, `PROC` = `models\gemma4_unified\processing_gemma4_unified.py`.
 - Checkpoint facts come from `tools/reference/gemma/tensor_names.json` (safetensors header of the Huihui file,
-  read both over HTTP and from the downloaded file; identical) and `D:\models\Huihui-gemma-4-12B-it-abliterated\config.json`.
+  read both over HTTP and from the downloaded file; identical) and `E:\models\Huihui-gemma-4-12B-it-abliterated\config.json`.
 - Mask / rope / embed-scale claims are backed by a CPU run of `tools/reference/gemma/rope_masks_golden.py`, which
   writes `tools/reference/golden_out/gemma/mask_semantics.json` (tiny 2-layer config, window 4, 8 tokens; the 12B rope
   tables). A copy is force-added to git because it is 30 KB and deterministic.

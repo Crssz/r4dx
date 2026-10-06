@@ -617,8 +617,8 @@ Two producers write that JSON, in the same layout: `tools/reference/kv_calibrate
 **prototype** -- raw embeddings into one layer, every preceding layer skipped) and
 `tools/reference/kv_calibrate_full.py` (the real one -- the whole 64-layer stack over a 6-file
 calibration corpus, all 16 full-attention layers in one file, at
-`D:\models\r4dx\qwen38-27b.kvcalib-full.json`). Use the latter. The real 64-layer container
-(`D:\models\r4dx\qwen38-27b.r4dx`) was converted with `--kv-calib` covering all 16 full-attention
+`E:\models\r4dx\qwen38-27b.kvcalib-full.json`). Use the latter. The real 64-layer container
+(`E:\models\r4dx\qwen38-27b.r4dx`) was converted with `--kv-calib` covering all 16 full-attention
 layers, but from the **prototype's** numbers, which run 1.4-3.3x low on `k_amax` and up to 8.8x low
 on `v_amax` in the back half of the stack -- it needs re-converting against the full-forward JSON
 before its fp8 KV cache means anything (see `tools/reference/README.md`, "kv_calibrate_full.py").
@@ -663,7 +663,7 @@ existed.
 ## DFlash2 draft container (Milestone 5 groundwork)
 
 A DFlash2 speculative-decoding draft model (background: `docs/dflash2.md`, the "DFlash2 assessment"
-section of `docs/mtp.md`, `docs/status.md`) converts from its own GGUF v3 source (`D:\models\Qwen3.8-27B-DFlash2\Qwen3.8-27B-DFlash2-Q8_0.gguf`)
+section of `docs/mtp.md`, `docs/status.md`) converts from its own GGUF v3 source (`E:\models\Qwen3.8-27B-DFlash2\Qwen3.8-27B-DFlash2-Q8_0.gguf`)
 into its OWN r4dx container -- a **separate file** from the main text-model container, never mixed
 into `text.*`/`vision.*`/`mtp.*`, so every existing loader/container is unaffected by this section.
 Written by `r4dx-convert --dflash-gguf <gguf> --out <container> --layout {w4a16,bf16}`

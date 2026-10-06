@@ -2,7 +2,7 @@
 
 ## Default container: the Huihui abliterated trellis mix4.5m; base files retired, 2026-09-29
 
-`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx` with `--layout trellis` (details, frozen
+`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx` with `--layout trellis` (details, frozen
 regression values and coverage: [huihui.md](huihui.md)). It is the same recipe as the base trellis
 mix4.5m below with every calibration artifact taken from the Huihui model. Against its own bf16
 reference: runtime KL **0.00788**, top-1 **95.70%** (oracle 0.00575 / 96.48%); TP=1 plain 36.67 tok/s,
@@ -12,7 +12,7 @@ tok/s; G6 `-Layout trellis` 5/5; TP=2 real smoke with vision + DFlash 207 PASS.
 - **What "default" now means in the repo:** `ProductionTargetPath()` / `Get-R4dxProductionTarget`
   return this container (with `ProductionLayoutName()` / `Get-R4dxProductionLayout` = `trellis`),
   `--tokenizer-dir` and every tokenizer / checkpoint default point at
-  `D:\models\Huihui-Qwen3.8-27B-abliterated` (its tokenizer files are byte-identical to the base's),
+  `E:\models\Huihui-Qwen3.8-27B-abliterated` (its tokenizer files are byte-identical to the base's),
   `tools/prefill/*.ps1`, `g6_validate.ps1`, `bench_decode.ps1`, `trellis_oracle.ps1`,
   `trellis_convert.ps1` and `trellis_quant.py --hessian-dir` default to the Huihui files.
 - **Retired (base model):** `qwen38-27b-v6.r4dx`, the base trellis mix4.5m / K4m containers, the base
@@ -39,9 +39,9 @@ speed: [perf.md](perf.md) top section.
 | **trellis-mix45m (recommended)** | 13.55 GiB | **0.00747** | 96.26% | 36.69 / 116.55 / 77.65 | A0-A2, A4-A6; A3 misses `--mtp 3` by 1.8% (acceptance), inside D1's 4% |
 | trellis-k4m (speed) | 12.13 GiB | 0.01004 | 95.53% | 40.34 / 123.52 / 81.98 | all, A3 +11% / +13% / +4% |
 
-- **Recommended container (then, base model):** `D:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx` with
+- **Recommended container (then, base model):** `E:\models\r4dx\qwen38-27b-trellis-mix45m.r4dx` with
   `--layout trellis` (accuracy first, then speed, native RDNA4). Prefill is 1.55x q2ab's (K4m 1.60x).
-  Speed option: `D:\models\r4dx\qwen38-27b-trellis-k4m.r4dx`. Both were retired on 2026-09-29; the
+  Speed option: `E:\models\r4dx\qwen38-27b-trellis-k4m.r4dx`. Both were retired on 2026-09-29; the
   recommendation is now the Huihui trellis mix4.5m above.
 - **q2ab is retired.** q2ab_hv2_q3 is no longer a recommendation or kept on disk; its row above is
   the historical baseline the gates were measured against. The w4a16 path itself is unchanged and
@@ -134,7 +134,7 @@ that crosses one can diverge from plain decode from there on.
 
 ## Milestone 11 complete: v6 is the production container, and group 64 is the default, 2026-09-22
 
-`D:\models\r4dx\qwen38-27b-v6.r4dx` replaces `v5`: **mean KL 0.05342 -> 0.03851 (-27.9%), top-1
+`E:\models\r4dx\qwen38-27b-v6.r4dx` replaces `v5`: **mean KL 0.05342 -> 0.03851 (-27.9%), top-1
 89.30% -> 90.93%**, for +0.8989 GiB of weights (15.5076 -> **16.4065 GiB**) and **-7.2% plain
 decode** (38.69 -> 35.96 tok/s), -7.5% on `--mtp 3` (65.93), **-4.8% on the fastest path**
 (`--dflash k=7`, 72.93 tok/s, 24.9% acceptance). w4a8 and mxfp4 out of the same file improve to
@@ -156,7 +156,7 @@ and the fix in the message, rather than reading their scales at the wrong stride
 the new **`win-hip-g128`** preset (verified: builds clean, loads `v5` at `weights=15.5076 GiB`).
 Note that an *existing* build directory keeps 128 in its CMake cache until you pass
 `-DR4DX_W4A16_GROUP=64` once. `tests/model`'s fixed-path containers were re-converted into
-`D:\models\r4dx\g64\`; `ctest --preset win-hip` needed `R4DX_TEST_CONTAINER_DIR` pointed there on
+`E:\models\r4dx\g64\`; `ctest --preset win-hip` needed `R4DX_TEST_CONTAINER_DIR` pointed there on
 this machine (no longer, 2026-09-23: the tests now pick the container directory -- and the
 production v6/v3 pair -- matching the build's group themselves; `docs/build-windows.md` "w4a16 group
 size"). The DFlash2 drafter was re-converted too, and **must** use `--quant search`: the
@@ -196,15 +196,15 @@ unmodified) run over a 6-file, **8316-token** corpus -- `tools/reference/calib.t
 conversation rendered through the checkpoint's own chat template); `kl_corpus/` is deliberately
 excluded as held-out evaluation text. All 16 full-attention layers in one run, K captured
 **post-rope** and V at `v_proj`, plus a per-head 99.99th-percentile tail statistic. Output:
-`D:\models\r4dx\qwen38-27b.kvcalib-full.json` (175.6 s, peak VRAM 1.905 GiB).
+`E:\models\r4dx\qwen38-27b.kvcalib-full.json` (175.6 s, peak VRAM 1.905 GiB).
 
 **The prototype was biased low, badly.** Per kv head, real `k_amax` is **1.41-3.29x** (median
 2.08x) the prototype's, and real `v_amax` **0.37-8.81x** (median 1.99x), with the V gap widening
 through the back half of the stack (layer 43 head 1: 6.81 -> 60.0). Descales built from the
 prototype are ~2x too small for K and up to 8x too small for V, i.e. the fp8 cache would saturate
-at +-448 on ordinary text. The shipped container `D:\models\r4dx\qwen38-27b.r4dx` still carries
+at +-448 on ordinary text. The shipped container `E:\models\r4dx\qwen38-27b.r4dx` still carries
 those numbers and needs re-converting with
-`r4dx-convert --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json`.
+`r4dx-convert --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json`.
 
 Gates: `full_logits_golden.py` untouched and its own cross-check (bit-identical `model` vs
 `manual`, max logit diff 0.0000e+00) and 32/32 greedy self-consistency re-run clean; the K tap
@@ -444,7 +444,7 @@ smoke case replays a Japanese answer and asserts the two outcomes stay CONSISTEN
 re-encode; not reused => re-encode + full re-prefill), which is the invariant that must hold
 whichever way the round trip goes.
 
-**Real-hardware evidence** (`tools/server/smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx
+**Real-hardware evidence** (`tools/server/smoke.ps1 -Model E:\models\r4dx\qwen38-27b-v3.r4dx
 -Layout w4a16 -Layers -1 -Vision`, HIP device 1):
 
 ```
@@ -730,7 +730,7 @@ Full details, the fixed script's own file comment, and the re-measured numbers a
 **Full `ctest` at the end of stage S3**: 53 registered, 52 passed, 1 skipped
 (`test_kernel_bandwidth`, gitignored golden absent), 0 failed, 652.49s -- identical counts to the
 baseline this stage started from (no regression from the engine/CLI/smoke/docs changes above).
-`tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16 -Layers -1 -Dflash
+`tools\server\smoke.ps1 -Model E:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16 -Layers -1 -Dflash
 <real w4a16 draft>` against the real container: **every check passed**, including the new seeded
 sampled-speculative checks (`timings.draft_n>0`, reproducible on repeat, matches a same-seeded
 plain sampled `r4dx-cli` run byte-for-byte).
@@ -1528,7 +1528,7 @@ top-N slice of `lm_head` used only for drafting, making wide speculation (K up t
   **36/36** (was 35/35).
 
 **Measured, real hardware** (see docs/mtp.md's "Reduced-vocab draft head" section for the complete
-table and analysis): the shipped calibration run (`D:/models/wikitext-2-raw/wiki.train.raw`, 20000
+table and analysis): the shipped calibration run (`E:/models/wikitext-2-raw/wiki.train.raw`, 20000
 positions teacher-forced through the real 64-layer container) found only **2977 distinct predicted
 ids** and **76.8% held-out coverage** -- far short of the 8k-16k, high-coverage subset the R9
 economic projection assumes. Re-ran with 10 dispersed corpus segments instead of one contiguous
@@ -1551,7 +1551,7 @@ supply. Recommended default remains the full-vocab MTP head at its previously-me
 not-matched-K "67.34 tok/s" citation) until a larger/more diverse calibration corpus is available
 and re-measured.
 
-**DFlash2** (`D:/models/Qwen3.8-27B-DFlash2/*.gguf`, real files already on disk): assessed, not
+**DFlash2** (`E:/models/Qwen3.8-27B-DFlash2/*.gguf`, real files already on disk): assessed, not
 ported -- a genuinely different model architecture (`general.architecture=dflash`, a block-diffusion
 drafter with its own selector mechanism), not a slice of this model's own weights; porting it would
 need a new GGUF loader and a new forward pass, a materially larger lift than the reduced-vocab head.
@@ -1593,7 +1593,7 @@ resolved review findings are in `docs/dflash2.md`; this section is the roadmap-l
   new `r4dx-convert --dflash-gguf` CLI mode). Tensor naming, conv-layout, RoPE-pairing (`neox_split_
   half`, corrected during review -- see below), and shape conventions are documented and covered by
   `tests/convert/test_dflash_container.cpp`/`test_gguf_reader.cpp`. Four real containers converted
-  and re-verified: `D:\models\r4dx\qwen38-27b-dflash2-{bf16,w4a16,w4a8,mxfp4}.r4dx` (3.585 /
+  and re-verified: `E:\models\r4dx\qwen38-27b-dflash2-{bf16,w4a16,w4a8,mxfp4}.r4dx` (3.585 /
   1.127 / 1.127 / 1.127 GiB), 81/81 tensors checked per layout by
   `tools/convert_ref/dflash2_container_check.py` (bf16 full-tensor bit-exact; quantized layouts a
   first-tile spot check, see that tool's own known limitation).
@@ -1656,7 +1656,7 @@ fixed, and integrated in this pass:
 1. **R1 -- quantize `gdn.in_proj_z`/`attn.k`/`attn.v`.** These three tensors (20.6% of every
    token's weight traffic) join the quantized-linear family (mxfp4/w4a16/w4a8, plus bf16) instead of
    being bf16-only regardless of `--layout`. Real container reconverted:
-   `D:\models\r4dx\qwen38-27b-v3.r4dx`, 45.02 GiB (was 87.79 GiB, -48.7%). Accuracy held (no
+   `E:\models\r4dx\qwen38-27b-v3.r4dx`, 45.02 GiB (was 87.79 GiB, -48.7%). Accuracy held (no
    tensor's rel-err crossed the task's "2x worse" bar; see "R1" below for the full table). Decode
    ceiling moved +9.7% to +15.1% depending on layout.
 2. **R3 + P6 -- kernel-level decode-path work.** R3 fuses `r4dx_residual_rmsnorm_bf16` into both
@@ -1686,7 +1686,7 @@ task's own "delete scratch logs" instruction -- `build/` is git-ignored regardle
 were ever going to be committed). `tools\server\smoke.ps1` run three times (default 4-layer
 container `--mtp 0`, the 4-layer MTP container `-Mtp 3`, and the real 64-layer container `-Mtp 3`):
 **24/24, 25/25, 25/25 checks passing.** A fresh confirmation sweep of `r4dx-cli` against the real
-container (`D:\models\r4dx\qwen38-27b-v3.r4dx`), this file's standard prompt/flags, w4a8/w4a16/mxfp4
+container (`E:\models\r4dx\qwen38-27b-v3.r4dx`), this file's standard prompt/flags, w4a8/w4a16/mxfp4
 x `--mtp {0,3}` (bf16 excluded from performance work per the standing rule): every number lands
 within run-to-run noise of the FIX pass's own measurements (see "Milestone 3 consolidated
 performance" in `docs/perf.md` for the full six-run table) -- confirming the merged, reviewed, and
@@ -1894,7 +1894,7 @@ future work, not attempted this pass.
 **Mandatory gate: end-to-end byte-identical generated text.** `tools/validate_fusion.ps1` (new):
 for every (layout in {w4a16, w4a8, mxfp4}) x (`--mtp` in {0, 3}) x (prompt in {short ~20-token
 single-chunk, medium ~100-token multi-chunk, long ~1000-token long-context}) -- 18 combinations --
-runs `r4dx-cli.exe` twice against the real 64-layer container (`D:\models\r4dx\qwen38-27b-v3.r4dx`),
+runs `r4dx-cli.exe` twice against the real 64-layer container (`E:\models\r4dx\qwen38-27b-v3.r4dx`),
 greedy, once with `R4DX_DISABLE_EPILOGUE=1` (forces every layout back to the pre-fusion baseline
 from the SAME binary, no second build needed) and once without, and SHA-256-hashes each run's raw
 stdout (the generated text only -- `[stats]`/`--profile` all go to stderr). **Run on real hardware,
@@ -1995,7 +1995,7 @@ regression test).
 
 **h_seed drift, measured: correlates with the acceptance ranking.** Built the one route M3 named but
 never had (a 4-layer container carrying ALL FOUR layouts plus `mtp.*` weights side by side --
-`D:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted this pass via `r4dx-convert --layers 4 --mtp on
+`E:\models\r4dx\qwen38-27b-l4-allmtp.r4dx`, converted this pass via `r4dx-convert --layers 4 --mtp on
 --layouts bf16,w4a16,w4a8,mxfp4`; the pre-existing `qwen38-27b-l4-mtp.r4dx` only carries bf16+w4a16).
 Added a diagnostic-only accessor, `Model::DebugSeedHiddenBf16()` (`src/model/model.h`/`.cpp`), that
 reads back `mtp_seed_hidden_` -- the exact pre-final-norm hidden-state row `MtpHead::Draft`'s first
@@ -2131,7 +2131,7 @@ mxfp4 GEMMs' own A-operand read code FIRST; wrote the byte-diff harness
   - **A real, reproducible correctness bug was found via actual `r4dx-cli` generation** (not
     caught by ctest's tolerance-bounded golden tests): with `EpilogueForLayout` wired to return
     `r4dx_epilogue_int8_fraga8`/`r4dx_epilogue_fp8_e4m3_row` for w4a8/mxfp4, the generated text for
-    the real 64-layer container (`D:\models\r4dx\qwen38-27b-v3.r4dx`, standard prompt/flags)
+    the real 64-layer container (`E:\models\r4dx\qwen38-27b-v3.r4dx`, standard prompt/flags)
     changed relative to the fusion-disabled baseline -- confirmed NOT GPU nondeterminism (the
     fusion-disabled baseline itself reproduces byte-identical text across repeated runs) and NOT
     isolated-kernel math (`test_fused_quant.cpp` above independently verifies that). An in-model
@@ -2293,7 +2293,7 @@ implemented, see its own note below.
   count stays flat and at least one request's log line shows `reset=`, not a reload; with `-Mtp N>0`
   an extra check confirms at least one `mtp:` log line appears. **Run and passing** against: the
   default 4-layer bf16 container (`--mtp 0`, regression check), the 4-layer MTP container with
-  `-Mtp 3`, and the real 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`) with `-Mtp 3` --
+  `-Mtp 3`, and the real 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`) with `-Mtp 3` --
   25/25 checks pass in every run.
 - **`--mtp-head-layout`, superseded by the merge -- now implemented.** This bullet originally read
   "NOT implemented", written against the stages-2-4 tree in isolation, before this pass's merge with
@@ -2340,7 +2340,7 @@ the new test).
   at M=64,K=17408 show a smaller/anomalous "before" number that looks like measurement noise rather
   than a real floor, not re-investigated). Full table and log paths in `docs/perf.md`'s new "P6
   kernel rewrite" update block.
-- **Measured, full-model decode** (real 64-layer container `D:\models\r4dx\qwen38-27b-v3.r4dx`,
+- **Measured, full-model decode** (real 64-layer container `E:\models\r4dx\qwen38-27b-v3.r4dx`,
   `docs/perf.md`'s standard prompt/flags, HIP device 1): w4a16 `--mtp 0` 37.39 -> **38.58 tok/s**
   (+3.2%), `--mtp 3` 65.02 -> **68.43 tok/s** (+5.2%, 46.3% acceptance); w4a8 `--mtp 0`
   **35.51 tok/s**, `--mtp 3` **61.47 tok/s** (43.3% acceptance); mxfp4 `--mtp 0` **30.08 tok/s**,
@@ -2405,7 +2405,7 @@ verified on real hardware; items 1 and 2 are **not implemented this pass** -- se
   several of which go through `core::r4d::QuantActI8` -- a libr4d entry point, not an
   `r4dx_kernels.hip` one). `Model::StepProfile` gained `r4dx_kernel_launches` (reset at the top of
   `DecodeStepProfiled`, read at the end); `r4dx-cli --profile` prints it.
-  - **Measured, real hardware, real container** (`D:\models\r4dx\qwen38-27b-v3.r4dx`, w4a16, HIP
+  - **Measured, real hardware, real container** (`E:\models\r4dx\qwen38-27b-v3.r4dx`, w4a16, HIP
     device 1, `r4dx-cli --profile`): **259 r4dx-owned launches/token after R3.** Before R3 (computed
     by adding back the exact removed call sites, not re-measured live to avoid a throwaway
     revert/rebuild cycle): 64 layers each had one `r4dx_rmsnorm_bf16` at (GDN|Attn) entry and one at
@@ -2522,7 +2522,7 @@ roadmap item that raises the decode *ceiling* rather than competing for existing
   real-weights `transformers` golden per quantized layout, were extended to also load `attn.k`/`v`
   (test_attn_layer) at the layout under test rather than always bf16 (`gdn.in_proj_z` needed no test
   change at all -- `GdnLayer`/`Container` already wire it through `layout` generically). Measured
-  on the regenerated 4-layer test containers (`D:\models\r4dx\qwen38-27b-l4-{bf16,mtp}.r4dx`, real
+  on the regenerated 4-layer test containers (`E:\models\r4dx\qwen38-27b-l4-{bf16,mtp}.r4dx`, real
   Qwen3.8-27B weights, HIP device 1):
 
   | Component | Layout | Before R1 (qg/o only) | After R1 (+k/v or +in_proj_z) | Tolerance |
@@ -2542,7 +2542,7 @@ roadmap item that raises the decode *ceiling* rather than competing for existing
   see `tests/model/test_gdn_layer.cpp`'s own tolerance-derivation comment). **No tensor's error
   crossed the 2x-worse bar, so all three stay quantized in every layout; none was reverted to
   bf16.** All 30 ctest tests pass (`.\tests\run_tests.ps1`, HIP device 1, 4-layer containers
-  regenerated with the new converter -- `D:\models\r4dx\qwen38-27b-l4-{bf16,mtp}.r4dx.pre-r1.bak`
+  regenerated with the new converter -- `E:\models\r4dx\qwen38-27b-l4-{bf16,mtp}.r4dx.pre-r1.bak`
   keep the pre-R1 fixtures for reference, not deleted).
 - **R14/Q13 (VRAM diagnostics)**: `Container::Load` now warns on stderr if the layout it just loaded
   consumed more VRAM than was free before the load started (the bf16-64-layer-model scenario
@@ -2551,11 +2551,11 @@ roadmap item that raises the decode *ceiling* rather than competing for existing
   at the end of every load, from four `hipMemGetInfo` snapshots bracketing each allocation phase --
   answering Q13 ("where does the measured VRAM actually go") from what the driver reports rather
   than from this codebase's own tensor-shape arithmetic.
-- **Real container reconversion**: `D:\models\r4dx\qwen38-27b-v3.r4dx` (w4a8/w4a16/mxfp4 body +
+- **Real container reconversion**: `E:\models\r4dx\qwen38-27b-v3.r4dx` (w4a8/w4a16/mxfp4 body +
   4-bit `lm_head` only, no bf16 anywhere, `--mtp on --vision on`, reusing the existing
   `qwen38-27b.kvcalib.json` calibration) -- **45.02 GiB on disk (was 87.79 GiB, -48.7%)**, converted
   in 150.2s (32 threads, `hardware_concurrency()` default). The old
-  `D:\models\r4dx\qwen38-27b.r4dx` (87.79 GiB, all four layouts including full bf16) was kept, not
+  `E:\models\r4dx\qwen38-27b.r4dx` (87.79 GiB, all four layouts including full bf16) was kept, not
   deleted. Measured decode (`--mtp 0`, real container, same prompt/flags as `docs/perf.md`): w4a16
   **37.77 tok/s** (was 32.83, +15.1%), w4a8 **34.97 tok/s** (was 30.95, +13.0%), mxfp4 **29.72 tok/s**
   (was 27.08, +9.7%) -- all three beat docs/r9700.md's "+4 to +5 tok/s realistic" prediction except
@@ -2593,7 +2593,7 @@ text generation are implemented, tested, and verified end-to-end against the rea
 container on HIP device 1 for all four body layouts (mxfp4/w4a16/w4a8/bf16). See the "Update"
 sections below for the assembly + review-fix narrative and `docs/perf.md` for the full perf table
 and verbatim generated text. This integration pass re-ran a clean `build.ps1 -Clean` rebuild, the
-full `ctest` suite, and one `r4dx-cli` generation per layout against `D:\models\r4dx\qwen38-27b.r4dx`
+full `ctest` suite, and one `r4dx-cli` generation per layout against `E:\models\r4dx\qwen38-27b.r4dx`
 to confirm the milestone is reproducible end to end; see "What passes" below for the numbers.
 
 ## What exists
@@ -2672,7 +2672,7 @@ during this integration pass, all green:
 `src/model/attention/`, and the assembled `r4dx::model::Model` forward pass in `model.{h,cpp}`) and
 `src/cli` (`r4dx-cli`, chat-template-driven prompt/--chat loop, streaming UTF-8-safe decode,
 prefill/decode tokens/s + VRAM stats) are now implemented and exercised end-to-end against the real
-64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`) on HIP device 1, for all four body layouts
+64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`) on HIP device 1, for all four body layouts
 (mxfp4/w4a16/w4a8/bf16) -- coherent, on-topic generated text for all four; see `docs/perf.md` for
 the full perf table, verbatim outputs, and two real stream-synchronization bugs found and fixed
 during this pass (`src/model/gdn_layer.cpp`'s `UploadArray`, `src/model/model.cpp`'s
@@ -2695,7 +2695,7 @@ All 17 Phase-0 tests plus `convert_kv_calib`, `convert_bf16_layout`, `test_gdn_l
 added across the conversion/assembly/review-fix stages) pass together in one run.
 
 One `r4dx-cli` generation per body layout against the real, full 64-layer container
-(`D:\models\r4dx\qwen38-27b.r4dx`, 87.79 GiB), same prompt/settings as `docs/perf.md`
+(`E:\models\r4dx\qwen38-27b.r4dx`, 87.79 GiB), same prompt/settings as `docs/perf.md`
 (`--prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." --max-tokens 128
 --temperature 0 --stats`, `--max-ctx 2048` except bf16's `--max-ctx 512`):
 
@@ -2728,7 +2728,7 @@ checks passed -- `/v1/models`, non-streaming and streaming `/v1/chat/completions
 `[DONE]` terminator, per-event `chat.completion.chunk` shape), and a rejected-image-part `400`.
 
 One `r4dx-cli` generation per quantized body layout, `--mtp 0` vs `--mtp 3`, against the real,
-unmodified 64-layer container (`D:\models\r4dx\qwen38-27b.r4dx`), same prompt as `docs/perf.md`
+unmodified 64-layer container (`E:\models\r4dx\qwen38-27b.r4dx`), same prompt as `docs/perf.md`
 (`--temperature 0 --max-ctx 2048 --stats`, `--max-tokens 128` except bf16's `--max-tokens 32
 --max-ctx 512`):
 

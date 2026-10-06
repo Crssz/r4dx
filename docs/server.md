@@ -1341,7 +1341,7 @@ follow-up whose replayed reply does not re-tokenize still reuses the prompt befo
 `--request-log <path>` (default: off): append one JSON line per request -- token counts and timings
 only -- to `<path>`; see "Request log" below. Omitting the flag changes nothing at all.
 
-`--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated`, same as `r4dx-cli` (its
+`--tokenizer-dir` defaults to `E:\models\Huihui-Qwen3.8-27B-abliterated`, same as `r4dx-cli` (its
 `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` are
 byte-identical to the base Qwen3.8-27B's, whose `C:\AI\models\Qwen3.8-27B` was the default until
 2026-09-29; the `C:\AI\models\Qwen3.8-27B\chat_template.jinja` references in this document name that
@@ -1350,7 +1350,7 @@ server-wide default for the chat template's `enable_thinking` when a request's
 `chat_template_kwargs` does not itself set it. `--layers N` loads only the first `N` layers
 (`r4dx::model::ModelOptions::layer_limit`) -- required for a test container that physically carries
 fewer layers than its (verbatim-copied) `config.json` declares, e.g.
-`D:\models\r4dx\qwen38-27b-l4-bf16.r4dx`; omit it (or pass `-1`) for a real, full-size container.
+`E:\models\r4dx\qwen38-27b-l4-bf16.r4dx`; omit it (or pass `-1`) for a real, full-size container.
 `--log-level` gates the one-line-per-request log (`debug` also gets extra detail; `info` -- the
 default -- prints exactly the required prompt/generated/prefill/decode-tok/s line; `warn`/`error`
 quiet it down).
@@ -1429,7 +1429,7 @@ Reading it with PowerShell: `Get-Content D:\logs\r4dx-requests.jsonl | ForEach-O
 Where-Object endpoint -eq 'chat/completions' | Measure-Object prompt_tokens, prompt_n, cached_tokens -Sum`
 (the cache saving is `sum(cached_tokens) / sum(prompt_tokens)`).
 
-**Measured on the smoke (2026-09-30, `D:\models\r4dx\reqlog\smoke`):** the same 7 greedy requests (plain
+**Measured on the smoke (2026-09-30, `E:\models\r4dx\reqlog\smoke`):** the same 7 greedy requests (plain
 chat, a stream with `include_usage`, `reasoning_effort: "high"`, the two turns of one conversation, a
 `/v1/completions`, a request with a tool) answered by a server started with and without the flag give
 responses identical byte for byte once the random `id`, `created` and the wall-clock `timings` values
@@ -1532,14 +1532,14 @@ shapes and status codes (the 4-layer model's text is nonsense, so only shapes/co
 never the text itself, except the tool-round-trip check, which needs a real container to exercise
 meaningfully -- see below). Run it with `.\tools\server\smoke.ps1`; pass `-Model`/`-Layout`/
 `-Layers -1` to point it at a real container instead, `-Mtp N` to exercise the MTP path against an
-MTP-converted container (`.\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-l4-mtp.r4dx
--Layout w4a16 -Mtp 3`, or `-Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -Mtp 3` against the real
+MTP-converted container (`.\tools\server\smoke.ps1 -Model E:\models\r4dx\qwen38-27b-l4-mtp.r4dx
+-Layout w4a16 -Mtp 3`, or `-Model E:\models\r4dx\qwen38-27b.r4dx -Layers -1 -Mtp 3` against the real
 container) -- with `-Mtp N>0` an extra check confirms at least one request's log line shows the MTP
 path was taken -- and `-ToolRoundTrip` for the tool round-trip check (`.\tools\server\smoke.ps1
--Model D:\models\r4dx\qwen38-27b.r4dx -Layers -1 -ToolRoundTrip`; skipped by default against the
+-Model E:\models\r4dx\qwen38-27b.r4dx -Layers -1 -ToolRoundTrip`; skipped by default against the
 4-layer container, whose nonsense output cannot reliably be coaxed into emitting a well-formed
 `<tool_call>` block), and `-Vision` for the full image suite against a real vision-capable
-container (`.\tools\server\smoke.ps1 -Model D:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16
+container (`.\tools\server\smoke.ps1 -Model E:\models\r4dx\qwen38-27b-v3.r4dx -Layout w4a16
 -Layers -1 -Vision`; see "Images" above for the checks it runs). The live tool-call streaming checks ("Tool calls" above) run unconditionally:
 a tool-offering streaming request asking a plain prose question must yield many `delta.content`
 events whose concatenation equals the same greedy request's non-streaming `message.content`, and no
@@ -1549,9 +1549,9 @@ decode is fast enough for the whole stream to arrive in a single socket read.
 
 ### Real-answer smoke run (once, against the full 64-layer container)
 
-Run 2026-09-19 against `D:\models\r4dx\qwen38-27b.r4dx` (`--layout w4a16`, the same prompt/settings
+Run 2026-09-19 against `E:\models\r4dx\qwen38-27b.r4dx` (`--layout w4a16`, the same prompt/settings
 `docs/perf.md`'s own CLI table uses, `temperature: 0`, `max_tokens: 128`, thinking off): the smoke
-script's shape checks all passed (`tools/server/smoke.ps1 -Model D:\models\r4dx\qwen38-27b.r4dx
+script's shape checks all passed (`tools/server/smoke.ps1 -Model E:\models\r4dx\qwen38-27b.r4dx
 -Layout w4a16 -Layers -1`), and a follow-up manual streaming request against the same server
 produced this verbatim streamed answer (`POST /v1/chat/completions`, `"stream": true`, content
 deltas concatenated):

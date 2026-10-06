@@ -93,7 +93,7 @@ else** -- no crash, no NaN, no warning:
 A container packed at any other group (the old group-128 containers) is refused:
 
 ```
-r4dx::model: D:\models\r4dx\qwen38-27b-v5.r4dx was packed with w4a16 group=128 but this build's
+r4dx::model: E:\models\r4dx\qwen38-27b-v5.r4dx was packed with w4a16 group=128 but this build's
 r4d_gemm_w4a16_nt_m64 kernel reads group=64 -- the .w4a16.wsz scales would be read at the wrong
 stride, producing wrong numbers with no other symptom. Re-convert the container with this build's
 r4dx-convert.
@@ -108,23 +108,23 @@ kernel serves), and the byte-exactness checks against the Python reference use
 by default, reads the group back out of the container the exe under test just wrote.
 
 The `tests/model` and `tests/model/attention` tests open fixed 4-layer test containers packed at group
-64, in `D:\models\r4dx\g64\`, and every test resolves its path through `r4dx_test::ContainerPath`
+64, in `E:\models\r4dx\g64\`, and every test resolves its path through `r4dx_test::ContainerPath`
 (`tests/model/test_container_path.h`):
 
 1. `R4DX_TEST_CONTAINER_DIR`, if set: `<that dir>\<basename>` (an explicit override; pointing it at
    copies of the wrong group makes the affected tests **fail** on the loader's group guard, with the
    loader's message).
-2. Otherwise `D:\models\r4dx\g64\<basename>`.
+2. Otherwise `E:\models\r4dx\g64\<basename>`.
 
 The tests that need the **real 64-layer container** (`test_dflash_e2e`, `test_vision_tower`, the
 real-container cases of `test_tp_emulation` / `test_tp_real_vs_emulation`, and the defaults of the
 `tool_*` diagnostics) use `ProductionTargetPath()` / `ProductionDrafterPath()` /
 `ProductionLayoutName()` from the same header: the Huihui abliterated trellis mix4.5m
 `huihui-qwen38-27b-abl-trellis-mix45m.r4dx` (layout `trellis`) + `qwen38-27b-dflash2-w4a16-g64.r4dx`,
-both in `D:\models\r4dx\`. The previous production container, the base `qwen38-27b-v6.r4dx`
+both in `E:\models\r4dx\`. The previous production container, the base `qwen38-27b-v6.r4dx`
 (w4a16), was retired on 2026-09-29 with the base checkpoint; the tokenizer tests
 (`R4DX_TOKENIZER_MODEL_DIR`) and `test_keep_bf16` (`R4DX_HF_CHECKPOINT`) read the Huihui checkpoint dir
-`D:\models\Huihui-Qwen3.8-27B-abliterated` (byte-identical tokenizer files; layers 0-3 unchanged).
+`E:\models\Huihui-Qwen3.8-27B-abliterated` (byte-identical tokenizer files; layers 0-3 unchanged).
 `R4DX_TEST_CONTAINER_DIR` does not apply to that pair (no 64-layer container is copied into `g64\`).
 
 So **no environment variable is needed** -- plain `ctest --preset win-hip` (or `ctest --test-dir
@@ -149,14 +149,14 @@ catches what would otherwise escape `main()` and end the process as `0xc0000409`
 The recipe for regenerating `g64\` (six containers, ~52 GiB, ~3 min of CPU) is:
 
 ```powershell
-$dir = 'D:\models\r4dx\g64'
+$dir = 'E:\models\r4dx\g64'
 # (a convert writes only bf16 and w4a16 here)
 # qwen38-27b-l4-bf16.r4dx:   --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp off --vision off
 # qwen38-27b-l4-mtp.r4dx:    --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-allmtp.r4dx: --layers 4 --layouts bf16,w4a16 --lm-head 4bit+bf16 --mtp on  --vision off
 # qwen38-27b-l4-mtp-draftvocab.r4dx: as -l4-mtp plus --draft-vocab-ids <ids.json> (see below)
 # the two DFlash2 drafters:  --dflash-gguf <Qwen3.8-27B-DFlash2-Q8_0.gguf> --out ... --layout {bf16,w4a16}
-.\build\win-hip\src\convert\r4dx-convert.exe --input D:\models\Huihui-Qwen3.8-27B-abliterated --output "$dir\..." ...
+.\build\win-hip\src\convert\r4dx-convert.exe --input E:\models\Huihui-Qwen3.8-27B-abliterated --output "$dir\..." ...
 ```
 
 `qwen38-27b-l4-mtp-draftvocab.r4dx` **is** in `g64\`, and it is the one container whose regeneration
@@ -171,7 +171,7 @@ Huihui trellis container instead, as above.
 A bf16 drafter does **not** need a group-64 copy: only the `w4a16` one does (the root group-128 w4a16
 drafter container is refused by the group guard). `g64\qwen38-27b-dflash2-bf16.r4dx` was converted
 before that scope was narrowed and is redundant; the original
-`D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx` loads as is.
+`E:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx` loads as is.
 
 `hipcc.exe` needs its own `clang.exe`/`lld-link.exe`/device libs found via PATH even though
 `--rocm-path` is passed; `third_party/CMakeLists.txt` prepends `C:\opt\rocm\bin` and

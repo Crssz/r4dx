@@ -8,11 +8,11 @@ repository's own docs and sources with the checkpoint's own `tokenizer.json` and
 inputs. Nothing is downloaded.
 
 Python: `C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe` (tokenizers, transformers,
-numpy). The scripts below call it `$py`. Outputs go to `D:\models\r4dx\prefill-m0\` and are never
+numpy). The scripts below call it `$py`. Outputs go to `E:\models\r4dx\prefill-m0\` and are never
 committed.
 
 Model: every `-Model` default is the production container, the Huihui abliterated trellis mix4.5m
-(`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `-Layout trellis`; before 2026-09-29 the
+(`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, `-Layout trellis`; before 2026-09-29 the
 base `qwen38-27b-trellis-mix45m.r4dx`), and the tokenizer is the Huihui checkpoint's
 (`common.DEFAULT_MODEL_DIR`; its tokenizer files are byte-identical to the base model's, so the
 frozen prompts and token files are unchanged). The M0 dense baselines under `prefill-m0\` (`kl\dense`,
@@ -49,7 +49,7 @@ Engine changes made for this kit:
   - `N` > 1: N split-KV segments on every prompt-prefill call, capped at 32.
   - Anything else prints a warning and uses the default.
   - Before the default changed (branch `prefill` up to `dd92f6d`), unset meant split-KV. Runs recorded as "split-KV (default law)" in `docs/prefill.md`'s M1 results are `=split` today.
-- `R4DX_PREFILL_CHUNK` picks the prompt-prefill chunk size. Unset (or `256`) is the **default since 2026-09-30**: 256-row super-chunks (libr4d's M = 256 trellis GEMM for the linears, 64-row sub-slices for the GDN scan and the attention core), bit-identical to the 64-row path, about 1.3x cold TTFT at 8k and 32k. `0` or `64` is the kill switch: today's 64-row chunks and buffers exactly. Anything else warns and uses 64. Every model load prints `prefill chunk: N rows (...)` with the reason when a 256 request could not be honoured. Details, the fallbacks and the measurements: `docs/prefill.md` "The 256-row prefill chunk" and `docs/trellis-m256.md`. It reaches these scripts through the environment (`$env:R4DX_PREFILL_CHUNK = '0'` for an OFF run of a TTFT or KL comparison); the KL dumps and TTFT runs under `D:\models\r4dx\linear\spike` and `D:\models\r4dx\chunk` were made that way.
+- `R4DX_PREFILL_CHUNK` picks the prompt-prefill chunk size. Unset (or `256`) is the **default since 2026-09-30**: 256-row super-chunks (libr4d's M = 256 trellis GEMM for the linears, 64-row sub-slices for the GDN scan and the attention core), bit-identical to the 64-row path, about 1.3x cold TTFT at 8k and 32k. `0` or `64` is the kill switch: today's 64-row chunks and buffers exactly. Anything else warns and uses 64. Every model load prints `prefill chunk: N rows (...)` with the reason when a 256 request could not be honoured. Details, the fallbacks and the measurements: `docs/prefill.md` "The 256-row prefill chunk" and `docs/trellis-m256.md`. It reaches these scripts through the environment (`$env:R4DX_PREFILL_CHUNK = '0'` for an OFF run of a TTFT or KL comparison); the KL dumps and TTFT runs under `E:\models\r4dx\linear\spike` and `E:\models\r4dx\chunk` were made that way.
 
 ## Tasks (`build_tasks.py`)
 
@@ -87,27 +87,27 @@ Build the frozen inputs once. This needs no GPU and takes about 3 minutes in tot
 
 ```powershell
 $py = 'C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe'
-& $py tools\prefill\build_tasks.py --lengths 8k,32k,64k,128k      # -> D:\models\r4dx\prefill-m0\tasks
-& $py tools\prefill\make_kl_tokens.py --lengths 8k,32k,64k,128k   # -> D:\models\r4dx\prefill-m0\kl\tokens_long.json
+& $py tools\prefill\build_tasks.py --lengths 8k,32k,64k,128k      # -> E:\models\r4dx\prefill-m0\tasks
+& $py tools\prefill\make_kl_tokens.py --lengths 8k,32k,64k,128k   # -> E:\models\r4dx\prefill-m0\kl\tokens_long.json
 ```
 
 **TTFT (cold prefill), CLI.** Each run is a fresh process. The first line is the timing sweep; the
 second is the attention-share profile:
 
 ```powershell
-.\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k,64k,128k -Runs 2 -OutDir D:\models\r4dx\prefill-m0\ttft\dense-tp1
-.\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k,64k,128k -ProfilePrefill -OutDir D:\models\r4dx\prefill-m0\ttft\profile-tp1
-.\tools\prefill\ttft_cli.ps1 -Tp 2 -Lengths 8k,32k,64k,128k -OutDir D:\models\r4dx\prefill-m0\ttft\dense-tp2
+.\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k,64k,128k -Runs 2 -OutDir E:\models\r4dx\prefill-m0\ttft\dense-tp1
+.\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k,64k,128k -ProfilePrefill -OutDir E:\models\r4dx\prefill-m0\ttft\profile-tp1
+.\tools\prefill\ttft_cli.ps1 -Tp 2 -Lengths 8k,32k,64k,128k -OutDir E:\models\r4dx\prefill-m0\ttft\dense-tp2
 ```
 
 **Accuracy task set, server.** The server is started and stopped by the script:
 
 ```powershell
-.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k,32k -OutDir D:\models\r4dx\prefill-m0\runs\dense-tp1
-.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 64k,128k -OutDir D:\models\r4dx\prefill-m0\runs\dense-tp1   # same dir: appends
-.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k -Limit 1 -OutDir D:\models\r4dx\prefill-m0\runs\smoke      # 1 item per task
-& $py tools\prefill\score_tasks.py --results D:\models\r4dx\prefill-m0\runs\dense-tp1\results.jsonl `
-    --compare D:\models\r4dx\prefill-m0\runs\variant\results.jsonl
+.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k,32k -OutDir E:\models\r4dx\prefill-m0\runs\dense-tp1
+.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 64k,128k -OutDir E:\models\r4dx\prefill-m0\runs\dense-tp1   # same dir: appends
+.\tools\prefill\run_tasks.ps1 -Device 1 -Lengths 8k -Limit 1 -OutDir E:\models\r4dx\prefill-m0\runs\smoke      # 1 item per task
+& $py tools\prefill\score_tasks.py --results E:\models\r4dx\prefill-m0\runs\dense-tp1\results.jsonl `
+    --compare E:\models\r4dx\prefill-m0\runs\variant\results.jsonl
 ```
 
 - A variant binary is passed with `-Server <path>`.
@@ -117,10 +117,10 @@ second is the attention-share profile:
 **KL, dense reference vs variant.** Both runs must use the same tokens file:
 
 ```powershell
-.\tools\prefill\run_kl.ps1 -Device 1 -OutDir D:\models\r4dx\prefill-m0\kl\dense
-.\tools\prefill\run_kl.ps1 -Device 0 -Tool <variant build>\tests\model\tool_teacher_forced_logprobs.exe -OutDir D:\models\r4dx\prefill-m0\kl\variant
-& $py tools\prefill\kl_compare.py --ref D:\models\r4dx\prefill-m0\kl\dense --test D:\models\r4dx\prefill-m0\kl\variant `
-    --tokens D:\models\r4dx\prefill-m0\kl\tokens_long.json --json D:\models\r4dx\prefill-m0\kl\dense_vs_variant.json
+.\tools\prefill\run_kl.ps1 -Device 1 -OutDir E:\models\r4dx\prefill-m0\kl\dense
+.\tools\prefill\run_kl.ps1 -Device 0 -Tool <variant build>\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\prefill-m0\kl\variant
+& $py tools\prefill\kl_compare.py --ref E:\models\r4dx\prefill-m0\kl\dense --test E:\models\r4dx\prefill-m0\kl\variant `
+    --tokens E:\models\r4dx\prefill-m0\kl\tokens_long.json --json E:\models\r4dx\prefill-m0\kl\dense_vs_variant.json
 ```
 
 Use `-Segment prose_8k,recall_8k` to run a subset (one process per segment). `-Tp 2` runs at TP=2.

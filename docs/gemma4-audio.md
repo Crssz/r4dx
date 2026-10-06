@@ -71,7 +71,7 @@ ctest --test-dir build\win-hip -R "^test_audio$|^test_audio_golden$|^test_openai
 GPU (user-run; **not run by the author**):
 
 ```
-r4dx-convert --model-dir D:\models\Huihui-gemma-4-12B-it-abliterated --out D:\models\r4dx\huihui-gemma\bf16-audio.r4dx --audio on
+r4dx-convert --model-dir E:\models\Huihui-gemma-4-12B-it-abliterated --out E:\models\r4dx\huihui-gemma\bf16-audio.r4dx --audio on
 $env:HIP_VISIBLE_DEVICES='1'; ctest --test-dir build\win-hip -R gemma_audio --output-on-failure
 ```
 

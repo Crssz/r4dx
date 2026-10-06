@@ -136,9 +136,9 @@ container with it.
 - ~~**`kv_calibrate.py`'s calibration distribution is not representative**~~ -- **CLOSED** by
   `tools/reference/kv_calibrate_full.py` (full 64-layer forward, all 16 layers, 8316 tokens of
   mixed English/Thai/C++/Python/chat-template corpus), which writes
-  `D:\models\r4dx\qwen38-27b.kvcalib-full.json`. What remains open is downstream, not here: the
-  shipped container `D:\models\r4dx\qwen38-27b.r4dx` still carries the **prototype's** descales and
-  has to be re-converted with `--kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json` before its
+  `E:\models\r4dx\qwen38-27b.kvcalib-full.json`. What remains open is downstream, not here: the
+  shipped container `E:\models\r4dx\qwen38-27b.r4dx` still carries the **prototype's** descales and
+  has to be re-converted with `--kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json` before its
   fp8 KV cache is trustworthy. Note the remaining caveat that no calibration pass can close: these
   are **static** per-kv-head scales, fixed at convert time, so an activation above the corpus's
   amax saturates at +-448 rather than getting its own scale. The JSON's `k_p9999`/`v_p9999` fields
@@ -230,7 +230,7 @@ deliberately **not** registered with `add_test()`.
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 build\win-hip\tests\model\tool_teacher_forced_logprobs.exe `
-    --model D:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
+    --model E:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
     --tokens <tokens.json> --out-dir <dir> [--segment <name>] [--max-ctx N] [--layers N] `
     [--vision off] [--check-greedy N] [--no-write] [--quiet]
 ```
@@ -283,7 +283,7 @@ output is a distribution (`max |log sum_j exp(row[j])| < 1e-2`, measured ~1.5e-6
 
 **The automatic check: ctest `test_teacher_forced_logprobs`**
 (`tests/model/test_teacher_forced_logprobs.cpp`, HIP device 1, SKIPPED when
-`D:/models/r4dx/qwen38-27b-l4-mtp.r4dx` is absent). It drives the *same* pass -- both TUs call
+`E:/models/r4dx/qwen38-27b-l4-mtp.r4dx` is absent). It drives the *same* pass -- both TUs call
 `teacher_forced.h`, so the tool's numbers are the ones ctest checks, not a lookalike
 reimplementation -- and asserts three things on the 4-layer container:
 
@@ -320,7 +320,7 @@ minute, which is not the bottleneck in this rung.
 
 ### Rung 4 measurement: w4a16
 
-**Measured 2026-09-22, HIP device 1, real 64-layer container `D:/models/r4dx/qwen38-27b-v3.r4dx`.**
+**Measured 2026-09-22, HIP device 1, real 64-layer container `E:/models/r4dx/qwen38-27b-v3.r4dx`.**
 
 **Corpus**: `tools/reference/kl_corpus/` (committed), the held-out four-segment corpus described in
 `tools/reference/README.md` -- `english_prose` (original), `cpp_source` (excerpt of this repo's own
@@ -340,7 +340,7 @@ $py = "<reference venv>\Scripts\python.exe"   # see tools/reference/README.md
 
 # r4dx: w4a16, all 4 segments
 build\win-hip\tests\model\tool_teacher_forced_logprobs.exe `
-    --model D:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
+    --model E:/models/r4dx/qwen38-27b-v3.r4dx --layout w4a16 `
     --tokens tools\reference\kl_corpus\tokens.json `
     --out-dir tools\reference\kl_out\w4a16 --max-ctx 4096 --vision off
 
@@ -572,7 +572,7 @@ What this says:
   8316 tokens, six files incl. a chat-templated turn) finds K amax ~2x and V amax up to ~8x larger
   than the prototype's, i.e. the old descales saturated the e4m3 cache on ordinary text. Fixing the
   calibration alone is worth -18% KL and +1.4 points top-1 at zero runtime cost, and every new
-  container should be converted with `--kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json`.
+  container should be converted with `--kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json`.
 - Published llama.cpp Q4_K_M on this checkpoint measures 0.011-0.014 mean KL / 95-96% top-1 (its
   own `llama-perplexity --kl-divergence` methodology, wikitext / held-out English). The remaining
   gap is in `quant_int4.hpp`'s grid: plain min/max scale, round-to-nearest, no scale/zero search,
@@ -706,10 +706,10 @@ worth using is explicit:
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v5.r4dx `
+    --input C:\AI\models\Qwen3.8-27B --output E:\models\r4dx\qwen38-27b-v5.r4dx `
     --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz
+    --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix E:\models\r4dx\qwen38-27b.imatrix.npz
 ```
 
 #### Not done
@@ -720,9 +720,9 @@ $env:HIP_VISIBLE_DEVICES = '1'
   tower participates in the `--vision off` teacher-forced forward, so the comparison is sound for
   KL; it does mean the w4a8/mxfp4 **acceptance** numbers were not measured).
 - `kl_audit.py`'s vocab-region/entropy breakdown was not re-run for B.
-- Container B lives on `C:\AI\r4dx-tmp\` rather than `D:\models\r4dx\`: `D:` had 16.48 GiB free and
+- Container B lives on `C:\AI\r4dx-tmp\` rather than `E:\models\r4dx\`: `D:` had 16.48 GiB free and
   the container needs 17.5 GiB, and freeing space means deleting files this session did not create.
-  Move it to `D:\models\r4dx\` when space allows; nothing in the tooling depends on its location.
+  Move it to `E:\models\r4dx\` when space allows; nothing in the tooling depends on its location.
 
 ### Milestone 11 / group size: what the w4a16 group buys (2026-09-22)
 
@@ -1046,7 +1046,7 @@ The two sections above are the two halves of one question. "Group size" measured
 *every* weight slightly more accurate; "sensitivity" measured which weights are worth making a lot
 more accurate. This section spends a fixed budget -- **at most +1.5 GiB of weights over
 `qwen38-27b-v5.r4dx`** -- using both tables, and ships the result as
-`D:\models\r4dx\qwen38-27b-v6.r4dx`.
+`E:\models\r4dx\qwen38-27b-v6.r4dx`.
 
 #### The decision, and the arithmetic it was made on (before anything was converted)
 
@@ -1115,15 +1115,15 @@ one at ~7 minutes of CPU and ~2.5 minutes of GPU apiece.
 
 #### v6, measured
 
-`D:\models\r4dx\qwen38-27b-v6.r4dx`, 42.74 GiB on disk, 417.9 s to convert:
+`E:\models\r4dx\qwen38-27b-v6.r4dx`, 42.74 GiB on disk, 417.9 s to convert:
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-v6.r4dx `
+    --input C:\AI\models\Qwen3.8-27B --output E:\models\r4dx\qwen38-27b-v6.r4dx `
     --layouts w4a16,w4a8,mxfp4 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix E:\models\r4dx\qwen38-27b.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
 ```
 
@@ -1171,7 +1171,7 @@ round amortizes one pass over the weight stream across 2.4-2.7 accepted tokens.
 #### The drafter has to be re-converted too, and *how* matters
 
 A group-64 build refuses the group-128 DFlash2 drafter (`DflashDraftWeights::Open` runs the same
-`CheckW4a16Group` guard), so `D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx` was converted from
+`CheckW4a16Group` guard), so `E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx` was converted from
 the same `Qwen3.8-27B-DFlash2-Q8_0.gguf`. The first attempt used the converter's default `--quant
 rtn` and cost **6.4 tok/s**:
 
@@ -1203,7 +1203,7 @@ production container if the production build reads it without a flag. The escape
 whole story including the trap that an *existing* build directory keeps its cached 128.
 
 `tests/model` reads 4-layer containers at hard-coded group-128 paths, so group-matched copies were
-converted once into `D:\models\r4dx\g64\` and `R4DX_TEST_CONTAINER_DIR` points the suite at them.
+converted once into `E:\models\r4dx\g64\` and `R4DX_TEST_CONTAINER_DIR` points the suite at them.
 `qwen38-27b-l4-mtp-draftvocab.r4dx` was regenerated there with a fresh arbitrary 4096-id subset
 (the 1416 distinct ids in `kl_corpus/tokens.json`, padded from 0 -- the reduced-vocab test is about
 correctness plumbing, not coverage), so the reduced-vocab draft head keeps its automated coverage

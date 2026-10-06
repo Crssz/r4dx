@@ -16,10 +16,10 @@ tuning row (all seven classes x KB 4/5, including mlp.down KB 4's SK 16) bit for
 ## The 256-row prefill chunk (stage S2, `R4DX_PREFILL_CHUNK=256`)
 
 Result (MEASURED, HIP device 1, TP = 1, Huihui mix4.5m, main dd38f8b + branch `linear`; logs under
-`D:\models\r4dx\linear\S2\logs`, outputs under `D:\models\r4dx\linear\spike`):
+`E:\models\r4dx\linear\S2\logs`, outputs under `E:\models\r4dx\linear\spike`):
 
 * **Bit identity: all 12 KL segments (prose / code / recall x 8k / 32k / 64k / 128k) are byte-identical
-  (sha256 of every `logprobs.f16`) to the dense dumps `D:\models\r4dx\pflash\baseline\kl-dense-huihui`**, mean /
+  (sha256 of every `logprobs.f16`) to the dense dumps `E:\models\r4dx\pflash\baseline\kl-dense-huihui`**, mean /
   p99 / max KL exactly 0, top-1 100%. Flag OFF: prose_8k and prose_32k are byte-identical to the same dumps
   (the noise floor of the harness is exactly 0, so this is a bit test). Greedy text of 4 short prompts
   (`tests/model/mtp_prompts.txt`), 4 long prompts (495 / 1069 / 2115 / 4310 tokens: super-chunks plus a
@@ -200,7 +200,7 @@ svh, out_scale and one bf16 rounding. Row tiles are independent in WMMA, so noth
   stores bf16.
 * ws is SKG M N x 4 B (gate_up 35.6 MB, down 10.5 MB at M = 256); tickets N/128 words, as the stock kernel.
 
-## Bit identity against the SHIPPED rows (MEASURED, S1: logs under D:\models\r4dx\linear\S1\logs)
+## Bit identity against the SHIPPED rows (MEASURED, S1: logs under E:\models\r4dx\linear\S1\logs)
 
 The comparison target is the shipped M = 64 tuning-table row of each (class, KB), read from
 `src/model/gemm_tuning_table_trellis.inc` (M = 64 band): mlp.gate_up SK 4; mlp.down SK 16 (KB 4) / SK 4
@@ -215,7 +215,7 @@ The comparison target is the shipped M = 64 tuning-table row of each (class, KB)
   time. Each M = 256 launch is repeated 8 more times and must give the same bytes (a race in the running-sum
   handoff would show). M = 128 against two launches (4 seeds, `--m128`, verify_m128.log): 176 of 176 identical;
   SK 16 has no M = 128 configuration (skipped, printed).
-* Real container weights (`tool_trellis_m256_real_check --dir D:\models\r4dx\linear\A2verify\real`, the
+* Real container weights (`tool_trellis_m256_real_check --dir E:\models\r4dx\linear\A2verify\real`, the
   verifier's extracted slices of the Huihui mix4.5m container, 9 tensor classes x KB 4/5 = 18 files, N(0,1)
   f16 activations, 3 seeds, one-A and two-part, each launch repeated 12 times; real_check_final.log): 246
   M = 256 launches, 0 of N x 256 bf16 differ from four shipped-row launches, 0 run-to-run differences,
@@ -302,6 +302,6 @@ that ablation is not clean: the stand-ins cost about the VALU they replace.)
   mlp.down KB 4). The tail lengths and prefix-reuse suffixes are bit-tested by `test_prefill_chunk_identity`.
 * The build's zero-scratch / 190-VGPR check (third_party/check_trellis_isa.cmake) covers this unit since S2:
   22 instantiations, max 190 VGPRs, no scratch (the S1 compile report,
-  D:\models\r4dx\linear\S1\logs\resource.txt, lists the ones since removed).
+  E:\models\r4dx\linear\S1\logs\resource.txt, lists the ones since removed).
 * A-layout: fragment-contiguous activations (a prefill-only input-transform change, measured -5..-8% on the
   M = 64 kernel) were not tried here.

@@ -42,6 +42,11 @@ This configures and builds with the `win-hip` CMake preset (Ninja + CMake from
 SDK at `C:\opt\rocm`. See `docs/build-windows.md` for the exact toolchain versions, flags, and
 gotchas.
 
+**Models root.** Every default model, container, calibration and corpus path in the tools, scripts and
+tests is derived from one root, the environment variable `R4DX_MODELS_ROOT` (default `E:\models`; the old
+`D:\models` is a junction to it). Set it to point the whole tree at another drive, for example
+`$env:R4DX_MODELS_ROOT = 'F:\models'`. Paths written as `E:\models\...` in these docs are that root.
+
 The w4a16 group -- how many contiguous `K` share one `(scale, zero)` pair -- is **64** (4.5
 bits/weight; 32 for the LM head, 5 bits). It is a compile-time constant of both the kernel and the
 converter, every container records the group it was packed with, and a loader refuses a mismatch
@@ -99,10 +104,10 @@ smoke test for `r4dx-server` (see "Run the OpenAI-compatible server" below) -- a
 ### Convert a checkpoint to a container
 
 **The default (production) container is the Huihui abliterated trellis mix4.5m,
-`D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, run with `--layout trellis`** (since
+`E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx`, run with `--layout trellis`** (since
 2026-09-29; `docs/huihui.md`). It is made with `tools\quant2\trellis_convert.ps1` from the Huihui
-checkpoint `D:\models\Huihui-Qwen3.8-27B-abliterated` and the Hessians, trellis bits and calibration
-files under `D:\models\r4dx\huihui\` (recipe: `D:\models\r4dx\huihui\RECIPE.md`); every default of
+checkpoint `E:\models\Huihui-Qwen3.8-27B-abliterated` and the Hessians, trellis bits and calibration
+files under `E:\models\r4dx\huihui\` (recipe: `E:\models\r4dx\huihui\RECIPE.md`); every default of
 that script names them. The base Qwen3.8-27B checkpoint and every container made from it (v6, the
 base trellis mix4.5m / K4m) were retired on 2026-09-29 -- the Huihui checkpoint has the same
 architecture, tokenizer and chat template (its four tokenizer files are byte-identical), so
@@ -112,10 +117,10 @@ runs, on any checkpoint:
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input D:\models\Huihui-Qwen3.8-27B-abliterated --output D:\models\r4dx\huihui-qwen38-27b-abl-v6.r4dx `
+    --input E:\models\Huihui-Qwen3.8-27B-abliterated --output E:\models\r4dx\huihui-qwen38-27b-abl-v6.r4dx `
     --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz `
+    --kv-calib E:\models\r4dx\huihui-qwen38-27b-abl.kvcalib-full.json `
+    --quant search --imatrix E:\models\r4dx\huihui-qwen38-27b-abl.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$"
 ```
 
@@ -169,7 +174,7 @@ scale. `--quant rtn` is the **default** and is the historical behaviour byte for
 **Use them as a pair: `--quant search --imatrix <npz>`, or not at all.** `--imatrix <npz>` weights
 the search's error term by each input channel's mean activation energy, from the importance matrix
 `tools/reference/imatrix_capture.py` captures over the calibration corpus
-(`D:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names); it
+(`E:\models\r4dx\qwen38-27b.imatrix.npz`, keyed by the converter's own container base names); it
 requires `--quant search`. The weighting is not a refinement, it is the whole mechanism -- measured
 on the real checkpoint against the bf16 reference (`docs/validation.md` "Milestone 10"):
 
@@ -207,12 +212,12 @@ a hard error.
 
 ```powershell
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-ldlq-mlp.r4dx `
+    --input C:\AI\models\Qwen3.8-27B --output E:\models\r4dx\qwen38-27b-ldlq-mlp.r4dx `
     --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix E:\models\r4dx\qwen38-27b.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
-    --hessian-dir D:\models\r4dx\qwen38-27b.hessian --ldlq "mlp\."
+    --hessian-dir E:\models\r4dx\qwen38-27b.hessian --ldlq "mlp\."
 ```
 
 - Linears the regex does not match follow `--quant` / `--imatrix` exactly as without the flag; the
@@ -228,7 +233,7 @@ a hard error.
   end; linears sharing an input (`gdn.in_proj_qkv`/`_z`, `attn.qg`/`k`/`v`) reuse one factorization.
 
 No KL number yet: the pilot (`--ldlq "mlp\."` on top of v6) is gate G3 in `docs/quant2.md`, and Q1
-stops there if it does not cut mean KL by at least 10%. (`D:\models\r4dx\qwen38-27b.hessian` is an
+stops there if it does not cut mean KL by at least 10%. (`E:\models\r4dx\qwen38-27b.hessian` is an
 example output directory, not an existing capture.)
 
 **`--w4a16-group-rule "<regex>=<g>"` -- per-tensor w4a16 group (experimental, `docs/quant2.md`
@@ -240,10 +245,10 @@ bytes and buys accuracy: 5 bits per weight at 32, 4.5 at 64.
 
 ```powershell
 .\build\win-hip\src\convert\r4dx-convert.exe `
-    --input C:\AI\models\Qwen3.8-27B --output D:\models\r4dx\qwen38-27b-groups.r4dx `
+    --input C:\AI\models\Qwen3.8-27B --output E:\models\r4dx\qwen38-27b-groups.r4dx `
     --layouts w4a16 --lm-head 4bit --no-bf16 --mtp on --vision on `
-    --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
-    --quant search --imatrix D:\models\r4dx\qwen38-27b.imatrix.npz `
+    --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --quant search --imatrix E:\models\r4dx\qwen38-27b.imatrix.npz `
     --keep-bf16 "^text\.layers\.[0-9]+\.attn\.[kv]$" `
     --w4a16-group-rule "^text\.layers\.([0-9]|[12][0-9]|3[01])\.mlp\.down$=32" `
     --w4a16-group-rule "gdn\.in_proj_z$=128"
@@ -286,7 +291,7 @@ bytes and buys accuracy: 5 bits per weight at 32, 4.5 at 64.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
+.\build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 128 --temperature 0 --stats
 ```
@@ -295,7 +300,7 @@ Add `--image <path>` (repeatable, any container the vision tower loaded from) to
 picture (docs/vision.md):
 
 ```powershell
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
+.\build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --image photo.png --prompt "What is in this picture?" --max-tokens 128 --temperature 0 --stats
 ```
 
@@ -309,7 +314,7 @@ attention's `qg`/`o` projections too (they used to always run bf16 regardless of
 `docs/perf.md`'s "Known limitation", now resolved). `--prompt "..."` renders one turn through
 the real chat template and generates once; `--chat` instead starts an interactive multi-turn REPL
 (re-rendering the whole conversation each turn, feeding only the new tail tokens to the model).
-`--tokenizer-dir` defaults to `D:\models\Huihui-Qwen3.8-27B-abliterated` (where `tokenizer.json` /
+`--tokenizer-dir` defaults to `E:\models\Huihui-Qwen3.8-27B-abliterated` (where `tokenizer.json` /
 `chat_template.jinja` / `generation_config.json` live; byte-identical to the base Qwen3.8-27B's, whose
 checkpoint dir `C:\AI\models\Qwen3.8-27B` was the default until 2026-09-29); `--think {on|off}` toggles the chat
 template's `enable_thinking`; `--temperature 0` selects greedy argmax decoding, otherwise
@@ -336,7 +341,7 @@ plain decode's own text somewhere (measured 6/8 96-token trajectories in one swe
 diverging token is still a legitimate canonical sample of the round that actually ran
 (`docs/sampling.md` sections 9.3, 11-12, `tools/validate_spec_sampling.ps1`). See `docs/mtp.md` for
 the full design, the container requirement (the container must carry
-`mtp.*` weights -- `D:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
+`mtp.*` weights -- `E:\models\r4dx\qwen38-27b.r4dx` already does), and measured acceptance/speedup
 per layout (roughly +75-165% decode throughput over `--mtp 0` at its best `K` -- w4a16 `K=3`, see
 `docs/perf.md`'s consolidated table -- `--mtp 3` a reasonable default). See `src/cli/cli_args.h` for
 the full flag list and `docs/perf.md` for measured throughput per layout.
@@ -346,7 +351,7 @@ self-speculative decode instead of MTP -- mutually exclusive with `--mtp`, runs 
 `--temperature` (same sample-and-match acceptance, lossless in distribution, as `--mtp` above --
 including the same batched-verify numeric caveat on a fixed-seed token-for-token match -- as of
 Milestone 6 stage S3), needs a separate DFlash2 draft container
-(`D:\models\r4dx\qwen38-27b-dflash2-{w4a16-g64,bf16}.r4dx`),
+(`E:\models\r4dx\qwen38-27b-dflash2-{w4a16-g64,bf16}.r4dx`),
 independent of the target's own `--layout`. `--dflash-k N` (1..7, default 7), `--dflash-p-min F`
 and `--dflash-n-min N` tune the selector walk's early-stop/discard gates. Best measured so far
 (docs/perf.md's Integrate-stage final confirmation sweep, each layout's own best `--dflash-k`
@@ -384,7 +389,7 @@ to TP=1: the split changes the order of the sums. Design, gates and measurements
 
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible
-.\build\win-hip\src\cli\r4dx-cli.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --tp 2 `
+.\build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --tp 2 `
     --prompt "Write a haiku about GPUs, then explain what a GPU is in two sentences." `
     --max-tokens 256 --max-ctx 2048 --temperature 0 --stats
 ```
@@ -412,9 +417,9 @@ the group and runs normally:
 
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
+.\build\win-hip\src\server\r4dx-server.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --host 127.0.0.1 --port 8080 --tp 2 `
-    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
+    --dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 ```
 
 Decode speed, standard protocol, one fresh process per run, TP=1 on device 1 in the same session
@@ -440,9 +445,9 @@ has the P5 gates.
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
-.\build\win-hip\src\server\r4dx-server.exe --model D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
+.\build\win-hip\src\server\r4dx-server.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis `
     --host 127.0.0.1 --port 8080 `
-    --dflash D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
+    --dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --dflash-k 7
 ```
 
 `--dflash` is optional (drop the last line for plain decode). The w4a16 drafter must be the
@@ -534,7 +539,7 @@ holds for `--layout w4a16` containers.
 decode +1.1% plain, +6.3% `--dflash k=7`, -1.8% `--mtp 3` (acceptance), prefill 1.55x.
 `qwen38-27b-trellis-k4m.r4dx` (KL 0.01004, 12.13 GiB) was the speed option: +11% plain, +13% DFlash,
 +3.7% `--mtp 3`, prefill 1.60x. Only the base K4m container is gone: the Huihui model's own K4m
-oracle bits exist (`D:\models\r4dx\huihui\trellis-q\K4m`) and `trellis_convert.ps1 -Oracle K4m` would
+oracle bits exist (`E:\models\r4dx\huihui\trellis-q\K4m`) and `trellis_convert.ps1 -Oracle K4m` would
 build a container from them, but that container has not been built or measured, so none of the base
 K4m figures is claimed for it. **q2ab is retired**: q2ab_hv2_q3 is quoted only as the historical
 baseline these gains were measured against.

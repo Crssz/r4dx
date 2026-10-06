@@ -14,7 +14,7 @@ Everything here is read-only against:
   `torch` 2.13.0+rocm10.0.0 in a venv that has since been deleted; later work (trellis) used a system
   Python 3.12 with torch 2.9.1 ROCm / transformers 5.5. Never `pip`/`uv install` into it -- these
   scripts only import from it.
-- `D:\models\Huihui-Qwen3.8-27B-abliterated` -- the checkpoint (`common.DEFAULT_MODEL_DIR` since
+- `E:\models\Huihui-Qwen3.8-27B-abliterated` -- the checkpoint (`common.DEFAULT_MODEL_DIR` since
   2026-09-29; before that the base Qwen3.8-27B at `C:\AI\models\Qwen3.8-27B`, retired). Same
   architecture, tokenizer and config; only 70 tensors in layers 17..51 differ from the base
   (docs/huihui.md). Shards may still be downloading; every
@@ -417,7 +417,7 @@ Runtime: ~10s on HIP device 1 (default `--num-tokens 256`); a few seconds on CPU
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 python tools\reference\kv_calibrate_full.py `
-    --out D:\models\r4dx\qwen38-27b.kvcalib-full.json
+    --out E:\models\r4dx\qwen38-27b.kvcalib-full.json
 ```
 
 The **real** static fp8 KV-cache calibration -- the one a shipping container should be converted
@@ -614,7 +614,7 @@ prototype's number was wrong for the job.
 ### Consuming it
 
 ```powershell
-r4dx-convert ... --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json
+r4dx-convert ... --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json
 ```
 
 The converter reads only `k_amax`/`v_amax` and writes `text.layers.{i}.attn.k_descale`/`.v_descale`
@@ -892,15 +892,15 @@ scores it against the existing bf16 reference on `kl_corpus/`.
 $py   = 'python'
 $gguf = 'D:\huggingface\hub\models--unsloth--Qwen3.8-27B-GGUF\snapshots\4ca720788d1e01f1bff70c033e0d0028fd02e502\Qwen3.8-27B-UD-Q4_K_XL.gguf'
 # CPU, no GPU: every tensor against the checkpoint and against ggml's C (~4 min, 6 processes)
-& $py tools\reference\gguf_validate.py --gguf $gguf --out-dir D:\models\r4dx\kl-gguf\validation
+& $py tools\reference\gguf_validate.py --gguf $gguf --out-dir E:\models\r4dx\kl-gguf\validation
 # HIP device 1. Check free commit first: the run itself peaks at ~15 GiB of it (see "Host memory")
 (Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory / 1MB   # GB; want >= 20
 $env:HIP_VISIBLE_DEVICES = '1'
 & $py tools\reference\full_logits_golden.py --device cuda --tokens tools\reference\kl_corpus\tokens.json `
-    --weights-gguf $gguf --gguf-sha256 --out-dir D:\models\r4dx\kl-gguf\q1
-& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\kl-q1\ref --test-dir D:\models\r4dx\kl-gguf\q1 `
-    --tokens tools\reference\kl_corpus\tokens.json --out D:\models\r4dx\kl-gguf\kl_q1.json
-# the Thai canonical corpus the same way: tokens_thai_canon.json, ref D:\models\r4dx\kl-thai-canon\ref
+    --weights-gguf $gguf --gguf-sha256 --out-dir E:\models\r4dx\kl-gguf\q1
+& $py tools\reference\kl_report.py --ref-dir E:\models\r4dx\kl-q1\ref --test-dir E:\models\r4dx\kl-gguf\q1 `
+    --tokens tools\reference\kl_corpus\tokens.json --out E:\models\r4dx\kl-gguf\kl_q1.json
+# the Thai canonical corpus the same way: tokens_thai_canon.json, ref E:\models\r4dx\kl-thai-canon\ref
 ```
 
 The 64-layer run must log `substituting 498 tensors {'Q5_K': 191, 'Q8_0': 108, 'IQ4_XS': 70,
@@ -1001,7 +1001,7 @@ correct decode. The evidence that does not depend on this file is:
 - bit-exactness against ggml's C, here and in test part (f), and against gguf-py;
 - the V-head reorder: the 240 tensors that carry it would be at rel >= 1.05 without its inverse.
 
-Result for the Unsloth file (`D:\models\r4dx\kl-gguf\validation`): **866 tensors, 0 failures**.
+Result for the Unsloth file (`E:\models\r4dx\kl-gguf\validation`): **866 tensors, 0 failures**.
 All 360 lossless tensors match (349 bit-exact, 11 `-exp(A_log)` 1 ulp off). ggml's C re-decoded
 4525 rows of all 506 quantized tensors, every type, with 0 differing bits.
 
@@ -1078,16 +1078,16 @@ $py = 'python'
 # (the directories are the Huihui model's, the default of --hessian-dir / --model-dir; the base
 #  model's trellis-q and hessian-v2 were retired on 2026-09-29, docs/huihui.md; its kl-canon\ref
 #  bf16 reference is still on disk but scores only base-model containers)
-$q = 'D:\models\r4dx\huihui\trellis-q'
+$q = 'E:\models\r4dx\huihui\trellis-q'
 & $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --out-dir $q\K4
 & $py tools\reference\trellis_quant.py quantize-model --device cuda --K 4 --hessian-basis matched `
     --out-dir $q\K4m                                                  # the "what we would ship" basis
 & $py tools\reference\trellis_quant.py mix --bpw 4.5 --src $q\K4 `
     --src $q\K5 --out-dir $q\mix4.5
 & $py tools\reference\full_logits_golden.py --device cuda --tokens tools\reference\kl_corpus\tokens_canon.json `
-    --weights-override $q\K4 --out-dir D:\models\r4dx\huihui\kl\4.0
-& $py tools\reference\kl_report.py --ref-dir D:\models\r4dx\huihui\kl-ref --test-dir D:\models\r4dx\huihui\kl\4.0 `
-    --tokens tools\reference\kl_corpus\tokens_canon.json --out D:\models\r4dx\huihui\kl\4.0\kl_canon.json
+    --weights-override $q\K4 --out-dir E:\models\r4dx\huihui\kl\4.0
+& $py tools\reference\kl_report.py --ref-dir E:\models\r4dx\huihui\kl-ref --test-dir E:\models\r4dx\huihui\kl\4.0 `
+    --tokens tools\reference\kl_corpus\tokens_canon.json --out E:\models\r4dx\huihui\kl\4.0\kl_canon.json
 ```
 
 **Encoders.** The Viterbi is the only heavy part (2 x 256 x 65,536 candidate evaluations per
@@ -1338,7 +1338,7 @@ Peak VRAM ~5.4 GiB (control) and ~1.6 GiB (streaming / noise floor).
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 python tools\reference\imatrix_capture.py `
-    --out D:\models\r4dx\qwen38-27b.imatrix.npz
+    --out E:\models\r4dx\qwen38-27b.imatrix.npz
 ```
 
 The **importance matrix** (llama.cpp's "imatrix") for every linear `r4dx-convert` quantizes. For a
@@ -1402,7 +1402,7 @@ recorded as the sidecar's `tokenizer`). `tools/reference/kl_corpus/` is delibera
 report is measured on, and calibrating the quantization constants on the text the drift is measured
 on would flatter the result.
 
-**Output**: `D:\models\r4dx\qwen38-27b.imatrix.npz` (341 `float32[K]` arrays, 10.1 MiB) plus
+**Output**: `E:\models\r4dx\qwen38-27b.imatrix.npz` (341 `float32[K]` arrays, 10.1 MiB) plus
 `qwen38-27b.imatrix.json`, a sidecar with the corpus (path + sha256 + tokens each), `tokenizer`,
 `config_sha256`, `total_calibration_tokens`, per-key `{K, rows, hf_names, tap}`, the converter
 audit's sha256 of `src/convert/main.cpp`, the gate results, and the `caveat` (what this is: the
@@ -1497,7 +1497,7 @@ python tools\reference\hessian_capture.py --dry-run
 
 $env:HIP_VISIBLE_DEVICES = '1'
 python tools\reference\hessian_capture.py `
-    --out-dir D:\models\r4dx\hessian-v1
+    --out-dir E:\models\r4dx\hessian-v1
 ```
 
 The **input Hessians** `r4dx-convert --ldlq` needs (docs/quant2.md section 2, phase Q1). For a
@@ -1580,7 +1580,7 @@ refuses instead of a half-valid set.
 - `calib.txt` + `kv_calib_corpus/` -- `kv_calibrate_full.collect_corpus`, exactly the imatrix
   corpus, each file truncated to `--seq-len`;
 - the first `--wikitext-seqs` (64) non-overlapping `--seq-len` (2048) token windows of
-  `D:/models/wikitext-2-raw/wiki.train.raw`, from the start (only a prefix is tokenized; the last
+  `E:/models/wikitext-2-raw/wiki.train.raw`, from the start (only a prefix is tokenized; the last
   256 tokens of that prefix are discarded, so the cut cannot change a kept token);
 - `--code-seqs` (16) windows of this repo's own `*.cpp/*.h/*.hpp/*.hip/*.py` (tracked files,
   `git ls-files`), sorted, concatenated with one `==> path <==` header line per file, CRLF
@@ -1627,7 +1627,7 @@ AutoTokenizer still gave the canonical counts; the reference venv's 5.17 gives 1
 [hessian] corpus: 86 sequences, 171268 tokens (2.4s to tokenize)
     calib       1 seq    1755 tok  calib
     ...
-    wikitext   64 seq  131072 tok  D:\models\wikitext-2-raw\wiki.train.raw
+    wikitext   64 seq  131072 tok  E:\models\wikitext-2-raw\wiki.train.raw
     code       16 seq   32768 tok  code
 [hessian] 341 converter linears -> 261 taps; selected 261 file(s) serving 341 key(s), text layers 0..63
     L00.in.hess            K= 5120 rows~ 171268     50.0 MiB  text.layers.0.gdn.in_proj_qkv,text.layers.0.gdn.in_proj_z
@@ -1661,7 +1661,7 @@ same `--out-dir` deletes a stale `hessian.failed.json` before it starts.
 and `--write-fixture` never touch `torch.cuda` and are exempt. Before capturing it checks that the
 `--out-dir` drive has at least 1.1x the disk estimate free.
 
-**Options**: `--model-dir`, `--out-dir` (default `D:\models\r4dx\hessian-v1`), `--force`,
+**Options**: `--model-dir`, `--out-dir` (default `E:\models\r4dx\hessian-v1`), `--force`,
 `--corpus-dir`/`--calib-txt` (`none` to skip), `--wikitext` (`none` to skip), `--wikitext-seqs`,
 `--code-seqs`, `--gen-file SAMPLES_JSONL`, `--gen-max-seqs N`, `--seq-len`, `--no-mtp`,
 `--draft-head`, `--layers N` (SMOKE: first N text layers
@@ -1678,11 +1678,11 @@ G3 pilot, which also matches `mtp.mlp.*` exactly as the converter's `--ldlq "mlp
 ```powershell
 # no GPU: plan + corpus check against the existing set
 python tools\reference\hessian_capture.py `
-    --rms-only --dry-run --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
+    --rms-only --dry-run --code-rev 34d381a --out-dir E:\models\r4dx\hessian-v1
 
 $env:HIP_VISIBLE_DEVICES = '1'
 python tools\reference\hessian_capture.py `
-    --rms-only --code-rev 34d381a --out-dir D:\models\r4dx\hessian-v1
+    --rms-only --code-rev 34d381a --out-dir E:\models\r4dx\hessian-v1
 ```
 
 A rotated container (`r4dx-convert --rotate q2a/q2ab`) runs each text layer's zero-centred norm
@@ -1837,7 +1837,7 @@ about 30 s with every optional input present (214 checks). It covers:
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 python tools\reference\kv_fakequant_golden.py `
-    --mode both --kv-calib D:\models\r4dx\qwen38-27b.kvcalib-full.json `
+    --mode both --kv-calib E:\models\r4dx\qwen38-27b.kvcalib-full.json `
     --tokens tools\reference\kl_corpus\tokens.json `
     --out-dir tools\reference\kl_out\kvfq-full-both
 ```
@@ -1895,16 +1895,16 @@ ranges and the clipping counters), so `kl_report.py` pairs it with `kl_out/ref` 
 
 All runs: corpus `tools/reference/kl_corpus/tokens.json`, all four 1024-token segments, paired
 against `tools/reference/kl_out/ref` with `kl_report.py`. `<full>` is
-`D:\models\r4dx\qwen38-27b.kvcalib-full.json` (`kv_calibrate_full.py`, the v4 descales the shipping
-container is converted with), `<old>` is `D:\models\r4dx\qwen38-27b.kvcalib.json` (the
+`E:\models\r4dx\qwen38-27b.kvcalib-full.json` (`kv_calibrate_full.py`, the v4 descales the shipping
+container is converted with), `<old>` is `E:\models\r4dx\qwen38-27b.kvcalib.json` (the
 `kv_calibrate.py` prototype's).
 
 ```powershell
 $env:HIP_VISIBLE_DEVICES = '1'
 $py = "python"
 $tok = "tools\reference\kl_corpus\tokens.json"
-$full = "D:\models\r4dx\qwen38-27b.kvcalib-full.json"
-$old  = "D:\models\r4dx\qwen38-27b.kvcalib.json"
+$full = "E:\models\r4dx\qwen38-27b.kvcalib-full.json"
+$old  = "E:\models\r4dx\qwen38-27b.kvcalib.json"
 
 & $py tools\reference\kv_fakequant_golden.py --self-test           # gate: no GPU, no checkpoint
 & $py tools\reference\kl_report.py --self-test                     # gate: unchanged, still passes

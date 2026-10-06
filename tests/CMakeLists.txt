@@ -127,6 +127,15 @@ if(_r4dx_ref_ok)
   )
   set_tests_properties(reference_gguf_dequant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
 
+  # tools/reference/fp8_dequant.py (block-FP8 -> bf16 checkpoint, header differ): synthetic tiny
+  # checkpoint, ragged shapes, both scale names, bit-exact, refusals. torch + safetensors, CPU only.
+  add_test(
+      NAME reference_fp8_dequant
+      COMMAND "${_r4dx_ref_python}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/reference/test_fp8_dequant.py"
+  )
+  set_tests_properties(reference_fp8_dequant PROPERTIES ENVIRONMENT "PYTHONIOENCODING=utf-8")
+
   # tools/reference/trellis_quant.py (the EXL3 trellis oracle, docs/trellis.md) and its native
   # encoders (trellis_viterbi.hip, built on first use with the venv's ROCm clang++): codebooks,
   # brute-force Viterbi optimality, native == torch bit for bit, the bitstream, LDLQ / regularize /

@@ -37,6 +37,12 @@ set(R4DX_MODEL_TESTS
   # container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library variant for
   # Model::DebugStateDigest.
   test_prefill_chunk_identity
+  # The GDN sequence ops of a 256-row super-chunk run once (the default) against the old 64-row sub-slices
+  # (R4DX_GDN_SLICE=64), and r4d_gdn_conv_prep2 (the default; R4DX_GDN_CONV=1 opts out) against r4d_gdn_conv_prep, byte for
+  # byte (docs/trellis-m256.md "GDN sequence ops"): part A synthetic at the real shape (fresh and has_init
+  # calls, 256 / 320 / 200 / 17 / 2 / 64 rows, a random initial state), part B GdnLayer::Forward on the
+  # 4-layer container's layer 0. Device 1; 77 without a device, or without the container after part A.
+  test_gdn_seq256_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})

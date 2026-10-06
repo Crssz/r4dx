@@ -209,7 +209,8 @@ class GdnControlCache {
   // which must never happen inside a tensor-parallel collective command (docs/tp.md 6.3.7 L4). The
   // TP warm-up (Model::TpWarmup) therefore uploads every key a single sequence can ever ask for
   // BEFORE it runs, and freezes the cache after it: CuPair(1..max_T), CacheIdx(slot),
-  // SidxBase(slot, window) and HasInitTrue(). After Freeze() a miss throws std::logic_error instead
+  // SidxBase(slot, window) and HasInitTrue() -- plus, on a wide Model, CuPair(256) for a super-chunk's
+  // one-call GDN sequence ops (TpWarmup adds it). After Freeze() a miss throws std::logic_error instead
   // of allocating. Never called at TP=1, where the cache stays lazy exactly as before.
   void Prewarm(int64_t max_T, int32_t slot, int64_t window) {
     for (int64_t T = 1; T <= max_T; ++T) (void)CuPair(T);

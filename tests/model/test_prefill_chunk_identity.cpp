@@ -6,6 +6,11 @@
 // KV cache, the DFlash2 drafter's K / V ring: Model::DebugStateDigest, R4DX_TP_TESTING), the speculative
 // rounds' tokens and the DFlash feature capture drained through Prefill's per-chunk callback.
 //
+// The 64-row Model always runs the pre-gdn256 GDN kernels (prefill_chunk.h's DecideGdnConv ignores
+// R4DX_GDN_CONV on it), so the env knobs select only the 256-row side: defaults compare one GDN call per
+// super-chunk + r4d_gdn_conv_prep2, R4DX_GDN_CONV=1 compares r4d_gdn_conv_prep and R4DX_GDN_SLICE=64 the
+// sub-slices -- each against the true 64-row path (tools/prefill/gdn256_check.ps1 runs all three).
+//
 // What is prefilled (the tail cases of the chunk grid, docs/prefill.md): one call of 1, 63, 64, 65, 255,
 // 256, 257, 511 and 8145 tokens (8145 on the 4-layer container only), and prefix-reuse shapes -- a second
 // Prefill call that continues the first (the chunk grid is anchored at each call's start), a suffix

@@ -520,10 +520,15 @@ TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) 
 ## The 256-row prefill chunk (default on, `R4DX_PREFILL_CHUNK`)
 
 Prompt prefill runs in 256-row super-chunks by default: the trellis linears see 256 rows through libr4d's
-M = 256 GEMM (one weight pass per 256 rows instead of four), and everything sequence-dependent (the GDN
-conv / scan, the attention core) still runs in 64-row sub-slices in order. The result is bit-identical to
-the 64-row path, so no accuracy number moves; the design, the identity coverage and the kernel are in
-[docs/trellis-m256.md](trellis-m256.md).
+M = 256 GEMM (one weight pass per 256 rows instead of four). The attention core still runs in 64-row
+sub-slices in order. The GDN sequence ops (conv prep, kkt solve, chunk scan, gated norm) run once over the
+256 rows with chunk 64 inside the kernels; `R4DX_GDN_SLICE=64` restores the sub-slices. Conv prep runs
+`r4d_gdn_conv_prep2` (same bytes on a grid that fills the device); `R4DX_GDN_CONV=1` restores
+`r4d_gdn_conv_prep`. A 64-row Model (`R4DX_PREFILL_CHUNK=0`) ignores both knobs and runs exactly the
+pre-change kernels. The result is bit-identical to the 64-row path, so no accuracy number moves. The two
+GDN changes cut 8k TTFT 5.002 -> 4.722 s (1713 tok/s) and 32k 24.55 -> 23.41 s on device 1. The design,
+the identity coverage, the kernels and the measurements are in [docs/trellis-m256.md](trellis-m256.md)
+("GDN sequence ops").
 
 | `R4DX_PREFILL_CHUNK` | prompt-prefill chunk |
 |---|---|
@@ -534,8 +539,9 @@ the 64-row path, so no accuracy number moves; the design, the identity coverage 
 - The variable is read once per process. `ModelOptions::prefill_chunk` (0 = follow the environment) forces
   64 or 256 for a test that needs both in one process.
 - Every model load prints one line, e.g. `[r4dx::model::Model] prefill chunk: 256 rows (default;
-  R4DX_PREFILL_CHUNK=0 restores 64-row chunks)`, or `64 rows (... asked for 256, not used: <reason>)`
-  when a 256 request could not be honoured.
+  R4DX_PREFILL_CHUNK=0 restores 64-row chunks), GDN sequence ops once per super-chunk (R4DX_GDN_SLICE=64
+  restores 64-row sub-slices)`, or `64 rows (... asked for 256, not used: <reason>)` when a 256 request
+  could not be honoured. A second line names the GDN conv prep kernel (`R4DX_GDN_CONV`).
 - The chunk grid is anchored at the start of each `Prefill` call: full 256-row super-chunks while at least
   256 rows remain, then the ordinary 64-row chunks for the rest (the last one holds 1..64 rows). The tail
   therefore runs the very chunks the 64-row grid makes for it, and a call split anywhere (a prefix-cache

@@ -183,6 +183,23 @@ inline void GdnConvPrep(const void* x, int64_t xpitch, const void* wgt, const vo
                                                  stream));
 }
 
+// GdnConvPrep's outputs bit for bit, on a grid that fills the device (r4d.h's
+// r4d_gdn_conv_prep2_w4_h128_bf16). Same arguments.
+inline void GdnConvPrep2(const void* x, int64_t xpitch, const void* wgt, const void* bias,
+                          void* cstate, int64_t cs_seq, int64_t cs_dim, int64_t cs_tok,
+                          const void* cache_idx, int64_t ci_stride, const void* has_init,
+                          const void* a, const void* b, int64_t ab_stride, int ab_is_bf16,
+                          const void* A_log, const void* dt_bias, void* q, void* k, void* v,
+                          void* g, void* beta, const void* cu, int N, int T, int H, int Hg, int K,
+                          int V, int width, float softplus_thr, hipStream_t stream) {
+  R4DX_R4D_CHECK("gdn_conv_prep2_w4_h128_bf16",
+                 r4d_gdn_conv_prep2_w4_h128_bf16(x, xpitch, wgt, bias, cstate, cs_seq, cs_dim,
+                                                  cs_tok, cache_idx, ci_stride, has_init, a, b,
+                                                  ab_stride, ab_is_bf16, A_log, dt_bias, q, k, v, g,
+                                                  beta, cu, N, T, H, Hg, K, V, width, softplus_thr,
+                                                  stream));
+}
+
 inline void GdnConvUpdate(const void* x, int64_t xpitch, const void* wgt, const void* bias,
                            void* cstate, int64_t cs_seq, int64_t cs_dim, int64_t cs_tok,
                            int state_len_max, const void* cache_idx, int64_t ci_stride,

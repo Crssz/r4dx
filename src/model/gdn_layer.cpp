@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "linear.h"
+#include "prefill_chunk.h"  // kGdnConvV1 / kGdnConvV2 (GdnLayerParams::conv_prep)
 #include "profile_span.h"
 #include "r4d.h"
 #include "r4dx/core/error.hpp"
@@ -113,8 +114,8 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   // matter, feed the decay path -- leave them bf16"), so they go straight through the bf16 GEMM
   // rather than through ApplyLinear's QuantLinear dispatch.
   // The bf16 GEMM takes at most 64 rows per launch (a row's bits do not depend on the other rows or on
-  // M): a 256-row prefill super-chunk (GdnLayerParams::seq_slice) runs it as 64-row slices, exactly the
-  // launches four 64-row chunks would make.
+  // M): a 256-row prefill super-chunk runs it as 64-row slices, exactly the launches four 64-row chunks
+  // would make, whatever GdnLayerParams::seq_slice says.
   ProfiledCall(prof, s, "gemm:gdn.in_proj_a", [&] {
     for (int64_t m0 = 0; m0 < T; m0 += 64) {
       core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_a.data(), a_buf + m0 * H,
@@ -150,13 +151,20 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
   // See GdnControlCache (gdn_state.h): these are pure functions of (T, p.slot), so every distinct
   // value is uploaded once ever (no per-call hipMemcpy, no per-call sync) rather than re-uploaded
   // on every single decode step.
-  // The sequence-dependent prefill ops (conv prep, kkt solve, chunk scan) run once per `slice` rows: the
-  // whole call (slice == T, T <= 64: today's path) or, for a 256-row prefill super-chunk, 64-row
-  // sub-slices in order -- each exactly the call a 64-row chunk makes (has_init true after the first, the
-  // fp32 state handed on through the slot), so the bytes equal four consecutive 64-row chunks.
+  // The sequence-dependent prefill ops (conv prep, kkt solve, chunk scan + state commit, gated norm) run
+  // once per `slice` rows: the whole call (slice == T: a 64-row chunk, and a 256-row super-chunk by
+  // default) or, under R4DX_GDN_SLICE=64 (p.seq_slice 64), 64-row sub-slices in order -- each exactly the
+  // call a 64-row chunk makes (has_init true after the first, the fp32 state handed on through the slot).
+  // The bytes are the same either way (docs/trellis-m256.md "GDN sequence ops"): the kernels chunk by 64
+  // internally with no cross-chunk state but the scan's fp32 state, which a sliced call stores and
+  // reloads as fp32 (exact) where a whole call keeps it in registers, and a chunk's conv halo is the same
+  // x shorts whether it is read from x or from the conv-state cache the previous slice wrote.
   const int64_t slice = (p.is_prefill && p.seq_slice > 0 && p.seq_slice < T) ? p.seq_slice : T;
   if (slice != T && (slice != 64 || T % slice != 0)) {
     throw std::runtime_error("GdnLayer::Forward: seq_slice must be 64 and divide T");
+  }
+  if (p.conv_prep < 0 || p.conv_prep > kGdnConvV2) {
+    throw std::runtime_error("GdnLayer::Forward: conv_prep must be 0, 1 or 2");
   }
   const int32_t* cu_dev = control.CuPair(slice);
   const int32_t* cache_idx_dev = control.CacheIdx(p.slot);
@@ -176,6 +184,10 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     float* ht_scratch = arena.Alloc<float>(static_cast<size_t>(H * V * K));
     uint16_t* o_core = arena.Alloc<uint16_t>(static_cast<size_t>(T * H * V));
     const int ts = static_cast<int>(slice);
+    // The original r4d_gdn_conv_prep (p.conv_prep 0 / 1) or r4d_gdn_conv_prep2 (2: a wide Model's default,
+    // R4DX_GDN_CONV=1 opts out): the same bytes; prep2 only spreads the work over more of the device
+    // (r4d.h).
+    const auto conv_prep = p.conv_prep == kGdnConvV2 ? &core::r4d::GdnConvPrep2 : &core::r4d::GdnConvPrep;
 
     for (int64_t r0 = 0; r0 < T; r0 += slice) {
       // rows [r0, r0 + slice) of every [T, ...] buffer; the first slice of a call reads the slot's
@@ -183,14 +195,14 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
       const uint8_t* has_init_dev = (p.has_init || r0 > 0) ? control.HasInitTrue() : nullptr;
 
       ProfiledCall(prof, s, "gdn.conv_prep", [&] {
-        core::r4d::GdnConvPrep(mixed_qkv + r0 * conv_dim, conv_dim, w_.conv1d_weight.data(),
-                                /*bias=*/nullptr, states.ConvBase(), states.ConvSeqStride(),
-                                states.ConvDimStride(), states.ConvTokStride(), cache_idx_dev,
-                                /*ci_stride=*/1, has_init_dev, a_buf + r0 * H, b_buf + r0 * H,
-                                /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
-                                w_.dt_bias.data(), q_buf + r0 * Hg * K, k_buf + r0 * Hg * K,
-                                v_buf + r0 * H * V, g_buf + r0 * H, beta_buf + r0 * H, cu_dev,
-                                /*N=*/1, ts, H, Hg, K, V, static_cast<int>(width), kSoftplusThr, s);
+        conv_prep(mixed_qkv + r0 * conv_dim, conv_dim, w_.conv1d_weight.data(),
+                  /*bias=*/nullptr, states.ConvBase(), states.ConvSeqStride(),
+                  states.ConvDimStride(), states.ConvTokStride(), cache_idx_dev,
+                  /*ci_stride=*/1, has_init_dev, a_buf + r0 * H, b_buf + r0 * H,
+                  /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
+                  w_.dt_bias.data(), q_buf + r0 * Hg * K, k_buf + r0 * Hg * K,
+                  v_buf + r0 * H * V, g_buf + r0 * H, beta_buf + r0 * H, cu_dev,
+                  /*N=*/1, ts, H, Hg, K, V, static_cast<int>(width), kSoftplusThr, s);
       });
 
       ProfiledCall(prof, s, "gdn.kkt_solve", [&] {

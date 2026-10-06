@@ -3,7 +3,7 @@
 # model's OWN bf16 reference dump, judged against the FROZEN numbers of the production container --
 # the Huihui abliterated trellis mix4.5m: mean KL 0.00788 nats, top-1 agreement 95.70%.
 #
-#   .\tools\quant2\kl_rung4.ps1 -OutDir D:\models\r4dx\huihui\kl\rt-check
+#   .\tools\quant2\kl_rung4.ps1 -OutDir <models-root>\r4dx\huihui\kl\rt-check
 #   .\tools\quant2\kl_rung4.ps1 -Device 0 -OutDir <dir>       # HIP device 0 (the desktop card; ~3 min)
 #   .\tools\quant2\kl_rung4.ps1 -Model <other.r4dx> -Layout w4a16 -RefDir <its bf16 ref> -ExpectKl 0 -NoGate ...
 #
@@ -19,15 +19,15 @@
 #      loader change that moves a single log-prob bit is caught even when the mean would not show it.
 # -NoGate only prints the numbers. One GPU process at a time: refuses while another r4dx job runs.
 param(
-  [string]$Model = 'D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx',
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
   [string]$Layout = 'trellis',
-  [string]$RefDir = 'D:\models\r4dx\huihui\kl-ref',
+  [string]$RefDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl-ref",
   [string]$Tokens = 'tools\reference\kl_corpus\tokens_canon.json',
   [Parameter(Mandatory = $true)][string]$OutDir,
   [int]$Device = 1,
   [double]$ExpectKl = 0.00788,
   [double]$ExpectTop1 = 95.70,
-  [string]$CompareDir = 'D:\models\r4dx\huihui\kl\rt-mix45m',
+  [string]$CompareDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl\rt-mix45m",
   [string]$Tool = '',
   [string]$Python = 'C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe',
   [switch]$NoGate

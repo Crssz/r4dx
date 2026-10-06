@@ -50,12 +50,12 @@
 
 .PARAMETER Model
   Path to the real 64-layer target container. Default: the production container, chosen by
-  tools\r4dx_containers.ps1: D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui
+  tools\r4dx_containers.ps1: <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx (the Huihui
   abliterated trellis mix4.5m, layout trellis).
 
 .PARAMETER Dflash
   Path to the DFlash2 draft container to test. Default: the w4a16 group-64 draft container,
-  D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx.
+  <models-root>\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx.
 
 .PARAMETER DflashAlt
   Second-tier "grouping control" draft container (review fix, 2026-09-21), mirroring
@@ -116,7 +116,7 @@
 param(
     [string]$Model = "",   # "" = the group-matched production container (see .PARAMETER Model)
     [string]$Dflash = "",  # "" = the group-matched w4a16 drafter (see .PARAMETER Dflash)
-    [string]$DflashAlt = "D:\models\r4dx\qwen38-27b-dflash2-bf16.r4dx",
+    [string]$DflashAlt = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-dflash2-bf16.r4dx",
     [string]$Layouts = "",  # "" = see .PARAMETER Layouts
     [string]$Seeds = "1,2",
     [int]$MaxTokens = 48,

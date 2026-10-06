@@ -36,7 +36,7 @@
   compared.)
 
   Rows 1-5 and 7-9 run on -Model with -Layout. The default is the production container, the Huihui
-  abliterated trellis mix4.5m (D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx, layout
+  abliterated trellis mix4.5m (<models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx, layout
   trellis), which needs a TRELLIS-CAPABLE baseline (below). Every run passes --tokenizer-dir
   explicitly (-TokenizerDir), so a baseline binary's own compiled-in default never matters.
 
@@ -79,11 +79,11 @@ param(
     [Parameter(Mandatory = $true)][string]$Baseline,
     [Parameter(Mandatory = $true)][string]$Candidate,
     [int[]]$Rows = @(1, 2, 3, 4, 5, 6, 7, 8, 9),
-    [string]$Model = "D:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
+    [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx",
     [string]$Layout = "trellis",
-    [string]$TokenizerDir = "D:\models\Huihui-Qwen3.8-27B-abliterated",
-    [string]$Dflash = "D:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx",
-    [string]$TestModel = "D:\models\r4dx\g64\qwen38-27b-l4-allmtp.r4dx",
+    [string]$TokenizerDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\Huihui-Qwen3.8-27B-abliterated",
+    [string]$Dflash = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx",
+    [string]$TestModel = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\g64\qwen38-27b-l4-allmtp.r4dx",
     [string]$Tokens = "tools\reference\kl_corpus\tokens.json",
     [string]$Image = "tools\reference\golden_out\vision_test_image.png",
     [string]$OutDir = "build\logs\tp1_identity",

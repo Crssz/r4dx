@@ -20,10 +20,10 @@
 # The KL of the assembled container is measured with the r4dx runtime on the container (the oracle manifest
 # itself has no Gemma weights-override KL driver): kl_report.py --gate gemma-fp32 --base-dir <r4dx bf16 dump>.
 param(
-  [string]$Checkpoint = 'D:\models\Huihui-gemma-4-12B-it-abliterated',
-  [string]$HessianDir = 'D:\models\r4dx\huihui-gemma\hessian-v1',
-  [string]$QDir = 'D:\models\r4dx\huihui-gemma\trellis-q',
-  [string]$RotationFile = 'D:\models\r4dx\huihui-gemma\rotation-q2ab.safetensors',
+  [string]$Checkpoint = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\Huihui-gemma-4-12B-it-abliterated",
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\hessian-v1",
+  [string]$QDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\trellis-q",
+  [string]$RotationFile = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\rotation-q2ab.safetensors",
   [string]$Rotate = 'q2ab',
   [int]$RotationSeed = 1,
   [double]$Bpw = 4.5,

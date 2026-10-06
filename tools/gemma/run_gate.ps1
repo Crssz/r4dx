@@ -3,9 +3,9 @@
 # reference dumps' --max-tokens 512) into ONE out dir, then runs kl_report.py --gate gemma-fp32.
 #
 #   # bf16 container, noise-relative rule:
-#   $env:R4DX_GEMMA_KV='bf16'; .\tools\gemma\run_gate.ps1 -Model D:\models\r4dx\huihui-gemma\<bf16>.r4dx -Layout bf16 -OutDir D:\models\r4dx\huihui-gemma\kl\r4dx-x
+#   $env:R4DX_GEMMA_KV='bf16'; .\tools\gemma\run_gate.ps1 -Model <models-root>\r4dx\huihui-gemma\<bf16>.r4dx -Layout bf16 -OutDir <models-root>\r4dx\huihui-gemma\kl\r4dx-x
 #   # quantized container, KL increment over the r4dx bf16 dump (<= 0.01):
-#   .\tools\gemma\run_gate.ps1 -Model <q>.r4dx -Layout trellis -OutDir <dir> -BaseDir D:\models\r4dx\huihui-gemma\kl\r4dx-bf16kv-f32res
+#   .\tools\gemma\run_gate.ps1 -Model <q>.r4dx -Layout trellis -OutDir <dir> -BaseDir <models-root>\r4dx\huihui-gemma\kl\r4dx-bf16kv-f32res
 #
 # KV / residual / attention settings are the engine's env vars, set by the caller (or via -Kv / -Resid /
 # -Attn, which just set R4DX_GEMMA_KV / R4DX_GEMMA_RESID / R4DX_GEMMA_ATTN for this run). The tool prints
@@ -22,8 +22,8 @@ param(
   [int]$Device = -1,
   [int]$MaxCtx = 4096,
   [int]$RawMaxTokens = 512,
-  [string]$TruthDir = 'D:\models\r4dx\huihui-gemma\kl\fp32\truth',
-  [string]$NoiseDir = 'D:\models\r4dx\huihui-gemma\kl\fp32\bf16sdpa',
+  [string]$TruthDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\kl\fp32\truth",
+  [string]$NoiseDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma\kl\fp32\bf16sdpa",
   [string]$Chat = 'tools\reference\kl_corpus\chat_gemma.json',
   [string]$Raw = 'tools\reference\kl_corpus\tokens_gemma.json',
   [string]$Tool = '',

@@ -11,16 +11,23 @@
 #
 # Same resolution rules as the C++ tests' tests/model/test_container_path.h:
 #   production pair (Get-R4dxProductionTarget / Get-R4dxProductionDrafter) and the target's body
-#   layout (Get-R4dxProductionLayout), in D:\models\r4dx:
+#   layout (Get-R4dxProductionLayout), in <models root>\r4dx (R4DX_MODELS_ROOT, default E:\models):
 #     huihui-qwen38-27b-abl-trellis-mix45m.r4dx (layout trellis: the Huihui abliterated trellis
 #     mix4.5m, docs/huihui.md) + qwen38-27b-dflash2-w4a16-g64.r4dx
 #   the tokenizer / chat-template directory (Get-R4dxTokenizerDir): the Huihui HF checkpoint dir, whose
 #   four tokenizer files are byte-identical to the base Qwen3.8-27B's (the base checkpoint was retired)
 #   fixed test containers (Get-R4dxTestContainer -Name <basename>):
-#     R4DX_TEST_CONTAINER_DIR\<basename> if that variable is set, else D:\models\r4dx\g64\<basename>
+#     R4DX_TEST_CONTAINER_DIR\<basename> if that variable is set, else <models root>\r4dx\g64\<basename>
 
-$script:R4dxModelRoot = "D:\models\r4dx"
-$script:R4dxTokenizerDir = "D:\models\Huihui-Qwen3.8-27B-abliterated"
+# The ONE models root: $env:R4DX_MODELS_ROOT, default E:\models. (Scripts' param() defaults run before
+# any dot-source, so they inline the same env-or-default expression.)
+function Get-R4dxModelsRoot {
+    if ($env:R4DX_MODELS_ROOT) { return $env:R4DX_MODELS_ROOT }
+    return "E:\models"
+}
+
+$script:R4dxModelRoot = Join-Path (Get-R4dxModelsRoot) "r4dx"
+$script:R4dxTokenizerDir = Join-Path (Get-R4dxModelsRoot) "Huihui-Qwen3.8-27B-abliterated"
 
 function Get-R4dxTokenizerDir { return $script:R4dxTokenizerDir }
 

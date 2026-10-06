@@ -28,8 +28,8 @@
 #
 # Python: the reference venv (transformers with gemma4_unified) for kvcalib / merge / hessian / gate; the oracle
 # (quantize-model) needs torch.linalg.cholesky on CUDA, which torch 2.9.1+rocmsdk (the reference venv) cannot do
-# ("requires compiling PyTorch with MAGMA", D:\models\r4dx\huihui\RECIPE.md addendum), so -OraclePython defaults to
-# D:\models\r4dx\huihui\venv-rocm10 (torch 2.13+rocm10.0.0) when it exists. The oracle imports no transformers.
+# ("requires compiling PyTorch with MAGMA", <models-root>\r4dx\huihui\RECIPE.md addendum), so -OraclePython defaults to
+# <models-root>\r4dx\huihui\venv-rocm10 (torch 2.13+rocm10.0.0) when it exists. The oracle imports no transformers.
 param(
   [Parameter(Mandatory = $true)]
   [ValidateSet('rotation', 'merge', 'kvcalib', 'hessian', 'oracle-k4', 'oracle-k5', 'mix', 'convert', 'gate', 'all')]
@@ -38,8 +38,8 @@ param(
   [switch]$Force,
   [string]$Device = '1',
   [switch]$AllowGpu0,
-  [string]$Root = 'D:\models\r4dx\huihui-gemma',
-  [string]$Model = 'D:\models\Huihui-gemma-4-12B-it-abliterated',
+  [string]$Root = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui-gemma",
+  [string]$Model = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\Huihui-gemma-4-12B-it-abliterated",
   [string]$Python = 'D:\venvs\r4dx-gemma-ref\Scripts\python.exe',
   [string]$OraclePython = '',
   [string]$Exe = '',                    # r4dx-convert; default: this checkout's build\win-hip-dry or build\win-hip
@@ -84,7 +84,7 @@ $truth    = Join-Path $kvdir 'fp32\truth'
 $noise    = Join-Path $kvdir 'fp32\bf16sdpa'
 $chatTok  = 'tools\reference\kl_corpus\chat_gemma.json'
 $rawTok   = 'tools\reference\kl_corpus\tokens_gemma.json'
-$venvRocm10 = 'D:\models\r4dx\huihui\venv-rocm10\Scripts\python.exe'
+$venvRocm10 = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\venv-rocm10\Scripts\python.exe"
 if (-not $OraclePython) { $OraclePython = if (Test-Path $venvRocm10) { $venvRocm10 } else { $Python } }
 if (-not $Exe) {
   foreach ($c in 'build\win-hip-dry\src\convert\r4dx-convert.exe', 'build\win-hip\src\convert\r4dx-convert.exe') {

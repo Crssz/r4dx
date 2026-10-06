@@ -20,10 +20,10 @@
 # -QDir -HessianDir -KlDir -RefDir -ModelDir explicitly.
 param(
   [string[]]$Points = @('K4m', 'mix4.5m', 'K3.5m', 'K4'),
-  [string]$QDir = 'D:\models\r4dx\huihui\trellis-q',
-  [string]$HessianDir = 'D:\models\r4dx\huihui\hessian-v2',
-  [string]$KlDir = 'D:\models\r4dx\huihui\kl',
-  [string]$RefDir = 'D:\models\r4dx\huihui\kl-ref',
+  [string]$QDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\trellis-q",
+  [string]$HessianDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\hessian-v2",
+  [string]$KlDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl",
+  [string]$RefDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl-ref",
   [string]$Tokens = 'tools\reference\kl_corpus\tokens_canon.json',
   # The bf16 checkpoint quantize-model reads and the golden run streams; '' = the tools' default
   # (common.DEFAULT_MODEL_DIR = the Huihui abliterated checkpoint). A fine-tune with the base's

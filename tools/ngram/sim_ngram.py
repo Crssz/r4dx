@@ -26,21 +26,24 @@ Reported (stdlib only; numpy is not needed):
   run>=10     share of those tokens inside runs of 10+ tokens.
   hybrid      per round, the n-gram proposal when its match is >= T tokens long, else a DFlash round. A
               DFlash round emits what the log's own DFlash rounds did from that position
-              (round_accepted; "positional": exact while the hybrid is aligned with the log's rounds,
-              i.e. right after another DFlash round or at the start; after an n-gram stretch the
-              position falls inside a logged round and the request's mean takes over) or always the
-              request's mean logged tok/round ("mean"), and --dflash-tpr when the log has no DFlash
-              rounds.
+              (round_accepted; "positional": the logged round that starts there, or the rest of the
+              one that covers the position after an n-gram stretch, so the hybrid keeps the log's
+              local difficulty) or always the request's mean logged tok/round ("mean": optimistic
+              when the n-gram takes the stretches where DFlash was great; the gate uses the lower of
+              the two), and --dflash-tpr when the log has no DFlash rounds.
 
 Timing (what the verdict is about). Speculation only pays if decode gets FASTER, and an n-gram round is
 cheaper than a DFlash round (no drafter forward, fewer verify rows), so rounds are priced:
   verify(rows)  = --verify-ms-base + --verify-ms-per-row * rows
   DFlash round  = verify(k+1 = 8 rows) + --drafter-ms           (39.8 ms at the defaults, TP1)
-  n-gram round  = verify(len(proposal) + 1 rows)  [+ --inject-ms-per-row per committed row, the
-                  drafter being fed the rows it did not see]  (no proposal: 1 row = plain decode)
+  n-gram round  = verify(len(proposal) + 1 rows)  [+ --inject-ms-per-round in the hybrid: the drafter
+                  must be fed the rows it did not see, one InjectFeatures call, weight-read bound so
+                  independent of the 1-8 rows]  (no proposal: 1 row = plain decode)
 The defaults are the repo's measurements (docs/dflash2.md k sweep: round 39.8 ms at k=7, 0.8 ms per
-draft row; docs/perf.md: plain decode ~27.2 ms/token, 8-row DFlash verify ~32.2 ms; InjectFeatures
-0.875 ms / 64 rows). Estimated tok/s = decode tokens (all but the first) / summed round time.
+draft row, InjectFeatures 0.875 ms wall at 64 rows; docs/perf.md top table: decode step 27.28 ms and
+8-row verify 32.19 ms on w4a16, 26.93 / 31.59 on trellis mix4.5m, plain 36.69 tok/s = 27.3 ms).
+Estimated tok/s = decode tokens (all but the first) / summed round time. A log written with
+--dflash-k below 7 prices its rounds at its own draft_k; an --mtp log has no DFlash rounds here.
 
 Gate: BUILD the n-gram path only if the best hybrid's estimated tok/s (the lower of the positional and
 mean models) beats DFlash alone as logged by >= --min-gain (default 5%) on at least --min-requests
@@ -73,7 +76,10 @@ DFLASH_TPR = 2.96  # real agent traffic, 2026-10-03
 VERIFY_MS_BASE = 26.4
 VERIFY_MS_PER_ROW = 0.8
 DRAFTER_MS = 7.0  # 39.8 - verify(8): DraftRound wall 6.2 ms + injection + glue
-INJECT_MS_PER_ROW = 0.875 / 64  # InjectFeatures(64 rows) wall, w4a16 drafter
+# InjectFeatures(64 rows) wall, w4a16 drafter. Charged per n-gram round, not per row: the call is
+# weight-read / launch bound (docs/dflash2.md: DraftRound runs at the card's bandwidth roof plus ~41 us
+# a launch), so injecting the 1-8 rows of an n-gram round costs about what 64 rows do.
+INJECT_MS_PER_ROUND = 0.875
 MIN_GAIN = 0.05
 MIN_REQUESTS = 20
 GATE_MIN_GEN = 32
@@ -245,10 +251,12 @@ def copy_runs(prompt, gen, table):
 
 
 def dflash_rounds_of(rec, n):
-    """(starts, ends) of the log's DFlash/MTP rounds in generated-token index space, or None. Round r
-    emitted round_accepted[r] + 1 tokens, the first one starting at index 1."""
+    """(starts, ends) of the log's DFlash rounds in generated-token index space, or None. Round r
+    emitted round_accepted[r] + 1 tokens, the first one starting at index 1. MTP rounds are not
+    DFlash rounds (a 4-row verify and a different drafter): the timing model cannot price them, so a
+    --mtp log is treated as having none and takes the --dflash-tpr constant."""
     acc = rec.get("round_accepted") or []
-    if not acc or rec.get("speculative") not in ("dflash", "mtp"):
+    if not acc or rec.get("speculative") != "dflash":
         return None
     starts, ends, s = [], [], 1
     for a in acc:
@@ -260,16 +268,19 @@ def dflash_rounds_of(rec, n):
 
 def sim_hybrid(prompt, gen, table, k, t_min, rounds_log, tpr):
     """n-gram when the match is >= t_min tokens long, else a DFlash round. rounds_log: dflash_rounds_of
-    (positional) or None (mean). A DFlash round emits `tpr` tokens on average (carried fractionally)
-    -- the request's mean logged tokens per round -- except in positional mode when it starts exactly
-    where a logged round started: then it emits that logged round's tokens. After an n-gram stretch
-    the position usually falls inside a logged round, whose remainder is not what a fresh round would
-    emit, so it is the mean that applies there. Returns (rounds, ngram_rounds, dflash_rounds,
-    ngram_rows, ngram_tokens): the rows the n-gram rounds verified and the tokens they committed."""
+    (positional) or None (mean). Mean mode: a DFlash round emits `tpr` tokens on average (carried
+    fractionally), the request's mean logged tokens per round. Positional mode: a DFlash round at
+    position i emits the rest of the logged round that covers i (a whole logged round when it starts
+    at i): the drafts that round got accepted are the ones a fresh round would, so the hybrid stays
+    on the log's own local difficulty. The mean is wrong exactly where the hybrid matters: the n-gram
+    takes the stretches where DFlash was also great, and charging the mean to the rest hands the
+    hybrid DFlash rounds far better than any it was logged with. The mean only covers a position
+    past the last logged round. Returns (rounds, ngram_rounds, dflash_rounds, ngram_rows): the rows
+    the n-gram rounds verified."""
     P, n = len(prompt), len(gen)
     full = prompt + gen
     i = 1
-    rounds = ng = df = ng_rows = ng_tokens = 0
+    rounds = ng = df = ng_rows = 0
     carry = 0.0
     while i < n:
         m = table[i]
@@ -278,13 +289,12 @@ def sim_hybrid(prompt, gen, table, k, t_min, rounds_log, tpr):
             emit = accepted(prop, gen, i) + 1
             ng += 1
             ng_rows += len(prop) + 1
-            ng_tokens += min(emit, n - i)
         else:
             emit = 0
             if rounds_log is not None:
                 starts, ends = rounds_log
                 r = bisect.bisect_right(starts, i) - 1
-                if r >= 0 and starts[r] == i:
+                if r >= 0 and i < ends[r]:
                     emit = ends[r] - i
             if emit == 0:
                 carry += tpr
@@ -293,15 +303,16 @@ def sim_hybrid(prompt, gen, table, k, t_min, rounds_log, tpr):
             df += 1
         i += min(emit, n - i)
         rounds += 1
-    return rounds, ng, df, ng_rows, ng_tokens
+    return rounds, ng, df, ng_rows
 
 
 def verify_ms(cfg, rows):
     return cfg["verify_base"] + cfg["verify_row"] * rows
 
 
-def dflash_round_ms(cfg):
-    return verify_ms(cfg, GATE_K + 1) + cfg["drafter_ms"]
+def dflash_round_ms(cfg, k=GATE_K):
+    """A DFlash round at draft cap k (the log's draft_k; 7 = 8 rows = the measured 39.8 ms)."""
+    return verify_ms(cfg, k + 1) + cfg["drafter_ms"]
 
 
 def analyse(rec, cfg):
@@ -320,6 +331,10 @@ def analyse(rec, cfg):
     # DFlash as logged (or the constant when the server ran without a drafter). Rounds cover the n - 1
     # tokens after the first, which the prefill emitted.
     log_rounds = dflash_rounds_of(rec, n)
+    # what a logged round cost: the server's own draft cap (7 when the log does not say)
+    kd = max(1, min(GATE_K, int(rec.get("draft_k") or GATE_K)))
+    round_ms = dflash_round_ms(cfg, kd)
+    res["dflash_k"] = kd
     if log_rounds is not None:
         res["dflash_rounds"] = len(log_rounds[0])
         res["dflash_src"] = "log"
@@ -332,7 +347,8 @@ def analyse(rec, cfg):
         res["dflash_tpr"] = cfg["dflash_tpr"]
         mean_emit = cfg["dflash_tpr"]
         eq_rounds = max(n - 1, 0) / cfg["dflash_tpr"]
-    res["dflash_ms"] = eq_rounds * dflash_round_ms(cfg)
+        round_ms = dflash_round_ms(cfg)  # a hypothetical DFlash round: the production k=7
+    res["dflash_ms"] = eq_rounds * round_ms
     res["ngram"] = {}
     for k in cfg["ks"]:
         rounds, proposed, hit, rows = sim_ngram(prompt, gen, table, k)
@@ -344,10 +360,9 @@ def analyse(rec, cfg):
     res["hybrid"] = {}
     for t in cfg["ts"]:
         for mode in ("positional", "mean"):
-            r, ng, df, ng_rows, ng_tokens = sim_hybrid(
+            r, ng, df, ng_rows = sim_hybrid(
                 prompt, gen, table, cfg["hybrid_k"], t, log_rounds if mode == "positional" else None, mean_emit)
-            ms = (df * dflash_round_ms(cfg) + ng * cfg["verify_base"] + ng_rows * cfg["verify_row"]
-                  + ng_tokens * cfg["inject_row"])
+            ms = (df * round_ms + ng * (cfg["verify_base"] + cfg["inject_round"]) + ng_rows * cfg["verify_row"])
             res["hybrid"][(t, mode)] = {"rounds": r, "ngram_rounds": ng, "dflash_rounds": df, "ms": ms}
     return res
 
@@ -468,7 +483,7 @@ def report(results, agg, cfg, rows, out=sys.stdout):
         if len(shown) < len(results):
             w("  ... %d more (--rows 0 prints all)\n" % (len(results) - len(shown)))
         if any(r["dflash_src"] != "log" for r in shown):
-            w("  * no DFlash/MTP rounds in the log for this request: the --dflash-tpr constant\n")
+            w("  * no DFlash rounds in the log for this request: the --dflash-tpr constant\n")
         w("\n")
 
     greedy = sum(1 for r in results if r["greedy"])
@@ -500,10 +515,10 @@ def report(results, agg, cfg, rows, out=sys.stdout):
 
     # ---- timing: the part the verdict rests on
     dm = dflash_round_ms(cfg)
-    w("\ntiming model (ms; --verify-ms-base/--verify-ms-per-row/--drafter-ms/--inject-ms-per-row):\n")
+    w("\ntiming model (ms; --verify-ms-base/--verify-ms-per-row/--drafter-ms/--inject-ms-per-round):\n")
     w("  verify(rows) = %.2f + %.3f * rows; plain decode (1 row) %.1f; DFlash round = verify(%d rows) + drafter %.2f = %.1f;"
-      " n-gram round = verify(proposal + 1 rows) + %.4f per committed row\n" % (
-          cfg["verify_base"], cfg["verify_row"], verify_ms(cfg, 1), GATE_K + 1, cfg["drafter_ms"], dm, cfg["inject_row"]))
+      " hybrid n-gram round = verify(proposal + 1 rows) + %.3f injection\n" % (
+          cfg["verify_base"], cfg["verify_row"], verify_ms(cfg, 1), GATE_K + 1, cfg["drafter_ms"], dm, cfg["inject_round"]))
 
     def tline(label, tm):
         if not tm["requests"]:
@@ -657,6 +672,34 @@ def _dflash_great_traffic(n_req, seed=12):
     return out
 
 
+def _steal_traffic(n_req, seed=21):
+    """The n-gram takes the 80 quoted tokens where DFlash was great (10 logged rounds of 8) and leaves the
+    80 fresh ones where it got 4 per round: the hybrid is only a little faster than DFlash alone. Charging
+    the request's mean tok/round to the DFlash rounds after the stretch (5.3 per round here, above the
+    4 the log shows there) overstates the hybrid's speed by 17%."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n_req):
+        block = _rand_tokens(rng, 80, 248320)
+        prompt = _rand_tokens(rng, 200, 248320) + block + _rand_tokens(rng, 20, 248320)
+        out.append(_traffic_rec(i, prompt, block + _rand_tokens(rng, 80, 248320), 0.0, [7] * 10 + [3] * 20))
+    return out
+
+
+def _partial_copy_traffic(n_req, period=8, seed=22):
+    """The smoke log's shape: a quoted block with every `period`-th token changed. The n-gram alone gets
+    ~2.7 tok/round (the old gate A passes) while DFlash gets 6, so any hybrid that hands rounds to the
+    n-gram is slower."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n_req):
+        block = _rand_tokens(rng, 120, 248320)
+        prompt = _rand_tokens(rng, 200, 248320) + block + _rand_tokens(rng, 20, 248320)
+        gen = [_rand_tokens(rng, 1, 248320)[0] if j % period == period - 1 else t for j, t in enumerate(block)]
+        out.append(_traffic_rec(i, prompt, gen, 0.0, [5] * 20))
+    return out
+
+
 def selftest_verdicts(check):
     """The timing-aware verdict: heavy copy traffic -> BUILD; DFlash already great -> DO NOT BUILD; too few
     requests (or too short ones) -> NOT ENOUGH DATA."""
@@ -680,6 +723,33 @@ def selftest_verdicts(check):
     best = agg["timing_gate"]["best"]
     check(label == "DO NOT BUILD" and best[1] < 0.05, "DFlash-great traffic: %s, best %r" % (label, best))
     check(any(h["tpr"] < agg["dflash_tpr"] for h in agg["hybrid"].values()), "hybrid should lose tok/round here")
+    # (b2) the regression the old gates had: the n-gram alone passes gate A (>= 2.5 tok/round at k=7) but
+    # DFlash gets 6, so the hybrid is much slower. The verdict must follow the time, not the gate.
+    results, agg, (label, _) = run(_partial_copy_traffic(24))
+    best = agg["timing_gate"]["best"]
+    check(agg["ngram"][GATE_K]["tpr"] >= GATE_TPR and label == "DO NOT BUILD" and best[1] < 0,
+          "n-gram passes gate A, hybrid slower: %s, tpr %.2f, best %r" % (label, agg["ngram"][GATE_K]["tpr"], best))
+    # (b3) the n-gram takes the stretches where DFlash was great: after one the DFlash rounds must come from
+    # the log (the rest of the covering round), not from the request's mean, which says BUILD here.
+    results, agg, (label, _) = run(_steal_traffic(24))
+    h = agg["timing_gate"]["hybrid"][3]
+    check(label == "DO NOT BUILD" and 0 <= h["gain"] < 0.05 and h["mean"] > 1.1 * h["positional"],
+          "stolen rounds: %s, positional %.1f mean %.1f tok/s, gain %.3f" % (label, h["positional"], h["mean"], h["gain"]))
+    # (b4) pricing: a --dflash-k 3 log is priced at 4 rows, an --mtp log is not a DFlash log
+    rec = _copy_traffic(1)[0]
+    rec["draft_k"] = 3
+    r = analyse(rec, cfg)
+    check(abs(r["dflash_ms"] - len(rec["round_accepted"]) * dflash_round_ms(cfg, 3)) < 1e-6
+          and dflash_round_ms(cfg, 3) < dflash_round_ms(cfg), "draft_k pricing")
+    rec = _copy_traffic(1)[0]
+    rec["speculative"] = "mtp"
+    check(analyse(rec, cfg)["dflash_src"] == "const", "an mtp log must not be priced as DFlash rounds")
+    # injection is a cost: a free injection never makes a hybrid slower, a dear one never faster
+    cheap = make_cfg(build_parser().parse_args(["--inject-ms-per-round", "0"]))
+    dear = make_cfg(build_parser().parse_args(["--inject-ms-per-round", "5"]))
+    recs = _copy_traffic(1)
+    check(analyse(recs[0], cheap)["hybrid"][(3, "positional")]["ms"] < analyse(recs[0], cfg)["hybrid"][(3, "positional")]["ms"]
+          < analyse(recs[0], dear)["hybrid"][(3, "positional")]["ms"], "injection cost must raise the hybrid time")
     # (c) too few requests, or requests too short to count: no verdict, however good the numbers look
     results, agg, (label, _) = run(_copy_traffic(5))
     check(label == "NOT ENOUGH DATA" and agg["timing_gate"]["best"][1] > 0.5, "5 copy requests: %s" % label)
@@ -802,7 +872,7 @@ def make_cfg(args):
     return {"min_n": args.min_n, "max_n": args.max_n, "ks": ks, "ts": ts, "window": args.window,
             "hybrid_k": GATE_K, "dflash_tpr": args.dflash_tpr,
             "verify_base": args.verify_ms_base, "verify_row": args.verify_ms_per_row, "drafter_ms": args.drafter_ms,
-            "inject_row": args.inject_ms_per_row, "min_gain": args.min_gain, "min_requests": args.min_requests,
+            "inject_round": args.inject_ms_per_round, "min_gain": args.min_gain, "min_requests": args.min_requests,
             "gate_min_gen": args.gate_min_gen}
 
 
@@ -828,8 +898,8 @@ def build_parser():
                    help="verify forward, ms per row in the window (default %.1f)" % VERIFY_MS_PER_ROW)
     g.add_argument("--drafter-ms", type=float, default=DRAFTER_MS,
                    help="DFlash drafter forward + glue per round, ms (default %.1f: a k=7 round is then 39.8)" % DRAFTER_MS)
-    g.add_argument("--inject-ms-per-row", type=float, default=INJECT_MS_PER_ROW,
-                   help="hybrid only: drafter feature injection per token an n-gram round committed, ms (default %.4f)" % INJECT_MS_PER_ROW)
+    g.add_argument("--inject-ms-per-round", type=float, default=INJECT_MS_PER_ROUND,
+                   help="hybrid only: drafter feature injection after each n-gram round, ms (default %.3f)" % INJECT_MS_PER_ROUND)
     g.add_argument("--min-gain", type=float, default=MIN_GAIN,
                    help="BUILD needs the best hybrid this much faster than DFlash alone, as a fraction (default %.2f)" % MIN_GAIN)
     g.add_argument("--min-requests", type=int, default=MIN_REQUESTS,

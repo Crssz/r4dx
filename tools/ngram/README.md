@@ -17,7 +17,7 @@ verdict is made in estimated tok/s, not tok/round:
 The old 2026-10-03 gates (standalone n-gram at k=7 >= 2.5 tok/round, > 50% of tokens in copy runs of
 10+) are still printed as `A` / `B`, as information only: n-gram alone can pass them on a log where DFlash
 already accepts more per round, and the hybrid is then slower than DFlash (a real 2-request smoke log:
-n-gram k=7 3.88 tok/round, DFlash 6.20, hybrid -16.7% tok/round, -5.7% in time).
+n-gram k=7 3.88 tok/round, DFlash 6.20, hybrid -16.7% tok/round, -7.1% in time).
 
 ## 1. Capture: run oh-my-pi against r4dx-server with logging on
 
@@ -57,15 +57,18 @@ Plain `python` (stdlib only; numpy is not used). Options: `--min-n/--max-n` (suf
 whose log has no DFlash rounds, default 2.96), `--window N` (only match sources within the last N
 tokens), `--min-gen` (skip tiny generations), `--greedy-only`, `--rows` (per-request rows printed:
 30 by default, 0 none, -1 all). The timing model and the gate: `--verify-ms-base 26.4`,
-`--verify-ms-per-row 0.8`, `--drafter-ms 7.0`, `--inject-ms-per-row 0.0137`, `--min-gain 0.05`,
+`--verify-ms-per-row 0.8`, `--drafter-ms 7.0`, `--inject-ms-per-round 0.875`, `--min-gain 0.05`,
 `--min-requests 20`, `--gate-min-gen 32`.
 
 Timing model (TP1, Huihui 27B trellis + w4a16 DFlash2 drafter; the report prints the values it used).
-`verify(rows) = base + per_row * rows`; plain decode is 1 row = 27.2 ms (docs/perf.md: ~27.2 ms/token),
-a k=7 DFlash round is `verify(8 rows) + drafter` = 26.4 + 6.4 + 7.0 = **39.8 ms** (docs/dflash2.md k
-sweep: 39.8 ms/round at k=7, 0.8 ms per extra draft row), an n-gram round is `verify(proposal + 1 rows)`
-plus the drafter-injection cost per committed token (InjectFeatures: 0.875 ms per 64 rows). DFlash
-alone is priced at its logged round count; requests without logged DFlash rounds use `--dflash-tpr`.
+`verify(rows) = base + per_row * rows`; plain decode is 1 row = 27.2 ms (docs/perf.md top table: decode
+step 27.28 ms on w4a16, 26.93 on trellis mix4.5m; plain 36.69 tok/s = 27.3 ms), a k=7 DFlash round is
+`verify(8 rows) + drafter` = 26.4 + 6.4 + 7.0 = **39.8 ms** (docs/dflash2.md k sweep: 39.8 ms/round at
+k=7, 0.8 ms per extra draft row; docs/perf.md 8-row verify 32.19 / 31.59 ms), an n-gram round is
+`verify(proposal + 1 rows)` plus, in the hybrid, one drafter injection (InjectFeatures, 0.875 ms wall at
+64 rows; it is weight-read bound, so 1-8 rows cost about the same, hence per round and not per row).
+DFlash alone is priced at its logged round count and the log's own `draft_k` (an `--mtp` log has no
+DFlash rounds); requests without logged DFlash rounds use `--dflash-tpr` at the k=7 round cost.
 Measure your own setup (TP2, a different drafter, long contexts all move these) and pass the numbers:
 the verdict depends on the ratio of n-gram round cost to DFlash round cost.
 
@@ -82,7 +85,7 @@ Reported:
 | tok/round | generated tokens / rounds (the engine's own `tok/round` convention) for the log's DFlash, for n-gram alone at each k, and for the hybrid |
 | round hit | rounds whose proposal had at least one accepted token |
 | token hit, run >= 10 | share of tokens after the first inside a copy run (the match's continuation keeps equalling the output), and inside runs of 10+ tokens; plus the run-length histogram |
-| hybrid | per round: n-gram if its match is >= T tokens, else a DFlash round. A DFlash round emits the logged round that starts at this position (`positional`, exact while the hybrid is lined up with the log) or the request's mean logged tok/round (`mean`; also what `positional` falls back to after an n-gram stretch, when the position is inside a logged round) |
+| hybrid | per round: n-gram if its match is >= T tokens, else a DFlash round. A DFlash round emits the logged round that starts at this position (`positional`, exact while the hybrid is lined up with the log; after an n-gram stretch it emits the rest of the logged round that covers the position, so the hybrid keeps the log's local difficulty) or the request's mean logged tok/round (`mean`: optimistic when the n-gram takes the stretches where DFlash was great, and charges DFlash rounds better than any it was logged with there; the gate uses the lower of the two) |
 | estimated tok/s | decode tokens / summed round time under the timing model, for DFlash alone, n-gram alone (info) and each hybrid T (positional, mean, and the lower of the two = the conservative gain the gate uses); for the gate set, and split greedy (exact) / sampled (estimate) |
 | gate | requests counted, best hybrid gain vs `--min-gain`, the old gates A/B as info, and the verdict line |
 
@@ -94,7 +97,7 @@ uses. Requests that failed (non-200) are
 skipped.
 
 The hybrid still ignores that a hybrid has to keep the drafter's feature ring fed (modelled by the
-per-token injection cost only), that an n-gram verify of fewer rows has a different kernel mix than the
+per-round injection cost only; consecutive n-gram rounds could share one injection, which would make the hybrid a little faster than modelled), that an n-gram verify of fewer rows has a different kernel mix than the
 8-row one, and sampled-request acceptance (see above). The 5% margin is there to cover that.
 
 ## 3. Without real data

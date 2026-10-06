@@ -4,7 +4,7 @@ Everything under tools/reference/** is read-only against:
   - the reference Python (torch + transformers + numpy): $env:R4DX_REFERENCE_VENV's
     Scripts\\python.exe when that is set, else python on PATH -- never pip/uv install into it, we
     only import from it
-  - D:\\models\\Huihui-Qwen3.8-27B-abliterated           (the checkpoint: DEFAULT_MODEL_DIR; shards may
+  - <models root>\\Huihui-Qwen3.8-27B-abliterated        (the checkpoint: DEFAULT_MODEL_DIR; shards may
     still be downloading, so every tensor read here is allowed to fail and fall back to random init).
     The base Qwen3.8-27B checkpoint (C:\\AI\\models\\Qwen3.8-27B) was retired on 2026-09-29; the Huihui
     fine-tune's tokenizer / config files are byte-identical to it (docs/huihui.md), only layers 17..51's
@@ -28,7 +28,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MODEL_DIR = Path(r"D:\models\Huihui-Qwen3.8-27B-abliterated")
+#: Root of every model / checkpoint / derived artifact: $env:R4DX_MODELS_ROOT, default E:\models.
+#: Every default path in tools/ and tests/reference/ is built from it (never a literal drive path).
+MODELS_ROOT = Path(os.environ.get("R4DX_MODELS_ROOT", r"E:\models"))
+DEFAULT_MODEL_DIR = MODELS_ROOT / "Huihui-Qwen3.8-27B-abliterated"
+
+
+def same_path(a: Any, b: Any) -> bool:
+    """True when `a` and `b` name the same location, junction/symlink- and case-aware (so a path
+    recorded through a junction alias of the models root still matches the real location). Falls back to a
+    normalized string comparison when a path cannot be resolved. None only equals None."""
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
 #: The reference venv when $env:R4DX_REFERENCE_VENV names one, else None (python on PATH).
 DEFAULT_REFERENCE_VENV = (Path(os.environ["R4DX_REFERENCE_VENV"])
                           if os.environ.get("R4DX_REFERENCE_VENV") else None)

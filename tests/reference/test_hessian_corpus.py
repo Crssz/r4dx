@@ -936,7 +936,7 @@ def test_provenance(canon, hf, model_dir: Path, tmp: Path) -> None:
     check(tm(cli) == "canonical" and tm(dict(cli, segments=[{"name": "x", "token_ids": [1, 2]}])) == "unknown" and
           tm(dict(cli, max_tokens=0)) == "unknown",
           "(h) the r4dx-cli dump shape (tokenizer + one 'cli' segment, nothing else) is canonical")
-    old_shape = {"tokenizer": r"D:\models\canonical-qwen", "add_special_tokens": False, "chat_template": False,
+    old_shape = {"tokenizer": r"X:\no-such-root\canonical-qwen", "add_special_tokens": False, "chat_template": False,
                  "max_tokens": 2, "segments": [{"name": "a", "token_ids": [1, 2]}]}
     check(tm(old_shape) == "unknown" and tm(dict(old_shape, tokenizer=canon.describe())) == "canonical" and
           tm(dict(tokens_json, tokenizer="elsewhere")) == "hf-auto" and

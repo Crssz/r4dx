@@ -7,7 +7,7 @@ bf16-sdpa), each layer streamed once from safetensors (so RAM stays ~ a few GB +
 Reports per-layer relative error / max-abs / max|h|, final-logit KL + top-1, and per-position breakdowns.
 
     D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe tools\\reference\\gemma\\investigate\\cpu_bisect.py \
-        --segment english_prose --tokens 256 --layers 48 --out D:\\models\\r4dx\\huihui-gemma\\kl\\bisect_256.json
+        --segment english_prose --tokens 256 --layers 48 --out <models root>\\r4dx\\huihui-gemma\\kl\\bisect_256.json
 """
 from __future__ import annotations
 

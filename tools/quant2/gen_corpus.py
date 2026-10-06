@@ -122,7 +122,7 @@ Usage (stdlib only; any python >= 3.9; tools/quant2/gen_corpus.ps1 starts the se
 
     python tools\\quant2\\gen_corpus.py --dry-run
     python tools\\quant2\\gen_corpus.py --server http://127.0.0.1:18080 `
-        --out D:\\models\\r4dx\\corpus-v2\\samples.jsonl --limit 5
+        --out <models root>\\r4dx\\corpus-v2\\samples.jsonl --limit 5
 """
 
 from __future__ import annotations
@@ -144,7 +144,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROMPTS = Path(__file__).resolve().parent / "corpus_v2_prompts.json"
-DEFAULT_OUT = Path(r"D:\models\r4dx\corpus-v2\samples.jsonl")
+MODELS_ROOT = Path(os.environ.get("R4DX_MODELS_ROOT", r"E:\models"))
+DEFAULT_OUT = MODELS_ROOT / "r4dx" / "corpus-v2" / "samples.jsonl"
 DEFAULT_SERVER = "http://127.0.0.1:18080"
 MANIFEST_NAME = "gen_manifest.json"
 

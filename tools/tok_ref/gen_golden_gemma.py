@@ -8,7 +8,7 @@ CPU only, no GPU touched:
 
     python tools\\tok_ref\\gen_golden_gemma.py [--model-dir DIR] [--out PATH]
 
-The tokenizer dir (default D:\\models\\Huihui-gemma-4-12B-it-abliterated-tok, or the
+The tokenizer dir (default <models root>\\Huihui-gemma-4-12B-it-abliterated-tok, or the
 R4DX_GEMMA_TOKENIZER_DIR environment variable) holds google/gemma-4-12B-it's tokenizer.json,
 tokenizer_config.json, chat_template.jinja and generation_config.json (the Huihui repo's
 tokenizer.json is byte-identical; its chat_template.jinja is older, see the plan).
@@ -40,7 +40,9 @@ import os
 import random
 import sys
 
-DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok")
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
+DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR",
+                             os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated-tok"))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_OUT = os.path.join(REPO, "tests", "tokenizer", "golden_gemma.json")
 

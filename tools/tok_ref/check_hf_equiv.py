@@ -25,9 +25,11 @@ import os
 import random
 import sys
 
-DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok")
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
+DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR",
+                             os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated-tok"))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WIKITEXT = r"D:\models\wikitext-2-raw\wiki.test.raw"
+WIKITEXT = os.path.join(MODELS_ROOT, "wikitext-2-raw", "wiki.test.raw")
 
 
 def corpus_texts(max_wiki_bytes):

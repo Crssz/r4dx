@@ -23,7 +23,7 @@ templated prompt) is fitted to at most the length tag's token target by binary s
 haystack size. Every item starts with a unique "[item <id>]" line so a server's prefix cache can
 never reuse one item's prefill for the next (each request is a cold prefill of ~all its tokens).
 
-Output (under --out, default D:\\models\\r4dx\\prefill-m0\\tasks):
+Output (under --out, default <models root>\\r4dx\\prefill-m0\\tasks):
   tasks_<len>.jsonl     one item per line: id, task, subtype, length, target_tokens, prompt_tokens,
                         content (the user message), answers, match, max_tokens, meta
   prompts\\ttft_<len>.txt the first niah_single item's user message (for r4dx-cli --prompt-file)

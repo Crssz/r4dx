@@ -149,12 +149,12 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
 
     $env:HIP_VISIBLE_DEVICES = '1'
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --dry-run
-    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir D:\\models\\r4dx\\hessian-v1
+    <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --out-dir <models root>\\r4dx\\hessian-v1
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py --rms-only --code-rev <commit> `
-        --out-dir D:\\models\\r4dx\\hessian-v1
+        --out-dir <models root>\\r4dx\\hessian-v1
     <venv>\\Scripts\\python.exe tools\\reference\\hessian_capture.py `
-        --out-dir D:\\models\\r4dx\\huihui\\hessian-v2 --rms-taps --wikitext-seqs 128 --code-seqs 48 `
-        --code-rev 714955f --gen-file D:\\models\\r4dx\\corpus-v2\\samples.jsonl
+        --out-dir <models root>\\r4dx\\huihui\\hessian-v2 --rms-taps --wikitext-seqs 128 --code-seqs 48 `
+        --code-rev 714955f --gen-file <models root>\\r4dx\\corpus-v2\\samples.jsonl
     (--model-dir defaults to the Huihui checkpoint, common.DEFAULT_MODEL_DIR; the base hessian-v2 and the
     base checkpoint were retired on 2026-09-29, docs/huihui.md. The example paths of the older hessian-v1
     lines above are historical.)
@@ -197,8 +197,9 @@ if str(TOOLS_REF) not in sys.path:
 from arch_table import GEMMA, QWEN, ArchSpec  # noqa: E402
 DEFAULT_CORPUS_DIR = TOOLS_REF / "kv_calib_corpus"
 DEFAULT_CALIB_TXT = TOOLS_REF / "calib.txt"
-DEFAULT_WIKITEXT = Path("D:/models/wikitext-2-raw/wiki.train.raw")
-DEFAULT_OUT_DIR = Path(r"D:\models\r4dx\hessian-v1")
+from common import MODELS_ROOT  # noqa: E402  (stdlib-only module; no torch)
+DEFAULT_WIKITEXT = MODELS_ROOT / "wikitext-2-raw" / "wiki.train.raw"
+DEFAULT_OUT_DIR = MODELS_ROOT / "r4dx" / "hessian-v1"
 
 #: The held-out KL corpus (tools/reference/kl_corpus/) is made of excerpts of these two files; the
 #: Hessian corpus must stay disjoint from the text the drift is measured on (same reasoning as the

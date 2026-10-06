@@ -31,7 +31,7 @@ Usage (reference venv only; read-only against the venv and the checkpoint):
 
     $env:HIP_VISIBLE_DEVICES = '1'
     <venv>\\Scripts\\python.exe tools\\reference\\kv_calibrate_full.py `
-        --out D:\\models\\r4dx\\qwen38-27b.kvcalib-full.json
+        --out <models root>\\r4dx\\qwen38-27b.kvcalib-full.json
 
 See tools/reference/README.md ("kv_calibrate_full.py") for the option list, the corpus, the gate
 runs and the expected runtime.
@@ -53,6 +53,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    MODELS_ROOT,
     DEFAULT_TOKENIZER_MODE,
     TOKENIZER_HELP,
     TOKENIZER_MODES,
@@ -82,7 +83,7 @@ TOP_BUFFER = 8192
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS_DIR = Path(__file__).parent / "kv_calib_corpus"
 DEFAULT_CALIB_TXT = Path(__file__).parent / "calib.txt"
-DEFAULT_OUT = Path(r"D:\models\r4dx\qwen38-27b.kvcalib-full.json")
+DEFAULT_OUT = MODELS_ROOT / "r4dx" / "qwen38-27b.kvcalib-full.json"
 
 
 def repo_relative(path: Path) -> str:

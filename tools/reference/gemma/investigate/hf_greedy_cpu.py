@@ -15,9 +15,10 @@ from transformers import AutoModelForImageTextToText, AutoTokenizer  # noqa: E40
 
 assert not torch.cuda.is_available(), "this script must not see a GPU"
 
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default=r"D:\models\Huihui-gemma-4-12B-it-abliterated")
-ap.add_argument("--tok", default=r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok")
+ap.add_argument("--model", default=os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated"))
+ap.add_argument("--tok", default=os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated-tok"))
 ap.add_argument("--prompt", required=True)
 ap.add_argument("--think", action="store_true")
 ap.add_argument("--max-new", type=int, default=400)

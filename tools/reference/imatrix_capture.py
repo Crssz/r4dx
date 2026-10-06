@@ -45,7 +45,7 @@ Usage (reference venv only -- read-only against the venv and the checkpoint):
 
     $env:HIP_VISIBLE_DEVICES = '1'
     <venv>\\Scripts\\python.exe tools\\reference\\imatrix_capture.py `
-        --out D:\\models\\r4dx\\qwen38-27b.imatrix.npz
+        --out <models root>\\r4dx\\qwen38-27b.imatrix.npz
 
 See tools/reference/README.md ("imatrix_capture.py") for the option list, the corpus, the gate runs
 and the expected runtime.
@@ -69,6 +69,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (  # noqa: E402
     DEFAULT_MODEL_DIR,
+    MODELS_ROOT,
     DEFAULT_TOKENIZER_MODE,
     TOKENIZER_HELP,
     TOKENIZER_MODES,
@@ -93,7 +94,7 @@ from kv_calibrate_full import collect_corpus, repo_relative  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CORPUS_DIR = Path(__file__).parent / "kv_calib_corpus"
 DEFAULT_CALIB_TXT = Path(__file__).parent / "calib.txt"
-DEFAULT_OUT = Path(r"D:\models\r4dx\qwen38-27b.imatrix.npz")
+DEFAULT_OUT = MODELS_ROOT / "r4dx" / "qwen38-27b.imatrix.npz"
 CONVERTER_MAIN = REPO_ROOT / "src" / "convert" / "main.cpp"
 
 #: HF weight-name prefixes (same checkpoint layout `full_logits_golden.py` documents).

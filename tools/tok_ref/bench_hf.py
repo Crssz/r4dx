@@ -23,9 +23,11 @@ import os
 import sys
 import time
 
-DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR", r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok")
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
+DEFAULT_DIR = os.environ.get("R4DX_GEMMA_TOKENIZER_DIR",
+                             os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated-tok"))
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WIKITEXT = r"D:\models\wikitext-2-raw\wiki.test.raw"
+WIKITEXT = os.path.join(MODELS_ROOT, "wikitext-2-raw", "wiki.test.raw")
 
 
 def build_corpus(wiki_bytes):
@@ -60,7 +62,7 @@ def best_of(fn, repeats):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default=DEFAULT_DIR)
-    ap.add_argument("--corpus-out", default=r"D:\models\r4dx\tok_bench\corpus_gemma.jsonl")
+    ap.add_argument("--corpus-out", default=os.path.join(MODELS_ROOT, "r4dx", "tok_bench", "corpus_gemma.jsonl"))
     ap.add_argument("--wiki-bytes", type=int, default=1500000)
     ap.add_argument("--repeats", type=int, default=5)
     args = ap.parse_args()

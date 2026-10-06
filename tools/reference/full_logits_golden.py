@@ -72,6 +72,7 @@ from common import (  # noqa: E402
     load_ref_tokenizer,
     load_text_config,
     resolve_device,
+    same_path,
     sha256_file,
     tokens_file_tokenizer_mode,
 )
@@ -869,8 +870,8 @@ class OverrideWeightsReference(StreamingReference):
         # A fine-tune (e.g. an abliterated model) shares the base's config.json byte for byte, so
         # the sha above cannot tell them apart: the manifest's own checkpoint path must match too.
         made_from = self.manifest.get("model_dir")
-        if made_from is not None and (os.path.normcase(os.path.abspath(made_from))
-                                      != os.path.normcase(os.path.abspath(str(model_dir)))):
+        # same_path resolves junctions, so a manifest recorded via a junction alias still matches
+        if made_from is not None and not same_path(made_from, model_dir):
             raise SystemExit(f"[full_logits] {self.manifest_path} was quantized from {made_from}, "
                              f"not --model-dir {model_dir}; pass the same --model-dir")
         names = list(self.manifest["tensors"])

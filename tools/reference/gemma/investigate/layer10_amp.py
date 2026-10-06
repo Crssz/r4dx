@@ -19,7 +19,7 @@ import torch  # noqa: E402
 
 if torch.cuda.is_available():
     raise SystemExit("ABORT: cuda visible")
-from gemma.common_gemma import DEFAULT_MODEL_DIR, KL_CORPUS_DIR  # noqa: E402
+from gemma.common_gemma import DEFAULT_MODEL_DIR, GEMMA_OUT_DIR, KL_CORPUS_DIR  # noqa: E402
 from gemma.ref import EMBED_NAME, FULL, SLIDING, GemmaReference, additive_mask  # noqa: E402
 
 torch.set_num_threads(16)
@@ -79,4 +79,4 @@ for inp in ("fp32", "b16e", "b16s"):
         res[f"in={inp} bf16layer {impl}"] = err(run(l10_16, h[inp], L, torch.bfloat16, impl))
     res[f"in={inp} fp32layer eager"] = err(run(l10, h[inp], L, torch.float32, "eager"))
 print(json.dumps(res, indent=1))
-json.dump(res, open(r"D:\models\r4dx\huihui-gemma\kl\layer10_amp.json", "w"), indent=1)
+json.dump(res, open(GEMMA_OUT_DIR / "kl" / "layer10_amp.json", "w"), indent=1)

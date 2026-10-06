@@ -1,7 +1,7 @@
 """CPU-only HF greedy answer to one audio + text prompt, to compare against r4dx-server's audio path.
 
   D:\\venvs\\r4dx-gemma-ref\\Scripts\\python.exe tools\\reference\\gemma\\investigate\\hf_audio_cpu.py \\
-      --wav D:\\models\\r4dx\\huihui-gemma\\dry\\smoke\\tone.wav --text "Describe what you hear in this audio clip in one sentence."
+      --wav <models root>\\r4dx\\huihui-gemma\\dry\\smoke\\tone.wav --text "Describe what you hear in this audio clip in one sentence."
 """
 import os
 
@@ -17,9 +17,10 @@ from transformers import AutoModelForImageTextToText, AutoProcessor  # noqa: E40
 
 assert not torch.cuda.is_available(), "this script must not see a GPU"
 
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default=r"D:\models\Huihui-gemma-4-12B-it-abliterated")
-ap.add_argument("--proc", default=r"D:\models\Huihui-gemma-4-12B-it-abliterated-tok")
+ap.add_argument("--model", default=os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated"))
+ap.add_argument("--proc", default=os.path.join(MODELS_ROOT, "Huihui-gemma-4-12B-it-abliterated-tok"))
 ap.add_argument("--wav", required=True)
 ap.add_argument("--text", required=True)
 ap.add_argument("--max-new", type=int, default=60)

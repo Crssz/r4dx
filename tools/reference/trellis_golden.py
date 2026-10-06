@@ -69,7 +69,9 @@ import torch  # noqa: E402
 
 HAD = 128
 DEFAULT_OUT = REPO / "tests" / "kernels" / "golden" / "trellis"
-DEFAULT_ORACLE = Path(r"D:\models\r4dx\huihui\trellis-q\K4m")
+from common import MODELS_ROOT  # noqa: E402
+
+DEFAULT_ORACLE = MODELS_ROOT / "r4dx" / "huihui" / "trellis-q" / "K4m"
 FORMAT = "r4dx-trellis-golden"
 VERSION = 1
 SEED = 0x7E11  # every stream is default_rng([SEED, tag]) so adding a stream moves no other

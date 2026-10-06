@@ -7,7 +7,7 @@ Run with the read-only reference venv (CPU only, no GPU touched):
     python tools\\tok_ref\\gen_golden.py
 
 Loads the real tokenizer.json / tokenizer_config.json / chat_template.jinja /
-generation_config.json from D:\\models\\Huihui-Qwen3.8-27B-abliterated (read-only; its tokenizer files are byte-identical to the base Qwen3.8-27B checkpoint golden.json was first cut from).
+generation_config.json from <models root>\\Huihui-Qwen3.8-27B-abliterated (read-only; its tokenizer files are byte-identical to the base Qwen3.8-27B checkpoint golden.json was first cut from).
 
 IMPORTANT (see the block comment above kQwen2SplitTrigger in src/tokenizer/bpe_tokenizer.cpp for
 the full story): `transformers.AutoTokenizer` for this checkpoint loads a `Qwen2Tokenizer`, whose
@@ -60,7 +60,8 @@ import json
 import os
 import sys
 
-MODEL_DIR = r"D:\models\Huihui-Qwen3.8-27B-abliterated"
+MODELS_ROOT = os.environ.get("R4DX_MODELS_ROOT", r"E:\models")
+MODEL_DIR = os.path.join(MODELS_ROOT, "Huihui-Qwen3.8-27B-abliterated")
 OUT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                          "tests", "tokenizer", "golden.json")
 

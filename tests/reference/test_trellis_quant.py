@@ -654,7 +654,8 @@ def test_mix_real_model():
     (reads only the checkpoint's config and safetensors headers). SKIPped without the checkpoint."""
     import argparse
 
-    model_dir = Path(os.environ.get("R4DX_MODEL_DIR", r"D:\models\Huihui-Qwen3.8-27B-abliterated"))
+    from common import DEFAULT_MODEL_DIR
+    model_dir = Path(os.environ.get("R4DX_MODEL_DIR", str(DEFAULT_MODEL_DIR)))
     if not (model_dir / "model.safetensors.index.json").exists():
         print(f"  SKIP mix on the real model: no checkpoint at {model_dir}")
         return

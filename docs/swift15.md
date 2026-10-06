@@ -14,8 +14,9 @@ tensor names, `config.json` (minus `quantization_config`), tokenizer and chat te
 2. `E:\models\r4dx\swift15\run_chain.ps1`: bf16 KL ref, imatrix + kvcalib (canonical tokenizer), Hessians
    (hessian-v2 settings, 191 min, 389 files, gates pass), K4m (73 min) and K5m on `huihui\venv-rocm10`, mix 4.5
    (4.5045 bpw), oracle KL. The Huihui RECIPE.md steps 1-5 with Swift's paths.
-3. `tools\quant2\trellis_convert.ps1` with Swift's paths, **all on E:** (`D:\models` is a junction to `E:\models`;
-   the manifest pin compares resolved paths and refuses the D: spelling). Verify 400/400.
+3. `tools\quant2\trellis_convert.ps1` with Swift's paths. Verify 400/400. (This run used E: paths
+   throughout: before the models-root merge the manifest pin compared unresolved paths and refused the old D:\models
+   junction spelling; it is junction-aware now.)
 
 Container: `E:\models\r4dx\swift15-qwen38-27b-trellis-mix45m.r4dx`, 18,338,486,745 B, 16.27 GiB weights in VRAM.
 Calibration: `E:\models\r4dx\swift15\{hessian-v2,trellis-q,kl-ref,kl}`, `swift15-qwen38-27b.{imatrix.npz,kvcalib-full.json}`.

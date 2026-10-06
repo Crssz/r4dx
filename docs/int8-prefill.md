@@ -337,6 +337,8 @@ few flips the difference is noise, so finer groups buy nothing measurable. Chunk
 Verdict: full int8 x int8 numerics with per-128 scales cost about +0.0006 mean KL against the reference on
 the prefill path (0.00751 -> 0.00807), under the paper estimate, and leave the production container well
 inside the 0.01 budget. Accuracy is not the obstacle to an int8 prefill GEMM; its speed is the open question.
+That question has its own bench-only prototype now, with a go / no-go rule fixed in advance: docs/int8-gemm-proto.md
+(branch `int8gemm`; the GPU runs are pending).
 
 Reading it: weights and activations roughly add if their errors are independent; a w8a8 total under the
 activation-only +0.0004 plus a similar weight term keeps `col128 + blk128` well inside the production budget

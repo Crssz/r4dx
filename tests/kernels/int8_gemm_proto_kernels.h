@@ -22,11 +22,11 @@
 //     reduce-and-convert when FWHT = false (the dense ceiling without the trellis rotation);
 //   * RESC = 1, 2, 3 are speed BOUNDS for coarser scales, NOT the per-128 math (each is verified against its own
 //     reference, i8g_ref_cols with a scale mask, and only ever reported as a bound):
-//       1  both scales of the slice's first block stand for the whole slice: the int32 accumulators run over the
-//          whole K slice, one rescale at the end (no per-128 VALU at all);
-//       2  the activation scale is per row only (kb 0's): per 128 K one cvt + one fma per element (sw), the
+//       1  both scales are per row / per column only (block 0's stand for the whole K): the int32 accumulators run
+//          over the whole K slice, one rescale at the end (no per-128 VALU at all);
+//       2  the activation scale is per row only (block 0's): per 128 K one cvt + one fma per element (sw), the
 //          row scale multiplied once at the end;
-//       3  the weight scale is per column only (kb 0's): per 128 K one cvt + one fma (sa), the column scale at the end.
+//       3  the weight scale is per column only (block 0's): per 128 K one cvt + one fma (sa), the column scale at the end.
 //     RESC 2 and 3 exist for the trellis kernel only; RESC 1 for both.
 // There is no bit-identity with the shipped kernel's summation order to keep, so SK = SKW (the slices of a
 // workgroup are all the slices there are) and SKG is free; the slices are whole 128-K blocks.
@@ -446,10 +446,11 @@ __global__ __launch_bounds__(128 * SKW) __attribute__((amdgpu_waves_per_eu(I8G_M
   }
 
   if constexpr (RESC != 0) {
-    // the coarse variants' one multiply with the slice's FIRST block's scale(s) (speed bounds, not the per-128 math):
-    // RESC 1 both scales (the int32 accumulators ran over the whole slice), RESC 2 the activation scale, RESC 3 the
-    // weight scale (the fp32 accumulators already hold the other, per-block, one)
-    const float* swp = SW + (size_t)kbg0 * N + ncol0;
+    // the coarse variants' one multiply with the scale(s) of block 0 of the whole K (a per-row / per-column scale;
+    // speed bounds, not the per-128 math): RESC 1 both scales (the int32 accumulators ran over the whole slice),
+    // RESC 2 the activation scale, RESC 3 the weight scale (the fp32 accumulators already hold the other, per-block,
+    // one). Every slice multiplies its own partial sum by the same factors, so the slices still add up.
+    const float* swp = SW + ncol0;
     const float s0 = swp[0], s1 = swp[8];
 #pragma unroll
     for (int i = 0; i < MT; ++i) {
@@ -457,7 +458,7 @@ __global__ __launch_bounds__(128 * SKW) __attribute__((amdgpu_waves_per_eu(I8G_M
         accf[0][i] = accf[0][i] * s0;
         accf[1][i] = accf[1][i] * s1;
       } else {
-        const i8g_v4f* sap = (const i8g_v4f*)(SA + (size_t)kbg0 * 256 + rg * 64 + 16 * i + 8 * hh);
+        const i8g_v4f* sap = (const i8g_v4f*)(SA + (size_t)rg * 64 + 16 * i + 8 * hh);
         const v8f sa8 = __builtin_shufflevector(sap[0], sap[1], 0, 1, 2, 3, 4, 5, 6, 7);
         if constexpr (RESC == 1) {
           const v8f t0 = __builtin_convertvector(acci[0][i], v8f), t1 = __builtin_convertvector(acci[1][i], v8f);

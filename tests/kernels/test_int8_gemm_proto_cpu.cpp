@@ -200,56 +200,63 @@ done:
   Check(128LL * 127 * 127 < (1LL << 24), "a 128-K int8 dot (<= 2,064,512) converts to fp32 exactly");
 }
 
-// the kernel's fragment-level chain on a CPU, in the arithmetic order of i8g_kernel for each RESC mode:
+// the kernel's fragment-level chain on a CPU, in the arithmetic order of i8g_kernel for each RESC mode, with its
+// K slicing: SKW x SKG slices of ktw = KT / (SKW SKG) k-tiles, slice (y, ks) at kt0 = (y SKW + ks) ktw, each slice
+// run as one wave does (nkb = ktw / 8 blocks of 8 k-tiles, kb = kt0 / 8 + kbi), the slices' partial tiles added in
+// slice order (the kernel's LDS reduction and ws y-sum):
 //   0  per 128 K: acc += float(int32) * (sa[kb][row] * sw[kb][col])
 //   1  one int32 accumulator over the whole slice, then float(int32) * (sa[0][row] * sw[0][col])
 //   2  per 128 K: acc += float(int32) * sw[kb][col]; at the end acc * sa[0][row]
 //   3  per 128 K: acc += float(int32) * sa[kb][row]; at the end acc * sw[0][col]
 void EmuKernel(const std::vector<int8_t>& a8, const std::vector<float>& sa, const std::vector<int8_t>& w8,
-               const std::vector<float>& sw, int N, int K, int resc, std::vector<double>& C) {
-  const int KT = K / 16, NKB = K / 128;
+               const std::vector<float>& sw, int N, int K, int resc, int skw, int skg, std::vector<double>& C) {
+  const int KT = K / 16;
+  const int ktw = KT / (skw * skg), nkb = ktw / 8;
   C.assign((size_t)i8p::kM * N, 0.0);
   for (int pair = 0; pair < N / 32; ++pair)
     for (int rg = 0; rg < 4; ++rg)
       for (int i = 0; i < 4; ++i)
-        for (int f = 0; f < 2; ++f) {
-          float accf[32][8] = {};
-          int32_t acci_all[32][8] = {};
-          for (int kb = 0; kb < NKB; ++kb) {
-            int32_t acci[32][8] = {};
-            for (int u = 0; u < 8; ++u) {
-              const int kt = kb * 8 + u;
-              int8_t af[32][8], bf[32][8];
-              for (int L = 0; L < 32; ++L)
-                for (int e = 0; e < 8; ++e) {
-                  af[L][e] = a8[i8p::A8FragOffset(rg, kt, i, L, KT) + e];
-                  bf[L][e] = w8[i8p::W8BlockOffset(pair, kt, KT) + (size_t)L * 16 + f * 8 + e];
-                }
-              i8p::EmuWmmaI8(af, bf, resc == 1 ? acci_all : acci);
+        for (int f = 0; f < 2; ++f)
+          for (int slice = 0; slice < skw * skg; ++slice) {
+            const int kt0 = slice * ktw, kbg0 = kt0 / 8;
+            float accf[32][8] = {};
+            int32_t acci_all[32][8] = {};
+            for (int kbi = 0; kbi < nkb; ++kbi) {
+              const int kb = kbg0 + kbi;
+              int32_t acci[32][8] = {};
+              for (int u = 0; u < 8; ++u) {
+                const int kt = kt0 + kbi * 8 + u;
+                int8_t af[32][8], bf[32][8];
+                for (int L = 0; L < 32; ++L)
+                  for (int e = 0; e < 8; ++e) {
+                    af[L][e] = a8[i8p::A8FragOffset(rg, kt, i, L, KT) + e];
+                    bf[L][e] = w8[i8p::W8BlockOffset(pair, kt, KT) + (size_t)L * 16 + f * 8 + e];
+                  }
+                i8p::EmuWmmaI8(af, bf, resc == 1 ? acci_all : acci);
+              }
+              if (resc != 1)
+                for (int L = 0; L < 32; ++L)
+                  for (int e = 0; e < 8; ++e) {
+                    const int row = i8p::AccRow(rg, i, L, e), col = i8p::FragCol(pair, L, f);
+                    const float sav = sa[(size_t)kb * i8p::kM + row], swv = sw[(size_t)kb * N + col];
+                    const float t = (float)acci[L][e];
+                    accf[L][e] = resc == 0 ? std::fmaf(t, sav * swv, accf[L][e]) : resc == 2 ? std::fmaf(t, swv, accf[L][e]) : std::fmaf(t, sav, accf[L][e]);
+                  }
             }
-            if (resc != 1)
-              for (int L = 0; L < 32; ++L)
-                for (int e = 0; e < 8; ++e) {
-                  const int row = i8p::AccRow(rg, i, L, e), col = i8p::FragCol(pair, L, f);
-                  const float sav = sa[(size_t)kb * i8p::kM + row], swv = sw[(size_t)kb * N + col];
-                  const float t = (float)acci[L][e];
-                  accf[L][e] = resc == 0 ? std::fmaf(t, sav * swv, accf[L][e]) : resc == 2 ? std::fmaf(t, swv, accf[L][e]) : std::fmaf(t, sav, accf[L][e]);
-                }
+            for (int L = 0; L < 32; ++L)
+              for (int e = 0; e < 8; ++e) {
+                const int row = i8p::AccRow(rg, i, L, e), col = i8p::FragCol(pair, L, f);
+                float v = accf[L][e];
+                if (resc == 1) v = (float)acci_all[L][e] * (sa[row] * sw[col]);   // kb 0 of the whole K
+                else if (resc == 2) v = v * sa[row];
+                else if (resc == 3) v = v * sw[col];
+                C[(size_t)row * N + col] += (double)v;
+              }
           }
-          for (int L = 0; L < 32; ++L)
-            for (int e = 0; e < 8; ++e) {
-              const int row = i8p::AccRow(rg, i, L, e), col = i8p::FragCol(pair, L, f);
-              float v = accf[L][e];
-              if (resc == 1) v = (float)acci_all[L][e] * (sa[row] * sw[col]);
-              else if (resc == 2) v = v * sa[row];
-              else if (resc == 3) v = v * sw[col];
-              C[(size_t)row * N + col] = (double)v;
-            }
-        }
 }
 
 void TestEmulatedGemm() {
-  const int N = 96, K = 384, M = i8p::kM, NKB = K / 128;
+  const int N = 96, K = 1024, M = i8p::kM, NKB = K / 128;
   std::mt19937_64 g(5);
   std::normal_distribution<float> nd(0.f, 1.f);
   std::vector<float> X((size_t)M * K);
@@ -264,19 +271,23 @@ void TestEmulatedGemm() {
   i8p::QuantizeWeightsRef(Q.data(), K, N, sw, Wp);
   const std::vector<int8_t> a8 = i8p::PackA8(Ap, K), w8 = i8p::PackW8(Wp, K, N);
   const int mask_of[4] = {0, 3, 1, 2};
+  const int cfgs[5][2] = {{2, 1}, {2, 2}, {4, 1}, {8, 1}, {2, 4}};
   for (int resc = 0; resc < 4; ++resc) {
-    std::vector<double> ref((size_t)M * N), got;
+    std::vector<double> ref((size_t)M * N);
     i8p::RefGemmInt8(Ap.data(), sa.data(), Wp.data(), sw.data(), M, N, K, mask_of[resc], ref.data());
-    EmuKernel(a8, sa, w8, sw, N, K, resc, got);
-    double maxerr = 0, rms = 0;
+    double rms = 0, worst = 0;
     for (size_t i = 0; i < ref.size(); ++i) rms += ref[i] * ref[i];
     rms = std::sqrt(rms / ref.size());
-    for (size_t i = 0; i < ref.size(); ++i) maxerr = std::max(maxerr, std::fabs(ref[i] - got[i]));
-    std::printf("    RESC %d (scale mask %d): max |emulated - exact| %.3e, rms of C %.3f (NKB %d)\n", resc, mask_of[resc], maxerr, rms, NKB);
+    for (const auto& cfg : cfgs) {
+      std::vector<double> got;
+      EmuKernel(a8, sa, w8, sw, N, K, resc, cfg[0], cfg[1], got);
+      for (size_t i = 0; i < ref.size(); ++i) worst = std::max(worst, std::fabs(ref[i] - got[i]));
+    }
+    std::printf("    RESC %d (scale mask %d): max |emulated - exact| over (skw, skg) in {2x1, 2x2, 4x1, 8x1, 2x4}: %.3e, rms of C %.3f (NKB %d)\n", resc, mask_of[resc], worst, rms, NKB);
     char what[160];
-    std::snprintf(what, sizeof what, "emulated kernel chain == exact reference, RESC %d (%s)", resc,
+    std::snprintf(what, sizeof what, "emulated kernel chain incl. the K slicing == exact reference, RESC %d (%s)", resc,
                   resc == 0 ? "per-128 both" : resc == 1 ? "both coarse, one rescale" : resc == 2 ? "activation coarse" : "weight coarse");
-    Check(maxerr < 1e-5 * rms, what);
+    Check(worst < 1e-5 * rms, what);
   }  // and the quantized product is the f16 product up to the quantization error (a sanity bound, not a gate)
   std::vector<double> exact((size_t)M * N, 0.0), q((size_t)M * N);
   for (int r = 0; r < M; ++r)

@@ -687,7 +687,14 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
     double worst_rel = 0, best_rel = 1e9;
     for (const I8gCfg& g : all) {
       CK(hipMemset(c.c_a, 0xFF, (size_t)256 * s.N * 2));
-      LaunchI8(c, g, 0, c.c_a);
+      try {
+        LaunchI8(c, g, 0, c.c_a);
+      } catch (const std::exception& e) {
+        verified[CfgName(g)] = false;
+        ++nbad;
+        std::printf("    VERIFY FAIL %-34s launch refused: %s\n", CfgName(g).c_str(), e.what());
+        continue;
+      }
       CK(hipDeviceSynchronize());
       const std::vector<unsigned short> C = ReadC(c.c_a, s.N);
       const auto r = V.Check(C, g.fwht, g.resc, g.fwht ? kOutScale : 1.0f);
@@ -762,6 +769,19 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
     const int NKB = s.K / 128;
     j.launch = [&, NKB](int) { hipLaunchKernelGGL(i8g_quant_act, dim3((256 * NKB + 7) / 8), dim3(256), 0, 0, c.a16, c.a8, (signed char*)nullptr, c.sa, c.K); };
     jobs.push_back(j);
+  }
+  {   // one launch of every job first: a configuration the runtime refuses is dropped, not fatal
+    std::vector<Job> ok;
+    for (Job& j : jobs) {
+      try {
+        j.launch(0);
+        CK(hipDeviceSynchronize());
+        ok.push_back(std::move(j));
+      } catch (const std::exception& e) {
+        std::printf("  dropped %s: %s\n", j.name.c_str(), e.what());
+      }
+    }
+    jobs = std::move(ok);
   }
   RunJobs(jobs, batch, rounds);
   CK(hipDeviceSynchronize());
@@ -877,7 +897,7 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
   (void)picks;
 }
 
-int main(int argc, char** argv) {
+static int RealMain(int argc, char** argv) {
   std::string outp, shape = "all", mode = "all", kbs = "both";
   int rounds = 11, batch = 6, simds = 128;
   bool quick = false, noverify = false, no_resc = false, verbose = false;
@@ -949,4 +969,14 @@ int main(int argc, char** argv) {
   if (json) { std::fprintf(json, "]}\n"); std::fclose(json); }
   std::printf("%s (%d failing checks)\n", fails == 0 ? "ALL OK" : "FAILED", fails);
   return fails == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  try {
+    return RealMain(argc, argv);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "exception: %s\n", e.what());
+    return 1;
+  }
 }

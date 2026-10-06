@@ -4,11 +4,20 @@ The question (2026-10-03 research): standalone prompt-lookup gave 1.3-1.8 tok/ro
 3.4-4.2 on benchmark prompts, and real agent traffic gets DFlash about 2.96 tok/round. A hybrid
 (n-gram when a long match exists, DFlash otherwise) might still win on agent traffic, where the model
 quotes files, diffs and tool output it has just been shown. This directory measures that on the real
-requests instead of guessing. The verify window is capped at 8 rows (`kMaxUnsplitDraftK` = 7), so the
-gate for building it is:
+requests instead of guessing. The decision is one question: **does the hybrid make decode faster than
+DFlash alone on real traffic?** Rounds are not equally expensive (a DFlash round = an 8-row verify plus
+the drafter forward; an n-gram round = a verify of however many rows it proposed, no drafter), so the
+verdict is made in estimated tok/s, not tok/round:
 
-- standalone n-gram at k=7 reaches **>= 2.5 tok/round**, or
-- **more than 50%** of the generated tokens sit in copy runs of **10+ tokens**.
+- **BUILD** only if the best hybrid is **>= 5% faster** than DFlash alone as logged (`--min-gain`) on
+  **>= 20 requests** (`--min-requests`) of **>= 32 generated tokens** (`--gate-min-gen`);
+- fewer such requests: **NOT ENOUGH DATA** (the numbers are still printed);
+- otherwise **DO NOT BUILD**.
+
+The old 2026-10-03 gates (standalone n-gram at k=7 >= 2.5 tok/round, > 50% of tokens in copy runs of
+10+) are still printed as `A` / `B`, as information only: n-gram alone can pass them on a log where DFlash
+already accepts more per round, and the hybrid is then slower than DFlash (a real 2-request smoke log:
+n-gram k=7 3.88 tok/round, DFlash 6.20, hybrid -16.7% tok/round, -5.7% in time).
 
 ## 1. Capture: run oh-my-pi against r4dx-server with logging on
 
@@ -47,7 +56,18 @@ Plain `python` (stdlib only; numpy is not used). Options: `--min-n/--max-n` (suf
 (match-length thresholds for the hybrid, default `3,4,5`), `--dflash-tpr` (tok/round for requests
 whose log has no DFlash rounds, default 2.96), `--window N` (only match sources within the last N
 tokens), `--min-gen` (skip tiny generations), `--greedy-only`, `--rows` (per-request rows printed:
-30 by default, 0 none, -1 all).
+30 by default, 0 none, -1 all). The timing model and the gate: `--verify-ms-base 26.4`,
+`--verify-ms-per-row 0.8`, `--drafter-ms 7.0`, `--inject-ms-per-row 0.0137`, `--min-gain 0.05`,
+`--min-requests 20`, `--gate-min-gen 32`.
+
+Timing model (TP1, Huihui 27B trellis + w4a16 DFlash2 drafter; the report prints the values it used).
+`verify(rows) = base + per_row * rows`; plain decode is 1 row = 27.2 ms (docs/perf.md: ~27.2 ms/token),
+a k=7 DFlash round is `verify(8 rows) + drafter` = 26.4 + 6.4 + 7.0 = **39.8 ms** (docs/dflash2.md k
+sweep: 39.8 ms/round at k=7, 0.8 ms per extra draft row), an n-gram round is `verify(proposal + 1 rows)`
+plus the drafter-injection cost per committed token (InjectFeatures: 0.875 ms per 64 rows). DFlash
+alone is priced at its logged round count; requests without logged DFlash rounds use `--dflash-tpr`.
+Measure your own setup (TP2, a different drafter, long contexts all move these) and pass the numbers:
+the verdict depends on the ratio of n-gram round cost to DFlash round cost.
 
 What it does, per request: rebuilds the prompt from `prompt_shared` + `prompt_ids`, then walks the
 generation round by round. A round proposes the tokens that followed the **most recent** earlier
@@ -62,20 +82,25 @@ Reported:
 | tok/round | generated tokens / rounds (the engine's own `tok/round` convention) for the log's DFlash, for n-gram alone at each k, and for the hybrid |
 | round hit | rounds whose proposal had at least one accepted token |
 | token hit, run >= 10 | share of tokens after the first inside a copy run (the match's continuation keeps equalling the output), and inside runs of 10+ tokens; plus the run-length histogram |
-| hybrid | per round: n-gram if its match is >= T tokens, else a DFlash round. A DFlash round emits what the log's DFlash round covering that position emitted (`positional`, exact when the rounds line up, optimistic after an n-gram stretch) or the request's mean logged tok/round (`mean`) |
-| gate | the two conditions above, PASS/FAIL, and a verdict line |
+| hybrid | per round: n-gram if its match is >= T tokens, else a DFlash round. A DFlash round emits the logged round that starts at this position (`positional`, exact while the hybrid is lined up with the log) or the request's mean logged tok/round (`mean`; also what `positional` falls back to after an n-gram stretch, when the position is inside a logged round) |
+| estimated tok/s | decode tokens / summed round time under the timing model, for DFlash alone, n-gram alone (info) and each hybrid T (positional, mean, and the lower of the two = the conservative gain the gate uses); for the gate set, and split greedy (exact) / sampled (estimate) |
+| gate | requests counted, best hybrid gain vs `--min-gain`, the old gates A/B as info, and the verdict line |
 
 Caveats. Greedy requests (temperature 0) are replayed exactly. A sampled request is one sampled
 trajectory: the replay is an unbiased but noisy estimate (a deterministic proposal is accepted with
-probability p(token)); use `--greedy-only` to see the exact subset. An n-gram round is counted as one
-round like a DFlash round although it skips the drafter forward, so the hybrid's tok/round understates
-its speed-up; the standalone numbers need no such correction. Requests that failed (non-200) are
+probability p(token)); use `--greedy-only` to see the exact subset. The tok/round columns count an n-gram
+round as one round like a DFlash round although it is cheaper; the estimated tok/s are what the verdict
+uses. Requests that failed (non-200) are
 skipped.
+
+The hybrid still ignores that a hybrid has to keep the drafter's feature ring fed (modelled by the
+per-token injection cost only), that an n-gram verify of fewer rows has a different kernel mix than the
+8-row one, and sampled-request acceptance (see above). The 5% margin is there to cover that.
 
 ## 3. Without real data
 
 ```powershell
-python tools\ngram\sim_ngram.py --selftest                 # synthetic log, cross-checks the proposer against a brute-force definition
+python tools\ngram\sim_ngram.py --selftest                 # proposer vs a brute-force definition, and the verdict on synthetic traffic: copy-heavy -> BUILD, DFlash-already-great -> DO NOT BUILD, too few/short requests -> NOT ENOUGH DATA
 python tools\ngram\sim_ngram.py tools\ngram\example_requests.jsonl --rows -1   # the 3 synthetic requests, in the server's file format
 python tools\ngram\sim_ngram.py --write-example tools\ngram\example_requests.jsonl   # regenerate it
 ```

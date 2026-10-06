@@ -26,16 +26,31 @@ Reported (stdlib only; numpy is not needed):
   run>=10     share of those tokens inside runs of 10+ tokens.
   hybrid      per round, the n-gram proposal when its match is >= T tokens long, else a DFlash round. A
               DFlash round emits what the log's own DFlash rounds did from that position
-              (round_accepted; "positional") or the request's mean logged tok/round ("mean"), and
-              --dflash-tpr when the log has no DFlash rounds. An n-gram round is counted as one round
-              like a DFlash round, although it is cheaper (no drafter forward).
+              (round_accepted; "positional": exact while the hybrid is aligned with the log's rounds,
+              i.e. right after another DFlash round or at the start; after an n-gram stretch the
+              position falls inside a logged round and the request's mean takes over) or always the
+              request's mean logged tok/round ("mean"), and --dflash-tpr when the log has no DFlash
+              rounds.
 
-Gate (from the 2026-10-03 research): build the n-gram path if standalone n-gram reaches >= 2.5 tok/round
-at k=7 (the verify window is capped at 8 rows), or if more than 50% of the generated tokens sit in copy
-runs of 10+ tokens.
+Timing (what the verdict is about). Speculation only pays if decode gets FASTER, and an n-gram round is
+cheaper than a DFlash round (no drafter forward, fewer verify rows), so rounds are priced:
+  verify(rows)  = --verify-ms-base + --verify-ms-per-row * rows
+  DFlash round  = verify(k+1 = 8 rows) + --drafter-ms           (39.8 ms at the defaults, TP1)
+  n-gram round  = verify(len(proposal) + 1 rows)  [+ --inject-ms-per-row per committed row, the
+                  drafter being fed the rows it did not see]  (no proposal: 1 row = plain decode)
+The defaults are the repo's measurements (docs/dflash2.md k sweep: round 39.8 ms at k=7, 0.8 ms per
+draft row; docs/perf.md: plain decode ~27.2 ms/token, 8-row DFlash verify ~32.2 ms; InjectFeatures
+0.875 ms / 64 rows). Estimated tok/s = decode tokens (all but the first) / summed round time.
+
+Gate: BUILD the n-gram path only if the best hybrid's estimated tok/s (the lower of the positional and
+mean models) beats DFlash alone as logged by >= --min-gain (default 5%) on at least --min-requests
+(default 20) requests of >= --gate-min-gen generated tokens. Fewer requests: NOT ENOUGH DATA. The
+2026-10-03 gates (n-gram alone >= 2.5 tok/round at k=7; > 50% of tokens in 10+ token copy runs) are
+still printed, as information only: n-gram alone can pass them while the hybrid is slower than DFlash.
 
   python sim_ngram.py requests.jsonl
   python sim_ngram.py requests.jsonl --k 7,9 --hybrid-t 3,4,5 --greedy-only --rows 0
+  python sim_ngram.py requests.jsonl --min-gain 0.10 --min-requests 50 --drafter-ms 6.5
   python sim_ngram.py --selftest
   python sim_ngram.py --write-example example_requests.jsonl
 """
@@ -53,6 +68,15 @@ GATE_TPR = 2.5
 GATE_RUN = 10
 GATE_RUN_SHARE = 0.5
 DFLASH_TPR = 2.96  # real agent traffic, 2026-10-03
+# Round cost model, TP1 Huihui 27B trellis + w4a16 DFlash2 drafter (docs/dflash2.md, docs/perf.md):
+# plain decode = 1 row = 27.2 ms, an 8-row verify = 32.8 ms (measured 32.2), a k=7 DFlash round = 39.8 ms.
+VERIFY_MS_BASE = 26.4
+VERIFY_MS_PER_ROW = 0.8
+DRAFTER_MS = 7.0  # 39.8 - verify(8): DraftRound wall 6.2 ms + injection + glue
+INJECT_MS_PER_ROW = 0.875 / 64  # InjectFeatures(64 rows) wall, w4a16 drafter
+MIN_GAIN = 0.05
+MIN_REQUESTS = 20
+GATE_MIN_GEN = 32
 RUN_BUCKETS = [(1, 1), (2, 2), (3, 4), (5, 9), (10, 19), (20, 49), (50, None)]
 
 
@@ -177,22 +201,25 @@ def accepted(prop, gen, i):
 # ---- one request -------------------------------------------------------------------------------------
 
 def sim_ngram(prompt, gen, table, k):
-    """Standalone n-gram rounds at draft cap k. Returns (rounds, rounds_with_proposal, rounds_hit)."""
+    """Standalone n-gram rounds at draft cap k. Returns (rounds, rounds_with_proposal, rounds_hit,
+    verified_rows): a round verifies len(proposal) + 1 rows, 1 without a proposal."""
     P, n = len(prompt), len(gen)
     full = prompt + gen
     i = 1
-    rounds = proposed = hit = 0
+    rounds = proposed = hit = rows = 0
     while i < n:
         m = table[i]
         a = 0
+        rows += 1
         if m is not None:
             prop = proposal(full, P, i, m, k)
             a = accepted(prop, gen, i)
             proposed += 1
             hit += a > 0
+            rows += len(prop)
         i += min(a + 1, n - i)
         rounds += 1
-    return rounds, proposed, hit
+    return rounds, proposed, hit, rows
 
 
 def copy_runs(prompt, gen, table):
@@ -233,32 +260,48 @@ def dflash_rounds_of(rec, n):
 
 def sim_hybrid(prompt, gen, table, k, t_min, rounds_log, tpr):
     """n-gram when the match is >= t_min tokens long, else a DFlash round. rounds_log: dflash_rounds_of
-    (positional) or None, in which case a DFlash round emits `tpr` tokens on average (carried
-    fractionally). Returns (rounds, ngram_rounds, dflash_rounds)."""
+    (positional) or None (mean). A DFlash round emits `tpr` tokens on average (carried fractionally)
+    -- the request's mean logged tokens per round -- except in positional mode when it starts exactly
+    where a logged round started: then it emits that logged round's tokens. After an n-gram stretch
+    the position usually falls inside a logged round, whose remainder is not what a fresh round would
+    emit, so it is the mean that applies there. Returns (rounds, ngram_rounds, dflash_rounds,
+    ngram_rows, ngram_tokens): the rows the n-gram rounds verified and the tokens they committed."""
     P, n = len(prompt), len(gen)
     full = prompt + gen
     i = 1
-    rounds = ng = df = 0
+    rounds = ng = df = ng_rows = ng_tokens = 0
     carry = 0.0
     while i < n:
         m = table[i]
         if m is not None and m[0] >= t_min:
-            a = accepted(proposal(full, P, i, m, k), gen, i)
-            emit = a + 1
+            prop = proposal(full, P, i, m, k)
+            emit = accepted(prop, gen, i) + 1
             ng += 1
+            ng_rows += len(prop) + 1
+            ng_tokens += min(emit, n - i)
         else:
+            emit = 0
             if rounds_log is not None:
                 starts, ends = rounds_log
                 r = bisect.bisect_right(starts, i) - 1
-                emit = ends[r] - i if r >= 0 and ends[r] > i else 1
-            else:
+                if r >= 0 and starts[r] == i:
+                    emit = ends[r] - i
+            if emit == 0:
                 carry += tpr
                 emit = max(1, int(carry))
                 carry -= emit
             df += 1
         i += min(emit, n - i)
         rounds += 1
-    return rounds, ng, df
+    return rounds, ng, df, ng_rows, ng_tokens
+
+
+def verify_ms(cfg, rows):
+    return cfg["verify_base"] + cfg["verify_row"] * rows
+
+
+def dflash_round_ms(cfg):
+    return verify_ms(cfg, GATE_K + 1) + cfg["drafter_ms"]
 
 
 def analyse(rec, cfg):
@@ -274,33 +317,38 @@ def analyse(rec, cfg):
         "temperature": rec.get("temperature"),
         "greedy": (rec.get("temperature") or 0) <= 0,
     }
-    # DFlash as logged (or the constant when the server ran without a drafter).
+    # DFlash as logged (or the constant when the server ran without a drafter). Rounds cover the n - 1
+    # tokens after the first, which the prefill emitted.
     log_rounds = dflash_rounds_of(rec, n)
     if log_rounds is not None:
         res["dflash_rounds"] = len(log_rounds[0])
         res["dflash_src"] = "log"
         res["dflash_tpr"] = n / len(log_rounds[0])
-        mean_tpr = res["dflash_tpr"]
+        mean_emit = max(n - 1, 1) / len(log_rounds[0])
+        eq_rounds = len(log_rounds[0])
     else:
         res["dflash_rounds"] = None
         res["dflash_src"] = "const"
         res["dflash_tpr"] = cfg["dflash_tpr"]
-        mean_tpr = cfg["dflash_tpr"]
+        mean_emit = cfg["dflash_tpr"]
+        eq_rounds = max(n - 1, 0) / cfg["dflash_tpr"]
+    res["dflash_ms"] = eq_rounds * dflash_round_ms(cfg)
     res["ngram"] = {}
     for k in cfg["ks"]:
-        rounds, proposed, hit = sim_ngram(prompt, gen, table, k)
-        res["ngram"][k] = {"rounds": rounds, "proposed": proposed, "hit": hit}
+        rounds, proposed, hit, rows = sim_ngram(prompt, gen, table, k)
+        res["ngram"][k] = {"rounds": rounds, "proposed": proposed, "hit": hit,
+                           "ms": rounds * cfg["verify_base"] + rows * cfg["verify_row"]}
     runs = copy_runs(prompt, gen, table)
     res["runs"] = runs
     res["covered"] = sum(runs)
     res["hybrid"] = {}
     for t in cfg["ts"]:
         for mode in ("positional", "mean"):
-            if mode == "positional":
-                r, ng, df = sim_hybrid(prompt, gen, table, cfg["hybrid_k"], t, log_rounds, cfg["dflash_tpr"])
-            else:
-                r, ng, df = sim_hybrid(prompt, gen, table, cfg["hybrid_k"], t, None, mean_tpr)
-            res["hybrid"][(t, mode)] = {"rounds": r, "ngram_rounds": ng, "dflash_rounds": df}
+            r, ng, df, ng_rows, ng_tokens = sim_hybrid(
+                prompt, gen, table, cfg["hybrid_k"], t, log_rounds if mode == "positional" else None, mean_emit)
+            ms = (df * dflash_round_ms(cfg) + ng * cfg["verify_base"] + ng_rows * cfg["verify_row"]
+                  + ng_tokens * cfg["inject_row"])
+            res["hybrid"][(t, mode)] = {"rounds": r, "ngram_rounds": ng, "dflash_rounds": df, "ms": ms}
     return res
 
 
@@ -308,6 +356,33 @@ def analyse(rec, cfg):
 
 def tpr(tokens, rounds):
     return tokens / rounds if rounds else 0.0
+
+
+def tok_s(tokens, ms):
+    return 1000.0 * tokens / ms if ms else 0.0
+
+
+def timing(results, cfg):
+    """Estimated decode speed of a set of requests: tok/s of DFlash as logged, of n-gram alone, and of
+    each hybrid (T, mode); the conservative gain per T is the lower of the two modes. best = (T, gain,
+    tok/s) of the T with the largest conservative gain (None without requests)."""
+    if not results:
+        return {"requests": 0, "tokens": 0, "dflash_tps": 0.0, "ngram_tps": {}, "hybrid": {}, "best": None}
+    toks = sum(max(r["gen_tokens"] - 1, 0) for r in results)
+    base = tok_s(toks, sum(r["dflash_ms"] for r in results))
+    out = {"requests": len(results), "tokens": toks, "dflash_tps": base, "ngram_tps": {}, "hybrid": {}, "best": None}
+    for k in cfg["ks"]:
+        out["ngram_tps"][k] = tok_s(toks, sum(r["ngram"][k]["ms"] for r in results))
+    for t in cfg["ts"]:
+        per = {}
+        for mode in ("positional", "mean"):
+            per[mode] = tok_s(toks, sum(r["hybrid"][(t, mode)]["ms"] for r in results))
+        cons = min(per.values())
+        gain = cons / base - 1 if base else 0.0
+        out["hybrid"][t] = {"positional": per["positional"], "mean": per["mean"], "conservative": cons, "gain": gain}
+        if out["best"] is None or gain > out["best"][1]:
+            out["best"] = (t, gain, cons)
+    return out
 
 
 def aggregate(results, cfg):
@@ -340,7 +415,27 @@ def aggregate(results, cfg):
         rounds = sum(r["hybrid"][key]["rounds"] for r in results)
         ng = sum(r["hybrid"][key]["ngram_rounds"] for r in results)
         agg["hybrid"][key] = {"tpr": tpr(agg["tokens"], rounds), "ngram_share": tpr(ng, rounds)}
+    # the timing verdict: the gate set is the requests long enough to count, split by sampling
+    gate_set = [r for r in results if r["gen_tokens"] >= cfg["gate_min_gen"]]
+    agg["gate_requests"] = len(gate_set)
+    agg["timing_all"] = timing(results, cfg)
+    agg["timing_gate"] = timing(gate_set, cfg)
+    agg["timing_greedy"] = timing([r for r in gate_set if r["greedy"]], cfg)
+    agg["timing_sampled"] = timing([r for r in gate_set if not r["greedy"]], cfg)
     return agg
+
+
+def decide(agg, cfg):
+    """The verdict: (label, reason). label is BUILD, DO NOT BUILD or NOT ENOUGH DATA."""
+    have, need = agg["gate_requests"], cfg["min_requests"]
+    best = agg["timing_gate"]["best"]
+    if have < need:
+        return "NOT ENOUGH DATA", "%d request(s) with >= %d generated tokens, need %d" % (have, cfg["gate_min_gen"], need)
+    if best is not None and best[1] >= cfg["min_gain"]:
+        return "BUILD", "best hybrid T=%d is %+.1f%% faster than DFlash alone (>= %+.1f%%)" % (
+            best[0], 100 * best[1], 100 * cfg["min_gain"])
+    return "DO NOT BUILD", "best hybrid%s vs DFlash alone, needs >= %+.1f%%" % (
+        " (T=%d) is %+.1f%%" % (best[0], 100 * best[1]) if best else " n/a", 100 * cfg["min_gain"])
 
 
 def bucket_name(lo, hi):
@@ -392,8 +487,8 @@ def report(results, agg, cfg, rows, out=sys.stdout):
         fmt_pct(agg["token_hit"]).strip(), fmt_pct(agg["run_share"]).strip(), GATE_RUN))
     w("    run length: " + ", ".join("%s: %d runs / %s of tokens" % (bucket_name(*b), c, fmt_pct(s).strip())
                                       for b, c, _, s in agg["run_hist"]) + "\n")
-    w("  hybrid (n-gram k=%d when match >= T, else DFlash), tok/round vs DFlash alone %.2f:\n" % (cfg["hybrid_k"], agg["dflash_tpr"]))
-    best = None
+    w("  hybrid (n-gram k=%d when match >= T, else DFlash), tok/round vs DFlash alone %.2f"
+      " (rounds are not equally long: see the timing below):\n" % (cfg["hybrid_k"], agg["dflash_tpr"]))
     for t in cfg["ts"]:
         parts = []
         for mode in ("positional", "mean"):
@@ -401,24 +496,62 @@ def report(results, agg, cfg, rows, out=sys.stdout):
             parts.append("%s %.2f (%+.1f%%, n-gram in %s of rounds)" % (
                 mode, h["tpr"], 100 * (h["tpr"] / agg["dflash_tpr"] - 1) if agg["dflash_tpr"] else 0.0,
                 fmt_pct(h["ngram_share"]).strip()))
-            if mode == "positional" and (best is None or h["tpr"] > best[1]):
-                best = (t, h["tpr"])
         w("    T=%d: %s\n" % (t, "; ".join(parts)))
+
+    # ---- timing: the part the verdict rests on
+    dm = dflash_round_ms(cfg)
+    w("\ntiming model (ms; --verify-ms-base/--verify-ms-per-row/--drafter-ms/--inject-ms-per-row):\n")
+    w("  verify(rows) = %.2f + %.3f * rows; plain decode (1 row) %.1f; DFlash round = verify(%d rows) + drafter %.2f = %.1f;"
+      " n-gram round = verify(proposal + 1 rows) + %.4f per committed row\n" % (
+          cfg["verify_base"], cfg["verify_row"], verify_ms(cfg, 1), GATE_K + 1, cfg["drafter_ms"], dm, cfg["inject_row"]))
+
+    def tline(label, tm):
+        if not tm["requests"]:
+            w("  %-34s no requests\n" % label)
+            return
+        w("  %-34s %3d requests, %6d decode tokens: DFlash alone %.1f tok/s\n" % (
+            label, tm["requests"], tm["tokens"], tm["dflash_tps"]))
+        for k in ks:
+            w("      n-gram alone k=%d (info): %.1f tok/s (%+.1f%%)\n" % (
+                k, tm["ngram_tps"][k], 100 * (tm["ngram_tps"][k] / tm["dflash_tps"] - 1) if tm["dflash_tps"] else 0.0))
+        for t in cfg["ts"]:
+            h = tm["hybrid"][t]
+            w("      hybrid T=%d: positional %.1f, mean %.1f tok/s -> %+.1f%% (lower of the two)%s\n" % (
+                t, h["positional"], h["mean"], 100 * h["gain"], "  <- best" if tm["best"] and tm["best"][0] == t else ""))
+
+    w("estimated decode speed, requests with >= %d generated tokens (the gate set):\n" % cfg["gate_min_gen"])
+    tline("all", agg["timing_gate"])
+    tline("  greedy (exact)", agg["timing_greedy"])
+    tline("  sampled (estimate)", agg["timing_sampled"])
+    if agg["timing_all"]["requests"] != agg["timing_gate"]["requests"]:
+        w("(all %d requests, including the short ones, for reference:)\n" % agg["timing_all"]["requests"])
+        tline("all requests", agg["timing_all"])
+    if agg["dflash_logged"] < agg["requests"]:
+        w("  note: %d request(s) have no logged DFlash rounds; DFlash alone is priced at --dflash-tpr %.2f for them\n" % (
+            agg["requests"] - agg["dflash_logged"], cfg["dflash_tpr"]))
+
+    label, reason = decide(agg, cfg)
+    best = agg["timing_gate"]["best"]
+    have = agg["gate_requests"]
+    w("\ngate (decides): the best hybrid must beat DFlash alone by >= %.1f%% on >= %d requests of >= %d tokens\n" % (
+        100 * cfg["min_gain"], cfg["min_requests"], cfg["gate_min_gen"]))
+    w("  requests with >= %d tokens: %d vs >= %d ........ %s\n" % (
+        cfg["gate_min_gen"], have, cfg["min_requests"], "PASS" if have >= cfg["min_requests"] else "FAIL"))
+    if best is not None:
+        w("  best hybrid T=%d: %+.1f%% vs >= %+.1f%% ........ %s\n" % (
+            best[0], 100 * best[1], 100 * cfg["min_gain"], "PASS" if best[1] >= cfg["min_gain"] else "FAIL"))
     exact = " (only greedy requests are exact; %d sampled are estimates)" % (agg["requests"] - greedy) if agg["requests"] > greedy else ""
-    w("\ngate (n-gram alone at k=%d >= %.1f tok/round, or > %d%% of tokens in runs of %d+)%s\n" % (
-        GATE_K, GATE_TPR, int(100 * GATE_RUN_SHARE), GATE_RUN, exact))
+    w("info, the 2026-10-03 gates (they no longer decide: n-gram alone passing them does not make the hybrid faster)%s:\n" % exact)
     tpr7 = agg["ngram"][GATE_K]["tpr"]
     a_ok = tpr7 >= GATE_TPR
     b_ok = agg["run_share"] > GATE_RUN_SHARE
     w("  A  n-gram k=%d: %.2f tok/round vs %.1f ........ %s\n" % (GATE_K, tpr7, GATE_TPR, "PASS" if a_ok else "FAIL"))
     w("  B  tokens in runs of %d+: %s vs > %d%% ........ %s\n" % (
         GATE_RUN, fmt_pct(agg["run_share"]).strip(), int(100 * GATE_RUN_SHARE), "PASS" if b_ok else "FAIL"))
-    if best is not None:
-        w("  info: best hybrid T=%d gives %.2f tok/round, %+.1f%% over DFlash alone (n-gram rounds skip the drafter forward)\n" % (
-            best[0], best[1], 100 * (best[1] / agg["dflash_tpr"] - 1) if agg["dflash_tpr"] else 0.0))
-    w("verdict: %s\n" % ("BUILD the n-gram path (gate met)" if (a_ok or b_ok) else
-                         "DO NOT BUILD standalone n-gram (gate not met); judge a hybrid on the uplift above"))
-    return a_ok or b_ok
+    verdict_text = {"BUILD": "BUILD the n-gram hybrid", "DO NOT BUILD": "DO NOT BUILD the n-gram hybrid",
+                    "NOT ENOUGH DATA": "NOT ENOUGH DATA to decide"}[label]
+    w("verdict: %s (%s)\n" % (verdict_text, reason))
+    return label
 
 
 def to_jsonable(results, agg):
@@ -494,6 +627,75 @@ def encode_log(recs):
     return lines
 
 
+def _traffic_rec(i, prompt, gen, temperature, acc):
+    return {"_prompt": prompt, "_gen": gen, "_where": "selftest:%d" % i, "request_id": "selftest%03d" % i,
+            "temperature": temperature, "speculative": "dflash", "round_accepted": acc}
+
+
+def _copy_traffic(n_req, gen_len=80, seed=11):
+    """Heavy copy traffic: every reply quotes a block of the prompt, and DFlash (as logged) only gets 3
+    tokens per round on it, so an n-gram round (8 tokens, no drafter) is both longer and cheaper."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n_req):
+        block = _rand_tokens(rng, gen_len, 248320)
+        prompt = _rand_tokens(rng, 200, 248320) + block + _rand_tokens(rng, 20, 248320)
+        acc = [2] * ((gen_len - 1) // 3) + ([(gen_len - 1) % 3 - 1] if (gen_len - 1) % 3 else [])
+        out.append(_traffic_rec(i, prompt, list(block), 0.0 if i % 2 == 0 else 0.7, acc))
+    return out
+
+
+def _dflash_great_traffic(n_req, seed=12):
+    """The smoke-like case: DFlash already gets 6 tokens per round, and the reply is fresh text over a small
+    vocabulary, so n-gram matches of 3+ tokens exist by chance and are almost never right."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n_req):
+        prompt = _rand_tokens(rng, 300, 12)
+        gen = _rand_tokens(rng, 120, 12)
+        out.append(_traffic_rec(i, prompt, gen, 0.0 if i % 3 else 0.7, [5] * 20))
+    return out
+
+
+def selftest_verdicts(check):
+    """The timing-aware verdict: heavy copy traffic -> BUILD; DFlash already great -> DO NOT BUILD; too few
+    requests (or too short ones) -> NOT ENOUGH DATA."""
+    cfg = make_cfg(build_parser().parse_args(["--hybrid-t", "3,4,5"]))
+
+    def run(recs):
+        results = [analyse(r, cfg) for r in recs]
+        agg = aggregate(results, cfg)
+        return results, agg, decide(agg, cfg)
+
+    check(abs(dflash_round_ms(cfg) - 39.8) < 1e-9 and abs(verify_ms(cfg, 1) - 27.2) < 1e-9,
+          "default timing model: round %.2f ms, plain %.2f ms" % (dflash_round_ms(cfg), verify_ms(cfg, 1)))
+    # (a) heavy copy traffic: the hybrid is much faster than DFlash alone
+    results, agg, (label, _) = run(_copy_traffic(24))
+    best = agg["timing_gate"]["best"]
+    check(label == "BUILD" and best[1] > 0.5, "copy traffic: %s, best %r" % (label, best))
+    check(agg["timing_greedy"]["requests"] == 12 and agg["timing_sampled"]["requests"] == 12,
+          "greedy/sampled split: %d/%d" % (agg["timing_greedy"]["requests"], agg["timing_sampled"]["requests"]))
+    # (b) DFlash already great, chance n-gram matches only cost time: not worth building
+    results, agg, (label, _) = run(_dflash_great_traffic(24))
+    best = agg["timing_gate"]["best"]
+    check(label == "DO NOT BUILD" and best[1] < 0.05, "DFlash-great traffic: %s, best %r" % (label, best))
+    check(any(h["tpr"] < agg["dflash_tpr"] for h in agg["hybrid"].values()), "hybrid should lose tok/round here")
+    # (c) too few requests, or requests too short to count: no verdict, however good the numbers look
+    results, agg, (label, _) = run(_copy_traffic(5))
+    check(label == "NOT ENOUGH DATA" and agg["timing_gate"]["best"][1] > 0.5, "5 copy requests: %s" % label)
+    short = _copy_traffic(24, gen_len=20)
+    results, agg, (label, _) = run(short)
+    check(label == "NOT ENOUGH DATA" and agg["gate_requests"] == 0, "short requests: %s, %d counted" % (label, agg["gate_requests"]))
+    # the threshold is a flag: the same copy traffic fails a 10x gain requirement
+    cfg2 = make_cfg(build_parser().parse_args(["--min-gain", "10"]))
+    agg2 = aggregate([analyse(r, cfg2) for r in _copy_traffic(24)], cfg2)
+    check(decide(agg2, cfg2)[0] == "DO NOT BUILD", "--min-gain 10 must reject")
+    # the positional model equals the log exactly when the hybrid never leaves DFlash (T above any match)
+    cfg3 = make_cfg(build_parser().parse_args(["--hybrid-t", "99"]))
+    r3 = analyse(_copy_traffic(1)[0], cfg3)
+    check(abs(r3["hybrid"][(99, "positional")]["ms"] - r3["dflash_ms"]) < 1e-6, "T=99 positional != DFlash as logged")
+
+
 def selftest():
     failures = []
 
@@ -517,12 +719,12 @@ def selftest():
     recs = synthetic_records()
     prompt, gen = recs[0]["prompt"], recs[0]["gen"]
     table = build_match_table(prompt, gen, 2, 5)
-    check(sim_ngram(prompt, gen, table, 7) == (5, 5, 5), "quote k=7: %r" % (sim_ngram(prompt, gen, table, 7),))
+    check(sim_ngram(prompt, gen, table, 7) == (5, 5, 5, 40), "quote k=7: %r" % (sim_ngram(prompt, gen, table, 7),))
     check(sim_ngram(prompt, gen, table, 3)[0] == 10, "quote k=3 rounds: %r" % (sim_ngram(prompt, gen, table, 3),))
     check(copy_runs(prompt, gen, table) == [39], "quote runs: %r" % (copy_runs(prompt, gen, table),))
     p2, g2 = recs[1]["prompt"], recs[1]["gen"]
     t2 = build_match_table(p2, g2, 2, 5)
-    check(sim_ngram(p2, g2, t2, 7) == (29, 0, 0), "fresh text: %r" % (sim_ngram(p2, g2, t2, 7),))
+    check(sim_ngram(p2, g2, t2, 7) == (29, 0, 0, 29), "fresh text: %r" % (sim_ngram(p2, g2, t2, 7),))
     # the repeated 5-token phrase: the 2nd and 3rd copies are found after their first two tokens, so
     # each contributes a run of the remaining 3 (the run stops where the filler differs)
     p3, g3 = recs[2]["prompt"], recs[2]["gen"]
@@ -564,7 +766,7 @@ def selftest():
         # 5. end to end on the synthetic log: the report runs and the numbers hang together.
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
-        cfg = make_cfg(argparse.Namespace(min_n=2, max_n=5, k="7,9", hybrid_t="2,3,4", dflash_tpr=DFLASH_TPR, window=0))
+        cfg = make_cfg(build_parser().parse_args(["--k", "7,9", "--hybrid-t", "2,3,4"]))
         results = [analyse(r, cfg) for r in read_requests([path], Counter())]
         agg = aggregate(results, cfg)
         check(agg["requests"] == 3 and agg["tokens"] == 40 + 30 + len(recs[2]["gen"]), "aggregate counts")
@@ -578,7 +780,9 @@ def selftest():
         report(results, agg, cfg, rows=-1, out=buf)
         text = buf.getvalue()
         check("verdict:" in text and "per request" in text and "hybrid" in text, "report text")
+        check("NOT ENOUGH DATA" in text, "3 requests are not enough data to decide")
         sys.stdout.write(text)
+    selftest_verdicts(check)
     if failures:
         sys.stderr.write("SELFTEST FAILED:\n  " + "\n  ".join(failures) + "\n")
         return 1
@@ -596,10 +800,13 @@ def make_cfg(args):
     ks = sorted(set(parse_ints(args.k)) | {GATE_K})
     ts = parse_ints(args.hybrid_t)
     return {"min_n": args.min_n, "max_n": args.max_n, "ks": ks, "ts": ts, "window": args.window,
-            "hybrid_k": GATE_K, "dflash_tpr": args.dflash_tpr}
+            "hybrid_k": GATE_K, "dflash_tpr": args.dflash_tpr,
+            "verify_base": args.verify_ms_base, "verify_row": args.verify_ms_per_row, "drafter_ms": args.drafter_ms,
+            "inject_row": args.inject_ms_per_row, "min_gain": args.min_gain, "min_requests": args.min_requests,
+            "gate_min_gen": args.gate_min_gen}
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="*", help="request log file(s), written with --request-log-tokens")
@@ -614,8 +821,28 @@ def main(argv=None):
     ap.add_argument("--greedy-only", action="store_true", help="only temperature <= 0 requests (the exact ones)")
     ap.add_argument("--rows", type=int, default=30, help="per-request rows to print (default 30, 0 none, -1 all)")
     ap.add_argument("--json", metavar="PATH", help="also write the per-request and overall numbers as JSON")
+    g = ap.add_argument_group("timing model and gate (defaults: the repo's TP1 measurements, see the module doc)")
+    g.add_argument("--verify-ms-base", type=float, default=VERIFY_MS_BASE,
+                   help="verify forward, fixed part, ms (default %.1f)" % VERIFY_MS_BASE)
+    g.add_argument("--verify-ms-per-row", type=float, default=VERIFY_MS_PER_ROW,
+                   help="verify forward, ms per row in the window (default %.1f)" % VERIFY_MS_PER_ROW)
+    g.add_argument("--drafter-ms", type=float, default=DRAFTER_MS,
+                   help="DFlash drafter forward + glue per round, ms (default %.1f: a k=7 round is then 39.8)" % DRAFTER_MS)
+    g.add_argument("--inject-ms-per-row", type=float, default=INJECT_MS_PER_ROW,
+                   help="hybrid only: drafter feature injection per token an n-gram round committed, ms (default %.4f)" % INJECT_MS_PER_ROW)
+    g.add_argument("--min-gain", type=float, default=MIN_GAIN,
+                   help="BUILD needs the best hybrid this much faster than DFlash alone, as a fraction (default %.2f)" % MIN_GAIN)
+    g.add_argument("--min-requests", type=int, default=MIN_REQUESTS,
+                   help="... on at least this many requests (default %d); fewer: NOT ENOUGH DATA" % MIN_REQUESTS)
+    g.add_argument("--gate-min-gen", type=int, default=GATE_MIN_GEN,
+                   help="... of at least this many generated tokens (default %d)" % GATE_MIN_GEN)
     ap.add_argument("--selftest", action="store_true", help="run on a synthetic log and exit")
     ap.add_argument("--write-example", metavar="PATH", help="write the small synthetic example log and exit")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     args = ap.parse_args(argv)
 
     if args.selftest:

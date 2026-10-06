@@ -88,9 +88,76 @@ A super-chunk (`RunChunk` with T = 256, only reachable from `Prefill`) is layer-
 | embedding gather, rmsnorms, fused residual+norm, residual add, silu_mul (trellis producer), split_qg, qk-norm, rope, KV write, gate-mul | one launch over 256 rows | one workgroup / block per row (or element-wise), the launch shape does not enter a row's arithmetic; the trellis input transforms (`r4dx_trellis_input_bf16`, the fused producers) are one wave per (row, 128-block) |
 | trellis linears (qkv, z, out, gate_up, down, qg, k, v, o) | `ApplyLinear(M = 256)`: one `r4d_gemm_trellis_nt_m256` launch where `PlanTrellisM256` has an exact configuration, else four 64-row launches as today | the M = 256 kernel reproduces the shipped M = 64 row's (SK, SKG) summation bit for bit (below); the plan reads that row from `PickTuning` at M = 64 |
 | gdn in_proj_a / in_proj_b (bf16 GEMM, M <= 64) | four 64-row launches | exactly the launches of four chunks |
-| gdn conv prep, kkt solve, chunk scan (+ the state commit), gated norm | once per 64-row sub-slice, in order (`GdnLayerParams::seq_slice = 64`) | each sub-slice is the call a 64-row chunk makes: `has_init` true after the first, conv history and the fp32 state handed on through the slot |
+| gdn conv prep, kkt solve, chunk scan (+ the state commit), gated norm | one call each over 256 rows (`seq_slice = 0`, the default; chunk 64 inside the kernels); `R4DX_GDN_SLICE=64` restores one call per 64-row sub-slice | see "GDN sequence ops" below: the only state between chunks is the scan's fp32 state, exact whether it stays in registers or goes through the slot, and a chunk's conv halo is the same x shorts whether read from x or from the conv cache |
 | attention core | once per 64-row sub-slice (`attn_slice = 64`), q_len 64, `seqused_k[j] = pos + 64 (j + 1)` from a per-slice device array | each is the exact-wide (or split / dense, per `R4DX_PREFILL_SPLITKV`) launch a 64-row chunk makes; the KV write covers all 256 rows first and the causal mask hides later sub-slices' keys from earlier ones |
 | lm_head / logits | last row only, from `cur + (T - 1) * hidden` | as today |
+
+### GDN sequence ops (branch gdn256, 2026-10-06; GPU validation and measurements PENDING)
+
+Until this change a super-chunk ran the four GDN sequence ops as four 64-row sub-slices. At 8k they were
+19.2% of `gpu_sum` under `--profile-prefill` (conv prep 7.3, kkt 4.6, scan 4.2, gated norm 3.1), and the
+launch count did not shrink with M = 256. They now run once per super-chunk (`GdnLayerParams::seq_slice = 0`,
+`cu = {0, 256}`), with no kernel change. The bytes are the same for these reasons (the libr4d units build
+with `-ffp-contract=off` and no fast-math, so the same expression rounds the same way whatever produced its
+operands):
+
+* conv prep: each 64-token chunk is its own workgroup, and the gate cumsum is local to the chunk. A chunk
+  with t0 > 0 reads its 3 halo tokens from x. A sliced call reads them from the conv cache, which holds the
+  raw bf16 shorts of the same x rows. Only the t0 == 0 workgroup reads and rewrites the cache, from rows
+  253..255, which are the bytes the last sub-slice wrote.
+* kkt solve: one workgroup per (chunk, k head), with no state between chunks. `A_buf` is sized T x H x 64.
+* chunk scan: the kernel loops over the chunks. Between chunks the fp32 state stays in registers. A sliced
+  call stores it as fp32, copies it into the slot and reloads it as fp32, which is exact. The bf16 copy
+  `SWRITE` derives from the state and the chunk body are the same code either way.
+* gated norm: one wave per (token, head) row.
+
+The launches per super-chunk drop from 16 + 4 memcpys to 4 + 1. kkt runs 64 live workgroups instead of 16.
+
+conv prep was costly because it is latency-bound, not bandwidth-bound. A 64-row call is only 10 live
+workgroups (80 waves on 64 CUs). Each wave walks all 64 tokens with one dependent 8-byte load per token. The
+y == 0 workgroups also do all 48 heads' gating before their own conv. `r4d_gdn_conv_prep2_w4_h128_bf16`
+(the same arguments, `core::r4d::GdnConvPrep2`) changes only who computes what:
+
+* the conv is blocked by 16 tokens, and the block is narrowed until there are at least 256 conv workgroups;
+* the gating runs on grid rows of its own, one wave per (64-token chunk, head);
+* a block's 16 x rows are loaded before the first is used.
+
+Every arithmetic line, operand order and lane mapping is copied from v1. That covers the conv sum, the bf16
+round before the norm, the 4-dims-per-lane l2norm and its xor 16..1 butterfly, and the 2-tokens-per-lane gate
+scan with `pre = p - (g0 + g1)`. It compiles to 98 VGPRs with no scratch. It serves every prefill call,
+64-row chunks too.
+
+Kill switches (read once per process, `prefill_chunk.h`, logged at load):
+
+| variable | default | old path |
+|---|---|---|
+| `R4DX_GDN_SLICE` | unset / `0` / `256`: one call per super-chunk | `64`: four 64-row sub-slices (anything else warns and uses 64) |
+| `R4DX_GDN_CONV` | unset / `2`: `r4d_gdn_conv_prep2` | `1`: `r4d_gdn_conv_prep` (anything else warns and uses 1) |
+
+`R4DX_PREFILL_CHUNK=0` still restores the whole 64-row path.
+
+Not changed, because the bits would move:
+* the chunk size of 64 and the per-chunk cumsum;
+* kkt's fp32 diagonal substitution (WMMA takes bf16 operands);
+* the truncating bf16 packs;
+* the order of any reduction;
+* fusing the gated norm into the scan (a workgroup owns only half of each row);
+* `in_proj_a` / `in_proj_b`, which stay 64-row launches.
+
+kkt and the scan already run on WMMA. conv prep and the gated norm have no matrix product to put on it.
+
+Validation, not run here (GPU runs need approval):
+* `tests/model/test_gdn_seq256_identity` checks the one-call path against the 4 x 64 path, and conv v1
+  against v2, byte for byte. Part A is synthetic at the real shape and needs no data: fresh and `has_init`
+  calls of 256, 320, 200, 17, 2 and 64 rows, plus a random initial state. Part B runs `GdnLayer::Forward` on
+  the 4-layer container.
+* `test_prefill_chunk_identity`, run with defaults and again with `R4DX_GDN_SLICE=64 R4DX_GDN_CONV=1`.
+* `tools/prefill/gdn256_check.ps1` (device 1) runs both tests, `test_gdn_layer`, `test_gdn_chunk_scan`,
+  greedy 8k / 32k text hashes across the new path, the old 256 path and the 64-row path, and
+  `--profile-prefill` at 8k both ways.
+
+Gate the change on the unprofiled `[stats]` TTFT A/B, not on the profile shares. 3.1% for a roughly 4 µs
+gated norm means the span overhead inflates all four rows. Measurements: PENDING.
 
 Memory: with the flag on (and a Model that can run it) the activation buffers, the position array and the
 seqused array are sized for 256 rows and the arena is 224 MiB instead of 96 MiB (the widest layer, the mlp,

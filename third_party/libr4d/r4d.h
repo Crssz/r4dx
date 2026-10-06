@@ -187,6 +187,18 @@ int r4d_gdn_conv_prep_w4_h128_bf16(
         const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
         void* stream);
 
+// r4d_gdn_conv_prep_w4_h128_bf16's outputs bit for bit (q/k/v, g, beta and the conv-state cache), same
+// arguments, on a grid that fills the device: the conv is blocked by 16 tokens rather than by the 64-token
+// chunk, the gating runs on grid rows of its own (one wave per chunk and head), and every x row a block
+// reads is loaded before the first is used. Every arithmetic expression and lane mapping is v1's.
+int r4d_gdn_conv_prep2_w4_h128_bf16(
+        const void* x, int64_t xpitch, const void* wgt, const void* bias, void* cstate,
+        int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, const void* cache_idx, int64_t ci_stride,
+        const void* has_init, const void* a, const void* b, int64_t ab_stride, int ab_is_bf16,
+        const void* A_log, const void* dt_bias, void* q, void* k, void* v, void* g, void* beta,
+        const void* cu, int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr,
+        void* stream);
+
 // The same convolution for a decode step: the tokens are a speculative window, the state cache is
 // a rolling buffer of width-1 + num_spec entries read at the slot the last ACCEPTED token left,
 // and q / k / v are written straight into their own layouts. Replaces causal_conv1d_update and

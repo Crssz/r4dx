@@ -574,13 +574,22 @@ Model Model::Load(const ModelOptions& opts) {
                                          : std::string("default");
     if (m.wide_rows_ > 0) {
       std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkWide << " rows (" << source
-                << "; R4DX_PREFILL_CHUNK=0 restores 64-row chunks)\n";
+                << "; R4DX_PREFILL_CHUNK=0 restores 64-row chunks), GDN sequence ops "
+                << (GdnSliceRequest() == kPrefillChunkBase
+                        ? "in 64-row sub-slices (R4DX_GDN_SLICE=64)"
+                        : "once per super-chunk (R4DX_GDN_SLICE=64 restores 64-row sub-slices)")
+                << "\n";
     } else if (chunk_why != nullptr) {
       std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkBase << " rows (" << source
                 << " asked for " << kPrefillChunkWide << ", not used: " << chunk_why << ")\n";
     } else {
       std::cerr << "[r4dx::model::Model] prefill chunk: " << kPrefillChunkBase << " rows (" << source << ")\n";
     }
+    std::cerr << "[r4dx::model::Model] GDN conv prep: "
+              << (GdnConvRequest() == kGdnConvV1
+                      ? "r4d_gdn_conv_prep (R4DX_GDN_CONV=1)"
+                      : "r4d_gdn_conv_prep2 (R4DX_GDN_CONV=1 restores r4d_gdn_conv_prep)")
+              << "\n";
   }
 
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
@@ -817,8 +826,10 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // A 256-row prefill super-chunk (docs/trellis-m256.md): only Prefill() creates one, after deciding
   // that this Model and call may (PrefillRowsForCall). Layer-major over all 256 rows: the trellis
   // linears see 256 rows (the M = 256 GEMM where the (class, KB) has an exact configuration),
-  // everything sequence-dependent -- the GDN conv / scan, the attention core -- runs in 64-row
-  // sub-slices in order, so the result is what four consecutive 64-row chunks give, bit for bit.
+  // the attention core runs in 64-row sub-slices in order, and the GDN sequence ops (conv prep, kkt,
+  // scan, gated norm) run once over the 256 rows with chunk 64 inside the kernels (or per 64-row
+  // sub-slice under R4DX_GDN_SLICE=64), so the result is what four consecutive 64-row chunks give, bit
+  // for bit.
   const bool wide = is_prefill_path && prefill_wide_active_ > 0 && T == prefill_wide_active_;
   if (T < 1 || (T > max_chunk_ && !wide)) {
     throw std::runtime_error("Model::RunChunk: token_ids.size() must be in [1, " +
@@ -970,7 +981,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                             ? mtp_num_accepted_dev_.data()
                             : nullptr;
       p.out_had_signs = had.gdn_out;
-      p.seq_slice = wide ? max_chunk_ : 0;
+      // A super-chunk's GDN sequence ops run once over its 256 rows, or in 64-row sub-slices under
+      // R4DX_GDN_SLICE=64 (prefill_chunk.h); the same bytes either way.
+      p.seq_slice = (wide && GdnSliceRequest() == kPrefillChunkBase) ? max_chunk_ : 0;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
@@ -1923,7 +1936,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         p.is_prefill = true;
         p.has_init = has_init;
         p.out_had_signs = had.gdn_out;
-        p.seq_slice = wide ? max_chunk_ : 0;
+        p.seq_slice = (wide && GdnSliceRequest() == kPrefillChunkBase) ? max_chunk_ : 0;  // as RunChunk
         layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                       cur, T, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
                       normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
@@ -2668,6 +2681,9 @@ void Model::TpWarmup() {
     }
   }
   gdn_control_.Prewarm(max_chunk_, slot, window);
+  // A wide Model's super-chunk runs its GDN sequence ops as one 256-row call (cu = {0, 256}) unless
+  // R4DX_GDN_SLICE=64; that key must exist before Freeze() too.
+  if (wide_rows_ > 0) (void)gdn_control_.CuPair(wide_rows_);
   // The real paths once, through the public methods (2.9 step 9): a full 64-row prefill chunk (the
   // channel-1 all-reduce size) and a greedy decode step (channel 0). Fixed ids 0..63: the warm-up
   // is a lockstep collective, so every rank must feed the same tokens.

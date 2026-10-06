@@ -283,6 +283,268 @@ extern "C" int r4d_gdn_conv_prep_w4_h128_bf16(
 }
 
 // ---------------------------------------------------------------------------------------------
+// PREFILL v2 (r4d_gdn_conv_prep2): the same outputs as r4d_gdn_conv_prep above, bit for bit, on a
+// grid that fills the device.
+//
+// Why v1 is slow (docs/trellis-m256.md, "GDN sequence ops"): its workgroup is a whole 64-token chunk
+// times HPB heads, so a 64-row call is 10 live workgroups (80 waves) on a 64-CU part, each wave walks
+// 64 tokens with one dependent 8-byte load per token and nothing else resident to hide it, and the
+// y == 0 workgroups do the gating for all H heads, serially, before their own conv loop starts. It
+// costs about 20x its bandwidth time.
+//
+// What changes here is only who computes what:
+//   * the conv is blocked by CP2_CT = 16 tokens rather than by the chunk (the conv has no per-chunk
+//     state -- only the cumsum does), so a 256-row call is 16x more conv workgroups than chunks;
+//   * the gating runs on its own grid rows (y >= conv_y), one wave per (64-token chunk, v head),
+//     with the chunk resolved exactly as v1 resolves it;
+//   * every x row a block needs is loaded before the first is used.
+// What does not change is every arithmetic expression, its operand order and its lane mapping: the
+// conv sum, the silu, the bf16 round before the norm, the 4-dims-per-lane l2norm with its xor-16..1
+// butterfly, the gate formula, the 2-tokens-per-lane wave scan and its `pre = p - (g0 + g1)`. The
+// unit is built with -ffp-contract=off and without fast-math (third_party/CMakeLists.txt), so the
+// same expression on the same operands rounds the same way in either kernel. The halo a block with
+// t0 > 0 reads from x is the same bf16 shorts v1 (t0 a multiple of 64) or the conv-state cache (a
+// later call of a sliced prefill) holds for those tokens; only the t0 == 0 block reads and rewrites
+// the cache, as in v1, so the in-place update stays inside one workgroup.
+// ---------------------------------------------------------------------------------------------
+#define CP2_CT 16               // conv tokens per workgroup
+
+template <int HPB, int ABF16>
+__global__ __launch_bounds__(HPB * 32)
+void r4d_gdn_conv_prep2_kernel(const unsigned short* __restrict__ x, int64_t xpitch,
+                               const unsigned short* __restrict__ wgt,
+                               const unsigned short* __restrict__ bias,
+                               unsigned short* __restrict__ cstate,
+                               int64_t cs_seq, int64_t cs_dim, int64_t cs_tok,
+                               const int* __restrict__ cache_idx, int64_t ci_stride,
+                               const unsigned char* __restrict__ has_init,
+                               const void* __restrict__ av, const void* __restrict__ bv,
+                               int64_t ab_stride,
+                               const float* __restrict__ A_log, const float* __restrict__ dt_bias,
+                               unsigned short* __restrict__ q, unsigned short* __restrict__ k,
+                               unsigned short* __restrict__ v,
+                               float* __restrict__ go, float* __restrict__ beta,
+                               const int* __restrict__ cu, int N, int H, int Hg, float sp_thr,
+                               int conv_y)
+{
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+
+  // ---- the gating half: one wave per (64-token chunk, v head) -------------------------------
+  if ((int)blockIdx.y >= conv_y) {
+    int n = -1, t0 = 0, bos = 0, rows = 0;
+    {
+      int acc = 0, want = blockIdx.x;
+      for (int i = 0; i < N; ++i) {
+        const int b = cu[i], e = cu[i + 1];
+        const int nc = (e - b + CP_BT - 1) / CP_BT;
+        if (want < acc + nc) { n = i; bos = b; t0 = (want - acc) * CP_BT;
+                               rows = min(CP_BT, (e - b) - t0); break; }
+        acc += nc;
+      }
+      if (n < 0) return;
+    }
+    const int hv = ((int)blockIdx.y - conv_y) * HPB + warp;
+    if (hv >= H) return;                           // wave-uniform
+    // verbatim from r4d_gdn_conv_prep_kernel's gating loop body
+    const float alog = __expf(A_log[hv]), dtb = dt_bias[hv];
+    const int i0 = 2 * lane, i1 = i0 + 1;
+    float g0 = 0.0f, g1 = 0.0f;
+    if (i0 < rows)
+      g0 = -alog * cp_softplus(cp_ab<ABF16>(av, (size_t)(bos + t0 + i0) * ab_stride + hv)
+                               + dtb, sp_thr);
+    if (i1 < rows)
+      g1 = -alog * cp_softplus(cp_ab<ABF16>(av, (size_t)(bos + t0 + i1) * ab_stride + hv)
+                               + dtb, sp_thr);
+    float p = g0 + g1;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      const float o = __shfl_up(p, d, 32);
+      if (lane >= d) p += o;
+    }
+    const float pre = p - (g0 + g1);
+    if (i0 < rows) {
+      go[(size_t)(bos + t0 + i0) * H + hv] = pre + g0;
+      beta[(size_t)(bos + t0 + i0) * H + hv] = 1.0f / (1.0f + __expf(
+          -cp_ab<ABF16>(bv, (size_t)(bos + t0 + i0) * ab_stride + hv)));
+    }
+    if (i1 < rows) {
+      go[(size_t)(bos + t0 + i1) * H + hv] = pre + g0 + g1;
+      beta[(size_t)(bos + t0 + i1) * H + hv] = 1.0f / (1.0f + __expf(
+          -cp_ab<ABF16>(bv, (size_t)(bos + t0 + i1) * ab_stride + hv)));
+    }
+    return;
+  }
+
+  // ---- the convolution half: CP2_CT tokens x HPB heads per workgroup ------------------------
+  int n = -1, t0 = 0, bos = 0, rows = 0, slen = 0;
+  {
+    int acc = 0, want = blockIdx.x;
+    for (int i = 0; i < N; ++i) {
+      const int b = cu[i], e = cu[i + 1];
+      const int nc = (e - b + CP2_CT - 1) / CP2_CT;
+      if (want < acc + nc) { n = i; bos = b; slen = e - b; t0 = (want - acc) * CP2_CT;
+                             rows = min(CP2_CT, slen - t0); break; }
+      acc += nc;
+    }
+    if (n < 0) return;
+  }
+  const bool first = (t0 == 0);
+
+  const int unit = blockIdx.y * HPB + warp;       // global 128-dim head unit
+  const int d0 = unit * CP_HD + lane * CP_DPL;    // this lane's first channel
+  const unsigned short* xp = x + (size_t)(bos + t0) * xpitch + d0;
+
+  // This block's tokens, all issued up front (rows past the end re-read the last one; nothing
+  // computed from them is stored).
+  ushort4 xb[CP2_CT];
+#pragma unroll
+  for (int t = 0; t < CP2_CT; ++t)
+    xb[t] = *(const ushort4*)(xp + (size_t)min(t, rows - 1) * xpitch);
+
+  float wt[CP_W][CP_DPL], bs[CP_DPL];
+#pragma unroll
+  for (int c = 0; c < CP_DPL; ++c) {
+    if (WVEC && CP_W == 4) {
+      const ushort4 w4 = *(const ushort4*)(wgt + (size_t)(d0 + c) * CP_W);
+      const unsigned short* ws = (const unsigned short*)&w4;
+#pragma unroll
+      for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(ws[i]);
+    } else {
+#pragma unroll
+      for (int i = 0; i < CP_W; ++i) wt[i][c] = bf2f(wgt[(size_t)(d0 + c) * CP_W + i]);
+    }
+    bs[c] = bias ? bf2f(bias[d0 + c]) : 0.0f;
+  }
+
+  // window[i] holds x[t - (W-1) + i]; seed it from the previous tokens, or from the conv state
+  // cache when this is the first block of the sequence
+  float win[CP_W][CP_DPL];
+  {
+    const bool init = first && has_init && has_init[n];
+    const unsigned short* sp = init ? (cstate + (size_t)cache_idx[(size_t)n * ci_stride] * cs_seq
+                                       + (size_t)d0 * cs_dim) : nullptr;
+#pragma unroll
+    for (int i = 0; i < CP_ST; ++i) {              // i = 0,1,2  ->  x[t0-3+i]
+      const int src = t0 - CP_ST + i;
+      if (src >= 0) {
+        const ushort4 raw = *(const ushort4*)(x + (size_t)(bos + src) * xpitch + d0);
+        win[i][0] = bf2f(raw.x); win[i][1] = bf2f(raw.y);
+        win[i][2] = bf2f(raw.z); win[i][3] = bf2f(raw.w);
+      } else {
+#pragma unroll
+        for (int c = 0; c < CP_DPL; ++c)
+          win[i][c] = init ? bf2f(sp[(size_t)c * cs_dim + (size_t)(CP_ST + src) * cs_tok]) : 0.0f;
+      }
+    }
+  }
+
+  // ---- write the new conv state, from x, at the sequence's first block ---------------------
+  // verbatim from v1: the read above and this write are the same workgroup and the same channels
+  if (first && cache_idx) {
+    unsigned short* sp = cstate + (size_t)cache_idx[(size_t)n * ci_stride] * cs_seq
+                       + (size_t)d0 * cs_dim;
+    const bool init = has_init && has_init[n];
+#pragma unroll
+    for (int c = 0; c < CP_DPL; ++c) {
+#pragma unroll
+      for (int i = 0; i < CP_ST; ++i) {
+        const int src = slen - CP_ST + i;
+        unsigned short val = 0;
+        if (src >= 0) val = x[(size_t)(bos + src) * xpitch + d0 + c];
+        else if (init) val = sp[(size_t)c * cs_dim + (size_t)(CP_ST + src) * cs_tok];
+        sp[(size_t)c * cs_dim + (size_t)i * cs_tok] = val;
+      }
+    }
+  }
+
+  const int hq = unit, hk = unit - Hg, hv = unit - 2 * Hg;
+  const int region = (unit < Hg) ? 0 : ((unit < 2 * Hg) ? 1 : 2);
+
+#pragma unroll
+  for (int t = 0; t < CP2_CT; ++t) {
+    if (t < rows) {                                // wave-uniform
+      float o[CP_DPL];
+      {
+        const ushort4 raw = xb[t];
+        win[CP_W - 1][0] = bf2f(raw.x); win[CP_W - 1][1] = bf2f(raw.y);
+        win[CP_W - 1][2] = bf2f(raw.z); win[CP_W - 1][3] = bf2f(raw.w);
+      }
+#pragma unroll
+      for (int c = 0; c < CP_DPL; ++c) {
+        float acc = bs[c];
+#pragma unroll
+        for (int i = 0; i < CP_W; ++i) acc += wt[i][c] * win[i][c];
+        o[c] = bf2f(f2bf(cp_silu(acc)));
+      }
+
+      if (region < 2) {
+        float ss = 0.0f;
+#pragma unroll
+        for (int c = 0; c < CP_DPL; ++c) ss += o[c] * o[c];
+#pragma unroll
+        for (int d = 16; d; d >>= 1) ss += __shfl_xor(ss, d, 32);
+        const float inv = 1.0f / sqrtf(ss + 1e-6f);
+        unsigned short* dst = (region ? k : q)
+                            + ((size_t)(bos + t0 + t) * Hg + (region ? hk : hq)) * CP_HD
+                            + lane * CP_DPL;
+        *(ushort4*)dst = make_ushort4(f2bf(o[0] * inv), f2bf(o[1] * inv),
+                                      f2bf(o[2] * inv), f2bf(o[3] * inv));
+      } else {
+        unsigned short* dst = v + ((size_t)(bos + t0 + t) * H + hv) * CP_HD + lane * CP_DPL;
+        *(ushort4*)dst = make_ushort4(f2bf(o[0]), f2bf(o[1]), f2bf(o[2]), f2bf(o[3]));
+      }
+
+#pragma unroll
+      for (int i = 0; i < CP_W - 1; ++i)
+#pragma unroll
+        for (int c = 0; c < CP_DPL; ++c) win[i][c] = win[i + 1][c];
+    }
+  }
+}
+
+extern "C" int r4d_gdn_conv_prep2_w4_h128_bf16(
+    const void* x, int64_t xpitch, const void* wgt, const void* bias, void* cstate,
+    int64_t cs_seq, int64_t cs_dim, int64_t cs_tok, const void* cache_idx, int64_t ci_stride,
+    const void* has_init,
+    const void* a, const void* b, int64_t ab_stride, int ab_is_bf16, const void* A_log,
+    const void* dt_bias, void* q, void* k, void* v, void* g, void* beta, const void* cu,
+    int N, int T, int H, int Hg, int K, int V, int width, float softplus_thr, void* stream)
+{
+  if (K != CP_HD || V != CP_HD || width != CP_W) return -1;
+  const int units = 2 * Hg + H;
+  int hpb = 8;
+  while (hpb > 1 && (Hg % hpb || H % hpb)) hpb >>= 1;
+  // Narrow the block until the conv alone covers the device a few times over (the grid shape
+  // changes no bits: every wave's work is a function of its own (block, unit) only).
+  const int nblk = (T + CP2_CT - 1) / CP2_CT;
+  while (hpb > 1 && (int64_t)nblk * (units / hpb) < 256) hpb >>= 1;
+  const int conv_y = units / hpb, gate_y = (H + hpb - 1) / hpb;
+  // x is an upper bound on the conv block count (and so on the 64-token chunk count); the extra
+  // workgroups find no (sequence, block) and return
+  dim3 grid(nblk + N, conv_y + gate_y), blk(hpb * 32);
+#define CP2_LAUNCH(P, AB)                                                                     \
+  hipLaunchKernelGGL((r4d_gdn_conv_prep2_kernel<P, AB>), grid, blk, 0, (hipStream_t)stream,    \
+                     (const unsigned short*)x, xpitch, (const unsigned short*)wgt,            \
+                     (const unsigned short*)bias, (unsigned short*)cstate,                    \
+                     cs_seq, cs_dim, cs_tok, (const int*)cache_idx, ci_stride,                \
+                     (const unsigned char*)has_init, a, b, ab_stride,                         \
+                     (const float*)A_log, (const float*)dt_bias, (unsigned short*)q,          \
+                     (unsigned short*)k, (unsigned short*)v, (float*)g, (float*)beta,         \
+                     (const int*)cu, N, H, Hg, softplus_thr, conv_y)
+#define CP2_SWITCH(AB)                                                                        \
+  switch (hpb) {                                                                              \
+    case 8: CP2_LAUNCH(8, AB); break;                                                         \
+    case 4: CP2_LAUNCH(4, AB); break;                                                         \
+    case 2: CP2_LAUNCH(2, AB); break;                                                         \
+    default: CP2_LAUNCH(1, AB); break;                                                        \
+  }
+  if (ab_is_bf16) { CP2_SWITCH(1); } else { CP2_SWITCH(0); }
+#undef CP2_SWITCH
+#undef CP2_LAUNCH
+  return (int)hipGetLastError();
+}
+
+// ---------------------------------------------------------------------------------------------
 // The decode-time convolution. Same depthwise causal filter, but the tokens of a step are a
 // speculative window rather than a chunk, and the state cache is a rolling buffer of
 // width-1 + num_spec entries rather than width-1: a step reads its window starting at the slot

@@ -50,14 +50,20 @@ struct GdnLayerParams {
   // because that container's gdn.out_proj was folded W Hb. nullptr (the default) is exactly the
   // pre-quant2 path; only Model's backbone loops ever set it.
   const float* out_had_signs = nullptr;
-  // prefill only: 0 (the default, and every caller before the 256-row prefill chunk) runs conv prep,
-  // kkt solve, chunk scan and the gated norm on all T rows in one call each. 64: T is a multiple of 64
-  // (a 256-row prefill super-chunk, Model's R4DX_PREFILL_CHUNK=256) and those four run once per 64-row
+  // prefill only: 0 (the default; Model's 256-row super-chunk unless R4DX_GDN_SLICE=64) runs conv prep,
+  // kkt solve, chunk scan + state commit and the gated norm on all T rows in one call each -- the kernels
+  // walk 64-row chunks inside, the fp32 recurrent state stays in registers from one chunk to the next and
+  // a chunk's conv halo is read from x. 64: T is a multiple of 64 and those four run once per 64-row
   // sub-slice, in order, each as the call a 64-row chunk makes (has_init true after the first slice; the
-  // fp32 recurrent state and the conv history are handed on through the state slot), while the
-  // row-independent ops (the linears, the norms, the residual) see all T rows. in_proj_a/b run as
-  // 64-row launches whatever T is. Equal to T / 64 consecutive 64-row calls, bit for bit.
+  // fp32 recurrent state and the conv history are handed on through the state slot) -- the old path,
+  // kept as R4DX_GDN_SLICE=64. Either way the row-independent ops (the linears, the norms, the residual)
+  // see all T rows, in_proj_a/b run as 64-row launches whatever T is, and the bytes equal T / 64
+  // consecutive 64-row calls (docs/trellis-m256.md "GDN sequence ops").
   int64_t seq_slice = 0;
+  // prefill only: which conv prep kernel -- 0 (the default) = the process's R4DX_GDN_CONV choice
+  // (prefill_chunk.h's GdnConvRequest: r4d_gdn_conv_prep2 unless R4DX_GDN_CONV=1), 1 = the original
+  // r4d_gdn_conv_prep, 2 = r4d_gdn_conv_prep2. Same bytes either way; tests pin it.
+  int conv_prep = 0;
 };
 
 class GdnLayer {

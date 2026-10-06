@@ -1,5 +1,5 @@
 // test_prefill_chunk: pure CPU unit test of src/model/prefill_chunk.h -- the R4DX_PREFILL_CHUNK parser (256
-// by default, "0" / "64" the kill switch), the decision of when a Model runs 256-row prefill super-chunks
+// by default, "0" / "64" the kill switch), the R4DX_GDN_SLICE / R4DX_GDN_CONV parsers, the decision of when a Model runs 256-row prefill super-chunks
 // (docs/prefill.md, docs/trellis-m256.md) and the chunk grid a Prefill call walks (tail lengths). No HIP,
 // no container. Every case the wide path does not serve falls back to 64-row chunks with a reason, never
 // an error.
@@ -48,6 +48,20 @@ int main() {
   CHECK(ParsePrefillChunk("on") == 64, "on -> 64");
   CHECK(ParsePrefillChunk("off") == 64, "off (not a spelling of the kill switch) -> 64 with a warning");
   CHECK(ParsePrefillChunk("abc") == 64, "abc -> 64");
+
+  // ---- R4DX_GDN_SLICE / R4DX_GDN_CONV (the GDN sequence ops inside a super-chunk) ----
+  CHECK(ParseGdnSlice(nullptr) == 0, "GDN slice unset -> 0 (one call per super-chunk)");
+  CHECK(ParseGdnSlice("") == 0, "GDN slice empty -> 0");
+  CHECK(ParseGdnSlice("0") == 0, "GDN slice 0 -> 0");
+  CHECK(ParseGdnSlice("256") == 0, "GDN slice 256 -> 0");
+  CHECK(ParseGdnSlice("64") == 64, "GDN slice 64 -> 64 (kill switch)");
+  CHECK(ParseGdnSlice("128") == 64, "GDN slice 128 (unsupported) -> 64");
+  CHECK(ParseGdnSlice("off") == 64, "GDN slice off -> 64 with a warning");
+  CHECK(ParseGdnConv(nullptr) == kGdnConvV2, "GDN conv unset -> 2");
+  CHECK(ParseGdnConv("") == kGdnConvV2, "GDN conv empty -> 2");
+  CHECK(ParseGdnConv("2") == kGdnConvV2, "GDN conv 2 -> 2");
+  CHECK(ParseGdnConv("1") == kGdnConvV1, "GDN conv 1 -> 1 (kill switch)");
+  CHECK(ParseGdnConv("v2") == kGdnConvV1, "GDN conv v2 (unrecognized) -> 1 with a warning");
 
   // ---- decision ----
   PrefillChunkInputs ok;  // an ordinary (not quant2) container, the default request

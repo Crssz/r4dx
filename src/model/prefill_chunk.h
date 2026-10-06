@@ -7,8 +7,9 @@
 // R4DX_PREFILL_CHUNK (read once per process, like R4DX_PREFILL_SPLITKV -- attention_layer.hpp's
 // ParsePrefillAttnMode):
 //   - unset or empty: 256 (the default). Prompt Prefill calls run 256-row super-chunks (layer-major: the
-//     trellis linears see 256 rows through libr4d's M = 256 GEMM, everything sequence-dependent runs in
-//     64-row sub-slices in order), bit-identical to the 64-row path;
+//     trellis linears see 256 rows through libr4d's M = 256 GEMM, the GDN sequence ops run once over the
+//     256 rows -- or in 64-row sub-slices under R4DX_GDN_SLICE=64 -- and attention, MTP and DFlash per
+//     64-row slice), bit-identical to the 64-row path;
 //   - "0" or "64": the kill switch -- today's 64-row chunks exactly, no wide buffers (the load-time
 //     activation buffers and arena are the 64-row sizes, so the VRAM is what it was before the default
 //     changed);
@@ -16,6 +17,18 @@
 //   - anything else: a warning on stderr, then 64 (an unreadable request is read as "keep the old path").
 // The super-chunk changes no bits, so it only applies to the shape of call it was built and validated for;
 // every other case falls back to 64-row chunks and says so once, never throws (DecidePrefillChunk below).
+//
+// Inside a super-chunk, two more switches pick how the GDN layer runs its sequence ops (conv prep, kkt
+// solve, chunk scan + state commit, gated norm; docs/trellis-m256.md "GDN sequence ops"). Both change no
+// bits, both are read once per process, and neither does anything at R4DX_PREFILL_CHUNK=0:
+//   R4DX_GDN_SLICE -- unset, empty, "0" or "256": one call each over the whole 256 rows (the default;
+//     chunk 64 inside the kernels, the fp32 state carried in registers between chunks); "64": the old
+//     path, four 64-row sub-slices in order with the state handed on through the slot; anything else: a
+//     warning, then 64.
+//   R4DX_GDN_CONV -- unset, empty or "2": r4d_gdn_conv_prep2 (the default; the same bytes on a grid that
+//     fills the device); "1": the original r4d_gdn_conv_prep; anything else: a warning, then 1. Applies
+//     to every prefill call (64-row chunks too).
+// An unreadable value keeps the old path, as R4DX_PREFILL_CHUNK does.
 #pragma once
 
 #include <cstdio>
@@ -35,6 +48,33 @@ inline int ParsePrefillChunk(const char* e) {
 }
 inline int PrefillChunkRequest() {
   static const int v = ParsePrefillChunk(std::getenv("R4DX_PREFILL_CHUNK"));
+  return v;
+}
+
+// R4DX_GDN_SLICE: 0 = one call per GDN sequence op over the whole prefill chunk (GdnLayerParams::seq_slice
+// 0), 64 = the 4 x 64 sub-slice path (seq_slice 64).
+inline int ParseGdnSlice(const char* e) {
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "0") == 0 || std::strcmp(e, "256") == 0) return 0;
+  if (std::strcmp(e, "64") == 0) return kPrefillChunkBase;
+  std::fprintf(stderr, "r4dx: R4DX_GDN_SLICE='%s' not recognized (0|64|256); using 64\n", e);
+  return kPrefillChunkBase;
+}
+inline int GdnSliceRequest() {
+  static const int v = ParseGdnSlice(std::getenv("R4DX_GDN_SLICE"));
+  return v;
+}
+
+// R4DX_GDN_CONV: 2 = r4d_gdn_conv_prep2 (the default), 1 = the original r4d_gdn_conv_prep.
+inline constexpr int kGdnConvV1 = 1;
+inline constexpr int kGdnConvV2 = 2;
+inline int ParseGdnConv(const char* e) {
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "2") == 0) return kGdnConvV2;
+  if (std::strcmp(e, "1") == 0) return kGdnConvV1;
+  std::fprintf(stderr, "r4dx: R4DX_GDN_CONV='%s' not recognized (1|2); using 1\n", e);
+  return kGdnConvV1;
+}
+inline int GdnConvRequest() {
+  static const int v = ParseGdnConv(std::getenv("R4DX_GDN_CONV"));
   return v;
 }
 

@@ -99,7 +99,7 @@ through a double-buffered LDS slot. What differs:
   barriers in the whole kernel (1 per kb in the loop). The trellis KB 4 kernel's phase D (per wave, per kb: two blocks)
   is 32 `v_mad_u32_u16` + 32 `v_pk_mad_u16` + 32 `v_sad_*` + 12 `v_alignbit_b32` (the decode, 124 VALU) + 16
   `v_pk_fma_f16` + 8 `v_perm_b32` + 2 `v_rcp_f32` + 2 `v_cvt_f16_f32` (the quantizer). A pass is 16 WMMA, then
-  16 `v_cvt_f32_i32`, 16 `v_mul_f32`, 16 `v_fmac_f32` (about 23 of the 32 mul / fmac in `v_dual_*` pairs).
+  16 `v_cvt_f32_i32`, 16 `v_mul_f32`, 16 `v_fmac_f32` (most of the mul / fmac go out as `v_dual_*` pairs).
   The probe kernels' loops are 8 independent WMMA chains and nothing else.
 
 * `test_int8_gemm_proto_emu`: the kernel source (`int8_gemm_proto_kernels.h`, unchanged by the build mode but

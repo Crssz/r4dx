@@ -247,20 +247,22 @@ Model Model::Load(const ModelOptions& opts) {
     co.shared_embed_host = tp.shared_embed_host;
     m.container_ = Container::Load(opts.container_path, co);
   }
-  const VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  VramSnap vram1 = SnapVram();  // after container weights are fully resident
   // R4DX_FAKEQ_W (docs/int8-prefill.md): the one-time pass that decodes every trellis linear and stores its
   // per-(column, k group) scale table, which the prefill GEMMs' rounding variants read. Nothing at all when
-  // the switch is unset.
+  // the switch is unset. The tables are part of the weights for the VRAM breakdown below (vram1 is taken
+  // again after them, so they are not booked as arena + scratch).
   if (const int fqw = FakeQuantWRequest(); fqw != kFakeQuantWOff) {
+    const VramSnap vram_before_fqw = vram1;
     m.container_.BuildTrellisWScales(fqw, m.stream_.get());
     m.stream_.Synchronize();
-    const VramSnap vram_fqw = SnapVram();
+    vram1 = SnapVram();
     std::cerr << "[r4dx::model::Model] R4DX_FAKEQ_W=" << FakeQuantWName(fqw)
               << ": scale tables built for every trellis linear (one scale per output column x "
               << FakeQuantWGroup(fqw) << " k), "
-              << (vram1.ok && vram_fqw.ok ? GiB(static_cast<int64_t>(vram1.free_bytes) -
-                                                static_cast<int64_t>(vram_fqw.free_bytes))
-                                          : 0.0)
+              << (vram_before_fqw.ok && vram1.ok ? GiB(static_cast<int64_t>(vram_before_fqw.free_bytes) -
+                                                       static_cast<int64_t>(vram1.free_bytes))
+                                                 : 0.0)
               << " GiB; the decoded weights are rounded to int8 and back in prompt prefill only "
                  "(accuracy experiment, not a production setting)\n";
   }
@@ -1925,7 +1927,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     const bool wide = wide_rows > max_chunk_ && T == wide_rows;
     const ScopedTrellisM256 trellis_m256_scope(wide);
     const ScopedFakeQuantAct fakeq_scope(FakeQuantActRequest());  // R4DX_FAKEQ_ACT, as RunChunk
-  const ScopedFakeQuantW fakeqw_scope(FakeQuantWRequest());     // R4DX_FAKEQ_W, as RunChunk
+    const ScopedFakeQuantW fakeqw_scope(FakeQuantWRequest());     // R4DX_FAKEQ_W, as RunChunk
     const bool has_init = started_;
 
     // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's

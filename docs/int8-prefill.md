@@ -208,7 +208,8 @@ thread-local scopes opened around the same layer loop, `Model::RunChunk` with `i
   (`r4d_trellis_k4_decode` / `k5_decode`, r4d_trellis_dq.h), one wave per (tile pair, group) with a lane xor 16
   joining the two k halves of a fragment, so the amax is taken over exactly the f16 values the WMMA sees.
   Memory at `col128`: K * N / 32 bytes per linear, about 0.8 GB for the model (weights are 16.3 GiB on a 32 GB
-  card; `col32` is 4x that, about 3.4 GB; the Load line prints the measured figure). The table is
+  card; `col32` is 4x that, about 3.4 GB; the Load line prints the measured figure, and the VRAM breakdown line
+  books it under `weights=`). The table is
   `QuantLinear::trellis_wscale`, empty when the switch is off.
 * The rounding happens IN the GEMM kernels, on the decoded fragment, before the WMMA. A decoded fragment (f0 or
   f1) is one lane's eight k of ONE column of Q, so one scale serves all eight; the lane loads its two scales
@@ -285,7 +286,8 @@ powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col32'; `$env:R4DX_FAKEQ_ACT
 powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col128'; & C:\Users\pay20\dev\r4dx-int8q\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8q\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8q\kl-chunk-wcol128; exit `$LASTEXITCODE"
 ```
 
-Check in each run's `tool.log` that stderr carries the `R4DX_FAKEQ_W=...: scale tables built` line (w2 - w5) and
+Check in each run's `tool.log` (`tool.err.log` for w5: `run_kl.ps1` splits stderr into it) that stderr carries the
+`R4DX_FAKEQ_W=...: scale tables built` line (w2 - w5) and
 `R4DX_FAKEQ_ACT=...` where set (w3, w4), and neither in w1. The one-token path runs the rounded M = 1 kernel
 4092 times per segment set and is slower than the activation runs (the K loop is several times longer; guess
 10 - 15 minutes). Compare against the unquantized one-token baseline `kl-off-pfx`:

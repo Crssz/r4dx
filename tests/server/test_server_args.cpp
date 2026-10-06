@@ -312,6 +312,35 @@ void TestRequestLogFlag() {
     CHECK(threw);
   }
   CHECK(r4dx::server::ServerUsageText("r4dx-server").find("--request-log <path>") != std::string::npos);
+
+  // --request-log-tokens: off by default (also with --request-log), a plain switch, and only legal
+  // next to --request-log, in either order.
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--request-log", "r.jsonl"};
+    auto argv = ToArgv(storage);
+    CHECK(!r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data()).request_log_tokens);
+  }
+  for (const std::vector<std::string>& tail :
+       {std::vector<std::string>{"--request-log", "r.jsonl", "--request-log-tokens", "--port", "18080"},
+        std::vector<std::string>{"--request-log-tokens", "--request-log", "r.jsonl", "--port", "18080"}}) {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx"};
+    storage.insert(storage.end(), tail.begin(), tail.end());
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.request_log_tokens && a.request_log == "r.jsonl" && a.port == 18080);  // the switch takes no value
+  }
+  {
+    std::vector<std::string> storage = {"r4dx-server", "--model", "m.r4dx", "--request-log-tokens"};
+    auto argv = ToArgv(storage);
+    bool threw = false;
+    try {
+      r4dx::server::ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+    } catch (const r4dx::server::ServerUsageError& e) {
+      threw = std::string(e.what()).find("--request-log") != std::string::npos;
+    }
+    CHECK(threw);  // --request-log-tokens without --request-log is a usage error
+  }
+  CHECK(r4dx::server::ServerUsageText("r4dx-server").find("[--request-log-tokens]") != std::string::npos);
 }
 
 // --mtp upper bound (review finding, 2026-09-20): mirrors src/cli/cli_args.h's own kMaxMtpDraftK

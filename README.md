@@ -91,7 +91,8 @@ Useful flags: `--think on|off`, `--mtp K`, `--max-ctx N`, `--tokenizer-dir <dir>
 `tokenizer.json`, `chat_template.jinja` and `generation_config.json`), `--image <path>` and
 `--tp 2` (unset `HIP_VISIBLE_DEVICES` so both cards are visible) and, for the server only,
 `--request-log <path>` (off by default: one JSON line of token counts and timings per request,
-docs/server.md "Request log"). `--help` lists everything. The full
+docs/server.md "Request log"; add `--request-log-tokens` to also record prompt and completion token ids
+for offline speculation studies, `tools/ngram/README.md`). `--help` lists everything. The full
 reference for the converter, CLI, server and tensor parallelism is in [docs/usage.md](docs/usage.md)
 and [docs/server.md](docs/server.md).
 

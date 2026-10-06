@@ -253,6 +253,8 @@ void Engine::RunRequest(PendingRequest& req) {
     rec->error_status = status;
     rec->http_status = req.stream ? 200 : status;
   };
+  // Points into *rec once a prompt is tokenized under --request-log-tokens (set below), else null.
+  RequestLogTokens* toks = nullptr;
   try {
     // The (possibly image-EXPANDED) prompt token sequence -- see the vision block below for why
     // this is int32 rather than r4dx::TokenId from the start (ExpandImagePlaceholders and every
@@ -572,6 +574,16 @@ void Engine::RunRequest(PendingRequest& req) {
                                   + std::to_string(MaxCtx()) + ")");
       return;
     }
+    // --request-log-tokens: from here on the request has a prompt the model will see. One host copy of
+    // it; the decode loops below only push ints into `toks` (null, so nothing at all, without the flag).
+    if (rec != nullptr && opts_.request_log_tokens) {
+      toks = &rec->tokens.emplace();
+      toks->prompt_ids = full_tokens_i32;
+      toks->top_p = static_cast<double>(req.sampling.top_p);
+      toks->top_k = req.sampling.top_k;
+      toks->min_p = static_cast<double>(req.sampling.min_p);
+      if (req.sampling.has_seed) toks->seed = req.sampling.seed;
+    }
 
     // DFlash2 self-speculative decode (docs/dflash2.md, docs/sampling.md section 9/10, Milestone 6
     // stage S3): runs at ANY temperature now -- mutually exclusive with MTP below (--dflash/--mtp
@@ -651,6 +663,10 @@ void Engine::RunRequest(PendingRequest& req) {
       if (reset_ms >= 0.0) rec->reset_ms = reset_ms;
       if (restore_ms >= 0.0) rec->restore_ms = restore_ms;
       rec->speculative = use_dflash ? "dflash" : (model_->MtpEnabled() ? "mtp" : "none");
+      if (toks != nullptr) {
+        if (use_dflash) toks->draft_k = opts_.model_opts.dflash_draft_k;
+        else if (model_->MtpEnabled()) toks->draft_k = opts_.model_opts.mtp_draft_k;
+      }
     }
 
     // Vision: only a span AT OR PAST the already-fed prefix boundary needs its rows spliced THIS
@@ -982,6 +998,10 @@ void Engine::RunRequest(PendingRequest& req) {
         ++dflash_rounds;
         dflash_drafted += walk_len;
         dflash_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+        if (toks != nullptr) {
+          toks->round_drafted.push_back(static_cast<int32_t>(walk_len));
+          toks->round_accepted.push_back(static_cast<int32_t>(round.size()) - 1);
+        }
         // Same "compute the commit decision up front, atomically" contract as the MTP branch below
         // -- ProcessMtpRound is speculation-family-agnostic (mtp_round.hpp's own file comment).
         const r4dx::model::MtpRoundResult outcome = r4dx::model::ProcessMtpRound(
@@ -1039,6 +1059,10 @@ void Engine::RunRequest(PendingRequest& req) {
         ++mtp_rounds;
         mtp_drafted += draft_k;
         mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
+        if (toks != nullptr) {
+          toks->round_drafted.push_back(static_cast<int32_t>(draft_k));
+          toks->round_accepted.push_back(static_cast<int32_t>(round.size()) - 1);
+        }
         // `next` (this call's own token_id argument) is now committed -- see prefix_state.h/
         // model.h's Reset() comment. ProcessMtpRound (src/model/mtp_round.hpp) computes the rest
         // of `round` that is ALSO unconditionally committed by the atomic call above, independent
@@ -1285,6 +1309,7 @@ void Engine::RunRequest(PendingRequest& req) {
       rec->draft_n_accepted = timings.draft_n_accepted;
       rec->image_n = timings.image_n;
       rec->image_ms = timings.image_ms;
+      if (toks != nullptr) toks->generated_ids = generated_tokens;
     }
 
     req.sink->OnDone(finish_reason, static_cast<int64_t>(generated_tokens.size()), timings,

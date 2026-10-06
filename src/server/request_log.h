@@ -7,7 +7,9 @@
 // PRIVACY, by construction: RequestLogRecord has no string field that could carry caller text. The
 // only strings are the request id (server generated), the endpoint name, the finish reason (one of a
 // fixed set) and the speculation mode. Message text, tool definitions and arguments, file contents,
-// prompts and completions are never stored here, so they cannot reach the file.
+// prompts and completions are never stored here, so they cannot reach the file. The one exception is
+// the opt-in RequestLogTokens (`--request-log-tokens`): token ids of the prompt and the completion,
+// which are the text in another encoding.
 //
 // Off (the default) costs nothing: Engine/HttpServer hold a null pointer and every log site is one
 // pointer test. On, Write() is one mutex-guarded fwrite + fflush per request and can never throw,
@@ -24,8 +26,34 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace r4dx::server {
+
+// `--request-log-tokens` (docs/server.md "Request log" > "Token capture"): the extra, OPT-IN content an
+// offline speculation simulator needs. Unlike the rest of the record this IS derived from caller text
+// (token ids detokenize back to it), so it exists only when the flag was given; the file is then as
+// private as the prompts themselves.
+struct RequestLogTokens {
+  // The whole prompt the model saw (chat template applied, image tokens expanded), not only the
+  // non-reused suffix. Held in full here; the writer emits only the part past `prompt_shared`.
+  std::vector<int32_t> prompt_ids;
+  // Leading tokens identical to the previous token-carrying line's prompt_ids + generated_ids.
+  // Filled by RequestLog::Write (it owns the previous line); FormatRequestLogLine emits
+  // prompt_ids[prompt_shared:]. 0 = the line carries the whole prompt.
+  size_t prompt_shared = 0;
+  std::vector<int32_t> generated_ids;  // the tokens shown to the client (an EOS is not among them)
+  // One entry per speculative verify round (empty at speculative "none"): draft tokens proposed and
+  // accepted. A round emits accepted + 1 tokens; the first generated token comes from the prefill's
+  // logits and belongs to no round.
+  std::vector<int32_t> round_drafted;
+  std::vector<int32_t> round_accepted;
+  std::optional<int64_t> draft_k;  // the per-round draft cap the server ran with (--dflash-k / --mtp)
+  std::optional<double> top_p;
+  std::optional<double> min_p;
+  std::optional<int64_t> top_k;
+  std::optional<uint64_t> seed;  // the request's own seed; unset = a fresh random one
+};
 
 // Every field is optional where a request can end before it is known (a 429 never reaches the
 // engine; a 400 can fail before the prompt is tokenized): an unset optional is written as JSON null,
@@ -88,6 +116,10 @@ struct RequestLogRecord {
   // timings.image_n / image_ms: images this request encoded itself (reused ones are not counted).
   std::optional<int64_t> image_n;
   std::optional<double> image_ms;
+
+  // Set only under --request-log-tokens, only for a request that got as far as a tokenized prompt.
+  // Its keys are appended after the fixed ones above, so a line without it is unchanged.
+  std::optional<RequestLogTokens> tokens;
 };
 
 // One JSON object on one line, no trailing newline. Field order is fixed (see docs/server.md).
@@ -129,6 +161,9 @@ class RequestLog {
   std::string path_;
   std::atomic<int64_t> lines_written_{0};
   std::atomic<int64_t> write_failures_{0};
+  // prompt_ids + generated_ids of the last token-carrying line written OK (empty = none, or its write
+  // failed): what the next token-carrying line's prompt_shared is measured against. Guarded by mu_.
+  std::vector<int32_t> last_tokens_;
 };
 
 }  // namespace r4dx::server

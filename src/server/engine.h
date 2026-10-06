@@ -86,6 +86,10 @@ struct EngineOptions {
   // else runs. Shared with HttpServer (via Engine::GetRequestLog) for the requests it rejects before
   // they reach the worker; RequestLog::Write is thread-safe.
   std::shared_ptr<RequestLog> request_log;
+  // `--request-log-tokens` (docs/server.md "Request log" > "Token capture"): with request_log set, also
+  // record each request's prompt/generated token ids and per-round speculative acceptance. False (the
+  // default) = none of it is collected: the decode loops see a null pointer. Ignored without request_log.
+  bool request_log_tokens = false;
 };
 
 enum class RequestKind { kChat, kCompletion };

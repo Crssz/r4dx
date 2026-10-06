@@ -28,7 +28,8 @@ the speedup instead of assuming it.
 | `int8_gemm_proto_ref.h` | the layouts, the quantizer definitions and the CPU references (header-only, hipcc and plain C++) |
 | `int8_gemm_proto_kernels.h` | the device code: `i8g_kernel` (dense and trellis int8 GEMM), the activation producer `i8g_quant_act`, the scale-table builder `i8g_wscale`, the int8 matrix dump `i8g_dump_w`, the exact reference `i8g_ref_cols`, the host launch / legality |
 | `tool_int8_gemm_proto.hip` | the bench: `probe`, `selftest`, `verify`, `time` |
-| `test_int8_gemm_proto_cpu.cpp` | ctest `test_int8_gemm_proto_cpu`, pure CPU, 0.3 s |
+| `test_int8_gemm_proto_cpu.cpp` | ctest `test_int8_gemm_proto_cpu`, pure CPU, 0.4 s: layouts, quantizers, a software-WMMA emulation of the fragment chain |
+| `i8g_host_emu.h`, `test_int8_gemm_proto_emu.cpp` | ctest `test_int8_gemm_proto_emu`, pure CPU, 45 s: the kernel SOURCE itself compiled as plain C++ (`I8G_EMU`) and run with one OS thread per GPU thread against exact references |
 | `build_int8_gemm_proto.ps1` | hipcc build (no CMake target, like `build_m256_bench.ps1`), `-Isa` prints every kernel's VGPRs, scratch and instruction counts |
 
 No libr4d unit, no `src/` file and no CMake target other than the CPU test was touched: the shipped kernels and
@@ -101,9 +102,26 @@ through a double-buffered LDS slot. What differs:
   16 `v_cvt_f32_i32`, 16 `v_mul_f32`, 16 `v_fmac_f32` (about 23 of the 32 mul / fmac in `v_dual_*` pairs).
   The probe kernels' loops are 8 independent WMMA chains and nothing else.
 
-What the CPU session could NOT check: that the device code does what the emulation says (the selftest below
-does, on the GPU, against CPU references: it is the first thing to run), and every number in a time column.
+* `test_int8_gemm_proto_emu`: the kernel source (`int8_gemm_proto_kernels.h`, unchanged by the build mode but
+  for a handful of `#ifdef I8G_EMU` helper definitions) compiled for the CPU with `i8g_host_emu.h`: one OS thread
+  per GPU thread, workgroup and wave barriers, per-workgroup shared memory, a software iu8 WMMA (the layout
+  this file defines), cross-lane fetches for the FWHT, atomics for the ticket, workgroups running concurrently,
+  and a deterministic STUB in place of the trellis decode (a hash of the lane's words to eight f16 values; the
+  real decode is shipped and tested). 8 checks, 72 kernel runs, 45 s: `i8g_quant_act`, `i8g_wscale` and
+  `i8g_dump_w` (KB 4 and 5) byte for byte against the CPU quantizers; every instantiation of `i8g_kernel` (36:
+  dense with the FWHT epilogue and plain, trellis KB 4 / 5, RESC 0..3, SKW 2 / 4 / 8) for every legal (skw, skg)
+  on K = 1024, N = 128 against the exact fp64 reference with the epilogue applied in fp64, the tickets back at
+  zero, and the trellis kernel byte-identical to the dense kernel on the same int8 weights. This executes the
+  loop, the LDS staging and its double buffering, the two-block decode ownership, the K slicing, the reduction
+  through LDS, the `ws` partials, the ticket protocol and the FWHT epilogue as written. It caught one bug
+  while the file was written (the coarse variants used the slice's first block instead of block 0 of the whole
+  K); the emulation's own first run failed on a CPU-side clang quirk (`__builtin_bit_cast` of one element of an f16
+  vector reads element 0, the comment in `r4d_trellis_dq.h`), which the device code avoids by whole-vector casts.
 
+What the CPU session could NOT check: the hardware-specific parts (the iu8 WMMA's behaviour on the part, `v_pk_fma_f16`,
+`v_perm_b32`, DPP, LDS timing: the device bench's selftest, which repeats the CPU checks against the GPU kernels
+and is the first thing to run), the real trellis decode inside the kernel (the shipped decode, called exactly as the
+shipped kernel calls it), and every number in a time column.
 ## How to run (device 1, machine otherwise idle; outputs under `E:\models\r4dx\int8gemm\`)
 
 The exe is built (CPU only) at `E:\models\r4dx\int8gemm\obj\tool_int8_gemm_proto.exe`. To rebuild:
@@ -227,9 +245,9 @@ x____), KB 4 and KB 5.
 
 ## Not done / caveats
 
-* Nothing was run on a GPU. The kernels were written, compiled, inspected at the ISA level and checked against a
-  CPU emulation of their fragment chain; a device bug the emulation cannot see (an LDS or barrier slip, a
-  builtin's behaviour) would show as a selftest failure, not as a wrong timing.
+* Nothing was run on a GPU. The kernels were written, compiled, inspected at the ISA level, executed as plain C++ on the
+  CPU against exact references (above) and checked by a CPU emulation of their fragment chain; a device-only bug
+  (a builtin's behaviour, the hardware's WMMA layout) would show as a selftest failure, not as a wrong timing.
 * One kernel family with a sweep of (SKW, SKG) only. Not tried: NP = 2 (64-column tiles), a fragment-direct
   dense kernel without the LDS stage, software-pipelining a pass's rescale behind the next pass's WMMA (it adds
   24 VGPRs, and VALU and WMMA do not overlap on a SIMD anyway), M = 512 (the chunk is 256). The model says the

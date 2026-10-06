@@ -212,6 +212,20 @@ add_executable(test_int8_gemm_proto_cpu test_int8_gemm_proto_cpu.cpp)
 target_include_directories(test_int8_gemm_proto_cpu PRIVATE "${R4D_ROCM_ROOT}/include")
 target_compile_definitions(test_int8_gemm_proto_cpu PRIVATE __HIP_PLATFORM_AMD__)
 add_test(NAME test_int8_gemm_proto_cpu COMMAND test_int8_gemm_proto_cpu)
+# test_int8_gemm_proto_emu: pure CPU too -- the prototype's kernel SOURCE compiled as plain C++ (I8G_EMU, i8g_host_emu.h:
+# one OS thread per GPU thread, barriers, a software iu8 WMMA, a stub trellis decode) and run against exact references.
+add_executable(test_int8_gemm_proto_emu test_int8_gemm_proto_emu.cpp)
+add_test(NAME test_int8_gemm_proto_emu COMMAND test_int8_gemm_proto_emu)
+# _Float16 arithmetic on the host: hardware conversions (F16C) instead of compiler-rt's, and the device source's
+# `#pragma unroll` loops that contain barriers cannot unroll on the CPU (harmless)
+target_compile_options(test_int8_gemm_proto_emu PRIVATE /clang:-mf16c /clang:-mavx2 /clang:-mfma /clang:-Wno-pass-failed /D_CRT_SECURE_NO_WARNINGS)
+# ... and compiler-rt's half <-> double helpers (__truncdfhf2: the f16 fma of the quantizer is done in double on x86)
+file(GLOB R4DX_CLANG_RT_BUILTINS "${R4D_ROCM_ROOT}/lib/llvm/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+if(R4DX_CLANG_RT_BUILTINS)
+  list(GET R4DX_CLANG_RT_BUILTINS 0 R4DX_CLANG_RT_BUILTINS_0)
+  target_link_libraries(test_int8_gemm_proto_emu PRIVATE "${R4DX_CLANG_RT_BUILTINS_0}")
+endif()
+set_tests_properties(test_int8_gemm_proto_emu PROPERTIES TIMEOUT 1200)
 
 # test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
 # rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.

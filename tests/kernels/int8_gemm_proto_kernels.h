@@ -32,7 +32,14 @@
 // workgroup are all the slices there are) and SKG is free; the slices are whole 128-K blocks.
 #pragma once
 
+// I8G_EMU: compile the very same kernel source as plain C++ for the CPU (tests/kernels/i8g_host_emu.h supplies the
+// device-side names: threads, workgroup and wave barriers, the iu8 WMMA, the cross-lane ops, stubbed trellis decode);
+// test_int8_gemm_proto_emu.cpp runs the kernels that way against exact references. Unset (hipcc), nothing changes.
+#ifdef I8G_EMU
+#include "i8g_host_emu.h"
+#else
 #include <hip/hip_runtime.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -41,9 +48,11 @@
 #include <type_traits>
 
 #include "int8_gemm_proto_ref.h"
+#ifndef I8G_EMU
 #include "r4d_fwht128.h"
 #include "r4d_gdn_wmma.h"
 #include "r4d_trellis_dq.h"
+#endif
 
 #define I8G_WAVE 32
 
@@ -51,9 +60,18 @@ typedef int i8g_v2i __attribute__((ext_vector_type(2)));
 typedef int i8g_v8i __attribute__((ext_vector_type(8)));
 typedef float i8g_v4f __attribute__((ext_vector_type(4)));
 typedef unsigned i8g_v4u __attribute__((ext_vector_type(4)));
-typedef __attribute__((address_space(1))) const unsigned char* i8g_gptr;
 
 // ---- small helpers ----------------------------------------------------------------------------------------
+#ifdef I8G_EMU
+typedef const unsigned char* i8g_gptr;
+template <typename T>
+inline T i8g_load(i8g_gptr base, unsigned off, int imm) { return *(const T*)(base + off + imm); }
+inline void i8g_opaque(i8g_gptr&) {}
+inline void i8g_opaque_v(unsigned&) {}
+inline void i8g_sync_lds() { emu::wg_barrier(); }
+#define I8G_LDS_DECL unsigned char* lds = emu::t_group->lds;
+#else
+typedef __attribute__((address_space(1))) const unsigned char* i8g_gptr;
 template <typename T>
 __device__ __forceinline__ T i8g_load(i8g_gptr base, unsigned off, int imm) {
   return *(__attribute__((address_space(1))) const T*)(base + off + imm);
@@ -69,6 +87,8 @@ __device__ __forceinline__ void i8g_sync_lds() {
   __builtin_amdgcn_s_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
+#define I8G_LDS_DECL extern __shared__ __attribute__((aligned(16))) unsigned char lds[];
+#endif
 __device__ __forceinline__ unsigned short i8g_bf16_rn(float f) {
   const unsigned u = __builtin_bit_cast(unsigned, f);
   if ((u & 0x7FFFFFFFu) > 0x7F800000u) return (unsigned short)((u >> 16) | 0x40u);
@@ -228,8 +248,13 @@ __global__ __launch_bounds__(256) void i8g_dump_w(const unsigned* __restrict__ W
 #ifndef I8G_MINWAVES
 #define I8G_MINWAVES 8   // amdgpu_waves_per_eu lower bound: 8 caps the kernel at 192 VGPRs (two 16-wave workgroups per WGP)
 #endif
+#ifdef I8G_EMU
+#define I8G_KATTR
+#else
+#define I8G_KATTR __attribute__((amdgpu_waves_per_eu(I8G_MINWAVES)))
+#endif
 template <bool TRELLIS, int KB, bool FWHT, int RESC, int SKW>
-__global__ __launch_bounds__(128 * SKW) __attribute__((amdgpu_waves_per_eu(I8G_MINWAVES))) void i8g_kernel(
+__global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
     const signed char* __restrict__ A8, const float* __restrict__ SA, const unsigned char* __restrict__ Wsrc,
     const float* __restrict__ SW, const float* __restrict__ svh, unsigned short* __restrict__ C, float* __restrict__ ws,
     unsigned* __restrict__ tickets, int K, int N, int SKG, float out_scale) {
@@ -238,7 +263,7 @@ __global__ __launch_bounds__(128 * SKW) __attribute__((amdgpu_waves_per_eu(I8G_M
   constexpr unsigned slot_bytes = 8 * 512;                // one K slice's staging per buffer: 8 blocks of 512 B
   constexpr unsigned buf_bytes = SKW * slot_bytes;
   static_assert(SKW == 2 || SKW == 4 || SKW == 8, "");
-  extern __shared__ __attribute__((aligned(16))) unsigned char lds[];
+  I8G_LDS_DECL
   const int tid = threadIdx.x, lane = tid & 31;
   const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
   const int rg = wave & 3, ks = wave >> 2;
@@ -669,6 +694,7 @@ inline const char* I8gCheck(const I8gCfg& c, int K, int N) {
   return nullptr;
 }
 
+#ifndef I8G_EMU
 template <bool TR, int KB, bool FW, int RE, int SKW>
 static void i8g_launch_t(const I8gCfg& c, const signed char* a8, const float* sa, const void* w, const float* sw,
                          const float* svh, unsigned short* C, float* ws, unsigned* tk, int K, int N, float out_scale,
@@ -715,4 +741,5 @@ inline void I8gRun(const I8gCfg& c, const signed char* a8, const float* sa, cons
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) throw std::runtime_error(std::string("i8g: launch failed: ") + hipGetErrorString(e));
 }
+#endif  // !I8G_EMU
 inline size_t I8gWsBytes(int N, int skg) { return (size_t)skg * i8p::kM * N * sizeof(float); }

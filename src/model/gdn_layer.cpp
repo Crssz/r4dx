@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "linear.h"
-#include "prefill_chunk.h"  // GdnConvRequest (R4DX_GDN_CONV)
+#include "prefill_chunk.h"  // kGdnConvV1 / kGdnConvV2 (GdnLayerParams::conv_prep)
 #include "profile_span.h"
 #include "r4d.h"
 #include "r4dx/core/error.hpp"
@@ -184,10 +184,10 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     float* ht_scratch = arena.Alloc<float>(static_cast<size_t>(H * V * K));
     uint16_t* o_core = arena.Alloc<uint16_t>(static_cast<size_t>(T * H * V));
     const int ts = static_cast<int>(slice);
-    // r4d_gdn_conv_prep2 (the default) or the original r4d_gdn_conv_prep (R4DX_GDN_CONV=1): the same
-    // bytes; prep2 only spreads the work over more of the device (r4d.h).
-    const int conv_kernel = p.conv_prep != 0 ? p.conv_prep : GdnConvRequest();
-    const auto conv_prep = conv_kernel == kGdnConvV1 ? &core::r4d::GdnConvPrep : &core::r4d::GdnConvPrep2;
+    // The original r4d_gdn_conv_prep (p.conv_prep 0 / 1, the default) or r4d_gdn_conv_prep2 (2: a wide
+    // Model under R4DX_GDN_CONV=2): the same bytes; prep2 only spreads the work over more of the device
+    // (r4d.h).
+    const auto conv_prep = p.conv_prep == kGdnConvV2 ? &core::r4d::GdnConvPrep2 : &core::r4d::GdnConvPrep;
 
     for (int64_t r0 = 0; r0 < T; r0 += slice) {
       // rows [r0, r0 + slice) of every [T, ...] buffer; the first slice of a call reads the slot's

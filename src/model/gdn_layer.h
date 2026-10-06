@@ -60,9 +60,10 @@ struct GdnLayerParams {
   // see all T rows, in_proj_a/b run as 64-row launches whatever T is, and the bytes equal T / 64
   // consecutive 64-row calls (docs/trellis-m256.md "GDN sequence ops").
   int64_t seq_slice = 0;
-  // prefill only: which conv prep kernel -- 0 (the default) = the process's R4DX_GDN_CONV choice
-  // (prefill_chunk.h's GdnConvRequest: r4d_gdn_conv_prep2 unless R4DX_GDN_CONV=1), 1 = the original
-  // r4d_gdn_conv_prep, 2 = r4d_gdn_conv_prep2. Same bytes either way; tests pin it.
+  // prefill only: which conv prep kernel -- 0 (the default) or 1 = the original r4d_gdn_conv_prep, 2 =
+  // r4d_gdn_conv_prep2 (the same bytes on a wider grid). The layer reads no environment for it: Model sets
+  // it from its load-time choice (prefill_chunk.h's DecideGdnConv -- 2 only on a wide Model under
+  // R4DX_GDN_CONV=2), tests pin it.
   int conv_prep = 0;
 };
 

@@ -997,6 +997,9 @@ class Model {
   int64_t wide_rows_ = 0;
   int64_t prefill_wide_active_ = 0;
   int64_t wide_chunks_run_ = 0;  // super-chunks run since Load (PrefillWideChunksRun)
+  // GdnLayerParams::conv_prep for every prefill call of this Model (prefill_chunk.h's DecideGdnConv, at
+  // load): kGdnConvV2 only on a wide Model under R4DX_GDN_CONV=2, else the original kernel (kGdnConvV1).
+  int gdn_conv_ = 1;
   // Rows per RunChunk call of a Prefill call of this Model: 256 or max_chunk_ (decided once, at load).
   int64_t PrefillRowsForCall();
   // After the RunChunk of a `rows`-row prefill chunk: the caller's per-chunk callback, once per 64-row

@@ -2,15 +2,15 @@
 // + state commit, gated rmsnorm) run ONCE over a whole prefill chunk (the default inside a 256-row
 // super-chunk, GdnLayerParams::seq_slice 0) against the old path, the same rows as consecutive 64-row calls
 // with has_init true after the first and the fp32 state handed on through the slot (R4DX_GDN_SLICE=64),
-// byte for byte; and r4d_gdn_conv_prep2 against r4d_gdn_conv_prep (R4DX_GDN_CONV=1) on both paths
+// byte for byte; and r4d_gdn_conv_prep2 (opt-in, R4DX_GDN_CONV=2) against r4d_gdn_conv_prep on both paths
 // (docs/trellis-m256.md "GDN sequence ops").
 //
 // Part A (synthetic, needs only a HIP device): the real per-rank shape (H 48, Hg 16, K = V = 128, conv
 // width 4, conv_dim 10240), random inputs, driven exactly the way gdn_layer.cpp drives the kernels, with
 // four variants each owning its own GdnStateManager:
 //   ref      = 64-row calls, r4d_gdn_conv_prep      (today's 64-row path, byte for byte)
-//   one/v1   = one call,     r4d_gdn_conv_prep
-//   one/v2   = one call,     r4d_gdn_conv_prep2     (the new default)
+//   one/v1   = one call,     r4d_gdn_conv_prep      (the new default)
+//   one/v2   = one call,     r4d_gdn_conv_prep2     (a wide Model under R4DX_GDN_CONV=2)
 //   s64/v2   = 64-row calls, r4d_gdn_conv_prep2
 // over a sequence of calls: a fresh 256-row call (has_init false), a 256-row continuation, 320 and 200 rows
 // (not multiples of 256, and 200 not of 64: the reference splits it 64/64/64/8 as the 64-row chunk grid

@@ -18,16 +18,19 @@
 // The super-chunk changes no bits, so it only applies to the shape of call it was built and validated for;
 // every other case falls back to 64-row chunks and says so once, never throws (DecidePrefillChunk below).
 //
-// Inside a super-chunk, two more switches pick how the GDN layer runs its sequence ops (conv prep, kkt
-// solve, chunk scan + state commit, gated norm; docs/trellis-m256.md "GDN sequence ops"). Both change no
-// bits, both are read once per process, and neither does anything at R4DX_PREFILL_CHUNK=0:
-//   R4DX_GDN_SLICE -- unset, empty, "0" or "256": one call each over the whole 256 rows (the default;
-//     chunk 64 inside the kernels, the fp32 state carried in registers between chunks); "64": the old
-//     path, four 64-row sub-slices in order with the state handed on through the slot; anything else: a
-//     warning, then 64.
-//   R4DX_GDN_CONV -- unset, empty or "2": r4d_gdn_conv_prep2 (the default; the same bytes on a grid that
-//     fills the device); "1": the original r4d_gdn_conv_prep; anything else: a warning, then 1. Applies
-//     to every prefill call (64-row chunks too).
+// On a wide Model (one that runs super-chunks), two more switches pick how the GDN layer runs its sequence
+// ops (conv prep, kkt solve, chunk scan + state commit, gated norm; docs/trellis-m256.md "GDN sequence
+// ops"). Both are meant to change no bits and both are read once per process. Neither does anything on a
+// 64-row Model (R4DX_PREFILL_CHUNK=0, ModelOptions::prefill_chunk = 64, or a fallback): such a Model runs
+// exactly the pre-gdn256 kernels, so the kill switch is the true old path whatever these say.
+//   R4DX_GDN_SLICE -- unset, empty, "0" or "256": one call each over the whole 256 rows of a super-chunk
+//     (the default; chunk 64 inside the kernels, the fp32 state carried in registers between chunks);
+//     "64": the old path, four 64-row sub-slices in order with the state handed on through the slot;
+//     anything else: a warning, then 64.
+//   R4DX_GDN_CONV -- unset, empty or "1": the original r4d_gdn_conv_prep (the default); "2": opt in to
+//     r4d_gdn_conv_prep2 (the same bytes on a grid that fills the device; GPU validation pending), for
+//     every prefill call of a wide Model (its 64-row tail chunks too, DecideGdnConv); anything else: a
+//     warning, then 1.
 // An unreadable value keeps the old path, as R4DX_PREFILL_CHUNK does.
 #pragma once
 
@@ -64,18 +67,25 @@ inline int GdnSliceRequest() {
   return v;
 }
 
-// R4DX_GDN_CONV: 2 = r4d_gdn_conv_prep2 (the default), 1 = the original r4d_gdn_conv_prep.
+// R4DX_GDN_CONV: 1 = the original r4d_gdn_conv_prep (the default), 2 = r4d_gdn_conv_prep2 (opt-in).
 inline constexpr int kGdnConvV1 = 1;
 inline constexpr int kGdnConvV2 = 2;
 inline int ParseGdnConv(const char* e) {
-  if (e == nullptr || *e == '\0' || std::strcmp(e, "2") == 0) return kGdnConvV2;
-  if (std::strcmp(e, "1") == 0) return kGdnConvV1;
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "1") == 0) return kGdnConvV1;
+  if (std::strcmp(e, "2") == 0) return kGdnConvV2;
   std::fprintf(stderr, "r4dx: R4DX_GDN_CONV='%s' not recognized (1|2); using 1\n", e);
   return kGdnConvV1;
 }
 inline int GdnConvRequest() {
   static const int v = ParseGdnConv(std::getenv("R4DX_GDN_CONV"));
   return v;
+}
+
+// The conv prep kernel one Model uses for all its prefill calls (GdnLayerParams::conv_prep), decided once
+// at load: the request only on a wide Model (`wide`: Load sized it for 256-row super-chunks); a 64-row
+// Model always runs the original r4d_gdn_conv_prep, so R4DX_PREFILL_CHUNK=0 is the pre-gdn256 path.
+inline int DecideGdnConv(int requested, bool wide) {
+  return (wide && requested == kGdnConvV2) ? kGdnConvV2 : kGdnConvV1;
 }
 
 // What decides it, for one Model, once at load (the buffers are sized by it).

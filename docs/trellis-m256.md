@@ -124,17 +124,20 @@ y == 0 workgroups also do all 48 heads' gating before their own conv. `r4d_gdn_c
 
 Every arithmetic line, operand order and lane mapping is copied from v1. That covers the conv sum, the bf16
 round before the norm, the 4-dims-per-lane l2norm and its xor 16..1 butterfly, and the 2-tokens-per-lane gate
-scan with `pre = p - (g0 + g1)`. It compiles to 98 VGPRs with no scratch. It serves every prefill call,
-64-row chunks too.
+scan with `pre = p - (g0 + g1)`. It compiles to 98 VGPRs with no scratch. It is opt-in (`R4DX_GDN_CONV=2`)
+until the GPU identity runs pass, and only on a wide Model, where it serves every prefill call (the 64-row
+tail chunks too). A 64-row Model always runs `r4d_gdn_conv_prep`.
 
-Kill switches (read once per process, `prefill_chunk.h`, logged at load):
+Switches (read once per process, `prefill_chunk.h`, logged at load; both apply only to a wide Model):
 
-| variable | default | old path |
+| variable | default | other value |
 |---|---|---|
 | `R4DX_GDN_SLICE` | unset / `0` / `256`: one call per super-chunk | `64`: four 64-row sub-slices (anything else warns and uses 64) |
-| `R4DX_GDN_CONV` | unset / `2`: `r4d_gdn_conv_prep2` | `1`: `r4d_gdn_conv_prep` (anything else warns and uses 1) |
+| `R4DX_GDN_CONV` | unset / `1`: `r4d_gdn_conv_prep` (the original) | `2`: opt in to `r4d_gdn_conv_prep2` (anything else warns and uses 1) |
 
-`R4DX_PREFILL_CHUNK=0` still restores the whole 64-row path.
+`R4DX_PREFILL_CHUNK=0` restores the whole pre-gdn256 64-row path, kernels included: a 64-row Model runs
+one GDN call per 64-row chunk and `r4d_gdn_conv_prep`, whatever `R4DX_GDN_SLICE` / `R4DX_GDN_CONV` say
+(`DecideGdnConv`).
 
 Not changed, because the bits would move:
 * the chunk size of 64 and the per-chunk cumsum;
@@ -145,16 +148,22 @@ Not changed, because the bits would move:
 * `in_proj_a` / `in_proj_b`, which stay 64-row launches.
 
 kkt and the scan already run on WMMA. conv prep and the gated norm have no matrix product to put on it.
+The one matmul-shaped scalar loop left is kkt's 16 x 16 fp32 forward substitution; a WMMA version would
+take bf16 operands and so would not be bit-identical (it would need its own flag and the KL gate). It is not
+in this branch.
 
 Validation, not run here (GPU runs need approval):
 * `tests/model/test_gdn_seq256_identity` checks the one-call path against the 4 x 64 path, and conv v1
   against v2, byte for byte. Part A is synthetic at the real shape and needs no data: fresh and `has_init`
   calls of 256, 320, 200, 17, 2 and 64 rows, plus a random initial state. Part B runs `GdnLayer::Forward` on
   the 4-layer container.
-* `test_prefill_chunk_identity`, run with defaults and again with `R4DX_GDN_SLICE=64 R4DX_GDN_CONV=1`.
+* `test_prefill_chunk_identity` (logits, greedy tokens and the full KV / GDN state digest of a 256-row
+  Model against a 64-row one in one process), run three times: defaults (one call, `r4d_gdn_conv_prep`),
+  `R4DX_GDN_CONV=2` (one call, prep2) and `R4DX_GDN_SLICE=64`. The 64-row side is the true pre-gdn256
+  path in all three.
 * `tools/prefill/gdn256_check.ps1` (device 1) runs both tests, `test_gdn_layer`, `test_gdn_chunk_scan`,
-  greedy 8k / 32k text hashes across the new path, the old 256 path and the 64-row path, and
-  `--profile-prefill` at 8k both ways.
+  greedy 8k / 32k text hashes across the new path, prep2, the old 256 path and the 64-row path, and
+  `--profile-prefill` at 8k for the new path, prep2 and the old path.
 
 Gate the change on the unprofiled `[stats]` TTFT A/B, not on the profile shares. 3.1% for a roughly 4 µs
 gated norm means the span overhead inflates all four rows. Measurements: PENDING.

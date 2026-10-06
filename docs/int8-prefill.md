@@ -298,26 +298,45 @@ C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20
 
 (and `kl-wcol128-ablk128`, `kl-wcol32-ablk32`; for w5 `--ref E:\models\r4dx\int8q\kl-chunk-off --test ...\kl-chunk-wcol128`).
 
-### Results (PENDING; to fill from the runs above)
+### Results (2026-10-07, ROCm 10.1.0)
 
 Mean KL against the bf16 reference (`[kl_rung4]` line) and top-1 in %; the baseline is `kl-off-pfx` (0.00751,
-95.72). Activations alone (from the table above): blk128 +0.00039, blk32 +0.00007.
+95.72). Activations alone (from the table above): blk128 +0.00039, blk32 +0.00007. kl-w-off, kl-wcol128 and
+kl-wcol128-ablk128 ran on HIP device 1, the col32 runs on device 0. test_fake_quant_w passed (361 checks) first.
 
 | run | R4DX_FAKEQ_W | R4DX_FAKEQ_ACT | path | mean KL | top-1 | cpp | english | python | thai |
 |---|---|---|---|---|---|---|---|---|---|
-| kl-w-off | unset | unset | decode (uniform pass), gate vs rocm1010 | | | | | | |
-| kl-wcol128 | col128 | unset | one-token prefill | | | | | | |
-| kl-wcol128-ablk128 | col128 | blk128 | one-token prefill | | | | | | |
-| kl-wcol32-ablk32 | col32 | blk32 | one-token prefill | | | | | | |
-| kl-chunk-wcol128 | col128 | unset | chunked prefill (M = 256) | | | | | | |
+| kl-w-off | unset | unset | decode (uniform pass), gate vs rocm1010 | 0.00788 | 95.70 | 0.00583 | 0.00975 | 0.00778 | 0.00814 |
+| kl-wcol128 | col128 | unset | one-token prefill | 0.00771 | 95.87 | 0.00605 | 0.00880 | 0.00757 | 0.00841 |
+| kl-wcol32 | col32 | unset | one-token prefill | 0.00764 | 95.75 | 0.00594 | 0.00851 | 0.00781 | 0.00831 |
+| kl-wcol128-ablk128 | col128 | blk128 | one-token prefill | 0.00807 | 95.75 | 0.00625 | 0.00966 | 0.00776 | 0.00859 |
+| kl-wcol32-ablk32 | col32 | blk32 | one-token prefill | 0.00820 | 95.58 | 0.00600 | 0.01045 | 0.00787 | 0.00847 |
 
-`KL(off || on)` from `kl_compare.py` against `kl-off-pfx`, 4092 rows:
+kl-w-off printed byte-identical on all four segments: the unset switch is main's path. Against kl-off-pfx:
+col128 +0.00020, col32 +0.00013, col128 + blk128 +0.00056, col32 + blk32 +0.00069.
 
-| on | mean KL | p99 | max | top-1 agreement |
-|---|---|---|---|---|
-| col128 | | | | |
-| col128 + blk128 | | | | |
-| col32 + blk32 | | | | |
+`KL(off || on)` from `kl_compare.py` against `kl-off-pfx`, 4092 rows (activation-only rows repeated for
+comparison):
+
+| on | mean KL | median | p99 | max | top-1 agreement |
+|---|---|---|---|---|---|
+| blk128 (A only) | 0.001301 | 0.000460 | 0.006835 | 1.1173 | 98.68 |
+| col128 (W only) | 0.001272 | 0.000522 | 0.007693 | 0.4702 | 98.63 |
+| col32 (W only) | 0.001058 | 0.000468 | 0.007136 | 0.0412 | 98.97 |
+| col128 + blk128 | 0.001616 | 0.000636 | 0.009445 | 1.2832 | 98.63 |
+| col32 + blk32 | 0.001577 | 0.000534 | 0.007402 | 1.8010 | 98.53 |
+
+The means are pulled by single flipped rows in english_prose (max 1.28 and 1.80; one row of 1.8 adds 0.0018
+to that segment's mean). The medians are the steadier read: activations and weights each move the
+distribution by about the same small amount, and w8a8 at 128 is a little worse than either alone, not their
+sum. col32 + blk32 is not better than col128 + blk128 against the reference (0.00820 vs 0.00807); with these
+few flips the difference is noise, so finer groups buy nothing measurable. Chunked path, activations only
+(`run_kl.ps1`, 768-token prefix through the M = 256 kernel, 256 decode rows scored): blk128 0.00089, blk32
+0.00094 KL(off || on), top-1 agreement 99.12 / 99.22 %.
+
+Verdict: full int8 x int8 numerics with per-128 scales cost about +0.0006 mean KL against the reference on
+the prefill path (0.00751 -> 0.00807), under the paper estimate, and leave the production container well
+inside the 0.01 budget. Accuracy is not the obstacle to an int8 prefill GEMM; its speed is the open question.
 
 Reading it: weights and activations roughly add if their errors are independent; a w8a8 total under the
 activation-only +0.0004 plus a similar weight term keeps `col128 + blk128` well inside the production budget

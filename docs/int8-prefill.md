@@ -134,26 +134,35 @@ need the bf16 reference at all).
 Expected wall time: a is about 2 min (decode, 29.5 ms/row on device 1 for the 10.1.0 baseline); the
 prefill-path runs process 4092 one-token prefill calls each and are slower (guess: 4-6 min).
 
-## Results (to fill in)
+## Results (2026-10-07, ROCm 10.1.0, Huihui trellis mix4.5m)
 
 Mean KL against the bf16 reference (kl_rung4.ps1 `[kl_rung4]` line), top-1 in %, per segment mean KL
-(cpp / english / python / thai):
+(cpp / english / python / thai). kl-off, kl-off-pfx and kl-blk128 ran on HIP device 1, kl-row and kl-blk32
+on device 0 (same card model, deterministic kernels):
 
 | run | R4DX_FAKEQ_ACT | path | mean KL | top-1 | cpp | english | python | thai |
 |---|---|---|---|---|---|---|---|---|
-| kl-off | unset | decode (uniform pass) | | | | | | |
-| kl-off-pfx | unset | one-token prefill | | | | | | |
-| kl-blk128 | blk128 | one-token prefill | | | | | | |
-| kl-row | row | one-token prefill | | | | | | |
-| kl-blk32 | blk32 | one-token prefill | | | | | | |
+| kl-off | unset | decode (uniform pass) | 0.00788 | 95.70 | 0.00583 | 0.00975 | 0.00778 | 0.00814 |
+| kl-off-pfx | unset | one-token prefill | 0.00751 | 95.72 | 0.00592 | 0.00844 | 0.00754 | 0.00815 |
+| kl-blk128 | blk128 | one-token prefill | 0.00790 | 95.92 | 0.00593 | 0.00962 | 0.00768 | 0.00836 |
+| kl-row | row | one-token prefill | 0.00834 | 95.77 | 0.00645 | 0.00939 | 0.00832 | 0.00920 |
+| kl-blk32 | blk32 | one-token prefill | 0.00758 | 95.92 | 0.00596 | 0.00824 | 0.00784 | 0.00828 |
 
-`KL(off || on)` from `kl_compare.py` (mean / p99 / max, top-1 agreement):
+kl-off is byte-identical to the ROCm 10.1.0 main baseline (all four segments), so the unset switch is
+main's path. Against kl-off-pfx: blk32 +0.00007, blk128 +0.00039, row +0.00083.
+
+`KL(off || on)` from `kl_compare.py` (mean / p99 / max, top-1 agreement), 4092 rows:
 
 | on | mean KL | p99 | max | top-1 agreement |
 |---|---|---|---|---|
-| blk128 | | | | |
-| row | | | | |
-| blk32 | | | | |
+| blk128 | 0.001301 | 0.006835 | 1.1173 | 98.68 |
+| row | 0.001775 | 0.011269 | 0.5361 | 98.34 |
+| blk32 | 0.000969 | 0.006301 | 0.0152 | 99.00 |
+
+The blk128 max (1.12, english_prose) is one row whose top token flipped; its mean without that row is in
+line with the other segments. All three are below the paper estimate (+0.001 to +0.003 against the
+reference): int8 activations with per-128-block scales cost about +0.0004 KL, per-32-block about nothing.
+The weight side (below) is still unmeasured.
 
 Reading it: a mean-KL increase of 0.001 to 0.003 for `blk128` confirms the paper estimate and makes an int8
 prefill GEMM worth building; `row` is expected to be clearly worse (the w4a8 lesson). The budget the

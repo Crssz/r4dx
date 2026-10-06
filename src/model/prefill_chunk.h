@@ -27,9 +27,9 @@
 //     (the default; chunk 64 inside the kernels, the fp32 state carried in registers between chunks);
 //     "64": the old path, four 64-row sub-slices in order with the state handed on through the slot;
 //     anything else: a warning, then 64.
-//   R4DX_GDN_CONV -- unset, empty or "1": the original r4d_gdn_conv_prep (the default); "2": opt in to
-//     r4d_gdn_conv_prep2 (the same bytes on a grid that fills the device; GPU validation pending), for
-//     every prefill call of a wide Model (its 64-row tail chunks too, DecideGdnConv); anything else: a
+//   R4DX_GDN_CONV -- unset, empty or "2": r4d_gdn_conv_prep2 (the default; the same bytes on a grid that
+//     fills the device, validated on device 1 2026-10-06), for every prefill call of a wide Model (its
+//     64-row tail chunks too, DecideGdnConv); "1": the original r4d_gdn_conv_prep; anything else: a
 //     warning, then 1.
 // An unreadable value keeps the old path, as R4DX_PREFILL_CHUNK does.
 #pragma once
@@ -67,12 +67,12 @@ inline int GdnSliceRequest() {
   return v;
 }
 
-// R4DX_GDN_CONV: 1 = the original r4d_gdn_conv_prep (the default), 2 = r4d_gdn_conv_prep2 (opt-in).
+// R4DX_GDN_CONV: 2 = r4d_gdn_conv_prep2 (the default), 1 = the original r4d_gdn_conv_prep.
 inline constexpr int kGdnConvV1 = 1;
 inline constexpr int kGdnConvV2 = 2;
 inline int ParseGdnConv(const char* e) {
-  if (e == nullptr || *e == '\0' || std::strcmp(e, "1") == 0) return kGdnConvV1;
-  if (std::strcmp(e, "2") == 0) return kGdnConvV2;
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "2") == 0) return kGdnConvV2;
+  if (std::strcmp(e, "1") == 0) return kGdnConvV1;
   std::fprintf(stderr, "r4dx: R4DX_GDN_CONV='%s' not recognized (1|2); using 1\n", e);
   return kGdnConvV1;
 }

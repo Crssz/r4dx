@@ -1,7 +1,7 @@
 # tools/prefill/gdn256_check.ps1 -- GPU validation of the GDN 256-row super-chunk change (docs/trellis-m256.md
 # "GDN sequence ops"): the GDN sequence ops run once per 256-row super-chunk (default) instead of four
-# 64-row sub-slices (R4DX_GDN_SLICE=64), and the opt-in r4d_gdn_conv_prep2 (R4DX_GDN_CONV=2) instead of
-# the original r4d_gdn_conv_prep (default). A 64-row Model (R4DX_PREFILL_CHUNK=0) ignores both knobs and
+# 64-row sub-slices (R4DX_GDN_SLICE=64), and r4d_gdn_conv_prep2 (default) instead of the original
+# r4d_gdn_conv_prep (R4DX_GDN_CONV=1). A 64-row Model (R4DX_PREFILL_CHUNK=0) ignores both knobs and
 # runs the pre-change kernels. Every step must show the same bytes every way; the profile and the [stats]
 # lines are the perf A/B.
 #
@@ -13,17 +13,17 @@
 #   1. tests\model\test_gdn_seq256_identity  (one call vs 4 x 64, conv v1 vs v2, byte for byte)
 #   2. tests\model\test_gdn_layer            (layer 0 against the golden, as before)
 #   3. tests\kernels\test_gdn_chunk_scan     (the scan against the fp64 recurrence, as before)
-#   4. tests\model\test_prefill_chunk_identity, three times: defaults, R4DX_GDN_CONV=2 and
+#   4. tests\model\test_prefill_chunk_identity, three times: defaults, R4DX_GDN_CONV=1 and
 #      R4DX_GDN_SLICE=64 (logits + KV / GDN state digest of the 256-row Model against the 64-row one, which
 #      is the true pre-change path every time; -SkipIdentity skips it)
 #   5. r4dx-cli greedy (temperature 0, -MaxTokens tokens) at each length, four configurations:
-#        new   = defaults (one call per super-chunk, r4d_gdn_conv_prep)
-#        conv2 = R4DX_GDN_CONV=2 (one call per super-chunk, r4d_gdn_conv_prep2)
-#        old   = R4DX_GDN_SLICE=64 (the pre-change 256-row path)
+#        new   = defaults (one call per super-chunk, r4d_gdn_conv_prep2)
+#        conv1 = R4DX_GDN_CONV=1 (one call per super-chunk, r4d_gdn_conv_prep)
+#        old   = R4DX_GDN_SLICE=64 R4DX_GDN_CONV=1 (the pre-change 256-row path)
 #        c64   = R4DX_PREFILL_CHUNK=0 (the 64-row chunk path, the bit-identity reference)
 #      the generated text's SHA-256 must match across all four; the [stats] prefill line of each is the
 #      unprofiled TTFT A/B (gate the change on these, not on the profile shares).
-#   6. r4dx-cli --profile-prefill at 8k, new, conv2 and old (the gdn.conv_prep / kkt_solve / chunk_scan /
+#   6. r4dx-cli --profile-prefill at 8k, new, conv1 and old (the gdn.conv_prep / kkt_solve / chunk_scan /
 #      gated_rmsnorm rows of the three tables).
 # Exit 0 only when every test passed (or skipped for missing data) and every hash matched.
 param(
@@ -87,8 +87,8 @@ $tests = @(
 )
 if (-not $SkipIdentity) {
   $tests += @{ Name = 'test_prefill_chunk_identity'; Exe = 'tests\model\test_prefill_chunk_identity.exe'; Env = @{} }
-  $tests += @{ Name = 'test_prefill_chunk_identity_conv2'; Exe = 'tests\model\test_prefill_chunk_identity.exe'
-               Env = @{ R4DX_GDN_CONV = '2' } }
+  $tests += @{ Name = 'test_prefill_chunk_identity_conv1'; Exe = 'tests\model\test_prefill_chunk_identity.exe'
+               Env = @{ R4DX_GDN_CONV = '1' } }
   $tests += @{ Name = 'test_prefill_chunk_identity_gdnslice64'; Exe = 'tests\model\test_prefill_chunk_identity.exe'
                Env = @{ R4DX_GDN_SLICE = '64' } }
 }
@@ -106,8 +106,8 @@ foreach ($t in $tests) {
 $lenTokens = @{ '4k' = 4096; '8k' = 8192; '16k' = 16384; '32k' = 32768; '64k' = 65536; '128k' = 131072 }
 $configs = [ordered]@{
   new = @{}
-  conv2 = @{ R4DX_GDN_CONV = '2' }
-  old = @{ R4DX_GDN_SLICE = '64' }
+  conv1 = @{ R4DX_GDN_CONV = '1' }
+  old = @{ R4DX_GDN_SLICE = '64'; R4DX_GDN_CONV = '1' }
   c64 = @{ R4DX_PREFILL_CHUNK = '0' }
 }
 function CliArgs([string]$len, [switch]$Prof) {
@@ -135,12 +135,12 @@ else {
       Say ("[cli] {0} {1,-5} ({2}): exit {3}, text sha256 {4}, prefill {5}" -f $len, $name, (EnvText $configs[$name]), $r.Exit, $hash, $stats)
     }
     $distinct = @($hashes.Values | Select-Object -Unique)
-    if ($distinct.Count -eq 1 -and $distinct[0] -ne 'none') { Say "[PASS] $len greedy text identical across new / conv2 / old / c64" }
+    if ($distinct.Count -eq 1 -and $distinct[0] -ne 'none') { Say "[PASS] $len greedy text identical across new / conv1 / old / c64" }
     else { Say "[FAIL] $len greedy text differs: $(($hashes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"; $fail++ }
   }
 
-  # ---- 6: --profile-prefill, new vs conv2 vs old ---------------------------------------------------
-  foreach ($name in @('new', 'conv2', 'old')) {
+  # ---- 6: --profile-prefill, new vs conv1 vs old ---------------------------------------------------
+  foreach ($name in @('new', 'conv1', 'old')) {
     $r = Invoke-WithEnv $cli (CliArgs $ProfileLength -Prof) $configs[$name] (Join-Path $outDir "profile_${ProfileLength}_$name")
     if ($r.Exit -ne 0) { $fail++ }
     Say ("[profile] {0} {1} ({2}): exit {3}; table in {4}" -f $ProfileLength, $name, (EnvText $configs[$name]), $r.Exit, $r.Err)

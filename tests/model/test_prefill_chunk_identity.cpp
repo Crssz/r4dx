@@ -8,7 +8,7 @@
 //
 // The 64-row Model always runs the pre-gdn256 GDN kernels (prefill_chunk.h's DecideGdnConv ignores
 // R4DX_GDN_CONV on it), so the env knobs select only the 256-row side: defaults compare one GDN call per
-// super-chunk + r4d_gdn_conv_prep, R4DX_GDN_CONV=2 compares r4d_gdn_conv_prep2 and R4DX_GDN_SLICE=64 the
+// super-chunk + r4d_gdn_conv_prep2, R4DX_GDN_CONV=1 compares r4d_gdn_conv_prep and R4DX_GDN_SLICE=64 the
 // sub-slices -- each against the true 64-row path (tools/prefill/gdn256_check.ps1 runs all three).
 //
 // What is prefilled (the tail cases of the chunk grid, docs/prefill.md): one call of 1, 63, 64, 65, 255,

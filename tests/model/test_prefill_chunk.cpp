@@ -57,10 +57,10 @@ int main() {
   CHECK(ParseGdnSlice("64") == 64, "GDN slice 64 -> 64 (kill switch)");
   CHECK(ParseGdnSlice("128") == 64, "GDN slice 128 (unsupported) -> 64");
   CHECK(ParseGdnSlice("off") == 64, "GDN slice off -> 64 with a warning");
-  CHECK(ParseGdnConv(nullptr) == kGdnConvV1, "GDN conv unset -> 1 (the original kernel, the default)");
-  CHECK(ParseGdnConv("") == kGdnConvV1, "GDN conv empty -> 1");
-  CHECK(ParseGdnConv("1") == kGdnConvV1, "GDN conv 1 -> 1");
-  CHECK(ParseGdnConv("2") == kGdnConvV2, "GDN conv 2 -> 2 (opt in to prep2)");
+  CHECK(ParseGdnConv(nullptr) == kGdnConvV2, "GDN conv unset -> 2 (prep2, the default)");
+  CHECK(ParseGdnConv("") == kGdnConvV2, "GDN conv empty -> 2");
+  CHECK(ParseGdnConv("1") == kGdnConvV1, "GDN conv 1 -> 1 (the original kernel)");
+  CHECK(ParseGdnConv("2") == kGdnConvV2, "GDN conv 2 -> 2");
   CHECK(ParseGdnConv("v2") == kGdnConvV1, "GDN conv v2 (unrecognized) -> 1 with a warning");
   // A 64-row Model (the R4DX_PREFILL_CHUNK=0 kill switch, or a fallback) always runs the original kernel.
   CHECK(DecideGdnConv(kGdnConvV2, /*wide=*/true) == kGdnConvV2, "wide Model, conv 2 -> prep2");

@@ -124,16 +124,16 @@ y == 0 workgroups also do all 48 heads' gating before their own conv. `r4d_gdn_c
 
 Every arithmetic line, operand order and lane mapping is copied from v1. That covers the conv sum, the bf16
 round before the norm, the 4-dims-per-lane l2norm and its xor 16..1 butterfly, and the 2-tokens-per-lane gate
-scan with `pre = p - (g0 + g1)`. It compiles to 98 VGPRs with no scratch. It is opt-in (`R4DX_GDN_CONV=2`)
-until the GPU identity runs pass, and only on a wide Model, where it serves every prefill call (the 64-row
-tail chunks too). A 64-row Model always runs `r4d_gdn_conv_prep`.
+scan with `pre = p - (g0 + g1)`. It compiles to 98 VGPRs with no scratch. It is the default on a wide Model
+(since the 2026-10-06 GPU validation below), where it serves every prefill call (the 64-row tail chunks too);
+`R4DX_GDN_CONV=1` restores `r4d_gdn_conv_prep`. A 64-row Model always runs `r4d_gdn_conv_prep`.
 
 Switches (read once per process, `prefill_chunk.h`, logged at load; both apply only to a wide Model):
 
 | variable | default | other value |
 |---|---|---|
 | `R4DX_GDN_SLICE` | unset / `0` / `256`: one call per super-chunk | `64`: four 64-row sub-slices (anything else warns and uses 64) |
-| `R4DX_GDN_CONV` | unset / `1`: `r4d_gdn_conv_prep` (the original) | `2`: opt in to `r4d_gdn_conv_prep2` (anything else warns and uses 1) |
+| `R4DX_GDN_CONV` | unset / `2`: `r4d_gdn_conv_prep2` | `1`: `r4d_gdn_conv_prep`, the original (anything else warns and uses 1) |
 
 `R4DX_PREFILL_CHUNK=0` restores the whole pre-gdn256 64-row path, kernels included: a 64-row Model runs
 one GDN call per 64-row chunk and `r4d_gdn_conv_prep`, whatever `R4DX_GDN_SLICE` / `R4DX_GDN_CONV` say
@@ -152,21 +152,38 @@ The one matmul-shaped scalar loop left is kkt's 16 x 16 fp32 forward substitutio
 take bf16 operands and so would not be bit-identical (it would need its own flag and the KL gate). It is not
 in this branch.
 
-Validation, not run here (GPU runs need approval):
-* `tests/model/test_gdn_seq256_identity` checks the one-call path against the 4 x 64 path, and conv v1
-  against v2, byte for byte. Part A is synthetic at the real shape and needs no data: fresh and `has_init`
-  calls of 256, 320, 200, 17, 2 and 64 rows, plus a random initial state. Part B runs `GdnLayer::Forward` on
-  the 4-layer container.
+Validation (`tools/prefill/gdn256_check.ps1`, HIP device 1, commit 9e333f5, 2026-10-06; at that commit
+prep2 was the opt-in `R4DX_GDN_CONV=2`, so "prep2" below is today's default). ALL PASS:
+* `tests/model/test_gdn_seq256_identity`: 33 / 33 byte-identical (one call against 4 x 64, conv v1 against
+  v2; synthetic at the real shape, fresh and `has_init` calls of 256, 320, 200, 17, 2 and 64 rows, plus a
+  random initial state). Part B (the 4-layer container) and `test_gdn_layer` skipped: data not on disk.
+* `test_gdn_chunk_scan` PASS.
 * `test_prefill_chunk_identity` (logits, greedy tokens and the full KV / GDN state digest of a 256-row
-  Model against a 64-row one in one process), run three times: defaults (one call, `r4d_gdn_conv_prep`),
-  `R4DX_GDN_CONV=2` (one call, prep2) and `R4DX_GDN_SLICE=64`. The 64-row side is the true pre-gdn256
-  path in all three.
-* `tools/prefill/gdn256_check.ps1` (device 1) runs both tests, `test_gdn_layer`, `test_gdn_chunk_scan`,
-  greedy 8k / 32k text hashes across the new path, prep2, the old 256 path and the 64-row path, and
-  `--profile-prefill` at 8k for the new path, prep2 and the old path.
+  Model against the true pre-gdn256 64-row Model) PASS three times: one call + `r4d_gdn_conv_prep`
+  (340 s), one call + prep2 (325 s), `R4DX_GDN_SLICE=64` (319 s).
+* Greedy 64-token text on the Huihui trellis mix4.5m container: the same SHA-256 across the four paths
+  below, at 8k (8089 prompt tokens) and 32k (32734).
 
-Gate the change on the unprofiled `[stats]` TTFT A/B, not on the profile shares. 3.1% for a roughly 4 µs
-gated norm means the span overhead inflates all four rows. Measurements: PENDING.
+TTFT (unprofiled `[stats]`, one run each, same session):
+
+| path | 8k | 32k |
+|---|--:|--:|
+| `R4DX_PREFILL_CHUNK=0` (64-row chunks) | 6.837 s (1183 tok/s) | 32.230 s |
+| `R4DX_GDN_SLICE=64` (pre-gdn256 256-row path) | 5.002 s (1617 tok/s) | 24.550 s |
+| one GDN call per super-chunk, `r4d_gdn_conv_prep` | 4.765 s (1698 tok/s) | 23.463 s |
+| **one call + prep2 (default)** | **4.722 s (1713 tok/s), -5.6%** | **23.405 s, -4.7%** |
+
+`--profile-prefill` at 8k, GPU ms for the four GDN sequence ops (span overhead included):
+
+| op | sub-slices (old) | one call, prep | one call, prep2 |
+|---|--:|--:|--:|
+| conv prep | 384.6 | 82.8 | 3.3 |
+| kkt solve | 20.2 | 4.3 | 2.3 |
+| chunk scan | 86.8 | 66.4 | 45.0 |
+| gated norm | 50.4 | 5.8 | 5.5 |
+| total (% of gpu_sum) | 542 (11.1%) | 159 (3.5%) | 56 (1.2%) |
+
+The GDN sequence ops are no longer a prefill target; what is left is the GEMMs and the attention core.
 
 Memory: with the flag on (and a Model that can run it) the activation buffers, the position array and the
 seqused array are sized for 256 rows and the arena is 224 MiB instead of 96 MiB (the widest layer, the mlp,

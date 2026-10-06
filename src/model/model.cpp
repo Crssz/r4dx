@@ -588,10 +588,10 @@ Model Model::Load(const ModelOptions& opts) {
     }
     std::cerr << "[r4dx::model::Model] GDN conv prep: "
               << (m.gdn_conv_ == kGdnConvV2
-                      ? "r4d_gdn_conv_prep2 (R4DX_GDN_CONV=2; unset restores r4d_gdn_conv_prep)"
+                      ? "r4d_gdn_conv_prep2 (default; R4DX_GDN_CONV=1 restores r4d_gdn_conv_prep)"
                       : (GdnConvRequest() == kGdnConvV2
-                             ? "r4d_gdn_conv_prep (R4DX_GDN_CONV=2 ignored: 64-row chunks)"
-                             : "r4d_gdn_conv_prep (default; R4DX_GDN_CONV=2 opts in to r4d_gdn_conv_prep2)"))
+                             ? "r4d_gdn_conv_prep (64-row chunks always run the original kernel)"
+                             : "r4d_gdn_conv_prep (R4DX_GDN_CONV=1)"))
               << "\n";
   }
 
@@ -987,7 +987,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // A super-chunk's GDN sequence ops run once over its 256 rows, or in 64-row sub-slices under
       // R4DX_GDN_SLICE=64 (prefill_chunk.h); the same bytes either way.
       p.seq_slice = (wide && GdnSliceRequest() == kPrefillChunkBase) ? max_chunk_ : 0;
-      p.conv_prep = gdn_conv_;  // the original kernel unless a wide Model under R4DX_GDN_CONV=2
+      p.conv_prep = gdn_conv_;  // prep2 on a wide Model unless R4DX_GDN_CONV=1
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
                     normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,

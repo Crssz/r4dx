@@ -522,12 +522,13 @@ TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) 
 Prompt prefill runs in 256-row super-chunks by default: the trellis linears see 256 rows through libr4d's
 M = 256 GEMM (one weight pass per 256 rows instead of four). The attention core still runs in 64-row
 sub-slices in order. The GDN sequence ops (conv prep, kkt solve, chunk scan, gated norm) run once over the
-256 rows with chunk 64 inside the kernels; `R4DX_GDN_SLICE=64` restores the sub-slices. Conv prep stays
-on the original `r4d_gdn_conv_prep`; `R4DX_GDN_CONV=2` opts a 256-row Model in to `r4d_gdn_conv_prep2`
-(same bytes on a wider grid, GPU validation pending). A 64-row Model (`R4DX_PREFILL_CHUNK=0`) ignores both
-knobs and runs exactly the pre-change kernels. The result is bit-identical to the 64-row path, so no
-accuracy number moves. The design, the identity coverage and the kernels are in
-[docs/trellis-m256.md](trellis-m256.md) ("GDN sequence ops": GPU validation and measurements are pending).
+256 rows with chunk 64 inside the kernels; `R4DX_GDN_SLICE=64` restores the sub-slices. Conv prep runs
+`r4d_gdn_conv_prep2` (same bytes on a grid that fills the device); `R4DX_GDN_CONV=1` restores
+`r4d_gdn_conv_prep`. A 64-row Model (`R4DX_PREFILL_CHUNK=0`) ignores both knobs and runs exactly the
+pre-change kernels. The result is bit-identical to the 64-row path, so no accuracy number moves. The two
+GDN changes cut 8k TTFT 5.002 -> 4.722 s (1713 tok/s) and 32k 24.55 -> 23.41 s on device 1. The design,
+the identity coverage, the kernels and the measurements are in [docs/trellis-m256.md](trellis-m256.md)
+("GDN sequence ops").
 
 | `R4DX_PREFILL_CHUNK` | prompt-prefill chunk |
 |---|---|

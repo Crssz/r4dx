@@ -184,8 +184,8 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     float* ht_scratch = arena.Alloc<float>(static_cast<size_t>(H * V * K));
     uint16_t* o_core = arena.Alloc<uint16_t>(static_cast<size_t>(T * H * V));
     const int ts = static_cast<int>(slice);
-    // The original r4d_gdn_conv_prep (p.conv_prep 0 / 1, the default) or r4d_gdn_conv_prep2 (2: a wide
-    // Model under R4DX_GDN_CONV=2): the same bytes; prep2 only spreads the work over more of the device
+    // The original r4d_gdn_conv_prep (p.conv_prep 0 / 1) or r4d_gdn_conv_prep2 (2: a wide Model's default,
+    // R4DX_GDN_CONV=1 opts out): the same bytes; prep2 only spreads the work over more of the device
     // (r4d.h).
     const auto conv_prep = p.conv_prep == kGdnConvV2 ? &core::r4d::GdnConvPrep2 : &core::r4d::GdnConvPrep;
 

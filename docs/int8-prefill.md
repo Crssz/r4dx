@@ -168,5 +168,8 @@ production container has is the gap between its KL and the 0.01 gate (docs/gemma
   modeled; with `blk128` the real kernel would also have to rescale each 128-block's int32 partial sum.
 * Round-trip rounding is exact in fp32 here; a real kernel's `s` may be stored in f16 or as a power of two,
   which would add error. `blk32` is the cheap bound on how much finer scales can recover.
+* Measure at TP = 1. Under tensor parallel a row-parallel linear (mlp.down, for one) quantizes
+  its own rank's K shard, so `row` would take one scale per shard, not per full row (`blk128` / `blk32` are
+  unchanged where the shard is whole 128-blocks).
 * The one-token prefill path differs numerically from the chunked path (other GEMM and GDN kernels), so its
   baseline is not the frozen 0.00788.

@@ -17,7 +17,7 @@
 //   - anything else: std::invalid_argument at Model load (an experiment must not silently run unquantized).
 //
 // Header-only and free of HIP so the parser and the reference have a CPU unit test
-// (tests/model/test_fake_quant_act.cpp); the kernel (src/kernels/src/trellis_transform.hip,
+// (tests/model/test_fake_quant_act_cpu.cpp); the kernel (src/kernels/src/trellis_transform.hip,
 // r4dx_fake_quant_act_f16) is tested against the same reference by tests/kernels/test_fake_quant_act.
 #pragma once
 

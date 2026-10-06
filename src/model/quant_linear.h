@@ -125,6 +125,12 @@ struct QuantLinear {
   int trellis_parts = 0;
   int64_t trellis_part_n[2] = {0, 0};
   int trellis_prescale_log2 = 0;
+  //   trellis_wscale: R4DX_FAKEQ_W (fake_quant_w.h, docs/int8-prefill.md), empty unless the switch is on. fp32
+  //     [K / 16 >> trellis_wscale_gsh][N], the per-(output column, k group) scale of the decoded weight
+  //     (libr4d's r4d_trellis_wscale_f32), built once at Model::Load; the prefill GEMMs read it to round
+  //     the decoded weights to int8. A measurement hook: nothing else touches it.
+  core::DeviceBuffer<float> trellis_wscale;
+  int trellis_wscale_gsh = 0;
 };
 
 }  // namespace r4dx::model

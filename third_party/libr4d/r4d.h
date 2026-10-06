@@ -340,6 +340,37 @@ const char* r4d_gemm_trellis_nt_m256_check(int M, int K, int N, int n_split, int
                                            int SKG, int U, int skw);
 size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
 
+// ---- weight fake-quant (r4dx R4DX_FAKEQ_W, docs/int8-prefill.md): a MEASUREMENT hook -----------------
+// "What would int8 WEIGHTS cost in prefill?", answered before an int8 x int8 GEMM exists: the `_wq`
+// entries below are r4d_gemm_trellis_nt_m64 / _raw / r4d_gemm_trellis_nt_m256 with every decoded weight
+// fragment rounded to symmetric int8 and back (one scale per output column and per group of 2^gsh k-tiles,
+// i.e. 32 k at gsh = 1, 128 k at gsh = 3) right before the WMMA. The shipped entries and their kernels are
+// unchanged. A group's scale is s = max|Q| / 127 over its 16 * 2^gsh values of one column of Q (fp32;
+// 1.0f for an all-zero group); a value w becomes f16(clamp(rint(w * (1 / s)), -127, 127) * s), all but the
+// last rounding in fp32 (src/model/fake_quant_w.h is the CPU transcription).
+//   r4d_trellis_wscale_count(K, N, gsh)   floats in the scale table: (K / 16 >> gsh) * N, laid out
+//                                         [group][column n of Q]
+//   r4d_trellis_wscale_f32(w, scale, ..)  builds the table from the pair-grid words `w` with the GEMM's own
+//                                         decode (so the values are the GEMM's); N a multiple of 32, KB 4 or 5
+//   *_wq                                  as the entry without _wq plus the table and gsh (1, 2 or 3,
+//                                         16 << gsh dividing K); a null table throws. NT is ignored (the
+//                                         `_wq` kernel always loads weights temporally: a cache hint, the
+//                                         same bits). The legality rules are the entry's own.
+size_t r4d_trellis_wscale_count(int K, int N, int gsh);
+void   r4d_trellis_wscale_f32(int64_t w, int64_t scale, int K, int N, int KB, int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m64_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh,
+                                int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                                int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                                float out_scale, int64_t wscale, int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m64_raw_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t c,
+                                    int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
+                                    int SK, int MT, int NP, int SKG, int U, int NT, int64_t wscale,
+                                    int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m256_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
+                                 int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
+                                 int SKG, int U, float out_scale, int64_t stream, int skw, int64_t wscale,
+                                 int gsh);
+
 // ---- registry ------------------------------------------------------------------------------
 // Every kernel in the library, with the constraints its name encodes spelled out. A caller that
 // wants to know whether R4D covers a model can read this instead of hardcoding what it remembers.

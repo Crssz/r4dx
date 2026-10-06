@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "debug_probe.h"
+#include "fake_quant_w.h"  // R4DX_FAKEQ_W (docs/int8-prefill.md)
 #include "kernels/model_kernels.h"
 #include "r4d.h"
 #include "r4dx/core/dtype.hpp"
@@ -400,6 +401,7 @@ bool M256ShapeAllowed(int64_t N, int64_t K) {
 
 thread_local bool t_trellis_m256 = false;
 thread_local int t_fake_quant_act = 0;  // fake_quant_act.h's mode; 0 off (ScopedFakeQuantAct)
+thread_local int t_fake_quant_w = 0;    // fake_quant_w.h's mode; 0 off (ScopedFakeQuantW)
 
 // docs/trellis-kernel.md 4.8's A-range study (milestone M4). With R4DX_TRELLIS_A_STATS=<file>, every
 // A the trellis input transform writes is copied back and tallied per linear -- elements, exact
@@ -545,6 +547,28 @@ void ScopedFakeQuantAct::End() {
   t_fake_quant_act = prev_;
 }
 
+ScopedFakeQuantW::ScopedFakeQuantW(int mode) : prev_(t_fake_quant_w), live_(true) { t_fake_quant_w = mode; }
+void ScopedFakeQuantW::End() {
+  if (!live_) return;
+  live_ = false;
+  t_fake_quant_w = prev_;
+}
+
+void BuildTrellisWScale(QuantLinear& w, int mode, hipStream_t stream) {
+  if (mode == kFakeQuantWOff || w.layout != Layout::kTrellis) return;
+  const int gsh = FakeQuantWGroupShift(mode);
+  if (gsh < 1 || w.N % 32 != 0 || w.K % (16 << gsh) != 0) {
+    throw std::runtime_error("r4dx::model::BuildTrellisWScale: trellis weight [" + std::to_string(w.N) + ", " +
+                             std::to_string(w.K) + "] does not fit R4DX_FAKEQ_W=" + FakeQuantWName(mode) +
+                             " (N a multiple of 32, K of " + std::to_string(16 << gsh) + ")");
+  }
+  w.trellis_wscale = core::DeviceBuffer<float>(
+      core::r4d::TrellisWscaleCount(static_cast<int>(w.K), static_cast<int>(w.N), gsh));
+  core::r4d::TrellisWscaleBuild(w.trellis_w.data(), w.trellis_wscale.data(), static_cast<int>(w.K),
+                                static_cast<int>(w.N), w.trellis_bits, gsh, stream);
+  w.trellis_wscale_gsh = gsh;
+}
+
 TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t part_n0) {
   TrellisM256Plan plan;
   const auto refuse = [&plan](std::string why) {
@@ -625,6 +649,16 @@ static void FakeQuantA(hipStream_t stream, const uint16_t* a0, const uint16_t* a
                        int parts, int mode) {
   r4dx_fake_quant_act_f16(reinterpret_cast<int64_t>(a0), rows, K, parts, parts > 1 ? a1 - a0 : 0, mode,
                           reinterpret_cast<int64_t>(stream));
+}
+
+// R4DX_FAKEQ_W: a trellis linear under a non-zero mode needs its scale table (Model::Load builds one for every
+// trellis linear when the switch is on); one without is a bug of the experiment, never a silent fallback.
+static void CheckTrellisWScale(const QuantLinear& w) {
+  if (w.trellis_wscale.empty() || w.trellis_wscale_gsh != FakeQuantWGroupShift(t_fake_quant_w)) {
+    throw std::runtime_error("r4dx::model::ApplyLinear: R4DX_FAKEQ_W is on but trellis weight [" +
+                             std::to_string(w.N) + ", " + std::to_string(w.K) +
+                             "] has no scale table for it (BuildTrellisWScale runs in Model::Load)");
+  }
 }
 
 void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, const uint16_t* x,
@@ -738,6 +772,16 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
       const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) /
                                                  std::sqrt(128.0));
       const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);
+      if (t_fake_quant_w != 0) {
+        // R4DX_FAKEQ_W (fake_quant_w.h): the same launch, the decoded weights rounded to int8.
+        CheckTrellisWScale(w);
+        core::r4d::GemmTrellisNtM256Wq(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), y, ws,
+                                       w.trellis_tickets, static_cast<int>(M), static_cast<int>(K),
+                                       static_cast<int>(N), w.trellis_bits, plan.SK, /*NP=*/1, plan.SKG,
+                                       /*U=*/4, out_scale, plan.SKW, w.trellis_wscale.data(),
+                                       w.trellis_wscale_gsh, s);
+        return;
+      }
       core::r4d::GemmTrellisNtM256(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), y, ws,
                                    w.trellis_tickets, static_cast<int>(M), static_cast<int>(K),
                                    static_cast<int>(N), w.trellis_bits, plan.SK, /*NP=*/1, plan.SKG,
@@ -875,6 +919,17 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
         // side stream, or sharing one Container between concurrently-running Models, would
         // miscount the tickets and corrupt the output silently -- key the tickets per stream
         // first (container.cpp AssignTrellisTickets).
+        if (t_fake_quant_w != 0) {
+          // R4DX_FAKEQ_W (fake_quant_w.h): the same launch, the decoded weights rounded to int8 (this is
+          // also the kernel a one-token Prefill call and a decode step run: M = 1).
+          CheckTrellisWScale(w);
+          core::r4d::GemmTrellisNtM64Wq(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), yc,
+                                        trellis_ws, w.trellis_tickets, m, static_cast<int>(K),
+                                        static_cast<int>(N), w.trellis_bits, t.WV, t.SK, t.MB, t.NPW,
+                                        t.SKG, t.U, t.NT, out_scale, w.trellis_wscale.data(),
+                                        w.trellis_wscale_gsh, s);
+          break;
+        }
         core::r4d::GemmTrellisNtM64(a0, a1, n_split, w.trellis_w.data(), w.trellis_svh.data(), yc,
                                     trellis_ws, w.trellis_tickets, m, static_cast<int>(K),
                                     static_cast<int>(N), w.trellis_bits, t.WV, t.SK, t.MB, t.NPW,

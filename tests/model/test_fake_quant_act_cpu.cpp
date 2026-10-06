@@ -1,6 +1,8 @@
 // test_fake_quant_act_cpu: pure CPU unit test of src/model/fake_quant_act.h -- the R4DX_FAKEQ_ACT parser and the
 // fp32 reference of the int8 round trip (docs/int8-prefill.md) that the GPU kernel r4dx_fake_quant_act_f16 is
-// held to (tests/kernels/test_fake_quant_act, GPU). No HIP, no container.
+// held to (tests/kernels/test_fake_quant_act, GPU) -- and of src/model/fake_quant_w.h, the weight side
+// (R4DX_FAKEQ_W: parser, the per-(column, k group) scale and rounding reference, the scale-table layout) that
+// libr4d's `_wq` trellis kernels are held to (tests/kernels/test_fake_quant_w, GPU). No HIP, no container.
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +10,7 @@
 #include <vector>
 
 #include "fake_quant_act.h"
+#include "fake_quant_w.h"
 
 using namespace r4dx::model;
 
@@ -186,6 +189,156 @@ int main() {
     CHECK(bad_bound == 0, "%d elements farther than s / 2 from x (of %d groups)", bad_bound, groups);
     CHECK(bad_grid == 0, "%d results off the int8 grid", bad_grid);
     CHECK(bad_max == 0, "%d groups whose max did not survive", bad_max);
+  }
+
+  // ======== R4DX_FAKEQ_W: fake_quant_w.h ========
+  // ---- parser ----
+  {
+    const auto parse_w = [](const char* e, bool* ok) {
+      int mode = -1;
+      *ok = ParseFakeQuantW(e, &mode);
+      return mode;
+    };
+    bool okw = false;
+    CHECK(parse_w(nullptr, &okw) == kFakeQuantWOff && okw, "W: unset -> off");
+    CHECK(parse_w("", &okw) == kFakeQuantWOff && okw, "W: empty -> off");
+    CHECK(parse_w("off", &okw) == kFakeQuantWOff && okw, "W: off -> off");
+    CHECK(parse_w("col128", &okw) == kFakeQuantWCol128 && okw, "W: col128");
+    CHECK(parse_w("col32", &okw) == kFakeQuantWCol32 && okw, "W: col32");
+    for (const char* bad :
+         {"COL128", "Col32", "col64", "col", "blk128", "row", "128", "1", "on", "int8", "col128 ", " col32"}) {
+      parse_w(bad, &okw);
+      CHECK(!okw, "W: '%s' must be rejected (an experiment must not silently run unquantized)", bad);
+    }
+    int keep = 77;
+    ParseFakeQuantW("nope", &keep);
+    CHECK(keep == 77, "W: a rejected value leaves *mode alone");
+    CHECK(kFakeQuantWOff == 0 && kFakeQuantWCol128 == 1 && kFakeQuantWCol32 == 2, "W: mode values");
+    CHECK(FakeQuantWGroup(kFakeQuantWCol128) == 128 && FakeQuantWGroup(kFakeQuantWCol32) == 32 &&
+              FakeQuantWGroup(kFakeQuantWOff) == 0,
+          "W: scale group widths");
+    // the kernels' `gsh` is log2 of k-tiles of 16: 16 << gsh is the group
+    CHECK((16 << FakeQuantWGroupShift(kFakeQuantWCol128)) == 128 &&
+              (16 << FakeQuantWGroupShift(kFakeQuantWCol32)) == 32,
+          "W: group shift matches the group width");
+    for (int m : {kFakeQuantWOff, kFakeQuantWCol128, kFakeQuantWCol32}) {
+      int back = -1;
+      CHECK(ParseFakeQuantW(FakeQuantWName(m), &back) && back == m, "W: name of mode %d parses back", m);
+    }
+    // the activation and weight spellings are disjoint where they could be confused
+    int dummy = 0;
+    CHECK(!ParseFakeQuantW("blk128", &dummy) && !ParseFakeQuantAct("col128", &dummy),
+          "W: R4DX_FAKEQ_W does not take R4DX_FAKEQ_ACT's spellings and vice versa");
+  }
+
+  // ---- scale ----
+  {
+    const float a[4] = {127.f, -3.f, 0.f, 50.f};
+    CHECK(FakeQuantWScaleRef(a, 4) == 1.0f, "W: amax 127 -> s = 1");
+    const float b[3] = {-254.f, 1.f, 3.f};
+    CHECK(FakeQuantWScaleRef(b, 3) == 2.0f, "W: amax 254 (negative max) -> s = 2");
+    const float z[4] = {0.f, -0.f, 0.f, 0.f};
+    CHECK(FakeQuantWScaleRef(z, 4) == 1.0f, "W: an all-zero group gets s = 1 (so 1 / s is finite)");
+    const float one[1] = {0.3f};
+    CHECK(FakeQuantWScaleRef(one, 1) == 0.3f / 127.0f, "W: s = amax / 127, one fp32 division");
+  }
+
+  // ---- rounding, by hand (s = 1: q = rint(w), half to even; clamp at +-127) ----
+  {
+    const float in[10] = {0.5f, 1.5f, 2.5f, -2.5f, -0.5f, 126.4f, 127.f, -127.f, 300.f, -300.f};
+    const float want[10] = {0.f, 2.f, 2.f, -2.f, -0.f, 126.f, 127.f, -127.f, 127.f, -127.f};
+    for (int i = 0; i < 10; ++i) {
+      const float got = FakeQuantWRoundRef(in[i], 1.0f);
+      CHECK(SameBits(got, want[i]), "W: round(%g, s=1) = %g, want %g", in[i], got, want[i]);
+    }
+    // s = 2: grid 2 q; 3 / 2 = 1.5 ties to 2 -> 4, 5 / 2 = 2.5 ties to 2 -> 4, -7 / 2 = -3.5 -> -4 -> -8
+    CHECK(FakeQuantWRoundRef(3.f, 2.f) == 4.f && FakeQuantWRoundRef(5.f, 2.f) == 4.f &&
+              FakeQuantWRoundRef(-7.f, 2.f) == -8.f,
+          "W: ties to even on a scale of 2");
+    // symmetric: negating the input negates the output bit for bit, for scales that are not powers of two too
+    uint32_t st = 777u;
+    const auto rnd = [&st] {  // uniform in [-1, 1)
+      st = st * 1664525u + 1013904223u;
+      return static_cast<float>(st >> 8) / static_cast<float>(1u << 23) - 1.0f;
+    };
+    int asym = 0;
+    for (int i = 0; i < 20000; ++i) {
+      const float s = std::exp2(6.0f * rnd()) / 127.0f * (1.0f + 0.1f * rnd());
+      const float w = rnd() * 130.0f * s;
+      if (!SameBits(FakeQuantWRoundRef(-w, s), -FakeQuantWRoundRef(w, s))) ++asym;
+    }
+    CHECK(asym == 0, "W: %d asymmetric roundings (no zero point)", asym);
+  }
+
+  // ---- rounding, properties over pseudo-random columns, both group widths ----
+  {
+    uint32_t st = 4242u;
+    const auto rnd = [&st] {
+      st = st * 1664525u + 1013904223u;
+      return static_cast<float>(st >> 8) / static_cast<float>(1u << 23) - 1.0f;
+    };
+    int bad_bound = 0, bad_grid = 0, bad_max = 0, groups = 0;
+    for (int n : {32, 128}) {
+      std::vector<float> w(static_cast<size_t>(n));
+      for (int trial = 0; trial < 2000; ++trial) {
+        const float mag = std::exp2(3.0f * rnd());
+        float amax = 0.f;
+        for (int i = 0; i < n; ++i) {
+          w[static_cast<size_t>(i)] = rnd() * mag * (i % 29 == 0 ? 3.f : 1.f);
+          amax = std::fmax(amax, std::fabs(w[static_cast<size_t>(i)]));
+        }
+        const float s = FakeQuantWScaleRef(w.data(), n);
+        ++groups;
+        float vmax = 0.f;
+        for (int i = 0; i < n; ++i) {
+          const float v = FakeQuantWRoundRef(w[static_cast<size_t>(i)], s);
+          if (std::fabs(v - w[static_cast<size_t>(i)]) > 0.5f * s * 1.0001f) ++bad_bound;  // the int8 round-off bound
+          const float q = v / s;
+          if (std::fabs(q - std::rint(q)) > 1e-3f || std::fabs(q) > 127.0001f) ++bad_grid;
+          vmax = std::fmax(vmax, std::fabs(v));
+        }
+        if (std::fabs(vmax - amax) > 1e-5f * amax) ++bad_max;  // the column's max maps to +-127 s
+      }
+    }
+    CHECK(bad_bound == 0, "W: %d elements farther than s / 2 from w (of %d groups)", bad_bound, groups);
+    CHECK(bad_grid == 0, "W: %d results off the int8 grid", bad_grid);
+    CHECK(bad_max == 0, "W: %d groups whose max did not survive", bad_max);
+  }
+
+  // ---- table layout and apply: Q[K][N], K = 256, N = 3 ----
+  {
+    const int K = 256, N = 3;
+    std::vector<float> Q(static_cast<size_t>(K) * N);
+    for (int k = 0; k < K; ++k) {
+      Q[static_cast<size_t>(k) * N + 0] = (k == 5) ? 127.f : 0.4f;                          // col 0: group 0 amax 127
+      Q[static_cast<size_t>(k) * N + 1] = (k == 200) ? -2.54f : (k == 40 ? 0.4f : 0.01f);   // col 1
+      Q[static_cast<size_t>(k) * N + 2] = 0.f;                                              // col 2: all zero
+    }
+    const std::vector<float> t128 = FakeQuantWTableRef(Q.data(), K, N, 128);
+    CHECK(t128.size() == 2u * N, "W: col128 table is [K/128][N], got %zu floats", t128.size());
+    CHECK(t128[0 * N + 0] == 1.0f, "W: col128 [g0][c0] = 127/127");
+    CHECK(t128[1 * N + 0] == 0.4f / 127.0f, "W: col128 [g1][c0] = 0.4/127");
+    CHECK(t128[0 * N + 1] == 0.4f / 127.0f, "W: col128 [g0][c1]: the 0.4 at k = 40 is the max of its group");
+    CHECK(t128[1 * N + 1] == 2.54f / 127.0f, "W: col128 [g1][c1]: k = 200 is in group 1");
+    CHECK(t128[0 * N + 2] == 1.0f && t128[1 * N + 2] == 1.0f, "W: an all-zero column gets 1.0f");
+    const std::vector<float> t32 = FakeQuantWTableRef(Q.data(), K, N, 32);
+    CHECK(t32.size() == 8u * N, "W: col32 table is [K/32][N], got %zu floats", t32.size());
+    CHECK(t32[1 * N + 1] == 0.4f / 127.0f && t32[0 * N + 1] == 0.01f / 127.0f,
+          "W: col32: k = 40 is in group 1, group 0 of column 1 has amax 0.01");
+    CHECK(t32[6 * N + 1] == 2.54f / 127.0f, "W: col32: k = 200 is in group 6");
+    // apply: column 0 under col128: group 0's 0.4s flush (s = 1), group 1's survive (own scale 0.4 / 127)
+    const std::vector<float> q128 = FakeQuantWApplyRef(Q.data(), K, N, 128, t128);
+    CHECK(q128[5 * N + 0] == 127.f && q128[7 * N + 0] == 0.f, "W: col128 column 0, group 0: max kept, 0.4 flushed");
+    CHECK(std::fabs(q128[200 * N + 0] - 0.4f) <= 0.5f * (0.4f / 127.0f) * 1.0001f && q128[200 * N + 0] != 0.f,
+          "W: col128 column 0, group 1 has its own scale (got %g)", q128[200 * N + 0]);
+    // col32: k = 40 of column 0 is in group 1 (0.4 only), so it keeps its value where col128 flushed it
+    const std::vector<float> q32 = FakeQuantWApplyRef(Q.data(), K, N, 32, t32);
+    CHECK(q32[6 * N + 0] == 0.f && std::fabs(q32[40 * N + 0] - 0.4f) <= 0.5f * (0.4f / 127.0f) * 1.0001f &&
+              q32[40 * N + 0] != 0.f,
+          "W: col32: column 0's 0.4 at k = 40 has its own group (got %g), k = 6 shares group 0 with the 127",
+          q32[40 * N + 0]);
+    CHECK(q128[40 * N + 0] == 0.f, "W: col128 flushes that same element");
+    for (int k = 0; k < K; ++k) CHECK(q32[static_cast<size_t>(k) * N + 2] == 0.f, "W: the zero column stays zero");
   }
 
   if (g_fail != 0) {

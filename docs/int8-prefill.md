@@ -1,7 +1,9 @@
 # int8 activations in prefill: the accuracy cost, measured before any int8 GEMM is written
 
-Status (2026-10-07, branch `int8q`): the measurement switch is written and its CPU tests pass; the GPU runs are
-PENDING (the commands are below, the results table is empty).
+Status (2026-10-07, branch `int8q`): the activation switch `R4DX_FAKEQ_ACT` is written, its CPU tests pass and
+its GPU runs are in the results below. The weight switch `R4DX_FAKEQ_W` (section "The weight side") is written,
+built and its CPU tests pass; its kernels and their bit-test are built and NOT run (CPU-only session), and its
+GPU runs are PENDING (the commands and an empty results table are in that section).
 
 The question: a trellis linear's GEMM (docs/trellis-kernel.md, docs/trellis-m256.md) multiplies an f16
 activation tile, the input after the 128-block Hadamard rotation, by on-the-fly decoded weights on f16 WMMA.
@@ -168,11 +170,175 @@ Reading it: a mean-KL increase of 0.001 to 0.003 for `blk128` confirms the paper
 prefill GEMM worth building; `row` is expected to be clearly worse (the w4a8 lesson). The budget the
 production container has is the gap between its KL and the 0.01 gate (docs/gemma4-plan.md, docs/quant2.md).
 
+## The weight side: R4DX_FAKEQ_W
+
+The other half of an int8 x int8 prefill GEMM. A trellis weight is decoded in the GEMM from its code to an f16
+codebook value, which is not on an int8 grid. `R4DX_FAKEQ_W` rounds each DECODED weight to a symmetric int8 grid
+before it enters the WMMA, in prefill only, and runs the rest of the GEMM unchanged (f16 WMMA, fp32 accumulate,
+the same FWHT / svh / bf16 epilogue). It measures the weight rounding only; with `R4DX_FAKEQ_ACT` on as well the
+numerics are the full int8 x int8 ones except the accumulation (int32 in a real kernel).
+
+### What is rounded
+
+Q is the decoded weight in its regularized domain, Q[K][N] (the values the WMMA multiplies; W^T = diag(suh) H Q
+H diag(svh)), f16. A scale group is one OUTPUT COLUMN n of Q over a block of k:
+
+| value | scale group | scale table |
+|---|---|---|
+| unset, empty, `off` | nothing: the shipped kernels, bit for bit | none |
+| `col128` | (column n, 128 k): the rotation's own block, matches `R4DX_FAKEQ_ACT=blk128` | fp32 [K/128][N], K * N / 32 bytes per linear |
+| `col32` | (column n, 32 k): matches `blk32` | fp32 [K/32][N], 4x that |
+
+Per group, in fp32: `s = max|w| / 127` (1.0f for an all-zero group), `rs = 1 / s` (IEEE division),
+`q = clamp(rint(w * rs), -127, 127)` (`rint` is round half to even), `v = q * s` (the product is rounded to fp32
+first, then once to f16). src/model/fake_quant_w.h is the CPU transcription (`FakeQuantWScaleRef`,
+`FakeQuantWRoundRef`, `FakeQuantWTableRef`, `FakeQuantWApplyRef`); tests/model/test_fake_quant_act_cpu.cpp
+tests the parser and the reference (hand values, symmetry, the half-s error bound, the grid, the table layout).
+Read once per process in `Model::Load` (an unrecognized value throws before the weights are read), one line on
+stderr when active (it prints the table's VRAM). Combine with `R4DX_FAKEQ_ACT` freely; they are independent
+thread-local scopes opened around the same layer loop, `Model::RunChunk` with `is_prefill_path`, so decode,
+`DecodeStep*`, `VerifyWindow`, the MTP / DFlash heads, the lm_head and the vision tower never see either
+(`PrefillProfiled` opens both per chunk; the Gemma 4 models are not wired).
+
+### Design
+
+* A scale table per trellis linear, built once at `Model::Load` (after the weights are resident, only when the
+  switch is on) by `Container::BuildTrellisWScales` -> `BuildTrellisWScale` (src/model/linear.cpp) ->
+  libr4d's `r4d_trellis_wscale_f32`. The builder decodes with the GEMM's own functions
+  (`r4d_trellis_k4_decode` / `k5_decode`, r4d_trellis_dq.h), one wave per (tile pair, group) with a lane xor 16
+  joining the two k halves of a fragment, so the amax is taken over exactly the f16 values the WMMA sees.
+  Memory at `col128`: K * N / 32 bytes per linear, about 0.8 GB for the model (weights are 16.3 GiB on a 32 GB
+  card; `col32` is 4x that, about 3.4 GB; the Load line prints the measured figure). The table is
+  `QuantLinear::trellis_wscale`, empty when the switch is off.
+* The rounding happens IN the GEMM kernels, on the decoded fragment, before the WMMA. A decoded fragment (f0 or
+  f1) is one lane's eight k of ONE column of Q, so one scale serves all eight; the lane loads its two scales
+  per decoded (tile pair, k-tile) and pays about one division and 8 x (mul, rndne, med3, mul, cvt) per fragment
+  on top of the 62-VALU decode, so the K loop is several times longer (by instruction count; not timed). This
+  is a measurement tool, not a fast kernel.
+  `r4d_trellis_wq_round` (r4d_trellis_dq.h) is the one function; the product barrier is an empty asm because the
+  backend otherwise folds `fptrunc(q * s)` into a single-rounding `v_fma_mix_f16` (seen in the first listing),
+  which is not the fp32 product followed by the f16 conversion the CPU reference does. The listing now has
+  `v_mul_f32` + `v_cvt_f16_f32`.
+* Why not decode to a dense f16 matrix, round it, and run a dense GEMM: it needs a dense f16 GEMM with the
+  trellis epilogue (none exists), and a different summation order, which would add noise to every comparison
+  against the switch-off baseline. Rounding inside the trellis kernel keeps (SK, SKG, Wc) and the epilogue
+  identical, so on vs off differs by the weight rounding alone.
+* What a real int8 kernel would have to do is the same: decode, multiply by a precomputed `1 / s`, round, with
+  `s` from a table of the size above (or a pass over the k block); an on-the-fly amax per 128-k group would need
+  the whole group decoded before the first WMMA.
+
+### Which kernels, by measurement path
+
+| measurement | path | kernels that run rounded |
+|---|---|---|
+| `kl_rung4.ps1 ... -ToolArgs '--tail-rows','1023','--tail-path','prefill'` | every row a one-token `Prefill` call: `RunChunk(is_prefill_path)` -> `ApplyLinear` with M = 1 -> the loop over <= 64-row chunks, one chunk | `r4d_gemm_trellis_nt_m64` with the shipped M = 1 tuning row: the kernel a decode step runs (decode itself is outside the scope) |
+| `tools/prefill/run_kl.ps1` (a 768-token prefix through the chunked path, then the tail) | a full 256-row super-chunk when `R4DX_PREFILL_CHUNK=256` and the linear has an M = 256 plan (check the `prefill chunk:` stderr line); every other chunk and a linear without a plan: 64-row slices | `r4d_gemm_trellis_nt_m256` (the decoding wave rounds before it publishes the fragment in LDS, so all four row groups see rounded weights) and `r4d_gemm_trellis_nt_m64` for the slices, the < 256-row tail chunk (M = 1..64) and the per-linear fallback |
+| not scoped | decode, verify windows, MTP / DFlash, lm_head, vision | the shipped kernels |
+
+Every instantiation of both kernels has a rounding variant (KB 4 and 5; every (NP, U, MT) of the M <= 64 kernel,
+49 of them since NT does not select a kernel in the rounding unit; every configuration of the M = 256 table, 22).
+`NT` (non-temporal weight loads) is a cache hint; the rounding kernels always use temporal loads.
+
+### OFF path: identical code, and how that was checked
+
+Switch unset: the model never builds a table, never opens a non-zero scope, and `ApplyLinear` takes the shipped
+launches (one thread-local int test). In libr4d the rounding is a template parameter that defaults to false
+(`bool WQ = false` and a trailing parameter pack that is empty, so the shipped signature and mangling prefix are
+as before), with every use under `if constexpr (WQ)`, and the rounding instantiations live in two units of their
+own, `r4d_gemm_trellis_nt_m64_wq.hip` and `r4d_gemm_trellis_nt_m256_wq.hip`, which `#include` the shipped
+sources with `R4D_TQ_WQ_UNIT` / `R4D_T256_WQ_UNIT` defined (the shipped entry points are compiled out there and
+only the rounding launches in).
+Two attempts that did not hold, kept because the check caught them: moving the body into a `__device__` function
+called by two kernels changed 98 of 98 shipped M <= 64 kernels; and keeping the rounding variant in the SAME unit
+as the shipped kernels changed every one of the 98 by a few instructions (the epilogue's lane compare), although
+the rounding variant is a different function. Hence the separate units.
+
+Checked with `hipcc -S` listings (the unit's own flags, exactly what `third_party/CMakeLists.txt` builds), from
+the sources at `3685ccc` and from this branch: the shipped M <= 64 unit (98 kernels + 2 reconstruct) and the
+M = 256 unit (22 kernels), instruction text with comments and symbol names normalised, per kernel, and the whole
+listing (instructions and code-object metadata: `.vgpr_count`, scratch, kernarg sizes) as a sorted multiset of
+lines: 0 differences, both units. `tools/reference/compare_isa_listings.ps1 <before.s> <after.s>` repeats that.
+The build's own checks hold: `check_trellis_isa` on the shipped units (max 189 / 188 VGPRs, no scratch, no
+spills, 0 near dependencies) and `check_qwen_attn_isa` (baseline hash unchanged). The rounding units get the
+same script with `-DWQ=ON`: near dependencies gated, resources reported (49 M <= 64 rounding kernels, max 192
+VGPRs, one with 88 bytes of scratch (KB 5, NP 2, U 2, MT 3); 22 M = 256 kernels, max 191 VGPRs, no scratch).
+A spilling kernel is slower, not wrong.
+
+### Commands (device 1 or 0; outputs under `E:\models\r4dx\int8q\`; one GPU job at a time)
+
+Build: `cmake --build build\win-hip --target tool_teacher_forced_logprobs test_fake_quant_w -j 12` (done; the
+exes below are this worktree's). All of these were NOT run by the session that wrote them.
+
+```
+# w0. the kernels against the CPU reference: scale table, one-hot rows of Q' through every instantiation, the
+#     M = 256 kernel vs four 64-row launches on the model's linear classes, the whole linear (a minute at most)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\kernels\test_fake_quant_w.exe; exit `$LASTEXITCODE"
+# w1. switch unset: byte-identical to rocm1010\kl (all four segments must print byte-identical)
+powershell -NoProfile -Command "& C:\Users\pay20\dev\r4dx-int8q\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8q\kl-w-off -CompareDir E:\models\r4dx\rocm1010\kl; exit `$LASTEXITCODE"
+# w2. weights only, col128, on the one-token prefill path (baseline: kl-off-pfx)
+powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col128'; & C:\Users\pay20\dev\r4dx-int8q\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8q\kl-wcol128 -NoGate -CompareDir '' -ToolArgs '--tail-rows','1023','--tail-path','prefill'; exit `$LASTEXITCODE"
+# w3. full w8a8 numerics: col128 + blk128
+powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col128'; `$env:R4DX_FAKEQ_ACT='blk128'; & C:\Users\pay20\dev\r4dx-int8q\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8q\kl-wcol128-ablk128 -NoGate -CompareDir '' -ToolArgs '--tail-rows','1023','--tail-path','prefill'; exit `$LASTEXITCODE"
+# w4. the finer bound: col32 + blk32
+powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col32'; `$env:R4DX_FAKEQ_ACT='blk32'; & C:\Users\pay20\dev\r4dx-int8q\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8q\kl-wcol32-ablk32 -NoGate -CompareDir '' -ToolArgs '--tail-rows','1023','--tail-path','prefill'; exit `$LASTEXITCODE"
+# w5 (optional). the real chunked path, M = 256 kernel: weights only, same form as the existing kl-chunk-off / kl-chunk-blk128
+powershell -NoProfile -Command "`$env:R4DX_FAKEQ_W='col128'; & C:\Users\pay20\dev\r4dx-int8q\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8q\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8q\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8q\kl-chunk-wcol128; exit `$LASTEXITCODE"
+```
+
+Check in each run's `tool.log` that stderr carries the `R4DX_FAKEQ_W=...: scale tables built` line (w2 - w5) and
+`R4DX_FAKEQ_ACT=...` where set (w3, w4), and neither in w1. The one-token path runs the rounded M = 1 kernel
+4092 times per segment set and is slower than the activation runs (the K loop is several times longer; guess
+10 - 15 minutes). Compare against the unquantized one-token baseline `kl-off-pfx`:
+
+```
+C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20\dev\r4dx-int8q\tools\prefill\kl_compare.py --ref E:\models\r4dx\int8q\kl-off-pfx --test E:\models\r4dx\int8q\kl-wcol128 --tokens C:\Users\pay20\dev\r4dx-int8q\tools\reference\kl_corpus\tokens_canon.json
+```
+
+(and `kl-wcol128-ablk128`, `kl-wcol32-ablk32`; for w5 `--ref E:\models\r4dx\int8q\kl-chunk-off --test ...\kl-chunk-wcol128`).
+
+### Results (PENDING; to fill from the runs above)
+
+Mean KL against the bf16 reference (`[kl_rung4]` line) and top-1 in %; the baseline is `kl-off-pfx` (0.00751,
+95.72). Activations alone (from the table above): blk128 +0.00039, blk32 +0.00007.
+
+| run | R4DX_FAKEQ_W | R4DX_FAKEQ_ACT | path | mean KL | top-1 | cpp | english | python | thai |
+|---|---|---|---|---|---|---|---|---|---|
+| kl-w-off | unset | unset | decode (uniform pass), gate vs rocm1010 | | | | | | |
+| kl-wcol128 | col128 | unset | one-token prefill | | | | | | |
+| kl-wcol128-ablk128 | col128 | blk128 | one-token prefill | | | | | | |
+| kl-wcol32-ablk32 | col32 | blk32 | one-token prefill | | | | | | |
+| kl-chunk-wcol128 | col128 | unset | chunked prefill (M = 256) | | | | | | |
+
+`KL(off || on)` from `kl_compare.py` against `kl-off-pfx`, 4092 rows:
+
+| on | mean KL | p99 | max | top-1 agreement |
+|---|---|---|---|---|
+| col128 | | | | |
+| col128 + blk128 | | | | |
+| col32 + blk32 | | | | |
+
+Reading it: weights and activations roughly add if their errors are independent; a w8a8 total under the
+activation-only +0.0004 plus a similar weight term keeps `col128 + blk128` well inside the production budget
+(the gap to the 0.01 gate, docs/gemma4-plan.md, docs/quant2.md). A weight term far above the activation one would
+say the int8 grid of a trellis weight is the obstacle and not the activations.
+
+### Weight-side caveats
+
+* Accumulation is f16 WMMA with fp32 accumulate, not int32; a real kernel rescales each k group's integer
+  partial sum (the activation's 128-block scale times the weight's column scale).
+* The scale is exact fp32 here; a stored table would be f16 or a power of two, which adds error. `col32` is the
+  bound on what finer scales recover.
+* Under tensor parallel a rank decodes its own shard; the table is built per rank from its own words and a group
+  never crosses a shard (K and N shards are whole 128-blocks), but TP is not wired or tested for this switch:
+  measure at TP = 1.
+* The one-token path runs the M <= 64 kernel at M = 1 only; the M = 256 kernel's rounding is covered by the
+  optional w5 run and, bit for bit, by `test_fake_quant_w` (which compares it with four 64-row launches).
+
 ## Caveats
 
-* Activations only. An int8 x int8 GEMM also needs int8 weights; the trellis weights decode to f16 codebook
-  values and are not int8. Whether they can be (and at what cost) is a separate question this switch cannot
-  answer.
+* The weights are unrounded in everything above `R4DX_FAKEQ_W`'s section: those runs measure the activation
+  rounding only. An int8 x int8 GEMM also needs int8 weights, and the trellis weights decode to f16 codebook
+  values that are not on an int8 grid; the section above measures what putting them on one costs.
 * The GEMM still accumulates in f16 WMMA, not int32, so the accumulation noise of a real int8 kernel is not
   modeled; with `blk128` the real kernel would also have to rescale each 128-block's int32 partial sum.
 * Round-trip rounding is exact in fp32 here; a real kernel's `s` may be stored in f16 or as a power of two,

@@ -23,6 +23,7 @@
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
 #include "fake_quant_act.h"  // R4DX_FAKEQ_ACT (docs/int8-prefill.md)
+#include "fake_quant_w.h"    // R4DX_FAKEQ_W (docs/int8-prefill.md)
 #include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/prefill.md)
 #ifdef R4DX_TP_TESTING
 #include "state_digest.h"
@@ -195,6 +196,7 @@ Model Model::Load(const ModelOptions& opts) {
   }
   const ModelOptions::VisionMode vision_mode = opts.vision;
   (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
+  (void)FakeQuantWRequest();    // R4DX_FAKEQ_W: likewise
   if (is_tp_rank) {
     if (tp.comm == nullptr || tp.comm->World() != tp.world || tp.comm->Rank() != tp.rank) {
       throw std::invalid_argument(
@@ -246,6 +248,22 @@ Model Model::Load(const ModelOptions& opts) {
     m.container_ = Container::Load(opts.container_path, co);
   }
   const VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  // R4DX_FAKEQ_W (docs/int8-prefill.md): the one-time pass that decodes every trellis linear and stores its
+  // per-(column, k group) scale table, which the prefill GEMMs' rounding variants read. Nothing at all when
+  // the switch is unset.
+  if (const int fqw = FakeQuantWRequest(); fqw != kFakeQuantWOff) {
+    m.container_.BuildTrellisWScales(fqw, m.stream_.get());
+    m.stream_.Synchronize();
+    const VramSnap vram_fqw = SnapVram();
+    std::cerr << "[r4dx::model::Model] R4DX_FAKEQ_W=" << FakeQuantWName(fqw)
+              << ": scale tables built for every trellis linear (one scale per output column x "
+              << FakeQuantWGroup(fqw) << " k), "
+              << (vram1.ok && vram_fqw.ok ? GiB(static_cast<int64_t>(vram1.free_bytes) -
+                                                static_cast<int64_t>(vram_fqw.free_bytes))
+                                          : 0.0)
+              << " GiB; the decoded weights are rounded to int8 and back in prompt prefill only "
+                 "(accuracy experiment, not a production setting)\n";
+  }
   // docs/tp.md 8.3: a tensor-parallel rank without the tower (rank 1) only parsed the vision
   // config, so the "the container has vision" test is HasVisionConfig() there -- the tower itself
   // is rank 0's. At TP=1 the two are the same test.
@@ -935,6 +953,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // (any row count, tails included) and nowhere else -- not decode, and ended below before the MTP head's
   // priming, the DFlash drafter's injection and the lm_head. Mode 0 (unset) touches nothing.
   ScopedFakeQuantAct fakeq_scope(is_prefill_path ? FakeQuantActRequest() : kFakeQuantOff);
+  ScopedFakeQuantW fakeqw_scope(is_prefill_path ? FakeQuantWRequest() : kFakeQuantWOff);  // R4DX_FAKEQ_W
   if (wide) ++wide_chunks_run_;
 
   uint16_t* cur = buf_a_.data();
@@ -1063,6 +1082,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   }
   if (probe_ != nullptr) probe_->SetLayer(-1);
   fakeq_scope.End();
+  fakeqw_scope.End();
   // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
   // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
   // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
@@ -1905,6 +1925,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     const bool wide = wide_rows > max_chunk_ && T == wide_rows;
     const ScopedTrellisM256 trellis_m256_scope(wide);
     const ScopedFakeQuantAct fakeq_scope(FakeQuantActRequest());  // R4DX_FAKEQ_ACT, as RunChunk
+  const ScopedFakeQuantW fakeqw_scope(FakeQuantWRequest());     // R4DX_FAKEQ_W, as RunChunk
     const bool has_init = started_;
 
     // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's

@@ -301,6 +301,51 @@ inline size_t GemmTrellisM256WsBytes(int M, int N, int SKG) {
   return r4d_gemm_trellis_nt_m256_ws_bytes(M, N, SKG);
 }
 
+// R4DX_FAKEQ_W (r4d.h "weight fake-quant", docs/int8-prefill.md): a MEASUREMENT hook. The scale table of one
+// trellis linear (TrellisWscaleCount floats, [K / 16 >> gsh][N]) and the three launches of the entries above
+// with every decoded weight fragment rounded to symmetric int8 and back by it. `wscale` is the table, `gsh`
+// log2 of the k-tiles per scale group (3 = 128 k, 1 = 32 k); NT is ignored (the rounding kernels always load
+// weights temporally).
+inline size_t TrellisWscaleCount(int K, int N, int gsh) { return r4d_trellis_wscale_count(K, N, gsh); }
+inline void TrellisWscaleBuild(const void* w, void* scale, int K, int N, int KB, int gsh,
+                               hipStream_t stream) {
+  r4d_trellis_wscale_f32(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(scale), K, N, KB, gsh,
+                         reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtM64Wq(const void* a0, const void* a1, int n_split, const void* w,
+                                const void* svh, void* c, void* ws, void* tickets, int M, int K,
+                                int N, int KB, int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                                float out_scale, const void* wscale, int gsh, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                             reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                             reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                             reinterpret_cast<int64_t>(tickets), M, K, N, KB, WV, SK, MT, NP, SKG, U,
+                             NT, out_scale, reinterpret_cast<int64_t>(wscale), gsh,
+                             reinterpret_cast<int64_t>(stream));
+}
+// _raw: fp32 C = A @ Q' (no output transform), Q' the rounded Q; one-hot A rows return rows of Q' bit for bit.
+inline void GemmTrellisNtM64RawWq(const void* a0, const void* a1, int n_split, const void* w, void* c,
+                                   void* ws, void* tickets, int M, int K, int N, int KB, int WV, int SK,
+                                   int MT, int NP, int SKG, int U, int NT, const void* wscale, int gsh,
+                                   hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64_raw_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                                 reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(c),
+                                 reinterpret_cast<int64_t>(ws), reinterpret_cast<int64_t>(tickets), M, K,
+                                 N, KB, WV, SK, MT, NP, SKG, U, NT, reinterpret_cast<int64_t>(wscale),
+                                 gsh, reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtM256Wq(const void* a0, const void* a1, int n_split, const void* w,
+                                 const void* svh, void* c, void* ws, void* tickets, int M, int K, int N,
+                                 int KB, int SK, int NP, int SKG, int U, float out_scale, int skw,
+                                 const void* wscale, int gsh, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m256_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                              reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                              reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                              reinterpret_cast<int64_t>(tickets), M, K, N, KB, SK, NP, SKG, U, out_scale,
+                              reinterpret_cast<int64_t>(stream), skw, reinterpret_cast<int64_t>(wscale),
+                              gsh);
+}
+
 inline void DflashConvT2G16Bf16(const void* x, const void* delta, const void* base, void* out,
                                  int T, int H, int dpitch, int NG, int taps, int group,
                                  int block_size, hipStream_t stream) {

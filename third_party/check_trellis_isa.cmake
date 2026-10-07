@@ -9,7 +9,9 @@
 # GEMM_KERNEL (default r4d_gemm_trellis_nt_m64_kernel) names the GEMM kernel template whose
 # instantiations the listing is checked for: the M <= 64 unit, or the M = 256 / 128 unit
 # (r4d_gemm_trellis_nt_m256.hip, whose instantiation table r4d_t256_inst lists only the combinations
-# that meet the same rules). MAX_VGPR (default 190) is the VGPR limit of the instantiations.
+# that meet the same rules), or the int8 x int8 unit (r4d_gemm_trellis_nt_i8.hip: -DGEMM_KERNEL=i8g_kernel
+# -DMAX_VGPR=192, the cap of its amdgpu_waves_per_eu(8) kernel; its 6 production instantiations, nothing else).
+# MAX_VGPR (default 190) is the VGPR limit of the instantiations.
 #
 # Reads a device-only -S listing and fails the build unless
 #

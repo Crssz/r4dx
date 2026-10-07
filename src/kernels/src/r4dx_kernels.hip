@@ -618,6 +618,124 @@ __global__ void KvWritePagedFp8Kernel(const __hip_bfloat16* __restrict__ k_new,
   }
 }
 
+// ---- attention pre-core chain, one launch (decode-t1 item 4, docs/perf.md) -----------------------
+// Replaces, on the text-only (single-row rope) path, the five launches between the k/v projections and
+// the attention core -- r4dx_model_attn_split_qg_bf16, r4dx_rmsnorm_bf16 on q and on k (per-head
+// q_norm / k_norm), r4dx_rope_partial_mrope_bf16 and r4dx_kv_write_paged_fp8_hnd -- with the same bytes:
+//   q[t, h, :]    = rope(rmsnorm(qg[t, h, 0:D], q_norm))                          bf16
+//   gate[t, h, :] = qg[t, h, D:2D]                                                bf16 copy
+//   cache(slot(t), kh, K half) = fp8(bf16(rope(rmsnorm(k[t, kh, :], k_norm))) * 1/k_descale[kh])
+//   cache(slot(t), kh, V half) = fp8(v[t, kh, :] * 1/v_descale[kh])
+// (the rope'd k never goes back to a bf16 buffer: nothing but the cache write reads it).
+// One wavefront per (token, head); grid = (T, heads_q + heads_k). Bit-exactness is by construction, each
+// stage being the replaced kernel's own arithmetic in the same order (the file builds with
+// -ffp-contract=off, so no stage can fuse differently):
+//   - rmsnorm: RmsNormKernel's vector path on a row of head_dim <= 256 -- lane l owns the 16-byte chunk l,
+//     ss = sum over its eight elements of (fl*fl + fh*fh) in order, then the same xor tree over the 32
+//     lanes (RmsNormKernel's other seven waves hold 0, and a sum with exact zeros is the sum),
+//     rstd = rsqrtf(ss / head_dim + eps), out = bf16((x * rstd) * (1 + w));
+//   - rope: RopePartialMropeKernel's per-pair expression, c/s from the same exp2f / log2f / sincosf;
+//   - kv write: KvWritePagedFp8Kernel's addressing and conversion.
+// The host takes this path only where RmsNormKernel would have taken its vector path (head_dim % 8 == 0,
+// the rows and weights 16-byte aligned): the scalar fallback sums in another order.
+constexpr int kPrecoreMaxHeadDim = 256;  // = 32 lanes x one 16-byte chunk
+
+__global__ __launch_bounds__(32) void AttnPrecoreKernel(
+    const __hip_bfloat16* __restrict__ qg, const __hip_bfloat16* __restrict__ k_in,
+    const __hip_bfloat16* __restrict__ v_in, const __hip_bfloat16* __restrict__ q_norm,
+    const __hip_bfloat16* __restrict__ k_norm, const int32_t* __restrict__ positions,
+    __hip_bfloat16* __restrict__ q_out, __hip_bfloat16* __restrict__ gate_out,
+    const float* __restrict__ k_descale, const float* __restrict__ v_descale,
+    uint8_t* __restrict__ kv_cache, int heads_q, int heads_k, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int64_t kv_block_stride, int64_t kv_head_stride) {
+  const int t = blockIdx.x;
+  const int hh = blockIdx.y;
+  const bool is_q = hh < heads_q;
+  const int kh = hh - heads_q;  // the k/v head, k rows only
+  const int lane = threadIdx.x;
+  const int n4 = head_dim >> 3;  // 16-byte chunks per row, <= 32
+
+  const __hip_bfloat16* src = is_q ? qg + (static_cast<int64_t>(t) * heads_q + hh) * 2 * head_dim
+                                   : k_in + (static_cast<int64_t>(t) * heads_k + kh) * head_dim;
+  const __hip_bfloat16* w = is_q ? q_norm : k_norm;
+
+  __shared__ __attribute__((aligned(16))) uint16_t row[kPrecoreMaxHeadDim];  // the normed, then rope'd, bf16 row
+
+  // ---- rmsnorm over the row ----
+  uint4 xc = make_uint4(0u, 0u, 0u, 0u);
+  float ss = 0.0f;
+  if (lane < n4) {
+    xc = reinterpret_cast<const uint4*>(src)[lane];
+    const unsigned dw[4] = {xc.x, xc.y, xc.z, xc.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      __hip_bfloat16 lo, hi;
+      UnpackBf16x2(dw[j], &lo, &hi);
+      const float fl = __bfloat162float(lo), fh = __bfloat162float(hi);
+      ss += fl * fl + fh * fh;
+    }
+  }
+  for (int o = 16; o; o >>= 1) ss += __shfl_xor(ss, o, 32);
+  const float rstd = rsqrtf(ss / static_cast<float>(head_dim) + eps);
+  if (lane < n4) {
+    const uint4 wc = reinterpret_cast<const uint4*>(w)[lane];
+    const unsigned xdw[4] = {xc.x, xc.y, xc.z, xc.w};
+    const unsigned wdw[4] = {wc.x, wc.y, wc.z, wc.w};
+    uint32_t* row32 = reinterpret_cast<uint32_t*>(row) + lane * 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      __hip_bfloat16 xlo, xhi, wlo, whi;
+      UnpackBf16x2(xdw[j], &xlo, &xhi);
+      UnpackBf16x2(wdw[j], &wlo, &whi);
+      const float ov_lo = __bfloat162float(xlo) * rstd * (1.0f + __bfloat162float(wlo));
+      const float ov_hi = __bfloat162float(xhi) * rstd * (1.0f + __bfloat162float(whi));
+      row32[j] = PackBf16x2(__float2bfloat16(ov_lo), __float2bfloat16(ov_hi));
+    }
+  }
+  __syncthreads();
+
+  // ---- partial rotary, NeoX half-split (one lane per frequency bin; the pairs are disjoint) ----
+  const int half = rotary_dim / 2;
+  const float pos = static_cast<float>(positions[t]);
+  for (int hd = lane; hd < half; hd += 32) {
+    const float inv_freq = exp2f(-(2.0f * hd) / static_cast<float>(rotary_dim) * log2f(theta));
+    const float angle = pos * inv_freq;
+    float c, s;
+    sincosf(angle, &s, &c);
+    const float x0 = __bfloat162float(__ushort_as_bfloat16(row[hd]));
+    const float x1 = __bfloat162float(__ushort_as_bfloat16(row[hd + half]));
+    row[hd] = __bfloat16_as_ushort(__float2bfloat16(x0 * c - x1 * s));
+    row[hd + half] = __bfloat16_as_ushort(__float2bfloat16(x1 * c + x0 * s));
+  }
+  __syncthreads();
+
+  if (is_q) {
+    // q row out, and the gate half of the qg row copied beside it
+    const int64_t o = (static_cast<int64_t>(t) * heads_q + hh) * head_dim;
+    if (lane < n4) {
+      reinterpret_cast<uint4*>(q_out + o)[lane] = reinterpret_cast<const uint4*>(row)[lane];
+      reinterpret_cast<uint4*>(gate_out + o)[lane] = reinterpret_cast<const uint4*>(src + head_dim)[lane];
+    }
+    return;
+  }
+
+  // ---- k head: fp8 cache write of the rope'd k row and of the v row ----
+  const int slot = positions[t];
+  if (slot < 0) return;  // -1 = skip this padded token, as KvWritePagedFp8Kernel
+  const int block_id = slot / block_size;
+  const int offset = slot % block_size;
+  const int64_t base = static_cast<int64_t>(block_id) * kv_block_stride +
+                       static_cast<int64_t>(kh) * kv_head_stride +
+                       static_cast<int64_t>(offset) * (2 * head_dim);
+  const float kd_inv = 1.0f / k_descale[kh];
+  const float vd_inv = 1.0f / v_descale[kh];
+  const __hip_bfloat16* vv = v_in + (static_cast<int64_t>(t) * heads_k + kh) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    kv_cache[base + d] = FloatToFp8E4M3(__bfloat162float(__ushort_as_bfloat16(row[d])) * kd_inv);
+    kv_cache[base + head_dim + d] = FloatToFp8E4M3(__bfloat162float(vv[d]) * vd_inv);
+  }
+}
+
 // ---- device argmax ------------------------------------------------------------------------
 // One block, grid-stride loop over `vocab` (kernels.h: ~1MB at this model's vocab, comfortably one
 // block's worth of work). Reduces (value, index) pairs together (not a separate max-then-search
@@ -1605,6 +1723,39 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                      (const __hip_bfloat16*)v_new, (const int32_t*)slot_mapping,
                      (const float*)k_descale, (const float*)v_descale, (uint8_t*)kv_cache,
                      kv_heads, head_dim, block_size, kv_block_stride, kv_head_stride);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+int r4dx_attn_precore_supported(int head_dim, int rotary_dim, int64_t qg, int64_t k, int64_t q_norm,
+                                 int64_t k_norm, int64_t q_out, int64_t gate_out) {
+  if (head_dim <= 0 || head_dim % 8 != 0 || head_dim > kPrecoreMaxHeadDim) return 0;
+  if (rotary_dim <= 0 || rotary_dim % 2 != 0 || rotary_dim > head_dim) return 0;
+  for (const int64_t p : {qg, k, q_norm, k_norm, q_out, gate_out}) {
+    if (p == 0 || p % 16 != 0) return 0;
+  }
+  return 1;
+}
+
+void r4dx_attn_precore_bf16(int64_t qg, int64_t k, int64_t v, int64_t q_norm, int64_t k_norm,
+                             int64_t positions, int64_t q_out, int64_t gate_out, int64_t k_descale,
+                             int64_t v_descale, int64_t kv_cache, int T, int heads_q, int heads_k,
+                             int head_dim, int rotary_dim, float theta, float eps, int block_size,
+                             int64_t kv_block_stride, int64_t kv_head_stride, int64_t stream) {
+  if (T <= 0 || heads_q <= 0 || heads_k <= 0) return;
+  if (!r4dx_attn_precore_supported(head_dim, rotary_dim, qg, k, q_norm, k_norm, q_out, gate_out)) {
+    throw std::runtime_error(
+        "r4dx_attn_precore_bf16: needs head_dim % 8 == 0 and <= 256, an even rotary_dim in "
+        "(0, head_dim], and 16-byte aligned qg / k / norm weights / q / gate (the one-launch chain is "
+        "the replaced kernels' vector path)");
+  }
+  CountLaunches(1);
+  hipLaunchKernelGGL(AttnPrecoreKernel, dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_q + heads_k)),
+                     dim3(32), 0, (hipStream_t)stream, (const __hip_bfloat16*)qg,
+                     (const __hip_bfloat16*)k, (const __hip_bfloat16*)v, (const __hip_bfloat16*)q_norm,
+                     (const __hip_bfloat16*)k_norm, (const int32_t*)positions, (__hip_bfloat16*)q_out,
+                     (__hip_bfloat16*)gate_out, (const float*)k_descale, (const float*)v_descale,
+                     (uint8_t*)kv_cache, heads_q, heads_k, head_dim, rotary_dim, theta, eps, block_size,
+                     kv_block_stride, kv_head_stride);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

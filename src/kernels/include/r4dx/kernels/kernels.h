@@ -225,6 +225,31 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
                                   int64_t kv_block_stride, int64_t kv_head_stride,
                                   int64_t stream);
 
+// ---- attention pre-core chain in one launch (decode-t1 item 4, docs/perf.md) --------------------
+// The five launches between an attention layer's k/v projections and its attention core -- split_qg
+// (r4dx_model_attn_split_qg_bf16), q_norm and k_norm (r4dx_rmsnorm_bf16 per head row), the single-row
+// partial rope (r4dx_rope_partial_mrope_bf16) and the fp8 paged cache write
+// (r4dx_kv_write_paged_fp8_hnd) -- as one kernel with the same bytes (the derivation is on
+// AttnPrecoreKernel in r4dx_kernels.hip):
+//   q_out / gate_out [T, heads_q, head_dim] bf16: the normed, rope'd q and the gate half of qg
+//   [T, heads_q, 2 * head_dim] (per-head interleaved); kv_cache (the cache write's layout and the same
+//   k_descale / v_descale / positions-as-slot-mapping contract) gets the normed, rope'd k and v. The
+//   rope'd k is NOT written back to `k`: only the cache write read it.
+// k, v: [T, heads_k, head_dim] bf16. q_norm / k_norm: bf16 [head_dim], applied as x * rstd * (1 + w).
+// positions: int32 [T], the rope position AND the slot (-1 = skip the cache write only). Not for the
+// 3-axis mrope variant (an image in the prompt): that keeps the five launches.
+// r4dx_attn_precore_supported(...) is 1 iff the shapes and pointers are ones this kernel reproduces
+// bit for bit (head_dim % 8 == 0 and <= 256, rotary_dim even in (0, head_dim], every listed pointer
+// non-null and 16-byte aligned -- exactly where r4dx_rmsnorm_bf16 takes its vector path); the entry
+// point throws otherwise. R4DX_DECODE_LEGACY=attn makes AttentionLayer keep the five launches.
+int r4dx_attn_precore_supported(int head_dim, int rotary_dim, int64_t qg, int64_t k, int64_t q_norm,
+                                 int64_t k_norm, int64_t q_out, int64_t gate_out);
+void r4dx_attn_precore_bf16(int64_t qg, int64_t k, int64_t v, int64_t q_norm, int64_t k_norm,
+                             int64_t positions, int64_t q_out, int64_t gate_out, int64_t k_descale,
+                             int64_t v_descale, int64_t kv_cache, int T, int heads_q, int heads_k,
+                             int head_dim, int rotary_dim, float theta, float eps, int block_size,
+                             int64_t kv_block_stride, int64_t kv_head_stride, int64_t stream);
+
 // ---- device argmax (host-overhead pass, 2026-09-19) -------------------------------------------
 // out_idx[0] = argmax_i logits[i] (ties broken toward the lowest index, matching
 // r4dx::kernels::Argmax's CPU reference in sampler.hpp). One block only -- vocab (~250k floats,

@@ -551,6 +551,16 @@ void TestShardPlans() {
           const int n_split = static_cast<int>(s.parts > 1 ? s.n0 : s.N);
           CHECK(r4d_gemm_trellis_nt_i8_check(256, static_cast<int>(s.K), static_cast<int>(s.N), n_split, kb, shard.skw, shard.skg) == nullptr,
                 "%s %s KB%d: the shard plan's (skw %d, skg %d) is not legal", coarse ? "coarse" : "blk128", s.name, kb, shard.skw, shard.skg);
+          // the plan IS the TP = 2 table's row: once that table has attn.qg's 6144 x 5120 next to gdn.in_proj_z's TP = 1 row,
+          // "ok iff the TP = 2 table has the row" no longer tells a borrowed TP = 1 row from the shard's own
+          for (size_t i = 0; i < n_tp; ++i) {
+            if (tp_rows[i].N == s.N && tp_rows[i].K == s.K && tp_rows[i].rate == kb) {
+              CHECK(shard.skw == tp_rows[i].skw && shard.skg == tp_rows[i].skg,
+                    "%s %s KB%d: the shard plan (skw %d, skg %d) is not the TP = 2 table's row (skw %d, skg %d)", coarse ? "coarse" : "blk128", s.name,
+                    kb, shard.skw, shard.skg, tp_rows[i].skw, tp_rows[i].skg);
+              break;
+            }
+          }
         }
         if (s.N == 6144 && s.K == 5120 && !in_tp) {
           // the rank's attn.qg is gdn.in_proj_z's shape: the TP = 1 row exists, and the shard must not borrow it

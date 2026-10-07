@@ -385,10 +385,12 @@ say the int8 grid of a trellis weight is the obstacle and not the activations.
 ## Production path (`R4DX_PREFILL_INT8`)
 
 Status (2026-10-07, branch `int8prefill` = `f16retune` (= `main`) + `int8q` + `int8gemm`, then this work): written and built
-(libr4d unit, `tool_teacher_forced_logprobs`, `r4dx-cli`, `r4dx-server`, the tests below); every CPU check passes; **nothing
-here has run on a GPU** (the session that wrote it was CPU-only by rule). The GPU validation sequence is the last
-subsection; its results table is at the end (filled 2026-10-07). It was default OFF, and off is byte-identical to `f16retune`
-(checked below); **it is now the default, see "Now the default (branch `fast`)" directly below.**
+(libr4d unit, `tool_teacher_forced_logprobs`, `r4dx-cli`, `r4dx-server`, the tests below); every CPU check passes. The branch
+`int8prefill` was written CPU-only and then validated on a GPU by the main session: the validation sequence is the last
+subsection and its results table (G1 to G5) is at the end, filled 2026-10-07 for that branch alone (int8 opt-in, exact-wide
+attention). It was default OFF, and off is byte-identical to `f16retune` (checked below); **it is now the default, see "Now
+the default (branch `fast`)" directly below -- and nothing of branch `fast` itself (the merge with `decode-t1` and `splitkv`,
+the default flip, `test_prefill_chunk_identity_defaults`, the corrected `test_prefill_int8`) has run on a GPU yet.**
 
 ### Now the default (branch `fast`, 2026-10-07)
 

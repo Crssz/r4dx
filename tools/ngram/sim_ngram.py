@@ -44,6 +44,9 @@ draft row, InjectFeatures 0.875 ms wall at 64 rows; docs/perf.md top table: deco
 8-row verify 32.19 ms on w4a16, 26.93 / 31.59 on trellis mix4.5m, plain 36.69 tok/s = 27.3 ms).
 Estimated tok/s = decode tokens (all but the first) / summed round time. A log written with
 --dflash-k below 7 prices its rounds at its own draft_k; an --mtp log has no DFlash rounds here.
+A line may carry `dflash_round_count` (an int) instead of round_accepted (tools/ngram/convert_dflash_gen.py
+does for sampled generations whose drafted chains were not logged): DFlash alone is then that many rounds
+and both hybrid models use the request's mean tok/round.
 
 Gate: BUILD the n-gram path only if the best hybrid's estimated tok/s (the lower of the positional and
 mean models) beats DFlash alone as logged by >= --min-gain (default 5%) on at least --min-requests
@@ -341,6 +344,15 @@ def analyse(rec, cfg):
         res["dflash_tpr"] = n / len(log_rounds[0])
         mean_emit = max(n - 1, 1) / len(log_rounds[0])
         eq_rounds = len(log_rounds[0])
+    elif rec.get("speculative") == "dflash" and (rec.get("dflash_round_count") or 0) > 0:
+        # no per-round list, only the request's DFlash round count (e.g. a sampled generation whose
+        # drafted chains were not logged): the mean tok/round of the request stands in for every round
+        cnt = int(rec["dflash_round_count"])
+        res["dflash_rounds"] = cnt
+        res["dflash_src"] = "count"
+        res["dflash_tpr"] = n / cnt
+        mean_emit = max(n - 1, 1) / cnt
+        eq_rounds = cnt
     else:
         res["dflash_rounds"] = None
         res["dflash_src"] = "const"
@@ -406,7 +418,8 @@ def aggregate(results, cfg):
     agg["tokens_after_first"] = after_first
     agg["dflash_tpr"] = tpr(agg["tokens"], sum(
         (r["dflash_rounds"] if r["dflash_rounds"] else r["gen_tokens"] / r["dflash_tpr"]) for r in results))
-    agg["dflash_logged"] = sum(1 for r in results if r["dflash_src"] == "log")
+    agg["dflash_logged"] = sum(1 for r in results if r["dflash_src"] != "const")
+    agg["dflash_counted"] = sum(1 for r in results if r["dflash_src"] == "count")
     agg["ngram"] = {}
     for k in cfg["ks"]:
         rounds = sum(r["ngram"][k]["rounds"] for r in results)
@@ -477,13 +490,15 @@ def report(results, agg, cfg, rows, out=sys.stdout):
             w("%4d %-18s %8d %6d %-6s %5s %8.2f%s %9.2f %8s %8s %9s\n" % (
                 i, rid, r["prompt_tokens"], r["gen_tokens"], r["speculative"] or "-",
                 "%g" % r["temperature"] if r["temperature"] is not None else "-",
-                r["dflash_tpr"], "" if r["dflash_src"] == "log" else "*",
+                r["dflash_tpr"], {"log": "", "count": "~"}.get(r["dflash_src"], "*"),
                 tpr(r["gen_tokens"], nk["rounds"]), fmt_pct(tpr(nk["hit"], nk["rounds"])),
                 fmt_pct(tpr(r["covered"], n)), fmt_pct(tpr(sum(x for x in r["runs"] if x >= GATE_RUN), n))))
         if len(shown) < len(results):
             w("  ... %d more (--rows 0 prints all)\n" % (len(results) - len(shown)))
-        if any(r["dflash_src"] != "log" for r in shown):
+        if any(r["dflash_src"] == "const" for r in shown):
             w("  * no DFlash rounds in the log for this request: the --dflash-tpr constant\n")
+        if any(r["dflash_src"] == "count" for r in shown):
+            w("  ~ only a DFlash round count (dflash_round_count) for this request: its mean tok/round\n")
         w("\n")
 
     greedy = sum(1 for r in results if r["greedy"])
@@ -491,8 +506,9 @@ def report(results, agg, cfg, rows, out=sys.stdout):
         agg["requests"], greedy, agg["requests"] - greedy, agg["tokens"]))
     w("  proposer: longest suffix %d..%d tokens, most recent occurrence%s\n" % (
         cfg["min_n"], cfg["max_n"], ", source within %d tokens" % cfg["window"] if cfg["window"] else ""))
-    w("  DFlash as logged: %.2f tok/round (%d of %d requests have logged rounds, the rest use %.2f)\n" % (
-        agg["dflash_tpr"], agg["dflash_logged"], agg["requests"], cfg["dflash_tpr"]))
+    w("  DFlash as logged: %.2f tok/round (%d of %d requests have logged rounds%s, the rest use %.2f)\n" % (
+        agg["dflash_tpr"], agg["dflash_logged"], agg["requests"],
+        " (%d of them a round count only)" % agg["dflash_counted"] if agg["dflash_counted"] else "", cfg["dflash_tpr"]))
     for k in ks:
         a = agg["ngram"][k]
         w("  n-gram alone, k=%d%s: %.2f tok/round (mean over requests %.2f), proposal in %s of rounds, "
@@ -744,6 +760,18 @@ def selftest_verdicts(check):
     rec = _copy_traffic(1)[0]
     rec["speculative"] = "mtp"
     check(analyse(rec, cfg)["dflash_src"] == "const", "an mtp log must not be priced as DFlash rounds")
+    # (b5) a round count instead of per-round acceptance: priced at count * round, hybrid = the mean model
+    rec = _copy_traffic(1)[0]
+    cnt = len(rec["round_accepted"])
+    rec["dflash_round_count"] = cnt
+    rec.pop("round_accepted")
+    r = analyse(rec, cfg)
+    check(r["dflash_src"] == "count" and r["dflash_rounds"] == cnt and abs(r["dflash_ms"] - cnt * dflash_round_ms(cfg)) < 1e-6
+          and abs(r["dflash_tpr"] - 80 / cnt) < 1e-9, "round-count pricing: %r" % ({k: r[k] for k in ("dflash_src", "dflash_rounds", "dflash_ms")},))
+    check(all(abs(r["hybrid"][(t, "positional")]["ms"] - r["hybrid"][(t, "mean")]["ms"]) < 1e-9 for t in cfg["ts"]),
+          "without per-round acceptance positional must equal mean")
+    rec["speculative"] = "mtp"
+    check(analyse(rec, cfg)["dflash_src"] == "const", "a round count on a non-dflash log is ignored")
     # injection is a cost: a free injection never makes a hybrid slower, a dear one never faster
     cheap = make_cfg(build_parser().parse_args(["--inject-ms-per-round", "0"]))
     dear = make_cfg(build_parser().parse_args(["--inject-ms-per-round", "5"]))

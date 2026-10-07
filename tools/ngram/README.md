@@ -112,3 +112,22 @@ python tools\ngram\sim_ngram.py --write-example tools\ngram\example_requests.jso
 with a repeated phrase) and carries only the fields the replay reads, not the server's full line: it
 shows the token fields and the `prompt_shared` encoding and runs the report, and says nothing about
 real traffic.
+
+## 4. Proxy data: the DFlash fine-tune generations
+
+Until real oh-my-pi traffic is captured, `convert_dflash_gen.py` turns the generations `tests/model/tool_dflash_traindata.cpp`
+wrote (`gen_p*.jsonl`: prompt ids, generated ids, temperature, DFlash round counters, and with `--log-drafts 1` the drafted chain
+of every greedy round) into this format, so the simulator can run on them as a PROXY (synthetic agent prompts of 100-1500
+tokens, a mix of sampled and greedy requests; real omp contexts are 10-100x longer):
+
+```powershell
+python tools\ngram\convert_dflash_gen.py --out all.jsonl --split-dir by_group D:\r4dx-scratch\dflash-huihui\eval\gen_p0.jsonl
+python tools\ngram\sim_ngram.py all.jsonl --hybrid-t 2,3,4,5 --rows 0
+python tools\ngram\convert_dflash_gen.py --selftest
+```
+
+Per-round acceptance is reconstructed from the drafted chains (greedy: exact; a generation cut by `max_new` takes its last
+round from the counter). Requests without drafted chains (sampled, or shards written without `--log-drafts`) carry
+`dflash_round_count` only: DFlash alone is priced at that many rounds and the hybrid uses the request's mean tok/round, the
+`mean` model, which is optimistic for the hybrid (the n-gram takes the stretches where DFlash was also good): on the 85 greedy
+held-out requests it says +5.4% where the exact positional model says -2.2%.

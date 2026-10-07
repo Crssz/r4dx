@@ -24,7 +24,9 @@
 // Build: tests/kernels/build_int8_gemm_proto.ps1 (hipcc; links the shipped r4d_gemm_trellis_nt_m256 unit).
 //   tool_int8_gemm_proto.exe [--mode all|probe|selftest|verify|time] [--shape gate_up|down|qkv|z|out|qg|kv|all]
 //                            [--kb 4|5|both] [--rounds 11] [--batch 6] [--quick] [--noverify] [--no-resc]
-//                            [--simds 128] [--verbose] [--out x.json]
+//                            [--simds 128] [--verbose] [--out x.json] [--emit-rows src/model/gemm_tuning_table_trellis_i8.inc]
+//   --emit-rows regenerates the production tuning table of R4DX_PREFILL_INT8 (a full timing run: --mode time or all,
+//   every shape, --kb both): per (class, KB) the best verified trellis kernel by median, ties within 1% to the smallest skg.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -312,7 +314,7 @@ static void FillCase(Case& c, uint32_t seed) {
   hipLaunchKernelGGL(FillSvh, dim3(256), dim3(256), 0, 0, c.svh, (int64_t)c.N, seed * 1299709u + 5u);
   CK(hipDeviceSynchronize());
   const int NKB = c.K / 128;
-  hipLaunchKernelGGL(i8g_quant_act, dim3((256 * NKB + 7) / 8), dim3(256), 0, 0, c.a16, c.a8, c.ap, c.sa, c.K);
+  hipLaunchKernelGGL(i8g_quant_act, dim3((256 * NKB + 7) / 8), dim3(256), 0, 0, c.a16, c.a8, c.ap, c.sa, c.K, 0LL);
   const long long groups = (long long)(c.N / 32) * NKB;
   if (c.KB == 4) hipLaunchKernelGGL(i8g_wscale<4>, dim3((unsigned)((groups + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.sw, c.K, c.N);
   else hipLaunchKernelGGL(i8g_wscale<5>, dim3((unsigned)((groups + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.sw, c.K, c.N);
@@ -519,7 +521,7 @@ static void SelftestGemms(int KB) {
   CK(hipMemcpy(d_x, xh.data(), xh.size() * 2, hipMemcpyHostToDevice));
   CK(hipMemcpy(d_words, grid.data(), grid.size() * 4, hipMemcpyHostToDevice));
   CK(hipMemcpy(d_svh, svh.data(), N * 4, hipMemcpyHostToDevice));
-  hipLaunchKernelGGL(i8g_quant_act, dim3((M * NKB + 7) / 8), dim3(256), 0, 0, d_x, d_a8, d_ap, d_sa, K);
+  hipLaunchKernelGGL(i8g_quant_act, dim3((M * NKB + 7) / 8), dim3(256), 0, 0, d_x, d_a8, d_ap, d_sa, K, 0LL);
   const long long groups = (long long)(N / 32) * NKB, blocks = (long long)(N / 32) * (K / 16);
   if (KB == 4) {
     hipLaunchKernelGGL(i8g_wscale<4>, dim3((unsigned)((groups + 7) / 8)), dim3(256), 0, 0, d_words, d_sw, K, N);
@@ -681,6 +683,13 @@ struct ClassResult {
   bool ok = true;     // every reported kernel verified
 };
 
+// --emit-rows: the production tuning table (src/model/gemm_tuning_table_trellis_i8.inc) from this run's timings. One row
+// per (class, KB): the best verified trellis int8 configuration by median time, and among the ones within 1% of that
+// the smallest skg (fewer K groups across the grid = less fp32 partial traffic through ws, the same speed to the bench's
+// noise), then the faster median.
+struct EmitRow { std::string cls; int N, K, kb, skw, skg; double us; };
+static std::vector<EmitRow> g_emit_rows;
+
 static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_verify, bool do_time, bool do_resc, bool verbose,
                      FILE* json, bool& json_first, std::map<std::string, ClassResult>& results, int& fails) {
   Case c;
@@ -805,7 +814,7 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   {
     Job j; j.name = "quantize A (K=" + std::to_string(s.K) + ")"; j.kind = "quant";
     const int NKB = s.K / 128;
-    j.launch = [&, NKB](int) { hipLaunchKernelGGL(i8g_quant_act, dim3((256 * NKB + 7) / 8), dim3(256), 0, 0, c.a16, c.a8, (signed char*)nullptr, c.sa, c.K); };
+    j.launch = [&, NKB](int) { hipLaunchKernelGGL(i8g_quant_act, dim3((256 * NKB + 7) / 8), dim3(256), 0, 0, c.a16, c.a8, (signed char*)nullptr, c.sa, c.K, 0LL); };
     jobs.push_back(j);
   }
   {   // one launch of every job first: a configuration the runtime refuses is dropped, not fatal
@@ -838,6 +847,14 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   const Job* dense = best("dense", true);
   const Job* dplain = best("denseplain", true);
   const Job* trel = best("trellis", true);
+  if (trel) {
+    const Job* pick = trel;
+    for (const Job& j : jobs)
+      if (j.kind == "trellis" && j.verified && Median(j.t) <= 1.01 * Median(trel->t) &&
+          (j.cfg.skg < pick->cfg.skg || (j.cfg.skg == pick->cfg.skg && Median(j.t) < Median(pick->t))))
+        pick = &j;
+    g_emit_rows.push_back({s.name, s.N, s.K, kb, pick->cfg.skw, pick->cfg.skg, Median(pick->t)});
+  }
   const Job* denseC = best("denseC", true);
   const Job* trelC = best("trellisC", true);
   const Job* trelA = best("trellisA", true);
@@ -946,11 +963,12 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
 }
 
 static int RealMain(int argc, char** argv) {
-  std::string outp, shape = "all", mode = "all", kbs = "both";
+  std::string outp, shape = "all", mode = "all", kbs = "both", emit_rows;
   int rounds = 11, batch = 6, simds = 128;
   bool quick = false, noverify = false, no_resc = false, verbose = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
+    else if (!std::strcmp(argv[i], "--emit-rows") && i + 1 < argc) emit_rows = argv[++i];
     else if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--batch") && i + 1 < argc) batch = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--simds") && i + 1 < argc) simds = std::atoi(argv[++i]);
@@ -1015,6 +1033,30 @@ static int RealMain(int argc, char** argv) {
     }
   }
   if (json) { std::fprintf(json, "]}\n"); std::fclose(json); }
+  if (!emit_rows.empty()) {
+    if (!do_time || g_emit_rows.empty()) {
+      std::fprintf(stderr, "--emit-rows needs a timing run (--mode time or all) that verified at least one trellis configuration\n");
+      return 2;
+    }
+    FILE* f = std::fopen(emit_rows.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "cannot write %s\n", emit_rows.c_str()); return 2; }
+    std::fprintf(f,
+                 "// GENERATED by tests/kernels/tool_int8_gemm_proto.exe --emit-rows (docs/int8-prefill.md \"Production path\").\n"
+                 "// Measured on %s (%s), %d rounds x batch %d, cold weights, random trellis words, Gaussian A. One row per\n"
+                 "// (N, K, KB): the best verified trellis int8 configuration (skw K slices per workgroup, skg K groups across the\n"
+                 "// grid) by median time and, among those within 1%% of it, the smallest skg. linear.cpp includes this file inside\n"
+                 "// its own namespace; PlanTrellisI8 reads it. A (class, KB) without a row runs the f16 kernel.\n"
+                 "// {N, K, KB, skw, skg}\n",
+                 prop.name, prop.gcnArchName, rounds, batch);
+    if (shape != "all" || kbs != "both")
+      std::fprintf(f, "// WARNING: a partial run (--shape %s --kb %s): merge by hand, this file does not cover every class\n", shape.c_str(), kbs.c_str());
+    std::fprintf(f, "const TrellisI8Row kTrellisI8Table[] = {\n");
+    for (const EmitRow& r : g_emit_rows)
+      std::fprintf(f, "    {%d, %d, %d, %d, %d},  // %s KB%d %.1f us\n", r.N, r.K, r.kb, r.skw, r.skg, r.cls.c_str(), r.kb, r.us);
+    std::fprintf(f, "};\n");
+    std::fclose(f);
+    std::printf("wrote %zu rows to %s\n", g_emit_rows.size(), emit_rows.c_str());
+  }
   std::printf("%s (%d failing checks)\n", fails == 0 ? "ALL OK" : "FAILED", fails);
   return fails == 0 ? 0 : 1;
 }

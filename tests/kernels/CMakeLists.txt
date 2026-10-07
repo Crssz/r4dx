@@ -209,12 +209,14 @@ add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
 # bench is tool_int8_gemm_proto (tests/kernels/build_int8_gemm_proto.ps1, hipcc, no CMake target).
 add_executable(test_int8_gemm_proto_cpu test_int8_gemm_proto_cpu.cpp)
 # trellis_ref.hpp's dtype.hpp wants the HIP headers (host-only use: nothing links amdhip64, nothing runs on a device).
-target_include_directories(test_int8_gemm_proto_cpu PRIVATE "${R4D_ROCM_ROOT}/include")
+target_include_directories(test_int8_gemm_proto_cpu PRIVATE "${R4D_ROCM_ROOT}/include" "${CMAKE_SOURCE_DIR}/third_party/libr4d")
 target_compile_definitions(test_int8_gemm_proto_cpu PRIVATE __HIP_PLATFORM_AMD__)
 add_test(NAME test_int8_gemm_proto_cpu COMMAND test_int8_gemm_proto_cpu)
 # test_int8_gemm_proto_emu: pure CPU too -- the prototype's kernel SOURCE compiled as plain C++ (I8G_EMU, i8g_host_emu.h:
 # one OS thread per GPU thread, barriers, a software iu8 WMMA, a stub trellis decode) and run against exact references.
 add_executable(test_int8_gemm_proto_emu test_int8_gemm_proto_emu.cpp)
+# the kernel source is libr4d's (r4d_trellis_i8.h, r4d_trellis_i8_layout.h): the production unit's own
+target_include_directories(test_int8_gemm_proto_emu PRIVATE "${CMAKE_SOURCE_DIR}/third_party/libr4d" "${CMAKE_CURRENT_SOURCE_DIR}")   # (i8g_host_emu.h is this directory's)
 add_test(NAME test_int8_gemm_proto_emu COMMAND test_int8_gemm_proto_emu)
 # _Float16 arithmetic on the host: hardware conversions (F16C) instead of compiler-rt's, and the device source's
 # `#pragma unroll` loops that contain barriers cannot unroll on the CPU (harmless)

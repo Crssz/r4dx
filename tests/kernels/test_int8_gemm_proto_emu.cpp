@@ -1,5 +1,6 @@
-// tests/kernels/test_int8_gemm_proto_emu.cpp -- pure CPU (no HIP call, no device). Runs the int8 prefill GEMM
-// prototype's KERNEL SOURCE (int8_gemm_proto_kernels.h, compiled as plain C++ with I8G_EMU: one OS thread per GPU
+// tests/kernels/test_int8_gemm_proto_emu.cpp -- pure CPU (no HIP call, no device). Runs the int8 prefill GEMM's
+// KERNEL SOURCE (libr4d's r4d_trellis_i8.h, the very source of the production unit r4d_gemm_trellis_nt_i8.hip, through
+// the bench layer int8_gemm_proto_kernels.h, compiled as plain C++ with I8G_EMU: one OS thread per GPU
 // thread, workgroup and wave barriers, shared memory, a software iu8 WMMA, a stub trellis decode; see
 // i8g_host_emu.h) against exact references:
 //   * i8g_quant_act   vs i8p::QuantizeActRef + PackA8, byte for byte;
@@ -7,7 +8,9 @@
 //   * i8g_kernel, every instantiation (dense with the FWHT epilogue and plain, trellis KB 4 and 5; RESC 0..3;
 //     SKW 2, 4, 8) for every legal (skw, skg) on K = 1024, N = 128 (one FWHT group, 4 x SKG workgroups racing for
 //     the ticket), against the exact-integer fp64 reference (scale mask by RESC) with the epilogue applied in fp64,
-//     and the trellis kernel against the dense kernel on the same int8 weights, byte for byte.
+//     and the trellis kernel against the dense kernel on the same int8 weights, byte for byte;
+//   * two A parts: a launch with a8_0 / a8_1 and an n_split (trellis, KB 4 and 5, several (skw, skg)) against the exact
+//     reference per part, byte-identical to two single-part launches, and a part-1 quantizer launch (blockIdx.y = 1).
 // What this does not cover: the hardware (the iu8 WMMA layout, v_pk_fma_f16, v_perm, DPP: the device bench's selftest)
 // and the real trellis decode (shipped, tested elsewhere).
 #define I8G_EMU 1
@@ -36,24 +39,25 @@ constexpr float kOutScale = 0.0883883f;
 int MaskOfResc(int resc) { static const int m[4] = {0, 3, 1, 2}; return m[resc & 3]; }
 
 // the emulated launch of i8g_kernel for a configuration (the dispatch of I8gRun, over emu::launch)
+// (a1 / sa1 / n_split: the second A part; a single part passes the first twice and n_split = N)
 template <bool TR, int KB, bool FW, int RE, int SKW>
-void LaunchT(const I8gCfg& c, const signed char* a8, const float* sa, const void* w, const float* sw, const float* svh,
-             unsigned short* C, float* ws, unsigned* tk, int K, int N, float os) {
-  emu::launch((unsigned)(N / 32), (unsigned)c.skg, 128u * SKW, i8g_kernel<TR, KB, FW, RE, SKW>, a8, sa, (const unsigned char*)w, sw, svh, C, ws,
-              tk, K, N, c.skg, os);
+void LaunchT(const I8gCfg& c, const signed char* a8, const float* sa, const signed char* a8b, const float* sab, int n_split, const void* w,
+             const float* sw, const float* svh, unsigned short* C, float* ws, unsigned* tk, int K, int N, float os) {
+  emu::launch((unsigned)(N / 32), (unsigned)c.skg, 128u * SKW, i8g_kernel<TR, KB, FW, RE, SKW>, a8, sa, a8b, sab, n_split,
+              (const unsigned char*)w, sw, svh, C, ws, tk, K, N, c.skg, os);
 }
 template <bool TR, int KB, bool FW, int RE>
-void LaunchSkw(const I8gCfg& c, const signed char* a8, const float* sa, const void* w, const float* sw, const float* svh,
-               unsigned short* C, float* ws, unsigned* tk, int K, int N, float os) {
+void LaunchSkw(const I8gCfg& c, const signed char* a8, const float* sa, const signed char* a8b, const float* sab, int n_split, const void* w,
+               const float* sw, const float* svh, unsigned short* C, float* ws, unsigned* tk, int K, int N, float os) {
   switch (c.skw) {
-    case 2: LaunchT<TR, KB, FW, RE, 2>(c, a8, sa, w, sw, svh, C, ws, tk, K, N, os); break;
-    case 4: LaunchT<TR, KB, FW, RE, 4>(c, a8, sa, w, sw, svh, C, ws, tk, K, N, os); break;
-    default: LaunchT<TR, KB, FW, RE, 8>(c, a8, sa, w, sw, svh, C, ws, tk, K, N, os); break;
+    case 2: LaunchT<TR, KB, FW, RE, 2>(c, a8, sa, a8b, sab, n_split, w, sw, svh, C, ws, tk, K, N, os); break;
+    case 4: LaunchT<TR, KB, FW, RE, 4>(c, a8, sa, a8b, sab, n_split, w, sw, svh, C, ws, tk, K, N, os); break;
+    default: LaunchT<TR, KB, FW, RE, 8>(c, a8, sa, a8b, sab, n_split, w, sw, svh, C, ws, tk, K, N, os); break;
   }
 }
-void Run(const I8gCfg& c, const signed char* a8, const float* sa, const void* w, const float* sw, const float* svh, unsigned short* C,
-         float* ws, unsigned* tk, int K, int N, float os) {
-#define CASE(TR, KB, FW, RE) LaunchSkw<TR, KB, FW, RE>(c, a8, sa, w, sw, svh, C, ws, tk, K, N, os)
+void RunParts(const I8gCfg& c, const signed char* a8, const float* sa, const signed char* a8b, const float* sab, int n_split, const void* w,
+              const float* sw, const float* svh, unsigned short* C, float* ws, unsigned* tk, int K, int N, float os) {
+#define CASE(TR, KB, FW, RE) LaunchSkw<TR, KB, FW, RE>(c, a8, sa, a8b, sab, n_split, w, sw, svh, C, ws, tk, K, N, os)
 #define RESC4(TR, KB, FW) \
   switch (c.resc) { case 0: CASE(TR, KB, FW, 0); break; case 1: CASE(TR, KB, FW, 1); break; case 2: CASE(TR, KB, FW, 2); break; default: CASE(TR, KB, FW, 3); break; }
   if (!c.trellis) {
@@ -66,6 +70,10 @@ void Run(const I8gCfg& c, const signed char* a8, const float* sa, const void* w,
   }
 #undef RESC4
 #undef CASE
+}
+void Run(const I8gCfg& c, const signed char* a8, const float* sa, const void* w, const float* sw, const float* svh, unsigned short* C,
+         float* ws, unsigned* tk, int K, int N, float os) {
+  RunParts(c, a8, sa, a8, sa, N, w, sw, svh, C, ws, tk, K, N, os);
 }
 
 struct Problem {
@@ -121,10 +129,13 @@ void BuildProblem(Problem& p, int K, int N, int KB, uint32_t seed) {
   }
 }
 
-long long CountViolations(const Problem& p, const std::vector<unsigned short>& C, bool fwht, int resc, float os) {
+// the 128-column groups g0 .. g1 - 1 (default: all) of C against the reference
+long long CountViolations(const Problem& p, const std::vector<unsigned short>& C, bool fwht, int resc, float os, int g0 = 0,
+                          int g1 = -1) {
   long long viol = 0;
+  if (g1 < 0) g1 = p.N / 128;
   for (int r = 0; r < 256; ++r)
-    for (int g = 0; g < p.N / 128; ++g) {
+    for (int g = g0; g < g1; ++g) {
       double v[128], e[128], rms = 0;
       for (int j = 0; j < 128; ++j) v[j] = p.raw[MaskOfResc(resc)][(size_t)r * p.N + g * 128 + j];
       if (fwht) i8p::Fwht128(v);
@@ -144,6 +155,20 @@ long long CountViolations(const Problem& p, const std::vector<unsigned short>& C
 template <class T>
 bool Same(const std::vector<T>& a, const T* b, size_t n) { return a.size() == n && std::memcmp(a.data(), b, n * sizeof(T)) == 0; }
 
+// the same weights with other activations (a second A part): re-quantize and re-derive the exact references
+void ReplaceActivations(Problem& p, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> nd(0.f, 1.3f);
+  for (size_t i = 0; i < p.xh.size(); ++i) {
+    p.xh[i] = i8p::F32ToF16(nd(rng));
+    p.X[i] = i8p::F16ToF32(p.xh[i]);
+  }
+  i8p::QuantizeActRef(p.X.data(), p.K, p.sa, p.Ap);
+  p.A8 = i8p::PackA8(p.Ap, p.K);
+  for (int mask = 0; mask < 4; ++mask)
+    i8p::RefGemmInt8(p.Ap.data(), p.sa.data(), p.Wp.data(), p.sw.data(), 256, p.N, p.K, mask, p.raw[mask].data());
+}
+
 }  // namespace
 
 int main() {
@@ -160,7 +185,7 @@ int main() {
     // producers
     std::vector<signed char> a8(p.A8.size(), 0), ap(p.Ap.size(), 0);
     std::vector<float> sa(p.sa.size(), 0.f);
-    emu::launch((unsigned)((256 * NKB + 7) / 8), 1, 256, i8g_quant_act, p.xh.data(), a8.data(), ap.data(), sa.data(), K);
+    emu::launch((unsigned)((256 * NKB + 7) / 8), 1, 256, i8g_quant_act, p.xh.data(), a8.data(), ap.data(), sa.data(), K, 0LL);
     std::snprintf(what, sizeof what, "KB %d: i8g_quant_act (emulated kernel) == CPU quantizer: A8 layout, plain A, scales (incl. an all-zero block)", KB);
     Check(std::memcmp(a8.data(), p.A8.data(), a8.size()) == 0 && std::memcmp(ap.data(), p.Ap.data(), ap.size()) == 0 &&
               std::memcmp(sa.data(), p.sa.data(), sa.size() * 4) == 0, what);
@@ -227,6 +252,67 @@ int main() {
     Check(bad == 0 && ran > 0, what);
     std::snprintf(what, sizeof what, "KB %d: the trellis kernel (stub decode + quantizer) == the dense kernel on the same int8 weights, byte for byte", KB);
     Check(bitdiff == 0, what);
+  }
+  // ---- two A parts (n_split): the production kernel's second activation pair ----
+  for (int KB : {4, 5}) {
+    const int N2 = 256;
+    Problem p0, p1;
+    BuildProblem(p0, K, N2, KB, 300 + KB);
+    p1 = p0;
+    ReplaceActivations(p1, 777 + KB);
+    char what[240];
+    // the part-1 quantizer launch: both parts in one launch (x at x0 and x0 + 256 K elements, outputs one after the other)
+    std::vector<uint16_t> xcat(p0.xh);
+    xcat.insert(xcat.end(), p1.xh.begin(), p1.xh.end());
+    std::vector<signed char> a8cat(2 * p0.A8.size(), 0), apcat(2 * p0.Ap.size(), 0);
+    std::vector<float> sacat(2 * p0.sa.size(), 0.f);
+    emu::launch((unsigned)((256 * NKB + 7) / 8), 2, 256, i8g_quant_act, xcat.data(), a8cat.data(), apcat.data(), sacat.data(), K,
+                (long long)256 * K);
+    std::snprintf(what, sizeof what, "KB %d: i8g_quant_act with two parts (blockIdx.y) == the CPU quantizer of each part", KB);
+    Check(std::memcmp(a8cat.data(), p0.A8.data(), p0.A8.size()) == 0 &&
+              std::memcmp(a8cat.data() + p0.A8.size(), p1.A8.data(), p1.A8.size()) == 0 &&
+              std::memcmp(apcat.data() + p0.Ap.size(), p1.Ap.data(), p1.Ap.size()) == 0 &&
+              std::memcmp(sacat.data(), p0.sa.data(), p0.sa.size() * 4) == 0 &&
+              std::memcmp(sacat.data() + p0.sa.size(), p1.sa.data(), p1.sa.size() * 4) == 0,
+          what);
+    const signed char *a0 = a8cat.data(), *a1 = a8cat.data() + p0.A8.size();
+    const float *s0 = sacat.data(), *s1 = sacat.data() + p0.sa.size();
+    std::vector<unsigned short> Cp((size_t)256 * N2), Ca((size_t)256 * N2), Cb((size_t)256 * N2);
+    std::vector<float> ws2((size_t)8 * 256 * N2);
+    std::vector<unsigned> tk2(N2 / 128, 0u);
+    int ran = 0, bad = 0;
+    for (int skw : {2, 4, 8})
+      for (int skg : {1, 2, 4}) {
+        I8gCfg c;
+        c.trellis = true; c.kb = KB; c.fwht = true; c.resc = 0; c.skw = skw; c.skg = skg;
+        if (I8gCheck(c, K, N2)) continue;
+        std::fill(Cp.begin(), Cp.end(), (unsigned short)0xFFFF);
+        RunParts(c, a0, s0, a1, s1, 128, p0.grid.data(), p0.sw.data(), p0.svh.data(), Cp.data(), ws2.data(), tk2.data(), K, N2,
+                 kOutScale);
+        // each group against the exact reference of its own part's activations
+        const long long v0 = CountViolations(p0, Cp, true, 0, kOutScale, 0, 1);
+        const long long v1 = CountViolations(p1, Cp, true, 0, kOutScale, 1, 2);
+        // and byte for byte against the two single-part launches
+        RunParts(c, a0, s0, a0, s0, N2, p0.grid.data(), p0.sw.data(), p0.svh.data(), Ca.data(), ws2.data(), tk2.data(), K, N2,
+                 kOutScale);
+        RunParts(c, a1, s1, a1, s1, N2, p0.grid.data(), p0.sw.data(), p0.svh.data(), Cb.data(), ws2.data(), tk2.data(), K, N2,
+                 kOutScale);
+        bool same = true;
+        for (int r = 0; r < 256; ++r)
+          for (int n = 0; n < N2; ++n) same = same && Cp[(size_t)r * N2 + n] == (n < 128 ? Ca : Cb)[(size_t)r * N2 + n];
+        bool tk_reset = true;
+        for (unsigned x : tk2) tk_reset = tk_reset && x == 0;
+        ++ran;
+        if (v0 || v1 || !same || !tk_reset) {
+          ++bad;
+          std::printf("    FAIL two parts kb%d skw%d skg%d: part 0 %lld, part 1 %lld outside tolerance, bytes %s single-part launches, "
+                      "tickets %s\n", KB, skw, skg, v0, v1, same ? "==" : "!=", tk_reset ? "reset" : "NOT reset");
+        }
+      }
+    std::snprintf(what, sizeof what,
+                  "KB %d: %d two-part launches (n_split 128 of 256) match each part's exact reference and the two single-part "
+                  "launches byte for byte", KB, ran);
+    Check(bad == 0 && ran > 0, what);
   }
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("%s (%d checks, %.1f s)\n", g_ok ? "ALL OK" : "FAILED", g_checks, s);

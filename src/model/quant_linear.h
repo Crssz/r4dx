@@ -131,6 +131,12 @@ struct QuantLinear {
   //     the decoded weights to int8. A measurement hook: nothing else touches it.
   core::DeviceBuffer<float> trellis_wscale;
   int trellis_wscale_gsh = 0;
+  //   trellis_i8_sw: R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"), empty unless the
+  //     switch is on and this linear has an int8 plan (PlanTrellisI8). fp32 [K / 128][N], the weight scale of
+  //     (128 k, output column n of Q) the int8 prefill GEMM quantizes the decoded weights with (libr4d's
+  //     r4d_trellis_i8_wscale), K * N / 32 bytes, built once at Model::Load from this rank's own words. Separate
+  //     from trellis_wscale (R4DX_FAKEQ_W's fp32 s = amax / 127 table): this one holds s_eff = 1 / f16(1 / s).
+  core::DeviceBuffer<float> trellis_i8_sw;
 };
 
 }  // namespace r4dx::model

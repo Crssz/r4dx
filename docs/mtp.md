@@ -97,7 +97,9 @@ derivation): GDN's `GdnStateManager` reserves `1 + mtp_draft_k` PHYSICAL SLOTS p
 -- one per candidate window index -- and every verify call's `num_accepted` device pointer
 (threaded from the PREVIOUS round's own accepted count, nullptr only for the very first round after
 a fresh `Prefill`) tells `r4d_gdn_conv_update_w4_h128_bf16`/`r4d_gdn_recurrent_update_*` which
-window slot to seed FROM. Attention's KV cache needs **no extra machinery at all**: since slot ==
+window slot to seed FROM. (`R4DX_GDN_WRITE_ONCE=1` replaces the slot bank with one state plus a per-row log
+of the window and replays the accepted prefix in the next call's seed load, bit-identically and without the
+per-row state stores: [gdn-write-once.md](gdn-write-once.md).) Attention's KV cache needs **no extra machinery at all**: since slot ==
 position in this paged cache, a rejected candidate's stale KV entry is simply overwritten the next
 time that position is written (`pos_` only ever advances by however many candidates were actually
 committed, never by the full window) -- this is the standard "self-correcting via position

@@ -59,13 +59,25 @@ set(R4DX_MODEL_TESTS
   # calls, 256 / 320 / 200 / 17 / 2 / 64 rows, a random initial state), part B GdnLayer::Forward on the
   # 4-layer container's layer 0. Device 1; 77 without a device, or without the container after part A.
   test_gdn_seq256_identity
+  # Write-once GDN state (docs/gdn-write-once.md), kernel level: r4d_gdn_recurrent_update_wo_* + the replay
+  # against the legacy window-slot kernel, bit for bit -- outputs, the replayed state of every n, scripted and
+  # random (T, n) chains, plain steps with and without a pending prefix, TP=1 / TP=2 rank shapes, the VS > 1
+  # no-norm path, refusals. Device 1; 77 without a device. Written, NOT run by its author (CPU-only session).
+  test_gdn_write_once
+  # Write-once GDN state, model level: two Models (and two TpModels in emulate mode) with ModelOptions::gdn_write_once
+  # 0 and 1 driven through the same scripts -- verify + commit n for many (T, n), plain steps, extends, checkpoint
+  # Save / Restore, Reset, real MTP rounds, a bare double verify, a refused over-commit; logits, tokens and the
+  # live GDN state / conv / KV digests bitwise equal after every event, with and without a digest between events.
+  # Links the R4DX_TP_TESTING variant. Device 1, SKIP 77 without the 4-layer container. Written, NOT run by its author.
+  test_gdn_write_once_model
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
   add_executable(${t} ${t}.cpp)
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
-  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8")
+  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
+     t STREQUAL "test_gdn_write_once_model")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)

@@ -17,6 +17,11 @@
 # (docs/trellis-kernel.md 1, A3 / A3p). The first entry, or -Baseline, is what the tables compare
 # against.
 #
+# Per-entry environment: an entry may end in ^NAME=value[,NAME=value] (after the !<tp> part, if any), set for
+# that entry's processes only -- the A/B of an env switch on ONE binary and container, e.g. the write-once GDN
+# state (docs/gdn-write-once.md): off=<path> and wo=<path>^R4DX_GDN_WRITE_ONCE=1, which makes the "text stable"
+# column across the entries' runs a check and the VRAM table the 0.96 GiB it should be. bench.json rows carry it.
+#
 # Tensor parallel: an entry may end in !<tp> (name=path[@binary][#layout]!2), or -Tp sets the default
 # for every entry (1). A TP=1 entry runs on HIP device 1 as before; a --tp 2 entry passes --tp 2
 # --tp-mode real with HIP_VISIBLE_DEVICES unset (docs/tp.md 9.2: rank 0 on device 1, rank 1 on
@@ -101,6 +106,15 @@ function Wait-Quiet {
 
 $entries = foreach ($c in $Container) {
   $name, $rest = $c -split '=', 2
+  $rest, $envStr = $rest -split '\^', 2
+  $envs = [ordered]@{}
+  if ($envStr) {
+    foreach ($kv in ($envStr -split ',')) {
+      $k, $v = $kv -split '=', 2
+      if (-not $k -or $null -eq $v) { throw "[bench] ${name}: bad environment '$kv' (want NAME=value)" }
+      $envs[$k] = $v
+    }
+  }
   $rest, $tpStr = $rest -split '!', 2
   $rest, $lay = $rest -split '#', 2
   $path, $bin = $rest -split '@', 2
@@ -110,7 +124,7 @@ $entries = foreach ($c in $Container) {
   if ($tpN -notin 1, 2) { throw "[bench] ${name}: tp must be 1 or 2, got '$tpStr'" }
   if (-not (Test-Path $path)) { throw "[bench] ${name}: container $path not found" }
   if (-not (Test-Path $bin)) { throw "[bench] ${name}: binary $bin not found" }
-  [pscustomobject]@{ name = $name; path = $path; bin = $bin; layout = $lay; tp = $tpN }
+  [pscustomobject]@{ name = $name; path = $path; bin = $bin; layout = $lay; tp = $tpN; env = $envs }
 }
 foreach ($e in $entries) {
   foreach ($m in $Modes) {
@@ -134,10 +148,16 @@ function Invoke-Cli($e, [string[]]$cliArgs, [string[]]$stdin, [string]$log) {
   if ($e.tp -eq 2) { Remove-Item Env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue } else { $env:HIP_VISIBLE_DEVICES = '1' }
   $cliArgs = @($cliArgs) + @(TpArgs $e)
   $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  # the entry's own environment, restored after the process
+  $savedEnv = @{}
+  foreach ($k in $e.env.Keys) { $savedEnv[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item -Path "Env:$k" -Value $e.env[$k] }
   try {
     if ($stdin) { $out = @($stdin | & $e.bin @cliArgs 2>&1 | ForEach-Object { "$_" }) }
     else { $out = @(& $e.bin @cliArgs 2>&1 | ForEach-Object { "$_" }) }
-  } finally { $ErrorActionPreference = $prev }
+  } finally {
+    $ErrorActionPreference = $prev
+    foreach ($k in $savedEnv.Keys) { if ($null -eq $savedEnv[$k]) { Remove-Item "Env:$k" -ErrorAction SilentlyContinue } else { Set-Item -Path "Env:$k" -Value $savedEnv[$k] } }
+  }
   $code = $LASTEXITCODE
   $out | Set-Content -Encoding utf8 $log
   return [pscustomobject]@{ code = $code; out = $out }

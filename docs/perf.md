@@ -8,7 +8,25 @@ the base checkpoint; those numbers stay as the historical record (same architect
 speeds transfer closely, KL numbers do not: a KL is only meaningful against the bf16 reference of
 its own model).
 
-## Decode step: bit-exact launch and host-edge cuts (2026-10-08, branch `decode-t1`; UNMEASURED)
+## Decode step: bit-exact launch and host-edge cuts (2026-10-08, branch `decode-t1`)
+
+**Measured** (2026-10-07, ROCm 10.1.0, HIP device 1, `tools\quant2\bench_decode.ps1`, 3 interleaved runs,
+4 prompts, logs `E:\models\r4dx\decode-eff\t1\`), main 89587f0 -> decode-t1:
+
+| mode | main tok/s | decode-t1 tok/s | gain |
+|---|--:|--:|--:|
+| plain | 36.56 | 37.40 | +2.28 % |
+| dflash7 | 110.81 | 115.98 | +4.67 % |
+| mtp3 | 78.83 | 82.13 | +4.19 % |
+
+Bit-exactness checked on the GPU: the three new kernel tests (`test_argmax_multi` 928 comparisons,
+`test_gdn_ab_merge`, `test_attn_precore`) and 15 existing kernel tests pass; `tp1_identity.ps1` against
+the main build: every compared row byte-identical (row 7 skipped, golden image absent);
+`validate_dflash` 3/3 and `validate_spec_sampling -Quick` 24/24 byte-identical; `kl_rung4` byte-identical
+to `rocm1010\kl`; bench text stable on every prompt and mode. The speculative modes gain more than plain
+because the multi-workgroup argmax also runs in every draft step and verify window.
+
+The section below was written before these runs (the "expected" column is the analysis's estimate).
 
 Tier 1 of the plain-decode efficiency analysis (`E:\models\r4dx\decode-eff\analysis.md`; the measured
 budget it starts from, GPU 1, plain greedy, ctx ~2k, f16retune: wall 27.47 ms/token = 36.40 tok/s,

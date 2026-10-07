@@ -15,7 +15,8 @@
     2  stage cost, dev 1   tool_pp_stage_bench on HIP device 1 (the headless card, decode's): the monolithic
                            prefill TTFT and the PP-emulate run (layers [0,k) as stage A, [k,N) as stage B, the
                            carry through pinned host memory, per-chunk stage times) at 8k, 32k, 64k.
-    3  stage cost, dev 0   the same on HIP device 0 (the desktop card): device skew and stage A's cost there.
+    3  stage cost, dev 0   the same on HIP device 0 (the desktop card): device skew and stage A's cost there; plus the
+                           design's literal probe on both cards: only layers [0,32) loaded (--layers 32), mono 8k / 32k.
     4  DFlash / MTP        --dflash at split 35 (8k, 32k) on both cards, --mtp 3 at split 33 (8k) on device 1:
                            the DFlash injection and MTP priming per 256-row chunk (the design's < 12 ms gate).
     5  hop bandwidth       tool_pp_hop_bench, both cards visible: D2H on one card -> pinned -> H2D on the other,
@@ -171,6 +172,9 @@ $plainRunsArg = ($plainRuns -join ',')
 # ---- 2, 3: stage cost on each card ------------------------------------------------------------------------------
 Run-Stage 1 'stage_dev1.csv' $plainRunsArg @() $null 'stage_dev1'
 Run-Stage 0 'stage_dev0.csv' $plainRunsArg @() $null 'stage_dev0'
+# the design's literal probe too: only layers [0, 32) loaded on each card (its TTFT against the full model's, and the skew)
+Run-Stage 1 'half_dev1.csv' 'mono:8k,mono:32k' @('--layers', '32') $null 'half_dev1'
+Run-Stage 0 'half_dev0.csv' 'mono:8k,mono:32k' @('--layers', '32') $null 'half_dev0'
 
 # ---- 4: DFlash injection / MTP priming ---------------------------------------------------------------------------
 if (-not $SkipDflash) {
@@ -283,6 +287,7 @@ Set-Content -Path $notesFile -Value ($notes -join "`r`n") -Encoding utf8
 
 # ---- 8: projection -----------------------------------------------------------------------------------------------
 $projArgs = @('--stage-a', (Join-Path $OutDir 'stage_dev0.csv'), '--stage-b', (Join-Path $OutDir 'stage_dev1.csv'),
+              '--half-a', (Join-Path $OutDir 'half_dev0.csv'), '--half-b', (Join-Path $OutDir 'half_dev1.csv'),
               '--hop', $hopAlone, '--split', "$Split", '--dflash-split', "$DflashSplit", '--notes', $notesFile,
               '--out', (Join-Path $OutDir 'summary.txt'))
 if ($haveConc) { $projArgs += @('--conc-a', (Join-Path $OutDir 'conc_dev0.csv'), '--conc-b', (Join-Path $OutDir 'conc_dev1.csv'), '--hop-conc', (Join-Path $OutDir 'hop_conc.csv')) }

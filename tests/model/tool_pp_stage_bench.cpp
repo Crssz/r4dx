@@ -10,6 +10,9 @@
 // with sizes 8k = 8145, 32k = 32623, 64k = 65529 tokens (the design's three prompts) or n<N> for a raw count.
 // A repeated run keeps the median (TTFT; per chunk and per column). The chunk grid, the int8 / split-KV defaults
 // and the synthetic token ids are the production prefill's, so what is measured is the production per-chunk cost.
+// `--layers N` loads only layers [0, N) (ModelOptions::layer_limit): `--layers 32` with mono runs is the design's literal
+// "stage cost with half the layers on each device" probe (its ratio to the full model's TTFT and the skew between the
+// two cards are two of the Phase 0 gates).
 // `--dflash` / `--mtp K` load the drafter / the MTP head: stage B's epilogue then includes the DFlash injection
 // and the MTP priming, which the CSV carries per chunk (the design's Phase 0 "< 12 ms per chunk" gate).
 //
@@ -69,6 +72,7 @@ struct Args {
   std::string dflash;   // drafter container, "" = none
   int64_t dflash_k = 7;
   int64_t mtp = 0;
+  int64_t layers = -1;  // ModelOptions::layer_limit: -1 = every layer; 32 = the design's "half the layers" stage-cost probe
   int64_t max_ctx = 0;  // 0 = the largest run + 512
   double need_gib = 20.0;
 };
@@ -77,7 +81,7 @@ struct Args {
   std::fprintf(stderr,
                "tool_pp_stage_bench: %s\nusage: tool_pp_stage_bench --runs mono:8k,emu33:8k[x3],... --out file.csv "
                "[--model c.r4dx] [--layout trellis] [--dflash [drafter.r4dx]] [--dflash-k 7] [--mtp K] "
-               "[--max-ctx N] [--need-gib 20] [--barrier prefix] [--device-note text]\n",
+               "[--layers N] [--max-ctx N] [--need-gib 20] [--barrier prefix] [--device-note text]\n",
                why.c_str());
   std::exit(2);
 }
@@ -103,6 +107,7 @@ Args Parse(int argc, char** argv) {
     }
     else if (s == "--dflash-k") a.dflash_k = std::stoll(next());
     else if (s == "--mtp") a.mtp = std::stoll(next());
+    else if (s == "--layers") a.layers = std::stoll(next());
     else if (s == "--max-ctx") a.max_ctx = std::stoll(next());
     else if (s == "--need-gib") a.need_gib = std::stod(next());
     else Usage("unknown argument " + s);
@@ -217,6 +222,7 @@ int RunTool(int argc, char** argv) {
   o.max_ctx = args.max_ctx > 0 ? args.max_ctx : max_tokens + 512;
   o.vision = ModelOptions::VisionMode::kOff;  // the prefill under test is text; its 0.9 GiB is not ours to pay
   o.pp_emulate_split = 0;                     // off at load; every emu run turns it on itself
+  o.layer_limit = args.layers;                // -1: all of them
   if (!args.dflash.empty()) {
     o.dflash_container = args.dflash;
     o.dflash_draft_k = args.dflash_k;

@@ -109,7 +109,7 @@ The design's Phase 0 table, as tools. All built under `tests/model` (never `add_
 
 | tool | measures |
 |---|---|
-| `tool_pp_stage_bench` | one card, the full model: the monolithic prefill TTFT and the PP-emulate run -- per chunk the prologue + layers [0, k) (stage A), the hop's D2H and H2D halves, layers [k, N) (stage B), the epilogue, and in it the MTP priming and the DFlash injection (`--mtp K`, `--dflash`); sizes 8k = 8145, 32k = 32623, 64k = 65529 tokens (the design's prompts) or `n<N>`; repeats keep the median; `--barrier <prefix>` starts two processes together |
+| `tool_pp_stage_bench` | one card, the full model: the monolithic prefill TTFT and the PP-emulate run -- per chunk the prologue + layers [0, k) (stage A), the hop's D2H and H2D halves, layers [k, N) (stage B), the epilogue, and in it the MTP priming and the DFlash injection (`--mtp K`, `--dflash`); sizes 8k = 8145, 32k = 32623, 64k = 65529 tokens (the design's prompts) or `n<N>`; repeats keep the median; `--layers N` loads only layers [0, N) (`--layers 32` + mono runs = the design's literal half-the-layers probe: its ratio to the full model and the skew between the cards); `--barrier <prefix>` starts two processes together |
 | `tool_pp_hop_bench` | both cards: D2H on one card into pinned memory, H2D on the other, both orders, 2.5 / 7.5 / 12.75 MiB and 24 x 3 MiB, the two legs alone and together (the pipeline's steady state), `--duration` to cover a busy window |
 | `tool_pp_project` | CPU only: the per-chunk stage times of the two cards -> the two-stage pipeline simulation (3 slots) -> projected TTFT at 8k / 32k / 64k, the go rule, the other gates; `summary.txt` |
 | `pp_phase0.ps1` | the one script that runs them (below) |
@@ -137,7 +137,7 @@ powershell -NoProfile -File <scratchpad>\pp_phase0.ps1 [-UserPresent] [-Skip64k]
 ```
 
 Steps: pre-flight (refuse if `r4dx-*` runs; each card's PCIe link, read through PnP), stage bench on device 1 then device 0
-(mono + emu at 8k x3, 32k, 64k), `--dflash` at k = 35 on both cards (8k, 32k) and `--mtp 3` on device 1 (8k), the hop bench idle,
+(mono + emu at 8k x3, 32k, 64k; then `--layers 32` mono 8k / 32k on both), `--dflash` at k = 35 on both cards (8k, 32k) and `--mtp 3` on device 1 (8k), the hop bench idle,
 (with `-UserPresent`) both stage benches at once behind a barrier with the hop bench on top and the link re-read under load,
 the clock probe (`R4DX_CLOCK_PROBE=1`, one 8k emulate run per card alone and, with `-UserPresent`, together), then the
 projection. Outputs in `<models root>\r4dx\pp\phase0` (default `E:\models\r4dx\pp\phase0`): the CSVs, one log per process,

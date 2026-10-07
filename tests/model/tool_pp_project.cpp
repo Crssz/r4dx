@@ -18,7 +18,7 @@
 //
 // Usage:
 //   tool_pp_project --stage-a stage_dev0.csv --stage-b stage_dev1.csv [--conc-a conc_dev0.csv --conc-b conc_dev1.csv]
-//       [--dflash-a ... --dflash-b ...] [--mtp-b ...] [--hop hop_alone.csv] [--hop-conc hop_conc.csv]
+//       [--dflash-a ... --dflash-b ...] [--mtp-b ...] [--half-a ... --half-b ...] [--hop hop_alone.csv] [--hop-conc hop_conc.csv]
 //       [--split 33] [--dflash-split 35] [--slots 3] [--fixed-ms 2.0] [--need 1.6] [--notes notes.txt] --out summary.txt
 #include <algorithm>
 #include <cstdio>
@@ -37,7 +37,7 @@ namespace pp = r4dx::model::pp;
 namespace {
 
 struct Args {
-  std::string stage_a, stage_b, conc_a, conc_b, dflash_a, dflash_b, mtp_b, hop, hop_conc, notes, out;
+  std::string stage_a, stage_b, conc_a, conc_b, dflash_a, dflash_b, mtp_b, half_a, half_b, hop, hop_conc, notes, out;
   int64_t split = 33;
   int64_t dflash_split = 35;
   int slots = 3;
@@ -48,7 +48,7 @@ struct Args {
 [[noreturn]] void Usage(const std::string& why) {
   std::fprintf(stderr,
                "tool_pp_project: %s\nusage: tool_pp_project --stage-a F --stage-b F [--conc-a F --conc-b F] [--dflash-a F "
-               "--dflash-b F] [--mtp-b F] [--hop F] [--hop-conc F] [--split 33] [--dflash-split 35] [--slots 3] "
+               "--dflash-b F] [--mtp-b F] [--half-a F --half-b F] [--hop F] [--hop-conc F] [--split 33] [--dflash-split 35] [--slots 3] "
                "[--fixed-ms 2] [--need 1.6] [--notes F] --out summary.txt\n", why.c_str());
   std::exit(2);
 }
@@ -68,6 +68,8 @@ Args Parse(int argc, char** argv) {
     else if (s == "--dflash-a") a.dflash_a = next();
     else if (s == "--dflash-b") a.dflash_b = next();
     else if (s == "--mtp-b") a.mtp_b = next();
+    else if (s == "--half-a") a.half_a = next();
+    else if (s == "--half-b") a.half_b = next();
     else if (s == "--hop") a.hop = next();
     else if (s == "--hop-conc") a.hop_conc = next();
     else if (s == "--notes") a.notes = next();
@@ -185,6 +187,8 @@ int main(int argc, char** argv) {
   const bool have_conc = LoadBench(args.conc_a, &ca) && LoadBench(args.conc_b, &cb);
   const bool have_dflash = LoadBench(args.dflash_a, &da) && LoadBench(args.dflash_b, &db);
   const bool have_mtp = LoadBench(args.mtp_b, &mb);
+  pp::BenchFile ha, hb;  // --layers 32 runs: the design's literal half-the-layers probe, one file per card
+  const bool have_half = LoadBench(args.half_a, &ha) && LoadBench(args.half_b, &hb);
   std::vector<pp::HopRow> hop_alone, hop_conc;
   const bool have_hop = LoadHop(args.hop, &hop_alone);
   const bool have_hop_conc = LoadHop(args.hop_conc, &hop_conc);
@@ -306,6 +310,17 @@ int main(int argc, char** argv) {
   // ---- the other Phase 0 gates (informational) --------------------------------------------------------------
   out << "\n---- the design's other Phase 0 gates (informational; only the go rule decides) ----\n";
   const std::string e8 = emu + "-8k";
+  if (have_half) {
+    // The design's literal Phase 0 probe: layers [0, 32) alone on each card against that card's full model.
+    for (const char* tag : {"8k", "32k"}) {
+      const std::string m = std::string("mono-") + tag;
+      if (ha.mono_ms.count(m) == 0 || hb.mono_ms.count(m) == 0 || a.mono_ms.count(m) == 0 || b.mono_ms.count(m) == 0) continue;
+      out << "half the layers (--layers 32), " << tag << ": device 0 " << Fmt("%.1f", ha.mono_ms[m]) << " ms = "
+          << Fmt("%.3f", ha.mono_ms[m] / a.mono_ms[m]) << " of its full model, device 1 " << Fmt("%.1f", hb.mono_ms[m])
+          << " ms = " << Fmt("%.3f", hb.mono_ms[m] / b.mono_ms[m]) << "  (gate [0.49, 0.54]); skew between the cards "
+          << Fmt("%+.1f", 100.0 * (ha.mono_ms[m] / hb.mono_ms[m] - 1.0)) << " %  (gate |skew| <= 6 %)\n";
+    }
+  }
   if (a.chunks.count(e8) != 0 && a.mono_ms.count("mono-8k") != 0) {
     const double ratio = Sum(a.chunks[e8], &pp::Sample::a_ms) / a.mono_ms["mono-8k"];
     out << "stage A cost / full prefill, device 0, 8k: " << Fmt("%.3f", ratio) << "  (gate [0.49, 0.54]; k = " << args.split

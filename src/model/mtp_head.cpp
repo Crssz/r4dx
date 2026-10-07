@@ -428,9 +428,9 @@ uint64_t MtpHead::DebugKvDigest(core::Stream& stream) {
 }
 
 void MtpHead::DebugZeroKv(core::Stream& stream) {
-  stream.Synchronize();
-  R4DX_HIP_CHECK(hipMemset(kv_.Data(), 0,
-                           static_cast<size_t>(kv_.MaxBlocks()) * static_cast<size_t>(kv_.KvBlockStride())));
+  R4DX_HIP_CHECK(hipMemsetAsync(kv_.Data(), 0,
+                                static_cast<size_t>(kv_.MaxBlocks()) * static_cast<size_t>(kv_.KvBlockStride()),
+                                stream.get()));
 }
 #endif
 

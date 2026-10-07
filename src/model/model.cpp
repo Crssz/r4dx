@@ -3202,13 +3202,17 @@ void Model::DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>*
 
 void Model::DebugZeroKvState() {
   stream_.Synchronize();
+  // On stream_, then a synchronize: a plain hipMemset may be asynchronous with respect to the host and is not ordered
+  // against a non-blocking stream (the same hazard RunChunk's comments describe for plain copies).
   for (auto& kv : kv_caches_) {
     if (kv) {
-      R4DX_HIP_CHECK(hipMemset(kv->Data(), 0,
-                               static_cast<size_t>(kv->MaxBlocks()) * static_cast<size_t>(kv->KvBlockStride())));
+      R4DX_HIP_CHECK(hipMemsetAsync(kv->Data(), 0,
+                                    static_cast<size_t>(kv->MaxBlocks()) * static_cast<size_t>(kv->KvBlockStride()),
+                                    stream_.get()));
     }
   }
   if (mtp_) mtp_->DebugZeroKv(stream_);
+  stream_.Synchronize();
 }
 
 std::vector<std::pair<std::string, uint64_t>> Model::DebugStateDigest() {

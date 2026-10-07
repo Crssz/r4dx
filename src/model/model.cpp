@@ -27,6 +27,8 @@
 #include "linear.h"
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
+#include "fake_quant_act.h"  // R4DX_FAKEQ_ACT (docs/int8-prefill.md)
+#include "fake_quant_w.h"    // R4DX_FAKEQ_W (docs/int8-prefill.md)
 #include "prefill_chunk.h"  // R4DX_PREFILL_CHUNK (docs/prefill.md)
 #ifdef R4DX_TP_TESTING
 #include "state_digest.h"
@@ -199,6 +201,21 @@ Model Model::Load(const ModelOptions& opts) {
     throw std::invalid_argument("Model::Load: tp.submit_layers and tp.max_inflight_units must be in [0, 64]");
   }
   const ModelOptions::VisionMode vision_mode = opts.vision;
+  (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
+  (void)FakeQuantWRequest();    // R4DX_FAKEQ_W: likewise
+  // R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"): the request is parsed here, before
+  // the weights are read. It cannot share a run with the fake-quant accuracy switches, which round A / W to int8
+  // and run the f16 GEMM: the int8 kernel would quantize what they already rounded.
+  if (!ValidPrefillInt8Option(opts.prefill_int8)) {
+    throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8 must be -1, 0 or 1, got " +
+                                std::to_string(opts.prefill_int8));
+  }
+  const int i8_request = ResolvePrefillInt8Request(opts.prefill_int8);
+  if (i8_request == kPrefillInt8On && (FakeQuantActRequest() != kFakeQuantOff || FakeQuantWRequest() != kFakeQuantWOff)) {
+    throw std::invalid_argument(
+        "Model::Load: R4DX_PREFILL_INT8 cannot be combined with R4DX_FAKEQ_ACT / R4DX_FAKEQ_W (the fake-quant "
+        "accuracy switches round to int8 and run the f16 GEMM; the int8 GEMM would quantize twice)");
+  }
   if (is_tp_rank) {
     if (tp.comm == nullptr || tp.comm->World() != tp.world || tp.comm->Rank() != tp.rank) {
       throw std::invalid_argument(
@@ -249,7 +266,59 @@ Model Model::Load(const ModelOptions& opts) {
     co.shared_embed_host = tp.shared_embed_host;
     m.container_ = Container::Load(opts.container_path, co);
   }
-  const VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  VramSnap vram1 = SnapVram();  // after container weights are fully resident
+  // R4DX_FAKEQ_W (docs/int8-prefill.md): the one-time pass that decodes every trellis linear and stores its
+  // per-(column, k group) scale table, which the prefill GEMMs' rounding variants read. Nothing at all when
+  // the switch is unset. The tables are part of the weights for the VRAM breakdown below (vram1 is taken
+  // again after them, so they are not booked as arena + scratch).
+  if (const int fqw = FakeQuantWRequest(); fqw != kFakeQuantWOff) {
+    const VramSnap vram_before_fqw = vram1;
+    m.container_.BuildTrellisWScales(fqw, m.stream_.get());
+    m.stream_.Synchronize();
+    vram1 = SnapVram();
+    std::cerr << "[r4dx::model::Model] R4DX_FAKEQ_W=" << FakeQuantWName(fqw)
+              << ": scale tables built for every trellis linear (one scale per output column x "
+              << FakeQuantWGroup(fqw) << " k), "
+              << (vram_before_fqw.ok && vram1.ok ? GiB(static_cast<int64_t>(vram_before_fqw.free_bytes) -
+                                                       static_cast<int64_t>(vram1.free_bytes))
+                                                 : 0.0)
+              << " GiB; the decoded weights are rounded to int8 and back in prompt prefill only "
+                 "(accuracy experiment, not a production setting)\n";
+  }
+  // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): decided here, where the container is resident --
+  // whether this Model can run the int8 GEMM (DecidePrefillInt8), and, if so, the one-time pass that builds the
+  // weight scale table of every trellis linear that has an int8 plan. Nothing at all when the switch is off. The
+  // tables are part of the weights for the VRAM breakdown below (vram1 is taken again after them, so they are not
+  // booked as arena + scratch). The chunk decision is the one made below (DecidePrefillChunk), restated from its
+  // two inputs because the buffers it sizes are not allocated yet.
+  bool want_i8 = false;
+  const char* i8_why = nullptr;
+  double i8_gib = 0.0;
+  int i8_tables = 0, i8_trellis = 0;
+  if (i8_request == kPrefillInt8On) {
+    PrefillChunkInputs i8_chunk;
+    i8_chunk.requested = opts.prefill_chunk != 0 ? opts.prefill_chunk : PrefillChunkRequest();
+    i8_chunk.rotated_container = m.container_.HasRotation();
+    PrefillInt8Inputs i8_in;
+    i8_in.requested = i8_request;
+    i8_in.wide = DecidePrefillChunk(i8_chunk) == kPrefillChunkWide;
+    i8_in.tp_world = tp.world;
+    i8_in.has_trellis = m.container_.HasTrellis();
+    i8_in.rotated_container = i8_chunk.rotated_container;
+    want_i8 = DecidePrefillInt8(i8_in, &i8_why);
+    if (want_i8) {
+      const VramSnap vram_before_i8 = vram1;
+      i8_tables = m.container_.BuildTrellisI8Scales(m.stream_.get(), &i8_trellis);
+      m.stream_.Synchronize();
+      vram1 = SnapVram();
+      if (vram_before_i8.ok && vram1.ok) {
+        i8_gib = GiB(static_cast<int64_t>(vram_before_i8.free_bytes) - static_cast<int64_t>(vram1.free_bytes));
+      }
+      i8_in.tables_built = i8_tables;
+      want_i8 = DecidePrefillInt8(i8_in, &i8_why);
+    }
+  }
+  m.prefill_int8_ = want_i8;
   // docs/tp.md 8.3: a tensor-parallel rank without the tower (rank 1) only parsed the vision
   // config, so the "the container has vision" test is HasVisionConfig() there -- the tower itself
   // is rank 0's. At TP=1 the two are the same test.
@@ -605,6 +674,40 @@ Model Model::Load(const ModelOptions& opts) {
                              ? "r4d_gdn_conv_prep (64-row chunks always run the original kernel)"
                              : "r4d_gdn_conv_prep (R4DX_GDN_CONV=1)"))
               << "\n";
+  }
+  // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): one line per load, on or off and why.
+  {
+    const char* env = std::getenv("R4DX_PREFILL_INT8");
+    const std::string source = opts.prefill_int8 >= 0
+                                   ? "ModelOptions::prefill_int8=" + std::to_string(opts.prefill_int8)
+                                   : (env != nullptr && *env != '\0') ? std::string("R4DX_PREFILL_INT8=") + env
+                                                                       : std::string("default");
+    if (m.prefill_int8_) {
+      std::cerr << "[r4dx::model::Model] prefill int8: ON (" << source
+                << "): the full 256-row super-chunks of Prefill calls run their trellis linears int8 x int8 (A per row x 128 k, "
+                   "weights per column x 128 k, int32 WMMA, per-128 fp32 rescale); "
+                << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
+                << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal calls with images stay f16; "
+                   "R4DX_PREFILL_INT8=0 turns it off\n";
+    } else if (i8_request == kPrefillInt8On) {
+      std::cerr << "[r4dx::model::Model] prefill int8: off (" << source << " asked for it, not used: "
+                << (i8_why != nullptr ? i8_why : "unknown") << ")\n";
+    } else {
+      std::cerr << "[r4dx::model::Model] prefill int8: off (default; R4DX_PREFILL_INT8=1 enables the int8 prefill GEMM)\n";
+    }
+  }
+  // R4DX_FAKEQ_ACT (docs/int8-prefill.md): parsed here (an unrecognized value throws), one line per process,
+  // and nothing at all when it is unset. Only the Qwen Model's prompt-prefill chunks read it.
+  if (const int fq = FakeQuantActRequest(); fq != kFakeQuantOff) {
+    static const bool once = [fq] {
+      std::cerr << "[r4dx::model::Model] R4DX_FAKEQ_ACT=" << FakeQuantActName(fq)
+                << ": the f16 A of every trellis linear is rounded to int8 and back (scale per "
+                << (FakeQuantActGroup(fq) == 0 ? std::string("row")
+                                               : "row x " + std::to_string(FakeQuantActGroup(fq)) + " columns")
+                << ") in prompt prefill only; accuracy experiment, not a production setting\n";
+      return true;
+    }();
+    (void)once;
   }
 
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
@@ -976,6 +1079,17 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
   // The M = 256 trellis GEMM is reachable from ApplyLinear only inside a super-chunk's layers.
   const ScopedTrellisM256 trellis_m256_scope(wide);
+  // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): the int8 x int8 GEMM for the trellis linears of a
+  // super-chunk of a Prefill() call of a Model that uses it -- and nowhere else (a 64-row chunk or tail, decode, a
+  // verify window, PrefillMultimodal's image chunks all see the f16 kernels).
+  const bool i8_chunk = wide && prefill_int8_call_;
+  const ScopedTrellisI8 trellis_i8_scope(i8_chunk);
+  if (i8_chunk) ++i8_chunks_run_;
+  // R4DX_FAKEQ_ACT (docs/int8-prefill.md): int8-rounded trellis A in the layers of a prompt-prefill chunk
+  // (any row count, tails included) and nowhere else -- not decode, and ended below before the MTP head's
+  // priming, the DFlash drafter's injection and the lm_head. Mode 0 (unset) touches nothing.
+  ScopedFakeQuantAct fakeq_scope(is_prefill_path ? FakeQuantActRequest() : kFakeQuantOff);
+  ScopedFakeQuantW fakeqw_scope(is_prefill_path ? FakeQuantWRequest() : kFakeQuantWOff);  // R4DX_FAKEQ_W
   if (wide) ++wide_chunks_run_;
 
   uint16_t* cur = buf_a_.data();
@@ -1102,6 +1216,8 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     arena_.Reset();
   }
   if (probe_ != nullptr) probe_->SetLayer(-1);
+  fakeq_scope.End();
+  fakeqw_scope.End();
   // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
   // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
   // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
@@ -1585,6 +1701,13 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
     ~WideGuard() { slot = 0; }
   } wide_guard{prefill_wide_active_};
   prefill_wide_active_ = rows > max_chunk_ ? rows : 0;
+  // R4DX_PREFILL_INT8: this call's super-chunks run the int8 GEMM (PrefillMultimodal never sets it itself; a text-only call with no image ever seen delegates to Prefill, so it is one). Cleared on
+  // every exit, so no later RunChunk (decode, a multimodal call) can see it.
+  struct Int8Guard {
+    bool& slot;
+    ~Int8Guard() { slot = false; }
+  } int8_guard{prefill_int8_call_};
+  prefill_int8_call_ = prefill_int8_;
   for (size_t off = 0; off < token_ids.size();) {
     const size_t n = static_cast<size_t>(PrefillNextChunk(static_cast<long long>(token_ids.size() - off),
                                                            static_cast<int>(rows)));
@@ -2016,6 +2139,9 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
     const int64_t T = static_cast<int64_t>(chunk.size());
     const bool wide = wide_rows > max_chunk_ && T == wide_rows;
     const ScopedTrellisM256 trellis_m256_scope(wide);
+    const ScopedTrellisI8 trellis_i8_scope(wide && prefill_int8_);  // R4DX_PREFILL_INT8: profile what Prefill() runs
+    const ScopedFakeQuantAct fakeq_scope(FakeQuantActRequest());  // R4DX_FAKEQ_ACT, as RunChunk
+    const ScopedFakeQuantW fakeqw_scope(FakeQuantWRequest());     // R4DX_FAKEQ_W, as RunChunk
     const bool has_init = started_;
 
     // Same device-resident-vs-host branch real prefill (RunChunk) takes -- see DecodeStepProfiled's

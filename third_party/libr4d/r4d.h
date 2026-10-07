@@ -340,6 +340,82 @@ const char* r4d_gemm_trellis_nt_m256_check(int M, int K, int N, int n_split, int
                                            int SKG, int U, int skw);
 size_t r4d_gemm_trellis_nt_m256_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
 
+// ---- weight fake-quant (r4dx R4DX_FAKEQ_W, docs/int8-prefill.md): a MEASUREMENT hook -----------------
+// "What would int8 WEIGHTS cost in prefill?", answered before an int8 x int8 GEMM exists: the `_wq`
+// entries below are r4d_gemm_trellis_nt_m64 / _raw / r4d_gemm_trellis_nt_m256 with every decoded weight
+// fragment rounded to symmetric int8 and back (one scale per output column and per group of 2^gsh k-tiles,
+// i.e. 32 k at gsh = 1, 128 k at gsh = 3) right before the WMMA. The shipped entries and their kernels are
+// unchanged. A group's scale is s = max|Q| / 127 over its 16 * 2^gsh values of one column of Q (fp32;
+// 1.0f for an all-zero group); a value w becomes f16(clamp(rint(w * (1 / s)), -127, 127) * s), all but the
+// last rounding in fp32 (src/model/fake_quant_w.h is the CPU transcription).
+//   r4d_trellis_wscale_count(K, N, gsh)   floats in the scale table: (K / 16 >> gsh) * N, laid out
+//                                         [group][column n of Q]
+//   r4d_trellis_wscale_f32(w, scale, ..)  builds the table from the pair-grid words `w` with the GEMM's own
+//                                         decode (so the values are the GEMM's); N a multiple of 32, KB 4 or 5
+//   *_wq                                  as the entry without _wq plus the table and gsh (1, 2 or 3,
+//                                         16 << gsh dividing K); a null table throws. NT is ignored (the
+//                                         `_wq` kernel always loads weights temporally: a cache hint, the
+//                                         same bits). The legality rules are the entry's own.
+size_t r4d_trellis_wscale_count(int K, int N, int gsh);
+void   r4d_trellis_wscale_f32(int64_t w, int64_t scale, int K, int N, int KB, int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m64_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh,
+                                int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                                int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                                float out_scale, int64_t wscale, int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m64_raw_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t c,
+                                    int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
+                                    int SK, int MT, int NP, int SKG, int U, int NT, int64_t wscale,
+                                    int gsh, int64_t stream);
+void r4d_gemm_trellis_nt_m256_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
+                                 int64_t ws, int64_t tickets, int M, int K, int N, int KB, int SK, int NP,
+                                 int SKG, int U, float out_scale, int64_t stream, int skw, int64_t wscale,
+                                 int gsh);
+
+// ---- int8 x int8 trellis prefill GEMM (r4d_gemm_trellis_nt_i8.hip; docs/int8-prefill.md "Production path") ----
+// The trellis linear of r4d_gemm_trellis_nt_m256 for exactly M = 256 rows with the operands QUANTIZED: A to int8
+// per (row, 128 k), the decoded trellis weight Q to int8 per (output column, 128 k) -- on the fly inside the GEMM,
+// from a per-linear scale table -- and v_wmma_i32_16x16x16_iu8, rescaling every 128-k int32 partial sum into fp32.
+// The output transform is the f16 kernel's (FWHT128, svh, out_scale, one bf16 rounding). It is NOT bit-identical
+// to r4d_gemm_trellis_nt_m256: a different, quantized model of the same linear (a KL budget against the f16 path
+// is its accuracy contract). A row's result depends on (skw, skg) and the weights, never on its position in the
+// launch or on the other rows.
+//
+//   Layouts (r4d_trellis_i8_layout.h): A8 [rg][kt][row tile][lane][8] int8 (256 K bytes) and SA [K/128][256] fp32
+//   per A part; the weight scale table SW [K/128][N] fp32 (r4d_trellis_i8_wscale_count floats; s_eff = 1 / rs, rs
+//   the f16 the weight is multiplied by: s = max|w| / 127 per (column, 128 k), rs = f16(min(1 / s, 60000)),
+//   q = rint(w * rs), 1.0 for an all-zero group).
+//
+//   r4d_trellis_i8_quant_act(x, a8, sa, parts, part_stride, K, stream): x is the transformed activation
+//       (r4dx_trellis_input_bf16's f16 output) [256][K] with row stride K, part p at x + p * part_stride elements;
+//       writes part p's A8 at a8 + p * 256 K bytes and its SA at sa + p * (K / 128) * 256 floats. s = amax / 127
+//       per (row, 128 k) (1.0 for all zero), q = clamp(rint(x / s), -127, 127), IEEE division. a8 and sa must be
+//       16-byte aligned. K a positive multiple of 128, parts 1 or 2 (part_stride >= 256 K for two).
+//   r4d_trellis_i8_wscale(w, sw, K, N, KB, stream): the table from the pair-grid words `w` with the GEMM's own
+//       decode; K and N multiples of 128, KB 4 or 5; stream-ordered. Built once per weight.
+//   r4d_trellis_i8_dump_w(w, sw, w8, wp, K, N, KB, stream): a DIAGNOSTIC for the tests: the int8 matrix the GEMM
+//       quantizes on the fly, from the words and the table, in the block layout (w8, N K bytes) and, if wp is not
+//       null, plain [N][K] (true k, true n).
+//   r4d_gemm_trellis_nt_i8(...): C bf16 [256][N]. Output columns >= n_split read a8_1 / sa_1 (a fused gate / up
+//       pair with different input transforms), the others a8_0 / sa_0; a8_1 = 0 means a8_0 (then n_split must be
+//       N). `ws` is fp32 r4d_gemm_trellis_nt_i8_ws_bytes(M, N, SKG) -- ALWAYS required, every slot written before it
+//       is read -- and `tickets` is u32 [N / 128], zero before the first call and zero again after every complete
+//       launch (the f16 kernel's protocol: one buffer per linear, never two launches of it in flight; f16 and
+//       int8 launches of one linear may interleave on one stream). skw (K slices per workgroup: 2, 4 or 8) x skg
+//       (K groups across the grid: 1, 2, 4 or 8) must divide K / 128. out_scale as the f16 kernel's.
+//   Legal only when M = 256, K and N and n_split are multiples of 128, (K / 128) % (skw skg) == 0 and the
+//   instantiation exists (KB 4 / 5 x skw 2 / 4 / 8); r4d_gemm_trellis_nt_i8_check says which rule a launch
+//   breaks, without launching (nullptr = legal, else a message valid until this thread's next call).
+size_t r4d_trellis_i8_wscale_count(int K, int N);   // (K / 128) * N
+void   r4d_trellis_i8_wscale(int64_t w, int64_t sw, int K, int N, int KB, int64_t stream);
+void   r4d_trellis_i8_dump_w(int64_t w, int64_t sw, int64_t w8, int64_t wp, int K, int N, int KB, int64_t stream);
+void   r4d_trellis_i8_quant_act(int64_t x, int64_t a8, int64_t sa, int parts, int64_t part_stride, int K,
+                                int64_t stream);
+void r4d_gemm_trellis_nt_i8(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w,
+                            int64_t sw, int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N,
+                            int KB, int skw, int skg, float out_scale, int64_t stream);
+const char* r4d_gemm_trellis_nt_i8_check(int M, int K, int N, int n_split, int KB, int skw, int skg);
+size_t r4d_gemm_trellis_nt_i8_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
+
 // ---- registry ------------------------------------------------------------------------------
 // Every kernel in the library, with the constraints its name encodes spelled out. A caller that
 // wants to know whether R4D covers a model can read this instead of hardcoding what it remembers.

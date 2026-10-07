@@ -23,6 +23,7 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
 - **Prefill:** 256-row chunks (the M = 256 trellis GEMM; bit-identical to 64-row chunks, kill switch
   `R4DX_PREFILL_CHUNK=0`) with a fused, exact-wide attention kernel; a faster split-KV variant is opt-in
   (`R4DX_PREFILL_SPLITKV=split`).
+  An int8 x int8 prefill GEMM for the 256-row chunks is opt-in and lossy (`R4DX_PREFILL_INT8=1`, default off; docs/int8-prefill.md).
 - **Tensor parallel across two GPUs (`--tp 2`):** all-reduce through pinned host memory, since the
   cards have no peer-to-peer path.
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,

@@ -7,6 +7,15 @@
 #   .\tools\quant2\kl_rung4.ps1 -Device 0 -OutDir <dir>       # HIP device 0 (the desktop card; ~3 min)
 #   .\tools\quant2\kl_rung4.ps1 -Model <other.r4dx> -Layout w4a16 -RefDir <its bf16 ref> -ExpectKl 0 -NoGate ...
 #
+# -ToolArgs appends extra arguments to the tool's command line (default none: the command line is unchanged).
+# The default pass feeds ids[1..] through DecodeStep, i.e. the DECODE path; to score the prefill path -- what
+# R4DX_FAKEQ_ACT (docs/int8-prefill.md) changes -- pass -ToolArgs '--tail-rows','1023','--tail-path','prefill'
+# (every row through a one-token Prefill call; 1023 = T - 1 of the 1024-token canon segments, so the dump is
+# still [T-1, V] and scoreable here). Such a run is a different path from the frozen numbers: use -NoGate
+# -CompareDir '' and read it against an unquantized run of the same arguments, or -NoGate -CompareDir <dir of that
+# run> to also get the byte comparison (under -NoGate the comparison runs only for an explicit -CompareDir, and
+# exits 1 when a segment differs).
+#
 # A KL number is only meaningful against the bf16 reference of the SAME model: the default -RefDir is
 # huihui\kl-ref (tools/reference/full_logits_golden.py on the Huihui checkpoint, tokens_canon.json).
 # The base Qwen3.8-27B reference (kl-canon\ref, still on disk) scores only the base model's containers,
@@ -29,6 +38,7 @@ param(
   [double]$ExpectTop1 = 95.70,
   [string]$CompareDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\huihui\kl\rt-mix45m",
   [string]$Tool = '',
+  [string[]]$ToolArgs = @(),
   [string]$Python = 'C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe',
   [switch]$NoGate
 )
@@ -49,7 +59,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 Write-Host ("[kl_rung4] {0:HH:mm:ss} tool_teacher_forced_logprobs on device {1}: {2} ({3})" -f (Get-Date), $Device, $Model, $Layout)
 $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
 try {
-  & $Tool --model $Model --layout $Layout --tokens $Tokens --out-dir $OutDir --max-ctx 4096 --vision off *> (Join-Path $OutDir 'tool.log')
+  & $Tool --model $Model --layout $Layout --tokens $Tokens --out-dir $OutDir --max-ctx 4096 --vision off @ToolArgs *> (Join-Path $OutDir 'tool.log')
   $rc = $LASTEXITCODE
 } finally { $ErrorActionPreference = $prev }
 if ($rc -ne 0) { throw "[kl_rung4] tool_teacher_forced_logprobs exited $rc (see $OutDir\tool.log)" }
@@ -80,16 +90,18 @@ $fail = @()
 if (-not $NoGate) {
   if ([math]::Round($kl, 5) -ne [math]::Round($ExpectKl, 5)) { $fail += ("mean KL {0:F5} != frozen {1:F5}" -f $kl, $ExpectKl) }
   if ([math]::Round($top1, 2) -ne [math]::Round($ExpectTop1, 2)) { $fail += ("top-1 {0:F2}% != frozen {1:F2}%" -f $top1, $ExpectTop1) }
-  if ($CompareDir) {
-    $ref = @(Get-ChildItem (Join-Path $CompareDir '*.logprobs.f16') | Sort-Object Name)
-    if ($ref.Count -eq 0) { $fail += "no *.logprobs.f16 in $CompareDir" }
-    foreach ($f in $ref) {
-      $c = Join-Path $OutDir $f.Name
-      if (-not (Test-Path $c)) { $fail += "$($f.Name) missing in $OutDir"; continue }
-      $same = ((Get-FileHash -Algorithm SHA256 $f.FullName).Hash -eq (Get-FileHash -Algorithm SHA256 $c).Hash)
-      Write-Host ("[kl_rung4]   {0,-28} {1} vs {2}" -f $f.Name, $(if ($same) { 'byte-identical' } else { 'DIFFERENT' }), $CompareDir)
-      if (-not $same) { $fail += "$($f.Name) differs from $CompareDir" }
-    }
+}
+# The byte comparison runs under the gate, and under -NoGate only when -CompareDir was passed explicitly (the
+# default CompareDir is the frozen run, which an -NoGate run of another path or model is not meant to equal).
+if ($CompareDir -and (-not $NoGate -or $PSBoundParameters.ContainsKey('CompareDir'))) {
+  $ref = @(Get-ChildItem (Join-Path $CompareDir '*.logprobs.f16') | Sort-Object Name)
+  if ($ref.Count -eq 0) { $fail += "no *.logprobs.f16 in $CompareDir" }
+  foreach ($f in $ref) {
+    $c = Join-Path $OutDir $f.Name
+    if (-not (Test-Path $c)) { $fail += "$($f.Name) missing in $OutDir"; continue }
+    $same = ((Get-FileHash -Algorithm SHA256 $f.FullName).Hash -eq (Get-FileHash -Algorithm SHA256 $c).Hash)
+    Write-Host ("[kl_rung4]   {0,-28} {1} vs {2}" -f $f.Name, $(if ($same) { 'byte-identical' } else { 'DIFFERENT' }), $CompareDir)
+    if (-not $same) { $fail += "$($f.Name) differs from $CompareDir" }
   }
 }
 if ($fail.Count -gt 0) { Write-Host ("[kl_rung4] FAILED: " + ($fail -join '; ')); exit 1 }

@@ -1,6 +1,6 @@
 # third_party/CMakeLists.txt
 #
-# r4d_core: a static library built from the 14 HIP translation units of the vendored libr4d
+# r4d_core: a static library built from the 17 HIP translation units of the vendored libr4d
 # (third_party/libr4d: attention, GDN, the bf16 / w4a16 / trellis GEMMs, the DFlash conv, the kernel
 # registry).
 #
@@ -46,7 +46,10 @@ if(EXISTS "${R4D_DEVICE_LIB_PATH}")
   list(APPEND R4D_BASE_FLAGS --rocm-device-lib-path=${R4D_DEVICE_LIB_PATH})
 endif()
 
-# unit -> extra per-unit flags, for the 14 units r4dx links.
+# unit -> extra per-unit flags, for the 17 units r4dx links (the two `_wq` units are R4DX_FAKEQ_W's,
+# docs/int8-prefill.md: the trellis GEMMs with the decoded weights rounded to int8, a unit of their own so
+# the shipped trellis units compile exactly as before; r4d_gemm_trellis_nt_i8 is R4DX_PREFILL_INT8's int8 x int8
+# GEMM, a unit of its own for the same reason).
 set(R4D_UNITS
   r4d_attn_paged_h256_gqa6
   r4d_attn_paged_h256_gqa2
@@ -60,6 +63,9 @@ set(R4D_UNITS
   r4d_gemm_w4a16_nt_m64
   r4d_gemm_trellis_nt_m64
   r4d_gemm_trellis_nt_m256
+  r4d_gemm_trellis_nt_m64_wq
+  r4d_gemm_trellis_nt_m256_wq
+  r4d_gemm_trellis_nt_i8
   r4d_dflash_conv_t2_g16_bf16
   r4d_registry
 )
@@ -76,6 +82,9 @@ set(R4D_EXTRA_r4d_gdn_chunk_scan_k128_v128_c64_bf16 -mcumode)
 file(GLOB R4D_HEADERS CONFIGURE_DEPENDS "${LIBR4D_DIR}/*.h")
 set(R4D_DEPS_r4d_attn_paged_h256_gqa6
   "${LIBR4D_DIR}/r4d_attn_decode_h256_gqa6.hip" "${LIBR4D_DIR}/r4d_attn_prefill_h256_gqa6.hip")
+# The `_wq` units #include the shipped trellis units' sources (R4D_TQ_WQ_UNIT / R4D_T256_WQ_UNIT).
+set(R4D_DEPS_r4d_gemm_trellis_nt_m64_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m64.hip")
+set(R4D_DEPS_r4d_gemm_trellis_nt_m256_wq "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip")
 # The sliding-window unit instantiates the same two kernel files (WIN = 1).
 set(R4D_DEPS_r4d_attn_paged_h256_gqa2 ${R4D_DEPS_r4d_attn_paged_h256_gqa6})
 
@@ -152,7 +161,86 @@ add_custom_command(
   COMMENT "check_trellis_isa: r4d_gemm_trellis_nt_m256 VGPR/scratch"
   VERBATIM
 )
-add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}" "${R4D_TRELLIS256_ISA_STAMP}")
+# The same check, resources REPORTED and not gated (-DWQ=ON), for R4DX_FAKEQ_W's two `_wq` units: no 190-VGPR /
+# zero-scratch rule (the rounding and the scale loads may cost registers; it is a measurement tool), but the
+# decode's near-dependency rule still holds.
+set(R4D_TRELLIS_WQ_ISA_STAMPS "")
+foreach(wq_pair "r4d_gemm_trellis_nt_m64_wq|r4d_gemm_trellis_nt_m64_kernel" "r4d_gemm_trellis_nt_m256_wq|r4d_gemm_trellis_nt_m256_kernel")
+  string(REPLACE "|" ";" wq_pair "${wq_pair}")
+  list(GET wq_pair 0 wq_unit)
+  list(GET wq_pair 1 wq_kernel)
+  set(wq_isa "${R4D_OBJ_DIR}/${wq_unit}-${R4D_GFX_ARCH}.s")
+  set(wq_stamp "${R4D_OBJ_DIR}/${wq_unit}_isa.ok")
+  add_custom_command(
+    OUTPUT "${wq_isa}"
+    COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4D_HIPCC_PATH}"
+            "${R4D_HIPCC}" ${R4D_BASE_FLAGS} ${R4D_EXTRA_${wq_unit}} --cuda-device-only -S
+            -Wno-unused-command-line-argument "${LIBR4D_DIR}/${wq_unit}.hip" -o "${wq_isa}"
+    DEPENDS "${LIBR4D_DIR}/${wq_unit}.hip" ${R4D_HEADERS} ${R4D_DEPS_${wq_unit}}
+    COMMENT "hipcc -S (${R4D_GFX_ARCH}) ${wq_unit} ISA"
+    VERBATIM
+  )
+  add_custom_command(
+    OUTPUT "${wq_stamp}"
+    COMMAND "${CMAKE_COMMAND}" "-DISA=${wq_isa}" "-DSTAMP=${wq_stamp}" "-DGEMM_KERNEL=${wq_kernel}" -DWQ=ON
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+    DEPENDS "${wq_isa}" "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+    COMMENT "check_trellis_isa (WQ): ${wq_unit} near dependencies, resources reported"
+    VERBATIM
+  )
+  list(APPEND R4D_TRELLIS_WQ_ISA_STAMPS "${wq_stamp}")
+endforeach()
+# The same check for the int8 x int8 unit (docs/int8-prefill.md "Production path"): every instantiation of
+# i8g_kernel (TRELLIS, KB 4 / 5, FWHT, RESC 0, skw 2 / 4 / 8: 6 kernels, and only those, since the unit holds
+# nothing else) must fit 192 VGPRs (amdgpu_waves_per_eu(8), the cap the kernel is written for) with no scratch,
+# no spill and no near dependency behind the decode's inline asm. Gated, unlike the `_wq` units.
+set(R4D_TRELLISI8_ISA "${R4D_OBJ_DIR}/r4d_gemm_trellis_nt_i8-${R4D_GFX_ARCH}.s")
+set(R4D_TRELLISI8_ISA_STAMP "${R4D_OBJ_DIR}/r4d_gemm_trellis_nt_i8_isa.ok")
+add_custom_command(
+  OUTPUT "${R4D_TRELLISI8_ISA}"
+  COMMAND "${CMAKE_COMMAND}" -E env "PATH=${R4D_HIPCC_PATH}"
+          "${R4D_HIPCC}" ${R4D_BASE_FLAGS} ${R4D_EXTRA_r4d_gemm_trellis_nt_i8} --cuda-device-only -S
+          -Wno-unused-command-line-argument "${LIBR4D_DIR}/r4d_gemm_trellis_nt_i8.hip"
+          -o "${R4D_TRELLISI8_ISA}"
+  DEPENDS "${LIBR4D_DIR}/r4d_gemm_trellis_nt_i8.hip" ${R4D_HEADERS}
+  COMMENT "hipcc -S (${R4D_GFX_ARCH}) r4d_gemm_trellis_nt_i8 ISA"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT "${R4D_TRELLISI8_ISA_STAMP}"
+  COMMAND "${CMAKE_COMMAND}" "-DISA=${R4D_TRELLISI8_ISA}" "-DSTAMP=${R4D_TRELLISI8_ISA_STAMP}"
+          -DGEMM_KERNEL=i8g_kernel -DMAX_VGPR=192
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+  DEPENDS "${R4D_TRELLISI8_ISA}" "${CMAKE_CURRENT_SOURCE_DIR}/check_trellis_isa.cmake"
+  COMMENT "check_trellis_isa: r4d_gemm_trellis_nt_i8 VGPR/scratch"
+  VERBATIM
+)
+# The int8 kernel's epilogue is a COPY of the f16 M = 256 kernel's (a shared helper would move the shipped
+# kernels' ISA): tools/reference/diff_epilogue.ps1 compares the two sources on the parts that define the arithmetic
+# (the FWHT stage trace, the ticket protocol, svh / out_scale / the one bf16 rounding, the y-sum, the slice
+# reduction) and fails the build when they diverge. Windows PowerShell, the project's only host; where it is not
+# found the check is left out, with a notice.
+find_program(R4D_POWERSHELL powershell)
+set(R4D_I8_EPILOGUE_STAMP "${R4D_OBJ_DIR}/r4d_i8_epilogue_diff.ok")
+set(R4D_I8_EPILOGUE_STAMPS "")
+if(R4D_POWERSHELL)
+  get_filename_component(R4DX_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+  add_custom_command(
+    OUTPUT "${R4D_I8_EPILOGUE_STAMP}"
+    COMMAND "${R4D_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File "${R4DX_ROOT_DIR}/tools/reference/diff_epilogue.ps1"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${R4D_I8_EPILOGUE_STAMP}"
+    DEPENDS "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip" "${LIBR4D_DIR}/r4d_trellis_i8.h"
+            "${R4DX_ROOT_DIR}/tools/reference/diff_epilogue.ps1"
+    COMMENT "diff_epilogue: the int8 GEMM epilogue equals the f16 M = 256 kernel epilogue"
+    VERBATIM
+  )
+  set(R4D_I8_EPILOGUE_STAMPS "${R4D_I8_EPILOGUE_STAMP}")
+else()
+  message(STATUS "r4d: powershell not found; tools/reference/diff_epilogue.ps1 (the int8 epilogue copy check) is not part of this build")
+endif()
+add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}" "${R4D_TRELLIS256_ISA_STAMP}"
+                                              "${R4D_TRELLISI8_ISA_STAMP}" ${R4D_I8_EPILOGUE_STAMPS}
+                                              ${R4D_TRELLIS_WQ_ISA_STAMPS})
 
 # Qwen-unchanged guard for the sliding-window attention extension (docs/gemma4-plan.md 3.3, M1-32): the
 # Qwen attention unit (r4d_attn_paged_h256_gqa6, which instantiates the prefill / decode templates the

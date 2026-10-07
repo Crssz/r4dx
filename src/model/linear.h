@@ -193,6 +193,97 @@ class ScopedTrellisM256 {
 };
 bool TrellisM256Active();
 
+// ---- the int8 x int8 prefill GEMM (R4DX_PREFILL_INT8; prefill_int8.h, docs/int8-prefill.md "Production path") ----
+// One row of the int8 tuning table (src/model/gemm_tuning_table_trellis_i8.inc): the (skw, skg) of libr4d's
+// r4d_gemm_trellis_nt_i8 for the trellis linear class of shape N x K at rate `rate` (KB).
+struct TrellisI8Row {
+  int64_t N, K;
+  int rate;
+  int skw, skg;
+};
+// The table, for tests and diagnostics (a pure read of the .inc).
+const TrellisI8Row* TrellisI8Rows(size_t* count);
+
+// Whether, and how, a trellis linear of this shape and rate runs through the int8 GEMM at M = 256: `skw` / `skg`
+// are the K slices per workgroup and the K groups across the grid of its table row. `ok` is false -- and `why`
+// says so -- for a combination without a legal configuration (no row for the class, a K or N the kernel
+// rejects, a part boundary that is not a whole 128-block, a shape R4DX_M256_SHAPES excludes), which keeps the
+// f16 kernel. `part_n0` is trellis_part_n[0] (ignored for parts == 1). A pure function of its arguments (and
+// R4DX_M256_SHAPES, the debug filter the f16 plan honours too); the load-time table builder, ApplyLinear and
+// tests/model/test_prefill_int8_cpu share it.
+struct TrellisI8Plan {
+  bool ok = false;
+  int skw = 0, skg = 0;
+  std::string why;
+};
+TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0);
+
+// RAII: while alive on this thread, a 256-row ApplyLinear of a trellis linear with an int8 plan (and a scale
+// table) takes the int8 x int8 GEMM instead of the f16 M = 256 kernel; it also needs ScopedTrellisM256 (the
+// super-chunk scope) to be on. Off by default: Model turns it on around the layers of a 256-row prefill
+// super-chunk of a Prefill call (not PrefillMultimodal, not decode, not a verify window, not a 64-row chunk)
+// when R4DX_PREFILL_INT8 is on, so no other caller of ApplyLinear can reach it.
+class ScopedTrellisI8 {
+ public:
+  explicit ScopedTrellisI8(bool on);
+  ~ScopedTrellisI8();
+  ScopedTrellisI8(const ScopedTrellisI8&) = delete;
+  ScopedTrellisI8& operator=(const ScopedTrellisI8&) = delete;
+
+ private:
+  bool prev_;
+};
+bool TrellisI8Active();
+
+// R4DX_PREFILL_INT8's one-time pass (Model::Load, only when the switch is on): the weight scale table of the
+// trellis linear `w` (libr4d's r4d_trellis_i8_wscale: s = max|w| / 127 per (column, 128 k), stored as 1 / f16(1 / s))
+// in w.trellis_i8_sw, K * N / 32 bytes. Only for a linear whose PlanTrellisI8 is ok; returns whether it built one.
+// Stream-ordered. A non-trellis linear is left alone.
+bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream);
+
+// RAII: while alive on this thread, every trellis linear's ApplyLinear rounds its transformed f16 A to int8
+// and back in place right before the GEMM (fake_quant_act.h's `mode`, kernels.h's r4dx_fake_quant_act_f16;
+// docs/int8-prefill.md). Mode 0 (kFakeQuantOff) does nothing at all. Model turns it on around the layers of
+// a prompt-prefill chunk only (R4DX_FAKEQ_ACT), so decode, verify windows, the MTP / DFlash heads and the
+// vision tower never see it. End() restores the previous mode early (idempotent).
+class ScopedFakeQuantAct {
+ public:
+  explicit ScopedFakeQuantAct(int mode);
+  ~ScopedFakeQuantAct() { End(); }
+  ScopedFakeQuantAct(const ScopedFakeQuantAct&) = delete;
+  ScopedFakeQuantAct& operator=(const ScopedFakeQuantAct&) = delete;
+  void End();
+
+ private:
+  int prev_;
+  bool live_;
+};
+
+// R4DX_FAKEQ_W (fake_quant_w.h, docs/int8-prefill.md), the weight side of the above: while alive on this
+// thread, every trellis linear's ApplyLinear runs the `_wq` GEMM kernels, which round each decoded weight to
+// int8 and back right before the WMMA with the linear's scale table (QuantLinear::trellis_wscale, built by
+// BuildTrellisWScale). Mode 0 (kFakeQuantWOff) does nothing at all: the shipped kernels, bit for bit. A
+// trellis linear without a table under a non-zero mode throws (the measurement must not silently run
+// unquantized). Model opens it around the layers of a prompt-prefill chunk only, next to ScopedFakeQuantAct.
+class ScopedFakeQuantW {
+ public:
+  explicit ScopedFakeQuantW(int mode);
+  ~ScopedFakeQuantW() { End(); }
+  ScopedFakeQuantW(const ScopedFakeQuantW&) = delete;
+  ScopedFakeQuantW& operator=(const ScopedFakeQuantW&) = delete;
+  void End();
+
+ private:
+  int prev_;
+  bool live_;
+};
+
+// R4DX_FAKEQ_W's one-time pass (Model::Load, only when the switch is on): decodes the trellis linear `w` with
+// the GEMM's own decode and stores the per-(column, k group) scale table in w.trellis_wscale (fp32,
+// [K / 16 >> gsh][N] for `mode`'s group, K * N / 32 bytes at col128). Stream-ordered (the GEMMs that
+// read it run on `stream`). A non-trellis linear is left alone.
+void BuildTrellisWScale(QuantLinear& w, int mode, hipStream_t stream);
+
 // docs/trellis-kernel.md 4.8 / 5.4 (M5): whether the layers use the trellis fused producers and
 // shared input transforms below -- on unless R4DX_DISABLE_EPILOGUE=1 (the same A/B switch
 // tools/validate_fusion.ps1 uses for the other layouts' fused epilogues, EpilogueForLayout) or

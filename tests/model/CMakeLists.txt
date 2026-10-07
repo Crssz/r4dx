@@ -37,6 +37,12 @@ set(R4DX_MODEL_TESTS
   # container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library variant for
   # Model::DebugStateDigest.
   test_prefill_chunk_identity
+  # R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path") against the f16 path on the real trellis container loaded
+  # three times (off, on, on): T < 256 byte-identical on and off, T >= 256 deterministic with the int8 chunk counts the
+  # chunk grid predicts, the state digest differing from f16 (negative control), the last row's logits close, text-only
+  # PrefillMultimodal == Prefill; the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
+  # R4DX_TP_TESTING library variant for Model::DebugStateDigest. Written, NOT run by its author.
+  test_prefill_int8
   # The GDN sequence ops of a 256-row super-chunk run once (the default) against the old 64-row sub-slices
   # (R4DX_GDN_SLICE=64), and r4d_gdn_conv_prep2 (the default; R4DX_GDN_CONV=1 opts out) against r4d_gdn_conv_prep, byte for
   # byte (docs/trellis-m256.md "GDN sequence ops"): part A synthetic at the real shape (fresh and has_init
@@ -49,7 +55,7 @@ foreach(t ${R4DX_MODEL_TESTS})
   add_executable(${t} ${t}.cpp)
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
-  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity")
+  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -189,6 +195,23 @@ add_executable(test_decode_legacy test_decode_legacy.cpp)
 target_include_directories(test_decode_legacy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model
                            ${CMAKE_CURRENT_SOURCE_DIR}/../../src/core/include)
 add_test(NAME test_decode_legacy COMMAND test_decode_legacy)
+
+# test_prefill_int8_cpu: pure CPU unit test for src/model/prefill_int8.h (R4DX_PREFILL_INT8's parser and decision table) and
+# the planning side of src/model/linear.cpp (PlanTrellisI8, its tuning table gemm_tuning_table_trellis_i8.inc checked
+# against the kernel's own legality rule, ScopedTrellisI8); docs/int8-prefill.md "Production path". No HIP call;
+# HIP_VISIBLE_DEVICES=-1 hides every device from the runtime that linking r4dx_model_linear loads.
+add_executable(test_prefill_int8_cpu test_prefill_int8_cpu.cpp)
+target_link_libraries(test_prefill_int8_cpu PRIVATE r4dx_model_linear)
+add_test(NAME test_prefill_int8_cpu COMMAND test_prefill_int8_cpu)
+set_tests_properties(test_prefill_int8_cpu PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# /EHc-: see tests/kernels/CMakeLists.txt (an extern "C" throw is otherwise uncatchable).
+set_source_files_properties(test_prefill_int8_cpu.cpp PROPERTIES COMPILE_OPTIONS "/EHc-")
+
+# test_fake_quant_act_cpu: pure CPU unit test for src/model/fake_quant_act.h (docs/int8-prefill.md): the
+# R4DX_FAKEQ_ACT parser and the fp32 reference of the int8 round trip, by hand values. No HIP.
+add_executable(test_fake_quant_act_cpu test_fake_quant_act_cpu.cpp)
+target_include_directories(test_fake_quant_act_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_fake_quant_act_cpu COMMAND test_fake_quant_act_cpu)
 
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group

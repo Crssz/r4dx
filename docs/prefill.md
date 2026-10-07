@@ -17,6 +17,9 @@ re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
 - **M2:** opt-in lossy modes, gated on the M0 KL harness.
 - **256-row chunk:** lossless, default on since 2026-09-30; `R4DX_PREFILL_CHUNK=0` is the kill switch. See
   [The 256-row prefill chunk](#the-256-row-prefill-chunk-default-on-r4dx_prefill_chunk).
+- **int8 prefill GEMM:** opt-in and lossy, `R4DX_PREFILL_INT8=1` (default off; written, GPU validation
+  pending): the full 256-row super-chunks run their trellis linears int8 x int8. See
+  [int8-prefill.md "Production path"](int8-prefill.md#production-path-r4dx_prefill_int8).
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs
 are in `E:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and are never committed.

@@ -9,7 +9,9 @@
 # GEMM_KERNEL (default r4d_gemm_trellis_nt_m64_kernel) names the GEMM kernel template whose
 # instantiations the listing is checked for: the M <= 64 unit, or the M = 256 / 128 unit
 # (r4d_gemm_trellis_nt_m256.hip, whose instantiation table r4d_t256_inst lists only the combinations
-# that meet the same rules). MAX_VGPR (default 190) is the VGPR limit of the instantiations.
+# that meet the same rules), or the int8 x int8 unit (r4d_gemm_trellis_nt_i8.hip: -DGEMM_KERNEL=i8g_kernel
+# -DMAX_VGPR=192, the cap of its amdgpu_waves_per_eu(8) kernel; its 6 production instantiations, nothing else).
+# MAX_VGPR (default 190) is the VGPR limit of the instantiations.
 #
 # Reads a device-only -S listing and fails the build unless
 #
@@ -32,6 +34,12 @@
 #     blocks and the 3 VALU after each are parsed (a near dependency on an asm producer can only be
 #     there), and the check fails if it finds no asm VALU at all, so it cannot pass vacuously.
 #
+# -DWQ=ON (R4DX_FAKEQ_W's r4d_gemm_trellis_nt_m64_wq / r4d_gemm_trellis_nt_m256_wq units, docs/int8-prefill.md in
+# r4dx): the same listing check with the resource rule relaxed -- the VGPR count, scratch and spills of its
+# instantiations are REPORTED, not gated (the rounding and the scale loads cost registers, and it is a
+# measurement tool, so a spill is a slower kernel and not a wrong one) -- while the near-dependency rule, which
+# is about the decode's own asm, still applies.
+#
 # On success it writes STAMP, so the check re-runs only when the listing changes.
 
 if(NOT DEFINED ISA OR NOT EXISTS "${ISA}")
@@ -48,6 +56,11 @@ if(NOT DEFINED MAX_VGPR)
 endif()
 
 set(max_vgpr ${MAX_VGPR})
+if(NOT DEFINED WQ)
+  set(WQ OFF)
+endif()
+set(report_scratch 0)
+set(report_spills 0)
 
 # One list element per line; `;` and square brackets are list syntax in CMake, so the listing's
 # comments start with `#` here and VGPR ranges read v<a:b>.
@@ -194,18 +207,26 @@ foreach(line IN LISTS lines)
   elseif(NOT name STREQUAL "")
     if(line MATCHES "^[ \t-]*\\.private_segment_fixed_size:[ \t]+([0-9]+)")
       if(NOT CMAKE_MATCH_1 EQUAL 0)
-        list(APPEND failures "${name}: scratch ${CMAKE_MATCH_1} bytes")
+        if(WQ)
+          math(EXPR report_scratch "${report_scratch} + 1")
+        else()
+          list(APPEND failures "${name}: scratch ${CMAKE_MATCH_1} bytes")
+        endif()
       endif()
     elseif(line MATCHES "^[ \t-]*\\.(vgpr|sgpr)_spill_count:[ \t]+([0-9]+)")
       if(NOT CMAKE_MATCH_2 EQUAL 0)
-        list(APPEND failures "${name}: ${CMAKE_MATCH_2} ${CMAKE_MATCH_1} spills")
+        if(WQ)
+          math(EXPR report_spills "${report_spills} + 1")
+        else()
+          list(APPEND failures "${name}: ${CMAKE_MATCH_2} ${CMAKE_MATCH_1} spills")
+        endif()
       endif()
     elseif(line MATCHES "^[ \t-]*\\.vgpr_count:[ \t]+([0-9]+)")
       set(v "${CMAKE_MATCH_1}")
       if(v GREATER worst)
         set(worst ${v})
       endif()
-      if(v GREATER max_vgpr)
+      if(v GREATER max_vgpr AND NOT WQ)
         list(APPEND failures "${name}: ${v} VGPRs > ${max_vgpr}")
       endif()
     endif()
@@ -232,6 +253,13 @@ if(near GREATER 0)
                       "result 1-3 VALU later with no s_delay_alu between (they stall the SIMD), e.g.\n"
                       "  ${msg}\n(keep r4d_trellis_k4_decode's / r4d_trellis_k5_decode's dependencies "
                       ">= 4 VALU apart inside the block and its trailing s_delay_alu)")
+endif()
+if(WQ)
+  message(STATUS "check_trellis_isa (WQ): ${count} rounding kernels, max ${worst} VGPRs, ${report_scratch} with "
+                 "scratch, ${report_spills} with spills (reported, not gated); ${asm_valu} asm VALU in the "
+                 "GEMM kernels, 0 near dependencies on them")
+  file(WRITE "${STAMP}" "ok\n")
+  return()
 endif()
 message(STATUS "check_trellis_isa: ${count} trellis kernels OK (max ${worst} VGPRs <= ${max_vgpr}, "
                "no scratch, no spills); ${asm_valu} asm VALU in the GEMM kernels, 0 near "

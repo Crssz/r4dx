@@ -6,6 +6,11 @@
 //   r4d_gemm_trellis_nt_m64_raw   C[M,N] = A[M,K] @ Q[K,N], f16 A, fp32 C, fp32 accumulate
 //   r4d_trellis_reconstruct_f16   Q[K,N] as f16, the whole matrix
 //
+// The kernel is also the source of r4d_gemm_trellis_nt_m64_wq.hip (R4DX_FAKEQ_W, a measurement hook: decoded
+// weights rounded to int8 before the WMMA, the `WQ` template parameter below), which includes this file with
+// R4D_TQ_WQ_UNIT defined: that unit has the `_wq` entry points and r4d_trellis_wscale_f32, this one the shipped
+// ones. Nothing under `if constexpr (WQ)` is part of a shipped instantiation.
+//
 // Q is the trellis-coded weight in its regularized domain: tiles of 16 k x 16 n, each a tail-biting
 // ring of 256*KB bits whose 16-bit states hash to f16 values (EXL3 / QTIP, the "mul1" codebook; the
 // format is docs/trellis.md in r4dx, the decode r4d_trellis_dq.h). The real linear is
@@ -188,12 +193,28 @@ __device__ __forceinline__ void r4d_tq_finish(float (&v)[4], int lane, const flo
 // full = 0: _raw (fp32 C, no output transform); 1: the linear (bf16 C). A runtime flag, not a
 // template parameter: it only selects the epilogue, after the K loop, so both entries share every
 // instantiation (and its register count and schedule). NT = non-temporal weight loads, as w4a16's.
-template <int KB, int NP, int U, int MT, bool NT>
+//
+// WQ (R4DX_FAKEQ_W, docs/int8-prefill.md; a measurement hook): true rounds every decoded fragment to
+// symmetric int8 with the scale of its (column, k group) from `wsc` (fp32 [K / 16 >> wq_gsh][N], built by
+// r4d_trellis_wscale_f32; a group is 2^wq_gsh k-tiles) right before the WMMA. The two extra arguments exist
+// only at WQ = true (a trailing parameter pack that is empty otherwise), so the shipped instantiations
+// (WQ = false, the default) keep their exact signature and, with every `if constexpr (WQ)` gone, their exact
+// code: the build's listing of them is identical to the one without this parameter (see docs/int8-prefill.md).
+// A WQ = true instantiation always loads weights temporally (NT = false: a cache hint, the same bits) and
+// is exempt from the 190-VGPR / zero-scratch rule (third_party/check_trellis_isa.cmake reports it only).
+inline __device__ void r4d_tq_wq_unpack(const float*& wsc, int& gsh, const float* p, int g) {
+  wsc = p;
+  gsh = g;
+}
+template <int KB, int NP, int U, int MT, bool NT, bool WQ = false, typename... WqArgs>
 __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
     const unsigned short* __restrict__ A0, const unsigned short* __restrict__ A1, int n_split,
     const unsigned* __restrict__ W, const float* __restrict__ svh, void* __restrict__ Cv,
     float* __restrict__ ws, unsigned* __restrict__ tickets, int M, int K, int N, int WV, int SK,
-    int SKG, int full, float out_scale, unsigned long long* __restrict__ clk) {
+    int SKG, int full, float out_scale, unsigned long long* __restrict__ clk, WqArgs... wq) {
+  const float* wsc = nullptr;
+  int wq_gsh = 0;
+  if constexpr (WQ) r4d_tq_wq_unpack(wsc, wq_gsh, wq...);
   constexpr int BLK = 64 * KB;                             // bytes per (pair, k-tile) block
   // SK x 8 rows x Wc columns, and nothing else: at SK = 16, Wc = 128 it is the whole 64 KiB, so the
   // split path's broadcast reuses its first word rather than a static __shared__ variable.
@@ -300,6 +321,11 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
       for (int i = 0; i < MT; ++i) r4d_tq_opaque_v(aoff[i]);
     };
     // The KB = 5 decode clobbers its words (they are reloaded before the stage is read again).
+    // WQ: wq_kt is the first k-tile of the step compute() is on. The stages are computed strictly in step
+    // order (s0, s1, s0, ... or the one stage of the plain loop), so compute() keeps the count itself and
+    // the shipped instantiations (WQ = false) carry no extra argument, array or variable: their listing
+    // must stay what it was.
+    [[maybe_unused]] int wq_kt = kt0;
     auto compute = [&](r4d_tq_stage<KB, NP, U, MT>& s) {
 #pragma unroll
       for (int u = 0; u < U; ++u)
@@ -311,14 +337,23 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
                                   f1);
           else
             r4d_trellis_k5_decode(s.w[p][u], k5sh, f0, f1);
+          if constexpr (WQ) {
+            // A fragment's column is fixed per lane (f0 = 32 pair + 16 t + c, f1 = f0 + 8); its scale
+            // group is a function of the k-tile, so the U k-tiles of a step may meet two groups when a
+            // group is narrower than the step (col32 at U = 4).
+            const float* row = wsc + (size_t)((wq_kt + u) >> wq_gsh) * N;
+            const int n = (pair0 + p) * 32 + 16 * ((lane >> 3) & 1) + (lane & 7);
+            f0 = r4d_trellis_wq_round(f0, row[n]);
+            f1 = r4d_trellis_wq_round(f1, row[n + 8]);
+          }
 #pragma unroll
           for (int i = 0; i < MT; ++i) {
             acc[p][0][i] = r4d_tq_mma(s.af[i][u], f0, acc[p][0][i]);
             acc[p][1][i] = r4d_tq_mma(s.af[i][u], f1, acc[p][1][i]);
           }
         }
+      if constexpr (WQ) wq_kt += U;
     };
-
     if constexpr (r4d_tq_prefetch(KB, NP, U, MT)) {
       // The sched_barriers pin each stage's loads ahead of the other stage's decode. Without them
       // the scheduler sinks the loads toward their first use to shorten live ranges -- at (NP, U)
@@ -453,6 +488,48 @@ __global__ __launch_bounds__(1024) void r4d_gemm_trellis_nt_m64_kernel(
   }
 }
 
+// The per-(column, k group) scale table R4DX_FAKEQ_W's `_wq` kernels read: sc[g * N + n] = max |Q[k][n]|
+// / 127 over the 2^gsh k-tiles of group g (fp32; 1.0f for an all-zero group). One wave per (tile pair,
+// group), eight per workgroup; each decodes its blocks with the GEMM's own decode, so the values are the
+// ones the GEMM's WMMA would see. A lane holds one column per fragment and half of each k-tile's 16 k
+// (lane >> 4), so the two halves meet through a lane xor 16.
+template <int KB>
+__global__ __launch_bounds__(256) void r4d_trellis_wscale_kernel(
+    const unsigned* __restrict__ W, float* __restrict__ sc, int K, int N, int gsh) {
+  const int lane = threadIdx.x % WAVE32;
+  const int kt_total = K / 16, groups = kt_total >> gsh;
+  const long long id = (long long)blockIdx.x * 8 + threadIdx.x / WAVE32;
+  if (id >= (long long)(N / 32) * groups) return;
+  const int pair = (int)(id / groups), g = (int)(id - (long long)pair * groups);
+  float m0 = 0.f, m1 = 0.f;
+  for (int j = 0; j < (1 << gsh); ++j) {
+    const long long blk = (long long)pair * kt_total + (g << gsh) + j;
+    const unsigned* b = W + blk * (16 * KB);
+    v8h f0, f1;
+    if constexpr (KB == 4) {
+      const unsigned ia = r4d_trellis_k4_off_ab(lane) / 4, ip = r4d_trellis_k4_off_p(lane) / 4;
+      r4d_trellis_k4_decode(b[ip], b[ia], b[ia + 1], f0, f1);
+    } else {
+      unsigned w5[5];
+#pragma unroll
+      for (int i = 0; i < 5; ++i) w5[i] = b[r4d_trellis_k5_word(lane, i)];
+      r4d_trellis_k5_decode(w5, r4d_trellis_k5_shift(lane), f0, f1);
+    }
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      m0 = __builtin_fmaxf(m0, __builtin_fabsf((float)f0[e]));
+      m1 = __builtin_fmaxf(m1, __builtin_fabsf((float)f1[e]));
+    }
+  }
+  m0 = __builtin_fmaxf(m0, __shfl_xor(m0, 16, WAVE32));
+  m1 = __builtin_fmaxf(m1, __shfl_xor(m1, 16, WAVE32));
+  if (lane < 16) {
+    const int n = pair * 32 + 16 * ((lane >> 3) & 1) + (lane & 7);
+    sc[(size_t)g * N + n] = m0 > 0.f ? m0 / 127.0f : 1.0f;
+    sc[(size_t)g * N + n + 8] = m1 > 0.f ? m1 / 127.0f : 1.0f;
+  }
+}
+
 // One wave per (tile pair, k-tile) block, eight blocks per workgroup: the lane decodes its two
 // fragments exactly as the GEMM does and scatters them to their true (k, n).
 template <int KB>
@@ -566,6 +643,8 @@ struct r4d_tq_launch_args {
   int M, K, N, WV, SK, SKG, NT, full;
   float out_scale;
   unsigned long long* clk;
+  const float* wsc;     // R4DX_FAKEQ_W: the scale table (nullptr = the shipped kernel)
+  int wq_gsh;           // log2 of the k-tiles per scale group
 };
 
 // One launch at a compile-time (KB, NP, U, MT); combinations r4d_trellis_fits rejects are never
@@ -573,12 +652,22 @@ struct r4d_tq_launch_args {
 template <int KB, int NP, int U, int MT>
 static void r4d_tq_launch(const r4d_tq_launch_args& a) {
   if constexpr (r4d_trellis_fits(KB, NP, U, MT)) {
-#define LAUNCH(NTv)                                                                                \
+#ifdef R4D_TQ_WQ_UNIT
+    // R4DX_FAKEQ_W's unit (r4d_gemm_trellis_nt_m64_wq.hip) instantiates only the rounding kernel, and the
+    // shipped unit only the shipped one: the shipped kernels' code must not depend on whether a rounding
+    // instantiation shares their translation unit (measured: it does, by a few instructions).
+    hipLaunchKernelGGL((r4d_gemm_trellis_nt_m64_kernel<KB, NP, U, MT, false, true, const float*, int>),
+                       a.grid, a.block, a.smem, a.stream, a.a0, a.a1, a.n_split, a.w, a.svh, a.c, a.ws,
+                       a.tickets, a.M, a.K, a.N, a.WV, a.SK, a.SKG, a.full, a.out_scale, a.clk, a.wsc,
+                       a.wq_gsh);
+#else
+#define LAUNCH(NTv)                                                                              \
   hipLaunchKernelGGL((r4d_gemm_trellis_nt_m64_kernel<KB, NP, U, MT, NTv>), a.grid, a.block, a.smem, \
                      a.stream, a.a0, a.a1, a.n_split, a.w, a.svh, a.c, a.ws, a.tickets, a.M, a.K,  \
                      a.N, a.WV, a.SK, a.SKG, a.full, a.out_scale, a.clk)
     if (a.NT) { LAUNCH(true); } else { LAUNCH(false); }
 #undef LAUNCH
+#endif
   } else {
     r4d_trellis_fail("(KB, NP, U, MT) not instantiated");
   }
@@ -613,9 +702,11 @@ static void r4d_tq_launch_kb(const r4d_tq_launch_args& a, int NP, int U, int MT)
 static void r4d_tq_run(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh, int64_t c,
                        int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV, int SK,
                        int MT, int NP, int SKG, int U, int NT, int full, float out_scale,
-                       int64_t clk, int64_t stream) {
+                       int64_t clk, int64_t stream, int64_t wsc = 0, int wq_gsh = 0) {
   r4d_trellis_check(M, K, N, n_split, KB, WV, SK, MT, NP, SKG, U, NT, ws != 0 && tickets != 0);
   if (full && svh == 0) r4d_trellis_fail("svh must be non-null");
+  if (wsc != 0 && (wq_gsh < 1 || wq_gsh > 3))
+    r4d_trellis_fail("wq_gsh (log2 of k-tiles per scale group) must be 1, 2 or 3");
   const int Wc = WV * NP * 32, mtiles = (M + 15) / 16;
   r4d_tq_launch_args a;
   a.grid = dim3(N / Wc, SKG, (mtiles + MT - 1) / MT);
@@ -633,9 +724,55 @@ static void r4d_tq_run(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t s
   a.M = M; a.K = K; a.N = N; a.WV = WV; a.SK = SK; a.SKG = SKG; a.NT = NT; a.full = full;
   a.out_scale = out_scale;
   a.clk = (unsigned long long*)clk;
+  a.wsc = (const float*)wsc;
+  a.wq_gsh = wq_gsh;
   if (KB == 4) r4d_tq_launch_kb<4>(a, NP, U, MT);
   else r4d_tq_launch_kb<5>(a, NP, U, MT);
 }
+
+#ifdef R4D_TQ_WQ_UNIT
+// R4DX_FAKEQ_W entries: the same two launches with the weight rounding on. The scale table is mandatory
+// (null throws: the measurement must never silently run unquantized).
+static void r4d_tq_need_wscale(int64_t wscale, int gsh, int K) {
+  if (wscale == 0) r4d_trellis_fail("the _wq entries need a scale table (r4d_trellis_wscale_f32)");
+  if (gsh < 1 || gsh > 3 || K % (16 << gsh))
+    r4d_trellis_fail("gsh (log2 of k-tiles per scale group) must be 1, 2 or 3 and 16 << gsh divide K");
+}
+void r4d_gemm_trellis_nt_m64_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh,
+                                int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                                int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                                float out_scale, int64_t wscale, int gsh, int64_t stream) {
+  r4d_tq_need_wscale(wscale, gsh, K);
+  r4d_tq_run(a0, a1, n_split, w, svh, c, ws, tickets, M, K, N, KB, WV, SK, MT, NP, SKG, U, NT, 1,
+             out_scale, 0, stream, wscale, gsh);
+}
+void r4d_gemm_trellis_nt_m64_raw_wq(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t c,
+                                    int64_t ws, int64_t tickets, int M, int K, int N, int KB, int WV,
+                                    int SK, int MT, int NP, int SKG, int U, int NT, int64_t wscale,
+                                    int gsh, int64_t stream) {
+  r4d_tq_need_wscale(wscale, gsh, K);
+  r4d_tq_run(a0, a1, n_split, w, 0, c, ws, tickets, M, K, N, KB, WV, SK, MT, NP, SKG, U, NT, 0, 1.f, 0,
+             stream, wscale, gsh);
+}
+
+size_t r4d_trellis_wscale_count(int K, int N, int gsh) {
+  return (size_t)(K / 16 >> gsh) * (size_t)N;
+}
+void r4d_trellis_wscale_f32(int64_t w, int64_t scale, int K, int N, int KB, int gsh, int64_t stream) {
+  if (K <= 0 || N <= 0 || N % 32 || gsh < 1 || gsh > 3 || K % (16 << gsh))
+    throw std::runtime_error("r4d trellis_wscale_f32: N must be a multiple of 32, gsh 1, 2 or 3, and "
+                             "K a multiple of 16 << gsh");
+  if (KB != 4 && KB != 5) throw std::runtime_error("r4d trellis_wscale_f32: KB must be 4 or 5");
+  if (w == 0 || scale == 0) throw std::runtime_error("r4d trellis_wscale_f32: null buffer");
+  const long long waves = (long long)(N / 32) * (K / 16 >> gsh);
+  dim3 grid((unsigned)((waves + 7) / 8)), block(8 * WAVE32);
+  auto Wp = (const unsigned*)w;
+  auto Sp = (float*)scale;
+  hipStream_t st = (hipStream_t)stream;
+  if (KB == 4) hipLaunchKernelGGL(r4d_trellis_wscale_kernel<4>, grid, block, 0, st, Wp, Sp, K, N, gsh);
+  else hipLaunchKernelGGL(r4d_trellis_wscale_kernel<5>, grid, block, 0, st, Wp, Sp, K, N, gsh);
+}
+#else  // the shipped unit's entries
 
 void r4d_gemm_trellis_nt_m64(int64_t a0, int64_t a1, int n_split, int64_t w, int64_t svh,
                              int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
@@ -686,3 +823,4 @@ void r4d_trellis_reconstruct_f16(int64_t w, int64_t q, int K, int N, int KB, int
   else
     hipLaunchKernelGGL(r4d_trellis_reconstruct_f16_kernel<5>, grid, block, 0, st, Wp, Qp, K, N);
 }
+#endif  // R4D_TQ_WQ_UNIT

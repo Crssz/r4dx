@@ -1,5 +1,6 @@
 #include "container.h"
 #include "container_load_util.h"
+#include "linear.h"  // BuildTrellisWScale (R4DX_FAKEQ_W)
 #include "shard_loader.h"
 
 #include <algorithm>
@@ -689,6 +690,22 @@ void Container::ForEachLinear(Fn&& fn) {
     layer(mtp_->layer);
     fn(mtp_->draft_lm_head);
   }
+}
+
+void Container::BuildTrellisWScales(int mode, hipStream_t stream) {
+  if (mode == 0) return;
+  ForEachLinear([&](QuantLinear& q) { BuildTrellisWScale(q, mode, stream); });
+}
+
+int Container::BuildTrellisI8Scales(hipStream_t stream, int* trellis_total) {
+  int built = 0, total = 0;
+  ForEachLinear([&](QuantLinear& q) {
+    if (q.layout != Layout::kTrellis) return;
+    ++total;
+    if (BuildTrellisI8Scale(q, stream)) ++built;
+  });
+  if (trellis_total != nullptr) *trellis_total = total;
+  return built;
 }
 
 void Container::AssignTrellisTickets() {

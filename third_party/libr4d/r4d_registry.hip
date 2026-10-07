@@ -102,6 +102,12 @@ static const R4DConstraint cGemmNtTrellisM256[] = {
     C_DIV("M", 128), C_LE("M", 256), C_DIV("K", 128), C_DIV("N", 128),
     C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
 };
+// The int8 x int8 sibling (r4d_gemm_trellis_nt_i8): exactly 256 rows, its own op, so "gemm_nt_m256" callers are
+// never handed a quantized kernel.
+static const R4DConstraint cGemmNtTrellisI8[] = {
+    C_EQ("M", 256), C_DIV("K", 128), C_DIV("N", 128),
+    C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
+};
 static const R4DConstraint cTrellisReconstruct[] = {
     C_DIV("K", 16), C_DIV("N", 32), C_IN("dtype", "trellis_mul1_k4 trellis_mul1_k5"),
 };
@@ -233,6 +239,18 @@ static const R4DKernelInfo kKernels[] = {
      "C, fp32 accumulate and transform, one rounding, deterministic reduction, <= 190 VGPRs and no "
      "scratch in every instantiation (build-checked)",
      ROW(cGemmNtTrellisM256)},
+    {"gemm_trellis_nt_i8", "gemm", "gemm_nt_i8",
+     "the trellis linear of gemm_trellis_nt_m256 for exactly 256 rows with QUANTIZED operands: A as int8 per "
+     "(row, 128 k) (r4d_trellis_i8_quant_act), the decoded weight as int8 per (column, 128 k) on the fly from a "
+     "scale table (r4d_trellis_i8_wscale), v_wmma_i32_16x16x16_iu8, the int32 partial sum of every 128 k rescaled "
+     "into fp32, then the f16 kernel's FWHT / svh / out_scale / one bf16 rounding. NOT bit-identical to "
+     "gemm_trellis_nt_m256",
+     "M 256; K, N, n_split multiples of 128; (K/128) divisible by skw*skg, skw in {2,4,8}, skg in {1,2,4,8}; "
+     "ws always used (M*N*SKG fp32); up to two A parts split at a 128-column boundary",
+     "int8 A8 + fp32 SA, mul1 trellis W at KB bits per weight + fp32 weight-scale table, fp32 svh, bf16 C, int32 "
+     "per-128-k sums, fp32 rescale and transform, one rounding, deterministic reduction, <= 192 VGPRs and no "
+     "scratch in every instantiation (build-checked)",
+     ROW(cGemmNtTrellisI8)},
     {"trellis_reconstruct_f16", "quant", "trellis_reconstruct",
      "the whole decoded trellis weight Q[K,N] as f16, with the GEMM's own device decode",
      "K a multiple of 16, N of 32 (tile pairs); KB 4 or 5",

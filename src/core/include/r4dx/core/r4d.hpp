@@ -301,6 +301,91 @@ inline size_t GemmTrellisM256WsBytes(int M, int N, int SKG) {
   return r4d_gemm_trellis_nt_m256_ws_bytes(M, N, SKG);
 }
 
+// The int8 x int8 trellis prefill GEMM (r4d.h "int8 x int8 trellis prefill GEMM", R4DX_PREFILL_INT8,
+// docs/int8-prefill.md "Production path"). TrellisI8WscaleCount floats are the weight-scale table of one trellis
+// linear ([K / 128][N] fp32), built once from its words; TrellisI8QuantAct quantizes a transformed activation
+// ([256][K] f16 per part) to A8 (256 K bytes per part) + SA ((K / 128) * 256 floats per part), the parts laid
+// out one after the other; GemmTrellisNtI8 is the linear for exactly 256 rows (a1 / sa1 null: one part, then
+// n_split = N). Throws on an illegal combination, GemmTrellisNtI8Check names the first rule it breaks (nullptr
+// when legal).
+inline size_t TrellisI8WscaleCount(int K, int N) { return r4d_trellis_i8_wscale_count(K, N); }
+inline void TrellisI8WscaleBuild(const void* w, void* sw, int K, int N, int KB, hipStream_t stream) {
+  r4d_trellis_i8_wscale(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(sw), K, N, KB,
+                        reinterpret_cast<int64_t>(stream));
+}
+// Diagnostic (tests): the int8 matrix the GEMM quantizes on the fly -- block layout in w8 (N K bytes) and, if
+// wp is not null, plain [N][K].
+inline void TrellisI8DumpW(const void* w, const void* sw, void* w8, void* wp, int K, int N, int KB,
+                           hipStream_t stream) {
+  r4d_trellis_i8_dump_w(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(sw), reinterpret_cast<int64_t>(w8),
+                        reinterpret_cast<int64_t>(wp), K, N, KB, reinterpret_cast<int64_t>(stream));
+}
+inline void TrellisI8QuantAct(const void* x, void* a8, void* sa, int parts, int64_t part_stride, int K,
+                              hipStream_t stream) {
+  r4d_trellis_i8_quant_act(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(a8),
+                           reinterpret_cast<int64_t>(sa), parts, part_stride, K, reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtI8(const void* a8_0, const void* sa_0, const void* a8_1, const void* sa_1, int n_split,
+                            const void* w, const void* sw, const void* svh, void* c, void* ws, void* tickets,
+                            int M, int K, int N, int KB, int skw, int skg, float out_scale, hipStream_t stream) {
+  r4d_gemm_trellis_nt_i8(reinterpret_cast<int64_t>(a8_0), reinterpret_cast<int64_t>(sa_0),
+                         reinterpret_cast<int64_t>(a8_1), reinterpret_cast<int64_t>(sa_1), n_split,
+                         reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(sw), reinterpret_cast<int64_t>(svh),
+                         reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                         reinterpret_cast<int64_t>(tickets), M, K, N, KB, skw, skg, out_scale,
+                         reinterpret_cast<int64_t>(stream));
+}
+inline const char* GemmTrellisNtI8Check(int M, int K, int N, int n_split, int KB, int skw, int skg) {
+  return r4d_gemm_trellis_nt_i8_check(M, K, N, n_split, KB, skw, skg);
+}
+// SKG * M * N fp32.
+inline size_t GemmTrellisNtI8WsBytes(int M, int N, int SKG) { return r4d_gemm_trellis_nt_i8_ws_bytes(M, N, SKG); }
+
+// R4DX_FAKEQ_W (r4d.h "weight fake-quant", docs/int8-prefill.md): a MEASUREMENT hook. The scale table of one
+// trellis linear (TrellisWscaleCount floats, [K / 16 >> gsh][N]) and the three launches of the entries above
+// with every decoded weight fragment rounded to symmetric int8 and back by it. `wscale` is the table, `gsh`
+// log2 of the k-tiles per scale group (3 = 128 k, 1 = 32 k); NT is ignored (the rounding kernels always load
+// weights temporally).
+inline size_t TrellisWscaleCount(int K, int N, int gsh) { return r4d_trellis_wscale_count(K, N, gsh); }
+inline void TrellisWscaleBuild(const void* w, void* scale, int K, int N, int KB, int gsh,
+                               hipStream_t stream) {
+  r4d_trellis_wscale_f32(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(scale), K, N, KB, gsh,
+                         reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtM64Wq(const void* a0, const void* a1, int n_split, const void* w,
+                                const void* svh, void* c, void* ws, void* tickets, int M, int K,
+                                int N, int KB, int WV, int SK, int MT, int NP, int SKG, int U, int NT,
+                                float out_scale, const void* wscale, int gsh, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                             reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                             reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                             reinterpret_cast<int64_t>(tickets), M, K, N, KB, WV, SK, MT, NP, SKG, U,
+                             NT, out_scale, reinterpret_cast<int64_t>(wscale), gsh,
+                             reinterpret_cast<int64_t>(stream));
+}
+// _raw: fp32 C = A @ Q' (no output transform), Q' the rounded Q; one-hot A rows return rows of Q' bit for bit.
+inline void GemmTrellisNtM64RawWq(const void* a0, const void* a1, int n_split, const void* w, void* c,
+                                   void* ws, void* tickets, int M, int K, int N, int KB, int WV, int SK,
+                                   int MT, int NP, int SKG, int U, int NT, const void* wscale, int gsh,
+                                   hipStream_t stream) {
+  r4d_gemm_trellis_nt_m64_raw_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                                 reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(c),
+                                 reinterpret_cast<int64_t>(ws), reinterpret_cast<int64_t>(tickets), M, K,
+                                 N, KB, WV, SK, MT, NP, SKG, U, NT, reinterpret_cast<int64_t>(wscale),
+                                 gsh, reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtM256Wq(const void* a0, const void* a1, int n_split, const void* w,
+                                 const void* svh, void* c, void* ws, void* tickets, int M, int K, int N,
+                                 int KB, int SK, int NP, int SKG, int U, float out_scale, int skw,
+                                 const void* wscale, int gsh, hipStream_t stream) {
+  r4d_gemm_trellis_nt_m256_wq(reinterpret_cast<int64_t>(a0), reinterpret_cast<int64_t>(a1), n_split,
+                              reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(svh),
+                              reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                              reinterpret_cast<int64_t>(tickets), M, K, N, KB, SK, NP, SKG, U, out_scale,
+                              reinterpret_cast<int64_t>(stream), skw, reinterpret_cast<int64_t>(wscale),
+                              gsh);
+}
+
 inline void DflashConvT2G16Bf16(const void* x, const void* delta, const void* base, void* out,
                                  int T, int H, int dpitch, int NG, int taps, int group,
                                  int block_size, hipStream_t stream) {

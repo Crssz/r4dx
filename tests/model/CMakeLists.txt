@@ -40,7 +40,7 @@ set(R4DX_MODEL_TESTS
   # R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path") against the f16 path on the real trellis container loaded
   # three times (off, on, on): T < 256 byte-identical on and off, T >= 256 deterministic with the int8 chunk counts the
   # chunk grid predicts, the state digest differing from f16 (negative control), the last row's logits close, text-only
-  # PrefillMultimodal f16; the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
+  # PrefillMultimodal == Prefill; the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
   # R4DX_TP_TESTING library variant for Model::DebugStateDigest. Written, NOT run by its author.
   test_prefill_int8
   # The GDN sequence ops of a 256-row super-chunk run once (the default) against the old 64-row sub-slices

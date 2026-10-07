@@ -168,6 +168,7 @@ bool RunConfigSide(const Config& cfg, int chunk, Trace* tr, std::vector<int64_t>
                    bool* wide_out) {
   ModelOptions o = cfg.opts;
   o.prefill_chunk = chunk;
+  o.prefill_int8 = 0;  // the 64 == 256 identity is the f16 path's: R4DX_PREFILL_INT8 in the environment must not reach it
   Model m = Model::Load(o);
   *wide_out = m.PrefillChunkRows() == 256;
   if (cfg.mode == Mode::kCapture) m.AttachDflashFeatureCapture({0, 1, 2, 3});
@@ -271,6 +272,7 @@ bool RunConfig(const Config& cfg) {
 bool CheckDigestSensitivity(const Config& cfg) {
   ModelOptions o = cfg.opts;
   o.prefill_chunk = 64;
+  o.prefill_int8 = 0;
   Model m = Model::Load(o);
   Trace a, b;
   Config plain = cfg;
@@ -305,6 +307,7 @@ bool RunTpEmulate(const std::string& name, const ModelOptions& base, Mode mode,
   for (int s = 0; s < 2; ++s) {
     ModelOptions o = base;
     o.prefill_chunk = s == 0 ? 64 : 256;
+    o.prefill_int8 = 0;
     r4dx::model::TpOptions t;
     t.world = 2;
     t.mode = r4dx::model::TpOptions::Mode::kEmulate;
@@ -491,6 +494,7 @@ bool RunVision(const std::string& name, const ModelOptions& base, Mode mode, int
   for (int s = 0; s < 2; ++s) {
     ModelOptions o = base;
     o.prefill_chunk = s == 0 ? 64 : 256;
+    o.prefill_int8 = 0;
     Model m = Model::Load(o);
     if (!m.GetContainer().HasVisionConfig()) {
       std::fprintf(stderr, "[SKIP] %s: the container has no vision config\n", name.c_str());

@@ -5,6 +5,11 @@ its GPU runs are in the results below. The weight switch `R4DX_FAKEQ_W` (section
 built and its CPU tests pass; its kernels and their bit-test are built and NOT run (CPU-only session), and its
 GPU runs are PENDING (the commands and an empty results table are in that section).
 
+Update (2026-10-07, branch `int8prefill`): the two switches above are accuracy EXPERIMENTS (they round, then run the f16
+GEMM). The bench-only int8 GEMM prototype (docs/int8-gemm-proto.md) measured 1.46x (KB4) and 1.34x (KB5) on the
+linears, so it is now a real, opt-in prefill path, `R4DX_PREFILL_INT8=1` (default off): see "Production path"
+at the end of this file. Nothing int8 is on `main` or on by default.
+
 The question: a trellis linear's GEMM (docs/trellis-kernel.md, docs/trellis-m256.md) multiplies an f16
 activation tile, the input after the 128-block Hadamard rotation, by on-the-fly decoded weights on f16 WMMA.
 An int8 prefill GEMM would feed int8 activations instead. What do the int8 activations cost in accuracy? The
@@ -371,3 +376,237 @@ say the int8 grid of a trellis weight is the obstacle and not the activations.
   unchanged where the shard is whole 128-blocks).
 * The one-token prefill path differs numerically from the chunked path (other GEMM and GDN kernels), so its
   baseline is not the frozen 0.00788.
+
+## Production path (`R4DX_PREFILL_INT8`)
+
+Status (2026-10-07, branch `int8prefill` = `f16retune` (= `main`) + `int8q` + `int8gemm`, then this work): written and built
+(libr4d unit, `tool_teacher_forced_logprobs`, `r4dx-cli`, `r4dx-server`, the tests below); every CPU check passes; **nothing
+here has run on a GPU** (the session that wrote it was CPU-only by rule). The GPU validation sequence is the last
+subsection; its results table is EMPTY. Default OFF, and off is byte-identical to `f16retune` (checked below).
+
+What it is: the prototype of docs/int8-gemm-proto.md (measured 1.456x KB4, 1.335x KB5 against the f16 M = 256 plan on all
+seven linear classes, before the mlp.down retune; the unfused activation quantizer adds about 5%) turned into a real
+path. A full 256-row prefill super-chunk runs each of its trellis linears as: transformed f16 A -> int8 A8 + scales
+(`r4d_trellis_i8_quant_act`) -> `r4d_gemm_trellis_nt_i8` (decoded trellis weight quantized to int8 on the fly with a
+per-(column, 128 k) scale table, `v_wmma_i32_16x16x16_iu8`, a per-128 fp32 rescale of the int32 partial sums, then the
+f16 kernel's FWHT / svh / out_scale / one bf16 rounding). It is a quantized MODEL of the f16 linear, not its bits.
+
+### Which rows run it
+
+| | |
+|---|---|
+| runs int8 | the rows of a full 256-row super-chunk of a `Prefill` call, on a TP = 1 Model that runs 256-row chunks (`R4DX_PREFILL_CHUNK` unset / 256) and whose container is trellis, for every linear class with an int8 plan (all seven of the 27B, KB 4 and 5) |
+| stays f16 | tails (1..255 rows: 64-row slices), `R4DX_PREFILL_CHUNK=0/64`, a quant2 (rotated) container, MTP and DFlash 64-row slices, decode and verify windows, the vision tower, **`PrefillMultimodal`** (image accuracy is unmeasured; it never sets the per-call flag), TP = 2 (explicit fallback with a reason at load), the Gemma 4 model (switch ignored, said once) |
+
+`ApplyLinear` takes the int8 branch when `M == 256 && TrellisM256Active() && TrellisI8Active()` and the linear has a plan
+and a scale table; anything else falls through to the f16 paths. `ScopedTrellisI8` is opened beside `ScopedTrellisM256`
+in `RunChunk` (and `PrefillProfiled`), only when the Model has the path and the call is `Prefill`.
+
+What holds with the switch ON:
+
+* **off is identical to today**: unset / `0` / `off` changes no launch, no allocation, no byte (`tests/model/test_prefill_int8`,
+  and the ISA check below);
+* **no super-chunk, no change**: any `Prefill` call of fewer than 256 rows (and any non-wide, non-trellis, TP, rotated Model)
+  is byte-identical on and off, because no int8 launch happens;
+* **deterministic**: the same call gives the same bytes twice (the plan is fixed per (class, KB); the kernel's fp32 order is fixed);
+* **row-position independent**: a row's output depends on the row, the weights and `(skw, skg)`, never on its position in
+  the chunk or on the other rows (`test_trellis_i8_gemm` check G).
+
+What is lost with it ON:
+
+* the 64 == 256 bit identity, for super-chunk rows (the f16 kernel's identity with four 64-row launches does not hold for
+  a quantized model);
+* independence from the chunk grid. The grid is anchored at each `Prefill` call's start, so with prefix reuse or a
+  checkpoint restore the SAME token can be int8 in one run (it fell in a super-chunk) and f16 in another (it fell in a
+  tail). The KV bytes of a prompt then depend on the prefix-cache state. That is a property of the idea (the rows a
+  grid makes super-chunks), bounded by the accuracy gates below, and the reason it is opt-in.
+
+What replaces 64 == 256 as the contract: kernel exactness against an integer reference (`test_trellis_i8_gemm`), a KL budget
+against off (gates below), and a split-consistency gate (`--prefix-split-at`): KL(on one-shot || on split) must be at most
+KL(off || on).
+
+### The kernel (third_party/libr4d)
+
+* `r4d_gemm_trellis_nt_i8.hip` (in `R4D_UNITS`, a unit of its own: the ISA of a kernel moved by a few instructions when other
+  instantiations shared its unit, see "OFF path") instantiates only `i8g_kernel<TRELLIS = true, KB in {4, 5}, FWHT = true,
+  RESC = 0, SKW in {2, 4, 8}>`, 6 kernels. The device code is `r4d_trellis_i8.h` (the `I8G_EMU` hooks kept: the bench, the
+  host-emulation test and the unit compile the one source), the layouts `r4d_trellis_i8_layout.h`. The dense kernel, the
+  RESC 1..3 speed bounds and the reference kernel stay bench-only (`tests/kernels/int8_gemm_proto_kernels.h`).
+* Entries (`r4d.h`, wrapped in `r4d.hpp`, one row in the kernel registry): `r4d_trellis_i8_wscale(_count)`,
+  `r4d_trellis_i8_quant_act` (fixed at M = 256, one launch for both parts), `r4d_trellis_i8_dump_w` (a test diagnostic),
+  `r4d_gemm_trellis_nt_i8_check` / `_ws_bytes` / `r4d_gemm_trellis_nt_i8`.
+* **Two A parts**: the kernel takes `A8_0, SA_0, A8_1, SA_1, n_split` and picks per block with `n0 >= n_split`, the f16
+  kernel's rule (m256.hip). `SW` is indexed by the absolute column. `ws` (`SKG * 256 * N * 4` bytes, always used) and
+  `tickets` are the f16 protocol, and the tickets self-reset, so f16 and int8 launches of one linear can interleave on its
+  stream. The concurrency invariant (one stream per Container) is unchanged.
+* **Legality**: `M == 256`, `K`, `N`, `n_split` multiples of 128, `(K / 128) % (skw skg) == 0`, `skw` in {2, 4, 8}, `skg` in
+  {1, 2, 4, 8}, `KB` in {4, 5}, LDS `8192 skw <= 64 KiB`. K / 128 is 40 (K = 5120), 48 (6144), 136 (17408), 24 (3072),
+  68 (8704), so `skw skg` is 2, 4 or 8 (and 16 at K = 6144).
+* **The weight scale rule** (`i8g_wscale`): per (column, 128 k) of Q, `s = max|w| / 127` (1 for an all-zero group),
+  `rs = f16(min(1 / s, 60000))`, `q = rint(w * rs)` (computed as the low byte of `f16(fma(w, rs, 1536))`), and the table holds
+  `s_eff = 1 / rs`, so dequantization uses exactly the grid the quantizer rounded on. This is NOT the fp32 table of
+  `r4d_trellis_wscale_f32` (R4DX_FAKEQ_W's, which lives in the `_wq` unit production must not depend on): 0.58% of weights
+  differ from the fp32 rule by one LSB with the same error RMS, so the real-kernel KL gate (G4) is the arbiter, not the
+  fake-quant numbers above.
+* **Activation quantizer** (`i8g_quant_act`): one wave per (row, 128-block), `s = amax / 127` (1 for all zero),
+  `q = clamp(rint(x / s), -127, 127)` with IEEE division, written straight in the fragment layout. v1 launches it separately
+  per `ApplyLinear` call (10 us at K = 5120, 28.6 us at K = 17408; scratch `264 K` bytes per part from the arena, at most
+  a few MB; the 224 MiB reserve is unchanged). Fusing it into the transform producers is a follow-up.
+* **Tuning table** `src/model/gemm_tuning_table_trellis_i8.inc`, `{N, K, KB, skw, skg}` per class, SEEDED from the bench's best
+  picks (`E:\models\r4dx\int8gemm\all.log`, device 1, before the mlp.down retune); `tool_int8_gemm_proto --emit-rows` regenerates
+  it with the rule "best median, then the smallest skg within 1%". `PlanTrellisI8(N, K, kb, parts, part_n0)` mirrors
+  `PlanTrellisM256`: it honors `R4DX_M256_SHAPES`, validates the row against the kernel's own check (so a bad regenerated row
+  cannot throw mid-request), and a shape without a plan runs f16 with a once-per-shape stderr line.
+
+  | class (N x K) | KB4 (skw skg, us) | KB5 (skw skg, us) |
+  |---|---|---|
+  | mlp.gate_up 34816 x 5120 | 2 1, 607 | 2 2, 645 |
+  | mlp.down 5120 x 17408 | 4 1, 308 | 2 2, 327 |
+  | gdn.in_proj_qkv 10240 x 5120 | 2 2, 192 | 2 2, 206 |
+  | gdn.in_proj_z 6144 x 5120 | 4 1, 123 | 4 2, 130 |
+  | gdn.out_proj / attn.o 5120 x 6144 | 4 2, 120 | 2 4, 127 |
+  | attn.qg 12288 x 5120 | 4 1, 227 | 2 2, 243 |
+  | attn.k / attn.v 1024 x 5120 | 4 2, 29 | 4 1, 29 |
+
+* **TP = 2 in v1**: an explicit f16 fallback, logged once at load. The kernel itself is shape-generic (the rank shards K/2 and
+  N/2 are still whole 128-blocks, `n_split` 8704) and `test_trellis_i8_gemm` bit-tests every TP = 2 rank shape, so v2 needs
+  wiring and its own KL gate only.
+
+### Epilogue: a copy that cannot drift silently
+
+The int8 kernel's LDS reduction, ticket protocol, FWHT-128, svh, `out_scale` and bf16 rounding are a COPY of the shipped
+M = 256 kernel's. A shared helper would change the shipped kernel's ISA (the int8q work showed any refactor of those
+kernels does), so the shipped file is not touched. `tools/reference/diff_epilogue.ps1` compares the two sources as text on
+the parts that define the arithmetic (whole bodies of `bf16_rn`, `lane_stage` and `bfly`; the FWHT stage trace at NP = 1;
+the ticket block literally; the y-sum and the ws unit address; `svh` addressing; the output expression; the slice
+reduction's owner and sum rules) and fails when they differ; it runs in the build (`r4d_trellis_isa`), and `-SelfTest`
+edits one FWHT stage in memory and requires the comparison to fail.
+
+### Weight scale tables and VRAM
+
+`QuantLinear::trellis_i8_sw` (`[K / 128][N]` fp32, separate from `trellis_wscale`) is built once at `Model::Load`, only when
+the switch is on and the Model uses it, from each rank's own words (`Container::BuildTrellisI8Scales`, after the weights are
+resident) and only for linears with a plan. `K N / 32` bytes per linear: 760,217,600 bytes (0.708 GiB) for the 27B's 64
+layers (MLP 0.50, GDN in_proj 0.12, out / attn.o 0.06, qg 0.03, k / v 0.005 GiB), on 16.3 GiB of weights; the VRAM breakdown
+books it under `weights=` and the load line prints it. Follow-up: store f16 `rs` (about 0.4 GB).
+
+### Model plumbing
+
+* `src/model/prefill_int8.h` (header-only, HIP-free): `ParsePrefillInt8` (unset, empty, `0`, `off` = off; `1`, `on` = on;
+  anything else warns and means off), `ResolvePrefillInt8Request` and `DecidePrefillInt8` (refuses with a reason, in this
+  order, for a rotated container, a Model without 256-row chunks, TP > 1, no trellis linears, no linear with a plan).
+* `ModelOptions::prefill_int8`: -1 follows the environment, 0 and 1 force it (`test_prefill_chunk_identity` forces 0).
+  `R4DX_PREFILL_INT8` together with `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` throws at load (they would quantize twice).
+* One load line: `prefill int8: ON (...)` with the table count and GiB, or `off (... asked for it, not used: <reason>)`, or
+  `off (default; R4DX_PREFILL_INT8=1 enables ...)`.
+* `Model::PrefillInt8Enabled()` and `PrefillInt8ChunksRun()` (a counter beside `PrefillWideChunksRun()`; tests prove the int8
+  path, not a fallback, produced a result).
+* DFlash feature capture and MTP priming read int8-perturbed hidden states (allowed, gated by the speculation gate below).
+
+### OFF path: identical code, and how that was checked
+
+With the switch unset (or on a Model that cannot use it): no table, no scope, no extra launch or allocation; `ApplyLinear`
+tests one thread-local bool before the (unchanged) f16 block, whose input transform now comes from a helper (`TrellisA256`, a
+verbatim move). In libr4d nothing shipped moved: the int8 kernels are a unit of their own and `r4d.h` only gained
+declarations. Checked on this branch with `hipcc -S` listings (the unit's own flags, `tools/reference/compare_isa_listings.ps1`,
+against the listings of the `f16retune` worktree, 89587f0): `r4d_gemm_trellis_nt_m64` (100 kernels), `r4d_gemm_trellis_nt_m256`
+(22 kernels), `r4d_attn_paged_h256_gqa6` and `_gqa2`: function bodies and the whole normalised listing (including the
+code-object metadata: VGPR counts, scratch, kernarg sizes) are IDENTICAL in all four. The build's own gates hold: shipped m64 100
+kernels max 189 VGPRs, m256 22 kernels max 188, no scratch, 0 near dependencies; the Qwen attention hash unchanged; the `_wq` units
+(49 and 22 kernels) are reported only.
+
+The int8 unit's own gate (`check_trellis_isa.cmake -DGEMM_KERNEL=i8g_kernel -DMAX_VGPR=192`): 6 kernels, max 192 VGPRs, no
+scratch, no spill, 822 asm VALU in the GEMM kernels, 0 near dependencies. Against the bench translation unit, where the GPU
+numbers were measured, the 6 production bodies are IDENTICAL (`compare_isa_listings.ps1 -Pattern 'i8g_kernelILb1ELi[45]ELb1ELi0ELi[248]E'`);
+against the prototype's listing from before the two-part parameters, each kernel gained one VALU and a few scalar selects (10 387 ->
+10 406 instructions at KB 4 / skw 2, 10 565 -> 10 565 at KB 5 / skw 4).
+
+### What was run (CPU only) and what was not
+
+Run and passing: `test_int8_gemm_proto_cpu` (layouts, quantizers, software-WMMA chain), `test_int8_gemm_proto_emu` (the production
+kernel SOURCE compiled as plain C++, run against exact references: every instantiation of the bench, plus the new two-part
+cases: quantizer part 1, `n_split` against each part's reference and against two single-part launches, byte for byte; 12 checks,
+88 s), `test_prefill_int8_cpu` (the parser, the decision table, `PlanTrellisI8` for the seven classes at both rates and its
+refusals, the table's legality under the kernel's own check, the scope), `test_prefill_chunk` (unchanged), the build gates
+(`r4d_trellis_isa`: ISA, VGPR, near-dependency, `diff_epilogue`). Built, NOT run: `test_trellis_i8_gemm` (GPU kernel bit-test),
+`test_prefill_int8` (model test), `tool_int8_gemm_proto` (with `--emit-rows`), `tool_teacher_forced_logprobs`, `r4dx-cli`,
+`r4dx-server`.
+
+### Predicted effect (from the bench, to be re-measured)
+
+The f16 side has improved since the bench ran (the mlp.down KB4 retune took that GEMM from 547 us to about 395 us at M = 256), so
+the ratios against today's baseline are lower: about 1.30x on the linears (1.25x with the unfused quantizer). Estimated cold TTFT:
+8k about -0.8 to -0.9 s (-18%) from 4.683 s, 32k about -3.3 to -3.6 s (-15%) from 22.954 s; a fused quantizer would add another
+~0.15 s at 8k. G1 below gives the true baseline.
+
+### Validation sequence (the main session runs these, device 1, one job at a time; outputs under `E:\models\r4dx\int8prefill\`)
+
+CPU build of everything (`cd C:\Users\pay20\dev\r4dx-int8p; $env:CMAKE_BUILD_PARALLEL_LEVEL='20'`):
+`cmake --build build\win-hip --target tool_teacher_forced_logprobs test_trellis_i8_gemm test_prefill_int8 test_prefill_int8_cpu test_prefill_chunk_identity test_prefill_chunk r4dx-cli r4dx-server tool_int8_gemm_proto -j 20`
+(`tool_int8_gemm_proto` is built by `tests\kernels\build_int8_gemm_proto.ps1`, not CMake).
+
+```
+# G1. bench re-baseline against the retuned f16 table (needs an idle machine; ~20 min)
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8p\tests\kernels\build_int8_gemm_proto.ps1 -Out E:\models\r4dx\int8prefill\obj
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & E:\models\r4dx\int8prefill\obj\tool_int8_gemm_proto.exe --mode all --out E:\models\r4dx\int8prefill\all.json --emit-rows E:\models\r4dx\int8prefill\rows.inc 2>&1 | Tee-Object -FilePath E:\models\r4dx\int8prefill\all.log; exit `$LASTEXITCODE"
+# G2. the production kernel bit-test (idle machine not required, a few minutes)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\kernels\test_trellis_i8_gemm.exe; exit `$LASTEXITCODE"
+# G2b. the model test (three loads of the 27B, ~10 min)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\test_prefill_int8.exe; exit `$LASTEXITCODE"
+# G3. switch-off identity: the chunk identity test and the Rung-4 gate with R4DX_PREFILL_INT8 UNSET
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\test_prefill_chunk_identity.exe; exit `$LASTEXITCODE"
+powershell -NoProfile -Command "& C:\Users\pay20\dev\r4dx-int8p\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8prefill\kl-off -CompareDir E:\models\r4dx\rocm1010\kl; exit `$LASTEXITCODE"
+```
+
+G4, prefill-path KL with the real kernel (the Rung-4 uniform pass is the DECODE path: a prefill switch changes nothing there
+except token 0, see "An important property of the Rung-4 harness"):
+
+```
+# G4a. tails stay f16: one-token prefill is M = 1 (the f16 band), so on must equal the unquantized one-token baseline byte for byte
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8='1'; & C:\Users\pay20\dev\r4dx-int8p\tools\quant2\kl_rung4.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8prefill\kl-tail-on -NoGate -CompareDir E:\models\r4dx\int8q\kl-off-pfx -ToolArgs '--tail-rows','1023','--tail-path','prefill'; exit `$LASTEXITCODE"
+# G4b. the chunked canon prefill (768-token prefix = three super-chunks, 256 decode rows scored); re-record off (the retune moved the prefill bits)
+powershell -NoProfile -Command "& C:\Users\pay20\dev\r4dx-int8p\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8p\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8prefill\kl-chunk-off; exit `$LASTEXITCODE"
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8='1'; & C:\Users\pay20\dev\r4dx-int8p\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8p\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8prefill\kl-chunk-on; exit `$LASTEXITCODE"
+C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20\dev\r4dx-int8p\tools\prefill\kl_compare.py --ref E:\models\r4dx\int8prefill\kl-chunk-off --test E:\models\r4dx\int8prefill\kl-chunk-on --tokens C:\Users\pay20\dev\r4dx-int8p\tools\reference\kl_corpus\tokens_canon.json
+# G4c. long prefixes: E:\models\r4dx\prefill-m0\kl\tokens_long.json does not exist on disk; make it first (CPU), then run_kl on and off as above with -Tokens it, and kl_compare
+python C:\Users\pay20\dev\r4dx-int8p\tools\prefill\make_kl_tokens.py --lengths 8k,32k
+# G4d. split consistency: the same tokens with the prefix split at 300, switch on, against the one-shot run with the switch on
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8='1'; & C:\Users\pay20\dev\r4dx-int8p\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8p\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8p\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8prefill\kl-chunk-on-split -ExtraArgs '--prefix-split-at','300'; exit `$LASTEXITCODE"
+C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20\dev\r4dx-int8p\tools\prefill\kl_compare.py --ref E:\models\r4dx\int8prefill\kl-chunk-on --test E:\models\r4dx\int8prefill\kl-chunk-on-split --tokens C:\Users\pay20\dev\r4dx-int8p\tools\reference\kl_corpus\tokens_canon.json
+```
+
+G5, greedy text and TTFT: `tools\prefill\gdn256_check.ps1` takes `-Int8` (the switch in `$knobs`, set to 1 for the new, conv1 and
+old configurations only; expect those three to share one hash and c64 to differ), and
+`$env:R4DX_PREFILL_INT8='1'; .\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k -Runs 3 -OutDir E:\models\r4dx\int8prefill\ttft`
+twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
+
+### Gates for making it the default
+
+| gate | required |
+|---|---|
+| speed | cold TTFT at least 10% faster at both 8k and 32k against 4.683 s and 22.954 s, with at least 1.25x on the linears in G1 |
+| accuracy, chunked canon | KL(off \|\| on) mean at most 0.0020, p99 at most 0.012, top-1 agreement at least 98.3%; mean KL against bf16 rises by at most 0.001 over off (the fake-quant references: 0.0009 chunked, +0.0006 on the prefill path) |
+| accuracy, 8k and 32k | per-kind KL(off \|\| on) mean at most 0.003, no single row with KL above 2 |
+| split consistency | KL(on one-shot \|\| on split) at most KL(off \|\| on) |
+| tasks | `run_tasks` at 8k and 32k within one item of off per task |
+| determinism | the greedy hash is identical across two on-runs |
+| speculation | DFlash and MTP mean accepted length within -1% on the OpenCode transcripts |
+| robustness | a 128k prefill completes, VRAM headroom logged, no NaN |
+| plumbing | the ISA and epilogue-diff gates in the build; switch-off byte identity passes every build |
+| not required for the flip, but needed first | TP = 2 (auto-falls back until validated) and the fused quantizer |
+
+### Results
+
+PENDING (no GPU run has happened). Fill from G1 to G5.
+
+| step | result |
+|---|---|
+| G1 bench vs retuned f16 | |
+| G2 `test_trellis_i8_gemm` | |
+| G2b `test_prefill_int8` | |
+| G3 off identity | |
+| G4a tails f16 | |
+| G4b chunked canon KL(off \|\| on) | |
+| G4c 8k / 32k KL | |
+| G4d split consistency | |
+| G5 greedy hash, TTFT 8k / 32k | |

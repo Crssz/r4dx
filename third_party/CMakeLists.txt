@@ -215,8 +215,32 @@ add_custom_command(
   COMMENT "check_trellis_isa: r4d_gemm_trellis_nt_i8 VGPR/scratch"
   VERBATIM
 )
+# The int8 kernel's epilogue is a COPY of the f16 M = 256 kernel's (a shared helper would move the shipped
+# kernels' ISA): tools/reference/diff_epilogue.ps1 compares the two sources on the parts that define the arithmetic
+# (the FWHT stage trace, the ticket protocol, svh / out_scale / the one bf16 rounding, the y-sum, the slice
+# reduction) and fails the build when they diverge. Windows PowerShell, the project's only host; where it is not
+# found the check is left out, with a notice.
+find_program(R4D_POWERSHELL powershell)
+set(R4D_I8_EPILOGUE_STAMP "${R4D_OBJ_DIR}/r4d_i8_epilogue_diff.ok")
+set(R4D_I8_EPILOGUE_STAMPS "")
+if(R4D_POWERSHELL)
+  get_filename_component(R4DX_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+  add_custom_command(
+    OUTPUT "${R4D_I8_EPILOGUE_STAMP}"
+    COMMAND "${R4D_POWERSHELL}" -NoProfile -ExecutionPolicy Bypass -File "${R4DX_ROOT_DIR}/tools/reference/diff_epilogue.ps1"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${R4D_I8_EPILOGUE_STAMP}"
+    DEPENDS "${LIBR4D_DIR}/r4d_gemm_trellis_nt_m256.hip" "${LIBR4D_DIR}/r4d_trellis_i8.h"
+            "${R4DX_ROOT_DIR}/tools/reference/diff_epilogue.ps1"
+    COMMENT "diff_epilogue: the int8 GEMM epilogue equals the f16 M = 256 kernel epilogue"
+    VERBATIM
+  )
+  set(R4D_I8_EPILOGUE_STAMPS "${R4D_I8_EPILOGUE_STAMP}")
+else()
+  message(STATUS "r4d: powershell not found; tools/reference/diff_epilogue.ps1 (the int8 epilogue copy check) is not part of this build")
+endif()
 add_custom_target(r4d_trellis_isa ALL DEPENDS "${R4D_TRELLIS_ISA_STAMP}" "${R4D_TRELLIS256_ISA_STAMP}"
-                                              "${R4D_TRELLISI8_ISA_STAMP}" ${R4D_TRELLIS_WQ_ISA_STAMPS})
+                                              "${R4D_TRELLISI8_ISA_STAMP}" ${R4D_I8_EPILOGUE_STAMPS}
+                                              ${R4D_TRELLIS_WQ_ISA_STAMPS})
 
 # Qwen-unchanged guard for the sliding-window attention extension (docs/gemma4-plan.md 3.3, M1-32): the
 # Qwen attention unit (r4d_attn_paged_h256_gqa6, which instantiates the prefill / decode templates the

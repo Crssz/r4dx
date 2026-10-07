@@ -5,6 +5,13 @@ ISA is inspected. **No GPU run has happened yet** (the session that wrote it was
 table below is EMPTY and the section "Predictions" is a cycle-budget model, not a measurement. The commands that
 fill it are in "How to run".
 
+Update (2026-10-07, branch `int8prefill`): the GPU run happened (device 1, `E:\models\r4dx\int8gemm\all.log`: the iu8 WMMA runs at 2.10x the f16
+rate; trellis int8 vs the shipped f16 M = 256 plan on all seven classes 1.456x at KB4 and 1.335x at KB5, mlp pair 1.491x (GO) and
+1.314x (inconclusive by the rule below), the unfused A quantizer about 5%), and the kernel became production code: the device source
+moved to `third_party/libr4d/r4d_trellis_i8.h` (the bench and the emulation test include it), with an opt-in model path,
+`R4DX_PREFILL_INT8` (docs/int8-prefill.md "Production path"). The table of files below is the bench layer that remains under
+`tests/kernels/`; `int8_gemm_proto_kernels.h` no longer holds the kernels.
+
 The question (docs/int8-prefill.md ends on it): accuracy is not the obstacle to an int8 prefill GEMM (full w8a8,
 one scale per 128 K on both sides, costs +0.0006 mean KL), so can an int8 x int8 GEMM at M = 256 beat the shipped
 f16 trellis kernel (docs/trellis-m256.md) by enough to be worth building? The earlier fp8 W8A8 dense prototype

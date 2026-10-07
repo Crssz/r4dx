@@ -1,0 +1,242 @@
+// test_prefill_int8_cpu: host-only checks of R4DX_PREFILL_INT8's decision and planning code (docs/int8-prefill.md
+// "Production path"); no HIP call, no device, no container.
+//   * src/model/prefill_int8.h: the parser (unset / empty / 0 / off = off, 1 / on = on, anything else = off with a
+//     warning), the ModelOptions::prefill_int8 resolution, and the decision table of DecidePrefillInt8 -- off is not a
+//     fallback (no reason), and every refusal names its reason in the order of the checks;
+//   * src/model/linear.cpp: PlanTrellisI8 for the seven linear classes of the 27B at both rates (the part boundary of
+//     mlp.gate_up included), its refusals (KB, parts, whole 128-blocks, the part boundary, a shape without a table
+//     row, R4DX_M256_SHAPES), and the tuning table itself: no duplicate key, every row legal under the kernel's own
+//     check (r4d_gemm_trellis_nt_i8_check) at its shape, every class of the model has a row at KB 4 and KB 5;
+//   * ScopedTrellisI8: off by default, nests, restores.
+// Links r4dx_model_linear (src/model/linear.cpp) and runs with HIP_VISIBLE_DEVICES=-1 (linking the library loads the
+// HIP runtime, which must see no device here); the libr4d check is host code.
+#include <cstdio>
+#include <cstdlib>
+#include <set>
+#include <string>
+#include <tuple>
+#include <utility>
+
+#include "linear.h"
+#include "prefill_int8.h"
+#include "r4d.h"
+
+namespace {
+
+int g_fail = 0;
+int g_checks = 0;
+#define CHECK(cond, ...)                                                    \
+  do {                                                                      \
+    ++g_checks;                                                             \
+    if (!(cond)) {                                                          \
+      std::printf("FAIL %s:%d: ", __FILE__, __LINE__);                      \
+      std::printf(__VA_ARGS__);                                             \
+      std::printf("\n");                                                    \
+      ++g_fail;                                                             \
+    }                                                                       \
+  } while (0)
+
+using namespace r4dx::model;
+
+struct Cls {
+  const char* name;
+  int64_t N, K;
+  int parts;
+  int64_t part_n0;
+};
+const Cls kClasses[] = {
+    {"mlp.gate_up", 34816, 5120, 2, 17408}, {"mlp.down", 5120, 17408, 1, 0},
+    {"gdn.in_proj_qkv", 10240, 5120, 1, 0}, {"gdn.in_proj_z", 6144, 5120, 1, 0},
+    {"gdn.out_proj/attn.o", 5120, 6144, 1, 0}, {"attn.qg", 12288, 5120, 1, 0},
+    {"attn.k/attn.v", 1024, 5120, 1, 0},
+};
+
+void TestParser() {
+  CHECK(ParsePrefillInt8(nullptr) == kPrefillInt8Off, "unset is off");
+  CHECK(ParsePrefillInt8("") == kPrefillInt8Off, "empty is off");
+  CHECK(ParsePrefillInt8("0") == kPrefillInt8Off, "0 is off");
+  CHECK(ParsePrefillInt8("off") == kPrefillInt8Off, "off is off");
+  CHECK(ParsePrefillInt8("1") == kPrefillInt8On, "1 is on");
+  CHECK(ParsePrefillInt8("on") == kPrefillInt8On, "on is on");
+  std::fflush(stderr);
+  CHECK(ParsePrefillInt8("yes") == kPrefillInt8Off, "an unrecognized value is off (with a warning on stderr)");
+  CHECK(ParsePrefillInt8("2") == kPrefillInt8Off, "2 is not recognized: off");
+  CHECK(ParsePrefillInt8("ON") == kPrefillInt8Off, "the spellings are case sensitive: ON is off");
+  CHECK(ValidPrefillInt8Option(-1) && ValidPrefillInt8Option(0) && ValidPrefillInt8Option(1), "options -1, 0, 1 are valid");
+  CHECK(!ValidPrefillInt8Option(2) && !ValidPrefillInt8Option(-2), "options 2 and -2 are not");
+  CHECK(ResolvePrefillInt8Request(0) == kPrefillInt8Off, "option 0 forces off whatever the environment says");
+  CHECK(ResolvePrefillInt8Request(1) == kPrefillInt8On, "option 1 forces on whatever the environment says");
+  // option -1 follows the process environment (PrefillInt8Request caches it; the test environment does not set it)
+  CHECK(ResolvePrefillInt8Request(-1) == PrefillInt8Request(), "option -1 follows R4DX_PREFILL_INT8");
+}
+
+PrefillInt8Inputs Good() {
+  PrefillInt8Inputs in;
+  in.requested = kPrefillInt8On;
+  in.wide = true;
+  in.tp_world = 1;
+  in.has_trellis = true;
+  in.rotated_container = false;
+  return in;
+}
+
+void TestDecision() {
+  const char* why = "unset";
+  CHECK(DecidePrefillInt8(Good(), &why) && why == nullptr, "a wide TP = 1 trellis Model with the switch on uses it, no reason");
+  CHECK(DecidePrefillInt8(Good()), "(why is optional)");
+  {
+    PrefillInt8Inputs in = Good();
+    in.requested = kPrefillInt8Off;
+    why = "unset";
+    CHECK(!DecidePrefillInt8(in, &why) && why == nullptr, "off is a choice, not a fallback: no reason");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.wide = false;
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("super-chunks") != std::string::npos,
+          "a 64-row Model is refused with its reason");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.tp_world = 2;
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("tensor parallel") != std::string::npos,
+          "TP = 2 is refused (v1 keeps the f16 kernel)");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.has_trellis = false;
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("trellis") != std::string::npos,
+          "a container without trellis linears is refused");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.rotated_container = true;
+    in.wide = false;   // (a rotated container is never wide; the rotation is the more specific reason)
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("quant2") != std::string::npos,
+          "a rotated container names quant2, not the chunk size");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.tables_built = 0;
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("int8 plan") != std::string::npos,
+          "no linear with a table: refused after the load-time pass");
+    in.tables_built = 12;
+    CHECK(DecidePrefillInt8(in), "some tables built: used");
+    in.tables_built = -1;
+    CHECK(DecidePrefillInt8(in), "tables not built yet (the first decision): not a reason");
+  }
+  {
+    // the order of the checks: rotated before wide before TP before trellis
+    PrefillInt8Inputs in = Good();
+    in.wide = false;
+    in.tp_world = 2;
+    in.has_trellis = false;
+    why = nullptr;
+    (void)DecidePrefillInt8(in, &why);
+    CHECK(why != nullptr && std::string(why).find("super-chunks") != std::string::npos, "wide is checked before TP");
+    in.wide = true;
+    why = nullptr;
+    (void)DecidePrefillInt8(in, &why);
+    CHECK(why != nullptr && std::string(why).find("tensor parallel") != std::string::npos, "TP is checked before trellis");
+  }
+}
+
+void TestPlans() {
+  for (int kb : {4, 5}) {
+    for (const Cls& c : kClasses) {
+      const TrellisI8Plan p = PlanTrellisI8(c.N, c.K, kb, c.parts, c.part_n0);
+      if (c.N == 10240 && c.K == 5120) {
+        // excluded by the R4DX_M256_SHAPES filter main() sets (every other class passes it)
+        CHECK(!p.ok && p.why.rfind("shape excluded", 0) == 0, "%s KB%d: the R4DX_M256_SHAPES filter must exclude it: %s", c.name, kb,
+              p.why.c_str());
+        continue;
+      }
+      CHECK(p.ok, "%s KB%d: no int8 plan: %s", c.name, kb, p.why.c_str());
+      if (!p.ok) continue;
+      const int64_t n_split = c.parts > 1 ? c.part_n0 : c.N;
+      CHECK(r4d_gemm_trellis_nt_i8_check(256, static_cast<int>(c.K), static_cast<int>(c.N), static_cast<int>(n_split), kb, p.skw,
+                                         p.skg) == nullptr,
+            "%s KB%d: the plan's (skw %d, skg %d) is not legal for the kernel", c.name, kb, p.skw, p.skg);
+      std::printf("  %-22s KB%d plan skw %d skg %d\n", c.name, kb, p.skw, p.skg);
+    }
+  }
+  // refusals, each with its reason
+  const auto why_of = [](int64_t N, int64_t K, int kb, int parts, int64_t n0) { return PlanTrellisI8(N, K, kb, parts, n0).why; };
+  CHECK(why_of(5120, 17408, 6, 1, 0).find("KB") != std::string::npos, "KB 6 is refused");
+  CHECK(why_of(5120, 17408, 4, 3, 0).find("parts") != std::string::npos, "3 parts are refused");
+  CHECK(why_of(5120 + 64, 17408, 4, 1, 0).find("128") != std::string::npos, "N not a multiple of 128 is refused");
+  CHECK(why_of(5120, 17408 + 64, 4, 1, 0).find("128") != std::string::npos, "K not a multiple of 128 is refused");
+  CHECK(why_of(0, 5120, 4, 1, 0).find("range") != std::string::npos, "an empty shape is refused");
+  CHECK(why_of(34816, 5120, 4, 2, 17408 + 64).find("boundary") != std::string::npos, "a part boundary inside a 128-block is refused");
+  CHECK(why_of(34816, 5120, 4, 2, 0).find("boundary") != std::string::npos, "a part boundary of 0 is refused");
+  CHECK(why_of(34816, 5120, 4, 2, 34816).find("boundary") != std::string::npos, "a part boundary of N is refused");
+  CHECK(why_of(4096, 3840, 4, 1, 0).find("no int8 tuning row") != std::string::npos, "a shape without a table row (Gemma q_sliding) is refused");
+  CHECK(why_of(1024, 5120, 5, 1, 0).empty(), "attn.k KB5 has a plan (empty reason)");
+  CHECK(PlanTrellisI8(1024, 5120, 5, 1, 0).ok, "attn.k KB5 is ok");
+  // a one-part linear ignores part_n0
+  CHECK(PlanTrellisI8(5120, 17408, 4, 1, 12345).ok, "a one-part linear ignores part_n0");
+}
+
+void TestTable() {
+  size_t n = 0;
+  const TrellisI8Row* rows = TrellisI8Rows(&n);
+  CHECK(rows != nullptr && n == 14, "the table has 14 rows (7 classes x 2 rates), got %zu", n);
+  std::set<std::tuple<int64_t, int64_t, int>> keys;
+  for (size_t i = 0; i < n; ++i) {
+    const TrellisI8Row& r = rows[i];
+    CHECK(keys.emplace(r.N, r.K, r.rate).second, "duplicate row for (N %lld, K %lld, KB %d)", static_cast<long long>(r.N),
+          static_cast<long long>(r.K), r.rate);
+    CHECK(r.rate == 4 || r.rate == 5, "row %zu: rate %d", i, r.rate);
+    CHECK(r.skw == 2 || r.skw == 4 || r.skw == 8, "row %zu: skw %d", i, r.skw);
+    CHECK(r.skg == 1 || r.skg == 2 || r.skg == 4 || r.skg == 8, "row %zu: skg %d", i, r.skg);
+    // legal at the shape under the kernel's own rules, as a one-part launch and (every class has an 8-wide boundary) a split one
+    CHECK(r4d_gemm_trellis_nt_i8_check(256, static_cast<int>(r.K), static_cast<int>(r.N), static_cast<int>(r.N), r.rate, r.skw, r.skg) == nullptr,
+          "row %zu (N %lld, K %lld, KB %d): (skw %d, skg %d) is not legal", i, static_cast<long long>(r.N), static_cast<long long>(r.K),
+          r.rate, r.skw, r.skg);
+    // the LDS rule: 8 KiB per slice
+    CHECK(8192 * r.skw <= 64 * 1024, "row %zu: LDS", i);
+  }
+  for (const Cls& c : kClasses)
+    for (int kb : {4, 5}) CHECK(keys.count({c.N, c.K, kb}) == 1, "%s KB%d has no table row", c.name, kb);
+}
+
+void TestScope() {
+  CHECK(!TrellisI8Active(), "off by default");
+  {
+    ScopedTrellisI8 a(true);
+    CHECK(TrellisI8Active(), "on inside a scope");
+    {
+      ScopedTrellisI8 b(false);
+      CHECK(!TrellisI8Active(), "an inner off scope turns it off");
+    }
+    CHECK(TrellisI8Active(), "and restores it on exit");
+  }
+  CHECK(!TrellisI8Active(), "off again after the scope");
+}
+
+}  // namespace
+
+int main() {
+  // The R4DX_M256_SHAPES filter is read once, at the first plan call: set it before any (it excludes the 10240 x 5120 class only (4096 x 3840, a Gemma shape with no table row, is let through to reach the row lookup), which TestPlans expects to be refused for that reason).
+#ifdef _WIN32
+  _putenv_s("R4DX_M256_SHAPES", "34816x5120,5120x17408,6144x5120,5120x6144,12288x5120,1024x5120,4096x3840");
+#else
+  setenv("R4DX_M256_SHAPES", "34816x5120,5120x17408,6144x5120,5120x6144,12288x5120,1024x5120,4096x3840", 1);
+#endif
+  TestParser();
+  TestDecision();
+  TestPlans();
+  TestTable();
+  TestScope();
+  if (g_fail != 0) {
+    std::printf("test_prefill_int8_cpu: %d of %d checks FAILED\n", g_fail, g_checks);
+    return 1;
+  }
+  std::printf("test_prefill_int8_cpu: PASS (%d checks)\n", g_checks);
+  return 0;
+}

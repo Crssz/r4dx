@@ -60,6 +60,13 @@ set(R4DX_KERNEL_TESTS
   # both rates (plus run-to-run, ticket reset, a negative control and the refusal messages). Skips (77)
   # only without a HIP device; needs no golden data.
   test_trellis_m256
+  # The int8 x int8 prefill GEMM (R4DX_PREFILL_INT8, docs/int8-prefill.md "Production path"): libr4d's
+  # r4d_gemm_trellis_nt_i8 on every linear class of the model (TP = 1 and the TP = 2 rank shapes) at both rates -- the
+  # producers (weight scale table, int8 weights, activation quantizer) bit for bit against the CPU rules, every legal
+  # (skw, skg) against the exact integer reference, a byte-exact one-hot check of the whole chain, two parts vs two
+  # single-part launches, repeats and tickets, an f16 / int8 / f16 interleave on one linear, row independence, the
+  # refusals. Skips (77) only without a HIP device; needs no golden data. Written, NOT run by its author.
+  test_trellis_i8_gemm
   # R4DX_FAKEQ_ACT's kernel (docs/int8-prefill.md): r4dx_fake_quant_act_f16 bit for bit against
   # src/model/fake_quant_act.h's fp32 reference, every mode, one and two parts, K up to 17408. Skips (77)
   # only without a HIP device; needs no golden data.
@@ -108,7 +115,7 @@ set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
 # has passed, and 1 if that part failed -- so a skip never hides a real regression.
 set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
                      test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 test_fake_quant_act test_fake_quant_w PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 test_trellis_i8_gemm test_fake_quant_act test_fake_quant_w PROPERTIES SKIP_RETURN_CODE 77)
 
 # `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
 # to be able to CATCH anything at all.
@@ -135,7 +142,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
-                            test_trellis_m256.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
+                            test_trellis_m256.cpp test_trellis_i8_gemm.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
                             test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
@@ -147,6 +154,9 @@ target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 # test_trellis_m256 asks src/model/linear.cpp for the shipped M = 64 row (PickTuning) and the plan
 # ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
 target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
+# test_trellis_i8_gemm: PlanTrellisI8 (the plan ApplyLinear runs the int8 GEMM with) and PlanTrellisM256 (its f16 neighbour in
+# the interleave check) come from src/model/linear.cpp; the CPU references are int8_gemm_proto_ref.h and trellis_ref.hpp.
+target_link_libraries(test_trellis_i8_gemm PRIVATE r4dx_model_linear)
 # test_fake_quant_act uses src/model/fake_quant_act.h (header-only) as its reference.
 target_include_directories(test_fake_quant_act PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
 # test_fake_quant_w: the CPU reference (src/model/fake_quant_w.h) and, like test_trellis_m256, the shipped M = 64

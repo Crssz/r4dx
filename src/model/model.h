@@ -535,7 +535,11 @@ class Model {
   // seed (gdn_state.h's file comment), which is what keeps GDN state in step with the real
   // committed sequence. Deliberately does NOT touch mtp_seed_hidden_: a DFlash2 driver has no MTP
   // head, and a Model that has BOTH would be re-seeding MTP from a window this call knows nothing
-  // about. Must be called at most once per VerifyWindow() call.
+  // about. Must be called at most once per VerifyWindow() call. With the write-once GDN state
+  // (ModelOptions::gdn_write_once) `num_committed` may not exceed the rows of that VerifyWindow() call
+  // (the log has no such row) and throws std::runtime_error before changing anything; the commit is what
+  // marks the first `num_committed` logged rows pending, so an uncommitted VerifyWindow() leaves the
+  // committed state untouched (a second bare VerifyWindow() reproduces the first's rows).
   void CommitVerifiedWindow(int64_t num_committed);
 
   // Runs the real model over `candidates` (1..DraftWindow() tokens, is_prefill_path=false, the

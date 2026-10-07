@@ -95,9 +95,10 @@ A write-once Model prints one line at load; a window-1 Model ignores the request
 
 * A T == 1 verify mutates B in place (it is the plain-decode kernel), so two bare T == 1 `VerifyWindow` calls
   with no commit between advance B twice. Production always commits. For T > 1 the second bare call seeds from the
-  committed state: the latent legacy bug (a second bare verify after a round that committed n > 1 re-reads a
-  window slot the first call overwrote) is fixed, pinned in `test_gdn_write_once_cpu` (both behaviours) and
-  `test_gdn_write_once_model` (the write-once rows are equal).
+  committed state: the latent window-slot bug (a second bare verify after a round that committed n > 1 re-reads a
+  window slot the first call overwrote) does not exist in the write-once path, pinned in
+  `test_gdn_write_once_cpu` (both behaviours) and `test_gdn_write_once_model` (the write-once rows are equal).
+  The window-slot path keeps the bug on purpose: it is the A/B reference and a fix would need a spare slot.
 * `DecodeStepProfiled` consumes a pending prefix like a plain step; `PrefillProfiled` never collapsed (as before).
 * The plain `gdn.rec.*` digests of the two modes differ by construction (different allocation); compare
   `gdn.live.*`.

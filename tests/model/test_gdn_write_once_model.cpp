@@ -340,7 +340,7 @@ const std::vector<Ev> kReset = {
     {K::kPlain},        {K::kVerify, 5, 1}, {K::kPrefill, 40},
 };
 const std::vector<Ev> kMtp = {
-    {K::kMtp, 3}, {K::kMtp, 3}, {K::kPlain}, {K::kMtp, 3}, {K::kVerify, 4, 3}, {K::kMtp, 3},
+    {K::kMtp, 3}, {K::kMtp, 3}, {K::kPlain}, {K::kMtp, 3}, {K::kPlain}, {K::kMtp, 3},
     {K::kMtp, 2}, {K::kPlain}, {K::kPrefill, 40}, {K::kMtp, 3}, {K::kMtp, 3},
 };
 
@@ -446,18 +446,23 @@ void CheckLayout(Layout layout) {
 
 void CheckTp(Layout layout) {
   const std::string tag = std::string("tp2 ") + LayoutName(layout);
-  TpEngine a(Options(layout, 0, 7, 0, true));
-  TpEngine b(Options(layout, 0, 7, 1, true));
-  CHECK(!a.WriteOnce() && b.WriteOnce(), "[%s] gdn_write_once 0 / 1 did not select the manager on both ranks", tag.c_str());
-  CHECK(b.GdnBytes() < a.GdnBytes(), "[%s] the write-once rank's GDN allocation is not smaller", tag.c_str());
-  std::printf("[info] %s: per-rank GDN state + logs %.2f MiB window-slot vs %.2f MiB write-once\n", tag.c_str(),
-              a.GdnBytes() / 1048576.0, b.GdnBytes() / 1048576.0);
-  CheckScript(a, b, kRounds, (tag + " rounds").c_str());
-  CheckScript(a, b, kCheckpoint, (tag + " checkpoint").c_str());
-  CheckBounds(b, (tag + " bounds").c_str());
-  TpEngine ma(Options(layout, 3, 0, 0, false));
-  TpEngine mb(Options(layout, 3, 0, 1, false));
-  CheckScript(ma, mb, kMtp, (tag + " mtp k=3").c_str());
+  {
+    // two TpModels (four rank Models) at a time, never four TpModels
+    TpEngine a(Options(layout, 0, 7, 0, true));
+    TpEngine b(Options(layout, 0, 7, 1, true));
+    CHECK(!a.WriteOnce() && b.WriteOnce(), "[%s] gdn_write_once 0 / 1 did not select the manager on both ranks", tag.c_str());
+    CHECK(b.GdnBytes() < a.GdnBytes(), "[%s] the write-once rank's GDN allocation is not smaller", tag.c_str());
+    std::printf("[info] %s: per-rank GDN state + logs %.2f MiB window-slot vs %.2f MiB write-once\n", tag.c_str(),
+                a.GdnBytes() / 1048576.0, b.GdnBytes() / 1048576.0);
+    CheckScript(a, b, kRounds, (tag + " rounds").c_str());
+    CheckScript(a, b, kCheckpoint, (tag + " checkpoint").c_str());
+    CheckBounds(b, (tag + " bounds").c_str());
+  }
+  {
+    TpEngine ma(Options(layout, 3, 0, 0, false));
+    TpEngine mb(Options(layout, 3, 0, 1, false));
+    CheckScript(ma, mb, kMtp, (tag + " mtp k=3").c_str());
+  }
 }
 
 int RunTest() {

@@ -146,6 +146,18 @@ void r4dx_silu_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermedi
 void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t rows, int64_t K,
                                       int64_t suh, int64_t out, int prescale_log2, int64_t stream);
 
+// Diagnostic (R4DX_FAKEQ_ACT, docs/int8-prefill.md; src/model/fake_quant_act.h is the reference): round a
+// trellis linear's transformed A to symmetric int8 and back, IN PLACE. a: f16 [rows, K] with row stride K,
+// plus a second such part at a + part_stride when parts == 2 (the layout r4dx_trellis_input_bf16 writes).
+// Per scale group, s = max|x| / 127 (fp32), v = f16(rint(x / s) * s) with q clamped to +-127 and the
+// product rounded to fp32 before the f16 conversion. mode 1: the group is a row; 2: a row x 128-column
+// block; 3: a row x 32-column block. An all-zero group becomes zeros; a group with a non-finite element is
+// left untouched. Preconditions (throw): mode 1..3, K a positive multiple of 128, rows 0..65535 (0 is a
+// no-op), parts 1..2, part_stride >= rows * K for two parts, non-null a. Launch: modes 2 / 3 grid
+// (K / 128, rows, parts) of one wave32; mode 1 grid (rows, parts) of 256 threads.
+void r4dx_fake_quant_act_f16(int64_t a, int64_t rows, int64_t K, int parts, int64_t part_stride, int mode,
+                              int64_t stream);
+
 // Test / diagnostic entry: an unnormalized in-place 128-point FWHT of each 128-float block of x
 // (fp32 [blocks * 128]) through libr4d's one-wave r4d_fwht128_wave (use_lds == 0; the trellis
 // kernels' butterfly) or r4dx's FwhtLds (use_lds != 0; the quant2 rotation kernels'), so a test can

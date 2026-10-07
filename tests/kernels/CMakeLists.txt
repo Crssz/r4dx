@@ -60,6 +60,15 @@ set(R4DX_KERNEL_TESTS
   # both rates (plus run-to-run, ticket reset, a negative control and the refusal messages). Skips (77)
   # only without a HIP device; needs no golden data.
   test_trellis_m256
+  # R4DX_FAKEQ_ACT's kernel (docs/int8-prefill.md): r4dx_fake_quant_act_f16 bit for bit against
+  # src/model/fake_quant_act.h's fp32 reference, every mode, one and two parts, K up to 17408. Skips (77)
+  # only without a HIP device; needs no golden data.
+  test_fake_quant_act
+  # R4DX_FAKEQ_W's kernels (docs/int8-prefill.md): libr4d's `_wq` trellis GEMMs (decoded weights rounded to
+  # int8 before the WMMA) and the scale-table builder against src/model/fake_quant_w.h's CPU reference --
+  # table, one-hot rows of the rounded Q' through every instantiation, the M = 256 kernel against four
+  # 64-row launches, the whole linear. Skips (77) only without a HIP device; needs no golden data.
+  test_fake_quant_w
   # Gemma 4 device pieces (docs/gemma4-plan.md 3.4 / 3.5, task M1-15; the GPU step is M1-16:
   #   ctest -R "rope_proportional|rmsnorm_noscale|gelu_mul|postnorm|softcap|embed_scaled").
   # CPU references live in gemma_ref.hpp; always-on GPU tests, no golden data.
@@ -99,7 +108,7 @@ set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
 # has passed, and 1 if that part failed -- so a skip never hides a real regression.
 set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
                      test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
-set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 test_fake_quant_act test_fake_quant_w PROPERTIES SKIP_RETURN_CODE 77)
 
 # `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
 # to be able to CATCH anything at all.
@@ -126,7 +135,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
-                            test_trellis_m256.cpp test_rope_proportional.cpp
+                            test_trellis_m256.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
                             test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 
@@ -138,6 +147,12 @@ target_link_libraries(test_trellis_input PRIVATE r4dx_model_attention)
 # test_trellis_m256 asks src/model/linear.cpp for the shipped M = 64 row (PickTuning) and the plan
 # ApplyLinear runs the M = 256 kernel with (PlanTrellisM256).
 target_link_libraries(test_trellis_m256 PRIVATE r4dx_model_linear)
+# test_fake_quant_act uses src/model/fake_quant_act.h (header-only) as its reference.
+target_include_directories(test_fake_quant_act PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
+# test_fake_quant_w: the CPU reference (src/model/fake_quant_w.h) and, like test_trellis_m256, the shipped M = 64
+# row (PickTuning) and the M = 256 plan (PlanTrellisM256) from r4dx_model_linear; trellis_ref.hpp is this directory's.
+target_include_directories(test_fake_quant_w PRIVATE "${CMAKE_SOURCE_DIR}/src/model")
+target_link_libraries(test_fake_quant_w PRIVATE r4dx_model_linear)
 
 # Gemma 4 stage-0 reference attention (docs/gemma4-plan.md 3.3, task M1-17; GPU step M1-18:
 # `ctest -R attn_ref_gemma`). The kernel lives in r4dx_model_attention (src/model/attention/src/
@@ -188,6 +203,29 @@ add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
 # (dense Sylvester FWHT, the closed-form rows of Q, norms/inverses, TP K-slicing).
 add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
 add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
+
+# test_int8_gemm_proto_cpu: pure CPU (no HIP call) -- the int8 x int8 prefill GEMM prototype's layouts,
+# quantizers and software-WMMA emulation of the kernel's fragment chain (docs/int8-gemm-proto.md). The device
+# bench is tool_int8_gemm_proto (tests/kernels/build_int8_gemm_proto.ps1, hipcc, no CMake target).
+add_executable(test_int8_gemm_proto_cpu test_int8_gemm_proto_cpu.cpp)
+# trellis_ref.hpp's dtype.hpp wants the HIP headers (host-only use: nothing links amdhip64, nothing runs on a device).
+target_include_directories(test_int8_gemm_proto_cpu PRIVATE "${R4D_ROCM_ROOT}/include")
+target_compile_definitions(test_int8_gemm_proto_cpu PRIVATE __HIP_PLATFORM_AMD__)
+add_test(NAME test_int8_gemm_proto_cpu COMMAND test_int8_gemm_proto_cpu)
+# test_int8_gemm_proto_emu: pure CPU too -- the prototype's kernel SOURCE compiled as plain C++ (I8G_EMU, i8g_host_emu.h:
+# one OS thread per GPU thread, barriers, a software iu8 WMMA, a stub trellis decode) and run against exact references.
+add_executable(test_int8_gemm_proto_emu test_int8_gemm_proto_emu.cpp)
+add_test(NAME test_int8_gemm_proto_emu COMMAND test_int8_gemm_proto_emu)
+# _Float16 arithmetic on the host: hardware conversions (F16C) instead of compiler-rt's, and the device source's
+# `#pragma unroll` loops that contain barriers cannot unroll on the CPU (harmless)
+target_compile_options(test_int8_gemm_proto_emu PRIVATE /clang:-mf16c /clang:-mavx2 /clang:-mfma /clang:-Wno-pass-failed /D_CRT_SECURE_NO_WARNINGS)
+# ... and compiler-rt's half <-> double helpers (__truncdfhf2: the f16 fma of the quantizer is done in double on x86)
+file(GLOB R4DX_CLANG_RT_BUILTINS "${R4D_ROCM_ROOT}/lib/llvm/lib/clang/*/lib/windows/clang_rt.builtins-x86_64.lib")
+if(R4DX_CLANG_RT_BUILTINS)
+  list(GET R4DX_CLANG_RT_BUILTINS 0 R4DX_CLANG_RT_BUILTINS_0)
+  target_link_libraries(test_int8_gemm_proto_emu PRIVATE "${R4DX_CLANG_RT_BUILTINS_0}")
+endif()
+set_tests_properties(test_int8_gemm_proto_emu PROPERTIES TIMEOUT 1200)
 
 # test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
 # rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.

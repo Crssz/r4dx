@@ -306,3 +306,33 @@ __device__ __forceinline__ void r4d_trellis_k5_decode(unsigned (&W)[5], unsigned
   f0 = __builtin_bit_cast(v8h, (r4d_u32x4){s0, s8, s2, s10});
   f1 = __builtin_bit_cast(v8h, (r4d_u32x4){s4, s12, s6, s14});
 }
+
+// ---- weight fake-quant (r4dx R4DX_FAKEQ_W, docs/int8-prefill.md) --------------------------------------
+// A MEASUREMENT hook, not part of the shipped GEMM: the `_wq` kernels of r4d_gemm_trellis_nt_m64.hip and
+// r4d_gemm_trellis_nt_m256.hip call it on a decoded fragment right before the WMMA, to answer "what would
+// int8 weights cost in accuracy?" before anyone writes an int8 x int8 GEMM. The kernels without `_wq` never
+// reference it, so their code is untouched.
+//
+// A decoded fragment (f0 or f1) is the lane's eight values of ONE column of Q (r4d_trellis_k4_decode's lane
+// map), so one scale `s` serves all eight: the fp32 scale of that column's k group, s = max|Q| / 127 over
+// the group (r4d_trellis_wscale_f32 builds the table; 1.0f for an all-zero group, so 1 / s is finite). The
+// rounding, in fp32: rs = 1 / s (IEEE division), q = clamp(rint(w * rs), -127, 127) (rint = round half to
+// even), v = q * s (an fp32 product, never fused: libr4d is built with -ffp-contract=off), then one f16
+// rounding. src/model/fake_quant_w.h's FakeQuantWRoundRef is the CPU transcription.
+typedef float r4d_wq_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ v8h r4d_trellis_wq_round(v8h f, float s) {
+  const float rs = 1.0f / s;
+  r4d_wq_f8 x = __builtin_convertvector(f, r4d_wq_f8);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    float q = __builtin_rintf(x[e] * rs);
+    q = __builtin_fminf(__builtin_fmaxf(q, -127.0f), 127.0f);
+    // The product is rounded to fp32 FIRST: without the barrier the backend folds fptrunc(q * s) into one
+    // v_fma_mix_f16 (seen in the listing), a single rounding to f16 that is not the fp32 product followed by
+    // the f16 conversion the CPU reference does. The empty asm costs no instruction.
+    float prod = q * s;
+    asm("" : "+v"(prod));
+    x[e] = prod;
+  }
+  return __builtin_convertvector(x, v8h);
+}

@@ -263,6 +263,10 @@ class Container {
   // not (a device fault or TDR); Model::Reset() calls it. One hipMemsetAsync on `stream`; a no-op
   // for a container without trellis linears.
   void ZeroTrellisTickets(hipStream_t stream);
+  // R4DX_FAKEQ_W (fake_quant_w.h, docs/int8-prefill.md), Model::Load only, and only when the switch is on:
+  // BuildTrellisWScale (linear.h) for every trellis linear -- the per-(column, k group) scale tables the
+  // rounding prefill GEMMs read. No-op for mode 0 or a container without trellis linears.
+  void BuildTrellisWScales(int mode, hipStream_t stream);
 
   // The vision tower's weights (docs/vision.md), present only when Load() was called with
   // load_vision=true AND the container actually carries vision.* tensors. HasVisionTensors() is

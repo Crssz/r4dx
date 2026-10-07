@@ -596,16 +596,17 @@ twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
 
 ### Results
 
-PENDING (no GPU run has happened). Fill from G1 to G5.
+2026-10-07, ROCm 10.1.0, HIP device 1 (G4d's f16 control on device 0), logs and dumps in
+`E:\models\r4dx\int8prefill\`.
 
 | step | result |
 |---|---|
-| G1 bench vs retuned f16 | |
-| G2 `test_trellis_i8_gemm` | |
-| G2b `test_prefill_int8` | |
-| G3 off identity | |
-| G4a tails f16 | |
-| G4b chunked canon KL(off \|\| on) | |
-| G4c 8k / 32k KL | |
-| G4d split consistency | |
-| G5 greedy hash, TTFT 8k / 32k | |
+| G1 bench vs retuned f16 | all seven classes, layer-weighted: KB4 x1.367, KB5 x1.327 (x1.300 / x1.259 with the unfused A quantizer); `--emit-rows` output is now `gemm_tuning_table_trellis_i8.inc` |
+| G2 `test_trellis_i8_gemm` | PASS (14 classes x KB 4/5, 847 checks; repeats byte-identical, f16/int8 interleave unchanged, row permutation 0 of 256 rows differ) |
+| G2b `test_prefill_int8` | 1 FAIL, a test assumption: `mm600` (text-only `PrefillMultimodal`) differs from `len600` (`Prefill`) in the attention layers' KV with the switch OFF too, so the two entry points are not byte-equal today; int8 is not involved. The test needs its expectation fixed |
+| G3 off identity | `test_prefill_chunk_identity` PASS (15 configurations); `kl_rung4` gate byte-identical to `rocm1010\kl` |
+| G4a tails f16 | switch on, one-token prefill path: byte-identical to `int8q\kl-off-pfx` on all four segments |
+| G4b chunked canon KL(off \|\| on) | mean 0.00110, median 0.00032, p99 0.0083, max 0.0187, top-1 agreement 98.83 %, ppl 3.4287 -> 3.4349 |
+| G4c 8k / 32k KL | 8k: mean 0.00166 (prose 0.0022, code 0.0023, recall 0.0005); 32k: mean 0.0104, of which code_32k 0.0291 (median 0.0008, p99 0.74, max 1.95, ppl 4.158 -> 4.625 on its 256 scored rows), prose 0.0020, recall 0.0002. code at depth is the most sensitive segment to any change of prefill numerics: docs/prefill.md measured a chunk-boundary shift alone at code mean KL 0.048, so 0.029 is inside the rounding-class spread, but it is the number to watch |
+| G4d split consistency | KL(on one-shot \|\| on split at 300) = 0.00281, vs the f16 control KL(off one-shot \|\| off split at 300) = 0.00274: splitting moves the bits by the same amount with or without int8 (GDN chunk alignment), so the int8 path adds no split sensitivity. The gate as first written (split <= KL(off \|\| on) = 0.0011) was too strict: it is below f16's own split spread |
+| G5 greedy hash, TTFT 8k / 32k | `gdn256_check -Int8` ALL PASS: greedy text identical across new / conv1 / old and equal to f16 at 8k (`9A0B80DE8E49B800`) and 32k (`CDD3FDD6609B99DF`). Cold TTFT, 2 runs each, off -> on: 8k 4.714 / 4.724 -> 3.837 / 3.820 s (-18.9 %, 2110 tok/s), 32k 22.945 / 22.976 -> 19.372 / 19.355 s (-15.7 %, 1690 tok/s) |

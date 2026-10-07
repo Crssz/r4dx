@@ -414,9 +414,12 @@ the prefix-cache state (a prefix-reuse suffix anchors its own grid). Load line: 
 Tests: the f16 identity tests pin `prefill_int8 = 0` per `Load` (`test_prefill_chunk_identity`, which also pins
 `R4DX_PREFILL_SPLITKV=exact` unless the environment says otherwise), `test_prefill_int8` loads off / on / **default (-1)**,
 `tp1_identity.ps1` pins both knobs and `gdn256_check.ps1` pins them unless run with `-Defaults`. One test expectation was wrong
-and is fixed: a text-only `PrefillMultimodal` is NOT byte-equal to `Prefill` of the same ids, even with int8 off (the attention
-layers' KV bytes differ; measured 2026-10-07, G2b below), so `test_prefill_int8` compares `PrefillMultimodal` on vs off and
-counts its int8 chunks instead. Not covered by the speed / accuracy gates that were measured (listed under "Gates for making it
+and is fixed (G2b below): `mm600` differed from `len600` in the attention layers' KV digests with int8 off too, but that was the
+test's own state, not the entry points -- a text-only `PrefillMultimodal` delegates to `Prefill`, `Reset()` leaves the KV pages
+alone, and `DebugStateDigest` covers all of them, so each scenario's digest carries the stale pages of the scenarios before it
+(`mm600` follows `len600` and its two decode steps, which wrote positions 600 and 601). `test_prefill_int8` now compares
+`mm600` with `len600` on the live state (logits, GDN states, decode tokens, int8 chunk count) and leaves the KV digests out of
+that one comparison. Not covered by the speed / accuracy gates that were measured (listed under "Gates for making it
 the default" below, which have no row in Results yet): the speculation gate (DFlash / MTP accepted length on the OpenCode
 transcripts), the `run_tasks` scores at 8k / 32k, a 128k prefill; they are in the validation list handed to the main session.
 
@@ -643,7 +646,7 @@ twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
 |---|---|
 | G1 bench vs retuned f16 | all seven classes, layer-weighted: KB4 x1.367, KB5 x1.327 (x1.300 / x1.259 with the unfused A quantizer); `--emit-rows` output is now `gemm_tuning_table_trellis_i8.inc` |
 | G2 `test_trellis_i8_gemm` | PASS (14 classes x KB 4/5, 847 checks; repeats byte-identical, f16/int8 interleave unchanged, row permutation 0 of 256 rows differ) |
-| G2b `test_prefill_int8` | 1 FAIL, a test assumption: `mm600` (text-only `PrefillMultimodal`) differs from `len600` (`Prefill`) in the attention layers' KV with the switch OFF too, so the two entry points are not byte-equal today; int8 is not involved. The test needs its expectation fixed |
+| G2b `test_prefill_int8` | 1 FAIL, a test assumption: `mm600` (text-only `PrefillMultimodal`) differs from `len600` (`Prefill`) in the attention layers' KV digests with the switch OFF too; int8 is not involved. Cause (found in review of branch `fast`, by reading, not a run): the digest covers every KV page and `Reset()` does not clear them, so the digests carry the stale pages of earlier scenarios; the entry points delegate and are the same code. The test compares the live state now (still to be run) |
 | G3 off identity | `test_prefill_chunk_identity` PASS (15 configurations); `kl_rung4` gate byte-identical to `rocm1010\kl` |
 | G4a tails f16 | switch on, one-token prefill path: byte-identical to `int8q\kl-off-pfx` on all four segments |
 | G4b chunked canon KL(off \|\| on) | mean 0.00110, median 0.00032, p99 0.0083, max 0.0187, top-1 agreement 98.83 %, ppl 3.4287 -> 3.4349 |

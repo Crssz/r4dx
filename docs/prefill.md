@@ -477,14 +477,16 @@ says split-KV costs no accuracy, only reproducibility against the old bits.
 
 Decision: option 1 of the gate decision above. "M1 = lossless" is binding, so the default prompt
 prefill attention is the exact-wide launch, and split-KV stays one environment variable away.
+**Historical (2026-10-03): the default has been the split law from 2048 tokens since 2026-10-07 (see "Split threshold" below);
+`exact` is now the kill switch, and an unreadable value falls back to split.**
 
 | `R4DX_PREFILL_SPLITKV` | prompt-prefill attention | bits vs dense | 128k TTFT, TP=1 |
 |---|---|---|---|
-| unset, empty or `exact` (**default**) | exact-wide (`r4d_attn_prefill_exact_*`, 12 warps x 4 d-slices x 96-key tiles) | identical | 1.51x |
+| unset, empty or `exact` (the default until 2026-10-07) | exact-wide (`r4d_attn_prefill_exact_*`, 12 warps x 4 d-slices x 96-key tiles) | identical | 1.51x |
 | `split` (also `splitkv`, `auto`) | split-KV by the split law (S=8 at TP=1, 16 per rank at TP=2, from 8k context) | rounding-class drift (see above) | 2.01x |
 | `0`, `1`, `off` or `dense` | the old single-workgroup dense launch | identical (it is the dense kernel) | 1.00x |
 | `N` > 1 | N split-KV segments on every call, capped at 32 | rounding-class drift | - |
-| anything else | a warning on stderr, then the default | identical | 1.51x |
+| anything else | a warning on stderr, then the default (then exact, now split) | identical (then) | 1.51x |
 
 - Only prompt prefill reads it. Decode, verify windows and MTP priming always take the plain launch.
 - The parse is `ParsePrefillAttnMode` in `attention_layer.hpp`. `test_attn_layer` checks it on the

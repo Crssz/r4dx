@@ -244,7 +244,12 @@ void TestFusedQ() {
   std::fflush(stderr);
   CHECK(ParsePrefillInt8FusedQ("yes") && ParsePrefillInt8FusedQ("ON") && ParsePrefillInt8FusedQ("2"),
         "an unrecognized value keeps the default, on (with a warning on stderr)");
-  CHECK(TrellisI8FusedQEnabled(), "the test environment sets neither the switch nor R4DX_TRELLIS_A_STATS: enabled");
+  {
+    // follows the environment the test runs under: a run with the kill switch set, to see it honored, must not fail here
+    const char* st = std::getenv("R4DX_TRELLIS_A_STATS");
+    const bool want = ParsePrefillInt8FusedQ(std::getenv("R4DX_PREFILL_INT8_FUSEDQ")) && !(st != nullptr && st[0] != '\0');
+    CHECK(TrellisI8FusedQEnabled() == want, "TrellisI8FusedQEnabled() follows R4DX_PREFILL_INT8_FUSEDQ (on when unset), off under R4DX_TRELLIS_A_STATS");
+  }
   QuantLinear w;
   w.layout = Layout::kTrellis;
   w.N = 5120;

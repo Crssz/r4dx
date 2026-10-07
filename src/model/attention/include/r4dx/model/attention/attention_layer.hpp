@@ -34,6 +34,7 @@
 #include "profile_span.h"  // r4dx::model::SpanAccumulator / ProfiledCall (Milestone 3 profiling)
 #include "r4d.h"
 #include "r4dx/core/arena.hpp"
+#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY=attn
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
@@ -270,19 +271,31 @@ class AttentionLayer {
 
     uint16_t* q = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
     uint16_t* gate = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D);
-    ProfiledCall(prof, stream, "attn.split_qg", [&] {
-      r4dx_model_attn_split_qg_bf16(reinterpret_cast<int64_t>(qg_raw), reinterpret_cast<int64_t>(q),
-                                     reinterpret_cast<int64_t>(gate), T, H, D,
-                                     reinterpret_cast<int64_t>(stream));
-    });
+    uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
+    uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
+    // decode-t1 item 4 (docs/perf.md): split_qg + q/k norm + rope + the fp8 cache write as ONE launch
+    // after the k/v projections (same bytes, r4dx_attn_precore_bf16's comment) -- on the single-row
+    // rope path (no image in the prompt) wherever the replaced norm kernel took its vector path.
+    // R4DX_DECODE_LEGACY=attn keeps the five launches.
+    const bool precore_fused =
+        rope_pos3 == nullptr && !core::DecodeLegacy(core::DecodeItem::kAttn) &&
+        r4dx_attn_precore_supported(D, cfg_.rotary_dim, reinterpret_cast<int64_t>(qg_raw),
+                                     reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(w.q_norm),
+                                     reinterpret_cast<int64_t>(w.k_norm), reinterpret_cast<int64_t>(q),
+                                     reinterpret_cast<int64_t>(gate)) != 0;
+    if (!precore_fused) {
+      ProfiledCall(prof, stream, "attn.split_qg", [&] {
+        r4dx_model_attn_split_qg_bf16(reinterpret_cast<int64_t>(qg_raw), reinterpret_cast<int64_t>(q),
+                                       reinterpret_cast<int64_t>(gate), T, H, D,
+                                       reinterpret_cast<int64_t>(stream));
+      });
+    }
 
     // ---- k / v projections ---------------------------------------------------------------------
     // Dispatched through the shared ApplyLinear (R1, docs/r9700.md), same as qg/o above -- k/v now
     // honor `--layout` too (Container::Load falls back to bf16 when the requested layout's tensors
     // are absent, e.g. mtp.attn.k/v, which are always bf16 by design). Replaces this component's
     // own bf16-only Linear wrapper (attention/linear.hpp), which is now unused.
-    uint16_t* k = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
-    uint16_t* v = arena.Alloc<uint16_t>(static_cast<size_t>(T) * Hkv * D);
     const bool k_shares_pre = have_qg_pre && (EpilogueForLayout(w.k->layout) == qg_epilogue);
     const bool v_shares_pre = have_qg_pre && (EpilogueForLayout(w.v->layout) == qg_epilogue);
     ProfiledCall(prof, stream, "gemm:attn.k_proj", [&] {
@@ -294,8 +307,25 @@ class AttentionLayer {
                   trellis_shared ? &trellis_in[2] : v_shares_pre ? &normed_pre : nullptr);
     });
 
+    if (precore_fused) {
+      // split_qg's q / gate, q_norm / k_norm, the single-row rope on q and k, and the fp8 cache write
+      // of k and v -- one launch (see the comment at `precore_fused`). `positions` is both the rope
+      // position and the slot mapping, as in the five-launch chain below.
+      ProfiledCall(prof, stream, "attn.precore", [&] {
+        r4dx_attn_precore_bf16(reinterpret_cast<int64_t>(qg_raw), reinterpret_cast<int64_t>(k),
+                                reinterpret_cast<int64_t>(v), reinterpret_cast<int64_t>(w.q_norm),
+                                reinterpret_cast<int64_t>(w.k_norm), reinterpret_cast<int64_t>(positions),
+                                reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(gate),
+                                reinterpret_cast<int64_t>(w.k_descale),
+                                reinterpret_cast<int64_t>(w.v_descale),
+                                reinterpret_cast<int64_t>(kv.Data()), T, H, Hkv, D, cfg_.rotary_dim,
+                                cfg_.rope_theta, cfg_.rms_eps, kv.BlockSize(), kv.KvBlockStride(),
+                                kv.KvHeadStride(), reinterpret_cast<int64_t>(stream));
+      });
+    }
+
     // ---- per-head q_norm / k_norm (RMSNorm over head_dim, one shared weight per head) ----------
-    ProfiledCall(prof, stream, "attn.qk_norm", [&] {
+    if (!precore_fused) ProfiledCall(prof, stream, "attn.qk_norm", [&] {
       r4dx_rmsnorm_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(w.q_norm),
                          reinterpret_cast<int64_t>(q), static_cast<int64_t>(T) * H, D, cfg_.rms_eps,
                          reinterpret_cast<int64_t>(stream));
@@ -308,7 +338,7 @@ class AttentionLayer {
     // Text-only (rope_pos3 == nullptr): all three position streams equal the token position, so the
     // single-row entry point is exactly equivalent and is what every pre-vision caller keeps using.
     // Multimodal: the (t,h,w) rows diverge from `positions` -- see this method's doc comment.
-    ProfiledCall(prof, stream, "attn.rope", [&] {
+    if (!precore_fused) ProfiledCall(prof, stream, "attn.rope", [&] {
       if (rope_pos3 != nullptr) {
         r4dx_rope_partial_mrope3_bf16(reinterpret_cast<int64_t>(q), reinterpret_cast<int64_t>(k),
                                        reinterpret_cast<int64_t>(rope_pos3), T, H, Hkv, D,
@@ -325,7 +355,7 @@ class AttentionLayer {
 
     // ---- fp8 paged KV cache write (post-rope K, per docs/architecture.md) -- BEFORE the attn call
     // `positions` doubles as the slot_mapping (contiguous block table: slot==pos, see above).
-    ProfiledCall(prof, stream, "attn.kv_write", [&] {
+    if (!precore_fused) ProfiledCall(prof, stream, "attn.kv_write", [&] {
       r4dx_kv_write_paged_fp8_hnd(
           reinterpret_cast<int64_t>(k), reinterpret_cast<int64_t>(v),
           reinterpret_cast<int64_t>(positions), reinterpret_cast<int64_t>(w.k_descale),

@@ -26,6 +26,12 @@ class FinalLmHead {
   void Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, float* logits_out,
                int64_t T);
 
+  // Forward without the widen: final_norm + lm_head only, returning the lm_head GEMM's own bf16 output
+  // [T, vocab] (arena scratch: valid on `stream` until the caller's next arena Reset). A greedy decode
+  // step argmaxes it directly (r4dx_argmax_bf16 -- the widen is exact, so the comparisons are the fp32
+  // row's) and skips the widen launch; Forward is exactly this plus the widen.
+  const uint16_t* ForwardBf16(core::Stream& stream, core::Arena& arena, const uint16_t* x, int64_t T);
+
  private:
   const ModelConfig& cfg_;
   const core::DeviceBuffer<uint16_t>& final_norm_;

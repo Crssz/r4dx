@@ -56,6 +56,7 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/include/r4dx/kernels/hadamard_device.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/decode_legacy.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) r4dx_kernels.obj"
   VERBATIM

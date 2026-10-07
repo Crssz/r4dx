@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -140,6 +141,17 @@ class TextModel {
                                                const std::vector<ImageSpan>& images) = 0;
   virtual std::vector<float> DecodeStep(int32_t token_id) = 0;
   virtual int32_t DecodeStepGreedy(int32_t token_id) = 0;
+  // DecodeStepGreedy with the caller's per-token host work (decode, stop-string scan, console / HTTP
+  // output of the token just fed) run while the step is on the device: Model enqueues the step first,
+  // calls `while_busy` once, then waits (decode-t1 item 5, docs/perf.md), taking that work off the
+  // critical path between two steps. The result is DecodeStepGreedy(token_id)'s, bit for bit; an
+  // exception thrown by `while_busy` is rethrown after the step has completed. Default (every model but
+  // the local Qwen one, and R4DX_DECODE_LEGACY=host): `while_busy()` first, then the step -- the order a
+  // caller that did its output before the call always had.
+  virtual int32_t DecodeStepGreedyOverlap(int32_t token_id, const std::function<void()>& while_busy) {
+    while_busy();
+    return DecodeStepGreedy(token_id);
+  }
   virtual int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params,
                                     std::mt19937_64& rng) = 0;
   virtual std::vector<int32_t> DecodeStepMtpGreedy(int32_t token_id, int64_t k) = 0;

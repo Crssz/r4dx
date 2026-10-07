@@ -53,6 +53,9 @@ class LocalTextModel final : public TextModel {
   }
   std::vector<float> DecodeStep(int32_t token_id) override { return m_.DecodeStep(token_id); }
   int32_t DecodeStepGreedy(int32_t token_id) override { return m_.DecodeStepGreedy(token_id); }
+  int32_t DecodeStepGreedyOverlap(int32_t token_id, const std::function<void()>& while_busy) override {
+    return m_.DecodeStepGreedyOverlap(token_id, while_busy);
+  }
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params,
                             std::mt19937_64& rng) override {
     return m_.DecodeStepSampled(token_id, params, rng);

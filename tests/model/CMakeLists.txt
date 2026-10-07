@@ -182,6 +182,13 @@ add_test(NAME test_mtp_round COMMAND test_mtp_round)
 add_executable(test_prefill_chunk test_prefill_chunk.cpp)
 target_include_directories(test_prefill_chunk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_prefill_chunk COMMAND test_prefill_chunk)
+# test_decode_legacy: pure CPU unit test for the decode-t1 host contracts (docs/perf.md): the
+# R4DX_DECODE_LEGACY parser (src/core/include/r4dx/core/decode_legacy.hpp) and the one-copy step
+# metadata layout (src/model/step_meta.h). Header-only, no HIP; always runs.
+add_executable(test_decode_legacy test_decode_legacy.cpp)
+target_include_directories(test_decode_legacy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../../src/core/include)
+add_test(NAME test_decode_legacy COMMAND test_decode_legacy)
 
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group

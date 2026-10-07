@@ -5,13 +5,17 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include "r4d.h"  // third_party/libr4d: r4d_dflash_conv_t2_g16_bf16 (the DFlash2 conv wrapper below)
+#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY=argmax (the one-workgroup argmax)
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/hadamard_device.h"  // FwhtLds for r4dx_silu_mul_hadamard_bf16
@@ -618,6 +622,124 @@ __global__ void KvWritePagedFp8Kernel(const __hip_bfloat16* __restrict__ k_new,
   }
 }
 
+// ---- attention pre-core chain, one launch (decode-t1 item 4, docs/perf.md) -----------------------
+// Replaces, on the text-only (single-row rope) path, the five launches between the k/v projections and
+// the attention core -- r4dx_model_attn_split_qg_bf16, r4dx_rmsnorm_bf16 on q and on k (per-head
+// q_norm / k_norm), r4dx_rope_partial_mrope_bf16 and r4dx_kv_write_paged_fp8_hnd -- with the same bytes:
+//   q[t, h, :]    = rope(rmsnorm(qg[t, h, 0:D], q_norm))                          bf16
+//   gate[t, h, :] = qg[t, h, D:2D]                                                bf16 copy
+//   cache(slot(t), kh, K half) = fp8(bf16(rope(rmsnorm(k[t, kh, :], k_norm))) * 1/k_descale[kh])
+//   cache(slot(t), kh, V half) = fp8(v[t, kh, :] * 1/v_descale[kh])
+// (the rope'd k never goes back to a bf16 buffer: nothing but the cache write reads it).
+// One wavefront per (token, head); grid = (T, heads_q + heads_k). Bit-exactness is by construction, each
+// stage being the replaced kernel's own arithmetic in the same order (the file builds with
+// -ffp-contract=off, so no stage can fuse differently):
+//   - rmsnorm: RmsNormKernel's vector path on a row of head_dim <= 256 -- lane l owns the 16-byte chunk l,
+//     ss = sum over its eight elements of (fl*fl + fh*fh) in order, then the same xor tree over the 32
+//     lanes (RmsNormKernel's other seven waves hold 0, and a sum with exact zeros is the sum),
+//     rstd = rsqrtf(ss / head_dim + eps), out = bf16((x * rstd) * (1 + w));
+//   - rope: RopePartialMropeKernel's per-pair expression, c/s from the same exp2f / log2f / sincosf;
+//   - kv write: KvWritePagedFp8Kernel's addressing and conversion.
+// The host takes this path only where RmsNormKernel would have taken its vector path (head_dim % 8 == 0,
+// the rows and weights 16-byte aligned): the scalar fallback sums in another order.
+constexpr int kPrecoreMaxHeadDim = 256;  // = 32 lanes x one 16-byte chunk
+
+__global__ __launch_bounds__(32) void AttnPrecoreKernel(
+    const __hip_bfloat16* __restrict__ qg, const __hip_bfloat16* __restrict__ k_in,
+    const __hip_bfloat16* __restrict__ v_in, const __hip_bfloat16* __restrict__ q_norm,
+    const __hip_bfloat16* __restrict__ k_norm, const int32_t* __restrict__ positions,
+    __hip_bfloat16* __restrict__ q_out, __hip_bfloat16* __restrict__ gate_out,
+    const float* __restrict__ k_descale, const float* __restrict__ v_descale,
+    uint8_t* __restrict__ kv_cache, int heads_q, int heads_k, int head_dim, int rotary_dim,
+    float theta, float eps, int block_size, int64_t kv_block_stride, int64_t kv_head_stride) {
+  const int t = blockIdx.x;
+  const int hh = blockIdx.y;
+  const bool is_q = hh < heads_q;
+  const int kh = hh - heads_q;  // the k/v head, k rows only
+  const int lane = threadIdx.x;
+  const int n4 = head_dim >> 3;  // 16-byte chunks per row, <= 32
+
+  const __hip_bfloat16* src = is_q ? qg + (static_cast<int64_t>(t) * heads_q + hh) * 2 * head_dim
+                                   : k_in + (static_cast<int64_t>(t) * heads_k + kh) * head_dim;
+  const __hip_bfloat16* w = is_q ? q_norm : k_norm;
+
+  __shared__ __attribute__((aligned(16))) uint16_t row[kPrecoreMaxHeadDim];  // the normed, then rope'd, bf16 row
+
+  // ---- rmsnorm over the row ----
+  uint4 xc = make_uint4(0u, 0u, 0u, 0u);
+  float ss = 0.0f;
+  if (lane < n4) {
+    xc = reinterpret_cast<const uint4*>(src)[lane];
+    const unsigned dw[4] = {xc.x, xc.y, xc.z, xc.w};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      __hip_bfloat16 lo, hi;
+      UnpackBf16x2(dw[j], &lo, &hi);
+      const float fl = __bfloat162float(lo), fh = __bfloat162float(hi);
+      ss += fl * fl + fh * fh;
+    }
+  }
+  for (int o = 16; o; o >>= 1) ss += __shfl_xor(ss, o, 32);
+  const float rstd = rsqrtf(ss / static_cast<float>(head_dim) + eps);
+  if (lane < n4) {
+    const uint4 wc = reinterpret_cast<const uint4*>(w)[lane];
+    const unsigned xdw[4] = {xc.x, xc.y, xc.z, xc.w};
+    const unsigned wdw[4] = {wc.x, wc.y, wc.z, wc.w};
+    uint32_t* row32 = reinterpret_cast<uint32_t*>(row) + lane * 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      __hip_bfloat16 xlo, xhi, wlo, whi;
+      UnpackBf16x2(xdw[j], &xlo, &xhi);
+      UnpackBf16x2(wdw[j], &wlo, &whi);
+      const float ov_lo = __bfloat162float(xlo) * rstd * (1.0f + __bfloat162float(wlo));
+      const float ov_hi = __bfloat162float(xhi) * rstd * (1.0f + __bfloat162float(whi));
+      row32[j] = PackBf16x2(__float2bfloat16(ov_lo), __float2bfloat16(ov_hi));
+    }
+  }
+  __syncthreads();
+
+  // ---- partial rotary, NeoX half-split (one lane per frequency bin; the pairs are disjoint) ----
+  const int half = rotary_dim / 2;
+  const float pos = static_cast<float>(positions[t]);
+  for (int hd = lane; hd < half; hd += 32) {
+    const float inv_freq = exp2f(-(2.0f * hd) / static_cast<float>(rotary_dim) * log2f(theta));
+    const float angle = pos * inv_freq;
+    float c, s;
+    sincosf(angle, &s, &c);
+    const float x0 = __bfloat162float(__ushort_as_bfloat16(row[hd]));
+    const float x1 = __bfloat162float(__ushort_as_bfloat16(row[hd + half]));
+    row[hd] = __bfloat16_as_ushort(__float2bfloat16(x0 * c - x1 * s));
+    row[hd + half] = __bfloat16_as_ushort(__float2bfloat16(x1 * c + x0 * s));
+  }
+  __syncthreads();
+
+  if (is_q) {
+    // q row out, and the gate half of the qg row copied beside it
+    const int64_t o = (static_cast<int64_t>(t) * heads_q + hh) * head_dim;
+    if (lane < n4) {
+      reinterpret_cast<uint4*>(q_out + o)[lane] = reinterpret_cast<const uint4*>(row)[lane];
+      reinterpret_cast<uint4*>(gate_out + o)[lane] = reinterpret_cast<const uint4*>(src + head_dim)[lane];
+    }
+    return;
+  }
+
+  // ---- k head: fp8 cache write of the rope'd k row and of the v row ----
+  const int slot = positions[t];
+  if (slot < 0) return;  // -1 = skip this padded token, as KvWritePagedFp8Kernel
+  const int block_id = slot / block_size;
+  const int offset = slot % block_size;
+  const int64_t base = static_cast<int64_t>(block_id) * kv_block_stride +
+                       static_cast<int64_t>(kh) * kv_head_stride +
+                       static_cast<int64_t>(offset) * (2 * head_dim);
+  const float kd_inv = 1.0f / k_descale[kh];
+  const float vd_inv = 1.0f / v_descale[kh];
+  const __hip_bfloat16* vv = v_in + (static_cast<int64_t>(t) * heads_k + kh) * head_dim;
+  for (int d = lane; d < head_dim; d += 32) {
+    kv_cache[base + d] = FloatToFp8E4M3(__bfloat162float(__ushort_as_bfloat16(row[d])) * kd_inv);
+    kv_cache[base + head_dim + d] = FloatToFp8E4M3(__bfloat162float(vv[d]) * vd_inv);
+  }
+}
+
 // ---- device argmax ------------------------------------------------------------------------
 // One block, grid-stride loop over `vocab` (kernels.h: ~1MB at this model's vocab, comfortably one
 // block's worth of work). Reduces (value, index) pairs together (not a separate max-then-search
@@ -682,6 +804,113 @@ __global__ __launch_bounds__(kThreads) void ArgmaxKernel(const float* __restrict
   if (threadIdx.x == 0) {
     out_idx[0] = best_i;
     if (out_val != nullptr) out_val[0] = best_v;
+  }
+}
+
+// ---- multi-workgroup argmax (decode-t1 item 1, docs/perf.md) ------------------------------------
+// ArgmaxKernel above is one workgroup looping over the whole row: ~970 dependent iterations per thread
+// at the 248 320-entry vocabulary, 0.13-0.19 ms (about 5 GB/s) on the decode critical path, and once per
+// draft step and per verify row of MTP/DFlash. The same answer, in two launches over many workgroups:
+//   pass 1 (ArgmaxPartialKernel, grid x = ceil(vocab / (kThreads * kArgmaxPerThread)) <= kArgmaxMaxBlocks,
+//           grid y = rows): each workgroup reduces a grid-stride slice of one row to one (value, index);
+//   pass 2 (ArgmaxFinalKernel, one workgroup per row): reduces that row's <= kArgmaxMaxBlocks partials.
+// The result is exactly ArgmaxKernel's, for every input including ties, -inf and NaN: both are the maximum,
+// under the total order "larger value first, then lower index", of the elements that compare greater than
+// the seed (-inf, 0) -- a NaN never compares greater, so it never wins; a row with no such element
+// (all -inf / NaN) gives index 0 -- and a maximum of a total order does not depend on how the elements
+// were partitioned or in which order the partials are combined. ArgmaxTake is that order's step; every
+// reduction below, like ArgmaxKernel's own warp/block tree, only ever applies it. The input is either
+// fp32 or bf16 (widened exactly, so the comparisons are the widened row's).
+// The partials live in a small per-stream device scratch (ArgmaxScratch below), written by pass 1 and
+// read by pass 2 of the same stream, so two streams never share one.
+constexpr int kArgmaxMaxBlocks = 256;  // pass 2 reduces one partial per thread
+constexpr int kArgmaxPerThread = 4;    // elements per thread in pass 1 at the smallest grid
+constexpr int kArgmaxMaxRows = 16;     // scratch rows (the widest verify window, GemmaModel's 16)
+
+__device__ __forceinline__ float ArgmaxLoad(const float* p, int64_t i) { return p[i]; }
+__device__ __forceinline__ float ArgmaxLoad(const __hip_bfloat16* p, int64_t i) {
+  return __bfloat162float(p[i]);
+}
+
+__device__ __forceinline__ void ArgmaxTake(float& best_v, int32_t& best_i, float v, int32_t i) {
+  if (v > best_v || (v == best_v && i < best_i)) {
+    best_v = v;
+    best_i = i;
+  }
+}
+
+// ArgmaxKernel's warp-then-block shuffle tree over (value, index) pairs, the result in every thread
+// of warp 0 (thread 0 is the one that stores it).
+__device__ __forceinline__ void ArgmaxBlockReduce(float& best_v, int32_t& best_i) {
+  __shared__ float red_v[kThreads / 32];
+  __shared__ int32_t red_i[kThreads / 32];
+  for (int o = 16; o; o >>= 1) {
+    const float ov = __shfl_xor(best_v, o, 32);
+    const int32_t oi = __shfl_xor(best_i, o, 32);
+    ArgmaxTake(best_v, best_i, ov, oi);
+  }
+  if ((threadIdx.x & 31) == 0) {
+    red_v[threadIdx.x >> 5] = best_v;
+    red_i[threadIdx.x >> 5] = best_i;
+  }
+  __syncthreads();
+  if (threadIdx.x < (blockDim.x + 31) / 32) {
+    best_v = red_v[threadIdx.x];
+    best_i = red_i[threadIdx.x];
+  } else {
+    best_v = -INFINITY;
+    best_i = 0;
+  }
+  if (threadIdx.x < 32) {
+    for (int o = 16; o; o >>= 1) {
+      const float ov = __shfl_xor(best_v, o, 32);
+      const int32_t oi = __shfl_xor(best_i, o, 32);
+      ArgmaxTake(best_v, best_i, ov, oi);
+    }
+  }
+}
+
+template <typename T>
+__global__ __launch_bounds__(kThreads) void ArgmaxPartialKernel(const T* __restrict__ logits,
+                                                                  int64_t row_stride,
+                                                                  float* __restrict__ part_v,
+                                                                  int32_t* __restrict__ part_i,
+                                                                  int64_t vocab) {
+  const T* row = logits + static_cast<int64_t>(blockIdx.y) * row_stride;
+  float best_v = -INFINITY;
+  int32_t best_i = 0;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * kThreads;
+#pragma unroll 4
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; i < vocab; i += stride) {
+    ArgmaxTake(best_v, best_i, ArgmaxLoad(row, i), static_cast<int32_t>(i));
+  }
+  ArgmaxBlockReduce(best_v, best_i);
+  if (threadIdx.x == 0) {
+    const int64_t slot = static_cast<int64_t>(blockIdx.y) * kArgmaxMaxBlocks + blockIdx.x;
+    part_v[slot] = best_v;
+    part_i[slot] = best_i;
+  }
+}
+
+// out_idx / out_val: row r's result at out_idx[r * out_idx_stride] / out_val[r * out_val_stride].
+__global__ __launch_bounds__(kThreads) void ArgmaxFinalKernel(const float* __restrict__ part_v,
+                                                                const int32_t* __restrict__ part_i,
+                                                                int nblocks,
+                                                                int32_t* __restrict__ out_idx,
+                                                                int64_t out_idx_stride,
+                                                                float* __restrict__ out_val,
+                                                                int64_t out_val_stride) {
+  const int64_t slot = static_cast<int64_t>(blockIdx.x) * kArgmaxMaxBlocks + threadIdx.x;
+  float best_v = -INFINITY;
+  int32_t best_i = 0;
+  if (static_cast<int>(threadIdx.x) < nblocks) {
+    best_v = part_v[slot];
+    best_i = part_i[slot];
+  }
+  ArgmaxBlockReduce(best_v, best_i);
+  if (threadIdx.x == 0) {
+    out_idx[static_cast<int64_t>(blockIdx.x) * out_idx_stride] = best_i;
+    if (out_val != nullptr) out_val[static_cast<int64_t>(blockIdx.x) * out_val_stride] = best_v;
   }
 }
 
@@ -1462,6 +1691,52 @@ __global__ __launch_bounds__(kThreads) void VisionPosEmbedKernel(
   }
 }
 
+// Per-stream partial scratch of the multi-workgroup argmax: [kArgmaxMaxRows][kArgmaxMaxBlocks] fp32
+// values then the same count of int32 indices. Keyed on the stream handle (the TP ranks, or an MTP head
+// and its model, may launch from different streams, even of one device, at the same time), allocated on
+// the stream's own device at its first argmax and never freed (a few KB per stream; freeing at static
+// destruction would run after the HIP runtime's own teardown).
+struct ArgmaxScratch {
+  float* v;
+  int32_t* i;
+};
+ArgmaxScratch GetArgmaxScratch(hipStream_t stream) {
+  static std::mutex mu;
+  static std::unordered_map<hipStream_t, void*> by_stream;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = by_stream.find(stream);
+  if (it == by_stream.end()) {
+    void* p = nullptr;
+    R4DX_HIP_CHECK(hipMalloc(&p, kArgmaxMaxRows * kArgmaxMaxBlocks * (sizeof(float) + sizeof(int32_t))));
+    it = by_stream.emplace(stream, p).first;
+  }
+  float* v = static_cast<float*>(it->second);
+  return {v, reinterpret_cast<int32_t*>(v + kArgmaxMaxRows * kArgmaxMaxBlocks)};
+}
+
+// rows rows of `vocab` entries (row r at logits + r * row_stride), result of row r at out_idx[r *
+// out_idx_stride] (and out_val[r * out_val_stride] when out_val is non-null).
+template <typename T>
+void LaunchArgmaxMulti(const T* logits, int64_t row_stride, int32_t* out_idx, int64_t out_idx_stride,
+                       float* out_val, int64_t out_val_stride, int rows, int64_t vocab,
+                       hipStream_t stream) {
+  if (rows <= 0 || vocab <= 0) return;
+  if (rows > kArgmaxMaxRows) {
+    throw std::runtime_error("r4dx argmax: at most " + std::to_string(kArgmaxMaxRows) +
+                             " rows per launch, got " + std::to_string(rows));
+  }
+  const int64_t per_block = static_cast<int64_t>(kThreads) * kArgmaxPerThread;
+  const int nblocks = static_cast<int>(std::min<int64_t>((vocab + per_block - 1) / per_block, kArgmaxMaxBlocks));
+  const ArgmaxScratch scratch = GetArgmaxScratch(stream);
+  CountLaunches(2);
+  hipLaunchKernelGGL(ArgmaxPartialKernel<T>, dim3(static_cast<unsigned>(nblocks), static_cast<unsigned>(rows)),
+                     dim3(kThreads), 0, stream, logits, row_stride, scratch.v, scratch.i, vocab);
+  R4DX_HIP_CHECK(hipGetLastError());
+  hipLaunchKernelGGL(ArgmaxFinalKernel, dim3(static_cast<unsigned>(rows)), dim3(kThreads), 0, stream,
+                     scratch.v, scratch.i, nblocks, out_idx, out_idx_stride, out_val, out_val_stride);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
 }  // namespace
 
 extern "C" {
@@ -1608,21 +1883,89 @@ void r4dx_kv_write_paged_fp8_hnd(int64_t k_new, int64_t v_new, int64_t slot_mapp
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
-void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
-  if (vocab <= 0) return;
+int r4dx_attn_precore_supported(int head_dim, int rotary_dim, int64_t qg, int64_t k, int64_t q_norm,
+                                 int64_t k_norm, int64_t q_out, int64_t gate_out) {
+  if (head_dim <= 0 || head_dim % 8 != 0 || head_dim > kPrecoreMaxHeadDim) return 0;
+  if (rotary_dim <= 0 || rotary_dim % 2 != 0 || rotary_dim > head_dim) return 0;
+  for (const int64_t p : {qg, k, q_norm, k_norm, q_out, gate_out}) {
+    if (p == 0 || p % 16 != 0) return 0;
+  }
+  return 1;
+}
+
+void r4dx_attn_precore_bf16(int64_t qg, int64_t k, int64_t v, int64_t q_norm, int64_t k_norm,
+                             int64_t positions, int64_t q_out, int64_t gate_out, int64_t k_descale,
+                             int64_t v_descale, int64_t kv_cache, int T, int heads_q, int heads_k,
+                             int head_dim, int rotary_dim, float theta, float eps, int block_size,
+                             int64_t kv_block_stride, int64_t kv_head_stride, int64_t stream) {
+  if (T <= 0 || heads_q <= 0 || heads_k <= 0) return;
+  if (!r4dx_attn_precore_supported(head_dim, rotary_dim, qg, k, q_norm, k_norm, q_out, gate_out)) {
+    throw std::runtime_error(
+        "r4dx_attn_precore_bf16: needs head_dim % 8 == 0 and <= 256, an even rotary_dim in "
+        "(0, head_dim], and 16-byte aligned qg / k / norm weights / q / gate (the one-launch chain is "
+        "the replaced kernels' vector path)");
+  }
   CountLaunches(1);
-  hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
-                     (const float*)logits, (int32_t*)out_idx, (float*)nullptr, vocab);
+  hipLaunchKernelGGL(AttnPrecoreKernel, dim3(static_cast<unsigned>(T), static_cast<unsigned>(heads_q + heads_k)),
+                     dim3(32), 0, (hipStream_t)stream, (const __hip_bfloat16*)qg,
+                     (const __hip_bfloat16*)k, (const __hip_bfloat16*)v, (const __hip_bfloat16*)q_norm,
+                     (const __hip_bfloat16*)k_norm, (const int32_t*)positions, (__hip_bfloat16*)q_out,
+                     (__hip_bfloat16*)gate_out, (const float*)k_descale, (const float*)v_descale,
+                     (uint8_t*)kv_cache, heads_q, heads_k, head_dim, rotary_dim, theta, eps, block_size,
+                     kv_block_stride, kv_head_stride);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 
-void r4dx_argmax_val_f32(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
-                          int64_t stream) {
+void r4dx_argmax_val_f32_single(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                                 int64_t stream) {
   if (vocab <= 0) return;
   CountLaunches(1);
   hipLaunchKernelGGL(ArgmaxKernel, dim3(1), dim3(kThreads), 0, (hipStream_t)stream,
                      (const float*)logits, (int32_t*)out_idx, (float*)out_val, vocab);
   R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_argmax_rows_f32(int64_t logits, int64_t row_stride, int64_t out_idx, int64_t out_val,
+                           int64_t out_stride, int64_t rows, int64_t vocab, int64_t stream) {
+  if (rows <= 0 || vocab <= 0) return;
+  if (r4dx::core::DecodeLegacy(r4dx::core::DecodeItem::kArgmax)) {
+    for (int64_t r = 0; r < rows; ++r) {
+      r4dx_argmax_val_f32_single(logits + r * row_stride * static_cast<int64_t>(sizeof(float)),
+                                  out_idx + r * out_stride * static_cast<int64_t>(sizeof(int32_t)),
+                                  out_val == 0 ? 0
+                                               : out_val + r * out_stride * static_cast<int64_t>(sizeof(float)),
+                                  vocab, stream);
+    }
+    return;
+  }
+  for (int64_t r0 = 0; r0 < rows; r0 += kArgmaxMaxRows) {  // more rows than the scratch holds: in groups
+    const int n = static_cast<int>(std::min<int64_t>(kArgmaxMaxRows, rows - r0));
+    LaunchArgmaxMulti<float>(
+        reinterpret_cast<const float*>(logits) + r0 * row_stride, row_stride,
+        reinterpret_cast<int32_t*>(out_idx) + r0 * out_stride, out_stride,
+        out_val == 0 ? nullptr : reinterpret_cast<float*>(out_val) + r0 * out_stride, out_stride, n, vocab,
+        (hipStream_t)stream);
+  }
+}
+
+void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
+  r4dx_argmax_rows_f32(logits, vocab, out_idx, /*out_val=*/0, /*out_stride=*/1, /*rows=*/1, vocab, stream);
+}
+
+void r4dx_argmax_val_f32(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                          int64_t stream) {
+  r4dx_argmax_rows_f32(logits, vocab, out_idx, out_val, /*out_stride=*/1, /*rows=*/1, vocab, stream);
+}
+
+void r4dx_argmax_val_bf16(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                           int64_t stream) {
+  LaunchArgmaxMulti<__hip_bfloat16>(reinterpret_cast<const __hip_bfloat16*>(logits), vocab,
+                                    reinterpret_cast<int32_t*>(out_idx), 1,
+                                    reinterpret_cast<float*>(out_val), 1, 1, vocab, (hipStream_t)stream);
+}
+
+void r4dx_argmax_bf16(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream) {
+  r4dx_argmax_val_bf16(logits, out_idx, /*out_val=*/0, vocab, stream);
 }
 
 void r4dx_embedding_gather_bf16(int64_t table, int64_t ids, int64_t out, int64_t n, int64_t hidden,

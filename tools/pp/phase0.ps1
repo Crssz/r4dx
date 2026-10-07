@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   Pipeline-parallel prefill, Phase 0 (docs/pp-prefill.md section 8): measure on BOTH GPUs what the design needs
@@ -123,8 +123,13 @@ function Start-Tool([string]$Exe, [string[]]$ArgList, [string]$Prefix, [hashtabl
     }
     try {
         $argLine = (($ArgList | ForEach-Object { Format-Arg $_ }) -join ' ')
-        return Start-Process -FilePath $Exe -ArgumentList $argLine -NoNewWindow -PassThru `
+        $p = Start-Process -FilePath $Exe -ArgumentList $argLine -NoNewWindow -PassThru `
             -RedirectStandardOutput "$Prefix.out.txt" -RedirectStandardError "$Prefix.log"
+        # Windows PowerShell 5.1: without this the process object never caches its handle and ExitCode reads back as
+        # $null after WaitForExit() -- every Wait-Tool would then see "failed", and the projection's GO / STOP exit
+        # code would be lost (`exit $null` is 0).
+        $null = $p.Handle
+        return $p
     } finally {
         foreach ($k in $EnvMap.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
     }
@@ -215,7 +220,8 @@ if ($UserPresent -and -not $SkipConcurrent) {
         Say 'resume: keeping conc_dev0/1.csv and hop_conc.csv'
     } else {
         $barrier = Join-Path $OutDir 'conc_barrier'
-        Remove-Item "$barrier.ready", "$barrier.go" -ErrorAction SilentlyContinue
+        # the stage benches use <barrier>0 / <barrier>1 (a stale .go from an interrupted run would release them early)
+        Remove-Item "${barrier}0.ready", "${barrier}0.go", "${barrier}1.ready", "${barrier}1.go" -ErrorAction SilentlyContinue
         Say 'BOTH-GPUS-BUSY phase: loading one model per card (each process waits at the barrier once loaded)'
         $pa = Start-Tool $stageExe @('--model', $Model, '--runs', $concRunsArg, '--out', $c0, '--barrier', "${barrier}0", '--device-note', 'physical device 0, both cards busy') (Join-Path $OutDir 'conc_dev0') @{ HIP_VISIBLE_DEVICES = '0' }
         $pb = Start-Tool $stageExe @('--model', $Model, '--runs', $concRunsArg, '--out', $c1, '--barrier', "${barrier}1", '--device-note', 'physical device 1, both cards busy') (Join-Path $OutDir 'conc_dev1') @{ HIP_VISIBLE_DEVICES = '1' }
@@ -232,7 +238,7 @@ if ($UserPresent -and -not $SkipConcurrent) {
         # the hop bench rides on top of the busy cards, a few seconds in (past the first chunks)
         Start-Sleep -Seconds 8
         foreach ($l in (Get-PcieLinks 'under load')) { $notes.Add($l); Say $l }
-        $ph = Start-Tool $hopExe @('--src', '0', '--dst', '1', '--reps', '30', '--duration', '6', '--mode', 'conc', '--out', $hopConc) (Join-Path $OutDir 'hop_conc') @{ HIP_VISIBLE_DEVICES = '0,1' }
+        $ph = Start-Tool $hopExe @('--src', '0', '--dst', '1', '--reps', '30', '--duration', '12', '--mode', 'conc', '--out', $hopConc) (Join-Path $OutDir 'hop_conc') @{ HIP_VISIBLE_DEVICES = '0,1' }
         Wait-Tool $ph 'tool_pp_hop_bench (concurrent)'
         Wait-Tool $pa 'tool_pp_stage_bench (concurrent, device 0)'
         Wait-Tool $pb 'tool_pp_stage_bench (concurrent, device 1)'
@@ -296,7 +302,7 @@ if (-not $SkipMtp) { $projArgs += @('--mtp-b', (Join-Path $OutDir 'mtp_dev1.csv'
 Say 'projection'
 $pp = Start-Tool $projExe $projArgs (Join-Path $OutDir 'project') @{ HIP_VISIBLE_DEVICES = '-1' }
 $pp.WaitForExit()
-$code = $pp.ExitCode
+$code = [int]$pp.ExitCode
 $summary = Join-Path $OutDir 'summary.txt'
 if (-not (Test-Path $summary)) {
     Set-Content -Path $summary -Value "PP phase 0: tool_pp_project failed (exit $code), see project.log in $OutDir" -Encoding utf8

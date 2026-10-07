@@ -13,7 +13,8 @@
 //
 // "Concurrent with compute": run it while two tool_pp_stage_bench processes (one per card) are mid-prefill
 // (tools: the Phase 0 script does) -- this tool queues only copies and holds ~100 MiB per device. --duration
-// repeats the whole sweep until that many seconds have passed (the median then covers the busy window).
+// repeats the whole sweep until that many seconds have passed, half of them per card order (the median then covers
+// the busy window).
 //
 // Output (--out): lines `hop,<dir>,<size label>,<bytes>,<leg>,<median_ms>,<GB/s>` read by tool_pp_project; dir is
 // d<src>to<dst> (visible ordinals), leg is d2h (on the source device), h2d (on the destination device), e2e
@@ -211,7 +212,10 @@ int RunTool(int argc, char** argv) {
         acc[si].pipe_h2d.insert(acc[si].pipe_h2d.end(), ph.begin(), ph.end());
       }
       ++sweeps;
-    } while ((NowMs() - t_begin) / 1000.0 < a.duration_s);
+      // --duration is split between the two card orders: each sweeps until its own half of it is up (a single clock
+      // from the tool's start would let the first order use it all and leave the second one a lone sweep, outside
+      // the busy window it is meant to cover).
+    } while ((NowMs() - t_begin) / 1000.0 < a.duration_s * static_cast<double>(order + 1) / 2.0);
 
     for (size_t si = 0; si < sizes.size(); ++si) {
       const Size& sz = sizes[si];

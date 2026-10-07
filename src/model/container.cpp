@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "nlohmann/json.hpp"
+#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY=ab (BuildGdnAb)
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"  // GemmTrellisTicketsBytes / GemmTrellisZeroTickets
@@ -42,6 +43,22 @@ ContainerLoadOptions MapTrellisHeads(const ContainerLoadOptions& o) {
   if (m.lm_head_layout == Layout::kTrellis) m.lm_head_layout = Layout::kW4a16;
   if (m.mtp_head_layout == Layout::kTrellis) m.mtp_head_layout = Layout::kW4a16;
   return m;
+}
+
+// decode-t1 item 2 (docs/perf.md): gdn.in_proj_a's rows then gdn.in_proj_b's as ONE bf16 [2H, hidden]
+// weight, so GdnLayer::Forward can run one r4d_gemm_bf16_nt_m64 launch with N = 2H instead of two with
+// N = H. The kernel's output column n is a fixed WMMA tile column reduced over the same K splits whatever
+// N is, and a / b rows start at a tile boundary or not -- columns never mix -- so every output element
+// is the bits the separate launches give. Skipped (the layer keeps two launches) under
+// R4DX_DECODE_LEGACY=ab, or when a or b is absent or they differ in size.
+void BuildGdnAb(GdnWeights& g) {
+  if (core::DecodeLegacy(core::DecodeItem::kAb)) return;
+  if (g.in_proj_a.empty() || g.in_proj_a.size() != g.in_proj_b.size()) return;
+  core::DeviceBuffer<uint16_t> ab(g.in_proj_a.size() + g.in_proj_b.size());
+  R4DX_HIP_CHECK(hipMemcpy(ab.data(), g.in_proj_a.data(), g.in_proj_a.bytes(), hipMemcpyDeviceToDevice));
+  R4DX_HIP_CHECK(hipMemcpy(ab.data() + g.in_proj_a.size(), g.in_proj_b.data(), g.in_proj_b.bytes(),
+                           hipMemcpyDeviceToDevice));
+  g.in_proj_ab = std::move(ab);
 }
 
 }  // namespace
@@ -211,6 +228,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       g.norm_weight = UploadWidenedF32(reader, base + "gdn.norm_weight");
       g.out_proj = LoadQuantLinearWithFallback(reader, meta,base + "gdn.out_proj", layout, hidden,
                                                 value_dim, &bf16_fallbacks);
+      BuildGdnAb(g);
       lw.gdn = std::move(g);
     } else {
       AttnWeights a;
@@ -525,6 +543,7 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
       gw.dt_bias = L.Raw<float>(base + "gdn.dt_bias");
       gw.norm_weight = L.WidenedF32(base + "gdn.norm_weight");
       gw.out_proj = L.Linear(base + "gdn.out_proj", o.layout, hidden, value_dim, &bf16_fallbacks);
+      BuildGdnAb(gw);
       lw.gdn = std::move(gw);
     } else {
       AttnWeights a;

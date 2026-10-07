@@ -109,28 +109,51 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     ApplyLinear(stream, arena, w_.in_proj_qkv, x_normed, mixed_qkv, T,
                 trellis_shared ? &trellis_in[0] : have_in_proj_pre ? &in_proj_pre : nullptr);
   });
-  uint16_t* a_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
   // in_proj_a/in_proj_b are plain bf16 linears (never quantized -- docs/r9700.md R1: "too small to
   // matter, feed the decay path -- leave them bf16"), so they go straight through the bf16 GEMM
   // rather than through ApplyLinear's QuantLinear dispatch.
   // The bf16 GEMM takes at most 64 rows per launch (a row's bits do not depend on the other rows or on
   // M): a 256-row prefill super-chunk runs it as 64-row slices, exactly the launches four 64-row chunks
   // would make, whatever GdnLayerParams::seq_slice says.
-  ProfiledCall(prof, s, "gemm:gdn.in_proj_a", [&] {
-    for (int64_t m0 = 0; m0 < T; m0 += 64) {
-      core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_a.data(), a_buf + m0 * H,
-                                static_cast<int>(std::min<int64_t>(64, T - m0)),
-                                static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
-    }
-  });
-  uint16_t* b_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
-  ProfiledCall(prof, s, "gemm:gdn.in_proj_b", [&] {
-    for (int64_t m0 = 0; m0 < T; m0 += 64) {
-      core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_b.data(), b_buf + m0 * H,
-                                static_cast<int>(std::min<int64_t>(64, T - m0)),
-                                static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
-    }
-  });
+  // decode-t1 item 2 (docs/perf.md): one launch over the concatenated [a; b] weight (Container's
+  // BuildGdnAb) with N = 2H -- output row t is [a_t (H), b_t (H)], so the consumers below read a at
+  // ab_buf and b at ab_buf + H with a row stride of 2H -- instead of two N = H launches. Every output
+  // column is the same bits (the GEMM's per-column reduction does not depend on N), so a and b are the
+  // separate launches' bytes. R4DX_DECODE_LEGACY=ab (or a container without the merged weight) keeps
+  // the two launches, with the original compact [T, H] buffers.
+  const bool ab_merged = !w_.in_proj_ab.empty() && w_.in_proj_ab.size() == 2 * w_.in_proj_a.size();
+  const int64_t ab_stride = ab_merged ? 2 * H : H;
+  uint16_t* a_buf = nullptr;
+  uint16_t* b_buf = nullptr;
+  if (ab_merged) {
+    uint16_t* ab_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * 2 * H));
+    ProfiledCall(prof, s, "gemm:gdn.in_proj_ab", [&] {
+      for (int64_t m0 = 0; m0 < T; m0 += 64) {
+        core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_ab.data(), ab_buf + m0 * 2 * H,
+                                  static_cast<int>(std::min<int64_t>(64, T - m0)),
+                                  static_cast<int>(hidden), static_cast<int>(2 * H), 4, 4, 1, s);
+      }
+    });
+    a_buf = ab_buf;
+    b_buf = ab_buf + H;
+  } else {
+    a_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
+    ProfiledCall(prof, s, "gemm:gdn.in_proj_a", [&] {
+      for (int64_t m0 = 0; m0 < T; m0 += 64) {
+        core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_a.data(), a_buf + m0 * H,
+                                  static_cast<int>(std::min<int64_t>(64, T - m0)),
+                                  static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+      }
+    });
+    b_buf = arena.Alloc<uint16_t>(static_cast<size_t>(T * H));
+    ProfiledCall(prof, s, "gemm:gdn.in_proj_b", [&] {
+      for (int64_t m0 = 0; m0 < T; m0 += 64) {
+        core::r4d::GemmBf16NtM64(x_normed + m0 * hidden, w_.in_proj_b.data(), b_buf + m0 * H,
+                                  static_cast<int>(std::min<int64_t>(64, T - m0)),
+                                  static_cast<int>(hidden), static_cast<int>(H), 4, 4, 1, s);
+      }
+    });
+  }
   // in_proj_z (R1, docs/r9700.md): now dispatched through ApplyLinear like in_proj_qkv/out_proj --
   // 3.02 GB/token of what used to be a forced-bf16 GEMM, now eligible for a quantized layout. Reuses
   // the SAME fused rmsnorm epilogue as in_proj_qkv above WHEN both weights agree on layout (the
@@ -198,8 +221,8 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
         conv_prep(mixed_qkv + r0 * conv_dim, conv_dim, w_.conv1d_weight.data(),
                   /*bias=*/nullptr, states.ConvBase(), states.ConvSeqStride(),
                   states.ConvDimStride(), states.ConvTokStride(), cache_idx_dev,
-                  /*ci_stride=*/1, has_init_dev, a_buf + r0 * H, b_buf + r0 * H,
-                  /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
+                  /*ci_stride=*/1, has_init_dev, a_buf + r0 * ab_stride, b_buf + r0 * ab_stride,
+                  ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
                   w_.dt_bias.data(), q_buf + r0 * Hg * K, k_buf + r0 * Hg * K,
                   v_buf + r0 * H * V, g_buf + r0 * H, beta_buf + r0 * H, cu_dev,
                   /*N=*/1, ts, H, Hg, K, V, static_cast<int>(width), kSoftplusThr, s);
@@ -266,7 +289,7 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
 
     ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
       core::r4d::GdnRecurrentUpdate(
-          q_buf, k_buf, v_buf, a_buf, b_buf, /*ab_stride=*/H, /*ab_is_bf16=*/1, w_.A_log.data(),
+          q_buf, k_buf, v_buf, a_buf, b_buf, ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
           w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
           states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
           /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,

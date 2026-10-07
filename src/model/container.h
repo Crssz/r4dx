@@ -64,6 +64,11 @@ struct GdnWeights {
   core::DeviceBuffer<uint16_t> in_proj_b, in_proj_a;  // bf16 [num_v_heads, hidden] -- deliberately
                                                      // left bf16 (docs/r9700.md R1: "too small to
                                                      // matter, feed the decay path")
+  // decode-t1 item 2 (docs/perf.md): in_proj_a's rows then in_proj_b's, bf16 [2 * num_v_heads, hidden],
+  // built once at load (BuildGdnAb) so GdnLayer runs the one bf16 GEMM with N = 2 * num_v_heads instead
+  // of two launches. A column's reduction does not depend on N (r4d_gemm_bf16_nt_m64 doc comment), so
+  // each output is the same bits. Empty when a or b is absent or they differ in size.
+  core::DeviceBuffer<uint16_t> in_proj_ab;
   core::DeviceBuffer<uint16_t> conv1d_weight;       // bf16 [conv_dim, width] (container's
                                                      // trailing singleton axis dropped)
   core::DeviceBuffer<float> A_log, dt_bias;         // fp32 [num_v_heads]

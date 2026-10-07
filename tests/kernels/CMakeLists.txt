@@ -78,6 +78,7 @@ set(R4DX_KERNEL_TESTS
   # N = 2H GEMM against two N = H, and the one-launch attention pre-core chain against split_qg + qk_norm +
   # rope + kv_write. GPU tests written, NOT yet run (CPU-only build session): `ctest -R
   # "argmax_multi|gdn_ab_merge|attn_precore"`. test_argmax_multi returns 77 under R4DX_DECODE_LEGACY=argmax.
+  test_gdn_ab_merge
   test_attn_precore
 )
 

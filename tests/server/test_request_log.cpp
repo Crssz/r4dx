@@ -244,6 +244,157 @@ void TestIso8601() {
   }
 }
 
+std::string Slurp(const std::filesystem::path& p);
+std::vector<std::string> Lines(const std::string& s);
+
+// A request logged under --request-log-tokens: a 6-token prompt, 5 generated tokens, two DFlash rounds.
+RequestLogRecord TokenRecord(std::vector<int32_t> prompt, std::vector<int32_t> generated) {
+  RequestLogRecord r = FullRecord();
+  r.tokens.emplace();
+  r.tokens->prompt_ids = std::move(prompt);
+  r.tokens->generated_ids = std::move(generated);
+  r.tokens->round_drafted = {7, 5};
+  r.tokens->round_accepted = {3, 0};
+  r.tokens->draft_k = 7;
+  r.tokens->top_p = 0.95;
+  r.tokens->top_k = 20;
+  r.tokens->min_p = 0.0;
+  return r;
+}
+
+std::vector<int32_t> Ints(const json& a) {
+  std::vector<int32_t> v;
+  for (const json& x : a) v.push_back(x.get<int32_t>());
+  return v;
+}
+
+void TestTokensFormat() {
+  // Absent (the default): not one extra key, and no id array anywhere in the line.
+  const std::string plain = FormatRequestLogLine(FullRecord());
+  CHECK(plain.find("prompt_ids") == std::string::npos && plain.find("generated_ids") == std::string::npos);
+
+  RequestLogRecord r = TokenRecord({10, 11, 12, 13, 14, 15}, {20, 21, 22, 23, 24});
+  r.tokens->seed = 1234567890123ULL;
+  std::string line = FormatRequestLogLine(r);
+  CHECK(line.find('\n') == std::string::npos && line.back() == '}');
+  json j = json::parse(line);
+  CHECK(j.size() == kKeys.size() + 10, "line has %zu keys", j.size());
+  for (const std::string& k : kKeys) CHECK(j.contains(k), "the fixed key %s is kept", k.c_str());
+  CHECK(j["prompt_ids"] == json::array({10, 11, 12, 13, 14, 15}) && j["prompt_shared"] == 0);
+  CHECK(j["generated_ids"] == json::array({20, 21, 22, 23, 24}));
+  CHECK(j["round_drafted"] == json::array({7, 5}) && j["round_accepted"] == json::array({3, 0}));
+  CHECK(j["draft_k"] == 7 && j["top_p"] == 0.95 && j["top_k"] == 20 && j["min_p"] == 0.0);
+  CHECK(j["seed"] == 1234567890123ULL);
+  // The token keys come after every fixed one, in a fixed order.
+  size_t pos = line.find("\"image_ms\":");
+  for (const char* k : {"draft_k", "top_p", "top_k", "min_p", "seed", "prompt_shared", "prompt_ids", "generated_ids",
+                        "round_drafted", "round_accepted"}) {
+    const size_t at = line.find(std::string("\"") + k + "\":", pos);
+    CHECK(at != std::string::npos, "token key %s missing or out of order", k);
+    if (at == std::string::npos) break;
+    pos = at;
+  }
+
+  // prompt_shared drops that many leading prompt ids from the line (clamped to the prompt's length).
+  r.tokens->prompt_shared = 4;
+  j = json::parse(FormatRequestLogLine(r));
+  CHECK(j["prompt_shared"] == 4 && j["prompt_ids"] == json::array({14, 15}));
+  r.tokens->prompt_shared = 99;
+  j = json::parse(FormatRequestLogLine(r));
+  CHECK(j["prompt_shared"] == 6 && j["prompt_ids"].empty());
+
+  // A request with no speculation and a random seed: empty round arrays, nulls, still valid JSON.
+  RequestLogRecord n = TokenRecord({1}, {});
+  n.tokens->round_drafted.clear();
+  n.tokens->round_accepted.clear();
+  n.tokens->draft_k.reset();
+  j = json::parse(FormatRequestLogLine(n));
+  CHECK(j["generated_ids"].empty() && j["round_accepted"].empty() && j["draft_k"].is_null() && j["seed"].is_null());
+}
+
+// The writer measures each token-carrying line against the previous one's prompt + generated ids.
+void TestTokensWriterDeltaChain() {
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "r4dx_request_log_test_tok";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::filesystem::path file = dir / "tok.jsonl";
+  std::string err;
+  const std::vector<int32_t> p1 = {1, 2, 3, 4, 5, 6};
+  const std::vector<int32_t> g1 = {7, 8, 9};
+  // 2: prompt 1 + generated 1 + new tokens (the common agent shape); 3: diverges inside prompt 2;
+  // 4: unrelated, after a line that carries no tokens; 5: the same prompt again (the shared part is
+  // capped by the shorter side, here the prompt), 6: the first line of a restarted server.
+  const std::vector<int32_t> p2 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 30, 31};
+  const std::vector<int32_t> g2 = {32, 33};
+  const std::vector<int32_t> p3 = {1, 2, 3, 4, 5, 6, 7, 8, 9, 30, 99, 98};
+  const std::vector<int32_t> p4 = {500, 501};
+  {
+    auto log = RequestLog::Open(file.string(), &err);
+    CHECK(log != nullptr, "%s", err.c_str());
+    if (!log) return;
+    log->Write(TokenRecord(p1, g1));
+    log->Write(TokenRecord(p2, g2));
+    log->Write(TokenRecord(p3, {}));
+    log->Write(FullRecord());  // a reject / token-less line in between must not disturb the chain
+    log->Write(TokenRecord(p4, {1}));
+    log->Write(TokenRecord(p4, {1}));
+    CHECK(log->lines_written() == 6 && log->write_failures() == 0);
+  }
+  {
+    auto log = RequestLog::Open(file.string(), &err);  // a restart: the first line of the run is whole again
+    CHECK(log != nullptr);
+    if (!log) return;
+    log->Write(TokenRecord(p4, {1}));
+  }
+  const auto lines = Lines(Slurp(file));
+  CHECK(lines.size() == 7, "got %zu lines", lines.size());
+  if (lines.size() != 7) return;
+  const std::vector<size_t> shared = {0, 9, 10, SIZE_MAX, 0, 2, 0};  // line 3 carries no tokens
+  // Replay it the way tools/ngram/sim_ngram.py does.
+  std::vector<int32_t> prev;
+  const std::vector<std::vector<int32_t>> want_prompt = {p1, p2, p3, {}, p4, p4, p4};
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const json j = json::parse(lines[i]);
+    if (shared[i] == SIZE_MAX) {
+      CHECK(!j.contains("prompt_ids"));
+      continue;
+    }
+    const size_t sh = j["prompt_shared"].get<size_t>();
+    CHECK(sh == shared[i], "line %zu: prompt_shared %zu", i, sh);
+    std::vector<int32_t> prompt(prev.begin(), prev.begin() + static_cast<ptrdiff_t>(sh));
+    const std::vector<int32_t> tail = Ints(j["prompt_ids"]);
+    prompt.insert(prompt.end(), tail.begin(), tail.end());
+    CHECK(prompt == want_prompt[i], "line %zu: rebuilt prompt differs", i);
+    prev = prompt;
+    const std::vector<int32_t> gen = Ints(j["generated_ids"]);
+    prev.insert(prev.end(), gen.begin(), gen.end());
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// A failed write leaves no usable previous line: the next token line must carry its whole prompt.
+void TestTokensWriteFailureResetsChain() {
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "r4dx_request_log_test_tokfail";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::filesystem::path file = dir / "ro.jsonl";
+  { std::ofstream(file, std::ios::binary) << "existing\n"; }
+  std::FILE* ro = std::fopen(file.string().c_str(), "rb");
+  CHECK(ro != nullptr);
+  if (!ro) return;
+  auto log = RequestLog::FromStream(ro, file.string());
+  bool threw = false;
+  try {
+    for (int i = 0; i < 2; ++i) log->Write(TokenRecord({1, 2, 3}, {4}));
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(!threw && log->write_failures() == 2 && log->lines_written() == 0);
+  log.reset();
+  CHECK(Slurp(file) == "existing\n");
+  std::filesystem::remove_all(dir);
+}
+
 std::string Slurp(const std::filesystem::path& p) {
   std::ifstream f(p, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
@@ -380,6 +531,9 @@ int main() {
   TestWriterAppendsWithoutBomAndTruncation();
   TestWriteFailureIsCountedNotFatal();
   TestConcurrentWritersKeepLinesWhole();
+  TestTokensFormat();
+  TestTokensWriterDeltaChain();
+  TestTokensWriteFailureResetsChain();
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);
     return 1;

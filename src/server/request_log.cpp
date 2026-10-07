@@ -1,6 +1,8 @@
 #include "request_log.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -47,6 +49,18 @@ OJson Opt(const std::optional<T>& v) {
   return v ? OJson(*v) : OJson(nullptr);
 }
 OJson OptMs(const std::optional<double>& v) { return v ? OJson(Round(*v, 1000.0)) : OJson(nullptr); }
+
+// `[1,2,3]` / `[]` appended to `out`: std::to_chars, no locale, no allocation per number.
+void AppendIntArray(std::string& out, const int32_t* v, size_t n) {
+  out += '[';
+  char buf[16];
+  for (size_t i = 0; i < n; ++i) {
+    if (i != 0) out += ',';
+    const auto r = std::to_chars(buf, buf + sizeof(buf), v[i]);
+    out.append(buf, r.ptr);
+  }
+  out += ']';
+}
 
 std::FILE* OpenAppend(const std::string& path) {
   // The path arrives as argv does: narrow, in the process's own code page on Windows (which is what
@@ -121,8 +135,36 @@ std::string FormatRequestLogLine(const RequestLogRecord& rec) {
   o["restore_ms"] = OptMs(rec.restore_ms);
   o["image_n"] = Opt(rec.image_n);
   o["image_ms"] = OptMs(rec.image_ms);
+  // --request-log-tokens: the scalars join the object (so they get the same escaping and number
+  // formatting), the long id arrays are appended by hand below -- a 200k-token prompt is not worth a
+  // JSON DOM of 200k numbers.
+  if (rec.tokens) {
+    const RequestLogTokens& t = *rec.tokens;
+    o["draft_k"] = Opt(t.draft_k);
+    o["top_p"] = t.top_p ? OJson(Round(*t.top_p, 1e6)) : OJson(nullptr);
+    o["top_k"] = Opt(t.top_k);
+    o["min_p"] = t.min_p ? OJson(Round(*t.min_p, 1e6)) : OJson(nullptr);
+    o["seed"] = Opt(t.seed);
+    o["prompt_shared"] = std::min(t.prompt_shared, t.prompt_ids.size());
+  }
   // `replace`: nothing written here is caller text, but a dump must never throw on a stray byte.
-  return o.dump(-1, ' ', false, OJson::error_handler_t::replace);
+  std::string line = o.dump(-1, ' ', false, OJson::error_handler_t::replace);
+  if (rec.tokens) {
+    const RequestLogTokens& t = *rec.tokens;
+    const size_t shared = std::min(t.prompt_shared, t.prompt_ids.size());
+    line.pop_back();  // the closing '}'
+    line.reserve(line.size() + (t.prompt_ids.size() - shared + t.generated_ids.size()) * 8 + 256);
+    line += ",\"prompt_ids\":";
+    AppendIntArray(line, t.prompt_ids.data() + shared, t.prompt_ids.size() - shared);
+    line += ",\"generated_ids\":";
+    AppendIntArray(line, t.generated_ids.data(), t.generated_ids.size());
+    line += ",\"round_drafted\":";
+    AppendIntArray(line, t.round_drafted.data(), t.round_drafted.size());
+    line += ",\"round_accepted\":";
+    AppendIntArray(line, t.round_accepted.data(), t.round_accepted.size());
+    line += '}';
+  }
+  return line;
 }
 
 std::string FormatIso8601(const std::tm& local, int utc_offset_minutes, int millis) {
@@ -182,10 +224,29 @@ RequestLog::~RequestLog() {
 void RequestLog::Write(RequestLogRecord rec) noexcept {
   try {
     if (rec.timestamp.empty()) rec.timestamp = LocalIso8601Now();
+    // A token-carrying line is measured against the previous one, so it formats under the lock (only
+    // the engine's worker writes those; the HTTP threads' reject lines carry none and stay outside).
+    std::unique_lock<std::mutex> lock(mu_, std::defer_lock);
+    if (rec.tokens) {
+      lock.lock();
+      const auto& prev = last_tokens_;
+      const auto& cur = rec.tokens->prompt_ids;
+      rec.tokens->prompt_shared = static_cast<size_t>(
+          std::mismatch(prev.begin(), prev.begin() + static_cast<ptrdiff_t>(std::min(prev.size(), cur.size())), cur.begin())
+              .first - prev.begin());
+    }
     std::string line = FormatRequestLogLine(rec);
     line += '\n';
-    std::lock_guard<std::mutex> lock(mu_);
+    if (!lock.owns_lock()) lock.lock();
     const bool ok = std::fwrite(line.data(), 1, line.size(), file_) == line.size() && std::fflush(file_) == 0;
+    if (rec.tokens) {
+      // A failed write may have left half a line: the next one then carries its whole prompt.
+      last_tokens_.clear();
+      if (ok) {
+        last_tokens_ = std::move(rec.tokens->prompt_ids);
+        last_tokens_.insert(last_tokens_.end(), rec.tokens->generated_ids.begin(), rec.tokens->generated_ids.end());
+      }
+    }
     if (ok) {
       ++lines_written_;
       return;

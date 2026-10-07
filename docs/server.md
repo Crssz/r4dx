@@ -1299,7 +1299,7 @@ r4dx-server --model <container.r4dx> --layout {trellis|w4a16|bf16}
     [--embed-device-resident {on|off}] [--prompt-checkpoint {on|off}]
     [--dflash <draft.r4dx>] [--dflash-k N]
     [--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}]
-    [--image-max-pixels N] [--request-log <path>]
+    [--image-max-pixels N] [--request-log <path>] [--request-log-tokens]
     [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
     [--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N]
     [--tp-max-inflight K]
@@ -1341,6 +1341,11 @@ follow-up whose replayed reply does not re-tokenize still reuses the prompt befo
 `--request-log <path>` (default: off): append one JSON line per request -- token counts and timings
 only -- to `<path>`; see "Request log" below. Omitting the flag changes nothing at all.
 
+`--request-log-tokens` (default: off; needs `--request-log`): also write each request's prompt and
+generated token ids and its per-round speculative acceptance into that file, to replay the traffic
+offline ("Token capture" below). **The file then holds the user's prompts and the model's answers as
+token ids** (invertible with the tokenizer): keep it local.
+
 `--tokenizer-dir` defaults to `E:\models\Huihui-Qwen3.8-27B-abliterated`, same as `r4dx-cli` (its
 `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json` are
 byte-identical to the base Qwen3.8-27B's, whose `C:\AI\models\Qwen3.8-27B` was the default until
@@ -1366,10 +1371,10 @@ prompt was, how much of it the prefix cache saved, and what the prefill and deco
 r4dx-server --model <container> --layout trellis --request-log D:\logs\r4dx-requests.jsonl
 ```
 
-**What is (not) written.** Token counts and timings only. The record type has no field that could
-carry message text, tool definitions or arguments, file contents, a prompt or a completion, and its
-only strings are the server-generated request id, the endpoint name, the finish reason and the
-speculation mode. The file is opened for **append** (created when missing, never truncated, so a
+**What is (not) written.** Token counts and timings only, unless `--request-log-tokens` is also given
+("Token capture" below). The record type has no field that could carry message text, tool definitions
+or arguments, file contents, a prompt or a completion, and its only strings are the server-generated
+request id, the endpoint name, the finish reason and the speculation mode. The file is opened for **append** (created when missing, never truncated, so a
 restart keeps adding to it), UTF-8 **without BOM**, every line ends in a bare `\n`, and each line is
 `fflush`ed, so `Get-Content -Wait` can follow it. If the file cannot be opened the server prints
 `error: cannot open request log '...' for append: <reason>` and exits 1 **before** loading the model.
@@ -1428,6 +1433,49 @@ of 51 prompt tokens, a client that dropped mid-stream, and a rejected body):
 Reading it with PowerShell: `Get-Content D:\logs\r4dx-requests.jsonl | ForEach-Object { $_ | ConvertFrom-Json } |
 Where-Object endpoint -eq 'chat/completions' | Measure-Object prompt_tokens, prompt_n, cached_tokens -Sum`
 (the cache saving is `sum(cached_tokens) / sum(prompt_tokens)`).
+
+### Token capture (`--request-log-tokens`)
+
+Off by default, and only legal next to `--request-log`. It exists to answer questions that need the
+text of the traffic, not just its sizes -- the first one being whether an n-gram (prompt-lookup)
+drafter in front of DFlash would pay (`tools/ngram/`, which replays this file). With the flag, a
+request that got as far as a tokenized prompt gets ten more keys at the **end** of its line, after
+`image_ms`; every other key, the order of the first 33 and the lines of requests that never reached
+the engine are unchanged. Without the flag none of this is collected: the decode loops hold a null
+pointer, no id is copied, and no output, timing path or scheduling changes (`test_http_server`'s
+`RequestLogTokensScenario` compares the responses with the flag on and off byte for byte, ids,
+`created` and timings masked). Nothing new runs on the GPU and no extra synchronisation is added: the
+ids are host vectors the engine already has (`full_tokens_i32`, `generated_tokens`, each round's
+returned vector).
+
+> **Privacy.** The prompt and completion ids are the user's code and conversation in another
+> encoding: `tokenizer.decode` returns the text. Keep the file on the local disk, do not attach it to
+> a bug report, and delete it when the study is done. Without this flag the file never holds text.
+
+| field | meaning |
+|---|---|
+| `draft_k` | the per-round draft cap the server ran with (`--dflash-k` / `--mtp`); `null` at `speculative: "none"` |
+| `top_p`, `top_k`, `min_p`, `seed` | the request's other sampling parameters as resolved (`temperature` is a fixed key above); `seed` is `null` when the request gave none |
+| `prompt_shared` | how many leading prompt ids this line leaves out because they equal the **previous token-carrying line's** `prompt_ids + generated_ids` (see below); `0` = the line carries its whole prompt |
+| `prompt_ids` | the prompt the model saw, from index `prompt_shared` on: chat template applied, image tokens expanded, **the whole context** -- not only the part prefill had to feed (`prompt_n`) |
+| `generated_ids` | the tokens shown to the client (`completion_tokens` of them, reasoning included). An EOS that ended the generation is not among them; a request that failed after its prompt was tokenized has `[]` |
+| `round_drafted`, `round_accepted` | one entry per speculative verify round (`[]` at `speculative: "none"`): draft tokens proposed and draft tokens accepted. A round emits `accepted + 1` tokens. The first generated token comes from the prefill's logits and belongs to no round, so `1 + sum(accepted + 1)` is `completion_tokens`, or a little more when the last round was cut by `max_tokens`, a `stop` string or an EOS. For `dflash`, `drafted` is the round's walk length (`--dflash-p-min` / `--dflash-n-min` can shorten it); for `mtp` it is `draft_k` |
+
+**Why `prompt_shared`.** An agent resends the whole conversation each turn, so request N+1's prompt is
+request N's prompt, N's reply and a new tool result: logging every prompt in full would write the same
+100k ids again and again. The writer therefore compares each prompt with the previous token-carrying
+line's `prompt_ids + generated_ids` and stores only what follows the common prefix. To rebuild line
+N+1's prompt: `(prev_prompt + prev_generated)[:prompt_shared] + prompt_ids`, where `prev_*` are the
+rebuilt lists of the previous line that has a `prompt_ids` key (lines without one, such as a rejected
+request, are skipped). The first line of a file, of a server run (the file is appended to) and the
+first line after a failed write carry `prompt_shared: 0`. A reader that finds a torn line (server
+killed mid-write) must treat the chain as broken until the next `prompt_shared: 0`;
+`tools/ngram/sim_ngram.py` does. `tools/ngram/README.md` has the replay.
+
+Size: about 6-7 bytes per id, and for an agent that extends its conversation only the new tail plus
+the reply per request, i.e. typically a few thousand ids (tens of KB) a request after the first.
+Writing a line costs one host-side pass over the ids on the worker thread after the response has been
+handed off, a few milliseconds for a 100k-token prompt (the next request waits for it).
 
 **Measured on the smoke (2026-09-30, `E:\models\r4dx\reqlog\smoke`):** the same 7 greedy requests (plain
 chat, a stream with `include_usage`, `reasoning_effort: "high"`, the two turns of one conversation, a
@@ -1495,8 +1543,8 @@ and "Images"), `test_tool_call_parser` (see
 content" property over every chunking of a dozen representative generations),
 `test_reasoning_splitter` (the `</think>` split), `test_request_log` (the request log's JSON Lines
 formatting and field order, `null` for unknowns, the ISO-8601 stamp, append without BOM or CRLF, an
-unopenable path, a failing stream, concurrent writers; `test_server_args` covers the flag itself; see
-"Request log"), `test_engine_recovery` (the engine's error and
+unopenable path, a failing stream, concurrent writers, the `--request-log-tokens` keys and their
+`prompt_shared` delta chain; `test_server_args` covers the flags themselves; see "Request log"), `test_engine_recovery` (the engine's error and
 recovery path through `engine.cpp` itself, against CPU fakes of the tensor-parallel model's state
 machine and of the TP=1 model, where a skipped `Reset()` would silently reuse a failed request's
 state; `CheckpointScenario` and `CheckpointThinkingScenario` drive `--prompt-checkpoint`'s restore
@@ -1509,7 +1557,10 @@ and through plain decode, and checks that streamed and non-streamed content agre
 charset-honouring client reads them. Its `RequestLogScenario` runs seven requests against a server
 with and without `--request-log`: equal responses (id/created/timings masked), seven lines whose
 token counts equal the responses' own `usage`/`timings`, `cached_tokens > 0` on a follow-up, the two
-rejected bodies logged as 400, and none of the prompt text in the file; `test_engine_recovery`'s
+rejected bodies logged as 400, and none of the prompt text in the file (nor any token id without
+`--request-log-tokens`; its `RequestLogTokensScenario` replays three requests against a scripted
+`--mtp 3` model and rebuilds their prompts, generated ids and per-round acceptance from the file);
+`test_engine_recovery`'s
 `RequestLogFaultScenario` checks that a mid-decode fault logs one 500 line and the recovery request
 `full_reset`. Same GPU-free setup and skip as `test_engine_recovery`, except
 that it checks `http_server.h`'s two content-type constants before the skip, so a revert to a bare

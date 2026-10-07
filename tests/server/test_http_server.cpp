@@ -180,12 +180,13 @@ class LiveServer {
  public:
   // `request_log_path` non-empty: the server runs with `--request-log <path>` (RequestLogScenario).
   LiveServer(const std::string& tokenizer_dir, std::vector<int32_t> script, std::vector<int64_t> round_sizes,
-             const std::string& request_log_path = "") {
+             const std::string& request_log_path = "", bool request_log_tokens = false) {
     r4dx::server::EngineOptions opts;
     if (!request_log_path.empty()) {
       std::string err;
       opts.request_log = r4dx::server::RequestLog::Open(request_log_path, &err);
       if (!opts.request_log) throw std::runtime_error(err);
+      opts.request_log_tokens = request_log_tokens;  // --request-log-tokens (RequestLogTokensScenario)
     }
     opts.tokenizer_dir = tokenizer_dir;
     opts.model_opts.max_ctx = 4096;
@@ -616,6 +617,140 @@ void RequestLogScenario(const std::string& tokenizer_dir, const std::vector<int3
                 static_cast<long long>(lines[4]["cached_tokens"].get<int64_t>()),
                 static_cast<long long>(lines[4]["prompt_tokens"].get<int64_t>()));
   }
+  CHECK(raw.find("prompt_ids") == std::string::npos && raw.find("generated_ids") == std::string::npos,
+        "without --request-log-tokens the file holds no token ids");
+  std::filesystem::remove_all(dir);
+}
+
+// ---- --request-log-tokens (docs/server.md "Request log" > "Token capture") -------------------------
+
+std::vector<int32_t> JsonInts(const nlohmann::json& a) {
+  std::vector<int32_t> v;
+  for (const nlohmann::json& x : a) v.push_back(x.get<int32_t>());
+  return v;
+}
+
+// Three greedy requests against a scripted --mtp 3 model with rounds of 3, 1, 4, 2 tokens: a completion,
+// a second completion extending it (prefix reuse), and a chat. Checks the logged ids against what the
+// tokenizer and the script say, the per-round numbers against the script's round sizes, the replay of
+// prompt_shared the way tools/ngram/sim_ngram.py does it, and that the flag changes no response byte.
+void RequestLogTokensScenario(const std::string& tokenizer_dir, const std::vector<int32_t>& script,
+                              const r4dx::Tokenizer& tok) {
+  const int failures_before = g_failures;
+  const std::filesystem::path dir = std::filesystem::temp_directory_path() / "r4dx_http_request_log_tokens_test";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string with_path = (dir / "with.jsonl").string();
+  const std::string without_path = (dir / "without.jsonl").string();
+  const std::vector<int64_t> rounds = {3, 1, 4, 2};
+  const std::string p1 = "12 plus 30 is\n";
+
+  auto run = [&](const std::string& log_path, bool tokens, std::vector<Exchange>* out) {
+    LiveServer server(tokenizer_dir, script, rounds, log_path, tokens);
+    httplib::Client cli = server.Client();
+    auto post = [&](const char* path, const nlohmann::json& body) {
+      Exchange e;
+      e.path = path;
+      e.body = body.dump();
+      const auto r = cli.Post(path, e.body, "application/json");
+      e.status = r ? r->status : -1;
+      e.response = r ? r->body : "";
+      out->push_back(e);
+    };
+    post("/v1/completions", {{"prompt", p1}, {"max_tokens", 8}, {"temperature", 0}});
+    // The second prompt is the first plus what the fake generated for it, so it extends the state.
+    const std::string first_text = nlohmann::json::parse((*out)[0].response)["choices"][0]["text"].get<std::string>();
+    post("/v1/completions", {{"prompt", p1 + first_text + " more"}, {"max_tokens", 5}, {"temperature", 0}, {"top_p", 0.5}});
+    post("/v1/chat/completions",
+         {{"messages", {{{"role", "user"}, {"content", "hi"}}}}, {"max_tokens", 6}, {"temperature", 0}, {"seed", 42}});
+  };
+  std::vector<Exchange> off, on;
+  run(without_path, false, &off);
+  run(with_path, true, &on);
+
+  CHECK(off.size() == 3 && on.size() == 3);
+  for (size_t i = 0; i < on.size() && i < off.size(); ++i) {
+    CHECK(on[i].status == 200 && off[i].status == 200, "request %zu status %d / %d", i, off[i].status, on[i].status);
+    CHECK(NormalizeBody(off[i].response, false) == NormalizeBody(on[i].response, false),
+          "request %zu: response differs with --request-log-tokens on", i);
+  }
+
+  std::ifstream in(with_path, std::ios::binary);
+  const std::string raw((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  std::vector<nlohmann::json> lines;
+  for (size_t pos = 0; pos < raw.size();) {
+    const size_t nl = raw.find('\n', pos);
+    if (nl == std::string::npos) break;
+    lines.push_back(nlohmann::json::parse(raw.substr(pos, nl - pos)));
+    pos = nl + 1;
+  }
+  CHECK(lines.size() == 3, "%zu lines", lines.size());
+  if (lines.size() != 3) return;
+  {  // the tokens-off server's log is the same lines minus the token keys
+    std::ifstream f(without_path, std::ios::binary);
+    const std::string no_tokens((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK(no_tokens.find("prompt_ids") == std::string::npos && no_tokens.find("round_accepted") == std::string::npos);
+    CHECK(raw.size() > no_tokens.size());
+  }
+
+  std::vector<int32_t> prev;  // the previous line's prompt + generated, as sim_ngram.py rebuilds it
+  std::vector<std::vector<int32_t>> prompts;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const nlohmann::json& l = lines[i];
+    const size_t shared = l["prompt_shared"].get<size_t>();
+    CHECK(shared <= prev.size(), "line %zu: prompt_shared %zu beyond the previous line (%zu)", i, shared, prev.size());
+    if (shared > prev.size()) return;
+    std::vector<int32_t> prompt(prev.begin(), prev.begin() + static_cast<ptrdiff_t>(shared));
+    const std::vector<int32_t> tail = JsonInts(l["prompt_ids"]);
+    prompt.insert(prompt.end(), tail.begin(), tail.end());
+    const std::vector<int32_t> gen = JsonInts(l["generated_ids"]);
+    CHECK(static_cast<int64_t>(prompt.size()) == l["prompt_tokens"].get<int64_t>(), "line %zu: rebuilt prompt %zu vs prompt_tokens %s",
+          i, prompt.size(), l["prompt_tokens"].dump().c_str());
+    CHECK(static_cast<int64_t>(gen.size()) == l["completion_tokens"].get<int64_t>());
+    CHECK(gen == std::vector<int32_t>(script.begin(), script.begin() + static_cast<ptrdiff_t>(gen.size())),
+          "line %zu: generated_ids are not the scripted tokens", i);
+    // Speculation: draft_k as configured, one entry per round, accepted = scripted round size - 1,
+    // and the rounds cover the generation (the first token comes from the prefill, the last round may
+    // be cut by max_tokens).
+    CHECK(l["speculative"] == "mtp" && l["draft_k"] == 3);
+    const std::vector<int32_t> acc = JsonInts(l["round_accepted"]);
+    const std::vector<int32_t> drafted = JsonInts(l["round_drafted"]);
+    CHECK(acc.size() == drafted.size() && !acc.empty());
+    int64_t emitted = 1;
+    for (size_t r = 0; r < acc.size(); ++r) {
+      CHECK(acc[r] == rounds[r % rounds.size()] - 1 && drafted[r] == 3, "line %zu round %zu: accepted %d drafted %d", i, r,
+            acc[r], drafted[r]);
+      emitted += acc[r] + 1;
+    }
+    CHECK(emitted >= static_cast<int64_t>(gen.size()) && emitted - (acc.empty() ? 0 : acc.back() + 1) < static_cast<int64_t>(gen.size()),
+          "line %zu: %lld tokens in rounds vs %zu generated", i, static_cast<long long>(emitted), gen.size());
+    CHECK(l["temperature"] == 0.0 && l["min_p"] == 0.0 && l["top_k"] == 0);
+    prompts.push_back(prompt);
+    prev = prompt;
+    prev.insert(prev.end(), gen.begin(), gen.end());
+  }
+  if (prompts.size() != 3) return;
+  auto as_i32 = [&](const std::string& text) {
+    std::vector<int32_t> v;
+    for (const r4dx::TokenId id : tok.encode(text)) v.push_back(static_cast<int32_t>(id));
+    return v;
+  };
+  CHECK(prompts[0] == as_i32(p1), "the first prompt is the tokenizer's encoding of the text");
+  CHECK(lines[0]["prompt_shared"] == 0 && lines[0]["top_p"] == 1.0 && lines[0]["seed"].is_null());
+  CHECK(lines[1]["prompt_shared"].get<size_t>() >= prompts[0].size() && lines[1]["full_reset"] == false,
+        "the follow-up shares the whole first prompt with the previous line (shared %s)", lines[1]["prompt_shared"].dump().c_str());
+  CHECK(lines[1]["prompt_shared"].get<size_t>() < prompts[1].size() &&
+            prompts[1].size() - lines[1]["prompt_shared"].get<size_t>() == lines[1]["prompt_ids"].size(),
+        "only the new tail is written");
+  CHECK(lines[1]["top_p"] == 0.5);
+  CHECK(lines[2]["seed"] == 42 && lines[2]["endpoint"] == "chat/completions");
+  if (g_failures == failures_before) {
+    std::printf("[request log tokens] off: no ids and identical responses; on: 3 lines whose prompts rebuild from "
+                "prompt_shared + prompt_ids, generated ids and mtp rounds match the script (follow-up wrote %zu of %zu "
+                "prompt ids)\n",
+                lines[1]["prompt_ids"].size(), prompts[1].size());
+  }
   std::filesystem::remove_all(dir);
 }
 
@@ -660,6 +795,7 @@ int main() {
     ThinkToolsScenario(tokenizer_dir, script, {}, "plain");
     OtherRoutesScenario(tokenizer_dir, script);
     RequestLogScenario(tokenizer_dir, script);
+    RequestLogTokensScenario(tokenizer_dir, script, tok);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "unexpected exception: %s\n", e.what());
     return 1;

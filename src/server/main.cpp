@@ -49,6 +49,12 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[r4dx-server] request log: appending one JSON line per request to %s\n",
                  args.request_log.c_str());
     opts.request_log = std::move(log);
+    opts.request_log_tokens = args.request_log_tokens;
+    if (args.request_log_tokens) {
+      std::fprintf(stderr,
+                   "[r4dx-server] request log: --request-log-tokens is ON, the file will hold every prompt and "
+                   "completion as token ids (private data: keep it local)\n");
+    }
   }
   opts.model_opts.container_path = args.model_path;
   try {

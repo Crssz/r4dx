@@ -72,6 +72,11 @@ struct ServerArgs {
   // Otherwise the JSON Lines file every completed request is appended to. Only the path is parsed
   // here (this header stays filesystem-free); main.cpp opens it and exits non-zero when it cannot.
   std::string request_log;
+  // --request-log-tokens (docs/server.md "Request log" > "Token capture"): also write each request's
+  // prompt and generated token ids and its per-round speculative acceptance into the request log, for
+  // offline speculation simulation. Off by default; needs --request-log (checked below). The file then
+  // holds the user's prompts in token form: keep it local.
+  bool request_log_tokens = false;
 
   // MTP self-speculative decode (docs/mtp.md), same semantics/default as src/cli/cli_args.h's
   // --mtp: 0 (disabled) unless the loaded --model container was converted with --mtp on. Used by
@@ -172,7 +177,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--dflash <draft.r4dx>] [--dflash-k N] "
          "[--dflash-p-min F] [--dflash-n-min N] [--vision {auto|on|off}] "
          "[--image-max-pixels N] [--image-soft-tokens {70|140|280}] [--request-log <path>] "
-         "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
+         "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K]";
 }
@@ -260,6 +265,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
       // Given but empty is a mistake, not "off": off is omitting the flag.
       if (a.request_log.empty()) throw ServerUsageError("--request-log requires a non-empty path (omit the flag to keep the log off)");
     }
+    else if (arg == "--request-log-tokens") a.request_log_tokens = true;
     else if (arg == "--mtp") a.mtp = ServerParseI64("--mtp", NextServerArg(argc, argv, i, "--mtp"));
     else if (arg == "--mtp-head-layout") a.mtp_head_layout = NextServerArg(argc, argv, i, "--mtp-head-layout");
     else if (arg == "--mtp-draft-head") a.mtp_draft_head = NextServerArg(argc, argv, i, "--mtp-draft-head");
@@ -289,6 +295,9 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.max_ctx <= 0) throw ServerUsageError("--max-ctx must be > 0");
   if (a.dialect != "auto" && a.dialect != "qwen35" && a.dialect != "gemma4") {
     throw ServerUsageError("--dialect must be 'auto', 'qwen35' or 'gemma4'");
+  }
+  if (a.request_log_tokens && a.request_log.empty()) {
+    throw ServerUsageError("--request-log-tokens needs --request-log <path> (it adds fields to that file)");
   }
   if (a.max_tokens_default < 0) throw ServerUsageError("--max-tokens-default must be >= 0");
   if (a.max_queue <= 0) throw ServerUsageError("--max-queue must be > 0");

@@ -32,6 +32,7 @@
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/rotate_residual.h"  // quant2 residual rotation (docs/quant2.md 3.1)
 #include "r4dx/model/attention/attention_layer.hpp"
+#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY (argmax, host)
 #include "r4dx/model/attention/types.hpp"
 #include "tp/tp_vocab.h"  // tensor-parallel vocab-split merges (docs/tp.md 7.3)
 
@@ -1149,21 +1150,45 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // every chunk but the last.
   if (want_logits) {
     FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
-    head.Forward(stream_, arena_, cur + (T - 1) * hidden, logits_dev_.data(), /*T=*/1);
+    // decode-t1 item 1 (docs/perf.md): a greedy step argmaxes the lm_head GEMM's bf16 output directly
+    // (the widen to fp32 is exact, so the comparisons are the fp32 row's) -- no widen launch, and
+    // logits_dev_ is not written (nothing reads it after a greedy step: the greedy caller wants the id).
+    // R4DX_DECODE_LEGACY=argmax keeps widen + the one-workgroup fp32 kernel.
+    const bool argmax_bf16 =
+        greedy_token_out != nullptr && !core::DecodeLegacy(core::DecodeItem::kArgmax);
+    const uint16_t* logits_bf16 = nullptr;
+    if (argmax_bf16) {
+      logits_bf16 = head.ForwardBf16(stream_, arena_, cur + (T - 1) * hidden, /*T=*/1);
+    } else {
+      head.Forward(stream_, arena_, cur + (T - 1) * hidden, logits_dev_.data(), /*T=*/1);
+    }
     // Greedy path (host-overhead pass, 2026-09-19): argmax logits_dev_ ON DEVICE while it's still
     // hot, so the only D2H this call ever does is 4 bytes instead of vocab*4 -- see
     // r4dx_argmax_f32 (src/kernels) and DecodeStepGreedy's own comment (model.h).
     if (greedy_token_out != nullptr && comm_ != nullptr) {
       // Tensor parallel (docs/tp.md 7.3): argmax THIS rank's vocab shard, keeping the winning value
       // too; the host merges the per-rank pairs below.
-      r4dx_argmax_val_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
-                           reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
-                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), vocab_local_,
-                           reinterpret_cast<int64_t>(stream_.get()));
+      if (argmax_bf16) {
+        r4dx_argmax_val_bf16(reinterpret_cast<int64_t>(logits_bf16),
+                              reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                              reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), vocab_local_,
+                              reinterpret_cast<int64_t>(stream_.get()));
+      } else {
+        r4dx_argmax_val_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                             reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                             reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), vocab_local_,
+                             reinterpret_cast<int64_t>(stream_.get()));
+      }
     } else if (greedy_token_out != nullptr) {
-      r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
-                       reinterpret_cast<int64_t>(argmax_dev_.data()), cfg.vocab_size,
-                       reinterpret_cast<int64_t>(stream_.get()));
+      if (argmax_bf16) {
+        r4dx_argmax_bf16(reinterpret_cast<int64_t>(logits_bf16),
+                          reinterpret_cast<int64_t>(argmax_dev_.data()), cfg.vocab_size,
+                          reinterpret_cast<int64_t>(stream_.get()));
+      } else {
+        r4dx_argmax_f32(reinterpret_cast<int64_t>(logits_dev_.data()),
+                         reinterpret_cast<int64_t>(argmax_dev_.data()), cfg.vocab_size,
+                         reinterpret_cast<int64_t>(stream_.get()));
+      }
     } else if (summary_out != nullptr) {
       // Sampled path (docs/sampling.md section 8): the same "argmax it on device while it is still
       // hot" trick one step further -- summarise the row on device so the D2H below is 516 bytes
@@ -2192,20 +2217,22 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   // want_logits path).
   FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
   head.Forward(stream_, arena_, cur, verify_logits_dev_.data(), T);
-  for (int64_t t = 0; t < T; ++t) {
-    if (comm_ != nullptr) {
-      // Tensor parallel (docs/tp.md 7.6): argmax this rank's [vocab_local_] shard of row t, keeping
-      // the winning value; the host merges the per-rank pairs below.
-      r4dx_argmax_val_f32(reinterpret_cast<int64_t>(verify_logits_dev_.data() + t * vocab_local_),
-                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 2 * t),
-                           reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 2 * t + 1),
-                           vocab_local_, reinterpret_cast<int64_t>(stream_.get()));
-      continue;
-    }
-    r4dx_argmax_f32(
-        reinterpret_cast<int64_t>(verify_logits_dev_.data() + t * cfg.vocab_size),
-        reinterpret_cast<int64_t>(verify_argmax_dev_.data() + t), cfg.vocab_size,
-        reinterpret_cast<int64_t>(stream_.get()));
+  // decode-t1 item 1: all T rows in ONE pair of multi-workgroup launches (r4dx_argmax_rows_f32; each row's
+  // answer is the one-workgroup kernel's, bit for bit) where this was T one-workgroup launches of
+  // ~0.15 ms each. R4DX_DECODE_LEGACY=argmax: the loop of single-row calls, which that entry point
+  // itself turns back into the one-workgroup kernel.
+  if (comm_ != nullptr) {
+    // Tensor parallel (docs/tp.md 7.6): argmax this rank's [vocab_local_] shard of each row, keeping
+    // the winning value; the host merges the per-rank pairs below. Pair t is {idx, val} at 2t, 2t + 1.
+    r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(verify_logits_dev_.data()), vocab_local_,
+                          reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                          reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), /*out_stride=*/2, T,
+                          vocab_local_, reinterpret_cast<int64_t>(stream_.get()));
+  } else {
+    r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(verify_logits_dev_.data()), cfg.vocab_size,
+                          reinterpret_cast<int64_t>(verify_argmax_dev_.data()), /*out_val=*/0,
+                          /*out_stride=*/1, T, cfg.vocab_size,
+                          reinterpret_cast<int64_t>(stream_.get()));
   }
   // Sampled rounds (docs/sampling.md section 9): summarise every row on device too, so the round's
   // whole D2H is T*516 bytes rather than T*~993 KB. Enqueued on the same stream as the argmaxes

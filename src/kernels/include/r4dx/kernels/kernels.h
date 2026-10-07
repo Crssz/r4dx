@@ -250,22 +250,44 @@ void r4dx_attn_precore_bf16(int64_t qg, int64_t k, int64_t v, int64_t q_norm, in
                              int head_dim, int rotary_dim, float theta, float eps, int block_size,
                              int64_t kv_block_stride, int64_t kv_head_stride, int64_t stream);
 
-// ---- device argmax (host-overhead pass, 2026-09-19) -------------------------------------------
+// ---- device argmax (host-overhead pass, 2026-09-19; multi-workgroup, decode-t1 2026-10-08) -----
 // out_idx[0] = argmax_i logits[i] (ties broken toward the lowest index, matching
-// r4dx::kernels::Argmax's CPU reference in sampler.hpp). One block only -- vocab (~250k floats,
-// ~1MB) comfortably fits one block's grid-stride loop, and this exists specifically so a
-// temperature==0 (greedy) decode caller can skip the vocab-sized logits D2H copy entirely and
-// read back a single int32 instead (Model::DecodeStepGreedy, model.cpp). logits: [vocab] fp32.
-// out_idx: device int32[1].
+// r4dx::kernels::Argmax's CPU reference in sampler.hpp), so a temperature==0 (greedy) decode caller
+// can skip the vocab-sized logits D2H copy entirely and read back a single int32 instead
+// (Model::DecodeStepGreedy, model.cpp). logits: [vocab] fp32. out_idx: device int32[1].
+// Two launches over up to 256 workgroups (partials into a per-stream scratch, then one workgroup per
+// row to reduce them): 0.13-0.19 ms became a few us at the 248 320-entry vocabulary. The result is
+// bit-identical to the one-workgroup kernel it replaced for every input, ties, -inf and NaN included
+// (a NaN never wins; a row with nothing greater than -inf gives index 0): both are the maximum of a
+// total order -- larger value, then lower index -- over the same elements, which does not depend on
+// the partition. R4DX_DECODE_LEGACY=argmax (core/decode_legacy.hpp) runs the one-workgroup kernel.
 void r4dx_argmax_f32(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream);
 
-// The same kernel, also writing the winning VALUE: out_idx[0] = the lowest index among equal maxima
+// The same, also writing the winning VALUE: out_idx[0] = the lowest index among equal maxima
 // of logits[0, vocab), out_val[0] = logits[out_idx[0]]. The tensor-parallel greedy merge's per-shard
 // half (docs/tp.md 7.3): each rank argmaxes its own lm_head vocab shard, and the host picks the rank
 // with the strictly larger value (tie -> the lower rank, i.e. the lower global id). out_val: device
 // float[1]. r4dx_argmax_f32 is this with no value output, so TP=1 is unchanged.
 void r4dx_argmax_val_f32(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
                           int64_t stream);
+
+// The same over a bf16 row (the lm_head GEMM's own output, widened exactly, so every comparison is the
+// widened row's): decode skips the bf16 -> fp32 widen launch. out_val may be 0 (no value output).
+void r4dx_argmax_bf16(int64_t logits, int64_t out_idx, int64_t vocab, int64_t stream);
+void r4dx_argmax_val_bf16(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                           int64_t stream);
+
+// `rows` rows (at most 16) in ONE pair of launches: row r is logits[r * row_stride, + vocab), its result
+// at out_idx[r * out_stride] (and out_val[r * out_stride] when out_val != 0 -- the TP pair layout passes
+// out_idx = pairs, out_val = pairs + 1, out_stride = 2). The verify window's per-row argmax
+// (Model::VerifyWindow): row_stride in elements.
+void r4dx_argmax_rows_f32(int64_t logits, int64_t row_stride, int64_t out_idx, int64_t out_val,
+                           int64_t out_stride, int64_t rows, int64_t vocab, int64_t stream);
+
+// The one-workgroup kernel itself (the pre-decode-t1 implementation), always: the bit-for-bit
+// reference tests/kernels/test_argmax_multi.cpp compares the multi-workgroup path against.
+void r4dx_argmax_val_f32_single(int64_t logits, int64_t out_idx, int64_t out_val, int64_t vocab,
+                                 int64_t stream);
 
 // ---- device-resident embedding gather (MTP device-residency pass, docs/mtp.md) -----------------
 // out[row,:] = table[ids[row],:], entirely on-device -- the device-resident counterpart of

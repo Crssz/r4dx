@@ -7,8 +7,8 @@
 
 namespace r4dx::model {
 
-void FinalLmHead::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x,
-                           float* logits_out, int64_t T) {
+const uint16_t* FinalLmHead::ForwardBf16(core::Stream& stream, core::Arena& arena, const uint16_t* x,
+                                          int64_t T) {
   const int64_t hidden = cfg_.hidden_size;
   const int64_t vocab = lm_head_.N;
   const float eps = static_cast<float>(cfg_.rms_norm_eps);
@@ -23,9 +23,16 @@ void FinalLmHead::Forward(core::Stream& stream, core::Arena& arena, const uint16
   // hipEvents wrap this whole method themselves.
   ProfiledCall(nullptr, stream.get(), "gemm:lm_head",
                [&] { ApplyLinear(stream, arena, lm_head_, x_normed, logits_bf16, T); });
+  return logits_bf16;
+}
 
+void FinalLmHead::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x,
+                           float* logits_out, int64_t T) {
+  const int64_t vocab = lm_head_.N;
+  const uint16_t* logits_bf16 = ForwardBf16(stream, arena, x, T);
   r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16),
-                                reinterpret_cast<int64_t>(logits_out), T * vocab, s);
+                                reinterpret_cast<int64_t>(logits_out), T * vocab,
+                                reinterpret_cast<int64_t>(stream.get()));
 }
 
 }  // namespace r4dx::model

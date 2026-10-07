@@ -78,6 +78,7 @@ set(R4DX_KERNEL_TESTS
   # N = 2H GEMM against two N = H, and the one-launch attention pre-core chain against split_qg + qk_norm +
   # rope + kv_write. GPU tests written, NOT yet run (CPU-only build session): `ctest -R
   # "argmax_multi|gdn_ab_merge|attn_precore"`. test_argmax_multi returns 77 under R4DX_DECODE_LEGACY=argmax.
+  test_argmax_multi
   test_gdn_ab_merge
   test_attn_precore
 )
@@ -108,6 +109,7 @@ set_tests_properties(test_kernel_bandwidth PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_conv
                      test_rmsnorm_plain PROPERTIES SKIP_RETURN_CODE 77)
 set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_argmax_multi PROPERTIES SKIP_RETURN_CODE 77)
 # test_attn_precore compares against r4dx_model_attn_split_qg_bf16, which lives in r4dx_model_attention.
 target_link_libraries(test_attn_precore PRIVATE r4dx_model_attention)
 
@@ -198,6 +200,13 @@ add_test(NAME test_rope_proportional_cpu COMMAND test_rope_proportional_cpu)
 # (dense Sylvester FWHT, the closed-form rows of Q, norms/inverses, TP K-slicing).
 add_executable(test_rotation_ref_cpu test_rotation_ref_cpu.cpp)
 add_test(NAME test_rotation_ref_cpu COMMAND test_rotation_ref_cpu)
+
+# test_argmax_order_cpu: pure CPU -- the order algebra behind decode-t1's multi-workgroup argmax
+# (argmax_ref.hpp): any partition / combine order gives the one-workgroup kernel's answer, ties, NaN,
+# -inf and signed zeros included. Always runs.
+add_executable(test_argmax_order_cpu test_argmax_order_cpu.cpp)
+target_include_directories(test_argmax_order_cpu PRIVATE "${CMAKE_SOURCE_DIR}/src/kernels/include")
+add_test(NAME test_argmax_order_cpu COMMAND test_argmax_order_cpu)
 
 # test_gemma_resid_f32_cpu: pure CPU -- the fp32-residual contract (post-norm/add/layer_scalar in fp32, exact embed scale,
 # rotated-stream round trip) against the fp64 references in gemma_ref.hpp / rotation_ref.hpp.

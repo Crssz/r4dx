@@ -25,10 +25,16 @@
 #      unprofiled TTFT A/B (gate the change on these, not on the profile shares).
 #   6. r4dx-cli --profile-prefill at 8k, new, conv1 and old (the gdn.conv_prep / kkt_solve / chunk_scan /
 #      gated_rmsnorm rows of the three tables).
-# -Int8 (docs/int8-prefill.md "Production path"): R4DX_PREFILL_INT8=1 in the new, conv1 and old configurations only (not c64:
-# a 64-row Model refuses the switch). The int8 kernel is a quantized model, not the f16 bits, so the bit-identity to c64 is NOT
-# expected: step 5 then requires new / conv1 / old (the three GDN variants, all int8) to share ONE hash and only REPORTS whether
-# c64 (f16) differs (it normally does, but a short greedy text can survive the quantization unchanged).
+# Since 2026-10-07 the int8 x int8 prefill GEMM (R4DX_PREFILL_INT8) and split-KV prompt-prefill attention (R4DX_PREFILL_SPLITKV)
+# are the DEFAULTS, and both are lossy against the f16 / exact-wide paths this bit-identity check was written for. So:
+#   * without -Defaults the check PINS the old paths (R4DX_PREFILL_INT8=0, R4DX_PREFILL_SPLITKV=exact in every configuration), and
+#     step 5 requires the four hashes to match, as before;
+#   * -Defaults (alias -Int8: the old name of the int8-only variant) runs new / conv1 / old with the shipped defaults (int8 on, split-KV
+#     attention) and c64 as the f16 chunk-64 reference (a 64-row Model refuses int8; its attention is the default split law too). The
+#     int8 kernel is a quantized model, not the f16 bits, so the bit-identity to c64 is NOT expected: step 5 then requires new / conv1
+#     / old (the three GDN variants, all int8) to share ONE hash and only REPORTS whether c64 differs (it normally does, but a short
+#     greedy text can survive the quantization unchanged). The [stats] prefill lines are the defaults' TTFT. The identity tests of
+#     steps 1-4 pin the f16 paths themselves in both modes.
 # Exit 0 only when every test passed (or skipped for missing data) and every hash matched.
 param(
   [int]$Device = 1,
@@ -39,7 +45,7 @@ param(
   [string]$TasksDir = "$(if ($env:R4DX_MODELS_ROOT) { $env:R4DX_MODELS_ROOT } else { 'E:\models' })\r4dx\prefill-m0\tasks",
   [string]$ProfileLength = '8k',
   [switch]$SkipIdentity,
-  [switch]$Int8,
+  [Alias('Int8')][switch]$Defaults,
   [switch]$AllowOthers
 )
 $ErrorActionPreference = 'Stop'
@@ -61,7 +67,7 @@ $env:HIP_VISIBLE_DEVICES = "$Device"
 $gitHead = (git -C $repo rev-parse --short HEAD)
 Say "[gdn256] $stamp git $gitHead HIP_VISIBLE_DEVICES=$($env:HIP_VISIBLE_DEVICES) -> $outDir"
 
-$knobs = @('R4DX_GDN_SLICE', 'R4DX_GDN_CONV', 'R4DX_PREFILL_CHUNK', 'R4DX_PREFILL_INT8')
+$knobs = @('R4DX_GDN_SLICE', 'R4DX_GDN_CONV', 'R4DX_PREFILL_CHUNK', 'R4DX_PREFILL_INT8', 'R4DX_PREFILL_SPLITKV', 'R4DX_PREFILL_SPLITKV_MIN')
 # Runs $exe with exactly the env overrides in $envSet (every other knob unset), stdout/stderr to files.
 function Invoke-WithEnv([string]$exe, [string[]]$argList, [hashtable]$envSet, [string]$logBase) {
   $saved = @{}
@@ -115,7 +121,7 @@ $configs = [ordered]@{
   old = @{ R4DX_GDN_SLICE = '64'; R4DX_GDN_CONV = '1' }
   c64 = @{ R4DX_PREFILL_CHUNK = '0' }
 }
-if ($Int8) { foreach ($n in @('new', 'conv1', 'old')) { $configs[$n].R4DX_PREFILL_INT8 = '1' } }
+if (-not $Defaults) { foreach ($n in @($configs.Keys)) { $configs[$n].R4DX_PREFILL_INT8 = '0'; $configs[$n].R4DX_PREFILL_SPLITKV = 'exact' } }
 function CliArgs([string]$len, [switch]$Prof) {
   $prompt = Join-Path $TasksDir "prompts\ttft_$len.txt"
   if (-not (Test-Path $prompt)) { throw "[gdn256] missing $prompt (run tools\prefill\build_tasks.py)" }
@@ -140,10 +146,10 @@ else {
       if ($r.Exit -ne 0) { $fail++ }
       Say ("[cli] {0} {1,-5} ({2}): exit {3}, text sha256 {4}, prefill {5}" -f $len, $name, (EnvText $configs[$name]), $r.Exit, $hash, $stats)
     }
-    if ($Int8) {
+    if ($Defaults) {
       $three = @(@($hashes.new, $hashes.conv1, $hashes.old) | Select-Object -Unique)
       if ($three.Count -eq 1 -and $three[0] -ne 'none') {
-        Say "[PASS] $len greedy text identical across new / conv1 / old (all int8); c64 (f16) $(if ($hashes.c64 -eq $three[0]) { 'SAME: the quantization did not change this text' } else { 'differs, as expected' })"
+        Say "[PASS] $len greedy text identical across new / conv1 / old (defaults: int8 prefill + split-KV attention); c64 (f16 GEMM) $(if ($hashes.c64 -eq $three[0]) { 'SAME: the quantization did not change this text' } else { 'differs, as expected' })"
       } else { Say "[FAIL] $len int8 greedy text differs across the GDN variants: $(($hashes.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"; $fail++ }
     } else {
       $distinct = @($hashes.Values | Select-Object -Unique)

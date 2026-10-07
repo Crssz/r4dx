@@ -35,12 +35,15 @@ set(R4DX_MODEL_TESTS
   # greedy / MTP / DFlash tokens, the digest of every piece of per-sequence state, the tail lengths of the
   # chunk grid and prefix-reuse suffixes; on the 4-layer container (bf16, w4a16) and the real trellis
   # container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library variant for
-  # Model::DebugStateDigest.
+  # Model::DebugStateDigest. It pins the f16 / exact-attention paths (prefill_int8 = 0 in every Load, and
+  # R4DX_PREFILL_SPLITKV=exact unless the environment sets it: split-KV and int8 prefill are the lossy defaults since
+  # 2026-10-07); test_prefill_chunk_identity_defaults below runs the 4-layer part with the split-KV default.
   test_prefill_chunk_identity
   # R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path") against the f16 path on the real trellis container loaded
-  # three times (off, on, on): T < 256 byte-identical on and off, T >= 256 deterministic with the int8 chunk counts the
-  # chunk grid predicts, the state digest differing from f16 (negative control), the last row's logits close, text-only
-  # PrefillMultimodal == Prefill; the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
+  # three times (off, on, default = on since 2026-10-07): T < 256 byte-identical on and off, T >= 256 deterministic with the
+  # int8 chunk counts the chunk grid predicts, the state digest differing from f16 (negative control), the last row's
+  # logits close; a text-only PrefillMultimodal counts the same int8 chunks as Prefill but its bytes are NOT Prefill's even
+  # with int8 off (measured), so it is compared on vs off only; the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
   # R4DX_TP_TESTING library variant for Model::DebugStateDigest. Written, NOT run by its author.
   test_prefill_int8
   # The GDN sequence ops of a 256-row super-chunk run once (the default) against the old 64-row sub-slices
@@ -66,6 +69,15 @@ foreach(t ${R4DX_MODEL_TESTS})
     SKIP_RETURN_CODE 77
   )
 endforeach()
+
+# The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
+# context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a
+# function of (context depth, 64-row slice), so the two chunk sizes should still leave the same bits; written, not run
+# by its author (CPU-only session). test_prefill_chunk_identity itself pins R4DX_PREFILL_SPLITKV=exact (the f16 paths).
+add_test(NAME test_prefill_chunk_identity_defaults COMMAND test_prefill_chunk_identity)
+set_tests_properties(test_prefill_chunk_identity_defaults PROPERTIES
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=1;R4DX_PREFILL_SPLITKV=split;R4DX_TEST_ONLY=l4/"
+  SKIP_RETURN_CODE 77)
 
 # Trellis (docs/trellis-kernel.md 6): test_trellis_linear and test_tp_loader's trellis cases load
 # the tiny containers convert_trellis_import (tests/convert) keeps in its build directory -- the

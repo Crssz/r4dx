@@ -654,4 +654,18 @@ static int RunTest() {
   return 0;
 }
 
-int main() { return r4dx_test::RunGuardedMain("test_prefill_chunk_identity", RunTest); }
+int main() {
+  // The 64 == 256 identity is the f16 / exact-attention paths': split-KV prompt-prefill attention is the default since
+  // 2026-10-07 (the law is a function of the context depth, so a moved chunk grid can change which rows split), so pin the
+  // exact-wide launch unless the environment chose one (test_prefill_chunk_identity_defaults sets "split"). The int8 side
+  // is pinned per Load (ModelOptions::prefill_int8 = 0). Read once per process, so set it before the first Model::Load.
+  const char* sk = std::getenv("R4DX_PREFILL_SPLITKV");
+  if (sk == nullptr || *sk == '\0') {
+#ifdef _WIN32
+    _putenv_s("R4DX_PREFILL_SPLITKV", "exact");
+#else
+    setenv("R4DX_PREFILL_SPLITKV", "exact", 1);
+#endif
+  }
+  return r4dx_test::RunGuardedMain("test_prefill_chunk_identity", RunTest);
+}

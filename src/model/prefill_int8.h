@@ -4,24 +4,27 @@
 // Header-only and free of HIP so the parser and the decision table have a CPU unit test
 // (tests/model/test_prefill_int8_cpu.cpp); Model::Load is the only caller.
 //
-// R4DX_PREFILL_INT8 (read once per process, like R4DX_PREFILL_CHUNK -- prefill_chunk.h):
-//   - unset, empty, "0" or "off": off (the default). Nothing changes: no scale table is built, no buffer or launch
-//     differs, every byte of every path is the one of a build without the int8 kernel (the f16 kernels' ISA is
-//     pinned by the build, their output by tests/model/test_prefill_int8);
-//   - "1" or "on": on, where this Model can use it (DecidePrefillInt8). The full 256-row super-chunks of a
-//     Prefill call -- and only those -- run their trellis linears through libr4d's int8 x int8 GEMM
+// R4DX_PREFILL_INT8 (read once per process, like R4DX_PREFILL_CHUNK -- prefill_chunk.h). ON BY DEFAULT:
+//   - unset, empty, "1" or "on": on, where this Model can use it (DecidePrefillInt8). The full 256-row super-chunks
+//     of a Prefill call -- and only those -- run their trellis linears through libr4d's int8 x int8 GEMM
 //     (A quantized per (row, 128 k), the decoded weight per (column, 128 k), int32 WMMA, a per-128 fp32
 //     rescale; the f16 output transform after it). Everything else stays f16: tails of fewer than 256 rows
-//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, MTP and DFlash 64-row slices, decode
+//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, TP = 2, MTP and DFlash 64-row slices, decode
 //     and verify windows, the vision tower, and PrefillMultimodal with images (image accuracy is unmeasured; a text-only call with no image ever seen is a Prefill call);
-//   - anything else: a warning on stderr, then off (an unreadable request is read as "keep the old path").
-// It is a research-grade accuracy trade, not a bit-identical optimization: with it on, a super-chunk row is NOT
-// the row the 64-row path computes (docs/int8-prefill.md lists what that costs: the chunk-size identity of the
-// KV bytes, and their independence of the prefix-cache state), so it is never on unless asked for.
+//   - "0" or "off": the kill switch. Nothing changes: no scale table is built (-0.7 GiB on the 27B), no buffer or
+//     launch differs, every byte of every path is the one of a build without the int8 kernel (the f16 kernels' ISA is
+//     pinned by the build, their output by tests/model/test_prefill_int8);
+//   - anything else: a warning on stderr, then the default (on): an unreadable request keeps the default.
+// It is a validated accuracy trade, not a bit-identical optimization: with it on, a super-chunk row is NOT the row
+// the 64-row path computes (docs/int8-prefill.md lists what that costs: the chunk-size identity of the KV bytes, and
+// their independence of the prefix-cache state; measured KL(off || on) 0.0011 canon / 0.0017 at 8k / 0.0104 at 32k,
+// greedy text unchanged, TTFT -18.9 % at 8k and -15.7 % at 32k). It was opt-in until the user approved making it the
+// default (docs/int8-prefill.md "Now the default").
 //
 // A Model that cannot use it says why once at load (the reasons of DecidePrefillInt8) and runs f16. It cannot be
 // combined with R4DX_FAKEQ_ACT / R4DX_FAKEQ_W (the accuracy-experiment switches that round to int8 and run the f16
-// GEMM): Model::Load throws, since the two would quantize twice.
+// GEMM, the int8 GEMM would quantize twice): when int8 is only the default those switches win (a reason at load);
+// when it was asked for explicitly (R4DX_PREFILL_INT8=1/on or ModelOptions::prefill_int8 = 1) Model::Load throws.
 #pragma once
 
 #include <cstdio>
@@ -33,22 +36,31 @@ namespace r4dx::model {
 inline constexpr int kPrefillInt8Off = 0;
 inline constexpr int kPrefillInt8On = 1;
 
-// 1 for "1" / "on", 0 for unset / empty / "0" / "off"; anything else warns and is 0.
+// 1 for unset / empty / "1" / "on" (the default is on), 0 for "0" / "off"; anything else warns and is the default.
 inline int ParsePrefillInt8(const char* e) {
-  if (e == nullptr || *e == '\0' || std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return kPrefillInt8Off;
+  if (e == nullptr || *e == '\0') return kPrefillInt8On;
+  if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return kPrefillInt8Off;
   if (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0) return kPrefillInt8On;
-  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8='%s' not recognized (0|off|1|on); using off\n", e);
-  return kPrefillInt8Off;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8='%s' not recognized (0|off|1|on); using the default (on)\n", e);
+  return kPrefillInt8On;
 }
+// True when the environment ASKED for on ("1" / "on"), as opposed to the default being on (unset, empty, unreadable).
+inline bool ParsePrefillInt8Explicit(const char* e) { return e != nullptr && (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0); }
 inline int PrefillInt8Request() {
   static const int v = ParsePrefillInt8(std::getenv("R4DX_PREFILL_INT8"));
   return v;
 }
+inline bool PrefillInt8RequestExplicit() {
+  static const bool v = ParsePrefillInt8Explicit(std::getenv("R4DX_PREFILL_INT8"));
+  return v;
+}
 
-// ModelOptions::prefill_int8: -1 follows the environment, 0 and 1 force the request whatever the environment says
-// (the identity tests load Models of each). Anything else is the caller's bug.
+// ModelOptions::prefill_int8: -1 follows the environment (default: on), 0 and 1 force the request whatever the
+// environment says (the identity tests load Models of 0, the int8 tests of 1). Anything else is the caller's bug.
 inline bool ValidPrefillInt8Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }
 inline int ResolvePrefillInt8Request(int opt) { return opt < 0 ? PrefillInt8Request() : (opt != 0 ? kPrefillInt8On : kPrefillInt8Off); }
+// Whether the on request was ASKED for (ModelOptions::prefill_int8 = 1, or R4DX_PREFILL_INT8=1/on) rather than the default.
+inline bool ResolvePrefillInt8Explicit(int opt) { return opt < 0 ? PrefillInt8RequestExplicit() : opt != 0; }
 
 // What decides it, for one Model, once at load.
 struct PrefillInt8Inputs {
@@ -57,6 +69,7 @@ struct PrefillInt8Inputs {
   int tp_world = 1;                 // ModelOptions::tp.world
   bool has_trellis = false;         // the container's body is trellis (Container::HasTrellis)
   bool rotated_container = false;   // a quant2 container (residual rotation / Hadamard signs)
+  bool fakeq_active = false;        // R4DX_FAKEQ_ACT / R4DX_FAKEQ_W set (the default yields to them; an explicit on throws before this)
   int tables_built = -1;            // trellis linears that got a scale table; -1 = not built yet (the first decision)
 };
 
@@ -77,6 +90,7 @@ inline bool DecidePrefillInt8(const PrefillInt8Inputs& in, const char** why = nu
     if (why != nullptr) *why = reason;
     return false;
   };
+  if (in.fakeq_active) return refuse("R4DX_FAKEQ_ACT / R4DX_FAKEQ_W are set (they round to int8 themselves)");
   if (in.rotated_container) return refuse("a quant2 (rotated) container");
   if (!in.wide) return refuse("this Model does not run 256-row prefill super-chunks (R4DX_PREFILL_CHUNK=0/64)");
   if (in.tp_world > 1) return refuse("tensor parallelism (TP = 2 keeps the f16 kernel)");

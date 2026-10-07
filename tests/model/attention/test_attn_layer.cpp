@@ -476,12 +476,13 @@ int Run() {
 }
 
 // prefill M1: R4DX_PREFILL_SPLITKV's parse (docs/prefill.md). Pure CPU, so it runs before the
-// data-presence skip. Unset/empty/"exact" = the exact-wide default; split-KV only when asked for.
+// data-presence skip. Unset/empty/split = the split law (the default since 2026-10-07); "exact" = the
+// exact-wide kill switch (the old default); an unreadable value keeps the default.
 bool CheckPrefillAttnModeParse() {
   namespace a = r4dx::model::attention;
   struct C { const char* in; int want; };
-  const C cases[] = {{nullptr, a::kPrefillAttnExact}, {"", a::kPrefillAttnExact},
-                     {"exact", a::kPrefillAttnExact}, {"bogus", a::kPrefillAttnExact},
+  const C cases[] = {{nullptr, a::kPrefillAttnSplitLaw}, {"", a::kPrefillAttnSplitLaw},
+                     {"exact", a::kPrefillAttnExact}, {"bogus", a::kPrefillAttnSplitLaw},
                      {"split", a::kPrefillAttnSplitLaw}, {"splitkv", a::kPrefillAttnSplitLaw},
                      {"auto", a::kPrefillAttnSplitLaw}, {"0", 1}, {"1", 1}, {"off", 1},
                      {"dense", 1}, {"8", 8}, {"16", 16}, {"99", 32}};
@@ -516,10 +517,14 @@ bool CheckPrefillSplitKvMinParse() {
       ok = false;
     }
   }
-  // The law: the default threshold is today's 8192 (S=8 at 4 KV heads, 16 at 2), and min_ctx moves it.
+  // The law: the default threshold is 2048 (kPrefillSplitKvMinCtx); at 8192 it is S=8 at 4 KV heads and
+  // 16 at 2 (unchanged from the 8192 default); min_ctx moves the threshold.
+  static_assert(a::kPrefillSplitKvMinCtx == 2048, "the default engage depth is 2048 tokens of context");
   struct L { int ctx, kv, min_ctx, want; };
-  const L laws[] = {{8191, 4, a::kPrefillSplitKvMinCtx, 1}, {8192, 4, a::kPrefillSplitKvMinCtx, 8},
-                    {8192, 2, a::kPrefillSplitKvMinCtx, 16}, {16383, 4, 16384, 1},
+  const L laws[] = {{2047, 4, a::kPrefillSplitKvMinCtx, 1}, {2048, 4, a::kPrefillSplitKvMinCtx, 4},
+                    {2048, 2, a::kPrefillSplitKvMinCtx, 4}, {4096, 4, a::kPrefillSplitKvMinCtx, 8},
+                    {8192, 4, a::kPrefillSplitKvMinCtx, 8}, {8192, 2, a::kPrefillSplitKvMinCtx, 16},
+                    {8191, 4, 8192, 1}, {8192, 4, 8192, 8}, {16383, 4, 16384, 1},
                     {16384, 4, 16384, 8}, {32768, 4, 32768, 8}, {4096, 4, 0, 8}};
   for (const L& l : laws) {
     const int got = a::PrefillSplitKvSplits(l.ctx, 64, l.kv, l.min_ctx);

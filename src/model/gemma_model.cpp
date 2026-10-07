@@ -277,8 +277,9 @@ GemmaModel GemmaModel::Load(const GemmaModelOptions& opts) {
   if (is_tp) std::cerr << ", TP rank " << opts.tp_rank << "/" << opts.tp_world << " (vocab shard " << m.vocab_local_ << ")";
   std::cerr << "\n";
   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): the Gemma 4 model has its own RunChunk, which does
-  // not open the int8 scope (and no scale table is built), so the switch does nothing here -- say so once per process.
-  if (PrefillInt8Request() == kPrefillInt8On) {
+  // not open the int8 scope (and no scale table is built), so the switch does nothing here -- say so once per process
+  // when it was asked for (the default being on is not worth a line per Gemma load).
+  if (PrefillInt8Request() == kPrefillInt8On && PrefillInt8RequestExplicit()) {
     static const bool once = [] {
       std::cerr << "[r4dx::model::GemmaModel] R4DX_PREFILL_INT8=1 ignored: the Gemma 4 model's prefill is not wired to the int8 "
                    "GEMM (Qwen only); its trellis linears run the f16 kernels\n";

@@ -1,7 +1,7 @@
 // test_prefill_int8_cpu: host-only checks of R4DX_PREFILL_INT8's decision and planning code (docs/int8-prefill.md
 // "Production path"); no HIP call, no device, no container.
-//   * src/model/prefill_int8.h: the parser (unset / empty / 0 / off = off, 1 / on = on, anything else = off with a
-//     warning), the ModelOptions::prefill_int8 resolution, and the decision table of DecidePrefillInt8 -- off is not a
+//   * src/model/prefill_int8.h: the parser (unset / empty / 1 / on = on -- the default --, 0 / off = off, anything else =
+//     the default with a warning; 1 / on are the only EXPLICIT requests), the ModelOptions::prefill_int8 resolution, and the decision table of DecidePrefillInt8 -- off is not a
 //     fallback (no reason), and every refusal names its reason in the order of the checks;
 //   * src/model/linear.cpp: PlanTrellisI8 for the seven linear classes of the 27B at both rates (the part boundary of
 //     mlp.gate_up included), its refusals (KB, parts, whole 128-blocks, the part boundary, a shape without a table
@@ -52,16 +52,23 @@ const Cls kClasses[] = {
 };
 
 void TestParser() {
-  CHECK(ParsePrefillInt8(nullptr) == kPrefillInt8Off, "unset is off");
-  CHECK(ParsePrefillInt8("") == kPrefillInt8Off, "empty is off");
+  // int8 prefill is ON by default (2026-10-07); "0" / "off" is the kill switch
+  CHECK(ParsePrefillInt8(nullptr) == kPrefillInt8On, "unset is on (the default)");
+  CHECK(ParsePrefillInt8("") == kPrefillInt8On, "empty is on (the default)");
   CHECK(ParsePrefillInt8("0") == kPrefillInt8Off, "0 is off");
   CHECK(ParsePrefillInt8("off") == kPrefillInt8Off, "off is off");
   CHECK(ParsePrefillInt8("1") == kPrefillInt8On, "1 is on");
   CHECK(ParsePrefillInt8("on") == kPrefillInt8On, "on is on");
   std::fflush(stderr);
-  CHECK(ParsePrefillInt8("yes") == kPrefillInt8Off, "an unrecognized value is off (with a warning on stderr)");
-  CHECK(ParsePrefillInt8("2") == kPrefillInt8Off, "2 is not recognized: off");
-  CHECK(ParsePrefillInt8("ON") == kPrefillInt8Off, "the spellings are case sensitive: ON is off");
+  CHECK(ParsePrefillInt8("yes") == kPrefillInt8On, "an unrecognized value keeps the default, on (with a warning on stderr)");
+  CHECK(ParsePrefillInt8("2") == kPrefillInt8On, "2 is not recognized: the default, on");
+  CHECK(ParsePrefillInt8("ON") == kPrefillInt8On, "the spellings are case sensitive: ON is not recognized: the default, on");
+  CHECK(!ParsePrefillInt8Explicit(nullptr) && !ParsePrefillInt8Explicit("") && !ParsePrefillInt8Explicit("0") &&
+            !ParsePrefillInt8Explicit("off") && !ParsePrefillInt8Explicit("yes"),
+        "only 1 / on are an explicit request: unset, empty, off and unreadable are not");
+  CHECK(ParsePrefillInt8Explicit("1") && ParsePrefillInt8Explicit("on"), "1 and on are explicit");
+  CHECK(ResolvePrefillInt8Explicit(1) && !ResolvePrefillInt8Explicit(0), "option 1 is explicit, option 0 is not");
+  CHECK(ResolvePrefillInt8Explicit(-1) == PrefillInt8RequestExplicit(), "option -1 follows the environment's explicitness");
   CHECK(ValidPrefillInt8Option(-1) && ValidPrefillInt8Option(0) && ValidPrefillInt8Option(1), "options -1, 0, 1 are valid");
   CHECK(!ValidPrefillInt8Option(2) && !ValidPrefillInt8Option(-2), "options 2 and -2 are not");
   CHECK(ResolvePrefillInt8Request(0) == kPrefillInt8Off, "option 0 forces off whatever the environment says");
@@ -110,6 +117,13 @@ void TestDecision() {
     why = nullptr;
     CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("trellis") != std::string::npos,
           "a container without trellis linears is refused");
+  }
+  {
+    PrefillInt8Inputs in = Good();
+    in.fakeq_active = true;
+    why = nullptr;
+    CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("FAKEQ") != std::string::npos,
+          "R4DX_FAKEQ_ACT / R4DX_FAKEQ_W set: the default yields, with its reason");
   }
   {
     PrefillInt8Inputs in = Good();

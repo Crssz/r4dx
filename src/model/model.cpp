@@ -203,17 +203,19 @@ Model Model::Load(const ModelOptions& opts) {
   const ModelOptions::VisionMode vision_mode = opts.vision;
   (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
   (void)FakeQuantWRequest();    // R4DX_FAKEQ_W: likewise
-  // R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"): the request is parsed here, before
-  // the weights are read. It cannot share a run with the fake-quant accuracy switches, which round A / W to int8
-  // and run the f16 GEMM: the int8 kernel would quantize what they already rounded.
+  // R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"; ON by default): the request is parsed
+  // here, before the weights are read. It cannot share a run with the fake-quant accuracy switches, which round A / W
+  // to int8 and run the f16 GEMM: the int8 kernel would quantize what they already rounded. When int8 is only the
+  // default the switches win (DecidePrefillInt8 refuses with that reason, below); an explicit request is an error.
   if (!ValidPrefillInt8Option(opts.prefill_int8)) {
     throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8 must be -1, 0 or 1, got " +
                                 std::to_string(opts.prefill_int8));
   }
   const int i8_request = ResolvePrefillInt8Request(opts.prefill_int8);
-  if (i8_request == kPrefillInt8On && (FakeQuantActRequest() != kFakeQuantOff || FakeQuantWRequest() != kFakeQuantWOff)) {
+  const bool i8_fakeq = FakeQuantActRequest() != kFakeQuantOff || FakeQuantWRequest() != kFakeQuantWOff;
+  if (i8_request == kPrefillInt8On && ResolvePrefillInt8Explicit(opts.prefill_int8) && i8_fakeq) {
     throw std::invalid_argument(
-        "Model::Load: R4DX_PREFILL_INT8 cannot be combined with R4DX_FAKEQ_ACT / R4DX_FAKEQ_W (the fake-quant "
+        "Model::Load: R4DX_PREFILL_INT8=1 cannot be combined with R4DX_FAKEQ_ACT / R4DX_FAKEQ_W (the fake-quant "
         "accuracy switches round to int8 and run the f16 GEMM; the int8 GEMM would quantize twice)");
   }
   if (is_tp_rank) {
@@ -305,6 +307,7 @@ Model Model::Load(const ModelOptions& opts) {
     i8_in.tp_world = tp.world;
     i8_in.has_trellis = m.container_.HasTrellis();
     i8_in.rotated_container = i8_chunk.rotated_container;
+    i8_in.fakeq_active = i8_fakeq;
     want_i8 = DecidePrefillInt8(i8_in, &i8_why);
     if (want_i8) {
       const VramSnap vram_before_i8 = vram1;
@@ -688,12 +691,34 @@ Model Model::Load(const ModelOptions& opts) {
                    "weights per column x 128 k, int32 WMMA, per-128 fp32 rescale); "
                 << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
                 << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal calls with images stay f16; "
-                   "R4DX_PREFILL_INT8=0 turns it off\n";
+                   "R4DX_PREFILL_INT8=0 turns it off (default; measured accuracy cost in docs/int8-prefill.md)\n";
     } else if (i8_request == kPrefillInt8On) {
-      std::cerr << "[r4dx::model::Model] prefill int8: off (" << source << " asked for it, not used: "
-                << (i8_why != nullptr ? i8_why : "unknown") << ")\n";
+      std::cerr << "[r4dx::model::Model] prefill int8: off (" << source << (source == "default" ? " is on" : " asked for it")
+                << ", not used: " << (i8_why != nullptr ? i8_why : "unknown") << ")\n";
     } else {
-      std::cerr << "[r4dx::model::Model] prefill int8: off (default; R4DX_PREFILL_INT8=1 enables the int8 prefill GEMM)\n";
+      std::cerr << "[r4dx::model::Model] prefill int8: off (" << source << ": prompt prefill runs the f16 kernels everywhere; "
+                << "unset R4DX_PREFILL_INT8 for the default int8 prefill GEMM)\n";
+    }
+  }
+  // R4DX_PREFILL_SPLITKV / _MIN (docs/prefill.md "Split threshold"): the prompt-prefill attention path, one line per load.
+  {
+    namespace attn = r4dx::model::attention;
+    const int mode = attn::PrefillSplitKvOverride();
+    const int min_env = attn::PrefillSplitKvMinOverride();
+    std::cerr << "[r4dx::model::Model] prefill attention: ";
+    if (mode == attn::kPrefillAttnSplitLaw) {
+      std::cerr << "split-KV from " << (min_env == attn::kPrefillSplitKvMinUnset ? attn::kPrefillSplitKvMinCtx : min_env)
+                << " tokens of context, exact-wide launch below ("
+                << (min_env == attn::kPrefillSplitKvMinUnset ? "default" : "R4DX_PREFILL_SPLITKV_MIN")
+                << "; R4DX_PREFILL_SPLITKV=exact restores exact-wide at every depth, =0 the plain launch)\n";
+    } else if (mode == attn::kPrefillAttnExact) {
+      std::cerr << "exact-wide launch at every depth (R4DX_PREFILL_SPLITKV=exact; unset for the default split-KV from "
+                << attn::kPrefillSplitKvMinCtx << " tokens)\n";
+    } else if (mode == 1) {
+      std::cerr << "the plain launch (R4DX_PREFILL_SPLITKV=0|off|dense; unset for the default split-KV from "
+                << attn::kPrefillSplitKvMinCtx << " tokens)\n";
+    } else {
+      std::cerr << mode << " split-KV segments on every call (R4DX_PREFILL_SPLITKV=" << mode << ")\n";
     }
   }
   // R4DX_FAKEQ_ACT (docs/int8-prefill.md): parsed here (an unrecognized value throws), one line per process,

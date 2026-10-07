@@ -203,8 +203,8 @@ struct ModelOptions {
   // every Prefill call unless the conversation has an image in it; a quant2 container loads 64-row.
   int prefill_chunk = 0;
   // int8 x int8 prefill GEMM (prefill_int8.h, docs/int8-prefill.md "Production path"): -1 (default) follows the
-  // environment (R4DX_PREFILL_INT8: unset / 0 / off = off, 1 / on = on); 0 and 1 force the choice whatever the
-  // environment says (the tests load Models of each; the identity tests force 0). On, the Model builds a weight
+  // environment (R4DX_PREFILL_INT8: unset / 1 / on = on -- the default --, 0 / off = the kill switch); 0 and 1 force
+  // the choice whatever the environment says (the tests load Models of each; the identity tests force 0). On, the Model builds a weight
   // scale table per trellis linear at load (+0.7 GiB on the 27B) and runs the full 256-row super-chunks of its
   // Prefill calls through the int8 kernel; whatever cannot be served (TP, a 64-row Model, a rotated container)
   // falls back to f16 with a one-line reason at load.

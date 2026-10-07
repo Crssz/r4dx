@@ -217,6 +217,13 @@ function Get-StatsLines([string]$StderrPath) {
 
 $saved_hip = $env:HIP_VISIBLE_DEVICES
 $env:HIP_VISIBLE_DEVICES = "1"
+# int8 prefill GEMM and split-KV prompt-prefill attention are the lossy DEFAULTS since 2026-10-07; this is a byte-identity
+# guard against frozen baselines, so the candidate runs the f16 / exact-wide paths (the baselines ignore these variables).
+# The matrix's prompts are short (under 256 tokens, 2048 of context), where both defaults are no-ops anyway.
+$saved_i8 = $env:R4DX_PREFILL_INT8
+$saved_sk = $env:R4DX_PREFILL_SPLITKV
+$env:R4DX_PREFILL_INT8 = "0"
+$env:R4DX_PREFILL_SPLITKV = "exact"
 $results = New-Object System.Collections.Generic.List[object]
 try {
     foreach ($row in $Rows) {
@@ -282,6 +289,10 @@ try {
 } finally {
     if ($null -eq $saved_hip) { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
     else { $env:HIP_VISIBLE_DEVICES = $saved_hip }
+    if ($null -eq $saved_i8) { Remove-Item env:R4DX_PREFILL_INT8 -ErrorAction SilentlyContinue }
+    else { $env:R4DX_PREFILL_INT8 = $saved_i8 }
+    if ($null -eq $saved_sk) { Remove-Item env:R4DX_PREFILL_SPLITKV -ErrorAction SilentlyContinue }
+    else { $env:R4DX_PREFILL_SPLITKV = $saved_sk }
 }
 
 $table = $results | Format-Table -AutoSize | Out-String -Width 200

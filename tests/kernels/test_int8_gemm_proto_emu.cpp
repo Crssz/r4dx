@@ -169,6 +169,21 @@ void ReplaceActivations(Problem& p, uint32_t seed) {
     i8p::RefGemmInt8(p.Ap.data(), p.sa.data(), p.Wp.data(), p.sw.data(), 256, p.N, p.K, mask, p.raw[mask].data());
 }
 
+// fp32 FWHT-128 in the kernel's order (stage lg = 0..6, pair (i, i + 2^lg) -> (a + b, a - b)); trellis_ref::FwhtLdsF32's
+// twin, which the production GPU test (test_trellis_i8_gemm.cpp, check C) predicts the kernel's bytes with
+void Fwht128F32(float* v) {
+#pragma clang fp contract(off)
+  for (int lg = 0; lg < 7; ++lg) {
+    const int h = 1 << lg;
+    for (int pp = 0; pp < 64; ++pp) {
+      const int i = ((pp >> lg) << (lg + 1)) | (pp & (h - 1));
+      const float a = v[i], b = v[i + h];
+      v[i] = a + b;
+      v[i + h] = a - b;
+    }
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -313,6 +328,52 @@ int main() {
                   "KB %d: %d two-part launches (n_split 128 of 256) match each part's exact reference and the two single-part "
                   "launches byte for byte", KB, ran);
     Check(bad == 0 && ran > 0, what);
+  }
+  // ---- one-hot rows: the whole chain byte-exact (the production GPU test's check C, validated here on the source) ----
+  // Every row has a single nonzero activation, so each int32 partial sum is one product and the fp32 chain has no
+  // rounding-order freedom: the output must equal the CPU's fp32 emulation of the epilogue byte for byte.
+  for (int KB : {4, 5}) {
+    Problem p;
+    BuildProblem(p, K, N, KB, 500 + KB);
+    std::mt19937 r2(900 + KB);
+    std::vector<int> kk(256);
+    for (int r = 0; r < 256; ++r) {
+      std::fill(p.xh.begin() + (size_t)r * K, p.xh.begin() + (size_t)(r + 1) * K, (uint16_t)0);
+      kk[r] = r * (K / 256) + (int)(r2() % (unsigned)(K / 256));
+      const float m = 0.25f + (float)(r2() % 4000u) / 1000.f;
+      p.xh[(size_t)r * K + kk[r]] = i8p::F32ToF16((r2() & 1u) ? -m : m);
+    }
+    for (size_t i = 0; i < p.xh.size(); ++i) p.X[i] = i8p::F16ToF32(p.xh[i]);
+    i8p::QuantizeActRef(p.X.data(), K, p.sa, p.Ap);
+    p.A8 = i8p::PackA8(p.Ap, K);
+    // expected bytes
+    std::vector<unsigned short> expect((size_t)256 * N);
+    for (int r = 0; r < 256; ++r) {
+      float v[128];
+      const int k = kk[r], kb = k / 128;
+      const float sa = p.sa[(size_t)kb * 256 + r];
+      for (int j = 0; j < 128; ++j) {
+        const int t = (int)p.Ap[(size_t)r * K + k] * (int)p.Wp[(size_t)j * K + k];
+        const float prod = sa * p.sw[(size_t)kb * N + j];
+        v[j] = (float)t * prod;
+      }
+      Fwht128F32(v);
+      for (int j = 0; j < 128; ++j) expect[(size_t)r * N + j] = i8g_bf16_rn((v[j] * p.svh[j]) * kOutScale);
+    }
+    size_t bad = 0, runs = 0;
+    for (int skw : {2, 4, 8})
+      for (int skg : {1, 2, 4, 8}) {
+        I8gCfg c;
+        c.trellis = true; c.kb = KB; c.fwht = true; c.resc = 0; c.skw = skw; c.skg = skg;
+        if (I8gCheck(c, K, N)) continue;
+        std::fill(C.begin(), C.end(), (unsigned short)0xFFFF);
+        Run(c, p.A8.data(), p.sa.data(), p.grid.data(), p.sw.data(), p.svh.data(), C.data(), ws.data(), tk.data(), K, N, kOutScale);
+        ++runs;
+        for (size_t i = 0; i < C.size(); ++i) bad += C[i] != expect[i];
+      }
+    char what[200];
+    std::snprintf(what, sizeof what, "KB %d: %zu one-hot launches byte-exact vs the fp32 emulation of the epilogue (%zu bytes differ)", KB, runs, bad);
+    Check(bad == 0 && runs > 0, what);
   }
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("%s (%d checks, %.1f s)\n", g_ok ? "ALL OK" : "FAILED", g_checks, s);

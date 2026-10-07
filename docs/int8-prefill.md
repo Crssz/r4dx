@@ -525,8 +525,7 @@ against the prototype's listing from before the two-part parameters, each kernel
 
 Run and passing: `test_int8_gemm_proto_cpu` (layouts, quantizers, software-WMMA chain), `test_int8_gemm_proto_emu` (the production
 kernel SOURCE compiled as plain C++, run against exact references: every instantiation of the bench, plus the new two-part
-cases: quantizer part 1, `n_split` against each part's reference and against two single-part launches, byte for byte; 12 checks,
-88 s), `test_prefill_int8_cpu` (the parser, the decision table, `PlanTrellisI8` for the seven classes at both rates and its
+cases: quantizer part 1, `n_split` against each part's reference and against two single-part launches, byte for byte, and a\none-hot check that the whole chain is byte-exact against the CPU's fp32 emulation of the epilogue, the very prediction\n`test_trellis_i8_gemm` check C makes on the GPU; 14 checks, 95 s), `test_prefill_int8_cpu` (the parser, the decision table, `PlanTrellisI8` for the seven classes at both rates and its
 refusals, the table's legality under the kernel's own check, the scope), `test_prefill_chunk` (unchanged), the build gates
 (`r4d_trellis_isa`: ISA, VGPR, near-dependency, `diff_epilogue`). Built, NOT run: `test_trellis_i8_gemm` (GPU kernel bit-test),
 `test_prefill_int8` (model test), `tool_int8_gemm_proto` (with `--emit-rows`), `tool_teacher_forced_logprobs`, `r4dx-cli`,

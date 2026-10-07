@@ -218,6 +218,12 @@ Model Model::Load(const ModelOptions& opts) {
                                 std::to_string(opts.prefill_int8_scales));
   }
   const int i8_scales = ResolvePrefillInt8Scales(opts.prefill_int8_scales);
+  // R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): off unless asked; only read where it matters.
+  if (!ValidPrefillInt8Tp2Option(opts.prefill_int8_tp2)) {
+    throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8_tp2 must be -1, 0 or 1, got " +
+                                std::to_string(opts.prefill_int8_tp2));
+  }
+  const bool i8_tp2 = ResolvePrefillInt8Tp2(opts.prefill_int8_tp2);
   const bool i8_fakeq = FakeQuantActRequest() != kFakeQuantOff || FakeQuantWRequest() != kFakeQuantWOff;
   if (i8_request == kPrefillInt8On && ResolvePrefillInt8Explicit(opts.prefill_int8) && i8_fakeq) {
     throw std::invalid_argument(
@@ -311,6 +317,7 @@ Model Model::Load(const ModelOptions& opts) {
     i8_in.requested = i8_request;
     i8_in.wide = DecidePrefillChunk(i8_chunk) == kPrefillChunkWide;
     i8_in.tp_world = tp.world;
+    i8_in.tp2_enabled = i8_tp2;
     i8_in.has_trellis = m.container_.HasTrellis();
     i8_in.rotated_container = i8_chunk.rotated_container;
     i8_in.fakeq_active = i8_fakeq;
@@ -698,6 +705,10 @@ Model Model::Load(const ModelOptions& opts) {
                         ? "scales COARSE (R4DX_PREFILL_INT8_SCALES=coarse): A per row, weights per column, over the whole K, "
                           "int32 WMMA, one fp32 rescale at the end"
                         : "A per row x 128 k, weights per column x 128 k, int32 WMMA, per-128 fp32 rescale")
+                << (is_tp_rank ? "; TP rank " + std::to_string(tp.rank) +
+                                     " shards (R4DX_PREFILL_INT8_TP2=1; a shard shape without a row in the TP = 2 int8 tuning tables runs f16, "
+                                     "once-per-shape notice)"
+                               : std::string())
                 << "); " << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
                 << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal calls with images stay f16; "
                    "R4DX_PREFILL_INT8=0 turns it off (default; measured accuracy cost in docs/int8-prefill.md)\n";

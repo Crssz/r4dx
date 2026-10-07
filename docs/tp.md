@@ -807,7 +807,8 @@ Device 0 also carries the desktop; ~15 GiB headroom remains on each card.
 Trellis containers (`--layout trellis`, measured 2026-09-28 at `--max-ctx 2048`; docs/perf.md
 "Trellis at TP=2"): the process's buffers on each rank are 9.63 GiB for mix4.5m (the load log counts 9.40 GiB of
 weights) and 8.92 GiB for K4m. With `--dflash` they are 11.12 / 10.41
-GiB, and with `--mtp 3` 9.84 / 9.14 GiB. The trellis rank shapes run `gemm_tuning_table_trellis_tp2.inc`.
+GiB, and with `--mtp 3` 9.84 / 9.14 GiB. The trellis rank shapes run `gemm_tuning_table_trellis_tp2.inc`. The int8 x int8 prefill GEMM
+on these rank shapes (`R4DX_PREFILL_INT8_TP2`, default off, its own tuning tables) is docs/int8-prefill.md "Tensor parallel".
 
 ---
 

@@ -221,6 +221,7 @@ class ShardLoader {
            std::to_string(cols.begin + cols.count) + ") is not whole 128-blocks");
     }
     SetTrellisFields(q, t);
+    q.trellis_tp_shard = world_ > 1 && rule.split != tp::Split::kReplicate;   // PlanTrellisI8 keys its rows by it
     tp::PartShape wshape;
     wshape.part = tp::Part::kTrellisW;
     wshape.N = N;

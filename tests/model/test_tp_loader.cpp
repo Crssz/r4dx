@@ -20,13 +20,15 @@
 // Plus the load-time refusals: TP-only options at tp_world 1, vision weights on rank 1.
 // And the trellis cases (docs/trellis-kernel.md 2.4, 5.5; CheckTrellisTp below) on tests/convert's
 // tiny trellis containers (FIXTURES_REQUIRED trellis_tiny): both ranks' words, suh, svh and part
-// widths against the TP=1 load of the same file.
+// widths against the TP=1 load of the same file, the QuantLinear::trellis_tp_shard flag (set on a rank's linear, never at TP=1), and
+// the int8 weight scale tables of a shard (docs/int8-prefill.md "Tensor parallel") against the TP=1 tables.
 //
 // GPU test on HIP device 1 (ctest sets HIP_VISIBLE_DEVICES=1); SKIPs (77) when neither the 4-layer
 // container nor the tiny trellis ones are present. Peak VRAM ~7 GiB (both bf16 ranks at once, no
 // embedding mirror).
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -37,6 +39,7 @@
 #include "container.h"
 #include "model_config.h"
 #include "r4dx/core/error.hpp"
+#include "r4dx/core/r4d.hpp"  // the int8 weight scale tables (TrellisI8WscaleBuild / ...ColBuild)
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "test_common.h"
 #include "tp/tp_shard.h"
@@ -561,9 +564,31 @@ int CheckTrellisTp(Checker& ck) {
       const std::vector<uint32_t> fw = q.trellis_w.CopyToHost();
       const std::vector<float> fsuh = q.trellis_suh.CopyToHost(), fsvh = q.trellis_svh.CopyToHost();
       const tp::ShardRule rule = tp::RuleFor(l.base, g);
+      ck.Expect(!q.trellis_tp_shard, what + ": a TP=1 linear is not a TP shard (QuantLinear::trellis_tp_shard)");
+      // R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): the int8 weight scale tables, built from words alone by
+      // the same libr4d calls BuildTrellisI8Scale makes. The TP=1 tables are the reference: a shard's per-(column, 128 k) table
+      // must be exactly the TP=1 table of its rows and K blocks (a shard boundary is a whole 128-block); the per-column coarse
+      // table of a column-parallel shard is exactly the TP=1 table of its rows, and of a row-parallel pair the two shards' (each
+      // over its own K half) are <= the whole-K scale with the larger of the two equal to it (the scale is a monotone function of
+      // the column's amax).
+      const auto blk_table = [&](const QuantLinear& x) {
+        r4dx::core::DeviceBuffer<float> t(r4dx::core::r4d::TrellisI8WscaleCount(static_cast<int>(x.K), static_cast<int>(x.N)));
+        r4dx::core::r4d::TrellisI8WscaleBuild(x.trellis_w.data(), t.data(), static_cast<int>(x.K), static_cast<int>(x.N), x.trellis_bits, nullptr);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        return t.CopyToHost();
+      };
+      const auto col_table = [&](const QuantLinear& x) {
+        r4dx::core::DeviceBuffer<float> t(r4dx::core::r4d::TrellisI8WscaleColCount(static_cast<int>(x.K), static_cast<int>(x.N)));
+        r4dx::core::r4d::TrellisI8WscaleColBuild(x.trellis_w.data(), t.data(), static_cast<int>(x.K), static_cast<int>(x.N), x.trellis_bits, nullptr);
+        R4DX_HIP_CHECK(hipDeviceSynchronize());
+        return t.CopyToHost();
+      };
+      const std::vector<float> full_blk = blk_table(q), full_col = col_table(q);
+      std::vector<float> shard_col[kWorld];
       for (int r = 0; r < kWorld; ++r) {
         const QuantLinear& s = *l.rank[r];
         const std::string w = what + " rank " + std::to_string(r);
+        ck.Expect(s.trellis_tp_shard, w + ": a TP rank's linear is a shard (QuantLinear::trellis_tp_shard)");
         ck.Expect(s.layout == Layout::kTrellis && s.trellis_bits == kb &&
                       s.trellis_prescale_log2 == q.trellis_prescale_log2 &&
                       s.trellis_parts == q.trellis_parts && s.trellis_tickets != nullptr,
@@ -609,6 +634,35 @@ int CheckTrellisTp(Checker& ck) {
                       s.trellis_part_n[1] == (two ? q.trellis_part_n[1] / kWorld : 0),
                   w + ": rank-local part widths " + std::to_string(s.trellis_part_n[0]) + " + " +
                       std::to_string(s.trellis_part_n[1]));
+        // the int8 weight scale tables of this shard (see above)
+        const std::vector<float> sblk = blk_table(s), scol = col_table(s);
+        bool blk_ok = sblk.size() == static_cast<size_t>((s.K / 128) * s.N), col_ok = scol.size() == static_cast<size_t>(s.N);
+        for (int64_t kbl = 0; blk_ok && kbl < s.K / 128; ++kbl)
+          for (int64_t nl = 0; blk_ok && nl < s.N; ++nl) {
+            const float a = sblk[static_cast<size_t>(kbl * s.N + nl)];
+            const float b = full_blk[static_cast<size_t>((k0 / 128 + kbl) * N + row_of[static_cast<size_t>(nl)])];
+            blk_ok = std::memcmp(&a, &b, sizeof a) == 0;
+          }
+        ck.Expect(blk_ok, w + ": int8 per-(column, 128 k) weight scale table == the TP=1 table of its rows and K blocks, bit for bit");
+        if (rule.split == tp::Split::kRows) {
+          for (int64_t nl = 0; col_ok && nl < s.N; ++nl) {
+            const float a = scol[static_cast<size_t>(nl)], b = full_col[static_cast<size_t>(row_of[static_cast<size_t>(nl)])];
+            col_ok = std::memcmp(&a, &b, sizeof a) == 0;
+          }
+          ck.Expect(col_ok, w + ": int8 per-column (coarse) weight scale table == the TP=1 table of its rows, bit for bit");
+        } else {
+          shard_col[r] = scol;
+          for (int64_t n = 0; col_ok && n < s.N; ++n) col_ok = scol[static_cast<size_t>(n)] <= full_col[static_cast<size_t>(n)];
+          ck.Expect(col_ok, w + ": int8 per-column (coarse) weight scale of a K half <= the whole-K scale");
+        }
+      }
+      if (rule.split == tp::Split::kCols) {
+        bool max_ok = shard_col[0].size() == full_col.size() && shard_col[1].size() == full_col.size();
+        for (size_t n = 0; max_ok && n < full_col.size(); ++n) {
+          const float m = std::max(shard_col[0][n], shard_col[1][n]);
+          max_ok = std::memcmp(&m, &full_col[n], sizeof m) == 0;
+        }
+        ck.Expect(max_ok, what + ": row-parallel pair: max of the two K halves' coarse weight scales == the whole-K scale, bit for bit");
       }
     }
     ck.Expect(lins.size() == 11, std::string(path) + ": 11 trellis linears checked");

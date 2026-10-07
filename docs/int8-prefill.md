@@ -411,7 +411,8 @@ prompt-prefill attention (docs/prefill.md "Split threshold"). What changed:
 | `R4DX_FAKEQ_ACT/W` set, int8 only the default | n/a | int8 is refused with the reason `R4DX_FAKEQ_ACT / R4DX_FAKEQ_W are set`, the experiment runs as before |
 
 Unchanged: it still runs only where it did (full 256-row super-chunks of `Prefill` calls on a TP = 1 trellis Model: tails, a
-64-row Model, a quant2 container, TP = 2, images, decode and verify windows and the Gemma 4 model stay on the f16 kernels).
+64-row Model, a quant2 container, TP = 2 (unless `R4DX_PREFILL_INT8_TP2=1`, off by default, "Tensor parallel"), images, decode and
+verify windows and the Gemma 4 model stay on the f16 kernels).
 Costs now paid by default: +0.7 GiB of weight scale tables at load (`R4DX_PREFILL_INT8=0` skips them), prefill rows that are a
 quantized model of the f16 rows (KL numbers in Results), and the KV bytes of a prompt depending on the chunk grid and so on
 the prefix-cache state (a prefix-reuse suffix anchors its own grid). Load line: `prefill int8: ON (default): ...`, or
@@ -447,7 +448,7 @@ f16 kernel's FWHT / svh / out_scale / one bf16 rounding). It is a quantized MODE
 | | |
 |---|---|
 | runs int8 | the rows of a full 256-row super-chunk of a `Prefill` call, on a TP = 1 Model that runs 256-row chunks (`R4DX_PREFILL_CHUNK` unset / 256) and whose container is trellis, for every linear class with an int8 plan (all seven of the 27B, KB 4 and 5) |
-| stays f16 | tails (1..255 rows: 64-row slices), `R4DX_PREFILL_CHUNK=0/64`, a quant2 (rotated) container, MTP and DFlash 64-row slices, decode and verify windows, the vision tower, **`PrefillMultimodal`** with image spans, or after an image has made the positions multimodal (image accuracy is unmeasured; it never sets the per-call flag; a text-only call with no image ever seen delegates to `Prefill` and so DOES run int8, which is the only text-only path the CLI and the server use), TP = 2 (explicit fallback with a reason at load), the Gemma 4 model (switch ignored, said once) |
+| stays f16 | tails (1..255 rows: 64-row slices), `R4DX_PREFILL_CHUNK=0/64`, a quant2 (rotated) container, MTP and DFlash 64-row slices, decode and verify windows, the vision tower, **`PrefillMultimodal`** with image spans, or after an image has made the positions multimodal (image accuracy is unmeasured; it never sets the per-call flag; a text-only call with no image ever seen delegates to `Prefill` and so DOES run int8, which is the only text-only path the CLI and the server use), TP = 2 (explicit fallback with a reason at load, unless `R4DX_PREFILL_INT8_TP2=1`: off by default and, until the TP = 2 tuning tables have rows, still f16; see "Tensor parallel"), the Gemma 4 model (switch ignored, said once) |
 
 `ApplyLinear` takes the int8 branch when `M == 256 && TrellisM256Active() && TrellisI8Active()` and the linear has a plan
 and a scale table; anything else falls through to the f16 paths. `ScopedTrellisI8` is opened beside `ScopedTrellisM256`
@@ -522,7 +523,8 @@ KL(off || on).
 
 * **TP = 2 in v1**: an explicit f16 fallback, logged once at load. The kernel itself is shape-generic (the rank shards K/2 and
   N/2 are still whole 128-blocks, `n_split` 8704) and `test_trellis_i8_gemm` bit-tests every TP = 2 rank shape, so v2 needs
-  wiring and its own KL gate only.
+  wiring and its own KL gate only. The wiring is written (branch `int8v2`, `R4DX_PREFILL_INT8_TP2`, default off, own empty tuning
+  tables): "Tensor parallel" below.
 
 ### The fused quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, branch `int8v2`)
 
@@ -583,7 +585,8 @@ powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\
 
 **Caveats.** The A8 stores are one byte per element (4 `global_store_b8` per lane, 16 8-byte segments per wave): the write combining is
 left to the L2 and the unfused quantizer's dword stores are not reproduced; if the GPU time of the fused kernels shows it, the
-fix is a 4-lane shuffle into dwords. TP = 2 still runs f16 (no int8 scopes), so nothing of this applies there. The Gemma 4 trellis
+fix is a 4-lane shuffle into dwords. TP = 2 runs f16 unless `R4DX_PREFILL_INT8_TP2=1` ("Tensor parallel"); with it the producers run at the
+shard widths (K 8704 silu_mul, K 3072 gate-mul, both byte-tested by `test_trellis_input_i8`). The Gemma 4 trellis
 producers (`r4dx_gelu_tanh_mul_trellis_bf16`) are not wired (that model has no int8 path).
 
 ### Coarse scales (`R4DX_PREFILL_INT8_SCALES=coarse`, branch `int8v2`)
@@ -715,7 +718,145 @@ Gates for making coarse the default (it would need the same list as "Gates for m
 f16 path and the speed ones against the per-128 default): KL(f16 || coarse) mean at most 0.0020, p99 at most 0.012, top-1 agreement at
 least 98.3% on the chunked canon; per-kind at most 0.003 at 8k and 32k with no row above 2 (the per-128 kernel sits at 0.0011 / 0.0017
 and 0.0104 at 32k, so there is little room at 32k code); and at least 3% faster cold TTFT than the per-128 default at 8k and 32k, else the
-accuracy it gives up buys nothing. What is NOT covered here, and not covered for the per-128 default either: TP = 2, images.
+accuracy it gives up buys nothing. What is NOT covered here, and not covered for the per-128 default either: images, and TP = 2
+(see "Tensor parallel" next, which wires the kernel for it, off by default).
+
+### Tensor parallel (`R4DX_PREFILL_INT8_TP2`, branch `int8v2`)
+
+Status: written, built and CPU-tested (`test_prefill_int8_cpu`, 485 checks, PASS); every GPU check below is written and NOT run (the
+writing session was CPU only). **The switch is OFF by default and the TP = 2 tuning tables are EMPTY**: nothing changes at TP = 2 until
+the bench has produced rows (`--tp 2`) and the accuracy gates below have been run. With the switch on and no rows the Model says so at
+load and runs f16 (byte-identical to the switch off, `test_prefill_int8_tp2` checks it).
+
+**Why TP = 2 ran f16 (every reason, found by reading the code).**
+
+1. `DecidePrefillInt8` (`prefill_int8.h`) refused `tp_world > 1` outright (the only hard switch; Model::Load calls it with
+   `tp.world`). The 256-row super-chunks themselves are NOT the obstacle: `DecidePrefillChunk` serves TP = 2, every rank runs
+   `Model::Prefill` -> `RunChunk` with `ScopedTrellisM256` open, `Model::Prefill` sets `prefill_int8_call_` on each rank, and `TpWarmup`
+   runs a 256-row prefill first, so the scope would be open on both ranks.
+2. `PlanTrellisI8` had no row for any rank shard shape: its table is keyed by `(N, K, KB)` of the seven TP = 1 classes. Lifting (1)
+   alone would have left every shard on f16 with the once-per-shape notice, except `attn.qg`, whose rank shape 6144 x 5120 equals
+   `gdn.in_proj_z`'s TP = 1 class: that linear alone would have taken the TP = 1 row, silently half-covering the model. (The f16 side
+   keys a separate TP = 2 table for exactly this reason, `gemm_tuning_table_trellis_tp2.inc`.)
+3. Nothing else: the scale tables are built from the rank's own words (`Container::BuildTrellisI8Scales` on the rank thread, the
+   rank's device and stream), the producers and `ApplyLinear` decide with the same `TrellisI8Takes` / `TrellisI8FusedQ`, and the kernel
+   was already bit-tested at all seven rank shapes (`test_trellis_i8_gemm`). No collective, comm or lockstep code is involved.
+
+**How TP = 2 shards the trellis linears** (docs/tp.md 4.2, 4.3, 5.2; the shapes below are derived from the real
+`tp::RuleFor` / `RankRows` / `RankCols` by `test_prefill_int8_cpu`):
+
+| class (count per forward) | rule | global N x K | rank N x K (part boundary) | K / 128 | legal `(skw, skg)` (`skw skg` divides K / 128) |
+|---|---|---|---|---|---|
+| mlp.gate_up (64) | column-parallel, 2 segments gate / up, 2 A parts | 34816 x 5120 | 17408 x 5120 (8704) | 40 | (2,1) (2,2) (2,4) (4,1) (4,2) (8,1) |
+| mlp.down (64) | row-parallel | 5120 x 17408 | 5120 x 8704 | **68** | **(2,1) (2,2) (4,1) only** |
+| gdn.in_proj_qkv (48) | column-parallel, 3 segments q / k / v | 10240 x 5120 | 5120 x 5120 | 40 | as gate_up |
+| gdn.in_proj_z (48) | column-parallel | 6144 x 5120 | 3072 x 5120 | 40 | as gate_up |
+| gdn.out_proj (48) + attn.o (16) | row-parallel | 5120 x 6144 | 5120 x 3072 | 24 | as gate_up |
+| attn.qg (16) | column-parallel, per-head `[q | gate]` | 12288 x 5120 | 6144 x 5120 | 40 | as gate_up |
+| attn.k, attn.v (16 each) | column-parallel | 1024 x 5120 | 512 x 5120 | 40 | as gate_up |
+
+* **The trellis tensors are sliced, not re-encoded.** `ShardLoader::TrellisSlice` cuts the pair-grid words by bytes (a run of rows is one
+  byte range, a K range one run per pair row; every range whole 128-blocks, which is whole 32 x 16 tiles), slices `suh` (row-parallel:
+  the rank's K range; column-parallel: replicated) and `svh` (column-parallel: the rank's rows) and recomputes the part widths. A rank's
+  linear is then a stand-alone trellis linear of the rank shape, which is why the f16 and int8 kernels run on it unchanged.
+  `test_tp_loader` checks the words, `suh`, `svh` and part widths of both ranks against the TP = 1 load.
+* **K blocks never straddle a shard.** Every row range, K range and part boundary is a whole 128-block (the loader refuses otherwise and
+  `test_prefill_int8_cpu` re-derives it): K / 2 = 3072 (24 blocks) and 8704 (68 blocks), K shard offsets 3072 r and 8704 r, N shards
+  1024 / 3072 / 6144 / 8704 multiples. So with `blk128` scales the A8 + SA of a row-parallel shard are exactly the TP = 1 blocks of its
+  K range, and a shard's per-(column, 128 k) weight table is exactly the TP = 1 table of its rows and K blocks (`test_tp_loader`
+  checks the tables bit for bit): **TP = 2 `blk128` int8 differs from TP = 1 `blk128` int8 only in the order of the fp32 sums and
+  the bf16 all-reduce**, the same noise TP = 2 f16 has against TP = 1 f16 (docs/tp.md 10.4: KL 0.00089).
+* **`coarse` is not TP = 1's slice for the row-parallel classes** (mlp.down, gdn.out_proj, attn.o): the A scale is the amax over the
+  rank's K half and the weight scale is per column over the rank's K half, i.e. FINER than TP = 1's whole-K scales (the two halves'
+  column scales are each at most the TP = 1 scale, and their maximum equals it, `test_tp_loader`). Column-parallel classes have the
+  whole K per rank and equal TP = 1's. So `coarse` at TP = 2 needs its own KL run and is expected to be at least as accurate as TP = 1's.
+* **Sizes.** The weight tables are `K N / 32` bytes per linear: 0.354 GiB per rank for `blk128` (half of 0.708 GiB), about 7 MiB per
+  rank for `coarse`; device 0 also carries the desktop (docs/tp.md 4.5: ~15 GiB headroom remains). The int8 GEMM's `ws` is
+  `skg * 256 * N * 4` bytes from the arena (224 MiB on a wide Model): the widest shard is mlp.gate_up (N = 17408, 17.8 MB per `skg`),
+  so any legal row fits (skg 8 would be 142 MB); the bench's rule picks the smallest `skg` within 1% anyway. `TpWarmup`'s 256-row prefill
+  (run when the KV cache holds a 256-row chunk, i.e. `--max-ctx` of at least 256) would raise an arena overflow at load, not mid-request.
+
+**What was built.**
+
+| piece | where |
+|---|---|
+| `R4DX_PREFILL_INT8_TP2` (read once; unset, empty, `0`, `off` = off, the default; `1`, `on` = asks for it; anything else warns and keeps the default), `ModelOptions::prefill_int8_tp2` (-1 follows the environment; 0 / 1 force it, the tests load both in one process), `PrefillInt8Inputs::tp2_enabled`, the `DecidePrefillInt8` reasons (TP without the switch: names the switch; switch on but no shard linear has a plan: names the TP tables and the bench command) | `prefill_int8.h`, `model.h`, `Model::Load` |
+| `QuantLinear::trellis_tp_shard`, set by `ShardLoader::TrellisSlice` for a column- or row-parallel linear of a world > 1 load (never at TP = 1, never for a replicated linear) | `quant_linear.h`, `shard_loader.h` |
+| `PlanTrellisI8(..., coarse, tp_shard)` and `TrellisI8Rows(..., coarse, tp_shard)`: a shard linear reads the TP = 2 tables ONLY (no borrowed row for `attn.qg`), and a TP = 1 linear never reads them; the refusal says "no int8 tuning row for this TP rank-shard (N, K, KB) (...: tool_int8_gemm_proto --tp 2 --emit-rows)", and the once-per-shape notice reads `trellis TP shard [N x K] KB4 parts 1 has no int8 plan (...); its 256-row calls run the f16 kernel` | `linear.h`, `linear.cpp` |
+| `gemm_tuning_table_trellis_i8_tp2.inc`, `gemm_tuning_table_trellis_i8c_tp2.inc` (`kTrellisI8Tp2Table`, `kTrellisI8cTp2Table`): EMPTY, one `N == 0` placeholder row each (a C++ array cannot be empty; no plan matches it, the CPU test skips it) | `src/model/` |
+| `tool_int8_gemm_proto --tp 2`: times, verifies and emits the seven rank shapes (`kShapesTp2`) against the f16 plan of the TP = 2 table (the f16 baseline of `gdn.in_proj_z` KB5, whose M = 64 row has no exact M = 256 configuration, is a flagged stand-in), and writes `kTrellisI8Tp2Table` / `kTrellisI8cTp2Table`; compiled (`-Lite`), not run | `tests/kernels/tool_int8_gemm_proto.hip` |
+| `TpModel::Load` compares `PrefillInt8Enabled()` across the ranks with the other capabilities (a split decision throws `TpDivergenceError`: a half-int8 prefill would still all-reduce, wrongly mixed) | `tp_model.cpp` |
+| the load line gains `; TP rank r shards (R4DX_PREFILL_INT8_TP2=1; ...)` when it is on; `prefill int8: off (default is on, not used: tensor parallelism (... R4DX_PREFILL_INT8_TP2=1 ...))` when it is not asked for | `Model::Load` |
+
+Everything else is shared with TP = 1 and unchanged: the producers (`SharedTrellisInput`, silu_mul, gate-mul) decide per group with
+`TrellisI8FusedQ`, so a group with a shard that has no row keeps f16 for all of it; `ApplyLinear` takes int8 per linear; the row-parallel
+all-reduce runs on the bf16 output exactly as before (it sums the ranks' partial outputs after the epilogue, which is linear); the fused
+producers are bit-tested at the shard widths (K 8704 silu_mul, K 3072 gate-mul, `test_trellis_input_i8`); `TpWarmup` runs the 256-row
+prefill through the int8 chain when it is on, so the first launch of every int8 kernel is inside the load.
+
+**OFF path.** With the switch unset a TP = 2 Model decides at load that it does not use int8 (`DecidePrefillInt8` refuses at the TP
+check, before any table is built), builds no scale table, opens no scope and launches nothing new: it is byte-identical to one built
+before this branch (T3 checks it against main's binary). `QuantLinear` gained one bool; no kernel, no f16 launch and no tuning row
+changed (no libr4d file is touched).
+
+**Tests.**
+
+| test | where | status |
+|---|---|---|
+| the switch's parser and option; `DecidePrefillInt8`'s TP rows and their order; the 27B's rank shapes from the real `RuleFor` / `RankRows` / `RankCols` against docs/tp.md 4.2, every range whole 128-blocks, K shard offsets 3072 r / 8704 r; at least one kernel-legal `(skw, skg)` per shard class (mlp.down: exactly three); the shard plan is ok iff the TP = 2 table has the row, a shard never borrows the TP = 1 row (`attn.qg`), a TP = 1 linear never reads a shard row, the refusal reasons; the TP = 2 tables (placeholder skipped, no duplicate, legal, shard shapes only); the f16 M = 256 plan at the rank shapes (printed) | `tests/model/test_prefill_int8_cpu.cpp` (CPU, +222 checks) | PASS (485 checks) |
+| `trellis_tp_shard` set on every rank linear and never at TP = 1; the int8 weight scale table of every shard == the TP = 1 table of its rows and K blocks, bit for bit (`TrellisI8WscaleBuild` on tiny trellis containers, KB 4 and mix); the per-column coarse table of a column-parallel shard == TP = 1's rows, of a row-parallel pair: each half <= the whole-K scale and the larger of the two == it | `tests/model/test_tp_loader.cpp` `CheckTrellisTp` (GPU, tiny containers, fixture `trellis_tiny`) | built, not run |
+| `TpModel` (emulate) on the real container: switch off -> f16 on both ranks; switch on with empty tables -> refused, both ranks f16, every observable byte-identical to off; with rows -> int8 chunk counts per rank, no-super-chunk scenarios identical, deterministic rerun, KL(TP = 2 f16 \|\| TP = 2 int8), and TP = 2 int8 against TP = 1 int8 | `tests/model/test_prefill_int8_tp2.cpp` (GPU, up to four 27B loads) | built, not run |
+| the seven rank shapes at both rates: kernel exactness (`r4d_gemm_trellis_nt_i8` and `_i8c`, every legal `(skw, skg)`, one-hot, two parts, tickets, row independence) | `tests/kernels/test_trellis_i8_gemm.cpp` (GPU, already covers the TP = 2 shards) | built (rebuilt on this branch), not run |
+| the bench at `--tp 2`: selftest, verify, sweep, timing, `--emit-rows` / `--emit-rows-coarse` | `tool_int8_gemm_proto.exe` (compiled with `build_int8_gemm_proto.ps1 -Lite` to check it) | built, not run |
+
+**What still needs the GPU** (the main session; one job at a time; TP = 2 real mode needs device 0 as well, so stop the production server first,
+docs/tp.md 9.2; outputs under `E:\models\r4dx\int8v2\tp2\`). Order matters: the fallback checks first, then the rows, then accuracy and speed.
+
+```
+# T1. the loader and the scale tables of a shard (tiny containers; a minute)
+ctest --test-dir C:\Users\pay20\dev\r4dx-int8v2\build\win-hip -R "^(convert_trellis_import|test_tp_loader)$" --output-on-failure
+# T2. the fallback with the TP tables EMPTY (as shipped): switch on == switch off, byte for byte (two 27B TP = 2 emulated loads, ~8 minutes)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\model\test_prefill_int8_tp2.exe; exit `$LASTEXITCODE"
+#     pass: "[PASS] tp2 fallback: ..." and "test_prefill_int8_tp2: PASS"; the load lines say "prefill int8: off (...not used: no TP rank-shard linear has an int8 plan ...)"
+# T3. TP = 2 identity with int8 off against main's TP = 2 (real mode, both GPUs): main's tool and this branch's tool, switch unset, the same tokens
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Tp 2 -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -Tool C:\Users\pay20\dev\r4dx\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -OutDir E:\models\r4dx\int8v2\tp2\kl-main-tp2
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Tp 2 -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8v2\tp2\kl-branch-tp2-off
+#     pass: every *.logprobs.f16 of the two directories has the same SHA-256 (Get-ChildItem both | Get-FileHash)
+# B1. the bench at the rank shapes (idle machine, both GPUs free; device 1; ~15 minutes): selftest, verify, the sweep and both tables
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tests\kernels\build_int8_gemm_proto.ps1 -Out E:\models\r4dx\int8v2\obj
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & E:\models\r4dx\int8v2\obj\tool_int8_gemm_proto.exe --tp 2 --mode all --out E:\models\r4dx\int8v2\tp2\all.json --emit-rows E:\models\r4dx\int8v2\tp2\rows_tp2.inc --emit-rows-coarse E:\models\r4dx\int8v2\tp2\rows_c_tp2.inc 2>&1 | Tee-Object -FilePath E:\models\r4dx\int8v2\tp2\all.log; exit `$LASTEXITCODE"
+#     pass: the selftest and every verify line pass; "ALL SEVEN LINEAR CLASSES, TP = 2 RANK SHARDS KB4/KB5" gives the speed (compare with x1.37 / x1.33 at TP = 1)
+#     then copy rows_tp2.inc over src\model\gemm_tuning_table_trellis_i8_tp2.inc and rows_c_tp2.inc over ..._i8c_tp2.inc (14 rows each; the CPU
+#     test lists how many it sees), rebuild (cmake --build build\win-hip --target test_prefill_int8_cpu test_prefill_int8_tp2 r4dx-cli tool_teacher_forced_logprobs), run test_prefill_int8_cpu
+# B2. the int8 part of the TP = 2 Model test, with rows (the tables are compiled in; four loads, ~14 minutes)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\model\test_prefill_int8_tp2.exe; exit `$LASTEXITCODE"
+# A1. accuracy, the chunked canon prefill under TP = 2, real mode: f16 (T3's kl-branch-tp2-off), int8 on, and the TP = 1 int8 twin
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8_TP2='1'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Tp 2 -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8v2\tp2\kl-tp2-on; exit `$LASTEXITCODE"
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Device 1 -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8v2\tp2\kl-tp1-on
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8='0'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Device 1 -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8v2\tp2\kl-tp1-off; exit `$LASTEXITCODE"
+$py = "C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe"; $kl = "C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\kl_compare.py"; $tok = "C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json"
+& $py $kl --ref E:\models\r4dx\int8v2\tp2\kl-branch-tp2-off --test E:\models\r4dx\int8v2\tp2\kl-tp2-on --tokens $tok      # TP2 int8 vs TP2 f16: the cost of int8 at TP = 2
+& $py $kl --ref E:\models\r4dx\int8v2\tp2\kl-tp1-on --test E:\models\r4dx\int8v2\tp2\kl-tp2-on --tokens $tok            # TP2 int8 vs TP1 int8: should sit at the next line's level (blk128)
+& $py $kl --ref E:\models\r4dx\int8v2\tp2\kl-tp1-off --test E:\models\r4dx\int8v2\tp2\kl-branch-tp2-off --tokens $tok   # TP2 f16 vs TP1 f16: the TP noise floor (docs/tp.md: mean 0.00089)
+#     8k / 32k: the same four runs with -Tokens the tokens_long.json of G4c (tools\prefill\make_kl_tokens.py --lengths 8k,32k)
+# S1. speed end to end, TP = 2 real mode: cold TTFT 8k / 32k, switch off and on (separate processes; greedy hashes must be equal to the TP = 1 gate's rule)
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\ttft_cli.ps1 -Tp 2 -Lengths 8k,32k -Runs 3 -OutDir E:\models\r4dx\int8v2\tp2\ttft-off
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8_TP2='1'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\ttft_cli.ps1 -Tp 2 -Lengths 8k,32k -Runs 3 -OutDir E:\models\r4dx\int8v2\tp2\ttft-on; exit `$LASTEXITCODE"
+# C1. coarse at TP = 2 (its own rows from B1, own KL): the A1 / S1 runs again with R4DX_PREFILL_INT8_SCALES=coarse as well
+```
+
+**Gates for turning it on by default at TP = 2** (the same as TP = 1's, against the TP = 2 f16 run, plus the TP-specific ones): KL(TP = 2 f16
+\|\| TP = 2 int8) mean at most 0.0020, p99 at most 0.012, top-1 agreement at least 98.3% on the chunked canon, per-kind at most 0.003 at 8k and
+32k with no row above 2; KL(TP = 1 int8 \|\| TP = 2 int8) at most 1.5 x KL(TP = 1 f16 \|\| TP = 2 f16) (blk128 only differs in summation
+order; a larger gap means a shard scale or alignment bug); T2 and T3 byte-identical; cold TTFT faster at 8k and 32k (predicted, NOT
+measured: the linears are a smaller share of a TP = 2 prefill than of a TP = 1 one, the all-reduces and the per-rank attention do not
+shrink, so expect a gain between half and three quarters of TP = 1's 18.9% / 15.7%, i.e. roughly -10 to -14% at 8k); a 128k TP = 2
+prefill completes, VRAM headroom on device 0 logged, no NaN, no all-reduce timeout (docs/tp.md 12); the greedy hash stable across two runs.
+The default is flipped by changing `ParsePrefillInt8Tp2`'s unset case, nothing else.
+
+**Not done / open.** The TP = 2 tables are empty by design (no measurement was possible); the `blk128` and `coarse` accuracy at TP = 2
+is unmeasured (the equality argument above is a prediction, `test_tp_loader` proves its scale-table half); MTP and DFlash at TP = 2 keep
+their 64-row f16 slices (unchanged); the vision tower and `PrefillMultimodal` with images stay f16 as at TP = 1.
 
 ### Epilogue: a copy that cannot drift silently
 
@@ -733,15 +874,16 @@ edits one FWHT stage in memory and requires the comparison to fail.
 the switch is on and the Model uses it, from each rank's own words (`Container::BuildTrellisI8Scales`, after the weights are
 resident) and only for linears with a plan. `K N / 32` bytes per linear: 760,217,600 bytes (0.708 GiB) for the 27B's 64
 layers (MLP 0.50, GDN in_proj 0.12, out / attn.o 0.06, qg 0.03, k / v 0.005 GiB), on 16.3 GiB of weights; the VRAM breakdown
-books it under `weights=` and the load line prints it. Follow-up: store f16 `rs` (about 0.4 GB).
+books it under `weights=` and the load line prints it. Follow-up: store f16 `rs` (about 0.4 GB). Under TP = 2 with
+`R4DX_PREFILL_INT8_TP2=1`, each rank builds the table of its own shard on its own device: 0.354 GiB per rank (`blk128`), ~7 MiB (`coarse`).
 
 ### Model plumbing
 
 * `src/model/prefill_int8.h` (header-only, HIP-free): `ParsePrefillInt8` (unset, empty, `1`, `on` = on -- the default --;
   `0`, `off` = off; anything else warns and means the default), `ParsePrefillInt8Explicit` / `ResolvePrefillInt8Explicit`
   (only `1` / `on` or option 1 are an explicit request), `ResolvePrefillInt8Request` and `DecidePrefillInt8` (refuses with a
-  reason, in this order, for `R4DX_FAKEQ_ACT/W` set, a rotated container, a Model without 256-row chunks, TP > 1, no trellis
-  linears, no linear with a plan).
+  reason, in this order, for `R4DX_FAKEQ_ACT/W` set, a rotated container, a Model without 256-row chunks, TP > 1 without
+  `R4DX_PREFILL_INT8_TP2`, no trellis linears, no linear with a plan).
 * `ModelOptions::prefill_int8`: -1 follows the environment (default on), 0 and 1 force it (`test_prefill_chunk_identity`
   forces 0). An EXPLICIT `R4DX_PREFILL_INT8=1` / option 1 together with `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` throws at load (they
   would quantize twice); with int8 only the default, the experiment switches win.
@@ -840,7 +982,7 @@ twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
 | speculation | DFlash and MTP mean accepted length within -1% on the OpenCode transcripts |
 | robustness | a 128k prefill completes, VRAM headroom logged, no NaN |
 | plumbing | the ISA and epilogue-diff gates in the build; switch-off byte identity passes every build |
-| not required for the flip, but needed first | TP = 2 (auto-falls back until validated) and the fused quantizer (written on branch `int8v2`, "The fused quantizer"; GPU runs pending) |
+| not required for the flip, but needed first | TP = 2 (auto-falls back until validated; wired on branch `int8v2` behind `R4DX_PREFILL_INT8_TP2`, default off, "Tensor parallel"; GPU runs pending) and the fused quantizer (written on branch `int8v2`, "The fused quantizer"; GPU runs pending) |
 
 ### Results
 

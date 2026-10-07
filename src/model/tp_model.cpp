@@ -273,6 +273,9 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
     std::string id;
     int64_t image_token = 0, merge = 2, patch_dim = 0, layers = 0, vocab = 0, hidden = 0;
     bool vision = false, mtp = false, mtp_reduced = false, dflash = false;
+    // R4DX_PREFILL_INT8_TP2: every rank must have decided the same way (the shard shapes and the tables are identical on both, so a
+    // difference is a failed load pass or a bug; a half-int8 prefill would still all-reduce, just wrongly mixed)
+    bool prefill_int8 = false;
   };
   std::vector<Caps> caps(static_cast<size_t>(n_slots));
   ModelConfig rank0_global_config;
@@ -506,6 +509,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
            c.mtp = mm.MtpEnabled();
            c.mtp_reduced = mm.MtpUsingReducedVocabDraft();
            c.dflash = mm.DflashEnabled();
+           c.prefill_int8 = mm.PrefillInt8Enabled();
            if (s.index == 0) rank0_global_config = mm.GlobalConfig();
          },
          CmdKind::kPlain, kNoStall);
@@ -514,7 +518,7 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
     const Caps &a = caps[0], &b = caps[i];
     if (a.id != b.id || a.image_token != b.image_token || a.merge != b.merge || a.patch_dim != b.patch_dim ||
         a.layers != b.layers || a.vocab != b.vocab || a.hidden != b.hidden || a.mtp != b.mtp ||
-        a.mtp_reduced != b.mtp_reduced || a.dflash != b.dflash) {
+        a.mtp_reduced != b.mtp_reduced || a.dflash != b.dflash || a.prefill_int8 != b.prefill_int8) {
       throw core::TpDivergenceError("TpModel::Load: the ranks disagree on the loaded model's identity or capabilities");
     }
   }

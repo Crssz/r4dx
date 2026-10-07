@@ -206,14 +206,18 @@ struct ModelOptions {
   // environment (R4DX_PREFILL_INT8: unset / 1 / on = on -- the default --, 0 / off = the kill switch); 0 and 1 force
   // the choice whatever the environment says (the tests load Models of each; the identity tests force 0). On, the Model builds a weight
   // scale table per trellis linear at load (+0.7 GiB on the 27B) and runs the full 256-row super-chunks of its
-  // Prefill calls through the int8 kernel; whatever cannot be served (TP, a 64-row Model, a rotated container)
-  // falls back to f16 with a one-line reason at load.
+  // Prefill calls through the int8 kernel; whatever cannot be served (TP without prefill_int8_tp2, a 64-row Model, a
+  // rotated container) falls back to f16 with a one-line reason at load.
   int prefill_int8 = -1;
   // The int8 GEMM's scale granularity (prefill_int8.h, docs/int8-prefill.md "Coarse scales"): -1 (default) follows
   // R4DX_PREFILL_INT8_SCALES (unset / blk128 = per (row | column, 128 k), today's bytes; coarse = one scale per row and per
   // column over the whole K, a 128x smaller weight table and no per-128 rescale); 0 forces blk128, 1 coarse. Only matters
   // when the int8 GEMM is on for this Model.
   int prefill_int8_scales = -1;
+  // int8 prefill on a tensor-parallel rank's shards (R4DX_PREFILL_INT8_TP2, prefill_int8.h, docs/int8-prefill.md "Tensor parallel"): -1
+  // (default) follows the environment (unset / 0 / off = off, 1 / on = asks for it); 0 and 1 force it. Only matters at tp.world > 1 with the
+  // int8 GEMM on; off keeps a TP = 2 Model byte-identical to one built before the option existed (no scale table, no scope).
+  int prefill_int8_tp2 = -1;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.

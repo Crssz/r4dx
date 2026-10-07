@@ -9,7 +9,7 @@
 //     of a Prefill call -- and only those -- run their trellis linears through libr4d's int8 x int8 GEMM
 //     (A quantized per (row, 128 k), the decoded weight per (column, 128 k), int32 WMMA, a per-128 fp32
 //     rescale; the f16 output transform after it). Everything else stays f16: tails of fewer than 256 rows
-//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, TP = 2, MTP and DFlash 64-row slices, decode
+//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, TP = 2 (unless R4DX_PREFILL_INT8_TP2=1, below), MTP and DFlash 64-row slices, decode
 //     and verify windows, the vision tower, and PrefillMultimodal with images (image accuracy is unmeasured; a text-only call with no image ever seen is a Prefill call);
 //   - "0" or "off": the kill switch. Nothing changes: no scale table is built (-0.7 GiB on the 27B), no buffer or
 //     launch differs, every byte of every path is the one of a build without the int8 kernel (the f16 kernels' ISA is
@@ -91,6 +91,27 @@ inline bool ValidPrefillInt8ScalesOption(int opt) { return opt == -1 || opt == 0
 inline int ResolvePrefillInt8Scales(int opt) { return opt < 0 ? PrefillInt8ScalesRequest() : (opt != 0 ? kPrefillInt8ScalesCoarse : kPrefillInt8ScalesBlk128); }
 inline const char* PrefillInt8ScalesName(int scales) { return scales == kPrefillInt8ScalesCoarse ? "coarse" : "blk128"; }
 
+// R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"; read once per process, Model::Load resolves it): whether a
+// tensor-parallel (TP = 2) Model may run the int8 GEMM on its rank shards, when R4DX_PREFILL_INT8 is on. OFF BY DEFAULT: "1" / "on" ask
+// for it; unset, empty, "0" / "off" keep the f16 kernels at TP = 2 (the bytes of main's TP = 2 exactly: no scale table, no scope);
+// anything else warns and keeps the default (off). It is only a request: a shard shape without a row in
+// gemm_tuning_table_trellis_i8_tp2.inc (and the coarse one) still runs f16 with a once-per-shape notice, and with no row at all the
+// Model stays f16 and says so at load. No effect at TP = 1.
+inline bool ParsePrefillInt8Tp2(const char* e) {
+  if (e == nullptr || *e == '\0') return false;
+  if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return false;
+  if (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0) return true;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_TP2='%s' not recognized (0|off|1|on); using the default (off)\n", e);
+  return false;
+}
+inline bool PrefillInt8Tp2Request() {
+  static const bool v = ParsePrefillInt8Tp2(std::getenv("R4DX_PREFILL_INT8_TP2"));
+  return v;
+}
+// ModelOptions::prefill_int8_tp2: -1 follows the environment (default off), 0 and 1 force it (the tests load both in one process).
+inline bool ValidPrefillInt8Tp2Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }
+inline bool ResolvePrefillInt8Tp2(int opt) { return opt < 0 ? PrefillInt8Tp2Request() : opt != 0; }
+
 // ModelOptions::prefill_int8: -1 follows the environment (default: on), 0 and 1 force the request whatever the
 // environment says (the identity tests load Models of 0, the int8 tests of 1). Anything else is the caller's bug.
 inline bool ValidPrefillInt8Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }
@@ -103,6 +124,7 @@ struct PrefillInt8Inputs {
   int requested = kPrefillInt8Off;  // ResolvePrefillInt8Request
   bool wide = false;                // this Model runs 256-row super-chunks (DecidePrefillChunk)
   int tp_world = 1;                 // ModelOptions::tp.world
+  bool tp2_enabled = false;         // ResolvePrefillInt8Tp2: a TP > 1 Model may use int8 on its rank shards (default off)
   bool has_trellis = false;         // the container's body is trellis (Container::HasTrellis)
   bool rotated_container = false;   // a quant2 container (residual rotation / Hadamard signs)
   bool fakeq_active = false;        // R4DX_FAKEQ_ACT / R4DX_FAKEQ_W set (the default yields to them; an explicit on throws before this)
@@ -117,8 +139,8 @@ struct PrefillInt8Inputs {
 // prefix-reuse suffix prefills (the chunk grid is anchored at each Prefill call's start: the same token can be
 // int8 in one run and f16 in another, so the KV bytes of a prompt depend on cache state -- docs/int8-prefill.md),
 // --mtp and --dflash (their capture and priming read int8-perturbed hidden states, which the accuracy gates cover).
-// TP = 2 keeps the f16 kernel in v1 (the kernel is shape-generic and bit-tested at the rank shapes; it needs the
-// wiring and its own KL gate).
+// TP = 2 keeps the f16 kernel unless R4DX_PREFILL_INT8_TP2 asked for int8 on the rank shards (the kernel is shape-generic and
+// bit-tested at the rank shapes; the wiring is docs/int8-prefill.md "Tensor parallel", its KL gate is not run yet, so it is off).
 inline bool DecidePrefillInt8(const PrefillInt8Inputs& in, const char** why = nullptr) {
   if (why != nullptr) *why = nullptr;
   if (in.requested != kPrefillInt8On) return false;
@@ -129,9 +151,15 @@ inline bool DecidePrefillInt8(const PrefillInt8Inputs& in, const char** why = nu
   if (in.fakeq_active) return refuse("R4DX_FAKEQ_ACT / R4DX_FAKEQ_W are set (they round to int8 themselves)");
   if (in.rotated_container) return refuse("a quant2 (rotated) container");
   if (!in.wide) return refuse("this Model does not run 256-row prefill super-chunks (R4DX_PREFILL_CHUNK=0/64)");
-  if (in.tp_world > 1) return refuse("tensor parallelism (TP = 2 keeps the f16 kernel)");
+  if (in.tp_world > 1 && !in.tp2_enabled) {
+    return refuse("tensor parallelism (TP = 2 keeps the f16 kernel; R4DX_PREFILL_INT8_TP2=1 asks for int8 on the rank shards, off until validated)");
+  }
   if (!in.has_trellis) return refuse("the container has no trellis linears");
-  if (in.tables_built == 0) return refuse("no trellis linear has an int8 plan (see the per-shape notices)");
+  if (in.tables_built == 0) {
+    return refuse(in.tp_world > 1 ? "no TP rank-shard linear has an int8 plan (the TP = 2 tuning tables have no row for its shapes yet: "
+                                    "tool_int8_gemm_proto --tp 2 --emit-rows; see the per-shape notices)"
+                                  : "no trellis linear has an int8 plan (see the per-shape notices)");
+  }
   return true;
 }
 

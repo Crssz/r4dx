@@ -25,7 +25,10 @@
 //   tool_int8_gemm_proto.exe [--mode all|probe|selftest|verify|time] [--shape gate_up|down|qkv|z|out|qg|kv|all]
 //                            [--kb 4|5|both] [--rounds 11] [--batch 6] [--quick] [--noverify] [--no-resc]
 //                            [--simds 128] [--verbose] [--out x.json] [--emit-rows src/model/gemm_tuning_table_trellis_i8.inc]
-//                            [--no-coarse] [--emit-rows-coarse src/model/gemm_tuning_table_trellis_i8c.inc]
+//                            [--no-coarse] [--emit-rows-coarse src/model/gemm_tuning_table_trellis_i8c.inc] [--tp 1|2]
+//   --tp 2 times, verifies and (with --emit-rows / --emit-rows-coarse) emits the shapes of one TENSOR-PARALLEL RANK (docs/int8-prefill.md "Tensor
+//   parallel": column-parallel linears at N / 2, row-parallel ones at K / 2) against the f16 plan of the TP = 2 tuning table, and
+//   writes kTrellisI8Tp2Table / kTrellisI8cTp2Table (src/model/gemm_tuning_table_trellis_i8_tp2.inc / ..._i8c_tp2.inc). Default --tp 1.
 //   The COARSE production kernel (RESC 4, R4DX_PREFILL_INT8_SCALES=coarse; docs/int8-prefill.md "Coarse scales") is selftested,
 //   verified against its exact reference, swept over every legal (skw, skg) and timed with its own operands (A per row, W per
 //   column over the whole K) next to the per-128 kernel and the RESC 1..3 speed bounds, with its stand-alone per-row quantizer;
@@ -226,18 +229,32 @@ static const Shape kShapes[] = {
     {"gate_up", 34816, 5120, 64}, {"down", 5120, 17408, 64}, {"qkv", 10240, 5120, 48}, {"z", 6144, 5120, 48},
     {"out", 5120, 6144, 64},      {"qg", 12288, 5120, 16},   {"kv", 1024, 5120, 32},
 };
+// --tp 2: the rank shards of the same seven classes (docs/tp.md 4.2: gate_up / qkv / z / qg / k / v column-parallel, N halved; down / out / attn.o
+// row-parallel, K halved; the names are the classes', the counts the layers'). One rank times its shard alone; the all-reduce is not part of it.
+static const Shape kShapesTp2[] = {
+    {"gate_up", 17408, 5120, 64}, {"down", 5120, 8704, 64}, {"qkv", 5120, 5120, 48}, {"z", 3072, 5120, 48},
+    {"out", 5120, 3072, 64},      {"qg", 6144, 5120, 16},   {"kv", 512, 5120, 32},
+};
+static int g_tp = 1;   // --tp
 struct Stock { int WV, SK, NP, SKG, U, NT, MT; };
-static bool TableRow(const Shape& s, int kb, Stock& out) {
-  for (const trellis_rows::GemmTuningRow& r : trellis_rows::kGemmTuningTable)
+static bool TableRowIn(const trellis_rows::GemmTuningRow* rows, size_t n, const Shape& s, int kb, Stock& out) {
+  for (size_t i = 0; i < n; ++i) {
+    const trellis_rows::GemmTuningRow& r = rows[i];
     if (r.layout == trellis_rows::Layout::kTrellis && r.N == s.N && r.K == s.K && r.M == 64 && r.rate == kb) {
       out = {r.tuning.WV, r.tuning.SK, r.tuning.NPW, r.tuning.SKG, r.tuning.U, r.tuning.NT, r.tuning.MB};
       return true;
     }
+  }
   return false;
+}
+// the M = 64 row the shipped f16 plan starts from: at --tp 2 the TP = 2 table first, then the TP = 1 one (linear.cpp's ResolveTuning order)
+static bool TableRow(const Shape& s, int kb, Stock& out) {
+  if (g_tp == 2 && TableRowIn(trellis_rows::tp2::kGemmTuningTable, sizeof(trellis_rows::tp2::kGemmTuningTable) / sizeof(trellis_rows::tp2::kGemmTuningTable[0]), s, kb, out)) return true;
+  return TableRowIn(trellis_rows::kGemmTuningTable, sizeof(trellis_rows::kGemmTuningTable) / sizeof(trellis_rows::kGemmTuningTable[0]), s, kb, out);
 }
 // PlanTrellisM256 (src/model/linear.cpp), reproduced: the shipped M = 64 row's (SK, SKG), K slices resident per
 // workgroup `pref` first, then 4, 8, 2, the first one the host check accepts
-struct Plan { int SK = 0, SKG = 0, skw = 0; bool ok = false; };
+struct Plan { int SK = 0, SKG = 0, skw = 0; bool ok = false, standin = false; };
 static Plan ShippedPlan(const Shape& s, int kb) {
   Plan p;
   Stock t{};
@@ -248,6 +265,21 @@ static Plan ShippedPlan(const Shape& s, int kb) {
   for (int skw : order) {
     if (skw > t.SK) continue;
     if (r4d_gemm_trellis_nt_m256_check(256, s.K, s.N, s.N, kb, t.SK, 1, t.SKG, 4, skw) == nullptr) { p.skw = skw; p.ok = true; return p; }
+  }
+  // --tp 2: a rank shard whose M = 64 row has NO exact M = 256 configuration (the model runs four 64-row f16 launches for it: gdn.in_proj_z's
+  // 3072 x 5120 at KB 5, SK 16) still needs int8 rows. The int8 kernel does not depend on the f16 plan; the bench's reference output and the
+  // "x vs shipped" ratios do, so the first legal M = 256 configuration stands in for it (flagged in the report; its ratio is not the
+  // model's f16 baseline, which is slower: four launches).
+  if (g_tp == 2) {
+    for (int SK : {4, 8, 2, 16})
+      for (int SKG : {1, 2, 4, 8})
+        for (int skw : {4, 8, 2}) {
+          if (skw > SK || SK % skw) continue;
+          if (r4d_gemm_trellis_nt_m256_check(256, s.K, s.N, s.N, kb, SK, 1, SKG, 4, skw) == nullptr) {
+            p.SK = SK; p.SKG = SKG; p.skw = skw; p.ok = true; p.standin = true;
+            return p;
+          }
+        }
   }
   return p;
 }
@@ -867,6 +899,9 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   const Plan plan = ShippedPlan(s, kb);
   if (!plan.ok) { std::printf("---- %s KB%d: no shipped M = 256 plan (skipped)\n", s.name, kb); FreeCase(c); return; }
   std::printf("---- %s KB%d  N=%d K=%d  shipped plan: SK %d SKG %d skw %d (x%d)\n", s.name, kb, s.N, s.K, plan.SK, plan.SKG, plan.skw, plan.SK / plan.skw);
+  if (plan.standin)
+    std::printf("     NOTE: the TP = 2 shipped M = 64 row has no exact M = 256 configuration at this shape (the model runs four 64-row f16 launches); the plan above is a STAND-IN\n"
+                "           (first legal M = 256 configuration) for the f16 reference output and the \"vs shipped\" ratios; the int8 sweep and its rows are unaffected\n");
 
   // the shipped f16 kernel on copy 0 (the reference for the fake-quant-level difference)
   LaunchShipped(c, plan, 0, c.c_f16);
@@ -1189,6 +1224,10 @@ static int RealMain(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--simds") && i + 1 < argc) simds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--shape") && i + 1 < argc) shape = argv[++i];
     else if (!std::strcmp(argv[i], "--kb") && i + 1 < argc) kbs = argv[++i];
+    else if (!std::strcmp(argv[i], "--tp") && i + 1 < argc) {
+      g_tp = std::atoi(argv[++i]);
+      if (g_tp != 1 && g_tp != 2) { std::fprintf(stderr, "--tp must be 1 or 2\n"); return 2; }
+    }
     else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) mode = argv[++i];
     else if (!std::strcmp(argv[i], "--quick")) quick = true;
     else if (!std::strcmp(argv[i], "--noverify")) noverify = true;
@@ -1200,8 +1239,8 @@ static int RealMain(int argc, char** argv) {
   if (quick) { rounds = 5; batch = 3; }
   hipDeviceProp_t prop;
   CK(hipGetDeviceProperties(&prop, 0));
-  std::printf("device %s (%s), multiProcessorCount %d, mode %s, rounds %d, batch %d\n", prop.name, prop.gcnArchName, prop.multiProcessorCount,
-              mode.c_str(), rounds, batch);
+  std::printf("device %s (%s), multiProcessorCount %d, mode %s, rounds %d, batch %d%s\n", prop.name, prop.gcnArchName, prop.multiProcessorCount,
+              mode.c_str(), rounds, batch, g_tp == 2 ? ", --tp 2: the shapes of ONE TENSOR-PARALLEL RANK (column-parallel N / 2, row-parallel K / 2)" : "");
   FILE* json = outp.empty() ? nullptr : std::fopen(outp.c_str(), "wb");
   bool json_first = true;
   if (json) std::fprintf(json, "{\"device\":\"%s\",\"mode\":\"%s\",\"rounds\":%d,\"batch\":%d,\"rows\":[\n", prop.name, mode.c_str(), rounds, batch);
@@ -1235,7 +1274,7 @@ static int RealMain(int argc, char** argv) {
   }
   if (do_shapes) {
     std::vector<Shape> shapes;
-    for (const Shape& s : kShapes)
+    for (const Shape& s : (g_tp == 2 ? kShapesTp2 : kShapes))
       if (shape == "all" || shape == s.name) shapes.push_back(s);
     if (shapes.empty()) { std::fprintf(stderr, "no such shape %s\n", shape.c_str()); return 2; }
     std::vector<int> kbl;
@@ -1245,8 +1284,10 @@ static int RealMain(int argc, char** argv) {
     for (int kb : kbl) {
       for (const Shape& s : shapes) ShapeRun(s, kb, rounds, batch, do_verify, do_time, !no_resc, !no_coarse, verbose, json, json_first, results, fails);
       if (do_time) {
-        Combined("MLP PAIR (mlp.gate_up + mlp.down)", results, {"gate_up", "down"}, false, kb, json, json_first, true);
-        Combined("ALL SEVEN LINEAR CLASSES", results, {"gate_up", "down", "qkv", "z", "out", "qg", "kv"}, true, kb, json, json_first, false);
+        Combined(g_tp == 2 ? "MLP PAIR (mlp.gate_up + mlp.down), TP = 2 RANK SHARDS" : "MLP PAIR (mlp.gate_up + mlp.down)", results,
+                 {"gate_up", "down"}, false, kb, json, json_first, true);
+        Combined(g_tp == 2 ? "ALL SEVEN LINEAR CLASSES, TP = 2 RANK SHARDS" : "ALL SEVEN LINEAR CLASSES", results,
+                 {"gate_up", "down", "qkv", "z", "out", "qg", "kv"}, true, kb, json, json_first, false);
       }
     }
   }
@@ -1269,6 +1310,9 @@ static int RealMain(int argc, char** argv) {
                  "// its own namespace; PlanTrellisI8 reads it. A (class, KB) without a row runs the f16 kernel.\n"
                  "// {N, K, KB, skw, skg}\n",
                  prop.name, prop.gcnArchName, rounds, batch);
+    if (g_tp == 2)
+      std::fprintf(f, "// --tp 2: the shapes of ONE TENSOR-PARALLEL RANK (column-parallel linears N / 2, row-parallel K / 2), the f16 baseline of the TP = 2 tuning\n"
+                      "// table; read by linears with QuantLinear::trellis_tp_shard only (PlanTrellisI8 tp_shard = true), docs/int8-prefill.md \"Tensor parallel\".\n");
     if (shape != "all" || kbs != "both")
       std::fprintf(f, "// WARNING: a partial run (--shape %s --kb %s): merge by hand, this file does not cover every class\n", shape.c_str(), kbs.c_str());
     std::fprintf(f, "const TrellisI8Row %s[] = {\n", table);
@@ -1279,9 +1323,12 @@ static int RealMain(int argc, char** argv) {
     std::printf("wrote %zu rows to %s\n", rows.size(), path.c_str());
     return 0;
   };
-  if (const int rc = emit(emit_rows, g_emit_rows, "--emit-rows", "kTrellisI8Table", "The tuning table of the per-128 int8 prefill GEMM (r4d_gemm_trellis_nt_i8, R4DX_PREFILL_INT8).")) return rc;
-  if (const int rc = emit(emit_rows_coarse, g_emit_rows_coarse, "--emit-rows-coarse", "kTrellisI8cTable",
-                          "The tuning table of the COARSE-scale int8 prefill GEMM (r4d_gemm_trellis_nt_i8c, R4DX_PREFILL_INT8_SCALES=coarse).")) return rc;
+  if (const int rc = emit(emit_rows, g_emit_rows, "--emit-rows", g_tp == 2 ? "kTrellisI8Tp2Table" : "kTrellisI8Table",
+                          g_tp == 2 ? "The tuning table of the per-128 int8 prefill GEMM (r4d_gemm_trellis_nt_i8, R4DX_PREFILL_INT8) at the TP = 2 rank shapes (R4DX_PREFILL_INT8_TP2)."
+                                    : "The tuning table of the per-128 int8 prefill GEMM (r4d_gemm_trellis_nt_i8, R4DX_PREFILL_INT8).")) return rc;
+  if (const int rc = emit(emit_rows_coarse, g_emit_rows_coarse, "--emit-rows-coarse", g_tp == 2 ? "kTrellisI8cTp2Table" : "kTrellisI8cTable",
+                          g_tp == 2 ? "The tuning table of the COARSE-scale int8 prefill GEMM (r4d_gemm_trellis_nt_i8c, R4DX_PREFILL_INT8_SCALES=coarse) at the TP = 2 rank shapes (R4DX_PREFILL_INT8_TP2)."
+                                    : "The tuning table of the COARSE-scale int8 prefill GEMM (r4d_gemm_trellis_nt_i8c, R4DX_PREFILL_INT8_SCALES=coarse).")) return rc;
   std::printf("%s (%d failing checks)\n", fails == 0 ? "ALL OK" : "FAILED", fails);
   return fails == 0 ? 0 : 1;
 }

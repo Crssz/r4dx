@@ -157,9 +157,13 @@ namespace trellis_tp2 {
 }  // namespace trellis_tp2
 
 // The int8 x int8 prefill GEMM's table (R4DX_PREFILL_INT8, docs/int8-prefill.md "Production path"): one
-// (skw, skg) per (N, K, KB), TP = 1 shapes only (a TP = 2 rank keeps the f16 kernel in v1).
+// (skw, skg) per (N, K, KB), TP = 1 shapes only.
 #include "gemm_tuning_table_trellis_i8.inc"
 #include "gemm_tuning_table_trellis_i8c.inc"   // R4DX_PREFILL_INT8_SCALES=coarse: the same kernel family's coarse rows
+// The same two tables for a tensor-parallel RANK's shard shapes (R4DX_PREFILL_INT8_TP2, docs/int8-prefill.md "Tensor parallel"),
+// read by a linear with QuantLinear::trellis_tp_shard only; empty (one N == 0 placeholder) until the bench has run at --tp 2.
+#include "gemm_tuning_table_trellis_i8_tp2.inc"
+#include "gemm_tuning_table_trellis_i8c_tp2.inc"
 
 thread_local bool t_tp2_tuning = false;
 
@@ -552,7 +556,15 @@ ScopedTrellisI8::ScopedTrellisI8(bool on) : prev_(t_trellis_i8) { t_trellis_i8 =
 ScopedTrellisI8::~ScopedTrellisI8() { t_trellis_i8 = prev_; }
 bool TrellisI8Active() { return t_trellis_i8; }
 
-const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse) {
+const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse, bool tp_shard) {
+  if (tp_shard) {
+    if (coarse) {
+      if (count != nullptr) *count = sizeof(kTrellisI8cTp2Table) / sizeof(kTrellisI8cTp2Table[0]);
+      return kTrellisI8cTp2Table;
+    }
+    if (count != nullptr) *count = sizeof(kTrellisI8Tp2Table) / sizeof(kTrellisI8Tp2Table[0]);
+    return kTrellisI8Tp2Table;
+  }
   if (coarse) {
     if (count != nullptr) *count = sizeof(kTrellisI8cTable) / sizeof(kTrellisI8cTable[0]);
     return kTrellisI8cTable;
@@ -638,7 +650,7 @@ TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t
   return refuse(first_why.empty() ? "no K-slice grouping fits" : first_why);
 }
 
-TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse) {
+TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse, bool tp_shard) {
   TrellisI8Plan plan;
   const auto refuse = [&plan](std::string why) {
     plan.ok = false;
@@ -656,14 +668,18 @@ TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t par
   if (!M256ShapeAllowed(N, K)) return refuse("shape excluded by R4DX_M256_SHAPES");
   const TrellisI8Row* row = nullptr;
   size_t nrows = 0;
-  const TrellisI8Row* rows = TrellisI8Rows(&nrows, coarse);
+  const TrellisI8Row* rows = TrellisI8Rows(&nrows, coarse, tp_shard);
   for (size_t i = 0; i < nrows; ++i) {
-    if (rows[i].N == N && rows[i].K == K && rows[i].rate == kb) {
+    if (rows[i].N == N && rows[i].K == K && rows[i].rate == kb) {   // (an N == 0 placeholder never matches: N > 0 above)
       row = &rows[i];
       break;
     }
   }
-  if (row == nullptr) return refuse("no int8 tuning row for this (N, K, KB)");
+  if (row == nullptr) {
+    return refuse(tp_shard ? "no int8 tuning row for this TP rank-shard (N, K, KB) (gemm_tuning_table_trellis_i8" +
+                                 std::string(coarse ? "c" : "") + "_tp2.inc: tool_int8_gemm_proto --tp 2 --emit-rows)"
+                           : "no int8 tuning row for this (N, K, KB)");
+  }
   const int n_split = static_cast<int>(parts > 1 ? part_n0 : N);
   // The table row must be launchable: the kernel's own rules (K / 128 divisible by skw * skg, ...) decide, so a
   // regenerated .inc cannot name a combination that would throw at its first launch mid-request.
@@ -679,7 +695,8 @@ TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t par
 
 bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream, bool coarse) {
   if (w.layout != Layout::kTrellis || !w.trellis_i8_sw.empty() || !w.trellis_i8_swc.empty()) return false;
-  const TrellisI8Plan plan = PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse);
+  const TrellisI8Plan plan =
+      PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse, w.trellis_tp_shard);
   if (!plan.ok) return false;
   if (coarse) {
     // one scale per column over the whole K: N floats, the [K / 128][N] table is never allocated
@@ -718,7 +735,7 @@ TrellisI8OperandCounts TrellisI8OperandCountsGet() {
 bool TrellisI8Takes(const QuantLinear& w, int64_t M) {
   if (w.layout != Layout::kTrellis || M != kTrellisM256Rows || !TrellisM256Active() || !TrellisI8Active()) return false;
   const bool coarse = TrellisI8Coarse(w);
-  return PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse).ok &&
+  return PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse, w.trellis_tp_shard).ok &&
          !(coarse ? w.trellis_i8_swc : w.trellis_i8_sw).empty();
 }
 
@@ -842,9 +859,9 @@ static void NoteNoInt8Plan(const QuantLinear& w, const TrellisI8Plan& plan) {
   if (plan.why.rfind("shape excluded", 0) == 0) return;   // R4DX_M256_SHAPES: asked for
   static thread_local std::set<std::tuple<int64_t, int64_t, int, int>> warned;
   if (warned.emplace(w.N, w.K, w.trellis_bits, w.trellis_parts).second) {
-    std::fprintf(stderr, "r4dx: trellis [%lld x %lld] KB%d parts %d has no int8 plan (%s); its 256-row calls run the f16 kernel\n",
-                 static_cast<long long>(w.N), static_cast<long long>(w.K), w.trellis_bits, w.trellis_parts,
-                 plan.why.c_str());
+    std::fprintf(stderr, "r4dx: trellis%s [%lld x %lld] KB%d parts %d has no int8 plan (%s); its 256-row calls run the f16 kernel\n",
+                 w.trellis_tp_shard ? " TP shard" : "", static_cast<long long>(w.N), static_cast<long long>(w.K), w.trellis_bits,
+                 w.trellis_parts, plan.why.c_str());
   }
 }
 
@@ -927,7 +944,8 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
     // R4DX_PREFILL_INT8_SCALES=coarse: the linear carries the one-per-column table instead of the per-128 one, and its A is
     // quantized per row (see TrellisI8Coarse)
     const bool coarse = TrellisI8Coarse(w);
-    const TrellisI8Plan plan8 = PlanTrellisI8(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse);
+    const TrellisI8Plan plan8 =
+        PlanTrellisI8(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse, w.trellis_tp_shard);
     if (!plan8.ok) NoteNoInt8Plan(w, plan8);
     if (plan8.ok) {
       if ((coarse ? w.trellis_i8_swc : w.trellis_i8_sw).empty()) {

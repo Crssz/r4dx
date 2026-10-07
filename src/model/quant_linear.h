@@ -142,6 +142,12 @@ struct QuantLinear {
   //     weight scale of output column n of Q over the WHOLE K (libr4d's r4d_trellis_i8_wscale_col), 4 N bytes. Its being
   //     non-empty is what makes the linear's int8 calls coarse (A per row too): TrellisI8Coarse(w) in linear.h.
   core::DeviceBuffer<float> trellis_i8_swc;
+  //   trellis_tp_shard: this linear is a tensor-parallel rank's SHARD of a global trellis linear (column-parallel: N / world rows,
+  //     row-parallel: K / world columns; ShardLoader::TrellisSlice sets it; false at TP = 1 and for a replicated linear). The int8
+  //     prefill GEMM keys its tuning rows by it (PlanTrellisI8's `tp_shard`: a shard reads the TP = 2 tables only, never the TP = 1 ones,
+  //     even when its shape equals a TP = 1 class's -- the rank's attn.qg is gdn.in_proj_z's 6144 x 5120), docs/int8-prefill.md
+  //     "Tensor parallel". Nothing else reads it.
+  bool trellis_tp_shard = false;
 };
 
 }  // namespace r4dx::model

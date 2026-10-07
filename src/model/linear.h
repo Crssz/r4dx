@@ -213,8 +213,11 @@ struct TrellisI8Row {
   int skw, skg;
 };
 // The table, for tests and diagnostics (a pure read of the .inc): the per-128 scales' (gemm_tuning_table_trellis_i8.inc) or,
-// with `coarse`, the coarse scales' (gemm_tuning_table_trellis_i8c.inc, R4DX_PREFILL_INT8_SCALES=coarse).
-const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse = false);
+// with `coarse`, the coarse scales' (gemm_tuning_table_trellis_i8c.inc, R4DX_PREFILL_INT8_SCALES=coarse). With `tp_shard` the TP = 2
+// RANK-SHARD tables instead (gemm_tuning_table_trellis_i8_tp2.inc / ..._i8c_tp2.inc, docs/int8-prefill.md "Tensor parallel"): the
+// rank shapes of the 27B, which no TP = 1 row covers. A row with N == 0 is the empty table's placeholder (no real row has one; a
+// C++ array cannot be empty): skip it when iterating.
+const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse = false, bool tp_shard = false);
 
 // Whether, and how, a trellis linear of this shape and rate runs through the int8 GEMM at M = 256: `skw` / `skg`
 // are the K slices per workgroup and the K groups across the grid of its table row. `ok` is false -- and `why`
@@ -223,13 +226,17 @@ const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse = false);
 // f16 kernel. `part_n0` is trellis_part_n[0] (ignored for parts == 1). A pure function of its arguments (and
 // R4DX_M256_SHAPES, the debug filter the f16 plan honours too); the load-time table builder, ApplyLinear and
 // tests/model/test_prefill_int8_cpu share it. `coarse`: the row of the coarse-scale table (TrellisI8Coarse(w) says which
-// a linear runs).
+// a linear runs). `tp_shard` (QuantLinear::trellis_tp_shard): the linear is a tensor-parallel rank's shard, and its row comes
+// from the TP = 2 tables ONLY (a shard of a TP = 1 class's shape -- attn.qg's 6144 x 5120 -- does not borrow that class's row, and a
+// TP = 1 linear never reads a shard's): the TP = 2 tables hold no rows until tool_int8_gemm_proto --tp 2 --emit-rows has run on the
+// GPU, so until then every shard is `ok == false` ("no int8 tuning row ...") and runs f16.
 struct TrellisI8Plan {
   bool ok = false;
   int skw = 0, skg = 0;
   std::string why;
 };
-TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse = false);
+TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse = false,
+                            bool tp_shard = false);
 
 // RAII: while alive on this thread, a 256-row ApplyLinear of a trellis linear with an int8 plan (and a scale
 // table) takes the int8 x int8 GEMM instead of the f16 M = 256 kernel; it also needs ScopedTrellisM256 (the

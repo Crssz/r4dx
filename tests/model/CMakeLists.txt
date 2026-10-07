@@ -46,6 +46,11 @@ set(R4DX_MODEL_TESTS
   # Reset() leaves stale pages that the digest covers); the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
   # R4DX_TP_TESTING library variant for Model::DebugStateDigest. Written, NOT run by its author.
   test_prefill_int8
+  # R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): TpModel (emulate, both ranks on device 1) on the real trellis
+  # container with the TP switch off and on. Empty TP = 2 tuning tables: the switch refuses int8, both ranks stay f16 and every observable
+  # equals the off run's. Rows present: int8 chunk counts per rank, no-super-chunk scenarios identical, determinism, KL bounds, and
+  # TP = 2 int8 against TP = 1 int8 (two more loads). Device 1, SKIP 77 without the container. Written, NOT run by its author.
+  test_prefill_int8_tp2
   # The GDN sequence ops of a 256-row super-chunk run once (the default) against the old 64-row sub-slices
   # (R4DX_GDN_SLICE=64), and r4d_gdn_conv_prep2 (the default; R4DX_GDN_CONV=1 opts out) against r4d_gdn_conv_prep, byte for
   # byte (docs/trellis-m256.md "GDN sequence ops"): part A synthetic at the real shape (fresh and has_init
@@ -210,10 +215,11 @@ add_test(NAME test_decode_legacy COMMAND test_decode_legacy)
 
 # test_prefill_int8_cpu: pure CPU unit test for src/model/prefill_int8.h (R4DX_PREFILL_INT8's parser and decision table) and
 # the planning side of src/model/linear.cpp (PlanTrellisI8, its tuning table gemm_tuning_table_trellis_i8.inc checked
-# against the kernel's own legality rule, ScopedTrellisI8); docs/int8-prefill.md "Production path". No HIP call;
+# against the kernel's own legality rule, ScopedTrellisI8); docs/int8-prefill.md "Production path". Also the TP = 2 rank
+# shapes of "Tensor parallel", derived from r4dx_tp_shard's real sharding rules. No HIP call;
 # HIP_VISIBLE_DEVICES=-1 hides every device from the runtime that linking r4dx_model_linear loads.
 add_executable(test_prefill_int8_cpu test_prefill_int8_cpu.cpp)
-target_link_libraries(test_prefill_int8_cpu PRIVATE r4dx_model_linear)
+target_link_libraries(test_prefill_int8_cpu PRIVATE r4dx_model_linear r4dx_tp_shard)
 add_test(NAME test_prefill_int8_cpu COMMAND test_prefill_int8_cpu)
 set_tests_properties(test_prefill_int8_cpu PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
 # /EHc-: see tests/kernels/CMakeLists.txt (an extern "C" throw is otherwise uncatchable).

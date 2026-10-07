@@ -171,6 +171,9 @@ void TestTransform(std::mt19937_64& rng, bool coarse) {
     DeviceBuffer<uint16_t> d_x(static_cast<size_t>(kM) * K);
     d_x.CopyFromHost(RandomX(rng, kM, K));
     for (int nout : {1, 2, 3}) {
+      // the per-row entries stage nout rows in LDS (nout * K * 2 + 64 <= 64 KiB): a larger group throws, which
+      // TestNegativeAndPreconditions checks; the model never forms one (a trellis group has K 5120 at most 3 wide)
+      if (coarse && static_cast<size_t>(nout) * static_cast<size_t>(K) * 2 + 64 > 65536) continue;
       DeviceBuffer<float> d_suh(static_cast<size_t>(nout) * K);
       d_suh.CopyFromHost(RandomScales(rng, static_cast<int64_t>(nout) * K));
       for (int prescale : {0, 4, -3}) {

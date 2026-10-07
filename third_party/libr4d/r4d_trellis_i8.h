@@ -1,7 +1,7 @@
 // r4d_trellis_i8.h -- the DEVICE code of libr4d's int8 x int8 trellis prefill GEMM: the kernel i8g_kernel, the
 // activation quantizer i8g_quant_act, the weight scale table builder i8g_wscale and the int8 weight dump
-// i8g_dump_w. r4d_gemm_trellis_nt_i8.hip instantiates the production kernels (TRELLIS, KB 4 / 5, FWHT, RESC 0,
-// SKW 2 / 4 / 8) and exports the host entries of r4d.h; tests/kernels/tool_int8_gemm_proto.hip (the bench, which
+// i8g_dump_w. r4d_gemm_trellis_nt_i8.hip instantiates the production kernels (TRELLIS, KB 4 / 5, FWHT, RESC 0 =
+// per-128 scales and RESC 4 = coarse scales, SKW 2 / 4 / 8) and exports the host entries of r4d.h; tests/kernels/tool_int8_gemm_proto.hip (the bench, which
 // also builds the dense and RESC 1..3 variants) and tests/kernels/test_int8_gemm_proto_emu.cpp (the kernel source
 // compiled as plain C++) include it too. The design and the measurements: docs/int8-gemm-proto.md; the model
 // side: docs/int8-prefill.md "Production path".

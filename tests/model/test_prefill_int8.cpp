@@ -28,7 +28,13 @@
 //     the fused quantizer scoped off (separate r4d_trellis_i8_quant_act launches) and on (the producers write A8 + SA):
 //     the logits of every call, the whole state digest and the decode tokens are byte-identical, and the operand counters
 //     (TrellisI8OperandCountsGet) show each side ran the chain it is named for (RunFusedQ);
-//   * R4DX_PREFILL_INT8_SCALES=coarse (a fifth load, ModelOptions::prefill_int8_scales = 1: A one scale per row, the weight one per\n//     column over the whole K, docs/int8-prefill.md "Coarse scales"): the same five scenarios, fused vs separate chain\n//     byte-identical (the per-row producers r4dx_*_i8r against the f16 producers + r4d_trellis_i8_quant_act_row), deterministic\n//     (a rerun gives the same bytes), the weight table is N floats per linear and not [K / 128][N] (the load's VRAM figure),\n//     the KV digests differ from the per-128 scales' and from f16's (negative control), and the last row's logits stay close to\n//     f16's and to the per-128 int8's (KL bounded, top-1 the same unless a near tie) -- RunFusedQ(scales = 1);\n//   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
+//   * R4DX_PREFILL_INT8_SCALES=coarse (a fifth load, ModelOptions::prefill_int8_scales = 1: A one scale per row, the weight one per
+//     column over the whole K, docs/int8-prefill.md "Coarse scales"): the same five scenarios, fused vs separate chain
+//     byte-identical (the per-row producers r4dx_*_i8r against the f16 producers + r4d_trellis_i8_quant_act_row), deterministic
+//     (a rerun gives the same bytes), the weight table is N floats per linear and not [K / 128][N] (the load's VRAM figure),
+//     the KV digests differ from the per-128 scales' and from f16's (negative control), and the last row's logits stay close to
+//     f16's and to the per-128 int8's (KL bounded, top-1 the same unless a near tie) -- RunFusedQ(scales = 1);
+//   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
 //     (PrefillInt8Enabled() == false) and every byte equals off's.
 // SKIPs (77) for a container that is missing; an exception from a present one is a FAIL.
 #include <hip/hip_runtime.h>

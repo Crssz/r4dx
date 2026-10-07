@@ -329,13 +329,17 @@ TurnResult RunTurn(r4dx::model::TextModel& model, const r4dx::Tokenizer& tok,
     for (int64_t step = 0; step < args.max_tokens; ++step) {
       if (is_eos(next)) { result.hit_eos = true; break; }
       result.generated_tokens.push_back(next);
-      const std::string piece = decoder.push(next);
-      if (!piece.empty()) {
-        std::cout << piece << std::flush;
-        result.generated_text += piece;
-      }
-      result.committed_tokens.push_back(next);  // fed by the DecodeStepGreedy call just above
-      next = model.DecodeStepGreedy(next);
+      result.committed_tokens.push_back(next);  // fed by the DecodeStepGreedyOverlap call just below
+      // decode-t1 item 5 (docs/perf.md): the token's text is decoded and flushed while the step that
+      // feeds it runs on the device, not before it is enqueued -- the same tokens and text, off the
+      // critical path between two steps (R4DX_DECODE_LEGACY=host / TP / Gemma: before the step, as it was).
+      next = model.DecodeStepGreedyOverlap(next, [&, tok = next] {
+        const std::string piece = decoder.push(tok);
+        if (!piece.empty()) {
+          std::cout << piece << std::flush;
+          result.generated_text += piece;
+        }
+      });
     }
   } else if ([]() {
 #if defined(__clang__)

@@ -9,9 +9,14 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>  // _mm_pause (WaitStepDone)
+#endif
 
 #include "attn_config.h"
 #include "debug_probe.h"
@@ -27,12 +32,12 @@
 #include "state_digest.h"
 #endif
 #include "profile_span.h"
+#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY (argmax, host)
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/kernels/rotate_residual.h"  // quant2 residual rotation (docs/quant2.md 3.1)
 #include "r4dx/model/attention/attention_layer.hpp"
-#include "r4dx/core/decode_legacy.hpp"  // R4DX_DECODE_LEGACY (argmax, host)
 #include "r4dx/model/attention/types.hpp"
 #include "tp/tp_vocab.h"  // tensor-parallel vocab-split merges (docs/tp.md 7.3)
 
@@ -354,6 +359,12 @@ Model Model::Load(const ModelOptions& opts) {
   m.body_epilogue_ = EpilogueForLayout(opts.layout);
   m.logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(m.vocab_local_));
   m.argmax_dev_ = core::DeviceBuffer<int32_t>(1);
+  // decode-t1 item 5 (model.h's StageStepMeta / WaitStepDone): the one-copy step metadata, the pinned
+  // landing of a step's token(s) (up to a 64-row verify window), and the completion event.
+  m.step_meta_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(kMetaInts));
+  m.step_meta_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(kMetaInts));
+  m.greedy_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(kMetaPos));
+  m.step_done_.emplace(hipEventDisableTiming);
   m.attn_positions_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(buf_rows));
   // one seqused_k per 64-row sub-slice of a super-chunk (RunChunk); a single one otherwise
   m.attn_seqused_k_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(buf_rows / m.max_chunk_));
@@ -802,6 +813,34 @@ const int32_t* Model::RopePositionsForChunk(int64_t start, int64_t T) {
   return attn_rope_pos_.data();
 }
 
+void Model::StageStepMeta(const std::vector<int32_t>& token_ids) {
+  int32_t* h = step_meta_host_.data();
+  FillStepMeta(h, token_ids, pos_);
+  // Async from pinned memory on stream_, ahead of the call's first kernel: the previous call ended with
+  // the device idle (its event / synchronize), so nothing still reads the pinned source or the device
+  // destination, and stream order puts the copy before every reader.
+  R4DX_HIP_CHECK(hipMemcpyAsync(step_meta_dev_.data(), h, static_cast<size_t>(kMetaInts) * sizeof(int32_t),
+                                 hipMemcpyHostToDevice, stream_.get()));
+}
+
+void Model::WaitStepDone() {
+  const hipEvent_t ev = step_done_->get();
+  for (unsigned spins = 0;; ++spins) {
+    const hipError_t e = hipEventQuery(ev);
+    if (e == hipSuccess) return;
+    if (e != hipErrorNotReady) R4DX_HIP_CHECK(e);
+    // Spin: the point of polling is to see the step finish without the scheduler wake-up a blocking wait
+    // pays. Yield now and then so a single-core host still lets the HIP runtime's own threads run.
+    if ((spins & 63u) == 63u) {
+      std::this_thread::yield();
+    } else {
+#if defined(_M_X64) || defined(__x86_64__)
+      _mm_pause();
+#endif
+    }
+  }
+}
+
 void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64_t hidden) {
   if (mrope_block_images_.empty()) return;
   for (const ImageSpan& sp : mrope_block_images_) {
@@ -825,7 +864,8 @@ void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64
 
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
                                     bool want_logits, int32_t* greedy_token_out,
-                                    const SummaryRequest* summary_out) {
+                                    const SummaryRequest* summary_out,
+                                    const std::function<void()>* overlap) {
   const int64_t T = static_cast<int64_t>(token_ids.size());
   // A 256-row prefill super-chunk (docs/trellis-m256.md): only Prefill() creates one, after deciding
   // that this Model and call may (PrefillRowsForCall). Layer-major over all 256 rows: the trellis
@@ -871,11 +911,21 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // staging buffer -- only a small [T] int32 id array needs to cross the H2D boundary. Falls back
   // to the original host-gather path when the container was loaded with embed_device_resident=
   // false or the free-VRAM heuristic decided the mirror would not fit (Container::Load's comment).
+  // decode-t1 item 5 (model.h's StageStepMeta): a non-super-chunk call (T <= 64) stages its ids, KV
+  // positions and seqused_k in one pinned buffer and ships them with ONE async copy, ahead of the first
+  // kernel, instead of the id copy plus the two blocking uploads below. R4DX_DECODE_LEGACY=host keeps those.
+  const bool meta_fast = !wide && !core::DecodeLegacy(core::DecodeItem::kHost);
+  if (meta_fast) StageStepMeta(token_ids);
   if (container_.EmbedTokensDeviceResident()) {
-    std::copy(token_ids.begin(), token_ids.end(), embed_ids_host_.begin());
-    embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
-    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
-                             T, cfg.vocab_size, buf_a_.data());
+    const int32_t* ids_dev = embed_ids_dev_.data();
+    if (meta_fast) {
+      ids_dev = step_meta_dev_.data() + kMetaIds;
+    } else {
+      std::copy(token_ids.begin(), token_ids.end(), embed_ids_host_.begin());
+      embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
+    }
+    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, ids_dev, T,
+                             cfg.vocab_size, buf_a_.data());
   } else {
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, token_ids,
                 embed_staging_, buf_a_);
@@ -898,19 +948,28 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // logits, so the device is guaranteed idle here and nothing can race this write -- see
   // AttentionLayer::Forward's doc comment, which requires exactly that (a non-arena, ordered
   // upload) for these two buffers.
-  std::vector<int32_t> positions_h(static_cast<size_t>(T));
-  for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
-  attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
-  if (wide) {
-    // one seqused_k per 64-row sub-slice: the causal context of sub-slice j is pos_ + 64 (j + 1)
-    std::vector<int32_t> seqused_slices_h(static_cast<size_t>(T / max_chunk_));
-    for (size_t j = 0; j < seqused_slices_h.size(); ++j) {
-      seqused_slices_h[j] = static_cast<int32_t>(pos_ + max_chunk_ * static_cast<int64_t>(j + 1));
-    }
-    attn_seqused_k_.CopyFromHost(seqused_slices_h.data(), seqused_slices_h.size());
+  // (With meta_fast above both already went out in StageStepMeta's single async copy, and the layers
+  // read them from step_meta_dev_.)
+  const int32_t* positions_dev = attn_positions_.data();
+  const int32_t* seqused_dev = attn_seqused_k_.data();
+  if (meta_fast) {
+    positions_dev = step_meta_dev_.data() + kMetaPos;
+    seqused_dev = step_meta_dev_.data() + kMetaSeq;
   } else {
-    const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
-    attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+    std::vector<int32_t> positions_h(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
+    attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
+    if (wide) {
+      // one seqused_k per 64-row sub-slice: the causal context of sub-slice j is pos_ + 64 (j + 1)
+      std::vector<int32_t> seqused_slices_h(static_cast<size_t>(T / max_chunk_));
+      for (size_t j = 0; j < seqused_slices_h.size(); ++j) {
+        seqused_slices_h[j] = static_cast<int32_t>(pos_ + max_chunk_ * static_cast<int64_t>(j + 1));
+      }
+      attn_seqused_k_.CopyFromHost(seqused_slices_h.data(), seqused_slices_h.size());
+    } else {
+      const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
+      attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+    }
   }
   // The 3-axis rope rows for the same window -- nullptr (and no upload at all) unless an image has
   // been spliced into this conversation, which is what keeps a text-only run byte-identical.
@@ -1009,12 +1068,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       aw.o_had_signs = had.o;
 
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
-                    static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
-                    attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
-                    buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
-                    buf_normed_pre_.data(), body_epilogue_, buf_normed_pre_.data(), rope_pos3,
-                    /*prefill_split_kv=*/is_prefill_path,
-                    /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, attn_seqused_k_.data());
+                    static_cast<int>(T), static_cast<int>(pos_), positions_dev, seqused_dev,
+                    stream_.get(), normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
+                    normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), rope_pos3, /*prefill_split_kv=*/is_prefill_path,
+                    /*attn_slice=*/wide ? static_cast<int>(max_chunk_) : 0, seqused_dev);
       std::swap(cur, other);
     }
     // A super-chunk's gdn / attention scratch is dead here (its results are in `cur` and buf_normed_,
@@ -1209,7 +1267,36 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // gdn_layer.cpp's UploadArray (see that file's comment) -- any plain hipMemcpy/
   // DeviceBuffer::CopyToHost/CopyFromHost call against a hipStreamNonBlocking stream's output
   // needs an explicit wait first, never an implicit one.
-  stream_.Synchronize();
+  //
+  // decode-t1 item 5 (model.h's WaitStepDone): a decode-sized call at TP=1 waits on an event the host
+  // polls, recorded behind everything this call enqueued, and a greedy step's token rides an async D2H
+  // into pinned memory ahead of that event -- the same "wait first, then touch" order as above, without
+  // the blocking-wait wake-up and the separate blocking 4-byte hipMemcpy. Prefill chunks, TP and
+  // R4DX_DECODE_LEGACY=host keep the plain synchronize.
+  const bool poll_wait = !is_prefill_path && !wide && comm_ == nullptr &&
+                         !core::DecodeLegacy(core::DecodeItem::kHost);
+  bool token_polled = false;
+  std::exception_ptr overlap_error;
+  auto run_overlap = [&] {
+    if (overlap == nullptr) return;
+    try {
+      (*overlap)();
+    } catch (...) {
+      overlap_error = std::current_exception();
+    }
+  };
+  if (poll_wait) {
+    if (want_logits && greedy_token_out != nullptr) {
+      R4DX_HIP_CHECK(hipMemcpyAsync(greedy_host_.data(), argmax_dev_.data(), sizeof(int32_t),
+                                     hipMemcpyDeviceToHost, stream_.get()));
+      token_polled = true;
+    }
+    step_done_->Record(stream_);
+    run_overlap();  // the caller's host work, while the step runs
+    WaitStepDone();
+  } else {
+    stream_.Synchronize();
+  }
 
   std::vector<float> logits;
   if (want_logits && comm_ != nullptr) {
@@ -1229,7 +1316,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     }
   } else if (want_logits) {
     if (greedy_token_out != nullptr) {
-      argmax_dev_.CopyToHost(greedy_token_out, 1);
+      if (token_polled) {
+        *greedy_token_out = greedy_host_.data()[0];
+      } else {
+        argmax_dev_.CopyToHost(greedy_token_out, 1);
+      }
     } else if (summary_out != nullptr) {
       // round_summaries_ is this Model's one summary staging vector; a plain decode step and a
       // verify round are never in flight at the same time (single sequence, single worker thread --
@@ -1241,6 +1332,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       logits_dev_.CopyToHost(logits.data(), logits.size());
     }
   }
+  if (!poll_wait) run_overlap();  // a synchronizing call: the caller's host work after the readback
 
   // Plain-decode/MTP-desync guard (review finding, 2026-09-19; see the p.num_accepted comment
   // above in the GDN branch for the read side): a plain decode step through this method always
@@ -1339,6 +1431,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
 
   pos_ += T;
   started_ = true;
+  // The caller's overlapped host work threw: the step it overlapped has completed and is committed
+  // (pos_ advanced above), so surface the error now, as DecodeStepGreedy followed by that work would have.
+  if (overlap_error) std::rethrow_exception(overlap_error);
   return logits;
 }
 
@@ -1550,6 +1645,18 @@ std::vector<float> Model::DecodeStep(int32_t token_id) {
 int32_t Model::DecodeStepGreedy(int32_t token_id) {
   int32_t next = -1;
   RunChunk({token_id}, /*is_prefill_path=*/false, /*want_logits=*/true, &next);
+  return next;
+}
+
+int32_t Model::DecodeStepGreedyOverlap(int32_t token_id, const std::function<void()>& while_busy) {
+  // Only a TP=1 decode call polls (RunChunk's poll_wait); every other case does the caller's work
+  // first and the step after, the order a caller without this method had.
+  if (comm_ != nullptr || core::DecodeLegacy(core::DecodeItem::kHost)) {
+    while_busy();
+    return DecodeStepGreedy(token_id);
+  }
+  int32_t next = -1;
+  RunChunk({token_id}, /*is_prefill_path=*/false, /*want_logits=*/true, &next, nullptr, &while_busy);
   return next;
 }
 
@@ -2097,11 +2204,20 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 
   // Same device-resident gather as RunChunk (model.cpp's own comment above) -- VerifyWindow is the
   // other hot-path caller (once per MTP round, docs/mtp.md).
+  // decode-t1 item 5: one async copy of ids + positions + seqused_k (RunChunk's meta_fast, same
+  // reasoning); R4DX_DECODE_LEGACY=host keeps the id copy and the two blocking uploads below.
+  const bool meta_fast = !core::DecodeLegacy(core::DecodeItem::kHost);
+  if (meta_fast) StageStepMeta(candidates);
   if (container_.EmbedTokensDeviceResident()) {
-    std::copy(candidates.begin(), candidates.end(), embed_ids_host_.begin());
-    embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
-    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, embed_ids_dev_.data(),
-                             T, cfg.vocab_size, buf_a_.data());
+    const int32_t* ids_dev = embed_ids_dev_.data();
+    if (meta_fast) {
+      ids_dev = step_meta_dev_.data() + kMetaIds;
+    } else {
+      std::copy(candidates.begin(), candidates.end(), embed_ids_host_.begin());
+      embed_ids_dev_.CopyFromHostAsync(embed_ids_host_.data(), static_cast<size_t>(T), stream_);
+    }
+    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, ids_dev, T,
+                             cfg.vocab_size, buf_a_.data());
   } else {
     EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, candidates,
                 embed_staging_, buf_a_);
@@ -2113,11 +2229,18 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   // Same reasoning/hazard as RunChunk's own upload (model.cpp's RunChunk comment): safe here
   // because the previous call (Prefill/DecodeStep*/VerifyWindow) always ends with
   // stream_.Synchronize() before returning.
-  std::vector<int32_t> positions_h(static_cast<size_t>(T));
-  for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
-  attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
-  const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
-  attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  const int32_t* positions_dev = attn_positions_.data();
+  const int32_t* seqused_dev = attn_seqused_k_.data();
+  if (meta_fast) {
+    positions_dev = step_meta_dev_.data() + kMetaPos;
+    seqused_dev = step_meta_dev_.data() + kMetaSeq;
+  } else {
+    std::vector<int32_t> positions_h(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) positions_h[static_cast<size_t>(t)] = static_cast<int32_t>(pos_ + t);
+    attn_positions_.CopyFromHost(positions_h.data(), positions_h.size());
+    const int32_t seqused_k_h = static_cast<int32_t>(pos_ + T);
+    attn_seqused_k_.CopyFromHost(&seqused_k_h, 1);
+  }
   // The candidate rows are always past the prompt, so their 3-axis rope positions are just
   // `pos_ + t + mrope_delta_` on all three axes -- but they still have to be BUILT, because
   // `attn_positions_` above is the KV slot mapping and must stay the plain sequence index.
@@ -2178,10 +2301,10 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       // unconditionally overwritten the next time that same slot (== that same position) is
       // written, before anything could ever read it.
       layer.Forward(arena_, cur, other, aw, *kv_caches_[static_cast<size_t>(i)],
-                    static_cast<int>(T), static_cast<int>(pos_), attn_positions_.data(),
-                    attn_seqused_k_.data(), stream_.get(), normed_in, mlp_norm_weight,
-                    buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue,
-                    buf_normed_pre_.data(), body_epilogue_, buf_normed_pre_.data(), rope_pos3);
+                    static_cast<int>(T), static_cast<int>(pos_), positions_dev, seqused_dev,
+                    stream_.get(), normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
+                    normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), rope_pos3);
       std::swap(cur, other);
     }
 
@@ -2246,7 +2369,19 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   mtp_last_hidden_ = cur;  // valid until the next RunChunk/VerifyWindow's EmbedTokens overwrites it
 
   probe_call.End();
-  stream_.Synchronize();  // same hazard class as RunChunk's own D2H -- see that method's comment
+  // Same hazard class as RunChunk's own D2H -- see that method's comment: wait first. TP=1 polls an
+  // event behind an async D2H of the T verdicts into pinned memory (RunChunk's poll_wait, decode-t1
+  // item 5); TP and R4DX_DECODE_LEGACY=host synchronize and copy back blockingly, as before.
+  const bool poll_wait = comm_ == nullptr && !core::DecodeLegacy(core::DecodeItem::kHost);
+  if (poll_wait) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(greedy_host_.data(), verify_argmax_dev_.data(),
+                                   static_cast<size_t>(T) * sizeof(int32_t), hipMemcpyDeviceToHost,
+                                   stream_.get()));
+    step_done_->Record(stream_);
+    WaitStepDone();
+  } else {
+    stream_.Synchronize();
+  }
   if (probe_ != nullptr) probe_->Collect(stream_.get());
 
   std::vector<int32_t> preds(static_cast<size_t>(T));
@@ -2272,7 +2407,11 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     }
     return preds;
   }
-  verify_argmax_dev_.CopyToHost(preds.data(), preds.size());
+  if (poll_wait) {
+    std::copy(greedy_host_.data(), greedy_host_.data() + preds.size(), preds.begin());
+  } else {
+    verify_argmax_dev_.CopyToHost(preds.data(), preds.size());
+  }
   if (logits_out != nullptr) {
     logits_out->resize(static_cast<size_t>(T * cfg.vocab_size));
     verify_logits_dev_.CopyToHost(logits_out->data(), logits_out->size());

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <exception>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -1092,14 +1093,27 @@ void Engine::RunRequest(PendingRequest& req) {
           break;
         }
         generated_tokens.push_back(tok);
-        const bool stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
-        NoteReasoningProgress();
+        // decode-t1 item 5 (docs/perf.md): the token's decode / stop-string scan / forward to the client
+        // runs while the step that feeds it executes on the device (TextModel::DecodeStepGreedyOverlap;
+        // before the step where that cannot overlap -- TP, Gemma, R4DX_DECODE_LEGACY=host). The
+        // callback's own failure is held until `tok` is in committed_tokens, because the step has run
+        // either way.
+        bool stop_hit = false;
+        std::exception_ptr emit_error;
         // Feed `tok` into the model regardless of stop_hit, so committed_tokens below accurately
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
         // token is real generated content, only its stop-marker tail text is withheld from the
         // client.
-        next = model_->DecodeStepGreedy(tok);
+        next = model_->DecodeStepGreedyOverlap(tok, [&] {
+          try {
+            stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
+            NoteReasoningProgress();
+          } catch (...) {
+            emit_error = std::current_exception();
+          }
+        });
         committed_tokens.push_back(tok);
+        if (emit_error) std::rethrow_exception(emit_error);
         if (stop_hit) {
           finish_reason = "stop";
           break;

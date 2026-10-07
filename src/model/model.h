@@ -45,12 +45,14 @@
 #include "model_types.h"  // ImageSpan, ImageRows, ProfileEntry, StepProfile (docs/tp.md 2.8)
 #include "mtp_head.h"
 #include "prefill_chunk.h"  // kPrefillChunkBase / kPrefillChunkWide (docs/prefill.md)
+#include "step_meta.h"      // the one-copy decode step metadata layout (decode-t1 item 5)
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
 // costs every existing includer nothing but a couple of <cmath>/<random> declarations.
 #include "r4dx/kernels/summary_sampler.hpp"
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/core/event.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
 #include "r4dx/core/tp_comm.hpp"
@@ -372,6 +374,13 @@ class Model {
   // Model has no notion of SampleParams/top-k/top-p; a caller that wants anything other than pure
   // greedy sampling must still call DecodeStep and sample over the full logits on the host.
   int32_t DecodeStepGreedy(int32_t token_id);
+
+  // DecodeStepGreedy with the caller's per-token host work (TextModel::DecodeStepGreedyOverlap's
+  // contract) run while the step executes: the step is enqueued, `while_busy` runs once, then the
+  // device result is awaited. The returned token and the model state are exactly DecodeStepGreedy's
+  // (an exception from `while_busy` is rethrown after the step completed and pos_ advanced). Under
+  // TP, or with R4DX_DECODE_LEGACY=host, `while_busy()` runs first and the step second.
+  int32_t DecodeStepGreedyOverlap(int32_t token_id, const std::function<void()>& while_busy);
 
   // ---- Sampled decode (docs/sampling.md section 8, Milestone 6 stage S2) -----------------------
   // The sampled counterpart of DecodeStepGreedy: computes the same next-token logits on-device,
@@ -791,9 +800,32 @@ class Model {
     float inv_temperature = 1.0f;   // 1/temperature; must be finite and > 0
     kernels::RowSummary* out = nullptr;
   };
+  // `overlap` (DecodeStepGreedyOverlap only; needs greedy_token_out): called once, after the whole step
+  // is enqueued and before the host waits for it -- or, where the wait is a plain synchronize (TP,
+  // prefill, R4DX_DECODE_LEGACY=host), after it. An exception it throws is held until the call has
+  // finished its own bookkeeping, then rethrown.
   std::vector<float> RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
                                bool want_logits, int32_t* greedy_token_out = nullptr,
-                               const SummaryRequest* summary_out = nullptr);
+                               const SummaryRequest* summary_out = nullptr,
+                               const std::function<void()>* overlap = nullptr);
+
+  // decode-t1 item 5 (docs/perf.md), the host edge of a decode-sized call (T <= 64, TP=1, not a prefill
+  // chunk), all off under R4DX_DECODE_LEGACY=host:
+  //  * StageStepMeta: the embed ids, KV positions and seqused_k of the call in ONE pinned buffer and one
+  //    async H2D into step_meta_dev_, instead of an async id copy plus two blocking hipMemcpy uploads
+  //    (each a full submit-and-wait on the otherwise idle device);
+  //  * WaitStepDone: the call's end is an event the host polls, not hipStreamSynchronize, and a greedy
+  //    step's 4-byte token is an async D2H into pinned memory ahead of that event, not a blocking
+  //    hipMemcpy after the synchronize. Everything a step enqueues is ahead of the event, so on return the
+  //    device is as idle as after the synchronize the other paths still end with.
+  // step_meta_dev_ layout (int32 elements, 64 rows max): ids at kMetaIds, KV positions at kMetaPos,
+  // seqused_k at kMetaSeq.
+  static constexpr int64_t kMetaIds = kStepMetaIds;
+  static constexpr int64_t kMetaPos = kStepMetaPos;
+  static constexpr int64_t kMetaSeq = kStepMetaSeq;
+  static constexpr int64_t kMetaInts = kStepMetaInts;  // the one copy's length, padded to 16 bytes
+  void StageStepMeta(const std::vector<int32_t>& token_ids);
+  void WaitStepDone();
 
   // ---- sampled decode internals (docs/sampling.md sections 8-9) ---------------------------------
   // Enqueues r4dx_topk_lse_f32 over `rows` rows of `logits_dev` ([rows, vocab] fp32, row stride
@@ -944,6 +976,14 @@ class Model {
   // AttentionLayer::Forward's doc comment for why these must NOT be arena-allocated.
   core::DeviceBuffer<int32_t> attn_positions_;  // [max_chunk_]
   core::DeviceBuffer<int32_t> attn_seqused_k_;  // [1]
+  // decode-t1 item 5: StageStepMeta's pinned source and device destination (kMetaInts int32 each), the
+  // pinned landing of a greedy step's 4-byte token, and the event WaitStepDone polls. Persistent for the
+  // same reason as embed_ids_host_: each call rewrites them only after the previous call's device work,
+  // copies included, has completed.
+  core::PinnedBuffer<int32_t> step_meta_host_;
+  core::DeviceBuffer<int32_t> step_meta_dev_;
+  core::PinnedBuffer<int32_t> greedy_host_;  // [1]
+  std::optional<core::Event> step_done_;     // hipEventDisableTiming
 
   // ---- 3-axis mrope state (docs/vision.md "Text-side splicing") ---------------------------------
   // Once an image has been spliced into this conversation, a token's ROPE position stops being its

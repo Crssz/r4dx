@@ -45,6 +45,7 @@
 #include "model_types.h"  // ImageSpan, ImageRows, ProfileEntry, StepProfile (docs/tp.md 2.8)
 #include "mtp_head.h"
 #include "prefill_chunk.h"  // kPrefillChunkBase / kPrefillChunkWide (docs/prefill.md)
+#include "prefill_int8.h"   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path")
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
@@ -199,6 +200,13 @@ struct ModelOptions {
   // buffers, the arena and the DFlash feature buffer for 256 rows at load (+0.22 GiB), and is honoured at
   // every Prefill call unless the conversation has an image in it; a quant2 container loads 64-row.
   int prefill_chunk = 0;
+  // int8 x int8 prefill GEMM (prefill_int8.h, docs/int8-prefill.md "Production path"): -1 (default) follows the
+  // environment (R4DX_PREFILL_INT8: unset / 0 / off = off, 1 / on = on); 0 and 1 force the choice whatever the
+  // environment says (the tests load Models of each; the identity tests force 0). On, the Model builds a weight
+  // scale table per trellis linear at load (+0.7 GiB on the 27B) and runs the full 256-row super-chunks of its
+  // Prefill calls through the int8 kernel; whatever cannot be served (TP, a 64-row Model, a rotated container)
+  // falls back to f16 with a one-line reason at load.
+  int prefill_int8 = -1;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -768,6 +776,11 @@ class Model {
   // How many 256-row super-chunks this Model has run since Load (tests and diagnostics: proof that the wide
   // path, not its fallback, produced a result).
   int64_t PrefillWideChunksRun() const { return wide_chunks_run_; }
+  // Whether this Model runs the int8 GEMM in its prompt-prefill super-chunks (R4DX_PREFILL_INT8 asked for it and
+  // DecidePrefillInt8 allowed it), and how many super-chunks ran it since Load (tests: proof that the int8 path,
+  // not a fallback, produced a result; PrefillWideChunksRun counts every super-chunk, these a subset).
+  bool PrefillInt8Enabled() const { return prefill_int8_; }
+  int64_t PrefillInt8ChunksRun() const { return i8_chunks_run_; }
 
  private:
   Model() = default;
@@ -997,6 +1010,13 @@ class Model {
   int64_t wide_rows_ = 0;
   int64_t prefill_wide_active_ = 0;
   int64_t wide_chunks_run_ = 0;  // super-chunks run since Load (PrefillWideChunksRun)
+  // R4DX_PREFILL_INT8 (prefill_int8.h): prefill_int8_ is decided once at load (and then the trellis linears hold
+  // their scale tables); prefill_int8_call_ is true only inside a Prefill() call of such a Model (never inside
+  // PrefillMultimodal, whose image accuracy is unmeasured), and RunChunk runs a super-chunk's linears through
+  // the int8 kernel only then. i8_chunks_run_ counts those super-chunks (PrefillInt8ChunksRun).
+  bool prefill_int8_ = false;
+  bool prefill_int8_call_ = false;
+  int64_t i8_chunks_run_ = 0;
   // GdnLayerParams::conv_prep for every prefill call of this Model (prefill_chunk.h's DecideGdnConv, at
   // load): kGdnConvV2 on a wide Model unless R4DX_GDN_CONV=1, else the original kernel (kGdnConvV1).
   int gdn_conv_ = 1;

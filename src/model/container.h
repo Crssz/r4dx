@@ -267,6 +267,11 @@ class Container {
   // BuildTrellisWScale (linear.h) for every trellis linear -- the per-(column, k group) scale tables the
   // rounding prefill GEMMs read. No-op for mode 0 or a container without trellis linears.
   void BuildTrellisWScales(int mode, hipStream_t stream);
+  // R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"), Model::Load only, and only when the
+  // switch is on and the Model uses it: BuildTrellisI8Scale (linear.h) for every trellis linear that has an int8
+  // plan -- the weight scale tables the int8 prefill GEMM quantizes with (K * N / 32 bytes each). Returns how many
+  // tables were built; *trellis_total (if non-null) receives how many trellis linears there are. Stream-ordered.
+  int BuildTrellisI8Scales(hipStream_t stream, int* trellis_total = nullptr);
 
   // The vision tower's weights (docs/vision.md), present only when Load() was called with
   // load_vision=true AND the container actually carries vision.* tensors. HasVisionTensors() is

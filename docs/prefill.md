@@ -11,15 +11,21 @@ re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
 
 - **M0:** measure. A long-context eval kit, a profile of where prefill time goes, and dense accuracy
   baselines.
-- **M1:** lossless attention parallelism (below). The default prompt-prefill attention is the
-  exact-wide launch (bit-identical to the dense kernel); split-KV is opt-in with
-  `R4DX_PREFILL_SPLITKV=split`. See [M1 final](#m1-final-exact-by-default-split-kv-opt-in).
+- **M1:** attention parallelism (below). **Default since 2026-10-07 (branch `fast`): split-KV from 2048
+  tokens of context, the exact-wide launch below it.** `R4DX_PREFILL_SPLITKV=exact` is the kill switch back to
+  the previous default (exact-wide at every depth, bit-identical to the dense kernel), `=0` / `dense` the plain
+  launch. See [Split threshold](#split-threshold-r4dx_prefill_splitkv_min) and
+  [M1 final](#m1-final-exact-by-default-split-kv-opt-in) (historical: it was exact by default until then).
 - **M2:** opt-in lossy modes, gated on the M0 KL harness.
 - **256-row chunk:** lossless, default on since 2026-09-30; `R4DX_PREFILL_CHUNK=0` is the kill switch. See
   [The 256-row prefill chunk](#the-256-row-prefill-chunk-default-on-r4dx_prefill_chunk).
-- **int8 prefill GEMM:** opt-in and lossy, `R4DX_PREFILL_INT8=1` (default off; written, GPU validation
-  pending): the full 256-row super-chunks run their trellis linears int8 x int8. See
+- **int8 prefill GEMM:** lossy but validated, **default on since 2026-10-07 (branch `fast`)**, `R4DX_PREFILL_INT8=0` is
+  the kill switch: the full 256-row super-chunks run their trellis linears int8 x int8 (-18.9% TTFT at 8k, -15.7% at
+  32k, greedy text unchanged, KL(off || on) 0.0011 canon / 0.0017 at 8k / 0.0104 at 32k). See
   [int8-prefill.md "Production path"](int8-prefill.md#production-path-r4dx_prefill_int8).
+- **Prefill is therefore no longer bit-identical to the 64-row f16 path by default.** `R4DX_PREFILL_INT8=0
+  R4DX_PREFILL_SPLITKV=exact` restores the old bytes (the identity tests, `tp1_identity.ps1` and `gdn256_check.ps1`
+  pin them; `gdn256_check.ps1 -Defaults` runs the new defaults).
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs
 are in `E:\models\r4dx\prefill-m0\` (`profile\results.json`, `baseline\`) and are never committed.
@@ -512,12 +518,26 @@ no exact-wide measurement exists below 8192). The per-call crossover is therefor
 2k tokens of context, and only depth 0 (plain 0.015 ms, split 0.028 to 0.037 ms) goes to the unsplit
 path.
 
-`R4DX_PREFILL_SPLITKV_MIN=N` (tokens of context, read once per process, only read with
-`R4DX_PREFILL_SPLITKV=split`) moves the threshold. Unset keeps today's behaviour exactly (8192, plain
-launch below it). Set (any non-negative integer, `0` = split from the first call that has 8 tiles per
-segment), every call below N, and any call the law leaves unsplit, takes the exact-wide launch, which is
-the plain launch's bits, so the output below N is the same as in the default. Anything else warns and
-means unset. The parse and the law's `min_ctx` are checked in `test_attn_layer` (CPU).
+`R4DX_PREFILL_SPLITKV_MIN=N` (tokens of context, read once per process, only read in the split mode)
+moves the threshold. Any non-negative integer; `0` = split from the first call that has 8 tiles per
+segment. Every call below N, and any call the law leaves unsplit, takes the exact-wide launch, which is
+the plain launch's bits. Anything else warns and means unset. The parse and the law's `min_ctx` are
+checked in `test_attn_layer` (CPU).
+
+**Now the default (2026-10-07, branch `fast`).** `R4DX_PREFILL_SPLITKV` unset (or `split`) is the split law with
+`R4DX_PREFILL_SPLITKV_MIN` unset meaning **2048** (`kPrefillSplitKvMinCtx`; it was 8192 with the plain launch below it
+while split-KV was opt-in), and the calls below the depth run exact-wide. The measured configuration is
+`R4DX_PREFILL_SPLITKV=split R4DX_PREFILL_SPLITKV_MIN=2048` on the `splitkv` branch (4aa391a): 8k 4.66 -> 4.56 s,
+32k 22.81 -> 19.73 s, 64k 56.89 -> 43.52 s against the exact-wide default. Kill switches: `=exact` (the previous
+default: exact-wide at every depth, bit-identical to dense), `=0` / `off` / `dense` (the plain launch), `=N` (N segments
+on every call). The law gives S = 4 at ctx 2048 (4 or 2 KV heads), 8 at ctx 4096 and 8192 with 4 KV heads (TP=1), 16 at 8192 with 2 KV
+heads (a TP=2 rank) (unit-tested in `test_attn_layer`). At TP=2 the new depth is not measured: the TP=2 numbers above are for the 8192 threshold. Load line:
+`prefill attention: split-KV from 2048 tokens of context, exact-wide launch below (...)`.
+
+What this costs: the split-KV output is rounding-class different from the dense bits (the calibration above: KL against
+dense within the spread, same exact greedy tasks), so prefill at depth beyond 2048 tokens is no longer bit-identical to
+`R4DX_PREFILL_CHUNK=0` or to the dense kernel, and the chunk grid can change which rows split (the law is a function of the
+context depth of a 64-row slice).
 
 **Checks with the new default** (the `1af310d` build, HIP device 1, outputs in
 `E:\models\r4dx\prefill-m1\final\`):
@@ -551,9 +571,10 @@ TP=2 against TP=1 (the TP=1 M1 validation table, means of 2 runs):
 - Outputs: `E:\models\r4dx\prefill-m1\final\` (`ttft\`, `identity_tp2\`, `phases.log`, and the
   runner `final.ps1`).
 
-**Final default:** exact-wide (lossless: bit-identical to dense at TP=1 and TP=2). 1.51x at 128k
-TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) stays opt-in for
-2.0x (TP=1) and 2.9x (TP=2) at 128k, with rounding-class drift against the dense bits.
+**Final default at the time (2026-10-03):** exact-wide (lossless: bit-identical to dense at TP=1 and TP=2). 1.51x at 128k
+TP=1 and 1.82x at 128k TP=2 over dense. Split-KV (`R4DX_PREFILL_SPLITKV=split`) stayed opt-in for
+2.0x (TP=1) and 2.9x (TP=2) at 128k, with rounding-class drift against the dense bits. **Superseded 2026-10-07:** split-KV
+from 2048 tokens of context is the default, exact-wide is `R4DX_PREFILL_SPLITKV=exact` (see "Split threshold").
 
 ## The 256-row prefill chunk (default on, `R4DX_PREFILL_CHUNK`)
 

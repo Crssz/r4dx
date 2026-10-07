@@ -7,8 +7,13 @@ GPU runs are PENDING (the commands and an empty results table are in that sectio
 
 Update (2026-10-07, branch `int8prefill`): the two switches above are accuracy EXPERIMENTS (they round, then run the f16
 GEMM). The bench-only int8 GEMM prototype (docs/int8-gemm-proto.md) measured 1.46x (KB4) and 1.34x (KB5) on the
-linears, so it is now a real, opt-in prefill path, `R4DX_PREFILL_INT8=1` (default off): see "Production path"
-at the end of this file. Nothing int8 is on `main` or on by default.
+linears, so it is now a real prefill path, `R4DX_PREFILL_INT8`: see "Production path" at the end of this file.
+
+**Now the default (2026-10-07, branch `fast`).** The path was validated on a GPU (Results at the end: -18.9% TTFT at 8k,
+-15.7% at 32k, greedy text unchanged, KL(off || on) 0.0011 canon / 0.0017 at 8k / 0.0104 at 32k) and made the default:
+`R4DX_PREFILL_INT8` unset, empty, `1` or `on` is on, `0` or `off` is the kill switch (see "Now the default" under
+"Production path"). `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` below are still experiments and, when set, win over the default.
+It is not on `main` yet: it is on branch `fast`.
 
 The question: a trellis linear's GEMM (docs/trellis-kernel.md, docs/trellis-m256.md) multiplies an f16
 activation tile, the input after the 128-block Hadamard rotation, by on-the-fly decoded weights on f16 WMMA.
@@ -382,7 +387,38 @@ say the int8 grid of a trellis weight is the obstacle and not the activations.
 Status (2026-10-07, branch `int8prefill` = `f16retune` (= `main`) + `int8q` + `int8gemm`, then this work): written and built
 (libr4d unit, `tool_teacher_forced_logprobs`, `r4dx-cli`, `r4dx-server`, the tests below); every CPU check passes; **nothing
 here has run on a GPU** (the session that wrote it was CPU-only by rule). The GPU validation sequence is the last
-subsection; its results table is EMPTY. Default OFF, and off is byte-identical to `f16retune` (checked below).
+subsection; its results table is at the end (filled 2026-10-07). It was default OFF, and off is byte-identical to `f16retune`
+(checked below); **it is now the default, see "Now the default (branch `fast`)" directly below.**
+
+### Now the default (branch `fast`, 2026-10-07)
+
+The user approved giving up "prefill is bit-identical" (September) for two lossy-but-validated speedups, this one and split-KV
+prompt-prefill attention (docs/prefill.md "Split threshold"). What changed:
+
+| | before | now |
+|---|---|---|
+| `R4DX_PREFILL_INT8` unset / empty | off | **on** (where the Model can use it) |
+| `R4DX_PREFILL_INT8=1` / `on` | on | on, and an explicit request: with `R4DX_FAKEQ_ACT/W` set it still throws |
+| `R4DX_PREFILL_INT8=0` / `off` | off | off: the kill switch (no scale table, no extra launch, the old bytes) |
+| anything else | off + warning | the default (on) + warning |
+| `ModelOptions::prefill_int8 = -1` | follows the environment (off) | follows the environment (on); 0 and 1 still force |
+| `R4DX_FAKEQ_ACT/W` set, int8 only the default | n/a | int8 is refused with the reason `R4DX_FAKEQ_ACT / R4DX_FAKEQ_W are set`, the experiment runs as before |
+
+Unchanged: it still runs only where it did (full 256-row super-chunks of `Prefill` calls on a TP = 1 trellis Model: tails, a
+64-row Model, a quant2 container, TP = 2, images, decode and verify windows and the Gemma 4 model stay on the f16 kernels).
+Costs now paid by default: +0.7 GiB of weight scale tables at load (`R4DX_PREFILL_INT8=0` skips them), prefill rows that are a
+quantized model of the f16 rows (KL numbers in Results), and the KV bytes of a prompt depending on the chunk grid and so on
+the prefix-cache state (a prefix-reuse suffix anchors its own grid). Load line: `prefill int8: ON (default): ...`, or
+`off (default is on, not used: <reason>)`, or `off (R4DX_PREFILL_INT8=0: ...)`.
+
+Tests: the f16 identity tests pin `prefill_int8 = 0` per `Load` (`test_prefill_chunk_identity`, which also pins
+`R4DX_PREFILL_SPLITKV=exact` unless the environment says otherwise), `test_prefill_int8` loads off / on / **default (-1)**,
+`tp1_identity.ps1` pins both knobs and `gdn256_check.ps1` pins them unless run with `-Defaults`. One test expectation was wrong
+and is fixed: a text-only `PrefillMultimodal` is NOT byte-equal to `Prefill` of the same ids, even with int8 off (the attention
+layers' KV bytes differ; measured 2026-10-07, G2b below), so `test_prefill_int8` compares `PrefillMultimodal` on vs off and
+counts its int8 chunks instead. Not covered by the speed / accuracy gates that were measured (listed under "Gates for making it
+the default" below, which have no row in Results yet): the speculation gate (DFlash / MTP accepted length on the OpenCode
+transcripts), the `run_tasks` scores at 8k / 32k, a 128k prefill; they are in the validation list handed to the main session.
 
 What it is: the prototype of docs/int8-gemm-proto.md (measured 1.456x KB4, 1.335x KB5 against the f16 M = 256 plan on all
 seven linear classes, before the mlp.down retune; the unfused activation quantizer adds about 5%) turned into a real
@@ -419,7 +455,8 @@ What is lost with it ON:
 * independence from the chunk grid. The grid is anchored at each `Prefill` call's start, so with prefix reuse or a
   checkpoint restore the SAME token can be int8 in one run (it fell in a super-chunk) and f16 in another (it fell in a
   tail). The KV bytes of a prompt then depend on the prefix-cache state. That is a property of the idea (the rows a
-  grid makes super-chunks), bounded by the accuracy gates below, and the reason it is opt-in.
+  grid makes super-chunks), bounded by the accuracy gates below, and why it was opt-in (it is now the default; the kill
+  switch is `R4DX_PREFILL_INT8=0`).
 
 What replaces 64 == 256 as the contract: kernel exactness against an integer reference (`test_trellis_i8_gemm`), a KL budget
 against off (gates below), and a split-consistency gate (`--prefix-split-at`): KL(on one-shot || on split) must be at most
@@ -492,13 +529,16 @@ books it under `weights=` and the load line prints it. Follow-up: store f16 `rs`
 
 ### Model plumbing
 
-* `src/model/prefill_int8.h` (header-only, HIP-free): `ParsePrefillInt8` (unset, empty, `0`, `off` = off; `1`, `on` = on;
-  anything else warns and means off), `ResolvePrefillInt8Request` and `DecidePrefillInt8` (refuses with a reason, in this
-  order, for a rotated container, a Model without 256-row chunks, TP > 1, no trellis linears, no linear with a plan).
-* `ModelOptions::prefill_int8`: -1 follows the environment, 0 and 1 force it (`test_prefill_chunk_identity` forces 0).
-  `R4DX_PREFILL_INT8` together with `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` throws at load (they would quantize twice).
-* One load line: `prefill int8: ON (...)` with the table count and GiB, or `off (... asked for it, not used: <reason>)`, or
-  `off (default; R4DX_PREFILL_INT8=1 enables ...)`.
+* `src/model/prefill_int8.h` (header-only, HIP-free): `ParsePrefillInt8` (unset, empty, `1`, `on` = on -- the default --;
+  `0`, `off` = off; anything else warns and means the default), `ParsePrefillInt8Explicit` / `ResolvePrefillInt8Explicit`
+  (only `1` / `on` or option 1 are an explicit request), `ResolvePrefillInt8Request` and `DecidePrefillInt8` (refuses with a
+  reason, in this order, for `R4DX_FAKEQ_ACT/W` set, a rotated container, a Model without 256-row chunks, TP > 1, no trellis
+  linears, no linear with a plan).
+* `ModelOptions::prefill_int8`: -1 follows the environment (default on), 0 and 1 force it (`test_prefill_chunk_identity`
+  forces 0). An EXPLICIT `R4DX_PREFILL_INT8=1` / option 1 together with `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` throws at load (they
+  would quantize twice); with int8 only the default, the experiment switches win.
+* One load line: `prefill int8: ON (default | R4DX_PREFILL_INT8=...)` with the table count and GiB, or
+  `off (<source> ..., not used: <reason>)`, or `off (R4DX_PREFILL_INT8=0: ...)`.
 * `Model::PrefillInt8Enabled()` and `PrefillInt8ChunksRun()` (a counter beside `PrefillWideChunksRun()`; tests prove the int8
   path, not a fallback, produced a result).
 * DFlash feature capture and MTP priming read int8-perturbed hidden states (allowed, gated by the speculation gate below).

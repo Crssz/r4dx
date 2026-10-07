@@ -20,10 +20,14 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   DFlash2 drafter.
 - **KV cache:** fp8 e4m3, paged in 16-token blocks, up to the model's native 262144-token context.
 - **Speculative decoding:** MTP and DFlash2 (block-diffusion drafter), lossless in distribution.
-- **Prefill:** 256-row chunks (the M = 256 trellis GEMM; bit-identical to 64-row chunks, kill switch
-  `R4DX_PREFILL_CHUNK=0`) with a fused, exact-wide attention kernel; a faster split-KV variant is opt-in
-  (`R4DX_PREFILL_SPLITKV=split`).
-  An int8 x int8 prefill GEMM for the 256-row chunks is opt-in and lossy (`R4DX_PREFILL_INT8=1`, default off; docs/int8-prefill.md).
+- **Prefill:** 256-row chunks (the M = 256 trellis GEMM; kill switch `R4DX_PREFILL_CHUNK=0`) with two
+  lossy-but-validated speedups ON BY DEFAULT: an int8 x int8 GEMM for the full 256-row chunks (greedy text
+  unchanged on the canon prompts, KL(f16 || int8) 0.0011 on the canon corpus, 0.0017 at 8k, 0.0104 at 32k;
+  kill switch `R4DX_PREFILL_INT8=0`; docs/int8-prefill.md) and split-KV attention from 2048 tokens of
+  context, exact-wide below (kill switch `R4DX_PREFILL_SPLITKV=exact`, which is the lossless exact-wide
+  launch; `=0` the plain dense launch; `R4DX_PREFILL_SPLITKV_MIN` moves the depth; docs/prefill.md). Prefill is
+  no longer bit-identical to the 64-row f16 path: set `R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact` to get
+  the old bytes back. TP = 2, a 64-row Model, tails shorter than 256 rows, images and quant2 containers keep the f16 GEMM.
 - **Tensor parallel across two GPUs (`--tp 2`):** all-reduce through pinned host memory, since the
   cards have no peer-to-peer path.
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
@@ -36,11 +40,17 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | | |
 |---|---|
 | Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70% |
-| Weights | about 17 GiB |
+| Weights | about 17 GiB (+0.7 GiB of int8 weight scale tables for the default int8 prefill; `R4DX_PREFILL_INT8=0` skips them) |
 | Decode, plain | 36.7 tok/s |
 | Decode, DFlash2 `k=7` | 108 tok/s |
 | Prefill, short prompts | about 1130 tok/s |
-| Cold prefill (time to first token) | 4.7 s at 8k, 23.0 s at 32k tokens (256-row chunks, HIP device 1, ROCm 10.1.0, 2026-10-07; 7.0 s and 32.3 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
+| Cold prefill (time to first token), defaults (int8 prefill GEMM + split-KV attention) | PENDING s at 8k, PENDING s at 32k, PENDING s at 64k tokens (HIP device 1; to be measured on the `fast` branch build by `tools\prefill\ttft_cli.ps1`) |
+| Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.7 s at 8k, 23.0 s at 32k tokens (256-row chunks, HIP device 1, ROCm 10.1.0, 2026-10-07; 7.0 s and 32.3 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
+
+Measured on the branches before they were merged (2026-10-07, same machine, one at a time): int8 prefill GEMM alone
+-18.9% TTFT at 8k and -15.7% at 32k; split-KV attention from 2048 tokens alone 4.66 -> 4.56 s at 8k, 22.81 ->
+19.73 s at 32k, 56.89 -> 43.52 s at 64k. The decode cuts merged with them (bit-exact; docs/perf.md "decode-t1")
+measured +2.3% plain and +4.7% DFlash2 `k=7`; the decode rows above are the numbers from before that merge (PENDING re-measure).
 
 With `--tp 2` on two R9700s (same container, measured 2026-09-30 against a single-card baseline from the
 same session), plain decode reaches 60.1 tok/s (1.70x one card), DFlash2 `k=7` 162 tok/s (1.58x) and

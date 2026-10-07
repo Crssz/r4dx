@@ -8,6 +8,16 @@ the base checkpoint; those numbers stay as the historical record (same architect
 speeds transfer closely, KL numbers do not: a KL is only meaningful against the bf16 reference of
 its own model).
 
+## Prefill defaults: int8 GEMM and split-KV attention (2026-10-07, branch `fast`)
+
+Branch `fast` = `main` (89587f0) + `decode-t1` + `splitkv` + `int8prefill`, with two lossy-but-validated prefill speedups made
+the DEFAULT (the user approved giving up "prefill is bit-identical", September). `R4DX_PREFILL_INT8` unset = on (kill switch
+`=0`; docs/int8-prefill.md "Now the default"); `R4DX_PREFILL_SPLITKV` unset = split-KV from 2048 tokens of context,
+exact-wide below (kill switch `=exact`, or `=0` for the plain launch; `R4DX_PREFILL_SPLITKV_MIN` moves the depth;
+docs/prefill.md "Split threshold"). Measured on the branches before the merge (cold TTFT, one at a time): int8 8k -18.9%,
+32k -15.7%; split-KV 8k 4.66 -> 4.56 s, 32k 22.81 -> 19.73 s, 64k 56.89 -> 43.52 s. The merged build's own TTFT numbers
+are PENDING (the README table has the placeholders). Decode is untouched by both switches (prompt prefill only).
+
 ## Decode step: bit-exact launch and host-edge cuts (2026-10-08, branch `decode-t1`)
 
 **Measured** (2026-10-07, ROCm 10.1.0, HIP device 1, `tools\quant2\bench_decode.ps1`, 3 interleaved runs,

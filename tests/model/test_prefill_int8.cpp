@@ -28,7 +28,7 @@
 //     the fused quantizer scoped off (separate r4d_trellis_i8_quant_act launches) and on (the producers write A8 + SA):
 //     the logits of every call, the whole state digest and the decode tokens are byte-identical, and the operand counters
 //     (TrellisI8OperandCountsGet) show each side ran the chain it is named for (RunFusedQ);
-//   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
+//   * R4DX_PREFILL_INT8_SCALES=coarse (a fifth load, ModelOptions::prefill_int8_scales = 1: A one scale per row, the weight one per\n//     column over the whole K, docs/int8-prefill.md "Coarse scales"): the same five scenarios, fused vs separate chain\n//     byte-identical (the per-row producers r4dx_*_i8r against the f16 producers + r4d_trellis_i8_quant_act_row), deterministic\n//     (a rerun gives the same bytes), the weight table is N floats per linear and not [K / 128][N] (the load's VRAM figure),\n//     the KV digests differ from the per-128 scales' and from f16's (negative control), and the last row's logits stay close to\n//     f16's and to the per-128 int8's (KL bounded, top-1 the same unless a near tie) -- RunFusedQ(scales = 1);\n//   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
 //     (PrefillInt8Enabled() == false) and every byte equals off's.
 // SKIPs (77) for a container that is missing; an exception from a present one is a FAIL.
 #include <hip/hip_runtime.h>
@@ -222,12 +222,15 @@ std::vector<Scenario> Scenarios() {
 // Reset() leaves the KV pages alone and the digest covers them all, so run A and run B of one scenario must start from
 // the same stale pages, which they do (B rewrites exactly the positions A wrote). The operand counters prove each side ran
 // the chain it is named for: off takes every operand from the separate quantizer, on from no separate quantizer at all.
-int RunFusedQ(const ModelOptions& base_in) {
+int RunFusedQ(const ModelOptions& base_in, int scales = 0, const std::vector<Scenario>* all_scs = nullptr, const Side* off = nullptr,
+              const Side* on = nullptr) {
   ModelOptions o = base_in;
   o.prefill_chunk = 256;
   o.prefill_int8 = 1;
+  o.prefill_int8_scales = scales;   // 0 = blk128 (today's), 1 = coarse
   Model m = Model::Load(o);
   int fails = 0;
+  const std::string stag = scales == 1 ? "fusedq-coarse/" : "fusedq/";
   if (!m.PrefillInt8Enabled()) {
     std::fprintf(stderr, "FAIL fusedq: the int8 path is not enabled on the production container\n");
     return 1;
@@ -238,7 +241,7 @@ int RunFusedQ(const ModelOptions& base_in) {
   using r4dx::model::TrellisI8OperandCounts;
   using r4dx::model::TrellisI8OperandCountsGet;
   for (const Scenario& sc : scs) {
-    const std::string cfg = "fusedq/" + sc.name;
+    const std::string cfg = stag + sc.name;
     const TrellisI8OperandCounts c0 = TrellisI8OperandCountsGet();
     Obs a, b;
     {
@@ -277,6 +280,49 @@ int RunFusedQ(const ModelOptions& base_in) {
       std::fprintf(stderr, "FAIL %s: %zu of %zu observables (logits, KV, GDN state, decode tokens) differ between the fused and the separate chain\n",
                    cfg.c_str(), bad, a.trace.size());
       ok = false;
+    }
+    if (scales == 1 && all_scs != nullptr && off != nullptr && on != nullptr) {
+      // coarse only: deterministic (a rerun of the fused chain gives the same bytes), the KV digests differ from the per-128
+      // scales' and from f16's (the digest sees the coarse rows), and the last row's logits stay close to both
+      Obs b2;
+      {
+        ScopedTrellisI8FusedQ on2(1);
+        b2 = RunScenario(m, sc);
+      }
+      if (CountDiff(b.trace, b2.trace, "coarse rerun", cfg, true) != 0) {
+        std::fprintf(stderr, "FAIL %s: the coarse int8 path is not deterministic (a rerun differs)\n", cfg.c_str());
+        ok = false;
+      }
+      size_t idx = 0;
+      while (idx < all_scs->size() && (*all_scs)[idx].name != sc.name) ++idx;
+      if (idx == all_scs->size()) {
+        std::fprintf(stderr, "FAIL %s: scenario not in the f16 / per-128 sides' list\n", cfg.c_str());
+        ok = false;
+      } else {
+        const auto kv_diff = [](const Trace& x, const Trace& y) {
+          size_t n = 0;
+          for (size_t t = 0; t < x.size() && t < y.size(); ++t)
+            if (x[t].first.find("/kv.") != std::string::npos && x[t] != y[t]) ++n;
+          return n;
+        };
+        const size_t d_f16 = kv_diff(off->obs[idx].trace, b.trace), d_blk = kv_diff(on->obs[idx].trace, b.trace);
+        if (d_f16 == 0 || d_blk == 0) {
+          std::fprintf(stderr, "FAIL %s: the coarse KV digests equal f16's (%zu differ) or the per-128 int8's (%zu differ): the digest cannot see them\n", cfg.c_str(), d_f16, d_blk);
+          ok = false;
+        }
+        const double kl_f16 = Kl(off->obs[idx].logits, b.logits), kl_blk = Kl(on->obs[idx].logits, b.logits);
+        const bool top1 = Argmax(off->obs[idx].logits) == Argmax(b.logits);
+        const double margin = Top2Margin(off->obs[idx].logits);
+        if (!(kl_f16 >= 0.0 && kl_f16 < 0.1) || !(kl_blk >= 0.0 && kl_blk < 0.1)) {
+          std::fprintf(stderr, "FAIL %s: KL of the last row's logits: coarse vs f16 %.5f, coarse vs per-128 int8 %.5f (bound 0.1)\n", cfg.c_str(), kl_f16, kl_blk);
+          ok = false;
+        }
+        if (!top1 && margin >= 0.25) {
+          std::fprintf(stderr, "FAIL %s: the coarse top-1 token differs from f16's although the f16 top-2 margin is %.3f logits\n", cfg.c_str(), margin);
+          ok = false;
+        }
+        std::fprintf(stderr, "[coarse] %s: KL(f16 || coarse) %.5f, KL(per-128 int8 || coarse) %.5f, KV digests differing from f16 / per-128: %zu / %zu, top-1 %s\n", cfg.c_str(), kl_f16, kl_blk, d_f16, d_blk, top1 ? "same" : "flipped (near tie)");
+      }
     }
     if (ok)
       std::fprintf(stderr, "[PASS] %s: %lld int8 chunks, %lld operands (%lld from producers, %lld from the own fused transform), %zu observables byte-identical to the separate chain\n",
@@ -403,6 +449,7 @@ int RunReal(const char* path) {
     }
   }
   fails += RunFusedQ(base);
+  fails += RunFusedQ(base, /*scales=*/1, &scs, &off, &on);   // R4DX_PREFILL_INT8_SCALES=coarse
   return fails;
 }
 

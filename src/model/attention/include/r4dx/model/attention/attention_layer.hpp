@@ -516,14 +516,14 @@ class AttentionLayer {
     if (o_fused && TrellisI8FusedQ(*w.o, T)) {
       // R4DX_PREFILL_INT8_FUSEDQ: o_proj will take the int8 GEMM, so the gate-mul's product goes through the
       // transform straight into the quantizer: A8 + SA, no f16 A.
-      const TrellisI8Operand a_o = AllocTrellisI8Operand(arena, static_cast<int64_t>(H) * D, 1);
+      // R4DX_PREFILL_INT8_SCALES=coarse: one scale per row (r4dx_attn_gate_mul_trellis_i8r) for a coarse o_proj.
+      const bool o_coarse = TrellisI8Coarse(*w.o);
+      const TrellisI8Operand a_o = AllocTrellisI8Operand(arena, static_cast<int64_t>(H) * D, 1, o_coarse);
       ProfiledCall(prof, stream, "attn.gate_mul_trellis", [&] {
-        r4dx_attn_gate_mul_trellis_i8(reinterpret_cast<int64_t>(attn_out),
-                                      reinterpret_cast<int64_t>(gate), T,
-                                      static_cast<int64_t>(H) * D,
-                                      reinterpret_cast<int64_t>(w.o->trellis_suh.data()),
-                                      reinterpret_cast<int64_t>(a_o.a8), reinterpret_cast<int64_t>(a_o.sa),
-                                      w.o->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));
+        (o_coarse ? r4dx_attn_gate_mul_trellis_i8r : r4dx_attn_gate_mul_trellis_i8)(
+            reinterpret_cast<int64_t>(attn_out), reinterpret_cast<int64_t>(gate), T, static_cast<int64_t>(H) * D,
+            reinterpret_cast<int64_t>(w.o->trellis_suh.data()), reinterpret_cast<int64_t>(a_o.a8),
+            reinterpret_cast<int64_t>(a_o.sa), w.o->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));
       });
       o_pre = PreQuantizedActivation{r4dx_epilogue_none, nullptr, w.o->trellis_suh.data(), 0};
       o_pre.a8 = a_o.a8;

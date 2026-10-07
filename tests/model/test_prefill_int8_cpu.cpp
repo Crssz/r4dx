@@ -8,7 +8,8 @@
 //     row, R4DX_M256_SHAPES), and the tuning table itself: no duplicate key, every row legal under the kernel's own
 //     check (r4d_gemm_trellis_nt_i8_check) at its shape, every class of the model has a row at KB 4 and KB 5;
 //   * ScopedTrellisI8: off by default, nests, restores;
-//   * R4DX_PREFILL_INT8_FUSEDQ: the parser and the producer / consumer decision (TrellisI8Takes, TrellisI8FusedQ).
+//   * R4DX_PREFILL_INT8_FUSEDQ: the parser and the producer / consumer decision (TrellisI8Takes, TrellisI8FusedQ);
+//   * R4DX_PREFILL_INT8_SCALES: the parser and the option, the coarse plan and its own tuning table (TrellisI8Coarse).
 // Links r4dx_model_linear (src/model/linear.cpp) and runs with HIP_VISIBLE_DEVICES=-1 (linking the library loads the
 // HIP runtime, which must see no device here); the libr4d check is host code.
 #include <cstdio>
@@ -272,6 +273,72 @@ void TestFusedQ() {
   }
 }
 
+// R4DX_PREFILL_INT8_SCALES=coarse (docs/int8-prefill.md "Coarse scales"): the parser and the option, the coarse plan and its
+// table (same classes, same legality, its own rows), and the per-linear decision (a linear is coarse when it holds the
+// column table; the positive case needs device memory: tests/model/test_prefill_int8 has it).
+void TestScales() {
+  CHECK(ParsePrefillInt8Scales(nullptr) == kPrefillInt8ScalesBlk128 && ParsePrefillInt8Scales("") == kPrefillInt8ScalesBlk128 &&
+            ParsePrefillInt8Scales("blk128") == kPrefillInt8ScalesBlk128,
+        "unset, empty, blk128: the per-128 scales (the default)");
+  CHECK(ParsePrefillInt8Scales("coarse") == kPrefillInt8ScalesCoarse, "coarse is coarse");
+  std::fflush(stderr);
+  CHECK(ParsePrefillInt8Scales("Coarse") == kPrefillInt8ScalesBlk128 && ParsePrefillInt8Scales("1") == kPrefillInt8ScalesBlk128 &&
+            ParsePrefillInt8Scales("row") == kPrefillInt8ScalesBlk128,
+        "an unrecognized value keeps the default, blk128 (with a warning on stderr; the spelling is case sensitive)");
+  CHECK(ValidPrefillInt8ScalesOption(-1) && ValidPrefillInt8ScalesOption(0) && ValidPrefillInt8ScalesOption(1) &&
+            !ValidPrefillInt8ScalesOption(2) && !ValidPrefillInt8ScalesOption(-2),
+        "options -1, 0, 1 are valid, 2 and -2 are not");
+  CHECK(ResolvePrefillInt8Scales(0) == kPrefillInt8ScalesBlk128 && ResolvePrefillInt8Scales(1) == kPrefillInt8ScalesCoarse,
+        "option 0 forces blk128, option 1 coarse, whatever the environment says");
+  CHECK(ResolvePrefillInt8Scales(-1) == PrefillInt8ScalesRequest(), "option -1 follows R4DX_PREFILL_INT8_SCALES");
+  CHECK(std::string(PrefillInt8ScalesName(kPrefillInt8ScalesCoarse)) == "coarse" &&
+            std::string(PrefillInt8ScalesName(kPrefillInt8ScalesBlk128)) == "blk128", "the names");
+  QuantLinear w;
+  w.layout = Layout::kTrellis;
+  CHECK(!TrellisI8Coarse(w), "a linear with no coarse table is not coarse");
+}
+
+void TestCoarsePlansAndTable() {
+  for (int kb : {4, 5}) {
+    for (const Cls& c : kClasses) {
+      const TrellisI8Plan p = PlanTrellisI8(c.N, c.K, kb, c.parts, c.part_n0, /*coarse=*/true);
+      if (c.N == 10240 && c.K == 5120) {
+        CHECK(!p.ok && p.why.rfind("shape excluded", 0) == 0, "coarse %s KB%d: the R4DX_M256_SHAPES filter excludes it too: %s", c.name, kb,
+              p.why.c_str());
+        continue;
+      }
+      CHECK(p.ok, "coarse %s KB%d: no int8 plan: %s", c.name, kb, p.why.c_str());
+      if (!p.ok) continue;
+      const int64_t n_split = c.parts > 1 ? c.part_n0 : c.N;
+      CHECK(r4d_gemm_trellis_nt_i8_check(256, static_cast<int>(c.K), static_cast<int>(c.N), static_cast<int>(n_split), kb, p.skw, p.skg) == nullptr,
+            "coarse %s KB%d: the plan's (skw %d, skg %d) is not legal for the kernel", c.name, kb, p.skw, p.skg);
+    }
+  }
+  const auto why_of = [](int64_t N, int64_t K, int kb, int parts, int64_t n0) { return PlanTrellisI8(N, K, kb, parts, n0, true).why; };
+  CHECK(why_of(5120, 17408, 6, 1, 0).find("KB") != std::string::npos, "coarse: KB 6 is refused");
+  CHECK(why_of(34816, 5120, 4, 2, 17408 + 64).find("boundary") != std::string::npos, "coarse: a part boundary inside a 128-block is refused");
+  CHECK(why_of(4096, 3840, 4, 1, 0).find("no int8 tuning row") != std::string::npos, "coarse: a shape without a table row is refused");
+  size_t n = 0, n_blk = 0;
+  const TrellisI8Row* rows = TrellisI8Rows(&n, /*coarse=*/true);
+  const TrellisI8Row* blk = TrellisI8Rows(&n_blk);
+  CHECK(rows != nullptr && rows != blk && n == 14, "the coarse table is its own, 14 rows (7 classes x 2 rates), got %zu", n);
+  std::set<std::tuple<int64_t, int64_t, int>> keys;
+  for (size_t i = 0; i < n; ++i) {
+    const TrellisI8Row& r = rows[i];
+    CHECK(keys.emplace(r.N, r.K, r.rate).second, "coarse: duplicate row for (N %lld, K %lld, KB %d)", static_cast<long long>(r.N),
+          static_cast<long long>(r.K), r.rate);
+    CHECK(r4d_gemm_trellis_nt_i8_check(256, static_cast<int>(r.K), static_cast<int>(r.N), static_cast<int>(r.N), r.rate, r.skw, r.skg) == nullptr,
+          "coarse row %zu (N %lld, K %lld, KB %d): (skw %d, skg %d) is not legal", i, static_cast<long long>(r.N), static_cast<long long>(r.K), r.rate,
+          r.skw, r.skg);
+  }
+  for (const Cls& c : kClasses)
+    for (int kb : {4, 5}) CHECK(keys.count({c.N, c.K, kb}) == 1, "coarse: %s KB%d has no table row", c.name, kb);
+  // the same (N, K, KB) key set as the per-128 table
+  std::set<std::tuple<int64_t, int64_t, int>> keys_blk;
+  for (size_t i = 0; i < n_blk; ++i) keys_blk.emplace(blk[i].N, blk[i].K, blk[i].rate);
+  CHECK(keys == keys_blk, "the coarse table covers exactly the classes the per-128 table does");
+}
+
 }  // namespace
 
 int main() {
@@ -287,6 +354,8 @@ int main() {
   TestTable();
   TestScope();
   TestFusedQ();
+  TestScales();
+  TestCoarsePlansAndTable();
   if (g_fail != 0) {
     std::printf("test_prefill_int8_cpu: %d of %d checks FAILED\n", g_fail, g_checks);
     return 1;

@@ -164,6 +164,20 @@ void r4dx_silu_mul_trellis_i8(int64_t gate_up, int64_t rows, int64_t intermediat
 void r4dx_attn_gate_mul_trellis_i8(int64_t attn_out, int64_t gate, int64_t rows, int64_t K, int64_t suh,
                                     int64_t a8, int64_t sa, int prescale_log2, int64_t stream);
 
+// ---- ... with ONE activation scale per ROW (R4DX_PREFILL_INT8_SCALES=coarse, docs/int8-prefill.md "Coarse scales") ----
+// r4dx_trellis_input_i8r / r4dx_silu_mul_trellis_i8r / r4dx_attn_gate_mul_trellis_i8r: the three entries above with the
+// same arguments, but s = amax / 127 is taken over the WHOLE row (the A8 bytes and the scale are what
+// r4d_trellis_i8_quant_act_row makes from the f16 A), so sa is [256] fp32 per output (a linear's second part at
+// sa + 256, a8 + 256 K as before). The amax needs the whole row, so a workgroup of 256 threads owns one row: its 8 waves
+// transform the row's 128-blocks, park the f16 values in LDS (nout * K * 2 + 64 bytes, at most 64 KiB: throws beyond) and
+// quantize the row once all are in. Launch: grid (256), 256 threads. Preconditions as the per-128 entries'.
+void r4dx_trellis_input_i8r(int64_t x, int64_t M, int64_t K, int nout, const int64_t* suh, const int64_t* a8,
+                             const int64_t* sa, int prescale_log2, int64_t stream);
+void r4dx_silu_mul_trellis_i8r(int64_t gate_up, int64_t rows, int64_t intermediate, int64_t in_row_stride,
+                                int64_t suh, int64_t a8, int64_t sa, int prescale_log2, int64_t stream);
+void r4dx_attn_gate_mul_trellis_i8r(int64_t attn_out, int64_t gate, int64_t rows, int64_t K, int64_t suh,
+                                     int64_t a8, int64_t sa, int prescale_log2, int64_t stream);
+
 // Diagnostic (R4DX_FAKEQ_ACT, docs/int8-prefill.md; src/model/fake_quant_act.h is the reference): round a
 // trellis linear's transformed A to symmetric int8 and back, IN PLACE. a: f16 [rows, K] with row stride K,
 // plus a second such part at a + part_stride when parts == 2 (the layout r4dx_trellis_input_bf16 writes).

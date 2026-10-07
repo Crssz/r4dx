@@ -341,6 +341,36 @@ inline const char* GemmTrellisNtI8Check(int M, int K, int N, int n_split, int KB
 // SKG * M * N fp32.
 inline size_t GemmTrellisNtI8WsBytes(int M, int N, int SKG) { return r4d_gemm_trellis_nt_i8_ws_bytes(M, N, SKG); }
 
+// The coarse-scale sibling (R4DX_PREFILL_INT8_SCALES=coarse; r4d.h "COARSE-scale sibling"): one activation scale per row
+// (SA [256] per part, TrellisI8QuantActRow) and one weight scale per column (SWC [N], TrellisI8WscaleColBuild), the same
+// GEMM entry and legality (GemmTrellisNtI8Check, GemmTrellisNtI8WsBytes) as the per-128 one.
+inline size_t TrellisI8WscaleColCount(int K, int N) { return r4d_trellis_i8_wscale_col_count(K, N); }
+inline void TrellisI8WscaleColBuild(const void* w, void* swc, int K, int N, int KB, hipStream_t stream) {
+  r4d_trellis_i8_wscale_col(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(swc), K, N, KB,
+                            reinterpret_cast<int64_t>(stream));
+}
+// Diagnostic (tests): TrellisI8DumpW for the coarse table.
+inline void TrellisI8DumpWCol(const void* w, const void* swc, void* w8, void* wp, int K, int N, int KB,
+                              hipStream_t stream) {
+  r4d_trellis_i8_dump_w_col(reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(swc), reinterpret_cast<int64_t>(w8),
+                            reinterpret_cast<int64_t>(wp), K, N, KB, reinterpret_cast<int64_t>(stream));
+}
+inline void TrellisI8QuantActRow(const void* x, void* a8, void* sa, int parts, int64_t part_stride, int K,
+                                 hipStream_t stream) {
+  r4d_trellis_i8_quant_act_row(reinterpret_cast<int64_t>(x), reinterpret_cast<int64_t>(a8),
+                               reinterpret_cast<int64_t>(sa), parts, part_stride, K, reinterpret_cast<int64_t>(stream));
+}
+inline void GemmTrellisNtI8c(const void* a8_0, const void* sa_0, const void* a8_1, const void* sa_1, int n_split,
+                             const void* w, const void* swc, const void* svh, void* c, void* ws, void* tickets,
+                             int M, int K, int N, int KB, int skw, int skg, float out_scale, hipStream_t stream) {
+  r4d_gemm_trellis_nt_i8c(reinterpret_cast<int64_t>(a8_0), reinterpret_cast<int64_t>(sa_0),
+                          reinterpret_cast<int64_t>(a8_1), reinterpret_cast<int64_t>(sa_1), n_split,
+                          reinterpret_cast<int64_t>(w), reinterpret_cast<int64_t>(swc), reinterpret_cast<int64_t>(svh),
+                          reinterpret_cast<int64_t>(c), reinterpret_cast<int64_t>(ws),
+                          reinterpret_cast<int64_t>(tickets), M, K, N, KB, skw, skg, out_scale,
+                          reinterpret_cast<int64_t>(stream));
+}
+
 // R4DX_FAKEQ_W (r4d.h "weight fake-quant", docs/int8-prefill.md): a MEASUREMENT hook. The scale table of one
 // trellis linear (TrellisWscaleCount floats, [K / 16 >> gsh][N]) and the three launches of the entries above
 // with every decoded weight fragment rounded to symmetric int8 and back by it. `wscale` is the table, `gsh`

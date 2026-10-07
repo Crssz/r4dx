@@ -148,6 +148,34 @@ inline void QuantizeActRef(const float* X, int K, std::vector<float>& sa, std::v
       for (int k = kb * 128; k < kb * 128 + 128; ++k) Ap[(size_t)r * K + k] = QuantAct(X[(size_t)r * K + k], s);
     }
 }
+// ---- the COARSE scales (R4DX_PREFILL_INT8_SCALES=coarse, docs/int8-prefill.md "Coarse scales") --------------------
+// One scale per output COLUMN of Q over the whole K, by the per-128 table's own f16-rs rule (RsHalf / SEff /
+// QuantWTrick on amax over all of K): sw -> [N] (s_eff), Wp [N][K]. |w rs| <= 127.07 holds for the whole column, so
+// there is still no clamp.
+inline void QuantizeWeightsColRef(const uint16_t* Q, int K, int N, std::vector<float>& sw, std::vector<int8_t>& Wp) {
+  sw.assign((size_t)N, 0.f);
+  Wp.assign((size_t)N * K, 0);
+  for (int n = 0; n < N; ++n) {
+    float amax = 0.f;
+    for (int k = 0; k < K; ++k) amax = std::fmax(amax, std::fabs(F16ToF32(Q[(size_t)k * N + n])));
+    const uint16_t rs = RsHalf(WScale0(amax));
+    sw[(size_t)n] = 1.0f / F16ToF32(rs);
+    for (int k = 0; k < K; ++k) Wp[(size_t)n * K + k] = QuantWTrick(Q[(size_t)k * N + n], rs);
+  }
+}
+// One scale per ROW over the whole K, the per-128 quantizer's rule (s = amax / 127, 1 for an all-zero row, q =
+// clamp(rint(x / s))): sa -> [256], Ap [256][K].
+inline void QuantizeActRowRef(const float* X, int K, std::vector<float>& sa, std::vector<int8_t>& Ap) {
+  sa.assign((size_t)kM, 0.f);
+  Ap.assign((size_t)kM * K, 0);
+  for (int r = 0; r < kM; ++r) {
+    float amax = 0.f;
+    for (int k = 0; k < K; ++k) amax = std::fmax(amax, std::fabs(X[(size_t)r * K + k]));
+    const float s = ActScale(amax);
+    sa[(size_t)r] = s;
+    for (int k = 0; k < K; ++k) Ap[(size_t)r * K + k] = QuantAct(X[(size_t)r * K + k], s);
+  }
+}
 inline std::vector<int8_t> PackA8(const std::vector<int8_t>& Ap, int K) {
   std::vector<int8_t> a8((size_t)kM * K, 0);
   for (int r = 0; r < kM; ++r)

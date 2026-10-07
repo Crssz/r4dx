@@ -212,6 +212,12 @@ Model Model::Load(const ModelOptions& opts) {
                                 std::to_string(opts.prefill_int8));
   }
   const int i8_request = ResolvePrefillInt8Request(opts.prefill_int8);
+  // R4DX_PREFILL_INT8_SCALES (docs/int8-prefill.md "Coarse scales"): blk128 (default) or coarse, parsed before the weights are read.
+  if (!ValidPrefillInt8ScalesOption(opts.prefill_int8_scales)) {
+    throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8_scales must be -1, 0 or 1, got " +
+                                std::to_string(opts.prefill_int8_scales));
+  }
+  const int i8_scales = ResolvePrefillInt8Scales(opts.prefill_int8_scales);
   const bool i8_fakeq = FakeQuantActRequest() != kFakeQuantOff || FakeQuantWRequest() != kFakeQuantWOff;
   if (i8_request == kPrefillInt8On && ResolvePrefillInt8Explicit(opts.prefill_int8) && i8_fakeq) {
     throw std::invalid_argument(
@@ -311,7 +317,7 @@ Model Model::Load(const ModelOptions& opts) {
     want_i8 = DecidePrefillInt8(i8_in, &i8_why);
     if (want_i8) {
       const VramSnap vram_before_i8 = vram1;
-      i8_tables = m.container_.BuildTrellisI8Scales(m.stream_.get(), &i8_trellis);
+      i8_tables = m.container_.BuildTrellisI8Scales(m.stream_.get(), &i8_trellis, i8_scales == kPrefillInt8ScalesCoarse);
       m.stream_.Synchronize();
       vram1 = SnapVram();
       if (vram_before_i8.ok && vram1.ok) {
@@ -687,9 +693,12 @@ Model Model::Load(const ModelOptions& opts) {
                                                                        : std::string("default");
     if (m.prefill_int8_) {
       std::cerr << "[r4dx::model::Model] prefill int8: ON (" << source
-                << "): the full 256-row super-chunks of Prefill calls run their trellis linears int8 x int8 (A per row x 128 k, "
-                   "weights per column x 128 k, int32 WMMA, per-128 fp32 rescale); "
-                << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
+                << "): the full 256-row super-chunks of Prefill calls run their trellis linears int8 x int8 ("
+                << (i8_scales == kPrefillInt8ScalesCoarse
+                        ? "scales COARSE (R4DX_PREFILL_INT8_SCALES=coarse): A per row, weights per column, over the whole K, "
+                          "int32 WMMA, one fp32 rescale at the end"
+                        : "A per row x 128 k, weights per column x 128 k, int32 WMMA, per-128 fp32 rescale")
+                << "); " << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
                 << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal calls with images stay f16; "
                    "R4DX_PREFILL_INT8=0 turns it off (default; measured accuracy cost in docs/int8-prefill.md)\n";
     } else if (i8_request == kPrefillInt8On) {

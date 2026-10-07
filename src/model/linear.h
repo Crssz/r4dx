@@ -121,7 +121,8 @@ int EpilogueForLayout(Layout layout);
 // R4DX_PREFILL_INT8_FUSEDQ (docs/int8-prefill.md "The fused quantizer"): a trellis producer that knows the call will
 // take the int8 GEMM (TrellisI8FusedQ below: the one decision both sides make) writes the int8 operand instead of
 // the f16 A: `a8` (A8 fragment layout, 256 * K bytes per part) and `sa` (fp32 [K / 128][256] per part), part p at
-// a8 + p * 256 * K and sa + p * (K / 128) * 256, both 16-byte aligned, with `transform_id` set as above and `data`
+// a8 + p * 256 * K and sa + p * (K / 128) * 256 (coarse scales, TrellisI8Coarse(w): sa is [256] per part, sa + p * 256),
+// both 16-byte aligned, with `transform_id` set as above and `data`
 // null (no f16 A exists; part_stride is unused). ApplyLinear then runs no quantizer launch. A pre with `a8` handed
 // to a call that does not take the int8 GEMM (the producer and the consumer disagree) throws: there is no f16 A to
 // fall back to.
@@ -211,8 +212,9 @@ struct TrellisI8Row {
   int rate;
   int skw, skg;
 };
-// The table, for tests and diagnostics (a pure read of the .inc).
-const TrellisI8Row* TrellisI8Rows(size_t* count);
+// The table, for tests and diagnostics (a pure read of the .inc): the per-128 scales' (gemm_tuning_table_trellis_i8.inc) or,
+// with `coarse`, the coarse scales' (gemm_tuning_table_trellis_i8c.inc, R4DX_PREFILL_INT8_SCALES=coarse).
+const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse = false);
 
 // Whether, and how, a trellis linear of this shape and rate runs through the int8 GEMM at M = 256: `skw` / `skg`
 // are the K slices per workgroup and the K groups across the grid of its table row. `ok` is false -- and `why`
@@ -220,13 +222,14 @@ const TrellisI8Row* TrellisI8Rows(size_t* count);
 // rejects, a part boundary that is not a whole 128-block, a shape R4DX_M256_SHAPES excludes), which keeps the
 // f16 kernel. `part_n0` is trellis_part_n[0] (ignored for parts == 1). A pure function of its arguments (and
 // R4DX_M256_SHAPES, the debug filter the f16 plan honours too); the load-time table builder, ApplyLinear and
-// tests/model/test_prefill_int8_cpu share it.
+// tests/model/test_prefill_int8_cpu share it. `coarse`: the row of the coarse-scale table (TrellisI8Coarse(w) says which
+// a linear runs).
 struct TrellisI8Plan {
   bool ok = false;
   int skw = 0, skg = 0;
   std::string why;
 };
-TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0);
+TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse = false);
 
 // RAII: while alive on this thread, a 256-row ApplyLinear of a trellis linear with an int8 plan (and a scale
 // table) takes the int8 x int8 GEMM instead of the f16 M = 256 kernel; it also needs ScopedTrellisM256 (the
@@ -276,19 +279,26 @@ bool TrellisI8Takes(const QuantLinear& w, int64_t M);
 // as its ApplyLinear agrees with it; a producer that fused and a consumer that cannot take int8 is a bug and throws.
 bool TrellisI8FusedQ(const QuantLinear& w, int64_t M);
 // The int8 operand of `parts` (1..2) 256-row parts of K columns, from the arena: A8 `parts * 256 K` bytes, SA
-// `parts * K / 128 * 256` floats, both 16-byte aligned, the second part following the first as
-// PreQuantizedActivation documents.
+// `parts * K / 128 * 256` floats (coarse: `parts * 256`, one scale per row), both 16-byte aligned, the second part
+// following the first as PreQuantizedActivation documents.
 struct TrellisI8Operand {
   int8_t* a8 = nullptr;
   float* sa = nullptr;
 };
-TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts);
+TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts, bool coarse = false);
+// Whether w's int8 calls use the COARSE scales (R4DX_PREFILL_INT8_SCALES=coarse): A one scale per row, W one per column over
+// the whole K. Decided once at Model::Load by which weight table the linear was given (trellis_i8_swc vs trellis_i8_sw), so
+// a producer, its consumer and the table agree by construction. SA of a coarse operand is [256] floats per part (the
+// per-128 one's is [K / 128][256]); everything else of PreQuantizedActivation's int8 contract is unchanged.
+bool TrellisI8Coarse(const QuantLinear& w);
 
 // R4DX_PREFILL_INT8's one-time pass (Model::Load, only when the switch is on): the weight scale table of the
 // trellis linear `w` (libr4d's r4d_trellis_i8_wscale: s = max|w| / 127 per (column, 128 k), stored as 1 / f16(1 / s))
 // in w.trellis_i8_sw, K * N / 32 bytes. Only for a linear whose PlanTrellisI8 is ok; returns whether it built one.
-// Stream-ordered. A non-trellis linear is left alone.
-bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream);
+// Stream-ordered. A non-trellis linear is left alone. `coarse` (R4DX_PREFILL_INT8_SCALES=coarse): the one-per-column table
+// instead (libr4d's r4d_trellis_i8_wscale_col, same rule over the whole K) in w.trellis_i8_swc, 4 N bytes, and the per-128
+// table is NOT allocated.
+bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream, bool coarse = false);
 
 // RAII: while alive on this thread, every trellis linear's ApplyLinear rounds its transformed f16 A to int8
 // and back in place right before the GEMM (fake_quant_act.h's `mode`, kernels.h's r4dx_fake_quant_act_f16;

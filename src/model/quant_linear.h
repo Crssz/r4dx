@@ -137,6 +137,11 @@ struct QuantLinear {
   //     r4d_trellis_i8_wscale), K * N / 32 bytes, built once at Model::Load from this rank's own words. Separate
   //     from trellis_wscale (R4DX_FAKEQ_W's fp32 s = amax / 127 table): this one holds s_eff = 1 / f16(1 / s).
   core::DeviceBuffer<float> trellis_i8_sw;
+  //   trellis_i8_swc: R4DX_PREFILL_INT8_SCALES=coarse (docs/int8-prefill.md "Coarse scales"), instead of trellis_i8_sw (a
+  //     linear carries one of the two, never both: the per-128 table is not even allocated in coarse mode). fp32 [N], the
+  //     weight scale of output column n of Q over the WHOLE K (libr4d's r4d_trellis_i8_wscale_col), 4 N bytes. Its being
+  //     non-empty is what makes the linear's int8 calls coarse (A per row too): TrellisI8Coarse(w) in linear.h.
+  core::DeviceBuffer<float> trellis_i8_swc;
 };
 
 }  // namespace r4dx::model

@@ -9,10 +9,11 @@
 // (tests/kernels/test_trellis_i8_gemm.cpp) and a KL budget against the f16 path (docs/int8-prefill.md).
 //
 // The device code is r4d_trellis_i8.h; this unit instantiates ONLY the production kernels,
-// i8g_kernel<TRELLIS = true, KB in {4, 5}, FWHT = true, RESC = 0, SKW in {2, 4, 8}> (6 of them), and exports
-// the host entries. A translation unit of its own for the reason r4d_gemm_trellis_nt_m64_wq.hip gives: the
-// ISA of a kernel moved by a few instructions when other instantiations shared its unit. The dense kernel, the
-// RESC 1..3 speed bounds and the reference kernels stay in the bench (tests/kernels/tool_int8_gemm_proto.hip).
+// i8g_kernel<TRELLIS = true, KB in {4, 5}, FWHT = true, RESC in {0, 4}, SKW in {2, 4, 8}> (12 of them: RESC 0 is
+// the per-128 scales, RESC 4 the coarse ones, R4DX_PREFILL_INT8_SCALES=coarse), and exports the host entries. A
+// translation unit of its own for the reason r4d_gemm_trellis_nt_m64_wq.hip gives: the ISA of a kernel moved by a
+// few instructions when other instantiations shared its unit. The dense kernel, the RESC 1..3 speed bounds and the
+// reference kernels stay in the bench (tests/kernels/tool_int8_gemm_proto.hip).
 // The build (third_party/check_trellis_isa.cmake, GEMM_KERNEL = i8g_kernel, MAX_VGPR 192) requires every
 // instantiation of this unit to fit 192 VGPRs (the kernel's amdgpu_waves_per_eu(8) cap) with no scratch and no
 // near dependency behind the decode's inline asm.
@@ -26,22 +27,22 @@
 static void r4d_i8_fail(const std::string& what) { throw std::runtime_error("r4d gemm_trellis_nt_i8: " + what); }
 
 // ---- the production kernels' instantiation table --------------------------------------------------------------
-template <int KB, int SKW>
+template <int KB, int SKW, int RESC>
 static void r4d_i8_launch(const signed char* a0, const float* s0, const signed char* a1, const float* s1, int n_split,
                           const unsigned char* w, const float* sw, const float* svh, unsigned short* c, float* ws,
                           unsigned* tickets, int K, int N, int SKG, float out_scale, hipStream_t stream) {
-  hipLaunchKernelGGL((i8g_kernel<true, KB, true, 0, SKW>), dim3(N / 32, SKG), dim3(128 * SKW), 8192 * SKW, stream, a0, s0,
+  hipLaunchKernelGGL((i8g_kernel<true, KB, true, RESC, SKW>), dim3(N / 32, SKG), dim3(128 * SKW), 8192 * SKW, stream, a0, s0,
                      a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale);
 }
-template <int KB>
+template <int KB, int RESC>
 static bool r4d_i8_dispatch_skw(int skw, const signed char* a0, const float* s0, const signed char* a1, const float* s1,
                                 int n_split, const unsigned char* w, const float* sw, const float* svh,
                                 unsigned short* c, float* ws, unsigned* tickets, int K, int N, int SKG, float out_scale,
                                 hipStream_t stream) {
   switch (skw) {
-    case 2: r4d_i8_launch<KB, 2>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
-    case 4: r4d_i8_launch<KB, 4>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
-    case 8: r4d_i8_launch<KB, 8>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
+    case 2: r4d_i8_launch<KB, 2, RESC>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
+    case 4: r4d_i8_launch<KB, 4, RESC>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
+    case 8: r4d_i8_launch<KB, 8, RESC>(a0, s0, a1, s1, n_split, w, sw, svh, c, ws, tickets, K, N, SKG, out_scale, stream); return true;
     default: return false;
   }
 }
@@ -68,9 +69,12 @@ size_t r4d_gemm_trellis_nt_i8_ws_bytes(int M, int N, int SKG) {
   return (size_t)SKG * (size_t)M * (size_t)N * sizeof(float);
 }
 
-void r4d_gemm_trellis_nt_i8(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w,
-                            int64_t sw, int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
-                            int skw, int skg, float out_scale, int64_t stream) {
+// the one body of r4d_gemm_trellis_nt_i8 (RESC 0: SA [K/128][256], SW [K/128][N]) and r4d_gemm_trellis_nt_i8c (RESC 4:
+// SA [256], SW [N]); the legality rules are the same
+template <int RESC>
+static void r4d_i8_gemm(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w, int64_t sw,
+                        int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB, int skw, int skg,
+                        float out_scale, int64_t stream) {
   if (const char* why = r4d_gemm_trellis_nt_i8_check(M, K, N, n_split, KB, skw, skg)) r4d_i8_fail(why);
   if (!a8_0 || !sa_0 || !w || !sw || !svh || !c || !ws || !tickets) r4d_i8_fail("null buffer");
   if ((!a8_1) != (!sa_1)) r4d_i8_fail("a8_1 and sa_1 must be given together");
@@ -84,15 +88,27 @@ void r4d_gemm_trellis_nt_i8(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa
   const float* s0 = (const float*)sa_0;
   const float* s1 = (const float*)sa_1;
   const unsigned char* wp = (const unsigned char*)w;
-  const bool ok = KB == 4 ? r4d_i8_dispatch_skw<4>(skw, a0, s0, a1, s1, n_split, wp, (const float*)sw, (const float*)svh,
-                                                    (unsigned short*)c, (float*)ws, (unsigned*)tickets, K, N, skg,
-                                                    out_scale, (hipStream_t)stream)
-                          : r4d_i8_dispatch_skw<5>(skw, a0, s0, a1, s1, n_split, wp, (const float*)sw, (const float*)svh,
-                                                    (unsigned short*)c, (float*)ws, (unsigned*)tickets, K, N, skg,
-                                                    out_scale, (hipStream_t)stream);
+  const bool ok = KB == 4 ? r4d_i8_dispatch_skw<4, RESC>(skw, a0, s0, a1, s1, n_split, wp, (const float*)sw, (const float*)svh,
+                                                          (unsigned short*)c, (float*)ws, (unsigned*)tickets, K, N, skg,
+                                                          out_scale, (hipStream_t)stream)
+                          : r4d_i8_dispatch_skw<5, RESC>(skw, a0, s0, a1, s1, n_split, wp, (const float*)sw, (const float*)svh,
+                                                          (unsigned short*)c, (float*)ws, (unsigned*)tickets, K, N, skg,
+                                                          out_scale, (hipStream_t)stream);
   if (!ok) r4d_i8_fail("configuration not instantiated");
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) r4d_i8_fail(std::string("launch failed: ") + hipGetErrorString(e));
+}
+
+void r4d_gemm_trellis_nt_i8(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w,
+                            int64_t sw, int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                            int skw, int skg, float out_scale, int64_t stream) {
+  r4d_i8_gemm<0>(a8_0, sa_0, a8_1, sa_1, n_split, w, sw, svh, c, ws, tickets, M, K, N, KB, skw, skg, out_scale, stream);
+}
+
+void r4d_gemm_trellis_nt_i8c(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w,
+                             int64_t sw, int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N, int KB,
+                             int skw, int skg, float out_scale, int64_t stream) {
+  r4d_i8_gemm<4>(a8_0, sa_0, a8_1, sa_1, n_split, w, sw, svh, c, ws, tickets, M, K, N, KB, skw, skg, out_scale, stream);
 }
 
 size_t r4d_trellis_i8_wscale_count(int K, int N) { return (size_t)(K / 128) * (size_t)N; }
@@ -113,6 +129,38 @@ void r4d_trellis_i8_wscale(int64_t w, int64_t sw, int K, int N, int KB, int64_t 
     hipLaunchKernelGGL(i8g_wscale<5>, grid, block, 0, (hipStream_t)stream, (const unsigned*)w, (float*)sw, K, N);
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) r4d_i8_fail(std::string("wscale launch failed: ") + hipGetErrorString(e));
+}
+
+size_t r4d_trellis_i8_wscale_col_count(int K, int N) {
+  (void)K;
+  return (size_t)N;
+}
+
+void r4d_trellis_i8_wscale_col(int64_t w, int64_t swc, int K, int N, int KB, int64_t stream) {
+  r4d_i8_check_weights("wscale_col", K, N, KB);
+  if (!w || !swc) r4d_i8_fail("wscale_col: null buffer");
+  const dim3 grid((unsigned)(N / 32)), block(256);
+  if (KB == 4)
+    hipLaunchKernelGGL(i8g_wscale_col<4>, grid, block, 1024, (hipStream_t)stream, (const unsigned*)w, (float*)swc, K, N);
+  else
+    hipLaunchKernelGGL(i8g_wscale_col<5>, grid, block, 1024, (hipStream_t)stream, (const unsigned*)w, (float*)swc, K, N);
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) r4d_i8_fail(std::string("wscale_col launch failed: ") + hipGetErrorString(e));
+}
+
+void r4d_trellis_i8_dump_w_col(int64_t w, int64_t swc, int64_t w8, int64_t wp, int K, int N, int KB, int64_t stream) {
+  r4d_i8_check_weights("dump_w_col", K, N, KB);
+  if (!w || !swc || !w8) r4d_i8_fail("dump_w_col: null buffer");
+  const long long blocks = (long long)(N / 32) * (K / 16);
+  const dim3 grid((unsigned)((blocks + 7) / 8)), block(256);
+  if (KB == 4)
+    hipLaunchKernelGGL((i8g_dump_w<4, true>), grid, block, 0, (hipStream_t)stream, (const unsigned*)w, (const float*)swc,
+                       (signed char*)w8, (signed char*)wp, K, N);
+  else
+    hipLaunchKernelGGL((i8g_dump_w<5, true>), grid, block, 0, (hipStream_t)stream, (const unsigned*)w, (const float*)swc,
+                       (signed char*)w8, (signed char*)wp, K, N);
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) r4d_i8_fail(std::string("dump_w_col launch failed: ") + hipGetErrorString(e));
 }
 
 void r4d_trellis_i8_dump_w(int64_t w, int64_t sw, int64_t w8, int64_t wp, int K, int N, int KB, int64_t stream) {
@@ -141,4 +189,15 @@ void r4d_trellis_i8_quant_act(int64_t x, int64_t a8, int64_t sa, int parts, int6
                      (long long)(parts > 1 ? part_stride : 0));
   const hipError_t e = hipGetLastError();
   if (e != hipSuccess) r4d_i8_fail(std::string("quant_act launch failed: ") + hipGetErrorString(e));
+}
+
+void r4d_trellis_i8_quant_act_row(int64_t x, int64_t a8, int64_t sa, int parts, int64_t part_stride, int K, int64_t stream) {
+  if (K <= 0 || K % 128) r4d_i8_fail("quant_act_row: K must be a positive multiple of 128");
+  if (parts < 1 || parts > 2) r4d_i8_fail("quant_act_row: parts must be 1 or 2");
+  if (!x || !a8 || !sa) r4d_i8_fail("quant_act_row: null buffer");
+  if (parts > 1 && part_stride < (int64_t)i8p::kM * K) r4d_i8_fail("quant_act_row: part_stride must be at least 256 * K elements");
+  hipLaunchKernelGGL(i8g_quant_act_row, dim3((unsigned)i8p::kM, (unsigned)parts), dim3(256), 64, (hipStream_t)stream,
+                     (const unsigned short*)x, (signed char*)a8, (float*)sa, K, (long long)(parts > 1 ? part_stride : 0));
+  const hipError_t e = hipGetLastError();
+  if (e != hipSuccess) r4d_i8_fail(std::string("quant_act_row launch failed: ") + hipGetErrorString(e));
 }

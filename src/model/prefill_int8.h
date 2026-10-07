@@ -67,6 +67,30 @@ inline bool ParsePrefillInt8FusedQ(const char* e) {
   return true;
 }
 
+// R4DX_PREFILL_INT8_SCALES (docs/int8-prefill.md "Coarse scales"; read once per process, Model::Load resolves it): the scale
+// granularity of the int8 GEMM when it is on. "blk128" (unset, empty: the default) is today's: A one scale per (row, 128 k),
+// the decoded weight one per (column, 128 k), the int32 partial sum of every 128 k rescaled in fp32. "coarse": A one scale
+// per ROW and the weight one per COLUMN over the whole K, so the int32 accumulator needs no per-128 rescale (one fp32
+// multiply at the end; the weight table is [N] floats per linear instead of [K / 128][N], 128 times smaller). Opt-in: a
+// bit coarser model of the linear (its accuracy cost is its own KL gate), faster in the bench (speed bound x1.56 against
+// x1.37). Anything else warns and means the default. Needs R4DX_PREFILL_INT8 on to matter at all.
+inline constexpr int kPrefillInt8ScalesBlk128 = 0;
+inline constexpr int kPrefillInt8ScalesCoarse = 1;
+inline int ParsePrefillInt8Scales(const char* e) {
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "blk128") == 0) return kPrefillInt8ScalesBlk128;
+  if (std::strcmp(e, "coarse") == 0) return kPrefillInt8ScalesCoarse;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_SCALES='%s' not recognized (blk128|coarse); using the default (blk128)\n", e);
+  return kPrefillInt8ScalesBlk128;
+}
+inline int PrefillInt8ScalesRequest() {
+  static const int v = ParsePrefillInt8Scales(std::getenv("R4DX_PREFILL_INT8_SCALES"));
+  return v;
+}
+// ModelOptions::prefill_int8_scales: -1 follows the environment, 0 (blk128) and 1 (coarse) force it (tests load both in one process).
+inline bool ValidPrefillInt8ScalesOption(int opt) { return opt == -1 || opt == 0 || opt == 1; }
+inline int ResolvePrefillInt8Scales(int opt) { return opt < 0 ? PrefillInt8ScalesRequest() : (opt != 0 ? kPrefillInt8ScalesCoarse : kPrefillInt8ScalesBlk128); }
+inline const char* PrefillInt8ScalesName(int scales) { return scales == kPrefillInt8ScalesCoarse ? "coarse" : "blk128"; }
+
 // ModelOptions::prefill_int8: -1 follows the environment (default: on), 0 and 1 force the request whatever the
 // environment says (the identity tests load Models of 0, the int8 tests of 1). Anything else is the caller's bug.
 inline bool ValidPrefillInt8Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }

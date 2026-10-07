@@ -244,7 +244,8 @@ static const R4DKernelInfo kKernels[] = {
      "(row, 128 k) (r4d_trellis_i8_quant_act), the decoded weight as int8 per (column, 128 k) on the fly from a "
      "scale table (r4d_trellis_i8_wscale), v_wmma_i32_16x16x16_iu8, the int32 partial sum of every 128 k rescaled "
      "into fp32, then the f16 kernel's FWHT / svh / out_scale / one bf16 rounding. NOT bit-identical to "
-     "gemm_trellis_nt_m256",
+     "gemm_trellis_nt_m256. Entry r4d_gemm_trellis_nt_i8c is the coarse-scale mode of the same op (A per row, W per "
+     "column over the whole K: no per-128 rescale, one multiply at the end)",
      "M 256; K, N, n_split multiples of 128; (K/128) divisible by skw*skg, skw in {2,4,8}, skg in {1,2,4,8}; "
      "ws always used (M*N*SKG fp32); up to two A parts split at a 128-column boundary",
      "int8 A8 + fp32 SA, mul1 trellis W at KB bits per weight + fp32 weight-scale table, fp32 svh, bf16 C, int32 "

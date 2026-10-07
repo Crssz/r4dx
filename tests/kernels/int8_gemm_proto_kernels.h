@@ -45,7 +45,7 @@ struct I8gCfg {
   bool trellis = false;
   int kb = 4;          // trellis rate (ignored when dense)
   bool fwht = true;
-  int resc = 0;        // 0: per-128 rescale (the math), 1: one rescale per slice (the bound)
+  int resc = 0;        // 0: per-128 rescale (the math), 1..3: speed bounds, 4: the production COARSE mode (SA [256], SW [N])
   int skw = 4;         // slices per workgroup (2, 4, 8) = SK
   int skg = 1;         // K groups across the grid (1, 2, 4, 8)
 };
@@ -60,8 +60,8 @@ inline const char* I8gCheck(const I8gCfg& c, int K, int N) {
   if ((K / 128) % (c.skw * c.skg)) I8G_BAD("K/128 = %d must be divisible by skw * skg = %d", K / 128, c.skw * c.skg);
   if (c.trellis && c.kb != 4 && c.kb != 5) I8G_BAD("kb %d must be 4 or 5", c.kb);
   if (c.trellis && !c.fwht) I8G_BAD("the trellis kernel is only instantiated with the FWHT epilogue");
-  if (c.resc < 0 || c.resc > 3) I8G_BAD("resc must be 0, 1, 2 or 3");
-  if (!c.trellis && c.resc > 1) I8G_BAD("resc 2 and 3 are instantiated for the trellis kernel only");
+  if (c.resc < 0 || c.resc > 4) I8G_BAD("resc must be 0, 1, 2, 3 or 4");
+  if (!c.trellis && c.resc > 1 && c.resc != 4) I8G_BAD("resc 2 and 3 are instantiated for the trellis kernel only");
 #undef I8G_BAD
   return nullptr;
 }
@@ -98,10 +98,11 @@ inline void I8gRun(const I8gCfg& c, const signed char* a8, const float* sa, cons
 #define I8G_CASE(TR, KB, FW, RE) ok = i8g_dispatch_skw<TR, KB, FW, RE>(c, a8, sa, w, sw, svh, C, ws, tk, K, N, out_scale, st)
 #define I8G_RESC4(TR, KB, FW) \
   switch (c.resc) { case 0: I8G_CASE(TR, KB, FW, 0); break; case 1: I8G_CASE(TR, KB, FW, 1); break; \
-                    case 2: I8G_CASE(TR, KB, FW, 2); break; default: I8G_CASE(TR, KB, FW, 3); break; }
+                    case 2: I8G_CASE(TR, KB, FW, 2); break; case 3: I8G_CASE(TR, KB, FW, 3); break; \
+                    default: I8G_CASE(TR, KB, FW, 4); break; }
   if (!c.trellis) {
-    if (c.fwht) { if (c.resc == 0) I8G_CASE(false, 4, true, 0); else I8G_CASE(false, 4, true, 1); }
-    else { if (c.resc == 0) I8G_CASE(false, 4, false, 0); else I8G_CASE(false, 4, false, 1); }
+    if (c.fwht) { if (c.resc == 0) I8G_CASE(false, 4, true, 0); else if (c.resc == 1) I8G_CASE(false, 4, true, 1); else I8G_CASE(false, 4, true, 4); }
+    else { if (c.resc == 0) I8G_CASE(false, 4, false, 0); else if (c.resc == 1) I8G_CASE(false, 4, false, 1); else I8G_CASE(false, 4, false, 4); }
   } else if (c.kb == 4) {
     I8G_RESC4(true, 4, true);
   } else {

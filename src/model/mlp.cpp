@@ -83,8 +83,10 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
   const bool down_trellis_i8 = down_trellis_fused && TrellisI8FusedQ(w_.down, T);
   uint16_t* down_trellis_a = nullptr;
   TrellisI8Operand down_i8;
+  // R4DX_PREFILL_INT8_SCALES=coarse: the producer writes one scale per row (r4dx_silu_mul_trellis_i8r) for a coarse mlp.down.
+  const bool down_i8_coarse = down_trellis_i8 && TrellisI8Coarse(w_.down);
   if (down_trellis_i8) {
-    down_i8 = AllocTrellisI8Operand(arena, intermediate, 1);
+    down_i8 = AllocTrellisI8Operand(arena, intermediate, 1, down_i8_coarse);
   } else if (down_trellis_fused) {
     down_trellis_a =
         arena.Alloc<uint16_t>(static_cast<size_t>(T * intermediate), /*align_bytes=*/16);
@@ -114,11 +116,11 @@ void Mlp::Forward(core::Stream& stream, core::Arena& arena, const uint16_t* x, u
       if (down_trellis_i8) {
         // ... and, on the int8 path, straight on into the quantizer: A8 + SA are the bytes
         // r4d_trellis_i8_quant_act would make from that f16 A.
-        r4dx_silu_mul_trellis_i8(reinterpret_cast<int64_t>(gate_up), T, intermediate,
-                                 /*in_row_stride=*/2 * intermediate,
-                                 reinterpret_cast<int64_t>(w_.down.trellis_suh.data()),
-                                 reinterpret_cast<int64_t>(down_i8.a8), reinterpret_cast<int64_t>(down_i8.sa),
-                                 w_.down.trellis_prescale_log2, s);
+        (down_i8_coarse ? r4dx_silu_mul_trellis_i8r : r4dx_silu_mul_trellis_i8)(
+            reinterpret_cast<int64_t>(gate_up), T, intermediate,
+            /*in_row_stride=*/2 * intermediate, reinterpret_cast<int64_t>(w_.down.trellis_suh.data()),
+            reinterpret_cast<int64_t>(down_i8.a8), reinterpret_cast<int64_t>(down_i8.sa),
+            w_.down.trellis_prescale_log2, s);
         return;
       }
       r4dx_silu_mul_trellis_bf16(reinterpret_cast<int64_t>(gate_up), T, intermediate,

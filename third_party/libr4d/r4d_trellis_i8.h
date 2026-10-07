@@ -35,6 +35,12 @@
 //          row scale multiplied once at the end;
 //       3  the weight scale is per column only (block 0's): per 128 K one cvt + one fma (sa), the column scale at the end.
 //     RESC 2 and 3 exist for the trellis kernel only; RESC 1 for both.
+//   * RESC = 4 is NOT a bound: it is the production coarse mode (R4DX_PREFILL_INT8_SCALES=coarse, docs/int8-prefill.md
+//     "Coarse scales"). RESC 1's math with the tables it really is for: SA [256] (one scale per row, i8g_quant_act_row or
+//     a fused producer), SW [N] (one per column over the whole K, i8g_wscale_col). The loop never loads SA or SW, the
+//     weight scale's f16 rs is formed once, and the one multiply by sa[row] * sw[col] comes after the K loop (the int32
+//     accumulators are exact over the whole slice: K 17408 x 127 x 127 = 2.8e8 < 2^31; a split-K slice is shorter).
+//     Trellis only, FWHT only; verified against the exact reference like the per-128 kernel (bench, emulation, GPU test).
 // There is no bit-identity with the shipped kernel's summation order to keep (the f16 kernel's chain of 16-k WMMA
 // is gone: the int32 sums are exact and the fp32 rescale order is this kernel's own), so SK = SKW (the slices of
 // a workgroup are all the slices there are) and SKG is free; the slices are whole 128-K blocks. A row's result
@@ -53,6 +59,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "r4d_trellis_i8_fused.h"   // i8g_quant_row_wg (the per-row activation scale of RESC 4)
 #include "r4d_trellis_i8_layout.h"
 #ifndef I8G_EMU
 #include "r4d_fwht128.h"
@@ -188,6 +195,18 @@ __global__ __launch_bounds__(256) void i8g_quant_act(const unsigned short* __res
   if (lane == 0) SA[(size_t)kb * i8p::kM + r] = s;
 }
 
+// The coarse (R4DX_PREFILL_INT8_SCALES=coarse) producer: one scale per ROW over the whole K instead of per (row, 128 k);
+// the arithmetic is i8g_quant_row_wg's (r4d_trellis_i8_fused.h), the one function the fused producers of
+// src/kernels/src/trellis_transform.hip call too. Grid (256 rows, parts), 256 threads; X as i8g_quant_act's (part p at
+// x_part_stride elements), A8 part p at + p 256 K bytes, SA part p at + p 256 floats ([256] per part). 32 bytes of dynamic LDS.
+__global__ __launch_bounds__(256) void i8g_quant_act_row(const unsigned short* __restrict__ X, signed char* __restrict__ A8,
+                                                         float* __restrict__ SA, int K, long long x_part_stride) {
+  I8G_LDS_DECL
+  const int row = (int)blockIdx.x, part = (int)blockIdx.y;
+  i8g_quant_row_wg(X + (long long)part * x_part_stride + (size_t)row * K, K, row, A8 + (long long)part * i8p::kM * K,
+                   SA + (long long)part * i8p::kM, (float*)lds);
+}
+
 // ---- weight side: scale table and the int8 matrix from the trellis words --------------------------------------
 template <int KB>
 __device__ __forceinline__ void i8g_decode_block(const unsigned* b, int lane, v8h& f0, v8h& f1) {
@@ -228,9 +247,52 @@ __global__ __launch_bounds__(256) void i8g_wscale(const unsigned* __restrict__ W
     SW[(size_t)g * N + n + 8] = i8g_seff(m1);
   }
 }
-// W8 (block layout, 16 B per lane) and, if Wp is non-null, the plain [N][K] matrix, from the words and the table
-// with the quantizer the GEMM runs: the dense kernel's weights ARE the trellis kernel's.
+// The coarse table (R4DX_PREFILL_INT8_SCALES=coarse): SWC[n], ONE entry per column n of Q over the whole K, by the same
+// rule as the per-128 table (s = amax / 127 with amax over all of K, 1 for an all-zero column, rs = f16(min(1 / s, 60000)),
+// stored s_eff = 1 / rs). One workgroup (8 waves) per tile pair: wave w takes the 128-groups w, w + 8, ...; the amax is
+// exact, so the order of the reduction (xor 16 joins the two k halves of a fragment, then 8 waves through LDS) is free.
+// Grid N / 32, 256 threads, 8 waves x 16 lanes x 2 floats = 1 KiB of dynamic LDS.
 template <int KB>
+__global__ __launch_bounds__(256) void i8g_wscale_col(const unsigned* __restrict__ W, float* __restrict__ SWC, int K, int N) {
+  (void)N;
+  I8G_LDS_DECL
+  float* red = (float*)lds;
+  const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+  const int kt_total = K >> 4, groups = kt_total >> 3, pair = (int)blockIdx.x;
+  float m0 = 0.f, m1 = 0.f;
+  for (int g = wave; g < groups; g += 8)
+    for (int j = 0; j < 8; ++j) {
+      const long long blk = (long long)pair * kt_total + g * 8 + j;
+      v8h f0, f1;
+      i8g_decode_block<KB>(W + blk * (16 * KB), lane, f0, f1);
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        m0 = __builtin_fmaxf(m0, __builtin_fabsf((float)f0[e]));
+        m1 = __builtin_fmaxf(m1, __builtin_fabsf((float)f1[e]));
+      }
+    }
+  m0 = __builtin_fmaxf(m0, __shfl_xor(m0, 16, I8G_WAVE));
+  m1 = __builtin_fmaxf(m1, __shfl_xor(m1, 16, I8G_WAVE));
+  if (lane < 16) {
+    red[(wave * 16 + lane) * 2] = m0;
+    red[(wave * 16 + lane) * 2 + 1] = m1;
+  }
+  i8g_sync_lds();
+  if (tid < 16) {
+    float a = 0.f, b = 0.f;
+    for (int w = 0; w < 8; ++w) {
+      a = __builtin_fmaxf(a, red[(w * 16 + tid) * 2]);
+      b = __builtin_fmaxf(b, red[(w * 16 + tid) * 2 + 1]);
+    }
+    const int n = i8p::FragCol(pair, tid, 0);
+    SWC[n] = i8g_seff(a);
+    SWC[n + 8] = i8g_seff(b);
+  }
+}
+// W8 (block layout, 16 B per lane) and, if Wp is non-null, the plain [N][K] matrix, from the words and the table
+// with the quantizer the GEMM runs: the dense kernel's weights ARE the trellis kernel's. COARSE: the table is
+// i8g_wscale_col's ([N], one entry per column), not the per-128 [K / 128][N].
+template <int KB, bool COARSE = false>
 __global__ __launch_bounds__(256) void i8g_dump_w(const unsigned* __restrict__ W, const float* __restrict__ SW,
                                                   signed char* __restrict__ W8, signed char* __restrict__ Wp, int K, int N) {
   const int lane = threadIdx.x & 31;
@@ -241,7 +303,7 @@ __global__ __launch_bounds__(256) void i8g_dump_w(const unsigned* __restrict__ W
   v8h f0, f1;
   i8g_decode_block<KB>(W + blk * (16 * KB), lane, f0, f1);
   const int n0 = i8p::FragCol(pair, lane, 0);
-  const float* row = SW + (size_t)(kt >> 3) * N;
+  const float* row = COARSE ? SW : SW + (size_t)(kt >> 3) * N;
   const uint2 q0 = i8g_qfrag(f0, i8g_rs_pair(row[n0])), q1 = i8g_qfrag(f1, i8g_rs_pair(row[n0 + 8]));
   *(i8g_v4u*)(W8 + (size_t)blk * 512 + lane * 16) = (i8g_v4u){q0.x, q0.y, q1.x, q1.y};
   if (Wp) {
@@ -277,6 +339,12 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
     const float* __restrict__ svh, unsigned short* __restrict__ C, float* __restrict__ ws,
     unsigned* __restrict__ tickets, int K, int N, int SKG, float out_scale) {
   constexpr int RG = 4, MT = 4, M = 256, Wc = 32, NBLK = 4;
+  // RESC 4 is the PRODUCTION coarse mode (R4DX_PREFILL_INT8_SCALES=coarse): SA is [256] (one scale per row), SW is [N]
+  // (one per column, the whole K), int32 accumulators over the whole K slice, one fp32 multiply by sa[row] * sw[col] at the
+  // end. Its math is RESC 1's (RESC 1 reads block 0 of the per-128 tables, RESC 4 reads the whole table that exists), but
+  // the loop touches neither SA nor SW: the weight scale is loaded once and its f16 rs formed once, not per 128 K.
+  constexpr bool kColW = RESC == 4;
+  constexpr bool kUseSA = RESC != 1 && RESC != 4;   // the variants whose loop reads the per-128 activation scales
   constexpr int WBLK = TRELLIS ? 64 * KB : 512;           // bytes of one (tile pair, k-tile) block in Wsrc
   constexpr unsigned slot_bytes = 8 * 512;                // one K slice's staging per buffer: 8 blocks of 512 B
   constexpr unsigned buf_bytes = SKW * slot_bytes;
@@ -312,7 +380,7 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
     const unsigned aoff = lane * 8;
     i8g_gptr sabase = (i8g_gptr)(const unsigned char*)SA + ((size_t)kbg0 * 256 + rg * 64) * 4;   // + hh 32 + i 64 (+16)
     const unsigned saoff = hh * 32;
-    i8g_gptr swbase = (i8g_gptr)(const unsigned char*)SW + (size_t)kbg0 * N * 4;
+    i8g_gptr swbase = (i8g_gptr)(const unsigned char*)SW + (kColW ? (size_t)0 : (size_t)kbg0 * N * 4);
     const unsigned swoff = ncol0 * 4;                     // fragment 1: + 32 bytes (column + 8)
     i8g_gptr wbase = (i8g_gptr)Wsrc + ((size_t)pair0 * KT + kt0 + rg) * WBLK;   // the wave's first block; the second is + 4 blocks
     constexpr int NOFF = TRELLIS ? (KB == 4 ? 2 : 5) : 1;
@@ -372,12 +440,22 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
     auto load_a = [&](int i) {
 #pragma unroll
       for (int u = 0; u < 8; ++u) af[u] = i8g_load<i8g_v2i>(abase, aoff, u * 1024 + i * 256);
-      sav[0] = i8g_load<i8g_v4f>(sabase, saoff, i * 64);
-      sav[1] = i8g_load<i8g_v4f>(sabase, saoff, i * 64 + 16);
+      if constexpr (kUseSA) {
+        sav[0] = i8g_load<i8g_v4f>(sabase, saoff, i * 64);
+        sav[1] = i8g_load<i8g_v4f>(sabase, saoff, i * 64 + 16);
+      }
     };
 
+    unsigned rs0h = 0, rs1h = 0;   // RESC 4: the rs pairs of the column scales, formed once for the whole K
+    if constexpr (kColW) {
+      load_sw(0);
+      if constexpr (TRELLIS) {
+        rs0h = i8g_rs_pair(swc0);
+        rs1h = i8g_rs_pair(swc1);
+      }
+    }
     load_w(0);
-    load_sw(0);
+    if constexpr (!kColW) load_sw(0);
     int buf = 0;
     const unsigned lds_w = ks * slot_bytes + rg * 512 + lane * 16;      // block u = rg; u = rg + 4 is + 2048
     const unsigned lds_r = ks * slot_bytes + lane * 16;                 // block u at + 512 u
@@ -394,14 +472,19 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
         for (int i = 0; i < 5; ++i) c5[b][i] = w5[b][i];
       const int more = (kbi + 1 < nkb) ? 1 : 0;
       load_w(more);
-      load_sw(more);
+      if constexpr (!kColW) load_sw(more);
       load_a(0);
       __builtin_amdgcn_sched_barrier(0);
       {
         unsigned rs0 = 0, rs1 = 0;
         if constexpr (TRELLIS) {
-          rs0 = i8g_rs_pair(s0c);
-          rs1 = i8g_rs_pair(s1c);
+          if constexpr (kColW) {
+            rs0 = rs0h;
+            rs1 = rs1h;
+          } else {
+            rs0 = i8g_rs_pair(s0c);
+            rs1 = i8g_rs_pair(s1c);
+          }
         }
 #pragma unroll
         for (int b = 0; b < 2; ++b) {
@@ -434,11 +517,13 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
         i8g_v4f sac[2];
 #pragma unroll
         for (int u = 0; u < 8; ++u) afc[u] = af[u];
-        sac[0] = sav[0];
-        sac[1] = sav[1];
+        if constexpr (kUseSA) {
+          sac[0] = sav[0];
+          sac[1] = sav[1];
+        }
         if (i + 1 < MT) load_a(i + 1);                    // the next pass's A and sa, behind this pass's WMMA
         __builtin_amdgcn_sched_barrier(0);
-        if constexpr (RESC != 1) {
+        if constexpr (RESC != 1 && RESC != 4) {
           i8g_v8i p0 = (i8g_v8i)(0), p1 = (i8g_v8i)(0);
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
@@ -481,9 +566,9 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
       wbase = wbase + (size_t)8 * WBLK;
       swbase = swbase + (size_t)N * 4;
       i8g_opaque(abase);
-      i8g_opaque(sabase);
+      if constexpr (kUseSA) i8g_opaque(sabase);
       i8g_opaque(wbase);
-      i8g_opaque(swbase);
+      if constexpr (!kColW) i8g_opaque(swbase);
 #pragma unroll
       for (int i = 0; i < NOFF; ++i) i8g_opaque_v(woff[i]);
       __builtin_amdgcn_sched_barrier(0);
@@ -494,7 +579,8 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
     // the coarse variants' one multiply with the scale(s) of block 0 of the whole K (a per-row / per-column scale;
     // speed bounds, not the per-128 math): RESC 1 both scales (the int32 accumulators ran over the whole slice),
     // RESC 2 the activation scale, RESC 3 the weight scale (the fp32 accumulators already hold the other, per-block,
-    // one). Every slice multiplies its own partial sum by the same factors, so the slices still add up.
+    // one). Every slice multiplies its own partial sum by the same factors, so the slices still add up. RESC 4 is
+    // RESC 1's multiply with the tables that actually hold one scale per row / column ([256], [N]).
     const float* swp = SW + ncol0;
     const float s0 = swp[0], s1 = swp[8];
 #pragma unroll
@@ -505,7 +591,7 @@ __global__ __launch_bounds__(128 * SKW) I8G_KATTR void i8g_kernel(
       } else {
         const i8g_v4f* sap = (const i8g_v4f*)(SA + (size_t)rg * 64 + 16 * i + 8 * hh);
         const v8f sa8 = __builtin_shufflevector(sap[0], sap[1], 0, 1, 2, 3, 4, 5, 6, 7);
-        if constexpr (RESC == 1) {
+        if constexpr (RESC == 1 || RESC == 4) {
           const v8f t0 = __builtin_convertvector(acci[0][i], v8f), t1 = __builtin_convertvector(acci[1][i], v8f);
 #pragma unroll
           for (int e = 0; e < 8; ++e) {

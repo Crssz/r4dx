@@ -14,6 +14,9 @@
 //   D. nothing outside the outputs is written (canary words around A8 and SA), every output byte IS written (the two
 //      sides start from different poison), and the comparison can fail (a flipped byte is seen);
 //   E. the preconditions: a row count other than 256 and a null a8 / sa throw.
+//   Everything above runs twice: with the per-128 entries (r4dx_*_i8) and, as [coarse], with the per-ROW ones (r4dx_*_i8r,
+//   R4DX_PREFILL_INT8_SCALES=coarse: one scale per row, SA [256] per output, a workgroup of 8 waves per row staging the f16 values
+//   in LDS) against the f16 producers + TrellisI8QuantActRow (r4d_trellis_i8_quant_act_row).
 //
 // GPU test: HIP device 1 via HIP_VISIBLE_DEVICES=1 (tests/kernels/CMakeLists.txt); skips (77) without a device.
 // Needs no golden data. The comparison against the CPU rules of the quantizer is on the CPU side:
@@ -98,15 +101,16 @@ std::vector<float> RandomScales(std::mt19937_64& rng, int64_t n) {
 // canary words after them and a poison fill.
 struct Operand {
   int nout, K;
+  bool coarse;
   DeviceBuffer<int8_t> a8;
   DeviceBuffer<float> sa;
   size_t a8_n, sa_n;
   static constexpr size_t kCanary = 256;
   static constexpr uint8_t kCanaryByte = 0xC3;
 
-  Operand(int nout_, int K_, uint8_t poison) : nout(nout_), K(K_) {
+  Operand(int nout_, int K_, uint8_t poison, bool coarse_ = false) : nout(nout_), K(K_), coarse(coarse_) {
     a8_n = static_cast<size_t>(nout) * kM * K;
-    sa_n = static_cast<size_t>(nout) * (K / 128) * kM;
+    sa_n = static_cast<size_t>(nout) * (coarse ? 1 : K / 128) * kM;   // coarse: SA is [256] per output
     a8 = DeviceBuffer<int8_t>(a8_n + kCanary);
     sa = DeviceBuffer<float>(sa_n + kCanary);
     R4DX_HIP_CHECK(hipMemset(a8.data(), poison, a8_n));
@@ -115,7 +119,7 @@ struct Operand {
     R4DX_HIP_CHECK(hipMemset(sa.data() + sa_n, kCanaryByte, kCanary * sizeof(float)));
   }
   int64_t A8(int o) { return P(a8.data() + static_cast<size_t>(o) * kM * K); }
-  int64_t SA(int o) { return P(sa.data() + static_cast<size_t>(o) * (K / 128) * kM); }
+  int64_t SA(int o) { return P(sa.data() + static_cast<size_t>(o) * (coarse ? 1 : K / 128) * kM); }
   bool CanariesIntact() const {
     std::vector<int8_t> a = a8.CopyToHost();
     std::vector<float> s = sa.CopyToHost();
@@ -151,18 +155,18 @@ bool SameBytes(const Operand& a, const Operand& b, size_t* bad_a8 = nullptr, siz
 // the layout a multi-part linear's single two-part launch also produces)
 void QuantizeUnfused(const DeviceBuffer<uint16_t>& a16, Operand& op) {
   for (int o = 0; o < op.nout; ++o) {
-    r4d::TrellisI8QuantAct(a16.data() + static_cast<size_t>(o) * kM * op.K, reinterpret_cast<int8_t*>(op.A8(o)),
-                           reinterpret_cast<float*>(op.SA(o)), 1, 0, op.K, nullptr);
+    (op.coarse ? r4d::TrellisI8QuantActRow : r4d::TrellisI8QuantAct)(a16.data() + static_cast<size_t>(o) * kM * op.K, reinterpret_cast<int8_t*>(op.A8(o)),
+                                                                     reinterpret_cast<float*>(op.SA(o)), 1, 0, op.K, nullptr);
   }
   R4DX_HIP_CHECK(hipDeviceSynchronize());
 }
 
-std::string Cfg(const char* what, int K, int nout, int prescale) {
-  return std::string(what) + " K " + std::to_string(K) + " nout " + std::to_string(nout) + " prescale " + std::to_string(prescale);
+std::string Cfg(const char* what, int K, int nout, int prescale, bool coarse = false) {
+  return std::string(what) + " K " + std::to_string(K) + " nout " + std::to_string(nout) + " prescale " + std::to_string(prescale) + (coarse ? " [coarse]" : "");
 }
 
 // ---- A: the input transform -----------------------------------------------------------------------------------
-void TestTransform(std::mt19937_64& rng) {
+void TestTransform(std::mt19937_64& rng, bool coarse) {
   for (int K : {3072, 5120, 6144, 8704, 17408}) {
     DeviceBuffer<uint16_t> d_x(static_cast<size_t>(kM) * K);
     d_x.CopyFromHost(RandomX(rng, kM, K));
@@ -172,7 +176,7 @@ void TestTransform(std::mt19937_64& rng) {
       for (int prescale : {0, 4, -3}) {
         int64_t suh[3] = {}, out[3] = {};
         DeviceBuffer<uint16_t> d_a16(static_cast<size_t>(nout) * kM * K);
-        Operand ref(nout, K, 0x5A), got(nout, K, 0xA5);
+        Operand ref(nout, K, 0x5A, coarse), got(nout, K, 0xA5, coarse);
         int64_t g8[3] = {}, gsa[3] = {};
         for (int o = 0; o < nout; ++o) {
           suh[o] = P(d_suh.data() + static_cast<size_t>(o) * K);
@@ -182,20 +186,20 @@ void TestTransform(std::mt19937_64& rng) {
         }
         r4dx_trellis_input_bf16(P(d_x.data()), kM, K, nout, suh, out, prescale, 0);
         QuantizeUnfused(d_a16, ref);
-        r4dx_trellis_input_i8(P(d_x.data()), kM, K, nout, suh, g8, gsa, prescale, 0);
+        (coarse ? r4dx_trellis_input_i8r : r4dx_trellis_input_i8)(P(d_x.data()), kM, K, nout, suh, g8, gsa, prescale, 0);
         R4DX_HIP_CHECK(hipDeviceSynchronize());
         size_t b8 = 0, bs = 0;
         const bool same = SameBytes(ref, got, &b8, &bs);
-        Check(same, Cfg("transform: fused == transform + separate quantizer", K, nout, prescale) + " (" + std::to_string(b8) +
+        Check(same, Cfg("transform: fused == transform + separate quantizer", K, nout, prescale, coarse) + " (" + std::to_string(b8) +
                         " A8 bytes, " + std::to_string(bs) + " scales differ)");
-        Check(got.CanariesIntact(), Cfg("transform: nothing written past the outputs", K, nout, prescale));
+        Check(got.CanariesIntact(), Cfg("transform: nothing written past the outputs", K, nout, prescale, coarse));
       }
     }
   }
 }
 
 // ---- B: silu_mul -> mlp.down's A ------------------------------------------------------------------------------------
-void TestSilu(std::mt19937_64& rng) {
+void TestSilu(std::mt19937_64& rng, bool coarse) {
   for (int inter : {17408, 8704})
     for (int pad : {0, 128}) {
       const int stride = 2 * inter + pad;
@@ -206,23 +210,23 @@ void TestSilu(std::mt19937_64& rng) {
       d_suh.CopyFromHost(RandomScales(rng, inter));
       for (int prescale : {0, 4}) {
         DeviceBuffer<uint16_t> d_a16(static_cast<size_t>(kM) * inter);
-        Operand ref(1, inter, 0x5A), got(1, inter, 0xA5);
+        Operand ref(1, inter, 0x5A, coarse), got(1, inter, 0xA5, coarse);
         r4dx_silu_mul_trellis_bf16(P(d_gu.data()), kM, inter, stride, P(d_suh.data()), P(d_a16.data()), prescale, 0);
         QuantizeUnfused(d_a16, ref);
-        r4dx_silu_mul_trellis_i8(P(d_gu.data()), kM, inter, stride, P(d_suh.data()), got.A8(0), got.SA(0), prescale, 0);
+        (coarse ? r4dx_silu_mul_trellis_i8r : r4dx_silu_mul_trellis_i8)(P(d_gu.data()), kM, inter, stride, P(d_suh.data()), got.A8(0), got.SA(0), prescale, 0);
         R4DX_HIP_CHECK(hipDeviceSynchronize());
         size_t b8 = 0, bs = 0;
         const bool same = SameBytes(ref, got, &b8, &bs);
         Check(same, "silu_mul: fused == silu_mul_trellis + separate quantizer, intermediate " + std::to_string(inter) + " stride " +
-                        std::to_string(stride) + " prescale " + std::to_string(prescale) + " (" + std::to_string(b8) + " A8 bytes, " +
+                        std::to_string(stride) + " prescale " + std::to_string(prescale) + (coarse ? " [coarse]" : "") + " (" + std::to_string(b8) + " A8 bytes, " +
                         std::to_string(bs) + " scales differ)");
-        Check(got.CanariesIntact(), "silu_mul: nothing written past the outputs, intermediate " + std::to_string(inter));
+        Check(got.CanariesIntact(), "silu_mul: nothing written past the outputs, intermediate " + std::to_string(inter) + (coarse ? " [coarse]" : ""));
       }
     }
 }
 
 // ---- C: attention gate-mul -> attn.o's A ----------------------------------------------------------------------------
-void TestGateMul(std::mt19937_64& rng) {
+void TestGateMul(std::mt19937_64& rng, bool coarse) {
   for (int K : {6144, 3072}) {
     DeviceBuffer<uint16_t> d_a(static_cast<size_t>(kM) * K), d_g(static_cast<size_t>(kM) * K);
     d_a.CopyFromHost(RandomX(rng, kM, K));
@@ -231,54 +235,67 @@ void TestGateMul(std::mt19937_64& rng) {
     d_suh.CopyFromHost(RandomScales(rng, K));
     for (int prescale : {0, 4, -3}) {
       DeviceBuffer<uint16_t> d_a16(static_cast<size_t>(kM) * K);
-      Operand ref(1, K, 0x5A), got(1, K, 0xA5);
+      Operand ref(1, K, 0x5A, coarse), got(1, K, 0xA5, coarse);
       r4dx_attn_gate_mul_trellis_bf16(P(d_a.data()), P(d_g.data()), kM, K, P(d_suh.data()), P(d_a16.data()), prescale, 0);
       QuantizeUnfused(d_a16, ref);
-      r4dx_attn_gate_mul_trellis_i8(P(d_a.data()), P(d_g.data()), kM, K, P(d_suh.data()), got.A8(0), got.SA(0), prescale, 0);
+      (coarse ? r4dx_attn_gate_mul_trellis_i8r : r4dx_attn_gate_mul_trellis_i8)(P(d_a.data()), P(d_g.data()), kM, K, P(d_suh.data()), got.A8(0), got.SA(0), prescale, 0);
       R4DX_HIP_CHECK(hipDeviceSynchronize());
       size_t b8 = 0, bs = 0;
       const bool same = SameBytes(ref, got, &b8, &bs);
-      Check(same, Cfg("gate_mul: fused == gate_mul_trellis + separate quantizer", K, 1, prescale) + " (" + std::to_string(b8) +
+      Check(same, Cfg("gate_mul: fused == gate_mul_trellis + separate quantizer", K, 1, prescale, coarse) + " (" + std::to_string(b8) +
                       " A8 bytes, " + std::to_string(bs) + " scales differ)");
-      Check(got.CanariesIntact(), Cfg("gate_mul: nothing written past the outputs", K, 1, prescale));
+      Check(got.CanariesIntact(), Cfg("gate_mul: nothing written past the outputs", K, 1, prescale, coarse));
     }
   }
 }
 
 // ---- D: the comparison can fail; E: the preconditions ----------------------------------------------------------------
-void TestNegativeAndPreconditions(std::mt19937_64& rng) {
+void TestNegativeAndPreconditions(std::mt19937_64& rng, bool coarse) {
+  const char* tag = coarse ? " [coarse]" : "";
+  const auto Run8 = [coarse](auto... a) { (coarse ? r4dx_trellis_input_i8r : r4dx_trellis_input_i8)(a...); };
+  const auto RunSilu = [coarse](auto... a) { (coarse ? r4dx_silu_mul_trellis_i8r : r4dx_silu_mul_trellis_i8)(a...); };
+  const auto RunGate = [coarse](auto... a) { (coarse ? r4dx_attn_gate_mul_trellis_i8r : r4dx_attn_gate_mul_trellis_i8)(a...); };
   const int K = 5120;
   DeviceBuffer<uint16_t> d_x(static_cast<size_t>(kM) * K);
   d_x.CopyFromHost(RandomX(rng, kM, K));
   DeviceBuffer<float> d_suh(static_cast<size_t>(K));
   d_suh.CopyFromHost(RandomScales(rng, K));
   DeviceBuffer<uint16_t> d_a16(static_cast<size_t>(kM) * K);
-  Operand ref(1, K, 0x5A), got(1, K, 0xA5);
+  Operand ref(1, K, 0x5A, coarse), got(1, K, 0xA5, coarse);
   int64_t suh[1] = {P(d_suh.data())}, out[1] = {P(d_a16.data())}, g8[1] = {got.A8(0)}, gsa[1] = {got.SA(0)};
   r4dx_trellis_input_bf16(P(d_x.data()), kM, K, 1, suh, out, 0, 0);
   QuantizeUnfused(d_a16, ref);
-  r4dx_trellis_input_i8(P(d_x.data()), kM, K, 1, suh, g8, gsa, 0, 0);
+  Run8(P(d_x.data()), kM, K, 1, suh, g8, gsa, 0, 0);
   R4DX_HIP_CHECK(hipDeviceSynchronize());
-  Check(SameBytes(ref, got), "negative control setup: the fused and unfused operands start equal");
+  Check(SameBytes(ref, got), std::string("negative control setup: the fused and unfused operands start equal") + tag);
   int8_t flipped = 0;
   R4DX_HIP_CHECK(hipMemcpy(&flipped, got.a8.data() + 12345, 1, hipMemcpyDeviceToHost));
   flipped = static_cast<int8_t>(flipped ^ 1);
   R4DX_HIP_CHECK(hipMemcpy(got.a8.data() + 12345, &flipped, 1, hipMemcpyHostToDevice));
-  Check(!SameBytes(ref, got), "negative control: one flipped A8 byte is seen by the comparison");
-  Check(Throws([&] { r4dx_trellis_input_i8(P(d_x.data()), 255, K, 1, suh, g8, gsa, 0, 0); }), "255 rows throws (the A8 layout is 256)");
-  Check(Throws([&] { r4dx_trellis_input_i8(P(d_x.data()), 64, K, 1, suh, g8, gsa, 0, 0); }), "64 rows throws");
+  Check(!SameBytes(ref, got), std::string("negative control: one flipped A8 byte is seen by the comparison") + tag);
+  Check(Throws([&] { Run8(P(d_x.data()), 255, K, 1, suh, g8, gsa, 0, 0); }), std::string("255 rows throws (the A8 layout is 256)") + tag);
+  Check(Throws([&] { Run8(P(d_x.data()), 64, K, 1, suh, g8, gsa, 0, 0); }), std::string("64 rows throws") + tag);
   const int64_t null8[1] = {0};
-  Check(Throws([&] { r4dx_trellis_input_i8(P(d_x.data()), kM, K, 1, suh, null8, gsa, 0, 0); }), "a null a8 throws");
-  Check(Throws([&] { r4dx_trellis_input_i8(P(d_x.data()), kM, K, 1, suh, g8, null8, 0, 0); }), "a null sa throws");
-  Check(Throws([&] { r4dx_trellis_input_i8(P(d_x.data()), kM, K + 64, 1, suh, g8, gsa, 0, 0); }), "K not a multiple of 128 throws");
-  Check(Throws([&] { r4dx_silu_mul_trellis_i8(P(d_x.data()), 128, 4096, 8192, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
-        "silu_mul: 128 rows throws");
-  Check(Throws([&] { r4dx_silu_mul_trellis_i8(P(d_x.data()), kM, 4096, 8191, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
-        "silu_mul: a row stride below 2 * intermediate throws");
-  Check(Throws([&] { r4dx_attn_gate_mul_trellis_i8(P(d_x.data()), P(d_x.data()), 100, 4096, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
-        "gate_mul: 100 rows throws");
-  Check(Throws([&] { r4dx_attn_gate_mul_trellis_i8(P(d_x.data()), 0, kM, 4096, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
-        "gate_mul: a null gate throws");
+  Check(Throws([&] { Run8(P(d_x.data()), kM, K, 1, suh, null8, gsa, 0, 0); }), std::string("a null a8 throws") + tag);
+  Check(Throws([&] { Run8(P(d_x.data()), kM, K, 1, suh, g8, null8, 0, 0); }), std::string("a null sa throws") + tag);
+  Check(Throws([&] { Run8(P(d_x.data()), kM, K + 64, 1, suh, g8, gsa, 0, 0); }), std::string("K not a multiple of 128 throws") + tag);
+  Check(Throws([&] { RunSilu(P(d_x.data()), 128, 4096, 8192, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
+        std::string("silu_mul: 128 rows throws") + tag);
+  Check(Throws([&] { RunSilu(P(d_x.data()), kM, 4096, 8191, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
+        std::string("silu_mul: a row stride below 2 * intermediate throws") + tag);
+  Check(Throws([&] { RunGate(P(d_x.data()), P(d_x.data()), 100, 4096, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
+        std::string("gate_mul: 100 rows throws") + tag);
+  Check(Throws([&] { RunGate(P(d_x.data()), 0, kM, 4096, P(d_suh.data()), g8[0], gsa[0], 0, 0); }),
+        std::string("gate_mul: a null gate throws") + tag);
+  if (coarse) {
+    // the row buffer must fit in LDS: nout * K * 2 + 64 <= 64 KiB (3 x 17408 does not)
+    DeviceBuffer<float> d_suh3(static_cast<size_t>(3) * 17408);
+    DeviceBuffer<uint16_t> d_big(static_cast<size_t>(kM) * 17408);
+    Operand big(3, 17408, 0x11, true);
+    int64_t s3[3] = {P(d_suh3.data()), P(d_suh3.data() + 17408), P(d_suh3.data() + 2 * 17408)};
+    int64_t b3[3] = {big.A8(0), big.A8(1), big.A8(2)}, sa3[3] = {big.SA(0), big.SA(1), big.SA(2)};
+    Check(Throws([&] { r4dx_trellis_input_i8r(P(d_big.data()), kM, 17408, 3, s3, b3, sa3, 0, 0); }), "i8r: three outputs of K 17408 do not fit the row buffer in LDS and throw");
+  }
 }
 
 }  // namespace
@@ -295,10 +312,12 @@ int main() {
   }
   try {
     std::mt19937_64 rng(20261007);
-    TestTransform(rng);
-    TestSilu(rng);
-    TestGateMul(rng);
-    TestNegativeAndPreconditions(rng);
+    for (const bool coarse : {false, true}) {   // the per-128 entries, then the per-row ones (R4DX_PREFILL_INT8_SCALES=coarse)
+      TestTransform(rng, coarse);
+      TestSilu(rng, coarse);
+      TestGateMul(rng, coarse);
+      TestNegativeAndPreconditions(rng, coarse);
+    }
   } catch (const std::exception& e) {
     std::printf("FAIL: exception: %s\n", e.what());
     return 1;

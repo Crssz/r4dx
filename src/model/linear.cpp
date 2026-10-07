@@ -159,6 +159,7 @@ namespace trellis_tp2 {
 // The int8 x int8 prefill GEMM's table (R4DX_PREFILL_INT8, docs/int8-prefill.md "Production path"): one
 // (skw, skg) per (N, K, KB), TP = 1 shapes only (a TP = 2 rank keeps the f16 kernel in v1).
 #include "gemm_tuning_table_trellis_i8.inc"
+#include "gemm_tuning_table_trellis_i8c.inc"   // R4DX_PREFILL_INT8_SCALES=coarse: the same kernel family's coarse rows
 
 thread_local bool t_tp2_tuning = false;
 
@@ -551,7 +552,11 @@ ScopedTrellisI8::ScopedTrellisI8(bool on) : prev_(t_trellis_i8) { t_trellis_i8 =
 ScopedTrellisI8::~ScopedTrellisI8() { t_trellis_i8 = prev_; }
 bool TrellisI8Active() { return t_trellis_i8; }
 
-const TrellisI8Row* TrellisI8Rows(size_t* count) {
+const TrellisI8Row* TrellisI8Rows(size_t* count, bool coarse) {
+  if (coarse) {
+    if (count != nullptr) *count = sizeof(kTrellisI8cTable) / sizeof(kTrellisI8cTable[0]);
+    return kTrellisI8cTable;
+  }
   if (count != nullptr) *count = sizeof(kTrellisI8Table) / sizeof(kTrellisI8Table[0]);
   return kTrellisI8Table;
 }
@@ -633,7 +638,7 @@ TrellisM256Plan PlanTrellisM256(int64_t N, int64_t K, int kb, int parts, int64_t
   return refuse(first_why.empty() ? "no K-slice grouping fits" : first_why);
 }
 
-TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0) {
+TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t part_n0, bool coarse) {
   TrellisI8Plan plan;
   const auto refuse = [&plan](std::string why) {
     plan.ok = false;
@@ -650,9 +655,11 @@ TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t par
   // The debug filter of the f16 plan applies to the int8 one too: "only these shapes take the M = 256 path".
   if (!M256ShapeAllowed(N, K)) return refuse("shape excluded by R4DX_M256_SHAPES");
   const TrellisI8Row* row = nullptr;
-  for (const TrellisI8Row& r : kTrellisI8Table) {
-    if (r.N == N && r.K == K && r.rate == kb) {
-      row = &r;
+  size_t nrows = 0;
+  const TrellisI8Row* rows = TrellisI8Rows(&nrows, coarse);
+  for (size_t i = 0; i < nrows; ++i) {
+    if (rows[i].N == N && rows[i].K == K && rows[i].rate == kb) {
+      row = &rows[i];
       break;
     }
   }
@@ -670,15 +677,25 @@ TrellisI8Plan PlanTrellisI8(int64_t N, int64_t K, int kb, int parts, int64_t par
   return plan;
 }
 
-bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream) {
-  if (w.layout != Layout::kTrellis || !w.trellis_i8_sw.empty()) return false;
-  const TrellisI8Plan plan = PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]);
+bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream, bool coarse) {
+  if (w.layout != Layout::kTrellis || !w.trellis_i8_sw.empty() || !w.trellis_i8_swc.empty()) return false;
+  const TrellisI8Plan plan = PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse);
   if (!plan.ok) return false;
+  if (coarse) {
+    // one scale per column over the whole K: N floats, the [K / 128][N] table is never allocated
+    w.trellis_i8_swc =
+        core::DeviceBuffer<float>(core::r4d::TrellisI8WscaleColCount(static_cast<int>(w.K), static_cast<int>(w.N)));
+    core::r4d::TrellisI8WscaleColBuild(w.trellis_w.data(), w.trellis_i8_swc.data(), static_cast<int>(w.K),
+                                       static_cast<int>(w.N), w.trellis_bits, stream);
+    return true;
+  }
   w.trellis_i8_sw = core::DeviceBuffer<float>(core::r4d::TrellisI8WscaleCount(static_cast<int>(w.K), static_cast<int>(w.N)));
   core::r4d::TrellisI8WscaleBuild(w.trellis_w.data(), w.trellis_i8_sw.data(), static_cast<int>(w.K),
                                   static_cast<int>(w.N), w.trellis_bits, stream);
   return true;
 }
+
+bool TrellisI8Coarse(const QuantLinear& w) { return !w.trellis_i8_swc.empty(); }
 
 bool TrellisI8FusedQEnabled() {
   static const bool kStats = [] {
@@ -700,15 +717,17 @@ TrellisI8OperandCounts TrellisI8OperandCountsGet() {
 // ApplyLinear's own test for its int8 branch (it keeps the plan's notice and the missing-table throw itself).
 bool TrellisI8Takes(const QuantLinear& w, int64_t M) {
   if (w.layout != Layout::kTrellis || M != kTrellisM256Rows || !TrellisM256Active() || !TrellisI8Active()) return false;
-  return PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]).ok && !w.trellis_i8_sw.empty();
+  const bool coarse = TrellisI8Coarse(w);
+  return PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse).ok &&
+         !(coarse ? w.trellis_i8_swc : w.trellis_i8_sw).empty();
 }
 
 bool TrellisI8FusedQ(const QuantLinear& w, int64_t M) { return TrellisI8FusedQEnabled() && TrellisI8Takes(w, M); }
 
-TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts) {
+TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts, bool coarse) {
   TrellisI8Operand op;
   op.a8 = arena.Alloc<int8_t>(static_cast<size_t>(parts * kTrellisM256Rows * K), /*align_bytes=*/16);
-  op.sa = arena.Alloc<float>(static_cast<size_t>(parts * (K / 128) * kTrellisM256Rows), /*align_bytes=*/16);
+  op.sa = arena.Alloc<float>(static_cast<size_t>(parts * (coarse ? 1 : K / 128) * kTrellisM256Rows), /*align_bytes=*/16);
   return op;
 }
 
@@ -727,12 +746,16 @@ bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* 
   // R4DX_PREFILL_INT8_FUSEDQ: when every linear of the group will take the int8 GEMM (the test ApplyLinear makes),
   // the one transform writes each linear's A8 + SA instead of f16 -- the quantizer of each, fused. A group where some
   // would not (no plan, no table) keeps f16 for all, so a linear never receives an operand it cannot use.
+  // R4DX_PREFILL_INT8_SCALES=coarse: the group's one transform writes one scale per row, so every linear of the group must
+  // be coarse (a model is uniform; a mixed group would fall back to f16 A for all, which each linear's own call then
+  // quantizes by its own table).
   bool all_i8 = true;
-  for (int i = 0; i < n; ++i) all_i8 = all_i8 && TrellisI8FusedQ(*ws[i], M);
+  const bool coarse0 = TrellisI8Coarse(*ws[0]);
+  for (int i = 0; i < n; ++i) all_i8 = all_i8 && TrellisI8FusedQ(*ws[i], M) && TrellisI8Coarse(*ws[i]) == coarse0;
   if (all_i8) {
     int64_t suh[3] = {}, o8[3] = {}, osa[3] = {};
     for (int i = 0; i < n; ++i) {
-      const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, 1);
+      const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, 1, coarse0);
       suh[i] = reinterpret_cast<int64_t>(ws[i]->trellis_suh.data());
       o8[i] = reinterpret_cast<int64_t>(op.a8);
       osa[i] = reinterpret_cast<int64_t>(op.sa);
@@ -741,8 +764,9 @@ bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* 
       p.sa = op.sa;
       pre[i] = p;
     }
-    r4dx_trellis_input_i8(reinterpret_cast<int64_t>(x), M, K, n, suh, o8, osa, ws[0]->trellis_prescale_log2,
-                          reinterpret_cast<int64_t>(stream));
+    (coarse0 ? r4dx_trellis_input_i8r : r4dx_trellis_input_i8)(reinterpret_cast<int64_t>(x), M, K, n, suh, o8, osa,
+                                                                ws[0]->trellis_prescale_log2,
+                                                                reinterpret_cast<int64_t>(stream));
     return true;
   }
   int64_t suh[3] = {}, out[3] = {};
@@ -900,10 +924,13 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   // the f16 linear, NOT its bits (the f16 kernel's 64 == 256 identity does not hold for these rows). Anything
   // else -- a plan the linear lacks, any other M, any other caller -- falls through to the f16 paths below.
   if (w.layout == Layout::kTrellis && M == kTrellisM256Rows && TrellisM256Active() && TrellisI8Active()) {
-    const TrellisI8Plan plan8 = PlanTrellisI8(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]);
+    // R4DX_PREFILL_INT8_SCALES=coarse: the linear carries the one-per-column table instead of the per-128 one, and its A is
+    // quantized per row (see TrellisI8Coarse)
+    const bool coarse = TrellisI8Coarse(w);
+    const TrellisI8Plan plan8 = PlanTrellisI8(N, K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0], coarse);
     if (!plan8.ok) NoteNoInt8Plan(w, plan8);
     if (plan8.ok) {
-      if (w.trellis_i8_sw.empty()) {
+      if ((coarse ? w.trellis_i8_swc : w.trellis_i8_sw).empty()) {
         throw std::runtime_error("r4dx::model::ApplyLinear: R4DX_PREFILL_INT8 is on but trellis weight [" +
                                  std::to_string(N) + ", " + std::to_string(K) +
                                  "] has no int8 scale table (BuildTrellisI8Scale runs in Model::Load)");
@@ -917,7 +944,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
       //     and there is no caller transform;
       //   * today's chain: the f16 A (the caller's or TrellisA256's transform), then r4d_trellis_i8_quant_act.
       const int64_t a8_part = M * K;
-      const int64_t sa_part = (K / 128) * M;
+      const int64_t sa_part = (coarse ? 1 : K / 128) * M;   // coarse: SA is [256] per part
       const int8_t* a8;
       const float* sa;
       if (pre_i8) {
@@ -926,13 +953,13 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
         g_i8_from_producer.fetch_add(1, std::memory_order_relaxed);
       } else if (!trellis_pre && TrellisI8FusedQEnabled()) {
         g_i8_from_own.fetch_add(1, std::memory_order_relaxed);
-        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts);
+        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts, coarse);
         const int64_t suh[2] = {reinterpret_cast<int64_t>(w.trellis_suh.data()),
                                 reinterpret_cast<int64_t>(w.trellis_suh.data() + K)};
         const int64_t o8[2] = {reinterpret_cast<int64_t>(op.a8), reinterpret_cast<int64_t>(op.a8 + a8_part)};
         const int64_t osa[2] = {reinterpret_cast<int64_t>(op.sa), reinterpret_cast<int64_t>(op.sa + sa_part)};
-        r4dx_trellis_input_i8(reinterpret_cast<int64_t>(x), M, K, parts, suh, o8, osa, w.trellis_prescale_log2,
-                              reinterpret_cast<int64_t>(s));
+        (coarse ? r4dx_trellis_input_i8r : r4dx_trellis_input_i8)(reinterpret_cast<int64_t>(x), M, K, parts, suh, o8, osa,
+                                                                  w.trellis_prescale_log2, reinterpret_cast<int64_t>(s));
         a8 = op.a8;
         sa = op.sa;
       } else {
@@ -940,8 +967,12 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
         const uint16_t* a0;
         const uint16_t* a1;
         TrellisA256(s, arena, w, x, M, pre, trellis_pre, /*mark_input=*/false, &a0, &a1);
-        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts);
-        core::r4d::TrellisI8QuantAct(a0, op.a8, op.sa, parts, parts > 1 ? a1 - a0 : 0, static_cast<int>(K), s);
+        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts, coarse);
+        if (coarse) {
+          core::r4d::TrellisI8QuantActRow(a0, op.a8, op.sa, parts, parts > 1 ? a1 - a0 : 0, static_cast<int>(K), s);
+        } else {
+          core::r4d::TrellisI8QuantAct(a0, op.a8, op.sa, parts, parts > 1 ? a1 - a0 : 0, static_cast<int>(K), s);
+        }
         a8 = op.a8;
         sa = op.sa;
       }
@@ -952,10 +983,10 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
       const float out_scale = static_cast<float>(std::ldexp(1.0, -w.trellis_prescale_log2) / std::sqrt(128.0));
       const int n_split = static_cast<int>(parts > 1 ? w.trellis_part_n[0] : N);
       // The tickets are this linear's own, the f16 kernels' protocol (and its concurrency invariant: one stream).
-      core::r4d::GemmTrellisNtI8(a8, sa, parts > 1 ? a8 + a8_part : nullptr, parts > 1 ? sa + sa_part : nullptr,
-                                 n_split, w.trellis_w.data(), w.trellis_i8_sw.data(), w.trellis_svh.data(), y, ws,
-                                 w.trellis_tickets, static_cast<int>(M), static_cast<int>(K), static_cast<int>(N),
-                                 w.trellis_bits, plan8.skw, plan8.skg, out_scale, s);
+      (coarse ? core::r4d::GemmTrellisNtI8c : core::r4d::GemmTrellisNtI8)(
+          a8, sa, parts > 1 ? a8 + a8_part : nullptr, parts > 1 ? sa + sa_part : nullptr, n_split, w.trellis_w.data(),
+          coarse ? w.trellis_i8_swc.data() : w.trellis_i8_sw.data(), w.trellis_svh.data(), y, ws, w.trellis_tickets,
+          static_cast<int>(M), static_cast<int>(K), static_cast<int>(N), w.trellis_bits, plan8.skw, plan8.skg, out_scale, s);
       return;
     }
   }

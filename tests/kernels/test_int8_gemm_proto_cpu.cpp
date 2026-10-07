@@ -340,6 +340,99 @@ void TestTrellisChain() {
   }
 }
 
+// The COARSE scales (R4DX_PREFILL_INT8_SCALES=coarse): QuantizeWeightsColRef (one scale per column over the whole K) and
+// QuantizeActRowRef (one per row), their relation to the per-128 quantizers, the kernel chain with them (EmuKernel RESC 1 is the
+// production RESC 4's math: sa [256], sw [N]), the int32 range, and the accuracy price on Gaussian data.
+void TestCoarse() {
+  const int N = 96, K = 1024, M = i8p::kM;
+  std::mt19937_64 g(31);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<float> X((size_t)M * K);
+  for (float& x : X) x = i8p::F16ToF32(i8p::F32ToF16(nd(g) * 0.7f));
+  for (int k = 0; k < K; ++k) X[(size_t)9 * K + k] = 0.f;                                       // an all-zero row (s = 1)
+  std::vector<uint16_t> Q((size_t)K * N);
+  for (uint16_t& q : Q) q = i8p::F32ToF16(nd(g) * 1.3f);
+  for (int k = 0; k < K; ++k) Q[(size_t)k * N + 5] = 0;                                         // an all-zero column
+  std::vector<int8_t> Apc, Wpc, Ap, Wp;
+  std::vector<float> sac, swc, sa, sw;
+  i8p::QuantizeActRowRef(X.data(), K, sac, Apc);
+  i8p::QuantizeWeightsColRef(Q.data(), K, N, swc, Wpc);
+  i8p::QuantizeActRef(X.data(), K, sa, Ap);
+  i8p::QuantizeWeightsRef(Q.data(), K, N, sw, Wp);
+  // range, amax -> 127, the all-zero rule
+  bool range = true, hit = true;
+  for (int8_t v : Apc) range = range && v >= -127;
+  for (int8_t v : Wpc) range = range && v >= -127;
+  for (int r = 0; r < M; ++r) {
+    int mx = 0;
+    for (int k = 0; k < K; ++k) mx = std::max(mx, std::abs((int)Apc[(size_t)r * K + k]));
+    hit = hit && (r == 9 ? mx == 0 : mx == 127);
+  }
+  for (int n = 0; n < N; ++n) {
+    int mx = 0;
+    for (int k = 0; k < K; ++k) mx = std::max(mx, std::abs((int)Wpc[(size_t)n * K + k]));
+    hit = hit && (n == 5 ? mx == 0 : mx >= 126);
+  }
+  Check(range && hit && sac[9] == 1.0f && swc[5] == 1.0f, "coarse quantizers: |q| <= 127, every row / column amax -> 127 (126 when rs rounds down), all-zero row / column -> scale 1, zeros");
+  // the coarse scale of a column is the largest per-128 one (monotone rule), the row scale is the largest per-128 one too
+  bool mono = true;
+  for (int n = 0; n < N; ++n)
+    for (int kb = 0; kb < K / 128; ++kb) mono = mono && swc[n] >= sw[(size_t)kb * N + n];
+  for (int r = 0; r < M; ++r)
+    for (int kb = 0; kb < K / 128; ++kb) mono = mono && sac[r] >= sa[(size_t)kb * M + r];
+  Check(mono, "the coarse scale of a row / column is at least every per-128 scale in it (it is their max)");
+  // one 128-block: coarse == per-128 exactly
+  {
+    std::vector<float> X1((size_t)M * 128);
+    for (int r = 0; r < M; ++r) std::copy(X.begin() + (size_t)r * K, X.begin() + (size_t)r * K + 128, X1.begin() + (size_t)r * 128);
+    std::vector<uint16_t> Q1((size_t)128 * N);
+    std::copy(Q.begin(), Q.begin() + (size_t)128 * N, Q1.begin());
+    std::vector<int8_t> a_c, a_b, w_c, w_b;
+    std::vector<float> s_ac, s_ab, s_wc, s_wb;
+    i8p::QuantizeActRowRef(X1.data(), 128, s_ac, a_c);
+    i8p::QuantizeActRef(X1.data(), 128, s_ab, a_b);
+    i8p::QuantizeWeightsColRef(Q1.data(), 128, N, s_wc, w_c);
+    i8p::QuantizeWeightsRef(Q1.data(), 128, N, s_wb, w_b);
+    Check(a_c == a_b && s_ac == s_ab && w_c == w_b && s_wc == s_wb, "K = 128 (one block): the coarse quantizers are the per-128 ones, bit for bit");
+  }
+  // the kernel chain (EmuKernel RESC 1 on sa [256] / sw [N]) against the exact integer reference, every K split
+  {
+    const std::vector<int8_t> a8 = i8p::PackA8(Apc, K), w8 = i8p::PackW8(Wpc, K, N);
+    std::vector<double> ref((size_t)M * N);
+    i8p::RefGemmInt8(Apc.data(), sac.data(), Wpc.data(), swc.data(), M, N, K, 3, ref.data());
+    double rms = 0, worst = 0;
+    for (double v : ref) rms += v * v;
+    rms = std::sqrt(rms / ref.size());
+    const int cfgs[5][2] = {{2, 1}, {2, 2}, {4, 1}, {8, 1}, {2, 4}};
+    for (const auto& cfg : cfgs) {
+      std::vector<double> got;
+      EmuKernel(a8, sac, w8, swc, N, K, 1, cfg[0], cfg[1], got);
+      for (size_t i = 0; i < ref.size(); ++i) worst = std::max(worst, std::fabs(ref[i] - got[i]));
+    }
+    std::printf("    coarse chain (RESC 4 math): max |emulated - exact| over (skw, skg) in {2x1, 2x2, 4x1, 8x1, 2x4}: %.3e, rms of C %.3f\n", worst, rms);
+    Check(worst < 1e-5 * rms, "coarse chain (A8 / W8 loads, whole-K int32 accumulate per slice, one rescale) == exact reference");
+    // the accuracy price: coarse vs per-128 vs the f16 product, Gaussian data
+    std::vector<double> exact((size_t)M * N, 0.0), blk((size_t)M * N);
+    for (int r = 0; r < M; ++r)
+      for (int n = 0; n < N; ++n) {
+        double s = 0;
+        for (int k = 0; k < K; ++k) s += (double)X[(size_t)r * K + k] * (double)i8p::F16ToF32(Q[(size_t)k * N + n]);
+        exact[(size_t)r * N + n] = s;
+      }
+    i8p::RefGemmInt8(Ap.data(), sa.data(), Wp.data(), sw.data(), M, N, K, 0, blk.data());
+    double dc = 0, db = 0, e2 = 0;
+    for (size_t i = 0; i < exact.size(); ++i) {
+      dc += (ref[i] - exact[i]) * (ref[i] - exact[i]);
+      db += (blk[i] - exact[i]) * (blk[i] - exact[i]);
+      e2 += exact[i] * exact[i];
+    }
+    std::printf("    rel RMS error of the product vs exact f16 x f16 (Gaussian): coarse %.5f, per-128 %.5f\n", std::sqrt(dc / e2), std::sqrt(db / e2));
+    Check(std::sqrt(dc / e2) < 0.03 && std::sqrt(dc / e2) < 1.6 * std::sqrt(db / e2), "coarse w8a8 rel RMS error < 3% and within 1.6x of the per-128 one (Gaussian data)");
+  }
+  // int32 range: the longest slice any legal configuration has is K / 2 (skw 2, skg 1) of the longest K, 17408
+  Check((17408LL / 2) * 127 * 127 < (1LL << 31) && 17408LL * 127 * 127 < (1LL << 31), "int32 accumulators cannot overflow: K 17408 x 127 x 127 = 2.8e8 < 2^31 (a slice is at most half of it)");
+}
+
 }  // namespace
 
 int main() {
@@ -347,6 +440,7 @@ int main() {
   TestF16();
   TestQuantizer();
   TestEmulatedGemm();
+  TestCoarse();
   TestTrellisChain();
   std::printf("%s\n", g_ok ? "ALL OK" : "FAILED");
   return g_ok ? 0 : 1;

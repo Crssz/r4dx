@@ -46,3 +46,54 @@ __device__ __forceinline__ void i8g_quant_wave_block(const unsigned short (&hb)[
   }
   if (lane == 0) SA[(size_t)kb * i8p::kM + row] = s;
 }
+
+// ---- the per-ROW activation scale (R4DX_PREFILL_INT8_SCALES=coarse, docs/int8-prefill.md "Coarse scales") ----------------
+// One workgroup of 256 threads (8 waves of 32) owns ONE row of the 256-row A: `xl` holds the row's K f16 values as bits
+// (workgroup shared memory in a producer, which writes the row there block by block after its transform; global memory
+// in the stand-alone quantizer i8g_quant_act_row) and every thread of the workgroup can read all of it; K a multiple of
+// 128. The arithmetic is the per-128 quantizer's with the group widened to the row: amax = max |x| over the whole row
+// (exact, so the reduction order is free), s = amax / 127 (1 for an all-zero row), q = clamp(rint(x / s), -127, 127) with
+// IEEE division; s goes to SA[row] (one fp32 per row, a part's SA is 256 floats). The bytes are stored straight into the
+// A8 fragment layout, one 8-byte segment per (k-tile, half): no two threads share a byte, no atomics.
+// `red`: at least 8 floats of workgroup shared memory. Begins after the caller's barrier (xl must be complete) and ends
+// with one, so xl and red can be reused right after the call.
+__device__ __forceinline__ void i8g_quant_row_wg(const unsigned short* xl, int K, int row, signed char* __restrict__ A8,
+                                                 float* __restrict__ SA, float* red) {
+  const int tid = (int)threadIdx.x;
+  float amax = 0.f;
+  for (int i = tid; i < (K >> 1); i += 256) {
+    const unsigned p = ((const unsigned*)xl)[i];
+    const float a = (float)__builtin_bit_cast(_Float16, (unsigned short)(p & 0xFFFFu));
+    const float b = (float)__builtin_bit_cast(_Float16, (unsigned short)(p >> 16));
+    amax = __builtin_fmaxf(amax, __builtin_fmaxf(__builtin_fabsf(a), __builtin_fabsf(b)));
+  }
+#pragma unroll
+  for (int m = 16; m >= 1; m >>= 1) amax = __builtin_fmaxf(amax, __shfl_xor(amax, m, 32));
+  if ((tid & 31) == 0) red[tid >> 5] = amax;
+  __syncthreads();
+  float mx = red[0];
+#pragma unroll
+  for (int w = 1; w < 8; ++w) mx = __builtin_fmaxf(mx, red[w]);
+  const float s = mx > 0.f ? mx / 127.0f : 1.0f;
+  if (tid == 0) SA[row] = s;
+  const int KT = K >> 4;
+  // segment sg = 2 kt + h holds, as bytes e = 0..7, k = 16 kt + 8 (e >> 2) + 4 h + (e & 3) (i8p::FragK16): two runs of four
+  // consecutive f16 (8 bytes each) at 16 kt + 4 h and 16 kt + 8 + 4 h
+  for (int sg = tid; sg < (K >> 3); sg += 256) {
+    const int kt = sg >> 1, h = sg & 1;
+    unsigned long long out = 0;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const unsigned long long raw = *(const unsigned long long*)(xl + kt * 16 + 8 * half + 4 * h);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float v = (float)__builtin_bit_cast(_Float16, (unsigned short)((raw >> (16 * j)) & 0xFFFFull));
+        float q = __builtin_rintf(v / s);
+        q = __builtin_fminf(__builtin_fmaxf(q, -127.f), 127.f);
+        out |= (unsigned long long)((unsigned)(int)q & 0xFFu) << (8 * (4 * half + j));
+      }
+    }
+    *(unsigned long long*)(A8 + i8p::A8FragOffset(row >> 6, kt, (row >> 4) & 3, (row & 15) + 16 * h, KT)) = out;
+  }
+  __syncthreads();
+}

@@ -697,12 +697,12 @@ void Container::BuildTrellisWScales(int mode, hipStream_t stream) {
   ForEachLinear([&](QuantLinear& q) { BuildTrellisWScale(q, mode, stream); });
 }
 
-int Container::BuildTrellisI8Scales(hipStream_t stream, int* trellis_total) {
+int Container::BuildTrellisI8Scales(hipStream_t stream, int* trellis_total, bool coarse) {
   int built = 0, total = 0;
   ForEachLinear([&](QuantLinear& q) {
     if (q.layout != Layout::kTrellis) return;
     ++total;
-    if (BuildTrellisI8Scale(q, stream)) ++built;
+    if (BuildTrellisI8Scale(q, stream, coarse)) ++built;
   });
   if (trellis_total != nullptr) *trellis_total = total;
   return built;

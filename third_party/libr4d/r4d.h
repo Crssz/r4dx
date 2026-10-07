@@ -416,6 +416,28 @@ void r4d_gemm_trellis_nt_i8(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa
 const char* r4d_gemm_trellis_nt_i8_check(int M, int K, int N, int n_split, int KB, int skw, int skg);
 size_t r4d_gemm_trellis_nt_i8_ws_bytes(int M, int N, int SKG);   // SKG * M * N * 4
 
+// The COARSE-scale sibling (R4DX_PREFILL_INT8_SCALES=coarse; docs/int8-prefill.md "Coarse scales"): the same GEMM with ONE
+// activation scale per ROW (amax over the whole K) and ONE weight scale per output COLUMN (amax over the whole K), so
+// the int32 accumulator needs no per-128 rescale: it runs over the whole K slice and is multiplied once by
+// sa[row] * sw[col] before the shared epilogue. The same quantizers (s = amax / 127, 1 for an all-zero group; the
+// weight's f16 rs rule), only the group is wider, so it is a different, a bit coarser, quantized model than the per-128
+// one, NOT bit-identical to it (KL budget in docs/int8-prefill.md). Layouts: A8 as above; SA [256] fp32 per A part;
+// the weight table SWC [N] fp32 (r4d_trellis_i8_wscale_col_count floats, s_eff = 1 / rs as in SW).
+//   r4d_trellis_i8_quant_act_row(x, a8, sa, parts, part_stride, K, stream): r4d_trellis_i8_quant_act's contract with
+//       the row-wide scale: part p's SA at sa + p * 256 floats (a8 as before: a8 + p * 256 K bytes).
+//   r4d_trellis_i8_wscale_col(w, swc, K, N, KB, stream) / r4d_trellis_i8_dump_w_col: wscale / dump_w for the coarse table.
+//   r4d_gemm_trellis_nt_i8c(...): r4d_gemm_trellis_nt_i8's contract and legality (r4d_gemm_trellis_nt_i8_check, ws, tickets,
+//       n_split), reading SA [256] and SWC [N]. A row's result depends on (skw, skg) and the weights only. Every int32
+//       partial sum is a slice of K (at most K x 127 x 127 = 2.8e8 for K = 17408, below 2^31).
+size_t r4d_trellis_i8_wscale_col_count(int K, int N);   // N
+void   r4d_trellis_i8_wscale_col(int64_t w, int64_t swc, int K, int N, int KB, int64_t stream);
+void   r4d_trellis_i8_dump_w_col(int64_t w, int64_t swc, int64_t w8, int64_t wp, int K, int N, int KB, int64_t stream);
+void   r4d_trellis_i8_quant_act_row(int64_t x, int64_t a8, int64_t sa, int parts, int64_t part_stride, int K,
+                                    int64_t stream);
+void r4d_gemm_trellis_nt_i8c(int64_t a8_0, int64_t sa_0, int64_t a8_1, int64_t sa_1, int n_split, int64_t w,
+                             int64_t swc, int64_t svh, int64_t c, int64_t ws, int64_t tickets, int M, int K, int N,
+                             int KB, int skw, int skg, float out_scale, int64_t stream);
+
 // ---- registry ------------------------------------------------------------------------------
 // Every kernel in the library, with the constraints its name encodes spelled out. A caller that
 // wants to know whether R4D covers a model can read this instead of hardcoding what it remembers.

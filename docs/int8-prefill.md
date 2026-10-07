@@ -413,6 +413,12 @@ quantized model of the f16 rows (KL numbers in Results), and the KV bytes of a p
 the prefix-cache state (a prefix-reuse suffix anchors its own grid). Load line: `prefill int8: ON (default): ...`, or
 `off (default is on, not used: <reason>)`, or `off (R4DX_PREFILL_INT8=0: ...)`.
 
+The reference side of an accuracy experiment moves with the default: the "unquantized" run of an `R4DX_FAKEQ_ACT/W`
+comparison (FAKEQ unset) is now an int8-prefill run, and a prefill A/B against recorded f16 dumps (`kl_rung4`'s long-prefix
+modes, `run_kl.ps1`, `ttft_cli.ps1`) is only an f16 reference with `$env:R4DX_PREFILL_INT8 = '0'; $env:R4DX_PREFILL_SPLITKV =
+'exact'` set by the caller. `kl_rung4.ps1` with its default arguments is unaffected: it feeds ids[1..] through `DecodeStep`
+after a one-token `Prefill` (a one-row tail: no super-chunk, and the decode kernel), so neither default reaches it.
+
 Tests: the f16 identity tests pin `prefill_int8 = 0` per `Load` (`test_prefill_chunk_identity`, which also pins
 `R4DX_PREFILL_SPLITKV=exact` unless the environment says otherwise), `test_prefill_int8` loads off / on / **default (-1)**,
 `tp1_identity.ps1` pins both knobs and `gdn256_check.ps1` pins them unless run with `-Defaults`. One test expectation was wrong

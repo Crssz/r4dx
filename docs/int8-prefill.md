@@ -2,8 +2,7 @@
 
 Status (2026-10-07, branch `int8q`): the activation switch `R4DX_FAKEQ_ACT` is written, its CPU tests pass and
 its GPU runs are in the results below. The weight switch `R4DX_FAKEQ_W` (section "The weight side") is written,
-built and its CPU tests pass; its kernels and their bit-test are built and NOT run (CPU-only session), and its
-GPU runs are PENDING (the commands and an empty results table are in that section).
+built and its CPU tests pass; its GPU bit-test and KL runs are in that section's results.
 
 Update (2026-10-07, branch `int8prefill`): the two switches above are accuracy EXPERIMENTS (they round, then run the f16
 GEMM). The bench-only int8 GEMM prototype (docs/int8-gemm-proto.md) measured 1.46x (KB4) and 1.34x (KB5) on the

@@ -15,8 +15,25 @@ the DEFAULT (the user approved giving up "prefill is bit-identical", September).
 `=0`; docs/int8-prefill.md "Now the default"); `R4DX_PREFILL_SPLITKV` unset = split-KV from 2048 tokens of context,
 exact-wide below (kill switch `=exact`, or `=0` for the plain launch; `R4DX_PREFILL_SPLITKV_MIN` moves the depth;
 docs/prefill.md "Split threshold"). Measured on the branches before the merge (cold TTFT, one at a time): int8 8k -18.9%,
-32k -15.7%; split-KV 8k 4.66 -> 4.56 s, 32k 22.81 -> 19.73 s, 64k 56.89 -> 43.52 s. The merged build's own TTFT numbers
-are PENDING (the README table has the placeholders). Decode is untouched by both switches (prompt prefill only).
+32k -15.7%; split-KV 8k 4.66 -> 4.56 s, 32k 22.81 -> 19.73 s, 64k 56.89 -> 43.52 s. Decode is untouched by both
+switches (prompt prefill only).
+
+**Measured on the merged build** (2026-10-07, ROCm 10.1.0, HIP device 1, logs `E:\models\r4dx\fast\`):
+
+| | 8k | 32k | 64k |
+|---|--:|--:|--:|
+| cold TTFT, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`) | 4.658 / 4.654 s | 22.735 / 22.716 s | 56.476 / 56.460 s |
+| cold TTFT, defaults | 3.627 / 3.632 s | 15.999 / 15.960 s | 36.010 / 35.967 s |
+| gain | -22.0 % | -29.7 % | -36.3 % |
+
+- KL(kill switches || defaults): canon corpus mean 0.0011 (top-1 agreement 98.83 %); 8k mean 0.0015; 32k mean 0.0161, of
+  which code_32k 0.0456 (median 0.0010, max 6.99, ppl 4.158 -> 4.662 on its 256 scored rows), prose_32k 0.0023,
+  recall_32k 0.0003. code_32k is the number to watch: int8 alone gave 0.029 there, a chunk-boundary shift alone 0.048.
+- Long-context tasks (tools\prefill\run_tasks.ps1, 8k/32k, 112 items): kill switches 100.0 / 97.5, defaults 100.0 / 98.2
+  (vt-32k-00 0.8 -> 1.0, vt-32k-04 0.4 -> 0.6); 100 of 112 outputs identical.
+- Gates: GPU unit tests 12/12 (incl. test_prefill_int8 and the first test_prefill_chunk_identity_defaults run);
+  kl_rung4 byte-identical to `rocm1010\kl`; validate_dflash 3/3, validate_spec_sampling -Quick 24/24, validate_fusion 6/6;
+  gdn256_check -Defaults ALL PASS, greedy text hashes unchanged at 8k and 32k.
 
 ## Decode step: bit-exact launch and host-edge cuts (2026-10-08, branch `decode-t1`)
 

@@ -41,16 +41,18 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 |---|---|
 | Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70% |
 | Weights | about 17 GiB (+0.7 GiB of int8 weight scale tables for the default int8 prefill; `R4DX_PREFILL_INT8=0` skips them) |
-| Decode, plain | 36.7 tok/s |
-| Decode, DFlash2 `k=7` | 108 tok/s |
+| Decode, plain | 37.4 tok/s |
+| Decode, DFlash2 `k=7` | 116 tok/s |
 | Prefill, short prompts | about 1130 tok/s |
-| Cold prefill (time to first token), defaults (int8 prefill GEMM + split-KV attention) | PENDING s at 8k, PENDING s at 32k, PENDING s at 64k tokens (HIP device 1; to be measured on the `fast` branch build by `tools\prefill\ttft_cli.ps1`) |
-| Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.7 s at 8k, 23.0 s at 32k tokens (256-row chunks, HIP device 1, ROCm 10.1.0, 2026-10-07; 7.0 s and 32.3 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
+| Cold prefill (time to first token), defaults (int8 prefill GEMM + split-KV attention) | 3.63 s at 8k (2230 tok/s), 16.0 s at 32k (2050 tok/s), 36.0 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-07, 2 runs each) |
+| Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.66 s at 8k, 22.7 s at 32k, 56.5 s at 64k tokens (same session, interleaved with the row above; 7.0 s and 32.3 s at 8k/32k with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
-Measured on the branches before they were merged (2026-10-07, same machine, one at a time): int8 prefill GEMM alone
--18.9% TTFT at 8k and -15.7% at 32k; split-KV attention from 2048 tokens alone 4.66 -> 4.56 s at 8k, 22.81 ->
-19.73 s at 32k, 56.89 -> 43.52 s at 64k. The decode cuts merged with them (bit-exact; docs/perf.md "decode-t1")
-measured +2.3% plain and +4.7% DFlash2 `k=7`; the decode rows above are the numbers from before that merge (PENDING re-measure).
+The defaults are 22% (8k), 30% (32k) and 36% (64k) faster than the kill switches. They are not bit-identical to them:
+against the f16/exact path, mean KL 0.0011 on the canon corpus, 0.0015 at 8k and 0.016 at 32k (dominated by the
+code_32k segment, 0.046, inside the rounding-class spread measured for that segment in docs/prefill.md); greedy text
+at 8k and 32k is unchanged, and the 8k/32k long-context task set (7 tasks x 8 items x 2 lengths) scores 100.0 / 98.2
+against 100.0 / 97.5 with the kill switches (100 of 112 outputs identical). Decode is bit-identical to before (the
+bit-exact decode cuts, docs/perf.md "decode-t1", measured +2.3% plain and +4.7% DFlash2 `k=7` on their branch).
 
 With `--tp 2` on two R9700s (same container, measured 2026-09-30 against a single-card baseline from the
 same session), plain decode reaches 60.1 tok/s (1.70x one card), DFlash2 `k=7` 162 tok/s (1.58x) and

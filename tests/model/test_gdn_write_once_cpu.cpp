@@ -10,9 +10,12 @@
 //      the next launch's seed, GdnPendingBook deciding when) must leave bitwise the same outputs and the
 //      same logical state after EVERY event: verify (T = 1, 2, 5, 8) + commit n for every n, plain decode,
 //      a collapse (the prefill / digest flush), chains of all of them from random scripts;
-//   4. the latent bug the design found: two bare VerifyWindow calls with no commit between, after a round that
-//      committed n > 1. The window-slot path re-reads a slot its first call overwrote and gives different
-//      rows; the write-once path gives the same rows (and this test pins both);
+//   4. the latent bug the design found, in the GDN recurrent state alone (the emulation has no conv history):
+//      two bare VerifyWindow calls with no commit between, after a round that committed n > 1. The window-slot
+//      path re-reads a slot its first call overwrote and gives different rows; the write-once path seeds both
+//      calls from the committed state (this test pins both). At MODEL level the second call's rows still differ
+//      from the first's in both modes -- the conv history is a rolling buffer each call rewrites -- so
+//      test_gdn_write_once_model checks the committed recurrent state, not the second call's logits;
 //   5. the arithmetic contract: the replay's two roundings per element are the main loop's -- a replay with an
 //      fma (the design's first draft, __fmaf_rn) is NOT bit-identical (negative control), which is why
 //      libr4d's unit is built with -ffp-contract=off and pins it again in the write-once section.
@@ -418,7 +421,7 @@ void TestBareVerify() {
     wo_same = wo_same && Same(w1[i], w2[i]);
   }
   Check(!legacy_same, "the window-slot path's second bare verify re-reads a slot its first call overwrote (the latent bug)");
-  Check(wo_same, "the write-once path's second bare verify seeds from the committed state: same rows as the first");
+  Check(wo_same, "the write-once path's second bare verify seeds from the committed state: same rows as the first (recurrent state only)");
   // and the committed state survived both bare calls
   CheckEqualOuts(w1, wo.Verify(w), "third bare verify", 2);
   std::printf("[ok] bare double verify: window-slot path differs between calls (bug pinned), write-once path idempotent\n");

@@ -1832,6 +1832,7 @@ void Model::CollapseSpeculativeWindow() {
     // as h0). The conv half is the window-slot path's own shift, under its own condition: it depends on the
     // acceptance count the conv kernel last read, which a bare (uncommitted) verify leaves behind too.
     FlushGdnPending();
+    gdn_book_.Clear();  // also drops the last verify's row count (an uncommitted verify leaves it behind)
     if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
       for (auto& gs : gdn_states_) {
         if (gs) gs->ShiftConv(0, mtp_last_committed_, stream_);

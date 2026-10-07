@@ -306,6 +306,13 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
       //                             transition; every later plain step has nothing pending)
       //   T  > 1                  : log the rows (no state store), replaying the pending prefix first and
       //                             writing it back into B; the next ping-pong half takes the log
+      // The log's key rows are sized from the manager's own key-head count (derived from its conv_dim); a layer
+      // whose head geometry disagrees would index the log out of range.
+      if (states.KeyHeads() != Hg) {
+        throw std::runtime_error("GdnLayer::Forward: write-once state sized for " +
+                                 std::to_string(states.KeyHeads()) + " key heads, this layer has " +
+                                 std::to_string(Hg));
+      }
       if (T == 1 && p.gdn_pending == nullptr) {
         ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
           core::r4d::GdnRecurrentUpdate(

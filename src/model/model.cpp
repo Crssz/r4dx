@@ -19,6 +19,7 @@
 #endif
 
 #include "attn_config.h"
+#include "chunk_run.h"  // Model::ChunkRun: RunChunk's three phases (docs/pp-prefill.md)
 #include "debug_probe.h"
 #include "dflash_draft_weights.h"
 #include "embedding.h"
@@ -760,6 +761,21 @@ Model Model::Load(const ModelOptions& opts) {
   // neither is set.
   if (!is_tp_rank) m.probe_ = DebugProbe::Get();
 
+  // Pipeline-parallel prefill, emulated on this device (docs/pp-prefill.md; ModelOptions::pp_emulate_split /
+  // R4DX_PP_EMULATE=<k>): off unless asked for, and nothing at all happens here then.
+  if (const int64_t split = PpEmulateRequest(opts.pp_emulate_split); split > 0) {
+    if (is_tp_rank) {
+      throw std::invalid_argument("Model::Load: pp_emulate_split / R4DX_PP_EMULATE is a TP=1 mode (the pipeline "
+                                  "replaces the tensor-parallel split; docs/pp-prefill.md)");
+    }
+    PpEmulateConfig pp;
+    pp.split = split;
+    m.SetPpEmulate(pp);
+    std::cerr << "[r4dx::model::Model] PP-emulate: every prompt-prefill chunk runs as layers [0, " << split
+              << ") then [" << split << ", " << m.container_.NumLoadedLayers()
+              << ") with the carry copied through host staging (R4DX_PP_EMULATE; diagnostic mode, not a speedup)\n";
+  }
+
   return m;
 }
 
@@ -1041,8 +1057,26 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     comm_->CheckHealthy();
   }
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h): this call's GPU span, its clock probes
-  // and linear spans; inert (probe_ null) otherwise.
-  ProbeScope probe_call(probe_, stream_.get(), is_prefill_path ? "prefill" : "decode", T);
+  // and linear spans (ChunkRun::probe_call); inert (probe_ null) otherwise.
+  ChunkRun r(*this, token_ids, is_prefill_path, want_logits, greedy_token_out, summary_out, overlap, T, wide);
+  // PP-emulate (SetPpEmulate, docs/pp-prefill.md): a prompt-prefill chunk runs as stage A = layers [0, split)
+  // and stage B = [split, num_layers) with the carry copied through host staging in between. Off (split == 0)
+  // by default, and never for a decode step: then this is exactly one RunLayerRange over every layer.
+  const int64_t pp_split = is_prefill_path ? pp_emulate_.split : 0;
+  if (pp_split > 0) return RunChunkPpEmulated(r, pp_split);
+  ChunkPrologue(r);
+  RunLayerRange(r, 0, r.num_layers);
+  return ChunkEpilogue(r);
+}
+
+// RunChunk's first phase (docs/pp-prefill.md 1.1): everything up to the first layer -- the id / meta upload, the
+// embedding gather, the image splice, the stack-entry rotation, the per-chunk device arrays, the scopes the
+// layers run under and the layer-to-layer carry's initial state. Pure code motion out of RunChunk.
+void Model::ChunkPrologue(ChunkRun& r) {
+  const std::vector<int32_t>& token_ids = r.token_ids;
+  const bool is_prefill_path = r.is_prefill_path;
+  const int64_t T = r.T;
+  const bool wide = r.wide;
   const ModelConfig& cfg = container_.Config();
   const int64_t hidden = cfg.hidden_size;
   const int64_t num_layers = container_.NumLoadedLayers();
@@ -1123,29 +1157,30 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // been spliced into this conversation, which is what keeps a text-only run byte-identical.
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);
   // The M = 256 trellis GEMM is reachable from ApplyLinear only inside a super-chunk's layers.
-  const ScopedTrellisM256 trellis_m256_scope(wide);
+  r.trellis_m256_scope.emplace(wide);
   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): the int8 x int8 GEMM for the trellis linears of a
   // super-chunk of a Prefill() call of a Model that uses it -- and nowhere else (a 64-row chunk or tail, decode, a
   // verify window, PrefillMultimodal's image chunks all see the f16 kernels).
   const bool i8_chunk = wide && prefill_int8_call_;
-  const ScopedTrellisI8 trellis_i8_scope(i8_chunk);
+  r.trellis_i8_scope.emplace(i8_chunk);
   if (i8_chunk) ++i8_chunks_run_;
   // R4DX_FAKEQ_ACT (docs/int8-prefill.md): int8-rounded trellis A in the layers of a prompt-prefill chunk
   // (any row count, tails included) and nowhere else -- not decode, and ended below before the MTP head's
   // priming, the DFlash drafter's injection and the lm_head. Mode 0 (unset) touches nothing.
-  ScopedFakeQuantAct fakeq_scope(is_prefill_path ? FakeQuantActRequest() : kFakeQuantOff);
-  ScopedFakeQuantW fakeqw_scope(is_prefill_path ? FakeQuantWRequest() : kFakeQuantWOff);  // R4DX_FAKEQ_W
+  r.fakeq_scope.emplace(is_prefill_path ? FakeQuantActRequest() : kFakeQuantOff);
+  r.fakeqw_scope.emplace(is_prefill_path ? FakeQuantWRequest() : kFakeQuantWOff);  // R4DX_FAKEQ_W
   if (wide) ++wide_chunks_run_;
 
-  uint16_t* cur = buf_a_.data();
-  uint16_t* other = buf_b_.data();
+  r.cur = buf_a_.data();
+  r.other = buf_b_.data();
   // R3 fusion (docs/r9700.md): null for layer 0 (no previous Mlp to have fused its rmsnorm), then
   // set to buf_normed_.data() by every layer's own Mlp::Forward call below for i+1 to consume.
-  const uint16_t* normed_in = nullptr;
+  r.normed_in = nullptr;
   // R2/P2 (docs/r9700.md): companion to normed_in above -- r4dx_epilogue_none for layer 0 (nothing
   // to reuse yet), then body_epilogue_ once a Mlp::Forward call below has fused an epilogue into
   // buf_normed_pre_ for layer i+1 to consume (mirrors normed_in's own carry-forward exactly).
-  int normed_in_epilogue = r4dx_epilogue_none;
+  r.normed_in_epilogue = r4dx_epilogue_none;
+
   // Tensor parallel: bounded submission of a prefill chunk (docs/tp.md Appendix B N57). A 64-row
   // chunk is ~41 ms at 2k context and several hundred ms near 262k, and the runtime submits it only
   // every 129 commands (N56); on device 0, which cannot preempt compute, the desktop waits behind
@@ -1163,9 +1198,45 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   if (bounded && T > max_chunk_) unit_layers = std::max<int64_t>(1, unit_layers * max_chunk_ / T);
   if (bounded) submit_.Reset();
   // quant2 Q2b (docs/quant2.md section 4): all nullptr unless the container is q2ab.
-  const BackboneHadSigns had = HadSigns();
+  r.had = HadSigns();
 
-  for (int64_t i = 0; i < num_layers; ++i) {
+  r.hidden = hidden;
+  r.num_layers = num_layers;
+  r.has_init = has_init;
+  r.dflash_capture_active = dflash_capture_active;
+  r.positions_dev = positions_dev;
+  r.seqused_dev = seqused_dev;
+  r.rope_pos3 = rope_pos3;
+  r.bounded = bounded;
+  r.unit_layers = unit_layers;
+}
+
+// RunChunk's layer loop over layers [first, last) (docs/pp-prefill.md 1.1). `r.cur` / `r.normed_in` /
+// `r.normed_in_epilogue` are the carry in and out: a range that starts at layer 0 begins from the prologue's
+// state, a later one from whatever the earlier range (or, in the pipeline, the previous stage's import) left.
+// The last layer of a range that is not the stack's last still fuses the NEXT layer's input rmsnorm into its
+// Mlp (has_next_layer is a property of the whole stack), exactly as in the monolithic run. Pure code motion.
+void Model::RunLayerRange(ChunkRun& r, int64_t first, int64_t last) {
+  const bool is_prefill_path = r.is_prefill_path;
+  const int64_t T = r.T;
+  const bool wide = r.wide;
+  const ModelConfig& cfg = container_.Config();
+  const int64_t hidden = r.hidden;
+  const int64_t num_layers = r.num_layers;
+  const bool has_init = r.has_init;
+  const bool dflash_capture_active = r.dflash_capture_active;
+  const int32_t* positions_dev = r.positions_dev;
+  const int32_t* seqused_dev = r.seqused_dev;
+  const int32_t* rope_pos3 = r.rope_pos3;
+  const bool bounded = r.bounded;
+  const int64_t unit_layers = r.unit_layers;
+  const BackboneHadSigns had = r.had;
+  uint16_t* cur = r.cur;
+  uint16_t* other = r.other;
+  const uint16_t* normed_in = r.normed_in;
+  int normed_in_epilogue = r.normed_in_epilogue;
+
+  for (int64_t i = first; i < last; ++i) {
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
     if (bounded && i > 0 && i % unit_layers == 0) submit_.EndUnit(stream_.get());
@@ -1259,10 +1330,35 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     if (probe_ != nullptr) probe_->AfterMlp(stream_.get());
 
     arena_.Reset();
+    if (r.poison_arena_layers) PoisonArena();  // PP-emulate test control (PpEmulateConfig::poison_arena == 2)
   }
+  r.cur = cur;
+  r.other = other;
+  r.normed_in = normed_in;
+  r.normed_in_epilogue = normed_in_epilogue;
+}
+
+// RunChunk's last phase (docs/pp-prefill.md 1.1): everything after the last layer -- the stack-exit rotation,
+// the MTP head's KV priming, final norm + lm_head, the stream synchronize and logits readback, the DFlash
+// injection, pos_ += T. Pure code motion out of RunChunk.
+std::vector<float> Model::ChunkEpilogue(ChunkRun& r) {
+  const std::vector<int32_t>& token_ids = r.token_ids;
+  const bool is_prefill_path = r.is_prefill_path;
+  const bool want_logits = r.want_logits;
+  int32_t* const greedy_token_out = r.greedy_token_out;
+  const SummaryRequest* const summary_out = r.summary_out;
+  const std::function<void()>* const overlap = r.overlap;
+  const int64_t T = r.T;
+  const bool wide = r.wide;
+  const ModelConfig& cfg = container_.Config();
+  const int64_t hidden = r.hidden;
+  const bool dflash_capture_active = r.dflash_capture_active;
+  ProbeScope& probe_call = r.probe_call;
+  uint16_t* cur = r.cur;
+
   if (probe_ != nullptr) probe_->SetLayer(-1);
-  fakeq_scope.End();
-  fakeqw_scope.End();
+  r.fakeq_scope->End();
+  r.fakeqw_scope->End();
   // quant2 stack exit (docs/quant2.md section 3.1): x <- x Q^T on ALL T rows, right after the last
   // layer (whose Mlp did a plain residual add -- next_norm_weight is null for it, so no fused
   // residual+rmsnorm straddles this point) and before every reader of the pre-final-norm residual
@@ -1356,6 +1452,11 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     mtp_seed_valid_ = true;
     arena_.Reset();
     probe_prime.End();
+    if (r.timing) {  // PP-emulate timing: the priming's own cost, behind a synchronize
+      const auto t0 = std::chrono::steady_clock::now();
+      stream_.Synchronize();
+      r.mtp_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
   }
 
   // Prefill discards every chunk's logits except the last (Prefill() below only keeps the final
@@ -1537,6 +1638,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   if (dflash_capture_active && (dflash_observer_ || dflash_.has_value())) {
     const int64_t feat_slice = wide ? max_chunk_ : T;
     const int64_t feat_cols = static_cast<int64_t>(dflash_target_layers_.size()) * hidden;
+    const auto inject_t0 = std::chrono::steady_clock::now();  // PP-emulate timing (ChunkRun::timing)
     for (int64_t row0 = 0; row0 < T; row0 += feat_slice) {
       const int64_t S = std::min(feat_slice, T - row0);
       const uint16_t* slice_features = dflash_features_dev_.data() + row0 * feat_cols;
@@ -1585,6 +1687,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       // pinned host array (ipos_host_) that the next slice's call would overwrite before the first
       // one's async H2D ran, exactly the race the 64-row run avoids by syncing between chunks.
       stream_.Synchronize();
+    }
+    if (r.timing) {
+      r.inject_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - inject_t0).count();
     }
   }
   // The stream is idle here on every path: read the probe's stamps back (debug_probe.h).
@@ -3093,6 +3198,17 @@ void Model::MtpDebugLastDraft(std::vector<float>* rows, std::vector<int32_t>* to
 void Model::DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>* unary) const {
   if (!dflash_.has_value()) throw std::runtime_error("Model::DflashDebugLastTop16: requires DflashEnabled()");
   dflash_->DebugLastTop16(cand, unary);
+}
+
+void Model::DebugZeroKvState() {
+  stream_.Synchronize();
+  for (auto& kv : kv_caches_) {
+    if (kv) {
+      R4DX_HIP_CHECK(hipMemset(kv->Data(), 0,
+                               static_cast<size_t>(kv->MaxBlocks()) * static_cast<size_t>(kv->KvBlockStride())));
+    }
+  }
+  if (mtp_) mtp_->DebugZeroKv(stream_);
 }
 
 std::vector<std::pair<std::string, uint64_t>> Model::DebugStateDigest() {

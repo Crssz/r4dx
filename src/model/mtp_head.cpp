@@ -426,6 +426,12 @@ uint64_t MtpHead::DebugKvDigest(core::Stream& stream) {
   return DigestDeviceBytes(kv_.Data(), static_cast<size_t>(kv_.MaxBlocks()) *
                                             static_cast<size_t>(kv_.KvBlockStride()));
 }
+
+void MtpHead::DebugZeroKv(core::Stream& stream) {
+  stream.Synchronize();
+  R4DX_HIP_CHECK(hipMemset(kv_.Data(), 0,
+                           static_cast<size_t>(kv_.MaxBlocks()) * static_cast<size_t>(kv_.KvBlockStride())));
+}
 #endif
 
 }  // namespace r4dx::model

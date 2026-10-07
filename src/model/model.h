@@ -219,6 +219,12 @@ struct ModelOptions {
   // (default) follows the environment (unset / 1 / on = on, the default; 0 / off = f16 at TP = 2); 0 and 1 force it. Only matters at tp.world > 1 with the
   // int8 GEMM on; 0 keeps a TP = 2 Model byte-identical to one built before the option existed (no scale table, no scope).
   int prefill_int8_tp2 = -1;
+  // Pipeline-parallel prefill, emulated on this device (docs/pp-prefill.md; Model::SetPpEmulate): -1 (default)
+  // follows the environment (R4DX_PP_EMULATE=<k>: unset / 0 / off = off, the default), 0 forces it off, k > 0 runs
+  // every prompt-prefill chunk as stage A = layers [0, k) and stage B = [k, NumLoadedLayers()) with the inter-stage
+  // carry copied through host staging, on this one device. A diagnostic and test mode (the bytes equal the
+  // monolithic run's); not for TP ranks or rotated containers.
+  int pp_emulate_split = -1;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -789,6 +795,11 @@ class Model {
   // Synchronizes the stream and copies everything to the host, so it is a test tool: the byte-identity
   // check that two prefill chunkings left the same state (tests/model/test_prefill_chunk_identity.cpp).
   std::vector<std::pair<std::string, uint64_t>> DebugStateDigest();
+  // Zeroes every attention KV cache and the MTP head's KV cache (Reset() leaves them stale on purpose: every write
+  // lands before any read), so DebugStateDigest -- which covers the whole caches -- no longer depends on what an
+  // earlier scenario left behind. Call right after Reset(); the device must be idle (it synchronizes).
+  // tests/model/test_pp_emulate_identity.cpp compares two runs on ONE Model, which needs exactly that.
+  void DebugZeroKvState();
 #endif
   // 256 when this Model runs 256-row prefill super-chunks (buffers sized for them at load), else 64.
   int PrefillChunkRows() const { return wide_rows_ > 0 ? kPrefillChunkWide : kPrefillChunkBase; }
@@ -800,6 +811,47 @@ class Model {
   // not a fallback, produced a result; PrefillWideChunksRun counts every super-chunk, these a subset).
   bool PrefillInt8Enabled() const { return prefill_int8_; }
   int64_t PrefillInt8ChunksRun() const { return i8_chunks_run_; }
+
+  // ---- pipeline-parallel prefill, emulated on this device (docs/pp-prefill.md) --------------------------
+  // RunChunk is three phases (ChunkPrologue, RunLayerRange, ChunkEpilogue); in this mode every prompt-prefill
+  // chunk (a 256-row super-chunk or a 64-row chunk; never a decode step or verify window) runs as stage A =
+  // layers [0, split) and stage B = [split, NumLoadedLayers()) with the inter-stage carry -- the residual
+  // stream, the fused-norm buffers (buf_normed_, buf_normed_pre_), the DFlash feature columns stage A
+  // captured, and the KV rows its attention layers wrote -- copied through pinned host staging between them:
+  // exactly what the two-GPU pipeline will do over PCIe, on one device. The destinations are poisoned first, so
+  // a byte that is not carried shows up. The result must equal the monolithic run's bit for bit
+  // (tests/model/test_pp_emulate_identity.cpp). Not on a tensor-parallel rank or a rotated (quant2) container.
+  struct PpEmulateConfig {
+    int64_t split = 0;  // 0 = off (the default); else 1 .. NumLoadedLayers() - 1
+    // Record PpChunkTimes for every emulated chunk. Adds stream synchronizes (after stage B's layers and after
+    // the MTP priming) so the stages are timed apart; the bytes are unchanged.
+    bool timing = false;
+    // Fill the activation arena with 0xFF (NaN in every float format here) at the stage boundary (1) or after
+    // every layer's scratch release (2): a kernel that reads scratch it did not write sees a different history
+    // on the second device, so it must not change a byte.
+    int poison_arena = 0;
+    // Negative controls (the identity test requires each of these to FAIL the comparison): import the residual
+    // stream one byte off, drop the fused-norm buffer, drop the KV rows, drop the DFlash columns.
+    enum class Fault { kNone, kShiftCurOneByte, kSkipNormed, kSkipKv, kSkipDflash };
+    Fault fault = Fault::kNone;
+  };
+  // The device must be idle (between calls). Throws std::invalid_argument for a split outside
+  // [1, NumLoadedLayers() - 1], a tensor-parallel rank, or a rotated container; split 0 turns it off.
+  void SetPpEmulate(const PpEmulateConfig& config);
+  const PpEmulateConfig& PpEmulate() const { return pp_emulate_; }
+  // How many chunks ran through the two-stage path since Load (tests: proof it, not the monolithic run, ran).
+  int64_t PpEmulatedChunksRun() const { return pp_emulated_chunks_; }
+  // One emulated chunk's host-measured stage times (PpEmulateConfig::timing), ms: stage A = the prologue (ids,
+  // embedding gather, ...) + layers [0, split); d2h / h2d the hop (the carry, DFlash columns and KV rows, with
+  // the poison fill in h2d); stage B = layers [split, N); epilogue = MTP priming, final norm + lm_head (last
+  // chunk), the synchronize and the DFlash injection, of which mtp / inject are the priming and the injection.
+  struct PpChunkTimes {
+    int64_t pos = 0, rows = 0;
+    double a_ms = 0, d2h_ms = 0, h2d_ms = 0, b_ms = 0, epilogue_ms = 0, mtp_ms = 0, inject_ms = 0;
+    int64_t hop_bytes = 0;  // carry + DFlash columns + KV bytes crossing the boundary (one direction)
+  };
+  const std::vector<PpChunkTimes>& PpChunkTimeLog() const { return pp_times_; }
+  void ClearPpChunkTimeLog() { pp_times_.clear(); }
 
  private:
   Model() = default;
@@ -831,6 +883,22 @@ class Model {
                                bool want_logits, int32_t* greedy_token_out = nullptr,
                                const SummaryRequest* summary_out = nullptr,
                                const std::function<void()>* overlap = nullptr);
+  // RunChunk's three phases (docs/pp-prefill.md 1.1; chunk_run.h): the monolithic call is ChunkPrologue, one
+  // RunLayerRange over every layer, ChunkEpilogue -- pure code motion, the same statements in the same order.
+  // ChunkRun carries what used to be RunChunk's locals between them.
+  struct ChunkRun;
+  void ChunkPrologue(ChunkRun& r);
+  void RunLayerRange(ChunkRun& r, int64_t first, int64_t last);
+  std::vector<float> ChunkEpilogue(ChunkRun& r);
+  // The PP-emulate composition (pp_stage.cpp): prologue, layers [0, split), the host hop, layers [split, N),
+  // epilogue.
+  std::vector<float> RunChunkPpEmulated(ChunkRun& r, int64_t split);
+  void PpEmulateHop(ChunkRun& r, int64_t split, PpChunkTimes* times);
+  // Fills the whole (just reset) activation arena with 0xFF on stream_ and resets it again.
+  void PoisonArena();
+  // ModelOptions::pp_emulate_split resolved against R4DX_PP_EMULATE: 0 = off, else the split layer. Throws on a
+  // value that is neither "0" / "off" nor a positive integer.
+  static int64_t PpEmulateRequest(int option);
 
   // decode-t1 item 5 (docs/perf.md), the host edge of a decode-sized call (T <= 64, TP=1, not a prefill
   // chunk), all off under R4DX_DECODE_LEGACY=host:
@@ -1087,6 +1155,13 @@ class Model {
   int64_t dflash_view_row0_ = 0;
   int64_t pos_ = 0;        // tokens already committed to KV/GDN state
   bool started_ = false;   // false only before the very first RunChunk call (GDN has_init gate)
+
+  // PP-emulate (SetPpEmulate): the mode, how many chunks went through it, its timing log and the pinned host
+  // staging the hop goes through (grown on demand; the device is idle whenever it is touched).
+  PpEmulateConfig pp_emulate_;
+  int64_t pp_emulated_chunks_ = 0;
+  std::vector<PpChunkTimes> pp_times_;
+  core::PinnedBuffer<uint8_t> pp_host_;
 
   // ---- prompt checkpoint (SaveCheckpoint); the GDN half lives in each GdnStateManager ------------
   bool prompt_checkpoint_ = false;  // ModelOptions::prompt_checkpoint, copied at Load()

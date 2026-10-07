@@ -128,6 +128,9 @@ set(R4DX_MODEL_SOURCES
   mtp_head.cpp
   dflash_draft.cpp
   model.cpp
+  # docs/pp-prefill.md: the PP-emulate composition of RunChunk's three phases (two layer ranges, the carry
+  # copied through host staging) -- Model member functions, split out of model.cpp.
+  pp_stage.cpp
   # docs/tp.md 2.8: the TextModel surface src/cli and src/server call -- LocalTextModel (TP=1, a
   # one-line forward per method onto Model) and TpModel (the tensor-parallel facade, 2.2-2.9).
   local_text_model.cpp

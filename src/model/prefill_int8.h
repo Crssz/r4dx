@@ -13,7 +13,7 @@
 //     (A quantized per (row, 128 k), the decoded weight per (column, 128 k), int32 WMMA, a per-128 fp32
 //     rescale; the f16 output transform after it). Everything else stays f16: tails of fewer than 256 rows
 //     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, MTP and DFlash 64-row slices, decode
-//     and verify windows, the vision tower, and PrefillMultimodal (image accuracy is unmeasured);
+//     and verify windows, the vision tower, and PrefillMultimodal with images (image accuracy is unmeasured; a text-only call with no image ever seen is a Prefill call);
 //   - anything else: a warning on stderr, then off (an unreadable request is read as "keep the old path").
 // It is a research-grade accuracy trade, not a bit-identical optimization: with it on, a super-chunk row is NOT
 // the row the 64-row path computes (docs/int8-prefill.md lists what that costs: the chunk-size identity of the

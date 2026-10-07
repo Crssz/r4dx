@@ -15,8 +15,10 @@
 //     per-sequence state DIFFERS from off (negative control: the digest sees the int8 rows -- if it did not, the
 //     comparisons above would prove nothing), the last row's logits stay close (KL(off || on) bounded, the top-1 token
 //     the same unless the f16 top two were within 0.25 of each other);
-//   * PrefillMultimodal (a text-only call through it) is f16 on a Model that has the switch on: the bytes equal off's and
-//     no int8 chunk is counted; a Prefill call after it runs int8 again (the per-call flag does not stick);
+//   * PrefillMultimodal with no image spans (and no image ever seen: mrope not active) delegates to Prefill, so on a Model
+//     that has the switch on it IS an int8 call: its bytes and counters equal a plain Prefill call's of the same ids
+//     (the image path, which never sets the per-call flag, needs a vision tower and is not reachable from this text-only
+//     test); the per-call flag does not stick (the call after it counts its own chunks);
 //   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
 //     (PrefillInt8Enabled() == false) and every byte equals off's.
 // SKIPs (77) for a container that is missing; an exception from a present one is a FAIL.
@@ -78,8 +80,7 @@ struct Scenario {
 int64_t ExpectedSuperChunks(const Scenario& sc) {
   int64_t n = 0;
   for (size_t i = 0; i < sc.calls.size(); ++i) {
-    if (sc.multimodal && i == 0) continue;   // PrefillMultimodal: super-chunks, but never int8
-    n += sc.calls[i] / 256;
+    n += sc.calls[i] / 256;   // a text-only PrefillMultimodal call is a Prefill call (it delegates), int8 included
   }
   return n;
 }
@@ -199,8 +200,9 @@ std::vector<Scenario> Scenarios() {
   s.push_back({"split300+333", {300, 333}, false});      // a suffix call anchors its own grid: two super-chunks
   s.push_back({"split257+1", {257, 1}, false});
   s.push_back({"split1+255+257", {1, 255, 257}, false});
-  s.push_back({"mm600", {600}, true});                   // text-only PrefillMultimodal: f16 even with the switch on
-  s.push_back({"mm300+Prefill300", {300, 300}, true});   // ... and the next Prefill call runs int8 again
+  s.push_back({"len600", {600}, false});
+  s.push_back({"mm600", {600}, true});                   // text-only PrefillMultimodal delegates to Prefill: same bytes as len600
+  s.push_back({"mm300+Prefill300", {300, 300}, true});   // ... and the next Prefill call counts its own chunks
   return s;
 }
 
@@ -287,17 +289,20 @@ int RunReal(const char* path) {
     }
     if (!ok) ++fails;
   }
-  // PrefillMultimodal is f16: its scenarios' bytes with the switch on equal off's (the second call of mm300+Prefill300 is
-  // an int8 Prefill call and is covered above)
+  // a text-only PrefillMultimodal call delegates to Prefill: on and off, its bytes equal a plain Prefill call's of the same ids
   {
-    const size_t i = static_cast<size_t>(std::find_if(scs.begin(), scs.end(), [](const Scenario& s) { return s.name == "mm600"; }) - scs.begin());
-    const size_t bad = CountDiff(off.obs[i].trace, on.obs[i].trace, "on vs off", "real/mm600", true);
-    if (bad != 0 || on.obs[i].i8_chunks != 0) {
-      std::fprintf(stderr, "FAIL real/mm600: PrefillMultimodal with the switch on differs from f16 in %zu observables (%lld int8 chunks)\n", bad,
-                   static_cast<long long>(on.obs[i].i8_chunks));
+    const auto find = [&](const char* name) {
+      return static_cast<size_t>(std::find_if(scs.begin(), scs.end(), [&](const Scenario& s) { return s.name == name; }) - scs.begin());
+    };
+    const size_t a = find("len600"), b = find("mm600");
+    const size_t bad_on = CountDiff(on.obs[a].trace, on.obs[b].trace, "mm600 vs len600 (on)", "real/mm600", true);
+    const size_t bad_off = CountDiff(off.obs[a].trace, off.obs[b].trace, "mm600 vs len600 (off)", "real/mm600", true);
+    if (bad_on != 0 || bad_off != 0 || on.obs[b].i8_chunks != on.obs[a].i8_chunks) {
+      std::fprintf(stderr, "FAIL real/mm600: text-only PrefillMultimodal differs from Prefill: %zu (on) / %zu (off) observables, %lld vs %lld int8 chunks\n",
+                   bad_on, bad_off, static_cast<long long>(on.obs[b].i8_chunks), static_cast<long long>(on.obs[a].i8_chunks));
       ++fails;
     } else {
-      std::fprintf(stderr, "[PASS] real/mm600: PrefillMultimodal is f16 with the switch on (bytes equal, no int8 chunk)\n");
+      std::fprintf(stderr, "[PASS] real/mm600: text-only PrefillMultimodal == Prefill, on and off (bytes and int8 chunk count)\n");
     }
   }
   return fails;

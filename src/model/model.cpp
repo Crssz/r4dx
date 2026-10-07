@@ -675,7 +675,7 @@ Model Model::Load(const ModelOptions& opts) {
                 << "): the full 256-row super-chunks of Prefill calls run their trellis linears int8 x int8 (A per row x 128 k, "
                    "weights per column x 128 k, int32 WMMA, per-128 fp32 rescale); "
                 << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib
-                << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal stay f16; "
+                << " GiB (included in weights=); tails, decode, verify windows, the vision tower and PrefillMultimodal calls with images stay f16; "
                    "R4DX_PREFILL_INT8=0 turns it off\n";
     } else if (i8_request == kPrefillInt8On) {
       std::cerr << "[r4dx::model::Model] prefill int8: off (" << source << " asked for it, not used: "
@@ -1021,7 +1021,7 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   const ScopedTrellisM256 trellis_m256_scope(wide);
   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path"): the int8 x int8 GEMM for the trellis linears of a
   // super-chunk of a Prefill() call of a Model that uses it -- and nowhere else (a 64-row chunk or tail, decode, a
-  // verify window, PrefillMultimodal's chunks all see the f16 kernels).
+  // verify window, PrefillMultimodal's image chunks all see the f16 kernels).
   const bool i8_chunk = wide && prefill_int8_call_;
   const ScopedTrellisI8 trellis_i8_scope(i8_chunk);
   if (i8_chunk) ++i8_chunks_run_;
@@ -1581,7 +1581,7 @@ std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
     ~WideGuard() { slot = 0; }
   } wide_guard{prefill_wide_active_};
   prefill_wide_active_ = rows > max_chunk_ ? rows : 0;
-  // R4DX_PREFILL_INT8: this call's super-chunks run the int8 GEMM (PrefillMultimodal never sets it). Cleared on
+  // R4DX_PREFILL_INT8: this call's super-chunks run the int8 GEMM (PrefillMultimodal never sets it itself; a text-only call with no image ever seen delegates to Prefill, so it is one). Cleared on
   // every exit, so no later RunChunk (decode, a multimodal call) can see it.
   struct Int8Guard {
     bool& slot;

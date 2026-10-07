@@ -13,6 +13,9 @@ tuning row (all seven classes x KB 4/5, including mlp.down KB 4's SK 16) bit for
 (`tests/kernels/tool_trellis_m256_bench.hip`) and real-weight check (`tool_trellis_m256_real_check.hip`,
 `build_m256_bench.ps1 [-Tool real_check]`, hipcc, no CMake target) are unchanged in purpose.
 
+Whether the plan can take a faster (SK, SKG) than the shipped M = 64 rows give it, and why nothing was applied: see the last
+section, "Retuning the plan" (2026-10-07).
+
 ## The 256-row prefill chunk (stage S2, `R4DX_PREFILL_CHUNK=256`)
 
 Result (MEASURED, HIP device 1, TP = 1, Huihui mix4.5m, main dd38f8b + branch `linear`; logs under
@@ -398,3 +401,135 @@ that ablation is not clean: the stand-ins cost about the VALU they replace.)
   E:\models\r4dx\linear\S1\logs\resource.txt, lists the ones since removed).
 * A-layout: fragment-contiguous activations (a prefill-only input-transform change, measured -5..-8% on the
   M = 64 kernel) were not tried here.
+
+## Retuning the plan: what is free and what is not (2026-10-07, branch `f16retune`; CPU analysis only, GPU runs PENDING)
+
+Why: the int8 prototype bench (`E:\models\r4dx\int8gemm\all.log` / `all.json`, docs/int8-gemm-proto.md) swept every
+legal (SK, SKG, SKW) of this unit and found, per class, a configuration 0-15% faster than the shipped plan. The
+question is whether the plan can take any of them without moving a bit of the "256-row chunk == 64-row chunk"
+identity. **Result: nothing was applied. No candidate is free, and the table is unchanged.** The sweep that decides
+it is in `tool_trellis_m256_bench --retune` (below), to be run on an idle device.
+
+### What defines the order of a sum (read from the two kernels, not assumed)
+
+Both kernels give the wave (y, slice) the K range `kt0 = (y * SK + slice) * ktw`, `ktw = K / 16 / (SK * SKG)`,
+accumulate it as one k-ordered chain of 16-k WMMA, sum the SK slices of a group in slice order from `0.f`
+(`v = 0.f; for s < SK: v += red[s]`, m64 line 400; the same running sum in m256 section 1), then sum the SKG groups
+in y order from `0.f` (m64 lines 436 / 449, m256 line 357), then FWHT, svh, scale, one bf16 rounding.
+
+| parameter | what it does | changes a per-element sum? |
+|---|---|---|
+| SK | K is cut into SK x SKG contiguous pieces; the SK pieces of a group are folded left to right | **yes** |
+| SKG | the groups' partials are folded left to right | **yes** |
+| SKW (M = 256 only) | slices resident per workgroup, PH = SK / SKW groups walked in turn; the fold keeps running through `ws` | no, scheduling only (360 / 360 identical comparisons in S1, every (SKW, PH) of every shipped SK) |
+| WV, NP, MT, U, NT, Wc (M = 64) | columns per block, tile pairs, row tiles, k unroll, cache hint | no (test_trellis_gemm / the bench compare 12-25 stock tunings per (SK, SKG), byte for byte) |
+| RG, NP, U of the M = 256 unit | fixed by the instantiation table (RG 4, NP 1, U 4) | no |
+| M, the row tile a row falls in | WMMA row tiles are independent | no |
+
+So the order is a function of (SK, SKG) alone. Two pairs give the same bytes only if their fold trees are equal: that
+holds for (P, 1) and (1, P) (a fold of P pieces either way) and for a pair with itself; (2, 2) is
+`(p0 + p1) + (p2 + p3)` and (4, 1) is `((p0 + p1) + p2) + p3`, which differ. Hence the M = 256 plan can only be
+identical to the 64-row path at the M = 64 row's own (SK, SKG), and `PlanTrellisM256` reads them from that row for
+exactly this reason. Changing a class's M = 256 (SK, SKG) means changing the class's M = 64 row with it.
+
+What a retune does and does not touch: M <= 16 (decode, verify, MTP / DFlash windows) takes the M = 1 band and M
+17..32 the M = 32 band, neither is a candidate and neither moves; `kl_rung4` runs the decode path and stays
+byte-identical. The M = 64 band serves the 256-row path (through `PlanTrellisM256`), every 33..64-row tail,
+`R4DX_PREFILL_CHUNK=0`, quant2 and image prompts. A retune changes the bits of that class's PREFILL output for every
+one of them: 64 == 256 still holds, but every prefill dump recorded before it (the dense-KL byte-identity of
+"Bit identity" above, the prefill-m0 / prefill-m1 baselines, any text hash of a prefill) stops matching and has to be
+re-recorded. That is a cost of the change, separate from its speed. The TP = 2 rows (`gemm_tuning_table_trellis_tp2.inc`)
+and the Gemma shapes are separate rows that this sweep does not cover.
+
+### Classification of the 14 (class, rate) results (DERIVED: all.log lines "f16 shipped plan" / "f16 alt ... best f16 config")
+
+The M = 64 columns come from the M5 screen (`E:\models\r4dx\trellis-m5\ptune_k4.json`, `ptune_mix.json`: every legal
+stock tuning per shape, flushed chains, random weights, ROCm before 10.1.0, one linear, run-to-run about +-3%) for
+the best M = 64 tuning of the candidate's (SK, SKG) against the shipped row. "p*" is the share of rows that may run
+through the 64-row kernel before the retune loses: `g / (g + 4 c)` for g us saved per 256 rows and c us lost per
+64-row launch. "ranges" says whether the bench's own [min..max] of the two M = 256 timings overlap.
+
+| class | KB | shipped (SK, SKG) | M256 us | best f16 config | M256 us | M64 row us | M64 us at the candidate | p* | ms saved per super-chunk (x layers) |
+|---|---|---|---|---|---|---|---|---|---|
+| gate_up | 4 | 4, 1 | 816.4 | 2, 1 (W2) | 811.3 (x1.006, ranges overlap) | 302.7 | 334.4 (+10.5%) | 4% | 0.33 |
+| down | 4 | 16, 2 | 547.5 | 2, 2 (W2) | 406.4 (**x1.347**, separated) | 169.9 | 190.7 (+12.3%) | 63% | 9.03 |
+| qkv | 4 | 2, 1 | 267.1 | 2, 2 (W2) | 255.7 (x1.045, overlap) | 92.3 | 110.2 (+19.4%) | 14% | 0.55 |
+| z | 4 | 4, 1 | 162.2 | none: the shipped plan is the best f16 config | | | | | 0 |
+| out, attn.o | 4 | 4, 1 | 175.0 | 2, 4 (W2) | 165.9 (x1.055, overlap) | 64.3 | 85.4 (+32.9%) | 10% | 0.58 |
+| qg | 4 | 4, 1 | 309.0 | 2, 2 (W2) | 304.9 (x1.013, overlap) | 98.0 | 122.7 (+25.2%) | 4% | 0.07 |
+| k, v | 4 | 8, 1 | 39.5 | 2, 2 (W2) | 38.1 (x1.037, overlap) | 15.5 | 29.4 (+90.4%) | 2% | 0.04 |
+| gate_up | 5 | 4, 1 | 847.4 | 2, 1 (W2) | 834.8 (x1.015, overlap) | 315.4 | 355.1 (+12.6%) | 7% | 0.81 |
+| down | 5 | 4, 2 | 427.9 | 4, 1 (W4) | 409.8 (x1.044, overlap) | 173.1 | 178.1 (+2.9%) | 47% | 1.16 |
+| qkv | 5 | 2, 1 | 272.4 | 4, 1 (W4) | 259.3 (x1.051, separated) | 99.8 | 102.6 (+2.7%) | 55% | 0.63 |
+| z | 5 | 8, 1 | 186.3 | 2, 2 (W2) | 162.7 (**x1.145**, separated) | 62.9 | 72.8 (+15.8%) | 37% | 1.13 |
+| out, attn.o | 5 | 8, 1 | 190.6 | 2, 4 (W2) | 170.6 (x1.117, overlap) | 66.9 | 92.9 (+38.7%) | 16% | 1.28 |
+| qg | 5 | 4, 1 | 312.7 | 2, 2 (W2) | 312.2 (x1.004, overlap) | 102.1 | 127.9 (+25.3%) | 0% | 0.01 |
+| k, v | 5 | 8, 1 | 39.4 | 4, 1 (W4) | 37.7 (x1.045, overlap) | 17.4 | 17.4 (+0.1%) | 97% | 0.05 |
+
+* **(A) identity-preserving with today's M = 64 rows (only SKW differs): none in the data.** `all.log` prints the best
+  configuration of the whole sweep per class; every one of them has another (SK, SKG) than the shipped row (the gate_up
+  KB 4 and qg KB 5 winners are inside the noise anyway), so a same-(SK, SKG) win at another SKW would only show if it
+  were the global best, and none is. The shipped SKW per class is S1's measured pick, and several alternatives do not
+  exist (KB 5 has no configuration that walks more than one group of slices, so SK 8 is W8 x 1 only). The sweep tool
+  prints an "(A)" line for any class where the plan's SKW loses to another SKW of the same (SK, SKG), so this is
+  decided on the device, not by this table.
+* **(B) needs the M = 64 row changed to the same (SK, SKG): all 13 candidates.** Every one is runnable by the M = 64
+  kernel (all are in the M5 screen). The M = 256 gain comes from fewer slices per workgroup and more groups (SK 2,
+  SKG 2-4: more, smaller workgroups for the 256-row tile), while the M = 64 rows were chosen by the M5 sweep for the
+  64-row kernel and are the best of their class there in 12 of 14 cases (the other two, out KB 4 and down KB 4, are within 1.4%).
+* **(C) cannot keep identity: none.** (SK 16 at KB 5 has no M = 256 instantiation, but no candidate uses it.)
+
+What the numbers say:
+
+1. **The headline is mostly noise and one class.** 10 of the 13 candidates have M = 256 time ranges that overlap the
+   shipped plan's, and the bench reports the MINIMUM over about 25 configurations per class (a winner's curse of a few
+   per cent against a +-3% run-to-run spread, docs "Speed" above). Outside the noise: down KB 4 (x1.347), z KB 5
+   (x1.145), qkv KB 5 (x1.051). Layer-weighted, all classes at one rate, one super-chunk: KB 4 saves 10.60 ms of 125.3
+   (8.5%), of which down KB 4 is 9.03 ms; KB 5 saves 5.15 ms of 122.3 (4.2%; all.log "ALL SEVEN LINEAR CLASSES"). On 32
+   super-chunks (8k) that is at most 160-340 ms of 4.836 s, if every winner were real and every one were taken.
+2. **The M = 64 side is not free.** Taking the best-f16 family of every class makes the 64-row chunk slower by
+   +14.7% (KB 4) / +12.2% (KB 5) of the linears' 43.6 / 45.6 ms per 64 rows, i.e. `R4DX_PREFILL_CHUNK=0` (the
+   kill switch and the pre-change reference) would lose about 0.7-0.8 s at 8k, and every tail chunk and quant2 / image
+   prompt pays too. Of the 13 candidates only k, v at KB 5 (SK 4: +0.1%) is not slower at M = 64, and its M = 256
+   gain (1.7 us per layer, ranges overlapping) is worth about 0.04% of a prompt: not worth the prefill re-baseline.
+   qkv KB 5 and down KB 5 (SK 4, SKG 1) cost +2.7% / +2.9% at M = 64 for x1.051 / x1.044 at M = 256.
+3. **The one lead that is cheap on both sides is down KB 4.** Its shipped row is SK 16, SKG 2, which M = 256 runs as
+   W4 x 4 with a 34-k-tile tail (the slowest configuration of the unit, 547 us). At M = 64 the screen puts SK 4, SKG 2
+   (WV 2 NP 2 SK 4 SKG 2 U 1 MT 4 NT 0, 169.0 us) at x1.005 of the shipped row (169.9 us), and SK 8 / 16 with SKG 2 within
+   1%; M5's own whole-chunk stage had chosen SK 16 over SK 4 by 0.10 ms per 64-row chunk of 45 ms (0.2%), a tie. S1's
+   old non-identical SK 4 down KB 4 ran at 485 us against the SK 16 plan's 516-524 (x1.07 at M = 256). Nobody has
+   measured M = 256 at SK 4 / SK 8 with SKG 2 on ROCm 10.1.0, which is the number that decides it; (2, 2) is faster
+   at M = 256 (x1.347) but 12% slower at M = 64 (a TRADE, p* 63%).
+4. Nothing above is a measurement on this ROCm: the M = 64 columns are the M5 screen (older ROCm), and the M = 256
+   columns are one run with +-3% noise.
+
+Decision: leave the table as it is (the retune cannot be shown not slower at M = 64, and the M = 256 gains outside
+the noise are two classes), and ship the instrument that decides it.
+
+### The sweep (`tests/kernels/tool_trellis_m256_bench.hip --retune`, built by `build_m256_bench.ps1`)
+
+* `--retune --mode verify`: every legal M = 256 (SK, SKG, SKW) of every family (SK 2 / 4 / 8 / 16 x SKG 1 / 2 / 4)
+  against stock M = 64 tunings of the SAME (SK, SKG) (WV x NP at U 1, NT 0, MT 4, plus the shipped row), byte for
+  byte, one-A and `n_split`, `--seeds` seeds, 8 repeats each, tickets reset, and the negative control. S1 verified the
+  shipped rows' (SK, SKG) only; this is the identity a retuned row would rest on, for the families S1 never ran
+  (SKG 4, SK 2 / SKG 2 ...). Correctness, so any device.
+* `--retune --mode time`: per class and rate, M = 256 for every family at the plan's SKW (the rule of
+  `PlanTrellisM256`, copied as `PlanSkw`) and at the best SKW, M = 64 for every legal stock tuning (WV x NP x U x NT x
+  MT in {4, 2}) screened in 3 short rounds and the best three of each family timed in the full protocol (cold weight
+  copies, `--rounds 11 --batch 6`, every round times every job once, medians of per-round ratios). Per family a
+  verdict: FREE (M = 256 >= `--min-gain` % faster, default 1, and M = 64 no more than `--tol64` % slower, default 1),
+  or TRADE with its p*. For each class it prints the FREE pick's `.inc` row, in the table's format, ready to replace
+  the class's M = 64 row, the fastest-at-M = 256 family's row, an "(A)" line when a different SKW of the shipped family
+  wins, and a layer-weighted summary per rate (super-chunk and 64-row chunk, FREE picks only and fastest picks). Idle
+  device only.
+* A row taken from the output must keep the M = 64 band legal for `BestRow` (a split row, SKG > 1 or Wc < 128,
+  needs MT 4 for a 64-row chunk; the tool never prints one that does not), and it needs no change to `PlanTrellisM256`
+  (the SKW rule picks the best SKW of every candidate's family in the table above, the log's winners are W2 for SK 2 and W4 for SK 4; the tool prints the plan's SKW and the best SKW side by side, so a gap shows).
+* Applying a row, in order: paste the row(s) into `src/model/gemm_tuning_table_trellis.inc`; `test_pick_tuning` (reads
+  the table itself, no expectation to edit: its check count does not change) and `test_prefill_chunk` (the decision
+  table, not the tuning) must still pass; `test_trellis_m256` (plan vs four launches of the new row, with its
+  negative control); `test_prefill_chunk_identity` (256 vs 64, the true pre-change path, real container); the KL pair
+  of `tools/prefill/run_kl.ps1` (default vs `R4DX_PREFILL_CHUNK=0`: byte-identical `logprobs.f16`, both new);
+  `tools/quant2/kl_rung4.ps1 -CompareDir E:\models\r4dx\rocm1010\kl` byte-identical (decode); then the cold TTFT of
+  `tools/prefill/gdn256_check.ps1` against 8k 4.836 s / 32k 23.456 s. The prefill dumps recorded before the change are
+  then history; re-record the KL baselines that matter.

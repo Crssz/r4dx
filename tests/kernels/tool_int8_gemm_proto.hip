@@ -379,6 +379,14 @@ static void FillCase(Case& c, uint32_t seed) {
   else hipLaunchKernelGGL(i8g_wscale_col<5>, dim3(c.N / 32), dim3(256), 1024, 0, (const unsigned*)c.wt, c.swc, c.K, c.N);
   CK(hipDeviceSynchronize());
   {
+    // i8g_quant_act_row writes only the A8 fragment layout; the references read the plain [256][K] matrix, so unpack it
+    std::vector<signed char> h8((size_t)256 * c.K), hp((size_t)256 * c.K);
+    CK(hipMemcpy(h8.data(), c.a8c, h8.size(), hipMemcpyDeviceToHost));
+    for (int r = 0; r < 256; ++r)
+      for (int k = 0; k < c.K; ++k) hp[(size_t)r * c.K + k] = h8[i8p::A8Offset(r, k, c.K)];
+    CK(hipMemcpy(c.apc, hp.data(), hp.size(), hipMemcpyHostToDevice));
+  }
+  {
     signed char* w8c;
     CK(hipMalloc(&w8c, c.w8_bytes));
     if (c.KB == 4) hipLaunchKernelGGL((i8g_dump_w<4, true>), dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.swc, w8c, c.wpc, c.K, c.N);

@@ -8,6 +8,45 @@ the base checkpoint; those numbers stay as the historical record (same architect
 speeds transfer closely, KL numbers do not: a KL is only meaningful against the bf16 reference of
 its own model).
 
+## Decode step: bit-exact launch and host-edge cuts (2026-10-08, branch `decode-t1`; UNMEASURED)
+
+Tier 1 of the plain-decode efficiency analysis (`E:\models\r4dx\decode-eff\analysis.md`; the measured
+budget it starts from, GPU 1, plain greedy, ctx ~2k, f16retune: wall 27.47 ms/token = 36.40 tok/s,
+clock-probe GPU span 27.145 ms, host-visible gap to the previous step 0.128 ms, device idle between
+steps ~0.7 ms, 818 spans per step with 1.10 ms in the gaps between them, `r4dx_argmax_f32` 0.13-0.19 ms,
+`gdn.in_proj_a/b` 4.7 us x 96 calls, 16 attention layers x five small kernels). Four changes, each
+**bit-exact against f16retune** -- the output token ids and logits of plain, MTP and DFlash decode do
+not change, no GEMM summation order and no M = 1 tuning row moves -- each with its own commit, kill
+switch and test. This pass was written and unit-built on a CPU-only session: **nothing below has run on
+the GPU**, so the "expected" column is the analysis's estimate, not a measurement.
+
+| item | what changed | why the bytes are the same | expected | kill switch |
+|---|---|---|--:|---|
+| argmax | `r4dx_argmax_f32` / `_val_f32` run two launches over up to 256 workgroups (partials into a per-stream scratch, one workgroup per row to combine) instead of one 256-thread workgroup; a greedy step argmaxes the lm_head GEMM's bf16 output directly (no widen launch); `VerifyWindow` argmaxes all T rows in one `r4dx_argmax_rows_f32` pair (T single-workgroup launches of ~0.15 ms before) | both are the maximum of the total order "larger value, then lower index" over the elements greater than the seed (-inf, 0): a NaN never wins, a row with nothing above -inf gives 0, and a maximum of a total order does not depend on the partition. bf16 -> fp32 is exact, so comparing the bf16 row is comparing the widened one | 0.09-0.10 ms/step plain; ~0.15 ms x (T - 1) per MTP/DFlash verify round and ~0.1 ms per draft step | `argmax` |
+| ab | `gdn.in_proj_a` and `in_proj_b` as one `r4d_gemm_bf16_nt_m64` launch, N = 2H, over `a; b` concatenated at load (`BuildGdnAb`, +47 MB VRAM); consumers read a at the buffer and b at +H with row stride 2H | the kernel's column is a WMMA tile column reduced over the same K splits (WV 4, SK 4, MB 1, unchanged) whatever N is; columns never mix, also where a TP shard's tile straddles a and b | ~0.19 ms (one 4.7 us launch + gap of 48 per step) | `ab` |
+| attn | `split_qg` + `q_norm` + `k_norm` + rope + `kv_write` in one kernel (`r4dx_attn_precore_bf16`, one wavefront per (token, head)); the rope'd k goes straight to the fp8 cache, not back to a bf16 buffer | each stage is the replaced kernel's own arithmetic in the same order (RmsNormKernel's vector path, the same xor tree over the 32 lanes that hold its data, the same `exp2f/log2f/sincosf` expressions, the same fp8 addressing); the file builds with `-ffp-contract=off`. Taken only on the single-row rope path (no image in the prompt) and where the norm kernel takes its vector path (`r4dx_attn_precore_supported`) | 0.10-0.15 ms | `attn` |
+| host | (a) the call's embed ids, KV positions and seqused_k go as ONE async H2D from pinned memory (`StageStepMeta`) instead of an async id copy plus two blocking `hipMemcpy` uploads; (b) a decode-sized TP=1 call ends in an event the host polls (`WaitStepDone`), and the greedy token (a verify window's T verdicts) is an async D2H into pinned memory ahead of that event, instead of `hipStreamSynchronize` + a blocking 4-byte `hipMemcpy`; (c) `DecodeStepGreedyOverlap`: the CLI and server loops decode, stop-scan and flush the fed token's text while its step runs, not before it is enqueued | no device math changes; ordering is by stream order and one event recorded after everything the call enqueued, so on return the device is as idle as after the synchronize the prefill chunks, TP and DFlash's injection drain still use | 0.10-0.30 ms (the ~0.7 ms idle bucket; the rest needs the one-step lookahead, which this pass does not do) | `host` |
+
+`R4DX_DECODE_LEGACY=argmax,ab,attn,host` (comma-separated, `all` for every item; read once per process;
+`src/core/include/r4dx/core/decode_legacy.hpp`) restores any subset on the same binary, for A/B. Notes for
+reading a probe run: with `ab` merged the per-class table has a `gdn.in_proj_ab` span and no `in_proj_a` /
+`in_proj_b` (set `ab` for the old classes); `attn.precore` replaces the five attention small-kernel spans
+(`attn` restores them); the poll spins a core for the whole step (the price of not paying a wake-up;
+`host` goes back to the blocking wait). TP=2, prefill chunks and Gemma's own model keep their
+synchronize; TP, Gemma and `host` do the output before the step, as before. The multi-workgroup argmax
+reaches Gemma (and TP's per-rank pairs) through the shared entry points, with the same results.
+
+Tests (all in `tests/`, names for `ctest -R`): `test_argmax_order_cpu` and `test_decode_legacy` (CPU, run
+here: the order algebra incl. ties/NaN/-inf/signed zeros, the env parser, the metadata layout);
+`test_argmax_multi` (device vs the one-workgroup kernel, bit for bit, incl. ties across block boundaries,
+NaN, -inf, bf16, rows/pair layouts), `test_gdn_ab_merge` (merged N = 2H vs two N = H for H = 48, 24, 16,
+8 and M up to 256), `test_attn_precore` (one launch vs the five, q rows, gate rows and every byte of the
+fp8 cache, T = 1..256, positions up to 40000, a skipped slot, both head layouts) -- built, **not run**.
+The GPU gates to run before merging are listed in the commit series' handoff: unit bit-tests; plain /
+`--mtp 3` / `--dflash` greedy byte-identity against the f16retune build (`tools/tp/tp1_identity.ps1`,
+`tools/validate_dflash.ps1`), the rung-4 KL gate byte-identical to `huihui\kl\rt-mix45m`, the TP=2
+emulation smoke, and `run_decode_probes.ps1` / `bench_decode.ps1` A/B against f16retune.
+
 ## Huihui trellis mix4.5m: decode and prefill against the base container (2026-09-29)
 
 `tools/quant2/bench_decode.ps1 -Runs 3`, HIP device 1, TP=1, the huihui and base trellis mix4.5m

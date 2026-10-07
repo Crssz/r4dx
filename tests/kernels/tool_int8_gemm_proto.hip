@@ -25,6 +25,11 @@
 //   tool_int8_gemm_proto.exe [--mode all|probe|selftest|verify|time] [--shape gate_up|down|qkv|z|out|qg|kv|all]
 //                            [--kb 4|5|both] [--rounds 11] [--batch 6] [--quick] [--noverify] [--no-resc]
 //                            [--simds 128] [--verbose] [--out x.json] [--emit-rows src/model/gemm_tuning_table_trellis_i8.inc]
+//                            [--no-coarse] [--emit-rows-coarse src/model/gemm_tuning_table_trellis_i8c.inc]
+//   The COARSE production kernel (RESC 4, R4DX_PREFILL_INT8_SCALES=coarse; docs/int8-prefill.md "Coarse scales") is selftested,
+//   verified against its exact reference, swept over every legal (skw, skg) and timed with its own operands (A per row, W per
+//   column over the whole K) next to the per-128 kernel and the RESC 1..3 speed bounds, with its stand-alone per-row quantizer;
+//   --no-coarse leaves it out, --emit-rows-coarse writes its tuning table the way --emit-rows writes the per-128 one.
 //   --emit-rows regenerates the production tuning table of R4DX_PREFILL_INT8 (a full timing run: --mode time or all,
 //   every shape, --kb both): per (class, KB) the best verified trellis kernel by median, ties within 1% to the smallest skg.
 #include <hip/hip_runtime.h>
@@ -250,18 +255,18 @@ static Plan ShippedPlan(const Shape& s, int kb) {
 static float Bf16ToF(unsigned short b) { return __builtin_bit_cast(float, (unsigned)b << 16); }
 static std::string CfgName(const I8gCfg& c) {
   char b[112];
-  static const char* const kResc[4] = {"", " COARSE-both", " COARSE-act", " COARSE-wgt"};
+  static const char* const kResc[5] = {"", " COARSE-both", " COARSE-act", " COARSE-wgt", " COARSE-PROD"};
   std::snprintf(b, sizeof b, "%s%s%s skw%d skg%d%s", c.trellis ? "trellis" : "dense", c.trellis ? (c.kb == 4 ? "-kb4" : "-kb5") : "",
-                c.trellis ? "" : (c.fwht ? "+fwht" : "-plain"), c.skw, c.skg, kResc[c.resc & 3]);
+                c.trellis ? "" : (c.fwht ? "+fwht" : "-plain"), c.skw, c.skg, kResc[c.resc]);
   return b;
 }
 // the scale mask of the reference (bit 0: the activation scale of kb 0 for all, bit 1: the weight scale of kb 0 for all)
-static int MaskOfResc(int resc) { static const int m[4] = {0, 3, 1, 2}; return m[resc & 3]; }
+static int MaskOfResc(int resc) { static const int m[5] = {0, 3, 1, 2, 3}; return m[resc]; }   // RESC 4 (production coarse): the same math as RESC 1's, on its own tables
 
 // the whole bench state of one (shape, KB)
 struct Case {
   int N = 0, K = 0, KB = 4, batch = 1;
-  size_t wt_bytes = 0, w8_bytes = 0, sw_bytes = 0;
+  size_t wt_bytes = 0, w8_bytes = 0, sw_bytes = 0, swc_bytes = 0;
   unsigned char* wt = nullptr;          // trellis words, batch copies
   signed char* w8 = nullptr;            // dense int8 (block layout), batch copies
   float* sw = nullptr;                  // scale table, batch copies
@@ -270,6 +275,12 @@ struct Case {
   signed char* a8 = nullptr;
   signed char* ap = nullptr;            // plain [256][K]
   float* sa = nullptr;                  // [K/128][256]
+  // the COARSE production operands (RESC 4, R4DX_PREFILL_INT8_SCALES=coarse): A one scale per row, W one per column
+  signed char* a8c = nullptr;           // A8 from i8g_quant_act_row
+  signed char* apc = nullptr;           // plain [256][K]
+  float* sac = nullptr;                 // [256]
+  float* swc = nullptr;                 // [N], batch copies
+  signed char* wpc = nullptr;           // plain [N][K] (one copy, the references)
   float* svh = nullptr;
   unsigned short* c_f16 = nullptr;      // shipped kernel output
   unsigned short* c_a = nullptr;        // scratch outputs for the verified kernel
@@ -283,6 +294,7 @@ static void AllocCase(Case& c, int N, int K, int KB, int batch) {
   c.wt_bytes = (size_t)N * K * KB / 8;
   c.w8_bytes = (size_t)N * K;
   c.sw_bytes = (size_t)(K / 128) * N * 4;
+  c.swc_bytes = (size_t)N * 4;
   CK(hipMalloc(&c.wt, c.wt_bytes * batch));
   CK(hipMalloc(&c.w8, c.w8_bytes * batch));
   CK(hipMalloc(&c.sw, c.sw_bytes * batch));
@@ -291,6 +303,11 @@ static void AllocCase(Case& c, int N, int K, int KB, int batch) {
   CK(hipMalloc(&c.a8, (size_t)256 * K));
   CK(hipMalloc(&c.ap, (size_t)256 * K));
   CK(hipMalloc(&c.sa, (size_t)(K / 128) * 256 * 4));
+  CK(hipMalloc(&c.a8c, (size_t)256 * K));
+  CK(hipMalloc(&c.apc, (size_t)256 * K));
+  CK(hipMalloc(&c.sac, (size_t)256 * 4));
+  CK(hipMalloc(&c.swc, c.swc_bytes * batch));
+  CK(hipMalloc(&c.wpc, c.w8_bytes));
   CK(hipMalloc(&c.svh, (size_t)N * 4));
   CK(hipMalloc(&c.c_f16, (size_t)256 * N * 2));
   CK(hipMalloc(&c.c_a, (size_t)256 * N * 2));
@@ -302,7 +319,7 @@ static void AllocCase(Case& c, int N, int K, int KB, int batch) {
   CK(hipMemset(c.tk2, 0, (size_t)(N / 128) * 4));
 }
 static void FreeCase(Case& c) {
-  void* ptrs[] = {c.wt, c.w8, c.sw, c.wp, c.a16, c.a8, c.ap, c.sa, c.svh, c.c_f16, c.c_a, c.c_b, c.ws, c.tk, c.tk2};
+  void* ptrs[] = {c.wt, c.w8, c.sw, c.wp, c.a16, c.a8, c.ap, c.sa, c.a8c, c.apc, c.sac, c.swc, c.wpc, c.svh, c.c_f16, c.c_a, c.c_b, c.ws, c.tk, c.tk2};
   for (void* p : ptrs) CK(hipFree(p));
   c = Case();
 }
@@ -323,10 +340,25 @@ static void FillCase(Case& c, uint32_t seed) {
   if (c.KB == 4) hipLaunchKernelGGL(i8g_dump_w<4>, dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.sw, c.w8, c.wp, c.K, c.N);
   else hipLaunchKernelGGL(i8g_dump_w<5>, dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.sw, c.w8, c.wp, c.K, c.N);
   CK(hipDeviceSynchronize());
+  // the coarse operands: the per-row activation quantizer, the per-column table and its int8 matrix (the block layout goes to a
+  // scratch buffer, only the plain matrix is kept for the references)
+  hipLaunchKernelGGL(i8g_quant_act_row, dim3(256), dim3(256), 64, 0, c.a16, c.a8c, c.sac, c.K, 0LL);
+  if (c.KB == 4) hipLaunchKernelGGL(i8g_wscale_col<4>, dim3(c.N / 32), dim3(256), 1024, 0, (const unsigned*)c.wt, c.swc, c.K, c.N);
+  else hipLaunchKernelGGL(i8g_wscale_col<5>, dim3(c.N / 32), dim3(256), 1024, 0, (const unsigned*)c.wt, c.swc, c.K, c.N);
+  CK(hipDeviceSynchronize());
+  {
+    signed char* w8c;
+    CK(hipMalloc(&w8c, c.w8_bytes));
+    if (c.KB == 4) hipLaunchKernelGGL((i8g_dump_w<4, true>), dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.swc, w8c, c.wpc, c.K, c.N);
+    else hipLaunchKernelGGL((i8g_dump_w<5, true>), dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, (const unsigned*)c.wt, c.swc, w8c, c.wpc, c.K, c.N);
+    CK(hipDeviceSynchronize());
+    CK(hipFree(w8c));
+  }
   for (int i = 1; i < c.batch; ++i) {
     CK(hipMemcpy(c.wt + (size_t)i * c.wt_bytes, c.wt, c.wt_bytes, hipMemcpyDeviceToDevice));
     CK(hipMemcpy(c.w8 + (size_t)i * c.w8_bytes, c.w8, c.w8_bytes, hipMemcpyDeviceToDevice));
     CK(hipMemcpy((unsigned char*)c.sw + (size_t)i * c.sw_bytes, c.sw, c.sw_bytes, hipMemcpyDeviceToDevice));
+    CK(hipMemcpy((unsigned char*)c.swc + (size_t)i * c.swc_bytes, c.swc, c.swc_bytes, hipMemcpyDeviceToDevice));
   }
   CK(hipDeviceSynchronize());
 }
@@ -337,6 +369,11 @@ static void LaunchShipped(const Case& c, const Plan& p, int copy, unsigned short
 }
 static void LaunchI8(const Case& c, const I8gCfg& g, int copy, unsigned short* out) {
   const void* w = g.trellis ? (const void*)(c.wt + (size_t)copy * c.wt_bytes) : (const void*)(c.w8 + (size_t)copy * c.w8_bytes);
+  if (g.resc == 4) {   // the production coarse kernel: SA [256], SW [N]
+    const float* swc = (const float*)((const unsigned char*)c.swc + (size_t)copy * c.swc_bytes);
+    I8gRun(g, c.a8c, c.sac, w, swc, c.svh, out, c.ws, c.tk2, c.K, c.N, g.fwht ? kOutScale : 1.0f, 0);
+    return;
+  }
   const float* sw = (const float*)((const unsigned char*)c.sw + (size_t)copy * c.sw_bytes);
   I8gRun(g, c.a8, c.sa, w, sw, c.svh, out, c.ws, c.tk2, c.K, c.N, g.fwht ? kOutScale : 1.0f, 0);
 }
@@ -349,8 +386,14 @@ struct Verifier {
   double* d_out = nullptr;
   std::vector<double> refs[4];         // by scale mask, each [ncols][256]
   std::vector<float> svh;
-  void Build(const Case& c) {
+  // coarse: the references of the production coarse kernel (RESC 4) on the coarse operands, scale mask 3 only
+  // (SA [256] and SW [N] are read as one scale per row / column; the other masks would index past them)
+  void Build(const Case& c, bool coarse = false) {
     N = c.N; K = c.K;
+    const signed char* d_ap = coarse ? c.apc : c.ap;
+    const float* d_sa = coarse ? c.sac : c.sa;
+    const signed char* d_wp = coarse ? c.wpc : c.wp;
+    const float* d_sw = coarse ? c.swc : c.sw;
     std::set<int> g = {0, c.N / 128 - 1};
     std::mt19937 rng(1234);
     while ((int)g.size() < std::min(5, c.N / 128)) g.insert((int)(rng() % (c.N / 128)));
@@ -359,8 +402,8 @@ struct Verifier {
     CK(hipMalloc(&d_cols, cols.size() * 4));
     CK(hipMemcpy(d_cols, cols.data(), cols.size() * 4, hipMemcpyHostToDevice));
     CK(hipMalloc(&d_out, cols.size() * 256 * 8));
-    for (int mask = 0; mask < 4; ++mask) {
-      hipLaunchKernelGGL(i8g_ref_cols, dim3((unsigned)cols.size()), dim3(256), 0, 0, c.ap, c.sa, c.wp, c.sw, d_cols, d_out, c.K, c.N, mask);
+    for (int mask = coarse ? 3 : 0; mask < 4; ++mask) {
+      hipLaunchKernelGGL(i8g_ref_cols, dim3((unsigned)cols.size()), dim3(256), 0, 0, d_ap, d_sa, d_wp, d_sw, d_cols, d_out, c.K, c.N, mask);
       CK(hipDeviceSynchronize());
       refs[mask].resize(cols.size() * 256);
       CK(hipMemcpy(refs[mask].data(), d_out, refs[mask].size() * 8, hipMemcpyDeviceToHost));
@@ -627,6 +670,131 @@ static void SelftestGemms(int KB) {
   CK(hipFree(d_wp)); CK(hipFree(d_svh)); CK(hipFree(d_ws)); CK(hipFree(d_tk)); CK(hipFree(d_c));
 }
 
+// The production COARSE kernel (RESC 4, R4DX_PREFILL_INT8_SCALES=coarse) and its producers on small shapes: the per-row
+// activation quantizer, the per-column table and its int8 matrix against the CPU (trellis decode + QuantizeWeightsColRef), the
+// GEMM for every legal (skw, skg) against the exact reference with scale mask 3 (sa [256], sw [N]), and the trellis kernel
+// against its dense twin on the same int8 weights, byte for byte.
+static void SelftestCoarse(int KB) {
+  const int K = 1024, N = 256, M = 256;
+  std::mt19937 rng(1900 + KB);
+  std::vector<uint16_t> xh((size_t)M * K);
+  std::vector<float> X((size_t)M * K);
+  {
+    std::normal_distribution<float> nd(0.f, 0.8f);
+    for (size_t i = 0; i < xh.size(); ++i) { xh[i] = i8p::F32ToF16(nd(rng)); X[i] = F16F(xh[i]); }
+    for (int k = 0; k < K; ++k) { xh[(size_t)5 * K + k] = 0; X[(size_t)5 * K + k] = 0.f; }   // an all-zero row (scale 1)
+    xh[(size_t)9 * K + 700] = i8p::F32ToF16(300.f); X[(size_t)9 * K + 700] = F16F(xh[(size_t)9 * K + 700]);   // a row scale far above the rest
+  }
+  std::vector<int8_t> Ap;
+  std::vector<float> sa;
+  i8p::QuantizeActRowRef(X.data(), K, sa, Ap);
+  const std::vector<int8_t> A8 = i8p::PackA8(Ap, K);
+  std::vector<uint32_t> grid((size_t)K / 16 * (N / 16) * 8 * KB);
+  for (uint32_t& w : grid) w = rng();
+  const std::vector<uint16_t> Q = trellis_ref::DecodePairGrid(grid, K, N, KB);
+  std::vector<int8_t> Wp;
+  std::vector<float> sw;
+  i8p::QuantizeWeightsColRef(Q.data(), K, N, sw, Wp);
+  const std::vector<int8_t> W8 = i8p::PackW8(Wp, K, N);
+  std::vector<float> svh(N);
+  for (int n = 0; n < N; ++n) svh[n] = (rng() & 1 ? -1.f : 1.f) * (0.5f + (rng() % 1000) / 1000.f);
+
+  uint16_t* d_x;
+  signed char *d_a8, *d_w8, *d_wp;
+  float *d_sa, *d_sw, *d_svh, *d_ws;
+  unsigned *d_words, *d_tk;
+  unsigned short* d_c;
+  CK(hipMalloc(&d_x, xh.size() * 2)); CK(hipMalloc(&d_a8, (size_t)M * K)); CK(hipMalloc(&d_sa, (size_t)M * 4));
+  CK(hipMalloc(&d_words, grid.size() * 4)); CK(hipMalloc(&d_sw, (size_t)N * 4)); CK(hipMalloc(&d_w8, (size_t)N * K));
+  CK(hipMalloc(&d_wp, (size_t)N * K)); CK(hipMalloc(&d_svh, N * 4)); CK(hipMalloc(&d_ws, (size_t)8 * M * N * 4));
+  CK(hipMalloc(&d_tk, (size_t)(N / 128) * 4)); CK(hipMalloc(&d_c, (size_t)M * N * 2));
+  CK(hipMemset(d_tk, 0, (size_t)(N / 128) * 4));
+  CK(hipMemcpy(d_x, xh.data(), xh.size() * 2, hipMemcpyHostToDevice));
+  CK(hipMemcpy(d_words, grid.data(), grid.size() * 4, hipMemcpyHostToDevice));
+  CK(hipMemcpy(d_svh, svh.data(), N * 4, hipMemcpyHostToDevice));
+  hipLaunchKernelGGL(i8g_quant_act_row, dim3(M), dim3(256), 64, 0, d_x, d_a8, d_sa, K, 0LL);
+  const long long blocks = (long long)(N / 32) * (K / 16);
+  if (KB == 4) {
+    hipLaunchKernelGGL(i8g_wscale_col<4>, dim3(N / 32), dim3(256), 1024, 0, d_words, d_sw, K, N);
+    CK(hipDeviceSynchronize());
+    hipLaunchKernelGGL((i8g_dump_w<4, true>), dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, d_words, d_sw, d_w8, d_wp, K, N);
+  } else {
+    hipLaunchKernelGGL(i8g_wscale_col<5>, dim3(N / 32), dim3(256), 1024, 0, d_words, d_sw, K, N);
+    CK(hipDeviceSynchronize());
+    hipLaunchKernelGGL((i8g_dump_w<5, true>), dim3((unsigned)((blocks + 7) / 8)), dim3(256), 0, 0, d_words, d_sw, d_w8, d_wp, K, N);
+  }
+  CK(hipDeviceSynchronize());
+  auto same = [&](const void* dev, const void* host, size_t bytes) {
+    std::vector<unsigned char> h(bytes);
+    CK(hipMemcpy(h.data(), dev, bytes, hipMemcpyDeviceToHost));
+    return std::memcmp(h.data(), host, bytes) == 0;
+  };
+  char what[170];
+  std::snprintf(what, sizeof what, "COARSE KB %d: per-row activation quantizer == CPU (A8 layout and scales; an all-zero row, a one-outlier row)", KB);
+  SCheck(same(d_a8, A8.data(), A8.size()) && same(d_sa, sa.data(), sa.size() * 4), what);
+  std::snprintf(what, sizeof what, "COARSE KB %d: per-column table (GPU decode, whole-K amax, f16 reciprocal) == CPU decode + CPU table", KB);
+  SCheck(same(d_sw, sw.data(), sw.size() * 4), what);
+  std::snprintf(what, sizeof what, "COARSE KB %d: int8 weights (W8 block layout and plain) == CPU decode + CPU column quantizer", KB);
+  SCheck(same(d_w8, W8.data(), W8.size()) && same(d_wp, Wp.data(), Wp.size()), what);
+
+  std::vector<double> raw((size_t)M * N);
+  i8p::RefGemmInt8(Ap.data(), sa.data(), Wp.data(), sw.data(), M, N, K, 3, raw.data());
+  int ran = 0, bad = 0, bitdiff = 0, refused = 0;
+  for (int skw : {2, 4, 8})
+    for (int skg : {1, 2, 4, 8}) {
+      I8gCfg g;
+      g.trellis = true; g.kb = KB; g.fwht = true; g.resc = 4; g.skw = skw; g.skg = skg;
+      if (I8gCheck(g, K, N)) continue;
+      CK(hipMemset(d_c, 0xFF, (size_t)M * N * 2));
+      try {
+        I8gRun(g, d_a8, d_sa, d_words, d_sw, d_svh, d_c, d_ws, d_tk, K, N, kOutScale, 0);
+      } catch (const std::exception& e) {
+        ++refused;
+        std::printf("    REFUSED by the runtime (not run, not timed): %s: %s\n", CfgName(g).c_str(), e.what());
+        continue;
+      }
+      CK(hipDeviceSynchronize());
+      std::vector<unsigned short> C((size_t)M * N);
+      CK(hipMemcpy(C.data(), d_c, C.size() * 2, hipMemcpyDeviceToHost));
+      long long viol = 0;
+      for (int r = 0; r < M; ++r)
+        for (int grp = 0; grp < N / 128; ++grp) {
+          double v[128], e[128], rms = 0;
+          for (int j = 0; j < 128; ++j) v[j] = raw[(size_t)r * N + grp * 128 + j];
+          i8p::Fwht128(v);
+          for (int j = 0; j < 128; ++j) {
+            e[j] = v[j] * (double)svh[grp * 128 + j] * (double)kOutScale;
+            rms += e[j] * e[j];
+          }
+          rms = std::sqrt(rms / 128);
+          for (int j = 0; j < 128; ++j) viol += std::fabs(Bf16ToF(C[(size_t)r * N + grp * 128 + j]) - e[j]) > 0.0085 * std::fabs(e[j]) + 1e-4 * rms;
+        }
+      ++ran;
+      if (viol) { ++bad; std::printf("    FAIL %s: %lld of %d outputs outside tolerance\n", CfgName(g).c_str(), viol, M * N); }
+      I8gCfg dcfg = g;
+      dcfg.trellis = false;
+      CK(hipMemset(d_c, 0xFF, (size_t)M * N * 2));
+      try {
+        I8gRun(dcfg, d_a8, d_sa, d_w8, d_sw, d_svh, d_c, d_ws, d_tk, K, N, kOutScale, 0);
+      } catch (const std::exception& e) {
+        ++refused;
+        std::printf("    REFUSED by the runtime (dense twin, not compared): %s: %s\n", CfgName(dcfg).c_str(), e.what());
+        continue;
+      }
+      CK(hipDeviceSynchronize());
+      std::vector<unsigned short> D((size_t)M * N);
+      CK(hipMemcpy(D.data(), d_c, D.size() * 2, hipMemcpyDeviceToHost));
+      if (D != C) { ++bitdiff; std::printf("    coarse trellis != dense twin (same int8 weights) for %s\n", CfgName(g).c_str()); }
+    }
+  std::snprintf(what, sizeof what, "COARSE KB %d: %d RESC 4 configurations (skw x skg) match the exact coarse reference", KB, ran);
+  SCheck(bad == 0 && ran > 0, what);
+  if (refused) std::printf("    NOTE: %d configuration(s) were refused by the runtime and are not covered by the line above\n", refused);
+  std::snprintf(what, sizeof what, "COARSE KB %d: the trellis kernel is byte-identical to the dense kernel on the same int8 weights", KB);
+  SCheck(bitdiff == 0, what);
+  CK(hipFree(d_x)); CK(hipFree(d_a8)); CK(hipFree(d_sa)); CK(hipFree(d_words)); CK(hipFree(d_sw)); CK(hipFree(d_w8));
+  CK(hipFree(d_wp)); CK(hipFree(d_svh)); CK(hipFree(d_ws)); CK(hipFree(d_tk)); CK(hipFree(d_c));
+}
+
 // ---- timing -----------------------------------------------------------------------------------------------------------------
 struct Job {
   std::string name, kind;                 // kind: f16ship, f16alt, dense, denseplain, trellis, denseC, trellisC, quant
@@ -678,8 +846,8 @@ static std::vector<double> SumRounds(const std::vector<const std::vector<double>
 struct ClassResult {
   std::string name;
   int count = 0, N = 0, K = 0, KB = 0;
-  std::vector<double> ship, f16best, dense, denseplain, trellis, denseC, trellisC, trellisA, trellisW, quant;
-  std::string n_ship, n_f16best, n_dense, n_denseplain, n_trellis, n_denseC, n_trellisC, n_trellisA, n_trellisW;
+  std::vector<double> ship, f16best, dense, denseplain, trellis, denseC, trellisC, trellisA, trellisW, quant, trellisCP, quantrow;
+  std::string n_ship, n_f16best, n_dense, n_denseplain, n_trellis, n_denseC, n_trellisC, n_trellisA, n_trellisW, n_trellisCP;
   bool ok = true;     // every reported kernel verified
 };
 
@@ -689,8 +857,9 @@ struct ClassResult {
 // noise), then the faster median.
 struct EmitRow { std::string cls; int N, K, kb, skw, skg; double us; };
 static std::vector<EmitRow> g_emit_rows;
+static std::vector<EmitRow> g_emit_rows_coarse;   // the same rule for the coarse production kernel (--emit-rows-coarse)
 
-static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_verify, bool do_time, bool do_resc, bool verbose,
+static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_verify, bool do_time, bool do_resc, bool do_coarse, bool verbose,
                      FILE* json, bool& json_first, std::map<std::string, ClassResult>& results, int& fails) {
   Case c;
   AllocCase(c, s.N, s.K, kb, do_time ? batch : 1);
@@ -704,18 +873,21 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   CK(hipDeviceSynchronize());
   const std::vector<unsigned short> Cf16 = ReadC(c.c_f16, s.N);
 
-  Verifier V;
+  Verifier V, Vc;                             // Vc: the references of the coarse production kernel (its own operands)
   std::map<std::string, bool> verified;       // by config name
   if (do_verify) {
     V.Build(c);
+    if (do_coarse) Vc.Build(c, /*coarse=*/true);
     // the quantization itself: how far is the w8a8 product from the f16 product (the coarse view of "fake-quant level")
     std::vector<I8gCfg> all;
     for (int kind = 0; kind < 3; ++kind)
       for (int resc = 0; resc < (!do_resc ? 1 : (kind == 2 ? 4 : 2)); ++resc) {
         for (const I8gCfg& g : Sweep(s.K, s.N, kind == 2, kb, kind != 1, resc)) all.push_back(g);
       }
+    if (do_coarse)   // the production coarse kernel (RESC 4, R4DX_PREFILL_INT8_SCALES=coarse), trellis only
+      for (const I8gCfg& g : Sweep(s.K, s.N, true, kb, true, 4)) all.push_back(g);
     int nbad = 0, nbit = 0, nrun = 0;
-    double worst_rel = 0, best_rel = 1e9;
+    double worst_rel = 0, best_rel = 1e9, worst_rel_c = 0, best_rel_c = 1e9;
     for (const I8gCfg& g : all) {
       CK(hipMemset(c.c_a, 0xFF, (size_t)256 * s.N * 2));
       try {
@@ -728,7 +900,7 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
       }
       CK(hipDeviceSynchronize());
       const std::vector<unsigned short> C = ReadC(c.c_a, s.N);
-      const auto r = V.Check(C, g.fwht, g.resc, g.fwht ? kOutScale : 1.0f);
+      const auto r = (g.resc == 4 ? Vc : V).Check(C, g.fwht, g.resc, g.fwht ? kOutScale : 1.0f);
       const bool ok = r.viol == 0;
       verified[CfgName(g)] = ok;
       ++nrun;
@@ -750,6 +922,11 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
           worst_rel = std::max(worst_rel, rel);
           best_rel = std::min(best_rel, rel);
         }
+        if (g.resc == 4) {
+          const double rel = Vc.RelDiff(C, Cf16);
+          worst_rel_c = std::max(worst_rel_c, rel);
+          best_rel_c = std::min(best_rel_c, rel);
+        }
       }
     }
     std::printf("  verify: %d configurations against the exact reference (5 groups x 128 columns x 256 rows each): %s; trellis vs dense byte-identical: %s\n",
@@ -763,12 +940,20 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
       ++nbad;
       std::printf("    VERIFY FAIL: a trellis int8 output is %.4f (relative RMS) away from the shipped f16 output, expected about 0.01\n", worst_rel);
     }
+    if (best_rel_c < 1e8) {
+      std::printf("  COARSE production kernel (RESC 4) vs shipped f16 trellis output: relative RMS difference %.4f .. %.4f (per-128 above; the coarse scales cost a bit more)\n", best_rel_c, worst_rel_c);
+      if (worst_rel_c > 0.05) {
+        ++nbad;
+        std::printf("    VERIFY FAIL: a coarse trellis int8 output is %.4f (relative RMS) away from the shipped f16 output\n", worst_rel_c);
+      }
+    }
     fails += nbad + nbit;
     // the shipped kernel itself against the f16 exact? (not the subject) -- sanity: not all zero
     double nz = 0;
     for (size_t i = 0; i < Cf16.size(); i += 97) nz += Bf16ToF(Cf16[i]) != 0.f;
     if (nz == 0) { std::printf("    DATA PROBLEM: the shipped kernel's output is all zero\n"); ++fails; }
     V.Free();
+    if (do_coarse) Vc.Free();
   }
   if (!do_time) { FreeCase(c); return; }
 
@@ -810,6 +995,12 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
     add(Sweep(s.K, s.N, true, kb, true, 1), "trellisC");
     add(Sweep(s.K, s.N, true, kb, true, 2), "trellisA");
     add(Sweep(s.K, s.N, true, kb, true, 3), "trellisW");
+  }
+  if (do_coarse) add(Sweep(s.K, s.N, true, kb, true, 4), "trellisCP");   // the production coarse kernel
+  if (do_coarse) {   // its A quantizer, the stand-alone per-row launch (the producers fuse it)
+    Job j; j.name = "quantize A per row (K=" + std::to_string(s.K) + ")"; j.kind = "quantrow";
+    j.launch = [&](int) { hipLaunchKernelGGL(i8g_quant_act_row, dim3(256), dim3(256), 64, 0, c.a16, c.a8c, c.sac, c.K, 0LL); };
+    jobs.push_back(j);
   }
   {
     Job j; j.name = "quantize A (K=" + std::to_string(s.K) + ")"; j.kind = "quant";
@@ -855,6 +1046,16 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
         pick = &j;
     g_emit_rows.push_back({s.name, s.N, s.K, kb, pick->cfg.skw, pick->cfg.skg, Median(pick->t)});
   }
+  const Job* trelCP = best("trellisCP", true);   // the production coarse kernel
+  if (trelCP) {
+    const Job* pick = trelCP;
+    for (const Job& j : jobs)
+      if (j.kind == "trellisCP" && j.verified && Median(j.t) <= 1.01 * Median(trelCP->t) &&
+          (j.cfg.skg < pick->cfg.skg || (j.cfg.skg == pick->cfg.skg && Median(j.t) < Median(pick->t))))
+        pick = &j;
+    g_emit_rows_coarse.push_back({s.name, s.N, s.K, kb, pick->cfg.skw, pick->cfg.skg, Median(pick->t)});
+  }
+  const Job* quantrow = best("quantrow", false);
   const Job* denseC = best("denseC", true);
   const Job* trelC = best("trellisC", true);
   const Job* trelA = best("trellisA", true);
@@ -863,11 +1064,11 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   const double t_ship = Median(ship->t);
   for (const Job& j : jobs) {
     const bool show = verbose || &j == ship || &j == f16best || &j == dense || &j == dplain || &j == trel || &j == denseC || &j == trelC ||
-                      &j == trelA || &j == trelW || &j == quant;
+                      &j == trelA || &j == trelW || &j == quant || &j == trelCP || &j == quantrow;
     if (!show) continue;
     const double med = Median(j.t);
-    std::printf("  %-34s %s %9.1f us [%8.1f..%8.1f] %7.1f TF/s", j.name.c_str(), j.verified ? " " : "!", med, MinOf(j.t), MaxOf(j.t), j.kind == "quant" ? 0.0 : flops / (med * 1e-6) / 1e12);
-    if (j.kind != "quant" && j.kind != "f16ship") std::printf("  x%.3f vs shipped plan", Median(Ratio(ship->t, j.t)));
+    std::printf("  %-34s %s %9.1f us [%8.1f..%8.1f] %7.1f TF/s", j.name.c_str(), j.verified ? " " : "!", med, MinOf(j.t), MaxOf(j.t), j.kind == "quant" || j.kind == "quantrow" ? 0.0 : flops / (med * 1e-6) / 1e12);
+    if (j.kind != "quant" && j.kind != "quantrow" && j.kind != "f16ship") std::printf("  x%.3f vs shipped plan", Median(Ratio(ship->t, j.t)));
     if (&j == dense) std::printf("  [best dense, trellis epilogue]");
     if (&j == dplain) std::printf("  [best dense, plain epilogue: the ceiling]");
     if (&j == trel) std::printf("  [best trellis int8]");
@@ -875,12 +1076,13 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
     if (&j == trelC) std::printf("  [best trellis, both scales coarse: bound]");
     if (&j == trelA) std::printf("  [best trellis, activation scale per row only: bound]");
     if (&j == trelW) std::printf("  [best trellis, weight scale per column only: bound]");
+    if (&j == trelCP) std::printf("  [best trellis, COARSE PRODUCTION kernel (A per row, W per column; R4DX_PREFILL_INT8_SCALES=coarse)]");
     if (&j == f16best && &j != ship) std::printf("  [best f16 config]");
     std::printf("\n");
     if (json && j.kind != "f16alt") {
       std::fprintf(json, "%s {\"kind\":\"time\",\"shape\":\"%s\",\"kb\":%d,\"job\":\"%s\",\"class\":\"%s\",\"verified\":%s,\"us_median\":%.2f,\"tflops\":%.2f,\"speedup_vs_shipped\":%.4f}\n",
                    json_first ? "" : ",", s.name, kb, j.name.c_str(), j.kind.c_str(), j.verified ? "true" : "false", med,
-                   j.kind == "quant" ? 0.0 : flops / (med * 1e-6) / 1e12, j.kind == "quant" ? 0.0 : Median(Ratio(ship->t, j.t)));
+                   j.kind == "quant" || j.kind == "quantrow" ? 0.0 : flops / (med * 1e-6) / 1e12, j.kind == "quant" || j.kind == "quantrow" ? 0.0 : Median(Ratio(ship->t, j.t)));
       json_first = false;
     }
   }
@@ -894,6 +1096,8 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
   if (trelC) { r.trellisC = trelC->t; r.n_trellisC = trelC->name; }
   if (trelA) { r.trellisA = trelA->t; r.n_trellisA = trelA->name; }
   if (trelW) { r.trellisW = trelW->t; r.n_trellisW = trelW->name; }
+  if (trelCP) { r.trellisCP = trelCP->t; r.n_trellisCP = trelCP->name; }
+  if (quantrow) r.quantrow = quantrow->t;
   if (quant) r.quant = quant->t;
   r.ok = dense && dplain && trel;
   results[std::string(s.name) + "/" + std::to_string(kb)] = r;
@@ -904,10 +1108,10 @@ static void ShapeRun(const Shape& s, int kb, int rounds, int batch, bool do_veri
 // combined report over classes (weights = layer counts, or 1 for the MLP pair)
 static void Combined(const char* title, const std::map<std::string, ClassResult>& res, const std::vector<std::string>& names, bool weighted,
                      int kb, FILE* json, bool& json_first, bool decide) {
-  std::vector<const std::vector<double>*> ship, f16b, dn, dp, tr, dnC, trC, trA, trW, qa;
+  std::vector<const std::vector<double>*> ship, f16b, dn, dp, tr, dnC, trC, trA, trW, qa, trCP, qr;
   std::vector<int> w;
   std::string picks;
-  bool haveC = true;
+  bool haveC = true, haveCP = true;
   for (const std::string& n : names) {
     auto it = res.find(n + "/" + std::to_string(kb));
     if (it == res.end() || !it->second.ok) {
@@ -919,6 +1123,8 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
     ship.push_back(&r.ship); f16b.push_back(&r.f16best); dn.push_back(&r.dense); dp.push_back(&r.denseplain); tr.push_back(&r.trellis); qa.push_back(&r.quant);
     if (r.denseC.empty() || r.trellisC.empty() || r.trellisA.empty() || r.trellisW.empty()) haveC = false;
     else { dnC.push_back(&r.denseC); trC.push_back(&r.trellisC); trA.push_back(&r.trellisA); trW.push_back(&r.trellisW); }
+    if (r.trellisCP.empty() || r.quantrow.empty()) haveCP = false;
+    else { trCP.push_back(&r.trellisCP); qr.push_back(&r.quantrow); }
     w.push_back(weighted ? r.count : 1);
     picks += (picks.empty() ? "" : " + ") + n + ":[" + r.n_trellis + "]";
   }
@@ -940,6 +1146,14 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
     std::printf("     SPEED BOUNDS with coarser scales (NOT the per-128 math; each needs its own accuracy gate): trellis int8 with both scales coarse x%.3f (dense x%.3f), "
                 "activation scale per row only x%.3f, weight scale per column only x%.3f, vs shipped plan\n", rc_t, rc_d, ra_t, rw_t);
   }
+  double rcp = 0, rcp_q = 0, rcp_vs_blk = 0;
+  if (haveCP) {   // the production coarse kernel (RESC 4): R4DX_PREFILL_INT8_SCALES=coarse
+    const auto TCP = SumRounds(trCP, w), QR = SumRounds(qr, w);
+    std::vector<double> TCPq(TCP.size());
+    for (size_t i = 0; i < TCP.size(); ++i) TCPq[i] = TCP[i] + QR[i];
+    rcp = Median(Ratio(S, TCP)); rcp_q = Median(Ratio(S, TCPq)); rcp_vs_blk = Median(Ratio(T, TCP));
+    std::printf("     COARSE PRODUCTION kernel (R4DX_PREFILL_INT8_SCALES=coarse, A per row, W per column, exact reference verified): %9.1f us, x%.3f vs shipped plan (x%.3f with the unfused per-row quantizer, %.1f us), x%.3f vs the per-128 int8 kernel; accuracy is its own KL gate\n", Median(TCP), rcp, rcp_q, Median(QR), rcp_vs_blk);
+  }
   if (decide) {
     const double sp = Median(r_t);
     std::printf("     DECISION RULE on this pair: GO if trellis int8 >= 1.40x, STOP if < 1.15x  ->  %s (x%.3f)\n",
@@ -955,20 +1169,21 @@ static void Combined(const char* title, const std::map<std::string, ClassResult>
       std::printf("     CAUTION: the GO is against the shipped plan only; a better f16 configuration of the same unit already closes the gap to x%.3f\n", Median(r_tb));
   }
   if (json) {
-    std::fprintf(json, "%s {\"kind\":\"combined\",\"title\":\"%s\",\"kb\":%d,\"shipped_us\":%.2f,\"trellis_int8_us\":%.2f,\"speedup\":%.4f,\"speedup_with_aquant\":%.4f,\"speedup_vs_best_f16\":%.4f,\"dense_plain_speedup\":%.4f,\"dense_epi_speedup\":%.4f,\"coarse_trellis_speedup\":%.4f,\"coarse_dense_speedup\":%.4f,\"act_row_only_speedup\":%.4f,\"wgt_col_only_speedup\":%.4f}\n",
-                 json_first ? "" : ",", title, kb, Median(S), Median(T), Median(r_t), Median(r_tq), Median(r_tb), Median(r_dp), Median(r_d), rc_t, rc_d, ra_t, rw_t);
+    std::fprintf(json, "%s {\"kind\":\"combined\",\"title\":\"%s\",\"kb\":%d,\"shipped_us\":%.2f,\"trellis_int8_us\":%.2f,\"speedup\":%.4f,\"speedup_with_aquant\":%.4f,\"speedup_vs_best_f16\":%.4f,\"dense_plain_speedup\":%.4f,\"dense_epi_speedup\":%.4f,\"coarse_trellis_speedup\":%.4f,\"coarse_dense_speedup\":%.4f,\"act_row_only_speedup\":%.4f,\"wgt_col_only_speedup\":%.4f,\"coarse_production_speedup\":%.4f,\"coarse_production_speedup_with_rowquant\":%.4f,\"coarse_production_vs_blk128\":%.4f}\n",
+                 json_first ? "" : ",", title, kb, Median(S), Median(T), Median(r_t), Median(r_tq), Median(r_tb), Median(r_dp), Median(r_d), rc_t, rc_d, ra_t, rw_t, rcp, rcp_q, rcp_vs_blk);
     json_first = false;
   }
   (void)picks;
 }
 
 static int RealMain(int argc, char** argv) {
-  std::string outp, shape = "all", mode = "all", kbs = "both", emit_rows;
+  std::string outp, shape = "all", mode = "all", kbs = "both", emit_rows, emit_rows_coarse;
   int rounds = 11, batch = 6, simds = 128;
-  bool quick = false, noverify = false, no_resc = false, verbose = false;
+  bool quick = false, noverify = false, no_resc = false, no_coarse = false, verbose = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
     else if (!std::strcmp(argv[i], "--emit-rows") && i + 1 < argc) emit_rows = argv[++i];
+    else if (!std::strcmp(argv[i], "--emit-rows-coarse") && i + 1 < argc) emit_rows_coarse = argv[++i];
     else if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--batch") && i + 1 < argc) batch = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--simds") && i + 1 < argc) simds = std::atoi(argv[++i]);
@@ -978,6 +1193,7 @@ static int RealMain(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--quick")) quick = true;
     else if (!std::strcmp(argv[i], "--noverify")) noverify = true;
     else if (!std::strcmp(argv[i], "--no-resc")) no_resc = true;
+    else if (!std::strcmp(argv[i], "--no-coarse")) no_coarse = true;
     else if (!std::strcmp(argv[i], "--verbose")) verbose = true;
     else { std::fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
   }
@@ -1007,6 +1223,8 @@ static int RealMain(int argc, char** argv) {
     std::printf("== selftest (small shapes, CPU references) ==\n");
     SelftestWmma();
     for (int kb : {4, 5}) SelftestGemms(kb);
+    if (!no_coarse)
+      for (int kb : {4, 5}) SelftestCoarse(kb);
     std::printf("selftest: %s (%d failing)\n", g_selftest_fails ? "FAILED" : "all pass", g_selftest_fails);
     fails += g_selftest_fails;
     if (g_selftest_fails) {
@@ -1025,7 +1243,7 @@ static int RealMain(int argc, char** argv) {
     if (kbs == "5" || kbs == "both") kbl.push_back(5);
     std::map<std::string, ClassResult> results;
     for (int kb : kbl) {
-      for (const Shape& s : shapes) ShapeRun(s, kb, rounds, batch, do_verify, do_time, !no_resc, verbose, json, json_first, results, fails);
+      for (const Shape& s : shapes) ShapeRun(s, kb, rounds, batch, do_verify, do_time, !no_resc, !no_coarse, verbose, json, json_first, results, fails);
       if (do_time) {
         Combined("MLP PAIR (mlp.gate_up + mlp.down)", results, {"gate_up", "down"}, false, kb, json, json_first, true);
         Combined("ALL SEVEN LINEAR CLASSES", results, {"gate_up", "down", "qkv", "z", "out", "qg", "kv"}, true, kb, json, json_first, false);
@@ -1033,15 +1251,18 @@ static int RealMain(int argc, char** argv) {
     }
   }
   if (json) { std::fprintf(json, "]}\n"); std::fclose(json); }
-  if (!emit_rows.empty()) {
-    if (!do_time || g_emit_rows.empty()) {
-      std::fprintf(stderr, "--emit-rows needs a timing run (--mode time or all) that verified at least one trellis configuration\n");
+  // --emit-rows (the per-128 kernel, gemm_tuning_table_trellis_i8.inc) and --emit-rows-coarse (the coarse production kernel,
+  // gemm_tuning_table_trellis_i8c.inc): the same rule, the same file shape, a different table name
+  const auto emit = [&](const std::string& path, const std::vector<EmitRow>& rows, const char* flag, const char* table, const char* what) -> int {
+    if (path.empty()) return 0;
+    if (!do_time || rows.empty()) {
+      std::fprintf(stderr, "%s needs a timing run (--mode time or all) that verified at least one trellis configuration%s\n", flag, rows.empty() ? " of this kernel" : "");
       return 2;
     }
-    FILE* f = std::fopen(emit_rows.c_str(), "wb");
-    if (!f) { std::fprintf(stderr, "cannot write %s\n", emit_rows.c_str()); return 2; }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "cannot write %s\n", path.c_str()); return 2; }
+    std::fprintf(f, "// GENERATED by tests/kernels/tool_int8_gemm_proto.exe %s (docs/int8-prefill.md).\n// %s\n", flag, what);
     std::fprintf(f,
-                 "// GENERATED by tests/kernels/tool_int8_gemm_proto.exe --emit-rows (docs/int8-prefill.md \"Production path\").\n"
                  "// Measured on %s (%s), %d rounds x batch %d, cold weights, random trellis words, Gaussian A. One row per\n"
                  "// (N, K, KB): the best verified trellis int8 configuration (skw K slices per workgroup, skg K groups across the\n"
                  "// grid) by median time and, among those within 1%% of it, the smallest skg. linear.cpp includes this file inside\n"
@@ -1050,13 +1271,17 @@ static int RealMain(int argc, char** argv) {
                  prop.name, prop.gcnArchName, rounds, batch);
     if (shape != "all" || kbs != "both")
       std::fprintf(f, "// WARNING: a partial run (--shape %s --kb %s): merge by hand, this file does not cover every class\n", shape.c_str(), kbs.c_str());
-    std::fprintf(f, "const TrellisI8Row kTrellisI8Table[] = {\n");
-    for (const EmitRow& r : g_emit_rows)
+    std::fprintf(f, "const TrellisI8Row %s[] = {\n", table);
+    for (const EmitRow& r : rows)
       std::fprintf(f, "    {%d, %d, %d, %d, %d},  // %s KB%d %.1f us\n", r.N, r.K, r.kb, r.skw, r.skg, r.cls.c_str(), r.kb, r.us);
     std::fprintf(f, "};\n");
     std::fclose(f);
-    std::printf("wrote %zu rows to %s\n", g_emit_rows.size(), emit_rows.c_str());
-  }
+    std::printf("wrote %zu rows to %s\n", rows.size(), path.c_str());
+    return 0;
+  };
+  if (const int rc = emit(emit_rows, g_emit_rows, "--emit-rows", "kTrellisI8Table", "The tuning table of the per-128 int8 prefill GEMM (r4d_gemm_trellis_nt_i8, R4DX_PREFILL_INT8).")) return rc;
+  if (const int rc = emit(emit_rows_coarse, g_emit_rows_coarse, "--emit-rows-coarse", "kTrellisI8cTable",
+                          "The tuning table of the COARSE-scale int8 prefill GEMM (r4d_gemm_trellis_nt_i8c, R4DX_PREFILL_INT8_SCALES=coarse).")) return rc;
   std::printf("%s (%d failing checks)\n", fails == 0 ? "ALL OK" : "FAILED", fails);
   return fails == 0 ? 0 : 1;
 }

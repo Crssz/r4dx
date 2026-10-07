@@ -14,6 +14,11 @@ linears, so it is now a real prefill path, `R4DX_PREFILL_INT8`: see "Production 
 "Production path"). `R4DX_FAKEQ_ACT` / `R4DX_FAKEQ_W` below are still experiments and, when set, win over the default.
 It is not on `main` yet: it is on branch `fast`.
 
+Update (2026-10-07, branch `int8v2`): two follow-ups on top of `main`, both with their own kill switch and both GPU-untested when they were written: the
+fused activation quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, default on; "The fused quantizer" below) and an opt-in COARSE-scale mode
+(`R4DX_PREFILL_INT8_SCALES=coarse`: one activation scale per row, one weight scale per column, no per-128 rescale; "Coarse scales"
+below). `blk128`, the default of the second, is today's bytes.
+
 The question: a trellis linear's GEMM (docs/trellis-kernel.md, docs/trellis-m256.md) multiplies an f16
 activation tile, the input after the 128-block Hadamard rotation, by on-the-fly decoded weights on f16 WMMA.
 An int8 prefill GEMM would feed int8 activations instead. What do the int8 activations cost in accuracy? The
@@ -476,7 +481,7 @@ KL(off || on).
 
 * `r4d_gemm_trellis_nt_i8.hip` (in `R4D_UNITS`, a unit of its own: the ISA of a kernel moved by a few instructions when other
   instantiations shared its unit, see "OFF path") instantiates only `i8g_kernel<TRELLIS = true, KB in {4, 5}, FWHT = true,
-  RESC = 0, SKW in {2, 4, 8}>`, 6 kernels. The device code is `r4d_trellis_i8.h` (the `I8G_EMU` hooks kept: the bench, the
+  RESC = 0, SKW in {2, 4, 8}>`, 6 kernels (and, since `R4DX_PREFILL_INT8_SCALES=coarse`, the same with `RESC = 4`: 12, see "Coarse scales"). The device code is `r4d_trellis_i8.h` (the `I8G_EMU` hooks kept: the bench, the
   host-emulation test and the unit compile the one source), the layouts `r4d_trellis_i8_layout.h`. The dense kernel, the
   RESC 1..3 speed bounds and the reference kernel stay bench-only (`tests/kernels/int8_gemm_proto_kernels.h`).
 * Entries (`r4d.h`, wrapped in `r4d.hpp`, one row in the kernel registry): `r4d_trellis_i8_wscale(_count)`,
@@ -581,6 +586,137 @@ left to the L2 and the unfused quantizer's dword stores are not reproduced; if t
 fix is a 4-lane shuffle into dwords. TP = 2 still runs f16 (no int8 scopes), so nothing of this applies there. The Gemma 4 trellis
 producers (`r4dx_gelu_tanh_mul_trellis_bf16`) are not wired (that model has no int8 path).
 
+### Coarse scales (`R4DX_PREFILL_INT8_SCALES=coarse`, branch `int8v2`)
+
+Status: written, built and CPU-tested; every GPU check below is written and NOT run (the writing session was CPU only). Opt-in; the
+default is `blk128`, today's bytes, unchanged.
+
+**What it is.** The per-128 GEMM rescales the int32 partial sum of every 128 K into fp32 (cvt + mul + fma per output element, about
+165 of ~860 clk per 128 K per wave in the cycle model of docs/int8-gemm-proto.md, WMMA and VALU not overlapping), because both
+scales change every 128 K. With ONE activation scale per ROW (amax over the whole K of the row, per A part) and ONE weight scale per
+output COLUMN of Q (amax over the whole K), the int32 accumulator can run over the whole K slice and be multiplied once, after the
+K loop, by `sa[row] * sw[col]`; then the unchanged epilogue (LDS reduction over the slices, fp32 partials in `ws`, ticket,
+FWHT-128, svh, `out_scale`, one bf16 rounding). The bench measured the bound of this idea (RESC 1: x1.56 to x1.58 against the
+shipped f16 plan, against x1.37 for the per-128 kernel); this is the production kernel of it.
+
+| | `blk128` (default) | `coarse` |
+|---|---|---|
+| activation scale | per (row, 128 k): SA `[K/128][256]` | per row: SA `[256]` per A part |
+| weight scale (the f16-`rs` rule of `i8g_wscale`: `s = amax / 127` (1 for all zero), `rs = f16(min(1 / s, 60000))`, `q = rint(w rs)`, table `s_eff = 1 / rs`) | per (column, 128 k): `[K/128][N]` fp32, 0.708 GiB on the 27B | per column over the whole K: `[N]` fp32, 4 N bytes per linear, **14.9 MiB on the 27B** (3,899,392 columns), a saving of 0.69 GiB |
+| int32 accumulation | per 128 K, then `acc_f32 += float(int32) * (sa * sw)` | the whole K slice, one `float(int32) * (sa[row] * sw[col])` at the end |
+| the weight's f16 `rs` | formed per 128 K from the table | formed once per kernel (two `v_rcp_f32`), the loop reads neither SA nor SW |
+| kernel | `i8g_kernel<TRELLIS, KB, FWHT, RESC = 0, SKW>` | `RESC = 4`, 6 more instantiations in the same unit (12 kernels, max 192 VGPRs, no scratch; RESC 4 itself 149 / 160 VGPRs at KB 4 / 5) |
+
+**Overflow.** `|q| <= 127` on both sides (the weight's amax maps to 127 and f16 `rs` is within 2^-11, `|w rs| <= 127.07`, no clamp). An int32
+accumulator holds one K slice, `K / (skw skg)` terms: at most K / 2 = 8704 terms (K = 17408, skw 2, skg 1) x 127 x 127 = 1.4e8,
+below 2^31 = 2.1e9 (the whole row is 2.8e8, also below). The slices are summed in fp32 (`ws`, the SKG partials), never in int32, so
+the split-K path cannot overflow either. The emulation test runs that worst case (every operand +127 at K = 17408, three `(skw, skg)`).
+
+**The pieces.**
+
+| piece | where |
+|---|---|
+| the kernel: `RESC = 4` (the bench's RESC 1 bound with its own tables; the SA / SW loads of the K loop are compiled out) | `third_party/libr4d/r4d_trellis_i8.h`; instantiated in `r4d_gemm_trellis_nt_i8.hip` |
+| entries `r4d_gemm_trellis_nt_i8c` (the per-128 entry's contract and legality, SA `[256]`, SWC `[N]`), `r4d_trellis_i8_wscale_col` (+ `_count` = N), `r4d_trellis_i8_dump_w_col` (test diagnostic), `r4d_trellis_i8_quant_act_row` | `r4d.h`, wrapped in `r4d.hpp` (`GemmTrellisNtI8c`, `TrellisI8WscaleColBuild`, `TrellisI8QuantActRow`, ...); the registry row of `gemm_trellis_nt_i8` names the coarse mode |
+| the column table: one workgroup of 8 waves per tile pair, wave w takes the 128-groups w, w + 8, ..., exact amax joined by `xor 16` and an LDS reduction | `i8g_wscale_col` |
+| the row quantizer, one workgroup (256 threads) per row: amax over the row, `s = amax / 127` (1 for all zero), `q = clamp(rint(x / s), -127, 127)`, 8-byte segments straight into the A8 fragment layout | `i8g_quant_row_wg` (`r4d_trellis_i8_fused.h`), the one function the stand-alone kernel `i8g_quant_act_row` and the producers call |
+| **the producers: fused**, `r4dx_trellis_input_i8r` / `r4dx_silu_mul_trellis_i8r` / `r4dx_attn_gate_mul_trellis_i8r` | `src/kernels/src/trellis_transform.hip`, `kernels.h` |
+| the model: `ModelOptions::prefill_int8_scales`, `QuantLinear::trellis_i8_swc`, `TrellisI8Coarse(w)`, `PlanTrellisI8(..., coarse)`, `BuildTrellisI8Scale(w, stream, coarse)`, `AllocTrellisI8Operand(..., coarse)` | `model.h`, `quant_linear.h`, `linear.h` / `linear.cpp`, `container.cpp`, `model.cpp`, `mlp.cpp`, `attention_layer.hpp` |
+| the tuning table | `src/model/gemm_tuning_table_trellis_i8c.inc` |
+
+**The fused producer, and why it is a different kernel from task A's.** The row's amax needs the whole row, which no single
+(row, 128-block) wave has, so the per-128 fused producers' structure (a wave32 per block, grid (K / 128, 256)) does not carry over. The
+coarse producers are one workgroup of 8 waves per row (grid 256): wave w transforms the row's 128-blocks w, w + 8, ... with the same
+arithmetic as the f16 producers (x * suh in fp32, the butterfly, the product by the scale as an fp32 value, ONE rounding to f16),
+parks the f16 bits in a row buffer in LDS (`nout * K * 2 + 64` bytes: 10 KiB for gate_up's two parts, 30 KiB for the shared qg / k / v,
+34 KiB for mlp.down's 17408; a host check throws beyond 64 KiB), one barrier, then `i8g_quant_row_wg` quantizes the row. So there is
+no f16 A in memory and no separate quantizer launch, as in task A, and A8 / SA are byte for byte what the stand-alone row quantizer
+makes from the f16 A (the GPU test compares them). The per-128 fused producers, `TransformBlockQ8` and the f16 kernels are untouched
+(`compare_isa_listings.ps1`, before / after, on `trellis_transform.hip`: the 9 f16 kernels and the 3 per-128 fused kernels IDENTICAL;
+the three new ones use 50 to 68 VGPRs, no scratch). The row kernels copy the transform's arithmetic instead of sharing a helper with
+the per-128 kernels for exactly that reason (a refactor of those moved their ISA).
+
+The price that is not measured: 256 workgroups x 8 waves is 2048 waves against the per-128 fused producers' up to 34816 (K = 17408), and
+LDS bounds the residency of the 34 KiB mlp.down row to about 3 workgroups per WGP, so the coarse producers have less latency hiding. The
+stand-alone row quantizer's time is a bench job (`quantize A per row`); the fused kernels' time shows only in the end-to-end A/B
+(`ttft_cli.ps1`). If it shows, the follow-ups are more threads per row (the function is written for 256, `red` and the loop strides are
+the only places) or a split row (a cluster of workgroups with an atomic max).
+
+**One decision, consistently.** Whether a linear is coarse is a property of its weight table: `TrellisI8Coarse(w)` is
+`!w.trellis_i8_swc.empty()`. `Model::Load` builds, per linear, the table of the model's mode and never both (with coarse the per-128
+table is NOT allocated: the Load line prints the VRAM figure, `0.0145 GiB` expected on the 27B, against 0.708). `ApplyLinear` reads the
+linear's own table to pick the plan row, the operand layout (`AllocTrellisI8Operand`: SA `parts x 256` floats), the quantizer
+(`r4dx_*_i8r` / `TrellisI8QuantActRow`) and the GEMM entry; every producer asks the same function for the linear whose A it makes
+(`SharedTrellisInput` also requires one scale mode across its group, else it falls back to f16 A for all and each linear quantizes its
+own). `R4DX_PREFILL_INT8_FUSEDQ=0` composes: the separate chain is then `r4d_trellis_i8_quant_act_row` over the f16 A (the test oracle
+as well as the kill switch).
+
+**Switches.**
+
+| | |
+|---|---|
+| `R4DX_PREFILL_INT8_SCALES` (read once; unset, empty, `blk128`: the default; `coarse`; anything else warns and keeps the default) | `ModelOptions::prefill_int8_scales`: -1 follows it, 0 forces blk128, 1 coarse (the tests load both in one process). It matters only where the int8 GEMM is on (`R4DX_PREFILL_INT8` not `0`, a TP = 1 trellis Model with 256-row chunks); the Gemma 4 model ignores it |
+| load line | `prefill int8: ON (...): ... scales COARSE (R4DX_PREFILL_INT8_SCALES=coarse): A per row, weights per column, over the whole K, ...; N of M trellis linears have a weight scale table, <x> GiB` |
+| kill switch | unset / `blk128`: today's table, kernels and bytes (the 6 RESC-0 kernel bodies are ISA-identical to before this work: `compare_isa_listings.ps1 -Pattern 'i8g_kernelILb1ELi[45]ELb1ELi0ELi[248]E'`) |
+
+**Tuning table.** `gemm_tuning_table_trellis_i8c.inc` is SEEDED with the per-128 table's rows (legal for the kernel, the same check),
+not measured: the coarse loop is lighter and its best `(skw, skg)` is likely different. `tool_int8_gemm_proto.exe` sweeps and times
+the coarse production kernel (`trellisCP` jobs, every legal configuration, verified against the exact coarse reference first, plus the
+stand-alone row quantizer) and `--emit-rows-coarse <file>` writes the table in the per-128 table's shape and rule (best verified
+median, then the smallest skg within 1%); paste it over the .inc.
+
+**Accuracy.** Fake quantization on the prefill path (baseline KL 0.00751): per-128 both sides 0.00807, W per column + A per row
+0.00838, inside the 0.01 budget. The real kernel is what the gate below measures (the f16-`rs` rule differs from the fp32 rule of the
+fake quantizer by one LSB on 0.58% of weights). CPU, Gaussian data (`test_int8_gemm_proto_cpu`, K = 1024): relative RMS error of the
+product against the f16 x f16 one 0.0112 coarse vs 0.0092 per-128. A row with one large element (the model's outlier rows after the
+Hadamard rotation are the rule's worst case) gets a coarse scale far above the rest of its row; the bench selftest and the GPU test
+include such a row, only the KL gate says what it costs on real activations.
+
+**Expected speed (a prediction, not a result).** Cycle model: 860 clk per 128 K per wave for the per-128 trellis kernel, 700 without the
+rescale: x1.23 of the kernel; the bench's RESC 1 bound over the per-128 production plan, x1.56 / x1.37, is x1.14. The coarse
+producers replace the per-128 ones. Linears are about three quarters of the 8k prefill, so the kernel gain is a few percent to 10% of
+TTFT: 8k from 3.6 s to about 3.3 to 3.5 s, minus whatever the row producers cost against task A's.
+
+**Tests.**
+
+| test | where | status |
+|---|---|---|
+| the coarse CPU references (`QuantizeWeightsColRef`, `QuantizeActRowRef`): range, amax -> 127, all-zero row / column -> scale 1, the coarse scale is the max of the per-128 ones, K = 128 equals per-128 bit for bit; the kernel chain (`EmuKernel` RESC 1 = RESC 4's math) vs the exact reference at five K splits; the accuracy price on Gaussian data; the int32 bound | `tests/kernels/test_int8_gemm_proto_cpu.cpp` (CPU) | PASS |
+| the kernel SOURCE as plain C++: `i8g_quant_act_row` and the producers' LDS form of `i8g_quant_row_wg` vs the CPU row quantizer (K 1024 two parts, K 17408, zero rows, a one-nonzero row); `i8g_wscale_col` and `i8g_dump_w<COARSE>` vs the CPU table / int8 matrix; `i8g_kernel` RESC 4 (trellis KB 4 / 5, every legal `(skw, skg)`) vs the exact coarse reference, byte for byte vs its dense twin and vs RESC 1 on the same operands replicated per 128, one-hot byte-exact, two A parts vs two single-part launches, tickets reset; K = 17408 with every operand +127 | `tests/kernels/test_int8_gemm_proto_emu.cpp` (CPU, 19 new checks, 287 s in total) | PASS (39 checks) |
+| the parser, the option, the coarse plan for the seven classes at both rates, the coarse table (14 rows, legal, same classes as the per-128 one) | `tests/model/test_prefill_int8_cpu.cpp` (CPU) | PASS (263 checks) |
+| `r4d_gemm_trellis_nt_i8c` on the 14 classes (TP = 1 and TP = 2 shards) x KB 4 / 5: A the column table, the int8 weights and the row quantizer vs the CPU; B every legal `(skw, skg)` vs the exact reference (+ a 2% negative control); C one-hot byte-exact; D two parts vs single-part launches; E repeats and tickets; F f16 / coarse / f16 on one linear; G row independence; the refusals | `tests/kernels/test_trellis_i8_gemm.cpp` `RunCaseCoarse` (GPU) | built, not run |
+| `r4dx_*_i8r` byte for byte vs the f16 producers + `TrellisI8QuantActRow`, all the per-128 test's shapes, canaries, poison, negative control, preconditions, the LDS limit | `tests/kernels/test_trellis_input_i8.cpp`, every test now runs twice (per-128, `[coarse]`) (GPU) | built, not run |
+| a Model with `prefill_int8_scales = 1`: fused chain == separate chain byte for byte (logits of every call, KV, GDN state, decode tokens), the operand counters, a rerun gives the same bytes, KV differs from f16's and from per-128's, KL bounds | `tests/model/test_prefill_int8.cpp` `RunFusedQ(scales = 1)`, a fifth load, about 3 more minutes (GPU) | built, not run |
+| selftest, verify, sweep and timing of the production coarse kernel and the stand-alone row quantizer | `tool_int8_gemm_proto.exe` (`SelftestCoarse`, `trellisCP`, `quantrow`; builds with `build_int8_gemm_proto.ps1`) | built, not run |
+
+**What still needs the GPU (the main session; device 1, one job at a time).**
+
+```
+# C1. the kernel and producer bit-tests (a few minutes each; test_trellis_i8_gemm now also runs the coarse cases)
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\kernels\test_trellis_i8_gemm.exe; exit `$LASTEXITCODE"
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\kernels\test_trellis_input_i8.exe; exit `$LASTEXITCODE"
+# C2. the Model test (five loads of the 27B, about 16 minutes): per-128 identity unchanged, the coarse fused-vs-separate chain
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\model\test_prefill_int8.exe; exit `$LASTEXITCODE"
+# C3. the bench: selftest (includes the coarse kernel), verify, the sweep and the coarse tuning rows (machine idle, about 25 minutes)
+powershell -NoProfile -File C:\Users\pay20\dev\r4dx-int8v2\tests\kernels\build_int8_gemm_proto.ps1 -Out E:\models\r4dx\int8v2\obj
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & E:\models\r4dx\int8v2\obj\tool_int8_gemm_proto.exe --mode all --out E:\models\r4dx\int8v2\all.json --emit-rows E:\models\r4dx\int8v2\rows.inc --emit-rows-coarse E:\models\r4dx\int8v2\rows_c.inc 2>&1 | Tee-Object -FilePath E:\models\r4dx\int8v2\all.log; exit `$LASTEXITCODE"
+#     pass: the selftest and every verify line pass; the line "COARSE PRODUCTION kernel ... x<r> vs shipped plan" per (KB, summary) is the speed;
+#     then copy rows_c.inc over src\model\gemm_tuning_table_trellis_i8c.inc (rebuild, run test_prefill_int8_cpu) 
+# C4. accuracy, the chunked canon prefill with the real kernel (KL(f16 || coarse) and KL(per-128 || coarse); gates as for the per-128 default)
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8_SCALES='coarse'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\run_kl.ps1 -Device 1 -Tool C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\model\tool_teacher_forced_logprobs.exe -Tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json -OutDir E:\models\r4dx\int8v2\kl-chunk-coarse; exit `$LASTEXITCODE"
+C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\kl_compare.py --ref E:\models\r4dx\int8prefill\kl-chunk-off --test E:\models\r4dx\int8v2\kl-chunk-coarse --tokens C:\Users\pay20\dev\r4dx-int8v2\tools\reference\kl_corpus\tokens_canon.json
+#     (the per-128 default's run, for the ratio: the same command without the variable, -OutDir ...\kl-chunk-blk128, and --ref kl-chunk-off --test that)
+#     8k / 32k: the same with -Tokens the tokens_long.json of G4c (tools\prefill\make_kl_tokens.py --lengths 8k,32k); the 32k code segment is the one to watch
+# C5. speed end to end: cold TTFT at 8k / 32k, coarse vs the default (and vs R4DX_PREFILL_INT8_FUSEDQ=0 coarse, which prices the row producers)
+powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8_SCALES='coarse'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k -Runs 3 -OutDir E:\models\r4dx\int8v2\ttft-coarse; exit `$LASTEXITCODE"
+```
+
+Gates for making coarse the default (it would need the same list as "Gates for making it the default" above, the KL ones against the
+f16 path and the speed ones against the per-128 default): KL(f16 || coarse) mean at most 0.0020, p99 at most 0.012, top-1 agreement at
+least 98.3% on the chunked canon; per-kind at most 0.003 at 8k and 32k with no row above 2 (the per-128 kernel sits at 0.0011 / 0.0017
+and 0.0104 at 32k, so there is little room at 32k code); and at least 3% faster cold TTFT than the per-128 default at 8k and 32k, else the
+accuracy it gives up buys nothing. What is NOT covered here, and not covered for the per-128 default either: TP = 2, images.
+
 ### Epilogue: a copy that cannot drift silently
 
 The int8 kernel's LDS reduction, ticket protocol, FWHT-128, svh, `out_scale` and bf16 rounding are a COPY of the shipped
@@ -628,7 +764,7 @@ kernels max 189 VGPRs, m256 22 kernels max 188, no scratch, 0 near dependencies;
 (49 and 22 kernels) are reported only.
 
 The int8 unit's own gate (`check_trellis_isa.cmake -DGEMM_KERNEL=i8g_kernel -DMAX_VGPR=192`): 6 kernels, max 192 VGPRs, no
-scratch, no spill, 822 asm VALU in the GEMM kernels, 0 near dependencies. Against the bench translation unit, where the GPU
+scratch, no spill, 822 asm VALU in the GEMM kernels, 0 near dependencies (12 kernels, 1644 asm VALU, still max 192, with the coarse ones). Against the bench translation unit, where the GPU
 numbers were measured, the 6 production bodies are IDENTICAL (`compare_isa_listings.ps1 -Pattern 'i8g_kernelILb1ELi[45]ELb1ELi0ELi[248]E'`);
 against the prototype's listing from before the two-part parameters, each kernel gained one VALU and a few scalar selects (10 387 ->
 10 406 instructions at KB 4 / skw 2, 10 565 -> 10 565 at KB 5 / skw 4).

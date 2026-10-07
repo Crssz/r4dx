@@ -12,6 +12,10 @@ moved to `third_party/libr4d/r4d_trellis_i8.h` (the bench and the emulation test
 `R4DX_PREFILL_INT8` (docs/int8-prefill.md "Production path"). The table of files below is the bench layer that remains under
 `tests/kernels/`; `int8_gemm_proto_kernels.h` no longer holds the kernels.
 
+Update (2026-10-07, branch `int8v2`): the RESC 1 speed bound below is now also a production kernel, `RESC = 4` (opt-in
+`R4DX_PREFILL_INT8_SCALES=coarse`: SA `[256]`, SW `[N]`, no per-128 rescale; docs/int8-prefill.md "Coarse scales"). It is the same
+`i8g_kernel` source; the bench times, sweeps and verifies it as `trellisCP` (`--emit-rows-coarse`).
+
 The question (docs/int8-prefill.md ends on it): accuracy is not the obstacle to an int8 prefill GEMM (full w8a8,
 one scale per 128 K on both sides, costs +0.0006 mean KL), so can an int8 x int8 GEMM at M = 256 beat the shipped
 f16 trellis kernel (docs/trellis-m256.md) by enough to be worth building? The earlier fp8 W8A8 dense prototype

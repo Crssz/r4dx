@@ -498,10 +498,47 @@ bool CheckPrefillAttnModeParse() {
   return ok;
 }
 
+// R4DX_PREFILL_SPLITKV_MIN's parse and its effect on the split law's depth check (CPU only).
+bool CheckPrefillSplitKvMinParse() {
+  namespace a = r4dx::model::attention;
+  struct C { const char* in; int want; };
+  const C cases[] = {{nullptr, a::kPrefillSplitKvMinUnset}, {"", a::kPrefillSplitKvMinUnset},
+                     {"bogus", a::kPrefillSplitKvMinUnset}, {"-1", a::kPrefillSplitKvMinUnset},
+                     {"1e4", a::kPrefillSplitKvMinUnset}, {"16k", a::kPrefillSplitKvMinUnset},
+                     {"99999999999999999999", a::kPrefillSplitKvMinUnset}, {"0", 0},
+                     {"8192", 8192}, {"16384", 16384}, {"32768", 32768}};
+  bool ok = true;
+  for (const C& c : cases) {
+    const int got = a::ParsePrefillSplitKvMin(c.in);
+    if (got != c.want) {
+      std::fprintf(stderr, "prefill split min parse: '%s' -> %d, want %d\n", c.in ? c.in : "(unset)",
+                   got, c.want);
+      ok = false;
+    }
+  }
+  // The law: the default threshold is today's 8192 (S=8 at 4 KV heads, 16 at 2), and min_ctx moves it.
+  struct L { int ctx, kv, min_ctx, want; };
+  const L laws[] = {{8191, 4, a::kPrefillSplitKvMinCtx, 1}, {8192, 4, a::kPrefillSplitKvMinCtx, 8},
+                    {8192, 2, a::kPrefillSplitKvMinCtx, 16}, {16383, 4, 16384, 1},
+                    {16384, 4, 16384, 8}, {32768, 4, 32768, 8}, {4096, 4, 0, 8}};
+  for (const L& l : laws) {
+    const int got = a::PrefillSplitKvSplits(l.ctx, 64, l.kv, l.min_ctx);
+    if (got != l.want || (l.min_ctx == a::kPrefillSplitKvMinCtx &&
+                          got != a::PrefillSplitKvSplits(l.ctx, 64, l.kv))) {
+      std::fprintf(stderr, "split law: ctx %d kv %d min %d -> %d, want %d\n", l.ctx, l.kv, l.min_ctx,
+                   got, l.want);
+      ok = false;
+    }
+  }
+  std::printf("prefill split min parse: %s\n", ok ? "PASS" : "FAIL");
+  return ok;
+}
+
 }  // namespace
 
 int main() {
   if (!CheckPrefillAttnModeParse()) return 1;
+  if (!CheckPrefillSplitKvMinParse()) return 1;
   // Same up-front presence checks every sibling in tests/model/ does (test_gdn_layer.cpp,
   // test_final_lm_head.cpp): both inputs are real, non-vendored data (docs/validation.md), so a
   // machine without them must SKIP (exit 77, tests/model/attention/CMakeLists.txt's

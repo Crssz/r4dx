@@ -58,8 +58,10 @@ namespace r4dx::model::attention {
 inline constexpr int kPrefillSplitKvMinCtx = 8192;
 inline constexpr int kPrefillSplitKvTargetWgs = 32;
 inline constexpr int kPrefillSplitKvMinTiles = 8;
-inline int PrefillSplitKvSplits(int ctx, int q_len, int kv_heads) {
-  if (ctx < kPrefillSplitKvMinCtx || q_len < 1 || kv_heads < 1) return 1;
+// `min_ctx` (default kPrefillSplitKvMinCtx) is the depth threshold; R4DX_PREFILL_SPLITKV_MIN sets it.
+inline int PrefillSplitKvSplits(int ctx, int q_len, int kv_heads,
+                                int min_ctx = kPrefillSplitKvMinCtx) {
+  if (ctx < min_ctx || q_len < 1 || kv_heads < 1) return 1;
   const int units = ((q_len + 63) / 64) * kv_heads;
   const int tiles = (ctx + 47) / 48;
   int s = 1;
@@ -101,6 +103,38 @@ inline int ParsePrefillAttnMode(const char* e) {
 }
 inline int PrefillSplitKvOverride() {
   static const int v = ParsePrefillAttnMode(std::getenv("R4DX_PREFILL_SPLITKV"));
+  return v;
+}
+
+// R4DX_PREFILL_SPLITKV_MIN (read once per process; only read in the "split" law mode): the context
+// depth, in tokens, at which the split law engages. "Context" is the call's seqused_k, i.e. the
+// tokens already in the KV cache plus the call's own rows (start_pos + 64 (j + 1) for 64-row slice
+// j), the same quantity the law's built-in 8192 is compared to. Per rank at TP=2 (the same depth
+// check, the law then gives that rank's kv_heads their segments).
+//   - unset or empty = kPrefillSplitKvMinUnset (-1): today's behaviour, threshold 8192 and the plain
+//     single-workgroup launch below it.
+//   - a non-negative integer N: threshold N, and every call below N (and any call where the law
+//     returns 1) takes the exact-wide launch instead of the plain one. Exact-wide is the plain
+//     launch's output bit for bit and about 2.3x faster per call, so this only changes speed.
+//   - anything else: a warning on stderr, then unset.
+inline constexpr int kPrefillSplitKvMinUnset = -1;
+inline int ParsePrefillSplitKvMin(const char* e) {
+  if (e == nullptr || *e == '\0') return kPrefillSplitKvMinUnset;
+  long long n = 0;
+  for (const char* p = e; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9' || n > 100000000LL) {
+      std::fprintf(stderr,
+                   "r4dx: R4DX_PREFILL_SPLITKV_MIN='%s' not a token count; using the default "
+                   "(%d, plain launch below it)\n",
+                   e, kPrefillSplitKvMinCtx);
+      return kPrefillSplitKvMinUnset;
+    }
+    n = n * 10 + (*p - '0');
+  }
+  return static_cast<int>(n);
+}
+inline int PrefillSplitKvMinOverride() {
+  static const int v = ParsePrefillSplitKvMin(std::getenv("R4DX_PREFILL_SPLITKV_MIN"));
   return v;
 }
 
@@ -385,11 +419,18 @@ class AttentionLayer {
       const int forced = prefill_split_kv ? PrefillSplitKvOverride() : 1;
       const int slice_rows = sliced ? attn_slice : T;
       const int n_slices = T / slice_rows;
+      // splits_of(j): > 1 split-KV segments, 1 the plain launch, 0 the exact-wide launch (only with
+      // R4DX_PREFILL_SPLITKV_MIN set: the calls the split law leaves unsplit run exact-wide).
+      const int min_env = (prefill_split_kv && forced == kPrefillAttnSplitLaw) ? PrefillSplitKvMinOverride()
+                                                                              : kPrefillSplitKvMinUnset;
       const auto splits_of = [&](int j) {
-        return !prefill_split_kv ? 1
-               : forced > 0     ? forced
-               : forced == kPrefillAttnExact ? 1
-                                : PrefillSplitKvSplits(start_pos + slice_rows * (j + 1), slice_rows, Hkv);
+        if (!prefill_split_kv) return 1;
+        if (forced > 0) return forced;
+        if (forced == kPrefillAttnExact) return 1;
+        const int ctx = start_pos + slice_rows * (j + 1);
+        if (min_env == kPrefillSplitKvMinUnset) return PrefillSplitKvSplits(ctx, slice_rows, Hkv);
+        const int s = PrefillSplitKvSplits(ctx, slice_rows, Hkv, min_env);
+        return s > 1 ? s : 0;
       };
       a.scratch = nullptr;
       a.q_len = slice_rows;
@@ -407,7 +448,7 @@ class AttentionLayer {
         a.out = attn_out + static_cast<size_t>(j) * slice_rows * H * D;
         a.seqused_k = sliced ? seqused_k_slices + j : seqused_k;
         const int splits = splits_of(j);
-        if (forced == kPrefillAttnExact) {
+        if (forced == kPrefillAttnExact || splits == 0) {
           a.splits = 0;  // the library's default exact-wide geometry
           ProfiledCall(prof, stream, "attn.core_prefill",
                        [&] { r4dx::core::r4d::AttnPrefillExactFp8Kv(a, stream); });

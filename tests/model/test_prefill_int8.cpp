@@ -226,7 +226,9 @@ std::vector<Scenario> Scenarios() {
 // logits of every call, every KV page, every GDN state, the decode tokens. One Model (int8 on), each scenario run twice,
 // with the switch scoped off (the separate chain) and on (ScopedTrellisI8FusedQ). Pair by pair rather than pass by pass:
 // Reset() leaves the KV pages alone and the digest covers them all, so run A and run B of one scenario must start from
-// the same stale pages, which they do (B rewrites exactly the positions A wrote). The operand counters prove each side ran
+// the same stale pages: a discarded warm-up run of the scenario goes first, so A starts from the pages a run leaves
+// (including its decode positions, which a call-0 digest sees before that run's own decode rewrites them), as B does.
+// The operand counters prove each side ran
 // the chain it is named for: off takes every operand from the separate quantizer, on from no separate quantizer at all.
 int RunFusedQ(const ModelOptions& base_in, int scales = 0, const std::vector<Scenario>* all_scs = nullptr, const Side* off = nullptr,
               const Side* on = nullptr) {
@@ -248,6 +250,12 @@ int RunFusedQ(const ModelOptions& base_in, int scales = 0, const std::vector<Sce
   using r4dx::model::TrellisI8OperandCountsGet;
   for (const Scenario& sc : scs) {
     const std::string cfg = stag + sc.name;
+    // Warm-up (discarded): a run leaves its decode positions in the KV pages, which the next run's first-call digest still
+    // sees before its own decode rewrites them, so A must start from the pages a run of this scenario leaves, as B does.
+    {
+      ScopedTrellisI8FusedQ off(0);
+      (void)RunScenario(m, sc);
+    }
     const TrellisI8OperandCounts c0 = TrellisI8OperandCountsGet();
     Obs a, b;
     {

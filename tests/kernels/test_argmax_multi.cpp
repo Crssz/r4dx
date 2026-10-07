@@ -178,7 +178,7 @@ int main() {
     m[200000] = -Inf();
     CheckRow(m, "NaN with -inf only (answer 0, not the first -inf)", true);
     std::vector<float> one(static_cast<size_t>(n), Nan());
-    one[247999] = -1e30f;
+    one[247999] = Widen(TruncBf16(-1e30f));  // bf16-exact, like every row CheckRow(..., true) gets
     CheckRow(one, "NaN with one finite", true);
     std::vector<float> nan0(static_cast<size_t>(n), -2.0f);
     nan0[0] = Nan();

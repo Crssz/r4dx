@@ -12,7 +12,9 @@
 # R4DX_FAKEQ_ACT (docs/int8-prefill.md) changes -- pass -ToolArgs '--tail-rows','1023','--tail-path','prefill'
 # (every row through a one-token Prefill call; 1023 = T - 1 of the 1024-token canon segments, so the dump is
 # still [T-1, V] and scoreable here). Such a run is a different path from the frozen numbers: use -NoGate
-# -CompareDir '' and read it against an unquantized run of the same arguments.
+# -CompareDir '' and read it against an unquantized run of the same arguments, or -NoGate -CompareDir <dir of that
+# run> to also get the byte comparison (under -NoGate the comparison runs only for an explicit -CompareDir, and
+# exits 1 when a segment differs).
 #
 # A KL number is only meaningful against the bf16 reference of the SAME model: the default -RefDir is
 # huihui\kl-ref (tools/reference/full_logits_golden.py on the Huihui checkpoint, tokens_canon.json).
@@ -88,16 +90,18 @@ $fail = @()
 if (-not $NoGate) {
   if ([math]::Round($kl, 5) -ne [math]::Round($ExpectKl, 5)) { $fail += ("mean KL {0:F5} != frozen {1:F5}" -f $kl, $ExpectKl) }
   if ([math]::Round($top1, 2) -ne [math]::Round($ExpectTop1, 2)) { $fail += ("top-1 {0:F2}% != frozen {1:F2}%" -f $top1, $ExpectTop1) }
-  if ($CompareDir) {
-    $ref = @(Get-ChildItem (Join-Path $CompareDir '*.logprobs.f16') | Sort-Object Name)
-    if ($ref.Count -eq 0) { $fail += "no *.logprobs.f16 in $CompareDir" }
-    foreach ($f in $ref) {
-      $c = Join-Path $OutDir $f.Name
-      if (-not (Test-Path $c)) { $fail += "$($f.Name) missing in $OutDir"; continue }
-      $same = ((Get-FileHash -Algorithm SHA256 $f.FullName).Hash -eq (Get-FileHash -Algorithm SHA256 $c).Hash)
-      Write-Host ("[kl_rung4]   {0,-28} {1} vs {2}" -f $f.Name, $(if ($same) { 'byte-identical' } else { 'DIFFERENT' }), $CompareDir)
-      if (-not $same) { $fail += "$($f.Name) differs from $CompareDir" }
-    }
+}
+# The byte comparison runs under the gate, and under -NoGate only when -CompareDir was passed explicitly (the
+# default CompareDir is the frozen run, which an -NoGate run of another path or model is not meant to equal).
+if ($CompareDir -and (-not $NoGate -or $PSBoundParameters.ContainsKey('CompareDir'))) {
+  $ref = @(Get-ChildItem (Join-Path $CompareDir '*.logprobs.f16') | Sort-Object Name)
+  if ($ref.Count -eq 0) { $fail += "no *.logprobs.f16 in $CompareDir" }
+  foreach ($f in $ref) {
+    $c = Join-Path $OutDir $f.Name
+    if (-not (Test-Path $c)) { $fail += "$($f.Name) missing in $OutDir"; continue }
+    $same = ((Get-FileHash -Algorithm SHA256 $f.FullName).Hash -eq (Get-FileHash -Algorithm SHA256 $c).Hash)
+    Write-Host ("[kl_rung4]   {0,-28} {1} vs {2}" -f $f.Name, $(if ($same) { 'byte-identical' } else { 'DIFFERENT' }), $CompareDir)
+    if (-not $same) { $fail += "$($f.Name) differs from $CompareDir" }
   }
 }
 if ($fail.Count -gt 0) { Write-Host ("[kl_rung4] FAILED: " + ($fail -join '; ')); exit 1 }

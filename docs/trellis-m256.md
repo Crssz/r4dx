@@ -430,7 +430,11 @@ So the order is a function of (SK, SKG) alone. Two pairs give the same bytes onl
 holds for (P, 1) and (1, P) (a fold of P pieces either way) and for a pair with itself; (2, 2) is
 `(p0 + p1) + (p2 + p3)` and (4, 1) is `((p0 + p1) + p2) + p3`, which differ. Hence the M = 256 plan can only be
 identical to the 64-row path at the M = 64 row's own (SK, SKG), and `PlanTrellisM256` reads them from that row for
-exactly this reason. Changing a class's M = 256 (SK, SKG) means changing the class's M = 64 row with it.
+exactly this reason. Changing a class's M = 256 (SK, SKG) means changing the class's M = 64 row with it. (The one
+exception is the alias: an M = 64 row at (1, P) gives the bytes of an M = 256 plan at (P, 1), SK 1 being legal for the
+64-row kernel. It never helps: in the M5 screen the best (1, P) tuning is 6% to 4.4x slower than the best (P, 1) one
+on every shape and rate except down KB 5 at P = 2 (192.2 against 194.3 us, and (2, 1) is not a candidate there), so the
+sweep below does not time it.)
 
 What a retune does and does not touch: M <= 16 (decode, verify, MTP / DFlash windows) takes the M = 1 band and M
 17..32 the M = 32 band, neither is a candidate and neither moves; `kl_rung4` runs the decode path and stays
@@ -529,7 +533,10 @@ the noise are two classes), and ship the instrument that decides it.
   the table itself, no expectation to edit: its check count does not change) and `test_prefill_chunk` (the decision
   table, not the tuning) must still pass; `test_trellis_m256` (plan vs four launches of the new row, with its
   negative control); `test_prefill_chunk_identity` (256 vs 64, the true pre-change path, real container); the KL pair
-  of `tools/prefill/run_kl.ps1` (default vs `R4DX_PREFILL_CHUNK=0`: byte-identical `logprobs.f16`, both new);
+  of `tools/prefill/run_kl.ps1` (default vs `R4DX_PREFILL_CHUNK=0`: byte-identical `logprobs.f16`, both new; the
+  default `-Tokens` file `prefill-m0\kl\tokens_long.json` no longer exists on disk: write one first with
+  `python tools\prefill\make_kl_tokens.py --lengths 8k --out <dir>\tokens_8k.json` (CPU, seconds, segments prose_8k /
+  code_8k / recall_8k) and pass it as `-Tokens`);
   `tools/quant2/kl_rung4.ps1 -CompareDir E:\models\r4dx\rocm1010\kl` byte-identical (decode); then the cold TTFT of
   `tools/prefill/gdn256_check.ps1` against 8k 4.836 s / 32k 23.456 s. The prefill dumps recorded before the change are
   then history; re-record the KL baselines that matter.

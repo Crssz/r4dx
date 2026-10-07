@@ -29,6 +29,7 @@
 #include <string>
 
 #include "r4d_fwht128.h"
+#include "r4d_trellis_i8_fused.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
 #include "r4dx/kernels/gemma_device.h"
@@ -42,6 +43,7 @@ constexpr int kTqBlock = 128;
 constexpr int kTqWave = 32;
 constexpr int kTqMaxOut = 3;
 constexpr int kTqMaxPrescale = 24;
+constexpr int kTqRowsI8 = 256;   // rows of the int8 prefill GEMM's A8 layout (i8p::kM)
 
 struct TrellisInputPtrs {
   const float* suh[kTqMaxOut];
@@ -164,6 +166,98 @@ __global__ __launch_bounds__(kTqWave) void GateMulTrellisKernel(const uint16_t* 
     xv[r] = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(a * sg));
   }
   TransformBlock(xv, suh, out, off, k_off, scale, lane);
+}
+
+// ---- the int8 variants (r4dx_*_i8; R4DX_PREFILL_INT8_FUSEDQ, docs/int8-prefill.md "The fused quantizer") --------
+// The same transform and the same producers, but the f16 A is never stored: each wave rounds its block to f16
+// exactly as TransformBlock does, then hands the four f16 values to libr4d's activation quantizer
+// (r4d_trellis_i8_fused.h: per (row, 128 k) amax, s = amax / 127, int8 straight into the A8 fragment layout, SA), so
+// A8 and SA are the bytes r4d_trellis_i8_quant_act would have made from the f16 A. TransformBlock itself, and the
+// kernels above, are untouched (their ISA is what the f16 paths run). Fixed at 256 rows, the A8 layout's M.
+struct TrellisInputI8Ptrs {
+  const float* suh[kTqMaxOut];
+  signed char* a8[kTqMaxOut];
+  float* sa[kTqMaxOut];
+};
+
+// TransformBlock's arithmetic (x * suh in fp32, the butterfly, the product by `scale` as an fp32 value, one rounding
+// to f16), the f16 bits handed to the quantizer. row: the block's row; kb: its index along K.
+__device__ __forceinline__ void TransformBlockQ8(const float (&xv)[4], const float* __restrict__ suh,
+                                                 signed char* __restrict__ a8, float* __restrict__ sa,
+                                                 int64_t k_off, float scale, int lane, int row, int kb,
+                                                 int64_t K) {
+  float v[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) v[r] = xv[r] * suh[k_off + kTqWave * r];
+  r4d_fwht128_wave(v, lane);
+  unsigned short hb[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    float prod = v[r] * scale;
+    asm("" : "+v"(prod));
+    const _Float16 h = static_cast<_Float16>(prod);   // round to nearest even
+    hb[r] = __builtin_bit_cast(unsigned short, h);
+  }
+  i8g_quant_wave_block(hb, lane, row, kb, static_cast<int>(K), a8, sa);
+}
+
+// TrellisInputKernel's int8 twin: grid (K / 128, 256), one wave32 per workgroup.
+__global__ __launch_bounds__(kTqWave) void TrellisInputI8Kernel(const uint16_t* __restrict__ x, int64_t K,
+                                                                 int nout, TrellisInputI8Ptrs p, float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row = static_cast<int>(blockIdx.y), kb = static_cast<int>(blockIdx.x);
+  const int64_t off = static_cast<int64_t>(row) * K + static_cast<int64_t>(kb) * kTqBlock + lane;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) xv[r] = Bf16BitsToFloat(x[off + kTqWave * r]);
+  const int64_t k_off = static_cast<int64_t>(kb) * kTqBlock + lane;
+#pragma unroll
+  for (int o = 0; o < kTqMaxOut; ++o) {
+    if (o >= nout) break;   // uniform
+    TransformBlockQ8(xv, p.suh[o], p.a8[o], p.sa[o], k_off, scale, lane, row, kb, K);
+  }
+}
+
+// SiluMulTrellisKernel's int8 twin (the element is the same bf16 product).
+__global__ __launch_bounds__(kTqWave) void SiluMulTrellisI8Kernel(const uint16_t* __restrict__ gate_up,
+                                                                   int64_t intermediate, int64_t in_row_stride,
+                                                                   const float* __restrict__ suh,
+                                                                   signed char* __restrict__ a8,
+                                                                   float* __restrict__ sa, float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row = static_cast<int>(blockIdx.y), kb = static_cast<int>(blockIdx.x);
+  const int64_t k_off = static_cast<int64_t>(kb) * kTqBlock + lane;
+  const uint16_t* gu = gate_up + static_cast<int64_t>(row) * in_row_stride;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float g = Bf16BitsToFloat(gu[k_off + kTqWave * r]);
+    const float u = Bf16BitsToFloat(gu[intermediate + k_off + kTqWave * r]);
+    const __hip_bfloat16 h = __float2bfloat16(g * TqSigmoid(g) * u);
+    xv[r] = __bfloat162float(h);
+  }
+  TransformBlockQ8(xv, suh, a8, sa, k_off, scale, lane, row, kb, intermediate);
+}
+
+// GateMulTrellisKernel's int8 twin.
+__global__ __launch_bounds__(kTqWave) void GateMulTrellisI8Kernel(const uint16_t* __restrict__ attn_out,
+                                                                   const uint16_t* __restrict__ gate, int64_t K,
+                                                                   const float* __restrict__ suh,
+                                                                   signed char* __restrict__ a8,
+                                                                   float* __restrict__ sa, float scale) {
+  const int lane = static_cast<int>(threadIdx.x);
+  const int row = static_cast<int>(blockIdx.y), kb = static_cast<int>(blockIdx.x);
+  const int64_t k_off = static_cast<int64_t>(kb) * kTqBlock + lane;
+  const int64_t off = static_cast<int64_t>(row) * K + k_off;
+  float xv[4];
+#pragma unroll
+  for (int r = 0; r < 4; ++r) {
+    const float a = r4dx::core::Bf16ToFloat(attn_out[off + kTqWave * r]);
+    const float g = r4dx::core::Bf16ToFloat(gate[off + kTqWave * r]);
+    const float sg = 1.0f / (1.0f + expf(-g));
+    xv[r] = r4dx::core::Bf16ToFloat(r4dx::core::FloatToBf16(a * sg));
+  }
+  TransformBlockQ8(xv, suh, a8, sa, k_off, scale, lane, row, kb, K);
 }
 
 // The diagnostic twins: one 128-block per workgroup.
@@ -291,6 +385,14 @@ float ProducerScale(const char* who, int64_t rows, int64_t K, int64_t suh, int64
   return static_cast<float>(std::ldexp(1.0, prescale_log2) / std::sqrt(128.0));
 }
 
+// The int8 entries' extra preconditions: the A8 layout is fixed at 256 rows, A8 / SA are device pointers.
+void TqI8Check(const char* who, int64_t rows, int64_t a8, int64_t sa) {
+  if (rows != kTqRowsI8) {
+    throw std::runtime_error(std::string(who) + ": rows must be 256 (the int8 A8 layout), got " + std::to_string(rows));
+  }
+  if (a8 == 0 || sa == 0) throw std::runtime_error(std::string(who) + ": a8 and sa must be non-null");
+}
+
 }  // namespace
 
 extern "C" {
@@ -373,6 +475,64 @@ void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t row
                      dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
                      reinterpret_cast<const uint16_t*>(attn_out), reinterpret_cast<const uint16_t*>(gate),
                      K, reinterpret_cast<const float*>(suh), reinterpret_cast<uint16_t*>(out), scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_trellis_input_i8(int64_t x, int64_t M, int64_t K, int nout, const int64_t* suh, const int64_t* a8,
+                            const int64_t* sa, int prescale_log2, int64_t stream) {
+  if (nout < 1 || nout > kTqMaxOut) TqFail("nout must be 1..3, got " + std::to_string(nout));
+  if (K <= 0 || K % kTqBlock != 0) TqFail("K must be a positive multiple of 128, got " + std::to_string(K));
+  if (prescale_log2 < -kTqMaxPrescale || prescale_log2 > kTqMaxPrescale)
+    TqFail("|prescale_log2| must be <= 24, got " + std::to_string(prescale_log2));
+  if (suh == nullptr || a8 == nullptr || sa == nullptr) TqFail("suh, a8 and sa must be host arrays of nout pointers");
+  TrellisInputI8Ptrs p{};
+  for (int o = 0; o < nout; ++o) {
+    TqI8Check("r4dx_trellis_input_i8", M, a8[o], sa[o]);
+    if (suh[o] == 0) TqFail("suh[" + std::to_string(o) + "] is null");
+    p.suh[o] = reinterpret_cast<const float*>(suh[o]);
+    p.a8[o] = reinterpret_cast<signed char*>(a8[o]);
+    p.sa[o] = reinterpret_cast<float*>(sa[o]);
+  }
+  if (x == 0) TqFail("x is null");
+  const float scale = static_cast<float>(std::ldexp(1.0, prescale_log2) / std::sqrt(128.0));
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(TrellisInputI8Kernel, dim3(static_cast<unsigned>(K / kTqBlock), static_cast<unsigned>(M)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream), reinterpret_cast<const uint16_t*>(x),
+                     K, nout, p, scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_silu_mul_trellis_i8(int64_t gate_up, int64_t rows, int64_t intermediate, int64_t in_row_stride,
+                               int64_t suh, int64_t a8, int64_t sa, int prescale_log2, int64_t stream) {
+  const float scale = ProducerScale("r4dx_silu_mul_trellis_i8", rows, intermediate, suh, a8, prescale_log2);
+  TqI8Check("r4dx_silu_mul_trellis_i8", rows, a8, sa);
+  if (gate_up == 0) throw std::runtime_error("r4dx_silu_mul_trellis_i8: gate_up is null");
+  if (in_row_stride < 2 * intermediate) {
+    throw std::runtime_error("r4dx_silu_mul_trellis_i8: in_row_stride must be >= 2 * intermediate");
+  }
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(SiluMulTrellisI8Kernel,
+                     dim3(static_cast<unsigned>(intermediate / kTqBlock), static_cast<unsigned>(rows)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(gate_up), intermediate, in_row_stride,
+                     reinterpret_cast<const float*>(suh), reinterpret_cast<signed char*>(a8),
+                     reinterpret_cast<float*>(sa), scale);
+  R4DX_HIP_CHECK(hipGetLastError());
+}
+
+void r4dx_attn_gate_mul_trellis_i8(int64_t attn_out, int64_t gate, int64_t rows, int64_t K, int64_t suh,
+                                    int64_t a8, int64_t sa, int prescale_log2, int64_t stream) {
+  const float scale = ProducerScale("r4dx_attn_gate_mul_trellis_i8", rows, K, suh, a8, prescale_log2);
+  TqI8Check("r4dx_attn_gate_mul_trellis_i8", rows, a8, sa);
+  if (attn_out == 0 || gate == 0) {
+    throw std::runtime_error("r4dx_attn_gate_mul_trellis_i8: attn_out and gate must be non-null");
+  }
+  r4dx_kernel_launch_counter_add(1);
+  hipLaunchKernelGGL(GateMulTrellisI8Kernel, dim3(static_cast<unsigned>(K / kTqBlock), static_cast<unsigned>(rows)),
+                     dim3(kTqWave), 0, reinterpret_cast<hipStream_t>(stream),
+                     reinterpret_cast<const uint16_t*>(attn_out), reinterpret_cast<const uint16_t*>(gate), K,
+                     reinterpret_cast<const float*>(suh), reinterpret_cast<signed char*>(a8),
+                     reinterpret_cast<float*>(sa), scale);
   R4DX_HIP_CHECK(hipGetLastError());
 }
 

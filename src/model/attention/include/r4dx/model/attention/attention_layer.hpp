@@ -513,7 +513,22 @@ class AttentionLayer {
     const bool o_fused = w.o_had_signs == nullptr && TrellisFusionEnabled() &&
                          w.o->layout == Layout::kTrellis && w.o->trellis_parts == 1 &&
                          w.o->K == static_cast<int64_t>(H) * D;
-    if (o_fused) {
+    if (o_fused && TrellisI8FusedQ(*w.o, T)) {
+      // R4DX_PREFILL_INT8_FUSEDQ: o_proj will take the int8 GEMM, so the gate-mul's product goes through the
+      // transform straight into the quantizer: A8 + SA, no f16 A.
+      const TrellisI8Operand a_o = AllocTrellisI8Operand(arena, static_cast<int64_t>(H) * D, 1);
+      ProfiledCall(prof, stream, "attn.gate_mul_trellis", [&] {
+        r4dx_attn_gate_mul_trellis_i8(reinterpret_cast<int64_t>(attn_out),
+                                      reinterpret_cast<int64_t>(gate), T,
+                                      static_cast<int64_t>(H) * D,
+                                      reinterpret_cast<int64_t>(w.o->trellis_suh.data()),
+                                      reinterpret_cast<int64_t>(a_o.a8), reinterpret_cast<int64_t>(a_o.sa),
+                                      w.o->trellis_prescale_log2, reinterpret_cast<int64_t>(stream));
+      });
+      o_pre = PreQuantizedActivation{r4dx_epilogue_none, nullptr, w.o->trellis_suh.data(), 0};
+      o_pre.a8 = a_o.a8;
+      o_pre.sa = a_o.sa;
+    } else if (o_fused) {
       uint16_t* a_o = arena.Alloc<uint16_t>(static_cast<size_t>(T) * H * D, /*align_bytes=*/16);
       ProfiledCall(prof, stream, "attn.gate_mul_trellis", [&] {
         r4dx_attn_gate_mul_trellis_bf16(reinterpret_cast<int64_t>(attn_out),

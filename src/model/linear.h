@@ -117,11 +117,21 @@ int EpilogueForLayout(Layout layout);
 // then holds the linear's parts, each f16 [M][K] with row stride K, part p at data + p *
 // part_stride elements (part_stride >= M * K; ignored for a one-part linear); a <= 64-row chunk m0
 // reads each part at + m0 * K.
+//
+// R4DX_PREFILL_INT8_FUSEDQ (docs/int8-prefill.md "The fused quantizer"): a trellis producer that knows the call will
+// take the int8 GEMM (TrellisI8FusedQ below: the one decision both sides make) writes the int8 operand instead of
+// the f16 A: `a8` (A8 fragment layout, 256 * K bytes per part) and `sa` (fp32 [K / 128][256] per part), part p at
+// a8 + p * 256 * K and sa + p * (K / 128) * 256, both 16-byte aligned, with `transform_id` set as above and `data`
+// null (no f16 A exists; part_stride is unused). ApplyLinear then runs no quantizer launch. A pre with `a8` handed
+// to a call that does not take the int8 GEMM (the producer and the consumer disagree) throws: there is no f16 A to
+// fall back to.
 struct PreQuantizedActivation {
   int epilogue = 0;  // r4dx_epilogue_none means "no pre-quantized input provided"
   const void* data = nullptr;
   const void* transform_id = nullptr;  // trellis only: the linear's trellis_suh.data()
   int64_t part_stride = 0;             // trellis only: elements between the parts in `data`
+  const void* a8 = nullptr;            // trellis int8 only: the int8 operand (replaces `data`)
+  const void* sa = nullptr;            // trellis int8 only: its scales
 };
 
 // x: device bf16 [M, K], row-major, CONTIGUOUS (row stride exactly K -- every r4d_gemm_*_nt_m64
@@ -234,6 +244,45 @@ class ScopedTrellisI8 {
   bool prev_;
 };
 bool TrellisI8Active();
+
+// R4DX_PREFILL_INT8_FUSEDQ (read once; default on, "0" / "off" is the kill switch: the quantizer runs as its own launch
+// again): whether a producer writes the int8 operand itself. Off too whenever R4DX_TRELLIS_A_STATS is set (that hook
+// tallies the f16 A, which a fused producer never writes).
+bool TrellisI8FusedQEnabled();
+// RAII, for tests: while alive on this thread, TrellisI8FusedQEnabled() answers `mode` (0 off, 1 on, whatever the
+// environment says; the A-stats hook still forces off), so one process can run the fused and the separate chain on
+// one Model and compare their bytes. -1 follows the environment (the default).
+class ScopedTrellisI8FusedQ {
+ public:
+  explicit ScopedTrellisI8FusedQ(int mode);
+  ~ScopedTrellisI8FusedQ();
+  ScopedTrellisI8FusedQ(const ScopedTrellisI8FusedQ&) = delete;
+  ScopedTrellisI8FusedQ& operator=(const ScopedTrellisI8FusedQ&) = delete;
+
+ private:
+  int prev_;
+};
+// Where the int8 GEMMs' A8 + SA came from, process-wide since start (tests prove the path they mean ran): a fused producer's
+// (PreQuantizedActivation::a8), this call's own fused transform (r4dx_trellis_input_i8), or the separate quantizer launch.
+struct TrellisI8OperandCounts {
+  int64_t from_producer = 0, from_own_transform = 0, separate = 0;
+};
+TrellisI8OperandCounts TrellisI8OperandCountsGet();
+// Whether ApplyLinear(w, ..., M) takes the int8 GEMM right now: a trellis linear, M == 256, both scopes open
+// (ScopedTrellisM256, ScopedTrellisI8), an int8 plan and its scale table. ApplyLinear's own test, factored out.
+bool TrellisI8Takes(const QuantLinear& w, int64_t M);
+// The decision a producer of w's A makes before it writes A8 + SA rather than f16: the switch is on and the call will
+// take the int8 GEMM. A pure function of the linear, M and the thread's scopes, so a producer asked in the same scope
+// as its ApplyLinear agrees with it; a producer that fused and a consumer that cannot take int8 is a bug and throws.
+bool TrellisI8FusedQ(const QuantLinear& w, int64_t M);
+// The int8 operand of `parts` (1..2) 256-row parts of K columns, from the arena: A8 `parts * 256 K` bytes, SA
+// `parts * K / 128 * 256` floats, both 16-byte aligned, the second part following the first as
+// PreQuantizedActivation documents.
+struct TrellisI8Operand {
+  int8_t* a8 = nullptr;
+  float* sa = nullptr;
+};
+TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts);
 
 // R4DX_PREFILL_INT8's one-time pass (Model::Load, only when the switch is on): the weight scale table of the
 // trellis linear `w` (libr4d's r4d_trellis_i8_wscale: s = max|w| / 127 per (column, 128 k), stored as 1 / f16(1 / s))

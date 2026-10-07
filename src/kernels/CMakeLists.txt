@@ -105,6 +105,8 @@ add_custom_command(
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/dtype.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../core/include/r4dx/core/error.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_fwht128.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_trellis_i8_fused.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/libr4d/r4d_trellis_i8_layout.h"
   COMMENT "hipcc (${R4D_GFX_ARCH}) trellis_transform.obj"
   VERBATIM
 )

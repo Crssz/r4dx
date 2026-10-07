@@ -146,6 +146,24 @@ void r4dx_silu_mul_trellis_bf16(int64_t gate_up, int64_t rows, int64_t intermedi
 void r4dx_attn_gate_mul_trellis_bf16(int64_t attn_out, int64_t gate, int64_t rows, int64_t K,
                                       int64_t suh, int64_t out, int prescale_log2, int64_t stream);
 
+// ---- the same three, quantizing for the int8 prefill GEMM (R4DX_PREFILL_INT8_FUSEDQ) -------------------
+// r4dx_trellis_input_i8 / r4dx_silu_mul_trellis_i8 / r4dx_attn_gate_mul_trellis_i8: each is the entry above with
+// the same arguments and the same arithmetic up to the f16 A (the transform's one rounding to f16), but the f16 A
+// is not stored: every (row, 128-block) goes straight through libr4d's activation quantizer
+// (r4d_trellis_i8_fused.h, the arithmetic of r4d_trellis_i8_quant_act) and the output is the int8 operand of
+// r4d_gemm_trellis_nt_i8: a8 (int8, the A8 fragment layout, 256 * K bytes per output) and sa (fp32 [K / 128][256]
+// per output), byte for byte what r4d_trellis_i8_quant_act makes from the f16 A. The outputs replace `out`:
+// r4dx_trellis_input_i8 takes host arrays a8[nout] / sa[nout] (a linear's two parts: a8[1] = a8[0] + 256 K,
+// sa[1] = sa[0] + K / 128 * 256 floats, the layout r4d_trellis_i8_quant_act and the GEMM expect), the producers one
+// pair each. Preconditions (throw), on top of the f16 entries': rows == 256 exactly (the A8 layout's M), non-null
+// a8 and sa. Launch: the same grids (K / 128, 256), one wave32 each.
+void r4dx_trellis_input_i8(int64_t x, int64_t M, int64_t K, int nout, const int64_t* suh, const int64_t* a8,
+                            const int64_t* sa, int prescale_log2, int64_t stream);
+void r4dx_silu_mul_trellis_i8(int64_t gate_up, int64_t rows, int64_t intermediate, int64_t in_row_stride,
+                               int64_t suh, int64_t a8, int64_t sa, int prescale_log2, int64_t stream);
+void r4dx_attn_gate_mul_trellis_i8(int64_t attn_out, int64_t gate, int64_t rows, int64_t K, int64_t suh,
+                                    int64_t a8, int64_t sa, int prescale_log2, int64_t stream);
+
 // Diagnostic (R4DX_FAKEQ_ACT, docs/int8-prefill.md; src/model/fake_quant_act.h is the reference): round a
 // trellis linear's transformed A to symmetric int8 and back, IN PLACE. a: f16 [rows, K] with row stride K,
 // plus a second such part at a + part_stride when parts == 2 (the layout r4dx_trellis_input_bf16 writes).

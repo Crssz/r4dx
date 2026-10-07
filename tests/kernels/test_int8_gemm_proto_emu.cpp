@@ -11,6 +11,9 @@
 //     and the trellis kernel against the dense kernel on the same int8 weights, byte for byte;
 //   * two A parts: a launch with a8_0 / a8_1 and an n_split (trellis, KB 4 and 5, several (skw, skg)) against the exact
 //     reference per part, byte-identical to two single-part launches, and a part-1 quantizer launch (blockIdx.y = 1).
+//   * the fused producers' quantizer (r4d_trellis_i8_fused.h's i8g_quant_wave_block, which the transform kernels of
+//     src/kernels/src/trellis_transform.hip call after their own f16 rounding, R4DX_PREFILL_INT8_FUSEDQ): on wide-range f16
+//     inputs, one and two parts, K = 1024 and 17408, byte for byte i8g_quant_act's A8 and SA and the CPU quantizer's.
 // What this does not cover: the hardware (the iu8 WMMA layout, v_pk_fma_f16, v_perm, DPP: the device bench's selftest)
 // and the real trellis decode (shipped, tested elsewhere).
 #define I8G_EMU 1
@@ -23,6 +26,7 @@
 #include <vector>
 
 #include "int8_gemm_proto_kernels.h"
+#include "r4d_trellis_i8_fused.h"   // the fused producers' quantizer: the device function src/kernels/src/trellis_transform.hip calls
 
 namespace {
 
@@ -184,6 +188,39 @@ void Fwht128F32(float* v) {
   }
 }
 
+// The fused producers' quantizer (src/kernels/src/trellis_transform.hip, R4DX_PREFILL_INT8_FUSEDQ) as a kernel of its
+// own, the shape of a producer after its transform: grid (K / 128, 256), a wave32 per (row, 128-block), the lane's
+// f16 values the block's elements lane + 32 r. The production kernels call the same i8g_quant_wave_block.
+void FusedQuantKernel(const unsigned short* X, signed char* A8, float* SA, int K) {
+  const int lane = (int)(threadIdx.x & 31u);
+  const int kb = (int)blockIdx.x, row = (int)blockIdx.y;
+  unsigned short hb[4];
+  for (int r = 0; r < 4; ++r) hb[r] = X[(size_t)row * K + kb * 128 + lane + 32 * r];
+  i8g_quant_wave_block(hb, lane, row, kb, K, A8, SA);
+}
+
+// random f16 values with a spread of magnitudes per 128-block (the transform's output spans the f16 range: subnormals
+// to near the maximum), some blocks all zero, some with a single nonzero element, some with ties at the rounding midpoint
+std::vector<unsigned short> WideRangeF16(int K, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::normal_distribution<float> nd(0.f, 1.f);
+  std::vector<unsigned short> x((size_t)256 * K);
+  for (int r = 0; r < 256; ++r)
+    for (int kb = 0; kb < K / 128; ++kb) {
+      const int kind = (int)((r * 7 + kb * 13 + seed) % 11);
+      const float mag = std::ldexp(1.0f, (int)(rng() % 31) - 20);   // 2^-20 .. 2^10
+      for (int k = 0; k < 128; ++k) {
+        float v = nd(rng) * mag;
+        if (kind == 0) v = 0.f;
+        if (kind == 1) v = k == 77 ? mag * 3.0f : 0.f;
+        if (kind == 2) v = (float)((int)(rng() % 255) - 127) * 0.5f * mag + 0.5f * mag / 127.0f * (float)(k & 1);   // near midpoints
+        if (kind == 3 && k == 5) v = 60000.f;
+        x[(size_t)r * K + kb * 128 + k] = i8p::F32ToF16(v);
+      }
+    }
+  return x;
+}
+
 }  // namespace
 
 int main() {
@@ -204,6 +241,14 @@ int main() {
     std::snprintf(what, sizeof what, "KB %d: i8g_quant_act (emulated kernel) == CPU quantizer: A8 layout, plain A, scales (incl. an all-zero block)", KB);
     Check(std::memcmp(a8.data(), p.A8.data(), a8.size()) == 0 && std::memcmp(ap.data(), p.Ap.data(), ap.size()) == 0 &&
               std::memcmp(sa.data(), p.sa.data(), sa.size() * 4) == 0, what);
+    {
+      // the fused producers' device function (r4d_trellis_i8_fused.h) on the same f16 A: byte for byte i8g_quant_act's
+      std::vector<signed char> a8f(p.A8.size(), 0x55);
+      std::vector<float> saf(p.sa.size(), -1.f);
+      emu::launch((unsigned)NKB, 256, 32, FusedQuantKernel, p.xh.data(), a8f.data(), saf.data(), K);
+      std::snprintf(what, sizeof what, "KB %d: the fused producers' i8g_quant_wave_block == i8g_quant_act byte for byte (A8 layout, scales, all-zero block)", KB);
+      Check(std::memcmp(a8f.data(), a8.data(), a8.size()) == 0 && std::memcmp(saf.data(), sa.data(), sa.size() * 4) == 0, what);
+    }
     std::vector<float> sw(p.sw.size(), 0.f);
     std::vector<signed char> w8(p.W8.size(), 0), wp(p.Wp.size(), 0);
     const unsigned groups = (unsigned)((N / 32) * NKB), blocks = (unsigned)((N / 32) * (K / 16));
@@ -374,6 +419,40 @@ int main() {
     char what[200];
     std::snprintf(what, sizeof what, "KB %d: %zu one-hot launches byte-exact vs the fp32 emulation of the epilogue (%zu bytes differ)", KB, runs, bad);
     Check(bad == 0 && runs > 0, what);
+  }
+  // ---- the fused producers' quantizer against the separate one: wide-range inputs, two parts, K = 17408 ----
+  // R4DX_PREFILL_INT8_FUSEDQ promises the GEMM's operands are bit for bit the unfused chain's. A producer writes part p
+  // at a8 + p * 256 K and sa + p * (K / 128) * 256 (a launch per output, as r4dx_trellis_input_i8 does it); the
+  // separate quantizer is one launch over both parts (blockIdx.y). Also against the CPU quantizer.
+  for (int Kq : {1024, 17408}) {
+    const int parts = Kq == 1024 ? 2 : 1, nkb = Kq / 128;
+    char what[240];
+    std::vector<unsigned short> x;
+    for (int p = 0; p < parts; ++p) {
+      const std::vector<unsigned short> xp = WideRangeF16(Kq, 4242 + 17 * Kq + p);
+      x.insert(x.end(), xp.begin(), xp.end());
+    }
+    const size_t a8n = (size_t)256 * Kq, san = (size_t)nkb * 256;
+    std::vector<signed char> a8u(parts * a8n, 0x55), a8f(parts * a8n, 0x2A), apu(parts * a8n, 0);
+    std::vector<float> sau(parts * san, -1.f), saf(parts * san, -2.f);
+    emu::launch((unsigned)((256 * nkb + 7) / 8), (unsigned)parts, 256, i8g_quant_act, x.data(), a8u.data(), apu.data(), sau.data(), Kq,
+                (long long)(parts > 1 ? a8n : 0));
+    for (int p = 0; p < parts; ++p)
+      emu::launch((unsigned)nkb, 256, 32, FusedQuantKernel, x.data() + p * a8n, a8f.data() + p * a8n, saf.data() + p * san, Kq);
+    std::snprintf(what, sizeof what, "K %d, %d part(s), wide range: the fused producers' A8 and SA == i8g_quant_act's, byte for byte", Kq, parts);
+    Check(std::memcmp(a8u.data(), a8f.data(), a8u.size()) == 0 && std::memcmp(sau.data(), saf.data(), sau.size() * 4) == 0, what);
+    bool cpu_same = true;
+    for (int p = 0; p < parts; ++p) {
+      std::vector<float> X(a8n);
+      for (size_t i = 0; i < a8n; ++i) X[i] = i8p::F16ToF32(x[p * a8n + i]);
+      std::vector<float> sac;
+      std::vector<signed char> apc;
+      i8p::QuantizeActRef(X.data(), Kq, sac, apc);
+      const std::vector<signed char> a8c = i8p::PackA8(apc, Kq);
+      cpu_same = cpu_same && std::memcmp(a8c.data(), a8f.data() + p * a8n, a8n) == 0 && std::memcmp(sac.data(), saf.data() + p * san, san * 4) == 0;
+    }
+    std::snprintf(what, sizeof what, "K %d, %d part(s), wide range: the fused producers' output == the CPU quantizer (QuantizeActRef + PackA8)", Kq, parts);
+    Check(cpu_same, what);
   }
   const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   std::printf("%s (%d checks, %.1f s)\n", g_ok ? "ALL OK" : "FAILED", g_checks, s);

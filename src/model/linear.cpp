@@ -1,6 +1,7 @@
 #include "linear.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include "debug_probe.h"
 #include "fake_quant_w.h"  // R4DX_FAKEQ_W (docs/int8-prefill.md)
 #include "kernels/model_kernels.h"
+#include "prefill_int8.h"  // R4DX_PREFILL_INT8_FUSEDQ's parser
 #include "r4d.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx/core/error.hpp"
@@ -405,6 +407,8 @@ bool M256ShapeAllowed(int64_t N, int64_t K) {
 
 thread_local bool t_trellis_m256 = false;
 thread_local bool t_trellis_i8 = false;  // ScopedTrellisI8: R4DX_PREFILL_INT8's super-chunk scope
+thread_local int t_trellis_i8_fusedq = -1;  // ScopedTrellisI8FusedQ: -1 follows R4DX_PREFILL_INT8_FUSEDQ
+std::atomic<int64_t> g_i8_from_producer{0}, g_i8_from_own{0}, g_i8_separate{0};   // TrellisI8OperandCounts
 thread_local int t_fake_quant_act = 0;  // fake_quant_act.h's mode; 0 off (ScopedFakeQuantAct)
 thread_local int t_fake_quant_w = 0;    // fake_quant_w.h's mode; 0 off (ScopedFakeQuantW)
 
@@ -676,6 +680,38 @@ bool BuildTrellisI8Scale(QuantLinear& w, hipStream_t stream) {
   return true;
 }
 
+bool TrellisI8FusedQEnabled() {
+  static const bool kStats = [] {
+    const char* a = std::getenv("R4DX_TRELLIS_A_STATS");
+    return a != nullptr && a[0] != '\0';
+  }();
+  static const bool kEnv = ParsePrefillInt8FusedQ(std::getenv("R4DX_PREFILL_INT8_FUSEDQ"));
+  if (kStats) return false;
+  return t_trellis_i8_fusedq >= 0 ? t_trellis_i8_fusedq != 0 : kEnv;
+}
+
+ScopedTrellisI8FusedQ::ScopedTrellisI8FusedQ(int mode) : prev_(t_trellis_i8_fusedq) { t_trellis_i8_fusedq = mode; }
+ScopedTrellisI8FusedQ::~ScopedTrellisI8FusedQ() { t_trellis_i8_fusedq = prev_; }
+
+TrellisI8OperandCounts TrellisI8OperandCountsGet() {
+  return {g_i8_from_producer.load(), g_i8_from_own.load(), g_i8_separate.load()};
+}
+
+// ApplyLinear's own test for its int8 branch (it keeps the plan's notice and the missing-table throw itself).
+bool TrellisI8Takes(const QuantLinear& w, int64_t M) {
+  if (w.layout != Layout::kTrellis || M != kTrellisM256Rows || !TrellisM256Active() || !TrellisI8Active()) return false;
+  return PlanTrellisI8(w.N, w.K, w.trellis_bits, w.trellis_parts, w.trellis_part_n[0]).ok && !w.trellis_i8_sw.empty();
+}
+
+bool TrellisI8FusedQ(const QuantLinear& w, int64_t M) { return TrellisI8FusedQEnabled() && TrellisI8Takes(w, M); }
+
+TrellisI8Operand AllocTrellisI8Operand(core::Arena& arena, int64_t K, int parts) {
+  TrellisI8Operand op;
+  op.a8 = arena.Alloc<int8_t>(static_cast<size_t>(parts * kTrellisM256Rows * K), /*align_bytes=*/16);
+  op.sa = arena.Alloc<float>(static_cast<size_t>(parts * (K / 128) * kTrellisM256Rows), /*align_bytes=*/16);
+  return op;
+}
+
 bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* x, int64_t M,
                         const QuantLinear* const* ws, int n, PreQuantizedActivation* pre) {
   if (!TrellisFusionEnabled() || n < 2 || n > 3 || M < 1) return false;
@@ -687,6 +723,27 @@ bool SharedTrellisInput(hipStream_t stream, core::Arena& arena, const uint16_t* 
         w.trellis_suh.size() != static_cast<size_t>(K)) {
       return false;
     }
+  }
+  // R4DX_PREFILL_INT8_FUSEDQ: when every linear of the group will take the int8 GEMM (the test ApplyLinear makes),
+  // the one transform writes each linear's A8 + SA instead of f16 -- the quantizer of each, fused. A group where some
+  // would not (no plan, no table) keeps f16 for all, so a linear never receives an operand it cannot use.
+  bool all_i8 = true;
+  for (int i = 0; i < n; ++i) all_i8 = all_i8 && TrellisI8FusedQ(*ws[i], M);
+  if (all_i8) {
+    int64_t suh[3] = {}, o8[3] = {}, osa[3] = {};
+    for (int i = 0; i < n; ++i) {
+      const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, 1);
+      suh[i] = reinterpret_cast<int64_t>(ws[i]->trellis_suh.data());
+      o8[i] = reinterpret_cast<int64_t>(op.a8);
+      osa[i] = reinterpret_cast<int64_t>(op.sa);
+      PreQuantizedActivation p{r4dx_epilogue_none, nullptr, ws[i]->trellis_suh.data(), 0};
+      p.a8 = op.a8;
+      p.sa = op.sa;
+      pre[i] = p;
+    }
+    r4dx_trellis_input_i8(reinterpret_cast<int64_t>(x), M, K, n, suh, o8, osa, ws[0]->trellis_prescale_log2,
+                          reinterpret_cast<int64_t>(stream));
+    return true;
   }
   int64_t suh[3] = {}, out[3] = {};
   for (int i = 0; i < n; ++i) {
@@ -788,6 +845,7 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
   // transform is per linear (its own suh), so the id must be this weight's, not merely a trellis
   // one's.
   const bool trellis_pre = (pre != nullptr) && (pre->transform_id != nullptr);
+  const bool pre_i8 = trellis_pre && pre->a8 != nullptr;   // R4DX_PREFILL_INT8_FUSEDQ: a producer's int8 operand
   if (trellis_pre && (w.layout != Layout::kTrellis || pre->transform_id != w.trellis_suh.data())) {
     throw std::runtime_error(
         "r4dx::model::ApplyLinear: PreQuantizedActivation.transform_id is not this linear's "
@@ -804,20 +862,35 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
                                ", " + std::to_string(K) + "] is not a loaded one (parts, suh, svh "
                                "or tickets inconsistent -- see QuantLinear's trellis fields)");
     }
-    if (trellis_pre && (pre->data == nullptr ||
-                        (w.trellis_parts > 1 && pre->part_stride < M * K))) {
-      throw std::runtime_error("r4dx::model::ApplyLinear: trellis PreQuantizedActivation needs "
-                               "data and, for two parts, part_stride >= M * K");
-    }
-    // The GEMM reads A with 8-byte loads and checks no alignment itself (a misaligned operand is
-    // read wrong, silently -- EpilogueForLayout's ROOT CAUSE note), so every part must start where an
-    // arena allocation would: data 16-byte aligned, and part_stride whole 16 bytes (8 elements).
-    // The chunk offset m0 * K keeps it (K is whole 128-blocks).
-    if (trellis_pre && (reinterpret_cast<uintptr_t>(pre->data) % 16 != 0 ||
-                        (w.trellis_parts > 1 && pre->part_stride % 8 != 0))) {
-      throw std::runtime_error("r4dx::model::ApplyLinear: trellis PreQuantizedActivation needs "
-                               "16-byte aligned data and, for two parts, a part_stride that is a "
-                               "multiple of 8 elements");
+    if (pre_i8) {
+      // R4DX_PREFILL_INT8_FUSEDQ: the producer wrote the int8 operand and no f16 A exists, so this call must take
+      // the int8 GEMM (the producer asked TrellisI8FusedQ, the very test below); anything else is a caller bug.
+      if (pre->sa == nullptr || !TrellisI8Takes(w, M)) {
+        throw std::runtime_error("r4dx::model::ApplyLinear: PreQuantizedActivation carries an int8 operand (a8) but this "
+                                 "call does not take the int8 GEMM for trellis weight [" +
+                                 std::to_string(N) + ", " + std::to_string(K) + "], M " + std::to_string(M) +
+                                 " (caller bug -- the producer must decide with TrellisI8FusedQ)");
+      }
+      if (reinterpret_cast<uintptr_t>(pre->a8) % 16 != 0 || reinterpret_cast<uintptr_t>(pre->sa) % 16 != 0) {
+        throw std::runtime_error("r4dx::model::ApplyLinear: trellis int8 PreQuantizedActivation needs 16-byte aligned "
+                                 "a8 and sa");
+      }
+    } else {
+      if (trellis_pre && (pre->data == nullptr ||
+                          (w.trellis_parts > 1 && pre->part_stride < M * K))) {
+        throw std::runtime_error("r4dx::model::ApplyLinear: trellis PreQuantizedActivation needs "
+                                 "data and, for two parts, part_stride >= M * K");
+      }
+      // The GEMM reads A with 8-byte loads and checks no alignment itself (a misaligned operand is
+      // read wrong, silently -- EpilogueForLayout's ROOT CAUSE note), so every part must start where an
+      // arena allocation would: data 16-byte aligned, and part_stride whole 16 bytes (8 elements).
+      // The chunk offset m0 * K keeps it (K is whole 128-blocks).
+      if (trellis_pre && (reinterpret_cast<uintptr_t>(pre->data) % 16 != 0 ||
+                          (w.trellis_parts > 1 && pre->part_stride % 8 != 0))) {
+        throw std::runtime_error("r4dx::model::ApplyLinear: trellis PreQuantizedActivation needs "
+                                 "16-byte aligned data and, for two parts, a part_stride that is a "
+                                 "multiple of 8 elements");
+      }
     }
   }
 
@@ -837,16 +910,41 @@ void ApplyLinear(hipStream_t stream, core::Arena& arena, const QuantLinear& w, c
       }
       const int parts = w.trellis_parts;
       DebugProbe* const probe = DebugProbe::Linears();
-      const uint16_t* a0;
-      const uint16_t* a1;
-      TrellisA256(s, arena, w, x, M, pre, trellis_pre, /*mark_input=*/false, &a0, &a1);
-      // The quantized A: per part A8 (256 K bytes) and SA ((K / 128) x 256 fp32), one after the other, from the
-      // arena (a few MB at most: 2 x 256 x 5120 B and 2 x 40 x 1 KiB).
+      // The quantized A: per part A8 (256 K bytes) and SA ((K / 128) x 256 fp32), one after the other (a few MB at
+      // most: 2 x 256 x 5120 B and 2 x 40 x 1 KiB). Three sources, one set of bytes:
+      //   * a fused producer's (R4DX_PREFILL_INT8_FUSEDQ: pre->a8 / pre->sa, written by the producer's own launch);
+      //   * this call's own input transform, fused with the quantizer (r4dx_trellis_input_i8) when the switch is on
+      //     and there is no caller transform;
+      //   * today's chain: the f16 A (the caller's or TrellisA256's transform), then r4d_trellis_i8_quant_act.
       const int64_t a8_part = M * K;
       const int64_t sa_part = (K / 128) * M;
-      int8_t* a8 = arena.Alloc<int8_t>(static_cast<size_t>(parts * a8_part), /*align_bytes=*/16);
-      float* sa = arena.Alloc<float>(static_cast<size_t>(parts * sa_part), /*align_bytes=*/16);
-      core::r4d::TrellisI8QuantAct(a0, a8, sa, parts, parts > 1 ? a1 - a0 : 0, static_cast<int>(K), s);
+      const int8_t* a8;
+      const float* sa;
+      if (pre_i8) {
+        a8 = static_cast<const int8_t*>(pre->a8);
+        sa = static_cast<const float*>(pre->sa);
+        g_i8_from_producer.fetch_add(1, std::memory_order_relaxed);
+      } else if (!trellis_pre && TrellisI8FusedQEnabled()) {
+        g_i8_from_own.fetch_add(1, std::memory_order_relaxed);
+        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts);
+        const int64_t suh[2] = {reinterpret_cast<int64_t>(w.trellis_suh.data()),
+                                reinterpret_cast<int64_t>(w.trellis_suh.data() + K)};
+        const int64_t o8[2] = {reinterpret_cast<int64_t>(op.a8), reinterpret_cast<int64_t>(op.a8 + a8_part)};
+        const int64_t osa[2] = {reinterpret_cast<int64_t>(op.sa), reinterpret_cast<int64_t>(op.sa + sa_part)};
+        r4dx_trellis_input_i8(reinterpret_cast<int64_t>(x), M, K, parts, suh, o8, osa, w.trellis_prescale_log2,
+                              reinterpret_cast<int64_t>(s));
+        a8 = op.a8;
+        sa = op.sa;
+      } else {
+        g_i8_separate.fetch_add(1, std::memory_order_relaxed);
+        const uint16_t* a0;
+        const uint16_t* a1;
+        TrellisA256(s, arena, w, x, M, pre, trellis_pre, /*mark_input=*/false, &a0, &a1);
+        const TrellisI8Operand op = AllocTrellisI8Operand(arena, K, parts);
+        core::r4d::TrellisI8QuantAct(a0, op.a8, op.sa, parts, parts > 1 ? a1 - a0 : 0, static_cast<int>(K), s);
+        a8 = op.a8;
+        sa = op.sa;
+      }
       if (probe != nullptr) probe->MarkInput(s);
       float* ws = arena.Alloc<float>(
           core::r4d::GemmTrellisNtI8WsBytes(static_cast<int>(M), static_cast<int>(N), plan8.skg) / sizeof(float),

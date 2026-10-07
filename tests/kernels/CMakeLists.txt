@@ -67,6 +67,11 @@ set(R4DX_KERNEL_TESTS
   # single-part launches, repeats and tickets, an f16 / int8 / f16 interleave on one linear, row independence, the
   # refusals. Skips (77) only without a HIP device; needs no golden data. Written, NOT run by its author.
   test_trellis_i8_gemm
+  # R4DX_PREFILL_INT8_FUSEDQ (docs/int8-prefill.md "The fused quantizer"): the transform and the two fused producers that
+  # write A8 + SA directly (r4dx_trellis_input_i8, r4dx_silu_mul_trellis_i8, r4dx_attn_gate_mul_trellis_i8) against the
+  # chain they replace (f16 producer + libr4d's separate quantizer), byte for byte, nout 1..3, K up to 17408, nothing
+  # written outside the outputs, the preconditions. Skips (77) only without a HIP device. Written, NOT run by its author.
+  test_trellis_input_i8
   # R4DX_FAKEQ_ACT's kernel (docs/int8-prefill.md): r4dx_fake_quant_act_f16 bit for bit against
   # src/model/fake_quant_act.h's fp32 reference, every mode, one and two parts, K up to 17408. Skips (77)
   # only without a HIP device; needs no golden data.
@@ -127,7 +132,7 @@ set_tests_properties(test_rope_neox test_topk16 test_dflash_attn test_dflash_con
 set_tests_properties(test_argmax_multi PROPERTIES SKIP_RETURN_CODE 77)
 # test_attn_precore compares against r4dx_model_attn_split_qg_bf16, which lives in r4dx_model_attention.
 target_link_libraries(test_attn_precore PRIVATE r4dx_model_attention)
-set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 test_trellis_i8_gemm test_fake_quant_act test_fake_quant_w PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_trellis_decode test_trellis_input test_trellis_gemm test_trellis_m256 test_trellis_i8_gemm test_trellis_input_i8 test_fake_quant_act test_fake_quant_w PROPERTIES SKIP_RETURN_CODE 77)
 
 # `/EHc-` -- required for the precondition checks in test_dflash_attn.cpp and test_dflash_conv.cpp
 # to be able to CATCH anything at all.
@@ -154,7 +159,7 @@ set_source_files_properties(test_dflash_attn.cpp test_dflash_conv.cpp test_topk_
                             test_rope_mrope3.cpp test_rotate_residual.cpp
                             test_attn_gate_mul_hadamard.cpp test_trellis_decode.cpp
                             test_trellis_input.cpp test_trellis_gemm.cpp test_fused_quant.cpp
-                            test_trellis_m256.cpp test_trellis_i8_gemm.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
+                            test_trellis_m256.cpp test_trellis_i8_gemm.cpp test_trellis_input_i8.cpp test_fake_quant_act.cpp test_fake_quant_w.cpp test_rope_proportional.cpp
                             test_gemma_postnorm.cpp test_gemma_resid_f32.cpp test_rotate_residual_f32.cpp
                             PROPERTIES COMPILE_OPTIONS "/EHc-")
 

@@ -498,7 +498,7 @@ KL(off || on).
 * **Activation quantizer** (`i8g_quant_act`): one wave per (row, 128-block), `s = amax / 127` (1 for all zero),
   `q = clamp(rint(x / s), -127, 127)` with IEEE division, written straight in the fragment layout. v1 launches it separately
   per `ApplyLinear` call (10 us at K = 5120, 28.6 us at K = 17408; scratch `264 K` bytes per part from the arena, at most
-  a few MB; the 224 MiB reserve is unchanged). Fusing it into the transform producers is a follow-up.
+  a few MB; the 224 MiB reserve is unchanged). Fusing it into the transform producers is done, see "The fused quantizer".
 * **Tuning table** `src/model/gemm_tuning_table_trellis_i8.inc`, `{N, K, KB, skw, skg}` per class, SEEDED from the bench's best
   picks (`E:\models\r4dx\int8gemm\all.log`, device 1, before the mlp.down retune); `tool_int8_gemm_proto --emit-rows` regenerates
   it with the rule "best median, then the smallest skg within 1%". `PlanTrellisI8(N, K, kb, parts, part_n0)` mirrors
@@ -518,6 +518,68 @@ KL(off || on).
 * **TP = 2 in v1**: an explicit f16 fallback, logged once at load. The kernel itself is shape-generic (the rank shards K/2 and
   N/2 are still whole 128-blocks, `n_split` 8704) and `test_trellis_i8_gemm` bit-tests every TP = 2 rank shape, so v2 needs
   wiring and its own KL gate only.
+
+### The fused quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, branch `int8v2`)
+
+Status: written, built and CPU-tested; every GPU check below is written and NOT run (the writing session was CPU only).
+
+**What it removes.** The separate `r4d_trellis_i8_quant_act` launch of every int8 call, and with it the f16 A: the transform
+(or the fused silu_mul / gate-mul producer) quantizes the block it just rotated and writes A8 + SA, so the f16 A is neither
+written nor read back. Expected gain at least the ~5% the unfused quantizer costs on the linears (about 0.15 s of the 3.63 s
+cold TTFT at 8k); the f16 A traffic that disappears (2 B written + 2 B read per element, 1 B of A8 written instead of one
+write by each of the two kernels) should add a little on top. Unmeasured.
+
+**The contract is byte identity.** A8 and SA are bit for bit what the unfused chain makes: the producer rounds to f16 exactly as
+`TransformBlock` does (the same fp32 product, the same `asm("")` that keeps the multiply and the conversion apart), then runs
+`i8g_quant_act`'s arithmetic on those f16 values (`amax` over the 128-block, `s = amax / 127`, 1 for an all-zero block,
+`q = clamp(rint(x / s), -127, 127)` with IEEE division), and stores the byte in the A8 fragment layout. Every downstream byte
+(the GEMM, the KV cache, the logits) is therefore unchanged by the switch.
+
+| piece | where |
+|---|---|
+| the device function `i8g_quant_wave_block` (a wave32 owning one (row, 128-block), lane `l` holding elements `l + 32 r` as f16 bits: the register layout the transform's FWHT leaves) | `third_party/libr4d/r4d_trellis_i8_fused.h`, header only, includes just `r4d_trellis_i8_layout.h`; the one definition the kernels and the CPU emulation test compile |
+| three kernels, twins of the f16 ones: `TrellisInputI8Kernel`, `SiluMulTrellisI8Kernel`, `GateMulTrellisI8Kernel` | `src/kernels/src/trellis_transform.hip`; the f16 kernels and `TransformBlock` are untouched (their ISA: 9 kernel bodies of the unit compared with `tools/reference/compare_isa_listings.ps1` before / after, identical; the new kernels use 28 to 55 VGPRs, no scratch) |
+| entries `r4dx_trellis_input_i8` (nout 1..3 with host arrays of `a8[]` / `sa[]`, a two-part linear's second output at `a8 + 256 K`, `sa + K / 128 x 256`), `r4dx_silu_mul_trellis_i8`, `r4dx_attn_gate_mul_trellis_i8` | `kernels.h`; rows must be exactly 256 (throws otherwise), a8 and sa non-null |
+| `PreQuantizedActivation::a8` / `sa` (with `transform_id` set, `data` null) | `src/model/linear.h`: a producer that fused hands the consumer its int8 operand instead of the f16 A |
+| `TrellisI8Takes(w, M)`, `TrellisI8FusedQ(w, M)`, `AllocTrellisI8Operand` | `src/model/linear.cpp`: THE decision, once |
+
+**One decision, consistently.** `TrellisI8Takes` is `ApplyLinear`'s own test for its int8 branch, factored out (trellis, M = 256,
+`ScopedTrellisM256` and `ScopedTrellisI8` open, `PlanTrellisI8` ok, the scale table present); `TrellisI8FusedQ` adds the switch.
+Every producer asks it for the linear whose A it makes, in the same scope as that linear's `ApplyLinear`, so they agree by
+construction: `SharedTrellisInput` (gdn in_proj_qkv / z, attn qg / k / v: all linears of the group fused, or none), the
+mlp.down silu_mul producer (`mlp.cpp`), the attn.o gate-mul producer (`attention_layer.hpp`). A call with no producer (mlp.gate_up
+two parts, gdn.out_proj, any linear whose input is a plain bf16 tensor) fuses inside `ApplyLinear` itself: `r4dx_trellis_input_i8`
+replaces `TrellisA256`'s transform + the separate quantizer. If a producer quantized and the consumer then cannot take int8
+(a8 handed to a call outside the scopes, a plan or table missing) `ApplyLinear` THROWS: no f16 A exists to fall back to. Alignment
+of a8 / sa (16 bytes) is checked like the f16 operand's.
+
+**Kill switch.** `R4DX_PREFILL_INT8_FUSEDQ` (read once; unset, empty, `1`, `on` = on, the default; `0`, `off` = the separate
+launch again, today's chain bit for bit; anything else warns and keeps the default). Forced off when `R4DX_TRELLIS_A_STATS` is set
+(that hook tallies the f16 A a fused producer never writes). It needs `R4DX_PREFILL_INT8` on to matter at all. `ScopedTrellisI8FusedQ`
+is the test-only per-thread override, and `TrellisI8OperandCountsGet()` counts where each int8 call's operand came from (producer,
+own fused transform, separate quantizer) so a test can prove which chain ran.
+
+**Tests.**
+
+| test | where | status |
+|---|---|---|
+| `i8g_quant_wave_block` == `i8g_quant_act` byte for byte (A8, SA), == the CPU quantizer, on wide-range f16 (magnitudes 2^-20 .. 2^10, all-zero blocks, one-nonzero blocks, values near rounding midpoints, 60000), one part K = 1024 x 2 and K = 17408; and on the standard problem of both KB | `tests/kernels/test_int8_gemm_proto_emu.cpp` (CPU, 6 new checks, 196 s in total) | PASS |
+| the parser, `TrellisI8Takes` / `TrellisI8FusedQ` outside the scopes and without a table | `tests/model/test_prefill_int8_cpu.cpp` (CPU) | PASS (182 checks) |
+| the three kernels against the f16 producer + separate quantizer, byte for byte: nout 1..3, K 3072 / 5120 / 6144 / 8704 / 17408, prescale 0 / 4 / -3, silu_mul at both rank widths and a padded row stride, gate-mul at K 6144 / 3072; canaries (nothing written past the outputs), poison (every byte is written), a negative control, the preconditions | `tests/kernels/test_trellis_input_i8.cpp` (GPU, new) | built, not run |
+| whole prefill: logits of every call, every KV page, every GDN state and the decode tokens byte-identical with the switch scoped off and on, scenarios of 256 / 257 / 600 / 300 + 333 / 1024 rows, plus the operand counters (off: all separate; on: none separate, the same number of operands) | `tests/model/test_prefill_int8.cpp` `RunFusedQ` (GPU, a fourth load, about 3 more minutes) | built, not run |
+
+GPU commands for the main session (device 1, one job at a time):
+
+```
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\kernels\test_trellis_input_i8.exe; exit `$LASTEXITCODE"
+powershell -NoProfile -Command "`$env:HIP_VISIBLE_DEVICES='1'; & C:\Users\pay20\dev\r4dx-int8v2\build\win-hip\tests\model\test_prefill_int8.exe; exit `$LASTEXITCODE"
+# an end-to-end A/B of the switch itself (separate process per side): ttft_cli.ps1 -Lengths 8k with R4DX_PREFILL_INT8_FUSEDQ=0 and unset; the greedy hashes must be equal
+```
+
+**Caveats.** The A8 stores are one byte per element (4 `global_store_b8` per lane, 16 8-byte segments per wave): the write combining is
+left to the L2 and the unfused quantizer's dword stores are not reproduced; if the GPU time of the fused kernels shows it, the
+fix is a 4-lane shuffle into dwords. TP = 2 still runs f16 (no int8 scopes), so nothing of this applies there. The Gemma 4 trellis
+producers (`r4dx_gelu_tanh_mul_trellis_bf16`) are not wired (that model has no int8 path).
 
 ### Epilogue: a copy that cannot drift silently
 
@@ -642,7 +704,7 @@ twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
 | speculation | DFlash and MTP mean accepted length within -1% on the OpenCode transcripts |
 | robustness | a 128k prefill completes, VRAM headroom logged, no NaN |
 | plumbing | the ISA and epilogue-diff gates in the build; switch-off byte identity passes every build |
-| not required for the flip, but needed first | TP = 2 (auto-falls back until validated) and the fused quantizer |
+| not required for the flip, but needed first | TP = 2 (auto-falls back until validated) and the fused quantizer (written on branch `int8v2`, "The fused quantizer"; GPU runs pending) |
 
 ### Results
 

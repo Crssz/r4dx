@@ -55,6 +55,18 @@ inline bool PrefillInt8RequestExplicit() {
   return v;
 }
 
+// R4DX_PREFILL_INT8_FUSEDQ (docs/int8-prefill.md "The fused quantizer"): whether the producers of a trellis A (the input
+// transform, the silu_mul / gate-mul fused producers) write the int8 operand themselves where the call will take the int8
+// GEMM, instead of the f16 A plus a separate r4d_trellis_i8_quant_act launch. Same bytes either way. true for unset / empty /
+// "1" / "on" (the default), false for "0" / "off" (the kill switch); anything else warns and is the default.
+inline bool ParsePrefillInt8FusedQ(const char* e) {
+  if (e == nullptr || *e == '\0') return true;
+  if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return false;
+  if (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0) return true;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_FUSEDQ='%s' not recognized (0|off|1|on); using the default (on)\n", e);
+  return true;
+}
+
 // ModelOptions::prefill_int8: -1 follows the environment (default: on), 0 and 1 force the request whatever the
 // environment says (the identity tests load Models of 0, the int8 tests of 1). Anything else is the caller's bug.
 inline bool ValidPrefillInt8Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }

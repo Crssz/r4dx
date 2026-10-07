@@ -7,7 +7,8 @@
 //     mlp.gate_up included), its refusals (KB, parts, whole 128-blocks, the part boundary, a shape without a table
 //     row, R4DX_M256_SHAPES), and the tuning table itself: no duplicate key, every row legal under the kernel's own
 //     check (r4d_gemm_trellis_nt_i8_check) at its shape, every class of the model has a row at KB 4 and KB 5;
-//   * ScopedTrellisI8: off by default, nests, restores.
+//   * ScopedTrellisI8: off by default, nests, restores;
+//   * R4DX_PREFILL_INT8_FUSEDQ: the parser and the producer / consumer decision (TrellisI8Takes, TrellisI8FusedQ).
 // Links r4dx_model_linear (src/model/linear.cpp) and runs with HIP_VISIBLE_DEVICES=-1 (linking the library loads the
 // HIP runtime, which must see no device here); the libr4d check is host code.
 #include <cstdio>
@@ -233,6 +234,39 @@ void TestScope() {
   CHECK(!TrellisI8Active(), "off again after the scope");
 }
 
+// R4DX_PREFILL_INT8_FUSEDQ: the parser, and the one decision producers and ApplyLinear share. The positive case (a
+// linear WITH its scale table inside both scopes) needs device memory for the table: tests/model/test_prefill_int8 has it.
+void TestFusedQ() {
+  CHECK(ParsePrefillInt8FusedQ(nullptr) && ParsePrefillInt8FusedQ("") && ParsePrefillInt8FusedQ("1") &&
+            ParsePrefillInt8FusedQ("on"),
+        "unset, empty, 1, on: the fused quantizer is on (the default)");
+  CHECK(!ParsePrefillInt8FusedQ("0") && !ParsePrefillInt8FusedQ("off"), "0 and off are the kill switch");
+  std::fflush(stderr);
+  CHECK(ParsePrefillInt8FusedQ("yes") && ParsePrefillInt8FusedQ("ON") && ParsePrefillInt8FusedQ("2"),
+        "an unrecognized value keeps the default, on (with a warning on stderr)");
+  CHECK(TrellisI8FusedQEnabled(), "the test environment sets neither the switch nor R4DX_TRELLIS_A_STATS: enabled");
+  QuantLinear w;
+  w.layout = Layout::kTrellis;
+  w.N = 5120;
+  w.K = 6144;
+  w.trellis_bits = 4;
+  w.trellis_parts = 1;
+  CHECK(!TrellisI8Takes(w, 256) && !TrellisI8FusedQ(w, 256), "outside the scopes nothing is taken or fused");
+  {
+    ScopedTrellisM256 m(true);
+    ScopedTrellisI8 i(true);
+    CHECK(!TrellisI8Takes(w, 256), "inside both scopes a linear without a scale table does not take int8 (ApplyLinear throws for it)");
+    CHECK(!TrellisI8FusedQ(w, 256), "... so its producer does not fuse either: the consumer's decision is the producer's");
+    CHECK(!TrellisI8Takes(w, 64) && !TrellisI8Takes(w, 255), "any M but 256 never takes int8");
+  }
+  w.layout = Layout::kBf16;
+  {
+    ScopedTrellisM256 m(true);
+    ScopedTrellisI8 i(true);
+    CHECK(!TrellisI8Takes(w, 256), "a non-trellis linear never does");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -247,6 +281,7 @@ int main() {
   TestPlans();
   TestTable();
   TestScope();
+  TestFusedQ();
   if (g_fail != 0) {
     std::printf("test_prefill_int8_cpu: %d of %d checks FAILED\n", g_fail, g_checks);
     return 1;

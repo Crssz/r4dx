@@ -24,6 +24,10 @@
 //     before; the first GPU run misread that as a difference of the entry points). The image path, which never sets the
 //     per-call flag, needs a vision tower and is not reachable from this text-only test; the per-call flag does not
 //     stick (the call after it counts its own chunks);
+//   * R4DX_PREFILL_INT8_FUSEDQ (a fourth load, int8 on): scenarios of 256, 257, 600, 300 + 333 and 1024 rows each run with
+//     the fused quantizer scoped off (separate r4d_trellis_i8_quant_act launches) and on (the producers write A8 + SA):
+//     the logits of every call, the whole state digest and the decode tokens are byte-identical, and the operand counters
+//     (TrellisI8OperandCountsGet) show each side ran the chain it is named for (RunFusedQ);
 //   * the 4-layer w4a16 and bf16 containers (no trellis linears) with the switch on: the Model refuses it, says so
 //     (PrefillInt8Enabled() == false) and every byte equals off's.
 // SKIPs (77) for a container that is missing; an exception from a present one is a FAIL.
@@ -211,6 +215,78 @@ std::vector<Scenario> Scenarios() {
   return s;
 }
 
+// R4DX_PREFILL_INT8_FUSEDQ (docs/int8-prefill.md "The fused quantizer"): the producers write the GEMMs' A8 + SA themselves
+// instead of the f16 A plus a separate quantizer launch, and every byte of the whole prefill must be the same: the
+// logits of every call, every KV page, every GDN state, the decode tokens. One Model (int8 on), each scenario run twice,
+// with the switch scoped off (the separate chain) and on (ScopedTrellisI8FusedQ). Pair by pair rather than pass by pass:
+// Reset() leaves the KV pages alone and the digest covers them all, so run A and run B of one scenario must start from
+// the same stale pages, which they do (B rewrites exactly the positions A wrote). The operand counters prove each side ran
+// the chain it is named for: off takes every operand from the separate quantizer, on from no separate quantizer at all.
+int RunFusedQ(const ModelOptions& base_in) {
+  ModelOptions o = base_in;
+  o.prefill_chunk = 256;
+  o.prefill_int8 = 1;
+  Model m = Model::Load(o);
+  int fails = 0;
+  if (!m.PrefillInt8Enabled()) {
+    std::fprintf(stderr, "FAIL fusedq: the int8 path is not enabled on the production container\n");
+    return 1;
+  }
+  const std::vector<Scenario> scs = {{"len256", {256}, false}, {"len257", {257}, false}, {"len600", {600}, false},
+                                     {"split300+333", {300, 333}, false}, {"len1024", {1024}, false}};
+  using r4dx::model::ScopedTrellisI8FusedQ;
+  using r4dx::model::TrellisI8OperandCounts;
+  using r4dx::model::TrellisI8OperandCountsGet;
+  for (const Scenario& sc : scs) {
+    const std::string cfg = "fusedq/" + sc.name;
+    const TrellisI8OperandCounts c0 = TrellisI8OperandCountsGet();
+    Obs a, b;
+    {
+      ScopedTrellisI8FusedQ off(0);
+      a = RunScenario(m, sc);
+    }
+    const TrellisI8OperandCounts c1 = TrellisI8OperandCountsGet();
+    {
+      ScopedTrellisI8FusedQ on(1);
+      b = RunScenario(m, sc);
+    }
+    const TrellisI8OperandCounts c2 = TrellisI8OperandCountsGet();
+    bool ok = true;
+    const int64_t sep_a = c1.separate - c0.separate, prod_a = c1.from_producer - c0.from_producer,
+                  own_a = c1.from_own_transform - c0.from_own_transform;
+    const int64_t sep_b = c2.separate - c1.separate, prod_b = c2.from_producer - c1.from_producer,
+                  own_b = c2.from_own_transform - c1.from_own_transform;
+    if (a.i8_chunks == 0 || a.i8_chunks != b.i8_chunks) {
+      std::fprintf(stderr, "FAIL %s: int8 chunks %lld (separate) vs %lld (fused)\n", cfg.c_str(), static_cast<long long>(a.i8_chunks),
+                   static_cast<long long>(b.i8_chunks));
+      ok = false;
+    }
+    if (sep_a == 0 || prod_a != 0 || own_a != 0) {
+      std::fprintf(stderr, "FAIL %s: the separate side ran %lld separate / %lld producer / %lld own-transform operands (want only separate)\n",
+                   cfg.c_str(), static_cast<long long>(sep_a), static_cast<long long>(prod_a), static_cast<long long>(own_a));
+      ok = false;
+    }
+    if (sep_b != 0 || prod_b == 0 || own_b == 0 || prod_b + own_b != sep_a) {
+      std::fprintf(stderr, "FAIL %s: the fused side ran %lld separate / %lld producer / %lld own-transform operands (want none separate, the same %lld operands in all)\n",
+                   cfg.c_str(), static_cast<long long>(sep_b), static_cast<long long>(prod_b), static_cast<long long>(own_b),
+                   static_cast<long long>(sep_a));
+      ok = false;
+    }
+    const size_t bad = CountDiff(a.trace, b.trace, "fused vs separate", cfg, true);
+    if (bad != 0) {
+      std::fprintf(stderr, "FAIL %s: %zu of %zu observables (logits, KV, GDN state, decode tokens) differ between the fused and the separate chain\n",
+                   cfg.c_str(), bad, a.trace.size());
+      ok = false;
+    }
+    if (ok)
+      std::fprintf(stderr, "[PASS] %s: %lld int8 chunks, %lld operands (%lld from producers, %lld from the own fused transform), %zu observables byte-identical to the separate chain\n",
+                   cfg.c_str(), static_cast<long long>(a.i8_chunks), static_cast<long long>(sep_a), static_cast<long long>(prod_b),
+                   static_cast<long long>(own_b), a.trace.size());
+    if (!ok) ++fails;
+  }
+  return fails;
+}
+
 int RunReal(const char* path) {
   ModelOptions base;
   base.container_path = path;
@@ -326,6 +402,7 @@ int RunReal(const char* path) {
       std::fprintf(stderr, "[PASS] real/mm600: text-only PrefillMultimodal == Prefill, on and off (logits, GDN states, decode tokens, int8 chunk count; KV digests excluded: stale pages)\n");
     }
   }
+  fails += RunFusedQ(base);
   return fails;
 }
 

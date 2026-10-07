@@ -39,7 +39,7 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Decode, plain | 36.7 tok/s |
 | Decode, DFlash2 `k=7` | 108 tok/s |
 | Prefill, short prompts | about 1130 tok/s |
-| Cold prefill (time to first token) | 4.7 s at 8k, 23.4 s at 32k tokens (256-row chunks, HIP device 1, 2026-10-06; 6.8 s and 32.2 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
+| Cold prefill (time to first token) | 4.7 s at 8k, 23.0 s at 32k tokens (256-row chunks, HIP device 1, ROCm 10.1.0, 2026-10-07; 7.0 s and 32.3 s with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
 With `--tp 2` on two R9700s (same container, measured 2026-09-30 against a single-card baseline from the
 same session), plain decode reaches 60.1 tok/s (1.70x one card), DFlash2 `k=7` 162 tok/s (1.58x) and

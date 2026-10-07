@@ -402,13 +402,32 @@ that ablation is not clean: the stand-ins cost about the VALU they replace.)
 * A-layout: fragment-contiguous activations (a prefill-only input-transform change, measured -5..-8% on the
   M = 64 kernel) were not tried here.
 
-## Retuning the plan: what is free and what is not (2026-10-07, branch `f16retune`; CPU analysis only, GPU runs PENDING)
+## Retuning the plan: what is free and what is not (2026-10-07, branch `f16retune`)
 
 Why: the int8 prototype bench (`E:\models\r4dx\int8gemm\all.log` / `all.json`, docs/int8-gemm-proto.md) swept every
 legal (SK, SKG, SKW) of this unit and found, per class, a configuration 0-15% faster than the shipped plan. The
 question is whether the plan can take any of them without moving a bit of the "256-row chunk == 64-row chunk"
-identity. **Result: nothing was applied. No candidate is free, and the table is unchanged.** The sweep that decides
-it is in `tool_trellis_m256_bench --retune` (below), to be run on an idle device.
+identity. The CPU analysis below found no candidate free from existing data; the GPU sweep then decided it.
+
+**Result (MEASURED, ROCm 10.1.0, HIP device 1, idle machine).** `--retune --mode verify` on device 0: every M = 256
+(SK, SKG, SKW) byte-identical to the stock M = 64 tunings of the same (SK, SKG), 0 failing comparisons. Two
+`--retune --mode time` runs (`E:\models\r4dx\f16retune\retune1.log`, `retune2.log`); a pick was accepted only if it
+is FREE in both:
+
+| class | change (M = 64 row, and so the M = 256 plan) | M = 256 run 1 / 2 | M = 64 run 1 / 2 | taken |
+|---|---|--:|--:|---|
+| mlp.down KB 4 | `{1, 16, 4, 2, 0, 2, 1}` (SK 16 SKG 2) -> `{1, 4, 4, 2, 0, 1, 1}` (SK 4 SKG 1) | x1.375 / x1.412 | x1.008 / x1.062 | yes |
+| in_proj_qkv KB 5 | SK 2 SKG 1 -> SK 4 SKG 1 | x1.017 / x1.028 | x1.018 / x1.008 | no (within noise) |
+| z, out, down KB 5 | FREE in one run only, different families | - | - | no |
+
+End to end with the down KB 4 row (`tools\prefill\gdn256_check.ps1 -SkipIdentity`, device 1, single runs; logs
+`E:\models\r4dx\f16retune\`): cold TTFT 8k 4.836 -> **4.683 s** (1727 tok/s), 32k 23.456 -> **22.954 s** (1426 tok/s)
+against the same-toolchain main (the 4.836 s baseline ran with a CPU build in parallel, so the 8k gain may be
+slightly overstated). Greedy text hashes unchanged (8k `9A0B80DE8E49B800`, 32k `CDD3FDD6609B99DF`) and identical
+across new / conv1 / old / c64. `test_prefill_chunk_identity` PASS (15 configurations, 64-row == 256-row bit for
+bit), `test_trellis_m256`, `test_pick_tuning`, `test_prefill_chunk` PASS, `kl_rung4` byte-identical to
+`E:\models\r4dx\rocm1010\kl` (decode path untouched). The prefill bits of mlp.down KB 4 layers change, so prefill
+dumps recorded before this commit (dense-KL baselines) need re-recording.
 
 ### What defines the order of a sum (read from the two kernels, not assumed)
 

@@ -50,7 +50,7 @@ static const GemmTuningRow kGemmTuningTable[] = {
     {Layout::kTrellis, 34816, 5120, 64, {2, 4, 4, 2, 0, 1, 1}, 0, 4},  // mlp.gate_up Wc 128
     {Layout::kTrellis, 5120, 17408, 1, {1, 4, 1, 1, 1, 1, 4}, 0, 4},  // mlp.down Wc 32
     {Layout::kTrellis, 5120, 17408, 32, {1, 4, 2, 1, 1, 1, 4}, 0, 4},  // mlp.down Wc 32
-    {Layout::kTrellis, 5120, 17408, 64, {1, 16, 4, 2, 0, 2, 1}, 0, 4},  // mlp.down Wc 64
+    {Layout::kTrellis, 5120, 17408, 64, {1, 4, 4, 2, 0, 1, 1}, 0, 4},  // mlp.down Wc 64 (retuned 2026-10-07 from SK 16 SKG 2: M=256 plan x1.38-1.41, M=64 x1.01-1.06; docs/trellis-m256.md)
     {Layout::kTrellis, 10240, 5120, 1, {4, 1, 1, 1, 1, 1, 4}, 0, 5},  // gdn.in_proj_qkv Wc 128
     {Layout::kTrellis, 10240, 5120, 32, {2, 8, 2, 1, 1, 1, 4}, 0, 5},  // gdn.in_proj_qkv Wc 64
     {Layout::kTrellis, 10240, 5120, 64, {2, 2, 4, 2, 0, 1, 1}, 0, 5},  // gdn.in_proj_qkv Wc 128

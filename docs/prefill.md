@@ -481,6 +481,41 @@ prefill attention is the exact-wide launch, and split-KV stays one environment v
 - The parse is `ParsePrefillAttnMode` in `attention_layer.hpp`. `test_attn_layer` checks it on the
   CPU before its data-presence skip.
 
+### Split threshold (`R4DX_PREFILL_SPLITKV_MIN`)
+
+Measured on 2026-10-07 (TP=1, device 1, ROCm 10.1.0, build 89587f0, 2 interleaved runs, cold TTFT):
+
+| length | exact (default) | `=split` | split vs exact |
+|---|---|---|---|
+| 8k | 4.65 s | 5.14 s | +11% (slower) |
+| 32k | 22.76 s | 20.32 s | -10.7% |
+| 64k | 56.79 s | 44.06 s | -22.4% |
+
+The law decides per prompt-prefill attention call, not per prompt. The depth is `ctx` = the call's
+`seqused_k` = tokens already in the KV cache plus the call's own rows (`start_pos + 64 (j + 1)` for
+64-row sub-slice `j` of a 256-row chunk). `ctx < 8192` gives 1 segment, and above that S is the largest
+power of two with `q_blocks x kv_heads x S <= 32` and at least 8 tiles per segment (S=8 at TP=1, 16
+per rank at TP=2; the depth check is per rank and the same on both ranks).
+
+Why 8k loses, from the kernel tables above rather than from the threshold being too shallow: in `split`
+mode a call below the threshold takes the PLAIN launch, not the exact-wide one. Plain is about 2.3x slower
+per call than exact-wide (0.695 vs 0.308 ms at depth 8192), so an 8k prompt (8145 tokens, every call
+below 8192) runs its whole attention at plain speed in split mode, against exact-wide in the default:
+about 0.2 ms x 127 calls x 16 full-attention layers = 0.4 s, which is the 0.49 s gap. At 32k and 64k the
+first 8192 tokens pay the same price, so the split gain there is understated. Per call, S=8 beats
+exact-wide at every depth the kernel tables cover: 0.152 vs 0.308 ms at 8192, and against plain at 2048
+and 4096 0.068 / 0.082 ms vs 0.202 / 0.348 ms (exact-wide there is about 0.09 / 0.15 ms, extrapolated:
+no exact-wide measurement exists below 8192). The per-call crossover is therefore shallow, about 1k to
+2k tokens of context, and only depth 0 (plain 0.015 ms, split 0.028 to 0.037 ms) goes to the unsplit
+path.
+
+`R4DX_PREFILL_SPLITKV_MIN=N` (tokens of context, read once per process, only read with
+`R4DX_PREFILL_SPLITKV=split`) moves the threshold. Unset keeps today's behaviour exactly (8192, plain
+launch below it). Set (any non-negative integer, `0` = split from the first call that has 8 tiles per
+segment), every call below N, and any call the law leaves unsplit, takes the exact-wide launch, which is
+the plain launch's bits, so the output below N is the same as in the default. Anything else warns and
+means unset. The parse and the law's `min_ctx` are checked in `test_attn_layer` (CPU).
+
 **Checks with the new default** (the `1af310d` build, HIP device 1, outputs in
 `E:\models\r4dx\prefill-m1\final\`):
 - `ctest -LE tp2gpu`: 95/95 passed, including `test_attn_prefill_splitkv` and the parse check in

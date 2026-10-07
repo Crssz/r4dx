@@ -59,13 +59,23 @@ set(R4DX_MODEL_TESTS
   # calls, 256 / 320 / 200 / 17 / 2 / 64 rows, a random initial state), part B GdnLayer::Forward on the
   # 4-layer container's layer 0. Device 1; 77 without a device, or without the container after part A.
   test_gdn_seq256_identity
+  # Pipeline-parallel prefill, Phase 1 (docs/pp-prefill.md, gate G1b): the PP-EMULATE mode -- every prompt-prefill
+  # chunk as stage A = layers [0, k) and stage B = [k, N) on ONE device, the carry (residual stream, fused-norm
+  # pair, DFlash columns, KV rows) through pinned host memory with the device-side destinations poisoned --
+  # against the monolithic prefill, bit for bit: logits, tokens, the digest of all state, the DFlash capture;
+  # test_prefill_chunk_identity's shape list, plain / --mtp 3 / --dflash / image rows, the arena poison
+  # controls and the four negative controls (each must fail the comparison). 4-layer container (bf16, w4a16) and
+  # the real trellis container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library
+  # variant for Model::DebugStateDigest. Written, NOT run by its author (GPU).
+  test_pp_emulate_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
   add_executable(${t} ${t}.cpp)
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
-  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8")
+  if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
+     t STREQUAL "test_pp_emulate_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -232,6 +242,28 @@ set_source_files_properties(test_prefill_int8_cpu.cpp PROPERTIES COMPILE_OPTIONS
 add_executable(test_fake_quant_act_cpu test_fake_quant_act_cpu.cpp)
 target_include_directories(test_fake_quant_act_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_fake_quant_act_cpu COMMAND test_fake_quant_act_cpu)
+
+# test_pp_plan_cpu: pure CPU unit test for src/model/pp_plan.h (docs/pp-prefill.md): the KV blocks a chunk touches,
+# the R4DX_PP_EMULATE parser, the two-stage pipeline simulation, the stage / hop bench CSVs and the projection with
+# its go rule. No HIP call, no container; always runs.
+add_executable(test_pp_plan_cpu test_pp_plan_cpu.cpp)
+target_include_directories(test_pp_plan_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_pp_plan_cpu COMMAND test_pp_plan_cpu)
+
+# tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
+# TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never
+# add_test()'d (it consumes measurements; tools/.../pp_phase0.ps1 runs it).
+add_executable(tool_pp_project tool_pp_project.cpp)
+target_include_directories(tool_pp_project PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+
+# tool_pp_stage_bench / tool_pp_hop_bench: the GPU halves of Phase 0 -- per-stage cost of a cold prefill on one card
+# (the PP-emulate mode, Model::PpChunkTimes: layer ranges, the host hop, DFlash injection / MTP priming), and the
+# D2H / H2D bandwidth of the stage-boundary hop between the two cards. Built, never add_test()'d (they print / write
+# numbers); the Phase 0 script runs them.
+add_executable(tool_pp_stage_bench tool_pp_stage_bench.cpp)
+target_link_libraries(tool_pp_stage_bench PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+add_executable(tool_pp_hop_bench tool_pp_hop_bench.cpp)
+target_link_libraries(tool_pp_hop_bench PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group

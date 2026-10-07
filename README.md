@@ -146,6 +146,7 @@ docs/           design notes and measurements
 | Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
+| Pipeline-parallel 2-GPU prefill (Phase 0 tooling, PP-emulate) | [docs/pp-prefill.md](docs/pp-prefill.md) |
 | Hardware notes | [docs/r9700.md](docs/r9700.md) |
 | Detailed usage and history | [docs/usage.md](docs/usage.md), [docs/status.md](docs/status.md) |
 

@@ -2,9 +2,11 @@
 // f16 path. Built, and NOT RUN by the session that wrote it (CPU only): device 1, the machine idle, ~10 minutes
 // (three loads of the 64-layer trellis container, one after the other).
 //
-// The real trellis production container, loaded three times with prefill_chunk = 256 and ModelOptions::prefill_int8
-// 0 (off), 1 (on) and -1 (the DEFAULT, which is on since 2026-10-07: the third load checks that the default is on and
-// that the result is deterministic; with R4DX_PREFILL_INT8 set in the environment it uses 1 instead); the same
+// The real trellis production container, loaded four times with prefill_chunk = 256 and ModelOptions::prefill_int8
+// 0 (off), 1 (on, per-128 scales PINNED: prefill_int8_scales = 0), 1 with the coarse scales pinned (prefill_int8_scales = 1) and
+// -1 / -1 (the DEFAULTS: int8 is on since 2026-10-07 and the scales are COARSE since 2026-10-08; the fourth load checks that the
+// default is on, that it IS the pinned coarse load byte for byte -- which also proves it is deterministic across loads -- and,
+// with R4DX_PREFILL_INT8 or R4DX_PREFILL_INT8_SCALES set in the environment, that it is the pinned load the variable names); the same
 // scenarios run on each (Prefill calls, then plain decode steps), and every observable is kept: the last row's
 // logits, the greedy tokens that follow and a digest of ALL the per-sequence state (every KV cache, every GDN state:
 // Model::DebugStateDigest, R4DX_TP_TESTING). The "off" side is the f16 path of before the default changed.
@@ -28,7 +30,7 @@
 //     the fused quantizer scoped off (separate r4d_trellis_i8_quant_act launches) and on (the producers write A8 + SA):
 //     the logits of every call, the whole state digest and the decode tokens are byte-identical, and the operand counters
 //     (TrellisI8OperandCountsGet) show each side ran the chain it is named for (RunFusedQ);
-//   * R4DX_PREFILL_INT8_SCALES=coarse (a fifth load, ModelOptions::prefill_int8_scales = 1: A one scale per row, the weight one per
+//   * R4DX_PREFILL_INT8_SCALES=coarse (a fifth load -- the default since 2026-10-08, pinned here with prefill_int8_scales = 1: A one scale per row, the weight one per
 //     column over the whole K, docs/int8-prefill.md "Coarse scales"): the same five scenarios, fused vs separate chain
 //     byte-identical (the per-row producers r4dx_*_i8r against the f16 producers + r4d_trellis_i8_quant_act_row), deterministic
 //     (a rerun gives the same bytes), the weight table is N floats per linear and not [K / 128][N] (the load's VRAM figure),
@@ -50,6 +52,7 @@
 #include <vector>
 
 #include "model.h"
+#include "prefill_int8.h"
 #include "test_common.h"
 
 using namespace r4dx_test;
@@ -146,16 +149,19 @@ struct Side {
   bool enabled = false;
 };
 
-Side RunSide(const ModelOptions& base, int prefill_int8, const std::vector<Scenario>& scs) {
+// `scales`: ModelOptions::prefill_int8_scales -- 0 (per-128) unless the caller says otherwise, because the default is coarse now and the
+// "on" side of most comparisons below is the per-128 path; 1 pins coarse, -1 follows the environment (the default).
+Side RunSide(const ModelOptions& base, int prefill_int8, const std::vector<Scenario>& scs, int scales = 0) {
   ModelOptions o = base;
   o.prefill_chunk = 256;
   o.prefill_int8 = prefill_int8;
+  o.prefill_int8_scales = scales;
   Model m = Model::Load(o);
   Side s;
   s.enabled = m.PrefillInt8Enabled();
   for (const Scenario& sc : scs) {
     s.obs.push_back(RunScenario(m, sc));
-    std::fprintf(stderr, "[prefill-int8]   prefill_int8 = %d: %s: %lld int8 / %lld super-chunks\n", prefill_int8, sc.name.c_str(),
+    std::fprintf(stderr, "[prefill-int8]   prefill_int8 = %d scales = %d: %s: %lld int8 / %lld super-chunks\n", prefill_int8, scales, sc.name.c_str(),
                  static_cast<long long>(s.obs.back().i8_chunks), static_cast<long long>(s.obs.back().wide_chunks));
   }
   return s;
@@ -235,7 +241,7 @@ int RunFusedQ(const ModelOptions& base_in, int scales = 0, const std::vector<Sce
   ModelOptions o = base_in;
   o.prefill_chunk = 256;
   o.prefill_int8 = 1;
-  o.prefill_int8_scales = scales;   // 0 = blk128 (today's), 1 = coarse
+  o.prefill_int8_scales = scales;   // 0 = blk128, 1 = coarse (both pinned: the default is coarse)
   Model m = Model::Load(o);
   int fails = 0;
   const std::string stag = scales == 1 ? "fusedq-coarse/" : "fusedq/";
@@ -353,19 +359,24 @@ int RunReal(const char* path) {
   base.layout = r4dx::model::LayoutFromName(r4dx_test::ProductionLayoutName());
   base.max_ctx = 2048;
   const std::vector<Scenario> scs = Scenarios();
-  std::fprintf(stderr, "[prefill-int8] real container %s: three loads, %zu scenarios each\n", path, scs.size());
+  std::fprintf(stderr, "[prefill-int8] real container %s: four loads (plus the fused-quantizer loads), %zu scenarios each\n", path, scs.size());
   const Side off = RunSide(base, 0, scs);
-  const Side on = RunSide(base, 1, scs);
-  // the DEFAULT (option -1) is int8 on: the same Model as option 1 unless the environment sets R4DX_PREFILL_INT8
+  const Side on = RunSide(base, 1, scs, /*scales=*/0);        // int8 on, per-128 scales pinned
+  const Side coarse = RunSide(base, 1, scs, /*scales=*/1);    // int8 on, coarse scales pinned
+  // the DEFAULTS (options -1 / -1) are int8 on with coarse scales (2026-10-08): the same Model as the pinned coarse load, unless
+  // the environment sets R4DX_PREFILL_INT8 (1 / on pin it, which changes nothing here) or R4DX_PREFILL_INT8_SCALES=blk128 (then it
+  // is the pinned per-128 load). `on2` is the Side that must equal `dflt_ref` byte for byte.
   const char* env_i8 = std::getenv("R4DX_PREFILL_INT8");
-  const Side on2 = RunSide(base, (env_i8 != nullptr && *env_i8 != '\0') ? 1 : -1, scs);
+  const bool default_coarse = r4dx::model::ParsePrefillInt8Scales(std::getenv("R4DX_PREFILL_INT8_SCALES")) == r4dx::model::kPrefillInt8ScalesCoarse;
+  const Side on2 = RunSide(base, (env_i8 != nullptr && *env_i8 != '\0') ? 1 : -1, scs, /*scales=*/-1);
+  const Side& dflt_ref = default_coarse ? coarse : on;
   int fails = 0;
   if (off.enabled) {
     std::fprintf(stderr, "FAIL: prefill_int8 = 0 loaded a Model that has the switch on\n");
     ++fails;
   }
-  if (!on.enabled || !on2.enabled) {
-    std::fprintf(stderr, "FAIL: prefill_int8 = 1 (or the default, -1) on the trellis production container did not enable the int8 path (see the load line)\n");
+  if (!on.enabled || !coarse.enabled || !on2.enabled) {
+    std::fprintf(stderr, "FAIL: prefill_int8 = 1 (or the defaults, -1 / -1) on the trellis production container did not enable the int8 path (see the load line)\n");
     return fails + 1;
   }
   for (size_t i = 0; i < scs.size(); ++i) {
@@ -378,20 +389,24 @@ int RunReal(const char* path) {
       std::fprintf(stderr, "FAIL %s: the off Model ran %lld int8 chunks\n", cfg.c_str(), static_cast<long long>(off.obs[i].i8_chunks));
       ok = false;
     }
-    if (off.obs[i].wide_chunks != expect_wide || on.obs[i].wide_chunks != expect_wide) {
-      std::fprintf(stderr, "FAIL %s: super-chunks run: off %lld, on %lld, expected %lld\n", cfg.c_str(),
+    if (off.obs[i].wide_chunks != expect_wide || on.obs[i].wide_chunks != expect_wide || coarse.obs[i].wide_chunks != expect_wide) {
+      std::fprintf(stderr, "FAIL %s: super-chunks run: off %lld, on %lld, coarse %lld, expected %lld\n", cfg.c_str(),
                    static_cast<long long>(off.obs[i].wide_chunks), static_cast<long long>(on.obs[i].wide_chunks),
+                   static_cast<long long>(coarse.obs[i].wide_chunks),
                    static_cast<long long>(expect_wide));
       ok = false;
     }
-    if (on.obs[i].i8_chunks != expect_i8 || on2.obs[i].i8_chunks != expect_i8) {
-      std::fprintf(stderr, "FAIL %s: int8 chunks run: %lld and %lld, expected %lld\n", cfg.c_str(), static_cast<long long>(on.obs[i].i8_chunks),
+    if (on.obs[i].i8_chunks != expect_i8 || coarse.obs[i].i8_chunks != expect_i8 || on2.obs[i].i8_chunks != expect_i8) {
+      std::fprintf(stderr, "FAIL %s: int8 chunks run: %lld (per-128), %lld (coarse) and %lld (default), expected %lld\n", cfg.c_str(),
+                   static_cast<long long>(on.obs[i].i8_chunks), static_cast<long long>(coarse.obs[i].i8_chunks),
                    static_cast<long long>(on2.obs[i].i8_chunks), static_cast<long long>(expect_i8));
       ok = false;
     }
     if (expect_i8 == 0) {
-      // no int8 launch can have happened: every observable of on equals off's
-      const size_t bad = CountDiff(off.obs[i].trace, on.obs[i].trace, "on vs off", cfg, true);
+      // no int8 launch can have happened: every observable of on (either scales) and of the default equals off's
+      size_t bad = CountDiff(off.obs[i].trace, on.obs[i].trace, "on vs off", cfg, true);
+      bad += CountDiff(off.obs[i].trace, coarse.obs[i].trace, "coarse vs off", cfg, true);
+      bad += CountDiff(off.obs[i].trace, on2.obs[i].trace, "default vs off", cfg, true);
       if (bad != 0) {
         std::fprintf(stderr, "FAIL %s: %zu of %zu observables differ between on and off, but this scenario has no int8 chunk\n", cfg.c_str(),
                      bad, off.obs[i].trace.size());
@@ -399,10 +414,12 @@ int RunReal(const char* path) {
       }
       if (ok) std::fprintf(stderr, "[PASS] %s: no int8 chunk, %zu observables bit-identical on vs off\n", cfg.c_str(), off.obs[i].trace.size());
     } else {
-      // determinism: the second on-load gives the same bytes
-      const size_t bad_det = CountDiff(on.obs[i].trace, on2.obs[i].trace, "on vs on (second load)", cfg, true);
+      // the default IS the pinned load it should be (coarse unless the environment says blk128): the same bytes, which is also
+      // determinism across loads
+      const size_t bad_det = CountDiff(dflt_ref.obs[i].trace, on2.obs[i].trace, "default vs its pinned load", cfg, true);
       if (bad_det != 0) {
-        std::fprintf(stderr, "FAIL %s: the int8 path is not deterministic across loads: %zu observables differ\n", cfg.c_str(), bad_det);
+        std::fprintf(stderr, "FAIL %s: the default (options -1 / -1) is not the pinned %s load (or not deterministic across loads): %zu observables differ\n",
+                     cfg.c_str(), default_coarse ? "coarse" : "per-128", bad_det);
         ok = false;
       }
       // the negative control: the state digest must see the int8 rows (the KV of the super-chunk differs from off's) --
@@ -427,8 +444,8 @@ int RunReal(const char* path) {
         ok = false;
       }
       if (ok)
-        std::fprintf(stderr, "[PASS] %s: %lld int8 chunks, deterministic, KV differs from f16 in %zu digests, KL(off||on) %.5f, top-1 %s (f16 margin %.3f)\n",
-                     cfg.c_str(), static_cast<long long>(expect_i8), kv_diff, kl, top1 ? "same" : "flipped (near tie)", margin);
+        std::fprintf(stderr, "[PASS] %s: %lld int8 chunks, default == pinned %s load, KV (per-128) differs from f16 in %zu digests, KL(off||on) %.5f, top-1 %s (f16 margin %.3f)\n",
+                     cfg.c_str(), static_cast<long long>(expect_i8), default_coarse ? "coarse" : "per-128", kv_diff, kl, top1 ? "same" : "flipped (near tie)", margin);
     }
     if (!ok) ++fails;
   }

@@ -808,7 +808,7 @@ Trellis containers (`--layout trellis`, measured 2026-09-28 at `--max-ctx 2048`;
 "Trellis at TP=2"): the process's buffers on each rank are 9.63 GiB for mix4.5m (the load log counts 9.40 GiB of
 weights) and 8.92 GiB for K4m. With `--dflash` they are 11.12 / 10.41
 GiB, and with `--mtp 3` 9.84 / 9.14 GiB. The trellis rank shapes run `gemm_tuning_table_trellis_tp2.inc`. The int8 x int8 prefill GEMM
-on these rank shapes (`R4DX_PREFILL_INT8_TP2`, default off, its own tuning tables) is docs/int8-prefill.md "Tensor parallel".
+on these rank shapes (`R4DX_PREFILL_INT8_TP2`, **default on since 2026-10-08**, `=0` restores the f16 kernels and the numbers of this file; its own tuning tables; cold TTFT with coarse scales 2.88 s at 8k, 12.1 s at 32k, 25.5 s at 64k against 3.54 / 14.4 / 30.3 s f16) is docs/int8-prefill.md "Tensor parallel".
 
 ---
 

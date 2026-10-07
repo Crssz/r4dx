@@ -15,9 +15,16 @@ linears, so it is now a real prefill path, `R4DX_PREFILL_INT8`: see "Production 
 It is not on `main` yet: it is on branch `fast`.
 
 Update (2026-10-07, branch `int8v2`): two follow-ups on top of `main`, both with their own kill switch and both GPU-untested when they were written: the
-fused activation quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, default on; "The fused quantizer" below) and an opt-in COARSE-scale mode
+fused activation quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, default on; "The fused quantizer" below) and a COARSE-scale mode
 (`R4DX_PREFILL_INT8_SCALES=coarse`: one activation scale per row, one weight scale per column, no per-128 rescale; "Coarse scales"
-below). `blk128`, the default of the second, is today's bytes.
+below).
+
+**Status (2026-10-08, branch `int8v2`): COARSE scales and int8 at TP = 2 are now the DEFAULTS.** The GPU runs of the two
+follow-ups were done (outputs `E:\models\r4dx\int8v2`, `...\int8v2\tp2`), the user decided "coarse everywhere" and "TP = 2 int8
+default on", and the code now says so: `R4DX_PREFILL_INT8_SCALES` unset / empty is `coarse` (`blk128` restores the per-128
+scales, anything unrecognized warns and keeps coarse) and `R4DX_PREFILL_INT8_TP2` unset / empty is on (`0` / `off` restores f16
+at TP = 2). Numbers and the watch items: "Defaults on `int8v2`: coarse scales and TP = 2" below. **The default prefill bytes
+CHANGED with this** (coarse is a different quantized model of the linear than per-128); the decode bytes did not.
 
 The question: a trellis linear's GEMM (docs/trellis-kernel.md, docs/trellis-m256.md) multiplies an f16
 activation tile, the input after the 128-block Hadamard rotation, by on-the-fly decoded weights on f16 WMMA.
@@ -411,7 +418,7 @@ prompt-prefill attention (docs/prefill.md "Split threshold"). What changed:
 | `R4DX_FAKEQ_ACT/W` set, int8 only the default | n/a | int8 is refused with the reason `R4DX_FAKEQ_ACT / R4DX_FAKEQ_W are set`, the experiment runs as before |
 
 Unchanged: it still runs only where it did (full 256-row super-chunks of `Prefill` calls on a TP = 1 trellis Model: tails, a
-64-row Model, a quant2 container, TP = 2 (unless `R4DX_PREFILL_INT8_TP2=1`, off by default, "Tensor parallel"), images, decode and
+64-row Model, a quant2 container, TP = 2 with `R4DX_PREFILL_INT8_TP2=0` (on by default since 2026-10-08, "Tensor parallel"), images, decode and
 verify windows and the Gemma 4 model stay on the f16 kernels).
 Costs now paid by default: +0.7 GiB of weight scale tables at load (`R4DX_PREFILL_INT8=0` skips them), prefill rows that are a
 quantized model of the f16 rows (KL numbers in Results), and the KV bytes of a prompt depending on the chunk grid and so on
@@ -448,7 +455,7 @@ f16 kernel's FWHT / svh / out_scale / one bf16 rounding). It is a quantized MODE
 | | |
 |---|---|
 | runs int8 | the rows of a full 256-row super-chunk of a `Prefill` call, on a TP = 1 Model that runs 256-row chunks (`R4DX_PREFILL_CHUNK` unset / 256) and whose container is trellis, for every linear class with an int8 plan (all seven of the 27B, KB 4 and 5) |
-| stays f16 | tails (1..255 rows: 64-row slices), `R4DX_PREFILL_CHUNK=0/64`, a quant2 (rotated) container, MTP and DFlash 64-row slices, decode and verify windows, the vision tower, **`PrefillMultimodal`** with image spans, or after an image has made the positions multimodal (image accuracy is unmeasured; it never sets the per-call flag; a text-only call with no image ever seen delegates to `Prefill` and so DOES run int8, which is the only text-only path the CLI and the server use), TP = 2 (explicit fallback with a reason at load, unless `R4DX_PREFILL_INT8_TP2=1`: off by default and, until the TP = 2 tuning tables have rows, still f16; see "Tensor parallel"), the Gemma 4 model (switch ignored, said once) |
+| stays f16 | tails (1..255 rows: 64-row slices), `R4DX_PREFILL_CHUNK=0/64`, a quant2 (rotated) container, MTP and DFlash 64-row slices, decode and verify windows, the vision tower, **`PrefillMultimodal`** with image spans, or after an image has made the positions multimodal (image accuracy is unmeasured; it never sets the per-call flag; a text-only call with no image ever seen delegates to `Prefill` and so DOES run int8, which is the only text-only path the CLI and the server use), TP = 2 with `R4DX_PREFILL_INT8_TP2=0` (explicit fallback with a reason at load; int8 at TP = 2 is the default since 2026-10-08, see "Tensor parallel"), the Gemma 4 model (switch ignored, said once) |
 
 `ApplyLinear` takes the int8 branch when `M == 256 && TrellisM256Active() && TrellisI8Active()` and the linear has a plan
 and a scale table; anything else falls through to the f16 paths. `ScopedTrellisI8` is opened beside `ScopedTrellisM256`
@@ -523,7 +530,7 @@ KL(off || on).
 
 * **TP = 2 in v1**: an explicit f16 fallback, logged once at load. The kernel itself is shape-generic (the rank shards K/2 and
   N/2 are still whole 128-blocks, `n_split` 8704) and `test_trellis_i8_gemm` bit-tests every TP = 2 rank shape, so v2 needs
-  wiring and its own KL gate only. The wiring is written (branch `int8v2`, `R4DX_PREFILL_INT8_TP2`, default off, own empty tuning
+  wiring and its own KL gate only. The wiring is written (branch `int8v2`, `R4DX_PREFILL_INT8_TP2`, default on since 2026-10-08, own tuning
   tables): "Tensor parallel" below.
 
 ### The fused quantizer (`R4DX_PREFILL_INT8_FUSEDQ`, branch `int8v2`)
@@ -589,10 +596,67 @@ fix is a 4-lane shuffle into dwords. TP = 2 runs f16 unless `R4DX_PREFILL_INT8_T
 shard widths (K 8704 silu_mul, K 3072 gate-mul, both byte-tested by `test_trellis_input_i8`). The Gemma 4 trellis
 producers (`r4dx_gelu_tanh_mul_trellis_bf16`) are not wired (that model has no int8 path).
 
+### Defaults on `int8v2`: coarse scales and TP = 2 (2026-10-08)
+
+What the user approved (AskUserQuestion, 2026-10-08): "Coarse everywhere" (the coarse scales at TP = 1 and TP = 2) and "TP = 2 int8
+default on: Yes".
+
+| | before | now |
+|---|---|---|
+| `R4DX_PREFILL_INT8_SCALES` unset / empty | `blk128` | **`coarse`** (`blk128` restores per-128; anything else warns and keeps `coarse`) |
+| `R4DX_PREFILL_INT8_TP2` unset / empty | off (f16 at TP = 2) | **on** (`0` / `off` restores f16 at TP = 2: main's TP = 2 bytes; anything else warns and keeps on) |
+| `R4DX_PREFILL_INT8_FUSEDQ` | on | on (byte-identical to the separate chain; `0` is the kill switch) |
+| `ModelOptions::prefill_int8_scales` / `prefill_int8_tp2` = -1 | follow the environment (blk128 / off) | follow the environment (coarse / on); 0 and 1 still force |
+
+Kill switches now: `R4DX_PREFILL_INT8=0` (everything), `R4DX_PREFILL_INT8_SCALES=blk128` (per-128 scales), `R4DX_PREFILL_INT8_TP2=0`
+(f16 at TP = 2), `R4DX_PREFILL_INT8_FUSEDQ=0` (separate quantizer launch).
+
+**What the measurements say** (HIP device 1, and both GPUs for TP = 2; ROCm 10.1.0; 2 runs each; `int8v2` at `d071953`; outputs
+`E:\models\r4dx\int8v2\ttft_summary.txt`, `...\int8v2\tp2\ttft_summary.txt`, `...\tasks_score.log`):
+
+| | 8k | 32k | 64k |
+|---|---|---|---|
+| TP = 1 cold TTFT, main (per-128, separate quantizer) | 3.631 s | 15.945 s | 35.929 s |
+| TP = 1, fused quantizer (byte-identical to main) | 3.567 s (-1.8%) | 15.686 s (-1.6%) | 35.369 s (-1.6%) |
+| **TP = 1, coarse (the default now)** | **3.151 s (-13.2%)** | **13.999 s (-12.2%)** | **31.909 s (-11.2%)** |
+| TP = 2 cold TTFT, f16 (`R4DX_PREFILL_INT8_TP2=0`, main's bytes) | 3.539 s | 14.365 s | 30.296 s |
+| TP = 2, per-128 int8 (`R4DX_PREFILL_INT8_SCALES=blk128`) | 3.070 s (-13.3%) | 12.871 s (-10.4%) | 26.796 s (-11.6%) |
+| **TP = 2, coarse (the default now)** | **2.875 s (-18.8%)** | **12.098 s (-15.8%)** | **25.537 s (-15.7%)** |
+
+The greedy output of every configuration equals main's at all three lengths (sha prefixes `9A0B80DE8E49`, `CDD3FDD6609B`,
+`B001C38F82D5`). The fused quantizer is byte-identical to main's default (canon and long prefill logits; the decode `kl_rung4` byte
+gate passes). Bench, production coarse kernel against the f16 plan: x1.619 (KB 4) and x1.584 (KB 5), x1.19 to x1.21 against the
+per-128 int8 kernel. VRAM: -0.69 GiB (no per-128 weight scale table).
+
+Accuracy, KL against the f16 path (TP = 1 for the first block, the TP = 2 f16 path for the second):
+
+| | mean KL | p99 | top-1 |
+|---|---|---|---|
+| TP = 1 canon, coarse | 0.00128 | 0.0115 | 98.63% |
+| TP = 1 canon, `blk128` (the previous default) | 0.00110 | 0.0083 | 98.83% |
+| TP = 2 canon, per-128 int8 | 0.00104 | 0.0072 | 98.34% |
+| TP = 2 canon, coarse | 0.00145 | **0.0146** | 98.54% |
+
+Long prompts (all segments / code_8k / code_32k): TP = 1 coarse 0.00497 / **0.0034** / 0.0199 against `blk128` 0.00877 / 0.0020 / 0.0456;
+TP = 2 coarse 0.0118 over all segments, code_32k 0.0598. TP = 1 int8 against TP = 2 int8 (per-128): KL 0.00102, against 0.00088 between
+TP = 1 and TP = 2 f16 (the noise floor of the split itself). Long-context task set (7 tasks x 8 items, 8k / 32k): 100.0 / 98.2 for both
+`blk128` and coarse, 100 of 112 outputs identical, 0 score changes. The prefill median of that run: 3.63 s -> 3.20 s at 8k, 15.77 s -> 14.01 s at 32k.
+
+**Watch items.** The gates in "Gates for making coarse the default" below were: mean at most 0.0020, p99 at most 0.012, top-1 at least
+98.3% on the chunked canon, per-kind at most 0.003 at 8k and 32k. Two numbers sit over them and were accepted by the user's
+decision, so they are the first thing to look at if quality is questioned: **TP = 1 code_8k KL 0.0034** (over the 0.003 per-kind
+limit; `blk128` 0.0020) and **TP = 2 coarse canon p99 0.0146** (over 0.012; mean 0.00145 and top-1 98.54% are inside). The code_32k
+segment (0.0199 at TP = 1, 0.0598 at TP = 2) is the known worst case of this kind of rounding (docs/prefill.md). The escape hatches
+are `R4DX_PREFILL_INT8_SCALES=blk128` (finer scales; at TP = 2 canon KL 0.00104 / p99 0.0072) and `R4DX_PREFILL_INT8_TP2=0`. Prefill
+bytes now differ from the 2026-10-07 default (per-128) and from main's; decode, tails shorter than 256 rows, `R4DX_PREFILL_INT8=0`
+and `R4DX_PREFILL_INT8_TP2=0` (TP = 2 f16: main's bytes, checked by T3 of the TP validation) are unchanged. Not covered by these runs, as
+before: images, a 128k prefill, the speculation gate on the OpenCode transcripts.
+
 ### Coarse scales (`R4DX_PREFILL_INT8_SCALES=coarse`, branch `int8v2`)
 
-Status: written, built and CPU-tested; every GPU check below is written and NOT run (the writing session was CPU only). Opt-in; the
-default is `blk128`, today's bytes, unchanged.
+Status (2026-10-08): the default (previous sections). The text below was written before the GPU runs, CPU only, and is kept as the
+design record: where it says "opt-in", "the default is `blk128`" or "written, not run", read the section above. `blk128` (per-128) is
+today's previous-default bytes and is what `R4DX_PREFILL_INT8_SCALES=blk128` restores.
 
 **What it is.** The per-128 GEMM rescales the int32 partial sum of every 128 K into fp32 (cvt + mul + fma per output element, about
 165 of ~860 clk per 128 K per wave in the cycle model of docs/int8-gemm-proto.md, WMMA and VALU not overlapping), because both
@@ -602,7 +666,7 @@ K loop, by `sa[row] * sw[col]`; then the unchanged epilogue (LDS reduction over 
 FWHT-128, svh, `out_scale`, one bf16 rounding). The bench measured the bound of this idea (RESC 1: x1.56 to x1.58 against the
 shipped f16 plan, against x1.37 for the per-128 kernel); this is the production kernel of it.
 
-| | `blk128` (default) | `coarse` |
+| | `blk128` (the previous default; `R4DX_PREFILL_INT8_SCALES=blk128`) | `coarse` (the default since 2026-10-08) |
 |---|---|---|
 | activation scale | per (row, 128 k): SA `[K/128][256]` | per row: SA `[256]` per A part |
 | weight scale (the f16-`rs` rule of `i8g_wscale`: `s = amax / 127` (1 for all zero), `rs = f16(min(1 / s, 60000))`, `q = rint(w rs)`, table `s_eff = 1 / rs`) | per (column, 128 k): `[K/128][N]` fp32, 0.708 GiB on the 27B | per column over the whole K: `[N]` fp32, 4 N bytes per linear, **14.9 MiB on the 27B** (3,899,392 columns), a saving of 0.69 GiB |
@@ -658,9 +722,9 @@ as well as the kill switch).
 
 | | |
 |---|---|
-| `R4DX_PREFILL_INT8_SCALES` (read once; unset, empty, `blk128`: the default; `coarse`; anything else warns and keeps the default) | `ModelOptions::prefill_int8_scales`: -1 follows it, 0 forces blk128, 1 coarse (the tests load both in one process). It matters only where the int8 GEMM is on (`R4DX_PREFILL_INT8` not `0`, a TP = 1 trellis Model with 256-row chunks); the Gemma 4 model ignores it |
+| `R4DX_PREFILL_INT8_SCALES` (read once; unset, empty, `coarse`: the default; `blk128`; anything else warns and keeps the default, coarse) | `ModelOptions::prefill_int8_scales`: -1 follows it, 0 forces blk128, 1 coarse (the tests load both in one process). It matters only where the int8 GEMM is on (`R4DX_PREFILL_INT8` not `0`, a trellis Model with 256-row chunks; TP = 2 too unless `R4DX_PREFILL_INT8_TP2=0`); the Gemma 4 model ignores it |
 | load line | `prefill int8: ON (...): ... scales COARSE (R4DX_PREFILL_INT8_SCALES=coarse): A per row, weights per column, over the whole K, ...; N of M trellis linears have a weight scale table, <x> GiB` |
-| kill switch | unset / `blk128`: today's table, kernels and bytes (the 6 RESC-0 kernel bodies are ISA-identical to before this work: `compare_isa_listings.ps1 -Pattern 'i8g_kernelILb1ELi[45]ELb1ELi0ELi[248]E'`) |
+| kill switch | `R4DX_PREFILL_INT8_SCALES=blk128`: the previous default's table, kernels and bytes (the 6 RESC-0 kernel bodies are ISA-identical to before this work: `compare_isa_listings.ps1 -Pattern 'i8g_kernelILb1ELi[45]ELb1ELi0ELi[248]E'`) |
 
 **Tuning table.** `gemm_tuning_table_trellis_i8c.inc` is SEEDED with the per-128 table's rows (legal for the kernel, the same check),
 not measured: the coarse loop is lighter and its best `(skw, skg)` is likely different. `tool_int8_gemm_proto.exe` sweeps and times
@@ -714,18 +778,19 @@ C:\Users\pay20\AppData\Local\Programs\Python\Python312\python.exe C:\Users\pay20
 powershell -NoProfile -Command "`$env:R4DX_PREFILL_INT8_SCALES='coarse'; & C:\Users\pay20\dev\r4dx-int8v2\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k -Runs 3 -OutDir E:\models\r4dx\int8v2\ttft-coarse; exit `$LASTEXITCODE"
 ```
 
-Gates for making coarse the default (it would need the same list as "Gates for making it the default" above, the KL ones against the
+Gates for making coarse the default (decided 2026-10-08, with two measured overruns: see "Defaults on `int8v2`" above; it needed the same list as "Gates for making it the default" above, the KL ones against the
 f16 path and the speed ones against the per-128 default): KL(f16 || coarse) mean at most 0.0020, p99 at most 0.012, top-1 agreement at
 least 98.3% on the chunked canon; per-kind at most 0.003 at 8k and 32k with no row above 2 (the per-128 kernel sits at 0.0011 / 0.0017
 and 0.0104 at 32k, so there is little room at 32k code); and at least 3% faster cold TTFT than the per-128 default at 8k and 32k, else the
 accuracy it gives up buys nothing. What is NOT covered here, and not covered for the per-128 default either: images, and TP = 2
-(see "Tensor parallel" next, which wires the kernel for it, off by default).
+(see "Tensor parallel" next, which wires the kernel for it; on by default since 2026-10-08).
 
 ### Tensor parallel (`R4DX_PREFILL_INT8_TP2`, branch `int8v2`)
 
-Status: written, built and CPU-tested (`test_prefill_int8_cpu`, 485 checks, PASS); every GPU check below is written and NOT run (the
-writing session was CPU only). **The switch is OFF by default and the TP = 2 tuning tables are EMPTY**: nothing changes at TP = 2 until
-the bench has produced rows (`--tp 2`) and the accuracy gates below have been run. With the switch on and no rows the Model says so at
+Status (2026-10-08): **ON BY DEFAULT** ("Defaults on `int8v2`" above has the TTFT and KL numbers; `R4DX_PREFILL_INT8_TP2=0` restores f16 at TP = 2,
+main's bytes). The text below was written CPU-only before the GPU runs and is the design record: where it says "off by default", "the
+tables are EMPTY" or "written and NOT run", read the status here (the TP = 2 tuning tables have rows now, commit `d071953`). With the
+switch on and a shard shape without a row, that shape runs f16 with a once-per-shape notice; with no row at all the Model says so at
 load and runs f16 (byte-identical to the switch off, `test_prefill_int8_tp2` checks it).
 
 **Why TP = 2 ran f16 (every reason, found by reading the code).**
@@ -780,7 +845,7 @@ load and runs f16 (byte-identical to the switch off, `test_prefill_int8_tp2` che
 
 | piece | where |
 |---|---|
-| `R4DX_PREFILL_INT8_TP2` (read once; unset, empty, `0`, `off` = off, the default; `1`, `on` = asks for it; anything else warns and keeps the default), `ModelOptions::prefill_int8_tp2` (-1 follows the environment; 0 / 1 force it, the tests load both in one process), `PrefillInt8Inputs::tp2_enabled`, the `DecidePrefillInt8` reasons (TP without the switch: names the switch; switch on but no shard linear has a plan: names the TP tables and the bench command) | `prefill_int8.h`, `model.h`, `Model::Load` |
+| `R4DX_PREFILL_INT8_TP2` (read once; unset, empty, `1`, `on` = on, the default since 2026-10-08; `0`, `off` = f16 at TP = 2; anything else warns and keeps the default, on), `ModelOptions::prefill_int8_tp2` (-1 follows the environment; 0 / 1 force it, the tests load both in one process), `PrefillInt8Inputs::tp2_enabled`, the `DecidePrefillInt8` reasons (TP without the switch: names the switch; switch on but no shard linear has a plan: names the TP tables and the bench command) | `prefill_int8.h`, `model.h`, `Model::Load` |
 | `QuantLinear::trellis_tp_shard`, set by `ShardLoader::TrellisSlice` for a column- or row-parallel linear of a world > 1 load (never at TP = 1, never for a replicated linear) | `quant_linear.h`, `shard_loader.h` |
 | `PlanTrellisI8(..., coarse, tp_shard)` and `TrellisI8Rows(..., coarse, tp_shard)`: a shard linear reads the TP = 2 tables ONLY (no borrowed row for `attn.qg`), and a TP = 1 linear never reads them; the refusal says "no int8 tuning row for this TP rank-shard (N, K, KB) (...: tool_int8_gemm_proto --tp 2 --emit-rows)", and the once-per-shape notice reads `trellis TP shard [N x K] KB4 parts 1 has no int8 plan (...); its 256-row calls run the f16 kernel` | `linear.h`, `linear.cpp` |
 | `gemm_tuning_table_trellis_i8_tp2.inc`, `gemm_tuning_table_trellis_i8c_tp2.inc` (`kTrellisI8Tp2Table`, `kTrellisI8cTp2Table`): EMPTY, one `N == 0` placeholder row each (a C++ array cannot be empty; no plan matches it, the CPU test skips it) | `src/model/` |
@@ -794,7 +859,7 @@ all-reduce runs on the bf16 output exactly as before (it sums the ranks' partial
 producers are bit-tested at the shard widths (K 8704 silu_mul, K 3072 gate-mul, `test_trellis_input_i8`); `TpWarmup` runs the 256-row
 prefill through the int8 chain when it is on, so the first launch of every int8 kernel is inside the load.
 
-**OFF path.** With the switch unset a TP = 2 Model decides at load that it does not use int8 (`DecidePrefillInt8` refuses at the TP
+**OFF path.** With `R4DX_PREFILL_INT8_TP2=0` (it was the unset state until 2026-10-08) a TP = 2 Model decides at load that it does not use int8 (`DecidePrefillInt8` refuses at the TP
 check, before any table is built), builds no scale table, opens no scope and launches nothing new: it is byte-identical to one built
 before this branch (T3 checks it against main's binary). `QuantLinear` gained one bool; no kernel, no f16 launch and no tuning row
 changed (no libr4d file is touched).
@@ -982,7 +1047,7 @@ twice for determinism (baselines 8k 4.683 s, 32k 22.954 s).
 | speculation | DFlash and MTP mean accepted length within -1% on the OpenCode transcripts |
 | robustness | a 128k prefill completes, VRAM headroom logged, no NaN |
 | plumbing | the ISA and epilogue-diff gates in the build; switch-off byte identity passes every build |
-| not required for the flip, but needed first | TP = 2 (auto-falls back until validated; wired on branch `int8v2` behind `R4DX_PREFILL_INT8_TP2`, default off, "Tensor parallel"; GPU runs pending) and the fused quantizer (written on branch `int8v2`, "The fused quantizer"; GPU runs pending) |
+| not required for the flip, but needed first | TP = 2 (auto-falls back until validated; wired on branch `int8v2` behind `R4DX_PREFILL_INT8_TP2`, default on since 2026-10-08, "Tensor parallel"; GPU-validated) and the fused quantizer (written on branch `int8v2`, "The fused quantizer"; GPU runs pending) |
 
 ### Results
 

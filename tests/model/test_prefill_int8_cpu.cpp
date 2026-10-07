@@ -121,10 +121,10 @@ void TestDecision() {
     why = nullptr;
     CHECK(!DecidePrefillInt8(in, &why) && why != nullptr && std::string(why).find("tensor parallel") != std::string::npos &&
               std::string(why).find("R4DX_PREFILL_INT8_TP2") != std::string::npos,
-          "TP = 2 is refused unless R4DX_PREFILL_INT8_TP2 asks (the reason names the switch)");
+          "TP = 2 is refused when R4DX_PREFILL_INT8_TP2 is off (the reason names the switch)");
     in.tp2_enabled = true;
     why = "unset";
-    CHECK(DecidePrefillInt8(in, &why) && why == nullptr, "TP = 2 with the switch on is used, no reason");
+    CHECK(DecidePrefillInt8(in, &why) && why == nullptr, "TP = 2 with the switch on (its default) is used, no reason");
   }
   {
     PrefillInt8Inputs in = Good();
@@ -178,7 +178,7 @@ void TestDecision() {
     CHECK(why != nullptr && std::string(why).find("trellis linears") != std::string::npos, "TP switch on: trellis is the next reason");
   }
   {
-    // after the load-time pass: no shard linear has a row (the TP = 2 tables are empty until the GPU run) -> the TP-specific reason
+    // after the load-time pass: no shard linear has a row (a table with no row for the shard shapes) -> the TP-specific reason
     PrefillInt8Inputs in = Good();
     in.tp_world = 2;
     in.tp2_enabled = true;
@@ -312,20 +312,22 @@ void TestFusedQ() {
 // table (same classes, same legality, its own rows), and the per-linear decision (a linear is coarse when it holds the
 // column table; the positive case needs device memory: tests/model/test_prefill_int8 has it).
 void TestScales() {
-  CHECK(ParsePrefillInt8Scales(nullptr) == kPrefillInt8ScalesBlk128 && ParsePrefillInt8Scales("") == kPrefillInt8ScalesBlk128 &&
-            ParsePrefillInt8Scales("blk128") == kPrefillInt8ScalesBlk128,
-        "unset, empty, blk128: the per-128 scales (the default)");
-  CHECK(ParsePrefillInt8Scales("coarse") == kPrefillInt8ScalesCoarse, "coarse is coarse");
+  CHECK(ParsePrefillInt8Scales(nullptr) == kPrefillInt8ScalesCoarse && ParsePrefillInt8Scales("") == kPrefillInt8ScalesCoarse &&
+            ParsePrefillInt8Scales("coarse") == kPrefillInt8ScalesCoarse,
+        "unset, empty, coarse: the coarse scales (the default since 2026-10-08)");
+  CHECK(ParsePrefillInt8Scales("blk128") == kPrefillInt8ScalesBlk128, "blk128 restores the per-128 scales");
   std::fflush(stderr);
-  CHECK(ParsePrefillInt8Scales("Coarse") == kPrefillInt8ScalesBlk128 && ParsePrefillInt8Scales("1") == kPrefillInt8ScalesBlk128 &&
-            ParsePrefillInt8Scales("row") == kPrefillInt8ScalesBlk128,
-        "an unrecognized value keeps the default, blk128 (with a warning on stderr; the spelling is case sensitive)");
+  CHECK(ParsePrefillInt8Scales("Coarse") == kPrefillInt8ScalesCoarse && ParsePrefillInt8Scales("1") == kPrefillInt8ScalesCoarse &&
+            ParsePrefillInt8Scales("row") == kPrefillInt8ScalesCoarse && ParsePrefillInt8Scales("BLK128") == kPrefillInt8ScalesCoarse,
+        "an unrecognized value keeps the default, coarse (with a warning on stderr; the spelling is case sensitive)");
   CHECK(ValidPrefillInt8ScalesOption(-1) && ValidPrefillInt8ScalesOption(0) && ValidPrefillInt8ScalesOption(1) &&
             !ValidPrefillInt8ScalesOption(2) && !ValidPrefillInt8ScalesOption(-2),
         "options -1, 0, 1 are valid, 2 and -2 are not");
   CHECK(ResolvePrefillInt8Scales(0) == kPrefillInt8ScalesBlk128 && ResolvePrefillInt8Scales(1) == kPrefillInt8ScalesCoarse,
         "option 0 forces blk128, option 1 coarse, whatever the environment says");
   CHECK(ResolvePrefillInt8Scales(-1) == PrefillInt8ScalesRequest(), "option -1 follows R4DX_PREFILL_INT8_SCALES");
+  CHECK(std::getenv("R4DX_PREFILL_INT8_SCALES") != nullptr || ResolvePrefillInt8Scales(-1) == kPrefillInt8ScalesCoarse,
+        "with the variable unset, the default option resolves to coarse");
   CHECK(std::string(PrefillInt8ScalesName(kPrefillInt8ScalesCoarse)) == "coarse" &&
             std::string(PrefillInt8ScalesName(kPrefillInt8ScalesBlk128)) == "blk128", "the names");
   QuantLinear w;
@@ -377,18 +379,19 @@ void TestCoarsePlansAndTable() {
 // ---- TP = 2 (docs/int8-prefill.md "Tensor parallel") ---------------------------------------------------------------------
 
 void TestTp2Switch() {
-  CHECK(!ParsePrefillInt8Tp2(nullptr) && !ParsePrefillInt8Tp2("") && !ParsePrefillInt8Tp2("0") && !ParsePrefillInt8Tp2("off"),
-        "unset, empty, 0, off: int8 on TP shards is off (the default)");
-  CHECK(ParsePrefillInt8Tp2("1") && ParsePrefillInt8Tp2("on"), "1 and on ask for it");
+  CHECK(ParsePrefillInt8Tp2(nullptr) && ParsePrefillInt8Tp2("") && ParsePrefillInt8Tp2("1") && ParsePrefillInt8Tp2("on"),
+        "unset, empty, 1, on: int8 on TP shards is on (the default since 2026-10-08)");
+  CHECK(!ParsePrefillInt8Tp2("0") && !ParsePrefillInt8Tp2("off"), "0 and off are the kill switch (f16 at TP = 2)");
   std::fflush(stderr);
-  CHECK(!ParsePrefillInt8Tp2("yes") && !ParsePrefillInt8Tp2("ON") && !ParsePrefillInt8Tp2("2"),
-        "an unrecognized value keeps the default, off (with a warning on stderr; the spelling is case sensitive)");
+  CHECK(ParsePrefillInt8Tp2("yes") && ParsePrefillInt8Tp2("ON") && ParsePrefillInt8Tp2("2"),
+        "an unrecognized value keeps the default, on (with a warning on stderr; the spelling is case sensitive)");
   CHECK(ValidPrefillInt8Tp2Option(-1) && ValidPrefillInt8Tp2Option(0) && ValidPrefillInt8Tp2Option(1) && !ValidPrefillInt8Tp2Option(2) &&
             !ValidPrefillInt8Tp2Option(-2),
         "options -1, 0, 1 are valid, 2 and -2 are not");
   CHECK(!ResolvePrefillInt8Tp2(0) && ResolvePrefillInt8Tp2(1), "option 0 forces off, 1 on, whatever the environment says");
   CHECK(ResolvePrefillInt8Tp2(-1) == PrefillInt8Tp2Request(), "option -1 follows R4DX_PREFILL_INT8_TP2");
-  CHECK(!PrefillInt8Tp2Request() || std::getenv("R4DX_PREFILL_INT8_TP2") != nullptr, "the request is off unless the environment sets it");
+  CHECK(PrefillInt8Tp2Request() || std::getenv("R4DX_PREFILL_INT8_TP2") != nullptr, "the request is on unless the environment sets it");
+  CHECK(std::getenv("R4DX_PREFILL_INT8_TP2") != nullptr || ResolvePrefillInt8Tp2(-1), "with the variable unset, the default option resolves to on");
   QuantLinear w;
   CHECK(!w.trellis_tp_shard, "a linear is not a TP shard by default (TP = 1 loads and replicated linears never are)");
 }

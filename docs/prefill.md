@@ -23,8 +23,14 @@ re-taken on the Huihui container, `docs/huihui.md` "Frozen values").
   the kill switch: the full 256-row super-chunks run their trellis linears int8 x int8 (-18.9% TTFT at 8k, -15.7% at
   32k, greedy text unchanged, KL(off || on) 0.0011 canon / 0.0017 at 8k / 0.0104 at 32k). See
   [int8-prefill.md "Production path"](int8-prefill.md#production-path-r4dx_prefill_int8).
+  **Since 2026-10-08 (branch `int8v2`) the scales are COARSE by default (`R4DX_PREFILL_INT8_SCALES=blk128` restores per-128) and TP = 2
+  runs int8 too (`R4DX_PREFILL_INT8_TP2=0` restores f16 at TP = 2).** Cold TTFT, TP = 1: 3.15 s at 8k, 14.0 s at 32k, 31.9 s at 64k
+  (-13.2%, -12.2%, -11.2% against main); TP = 2: 2.88 s, 12.1 s, 25.5 s (-18.8%, -15.8%, -15.7% against main TP = 2 f16, 3.54 s,
+  14.4 s, 30.3 s). Greedy text unchanged at all three lengths; KL numbers and watch items in
+  [int8-prefill.md "Defaults on int8v2"](int8-prefill.md#defaults-on-int8v2-coarse-scales-and-tp--2-2026-10-08). The TP = 2 tables
+  below (2026-09-30 to 2026-10-03) are the f16 / exact-wide ones, i.e. `R4DX_PREFILL_INT8=0` or `R4DX_PREFILL_INT8_TP2=0`.
 - **Prefill is therefore no longer bit-identical to the 64-row f16 path by default.** `R4DX_PREFILL_INT8=0
-  R4DX_PREFILL_SPLITKV=exact` restores the old bytes (the identity tests, `tp1_identity.ps1` and `gdn256_check.ps1`
+  R4DX_PREFILL_SPLITKV=exact` restores the old bytes (add `R4DX_PREFILL_INT8_TP2=0` for TP = 2; the identity tests, `tp1_identity.ps1` and `gdn256_check.ps1`
   pin them; `gdn256_check.ps1 -Defaults` runs the new defaults).
 
 The kit and its commands are in [`tools/prefill/README.md`](../tools/prefill/README.md). Raw outputs

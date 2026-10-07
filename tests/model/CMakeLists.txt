@@ -40,14 +40,16 @@ set(R4DX_MODEL_TESTS
   # 2026-10-07); test_prefill_chunk_identity_defaults below runs the 4-layer part with the split-KV default.
   test_prefill_chunk_identity
   # R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path") against the f16 path on the real trellis container loaded
-  # three times (off, on, default = on since 2026-10-07): T < 256 byte-identical on and off, T >= 256 deterministic with the
+  # four times (off, on with per-128 scales pinned, on with coarse scales pinned, the defaults = int8 on since 2026-10-07 and coarse scales
+  # since 2026-10-08; the defaults must equal the pinned coarse load): T < 256 byte-identical on and off, T >= 256 deterministic with the
   # int8 chunk counts the chunk grid predicts, the state digest differing from f16 (negative control), the last row's
   # logits close, a text-only PrefillMultimodal == Prefill in its live state and int8 chunk count (KV digests excluded there:
   # Reset() leaves stale pages that the digest covers); the 4-layer containers refuse the switch. Device 1, SKIP 77 without the containers. Links the
   # R4DX_TP_TESTING library variant for Model::DebugStateDigest. Written, NOT run by its author.
   test_prefill_int8
   # R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): TpModel (emulate, both ranks on device 1) on the real trellis
-  # container with the TP switch off and on. Empty TP = 2 tuning tables: the switch refuses int8, both ranks stay f16 and every observable
+  # container with the TP switch off (R4DX_PREFILL_INT8_TP2=0, the kill switch) and on (per-128 scales pinned), then the defaults (TP = 2 int8
+  # on, coarse scales). Empty TP = 2 tuning tables: the switch refuses int8, both ranks stay f16 and every observable
   # equals the off run's. Rows present: int8 chunk counts per rank, no-super-chunk scenarios identical, determinism, KL bounds, and
   # TP = 2 int8 against TP = 1 int8 (two more loads). Device 1, SKIP 77 without the container. Written, NOT run by its author.
   test_prefill_int8_tp2

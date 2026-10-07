@@ -1,10 +1,12 @@
 // tests/model/test_prefill_int8_tp2.cpp -- R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): the int8 prefill GEMM on the
 // shards of a TP = 2 rank. Built, and NOT RUN by the session that wrote it (CPU only): device 1, the machine idle, both ranks emulated on
-// that one device (TpOptions::Mode::kEmulate, ~21 GiB), the real 64-layer trellis container loaded up to four times, one after the other.
+// that one device (TpOptions::Mode::kEmulate, ~21 GiB), the real 64-layer trellis container loaded up to five times, one after the other.
 //
-//   A  TpModel, prefill_int8 = 1, prefill_int8_tp2 = 0 (the default): TP = 2 keeps the f16 kernels. Both ranks report
+// Since 2026-10-08 TP = 2 int8 (R4DX_PREFILL_INT8_TP2) and the coarse scales (R4DX_PREFILL_INT8_SCALES) are the DEFAULTS, so every load
+// below PINS both options it means (prefill_int8_tp2 0 / 1, prefill_int8_scales 0 = per-128) except E, which is the defaults themselves.
+//   A  TpModel, prefill_int8 = 1, prefill_int8_tp2 = 0 (the kill switch): TP = 2 keeps the f16 kernels. Both ranks report
 //      PrefillInt8Enabled() == false and run no int8 chunk. This is the TP = 2 f16 reference of everything below.
-//   B  TpModel, prefill_int8 = 1, prefill_int8_tp2 = 1. What it must do depends on the TP = 2 tuning tables
+//   B  TpModel, prefill_int8 = 1, prefill_int8_tp2 = 1, prefill_int8_scales = 0 (per-128). What it must do depends on the TP = 2 tuning tables
 //      (gemm_tuning_table_trellis_i8_tp2.inc, the bench's --tp 2 --emit-rows fills them):
 //        * the tables are EMPTY (no shard shape has a row): the Model refuses int8 at load ("no TP rank-shard linear has an int8 plan"),
 //          both ranks run f16, and EVERY observable (the last row's logits of every call, the greedy tokens after them) is byte-identical
@@ -19,6 +21,10 @@
 //      TP = 1 scales of its blocks (docs/int8-prefill.md "Tensor parallel"; test_tp_loader checks the tables bit for bit), so the two differ
 //      only in the order of the fp32 sums and the bf16 all-reduce. Printed as numbers; failing at KL(D || B) >= 0.1, where a wrong shard
 //      scale would sit.
+//   E  (only when B ran int8) TpModel with every option at -1 (the DEFAULTS: int8 on, TP = 2 int8 on, COARSE scales): both ranks enabled and
+//      agreeing, the chunk grid as in B, deterministic, close to A (KL < 0.1) yet different from A and from B (the coarse rows change the
+//      bytes: per-128 and coarse are not the same arithmetic). With R4DX_PREFILL_INT8_TP2=0 / R4DX_PREFILL_INT8_SCALES=blk128 in the
+//      environment the corresponding expectation is relaxed (f16 like A / the bytes of B).
 // SKIPs (77) for a missing container; an exception from a present one is a FAIL.
 #include <hip/hip_runtime.h>
 
@@ -26,6 +32,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -41,6 +48,11 @@ using r4dx::model::TpModel;
 using r4dx::model::TpOptions;
 
 namespace {
+
+bool env_scales_is_blk128() {
+  const char* s = std::getenv("R4DX_PREFILL_INT8_SCALES");
+  return s != nullptr && std::strcmp(s, "blk128") == 0;
+}
 
 int32_t Argmax(const std::vector<float>& v) {
   size_t best = 0;
@@ -187,11 +199,13 @@ TpOptions EmulateOptions() {
   return t;
 }
 
-Side RunTp(const ModelOptions& base, int tp2_option) {
+// `scales`: ModelOptions::prefill_int8_scales -- 0 (per-128) by default of THIS helper, since the default of the option is coarse now.
+Side RunTp(const ModelOptions& base, int tp2_option, int scales = 0, int int8 = 1) {
   ModelOptions o = base;
   o.prefill_chunk = 256;
-  o.prefill_int8 = 1;
+  o.prefill_int8 = int8;
   o.prefill_int8_tp2 = tp2_option;
+  o.prefill_int8_scales = scales;
   std::unique_ptr<TpModel> m = TpModel::Load(o, EmulateOptions());
   return RunAll(*m);
 }
@@ -199,6 +213,7 @@ Side RunTp1(const ModelOptions& base, int int8) {
   ModelOptions o = base;
   o.prefill_chunk = 256;
   o.prefill_int8 = int8;
+  o.prefill_int8_scales = 0;   // per-128 pinned: the twin of B (the default is coarse)
   Model m = Model::Load(o);
   return RunAll(m);
 }
@@ -242,8 +257,8 @@ int Run(const char* path) {
     fails += bad;
     if (bad == 0)
       std::fprintf(stderr,
-                   "[PASS] tp2 fallback: R4DX_PREFILL_INT8_TP2 on, no shard shape has an int8 tuning row (the TP = 2 tables are empty until "
-                   "tool_int8_gemm_proto --tp 2 --emit-rows has run): both ranks stay f16, every observable of %zu scenarios is byte-identical to the "
+                   "[PASS] tp2 fallback: R4DX_PREFILL_INT8_TP2 on, no shard shape has an int8 tuning row (a TP = 2 table with no row for the shard "
+                   "shapes; tool_int8_gemm_proto --tp 2 --emit-rows fills it): both ranks stay f16, every observable of %zu scenarios is byte-identical to the "
                    "switch-off run. Fill the tables, rebuild and run this test again for the int8 part.\n",
                    scs.size());
     if (fails != 0) return fails;
@@ -314,6 +329,64 @@ int Run(const char* path) {
                    scs[i].name.c_str(), kl_i8, kl_f16);
       ++fails;
     }
+  }
+
+  // E: the defaults (every option -1): TP = 2 int8 on, coarse scales
+  const char* env_tp2 = std::getenv("R4DX_PREFILL_INT8_TP2");
+  const char* env_i8 = std::getenv("R4DX_PREFILL_INT8");
+  const bool env_tp2_off = env_tp2 != nullptr && (std::strcmp(env_tp2, "0") == 0 || std::strcmp(env_tp2, "off") == 0);
+  const bool env_i8_off = env_i8 != nullptr && (std::strcmp(env_i8, "0") == 0 || std::strcmp(env_i8, "off") == 0);
+  const bool env_blk128 = env_scales_is_blk128();
+  const bool expect_i8 = !env_tp2_off && !env_i8_off;
+  const Side e = RunTp(base, /*tp2_option=*/-1, /*scales=*/-1, /*int8=*/-1);
+  if (e.enabled[0] != e.enabled[1] || e.enabled[0] != expect_i8) {
+    std::fprintf(stderr, "FAIL E: the defaults on a TP = 2 Model: int8 enabled rank0 %d rank1 %d, expected %d (TP = 2 int8 is on by default)\n", e.enabled[0],
+                 e.enabled[1], expect_i8 ? 1 : 0);
+    return fails + 1;
+  }
+  for (size_t i = 0; i < scs.size(); ++i) {
+    const int64_t expect = expect_i8 ? SuperChunks(scs[i]) : 0;
+    const std::string cfg = "tp2-default/" + scs[i].name;
+    bool ok = true;
+    if (e.obs[i].i8[0] != expect || e.obs[i].i8[1] != expect) {
+      std::fprintf(stderr, "FAIL %s: int8 chunks rank0 %lld rank1 %lld, expected %lld\n", cfg.c_str(), static_cast<long long>(e.obs[i].i8[0]),
+                   static_cast<long long>(e.obs[i].i8[1]), static_cast<long long>(expect));
+      ok = false;
+    }
+    if (expect == 0) {
+      if (!SameBytes(a.obs[i], e.obs[i])) {
+        std::fprintf(stderr, "FAIL %s: no int8 chunk, yet the default run differs from the f16 run\n", cfg.c_str());
+        ok = false;
+      }
+    } else {
+      const double kl = Kl(a.obs[i].logits, e.obs[i].logits), margin = Top2Margin(a.obs[i].logits);
+      const bool top1 = Argmax(a.obs[i].logits) == Argmax(e.obs[i].logits);
+      if (SameBytes(a.obs[i], e.obs[i])) {
+        std::fprintf(stderr, "FAIL %s: the default run equals the f16 run byte for byte (the int8 chunks ran but changed nothing?)\n", cfg.c_str());
+        ok = false;
+      }
+      if (env_blk128 ? !SameBytes(b.obs[i], e.obs[i]) : SameBytes(b.obs[i], e.obs[i])) {
+        std::fprintf(stderr, "FAIL %s: the default run %s the per-128 run (B) byte for byte, but its scales are %s\n", cfg.c_str(),
+                     env_blk128 ? "differs from" : "equals", env_blk128 ? "blk128 (R4DX_PREFILL_INT8_SCALES in the environment)" : "coarse by default");
+        ok = false;
+      }
+      if (!(kl >= 0.0 && kl < 0.1)) {
+        std::fprintf(stderr, "FAIL %s: KL(f16 || default) of the last row's logits is %.5f (bound 0.1)\n", cfg.c_str(), kl);
+        ok = false;
+      }
+      if (!top1 && margin >= 0.25) {
+        std::fprintf(stderr, "FAIL %s: the top-1 token differs although the f16 top-2 margin is %.3f logits\n", cfg.c_str(), margin);
+        ok = false;
+      }
+      if (ok)
+        std::fprintf(stderr, "[PASS] %s: %lld int8 chunks on each rank, KL(tp2 f16 || tp2 default) %.5f, top-1 %s (f16 margin %.3f), %s from the per-128 run\n",
+                     cfg.c_str(), static_cast<long long>(expect), kl, top1 ? "same" : "flipped (near tie)", margin, env_blk128 ? "identical" : "different");
+    }
+    if (!ok) ++fails;
+  }
+  if (expect_i8 && !e.rerun_same) {
+    std::fprintf(stderr, "FAIL tp2-default: a rerun of a super-chunk scenario on the same Model gives different bytes\n");
+    ++fails;
   }
   return fails;
 }

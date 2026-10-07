@@ -7,9 +7,10 @@
 // R4DX_PREFILL_INT8 (read once per process, like R4DX_PREFILL_CHUNK -- prefill_chunk.h). ON BY DEFAULT:
 //   - unset, empty, "1" or "on": on, where this Model can use it (DecidePrefillInt8). The full 256-row super-chunks
 //     of a Prefill call -- and only those -- run their trellis linears through libr4d's int8 x int8 GEMM
-//     (A quantized per (row, 128 k), the decoded weight per (column, 128 k), int32 WMMA, a per-128 fp32
-//     rescale; the f16 output transform after it). Everything else stays f16: tails of fewer than 256 rows
-//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, TP = 2 (unless R4DX_PREFILL_INT8_TP2=1, below), MTP and DFlash 64-row slices, decode
+//     (by default the COARSE scales: A quantized per row, the decoded weight per column, over the whole K, int32 WMMA, one fp32
+//     rescale at the end; R4DX_PREFILL_INT8_SCALES=blk128 restores per (row | column, 128 k) with a per-128 fp32 rescale; the f16
+//     output transform after it). Everything else stays f16: tails of fewer than 256 rows
+//     (64-row slices), R4DX_PREFILL_CHUNK=0 / 64, a quant2 container, TP = 2 with R4DX_PREFILL_INT8_TP2=0 (below), MTP and DFlash 64-row slices, decode
 //     and verify windows, the vision tower, and PrefillMultimodal with images (image accuracy is unmeasured; a text-only call with no image ever seen is a Prefill call);
 //   - "0" or "off": the kill switch. Nothing changes: no scale table is built (-0.7 GiB on the 27B), no buffer or
 //     launch differs, every byte of every path is the one of a build without the int8 kernel (the f16 kernels' ISA is
@@ -68,47 +69,48 @@ inline bool ParsePrefillInt8FusedQ(const char* e) {
 }
 
 // R4DX_PREFILL_INT8_SCALES (docs/int8-prefill.md "Coarse scales"; read once per process, Model::Load resolves it): the scale
-// granularity of the int8 GEMM when it is on. "blk128" (unset, empty: the default) is today's: A one scale per (row, 128 k),
-// the decoded weight one per (column, 128 k), the int32 partial sum of every 128 k rescaled in fp32. "coarse": A one scale
-// per ROW and the weight one per COLUMN over the whole K, so the int32 accumulator needs no per-128 rescale (one fp32
-// multiply at the end; the weight table is [N] floats per linear instead of [K / 128][N], 128 times smaller). Opt-in: a
-// bit coarser model of the linear (its accuracy cost is its own KL gate), faster in the bench (speed bound x1.56 against
-// x1.37). Anything else warns and means the default. Needs R4DX_PREFILL_INT8 on to matter at all.
+// granularity of the int8 GEMM when it is on. "coarse" (unset, empty: THE DEFAULT, since the user approved it 2026-10-08): A one
+// scale per ROW and the weight one per COLUMN over the whole K, so the int32 accumulator needs no per-128 rescale (one fp32
+// multiply at the end; the weight table is [N] floats per linear instead of [K / 128][N], 128 times smaller). "blk128" restores
+// the previous default: A one scale per (row, 128 k), the decoded weight one per (column, 128 k), the int32 partial sum of every
+// 128 k rescaled in fp32 (a bit finer model of the linear, ~x1.2 slower in the bench). Coarse is a bit coarser model of the linear
+// (its accuracy cost is its own KL gate, docs/int8-prefill.md "Coarse scales"). Anything else warns and means the default
+// (coarse). Needs R4DX_PREFILL_INT8 on to matter at all.
 inline constexpr int kPrefillInt8ScalesBlk128 = 0;
 inline constexpr int kPrefillInt8ScalesCoarse = 1;
 inline int ParsePrefillInt8Scales(const char* e) {
-  if (e == nullptr || *e == '\0' || std::strcmp(e, "blk128") == 0) return kPrefillInt8ScalesBlk128;
-  if (std::strcmp(e, "coarse") == 0) return kPrefillInt8ScalesCoarse;
-  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_SCALES='%s' not recognized (blk128|coarse); using the default (blk128)\n", e);
-  return kPrefillInt8ScalesBlk128;
+  if (e == nullptr || *e == '\0' || std::strcmp(e, "coarse") == 0) return kPrefillInt8ScalesCoarse;
+  if (std::strcmp(e, "blk128") == 0) return kPrefillInt8ScalesBlk128;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_SCALES='%s' not recognized (blk128|coarse); using the default (coarse)\n", e);
+  return kPrefillInt8ScalesCoarse;
 }
 inline int PrefillInt8ScalesRequest() {
   static const int v = ParsePrefillInt8Scales(std::getenv("R4DX_PREFILL_INT8_SCALES"));
   return v;
 }
-// ModelOptions::prefill_int8_scales: -1 follows the environment, 0 (blk128) and 1 (coarse) force it (tests load both in one process).
+// ModelOptions::prefill_int8_scales: -1 follows the environment (default coarse), 0 (blk128) and 1 (coarse) force it (tests load both in one process).
 inline bool ValidPrefillInt8ScalesOption(int opt) { return opt == -1 || opt == 0 || opt == 1; }
 inline int ResolvePrefillInt8Scales(int opt) { return opt < 0 ? PrefillInt8ScalesRequest() : (opt != 0 ? kPrefillInt8ScalesCoarse : kPrefillInt8ScalesBlk128); }
 inline const char* PrefillInt8ScalesName(int scales) { return scales == kPrefillInt8ScalesCoarse ? "coarse" : "blk128"; }
 
 // R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"; read once per process, Model::Load resolves it): whether a
-// tensor-parallel (TP = 2) Model may run the int8 GEMM on its rank shards, when R4DX_PREFILL_INT8 is on. OFF BY DEFAULT: "1" / "on" ask
-// for it; unset, empty, "0" / "off" keep the f16 kernels at TP = 2 (the bytes of main's TP = 2 exactly: no scale table, no scope);
-// anything else warns and keeps the default (off). It is only a request: a shard shape without a row in
-// gemm_tuning_table_trellis_i8_tp2.inc (and the coarse one) still runs f16 with a once-per-shape notice, and with no row at all the
-// Model stays f16 and says so at load. No effect at TP = 1.
+// tensor-parallel (TP = 2) Model may run the int8 GEMM on its rank shards, when R4DX_PREFILL_INT8 is on. ON BY DEFAULT (the user
+// approved it 2026-10-08): unset, empty, "1" / "on" are on; "0" / "off" keep the f16 kernels at TP = 2 (the bytes of main's TP = 2
+// exactly: no scale table, no scope); anything else warns and keeps the default (on). It is only a request: a shard shape without a
+// row in gemm_tuning_table_trellis_i8_tp2.inc (and the coarse one) still runs f16 with a once-per-shape notice, and with no row at
+// all the Model stays f16 and says so at load. No effect at TP = 1.
 inline bool ParsePrefillInt8Tp2(const char* e) {
-  if (e == nullptr || *e == '\0') return false;
+  if (e == nullptr || *e == '\0') return true;
   if (std::strcmp(e, "0") == 0 || std::strcmp(e, "off") == 0) return false;
   if (std::strcmp(e, "1") == 0 || std::strcmp(e, "on") == 0) return true;
-  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_TP2='%s' not recognized (0|off|1|on); using the default (off)\n", e);
-  return false;
+  std::fprintf(stderr, "r4dx: R4DX_PREFILL_INT8_TP2='%s' not recognized (0|off|1|on); using the default (on)\n", e);
+  return true;
 }
 inline bool PrefillInt8Tp2Request() {
   static const bool v = ParsePrefillInt8Tp2(std::getenv("R4DX_PREFILL_INT8_TP2"));
   return v;
 }
-// ModelOptions::prefill_int8_tp2: -1 follows the environment (default off), 0 and 1 force it (the tests load both in one process).
+// ModelOptions::prefill_int8_tp2: -1 follows the environment (default on), 0 and 1 force it (the tests load both in one process).
 inline bool ValidPrefillInt8Tp2Option(int opt) { return opt == -1 || opt == 0 || opt == 1; }
 inline bool ResolvePrefillInt8Tp2(int opt) { return opt < 0 ? PrefillInt8Tp2Request() : opt != 0; }
 
@@ -124,7 +126,7 @@ struct PrefillInt8Inputs {
   int requested = kPrefillInt8Off;  // ResolvePrefillInt8Request
   bool wide = false;                // this Model runs 256-row super-chunks (DecidePrefillChunk)
   int tp_world = 1;                 // ModelOptions::tp.world
-  bool tp2_enabled = false;         // ResolvePrefillInt8Tp2: a TP > 1 Model may use int8 on its rank shards (default off)
+  bool tp2_enabled = false;         // ResolvePrefillInt8Tp2: a TP > 1 Model may use int8 on its rank shards (the switch defaults to on; Model::Load sets this)
   bool has_trellis = false;         // the container's body is trellis (Container::HasTrellis)
   bool rotated_container = false;   // a quant2 container (residual rotation / Hadamard signs)
   bool fakeq_active = false;        // R4DX_FAKEQ_ACT / R4DX_FAKEQ_W set (the default yields to them; an explicit on throws before this)
@@ -139,8 +141,8 @@ struct PrefillInt8Inputs {
 // prefix-reuse suffix prefills (the chunk grid is anchored at each Prefill call's start: the same token can be
 // int8 in one run and f16 in another, so the KV bytes of a prompt depend on cache state -- docs/int8-prefill.md),
 // --mtp and --dflash (their capture and priming read int8-perturbed hidden states, which the accuracy gates cover).
-// TP = 2 keeps the f16 kernel unless R4DX_PREFILL_INT8_TP2 asked for int8 on the rank shards (the kernel is shape-generic and
-// bit-tested at the rank shapes; the wiring is docs/int8-prefill.md "Tensor parallel", its KL gate is not run yet, so it is off).
+// TP = 2 runs int8 on the rank shards unless R4DX_PREFILL_INT8_TP2=0 (the kernel is shape-generic and bit-tested at the rank shapes;
+// the wiring and its KL gate are docs/int8-prefill.md "Tensor parallel").
 inline bool DecidePrefillInt8(const PrefillInt8Inputs& in, const char** why = nullptr) {
   if (why != nullptr) *why = nullptr;
   if (in.requested != kPrefillInt8On) return false;
@@ -152,7 +154,7 @@ inline bool DecidePrefillInt8(const PrefillInt8Inputs& in, const char** why = nu
   if (in.rotated_container) return refuse("a quant2 (rotated) container");
   if (!in.wide) return refuse("this Model does not run 256-row prefill super-chunks (R4DX_PREFILL_CHUNK=0/64)");
   if (in.tp_world > 1 && !in.tp2_enabled) {
-    return refuse("tensor parallelism (TP = 2 keeps the f16 kernel; R4DX_PREFILL_INT8_TP2=1 asks for int8 on the rank shards, off until validated)");
+    return refuse("tensor parallelism with R4DX_PREFILL_INT8_TP2=0 (TP = 2 keeps the f16 kernel; unset it for int8 on the rank shards)");
   }
   if (!in.has_trellis) return refuse("the container has no trellis linears");
   if (in.tables_built == 0) {

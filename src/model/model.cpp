@@ -212,13 +212,13 @@ Model Model::Load(const ModelOptions& opts) {
                                 std::to_string(opts.prefill_int8));
   }
   const int i8_request = ResolvePrefillInt8Request(opts.prefill_int8);
-  // R4DX_PREFILL_INT8_SCALES (docs/int8-prefill.md "Coarse scales"): blk128 (default) or coarse, parsed before the weights are read.
+  // R4DX_PREFILL_INT8_SCALES (docs/int8-prefill.md "Coarse scales"): coarse (default) or blk128, parsed before the weights are read.
   if (!ValidPrefillInt8ScalesOption(opts.prefill_int8_scales)) {
     throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8_scales must be -1, 0 or 1, got " +
                                 std::to_string(opts.prefill_int8_scales));
   }
   const int i8_scales = ResolvePrefillInt8Scales(opts.prefill_int8_scales);
-  // R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): off unless asked; only read where it matters.
+  // R4DX_PREFILL_INT8_TP2 (docs/int8-prefill.md "Tensor parallel"): on unless R4DX_PREFILL_INT8_TP2=0; only read where it matters.
   if (!ValidPrefillInt8Tp2Option(opts.prefill_int8_tp2)) {
     throw std::invalid_argument("Model::Load: ModelOptions::prefill_int8_tp2 must be -1, 0 or 1, got " +
                                 std::to_string(opts.prefill_int8_tp2));
@@ -702,11 +702,11 @@ Model Model::Load(const ModelOptions& opts) {
       std::cerr << "[r4dx::model::Model] prefill int8: ON (" << source
                 << "): the full 256-row super-chunks of Prefill calls run their trellis linears int8 x int8 ("
                 << (i8_scales == kPrefillInt8ScalesCoarse
-                        ? "scales COARSE (R4DX_PREFILL_INT8_SCALES=coarse): A per row, weights per column, over the whole K, "
+                        ? "scales COARSE (default; R4DX_PREFILL_INT8_SCALES=blk128 restores per-128): A per row, weights per column, over the whole K, "
                           "int32 WMMA, one fp32 rescale at the end"
-                        : "A per row x 128 k, weights per column x 128 k, int32 WMMA, per-128 fp32 rescale")
+                        : "scales blk128 (R4DX_PREFILL_INT8_SCALES=blk128): A per row x 128 k, weights per column x 128 k, int32 WMMA, per-128 fp32 rescale")
                 << (is_tp_rank ? "; TP rank " + std::to_string(tp.rank) +
-                                     " shards (R4DX_PREFILL_INT8_TP2=1; a shard shape without a row in the TP = 2 int8 tuning tables runs f16, "
+                                     " shards (default; R4DX_PREFILL_INT8_TP2=0 keeps f16 at TP = 2; a shard shape without a row in the TP = 2 int8 tuning tables runs f16, "
                                      "once-per-shape notice)"
                                : std::string())
                 << "); " << i8_tables << " of " << i8_trellis << " trellis linears have a weight scale table, " << i8_gib

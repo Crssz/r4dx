@@ -32,7 +32,7 @@
 #   * -Defaults (alias -Int8: the old name of the int8-only variant) runs new / conv1 / old with the shipped defaults (int8 on, split-KV
 #     attention) and c64 as the f16 chunk-64 reference (a 64-row Model refuses int8; its attention is the default split law too). The
 #     int8 kernel is a quantized model, not the f16 bits, so the bit-identity to c64 is NOT expected: step 5 then requires new / conv1
-#     / old (the three GDN variants, all int8) to share ONE hash and only REPORTS whether c64 differs (it normally does, but a short
+#     / old (the three GDN variants, all int8, with the default COARSE scales since 2026-10-08) to share ONE hash and only REPORTS whether c64 differs (it normally does, but a short
 #     greedy text can survive the quantization unchanged). The [stats] prefill lines are the defaults' TTFT. The identity tests of
 #     steps 1-4 pin the f16 paths themselves in both modes.
 # Exit 0 only when every test passed (or skipped for missing data) and every hash matched.

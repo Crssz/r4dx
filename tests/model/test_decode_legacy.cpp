@@ -39,7 +39,10 @@ int main() {
   Check(ParseDecodeLegacy("argmax,ab,attn,host") == (A | B | C | D), "the documented four");
   Check(ParseDecodeLegacy("ab,host") == (B | D), "two items");
   Check(ParseDecodeLegacy("all") == r4dx::core::kDecodeItemAll, "all");
-  Check(r4dx::core::kDecodeItemAll == (A | B | C | D), "all is every item");
+  constexpr unsigned E = static_cast<unsigned>(DecodeItem::kGdnWo);
+  Check(ParseDecodeLegacy("gdnwo") == E, "gdnwo");
+  Check(ParseDecodeLegacy("ab,gdnwo,host") == (B | E | D), "gdnwo among others");
+  Check(r4dx::core::kDecodeItemAll == (A | B | C | D | E), "all is every item");
   Check(ParseDecodeLegacy("ATTN; Host argmax") == (C | D | A), "case, semicolons and spaces");
   Check(ParseDecodeLegacy(",,ab,,") == B, "empty tokens");
   Check(ParseDecodeLegacy("bogus", /*warn=*/false) == 0, "an unknown token is ignored");

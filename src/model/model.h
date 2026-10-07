@@ -219,6 +219,15 @@ struct ModelOptions {
   // (default) follows the environment (unset / 1 / on = on, the default; 0 / off = f16 at TP = 2); 0 and 1 force it. Only matters at tp.world > 1 with the
   // int8 GEMM on; 0 keeps a TP = 2 Model byte-identical to one built before the option existed (no scale table, no scope).
   int prefill_int8_tp2 = -1;
+  // Write-once GDN state for speculative verify (gdn_write_once.h, docs/gdn-write-once.md): -1 (default) follows
+  // the environment (R4DX_GDN_WRITE_ONCE: unset / 0 / off = the window-slot path, 1 / on = write-once; the
+  // R4DX_DECODE_LEGACY token gdnwo forces the window-slot path); 0 and 1 force the choice whatever the
+  // environment says (the A/B tests load one Model of each). On, every layer keeps ONE recurrent state plus
+  // two small per-row logs instead of one state slot per candidate row of the verify window, and the accepted
+  // prefix of a round is applied inside the next call's seed load: bit-identical outputs, state traffic per
+  // k = 7 round 1 read + 1 write instead of 1 + 8, about 0.96 GiB of VRAM per rank not allocated. Moot (the
+  // window-slot manager, one slot) when the Model has no speculative window.
+  int gdn_write_once = -1;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -789,7 +798,20 @@ class Model {
   // Synchronizes the stream and copies everything to the host, so it is a test tool: the byte-identity
   // check that two prefill chunkings left the same state (tests/model/test_prefill_chunk_identity.cpp).
   std::vector<std::pair<std::string, uint64_t>> DebugStateDigest();
+  // One digest per GDN layer ("gdn.live.<layer>") of the LOGICAL recurrent state -- the state the next token
+  // would be decoded from -- in both GDN state modes, so the two can be compared bit for bit (the plain
+  // "gdn.rec.<layer>" entries cannot: the window-slot path digests its stale window slots, the write-once path
+  // its two slots). Window-slot path: slot (committed count - 1) of the window after a speculative round (the
+  // sequence's one slot otherwise). Write-once: a pending prefix is flushed into B first, then B (the flush is
+  // invisible to the continuing run). Synchronizes the stream.
+  std::vector<std::pair<std::string, uint64_t>> DebugLiveGdnDigest();
+  // The write-once state's pending bookkeeping, for a test that pins the transitions.
+  bool DebugGdnPending() const { return gdn_book_.Pending(); }
 #endif
+  // Whether this Model's GDN layers run the write-once state (ModelOptions::gdn_write_once resolved at load).
+  bool GdnWriteOnceEnabled() const { return gdn_write_once_; }
+  // Bytes the GDN recurrent allocations + logs of every layer hold (tests / the VRAM column of the bench).
+  int64_t GdnStateBytes() const;
   // 256 when this Model runs 256-row prefill super-chunks (buffers sized for them at load), else 64.
   int PrefillChunkRows() const { return wide_rows_ > 0 ? kPrefillChunkWide : kPrefillChunkBase; }
   // How many 256-row super-chunks this Model has run since Load (tests and diagnostics: proof that the wide
@@ -1130,11 +1152,28 @@ class Model {
   // committed. >1 means the live GDN state is in window slot n-1, not where a prefill reads it --
   // see CollapseSpeculativeWindow.
   int64_t mtp_last_committed_ = 1;
+  // Write-once GDN state (ModelOptions::gdn_write_once, gdn_write_once.h): whether this Model's GdnStateManagers
+  // are write-once ones, and the host bookkeeping of "the logical state is B plus the first n rows of the last
+  // verify call's log" (GdnPendingBook documents every transition). The count n is mtp_num_accepted_dev_, the
+  // acceptance thread the conv kernel already reads; the recurrent kernel gets it through
+  // GdnLayerParams::gdn_pending only while the book says pending. Unused when !gdn_write_once_.
+  bool gdn_write_once_ = false;
+  GdnPendingBook gdn_book_;
+  // GdnLayerParams::gdn_pending for a decode / verify call now: the acceptance count when a committed prefix
+  // is pending, else nullptr (always nullptr without write-once).
+  const int32_t* GdnPendingPtr() const {
+    return gdn_write_once_ && gdn_book_.Pending() ? mtp_num_accepted_dev_.data() : nullptr;
+  }
+  // Applies a pending committed prefix to every layer's state in place (enqueued on stream_) and drops the
+  // pending flag; a no-op when nothing is pending. Invisible to the logical state.
+  void FlushGdnPending();
   // Called by Prefill/PrefillMultimodal before their first chunk: moves the live GDN state from the
   // last verify round's window slot / conv offset to window 0 / offset 0 (GdnStateManager::
   // CollapseWindow), then drops the num_accepted thread as before. Without the move, the prefill
   // that continues a conversation after a speculative round that committed n > 1 tokens (the
-  // server's prefix reuse, r4dx-cli --chat) seeded from the state n-1 tokens back.
+  // server's prefix reuse, r4dx-cli --chat) seeded from the state n-1 tokens back. With the write-once
+  // state the recurrent half is FlushGdnPending (the prefill reads B at window 0 = its only slot) and the
+  // conv half is the same shift.
   void CollapseSpeculativeWindow();
   // Scratch for VerifyWindow: logits for up to draft_window_ candidate positions at once, plus one
   // argmax result per position. Shared by both speculation families (MTP and DFlash2) -- the verify

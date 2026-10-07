@@ -229,6 +229,35 @@ int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
         const void* z_gate, const void* norm_weight, float norm_eps, int norm_act,
         int N, int H, int Hg, int K, int V, float scale, float softplus_thr, void* stream);
 
+// WRITE-ONCE state (docs/gdn-write-once.md): the same recurrent update for a speculative verify,
+// writing ONE state per sequence instead of one per candidate row. A call logs, per row, the decay,
+// the correction and the normalised key (r4d_gdn_wo_log_bytes() bytes per log buffer); the next
+// call applies the accepted prefix of the previous log to its seed in registers (`pending` = the
+// device int32 count, null = none) with the legacy kernel's own two roundings per element, so the
+// replayed state is bit-identical to the one the legacy kernel stored for that row. The outputs `o`
+// are the legacy kernel's bit for bit. N must be 1. `state` + sidx[0] address B (sidx[0] <= 0
+// skips the sequence, as the legacy kernel); mode R4D_GDN_WO_LOG logs the call's rows and writes B
+// only to materialise `pending` in place; R4D_GDN_WO_DIRECT logs nothing and stores the final state
+// into B after the last row (the plain-decode behaviour, with an optional replay first). log_in is
+// read only with `pending` and must not alias log_out (the previous and the new log are the two
+// halves of a ping-pong). log_depth: rows per log, the verify window.
+#define R4D_GDN_WO_LOG    0
+#define R4D_GDN_WO_DIRECT 1
+int64_t r4d_gdn_wo_log_bytes(int H, int Hg, int depth);
+int r4d_gdn_recurrent_update_wo_k128_v128_bf16_fp32state(
+        const void* q, const void* k, const void* v, const void* a, const void* b,
+        int64_t ab_stride, int ab_is_bf16, const void* A_log, const void* dt_bias, void* state,
+        int64_t state_slot_stride, int64_t state_head_stride, void* o, const void* cu,
+        const void* ssm_state_indices, const void* z_gate, const void* norm_weight, float norm_eps,
+        int norm_act, const void* log_in, void* log_out, const void* pending, int log_depth,
+        int mode, int N, int H, int Hg, int K, int V, float scale, float softplus_thr, void* stream);
+// state(dst) = state(src) + the first n logged rows (n read from the device int32 `pending` instead
+// when it is non-null), per (value head, v row, k half) exactly as the update kernel's replay. src and
+// dst are ONE sequence's slot pointers (head h at + h * state_head_stride); dst may equal src.
+int r4d_gdn_state_replay_k128_v128_fp32(
+        const void* src_state, void* dst_state, int64_t state_head_stride, const void* log,
+        const void* pending, int n, int log_depth, int H, int Hg, int K, int V, void* stream);
+
 // ---- GEMM ----------------------------------------------------------------------------------
 // Skinny bf16 GEMM for M up to 64: C[M,N] = A[M,K] @ W[N,K]^T, bf16 throughout -- a torch Linear
 // with the weight stored (N,K), which is the "nt" in the name. Where the weight read dominates and

@@ -68,6 +68,12 @@ static const R4DConstraint cGdnKktSolve[] = {
 static const R4DConstraint cGdnRecurrentUpdate[] = {
     C_EQ("head_k", 128), C_EQ("head_v", 128),
 };
+static const R4DConstraint cGdnRecurrentUpdateWo[] = {
+    C_EQ("head_k", 128), C_EQ("head_v", 128), C_EQ("num_seqs", 1),
+};
+static const R4DConstraint cGdnStateReplay[] = {
+    C_EQ("head_k", 128), C_EQ("head_v", 128),
+};
 static const R4DConstraint cGdnGatedRmsNorm[] = {
     C_EQ("channels", 128),
 };
@@ -186,6 +192,20 @@ static const R4DKernelInfo kKernels[] = {
      "head_k 128, head_v 128, paged state, one state written per candidate token",
      "bf16 q/k/v and out, fp32 a,b and state cache",
      ROW(cGdnRecurrentUpdate)},
+    // Own ops: a different contract (one state per sequence plus a log of the rows' updates, the
+    // previous log replayed in the seed load), so a caller selecting "gdn_recurrent_update" is never
+    // handed it.
+    {"gdn_recurrent_update_wo_k128_v128_bf16_fp32state", "gdn", "gdn_recurrent_update_wo",
+     "gdn decode recurrent update, write-once state: the same outputs, one state store per call, a "
+     "per-row log (decay, correction, key) and the previous call's accepted prefix replayed in the seed",
+     "head_k 128, head_v 128, one sequence, two ping-pong log buffers of r4d_gdn_wo_log_bytes",
+     "bf16 q/k/v and out, fp32 a,b, state and log",
+     ROW(cGdnRecurrentUpdateWo)},
+    {"gdn_state_replay_k128_v128_fp32", "gdn", "gdn_state_replay",
+     "materialise a write-once state: seed state plus the first n logged rows, in place or to a scratch slot",
+     "head_k 128, head_v 128, one workgroup per value head",
+     "fp32 state and log",
+     ROW(cGdnStateReplay)},
     {"gdn_gated_rmsnorm_h128_bf16", "gdn", "gdn_gated_rmsnorm",
      "gated rms norm over a row: out = rms(x) . w . act(z), for the prefill path only",
      "128 channels per row, one wave per row; silu or sigmoid gate",

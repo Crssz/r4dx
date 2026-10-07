@@ -287,14 +287,49 @@ void GdnLayer::Forward(core::Stream& stream, core::Arena& arena, GdnStateManager
     const int64_t window = states.MaxDecodeWindow();
     const int32_t* sidx_dev = control.SidxBase(p.slot, window);
 
-    ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
-      core::r4d::GdnRecurrentUpdate(
-          q_buf, k_buf, v_buf, a_buf, b_buf, ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
-          w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
-          states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
-          /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
-          kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
-    });
+    if (!states.WriteOnce()) {
+      ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
+        core::r4d::GdnRecurrentUpdate(
+            q_buf, k_buf, v_buf, a_buf, b_buf, ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
+            w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
+            states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
+            /*indices_stride=*/window, p.num_accepted, z_buf, w_.norm_weight.data(), eps,
+            kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+      });
+    } else {
+      // Write-once state (docs/gdn-write-once.md 2.2): one state B per sequence, at sidx[0] == p.slot.
+      //   T == 1, nothing pending : the legacy kernel, in place -- today's plain decode, byte for byte
+      //                             (sidx = the window's ascending array, only sidx[0] is touched; no
+      //                             num_accepted: there are no window slots to seed from)
+      //   T == 1, pending         : replay the committed prefix of the last verify's log in the seed load,
+      //                             run the row, store the final state into B (the speculation-to-plain
+      //                             transition; every later plain step has nothing pending)
+      //   T  > 1                  : log the rows (no state store), replaying the pending prefix first and
+      //                             writing it back into B; the next ping-pong half takes the log
+      if (T == 1 && p.gdn_pending == nullptr) {
+        ProfiledCall(prof, s, "gdn.recurrent_update", [&] {
+          core::r4d::GdnRecurrentUpdate(
+              q_buf, k_buf, v_buf, a_buf, b_buf, ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
+              w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
+              states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev,
+              /*indices_stride=*/window, /*num_accepted=*/nullptr, z_buf, w_.norm_weight.data(), eps,
+              kGdnActSilu, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+        });
+      } else {
+        const bool direct = (T == 1);
+        const float* log_in = p.gdn_pending != nullptr ? states.LogIn() : nullptr;
+        float* log_out = direct ? nullptr : states.LogOut();
+        ProfiledCall(prof, s, direct ? "gdn.recurrent_update_wo_direct" : "gdn.recurrent_update_wo", [&] {
+          core::r4d::GdnRecurrentUpdateWo(
+              q_buf, k_buf, v_buf, a_buf, b_buf, ab_stride, /*ab_is_bf16=*/1, w_.A_log.data(),
+              w_.dt_bias.data(), states.RecurrentBase(), states.RecurrentSlotStride(),
+              states.RecurrentHeadStride(), out_core, cu_dev, sidx_dev, z_buf, w_.norm_weight.data(),
+              eps, kGdnActSilu, log_in, log_out, p.gdn_pending, static_cast<int>(window),
+              direct ? R4D_GDN_WO_DIRECT : R4D_GDN_WO_LOG, /*N=*/1, H, Hg, K, V, scale, kSoftplusThr, s);
+        });
+        if (!direct) states.FlipParity();
+      }
+    }
   }
 
   // ---- quant2 Q2b: out_proj's input Hadamard (docs/quant2.md section 4) ------------------------

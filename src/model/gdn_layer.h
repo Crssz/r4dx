@@ -43,6 +43,14 @@ struct GdnLayerParams {
   // num_accepted-1 rather than window index 0 -- see GdnStateManager's file comment and
   // Model::DecodeStepMtpGreedy (model.cpp) for the caller side of this contract.
   const int32_t* num_accepted = nullptr;
+  // decode/verify only, and only for a write-once GdnStateManager (docs/gdn-write-once.md; ignored
+  // otherwise): device int32[1] holding how many rows of the LAST verify call's log are committed but not
+  // yet applied to the state (the same acceptance count `num_accepted` points at, which the conv kernel
+  // keeps reading as before), or nullptr when nothing is pending. A call with a pending prefix applies it in
+  // its seed load and writes the result back into the state; Model::gdn_book_ decides when it is non-null.
+  // With a write-once manager `num_accepted` is NOT passed to the recurrent kernel at all: there are no
+  // window slots to seed from.
+  const int32_t* gdn_pending = nullptr;
   // quant2 Q2b (docs/quant2.md section 4): non-owning device fp32 [cfg.ValueDim()] (+-1) -- a q2ab
   // container's rotation.had_gdn_out_signs (this rank's K slice under TP). When non-null, out_proj's
   // input is rotated in place by the blockwise Hadamard (block = linear_value_head_dim = 128, one

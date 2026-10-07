@@ -168,6 +168,37 @@ inline void GdnRecurrentUpdate(const void* q, const void* k, const void* v, cons
           norm_weight, norm_eps, norm_act, N, H, Hg, K, V, scale, softplus_thr, stream));
 }
 
+// Write-once state (r4d.h's r4d_gdn_recurrent_update_wo_*, docs/gdn-write-once.md). `mode` is
+// R4D_GDN_WO_LOG or R4D_GDN_WO_DIRECT; `pending` is a device int32 count or null; log_in / log_out are
+// log buffers of GdnWoLogBytes(H, Hg, log_depth) bytes (log_in only read with `pending`, log_out only
+// written in LOG mode). N must be 1.
+inline int64_t GdnWoLogBytes(int H, int Hg, int depth) { return r4d_gdn_wo_log_bytes(H, Hg, depth); }
+inline void GdnRecurrentUpdateWo(const void* q, const void* k, const void* v, const void* a,
+                                  const void* b, int64_t ab_stride, int ab_is_bf16,
+                                  const void* A_log, const void* dt_bias, void* state,
+                                  int64_t state_slot_stride, int64_t state_head_stride, void* o,
+                                  const void* cu, const void* ssm_state_indices,
+                                  const void* z_gate, const void* norm_weight, float norm_eps,
+                                  int norm_act, const void* log_in, void* log_out,
+                                  const void* pending, int log_depth, int mode, int N, int H,
+                                  int Hg, int K, int V, float scale, float softplus_thr,
+                                  hipStream_t stream) {
+  R4DX_R4D_CHECK(
+      "gdn_recurrent_update_wo_k128_v128_bf16_fp32state",
+      r4d_gdn_recurrent_update_wo_k128_v128_bf16_fp32state(
+          q, k, v, a, b, ab_stride, ab_is_bf16, A_log, dt_bias, state, state_slot_stride,
+          state_head_stride, o, cu, ssm_state_indices, z_gate, norm_weight, norm_eps, norm_act,
+          log_in, log_out, pending, log_depth, mode, N, H, Hg, K, V, scale, softplus_thr, stream));
+}
+// dst = src + the first n (or *pending) rows of `log`; src, dst: one sequence's state slot pointers.
+inline void GdnStateReplay(const void* src_state, void* dst_state, int64_t state_head_stride,
+                            const void* log, const void* pending, int n, int log_depth, int H,
+                            int Hg, int K, int V, hipStream_t stream) {
+  R4DX_R4D_CHECK("gdn_state_replay_k128_v128_fp32",
+                 r4d_gdn_state_replay_k128_v128_fp32(src_state, dst_state, state_head_stride, log,
+                                                     pending, n, log_depth, H, Hg, K, V, stream));
+}
+
 inline void GdnConvPrep(const void* x, int64_t xpitch, const void* wgt, const void* bias,
                          void* cstate, int64_t cs_seq, int64_t cs_dim, int64_t cs_tok,
                          const void* cache_idx, int64_t ci_stride, const void* has_init,

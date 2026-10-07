@@ -17,7 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include "gdn_write_once.h"
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/core/r4d.hpp"
 #include "r4dx/core/stream.hpp"
 
 namespace r4dx::model {
@@ -44,8 +46,17 @@ class GdnStateManager {
   // WindowSlot(seq,max_decode_window-1)} array every call (indices beyond a short call's own T are
   // simply never read/written that call), so a `num_accepted` carried from one call to the next
   // indexes consistently across calls without any reallocation or renumbering.
+  //
+  // `write_once` (docs/gdn-write-once.md, gdn_write_once.h): keep ONE recurrent state B per sequence plus
+  // two ping-pong logs of the last verify window's per-row updates instead of `max_decode_window` state
+  // slots per sequence. A verify call (GdnLayer::Forward, T > 1) stores its rows into the log and applies
+  // the PREVIOUS call's accepted prefix to B inside its own seed load; Materialize() applies the pending
+  // prefix to B on its own (a prefill, a digest). The window then only sizes the logs and the conv history;
+  // WindowSlot() does not exist. Requires a window > 1 (otherwise there is nothing to save and the manager
+  // is the window-slot one) and a conv_dim that matches the key-head geometry (the log's key rows are
+  // sized from it).
   GdnStateManager(int64_t max_seqs, int64_t H, int64_t V, int64_t K, int64_t conv_dim,
-                  int64_t conv_width, int64_t max_decode_window)
+                  int64_t conv_width, int64_t max_decode_window, bool write_once = false)
       : H_(H),
         V_(V),
         K_(K),
@@ -53,15 +64,34 @@ class GdnStateManager {
         conv_width_(conv_width),
         state_len_max_(conv_width - 2 + max_decode_window),
         max_decode_window_(max_decode_window < 1 ? 1 : max_decode_window),
-        recurrent_(static_cast<size_t>((max_seqs * max_decode_window_ + 1) * H * V * K)),
-        conv_(static_cast<size_t>((max_seqs + 1) * conv_dim * state_len_max_)) {}
+        plan_{max_seqs, max_decode_window_, write_once && max_decode_window_ > 1},
+        recurrent_(static_cast<size_t>(plan_.RecurrentSlots() * H * V * K)),
+        conv_(static_cast<size_t>((max_seqs + 1) * conv_dim * state_len_max_)) {
+    if (plan_.write_once) {
+      // conv_dim = 2 * Hg * K + H * V: the key-head count of THIS rank's geometry
+      const int64_t key_part = conv_dim - H * V;
+      if (key_part <= 0 || key_part % (2 * K) != 0 || max_seqs != 1) {
+        throw std::logic_error(
+            "GdnStateManager: write_once needs max_seqs == 1 and conv_dim == 2 * Hg * K + H * V");
+      }
+      Hg_ = key_part / (2 * K);
+      const size_t floats = static_cast<size_t>(GdnLogFloats(H, Hg_, V, K, max_decode_window_));
+      log_[0] = core::DeviceBuffer<float>(floats);
+      log_[1] = core::DeviceBuffer<float>(floats);
+    }
+  }
 
   // seq_id is 0-based. SlotForSeq is WindowSlot(seq_id, 0) -- the physical slot a plain
   // (non-speculative, window index 0) decode step always reads and writes in place, unchanged from
-  // this class's pre-MTP behavior when max_decode_window==1.
-  int32_t SlotForSeq(int32_t seq_id) const { return 1 + seq_id * static_cast<int32_t>(max_decode_window_); }
-  int32_t WindowSlot(int32_t seq_id, int32_t window_idx) const { return SlotForSeq(seq_id) + window_idx; }
+  // this class's pre-MTP behavior when max_decode_window==1. Write-once: the sequence's one slot (B).
+  int32_t SlotForSeq(int32_t seq_id) const { return plan_.SlotForSeq(seq_id); }
+  int32_t WindowSlot(int32_t seq_id, int32_t window_idx) const {
+    if (plan_.write_once) throw std::logic_error("GdnStateManager::WindowSlot: a write-once manager has no window slots");
+    return SlotForSeq(seq_id) + window_idx;
+  }
   int64_t MaxDecodeWindow() const { return max_decode_window_; }
+  bool WriteOnce() const { return plan_.write_once; }
+  int64_t KeyHeads() const { return Hg_; }  // write-once only
 
   int64_t RecurrentSlotStride() const { return H_ * V_ * K_; }
   int64_t RecurrentHeadStride() const { return V_ * K_; }
@@ -92,10 +122,18 @@ class GdnStateManager {
   void CollapseWindow(int32_t seq_id, int64_t n, core::Stream& stream) {
     if (n <= 1) return;
     if (n > max_decode_window_) throw std::logic_error("GdnStateManager::CollapseWindow: n exceeds the window");
+    if (plan_.write_once) throw std::logic_error("GdnStateManager::CollapseWindow: write-once state -- Materialize + ShiftConv");
     R4DX_HIP_CHECK(hipMemcpyAsync(RecurrentSlotPtr(SlotForSeq(seq_id)),
                                   RecurrentSlotPtr(WindowSlot(seq_id, static_cast<int32_t>(n - 1))),
                                   static_cast<size_t>(RecurrentSlotStride()) * sizeof(float),
                                   hipMemcpyDeviceToDevice, stream.get()));
+    ShiftConv(seq_id, n, stream);
+  }
+  // The conv half of CollapseWindow (unchanged by the write-once state): the history a step reads moves from
+  // offset n-1 to offset 0. n <= 1 is already in place.
+  void ShiftConv(int32_t seq_id, int64_t n, core::Stream& stream) {
+    if (n <= 1) return;
+    if (n > max_decode_window_) throw std::logic_error("GdnStateManager::ShiftConv: n exceeds the window");
     // The conv line is [conv_dim][state_len_max] with each channel's history contiguous; the history a
     // step reads is conv_width-1 entries. One strided column per entry, in ascending order: column j
     // reads entry n-1+j, which only a LATER column (j' = n-1+j > j) overwrites.
@@ -105,6 +143,36 @@ class GdnStateManager {
       R4DX_HIP_CHECK(hipMemcpy2DAsync(line + j, pitch, line + (n - 1) + j, pitch, sizeof(uint16_t),
                                       static_cast<size_t>(conv_dim_), hipMemcpyDeviceToDevice, stream.get()));
     }
+  }
+
+  // ---- write-once state (docs/gdn-write-once.md) ---------------------------------------------------------
+  // The log buffers (libr4d's r4d_gdn_wo_log_bytes layout: u, kk, eg). LogIn is the log of the last launched
+  // verify call with T > 1, which a pending commit refers to; LogOut the one the next such call writes;
+  // FlipParity() once per such launch (GdnLayer::Forward).
+  const float* LogIn() { return log_[static_cast<size_t>(ring_.In())].data(); }
+  float* LogOut() { return log_[static_cast<size_t>(ring_.Out())].data(); }
+  void FlipParity() { ring_.Flip(); }
+  size_t LogBytes() const { return log_[0].bytes() + log_[1].bytes(); }
+  // Applies the first n rows of LogIn() to sequence `seq_id`'s state, in place (n = the committed count of
+  // the last verify call, >= 1). Enqueued on `stream`; nothing else is touched. The logical state does not
+  // change: replaying here and continuing with no pending performs the same fp32 operations the next call's
+  // seed load would have, so the caller may flush at any point.
+  void Materialize(int32_t seq_id, int64_t n, core::Stream& stream) {
+    if (!plan_.write_once) throw std::logic_error("GdnStateManager::Materialize: not a write-once manager");
+    if (n < 1 || n > max_decode_window_) throw std::logic_error("GdnStateManager::Materialize: n outside [1, window]");
+    float* b = RecurrentSlotPtr(SlotForSeq(seq_id));
+    core::r4d::GdnStateReplay(b, b, RecurrentHeadStride(), LogIn(), /*pending=*/nullptr, static_cast<int>(n),
+                              static_cast<int>(max_decode_window_), static_cast<int>(H_),
+                              static_cast<int>(Hg_), static_cast<int>(K_), static_cast<int>(V_), stream.get());
+  }
+  // The same replay into a scratch slot (a test comparing it with a window slot of the legacy path).
+  void MaterializeTo(int32_t seq_id, int64_t n, float* dst, core::Stream& stream) {
+    if (!plan_.write_once) throw std::logic_error("GdnStateManager::MaterializeTo: not a write-once manager");
+    if (n < 0 || n > max_decode_window_) throw std::logic_error("GdnStateManager::MaterializeTo: n outside [0, window]");
+    core::r4d::GdnStateReplay(RecurrentSlotPtr(SlotForSeq(seq_id)), dst, RecurrentHeadStride(), LogIn(),
+                              /*pending=*/nullptr, static_cast<int>(n), static_cast<int>(max_decode_window_),
+                              static_cast<int>(H_), static_cast<int>(Hg_), static_cast<int>(K_),
+                              static_cast<int>(V_), stream.get());
   }
 
   // ---- prompt checkpoint (Model::SaveCheckpoint, docs/server.md "Prefix cache") ------------------
@@ -137,8 +205,12 @@ class GdnStateManager {
   }
 
   int64_t H_, V_, K_, conv_dim_, conv_width_, state_len_max_, max_decode_window_;
+  GdnSlotPlan plan_;
+  int64_t Hg_ = 0;                      // write-once only
   core::DeviceBuffer<float> recurrent_;
   core::DeviceBuffer<uint16_t> conv_;
+  GdnLogRing ring_;                     // write-once only
+  core::DeviceBuffer<float> log_[2];    // write-once only: the ping-pong logs
   core::DeviceBuffer<float> ckpt_recurrent_;  // [H*V*K], empty unless AllocateCheckpoint()
   core::DeviceBuffer<uint16_t> ckpt_conv_;    // [conv_dim * state_len_max]
 };

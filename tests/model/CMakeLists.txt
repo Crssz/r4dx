@@ -215,6 +215,17 @@ target_include_directories(test_decode_legacy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
                            ${CMAKE_CURRENT_SOURCE_DIR}/../../src/core/include)
 add_test(NAME test_decode_legacy COMMAND test_decode_legacy)
 
+# test_gdn_write_once_cpu: pure CPU unit test for src/model/gdn_write_once.h (docs/gdn-write-once.md): the
+# R4DX_GDN_WRITE_ONCE parser and decision, the slot / ring / log arithmetic against libr4d's own log size, and an
+# fp32 emulation of the kernel's arithmetic that runs scripted rounds through the window-slot path and the
+# write-once path (real GdnPendingBook) and requires bitwise equal outputs and logical state after every event,
+# the double-VerifyWindow bug pinned, an fma negative control. HIP_VISIBLE_DEVICES=-1: no device is touched.
+add_executable(test_gdn_write_once_cpu test_gdn_write_once_cpu.cpp)
+target_include_directories(test_gdn_write_once_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+target_link_libraries(test_gdn_write_once_cpu PRIVATE r4dx_core r4d_core)
+add_test(NAME test_gdn_write_once_cpu COMMAND test_gdn_write_once_cpu)
+set_tests_properties(test_gdn_write_once_cpu PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+
 # test_prefill_int8_cpu: pure CPU unit test for src/model/prefill_int8.h (R4DX_PREFILL_INT8's parser and decision table) and
 # the planning side of src/model/linear.cpp (PlanTrellisI8, its tuning table gemm_tuning_table_trellis_i8.inc checked
 # against the kernel's own legality rule, ScopedTrellisI8); docs/int8-prefill.md "Production path". Also the TP = 2 rank

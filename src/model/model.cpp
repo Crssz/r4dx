@@ -24,6 +24,7 @@
 #include "embedding.h"
 #include "final_lm_head.h"
 #include "gdn_layer.h"
+#include "gdn_write_once.h"  // R4DX_GDN_WRITE_ONCE (docs/gdn-write-once.md)
 #include "linear.h"
 #include "mlp.h"
 #include "position_ids.h"  // src/vision: BuildMropePositionIds (docs/vision.md)
@@ -404,6 +405,28 @@ Model Model::Load(const ModelOptions& opts) {
   // Model with only MTP enabled sizes identically to before dflash_draft_k existed.
   m.draft_window_ = 1 + std::max(opts.mtp_draft_k, opts.dflash_draft_k);
   const int64_t max_decode_window = m.draft_window_;
+  // Write-once GDN state (gdn_write_once.h, docs/gdn-write-once.md): decided once, here, before the state
+  // managers are built -- they size their recurrent allocation by it (one slot per sequence instead of one per
+  // window row). Every TP rank decides the same from the same options and environment.
+  if (!ValidGdnWriteOnceOption(opts.gdn_write_once)) {
+    throw std::invalid_argument("Model::Load: ModelOptions::gdn_write_once must be -1, 0 or 1, got " +
+                                std::to_string(opts.gdn_write_once));
+  }
+  {
+    GdnWriteOnceInputs in;
+    in.option = opts.gdn_write_once;
+    in.env_request = GdnWriteOnceRequest();
+    in.decode_legacy_gdnwo = core::DecodeLegacy(core::DecodeItem::kGdnWo);
+    in.window = max_decode_window;
+    const char* why = nullptr;
+    m.gdn_write_once_ = DecideGdnWriteOnce(in, &why);
+    if (m.gdn_write_once_) {
+      std::fprintf(stderr, "r4dx: GDN write-once state on (window %lld: one state per layer + per-row logs)\n",
+                   static_cast<long long>(max_decode_window));
+    } else if (max_decode_window > 1 && in.option != 0 && (in.env_request || in.option == 1 || in.decode_legacy_gdnwo)) {
+      std::fprintf(stderr, "r4dx: GDN write-once state off: %s\n", why);
+    }
+  }
 
   m.max_chunk_ = kPrefillChunkBase;
   // The prompt-prefill chunk (prefill_chunk.h, docs/prefill.md): 256 rows by default. A Model that runs
@@ -477,7 +500,7 @@ Model Model::Load(const ModelOptions& opts) {
       m.gdn_states_[static_cast<size_t>(i)].emplace(
           /*max_seqs=*/1, /*H=*/cfg.linear_num_value_heads, /*V=*/cfg.linear_value_head_dim,
           /*K=*/cfg.linear_key_head_dim, cfg.ConvDim(), cfg.linear_conv_kernel_dim,
-          max_decode_window);
+          max_decode_window, m.gdn_write_once_);
       m.gdn_states_[static_cast<size_t>(i)]->ZeroAll(m.stream_);
     } else {
       m.kv_caches_[static_cast<size_t>(i)].emplace(
@@ -840,6 +863,7 @@ void Model::Reset() {
   mtp_num_accepted_valid_ = false;
   mtp_last_committed_ = 1;
   mtp_last_hidden_ = nullptr;
+  gdn_book_.Clear();  // ZeroAll above cleared B; the logs need no clearing (nothing reads them unpended)
 
   // DFlash2 target feature capture (review finding, 2026-09-20): dflash_features_dev_'s bytes are
   // now stale (the previous sequence's residual stream) but harmless for the identical reason
@@ -913,6 +937,7 @@ void Model::RestoreCheckpoint() {
   mtp_seed_valid_ = ckpt_mtp_seed_valid_;
   mtp_num_accepted_valid_ = false;
   mtp_last_hidden_ = nullptr;
+  gdn_book_.Clear();  // the checkpoint was taken with nothing pending (SaveCheckpoint's precondition)
   SetDflashFeatureRows(0);
   if (dflash_.has_value()) {
     // A drafter whose injection lagged (toggled off) is already at or behind pos_: the next RunChunk
@@ -1202,6 +1227,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
       p.num_accepted = (!is_prefill_path && draft_window_ > 1 && mtp_num_accepted_valid_)
                             ? mtp_num_accepted_dev_.data()
                             : nullptr;
+      // Write-once state: a committed prefix of the last verify's log that this plain step must replay
+      // (the speculation-to-plain transition); consumed by this step, see the commit block below.
+      p.gdn_pending = is_prefill_path ? nullptr : GdnPendingPtr();
       p.out_had_signs = had.gdn_out;
       // A super-chunk's GDN sequence ops run once over its 256 rows, or in 64-row sub-slices under
       // R4DX_GDN_SLICE=64 (prefill_chunk.h); the same bytes either way.
@@ -1509,6 +1537,9 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     mtp_num_accepted_dev_.CopyFromHost(&one, 1);
     mtp_num_accepted_valid_ = true;
     mtp_last_committed_ = 1;
+    // Write-once state: this step's kernel replayed any pending prefix and stored the final state into B,
+    // so nothing is pending any more. (The write above only feeds conv_update's history offset.)
+    gdn_book_.OnPlainDecode();
   }
 
   // DFlash2 per-chunk capture drain (model.h's SetDflashCaptureObserver): invoked once per
@@ -1796,7 +1827,17 @@ int64_t Model::PrefillRowsForCall() {
   return wide_rows_ > 0 ? wide_rows_ : max_chunk_;
 }
 void Model::CollapseSpeculativeWindow() {
-  if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
+  if (gdn_write_once_) {
+    // The recurrent half: B plus the pending committed prefix, applied in place (the chunked scan reads B
+    // as h0). The conv half is the window-slot path's own shift, under its own condition: it depends on the
+    // acceptance count the conv kernel last read, which a bare (uncommitted) verify leaves behind too.
+    FlushGdnPending();
+    if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
+      for (auto& gs : gdn_states_) {
+        if (gs) gs->ShiftConv(0, mtp_last_committed_, stream_);
+      }
+    }
+  } else if (mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
     // Enqueued on stream_, so ordered before the prefill's own kernels; no other buffer is touched.
     for (auto& gs : gdn_states_) {
       if (gs) gs->CollapseWindow(0, mtp_last_committed_, stream_);
@@ -1804,6 +1845,23 @@ void Model::CollapseSpeculativeWindow() {
   }
   mtp_num_accepted_valid_ = false;
   mtp_last_committed_ = 1;
+}
+
+void Model::FlushGdnPending() {
+  if (!gdn_write_once_ || !gdn_book_.Pending()) return;
+  const int64_t n = gdn_book_.Count();
+  for (auto& gs : gdn_states_) {
+    if (gs) gs->Materialize(0, n, stream_);
+  }
+  gdn_book_.Clear();
+}
+
+int64_t Model::GdnStateBytes() const {
+  int64_t bytes = 0;
+  for (const auto& gs : gdn_states_) {
+    if (gs) bytes += static_cast<int64_t>(gs->RecurrentElems() * sizeof(float) + gs->LogBytes());
+  }
+  return bytes;
 }
 
 std::vector<float> Model::DecodeStep(int32_t token_id) {
@@ -2075,6 +2133,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
       // round's real num_accepted, silently profiling the wrong GDN window.
       p.num_accepted =
           (draft_window_ > 1 && mtp_num_accepted_valid_) ? mtp_num_accepted_dev_.data() : nullptr;
+      p.gdn_pending = GdnPendingPtr();  // write-once state; consumed by this step, cleared below
       p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur,
                     cur, 1, p, normed_in, mlp_norm_weight, buf_normed_.data(), &acc,
@@ -2154,6 +2213,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   sp.wall_ms = std::chrono::duration<double, std::milli>(wall_t1 - wall_t0).count();
   sp.r4dx_kernel_launches = r4dx_kernel_launch_counter_get();
 
+  gdn_book_.OnPlainDecode();  // write-once state: this step's kernel consumed any pending prefix
   pos_ += 1;
   started_ = true;
   return sp;
@@ -2418,6 +2478,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   const int32_t* rope_pos3 = RopePositionsForChunk(pos_, T);  // nullptr for a text-only run
 
   const int32_t* num_accepted_ptr = mtp_num_accepted_valid_ ? mtp_num_accepted_dev_.data() : nullptr;
+  const int32_t* gdn_pending_ptr = GdnPendingPtr();
 
   uint16_t* cur = buf_a_.data();
   uint16_t* other = buf_b_.data();
@@ -2444,6 +2505,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
       p.is_prefill = false;
       p.has_init = has_init;
       p.num_accepted = num_accepted_ptr;
+      p.gdn_pending = gdn_pending_ptr;  // write-once state: the previous round's committed prefix, if any
       p.out_had_signs = had.gdn_out;
       layer.Forward(stream_, arena_, *gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur,
                     T, p, normed_in, mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr,
@@ -2493,6 +2555,9 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
     arena_.Reset();
   }
   if (probe_ != nullptr) probe_->SetLayer(-1);
+  // Write-once state: every GDN layer replayed the previous round's committed prefix into B and logged this
+  // window's rows. Nothing of THIS call is committed until CommitVerifiedWindow(n) says how many rows are.
+  gdn_book_.OnVerifyLaunched(T);
   // quant2 stack exit, as RunChunk's (docs/quant2.md section 3.1): all T rows, before FinalLmHead
   // (every row) and before mtp_last_hidden_ = cur below, which DecodeStepMtpImpl copies into
   // mtp_seed_hidden_.
@@ -2690,10 +2755,18 @@ void Model::CommitVerifiedWindow(int64_t num_committed) {
   // the window width, which would silently accept every candidate regardless of whether the real
   // model agreed. Safe to write mtp_num_accepted_dev_ synchronously here: VerifyWindow ended with
   // a stream_.Synchronize() before returning, so every kernel that read the previous value is done.
+  if (gdn_write_once_ && num_committed > gdn_book_.LastVerifyT()) {
+    // Only the rows the last verify call logged can be committed; the window-slot path would read a window
+    // slot that call never wrote (stale state), the write-once log has no such row at all.
+    throw std::runtime_error("Model::CommitVerifiedWindow: num_committed (" + std::to_string(num_committed) +
+                             ") exceeds the " + std::to_string(gdn_book_.LastVerifyT()) +
+                             " row(s) of the last verify call (write-once GDN state)");
+  }
   const int32_t n = static_cast<int32_t>(num_committed);
   mtp_num_accepted_dev_.CopyFromHost(&n, 1);
   mtp_num_accepted_valid_ = true;
   mtp_last_committed_ = num_committed;
+  if (gdn_write_once_) (void)gdn_book_.OnCommit(num_committed);  // pending iff the call logged (T > 1)
   pos_ += num_committed;
   started_ = true;
 }
@@ -3096,6 +3169,9 @@ void Model::DflashDebugLastTop16(std::vector<int32_t>* cand, std::vector<float>*
 }
 
 std::vector<std::pair<std::string, uint64_t>> Model::DebugStateDigest() {
+  // Write-once state: apply a pending committed prefix to B first (invisible to the continuing run), so B is
+  // the live state; the logs are scratch and are not digested.
+  FlushGdnPending();
   stream_.Synchronize();
   std::vector<std::pair<std::string, uint64_t>> out;
   out.emplace_back("pos", static_cast<uint64_t>(pos_));
@@ -3127,6 +3203,26 @@ std::vector<std::pair<std::string, uint64_t>> Model::DebugStateDigest() {
                        Fnv1a64Bytes(reinterpret_cast<const uint8_t*>(v.data()), v.size() * 2));
     }
     out.emplace_back("dflash.injected", static_cast<uint64_t>(dflash_->InjectedCount()));
+  }
+  return out;
+}
+
+std::vector<std::pair<std::string, uint64_t>> Model::DebugLiveGdnDigest() {
+  FlushGdnPending();
+  stream_.Synchronize();
+  std::vector<std::pair<std::string, uint64_t>> out;
+  for (size_t i = 0; i < gdn_states_.size(); ++i) {
+    if (!gdn_states_[i]) continue;
+    GdnStateManager& gs = *gdn_states_[i];
+    // Window-slot path: after a speculative round that committed n the live state is window slot n-1 (and
+    // the sequence's one slot, window 0, after a prefill or a plain decode step: n == 1).
+    int32_t slot = gs.SlotForSeq(0);
+    if (!gs.WriteOnce() && mtp_num_accepted_valid_ && mtp_last_committed_ > 1) {
+      slot = gs.WindowSlot(0, static_cast<int32_t>(mtp_last_committed_ - 1));
+    }
+    out.emplace_back("gdn.live." + std::to_string(i),
+                     DigestDeviceBytes(gs.RecurrentSlotPtr(slot),
+                                       static_cast<size_t>(gs.RecurrentSlotStride()) * sizeof(float)));
   }
   return out;
 }

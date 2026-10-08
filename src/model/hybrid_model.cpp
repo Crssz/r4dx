@@ -210,6 +210,10 @@ void Model::TpInjectDflashTail(const uint16_t* features, int64_t rows, int64_t s
   }
   if (!dflash_.has_value()) throw std::logic_error("Model::TpInjectDflashTail: this Model has no DFlash drafter");
   if (features == nullptr) throw std::invalid_argument("Model::TpInjectDflashTail: no feature rows");
+  if (max_chunk_ != hybrid::kDflashSliceRows) {  // DflashTailStart's grid and the drafter's max_inject_rows are 64 rows
+    throw std::logic_error("Model::TpInjectDflashTail: the tail's slice grid is " + std::to_string(hybrid::kDflashSliceRows) + " rows but max_chunk_ is " +
+                           std::to_string(max_chunk_));
+  }
   CheckTuningScope();  // the drafter's fc / k_proj / v_proj GEMMs pick their tuning table by the thread's flag
   const int64_t window = dflash_->Config().attention.sliding_window;
   if (const std::string why = hybrid::CheckTailInject(dflash_->InjectedCount(), pos_, start_pos, rows, window); !why.empty()) {

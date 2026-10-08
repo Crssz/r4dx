@@ -1063,7 +1063,10 @@ class Model {
   // has no image: the drafter then ropes at start + t + its delta, as RunChunk does). The tail must end at PositionCount() and
   // start at or after the drafter's frontier; a gap (the usual case, start = max(p0, n - 2048 aligned)) must cover a whole window
   // (hybrid::CheckTailInject). Runs the drafter's GEMMs, so the thread's tuning flag must equal this Model's (CheckTuningScope).
-  // Synchronous. Not a stage.
+  // Synchronous. Not a stage. Caller contracts: max_chunk_ must be hybrid::kDflashSliceRows (checked); `rope_t` has no length
+  // argument (it must hold `rows` entries) and, while an image's mrope is active, must be passed for any slice that may touch the
+  // image (nullptr means the delta shortcut, only right for text rows past it); CheckTailInject throws when the drafter's frontier
+  // lags (injection was off for a sampled turn) and the call is shorter than the window -- the caller (P3) then takes the plain TP path.
   void TpInjectDflashTail(const uint16_t* features, int64_t rows, int64_t start_pos, const int32_t* rope_t);
   // Stage side: captures the feature rows of positions [start_pos, end_pos) as this Model's chunks drain them (the capture observer),
   // into `host` ([capacity_rows][DflashFeatureCols()] bf16, caller-owned pinned memory). Needs AttachDflashFeatureCapture and a Model

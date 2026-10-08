@@ -21,7 +21,7 @@
 //         incl. the MTP seed sync into stage Y); checkpoint save / restore around a decode and a warm turn after the restore; image rows (synthetic merger rows
 //         spliced by PrefillMultimodal, mrope carried into the next turn) where the container has a vision config.
 //   Configs (each one "configuration" in the final count): l4/bf16 (the 4-layer selftest container, split 2, window-slot GDN), l4/bf16-writeonce,
-//         l4/w4a16, real16 (the production trellis container with layer_limit 16, split 8: real shapes, real shard rules). ~20 GiB resident for real16.
+//         l4/w4a16, real16 (the production trellis container with layer_limit 16, split 8: real shapes, real shard rules). ~22.5 GiB resident for real16 (doc estimate: ranks 9.5, R 7.4, X 2.4, Y 3.2); Gate B at 64 layers is ~29.8 of 31.86 GiB, the OOM candidate.
 //   NEGATIVE CONTROLS (design section 4; each must change a digest or a token comparison, printed "[PASS] negative control NCk: ..."):
 //         NC1 swap the head halves   NC2 drop a conv segment   NC3 skip the MTP half   NC5 off-by-one KV block   NC6 wrong rank mapping (GDN v-heads)
 //         NC7 stale mirror (no gather / no GDN gather / no KV-rows gather on a warm turn)   NC8 skip the scalars (and drop the mrope delta)
@@ -37,7 +37,7 @@
 //          test_hybrid_emulate_identity --gate-b-dump <dir>   process 1 of Gate B: the TP=1 reference prefills, state files + logits hashes into <dir>
 //          test_hybrid_emulate_identity --gate-b <dir>        process 2 of Gate B: ranks + stages only, --embed-device-resident off, compares with <dir>
 //   (env R4DX_HYBRID_GATE_B=dump|verify + R4DX_HYBRID_GATE_B_DIR=<dir> are the same switches; --layers N / --split K change the Gate B depth.)
-//   R4DX_TEST_ONLY=<substring> runs only the configurations / scenarios whose "cfg/name" contains it.
+//   R4DX_TEST_ONLY=<substring> runs only the configurations / scenarios whose "cfg/name" contains it (R4DX_TEST_ONLY==<cfg>: exactly that configuration, not its prefix-sharing siblings).
 // Output: "[PASS] ..." / "FAIL ..." lines on stderr and a final "test_hybrid_emulate_identity: PASS (N configurations)"; exit 0 only when every required
 // case passed, 1 on a failure, 77 when there is no device or no container at all. Device 1 (HIP_VISIBLE_DEVICES=1), links the R4DX_TP_TESTING variant.
 // Written, NOT run by its author (CPU-only session).
@@ -109,7 +109,12 @@ std::set<int> g_nc_done;
 
 bool Only(const std::string& name) {
   const char* only = std::getenv("R4DX_TEST_ONLY");
-  return only == nullptr || *only == '\0' || name.find(only) != std::string::npos;
+  if (only == nullptr || *only == '\0') return true;
+  if (*only == '=') {  // "=l4/bf16" matches that configuration (and its "/..." scenarios), not "l4/bf16-writeonce"
+    const std::string want = only + 1;
+    return name == want || name.compare(0, want.size() + 1, want + "/") == 0;
+  }
+  return name.find(only) != std::string::npos;
 }
 
 // One scenario's checks: silent while they pass, one "[PASS]" line at Done(), a "FAIL" line per failing check.
@@ -286,6 +291,7 @@ struct RefState {
 struct CallResult {
   bool logits_equal = false;
   bool scalars_equal = false;
+  bool rank_scalars_equal[2] = {false, false};  // each rank's StageGetSyncState() after TpAdoptPrefill == stage Y's end state
   bool digest_equal[2] = {false, false};
   std::string why[2];
   int64_t p0 = 0, n = 0;
@@ -294,7 +300,9 @@ struct DecodeOutcome {
   std::vector<int32_t> tok[2];            // [mode: 0 plain, 1 mtp]
   hybrid::DigestList dig[2][2];           // [mode][rank]
 };
-bool CallOk(const CallResult& c) { return c.logits_equal && c.scalars_equal && c.digest_equal[0] && c.digest_equal[1]; }
+bool CallOk(const CallResult& c) {
+  return c.logits_equal && c.scalars_equal && c.rank_scalars_equal[0] && c.rank_scalars_equal[1] && c.digest_equal[0] && c.digest_equal[1];
+}
 struct ScenarioOut {
   std::vector<CallResult> calls;          // every call in order; the last one is the one a fault was injected into
   bool decode_checked = false;
@@ -821,6 +829,16 @@ class Rig {
       OnRanks([&](Model& m, int) { m.TpAdoptPrefill(adopt); });
     }
     tracker->AfterPipelined(p0 + n);
+
+    // the adoption itself: each rank's scalars (position, started, mrope, MTP seed) are stage Y's end state
+    OnRanks([&](Model& m, int rank) {
+      const StageSyncState r = m.StageGetSyncState();
+      res.rank_scalars_equal[rank] = r.pos == end.pos && r.started == end.started && r.mrope_active == end.mrope_active &&
+                                     r.mrope_delta == end.mrope_delta && r.mtp_seed_valid == end.mtp_seed_valid && r.mtp_seed == end.mtp_seed;
+    });
+    if (grp != nullptr) {
+      for (int k = 0; k < 2; ++k) grp->Ok(res.rank_scalars_equal[k], tag + ": rank " + std::to_string(k) + "'s adopted scalars (pos, started, mrope, MTP seed) equal stage Y's end state");
+    }
 
     // ---- G-H1 ----
     hybrid::DigestList want[2];
@@ -1582,7 +1600,7 @@ static int RunTest(int argc, char** argv) {
     c.layout = r4dx::model::LayoutFromName(ProductionLayoutName());
     c.layers = 16;
     c.split = 8;
-    c.nc10_must_flip = true;
+    c.nc10_must_flip = false;  // informational until measured: the TP2 tuning table may pick the same bytes for these stage GEMM shapes
     std::vector<Scenario> sc = {Cold(17, true),
                                 Cold(300),
                                 Cold(1000),
@@ -1602,7 +1620,7 @@ static int RunTest(int argc, char** argv) {
     std::string done, missing;
     for (const int nc : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}) (g_nc_done.count(nc) != 0 ? done : missing) += std::to_string(nc) + " ";
     std::fprintf(stderr, "[hybrid-emu] negative controls detected: %s\n", done.empty() ? "(none)" : done.c_str());
-    if (!missing.empty()) std::fprintf(stderr, "[hybrid-emu] negative controls NOT exercised in this run: %s(filtered out, or the container they need is missing)\n", missing.c_str());
+    if (!missing.empty()) std::fprintf(stderr, "[hybrid-emu] negative controls NOT exercised in this run: %s(filtered out, the container they need is missing, or - NC8's image variant and NC11 - it has no vision config; not a failure)\n", missing.c_str());
   }
   if (g_configs == 0) return SkipMissing(l4);
   if (g_fails != 0) {

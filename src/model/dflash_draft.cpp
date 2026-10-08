@@ -772,6 +772,15 @@ DflashDraftResult DflashDraft::SelectorWalk(int32_t anchor_id, int64_t k, float 
     // means "draft nothing", which a driver uses to fall back to a plain verify of the anchor alone.
     if (static_cast<int64_t>(out.tokens.size()) >= k) break;
     const int32_t* cand_t = cand + t * topk;
+    // r4dx_topk16_f32 returns (-inf, INT32_MAX) for a row with fewer than 16 non-NaN logits (NaN drafter output,
+    // e.g. from NaN target features). Both codebooks are indexed by these ids below: refuse, do not read past them.
+    for (int64_t b = 0; b < topk; ++b) {
+      if (cand_t[b] < 0 || cand_t[b] >= global_vocab_) {
+        throw std::runtime_error("DflashDraft::SelectorWalk: candidate id " + std::to_string(cand_t[b]) +
+                                 " is outside the vocabulary [0, " + std::to_string(global_vocab_) +
+                                 ") -- the drafter's logits row has non-finite values");
+      }
+    }
     const float* unary_t = unary + t * topk;
     const uint16_t* gate_t = gate + t * rank;
 

@@ -200,7 +200,12 @@ void Model::PpEmulateHop(ChunkRun& r, int64_t split, PpChunkTimes* times) {
     R4DX_HIP_CHECK(hipMemsetAsync(buf_normed_.data(), kPoison, carry_bytes, s));
     R4DX_HIP_CHECK(hipMemsetAsync(buf_normed_pre_.data(), kPoison, carry_bytes, s));
     if (dfl_here > 0) {
-      R4DX_HIP_CHECK(hipMemset2DAsync(dflash_features_dev_.data(), dfl_pitch, kPoison, dfl_width,
+      // The negative control that drops these columns zero-fills them instead: a 0xFF (NaN) feature column makes
+      // the drafter's logits NaN, r4dx_topk16_f32 then returns its (-inf, INT32_MAX) sentinel ids, and the host
+      // selector walk indexes its codebooks with INT32_MAX (an access violation, no exception). Zeros are finite,
+      // so the drafter runs, and the ring it leaves is not the monolithic run's -- which is what the control needs.
+      const int fill = fault == PpEmulateConfig::Fault::kSkipDflash ? 0 : kPoison;
+      R4DX_HIP_CHECK(hipMemset2DAsync(dflash_features_dev_.data(), dfl_pitch, fill, dfl_width,
                                       static_cast<size_t>(T), s));
     }
     for (const KvPiece& k : kvs) R4DX_HIP_CHECK(hipMemsetAsync(k.kv->Data() + k.dev_off, kPoison, k.bytes, s));

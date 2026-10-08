@@ -1144,7 +1144,17 @@ void TpModel::BatchImport(int slot) {
   // A local copy on every rank (its own shard of the KV and GDN state; no TpComm), run as a collective command only for its state
   // rules: TpStateError unless kReady, and a failure makes the group kNeedsRecovery. The single-sequence state does not move, so the
   // hybrid's mirrors (NoteTpMoved) are left alone.
-  RunCollective([slot](Model& m, int) { m.BatchImport(slot); });
+  try {
+    RunCollective([slot](Model& m, int) { m.BatchImport(slot); });
+  } catch (...) {
+    // A rank whose copies succeeded activated the slot, one whose copies failed did not: make every rank agree it is free (a later step
+    // naming it would otherwise pass one rank's validation and fail the other's before the lockstep check). Best effort.
+    try {
+      if (state_ != State::kFatal) RunAll([slot](Model& m, int) { m.BatchRelease(slot); });
+    } catch (...) {
+    }
+    throw;
+  }
 }
 
 void TpModel::BatchRelease(int slot) {

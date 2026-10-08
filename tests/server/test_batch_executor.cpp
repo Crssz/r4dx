@@ -245,6 +245,27 @@ void TestStop() {
   ex.reset();
 }
 
+// Stop() racing a Run() whose job is still queued: the caller must get an exception, not hang.
+void TestStopFailsQueuedJob() {
+  Recorder rec;
+  rec.delay = std::chrono::milliseconds(200);
+  auto ex = std::make_unique<BatchExecutor>(BatchExecutor::Options{2, std::chrono::microseconds(100)}, rec.Fn());
+  std::future<int32_t> running = ex->StepAsync(MakeRow(0, 1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));  // the executor is inside the (slow) decode
+  std::atomic<bool> threw{false};
+  std::thread caller([&] {
+    try { ex->Run([] { return 1; }); } catch (const std::exception&) { threw = true; }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));  // the job is queued behind the step
+  std::thread s1([&] { ex->Stop(); });
+  std::thread s2([&] { ex->Stop(); });                          // two concurrent Stop() calls
+  s1.join();
+  s2.join();
+  caller.join();
+  CHECK(threw.load());  // a job queued when Stop() ran must fail, not hang
+  CHECK(running.get() == Next(0, 1));  // the step in flight finishes
+}
+
 void TestBadConstruction() {
   bool threw = false;
   try { BatchExecutor ex({0, std::chrono::microseconds(1)}, [](const std::vector<Row>&) { return std::vector<int32_t>(); }); }
@@ -265,6 +286,7 @@ int main() {
   TestJobsInterleave();
   TestMisuse();
   TestStop();
+  TestStopFailsQueuedJob();
   TestBadConstruction();
   if (g_failures > 0) {
     std::fprintf(stderr, "%d check(s) failed\n", g_failures);

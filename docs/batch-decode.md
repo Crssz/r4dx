@@ -16,7 +16,7 @@ requests concurrently; `--tp 2` and the hybrid mode (`--tp 2 --pp 2`) support it
 
 | | |
 |---|---|
-| Flags | `--batch N` (0 = off, the default, byte-for-byte the one-request-at-a-time server; N in [2, 16]), `--batch-ctx N` (tokens per slot, a multiple of 16, default 32768) |
+| Flags | `--batch N` (0 = off, the default, byte-for-byte the one-request-at-a-time server; N in [2, 16], at most 8 with `--tp 2`: a TP step is never split into submission units, docs/tp.md N80), `--batch-ctx N` (tokens per slot, a multiple of 16, default 32768) |
 | Works with | `--tp 1`, `--pp 2` (decode runs on the decode card), `--tp 2`, `--tp 2 --pp 2` (hybrid), every `--layout`, images (a slot carries its conversation's mrope delta), sampled and greedy requests, streaming, tools, thinking |
 | Not with | `--mtp`, `--dflash` (a batched step decodes one plain token per sequence; refused at startup), Gemma 4 (`BatchSlots() == 0`; refused at startup) |
 | Changes under `--batch` | the prompt checkpoint is off, and a request never reuses another's prefix: every request prefills its whole prompt (a request owns a slot, not the model) |
@@ -118,8 +118,8 @@ check, per-rank closure, failure -> `kNeedsRecovery`). Every rank holds the same
   (`MergeShardResults`); an unresolved sampled row is gathered full-width (`GatherVocabRow`). All ranks reach the
   same token because they hold identical rng copies: `TpModel::DecodeBatch` hands each rank a copy of every sampled
   row's generator, compares the copies afterwards (`RequireRngsEqual`) and gives the caller's generators rank 0's.
-* **Warm-up.** `Model::TpWarmup` runs `BatchWarmup`: every row count `1..N` greedy, then one all-sampled step, so no
-  kernel's first use and no first merge happens inside a request.
+* **Warm-up.** `Model::TpWarmup` (and, at TP=1, the end of `Model::Load`) runs `BatchWarmup`: every row count `1..N` greedy, then one
+  all-sampled step, so no kernel's first use and no first merge happens inside a request.
 * **Hybrid.** The PP-2 prefill reshards its state into the two rank Models at the end of the call. `BatchImport` runs
   after that, on the ranks, so a slot receives the same state a plain `--tp 2` prefill would have left: **the slot never
   knows which prefill built it.** A batched step runs on the ranks alone and leaves the single-sequence state where it
@@ -204,7 +204,7 @@ A `DecodeBatch` that throws fails every row of that step (`500` for each request
 releases those slots first (their state is unknown), the executor keeps running and the other requests -- those
 still in prefill, or not in this step -- continue. Under TP the group is then `kNeedsRecovery` until a request's
 `Reset()` recovers it; requests that were mid-decode fail at their next step with the state error. A prefill failure
-fails only its request. Input errors (a slot that is not live, a repeated slot) throw before anything is enqueued;
+fails only its request. A failed `BatchImport` leaves its slot free on every rank (`TpModel::BatchImport` releases it everywhere). Input errors (a slot that is not live, a repeated slot) throw before anything is enqueued;
 under TP they still make the group `kNeedsRecovery` because the validation runs inside the collective -- the engine
 never produces them.
 

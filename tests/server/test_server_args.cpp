@@ -629,8 +629,11 @@ void TestBatchFlags() {
   CHECK(a0.batch == 0 && a0.batch_ctx == 32768 && !a0.batch_ctx_given);  // off by default: the one-request-at-a-time server
   const auto a = parse({"--batch", "4"});
   CHECK(a.batch == 4 && a.batch_ctx == 32768);
-  const auto b = parse({"--batch", "16", "--batch-ctx", "65536", "--tp", "2"});
-  CHECK(b.batch == 16 && b.batch_ctx == 65536 && b.batch_ctx_given && b.tp == 2);
+  const auto big = parse({"--batch", "16", "--batch-ctx", "65536"});
+  CHECK(big.batch == 16 && big.batch_ctx == 65536 && big.batch_ctx_given && big.tp == 1);
+  const auto b = parse({"--batch", "8", "--tp", "2"});
+  CHECK(b.batch == 8 && b.tp == 2);
+  CHECK(throws({"--batch", "9", "--tp", "2"}));  // a TP step stays at most 8 rows
   // the hybrid mode takes it too: decode of the slots runs on the TP ranks after the pipelined prefill
   const auto h = parse({"--tp", "2", "--pp", "2", "--batch", "4", "--batch-ctx", "16384"});
   CHECK(h.batch == 4 && h.tp == 2 && h.pp == 2);

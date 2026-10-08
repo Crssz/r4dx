@@ -946,6 +946,17 @@ Model Model::Load(const ModelOptions& opts) {
               << ") with the carry copied through host staging (R4DX_PP_EMULATE; diagnostic mode, not a speedup)\n";
   }
 
+  // Batched decode at TP=1: the first touch of every batch kernel and row count, here rather than inside the first requests (a TP rank
+  // does the same in TpWarmup). Skipped when the context cannot hold the 65 warm-up positions.
+  if (opts.batch_slots > 0 && !is_tp_rank && opts.max_ctx > 66) {
+    std::vector<int32_t> ids(static_cast<size_t>(m.max_chunk_));
+    for (int64_t i = 0; i < m.max_chunk_; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    (void)m.Prefill(ids);
+    (void)m.DecodeStepGreedy(0);
+    m.BatchWarmup();
+    m.Reset();
+  }
+
   return m;
 }
 
@@ -2981,6 +2992,7 @@ void Model::BatchImport(int slot) {
   // Same hazard class as every other public call: the device is idle on entry (the previous call ended synchronized), and the
   // copies below are enqueued on stream_ and waited for before the slot goes live.
   const int64_t num_layers = container_.NumLoadedLayers();
+  try {
   for (int64_t i = 0; i < num_layers; ++i) {
     const size_t li = static_cast<size_t>(i);
     if (gdn_states_[li]) {
@@ -3007,6 +3019,10 @@ void Model::BatchImport(int slot) {
     }
   }
   stream_.Synchronize();
+  } catch (...) {
+    batch_slots_.Release(slot);  // half-copied: the slot holds nothing (and under TP the ranks must agree on that)
+    throw;
+  }
   batch_slots_.Activate(slot, pos_, mrope_active_, mrope_delta_);
 }
 
@@ -3040,6 +3056,12 @@ std::vector<int32_t> Model::DecodeBatch(const std::vector<BatchDecodeRow>& rows)
     // Some layers may have advanced these slots' state and some not: it is unknown, so the slots are free again (their next
     // BatchImport overwrites all of it) and the caller must not feed them another token.
     for (int s : slots) batch_slots_.Release(s);
+    // The failure may have left part of the step enqueued: wait for it, so the next call's overwrite of the pinned metadata and the
+    // slots' next import cannot race it. (Best effort: the original exception is the one that propagates.)
+    try {
+      stream_.Synchronize();
+    } catch (...) {
+    }
     throw;
   }
 }

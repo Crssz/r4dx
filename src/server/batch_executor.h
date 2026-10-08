@@ -77,12 +77,14 @@ class BatchExecutor {
   template <class F>
   auto Run(F&& f) -> std::invoke_result_t<F&> {
     using R = std::invoke_result_t<F&>;
-    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
-    std::future<R> result = task->get_future();
+    std::packaged_task<R()> task(std::forward<F>(f));
+    std::future<R> result = task.get_future();
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (stop_) throw std::runtime_error("batch executor stopped");
-      jobs_.push_back([task] { (*task)(); });
+      // The queued closure is the task's ONLY owner (std::function needs a copyable callable, hence the shared_ptr): when Stop() drops it
+      // unrun, the task dies and the caller's future throws broken_promise instead of waiting forever.
+      jobs_.push_back([t = std::make_shared<std::packaged_task<R()>>(std::move(task))] { (*t)(); });
     }
     cv_.notify_all();
     return result.get();
@@ -130,6 +132,7 @@ class BatchExecutor {
 
   // Fails everything still queued with "batch executor stopped" and joins the thread. Idempotent.
   void Stop() {
+    std::lock_guard<std::mutex> stop_lock(stop_mu_);  // one caller at a time: a second waits for the first's join, then finds nothing to do
     {
       std::lock_guard<std::mutex> lock(mu_);
       if (stop_ && !thread_.joinable()) return;
@@ -144,7 +147,7 @@ class BatchExecutor {
       jobs.swap(jobs_);
       steps.swap(steps_);
     }
-    jobs.clear();  // a queued packaged_task destroyed unrun makes its future throw broken_promise
+    jobs.clear();  // each closure solely owns its packaged_task: destroyed unrun, its future throws broken_promise
     for (auto& s : steps) s->token.set_exception(std::make_exception_ptr(std::runtime_error("batch executor stopped")));
   }
 
@@ -235,6 +238,7 @@ class BatchExecutor {
 
   const Options opts_;
   const DecodeFn decode_;
+  std::mutex stop_mu_;
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::deque<std::function<void()>> jobs_;

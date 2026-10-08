@@ -451,6 +451,12 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
       throw ServerUsageError("--max-queue must be >= --batch (" + std::to_string(a.batch) + "): the queue feeds the slots");
     }
   }
+  // Under TP a step is never split into device-0 submission units (tp_submit.h's kMaxUnsplitDraftK, docs/tp.md Appendix B N80: at most 8
+  // rows), and a batched step has one row per slot.
+  if (a.batch > 8 && a.tp == 2) {
+    throw ServerUsageError("--batch must be at most 8 with --tp 2 (a decode step is not split into device-0 submission units, so it stays at "
+                           "most 8 rows; docs/tp.md Appendix B N80)");
+  }
   // ---- tensor parallel (docs/tp.md 9.1): src/cli/cli_args.h's rules, minus --profile* (the server
   // has no profiling flags) ------------------------------------------------------------------------
   if (a.tp != 1 && a.tp != 2) throw ServerUsageError("--tp must be 1 or 2");

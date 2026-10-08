@@ -206,6 +206,10 @@ void Layout() {
     }
   }
   Check(ok, "slot regions are 256-byte aligned, disjoint and inside the total, which MaxSlotBytes bounds");
+  // An empty carry is refused (hidden 0 -- ChunkRun::hidden read before the prologue -- shipped 0-byte carries, 2026-10-08).
+  Check(Throws<std::invalid_argument>([&] { (void)MakeSlotLayout(0, 256, 0, 0, layers, 16, stride); }), "hidden 0 throws");
+  Check(Throws<std::invalid_argument>([&] { (void)MakeSlotLayout(0, 0, 5120, 0, layers, 16, stride); }), "0 rows throws");
+  Check(Throws<std::invalid_argument>([&] { (void)MakeSlotLayout(0, 1, 5120, -1, layers, 16, stride); }), "dfl_cols < 0 throws");
   // The GDN wire: 3 MiB fp32 recurrent state + [10240][3] bf16 history per layer.
   const GdnWire w = MakeGdnWire(48, 128, 128, 10240, 4);
   Check(w.recurrent_bytes == 3u * 1024u * 1024u && w.conv_bytes == 10240u * 3u * 2u, "GDN wire sizes");

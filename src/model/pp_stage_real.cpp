@@ -48,13 +48,6 @@ std::string GetEnv(const char* name) {
   return v;
 }
 
-// R4DX_PP_IMPORT_SYNC=0 (diagnostic only): stage B's import without the two stream synchronizes around it -- the code as it
-// was before the 2026-10-08 fix, so a GPU run can show the failure come back.
-bool PpImportSyncOn() {
-  static const bool on = GetEnv("R4DX_PP_IMPORT_SYNC") != "0";
-  return on;
-}
-
 // The trace's hash: FNV-1a over 8-byte words (and the tail bytes); fast enough for a few MiB per chunk.
 uint64_t TraceHash(const uint8_t* p, size_t n) {
   uint64_t h = kFnvInit;
@@ -429,10 +422,34 @@ std::vector<std::pair<std::string, uint64_t>> Model::PpLiveDigest(int64_t split)
 
 // ---- the chunk compositions -------------------------------------------------------------------------------------------
 
+// The carry's row width. From the configuration, NOT from r.hidden: ChunkRun::hidden is 0 until ChunkPrologue fills it,
+// and reading it before the prologue (as both stages did until 2026-10-08) made every carry copy 0 bytes long -- the
+// identity failure of that day (docs/pp-prefill.md 4.6).
+int64_t Model::PpCarryHidden() const {
+  const int64_t hidden = container_.Config().hidden_size;
+  if (hidden <= 0) throw std::logic_error("Model: the configuration's hidden_size is not positive");
+  return hidden;
+}
+
+namespace {
+
+// Every chunk carries T x hidden x 2 bytes in each of the three carry buffers; anything else is a bug that would ship a
+// truncated (or empty) carry while the slot header and payload size still agree on both sides.
+void CheckCarryLayout(const pp::SlotLayout& lay, int64_t T, int64_t hidden, const char* who) {
+  const size_t want = static_cast<size_t>(T) * static_cast<size_t>(hidden) * sizeof(uint16_t);
+  if (want == 0 || lay.carry_bytes != want) {
+    throw std::logic_error(std::string(who) + ": the carry is " + std::to_string(lay.carry_bytes) + " bytes, expected " +
+                           std::to_string(want) + " (T " + std::to_string(T) + " x hidden " + std::to_string(hidden) +
+                           " x 2)");
+  }
+}
+
+}  // namespace
+
 std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
   const int64_t split = pp_setup_.split;
   const int64_t T = r.T;
-  const int64_t hidden = r.hidden;
+  const int64_t hidden = PpCarryHidden();
   const std::chrono::milliseconds timeout(pp_setup_.timeout_ms);
   // Layers [0, split): the last one's Mlp fuses layer `split`'s input rmsnorm (stage A holds that layer's weight, and
   // has_next_layer is `i + 1 < NumLoadedLayers()`), so `normed_in` leaves this range exactly as in the monolithic run.
@@ -455,6 +472,8 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
   }
   const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
+  CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageA");
+  if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageA: the prologue's hidden differs from the configuration's");
   pp::StageChannel::Slot* slot = pp_setup_.channel->AcquireFree(timeout);
   if (lay.total > slot->capacity) {
     throw std::logic_error("Model::RunChunkPpStageA: a chunk's payload (" + std::to_string(lay.total) +
@@ -494,7 +513,7 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
 std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
   const int64_t split = pp_setup_.split;
   const int64_t T = r.T;
-  const int64_t hidden = r.hidden;
+  const int64_t hidden = PpCarryHidden();
   const std::chrono::milliseconds timeout(pp_setup_.timeout_ms);
   // The prologue first: it overlaps stage A's chunk (it uploads this chunk's positions and gathers an embedding that
   // the import then overwrites -- the cost of keeping the prologue a single piece of code for both stages).
@@ -517,6 +536,8 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
   }
   const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
+  CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageB");
+  if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageB: the prologue's hidden differs from the configuration's");
   if (lay.total != h.bytes) {
     throw std::runtime_error("Model::RunChunkPpStageB: the stages disagree on the payload size (" + std::to_string(h.bytes) +
                              " vs " + std::to_string(lay.total) + " bytes)");
@@ -527,17 +548,7 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
 
   const uint8_t* const host = slot->data;
   const hipStream_t s = stream_.get();
-  // The import is bracketed by two stream synchronizes, exactly as PP-emulate's hop is (pp_stage.cpp; the hop that passes
-  // G1b synchronizes after its H2D before stage B's first layer). Without them the GPU run of 2026-10-08 failed every
-  // configuration in exactly the pattern of B's first layer reading the carry buffers' PREVIOUS contents: every observable
-  // fed by the carry differed (layers >= k, logits), everything else that crosses through the same slot or the same pinned
-  // memory -- the KV blocks and DFlash columns (read only after the epilogue's synchronize) and the GDN hand-off (fenced) --
-  // was exact, and the wrong bits depended on the configuration's history (plain and capture gave different pipelined hashes
-  // for the same computation). The first synchronize also lands the prologue's embedding gather into buf_a_ before the
-  // import overwrites it. Cost: two host round trips per chunk (the prologue ran while B waited for the slot; the copy is on
-  // B's critical path either way). R4DX_PP_IMPORT_SYNC=0 restores the unsynchronized import (diagnostic only).
-  const bool import_sync = PpImportSyncOn();
-  if (import_sync) stream_.Synchronize();
+  // All on stream_, behind the prologue (whose embedding gather into buf_a_ this overwrites) and ahead of the layers.
   // `cur` always lands in buf_a_ (whichever ping-pong buffer stage A's attention-layer parity left it in).
   R4DX_HIP_CHECK(hipMemcpyAsync(buf_a_.data(), host + lay.off_cur, lay.carry_bytes, hipMemcpyHostToDevice, s));
   R4DX_HIP_CHECK(hipMemcpyAsync(buf_normed_.data(), host + lay.off_norm, lay.carry_bytes, hipMemcpyHostToDevice, s));
@@ -552,12 +563,11 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
     attention::PagedKvCache& kv = *kv_caches_[static_cast<size_t>(k.layer)];
     R4DX_HIP_CHECK(hipMemcpyAsync(kv.Data() + k.dev_off, host + k.host_off, k.bytes, hipMemcpyHostToDevice, s));
   }
-  if (import_sync) stream_.Synchronize();  // the carry has landed before any layer of [split, N) reads it
   r.cur = buf_a_.data();
   r.other = buf_b_.data();
   r.normed_in = buf_normed_.data();
   r.normed_in_epilogue = body_epilogue_;
-  if (trace) PpTraceCarry("B-dev", r, split);  // (synchronizes: with R4DX_PP_IMPORT_SYNC=0 it hides the hazard it would show)
+  if (trace) PpTraceCarry("B-dev", r, split);  // (synchronizes)
 
   RunLayerRange(r, split, r.num_layers);
   std::vector<float> logits = ChunkEpilogue(r);  // ends with the stream synchronize: every copy above has landed

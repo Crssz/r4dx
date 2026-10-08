@@ -216,9 +216,9 @@ facade / engine thread  (HIP ordinal 0 = physical device 1, the headless card)  
 * `Model` gets the stage roles (`src/model/pp_stage_real.cpp`, `Model::PpAttach`): in `RunChunk`, a prompt-prefill chunk of an
   attached Model goes to `RunChunkPpStageA` (prologue, `RunLayerRange(0, k)`, synchronize, acquire a free slot, D2H of the carry /
   DFlash columns / the KV blocks the chunk wrote, synchronize, publish; `pos_ += T`; no logits) or `RunChunkPpStageB` (prologue,
-  acquire the full slot, check its header against the chunk, synchronize, H2D into `buf_a_` / `buf_normed_` / `buf_normed_pre_` / the
-  DFlash columns / the KV blocks, synchronize, `RunLayerRange(k, N)`, `ChunkEpilogue`, release; the two synchronizes are the
-  emulate hop's, see 4.6 "GPU result"). **Both Models run the same `Model::Prefill` /
+  acquire the full slot, check its header against the chunk, H2D into `buf_a_` / `buf_normed_` / `buf_normed_pre_` / the DFlash
+  columns / the KV blocks, `RunLayerRange(k, N)`, `ChunkEpilogue`, release). The carry's row width is the configuration's
+  `hidden_size` (`Model::PpCarryHidden`), checked against the layout on both sides (4.6 "GPU result"). **Both Models run the same `Model::Prefill` /
   `PrefillMultimodal` on the same tokens**, so the chunk grid, the int8 / M = 256 scope decisions, the mrope bookkeeping and the
   last-chunk flag agree by construction; the slot header (position, rows, DFlash columns, last) and the payload size are checked
   anyway and a disagreement throws. Everything else in `RunChunk` is untouched (one extra branch on `pp_active_`).
@@ -243,8 +243,7 @@ facade / engine thread  (HIP ordinal 0 = physical device 1, the headless card)  
 | `--pp-verify` / `R4DX_PP_VERIFY=1` | digest the live state of both stages after every sync-back and hand-off and compare (slow: copies the state to the host) | off |
 | `--pp-submit-layers N`, `--pp-max-inflight K` | stage A's bounded GPU submission: a forced submission every N layers (fewer past 16k / 64k / 128k of context), at most K units queued; `0` layers = off | 32, 1 (as TP) |
 | `HIP_VISIBLE_DEVICES=1,0` | **required**; any other value is refused at load by name | -- |
-| `R4DX_PP_TRACE=1` | diagnostic: one stderr line per chunk and boundary point with a hash of each carry buffer and of the chunk's ids -- `A-dev` (stage A's device buffers after layers [0, k)), `A-slot` / `B-slot` (the slot bytes as A published / B found them), `B-dev` (B's buffers after the import), `mono` (a monolithic call on the decode Model, split at the same k). Match lines by `ids` + `pos` + `rows`. Synchronizes (slow) | off |
-| `R4DX_PP_IMPORT_SYNC=0` | diagnostic: stage B's import without the two synchronizes (the pre-fix code; the identity test should fail again) | on |
+| `R4DX_PP_TRACE=1` | diagnostic: one stderr line per chunk and boundary point with a hash of each carry buffer and of the chunk's ids -- `A-dev` (stage A's device buffers after layers [0, k)), `A-slot` / `B-slot` (the slot bytes as A published / B found them), `B-dev` (B's buffers after the import), `mono` (a monolithic call on the decode Model, split at the same k). Match lines by `ids` + `pos` + `rows`. The hash of an empty region is the offset basis `14650fb0739d0383`. Synchronizes (slow) | off |
 
 Refused at load / parse: `--tp 2` (mutually exclusive), Gemma 4, a rotated (quant2) container, a probe (`R4DX_CLOCK_PROBE`), fewer
 than two devices, both ordinals on one physical GPU, GPUs of different architectures, a stage-A / stage-B disagreement on the prefill
@@ -321,18 +320,23 @@ same container; the carry crosses as raw bytes. New here beyond Phase 1: two thr
   at splits 1, 2, 3; the real container plain (33, 5), `--mtp 3` (33, 5), `--dflash 7` (35, 21, 5), vision. **Negative controls**
   (`PpModel::SetTestFault`): no sync-back to stage A on a warm turn (a stale mirror), no GDN import into B -- each must change an
   observable or fail a call.
-* **GPU result (2026-10-08, `E:\models\r4dx\pp2\logs\test_pp_real_identity.err.txt`): every configuration FAILED; fix applied,
+* **GPU result (2026-10-08, `E:\models\r4dx\pp2\logs\test_pp_real_identity.err.txt`): every configuration FAILED; fixed,
   not yet re-run.** The pattern: every observable fed by the carry differed (B's layers >= k: GDN states, KV, logits, MTP KV, the
   capture of B's layers), from a 1-row prompt at k = 1 on; everything else that crosses -- A's GDN states and the KV blocks of
   A's attention layers (the same slot, the same pinned memory; B reads them only after its epilogue's synchronize), the GDN
   hand-off (fenced), the sync-back (`R4DX_PP_VERIFY` found nothing: it digests layers < k only) -- was exact; and the wrong bits
   depended on the configuration's history (the plain and the capture configurations, the same computation, gave different
-  pipelined hashes), i.e. B's first layer read the carry buffers' previous contents. The one place in the whole design where an
-  async H2D is consumed by kernels with no host synchronize in between was stage B's import (PP-emulate's hop, which passes G1b,
-  synchronizes after its H2D; every other import is synchronized or fenced). Fix: the import is bracketed by two
-  `stream_.Synchronize()` (before: the prologue's embedding into `buf_a_` has landed; after: the carry has landed before layer k
-  reads it). `R4DX_PP_IMPORT_SYNC=0` removes them again (the identity test should fail), `R4DX_PP_TRACE=1` localizes any
-  remaining mismatch (4.2). The below-threshold / turn diffs of the threshold variant are the same bug: their first diffs are in
+  pipelined hashes), i.e. B's first layer read the carry buffers' previous contents. A first guess (an unsynchronized import;
+  synchronizes added) changed no failure count. `R4DX_PP_TRACE=1` (4.2) then showed A's device buffers right and every slot's
+  three carry regions hashing to the hash of ZERO bytes (`14650fb0739d0383`, the offset basis) at every chunk size, and B's
+  buffers after the import = its own prologue's embedding / stale contents. Cause: `RunChunkPpStageA` / `B` read
+  `const int64_t hidden = r.hidden;` BEFORE `ChunkPrologue(r)`, and `ChunkRun::hidden` is 0 until the prologue fills it
+  (`chunk_run.h`), so `MakeSlotLayout` sized every carry copy (and the DFlash columns' width) 0 bytes on both sides -- the
+  headers, the payload sizes and the KV blocks (sized from the block geometry, not `hidden`) all still agreed, and no HIP call
+  failed (a 0-byte copy is legal). PP-emulate's hop reads `r.hidden` after the prologue, which is why G1b passed. Fix: the width
+  is the configuration's `hidden_size` (`Model::PpCarryHidden`); both stages check `carry_bytes == T x hidden x 2` and that the
+  prologue agrees; `pp::MakeSlotLayout` refuses rows or hidden < 1 (CPU-tested in `test_pp_channel_cpu`); the unneeded
+  synchronizes were removed again (stream order covers the import, as everywhere else). The below-threshold / turn diffs of the threshold variant are the same bug: their first diffs are in
   a pipelined call (1100 / 1200 rows); later B-only calls differ only because the tokens decoded in between already did.
   Separately, the log shows `HIP_VISIBLE_DEVICES=1,0` did not reorder the devices on this runtime: ordinal 0 (stage B, decode) is
   pci 03:00 -- the desktop card in docs/tp.md -- and ordinal 1 (stage A) pci 07:00, the opposite of 4.1's intent; the line prints

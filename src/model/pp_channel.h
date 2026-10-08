@@ -81,6 +81,13 @@ inline void KvBlockSpan(int64_t pos, int64_t rows, int64_t block_size, int64_t* 
 inline SlotLayout MakeSlotLayout(int64_t pos, int64_t rows, int64_t hidden, int64_t dfl_cols,
                                  const std::vector<int64_t>& attn_layers, int64_t block_size,
                                  size_t block_stride_bytes) {
+  // A chunk always carries something: rows >= 1 and hidden >= 1 (hidden 0 once shipped an empty carry while both stages'
+  // layouts, headers and payload sizes still agreed -- the 2026-10-08 identity failure, docs/pp-prefill.md 4.6).
+  if (rows < 1 || hidden < 1 || dfl_cols < 0 || pos < 0) {
+    throw std::invalid_argument("pp::MakeSlotLayout: rows " + std::to_string(rows) + ", hidden " + std::to_string(hidden) +
+                                ", dfl_cols " + std::to_string(dfl_cols) + ", pos " + std::to_string(pos) +
+                                " (rows and hidden must be >= 1, the others >= 0)");
+  }
   SlotLayout l;
   l.carry_bytes = static_cast<size_t>(rows * hidden) * 2;
   size_t off = 0;

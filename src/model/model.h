@@ -980,6 +980,8 @@ class Model {
   // wait for the slot, import it, layers [split, N), epilogue, release the slot.
   std::vector<float> RunChunkPpStageA(ChunkRun& r);
   std::vector<float> RunChunkPpStageB(ChunkRun& r);
+  // The carry's row width (the configuration's hidden_size; never ChunkRun::hidden, which is 0 before the prologue).
+  int64_t PpCarryHidden() const;
   // R4DX_PP_TRACE=1 (pp_stage_real.cpp; diagnostic, off by default): one stderr line per chunk and boundary point with a
   // 64-bit hash of each carry buffer (`cur`, buf_normed_, buf_normed_pre_ over T x hidden x 2 bytes) and of the chunk's
   // token ids -- "A-dev" (stage A's device buffers after layers [0, k)), "A-slot" / "B-slot" (the slot's host bytes as A

@@ -143,6 +143,28 @@ pp::GdnWire WireOf(const GdnStateManager& g) {
   return pp::MakeGdnWire(g.NumHeads(), g.ValueDim(), g.KeyDim(), g.ConvDim(), g.ConvHistory() + 1);
 }
 
+// Moves the live conv history ([conv_dim][conv_width - 1] bf16, the compact wire form) between the host and the live line
+// ([conv_dim][StateLenMax()], history at offset 0). A line whose pitch is exactly the history length (stage A, and any
+// Model that does not speculate: state_len_max = conv_width - 2 + max_decode_window = conv_width - 1) IS the wire form: one
+// contiguous copy. A speculating Model's longer lines need the 2D copy (row pitch StateLenMax(), 2 x 3 bytes per row).
+void CopyConvHistory(GdnStateManager& g, uint8_t* host, bool to_host, hipStream_t s) {
+  const size_t hist = static_cast<size_t>(g.ConvHistory()) * sizeof(uint16_t);
+  const size_t rows = static_cast<size_t>(g.ConvDim());
+  const size_t pitch = static_cast<size_t>(g.StateLenMax()) * sizeof(uint16_t);
+  uint16_t* line = g.ConvLinePtr(0);
+  if (pitch == hist) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(to_host ? static_cast<void*>(host) : static_cast<void*>(line),
+                                   to_host ? static_cast<const void*>(line) : static_cast<const void*>(host), hist * rows,
+                                   to_host ? hipMemcpyDeviceToHost : hipMemcpyHostToDevice, s));
+  } else if (to_host) {
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(host, hist, line, pitch, hist, rows, hipMemcpyDeviceToHost, s));
+  } else {
+    // The history lands at offset 0 of the live line (where a prefill / the first step of a fresh seed reads it); the
+    // line's other entries (this stage's longer window) are not part of the live state and keep what they hold.
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(line, pitch, host, hist, hist, rows, hipMemcpyHostToDevice, s));
+  }
+}
+
 }  // namespace
 
 // ---- the GDN live state -----------------------------------------------------------------------------------------------
@@ -163,12 +185,9 @@ void Model::PpExportGdn(uint8_t* host, int64_t split) {
     if (!gdn_states_[static_cast<size_t>(i)]) continue;
     GdnStateManager& g = *gdn_states_[static_cast<size_t>(i)];
     const pp::GdnWire w = WireOf(g);
-    const size_t hist = static_cast<size_t>(g.ConvHistory()) * sizeof(uint16_t);
     R4DX_HIP_CHECK(hipMemcpyAsync(host + off, g.RecurrentSlotPtr(g.SlotForSeq(0)), w.recurrent_bytes,
                                    hipMemcpyDeviceToHost, s));
-    R4DX_HIP_CHECK(hipMemcpy2DAsync(host + off + w.recurrent_bytes, hist, g.ConvLinePtr(0),
-                                     static_cast<size_t>(g.StateLenMax()) * sizeof(uint16_t), hist,
-                                     static_cast<size_t>(g.ConvDim()), hipMemcpyDeviceToHost, s));
+    CopyConvHistory(g, host + off + w.recurrent_bytes, /*to_host=*/true, s);
     off += w.PerLayer();
   }
   stream_.Synchronize();
@@ -184,14 +203,10 @@ void EnqueueGdnImport(std::vector<std::optional<GdnStateManager>>& states, const
     if (!states[static_cast<size_t>(i)]) continue;
     GdnStateManager& g = *states[static_cast<size_t>(i)];
     const pp::GdnWire w = WireOf(g);
-    const size_t hist = static_cast<size_t>(g.ConvHistory()) * sizeof(uint16_t);
     R4DX_HIP_CHECK(hipMemcpyAsync(g.RecurrentSlotPtr(g.SlotForSeq(0)), host + off, w.recurrent_bytes,
                                    hipMemcpyHostToDevice, s));
-    // The history lands at offset 0 of the live line (where a prefill / the first decode of a fresh seed reads it);
-    // the line's other entries (this stage's longer window) are not part of the live state and keep what they hold.
-    R4DX_HIP_CHECK(hipMemcpy2DAsync(g.ConvLinePtr(0), static_cast<size_t>(g.StateLenMax()) * sizeof(uint16_t),
-                                     host + off + w.recurrent_bytes, hist, hist, static_cast<size_t>(g.ConvDim()),
-                                     hipMemcpyHostToDevice, s));
+    // (const_cast: the helper takes one signature for both directions; the import only reads `host`.)
+    CopyConvHistory(g, const_cast<uint8_t*>(host) + off + w.recurrent_bytes, /*to_host=*/false, s);
     off += w.PerLayer();
   }
 }
@@ -270,12 +285,10 @@ std::vector<std::pair<std::string, uint64_t>> Model::PpLiveDigest(int64_t split)
       GdnStateManager& g = *gdn_states_[idx];
       const pp::GdnWire w = WireOf(g);
       std::vector<uint8_t> host(w.recurrent_bytes + w.conv_bytes);
-      const size_t hist = static_cast<size_t>(g.ConvHistory()) * sizeof(uint16_t);
       R4DX_HIP_CHECK(hipMemcpy(host.data(), g.RecurrentSlotPtr(g.SlotForSeq(0)), w.recurrent_bytes,
                                 hipMemcpyDeviceToHost));
-      R4DX_HIP_CHECK(hipMemcpy2D(host.data() + w.recurrent_bytes, hist, g.ConvLinePtr(0),
-                                  static_cast<size_t>(g.StateLenMax()) * sizeof(uint16_t), hist,
-                                  static_cast<size_t>(g.ConvDim()), hipMemcpyDeviceToHost));
+      CopyConvHistory(g, host.data() + w.recurrent_bytes, /*to_host=*/true, stream_.get());
+      stream_.Synchronize();
       out.emplace_back("gdn." + std::to_string(i), FnvUpdate(kFnvInit, host.data(), host.size()));
     } else if (!cfg.IsGdnLayer(i) && kv_caches_[idx]) {
       attention::PagedKvCache& kv = *kv_caches_[idx];

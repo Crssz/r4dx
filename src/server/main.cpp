@@ -121,6 +121,13 @@ int main(int argc, char** argv) {
     if (args.tp_submit_layers >= 0) opts.tp.submit_layers = args.tp_submit_layers;  // -1: TpOptions' default
     if (args.tp_max_inflight >= 0) opts.tp.max_inflight_units = args.tp_max_inflight;
   }
+  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): ModelOptions::pp (-1 follows R4DX_PP) and PpOptions' knobs.
+  opts.model_opts.pp = args.pp == 2 ? 2 : (args.pp == 1 ? 0 : -1);
+  opts.pp.split = args.pp_split;
+  if (args.pp_min_rows > 0) opts.pp.min_rows = args.pp_min_rows;
+  opts.pp.verify = args.pp_verify;
+  if (args.pp_submit_layers >= 0) opts.pp.submit_layers = args.pp_submit_layers;
+  if (args.pp_max_inflight >= 0) opts.pp.max_inflight = args.pp_max_inflight;
 
   r4dx::server::Engine engine(std::move(opts));
   try {

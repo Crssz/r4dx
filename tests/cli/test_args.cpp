@@ -517,6 +517,40 @@ void TestTpFlags() {
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1"}));
+  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 and its knobs; exclusive with --tp 2.
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.pp == -1 && a.pp_split == 0 && a.pp_min_rows == -1 && !a.pp_verify && a.pp_submit_layers == -1 &&
+          a.pp_max_inflight == -1 && !a.pp_options_given);  // off / R4DX_PP unless asked for
+    std::vector<std::string> storage2 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi",
+                                          "--pp", "2", "--pp-split", "35", "--pp-min-rows", "512", "--pp-verify",
+                                          "--pp-submit-layers", "0", "--pp-max-inflight", "2"};
+    auto argv2 = ToArgv(storage2);
+    const auto b = r4dx::cli::ParseArgs(static_cast<int>(argv2.size()), argv2.data());
+    CHECK(b.pp == 2 && b.pp_split == 35 && b.pp_min_rows == 512 && b.pp_verify && b.pp_submit_layers == 0 &&
+          b.pp_max_inflight == 2 && b.pp_options_given);
+    std::vector<std::string> storage3 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi",
+                                          "--pp", "2", "--pp-split", "auto"};
+    auto argv3 = ToArgv(storage3);
+    CHECK(r4dx::cli::ParseArgs(static_cast<int>(argv3.size()), argv3.data()).pp_split == 0);
+  }
+  CHECK(!TpThrows({"--pp", "2"}));
+  CHECK(!TpThrows({"--pp", "1"}));
+  CHECK(!TpThrows({"--pp", "2", "--dflash", "d.r4dx", "--dflash-k", "7", "--mtp", "0"}));
+  CHECK(!TpThrows({"--pp", "2", "--vision", "on", "--image", "a.png"}));
+  CHECK(TpThrows({"--pp", "3"}));
+  CHECK(TpThrows({"--pp", "0"}));
+  CHECK(TpThrows({"--pp-split", "33"}));                // knobs need --pp 2
+  CHECK(TpThrows({"--pp", "1", "--pp-verify"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2"}));          // exclusive with tensor parallelism
+  CHECK(TpThrows({"--pp", "2", "--pp-split", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-split", "x"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-min-rows", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-submit-layers", "-1"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-submit-layers", "65"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-max-inflight", "65"}));
 }
 
 // --prompt-file (tools/prefill): loads the file verbatim into `prompt`; exclusive with --prompt and

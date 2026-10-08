@@ -119,6 +119,8 @@ class PpModel final : public TextModel {
     int64_t early_gdn_imports = 0; // calls whose GDN import overlapped the last chunk (the rest imported after it)
     int64_t chunks = 0;            // chunks stage B took from the channel
     double last_total_ms = 0, last_sync_ms = 0, last_tail_ms = 0;  // the latest pipelined call
+    double last_gdn_export_ms = 0;  // ... stage A's GDN export (D2H of the live state, after its last chunk)
+    double last_gdn_wait_ms = 0;    // ... stage B's wait for the GDN state after its last chunk (0 when it overlapped)
     double stage_a_wait_ms = 0;    // stage A blocked on a full ring since load (back-pressure: B is the slower stage)
     double stage_b_wait_ms = 0;    // stage B blocked on an empty ring (starvation: the fill, or A is the slower stage)
   };
@@ -148,6 +150,7 @@ class PpModel final : public TextModel {
     std::vector<std::pair<std::string, uint64_t>> b_digest_sync;    // B's live state at the call's start (verify)
     std::vector<std::pair<std::string, uint64_t>> a_digest_end;     // A's live state at the call's end (verify)
     double a_sync_ms = 0;
+    double a_gdn_export_ms = 0;
   };
 
   void RequireReady() const;

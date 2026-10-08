@@ -155,7 +155,7 @@ void Engine::LoadAndStart() {
   // docs/tp.md 2.8: --tp 1 is a LocalTextModel (Model::Load, exactly the pre-TP call); --tp 2 a
   // TpModel.
   model_ = opts_.model_loader ? opts_.model_loader(opts_.model_opts, opts_.tp)
-                              : r4dx::model::LoadTextModel(opts_.model_opts, opts_.tp);
+                              : r4dx::model::LoadTextModel(opts_.model_opts, opts_.tp, opts_.pp);
   model_id_ = model_->ModelId();
   {
     const std::string err =

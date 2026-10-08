@@ -47,6 +47,8 @@ struct EngineOptions {
   // The --tp* flags (docs/tp.md 9.1), filled by main.cpp exactly as r4dx-cli fills its own:
   // world 1 (the default) is the single-device server; world 2 loads a TpModel.
   r4dx::model::TpOptions tp;
+  // The --pp* knobs (docs/pp-prefill.md Phase 2); whether the pipeline is on is model_opts.pp (-1 = R4DX_PP, off by default).
+  r4dx::model::PpOptions pp;
   // How LoadAndStart builds the model. Empty (always, in r4dx-server) = r4dx::model::LoadTextModel.
   // tests/server/test_engine_recovery.cpp substitutes a CPU fake to drive RunRequest's error path.
   std::function<std::unique_ptr<r4dx::model::TextModel>(const r4dx::model::ModelOptions&,

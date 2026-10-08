@@ -495,7 +495,9 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
       }
       // The GDN live state of A's layers follows the last chunk (compactly); B imports it while it computes its own last
       // chunk when it is ready in time (OnLastChunk), else right after.
+      const auto t_exp = Clock::now();
       a.PpExportGdn(self->gdn_hand_.data(), split);
+      st->a_gdn_export_ms = Ms(t_exp, Clock::now());
       ch->PublishBulk(st->call_id);
       if (st->verify) st->a_digest_end = a.PpLiveDigest(split);
     } catch (const std::exception& e) {
@@ -521,17 +523,20 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   };
   std::vector<float> logits;
   std::exception_ptr berr;
+  double gdn_wait_ms = 0;
   const auto t_b0 = Clock::now();
   try {
     {
       ActiveGuard active(b);
       logits = images != nullptr ? b.PrefillMultimodal(ids, *images) : b.Prefill(ids);
     }
+    const auto t_gdn0 = Clock::now();
     if (!early_import_) {
       channel_->WaitBulk(st->call_id, std::chrono::milliseconds(pp_.timeout_ms));
       b.PpImportGdnAsync(gdn_hand_.data(), split_);
     }
     b.PpImportFence();
+    gdn_wait_ms = Ms(t_gdn0, Clock::now());
   } catch (...) {
     berr = std::current_exception();
     std::fprintf(stderr, "[r4dx-pp] stage B failed: %s\n", WhatOf(berr).c_str());
@@ -564,6 +569,8 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   stats_.last_sync_ms = sync_ms + st->a_sync_ms;
   stats_.last_tail_ms = Ms(t_tail0, Clock::now());
   stats_.last_total_ms = Ms(t_call0, Clock::now());
+  stats_.last_gdn_export_ms = st->a_gdn_export_ms;
+  stats_.last_gdn_wait_ms = gdn_wait_ms;
   (void)t_b0;
   return logits;
 }
@@ -652,11 +659,11 @@ std::string PpModel::StatsLine() const {
   std::snprintf(buf, sizeof(buf),
                 "pp: split k=%lld, %lld pipelined / %lld decode-only prefill calls, %lld chunks through the ring, sync-backs: %lld "
                 "GDN + %lld KV rows, GDN import overlapped the last chunk in %lld calls; stage A blocked %.0f ms on a full "
-                "ring, stage B %.0f ms on an empty one; last call %.1f ms (sync %.1f ms, tail %.1f ms)",
+                "ring, stage B %.0f ms on an empty one; last call %.1f ms (sync %.1f ms, tail %.1f ms, GDN export %.1f ms, B waited %.1f ms for it)",
                 static_cast<long long>(split_), static_cast<long long>(s.pipelined_calls), static_cast<long long>(s.b_only_calls),
                 static_cast<long long>(s.chunks), static_cast<long long>(s.sync_gdn), static_cast<long long>(s.sync_kv_rows),
                 static_cast<long long>(s.early_gdn_imports), s.stage_a_wait_ms, s.stage_b_wait_ms, s.last_total_ms,
-                s.last_sync_ms, s.last_tail_ms);
+                s.last_sync_ms, s.last_tail_ms, s.last_gdn_export_ms, s.last_gdn_wait_ms);
   return buf;
 }
 

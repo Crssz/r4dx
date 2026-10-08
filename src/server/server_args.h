@@ -155,6 +155,17 @@ struct ServerArgs {
   int tp_submit_layers = -1;
   int tp_max_inflight = -1;
   bool tp_options_given = false;  // any --tp-* flag other than --tp itself (refused at --tp 1)
+
+  // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2): src/cli/cli_args.h's --pp* ---------------------
+  // --pp 2 (or R4DX_PP=1 when --pp is not given: -1) runs prompt prefill as a two-stage pipeline across both GPUs
+  // (HIP_VISIBLE_DEVICES=1,0), decode unchanged on the headless card; exclusive with --tp 2. 1 forces it off.
+  int pp = -1;
+  int pp_split = 0;           // auto: 33, 35 with --dflash
+  int pp_min_rows = -1;       // default 1024
+  bool pp_verify = false;
+  int pp_submit_layers = -1;  // default 32
+  int pp_max_inflight = -1;   // default 1
+  bool pp_options_given = false;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -179,7 +190,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--image-max-pixels N] [--image-soft-tokens {70|140|280}] [--request-log <path>] "
          "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
-         "[--tp-max-inflight K]";
+         "[--tp-max-inflight K] [--pp {1|2}] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
+         "[--pp-submit-layers N] [--pp-max-inflight K]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -241,6 +253,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   ServerArgs a;
   bool tp_rank_given = false;
   bool tp_submit_given = false, tp_inflight_given = false;
+  bool pp_split_given = false, pp_min_rows_given = false, pp_submit_given = false, pp_inflight_given = false;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--model") a.model_path = NextServerArg(argc, argv, i, "--model");
@@ -287,6 +300,17 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--tp-ar-nb-large") { a.tp_ar_nb_large = ServerParseInt("--tp-ar-nb-large", NextServerArg(argc, argv, i, "--tp-ar-nb-large")); a.tp_options_given = true; }
     else if (arg == "--tp-submit-layers") { a.tp_submit_layers = ServerParseInt("--tp-submit-layers", NextServerArg(argc, argv, i, "--tp-submit-layers")); a.tp_options_given = true; tp_submit_given = true; }
     else if (arg == "--tp-max-inflight") { a.tp_max_inflight = ServerParseInt("--tp-max-inflight", NextServerArg(argc, argv, i, "--tp-max-inflight")); a.tp_options_given = true; tp_inflight_given = true; }
+    else if (arg == "--pp") a.pp = ServerParseInt("--pp", NextServerArg(argc, argv, i, "--pp"));
+    else if (arg == "--pp-split") {
+      const std::string v = NextServerArg(argc, argv, i, "--pp-split");
+      a.pp_split = v == "auto" ? 0 : ServerParseInt("--pp-split", v);
+      a.pp_options_given = true;
+      pp_split_given = v != "auto";
+    }
+    else if (arg == "--pp-min-rows") { a.pp_min_rows = ServerParseInt("--pp-min-rows", NextServerArg(argc, argv, i, "--pp-min-rows")); a.pp_options_given = true; pp_min_rows_given = true; }
+    else if (arg == "--pp-verify") { a.pp_verify = true; a.pp_options_given = true; }
+    else if (arg == "--pp-submit-layers") { a.pp_submit_layers = ServerParseInt("--pp-submit-layers", NextServerArg(argc, argv, i, "--pp-submit-layers")); a.pp_options_given = true; pp_submit_given = true; }
+    else if (arg == "--pp-max-inflight") { a.pp_max_inflight = ServerParseInt("--pp-max-inflight", NextServerArg(argc, argv, i, "--pp-max-inflight")); a.pp_options_given = true; pp_inflight_given = true; }
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -369,6 +393,20 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
       throw ServerUsageError("--mtp must be in [0, " + std::to_string(kMaxMtpDraftKTp) +
                               "] with --tp 2 (a verify window is not split into device-0 submission units, "
                               "so it stays at most 8 rows; docs/tp.md Appendix B N80)");
+    }
+  }
+  // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2) -------------------------------------
+  if (a.pp != -1 && a.pp != 1 && a.pp != 2) throw ServerUsageError("--pp must be 1 or 2");
+  if (a.pp != 2 && a.pp_options_given) {
+    throw ServerUsageError("--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
+  }
+  if (a.pp == 2) {
+    if (a.tp != 1) throw ServerUsageError("--pp 2 and --tp 2 are mutually exclusive");
+    if (pp_split_given && a.pp_split < 1) throw ServerUsageError("--pp-split must be 'auto' or >= 1");
+    if (pp_min_rows_given && a.pp_min_rows < 1) throw ServerUsageError("--pp-min-rows must be >= 1");
+    if ((pp_submit_given && (a.pp_submit_layers < 0 || a.pp_submit_layers > 64)) ||
+        (pp_inflight_given && (a.pp_max_inflight < 0 || a.pp_max_inflight > 64))) {
+      throw ServerUsageError("--pp-submit-layers and --pp-max-inflight must be in [0, 64]");
     }
   }
   return a;

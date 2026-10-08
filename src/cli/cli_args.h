@@ -242,8 +242,8 @@ struct CliArgs {
   // --pp-devices B,A: process-visible HIP ordinals of stage B (the decode card) and stage A; empty = auto (R4DX_PP_DEVICES,
   // else B = the last visible ordinal = physical device 1 with HIP_VISIBLE_DEVICES unset, A = the one before it).
   std::vector<int> pp_devices;
-  int pp_split = 0;             // --pp-split N|auto: stage A's layer count k (auto = 33, 35 with --dflash)
-  int pp_min_rows = -1;         // --pp-min-rows N: prefill calls shorter than this run on the decode card alone (default 1024)
+  int pp_split = 0;             // --pp-split N|auto: stage A's layer count k (auto = 32, 35 with --dflash)
+  int pp_min_rows = -1;         // --pp-min-rows N: prefill calls shorter than this run on the decode card alone (default 512)
   bool pp_verify = false;       // --pp-verify: digest both stages' live state after every hand-off (slow; also R4DX_PP_VERIFY=1)
   int pp_submit_layers = -1;    // --pp-submit-layers N: stage A's bounded GPU submission, [0, 64] (default 32)
   int pp_max_inflight = -1;     // --pp-max-inflight K, [0, 64] (default 1)

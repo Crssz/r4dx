@@ -80,9 +80,9 @@ struct PpOptions {
   // ordinal, A on the one before it (with HIP_VISIBLE_DEVICES unset: B = ordinal 1 = physical device 1 = the headless card
   // TP=1 runs on, A = ordinal 0 = the desktop card). HIP_VISIBLE_DEVICES need not be set; it must expose both cards.
   std::vector<int> devices;
-  int split = 0;           // k: 0 = auto (33, or 35 with a DFlash drafter; both keep 8 attention layers per stage)
+  int split = 0;           // k: 0 = auto (32, or 35 with a DFlash drafter; both keep 8 attention layers per stage)
   int reserve_split = 0;   // stage A is loaded for splits up to this (0 = split); tests move k with PpModel::SetSplit
-  int min_rows = 1024;     // a Prefill call with fewer rows runs on the decode Model alone (the fill and the sync-back would not pay)
+  int min_rows = 512;      // a Prefill call with fewer rows runs on the decode Model alone (the fill and the sync-back would not pay)
   bool verify = false;     // digest the live state of both stages after every hand-off and compare (R4DX_PP_VERIFY=1 also turns it on)
   int submit_layers = 32;  // stage A's bounded GPU submission (docs/tp.md Appendix B N57): 0 = off, [0, 64]
   int max_inflight = 1;    // ... and the number of units it keeps queued, [0, 64]

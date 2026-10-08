@@ -80,10 +80,11 @@ inline int ParsePpEnable(const char* e) {
   return -1;
 }
 
-// The default split layer k (docs/pp-prefill.md 5): 33 without a drafter, 35 with one (it moves the DFlash injection's
+// The default split layer k (docs/pp-prefill.md 5): 32 without a drafter (2026-10-08: 8k 1.657 s vs 1.702 s at k = 33, 32k
+// 7.236 vs 7.392 s; stage B idles 0.6-1.5 ms per chunk vs 4.2-4.9 ms), 35 with one (it moves the DFlash injection's
 // cost off stage B); both keep 8 attention layers per stage. Clamped into [1, layers - 1] for a shorter container.
 inline int64_t DefaultSplit(bool dflash, int64_t num_layers) {
-  const int64_t k = dflash ? 35 : 33;
+  const int64_t k = dflash ? 35 : 32;
   return std::max<int64_t>(1, std::min<int64_t>(k, num_layers - 1));
 }
 

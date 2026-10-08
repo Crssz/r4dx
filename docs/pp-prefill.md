@@ -20,8 +20,12 @@ Status (2026-10-08, branch `pp`, from `main` 4e710ab):
   * failure: a hard kill of `r4dx-cli --pp 2` at 25 % and 65 % of a 32k prefill leaves no orphan and no TDR, and the next `--pp 2` run
     reproduces the baseline's bytes;
   * soak (G2c, `tools/pp/soak.ps1`): 5 minutes (17 iterations, 9 compared) and 60 minutes (199 iterations, 100
-    compared, all equal; mean prefill speedup 1.60x including the warm turns, best 1.68x; buffer drift < 0.001 MiB, VRAM drift 6 MiB; no
-    TDR; summary and teardown `exit_code` 0).
+    compared, all equal; buffer drift < 0.001 MiB, VRAM drift 6 MiB; no TDR; summary and teardown `exit_code` 0). The soak's
+    "mean prefill speedup 1.60x, best 1.68x" is NOT a production figure: the soak ran with `--verify`, whose `PpLiveDigest`
+    copies and hashes each stage's whole live state (about 0.45 s at sync and 0.85 s at the tail of a 25k-row call), and
+    `pp_prefill_s` times only each iteration's cold first prefill. Without verify the warm-turn sync-back is about 6 ms (76.5 MiB
+    of GDN state, export 2.9 ms + import 2.8 ms) and the tail about 3 ms (scratchpad design_pp_warm.md, 2026-10-08).
+  * defaults since 2026-10-08: split k = 32 (35 with a drafter) and `--pp-min-rows` 512 (break-even about 400 rows).
 
   **Placement caveat of those runs.** They ran with `HIP_VISIBLE_DEVICES=1,0`, which on this ROCm (10.1, Windows) does NOT reorder
   the devices, so stage B (decode) sat on HIP device 0 = pci 03:00 (the desktop card) and stage A on device 1 = pci 07:00 -- the
@@ -256,8 +260,8 @@ facade / engine thread  (hipSetDevice(B) = physical device 1, the headless card)
 | switch | meaning | default |
 |---|---|---|
 | `--pp 2` (r4dx-cli, r4dx-server) / `ModelOptions::pp = 2` / `R4DX_PP=1` | run prompt prefill as the two-stage pipeline; `--pp 1` / `pp = 0` force it off | off (`pp = -1` follows `R4DX_PP`, unset = off) |
-| `--pp-split N` \| `auto` (`PpOptions::split`) | k = stage A's layer count | auto: 33, 35 with a drafter |
-| `--pp-min-rows N` | calls shorter than this run on the decode Model alone | 1024 |
+| `--pp-split N` \| `auto` (`PpOptions::split`) | k = stage A's layer count | auto: 32, 35 with a drafter |
+| `--pp-min-rows N` | calls shorter than this run on the decode Model alone | 512 |
 | `--pp-verify` / `R4DX_PP_VERIFY=1` | digest the live state of both stages after every sync-back and hand-off and compare (slow: copies the state to the host) | off |
 | `--pp-submit-layers N`, `--pp-max-inflight K` | stage A's bounded GPU submission: a forced submission every N layers (fewer past 16k / 64k / 128k of context), at most K units queued; `0` layers = off | 32, 1 (as TP) |
 | `--pp-devices B,A` (r4dx-cli, r4dx-server) / `R4DX_PP_DEVICES=B,A` / `PpOptions::devices` | the process-visible HIP **ordinals** of stage B (the decode card) and stage A, two different values inside the visible range; `auto` = the default. The flag wins over the variable | auto: B = the last visible ordinal, A = the one before it (with `HIP_VISIBLE_DEVICES` unset: B = ordinal 1 = physical device 1 = pci 07, the headless card every TP=1 run uses; A = ordinal 0 = pci 03, the desktop card) |

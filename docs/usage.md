@@ -19,7 +19,7 @@ The stages are placed by HIP ordinal, not by `HIP_VISIBLE_DEVICES` order (which 
 prefill half (stage A) on the other one. `--pp-devices B,A` (or `R4DX_PP_DEVICES=B,A`; the flag wins) overrides it with two different
 ordinals; the load log prints `stage B (decode) -> HIP device <n> (<name>, pci <bus>:<dev>); stage A -> ...` for both.
 
-Flags: `--pp 2` (`--pp 1` forces it off), `--pp-devices B,A|auto`, `--pp-split N|auto`, `--pp-min-rows N` (1024: shorter prefill calls run on the decode card
+Flags: `--pp 2` (`--pp 1` forces it off), `--pp-devices B,A|auto`, `--pp-split N|auto`, `--pp-min-rows N` (512: shorter prefill calls run on the decode card
 alone), `--pp-verify` (compare both cards' state after every hand-off; slow), `--pp-submit-layers` / `--pp-max-inflight` (32 / 1: the
 desktop card's bounded submission). `r4dx-server --pp 2` takes the same flags. Exclusive with `--tp 2`; not for Gemma 4 or quant2
 containers; the desktop card carries ~10-13 GiB more and a full-duty load for the length of every long prefill. **Detailed usage notes.** This page was the project README before it was rewritten as a short overview.

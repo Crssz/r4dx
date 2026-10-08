@@ -60,6 +60,13 @@ void Model::PpAttach(PpStageSetup setup) {
                                 std::to_string(container_.NumLoadedLayers()) + " loaded layers on each side");
   }
   stream_.Synchronize();
+  for (const auto& kv : kv_caches_) {  // the geometry the channel's slot layout assumes is the caches' own
+    if (!kv) continue;
+    if (kv->BlockSize() != PpKvBlockSize() || static_cast<size_t>(kv->KvBlockStride()) != PpKvBlockStrideBytes()) {
+      throw std::logic_error("Model::PpAttach: the KV cache geometry differs from the configuration's");
+    }
+    break;
+  }
   // The conv-history hand-off's device scratch (CopyConvHistory): one layer's [conv_dim][conv_width - 1] bf16.
   for (const auto& g : gdn_states_) {
     if (g) {

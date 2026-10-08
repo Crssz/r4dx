@@ -14,8 +14,11 @@
 //   G-H1  each pipelined call's logits equal the TP=1 reference's byte for byte and each rank's live-state digest equals ReshardRef(reference state, rank).
 //   G-H2  16 greedy tokens (plain, then --mtp 3 / --dflash 7 rounds) decoded at TP=2 by the hybrid-prefilled ranks equal those decoded by the same ranks
 //         after DebugImportFullState of the reference's end state (cold 2125 and 8145 rows). The speculative modes are lossless, so for --dflash 7 the
-//         import run (an empty drafter ring) must agree too; the drafter itself is checked by its frontier (injected == position on both ranks) and by
-//         both ranks' windows agreeing (DFlash tail), which the digest of the reference image cannot cover.
+//         import run (an empty drafter ring) must agree too; the drafter itself is checked by its frontier (injected == position on both ranks), by
+//         both ranks' windows agreeing, and -- because both drafters are fed from ONE assembled tail buffer, so equal windows cannot expose a wrong
+//         tail -- by that buffer's digest (TpModel::HybridTailDigest: stage X's carried columns + stage Y's) against the TP=1 run's
+//         StageArmDflashTail capture of the same call (the ref phase writes refs_tail.txt when the drafter exists). The injection itself
+//         (tail buffer -> drafter ring, TP-thread numerics) is test_dflash_tail parts a and c.
 //   Dispatch   a call below --pp-min-rows (300 rows) and a call over the stage-KV capacity S take the TP=2 prefill and are COUNTED as such; a warm pipelined
 //         call continues from the TP-prefilled state (G-H1 in the verify phase); decode works after both.
 //   Warm turns  call (1024 rows), decode 32 tokens at TP=2 (plain / --mtp 3 rounds), then a 1500-row hybrid call; the same after SaveCheckpoint, a decode
@@ -50,10 +53,13 @@
 #include <utility>
 #include <vector>
 
+#include "dflash_draft_weights.h"
+#include "dflash_tail_plan.h"
 #include "hybrid_dispatch.h"
 #include "live_digest.h"
 #include "live_state.h"
 #include "model.h"
+#include "r4dx/core/pinned_buffer.hpp"
 #include "reshard_plan.h"
 #include "test_common.h"
 #include "tp_model.h"
@@ -315,8 +321,34 @@ class RefRig {
     r.salt = hyb.salt;
     return r;
   }
+  // The DFlash tail of a fresh call as the TP=1 run captures it (Model::StageArmDflashTail, the capture stage Y runs): FNV-1a of the [tail rows][cols]
+  // bf16 block. The reference for the hybrid's assembled tail (stage X's carried columns + stage Y's), which the drafters are fed from. `targets`:
+  // the drafter's target layers. Run after the cold jobs (it attaches the feature capture to the reference Model).
+  uint64_t TailDigest(int rows, int salt, const std::vector<int64_t>& targets) {
+    if (!capture_attached_) {
+      m_->AttachDflashFeatureCapture(targets);
+      capture_attached_ = true;
+    }
+    const int64_t start = hybrid::DflashTailStart(0, rows), n_tail = rows - start, cols = m_->DflashFeatureCols();
+    r4dx::core::PinnedBuffer<uint16_t> buf(static_cast<size_t>(hybrid::kTailCapacityRows * cols), hipHostMallocPortable);
+    m_->Reset();
+    m_->DebugZeroKvState();
+    m_->StageArmDflashTail(buf.data(), hybrid::kTailCapacityRows, start, rows);
+    try {
+      (void)m_->Prefill(Tokens(rows, salt));
+    } catch (...) {
+      try {
+        (void)m_->StageDisarmDflashTail();
+      } catch (...) {
+      }
+      throw;
+    }
+    if (m_->StageDisarmDflashTail() != n_tail) throw std::runtime_error("the reference captured a different number of tail rows than the call's tail");
+    return hybrid::FnvUpdate(hybrid::kFnvInit, buf.data(), static_cast<size_t>(n_tail * cols) * sizeof(uint16_t));
+  }
 
  private:
+  bool capture_attached_ = false;
   Rec Finish(const std::string& id, const std::vector<float>& logits) {
     const hybrid::LiveState st = m_->DebugExportLiveState();
     Rec r;
@@ -344,7 +376,7 @@ constexpr int kColdSalt = 1;
 int RunRefPhase(const Opts& o) {
   Group grp("ref/cold");
   fs::create_directories(o.dir);
-  std::vector<Rec> recs;
+  std::vector<Rec> recs, tails;
   {
     RefRig ref(o);
     for (const ColdJob& j : kColdJobs) {
@@ -353,8 +385,23 @@ int RunRefPhase(const Opts& o) {
       std::fprintf(stderr, "[hybrid-real] reference %s: %d rows, logits %s\n", j.id, j.rows, Hex(r.logits).c_str());
       recs.push_back(std::move(r));
     }
+    // the DFlash tail features the drafters are fed from (only where the --dflash load will run): the reference for DflashTail's assembled-tail check
+    if (FileExists(ProductionDrafterPath())) {
+      const std::vector<int64_t> targets = r4dx::model::DflashDraftWeights::Open(ProductionDrafterPath()).Config().target_layers;
+      for (const ColdJob& j : kColdJobs) {
+        if (j.rows < 2048) continue;  // the dflash load runs the two long cold calls only
+        Rec t;
+        t.id = std::string("tail_") + j.id;
+        t.rows = j.rows;
+        t.salt = kColdSalt;
+        t.logits = ref.TailDigest(j.rows, kColdSalt, targets);
+        std::fprintf(stderr, "[hybrid-real] reference DFlash tail %s: %d rows, features %s\n", j.id, j.rows, Hex(t.logits).c_str());
+        tails.push_back(std::move(t));
+      }
+    }
   }  // the reference Model is freed here
   SaveRecs(o.Path("refs_cold.txt"), recs);
+  SaveRecs(o.Path("refs_tail.txt"), tails);
   grp.Done("reference records and state files in " + o.dir);
   return 0;
 }
@@ -374,6 +421,7 @@ class HybridRig {
   std::unique_ptr<TpModel> tpm;
   std::vector<Rec> recs;
   std::map<std::string, Rec> cold_refs;
+  std::map<std::string, Rec> tail_refs;  // the TP=1 run's DFlash tail features (digest in .logits), by cold job id
 
   HybridRig(HCfg c, Opts opts) : cfg(std::move(c)), o(std::move(opts)) {
     ModelOptions mo = BaseOptions(o, cfg.dflash ? 0 : kMtpK, cfg.dflash);
@@ -601,6 +649,17 @@ class HybridRig {
         const std::string why = DflashProblem();
         grp.Ok(why.empty(), std::string(id) + ": the DFlash tail left both drafters at the call's end with the same window: " + why);
         grp.Ok(tpm->GetHybridStats().tail_rows > 0, std::string(id) + ": the tail rows were counted");
+        // The drafters are both fed from the one assembled tail buffer, so equal windows cannot tell a wrong tail from a right one: the buffer itself
+        // (stage X's carried columns + stage Y's, in the drafter's column order) must equal what the TP=1 run captures for the same call.
+        const auto tr = tail_refs.find(id);
+        grp.Ok(tr != tail_refs.end(), std::string(id) + ": a TP=1 DFlash tail reference exists (run the ref phase with the drafter present)");
+        if (tr != tail_refs.end()) {
+          const int64_t n_tail = rows - hybrid::DflashTailStart(0, rows);
+          const uint64_t got = tpm->HybridTailDigest(n_tail);
+          grp.Ok(got == tr->second.logits, std::string(id) + ": the hybrid's assembled DFlash tail (" + std::to_string(n_tail) + " rows) equals the TP=1 run's capture, got " +
+                                               Hex(got) + " want " + Hex(tr->second.logits));
+          grp.Ok(tpm->HybridTailDigest(n_tail - 1) != tr->second.logits, std::string(id) + ": control -- the digest of a tail one row short does not match the reference");
+        }
       }
       if (gh2 && it != cold_refs.end()) CheckDecode(grp, it->second, o.Path(std::string("ref_") + id + ".state"));
       (void)r;
@@ -748,6 +807,9 @@ int RunHybridConfig(const Opts& o, const HCfg& cfg) {
   }
   ++g_configs;
   for (const Rec& r : refs) rig->cold_refs[r.id] = r;
+  if (cfg.dflash && FileExists(o.Path("refs_tail.txt"))) {
+    for (const Rec& r : LoadRecs(o.Path("refs_tail.txt"))) rig->tail_refs[r.id.rfind("tail_", 0) == 0 ? r.id.substr(5) : r.id] = r;
+  }
   if (!cfg.dflash) {
     rig->Cold("c1024", 1024, false);
     rig->Cold("c2125", 2125, true);

@@ -28,6 +28,7 @@
 
 #include "dflash_tail_plan.h"
 #include "linear.h"
+#include "live_digest.h"
 #include "pp_model.h"
 #include "pp_plan.h"
 #include "r4dx/core/error.hpp"
@@ -116,6 +117,19 @@ bool ResolveHybridRequest(const ModelOptions& opts, const TpOptions& tp, const P
     throw std::invalid_argument(std::string("TpModel::Load: the hybrid mode runs the decode stage on TP rank 0's card and the front stage on rank 1's; ") +
                                 src + " must equal --tp-devices (rank 0, rank 1) = " +
                                 (devices.size() == 2 ? std::to_string(devices[0]) + "," + std::to_string(devices[1]) : std::string("?")));
+  }
+  // The roles follow the TP ranks, not the cards: an explicit --tp-devices that is not the auto pair (rank 0 = the last visible ordinal, the
+  // headless card; rank 1 = the one before it, the desktop card) puts the heavy back stage Y on rank 0's card whatever it is, and the bounded
+  // submission and the larger VRAM reserve on rank 1's. Legal (a swapped pair is a valid experiment), but said out loud.
+  if (requested.empty() && devices.size() == 2) {
+    int visible = 0;
+    if (hipGetDeviceCount(&visible) == hipSuccess && visible >= 2 && (devices[0] != visible - 1 || devices[1] != visible - 2)) {
+      std::fprintf(stderr,
+                   "[r4dx-hybrid] WARNING: --tp-devices %d,%d is not the auto placement %d,%d: stage Y (decode, the full lm_head, MTP; unbounded submission, "
+                   "the 1.5 GiB reserve) runs on HIP device %d and stage X (bounded submission, the 3.0 GiB reserve) on %d; the defaults assume Y on the "
+                   "headless card and X on the desktop card, which cannot preempt compute\n",
+                   devices[0], devices[1], visible - 1, visible - 2, devices[0], devices[1]);
+    }
   }
   return true;
 }
@@ -584,7 +598,13 @@ std::vector<float> TpModel::HybridPrefillRun(const std::vector<int32_t>& ids, co
   TpModel* const self = this;
   RunGuarded(AllSlots(), [self, c](RankSlot& s) { self->HybridMain(s, *c); }, CmdKind::kPlain);
 
-  // ---- bookkeeping: both shards and both stages agree through the call's end
+  // ---- bookkeeping: both shards and both stages agree through the call's end (the TP path's RequireAllEqual, for the facts the cache takes from
+  // rank 0 alone: both ranks adopted the same end state, so they must be at p0 + n with the same sampled-fallback count)
+  if (c->pos_after[0] != c->pos_after[1] || c->fallback_after[0] != c->fallback_after[1] || c->pos_after[hybrid::kStageB] != p0 + n) {
+    Diverged("hybrid: the ranks ended the pipelined call at positions " + std::to_string(c->pos_after[hybrid::kStageA]) + " / " +
+             std::to_string(c->pos_after[hybrid::kStageB]) + " (expected " + std::to_string(p0 + n) + "), sampled-fallback rows " +
+             std::to_string(c->fallback_after[hybrid::kStageA]) + " / " + std::to_string(c->fallback_after[hybrid::kStageB]));
+  }
   h.tracker->AfterPipelined(p0 + n);
   cached_position_ = c->pos_after[hybrid::kStageB];
   cached_fallback_rows_ = c->fallback_after[hybrid::kStageB];
@@ -724,6 +744,9 @@ void TpModel::HybridExec(RankSlot& s, Model& stage, Model& rank, HyCall& c, bool
   const int sidx = s.rank == 1 ? hybrid::kStageA : hybrid::kStageB;
   const int peer = 1 - sidx;
   const hybrid::ReshardPlan& plan = scatter ? c.scatter : c.gather;
+  if (c.pipe[0].Slots() != hybrid::kHybridRingSlots || c.pipe[1].Slots() != hybrid::kHybridRingSlots) {
+    throw std::logic_error("TpModel::HybridExec: the ring pipes' depth differs from the physical ring's (kHybridRingSlots)");
+  }
   const std::vector<hybrid::RingBatch>* const batches = scatter ? c.scatter_batches : c.gather_batches;
   RankSlot& peer_slot = *ranks_[static_cast<size_t>(h.slot_of_stage[peer])];
   uint8_t* const ring_out = s.hy_ring.data();
@@ -784,6 +807,14 @@ int64_t TpModel::HybridMinRows() const { return hy_ ? hy_->min_rows : 0; }
 void TpModel::SetHybridMinRows(int64_t min_rows) {
   if (min_rows < 1) throw std::invalid_argument("TpModel::SetHybridMinRows: min_rows must be >= 1");
   if (hy_) hy_->min_rows = min_rows;
+}
+uint64_t TpModel::HybridTailDigest(int64_t rows) {
+  RequireReady();
+  if (!hy_ || !hy_->dflash) throw std::logic_error("TpModel::HybridTailDigest: the hybrid is not engaged with a drafter");
+  if (rows < 1 || rows > hybrid::kTailCapacityRows) throw std::invalid_argument("TpModel::HybridTailDigest: rows must be in [1, the tail capacity]");
+  const RankSlot& y = *ranks_[static_cast<size_t>(hy_->slot_of_stage[hybrid::kStageB])];
+  const uint64_t cols = static_cast<uint64_t>(hy_->targets.size()) * static_cast<uint64_t>(hy_->hidden);
+  return hybrid::FnvUpdate(hybrid::kFnvInit, y.hy_tail.data(), static_cast<size_t>(static_cast<uint64_t>(rows) * cols * sizeof(uint16_t)));
 }
 void TpModel::ArmHybridFault(int rank, HybridFaultPhase phase) {
   RequireReady();

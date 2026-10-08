@@ -169,6 +169,10 @@ class TpModel final : public TextModel, public TpDiagnostics {
   int64_t HybridMinRows() const;
   // Tests and sweeps: the pipelining threshold (>= 1 pipelines every call; the dispatch rule's other fallbacks still apply).
   void SetHybridMinRows(int64_t min_rows);
+  // Test-only (tests/model/test_hybrid_real_identity.cpp): the FNV-1a (hybrid::FnvUpdate) of the first `rows` rows ([rows][cols] bf16, cols = the
+  // drafter's target layers x hidden) of the DFlash tail buffer the latest pipelined call filled -- stage X's carried columns and stage Y's
+  // captured ones, assembled -- to compare with a TP=1 run's StageArmDflashTail capture of the same call. Needs a drafter; legal in kReady.
+  uint64_t HybridTailDigest(int64_t rows);
   // Test-only (recovery tests): the NEXT pipelined prefill throws std::runtime_error("injected hybrid fault") on TP rank `rank`'s thread when it
   // reaches `phase` (one-shot, disarmed when that call returns or throws). The other card's thread must be freed at once, the root cause reported
   // with its type, the group be kNeedsRecovery, and Reset() heal it. Legal in kReady with the hybrid engaged.

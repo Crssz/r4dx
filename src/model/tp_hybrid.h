@@ -77,8 +77,9 @@ struct TpModel::HyCall {
   pp::StageChannel* channel = nullptr;
   std::chrono::milliseconds timeout{30000};
   // ---- shared sync. pipe[s]: the ring out of the card of stage s. Batch numbers keep counting across the gather and the scatter.
-  hybrid::RingPipe pipe[2];
-  hybrid::HostGate end_gate;   // stage Y's end state (`end`, `logits`, `tail_rope`) is published
+  // The pipes' depth IS the physical ring's (kHybridRingSlots: HybridExec's slot_of): one constant, so a grant never outruns the memory.
+  hybrid::RingPipe pipe[2] = {hybrid::RingPipe(hybrid::kHybridRingSlots), hybrid::RingPipe(hybrid::kHybridRingSlots)};
+  hybrid::HostGate end_gate;  // stage Y's end state (`end`, `logits`, `tail_rope`) is published
   // ---- written by stage Y's thread (rank 0), read by stage X's after the gate
   StageSyncState end;
   std::vector<float> logits;

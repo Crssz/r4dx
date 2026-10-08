@@ -69,7 +69,7 @@ void TestPolicy() {
   Check(ParseGdnWriteOnce("bogus", true, false) == true && ParseGdnWriteOnce("bogus", false, false) == false,
         "an unreadable value is the default");
   Check(ParseGdnWriteOnce("ON", false, false) == false, "case matters like the other R4DX_* switches (unreadable)");
-  Check(kGdnWriteOnceDefault == false, "the default is off until the GPU gates have passed");
+  Check(kGdnWriteOnceDefault == true, "the default is on since the GPU gates passed (2026-10-08)");
   Check(ValidGdnWriteOnceOption(-1) && ValidGdnWriteOnceOption(0) && ValidGdnWriteOnceOption(1) &&
             !ValidGdnWriteOnceOption(2) && !ValidGdnWriteOnceOption(-2),
         "option range");

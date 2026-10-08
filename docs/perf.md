@@ -73,7 +73,7 @@ the GPU**, so the "expected" column is the analysis's estimate, not a measuremen
 | host | (a) the call's embed ids, KV positions and seqused_k go as ONE async H2D from pinned memory (`StageStepMeta`) instead of an async id copy plus two blocking `hipMemcpy` uploads; (b) a decode-sized TP=1 call ends in an event the host polls (`WaitStepDone`), and the greedy token (a verify window's T verdicts) is an async D2H into pinned memory ahead of that event, instead of `hipStreamSynchronize` + a blocking 4-byte `hipMemcpy`; (c) `DecodeStepGreedyOverlap`: the CLI and server loops decode, stop-scan and flush the fed token's text while its step runs, not before it is enqueued | no device math changes; ordering is by stream order and one event recorded after everything the call enqueued, so on return the device is as idle as after the synchronize the prefill chunks, TP and DFlash's injection drain still use | 0.10-0.30 ms (the ~0.7 ms idle bucket; the rest needs the one-step lookahead, which this pass does not do) | `host` |
 
 A fifth token, `gdnwo`, is the kill switch of the write-once GDN state for speculative verify
-(`R4DX_GDN_WRITE_ONCE=1`, off by default; [gdn-write-once.md](gdn-write-once.md)): it is not a bit-exact
+(`R4DX_GDN_WRITE_ONCE`, on by default since 2026-10-08: DFlash k=7 +3.5%, MTP-3 +1.4%, 0.92 GiB freed; [gdn-write-once.md](gdn-write-once.md)): it is not a bit-exact
 launch cut but a different state layout, and is bit-identical to the window-slot path in every output
 (logits, tokens, the committed state) while storing one state per round instead of one per candidate row.
 

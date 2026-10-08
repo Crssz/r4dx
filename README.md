@@ -44,7 +44,7 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70% |
 | Weights | about 17 GiB (+15 MiB of int8 weight scale tables for the default int8 prefill; `R4DX_PREFILL_INT8_SCALES=blk128` makes them 0.7 GiB, `R4DX_PREFILL_INT8=0` skips them) |
 | Decode, plain | 37.4 tok/s |
-| Decode, DFlash2 `k=7` | 116 tok/s |
+| Decode, DFlash2 `k=7` | 123 tok/s (write-once GDN state; 119 with `R4DX_GDN_WRITE_ONCE=0`; HIP device 1, 2026-10-08, `E:\models\r4dx\round2\bench_gdnwo`) |
 | Prefill, short prompts | about 1130 tok/s |
 | Cold prefill (time to first token), defaults (int8 prefill GEMM with coarse scales + split-KV attention) | 3.15 s at 8k, 14.0 s at 32k, 31.9 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-08, 2 runs each; `E:\models\r4dx\int8v2\ttft_summary.txt`) |
 | Cold prefill, per-128 int8 scales (`R4DX_PREFILL_INT8_SCALES=blk128`, the 2026-10-07 default) | 3.63 s at 8k (2230 tok/s), 16.0 s at 32k (2050 tok/s), 36.0 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-07, 2 runs each) |

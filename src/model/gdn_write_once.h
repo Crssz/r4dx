@@ -5,8 +5,8 @@
 // Header-only and free of HIP so the parser and the decision have a CPU unit test
 // (tests/model/test_gdn_write_once_cpu.cpp); Model::Load is the only caller.
 //
-// R4DX_GDN_WRITE_ONCE (read once per process, like R4DX_PREFILL_INT8). OFF BY DEFAULT until the GPU gates of the
-// document have passed (kGdnWriteOnceDefault below is the one line that flips it):
+// R4DX_GDN_WRITE_ONCE (read once per process, like R4DX_PREFILL_INT8). ON BY DEFAULT since the GPU gates of the
+// document passed on 2026-10-08 (E:\models\r4dx\gdnwo; kGdnWriteOnceDefault below is the one line that flips it):
 //   - "1" or "on": the write-once state, where this Model can use it (DecideGdnWriteOnce): a speculative verify
 //     call stores a 0.26 MiB-per-layer log of its rows and one state per layer, instead of one 3 MiB state per
 //     candidate row; the accepted prefix of the log is applied inside the NEXT call's seed load. Every output is
@@ -30,7 +30,7 @@ namespace r4dx::model {
 
 // What an unset / empty / unreadable R4DX_GDN_WRITE_ONCE means. Flip to true to make the write-once state the
 // default (the kill switches above keep restoring the window-slot path).
-inline constexpr bool kGdnWriteOnceDefault = false;
+inline constexpr bool kGdnWriteOnceDefault = true;
 
 // "1" / "on" -> true, "0" / "off" -> false, unset / empty -> `dflt`; anything else warns and is `dflt`.
 inline bool ParseGdnWriteOnce(const char* e, bool dflt = kGdnWriteOnceDefault, bool warn = true) {

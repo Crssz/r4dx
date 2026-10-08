@@ -1,8 +1,19 @@
 # Write-once GDN state for speculative verify
 
-Branch `gdnwo`. Status: implemented and built; the CPU tests have run, **nothing here has run on a GPU**
-(`test_gdn_write_once`, `test_gdn_write_once_model` and the bench are written, built and waiting for device 1).
-Off by default (`R4DX_GDN_WRITE_ONCE=1` turns it on); with it off every byte of every path is what it was.
+Status: **on by default** since 2026-10-08 (`R4DX_GDN_WRITE_ONCE=0` or `R4DX_DECODE_LEGACY=gdnwo` restores the
+window-slot path, every byte of every path as it was).
+
+Measured on device 1 (E:\models\r4dx\gdnwo, E:\models\r4dx\round2; mix4.5m, `bench_decode.ps1`, 4 prompts):
+every text SHA-256 identical to main and to the switch-off run in plain, `--dflash` k=7 and `--mtp 3`, at TP = 1
+and TP = 2; tok/round and acceptance identical; `tp1_identity`, `kl_rung4`, `validate_dflash`,
+`validate_spec_sampling -Quick` and `validate_fusion` pass with the switch on and off.
+
+| | round ms off -> on | tok/s main -> default on | VRAM freed |
+|---|---|---|---|
+| plain | -- | 37.46 -> 37.40 (noise) | 0 |
+| DFlash k=7 | 34.85 -> 33.54 (-1.31) | 119.25 -> 123.39 (+3.5%) | 0.92 GiB |
+| MTP-3 | 34.15 -> 33.64 (-0.50) | 79.42 -> 80.56 (+1.4%) | 0.42 GiB |
+| TP = 2 DFlash k=7 | 21.92 -> 21.15 (-0.77) | | 0.38 GiB per rank |
 
 ## What it does
 

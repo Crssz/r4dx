@@ -43,8 +43,9 @@
 //     token (stale stage mirror, leaked state, a wrong gather after unrelated traffic all show up here);
 //   * --tp2-ref-every N (default 0 = off): every N-th greedy / turns iteration is also generated with the pipelining switched off
 //     (TpModel::SetHybridMinRows(huge): the ordinary TP=2 prefill) and the two token streams are compared. They are NOT equal in general
-//     (different prefill numerics, the KL floor of docs/tp.md), so this is a gross-corruption detector: the soak fails when the mean
-//     agreeing prefix over >= 4 compared iterations is below half the compared length;
+//     (different prefill numerics, the KL floor of docs/tp.md; greedy streams diverge at the first flip and stay apart), so this is a
+//     gross-corruption detector: over >= 4 compared iterations the soak fails when more than half differ at the very first token, or
+//     the mean agreeing prefix is below 10 % of the compared length;
 //   * a hybrid soak must have pipelined (>= 1 pipelined call; the summary carries the whole `hybrid:` counter set) and the hybrid must
 //     have stayed engaged (no "hybrid mode OFF" fallback at load).
 // --pp-verify has no meaning here (the hybrid has no peer mirror to digest, tp_model_hybrid.cpp ignores it): the canaries and the TP=2
@@ -781,9 +782,14 @@ int main(int argc, char** argv) {
     if (!m->HybridEngaged()) failures.push_back("the hybrid mode was torn down during the soak (plain --tp 2 from then on): " + m->HybridRefusal());
     if (hs.pipelined_calls == 0) failures.push_back("no pipelined call in the whole soak: " + m->HybridStatsLine());
     const double mean_agree = ref_compared > 0 ? ref_agree_sum / static_cast<double>(ref_compared) : 1.0;
-    if (ref_compared >= 4 && mean_agree < 0.5) {
+    // Greedy streams that start from different prefill numerics (KL floor ~0.001) diverge at the first flipped token and never
+    // re-converge, so a healthy mean agreeing prefix is only ~0.35-0.55 of a 32..512-token run: it cannot be gated at 0.5. The
+    // very first token (one argmax of the prefill's logits) flips for ~1 % of iterations when healthy and for most of them when the
+    // gather or the stage state is corrupt, so that is the signal; the mean prefix is a floor for outright garbage only.
+    if (ref_compared >= 4 && (ref_first_diff * 2 > ref_compared || mean_agree < 0.1)) {
       failures.push_back("the hybrid and the TP=2 prefill agree on a mean " + Num(mean_agree * 100.0) + " % of the compared prefix over " +
-                         std::to_string(ref_compared) + " iterations (" + std::to_string(ref_first_diff) + " differ at the very first token)");
+                         std::to_string(ref_compared) + " iterations (" + std::to_string(ref_first_diff) + " differ at the very first token; gate: "
+                         "more than half differing at the first token, or a mean below 10 %)");
     }
     hybrid_json = ",\"hybrid\":{" + HybridJson(*m, true) + ",\"tp2_ref\":{\"compared\":" + std::to_string(ref_compared) + ",\"first_token_diff\":" +
                   std::to_string(ref_first_diff) + ",\"mean_agree\":" + Num(mean_agree) + "}}";

@@ -77,9 +77,14 @@ if ($IsHybrid -and $summary) {
     if ($null -eq $hy) {
         $fail.Add("--pp 2 but the summary line has no 'hybrid' object")
     } else {
+        $refText = if ([int]$hy.tp2_ref.compared -gt 0) {
+            ("{0} iterations compared, {1} differ at the first token, mean agreement {2:P1}") -f $hy.tp2_ref.compared, $hy.tp2_ref.first_token_diff, $hy.tp2_ref.mean_agree
+        } else {
+            "no iteration compared (--tp2-ref-every not given or no greedy iteration reached it)"
+        }
         $hyLine = ("[soak.ps1] hybrid: split k={0}, S={1} tokens, min rows {2}; {3} pipelined / {4} TP-prefill calls, DFlash tail rows {5}; " +
-                   "TP=2 reference: {6} iterations compared, mean agreement {7:P1}") -f `
-            $hy.split, $hy.stage_ctx, $hy.min_rows, $hy.pipelined, $hy.tp_prefill, $hy.tail_rows, $hy.tp2_ref.compared, $hy.tp2_ref.mean_agree
+                   "TP=2 reference: {6}") -f `
+            $hy.split, $hy.stage_ctx, $hy.min_rows, $hy.pipelined, $hy.tp_prefill, $hy.tail_rows, $refText
         Write-Output $hyLine
         if (-not $hy.engaged) { $fail.Add("the hybrid mode was not engaged at the end of the soak") }
         if ($hy.pipelined -lt 1) { $fail.Add("the hybrid soak made no pipelined call") }

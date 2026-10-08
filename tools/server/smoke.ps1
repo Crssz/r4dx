@@ -382,7 +382,7 @@ function Invoke-HybridChat {
 #     usage.prompt_tokens) it started at position > 0 (a warm gather);
 #   - with -Dflash every pipelined call grew the DFlash tail rows (the drafters' windows were fed).
 function Test-HybridDispatch {
-    param($R, [string]$Label, [ValidateSet("pipe", "tp", "any")][string]$Want = "any", [int]$Calls = 1, [switch]$Cold, [switch]$Warm)
+    param($R, [string]$Label, [ValidateSet("pipe", "tp", "any")][string]$Want = "any", [int]$Calls = 1, [switch]$Cold, [switch]$Warm, [switch]$RequireReuse)
     Check ($R.Status -eq 200) "hybrid: $Label returns 200 (got $($R.Status))"
     if ($R.Status -ne 200) { return }
     $a = $R.After
@@ -413,6 +413,8 @@ function Test-HybridDispatch {
         if ($Cold) { Check ($a.LastP0 -eq 0) "hybrid: $Label : a cold call (position 0, got $($a.LastP0))" }
         if ($Warm -and $promptN -lt $total) {
             Check ($a.LastP0 -gt 0) "hybrid: $Label : a warm call (prefix reused: position $($a.LastP0) > 0, $promptN of $total tokens fed)"
+        } elseif ($RequireReuse) {
+            Check $false "hybrid: $Label : the prefix was not reused ($promptN of $total tokens fed): this case must be a warm call, so the replay diverged and the case did not test a warm gather"
         } elseif ($Warm) {
             Write-Output "  [info] hybrid: $Label : the prefix was not reused ($promptN of $total tokens fed): a cold call, warm assertion skipped"
         }
@@ -2133,7 +2135,7 @@ try {
         Test-HybridDispatch $tr1 "thinking turn 1 (cold, long)" -Want pipe -Cold -Calls 2
         $tu2 = New-HyUser 12 "And 3 plus 3? Answer with just the number."
         $tr2 = Invoke-HybridChat -Messages @($tu1, @{ role = "assistant"; content = (Get-HyReply $tr1) }, $tu2) -MaxTokens 96 -Extra $thinkKw
-        Test-HybridDispatch $tr2 "thinking turn 2 (reasoning dropped from the replay: checkpoint restore, then a warm hybrid call)" -Want pipe -Warm -Calls 2
+        Test-HybridDispatch $tr2 "thinking turn 2 (reasoning dropped from the replay: checkpoint restore, then a warm hybrid call)" -Want pipe -Warm -RequireReuse -Calls 2
         if ($tr2.Chat) {
             Check ((Get-RequestLogLine $tr2.Chat.id) -match ' restore=') "hybrid: thinking turn 2's log line shows the checkpoint restore"
         }
@@ -2161,8 +2163,8 @@ try {
                 $tc2 = Invoke-HybridChat -Messages @(
                     (New-HyUser 21 $toolAsk),
                     @{ role = "assistant"; content = $null; tool_calls = @($hyCall) },
-                    @{ role = "tool"; tool_call_id = $hyCall.id; content = $toolResult }) -MaxTokens 64
-                Test-HybridDispatch $tc2 "tool round trip: the follow-up with a long tool result (warm, pipelined)" -Want pipe -Warm
+                    @{ role = "tool"; tool_call_id = $hyCall.id; content = $toolResult }) -MaxTokens 64 -Extra @{ tools = @($proseTool) }
+                Test-HybridDispatch $tc2 "tool round trip: the follow-up with a long tool result (warm, pipelined)" -Want pipe -Warm -RequireReuse
                 Test-HybridSpec $tc2 "tool round trip, follow-up"
                 Check ([bool]$tc2.Text) "hybrid: tool round trip: the follow-up answer has non-empty content"
             }
@@ -2205,13 +2207,32 @@ try {
                 # dispatch and the counters; the byte identity of this case is test_hybrid_real_identity's job.
                 $okRun = 0
                 $sweepN = 0
+                $swTotals = @{}
+                $swPrefix = (New-HybridFiller 35 ([int]($HybridFillerLines * 0.6))) + "`nLook at the next picture."
                 for ($k = 1960; $k -le 2056; $k += 8) {
-                    $sw = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText ((New-HybridFiller 35 ([int]($HybridFillerLines * 0.6))) + "`nLook at the next picture.")), $hyImgPart, (New-HyText ("Describe it in one word." + (" ok" * $k)))) }) -MaxTokens 8
+                    $sw = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix), $hyImgPart, (New-HyText ("Describe it in one word." + (" ok" * $k)))) }) -MaxTokens 8
                     $sweepN++
                     if ($sw.Status -eq 200 -and $null -ne $sw.After -and ($sw.After.Pipelined - $sw.Before.Pipelined) -eq 1 -and [bool]$sw.Text) { $okRun++ }
                     elseif ($null -ne $sw.After) { Write-Output "  [info] straddle k=${k}: status $($sw.Status), pipelined +$($sw.After.Pipelined - $sw.Before.Pipelined), answer '$($sw.Text)'" }
+                    if ($sw.Status -eq 200 -and $sw.Chat) { $swTotals[$k] = [int64]$sw.Chat.usage.prompt_tokens }
                 }
                 Check ($okRun -eq $sweepN) "hybrid: vision straddle sweep: all $sweepN requests (text after the image 1960..2056 tokens) were pipelined and answered ($okRun ok)"
+                # Is the straddle itself exercised? Two small probes size the image's rows: the prompt without the image and
+                # the prompt that stops where the image starts. The tail window starts at (prompt tokens - 2048); at least one
+                # sweep point must start it inside [image start - 8, image end + 8] (the slack covers the chat-template
+                # tokens around the probes), and " ok" must be one token (the prompt grows by exactly 8 per step).
+                $swNoImg = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix), (New-HyText ("Describe it in one word." + (" ok" * 1960)))) }) -MaxTokens 1
+                $swPre = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix)) }) -MaxTokens 1
+                if ($swNoImg.Chat -and $swPre.Chat -and $swTotals.ContainsKey(1960) -and $swTotals.ContainsKey(2056)) {
+                    $imgRows = $swTotals[1960] - [int64]$swNoImg.Chat.usage.prompt_tokens
+                    $imgStart = [int64]$swPre.Chat.usage.prompt_tokens - 5
+                    $inside = @($swTotals.Keys | Where-Object { $t = $swTotals[$_] - 2048; $t -ge ($imgStart - 8) -and $t -le ($imgStart + $imgRows + 8) }).Count
+                    Write-Output "  [info] straddle: image ~$imgRows rows from ~$imgStart; tail start (prompt - 2048) spans $($swTotals[1960] - 2048)..$($swTotals[2056] - 2048); $inside of $sweepN points inside"
+                    Check (($swTotals[2056] - $swTotals[1960]) -eq 96) "hybrid: vision straddle sweep: the prompt grew by 96 tokens over the 12 steps of 8 (' ok' is one token; got $($swTotals[2056] - $swTotals[1960]))"
+                    Check ($inside -ge 1) "hybrid: vision straddle sweep: at least one point starts the tail window inside the image's rows (found $inside; image ~$imgRows rows from ~$imgStart)"
+                } else {
+                    Check $false "hybrid: vision straddle sweep: the size probes or the sweep totals are missing"
+                }
             }
         } else {
             Write-Output "  [SKIP] hybrid: vision rows through the pipelined call (pass -Vision with a real vision-capable container)"

@@ -111,8 +111,12 @@ bool Only(const std::string& name) {
   return name.find(only) != std::string::npos;
 }
 
-// The image-straddle scenario (dflash load) needs the vision config on the reference and on the ranks (and loads the tower): only when it is selected.
-bool ImageWanted() { return Only("dflash/image-straddle"); }
+// The image-straddle scenario (dflash load) needs the vision config on the reference and on the ranks (and loads the tower, +0.9 GiB on
+// rank 0): only when R4DX_TEST_ONLY names it. An unfiltered run keeps the earlier footprint and leaves the scenario out ([SKIP]).
+bool ImageWanted() {
+  const char* only = std::getenv("R4DX_TEST_ONLY");
+  return only != nullptr && *only != '\0' && Only("dflash/image-straddle");
+}
 
 class Group {
  public:
@@ -949,6 +953,10 @@ class HybridRig {
   // 1000..1255 of 3156, the window starts at 1088): the tail's temporal rope rows must carry the image's mrope positions.
   void ImageStraddle() {
     Guard("image-straddle", [&](Group& grp) {
+      if (!ImageWanted()) {
+        std::fprintf(stderr, "[SKIP] %s/image-straddle: not selected (run it with R4DX_TEST_ONLY=dflash/image-straddle, in the ref and the hybrid phase)\n", cfg.name.c_str());
+        return;
+      }
       bool splice = false;
       OnRanks([&](Model& m, int rank) {
         if (rank == 0) splice = m.VisionSpliceEnabled();

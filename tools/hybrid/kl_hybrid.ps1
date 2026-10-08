@@ -60,7 +60,7 @@ param(
     [string]$Layout = 'trellis',
     [string]$Tokens = '',
     [switch]$Long,
-    [int]$TailRows = 256,
+    [int]$TailRows = 0,           # 0 = the tokens file's tail_rows (run_kl.ps1 reads it from there; a different value is an error)
     [string[]]$Segment = @(),
     [int]$PpSplit = 0,
     [int]$PpMinRows = 0,          # 0 = automatic: 1 when the shortest prefix is below 1024 rows, else the hybrid's default
@@ -83,7 +83,7 @@ if (-not $Tokens) {
     $Tokens = if ($Long) { Join-Path $modelsRoot 'r4dx\prefill-m0\kl\tokens_long.json' } else { Join-Path $repo 'tools\reference\kl_corpus\tokens_canon.json' }
 }
 foreach ($p in $runKl, $klCompare, $Tokens, $Model, $Python) { if (-not (Test-Path $p)) { throw "[kl_hybrid] missing $p" } }
-if ($TailRows -lt 1) { throw "[kl_hybrid] -TailRows must be >= 1 (the uniform pass has no prefill to pipeline)" }
+if ($TailRows -lt 0) { throw "[kl_hybrid] -TailRows must be >= 1, or 0 for the tokens file's tail_rows (the uniform pass has no prefill to pipeline)" }
 
 # Segment lengths: the shortest prefix decides whether the hybrid's 1024-row threshold is met; the longest decides --max-ctx.
 [string]$segList = ($Segment -join ',')
@@ -93,10 +93,14 @@ d = json.load(open(sys.argv[1], encoding='utf-8'))
 want = set(s for s in sys.argv[2][4:].split(',') if s)
 segs = [s for s in d['segments'] if not want or s['name'] in want]
 if not segs: sys.exit('no matching segment')
-print(min(len(s['token_ids']) for s in segs), max(len(s['token_ids']) for s in segs), len(segs))
+print(d.get('tail_rows', 256), min(len(s['token_ids']) for s in segs), max(len(s['token_ids']) for s in segs), len(segs))
 "@ $Tokens "sel=$segList"
 if ($LASTEXITCODE -ne 0) { throw "[kl_hybrid] cannot read $Tokens" }
-$minT, $maxT, $nSeg = $info.Trim().Split(' ') | ForEach-Object { [int]$_ }
+$fileTail, $minT, $maxT, $nSeg = $info.Trim().Split(' ') | ForEach-Object { [int]$_ }
+# run_kl.ps1 takes the tail from the tokens file (tail_rows, default 256) and has no way to override it: -TailRows can only
+# restate it, so a different value would only mislabel the prefix sizes, the --pp-min-rows decision and the verdict.
+if ($TailRows -eq 0) { $TailRows = $fileTail }
+elseif ($TailRows -ne $fileTail) { throw "[kl_hybrid] -TailRows $TailRows but $Tokens says tail_rows $fileTail (run_kl.ps1 uses the file's value); omit -TailRows or edit the tokens file" }
 if ($minT -le $TailRows) { throw "[kl_hybrid] the shortest segment has $minT tokens, not more than -TailRows $TailRows" }
 $minPrefix = $minT - $TailRows
 $maxCtx = [int][Math]::Max(16384, [Math]::Ceiling(($maxT + 64) / 1024.0) * 1024)
@@ -109,8 +113,8 @@ if ($PpMinRows -gt 0) {
 Write-Host ("[kl_hybrid] {0} segment(s) of {1}..{2} tokens, tail {3} rows, prefix {4}..{5} rows, --max-ctx {6} for all three runs" -f `
     $nSeg, $minT, $maxT, $TailRows, $minPrefix, ($maxT - $TailRows), $maxCtx)
 if ($hybridMinRowsArgs.Count -gt 0) {
-    Write-Host ("[kl_hybrid] NOTE: the shortest prefix is {0} rows (< the hybrid's 1024-row threshold): the hybrid run uses {1} so that every prefix " +
-                "IS pipelined; what this measures is the numerics of the pipelined prefill + reshard, not the dispatch threshold. Use -Long for prefixes above 1024." -f `
+    Write-Host (("[kl_hybrid] NOTE: the shortest prefix is {0} rows (< the hybrid's 1024-row threshold): the hybrid run uses {1} so that every prefix " +
+                 "IS pipelined; what this measures is the numerics of the pipelined prefill + reshard, not the dispatch threshold. Use -Long for prefixes above 1024.") -f `
         $minPrefix, ($hybridMinRowsArgs -join ' '))
 }
 
@@ -120,6 +124,22 @@ $phases = @(
     @{ Name = 'hybrid'; Args = @{ Tp = 2 };      Extra = @('--max-ctx', "$maxCtx", '--pp', '2') + $(if ($PpSplit -gt 0) { @('--pp-split', "$PpSplit") } else { @() }) +
                                                          $(if ($HybridCtx -gt 0) { @('--hybrid-ctx', "$HybridCtx") } else { @() }) + $hybridMinRowsArgs }
 )
+# What a dump directory was produced with: run_kl.ps1 records the tool's arguments in <dir>\run_info.json. Returns '' when the
+# directory's run is what phase $Name needs (tp1: no --tp / --pp; tp2: --tp 2, no --pp; hybrid: --tp 2 --pp 2; all with this
+# run's tail rows and --max-ctx), else the reason it is not -- so a stale plain --tp 2 dump cannot stand in for the hybrid's.
+function Get-DumpMismatch([string]$Name, [string]$Dir) {
+    $info = Join-Path $Dir 'run_info.json'
+    if (-not (Test-Path $info)) { return "no run_info.json in $Dir" }
+    $ra = [string](Get-Content $info -Raw | ConvertFrom-Json).args
+    $wantTp = $Name -ne 'tp1'
+    $wantPp = $Name -eq 'hybrid'
+    if (($ra -match '--tp 2') -ne $wantTp) { return "run args '$ra' do not match phase $Name (--tp 2 expected: $wantTp)" }
+    if (($ra -match '--pp 2') -ne $wantPp) { return "run args '$ra' do not match phase $Name (--pp 2 expected: $wantPp)" }
+    if ($ra -notmatch "--tail-rows $TailRows(\s|$)") { return "run args '$ra' do not use --tail-rows $TailRows" }
+    $mc = [regex]::Matches($ra, '--max-ctx (\d+)')
+    if ($mc.Count -eq 0 -or [int]$mc[$mc.Count - 1].Groups[1].Value -ne $maxCtx) { return "run args '$ra' do not end on --max-ctx $maxCtx" }
+    return ''
+}
 $savedHip = $env:HIP_VISIBLE_DEVICES
 try {
     foreach ($ph in $phases) {
@@ -127,8 +147,12 @@ try {
         $dir = Join-Path $OutDir $ph.Name
         $have = if (Test-Path $dir) { @(Get-ChildItem (Join-Path $dir '*.logprobs.f16') -ErrorAction SilentlyContinue).Count } else { 0 }
         if ($Reuse -and $have -ge $nSeg) {
-            Write-Host "[kl_hybrid] $($ph.Name): $have dump(s) in $dir, -Reuse: not re-run"
-            continue
+            $why = Get-DumpMismatch $ph.Name $dir
+            if (-not $why) {
+                Write-Host "[kl_hybrid] $($ph.Name): $have dump(s) in $dir, -Reuse: not re-run"
+                continue
+            }
+            Write-Host "[kl_hybrid] $($ph.Name): $have dump(s) in $dir are not reusable ($why): re-running"
         }
         Write-Host ("[kl_hybrid] {0:HH:mm:ss} phase {1}: run_kl.ps1 {2} --> {3}" -f (Get-Date), $ph.Name, ($ph.Extra -join ' '), $dir)
         $a = @{ Tokens = $Tokens; OutDir = $dir; Model = $Model; Layout = $Layout; ExtraArgs = [string[]]$ph.Extra }
@@ -159,7 +183,11 @@ function Invoke-Compare([string]$ref, [string]$test, [string]$json) {
     if ($rc -ne 0) { throw "[kl_hybrid] kl_compare.py $ref vs $test exited $rc (see $OutDir\$($json -replace '\.json$', '.log'))" }
     (Get-Content (Join-Path $OutDir $json) -Raw | ConvertFrom-Json)
 }
-foreach ($d in 'tp1', 'tp2', 'hybrid') { if (-not (Test-Path (Join-Path $OutDir $d))) { throw "[kl_hybrid] no $d dump in $OutDir (run that phase first)" } }
+foreach ($d in 'tp1', 'tp2', 'hybrid') {
+    if (-not (Test-Path (Join-Path $OutDir $d))) { throw "[kl_hybrid] no $d dump in $OutDir (run that phase first)" }
+    $why = Get-DumpMismatch $d (Join-Path $OutDir $d)
+    if ($why) { throw "[kl_hybrid] the $d dump is not the one this gate needs: $why (re-run that phase)" }
+}
 $env:PYTHONIOENCODING = 'utf-8'
 $floor = Invoke-Compare 'tp1' 'tp2' 'kl_tp1_vs_tp2.json'
 $hyb = Invoke-Compare 'tp1' 'hybrid' 'kl_tp1_vs_hybrid.json'

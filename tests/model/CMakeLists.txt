@@ -286,6 +286,12 @@ target_link_libraries(tool_pp_stage_bench PRIVATE r4dx_model r4dx_convert r4dx_c
 add_executable(tool_pp_hop_bench tool_pp_hop_bench.cpp)
 target_link_libraries(tool_pp_hop_bench PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
 
+# tool_pp_soak: the pipeline-parallel-prefill soak (docs/pp-prefill.md Phase 2, gate G2c) -- one PpModel, random prompts of
+# 2k-32k tokens, each generation run monolithically on the decode Model and pipelined, tokens compared; JSON log;
+# tools/pp/soak.ps1 wraps it in the TDR watch. Built, never add_test()'d (both GPUs, minutes to an hour).
+add_executable(tool_pp_soak tool_pp_soak.cpp)
+target_link_libraries(tool_pp_soak PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
+
 # test_pick_tuning: every tuning PickTuning hands out for a shape src/model/gemm_tuning_table.inc
 # covers must be launchable at THIS build's kernel groups -- the table is swept at one w4a16 group
 # (linear.cpp's ResolveTuning skips the rows that are not launchable at another). Host-only (no HIP call, no container), so it always runs; HIP_VISIBLE_DEVICES=1 only

@@ -6,6 +6,7 @@
 #   .\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k -Runs 2
 #   .\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 32k -ProfilePrefill
 #   .\tools\prefill\ttft_cli.ps1 -Tp 2 -Lengths 8k,32k,64k,128k
+#   .\tools\prefill\ttft_cli.ps1 -Pp -Lengths 8k,32k,64k -Runs 2        # pipeline-parallel prefill (G2b: >= 1.6x at 8k/32k)
 #
 # Prompts: <TasksDir>\prompts\ttft_<len>.txt (build_tasks.py writes them: the first niah_single item
 # of each length, a user message the CLI wraps in the chat template, thinking off). Output lines are
@@ -22,7 +23,11 @@ param(
   [string]$Cli = '',
   [string[]]$ExtraArgs = @(),
   [switch]$ProfilePrefill,
-  [switch]$AllowOthers
+  [switch]$AllowOthers,
+  # Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 with HIP_VISIBLE_DEVICES=1,0 (stage B = the decode card on
+  # ordinal 0, stage A = the desktop card). Extra knobs (-ExtraArgs '--pp-split','35') as usual. The first Prefill after
+  # load includes nothing the warm-up did not already touch. Exclusive with -Tp 2 and -ProfilePrefill.
+  [switch]$Pp
 )
 $ErrorActionPreference = 'Stop'
 [string]$LengthList = ($Lengths -join ',')  # a,b arrives as an array
@@ -33,7 +38,9 @@ if ($others.Count -gt 0 -and -not $AllowOthers) {
   throw "[ttft] other GPU jobs are running ($(($others | ForEach-Object { "$($_.ProcessName)#$($_.Id)" }) -join ', ')); pass -AllowOthers if they use another device"
 }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
-if ($Tp -eq 2) { $env:HIP_VISIBLE_DEVICES = '0,1' } else { $env:HIP_VISIBLE_DEVICES = "$Device" }
+if ($Pp -and ($Tp -eq 2 -or $ProfilePrefill)) { throw "[ttft] -Pp is exclusive with -Tp 2 and -ProfilePrefill" }
+if ($Pp) { $env:HIP_VISIBLE_DEVICES = '1,0' }
+elseif ($Tp -eq 2) { $env:HIP_VISIBLE_DEVICES = '0,1' } else { $env:HIP_VISIBLE_DEVICES = "$Device" }
 $lenTokens = @{ '4k' = 4096; '8k' = 8192; '16k' = 16384; '32k' = 32768; '64k' = 65536; '128k' = 131072 }
 $head = (git -C $repo rev-parse --short HEAD)
 foreach ($len in $LengthList.Split(',')) {
@@ -46,6 +53,7 @@ foreach ($len in $LengthList.Split(',')) {
            '--vision', 'off', '--temperature', '0', '--max-tokens', '8', '--stats')
     if ($ProfilePrefill) { $a += '--profile-prefill' }
     if ($Tp -eq 2) { $a += @('--tp', '2') }
+    if ($Pp) { $a += @('--pp', '2') }
     $a += $ExtraArgs
     $log = Join-Path $OutDir ("ttft_{0}_{1}{2}.log" -f $len, $r, $(if ($ProfilePrefill) { '_profile' } else { '' }))
     Write-Output "[ttft] HIP_VISIBLE_DEVICES=$($env:HIP_VISIBLE_DEVICES) $len run $r -> $log"
@@ -57,7 +65,7 @@ foreach ($len in $LengthList.Split(',')) {
     $wall = ((Get-Date) - $t0).TotalSeconds
     $text = Get-Content $log -Raw
     $m = [regex]::Match($text, '\[stats\] prefill: (\d+) tok in ([\d.]+)s \(([\d.]+) tok/s\)')
-    $rec = [ordered]@{ length = $len; run = $r; tp = $Tp; exit = $code; wall_s = [math]::Round($wall, 2);
+    $rec = [ordered]@{ length = $len; run = $r; tp = $Tp; pp = [bool]$Pp; exit = $code; wall_s = [math]::Round($wall, 2);
       profile = [bool]$ProfilePrefill; git = $head; extra = ($ExtraArgs -join ' ') }
     if ($m.Success) {
       $rec.prefill_tokens = [int]$m.Groups[1].Value; $rec.prefill_s = [double]$m.Groups[2].Value

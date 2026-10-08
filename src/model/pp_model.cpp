@@ -685,7 +685,9 @@ void PpModel::UpdateStageACapture() {
 }
 
 void PpModel::SetSplit(int64_t k) {
-  RequireReady();
+  // Not RequireReady(): SetSplit ends in Reset(), which is also the recovery from kNeedsRecovery -- and the identity test's
+  // negative controls end a variant exactly there (a failed call), then move the split for the next one.
+  if (state_ == State::kFatal) throw std::runtime_error("pp: fatal, restart the process");
   if (!pp::ValidSplit(k, NumLoadedLayers()) || k > reserve_split_) {
     throw std::invalid_argument("PpModel::SetSplit: split " + std::to_string(k) + " must be in [1, " +
                                 std::to_string(reserve_split_) + "] (stage A was loaded for splits up to " +

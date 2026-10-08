@@ -163,6 +163,8 @@ class TpModel final : public TextModel, public TpDiagnostics {
     int64_t last_gather_bytes[2] = {0, 0}, last_reshard_bytes[2] = {0, 0};  // the latest pipelined call
   };
   bool HybridEngaged() const { return hy_ != nullptr; }
+  // Why the hybrid is off (the text of the "[r4dx-hybrid] hybrid mode OFF" log line); "" when engaged or never requested.
+  const std::string& HybridRefusal() const { return hybrid_refusal_; }
   HybridStats GetHybridStats() const;
   int64_t HybridSplit() const;     // the split layer k (0 when not engaged)
   int64_t HybridStageCtx() const;  // S: the stage-KV capacity in tokens
@@ -440,6 +442,7 @@ class TpModel final : public TextModel, public TpDiagnostics {
   bool dflash_injection_ = true;  // the Model default (model.h's SetDflashInjectionEnabled)
   mutable std::vector<VramReport> cached_vram_;
   // Last member: destroyed first, after ~TpModel's teardown already freed everything the rank threads own (the stages, the pinned buffers).
+  std::string hybrid_refusal_;  // the last HybridDrop reason
   std::unique_ptr<Hybrid> hy_;  // null: plain TP=2 (never requested, killed, refused, torn down)
 };
 

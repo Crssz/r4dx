@@ -150,7 +150,7 @@ class Rig {
     pp.hybrid_ctx = kStageCtx;
     std::fprintf(stderr, "[tp-hybrid] %s: loading the two-GPU TpModel with the hybrid\n", cfg.name.c_str());
     tpm = TpModel::Load(o, tp, pp);
-    if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage (see the [r4dx-hybrid] lines above)");
+    if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage: " + tpm->HybridRefusal());
     ref_device = tpm->Vram().at(0).device;  // rank 0's card
     if (hipSetDevice(ref_device) != hipSuccess) throw std::runtime_error("hipSetDevice failed for the reference");
     std::fprintf(stderr, "[tp-hybrid] %s: loading the TP=1 reference on HIP device %d\n", cfg.name.c_str(), ref_device);

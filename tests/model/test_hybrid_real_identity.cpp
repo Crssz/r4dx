@@ -437,7 +437,7 @@ class HybridRig {
     pp.hybrid_ctx = o.hybrid_ctx;
     std::fprintf(stderr, "[hybrid-real] %s: loading the two-GPU TpModel with the hybrid (64 layers)\n", cfg.name.c_str());
     tpm = TpModel::Load(mo, tp, pp);
-    if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage (see the [r4dx-hybrid] lines above): lower --max-ctx / --hybrid-ctx or free VRAM");
+    if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage: " + tpm->HybridRefusal() + " (lower --max-ctx / --hybrid-ctx or free VRAM)");
     if (cfg.dflash && !tpm->DflashEnabled()) throw std::runtime_error("the DFlash drafter did not load");
     r4dx::model::ModelConfig gc = tpm->Config();
     gc.num_hidden_layers = tpm->NumLoadedLayers();

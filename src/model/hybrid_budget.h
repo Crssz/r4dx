@@ -56,10 +56,13 @@ inline int64_t FreeAfterRanksPlanning(double total_gib, double desktop_gib, doub
   return Gib(total_gib - desktop_gib - rank_buffers_gib - vision_gib) - rank_kv_bytes;
 }
 
-// S = floor((free_after_ranks - stage_fixed - reserve) / bytes_per_token), 0 when nothing is left.
+// S = floor((free_after_ranks - stage_fixed - reserve) / bytes_per_token), 0 when nothing is left. A stage with no attention layer
+// has 0 KV bytes per token: its KV never limits S (kUnboundedTokens) as long as its fixed part fits.
+constexpr int64_t kUnboundedTokens = INT64_MAX;
 inline int64_t StageCapacityTokens(const CardBudget& b, int64_t bytes_per_token) {
   const int64_t avail = b.free_after_ranks - b.stage_fixed - b.reserve;
-  return avail > 0 && bytes_per_token > 0 ? avail / bytes_per_token : 0;
+  if (avail <= 0 || bytes_per_token < 0) return 0;
+  return bytes_per_token == 0 ? kUnboundedTokens : avail / bytes_per_token;
 }
 inline int64_t FreeAfterStageLoad(const CardBudget& b, int64_t stage_ctx, int64_t bytes_per_token) {
   return b.free_after_ranks - b.stage_fixed - stage_ctx * bytes_per_token;

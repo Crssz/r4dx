@@ -266,8 +266,15 @@ bool TpModel::HybridLoad(const ModelOptions& opts, const PpOptions& pp, const st
       throw std::runtime_error("the stages chose different prefill chunk sizes / int8 prefill (X " + std::to_string(px.chunk) + "/" + std::to_string(px.i8) +
                                ", Y " + std::to_string(py.chunk) + "/" + std::to_string(py.i8) + "): the bits would differ");
     }
-    if (px.layers != layers || py.layers != layers || px.hidden != h.hidden || py.hidden != h.hidden || px.block != block || py.block != block) {
-      throw std::runtime_error("the stage Models disagree with the ranks on the layer count / hidden size / KV block");
+    // The back stage (Y) is a hole-prefix container: layers [0, k) are holes but it is globally indexed, so it reports the ranks' full count.
+    // The front stage (X) loads layers [0, k] only (layer_limit k + 1: layer k supplies just the input_layernorm that layer k - 1 fuses, stage_load.h),
+    // so it reports k + 1; the layers it RUNS are [0, k), the same as in the PP stage A.
+    const int64_t front_layers = split + 1;
+    if (px.layers != front_layers || py.layers != layers || px.hidden != h.hidden || py.hidden != h.hidden || px.block != block || py.block != block) {
+      throw std::runtime_error("the stage Models disagree with the ranks: layers X " + std::to_string(px.layers) + " (expected k + 1 = " + std::to_string(front_layers) +
+                               "), Y " + std::to_string(py.layers) + " (expected " + std::to_string(layers) + "); hidden X " + std::to_string(px.hidden) + ", Y " +
+                               std::to_string(py.hidden) + " (ranks " + std::to_string(h.hidden) + "); KV block X " + std::to_string(px.block) + ", Y " +
+                               std::to_string(py.block) + " (ranks " + std::to_string(block) + ")");
     }
     h.chunk_rows = px.chunk;
 
@@ -375,6 +382,7 @@ bool TpModel::HybridLoad(const ModelOptions& opts, const PpOptions& pp, const st
 
 void TpModel::HybridDrop(const std::string& why) {
   std::fprintf(stderr, "[r4dx-hybrid] hybrid mode OFF, plain --tp 2: %s\n", why.c_str());
+  hybrid_refusal_ = why;
   if (!hy_) return;
   if (state_ == State::kFatal) {
     // A rank is stuck inside a HIP call: what it may still touch must not be freed. Leak it (the process is going down anyway).

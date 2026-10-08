@@ -87,6 +87,23 @@ void StagePlanning() {
     const StageCtxPlan small_max = PlanStageCtxPerCard(8192, 0, BudgetX(Gib(20.0), Gib(8.6)), y, 16384, 16384);
     Check(!small_max.engaged, "--max-ctx below the minimum stage capacity: refused");
   }
+  {  // a stage with NO attention layer (the 4-layer test container at k = 2: X has 0, Y 1) has 0 KV bytes per token: its capacity is unbounded, not 0
+    const int64_t b0 = StageKvBytesPerToken(0, 4, 256), b1 = StageKvBytesPerToken(1, 4, 256);
+    Check(b0 == 0 && b1 == 2048, "0 attention layers = 0 KV bytes per token");
+    const CardBudget x = BudgetX(Gib(20.0), Gib(1.0)), y = BudgetY(Gib(20.0), Gib(1.0));
+    Check(StageCapacityTokens(x, b0) == kUnboundedTokens, "a KV-less stage's capacity is unbounded");
+    Check(StageCapacityTokens(BudgetX(Gib(3.5), Gib(1.0)), b0) == 0, "... unless its fixed part and reserve do not fit");
+    Check(StageCapacityTokens(x, -1) == 0, "a negative bytes-per-token is an error, not unbounded");
+    const StageCtxPlan p = PlanStageCtxPerCard(20000, 16384, x, y, b0, b1);
+    Check(p.engaged && p.refusal.empty() && p.s == 16384 && p.s_x == kUnboundedTokens && p.s_y > 16384, "l4 case: --hybrid-ctx 16384, X without KV, Y with 1 layer: engaged");
+    const StageCtxPlan a = PlanStageCtxPerCard(20000, 0, x, y, b0, b1);
+    Check(a.engaged && a.s == 20000, "auto: S = min(max_ctx, S_y) when X is KV-less");
+    Check(a.x_free_after == x.free_after_ranks - x.stage_fixed, "a KV-less stage books no KV bytes");
+    const StageCtxPlan both = PlanStageCtxPerCard(20000, 0, x, y, b0, b0);
+    Check(both.engaged && both.s == 20000, "both stages KV-less: S = max_ctx");
+    const StageCtxPlan none = PlanStageCtxPerCard(20000, 16384, BudgetX(Gib(3.5), Gib(1.0)), y, b0, b1);
+    Check(!none.engaged && none.s == 0, "a KV-less X that does not fit at all is still refused");
+  }
 }
 
 void TailPlans() {

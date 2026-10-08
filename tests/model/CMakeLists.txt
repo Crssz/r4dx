@@ -250,6 +250,18 @@ add_executable(test_pp_plan_cpu test_pp_plan_cpu.cpp)
 target_include_directories(test_pp_plan_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_pp_plan_cpu COMMAND test_pp_plan_cpu)
 
+# test_pp_channel_cpu / test_pp_sync_cpu: pure CPU unit tests of the real pipeline's runtime (docs/pp-prefill.md
+# Phase 2): the stage hand-over ring (src/model/pp_channel.h -- FIFO, back-pressure, poison, bounded waits, a
+# million-item two-thread stress run, the slot payload arithmetic) and the stale-state rules of the stage-A mirror
+# (src/model/pp_sync.h -- a random walk against an abstract model of both devices, the switches, the device order).
+# No HIP call, no container; always run.
+add_executable(test_pp_channel_cpu test_pp_channel_cpu.cpp)
+target_include_directories(test_pp_channel_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_pp_channel_cpu COMMAND test_pp_channel_cpu)
+add_executable(test_pp_sync_cpu test_pp_sync_cpu.cpp)
+target_include_directories(test_pp_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_pp_sync_cpu COMMAND test_pp_sync_cpu)
+
 # tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
 # TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never
 # add_test()'d (it consumes measurements; tools/.../pp_phase0.ps1 runs it).

@@ -2,12 +2,11 @@
 // (docs/pp-tp2-hybrid.md 7 "Destruction and borrowed state", P0 item 12): in the hybrid mode each card holds a TP rank Model
 // and a stage Model, and the stage borrows the rank Container's 2.37 GiB mirror instead of uploading its own.
 //
-// The owner (the rank's Container) creates one lease when it uploads the mirror and hands out copies of the shared_ptr
-// (Container::EmbedMirrorLeaseHandle); a borrower keeps its copy for as long as it reads the pointer. The owner's destructor
-// asserts that no copy is left (EmbedMirrorLeaseViolation): freeing the mirror under a live borrower would leave the stage
-// gathering from freed device memory, so the rule is "the stage Model is destroyed before the rank Model that owns the
-// mirror" and a violation aborts with the message instead of corrupting a later request. Header-only and HIP-free (the device
-// is just an int here) so tests/model/test_stage_load_cpu.cpp covers the counting.
+// The lease OWNS the mirror (`keepalive` is the shared owner of the DeviceBuffer): the uploading Container and every borrower
+// hold a copy of the shared_ptr, and the device memory is freed when the last copy goes. No destruction order is required --
+// a stage Model that outlives the rank Model that uploaded the mirror (or a ModelOptions the caller kept) still gathers from
+// live memory; the VRAM is simply returned later. Header-only and HIP-free (the device is just an int, the buffer a type-erased
+// owner) so tests/model/test_stage_load_cpu.cpp covers the ownership.
 #pragma once
 
 #include <cstddef>
@@ -21,24 +20,13 @@ struct EmbedMirrorLease {
   const uint16_t* data = nullptr;  // the mirror, bf16 [vocab, hidden], on `device`
   size_t elems = 0;
   int device = -1;                 // the HIP device that owns it: a borrower on another device would read foreign memory
+  std::shared_ptr<void> keepalive; // owns the DeviceBuffer `data` points into (the lease's copies share it)
 };
-
-// Copies of the lease alive besides the owner's own.
-inline long EmbedMirrorBorrowers(const std::shared_ptr<EmbedMirrorLease>& owners_handle) {
-  return owners_handle ? owners_handle.use_count() - 1 : 0;
-}
-
-// "" when nothing borrows the mirror any more (or there is no lease); else the message the owner's destructor aborts with.
-inline std::string EmbedMirrorLeaseViolation(const std::shared_ptr<EmbedMirrorLease>& owners_handle) {
-  const long n = EmbedMirrorBorrowers(owners_handle);
-  if (n <= 0) return "";
-  return "the embedding device mirror is being destroyed while " + std::to_string(n) +
-         " other Container(s) still borrow it: destroy the stage Model before the rank Model that owns the mirror";
-}
 
 // "" when a Container on `device` may borrow `lease` for a text.embed_tokens of `elems` elements.
 inline std::string CheckEmbedMirrorBorrow(const EmbedMirrorLease& lease, int device, size_t elems) {
   if (lease.data == nullptr || lease.elems == 0) return "the borrowed embedding mirror is empty";
+  if (lease.keepalive == nullptr) return "the borrowed embedding mirror has no owner (a lease must keep its buffer alive)";
   if (lease.device != device) {
     return "the embedding mirror lives on HIP device " + std::to_string(lease.device) + ", this Container loads on device " +
            std::to_string(device);

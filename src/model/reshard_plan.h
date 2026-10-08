@@ -296,11 +296,19 @@ struct PlanParams {
   StageLayers stage[2];
   int64_t stage_conv_pitch = 3, rank_conv_pitch = 3;
   bool mtp = true;  // the MTP head KV is part of the state (stage B only)
-  static PlanParams ForSplit(const StateGeometry& g, int64_t split, bool mtp = true) {
+  // `rank_conv_pitch` is the TP rank Model's conv line pitch (state_len_max): conv_width - 2 + window for a speculating rank, so
+  // it is the caller's to give (a default of the compact conv_live would silently mis-address every conv run of a real rank).
+  // The stage Model's pitch is conv_live (its state_len_max is conv_width - 1).
+  static PlanParams ForSplit(const StateGeometry& g, int64_t split, int64_t rank_conv_pitch, bool mtp = true) {
+    if (rank_conv_pitch < g.conv_live) {
+      throw std::invalid_argument("PlanParams::ForSplit: rank_conv_pitch " + std::to_string(rank_conv_pitch) +
+                                  " is below the " + std::to_string(g.conv_live) + " live conv entries per channel");
+    }
     PlanParams p;
     p.stage[kStageA] = LayersOfStage(g, split, kStageA);
     p.stage[kStageB] = LayersOfStage(g, split, kStageB);
-    p.stage_conv_pitch = p.rank_conv_pitch = g.conv_live;
+    p.stage_conv_pitch = g.conv_live;
+    p.rank_conv_pitch = rank_conv_pitch;
     p.mtp = mtp;
     return p;
   }

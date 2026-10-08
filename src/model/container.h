@@ -193,16 +193,13 @@ struct ContainerLoadOptions {
   // No lm_head and no mtp.* (the front stage). HasLmHead() / HasMtp() are then false.
   bool skip_heads = false;
   // The device mirror of text.embed_tokens borrowed from a Container on the same device (Container::EmbedMirrorLeaseHandle)
-  // instead of uploading another one; the borrower must be destroyed before the owner (embed_mirror_lease.h). Null: this Load
+  // instead of uploading another one; the lease keeps the mirror alive (embed_mirror_lease.h). Null: this Load
   // decides (embed_device_resident_decided, else the free-VRAM heuristic) as before.
   std::shared_ptr<const EmbedMirrorLease> borrowed_embed_mirror;
 };
 
 class Container {
  public:
-  // The destructor asserts that no other Container still borrows this one's embedding mirror (embed_mirror_lease.h); the
-  // moves are spelled out because a user-provided destructor would otherwise suppress them.
-  ~Container();
   Container(Container&&) = default;
   Container& operator=(Container&&) = default;
 
@@ -262,15 +259,11 @@ class Container {
   // heuristic decided it would not fit (see Load()'s own comment); check
   // EmbedTokensDeviceResident() rather than relying on this being non-null implicitly.
   // (A borrowed mirror -- ContainerLoadOptions::borrowed_embed_mirror -- answers the same way: it is the owner's.)
-  const uint16_t* EmbedTokensDevice() const {
-    return embed_borrowed_ ? embed_borrowed_->data : embed_tokens_dev_.data();
-  }
-  bool EmbedTokensDeviceResident() const { return embed_borrowed_ != nullptr || !embed_tokens_dev_.empty(); }
+  const uint16_t* EmbedTokensDevice() const { return embed_mirror_ ? embed_mirror_->data : nullptr; }
+  bool EmbedTokensDeviceResident() const { return embed_mirror_ != nullptr; }
   // The handle a second Container on this device passes as ContainerLoadOptions::borrowed_embed_mirror. Null when there is no
-  // mirror. Every copy must be gone before this Container is destroyed (embed_mirror_lease.h; the destructor asserts it).
-  std::shared_ptr<const EmbedMirrorLease> EmbedMirrorLeaseHandle() const {
-    return embed_lease_ ? embed_lease_ : embed_borrowed_;
-  }
+  // mirror. It owns the device buffer (embed_mirror_lease.h): a borrower keeps the mirror alive, whatever the destruction order.
+  std::shared_ptr<const EmbedMirrorLease> EmbedMirrorLeaseHandle() const { return embed_mirror_; }
 
   // The layer count of the model being served: layers_.size(), holes included (a hole-prefix load keeps layers_ globally
   // indexed, so every `i + 1 < NumLoadedLayers()` / target-layer / split test keeps meaning what it always meant).
@@ -388,8 +381,6 @@ class Container {
   std::string model_id_, config_sha256_;
   core::PinnedBuffer<uint16_t> embed_tokens_;  // empty when shared_embed_host_ is set
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host_;
-  core::DeviceBuffer<uint16_t> embed_tokens_dev_;  // empty iff not device-resident (Load's own
-                                                    // comment) -- see EmbedTokensDeviceResident()
   std::vector<LayerWeights> layers_;
   // One per layers_ entry: fully resident, norm-only or a hole (stage_load.h). All kFull except in a stage-only load.
   std::vector<stage::LayerKind> layer_kinds_;
@@ -397,10 +388,10 @@ class Container {
   [[noreturn]] void ThrowLayerNotLoaded(int64_t i) const;
   // Uploads text.embed_tokens' device mirror from EmbedTokensHost() and publishes its lease (both loaders).
   void UploadEmbedMirror(size_t elems);
-  // The embedding mirror this Container uploaded (null when it has none) and the one it borrowed instead (null when it
-  // uploaded or has none). At most one of the two is set.
-  std::shared_ptr<EmbedMirrorLease> embed_lease_;
-  std::shared_ptr<const EmbedMirrorLease> embed_borrowed_;
+  // The device mirror of text.embed_tokens: the lease this Container uploaded or the one it borrowed (ContainerLoadOptions::
+  // borrowed_embed_mirror); null iff not device-resident (Load's own comment) -- see EmbedTokensDeviceResident(). The lease owns
+  // the device buffer, so the mirror lives until the last Container holding the lease is gone.
+  std::shared_ptr<const EmbedMirrorLease> embed_mirror_;
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;

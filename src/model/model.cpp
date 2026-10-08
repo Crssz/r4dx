@@ -270,13 +270,20 @@ Model Model::Load(const ModelOptions& opts) {
   // docs/tp.md 2.7: a TP rank's thread consults the per-rank tuning table first. Set on EVERY load
   // (false at TP=1), so the flag follows this thread's latest successful Model::Load rather than any
   // earlier rank load; a TP load that throws clears it again (Appendix B N24).
+  // A stage-only load (hybrid mode: loaded on a rank worker's thread AFTER its TP rank Model) leaves the caller's flag as it found
+  // it, so the rank Model's later calls (EncodeImages, ...) still see the rank flag (docs/pp-tp2-hybrid.md 7); the stage Model's
+  // own calls run inside Tp2TuningScope(false).
+  const bool tp2_flag_before = Tp2TuningForThisThread();
   SetTp2TuningForThisThread(is_tp_rank);
   struct Tp2FlagOnThrow {
-    int uncaught = std::uncaught_exceptions();
+    int uncaught;
+    bool restore;
+    bool previous;
     ~Tp2FlagOnThrow() {
-      if (std::uncaught_exceptions() > uncaught) SetTp2TuningForThisThread(false);
+      if (restore) SetTp2TuningForThisThread(previous);
+      else if (std::uncaught_exceptions() > uncaught) SetTp2TuningForThisThread(false);
     }
-  } tp2_flag_on_throw;
+  } tp2_flag_on_throw{std::uncaught_exceptions(), stage_only, tp2_flag_before};
 
   Model m;
   m.comm_ = tp.comm;
@@ -875,6 +882,7 @@ void Model::EncodeImages(const float* pixel_values, int64_t total_patches,
                           const std::vector<vision::GridThw>& grids,
                           core::DeviceBuffer<uint16_t>* out, vision::VisionEncodeStats* stats,
                           const vision::VisionTrace* trace) {
+  CheckTuningScope();  // the tower's GEMMs run under the thread's flag (a hybrid rank worker's stage Load must not have changed it)
   if (!HasVision()) {
     throw std::runtime_error(
         "Model::EncodeImages: this model has no vision tower (the container carries no vision.* "
@@ -1135,6 +1143,10 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
                                     const SummaryRequest* summary_out,
                                     const std::function<void()>* overlap) {
   CheckTuningScope();  // every prefill chunk and decode step reaches a GEMM through here
+  // A call that is not a pipelined prefill chunk runs layers [0, N): a stage-only Model (holes / a norm-only layer) refuses it
+  // here, before the prologue's id upload and embedding gather or any state change (the pipelined chunks assert their own range
+  // in RunLayerRange).
+  if (!(pp_active_ && is_prefill_path)) CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::RunChunk");
   const int64_t T = static_cast<int64_t>(token_ids.size());
   // A 256-row prefill super-chunk (docs/trellis-m256.md): only Prefill() creates one, after deciding
   // that this Model and call may (PrefillRowsForCall). Layer-major over all 256 rows: the trellis
@@ -1839,6 +1851,7 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
                                               const std::function<void()>& on_chunk_captured,
                                               std::vector<int32_t>* rope_rows_out) {
   if (token_ids.empty()) throw std::runtime_error("Model::PrefillMultimodal: token_ids is empty");
+  if (!pp_active_) CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::PrefillMultimodal");  // as Prefill(): before any state
   if (images.empty() && !mrope_active_) {
     // Text-only, and nothing has ever diverged -- the pre-vision path, byte for byte. The rows a
     // diagnostic caller asked for are simply the sequence indices on all three axes.
@@ -1962,6 +1975,9 @@ std::vector<float> Model::PrefillMultimodal(const std::vector<int32_t>& token_id
 std::vector<float> Model::Prefill(const std::vector<int32_t>& token_ids,
                                     const std::function<void()>& on_chunk_captured) {
   if (token_ids.empty()) throw std::runtime_error("Model::Prefill: token_ids is empty");
+  // A monolithic call on a stage-only Model is refused before it collapses the window or clears at_prefill_end_ (RunChunk's own
+  // check would come after both).
+  if (!pp_active_) CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::Prefill");
   // Prefill's chunked-scan GDN path always reads and lands its result at window index 0
   // (GdnLayerParams::slot == GdnStateManager::SlotForSeq, never a windowed verify slot -- see that
   // class's file comment), exactly what a nullptr-seeded MTP verify call reads. A PRIOR generation's
@@ -2270,6 +2286,7 @@ int32_t Model::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& 
 // what this does and does not break out, and tools/profile/README.md for how to extend it.
 Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
   RequireNotTp("DecodeStepProfiled (profiling is not supported under tensor parallelism)");
+  CheckTuningScope();
   using Clock = std::chrono::steady_clock;
   const auto wall_t0 = Clock::now();
   r4dx_kernel_launch_counter_reset();  // docs/r9700.md P2/task item 4: count just this one step
@@ -2427,6 +2444,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
 
 Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids) {
   RequireNotTp("PrefillProfiled (profiling is not supported under tensor parallelism)");
+  CheckTuningScope();
   using Clock = std::chrono::steady_clock;
   const auto wall_t0 = Clock::now();
   if (token_ids.empty()) throw std::runtime_error("Model::PrefillProfiled: token_ids is empty");

@@ -4,13 +4,14 @@
 //
 //   * back stage Y (split 2 of 4): hole-prefix container -- NumLoadedLayers() stays 4, layers 0 and 1 are holes (Layer(i) throws,
 //     LayerLoaded false, no GDN state), the head and the MTP head are whole, the KV cache has exactly S = 1024 tokens, a monolithic
-//     Prefill is refused by the range assertion BEFORE it changes any state, PpAttach as stage A is refused (its range holds holes);
+//     Prefill is refused by the range assertion at its entry (Prefill / RunChunk check before the window collapse, the prologue's id
+//     upload and embedding gather; the test can observe only the position, not at_prefill_end_), PpAttach as stage A is refused (its range holds holes);
 //   * front stage X (split 2): layers 0, 1 full + layer 2 as its input_layernorm only (LayerInputNorm works, Layer(2) throws), no
 //     lm_head / MTP / vision, no GDN state for layer 2 (the hand-off wire is two layers' worth, the full Model's three), a monolithic
 //     Prefill and PpAttach as stage B are refused, a drafter target at the split layer is refused;
 //   * the embedding: both stages take the process's shared pinned host copy and BORROW the full Model's device mirror (same
-//     pointer), and use less VRAM than a full Model; destroying the stages before the owner is the rule (the other order aborts the
-//     process by design and cannot be a test case);
+//     pointer), and use less VRAM than a full Model; the lease OWNS the mirror, so destroying the uploading Model first is fine (the
+//     stage still reads it);
 //   * StageSetSyncState on both roles and TpAdoptPrefill on a rank: pos / started / mrope and the MTP seed travel, a wrong-width seed
 //     is refused before anything is written, a stale `mtp_seed_valid` on the stage is overwritten by an invalid one, stage A (no MTP
 //     head) ignores the seed, a stage and a pos-0 state cannot be adopted, an adopted rank can checkpoint (at_prefill_end_);
@@ -291,17 +292,24 @@ static int RunTest() {
     rank.reset();
   }
 
-  // ---- destruction order: stages first, then the Model that owns the mirror ---------------------------------------------------
+  // ---- the lease owns the mirror: no destruction order is required -------------------------------------------------------------
+  // The owner dies FIRST while the option structs, this test's copy and a stage Container still hold the lease; the stage must
+  // keep gathering from live memory (the mirror's first row still equals the shared host copy's).
   Check(lease.use_count() >= 5, "the lease is held by the owner, this test, the two option structs and the two stage Containers");
   y.reset();
+  full.reset();
+  {
+    const uint16_t* dev = x->GetContainer().EmbedTokensDevice();
+    std::vector<uint16_t> row(static_cast<size_t>(hidden));
+    const hipError_t err = hipMemcpy(row.data(), dev, row.size() * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    Check(err == hipSuccess && std::memcmp(row.data(), host->data(), row.size() * sizeof(uint16_t)) == 0,
+          "the borrowed mirror outlives the Model that uploaded it (the lease owns the buffer)");
+  }
   x.reset();
-  // Every handle on the lease must be gone before its owner dies (the owner aborts otherwise): the options structs and this
-  // test's own copy hold some.
   yo.stage_only.borrowed_embed_mirror.reset();
   xo.stage_only.borrowed_embed_mirror.reset();
   lease.reset();
-  full.reset();
-  std::fprintf(stderr, "  destroyed the stages before the owner of the borrowed mirror\n");
+  std::fprintf(stderr, "  destroyed the owner of the borrowed mirror before its borrowers\n");
 
   if (g_fails != 0) {
     std::fprintf(stderr, "test_stage_load: %d FAILED\n", g_fails);

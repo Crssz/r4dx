@@ -1,12 +1,12 @@
 // tests/model/test_stage_load_cpu.cpp -- CPU-only checks of the HIP-free policy of the hybrid mode's stage-only loads
 // (docs/pp-tp2-hybrid.md 9 "P0 prerequisites"): src/model/stage_load.h (which layers a stage holds, the request validation, the
 // "is this layer range resident" check the stage entry points assert, the ModelOptions::stage_only -> container request),
-// src/model/embed_mirror_lease.h (the borrowed embedding mirror and its destruction-order rule) and src/model/stage_sync.h (the
+// src/model/embed_mirror_lease.h (the borrowed embedding mirror: the lease owns the buffer) and src/model/stage_sync.h (the
 // MTP seed rule of StageSetSyncState / TpAdoptPrefill). The device half -- Container's hole-prefix and norm-only layers, the
 // state allocation, the sync primitives -- is tests/model/test_stage_load.cpp (GPU). No HIP call; always runs.
 //
-// Negative controls: a checker that treats norm-only layers as loaded, one that forgets the hole prefix, a lease counter that
-// forgets the borrower, and a seed rule that ignores the model's lack of an MTP head -- each is built here and must be caught by
+// Negative controls: a checker that treats norm-only layers as loaded, one that forgets the hole prefix, a lease that does not
+// own its buffer, and a seed rule that ignores the model's lack of an MTP head -- each is built here and must be caught by
 // the oracle, otherwise the oracle proves nothing.
 #include <cstdint>
 #include <cstdio>
@@ -188,34 +188,53 @@ void Roles() {
 
 // ---- the borrowed embedding mirror ----------------------------------------------------------------------------------------
 void Lease() {
-  std::shared_ptr<EmbedMirrorLease> owner;
-  Check(EmbedMirrorLeaseViolation(owner).empty() && EmbedMirrorBorrowers(owner) == 0, "no lease, nothing to violate");
-  owner = std::make_shared<EmbedMirrorLease>();
+  // The lease owns the mirror: a stand-in "device buffer" whose destruction is observable. The uploading Container
+  // (Container::UploadEmbedMirror) makes the lease exactly this way, with the DeviceBuffer in `keepalive`.
   static const uint16_t kMirror[4] = {1, 2, 3, 4};
-  owner->data = kMirror;
-  owner->elems = 4;
-  owner->device = 1;
-  Check(EmbedMirrorLeaseViolation(owner).empty(), "an owner with no borrower may be destroyed");
+  int freed = 0;
+  struct Buffer {
+    explicit Buffer(int* f) : freed(f) {}
+    Buffer(const Buffer&) = delete;
+    ~Buffer() { ++*freed; }
+    int* freed;
+  };
+  auto make_lease = [&](bool owns) {
+    auto l = std::make_shared<EmbedMirrorLease>();
+    l->data = kMirror;
+    l->elems = 4;
+    l->device = 1;
+    if (owns) l->keepalive = std::make_shared<Buffer>(&freed);
+    return l;
+  };
   {
+    std::shared_ptr<const EmbedMirrorLease> owner = make_lease(true);
     std::shared_ptr<const EmbedMirrorLease> stage = owner;  // what Container::EmbedMirrorLeaseHandle hands the stage's Load
-    Check(EmbedMirrorBorrowers(owner) == 1, "one borrower");
-    const std::string why = EmbedMirrorLeaseViolation(owner);
-    Check(Contains(why, "destroy the stage Model before the rank Model"), "destroying the owner under a live borrower names the rule");
+    Check(CheckEmbedMirrorBorrow(*stage, 1, 4).empty(), "an owning lease may be borrowed on its device");
+    owner.reset();  // the rank Model dies first (or a ModelOptions copy is the last holder): the borrower is unaffected
+    Check(freed == 0 && stage->keepalive != nullptr, "the owner destroyed first: the buffer is still alive for the borrower");
     std::shared_ptr<const EmbedMirrorLease> second = stage;
-    Check(EmbedMirrorBorrowers(owner) == 2, "two borrowers");
-
-    // Negative control: a counter that forgets the borrower (compares the count to 1 the wrong way) is caught.
-    const bool mutant_sees_borrower = owner.use_count() > 2;  // off by one
-    Check(mutant_sees_borrower, "negative control: the off-by-one counter still sees TWO borrowers ...");
     stage.reset();
-    Check(EmbedMirrorBorrowers(owner) == 1 && !(owner.use_count() > 2), "... but misses the last one, which the real counter reports");
+    Check(freed == 0, "... and for a second borrower after the first is gone");
   }
-  Check(EmbedMirrorLeaseViolation(owner).empty(), "stage destroyed first, then the owner: no violation");
+  Check(freed == 1, "the buffer is freed exactly once, when the last copy of the lease goes");
+
+  // Negative control: a lease that does not own its buffer (the old rule: the owner's Container held the DeviceBuffer) frees
+  // it with the owner and leaves the borrower reading freed memory; the borrow check refuses it, and the ownership test above
+  // would see the buffer freed under the borrower.
+  {
+    freed = 0;
+    std::shared_ptr<void> owners_buffer = std::make_shared<Buffer>(&freed);
+    std::shared_ptr<const EmbedMirrorLease> borrower = make_lease(false);
+    owners_buffer.reset();  // the owner dies; nothing ties the borrower to the buffer
+    Check(freed == 1 && borrower->keepalive == nullptr, "negative control: a non-owning lease sees the buffer freed under it ...");
+    Check(Contains(CheckEmbedMirrorBorrow(*borrower, 1, 4), "no owner"), "... and the borrow check refuses a lease with no owner");
+  }
 
   EmbedMirrorLease l;
   l.data = kMirror;
   l.elems = 4;
   l.device = 1;
+  l.keepalive = std::make_shared<int>(0);
   Check(CheckEmbedMirrorBorrow(l, 1, 4).empty(), "borrow on the owner's device, same size");
   Check(Contains(CheckEmbedMirrorBorrow(l, 0, 4), "device"), "a borrower on the other card is refused (no peer access)");
   Check(Contains(CheckEmbedMirrorBorrow(l, 1, 5), "elements"), "a mirror of another size is refused");

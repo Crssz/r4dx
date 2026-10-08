@@ -251,7 +251,7 @@ struct ModelOptions {
   //     globally indexed, NumLoadedLayers() stays N, layers below `split` are empty and get no state -- plus the final norm, the
   //     full lm_head and the full MTP head (so its Prefill logits and MTP priming equal TP=1's), no vision tower (geometry only), no drafter.
   // Both are TP=1 Models (tp.world == 1), take the process's shared pinned embedding copy and, on the card of the rank that
-  // owns one, borrow that rank's device mirror (destroy the stage Model first), and size their KV by max_ctx = the stage-KV
+  // owns one, borrow that rank's device mirror (the lease keeps it alive, so the destruction order is free), and size their KV by max_ctx = the stage-KV
   // capacity S (CheckStageKv). kOff (the default) leaves every path exactly as before.
   struct StageOnlyOptions {
     stage::Role role = stage::Role::kOff;

@@ -186,12 +186,12 @@ void RealMapping() {
 void Sizes() {
   const ModelConfig cfg = RealConfig();
   const StateGeometry g = StateGeometry::FromRules(cfg);
-  const PlanParams p35 = PlanParams::ForSplit(g, 35);
+  const PlanParams p35 = PlanParams::ForSplit(g, 35, g.conv_live);
   Check(p35.stage[kStageA].attn.size() == 8 && p35.stage[kStageA].attn.back() == 31 && p35.stage[kStageA].gdn.size() == 27,
         "k = 35: stage A owns attention 3..31 (8) and 27 GDN layers; layer 35 is stage B's");
   Check(p35.stage[kStageB].attn.size() == 8 && p35.stage[kStageB].attn.front() == 35 && p35.stage[kStageB].gdn.size() == 21,
         "k = 35: stage B owns attention 35..63 (8) and 21 GDN layers");
-  const PlanParams p32 = PlanParams::ForSplit(g, 32);
+  const PlanParams p32 = PlanParams::ForSplit(g, 32, g.conv_live);
   Check(p32.stage[kStageA].gdn.size() == 24 && p32.stage[kStageB].gdn.size() == 24 && p32.stage[kStageA].attn.size() == 8 && p32.stage[kStageB].attn.size() == 8,
         "k = 32: 8 attention + 24 GDN layers on each stage");
 
@@ -284,6 +284,30 @@ void Sizes() {
       }
     }
   }
+  {  // ForSplit takes the rank's pitch from the caller: a speculating rank (window 8) is conv_width - 2 + window = 10 entries
+    const int64_t spec_pitch = g.conv_live - 1 + 8;
+    const PlanParams p = PlanParams::ForSplit(g, 35, spec_pitch);
+    Check(p.stage_conv_pitch == g.conv_live && p.rank_conv_pitch == spec_pitch, "ForSplit: the stage keeps the compact pitch, the rank gets the caller's");
+    const ReshardPlan plan = ScatterPlan(g, p, 0, 16);
+    bool seen = false;
+    for (const CopyOp& op : plan.ops) {
+      if (op.kind == StateKind::kGdnConv && op.rank == 1) {
+        Check(op.runs[1].rank_pitch == static_cast<uint64_t>(spec_pitch * 2) && op.runs[1].rank_off == static_cast<uint64_t>(1024 * spec_pitch * 2) &&
+                  op.runs[1].full_pitch == 6,
+              "speculating rank conv: rank_pitch and rank_off use 2 * (conv_width - 2 + window) bytes per channel");
+        seen = true;
+        break;
+      }
+    }
+    Check(seen, "a rank-1 conv op exists in the speculating plan");
+    bool refused = false;
+    try {
+      (void)PlanParams::ForSplit(g, 35, g.conv_live - 1);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    Check(refused, "ForSplit refuses a rank pitch below the live conv entries");
+  }
 
   // The warm gather from a tracker plan: 300 rows behind the position, both stages stale.
   {
@@ -335,7 +359,7 @@ void Ring() {
   Check(threw, "a zero piece size is refused");
   // the real plan's stream
   const StateGeometry g = StateGeometry::FromRules(RealConfig());
-  const ReshardPlan plan = ScatterPlan(g, PlanParams::ForSplit(g, 35), 0, 131072);
+  const ReshardPlan plan = ScatterPlan(g, PlanParams::ForSplit(g, 35, g.conv_live), 0, 131072);
   const std::vector<RingPiece> xy = RingPiecesFrom(plan, kStageA), yx = RingPiecesFrom(plan, kStageB);
   Check(xy.size() == 9 && yx.size() == 10, "128k: 9 pieces X->Y (1065 MiB), 10 pieces Y->X (1184 MiB)");
 }
@@ -436,7 +460,7 @@ void HandChecked() {
   Check(GatherRef(g, r0, r1) == x, "hand: gather restores the image");
 
   // Plan ops on the hand model (k = 2: stage A = layers 0, 1; stage B = layers 2, 3 + MTP), rows [0, 2) = block 0.
-  const PlanParams p = PlanParams::ForSplit(g, 2);
+  const PlanParams p = PlanParams::ForSplit(g, 2, g.conv_live);
   const ReshardPlan plan = ScatterPlan(g, p, 0, 2);
   Check(p.stage[0].gdn.size() == 2 && p.stage[0].attn.empty() && p.stage[1].gdn.size() == 1 && p.stage[1].attn == std::vector<int64_t>({3}), "hand: layer ownership");
   Check(plan.ops.size() == 16, "hand: stage A 8 ops (2 GDN layers x 2 ranks x recurrent+conv), stage B 4 GDN + 2 KV + 2 MTP");
@@ -538,7 +562,7 @@ struct Harness {
   int64_t blocks;
   LiveImage x, y;  // x = the new truth, y = the stale content of the destination
   std::vector<Side> stage, rank;
-  Harness(const ModelConfig& cfg, int64_t split, int64_t blocks_in) : g(StateGeometry::FromRules(cfg, 4)), p(PlanParams::ForSplit(g, split)), blocks(blocks_in) {
+  Harness(const ModelConfig& cfg, int64_t split, int64_t blocks_in) : g(StateGeometry::FromRules(cfg, 4)), p(PlanParams::ForSplit(g, split, kRankPitch)), blocks(blocks_in) {
     p.stage_conv_pitch = kStagePitch;
     p.rank_conv_pitch = kRankPitch;
     x = RandomImage(g, blocks);
@@ -707,12 +731,12 @@ void NegativeControls() {
     Apply(wrong, &h.stage, &h.rank);
     Check(!RankMatches(h, BlockRange{0, 2}, BlockRange{0, 2}), "NEGATIVE CONTROL: a wrong stage/rank mapping puts each half on the wrong rank");
     const StateGeometry g = StateGeometry::FromRules(RealConfig());
-    const PlanTotals a = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 35), 0, 8192));
+    const PlanTotals a = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 35, g.conv_live), 0, 8192));
     Check(a.CrossFrom(kStageA) != a.CrossFrom(kStageB), "the two directions carry different amounts (so a swapped direction is visible in the sizes)");
   }
   {  // (6) a plan for the wrong split moves the wrong layers
     const StateGeometry g = StateGeometry::FromRules(RealConfig());
-    const PlanTotals a = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 35), 0, 8192)), b = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 32), 0, 8192));
+    const PlanTotals a = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 35, g.conv_live), 0, 8192)), b = Totals(ScatterPlan(g, PlanParams::ForSplit(g, 32, g.conv_live), 0, 8192));
     Check(a.CrossFrom(kStageA) != b.CrossFrom(kStageA), "NEGATIVE CONTROL: k = 32 vs 35 changes the GDN layers each direction carries (24 vs 27)");
   }
   {  // refusals
@@ -748,7 +772,7 @@ void NegativeControls() {
     Check(threw, "FromRules refuses a model of another family");
     threw = false;
     try {
-      (void)ScatterPlan(good, PlanParams::ForSplit(good, 3), 5, 5);
+      (void)ScatterPlan(good, PlanParams::ForSplit(good, 3, good.conv_live), 5, 5);
     } catch (const std::invalid_argument&) {
       threw = true;
     }

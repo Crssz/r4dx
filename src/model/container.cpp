@@ -215,7 +215,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
       if (const std::string why = CheckEmbedMirrorBorrow(*o.borrowed_embed_mirror, device, static_cast<size_t>(n)); !why.empty()) {
         throw std::invalid_argument("r4dx::model::Container::Load: " + why);
       }
-      c.embed_borrowed_ = o.borrowed_embed_mirror;
+      c.embed_mirror_ = o.borrowed_embed_mirror;
     } else if (o.embed_device_resident_decided >= 0) {
       if (o.embed_device_resident_decided != 0) c.UploadEmbedMirror(static_cast<size_t>(n));
     } else if (embed_device_resident) {
@@ -785,17 +785,6 @@ void Container::AssignTrellisTickets() {
   });
 }
 
-Container::~Container() {
-  if (!embed_lease_) return;
-  // Freeing the mirror under a live borrower would leave a stage Model gathering embeddings from freed device memory: the
-  // destruction order (stage Model first, then the rank Model that owns the mirror) is a hard rule, so break it loudly.
-  if (const std::string why = EmbedMirrorLeaseViolation(embed_lease_); !why.empty()) {
-    std::fprintf(stderr, "r4dx::model::Container: FATAL: %s\n", why.c_str());
-    std::fflush(stderr);
-    std::abort();
-  }
-}
-
 void Container::ThrowLayerNotLoaded(int64_t i) const {
   if (i < 0 || i >= NumLoadedLayers()) {  // (what layers_.at(i) always threw)
     throw std::out_of_range("r4dx::model::Container: layer " + std::to_string(i) + " is outside the " +
@@ -807,13 +796,15 @@ void Container::ThrowLayerNotLoaded(int64_t i) const {
 }
 
 void Container::UploadEmbedMirror(size_t elems) {
-  embed_tokens_dev_ = core::DeviceBuffer<uint16_t>(elems);
-  embed_tokens_dev_.CopyFromHost(EmbedTokensHost(), elems);
+  // The lease owns the buffer (embed_mirror_lease.h): a stage Model borrowing it keeps it alive past this Container.
+  auto dev = std::make_shared<core::DeviceBuffer<uint16_t>>(elems);
+  dev->CopyFromHost(EmbedTokensHost(), elems);
   auto lease = std::make_shared<EmbedMirrorLease>();
-  lease->data = embed_tokens_dev_.data();
+  lease->data = dev->data();
   lease->elems = elems;
   R4DX_HIP_CHECK(hipGetDevice(&lease->device));
-  embed_lease_ = std::move(lease);
+  lease->keepalive = std::move(dev);
+  embed_mirror_ = std::move(lease);
 }
 
 void Container::ZeroTrellisTickets(hipStream_t stream) {

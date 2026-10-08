@@ -154,6 +154,23 @@ void GatherBudget() {
   Check(kGatherBudgetBytes == 512 * kMiB, "512 MiB");
 }
 
+// The stage-KV capacity as a load argument (design 9 P0, "max_ctx = S check"): S is whole blocks, >= 16384, <= the ranks' max-ctx.
+void StageCtxCheck() {
+  constexpr int64_t kBlock = 16;
+  Check(CheckStageCtx(131072, 131072, kBlock).empty(), "S = max-ctx = 131072 is fine");
+  Check(CheckStageCtx(16384, 131072, kBlock).empty(), "S = 16384 (the floor) is fine");
+  Check(!CheckStageCtx(16383, 131072, kBlock).empty(), "S just below the 16384 floor is refused");
+  Check(!CheckStageCtx(131088, 131072, kBlock).empty(), "S above the ranks' --max-ctx is refused");
+  Check(!CheckStageCtx(100925, 131072, kBlock).empty(), "S that is not a whole number of blocks is refused (the cache would round up)");
+  Check(!CheckStageCtx(32768, 65536, 0).empty(), "a zero block size is refused");
+  // The planned S of the table's S-limited rows (100925 / 35389) becomes loadable once aligned down.
+  Check(AlignStageCtx(100925, kBlock) == 100912 && CheckStageCtx(AlignStageCtx(100925, kBlock), 196608, kBlock).empty(), "100925 aligns to 100912");
+  Check(AlignStageCtx(35389, kBlock) == 35376 && AlignStageCtx(35376, kBlock) == 35376, "35389 aligns to 35376; aligned values are fixed points");
+  Check(AlignStageCtx(0, kBlock) == 0 && AlignStageCtx(-5, kBlock) == 0 && AlignStageCtx(100, 0) == 0, "AlignStageCtx degenerate inputs");
+  Check(StageFits(131072, 131072) && !StageFits(131073, 131072) && StageFits(0, 16384) && !StageFits(-1, 16384),
+        "a prompt fits iff its total context is <= S (else the TP prefill path)");
+}
+
 }  // namespace
 
 int main() {
@@ -161,6 +178,7 @@ int main() {
   Refusals();
   MinRows();
   GatherBudget();
+  StageCtxCheck();
   if (g_fails != 0) {
     std::fprintf(stderr, "test_hybrid_budget_cpu: %d FAILED\n", g_fails);
     return 1;

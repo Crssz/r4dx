@@ -88,6 +88,10 @@ struct PpOptions {
   int max_inflight = 1;    // ... and the number of units it keeps queued, [0, 64]
   int slots = 3;           // the hand-over ring, [2, 8]
   int timeout_ms = 30000;  // bound of every wait between the stages
+  // Load stage A lean (ModelOptions::stage_only, front role; docs/pp-tp2-hybrid.md 9 P0): no lm_head / MTP head / vision tower, the
+  // split layer as its input_layernorm only, no KV or GDN state for it. Off by default (stage A then loads reserve_split + 1 whole
+  // layers as always); R4DX_PP_STAGE_ONLY=1 also turns it on. The prefill bytes must not change (test_pp_real_identity).
+  bool stage_only = false;
 };
 
 // One rank's device memory, as hipMemGetInfo reports it for that rank's device (device-wide: other

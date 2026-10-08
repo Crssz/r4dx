@@ -120,6 +120,13 @@ void Model::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
     if (target_layers[i] < 0 || target_layers[i] >= num_layers) {
       throw std::out_of_range("Model::AttachDflashFeatureCapture: target layer index out of range");
     }
+    // A hole-prefix back stage legitimately lists target layers below its first layer (their columns arrive with the carry, the
+    // front stage captured them), but the front stage never runs layer `split` (norm-only) or anything above: a target there
+    // would silently capture nothing.
+    if (stage_role_ == stage::Role::kFront && target_layers[i] >= stage_split_) {
+      throw std::out_of_range("Model::AttachDflashFeatureCapture: target layer " + std::to_string(target_layers[i]) +
+                              " is not run by the front stage (split " + std::to_string(stage_split_) + ")");
+    }
     if (i > 0 && target_layers[i] <= target_layers[i - 1]) {
       throw std::invalid_argument(
           "Model::AttachDflashFeatureCapture: target_layers must be sorted, strictly ascending");
@@ -202,7 +209,22 @@ Model Model::Load(const ModelOptions& opts) {
   if (tp.submit_layers < 0 || tp.submit_layers > 64 || tp.max_inflight_units < 0 || tp.max_inflight_units > 64) {
     throw std::invalid_argument("Model::Load: tp.submit_layers and tp.max_inflight_units must be in [0, 64]");
   }
-  const ModelOptions::VisionMode vision_mode = opts.vision;
+  // Hybrid mode's stage-only loads (ModelOptions::stage_only, stage_load.h): TP=1 Models holding one pipeline stage's layers.
+  // Validated before anything is read; every stage-only Model also loads without the vision tower (the tower is rank 0's).
+  const ModelOptions::StageOnlyOptions& so = opts.stage_only;
+  const bool stage_only = so.role != stage::Role::kOff;
+  stage::RoleRequest stage_req;
+  stage_req.role = so.role;
+  stage_req.split = so.split;
+  stage_req.layer_limit = opts.layer_limit;
+  stage_req.tp_world = tp.world;
+  stage_req.mtp_draft_k = opts.mtp_draft_k;
+  stage_req.dflash_draft_k = opts.dflash_draft_k;
+  stage_req.dflash_container = !opts.dflash_container.empty();
+  if (const std::string why = stage::ValidateRole(stage_req); !why.empty()) {
+    throw std::invalid_argument("Model::Load: " + why);
+  }
+  const ModelOptions::VisionMode vision_mode = stage_only ? ModelOptions::VisionMode::kOff : opts.vision;
   (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
   (void)FakeQuantWRequest();    // R4DX_FAKEQ_W: likewise
   // R4DX_PREFILL_INT8 (prefill_int8.h, docs/int8-prefill.md "Production path"; ON by default): the request is parsed
@@ -264,7 +286,34 @@ Model Model::Load(const ModelOptions& opts) {
   // VRAM breakdown line -- the same treatment the DFlash2 drafter gets below, and the only honest
   // way to report a delta docs/vision.md quotes as a number (docs/vision.md "Load policy").
   const bool want_vision = vision_mode != ModelOptions::VisionMode::kOff;
-  if (!is_tp_rank) {
+  if (stage_only) {
+    const stage::ContainerArgs ca = stage::ContainerArgsFor(stage_req);
+    ContainerLoadOptions co;
+    co.layout = opts.layout;
+    co.lm_head_layout = opts.layout;
+    co.mtp_head_layout = opts.mtp_head_layout.value_or(opts.layout);
+    co.layer_limit = ca.layer_limit;
+    co.embed_device_resident = opts.embed_device_resident;
+    co.embed_device_resident_decided = so.embed_device_resident_decided;
+    co.load_vision = false;  // the tower is rank 0's; a stage only needs the geometry to splice the rows rank 0 encoded
+    co.parse_vision_config = opts.vision != ModelOptions::VisionMode::kOff;
+    co.first_layer = ca.first_layer;
+    co.norm_only_from = ca.norm_only_from;
+    co.skip_heads = ca.skip_heads;
+    co.shared_embed_host = so.shared_embed_host;
+    co.borrowed_embed_mirror = so.borrowed_embed_mirror;
+    m.container_ = Container::Load(opts.container_path, co);
+    m.stage_role_ = so.role;
+    m.stage_split_ = so.split;
+    if (m.container_.HasRotation()) {
+      throw std::invalid_argument("Model::Load: stage_only is not available for a rotated (quant2) container: the stack-entry and "
+                                  "-exit rotations straddle the stages (docs/pp-prefill.md 4)");
+    }
+    if (m.container_.NumLoadedLayers() <= so.split) {
+      throw std::invalid_argument("Model::Load: stage_only.split " + std::to_string(so.split) + " must be below the " +
+                                  std::to_string(m.container_.NumLoadedLayers()) + " loaded layers");
+    }
+  } else if (!is_tp_rank) {
     m.container_ = Container::Load(opts.container_path, opts.layout, opts.layout, opts.layer_limit,
                                     opts.mtp_head_layout.value_or(opts.layout),
                                     opts.embed_device_resident, want_vision);
@@ -369,7 +418,9 @@ Model Model::Load(const ModelOptions& opts) {
   // 0 at TP=1, so every sizing below is unchanged there.
   m.vocab_local_ = m.container_.LmHead().N;
   m.vocab_offset_ = cfg.VocabShardBegin();
-  if (m.vocab_local_ * tp.world != cfg.vocab_size) {
+  // (A front stage has no lm_head: vocab_local_ is 0 and nothing sized by it is ever read -- ChunkEpilogue refuses a logits
+  // request on it.)
+  if (so.role != stage::Role::kFront && m.vocab_local_ * tp.world != cfg.vocab_size) {
     throw std::runtime_error("Model::Load: lm_head has " + std::to_string(m.vocab_local_) +
                              " rows, not vocab_size / tp.world = " +
                              std::to_string(cfg.vocab_size / tp.world));
@@ -498,6 +549,10 @@ Model Model::Load(const ModelOptions& opts) {
   m.gdn_states_.resize(static_cast<size_t>(num_layers));
   m.kv_caches_.resize(static_cast<size_t>(num_layers));
   for (int64_t i = 0; i < num_layers; ++i) {
+    // A layer this Model does not run -- a hole of a back stage, the front stage's norm-only split layer -- gets neither a GDN
+    // state nor a KV cache (the optionals stay empty, which every loop over them already tolerates). Every layer of a
+    // Model that is not stage-only is fully resident, so nothing changes there.
+    if (!m.container_.LayerLoaded(i)) continue;
     if (cfg.IsGdnLayer(i)) {
       m.gdn_states_[static_cast<size_t>(i)].emplace(
           /*max_seqs=*/1, /*H=*/cfg.linear_num_value_heads, /*V=*/cfg.linear_value_head_dim,
@@ -780,6 +835,19 @@ Model Model::Load(const ModelOptions& opts) {
     (void)once;
   }
 
+  if (stage_only) {
+    int64_t n_kv = 0, n_gdn = 0;
+    for (const auto& kv : m.kv_caches_) n_kv += kv ? 1 : 0;
+    for (const auto& gs : m.gdn_states_) n_gdn += gs ? 1 : 0;
+    std::cerr << "[r4dx::model::Model] stage-only load, " << stage::RoleName(so.role) << ", split k=" << so.split << ": "
+              << n_kv << " KV caches (" << opts.max_ctx << " tokens each), " << n_gdn << " GDN states, "
+              << (m.container_.HasLmHead() ? "with" : "no") << " lm_head, " << (m.container_.HasMtp() ? "with" : "no")
+              << " MTP head, embedding host " << (so.shared_embed_host ? "shared" : "own") << ", device mirror "
+              << (so.borrowed_embed_mirror ? "borrowed"
+                                           : (m.container_.EmbedTokensDeviceResident() ? "own" : "none (host gather)"))
+              << "\n";
+  }
+
   // R4DX_CLOCK_PROBE / R4DX_PROFILE_LINEARS (debug_probe.h), TP = 1 only: the first Get()
   // calibrates the probe's clocks, here where the device is idle. nullptr, and no work, when
   // neither is set.
@@ -1054,6 +1122,14 @@ void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64
 
 void Model::CheckTuningScope() const { CheckTp2TuningScope(tp2_tuning_, "Model::CheckTuningScope"); }
 
+void Model::CheckLayersLoaded(int64_t first, int64_t last, const char* what) const {
+  if (container_.AllLayersLoaded() && first >= 0 && first <= last && last <= container_.NumLoadedLayers()) return;
+  if (const std::string why = container_.CheckLayerRangeLoaded(first, last); !why.empty()) {
+    throw std::logic_error(std::string(what) + ": " + why + " (stage_only role " + stage::RoleName(stage_role_) + ", split " +
+                           std::to_string(stage_split_) + ")");
+  }
+}
+
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
                                     bool want_logits, int32_t* greedy_token_out,
                                     const SummaryRequest* summary_out,
@@ -1282,6 +1358,8 @@ void Model::RunLayerRange(ChunkRun& r, int64_t first, int64_t last) {
   const uint16_t* normed_in = r.normed_in;
   int normed_in_epilogue = r.normed_in_epilogue;
 
+  // A stage-only Model runs only the layers it holds: asserted up front, before any layer has touched the carry or the state.
+  CheckLayersLoaded(first, last, "Model::RunLayerRange");
   for (int64_t i = first; i < last; ++i) {
     const LayerWeights& lw = container_.Layer(i);
     const bool has_next_layer = (i + 1 < num_layers);
@@ -1369,7 +1447,7 @@ void Model::RunLayerRange(ChunkRun& r, int64_t first, int64_t last) {
     // residual+rmsnorm epilogue ALSO emit x_normed_out's fused cast epilogue, for layer i+1's
     // Gdn/Attn sub-block to consume, unless this is the last layer.
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
-                has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                has_next_layer ? container_.LayerInputNorm(i + 1).data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
                 normed_in_epilogue, buf_normed_pre_.data(),
                 has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
@@ -1518,6 +1596,7 @@ std::vector<float> Model::ChunkEpilogue(ChunkRun& r) {
   // it runs (see that comment) -- skipping the sync here would silently break that invariant for
   // every chunk but the last.
   if (want_logits) {
+    if (!container_.HasLmHead()) throw std::logic_error("Model::ChunkEpilogue: this front-stage Model has no lm_head");
     FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
     // decode-t1 item 1 (docs/perf.md): a greedy step argmaxes the lm_head GEMM's bf16 output directly
     // (the widen to fp32 is exact, so the comparisons are the fp32 row's) -- no widen launch, and
@@ -2291,7 +2370,7 @@ Model::StepProfile Model::DecodeStepProfiled(int32_t token_id) {
     {
       Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
       mlp.Forward(stream_, arena_, cur, cur, 1, buf_normed_.data(),
-                  has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                  has_next_layer ? container_.LayerInputNorm(i + 1).data() : nullptr,
                   has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
                   buf_normed_pre_.data(),
                   has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
@@ -2471,7 +2550,7 @@ Model::StepProfile Model::PrefillProfiled(const std::vector<int32_t>& token_ids)
         // chunk that RunChunk never issues).
         Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
         mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
-                    has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                    has_next_layer ? container_.LayerInputNorm(i + 1).data() : nullptr,
                     has_next_layer ? buf_normed_.data() : nullptr, &acc, normed_in_epilogue,
                     buf_normed_pre_.data(),
                     has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
@@ -2512,6 +2591,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                                           std::vector<kernels::RowSummary>* summaries_out,
                                           float summary_inv_temperature) {
   CheckTuningScope();
+  CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::VerifyWindow");  // a stage-only Model never verifies
   // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
   // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
   // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
@@ -2671,7 +2751,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
 
     Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
     mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
-                has_next_layer ? container_.Layer(i + 1).input_layernorm.data() : nullptr,
+                has_next_layer ? container_.LayerInputNorm(i + 1).data() : nullptr,
                 has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr,
                 normed_in_epilogue, buf_normed_pre_.data(),
                 has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
@@ -2915,6 +2995,7 @@ std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                                                const kernels::SampleParams* params,
                                                std::mt19937_64* rng) {
   CheckTuningScope();  // the draft loop's GEMMs run before the verify window does
+  CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::DecodeStepMtpImpl");
   // Tensor parallel (docs/tp.md 8.1): MtpHead::Draft merges the full-vocab head's per-step argmax
   // across ranks itself (H6), and VerifyWindow merges the verify rows (H4), so every rank drafts,
   // verifies and commits the same round; nothing here differs from TP=1.
@@ -3028,6 +3109,7 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
                                                   DflashRoundTrace* trace_out,
                                                   std::vector<int32_t>* drafted_tokens_out) {
   CheckTuningScope();  // the drafter's GEMMs (DraftRound, InjectFeatures) run under the Model's flag, not the thread's default
+  CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::DecodeStepDflashImpl");
   // Tensor parallel (docs/tp.md 8.2): DraftRound merges the per-rank top-16s itself (H7), so both
   // ranks walk the same selector lattice to the same drafts; the rest of the round is the shared
   // verify path (7.6), unchanged.

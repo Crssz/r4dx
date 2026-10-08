@@ -224,6 +224,12 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
     ao.dflash_draft_k = 0;
     ao.prompt_checkpoint = false;
     ao.pp = 0;
+    if (pp.stage_only || EnvFlag("R4DX_PP_STAGE_ONLY")) {  // lean stage A (docs/pp-tp2-hybrid.md 9 P0): the same layers, fewer weights
+      ao.stage_only.role = stage::Role::kFront;
+      ao.stage_only.split = m->reserve_split_;
+      std::fprintf(stderr, "[r4dx-pp] stage A loads lean (stage_only front, split layer %lld as input_layernorm only)\n",
+                   static_cast<long long>(m->reserve_split_));
+    }
     const int stage_b_chunk = b.PrefillChunkRows();
     const bool stage_b_i8 = b.PrefillInt8Enabled();
     const int submit_layers = pp.submit_layers, inflight = pp.max_inflight;

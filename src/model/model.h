@@ -47,6 +47,7 @@
 #include "prefill_chunk.h"  // kPrefillChunkBase / kPrefillChunkWide (docs/prefill.md)
 #include "step_meta.h"      // the one-copy decode step metadata layout (decode-t1 item 5)
 #include "prefill_int8.h"   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path")
+#include "stage_sync.h"     // StageSyncState: the scalars handed between a TP rank and the hybrid mode's stages
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
@@ -241,6 +242,25 @@ struct ModelOptions {
   // carry copied through host staging, on this one device. A diagnostic and test mode (the bytes equal the
   // monolithic run's); not for TP ranks or rotated containers.
   int pp_emulate_split = -1;
+  // Hybrid mode (docs/pp-tp2-hybrid.md 1, 7, 9 "P0 prerequisites"): load this Model as one PIPELINE STAGE of the PP-2 prefill that
+  // sits next to a TP-2 rank Model on the same card, holding only what the stage runs (stage_load.h has the policy):
+  //   kFront (stage X, the PP stage A): layers [0, split) plus the input_layernorm of layer `split` (norm-only: what layer
+  //     split - 1's Mlp fuses -- the reason PpModel loads `reserve_split + 1` layers), NO lm_head / MTP head / drafter / vision tower (the vision GEOMETRY is parsed, so the stage splices the image rows rank 0 encoded),
+  //     and no KV cache or GDN state for layer `split`. layer_limit must be -1 or split + 1.
+  //   kBack (stage Y, the PP stage B / decode side of rank 0): layers [split, N) as a HOLE-PREFIX container -- layers_ stays
+  //     globally indexed, NumLoadedLayers() stays N, layers below `split` are empty and get no state -- plus the final norm, the
+  //     full lm_head and the full MTP head (so its Prefill logits and MTP priming equal TP=1's), no vision tower (geometry only), no drafter.
+  // Both are TP=1 Models (tp.world == 1), take the process's shared pinned embedding copy and, on the card of the rank that
+  // owns one, borrow that rank's device mirror (destroy the stage Model first), and size their KV by max_ctx = the stage-KV
+  // capacity S (CheckStageKv). kOff (the default) leaves every path exactly as before.
+  struct StageOnlyOptions {
+    stage::Role role = stage::Role::kOff;
+    int64_t split = 0;  // k
+    std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;  // null: this Model pins its own copy
+    std::shared_ptr<const EmbedMirrorLease> borrowed_embed_mirror;           // null: this Model decides itself
+    int embed_device_resident_decided = -1;  // when no mirror is borrowed: 1 mirror, 0 host-only, -1 the free-VRAM heuristic
+  };
+  StageOnlyOptions stage_only;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -972,8 +992,41 @@ class Model {
   // (R4DX_PP_VERIFY, tests/model/test_pp_real_identity.cpp). Synchronous, slow (copies the state to the host).
   std::vector<std::pair<std::string, uint64_t>> PpLiveDigest(int64_t split);
 
+  // ---- hybrid mode: stage-only Models and the TP rank's adoption of a pipelined prefill (docs/pp-tp2-hybrid.md 3, 5, 9) ----
+  // ModelOptions::stage_only this Model was loaded with (kOff for every other Model) and its split k.
+  stage::Role StageOnlyRole() const { return stage_role_; }
+  int64_t StageOnlySplit() const { return stage_split_; }
+  // Throws std::logic_error unless layers [first, last) are all fully resident (not a hole, not a norm-only layer): the entry
+  // points of a stage (PpAttach, the layer loops) assert their range so a hole is never executed with null weights. O(1) for
+  // every Model that is not stage-only.
+  void CheckLayersLoaded(int64_t first, int64_t last, const char* what) const;
+  // The stage-KV capacity S (design 2): every attention layer this Model holds has a cache of exactly ceil(S / block) blocks, and
+  // no layer it does not run (a hole, the front stage's split layer) has one. Throws std::logic_error otherwise. The S itself
+  // is checked by hybrid::CheckStageCtx (hybrid_budget.h). StageKvCapacityTokens() is the capacity of the caches (-1: none).
+  void CheckStageKv(int64_t stage_ctx) const;
+  int64_t StageKvCapacityTokens() const;
+  // The scalars a pipelined prefill call hands over (stage_sync.h): this Model's pos / started / mrope state and, when it has an
+  // MTP head with a valid seed, the seed row (device idle on return: one 10 KiB D2H). Non-const because it synchronizes.
+  StageSyncState StageGetSyncState();
+  // Before a pipelined call: a TP rank's state into a stage Model of EITHER role (PpSetSyncState is stage A's, PpModel's). pos /
+  // started / mrope, at_prefill_end_ = false, and -- when this Model has an MTP head (stage Y) -- mtp_seed_valid_ and the seed row
+  // (without it Y's `have_boundary` is stale after a decode and the MTP KV row of the call's first position is skipped or
+  // primed from the wrong hidden state). Throws std::logic_error when not attached as a pipeline stage. Device idle.
+  void StageSetSyncState(const StageSyncState& s);
+  // After a pipelined call: the stage Y's end state into a TP rank Model (run on that rank's thread). pos / started / mrope
+  // active+delta, at_prefill_end_ = true, mtp_num_accepted_valid_ = false (no verify round has run on the new state), the write-
+  // once book clean, the drafter's rope delta, and the MTP seed (mtp_seed_valid_ + the 10 KiB row) when this rank has an MTP head.
+  // Does NOT touch the KV / GDN / MTP-KV / DFlash ring contents (the reshard and TpInjectDflashTail write those). Throws
+  // std::logic_error for a pipeline stage or a state that is not a finished prefill (pos <= 0). Device idle; not collective.
+  void TpAdoptPrefill(const StageSyncState& s);
+
  private:
   Model() = default;
+
+  // StageSetSyncState / TpAdoptPrefill's shared write of the scalars and the seed.
+  void ApplySyncState(const StageSyncState& s, bool at_prefill_end);
+  stage::Role stage_role_ = stage::Role::kOff;
+  int64_t stage_split_ = 0;
 
   // Runs every layer once over `token_ids` (<=64 of them), advancing `pos_` by token_ids.size().
   // `is_prefill_path` selects GDN's chunked-scan kernels (true) vs its sequential recurrent-update

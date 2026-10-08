@@ -85,6 +85,11 @@ set(R4DX_MODEL_TESTS
   # the live state of both stages compared after every hand-off; two negative controls. NEEDS BOTH GPUs and
   # both cards visible (HIP_VISIBLE_DEVICES=0,1, set below); SKIP 77 otherwise or without the containers. Written, NOT run by its author (GPU).
   test_pp_real_identity
+  # Hybrid mode P0 (docs/pp-tp2-hybrid.md 9): stage-only Models (ModelOptions::stage_only) next to a full Model on ONE card -- the
+  # hole-prefix back stage, the front stage with a norm-only split layer and no heads, the borrowed embedding mirror and shared host
+  # copy, StageSetSyncState on both roles, TpAdoptPrefill, the stage-KV check. Device 1, SKIP 77 without the 4-layer container.
+  # Written, NOT run by its author (CPU-only session). test_stage_load_cpu below is the policy half.
+  test_stage_load
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -313,6 +318,12 @@ add_test(NAME test_hybrid_budget_cpu COMMAND test_hybrid_budget_cpu)
 add_executable(test_reshard_plan_cpu test_reshard_plan_cpu.cpp)
 target_link_libraries(test_reshard_plan_cpu PRIVATE r4dx_tp_shard)
 add_test(NAME test_reshard_plan_cpu COMMAND test_reshard_plan_cpu)
+# test_stage_load_cpu: src/model/stage_load.h (layer kinds of a stage-only load, the request validation, the resident-range check),
+# embed_mirror_lease.h (the borrowed embedding mirror and its destruction-order rule) and stage_sync.h (the MTP seed rule of
+# StageSetSyncState / TpAdoptPrefill), with negative controls. The device half is test_stage_load (GPU).
+add_executable(test_stage_load_cpu test_stage_load_cpu.cpp)
+target_include_directories(test_stage_load_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_stage_load_cpu COMMAND test_stage_load_cpu)
 add_executable(test_tp_tuning_scope test_tp_tuning_scope.cpp)
 target_link_libraries(test_tp_tuning_scope PRIVATE r4dx_model_linear)
 add_test(NAME test_tp_tuning_scope COMMAND test_tp_tuning_scope)

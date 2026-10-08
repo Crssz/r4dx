@@ -99,6 +99,27 @@ inline StageCtxPlan PlanStageCtx(int64_t max_ctx, int64_t requested, const CardB
   return p;
 }
 
+// ---- the stage-KV capacity S as a load argument (design 9 P0, "stage-KV max_ctx = S check") ---------------------------------
+// The stage Models are loaded with ModelOptions::max_ctx = S, so S has to be something a PagedKvCache can honour exactly and
+// something the ranks' own caches cover: whole blocks (the cache rounds UP to a block, which would let a prompt past S be
+// accepted by the stage while the budget never paid for it), at least kMinStageCtx, at most the ranks' --max-ctx (a prompt
+// longer than the rank cache cannot be decoded anyway). AlignStageCtx rounds a planned S down to a block; CheckStageCtx is the
+// load-time check ("" = fine); Model::CheckStageKv is the device-side half (the caches really have that capacity, and no layer the
+// stage does not run has one). A prompt whose total context exceeds S takes the ordinary TP prefill (StageFits).
+inline int64_t AlignStageCtx(int64_t s, int64_t kv_block) { return kv_block > 0 && s > 0 ? s / kv_block * kv_block : 0; }
+inline std::string CheckStageCtx(int64_t s, int64_t rank_max_ctx, int64_t kv_block) {
+  if (kv_block <= 0) return "the KV block size must be positive";
+  if (s < kMinStageCtx) return "stage KV capacity " + std::to_string(s) + " tokens < " + std::to_string(kMinStageCtx);
+  if (s % kv_block != 0) {
+    return "stage KV capacity " + std::to_string(s) + " is not a whole number of " + std::to_string(kv_block) + "-token blocks";
+  }
+  if (s > rank_max_ctx) {
+    return "stage KV capacity " + std::to_string(s) + " exceeds the TP ranks' --max-ctx " + std::to_string(rank_max_ctx);
+  }
+  return "";
+}
+inline bool StageFits(int64_t n_total, int64_t s) { return n_total >= 0 && n_total <= s; }
+
 // ---- the min-rows model (design 5, "Break-even") ----------------------------------------------------------------------
 // A pipelined call of c chunks costs (c + 1) stage-chunk times (fill and drain) plus a fixed tail (warm gather, reshard,
 // DFlash window injection); the TP prefill costs c TP-chunk times. Provisional until P-1 re-measures the PP figures with the

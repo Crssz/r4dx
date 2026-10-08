@@ -25,9 +25,6 @@ using Clock = std::chrono::steady_clock;
 double Ms(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); }
 constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 constexpr std::chrono::seconds kShutdownWait{30};
-// A sync-back larger than this (KV rows stage A is missing x 16 KiB x ...) is not worth a pinned buffer of its own: the
-// call runs on the decode Model alone. 512 MiB = 32k rows of 8 attention layers.
-constexpr size_t kMaxKvSyncBytes = 512ull * 1024 * 1024;
 
 std::string GetEnvVar(const char* name) {
   char* v = nullptr;
@@ -41,26 +38,6 @@ std::string GetEnvVar(const char* name) {
 bool EnvFlag(const char* name) {
   const std::string v = GetEnvVar(name);
   return v == "1" || v == "on" || v == "true";
-}
-
-std::string WhatOf(const std::exception_ptr& e) {
-  try {
-    std::rethrow_exception(e);
-  } catch (const std::exception& x) {
-    return x.what();
-  } catch (...) {
-    return "unknown exception";
-  }
-}
-
-bool IsChannelPoisoned(const std::exception_ptr& e) {
-  try {
-    std::rethrow_exception(e);
-  } catch (const pp::ChannelPoisoned&) {
-    return true;
-  } catch (...) {
-    return false;
-  }
 }
 
 VramReport MakeVramReport(int rank) {
@@ -187,26 +164,32 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
   dfl_cols_max = std::max<int64_t>(dfl_cols_max, 4);  // room for a test capture (AttachDflashFeatureCapture)
   const std::vector<int64_t> attn = b.PpAttnLayers(split);
   const std::vector<int64_t> attn_max = b.PpAttnLayers(m->reserve_split_);
-  const size_t cap = pp::MaxSlotBytes(b.PrefillChunkRows(), hidden, dfl_cols_max, static_cast<int64_t>(attn_max.size()),
-                                      b.PpKvBlockSize(), b.PpKvBlockStrideBytes());
   m->hidden_ = hidden;
-  std::vector<uint8_t*> ptrs;
-  for (int i = 0; i < pp.slots; ++i) {
-    m->slots_.emplace_back(cap, hipHostMallocPortable);
-    ptrs.push_back(m->slots_.back().data());
-  }
-  const size_t gdn_bytes = b.PpGdnWireBytes(m->reserve_split_);
-  m->gdn_hand_ = core::PinnedBuffer<uint8_t>(gdn_bytes, hipHostMallocPortable);
-  m->gdn_sync_ = core::PinnedBuffer<uint8_t>(gdn_bytes, hipHostMallocPortable);
-  m->channel_ = std::make_unique<pp::StageChannel>(ptrs, cap);
-  std::fprintf(stderr,
-               "[r4dx-pp] split k=%lld (%lld attention layers and %zu DFlash columns on stage A), %d slots of %.1f MiB, GDN "
-               "hand-off %.1f MiB, min rows %d, bounded submission %d/%d on stage A%s\n",
-               static_cast<long long>(split), static_cast<long long>(attn.size()), targets_a.size(), pp.slots,
-               static_cast<double>(cap) / (1024.0 * 1024.0), static_cast<double>(gdn_bytes) / (1024.0 * 1024.0), pp.min_rows,
-               pp.submit_layers, pp.max_inflight, m->verify_ ? ", VERIFY on" : "");
+  m->run_.split = split;
+  m->run_.timeout_ms = pp.timeout_ms;
+  m->run_.carry_kv = true;       // --pp 2: stage A's KV blocks cross in the slots
+  m->run_.gdn_handoff = true;
+  // The buffers' sizes are known without a device; each group is allocated by the thread that owns its producing device and none lazily
+  // (docs/pp-tp2-hybrid.md 7): the sync-back buffers by this (the facade) thread -- stage B's, bound to its device by BindStageB above --
+  // the slots and the GDN hand-off by stage A's worker below. The KV sync buffer is sized for the whole stage-KV capacity (capped).
+  pp::StageBufferGeometry geo;
+  geo.slots = pp.slots;
+  geo.chunk_rows = b.PrefillChunkRows();
+  geo.hidden = hidden;
+  geo.dfl_cols_max = dfl_cols_max;
+  geo.attn_layers_max = static_cast<int64_t>(attn_max.size());
+  geo.block_size = b.PpKvBlockSize();
+  geo.block_stride_bytes = b.PpKvBlockStrideBytes();
+  geo.gdn_bytes = b.PpGdnWireBytes(m->reserve_split_);
+  const int64_t kv_capacity = b.StageKvCapacityTokens();
+  geo.kv_wire_full_ctx = kv_capacity > 0 ? b.PpKvWireBytes(m->reserve_split_, 0, kv_capacity) : 0;
+  const pp::StageBufferSpec spec = pp::MakeStageBufferSpec(geo, m->run_.carry_kv);
+  const size_t cap = spec.slot_bytes;
+  const size_t gdn_bytes = spec.gdn_bytes;
+  m->bufs_ = std::make_unique<pp::StageBuffers>(spec, pp::PinnedAllocator());
+  m->bufs_->AllocateBProduced();
 
-  // Stage A's thread, and its Model, built there.
+  // Stage A's thread: it allocates the buffers it produces into, then builds its Model.
   m->worker_ = std::make_unique<tp::RankWorker>(
       1,
       [dev_a] {
@@ -216,6 +199,15 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
       &m->done_, m->timing_);
   PpModel* const self = m.get();
   const auto kNoStall = tp::ProgressWatchdog::kNoStallLimit;
+  m->worker_->Post([self] { self->bufs_->AllocateAProduced(); });
+  if (const std::exception_ptr err = self->JoinStageA(kNoStall)) std::rethrow_exception(err);
+  m->channel_ = std::make_unique<pp::StageChannel>(m->bufs_->SlotPointers(), cap);
+  std::fprintf(stderr,
+               "[r4dx-pp] split k=%lld (%lld attention layers and %zu DFlash columns on stage A), %d slots of %.1f MiB, GDN "
+               "hand-off %.1f MiB, min rows %d, bounded submission %d/%d on stage A%s\n",
+               static_cast<long long>(split), static_cast<long long>(attn.size()), targets_a.size(), pp.slots,
+               static_cast<double>(cap) / (1024.0 * 1024.0), static_cast<double>(gdn_bytes) / (1024.0 * 1024.0), pp.min_rows,
+               pp.submit_layers, pp.max_inflight, m->verify_ ? ", VERIFY on" : "");
   {
     ModelOptions ao = m->opts_;
     ao.layer_limit = m->reserve_split_ + 1;  // [0, split) run; layer `split` only supplies the input_layernorm layer split - 1 fuses
@@ -294,10 +286,14 @@ PpModel::~PpModel() {
     }
   };
   wait_idle("its command");
-  if (a_) {
-    // Stage A's Model (and every device buffer it owns) dies on its own thread, as a TP rank's does (docs/tp.md 2.6).
+  if (a_ || (bufs_ && bufs_->AProducedAllocated())) {
+    // Stage A's Model (and every device buffer it owns) dies on its own thread, as a TP rank's does (docs/tp.md 2.6), and so does the
+    // pinned memory that thread allocated (the slots, the GDN hand-off).
     try {
-      worker_->Post([this] { a_.reset(); });
+      worker_->Post([this] {
+        a_.reset();
+        if (bufs_) bufs_->ReleaseAProduced();
+      });
     } catch (...) {
     }
     wait_idle("tearing down");
@@ -308,6 +304,7 @@ PpModel::~PpModel() {
     } catch (...) {
     }
   }
+  if (bufs_) bufs_->ReleaseBProduced();  // allocated on stage B's thread, freed on it (BindStageB above), after B's streams drained
 }
 
 // ---- stage A plumbing ------------------------------------------------------------------------------------------------
@@ -449,15 +446,15 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   const pp::MirrorTracker::SyncPlan plan =
       fault_ == TestFault::kSkipSyncBack ? pp::MirrorTracker::SyncPlan{} : tracker_.PlanSync(p0);
   const size_t kv_need = plan.kv_row1 > plan.kv_row0 ? b.PpKvWireBytes(split_, plan.kv_row0, plan.kv_row1) : 0;
-  if (kv_need > kMaxKvSyncBytes) {
-    // Stage A is that far behind: the sync-back would dwarf the gain. The decode Model runs the call alone, which leaves
-    // the mirror stale exactly as a decode step does.
+  if (!pp::KvSyncFits(kv_need, bufs_->KvSyncBytes())) {
+    // Stage A is that far behind: the sync-back would dwarf the gain (more than pp::kMaxKvSyncBytes). The decode Model runs the call
+    // alone, which leaves the mirror stale exactly as a decode step does.
     ++stats_.b_only_calls;
     NoteBOnly();
     return images != nullptr ? b.PrefillMultimodal(ids, *images) : b.Prefill(ids);
   }
 
-  auto st = std::make_shared<CallState>();
+  auto st = std::make_shared<pp::StageCall>();
   st->ids = ids;
   st->multimodal = images != nullptr;
   st->sync = b.PpGetSyncState();
@@ -467,123 +464,28 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   st->verify = verify_;
 
   // ---- the sync-back (B -> A): host-side export now, A imports at the start of its command -------------------------
-  if (plan.gdn) b.PpExportGdn(gdn_sync_.data(), split_);
-  if (kv_need > 0) {
-    if (kv_sync_.bytes() < kv_need) {
-      kv_sync_ = core::PinnedBuffer<uint8_t>(std::max<size_t>(kv_need, 16ull << 20), hipHostMallocPortable);
-    }
-    b.PpExportKvRows(kv_sync_.data(), split_, plan.kv_row0, plan.kv_row1);
-  }
-  if (st->verify) st->b_digest_sync = b.PpLiveDigest(split_);
+  pp::StageBExportSyncBack(b, *bufs_, run_, st.get());
 
   // ---- stage A's image spans: rows A can read (host); B keeps the caller's (device rows) ------------------------------
-  if (images != nullptr) {
-    const int64_t hidden = b.Config().hidden_size;
-    st->a_spans = *images;
-    st->a_rows.reserve(images->size());
-    for (ImageSpan& sp : st->a_spans) {
-      if (sp.embeds_on_host) continue;
-      const size_t n = static_cast<size_t>(sp.tokens * hidden);
-      st->a_rows.emplace_back(n);
-      R4DX_HIP_CHECK(hipMemcpy(st->a_rows.back().data(), sp.embeds, n * sizeof(uint16_t), hipMemcpyDeviceToHost));
-      sp.embeds = st->a_rows.back().data();
-      sp.embeds_on_host = true;
-    }
-  }
+  if (images != nullptr) pp::HostImageSpans(*images, b.Config().hidden_size, st.get());
   const double sync_ms = Ms(t_call0, Clock::now());
 
   // ---- stage A's command ------------------------------------------------------------------------------------------------
   pp::StageChannel* const ch = channel_.get();
   channel_->BeginCall(st->call_id);
-  early_import_ = false;
-  cur_call_ = st->call_id;
+  b_state_ = pp::StageBCallState{st->call_id, false};
   PpModel* const self = this;
-  const int64_t split = split_;
-  worker_->Post([self, st, ch, split] {
-    try {
-      Model& a = *self->a_;
-      const auto t0 = Clock::now();
-      a.PpSetSyncState(st->sync);
-      a.SetDflashInjectionEnabled(st->dflash_injection);
-      if (st->plan.gdn) a.PpImportGdn(self->gdn_sync_.data(), split);
-      if (st->plan.kv_row1 > st->plan.kv_row0) a.PpImportKvRows(self->kv_sync_.data(), split, st->plan.kv_row0, st->plan.kv_row1);
-      st->a_sync_ms = Ms(t0, Clock::now());
-      if (st->verify) {
-        const auto d = a.PpLiveDigest(split);
-        if (d != st->b_digest_sync) {
-          throw std::runtime_error("R4DX_PP_VERIFY: stage A's state after the sync-back differs from stage B's (position " +
-                                   std::to_string(st->sync.pos) + ")");
-        }
-      }
-      if (st->multimodal) {
-        (void)a.PrefillMultimodal(st->ids, st->a_spans);
-      } else {
-        (void)a.Prefill(st->ids);
-      }
-      // The GDN live state of A's layers follows the last chunk (compactly); B imports it while it computes its own last
-      // chunk when it is ready in time (OnLastChunk), else right after.
-      const auto t_exp = Clock::now();
-      a.PpExportGdn(self->gdn_hand_.data(), split);
-      st->a_gdn_export_ms = Ms(t_exp, Clock::now());
-      ch->PublishBulk(st->call_id);
-      if (st->verify) st->a_digest_end = a.PpLiveDigest(split);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "[r4dx-pp] stage A failed: %s\n", e.what());
-      ch->Poison(std::string("stage A failed: ") + e.what());
-      throw;
-    } catch (...) {
-      ch->Poison("stage A failed");
-      throw;
-    }
-  });
+  worker_->Post([self, st, ch, run = run_] { pp::RunStageA(*self->a_, *ch, *self->bufs_, run, *st); });
 
   // ---- stage B, on this thread ---------------------------------------------------------------------------------------------
-  struct ActiveGuard {
-    Model& m;
-    explicit ActiveGuard(Model& mm) : m(mm) { m.PpSetActive(true); }
-    ~ActiveGuard() {
-      try {
-        m.PpSetActive(false);
-      } catch (...) {
-      }
-    }
-  };
-  std::vector<float> logits;
-  std::exception_ptr berr;
-  double gdn_wait_ms = 0;
-  const auto t_b0 = Clock::now();
-  try {
-    {
-      ActiveGuard active(b);
-      logits = images != nullptr ? b.PrefillMultimodal(ids, *images) : b.Prefill(ids);
-    }
-    const auto t_gdn0 = Clock::now();
-    if (!early_import_) {
-      channel_->WaitBulk(st->call_id, std::chrono::milliseconds(pp_.timeout_ms));
-      if (fault_ != TestFault::kSkipGdnImport) b.PpImportGdnAsync(gdn_hand_.data(), split_);
-    }
-    b.PpImportFence();
-    gdn_wait_ms = Ms(t_gdn0, Clock::now());
-  } catch (...) {
-    berr = std::current_exception();
-    std::fprintf(stderr, "[r4dx-pp] stage B failed: %s\n", WhatOf(berr).c_str());
-    channel_->Poison("stage B failed: " + WhatOf(berr));
-    // An early GDN import (OnLastChunk) may still be copying out of gdn_hand_ on the side stream: let it land before the
-    // recovery (Reset) zeroes the state it writes.
-    try {
-      b.PpImportFence();
-    } catch (...) {
-    }
-  }
+  pp::StageBResult br = pp::RunStageB(b, *channel_, *bufs_, run_, b_state_, ids, images);
+  std::vector<float> logits = std::move(br.logits);
+  const double gdn_wait_ms = br.gdn_wait_ms;
   const auto t_tail0 = Clock::now();
 
   // ---- join stage A -------------------------------------------------------------------------------------------------------------
   std::exception_ptr aerr = JoinStageA(std::chrono::seconds(60));
-  if (berr || aerr) {
-    // The root cause: stage A's own error unless stage B's is not just the channel telling it A had failed.
-    if (aerr && (!berr || IsChannelPoisoned(berr))) Fail(aerr);
-    Fail(berr);
-  }
+  if (const std::exception_ptr cause = pp::PickRootCause(aerr, br.error)) Fail(cause);
   const int64_t p_end = b.PositionCount();
   if (st->verify) {
     const auto db = b.PpLiveDigest(split_);
@@ -598,25 +500,13 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   ++stats_.pipelined_calls;
   if (plan.gdn) ++stats_.sync_gdn;
   stats_.sync_kv_rows += std::max<int64_t>(0, plan.kv_row1 - plan.kv_row0);
-  if (early_import_) ++stats_.early_gdn_imports;
+  if (b_state_.early_import) ++stats_.early_gdn_imports;
   stats_.last_sync_ms = sync_ms + st->a_sync_ms;
   stats_.last_tail_ms = Ms(t_tail0, Clock::now());
   stats_.last_total_ms = Ms(t_call0, Clock::now());
   stats_.last_gdn_export_ms = st->a_gdn_export_ms;
   stats_.last_gdn_wait_ms = gdn_wait_ms;
-  (void)t_b0;
   return logits;
-}
-
-// Stage B's last chunk of a call has taken its slot: if stage A's GDN export is already complete, start importing it on
-// B's side stream now, so it overlaps this chunk's compute (the import writes only layers < split's state, which B's own
-// layers [split, N) never read). Otherwise PipelinedPrefill imports it after the chunk.
-void PpModel::OnLastChunk() {
-  if (fault_ == TestFault::kSkipGdnImport) return;
-  if (channel_->BulkReady(cur_call_)) {
-    b_->PpImportGdnAsync(gdn_hand_.data(), split_);
-    early_import_ = true;
-  }
 }
 
 // ---- everything that moves B alone ------------------------------------------------------------------------------------------
@@ -677,16 +567,14 @@ StepProfile PpModel::PrefillProfiled(const std::vector<int32_t>& token_ids) {
 }
 
 Model::PpStageSetup PpModel::StageSetup(Model::PpRole role) {
-  Model::PpStageSetup st;
-  st.role = role;
-  st.split = split_;
-  st.channel = channel_.get();
-  st.timeout_ms = pp_.timeout_ms;
+  Model::PpStageSetup st = pp::MakeStageSetup(role, run_, channel_.get());
   if (role == Model::PpRole::kStageA) {
     tp::RankWorker* w = worker_.get();
     st.on_chunk = [w] { w->Heartbeat().fetch_add(1, std::memory_order_relaxed); };
   } else {
-    st.before_last_chunk = [this] { OnLastChunk(); };
+    // Stage B's last chunk of a call has taken its slot: the GDN import may start now (pp::StageBOnLastChunk). `run_` is read at the
+    // time of the call: SetSplit re-attaches both stages and changes run_.split.
+    st.before_last_chunk = [this] { pp::StageBOnLastChunk(*b_, *channel_, *bufs_, run_, b_state_); };
   }
   return st;
 }
@@ -725,12 +613,14 @@ void PpModel::SetSplit(int64_t k) {
   }
   const int64_t old = split_;
   split_ = k;
+  run_.split = k;
   try {
     RunA([this](Model& a) { a.PpAttach(StageSetup(Model::PpRole::kStageA)); }, std::chrono::seconds(60));
     b_->PpAttach(StageSetup(Model::PpRole::kStageB));
     UpdateStageACapture();
   } catch (...) {
     split_ = old;
+    run_.split = old;
     state_ = State::kNeedsRecovery;
     throw;
   }
@@ -747,9 +637,9 @@ void PpModel::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
   const std::vector<int64_t> old = targets_;
   targets_ = target_layers;
   const int64_t cols = static_cast<int64_t>(TargetsBelow(reserve_split_).size());
-  const size_t need = pp::MaxSlotBytes(b_->PrefillChunkRows(), hidden_, cols,
-                                       static_cast<int64_t>(b_->PpAttnLayers(reserve_split_).size()), b_->PpKvBlockSize(),
-                                       b_->PpKvBlockStrideBytes());
+  const size_t need = pp::StageSlotBytes(run_.carry_kv, b_->PrefillChunkRows(), hidden_, cols,
+                                         static_cast<int64_t>(b_->PpAttnLayers(reserve_split_).size()), b_->PpKvBlockSize(),
+                                         b_->PpKvBlockStrideBytes());
   if (need > channel_->Capacity()) {
     targets_ = old;
     throw std::invalid_argument("PpModel::AttachDflashFeatureCapture: " + std::to_string(cols) +

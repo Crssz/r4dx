@@ -8,6 +8,9 @@
 #include <functional>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -269,9 +272,29 @@ void Stress() {
   Check(ch.InFlight() == 0 && ch.GetStats().published == kItems && ch.GetStats().taken == kItems, "all drained");
 }
 
+// The error protocol every owner of a channel shares (PpModel, the hybrid): which of the two stages' errors a call reports.
+void RootCause() {
+  const std::exception_ptr none;
+  const std::exception_ptr a_err = std::make_exception_ptr(std::runtime_error("A: kernel failed"));
+  const std::exception_ptr b_err = std::make_exception_ptr(std::runtime_error("B: kernel failed"));
+  const std::exception_ptr b_poison = std::make_exception_ptr(ChannelPoisoned("StageChannel::AcquireFull: poisoned (stage A failed)"));
+  const std::exception_ptr b_timeout = std::make_exception_ptr(ChannelTimeout("StageChannel::AcquireFull: no progress"));
+  Check(!PickRootCause(none, none), "no error on either stage: no root cause");
+  Check(PickRootCause(a_err, none) == a_err, "only A failed: A's error");
+  Check(PickRootCause(none, b_err) == b_err, "only B failed: B's error");
+  Check(PickRootCause(a_err, b_poison) == a_err, "A failed and B only saw the poison: A's error is the root");
+  Check(PickRootCause(a_err, b_err) == b_err, "both failed on their own: B's (the consumer's, as PpModel always reported)");
+  Check(PickRootCause(a_err, b_timeout) == b_timeout, "a timeout on B is not the poison: B's error");
+  Check(PickRootCause(none, b_poison) == b_poison, "a poison with no producer error is reported as it is");
+  Check(IsChannelPoisoned(b_poison) && !IsChannelPoisoned(b_timeout) && !IsChannelPoisoned(a_err), "IsChannelPoisoned matches ChannelPoisoned only");
+  Check(WhatOf(a_err) == "A: kernel failed" && WhatOf(b_poison).find("poisoned") != std::string::npos, "WhatOf renders the message");
+  Check(WhatOf(std::make_exception_ptr(42)) == "unknown exception", "WhatOf on a non-std exception");
+}
+
 }  // namespace
 
 int main() {
+  RootCause();
   Fifo();
   Misuse();
   PoisonAndReset();

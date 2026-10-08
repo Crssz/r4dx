@@ -68,6 +68,8 @@
 #include "linear.h"
 #include "model.h"
 #include "pp_channel.h"
+#include "pp_stage_buffers.h"
+#include "pp_stage_runner.h"
 #include "r4dx/core/arena.hpp"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/dtype.hpp"
@@ -344,7 +346,8 @@ class Rig {
   hybrid::DigestShape full_shape, rank_shape[2];
   std::unique_ptr<hybrid::TpMasterTracker> tracker;
   PinnedBuffer<uint8_t> ring;
-  std::vector<PinnedBuffer<uint8_t>> slots;
+  std::unique_ptr<pp::StageBuffers> bufs;
+  pp::StageRunOptions run;
   std::unique_ptr<pp::StageChannel> channel;
   std::shared_ptr<const PinnedBuffer<uint16_t>> embed_host;
   int device = 0;
@@ -429,13 +432,22 @@ class Rig {
     ring = PinnedBuffer<uint8_t>(kRingBytes);
 
     // The channel between the stages. No KV payload and no DFlash columns: the carry only.
-    const size_t cap = pp::MaxSlotBytes(y->PrefillChunkRows(), hidden, /*dfl_cols=*/0, /*attn_layers=*/0, y->PpKvBlockSize(), y->PpKvBlockStrideBytes());
-    std::vector<uint8_t*> ptrs;
-    for (int i = 0; i < 3; ++i) {
-      slots.emplace_back(cap, hipHostMallocPortable);
-      ptrs.push_back(slots.back().data());
-    }
-    channel = std::make_unique<pp::StageChannel>(ptrs, cap);
+    // The buffers and the stage calls are the thread-agnostic runners' (pp_stage_runner.h), with the hybrid's layout: no KV payload in a slot
+    // (run.carry_kv = false), no GDN hand-off (each stage's GDN state is resharded to the ranks directly), no sync-back buffers (the warm
+    // gather moves the shards' state). Everything is allocated on this thread here (one device); the P3 orchestration allocates each group
+    // on the rank thread that owns the producing device.
+    run.split = cfg.split;
+    run.timeout_ms = kStageTimeoutMs;
+    run.carry_kv = false;
+    run.gdn_handoff = false;
+    pp::StageBufferSpec spec;
+    spec.slots = 3;
+    spec.slot_bytes = pp::StageSlotBytes(run.carry_kv, y->PrefillChunkRows(), hidden, /*dfl_cols=*/0, /*attn_layers=*/static_cast<int64_t>(g.attn_layers.size()),
+                                         y->PpKvBlockSize(), y->PpKvBlockStrideBytes());
+    bufs = std::make_unique<pp::StageBuffers>(spec, pp::PinnedAllocator());
+    bufs->AllocateAProduced();
+    bufs->AllocateBProduced();
+    channel = std::make_unique<pp::StageChannel>(bufs->SlotPointers(), spec.slot_bytes);
     x->PpAttach(StageSetup(Model::PpRole::kStageA));
     y->PpAttach(StageSetup(Model::PpRole::kStageB));
     std::fprintf(stderr, "[hybrid-emu] %s: ready (%lld layers, attention %zu / GDN %zu, conv pitch rank %lld, stage X %lld, stage Y %lld)\n", cfg.name.c_str(),
@@ -450,15 +462,7 @@ class Rig {
     return s;
   }
 
-  Model::PpStageSetup StageSetup(Model::PpRole role) {
-    Model::PpStageSetup s;
-    s.role = role;
-    s.split = cfg.split;
-    s.channel = channel.get();
-    s.timeout_ms = kStageTimeoutMs;
-    s.carry_kv = false;
-    return s;
-  }
+  Model::PpStageSetup StageSetup(Model::PpRole role) { return pp::MakeStageSetup(role, run, channel.get()); }
 
   // ---- helpers on the ranks ---------------------------------------------------------------------------------------------------------
   void OnRanks(const std::function<void(Model&, int)>& fn) { tpm->RunCollectiveForTest(fn); }
@@ -491,53 +495,41 @@ class Rig {
   Model& StageOf(int s) { return s == hybrid::kStageA ? *x : *y; }
 
   // ---- the stage prefill: X on its own thread, Y on this one ---------------------------------------------------------------------------
-  static bool IsPoison(const std::exception_ptr& e) {
-    try {
-      std::rethrow_exception(e);
-    } catch (const pp::ChannelPoisoned&) {
-      return true;
-    } catch (...) {
-    }
-    return false;
-  }
+  // The thread-agnostic runners of pp_stage_runner.h: RunStageA on its own thread (device + tuning scope are this caller's business),
+  // RunStageB on this one. No sync-back (the gather did it), no GDN hand-off, no KV payload.
   std::vector<float> StagePrefill(const std::vector<int32_t>& ids, const std::vector<Model::ImageSpan>* images, bool tp_flag) {
-    channel->BeginCall(++call_id);
-    std::exception_ptr xerr, yerr;
-    std::vector<float> logits;
+    const int64_t id = ++call_id;
+    channel->BeginCall(id);
+    pp::StageCall xcall;
+    xcall.ids = ids;
+    xcall.multimodal = images != nullptr;
+    if (images != nullptr) xcall.a_spans = *images;
+    xcall.call_id = id;
+    pp::StageBCallState ystate;
+    ystate.call_id = id;
+    std::exception_ptr xerr;
     pp::StageChannel* const ch = channel.get();
     std::thread tx([&] {
       try {
         if (hipSetDevice(device) != hipSuccess) throw std::runtime_error("hipSetDevice failed on the stage X thread");
         r4dx::model::Tp2TuningScope scope(tp_flag);
-        if (images != nullptr) {
-          (void)x->PrefillMultimodal(ids, *images);
-        } else {
-          (void)x->Prefill(ids);
-        }
+        pp::RunStageA(*x, *ch, *bufs, run, xcall);  // poisons the channel and rethrows on failure
       } catch (...) {
         xerr = std::current_exception();
         ch->Poison("stage X failed");
       }
     });
-    try {
+    pp::StageBResult yres;
+    {
       r4dx::model::Tp2TuningScope scope(tp_flag);
-      y->PpSetActive(true);
-      logits = images != nullptr ? y->PrefillMultimodal(ids, *images) : y->Prefill(ids);
-    } catch (...) {
-      yerr = std::current_exception();
-      ch->Poison("stage Y failed");
+      yres = pp::RunStageB(*y, *ch, *bufs, run, ystate, ids, images);  // never throws; poisons the channel on failure
     }
     tx.join();
-    try {
-      y->PpSetActive(false);
-    } catch (...) {
-    }
-    if (xerr || yerr) {
+    if (const std::exception_ptr root = pp::PickRootCause(xerr, yres.error)) {
       ch->Reset();
-      const std::exception_ptr root = (xerr && (!yerr || IsPoison(yerr))) ? xerr : yerr;
       std::rethrow_exception(root);
     }
-    return logits;
+    return std::move(yres.logits);
   }
 
   // ---- the reshard executor, driven by the plan's ops ------------------------------------------------------------------------------------

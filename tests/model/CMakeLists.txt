@@ -324,6 +324,12 @@ add_test(NAME test_pp_channel_cpu COMMAND test_pp_channel_cpu)
 add_executable(test_pp_sync_cpu test_pp_sync_cpu.cpp)
 target_include_directories(test_pp_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_pp_sync_cpu COMMAND test_pp_sync_cpu)
+# test_pp_runner_cpu: src/model/pp_stage_buffers.h, the buffer half of the thread-agnostic stage runners (pp_stage_runner.h; docs/pp-tp2-hybrid.md
+# 7): the slot / KV-sync sizing incl. the hybrid's carry_kv = false slot, the allocate-on-the-owning-thread protocol with an injected allocator,
+# and a fake two-stage call whose stages swap threads. No HIP call, no container; always runs.
+add_executable(test_pp_runner_cpu test_pp_runner_cpu.cpp)
+target_include_directories(test_pp_runner_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_pp_runner_cpu COMMAND test_pp_runner_cpu)
 
 # Hybrid serving mode (docs/pp-tp2-hybrid.md, P0/P1 CPU): pure CPU unit tests of the PP-2 prefill + TP-2 decode mode's host-side
 # policy. test_hybrid_sync_cpu: src/model/hybrid_sync.h, the TP-master mirror tracker (the TP shards are the truth, both stages

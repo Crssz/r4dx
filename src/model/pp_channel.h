@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -333,5 +334,35 @@ class StageChannel {
   std::string reason_;
   Stats stats_;
 };
+
+// ---- the error protocol of a call (shared by every owner of a channel: PpModel, the hybrid) ------------------------------
+// A stage that fails poisons the channel, which makes the other stage's waits throw ChannelPoisoned. The owner joins both and
+// reports the ROOT cause: the producer's own error unless the consumer's error is not just the channel telling it the producer
+// had failed.
+inline bool IsChannelPoisoned(const std::exception_ptr& e) {
+  try {
+    std::rethrow_exception(e);
+  } catch (const ChannelPoisoned&) {
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+inline std::string WhatOf(const std::exception_ptr& e) {
+  try {
+    std::rethrow_exception(e);
+  } catch (const std::exception& x) {
+    return x.what();
+  } catch (...) {
+    return "unknown exception";
+  }
+}
+// The error to report for a call whose stage A (producer) ended with `aerr` and stage B (consumer) with `berr` (either may be
+// null); null when neither failed.
+inline std::exception_ptr PickRootCause(const std::exception_ptr& aerr, const std::exception_ptr& berr) {
+  if (!aerr && !berr) return nullptr;
+  if (aerr && (!berr || IsChannelPoisoned(berr))) return aerr;
+  return berr;
+}
 
 }  // namespace r4dx::model::pp

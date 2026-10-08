@@ -157,20 +157,32 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
                                 std::to_string(layers) + " loaded layers on each side");
   }
   const int64_t split = m->split_;
-  const int64_t hidden = b.Config().hidden_size;
-  std::vector<int64_t> targets_a;  // the drafter's target layers that stage A owns (a prefix of the full list)
-  for (const int64_t l : b.DflashTargetLayers()) {
-    if (l < split) targets_a.push_back(l);
+  // Stage A is loaded for the largest split it will ever run (PpOptions::reserve_split; tests move the split between
+  // scenarios with SetSplit): the ring, the GDN buffers and the layer count are sized for it.
+  m->reserve_split_ = std::max(split, static_cast<int64_t>(pp.reserve_split));
+  if (!pp::ValidSplit(m->reserve_split_, layers)) {
+    throw std::invalid_argument("PpModel::Load: reserve_split " + std::to_string(m->reserve_split_) +
+                                " must leave at least one of the " + std::to_string(layers) + " loaded layers on stage B");
   }
+  const int64_t hidden = b.Config().hidden_size;
+  m->targets_ = b.DflashTargetLayers();
+  std::vector<int64_t> targets_a = m->TargetsBelow(split);  // the drafter's target layers that stage A owns (a prefix)
+  int64_t dfl_cols_max = 0;
+  for (const int64_t l : m->targets_) {
+    if (l < m->reserve_split_) ++dfl_cols_max;
+  }
+  dfl_cols_max = std::max<int64_t>(dfl_cols_max, 4);  // room for a test capture (AttachDflashFeatureCapture)
   const std::vector<int64_t> attn = b.PpAttnLayers(split);
-  const size_t cap = pp::MaxSlotBytes(b.PrefillChunkRows(), hidden, static_cast<int64_t>(targets_a.size()),
-                                      static_cast<int64_t>(attn.size()), b.PpKvBlockSize(), b.PpKvBlockStrideBytes());
+  const std::vector<int64_t> attn_max = b.PpAttnLayers(m->reserve_split_);
+  const size_t cap = pp::MaxSlotBytes(b.PrefillChunkRows(), hidden, dfl_cols_max, static_cast<int64_t>(attn_max.size()),
+                                      b.PpKvBlockSize(), b.PpKvBlockStrideBytes());
+  m->hidden_ = hidden;
   std::vector<uint8_t*> ptrs;
   for (int i = 0; i < pp.slots; ++i) {
     m->slots_.emplace_back(cap, hipHostMallocPortable);
     ptrs.push_back(m->slots_.back().data());
   }
-  const size_t gdn_bytes = b.PpGdnWireBytes(split);
+  const size_t gdn_bytes = b.PpGdnWireBytes(m->reserve_split_);
   m->gdn_hand_ = core::PinnedBuffer<uint8_t>(gdn_bytes, hipHostMallocPortable);
   m->gdn_sync_ = core::PinnedBuffer<uint8_t>(gdn_bytes, hipHostMallocPortable);
   m->channel_ = std::make_unique<pp::StageChannel>(ptrs, cap);
@@ -193,7 +205,7 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
   const auto kNoStall = tp::ProgressWatchdog::kNoStallLimit;
   {
     ModelOptions ao = m->opts_;
-    ao.layer_limit = split + 1;  // [0, split) run; layer `split` only supplies the input_layernorm layer split - 1 fuses
+    ao.layer_limit = m->reserve_split_ + 1;  // [0, split) run; layer `split` only supplies the input_layernorm layer split - 1 fuses
     ao.mtp_draft_k = 0;
     ao.dflash_container.clear();
     ao.dflash_draft_k = 0;
@@ -201,9 +213,9 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
     ao.pp = 0;
     const int stage_b_chunk = b.PrefillChunkRows();
     const bool stage_b_i8 = b.PrefillInt8Enabled();
-    const int timeout_ms = pp.timeout_ms;
     const int submit_layers = pp.submit_layers, inflight = pp.max_inflight;
-    m->worker_->Post([self, ao, split, stage_b_chunk, stage_b_i8, targets_a, gdn_bytes, timeout_ms, submit_layers, inflight] {
+    const int64_t reserve = m->reserve_split_;
+    m->worker_->Post([self, ao, split, reserve, stage_b_chunk, stage_b_i8, targets_a, gdn_bytes, submit_layers, inflight] {
       self->a_.emplace(Model::Load(ao));
       Model& a = *self->a_;
       if (a.PrefillChunkRows() != stage_b_chunk) {
@@ -215,32 +227,17 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
                                  std::to_string(a.PrefillInt8Enabled()) + ", B " + std::to_string(stage_b_i8) +
                                  "): the bits would differ");
       }
-      if (a.PpGdnWireBytes(split) != gdn_bytes) {
+      if (a.PpGdnWireBytes(reserve) != gdn_bytes) {
         throw std::runtime_error("PpModel::Load: the stages disagree on the GDN hand-off size");
       }
-      Model::PpStageSetup st;
-      st.role = Model::PpRole::kStageA;
-      st.split = split;
-      st.channel = self->channel_.get();
-      st.timeout_ms = timeout_ms;
-      tp::RankWorker* w = self->worker_.get();
-      st.on_chunk = [w] { w->Heartbeat().fetch_add(1, std::memory_order_relaxed); };
-      a.PpAttach(std::move(st));
+      a.PpAttach(self->StageSetup(Model::PpRole::kStageA));
       a.PpEnableBounding(submit_layers, inflight);
       if (!targets_a.empty()) a.AttachDflashFeatureCapture(targets_a);
     });
     const std::exception_ptr err = self->JoinStageA(kNoStall);
     if (err) std::rethrow_exception(err);
   }
-  {
-    Model::PpStageSetup st;
-    st.role = Model::PpRole::kStageB;
-    st.split = split;
-    st.channel = m->channel_.get();
-    st.timeout_ms = pp.timeout_ms;
-    st.before_last_chunk = [self] { self->OnLastChunk(); };
-    b.PpAttach(std::move(st));
-  }
+  b.PpAttach(m->StageSetup(Model::PpRole::kStageB));
   for (const VramReport& r : m->Vram()) {
     std::fprintf(stderr, "[r4dx-pp] stage %c (rank %d, HIP device %d): %.2f GiB used of %.2f GiB (%.2f GiB in this process's buffers)\n",
                  r.rank == 0 ? 'B' : 'A', r.rank, r.device, r.used_gib, r.total_gib, r.buffers_gib);
@@ -420,7 +417,8 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
   const auto t_call0 = Clock::now();
   b.PpPrepareCall();  // move the live GDN state to window 0 if a speculative round left it elsewhere (before the export)
   const int64_t p0 = b.PositionCount();
-  const pp::MirrorTracker::SyncPlan plan = tracker_.PlanSync(p0);
+  const pp::MirrorTracker::SyncPlan plan =
+      fault_ == TestFault::kSkipSyncBack ? pp::MirrorTracker::SyncPlan{} : tracker_.PlanSync(p0);
   const size_t kv_need = plan.kv_row1 > plan.kv_row0 ? b.PpKvWireBytes(split_, plan.kv_row0, plan.kv_row1) : 0;
   if (kv_need > kMaxKvSyncBytes) {
     // Stage A is that far behind: the sync-back would dwarf the gain. The decode Model runs the call alone, which leaves
@@ -533,7 +531,7 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
     const auto t_gdn0 = Clock::now();
     if (!early_import_) {
       channel_->WaitBulk(st->call_id, std::chrono::milliseconds(pp_.timeout_ms));
-      b.PpImportGdnAsync(gdn_hand_.data(), split_);
+      if (fault_ != TestFault::kSkipGdnImport) b.PpImportGdnAsync(gdn_hand_.data(), split_);
     }
     b.PpImportFence();
     gdn_wait_ms = Ms(t_gdn0, Clock::now());
@@ -579,6 +577,7 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
 // B's side stream now, so it overlaps this chunk's compute (the import writes only layers < split's state, which B's own
 // layers [split, N) never read). Otherwise PipelinedPrefill imports it after the chunk.
 void PpModel::OnLastChunk() {
+  if (fault_ == TestFault::kSkipGdnImport) return;
   if (channel_->BulkReady(cur_call_)) {
     b_->PpImportGdnAsync(gdn_hand_.data(), split_);
     early_import_ = true;
@@ -640,6 +639,86 @@ StepProfile PpModel::PrefillProfiled(const std::vector<int32_t>& token_ids) {
   RequireReady();
   NoteBOnly();
   return b_->PrefillProfiled(token_ids);
+}
+
+Model::PpStageSetup PpModel::StageSetup(Model::PpRole role) {
+  Model::PpStageSetup st;
+  st.role = role;
+  st.split = split_;
+  st.channel = channel_.get();
+  st.timeout_ms = pp_.timeout_ms;
+  if (role == Model::PpRole::kStageA) {
+    tp::RankWorker* w = worker_.get();
+    st.on_chunk = [w] { w->Heartbeat().fetch_add(1, std::memory_order_relaxed); };
+  } else {
+    st.before_last_chunk = [this] { OnLastChunk(); };
+  }
+  return st;
+}
+
+std::vector<int64_t> PpModel::TargetsBelow(int64_t split) const {
+  std::vector<int64_t> out;
+  for (const int64_t l : targets_) {
+    if (l < split) out.push_back(l);
+  }
+  return out;
+}
+
+// Stage A captures the DFlash target layers below the split (a prefix of B's ascending list: its columns land in
+// columns [0, n) of B's feature buffer).
+void PpModel::UpdateStageACapture() {
+  const std::vector<int64_t> below = TargetsBelow(split_);
+  RunA([below](Model& a) {
+         if (below.empty()) {
+           a.DetachDflashFeatureCapture();
+         } else {
+           a.AttachDflashFeatureCapture(below);
+         }
+       },
+       std::chrono::seconds(60));
+}
+
+void PpModel::SetSplit(int64_t k) {
+  RequireReady();
+  if (!pp::ValidSplit(k, NumLoadedLayers()) || k > reserve_split_) {
+    throw std::invalid_argument("PpModel::SetSplit: split " + std::to_string(k) + " must be in [1, " +
+                                std::to_string(reserve_split_) + "] (stage A was loaded for splits up to " +
+                                std::to_string(reserve_split_) + ")");
+  }
+  const int64_t old = split_;
+  split_ = k;
+  try {
+    RunA([this](Model& a) { a.PpAttach(StageSetup(Model::PpRole::kStageA)); }, std::chrono::seconds(60));
+    b_->PpAttach(StageSetup(Model::PpRole::kStageB));
+    UpdateStageACapture();
+  } catch (...) {
+    split_ = old;
+    state_ = State::kNeedsRecovery;
+    throw;
+  }
+  Reset();  // the mirror covered layers [0, old); it knows nothing of [old, k)
+}
+
+void PpModel::SetMinRows(int64_t min_rows) {
+  if (min_rows < 1) throw std::invalid_argument("PpModel::SetMinRows: min_rows must be >= 1");
+  min_rows_ = min_rows;
+}
+
+void PpModel::AttachDflashFeatureCapture(std::vector<int64_t> target_layers) {
+  RequireReady();
+  const std::vector<int64_t> old = targets_;
+  targets_ = target_layers;
+  const int64_t cols = static_cast<int64_t>(TargetsBelow(reserve_split_).size());
+  const size_t need = pp::MaxSlotBytes(b_->PrefillChunkRows(), hidden_, cols,
+                                       static_cast<int64_t>(b_->PpAttnLayers(reserve_split_).size()), b_->PpKvBlockSize(),
+                                       b_->PpKvBlockStrideBytes());
+  if (need > channel_->Capacity()) {
+    targets_ = old;
+    throw std::invalid_argument("PpModel::AttachDflashFeatureCapture: " + std::to_string(cols) +
+                                " DFlash columns below the largest split do not fit the ring slots");
+  }
+  b_->AttachDflashFeatureCapture(std::move(target_layers));
+  UpdateStageACapture();
 }
 
 // ---- diagnostics ---------------------------------------------------------------------------------------------------------------

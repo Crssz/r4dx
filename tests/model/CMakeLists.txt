@@ -68,6 +68,12 @@ set(R4DX_MODEL_TESTS
   # the real trellis container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING library
   # variant for Model::DebugStateDigest. Written, NOT run by its author (GPU).
   test_pp_emulate_identity
+  # Pipeline-parallel prefill, Phase 2 (docs/pp-prefill.md, gate G2a): the REAL two-GPU pipeline (PpModel: stage A on the desktop
+  # card, stage B the decode Model) against the monolithic prefill on the same Model, bit for bit -- test_pp_emulate_identity's
+  # shape list plus warm turns (the sync-back), speculative rounds, a checkpoint restore, the pipelining threshold, image rows;
+  # the live state of both stages compared after every hand-off; two negative controls. NEEDS BOTH GPUs and
+  # HIP_VISIBLE_DEVICES=1,0 (set below); SKIP 77 otherwise or without the containers. Written, NOT run by its author (GPU).
+  test_pp_real_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -75,7 +81,7 @@ foreach(t ${R4DX_MODEL_TESTS})
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
-     t STREQUAL "test_pp_emulate_identity")
+     t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -86,6 +92,9 @@ foreach(t ${R4DX_MODEL_TESTS})
     SKIP_RETURN_CODE 77
   )
 endforeach()
+# The real pipeline puts stage B on process ordinal 0 = physical device 1 (the headless card) and stage A on ordinal 1 =
+# physical device 0 (docs/pp-prefill.md 1.2).
+set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1,0")
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a

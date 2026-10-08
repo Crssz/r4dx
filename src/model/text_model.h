@@ -77,6 +77,7 @@ struct TpOptions {
 // HIP_VISIBLE_DEVICES=1,0 -- and stage B (the full decode Model) on ordinal 0.
 struct PpOptions {
   int split = 0;           // k: 0 = auto (33, or 35 with a DFlash drafter; both keep 8 attention layers per stage)
+  int reserve_split = 0;   // stage A is loaded for splits up to this (0 = split); tests move k with PpModel::SetSplit
   int min_rows = 1024;     // a Prefill call with fewer rows runs on the decode Model alone (the fill and the sync-back would not pay)
   bool verify = false;     // digest the live state of both stages after every hand-off and compare (R4DX_PP_VERIFY=1 also turns it on)
   int submit_layers = 32;  // stage A's bounded GPU submission (docs/tp.md Appendix B N57): 0 = off, [0, 64]

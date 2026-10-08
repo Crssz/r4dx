@@ -127,6 +127,16 @@ class PpModel final : public TextModel {
   Stats GetStats() const;
   // The `--stats` line (without the "[stats] " prefix).
   std::string StatsLine() const;
+  // Tests and tools. SetSplit moves the split layer k (up to PpOptions::reserve_split, which stage A was loaded for) and
+  // resets both stages; SetMinRows changes the pipelining threshold; AttachDflashFeatureCapture attaches a feature capture on
+  // the decode Model (like Model::AttachDflashFeatureCapture) and the below-the-split prefix of it on stage A.
+  // Negative controls (tests/model/test_pp_real_identity.cpp requires each to change an observable): do not copy the sync-back
+  // to stage A (a stale mirror), do not import stage A's GDN state into stage B.
+  enum class TestFault { kNone, kSkipSyncBack, kSkipGdnImport };
+  void SetTestFault(TestFault f) { fault_ = f; }
+  void SetSplit(int64_t k);
+  void SetMinRows(int64_t min_rows);
+  void AttachDflashFeatureCapture(std::vector<int64_t> target_layers);
   // The decode Model, for tests and tools (the facade thread only).
   Model& DecodeModel() { return *b_; }
   // Runs fn(stage-A Model&) on stage A's thread as one command and waits (tests: digests, state pokes).
@@ -162,15 +172,22 @@ class PpModel final : public TextModel {
   [[noreturn]] void Fail(std::exception_ptr cause);
   // Stage B's last chunk of the call has taken its slot (Model::PpStageSetup::before_last_chunk).
   void OnLastChunk();
+  Model::PpStageSetup StageSetup(Model::PpRole role);
+  std::vector<int64_t> TargetsBelow(int64_t split) const;
+  void UpdateStageACapture();
 
   ModelOptions opts_;
   PpOptions pp_;
   State state_ = State::kReady;
   int64_t split_ = 0;
+  int64_t reserve_split_ = 0;           // stage A is loaded for splits up to this
+  int64_t hidden_ = 0;
+  std::vector<int64_t> targets_;        // the DFlash target layers B captures (empty without a drafter / capture)
   int64_t min_rows_ = 1024;
   bool verify_ = false;
   bool dflash_injection_ = true;
   int64_t call_id_ = 0;
+  TestFault fault_ = TestFault::kNone;
   int64_t cur_call_ = -1;        // the pipelined call in flight (OnLastChunk)
   bool early_import_ = false;    // its GDN import was started before B's last chunk computed
   pp::MirrorTracker tracker_;

@@ -575,7 +575,30 @@ void TestTpFlags() {
   CHECK(TpThrows({"--pp", "0"}));
   CHECK(TpThrows({"--pp-split", "33"}));
   CHECK(TpThrows({"--pp", "1", "--pp-verify"}));
-  CHECK(TpThrows({"--pp", "2", "--tp", "2"}));
+  // --tp 2 --pp 2 is the hybrid serving mode (docs/pp-tp2-hybrid.md): two real GPUs, the stages next to the ranks.
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--pp-split", "30", "--pp-min-rows", "768", "--pp-devices", "1,0"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "off"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "on", "--hybrid-ctx", "65536", "--hybrid-reserve-gib", "2.5"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "auto"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate", "--hybrid", "off"}));
+  // --pp-devices B,A must name the --tp-devices pair or be refused
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "1,0"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1", "--hybrid", "off"}));
+  CHECK(TpThrows({"--hybrid", "off"}));
+  CHECK(TpThrows({"--tp", "2", "--hybrid", "off"}));
+  CHECK(TpThrows({"--pp", "2", "--hybrid-ctx", "65536"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "maybe"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-reserve-gib", "99"}));
+  {
+    const auto a = parse({"--pp", "2", "--tp", "2", "--hybrid", "off", "--hybrid-ctx", "65536", "--hybrid-reserve-gib", "2.5"});
+    CHECK(a.pp == 2 && a.tp == 2 && a.hybrid == 0 && a.hybrid_ctx == 65536 && a.hybrid_reserve_gib == 2.5 && a.hybrid_options_given);
+    const auto b = parse({"--pp", "2", "--tp", "2"});
+    CHECK(b.hybrid == -1 && b.hybrid_ctx == 0 && b.hybrid_reserve_gib < 0 && !b.hybrid_options_given);
+  }
   CHECK(TpThrows({"--pp", "2", "--pp-split", "0"}));
   CHECK(TpThrows({"--pp", "2", "--pp-min-rows", "0"}));
   CHECK(TpThrows({"--pp", "2", "--pp-submit-layers", "65"}));

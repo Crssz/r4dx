@@ -35,6 +35,9 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
 - **Pipeline-parallel prefill (`--pp 2`, off by default):** layers split across the two cards for long
   prompts, about 1.7-1.8x faster cold prefill and byte-identical to the single-card prefill; decode stays
   on the headless card (docs/pp-prefill.md).
+- **Hybrid two-GPU mode (`--tp 2 --pp 2`, off by default):** the prompt goes through the `--pp 2` pipeline,
+  its state is resharded once into the TP layout, and decode runs as `--tp 2`: `--pp 2`'s prefill speed with
+  `--tp 2`'s decode speed (docs/pp-tp2-hybrid.md).
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
   images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
 
@@ -51,6 +54,7 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Prefill, short prompts | about 1130 tok/s |
 | Cold prefill (time to first token), defaults (int8 prefill GEMM with coarse scales + split-KV attention) | 3.15 s at 8k, 14.0 s at 32k, 31.9 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-08, 2 runs each; `E:\models\r4dx\int8v2\ttft_summary.txt`) |
 | Cold prefill, two GPUs (`--pp 2`, pipeline-parallel prefill, decode unchanged on one card) | 1.84 s at 8k (1.72x), 7.86 s at 32k (1.78x) with the default split 29 (30 with `--dflash`: 1.84 s / 8.22 s), against 3.15 s / 14.0 s on one card in the same session, greedy output identical (`E:\models\r4dx\hybrid_p-1`); 44.2 s at 128k against 80.6 s on one card (1.83x at split 32, same text; VRAM 21.1 GiB decode card / 12.6 GiB stage A, no TDR; `E:\models\r4dx\pp128k`). The earlier 1.66 s / 7.24 s were measured with the two cards swapped (decode on the desktop card) and are superseded (HIP ROCm 10.1.0, 2026-10-08; docs/pp-prefill.md). Decode with `--pp 2`: 0.997x tok/s, text identical. Off by default |
+| Hybrid two-GPU mode (`--tp 2 --pp 2`: `--pp 2` prefill, one reshard, `--tp 2` decode) | Cold prefill 1.77 s at 8k, 7.78 s at 32k, 44.0 s at 128k (equal to `--pp 2`: 1.77 / 7.77 / 44.2 s; `--tp 2`: 2.89 / 12.14 s); plain decode 59.8 tok/s (equal to `--tp 2`; `--pp 2` 36.3). 8k prompt + 512 tokens end to end: 10.35 s against 11.39 s (`--tp 2`) and 15.88 s (`--pp 2`); with `--dflash` 7.24 s against 7.94 / 9.21 s. KL against one card 0.0005-0.0006 (closer than `--tp 2`'s 0.0014-0.0023); VRAM free at 128k: 11.7 GiB desktop card / 9.0 GiB decode card. DFlash acceptance over 6 prompts 3.10 tok/round against 3.25 for `--tp 2` (the texts differ after the prefill; per-round time within 4 %). Prompts under 1024 tokens and calls past the stage-KV cap take the `--tp 2` prefill. Idle machine, ROCm 10.1.0, 2026-10-08 (`E:\models\r4dx\hybrid_p4`). Off by default |
 | Cold prefill, per-128 int8 scales (`R4DX_PREFILL_INT8_SCALES=blk128`, the 2026-10-07 default) | 3.63 s at 8k (2230 tok/s), 16.0 s at 32k (2050 tok/s), 36.0 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-07, 2 runs each) |
 | Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.66 s at 8k, 22.7 s at 32k, 56.5 s at 64k tokens (same session, interleaved with the row above; 7.0 s and 32.3 s at 8k/32k with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
@@ -152,6 +156,7 @@ docs/           design notes and measurements
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
 | Pipeline-parallel 2-GPU prefill (`--pp 2`, validated) | [docs/pp-prefill.md](docs/pp-prefill.md) |
+| Hybrid 2-GPU mode (`--tp 2 --pp 2`: PP prefill + TP decode) | [docs/pp-tp2-hybrid.md](docs/pp-tp2-hybrid.md) |
 | Hardware notes | [docs/r9700.md](docs/r9700.md) |
 | Detailed usage and history | [docs/usage.md](docs/usage.md), [docs/status.md](docs/status.md) |
 

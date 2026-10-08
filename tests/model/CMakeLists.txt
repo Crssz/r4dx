@@ -85,6 +85,50 @@ set(R4DX_MODEL_TESTS
   # the live state of both stages compared after every hand-off; two negative controls. NEEDS BOTH GPUs and
   # both cards visible (HIP_VISIBLE_DEVICES=0,1, set below); SKIP 77 otherwise or without the containers. Written, NOT run by its author (GPU).
   test_pp_real_identity
+  # Hybrid mode P0 (docs/pp-tp2-hybrid.md 9): stage-only Models (ModelOptions::stage_only) next to a full Model on ONE card -- the
+  # hole-prefix back stage, the front stage with a norm-only split layer and no heads, the borrowed embedding mirror and shared host
+  # copy, StageSetSyncState on both roles, TpAdoptPrefill, the stage-KV check. Device 1, SKIP 77 without the 4-layer container.
+  # Written, NOT run by its author (CPU-only session). test_stage_load_cpu below is the policy half.
+  test_stage_load
+  # Hybrid mode P2 part 1 (docs/pp-tp2-hybrid.md 3, 4, 9): the reshard executor (Model::ReshardExport / ReshardImport / ReshardCopyLocal driven by
+  # the copy ops of ScatterPlan / GatherPlan) and the live-state hooks (DebugLiveStateDigest, DebugExport / ImportLiveState, DebugExport /
+  # ImportFullState) on the 4-layer container, ONE device: a TP=1 Model plays both stages, a TpModel in emulate mode the ranks. Scatter through the
+  # host hop and device-to-device, the import path, decode from both (G-H2 lite), the warm gather, nine negative controls and the guards, the
+  # speculative-window collapse (window slots and write-once). Links the R4DX_TP_TESTING variant. Device 1, SKIP 77 without the container.
+  # Written, NOT run by its author (CPU-only session).
+  test_reshard_exec
+  # Hybrid mode P2 part 1, the DFlash tail (docs/pp-tp2-hybrid.md 6, 9 Gate C): a) two production drafters (~4 GiB, no target): a tail-fed ring ==
+  # a fully fed one under the TP-thread tuning flag (cold, warm, image run, short call; 4 negative controls); b) the stage-side capture
+  # (StageArmDflashTail) on the 4-layer container, plain / warm / PP-emulate; c) Model::TpInjectDflashTail end to end on the production target +
+  # drafter as one TP=1 Model (~17 GiB). R4DX_TEST_ONLY=a|b|c picks a part. Links the R4DX_TP_TESTING variant. Device 1; SKIP 77 when nothing exists.
+  # Written, NOT run by its author (CPU-only session).
+  test_dflash_tail
+  # Hybrid mode P2 part 2, the ONE-DEVICE identity harness (docs/pp-tp2-hybrid.md 4, 9 "P2", section 13): a TP=1 reference Model, the two stage Models
+  # (hole-prefix, stage_only, shared embedding + borrowed mirror, driven on two threads through a StageChannel without the KV payload) and a TpModel in
+  # emulate mode on ONE device. G-H1: the hybrid path (warm gather, stage prefill, reshard, TpAdoptPrefill) leaves each rank with exactly ReshardRef(TP=1
+  # state) -- DebugLiveStateDigest, byte for byte -- for row counts 1..2125, prefix-reuse shapes, warm turns (plain / --mtp 3, incl. the MTP seed and
+  # block rules), checkpoint save/restore and image rows; G-H2: 16 greedy tokens (plain, --mtp 3) from the hybrid ranks == from ranks loaded with the
+  # reference image. Configs: 4-layer container (bf16, bf16 + write-once GDN, w4a16) and the real container with 16 layers (k = 8). Negative controls NC1-3,
+  # 5-10, 12 on the hybrid path, Gate C (NC4, NC11: DFlash tail, drafters only, ~4 GiB). Gate B (full depth, separate processes): --gate-b-dump <dir> then
+  # --gate-b <dir>. ~20 GiB resident for the real container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING variant.
+  # Written, NOT run by its author (CPU-only session).
+  test_hybrid_emulate_identity
+  # Hybrid mode P3 step 2, the TWO-GPU gate (docs/pp-tp2-hybrid.md 15): a real TpModel (two rank threads on two cards) with the hybrid engaged (a stage
+  # Model next to each rank, the pinned host ring between the cards) against a TP=1 reference on the headless card. G-H1 (logits byte-equal to TP=1,
+  # each rank's live-state digest == ReshardRef) for cold / prefix-reuse / warm (plain, --mtp 3) / checkpoint shapes, G-H2 (16 greedy tokens from the
+  # hybrid ranks == from ranks loaded with the reference image), the dispatch fallbacks (below min rows, over S) and recovery from an injected
+  # failure on either card in each phase. 4-layer container (k = 2) and the real container with 16 layers (k = 8). HIP_VISIBLE_DEVICES=0,1.
+  # Links the R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
+  test_tp_hybrid_identity
+  # Hybrid mode P3 step 3, the FULL-DEPTH two-GPU gate (docs/pp-tp2-hybrid.md 16): the real TpModel with the hybrid engaged on the production trellis
+  # container at all 64 layers (--mtp 3, and --dflash 7 when the drafter exists) against a TP=1 reference that lives in EARLIER / LATER phases of the
+  # exe (it does not fit next to the ranks + stages): phase ref (cold 1024 / 2125 / 8145 rows -> digest records + state files), phase hybrid (the same
+  # calls through the pipeline, G-H1 at once; warm turns -- TP=2 decode, a TP prefill, a checkpoint restore -- record their gathered pre-call state),
+  # phase verify (the reference from each recorded pre-call state). G-H2 greedy tokens (plain, --mtp 3, --dflash 7) against ranks loaded with the
+  # reference image, the dispatch fallbacks (below min rows, n_total > S) and four negative controls (wrong rank mapping, stale MTP seed, stale mirror,
+  # skipped DFlash tail). Options: --phase all|ref|hybrid|verify --dir D --max-ctx N --hybrid-ctx N --keep. HIP_VISIBLE_DEVICES=0,1. Links the
+  # R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
+  test_hybrid_real_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -92,7 +136,9 @@ foreach(t ${R4DX_MODEL_TESTS})
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
-     t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity")
+     t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity" OR
+     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail" OR t STREQUAL "test_hybrid_emulate_identity" OR
+     t STREQUAL "test_tp_hybrid_identity" OR t STREQUAL "test_hybrid_real_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -107,6 +153,12 @@ endforeach()
 # overrides the loop's HIP_VISIBLE_DEVICES=1. PpModel then puts stage B (decode) on ordinal 1 = physical device 1 (the
 # headless card, pci 07) and stage A on ordinal 0 (the desktop card) -- docs/pp-prefill.md 1.2.
 set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1")
+# four rigs (three on the 4-layer container, one with 16 real layers) and ~60 scenarios: well past CTest's default 1500 s on a cold kernel cache
+set_tests_properties(test_hybrid_emulate_identity PROPERTIES TIMEOUT 5400)
+# The two-GPU hybrid: both cards visible (rank 0 = ordinal 1 = the headless card, which also holds the TP=1 reference; rank 1 = ordinal 0 = the desktop card)
+set_tests_properties(test_tp_hybrid_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 5400)
+# The full-depth gate: both cards visible ("0,1" is the natural order, the same as unset), three model loads of ~1-3 minutes each plus ~40 scenarios
+set_tests_properties(test_hybrid_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 7200)
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a
@@ -293,6 +345,70 @@ add_test(NAME test_pp_channel_cpu COMMAND test_pp_channel_cpu)
 add_executable(test_pp_sync_cpu test_pp_sync_cpu.cpp)
 target_include_directories(test_pp_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_pp_sync_cpu COMMAND test_pp_sync_cpu)
+# test_pp_runner_cpu: src/model/pp_stage_buffers.h, the buffer half of the thread-agnostic stage runners (pp_stage_runner.h; docs/pp-tp2-hybrid.md
+# 7): the slot / KV-sync sizing incl. the hybrid's carry_kv = false slot, the allocate-on-the-owning-thread protocol with an injected allocator,
+# and a fake two-stage call whose stages swap threads. No HIP call, no container; always runs.
+add_executable(test_pp_runner_cpu test_pp_runner_cpu.cpp)
+target_include_directories(test_pp_runner_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_pp_runner_cpu COMMAND test_pp_runner_cpu)
+
+# Hybrid serving mode (docs/pp-tp2-hybrid.md, P0/P1 CPU): pure CPU unit tests of the PP-2 prefill + TP-2 decode mode's host-side
+# policy. test_hybrid_sync_cpu: src/model/hybrid_sync.h, the TP-master mirror tracker (the TP shards are the truth, both stages
+# mirror them: kv_valid_to / gdn_pos per stage, the stage-B MTP seed, the MTP primed-block rule) against an abstract model of
+# every holder under a random walk, with an oracle and nine negative controls. test_reshard_plan_cpu: src/model/reshard_plan.h,
+# the state mapping DERIVED from tp::RuleFor / RankRows (checked against every head / channel rule of the weight loader), the copy
+# ranges and sizes per direction (the design's crossing-size table), the ring chunking, and ReshardRef / GatherRef against a host
+# executor of the plan's strided copies. test_hybrid_budget_cpu: src/model/hybrid_budget.h, the stage-KV capacity S and the
+# min-rows model against the design's tables. test_tp_tuning_scope: Tp2TuningScope / CheckTp2TuningScope (the thread-local GEMM
+# tuning flag as a per-Model scope). No HIP call (HIP_VISIBLE_DEVICES=-1 hides the devices from the runtime linking
+# r4dx_model_linear loads), no container; always run.
+add_executable(test_hybrid_sync_cpu test_hybrid_sync_cpu.cpp)
+target_include_directories(test_hybrid_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_sync_cpu COMMAND test_hybrid_sync_cpu)
+add_executable(test_hybrid_budget_cpu test_hybrid_budget_cpu.cpp)
+target_include_directories(test_hybrid_budget_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_budget_cpu COMMAND test_hybrid_budget_cpu)
+add_executable(test_reshard_plan_cpu test_reshard_plan_cpu.cpp)
+target_link_libraries(test_reshard_plan_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_reshard_plan_cpu COMMAND test_reshard_plan_cpu)
+# test_stage_load_cpu: src/model/stage_load.h (layer kinds of a stage-only load, the request validation, the resident-range check),
+# embed_mirror_lease.h (the borrowed embedding mirror and its destruction-order rule) and stage_sync.h (the MTP seed rule of
+# StageSetSyncState / TpAdoptPrefill), with negative controls. The device half is test_stage_load (GPU).
+add_executable(test_stage_load_cpu test_stage_load_cpu.cpp)
+target_include_directories(test_stage_load_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_stage_load_cpu COMMAND test_stage_load_cpu)
+add_executable(test_tp_tuning_scope test_tp_tuning_scope.cpp)
+target_link_libraries(test_tp_tuning_scope PRIVATE r4dx_model_linear)
+add_test(NAME test_tp_tuning_scope COMMAND test_tp_tuning_scope)
+set_tests_properties(test_tp_tuning_scope PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# Hybrid mode P2 (docs/pp-tp2-hybrid.md 3, 4, 6, 9), the HIP-free half. test_live_digest_cpu: src/model/live_digest.h + live_state.h, the
+# canonical digest of the LIVE state (every live KV byte moves it, no dead one does; a device-shaped holder with garbage past the rows,
+# stale window slots and long conv lines digests like its host image, full and per rank) and the checksummed dump file the one-device
+# gates hand a TP=1 reference state across processes. test_reshard_exec_cpu: src/model/reshard_exec.h, the executor's address
+# arithmetic (RectOf, row slices, ring batches) over the real 27B plans and run as a host executor against ReshardRef, with stage B's
+# longer conv lines. test_dflash_tail_cpu: src/model/dflash_tail_plan.h, the tail start on the call's 64-row grid, the capture
+# bookkeeping and a simulated drafter ring (a tail-fed ring == a fully fed one). Negative controls in each; no HIP call, always run.
+add_executable(test_live_digest_cpu test_live_digest_cpu.cpp)
+target_link_libraries(test_live_digest_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_live_digest_cpu COMMAND test_live_digest_cpu)
+add_executable(test_reshard_exec_cpu test_reshard_exec_cpu.cpp)
+target_link_libraries(test_reshard_exec_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_reshard_exec_cpu COMMAND test_reshard_exec_cpu)
+add_executable(test_dflash_tail_cpu test_dflash_tail_cpu.cpp)
+target_include_directories(test_dflash_tail_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_dflash_tail_cpu COMMAND test_dflash_tail_cpu)
+# Hybrid mode P3 step 2 (docs/pp-tp2-hybrid.md 7, 15), the HIP-free half of TpModel's hybrid. test_hybrid_dispatch_cpu:
+# src/model/hybrid_dispatch.h -- the kill-switch parse, the per-card stage-KV capacity S against the design's figures, the DFlash tail plan,
+# and the dispatch rule of Prefill / PrefillMultimodal with every fallback (below min rows, over S, gather budget, DFlash frontier),
+# walked against an oracle through the real TpMasterTracker. test_hybrid_ring_cpu: src/model/hybrid_ring.h -- the pinned ring's
+# publish / consume handshake, the host gates and the per-card lockstep loop, with two threads playing the cards (no deadlock, no slot
+# refilled early, a failure frees the peer at once). No HIP call; always run.
+add_executable(test_hybrid_dispatch_cpu test_hybrid_dispatch_cpu.cpp)
+target_include_directories(test_hybrid_dispatch_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_dispatch_cpu COMMAND test_hybrid_dispatch_cpu)
+add_executable(test_hybrid_ring_cpu test_hybrid_ring_cpu.cpp)
+target_include_directories(test_hybrid_ring_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_ring_cpu COMMAND test_hybrid_ring_cpu)
 
 # tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
 # TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never

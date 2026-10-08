@@ -20,6 +20,11 @@
   --tp-max-inflight other than 1 (the default): only K = 1 leaves the GPU an idle gap at each unit
   (Appendix B N64); short A/B measurements with other settings call the tool directly.
 
+  HYBRID SOAK (docs/pp-tp2-hybrid.md 9 P4, gate G-H4): with `--pp 2` tool_tp_soak runs the hybrid serving mode
+  (--tp 2 --pp 2) with long prompts, warm "turns" conversations and hybrid canaries (see that tool's header); the
+  verdict is the same plus: the summary's "hybrid" object must show the hybrid engaged and >= 1 pipelined call.
+  tools\hybrid\soak.ps1 is the convenience wrapper that supplies --pp 2 and the hybrid's soak defaults.
+
   No param() block on purpose: every argument, `--minutes 5` included, belongs to tool_tp_soak. Set
   $env:R4DX_SOAK_PRESET to use a build preset other than win-hip. A relative --json path is relative
   to the repository root, where the soak runs.
@@ -47,6 +52,11 @@ for ($i = 0; $i + 1 -lt $ToolArgs.Count; $i++) {
                "leaves the GPU no idle gap inside a prefill chunk (docs/tp.md Appendix B N64)")
     }
 }
+$IsHybrid = $false
+for ($i = 0; $i + 1 -lt $ToolArgs.Count; $i++) {
+    if ($ToolArgs[$i] -eq '--pp' -and $ToolArgs[$i + 1] -eq '2') { $IsHybrid = $true }
+}
+$Gate = if ($IsHybrid) { "G-H4" } else { "G8" }
 $JsonAbs = if ([System.IO.Path]::IsPathRooted($json)) { $json } else { Join-Path $Root $json }
 
 $r = Invoke-TdrWatched -Exe $Exe -ToolArgs $ToolArgs -WorkingDirectory $Root -JsonLog $JsonAbs -JsonAppends `
@@ -62,11 +72,29 @@ if (-not $summary) { $fail.Add("no summary line in this run's log") }
 elseif (($summary | ConvertFrom-Json).exit_code -ne 0) { $fail.Add("the summary line has exit_code $(($summary | ConvertFrom-Json).exit_code)") }
 if (-not $teardown) { $fail.Add("no teardown line in this run's log (the process died before or inside ~TpModel)") }
 elseif (($teardown | ConvertFrom-Json).exit_code -ne 0) { $fail.Add("the teardown line has exit_code $(($teardown | ConvertFrom-Json).exit_code)") }
+if ($IsHybrid -and $summary) {
+    $hy = ($summary | ConvertFrom-Json).hybrid
+    if ($null -eq $hy) {
+        $fail.Add("--pp 2 but the summary line has no 'hybrid' object")
+    } else {
+        $refText = if ([int]$hy.tp2_ref.compared -gt 0) {
+            ("{0} iterations compared, {1} differ at the first token, mean agreement {2:P1}") -f $hy.tp2_ref.compared, $hy.tp2_ref.first_token_diff, $hy.tp2_ref.mean_agree
+        } else {
+            "no iteration compared (--tp2-ref-every not given or no greedy iteration reached it)"
+        }
+        $hyLine = ("[soak.ps1] hybrid: split k={0}, S={1} tokens, min rows {2}; {3} pipelined / {4} TP-prefill calls, DFlash tail rows {5}; " +
+                   "TP=2 reference: {6}") -f `
+            $hy.split, $hy.stage_ctx, $hy.min_rows, $hy.pipelined, $hy.tp_prefill, $hy.tail_rows, $refText
+        Write-Output $hyLine
+        if (-not $hy.engaged) { $fail.Add("the hybrid mode was not engaged at the end of the soak") }
+        if ($hy.pipelined -lt 1) { $fail.Add("the hybrid soak made no pipelined call") }
+    }
+}
 
 if ($fail.Count -gt 0) {
-    Write-Output "[soak.ps1] FAIL (G8):"
+    Write-Output "[soak.ps1] FAIL ($Gate):"
     foreach ($f in $fail) { Write-Output "    $f" }
     exit 1
 }
-Write-Output "[soak.ps1] PASS (G8): soak exit 0, summary and teardown exit_code 0, no TDR since the start"
+Write-Output "[soak.ps1] PASS ($Gate): soak exit 0, summary and teardown exit_code 0, no TDR since the start"
 exit 0

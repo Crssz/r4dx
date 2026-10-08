@@ -158,8 +158,14 @@ struct ServerArgs {
 
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2): src/cli/cli_args.h's --pp* ---------------------
   // --pp 2 (or R4DX_PP=1 when --pp is not given: -1) runs prompt prefill as a two-stage pipeline across both GPUs
-  // (both cards visible: HIP_VISIBLE_DEVICES unset), decode unchanged on the headless card; exclusive with --tp 2. 1 forces it off.
+  // (both cards visible: HIP_VISIBLE_DEVICES unset), decode unchanged on the headless card. 1 forces it off. With --tp 2 it is the
+  // HYBRID serving mode (docs/pp-tp2-hybrid.md; --tp-mode real; --hybrid off turns it back into plain --tp 2).
   int pp = -1;
+  // ---- hybrid mode (--tp 2 --pp 2): src/cli/cli_args.h's --hybrid* (--pp-min-rows defaults to 1024 there)
+  int hybrid = -1;                  // --hybrid {on|off}; -1 follows R4DX_HYBRID (unset = on)
+  int64_t hybrid_ctx = 0;           // --hybrid-ctx N|auto (0 = auto)
+  double hybrid_reserve_gib = -1.0;  // --hybrid-reserve-gib X (< 0 = built-in)
+  bool hybrid_options_given = false;
   std::vector<int> pp_devices;  // --pp-devices B,A (HIP ordinals: stage B = decode card, stage A); empty = auto
   int pp_split = 0;           // auto: 29, 30 with --dflash
   int pp_min_rows = -1;       // default 1024
@@ -192,7 +198,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
-         "[--pp-submit-layers N] [--pp-max-inflight K]";
+         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -340,6 +346,23 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--pp-verify") { a.pp_verify = true; a.pp_options_given = true; }
     else if (arg == "--pp-submit-layers") { a.pp_submit_layers = ServerParseInt("--pp-submit-layers", NextServerArg(argc, argv, i, "--pp-submit-layers")); a.pp_options_given = true; pp_submit_given = true; }
     else if (arg == "--pp-max-inflight") { a.pp_max_inflight = ServerParseInt("--pp-max-inflight", NextServerArg(argc, argv, i, "--pp-max-inflight")); a.pp_options_given = true; pp_inflight_given = true; }
+    else if (arg == "--hybrid") {
+      const std::string v = NextServerArg(argc, argv, i, "--hybrid");
+      if (v != "on" && v != "off") throw ServerUsageError("--hybrid expects on or off, got '" + v + "'");
+      a.hybrid = v == "on" ? 1 : 0;
+      a.hybrid_options_given = true;
+    }
+    else if (arg == "--hybrid-ctx") {
+      const std::string v = NextServerArg(argc, argv, i, "--hybrid-ctx");
+      a.hybrid_ctx = v == "auto" ? 0 : ServerParseI64("--hybrid-ctx", v);
+      if (v != "auto" && a.hybrid_ctx < 1) throw ServerUsageError("--hybrid-ctx must be 'auto' or >= 1 tokens");
+      a.hybrid_options_given = true;
+    }
+    else if (arg == "--hybrid-reserve-gib") {
+      a.hybrid_reserve_gib = static_cast<double>(ServerParseFloat("--hybrid-reserve-gib", NextServerArg(argc, argv, i, "--hybrid-reserve-gib")));
+      if (!(a.hybrid_reserve_gib >= 0.0) || a.hybrid_reserve_gib > 24.0) throw ServerUsageError("--hybrid-reserve-gib must be in [0, 24]");
+      a.hybrid_options_given = true;
+    }
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -429,8 +452,18 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (a.pp != 2 && a.pp_options_given) {
     throw ServerUsageError("--pp-devices/--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
   }
+  if (a.hybrid_options_given && !(a.pp == 2 && a.tp == 2)) {
+    throw ServerUsageError("--hybrid/--hybrid-ctx/--hybrid-reserve-gib need --tp 2 --pp 2 (the hybrid serving mode, docs/pp-tp2-hybrid.md)");
+  }
   if (a.pp == 2) {
-    if (a.tp != 1) throw ServerUsageError("--pp 2 and --tp 2 are mutually exclusive");
+    // --tp 2 --pp 2 is the hybrid serving mode: the stages sit next to the two TP ranks, one per GPU.
+    if (a.tp == 2 && a.hybrid != 0 && a.tp_mode != "real") {
+      throw ServerUsageError("--tp 2 --pp 2 (the hybrid serving mode) needs --tp-mode real; add --hybrid off to run --tp-mode " + a.tp_mode + " without it");
+    }
+    // The decode stage is TP rank 0's card and the front stage rank 1's: an explicit --pp-devices B,A must name the --tp-devices pair.
+    if (a.tp == 2 && a.hybrid != 0 && a.pp_devices.size() == 2 && a.tp_devices.size() == 2 && a.pp_devices != a.tp_devices) {
+      throw ServerUsageError("--tp 2 --pp 2: --pp-devices must equal --tp-devices (stage B = TP rank 0's card, stage A = rank 1's)");
+    }
     if (pp_split_given && a.pp_split < 1) throw ServerUsageError("--pp-split must be 'auto' or >= 1");
     if (pp_min_rows_given && a.pp_min_rows < 1) throw ServerUsageError("--pp-min-rows must be >= 1");
     if ((pp_submit_given && (a.pp_submit_layers < 0 || a.pp_submit_layers > 64)) ||

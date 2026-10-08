@@ -133,12 +133,19 @@ set(R4DX_MODEL_SOURCES
   pp_stage.cpp
   # The real two-GPU pipeline's Model side (Phase 2): the stage A / stage B chunk compositions and the state hand-off.
   pp_stage_real.cpp
+  # The thread-agnostic stage runners (docs/pp-tp2-hybrid.md 7): what PpModel's orchestration of one pipelined call is made of.
+  pp_stage_runner.cpp
+  # Hybrid mode P2 (docs/pp-tp2-hybrid.md 3, 4, 6): the reshard executor, the DFlash tail and the live-state test hooks -- Model member code.
+  hybrid_model.cpp
   # The PpModel facade (--pp 2): stage A's rank thread + the decode Model, one TextModel.
   pp_model.cpp
   # docs/tp.md 2.8: the TextModel surface src/cli and src/server call -- LocalTextModel (TP=1, a
   # one-line forward per method onto Model) and TpModel (the tensor-parallel facade, 2.2-2.9).
   local_text_model.cpp
   tp_model.cpp
+  # The hybrid serving mode inside TpModel (docs/pp-tp2-hybrid.md, P3 step 2): the stage Models next to the ranks, the pipelined prefill
+  # command, the reshard over the pinned host ring, the dispatch -- TpModel members, split out of tp_model.cpp.
+  tp_model_hybrid.cpp
 )
 # r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel
 # test hooks (Model::DflashDebugLastTop16 and friends, docs/tp.md 10.1 "P5 additions") -- linked only

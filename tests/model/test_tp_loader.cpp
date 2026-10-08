@@ -459,18 +459,30 @@ bool ThrowsInvalidArgument(Fn&& fn) {
 
 void CheckRefusals(const std::shared_ptr<const r4dx::core::PinnedBuffer<uint16_t>>& shared,
                    Checker& ck) {
+  // shared_embed_host and embed_device_resident_decided are accepted at tp_world 1 (a hybrid-mode stage Model shares the TP
+  // ranks' host copy and takes their mirror decision, docs/pp-tp2-hybrid.md 9 P0); a host copy of the wrong size is refused.
+  {
+    ContainerLoadOptions o;
+    o.shared_embed_host = shared;
+    o.embed_device_resident = false;
+    o.layer_limit = kLayers;  // the l4 container's config says 64 layers but only 0..3 are on disk
+    const Container c = Container::Load(kContainerPath, o);
+    ck.Expect(c.EmbedTokensHost() == shared->data(), "tp_world 1 accepts shared_embed_host (the shared copy is used)");
+  }
+  for (int decided = 0; decided <= 1; ++decided) {
+    ContainerLoadOptions o;
+    o.embed_device_resident_decided = decided;
+    o.layer_limit = kLayers;
+    const Container c = Container::Load(kContainerPath, o);
+    ck.Expect(c.EmbedTokensDeviceResident() == (decided == 1),
+              "tp_world 1 accepts embed_device_resident_decided = " + std::to_string(decided));
+  }
   ck.Expect(ThrowsInvalidArgument([&] {
               ContainerLoadOptions o;
-              o.shared_embed_host = shared;  // TP-only, at tp_world 1
+              o.shared_embed_host = std::make_shared<const r4dx::core::PinnedBuffer<uint16_t>>(16);
               (void)Container::Load(kContainerPath, o);
             }),
-            "tp_world 1 refuses shared_embed_host");
-  ck.Expect(ThrowsInvalidArgument([&] {
-              ContainerLoadOptions o;
-              o.embed_device_resident_decided = 1;
-              (void)Container::Load(kContainerPath, o);
-            }),
-            "tp_world 1 refuses embed_device_resident_decided");
+            "tp_world 1 refuses a shared_embed_host of the wrong size");
   ck.Expect(ThrowsInvalidArgument([&] {
               ContainerLoadOptions o;
               o.tp_world = 2;

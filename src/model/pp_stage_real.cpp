@@ -139,6 +139,12 @@ void Model::PpAttach(PpStageSetup setup) {
     throw std::invalid_argument("Model::PpAttach: split " + std::to_string(setup.split) + " must leave at least one of the " +
                                 std::to_string(container_.NumLoadedLayers()) + " loaded layers on each side");
   }
+  // A stage runs [0, split) (A) or [split, N) (B): that range must be resident (a stage-only Model holds only its own).
+  if (setup.role == PpRole::kStageA) {
+    CheckLayersLoaded(0, setup.split, "Model::PpAttach (stage A)");
+  } else {
+    CheckLayersLoaded(setup.split, container_.NumLoadedLayers(), "Model::PpAttach (stage B)");
+  }
   stream_.Synchronize();
   for (const auto& kv : kv_caches_) {  // the geometry the channel's slot layout assumes is the caches' own
     if (!kv) continue;
@@ -199,12 +205,101 @@ void Model::PpEnableBounding(int submit_layers, int max_inflight) {
 
 void Model::PpSetSyncState(const PpSyncState& s) {
   if (pp_role_ != PpRole::kStageA) throw std::logic_error("Model::PpSetSyncState: stage A only");
+  StageSyncState st;  // (stage A has no MTP head: the seed fields stay out of it)
+  st.pos = s.pos;
+  st.started = s.started;
+  st.mrope_active = s.mrope_active;
+  st.mrope_delta = s.mrope_delta;
+  ApplySyncState(st, /*at_prefill_end=*/false);
+}
+
+// ---- hybrid mode: sync state of both stages, the rank's adoption, the stage-KV check (docs/pp-tp2-hybrid.md 3, 5, 9) ----------
+
+void Model::ApplySyncState(const StageSyncState& s, bool at_prefill_end) {
+  const SeedPlan seed = PlanSeed(s, mtp_.has_value(), container_.Config().hidden_size);
+  if (!seed.error.empty()) throw std::invalid_argument("Model::StageSetSyncState: " + seed.error);
   stream_.Synchronize();
   pos_ = s.pos;
   started_ = s.started;
   mrope_active_ = s.mrope_active;
   mrope_delta_ = s.mrope_delta;
-  at_prefill_end_ = false;
+  at_prefill_end_ = at_prefill_end;
+  if (mtp_) {  // only a Model with an MTP head has the seed buffer and the flag (stage A, a plain stage, keeps neither)
+    if (seed.copy) {
+      R4DX_HIP_CHECK(hipMemcpyAsync(mtp_seed_hidden_.data(), s.mtp_seed.data(), mtp_seed_hidden_.bytes(), hipMemcpyHostToDevice,
+                                     stream_.get()));
+      stream_.Synchronize();  // the host vector may die as soon as we return
+    }
+    mtp_seed_valid_ = seed.valid;
+  }
+}
+
+StageSyncState Model::StageGetSyncState() {
+  stream_.Synchronize();
+  StageSyncState s;
+  s.pos = pos_;
+  s.started = started_;
+  s.mrope_active = mrope_active_;
+  s.mrope_delta = mrope_delta_;
+  if (mtp_ && mtp_seed_valid_) {
+    s.mtp_seed_valid = true;
+    s.mtp_seed.resize(static_cast<size_t>(container_.Config().hidden_size));
+    R4DX_HIP_CHECK(hipMemcpyAsync(s.mtp_seed.data(), mtp_seed_hidden_.data(), s.mtp_seed.size() * sizeof(uint16_t),
+                                   hipMemcpyDeviceToHost, stream_.get()));
+    stream_.Synchronize();
+  }
+  return s;
+}
+
+void Model::StageSetSyncState(const StageSyncState& s) {
+  if (pp_role_ == PpRole::kNone) throw std::logic_error("Model::StageSetSyncState: not attached as a pipeline stage");
+  ApplySyncState(s, /*at_prefill_end=*/false);
+}
+
+void Model::TpAdoptPrefill(const StageSyncState& s) {
+  if (pp_role_ != PpRole::kNone || stage_role_ != stage::Role::kOff) {
+    throw std::logic_error("Model::TpAdoptPrefill: a rank Model adopts a pipelined prefill, a pipeline stage does not");
+  }
+  if (const std::string why = CheckAdoptable(s); !why.empty()) throw std::logic_error("Model::TpAdoptPrefill: " + why);
+  ApplySyncState(s, /*at_prefill_end=*/true);
+  // What a prefill leaves behind besides the scalars (Prefill / PrefillMultimodal / RestoreCheckpoint): no verify round has run on
+  // this state, no pending write-once prefix, no captured DFlash rows; the drafter ropes its blocks at `index + delta`. The KV /
+  // GDN / MTP-KV contents and the DFlash ring are written by the reshard and by the tail injection, not here.
+  mtp_num_accepted_valid_ = false;
+  mtp_last_committed_ = 1;
+  mtp_last_hidden_ = nullptr;
+  gdn_book_.Clear();
+  SetDflashFeatureRows(0);
+  if (dflash_.has_value()) dflash_->SetRopeDelta(mrope_delta_);
+}
+
+int64_t Model::StageKvCapacityTokens() const {
+  for (const auto& kv : kv_caches_) {
+    if (kv) return kv->CapacityTokens();
+  }
+  return -1;
+}
+
+void Model::CheckStageKv(int64_t stage_ctx) const {
+  if (stage_ctx <= 0) throw std::invalid_argument("Model::CheckStageKv: the stage-KV capacity S must be positive");
+  const int64_t block = PpKvBlockSize();
+  const int64_t want = (stage_ctx + block - 1) / block * block;  // PagedKvCache rounds up to whole blocks
+  const ModelConfig& cfg = container_.Config();
+  for (size_t i = 0; i < kv_caches_.size(); ++i) {
+    const int64_t layer = static_cast<int64_t>(i);
+    const bool wants_cache = container_.LayerLoaded(layer) && !cfg.IsGdnLayer(layer);
+    const auto& kv = kv_caches_[i];
+    if (wants_cache != kv.has_value()) {
+      throw std::logic_error("Model::CheckStageKv: layer " + std::to_string(layer) +
+                             (wants_cache ? " is an attention layer this Model runs but has no KV cache"
+                                          : " is not run by this Model and must have no KV cache"));
+    }
+    if (kv && kv->CapacityTokens() != want) {
+      throw std::logic_error("Model::CheckStageKv: layer " + std::to_string(layer) + "'s KV cache holds " +
+                             std::to_string(kv->CapacityTokens()) + " tokens, the stage-KV capacity S = " +
+                             std::to_string(stage_ctx) + " needs " + std::to_string(want) + " (ModelOptions::max_ctx = S)");
+    }
+  }
 }
 
 // ---- geometry -------------------------------------------------------------------------------------------------------
@@ -470,7 +565,8 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
       if (l < split) ++dfl_here;
     }
   }
-  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
+  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here,
+                                                pp_setup_.carry_kv ? PpAttnLayers(split) : std::vector<int64_t>{}, PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
   CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageA");
   if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageA: the prologue's hidden differs from the configuration's");
@@ -534,7 +630,8 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
                              std::to_string(pos_) + ", " + std::to_string(T) + " rows, last " +
                              std::to_string(r.want_logits) + ", " + std::to_string(dfl_here) + " columns");
   }
-  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
+  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here,
+                                                pp_setup_.carry_kv ? PpAttnLayers(split) : std::vector<int64_t>{}, PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
   CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageB");
   if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageB: the prologue's hidden differs from the configuration's");

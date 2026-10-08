@@ -24,8 +24,10 @@
 #include <string>
 #include <vector>
 
+#include "embed_mirror_lease.h"  // the borrowed embedding mirror (docs/pp-tp2-hybrid.md 7)
 #include "model_config.h"
 #include "quant_linear.h"
+#include "stage_load.h"          // LayerKind: hole-prefix / norm-only layers of a stage-only load
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
@@ -160,8 +162,10 @@ struct RotationWeights {
 // ranges are uploaded, straight from the mmap when they are one contiguous range and through a
 // reusable host staging buffer otherwise. Config() is then the rank-local config
 // (ModelConfig::Shard) and every QuantLinear carries the RANK's N/K; GlobalConfig() is the
-// container's own. The TP-only fields below must keep their defaults at tp_world == 1 (Load throws
-// std::invalid_argument otherwise): that path is the pre-TP loader, untouched.
+// container's own. The TP-only field parse_vision_config must keep its default at tp_world == 1 unless the load is stage-only (Load throws
+// std::invalid_argument otherwise): that path is the pre-TP loader, untouched at the defaults. shared_embed_host and
+// embed_device_resident_decided are also accepted at tp_world == 1 (a hybrid-mode stage Model shares the TP ranks' host
+// embedding copy), and the stage-only fields at the end are tp_world == 1 only.
 struct ContainerLoadOptions {
   Layout layout = Layout::kBf16, lm_head_layout = Layout::kBf16, mtp_head_layout = Layout::kBf16;
   int64_t layer_limit = -1;
@@ -170,15 +174,35 @@ struct ContainerLoadOptions {
   // host-only), so every rank takes the same gather path (docs/tp.md 2.9 step 5). -1: the heuristic.
   int embed_device_resident_decided = -1;
   bool load_vision = false;          // upload vision.* weights on THIS rank (TP: rank 0 only)
-  bool parse_vision_config = false;  // TP: parse vision_config even when not uploading (rank > 0)
+  bool parse_vision_config = false;  // TP: parse vision_config even when not uploading (rank > 0); also a stage-only load (tp_world == 1)
   int tp_world = 1, tp_rank = 0;
   // TP: the process's ONE pinned host copy of text.embed_tokens (LoadEmbedTokensHost), shared by
-  // every rank instead of each rank pinning its own 2.37 GiB. nullptr: this Load pins its own.
+  // every rank instead of each rank pinning its own 2.37 GiB (and, in the hybrid mode, by that card's stage Model). nullptr:
+  // this Load pins its own.
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;
+
+  // Stage-only loads (docs/pp-tp2-hybrid.md 7, 9 "P0 prerequisites"; stage_load.h has the policy). The shard loader refuses all
+  // of them (Load throws at tp_world > 1); at the defaults the tp_world == 1 loader is untouched.
+  // first_layer: layers [0, first_layer) are HOLES -- default-empty LayerWeights, nothing uploaded -- so layers_ stays globally
+  // indexed and NumLoadedLayers() stays the full count (DFlash target indices, has_next_layer and the FinalLmHead path need no
+  // re-indexing). Layer(i) throws on a hole; LayerLoaded(i) says which are resident.
+  int64_t first_layer = 0;
+  // norm_only_from >= 0: layers [norm_only_from, layer count) load their input_layernorm only (LayerInputNorm(i)): the weight the
+  // layer before fuses into its Mlp, which is all the front stage needs of its split layer. -1: none.
+  int64_t norm_only_from = -1;
+  // No lm_head and no mtp.* (the front stage). HasLmHead() / HasMtp() are then false.
+  bool skip_heads = false;
+  // The device mirror of text.embed_tokens borrowed from a Container on the same device (Container::EmbedMirrorLeaseHandle)
+  // instead of uploading another one; the lease keeps the mirror alive (embed_mirror_lease.h). Null: this Load
+  // decides (embed_device_resident_decided, else the free-VRAM heuristic) as before.
+  std::shared_ptr<const EmbedMirrorLease> borrowed_embed_mirror;
 };
 
 class Container {
  public:
+  Container(Container&&) = default;
+  Container& operator=(Container&&) = default;
+
   // Loads `path` onto the current HIP device (caller must have already selected device 1 per the
   // project's GPU rule), synchronously (Container::Load is a startup-path call, not a hot-path
   // one -- every upload below is a plain synchronous DeviceBuffer::CopyFromHost). `layer_limit`,
@@ -234,14 +258,45 @@ class Container {
   // Load() was called with embed_device_resident=false, or when it was true but the free-VRAM
   // heuristic decided it would not fit (see Load()'s own comment); check
   // EmbedTokensDeviceResident() rather than relying on this being non-null implicitly.
-  const uint16_t* EmbedTokensDevice() const { return embed_tokens_dev_.data(); }
-  bool EmbedTokensDeviceResident() const { return !embed_tokens_dev_.empty(); }
+  // (A borrowed mirror -- ContainerLoadOptions::borrowed_embed_mirror -- answers the same way: it is the owner's.)
+  const uint16_t* EmbedTokensDevice() const { return embed_mirror_ ? embed_mirror_->data : nullptr; }
+  bool EmbedTokensDeviceResident() const { return embed_mirror_ != nullptr; }
+  // The handle a second Container on this device passes as ContainerLoadOptions::borrowed_embed_mirror. Null when there is no
+  // mirror. It owns the device buffer (embed_mirror_lease.h): a borrower keeps the mirror alive, whatever the destruction order.
+  std::shared_ptr<const EmbedMirrorLease> EmbedMirrorLeaseHandle() const { return embed_mirror_; }
 
+  // The layer count of the model being served: layers_.size(), holes included (a hole-prefix load keeps layers_ globally
+  // indexed, so every `i + 1 < NumLoadedLayers()` / target-layer / split test keeps meaning what it always meant).
   int64_t NumLoadedLayers() const { return static_cast<int64_t>(layers_.size()); }
-  const LayerWeights& Layer(int64_t i) const { return layers_.at(static_cast<size_t>(i)); }
+  // Layer i's weights. Throws std::logic_error unless the layer is fully resident (a hole or a norm-only layer): a layer that
+  // is not there must never be run silently with null weights.
+  const LayerWeights& Layer(int64_t i) const {
+    if (!LayerLoaded(i)) ThrowLayerNotLoaded(i);
+    return layers_[static_cast<size_t>(i)];
+  }
+  // True iff layer i's weights are all resident (not a hole, not norm-only). False outside [0, NumLoadedLayers()).
+  bool LayerLoaded(int64_t i) const {
+    return i >= 0 && i < NumLoadedLayers() && layer_kinds_[static_cast<size_t>(i)] == stage::LayerKind::kFull;
+  }
+  // True iff every layer is fully resident -- every container but a stage-only one (O(1): Model's per-call range checks).
+  bool AllLayersLoaded() const { return all_layers_loaded_; }
+  // Layer i's input_layernorm, which a norm-only layer also has: the weight layer i - 1's Mlp fuses into its epilogue.
+  // Throws std::logic_error for a hole.
+  const core::DeviceBuffer<uint16_t>& LayerInputNorm(int64_t i) const {
+    if (i < 0 || i >= NumLoadedLayers() || layer_kinds_[static_cast<size_t>(i)] == stage::LayerKind::kHole) ThrowLayerNotLoaded(i);
+    return layers_[static_cast<size_t>(i)].input_layernorm;
+  }
+  // Ok ("") or why layers [first, last) are not all fully resident (stage_load.h's CheckRangeLoaded).
+  std::string CheckLayerRangeLoaded(int64_t first, int64_t last) const {
+    return all_layers_loaded_ && first >= 0 && last >= first && last <= NumLoadedLayers()
+               ? std::string()
+               : stage::CheckRangeLoaded(layer_kinds_, first, last);
+  }
 
   const core::DeviceBuffer<uint16_t>& FinalNorm() const { return final_norm_; }
   const QuantLinear& LmHead() const { return lm_head_; }
+  // False for a front-stage load (ContainerLoadOptions::skip_heads): LmHead() is then empty (N == 0).
+  bool HasLmHead() const { return lm_head_.N > 0; }
 
   // True iff `path` was converted with --mtp on (docs/container-format.md "mtp.*") -- checked once
   // at Load() time via SafetensorsReader::Has, not inferred from `__metadata__.r4dx_convert_run.mtp`
@@ -326,9 +381,17 @@ class Container {
   std::string model_id_, config_sha256_;
   core::PinnedBuffer<uint16_t> embed_tokens_;  // empty when shared_embed_host_ is set
   std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host_;
-  core::DeviceBuffer<uint16_t> embed_tokens_dev_;  // empty iff not device-resident (Load's own
-                                                    // comment) -- see EmbedTokensDeviceResident()
   std::vector<LayerWeights> layers_;
+  // One per layers_ entry: fully resident, norm-only or a hole (stage_load.h). All kFull except in a stage-only load.
+  std::vector<stage::LayerKind> layer_kinds_;
+  bool all_layers_loaded_ = true;
+  [[noreturn]] void ThrowLayerNotLoaded(int64_t i) const;
+  // Uploads text.embed_tokens' device mirror from EmbedTokensHost() and publishes its lease (both loaders).
+  void UploadEmbedMirror(size_t elems);
+  // The device mirror of text.embed_tokens: the lease this Container uploaded or the one it borrowed (ContainerLoadOptions::
+  // borrowed_embed_mirror); null iff not device-resident (Load's own comment) -- see EmbedTokensDeviceResident(). The lease owns
+  // the device buffer, so the mirror lives until the last Container holding the lease is gone.
+  std::shared_ptr<const EmbedMirrorLease> embed_mirror_;
   core::DeviceBuffer<uint16_t> final_norm_;
   QuantLinear lm_head_;
   std::optional<MtpWeights> mtp_;

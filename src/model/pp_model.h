@@ -21,6 +21,11 @@
 // the model is kNeedsRecovery: every device-work call throws until Reset() (which resets both Models and the channel)
 // heals it, as TpModel's state machine does (docs/tp.md 2.4). A stage A that makes no progress for 60 s is kFatal.
 //
+// Orchestration: the per-call work is the thread-agnostic stage runners of pp_stage_runner.h (RunStageA on stage A's worker, RunStageB on
+// the facade, StageBExportSyncBack ...); PpModel owns the threads, the channel, the mirror tracker and the error state. Every pinned buffer
+// (pp::StageBuffers) is allocated by the thread that owns its producing device -- stage A's worker for the slots and the GDN hand-off, the
+// facade (stage B's thread) for the sync-back buffers -- and none lazily (docs/pp-tp2-hybrid.md 7).
+//
 // Thread safety: like Model, one facade thread issues every call.
 #pragma once
 
@@ -37,8 +42,9 @@
 
 #include "model.h"
 #include "pp_channel.h"
+#include "pp_stage_buffers.h"
+#include "pp_stage_runner.h"
 #include "pp_sync.h"
-#include "r4dx/core/pinned_buffer.hpp"
 #include "text_model.h"
 #include "tp/tp_rank_worker.h"
 
@@ -136,7 +142,10 @@ class PpModel final : public TextModel {
   // Negative controls (tests/model/test_pp_real_identity.cpp requires each to change an observable): do not copy the sync-back
   // to stage A (a stale mirror), do not import stage A's GDN state into stage B.
   enum class TestFault { kNone, kSkipSyncBack, kSkipGdnImport };
-  void SetTestFault(TestFault f) { fault_ = f; }
+  void SetTestFault(TestFault f) {
+    fault_ = f;
+    run_.skip_gdn_import = f == TestFault::kSkipGdnImport;
+  }
   void SetSplit(int64_t k);
   void SetMinRows(int64_t min_rows);
   void AttachDflashFeatureCapture(std::vector<int64_t> target_layers);
@@ -147,24 +156,6 @@ class PpModel final : public TextModel {
 
  private:
   PpModel() = default;
-
-  // Per-call state shared with stage A's command, on the heap: if the facade gives up on a stalled stage A and throws,
-  // A's closure still holds it.
-  struct CallState {
-    std::vector<int32_t> ids;
-    std::vector<ImageSpan> a_spans;                  // stage A's image spans (host rows)
-    std::vector<std::vector<uint16_t>> a_rows;       // ... their storage
-    bool multimodal = false;
-    Model::PpSyncState sync;
-    bool dflash_injection = true;
-    pp::MirrorTracker::SyncPlan plan;
-    int64_t call_id = 0;
-    bool verify = false;
-    std::vector<std::pair<std::string, uint64_t>> b_digest_sync;    // B's live state at the call's start (verify)
-    std::vector<std::pair<std::string, uint64_t>> a_digest_end;     // A's live state at the call's end (verify)
-    double a_sync_ms = 0;
-    double a_gdn_export_ms = 0;
-  };
 
   // hipSetDevice(stage B's ordinal) on the calling thread. The decode Model's device is not necessarily the process default
   // (ordinal 0) and the thread that calls into the PpModel is not necessarily the one that loaded it (the server loads on
@@ -177,8 +168,6 @@ class PpModel final : public TextModel {
   std::exception_ptr JoinStageA(std::chrono::milliseconds stall);
   void RunA(const std::function<void(Model&)>& fn, std::chrono::milliseconds stall);
   [[noreturn]] void Fail(std::exception_ptr cause);
-  // Stage B's last chunk of the call has taken its slot (Model::PpStageSetup::before_last_chunk).
-  void OnLastChunk();
   Model::PpStageSetup StageSetup(Model::PpRole role);
   std::vector<int64_t> TargetsBelow(int64_t split) const;
   void UpdateStageACapture();
@@ -197,17 +186,15 @@ class PpModel final : public TextModel {
   bool dflash_injection_ = true;
   int64_t call_id_ = 0;
   TestFault fault_ = TestFault::kNone;
-  int64_t cur_call_ = -1;        // the pipelined call in flight (OnLastChunk)
-  bool early_import_ = false;    // its GDN import was started before B's last chunk computed
+  pp::StageRunOptions run_;      // what the stage runners are told (split_ mirrored into run_.split, the GDN-import fault)
+  pp::StageBCallState b_state_;  // stage B's per-call state (the call in flight, whether its GDN import started early)
   pp::MirrorTracker tracker_;
   Stats stats_;
 
   // Declared in reverse order of destruction: the worker (joins stage A's thread) goes first; stage A's Model was already
-  // destroyed on that thread by ~PpModel; then stage B; then the channel and the pinned memory they point into.
-  std::vector<core::PinnedBuffer<uint8_t>> slots_;
-  core::PinnedBuffer<uint8_t> gdn_hand_;   // A -> B: the GDN live state at the end of a call
-  core::PinnedBuffer<uint8_t> gdn_sync_;   // B -> A: the GDN live state before a call (sync-back)
-  core::PinnedBuffer<uint8_t> kv_sync_;    // B -> A: the KV rows A is missing before a call
+  // destroyed on that thread by ~PpModel (which also released the stage-A-produced buffers there); then stage B; then the channel
+  // and the pinned memory it points into (the stage-B-produced buffers were released by ~PpModel on the facade).
+  std::unique_ptr<pp::StageBuffers> bufs_;  // slots + GDN hand-off (A-produced), GDN / KV sync-back (B-produced)
   std::unique_ptr<pp::StageChannel> channel_;
   std::optional<Model> b_;
   std::optional<Model> a_;  // built, used and destroyed ONLY on stage A's thread

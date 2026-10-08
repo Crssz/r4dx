@@ -47,6 +47,9 @@
 #include "prefill_chunk.h"  // kPrefillChunkBase / kPrefillChunkWide (docs/prefill.md)
 #include "step_meta.h"      // the one-copy decode step metadata layout (decode-t1 item 5)
 #include "prefill_int8.h"   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path")
+#include "stage_sync.h"     // StageSyncState: the scalars handed between a TP rank and the hybrid mode's stages
+#include "live_state.h"     // hybrid::LiveState / DigestList: host images of the live state (HIP-free; the debug hooks below)
+#include "reshard_exec.h"   // hybrid::CopyOp / OpSlice / Side: the reshard executor's vocabulary (HIP-free)
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
@@ -241,6 +244,25 @@ struct ModelOptions {
   // carry copied through host staging, on this one device. A diagnostic and test mode (the bytes equal the
   // monolithic run's); not for TP ranks or rotated containers.
   int pp_emulate_split = -1;
+  // Hybrid mode (docs/pp-tp2-hybrid.md 1, 7, 9 "P0 prerequisites"): load this Model as one PIPELINE STAGE of the PP-2 prefill that
+  // sits next to a TP-2 rank Model on the same card, holding only what the stage runs (stage_load.h has the policy):
+  //   kFront (stage X, the PP stage A): layers [0, split) plus the input_layernorm of layer `split` (norm-only: what layer
+  //     split - 1's Mlp fuses -- the reason PpModel loads `reserve_split + 1` layers), NO lm_head / MTP head / drafter / vision tower (the vision GEOMETRY is parsed, so the stage splices the image rows rank 0 encoded),
+  //     and no KV cache or GDN state for layer `split`. layer_limit must be -1 or split + 1.
+  //   kBack (stage Y, the PP stage B / decode side of rank 0): layers [split, N) as a HOLE-PREFIX container -- layers_ stays
+  //     globally indexed, NumLoadedLayers() stays N, layers below `split` are empty and get no state -- plus the final norm, the
+  //     full lm_head and the full MTP head (so its Prefill logits and MTP priming equal TP=1's), no vision tower (geometry only), no drafter.
+  // Both are TP=1 Models (tp.world == 1), take the process's shared pinned embedding copy and, on the card of the rank that
+  // owns one, borrow that rank's device mirror (the lease keeps it alive, so the destruction order is free), and size their KV by max_ctx = the stage-KV
+  // capacity S (CheckStageKv). kOff (the default) leaves every path exactly as before.
+  struct StageOnlyOptions {
+    stage::Role role = stage::Role::kOff;
+    int64_t split = 0;  // k
+    std::shared_ptr<const core::PinnedBuffer<uint16_t>> shared_embed_host;  // null: this Model pins its own copy
+    std::shared_ptr<const EmbedMirrorLease> borrowed_embed_mirror;           // null: this Model decides itself
+    int embed_device_resident_decided = -1;  // when no mirror is borrowed: 1 mirror, 0 host-only, -1 the free-VRAM heuristic
+  };
+  StageOnlyOptions stage_only;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -277,6 +299,16 @@ class Model {
   Model& operator=(Model&&) = default;
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
+
+  // GEMM tuning scope (docs/pp-tp2-hybrid.md 7). The per-thread tuning flag (linear.h SetTp2TuningForThisThread) must equal the
+  // Model that runs: true for a TP rank, false for a TP=1 Model and a pipeline stage. Tp2TuningForModel() is that value, fixed
+  // at Load; a caller that runs this Model on a thread that also hosts another one wraps the call in
+  // Tp2TuningScope(model.Tp2TuningForModel()). CheckTuningScope() throws std::logic_error when the calling thread's flag
+  // disagrees; the entry points that reach a GEMM (RunChunk, VerifyWindow, the MTP / DFlash rounds) run it first. Every
+  // single-Model-per-thread path satisfies it by construction: Load sets the flag on the loading thread, a rank worker thread
+  // only ever runs its rank, and any other thread's flag is its default, false.
+  bool Tp2TuningForModel() const { return tp2_tuning_; }
+  void CheckTuningScope() const;
 
   // Under tensor parallelism (ModelOptions::tp.world > 1) Config() is the RANK-local config (head
   // counts and intermediate_size divided by the world, docs/tp.md 3.2; vocab_size stays global) and
@@ -907,6 +939,10 @@ class Model {
     // Either stage: called when a chunk has been fully handled (stage A: published; stage B: epilogue done, slot
     // released). PpModel bumps stage A's heartbeat from it (the progress watchdog's input).
     std::function<void()> on_chunk;
+    // Hybrid mode (docs/pp-tp2-hybrid.md 1): false drops the KV blocks of stage A's attention layers from every slot -- stage B is a
+    // hole-prefix Model with no cache for layers < split, and stage A's KV stays on stage A until the reshard. BOTH stages of a
+    // call must be attached with the same value (the payload size is checked per chunk). true (the default) is the PP-2 prefill.
+    bool carry_kv = true;
   };
   // Throws std::invalid_argument for a TP rank, a rotated (quant2) container, the PP-emulate mode, an active debug
   // probe (R4DX_CLOCK_PROBE), or a split outside [1, NumLoadedLayers() - 1]. The device must be idle.
@@ -962,8 +998,131 @@ class Model {
   // (R4DX_PP_VERIFY, tests/model/test_pp_real_identity.cpp). Synchronous, slow (copies the state to the host).
   std::vector<std::pair<std::string, uint64_t>> PpLiveDigest(int64_t split);
 
+  // ---- hybrid mode: stage-only Models and the TP rank's adoption of a pipelined prefill (docs/pp-tp2-hybrid.md 3, 5, 9) ----
+  // ModelOptions::stage_only this Model was loaded with (kOff for every other Model) and its split k.
+  stage::Role StageOnlyRole() const { return stage_role_; }
+  int64_t StageOnlySplit() const { return stage_split_; }
+  // Throws std::logic_error unless layers [first, last) are all fully resident (not a hole, not a norm-only layer): the entry
+  // points of a stage (PpAttach, the layer loops) assert their range so a hole is never executed with null weights. O(1) for
+  // every Model that is not stage-only.
+  void CheckLayersLoaded(int64_t first, int64_t last, const char* what) const;
+  // The stage-KV capacity S (design 2): every attention layer this Model holds has a cache of exactly ceil(S / block) blocks, and
+  // no layer it does not run (a hole, the front stage's split layer) has one. Throws std::logic_error otherwise. The S itself
+  // is checked by hybrid::CheckStageCtx (hybrid_budget.h). StageKvCapacityTokens() is the capacity of the caches (-1: none).
+  void CheckStageKv(int64_t stage_ctx) const;
+  int64_t StageKvCapacityTokens() const;
+  // The scalars a pipelined prefill call hands over (stage_sync.h): this Model's pos / started / mrope state and, when it has an
+  // MTP head with a valid seed, the seed row (device idle on return: one 10 KiB D2H). Non-const because it synchronizes.
+  StageSyncState StageGetSyncState();
+  // Before a pipelined call: a TP rank's state into a stage Model of EITHER role (PpSetSyncState is stage A's, PpModel's). pos /
+  // started / mrope, at_prefill_end_ = false, and -- when this Model has an MTP head (stage Y) -- mtp_seed_valid_ and the seed row
+  // (without it Y's `have_boundary` is stale after a decode and the MTP KV row of the call's first position is skipped or
+  // primed from the wrong hidden state). Throws std::logic_error when not attached as a pipeline stage. Device idle.
+  void StageSetSyncState(const StageSyncState& s);
+  // After a pipelined call: the stage Y's end state into a TP rank Model (run on that rank's thread). pos / started / mrope
+  // active+delta, at_prefill_end_ = true, mtp_num_accepted_valid_ = false (no verify round has run on the new state), the write-
+  // once book clean, the drafter's rope delta, and the MTP seed (mtp_seed_valid_ + the 10 KiB row) when this rank has an MTP head.
+  // Does NOT touch the KV / GDN / MTP-KV / DFlash ring contents (the reshard and TpInjectDflashTail write those). Throws
+  // std::logic_error for a pipeline stage or a state that is not a finished prefill (pos <= 0). Device idle; not collective.
+  void TpAdoptPrefill(const StageSyncState& s);
+
+  // ---- hybrid mode: the reshard executor (docs/pp-tp2-hybrid.md 3, 7; hybrid_model.cpp) ---------------------------------------
+  // The live state of a pipeline stage (the TP=1 layout: every head) and of a TP=2 rank (its head half) moves by the copy ops of a
+  // hybrid::ReshardPlan (reshard_plan.h): this is the executor that takes those ops, so the plan the CPU test checks IS what runs.
+  // `side` says which holder of the op THIS Model is: Side::kFull for a TP=1 Model or a stage (a stage-only Model must be the op's
+  // stage), Side::kRank for a TP=2 rank (it must be the op's rank). A Model that holds no buffer for the op's layer throws.
+  //   * ReshardExport copies the slice's bytes out of this Model's layer buffer into `host`, compact (row after row), ReshardImport
+  //     the other way. `host` is caller-owned pinned memory of at least hybrid::SliceBytes(op, slice) bytes. Both only ENQUEUE on this
+  //     Model's stream (ReshardStream): the caller orders the other card's side after it (ReshardSync here, then the other Model's
+  //     import) and synchronizes before it reads or reuses `host`. No allocation, no host synchronization: usable from a rank thread
+  //     inside a command.
+  //   * ReshardCopyLocal is the same-card half (op.local): one device-to-device 2D copy from the source Model's buffer to the
+  //     destination's, on the DESTINATION's stream; both Models must be idle on entry (every public call ends idle).
+  //   * Recurrent and conv ops address the LIVE state (window 0 / offset 0), so a speculating Model must be collapsed first
+  //     (ReshardCollapse, stream-ordered); a Model with a pending window or write-once prefix refuses the op instead of copying the
+  //     wrong slot.
+  //   * A conv op through a pitched line stages through a small device scratch: ReshardInit allocates it, once, outside the hot path
+  //     (a Model that never needs it -- compact conv lines -- may skip the call); a missing scratch throws.
+  // The op's pitches and widths are checked against this Model's own buffers, so a plan built for another geometry (a wrong
+  // rank_conv_pitch, a cache of another size) is an error, not a mis-addressed copy.
+  void ReshardInit();
+  void ReshardCollapse();
+  // The conv line pitch of this Model's GDN state in ENTRIES per channel (conv_width - 2 + window): hybrid::PlanParams::rank_conv_pitch
+  // for a rank, stage_conv_pitch / stage_b_conv_pitch for a stage (a stage with an MTP head is sized for the verify window too).
+  int64_t ReshardConvPitch() const;
+  void ReshardExport(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, uint8_t* host);
+  void ReshardImport(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, const uint8_t* host);
+  static void ReshardCopyLocal(Model& stage, Model& rank, const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Dir dir);
+  hipStream_t ReshardStream() const { return stream_.get(); }
+  void ReshardSync() { stream_.Synchronize(); }
+
+  // ---- hybrid mode: the DFlash tail (docs/pp-tp2-hybrid.md 3, 6; hybrid_model.cpp; dflash_tail_plan.h has the rules) -----------
+  // On a rank Model with a drafter, after TpAdoptPrefill: injects the tail rows [start_pos, start_pos + rows) of the finished call
+  // into the drafter's ring from host feature rows `features` ([rows][DflashFeatureCols()] bf16, the stage's capture), in the
+  // 64-row slices RunChunk injects, each with the temporal rope row `rope_t + row0` (host int32[rows]; nullptr when the conversation
+  // has no image: the drafter then ropes at start + t + its delta, as RunChunk does). The tail must end at PositionCount() and
+  // start at or after the drafter's frontier; a gap (the usual case, start = max(p0, n - 2048 aligned)) must cover a whole window
+  // (hybrid::CheckTailInject). Runs the drafter's GEMMs, so the thread's tuning flag must equal this Model's (CheckTuningScope).
+  // Synchronous. Not a stage. Caller contracts: max_chunk_ must be hybrid::kDflashSliceRows (checked); `rope_t` has no length
+  // argument (it must hold `rows` entries) and, while an image's mrope is active, must be passed for any slice that may touch the
+  // image (nullptr means the delta shortcut, only right for text rows past it); CheckTailInject throws when the drafter's frontier
+  // lags (injection was off for a sampled turn) and the call is shorter than the window -- the caller (P3) then takes the plain TP path.
+  void TpInjectDflashTail(const uint16_t* features, int64_t rows, int64_t start_pos, const int32_t* rope_t);
+  // Stage side: captures the feature rows of positions [start_pos, end_pos) as this Model's chunks drain them (the capture observer),
+  // into `host` ([capacity_rows][DflashFeatureCols()] bf16, caller-owned pinned memory). Needs AttachDflashFeatureCapture and a Model
+  // whose prefill drains its chunks (a monolithic Model, PP-emulate, or the pipeline's stage B -- stage A never drains; its columns
+  // arrive in the carry). Armed before a Prefill / PrefillMultimodal call, disarmed after it; the device copies are asynchronous, so
+  // StageDisarmDflashTail synchronizes and returns the number of rows captured, throwing if the call left a gap in [start, end).
+  // Do not move the Model while armed. Takes the capture-observer slot (throws if another observer is set).
+  void StageArmDflashTail(uint16_t* host, int64_t capacity_rows, int64_t start_pos, int64_t end_pos);
+  int64_t StageDisarmDflashTail();
+  bool StageDflashTailArmed() const { return dflash_tail_ != nullptr; }
+
+#ifdef R4DX_TP_TESTING
+  // ---- hybrid mode test hooks (docs/pp-tp2-hybrid.md 4; hybrid_model.cpp) ------------------------------------------------------
+  // The digest of the LIVE state only, as canonical (layer, head, row) records (live_digest.h documents the names): per attention
+  // layer KV rows < pos, the MTP head's KV rows < pos - 1, per GDN layer the live recurrent slot (the window rule of
+  // DebugLiveGdnDigest) and the three live conv entries per channel (at the offset a speculative round left them), the DFlash
+  // drafter's visible window and injected count, and "pos". A host image digests identically (hybrid::DigestLiveImage), which is what
+  // makes the hybrid-prefilled rank comparable with a rank image loaded through DebugImportLiveState / DebugImportFullState. Unlike
+  // DebugStateDigest it is valid after warm turns and decode. Synchronizes; may flush a pending write-once prefix (invisible).
+  hybrid::DigestList DebugLiveStateDigest();
+  // The live state as a host image of THIS Model's geometry (a TP=1 Model: the full-head image; a rank: its head half), canonical
+  // (hybrid::CanonicalizeKv) so equal states are equal bytes, plus the scalars (StageGetSyncState). Requires pos > 0.
+  hybrid::LiveState DebugExportLiveState();
+  // Loads an image of THIS Model's geometry (DebugExportLiveState's shape) as the live state: KV and MTP-KV blocks, the live recurrent
+  // slot and the three live conv entries per channel, then the scalars through TpAdoptPrefill (so the Model is as after a finished
+  // prefill). A stage-only Model refuses. The DFlash ring is not part of the image (TpInjectDflashTail fills it).
+  void DebugImportLiveState(const hybrid::LiveState& state);
+  // Dump a TP=1 Model's live state to `path` (hybrid::WriteLiveState: a checksummed file, the `extra` payloads included when a test
+  // adds them through DebugExportLiveState + WriteLiveState itself) / load a FULL-head state file into this Model: a TP=1 Model takes
+  // it as it is, a TP rank takes its head half of it (hybrid::ReshardRef over StateGeometry::FromRules(GlobalConfig())).
+  void DebugExportFullState(const std::string& path);
+  void DebugImportFullState(const std::string& path);
+  // Negative control (10) of design section 4 (tests/model/test_hybrid_emulate_identity.cpp): overrides the tuning flag this Model
+  // believes it runs under (Tp2TuningForModel / CheckTuningScope), so a TP=1 stage can be driven under the TP-thread flag WITHOUT the
+  // entry guard refusing it, to show that the stage's live-state digest changes. Nothing else in the tree calls it.
+  void DebugSetTp2Tuning(bool enabled) { tp2_tuning_ = enabled; }
+#endif
+
  private:
   Model() = default;
+
+  // The reshard executor's lookup (hybrid_model.cpp): the device address of the first byte of `slice` in this Model's buffer for `op`
+  // (the Model must hold `side` of the op), `*rect` the rectangle it covers; every pitch and extent is checked against the buffer.
+  uint8_t* ReshardLocate(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, const char* who, hybrid::Rect* rect);
+  void CheckGdnLiveInPlace(const char* who) const;
+  // The GDN slot and conv-history offset the live state of `gs` is in (DebugLiveGdnDigest's window rule; the write-once recurrent state
+  // is in its one slot, its conv history follows the same offset).
+  void LiveGdnPlace(GdnStateManager& gs, int32_t* slot, int64_t* conv_off) const;
+  core::DeviceBuffer<uint8_t> reshard_scratch_;  // ReshardInit: one pitched conv line's live entries, compact
+  struct DflashTailState;                        // StageArmDflashTail's capture (hybrid_model.cpp)
+  std::shared_ptr<DflashTailState> dflash_tail_;
+
+  // StageSetSyncState / TpAdoptPrefill's shared write of the scalars and the seed.
+  void ApplySyncState(const StageSyncState& s, bool at_prefill_end);
+  stage::Role stage_role_ = stage::Role::kOff;
+  int64_t stage_split_ = 0;
 
   // Runs every layer once over `token_ids` (<=64 of them), advancing `pos_` by token_ids.size().
   // `is_prefill_path` selects GDN's chunked-scan kernels (true) vs its sequential recurrent-update
@@ -1160,6 +1319,7 @@ class Model {
 
   // ---- tensor parallel (docs/tp.md 4.4, 7.2); inert at TP=1 -------------------------------------
   core::TpComm* comm_ = nullptr;  // ModelOptions::tp.comm, non-owning; nullptr at TP=1
+  bool tp2_tuning_ = false;       // this Model is a TP rank (tp.world > 1): the value of the thread's tuning flag for its calls
   // This rank's lm_head rows (container_.LmHead().N) and the global id of the first one
   // (Config().VocabShardBegin()): vocab_size and 0 at TP=1. Every device logits buffer, kernel
   // `vocab` argument and D2H count uses vocab_local_; every host row a sampler or caller sees is

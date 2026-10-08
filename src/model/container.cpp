@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -110,13 +111,24 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
                                 "tp_rank < tp_world, got tp_world " + std::to_string(o.tp_world) +
                                 ", tp_rank " + std::to_string(o.tp_rank));
   }
-  if (o.tp_world > 1) return LoadShard(path, o);
+  // The stage-only fields (docs/pp-tp2-hybrid.md 9 P0) belong to the single-device loader: a stage Model is a TP=1 Model.
+  const bool stage_fields = o.first_layer != 0 || o.norm_only_from >= 0 || o.skip_heads || o.borrowed_embed_mirror;
+  if (o.tp_world > 1) {
+    if (stage_fields) {
+      throw std::invalid_argument(
+          "r4dx::model::Container::Load: first_layer, norm_only_from, skip_heads and borrowed_embed_mirror are stage-only "
+          "options (tp_world == 1 only)");
+    }
+    return LoadShard(path, o);
+  }
   // tp_world == 1 (docs/tp.md 5.1 step 7): the single-device loader below -- no rule lookup, no
-  // staging. The TP-only options have no meaning here; refuse them rather than ignore them.
-  if (o.shared_embed_host || o.embed_device_resident_decided >= 0 || o.parse_vision_config) {
+  // staging. The TP-only option parse_vision_config has no meaning here, except for a stage-only load (which splices image rows
+  // rank 0 encoded and so needs the geometry without the tower); refuse it elsewhere rather than ignore it.
+  // (shared_embed_host and embed_device_resident_decided are accepted: a hybrid-mode stage Model shares the TP ranks'
+  // host embedding copy and takes the ranks' mirror decision.)
+  if (o.parse_vision_config && !(o.first_layer != 0 || o.norm_only_from >= 0 || o.skip_heads)) {
     throw std::invalid_argument(
-        "r4dx::model::Container::Load: shared_embed_host, embed_device_resident_decided and "
-        "parse_vision_config are tensor-parallel options (tp_world > 1 only)");
+        "r4dx::model::Container::Load: parse_vision_config is a tensor-parallel option (tp_world > 1 only)");
   }
   const Layout layout = o.layout, lm_head_layout = o.lm_head_layout;
   const Layout mtp_head_layout = o.mtp_head_layout;
@@ -162,24 +174,56 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   const int64_t num_layers = (layer_limit >= 0)
                                   ? std::min(layer_limit, c.config_.num_hidden_layers)
                                   : c.config_.num_hidden_layers;
+  // Stage-only loads (hole prefix, norm-only tail, no heads): checked before any upload. A rotated container's stack-entry
+  // and -exit rotations straddle the stages (docs/pp-prefill.md 4), so it never loads as a stage.
+  const bool stage_layers = o.first_layer != 0 || o.norm_only_from >= 0 || o.skip_heads;
+  if (stage_layers) {
+    if (const std::string why = stage::ValidateLayerRequest(num_layers, o.first_layer, o.norm_only_from); !why.empty()) {
+      throw std::invalid_argument("r4dx::model::Container::Load: " + why);
+    }
+  }
+  if (stage_layers && rotation) {
+    throw std::invalid_argument("r4dx::model::Container::Load: a stage-only load is not available for a rotated (quant2) container");
+  }
+  c.layer_kinds_ = stage::LayerKinds(num_layers, o.first_layer, o.norm_only_from);
+  c.all_layers_loaded_ = o.first_layer == 0 && o.norm_only_from < 0;
 
-  // text.embed_tokens: host-resident, pinned so a future async H2D staging copy can overlap.
+  // text.embed_tokens: host-resident, pinned so a future async H2D staging copy can overlap -- or the process's one shared
+  // pinned copy (shared_embed_host: the hybrid mode's stage Models, never a second 2.37 GiB).
   {
     const int64_t n = ElemCountBySize(reader, "text.embed_tokens", 2);
-    c.embed_tokens_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(n));
-    std::memcpy(c.embed_tokens_.data(), reader.Data("text.embed_tokens"),
-                static_cast<size_t>(n) * 2);
+    if (o.shared_embed_host) {
+      if (o.shared_embed_host->size() != static_cast<size_t>(n)) {
+        throw std::invalid_argument("r4dx::model::Container::Load: shared_embed_host holds " +
+                                    std::to_string(o.shared_embed_host->size()) + " elements, text.embed_tokens has " +
+                                    std::to_string(n));
+      }
+      c.shared_embed_host_ = o.shared_embed_host;
+    } else {
+      c.embed_tokens_ = core::PinnedBuffer<uint16_t>(static_cast<size_t>(n));
+      std::memcpy(c.embed_tokens_.data(), reader.Data("text.embed_tokens"),
+                  static_cast<size_t>(n) * 2);
+    }
 
     // Device mirror (docs/mtp.md "device-resident draft loop") -- see Load()'s own comment for the
     // free-VRAM heuristic and why this is a best-effort ADDITION, never a replacement for the host
-    // copy above.
-    if (embed_device_resident) {
+    // copy above. A borrowed mirror (the rank Container's, on this device) is used as is; otherwise the caller's decision
+    // (embed_device_resident_decided: 1 mirror, 0 host-only) wins over the heuristic, as in the shard loader.
+    if (o.borrowed_embed_mirror) {
+      int device = -1;
+      R4DX_HIP_CHECK(hipGetDevice(&device));
+      if (const std::string why = CheckEmbedMirrorBorrow(*o.borrowed_embed_mirror, device, static_cast<size_t>(n)); !why.empty()) {
+        throw std::invalid_argument("r4dx::model::Container::Load: " + why);
+      }
+      c.embed_mirror_ = o.borrowed_embed_mirror;
+    } else if (o.embed_device_resident_decided >= 0) {
+      if (o.embed_device_resident_decided != 0) c.UploadEmbedMirror(static_cast<size_t>(n));
+    } else if (embed_device_resident) {
       size_t free_bytes = 0, total_bytes = 0;
       R4DX_HIP_CHECK(hipMemGetInfo(&free_bytes, &total_bytes));
       const size_t embed_bytes = static_cast<size_t>(n) * sizeof(uint16_t);
       if (free_bytes > embed_bytes * 2) {
-        c.embed_tokens_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(n));
-        c.embed_tokens_dev_.CopyFromHost(c.embed_tokens_.data(), static_cast<size_t>(n));
+        c.UploadEmbedMirror(static_cast<size_t>(n));
       } else {
         std::fprintf(stderr,
                       "r4dx: only %.2f GiB free VRAM (need ~%.2f GiB for text.embed_tokens plus "
@@ -204,6 +248,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
 
   c.layers_.reserve(static_cast<size_t>(num_layers));
   for (int64_t i = 0; i < num_layers; ++i) {
+    if (c.layer_kinds_[static_cast<size_t>(i)] == stage::LayerKind::kHole) {  // a hole prefix: layers_ stays globally indexed
+      c.layers_.emplace_back();
+      continue;
+    }
     const std::string base = "text.layers." + std::to_string(i) + ".";
     LayerWeights lw;
     // A rotated container stores its (zeroed, folded) norms under `.rotated` names so that a binary
@@ -211,6 +259,10 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
     // instead of running rotated weights in the unrotated basis (docs/container-format.md).
     const char* norm_suffix = rotation ? ".rotated" : "";
     lw.input_layernorm = UploadRawU16(reader, base + "input_layernorm" + norm_suffix);
+    if (c.layer_kinds_[static_cast<size_t>(i)] == stage::LayerKind::kNormOnly) {  // the front stage's split layer: the norm only
+      c.layers_.push_back(std::move(lw));
+      continue;
+    }
     lw.post_attention_layernorm =
         UploadRawU16(reader, base + "post_attention_layernorm" + norm_suffix);
 
@@ -266,10 +318,12 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // lm_head is where the vocab-tail KL loss concentrates) carries only lm_head.bf16.w, and every
   // caller that asks for the body layout here should get that bf16 head rather than a throw.
   const int fallbacks_before_head = bf16_fallbacks;
-  c.lm_head_ = LoadQuantLinearWithFallback(reader, meta,"lm_head", lm_head_layout, c.config_.vocab_size,
-                                           hidden, &bf16_fallbacks);
-  const bool trellis_bf16_head =
-      TakeTrellisBf16Head(meta, c.lm_head_, fallbacks_before_head, &bf16_fallbacks);
+  bool trellis_bf16_head = false;
+  if (!o.skip_heads) {  // the front stage (docs/pp-tp2-hybrid.md 9) has no head: HasLmHead() is false, no mtp.* below
+    c.lm_head_ = LoadQuantLinearWithFallback(reader, meta,"lm_head", lm_head_layout, c.config_.vocab_size,
+                                             hidden, &bf16_fallbacks);
+    trellis_bf16_head = TakeTrellisBf16Head(meta, c.lm_head_, fallbacks_before_head, &bf16_fallbacks);
+  }
   if (rotation) {
     c.rotation_ = LoadRotationWeights(reader, *rotation, c.global_config_, c.config_, path,
                                       [&](const std::string& name) { return UploadRawF32(reader, name); });
@@ -281,7 +335,7 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
   // works uniformly for the real checkpoint's container and any hand-built/selftest fixture.
   // "mtp.norm" (add_bf16, src/convert/main.cpp) has no .{layout} suffix -- a bare bf16 passthrough
   // tensor, same naming convention as "text.final_norm" (UploadRawU16 below, not LoadQuantLinear).
-  if (reader.Has("mtp.norm")) {
+  if (reader.Has("mtp.norm") && !o.skip_heads) {
     MtpWeights mw;
     const std::string base = "mtp.";
     LayerWeights lw;
@@ -379,6 +433,12 @@ Container Container::Load(const std::string& path, const ContainerLoadOptions& o
                                 " carries vision.* tensors but no model_config.vision_config");
     }
     c.vision_ = vision::LoadVisionWeights(reader, model_config.at("vision_config"));
+  } else if (o.parse_vision_config && c.container_has_vision_tensors_) {  // stage-only: the geometry, not the tower
+    if (!model_config.contains("vision_config")) {
+      throw std::runtime_error("r4dx::model::Container: " + path +
+                                " carries vision.* tensors but no model_config.vision_config");
+    }
+    c.vision_config_ = vision::VisionConfig::FromJson(model_config.at("vision_config"));
   }
 
   // R14 (docs/r9700.md): warn, don't fail, if this load just consumed more VRAM than was free
@@ -471,6 +531,7 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
   ShardLoader L(reader, gc, o.tp_world, o.tp_rank, meta);
   const int64_t num_layers =
       (o.layer_limit >= 0) ? std::min(o.layer_limit, gc.num_hidden_layers) : gc.num_hidden_layers;
+  c.layer_kinds_.assign(static_cast<size_t>(num_layers), stage::LayerKind::kFull);  // the shard loader has no holes
 
   // text.embed_tokens: replicated. Host: the process's one shared pinned copy when the caller has
   // it (docs/tp.md 5.3 -- never duplicated), else this rank's own. Device mirror: the caller's joint
@@ -509,10 +570,7 @@ Container Container::LoadShard(const std::string& path, const ContainerLoadOptio
                      GiB(free_bytes), GiB(embed_bytes));
       }
     }
-    if (resident) {
-      c.embed_tokens_dev_ = core::DeviceBuffer<uint16_t>(static_cast<size_t>(n));
-      c.embed_tokens_dev_.CopyFromHost(c.EmbedTokensHost(), static_cast<size_t>(n));
-    }
+    if (resident) c.UploadEmbedMirror(static_cast<size_t>(n));  // (the lease a same-card stage Model borrows)
     L.CountReplicated(resident ? embed_bytes : 0);
   }
 
@@ -684,8 +742,10 @@ void Container::ForEachLinear(Fn&& fn) {
     fn(lw.mlp.gate_up);
     fn(lw.mlp.down);
   };
-  for (LayerWeights& lw : layers_) layer(lw);
-  fn(lm_head_);
+  for (size_t i = 0; i < layers_.size(); ++i) {
+    if (layer_kinds_[i] == stage::LayerKind::kFull) layer(layers_[i]);  // not a hole, not a norm-only layer
+  }
+  if (lm_head_.N > 0) fn(lm_head_);  // (a front-stage load has none)
   if (mtp_) {
     layer(mtp_->layer);
     fn(mtp_->draft_lm_head);
@@ -723,6 +783,28 @@ void Container::AssignTrellisTickets() {
     q.trellis_tickets = trellis_tickets_.data() + off;
     off += core::r4d::GemmTrellisTicketsBytes(static_cast<int>(q.N)) / sizeof(uint32_t);
   });
+}
+
+void Container::ThrowLayerNotLoaded(int64_t i) const {
+  if (i < 0 || i >= NumLoadedLayers()) {  // (what layers_.at(i) always threw)
+    throw std::out_of_range("r4dx::model::Container: layer " + std::to_string(i) + " is outside the " +
+                            std::to_string(NumLoadedLayers()) + " layers of the container");
+  }
+  throw std::logic_error("r4dx::model::Container: layer " + std::to_string(i) + " is " +
+                         stage::KindName(layer_kinds_[static_cast<size_t>(i)]) +
+                         " in this stage-only container (ContainerLoadOptions::first_layer / norm_only_from)");
+}
+
+void Container::UploadEmbedMirror(size_t elems) {
+  // The lease owns the buffer (embed_mirror_lease.h): a stage Model borrowing it keeps it alive past this Container.
+  auto dev = std::make_shared<core::DeviceBuffer<uint16_t>>(elems);
+  dev->CopyFromHost(EmbedTokensHost(), elems);
+  auto lease = std::make_shared<EmbedMirrorLease>();
+  lease->data = dev->data();
+  lease->elems = elems;
+  R4DX_HIP_CHECK(hipGetDevice(&lease->device));
+  lease->keepalive = std::move(dev);
+  embed_mirror_ = std::move(lease);
 }
 
 void Container::ZeroTrellisTickets(hipStream_t stream) {

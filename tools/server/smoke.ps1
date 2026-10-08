@@ -112,10 +112,57 @@
   In real mode a stall on rank 0 (0:<n>:1) is refused before anything starts: rank 1's all-reduce would
   spin on HIP device 0, the desktop card, until it timed out (docs/tp.md Appendix B N61).
 
+.PARAMETER Pp
+  Pipeline-parallel prefill (docs/pp-tp2-hybrid.md): 1 (default) leaves everything as it was. 2 needs -Tp 2 in
+  real mode and starts the HYBRID serving mode, `--tp 2 --pp 2` (PP-2 prefill on stage Models of both cards, one
+  reshard into the TP ranks, TP-2 decode; every prefill of >= --pp-min-rows = 1024 new tokens is pipelined, shorter
+  ones take the TP=2 prefill). The server is started with --max-ctx 16384 (the stage-KV capacity S must be >= 16384,
+  so every context_length check below expects 16384, not 4096), `--pp-split` (see -PpSplit), and the same flags go
+  to the r4dx-cli comparison run. The server logs a "[stats] hybrid: ..." line after every request (engine.cpp:
+  TpModel::HybridStatsLine, the line `r4dx-cli --stats` prints); this script parses its cumulative counters and, after
+  the ordinary checks, runs the HYBRID MATRIX (all cases need prompts of >= 1024 new tokens, built from a
+  deterministic synthetic log, see -HybridFillerLines; each asserts both the answer and the counters):
+    - load: "[r4dx-hybrid] engaged in ..." and no "hybrid mode OFF" line; the short requests of the ordinary checks
+      ran the TP prefill (0 pipelined calls before the matrix, unless -TpFault's long request A ran);
+    - plain multi-turn: a cold long turn (pipelined, position 0), warm turns 2 and 3 of >= 1024 new tokens
+      (pipelined, position > 0 when the server reused the prefix), a short turn 4 (TP prefill), a long turn 5 after
+      TP-only work (pipelined again: the warm gather), a regenerate of turn 5 twice (a cold, identical call: the two
+      answers must be equal);
+    - thinking on: a long thinking turn and its replay without reasoning_content (checkpoint restore, then a warm
+      hybrid call), with the dispatch counted per prefill call (the server splits a thinking prompt in two calls);
+    - -Mtp > 0 / -Dflash: the long turns' request log lines show the speculative path (` mtp: ` / ` dflash: `),
+      timings.draft_n > 0, and with -Dflash every pipelined call grew the DFlash tail rows;
+    - -ToolRoundTrip: a long conversation with a tool call, then a LONG tool result (a warm hybrid call after a
+      TP-decoded tool-call turn) and the final answer;
+    - -Vision: image first / image after >= 3000 tokens of text (inside the DFlash tail window) / image first with
+      3000 tokens after it (outside), then a warm follow-up turn (no image re-encode, pipelined, with -Dflash the
+      tail rope rows after the mrope carry); -VisionStraddle sweeps the text after the image so the 2048-row tail
+      window start passes through the image;
+    - -TpFault: request A gets a long prompt, so the all-reduce fault fires in the decode AFTER a hybrid prefill, and the
+      first long request after the recovery must be pipelined again (Reset() resets the stage Models).
+  The case list is the design's P4 row (docs/pp-tp2-hybrid.md 9); the pure identity of the state lives in
+  test_hybrid_real_identity / test_tp_hybrid_identity, this script checks the product path and the counters.
+
+.PARAMETER PpSplit
+  With -Pp 2: the split layer k (`--pp-split`). 0 (default): the server's own default (29, 30 with a drafter) for a
+  full container, layers/2 for a partial container (-Layers N, N >= 0).
+
+.PARAMETER HybridFillerLines
+  With -Pp 2: the number of lines of synthetic log text per long user message (default 50, about 30 tokens each:
+  1500 tokens, comfortably above the 1024-row threshold). A case that does not reach --pp-min-rows says so; raise it.
+
+.PARAMETER VisionStraddle
+  With -Pp 2 -Vision: also sweep the length of the text after an image so the DFlash tail window (the last 2048 rows)
+  starts inside the image (about 20 extra requests, ~1 min). Off by default.
+
 .EXAMPLE
   .\tools\server\smoke.ps1
 .EXAMPLE
   .\tools\server\smoke.ps1 -Tp 2                 # both GPUs, the 4-layer default container
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Tp 2 -Pp 2           # the hybrid, 4-layer default container (split 2): the counters and the dispatch
+.EXAMPLE
+  .\tools\server\smoke.ps1 -Tp 2 -Pp 2 -Model <models-root>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx -Layout trellis -Layers -1 -Dflash <models-root>\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx -ToolRoundTrip -Vision
 .EXAMPLE
   .\tools\server\smoke.ps1 -Tp 2 -TpFault        # recovery after an injected all-reduce timeout
 .EXAMPLE
@@ -143,7 +190,11 @@ param(
     [ValidateSet(1, 2)][int]$Tp = 1,
     [ValidateSet("", "real", "emulate", "noop")][string]$TpMode = "",
     [switch]$TpFault,
-    [string]$TpFaultSpec = "1:3000:1"
+    [string]$TpFaultSpec = "1:3000:1",
+    [ValidateSet(1, 2)][int]$Pp = 1,
+    [int]$PpSplit = 0,
+    [int]$HybridFillerLines = 50,
+    [switch]$VisionStraddle
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -199,6 +250,19 @@ function New-OcrImageBase64 {
 
 function Image-DataUri { param([string]$Base64) "data:image/png;base64,$Base64" }
 
+# -Pp 2: deterministic synthetic text for the long (>= 1024 new tokens) user messages of the hybrid matrix and of
+# -TpFault's request A. $Seed makes each message different (so no turn is a repeat of an earlier one); every line
+# is about 30 tokens (digits are single tokens), so the default 50 lines are about 1500.
+function New-HybridFiller {
+    param([int]$Seed, [int]$Lines = 50)
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $Lines; $i++) {
+        $n = $Seed * 1000 + $i
+        [void]$sb.AppendLine("Log entry $n : the lighthouse keeper recorded wind $(($n * 7) % 90) knots, tide $(($n * 3) % 12) feet and visibility $(($n % 9) + 1) miles at dock $(($n * 11) % 40).")
+    }
+    $sb.ToString()
+}
+
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot\..\..
 
@@ -242,6 +306,132 @@ function Get-RequestLogLine {
         Start-Sleep -Milliseconds 250
     }
     return ""
+}
+
+# ---- -Pp 2: the hybrid's counters (docs/pp-tp2-hybrid.md 15) ---------------------------------------------------
+# After every request the server logs "[stats] hybrid: <TpModel::HybridStatsLine> [request <id>]" (engine.cpp; only when
+# the hybrid mode is engaged). The counters are cumulative since the load; a request's own effect is the difference
+# between the line before it and the line carrying its id.
+function ConvertFrom-HybridStatsLine {
+    param([string]$Line)
+    $m = [regex]::Match($Line, 'hybrid: split k=(\d+), S=(\d+) tokens, min rows (\d+); (\d+) pipelined / (\d+) TP-prefill calls \(below min rows (\d+), over S (\d+), gather budget (\d+), DFlash frontier (\d+), not engaged (\d+)\); last pipelined call (\d+) rows at position (\d+): ')
+    if (-not $m.Success) { return $null }
+    $t = [regex]::Match($Line, 'tail rows (\d+)')
+    [pscustomobject]@{
+        Split = [int]$m.Groups[1].Value; S = [int64]$m.Groups[2].Value; MinRows = [int64]$m.Groups[3].Value
+        Pipelined = [int64]$m.Groups[4].Value; TpPrefill = [int64]$m.Groups[5].Value
+        BelowMin = [int64]$m.Groups[6].Value; OverS = [int64]$m.Groups[7].Value; GatherBudget = [int64]$m.Groups[8].Value
+        DflashFrontier = [int64]$m.Groups[9].Value; NotEngaged = [int64]$m.Groups[10].Value
+        LastRows = [int64]$m.Groups[11].Value; LastP0 = [int64]$m.Groups[12].Value
+        TailRows = $(if ($t.Success) { [int64]$t.Groups[1].Value } else { 0 })
+        Line = $Line
+    }
+}
+
+# The newest "[stats] hybrid:" line of the server log, parsed ($null when there is none yet).
+function Get-HybridStats {
+    $hit = @(Select-String -Path $ServerErrLog -Pattern "[stats] hybrid:" -SimpleMatch -ErrorAction SilentlyContinue)
+    if ($hit.Count -eq 0) { return $null }
+    ConvertFrom-HybridStatsLine $hit[-1].Line
+}
+
+# The stats line a request left behind (written just after its "request <id>:" line, so polled like Get-RequestLogLine).
+function Wait-HybridStats {
+    param([string]$Id)
+    for ($i = 0; $i -lt 40; $i++) {
+        $hit = @(Select-String -Path $ServerErrLog -Pattern "[request $Id]" -SimpleMatch -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Line.Contains("[stats] hybrid:") })
+        if ($hit.Count -gt 0) { return (ConvertFrom-HybridStatsLine $hit[-1].Line) }
+        Start-Sleep -Milliseconds 250
+    }
+    return $null
+}
+
+# One greedy, non-streaming chat request with the stats line before and after it.
+function Invoke-HybridChat {
+    param([object[]]$Messages, [int]$MaxTokens = 24, [hashtable]$Extra = @{})
+    $before = Get-HybridStats
+    if ($null -eq $before) { $before = ConvertFrom-HybridStatsLine "hybrid: split k=0, S=0 tokens, min rows 0; 0 pipelined / 0 TP-prefill calls (below min rows 0, over S 0, gather budget 0, DFlash frontier 0, not engaged 0); last pipelined call 0 rows at position 0: " }
+    $body = @{ messages = $Messages; max_tokens = $MaxTokens; temperature = 0; stream = $false }
+    foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] }
+    $status = 0
+    $chat = $null
+    try {
+        $resp = Invoke-WebRequest -Uri "$BaseUrl/v1/chat/completions" -Method Post -ContentType "application/json; charset=utf-8" `
+            -Body ($body | ConvertTo-Json -Depth 12) -UseBasicParsing -TimeoutSec 900
+        $status = [int]$resp.StatusCode
+        $chat = $resp.Content | ConvertFrom-Json
+    } catch {
+        if ($null -eq $_.Exception.Response) { throw }
+        $status = [int]$_.Exception.Response.StatusCode.value__
+    }
+    $after = $null
+    if ($null -ne $chat) { $after = Wait-HybridStats $chat.id }
+    $text = if ($null -ne $chat -and $chat.choices.Count -gt 0) { [string]$chat.choices[0].message.content } else { "" }
+    [pscustomobject]@{ Status = $status; Chat = $chat; Before = $before; After = $after; Text = $text }
+}
+
+# Asserts what the hybrid did with the prefill call(s) of one request (Invoke-HybridChat's result):
+#   - exactly -Calls prefill calls were counted (a thinking prompt is split in two by the prompt checkpoint, engine.cpp);
+#   - the dispatch rule: the call is PIPELINED iff its new rows >= the line's "min rows" and the whole context <= S,
+#     otherwise it ran the TP=2 prefill (the counters must agree with timings.prompt_n whatever the case wanted);
+#   - -Want pipe / tp: the case is live (a long case that did not reach min rows, or a short case that did, fails);
+#     'tp' is not enforced against a partial container (-Layers N), whose nonsense replies need not round-trip, so a
+#     'short' turn may legitimately re-prefill the whole conversation;
+#   - -Cold: the pipelined call started at position 0; -Warm: when the server reused the prefix (timings.prompt_n <
+#     usage.prompt_tokens) it started at position > 0 (a warm gather);
+#   - with -Dflash every pipelined call grew the DFlash tail rows (the drafters' windows were fed).
+function Test-HybridDispatch {
+    param($R, [string]$Label, [ValidateSet("pipe", "tp", "any")][string]$Want = "any", [int]$Calls = 1, [switch]$Cold, [switch]$Warm, [switch]$RequireReuse)
+    Check ($R.Status -eq 200) "hybrid: $Label returns 200 (got $($R.Status))"
+    if ($R.Status -ne 200) { return }
+    $a = $R.After
+    $b = $R.Before
+    Check ($null -ne $a) "hybrid: $Label : the server log carries a '[stats] hybrid:' line for this request"
+    if ($null -eq $a) { return }
+    $promptN = [int64]$R.Chat.timings.prompt_n
+    $total = [int64]$R.Chat.usage.prompt_tokens
+    $dP = $a.Pipelined - $b.Pipelined
+    $dT = $a.TpPrefill - $b.TpPrefill
+    # The call the rule sees: a split thinking prompt feeds its head (all but the last token) first.
+    $headRows = if ($Calls -eq 2) { $promptN - 1 } else { $promptN }
+    $expectPipe = ($headRows -ge $a.MinRows) -and ($total -le $a.S)
+    $declined = "declined: below min rows $($a.BelowMin), over S $($a.OverS), gather budget $($a.GatherBudget), DFlash frontier $($a.DflashFrontier), not engaged $($a.NotEngaged)"
+    Check (($dP + $dT) -eq $Calls) "hybrid: $Label : $Calls prefill call(s) counted (pipelined +$dP, TP prefill +$dT)"
+    if ($expectPipe) {
+        Check ($dP -eq 1) "hybrid: $Label : $headRows new rows >= min rows $($a.MinRows), context $total <= S $($a.S) -> the call was pipelined (+$dP; $declined)"
+    } else {
+        Check ($dP -eq 0) "hybrid: $Label : $headRows new rows (min rows $($a.MinRows), context $total, S $($a.S)) -> the TP=2 prefill, not the pipeline (pipelined +$dP)"
+    }
+    if ($Want -eq "pipe") {
+        Check $expectPipe "hybrid: $Label : the case is live ($headRows new rows >= min rows $($a.MinRows); raise -HybridFillerLines if not)"
+    } elseif ($Want -eq "tp" -and $Layers -lt 0) {
+        Check (-not $expectPipe) "hybrid: $Label : a short turn ($headRows new rows < min rows $($a.MinRows)) stays on the TP=2 prefill"
+    }
+    if ($dP -eq 1) {
+        Check ($a.LastRows -ge $a.MinRows) "hybrid: $Label : the pipelined call fed $($a.LastRows) rows at position $($a.LastP0)"
+        if ($Cold) { Check ($a.LastP0 -eq 0) "hybrid: $Label : a cold call (position 0, got $($a.LastP0))" }
+        if ($Warm -and $promptN -lt $total) {
+            Check ($a.LastP0 -gt 0) "hybrid: $Label : a warm call (prefix reused: position $($a.LastP0) > 0, $promptN of $total tokens fed)"
+        } elseif ($RequireReuse) {
+            Check $false "hybrid: $Label : the prefix was not reused ($promptN of $total tokens fed): this case must be a warm call, so the replay diverged and the case did not test a warm gather"
+        } elseif ($Warm) {
+            Write-Output "  [info] hybrid: $Label : the prefix was not reused ($promptN of $total tokens fed): a cold call, warm assertion skipped"
+        }
+        if ($Dflash -ne "") {
+            Check ($a.TailRows -gt $b.TailRows) "hybrid: $Label : the DFlash tail was injected (tail rows $($b.TailRows) -> $($a.TailRows))"
+        }
+    }
+}
+
+# -Mtp / -Dflash: the request decoded speculatively (after a hybrid prefill, or a warm hybrid turn's).
+function Test-HybridSpec {
+    param($R, [string]$Label)
+    if ($Mtp -le 0 -and $Dflash -eq "") { return }
+    if ($R.Status -ne 200) { return }
+    Check ($R.Chat.timings.draft_n -gt 0) "hybrid: $Label : decoded speculatively after the prefill (timings.draft_n $($R.Chat.timings.draft_n) > 0)"
+    $line = Get-RequestLogLine $R.Chat.id
+    Check ($line -match ' (mtp|dflash): ') "hybrid: $Label : the request log line shows the speculative path"
 }
 
 # True when a reply begins or ends with whitespace, which the chat template's |trim drops when the
@@ -300,6 +490,20 @@ if ($TpFault -and $TpModeResolved -eq "noop") {
 # Every r4dx-server and r4dx-cli this script starts runs the same engine.
 $TpArgs = @()
 if ($Tp -eq 2) { $TpArgs = @("--tp", "2", "--tp-mode", $TpModeResolved) }
+# -Pp 2: the hybrid serving mode (docs/pp-tp2-hybrid.md): `--tp 2 --pp 2` for the server AND the r4dx-cli comparison
+# run. The hybrid needs two real devices, and a stage-KV capacity S >= 16384 (so --max-ctx >= 16384, below).
+if ($Pp -eq 2) {
+    if ($Tp -ne 2 -or $TpModeResolved -ne "real") {
+        throw "-Pp 2 is the hybrid mode (--tp 2 --pp 2): it needs -Tp 2 in real mode (the plain --pp 2 server is not covered by this script)"
+    }
+    $TpArgs += @("--pp", "2")
+    $splitK = $PpSplit
+    if ($splitK -le 0 -and $Layers -ge 0) { $splitK = [Math]::Max(1, [int][Math]::Floor($Layers / 2)) }
+    if ($splitK -gt 0) { $TpArgs += @("--pp-split", "$splitK") }
+} elseif ($PpSplit -ne 0 -or $VisionStraddle) {
+    throw "-PpSplit and -VisionStraddle need -Pp 2"
+}
+if ($VisionStraddle -and -not $Vision) { throw "-VisionStraddle needs -Vision" }
 # Real mode is the one configuration that touches HIP device 0 (the desktop card): both GPUs, so no
 # other r4dx-server may be running (docs/tp.md 9.2), and the run is TDR-watched (see -Tp).
 $UsesDevice0 = ($Tp -eq 2 -and $TpModeResolved -eq "real")
@@ -336,7 +540,7 @@ Remove-Item -LiteralPath $CliErrLog -ErrorAction SilentlyContinue
 # 4096 (raised from 512, model-metadata/reasoning_content pass): the reasoning_content checks below
 # send `max_tokens: 1024` on the real container so a real thinking span has room to close and still
 # leave room for an answer -- 512 was too tight once thinking is on.
-$MaxCtx = 4096
+$MaxCtx = if ($Pp -eq 2) { 16384 } else { 4096 }  # -Pp 2: S must be >= 16384 (docs/pp-tp2-hybrid.md 2), S <= --max-ctx
 $ServerArgList = @(
     "--model", $Model, "--layout", $Layout, "--host", "127.0.0.1", "--port", "$Port",
     "--max-ctx", "$MaxCtx", "--max-tokens-default", "16"
@@ -359,6 +563,7 @@ $tdrJob = $null
 try {
     Write-Output ("[smoke] starting r4dx-server: model=$Model layout=$Layout port=$Port mtp=$Mtp" +
                   $(if ($Tp -eq 2) { " tp=2 tp-mode=$TpModeResolved" } else { "" }) +
+                  $(if ($Pp -eq 2) { " pp=2 (hybrid, max-ctx $MaxCtx)" } else { "" }) +
                   $(if ($TpFault) { " R4DX_TP_FAULT=$TpFaultSpec" } else { "" }))
     if ($UsesDevice0) {
         Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
@@ -417,6 +622,18 @@ try {
         foreach ($l in $rankLines) { Write-Output "  [info] $($l.Line)" }
     }
 
+    # ---- --pp 2 (hybrid): the load engaged it (a budget that leaves no room drops back to plain --tp 2 with a log line) --
+    if ($Pp -eq 2) {
+        $engaged = @(Select-String -Path $ServerErrLog -Pattern "[r4dx-hybrid] engaged in" -SimpleMatch -ErrorAction SilentlyContinue)
+        $dropped = @(Select-String -Path $ServerErrLog -Pattern "hybrid mode OFF" -SimpleMatch -ErrorAction SilentlyContinue)
+        Check ($engaged.Count -eq 1 -and $dropped.Count -eq 0) `
+            ("--pp 2: the hybrid mode engaged at load ('[r4dx-hybrid] engaged in ...' x$($engaged.Count), 'hybrid mode OFF' x$($dropped.Count)" +
+             $(if ($dropped.Count -gt 0) { ": $($dropped[0].Line)" } else { "" }) + ")")
+        foreach ($l in @(Select-String -Path $ServerErrLog -Pattern "[r4dx-hybrid] " -SimpleMatch -ErrorAction SilentlyContinue)) {
+            Write-Output "  [info] $($l.Line)"
+        }
+    }
+
     # ---- -TpFault: a request that hits an injected all-reduce fault, then recovery ---------------
     # docs/tp.md 8.4 / gate G11. The fault (R4DX_TP_FAULT, armed at load) fires once, at the n-th
     # all-reduce after warm-up; the reference below runs while it is still pending, request A crosses
@@ -438,9 +655,12 @@ try {
         Check ($firedBefore -eq 0) "TpFault: the fault has not fired yet after the reference request"
 
         # Request A: long and greedy, so it crosses the armed all-reduce on the 4-layer container too
-        # (see -TpFaultSpec).
+        # (see -TpFaultSpec). With -Pp 2 its PROMPT is long too (>= 1024 new tokens), so the pipelined prefill runs
+        # first and the fault fires in the TP decode after it (design P4: "AR fault after hybrid prefill"); the
+        # prefill itself adds no all-reduce, so the fault lands a few forwards later than in the plain case.
+        $faultAPrefix = if ($Pp -eq 2) { (New-HybridFiller 90 $HybridFillerLines) + "`n" } else { "" }
         $faultABody = @{
-            messages    = @(@{ role = "user"; content = "Write a long story about a lighthouse keeper who finds a message in a bottle. Use at least 600 words." })
+            messages    = @(@{ role = "user"; content = $faultAPrefix + "Write a long story about a lighthouse keeper who finds a message in a bottle. Use at least 600 words." })
             max_tokens  = 512
             temperature = 0
             stream      = $false
@@ -1828,6 +2048,205 @@ try {
             "vision: /v1/models architecture.input_modalities contains 'image'"
         Check (($visionModels.data[0].capabilities) -contains "image") `
             "vision: /v1/models capabilities contains 'image'"
+    }
+
+    # ---- -Pp 2: the HYBRID MATRIX (docs/pp-tp2-hybrid.md 9 P4; see -Pp) ------------------------------------
+    # Everything above ran SHORT prompts, so on the hybrid server they took the TP=2 prefill (below --pp-min-rows).
+    # The cases below use prompts of >= 1024 new tokens so the pipelined prefill engages, interleaved with short ones.
+    # Each case asserts the answer AND the "[stats] hybrid:" counters (Test-HybridDispatch). The hybrid's exactness
+    # (state byte identity, decode equality, KL) is test_hybrid_real_identity / test_tp_hybrid_identity / kl_hybrid.ps1;
+    # this is the product path: HTTP, chat template, prefix cache, checkpoints, speculative decode, images, tools.
+    if ($Pp -eq 2) {
+        Write-Output "[smoke] hybrid matrix (--tp 2 --pp 2, long prompts of ~$HybridFillerLines lines of synthetic log text)"
+        $hyErrBefore = @(Select-String -Path $ServerErrLog -Pattern "[r4dx-server][error]" -SimpleMatch -ErrorAction SilentlyContinue).Count
+        $hyBase = Get-HybridStats
+        Check ($null -ne $hyBase) "hybrid: the server logs a '[stats] hybrid:' line after a request (engine.cpp)"
+        if ($null -ne $hyBase) {
+            Write-Output "  [info] $($hyBase.Line)"
+            Check ($hyBase.Split -gt 0 -and $hyBase.S -ge 16384 -and $hyBase.MinRows -ge 1) `
+                "hybrid: split k=$($hyBase.Split), stage-KV capacity S=$($hyBase.S) (>= 16384), min rows $($hyBase.MinRows)"
+            Check ($hyBase.TpPrefill -ge 1) "hybrid: the ordinary checks' short prompts took the TP=2 prefill ($($hyBase.TpPrefill) TP-prefill calls, $($hyBase.BelowMin) below min rows)"
+            if (-not $TpFault) {
+                Check ($hyBase.Pipelined -eq 0) "hybrid: no pipelined call before the matrix (the ordinary checks are all short): $($hyBase.Pipelined)"
+            } else {
+                Write-Output "  [info] -TpFault: request A's long prompt ran a pipelined prefill before the fault ($($hyBase.Pipelined) pipelined call(s) so far)"
+            }
+        }
+
+        $hyAsk = "Reply with one short plain ASCII sentence."
+        function New-HyUser { param([int]$Seed, [string]$Ask = $hyAsk) @{ role = "user"; content = (New-HybridFiller $Seed $HybridFillerLines) + "`n" + $Ask } }
+        function Get-HyReply { param($R) if ($R.Text) { $R.Text } else { "OK" } }
+
+        # -- plain multi-turn: cold, warm, warm, short (TP), long after TP-only work (warm gather) -------------
+        $u1 = New-HyUser 1
+        $r1 = Invoke-HybridChat -Messages @($u1)
+        Test-HybridDispatch $r1 "plain turn 1 (cold, long prompt)" -Want pipe -Cold
+        Test-HybridSpec $r1 "plain turn 1"
+        $a1 = Get-HyReply $r1
+
+        $u2 = New-HyUser 2
+        $r2 = Invoke-HybridChat -Messages @($u1, @{ role = "assistant"; content = $a1 }, $u2)
+        Test-HybridDispatch $r2 "plain turn 2 (warm, >= 1024 new tokens)" -Want pipe -Warm
+        Test-HybridSpec $r2 "plain turn 2"
+        $a2 = Get-HyReply $r2
+
+        $u3 = New-HyUser 3
+        $m3 = @($u1, @{ role = "assistant"; content = $a1 }, $u2, @{ role = "assistant"; content = $a2 }, $u3)
+        $r3 = Invoke-HybridChat -Messages $m3
+        Test-HybridDispatch $r3 "plain turn 3 (warm, after a warm hybrid turn)" -Want pipe -Warm
+        Test-HybridSpec $r3 "plain turn 3"
+        $a3 = Get-HyReply $r3
+
+        $u4 = @{ role = "user"; content = "Say OK." }
+        $m4 = $m3 + @(@{ role = "assistant"; content = $a3 }, $u4)
+        $r4 = Invoke-HybridChat -Messages $m4 -MaxTokens 8
+        Test-HybridDispatch $r4 "plain turn 4 (short, TP=2 prefill)" -Want tp -Warm
+        $a4 = Get-HyReply $r4
+
+        $u5 = New-HyUser 5
+        $m5 = $m4 + @(@{ role = "assistant"; content = $a4 }, $u5)
+        $r5 = Invoke-HybridChat -Messages $m5
+        Test-HybridDispatch $r5 "plain turn 5 (long, after TP-only work: decode + a short TP prefill)" -Want pipe -Warm
+        Test-HybridSpec $r5 "plain turn 5"
+
+        # -- regenerate: the same request again, twice. An identical prompt does not strictly extend the committed
+        # one, so the server Reset()s and re-prefills it cold (a pipelined call at position 0): both runs are the same
+        # call sequence from the same state and must answer the same. (Not compared with turn 5, whose rows came from a
+        # warm gather and TP decode: that is a numerics question for the identity tests, shown here as info.)
+        $rg1 = Invoke-HybridChat -Messages $m5
+        $rg1Line = if ($rg1.Chat) { Get-RequestLogLine $rg1.Chat.id } else { "" }
+        Test-HybridDispatch $rg1 "regenerate 1 (turn 5 again)" -Want pipe
+        $rg2 = Invoke-HybridChat -Messages $m5
+        Test-HybridDispatch $rg2 "regenerate 2 (turn 5 again)" -Want pipe
+        Check ($rg1.Status -eq 200 -and $rg2.Status -eq 200 -and $rg1.Text -ceq $rg2.Text) `
+            "hybrid: regenerate: two identical cold requests answer the same ('$($rg1.Text)' vs '$($rg2.Text)')"
+        if ($rg1Line -match ' reset=') {
+            Check ($null -ne $rg1.After -and $rg1.After.LastP0 -eq 0) "hybrid: regenerate 1 re-prefilled cold (log line has reset=, pipelined call at position $($rg1.After.LastP0))"
+        }
+        Write-Output "  [info] turn 5 answered '$($r5.Text)', its regenerate '$($rg1.Text)' ($(if ($r5.Text -ceq $rg1.Text) { 'equal' } else { 'differs: warm-gather state vs a cold prefill' }))"
+
+        # -- thinking on: the prompt ends "<think>\n"; a replay without reasoning_content diverges at its last token, so
+        # the server saves its checkpoint one token early (docs/server.md "Prefix cache") and splits the prefill in two
+        # calls: the head (pipelined when long) and the one held-back token (TP). Turn 2 restores that checkpoint and
+        # then runs a warm hybrid call from it.
+        $thinkKw = @{ chat_template_kwargs = @{ enable_thinking = $true; reasoning_effort = "low" } }
+        $tu1 = New-HyUser 11 "What is 2 plus 2? Answer with just the number."
+        $tr1 = Invoke-HybridChat -Messages @($tu1) -MaxTokens 96 -Extra $thinkKw
+        Test-HybridDispatch $tr1 "thinking turn 1 (cold, long)" -Want pipe -Cold -Calls 2
+        $tu2 = New-HyUser 12 "And 3 plus 3? Answer with just the number."
+        $tr2 = Invoke-HybridChat -Messages @($tu1, @{ role = "assistant"; content = (Get-HyReply $tr1) }, $tu2) -MaxTokens 96 -Extra $thinkKw
+        Test-HybridDispatch $tr2 "thinking turn 2 (reasoning dropped from the replay: checkpoint restore, then a warm hybrid call)" -Want pipe -Warm -RequireReuse -Calls 2
+        if ($tr2.Chat) {
+            Check ((Get-RequestLogLine $tr2.Chat.id) -match ' restore=') "hybrid: thinking turn 2's log line shows the checkpoint restore"
+        }
+
+        # -- a short turn right after: the TP path still works on the state a pipelined call left -----------------
+        $rs = Invoke-HybridChat -Messages @(@{ role = "user"; content = "Say hello in one short sentence." }) -MaxTokens 8
+        Test-HybridDispatch $rs "short cold turn after the long ones (Reset + TP prefill)" -Want tp
+
+        # -- tool call round trip with a long context and a LONG tool result (-ToolRoundTrip, real container) --------
+        if ($ToolRoundTrip) {
+            $toolAsk = "What is the weather like in Boston, MA right now? Use the tool."
+            $tc1 = Invoke-HybridChat -Messages @(New-HyUser 21 $toolAsk) -MaxTokens 64 -Extra @{ tools = @($proseTool) }
+            Test-HybridDispatch $tc1 "tool round trip: the tool-offering turn (cold, long)" -Want pipe -Cold
+            Test-HybridSpec $tc1 "tool round trip, turn 1"
+            $tcalls = $null
+            if ($tc1.Chat) { $tcalls = $tc1.Chat.choices[0].message.tool_calls }
+            $gotHyCall = ($null -ne $tcalls) -and ($tcalls.Count -ge 1)
+            Check $gotHyCall "hybrid: tool round trip: the long-context turn still emitted a structured tool_calls entry"
+            if ($gotHyCall) {
+                $hyCall = $tcalls[0]
+                # A long result (80 forecast entries, ~2000 tokens): the follow-up is a WARM pipelined call after a
+                # TP-decoded tool-call turn, with the DFlash tail on top of the drafters' decode-time state.
+                $days = foreach ($d in 0..79) { '{"day":' + $d + ',"high_f":' + (60 + $d % 20) + ',"low_f":' + (40 + $d % 15) + ',"condition":"partly cloudy","wind_mph":' + ($d % 17) + '}' }
+                $toolResult = '{"city":"Boston","forecast":[' + ($days -join ',') + ']}'
+                $tc2 = Invoke-HybridChat -Messages @(
+                    (New-HyUser 21 $toolAsk),
+                    @{ role = "assistant"; content = $null; tool_calls = @($hyCall) },
+                    @{ role = "tool"; tool_call_id = $hyCall.id; content = $toolResult }) -MaxTokens 64 -Extra @{ tools = @($proseTool) }
+                Test-HybridDispatch $tc2 "tool round trip: the follow-up with a long tool result (warm, pipelined)" -Want pipe -Warm -RequireReuse
+                Test-HybridSpec $tc2 "tool round trip, follow-up"
+                Check ([bool]$tc2.Text) "hybrid: tool round trip: the follow-up answer has non-empty content"
+            }
+        } else {
+            Write-Output "  [SKIP] hybrid: tool round trip with a long context (pass -ToolRoundTrip with a real container, -Layers -1)"
+        }
+
+        # -- vision (-Vision, real container): images in pipelined calls; with -Dflash the tail's rope rows -----------
+        if ($Vision) {
+            $hyImg = Image-DataUri (New-SyntheticShapesImageBase64)
+            $hyImgPart = @{ type = "image_url"; image_url = @{ url = $hyImg } }
+            function New-HyText { param([string]$Text) @{ type = "text"; text = $Text } }
+            # image first, ~1500 tokens after it: the whole prompt is inside the DFlash tail window (last 2048 rows)
+            $v1 = Invoke-HybridChat -Messages @(@{ role = "user"; content = @($hyImgPart, (New-HyText ((New-HybridFiller 31 $HybridFillerLines) + "`nDescribe the picture in one short sentence."))) }) -MaxTokens 48
+            Test-HybridDispatch $v1 "vision: image first, long text after (cold)" -Want pipe -Cold
+            Check ($v1.Chat.timings.image_n -eq 1) "hybrid: vision: the image was encoded (timings.image_n == 1)"
+            Check ([bool]$v1.Text) "hybrid: vision: image-first answer has non-empty content"
+            Test-HybridSpec $v1 "vision, image first"
+            # ~3000 tokens of text, then the image, then a question: the image sits inside the last 2048 rows
+            $v2 = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText (New-HybridFiller 32 ($HybridFillerLines * 2))), $hyImgPart, (New-HyText "What shape is in the picture? Answer with one word.")) }) -MaxTokens 16
+            Test-HybridDispatch $v2 "vision: ~3000 tokens of text, then the image (the image is inside the DFlash tail window)" -Want pipe -Cold
+            Check ([bool]$v2.Text) "hybrid: vision: image-after-text answer has non-empty content"
+            # image first, ~3000 tokens after it: the image is OUTSIDE the tail window (the rope rows of the tail are plain text)
+            $v3user = @{ role = "user"; content = @($hyImgPart, (New-HyText ((New-HybridFiller 33 ($HybridFillerLines * 2)) + "`nDescribe the picture in one short sentence."))) }
+            $v3 = Invoke-HybridChat -Messages @($v3user) -MaxTokens 48
+            Test-HybridDispatch $v3 "vision: image first, ~3000 tokens after it (the image is outside the DFlash tail window)" -Want pipe -Cold
+            Check ([bool]$v3.Text) "hybrid: vision: image-outside-window answer has non-empty content"
+            # a warm follow-up turn: the image is in the reused prefix (no re-encode), the mrope delta carries over
+            # the TP decode, and the next pipelined call's tail rope rows continue from it
+            $v4 = Invoke-HybridChat -Messages @($v3user, @{ role = "assistant"; content = (Get-HyReply $v3) }, (New-HyUser 34 "Now say OK.")) -MaxTokens 16
+            Test-HybridDispatch $v4 "vision: warm follow-up turn after the image (>= 1024 new tokens, mrope delta carried)" -Want pipe -Warm
+            if ($v4.Chat -and $v4.Chat.timings.prompt_n -lt $v4.Chat.usage.prompt_tokens) {
+                Check (-not ($v4.Chat.timings.PSObject.Properties.Name -contains "image_n")) "hybrid: vision: the warm follow-up did NOT re-encode the image (no timings.image_n)"
+            }
+            Check ([bool]$v4.Text) "hybrid: vision: warm follow-up answer has non-empty content"
+            if ($VisionStraddle) {
+                # The text after the image grows by 8 tokens per step ("ok" is one token); the tail window starts where
+                # n - 2048 lands, so somewhere in this sweep it starts INSIDE the image's rows (the image is ~64-81
+                # tokens: k in (2048 - image_tokens, 2048)). Answers are only checked for being produced, the pipelined
+                # dispatch and the counters; the byte identity of this case is test_hybrid_real_identity's job.
+                $okRun = 0
+                $sweepN = 0
+                $swTotals = @{}
+                $swPrefix = (New-HybridFiller 35 ([int]($HybridFillerLines * 0.6))) + "`nLook at the next picture."
+                for ($k = 1960; $k -le 2056; $k += 8) {
+                    $sw = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix), $hyImgPart, (New-HyText ("Describe it in one word." + (" ok" * $k)))) }) -MaxTokens 8
+                    $sweepN++
+                    if ($sw.Status -eq 200 -and $null -ne $sw.After -and ($sw.After.Pipelined - $sw.Before.Pipelined) -eq 1 -and [bool]$sw.Text) { $okRun++ }
+                    elseif ($null -ne $sw.After) { Write-Output "  [info] straddle k=${k}: status $($sw.Status), pipelined +$($sw.After.Pipelined - $sw.Before.Pipelined), answer '$($sw.Text)'" }
+                    if ($sw.Status -eq 200 -and $sw.Chat) { $swTotals[$k] = [int64]$sw.Chat.usage.prompt_tokens }
+                }
+                Check ($okRun -eq $sweepN) "hybrid: vision straddle sweep: all $sweepN requests (text after the image 1960..2056 tokens) were pipelined and answered ($okRun ok)"
+                # Is the straddle itself exercised? Two small probes size the image's rows: the prompt without the image and
+                # the prompt that stops where the image starts. The tail window starts at (prompt tokens - 2048); at least one
+                # sweep point must start it inside [image start - 8, image end + 8] (the slack covers the chat-template
+                # tokens around the probes), and " ok" must be one token (the prompt grows by exactly 8 per step).
+                $swNoImg = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix), (New-HyText ("Describe it in one word." + (" ok" * 1960)))) }) -MaxTokens 1
+                $swPre = Invoke-HybridChat -Messages @(@{ role = "user"; content = @((New-HyText $swPrefix)) }) -MaxTokens 1
+                if ($swNoImg.Chat -and $swPre.Chat -and $swTotals.ContainsKey(1960) -and $swTotals.ContainsKey(2056)) {
+                    $imgRows = $swTotals[1960] - [int64]$swNoImg.Chat.usage.prompt_tokens
+                    $imgStart = [int64]$swPre.Chat.usage.prompt_tokens - 5
+                    $inside = @($swTotals.Keys | Where-Object { $t = $swTotals[$_] - 2048; $t -ge ($imgStart - 8) -and $t -le ($imgStart + $imgRows + 8) }).Count
+                    Write-Output "  [info] straddle: image ~$imgRows rows from ~$imgStart; tail start (prompt - 2048) spans $($swTotals[1960] - 2048)..$($swTotals[2056] - 2048); $inside of $sweepN points inside"
+                    Check (($swTotals[2056] - $swTotals[1960]) -eq 96) "hybrid: vision straddle sweep: the prompt grew by 96 tokens over the 12 steps of 8 (' ok' is one token; got $($swTotals[2056] - $swTotals[1960]))"
+                    Check ($inside -ge 1) "hybrid: vision straddle sweep: at least one point starts the tail window inside the image's rows (found $inside; image ~$imgRows rows from ~$imgStart)"
+                } else {
+                    Check $false "hybrid: vision straddle sweep: the size probes or the sweep totals are missing"
+                }
+            }
+        } else {
+            Write-Output "  [SKIP] hybrid: vision rows through the pipelined call (pass -Vision with a real vision-capable container)"
+        }
+
+        # -- the matrix left the server healthy ---------------------------------------------------------------------
+        $hyFinal = Get-HybridStats
+        if ($null -ne $hyFinal) {
+            Write-Output "  [info] $($hyFinal.Line)"
+            Check ($hyFinal.Pipelined -ge 1) "hybrid: the matrix ran $($hyFinal.Pipelined) pipelined and $($hyFinal.TpPrefill) TP-prefill calls in all"
+        }
+        $hyErrAfter = @(Select-String -Path $ServerErrLog -Pattern "[r4dx-server][error]" -SimpleMatch -ErrorAction SilentlyContinue).Count
+        Check ($hyErrAfter -eq $hyErrBefore) "hybrid: no '[r4dx-server][error]' line during the matrix ($hyErrBefore before, $hyErrAfter after)"
+        Check (-not $proc.HasExited) "hybrid: the server is still running after the matrix"
     }
 
     # ---- Sampled speculative decode (Milestone 6 stage S3, docs/sampling.md section 9/10): lifting

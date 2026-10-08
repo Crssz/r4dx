@@ -294,6 +294,30 @@ add_executable(test_pp_sync_cpu test_pp_sync_cpu.cpp)
 target_include_directories(test_pp_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_pp_sync_cpu COMMAND test_pp_sync_cpu)
 
+# Hybrid serving mode (docs/pp-tp2-hybrid.md, P0/P1 CPU): pure CPU unit tests of the PP-2 prefill + TP-2 decode mode's host-side
+# policy. test_hybrid_sync_cpu: src/model/hybrid_sync.h, the TP-master mirror tracker (the TP shards are the truth, both stages
+# mirror them: kv_valid_to / gdn_pos per stage, the stage-B MTP seed, the MTP primed-block rule) against an abstract model of
+# every holder under a random walk, with an oracle and nine negative controls. test_reshard_plan_cpu: src/model/reshard_plan.h,
+# the state mapping DERIVED from tp::RuleFor / RankRows (checked against every head / channel rule of the weight loader), the copy
+# ranges and sizes per direction (the design's crossing-size table), the ring chunking, and ReshardRef / GatherRef against a host
+# executor of the plan's strided copies. test_hybrid_budget_cpu: src/model/hybrid_budget.h, the stage-KV capacity S and the
+# min-rows model against the design's tables. test_tp_tuning_scope: Tp2TuningScope / CheckTp2TuningScope (the thread-local GEMM
+# tuning flag as a per-Model scope). No HIP call (HIP_VISIBLE_DEVICES=-1 hides the devices from the runtime linking
+# r4dx_model_linear loads), no container; always run.
+add_executable(test_hybrid_sync_cpu test_hybrid_sync_cpu.cpp)
+target_include_directories(test_hybrid_sync_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_sync_cpu COMMAND test_hybrid_sync_cpu)
+add_executable(test_hybrid_budget_cpu test_hybrid_budget_cpu.cpp)
+target_include_directories(test_hybrid_budget_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_budget_cpu COMMAND test_hybrid_budget_cpu)
+add_executable(test_reshard_plan_cpu test_reshard_plan_cpu.cpp)
+target_link_libraries(test_reshard_plan_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_reshard_plan_cpu COMMAND test_reshard_plan_cpu)
+add_executable(test_tp_tuning_scope test_tp_tuning_scope.cpp)
+target_link_libraries(test_tp_tuning_scope PRIVATE r4dx_model_linear)
+add_test(NAME test_tp_tuning_scope COMMAND test_tp_tuning_scope)
+set_tests_properties(test_tp_tuning_scope PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+
 # tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
 # TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never
 # add_test()'d (it consumes measurements; tools/.../pp_phase0.ps1 runs it).

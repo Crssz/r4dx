@@ -93,6 +93,30 @@ int EffectiveW4a16Group(int w4a16_group);
 // trellis rows follow the same rule: src/model/gemm_tuning_table_trellis_tp2.inc on such a thread,
 // before the TP=1 trellis rows.
 void SetTp2TuningForThisThread(bool enabled);
+// The calling thread's current setting (what PickTuning on this thread would use right now).
+bool Tp2TuningForThisThread();
+
+// Sets the calling thread's tuning flag for a scope and restores the previous value on exit, also when the scope is left by an
+// exception (docs/pp-tp2-hybrid.md 7, "Tuning scope"). The flag is thread state, but the right value is a property of the
+// MODEL a call runs (a TP rank: true; a pipeline stage or a TP=1 Model: false), so a thread that hosts two Models -- the
+// hybrid mode's rank worker owns a rank Model and a stage Model -- wraps every Model call in a scope with that Model's own
+// value instead of relying on whichever Model::Load ran last. Nests; a scope never leaks its value to the code around it.
+class Tp2TuningScope {
+ public:
+  explicit Tp2TuningScope(bool enabled) : previous_(Tp2TuningForThisThread()) { SetTp2TuningForThisThread(enabled); }
+  ~Tp2TuningScope() { SetTp2TuningForThisThread(previous_); }
+  Tp2TuningScope(const Tp2TuningScope&) = delete;
+  Tp2TuningScope& operator=(const Tp2TuningScope&) = delete;
+
+ private:
+  bool previous_;
+};
+
+// Throws std::logic_error unless the calling thread's flag equals `expected` -- the guard a Model entry point runs
+// (Model::CheckTuningScope): a call whose tuning flag disagrees with its Model would silently pick the other layout's GEMM
+// tunings (a different summation order on a rank-equal shape, or a TP=2 table row outside the rank-shape legality rules).
+// `what` names the caller in the message.
+void CheckTp2TuningScope(bool expected, const char* what);
 
 // The r4dx_epilogue (kernels.h) a fused producer must emit to feed `layout`'s GEMM directly --
 // r4dx_epilogue_none for kBf16 (which never quantizes its activation input), r4dx_epilogue_f16 for

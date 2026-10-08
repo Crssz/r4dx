@@ -258,6 +258,7 @@ Model Model::Load(const ModelOptions& opts) {
 
   Model m;
   m.comm_ = tp.comm;
+  m.tp2_tuning_ = is_tp_rank;
   const VramSnap vram0 = SnapVram();  // before any of this Load() call's own allocations
   // The vision tower's ~0.90 GiB is loaded between two of its own snapshots so it gets its own
   // VRAM breakdown line -- the same treatment the DFlash2 drafter gets below, and the only honest
@@ -1051,10 +1052,13 @@ void Model::SpliceImageEmbeddings(int64_t start, int64_t T, uint16_t* dst, int64
   }
 }
 
+void Model::CheckTuningScope() const { CheckTp2TuningScope(tp2_tuning_, "Model::CheckTuningScope"); }
+
 std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool is_prefill_path,
                                     bool want_logits, int32_t* greedy_token_out,
                                     const SummaryRequest* summary_out,
                                     const std::function<void()>* overlap) {
+  CheckTuningScope();  // every prefill chunk and decode step reaches a GEMM through here
   const int64_t T = static_cast<int64_t>(token_ids.size());
   // A 256-row prefill super-chunk (docs/trellis-m256.md): only Prefill() creates one, after deciding
   // that this Model and call may (PrefillRowsForCall). Layer-major over all 256 rows: the trellis
@@ -2507,6 +2511,7 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
                                           std::vector<float>* logits_out,
                                           std::vector<kernels::RowSummary>* summaries_out,
                                           float summary_inv_temperature) {
+  CheckTuningScope();
   // No MTP head required (generalised for DFlash2, 2026-09-20 stage S2): what this method actually
   // needs is the speculative-verify SIZING -- the GDN window bank, verify_logits_dev_/
   // verify_argmax_dev_ and mtp_num_accepted_dev_ -- all of which Load() allocates whenever
@@ -2909,6 +2914,7 @@ std::vector<int32_t> Model::DecodeStepMtpSampled(int32_t token_id, int64_t k,
 std::vector<int32_t> Model::DecodeStepMtpImpl(int32_t token_id, int64_t k,
                                                const kernels::SampleParams* params,
                                                std::mt19937_64* rng) {
+  CheckTuningScope();  // the draft loop's GEMMs run before the verify window does
   // Tensor parallel (docs/tp.md 8.1): MtpHead::Draft merges the full-vocab head's per-step argmax
   // across ranks itself (H6), and VerifyWindow merges the verify rows (H4), so every rank drafts,
   // verifies and commits the same round; nothing here differs from TP=1.
@@ -3021,6 +3027,7 @@ std::vector<int32_t> Model::DecodeStepDflashImpl(int32_t token_id, int64_t k, fl
                                                   std::mt19937_64* rng, int64_t* walk_len_out,
                                                   DflashRoundTrace* trace_out,
                                                   std::vector<int32_t>* drafted_tokens_out) {
+  CheckTuningScope();  // the drafter's GEMMs (DraftRound, InjectFeatures) run under the Model's flag, not the thread's default
   // Tensor parallel (docs/tp.md 8.2): DraftRound merges the per-rank top-16s itself (H7), so both
   // ranks walk the same selector lattice to the same drafts; the rest of the round is the shared
   // verify path (7.6), unchanged.

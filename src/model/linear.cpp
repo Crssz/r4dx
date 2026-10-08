@@ -245,6 +245,15 @@ const GemmTuningRow* BestRow(const GemmTuningRow (&table)[kRows], Layout layout,
 
 void SetTp2TuningForThisThread(bool enabled) { t_tp2_tuning = enabled; }
 
+bool Tp2TuningForThisThread() { return t_tp2_tuning; }
+
+void CheckTp2TuningScope(bool expected, const char* what) {
+  if (t_tp2_tuning == expected) return;
+  throw std::logic_error(std::string(what) + ": this thread's GEMM tuning flag is " + (t_tp2_tuning ? "true (TP rank tunings)" : "false (TP=1 tunings)") +
+                         " but the Model is " + (expected ? "a TP rank" : "not a TP rank") +
+                         "; run its calls inside a Tp2TuningScope(model's own value) (docs/pp-tp2-hybrid.md 7)");
+}
+
 int EffectiveW4a16Group(int w4a16_group) {
   return w4a16_group == 0 ? DefaultW4a16Group() : w4a16_group;
 }

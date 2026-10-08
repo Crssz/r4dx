@@ -278,6 +278,16 @@ class Model {
   Model(const Model&) = delete;
   Model& operator=(const Model&) = delete;
 
+  // GEMM tuning scope (docs/pp-tp2-hybrid.md 7). The per-thread tuning flag (linear.h SetTp2TuningForThisThread) must equal the
+  // Model that runs: true for a TP rank, false for a TP=1 Model and a pipeline stage. Tp2TuningForModel() is that value, fixed
+  // at Load; a caller that runs this Model on a thread that also hosts another one wraps the call in
+  // Tp2TuningScope(model.Tp2TuningForModel()). CheckTuningScope() throws std::logic_error when the calling thread's flag
+  // disagrees; the entry points that reach a GEMM (RunChunk, VerifyWindow, the MTP / DFlash rounds) run it first. Every
+  // single-Model-per-thread path satisfies it by construction: Load sets the flag on the loading thread, a rank worker thread
+  // only ever runs its rank, and any other thread's flag is its default, false.
+  bool Tp2TuningForModel() const { return tp2_tuning_; }
+  void CheckTuningScope() const;
+
   // Under tensor parallelism (ModelOptions::tp.world > 1) Config() is the RANK-local config (head
   // counts and intermediate_size divided by the world, docs/tp.md 3.2; vocab_size stays global) and
   // GlobalConfig() the container's own; at TP=1 the two are equal.
@@ -1160,6 +1170,7 @@ class Model {
 
   // ---- tensor parallel (docs/tp.md 4.4, 7.2); inert at TP=1 -------------------------------------
   core::TpComm* comm_ = nullptr;  // ModelOptions::tp.comm, non-owning; nullptr at TP=1
+  bool tp2_tuning_ = false;       // this Model is a TP rank (tp.world > 1): the value of the thread's tuning flag for its calls
   // This rank's lm_head rows (container_.LmHead().N) and the global id of the first one
   // (Config().VocabShardBegin()): vocab_size and 0 at TP=1. Every device logits buffer, kernel
   // `vocab` argument and D2H count uses vocab_local_; every host row a sampler or caller sees is

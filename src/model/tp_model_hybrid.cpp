@@ -683,6 +683,13 @@ void TpModel::HybridMain(RankSlot& s, HyCall& c) {
   } catch (...) {
     const std::exception_ptr e = std::current_exception();
     c.PoisonAll(pp::WhatOf(e));  // frees the other thread wherever it waits
+    // Nothing this thread enqueued (a reshard copy into the ring, a stage chunk) may outlive the command: the recovery reuses the ring and
+    // resets the Models, and the peer may read a slot only after a publish that will never come.
+    try {
+      stg.ReshardSync();
+      rank.ReshardSync();
+    } catch (...) {
+    }
     if (hybrid::IsPoisonConsequence(e)) {
       // Only the other card's failure told this one: rank it last, so Run reports the root cause (docs/tp.md 2.4).
       throw core::TpAbortedError("hybrid: aborted by the other card's failure: " + pp::WhatOf(e));

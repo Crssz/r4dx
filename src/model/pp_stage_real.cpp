@@ -17,6 +17,7 @@
 #include "model.h"
 #include "pp_plan.h"
 #include "r4dx/core/error.hpp"
+#include "r4dx/core/r4d.hpp"
 
 namespace r4dx::model {
 
@@ -59,6 +60,14 @@ void Model::PpAttach(PpStageSetup setup) {
                                 std::to_string(container_.NumLoadedLayers()) + " loaded layers on each side");
   }
   stream_.Synchronize();
+  // The conv-history hand-off's device scratch (CopyConvHistory): one layer's [conv_dim][conv_width - 1] bf16.
+  for (const auto& g : gdn_states_) {
+    if (g) {
+      const size_t need = static_cast<size_t>(g->ConvDim() * g->ConvHistory());
+      if (pp_conv_scratch_.size() < need) pp_conv_scratch_ = core::DeviceBuffer<uint16_t>(need);
+      break;
+    }
+  }
   pp_setup_ = std::move(setup);
   pp_role_ = pp_setup_.role;
   pp_active_ = pp_role_ == PpRole::kStageA;
@@ -122,18 +131,15 @@ std::vector<int64_t> Model::PpAttnLayers(int64_t split) const {
   return out;
 }
 
-int64_t Model::PpKvBlockSize() const {
-  for (const auto& kv : kv_caches_) {
-    if (kv) return kv->BlockSize();
-  }
-  throw std::logic_error("Model::PpKvBlockSize: no attention layer is loaded");
-}
+// From the configuration, not from a loaded cache: a stage-A Model whose layers [0, split] hold no attention layer (a tiny
+// split) still has the geometry. Model::Load builds every PagedKvCache from exactly these (kv heads, head_dim, block size), and
+// KvBlockStride() = kv_heads x block_size x 2 x head_dim bytes (fp8).
+int64_t Model::PpKvBlockSize() const { return core::r4d::GetAttnDims().block_size; }
 
 size_t Model::PpKvBlockStrideBytes() const {
-  for (const auto& kv : kv_caches_) {
-    if (kv) return static_cast<size_t>(kv->KvBlockStride());
-  }
-  throw std::logic_error("Model::PpKvBlockStrideBytes: no attention layer is loaded");
+  const ModelConfig& cfg = container_.Config();
+  return static_cast<size_t>(cfg.num_key_value_heads) * static_cast<size_t>(PpKvBlockSize()) * 2u *
+         static_cast<size_t>(cfg.head_dim);
 }
 
 namespace {
@@ -147,7 +153,10 @@ pp::GdnWire WireOf(const GdnStateManager& g) {
 // ([conv_dim][StateLenMax()], history at offset 0). A line whose pitch is exactly the history length (stage A, and any
 // Model that does not speculate: state_len_max = conv_width - 2 + max_decode_window = conv_width - 1) IS the wire form: one
 // contiguous copy. A speculating Model's longer lines need the 2D copy (row pitch StateLenMax(), 2 x 3 bytes per row).
-void CopyConvHistory(GdnStateManager& g, uint8_t* host, bool to_host, hipStream_t s) {
+// The longer line is moved through a small device scratch (`scratch`, conv_dim x history elements): a contiguous host copy plus a
+// device-to-device 2D copy -- the pattern GdnStateManager::CollapseWindow already runs on every layer after a speculative round --
+// instead of a host 2D copy with 6-byte rows. Copies on one stream are ordered, so one scratch serves every layer in turn.
+void CopyConvHistory(GdnStateManager& g, uint8_t* host, bool to_host, hipStream_t s, core::DeviceBuffer<uint16_t>& scratch) {
   const size_t hist = static_cast<size_t>(g.ConvHistory()) * sizeof(uint16_t);
   const size_t rows = static_cast<size_t>(g.ConvDim());
   const size_t pitch = static_cast<size_t>(g.StateLenMax()) * sizeof(uint16_t);
@@ -156,12 +165,17 @@ void CopyConvHistory(GdnStateManager& g, uint8_t* host, bool to_host, hipStream_
     R4DX_HIP_CHECK(hipMemcpyAsync(to_host ? static_cast<void*>(host) : static_cast<void*>(line),
                                    to_host ? static_cast<const void*>(line) : static_cast<const void*>(host), hist * rows,
                                    to_host ? hipMemcpyDeviceToHost : hipMemcpyHostToDevice, s));
-  } else if (to_host) {
-    R4DX_HIP_CHECK(hipMemcpy2DAsync(host, hist, line, pitch, hist, rows, hipMemcpyDeviceToHost, s));
+    return;
+  }
+  if (scratch.bytes() < hist * rows) throw std::logic_error("GDN hand-off: the conv scratch is not allocated (PpAttach)");
+  if (to_host) {
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(scratch.data(), hist, line, pitch, hist, rows, hipMemcpyDeviceToDevice, s));
+    R4DX_HIP_CHECK(hipMemcpyAsync(host, scratch.data(), hist * rows, hipMemcpyDeviceToHost, s));
   } else {
     // The history lands at offset 0 of the live line (where a prefill / the first step of a fresh seed reads it); the
     // line's other entries (this stage's longer window) are not part of the live state and keep what they hold.
-    R4DX_HIP_CHECK(hipMemcpy2DAsync(line, pitch, host, hist, hist, rows, hipMemcpyHostToDevice, s));
+    R4DX_HIP_CHECK(hipMemcpyAsync(scratch.data(), host, hist * rows, hipMemcpyHostToDevice, s));
+    R4DX_HIP_CHECK(hipMemcpy2DAsync(line, pitch, scratch.data(), hist, hist, rows, hipMemcpyDeviceToDevice, s));
   }
 }
 
@@ -187,7 +201,7 @@ void Model::PpExportGdn(uint8_t* host, int64_t split) {
     const pp::GdnWire w = WireOf(g);
     R4DX_HIP_CHECK(hipMemcpyAsync(host + off, g.RecurrentSlotPtr(g.SlotForSeq(0)), w.recurrent_bytes,
                                    hipMemcpyDeviceToHost, s));
-    CopyConvHistory(g, host + off + w.recurrent_bytes, /*to_host=*/true, s);
+    CopyConvHistory(g, host + off + w.recurrent_bytes, /*to_host=*/true, s, pp_conv_scratch_);
     off += w.PerLayer();
   }
   stream_.Synchronize();
@@ -197,7 +211,7 @@ namespace {
 
 // Enqueues the compact -> live-layout copies of layers [0, split) on `s`.
 void EnqueueGdnImport(std::vector<std::optional<GdnStateManager>>& states, const uint8_t* host, int64_t split,
-                      hipStream_t s) {
+                      hipStream_t s, core::DeviceBuffer<uint16_t>& scratch) {
   size_t off = 0;
   for (int64_t i = 0; i < split && i < static_cast<int64_t>(states.size()); ++i) {
     if (!states[static_cast<size_t>(i)]) continue;
@@ -206,7 +220,7 @@ void EnqueueGdnImport(std::vector<std::optional<GdnStateManager>>& states, const
     R4DX_HIP_CHECK(hipMemcpyAsync(g.RecurrentSlotPtr(g.SlotForSeq(0)), host + off, w.recurrent_bytes,
                                    hipMemcpyHostToDevice, s));
     // (const_cast: the helper takes one signature for both directions; the import only reads `host`.)
-    CopyConvHistory(g, const_cast<uint8_t*>(host) + off + w.recurrent_bytes, /*to_host=*/false, s);
+    CopyConvHistory(g, const_cast<uint8_t*>(host) + off + w.recurrent_bytes, /*to_host=*/false, s, scratch);
     off += w.PerLayer();
   }
 }
@@ -215,13 +229,13 @@ void EnqueueGdnImport(std::vector<std::optional<GdnStateManager>>& states, const
 
 void Model::PpImportGdn(const uint8_t* host, int64_t split) {
   stream_.Synchronize();
-  EnqueueGdnImport(gdn_states_, host, split, stream_.get());
+  EnqueueGdnImport(gdn_states_, host, split, stream_.get(), pp_conv_scratch_);
   stream_.Synchronize();
 }
 
 void Model::PpImportGdnAsync(const uint8_t* host, int64_t split) {
   if (!pp_aux_stream_) throw std::logic_error("Model::PpImportGdnAsync: stage B only");
-  EnqueueGdnImport(gdn_states_, host, split, pp_aux_stream_->get());
+  EnqueueGdnImport(gdn_states_, host, split, pp_aux_stream_->get(), pp_conv_scratch_);
 }
 
 void Model::PpImportFence() {
@@ -287,7 +301,7 @@ std::vector<std::pair<std::string, uint64_t>> Model::PpLiveDigest(int64_t split)
       std::vector<uint8_t> host(w.recurrent_bytes + w.conv_bytes);
       R4DX_HIP_CHECK(hipMemcpy(host.data(), g.RecurrentSlotPtr(g.SlotForSeq(0)), w.recurrent_bytes,
                                 hipMemcpyDeviceToHost));
-      CopyConvHistory(g, host.data() + w.recurrent_bytes, /*to_host=*/true, stream_.get());
+      CopyConvHistory(g, host.data() + w.recurrent_bytes, /*to_host=*/true, stream_.get(), pp_conv_scratch_);
       stream_.Synchronize();
       out.emplace_back("gdn." + std::to_string(i), FnvUpdate(kFnvInit, host.data(), host.size()));
     } else if (!cfg.IsGdnLayer(i) && kv_caches_[idx]) {

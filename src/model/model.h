@@ -1256,6 +1256,7 @@ class Model {
   bool pp_active_ = false;
   bool pp_bounded_ = false;
   std::optional<core::Stream> pp_aux_stream_;
+  core::DeviceBuffer<uint16_t> pp_conv_scratch_;  // one layer's conv history, for the GDN hand-off through a longer line
   int64_t pp_staged_chunks_ = 0;
 
   // ---- prompt checkpoint (SaveCheckpoint); the GDN half lives in each GdnStateManager ------------

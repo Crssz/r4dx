@@ -107,6 +107,18 @@ class GdnStateManager {
     }
   }
 
+  // ---- pipeline-parallel hand-off (Model::PpExportGdn / PpImportGdn, docs/pp-prefill.md 3.2) -------
+  // The live state of a sequence after a prefill: its recurrent slot (RecurrentSlotPtr(SlotForSeq(seq_id)), fp32
+  // H x V x K) and the first conv_width - 1 entries of every channel's history in its conv line (ConvLinePtr, row pitch
+  // StateLenMax() entries). Two managers with different max_decode_window have different line pitches, so the
+  // hand-off copies [conv_dim][ConvHistory()] compactly with a 2D copy.
+  uint16_t* ConvLinePtr(int32_t seq_id) { return ConvSeqPtr(seq_id); }
+  int64_t ConvDim() const { return conv_dim_; }
+  int64_t ConvHistory() const { return conv_width_ - 1; }
+  int64_t NumHeads() const { return H_; }
+  int64_t ValueDim() const { return V_; }
+  int64_t KeyDim() const { return K_; }
+
   // ---- prompt checkpoint (Model::SaveCheckpoint, docs/server.md "Prefix cache") ------------------
   // One spare copy of a sequence's window-0 recurrent slot and its conv state: the per-sequence state
   // that moving the position back cannot rewind (the next call READS it, where the KV caches are

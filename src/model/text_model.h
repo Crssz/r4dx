@@ -72,6 +72,20 @@ struct TpOptions {
   int fault_kind = 0;
 };
 
+// The `--pp*` knobs (docs/pp-prefill.md Phase 2). Whether the pipeline is on at all is ModelOptions::pp (--pp 2, R4DX_PP);
+// these only tune it. Stage A (layers [0, k) + embedding) runs on HIP ordinal `stage_a_device` -- the desktop card, with
+// HIP_VISIBLE_DEVICES=1,0 -- and stage B (the full decode Model) on ordinal 0.
+struct PpOptions {
+  int split = 0;           // k: 0 = auto (33, or 35 with a DFlash drafter; both keep 8 attention layers per stage)
+  int min_rows = 1024;     // a Prefill call with fewer rows runs on the decode Model alone (the fill and the sync-back would not pay)
+  bool verify = false;     // digest the live state of both stages after every hand-off and compare (R4DX_PP_VERIFY=1 also turns it on)
+  int submit_layers = 32;  // stage A's bounded GPU submission (docs/tp.md Appendix B N57): 0 = off, [0, 64]
+  int max_inflight = 1;    // ... and the number of units it keeps queued, [0, 64]
+  int slots = 3;           // the hand-over ring, [2, 8]
+  int timeout_ms = 30000;  // bound of every wait between the stages
+  int stage_a_device = 1;  // process-visible HIP ordinal of stage A
+};
+
 // One rank's device memory, as hipMemGetInfo reports it for that rank's device (device-wide: other
 // processes included -- on HIP device 0, the desktop), plus this process's own live DeviceBuffer
 // bytes on that device (core::DeviceBufferBytes; under emulation both ranks share one device, so both
@@ -186,6 +200,10 @@ class TpDiagnostics {
 // field must then keep its default. tp.world == 2 => TpModel::Load(opts, tp). Defined in
 // tp_model.cpp.
 std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp);
+// With the pipeline's knobs: ModelOptions::pp (--pp 2 / R4DX_PP, off by default) picks PpModel::Load(opts, pp) -- a
+// half-weight stage A on the desktop card + the ordinary decode Model, prefill pipelined across them, decode unchanged
+// (docs/pp-prefill.md Phase 2) -- and needs tp.world == 1. The two-argument form is this with default PpOptions.
+std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptions& tp, const PpOptions& pp);
 
 // The Gemma 4 branch of LoadTextModel (arch.h: DetectArch(opts.container_path) == kGemma4). Defined in
 // gemma_local_text_model.cpp: tp.world == 1 -> GemmaLocalTextModel, tp.world == 2 -> GemmaTpModel (M1b-1).

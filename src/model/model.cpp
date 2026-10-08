@@ -1064,6 +1064,14 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
   // by default, and never for a decode step: then this is exactly one RunLayerRange over every layer.
   const int64_t pp_split = is_prefill_path ? pp_emulate_.split : 0;
   if (pp_split > 0) return RunChunkPpEmulated(r, pp_split);
+  // The real pipeline (PpAttach, docs/pp-prefill.md Phase 2): stage A's chunk ends after layers [0, split) with the carry
+  // in a channel slot; an active stage B's chunk starts from that slot. Stage A has no use for a decode-shaped call.
+  if (pp_role_ == PpRole::kStageA && !is_prefill_path) {
+    throw std::logic_error("Model::RunChunk: a pipeline stage-A Model only runs prompt-prefill chunks");
+  }
+  if (pp_active_ && is_prefill_path) {
+    return pp_role_ == PpRole::kStageA ? RunChunkPpStageA(r) : RunChunkPpStageB(r);
+  }
   ChunkPrologue(r);
   RunLayerRange(r, 0, r.num_layers);
   return ChunkEpilogue(r);
@@ -1190,7 +1198,8 @@ void Model::ChunkPrologue(ChunkRun& r) {
   // steps and verify windows (<= 8 rows under TP, a decode-sized step: Load caps the draft count at
   // tp::kMaxUnsplitDraftK, N80) are not split; every call already ends in the stream synchronize
   // below. The previous call ended synchronized, so no unit is outstanding here.
-  const bool bounded = comm_ != nullptr && is_prefill_path && submit_.Active();
+  // (Also stage A of the real pipeline, which runs on the desktop card: PpEnableBounding.)
+  const bool bounded = (comm_ != nullptr || pp_bounded_) && is_prefill_path && submit_.Active();
   // A 256-row super-chunk costs about four times a 64-row chunk per layer, so its unit is a quarter of the
   // layers (at least one): the GPU time between two forced submissions -- what the display card waits
   // behind -- stays what UnitLayersForContext sized it for.

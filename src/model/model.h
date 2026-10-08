@@ -58,6 +58,7 @@
 #include "r4dx/core/stream.hpp"
 #include "r4dx/core/tp_comm.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
+#include "pp_channel.h"    // pp::StageChannel (docs/pp-prefill.md, Phase 2), header-only and HIP-free
 #include "tp/tp_vocab.h"   // tp::ArgmaxPair (docs/tp.md 7.3), header-only and HIP-free
 #include "tp/tp_submit.h"  // tp::SubmitBounder (docs/tp.md Appendix B N57); inert at TP=1
 #include "vision_tower.h"  // src/vision: the device-side vision tower (docs/vision.md)
@@ -219,6 +220,11 @@ struct ModelOptions {
   // (default) follows the environment (unset / 1 / on = on, the default; 0 / off = f16 at TP = 2); 0 and 1 force it. Only matters at tp.world > 1 with the
   // int8 GEMM on; 0 keeps a TP = 2 Model byte-identical to one built before the option existed (no scale table, no scope).
   int prefill_int8_tp2 = -1;
+  // Pipeline-parallel prefill (docs/pp-prefill.md, Phase 2; --pp 2): -1 (default) follows the environment (R4DX_PP: unset /
+  // 0 / off = off, the default; 1 / on / 2 = on), 0 forces it off, 2 forces it on. Read by LoadTextModel, which then builds a
+  // PpModel (a half-weight stage A on HIP ordinal 1 + this full Model on ordinal 0, decode unchanged); Model::Load itself
+  // ignores it. The knobs (split, min rows, ...) are PpOptions (text_model.h).
+  int pp = -1;
   // Pipeline-parallel prefill, emulated on this device (docs/pp-prefill.md; Model::SetPpEmulate): -1 (default)
   // follows the environment (R4DX_PP_EMULATE=<k>: unset / 0 / off = off, the default), 0 forces it off, k > 0 runs
   // every prompt-prefill chunk as stage A = layers [0, k) and stage B = [k, NumLoadedLayers()) with the inter-stage
@@ -853,6 +859,81 @@ class Model {
   const std::vector<PpChunkTimes>& PpChunkTimeLog() const { return pp_times_; }
   void ClearPpChunkTimeLog() { pp_times_.clear(); }
 
+  // ---- real pipeline-parallel prefill (docs/pp-prefill.md, Phase 2; PpModel drives all of this) ------------------
+  // Two Models, one per GPU, each on its own thread. Stage A = a Model loaded with layer_limit = split + 1 (layers
+  // [0, split] are resident; the last one only supplies the input_layernorm weight layer split - 1's Mlp fuses, exactly
+  // as in the monolithic run) that runs the prologue and layers [0, split) of every prompt-prefill chunk and ships the
+  // carry to stage B through a pp::StageChannel; stage B = the ordinary full Model, which per chunk waits for the slot,
+  // imports it and runs layers [split, N) and the epilogue. Both Models run the SAME Prefill / PrefillMultimodal on the
+  // same tokens, so the chunk grid, the int8 / scope decisions and the mrope bookkeeping agree by construction. Decode,
+  // verify windows and everything else are untouched (a stage-B Model that is not "active" is exactly today's Model).
+  enum class PpRole { kNone, kStageA, kStageB };
+  struct PpStageSetup {
+    PpRole role = PpRole::kNone;
+    int64_t split = 0;                      // layers [0, split) are stage A's, [split, NumLoadedLayers()) stage B's
+    pp::StageChannel* channel = nullptr;    // non-owning; outlives the attachment
+    int timeout_ms = 30000;                 // bound of every wait on the channel
+    // Stage B: called right after the LAST chunk of a call took its slot, before it imports it (PpModel starts the
+    // GDN state's import there, on a side stream, so it overlaps that chunk's compute).
+    std::function<void()> before_last_chunk;
+    // Either stage: called when a chunk has been fully handled (stage A: published; stage B: epilogue done, slot
+    // released). PpModel bumps stage A's heartbeat from it (the progress watchdog's input).
+    std::function<void()> on_chunk;
+  };
+  // Throws std::invalid_argument for a TP rank, a rotated (quant2) container, the PP-emulate mode, an active debug
+  // probe (R4DX_CLOCK_PROBE), or a split outside [1, NumLoadedLayers() - 1]. The device must be idle.
+  void PpAttach(PpStageSetup setup);
+  void PpDetach();
+  PpRole PpStageRole() const { return pp_role_; }
+  // Stage B: whether Prefill / PrefillMultimodal chunks go through the channel (off = today's monolithic chunk). Stage A
+  // is always active. Toggled by PpModel around a pipelined call, device idle.
+  void PpSetActive(bool on);
+  bool PpActive() const { return pp_active_; }
+  // Chunks that went through the channel since Load (tests: proof it, not a fallback, ran).
+  int64_t PpStagedChunks() const { return pp_staged_chunks_; }
+  // Stage A: bounded GPU submission in its chunks (tp/tp_submit.h; device 0 drives the desktop and cannot preempt
+  // compute): a forced submission after every UnitLayersForContext(submit_layers, chunk end) layers and at most
+  // `max_inflight` units queued. 0 layers = off. Creates events on the calling thread's device.
+  void PpEnableBounding(int submit_layers, int max_inflight);
+
+  // The per-sequence scalars stage A must share with stage B at the start of a pipelined call (the device state itself
+  // travels as GDN / KV bytes below).
+  struct PpSyncState {
+    int64_t pos = 0;
+    bool started = false;
+    bool mrope_active = false;
+    int64_t mrope_delta = 0;
+  };
+  PpSyncState PpGetSyncState() const { return {pos_, started_, mrope_active_, mrope_delta_}; }
+  void PpSetSyncState(const PpSyncState& s);
+  // Stage B, before the call's first state export: what Prefill does first (a prior speculative round may have left
+  // the live GDN state in a window slot; move it to window 0 and drop the acceptance thread). Idempotent.
+  void PpPrepareCall() { CollapseSpeculativeWindow(); }
+
+  // Geometry of the boundary (PpModel sizes the ring from it).
+  std::vector<int64_t> PpAttnLayers(int64_t split) const;   // full-attention layers in [0, split)
+  int64_t PpKvBlockSize() const;                            // rows per KV block
+  size_t PpKvBlockStrideBytes() const;                      // bytes of one block of one layer
+  // The GDN live state of layers [0, split), compact (pp_channel.h's GdnWire: per layer a recurrent slot then a
+  // [conv_dim][conv_width - 1] history, 256-byte aligned). Synchronous: the device is idle on return. The host buffer is
+  // pinned memory of at least PpGdnWireBytes() bytes.
+  size_t PpGdnWireBytes(int64_t split) const;
+  void PpExportGdn(uint8_t* host, int64_t split);
+  void PpImportGdn(const uint8_t* host, int64_t split);
+  // The import on the Model's side stream (overlaps whatever is queued on stream_); PpImportFence() waits for it.
+  void PpImportGdnAsync(const uint8_t* host, int64_t split);
+  void PpImportFence();
+  // KV rows [row0, row1) of the attention layers in [0, split): whole blocks, one contiguous byte range per layer, in
+  // layer order, packed. Synchronous. PpKvWireBytes is the host size.
+  size_t PpKvWireBytes(int64_t split, int64_t row0, int64_t row1) const;
+  void PpExportKvRows(uint8_t* host, int64_t split, int64_t row0, int64_t row1);
+  void PpImportKvRows(const uint8_t* host, int64_t split, int64_t row0, int64_t row1);
+  // FNV-1a digests of the LIVE state of layers [0, split) at the current position: per GDN layer the compact live
+  // recurrent slot + conv history, per attention layer the KV rows [0, PositionCount()) only (not the stale tail of the
+  // last block, not anything past it). Equal on both stages after a hand-off iff the hand-off is exact
+  // (R4DX_PP_VERIFY, tests/model/test_pp_real_identity.cpp). Synchronous, slow (copies the state to the host).
+  std::vector<std::pair<std::string, uint64_t>> PpLiveDigest(int64_t split);
+
  private:
   Model() = default;
 
@@ -894,6 +975,11 @@ class Model {
   // epilogue.
   std::vector<float> RunChunkPpEmulated(ChunkRun& r, int64_t split);
   void PpEmulateHop(ChunkRun& r, int64_t split, PpChunkTimes* times);
+  // The real pipeline's two compositions of a prompt-prefill chunk (pp_stage.cpp, PpAttach): stage A = prologue,
+  // layers [0, split), export the carry into a channel slot (returns no logits, advances pos_); stage B = prologue,
+  // wait for the slot, import it, layers [split, N), epilogue, release the slot.
+  std::vector<float> RunChunkPpStageA(ChunkRun& r);
+  std::vector<float> RunChunkPpStageB(ChunkRun& r);
   // Fills the whole (just reset) activation arena with 0xFF on stream_ and resets it again.
   void PoisonArena();
   // ModelOptions::pp_emulate_split resolved against R4DX_PP_EMULATE: 0 = off, else the split layer. Throws on a
@@ -1162,6 +1248,15 @@ class Model {
   int64_t pp_emulated_chunks_ = 0;
   std::vector<PpChunkTimes> pp_times_;
   core::PinnedBuffer<uint8_t> pp_host_;
+
+  // The real pipeline (PpAttach): this Model's role, the stage setup, whether its prompt-prefill chunks go through the
+  // channel right now, the side stream of the async GDN import (stage B), stage A's bounded submission, a counter.
+  PpRole pp_role_ = PpRole::kNone;
+  PpStageSetup pp_setup_;
+  bool pp_active_ = false;
+  bool pp_bounded_ = false;
+  std::optional<core::Stream> pp_aux_stream_;
+  int64_t pp_staged_chunks_ = 0;
 
   // ---- prompt checkpoint (SaveCheckpoint); the GDN half lives in each GdnStateManager ------------
   bool prompt_checkpoint_ = false;  // ModelOptions::prompt_checkpoint, copied at Load()

@@ -1,4 +1,4 @@
-﻿// tests/model/test_pp_channel_cpu.cpp -- CPU-only checks of src/model/pp_channel.h, the hand-over of the real
+// tests/model/test_pp_channel_cpu.cpp -- CPU-only checks of src/model/pp_channel.h, the hand-over of the real
 // pipeline-parallel prefill (docs/pp-prefill.md Phase 2): FIFO slot order, back-pressure, bounded waits, the poison
 // flag, the per-call reset, the bulk (GDN state) flag, the slot payload arithmetic and a million-item two-thread stress
 // run with payload integrity checks. No HIP call, no container, always runs.

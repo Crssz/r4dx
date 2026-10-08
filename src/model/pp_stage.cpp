@@ -54,6 +54,9 @@ void Model::SetPpEmulate(const PpEmulateConfig& config) {
     throw std::invalid_argument("Model::SetPpEmulate: poison_arena must be 0, 1 or 2");
   }
   if (config.split > 0) {
+    if (pp_role_ != PpRole::kNone) {
+      throw std::invalid_argument("Model::SetPpEmulate: not on a Model that is a stage of the real pipeline (PpAttach)");
+    }
     if (comm_ != nullptr) {
       throw std::invalid_argument("Model::SetPpEmulate: not on a tensor-parallel rank (the pipeline replaces TP)");
     }

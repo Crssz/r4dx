@@ -174,6 +174,15 @@ class TpModel final : public TextModel, public TpDiagnostics {
   // with its type, the group be kNeedsRecovery, and Reset() heal it. Legal in kReady with the hybrid engaged.
   enum class HybridFaultPhase { kNone, kGather, kStagePrefill, kReshard, kAdopt };
   void ArmHybridFault(int rank, HybridFaultPhase phase);
+  // Test-only negative controls (tests/model/test_hybrid_real_identity.cpp): each damages ONE piece of the pipelined calls that follow, so the test
+  // can show that its comparison notices (a comparison that cannot fail proves nothing). Persistent until set back to kNone; the stage mirrors
+  // are wrong after a damaged call, so the caller Reset()s the group before it trusts anything again. Legal in kReady with the hybrid engaged.
+  //   kWrongRankGdn    the scatter's first recurrent-state op of rank 0 reads rank 1's v-heads (a wrong rank mapping)
+  //   kStaleSeed       stage Y keeps the MTP seed its own last call left instead of rank 0's (the TP -> Y seed sync is skipped)
+  //   kSkipDflashTail  the DFlash tail is not injected into the drafters
+  //   kSkipGather      the warm gather is skipped (a stale mirror: the stages keep the state of their last call)
+  enum class HybridNegControl { kNone, kWrongRankGdn, kStaleSeed, kSkipDflashTail, kSkipGather };
+  void SetHybridNegControl(HybridNegControl nc);
 
   // ---- tensor-parallel diagnostics (tests, tools, --stats) --------------------------------------
   State GetState() const { return state_; }

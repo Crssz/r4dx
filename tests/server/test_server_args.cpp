@@ -583,6 +583,10 @@ void TestTpFlags() {
   CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "auto"}));
   CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate"}));
   CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate", "--hybrid", "off"}));
+  // --pp-devices B,A must name the --tp-devices pair or be refused
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "1,0"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1", "--hybrid", "off"}));
   CHECK(TpThrows({"--hybrid", "off"}));
   CHECK(TpThrows({"--tp", "2", "--hybrid", "off"}));
   CHECK(TpThrows({"--pp", "2", "--hybrid-ctx", "65536"}));

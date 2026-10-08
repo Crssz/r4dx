@@ -544,6 +544,19 @@ std::vector<float> TpModel::HybridPrefillRun(const std::vector<int32_t>& ids, co
   const hybrid::TpMasterTracker::SyncPlan sync_plan = h.tracker->PlanSync(p0);
   c->gather = hybrid::GatherPlan(h.geo, h.plan_params, sync_plan);
   c->scatter = hybrid::ScatterPlan(h.geo, h.plan_params, p0, p0 + n);
+  if (h.neg_control == HybridNegControl::kSkipGather) c->gather.ops.clear();  // test-only: the stale mirror
+  if (h.neg_control == HybridNegControl::kWrongRankGdn) {                     // test-only: rank 0's first recurrent op reads rank 1's v-heads
+    for (hybrid::CopyOp& op : c->scatter.ops) {
+      if (op.kind != hybrid::StateKind::kGdnRecurrent || op.rank != 0) continue;
+      for (const hybrid::CopyOp& other : c->scatter.ops) {
+        if (other.kind == op.kind && other.layer == op.layer && other.stage == op.stage && other.rank != op.rank) {
+          op.runs[0].full_off = other.runs[0].full_off;
+          break;
+        }
+      }
+      break;
+    }
+  }
   for (int s = 0; s < 2; ++s) {
     c->gather_batches[s] = hybrid::PackCrossOps(c->gather, s, hybrid::kHybridRingPieceBytes, hybrid::kHybridRingSlots);
     c->scatter_batches[s] = hybrid::PackCrossOps(c->scatter, s, hybrid::kHybridRingPieceBytes, hybrid::kHybridRingSlots);
@@ -616,7 +629,15 @@ void TpModel::HybridMain(RankSlot& s, HyCall& c) {
     //    the TP=1 GEMM tuning flag, the rank Models under their own (Tp2TuningScope per Model).
     {
       Tp2TuningScope scope(stg.Tp2TuningForModel());
-      stg.StageSetSyncState(c.sync);
+      if (!front && h.neg_control == HybridNegControl::kStaleSeed) {  // test-only: stage Y keeps its own (stale) MTP seed
+        StageSyncState stale = c.sync;
+        const StageSyncState own = stg.StageGetSyncState();
+        stale.mtp_seed_valid = own.mtp_seed_valid;
+        stale.mtp_seed = own.mtp_seed;
+        stg.StageSetSyncState(stale);
+      } else {
+        stg.StageSetSyncState(c.sync);
+      }
     }
     rank.SetDflashInjectionEnabled(c.inject);
 
@@ -671,7 +692,7 @@ void TpModel::HybridMain(RankSlot& s, HyCall& c) {
     {
       Tp2TuningScope scope(rank.Tp2TuningForModel());
       rank.TpAdoptPrefill(c.end);
-      if (c.tail.use) {
+      if (c.tail.use && h.neg_control != HybridNegControl::kSkipDflashTail) {
         t = Clock::now();
         rank.TpInjectDflashTail(c.tail_host, c.tail.rows, c.tail.start, c.tail_rope.empty() ? nullptr : c.tail_rope.data());
         c.tail_ms[sidx] = Ms(t, Clock::now());
@@ -770,6 +791,11 @@ void TpModel::ArmHybridFault(int rank, HybridFaultPhase phase) {
   if (rank != 0 && rank != 1) throw std::invalid_argument("TpModel::ArmHybridFault: rank must be 0 or 1");
   hy_->fault_rank = phase == HybridFaultPhase::kNone ? -1 : rank;
   hy_->fault_phase = phase;
+}
+void TpModel::SetHybridNegControl(HybridNegControl nc) {
+  RequireReady();
+  if (!hy_) throw std::logic_error("TpModel::SetHybridNegControl: the hybrid mode is not engaged");
+  hy_->neg_control = nc;
 }
 
 std::string TpModel::HybridStatsLine() {

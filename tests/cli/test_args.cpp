@@ -517,7 +517,7 @@ void TestTpFlags() {
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1"}));
-  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 and its knobs; exclusive with --tp 2.
+  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 and its knobs; with --tp 2 it is the hybrid serving mode (below).
   {
     std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi"};
     auto argv = ToArgv(storage);
@@ -571,6 +571,10 @@ void TestTpFlags() {
   CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate"}));                    // the hybrid needs two real GPUs ...
   CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "noop"}));
   CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate", "--hybrid", "off"}));  // ... unless it is switched off
+  // --pp-devices B,A must name the --tp-devices pair (rank 0 = the decode stage's card, rank 1 = the front stage's) or be refused
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "1,0"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-devices", "1,0", "--pp-devices", "0,1", "--hybrid", "off"}));
   CHECK(TpThrows({"--hybrid", "off"}));                                                   // the hybrid flags need --tp 2 --pp 2
   CHECK(TpThrows({"--tp", "2", "--hybrid", "off"}));
   CHECK(TpThrows({"--pp", "2", "--hybrid", "off"}));

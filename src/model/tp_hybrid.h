@@ -53,6 +53,8 @@ struct TpModel::Hybrid {
   // test-only fault injection (TpModel::ArmHybridFault): set on the facade before a command is posted, read by the rank threads during it
   int fault_rank = -1;
   HybridFaultPhase fault_phase = HybridFaultPhase::kNone;
+  // test-only negative control (TpModel::SetHybridNegControl): persistent, same threading rule as the fault above
+  HybridNegControl neg_control = HybridNegControl::kNone;
 };
 
 // One pipelined call, shared by the two rank closures (heap, co-owned: a rank that stalls past the watchdog never touches the facade's

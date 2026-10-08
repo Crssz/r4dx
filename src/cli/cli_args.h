@@ -571,6 +571,11 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     if (a.tp == 2 && a.hybrid != 0 && a.tp_mode != "real") {
       throw CliUsageError("--tp 2 --pp 2 (the hybrid serving mode) needs --tp-mode real; add --hybrid off to run --tp-mode " + a.tp_mode + " without it");
     }
+    // The decode stage is TP rank 0's card and the front stage rank 1's, so an explicit --pp-devices B,A must name the --tp-devices pair
+    // (TpModel::Load re-checks the defaults and R4DX_PP_DEVICES).
+    if (a.tp == 2 && a.hybrid != 0 && a.pp_devices.size() == 2 && a.tp_devices.size() == 2 && a.pp_devices != a.tp_devices) {
+      throw CliUsageError("--tp 2 --pp 2: --pp-devices must equal --tp-devices (stage B = TP rank 0's card, stage A = rank 1's)");
+    }
     if (pp_split_given && a.pp_split < 1) throw CliUsageError("--pp-split must be 'auto' or >= 1");
     if (pp_min_rows_given && a.pp_min_rows < 1) throw CliUsageError("--pp-min-rows must be >= 1");
     if ((pp_submit_given && (a.pp_submit_layers < 0 || a.pp_submit_layers > 64)) ||

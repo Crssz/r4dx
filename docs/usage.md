@@ -21,8 +21,8 @@ ordinals; the load log prints `stage B (decode) -> HIP device <n> (<name>, pci <
 
 Flags: `--pp 2` (`--pp 1` forces it off), `--pp-devices B,A|auto`, `--pp-split N|auto`, `--pp-min-rows N` (512: shorter prefill calls run on the decode card
 alone), `--pp-verify` (compare both cards' state after every hand-off; slow), `--pp-submit-layers` / `--pp-max-inflight` (32 / 1: the
-desktop card's bounded submission). `r4dx-server --pp 2` takes the same flags. Exclusive with `--tp 2`; not for Gemma 4 or quant2
-containers; the desktop card carries ~10-13 GiB more and a full-duty load for the length of every long prefill. **Detailed usage notes.** This page was the project README before it was rewritten as a short overview.
+desktop card's bounded submission). `r4dx-server --pp 2` takes the same flags. With `--tp 2` it is the experimental hybrid below; not for
+Gemma 4 or quant2 containers; the desktop card carries ~10-13 GiB more and a full-duty load for the length of every long prefill. **Detailed usage notes.** This page was the project README before it was rewritten as a short overview.
 > It keeps the full converter / CLI / server / tensor-parallel reference and a dated status log. Parts describe
 > older containers (the w4a16 v6 recipe, the base Qwen3.8-27B model) that are no longer the default; the current
 > default is the Huihui trellis mix4.5m container (see [huihui.md](huihui.md)).
@@ -464,6 +464,31 @@ batched-verify mechanism. `tools/validate_spec_sampling.ps1 -Layouts w4a16` leav
 unresolved at TP=2 and 5 at TP=1, all of them `--mtp 3` and the TP=2 three among the TP=1 five, so
 it exits 1 at both and gate G12 is not met. docs/perf.md has the rest; `docs/tp.md` Appendix B N82
 has the P5 gates.
+
+#### Hybrid: pipelined prefill + TP=2 decode (`--tp 2 --pp 2`, EXPERIMENTAL)
+
+`--tp 2 --pp 2` keeps `--tp 2` for decode and swaps its prefill for the `--pp 2` pipeline on stage Models that sit next to the two TP
+ranks (rank 1 / the desktop card holds the front stage, rank 0 / the headless card the back stage and the heads); at the end of a
+prompt the stages' state is copied into the ranks' head halves, so decode, `--mtp`, `--dflash` and the prefix cache are the `--tp 2`
+ones. A prefill call of at least `--pp-min-rows` rows (1024 here) whose total context fits the stage-KV capacity S runs pipelined;
+every other call (short, longer than S, a drafter that cannot continue) is the ordinary TP=2 prefill and is counted in
+`--stats`. The prefill logits come from the back stage (full vocabulary, equal to TP=1's). Not run on the GPUs by its author yet:
+the identity gates are `test_tp_hybrid_identity` (16 layers) and `test_hybrid_real_identity` (64 layers), the TTFT check is
+`tools\prefill\ttft_cli.ps1 -Tp 2 -Pp`. Design and status: `docs/pp-tp2-hybrid.md`.
+
+```powershell
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible
+.\build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --tp 2 --pp 2 `
+    --dflash E:\models\r4dx\qwen38-27b-dflash2-w4a16-g64.r4dx --max-ctx 131072 --prompt-file prompt.txt --max-tokens 64 --temperature 0 --stats
+```
+
+Flags: `--pp-split N|auto` (29, 30 with `--dflash`), `--pp-min-rows N`, `--pp-devices B,A` (must equal `--tp-devices`, default 1,0),
+`--hybrid {on|off}` (`off` = plain `--tp 2`; `R4DX_HYBRID=0` is the same switch, the flag wins), `--hybrid-ctx N|auto` (the stage-KV
+capacity S in tokens, at least 16384 and at most `--max-ctx`; auto = what the free VRAM allows), `--hybrid-reserve-gib X` (VRAM kept
+free on the desktop card after the stages load, default 3). `r4dx-server --tp 2 --pp 2` takes the same flags. The stages cost about
+7 GiB per card on top of `--tp 2`; if the budget leaves no room for S >= 16384 the load log says `hybrid mode OFF, plain --tp 2: <why>`
+and the process serves as `--tp 2`. Needs `--tp-mode real` (two cards), `--max-ctx >= 16384`, and is refused for Gemma 4 and quant2
+(rotated) containers.
 
 ## Run the OpenAI-compatible server
 

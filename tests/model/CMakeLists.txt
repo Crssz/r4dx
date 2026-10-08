@@ -120,6 +120,15 @@ set(R4DX_MODEL_TESTS
   # failure on either card in each phase. 4-layer container (k = 2) and the real container with 16 layers (k = 8). HIP_VISIBLE_DEVICES=0,1.
   # Links the R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
   test_tp_hybrid_identity
+  # Hybrid mode P3 step 3, the FULL-DEPTH two-GPU gate (docs/pp-tp2-hybrid.md 16): the real TpModel with the hybrid engaged on the production trellis
+  # container at all 64 layers (--mtp 3, and --dflash 7 when the drafter exists) against a TP=1 reference that lives in EARLIER / LATER phases of the
+  # exe (it does not fit next to the ranks + stages): phase ref (cold 1024 / 2125 / 8145 rows -> digest records + state files), phase hybrid (the same
+  # calls through the pipeline, G-H1 at once; warm turns -- TP=2 decode, a TP prefill, a checkpoint restore -- record their gathered pre-call state),
+  # phase verify (the reference from each recorded pre-call state). G-H2 greedy tokens (plain, --mtp 3, --dflash 7) against ranks loaded with the
+  # reference image, the dispatch fallbacks (below min rows, n_total > S) and four negative controls (wrong rank mapping, stale MTP seed, stale mirror,
+  # skipped DFlash tail). Options: --phase all|ref|hybrid|verify --dir D --max-ctx N --hybrid-ctx N --keep. HIP_VISIBLE_DEVICES=0,1. Links the
+  # R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
+  test_hybrid_real_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -129,7 +138,7 @@ foreach(t ${R4DX_MODEL_TESTS})
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
      t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity" OR
      t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail" OR t STREQUAL "test_hybrid_emulate_identity" OR
-     t STREQUAL "test_tp_hybrid_identity")
+     t STREQUAL "test_tp_hybrid_identity" OR t STREQUAL "test_hybrid_real_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -148,6 +157,8 @@ set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_D
 set_tests_properties(test_hybrid_emulate_identity PROPERTIES TIMEOUT 5400)
 # The two-GPU hybrid: both cards visible (rank 0 = ordinal 1 = the headless card, which also holds the TP=1 reference; rank 1 = ordinal 0 = the desktop card)
 set_tests_properties(test_tp_hybrid_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 5400)
+# The full-depth gate: both cards visible ("0,1" is the natural order, the same as unset), three model loads of ~1-3 minutes each plus ~40 scenarios
+set_tests_properties(test_hybrid_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 7200)
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a

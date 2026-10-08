@@ -61,6 +61,16 @@
 //   --prefix-split-at K   long-prefix mode: prefill the prefix as two calls, ids[0..K) then the rest
 //                         (chunk boundaries shifted by K, like a prefix-cache restore) -- the
 //                         calibration for a variant's KL. 0 (default) = one call
+//   --pp {1|2}            2 = the HYBRID serving mode (docs/pp-tp2-hybrid.md, gate G-H3): needs --tp 2
+//                         (real) and --tail-rows R > 0. The T-R-row prefix is prefilled by the PP-2
+//                         pipeline on the stage Models and resharded into the TP ranks (when it has
+//                         >= --pp-min-rows rows), the tail is decoded at TP=2 -- exactly "prefix by the
+//                         hybrid, continuation at TP=2". The tool FAILS when the hybrid is not engaged
+//                         or a segment's prefix was not pipelined, and prints the `[stats] hybrid:` line.
+//                         --max-ctx must be >= 16384 (the stage-KV capacity S). Default 1
+//   --pp-split N, --pp-min-rows N (default 1024; 1 pipelines a short prefix -- the 1024-token kl_corpus
+//                         segments have 768-row prefixes at --tail-rows 256), --hybrid-ctx N|auto,
+//                         --hybrid-reserve-gib X   with --pp 2: the server's flags of the same names
 //
 // MTP and DFlash2 are unconditionally off (ModelOptions::mtp_draft_k stays 0, dflash_container
 // stays empty): both are speculation strategies for GENERATING, and this tool never generates -- it
@@ -86,6 +96,7 @@
 #include "teacher_forced.h"
 #include "test_common.h"
 #include "text_model.h"
+#include "tp_model.h"
 
 using r4dx_test::FileExists;
 using r4dx_test::SkipMissing;
@@ -134,6 +145,10 @@ int main(int argc, char** argv) {
   int64_t max_ctx = 8192, layers = -1, check_greedy = 0, tail_rows = 0, prefix_split_at = 0, max_tokens = 0;
   std::string tail_path = "decode";
   bool no_write = false, quiet = false;
+  int pp = 1, pp_split = 0, pp_min_rows = -1;          // --pp 2: the hybrid serving mode
+  int64_t hybrid_ctx = 0;
+  double hybrid_reserve_gib = -1.0;
+  bool pp_options_given = false;
 
   try {
     for (int i = 1; i < argc; ++i) {
@@ -164,6 +179,14 @@ int main(int argc, char** argv) {
       else if (a == "--tp-rank") { tp_rank = std::stoi(next()); tp_options_given = true; }
       else if (a == "--tp-submit-layers") { tp_submit_layers = std::stoi(next()); tp_options_given = true; }
       else if (a == "--tp-max-inflight") { tp_max_inflight = std::stoi(next()); tp_options_given = true; }
+      else if (a == "--pp") pp = std::stoi(next());
+      else if (a == "--pp-split") { pp_split = std::stoi(next()); pp_options_given = true; }
+      else if (a == "--pp-min-rows") { pp_min_rows = std::stoi(next()); pp_options_given = true; }
+      else if (a == "--hybrid-ctx") {
+        const std::string v = next();
+        hybrid_ctx = v == "auto" ? 0 : std::stoll(v);
+        pp_options_given = true;
+      } else if (a == "--hybrid-reserve-gib") { hybrid_reserve_gib = std::stod(next()); pp_options_given = true; }
       else {
         std::fprintf(stderr, "unrecognized argument: %s\n", a.c_str());
         return 2;
@@ -177,7 +200,20 @@ int main(int argc, char** argv) {
                             "[--embed-device-resident {on|off}] [--tp {1|2}] "
                             "[--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
                             "[--tp-submit-layers N] [--tp-max-inflight K] [--tail-rows R] "
-                            "[--tail-path {decode|prefill}] [--prefix-split-at K]\n");
+                            "[--tail-path {decode|prefill}] [--prefix-split-at K] "
+                            "[--pp {1|2} [--pp-split N] [--pp-min-rows N] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]]\n");
+      return 2;
+    }
+    if (pp != 1 && pp != 2) {
+      std::fprintf(stderr, "--pp must be 1 or 2 (2 = the hybrid serving mode, --tp 2 --pp 2)\n");
+      return 2;
+    }
+    if (pp == 1 && pp_options_given) {
+      std::fprintf(stderr, "--pp-split/--pp-min-rows/--hybrid-ctx/--hybrid-reserve-gib need --pp 2\n");
+      return 2;
+    }
+    if (pp == 2 && (tp != 2 || tp_mode != "real" || tail_rows <= 0)) {
+      std::fprintf(stderr, "--pp 2 (the hybrid) needs --tp 2 with --tp-mode real, and --tail-rows R > 0 (the uniform pass has no prefill to pipeline)\n");
       return 2;
     }
     if (tail_rows < 0 || (tail_path != "decode" && tail_path != "prefill")) {
@@ -248,8 +284,35 @@ int main(int argc, char** argv) {
 
     // Under --tp 2 this thread is the TpModel facade and makes no HIP call (docs/tp.md 2.1).
     const double vram_before = tp == 1 ? VramUsedGiB() : 0.0;
-    std::unique_ptr<r4dx::model::TextModel> model_ptr = r4dx::model::LoadTextModel(opts, tpo);
+    std::unique_ptr<r4dx::model::TextModel> model_ptr;
+    if (pp == 2) {
+      // The hybrid serving mode: the same option fill as src/cli/main.cpp / src/server/main.cpp (ModelOptions::pp + PpOptions).
+      opts.pp = 2;
+      r4dx::model::PpOptions ppo;
+      ppo.split = pp_split;
+      if (pp_min_rows > 0) {
+        ppo.min_rows = pp_min_rows;
+        ppo.min_rows_given = true;
+      }
+      ppo.hybrid = 1;  // on: a dump that silently came from plain --tp 2 would make the KL gate vacuous
+      ppo.hybrid_ctx = hybrid_ctx;
+      ppo.hybrid_reserve_gib = hybrid_reserve_gib;
+      model_ptr = r4dx::model::LoadTextModel(opts, tpo, ppo);
+    } else {
+      model_ptr = r4dx::model::LoadTextModel(opts, tpo);
+    }
     r4dx::model::TextModel& model = *model_ptr;
+    r4dx::model::TpModel* hybrid_model = pp == 2 ? dynamic_cast<r4dx::model::TpModel*>(&model) : nullptr;
+    if (pp == 2) {
+      if (hybrid_model == nullptr || !hybrid_model->HybridEngaged()) {
+        std::fprintf(stderr, "FAIL: --pp 2 but the hybrid mode is not engaged (plain --tp 2): %s\n",
+                     hybrid_model != nullptr ? hybrid_model->HybridRefusal().c_str() : "the model is not a TpModel");
+        return 1;
+      }
+      std::printf("[hybrid] engaged: split k=%lld, stage-KV capacity S=%lld tokens, min rows %lld\n",
+                  static_cast<long long>(hybrid_model->HybridSplit()), static_cast<long long>(hybrid_model->HybridStageCtx()),
+                  static_cast<long long>(hybrid_model->HybridMinRows()));
+    }
     const double vram_after_load = ModelVramGiB(model);
     const int64_t vocab = model.Config().vocab_size;
     std::printf("[model] %s layout=%s layers=%lld/%lld vocab=%lld max_ctx=%lld%s\n",
@@ -342,6 +405,23 @@ int main(int argc, char** argv) {
                 static_cast<long long>(segments_run), static_cast<long long>(total_rows),
                 total_wall, 1000.0 * total_wall / static_cast<double>(std::max<int64_t>(1, total_rows)),
                 worst_lse, peak_vram);
+
+    // --pp 2: every segment's prefix must have been a PIPELINED call (otherwise the dump is plain --tp 2's and a KL gate on it proves
+    // nothing about the hybrid): a prefix shorter than --pp-min-rows (1024) needs --pp-min-rows 1.
+    if (hybrid_model != nullptr) {
+      const r4dx::model::TpModel::HybridStats hs = hybrid_model->GetHybridStats();
+      std::printf("[stats] %s\n", hybrid_model->HybridStatsLine().c_str());
+      std::printf("[hybrid] %lld pipelined / %lld TP-prefill calls for %lld segment(s)\n", static_cast<long long>(hs.pipelined_calls),
+                  static_cast<long long>(hs.tp_prefill_calls), static_cast<long long>(segments_run));
+      if (hs.pipelined_calls < segments_run) {
+        std::fprintf(stderr,
+                     "FAIL: only %lld of %lld segment prefixes ran the pipelined prefill (a prefix below --pp-min-rows = %lld rows takes the TP=2 prefill; "
+                     "pass --pp-min-rows 1 for short corpus segments)\n",
+                     static_cast<long long>(hs.pipelined_calls), static_cast<long long>(segments_run),
+                     static_cast<long long>(hybrid_model->HybridMinRows()));
+        return 1;
+      }
+    }
 
     // The pass's own arithmetic invariant, always checked (it costs one extra reduction per row and
     // is the cheapest possible evidence that the dump is a log-probability distribution at all).

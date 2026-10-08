@@ -29,10 +29,25 @@
 //         stale-mirror the warm gather is skipped on a warm turn                                                  (G-H1, the logits)
 //         skip-tail    the DFlash tail is not injected (dflash load)                                              (drafter frontier + window check)
 //
+//   P4 additions (dflash load; the design's "DFlash warm-turn case" and "vision + DFlash case with an image straddling the tail window"):
+//     dflash/warm-dflash     call (1024 rows) -> 32 tokens decoded at TP=2 in --dflash 7 ROUNDS -> a 1500-row hybrid call (the warm gather with the drafters
+//                            holding decode-time state; the DFlash tail on top of it). Checked: G-H1 from the recorded pre-call state (verify phase, a TP=1
+//                            reference without an MTP head -- the dflash load has none), both drafters at the call's end with equal windows, the hybrid's
+//                            assembled TAIL digest (HybridTailDigest: stage X's columns + stage Y's) equal to the TP=1 reference's capture of the same warm call
+//                            (verify phase), and G-H2: the 16 plain + 16 --dflash 7 tokens decoded after the call equal those decoded from the reference's end
+//                            state (the decode phase, a plain TP=2 load, DebugImportFullState of the file the verify phase wrote).
+//     dflash/image-straddle  a cold PrefillMultimodal call: 1000 text rows, a 256-token synthetic image (the vision tower's output replaced by deterministic bf16
+//                            rows, as test_hybrid_emulate_identity does), 1900 text rows; the 2048-row tail window starts INSIDE the image (rows 1000..1255), so the
+//                            tail's temporal rope rows must carry the image's mrope positions. G-H1 vs the TP=1 reference (PrefillMultimodal), the assembled tail's
+//                            features vs the reference capture, the drafters' frontier and windows, and G-H2 (the mrope delta rides the adoption; the plain and
+//                            --dflash 7 decode must equal those from the reference image). The rope rows themselves are test_hybrid_emulate_identity Gate C's NC11.
+//                            Needs the production container's vision config (skipped without it); the vision tower is loaded for this scenario.
+//   Phases: ref -> hybrid -> verify -> decode (the last one only for the dflash warm records: a plain --tp 2 load decoding from the reference's end state).
+//
 // Needs BOTH cards visible (CMake sets HIP_VISIBLE_DEVICES=0,1, the natural order = unset): rank 0 = the last visible ordinal = the headless card (the
 // reference also lives there), rank 1 = ordinal 0 = the desktop card. ~14 GiB per card for the hybrid at 64 layers; the reference alone ~16 GiB on one.
-// Usage: test_hybrid_real_identity [--phase all|ref|hybrid|verify] [--dir D] [--max-ctx N] [--hybrid-ctx N] [--keep]; R4DX_TEST_ONLY=<substring> filters
-// scenarios ("mtp/", "mtp/warm", "dflash/", ...). Output "[PASS] ..." / "FAIL ..." and "test_hybrid_real_identity: PASS (N configurations)"; exit 0 when
+// Usage: test_hybrid_real_identity [--phase all|ref|hybrid|verify|decode] [--dir D] [--max-ctx N] [--hybrid-ctx N] [--keep]; R4DX_TEST_ONLY=<substring> filters
+// scenarios ("mtp/", "mtp/warm", "dflash/", "dflash/warm-dflash", "dflash/image", ...). Output "[PASS] ..." / "FAIL ..." and "test_hybrid_real_identity: PASS (N configurations)"; exit 0 when
 // every check passed, 1 on a failure, 77 with fewer than two devices or a missing container. Written, NOT run by its author (CPU-only session).
 #include <hip/hip_runtime.h>
 
@@ -59,6 +74,8 @@
 #include "live_digest.h"
 #include "live_state.h"
 #include "model.h"
+#include "r4dx/core/device_buffer.hpp"
+#include "r4dx/core/dtype.hpp"
 #include "r4dx/core/pinned_buffer.hpp"
 #include "reshard_plan.h"
 #include "test_common.h"
@@ -94,6 +111,9 @@ bool Only(const std::string& name) {
   return name.find(only) != std::string::npos;
 }
 
+// The image-straddle scenario (dflash load) needs the vision config on the reference and on the ranks (and loads the tower): only when it is selected.
+bool ImageWanted() { return Only("dflash/image-straddle"); }
+
 class Group {
  public:
   explicit Group(std::string name) : name_(std::move(name)) {}
@@ -127,6 +147,55 @@ std::vector<int32_t> Tokens(int n, int salt) {
   for (int i = 0; i < n; ++i) v[static_cast<size_t>(i)] = 100 + (i * 41 + salt * 977) % 5000;
   return v;
 }
+// ---- synthetic image rows (test_hybrid_emulate_identity's: the vision tower's output replaced by deterministic bf16 rows) --------------
+// A cold image call: `before` text rows, an image of side x side merged tokens, `after` text rows.
+struct ImageSpec {
+  int before = 0, after = 0, side = 0, salt = 1;
+  int64_t ImageTokens() const { return static_cast<int64_t>(side) * side; }
+  int64_t Total() const { return before + ImageTokens() + after; }
+};
+// The first call of the dflash load's image scenario: the image's rows 1000..1255 contain the tail window's start (n = 3156, n - 2048 = 1108, on the
+// call's 64-row grid 1088).
+constexpr ImageSpec kStraddle{1000, 1900, 16, 1};
+constexpr const char* kStraddleId = "img-straddle";
+
+struct ImageCallData {
+  std::vector<int32_t> ids;
+  std::vector<r4dx::model::ImageSpan> spans;
+  std::vector<uint16_t> host;               // [tokens][hidden] bf16
+  r4dx::core::DeviceBuffer<uint16_t> dev;   // the same rows on the calling thread's device (a TP=1 Model's spans; empty for the TpModel's)
+};
+
+// `on_host`: the rows stay in `host` (TpModel::PrefillMultimodal copies them under its own lock); else they are uploaded to `dev` for a TP=1 Model.
+ImageCallData BuildImageCall(const ImageSpec& s, int64_t image_id, int64_t merge, int64_t hidden, bool on_host) {
+  ImageCallData d;
+  const int64_t tokens = s.ImageTokens();
+  d.host.resize(static_cast<size_t>(tokens * hidden));
+  uint32_t x = 12345u + static_cast<uint32_t>(s.salt);
+  for (uint16_t& v : d.host) {
+    x = x * 1664525u + 1013904223u;
+    v = r4dx::core::FloatToBf16((static_cast<float>(x >> 9) / static_cast<float>(1u << 23) - 0.5f) * 0.5f);
+  }
+  if (!on_host) {
+    d.dev = r4dx::core::DeviceBuffer<uint16_t>(d.host.size());
+    d.dev.CopyFromHost(d.host);
+  }
+  const std::vector<int32_t> a = Tokens(s.before, s.salt + 3), b = Tokens(s.after, s.salt + 5);
+  d.ids.assign(a.begin(), a.end());
+  r4dx::model::ImageSpan sp;
+  sp.offset = static_cast<int64_t>(d.ids.size());
+  sp.tokens = tokens;
+  sp.grid.t = 1;
+  sp.grid.h = static_cast<int64_t>(s.side) * merge;
+  sp.grid.w = static_cast<int64_t>(s.side) * merge;
+  sp.embeds = on_host ? d.host.data() : d.dev.data();
+  sp.embeds_on_host = on_host;
+  d.spans.push_back(sp);
+  d.ids.insert(d.ids.end(), static_cast<size_t>(tokens), static_cast<int32_t>(image_id));
+  d.ids.insert(d.ids.end(), b.begin(), b.end());
+  return d;
+}
+
 std::string Hex(uint64_t v) {
   char b[24];
   std::snprintf(b, sizeof b, "%016llx", static_cast<unsigned long long>(v));
@@ -163,6 +232,13 @@ struct Rec {
   uint64_t logits = 0;
   int32_t first = 0;
   hybrid::DigestList dig[2];
+  // ---- dflash-load extras (saved on an "ext" / "tok" line after the record, absent for the others) ----
+  int img_before = 0, img_after = 0, img_side = 0, img_salt = 1;  // an image call (img_side > 0): the ImageSpec the hybrid prefilled
+  int64_t tail_rows = 0;      // the hybrid's assembled DFlash tail, rows ...
+  uint64_t tail_digest = 0;   // ... and its FNV-1a (TpModel::HybridTailDigest), for the verify phase's TP=1 capture of the same call
+  std::vector<int32_t> tok[2];  // G-H2 of a warm record: the tokens decoded after the call at TP=2 (0: plain, 1: --dflash 7 rounds)
+  bool HasExt() const { return img_side > 0 || tail_rows > 0 || !tok[0].empty() || !tok[1].empty(); }
+  ImageSpec Image() const { return ImageSpec{img_before, img_after, img_side, img_salt}; }
 };
 
 std::vector<std::string> SplitTabs(const std::string& line) {
@@ -187,6 +263,13 @@ void SaveRecs(const std::string& path, const std::vector<Rec>& recs) {
       << (r.pipelined ? 1 : 0) << '\t' << r.pos << '\t' << Hex(r.logits) << '\t' << r.first << '\n';
     for (int k = 0; k < 2; ++k) {
       for (const auto& [name, v] : r.dig[k]) f << "dig\t" << k << '\t' << name << '\t' << Hex(v) << '\n';
+    }
+    if (r.HasExt()) f << "ext\t" << r.img_before << '\t' << r.img_after << '\t' << r.img_side << '\t' << r.img_salt << '\t' << r.tail_rows << '\t' << Hex(r.tail_digest) << '\n';
+    for (int mode = 0; mode < 2; ++mode) {
+      if (r.tok[mode].empty()) continue;
+      f << "tok\t" << mode;
+      for (const int32_t t : r.tok[mode]) f << '\t' << t;
+      f << '\n';
     }
   }
   f.flush();
@@ -218,6 +301,18 @@ std::vector<Rec> LoadRecs(const std::string& path) {
       const int k = std::stoi(p[1]);
       if (k < 0 || k > 1) throw std::runtime_error("bad rank in " + path);
       out.back().dig[k].emplace_back(p[2], std::stoull(p[3], nullptr, 16));
+    } else if (p[0] == "ext" && p.size() == 7 && !out.empty()) {
+      Rec& r = out.back();
+      r.img_before = std::stoi(p[1]);
+      r.img_after = std::stoi(p[2]);
+      r.img_side = std::stoi(p[3]);
+      r.img_salt = std::stoi(p[4]);
+      r.tail_rows = std::stoll(p[5]);
+      r.tail_digest = std::stoull(p[6], nullptr, 16);
+    } else if (p[0] == "tok" && p.size() >= 2 && !out.empty()) {
+      const int mode = std::stoi(p[1]);
+      if (mode < 0 || mode > 1) throw std::runtime_error("bad token mode in " + path);
+      for (size_t i = 2; i < p.size(); ++i) out.back().tok[mode].push_back(static_cast<int32_t>(std::stol(p[i])));
     } else {
       throw std::runtime_error("unreadable line in " + path + ": " + line);
     }
@@ -273,7 +368,7 @@ void CheckAgainst(Group& grp, const Rec& hyb, const Rec& ref, bool has_mtp) {
 // ======================================================================================================================================
 // The TP=1 reference
 // ======================================================================================================================================
-ModelOptions BaseOptions(const Opts& o, int64_t mtp_k, bool dflash) {
+ModelOptions BaseOptions(const Opts& o, int64_t mtp_k, bool dflash, bool vision = false) {
   ModelOptions mo;
   mo.container_path = ProductionTargetPath();
   mo.layout = r4dx::model::LayoutFromName(ProductionLayoutName());
@@ -283,16 +378,21 @@ ModelOptions BaseOptions(const Opts& o, int64_t mtp_k, bool dflash) {
     mo.dflash_container = ProductionDrafterPath();
     mo.dflash_draft_k = kDflashK;
   }
-  mo.vision = ModelOptions::VisionMode::kOff;
+  // kAuto: the tower is loaded (rank 0 / the reference) and every Model parses the vision geometry, which PrefillMultimodal's span validation needs
+  // (the image-straddle scenario); kOff otherwise, as before.
+  mo.vision = vision ? ModelOptions::VisionMode::kAuto : ModelOptions::VisionMode::kOff;
   return mo;
 }
 
 class RefRig {
  public:
-  explicit RefRig(const Opts& o) {
+  // `mtp_k`: the reference's MTP head (kMtpK for the mtp load's comparisons; 0 for the dflash load's warm calls, whose gathered pre-call state has no MTP KV);
+  // `vision`: parse the vision geometry (the image scenario).
+  explicit RefRig(const Opts& o, int64_t mtp_k = kMtpK, bool vision = false) {
     if (hipSetDevice(o.ref_device) != hipSuccess) throw std::runtime_error("hipSetDevice failed for the reference");
-    std::fprintf(stderr, "[hybrid-real] loading the TP=1 reference (64 layers, MTP head) on HIP device %d\n", o.ref_device);
-    m_ = std::make_unique<Model>(Model::Load(BaseOptions(o, kMtpK, false)));
+    std::fprintf(stderr, "[hybrid-real] loading the TP=1 reference (64 layers, %s%s) on HIP device %d\n", mtp_k > 0 ? "MTP head" : "no MTP head",
+                 vision ? ", vision" : "", o.ref_device);
+    m_ = std::make_unique<Model>(Model::Load(BaseOptions(o, mtp_k, false, vision)));
     r4dx::model::ModelConfig gc = m_->GlobalConfig();
     gc.num_hidden_layers = m_->GetContainer().NumLoadedLayers();
     gc.layer_types.resize(static_cast<size_t>(gc.num_hidden_layers));
@@ -325,17 +425,71 @@ class RefRig {
   // bf16 block. The reference for the hybrid's assembled tail (stage X's carried columns + stage Y's), which the drafters are fed from. `targets`:
   // the drafter's target layers. Run after the cold jobs (it attaches the feature capture to the reference Model).
   uint64_t TailDigest(int rows, int salt, const std::vector<int64_t>& targets) {
-    if (!capture_attached_) {
-      m_->AttachDflashFeatureCapture(targets);
-      capture_attached_ = true;
-    }
-    const int64_t start = hybrid::DflashTailStart(0, rows), n_tail = rows - start, cols = m_->DflashFeatureCols();
-    r4dx::core::PinnedBuffer<uint16_t> buf(static_cast<size_t>(hybrid::kTailCapacityRows * cols), hipHostMallocPortable);
+    EnsureCapture(targets);
     m_->Reset();
     m_->DebugZeroKvState();
-    m_->StageArmDflashTail(buf.data(), hybrid::kTailCapacityRows, start, rows);
+    return CaptureTail(0, rows, [&] { (void)m_->Prefill(Tokens(rows, salt)); }, nullptr);
+  }
+
+  // ---- P4: the same for an image call and for a warm call -----------------------------------------------------------------------------------
+  bool VisionSplice() const { return m_->VisionSpliceEnabled(); }
+
+  // A fresh image conversation (PrefillMultimodal with the synthetic rows on the device). `full_state_file` (may be empty): the end state for G-H2.
+  Rec FreshImage(const std::string& id, const ImageSpec& s, const std::string& full_state_file) {
+    const ImageCallData d = ImageData(s);
+    m_->Reset();
+    m_->DebugZeroKvState();
+    Rec r = Finish(id, m_->PrefillMultimodal(d.ids, d.spans));
+    r.rows = static_cast<int>(d.ids.size());
+    r.img_before = s.before;
+    r.img_after = s.after;
+    r.img_side = s.side;
+    r.img_salt = s.salt;
+    if (!full_state_file.empty()) m_->DebugExportFullState(full_state_file);
+    return r;
+  }
+  // The DFlash tail features of that call as the TP=1 run captures them (the reference of the hybrid's assembled tail).
+  uint64_t TailDigestImage(const ImageSpec& s, const std::vector<int64_t>& targets) {
+    EnsureCapture(targets);
+    const ImageCallData d = ImageData(s);
+    m_->Reset();
+    m_->DebugZeroKvState();
+    return CaptureTail(0, static_cast<int64_t>(d.ids.size()), [&] { (void)m_->PrefillMultimodal(d.ids, d.spans); }, nullptr);
+  }
+  // A recorded WARM dflash-load call from its gathered pre-call state, with the tail capture of that very prefill (digest and row count) and, when
+  // `end_state_file` is not empty, the reference's end state (DebugExportFullState) for the decode phase's G-H2.
+  Rec WarmTail(const Rec& hyb, const std::vector<int64_t>& targets, uint64_t* tail_digest, int64_t* tail_rows, const std::string& end_state_file) {
+    const hybrid::LiveState pre = hybrid::ReadLiveState(hyb.pre_file);
+    EnsureCapture(targets);
+    m_->Reset();
+    m_->DebugZeroKvState();
+    m_->DebugImportLiveState(pre);
+    std::vector<float> logits;
+    *tail_digest = CaptureTail(pre.scalars.pos, pre.scalars.pos + hyb.rows, [&] { logits = m_->Prefill(Tokens(hyb.rows, hyb.salt)); }, tail_rows);
+    Rec r = Finish(hyb.id, logits);
+    r.rows = hyb.rows;
+    r.salt = hyb.salt;
+    if (!end_state_file.empty()) m_->DebugExportFullState(end_state_file);
+    return r;
+  }
+
+ private:
+  ImageCallData ImageData(const ImageSpec& s) {
+    return BuildImageCall(s, m_->GetContainer().ImageTokenId(), m_->GetContainer().VisionCfg().spatial_merge_size, m_->Config().hidden_size, /*on_host=*/false);
+  }
+  void EnsureCapture(const std::vector<int64_t>& targets) {
+    if (capture_attached_) return;
+    m_->AttachDflashFeatureCapture(targets);
+    capture_attached_ = true;
+  }
+  // Arms the tail capture of the call [p0, n_end) (the call's own 64-row grid, hybrid::DflashTailStart), runs `prefill`, and returns the FNV-1a of the
+  // captured [tail rows][cols] bf16 block -- what stage Y's StageArmDflashTail captures. The caller has Reset() and loaded the pre-call state.
+  uint64_t CaptureTail(int64_t p0, int64_t n_end, const std::function<void()>& prefill, int64_t* rows_out) {
+    const int64_t start = hybrid::DflashTailStart(p0, n_end), n_tail = n_end - start, cols = m_->DflashFeatureCols();
+    r4dx::core::PinnedBuffer<uint16_t> buf(static_cast<size_t>(hybrid::kTailCapacityRows * cols), hipHostMallocPortable);
+    m_->StageArmDflashTail(buf.data(), hybrid::kTailCapacityRows, start, n_end);
     try {
-      (void)m_->Prefill(Tokens(rows, salt));
+      prefill();
     } catch (...) {
       try {
         (void)m_->StageDisarmDflashTail();
@@ -344,10 +498,9 @@ class RefRig {
       throw;
     }
     if (m_->StageDisarmDflashTail() != n_tail) throw std::runtime_error("the reference captured a different number of tail rows than the call's tail");
+    if (rows_out != nullptr) *rows_out = n_tail;
     return hybrid::FnvUpdate(hybrid::kFnvInit, buf.data(), static_cast<size_t>(n_tail * cols) * sizeof(uint16_t));
   }
-
- private:
   bool capture_attached_ = false;
   Rec Finish(const std::string& id, const std::vector<float>& logits) {
     const hybrid::LiveState st = m_->DebugExportLiveState();
@@ -378,7 +531,8 @@ int RunRefPhase(const Opts& o) {
   fs::create_directories(o.dir);
   std::vector<Rec> recs, tails;
   {
-    RefRig ref(o);
+    const bool image = ImageWanted() && FileExists(ProductionDrafterPath());  // the dflash load's image-straddle scenario
+    RefRig ref(o, kMtpK, image);
     for (const ColdJob& j : kColdJobs) {
       Rec r = ref.Fresh(j.id, j.rows, kColdSalt, j.full_state ? o.Path(std::string("ref_") + j.id + ".state") : std::string());
       grp.Ok(r.pos == j.rows, std::string(j.id) + ": the reference ended at position " + std::to_string(j.rows));
@@ -399,6 +553,25 @@ int RunRefPhase(const Opts& o) {
         tails.push_back(std::move(t));
       }
     }
+    // the image-straddle call: the reference's PrefillMultimodal (its logits, digests, end state for G-H2) and its tail features
+    if (image) {
+      if (!ref.VisionSplice()) {
+        std::fprintf(stderr, "[SKIP] ref/%s: the container has no vision config (no image rows can be spliced)\n", kStraddleId);
+      } else {
+        Rec r = ref.FreshImage(kStraddleId, kStraddle, o.Path(std::string("ref_") + kStraddleId + ".state"));
+        grp.Ok(r.pos == kStraddle.Total(), std::string(kStraddleId) + ": the reference ended at position " + std::to_string(kStraddle.Total()));
+        std::fprintf(stderr, "[hybrid-real] reference %s: %lld rows (image at %d..%lld), logits %s\n", kStraddleId, static_cast<long long>(kStraddle.Total()),
+                     kStraddle.before, static_cast<long long>(kStraddle.before + kStraddle.ImageTokens()), Hex(r.logits).c_str());
+        recs.push_back(std::move(r));
+        const std::vector<int64_t> targets = r4dx::model::DflashDraftWeights::Open(ProductionDrafterPath()).Config().target_layers;
+        Rec t;
+        t.id = std::string("tail_") + kStraddleId;
+        t.rows = static_cast<int>(kStraddle.Total());
+        t.logits = ref.TailDigestImage(kStraddle, targets);
+        std::fprintf(stderr, "[hybrid-real] reference DFlash tail %s: features %s\n", kStraddleId, Hex(t.logits).c_str());
+        tails.push_back(std::move(t));
+      }
+    }
   }  // the reference Model is freed here
   SaveRecs(o.Path("refs_cold.txt"), recs);
   SaveRecs(o.Path("refs_tail.txt"), tails);
@@ -412,6 +585,7 @@ int RunRefPhase(const Opts& o) {
 struct HCfg {
   std::string name;  // "mtp" / "dflash"
   bool dflash = false;
+  bool hybrid = true;  // false: a plain --tp 2 load of the same container (the decode phase: ranks only, decoding from a reference image)
 };
 
 class HybridRig {
@@ -424,7 +598,8 @@ class HybridRig {
   std::map<std::string, Rec> tail_refs;  // the TP=1 run's DFlash tail features (digest in .logits), by cold job id
 
   HybridRig(HCfg c, Opts opts) : cfg(std::move(c)), o(std::move(opts)) {
-    ModelOptions mo = BaseOptions(o, cfg.dflash ? 0 : kMtpK, cfg.dflash);
+    // The dflash load also loads the vision tower (rank 0) when the image-straddle scenario is selected.
+    ModelOptions mo = BaseOptions(o, cfg.dflash ? 0 : kMtpK, cfg.dflash, /*vision=*/cfg.dflash && cfg.hybrid && ImageWanted());
     mo.prompt_checkpoint = true;
     mo.pp = 2;  // --pp 2
     TpOptions tp;
@@ -435,9 +610,14 @@ class HybridRig {
     pp.min_rows_given = true;
     pp.hybrid = 1;
     pp.hybrid_ctx = o.hybrid_ctx;
-    std::fprintf(stderr, "[hybrid-real] %s: loading the two-GPU TpModel with the hybrid (64 layers)\n", cfg.name.c_str());
-    tpm = TpModel::Load(mo, tp, pp);
-    if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage: " + tpm->HybridRefusal() + " (lower --max-ctx / --hybrid-ctx or free VRAM)");
+    std::fprintf(stderr, "[hybrid-real] %s: loading the two-GPU TpModel %s (64 layers)\n", cfg.name.c_str(), cfg.hybrid ? "with the hybrid" : "(plain --tp 2, no hybrid)");
+    if (cfg.hybrid) {
+      tpm = TpModel::Load(mo, tp, pp);
+      if (!tpm->HybridEngaged()) throw std::runtime_error("the hybrid did not engage: " + tpm->HybridRefusal() + " (lower --max-ctx / --hybrid-ctx or free VRAM)");
+    } else {
+      mo.pp = 0;
+      tpm = TpModel::Load(mo, tp);
+    }
     if (cfg.dflash && !tpm->DflashEnabled()) throw std::runtime_error("the DFlash drafter did not load");
     r4dx::model::ModelConfig gc = tpm->Config();
     gc.num_hidden_layers = tpm->NumLoadedLayers();
@@ -474,13 +654,28 @@ class HybridRig {
   // ---- one TpModel::Prefill, recorded ---------------------------------------------------------------------------------------------------
   // `warm`: the ranks did TP-only work since the last pipelined call, so their gathered state is written to a file for the verify phase. `ref_key`: the
   // reference to compare with ("" = none). `expect`: -1 any route, 1 must be pipelined, 0 must be the TP prefill.
-  Rec Call(Group& grp, const std::string& id, int rows, int salt, const std::string& ref_key, bool warm, int expect, bool expect_mismatch = false) {
-    const std::vector<int32_t> ids = Tokens(rows, salt);
+  // `img` (P4): a cold PrefillMultimodal call with a synthetic image (`rows` and `salt` are then taken from it). On a dflash load the hybrid's assembled
+  // DFlash tail (rows and FNV-1a) of every pipelined call is recorded, for the verify phase's TP=1 capture of the same warm call.
+  Rec Call(Group& grp, const std::string& id, int rows, int salt, const std::string& ref_key, bool warm, int expect, bool expect_mismatch = false,
+           const ImageSpec* img = nullptr) {
+    ImageCallData img_data;
+    if (img != nullptr) {
+      img_data = BuildImageCall(*img, tpm->ImageTokenId(), tpm->VisionMergeSize(), tpm->Config().hidden_size, /*on_host=*/true);
+      rows = static_cast<int>(img_data.ids.size());
+      salt = img->salt;
+    }
+    const std::vector<int32_t> ids = img != nullptr ? img_data.ids : Tokens(rows, salt);
     Rec r;
     r.id = id;
     r.ref_key = ref_key;
     r.rows = rows;
     r.salt = salt;
+    if (img != nullptr) {
+      r.img_before = img->before;
+      r.img_after = img->after;
+      r.img_side = img->side;
+      r.img_salt = img->salt;
+    }
     r.expect_mismatch = expect_mismatch;
     const int64_t p0 = tpm->PositionCount();
     if (warm) {
@@ -492,7 +687,7 @@ class HybridRig {
       hybrid::WriteLiveState(r.pre_file, full);
     }
     const Stats before = tpm->GetHybridStats();
-    const std::vector<float> logits = tpm->Prefill(ids);
+    const std::vector<float> logits = img != nullptr ? tpm->PrefillMultimodal(ids, img_data.spans) : tpm->Prefill(ids);
     const Stats after = tpm->GetHybridStats();
     r.pipelined = after.pipelined_calls == before.pipelined_calls + 1;
     grp.Ok(r.pipelined || after.tp_prefill_calls == before.tp_prefill_calls + 1, id + ": the call is counted as pipelined or as a TP prefill");
@@ -504,6 +699,10 @@ class HybridRig {
     if (r.pipelined) {
       const std::vector<hybrid::DigestList> d = RankDigests();
       for (int k = 0; k < 2; ++k) r.dig[k] = DropPrefix(d[static_cast<size_t>(k)], "dflash.");
+      if (cfg.dflash) {
+        r.tail_rows = (p0 + rows) - hybrid::DflashTailStart(p0, p0 + rows);
+        r.tail_digest = tpm->HybridTailDigest(r.tail_rows);
+      }
     }
     if (r.pipelined && !ref_key.empty()) {
       const auto it = cold_refs.find(ref_key);
@@ -619,6 +818,17 @@ class HybridRig {
     }
     return tok;
   }
+  // --dflash 7 rounds at TP=2 (the drafters inject what they accept: the decode-time state a following warm call must continue from)
+  int32_t DecodeDflash(int32_t tok, int n) {
+    int got = 0;
+    while (got < n) {
+      int64_t walk = 0;
+      const std::vector<int32_t> round = tpm->DecodeStepDflashGreedy(tok, kDflashK, 0.0f, 0, &walk);
+      got += static_cast<int>(round.size());
+      tok = round.back();
+    }
+    return tok;
+  }
 
   // ---- scenarios ----------------------------------------------------------------------------------------------------------------------------------
   void Guard(const std::string& name, const std::function<void(Group&)>& body) {
@@ -711,6 +921,64 @@ class HybridRig {
       }
       (void)Call(grp, "checkpoint.b", 1500, 2, "checkpoint.b", true, 1);
       grp.Done("restore, then a warm hybrid call (verify phase)");
+    });
+  }
+
+  // P4, dflash load: a call, 32 tokens decoded at TP=2 in --dflash 7 rounds, then a 1500-row hybrid call -- the warm gather with the drafters holding
+  // decode-time state, and the DFlash tail on top of it. Here: the call is pipelined, both drafters sit at its end with equal windows, the tail rows were
+  // counted, and the 16 plain + 16 --dflash 7 tokens decoded after it are recorded for the decode phase (G-H2). The verify phase compares the call with a
+  // TP=1 reference loaded with the recorded pre-call state (G-H1, and the assembled tail's digest against the reference's capture of the same warm call).
+  void WarmDflash() {
+    Guard("warm-dflash", [&](Group& grp) {
+      tpm->Reset();
+      const Rec a = Call(grp, "warm-dflash.a", 1024, kColdSalt, "c1024", false, 1);
+      (void)DecodeDflash(a.first, kWarmDecode);
+      const Rec b = Call(grp, "warm-dflash.b", 1500, 2, "warm-dflash.b", true, 1);
+      const std::string why = DflashProblem();
+      grp.Ok(why.empty(), "warm-dflash.b: the DFlash tail left both drafters at the call's end with the same window: " + why);
+      grp.Ok(b.pipelined && b.tail_rows > 0 && b.tail_rows <= b.rows, "warm-dflash.b: the warm call's DFlash tail is " + std::to_string(b.tail_rows) + " rows of its " + std::to_string(b.rows));
+      grp.Ok(tpm->GetHybridStats().tail_rows > 0, "warm-dflash.b: the tail rows were counted");
+      const DecodeOutcome dec = DecodeModes(b.first, /*digests=*/false);  // G-H2's hybrid side; the reference side is the decode phase
+      recs.back().tok[0] = dec.tok[0];
+      recs.back().tok[1] = dec.tok[1];
+      grp.Done("1024 rows, " + std::to_string(kWarmDecode) + " tokens at TP=2 in --dflash 7 rounds, 1500 rows; G-H1, the tail digest (verify phase) and G-H2 (decode phase) follow");
+    });
+  }
+
+  // P4, dflash load: a cold PrefillMultimodal call whose image straddles the start of the 2048-row DFlash tail window (kStraddle: the image is rows
+  // 1000..1255 of 3156, the window starts at 1088): the tail's temporal rope rows must carry the image's mrope positions.
+  void ImageStraddle() {
+    Guard("image-straddle", [&](Group& grp) {
+      bool splice = false;
+      OnRanks([&](Model& m, int rank) {
+        if (rank == 0) splice = m.VisionSpliceEnabled();
+      }, /*read_only=*/true);
+      if (!splice) {
+        std::fprintf(stderr, "[SKIP] %s/image-straddle: the container has no vision config (no image rows can be spliced)\n", cfg.name.c_str());
+        return;
+      }
+      const auto ref = cold_refs.find(kStraddleId);
+      if (ref == cold_refs.end()) {
+        grp.Ok(false, "no TP=1 reference for the image call: run the ref phase with this scenario selected (R4DX_TEST_ONLY=dflash/image-straddle)");
+        return;
+      }
+      tpm->Reset();
+      const Rec r = Call(grp, std::string(cfg.name) + "." + kStraddleId, 0, 0, kStraddleId, false, 1, false, &kStraddle);
+      grp.Ok(r.rows == kStraddle.Total(), std::string(kStraddleId) + ": the call had " + std::to_string(kStraddle.Total()) + " rows");
+      const std::string why = DflashProblem();
+      grp.Ok(why.empty(), std::string(kStraddleId) + ": the DFlash tail left both drafters at the call's end with the same window: " + why);
+      const int64_t start = hybrid::DflashTailStart(0, r.rows);
+      grp.Ok(start > kStraddle.before && start < kStraddle.before + kStraddle.ImageTokens(),
+             std::string(kStraddleId) + ": the tail window starts at row " + std::to_string(start) + ", inside the image (rows " + std::to_string(kStraddle.before) + ".." +
+                 std::to_string(kStraddle.before + kStraddle.ImageTokens()) + ")");
+      const auto tr = tail_refs.find(kStraddleId);
+      grp.Ok(tr != tail_refs.end(), std::string(kStraddleId) + ": a TP=1 DFlash tail reference exists");
+      if (tr != tail_refs.end()) {
+        grp.Ok(r.tail_digest == tr->second.logits, std::string(kStraddleId) + ": the hybrid's assembled DFlash tail (" + std::to_string(r.tail_rows) + " rows) equals the TP=1 run's capture, got " +
+                                                       Hex(r.tail_digest) + " want " + Hex(tr->second.logits));
+      }
+      CheckDecode(grp, ref->second, o.Path(std::string("ref_") + kStraddleId + ".state"));
+      grp.Done("image rows 1000..1255, tail window from " + std::to_string(start) + "; G-H1, tail features, G-H2 (the mrope delta rides the adoption)");
     });
   }
 
@@ -822,6 +1090,8 @@ int RunHybridConfig(const Opts& o, const HCfg& cfg) {
   } else {
     rig->Cold("c2125", 2125, true);
     rig->Cold("c8145", 8145, false);
+    rig->WarmDflash();
+    rig->ImageStraddle();
   }
   rig->Controls();
   SaveRecs(o.Path("hyb_" + cfg.name + ".txt"), rig->recs);
@@ -832,7 +1102,38 @@ int RunHybridConfig(const Opts& o, const HCfg& cfg) {
 // ======================================================================================================================================
 // The verify phase: the TP=1 reference from each recorded warm call's pre-call state
 // ======================================================================================================================================
+// The dflash load's WARM calls (P4): a TP=1 reference WITHOUT an MTP head (the dflash ranks have none, so their gathered pre-call state carries no MTP KV)
+// loaded with the recorded pre-call state prefills the same tokens with the tail capture armed: G-H1 (logits, digests), the assembled DFlash tail's
+// digest against the hybrid's, and the reference's end state is written for the decode phase's G-H2.
+int RunVerifyDflash(const Opts& o) {
+  const std::string path = o.Path("hyb_dflash.txt");
+  if (!FileExists(path) || !FileExists(ProductionDrafterPath())) return 0;
+  std::vector<Rec> warm;
+  for (Rec& r : LoadRecs(path)) {
+    if (!r.pre_file.empty() && r.pipelined && Only("dflash/" + r.id)) warm.push_back(std::move(r));
+  }
+  if (warm.empty()) return 0;
+  const std::vector<int64_t> targets = r4dx::model::DflashDraftWeights::Open(ProductionDrafterPath()).Config().target_layers;
+  RefRig ref(o, /*mtp_k=*/0, /*vision=*/false);
+  for (const Rec& hyb : warm) {
+    Group grp("verify/dflash/" + hyb.id);
+    try {
+      uint64_t tail = 0;
+      int64_t tail_rows = 0;
+      const Rec want = ref.WarmTail(hyb, targets, &tail, &tail_rows, o.Path("ref_warm_" + SafeName(hyb.id) + ".state"));
+      CheckAgainst(grp, hyb, want, /*has_mtp=*/false);
+      grp.Ok(tail_rows == hyb.tail_rows, "the reference's tail of the warm call has " + std::to_string(tail_rows) + " rows, the hybrid's " + std::to_string(hyb.tail_rows));
+      grp.Ok(tail == hyb.tail_digest, "the hybrid's assembled DFlash tail equals the TP=1 capture of the same warm call, got " + Hex(hyb.tail_digest) + " want " + Hex(tail));
+      grp.Done("G-H1 and the DFlash tail digest from the recorded warm pre-call state; the reference's end state is in " + o.dir + " for the decode phase");
+    } catch (const std::exception& e) {
+      grp.Ok(false, std::string("uncaught exception: ") + e.what());
+    }
+  }
+  return 0;
+}
+
 int RunVerifyPhase(const Opts& o) {
+  RunVerifyDflash(o);
   const std::string path = o.Path("hyb_mtp.txt");
   if (!FileExists(path)) {
     std::fprintf(stderr, "[hybrid-real] verify: %s not found (the hybrid phase did not run for the --mtp load): nothing to verify\n", path.c_str());
@@ -850,6 +1151,57 @@ int RunVerifyPhase(const Opts& o) {
       const Rec want = ref.Warm(hyb);
       CheckAgainst(grp, hyb, want, /*has_mtp=*/true);
       grp.Done(hyb.expect_mismatch ? "negative control detected" : "G-H1 from the recorded warm pre-call state");
+    } catch (const std::exception& e) {
+      grp.Ok(false, std::string("uncaught exception: ") + e.what());
+    }
+  }
+  return 0;
+}
+
+// ======================================================================================================================================
+// The decode phase (P4): G-H2 of the dflash warm records. A plain --tp 2 load (ranks only) is loaded with the reference's END state of the warm call
+// (the file the verify phase wrote) and decodes; its tokens must equal those the hybrid's ranks decoded after the call itself (recorded in the hybrid phase).
+// ======================================================================================================================================
+int RunDecodePhase(const Opts& o) {
+  const std::string path = o.Path("hyb_dflash.txt");
+  if (!FileExists(path) || !FileExists(ProductionDrafterPath())) return 0;
+  std::vector<Rec> warm;
+  for (Rec& r : LoadRecs(path)) {
+    if (!r.pre_file.empty() && r.pipelined && !r.tok[0].empty() && Only("dflash/" + r.id)) warm.push_back(std::move(r));
+  }
+  if (warm.empty()) return 0;
+  std::unique_ptr<HybridRig> rig;
+  try {
+    HCfg cfg;
+    cfg.name = "dflash";
+    cfg.dflash = true;
+    cfg.hybrid = false;
+    rig = std::make_unique<HybridRig>(cfg, o);
+  } catch (const std::exception& e) {
+    ++g_fails;
+    std::fprintf(stderr, "FAIL decode/dflash: the plain --tp 2 rig did not load: %s\n", e.what());
+    return 1;
+  }
+  for (const Rec& hyb : warm) {
+    Group grp("decode/dflash/" + hyb.id);
+    try {
+      const std::string ref_state = o.Path("ref_warm_" + SafeName(hyb.id) + ".state");
+      if (!FileExists(ref_state)) {
+        grp.Ok(false, ref_state + " not found (run the verify phase first)");
+        continue;
+      }
+      rig->ImportReference(ref_state);
+      const HybridRig::DecodeOutcome w = rig->DecodeModes(hyb.first, /*digests=*/false);
+      for (int mode = 0; mode < 2; ++mode) {
+        const std::string name = mode == 0 ? "plain" : "--dflash 7";
+        const size_t n = static_cast<size_t>(kDecodeTokens);
+        const bool enough = hyb.tok[mode].size() >= n && w.tok[mode].size() >= n;
+        grp.Ok(enough, "G-H2 " + name + ": both sides decoded " + std::to_string(n) + " tokens (hybrid " + std::to_string(hyb.tok[mode].size()) + ", reference image " +
+                           std::to_string(w.tok[mode].size()) + ")");
+        grp.Ok(enough && std::equal(hyb.tok[mode].begin(), hyb.tok[mode].begin() + static_cast<std::ptrdiff_t>(n), w.tok[mode].begin()),
+               "G-H2 " + name + ": the first " + std::to_string(n) + " tokens decoded at TP=2 after the WARM hybrid call equal those decoded from the reference's end state");
+      }
+      grp.Done("G-H2 plain + --dflash 7 after a warm hybrid call that followed a TP=2 DFlash decode");
     } catch (const std::exception& e) {
       grp.Ok(false, std::string("uncaught exception: ") + e.what());
     }
@@ -888,8 +1240,8 @@ static int RunTest(int argc, char** argv) {
       throw std::invalid_argument("unknown argument " + a);
     }
   }
-  if (o.phase != "all" && o.phase != "ref" && o.phase != "hybrid" && o.phase != "verify") {
-    throw std::invalid_argument("--phase must be all, ref, hybrid or verify");
+  if (o.phase != "all" && o.phase != "ref" && o.phase != "hybrid" && o.phase != "verify" && o.phase != "decode") {
+    throw std::invalid_argument("--phase must be all, ref, hybrid, verify or decode");
   }
   if (o.dir.empty()) o.dir = (fs::temp_directory_path() / "r4dx_hybrid_real_identity").string();
   int devices = 0;
@@ -913,12 +1265,13 @@ static int RunTest(int argc, char** argv) {
     }
   }
   if (all || o.phase == "verify") RunVerifyPhase(o);
+  if (all || o.phase == "decode") RunDecodePhase(o);
   if (all && !o.keep && g_fails == 0) RemoveStateFiles(o);
   if (g_fails != 0) {
     std::fprintf(stderr, "test_hybrid_real_identity: %d FAILED\n", g_fails);
     return 1;
   }
-  if (g_configs == 0 && o.phase != "ref" && o.phase != "verify") {
+  if (g_configs == 0 && o.phase != "ref" && o.phase != "verify" && o.phase != "decode") {
     std::fprintf(stderr, "[SKIP] no hybrid configuration ran (R4DX_TEST_ONLY filtered everything out)\n");
     return kSkipReturnCode;
   }

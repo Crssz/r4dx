@@ -1401,6 +1401,17 @@ void Engine::RunRequest(PendingRequest& req) {
                     static_cast<double>(generated_tokens.size()) / static_cast<double>(dflash_rounds));
     }
     LogLine(opts_.log_level, "info", buf);
+    // Hybrid mode (--tp 2 --pp 2, docs/pp-tp2-hybrid.md): the pipelined prefill's cumulative counters after this request -- r4dx-cli --stats'
+    // `hybrid:` line, one extra line, only when the hybrid is engaged (tools/server/smoke.ps1 -Pp 2 parses it). It carries the request id
+    // as a SUFFIX without a colon, so it is never mistaken for the `request <id>:` line above. Caught like the debug line below.
+    if (tp_model_ != nullptr) {
+      try {
+        const std::string hybrid_line = tp_model_->HybridStatsLine();
+        if (!hybrid_line.empty()) LogLine(opts_.log_level, "info", "[stats] " + hybrid_line + " [request " + req.request_id + "]");
+      } catch (const std::exception& e) {
+        LogLine(opts_.log_level, "info", "request " + req.request_id + ": hybrid stats unavailable: " + e.what());
+      }
+    }
     // r4dx-cli --stats' `tp:` line (docs/tp.md 9.1, Appendix B N59), per request at debug level only:
     // it is one short host command on each rank thread. Caught here: the sink is already done, so a
     // failure must not reach the catch below (which would report the finished request a second time).

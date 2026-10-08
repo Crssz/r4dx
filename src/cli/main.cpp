@@ -512,6 +512,7 @@ int RunMain(int argc, char** argv) {
   // card next to the decode Model; decode is unchanged. LoadTextModel reads ModelOptions::pp (-1 follows R4DX_PP).
   opts.pp = args.pp == 2 ? 2 : (args.pp == 1 ? 0 : -1);
   r4dx::model::PpOptions ppo;
+  ppo.devices = args.pp_devices;
   ppo.split = args.pp_split;
   if (args.pp_min_rows > 0) ppo.min_rows = args.pp_min_rows;
   ppo.verify = args.pp_verify;
@@ -535,7 +536,17 @@ int RunMain(int argc, char** argv) {
   };
 
   if (args.stats) {
-    if (args.tp == 1) {
+    if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) != nullptr) {
+      // --pp 2: the pre-load reading was taken on the process default device, which is not the decode card here, so there is no
+      // single before/after delta; the per-stage VRAM follows (the load log has printed the placement).
+      std::fprintf(stderr, "[stats] container load: %.2fs (--pp 2)\n", Seconds(load_t0, load_t1));
+      for (const r4dx::model::VramReport& r : model->Vram()) {
+        std::fprintf(stderr,
+                     "[stats] pp stage %c (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; this process's "
+                     "buffers %.2f GiB\n",
+                     r.rank == 0 ? 'B' : 'A', r.device, r.used_gib, r.free_gib, r.total_gib, r.buffers_gib);
+      }
+    } else if (args.tp == 1) {
       const double vram_after = VramUsedGiB();
       std::fprintf(stderr, "[stats] container load: %.2fs, VRAM used: %.2f GiB (delta %.2f GiB)\n",
                    Seconds(load_t0, load_t1), vram_after, vram_after - vram_before);

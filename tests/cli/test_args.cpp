@@ -535,7 +535,25 @@ void TestTpFlags() {
                                           "--pp", "2", "--pp-split", "auto"};
     auto argv3 = ToArgv(storage3);
     CHECK(r4dx::cli::ParseArgs(static_cast<int>(argv3.size()), argv3.data()).pp_split == 0);
+    CHECK(a.pp_devices.empty() && b.pp_devices.empty());  // auto placement unless asked for
+    // --pp-devices B,A (HIP ordinals: stage B = decode card, stage A).
+    std::vector<std::string> storage4 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi",
+                                          "--pp", "2", "--pp-devices", "1,0"};
+    auto argv4 = ToArgv(storage4);
+    const auto c = r4dx::cli::ParseArgs(static_cast<int>(argv4.size()), argv4.data());
+    CHECK(c.pp == 2 && c.pp_devices == std::vector<int>({1, 0}) && c.pp_options_given);
+    std::vector<std::string> storage5 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi",
+                                          "--pp", "2", "--pp-devices", "auto"};
+    auto argv5 = ToArgv(storage5);
+    CHECK(r4dx::cli::ParseArgs(static_cast<int>(argv5.size()), argv5.data()).pp_devices.empty());
   }
+  CHECK(TpThrows({"--pp-devices", "1,0"}));                          // needs --pp 2
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1"}));               // exactly two
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,0,2"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,1"}));             // different cards
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,x"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "-1,0"}));
+  CHECK(!TpThrows({"--pp", "2", "--pp-devices", "0,1"}));
   CHECK(!TpThrows({"--pp", "2"}));
   CHECK(!TpThrows({"--pp", "1"}));
   CHECK(!TpThrows({"--pp", "2", "--dflash", "d.r4dx", "--dflash-k", "7", "--mtp", "0"}));

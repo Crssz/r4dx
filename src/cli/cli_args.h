@@ -235,9 +235,13 @@ struct CliArgs {
   bool tp_options_given = false;
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2) ---------------------------------------
   // --pp N: -1 (not given) follows R4DX_PP (unset = off); 1 forces it off; 2 runs prompt prefill as a two-stage pipeline
-  // (layers [0, k) on the desktop card, the rest on the decode card; HIP_VISIBLE_DEVICES=1,0 required), decode unchanged
-  // (r4dx::model::PpModel). Exclusive with --tp 2. The knobs below need --pp 2; -1 / 0 keep PpOptions' own defaults.
+  // (layers [0, k) on the desktop card, the rest on the decode card; both cards must be visible -- HIP_VISIBLE_DEVICES
+  // unset), decode unchanged (r4dx::model::PpModel). Exclusive with --tp 2. The knobs below need --pp 2; -1 / 0 keep
+  // PpOptions' own defaults.
   int pp = -1;
+  // --pp-devices B,A: process-visible HIP ordinals of stage B (the decode card) and stage A; empty = auto (R4DX_PP_DEVICES,
+  // else B = the last visible ordinal = physical device 1 with HIP_VISIBLE_DEVICES unset, A = the one before it).
+  std::vector<int> pp_devices;
   int pp_split = 0;             // --pp-split N|auto: stage A's layer count k (auto = 33, 35 with --dflash)
   int pp_min_rows = -1;         // --pp-min-rows N: prefill calls shorter than this run on the decode card alone (default 1024)
   bool pp_verify = false;       // --pp-verify: digest both stages' live state after every hand-off (slow; also R4DX_PP_VERIFY=1)
@@ -267,8 +271,36 @@ inline std::string CliUsageText(const char* argv0) {
          "[--dump-token-ids <tokens.json>] [--layers N] "
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
-         "[--tp-max-inflight K] [--pp {1|2}] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
+         "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
          "[--pp-submit-layers N] [--pp-max-inflight K]";
+}
+
+// --pp-devices: "auto" (or "") -> empty (auto placement); "B,A" -> exactly two different ordinals (stage B = decode card,
+// stage A). src/model/pp_sync.h's pp::ParseDevicePair is the same rule, which this HIP-free header does not include.
+inline std::vector<int> ParsePpDevices(const std::string& value) {
+  std::vector<int> out;
+  if (value.empty() || value == "auto") return out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t comma = value.find(',', start);
+    const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    int d = 0;
+    try {
+      size_t used = 0;
+      d = std::stoi(item, &used);
+      if (used != item.size()) throw std::invalid_argument(item);
+    } catch (const std::exception&) {
+      throw CliUsageError("--pp-devices expects 'auto' or 'B,A' (two HIP ordinals: stage B = decode card, stage A), got '" +
+                          value + "'");
+    }
+    if (d < 0) throw CliUsageError("--pp-devices ordinals must be >= 0, got '" + value + "'");
+    out.push_back(d);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (out.size() != 2) throw CliUsageError("--pp-devices takes exactly two ordinals (stage B, stage A), got '" + value + "'");
+  if (out[0] == out[1]) throw CliUsageError("--pp-devices needs two different ordinals, got '" + value + "'");
+  return out;
 }
 
 // "auto" (or "") -> empty (docs/tp.md 9.2 auto); "a" or "a,b" -> the ordinals.
@@ -384,6 +416,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--tp-submit-layers") { a.tp_submit_layers = ParseInt("--tp-submit-layers", NextCliArg(argc, argv, i, "--tp-submit-layers")); a.tp_options_given = true; tp_submit_given = true; }
     else if (arg == "--tp-max-inflight") { a.tp_max_inflight = ParseInt("--tp-max-inflight", NextCliArg(argc, argv, i, "--tp-max-inflight")); a.tp_options_given = true; tp_inflight_given = true; }
     else if (arg == "--pp") a.pp = ParseInt("--pp", NextCliArg(argc, argv, i, "--pp"));
+    else if (arg == "--pp-devices") { a.pp_devices = ParsePpDevices(NextCliArg(argc, argv, i, "--pp-devices")); a.pp_options_given = true; }
     else if (arg == "--pp-split") {
       const std::string v = NextCliArg(argc, argv, i, "--pp-split");
       a.pp_split = v == "auto" ? 0 : ParseInt("--pp-split", v);
@@ -502,7 +535,7 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2) -----------------------------------
   if (a.pp != -1 && a.pp != 1 && a.pp != 2) throw CliUsageError("--pp must be 1 or 2");
   if (a.pp != 2 && a.pp_options_given) {
-    throw CliUsageError("--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
+    throw CliUsageError("--pp-devices/--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
   }
   if (a.pp == 2) {
     if (a.tp != 1) throw CliUsageError("--pp 2 and --tp 2 are mutually exclusive");

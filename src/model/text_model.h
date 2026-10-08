@@ -73,9 +73,13 @@ struct TpOptions {
 };
 
 // The `--pp*` knobs (docs/pp-prefill.md Phase 2). Whether the pipeline is on at all is ModelOptions::pp (--pp 2, R4DX_PP);
-// these only tune it. Stage A (layers [0, k) + embedding) runs on HIP ordinal `stage_a_device` -- the desktop card, with
-// HIP_VISIBLE_DEVICES=1,0 -- and stage B (the full decode Model) on ordinal 0.
+// these only tune it. Stage A (layers [0, k) + embedding) runs on the desktop card and stage B (the full decode Model) on
+// the headless card; `devices` names them by process-visible HIP ordinal (pp::ResolvePlacement, pp_sync.h).
 struct PpOptions {
+  // {stage B, stage A} ordinals (--pp-devices B,A). Empty = R4DX_PP_DEVICES if set, else auto: B on the last visible
+  // ordinal, A on the one before it (with HIP_VISIBLE_DEVICES unset: B = ordinal 1 = physical device 1 = the headless card
+  // TP=1 runs on, A = ordinal 0 = the desktop card). HIP_VISIBLE_DEVICES need not be set; it must expose both cards.
+  std::vector<int> devices;
   int split = 0;           // k: 0 = auto (33, or 35 with a DFlash drafter; both keep 8 attention layers per stage)
   int reserve_split = 0;   // stage A is loaded for splits up to this (0 = split); tests move k with PpModel::SetSplit
   int min_rows = 1024;     // a Prefill call with fewer rows runs on the decode Model alone (the fill and the sync-back would not pay)
@@ -84,7 +88,6 @@ struct PpOptions {
   int max_inflight = 1;    // ... and the number of units it keeps queued, [0, 64]
   int slots = 3;           // the hand-over ring, [2, 8]
   int timeout_ms = 30000;  // bound of every wait between the stages
-  int stage_a_device = 1;  // process-visible HIP ordinal of stage A
 };
 
 // One rank's device memory, as hipMemGetInfo reports it for that rank's device (device-wide: other

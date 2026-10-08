@@ -557,7 +557,17 @@ void TestTpFlags() {
     CHECK(b.pp == 2 && b.pp_split == 35 && b.pp_min_rows == 512 && b.pp_verify && b.pp_submit_layers == 0 &&
           b.pp_max_inflight == 2 && b.pp_options_given);
     CHECK(parse({"--pp", "2", "--pp-split", "auto"}).pp_split == 0);
+    CHECK(a.pp_devices.empty() && b.pp_devices.empty());  // auto placement unless asked for
+    CHECK(parse({"--pp", "2", "--pp-devices", "1,0"}).pp_devices == std::vector<int>({1, 0}));
+    CHECK(parse({"--pp", "2", "--pp-devices", "0,1"}).pp_devices == std::vector<int>({0, 1}));
+    CHECK(parse({"--pp", "2", "--pp-devices", "auto"}).pp_devices.empty());
   }
+  CHECK(TpThrows({"--pp-devices", "1,0"}));  // needs --pp 2
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,0,2"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,1"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,x"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "-1,0"}));
   CHECK(!TpThrows({"--pp", "2"}));
   CHECK(!TpThrows({"--pp", "1"}));
   CHECK(!TpThrows({"--pp", "2", "--dflash", "d.r4dx", "--dflash-k", "7"}));

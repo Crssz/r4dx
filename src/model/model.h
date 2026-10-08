@@ -222,7 +222,8 @@ struct ModelOptions {
   int prefill_int8_tp2 = -1;
   // Pipeline-parallel prefill (docs/pp-prefill.md, Phase 2; --pp 2): -1 (default) follows the environment (R4DX_PP: unset /
   // 0 / off = off, the default; 1 / on / 2 = on), 0 forces it off, 2 forces it on. Read by LoadTextModel, which then builds a
-  // PpModel (a half-weight stage A on HIP ordinal 1 + this full Model on ordinal 0, decode unchanged); Model::Load itself
+  // PpModel (a half-weight stage A on the desktop card + this full Model on the headless one, decode unchanged; the HIP
+  // ordinals are PpOptions::devices / R4DX_PP_DEVICES, default B = the last visible ordinal); Model::Load itself
   // ignores it. The knobs (split, min rows, ...) are PpOptions (text_model.h).
   int pp = -1;
   // Pipeline-parallel prefill, emulated on this device (docs/pp-prefill.md; Model::SetPpEmulate): -1 (default)

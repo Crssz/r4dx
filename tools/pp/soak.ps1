@@ -6,8 +6,9 @@
 .DESCRIPTION
   Runs build\<preset>\tests\model\tool_pp_soak.exe with EVERY argument given to this script passed through unchanged (see
   that tool's header for its options; --json is required) through tools\tp\tdr_watch.psm1's Invoke-TdrWatched with
-  HIP_VISIBLE_DEVICES=1,0 (ordinal 0 = the headless decode card = stage B, ordinal 1 = the desktop card = stage A; restored
-  afterwards): the r4dx-server pre-flight, tdr_check.ps1 -Since <start> every 20 s WHILE the soak runs -- the first TDR
+  HIP_VISIBLE_DEVICES unset (both cards; PpModel puts stage B = decode on the last visible ordinal = physical device 1, the
+  headless card, and stage A on ordinal 0, the desktop card; R4DX_PP_DEVICES=B,A overrides; restored afterwards): the
+  r4dx-server pre-flight, tdr_check.ps1 -Since <start> every 20 s WHILE the soak runs -- the first TDR
   stops the soak at once, it is never retried (docs/tp.md Appendix B N44, N64) -- then a 30 s wait and a final TDR check,
   and a scan of the log for HIP error 719 (a suspected TDR).
 
@@ -43,7 +44,7 @@ if (-not $json) { throw "soak.ps1: --json <log.jsonl> is required (the G2c verdi
 $JsonAbs = if ([System.IO.Path]::IsPathRooted($json)) { $json } else { Join-Path $Root $json }
 
 $r = Invoke-TdrWatched -Exe $Exe -ToolArgs $ToolArgs -WorkingDirectory $Root -JsonLog $JsonAbs -JsonAppends `
-                       -Label 'pp/soak.ps1' -HipVisibleDevices '1,0'
+                       -Label 'pp/soak.ps1'
 
 $fail = New-Object System.Collections.Generic.List[string]
 if ($r.Tdr) { $fail.Add("a TDR since the start (the soak was stopped: $($r.Stopped))") }

@@ -85,9 +85,9 @@ function Invoke-TdrWatched {
         # Test hook: the start of the TDR window (default: the run's start). An earlier time makes an
         # old, already logged TDR trip the watch, which exercises the stop path without a GPU.
         [datetime]$CheckSince,
-        # The tensor-parallel tools run with HIP_VISIBLE_DEVICES unset (rank 0 = device 1, rank 1 = device 0). The
-        # pipeline-parallel tools (tools\pp\soak.ps1) need '1,0': ordinal 0 = the headless decode card, ordinal 1 = the
-        # desktop card (docs/pp-prefill.md 1.2). Empty (the default) keeps the unset behaviour.
+        # The tensor-parallel and pipeline-parallel tools run with HIP_VISIBLE_DEVICES unset (TP: rank 0 = device 1, rank 1 =
+        # device 0; PP: PpModel places stage B = decode on the last visible ordinal = device 1, docs/pp-prefill.md 1.2).
+        # Empty (the default) keeps the unset behaviour.
         [string]$HipVisibleDevices = ''
     )
     if (Get-Process r4dx-server -ErrorAction SilentlyContinue) {

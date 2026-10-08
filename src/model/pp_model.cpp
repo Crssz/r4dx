@@ -108,38 +108,51 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
   if (opts.pp_emulate_split > 0) {
     throw std::invalid_argument("PpModel::Load: --pp 2 and the PP-emulate mode (R4DX_PP_EMULATE) are mutually exclusive");
   }
-  // Stage B (decode) must be process ordinal 0 -- the ordinal every existing code path and every thread starts on -- and be
-  // the physical headless card: HIP_VISIBLE_DEVICES=1,0 (docs/pp-prefill.md 1.2).
-  if (const std::string why = pp::CheckDeviceOrder(GetEnvVar("HIP_VISIBLE_DEVICES")); !why.empty()) {
-    throw std::runtime_error("PpModel::Load: " + why);
-  }
+  // Placement (docs/pp-prefill.md 1.2): stage B (decode, the full Model) on the headless card, stage A on the other one,
+  // chosen by explicit ordinal -- PpOptions::devices (--pp-devices), else R4DX_PP_DEVICES, else the last visible ordinal for
+  // B -- never by HIP_VISIBLE_DEVICES ordering. The facade thread is bound to stage B's device (hipSetDevice) here and at the
+  // start of every call that touches the decode Model (BindStageB).
+  const std::string hip_visible = GetEnvVar("HIP_VISIBLE_DEVICES");
   int visible = 0;
   R4DX_HIP_CHECK(hipGetDeviceCount(&visible));
-  const int dev_b = 0, dev_a = pp.stage_a_device;
-  if (visible < 2 || dev_a < 1 || dev_a >= visible) {
-    throw std::runtime_error("PpModel::Load: the pipeline needs two visible HIP devices (stage A on ordinal " +
-                             std::to_string(dev_a) + "), HIP_VISIBLE_DEVICES exposes " + std::to_string(visible));
+  std::vector<int> requested = pp.devices;
+  const char* placement_src = requested.empty() ? "auto" : "--pp-devices";
+  if (requested.empty()) {
+    const std::string env = GetEnvVar("R4DX_PP_DEVICES");
+    if (const std::string why = pp::ParseDevicePair(env, &requested); !why.empty()) {
+      throw std::invalid_argument("PpModel::Load: R4DX_PP_DEVICES " + why);
+    }
+    if (!requested.empty()) placement_src = "R4DX_PP_DEVICES";
   }
+  const pp::Placement place = pp::ResolvePlacement(requested, visible, hip_visible);
+  if (!place.Ok()) throw std::runtime_error("PpModel::Load: " + place.error);
+  const int dev_b = place.stage_b, dev_a = place.stage_a;
   {
     hipDeviceProp_t pb, pa;
     R4DX_HIP_CHECK(hipGetDeviceProperties(&pb, dev_b));
     R4DX_HIP_CHECK(hipGetDeviceProperties(&pa, dev_a));
     if (pb.pciDomainID == pa.pciDomainID && pb.pciBusID == pa.pciBusID) {
-      throw std::runtime_error("PpModel::Load: ordinals 0 and " + std::to_string(dev_a) +
+      throw std::runtime_error("PpModel::Load: ordinals " + std::to_string(dev_b) + " and " + std::to_string(dev_a) +
                                " are the same physical GPU (pci bus " + std::to_string(pb.pciBusID) + ")");
     }
     if (std::string(pb.gcnArchName) != std::string(pa.gcnArchName)) {
       throw std::runtime_error(std::string("PpModel::Load: the stages must run on GPUs of the same architecture, got ") +
                                pb.gcnArchName + " and " + pa.gcnArchName + " (the same code objects, the same bits)");
     }
-    std::fprintf(stderr, "[r4dx-pp] stage B (decode) -> HIP device %d (%s, pci %02x:%02x); stage A -> HIP device %d (%s, pci %02x:%02x)\n",
-                 dev_b, pb.name, pb.pciBusID, pb.pciDeviceID, dev_a, pa.name, pa.pciBusID, pa.pciDeviceID);
+    std::fprintf(stderr,
+                 "[r4dx-pp] stage B (decode) -> HIP device %d (%s, pci %02x:%02x); stage A -> HIP device %d (%s, pci %02x:%02x) "
+                 "[placement: %s; %d visible, HIP_VISIBLE_DEVICES=%s]\n",
+                 dev_b, pb.name, pb.pciBusID, pb.pciDeviceID, dev_a, pa.name, pa.pciBusID, pa.pciDeviceID, placement_src, visible,
+                 hip_visible.empty() ? "<unset>" : hip_visible.c_str());
   }
 
   std::unique_ptr<PpModel> m(new PpModel());
   m->opts_ = opts;
   m->opts_.pp_emulate_split = 0;
   m->pp_ = pp;
+  m->dev_b_ = dev_b;
+  m->dev_a_ = dev_a;
+  m->BindStageB();
   m->min_rows_ = pp.min_rows;
   m->verify_ = pp.verify || EnvFlag("R4DX_PP_VERIFY");
 
@@ -261,6 +274,10 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
 
 PpModel::~PpModel() {
   if (!worker_) return;
+  try {
+    BindStageB();  // the destroying thread may not be the one that last ran a call: the decode Model's buffers die on its device
+  } catch (...) {
+  }
   if (channel_) channel_->Poison("shutdown");
   const auto wait_idle = [&](const char* what) {
     std::unique_lock<std::mutex> lk(done_.mu);
@@ -315,7 +332,10 @@ void PpModel::RunOnStageA(const std::function<void(Model&)>& fn) {
   RunA(fn, std::chrono::seconds(60));
 }
 
+void PpModel::BindStageB() const { R4DX_HIP_CHECK(hipSetDevice(dev_b_)); }
+
 void PpModel::RequireReady() const {
+  BindStageB();
   if (state_ == State::kFatal) throw std::runtime_error("pp: fatal, restart the process");
   if (state_ == State::kNeedsRecovery) {
     throw std::runtime_error("pp: a pipelined prefill failed earlier; call Reset() first");
@@ -335,6 +355,7 @@ int64_t PpModel::VisionMergeSize() const {
 
 std::vector<VramReport> PpModel::Vram() const {
   PpModel* const self = const_cast<PpModel*>(this);
+  BindStageB();
   VramReport rb = MakeVramReport(0);
   VramReport ra;
   ra.rank = 1;
@@ -347,6 +368,7 @@ std::vector<VramReport> PpModel::Vram() const {
 // ---- sequence state -----------------------------------------------------------------------------------------------------
 
 void PpModel::Reset() {
+  BindStageB();
   if (state_ == State::kFatal) throw std::runtime_error("pp: fatal, restart the process");
   try {
     b_->PpSetActive(false);
@@ -362,6 +384,7 @@ void PpModel::Reset() {
 }
 
 void PpModel::SetDflashInjectionEnabled(bool enabled) {
+  BindStageB();
   dflash_injection_ = enabled;
   b_->SetDflashInjectionEnabled(enabled);  // stage A takes the policy with every pipelined call
 }
@@ -687,6 +710,7 @@ void PpModel::UpdateStageACapture() {
 void PpModel::SetSplit(int64_t k) {
   // Not RequireReady(): SetSplit ends in Reset(), which is also the recovery from kNeedsRecovery -- and the identity test's
   // negative controls end a variant exactly there (a failed call), then move the split for the next one.
+  BindStageB();
   if (state_ == State::kFatal) throw std::runtime_error("pp: fatal, restart the process");
   if (!pp::ValidSplit(k, NumLoadedLayers()) || k > reserve_split_) {
     throw std::invalid_argument("PpModel::SetSplit: split " + std::to_string(k) + " must be in [1, " +

@@ -19,7 +19,8 @@
 //
 // Pre-flight: before loading, a helper thread requires --need-gib free on both devices.
 //
-// Built, never add_test()'d. Usage (HIP_VISIBLE_DEVICES=1,0, production server stopped):
+// Built, never add_test()'d. Usage (HIP_VISIBLE_DEVICES unset, production server stopped; R4DX_PP_DEVICES=B,A picks the
+// placement, default decode on the last visible ordinal = physical device 1):
 //   tool_pp_soak --model <R4DX_MODELS_ROOT>\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --minutes 60
 //                --max-ctx 36864 --json build\logs\pp_soak.jsonl [--seed 1] [--iterations N]
 //                [--tokens tools\reference\kl_corpus\tokens.json] [--min-prompt 2048] [--max-prompt 32768]
@@ -196,7 +197,7 @@ std::string Preflight(double need_gib) {
   std::thread t([&] {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess) n = 0;
-    if (n < 2) msg = "the pipeline needs two visible HIP devices (HIP_VISIBLE_DEVICES=1,0)";
+    if (n < 2) msg = "the pipeline needs two visible HIP devices (HIP_VISIBLE_DEVICES unset)";
     for (int d = 0; d < n && d < 2 && msg.empty(); ++d) {
       size_t free_b = 0, total_b = 0;
       if (hipSetDevice(d) != hipSuccess || hipMemGetInfo(&free_b, &total_b) != hipSuccess) {

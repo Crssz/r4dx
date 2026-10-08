@@ -1,6 +1,6 @@
 // HIP-free policy of the real pipeline-parallel prefill (docs/pp-prefill.md, Phase 2): what the stage-A mirror
-// (device 0) is known to hold relative to the decode Model (stage B, device 1), the switches that turn the pipeline
-// on, the default split and the device-order rule. Header-only so a CPU test (tests/model/test_pp_sync_cpu.cpp)
+// is known to hold relative to the decode Model (stage B), the switches that turn the pipeline on, the default split
+// and the device-placement rule. Header-only so a CPU test (tests/model/test_pp_sync_cpu.cpp)
 // checks the stale-state rules -- the dangerous part of the design: a stale mirror silently produces wrong tokens --
 // against an abstract model of both devices' contents, with no GPU.
 #pragma once
@@ -91,25 +91,86 @@ inline int64_t DefaultSplit(bool dflash, int64_t num_layers) {
 // chunk) and the warm-turn sync-back to pay (docs/pp-prefill.md 6.3). `min_rows` 1 pipelines every call (tests).
 inline bool ShouldPipeline(int64_t rows, int64_t min_rows) { return rows >= std::max<int64_t>(1, min_rows); }
 
-// HIP_VISIBLE_DEVICES must be "1,0": ordinal 0 of the process is then the physical headless card (decode's, stage B,
-// what every existing code path already uses) and ordinal 1 the desktop card (stage A's thread selects it with
-// hipSetDevice). Whitespace around the entries is tolerated. Returns "" when fine, else the reason.
-inline std::string CheckDeviceOrder(const std::string& hip_visible_devices) {
-  std::vector<std::string> parts;
-  std::string cur;
-  for (const char ch : hip_visible_devices) {
-    if (ch == ',') {
-      parts.push_back(cur);
-      cur.clear();
-    } else if (ch != ' ' && ch != '\t') {
-      cur.push_back(ch);
-    }
+// ---- device placement -----------------------------------------------------------------------------------------------
+// Which process-visible HIP ordinals the two stages run on. Nothing here depends on HIP_VISIBLE_DEVICES reordering the
+// cards (on this ROCm / Windows runtime "1,0" is NOT a reorder: it exposes the same two cards in the natural order), so
+// the placement is explicit: `--pp-devices B,A` / R4DX_PP_DEVICES (PpOptions::devices), else the auto rule.
+//
+// Auto = stage B (decode, the full Model) on the LAST visible ordinal, stage A on the one before it -- the same rule as
+// `--tp-devices auto` (docs/tp.md 9.2): with HIP_VISIBLE_DEVICES unset, ordinal 1 = physical device 1 = the headless card
+// (pci bus 07) that every TP=1 run of r4dx-cli / r4dx-server uses (the habit HIP_VISIBLE_DEVICES=1), and ordinal 0 = the
+// desktop card (pci bus 03) runs stage A. Both cards must be visible: HIP_VISIBLE_DEVICES=1 alone is refused.
+
+// "auto" or "" -> *out cleared (auto placement); "b,a" -> {b, a}. Whitespace around the entries is tolerated. Returns "" when
+// fine, else the reason (the caller prefixes the flag / variable name).
+inline std::string ParseDevicePair(const std::string& text, std::vector<int>* out) {
+  out->clear();
+  std::string t;
+  for (const char ch : text) {
+    if (ch != ' ' && ch != '\t') t.push_back(ch);
   }
-  parts.push_back(cur);
-  if (parts.size() == 2 && parts[0] == "1" && parts[1] == "0") return "";
-  return "pipeline-parallel prefill needs HIP_VISIBLE_DEVICES=1,0 (process ordinal 0 = the headless card that decodes, "
-         "ordinal 1 = the desktop card that runs stage A), got '" +
-         (hip_visible_devices.empty() ? std::string("<unset>") : hip_visible_devices) + "'";
+  if (t.empty() || t == "auto") return "";
+  const std::string what = "expects 'auto' or 'B,A' (two HIP ordinals: stage B = decode card, stage A), got '" + text + "'";
+  std::vector<int> v;
+  size_t start = 0;
+  while (start <= t.size()) {
+    const size_t comma = t.find(',', start);
+    const std::string item = t.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    if (item.empty() || item.size() > 4) return what;
+    int d = 0;
+    for (const char ch : item) {
+      if (ch < '0' || ch > '9') return what;
+      d = d * 10 + (ch - '0');
+    }
+    v.push_back(d);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (v.size() != 2) return what;
+  if (v[0] == v[1]) return "stage B and stage A must be different ordinals, got '" + text + "'";
+  *out = v;
+  return "";
+}
+
+struct Placement {
+  int stage_b = -1;     // process-visible HIP ordinal of the decode Model
+  int stage_a = -1;     // ... and of the half-weight prefill stage
+  std::string error;    // non-empty: refused, with the reason
+  bool Ok() const { return error.empty(); }
+};
+
+// `requested`: PpOptions::devices (empty = auto, else {B, A}); `visible`: hipGetDeviceCount; `hip_visible_devices`: the
+// environment value, for the message only.
+inline Placement ResolvePlacement(const std::vector<int>& requested, int visible, const std::string& hip_visible_devices) {
+  Placement p;
+  const std::string hvd = hip_visible_devices.empty() ? std::string("<unset>") : hip_visible_devices;
+  if (visible < 2) {
+    p.error = "pipeline-parallel prefill needs two visible HIP devices (decode card + desktop card), but HIP_VISIBLE_DEVICES=" +
+              hvd + " exposes " + std::to_string(std::max(visible, 0)) + ". Unset it (or expose both cards).";
+    return p;
+  }
+  if (requested.empty()) {
+    p.stage_b = visible - 1;
+    p.stage_a = visible - 2;
+    return p;
+  }
+  if (requested.size() != 2) {
+    p.error = "pipeline-parallel prefill needs exactly two ordinals (stage B, stage A), got " + std::to_string(requested.size());
+    return p;
+  }
+  const int b = requested[0], a = requested[1];
+  if (b < 0 || a < 0 || b >= visible || a >= visible) {
+    p.error = "pipeline-parallel prefill devices " + std::to_string(b) + "," + std::to_string(a) +
+              " are not both inside the " + std::to_string(visible) + " visible HIP devices (HIP_VISIBLE_DEVICES=" + hvd + ")";
+    return p;
+  }
+  if (a == b) {
+    p.error = "pipeline-parallel prefill needs two different devices, got " + std::to_string(b) + "," + std::to_string(a);
+    return p;
+  }
+  p.stage_b = b;
+  p.stage_a = a;
+  return p;
 }
 
 }  // namespace r4dx::model::pp

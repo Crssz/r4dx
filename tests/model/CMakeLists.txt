@@ -72,7 +72,7 @@ set(R4DX_MODEL_TESTS
   # card, stage B the decode Model) against the monolithic prefill on the same Model, bit for bit -- test_pp_emulate_identity's
   # shape list plus warm turns (the sync-back), speculative rounds, a checkpoint restore, the pipelining threshold, image rows;
   # the live state of both stages compared after every hand-off; two negative controls. NEEDS BOTH GPUs and
-  # HIP_VISIBLE_DEVICES=1,0 (set below); SKIP 77 otherwise or without the containers. Written, NOT run by its author (GPU).
+  # both cards visible (HIP_VISIBLE_DEVICES=0,1, set below); SKIP 77 otherwise or without the containers. Written, NOT run by its author (GPU).
   test_pp_real_identity
 )
 
@@ -92,9 +92,10 @@ foreach(t ${R4DX_MODEL_TESTS})
     SKIP_RETURN_CODE 77
   )
 endforeach()
-# The real pipeline puts stage B on process ordinal 0 = physical device 1 (the headless card) and stage A on ordinal 1 =
-# physical device 0 (docs/pp-prefill.md 1.2).
-set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=1,0")
+# The real pipeline needs both cards visible: "0,1" is the natural order (the same as unset; this ROCm does not reorder), which
+# overrides the loop's HIP_VISIBLE_DEVICES=1. PpModel then puts stage B (decode) on ordinal 1 = physical device 1 (the
+# headless card, pci 07) and stage A on ordinal 0 (the desktop card) -- docs/pp-prefill.md 1.2.
+set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1")
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a

@@ -1,9 +1,10 @@
 // r4dx::model::PpModel -- the pipeline-parallel-prefill TextModel (docs/pp-prefill.md, Phase 2; `--pp 2`).
 //
-// Two GPUs, two Models, one conversation. Stage B is the ordinary full decode Model on the facade's own thread and HIP
-// ordinal 0 (with HIP_VISIBLE_DEVICES=1,0: the physical headless card -- decode is byte-for-byte today's, it is the
-// same Model on the same device on the same thread). Stage A is a half-weight Model on its own rank thread and
-// HIP ordinal 1 (the desktop card): layers [0, k) + the embedding (it is loaded with layer_limit = k + 1, the last layer
+// Two GPUs, two Models, one conversation. Stage B is the ordinary full decode Model on the facade's own thread and the
+// headless card (the facade thread is bound to it with hipSetDevice at every entry; by default the last visible HIP ordinal,
+// or --pp-devices B,A / R4DX_PP_DEVICES -- pp::ResolvePlacement, never HIP_VISIBLE_DEVICES ordering -- decode is
+// byte-for-byte today's, it is the same Model on the same device on the same thread). Stage A is a half-weight Model on its
+// own rank thread and the other card (the desktop one): layers [0, k) + the embedding (it is loaded with layer_limit = k + 1, the last layer
 // only supplying the input_layernorm weight that layer k - 1's Mlp fuses). A Prefill / PrefillMultimodal call of at
 // least `min_rows` rows runs on both at once: A's chunk c + 1 overlaps B's chunk c, the carry (residual stream, the
 // fused-norm pair, DFlash feature columns, the KV rows A's attention layers wrote) crossing through a ring of pinned host
@@ -52,7 +53,7 @@ class PpModel final : public TextModel {
   enum class State { kReady, kNeedsRecovery, kFatal };
 
   // `opts` is the ordinary single-model option set (opts.tp must be default, opts.pp is not consulted here). Refuses, by
-  // name, a HIP_VISIBLE_DEVICES other than "1,0", fewer than two devices, two ordinals on one physical GPU, GPUs of
+  // name, fewer than two visible devices, a malformed or out-of-range --pp-devices / R4DX_PP_DEVICES, two ordinals on one physical GPU, GPUs of
   // different architectures, a rotated (quant2) container, a split outside [1, layers - 1].
   static std::unique_ptr<PpModel> Load(const ModelOptions& opts, const PpOptions& pp);
   ~PpModel() override;
@@ -72,7 +73,7 @@ class PpModel final : public TextModel {
   int64_t PositionCount() const override { return b_->PositionCount(); }
   int64_t NumLoadedLayers() const override { return b_->GetContainer().NumLoadedLayers(); }
   int TpWorld() const override { return 1; }
-  // One entry per stage: rank 0 = the decode card (stage B), rank 1 = the desktop card (stage A). Takes a command on
+  // One entry per stage: rank 0 = the decode card (stage B), rank 1 = the desktop card (stage A); .device is the HIP ordinal. Takes a command on
   // stage A's thread (hipMemGetInfo there).
   std::vector<VramReport> Vram() const override;
 
@@ -110,6 +111,8 @@ class PpModel final : public TextModel {
   State GetState() const { return state_; }
   const PpOptions& Options() const { return pp_; }
   int64_t Split() const { return split_; }
+  int StageBDevice() const { return dev_b_; }  // process-visible HIP ordinals the stages run on
+  int StageADevice() const { return dev_a_; }
   const pp::MirrorTracker& Mirror() const { return tracker_; }
   struct Stats {
     int64_t pipelined_calls = 0;   // Prefill / PrefillMultimodal calls that ran on both stages
@@ -163,6 +166,10 @@ class PpModel final : public TextModel {
     double a_gdn_export_ms = 0;
   };
 
+  // hipSetDevice(stage B's ordinal) on the calling thread. The decode Model's device is not necessarily the process default
+  // (ordinal 0) and the thread that calls into the PpModel is not necessarily the one that loaded it (the server loads on
+  // main, runs on the engine worker), so every entry point binds first (RequireReady, Reset, ...).
+  void BindStageB() const;
   void RequireReady() const;
   void NoteBOnly() { tracker_.BOnly(b_->PositionCount()); }
   std::vector<float> PipelinedPrefill(const std::vector<int32_t>& ids, const std::vector<ImageSpan>* images);
@@ -179,6 +186,8 @@ class PpModel final : public TextModel {
   ModelOptions opts_;
   PpOptions pp_;
   State state_ = State::kReady;
+  int dev_b_ = 0;                       // process-visible HIP ordinals of the stages (pp::ResolvePlacement)
+  int dev_a_ = 1;
   int64_t split_ = 0;
   int64_t reserve_split_ = 0;           // stage A is loaded for splits up to this
   int64_t hidden_ = 0;

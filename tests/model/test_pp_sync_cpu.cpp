@@ -2,7 +2,7 @@
 // pipeline-parallel prefill (docs/pp-prefill.md Phase 2, section 3.3): the MirrorTracker's two numbers against an
 // abstract model of both devices' contents under a few hundred thousand random operation sequences (pipelined
 // prefill, B-only prefill, decode, speculative round, checkpoint save / restore, reset), the switches and the
-// device-order rule. A stale mirror silently produces wrong tokens, so this is the property the design leans on:
+// device-placement rule (--pp-devices / R4DX_PP_DEVICES / auto). A stale mirror silently produces wrong tokens, so this is the property the design leans on:
 // whenever the tracker says "no copy needed", the mirror really does equal the decode Model on everything the next
 // pipelined call reads. No HIP call, no container, always runs.
 #include <algorithm>
@@ -198,13 +198,46 @@ void Switches() {
         "the default split clamps into [1, layers - 1] for a short container");
   Check(ShouldPipeline(1024, 1024) && !ShouldPipeline(1023, 1024) && ShouldPipeline(1, 1) && ShouldPipeline(1, 0),
         "the pipeline engages from min_rows (1 pipelines every call)");
-  Check(CheckDeviceOrder("1,0").empty() && CheckDeviceOrder(" 1 , 0 ").empty(), "HIP_VISIBLE_DEVICES=1,0 is accepted");
-  Check(!CheckDeviceOrder("").empty() && !CheckDeviceOrder("0,1").empty() && !CheckDeviceOrder("1").empty() &&
-            !CheckDeviceOrder("1,0,2").empty() && !CheckDeviceOrder("-1").empty(),
-        "every other device order is refused");
-  Check(CheckDeviceOrder("0,1").find("<unset>") == std::string::npos &&
-            CheckDeviceOrder("").find("<unset>") != std::string::npos,
-        "the refusal names the value");
+}
+
+void PlacementRules() {
+  // --pp-devices / R4DX_PP_DEVICES text.
+  std::vector<int> v{7};
+  Check(ParseDevicePair("", &v).empty() && v.empty() && ParseDevicePair("auto", &v).empty() && v.empty(),
+        "'' and 'auto' are the auto placement");
+  Check(ParseDevicePair("1,0", &v).empty() && v == std::vector<int>({1, 0}), "'1,0' = stage B on ordinal 1, stage A on 0");
+  Check(ParseDevicePair(" 0 , 1 ", &v).empty() && v == std::vector<int>({0, 1}), "whitespace is tolerated");
+  for (const char* bad : {"1", "1,0,2", "1,1", "a,b", "1,", ",1", "-1,0", "1;0", "1.5,0", "99999,0"}) {
+    v.assign({5, 5});
+    Check(!ParseDevicePair(bad, &v).empty() && v.empty(), (std::string("'") + bad + "' is refused").c_str());
+  }
+  Check(ParseDevicePair("2,2", &v).find("different") != std::string::npos, "the same ordinal twice names the problem");
+
+  // Auto: stage B on the LAST visible ordinal (physical device 1 = the headless card with HIP_VISIBLE_DEVICES unset), A before it.
+  Placement p = ResolvePlacement({}, 2, "");
+  Check(p.Ok() && p.stage_b == 1 && p.stage_a == 0, "auto with two visible cards: decode on ordinal 1, stage A on 0");
+  p = ResolvePlacement({}, 2, "1,0");
+  Check(p.Ok() && p.stage_b == 1 && p.stage_a == 0, "HIP_VISIBLE_DEVICES=1,0 is accepted and does not change the auto pick");
+  p = ResolvePlacement({}, 3, "");
+  Check(p.Ok() && p.stage_b == 2 && p.stage_a == 1, "auto with three visible: the last two");
+  // Fewer than two visible: refused, naming the variable and the count.
+  p = ResolvePlacement({}, 1, "1");
+  Check(!p.Ok() && p.error.find("HIP_VISIBLE_DEVICES=1") != std::string::npos && p.error.find("exposes 1") != std::string::npos,
+        "HIP_VISIBLE_DEVICES=1 (one card) is refused with a clear message");
+  p = ResolvePlacement({}, 0, "");
+  Check(!p.Ok() && p.error.find("<unset>") != std::string::npos && p.error.find("exposes 0") != std::string::npos,
+        "no device: refused, names <unset>");
+  p = ResolvePlacement({1, 0}, 1, "1");
+  Check(!p.Ok(), "an explicit pair does not rescue a one-card process");
+  // Explicit.
+  p = ResolvePlacement({1, 0}, 2, "");
+  Check(p.Ok() && p.stage_b == 1 && p.stage_a == 0, "explicit 1,0");
+  p = ResolvePlacement({0, 1}, 2, "");
+  Check(p.Ok() && p.stage_b == 0 && p.stage_a == 1, "explicit 0,1 (decode on the other card)");
+  Check(!ResolvePlacement({2, 0}, 2, "").Ok() && !ResolvePlacement({0, 2}, 2, "").Ok() && !ResolvePlacement({-1, 0}, 2, "").Ok(),
+        "an ordinal outside the visible range is refused");
+  Check(!ResolvePlacement({1, 1}, 2, "").Ok() && !ResolvePlacement({1}, 2, "").Ok() && !ResolvePlacement({0, 1, 2}, 3, "").Ok(),
+        "the same ordinal twice, or not exactly two entries, is refused");
 }
 
 }  // namespace
@@ -213,6 +246,7 @@ int main() {
   RandomSequences();
   Rules();
   Switches();
+  PlacementRules();
   if (g_fails != 0) {
     std::fprintf(stderr, "test_pp_sync_cpu: %d FAILED\n", g_fails);
     return 1;

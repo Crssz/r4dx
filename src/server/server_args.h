@@ -158,8 +158,9 @@ struct ServerArgs {
 
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2): src/cli/cli_args.h's --pp* ---------------------
   // --pp 2 (or R4DX_PP=1 when --pp is not given: -1) runs prompt prefill as a two-stage pipeline across both GPUs
-  // (HIP_VISIBLE_DEVICES=1,0), decode unchanged on the headless card; exclusive with --tp 2. 1 forces it off.
+  // (both cards visible: HIP_VISIBLE_DEVICES unset), decode unchanged on the headless card; exclusive with --tp 2. 1 forces it off.
   int pp = -1;
+  std::vector<int> pp_devices;  // --pp-devices B,A (HIP ordinals: stage B = decode card, stage A); empty = auto
   int pp_split = 0;           // auto: 33, 35 with --dflash
   int pp_min_rows = -1;       // default 1024
   bool pp_verify = false;
@@ -190,7 +191,7 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--image-max-pixels N] [--image-soft-tokens {70|140|280}] [--request-log <path>] "
          "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
-         "[--tp-max-inflight K] [--pp {1|2}] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
+         "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
          "[--pp-submit-layers N] [--pp-max-inflight K]";
 }
 
@@ -222,6 +223,33 @@ inline std::vector<int> ParseServerTpDevices(const std::string& value) {
     start = comma + 1;
   }
   if (out.size() > 2) throw ServerUsageError("--tp-devices takes at most two ordinals (rank 0, rank 1)");
+  return out;
+}
+
+// src/cli/cli_args.h's ParsePpDevices, throwing ServerUsageError: "auto" (or "") -> empty; "B,A" -> two different ordinals.
+inline std::vector<int> ParseServerPpDevices(const std::string& value) {
+  std::vector<int> out;
+  if (value.empty() || value == "auto") return out;
+  size_t start = 0;
+  while (start <= value.size()) {
+    const size_t comma = value.find(',', start);
+    const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    int d = 0;
+    try {
+      size_t used = 0;
+      d = std::stoi(item, &used);
+      if (used != item.size()) throw std::invalid_argument(item);
+    } catch (const std::exception&) {
+      throw ServerUsageError("--pp-devices expects 'auto' or 'B,A' (two HIP ordinals: stage B = decode card, stage A), got '" +
+                             value + "'");
+    }
+    if (d < 0) throw ServerUsageError("--pp-devices ordinals must be >= 0, got '" + value + "'");
+    out.push_back(d);
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (out.size() != 2) throw ServerUsageError("--pp-devices takes exactly two ordinals (stage B, stage A), got '" + value + "'");
+  if (out[0] == out[1]) throw ServerUsageError("--pp-devices needs two different ordinals, got '" + value + "'");
   return out;
 }
 
@@ -301,6 +329,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
     else if (arg == "--tp-submit-layers") { a.tp_submit_layers = ServerParseInt("--tp-submit-layers", NextServerArg(argc, argv, i, "--tp-submit-layers")); a.tp_options_given = true; tp_submit_given = true; }
     else if (arg == "--tp-max-inflight") { a.tp_max_inflight = ServerParseInt("--tp-max-inflight", NextServerArg(argc, argv, i, "--tp-max-inflight")); a.tp_options_given = true; tp_inflight_given = true; }
     else if (arg == "--pp") a.pp = ServerParseInt("--pp", NextServerArg(argc, argv, i, "--pp"));
+    else if (arg == "--pp-devices") { a.pp_devices = ParseServerPpDevices(NextServerArg(argc, argv, i, "--pp-devices")); a.pp_options_given = true; }
     else if (arg == "--pp-split") {
       const std::string v = NextServerArg(argc, argv, i, "--pp-split");
       a.pp_split = v == "auto" ? 0 : ServerParseInt("--pp-split", v);
@@ -398,7 +427,7 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2) -------------------------------------
   if (a.pp != -1 && a.pp != 1 && a.pp != 2) throw ServerUsageError("--pp must be 1 or 2");
   if (a.pp != 2 && a.pp_options_given) {
-    throw ServerUsageError("--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
+    throw ServerUsageError("--pp-devices/--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
   }
   if (a.pp == 2) {
     if (a.tp != 1) throw ServerUsageError("--pp 2 and --tp 2 are mutually exclusive");

@@ -8,9 +8,27 @@ Status (2026-10-08, branch `pp`, from `main` 4e710ab):
 * **Phase 1** (the three-phase RunChunk and PP-emulate) is validated on the GPUs: `test_prefill_chunk_identity` (+ defaults) PASS,
   `tp1_identity` rows equal to main, and `test_pp_emulate_identity` passed every identity case and nine negative controls; the tenth
   (real / dflash7 `neg/skip-dflash`) crashed the process -- fixed in this branch (section 2).
-* **Phase 2** (the real two-GPU pipeline, section 4) is **written, builds, and its CPU tests pass; no GPU run of it has been
-  made.** Its gates (G2a identity, G2b TTFT / decode, G2c soak) are `tests/model/test_pp_real_identity.cpp`,
-  `tools/prefill/ttft_cli.ps1 -Pp` and `tools/pp/soak.ps1`; `tools/pp/phase2.ps1` runs all of them unattended.
+* **Phase 2** (the real two-GPU pipeline, section 4) is **validated on the GPUs (2026-10-08, `E:\models\r4dx\pp2`)**:
+  * identity (G2a): `test_pp_emulate_identity` PASS (11 configurations, 10 negative controls), `test_pp_real_identity` PASS (9
+    configurations, 6 negative controls: real pipeline == monolithic prefill, bit for bit, on the 4-layer containers and the real one,
+    plain / `--mtp 3` / `--dflash` / image rows / warm turns / checkpoints), and `tp1_identity` rows 1-6, 8, 9 EQUAL to main (PP off is
+    unchanged);
+  * cold TTFT (G2b), median of 2 runs, HIP device 1 baseline vs `--pp 2`, greedy output identical in every arm: 8k 3.150 s -> 1.702 s
+    (**1.85x**), 32k 14.034 s -> 7.392 s (**1.90x**), 64k 32.049 s -> 16.794 s (**1.91x**); with `--pp-split 32` 1.657 s (1.90x) at 8k and
+    7.236 s (1.94x) at 32k. MTP and DFlash (k = 7, 8k and 32k) give the same text, ids and accept stats as the baseline; decode 37.2
+    vs 37.3 tok/s (**0.997x**, gate >= 0.97), text identical;
+  * failure: a hard kill of `r4dx-cli --pp 2` at 25 % and 65 % of a 32k prefill leaves no orphan and no TDR, and the next `--pp 2` run
+    reproduces the baseline's bytes;
+  * soak (G2c, `tools/pp/soak.ps1`): 5 minutes (17 iterations, 9 compared) and 60 minutes (199 iterations, 100
+    compared, all equal; mean prefill speedup 1.60x including the warm turns, best 1.68x; buffer drift < 0.001 MiB, VRAM drift 6 MiB; no
+    TDR; summary and teardown `exit_code` 0).
+
+  **Placement caveat of those runs.** They ran with `HIP_VISIBLE_DEVICES=1,0`, which on this ROCm (10.1, Windows) does NOT reorder
+  the devices, so stage B (decode) sat on HIP device 0 = pci 03:00 (the desktop card) and stage A on device 1 = pci 07:00 -- the
+  opposite of the design (4.1). Correctness is unaffected (both cards are the same model), and the TTFT numbers above are what that
+  placement gave. Placement is now explicit (`--pp-devices B,A`, `R4DX_PP_DEVICES`, default decode on the last visible ordinal =
+  physical device 1 = pci 07:00 with `HIP_VISIBLE_DEVICES` unset; section 4.2) and `HIP_VISIBLE_DEVICES=1,0` is no longer needed. The
+  corrected placement has to be re-confirmed on the GPUs (identity, an 8k TTFT, the log lines of 4.7).
 
 The design this implements (research ideas #26 / #33): 2 stages of 256-row super-chunks, stage A = layers [0, k) + embedding on
 device 0 (the desktop card), stage B = layers [k, N) + final norm + lm_head + MTP priming + DFlash injection on device 1 (the
@@ -194,7 +212,7 @@ Off by default: nothing below runs unless `--pp 2` (r4dx-cli and r4dx-server), `
 ### 4.1 Structure
 
 ```
-facade / engine thread  (HIP ordinal 0 = physical device 1, the headless card)       stage-A thread  (hipSetDevice(1) = device 0, the desktop card)
+facade / engine thread  (hipSetDevice(B) = physical device 1, the headless card)      stage-A thread  (hipSetDevice(A) = device 0, the desktop card)
   Model B  = the ordinary full Model: decode, MTP, DFlash, vision, checkpoints          Model A = layers [0, k] resident (k+1 layers), embedding,
   Prefill(call) ---------------- pipelined ------------------------------------------   runs layers [0, k) of every chunk; no lm_head use, no MTP,
      per chunk: prologue -> wait slot -> import -> layers [k, N) -> epilogue -> release     no drafter, bounded GPU submission (SubmitBounder)
@@ -242,17 +260,25 @@ facade / engine thread  (HIP ordinal 0 = physical device 1, the headless card)  
 | `--pp-min-rows N` | calls shorter than this run on the decode Model alone | 1024 |
 | `--pp-verify` / `R4DX_PP_VERIFY=1` | digest the live state of both stages after every sync-back and hand-off and compare (slow: copies the state to the host) | off |
 | `--pp-submit-layers N`, `--pp-max-inflight K` | stage A's bounded GPU submission: a forced submission every N layers (fewer past 16k / 64k / 128k of context), at most K units queued; `0` layers = off | 32, 1 (as TP) |
-| `HIP_VISIBLE_DEVICES=1,0` | **required**; any other value is refused at load by name | -- |
+| `--pp-devices B,A` (r4dx-cli, r4dx-server) / `R4DX_PP_DEVICES=B,A` / `PpOptions::devices` | the process-visible HIP **ordinals** of stage B (the decode card) and stage A, two different values inside the visible range; `auto` = the default. The flag wins over the variable | auto: B = the last visible ordinal, A = the one before it (with `HIP_VISIBLE_DEVICES` unset: B = ordinal 1 = physical device 1 = pci 07, the headless card every TP=1 run uses; A = ordinal 0 = pci 03, the desktop card) |
+| `HIP_VISIBLE_DEVICES` | not needed: leave it unset. It must expose both cards (a value that leaves fewer than two is refused at load: `pipeline-parallel prefill needs two visible HIP devices ... HIP_VISIBLE_DEVICES=<value> exposes <n>`). It is never used to order the stages: on this ROCm `1,0` does not reorder | unset |
 | `R4DX_PP_TRACE=1` | diagnostic: one stderr line per chunk and boundary point with a hash of each carry buffer and of the chunk's ids -- `A-dev` (stage A's device buffers after layers [0, k)), `A-slot` / `B-slot` (the slot bytes as A published / B found them), `B-dev` (B's buffers after the import), `mono` (a monolithic call on the decode Model, split at the same k). Match lines by `ids` + `pos` + `rows`. The hash of an empty region is the offset basis `14650fb0739d0383`. Synchronizes (slow) | off |
 
 Refused at load / parse: `--tp 2` (mutually exclusive), Gemma 4, a rotated (quant2) container, a probe (`R4DX_CLOCK_PROBE`), fewer
-than two devices, both ordinals on one physical GPU, GPUs of different architectures, a stage-A / stage-B disagreement on the prefill
-chunk size or on int8 prefill (the bits would differ), a split outside [1, layers - 1].
+than two visible devices, a malformed or out-of-range `--pp-devices` / `R4DX_PP_DEVICES`, both ordinals on one physical GPU (same pci
+bus), GPUs of different architectures, a stage-A / stage-B disagreement on the prefill chunk size or on int8 prefill (the bits would
+differ), a split outside [1, layers - 1].
 
-Why `1,0`: every thread starts on ordinal 0 and the whole code base calls no `hipSetDevice`, so with `1,0` ordinal 0 is the
-physical headless card and the engine thread, the main thread (which calls `Model::Load`) and every existing code path keep working
-on the decode device; only the one new thread selects ordinal 1. A forgotten `hipSetDevice` on any thread would otherwise silently
-launch on the desktop card with device-1 pointers.
+**Placement.** The stages are chosen by explicit ordinal (`pp::ResolvePlacement`, `pp_sync.h`, CPU-tested), never by the order
+`HIP_VISIBLE_DEVICES` lists the cards: on ROCm 10.1 / Windows `HIP_VISIBLE_DEVICES=1,0` exposes the same two cards in the natural
+order (ordinal 0 = pci 03, ordinal 1 = pci 07), which put decode on the desktop card in the 2026-10-08 runs. The auto rule is
+`--tp-devices auto`'s (docs/tp.md 9.2): decode on the LAST visible ordinal. A TP=1 run calls no `hipSetDevice` and uses ordinal 0 of
+whatever `HIP_VISIBLE_DEVICES` exposes (the production habit `=1` makes that physical device 1), so with both cards visible decode
+lands on the same physical card (device 1, pci 07) a TP=1 run uses. Because decode is then not on ordinal 0, `PpModel` binds the
+calling thread with `hipSetDevice(B)` in `Load` and at the start of every entry point (`PpModel::BindStageB`; the server loads on
+the main thread and runs on the engine worker thread; the destructor binds too), and stage A's thread selects A as before. The load
+log names both: `[r4dx-pp] stage B (decode) -> HIP device 1 (<name>, pci 07:00); stage A -> HIP device 0 (<name>, pci 03:00) [placement:
+auto; 2 visible, HIP_VISIBLE_DEVICES=<unset>]`.
 
 ### 4.3 One pipelined call
 
@@ -306,7 +332,7 @@ thread.
 The claim is the design's 7.1: every layer runs the same kernels, selected by shape only, with deterministic reductions, from the
 same container; the carry crosses as raw bytes. New here beyond Phase 1: two threads, two devices, the GDN hand-off and the sync-back.
 
-* `tests/model/test_pp_real_identity.cpp` (GPU, **both cards**, `HIP_VISIBLE_DEVICES=1,0`, SKIP 77 otherwise): one `PpModel` per
+* `tests/model/test_pp_real_identity.cpp` (GPU, **both cards**, `HIP_VISIBLE_DEVICES` unset or `0,1` as ctest sets it, SKIP 77 with fewer than two visible devices): one `PpModel` per
   configuration (stage A loaded for the largest split, `SetSplit` moves k without reloading); every scenario runs monolithic (the
   decode Model driven directly) and then through the `PpModel` with `min_rows = 1`; compared bit for bit: each Prefill call's last-row
   logits, the greedy / speculative tokens, the digest of ALL of B's state (KV caches of both stages zeroed at the start), the DFlash
@@ -338,18 +364,22 @@ same container; the carry crosses as raw bytes. New here beyond Phase 1: two thr
   prologue agrees; `pp::MakeSlotLayout` refuses rows or hidden < 1 (CPU-tested in `test_pp_channel_cpu`); the unneeded
   synchronizes were removed again (stream order covers the import, as everywhere else). The below-threshold / turn diffs of the threshold variant are the same bug: their first diffs are in
   a pipelined call (1100 / 1200 rows); later B-only calls differ only because the tokens decoded in between already did.
-  Separately, the log shows `HIP_VISIBLE_DEVICES=1,0` did not reorder the devices on this runtime: ordinal 0 (stage B, decode) is
-  pci 03:00 -- the desktop card in docs/tp.md -- and ordinal 1 (stage A) pci 07:00, the opposite of 4.1's intent; the line prints
-  the properties of the very ordinals the stages use, so it is right and the assumption is not. Not a correctness issue.
+  Separately, the log showed `HIP_VISIBLE_DEVICES=1,0` did not reorder the devices on this runtime: ordinal 0 (stage B, decode) was
+  pci 03:00 -- the desktop card in docs/tp.md -- and ordinal 1 (stage A) pci 07:00, the opposite of 4.1's intent. Not a correctness
+  issue; fixed by explicit placement (4.2, "Placement").
+* **GPU result after the fix (same day, `E:\models\r4dx\pp2\logs`):** `test_pp_real_identity` PASS (9 configurations, 6 negative
+  controls), see the status block at the top for the TTFT, decode, spec, kill and soak results.
 * CPU, always run: `test_pp_channel_cpu` (FIFO, back-pressure, timeouts, poison, per-call reset, bulk flag, the payload arithmetic,
   a million chunks between two threads with payload integrity), `test_pp_sync_cpu` (the tracker against the abstract model, the
-  switches, the device-order rule), the arg tests of both binaries.
+  switches, the placement rule and the `--pp-devices` / `R4DX_PP_DEVICES` parser), the arg tests of both binaries.
 
 ### 4.7 Harness and how to run the gates (GPU; the user approves; nothing else may be running)
 
 ```powershell
 # G2a -- needs both cards; takes a while (several model loads on each)
-$env:HIP_VISIBLE_DEVICES='1,0'; .\build\win-hip\tests\model\test_pp_real_identity.exe            # R4DX_TEST_ONLY=l4/bf16 narrows it
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue                                  # both cards visible; the placement is PpModel's
+.\build\win-hip\tests\model\test_pp_real_identity.exe                                              # R4DX_TEST_ONLY=l4/bf16/plain narrows it
+# expect on every load: [r4dx-pp] stage B (decode) -> HIP device 1 (..., pci 07:00); stage A -> HIP device 0 (..., pci 03:00) [placement: auto; ...]
 # G2b -- cold TTFT, baseline then pipelined (G2b: >= 1.6x at 8k and 32k, >= 1.7x at 64k) and decode tok/s unchanged
 .\tools\prefill\ttft_cli.ps1 -Device 1 -Lengths 8k,32k,64k -Runs 2 -OutDir E:\models\r4dx\pp\ttft_base
 .\tools\prefill\ttft_cli.ps1 -Pp -Lengths 8k,32k,64k -Runs 2 -OutDir E:\models\r4dx\pp\ttft_pp     # -ExtraArgs '--pp-split','32' to try a split
@@ -358,7 +388,7 @@ $env:HIP_VISIBLE_DEVICES='1,0'; .\build\win-hip\tests\model\test_pp_real_identit
 # or all of it, with a verdict file
 .\tools\pp\phase2.ps1 [-Dflash] [-Skip64k] [-SoakMinutes 5]       # E:\models\r4dx\pp\phase2\summary.txt
 # the server
-$env:HIP_VISIBLE_DEVICES='1,0'; .\build\win-hip\src\server\r4dx-server.exe --model <container> --layout trellis --pp 2 --prompt-checkpoint on ...
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue; .\build\win-hip\src\server\r4dx-server.exe --model <container> --layout trellis --pp 2 --prompt-checkpoint on ...   # --pp-devices B,A to override the placement
 ```
 
 `tool_pp_soak` (tests/model) logs one JSON line per iteration (both paths' prefill seconds, the speedup, decode tok/s, buffer drift on
@@ -379,11 +409,10 @@ was with both cards ramping; the soak does not read power).
 
 ## 5. What is not done
 
-* **No GPU run of Phase 2.** Everything in 4 compiles and its CPU tests pass; `test_pp_real_identity`, the TTFT numbers, the soak and
-  the server smoke have not been run. The risks that only a run answers: byte identity across the two devices at depth (the design's 7.1
-  evidence is the TP=2 real-vs-emulate equality, not this path); the cost of the GDN conv copy on a speculating B (a 2D copy of 6-byte rows, 10240
-  rows per layer -- `Stats::last_gdn_export_ms` / `last_gdn_wait_ms` show it); whether the ring's three slots and the per-chunk synchronize
-  (h ~ 1.3 ms) cost more than the design allowed; stage A's duty on the display card.
+* **The corrected placement has not been re-run.** Phase 2 is validated (status block), but on the placement with decode on the desktop card
+  (pci 03); the explicit `--pp-devices` / auto placement (decode on pci 07) and the per-entry `hipSetDevice` binding of the facade thread
+  are CPU-tested and compile, and need one GPU confirmation (4.7: placement log lines, `test_pp_real_identity` l4/bf16/plain and
+  real/plain, an 8k TTFT). The server smoke (`tools/server/smoke.ps1 -Pp 2`, below) has not been run either.
 * The auto-split at warm-up (`--pp-split auto` is the fixed default 33 / 35); Phase 0 says stage A is 6-7 % slower, so k = 32 is the
   first thing to try (`--pp-split 32`).
 * Phase 4 tuning (double-buffered export, option (b) of design 1.4: ship `cur` only), the ring-window DFlash injection skip, and Phase 5
@@ -402,9 +431,10 @@ Phase 1: `src/model/chunk_run.h`, `src/model/pp_stage.cpp`, `src/model/pp_plan.h
 `tools/pp/phase0.ps1`. Switches: `R4DX_PP_EMULATE=<k>` (off by default), `ModelOptions::pp_emulate_split`, `R4DX_CLOCK_PROBE=1` (existing; used by the
 clock step).
 
-Phase 2: `src/model/pp_channel.h` (ring, poison, slot / GDN wire arithmetic), `src/model/pp_sync.h` (mirror tracker, switches, device order),
+Phase 2: `src/model/pp_channel.h` (ring, poison, slot / GDN wire arithmetic), `src/model/pp_sync.h` (mirror tracker, switches, device placement),
 `src/model/pp_stage_real.cpp` (the stage compositions and hand-off primitives, `Model` members), `src/model/pp_model.{h,cpp}` (`PpModel`),
 `src/model/gdn_state.h` (live-state accessors), `src/model/text_model.h` (`PpOptions`, `LoadTextModel(opts, tp, pp)`), `src/model/model.{h,cpp}`
 (the roles, `ModelOptions::pp`), `src/cli/{cli_args.h,main.cpp}`, `src/server/{server_args.h,main.cpp,engine.{h,cpp}}`,
 `tests/model/test_pp_{channel,sync}_cpu.cpp`, `tests/model/test_pp_real_identity.cpp`, `tests/model/tool_pp_soak.cpp`, `tools/pp/{soak,phase2}.ps1`,
-`tools/prefill/ttft_cli.ps1 -Pp`, `tools/tp/tdr_watch.psm1 -HipVisibleDevices`. Switches: `--pp 2`, `R4DX_PP`, `R4DX_PP_VERIFY` (all off by default).
+`tools/prefill/ttft_cli.ps1 -Pp [-PpDevices B,A]`, `tools/tp/tdr_watch.psm1 -HipVisibleDevices`. Switches: `--pp 2`, `R4DX_PP`, `R4DX_PP_VERIFY` (all off by default),
+`--pp-devices` / `R4DX_PP_DEVICES` (placement; auto by default).

@@ -1,7 +1,8 @@
 // tests/model/test_pp_real_identity.cpp -- the REAL two-GPU pipeline-parallel prefill (docs/pp-prefill.md Phase 2, gate
 // G2a) leaves exactly the bits the monolithic prefill on the decode Model leaves. Needs BOTH cards and
-// HIP_VISIBLE_DEVICES=1,0 (process ordinal 0 = the headless decode card = stage B, ordinal 1 = the desktop card = stage A);
-// SKIPs (77) otherwise, and without the containers.
+// HIP_VISIBLE_DEVICES unset (or 0,1): stage B = the headless decode card = the last visible ordinal (physical device 1, pci
+// 07), stage A = the desktop card = ordinal 0 (pci 03); R4DX_PP_DEVICES=B,A overrides. SKIPs (77) with fewer than two
+// visible devices, and without the containers.
 //
 // One PpModel is loaded per configuration. Every scenario runs twice on it, from a fresh state: first MONOLITHIC -- the
 // decode Model (stage B's Model) driven directly, its pipeline role inactive, which is today's Model::Prefill -- and then
@@ -563,13 +564,11 @@ static int RunTest() {
 
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices < 2) {
-    std::fprintf(stderr, "[SKIP] the real pipeline needs two visible HIP devices (HIP_VISIBLE_DEVICES=1,0), found %d\n", devices);
+    std::fprintf(stderr, "[SKIP] the real pipeline needs two visible HIP devices (HIP_VISIBLE_DEVICES unset), found %d\n", devices);
     return kSkipReturnCode;
   }
-  if (const char* hvd = std::getenv("HIP_VISIBLE_DEVICES"); hvd == nullptr || std::string(hvd) != "1,0") {
-    std::fprintf(stderr, "[SKIP] HIP_VISIBLE_DEVICES must be 1,0 for the real pipeline, got '%s'\n", hvd == nullptr ? "" : hvd);
-    return kSkipReturnCode;
-  }
+  // Placement is PpModel's auto rule (stage B = the last visible ordinal = physical device 1, the headless card, stage A =
+  // ordinal 0 = the desktop card) unless R4DX_PP_DEVICES=B,A says otherwise; every PpModel::Load logs the PCI buses.
 
   if (FileExists(kL4Container)) {
     for (Layout layout : {Layout::kBf16, Layout::kW4a16}) {

@@ -24,10 +24,12 @@ param(
   [string[]]$ExtraArgs = @(),
   [switch]$ProfilePrefill,
   [switch]$AllowOthers,
-  # Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 with HIP_VISIBLE_DEVICES=1,0 (stage B = the decode card on
-  # ordinal 0, stage A = the desktop card). Extra knobs (-ExtraArgs '--pp-split','35') as usual. The first Prefill after
-  # load includes nothing the warm-up did not already touch. Exclusive with -Tp 2 and -ProfilePrefill.
-  [switch]$Pp
+  # Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 with HIP_VISIBLE_DEVICES unset (both cards visible; stage B =
+  # the decode card = the last visible ordinal = physical device 1, the same card the -Device 1 baseline uses; stage A = the
+  # desktop card). -PpDevices 'B,A' passes --pp-devices. Extra knobs (-ExtraArgs '--pp-split','35') as usual. The first
+  # Prefill after load includes nothing the warm-up did not already touch. Exclusive with -Tp 2 and -ProfilePrefill.
+  [switch]$Pp,
+  [string]$PpDevices = ''
 )
 $ErrorActionPreference = 'Stop'
 [string]$LengthList = ($Lengths -join ',')  # a,b arrives as an array
@@ -39,7 +41,7 @@ if ($others.Count -gt 0 -and -not $AllowOthers) {
 }
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 if ($Pp -and ($Tp -eq 2 -or $ProfilePrefill)) { throw "[ttft] -Pp is exclusive with -Tp 2 and -ProfilePrefill" }
-if ($Pp) { $env:HIP_VISIBLE_DEVICES = '1,0' }
+if ($Pp) { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
 elseif ($Tp -eq 2) { $env:HIP_VISIBLE_DEVICES = '0,1' } else { $env:HIP_VISIBLE_DEVICES = "$Device" }
 $lenTokens = @{ '4k' = 4096; '8k' = 8192; '16k' = 16384; '32k' = 32768; '64k' = 65536; '128k' = 131072 }
 $head = (git -C $repo rev-parse --short HEAD)
@@ -54,9 +56,10 @@ foreach ($len in $LengthList.Split(',')) {
     if ($ProfilePrefill) { $a += '--profile-prefill' }
     if ($Tp -eq 2) { $a += @('--tp', '2') }
     if ($Pp) { $a += @('--pp', '2') }
+    if ($Pp -and $PpDevices) { $a += @('--pp-devices', $PpDevices) }
     $a += $ExtraArgs
     $log = Join-Path $OutDir ("ttft_{0}_{1}{2}.log" -f $len, $r, $(if ($ProfilePrefill) { '_profile' } else { '' }))
-    Write-Output "[ttft] HIP_VISIBLE_DEVICES=$($env:HIP_VISIBLE_DEVICES) $len run $r -> $log"
+    Write-Output "[ttft] HIP_VISIBLE_DEVICES=$(if ($env:HIP_VISIBLE_DEVICES) { $env:HIP_VISIBLE_DEVICES } else { '<unset>' }) $len run $r -> $log"
     $t0 = Get-Date
     # Start-Process (not &): PowerShell 5.1 would wrap every stderr line in an ErrorRecord.
     $p = Start-Process -FilePath $Cli -ArgumentList $a -NoNewWindow -Wait -PassThru `

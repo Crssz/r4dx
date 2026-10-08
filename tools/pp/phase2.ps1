@@ -7,7 +7,8 @@
 
 .DESCRIPTION
   GPU RUN -- needs the user's approval, and NEVER while an r4dx-* process exists (the pre-flight refuses). Uses BOTH cards
-  (HIP_VISIBLE_DEVICES=1,0 for the pipeline, =1 for the baselines); the first long prefills load the desktop card for
+  (HIP_VISIBLE_DEVICES unset for the pipeline -- PpModel puts decode on the last visible ordinal = physical device 1, the
+  headless card; =1 for the baselines); the first long prefills load the desktop card for
   seconds at a time, so run it with the user present (docs/pp-prefill.md 4: power, TDR).
 
     1  identity   build\...\tests\model\test_pp_real_identity.exe (G2a): real PP == monolithic, bit for bit, on the
@@ -79,10 +80,11 @@ function Format-Arg([string]$a) {
     $q = $q -replace '(\\+)$', '$1$1'
     return '"' + $q + '"'
 }
-# Runs $Exe with HIP_VISIBLE_DEVICES=$Hip, stdout / stderr to <Prefix>.out.txt / .log; returns the exit code.
+# Runs $Exe with HIP_VISIBLE_DEVICES=$Hip ('' = UNSET: both cards visible, which is what the pipeline wants -- an EMPTY value
+# would hide every card), stdout / stderr to <Prefix>.out.txt / .log; returns the exit code.
 function Invoke-Tool([string]$Exe, [string[]]$ArgList, [string]$Prefix, [string]$Hip, [hashtable]$ExtraEnv = @{}) {
     $saved = $env:HIP_VISIBLE_DEVICES
-    $env:HIP_VISIBLE_DEVICES = $Hip
+    if ($Hip) { $env:HIP_VISIBLE_DEVICES = $Hip } else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
     $savedExtra = @{}
     foreach ($k in $ExtraEnv.Keys) { $savedExtra[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $ExtraEnv[$k]) }
     try {
@@ -108,7 +110,7 @@ Say "start; build $BuildDir; out $OutDir; head $(git -C $repo rev-parse --short 
 # ---- 1 identity (G2a) ---------------------------------------------------------------------------------------------
 if (-not $SkipIdentity) {
     Say "G2a: test_pp_real_identity (this takes a while: several model loads on two cards)"
-    $code = Invoke-Tool $identityExe @() (Join-Path $OutDir 'identity') '1,0'
+    $code = Invoke-Tool $identityExe @() (Join-Path $OutDir 'identity') ''
     $tail = (Get-Content (Join-Path $OutDir 'identity.log') -Tail 4 -ErrorAction SilentlyContinue) -join ' | '
     $fails = @(Select-String -Path (Join-Path $OutDir 'identity.log') -Pattern '^FAIL ' -ErrorAction SilentlyContinue).Count
     Gate 'G2a identity' ($code -eq 0) "exit $code, $fails FAIL line(s); $tail"
@@ -168,7 +170,7 @@ if (-not $SkipDecode) {
         for ($i = 1; $i -le 3; $i++) {
             $prefix = Join-Path $OutDir "decode_${mode}_$i"
             $args2 = $common + $(if ($mode -eq 'pp') { @('--pp', '2') } else { @() })
-            $code = Invoke-Tool $cli $args2 $prefix $(if ($mode -eq 'pp') { '1,0' } else { '1' })
+            $code = Invoke-Tool $cli $args2 $prefix $(if ($mode -eq 'pp') { '' } else { '1' })
             $text = Get-Content "$prefix.log" -Raw -ErrorAction SilentlyContinue
             $m = [regex]::Match($text, 'decode: (\d+) tok in ([\d.]+)s \(([\d.]+) tok/s\)')
             if ($code -eq 0 -and $m.Success) { $rates[$mode] += [double]$m.Groups[3].Value }

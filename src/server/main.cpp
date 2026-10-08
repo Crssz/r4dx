@@ -123,6 +123,7 @@ int main(int argc, char** argv) {
   }
   // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): ModelOptions::pp (-1 follows R4DX_PP) and PpOptions' knobs.
   opts.model_opts.pp = args.pp == 2 ? 2 : (args.pp == 1 ? 0 : -1);
+  opts.pp.devices = args.pp_devices;
   opts.pp.split = args.pp_split;
   if (args.pp_min_rows > 0) opts.pp.min_rows = args.pp_min_rows;
   opts.pp.verify = args.pp_verify;

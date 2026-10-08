@@ -978,6 +978,11 @@ void Model::Reset() {
   // A checkpoint describes the conversation just dropped. Its buffers are left alone.
   ckpt_pos_ = -1;
   at_prefill_end_ = false;
+  // An armed stage-side DFlash tail capture (hybrid_model.cpp) belongs to the call just dropped; nothing is armed outside the hybrid mode.
+  if (dflash_tail_) {
+    dflash_tail_.reset();
+    ClearDflashCaptureObserver();
+  }
 }
 
 void Model::SaveCheckpoint() {

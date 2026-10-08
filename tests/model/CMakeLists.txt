@@ -90,6 +90,19 @@ set(R4DX_MODEL_TESTS
   # copy, StageSetSyncState on both roles, TpAdoptPrefill, the stage-KV check. Device 1, SKIP 77 without the 4-layer container.
   # Written, NOT run by its author (CPU-only session). test_stage_load_cpu below is the policy half.
   test_stage_load
+  # Hybrid mode P2 part 1 (docs/pp-tp2-hybrid.md 3, 4, 9): the reshard executor (Model::ReshardExport / ReshardImport / ReshardCopyLocal driven by
+  # the copy ops of ScatterPlan / GatherPlan) and the live-state hooks (DebugLiveStateDigest, DebugExport / ImportLiveState, DebugExport /
+  # ImportFullState) on the 4-layer container, ONE device: a TP=1 Model plays both stages, a TpModel in emulate mode the ranks. Scatter through the
+  # host hop and device-to-device, the import path, decode from both (G-H2 lite), the warm gather, nine negative controls and the guards, the
+  # speculative-window collapse (window slots and write-once). Links the R4DX_TP_TESTING variant. Device 1, SKIP 77 without the container.
+  # Written, NOT run by its author (CPU-only session).
+  test_reshard_exec
+  # Hybrid mode P2 part 1, the DFlash tail (docs/pp-tp2-hybrid.md 6, 9 Gate C): a) two production drafters (~4 GiB, no target): a tail-fed ring ==
+  # a fully fed one under the TP-thread tuning flag (cold, warm, image run, short call; 4 negative controls); b) the stage-side capture
+  # (StageArmDflashTail) on the 4-layer container, plain / warm / PP-emulate; c) Model::TpInjectDflashTail end to end on the production target +
+  # drafter as one TP=1 Model (~17 GiB). R4DX_TEST_ONLY=a|b|c picks a part. Links the R4DX_TP_TESTING variant. Device 1; SKIP 77 when nothing exists.
+  # Written, NOT run by its author (CPU-only session).
+  test_dflash_tail
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -97,7 +110,8 @@ foreach(t ${R4DX_MODEL_TESTS})
   # The tensor-parallel tests link the R4DX_TP_TESTING variant of r4dx_model (its test hooks,
   # src/model/CMakeLists.txt); every other test links the production library.
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
-     t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity")
+     t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity" OR
+     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -328,6 +342,22 @@ add_executable(test_tp_tuning_scope test_tp_tuning_scope.cpp)
 target_link_libraries(test_tp_tuning_scope PRIVATE r4dx_model_linear)
 add_test(NAME test_tp_tuning_scope COMMAND test_tp_tuning_scope)
 set_tests_properties(test_tp_tuning_scope PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+# Hybrid mode P2 (docs/pp-tp2-hybrid.md 3, 4, 6, 9), the HIP-free half. test_live_digest_cpu: src/model/live_digest.h + live_state.h, the
+# canonical digest of the LIVE state (every live KV byte moves it, no dead one does; a device-shaped holder with garbage past the rows,
+# stale window slots and long conv lines digests like its host image, full and per rank) and the checksummed dump file the one-device
+# gates hand a TP=1 reference state across processes. test_reshard_exec_cpu: src/model/reshard_exec.h, the executor's address
+# arithmetic (RectOf, row slices, ring batches) over the real 27B plans and run as a host executor against ReshardRef, with stage B's
+# longer conv lines. test_dflash_tail_cpu: src/model/dflash_tail_plan.h, the tail start on the call's 64-row grid, the capture
+# bookkeeping and a simulated drafter ring (a tail-fed ring == a fully fed one). Negative controls in each; no HIP call, always run.
+add_executable(test_live_digest_cpu test_live_digest_cpu.cpp)
+target_link_libraries(test_live_digest_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_live_digest_cpu COMMAND test_live_digest_cpu)
+add_executable(test_reshard_exec_cpu test_reshard_exec_cpu.cpp)
+target_link_libraries(test_reshard_exec_cpu PRIVATE r4dx_tp_shard)
+add_test(NAME test_reshard_exec_cpu COMMAND test_reshard_exec_cpu)
+add_executable(test_dflash_tail_cpu test_dflash_tail_cpu.cpp)
+target_include_directories(test_dflash_tail_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_dflash_tail_cpu COMMAND test_dflash_tail_cpu)
 
 # tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
 # TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never

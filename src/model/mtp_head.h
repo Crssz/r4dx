@@ -197,6 +197,10 @@ class MtpHead {
                const std::vector<int32_t>& next_tokens, const uint16_t* embed_table, int64_t vocab,
                int64_t host_staging_offset = 0, const int32_t* rope3_host = nullptr);
 
+  // The head's own paged KV cache (same layout as a backbone layer's): the hybrid mode's reshard executor copies it between a stage and a
+  // TP rank (Model::ReshardExport / ReshardImport, docs/pp-tp2-hybrid.md 3). Nothing else touches it from outside.
+  attention::PagedKvCache& KvCache() { return kv_; }
+
 #ifdef R4DX_TP_TESTING
   // Test hook (docs/tp.md 10.1, the H6 exactness check of tests/model/test_tp_emulation.cpp): while
   // capture is on, every step of a full-vocab draft that merges its argmax across ranks (TP only)

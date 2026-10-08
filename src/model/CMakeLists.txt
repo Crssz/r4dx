@@ -133,6 +133,8 @@ set(R4DX_MODEL_SOURCES
   pp_stage.cpp
   # The real two-GPU pipeline's Model side (Phase 2): the stage A / stage B chunk compositions and the state hand-off.
   pp_stage_real.cpp
+  # Hybrid mode P2 (docs/pp-tp2-hybrid.md 3, 4, 6): the reshard executor, the DFlash tail and the live-state test hooks -- Model member code.
+  hybrid_model.cpp
   # The PpModel facade (--pp 2): stage A's rank thread + the decode Model, one TextModel.
   pp_model.cpp
   # docs/tp.md 2.8: the TextModel surface src/cli and src/server call -- LocalTextModel (TP=1, a

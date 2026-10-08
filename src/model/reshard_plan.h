@@ -295,6 +295,11 @@ struct ReshardPlan {
 struct PlanParams {
   StageLayers stage[2];
   int64_t stage_conv_pitch = 3, rank_conv_pitch = 3;
+  // Stage B's conv line pitch when it differs from stage A's `stage_conv_pitch` (0 = the same). Stage B carries the MTP head, so it is
+  // loaded with mtp_draft_k > 0 and its GDN state is sized for the verify window (conv_width - 2 + window entries per channel, like a
+  // speculating rank), while stage A, which has no head, keeps the compact conv_width - 1 (Model::ReshardConvPitch has the Model's).
+  int64_t stage_b_conv_pitch = 0;
+  int64_t StageConvPitch(int stage) const { return stage == kStageB && stage_b_conv_pitch > 0 ? stage_b_conv_pitch : stage_conv_pitch; }
   bool mtp = true;  // the MTP head KV is part of the state (stage B only)
   // `rank_conv_pitch` is the TP rank Model's conv line pitch (state_len_max): conv_width - 2 + window for a speculating rank, so
   // it is the caller's to give (a default of the compact conv_live would silently mis-address every conv run of a real rank).
@@ -361,7 +366,7 @@ inline CopyOp ConvOp(const StateGeometry& g, const PlanParams& p, int64_t layer,
   op.stage = stage;
   op.rank = rank;
   op.local = RankOfStage(stage) == rank;
-  const uint64_t fp = static_cast<uint64_t>(p.stage_conv_pitch) * 2, rp = static_cast<uint64_t>(p.rank_conv_pitch) * 2;
+  const uint64_t fp = static_cast<uint64_t>(p.StageConvPitch(stage)) * 2, rp = static_cast<uint64_t>(p.rank_conv_pitch) * 2;
   for (const ConvSegment& c : m.conv) {
     Run2D r;
     r.full_off = static_cast<uint64_t>(c.full_begin) * fp;

@@ -48,6 +48,8 @@
 #include "step_meta.h"      // the one-copy decode step metadata layout (decode-t1 item 5)
 #include "prefill_int8.h"   // R4DX_PREFILL_INT8 (docs/int8-prefill.md "Production path")
 #include "stage_sync.h"     // StageSyncState: the scalars handed between a TP rank and the hybrid mode's stages
+#include "live_state.h"     // hybrid::LiveState / DigestList: host images of the live state (HIP-free; the debug hooks below)
+#include "reshard_exec.h"   // hybrid::CopyOp / OpSlice / Side: the reshard executor's vocabulary (HIP-free)
 #include "r4dx/core/arena.hpp"
 // Sampled decode (docs/sampling.md): SampleParams/SampleCanonical/DrawUniform01 plus the RowSummary
 // the device summary kernel fills and SampleFromSummary consumes. Header-only and HIP-free, so this
@@ -1020,8 +1022,91 @@ class Model {
   // std::logic_error for a pipeline stage or a state that is not a finished prefill (pos <= 0). Device idle; not collective.
   void TpAdoptPrefill(const StageSyncState& s);
 
+  // ---- hybrid mode: the reshard executor (docs/pp-tp2-hybrid.md 3, 7; hybrid_model.cpp) ---------------------------------------
+  // The live state of a pipeline stage (the TP=1 layout: every head) and of a TP=2 rank (its head half) moves by the copy ops of a
+  // hybrid::ReshardPlan (reshard_plan.h): this is the executor that takes those ops, so the plan the CPU test checks IS what runs.
+  // `side` says which holder of the op THIS Model is: Side::kFull for a TP=1 Model or a stage (a stage-only Model must be the op's
+  // stage), Side::kRank for a TP=2 rank (it must be the op's rank). A Model that holds no buffer for the op's layer throws.
+  //   * ReshardExport copies the slice's bytes out of this Model's layer buffer into `host`, compact (row after row), ReshardImport
+  //     the other way. `host` is caller-owned pinned memory of at least hybrid::SliceBytes(op, slice) bytes. Both only ENQUEUE on this
+  //     Model's stream (ReshardStream): the caller orders the other card's side after it (ReshardSync here, then the other Model's
+  //     import) and synchronizes before it reads or reuses `host`. No allocation, no host synchronization: usable from a rank thread
+  //     inside a command.
+  //   * ReshardCopyLocal is the same-card half (op.local): one device-to-device 2D copy from the source Model's buffer to the
+  //     destination's, on the DESTINATION's stream; both Models must be idle on entry (every public call ends idle).
+  //   * Recurrent and conv ops address the LIVE state (window 0 / offset 0), so a speculating Model must be collapsed first
+  //     (ReshardCollapse, stream-ordered); a Model with a pending window or write-once prefix refuses the op instead of copying the
+  //     wrong slot.
+  //   * A conv op through a pitched line stages through a small device scratch: ReshardInit allocates it, once, outside the hot path
+  //     (a Model that never needs it -- compact conv lines -- may skip the call); a missing scratch throws.
+  // The op's pitches and widths are checked against this Model's own buffers, so a plan built for another geometry (a wrong
+  // rank_conv_pitch, a cache of another size) is an error, not a mis-addressed copy.
+  void ReshardInit();
+  void ReshardCollapse();
+  // The conv line pitch of this Model's GDN state in ENTRIES per channel (conv_width - 2 + window): hybrid::PlanParams::rank_conv_pitch
+  // for a rank, stage_conv_pitch / stage_b_conv_pitch for a stage (a stage with an MTP head is sized for the verify window too).
+  int64_t ReshardConvPitch() const;
+  void ReshardExport(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, uint8_t* host);
+  void ReshardImport(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, const uint8_t* host);
+  static void ReshardCopyLocal(Model& stage, Model& rank, const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Dir dir);
+  hipStream_t ReshardStream() const { return stream_.get(); }
+  void ReshardSync() { stream_.Synchronize(); }
+
+  // ---- hybrid mode: the DFlash tail (docs/pp-tp2-hybrid.md 3, 6; hybrid_model.cpp; dflash_tail_plan.h has the rules) -----------
+  // On a rank Model with a drafter, after TpAdoptPrefill: injects the tail rows [start_pos, start_pos + rows) of the finished call
+  // into the drafter's ring from host feature rows `features` ([rows][DflashFeatureCols()] bf16, the stage's capture), in the
+  // 64-row slices RunChunk injects, each with the temporal rope row `rope_t + row0` (host int32[rows]; nullptr when the conversation
+  // has no image: the drafter then ropes at start + t + its delta, as RunChunk does). The tail must end at PositionCount() and
+  // start at or after the drafter's frontier; a gap (the usual case, start = max(p0, n - 2048 aligned)) must cover a whole window
+  // (hybrid::CheckTailInject). Runs the drafter's GEMMs, so the thread's tuning flag must equal this Model's (CheckTuningScope).
+  // Synchronous. Not a stage.
+  void TpInjectDflashTail(const uint16_t* features, int64_t rows, int64_t start_pos, const int32_t* rope_t);
+  // Stage side: captures the feature rows of positions [start_pos, end_pos) as this Model's chunks drain them (the capture observer),
+  // into `host` ([capacity_rows][DflashFeatureCols()] bf16, caller-owned pinned memory). Needs AttachDflashFeatureCapture and a Model
+  // whose prefill drains its chunks (a monolithic Model, PP-emulate, or the pipeline's stage B -- stage A never drains; its columns
+  // arrive in the carry). Armed before a Prefill / PrefillMultimodal call, disarmed after it; the device copies are asynchronous, so
+  // StageDisarmDflashTail synchronizes and returns the number of rows captured, throwing if the call left a gap in [start, end).
+  // Do not move the Model while armed. Takes the capture-observer slot (throws if another observer is set).
+  void StageArmDflashTail(uint16_t* host, int64_t capacity_rows, int64_t start_pos, int64_t end_pos);
+  int64_t StageDisarmDflashTail();
+  bool StageDflashTailArmed() const { return dflash_tail_ != nullptr; }
+
+#ifdef R4DX_TP_TESTING
+  // ---- hybrid mode test hooks (docs/pp-tp2-hybrid.md 4; hybrid_model.cpp) ------------------------------------------------------
+  // The digest of the LIVE state only, as canonical (layer, head, row) records (live_digest.h documents the names): per attention
+  // layer KV rows < pos, the MTP head's KV rows < pos - 1, per GDN layer the live recurrent slot (the window rule of
+  // DebugLiveGdnDigest) and the three live conv entries per channel (at the offset a speculative round left them), the DFlash
+  // drafter's visible window and injected count, and "pos". A host image digests identically (hybrid::DigestLiveImage), which is what
+  // makes the hybrid-prefilled rank comparable with a rank image loaded through DebugImportLiveState / DebugImportFullState. Unlike
+  // DebugStateDigest it is valid after warm turns and decode. Synchronizes; may flush a pending write-once prefix (invisible).
+  hybrid::DigestList DebugLiveStateDigest();
+  // The live state as a host image of THIS Model's geometry (a TP=1 Model: the full-head image; a rank: its head half), canonical
+  // (hybrid::CanonicalizeKv) so equal states are equal bytes, plus the scalars (StageGetSyncState). Requires pos > 0.
+  hybrid::LiveState DebugExportLiveState();
+  // Loads an image of THIS Model's geometry (DebugExportLiveState's shape) as the live state: KV and MTP-KV blocks, the live recurrent
+  // slot and the three live conv entries per channel, then the scalars through TpAdoptPrefill (so the Model is as after a finished
+  // prefill). A stage-only Model refuses. The DFlash ring is not part of the image (TpInjectDflashTail fills it).
+  void DebugImportLiveState(const hybrid::LiveState& state);
+  // Dump a TP=1 Model's live state to `path` (hybrid::WriteLiveState: a checksummed file, the `extra` payloads included when a test
+  // adds them through DebugExportLiveState + WriteLiveState itself) / load a FULL-head state file into this Model: a TP=1 Model takes
+  // it as it is, a TP rank takes its head half of it (hybrid::ReshardRef over StateGeometry::FromRules(GlobalConfig())).
+  void DebugExportFullState(const std::string& path);
+  void DebugImportFullState(const std::string& path);
+#endif
+
  private:
   Model() = default;
+
+  // The reshard executor's lookup (hybrid_model.cpp): the device address of the first byte of `slice` in this Model's buffer for `op`
+  // (the Model must hold `side` of the op), `*rect` the rectangle it covers; every pitch and extent is checked against the buffer.
+  uint8_t* ReshardLocate(const hybrid::CopyOp& op, const hybrid::OpSlice& slice, hybrid::Side side, const char* who, hybrid::Rect* rect);
+  void CheckGdnLiveInPlace(const char* who) const;
+  // The GDN slot and conv-history offset the live state of `gs` is in (DebugLiveGdnDigest's window rule; the write-once recurrent state
+  // is in its one slot, its conv history follows the same offset).
+  void LiveGdnPlace(GdnStateManager& gs, int32_t* slot, int64_t* conv_off) const;
+  core::DeviceBuffer<uint8_t> reshard_scratch_;  // ReshardInit: one pitched conv line's live entries, compact
+  struct DflashTailState;                        // StageArmDflashTail's capture (hybrid_model.cpp)
+  std::shared_ptr<DflashTailState> dflash_tail_;
 
   // StageSetSyncState / TpAdoptPrefill's shared write of the scalars and the seed.
   void ApplySyncState(const StageSyncState& s, bool at_prefill_end);

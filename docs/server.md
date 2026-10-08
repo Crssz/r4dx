@@ -1302,11 +1302,16 @@ r4dx-server --model <container.r4dx> --layout {trellis|w4a16|bf16}
     [--image-max-pixels N] [--request-log <path>] [--request-log-tokens]
     [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
     [--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N]
-    [--tp-max-inflight K]
+    [--tp-max-inflight K] [--pp {1|2}] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify]
+    [--pp-submit-layers N] [--pp-max-inflight K]
 ```
 
 `--tp 2` (default 1) and the `--tp-*` flags: tensor parallel across two ranks, the same flags,
 defaults, ranges and usage errors as `r4dx-cli`'s (docs/tp.md 9.1); see "Tensor parallel" below.
+
+`--pp 2` and the `--pp-*` flags (off by default; `R4DX_PP=1` when `--pp` is not given): prompt prefill as a two-stage pipeline
+across both GPUs with decode unchanged on the headless card -- needs `HIP_VISIBLE_DEVICES=1,0`, excludes `--tp 2`
+(`docs/pp-prefill.md`, `docs/usage.md`). After a failed request the next request's `Reset()` heals both stages, as under TP.
 
 `--mtp N` (default 0): see "MTP" above -- requires an MTP-converted `--model` container when N>0.
 

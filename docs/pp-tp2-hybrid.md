@@ -385,3 +385,33 @@ Expect (besides the existing dflash lines `[PASS] dflash/c2125`, `dflash/c8145`,
 ### 17.5 What P4 still needs from the user's session
 
 Run 17.1 (five commands), 17.2 (5 then 60 minutes), 17.3, 17.4; the server fault-injection rows of the design are `test_tp_hybrid_identity` (A throws, B throws, reshard, gather, adopt: already written) plus smoke `-TpFault` (the all-reduce fault after a hybrid prefill, 17.1); the first 128k hybrid prompt with the user present (`ttft_cli.ps1 -Tp 2 -Pp -Lengths 128k`).
+
+## 18. Validation results (2026-10-08, both cards, ROCm 10.1.0; `E:\models\r4dx\hybrid_p2`, `hybrid_p3`, `hybrid_p4`)
+
+Status: **validated; off by default** (`--tp 2 --pp 2` selects it; `--hybrid off` / `R4DX_HYBRID=0` is the kill switch).
+
+* **Identity.** P0/P2 gates on device 1 (`test_stage_load`, `test_reshard_exec`, `test_dflash_tail`,
+  `test_hybrid_emulate_identity` 5 configurations incl. the 16-layer production container and full-depth Gate B; NC10 flips on the
+  production container). Two-GPU: `test_tp_hybrid_identity` PASS (2 configurations, incl. six fault-injection cases that heal),
+  `test_hybrid_real_identity` PASS (mtp: cold 1024 / 2125 / 8145, below-min, warm plain / mtp, checkpoint, over-S; dflash: cold, warm
+  dflash, image straddling the tail window; controls wrong-rank, stale mirror, stale seed, skipped tail all detected).
+  `test_pp_real_identity` (9 configurations) and `tp1_identity` (rows 1-6, 8, 9 EQUAL to main) unchanged: `--pp 2`, TP=1 and
+  `--tp 2` without the hybrid keep their bytes.
+* **KL (G-H3).** canon 1024: KL(TP=1||hybrid) 0.000642 against the TP=2 floor 0.001400 (top-1 98.93 % vs 98.73 %); 8k segments:
+  0.000487 against 0.002340 (99.22 % vs 98.96 %). The hybrid's prefill is TP=1's, so it is closer to TP=1 than `--tp 2` is.
+* **TTFT (G3, idle machine, median of 3).** 8k 1.771 s (`--pp 2` 1.768, `--tp 2` 2.894); 32k 7.776 s (7.767 / 12.136); 128k
+  44.01 s (`--pp 2` 44.20 s). Greedy output identical to TP=1 at 8k and 32k. VRAM at 128k: device 0 (desktop, stage X + rank 1)
+  20.14 GiB used, 11.72 free; device 1 (stage Y + rank 0) 22.83 used, 9.03 free.
+* **Decode (G3).** 8k prompt + 512-token essay, median of 3: plain 59.8 tok/s (= `--tp 2` 59.8, x0.999; `--pp 2` 36.3); end to end
+  10.35 s vs 11.39 s (`--tp 2`) vs 15.88 s (`--pp 2`). With `--dflash 7`: 93.7 tok/s vs 103.7 (x0.904 on that prompt) but end to
+  end 7.24 s vs 7.94 s vs 9.21 s. Over 6 prompts (4 short with `--pp-min-rows 1`, 8k and 32k essays) DFlash averages 3.10 tok/round
+  (hybrid) / 3.25 (`--tp 2`) / 3.20 (`--pp 2`) at 34.1 / 32.8 / 43.4 ms per round; per prompt the hybrid is ahead (short1 3.14 vs
+  2.80), behind (short2 5.00 vs 6.22) or equal (short4, essay32k), and on short1 it equals `--pp 2` exactly (both have TP=1's
+  prefill), so the drafter state is right and the gap is the texts diverging. The x0.98 DFlash decode gate is therefore recorded as
+  a caveat (acceptance is content-dependent), not a defect. Several of these runs waited for a game on the desktop card.
+* **Server smoke.** l4, plain, `--dflash` + tool round trip + vision + image-straddle sweep, `--mtp 3`, `--dflash` + TP fault: all
+  checks passed.
+* **Soak (G-H4).** 5 min plain (35 iterations, 48 pipelined / 11 TP prefill), 5 min `--dflash` (41 iterations, 72 / 24, canaries
+  equal, TP=2 reference 0 first-token differences), 60 min `--dflash` (488 iterations, 3.34 M tokens, 49 canaries all equal, 799 pipelined / 215 TP prefill, buffer drift 0.0005 MiB, TP=2 reference 1 of 40 differing at the first token, which the soak's bound allows: the two prefills are not token-equal). No TDR in any run. The soak's per-call stats show reshard times of 60-100 ms on 4-7k-row calls with DFlash, above the design's ~10 ms estimate; cold TTFT nevertheless equals `--pp 2` (1.771 vs 1.768 s at 8k), so the reshard overlaps or the soak's contention inflates it -- the first thing to look at in the optional P5.
+* **Caveats.** Text is not bit-identical to `--tp 2` (or to TP=1: decode runs at TP=2). Prompts under 1024 rows and calls past the
+  stage-KV capacity S take the `--tp 2` prefill. Each card holds two copies of its share of the model (VRAM above); load is longer.

@@ -32,6 +32,7 @@
 #include "mtp_round.hpp"
 #include "preprocess.h"  // src/vision: ImageProcessorConfig (docs/vision.md "Large images")
 #include "r4dx/kernels/sampler.hpp"
+#include "pp_model.h"    // r4dx::model::PpModel::StatsLine (--stats with --pp 2, docs/pp-prefill.md)
 #include "text_model.h"  // r4dx::model::TextModel / LoadTextModel (docs/tp.md 2.8)
 #include "tp_model.h"    // r4dx::model::TpModel::StatsLine (--stats with --tp 2, docs/tp.md 9.1)
 #include "tokenizer.h"
@@ -507,11 +508,22 @@ int RunMain(int argc, char** argv) {
     if (args.tp_max_inflight >= 0) tpo.max_inflight_units = args.tp_max_inflight;
   }
 
+  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): --pp 2 (or R4DX_PP=1) loads a half-weight stage A on the desktop
+  // card next to the decode Model; decode is unchanged. LoadTextModel reads ModelOptions::pp (-1 follows R4DX_PP).
+  opts.pp = args.pp == 2 ? 2 : (args.pp == 1 ? 0 : -1);
+  r4dx::model::PpOptions ppo;
+  ppo.devices = args.pp_devices;
+  ppo.split = args.pp_split;
+  if (args.pp_min_rows > 0) ppo.min_rows = args.pp_min_rows;
+  ppo.verify = args.pp_verify;
+  if (args.pp_submit_layers >= 0) ppo.submit_layers = args.pp_submit_layers;
+  if (args.pp_max_inflight >= 0) ppo.max_inflight = args.pp_max_inflight;
+
   // The pre-load VRAM reading is a HIP call on this thread, which under --tp 2 (the facade thread)
   // must make none (docs/tp.md 2.8); the TP load log prints every rank's free/total instead.
   const double vram_before = args.tp == 1 ? VramUsedGiB() : 0.0;
   const auto load_t0 = Clock::now();
-  std::unique_ptr<r4dx::model::TextModel> model = r4dx::model::LoadTextModel(opts, tpo);
+  std::unique_ptr<r4dx::model::TextModel> model = r4dx::model::LoadTextModel(opts, tpo, ppo);
   const auto load_t1 = Clock::now();
   // Every rank's device usage as the model reports it: at --tp 1 exactly the pre-TextModel
   // VramUsedGiB() reading (one hipMemGetInfo on this thread); under --tp 2 one per rank, taken on
@@ -524,7 +536,17 @@ int RunMain(int argc, char** argv) {
   };
 
   if (args.stats) {
-    if (args.tp == 1) {
+    if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) != nullptr) {
+      // --pp 2: the pre-load reading was taken on the process default device, which is not the decode card here, so there is no
+      // single before/after delta; the per-stage VRAM follows (the load log has printed the placement).
+      std::fprintf(stderr, "[stats] container load: %.2fs (--pp 2)\n", Seconds(load_t0, load_t1));
+      for (const r4dx::model::VramReport& r : model->Vram()) {
+        std::fprintf(stderr,
+                     "[stats] pp stage %c (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; this process's "
+                     "buffers %.2f GiB\n",
+                     r.rank == 0 ? 'B' : 'A', r.device, r.used_gib, r.free_gib, r.total_gib, r.buffers_gib);
+      }
+    } else if (args.tp == 1) {
       const double vram_after = VramUsedGiB();
       std::fprintf(stderr, "[stats] container load: %.2fs, VRAM used: %.2f GiB (delta %.2f GiB)\n",
                    Seconds(load_t0, load_t1), vram_after, vram_after - vram_before);
@@ -669,8 +691,8 @@ int RunMain(int argc, char** argv) {
       // rather than killing the session (std::exit(1)).
       std::fprintf(stderr, "warning: chat template re-render did not extend the previous token "
                             "prefix; dropping state and re-prefilling the whole conversation\n");
-      if (args.tp == 1) {
-        model = r4dx::model::LoadTextModel(opts, tpo);
+      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr) {
+        model = r4dx::model::LoadTextModel(opts, tpo, ppo);
       } else {
         // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same
         // per-sequence state without touching a weight.
@@ -809,6 +831,16 @@ int RunMain(int argc, char** argv) {
         if (auto* tpm = dynamic_cast<r4dx::model::TpDiagnostics*>(model.get())) {  // TpModel or GemmaTpModel
           std::fprintf(stderr, "[stats] %s\n", tpm->GroupStatsLine().c_str());
         }
+      }
+      if (auto* ppm = dynamic_cast<r4dx::model::PpModel*>(model.get())) {
+        // docs/pp-prefill.md Phase 2: one VRAM line per stage, then the pipeline's counters.
+        for (const r4dx::model::VramReport& v : model->Vram()) {
+          std::fprintf(stderr,
+                       "[stats] pp stage %c (HIP device %d): VRAM used %.2f GiB, free %.2f GiB of %.2f GiB; this "
+                       "process's buffers %.2f GiB\n",
+                       v.rank == 0 ? 'B' : 'A', v.device, v.used_gib, v.free_gib, v.total_gib, v.buffers_gib);
+        }
+        std::fprintf(stderr, "[stats] %s\n", ppm->StatsLine().c_str());
       }
       if (!args.dflash.empty()) {
         const double accept_rate = r.dflash_drafted > 0

@@ -1,4 +1,28 @@
-> **Detailed usage notes.** This page was the project README before it was rewritten as a short overview.
+>
+### Pipelined prefill across both GPUs (`--pp 2`, off by default)
+
+`--pp 2` (or `R4DX_PP=1`) keeps decode exactly as it is -- the whole model on the headless card (HIP device 1) -- and splits only the
+prompt prefill: the first 33 layers (35 with `--dflash`) and the embedding run on the desktop card (HIP device 0), the rest on the
+decode card, 256-row chunk by chunk with the two cards working on neighbouring chunks, the hidden state and the KV rows crossing through
+pinned host memory. The result is bit-identical to the one-card prefill (the gate is `tests/model/test_pp_real_identity`); measured on
+the GPUs (2026-10-08): cold prefill 1.85x / 1.90x / 1.91x faster at 8k / 32k / 64k (1.70 s / 7.39 s / 16.8 s), decode 0.997x. Design,
+protocol, gates and results: `docs/pp-prefill.md`.
+
+```powershell
+Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible (a value exposing one card is refused)
+.\build\win-hip\src\cli\r4dx-cli.exe --model E:\models\r4dx\huihui-qwen38-27b-abl-trellis-mix45m.r4dx --layout trellis --pp 2 `
+    --prompt-file prompt.txt --max-ctx 36864 --max-tokens 64 --temperature 0 --stats
+```
+
+The stages are placed by HIP ordinal, not by `HIP_VISIBLE_DEVICES` order (which does not reorder on this ROCm): by default decode
+(stage B) runs on the last visible ordinal = physical device 1, the headless card that a `HIP_VISIBLE_DEVICES=1` run uses, and the
+prefill half (stage A) on the other one. `--pp-devices B,A` (or `R4DX_PP_DEVICES=B,A`; the flag wins) overrides it with two different
+ordinals; the load log prints `stage B (decode) -> HIP device <n> (<name>, pci <bus>:<dev>); stage A -> ...` for both.
+
+Flags: `--pp 2` (`--pp 1` forces it off), `--pp-devices B,A|auto`, `--pp-split N|auto`, `--pp-min-rows N` (1024: shorter prefill calls run on the decode card
+alone), `--pp-verify` (compare both cards' state after every hand-off; slow), `--pp-submit-layers` / `--pp-max-inflight` (32 / 1: the
+desktop card's bounded submission). `r4dx-server --pp 2` takes the same flags. Exclusive with `--tp 2`; not for Gemma 4 or quant2
+containers; the desktop card carries ~10-13 GiB more and a full-duty load for the length of every long prefill. **Detailed usage notes.** This page was the project README before it was rewritten as a short overview.
 > It keeps the full converter / CLI / server / tensor-parallel reference and a dated status log. Parts describe
 > older containers (the w4a16 v6 recipe, the base Qwen3.8-27B model) that are no longer the default; the current
 > default is the Huihui trellis mix4.5m container (see [huihui.md](huihui.md)).

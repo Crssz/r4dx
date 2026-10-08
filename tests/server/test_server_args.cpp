@@ -547,6 +547,39 @@ void TestTpFlags() {
   CHECK(TpThrows({"--tp", "2", "--mtp", "8"}));
   CHECK(TpThrows({"--tp", "2", "--tp-mode", "emulate", "--mtp", "63"}));
   CHECK(!TpThrows({"--tp", "1", "--mtp", "63"}));
+  // Pipeline-parallel prefill (docs/pp-prefill.md Phase 2): the same --pp* flags as r4dx-cli.
+  {
+    const auto a = parse({});
+    CHECK(a.pp == -1 && a.pp_split == 0 && a.pp_min_rows == -1 && !a.pp_verify && a.pp_submit_layers == -1 &&
+          a.pp_max_inflight == -1 && !a.pp_options_given);
+    const auto b = parse({"--pp", "2", "--pp-split", "35", "--pp-min-rows", "512", "--pp-verify", "--pp-submit-layers", "0",
+                          "--pp-max-inflight", "2"});
+    CHECK(b.pp == 2 && b.pp_split == 35 && b.pp_min_rows == 512 && b.pp_verify && b.pp_submit_layers == 0 &&
+          b.pp_max_inflight == 2 && b.pp_options_given);
+    CHECK(parse({"--pp", "2", "--pp-split", "auto"}).pp_split == 0);
+    CHECK(a.pp_devices.empty() && b.pp_devices.empty());  // auto placement unless asked for
+    CHECK(parse({"--pp", "2", "--pp-devices", "1,0"}).pp_devices == std::vector<int>({1, 0}));
+    CHECK(parse({"--pp", "2", "--pp-devices", "0,1"}).pp_devices == std::vector<int>({0, 1}));
+    CHECK(parse({"--pp", "2", "--pp-devices", "auto"}).pp_devices.empty());
+  }
+  CHECK(TpThrows({"--pp-devices", "1,0"}));  // needs --pp 2
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,0,2"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,1"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "1,x"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-devices", "-1,0"}));
+  CHECK(!TpThrows({"--pp", "2"}));
+  CHECK(!TpThrows({"--pp", "1"}));
+  CHECK(!TpThrows({"--pp", "2", "--dflash", "d.r4dx", "--dflash-k", "7"}));
+  CHECK(TpThrows({"--pp", "3"}));
+  CHECK(TpThrows({"--pp", "0"}));
+  CHECK(TpThrows({"--pp-split", "33"}));
+  CHECK(TpThrows({"--pp", "1", "--pp-verify"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-split", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-min-rows", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-submit-layers", "65"}));
+  CHECK(TpThrows({"--pp", "2", "--pp-max-inflight", "-1"}));
 }
 
 }  // namespace

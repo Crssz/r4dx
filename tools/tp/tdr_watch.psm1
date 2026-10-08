@@ -84,7 +84,11 @@ function Invoke-TdrWatched {
         [ValidateRange(5, 300)][int]$PollSeconds = 20,
         # Test hook: the start of the TDR window (default: the run's start). An earlier time makes an
         # old, already logged TDR trip the watch, which exercises the stop path without a GPU.
-        [datetime]$CheckSince
+        [datetime]$CheckSince,
+        # The tensor-parallel and pipeline-parallel tools run with HIP_VISIBLE_DEVICES unset (TP: rank 0 = device 1, rank 1 =
+        # device 0; PP: PpModel places stage B = decode on the last visible ordinal = device 1, docs/pp-prefill.md 1.2).
+        # Empty (the default) keeps the unset behaviour.
+        [string]$HipVisibleDevices = ''
     )
     if (Get-Process r4dx-server -ErrorAction SilentlyContinue) {
         throw "stop the production server first (r4dx-server is running; this run uses both GPUs)"
@@ -102,7 +106,8 @@ function Invoke-TdrWatched {
                             NewLines = @() }
     $savedHip = $env:HIP_VISIBLE_DEVICES
     try {
-        Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue
+        if ($HipVisibleDevices) { $env:HIP_VISIBLE_DEVICES = $HipVisibleDevices }
+        else { Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue }
         $start = Get-Date
         $r.Start = $start
         $since = if ($PSBoundParameters.ContainsKey('CheckSince')) { $CheckSince } else { $start }

@@ -214,6 +214,8 @@ class MtpHead {
   // FNV-1a 64 of the head's whole KV cache (D2H, synchronizes `stream`): the byte-identity check of the
   // 256-row prefill chunk's per-slice priming (tests/model/test_prefill_chunk_identity.cpp).
   uint64_t DebugKvDigest(core::Stream& stream);
+  // Enqueues a zero fill of the head's whole KV cache on `stream` (the caller synchronizes): Model::DebugZeroKvState.
+  void DebugZeroKv(core::Stream& stream);
 #endif
 
  private:

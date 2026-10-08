@@ -32,6 +32,9 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   the old bytes back. A 64-row Model, tails shorter than 256 rows, images and quant2 containers keep the f16 GEMM.
 - **Tensor parallel across two GPUs (`--tp 2`):** all-reduce through pinned host memory, since the
   cards have no peer-to-peer path.
+- **Pipeline-parallel prefill (`--pp 2`, off by default):** layers split across the two cards for long
+  prompts, about 1.9x faster cold prefill and byte-identical to the single-card prefill; decode stays
+  on the headless card (docs/pp-prefill.md).
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
   images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
 
@@ -47,6 +50,7 @@ Huihui trellis mix4.5m container, one R9700, greedy decoding:
 | Decode, DFlash2 `k=7` | 123 tok/s (write-once GDN state; 119 with `R4DX_GDN_WRITE_ONCE=0`; HIP device 1, 2026-10-08, `E:\models\r4dx\round2\bench_gdnwo`) |
 | Prefill, short prompts | about 1130 tok/s |
 | Cold prefill (time to first token), defaults (int8 prefill GEMM with coarse scales + split-KV attention) | 3.15 s at 8k, 14.0 s at 32k, 31.9 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-08, 2 runs each; `E:\models\r4dx\int8v2\ttft_summary.txt`) |
+| Cold prefill, two GPUs (`--pp 2`, pipeline-parallel prefill, decode unchanged on one card) | 1.70 s at 8k (1.85x), 7.39 s at 32k (1.90x), 16.8 s at 64k tokens (1.91x) against the single-card row above, same session, median of 2 runs each, greedy output identical (HIP ROCm 10.1.0, 2026-10-08; `E:\models\r4dx\pp2\ttft_summary.txt`; docs/pp-prefill.md). Decode with `--pp 2`: 0.997x tok/s, text identical. Off by default |
 | Cold prefill, per-128 int8 scales (`R4DX_PREFILL_INT8_SCALES=blk128`, the 2026-10-07 default) | 3.63 s at 8k (2230 tok/s), 16.0 s at 32k (2050 tok/s), 36.0 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-07, 2 runs each) |
 | Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.66 s at 8k, 22.7 s at 32k, 56.5 s at 64k tokens (same session, interleaved with the row above; 7.0 s and 32.3 s at 8k/32k with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
 
@@ -109,7 +113,8 @@ $env:HIP_VISIBLE_DEVICES = '1'
 
 Useful flags: `--think on|off`, `--mtp K`, `--max-ctx N`, `--tokenizer-dir <dir>` (needs
 `tokenizer.json`, `chat_template.jinja` and `generation_config.json`), `--image <path>` and
-`--tp 2` (unset `HIP_VISIBLE_DEVICES` so both cards are visible) and, for the server only,
+`--tp 2` or `--pp 2` (unset `HIP_VISIBLE_DEVICES` so both cards are visible; `--pp-devices B,A` picks
+the decode and the prefill card by HIP ordinal, default decode on physical device 1) and, for the server only,
 `--request-log <path>` (off by default: one JSON line of token counts and timings per request,
 docs/server.md "Request log"; add `--request-log-tokens` to also record prompt and completion token ids
 for offline speculation studies, `tools/ngram/README.md`). `--help` lists everything. The full
@@ -146,6 +151,7 @@ docs/           design notes and measurements
 | Server and vision | [docs/server.md](docs/server.md), [docs/vision.md](docs/vision.md) |
 | Tensor parallelism | [docs/tp.md](docs/tp.md) |
 | Performance and validation | [docs/perf.md](docs/perf.md), [docs/prefill.md](docs/prefill.md), [docs/validation.md](docs/validation.md) |
+| Pipeline-parallel 2-GPU prefill (`--pp 2`, validated) | [docs/pp-prefill.md](docs/pp-prefill.md) |
 | Hardware notes | [docs/r9700.md](docs/r9700.md) |
 | Detailed usage and history | [docs/usage.md](docs/usage.md), [docs/status.md](docs/status.md) |
 

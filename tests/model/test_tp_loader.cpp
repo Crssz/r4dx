@@ -465,12 +465,14 @@ void CheckRefusals(const std::shared_ptr<const r4dx::core::PinnedBuffer<uint16_t
     ContainerLoadOptions o;
     o.shared_embed_host = shared;
     o.embed_device_resident = false;
+    o.layer_limit = kLayers;  // the l4 container's config says 64 layers but only 0..3 are on disk
     const Container c = Container::Load(kContainerPath, o);
     ck.Expect(c.EmbedTokensHost() == shared->data(), "tp_world 1 accepts shared_embed_host (the shared copy is used)");
   }
   for (int decided = 0; decided <= 1; ++decided) {
     ContainerLoadOptions o;
     o.embed_device_resident_decided = decided;
+    o.layer_limit = kLayers;
     const Container c = Container::Load(kContainerPath, o);
     ck.Expect(c.EmbedTokensDeviceResident() == (decided == 1),
               "tp_world 1 accepts embed_device_resident_decided = " + std::to_string(decided));

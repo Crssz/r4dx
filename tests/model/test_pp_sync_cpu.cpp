@@ -193,7 +193,7 @@ void Switches() {
   Check(ParsePpEnable("1") == 1 && ParsePpEnable("on") == 1 && ParsePpEnable("true") == 1 && ParsePpEnable("2") == 1,
         "R4DX_PP 1 / on / true / 2 = on");
   Check(ParsePpEnable("3") == -1 && ParsePpEnable("yes") == -1 && ParsePpEnable("-1") == -1, "anything else is refused");
-  Check(DefaultSplit(false, 64) == 32 && DefaultSplit(true, 64) == 35, "default split 32, 35 with a drafter");
+  Check(DefaultSplit(false, 64) == 29 && DefaultSplit(true, 64) == 30, "default split 29, 30 with a drafter");
   Check(DefaultSplit(false, 4) == 3 && DefaultSplit(true, 4) == 3 && DefaultSplit(false, 2) == 1,
         "the default split clamps into [1, layers - 1] for a short container");
   Check(ShouldPipeline(1024, 1024) && !ShouldPipeline(1023, 1024) && ShouldPipeline(1, 1) && ShouldPipeline(1, 0),

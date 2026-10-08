@@ -43,37 +43,67 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
 
 ## Performance
 
-Huihui trellis mix4.5m container, one R9700, greedy decoding:
+Huihui Qwen3.8-27B, trellis mix4.5m container (about 17 GiB), AMD Radeon AI PRO R9700, greedy decoding,
+ROCm 10.1.0. Measured 2026-10-08 on an idle machine unless noted.
+
+### Modes
+
+Time to first token (TTFT) is a cold prefill of the whole prompt.
+
+| Mode | Flags | TTFT 8k | TTFT 32k | TTFT 128k | Decode |
+|---|---|---|---|---|---|
+| One GPU | (default) | 3.15 s | 14.0 s | 80.6 s | 37.4 tok/s |
+| Pipeline prefill | `--pp 2` | 1.77 s | 7.77 s | 44.2 s | 36.3 tok/s |
+| Tensor parallel | `--tp 2` | 2.89 s | 12.1 s | – | 59.8 tok/s |
+| **Hybrid** | `--tp 2 --pp 2` | **1.77 s** | **7.78 s** | **44.0 s** | **59.8 tok/s** |
+
+### A typical request: 8k-token prompt, 512-token answer
+
+| Mode | Plain | With DFlash2 (`--dflash`, k = 7) |
+|---|---|---|
+| `--pp 2` | 15.9 s | 9.2 s |
+| `--tp 2` | 11.4 s | 7.9 s |
+| **Hybrid** | **10.4 s** | **7.2 s** |
+
+Which mode to use:
+- **Hybrid** for long prompts with real answers (chat, coding agents, document Q&A).
+- **`--pp 2`** when VRAM is tight or the desktop card should stay free while it generates.
+- **`--tp 2`** when prompts are short (under about 1024 tokens).
+
+### One GPU in detail
 
 | | |
 |---|---|
-| Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70% |
-| Weights | about 17 GiB (+15 MiB of int8 weight scale tables for the default int8 prefill; `R4DX_PREFILL_INT8_SCALES=blk128` makes them 0.7 GiB, `R4DX_PREFILL_INT8=0` skips them) |
+| Accuracy vs bf16 (teacher-forced) | mean KL 0.00788, top-1 agreement 95.70 % |
 | Decode, plain | 37.4 tok/s |
-| Decode, DFlash2 `k=7` | 123 tok/s (write-once GDN state; 119 with `R4DX_GDN_WRITE_ONCE=0`; HIP device 1, 2026-10-08, `E:\models\r4dx\round2\bench_gdnwo`) |
+| Decode, DFlash2 `k=7` | 123 tok/s |
 | Prefill, short prompts | about 1130 tok/s |
-| Cold prefill (time to first token), defaults (int8 prefill GEMM with coarse scales + split-KV attention) | 3.15 s at 8k, 14.0 s at 32k, 31.9 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-08, 2 runs each; `E:\models\r4dx\int8v2\ttft_summary.txt`) |
-| Cold prefill, two GPUs (`--pp 2`, pipeline-parallel prefill, decode unchanged on one card) | 1.84 s at 8k (1.72x), 7.86 s at 32k (1.78x) with the default split 29 (30 with `--dflash`: 1.84 s / 8.22 s), against 3.15 s / 14.0 s on one card in the same session, greedy output identical (`E:\models\r4dx\hybrid_p-1`); 44.2 s at 128k against 80.6 s on one card (1.83x at split 32, same text; VRAM 21.1 GiB decode card / 12.6 GiB stage A, no TDR; `E:\models\r4dx\pp128k`). The earlier 1.66 s / 7.24 s were measured with the two cards swapped (decode on the desktop card) and are superseded (HIP ROCm 10.1.0, 2026-10-08; docs/pp-prefill.md). Decode with `--pp 2`: 0.997x tok/s, text identical. Off by default |
-| Hybrid two-GPU mode (`--tp 2 --pp 2`: `--pp 2` prefill, one reshard, `--tp 2` decode) | Cold prefill 1.77 s at 8k, 7.78 s at 32k, 44.0 s at 128k (equal to `--pp 2`: 1.77 / 7.77 / 44.2 s; `--tp 2`: 2.89 / 12.14 s); plain decode 59.8 tok/s (equal to `--tp 2`; `--pp 2` 36.3). 8k prompt + 512 tokens end to end: 10.35 s against 11.39 s (`--tp 2`) and 15.88 s (`--pp 2`); with `--dflash` 7.24 s against 7.94 / 9.21 s. KL against one card 0.0005-0.0006 (closer than `--tp 2`'s 0.0014-0.0023); VRAM free at 128k: 11.7 GiB desktop card / 9.0 GiB decode card. DFlash acceptance over 6 prompts 3.10 tok/round against 3.25 for `--tp 2` (the texts differ after the prefill; per-round time within 4 %). Prompts under 1024 tokens and calls past the stage-KV cap take the `--tp 2` prefill. Idle machine, ROCm 10.1.0, 2026-10-08 (`E:\models\r4dx\hybrid_p4`). Off by default |
-| Cold prefill, per-128 int8 scales (`R4DX_PREFILL_INT8_SCALES=blk128`, the 2026-10-07 default) | 3.63 s at 8k (2230 tok/s), 16.0 s at 32k (2050 tok/s), 36.0 s at 64k tokens (HIP device 1, ROCm 10.1.0, 2026-10-07, 2 runs each) |
-| Cold prefill, kill switches (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`, f16 GEMM + exact-wide attention) | 4.66 s at 8k, 22.7 s at 32k, 56.5 s at 64k tokens (same session, interleaved with the row above; 7.0 s and 32.3 s at 8k/32k with `R4DX_PREFILL_CHUNK=0`). 64-row chunks, measured earlier: 74 s at 64k, 194 s at 128k |
+| TTFT 8k / 32k / 64k | 3.15 s / 14.0 s / 31.9 s |
 
-The defaults are about 32% (8k), 38% (32k) and 44% (64k) faster than the kill switches (whose figures are from the earlier session) and 13% /
-12% / 11% faster than the per-128 scales. They are not bit-identical to the f16/exact path: mean KL 0.0013 on the canon corpus
-(p99 0.0115, top-1 agreement 98.63%) and 0.0050 over the long-context set, with code_8k at 0.0034 and code_32k at 0.0199 (the
-two segments to watch; docs/int8-prefill.md "Defaults on int8v2"); greedy text at 8k, 32k and 64k is unchanged, and the 8k/32k
-long-context task set (7 tasks x 8 items x 2 lengths) scores 100.0 / 98.2, the same as with the per-128 scales (100 of 112
-outputs identical, 0 score changes) against 100.0 / 97.5 with the kill switches. Decode is bit-identical to before (the
-bit-exact decode cuts, docs/perf.md "decode-t1", measured +2.3% plain and +4.7% DFlash2 `k=7` on their branch).
+### Prefill settings (one GPU, TTFT)
 
-With `--tp 2` on two R9700s (same container, measured 2026-09-30 against a single-card baseline from the
-same session), plain decode reaches 60.1 tok/s (1.70x one card), DFlash2 `k=7` 162 tok/s (1.58x) and
-`--mtp 3` 116 tok/s (1.55x); cold prefill took 3.9 s at 8k, 19.1 s at 32k and 49.0 s at 64k tokens
-(1.33x to 1.44x faster than one card; 256-row chunks). With the int8 prefill GEMM now on at TP = 2 as well (coarse scales, 2026-10-08,
-`E:\models\r4dx\int8v2\tp2\ttft_summary.txt`), cold prefill takes 2.88 s at 8k, 12.1 s at 32k and 25.5 s at 64k tokens
-(-19%, -16% and -16% against TP = 2 f16 in the same session; `R4DX_PREFILL_INT8_TP2=0` restores f16; the canon KL p99 of 0.0146 is over
-the 0.012 gate, see docs/int8-prefill.md). Methodology and more numbers: [docs/perf.md](docs/perf.md), [docs/huihui.md](docs/huihui.md),
-[docs/prefill.md](docs/prefill.md).
+| Setting | 8k | 32k | 64k |
+|---|---|---|---|
+| Default: int8 GEMM, coarse scales, split-KV attention | 3.15 s | 14.0 s | 31.9 s |
+| Per-128 int8 scales (`R4DX_PREFILL_INT8_SCALES=blk128`) | 3.63 s | 16.0 s | 36.0 s |
+| Kill switches: f16 GEMM, exact attention (`R4DX_PREFILL_INT8=0 R4DX_PREFILL_SPLITKV=exact`) | 4.66 s | 22.7 s | 56.5 s |
+
+### Notes
+
+- **Exactness.**
+  - `--pp 2` gives byte-identical output to one GPU.
+  - `--tp 2` and the hybrid decode across both cards, so they are not bit-identical to one GPU.
+  - KL against one GPU is 0.0014–0.0023 for `--tp 2` and 0.0005–0.0006 for the hybrid.
+  - The int8 prefill is not bit-identical to the f16 path: mean KL 0.0013 on the canon corpus. Greedy text at 8k, 32k and 64k is unchanged ([docs/int8-prefill.md](docs/int8-prefill.md)).
+- **DFlash2 speed.** The speedup depends on the prompt, from about 3 to 6 accepted tokens per round. `--tp 2` reached 162 tok/s on the four standard prompts (2026-09-30), and `--mtp 3` 116 tok/s. Over six mixed prompts the hybrid averaged 3.10 tokens per round against 3.25 for `--tp 2`, because the two generate different text.
+- **VRAM.** The hybrid keeps two copies of each card's share of the model. At a 128k context, 11.7 GiB stays free on the desktop card and 9.0 GiB on the decode card. `--pp 2` uses 12.6 GiB on the desktop card.
+- **Hybrid thresholds.** Prompts under 1024 tokens, and calls past the stage-KV cap, use the `--tp 2` prefill.
+- **Details and raw logs:**
+  - [docs/pp-tp2-hybrid.md](docs/pp-tp2-hybrid.md) (hybrid)
+  - [docs/pp-prefill.md](docs/pp-prefill.md) (`--pp 2`)
+  - [docs/tp.md](docs/tp.md) (`--tp 2`)
+  - [docs/perf.md](docs/perf.md) and [docs/prefill.md](docs/prefill.md) (methodology)
+  - [docs/huihui.md](docs/huihui.md) (accuracy)
 
 ## Requirements
 

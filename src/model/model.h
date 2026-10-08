@@ -939,6 +939,10 @@ class Model {
     // Either stage: called when a chunk has been fully handled (stage A: published; stage B: epilogue done, slot
     // released). PpModel bumps stage A's heartbeat from it (the progress watchdog's input).
     std::function<void()> on_chunk;
+    // Hybrid mode (docs/pp-tp2-hybrid.md 1): false drops the KV blocks of stage A's attention layers from every slot -- stage B is a
+    // hole-prefix Model with no cache for layers < split, and stage A's KV stays on stage A until the reshard. BOTH stages of a
+    // call must be attached with the same value (the payload size is checked per chunk). true (the default) is the PP-2 prefill.
+    bool carry_kv = true;
   };
   // Throws std::invalid_argument for a TP rank, a rotated (quant2) container, the PP-emulate mode, an active debug
   // probe (R4DX_CLOCK_PROBE), or a split outside [1, NumLoadedLayers() - 1]. The device must be idle.
@@ -1092,6 +1096,10 @@ class Model {
   // it as it is, a TP rank takes its head half of it (hybrid::ReshardRef over StateGeometry::FromRules(GlobalConfig())).
   void DebugExportFullState(const std::string& path);
   void DebugImportFullState(const std::string& path);
+  // Negative control (10) of design section 4 (tests/model/test_hybrid_emulate_identity.cpp): overrides the tuning flag this Model
+  // believes it runs under (Tp2TuningForModel / CheckTuningScope), so a TP=1 stage can be driven under the TP-thread flag WITHOUT the
+  // entry guard refusing it, to show that the stage's live-state digest changes. Nothing else in the tree calls it.
+  void DebugSetTp2Tuning(bool enabled) { tp2_tuning_ = enabled; }
 #endif
 
  private:

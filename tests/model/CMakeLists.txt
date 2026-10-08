@@ -103,6 +103,16 @@ set(R4DX_MODEL_TESTS
   # drafter as one TP=1 Model (~17 GiB). R4DX_TEST_ONLY=a|b|c picks a part. Links the R4DX_TP_TESTING variant. Device 1; SKIP 77 when nothing exists.
   # Written, NOT run by its author (CPU-only session).
   test_dflash_tail
+  # Hybrid mode P2 part 2, the ONE-DEVICE identity harness (docs/pp-tp2-hybrid.md 4, 9 "P2", section 13): a TP=1 reference Model, the two stage Models
+  # (hole-prefix, stage_only, shared embedding + borrowed mirror, driven on two threads through a StageChannel without the KV payload) and a TpModel in
+  # emulate mode on ONE device. G-H1: the hybrid path (warm gather, stage prefill, reshard, TpAdoptPrefill) leaves each rank with exactly ReshardRef(TP=1
+  # state) -- DebugLiveStateDigest, byte for byte -- for row counts 1..2125, prefix-reuse shapes, warm turns (plain / --mtp 3, incl. the MTP seed and
+  # block rules), checkpoint save/restore and image rows; G-H2: 16 greedy tokens (plain, --mtp 3) from the hybrid ranks == from ranks loaded with the
+  # reference image. Configs: 4-layer container (bf16, bf16 + write-once GDN, w4a16) and the real container with 16 layers (k = 8). Negative controls NC1-3,
+  # 5-10, 12 on the hybrid path, Gate C (NC4, NC11: DFlash tail, drafters only, ~4 GiB). Gate B (full depth, separate processes): --gate-b-dump <dir> then
+  # --gate-b <dir>. ~20 GiB resident for the real container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING variant.
+  # Written, NOT run by its author (CPU-only session).
+  test_hybrid_emulate_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -111,7 +121,7 @@ foreach(t ${R4DX_MODEL_TESTS})
   # src/model/CMakeLists.txt); every other test links the production library.
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
      t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity" OR
-     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail")
+     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail" OR t STREQUAL "test_hybrid_emulate_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -126,6 +136,8 @@ endforeach()
 # overrides the loop's HIP_VISIBLE_DEVICES=1. PpModel then puts stage B (decode) on ordinal 1 = physical device 1 (the
 # headless card, pci 07) and stage A on ordinal 0 (the desktop card) -- docs/pp-prefill.md 1.2.
 set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1")
+# four rigs (three on the 4-layer container, one with 16 real layers) and ~60 scenarios: well past CTest's default 1500 s on a cold kernel cache
+set_tests_properties(test_hybrid_emulate_identity PROPERTIES TIMEOUT 5400)
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a

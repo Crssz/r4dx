@@ -565,7 +565,8 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
       if (l < split) ++dfl_here;
     }
   }
-  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
+  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here,
+                                                pp_setup_.carry_kv ? PpAttnLayers(split) : std::vector<int64_t>{}, PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
   CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageA");
   if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageA: the prologue's hidden differs from the configuration's");
@@ -629,7 +630,8 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
                              std::to_string(pos_) + ", " + std::to_string(T) + " rows, last " +
                              std::to_string(r.want_logits) + ", " + std::to_string(dfl_here) + " columns");
   }
-  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here, PpAttnLayers(split), PpKvBlockSize(),
+  const pp::SlotLayout lay = pp::MakeSlotLayout(pos_, T, hidden, dfl_here,
+                                                pp_setup_.carry_kv ? PpAttnLayers(split) : std::vector<int64_t>{}, PpKvBlockSize(),
                                                 PpKvBlockStrideBytes());
   CheckCarryLayout(lay, T, hidden, "Model::RunChunkPpStageB");
   if (r.hidden != hidden) throw std::logic_error("Model::RunChunkPpStageB: the prologue's hidden differs from the configuration's");

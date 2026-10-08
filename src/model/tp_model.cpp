@@ -15,11 +15,13 @@
 #include <utility>
 
 #include "arch.h"
+#include "linear.h"
 #include "local_text_model.h"
 #include "pp_model.h"
 #include "r4dx/core/device_buffer.hpp"
 #include "r4dx/core/error.hpp"
 #include "tp/tp_comm_noop.h"
+#include "tp_hybrid.h"
 
 // Thread names for the debugger / ETW (docs/tp.md 2.2: "r4dx-tp-rank<r>"), declared by hand rather
 // than through <windows.h>, whose macros would leak into every header below. Same signature as
@@ -131,7 +133,15 @@ struct DeviceProbe {
 
 // ---- load ---------------------------------------------------------------------------------------
 
-std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions& tp_arg) {
+TpModel::TpModel() = default;
+
+std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions& tp) {
+  PpOptions off;  // the two-argument form never loads the hybrid, whatever R4DX_PP says
+  off.hybrid = 0;
+  return Load(opts, tp, off);
+}
+
+std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions& tp_arg, const PpOptions& pp) {
   // Test-only fault injection from the environment (docs/tp.md 9.1): R4DX_TP_FAULT arms what a test
   // would set in TpOptions::fault_*, so tools/server/smoke.ps1 can drive the production binaries. A
   // fault the caller set directly wins; the variable is then ignored, loudly.
@@ -248,6 +258,9 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
                                   std::to_string(visible) + " visible device(s))");
     }
   }
+  // Hybrid mode (docs/pp-tp2-hybrid.md): `--tp 2 --pp 2` asks for the PP-2 prefill stages next to the ranks. Resolved (kill switch) and
+  // validated here, before any weight is read: a configuration error throws, nothing is loaded yet.
+  const bool want_hybrid = ResolveHybridRequest(opts, tp, pp, devices);
   // A stall fault makes the PEER's all-reduce kernel spin until it times out, so real-GPU stalls go
   // on the rank whose peer is the headless card (Appendix B N61). Said out loud, not refused: a test
   // may mean it.
@@ -536,6 +549,11 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   m->cached_position_ = 0;
   m->cached_fallback_rows_ = 0;
 
+  // Hybrid mode: the stage Models next to the ranks (after their warm-up, so the free VRAM measured now already holds everything the ranks
+  // keep). Failures past the validation above leave plain --tp 2 and a log line (HybridLoad); the pinned embedding copy is still alive here
+  // and is shared by the stages.
+  if (want_hybrid) (void)m->HybridLoad(opts, pp, embed);
+
   // Test-only fault injection, counted from the END of warm-up (TpOptions::fault_*).
   if (tp.fault_rank >= 0) m->ArmFaultInjection(tp.fault_rank, tp.fault_at_allreduce, tp.fault_kind);
 
@@ -589,10 +607,23 @@ TpModel::~TpModel() {
   wait_idle("stream drain");
   // 4. The teardown closure on each rank's own thread: the Model first (it owns the streams the
   //    endpoint tracked), then the endpoint (frees its device memory on the right device).
+  pp::StageBuffers* const hy_bufs = hy_ ? hy_->bufs.get() : nullptr;
   for (const auto& s : ranks_) {
     s->facade_comm = nullptr;
     RankSlot* sp = s.get();
-    sp->worker->Post([sp] {
+    sp->worker->Post([sp, hy_bufs] {
+      // Hybrid mode: the stage Model first (it borrows the rank's embedding mirror and holds the stage KV), then the pinned memory this
+      // thread allocated -- the slot ring is stage A's (rank 1's), the rest of the group is stage B's (rank 0's) -- then the rank Model.
+      sp->stage.reset();
+      sp->hy_ring = core::PinnedBuffer<uint8_t>();
+      sp->hy_tail = core::PinnedBuffer<uint16_t>();
+      if (hy_bufs != nullptr) {
+        if (sp->rank == 1) {
+          hy_bufs->ReleaseAProduced();
+        } else {
+          hy_bufs->ReleaseBProduced();
+        }
+      }
       sp->model.reset();
       sp->endpoint.reset();
       sp->noop.reset();
@@ -636,6 +667,12 @@ void TpModel::Run(const std::vector<int>& slots, const std::function<void(RankSl
     workers.push_back(s->worker.get());
     s->worker->Post([shared, s, kind] {
       try {
+        // Every command runs under the thread flag of the rank Model this thread owns (true for a TP rank): a rank thread also hosts the
+        // hybrid's stage Model, whose calls set the TP=1 flag for themselves (Tp2TuningScope(false), docs/pp-tp2-hybrid.md 7) and restore
+        // it. A no-op where the flag already is the rank's -- every non-hybrid command. Before the rank Model exists (the load commands)
+        // there is nothing to follow.
+        std::optional<Tp2TuningScope> tuning;
+        if (s->model.has_value()) tuning.emplace(s->model->Tp2TuningForModel());
         (*shared)(*s);
         if (kind == CmdKind::kCollective) {
           if (core::TpComm* c = s->Comm()) c->CheckHealthy();
@@ -796,6 +833,7 @@ void TpModel::Reset() {
       m.Reset();
       m.SetDflashInjectionEnabled(inject);
     });
+    HybridResetStages();  // hybrid mode: both stage Models, the channel and the tracker (a no-op without it)
   };
   if (state_ == State::kNeedsRecovery) {
     try {
@@ -824,6 +862,7 @@ void TpModel::SaveCheckpoint() {
 }
 
 void TpModel::RestoreCheckpoint() {
+  if (hy_) hy_->tracker->TpRestored();  // the shards' GDN state and MTP seed are the saved ones; the stages' mirrors know nothing of it
   RunCollective([](Model& m, int) { m.RestoreCheckpoint(); });  // re-caches PositionCount()
 }
 
@@ -934,7 +973,8 @@ void TpModel::ArmFaultInjection(int rank, int64_t at_allreduce, int kind) {
   throw std::invalid_argument("TpModel::ArmFaultInjection: no rank " + std::to_string(rank) + " in this group");
 }
 
-void TpModel::RunCollectiveForTest(const std::function<void(Model&, int)>& fn) {
+void TpModel::RunCollectiveForTest(const std::function<void(Model&, int)>& fn, bool read_only) {
+  if (!read_only) NoteTpMoved(0);  // an arbitrary closure may change anything: the stages' mirrors are stale everywhere
   RunCollective([this, fn](Model& m, int slot) { fn(m, ranks_[static_cast<size_t>(slot)]->rank); });
 }
 
@@ -1014,6 +1054,12 @@ StepProfile TpModel::PrefillProfiled(const std::vector<int32_t>&) {
 // watchdog stall never reads the caller's (possibly freed) arguments.
 
 std::vector<float> TpModel::Prefill(const std::vector<int32_t>& token_ids) {
+  if (hy_) {
+    // Hybrid mode: a long enough prompt runs as the PP-2 pipeline on the stages and is resharded into the ranks (the logits are stage Y's,
+    // full vocab); every other call -- and every call the dispatch rule declines -- is the TP=2 prefill below, unchanged.
+    if (std::optional<std::vector<float>> logits = TryHybridPrefill(token_ids, nullptr, nullptr)) return std::move(*logits);
+    NoteTpMoved(cached_position_);
+  }
   std::vector<std::vector<float>> r =
       RunCollective([ids = token_ids](Model& m, int) { return m.Prefill(ids); });
   RequireAllEqual(r, "Prefill logits");
@@ -1048,6 +1094,10 @@ std::vector<float> TpModel::PrefillMultimodal(const std::vector<int32_t>& token_
     sp.embeds = rows->data() + at;
     at += n;
   }
+  if (hy_) {
+    if (std::optional<std::vector<float>> logits = TryHybridPrefill(token_ids, &spans, rows)) return std::move(*logits);
+    NoteTpMoved(cached_position_);
+  }
   std::vector<std::vector<float>> r =
       RunCollective([ids = token_ids, spans = std::move(spans), rows](Model& m, int) {
         (void)rows;  // co-owned: `spans` point into it
@@ -1058,12 +1108,14 @@ std::vector<float> TpModel::PrefillMultimodal(const std::vector<int32_t>& token_
 }
 
 std::vector<float> TpModel::DecodeStep(int32_t token_id) {
+  NoteTpMoved(cached_position_);
   std::vector<std::vector<float>> r = RunCollective([token_id](Model& m, int) { return m.DecodeStep(token_id); });
   RequireAllEqual(r, "DecodeStep logits");
   return std::move(r[0]);
 }
 
 int32_t TpModel::DecodeStepGreedy(int32_t token_id) {
+  NoteTpMoved(cached_position_);
   const std::vector<int32_t> r =
       RunCollective([token_id](Model& m, int) { return m.DecodeStepGreedy(token_id); });
   RequireAllEqual(r, "DecodeStepGreedy token");
@@ -1071,6 +1123,7 @@ int32_t TpModel::DecodeStepGreedy(int32_t token_id) {
 }
 
 int32_t TpModel::DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng) {
+  NoteTpMoved(cached_position_);
   // docs/tp.md 2.3: every rank draws from its own copy of the caller's generator; the copies must
   // end in the same state (same number of draws), and the caller's generator then takes it.
   auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
@@ -1088,6 +1141,7 @@ std::vector<int32_t> TpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   if (!mtp_enabled_) {
     throw std::runtime_error("TpModel::DecodeStepMtp{Greedy,Sampled}: MTP is not enabled on this model");
   }
+  NoteTpMoved(cached_position_);
   std::vector<std::vector<int32_t>> r =
       RunCollective([token_id, k](Model& m, int) { return m.DecodeStepMtpGreedy(token_id, k); });
   RequireAllEqual(r, "DecodeStepMtpGreedy round");
@@ -1100,6 +1154,7 @@ std::vector<int32_t> TpModel::DecodeStepMtpSampled(int32_t token_id, int64_t k, 
   if (!mtp_enabled_) {
     throw std::runtime_error("TpModel::DecodeStepMtp{Greedy,Sampled}: MTP is not enabled on this model");
   }
+  NoteTpMoved(cached_position_);
   auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
   std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, params, rngs](Model& m, int slot) {
     return m.DecodeStepMtpSampled(token_id, k, params, (*rngs)[static_cast<size_t>(slot)]);
@@ -1116,6 +1171,7 @@ std::vector<int32_t> TpModel::DecodeStepDflashGreedy(int32_t token_id, int64_t k
   if (!dflash_enabled_) {
     throw std::runtime_error("TpModel::DecodeStepDflash{Greedy,Sampled}: DFlash2 is not enabled on this model");
   }
+  NoteTpMoved(cached_position_);
   auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
   std::vector<std::vector<int32_t>> r = RunCollective([token_id, k, p_min, n_min, walks](Model& m, int slot) {
     return m.DecodeStepDflashGreedy(token_id, k, p_min, n_min, &(*walks)[static_cast<size_t>(slot)]);
@@ -1133,6 +1189,7 @@ std::vector<int32_t> TpModel::DecodeStepDflashSampled(int32_t token_id, int64_t 
   if (!dflash_enabled_) {
     throw std::runtime_error("TpModel::DecodeStepDflash{Greedy,Sampled}: DFlash2 is not enabled on this model");
   }
+  NoteTpMoved(cached_position_);
   auto rngs = std::make_shared<std::vector<std::mt19937_64>>(ranks_.size(), rng);
   auto walks = std::make_shared<std::vector<int64_t>>(ranks_.size(), 0);
   std::vector<std::vector<int32_t>> r =
@@ -1167,7 +1224,10 @@ std::unique_ptr<TextModel> LoadTextModel(const ModelOptions& opts, const TpOptio
     return LoadGemmaTextModel(opts, tp);
   }
   if (pp_on) {
-    if (tp.world != 1) throw std::invalid_argument("LoadTextModel: --pp 2 and --tp 2 are mutually exclusive");
+    // `--tp 2 --pp 2` is the hybrid serving mode (docs/pp-tp2-hybrid.md): the TP=2 group with the PP-2 prefill stages next to its ranks.
+    // `--hybrid off` / R4DX_HYBRID=0 leaves plain --tp 2 (TpModel::Load says so).
+    if (tp.world == 2) return TpModel::Load(opts, tp, pp);
+    if (tp.world != 1) throw std::invalid_argument("LoadTextModel: --pp 2 needs --tp 1 or --tp 2, got a tensor-parallel world of " + std::to_string(tp.world));
     return PpModel::Load(opts, pp);
   }
   if (tp.world == 1) {

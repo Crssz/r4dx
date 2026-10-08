@@ -125,7 +125,14 @@ int main(int argc, char** argv) {
   opts.model_opts.pp = args.pp == 2 ? 2 : (args.pp == 1 ? 0 : -1);
   opts.pp.devices = args.pp_devices;
   opts.pp.split = args.pp_split;
-  if (args.pp_min_rows > 0) opts.pp.min_rows = args.pp_min_rows;
+  if (args.pp_min_rows > 0) {
+    opts.pp.min_rows = args.pp_min_rows;
+    opts.pp.min_rows_given = true;
+  }
+  // --tp 2 --pp 2 is the hybrid serving mode (docs/pp-tp2-hybrid.md): LoadTextModel routes it to TpModel, which reads these.
+  opts.pp.hybrid = args.hybrid;
+  opts.pp.hybrid_ctx = args.hybrid_ctx;
+  opts.pp.hybrid_reserve_gib = args.hybrid_reserve_gib;
   opts.pp.verify = args.pp_verify;
   if (args.pp_submit_layers >= 0) opts.pp.submit_layers = args.pp_submit_layers;
   if (args.pp_max_inflight >= 0) opts.pp.max_inflight = args.pp_max_inflight;

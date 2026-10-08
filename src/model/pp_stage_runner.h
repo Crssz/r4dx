@@ -92,7 +92,9 @@ struct StageBResult {
   double gdn_wait_ms = 0;      // B's wait for A's GDN state after its last chunk (0 when the import overlapped)
 };
 // Stage B's prefill: engages the channel around the prefill, then imports A's GDN state unless it started early. Never throws.
+// `rope_rows_out` (multimodal calls only, the hybrid's DFlash tail): receives PrefillMultimodal's [3, ids.size()] rope rows.
 StageBResult RunStageB(Model& b, StageChannel& ch, StageBuffers& bufs, const StageRunOptions& opt, StageBCallState& st,
-                       const std::vector<int32_t>& ids, const std::vector<Model::ImageSpan>* images);
+                       const std::vector<int32_t>& ids, const std::vector<Model::ImageSpan>* images,
+                       std::vector<int32_t>* rope_rows_out = nullptr);
 
 }  // namespace r4dx::model::pp

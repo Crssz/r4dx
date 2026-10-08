@@ -92,6 +92,13 @@ struct PpOptions {
   // split layer as its input_layernorm only, no KV or GDN state for it. Off by default (stage A then loads reserve_split + 1 whole
   // layers as always); R4DX_PP_STAGE_ONLY=1 also turns it on. The prefill bytes must not change (test_pp_real_identity).
   bool stage_only = false;
+  // ---- hybrid mode: `--tp 2 --pp 2` (docs/pp-tp2-hybrid.md): the TP=2 decode ranks + a PP-2 pipelined prefill on stage Models that live next to
+  // them on the same two cards, the state resharded into the ranks at the end of a call. Read by TpModel::Load (LoadTextModel routes
+  // pp on + tp 2 there); split, slots, timeout_ms, submit_layers and devices keep their meaning, min_rows defaults to 1024 there.
+  bool min_rows_given = false;     // `min_rows` was set by the caller (hybrid mode otherwise uses its own default, 1024)
+  int hybrid = -1;                 // --hybrid {on|off}: -1 follows R4DX_HYBRID (unset = on); 0 = off, plain --tp 2 (the kill switch); 1 = on
+  int64_t hybrid_ctx = 0;          // --hybrid-ctx N|auto (0 = auto): the stage-KV capacity S, in tokens (a longer conversation prefills at TP=2)
+  double hybrid_reserve_gib = -1;  // --hybrid-reserve-gib X: VRAM kept free on the desktop card after the stage load (< 0 = 3.0; the headless card keeps min(X, 1.5))
 };
 
 // One rank's device memory, as hipMemGetInfo reports it for that rank's device (device-wide: other
@@ -202,6 +209,8 @@ class TpDiagnostics {
   virtual Health GroupHealth() const = 0;
   virtual const TpOptions& GroupOptions() const = 0;
   virtual std::string GroupStatsLine() = 0;  // the `--stats` "tp: ..." line without its "[stats] " prefix
+  // The hybrid mode's `--stats` line ("hybrid: ..." without the prefix); empty when the group runs no hybrid prefill.
+  virtual std::string HybridStatsLine() { return ""; }
 };
 
 // tp.world == 1 => LocalTextModel(Model::Load(opts)) -- exactly today's Model; every other TpOptions

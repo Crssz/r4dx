@@ -562,7 +562,35 @@ void TestTpFlags() {
   CHECK(TpThrows({"--pp", "0"}));
   CHECK(TpThrows({"--pp-split", "33"}));                // knobs need --pp 2
   CHECK(TpThrows({"--pp", "1", "--pp-verify"}));
-  CHECK(TpThrows({"--pp", "2", "--tp", "2"}));          // exclusive with tensor parallelism
+  // --tp 2 --pp 2 is the hybrid serving mode (docs/pp-tp2-hybrid.md): two real GPUs, the stages next to the ranks.
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--pp-split", "30", "--pp-min-rows", "768", "--pp-devices", "1,0"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "off"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "on", "--hybrid-ctx", "65536", "--hybrid-reserve-gib", "2.5"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "auto"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate"}));                    // the hybrid needs two real GPUs ...
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "noop"}));
+  CHECK(!TpThrows({"--pp", "2", "--tp", "2", "--tp-mode", "emulate", "--hybrid", "off"}));  // ... unless it is switched off
+  CHECK(TpThrows({"--hybrid", "off"}));                                                   // the hybrid flags need --tp 2 --pp 2
+  CHECK(TpThrows({"--tp", "2", "--hybrid", "off"}));
+  CHECK(TpThrows({"--pp", "2", "--hybrid", "off"}));
+  CHECK(TpThrows({"--tp", "2", "--hybrid-ctx", "65536"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid", "maybe"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "0"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-ctx", "x"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-reserve-gib", "-1"}));
+  CHECK(TpThrows({"--pp", "2", "--tp", "2", "--hybrid-reserve-gib", "99"}));
+  {
+    std::vector<std::string> storage = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi", "--pp", "2", "--tp", "2",
+                                         "--hybrid", "off", "--hybrid-ctx", "65536", "--hybrid-reserve-gib", "2.5"};
+    auto argv = ToArgv(storage);
+    const auto a = r4dx::cli::ParseArgs(static_cast<int>(argv.size()), argv.data());
+    CHECK(a.pp == 2 && a.tp == 2 && a.hybrid == 0 && a.hybrid_ctx == 65536 && a.hybrid_reserve_gib == 2.5 && a.hybrid_options_given);
+    std::vector<std::string> storage2 = {"r4dx-cli", "--model", "m.r4dx", "--layout", "w4a16", "--prompt", "hi", "--pp", "2", "--tp", "2"};
+    auto argv2 = ToArgv(storage2);
+    const auto b = r4dx::cli::ParseArgs(static_cast<int>(argv2.size()), argv2.data());
+    CHECK(b.hybrid == -1 && b.hybrid_ctx == 0 && b.hybrid_reserve_gib < 0 && !b.hybrid_options_given);  // R4DX_HYBRID / the built-ins unless asked for
+  }
   CHECK(TpThrows({"--pp", "2", "--pp-split", "0"}));
   CHECK(TpThrows({"--pp", "2", "--pp-split", "x"}));
   CHECK(TpThrows({"--pp", "2", "--pp-min-rows", "0"}));

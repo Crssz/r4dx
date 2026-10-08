@@ -27,6 +27,13 @@
 // once, on this thread (CPU only), and shared by both ranks' drafters. R4DX_TP_FAULT
 // ("<rank>:<n>:<kind>", docs/tp.md 9.1) arms TpOptions::fault_* from the environment.
 //
+// Hybrid mode (`--tp 2 --pp 2`, docs/pp-tp2-hybrid.md; tp_model_hybrid.cpp): every rank worker also owns a pipeline-STAGE Model on its card
+// (rank 1 / the desktop card: the front stage X = layers [0, k); rank 0 / the headless card: the back stage Y = layers [k, N) + the full
+// lm_head + MTP head). A Prefill / PrefillMultimodal of at least `min_rows` rows runs as the PP-2 pipeline on the stages (bit-equal to TP=1)
+// and is resharded into the two TP rank Models at its end (TpAdoptPrefill + the DFlash tail), so decode stays TP=2 untouched. The call is
+// ONE plain command (no TpComm) on both rank workers; everything else (and every call the dispatch rule declines) is the TP=2 path above,
+// unchanged. The logits a hybrid prefill returns are stage Y's (full vocab, equal to TP=1's / --pp 2's), not a vocab-merge of the ranks'.
+//
 // Thread safety: like Model, one facade thread issues every call. HasVision() and the other cached
 // accessors are plain reads of values fixed at load and are safe from any thread.
 #pragma once
@@ -46,7 +53,9 @@
 #include <vector>
 
 #include "model.h"
+#include "r4dx/core/pinned_buffer.hpp"
 #include "r4dx/core/stream.hpp"
+#include "stage_sync.h"
 #include "r4dx/core/tp_alloc_guard.hpp"
 #include "r4dx/core/tp_comm.hpp"
 #include "text_model.h"
@@ -62,9 +71,14 @@ class TpModel final : public TextModel, public TpDiagnostics {
   // docs/tp.md 2.9. `opts` is the ordinary single-model option set (opts.tp must be default: the
   // per-rank TpRankOptions are filled in here); `tp.world` must be 2.
   static std::unique_ptr<TpModel> Load(const ModelOptions& opts, const TpOptions& tp);
+  // The hybrid mode (docs/pp-tp2-hybrid.md): with ModelOptions::pp on (--pp 2 / R4DX_PP), pp.hybrid not off (--hybrid / R4DX_HYBRID) and
+  // TpOptions::mode kReal, the stage Models are loaded next to the ranks after their warm-up. Configuration errors throw; a budget that
+  // leaves no room for the stage KV (S < 16384 tokens), a failed stage load and a failed warm-up call log one line and leave plain --tp 2.
+  // The two-argument Load is this with the hybrid forced off.
+  static std::unique_ptr<TpModel> Load(const ModelOptions& opts, const TpOptions& tp, const PpOptions& pp);
   // docs/tp.md 2.6: every rank's Model and endpoint are destroyed on that rank's thread; a rank that
   // does not finish within 30 s ends the process (quick_exit(3)) rather than free memory a kernel
-  // may still touch.
+  // may still touch. The stage Models and the hybrid's pinned buffers go first, on the same threads.
   ~TpModel() override;
   TpModel(const TpModel&) = delete;
   TpModel& operator=(const TpModel&) = delete;
@@ -132,6 +146,34 @@ class TpModel final : public TextModel, public TpDiagnostics {
   Health GroupHealth() const override { return static_cast<Health>(static_cast<int>(state_)); }
   const TpOptions& GroupOptions() const override { return tp_; }
   std::string GroupStatsLine() override { return StatsLine(); }
+  std::string HybridStatsLine() override;
+
+  // ---- hybrid mode diagnostics (docs/pp-tp2-hybrid.md; empty / zero when the hybrid is not engaged) ---------------------------------
+  struct HybridStats {
+    int64_t pipelined_calls = 0;   // Prefill / PrefillMultimodal calls that ran as the pipeline (stage X || stage Y + the reshard)
+    int64_t tp_prefill_calls = 0;  // ... that ran the ordinary TP=2 prefill
+    int64_t declined[6] = {};      // tp_prefill_calls by reason, indexed by hybrid::Why (kNotEngaged .. kDflashFrontier; [0] unused)
+    // the latest pipelined call, ms (each phase is the slower of the two cards)
+    int64_t last_p0 = 0, last_rows = 0;
+    double last_total_ms = 0, last_gather_ms = 0, last_prefill_ms = 0, last_reshard_ms = 0, last_tail_ms = 0;
+    // bytes that crossed the host, cumulative, by the card they LEFT: [0] = X (desktop, stage A / rank 1), [1] = Y (headless, stage B / rank 0)
+    uint64_t gather_bytes[2] = {0, 0}, reshard_bytes[2] = {0, 0};
+    uint64_t local_bytes = 0;       // device-to-device (the same-card halves), cumulative
+    uint64_t tail_rows = 0;         // DFlash tail rows injected per rank, cumulative
+    int64_t last_gather_bytes[2] = {0, 0}, last_reshard_bytes[2] = {0, 0};  // the latest pipelined call
+  };
+  bool HybridEngaged() const { return hy_ != nullptr; }
+  HybridStats GetHybridStats() const;
+  int64_t HybridSplit() const;     // the split layer k (0 when not engaged)
+  int64_t HybridStageCtx() const;  // S: the stage-KV capacity in tokens
+  int64_t HybridMinRows() const;
+  // Tests and sweeps: the pipelining threshold (>= 1 pipelines every call; the dispatch rule's other fallbacks still apply).
+  void SetHybridMinRows(int64_t min_rows);
+  // Test-only (recovery tests): the NEXT pipelined prefill throws std::runtime_error("injected hybrid fault") on TP rank `rank`'s thread when it
+  // reaches `phase` (one-shot, disarmed when that call returns or throws). The other card's thread must be freed at once, the root cause reported
+  // with its type, the group be kNeedsRecovery, and Reset() heal it. Legal in kReady with the hybrid engaged.
+  enum class HybridFaultPhase { kNone, kGather, kStagePrefill, kReshard, kAdopt };
+  void ArmHybridFault(int rank, HybridFaultPhase phase);
 
   // ---- tensor-parallel diagnostics (tests, tools, --stats) --------------------------------------
   State GetState() const { return state_; }
@@ -157,8 +199,10 @@ class TpModel final : public TextModel, public TpDiagnostics {
   void ArmFaultInjection(int rank, int64_t at_allreduce, int kind);
   // Test-only: runs fn(model, rank) on every rank as ONE collective command -- the same state
   // check, allocation guard, CheckHealthy, abort-on-error and root-cause rethrow as a forward call,
-  // no result comparison. The caller must issue the same collective sequence on every rank.
-  void RunCollectiveForTest(const std::function<void(Model&, int)>& fn);
+  // no result comparison. The caller must issue the same collective sequence on every rank. In the hybrid mode an arbitrary closure may have
+  // changed anything, so the stages' mirrors are marked stale (as a decode does); `read_only` promises the closure only READS the shards
+  // (digests, exports), which leaves the mirrors' bookkeeping alone.
+  void RunCollectiveForTest(const std::function<void(Model&, int)>& fn, bool read_only = false);
 
  private:
   struct RankSlot {
@@ -170,6 +214,12 @@ class TpModel final : public TextModel, public TpDiagnostics {
     std::unique_ptr<core::TpComm> noop;        // noop
     std::optional<core::Stream> aux_stream;    // warm-up latency sample; lives as long as the endpoint
     std::optional<Model> model;
+    // Hybrid mode (docs/pp-tp2-hybrid.md 7), all built, used and destroyed ONLY on this rank's thread: the pipeline-stage Model of this
+    // card (rank 1: front stage X; rank 0: back stage Y), the card's outgoing host ring of the cross-card reshard (pinned, portable), and
+    // on rank 0 the DFlash tail capture buffer. The stage is destroyed before `model` (~TpModel's teardown closure).
+    std::optional<Model> stage;
+    core::PinnedBuffer<uint8_t> hy_ring;
+    core::PinnedBuffer<uint16_t> hy_tail;
     // The facade's own copy of Comm(), written and read only on the facade thread (set once the
     // endpoint-creation command has returned, cleared before teardown), so the facade can poison the
     // group while this rank is still inside a command without reading `endpoint`/`noop` as the rank
@@ -182,7 +232,7 @@ class TpModel final : public TextModel, public TpDiagnostics {
     kPlain,       // no TpComm (load helpers, Reset, Vram, counters)
   };
 
-  TpModel() = default;
+  TpModel();  // out of line: `hy_` holds a type that is incomplete here
 
   std::vector<int> AllSlots() const;
   // Runs body(slot) on each listed slot's rank thread as one command, waits with the progress
@@ -322,6 +372,36 @@ class TpModel final : public TextModel, public TpDiagnostics {
     throw std::invalid_argument("TpModel::RunOne: no rank " + std::to_string(rank) + " in this group");
   }
 
+  // ---- hybrid mode (tp_model_hybrid.cpp; tp_hybrid.h has the types) ------------------------------------------------------------------
+  struct Hybrid;  // the facade's side: configuration, geometry, tracker, channel, buffers, stats
+  struct HyCall;  // one pipelined call's shared state, heap-owned by both rank closures (N53)
+  // After the rank warm-up and the caps (Load step 10): validates, plans S from the measured free VRAM, loads the stage Models on the rank
+  // threads, allocates the pinned buffers there, attaches the stages and runs a warm-up call. True when engaged; a configuration error
+  // throws std::invalid_argument; anything else that goes wrong tears the hybrid down again (HybridDrop) and returns false, plain --tp 2.
+  bool HybridLoad(const ModelOptions& opts, const PpOptions& pp, const std::shared_ptr<const core::PinnedBuffer<uint16_t>>& embed);
+  // Frees the stage Models and the hybrid's pinned buffers on the rank threads and drops `hy_`. `why` is logged.
+  void HybridDrop(const std::string& why);
+  // The dispatch of Prefill / PrefillMultimodal (hybrid::Decide): the logits of a pipelined call, or nullopt for the TP=2 prefill.
+  std::optional<std::vector<float>> TryHybridPrefill(const std::vector<int32_t>& ids, const std::vector<ImageSpan>* spans,
+                                                     const std::shared_ptr<std::vector<uint16_t>>& rows);
+  // One small plain command: collapses the ranks' speculative windows (their live GDN state back to window 0), and returns TP rank 0's
+  // scalars + MTP seed (what both stages are told) and, with a drafter, both ranks' drafter frontiers (-1 without one).
+  StageSyncState HybridReadSync(int64_t injected[2]);
+  // The pipelined call itself (one plain command on both rank workers); declined calls never get here. `tail_*`: the DFlash tail to capture
+  // on stage Y and inject into both drafters (hybrid::PlanTail); returns stage Y's logits.
+  std::vector<float> HybridPrefillRun(const std::vector<int32_t>& ids, const std::vector<ImageSpan>* spans,
+                                      const std::shared_ptr<std::vector<uint16_t>>& rows, const StageSyncState& sync, bool tail_use,
+                                      int64_t tail_start, int64_t tail_rows);
+  void HybridMain(RankSlot& s, HyCall& c);  // one rank thread's share of a pipelined call
+  // Executes one reshard plan (the warm gather / the end-of-call scatter) from this card's thread: the same-card ops device-to-device, the
+  // cross-card ones through the host ring in lockstep with the peer card's thread.
+  void HybridExec(RankSlot& s, Model& stage, Model& rank, HyCall& c, bool scatter);
+  void HybridWarmup();
+  // The sequence-state side of Reset(): both stage Models, the channel, the tracker (the ranks are reset by the caller).
+  void HybridResetStages();
+  // A TP-only forward call moves the shards from `from_pos` on (decode, speculative round, TP prefill): the stages' mirrors go stale.
+  void NoteTpMoved(int64_t from_pos);
+
   ModelOptions opts_;
   TpOptions tp_;
   State state_ = State::kReady;
@@ -346,6 +426,8 @@ class TpModel final : public TextModel, public TpDiagnostics {
   int64_t cached_fallback_rows_ = 0;
   bool dflash_injection_ = true;  // the Model default (model.h's SetDflashInjectionEnabled)
   mutable std::vector<VramReport> cached_vram_;
+  // Last member: destroyed first, after ~TpModel's teardown already freed everything the rank threads own (the stages, the pinned buffers).
+  std::unique_ptr<Hybrid> hy_;  // null: plain TP=2 (never requested, killed, refused, torn down)
 };
 
 }  // namespace r4dx::model

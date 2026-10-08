@@ -113,6 +113,13 @@ set(R4DX_MODEL_TESTS
   # --gate-b <dir>. ~20 GiB resident for the real container. Device 1, SKIP 77 without the containers. Links the R4DX_TP_TESTING variant.
   # Written, NOT run by its author (CPU-only session).
   test_hybrid_emulate_identity
+  # Hybrid mode P3 step 2, the TWO-GPU gate (docs/pp-tp2-hybrid.md 15): a real TpModel (two rank threads on two cards) with the hybrid engaged (a stage
+  # Model next to each rank, the pinned host ring between the cards) against a TP=1 reference on the headless card. G-H1 (logits byte-equal to TP=1,
+  # each rank's live-state digest == ReshardRef) for cold / prefix-reuse / warm (plain, --mtp 3) / checkpoint shapes, G-H2 (16 greedy tokens from the
+  # hybrid ranks == from ranks loaded with the reference image), the dispatch fallbacks (below min rows, over S) and recovery from an injected
+  # failure on either card in each phase. 4-layer container (k = 2) and the real container with 16 layers (k = 8). HIP_VISIBLE_DEVICES=0,1.
+  # Links the R4DX_TP_TESTING variant. Written, NOT run by its author (CPU-only session).
+  test_tp_hybrid_identity
 )
 
 foreach(t ${R4DX_MODEL_TESTS})
@@ -121,7 +128,8 @@ foreach(t ${R4DX_MODEL_TESTS})
   # src/model/CMakeLists.txt); every other test links the production library.
   if(t STREQUAL "test_tp_emulation" OR t STREQUAL "test_prefill_chunk_identity" OR t STREQUAL "test_prefill_int8" OR
      t STREQUAL "test_gdn_write_once_model" OR t STREQUAL "test_pp_emulate_identity" OR t STREQUAL "test_pp_real_identity" OR
-     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail" OR t STREQUAL "test_hybrid_emulate_identity")
+     t STREQUAL "test_reshard_exec" OR t STREQUAL "test_dflash_tail" OR t STREQUAL "test_hybrid_emulate_identity" OR
+     t STREQUAL "test_tp_hybrid_identity")
     target_link_libraries(${t} PRIVATE r4dx_model_tptest r4dx_convert r4dx_core r4d_core)
   else()
     target_link_libraries(${t} PRIVATE r4dx_model r4dx_convert r4dx_core r4d_core)
@@ -138,6 +146,8 @@ endforeach()
 set_tests_properties(test_pp_real_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1")
 # four rigs (three on the 4-layer container, one with 16 real layers) and ~60 scenarios: well past CTest's default 1500 s on a cold kernel cache
 set_tests_properties(test_hybrid_emulate_identity PROPERTIES TIMEOUT 5400)
+# The two-GPU hybrid: both cards visible (rank 0 = ordinal 1 = the headless card, which also holds the TP=1 reference; rank 1 = ordinal 0 = the desktop card)
+set_tests_properties(test_tp_hybrid_identity PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=0,1" TIMEOUT 5400)
 
 # The 64-row == 256-row chunk identity again with the DEFAULT prompt-prefill attention (split-KV from 2048 tokens of
 # context, exact-wide below): the 4-layer part, whose 8145-token scenario crosses the engage depth. The split law is a
@@ -376,6 +386,18 @@ add_test(NAME test_reshard_exec_cpu COMMAND test_reshard_exec_cpu)
 add_executable(test_dflash_tail_cpu test_dflash_tail_cpu.cpp)
 target_include_directories(test_dflash_tail_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
 add_test(NAME test_dflash_tail_cpu COMMAND test_dflash_tail_cpu)
+# Hybrid mode P3 step 2 (docs/pp-tp2-hybrid.md 7, 15), the HIP-free half of TpModel's hybrid. test_hybrid_dispatch_cpu:
+# src/model/hybrid_dispatch.h -- the kill-switch parse, the per-card stage-KV capacity S against the design's figures, the DFlash tail plan,
+# and the dispatch rule of Prefill / PrefillMultimodal with every fallback (below min rows, over S, gather budget, DFlash frontier),
+# walked against an oracle through the real TpMasterTracker. test_hybrid_ring_cpu: src/model/hybrid_ring.h -- the pinned ring's
+# publish / consume handshake, the host gates and the per-card lockstep loop, with two threads playing the cards (no deadlock, no slot
+# refilled early, a failure frees the peer at once). No HIP call; always run.
+add_executable(test_hybrid_dispatch_cpu test_hybrid_dispatch_cpu.cpp)
+target_include_directories(test_hybrid_dispatch_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_dispatch_cpu COMMAND test_hybrid_dispatch_cpu)
+add_executable(test_hybrid_ring_cpu test_hybrid_ring_cpu.cpp)
+target_include_directories(test_hybrid_ring_cpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src/model)
+add_test(NAME test_hybrid_ring_cpu COMMAND test_hybrid_ring_cpu)
 
 # tool_pp_project: the CPU half of pipeline-parallel prefill Phase 0 (docs/pp-prefill.md section 8) -- the projected
 # TTFT at 8k / 32k / 64k and the go rule from the two cards' stage benches and the hop bench. Built, never

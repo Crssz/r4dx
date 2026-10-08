@@ -236,9 +236,18 @@ struct CliArgs {
   // ---- pipeline-parallel prefill (docs/pp-prefill.md Phase 2) ---------------------------------------
   // --pp N: -1 (not given) follows R4DX_PP (unset = off); 1 forces it off; 2 runs prompt prefill as a two-stage pipeline
   // (layers [0, k) on the desktop card, the rest on the decode card; both cards must be visible -- HIP_VISIBLE_DEVICES
-  // unset), decode unchanged (r4dx::model::PpModel). Exclusive with --tp 2. The knobs below need --pp 2; -1 / 0 keep
-  // PpOptions' own defaults.
+  // unset), decode unchanged (r4dx::model::PpModel). With --tp 2 it is the HYBRID serving mode (docs/pp-tp2-hybrid.md): TP=2 decode
+  // with the PP-2 prefill stages next to the ranks (--tp-mode real; --hybrid off turns it back into plain --tp 2). The knobs
+  // below need --pp 2; -1 / 0 keep PpOptions' own defaults.
   int pp = -1;
+  // ---- hybrid mode (--tp 2 --pp 2; they need both) ----------------------------------------------------------------
+  // --hybrid {on|off}: -1 (not given) follows R4DX_HYBRID (unset = on); 0 = the kill switch. --hybrid-ctx N|auto: the stage-KV
+  // capacity S (0 = auto, from the measured free VRAM). --hybrid-reserve-gib X: VRAM kept free on the desktop card after the stage
+  // load (< 0 = the built-in 3.0). --pp-min-rows defaults to 1024 here (512 for --pp 2 alone).
+  int hybrid = -1;
+  int64_t hybrid_ctx = 0;
+  double hybrid_reserve_gib = -1.0;
+  bool hybrid_options_given = false;
   // --pp-devices B,A: process-visible HIP ordinals of stage B (the decode card) and stage A; empty = auto (R4DX_PP_DEVICES,
   // else B = the last visible ordinal = physical device 1 with HIP_VISIBLE_DEVICES unset, A = the one before it).
   std::vector<int> pp_devices;
@@ -272,7 +281,7 @@ inline std::string CliUsageText(const char* argv0) {
          "[--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
-         "[--pp-submit-layers N] [--pp-max-inflight K]";
+         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]";
 }
 
 // --pp-devices: "auto" (or "") -> empty (auto placement); "B,A" -> exactly two different ordinals (stage B = decode card,
@@ -427,6 +436,23 @@ inline CliArgs ParseArgs(int argc, char** argv) {
     else if (arg == "--pp-verify") { a.pp_verify = true; a.pp_options_given = true; }
     else if (arg == "--pp-submit-layers") { a.pp_submit_layers = ParseInt("--pp-submit-layers", NextCliArg(argc, argv, i, "--pp-submit-layers")); a.pp_options_given = true; pp_submit_given = true; }
     else if (arg == "--pp-max-inflight") { a.pp_max_inflight = ParseInt("--pp-max-inflight", NextCliArg(argc, argv, i, "--pp-max-inflight")); a.pp_options_given = true; pp_inflight_given = true; }
+    else if (arg == "--hybrid") {
+      const std::string v = NextCliArg(argc, argv, i, "--hybrid");
+      if (v != "on" && v != "off") throw CliUsageError("--hybrid expects on or off, got '" + v + "'");
+      a.hybrid = v == "on" ? 1 : 0;
+      a.hybrid_options_given = true;
+    }
+    else if (arg == "--hybrid-ctx") {
+      const std::string v = NextCliArg(argc, argv, i, "--hybrid-ctx");
+      a.hybrid_ctx = v == "auto" ? 0 : ParseI64("--hybrid-ctx", v);
+      if (v != "auto" && a.hybrid_ctx < 1) throw CliUsageError("--hybrid-ctx must be 'auto' or >= 1 tokens");
+      a.hybrid_options_given = true;
+    }
+    else if (arg == "--hybrid-reserve-gib") {
+      a.hybrid_reserve_gib = ParseFloat("--hybrid-reserve-gib", NextCliArg(argc, argv, i, "--hybrid-reserve-gib"));
+      if (!(a.hybrid_reserve_gib >= 0.0) || a.hybrid_reserve_gib > 24.0) throw CliUsageError("--hybrid-reserve-gib must be in [0, 24]");
+      a.hybrid_options_given = true;
+    }
     else if (arg == "--help" || arg == "-h") throw CliUsageError("help requested");
     else throw CliUsageError("unrecognized argument: " + arg);
   }
@@ -537,8 +563,14 @@ inline CliArgs ParseArgs(int argc, char** argv) {
   if (a.pp != 2 && a.pp_options_given) {
     throw CliUsageError("--pp-devices/--pp-split/--pp-min-rows/--pp-verify/--pp-submit-layers/--pp-max-inflight need --pp 2");
   }
+  if (a.hybrid_options_given && !(a.pp == 2 && a.tp == 2)) {
+    throw CliUsageError("--hybrid/--hybrid-ctx/--hybrid-reserve-gib need --tp 2 --pp 2 (the hybrid serving mode, docs/pp-tp2-hybrid.md)");
+  }
   if (a.pp == 2) {
-    if (a.tp != 1) throw CliUsageError("--pp 2 and --tp 2 are mutually exclusive");
+    // --tp 2 --pp 2 is the hybrid serving mode: the stages sit next to the two TP ranks, one per GPU.
+    if (a.tp == 2 && a.hybrid != 0 && a.tp_mode != "real") {
+      throw CliUsageError("--tp 2 --pp 2 (the hybrid serving mode) needs --tp-mode real; add --hybrid off to run --tp-mode " + a.tp_mode + " without it");
+    }
     if (pp_split_given && a.pp_split < 1) throw CliUsageError("--pp-split must be 'auto' or >= 1");
     if (pp_min_rows_given && a.pp_min_rows < 1) throw CliUsageError("--pp-min-rows must be >= 1");
     if ((pp_submit_given && (a.pp_submit_layers < 0 || a.pp_submit_layers > 64)) ||

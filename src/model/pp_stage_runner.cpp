@@ -127,13 +127,13 @@ void StageBOnLastChunk(Model& b, StageChannel& ch, StageBuffers& bufs, const Sta
 }
 
 StageBResult RunStageB(Model& b, StageChannel& ch, StageBuffers& bufs, const StageRunOptions& opt, StageBCallState& st,
-                       const std::vector<int32_t>& ids, const std::vector<Model::ImageSpan>* images) {
+                       const std::vector<int32_t>& ids, const std::vector<Model::ImageSpan>* images, std::vector<int32_t>* rope_rows_out) {
   StageBResult res;
   st.early_import = false;
   try {
     {
       ActiveGuard active(b);
-      res.logits = images != nullptr ? b.PrefillMultimodal(ids, *images) : b.Prefill(ids);
+      res.logits = images != nullptr ? b.PrefillMultimodal(ids, *images, nullptr, rope_rows_out) : b.Prefill(ids);
     }
     if (opt.gdn_handoff) {
       const auto t_gdn0 = Clock::now();

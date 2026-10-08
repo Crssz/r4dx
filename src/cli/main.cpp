@@ -514,7 +514,14 @@ int RunMain(int argc, char** argv) {
   r4dx::model::PpOptions ppo;
   ppo.devices = args.pp_devices;
   ppo.split = args.pp_split;
-  if (args.pp_min_rows > 0) ppo.min_rows = args.pp_min_rows;
+  if (args.pp_min_rows > 0) {
+    ppo.min_rows = args.pp_min_rows;
+    ppo.min_rows_given = true;
+  }
+  // --tp 2 --pp 2 is the hybrid serving mode (docs/pp-tp2-hybrid.md): LoadTextModel routes it to TpModel, which reads these.
+  ppo.hybrid = args.hybrid;
+  ppo.hybrid_ctx = args.hybrid_ctx;
+  ppo.hybrid_reserve_gib = args.hybrid_reserve_gib;
   ppo.verify = args.pp_verify;
   if (args.pp_submit_layers >= 0) ppo.submit_layers = args.pp_submit_layers;
   if (args.pp_max_inflight >= 0) ppo.max_inflight = args.pp_max_inflight;
@@ -830,6 +837,8 @@ int RunMain(int argc, char** argv) {
         }
         if (auto* tpm = dynamic_cast<r4dx::model::TpDiagnostics*>(model.get())) {  // TpModel or GemmaTpModel
           std::fprintf(stderr, "[stats] %s\n", tpm->GroupStatsLine().c_str());
+          const std::string hybrid_line = tpm->HybridStatsLine();  // --tp 2 --pp 2: the pipelined prefill's counters
+          if (!hybrid_line.empty()) std::fprintf(stderr, "[stats] %s\n", hybrid_line.c_str());
         }
       }
       if (auto* ppm = dynamic_cast<r4dx::model::PpModel*>(model.get())) {

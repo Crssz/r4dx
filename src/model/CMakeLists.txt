@@ -143,6 +143,9 @@ set(R4DX_MODEL_SOURCES
   # one-line forward per method onto Model) and TpModel (the tensor-parallel facade, 2.2-2.9).
   local_text_model.cpp
   tp_model.cpp
+  # The hybrid serving mode inside TpModel (docs/pp-tp2-hybrid.md, P3 step 2): the stage Models next to the ranks, the pipelined prefill
+  # command, the reshard over the pinned host ring, the dispatch -- TpModel members, split out of tp_model.cpp.
+  tp_model_hybrid.cpp
 )
 # r4dx_model_tptest: the SAME sources compiled with R4DX_TP_TESTING, which adds the tensor-parallel
 # test hooks (Model::DflashDebugLastTop16 and friends, docs/tp.md 10.1 "P5 additions") -- linked only

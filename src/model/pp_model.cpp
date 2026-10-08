@@ -215,6 +215,7 @@ std::unique_ptr<PpModel> PpModel::Load(const ModelOptions& opts, const PpOptions
     ao.dflash_container.clear();
     ao.dflash_draft_k = 0;
     ao.prompt_checkpoint = false;
+    ao.batch_slots = 0;  // the batch slots live on the decode Model (stage B); a stage takes none
     ao.pp = 0;
     if (pp.stage_only || EnvFlag("R4DX_PP_STAGE_ONLY")) {  // lean stage A (docs/pp-tp2-hybrid.md 9 P0): the same layers, fewer weights
       ao.stage_only.role = stage::Role::kFront;
@@ -530,6 +531,18 @@ int32_t PpModel::DecodeStepSampled(int32_t token_id, const kernels::SampleParams
   RequireReady();
   NoteBOnly();
   return b_->DecodeStepSampled(token_id, params, rng);
+}
+void PpModel::BatchImport(int slot) {
+  RequireReady();
+  b_->BatchImport(slot);
+}
+void PpModel::BatchRelease(int slot) {
+  BindStageB();
+  b_->BatchRelease(slot);
+}
+std::vector<int32_t> PpModel::DecodeBatch(const std::vector<BatchDecodeRow>& rows) {
+  RequireReady();
+  return b_->DecodeBatch(rows);
 }
 std::vector<int32_t> PpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
   RequireReady();

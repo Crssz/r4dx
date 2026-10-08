@@ -23,11 +23,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "batch_executor.h"  // BatchExecutor (--batch N): HIP-free
 #include "chat_template.h"
 #include "dialect.h"
 #include "model.h"  // ModelOptions
@@ -92,6 +94,9 @@ struct EngineOptions {
   // record each request's prompt/generated token ids and per-round speculative acceptance. False (the
   // default) = none of it is collected: the decode loops see a null pointer. Ignored without request_log.
   bool request_log_tokens = false;
+  // `--batch N` (model_opts.batch_slots > 0, docs/batch-decode.md 7): how long one batched decode step waits for the sequences that are still
+  // between tokens before it runs with the rows it has (BatchExecutor::Options::gather). Not a CLI flag; tests and tools move it.
+  std::chrono::microseconds batch_gather{2000};
 };
 
 enum class RequestKind { kChat, kCompletion };
@@ -185,11 +190,16 @@ class Engine {
 
  private:
   void WorkerLoop();
+  // `--batch N`: one of N request threads, each serving the requests it pops from the queue in batch slot `slot` (docs/batch-decode.md 7).
+  void BatchWorkerLoop(int slot);
 
   // Runs one request end to end against tok_/tmpl_/model_, feeding req->sink. Never throws --
   // every failure path reports through req->sink->OnError instead, since this runs on the single
   // worker thread and an uncaught exception here would take the whole server down.
-  void RunRequest(PendingRequest& req);
+  // `port` (batched serving only): the BatchPort this request talks to INSTEAD of model_ -- a TextModel that forwards to the executor
+  // thread that owns model_ and joins this request's decode steps into batched ones. With a port the request also keeps no prefix state
+  // across requests (it owns a slot, not the model) and answers a prompt longer than the slot (--batch-ctx) with a 400.
+  void RunRequest(PendingRequest& req, r4dx::model::TextModel* port = nullptr);
 
   // Shared stop-string-aware token emission (engine.cpp) used by both the plain-decode and MTP
   // generation loops in RunRequest -- see that function's definition for the full contract.
@@ -249,6 +259,12 @@ class Engine {
 
   BoundedQueue<std::shared_ptr<PendingRequest>> queue_;
   std::thread worker_;
+  // Batched serving (model_opts.batch_slots > 0): the executor thread that owns model_, the request threads (worker_ stays unused), and the
+  // lock that gives one request at a time the model's single-sequence state while its prompt is prefilled (BatchPort).
+  // Declared after model_ so they are destroyed first: the executor thread uses it.
+  std::unique_ptr<BatchExecutor> batch_exec_;
+  std::vector<std::thread> batch_workers_;
+  std::mutex batch_primary_mu_;
   std::atomic<bool> stop_{false};
   // TpFatal(): the worker thread's copy of `tp_model_->GroupHealth() == kFatal`, taken after every
   // failed request -- TpModel's own state is facade-thread-only, so the HTTP threads read this.

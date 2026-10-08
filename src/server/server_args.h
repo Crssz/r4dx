@@ -21,6 +21,8 @@ namespace r4dx::server {
 inline constexpr int64_t kMaxMtpDraftK = 63;
 // ... and 7 under --tp 2: src/cli/cli_args.h's kMaxMtpDraftKTp (docs/tp.md Appendix B N80).
 inline constexpr int64_t kMaxMtpDraftKTp = 7;
+// r4dx::model::batch::kMaxSlots (src/model/batch_plan.h): the most batch slots one server can hold.
+inline constexpr int kMaxBatchSlots = 16;
 
 struct ServerArgs {
   std::string model_path;
@@ -173,6 +175,17 @@ struct ServerArgs {
   int pp_submit_layers = -1;  // default 32
   int pp_max_inflight = -1;   // default 1
   bool pp_options_given = false;
+
+  // ---- batched decode (docs/batch-decode.md) -------------------------------------------------------------------
+  // --batch N: serve up to N requests at once, one decode forward pass per token for all of them (continuous batching with
+  // serialized prefill). 0 (default) is the one-request-at-a-time server, byte for byte. N in [2, 16] needs a plain Model (no
+  // --mtp, no --dflash), turns the prompt checkpoint and cross-request prefix reuse off (every request prefills on its own and
+  // owns a slot), and works with --tp 2 and the hybrid --tp 2 --pp 2 (decode of the slots runs as TP=2 after the pipelined
+  // prefill). --batch-ctx N: tokens one slot holds (a multiple of 16; default 32768): a longer prompt is refused with a 400;
+  // the slots cost N x batch-ctx x 32 KiB of VRAM at --tp 1, half of that per rank at --tp 2.
+  int batch = 0;
+  int64_t batch_ctx = 32768;
+  bool batch_ctx_given = false;
 };
 
 // Thrown for a malformed/incomplete argument list -- ParseArgs never calls std::exit() itself, so
@@ -198,7 +211,8 @@ inline std::string ServerUsageText(const char* argv0) {
          "[--request-log-tokens] [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r] "
          "[--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N] "
          "[--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify] "
-         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]";
+         "[--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X] "
+         "[--batch N] [--batch-ctx N]";
 }
 
 inline std::string NextServerArg(int argc, char** argv, int& i, const char* flag) {
@@ -363,6 +377,8 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
       if (!(a.hybrid_reserve_gib >= 0.0) || a.hybrid_reserve_gib > 24.0) throw ServerUsageError("--hybrid-reserve-gib must be in [0, 24]");
       a.hybrid_options_given = true;
     }
+    else if (arg == "--batch") a.batch = ServerParseInt("--batch", NextServerArg(argc, argv, i, "--batch"));
+    else if (arg == "--batch-ctx") { a.batch_ctx = ServerParseI64("--batch-ctx", NextServerArg(argc, argv, i, "--batch-ctx")); a.batch_ctx_given = true; }
     else if (arg == "--help" || arg == "-h") throw ServerUsageError("help requested");
     else throw ServerUsageError("unrecognized argument: " + arg);
   }
@@ -417,6 +433,23 @@ inline ServerArgs ParseServerArgs(int argc, char** argv) {
   if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) {
     throw ServerUsageError("--dflash-k must be in [1, 7] (DFlash2's block is 8 wide: anchor + up "
                             "to block_size-1 drafted tokens)");
+  }
+  // ---- batched decode (docs/batch-decode.md) --------------------------------------------------------------------
+  // 0 = off, else 2..16 (one slot is the one-at-a-time server, which --batch 0 already is); the same bound as
+  // r4dx::model::batch::kMaxSlots (src/model/batch_plan.h, HIP-free but not on this header's include path).
+  if (a.batch != 0 && (a.batch < 2 || a.batch > kMaxBatchSlots)) {
+    throw ServerUsageError("--batch must be 0 (off) or in [2, " + std::to_string(kMaxBatchSlots) + "]");
+  }
+  if (a.batch == 0 && a.batch_ctx_given) throw ServerUsageError("--batch-ctx needs --batch N");
+  if (a.batch_ctx < 16 || a.batch_ctx % 16 != 0 || a.batch_ctx > (int64_t{1} << 24)) {
+    throw ServerUsageError("--batch-ctx must be a multiple of 16 (the KV block) in [16, 16777216]");
+  }
+  if (a.batch > 0) {
+    if (a.mtp > 0) throw ServerUsageError("--batch and --mtp cannot be combined (a batched step decodes one plain token per sequence)");
+    if (!a.dflash.empty()) throw ServerUsageError("--batch and --dflash cannot be combined (a batched step decodes one plain token per sequence)");
+    if (a.max_queue < a.batch) {
+      throw ServerUsageError("--max-queue must be >= --batch (" + std::to_string(a.batch) + "): the queue feeds the slots");
+    }
   }
   // ---- tensor parallel (docs/tp.md 9.1): src/cli/cli_args.h's rules, minus --profile* (the server
   // has no profiling flags) ------------------------------------------------------------------------

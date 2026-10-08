@@ -545,6 +545,8 @@ std::unique_ptr<TpModel> TpModel::Load(const ModelOptions& opts, const TpOptions
   m->mtp_reduced_vocab_ = caps[0].mtp_reduced;
   m->dflash_enabled_ = caps[0].dflash;
   m->num_loaded_layers_ = caps[0].layers;
+  m->batch_slots_ = opts.batch_slots;
+  m->batch_slot_ctx_ = opts.batch_slots > 0 ? opts.batch_ctx : 0;
   m->dflash_injection_ = true;  // the Model default (model.h)
   m->cached_position_ = 0;
   m->cached_fallback_rows_ = 0;
@@ -1133,6 +1135,53 @@ int32_t TpModel::DecodeStepSampled(int32_t token_id, const kernels::SampleParams
   RequireAllEqual(r, "DecodeStepSampled token");
   RequireRngsEqual(*rngs, "DecodeStepSampled");
   rng = (*rngs)[0];
+  return r[0];
+}
+
+void TpModel::BatchImport(int slot) {
+  RequireReady();
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::BatchImport: loaded without batch slots (ModelOptions::batch_slots)");
+  // A local copy on every rank (its own shard of the KV and GDN state; no TpComm), run as a collective command only for its state
+  // rules: TpStateError unless kReady, and a failure makes the group kNeedsRecovery. The single-sequence state does not move, so the
+  // hybrid's mirrors (NoteTpMoved) are left alone.
+  RunCollective([slot](Model& m, int) { m.BatchImport(slot); });
+}
+
+void TpModel::BatchRelease(int slot) {
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::BatchRelease: loaded without batch slots (ModelOptions::batch_slots)");
+  // Host bookkeeping on every rank, legal in any non-fatal state (a failed step's slots are released while the group needs recovery).
+  if (state_ == State::kFatal) throw core::TpStateError("tp: fatal, restart the process");
+  RunAll([slot](Model& m, int) { m.BatchRelease(slot); });
+}
+
+std::vector<int32_t> TpModel::DecodeBatch(const std::vector<BatchDecodeRow>& rows) {
+  RequireReady();
+  if (batch_slots_ == 0) throw std::runtime_error("TpModel::DecodeBatch: loaded without batch slots (ModelOptions::batch_slots)");
+  const size_t n = rows.size();
+  // rank -> row -> that rank's copy of the row's generator (a greedy row has none)
+  auto rngs = std::make_shared<std::vector<std::vector<std::mt19937_64>>>(ranks_.size());
+  for (auto& per_rank : *rngs) {
+    per_rank.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+      if (rows[i].rng != nullptr) per_rank[i] = *rows[i].rng;
+    }
+  }
+  auto plain = std::make_shared<std::vector<BatchDecodeRow>>(rows);  // the rng pointers are replaced per rank below
+  const std::vector<std::vector<int32_t>> r = RunCollective([plain, rngs](Model& m, int slot) {
+    std::vector<BatchDecodeRow> mine = *plain;
+    for (size_t i = 0; i < mine.size(); ++i) {
+      mine[i].rng = mine[i].params.temperature > 0.0f ? &(*rngs)[static_cast<size_t>(slot)][i] : nullptr;
+    }
+    return m.DecodeBatch(mine);
+  });
+  RequireAllEqual(r, "DecodeBatch tokens");
+  for (size_t i = 0; i < n; ++i) {
+    if (rows[i].rng == nullptr || !(rows[i].params.temperature > 0.0f)) continue;
+    std::vector<std::mt19937_64> per_rank;
+    for (const auto& pr : *rngs) per_rank.push_back(pr[i]);
+    RequireRngsEqual(per_rank, "DecodeBatch");
+    *rows[i].rng = per_rank[0];
+  }
   return r[0];
 }
 

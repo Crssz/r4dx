@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -57,6 +58,7 @@ namespace {
 // mode would otherwise only find out at a mismatched all-gather.
 constexpr uint64_t kLockstepRunChunk = 0x52554e4300000000ull;  // "RUNC"
 constexpr uint64_t kLockstepVerify = 0x5645524900000000ull;    // "VERI"
+constexpr uint64_t kLockstepBatch = 0x4241544300000000ull;     // "BATC": DecodeBatch (docs/batch-decode.md)
 
 uint64_t Fnv1a64(const std::vector<int32_t>& tokens) {
   uint64_t h = 0xcbf29ce484222325ull;
@@ -223,6 +225,24 @@ Model Model::Load(const ModelOptions& opts) {
   stage_req.dflash_container = !opts.dflash_container.empty();
   if (const std::string why = stage::ValidateRole(stage_req); !why.empty()) {
     throw std::invalid_argument("Model::Load: " + why);
+  }
+  // Batched decode (docs/batch-decode.md): the slots hold plain decode state, so no speculation family and no stage-only load.
+  if (opts.batch_slots < 0 || opts.batch_slots > batch::kMaxSlots) {
+    throw std::invalid_argument("Model::Load: ModelOptions::batch_slots must be in [0, " + std::to_string(batch::kMaxSlots) +
+                                "], got " + std::to_string(opts.batch_slots));
+  }
+  if (opts.batch_slots > 0) {
+    if (opts.mtp_draft_k != 0 || opts.dflash_draft_k != 0 || !opts.dflash_container.empty()) {
+      throw std::invalid_argument("Model::Load: batched decode (batch_slots > 0) cannot be combined with MTP or DFlash2 (mtp_draft_k / "
+                                  "dflash_draft_k / dflash_container): the slots decode one plain token per step");
+    }
+    if (stage_only) {
+      throw std::invalid_argument("Model::Load: batched decode (batch_slots > 0) is not available for a stage-only (pipeline stage) Model");
+    }
+    if (opts.batch_ctx < 16 || opts.batch_ctx % 16 != 0 || opts.batch_ctx > (int64_t{1} << 24)) {
+      throw std::invalid_argument("Model::Load: ModelOptions::batch_ctx must be a multiple of the 16-token KV block in [16, 2^24], got " +
+                                  std::to_string(opts.batch_ctx));
+    }
   }
   const ModelOptions::VisionMode vision_mode = stage_only ? ModelOptions::VisionMode::kOff : opts.vision;
   (void)FakeQuantActRequest();  // R4DX_FAKEQ_ACT: a bad value throws before the weights are read
@@ -573,6 +593,55 @@ Model Model::Load(const ModelOptions& opts) {
     }
   }
 
+  // Batched decode (docs/batch-decode.md): the slots' GDN state and KV, next to the single-sequence ones and never aliasing them.
+  if (opts.batch_slots > 0) {
+    m.batch_slots_ = batch::SlotTable(opts.batch_slots, opts.batch_ctx);
+    m.batch_gdn_states_.resize(static_cast<size_t>(num_layers));
+    m.batch_kv_caches_.resize(static_cast<size_t>(num_layers));
+    int64_t gdn_layers = 0, attn_layers = 0;
+    int64_t state_len_max = 0;
+    for (int64_t i = 0; i < num_layers; ++i) {
+      if (!m.container_.LayerLoaded(i)) continue;
+      if (cfg.IsGdnLayer(i)) {
+        auto& gs = m.batch_gdn_states_[static_cast<size_t>(i)];
+        gs.emplace(/*max_seqs=*/opts.batch_slots, /*H=*/cfg.linear_num_value_heads, /*V=*/cfg.linear_value_head_dim,
+                   /*K=*/cfg.linear_key_head_dim, cfg.ConvDim(), cfg.linear_conv_kernel_dim, /*max_decode_window=*/1,
+                   /*write_once=*/false);
+        gs->ZeroAll(m.stream_);
+        // batch_plan.h's GdnSlotOf is the manager's own slot rule at window 1
+        for (int s = 0; s < opts.batch_slots; ++s) {
+          if (gs->SlotForSeq(s) != batch::GdnSlotOf(s)) {
+            throw std::logic_error("Model::Load: GdnStateManager::SlotForSeq disagrees with batch::GdnSlotOf");
+          }
+        }
+        state_len_max = gs->StateLenMax();
+        ++gdn_layers;
+      } else {
+        m.batch_kv_caches_[static_cast<size_t>(i)].emplace(
+            static_cast<int>(cfg.num_key_value_heads), static_cast<int>(cfg.head_dim), adims.block_size,
+            static_cast<int>(opts.batch_slots * opts.batch_ctx));
+        if (m.batch_split_ctx_ == 0) m.batch_split_ctx_ = m.kv_caches_[static_cast<size_t>(i)]->CapacityTokens();
+        ++attn_layers;
+      }
+    }
+    if (opts.batch_ctx % adims.block_size != 0) {
+      throw std::invalid_argument("Model::Load: ModelOptions::batch_ctx must be a multiple of the KV block (" +
+                                  std::to_string(adims.block_size) + ")");
+    }
+    m.batch_bytes_ = batch::BatchKvBytes(opts.batch_slots, opts.batch_ctx, attn_layers, cfg.num_key_value_heads, cfg.head_dim) +
+                     batch::BatchGdnBytes(opts.batch_slots, gdn_layers, cfg.linear_num_value_heads, cfg.linear_value_head_dim,
+                                          cfg.linear_key_head_dim, cfg.ConvDim(), state_len_max);
+    m.batch_meta_host_ = core::PinnedBuffer<int32_t>(static_cast<size_t>(batch::kMetaInts));
+    m.batch_meta_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(batch::kMetaInts));
+    m.batch_logits_dev_ = core::DeviceBuffer<float>(static_cast<size_t>(opts.batch_slots * m.vocab_local_));
+    m.batch_argmax_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(opts.batch_slots));
+    char batch_line[160];
+    std::snprintf(batch_line, sizeof(batch_line), "[r4dx::model::Model] batched decode: %d slots x %lld tokens, %.2f GiB (KV + GDN state)\n",
+                  opts.batch_slots, static_cast<long long>(opts.batch_ctx),
+                  static_cast<double>(m.batch_bytes_) / (1024.0 * 1024.0 * 1024.0));
+    std::cerr << batch_line;
+  }
+
   if (opts.mtp_draft_k > 0) {
     // docs/tp.md 8.1, 4.4: the head's logits buffer holds the widest draft head it can run -- this
     // rank's lm_head shard or the replicated reduced head (the whole vocabulary at TP=1) -- and its
@@ -611,7 +680,8 @@ Model Model::Load(const ModelOptions& opts) {
   // workspace (docs/tp.md 2.7), allocated here with the rest of the load-time scratch rather than
   // at the first sampled row, so no sampled path ever allocates inside a collective (6.3.7).
   if (m.comm_ != nullptr) {
-    m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(static_cast<size_t>(2 * m.draft_window_));
+    m.argmax_pair_dev_ = core::DeviceBuffer<int32_t>(
+        static_cast<size_t>(2 * std::max<int64_t>(m.draft_window_, opts.batch_slots)));
     m.topk_lse_ws_ = core::DeviceBuffer<uint8_t>(static_cast<size_t>(r4dx_topk_lse_workspace_bytes()));
     // The prefill submission bounding's events (docs/tp.md Appendix B N57): created here, on this
     // rank's thread and device, never inside a collective command.
@@ -627,7 +697,8 @@ Model Model::Load(const ModelOptions& opts) {
   // sized for speculation at all, and a conditional allocation would be one more way for a caller
   // to reach a null pointer.
   {
-    const size_t summary_rows = static_cast<size_t>(m.draft_window_ > 1 ? m.draft_window_ : 1);
+    const size_t summary_rows =
+        static_cast<size_t>(std::max<int64_t>({m.draft_window_, int64_t{1}, static_cast<int64_t>(opts.batch_slots)}));
     m.summary_ids_dev_ = core::DeviceBuffer<int32_t>(summary_rows * R4DX_TOPK_LSE_K);
     m.summary_vals_dev_ = core::DeviceBuffer<float>(summary_rows * R4DX_TOPK_LSE_K);
     m.summary_lse_dev_ = core::DeviceBuffer<float>(summary_rows);
@@ -2139,14 +2210,14 @@ float Model::SummaryInvTemperature(const kernels::SampleParams& params) {
   return inv;
 }
 
-void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature) {
+void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature, int64_t out_row0) {
   if (rows <= 0) return;
   // The device rows are this rank's [vocab_local_] shard (docs/tp.md 7.2's rule); at TP=1
   // vocab_local_ == Config().vocab_size.
   const int64_t vocab = vocab_local_;
   const int64_t capacity = static_cast<int64_t>(summary_lse_dev_.size());
-  if (rows > capacity) {
-    throw std::runtime_error("Model::LaunchRowSummaries: rows (" + std::to_string(rows) +
+  if (out_row0 < 0 || out_row0 + rows > capacity) {
+    throw std::runtime_error("Model::LaunchRowSummaries: rows (" + std::to_string(out_row0 + rows) +
                               ") exceeds the summary scratch this Model was sized for (" +
                               std::to_string(capacity) + ")");
   }
@@ -2169,18 +2240,18 @@ void Model::LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_
       // Tensor parallel (docs/tp.md 2.7): this rank's own workspace, never the kernels' module
       // scratch -- under emulation the other rank summarizes concurrently on the same device.
       r4dx_topk_lse_f32_ws(reinterpret_cast<int64_t>(logits_dev + off * vocab),
-                           reinterpret_cast<int64_t>(summary_ids_dev_.data() + off * R4DX_TOPK_LSE_K),
-                           reinterpret_cast<int64_t>(summary_vals_dev_.data() + off * R4DX_TOPK_LSE_K),
-                           reinterpret_cast<int64_t>(summary_lse_dev_.data() + off),
+                           reinterpret_cast<int64_t>(summary_ids_dev_.data() + (out_row0 + off) * R4DX_TOPK_LSE_K),
+                           reinterpret_cast<int64_t>(summary_vals_dev_.data() + (out_row0 + off) * R4DX_TOPK_LSE_K),
+                           reinterpret_cast<int64_t>(summary_lse_dev_.data() + out_row0 + off),
                            static_cast<int>(n), vocab, inv_temperature,
                            reinterpret_cast<int64_t>(stream_.get()),
                            reinterpret_cast<int64_t>(topk_lse_ws_.data()));
       continue;
     }
     r4dx_topk_lse_f32(reinterpret_cast<int64_t>(logits_dev + off * vocab),
-                       reinterpret_cast<int64_t>(summary_ids_dev_.data() + off * R4DX_TOPK_LSE_K),
-                       reinterpret_cast<int64_t>(summary_vals_dev_.data() + off * R4DX_TOPK_LSE_K),
-                       reinterpret_cast<int64_t>(summary_lse_dev_.data() + off),
+                       reinterpret_cast<int64_t>(summary_ids_dev_.data() + (out_row0 + off) * R4DX_TOPK_LSE_K),
+                       reinterpret_cast<int64_t>(summary_vals_dev_.data() + (out_row0 + off) * R4DX_TOPK_LSE_K),
+                       reinterpret_cast<int64_t>(summary_lse_dev_.data() + out_row0 + off),
                        static_cast<int>(n), vocab, inv_temperature,
                        reinterpret_cast<int64_t>(stream_.get()));
   }
@@ -2889,6 +2960,336 @@ std::vector<int32_t> Model::VerifyWindow(const std::vector<int32_t>& candidates,
   return preds;
 }
 
+// ---- batched decode (docs/batch-decode.md) -----------------------------------------------------------------------------------
+
+void Model::BatchImport(int slot) {
+  if (batch_slots_.Slots() == 0) {
+    throw std::runtime_error("Model::BatchImport: this Model was loaded without ModelOptions::batch_slots");
+  }
+  if (slot < 0 || slot >= batch_slots_.Slots()) {
+    throw std::invalid_argument("Model::BatchImport: slot " + std::to_string(slot) + " outside [0, " +
+                                std::to_string(batch_slots_.Slots()) + ")");
+  }
+  if (!started_ || pos_ < 1) throw std::runtime_error("Model::BatchImport: nothing to import (Prefill first)");
+  if (pos_ >= batch_slots_.SlotCtx()) {
+    throw std::runtime_error("Model::BatchImport: a " + std::to_string(pos_) + "-token sequence leaves no room in a " +
+                             std::to_string(batch_slots_.SlotCtx()) + "-token batch slot (raise the batch context)");
+  }
+  // The single-sequence state must be the live state of a plain decode: a speculative window (draft_window_ > 1) would keep it in a
+  // window slot (gdn_state.h). A batch Model has none (Load refuses MTP / DFlash2 next to batch_slots).
+  if (draft_window_ != 1) throw std::logic_error("Model::BatchImport: a Model with a speculative window cannot batch");
+  // Same hazard class as every other public call: the device is idle on entry (the previous call ended synchronized), and the
+  // copies below are enqueued on stream_ and waited for before the slot goes live.
+  const int64_t num_layers = container_.NumLoadedLayers();
+  for (int64_t i = 0; i < num_layers; ++i) {
+    const size_t li = static_cast<size_t>(i);
+    if (gdn_states_[li]) {
+      GdnStateManager& src = *gdn_states_[li];
+      GdnStateManager& dst = *batch_gdn_states_[li];
+      R4DX_HIP_CHECK(hipMemcpyAsync(dst.RecurrentSlotPtr(dst.SlotForSeq(slot)), src.RecurrentSlotPtr(src.SlotForSeq(0)),
+                                    static_cast<size_t>(src.RecurrentSlotStride()) * sizeof(float), hipMemcpyDeviceToDevice,
+                                    stream_.get()));
+      // the history a decode step reads: the first conv_width - 1 entries of each channel's line (the two managers' line
+      // pitches agree today -- both have window 1 -- but the copy does not rely on it)
+      R4DX_HIP_CHECK(hipMemcpy2DAsync(dst.ConvLinePtr(slot), static_cast<size_t>(dst.StateLenMax()) * sizeof(uint16_t),
+                                      src.ConvLinePtr(0), static_cast<size_t>(src.StateLenMax()) * sizeof(uint16_t),
+                                      static_cast<size_t>(src.ConvHistory()) * sizeof(uint16_t),
+                                      static_cast<size_t>(src.ConvDim()), hipMemcpyDeviceToDevice, stream_.get()));
+    } else if (kv_caches_[li]) {
+      attention::PagedKvCache& src = *kv_caches_[li];
+      attention::PagedKvCache& dst = *batch_kv_caches_[li];
+      // Block-major layout on both sides with the same block stride: the first ceil(pos / block) blocks of the single-sequence
+      // cache are one contiguous run, and slot s's blocks start at s * (slot_ctx / block) of the batch cache.
+      const int64_t blocks = (pos_ + src.BlockSize() - 1) / src.BlockSize();
+      const int64_t blocks_per_slot = batch_slots_.SlotCtx() / dst.BlockSize();
+      R4DX_HIP_CHECK(hipMemcpyAsync(dst.Data() + static_cast<int64_t>(slot) * blocks_per_slot * dst.KvBlockStride(), src.Data(),
+                                    static_cast<size_t>(blocks * src.KvBlockStride()), hipMemcpyDeviceToDevice, stream_.get()));
+    }
+  }
+  stream_.Synchronize();
+  batch_slots_.Activate(slot, pos_, mrope_active_, mrope_delta_);
+}
+
+void Model::BatchRelease(int slot) {
+  if (batch_slots_.Slots() == 0) throw std::runtime_error("Model::BatchRelease: this Model was loaded without ModelOptions::batch_slots");
+  batch_slots_.Release(slot);
+}
+
+std::vector<int32_t> Model::DecodeBatch(const std::vector<BatchDecodeRow>& rows) {
+  if (batch_slots_.Slots() == 0) {
+    throw std::runtime_error("Model::DecodeBatch: this Model was loaded without ModelOptions::batch_slots");
+  }
+  CheckTuningScope();
+  CheckLayersLoaded(0, container_.NumLoadedLayers(), "Model::DecodeBatch");
+  const int T = static_cast<int>(rows.size());
+  std::vector<int> slots(rows.size());
+  std::vector<int32_t> tokens(rows.size());
+  for (size_t r = 0; r < rows.size(); ++r) {
+    slots[r] = rows[r].slot;
+    tokens[r] = rows[r].token;
+    if (rows[r].params.temperature > 0.0f && rows[r].rng == nullptr) {
+      throw std::invalid_argument("Model::DecodeBatch: a sampled row (temperature > 0) needs its rng");
+    }
+  }
+  if (const std::string why = batch::CheckStep(batch_slots_, slots.data(), T); !why.empty()) {
+    throw std::invalid_argument("Model::DecodeBatch: " + why);
+  }
+  try {
+    return DecodeBatchRun(rows, slots, tokens);
+  } catch (...) {
+    // Some layers may have advanced these slots' state and some not: it is unknown, so the slots are free again (their next
+    // BatchImport overwrites all of it) and the caller must not feed them another token.
+    for (int s : slots) batch_slots_.Release(s);
+    throw;
+  }
+}
+
+std::vector<int32_t> Model::DecodeBatchRun(const std::vector<BatchDecodeRow>& rows, const std::vector<int>& slots,
+                                           const std::vector<int32_t>& tokens) {
+  const int T = static_cast<int>(rows.size());
+  const ModelConfig& cfg = container_.Config();
+  const int64_t hidden = cfg.hidden_size;
+  const int64_t num_layers = container_.NumLoadedLayers();
+
+  // Per-row mode: greedy (no draw), device row summary (inv_t > 0), or the full-row path (a temperature so small the summary is
+  // skipped, SummaryInvTemperature). `sum_idx[r]` is the row's place among the summarised rows (consecutive summary rows).
+  std::vector<float> inv_t(static_cast<size_t>(T), 0.0f);
+  std::vector<int> sum_idx(static_cast<size_t>(T), -1);
+  int n_sum = 0;
+  uint64_t mode_mask = 0;
+  for (int r = 0; r < T; ++r) {
+    const kernels::SampleParams& sp = rows[static_cast<size_t>(r)].params;
+    if (!(sp.temperature > 0.0f)) continue;
+    mode_mask |= uint64_t{1} << r;
+    inv_t[static_cast<size_t>(r)] = SummaryInvTemperature(sp);
+    if (inv_t[static_cast<size_t>(r)] > 0.0f) {
+      mode_mask |= uint64_t{1} << (16 + r);
+      sum_idx[static_cast<size_t>(r)] = n_sum++;
+    }
+  }
+
+  // Tensor parallel (docs/tp.md 6.2): every rank must be about to run the same step -- same rows, tokens, positions and per-row
+  // mode, which decides the collectives after the layers -- before its all-reduces are enqueued.
+  if (comm_ != nullptr) {
+    const uint64_t fingerprint[4] = {kLockstepBatch, static_cast<uint64_t>(T),
+                                     batch::StepFingerprint(batch_slots_, slots.data(), tokens.data(), T), mode_mask};
+    comm_->CheckLockstep(fingerprint);
+    comm_->CheckHealthy();
+  }
+
+  // One async copy of the step's metadata (the previous call ended synchronized, so nothing still reads either buffer).
+  const bool any_mrope = batch::FillStepMeta(batch_slots_, slots.data(), tokens.data(), T, batch_meta_host_.data());
+  R4DX_HIP_CHECK(hipMemcpyAsync(batch_meta_dev_.data(), batch_meta_host_.data(),
+                                static_cast<size_t>(batch::kMetaInts) * sizeof(int32_t), hipMemcpyHostToDevice, stream_.get()));
+  const int32_t* meta = batch_meta_dev_.data();
+
+  if (container_.EmbedTokensDeviceResident()) {
+    EmbedTokensDeviceGather(stream_, container_.EmbedTokensDevice(), hidden, meta + batch::kMetaIds, T, cfg.vocab_size,
+                            buf_a_.data());
+  } else {
+    EmbedTokens(stream_, container_.EmbedTokensHost(), cfg.vocab_size, hidden, tokens, embed_staging_, buf_a_);
+  }
+  RotateResidual(buf_a_.data(), T, /*inverse=*/false);  // quant2 stack entry, as RunChunk's
+
+  const int32_t* rope_pos3 = any_mrope ? meta + batch::kMetaRope3 : nullptr;
+  attention::AttnBatchView view;
+  view.rows = T;
+  view.slot_mapping = meta + batch::kMetaSlotMap;
+  view.seqused_k = meta + batch::kMetaSeqUsed;
+  view.row_slot = slots.data();
+  view.split_max_ctx = static_cast<int>(batch_split_ctx_);
+  for (int64_t i = 0; i < num_layers; ++i) {  // every attention layer's cache has the same geometry (Load)
+    if (batch_kv_caches_[static_cast<size_t>(i)]) {
+      view.blocks_per_slot = static_cast<int>(batch_slots_.SlotCtx() / batch_kv_caches_[static_cast<size_t>(i)]->BlockSize());
+      break;
+    }
+  }
+
+  uint16_t* cur = buf_a_.data();
+  uint16_t* other = buf_b_.data();
+  const uint16_t* normed_in = nullptr;  // R3 fusion, as VerifyWindow's identical pattern
+  int normed_in_epilogue = r4dx_epilogue_none;
+  const BackboneHadSigns had = HadSigns();  // quant2 Q2b
+
+  for (int64_t i = 0; i < num_layers; ++i) {
+    const LayerWeights& lw = container_.Layer(i);
+    const bool has_next_layer = (i + 1 < num_layers);
+    const uint16_t* mlp_norm_weight = lw.post_attention_layernorm.data();
+
+    if (cfg.IsGdnLayer(i)) {
+      GdnLayer layer(cfg, lw.input_layernorm, *lw.gdn, comm_);
+      GdnLayerParams p;
+      p.is_prefill = false;
+      p.num_seqs = T;
+      p.batch_cu = meta + batch::kMetaCu;
+      p.batch_cache_idx = meta + batch::kMetaCacheIdx;
+      p.batch_sidx = meta + batch::kMetaSidx;
+      p.out_had_signs = had.gdn_out;
+      layer.Forward(stream_, arena_, *batch_gdn_states_[static_cast<size_t>(i)], gdn_control_, cur, cur, T, p, normed_in,
+                    mlp_norm_weight, buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue, buf_normed_pre_.data(),
+                    body_epilogue_, buf_normed_pre_.data());
+    } else {
+      attention::AttentionLayer layer(MakeAttnConfig(cfg, comm_));
+
+      attention::AttnWeights aw;
+      aw.input_layernorm = lw.input_layernorm.data();
+      aw.qg = &lw.attn->qg;
+      aw.k = &lw.attn->k;
+      aw.v = &lw.attn->v;
+      aw.o = &lw.attn->o;
+      aw.q_norm = lw.attn->q_norm.data();
+      aw.k_norm = lw.attn->k_norm.data();
+      aw.k_descale = lw.attn->k_descale.data();
+      aw.v_descale = lw.attn->v_descale.data();
+      aw.o_had_signs = had.o;
+
+      // `positions` is the per-row ROPE position; the KV slot mapping and seqused_k ride in the view (AttnBatchView).
+      layer.Forward(arena_, cur, other, aw, *batch_kv_caches_[static_cast<size_t>(i)], T, /*start_pos=*/0,
+                    meta + batch::kMetaRopePos, meta + batch::kMetaSeqUsed, stream_.get(), normed_in, mlp_norm_weight,
+                    buf_normed_.data(), /*prof=*/nullptr, normed_in_epilogue, buf_normed_pre_.data(), body_epilogue_,
+                    buf_normed_pre_.data(), rope_pos3, /*prefill_split_kv=*/false, /*attn_slice=*/0,
+                    /*seqused_k_slices=*/nullptr, &view);
+      std::swap(cur, other);
+    }
+
+    Mlp mlp(cfg, lw.post_attention_layernorm, lw.mlp, comm_, had.down);
+    mlp.Forward(stream_, arena_, cur, cur, T, buf_normed_.data(),
+                has_next_layer ? container_.LayerInputNorm(i + 1).data() : nullptr,
+                has_next_layer ? buf_normed_.data() : nullptr, /*prof=*/nullptr, normed_in_epilogue,
+                buf_normed_pre_.data(), has_next_layer ? body_epilogue_ : r4dx_epilogue_none,
+                has_next_layer ? buf_normed_pre_.data() : nullptr);
+    normed_in = has_next_layer ? buf_normed_.data() : nullptr;
+    normed_in_epilogue = has_next_layer ? body_epilogue_ : r4dx_epilogue_none;
+
+    arena_.Reset();
+  }
+  RotateResidual(cur, T, /*inverse=*/true);  // quant2 stack exit
+
+  // One lm_head row per sequence, then ONE pair of launches argmaxes all of them (VerifyWindow's), and each sampled row gets a
+  // device summary at its own temperature into the next summary row.
+  FinalLmHead head(cfg, container_.FinalNorm(), container_.LmHead());
+  head.Forward(stream_, arena_, cur, batch_logits_dev_.data(), T);
+  if (comm_ != nullptr) {
+    r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(batch_logits_dev_.data()), vocab_local_,
+                         reinterpret_cast<int64_t>(argmax_pair_dev_.data()),
+                         reinterpret_cast<int64_t>(argmax_pair_dev_.data() + 1), /*out_stride=*/2, T, vocab_local_,
+                         reinterpret_cast<int64_t>(stream_.get()));
+  } else {
+    r4dx_argmax_rows_f32(reinterpret_cast<int64_t>(batch_logits_dev_.data()), cfg.vocab_size,
+                         reinterpret_cast<int64_t>(batch_argmax_dev_.data()), /*out_val=*/0, /*out_stride=*/1, T,
+                         cfg.vocab_size, reinterpret_cast<int64_t>(stream_.get()));
+  }
+  for (int r = 0; r < T; ++r) {
+    if (sum_idx[static_cast<size_t>(r)] >= 0) {
+      LaunchRowSummaries(batch_logits_dev_.data() + static_cast<int64_t>(r) * vocab_local_, /*rows=*/1,
+                         inv_t[static_cast<size_t>(r)], /*out_row0=*/sum_idx[static_cast<size_t>(r)]);
+    }
+  }
+  arena_.Reset();
+
+  // Wait for the step: TP=1 polls an event behind an async D2H of the T argmaxes into pinned memory (VerifyWindow's
+  // poll_wait); TP synchronizes and copies back blockingly.
+  const bool poll_wait = comm_ == nullptr && !core::DecodeLegacy(core::DecodeItem::kHost);
+  if (poll_wait) {
+    R4DX_HIP_CHECK(hipMemcpyAsync(greedy_host_.data(), batch_argmax_dev_.data(), static_cast<size_t>(T) * sizeof(int32_t),
+                                  hipMemcpyDeviceToHost, stream_.get()));
+    step_done_->Record(stream_);
+    WaitStepDone();
+  } else {
+    stream_.Synchronize();
+  }
+
+  std::vector<int32_t> out(static_cast<size_t>(T));
+  std::vector<kernels::RowSummary> summaries;
+  const auto fetch_summaries = [&] {
+    FetchRowSummaries(n_sum, /*inv_temperature=*/0.0f, summaries);
+    for (int r = 0; r < T; ++r) {  // each summary carries its own row's temperature (the merge and the sampler read it)
+      if (sum_idx[static_cast<size_t>(r)] >= 0) {
+        summaries[static_cast<size_t>(sum_idx[static_cast<size_t>(r)])].inv_temperature = inv_t[static_cast<size_t>(r)];
+      }
+    }
+  };
+  if (comm_ != nullptr) {
+    // docs/tp.md 7.3-7.6: the T greedy pairs and the summarised rows' summaries of this rank's vocab shard, merged across ranks
+    // in ONE host all-gather; afterwards `pairs` and `summaries` are global and identical on every rank.
+    std::vector<tp::ArgmaxPair> pairs(static_cast<size_t>(T));
+    R4DX_HIP_CHECK(hipMemcpy(pairs.data(), argmax_pair_dev_.data(), pairs.size() * sizeof(tp::ArgmaxPair), hipMemcpyDeviceToHost));
+    if (n_sum > 0) fetch_summaries();
+    MergeShardResults(pairs, n_sum > 0 ? &summaries : nullptr);
+    for (int r = 0; r < T; ++r) out[static_cast<size_t>(r)] = pairs[static_cast<size_t>(r)].idx;
+  } else {
+    if (poll_wait) {
+      std::copy(greedy_host_.data(), greedy_host_.data() + T, out.begin());
+    } else {
+      std::vector<int32_t> host(static_cast<size_t>(batch_argmax_dev_.size()));
+      batch_argmax_dev_.CopyToHost(host.data(), host.size());
+      std::copy(host.begin(), host.begin() + T, out.begin());
+    }
+    if (n_sum > 0) fetch_summaries();
+  }
+
+  // Sampled rows: exactly one draw each from the row's own rng, in row order (docs/sampling.md design point A). A resolved
+  // summary gives the token; otherwise the row's full fp32 logits are fetched from this step's batch_logits_dev_ and the
+  // canonical sampler runs with the SAME draw -- DecodeStepSampled's rule, so the token is the one a lone decode would pick.
+  const int64_t vocab = cfg.vocab_size;
+  for (int r = 0; r < T; ++r) {
+    const BatchDecodeRow& row = rows[static_cast<size_t>(r)];
+    if (!(row.params.temperature > 0.0f)) continue;
+    const double u = kernels::DrawUniform01(*row.rng);
+    if (sum_idx[static_cast<size_t>(r)] >= 0) {
+      const kernels::SummarySampleResult res = kernels::SampleFromSummary(
+          summaries[static_cast<size_t>(sum_idx[static_cast<size_t>(r)])], row.params, u);
+      if (res.resolved) {
+        out[static_cast<size_t>(r)] = res.token;
+        continue;
+      }
+      ++sampled_fallback_rows_;
+    }
+    sampled_row_scratch_.resize(static_cast<size_t>(vocab));
+    const float* row_dev = batch_logits_dev_.data() + static_cast<int64_t>(r) * vocab_local_;
+    if (comm_ != nullptr) {
+      GatherVocabRow(row_dev, sampled_row_scratch_.data());
+    } else {
+      R4DX_HIP_CHECK(hipMemcpy(sampled_row_scratch_.data(), row_dev, static_cast<size_t>(vocab) * sizeof(float),
+                               hipMemcpyDeviceToHost));
+    }
+    out[static_cast<size_t>(r)] = kernels::SampleCanonical(sampled_row_scratch_.data(), vocab, row.params, u);
+  }
+
+  for (int s : slots) batch_slots_.Advance(s);
+  return out;
+}
+
+// TpWarmup's share (docs/batch-decode.md 5): the first touch of every kernel and merge the batch path uses must not happen inside a
+// request, where a rank stalled in a first-use kernel load would let its peer's spin timeout fire (docs/tp.md 2.9 step 9). Runs on the
+// state TpWarmup's prefill + decode step left (positions 0..64); the slots are released again and the single-sequence state is
+// Reset() by the caller.
+void Model::BatchWarmup() {
+  const int n = batch_slots_.Slots();
+  if (n == 0) return;
+  if (batch_slots_.SlotCtx() <= pos_ + 2 * n + 4) {
+    std::cerr << "[r4dx::model::Model] batched decode: batch context " << batch_slots_.SlotCtx()
+              << " is too small to warm up on; the first batched steps will pay the first-use costs\n";
+    return;
+  }
+  for (int s = 0; s < n; ++s) BatchImport(s);
+  std::mt19937_64 rng = kernels::MakeRng(12345);  // every rank draws the same numbers
+  std::vector<BatchDecodeRow> rows;
+  for (int count = 1; count <= n; ++count) {  // every row count: each takes its own GEMM tuning entries
+    rows.clear();
+    for (int s = 0; s < count; ++s) rows.push_back(BatchDecodeRow{s, static_cast<int32_t>(s), kernels::SampleParams{0.0f}, nullptr});
+    (void)DecodeBatch(rows);
+  }
+  rows.clear();
+  kernels::SampleParams sp;
+  sp.temperature = 0.8f;
+  sp.top_k = 40;
+  std::vector<std::mt19937_64> rngs(static_cast<size_t>(n), rng);
+  for (int s = 0; s < n; ++s) rows.push_back(BatchDecodeRow{s, static_cast<int32_t>(s), sp, &rngs[static_cast<size_t>(s)]});
+  (void)DecodeBatch(rows);  // the summary kernels and the sampled merge
+  for (int s = 0; s < n; ++s) BatchRelease(s);
+}
+
 void Model::ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const {
   if (draft_window_ <= 1) {
     throw std::runtime_error(
@@ -3362,6 +3763,7 @@ void Model::TpWarmup() {
   for (int64_t i = 0; i < max_chunk_; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
   (void)Prefill(ids);
   (void)DecodeStepGreedy(0);
+  BatchWarmup();  // batched decode (a no-op without ModelOptions::batch_slots)
   // One full-width speculative round when a drafter is loaded (docs/tp.md 2.9 step 9): the MTP
   // head's or the DFlash2 drafter's first touch of its own kernels and weights, its per-step H6 /
   // per-round H7 merge, and the widest verify window (H2/H4). The DFlash round runs with p_min and

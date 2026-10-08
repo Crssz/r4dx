@@ -1010,8 +1010,11 @@ Audio and image parts cannot be mixed in one request yet. Design, verification a
   generation -- adequate for the short stop strings (`"</s>"`, `"\n\n"`, ...) OpenAI clients
   typically send.
 - **Multi-sequence / batching**: `r4dx::model::Model` is single-sequence (`model.h`'s own SCOPE
-  comment); this server serializes all requests through one worker thread that owns the one `Model`
-  instance (task design point 2) rather than batching -- see "Concurrency model" below.
+  comment); by default this server serializes all requests through one worker thread that owns the
+  one `Model` instance (task design point 2) -- see "Concurrency model" below. `--batch N` adds batch
+  slots next to that state and decodes up to N requests per forward pass (serialized prefill, no
+  speculation, no prefix reuse): docs/batch-decode.md. **Written without a GPU; its GPU tests have not
+  been run.**
 - **`stream_options.include_usage`**: accepted in the request body but not acted on -- streaming
   (SSE) responses never carry a final `usage` chunk regardless of this flag (only the non-streaming
   response includes `usage`). Flagged here (review finding, 2026-09-19) rather than left silently
@@ -1303,8 +1306,16 @@ r4dx-server --model <container.r4dx> --layout {trellis|w4a16|bf16}
     [--tp {1|2}] [--tp-mode {real|emulate|noop}] [--tp-devices a[,b]] [--tp-rank r]
     [--tp-ar-timeout-ms N] [--tp-ar-nb N] [--tp-ar-nb-large N] [--tp-submit-layers N]
     [--tp-max-inflight K] [--pp {1|2}] [--pp-devices B,A] [--pp-split N|auto] [--pp-min-rows N] [--pp-verify]
-    [--pp-submit-layers N] [--pp-max-inflight K]
+    [--pp-submit-layers N] [--pp-max-inflight K] [--hybrid {on|off}] [--hybrid-ctx N|auto] [--hybrid-reserve-gib X]
+    [--batch N] [--batch-ctx N]
 ```
+
+`--batch N` (default 0 = off; 2..16) serves up to N requests at once, decoding them in one forward pass per
+token, and `--batch-ctx N` (default 32768, a multiple of 16) is the tokens one slot holds -- a longer prompt is
+answered `400`. Needs a plain model (a usage error with `--mtp` or `--dflash`; Gemma 4 refuses at load), needs
+`--max-queue >= N`, turns the prompt checkpoint off, and works with `--tp 2` and the hybrid mode. The slots cost
+`N x batch-ctx x 32 KiB` of VRAM at `--tp 1` (half per rank at `--tp 2`) plus about 0.15 GiB of GDN state per
+slot. See docs/batch-decode.md (including its validation status).
 
 `--tp 2` (default 1) and the `--tp-*` flags: tensor parallel across two ranks, the same flags,
 defaults, ranges and usage errors as `r4dx-cli`'s (docs/tp.md 9.1); see "Tensor parallel" below.

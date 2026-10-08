@@ -17,6 +17,7 @@
 #include "reasoning_splitter.h"
 #include "tool_call_parser.h"
 #include "tool_stream_gate.h"
+#include "batch_port.h"  // BatchPort: the TextModel a request sees under --batch
 #include "tp_model.h"  // r4dx::model::TpModel: GetState / StatsLine (tp_model_, engine.h)
 #include "vision_tower.h"  // src/vision: VisionEncodeStats
 
@@ -204,6 +205,24 @@ void Engine::LoadAndStart() {
     }
   }
 
+  // Batched serving (docs/batch-decode.md 7): N request threads share one executor thread that owns the model.
+  if (opts_.model_opts.batch_slots > 0) {
+    const int slots = opts_.model_opts.batch_slots;
+    if (model_->BatchSlots() != slots) {
+      throw std::runtime_error("--batch " + std::to_string(slots) +
+                               ": this model cannot decode in batches (its loader gave no batch slots; Gemma 4 does not support --batch)");
+    }
+    BatchExecutor::Options bo;
+    bo.slots = slots;
+    bo.gather = opts_.batch_gather;
+    batch_exec_ = std::make_unique<BatchExecutor>(bo, [this](const std::vector<r4dx::model::BatchDecodeRow>& rows) {
+      return model_->DecodeBatch(rows);
+    });
+    std::fprintf(stderr, "[r4dx-server] batched decode: %d slots x %lld tokens (a prompt longer than that is refused), serialized prefill\n",
+                 slots, static_cast<long long>(model_->BatchSlotCtx()));
+    for (int s = 0; s < slots; ++s) batch_workers_.emplace_back(&Engine::BatchWorkerLoop, this, s);
+    return;
+  }
   worker_ = std::thread(&Engine::WorkerLoop, this);
 }
 
@@ -215,12 +234,20 @@ bool Engine::Submit(std::shared_ptr<PendingRequest> req) {
 
 void Engine::Shutdown() {
   const bool already_stopping = stop_.exchange(true);
-  if (already_stopping) {
+  const auto join_all = [this] {
     if (worker_.joinable()) worker_.join();
+    for (std::thread& t : batch_workers_) {
+      if (t.joinable()) t.join();
+    }
+    // The request threads are gone, so nothing waits on the executor any more; stop it before model_ (declared before it) goes away.
+    if (batch_exec_) batch_exec_->Stop();
+  };
+  if (already_stopping) {
+    join_all();
     return;
   }
   queue_.Close();
-  if (worker_.joinable()) worker_.join();
+  join_all();
 }
 
 void Engine::WorkerLoop() {
@@ -231,9 +258,30 @@ void Engine::WorkerLoop() {
   }
 }
 
-void Engine::RunRequest(PendingRequest& req) {
+void Engine::BatchWorkerLoop(int slot) {
+  while (true) {
+    std::optional<std::shared_ptr<PendingRequest>> item = queue_.Pop();
+    if (!item) break;  // queue closed and drained -- Shutdown() was called
+    // One port per request: it owns the request's slot for as long as the request runs and gives it back (and the primary lock, if the
+    // request failed holding it) when it ends, however it ends.
+    BatchPort port(*model_, *batch_exec_, batch_primary_mu_, slot);
+    RunRequest(**item, &port);
+  }
+}
+
+void Engine::RunRequest(PendingRequest& req, r4dx::model::TextModel* port) {
   // --request-log (docs/server.md "Request log"): `rec` is null unless the flag was given, and every
   // use below is guarded on it. Token counts and timings only -- nothing the caller wrote.
+  // Batched serving (docs/batch-decode.md 7): `model` is this request's port, `prefix` a PrefixState of its own that never matches (every request
+  // prefills from scratch and owns a slot), and the TP group's state is not read from this thread (the executor thread owns it) -- the paths
+  // below that did use `tp_diag`.
+  r4dx::model::TextModel* const model = port != nullptr ? port : model_.get();
+  PrefixState batch_prefix;
+  batch_prefix.Invalidate();  // an empty PrefixState matches ANY prompt (it describes a model at position 0): this one must always say "reset"
+  PrefixState& prefix = port != nullptr ? batch_prefix : prefix_;
+  r4dx::model::TpDiagnostics* const tp_diag = port != nullptr ? nullptr : tp_model_;
+  // The context a request may use: --max-ctx, or in batch mode also what one slot holds (--batch-ctx).
+  const int64_t ctx_limit = port != nullptr ? std::min(MaxCtx(), model->BatchSlotCtx()) : MaxCtx();
   RequestLogScope log_scope(opts_.request_log.get());
   RequestLogRecord* const rec = log_scope.record();
   if (rec != nullptr) {
@@ -318,7 +366,7 @@ void Engine::RunRequest(PendingRequest& req) {
         }
       }
       if (rec != nullptr) rec->image_count = static_cast<int64_t>(placeholders_in.size());
-      if (!placeholders_in.empty() && !model_->HasVision()) {
+      if (!placeholders_in.empty() && !model->HasVision()) {
         note_error(400);
         req.sink->OnError(400, "this model/container has no vision tower (loaded without "
                                 "vision.* tensors, or started with --vision off)");
@@ -333,7 +381,7 @@ void Engine::RunRequest(PendingRequest& req) {
           if (part.is_audio) audio_ptrs.push_back(&part.audio);
         }
       }
-      if (!audio_ptrs.empty() && !model_->HasAudio()) {
+      if (!audio_ptrs.empty() && !model->HasAudio()) {
         note_error(400);
         req.sink->OnError(400, "this model/container has no audio embedder (audio input needs a Gemma 4 "
                                 "container converted with `--audio on`)");
@@ -492,16 +540,16 @@ void Engine::RunRequest(PendingRequest& req) {
       // `image_keys`/`pending_image_spans` feed the prefix-reuse decision just below. Untouched
       // (an empty vector, a no-op) for every text-only request, exactly the pre-vision behavior.
       if (!placeholders_in.empty()) {
-        const int32_t image_token_id = static_cast<int32_t>(model_->ImageTokenId());
-        const int merge_size = static_cast<int>(model_->VisionMergeSize());
+        const int32_t image_token_id = static_cast<int32_t>(model->ImageTokenId());
+        const int merge_size = static_cast<int>(model->VisionMergeSize());
         r4dx::vision::ExpandedImagePrompt expanded;
         try {
           // Gemma 4 (ImageBoiTokenId() >= 0): one `<|image|>` per image becomes boi + N soft tokens + eoi;
           // merge_size is 1 there (grids are in merged cells). Qwen: -1 / -1, unchanged.
           expanded = r4dx::vision::ExpandImagePlaceholders(full_tokens_i32, image_token_id, placeholders_in,
                                                             merge_size,
-                                                            static_cast<int32_t>(model_->ImageBoiTokenId()),
-                                                            static_cast<int32_t>(model_->ImageEoiTokenId()));
+                                                            static_cast<int32_t>(model->ImageBoiTokenId()),
+                                                            static_cast<int32_t>(model->ImageEoiTokenId()));
         } catch (const std::exception& e) {
           note_error(400);
           req.sink->OnError(400,
@@ -568,11 +616,15 @@ void Engine::RunRequest(PendingRequest& req) {
       req.sink->OnError(400, "prompt rendered to zero tokens");
       return;
     }
-    if (static_cast<int64_t>(full_tokens_i32.size()) > MaxCtx()) {
+    // Batch mode: a prompt that fills a whole slot leaves no position for the first decoded token (BatchImport refuses it), so the limit is
+    // one token lower there.
+    if (static_cast<int64_t>(full_tokens_i32.size()) > ctx_limit - (port != nullptr ? 1 : 0)) {
       note_error(400);
       req.sink->OnError(400, "prompt (" + std::to_string(full_tokens_i32.size()) +
-                                  " tokens, including any spliced image tokens) exceeds --max-ctx ("
-                                  + std::to_string(MaxCtx()) + ")");
+                                  " tokens, including any spliced image tokens) exceeds " +
+                                  (port != nullptr && ctx_limit < MaxCtx()
+                                       ? "the batch context --batch-ctx (" + std::to_string(ctx_limit) + ")"
+                                       : "--max-ctx (" + std::to_string(MaxCtx()) + ")"));
       return;
     }
     // --request-log-tokens: from here on the request has a prompt the model will see. One host copy of
@@ -589,7 +641,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // DFlash2 self-speculative decode (docs/dflash2.md, docs/sampling.md section 9/10, Milestone 6
     // stage S3): runs at ANY temperature now -- mutually exclusive with MTP below (--dflash/--mtp
     // are rejected together at the arg-parse layer, so at most one of use_mtp/use_dflash is ever
-    // true). model_->DflashEnabled() is private to r4dx::model::Model in the CLI's own header, so
+    // true). model->DflashEnabled() is private to r4dx::model::Model in the CLI's own header, so
     // this uses the same "was the drafter loaded" signal DecodeStepDflashGreedy/Sampled themselves
     // throw on -- opts_.model_opts.dflash_draft_k > 0 is set if and only if Model::Load was given a
     // non-empty dflash_container (cli_args.h/server_args.h's own mutual-exclusion + range checks
@@ -609,7 +661,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // the facade, legal while the group awaits recovery (docs/tp.md 2.4): it must not throw here,
     // before the Reset() below that recovers the group after a failed request (8.4).
     if (!opts_.model_opts.dflash_container.empty()) {
-      model_->SetDflashInjectionEnabled(use_dflash);
+      model->SetDflashInjectionEnabled(use_dflash);
     }
 
     // Prefix reuse (task point 2): continue from the existing KV/GDN state if `full_tokens_i32`
@@ -634,23 +686,23 @@ void Engine::RunRequest(PendingRequest& req) {
     // After a failed request prefix_ refuses every prompt until the next Commit() (prefix_state.h's
     // needs_reset_, docs/tp.md 8.4), so this request takes the Reset() branch: under TP that
     // Reset() is what recovers a group an earlier error left in kNeedsRecovery.
-    std::optional<PrefixState::Reuse> reuse = prefix_.Plan(full_tokens_i32, image_keys);
+    std::optional<PrefixState::Reuse> reuse = prefix.Plan(full_tokens_i32, image_keys);
     if (reuse) {
       if (reuse->from_checkpoint) {
         const auto r0 = Clock::now();
-        model_->RestoreCheckpoint();
+        model->RestoreCheckpoint();
         restore_ms = Seconds(r0, Clock::now()) * 1000.0;
       }
       skip = static_cast<int64_t>(full_tokens_i32.size() - reuse->tail.size());
       new_tokens_i32 = std::move(reuse->tail);
     } else {
-      tp_recovered = tp_model_ != nullptr &&
-                     tp_model_->GroupHealth() == r4dx::model::TpDiagnostics::Health::kNeedsRecovery;
+      tp_recovered = tp_diag != nullptr &&
+                     tp_diag->GroupHealth() == r4dx::model::TpDiagnostics::Health::kNeedsRecovery;
       const auto r0 = Clock::now();
-      model_->Reset();
+      model->Reset();
       const auto r1 = Clock::now();
       reset_ms = Seconds(r0, r1) * 1000.0;
-      prefix_.Clear();
+      prefix.Clear();
       new_tokens_i32.assign(full_tokens_i32.begin(), full_tokens_i32.end());
       skip = 0;
     }
@@ -663,10 +715,10 @@ void Engine::RunRequest(PendingRequest& req) {
       rec->checkpoint_restore = restore_ms >= 0.0;
       if (reset_ms >= 0.0) rec->reset_ms = reset_ms;
       if (restore_ms >= 0.0) rec->restore_ms = restore_ms;
-      rec->speculative = use_dflash ? "dflash" : (model_->MtpEnabled() ? "mtp" : "none");
+      rec->speculative = use_dflash ? "dflash" : (model->MtpEnabled() ? "mtp" : "none");
       if (toks != nullptr) {
         if (use_dflash) toks->draft_k = opts_.model_opts.dflash_draft_k;
-        else if (model_->MtpEnabled()) toks->draft_k = opts_.model_opts.mtp_draft_k;
+        else if (model->MtpEnabled()) toks->draft_k = opts_.model_opts.mtp_draft_k;
       }
     }
 
@@ -685,7 +737,7 @@ void Engine::RunRequest(PendingRequest& req) {
       r4dx::model::ImageRows embeds;
       r4dx::vision::VisionEncodeStats stats;
       const auto e0 = Clock::now();
-      model_->EncodeImages(img.pixel_values.data(), sp.grid.PatchCount(), {sp.grid}, &embeds, &stats);
+      model->EncodeImages(img.pixel_values.data(), sp.grid.PatchCount(), {sp.grid}, &embeds, &stats);
       const auto e1 = Clock::now();
       image_encode_count += 1;
       image_encode_ms_total += Seconds(e0, e1) * 1000.0;
@@ -707,7 +759,7 @@ void Engine::RunRequest(PendingRequest& req) {
     for (size_t i = 0; i < pending_audio_spans.size(); ++i) {
       const auto& sp = pending_audio_spans[i];
       if (sp.offset < skip) continue;
-      audio_rows_owned.push_back(model_->EncodeAudio(pending_audio_ptrs[i]->frames.data(), sp.tokens));
+      audio_rows_owned.push_back(model->EncodeAudio(pending_audio_ptrs[i]->frames.data(), sp.tokens));
       r4dx::model::AudioRowSpan as;
       as.offset = sp.offset - skip;
       as.tokens = sp.tokens;
@@ -716,7 +768,7 @@ void Engine::RunRequest(PendingRequest& req) {
     }
 
     int64_t max_tokens = req.max_tokens;
-    const int64_t ctx_budget = MaxCtx() - static_cast<int64_t>(full_tokens_i32.size());
+    const int64_t ctx_budget = ctx_limit - static_cast<int64_t>(full_tokens_i32.size());
     if (max_tokens > ctx_budget) max_tokens = std::max<int64_t>(0, ctx_budget);
 
     // Where generated text starts relative to reasoning (task M1-14): the dialect decides from the
@@ -744,7 +796,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // does not consume it, and on any reuse path it is still a prefix of this prompt.
     const bool checkpointed = opts_.model_opts.prompt_checkpoint;
     const bool tail_too_short = static_cast<int64_t>(new_tokens_i32.size()) <= ckpt_back;
-    const bool keep_checkpoint = checkpointed && tail_too_short && prefix_.has_checkpoint();
+    const bool keep_checkpoint = checkpointed && tail_too_short && prefix.has_checkpoint();
     int64_t back = checkpointed && !tail_too_short ? ckpt_back : 0;
     const auto head_n = [&] { return new_tokens_i32.size() - static_cast<size_t>(back); };
     for (const auto& s : image_spans) {
@@ -754,7 +806,7 @@ void Engine::RunRequest(PendingRequest& req) {
       if (static_cast<size_t>(s.offset + s.tokens) > head_n()) back = 0;
     }
     const size_t ckpt_len =
-        keep_checkpoint ? prefix_.checkpoint().size() : full_tokens_i32.size() - static_cast<size_t>(back);
+        keep_checkpoint ? prefix.checkpoint().size() : full_tokens_i32.size() - static_cast<size_t>(back);
     double prefill_seconds = 0.0;
     double ckpt_ms = -1.0;
     // PrefillMultimodal with an EMPTY span list is byte-identical to Prefill() (that method's own
@@ -764,15 +816,15 @@ void Engine::RunRequest(PendingRequest& req) {
     auto prefill = [&](const std::vector<int32_t>& ids, const std::vector<r4dx::model::ImageSpan>& spans,
                        const std::vector<r4dx::model::AudioRowSpan>& aspans) {
       const auto a = Clock::now();
-      std::vector<float> out = !aspans.empty() ? model_->PrefillAudio(ids, aspans)
-                               : spans.empty() ? model_->Prefill(ids)
-                                               : model_->PrefillMultimodal(ids, spans);
+      std::vector<float> out = !aspans.empty() ? model->PrefillAudio(ids, aspans)
+                               : spans.empty() ? model->Prefill(ids)
+                                               : model->PrefillMultimodal(ids, spans);
       prefill_seconds += Seconds(a, Clock::now());
       return out;
     };
     auto save = [&] {
       const auto a = Clock::now();
-      model_->SaveCheckpoint();
+      model->SaveCheckpoint();
       ckpt_ms = Seconds(a, Clock::now()) * 1000.0;
     };
     std::vector<float> logits;
@@ -957,7 +1009,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // else (MTP disabled at startup, or DFlash2 active instead) is plain decode, byte-for-byte the
     // pre-existing loop below for a greedy request. Mirrors src/cli/main.cpp's RunTurn `args.mtp > 0`
     // gate exactly.
-    const bool use_mtp = model_->MtpEnabled();
+    const bool use_mtp = model->MtpEnabled();
     int64_t mtp_rounds = 0, mtp_drafted = 0, mtp_accepted = 0;
     // `use_dflash` is computed above, before the prefill, because it also gates this request's
     // drafter injection (see its own comment there).
@@ -992,9 +1044,9 @@ void Engine::RunRequest(PendingRequest& req) {
         // match rejection sampling (DecodeStepDflashSampled, docs/sampling.md section 9.2) -- for a
         // fixed seed this emits the same sequence as the plain sampled branch below.
         const std::vector<int32_t> round =
-            greedy ? model_->DecodeStepDflashGreedy(next, draft_k, opts_.dflash_p_min,
+            greedy ? model->DecodeStepDflashGreedy(next, draft_k, opts_.dflash_p_min,
                                                      opts_.dflash_n_min, &walk_len)
-                   : model_->DecodeStepDflashSampled(next, draft_k, opts_.dflash_p_min,
+                   : model->DecodeStepDflashSampled(next, draft_k, opts_.dflash_p_min,
                                                       opts_.dflash_n_min, sp, rng, &walk_len);
         ++dflash_rounds;
         dflash_drafted += walk_len;
@@ -1055,8 +1107,8 @@ void Engine::RunRequest(PendingRequest& req) {
         }
         // Greedy: DecodeStepMtpGreedy, byte-identical to before this stage. Sampled: sample-and-match
         // rejection sampling (DecodeStepMtpSampled, docs/sampling.md section 9).
-        const std::vector<int32_t> round = greedy ? model_->DecodeStepMtpGreedy(next, draft_k)
-                                                   : model_->DecodeStepMtpSampled(next, draft_k, sp, rng);
+        const std::vector<int32_t> round = greedy ? model->DecodeStepMtpGreedy(next, draft_k)
+                                                   : model->DecodeStepMtpSampled(next, draft_k, sp, rng);
         ++mtp_rounds;
         mtp_drafted += draft_k;
         mtp_accepted += static_cast<int64_t>(round.size()) - 1;  // last token is never a draft
@@ -1128,7 +1180,7 @@ void Engine::RunRequest(PendingRequest& req) {
         // reflects what the KV/GDN state actually holds (see prefix_state.h's file comment) -- the
         // token is real generated content, only its stop-marker tail text is withheld from the
         // client.
-        next = model_->DecodeStepGreedyOverlap(tok, [&] {
+        next = model->DecodeStepGreedyOverlap(tok, [&] {
           try {
             stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
             NoteReasoningProgress();
@@ -1166,7 +1218,7 @@ void Engine::RunRequest(PendingRequest& req) {
         const bool stop_hit = EmitToken(req, decoder, accumulated, tok, forward, &stop_match_pos, stop_search_floor);
         NoteReasoningProgress();
         // Same "feed regardless of stop_hit" reasoning as the greedy branch above.
-        next = model_->DecodeStepSampled(tok, sp, rng);
+        next = model->DecodeStepSampled(tok, sp, rng);
         committed_tokens.push_back(tok);
         if (stop_hit) {
           finish_reason = "stop";
@@ -1191,7 +1243,7 @@ void Engine::RunRequest(PendingRequest& req) {
     // HTTP layer once a finished stream is released, which is not a disconnect.
     const bool client_gone = rec != nullptr && req.sink->IsCancelled();
 
-    prefix_.Commit(full_tokens_i32, committed_tokens, image_keys,
+    prefix.Commit(full_tokens_i32, committed_tokens, image_keys,
                    checkpointed ? std::optional<size_t>(ckpt_len) : std::nullopt);
 
     if (tool_mode) {
@@ -1369,8 +1421,8 @@ void Engine::RunRequest(PendingRequest& req) {
     // `tp_recovery=yes`: this request's reset= also recovered the group after an earlier failure
     // (docs/tp.md 2.5; tools/server/smoke.ps1 -TpFault reads it).
     if (tp_model_ != nullptr && n > 0 && n < static_cast<int>(sizeof(buf))) {
-      const auto mode = tp_model_->GroupOptions().mode;
-      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " tp=%d%s%s", model_->TpWorld(),
+      const auto mode = tp_model_->GroupOptions().mode;  // immutable after load: safe to read from a request thread
+      n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " tp=%d%s%s", model->TpWorld(),
                          mode == r4dx::model::TpOptions::Mode::kEmulate ? " tp_mode=emulate"
                          : mode == r4dx::model::TpOptions::Mode::kNoop  ? " tp_mode=noop"
                                                                          : "",
@@ -1404,9 +1456,9 @@ void Engine::RunRequest(PendingRequest& req) {
     // Hybrid mode (--tp 2 --pp 2, docs/pp-tp2-hybrid.md): the pipelined prefill's cumulative counters after this request -- r4dx-cli --stats'
     // `hybrid:` line, one extra line, only when the hybrid is engaged (tools/server/smoke.ps1 -Pp 2 parses it). It carries the request id
     // as a SUFFIX without a colon, so it is never mistaken for the `request <id>:` line above. Caught like the debug line below.
-    if (tp_model_ != nullptr) {
+    if (tp_diag != nullptr) {  // (the stats lines run commands on the rank threads: not from a batch request thread)
       try {
-        const std::string hybrid_line = tp_model_->HybridStatsLine();
+        const std::string hybrid_line = tp_diag->HybridStatsLine();
         if (!hybrid_line.empty()) LogLine(opts_.log_level, "info", "[stats] " + hybrid_line + " [request " + req.request_id + "]");
       } catch (const std::exception& e) {
         LogLine(opts_.log_level, "info", "request " + req.request_id + ": hybrid stats unavailable: " + e.what());
@@ -1415,9 +1467,9 @@ void Engine::RunRequest(PendingRequest& req) {
     // r4dx-cli --stats' `tp:` line (docs/tp.md 9.1, Appendix B N59), per request at debug level only:
     // it is one short host command on each rank thread. Caught here: the sink is already done, so a
     // failure must not reach the catch below (which would report the finished request a second time).
-    if (tp_model_ != nullptr && opts_.log_level == "debug") {
+    if (tp_diag != nullptr && opts_.log_level == "debug") {
       try {
-        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": " + tp_model_->GroupStatsLine());
+        LogLine(opts_.log_level, "debug", "request " + req.request_id + ": " + tp_diag->GroupStatsLine());
       } catch (const std::exception& e) {
         LogLine(opts_.log_level, "debug", "request " + req.request_id + ": tp stats unavailable: " + e.what());
       }
@@ -1434,11 +1486,16 @@ void Engine::RunRequest(PendingRequest& req) {
     // every device call throws until Reset(): the next request's Extend() refuses (Invalidate()
     // holds until a Commit()), so it resets -- which recovers the group -- and runs normally.
     // kFatal (recovery itself failed) answers 500 until the process is restarted.
-    prefix_.Invalidate();
+    prefix.Invalidate();
     std::string what = e.what();
     std::string tp_note;
     if (tp_model_ != nullptr) {
-      const auto state = tp_model_->GroupHealth();
+      // The group's state belongs to the thread that owns the model: a batch request asks it (and treats an unreachable executor as healthy).
+      r4dx::model::TpDiagnostics::Health state = r4dx::model::TpDiagnostics::Health::kReady;
+      try {
+        state = port != nullptr ? batch_exec_->Run([this] { return tp_model_->GroupHealth(); }) : tp_model_->GroupHealth();
+      } catch (...) {
+      }
       tp_note = state == r4dx::model::TpDiagnostics::Health::kNeedsRecovery
                     ? " (tp: group needs recovery; the next request resets it)"
                 : state == r4dx::model::TpDiagnostics::Health::kFatal ? " (tp: fatal, restart the server)"

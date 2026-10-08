@@ -235,6 +235,7 @@ bool TpModel::HybridLoad(const ModelOptions& opts, const PpOptions& pp, const st
           so.pp = 0;
           so.pp_emulate_split = 0;
           so.prompt_checkpoint = false;
+          so.batch_slots = 0;  // the batch slots live on the rank Models; a pipeline stage takes none
           so.dflash_container.clear();
           so.dflash_draft_k = 0;
           so.stage_only.role = front ? stage::Role::kFront : stage::Role::kBack;

@@ -28,6 +28,30 @@ foreach(t ${R4DX_SERVER_TESTS})
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# test_batch_executor: src/server/batch_executor.h (docs/batch-decode.md 7), the thread that owns the model in `--batch N` serving, against a
+# fake decode function with real threads. Header-only and HIP-free (batch_row.h / sampler.hpp are too), so it links nothing.
+add_executable(test_batch_executor test_batch_executor.cpp)
+target_include_directories(test_batch_executor PRIVATE
+  ${CMAKE_SOURCE_DIR}/src/server
+  ${CMAKE_SOURCE_DIR}/src/model
+  ${CMAKE_SOURCE_DIR}/src/kernels/include
+)
+add_test(NAME test_batch_executor COMMAND test_batch_executor)
+
+# test_batch_port: src/server/batch_port.h -- the TextModel a request sees under `--batch N` -- with a real BatchExecutor and a CPU fake
+# TextModel that has batch slots (fake_batch_model.h): the calls Engine::RunRequest makes, from several threads. It names TextModel (whose
+# headers include the HIP device buffer), so it links the HIP runtime for the headers only; no HIP call is made (HIP_VISIBLE_DEVICES=-1).
+add_executable(test_batch_port test_batch_port.cpp)
+target_include_directories(test_batch_port PRIVATE
+  ${CMAKE_SOURCE_DIR}/third_party
+  ${CMAKE_SOURCE_DIR}/src/server
+  ${CMAKE_SOURCE_DIR}/src/model
+  ${CMAKE_SOURCE_DIR}/src/kernels/include
+)
+target_link_libraries(test_batch_port PRIVATE r4dx_server_core r4dx_core r4dx_hip_runtime)
+add_test(NAME test_batch_port COMMAND test_batch_port)
+set_tests_properties(test_batch_port PROPERTIES ENVIRONMENT "HIP_VISIBLE_DEVICES=-1")
+
 # test_engine_recovery: Engine::RunRequest's error path (docs/tp.md 2.4, 8.4), through engine.cpp
 # itself, against CPU fakes of TpModel's state machine and of the TP=1 model
 # (EngineOptions::model_loader). It makes no GPU call, but engine.cpp is HIP-dependent, so it links
@@ -57,6 +81,32 @@ if(R4DX_BUILD_SERVER)
   )
   add_test(NAME test_engine_recovery COMMAND test_engine_recovery)
   set_tests_properties(test_engine_recovery PROPERTIES
+    ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
+    SKIP_RETURN_CODE 77
+  )
+
+  # test_engine_batch: `--batch N` serving (docs/batch-decode.md 7) through engine.cpp -- BatchPort, BatchExecutor, the request threads --
+  # against a CPU fake TextModel with batch slots. Same GPU-free setup, link line, include order and tokenizer-directory skip as
+  # test_engine_recovery above.
+  add_executable(test_engine_batch test_engine_batch.cpp ${CMAKE_SOURCE_DIR}/src/server/engine.cpp)
+  target_include_directories(test_engine_batch PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/src/server
+  )
+  target_compile_definitions(test_engine_batch PRIVATE
+    R4DX_TOKENIZER_MODEL_DIR="${R4DX_TOKENIZER_MODEL_DIR}"
+  )
+  target_link_libraries(test_engine_batch PRIVATE
+    r4dx_server_core
+    r4dx_model
+    r4dx_tokenizer
+    r4dx_core
+    r4dx_kernels
+    r4d_core
+    r4dx_hip_runtime
+  )
+  add_test(NAME test_engine_batch COMMAND test_engine_batch)
+  set_tests_properties(test_engine_batch PROPERTIES
     ENVIRONMENT "HIP_VISIBLE_DEVICES=1"
     SKIP_RETURN_CODE 77
   )

@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -32,7 +35,91 @@ uint64_t FnvUpdate(uint64_t h, const uint8_t* p, size_t n) {
 }
 constexpr uint64_t kFnvInit = 1469598103934665603ull;
 
+std::string GetEnv(const char* name) {
+  std::string v;
+#ifdef _MSC_VER
+  char* buf = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&buf, &len, name) == 0 && buf != nullptr) v = buf;
+  std::free(buf);
+#else
+  if (const char* e = std::getenv(name)) v = e;
+#endif
+  return v;
+}
+
+// R4DX_PP_IMPORT_SYNC=0 (diagnostic only): stage B's import without the two stream synchronizes around it -- the code as it
+// was before the 2026-10-08 fix, so a GPU run can show the failure come back.
+bool PpImportSyncOn() {
+  static const bool on = GetEnv("R4DX_PP_IMPORT_SYNC") != "0";
+  return on;
+}
+
+// The trace's hash: FNV-1a over 8-byte words (and the tail bytes); fast enough for a few MiB per chunk.
+uint64_t TraceHash(const uint8_t* p, size_t n) {
+  uint64_t h = kFnvInit;
+  size_t i = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t w;
+    std::memcpy(&w, p + i, 8);
+    h = (h ^ w) * 1099511628211ull;
+  }
+  for (; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+
+// The caller synchronized the stream that wrote `dev`.
+uint64_t TraceHashDevice(const void* dev, size_t n) {
+  std::vector<uint8_t> host(n);
+  if (n > 0) R4DX_HIP_CHECK(hipMemcpy(host.data(), dev, n, hipMemcpyDeviceToHost));
+  return TraceHash(host.data(), n);
+}
+
+uint64_t TraceIds(const std::vector<int32_t>& ids) {
+  return TraceHash(reinterpret_cast<const uint8_t*>(ids.data()), ids.size() * sizeof(int32_t));
+}
+
+// One slot's payload as host bytes: the three carry buffers and everything after them (DFlash columns, KV blocks).
+void TraceSlot(const char* who, const pp::StageChannel::Slot* slot, const pp::SlotLayout& lay, int64_t split, int64_t pos,
+               int64_t rows, uint64_t ids) {
+  const uint8_t* h = slot->data;
+  const uint64_t rest = lay.total > lay.off_dfl ? TraceHash(h + lay.off_dfl, lay.total - lay.off_dfl) : 0;
+  std::fprintf(stderr,
+               "[pp-trace] %-6s split=%lld pos=%lld rows=%lld ids=%016llx cur=%016llx norm=%016llx pre=%016llx rest=%016llx "
+               "(slot %d, seq %lld)\n",
+               who, static_cast<long long>(split), static_cast<long long>(pos), static_cast<long long>(rows),
+               static_cast<unsigned long long>(ids),
+               static_cast<unsigned long long>(TraceHash(h + lay.off_cur, lay.carry_bytes)),
+               static_cast<unsigned long long>(TraceHash(h + lay.off_norm, lay.carry_bytes)),
+               static_cast<unsigned long long>(TraceHash(h + lay.off_pre, lay.carry_bytes)),
+               static_cast<unsigned long long>(rest), slot->index, static_cast<long long>(slot->hdr.seq));
+}
+
 }  // namespace
+
+bool Model::PpTraceEnabled() {
+  static const bool on = [] {
+    const std::string v = GetEnv("R4DX_PP_TRACE");
+    return v == "1" || v == "on" || v == "true";
+  }();
+  return on;
+}
+
+void Model::PpTraceCarry(const char* who, ChunkRun& r, int64_t split) {
+  stream_.Synchronize();
+  const size_t n = static_cast<size_t>(r.T * r.hidden) * sizeof(uint16_t);
+  const char* cur_name = r.cur == buf_a_.data() ? "buf_a" : r.cur == buf_b_.data() ? "buf_b" : "other";
+  std::fprintf(stderr,
+               "[pp-trace] %-6s split=%lld pos=%lld rows=%lld ids=%016llx cur=%016llx norm=%016llx pre=%016llx "
+               "(cur in %s, normed_in %s, epilogue %d, has_init %d)\n",
+               who, static_cast<long long>(split), static_cast<long long>(pos_), static_cast<long long>(r.T),
+               static_cast<unsigned long long>(TraceIds(r.token_ids)),
+               static_cast<unsigned long long>(TraceHashDevice(r.cur, n)),
+               static_cast<unsigned long long>(TraceHashDevice(buf_normed_.data(), n)),
+               static_cast<unsigned long long>(TraceHashDevice(buf_normed_pre_.data(), n)), cur_name,
+               r.normed_in == nullptr ? "null" : r.normed_in == buf_normed_.data() ? "buf_normed" : "other",
+               r.normed_in_epilogue, r.has_init ? 1 : 0);
+}
 
 // ---- attachment ---------------------------------------------------------------------------------------------------
 
@@ -355,6 +442,8 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
   if (r.normed_in == nullptr) {
     throw std::logic_error("Model::RunChunkPpStageA: the layer before the split carries no fused norm");
   }
+  const bool trace = PpTraceEnabled();
+  if (trace) PpTraceCarry("A-dev", r, split);
   r.fakeq_scope->End();
   r.fakeqw_scope->End();
 
@@ -387,6 +476,7 @@ std::vector<float> Model::RunChunkPpStageA(ChunkRun& r) {
     R4DX_HIP_CHECK(hipMemcpyAsync(host + k.host_off, kv.Data() + k.dev_off, k.bytes, hipMemcpyDeviceToHost, s));
   }
   stream_.Synchronize();  // the host owns the stage's output now
+  if (trace) TraceSlot("A-slot", slot, lay, split, pos_, T, TraceIds(r.token_ids));
   slot->hdr.pos = pos_;
   slot->hdr.rows = T;
   slot->hdr.dfl_cols = dfl_here;
@@ -432,9 +522,22 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
                              " vs " + std::to_string(lay.total) + " bytes)");
   }
   if (r.want_logits && pp_setup_.before_last_chunk) pp_setup_.before_last_chunk();
+  const bool trace = PpTraceEnabled();
+  if (trace) TraceSlot("B-slot", slot, lay, split, pos_, T, TraceIds(r.token_ids));
 
   const uint8_t* const host = slot->data;
   const hipStream_t s = stream_.get();
+  // The import is bracketed by two stream synchronizes, exactly as PP-emulate's hop is (pp_stage.cpp; the hop that passes
+  // G1b synchronizes after its H2D before stage B's first layer). Without them the GPU run of 2026-10-08 failed every
+  // configuration in exactly the pattern of B's first layer reading the carry buffers' PREVIOUS contents: every observable
+  // fed by the carry differed (layers >= k, logits), everything else that crosses through the same slot or the same pinned
+  // memory -- the KV blocks and DFlash columns (read only after the epilogue's synchronize) and the GDN hand-off (fenced) --
+  // was exact, and the wrong bits depended on the configuration's history (plain and capture gave different pipelined hashes
+  // for the same computation). The first synchronize also lands the prologue's embedding gather into buf_a_ before the
+  // import overwrites it. Cost: two host round trips per chunk (the prologue ran while B waited for the slot; the copy is on
+  // B's critical path either way). R4DX_PP_IMPORT_SYNC=0 restores the unsynchronized import (diagnostic only).
+  const bool import_sync = PpImportSyncOn();
+  if (import_sync) stream_.Synchronize();
   // `cur` always lands in buf_a_ (whichever ping-pong buffer stage A's attention-layer parity left it in).
   R4DX_HIP_CHECK(hipMemcpyAsync(buf_a_.data(), host + lay.off_cur, lay.carry_bytes, hipMemcpyHostToDevice, s));
   R4DX_HIP_CHECK(hipMemcpyAsync(buf_normed_.data(), host + lay.off_norm, lay.carry_bytes, hipMemcpyHostToDevice, s));
@@ -449,10 +552,12 @@ std::vector<float> Model::RunChunkPpStageB(ChunkRun& r) {
     attention::PagedKvCache& kv = *kv_caches_[static_cast<size_t>(k.layer)];
     R4DX_HIP_CHECK(hipMemcpyAsync(kv.Data() + k.dev_off, host + k.host_off, k.bytes, hipMemcpyHostToDevice, s));
   }
+  if (import_sync) stream_.Synchronize();  // the carry has landed before any layer of [split, N) reads it
   r.cur = buf_a_.data();
   r.other = buf_b_.data();
   r.normed_in = buf_normed_.data();
   r.normed_in_epilogue = body_epilogue_;
+  if (trace) PpTraceCarry("B-dev", r, split);  // (synchronizes: with R4DX_PP_IMPORT_SYNC=0 it hides the hazard it would show)
 
   RunLayerRange(r, split, r.num_layers);
   std::vector<float> logits = ChunkEpilogue(r);  // ends with the stream synchronize: every copy above has landed

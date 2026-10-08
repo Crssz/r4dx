@@ -1073,7 +1073,15 @@ std::vector<float> Model::RunChunk(const std::vector<int32_t>& token_ids, bool i
     return pp_role_ == PpRole::kStageA ? RunChunkPpStageA(r) : RunChunkPpStageB(r);
   }
   ChunkPrologue(r);
-  RunLayerRange(r, 0, r.num_layers);
+  if (is_prefill_path && pp_role_ == PpRole::kStageB && PpTraceEnabled()) {
+    // R4DX_PP_TRACE: the monolithic reference's carry at the pipeline's boundary (two ranges = one, docs/pp-prefill.md 1.1).
+    const int64_t k = pp_setup_.split;
+    RunLayerRange(r, 0, k);
+    PpTraceCarry("mono", r, k);
+    RunLayerRange(r, k, r.num_layers);
+  } else {
+    RunLayerRange(r, 0, r.num_layers);
+  }
   return ChunkEpilogue(r);
 }
 

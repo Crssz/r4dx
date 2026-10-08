@@ -980,6 +980,13 @@ class Model {
   // wait for the slot, import it, layers [split, N), epilogue, release the slot.
   std::vector<float> RunChunkPpStageA(ChunkRun& r);
   std::vector<float> RunChunkPpStageB(ChunkRun& r);
+  // R4DX_PP_TRACE=1 (pp_stage_real.cpp; diagnostic, off by default): one stderr line per chunk and boundary point with a
+  // 64-bit hash of each carry buffer (`cur`, buf_normed_, buf_normed_pre_ over T x hidden x 2 bytes) and of the chunk's
+  // token ids -- "A-dev" (stage A's device buffers after layers [0, k)), "A-slot" / "B-slot" (the slot's host bytes as A
+  // published them / as B found them), "B-dev" (B's buffers after the import), "mono" (a stage-B Model's monolithic
+  // chunk, split into RunLayerRange(0, k) + RunLayerRange(k, N) at the same boundary). Synchronizes stream_.
+  static bool PpTraceEnabled();
+  void PpTraceCarry(const char* who, ChunkRun& r, int64_t split);
   // Fills the whole (just reset) activation arena with 0xFF on stream_ and resets it again.
   void PoisonArena();
   // ModelOptions::pp_emulate_split resolved against R4DX_PP_EMULATE: 0 = off, else the split layer. Throws on a

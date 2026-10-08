@@ -161,7 +161,7 @@ struct ServerArgs {
   // (both cards visible: HIP_VISIBLE_DEVICES unset), decode unchanged on the headless card; exclusive with --tp 2. 1 forces it off.
   int pp = -1;
   std::vector<int> pp_devices;  // --pp-devices B,A (HIP ordinals: stage B = decode card, stage A); empty = auto
-  int pp_split = 0;           // auto: 33, 35 with --dflash
+  int pp_split = 0;           // auto: 29, 30 with --dflash
   int pp_min_rows = -1;       // default 1024
   bool pp_verify = false;
   int pp_submit_layers = -1;  // default 32

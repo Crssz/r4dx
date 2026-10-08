@@ -2,11 +2,11 @@
 ### Pipelined prefill across both GPUs (`--pp 2`, off by default)
 
 `--pp 2` (or `R4DX_PP=1`) keeps decode exactly as it is -- the whole model on the headless card (HIP device 1) -- and splits only the
-prompt prefill: the first 33 layers (35 with `--dflash`) and the embedding run on the desktop card (HIP device 0), the rest on the
+prompt prefill: the first 29 layers (30 with `--dflash`) and the embedding run on the desktop card (HIP device 0), the rest on the
 decode card, 256-row chunk by chunk with the two cards working on neighbouring chunks, the hidden state and the KV rows crossing through
 pinned host memory. The result is bit-identical to the one-card prefill (the gate is `tests/model/test_pp_real_identity`); measured on
-the GPUs (2026-10-08): cold prefill 1.85x / 1.90x / 1.91x faster at 8k / 32k / 64k (1.70 s / 7.39 s / 16.8 s), decode 0.997x. Design,
-protocol, gates and results: `docs/pp-prefill.md`.
+the GPUs (2026-10-08, corrected placement): cold prefill 1.72x / 1.78x faster at 8k / 32k (1.84 s / 7.86 s against 3.15 s / 14.0 s),
+1.83x at 128k (44.2 s against 80.6 s), decode 0.997x. Design, protocol, gates and results: `docs/pp-prefill.md`.
 
 ```powershell
 Remove-Item env:HIP_VISIBLE_DEVICES -ErrorAction SilentlyContinue   # both cards must be visible (a value exposing one card is refused)

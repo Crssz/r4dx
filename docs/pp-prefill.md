@@ -25,14 +25,35 @@ Status (2026-10-08, branch `pp`, from `main` 4e710ab):
     copies and hashes each stage's whole live state (about 0.45 s at sync and 0.85 s at the tail of a 25k-row call), and
     `pp_prefill_s` times only each iteration's cold first prefill. Without verify the warm-turn sync-back is about 6 ms (76.5 MiB
     of GDN state, export 2.9 ms + import 2.8 ms) and the tail about 3 ms (scratchpad design_pp_warm.md, 2026-10-08).
-  * defaults since 2026-10-08: split k = 32 (35 with a drafter) and `--pp-min-rows` 512 (break-even about 400 rows).
+  * defaults: split k = 29 (30 with a drafter) since the corrected-placement sweep below, and `--pp-min-rows` 512 (break-even
+    about 400 rows).
 
   **Placement caveat of those runs.** They ran with `HIP_VISIBLE_DEVICES=1,0`, which on this ROCm (10.1, Windows) does NOT reorder
   the devices, so stage B (decode) sat on HIP device 0 = pci 03:00 (the desktop card) and stage A on device 1 = pci 07:00 -- the
   opposite of the design (4.1). Correctness is unaffected (both cards are the same model), and the TTFT numbers above are what that
   placement gave. Placement is now explicit (`--pp-devices B,A`, `R4DX_PP_DEVICES`, default decode on the last visible ordinal =
-  physical device 1 = pci 07:00 with `HIP_VISIBLE_DEVICES` unset; section 4.2) and `HIP_VISIBLE_DEVICES=1,0` is no longer needed. The
-  corrected placement has to be re-confirmed on the GPUs (identity, an 8k TTFT, the log lines of 4.7).
+  physical device 1 = pci 07:00 with `HIP_VISIBLE_DEVICES` unset; section 4.2) and `HIP_VISIBLE_DEVICES=1,0` is no longer needed.
+
+  **Corrected placement, re-confirmed (2026-10-08, `E:\models\r4dx\hybrid_p-1`, `hybrid_p0`).** The load log shows stage B on HIP
+  device 1 (pci 07:00) and stage A on device 0 (pci 03:00); `test_pp_real_identity` PASS (9 configurations, 6 negative controls).
+  With stage A on the desktop card, stage A is the slower stage: at k = 32 stage B waits 0.4-0.5 s (8k) and 1.0-1.9 s (32k) on an
+  empty ring, and TTFT is 1.98 s / 8.43 s at 8k / 32k (median of 3), slower than the swapped-placement 1.66 / 7.24 s above. Split
+  sweep (2 runs each, interleaved, greedy output identical at every k):
+
+  | k | 8k (s) | 32k (s) | with `--dflash` k = 7: 8k (s) | 32k (s) |
+  |---|---|---|---|---|
+  | 27 | 1.851 / 1.872 | 8.195 / 8.271 | | |
+  | 28 | 1.907 / 1.824 | 7.952 / 8.485 | | |
+  | **29** | **1.810 / 1.860** | **7.867 / 7.844** | 1.846 / 1.898 | 8.140 / 8.270 |
+  | **30** | 1.842 / 1.846 | 7.976 / 8.292 | **1.833 / 1.855** | **8.149 / 8.292** |
+  | 31 | 1.881 / 2.001 | 8.065 / 8.589 | | |
+  | 32 | 2.035 / 2.063 | 8.725 / 8.763 | 2.053 / 1.927 | 8.537 / 8.756 |
+  | 33 | | | 2.001 / 1.990 | 8.939 / 9.258 |
+  | 35 | | | 2.221 / 2.265 | 9.603 / 9.637 |
+
+  So the defaults are k = 29 (TTFT 1.835 s / 7.856 s, **1.72x / 1.78x** against TP=1's 3.151 / 14.009 s of the same session) and
+  k = 30 with a drafter. For comparison, `--tp 2` prefill in the same session: 3.116 s / 13.664 s. The 128k figure (44.2 s against
+  80.6 s) was measured with the corrected placement at k = 32.
 
 The design this implements (research ideas #26 / #33): 2 stages of 256-row super-chunks, stage A = layers [0, k) + embedding on
 device 0 (the desktop card), stage B = layers [k, N) + final norm + lm_head + MTP priming + DFlash injection on device 1 (the
@@ -260,7 +281,7 @@ facade / engine thread  (hipSetDevice(B) = physical device 1, the headless card)
 | switch | meaning | default |
 |---|---|---|
 | `--pp 2` (r4dx-cli, r4dx-server) / `ModelOptions::pp = 2` / `R4DX_PP=1` | run prompt prefill as the two-stage pipeline; `--pp 1` / `pp = 0` force it off | off (`pp = -1` follows `R4DX_PP`, unset = off) |
-| `--pp-split N` \| `auto` (`PpOptions::split`) | k = stage A's layer count | auto: 32, 35 with a drafter |
+| `--pp-split N` \| `auto` (`PpOptions::split`) | k = stage A's layer count | auto: 29, 30 with a drafter |
 | `--pp-min-rows N` | calls shorter than this run on the decode Model alone | 512 |
 | `--pp-verify` / `R4DX_PP_VERIFY=1` | digest the live state of both stages after every sync-back and hand-off and compare (slow: copies the state to the host) | off |
 | `--pp-submit-layers N`, `--pp-max-inflight K` | stage A's bounded GPU submission: a forced submission every N layers (fewer past 16k / 64k / 128k of context), at most K units queued; `0` layers = off | 32, 1 (as TP) |

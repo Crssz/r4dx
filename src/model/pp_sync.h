@@ -80,11 +80,13 @@ inline int ParsePpEnable(const char* e) {
   return -1;
 }
 
-// The default split layer k (docs/pp-prefill.md 5): 32 without a drafter (2026-10-08: 8k 1.657 s vs 1.702 s at k = 33, 32k
-// 7.236 vs 7.392 s; stage B idles 0.6-1.5 ms per chunk vs 4.2-4.9 ms), 35 with one (it moves the DFlash injection's
-// cost off stage B); both keep 8 attention layers per stage. Clamped into [1, layers - 1] for a shorter container.
+// The default split layer k (docs/pp-prefill.md 5), measured with the corrected placement (stage A on the desktop card, which
+// is the slower stage; 2026-10-08, E:\models\r4dx\hybrid_p-1\split and hybrid_p0\dsweep): 29 without a drafter (8k 1.835 s,
+// 32k 7.856 s vs 2.049 / 8.744 s at k = 32; stage B idles 76 / 148 ms per call vs 506 / 1918 ms), 30 with one (8k 1.844 s,
+// 32k 8.221 s vs 2.243 / 9.620 s at k = 35). Stage A then holds 7 attention layers, stage B 9. Clamped into [1, layers - 1]
+// for a shorter container.
 inline int64_t DefaultSplit(bool dflash, int64_t num_layers) {
-  const int64_t k = dflash ? 35 : 32;
+  const int64_t k = dflash ? 30 : 29;
   return std::max<int64_t>(1, std::min<int64_t>(k, num_layers - 1));
 }
 

@@ -77,6 +77,10 @@ struct Args {
   int64_t dflash_k = 7;
 };
 
+// Rows beyond the prompt (and a "turns" tail) one iteration can feed: two decode runs, each overshooting by up to one
+// DFlash round, and a margin.
+int64_t DecodeSlack(int64_t max_decode, int64_t dflash_k) { return 2 * max_decode + 2 * (dflash_k + 1) + 64; }
+
 [[noreturn]] void Usage(const std::string& why) {
   std::fprintf(stderr,
                "tool_pp_soak: %s\nusage: tool_pp_soak [--model <c.r4dx>] [--layout trellis] [--minutes 60] [--iterations N] "
@@ -127,9 +131,13 @@ Args Parse(int argc, char** argv) {
   if (a.min_prompt < 1 || a.max_prompt < a.min_prompt || a.min_decode < 1 || a.max_decode < a.min_decode) {
     Usage("need 1 <= --min-prompt <= --max-prompt and 1 <= --min-decode <= --max-decode");
   }
-  // A "turns" iteration feeds up to a second tail of 4096 rows and twice the decode length (plus DFlash rounds' slack).
-  const int64_t slack = 4096 + 2 * a.max_decode + 2 * (a.dflash_k + 1) + 64;
-  if (a.max_prompt + slack > a.max_ctx) Usage("--max-prompt + 4096 + 2 * --max-decode (+ slack) must fit in --max-ctx");
+  // A "turns" iteration feeds a second tail (at most 4096 rows, clamped per iteration to what is left of --max-ctx) and
+  // twice the decode length (plus DFlash rounds' slack): the prompt alone must leave room for the decode and one tail row.
+  // (This used to demand room for the whole 4096-row tail too, which refused the documented default
+  // --max-ctx 36864 with the default --max-prompt 32768.)
+  if (a.max_prompt + DecodeSlack(a.max_decode, a.dflash_k) + 1 > a.max_ctx) {
+    Usage("--max-prompt + 2 * --max-decode (+ slack) + 1 must fit in --max-ctx");
+  }
   if (!a.dflash.empty() && (a.dflash_k < 1 || a.dflash_k > 7)) Usage("--dflash-k must be in [1, 7]");
   return a;
 }
@@ -389,7 +397,9 @@ int main(int argc, char** argv) {
       const int P = plen(rng), D = dlen(rng);
       const Mode mode = static_cast<Mode>(mode_d(rng));  // 0..2 (greedy, sampled, turns), 3 = DFlash with --dflash
       const size_t start = start_d(rng);
-      const int tail = tail_d(rng);
+      // The tail leaves room in --max-ctx for the prompt and both decode runs (Parse guarantees at least one row).
+      const int tail = static_cast<int>(
+          std::max<int64_t>(1, std::min<int64_t>(tail_d(rng), a.max_ctx - P - DecodeSlack(D, a.dflash_k))));
       const uint64_t sample_seed = rng();
       std::vector<std::vector<int32_t>> parts(mode == Mode::kTurns ? 2 : 1);
       parts[0].resize(static_cast<size_t>(P));

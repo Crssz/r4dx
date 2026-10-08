@@ -539,6 +539,12 @@ std::vector<float> PpModel::PipelinedPrefill(const std::vector<int32_t>& ids, co
     berr = std::current_exception();
     std::fprintf(stderr, "[r4dx-pp] stage B failed: %s\n", WhatOf(berr).c_str());
     channel_->Poison("stage B failed: " + WhatOf(berr));
+    // An early GDN import (OnLastChunk) may still be copying out of gdn_hand_ on the side stream: let it land before the
+    // recovery (Reset) zeroes the state it writes.
+    try {
+      b.PpImportFence();
+    } catch (...) {
+    }
   }
   const auto t_tail0 = Clock::now();
 

@@ -81,8 +81,8 @@ inline StageCtxPlan PlanStageCtxPerCard(int64_t max_ctx, int64_t requested, cons
   } else {
     p.s = std::min(max_ctx, cap);
   }
-  if (p.refusal.empty() && p.s < kMinStageCtx) {
-    p.refusal = "stage KV capacity " + std::to_string(p.s) + " tokens < " + std::to_string(kMinStageCtx);
+  if (p.refusal.empty() && p.s < MinStageCtx(max_ctx)) {
+    p.refusal = "stage KV capacity " + std::to_string(p.s) + " tokens < " + std::to_string(MinStageCtx(max_ctx));
   }
   p.engaged = p.refusal.empty();
   p.x_free_after = FreeAfterStageLoad(x, p.s, bytes_per_token_x);

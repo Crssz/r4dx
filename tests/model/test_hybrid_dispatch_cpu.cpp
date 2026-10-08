@@ -85,7 +85,11 @@ void StagePlanning() {
     const StageCtxPlan z = PlanStageCtxPerCard(262144, 0, BudgetX(Gib(5.0), Gib(8.6)), y, 16384, 16384);
     Check(!z.engaged && z.s == 0, "nothing left on X: S = 0, refused");
     const StageCtxPlan small_max = PlanStageCtxPerCard(8192, 0, BudgetX(Gib(20.0), Gib(8.6)), y, 16384, 16384);
-    Check(!small_max.engaged, "--max-ctx below the minimum stage capacity: refused");
+    Check(small_max.engaged && small_max.s == 8192,
+          "--max-ctx below the minimum stage capacity: S = --max-ctx holds every call the ranks can take, engaged");
+    const StageCtxPlan small_tight = PlanStageCtxPerCard(9216, 0, BudgetX(Gib(11.7), Gib(8.6)), y, 16384, 16384);
+    Check(small_tight.engaged == (small_tight.s_x >= 9216) && (!small_tight.engaged || small_tight.s == 9216),
+          "--max-ctx 9216: engaged exactly when both cards hold 9216 tokens");
   }
   {  // a stage with NO attention layer (the 4-layer test container at k = 2: X has 0, Y 1) has 0 KV bytes per token: its capacity is unbounded, not 0
     const int64_t b0 = StageKvBytesPerToken(0, 4, 256), b1 = StageKvBytesPerToken(1, 4, 256);

@@ -24,8 +24,10 @@ inline double ToGib(int64_t bytes) { return static_cast<double>(bytes) / static_
 // slack, lazily allocated arenas); for scale TP=1 production leaves 3.5 GiB free on the headless card.
 constexpr double kReserveXGib = 3.0;
 constexpr double kReserveYGib = 1.5;
-// Hybrid is refused (plain --tp 2, one log line) below this stage-KV capacity.
+// Hybrid is refused (plain --tp 2, one log line) below this stage-KV capacity -- unless the ranks' --max-ctx is itself smaller:
+// then S = --max-ctx holds every call the ranks can take, and there is nothing to refuse (MinStageCtx).
 constexpr int64_t kMinStageCtx = 16384;
+inline int64_t MinStageCtx(int64_t max_ctx) { return max_ctx > 0 ? std::min(kMinStageCtx, max_ctx) : kMinStageCtx; }
 
 // Stage KV bytes per token on one card: the stage's attention layers x ALL kv heads x (K + V fp8 rows). 8 layers x 4 heads x
 // 512 B = 16 KiB for both k = 32 and k = 35 (layer k itself gets no cache).
@@ -93,8 +95,8 @@ inline StageCtxPlan PlanStageCtx(int64_t max_ctx, int64_t requested, const CardB
   } else {
     p.s = std::min(max_ctx, cap);
   }
-  if (p.refusal.empty() && p.s < kMinStageCtx) {
-    p.refusal = "stage KV capacity " + std::to_string(p.s) + " tokens < " + std::to_string(kMinStageCtx);
+  if (p.refusal.empty() && p.s < MinStageCtx(max_ctx)) {
+    p.refusal = "stage KV capacity " + std::to_string(p.s) + " tokens < " + std::to_string(MinStageCtx(max_ctx));
   }
   p.engaged = p.refusal.empty();
   p.x_free_after = FreeAfterStageLoad(x, p.s, bytes_per_token);
@@ -112,7 +114,8 @@ inline StageCtxPlan PlanStageCtx(int64_t max_ctx, int64_t requested, const CardB
 inline int64_t AlignStageCtx(int64_t s, int64_t kv_block) { return kv_block > 0 && s > 0 ? s / kv_block * kv_block : 0; }
 inline std::string CheckStageCtx(int64_t s, int64_t rank_max_ctx, int64_t kv_block) {
   if (kv_block <= 0) return "the KV block size must be positive";
-  if (s < kMinStageCtx) return "stage KV capacity " + std::to_string(s) + " tokens < " + std::to_string(kMinStageCtx);
+  const int64_t min_s = MinStageCtx(AlignStageCtx(rank_max_ctx, kv_block));  // a --max-ctx off the block grid aligns down too
+  if (s < min_s) return "stage KV capacity " + std::to_string(s) + " tokens < " + std::to_string(min_s);
   if (s % kv_block != 0) {
     return "stage KV capacity " + std::to_string(s) + " is not a whole number of " + std::to_string(kv_block) + "-token blocks";
   }

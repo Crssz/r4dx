@@ -40,6 +40,7 @@
 
 #include "container.h"
 #include "dflash_draft.h"
+#include "batch_plan.h"   // batch::SlotTable (docs/batch-decode.md; HIP-free)
 #include "gdn_state.h"
 #include "model_config.h"
 #include "model_types.h"  // ImageSpan, ImageRows, ProfileEntry, StepProfile (docs/tp.md 2.8)
@@ -263,6 +264,16 @@ struct ModelOptions {
     int embed_device_resident_decided = -1;  // when no mirror is borrowed: 1 mirror, 0 host-only, -1 the free-VRAM heuristic
   };
   StageOnlyOptions stage_only;
+  // Batched decode (docs/batch-decode.md; `--batch N` on the server): 0 (the default, and every pre-batch caller) = off, nothing is
+  // allocated and no code path differs. 1..batch::kMaxSlots sizes N BATCH SLOTS next to the one single-sequence state: each slot
+  // holds one sequence's KV (`batch_ctx` tokens in every full-attention layer, one shared fp8 cache) and GDN state (one physical
+  // slot per GDN layer, a manager of its own), a prompt is prefilled the usual way into the single-sequence state and BatchImport()ed
+  // into a slot, and DecodeBatch() then decodes one token for several slots in one forward pass. Needs a plain Model (no MTP, no
+  // DFlash2, not a pipeline stage); the single-sequence state, Prefill, DecodeStep* and Reset() are exactly as without it.
+  int batch_slots = 0;
+  // Tokens per batch slot (a multiple of the 16-token KV block); a prompt longer than this cannot be imported. The batch KV costs
+  // batch_slots * batch_ctx * 32 KiB at TP=1 (16 KiB per rank at TP=2), batch::BatchKvBytes.
+  int64_t batch_ctx = 32768;
   // Tensor parallel (docs/tp.md 3.3); default-constructed == TP=1 == every pre-TP caller. Under TP
   // the vision tower loads on the rank with tp.vision_weights_on_this_rank (rank 0); every rank
   // parses the vision config, so `vision == kOn` needs only the container's vision.* tensors.
@@ -627,6 +638,34 @@ class Model {
   // until the next RunChunk/VerifyWindow call overwrites verify_logits_dev_, exactly like
   // DflashFeatureBuffer()'s own lifetime. Requires DraftWindow() > 1.
   void ReadVerifyLogitsRow(int64_t row, std::vector<float>& out) const;
+
+  // ---- batched decode (docs/batch-decode.md; needs ModelOptions::batch_slots > 0) ----------------------------------
+  // The number of batch slots (0: batching is off) and the tokens one slot holds.
+  int BatchSlots() const { return batch_slots_.Slots(); }
+  int64_t BatchSlotCtx() const { return batch_slots_.SlotCtx(); }
+  // True while `slot` holds a sequence (BatchImport'ed and not released); tokens committed to it so far.
+  bool BatchSlotActive(int slot) const { return batch_slots_.Active(slot); }
+  int64_t BatchSlotPosition(int slot) const { return batch_slots_.Pos(slot); }
+  // Copies this Model's single-sequence state -- every full-attention layer's KV for the PositionCount() committed tokens and
+  // every GDN layer's recurrent state and conv history -- into batch slot `slot` (replacing whatever it held) and marks the
+  // slot live at that position, carrying the mrope delta of a conversation with an image. Call it right after Prefill /
+  // PrefillMultimodal, before any decode step or verify window moves the single-sequence state. The single-sequence state is
+  // left exactly as it was (the next request's Reset() / prefix reuse is unaffected). Throws if PositionCount() is 0 or does not
+  // leave room in a slot (BatchSlotCtx()). Local device copies only (no TpComm), synchronous.
+  void BatchImport(int slot);
+  // Marks `slot` free (host bookkeeping only: its device state is overwritten by the next BatchImport).
+  void BatchRelease(int slot);
+  // One decode step for several sequences: row r feeds rows[r].token into slot rows[r].slot -- the token that sequence's last step
+  // returned, or the one sampled from its prefill logits -- and the result is the token that follows it, per row. Slots must be
+  // live and distinct; any subset, in any order. Greedy rows (temperature <= 0) are the argmax of the row's logits, sampled
+  // rows the sampler of DecodeStepSampled (device row summary, exactly one draw from the row's rng, full-row fallback when the
+  // summary cannot resolve it), so a slot's token stream equals the one DecodeStepGreedy / DecodeStepSampled would give the
+  // same sequence decoded alone, up to the GEMM tuning table choosing different kernels at M = rows (docs/batch-decode.md 6).
+  // Advances each slot by one position. On a failure every row's slot is released (its state is unknown) before the exception
+  // propagates. Under TP every rank must make the same call (TpModel does); the lockstep fingerprint checks it.
+  std::vector<int32_t> DecodeBatch(const std::vector<BatchDecodeRow>& rows);
+  // VRAM held by the batch slots (KV + GDN state), bytes; 0 when off.
+  int64_t BatchBytes() const { return batch_bytes_; }
 
   // Diagnostic-only accessor (docs/mtp.md "Acceptance gap investigation", h_seed drift pass): reads
   // back `mtp_seed_hidden_` -- the exact [hidden] bf16 row `MtpHead::Draft`'s first step consumes --
@@ -1206,7 +1245,9 @@ class Model {
   // 8-row-per-call limit (a K=16 MTP window is 17 rows): it is issued in <=8-row calls on the SAME
   // stream, which serialises their shared module-scope device scratch (kernels.h's "one call in
   // flight" precondition). Caller must sync before FetchRowSummaries.
-  void LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature);
+  // `out_row0` (batched decode): the summary row the first of the `rows` lands in (default 0), so one step can summarise
+  // rows of different temperatures with a call each, into consecutive summary rows.
+  void LaunchRowSummaries(const float* logits_dev, int64_t rows, float inv_temperature, int64_t out_row0 = 0);
   // Copies those `rows` summaries back (device must be idle) into `out`, resized to `rows`.
   void FetchRowSummaries(int64_t rows, float inv_temperature, std::vector<kernels::RowSummary>& out);
   // 1/temperature, or 0 when `params` has no usable device summary (greedy, or a temperature so
@@ -1237,6 +1278,11 @@ class Model {
   std::vector<int32_t> DecodeStepMtpImpl(int32_t token_id, int64_t k,
                                           const kernels::SampleParams* params,
                                           std::mt19937_64* rng);
+  // DecodeBatch's body (the public method validates, then runs this inside the release-on-failure guard) and, under TP, the
+  // warm-up of the batch path TpWarmup runs once (docs/batch-decode.md 5): rows = 1..BatchSlots() greedy, then a sampled step.
+  std::vector<int32_t> DecodeBatchRun(const std::vector<BatchDecodeRow>& rows, const std::vector<int>& slots,
+                                      const std::vector<int32_t>& tokens);
+  void BatchWarmup();
   // The one body behind DecodeStepDflashGreedy (params==nullptr) and DecodeStepDflashSampled.
   std::vector<int32_t> DecodeStepDflashImpl(int32_t token_id, int64_t k, float p_min, int64_t n_min,
                                              const kernels::SampleParams* params,
@@ -1398,6 +1444,23 @@ class Model {
   std::vector<std::optional<GdnStateManager>> gdn_states_;             // one per GDN layer
   std::vector<std::optional<attention::PagedKvCache>> kv_caches_;      // one per attn layer
   GdnControlCache gdn_control_;  // shared by every GDN layer -- see gdn_state.h
+
+  // ---- batched decode (docs/batch-decode.md); everything below is empty / zero unless ModelOptions::batch_slots > 0 -------------
+  // One entry per layer like gdn_states_ / kv_caches_ (empty for a layer of the other kind). batch_gdn_states_[i] is a manager of
+  // `slots` sequences (physical slot s + 1 is batch slot s) with window 1; batch_kv_caches_[i] one cache of slots * batch_ctx
+  // tokens, batch slot s owning positions [s * batch_ctx, (s + 1) * batch_ctx). Separate objects, so Reset() of the
+  // single-sequence state never touches a slot some other request is decoding in.
+  std::vector<std::optional<GdnStateManager>> batch_gdn_states_;
+  std::vector<std::optional<attention::PagedKvCache>> batch_kv_caches_;
+  batch::SlotTable batch_slots_;                   // default-constructed (0 slots) when off
+  int64_t batch_bytes_ = 0;
+  int64_t batch_split_ctx_ = 0;                    // the single-sequence cache's CapacityTokens(): AttnBatchView::split_max_ctx
+  // One step's metadata (batch_plan.h's layout): pinned host staging + its device mirror, one async H2D per step. Persistent
+  // for the same reason step_meta_dev_ is (the previous call ended synchronized, so nothing still reads either).
+  core::PinnedBuffer<int32_t> batch_meta_host_;
+  core::DeviceBuffer<int32_t> batch_meta_dev_;
+  core::DeviceBuffer<float> batch_logits_dev_;     // [slots * vocab_local_] fp32: one lm_head row per step row
+  core::DeviceBuffer<int32_t> batch_argmax_dev_;   // [slots]; TP uses argmax_pair_dev_
 
   int64_t max_chunk_ = 64;
   // 256-row prompt prefill (default on; R4DX_PREFILL_CHUNK / ModelOptions::prefill_chunk, prefill_chunk.h,

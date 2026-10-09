@@ -194,6 +194,25 @@ class TextModel {
                                                        std::mt19937_64& rng,
                                                        int64_t* walk_len_out = nullptr) = 0;
 
+  // ---- batched decode (docs/batch-decode.md): several sequences, one forward pass per token -------------------------------
+  // BatchSlots() is the number of batch slots the model was loaded with (ModelOptions::batch_slots; 0 = it cannot batch -- the
+  // default of every model that does not override these, Gemma included) and BatchSlotCtx() the tokens one slot holds.
+  // BatchImport(slot) copies the single-sequence state a Prefill / PrefillMultimodal just built into a slot and DecodeBatch(rows)
+  // feeds one token into each listed slot and returns each sequence's next token: Model::BatchImport / DecodeBatch, whose
+  // contracts these are (under TP, on every rank; with the hybrid mode the prefill that fed the single-sequence state may have been
+  // the PP-2 pipeline -- its state is resharded into the ranks before BatchImport runs, so a slot never knows).
+  virtual int BatchSlots() const { return 0; }
+  virtual int64_t BatchSlotCtx() const { return 0; }
+  virtual void BatchImport(int /*slot*/) {
+    throw std::runtime_error("this model was not loaded for batched decode (ModelOptions::batch_slots, `--batch N`)");
+  }
+  virtual void BatchRelease(int /*slot*/) {
+    throw std::runtime_error("this model was not loaded for batched decode (ModelOptions::batch_slots, `--batch N`)");
+  }
+  virtual std::vector<int32_t> DecodeBatch(const std::vector<BatchDecodeRow>& /*rows*/) {
+    throw std::runtime_error("this model was not loaded for batched decode (ModelOptions::batch_slots, `--batch N`)");
+  }
+
   // ---- diagnostics (TP: throws core::TpUnsupportedError) ---------------------------------------
   virtual StepProfile DecodeStepProfiled(int32_t token_id) = 0;
   virtual StepProfile PrefillProfiled(const std::vector<int32_t>& token_ids) = 0;

@@ -607,7 +607,51 @@ void TestTpFlags() {
 
 }  // namespace
 
+void TestBatchFlags() {
+  using r4dx::server::ParseServerArgs;
+  using r4dx::server::ServerUsageError;
+  const auto parse = [](std::vector<std::string> storage) {
+    storage.insert(storage.begin(), "r4dx-server");
+    storage.insert(storage.begin() + 1, "--model");
+    storage.insert(storage.begin() + 2, "m.r4dx");
+    auto argv = ToArgv(storage);
+    return ParseServerArgs(static_cast<int>(argv.size()), argv.data());
+  };
+  const auto throws = [&](std::vector<std::string> storage) {
+    try {
+      (void)parse(std::move(storage));
+    } catch (const ServerUsageError&) {
+      return true;
+    }
+    return false;
+  };
+  const auto a0 = parse({});
+  CHECK(a0.batch == 0 && a0.batch_ctx == 32768 && !a0.batch_ctx_given);  // off by default: the one-request-at-a-time server
+  const auto a = parse({"--batch", "4"});
+  CHECK(a.batch == 4 && a.batch_ctx == 32768);
+  const auto big = parse({"--batch", "16", "--batch-ctx", "65536"});
+  CHECK(big.batch == 16 && big.batch_ctx == 65536 && big.batch_ctx_given && big.tp == 1);
+  const auto b = parse({"--batch", "8", "--tp", "2"});
+  CHECK(b.batch == 8 && b.tp == 2);
+  CHECK(throws({"--batch", "9", "--tp", "2"}));  // a TP step stays at most 8 rows
+  // the hybrid mode takes it too: decode of the slots runs on the TP ranks after the pipelined prefill
+  const auto h = parse({"--tp", "2", "--pp", "2", "--batch", "4", "--batch-ctx", "16384"});
+  CHECK(h.batch == 4 && h.tp == 2 && h.pp == 2);
+  CHECK(throws({"--batch", "1"}));                        // one slot IS --batch 0
+  CHECK(throws({"--batch", "17"}));                       // past the slot bound
+  CHECK(throws({"--batch", "-2"}));
+  CHECK(throws({"--batch-ctx", "4096"}));                 // without --batch
+  CHECK(throws({"--batch", "2", "--batch-ctx", "1000"})); // not a multiple of the 16-token KV block
+  CHECK(throws({"--batch", "2", "--batch-ctx", "0"}));
+  CHECK(throws({"--batch", "2", "--mtp", "3"}));          // plain decode only
+  CHECK(throws({"--batch", "2", "--dflash", "d.r4dx"}));
+  CHECK(throws({"--batch", "8", "--max-queue", "4"}));    // the queue has to be able to fill the slots
+  CHECK(!throws({"--batch", "8", "--max-queue", "8"}));
+  CHECK(throws({"--batch", "abc"}));
+}
+
 int main() {
+  TestBatchFlags();
   TestDefaults();
   TestAllFlags();
   TestMissingModelThrows();

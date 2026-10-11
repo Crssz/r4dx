@@ -20,6 +20,7 @@
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
 #include "r4dx/model/qwen4exp/common.h"
+#include "r4dx/model/qwen4exp/fuse_flags.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/hc_conn.h"
 #include "r4dx/model/qwen4exp/moe_block.h"
@@ -131,6 +132,7 @@ struct LayerRt {
   // Steady-state decode HIP Graphs (M=1, zero CPU driver overhead)
   hipGraphExec_t decode_graph_exec = nullptr;
   hipGraphExec_t moe_graph_exec = nullptr;
+  uint32_t graph_fuse_mask = 0;  // qwen4exp::FuseMask() the two graphs were captured under
 
 
   ~LayerRt() {
@@ -773,6 +775,20 @@ void Qwen4ExpStage::RunLayers(const Qwen4ExpChunk& c) {
     for (int64_t t = 0; t < T; ++t) m.positions_host[static_cast<size_t>(t)] = static_cast<int32_t>(c.first_pos + t);
     R4DX_HIP_CHECK(hipMemcpyAsync(m.positions.data(), m.positions_host.data(), static_cast<size_t>(T) * 4,
                                   hipMemcpyHostToDevice, s));
+  }
+
+  const uint32_t fuse_mask = qwen4exp::FuseMask();
+  for (auto& lp : m.layers) {
+    LayerRt& L = *lp;
+    if (is_decode && (L.decode_graph_exec != nullptr || L.moe_graph_exec != nullptr) && L.graph_fuse_mask != fuse_mask) {
+      // a fusion switch (R4DX_Q4_FUSE_*) flipped since the graphs were captured: drop them, the next step captures under the new mask
+      R4DX_HIP_CHECK(hipStreamSynchronize(s));
+      if (L.decode_graph_exec) static_cast<void>(hipGraphExecDestroy(L.decode_graph_exec));
+      if (L.moe_graph_exec) static_cast<void>(hipGraphExecDestroy(L.moe_graph_exec));
+      L.decode_graph_exec = nullptr;
+      L.moe_graph_exec = nullptr;
+    }
+    L.graph_fuse_mask = fuse_mask;
   }
 
   for (auto& lp : m.layers) {

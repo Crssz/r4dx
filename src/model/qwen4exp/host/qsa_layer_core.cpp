@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "r4dx/core/error.hpp"
+#include "r4dx/model/qwen4exp/fuse_flags.h"
 #include "r4dx/model/qwen4exp/qsa.h"
 #include "r4dx/model/qwen4exp/qsa_kernels.h"
 
@@ -240,6 +241,10 @@ uint16_t* QsaLayerCore::Forward(hipStream_t stream, core::Arena& arena, const Qs
   at.topk = topk_;
   at.tiles_per_split = tps;
   at.nsplit = nsplit;
+  // Decode (one query) over at most a few tiles starts only heads_kv workgroups, i.e. two compute units: split the twelve query
+  // heads of each kv head over four workgroups (three heads each; bit-identical, see qsa_attn.hip; 4 measured best of
+  // 1 / 2 / 3 / 4 / 6 / 12 at 243 and 2000 tokens). R4DX_Q4_FUSE_QSA=0 keeps one workgroup per kv head.
+  at.head_split = (T == 1 && (FuseMask() & kFuseQsa) != 0) ? 4 : 1;
   at.kv_block_stride = kv.KvBlockStride();
   at.kv_head_stride = kv.KvHeadStride();
   R4DX_HIP_CHECK(r4dx_q4_qsa_attn(&at, stream));

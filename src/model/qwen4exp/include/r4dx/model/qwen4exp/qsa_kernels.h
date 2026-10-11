@@ -116,9 +116,10 @@ struct Q4QsaAttnArgs {
   int T, heads_q, heads_kv, sel_stride, ratio, topk;
   int tiles_per_split;           // 256-token tiles per workgroup
   int nsplit;                    // grid.x of the main kernel; ceil(max tiles / tiles_per_split)
+  int head_split;                // workgroups per kv head (1, 2, 3, 4, 6, 12; 0 = 1): the twelve query heads are divided between them
   int64_t kv_block_stride, kv_head_stride;
 };
-// heads_q / heads_kv == 12, head_dim == 256, block_size == 16 only. Stage 1: grid (nsplit, heads_kv, T), 256
+// heads_q / heads_kv == 12, head_dim == 256, block_size == 16 only. Stage 1: grid (nsplit, heads_kv * head_split, T), 256
 // threads. Stage 2 (merge + gate): grid (heads_q, T).
 hipError_t r4dx_q4_qsa_attn(const Q4QsaAttnArgs* a, hipStream_t stream);
 

@@ -3,7 +3,8 @@
 //
 // Shape: gqa 12 (one kv head serves 12 query heads), head_dim 256, PagedKvCache block 16, K row then V row of 256
 // fp8 e4m3 bytes per (block, kv head, slot). Flash-decoding structure:
-//   AttnPartialKernel  grid (nsplit, kv heads, T), 256 threads. A workgroup walks `tiles_per_split` tiles of 256
+//   AttnPartialKernel  grid (nsplit, kv heads * head_split, T), 256 threads (head_split workgroups share a kv head: 12 / head_split
+//     query heads each, see the kernel). A workgroup walks `tiles_per_split` tiles of 256
 //     tokens of one (query, kv head). Per tile, thread j owns token j: it dots the 12 q heads (q in LDS, fp32)
 //     with the token's fp8 K row (hardware fp8 -> fp32 convert) -> scores in LDS; the tile max per head and the
 //     online-softmax rescale are uniform over the workgroup; then thread d owns head dim d and accumulates
@@ -33,14 +34,21 @@ constexpr float kScale = 0.0625f;  // 1 / sqrt(256), exact
 
 typedef float v2f __attribute__((ext_vector_type(2)));
 
+// kH query heads per workgroup (kG / kH workgroups per kv head, blockIdx.y = g * (kG / kH) + head group): every head's arithmetic is
+// independent of the others' (same operations in the same order per head), so the split is bit-identical to kH == kG; it only spreads
+// the heads' FMAs over more workgroups. Decode (T = 1, one tile) otherwise runs on heads_kv workgroups, i.e. two compute units.
+template <int kH>
 __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
-  __shared__ __attribute__((aligned(16))) float q_lds[kHD * kG];
-  __shared__ __attribute__((aligned(16))) float s_lds[kTile * kG];
+  static_assert(kG % kH == 0, "heads per workgroup must divide the group");
+  __shared__ __attribute__((aligned(16))) float q_lds[kHD * kH];
+  __shared__ __attribute__((aligned(16))) float s_lds[kTile * kH];
   __shared__ unsigned long long off_lds[kTile];
-  __shared__ float red[kWaves * kG];
-  __shared__ float m_tile[kG];
+  __shared__ float red[kWaves * kH];
+  __shared__ float m_tile[kH];
 
-  const int sp = blockIdx.x, g = blockIdx.y, t = blockIdx.z;
+  const int sp = blockIdx.x, t = blockIdx.z;
+  const int g = blockIdx.y / (kG / kH);          // kv head
+  const int ho = (blockIdx.y % (kG / kH)) * kH;  // first query head of the group within the kv head's twelve
   const int tid = threadIdx.x;
   const int lane = tid & 31, wave = tid >> 5;
   const int p = a.positions[t];
@@ -52,9 +60,9 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
   const int tile1 = min(ntiles, tile0 + a.tiles_per_split);
 
   {
-    const uint16_t* qsrc = a.q + (static_cast<int64_t>(t) * a.heads_q + g * kG) * kHD;
-    for (int idx = tid; idx < kG * kHD; idx += kTile) {
-      q_lds[(idx % kHD) * kG + idx / kHD] = Bf16ToFloat(qsrc[idx]);
+    const uint16_t* qsrc = a.q + (static_cast<int64_t>(t) * a.heads_q + g * kG + ho) * kHD;
+    for (int idx = tid; idx < kH * kHD; idx += kTile) {
+      q_lds[(idx % kHD) * kH + idx / kHD] = Bf16ToFloat(qsrc[idx]);
     }
   }
   __syncthreads();
@@ -62,9 +70,9 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
   const int32_t* list = a.sel_tokens + static_cast<int64_t>(t) * a.sel_stride;
   const uint8_t* head_base = a.kv_cache + static_cast<int64_t>(g) * a.kv_head_stride;
 
-  float acc[kG], lp[kG], m_run[kG];
+  float acc[kH], lp[kH], m_run[kH];
 #pragma unroll
-  for (int h = 0; h < kG; ++h) {
+  for (int h = 0; h < kH; ++h) {
     acc[h] = 0.0f;
     lp[h] = 0.0f;
     m_run[h] = -INFINITY;
@@ -73,9 +81,9 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
   for (int tile = tile0; tile < tile1; ++tile) {
     const int i = tile * kTile + tid;
     const bool valid = i < n_tok;
-    float s[kG];
+    float s[kH];
 #pragma unroll
-    for (int h = 0; h < kG; ++h) s[h] = 0.0f;
+    for (int h = 0; h < kH; ++h) s[h] = 0.0f;
     unsigned long long off = 0;
     if (valid) {
       const int tok = sparse ? list[i] : i;
@@ -93,37 +101,43 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
           const float x[4] = {lo.x, lo.y, hi.x, hi.y};
 #pragma unroll
           for (int e = 0; e < 4; ++e) {
-            const float4* qp = reinterpret_cast<const float4*>(&q_lds[(c * 16 + j * 4 + e) * kG]);
-            const float4 q0 = qp[0], q1 = qp[1], q2 = qp[2];
-            s[0] += x[e] * q0.x;  s[1] += x[e] * q0.y;  s[2] += x[e] * q0.z;   s[3] += x[e] * q0.w;
-            s[4] += x[e] * q1.x;  s[5] += x[e] * q1.y;  s[6] += x[e] * q1.z;   s[7] += x[e] * q1.w;
-            s[8] += x[e] * q2.x;  s[9] += x[e] * q2.y;  s[10] += x[e] * q2.z;  s[11] += x[e] * q2.w;
+            if constexpr (kH == kG) {
+              const float4* qp = reinterpret_cast<const float4*>(&q_lds[(c * 16 + j * 4 + e) * kG]);
+              const float4 q0 = qp[0], q1 = qp[1], q2 = qp[2];
+              s[0] += x[e] * q0.x;  s[1] += x[e] * q0.y;  s[2] += x[e] * q0.z;   s[3] += x[e] * q0.w;
+              s[4] += x[e] * q1.x;  s[5] += x[e] * q1.y;  s[6] += x[e] * q1.z;   s[7] += x[e] * q1.w;
+              s[8] += x[e] * q2.x;  s[9] += x[e] * q2.y;  s[10] += x[e] * q2.z;  s[11] += x[e] * q2.w;
+            } else {
+              const float* qp = &q_lds[(c * 16 + j * 4 + e) * kH];
+#pragma unroll
+              for (int h = 0; h < kH; ++h) s[h] += x[e] * qp[h];
+            }
           }
         }
       }
     }
 #pragma unroll
-    for (int h = 0; h < kG; ++h) s[h] = valid ? s[h] * k_scale : -INFINITY;
+    for (int h = 0; h < kH; ++h) s[h] = valid ? s[h] * k_scale : -INFINITY;
     off_lds[tid] = off;
 
     // tile max per head
 #pragma unroll
-    for (int h = 0; h < kG; ++h) {
+    for (int h = 0; h < kH; ++h) {
       const float v = qsa::WaveMax(s[h]);
-      if (lane == 0) red[wave * kG + h] = v;
+      if (lane == 0) red[wave * kH + h] = v;
     }
     __syncthreads();
-    if (tid < kG) {
+    if (tid < kH) {
       float m = -INFINITY;
 #pragma unroll
-      for (int w = 0; w < kWaves; ++w) m = fmaxf(m, red[w * kG + tid]);
+      for (int w = 0; w < kWaves; ++w) m = fmaxf(m, red[w * kH + tid]);
       m_tile[tid] = m;
     }
     __syncthreads();
 
-    float alpha[kG], pr[kG];
+    float alpha[kH], pr[kH];
 #pragma unroll
-    for (int h = 0; h < kG; ++h) {
+    for (int h = 0; h < kH; ++h) {
       const float m_new = fmaxf(m_run[h], m_tile[h]);
       alpha[h] = expf(m_run[h] - m_new);  // 0 on the first tile (m_run = -inf)
       m_run[h] = m_new;
@@ -131,10 +145,8 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
       lp[h] = lp[h] * alpha[h] + pr[h];
       acc[h] *= alpha[h];
     }
-    float4* sp4 = reinterpret_cast<float4*>(&s_lds[tid * kG]);
-    sp4[0] = make_float4(pr[0], pr[1], pr[2], pr[3]);
-    sp4[1] = make_float4(pr[4], pr[5], pr[6], pr[7]);
-    sp4[2] = make_float4(pr[8], pr[9], pr[10], pr[11]);
+#pragma unroll
+    for (int h = 0; h < kH; ++h) s_lds[tid * kH + h] = pr[h];
     __syncthreads();
 
     const int nt = min(kTile, n_tok - tile * kTile);
@@ -143,32 +155,38 @@ __global__ __launch_bounds__(kTile) void AttnPartialKernel(Q4QsaAttnArgs a) {
     for (int j = 0; j < nt; ++j) {
       const unsigned vb = vcol[off_lds[j]];
       const float vf = __builtin_amdgcn_cvt_f32_fp8(vb, 0);
-      const float4* pp = reinterpret_cast<const float4*>(&s_lds[j * kG]);
-      const float4 p0 = pp[0], p1 = pp[1], p2 = pp[2];
-      acc[0] += p0.x * vf;  acc[1] += p0.y * vf;  acc[2] += p0.z * vf;   acc[3] += p0.w * vf;
-      acc[4] += p1.x * vf;  acc[5] += p1.y * vf;  acc[6] += p1.z * vf;   acc[7] += p1.w * vf;
-      acc[8] += p2.x * vf;  acc[9] += p2.y * vf;  acc[10] += p2.z * vf;  acc[11] += p2.w * vf;
+      if constexpr (kH == kG) {
+        const float4* pp = reinterpret_cast<const float4*>(&s_lds[j * kG]);
+        const float4 p0 = pp[0], p1 = pp[1], p2 = pp[2];
+        acc[0] += p0.x * vf;  acc[1] += p0.y * vf;  acc[2] += p0.z * vf;   acc[3] += p0.w * vf;
+        acc[4] += p1.x * vf;  acc[5] += p1.y * vf;  acc[6] += p1.z * vf;   acc[7] += p1.w * vf;
+        acc[8] += p2.x * vf;  acc[9] += p2.y * vf;  acc[10] += p2.z * vf;  acc[11] += p2.w * vf;
+      } else {
+        const float* pp = &s_lds[j * kH];
+#pragma unroll
+        for (int h = 0; h < kH; ++h) acc[h] += pp[h] * vf;
+      }
     }
     __syncthreads();  // s_lds / off_lds / red are rewritten by the next tile
   }
 
   // sum of the per-thread partial sums
 #pragma unroll
-  for (int h = 0; h < kG; ++h) {
+  for (int h = 0; h < kH; ++h) {
     const float v = qsa::WaveSum(lp[h]);
-    if (lane == 0) red[wave * kG + h] = v;
+    if (lane == 0) red[wave * kH + h] = v;
   }
   __syncthreads();
   const int64_t slot = (static_cast<int64_t>(t) * a.heads_kv + g) * a.nsplit + sp;
-  if (tid < kG) {
+  if (tid < kH) {
     float l = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWaves; ++w) l += red[w * kG + tid];
-    a.part_ml[(slot * kG + tid) * 2 + 0] = m_run[tid];
-    a.part_ml[(slot * kG + tid) * 2 + 1] = l;
+    for (int w = 0; w < kWaves; ++w) l += red[w * kH + tid];
+    a.part_ml[(slot * kG + ho + tid) * 2 + 0] = m_run[tid];
+    a.part_ml[(slot * kG + ho + tid) * 2 + 1] = l;
   }
 #pragma unroll
-  for (int h = 0; h < kG; ++h) a.part_acc[(slot * kG + h) * kHD + tid] = acc[h];
+  for (int h = 0; h < kH; ++h) a.part_acc[(slot * kG + ho + h) * kHD + tid] = acc[h];
 }
 
 __global__ __launch_bounds__(kHD) void AttnCombineKernel(Q4QsaAttnArgs a) {
@@ -204,10 +222,18 @@ extern "C" hipError_t r4dx_q4_qsa_attn(const Q4QsaAttnArgs* a, hipStream_t strea
   if (a->heads_kv <= 0 || a->heads_q != a->heads_kv * kG || a->tiles_per_split <= 0 || a->nsplit <= 0) {
     return hipErrorInvalidValue;
   }
-  hipLaunchKernelGGL(AttnPartialKernel,
-                     dim3(static_cast<unsigned>(a->nsplit), static_cast<unsigned>(a->heads_kv),
-                          static_cast<unsigned>(a->T)),
-                     dim3(kTile), 0, stream, *a);
+  const int hs = a->head_split <= 0 ? 1 : a->head_split;  // workgroups per kv head
+  if (kG % hs != 0) return hipErrorInvalidValue;
+  const dim3 grid(static_cast<unsigned>(a->nsplit), static_cast<unsigned>(a->heads_kv * hs), static_cast<unsigned>(a->T));
+  switch (kG / hs) {
+    case 12: hipLaunchKernelGGL(AttnPartialKernel<12>, grid, dim3(kTile), 0, stream, *a); break;
+    case 6: hipLaunchKernelGGL(AttnPartialKernel<6>, grid, dim3(kTile), 0, stream, *a); break;
+    case 4: hipLaunchKernelGGL(AttnPartialKernel<4>, grid, dim3(kTile), 0, stream, *a); break;
+    case 3: hipLaunchKernelGGL(AttnPartialKernel<3>, grid, dim3(kTile), 0, stream, *a); break;
+    case 2: hipLaunchKernelGGL(AttnPartialKernel<2>, grid, dim3(kTile), 0, stream, *a); break;
+    case 1: hipLaunchKernelGGL(AttnPartialKernel<1>, grid, dim3(kTile), 0, stream, *a); break;
+    default: return hipErrorInvalidValue;
+  }
   hipLaunchKernelGGL(AttnCombineKernel, dim3(static_cast<unsigned>(a->heads_q), static_cast<unsigned>(a->T)),
                      dim3(kHD), 0, stream, *a);
   return hipGetLastError();

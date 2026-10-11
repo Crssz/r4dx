@@ -5,7 +5,9 @@
 
 #include "r4dx/core/error.hpp"
 #include "r4dx/model/qwen4exp/common.h"
+#include "r4dx/model/qwen4exp/fuse_flags.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
+#include "r4dx/model/qwen4exp/hc_fused.h"
 #include "r4dx/model/qwen4exp/hc_kernels.h"
 
 namespace r4dx::model::qwen4exp {
@@ -51,6 +53,18 @@ void HyperConn::Prep(hipStream_t stream, core::Arena& arena, const uint16_t* h, 
   uint16_t* up = arena.Alloc<uint16_t>(static_cast<size_t>(rows * wide));
 
   Check(q4x_grouped_rmsnorm_bf16(h, w_.norm, n, rows, cfg_.hc, cfg_.hidden, cfg_.eps, stream), "hc norm");
+  // Decode (one row): the down GEMM + silu + inject GEMM + gate and the up GEMM + mix collapse into two launches
+  // (hc_fused.h; bit-identical, R4DX_Q4_FUSE_HC=0 switches it off).
+  if (rows == 1 && (FuseMask() & kFuseHc) != 0 && q4x_hc_fused_supported(cfg_.hc, cfg_.hidden, cfg_.lowrank) != 0 &&
+      w_.down->layout == Layout::kBf16 && w_.up->layout == Layout::kBf16 &&
+      (w_.inject == nullptr || w_.inject->layout == Layout::kBf16)) {
+    Check(q4x_hc_prep_gemm1_bf16(n, w_.down->bf16_w.data(), w_.inject != nullptr ? w_.inject->bf16_w.data() : nullptr, mid,
+                                 inj_out, cfg_.hc, cfg_.hidden, cfg_.lowrank, 1.0f / static_cast<float>(cfg_.hc), stream),
+          "hc fused down / inject");
+    Check(q4x_hc_prep_up_mix_bf16(mid, w_.up->bf16_w.data(), n, x_out, cfg_.hc, cfg_.hidden, cfg_.lowrank, stream),
+          "hc fused up / mix");
+    return;
+  }
   ApplyBf16Linear(stream, arena, *w_.down, n, mid, rows);
   Check(q4x_hc_silu_scaled_bf16(mid, mid, rows * cfg_.lowrank, 1.0f / static_cast<float>(cfg_.hc), stream),
         "hc silu");

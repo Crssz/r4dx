@@ -85,7 +85,9 @@ build\win-hip\src\server\r4dx-server.exe --model <container> --port 8080
 model id read from the container metadata. `--tokenizer-dir` is optional (see Requirements).
 
 Environment (read by `Qwen4ExpModel::Load` / `Reset`): `R4DX_Q4_DEVICES` (`a,b`, HIP ordinals of stage 0 / 1), `R4DX_Q4_SPLIT` (layer
-boundary), `R4DX_Q4_GDN_PREFILL=recurrent|chunked`, and `R4DX_Q4_PROFILE=1` (decode timing breakdown, see "Decode performance").
+boundary), `R4DX_Q4_GDN_PREFILL=recurrent|chunked`, `R4DX_Q4_PROFILE=1` (decode timing breakdown, see "Decode performance"), and the
+decode fusion switches `R4DX_Q4_FUSE_HC=0` / `R4DX_Q4_FUSE_QSA=0` (default on, bit-identical either way; re-read on every step, see
+"Decode kernel inventory and fusions").
 
 CPU tests for this surface (no GPU): `ctest -R "test_dialect|test_q4exp_dialect|test_q4exp_template"` in
 `build\win-hip` (dialect resolution from a synthetic container header, the Swift vs 27B chat-template byte comparison
@@ -283,6 +285,85 @@ and in the ~4 ms of per-step latency around the two host synchronizations, not i
 Run-to-run spread is larger than the effects above: the same binary measured 43-53 tok/s in a first session and 59-60 tok/s
 later (GPU clocks / what else uses the cards), so compare variants interleaved inside one process (and keep the first rep of a
 process out: it is ~5% slower).
+
+#### Decode kernel inventory and fusions (2026-10-12)
+
+**Method.** `rocprofv3` / `rocprof` are not in the Windows HIP SDK (`C:\opt\rocm\bin` has none). A hipEvent after every launch does not
+work either: it makes decode host-bound (~1900 launches x ~40 us, 77 ms/token attributed against 14 ms of real GPU time), so per-kernel
+event times were discarded. What does work is a **remove-one ablation in the production (graph) mode**: a throwaway build (kept out of the
+tree; `hipLaunchKernelGGL` redefined through a force-included header, labels set at every launch site) skips every launch of one label
+for the whole decode step; the tok/s difference is what that label costs inside the real pipeline (activations stale, so the tokens are
+garbage, timing is not). 3 reps x 128 steps per label after a warm-up rep, all variants interleaved in one process, 243-token prompt,
+both cards, graphs on, `R4DX_Q4_FUSE_HC` on (the build before the QSA change, with the route + sort pair still fused into one launch, see
+"Tried and reverted"). The costs
+add up to 13.9 ms of the 15.3 ms step (the rest is the ~3 ms of hand-off / sync latency outside the GPU spans, less the idle gaps no
+launch owns). Launches per token from a counting run: **1922** (about 1536 with the HC fusion below).
+
+| label | kernels | launches / token | ms / token | us / launch |
+|---|---|---:|---:|---:|
+| hc.gemm1 (down GEMM + silu, inject GEMM + gate; `HcPrepGemm1Kernel`) | fused, see below (unfused: 4 launches) | 97 | 1.49 | 15.4 |
+| moe.gate_up_gemv | `GroupedGemmTrellisM1Kernel<3 / 4, 2560, 1280>` | 48 | 1.45 | 30.2 |
+| hc.up_mix (up GEMM + mix; `HcPrepUpMixKernel`) | fused (unfused: 2 launches) | 97 | 1.30 | 13.4 |
+| gdn.in_proj_qkv | `TrellisInputKernel`, `r4d_gemm_trellis_nt_m64` | 72 | 0.90 | 12.5 |
+| gdn.core | `r4d_gdn_conv_update`, `r4d_gdn_recurrent_update` (gated norm inside) | 72 | 0.87 | 12.1 |
+| moe.down_gemv | `GroupedGemmTrellisM1Kernel<3 / 4, 640, 2560>` | 48 | 0.83 | 17.3 |
+| gdn.in_proj_z | `TrellisInputKernel`, trellis GEMM | 72 | 0.74 | 10.3 |
+| head.lm_head | `CastBf16ToF16Kernel`, `r4d_gemm_w4a16_nt_m64` | 2 | 0.73 | 367 |
+| hc.norm | `GroupedRmsNormKernel` | 97 | 0.73 | 7.6 |
+| qsa.core (4 kernels per QSA layer) | `PrepKernel`, `BlockKeyKernel`, `AttnPartialKernel`, `AttnCombineKernel` | 48 | 0.67 | 14.0 |
+| gdn.out_proj | `TrellisInputKernel`, trellis GEMM | 72 | 0.66 | 9.2 |
+| moe.route (+ sort) | `RouteKernel` (this row: the fused route + sort kernel) | 48 | 0.49 | 10.2 |
+| qsa.qg / qsa.o | `TrellisInputKernel`, trellis GEMM | 24 / 24 | 0.39 / 0.23 | 16.4 / 9.6 |
+| moe.shared_down / shared_up / router / shared_gate_proj | `r4d_gemm_bf16_nt_m64` | 48 each | 0.38 / 0.37 / 0.33 / 0.31 | 8.0 / 7.6 / 6.8 / 6.4 |
+| gdn.in_proj_ab | `r4d_gemm_bf16_nt_m64` x 2 | 72 | 0.16 | 2.2 |
+| ple (layer 1, once) | 5 launches | 5 | 0.14 | 27.5 |
+| moe.gate_up_in / combine / silu_down_in | `GroupedTrellisInputGateUpKernel`, `GroupedMoeDecodeCombineKernel`, `GroupedSiluMulTrellisInputDownKernel` | 48 each | 0.13 / 0.10 / 0.08 | 2.8 / 2.0 / 1.7 |
+| qsa.idx_qk / qsa.v / qsa.k, head.argmax, hc.inject, moe.shared_gate, moe.shared_silu_mul, head.mixer | | | <= 0.09 each | |
+
+The step is weight-stream bound almost everywhere: the big kernels move their weights at 345-485 GB/s (65-75% of the 640 GB/s peak),
+and 1.25 GB of the ~4 GB read per token are the bf16 hyper-connection `down` / `up` matrices (6.5 MB each, 97 times), which cannot shrink
+without leaving bf16 (not bit-exact). Removing a small kernel from a **graph** saves little (the HC fusion removed 388 launches for 0.1-0.2 ms, i.e. ~0.3-0.5 us each); the same removal in the eager QSA / PLE / head path saves 3-4 us. So fusing launches only helps where the fused kernel
+also does less serial latency or has more parallelism.
+
+**Kept (both bit-identical, default on, interleaved A/B, 8 reps x 128 steps, one process, 243-token prompt, token-id hash `52e9df5ff8b047da`
+identical in every variant and rep):**
+
+| variant | mean tok/s | min / max | ms/token |
+|---|---:|---|---:|
+| neither (`R4DX_Q4_FUSE_HC=0 R4DX_Q4_FUSE_QSA=0`) | 59.56 | 59.33 / 59.88 | 16.789 |
+| `R4DX_Q4_FUSE_HC` only | 60.20 | 59.60 / 60.36 | 16.611 (-0.178) |
+| `R4DX_Q4_FUSE_QSA` only | 60.41 | 60.00 / 60.51 | 16.555 (-0.234) |
+| both (default) | **61.01** | 60.84 / 61.13 | **16.390 (-0.399, +2.4%)** |
+
+(The same pair measured in other sessions: HC alone -0.108 ms, QSA alone -0.175 ms, both -0.397 ms against 15.47 ms; the absolute
+level drifts between sessions (15.2-16.8 ms/token for the same binary), the within-process differences did not.) Each alone is below
+the 0.3 ms bar set for a fusion, together they are above it and outside the min / max spread, so both stay.
+
+- **`R4DX_Q4_FUSE_HC`** (`hc_fused.hip`, used by `HyperConn::Prep` for one row): the 7 launches of a prep (norm, down GEMM, silu, up GEMM,
+  mix, inject GEMM, inject gate) become 3 (norm, `HcPrepGemm1Kernel`, `HcPrepUpMixKernel`), 388 launches per token fewer. The GEMMs keep
+  libr4d's exact accumulation: every output tile is the same WMMA chain over the same K slice as `r4d_gemm_bf16_nt_m64` (down: split-K 4
+  over 2560, inject: 16 over 640, up: 4 over 80), the splits are summed in ascending order from 0.f, and every bf16 rounding point (GEMM
+  output, silu input, sigmoid, product, mean) is kept, so the result is bit-identical to the unfused chain. What changes is the grid: the
+  down GEMM used 5 blocks and the inject GEMM 1 (now 20 + 1 in one launch), and the silu / gate / mix epilogues no longer round-trip
+  through memory. Shapes hc 4 x hidden 2560 x lowrank 320 only (`q4x_hc_fused_supported`); the prefill path and other shapes keep the
+  unfused chain.
+- **`R4DX_Q4_FUSE_QSA`** (`qsa_attn.hip`, decode only): `AttnPartialKernel` ran on `heads_kv` = 2 workgroups at short contexts (one 256-token
+  tile), i.e. two compute units, ~30 us. The twelve query heads of a kv head are now split over 4 workgroups (3 heads each,
+  `Q4QsaAttnArgs::head_split`; every head's arithmetic is independent and in the same order, so the output is bit-identical). Measured in
+  a graph of `QsaLayerCore::Forward(T = 1)`: 52 -> 24 us at 243 tokens, 55 -> 36 us at 2000, 92 -> 68 us at 2200 (sparse selection); the
+  attn_out hash was identical for split 1 / 2 / 3 / 4 / 6 / 12 and 4 was the best compromise over contexts. Prefill (T > 1) keeps the 12-head workgroups.
+
+**Tried and reverted:**
+- *Route + sort in one single-wave launch* (`RouteKernel` + `GroupedMoeDecodeSort`, the top-10 search done with wave reductions instead of
+  shuffle trees, NaN / inf rows through the old search; 576 / 576 test rows bit-identical): 14.4 -> 8.3 us in a graph micro-benchmark, but
+  15.242 vs 15.232 ms/token in the interleaved A/B (6 reps, same hash): no gain, removed.
+- The hipEvent per-launch trace (above) and an eager "launch it 4 more times" ablation: the latter reads 3-4 us per tiny launch because
+  the eager stream pays the dependent-launch gap that a graph hides (e.g. it predicted -1.5 ms for the HC fusion; the graph A/B gave
+  -0.1 to -0.2), so it was not used for decisions.
+
+Candidates left (each small or not bit-exact): `hc.norm` (0.73 ms, latency-bound at 4 blocks; merging it into `HcPrepGemm1Kernel` needs
+an in-kernel emulation of the 256-thread block reduction), the `gdn.core` recurrent update (0.87 ms, 48 workgroups, the gated norm
+forbids splitting a head), the grouped trellis GEMVs (2.3 ms at ~450 GB/s, near the bandwidth floor), and the ~3 ms of hand-off latency.
 
 #### Server smoke (`tools/qwen4exp/smoke.ps1`, port 8089)
 

@@ -35,6 +35,7 @@ q4exp_add_test(test_ngram_reader KERNELS)
 
 # Kernel tests on fixtures / random data (single device).
 q4exp_add_test(test_gpu_gdn_sigmoid KERNELS GPU SINGLE_DEVICE)
+q4exp_add_test(test_gpu_fuse_decode KERNELS GPU SINGLE_DEVICE)
 q4exp_add_test(test_gpu_hc KERNELS GPU SINGLE_DEVICE)
 q4exp_add_test(test_gpu_moe_block KERNELS GPU SINGLE_DEVICE)
 q4exp_add_test(test_gpu_moe_route KERNELS GPU SINGLE_DEVICE)

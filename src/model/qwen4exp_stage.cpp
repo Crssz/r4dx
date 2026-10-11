@@ -520,6 +520,9 @@ void Qwen4ExpStage::StoreResidual(uint16_t* host_rows, int64_t rows) {
   m.stream.Synchronize();
 }
 
+const uint16_t* Qwen4ExpStage::LastResidualDev() const {
+  return impl_->h.data();
+}
 // ---- the layers -----------------------------------------------------------------------------------------------------
 
 void Qwen4ExpStage::Impl::RunGdn(LayerRt& L, const Qwen4ExpChunk& c) {

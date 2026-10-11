@@ -196,7 +196,7 @@ class Qwen4ExpStage {
 
   // The residual [rows, hc * hidden] -> host (pinned preferred); synchronizes.
   void StoreResidual(uint16_t* host_rows, int64_t rows);
-
+  const uint16_t* LastResidualDev() const;
   // ---- the head (last stage): final mixer + lm_head on the LAST row of the chunk just run ----------------------------
   Qwen4ExpHeadResult Head(int64_t rows, const Qwen4ExpHeadRequest& request);
   // The fp32 logits row of the last kLogits / kSummary head call (the sampler's row-granular fallback), D2H.

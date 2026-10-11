@@ -42,7 +42,7 @@
 #include "r4dx/model/qwen4exp/ngram_ids.h"
 #include "r4dx/model/qwen4exp/ngram_reader.h"
 #include "r4dx/model/qwen4exp/ngram_sidecar.h"
-
+#include "r4dx/model/qwen4exp/qwen4exp_mtp.h"
 namespace r4dx::model {
 
 class Stage0Worker;
@@ -188,6 +188,8 @@ class Qwen4ExpModel {
   bool capture_active_ = false;
   Timings last_;
   std::vector<int32_t> context_tokens_;
+  std::unique_ptr<qwen4exp::Qwen4ExpMtp> mtp_;
+  core::DeviceBuffer<uint16_t> last_residual_dev_;
 };
 
 }  // namespace r4dx::model

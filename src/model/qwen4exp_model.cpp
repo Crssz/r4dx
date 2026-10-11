@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -385,6 +386,17 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
     m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hc_count * cfg.hidden_size));
     m.stage0_worker_ = std::make_unique<Stage0Worker>(m.stages_[0].get(), m.stages_[0]->Device());
   }
+  // Try loading MTP neural drafter if model_mtp.safetensors exists
+  {
+    std::filesystem::path cp(options.container_path);
+    std::filesystem::path mtp_p = cp.parent_path() / "model_mtp.safetensors";
+    if (!std::filesystem::exists(mtp_p)) {
+      mtp_p = "E:/models/r4dx/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ/model_mtp.safetensors";
+    }
+    if (std::filesystem::exists(mtp_p)) {
+      m.mtp_ = qwen4exp::Qwen4ExpMtp::Load(mtp_p.string(), m.cfg_, m.stages_.back()->Device(), m.stages_.back()->Stream());
+    }
+  }
 
   // ---- the n-gram table -------------------------------------------------------------------------------------------
   m.ple_enabled_ = !cfg.ple_layer_indices.empty();
@@ -656,10 +668,17 @@ std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpGreedy(int32_t token_id, int64_
   if (k <= 0) {
     return {DecodeStepGreedy(token_id)};
   }
-
-  // Look for draft candidates via n-gram suffix lookup in context_tokens_
+  // 1. Try neural MTP drafting first
   std::vector<int32_t> drafts;
-  if (!context_tokens_.empty()) {
+  if (mtp_ != nullptr) {
+    const uint16_t* h_seed = stages_.back()->LastResidualDev();
+    const uint16_t* embed_table = containers_.front()->EmbedTokensHost();
+    const QuantLinear& lm = containers_.back()->LmHead();
+    drafts = mtp_->Draft(token_id, h_seed, embed_table, lm, k, pos_);
+  }
+
+  // 2. Fall back to n-gram suffix lookup if neural MTP returned nothing
+  if (drafts.empty() && !context_tokens_.empty()) {
     std::vector<int32_t> search_ctx = context_tokens_;
     search_ctx.push_back(token_id);
     for (int gram_len = 3; gram_len >= 1; --gram_len) {

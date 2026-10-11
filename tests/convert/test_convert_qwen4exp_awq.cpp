@@ -33,6 +33,7 @@
 #include "awq_source.hpp"
 #include "nlohmann/json.hpp"
 #include "r4dx/core/dtype.hpp"
+#include "r4dx/models_root.h"
 #include "r4dx_convert/safetensors_reader.hpp"
 #include "r4dx_convert/tensor_codec.hpp"
 
@@ -452,7 +453,7 @@ void TestRefusals() {
 
 fs::path FixturesDir() {
   if (const char* e = std::getenv("R4DX_Q4EXP_FIXTURES")) return e;
-  return "E:/models/r4dx/q4exp-fixtures/ConvertQ4";
+  return r4dx::ModelsPath("r4dx/q4exp-fixtures/ConvertQ4");
 }
 
 void CompareToExpected(ShardedModel& model, r4dx_convert::SafetensorsReader& expected, const std::string& label) {
@@ -492,7 +493,7 @@ void TestPythonReference() {
     CompareToExpected(model, expected, "awq-mini (compressed-tensors' own packer)");
   }
   const fs::path spot = FixturesDir() / "real-spot";
-  const fs::path real = "E:/models/r4dx/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ";
+  const fs::path real = r4dx::ModelsPath("r4dx/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ");
   if (!fs::exists(spot / "expected_bf16.safetensors") || !fs::exists(real / "config.json")) {
     std::printf("SKIP: real-spot not generated or the real checkpoint is absent (convert_fixtures.py real-spot)\n");
   } else {

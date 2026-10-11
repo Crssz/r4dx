@@ -19,6 +19,7 @@
 #include "r4dx/core/stream.hpp"
 #include "r4dx/kernels/kernels.h"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
+#include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/hc_conn.h"
 #include "r4dx/model/qwen4exp/moe_block.h"
@@ -37,9 +38,43 @@ double MsSince(Clock::time_point t0) {
   return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
 
-[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("Qwen4ExpStage: " + msg); }
+constexpr const char* kCtx = "Qwen4ExpStage";
 
-size_t Padded(size_t bytes) { return (bytes + 15) & ~size_t{15}; }
+[[noreturn]] void Fail(const std::string& msg) { qwen4exp::Fail(kCtx, msg); }
+
+using qwen4exp::Padded;
+
+// The grouped decode MoE kernels (moe_trellis_decode.hip) are instantiated for one geometry only: hidden 2560, routed
+// and shared expert intermediate 640, <= 16 experts per token (s_ids[16], one lane each), <= 1024 experts (the route
+// kernel's LDS row), trellis bits 3 or 4 for both projections. Anything else takes the host-routed MoE.
+bool GroupedDecodeSupported(const Qwen4ExpConfig& cfg, const Qwen4ExpMoeTrellisPointers& p) {
+  const auto bits_ok = [](int b) { return b == 3 || b == 4; };
+  return p.gate_up_w != nullptr && p.gate_up_suh != nullptr && p.gate_up_svh != nullptr && p.down_w != nullptr &&
+         p.down_suh != nullptr && p.down_svh != nullptr && bits_ok(p.gate_up_bits) && bits_ok(p.down_bits) &&
+         cfg.hidden_size == 2560 && cfg.moe_intermediate_size == 640 && cfg.shared_expert_intermediate_size == 640 &&
+         cfg.num_experts_per_tok >= 1 && cfg.num_experts_per_tok <= 16 && cfg.num_experts <= 1024;
+}
+
+// Records `record()` into a HIP graph on `s` and instantiates it into *exec. False (nothing recorded, stream usable)
+// when capture cannot begin / end / instantiate. If `record` throws, the capture is ended and the partial graph
+// destroyed before the exception propagates, so the stream is never left in capture mode.
+template <class Record>
+bool CaptureDecodeGraph(hipStream_t s, hipGraphExec_t* exec, Record&& record) {
+  if (hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal) != hipSuccess) return false;
+  struct Guard {
+    hipStream_t stream;
+    bool capturing = true;
+    hipGraph_t graph = nullptr;
+    ~Guard() {
+      if (capturing) static_cast<void>(hipStreamEndCapture(stream, &graph));
+      if (graph != nullptr) static_cast<void>(hipGraphDestroy(graph));
+    }
+  } guard{s};
+  record();
+  guard.capturing = false;
+  if (hipStreamEndCapture(s, &guard.graph) != hipSuccess) return false;
+  return hipGraphInstantiate(exec, guard.graph, nullptr, nullptr, 0) == hipSuccess;
+}
 
 // A non-owning bf16 linear over a container tensor (ApplyLinear reads .data() / .size() only).
 QuantLinear BorrowedBf16Linear(const uint16_t* w, int64_t N, int64_t K, const char* what) {
@@ -88,6 +123,7 @@ struct LayerRt {
   // MoE
   qwen4exp::MoeWeights moe_w;
   const Qwen4ExpMoeRefs* moe_refs = nullptr;  // points into Impl::layer_refs
+  bool grouped = false;                       // decode MoE takes the grouped trellis path (GroupedDecodeSupported)
   // PLE
   std::unique_ptr<qwen4exp::PleLayer> ple;
   core::DeviceBuffer<uint16_t> ple_ckpt;
@@ -162,8 +198,12 @@ struct Qwen4ExpStage::Impl {
   core::DeviceBuffer<uint16_t> dmoe_shared_h;
   core::DeviceBuffer<uint16_t> dmoe_shared_y;
   core::DeviceBuffer<uint16_t> dmoe_shared_gate_logit;
+  // Split-group tickets of the grouped GEMVs: the kernels index them at expert * 10 (gate_up) / expert * 20 (down), so
+  // they are dedicated [experts * 10] / [experts * 20] arrays (not a slice of the Container's interleaved tickets).
+  core::DeviceBuffer<uint32_t> dmoe_tickets_gu, dmoe_tickets_down;
 
   void RunMoeGroupedDecode(LayerRt& L);
+  void RunMlpDecode(LayerRt& L);  // MLP-side Prep -> grouped MoE -> Inject for one decode token
 
   Qwen4ExpCaptureFn capture;
   double last_run_ms = 0, last_head_ms = 0, last_ple_wait_ms = 0;
@@ -356,6 +396,7 @@ Qwen4ExpStage::Qwen4ExpStage(const Qwen4ExpStageOptions& options, std::vector<Qw
     L->moe_w.shared_up_proj = e.shared_up_proj;
     L->moe_w.shared_down_proj = e.shared_down_proj;
     L->moe_refs = &e;
+    L->grouped = GroupedDecodeSupported(cfg, e.trellis_ptrs);
 
     // PLE
     if (r.ple.has_value() != cfg.IsPleLayer(r.index)) {
@@ -433,25 +474,33 @@ Qwen4ExpStage::Qwen4ExpStage(const Qwen4ExpStageOptions& options, std::vector<Qw
     m.positions = core::DeviceBuffer<int32_t>(static_cast<size_t>(R));
     m.positions_host = core::PinnedBuffer<int32_t>(static_cast<size_t>(R));
   }
-  // Grouped decode MoE buffers (M=1, zero CPU-GPU sync)
-  const size_t kTopK = static_cast<size_t>(cfg.num_experts_per_tok);
-  m.dmoe_logits = core::DeviceBuffer<uint16_t>(static_cast<size_t>(cfg.num_experts));
-  m.dmoe_ids = core::DeviceBuffer<int32_t>(kTopK);
-  m.dmoe_weights = core::DeviceBuffer<float>(kTopK);
-  m.dmoe_ids_sorted = core::DeviceBuffer<int32_t>(kTopK);
-  m.dmoe_weights_sorted = core::DeviceBuffer<float>(kTopK);
-  m.dmoe_a0_gu = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
-  m.dmoe_a1_gu = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
-  m.dmoe_gu = core::DeviceBuffer<uint16_t>(kTopK * 1280);
-  m.dmoe_ws_gu = core::DeviceBuffer<float>(kTopK * 5120);
-  m.dmoe_a0_down = core::DeviceBuffer<uint16_t>(kTopK * 640);
-  m.dmoe_yp = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
-  m.dmoe_ws_down = core::DeviceBuffer<float>(kTopK * 5120);
-  m.dmoe_shared_g = core::DeviceBuffer<uint16_t>(640);
-  m.dmoe_shared_u = core::DeviceBuffer<uint16_t>(640);
-  m.dmoe_shared_h = core::DeviceBuffer<uint16_t>(640);
-  m.dmoe_shared_y = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.hidden));
-  m.dmoe_shared_gate_logit = core::DeviceBuffer<uint16_t>(1);
+  // Grouped decode MoE buffers (M=1, zero CPU-GPU sync); only when some layer takes the grouped path
+  const bool any_grouped =
+      std::any_of(m.layers.begin(), m.layers.end(), [](const auto& lp) { return lp->grouped; });
+  if (any_grouped) {
+    const size_t kTopK = static_cast<size_t>(cfg.num_experts_per_tok);
+    m.dmoe_logits = core::DeviceBuffer<uint16_t>(static_cast<size_t>(cfg.num_experts));
+    m.dmoe_ids = core::DeviceBuffer<int32_t>(kTopK);
+    m.dmoe_weights = core::DeviceBuffer<float>(kTopK);
+    m.dmoe_ids_sorted = core::DeviceBuffer<int32_t>(kTopK);
+    m.dmoe_weights_sorted = core::DeviceBuffer<float>(kTopK);
+    m.dmoe_a0_gu = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
+    m.dmoe_a1_gu = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
+    m.dmoe_gu = core::DeviceBuffer<uint16_t>(kTopK * 1280);
+    m.dmoe_ws_gu = core::DeviceBuffer<float>(kTopK * 5120);
+    m.dmoe_a0_down = core::DeviceBuffer<uint16_t>(kTopK * 640);
+    m.dmoe_yp = core::DeviceBuffer<uint16_t>(kTopK * static_cast<size_t>(m.hidden));
+    m.dmoe_ws_down = core::DeviceBuffer<float>(kTopK * 5120);
+    m.dmoe_shared_g = core::DeviceBuffer<uint16_t>(640);
+    m.dmoe_shared_u = core::DeviceBuffer<uint16_t>(640);
+    m.dmoe_shared_h = core::DeviceBuffer<uint16_t>(640);
+    m.dmoe_shared_y = core::DeviceBuffer<uint16_t>(static_cast<size_t>(m.hidden));
+    m.dmoe_shared_gate_logit = core::DeviceBuffer<uint16_t>(1);
+    m.dmoe_tickets_gu = core::DeviceBuffer<uint32_t>(static_cast<size_t>(cfg.num_experts) * 10);
+    m.dmoe_tickets_down = core::DeviceBuffer<uint32_t>(static_cast<size_t>(cfg.num_experts) * 20);
+    m.dmoe_tickets_gu.Zero();
+    m.dmoe_tickets_down.Zero();
+  }
   // Prewarm GDN control cache so it never calls hipMalloc during stream capture
   m.control.Prewarm(std::min<int64_t>(m.opt.max_rows, 256), 0, 1);
 
@@ -571,63 +620,74 @@ void Qwen4ExpStage::Impl::RunMoeGroupedDecode(LayerRt& L) {
   qwen4exp::ApplyBf16Linear(s, arena, *L.moe_w.router, x.data(), dmoe_logits.data(), 1);
 
   // 2. Route kernel
-  q4x_moe_route_bf16(dmoe_logits.data(), dmoe_ids.data(), dmoe_weights.data(), nullptr, 1,
-                     static_cast<int>(cfg.num_experts), top_k, cfg.norm_topk_prob ? 1 : 0, s);
+  qwen4exp::Check(kCtx, q4x_moe_route_bf16(dmoe_logits.data(), dmoe_ids.data(), dmoe_weights.data(), nullptr, 1,
+                                           static_cast<int>(cfg.num_experts), top_k, cfg.norm_topk_prob ? 1 : 0, s),
+                  "grouped route");
 
   // 3. Shared expert GEMMs (asynchronous)
   qwen4exp::ApplyBf16Linear(s, arena, *L.moe_w.shared_gate_proj, x.data(), dmoe_shared_g.data(), 1);
   qwen4exp::ApplyBf16Linear(s, arena, *L.moe_w.shared_up_proj, x.data(), dmoe_shared_u.data(), 1);
-  q4x_moe_silu_mul_bf16(dmoe_shared_g.data(), dmoe_shared_u.data(), dmoe_shared_h.data(), 1, 640, 640, 640, s);
+  qwen4exp::Check(kCtx,
+                  q4x_moe_silu_mul_bf16(dmoe_shared_g.data(), dmoe_shared_u.data(), dmoe_shared_h.data(), 1, 640, 640,
+                                        640, s),
+                  "grouped shared silu_mul");
   qwen4exp::ApplyBf16Linear(s, arena, *L.moe_w.shared_down_proj, dmoe_shared_h.data(), dmoe_shared_y.data(), 1);
   qwen4exp::ApplyBf16Linear(s, arena, *L.moe_w.shared_gate, x.data(), dmoe_shared_gate_logit.data(), 1);
 
   // 4. Sort selected expert IDs on device
-  qwen4exp::GroupedMoeDecodeSort(dmoe_ids.data(), dmoe_weights.data(),
-                                 dmoe_ids_sorted.data(), dmoe_weights_sorted.data(),
-                                 top_k, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedMoeDecodeSort(dmoe_ids.data(), dmoe_weights.data(), dmoe_ids_sorted.data(),
+                                                 dmoe_weights_sorted.data(), top_k, s),
+                  "grouped sort");
 
   // 5. Input transform gate_up
-  qwen4exp::GroupedTrellisInputGateUp(x.data(), dmoe_ids_sorted.data(),
-                                     e.trellis_ptrs.gate_up_suh,
-                                     dmoe_a0_gu.data(), dmoe_a1_gu.data(),
-                                     top_k, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedTrellisInputGateUp(x.data(), dmoe_ids_sorted.data(), e.trellis_ptrs.gate_up_suh,
+                                                      dmoe_a0_gu.data(), dmoe_a1_gu.data(), top_k, s),
+                  "grouped gate_up input transform");
 
   // 6. GEMV gate_up
-  qwen4exp::GroupedTrellisGemvGateUp(e.trellis_ptrs.gate_up_bits,
-                                    dmoe_a0_gu.data(), dmoe_a1_gu.data(),
-                                    dmoe_ids_sorted.data(),
-                                    e.trellis_ptrs.gate_up_w,
-                                    e.trellis_ptrs.gate_up_svh,
-                                    dmoe_gu.data(), dmoe_ws_gu.data(),
-                                    e.expert_gate_up[0]->trellis_tickets,
-                                    top_k, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedTrellisGemvGateUp(e.trellis_ptrs.gate_up_bits, dmoe_a0_gu.data(), dmoe_a1_gu.data(),
+                                                     dmoe_ids_sorted.data(), e.trellis_ptrs.gate_up_w,
+                                                     e.trellis_ptrs.gate_up_svh, dmoe_gu.data(), dmoe_ws_gu.data(),
+                                                     dmoe_tickets_gu.data(), top_k, s),
+                  "grouped gate_up GEMV");
 
   // 7. Fused silu_mul + input transform down
-  qwen4exp::GroupedSiluMulTrellisInputDown(dmoe_gu.data(), dmoe_ids_sorted.data(),
-                                          e.trellis_ptrs.down_suh,
-                                          dmoe_a0_down.data(),
-                                          top_k, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedSiluMulTrellisInputDown(dmoe_gu.data(), dmoe_ids_sorted.data(),
+                                                           e.trellis_ptrs.down_suh, dmoe_a0_down.data(), top_k, s),
+                  "grouped silu_mul / down input transform");
 
   // 8. GEMV down
-  qwen4exp::GroupedTrellisGemvDown(e.trellis_ptrs.down_bits,
-                                  dmoe_a0_down.data(),
-                                  dmoe_ids_sorted.data(),
-                                  e.trellis_ptrs.down_w,
-                                  e.trellis_ptrs.down_svh,
-                                  dmoe_yp.data(), dmoe_ws_down.data(),
-                                  e.expert_down[0]->trellis_tickets,
-                                  top_k, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedTrellisGemvDown(e.trellis_ptrs.down_bits, dmoe_a0_down.data(),
+                                                   dmoe_ids_sorted.data(), e.trellis_ptrs.down_w,
+                                                   e.trellis_ptrs.down_svh, dmoe_yp.data(), dmoe_ws_down.data(),
+                                                   dmoe_tickets_down.data(), top_k, s),
+                  "grouped down GEMV");
 
   // 9. Combine
-  qwen4exp::GroupedMoeDecodeCombine(dmoe_yp.data(), dmoe_weights_sorted.data(),
-                                   dmoe_shared_y.data(), dmoe_shared_gate_logit.data(),
-                                   blk.data(), top_k, hidden_dim, s);
+  qwen4exp::Check(kCtx,
+                  qwen4exp::GroupedMoeDecodeCombine(dmoe_yp.data(), dmoe_weights_sorted.data(), dmoe_shared_y.data(),
+                                                    dmoe_shared_gate_logit.data(), blk.data(), top_k, hidden_dim, s),
+                  "grouped combine");
+}
+
+void Qwen4ExpStage::Impl::RunMlpDecode(LayerRt& L) {
+  const hipStream_t s = stream.get();
+  L.hc_mlp->Prep(s, arena, h.data(), 1, x.data(), inj.data());
+  arena.Reset();
+  RunMoeGroupedDecode(L);
+  arena.Reset();
+  L.hc_mlp->Inject(s, h.data(), blk.data(), inj.data(), 1, h.data());
 }
 
 void Qwen4ExpStage::Impl::RunMoe(LayerRt& L, const Qwen4ExpChunk& c) {
   const hipStream_t s = stream.get();
   const Qwen4ExpMoeRefs& e = *L.moe_refs;
-  if (c.rows == 1 && e.trellis_ptrs.gate_up_w != nullptr && !capture) {
+  if (c.rows == 1 && L.grouped && !capture) {
     RunMoeGroupedDecode(L);
     return;
   }
@@ -688,35 +748,21 @@ void Qwen4ExpStage::RunLayers(const Qwen4ExpChunk& c) {
       m.CapBf16(L.index, "residual_ple", m.h.data(), T, m.wide, c.first_pos);
     }
 
-    const Qwen4ExpMoeRefs& e = *L.moe_refs;
-
     // Steady-state decode fast path for GDN layers: capture & launch full layer graph
-    if (is_decode && !L.ple && !L.qsa && e.trellis_ptrs.gate_up_w != nullptr) {
-      if (L.decode_graph_exec != nullptr) {
-        R4DX_HIP_CHECK(hipGraphLaunch(L.decode_graph_exec, s));
-        continue;
-      }
-      if (m.decode_steps_seen > 1) {
-        hipGraph_t g = nullptr;
-        if (hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal) == hipSuccess) {
+    if (is_decode && !L.ple && !L.qsa && L.grouped) {
+      if (L.decode_graph_exec == nullptr && m.decode_steps_seen > 1) {
+        CaptureDecodeGraph(s, &L.decode_graph_exec, [&] {
           L.hc_attn->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
           m.arena.Reset();
           m.RunGdn(L, c);
           m.arena.Reset();
           L.hc_attn->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
-          L.hc_mlp->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
-          m.arena.Reset();
-          m.RunMoeGroupedDecode(L);
-          m.arena.Reset();
-          L.hc_mlp->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
-          if (hipStreamEndCapture(s, &g) == hipSuccess &&
-              hipGraphInstantiate(&L.decode_graph_exec, g, nullptr, nullptr, 0) == hipSuccess) {
-            (void)hipGraphDestroy(g);
-            R4DX_HIP_CHECK(hipGraphLaunch(L.decode_graph_exec, s));
-            continue;
-          }
-          if (g) (void)hipGraphDestroy(g);
-        }
+          m.RunMlpDecode(L);
+        });
+      }
+      if (L.decode_graph_exec != nullptr) {
+        R4DX_HIP_CHECK(hipGraphLaunch(L.decode_graph_exec, s));
+        continue;
       }
     }
 
@@ -736,42 +782,14 @@ void Qwen4ExpStage::RunLayers(const Qwen4ExpChunk& c) {
     m.CapBf16(L.index, "residual_attn", m.h.data(), T, m.wide, c.first_pos);
 
     // ---- MoE block ----
-    if (is_decode && e.trellis_ptrs.gate_up_w != nullptr) {
+    if (is_decode && L.grouped) {
+      if (L.moe_graph_exec == nullptr && m.decode_steps_seen > 1) {
+        CaptureDecodeGraph(s, &L.moe_graph_exec, [&] { m.RunMlpDecode(L); });
+      }
       if (L.moe_graph_exec != nullptr) {
         R4DX_HIP_CHECK(hipGraphLaunch(L.moe_graph_exec, s));
-      } else if (m.decode_steps_seen > 1) {
-        hipGraph_t g = nullptr;
-        if (hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal) == hipSuccess) {
-          L.hc_mlp->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
-          m.arena.Reset();
-          m.RunMoeGroupedDecode(L);
-          m.arena.Reset();
-          L.hc_mlp->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
-          if (hipStreamEndCapture(s, &g) == hipSuccess &&
-              hipGraphInstantiate(&L.moe_graph_exec, g, nullptr, nullptr, 0) == hipSuccess) {
-            (void)hipGraphDestroy(g);
-            R4DX_HIP_CHECK(hipGraphLaunch(L.moe_graph_exec, s));
-          } else {
-            if (g) (void)hipGraphDestroy(g);
-            L.hc_mlp->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
-            m.arena.Reset();
-            m.RunMoeGroupedDecode(L);
-            m.arena.Reset();
-            L.hc_mlp->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
-          }
-        } else {
-          L.hc_mlp->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
-          m.arena.Reset();
-          m.RunMoeGroupedDecode(L);
-          m.arena.Reset();
-          L.hc_mlp->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
-        }
       } else {
-        L.hc_mlp->Prep(s, m.arena, m.h.data(), 1, m.x.data(), m.inj.data());
-        m.arena.Reset();
-        m.RunMoeGroupedDecode(L);
-        m.arena.Reset();
-        L.hc_mlp->Inject(s, m.h.data(), m.blk.data(), m.inj.data(), 1, m.h.data());
+        m.RunMlpDecode(L);
       }
     } else {
       L.hc_mlp->Prep(s, m.arena, m.h.data(), T, m.x.data(), m.inj.data());
@@ -890,6 +908,9 @@ void Qwen4ExpStage::Reset() {
     if (L.ple) L.ple->Reset(s);
     if (L.qsa_core) L.qsa_core->Reset();
   }
+  // a grouped GEMV that did not complete (device fault) can leave its split-group tickets non-zero
+  m.dmoe_tickets_gu.ZeroAsync(m.stream);
+  m.dmoe_tickets_down.ZeroAsync(m.stream);
   m.stream.Synchronize();
   m.arena.Reset();
   m.expert_arena.Reset();

@@ -1,6 +1,6 @@
 // Shared helpers of the test_model_q4exp_*.cpp tests (Qwen4ExpModel on the tiny container): fixture paths, the HF golden
-// reader, a capture store for Qwen4ExpModel::SetCapture, bf16 error statistics and the model loader. Header only; the
-// glob of tests/model/qwen4exp/CMakeLists.txt matches test_*.cpp only.
+// reader, a capture store for Qwen4ExpModel::SetCapture, bf16 error statistics and the model loader. Header only (not a test
+// target of tests/model/qwen4exp/CMakeLists.txt).
 //
 // Fixtures (exit code 77 = skip when one is missing):
 //   R4DX_Q4EXP_TINY_DIR   default E:\models\r4dx\tiny-q4exp: container-bf16.r4dx, container-w4a16.r4dx, sidecar.r4dx-ngram,
@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "qwen4exp_model.h"
+#include "r4dx/models_root.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 
@@ -42,7 +43,7 @@ constexpr int kSkip = 77;
 
 inline std::string TinyDir() {
   const char* e = std::getenv("R4DX_Q4EXP_TINY_DIR");
-  return e != nullptr && e[0] != 0 ? e : "E:\\models\\r4dx\\tiny-q4exp";
+  return e != nullptr && e[0] != 0 ? e : r4dx::ModelsPath("r4dx/tiny-q4exp");
 }
 inline std::string ContainerPath(const std::string& layout) { return TinyDir() + "\\container-" + layout + ".r4dx"; }
 inline std::string GoldenPath(int T) { return TinyDir() + "\\golden\\T" + std::to_string(T) + ".recent.safetensors"; }

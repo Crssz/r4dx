@@ -173,10 +173,17 @@ int RunTest() {
     std::printf("  decode (mean of 30): total %.2f ms = stage0 %.2f + hand-off %.3f + stage1 %.2f + head %.2f\n", got.decode_ms / 30.0,
                 got.decode_stage0_ms / 30.0, got.decode_handoff_ms / 30.0, got.decode_stage1_ms / 30.0, got.decode_head_ms / 30.0);
   }
-  if (not_run > 0) {
-    std::printf("\n(%d real two-device variant(s) not run: only %d HIP device visible; run with HIP_VISIBLE_DEVICES unset)\n",
-                not_run, visible);
+  if (g_failures != 0) {
+    std::printf("\nFAIL (%d failure(s))\n", g_failures);
+    return 1;
   }
-  std::printf("\n%s (%d failure(s))\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
-  return g_failures == 0 ? 0 : 1;
+  if (not_run > 0) {
+    // The single-device variants passed, but the real two-device variants are what this test is for: report SKIPPED, not PASS.
+    std::printf("\nSKIP: %d real two-device variant(s) not run: only %d HIP device visible (the single-device variants passed); run "
+                "with two devices visible (HIP_VISIBLE_DEVICES unset)\n",
+                not_run, visible);
+    return kSkip;
+  }
+  std::printf("\nPASS (0 failure(s))\n");
+  return 0;
 }

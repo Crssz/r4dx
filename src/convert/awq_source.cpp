@@ -197,6 +197,9 @@ const uint8_t* AwqOverlay::DataRows(const std::string& name, int64_t row0, int64
                                     std::vector<uint8_t>& scratch) const {
   std::string base;
   const Linear& l = Find(name, &base);
+  if (row0 < 0 || nrows < 0 || row0 > l.N || nrows > l.N - row0)
+    throw std::invalid_argument("awq::DataRows: '" + name + "' rows [" + std::to_string(row0) + ", +" +
+                                std::to_string(nrows) + ") outside N=" + std::to_string(l.N));
   scratch.resize(static_cast<size_t>(nrows) * static_cast<size_t>(l.K) * 2);
   Dequant(base, l, row0, nrows, scratch.data());
   return scratch.data();

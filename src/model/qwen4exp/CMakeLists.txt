@@ -69,6 +69,6 @@ target_include_directories(r4dx_model_qwen4exp_kernels PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/include"
   "${CMAKE_CURRENT_SOURCE_DIR}/../../convert/include"
 )
-# (Qwen4ExpConfig); not r4dx_model.
+# Links r4dx_model_arch (Qwen4ExpConfig) rather than r4dx_model.
 target_link_libraries(r4dx_model_qwen4exp_kernels PUBLIC
   r4dx_core r4dx_kernels r4d_core r4dx_model_linear r4dx_model_arch r4dx_model_attention)

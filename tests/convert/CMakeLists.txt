@@ -158,6 +158,13 @@ add_executable(convert_sharded_single_file test_sharded_single_file.cpp)
 target_link_libraries(convert_sharded_single_file PRIVATE r4dx_convert)
 add_test(NAME convert_sharded_single_file COMMAND convert_sharded_single_file)
 
+# SafetensorsReader hardening (safetensors_reader.hpp): a header length / data_offsets end near 2^64 and a negative shape
+# dimension are refused with runtime_error (no wrap-around, no read off the mapping), and a throwing open releases its
+# handles. Writes tiny hand-built shards into a temp dir. CPU-only.
+add_executable(convert_safetensors_reader test_safetensors_reader.cpp)
+target_link_libraries(convert_safetensors_reader PRIVATE r4dx_convert)
+add_test(NAME convert_safetensors_reader COMMAND convert_safetensors_reader)
+
 # bf16 linear-weight layout (task item 2: --layouts bf16 for all linear weights): plain row-major
 # on-disk bytes, no WMMA-fragment permutation, plan/emit byte-size agreement.
 add_executable(convert_bf16_layout test_bf16_layout.cpp)

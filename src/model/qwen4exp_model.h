@@ -3,8 +3,8 @@
 //
 // Two Qwen4ExpStage objects (qwen4exp_stage.h): stage 0 holds layers [0, k) -- the host embedding gather, the n-gram rows
 // and the PLE layer are driven from here -- and stage 1 layers [k, L), the final mixer and the lm_head. k comes from the
-// loader's ChooseSplit (bytes balanced per card) unless asked for. The two are driven in sequence: stage 0 runs a
-// chunk on the Stage0Worker thread (the caller waits), its residual [rows, 4 * hidden] bf16 goes through pinned host memory (D2H on stage 0's
+// loader's ChooseSplit (bytes balanced per card) unless asked for. The two are driven in sequence on the calling thread:
+// stage 0 runs a chunk, its residual [rows, 4 * hidden] bf16 goes through pinned host memory (D2H on stage 0's
 // stream, synchronize, H2D on stage 1's), stage 1 runs it. When both stages sit on one device and no split was asked for
 // there is a single stage with everything. The hand-off copies bytes, so a two-stage run equals the one-stage run bit for
 // bit.
@@ -20,9 +20,8 @@
 // the checkpoint copies the GDN + PLE state and the n-gram history, and a restore rewinds the position and the QSA
 // bookkeeping (KV and block keys beyond the position are overwritten before they are read).
 //
-// Not thread-safe; callers must serialize. Internally stage 0 runs on a worker thread (Stage0Worker) while the caller
-// blocks until it is done, so a worker failure is rethrown on the calling thread. After an exception out of Prefill /
-// Decode*, call Reset().
+// Not thread-safe; callers must serialize. Both stages are driven in sequence on the calling thread. After an exception
+// out of Prefill / Decode*, call Reset().
 #pragma once
 
 #include <cstdint>
@@ -46,7 +45,6 @@
 #include "r4dx/model/qwen4exp/ngram_sidecar.h"
 namespace r4dx::model {
 
-class Stage0Worker;
 struct Qwen4ExpModelOptions {
   std::string container_path;
   // Body layout (GDN / QSA / expert linears): the container's own -- trellis for a trellis container, bf16 or w4a16 for
@@ -160,7 +158,6 @@ class Qwen4ExpModel {
   // Declaration order is destruction order reversed: the stages (which borrow the containers' weights) go first.
   std::vector<std::unique_ptr<Qwen4ExpContainer>> containers_;
   std::vector<std::unique_ptr<Qwen4ExpStage>> stages_;
-  std::unique_ptr<Stage0Worker> stage0_worker_;
   // n-gram path
   bool ple_enabled_ = false;
   bool gdn_recurrent_ = false;

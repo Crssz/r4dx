@@ -6,7 +6,7 @@
 // Assertions:
 //   1. Both paths produce identical or nearly identical outputs (max err < 0.005, <= 1-2 bf16 ulps).
 //   2. Output argmax is identical.
-//   3. Benchmarks latency and prints speedup.
+//   3. Benchmarks latency and prints speedup (only with R4DX_BENCH=1).
 
 #include <hip/hip_runtime.h>
 #include <chrono>
@@ -25,6 +25,7 @@
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/moe_kernels.h"
 #include "r4dx/model/qwen4exp/moe_trellis_grouped.h"
+#include "r4dx/models_root.h"
 #include "qwen4exp_container.h"
 #include "qwen4exp_weights.h"
 
@@ -50,10 +51,17 @@ uint16_t FloatToBf16(float f) {
 
 int main() {
 try {
-  const std::string path = "E:\\models\\r4dx\\swift15-flash-next-trellis-mix.r4dx";
+  const std::string path = r4dx::ModelsPath("r4dx/swift15-flash-next-trellis-mix.r4dx");
   if (!std::filesystem::exists(path)) {
     std::printf("[SKIP] container %s not found\n", path.c_str());
     return 77;
+  }
+  {
+    int n_devices = 0;
+    if (hipGetDeviceCount(&n_devices) != hipSuccess || n_devices < 1) {
+      std::printf("[SKIP] no HIP device\n");
+      return 77;
+    }
   }
 
   int device = 0;
@@ -113,7 +121,7 @@ try {
   r4dx::core::DeviceBuffer<int32_t> d_ids(top_k);
   r4dx::core::DeviceBuffer<float> d_weights(top_k);
   r4dx::core::DeviceBuffer<int32_t> d_counts(experts);
-  hipMemsetAsync(d_counts.data(), 0, experts * sizeof(int32_t), stream);
+  CheckHip(hipMemsetAsync(d_counts.data(), 0, experts * sizeof(int32_t), stream), "hipMemsetAsync d_counts");
   std::vector<int32_t> h_ids(top_k);
   std::vector<float> h_weights(top_k);
   std::vector<int> h_slots(top_k);
@@ -304,6 +312,14 @@ try {
     return 1;
   }
   std::printf("PASS: Output matches sequential reference within tolerance!\n");
+  // The benchmark (3 x 100 launches plus a HIP graph capture) only runs on request: ctest checks correctness only.
+  {
+    const char* bench = std::getenv("R4DX_BENCH");
+    if (bench == nullptr || std::string(bench) != "1") {
+      std::printf("(benchmark skipped; set R4DX_BENCH=1 to run it)\n");
+      return 0;
+    }
+  }
   // Benchmark with HIP Graph
   hipGraph_t graph = nullptr;
   hipGraphExec_t graph_exec = nullptr;

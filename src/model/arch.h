@@ -2,8 +2,8 @@
 // (docs/gemma4-plan.md 3.2, task M1-1 / M1-24; docs/qwen4exp-plan.md 4.1, task M1-1).
 //
 // LoadTextModel (tp_model.cpp) calls DetectArch(container_path) before it builds anything: kQwen35
-// goes down the unchanged Model / TpModel branches, kGemma4 to LoadGemmaTextModel, kQwen4Exp is
-// refused until its loader lands (docs/qwen4exp-plan.md M1-3). The enum is also
+// goes down the unchanged Model / TpModel branches, kGemma4 to LoadGemmaTextModel, kQwen4Exp to
+// LoadQwen4ExpTextModel (docs/qwen4exp-plan.md M1-16). The enum is also
 // carried on ModelConfig::arch (model_config.h), so a TextModel's Config() tells the server which
 // family it loaded (server dialect cross-check, CheckDialectAgainstArch).
 //
@@ -57,6 +57,12 @@ Arch DetectArch(const std::string& container_path);
 // `container_path`'s `__metadata__` object (the safetensors-shell header only, never a tensor), or a
 // null json when the file cannot be opened / is not a shell / has no `__metadata__`.
 nlohmann::json ReadContainerMetadata(const std::string& container_path);
+
+// True for a qwen4_exp container whose `__metadata__` carries a `quant.trellis` payload: such a container runs the
+// trellis layout when no --layout was given (docs/qwen4exp.md "Run"). r4dx-cli and r4dx-server apply it only when
+// --layout was not given; every other arch (and a qwen4_exp container without the payload) is false. Throws what
+// DetectArchFromMetadata throws for an unknown `model_arch`.
+bool Qwen4ExpDefaultsToTrellis(const std::string& container_path);
 
 // The `max_ctx` a run on `container_path` gets (docs/gemma4-plan.md section 9.1, task M1-14), shared by
 // r4dx-cli and r4dx-server so the two cannot drift:

@@ -409,29 +409,32 @@ namespace r4dx {
 namespace model {
 namespace qwen4exp {
 
-void GroupedMoeDecodeSort(const int32_t* ids_in, const float* weights_in,
-                          int32_t* ids_sorted_out, float* weights_sorted_out,
-                          int top_k, void* stream) {
-  if (top_k <= 0) return;
+hipError_t GroupedMoeDecodeSort(const int32_t* ids_in, const float* weights_in,
+                                int32_t* ids_sorted_out, float* weights_sorted_out,
+                                int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
+  if (top_k > 16) return hipErrorInvalidValue;  // s_ids[16] / one lane per selected expert
   hipLaunchKernelGGL(GroupedMoeDecodeSortKernel, dim3(1), dim3(32), 0, static_cast<hipStream_t>(stream),
                      ids_in, weights_in, ids_sorted_out, weights_sorted_out, top_k);
+  return hipGetLastError();
 }
 
-void GroupedTrellisInputGateUp(const uint16_t* x, const int32_t* ids_sorted,
-                              const float* all_suh, uint16_t* out_a0, uint16_t* out_a1,
-                              int top_k, void* stream) {
-  if (top_k <= 0) return;
+hipError_t GroupedTrellisInputGateUp(const uint16_t* x, const int32_t* ids_sorted,
+                                     const float* all_suh, uint16_t* out_a0, uint16_t* out_a1,
+                                     int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
   const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
   hipLaunchKernelGGL(GroupedTrellisInputGateUpKernel, dim3(20, static_cast<unsigned>(top_k)), dim3(32), 0,
                      static_cast<hipStream_t>(stream), x, ids_sorted, all_suh, out_a0, out_a1, scale);
+  return hipGetLastError();
 }
 
-void GroupedTrellisGemvGateUp(int kb, const uint16_t* in_a0, const uint16_t* in_a1,
-                             const int32_t* ids_sorted,
-                             const uint32_t* all_w, const float* all_svh,
-                             uint16_t* out_c, float* ws, unsigned* all_tickets,
-                             int top_k, void* stream) {
-  if (top_k <= 0) return;
+hipError_t GroupedTrellisGemvGateUp(int kb, const uint16_t* in_a0, const uint16_t* in_a1,
+                                    const int32_t* ids_sorted,
+                                    const uint32_t* all_w, const float* all_svh,
+                                    uint16_t* out_c, float* ws, unsigned* all_tickets,
+                                    int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
   const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
   const size_t smem = 2 * 128 * 8 * sizeof(float);
   const dim3 grid(10, 4, static_cast<unsigned>(top_k));
@@ -457,25 +460,27 @@ void GroupedTrellisGemvGateUp(int kb, const uint16_t* in_a0, const uint16_t* in_
                        (const unsigned short*)in_a0, (const unsigned short*)in_a1,
                        all_w, all_svh, ids_sorted, out_c, ws, all_tickets, out_scale);
   } else {
-    throw std::runtime_error("GroupedTrellisGemvGateUp: unsupported KB " + std::to_string(kb));
+    return hipErrorInvalidValue;  // only 3 / 4 bit trellis is instantiated
   }
+  return hipGetLastError();
 }
 
-void GroupedSiluMulTrellisInputDown(const uint16_t* gu, const int32_t* ids_sorted,
-                                   const float* all_suh_down, uint16_t* out_a0,
-                                   int top_k, void* stream) {
-  if (top_k <= 0) return;
+hipError_t GroupedSiluMulTrellisInputDown(const uint16_t* gu, const int32_t* ids_sorted,
+                                          const float* all_suh_down, uint16_t* out_a0,
+                                          int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
   const float scale = static_cast<float>(1.0 / std::sqrt(128.0));
   hipLaunchKernelGGL(GroupedSiluMulTrellisInputDownKernel, dim3(5, static_cast<unsigned>(top_k)), dim3(32), 0,
                      static_cast<hipStream_t>(stream), gu, ids_sorted, all_suh_down, out_a0, scale);
+  return hipGetLastError();
 }
 
-void GroupedTrellisGemvDown(int kb, const uint16_t* in_a0,
-                           const int32_t* ids_sorted,
-                           const uint32_t* all_w_down, const float* all_svh_down,
-                           uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
-                           int top_k, void* stream) {
-  if (top_k <= 0) return;
+hipError_t GroupedTrellisGemvDown(int kb, const uint16_t* in_a0,
+                                  const int32_t* ids_sorted,
+                                  const uint32_t* all_w_down, const float* all_svh_down,
+                                  uint16_t* out_yp, float* ws, unsigned* all_tickets_down,
+                                  int top_k, void* stream) {
+  if (top_k <= 0) return hipSuccess;
   const float out_scale = static_cast<float>(1.0 / std::sqrt(128.0));
   const size_t smem = 2 * 128 * 8 * sizeof(float);
   const dim3 grid(20, 2, static_cast<unsigned>(top_k));
@@ -501,17 +506,19 @@ void GroupedTrellisGemvDown(int kb, const uint16_t* in_a0,
                        (const unsigned short*)in_a0, nullptr,
                        all_w_down, all_svh_down, ids_sorted, out_yp, ws, all_tickets_down, out_scale);
   } else {
-    throw std::runtime_error("GroupedTrellisGemvDown: unsupported KB " + std::to_string(kb));
+    return hipErrorInvalidValue;  // only 3 / 4 bit trellis is instantiated
   }
+  return hipGetLastError();
 }
 
-void GroupedMoeDecodeCombine(const uint16_t* yp, const float* weights_sorted,
-                            const uint16_t* shared_y, const uint16_t* shared_gate_logit,
-                            uint16_t* out, int top_k, int hidden, void* stream) {
-  if (top_k <= 0 || hidden <= 0) return;
+hipError_t GroupedMoeDecodeCombine(const uint16_t* yp, const float* weights_sorted,
+                                   const uint16_t* shared_y, const uint16_t* shared_gate_logit,
+                                   uint16_t* out, int top_k, int hidden, void* stream) {
+  if (top_k <= 0 || hidden <= 0) return hipSuccess;
   const unsigned blocks = static_cast<unsigned>((hidden + 255) / 256);
   hipLaunchKernelGGL(GroupedMoeDecodeCombineKernel, dim3(blocks), dim3(256), 0, static_cast<hipStream_t>(stream),
                      yp, weights_sorted, shared_y, shared_gate_logit, out, top_k, hidden);
+  return hipGetLastError();
 }
 
 }  // namespace qwen4exp

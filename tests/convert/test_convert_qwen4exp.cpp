@@ -33,6 +33,7 @@
 #include "awq_source.hpp"
 #include "nlohmann/json.hpp"
 #include "r4dx/core/dtype.hpp"
+#include "r4dx/models_root.h"
 #include "r4dx_convert/safetensors_reader.hpp"
 
 namespace fs = std::filesystem;
@@ -66,12 +67,12 @@ void WriteWhole(const fs::path& p, const std::string& bytes) {
 
 fs::path FixturesDir() {
   if (const char* e = std::getenv("R4DX_Q4EXP_FIXTURES")) return e;
-  return "E:/models/r4dx/q4exp-fixtures/ConvertQ4";
+  return r4dx::ModelsPath("r4dx/q4exp-fixtures/ConvertQ4");
 }
 
 fs::path TinyDir() {
   if (const char* e = std::getenv("R4DX_TINY_Q4EXP")) return e;
-  return "E:/models/r4dx/tiny-q4exp";
+  return r4dx::ModelsPath("r4dx/tiny-q4exp");
 }
 
 #if defined(R4DX_CONVERT_EXE)

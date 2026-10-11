@@ -43,7 +43,7 @@ Every GPU step is a command handed to the user.
 | Q18 | Disk | Everything under `E:\models\r4dx` (565 GiB free on 2026-10-10). |
 | Q20 | Card roles | Bytes-balanced layer boundary. Device 0: embedding gather, n-gram reads, PLE, first layers. Device 1: last layers, final mixer, lm_head, sampling. |
 | Q21 | Tracking | This document only; no GitHub issues. |
-| Q22 | Validated context | KL gate on the canon corpus plus teacher-forced probes at 8k and 32k. Longer contexts run but are unvalidated in milestone 1. |
+| Q22 | Validated context | KL gate on the canon corpus plus teacher-forced probes at 8k and 32k. Longer contexts run but are unvalidated in milestone 1. **Status 2026-10-11: not met.** Canon and the 8k probe are measured and miss both gates (see M1-21); the 32k probe is not run, so no context is validated yet. |
 | Q23 | QSA ties | Ties at the top-k cut are frequent (a block whose 4 head dot products are all <= 0 scores exactly 0; M0-6 saw 125 tied queries of 3000), and CPU `torch.topk` picks among them in an implementation-defined order. r4dx and the gate reference both break ties by a fixed rule: prefer the most recent blocks. KL between HF's own torch choice and the rule is measured and reported next to the gate as a noise floor. |
 
 ## 2. Architecture facts
@@ -352,12 +352,12 @@ HF reference work runs on device 1 only (`$env:HIP_VISIBLE_DEVICES = '1'`).
 | M1-16..18 | done on tiny + real prefix | `Qwen4ExpModel`/`LocalTextModel`; layer-isolated golden tests pass for both GDN prefill modes; prefill/decode/chunk-split/checkpoint bit-identical; two-device split bit-identical to single device (crash found and fixed: stream created before `hipSetDevice`). |
 | M1-10..14 | done | Full 48-layer quantization completed in ~25.4 h GPU time. Container written to `E:\models\r4dx\swift15-flash-next-trellis-mix.r4dx` (56.47 GB, 51.83 GiB weights split k=26: 25.92 GiB on dev 0, 25.91 GiB on dev 1). |
 | M1-19..20 | done | Dialect, CLI, server flags and docs in place. |
-| M1-21 | done | KL gate evaluated: mean KL 0.0578 vs bf16 ref (top-1 89.44%) and 0.0590 vs fp32 truth (top-1 89.42%) on canon; 0.0500 / 91.71% on 8k probe. |
+| M1-21 | **blocked: gate not met** | Measured on the 4 canon segments (4092 rows), trellis mix container: mean KL 0.0578 vs the bf16 ref (top-1 89.44%) and 0.0590 vs the fp32 truth (top-1 89.42%) on canon; probe_8k 0.0500 / 91.71% (vs bf16 ref), 0.0483 / 92.05% (vs fp32 truth). Gate A (KL <= 0.02, top-1 >= 93%) is missed; gate B (noise-relative, canon ALL <= 0.0261, top-1 >= 94.23%) is missed too. The probe_32k run is **not done** (no 32k number exists). Plan 3.1 says to stop and ask when the sweep cannot reach the gate inside the cap: awaiting the user's decision on which gate binds (or whether to change the quantization budget); the cap was not raised. |
 | M1-22 | done | Server smoke test passed (37/37 checks: health, models, chat, thinking low/med/xhigh, stream SSE, tools, multi-turn prefix reuse, ~20k needle at 459 tok/s, max-ctx 400, clean shutdown). |
 | M1-23 | done | Non-regression passed: 184 pass, 25 skip, 0 fail; existing Qwen/Gemma code proven byte-identical. |
 Findings that changed the plan during implementation:
 - **libr4d `r4d_gdn_chunk_scan` is wrong for this checkpoint** (exact only while a 64-row chunk's gate span is under about 160 nats; here A reaches e^158, spans up to 6505). A span-safe additive unit `GdnChunkScanStable` is the default; the shipped kernel is unchanged (ISA identical to HEAD). Without it the real model would have produced garbage.
-- **Gate.** A stock bf16 re-run of the HF stack differs from itself by mean KL ~0.011 / top-1 ~96% (append one token), so the original "KL <= 0.02 vs the bf16 reference" leaves only ~0.009 nats for trellis error. REAL_REF.md proposes the Gemma-style noise-relative gate against the fp32 truth: KL(truth||r4dx) <= 1.5 x N + 0.005 per group (canon ALL: 0.0261, top-1 >= 94.23%). **Both gates are evaluated at M1-21; which one is binding is the user's call.**
+- **Gate.** A stock bf16 re-run of the HF stack differs from itself by mean KL ~0.011 / top-1 ~96% (append one token), so the original "KL <= 0.02 vs the bf16 reference" leaves only ~0.009 nats for trellis error. REAL_REF.md proposes the Gemma-style noise-relative gate against the fp32 truth: KL(truth||r4dx) <= 1.5 x N + 0.005 per group (canon ALL: 0.0261, top-1 >= 94.23%). **Both gates were evaluated at M1-21 and both are missed (see the status row); which one is binding is the user's call and is still open.**
 - The tie rule `recent` vs HF-exact costs 0.0007 mean KL at 8k in fp32 (0 on canon, which is shorter than the dense limit).
 - Sidecar is 95.4 GiB (102,400,495,616 bytes), not 92.
 
@@ -428,7 +428,7 @@ Findings that changed the plan during implementation:
 - **M1-20 Tools and thinking.** Done: the existing server tool and reasoning tests pass against this model.
 
 **Gate**
-- **M1-21 KL gate [GPU].** 4.10. Done: thresholds met on the canon corpus; 8k and 32k probes reported.
+- **M1-21 KL gate [GPU].** 4.10. Done when: thresholds met on the canon corpus; 8k and 32k probes reported. **Status: not met** (canon KL 0.0578 / top-1 89.44%; the 32k probe is not reported), see the status table.
 - **M1-22 Server smoke [GPU].** Existing smoke scripts with this container: tools, thinking on/off,
   multi-turn prefix reuse, a 20k-token prompt. Done: zero failures; decode and prefill speeds recorded.
 - **M1-23 Non-regression [GPU].** 27B and Gemma ctest suites and KL gates. Done: byte-identical to

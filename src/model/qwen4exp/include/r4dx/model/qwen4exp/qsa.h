@@ -116,6 +116,7 @@ class QsaLayerCore {
   int score_rows_ = 0;    // query rows scored per pass (score scratch rows)
   int ntiles_max_ = 0;    // ceil((budget + ratio - 1) / 256)
   int valid_pos_ = 0;
+  const int32_t* verified_table_ = nullptr;  // the KV cache block table last checked to be the identity (Forward)
   float inv_freq_host_[32] = {};
   const uint16_t* last_idx_q_ = nullptr;
   core::DeviceBuffer<float> inv_freq_;

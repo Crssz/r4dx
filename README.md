@@ -40,9 +40,12 @@ OpenAI-compatible server. No PyTorch, vLLM or ggml at runtime.
   `--tp 2`'s decode speed (docs/pp-tp2-hybrid.md).
 - **Qwen3.8-Flash-Next (`qwen4_exp`, experimental, text only):** a third architecture (GDN + sparse attention,
   512-expert MoE, hyper-connections, per-layer n-gram embeddings) served on two cards by splitting the layers.
-  Quantized to ~3.3 bits/weight (mixed KB 3 and 4 trellis). Measured at **~57.5 tok/s decode** with an on-GPU grouped
-  MoE decode kernel and **~450–600 tok/s prefill** (docs/qwen4exp.md). Needs a 95.4 GiB n-gram sidecar on NVMe;
-  no `--tp`, `--pp`, MTP, DFlash or images.
+  Quantized to ~3.3 bits/weight (mixed KB 3 and 4 trellis). Decode with the on-GPU grouped MoE kernel measured
+  **50.3 tok/s at a 243-token prompt and 57.5 tok/s at a 2k-token prompt**; the 8k and 32k rows of the same table
+  (16.9 and 17.9 tok/s) predate that kernel and were not re-measured, so long-context decode is not known. Prefill
+  is 231 tok/s at 243 tokens, 370 at 2k and about 440-450 at 8k-32k (docs/qwen4exp.md; speeds are recorded, not
+  gated). Needs a 95.4 GiB n-gram sidecar on NVMe; no `--tp`, `--pp`, MTP, DFlash or images. The KL gate
+  (mean KL 0.0578, top-1 89.4% on the canon corpus) is not met and awaits a decision (docs/qwen4exp-plan.md).
 - **Server:** `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (streaming, tools,
   images) and `POST /v1/completions`. One request at a time, with prefix reuse across turns.
 

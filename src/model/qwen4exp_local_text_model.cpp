@@ -17,7 +17,7 @@ namespace {
 
 void Qwen4ExpLocalTextModel::SetDflashInjectionEnabled(bool enabled) {
   // The server only calls this when a drafter container is configured, which MakeQwen4ExpModelOptions refused.
-  if (enabled) Unsupported("DFlash", "milestone 1 is text-only, no drafter");
+  if (enabled) Unsupported("DFlash", "no DFlash drafter exists for this model");
 }
 
 void Qwen4ExpLocalTextModel::EncodeImages(const float*, int64_t, const std::vector<vision::GridThw>&, ImageRows*,

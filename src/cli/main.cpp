@@ -418,13 +418,9 @@ int RunMain(int argc, char** argv) {
   opts.container_path = args.model_path;
   // qwen4_exp (docs/qwen4exp.md): a container with a trellis payload and no explicit --layout runs the trellis
   // layout; every other arch and every explicit --layout keeps exactly what was asked for.
-  if (!args.layout_given && r4dx::model::DetectArch(args.model_path) == r4dx::model::Arch::kQwen4Exp) {
-    const nlohmann::json meta = r4dx::model::ReadContainerMetadata(args.model_path);
-    if (meta.is_object() && meta.contains("quant") && meta.at("quant").is_object() &&
-        meta.at("quant").contains("trellis")) {
-      args.layout = "trellis";
-      std::fprintf(stderr, "[r4dx-cli] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
-    }
+  if (!args.layout_given && r4dx::model::Qwen4ExpDefaultsToTrellis(args.model_path)) {
+    args.layout = "trellis";
+    std::fprintf(stderr, "[r4dx-cli] qwen4_exp container with a trellis payload: --layout defaults to trellis\n");
   }
   try {
     opts.layout = r4dx::model::LayoutFromName(args.layout);
@@ -494,14 +490,8 @@ int RunMain(int argc, char** argv) {
   }
   // qwen4_exp (docs/qwen4exp.md): refuse what it cannot serve with the precise message, before any model load.
   if (container_arch == r4dx::model::Arch::kQwen4Exp) {
-    r4dx::server::Qwen4ExpFlags flags;
-    flags.tp = args.tp;
-    flags.pp = args.pp;
-    flags.mtp = args.mtp;
-    flags.dflash = !args.dflash.empty();
-    flags.vision_on = args.vision == "on";
-    flags.images = !args.image_paths.empty();
-    const std::string err = r4dx::server::CheckQwen4ExpFlags(flags);
+    const std::string err = r4dx::server::CheckQwen4ExpFlags(r4dx::server::MakeQwen4ExpFlags(
+        args.tp, args.pp, args.mtp, !args.dflash.empty(), args.vision == "on", !args.image_paths.empty()));
     if (!err.empty()) {
       std::fprintf(stderr, "error: %s\n", err.c_str());
       return 2;

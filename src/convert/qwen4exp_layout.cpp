@@ -1,6 +1,7 @@
 #include "qwen4exp_layout.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -20,14 +21,17 @@ const std::string kWho = "r4dx-convert (qwen4_exp): ";
 
 std::string ShapeStr(const std::vector<int64_t>& s) { return nlohmann::json(s).dump(); }
 
-// The layer index of "model.language_model.layers.<i>.<rest>", or -1.
+// The layer index of "model.language_model.layers.<i>.<rest>", or -1 (also for an index that does not fit an int, so
+// such a name is reported by the unconsumed-tensor audit instead of being read as an out-of-range layer).
 int LayerOf(const std::string& name) {
   if (name.compare(0, kLayerPrefix.size(), kLayerPrefix) != 0) return -1;
   size_t i = kLayerPrefix.size();
   int v = 0;
   bool any = false;
   while (i < name.size() && name[i] >= '0' && name[i] <= '9') {
-    v = v * 10 + (name[i] - '0');
+    const int digit = name[i] - '0';
+    if (v > (std::numeric_limits<int>::max() - digit) / 10) return -1;
+    v = v * 10 + digit;
     any = true;
     ++i;
   }
@@ -358,6 +362,10 @@ NgramSidecar ReadNgramSidecar(const std::string& path, const TextShape& s, const
   if (static_cast<int64_t>(n.row_bytes) * n.heads != 2LL * s.ple_embed_dim)
     throw std::runtime_error(who + "row_bytes " + std::to_string(n.row_bytes) + " x " + std::to_string(n.heads) +
                              " heads != 2 x ple_embed_dim " + std::to_string(s.ple_embed_dim) + " (a bf16 row per head)");
+  const uint64_t max_rows = (std::numeric_limits<uint64_t>::max() - kHeaderBytes) / static_cast<uint64_t>(n.row_bytes);
+  if (n.rows > max_rows)
+    throw std::runtime_error(who + "the header's " + std::to_string(n.rows) + " rows x " + std::to_string(n.row_bytes) +
+                             " B overflow the file size (corrupt header)");
   const uint64_t want_size = kHeaderBytes + n.rows * static_cast<uint64_t>(n.row_bytes);
   if (file_size != want_size)
     throw std::runtime_error(who + "the file is " + std::to_string(file_size) + " bytes but the header's " +

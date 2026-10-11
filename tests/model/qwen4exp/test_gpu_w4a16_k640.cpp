@@ -179,6 +179,11 @@ void RunCase(hipStream_t s, r4dx::core::Arena& arena, std::mt19937_64& rng, cons
 }
 
 int RunTest() {
+  int n_devices = 0;
+  if (hipGetDeviceCount(&n_devices) != hipSuccess || n_devices < 1) {
+    std::printf("[SKIP] no HIP device\n");
+    return 77;
+  }
   R4DX_HIP_CHECK(hipSetDevice(0));
   r4dx::core::Stream stream;
   r4dx::core::Arena arena;

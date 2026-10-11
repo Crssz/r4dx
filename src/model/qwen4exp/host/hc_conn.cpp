@@ -4,6 +4,7 @@
 #include <string>
 
 #include "r4dx/core/error.hpp"
+#include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/hc_kernels.h"
 
@@ -11,25 +12,10 @@ namespace r4dx::model::qwen4exp {
 
 namespace {
 
-[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("qwen4exp::HyperConn: " + msg); }
+constexpr const char* kCtx = "qwen4exp::HyperConn";
 
-void Check(int code, const char* what) {
-  if (code != 0) {
-    throw std::runtime_error(std::string("qwen4exp::HyperConn: ") + what + " failed: " +
-                             hipGetErrorString(static_cast<hipError_t>(code)));
-  }
-}
-
-void CheckLinear(const QuantLinear* l, const char* name, int64_t n, int64_t k) {
-  if (l == nullptr) Fail(std::string("missing weight ") + name);
-  if (l->N != n || l->K != k) {
-    Fail(std::string(name) + " is [" + std::to_string(l->N) + ", " + std::to_string(l->K) + "], expected [" +
-         std::to_string(n) + ", " + std::to_string(k) + "]");
-  }
-}
-
-constexpr size_t kAlign = 16;  // Arena::Alloc rounds every allocation's end up to 16 bytes
-size_t Padded(size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
+[[noreturn]] void Fail(const std::string& msg) { qwen4exp::Fail(kCtx, msg); }
+void Check(int code, const char* what) { qwen4exp::Check(kCtx, code, what); }
 
 }  // namespace
 
@@ -37,9 +23,9 @@ HyperConn::HyperConn(const HyperConnConfig& cfg, const HyperConnWeights& w) : cf
   if (cfg.hc < 1 || cfg.hidden < 1 || cfg.lowrank < 1) Fail("non-positive dimension in the config");
   if (w.norm == nullptr) Fail("missing norm weight");
   const int64_t wide = static_cast<int64_t>(cfg.hc) * cfg.hidden;
-  CheckLinear(w.down, "down", cfg.lowrank, wide);
-  CheckLinear(w.up, "up", wide, cfg.lowrank);
-  if (w.inject != nullptr) CheckLinear(w.inject, "inject", cfg.hc, wide);
+  CheckLinear(kCtx, w.down, "down", cfg.lowrank, wide);
+  CheckLinear(kCtx, w.up, "up", wide, cfg.lowrank);
+  if (w.inject != nullptr) CheckLinear(kCtx, w.inject, "inject", cfg.hc, wide);
 }
 
 size_t HyperConn::ArenaBytes(int64_t rows) const {

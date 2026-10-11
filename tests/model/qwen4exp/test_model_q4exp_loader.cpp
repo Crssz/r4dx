@@ -4,11 +4,11 @@
 //      model's estimate (uniform 3.33 bpw experts: KB 3 gate/up, KB 4 down, 26 GiB cap -> k = 24); the
 //      Qwen4ExpConfig::ToModelConfig() view of the real config.
 //   2. GPU, when the tiny converter container exists (R4DX_Q4EXP_TINY_CONTAINER, default
-//      E:\models\r4dx\tiny-q4exp\container-bf16.r4dx; otherwise the test ends with exit code 77 after part 1):
+//      <R4DX_MODELS_ROOT>\r4dx\tiny-q4exp\container-bf16.r4dx; otherwise the test ends with exit code 77 after part 1):
 //      Inspect, then Load of layers [0, 2) and [2, 4) on the test device: shapes, device bytes of expert linears equal
 //      the file bytes (downloaded and memcmp'd), expert views alias their class buffer, VRAM report == the bytes
 //      Inspect predicted == the DeviceBuffer counter's growth, loading twice and destroying frees everything.
-//   3. When R4DX_Q4EXP_TINY_TRELLIS (default E:\models\r4dx\tiny-q4exp\container-trellis.r4dx) exists: the same on a
+//   3. When R4DX_Q4EXP_TINY_TRELLIS (default <R4DX_MODELS_ROOT>\r4dx\tiny-q4exp\container-trellis.r4dx) exists: the same on a
 //      trellis container -- per-layer KB, ticket slices (one buffer, disjoint, N/128 words each), widened sign
 //      vectors, and a copy with one expert's KB flipped is refused for non-uniformity.
 // The device is 0 when HIP_VISIBLE_DEVICES is set (ctest sets it to 1), else device 1 when there are two.
@@ -29,6 +29,7 @@
 
 #include "qwen4exp_container.h"
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/models_root.h"
 #include "r4dx/core/dtype.hpp"
 #include "r4dx_convert/safetensors_reader.hpp"
 
@@ -157,7 +158,7 @@ void TestChooseSplitRealEstimate() {
 }
 
 void TestToModelConfig() {
-  const fs::path cfg = fs::path("E:\\models\\r4dx\\Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ\\config.json");
+  const fs::path cfg = fs::path(r4dx::ModelsPath("r4dx/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ/config.json"));
   if (!fs::exists(cfg)) {
     std::printf("SKIP: ToModelConfig on the real config (%s absent)\n", cfg.string().c_str());
     return;
@@ -595,7 +596,8 @@ void TestContainer(const std::string& path, int device, Layout expected) {
     Qwen4ExpLoadOptions wrong;
     wrong.layout = expected == Layout::kTrellis ? Layout::kBf16 : Layout::kTrellis;
     Check(Throws([&] { Qwen4ExpContainer::Load(path, wrong); }), label + "a layout the container cannot serve is refused");
-    Check(Throws([&] { Qwen4ExpContainer::Inspect("E:\\no\\such\\container.r4dx"); }), label + "Inspect of a missing file throws");
+    Check(Throws([&] { Qwen4ExpContainer::Inspect((fs::temp_directory_path() / "r4dx-tests" / "no" / "such" / "container.r4dx").string()); }),
+          label + "Inspect of a missing file throws");
   }
   Check(counter() == counted0, label + "refused loads leak nothing");
 }
@@ -619,10 +621,16 @@ bool EndsWith(const std::string& s, const std::string& suffix) {
 }
 
 std::string BuildSyntheticTrellis(const std::string& bf16_path) {
-  const fs::path dir = "E:\\models\\r4dx\\q4exp-fixtures\\LoaderQ4";
+  // Cached under the temp dir (not the models tree). The name carries the generator version and the source
+  // container's size + mtime, so a changed generator (bump kGeneratorVersion) or a regenerated bf16 container
+  // yields a different file instead of reusing a stale one.
+  constexpr int kGeneratorVersion = 1;
+  const fs::path dir = fs::temp_directory_path() / "r4dx-tests" / "q4exp-loader";
   fs::create_directories(dir);
-  const fs::path out = dir / "synthetic-trellis.r4dx";
-  if (fs::exists(out) && fs::last_write_time(out) > fs::last_write_time(bf16_path)) return out.string();
+  const fs::path out =
+      dir / ("synthetic-trellis-v" + std::to_string(kGeneratorVersion) + "-" + std::to_string(fs::file_size(bf16_path)) + "-" +
+             std::to_string(fs::last_write_time(bf16_path).time_since_epoch().count()) + ".r4dx");
+  if (fs::exists(out)) return out.string();
 
   const SafetensorsReader src(Utf8ToWide(bf16_path));
   nlohmann::json hdr = nlohmann::json::parse(src.HeaderJson());
@@ -806,9 +814,9 @@ int main() {
 
   const char* env_bf16 = std::getenv("R4DX_Q4EXP_TINY_CONTAINER");
   const char* env_tr = std::getenv("R4DX_Q4EXP_TINY_TRELLIS");
-  const std::string bf16_path = env_bf16 ? env_bf16 : "E:\\models\\r4dx\\tiny-q4exp\\container-bf16.r4dx";
-  const std::string trellis_path = env_tr ? env_tr : "E:\\models\\r4dx\\tiny-q4exp\\container-trellis.r4dx";
-  const std::string w4a16_path = "E:\\models\\r4dx\\tiny-q4exp\\container-w4a16.r4dx";
+  const std::string bf16_path = env_bf16 ? env_bf16 : r4dx::ModelsPath("r4dx/tiny-q4exp/container-bf16.r4dx");
+  const std::string trellis_path = env_tr ? env_tr : r4dx::ModelsPath("r4dx/tiny-q4exp/container-trellis.r4dx");
+  const std::string w4a16_path = r4dx::ModelsPath("r4dx/tiny-q4exp/container-w4a16.r4dx");
   const bool have_bf16 = fs::exists(bf16_path), have_trellis = fs::exists(trellis_path), have_w4a16 = fs::exists(w4a16_path);
   if (!have_bf16 && !have_trellis && !have_w4a16) {
     std::printf("SKIP: no tiny container (%s) -- ran the CPU parts only; failures so far: %d\n", bf16_path.c_str(), g_failures);

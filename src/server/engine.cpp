@@ -146,13 +146,9 @@ void Engine::LoadAndStart() {
   // qwen4_exp (docs/qwen4exp.md): the flags it cannot serve are refused here, with the precise message, before
   // the tokenizer and the model load (which would throw its own, later and less precisely).
   if (container_arch == r4dx::model::Arch::kQwen4Exp) {
-    Qwen4ExpFlags flags;
-    flags.tp = opts_.tp.world;
-    flags.pp = opts_.model_opts.pp;
-    flags.mtp = opts_.model_opts.mtp_draft_k;
-    flags.dflash = !opts_.model_opts.dflash_container.empty();
-    flags.vision_on = opts_.model_opts.vision == r4dx::model::ModelOptions::VisionMode::kOn;
-    const std::string err = CheckQwen4ExpFlags(flags);
+    const std::string err = CheckQwen4ExpFlags(MakeQwen4ExpFlags(
+        opts_.tp.world, opts_.model_opts.pp, opts_.model_opts.mtp_draft_k, !opts_.model_opts.dflash_container.empty(),
+        opts_.model_opts.vision == r4dx::model::ModelOptions::VisionMode::kOn, /*images=*/false));
     if (!err.empty()) throw std::invalid_argument(err);
   }
   tokenizer_dir_ = ResolveTokenizerDir(*dialect_, opts_.tokenizer_dir);

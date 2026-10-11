@@ -108,6 +108,21 @@ uint16_t* QsaLayerCore::Forward(hipStream_t stream, core::Arena& arena, const Qs
     throw std::invalid_argument("QsaLayerCore::Forward: the KV cache must be (kv_heads, head_dim 256, block 16)");
   }
   kv.CheckCapacity(first_pos, T);
+  // r4dx_q4_qsa_prep writes the KV rows at pos / block_size without the block table while r4dx_q4_qsa_attn reads them
+  // through it: they agree only for the identity table PagedKvCache builds (BuildContiguousBlockTable). Checked once
+  // per table (one small D2H), never in the steady state.
+  if (kv.BlockTable() != verified_table_) {
+    std::vector<int32_t> table(static_cast<size_t>(kv.MaxBlocks()));
+    R4DX_HIP_CHECK(hipMemcpy(table.data(), kv.BlockTable(), table.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+    for (size_t i = 0; i < table.size(); ++i) {
+      if (table[i] != static_cast<int32_t>(i)) {
+        throw std::runtime_error("QsaLayerCore::Forward: the KV cache block table is not the identity (entry " +
+                                 std::to_string(i) + " is " + std::to_string(table[i]) +
+                                 "); the KV write kernel bypasses the table");
+      }
+    }
+    verified_table_ = kv.BlockTable();
+  }
   if (!in.qg || !in.k || !in.v || !in.idxqk || !w.q_norm || !w.k_norm || !w.idx_q_norm || !w.idx_k_norm ||
       !w.k_descale || !w.v_descale || !positions) {
     throw std::invalid_argument("QsaLayerCore::Forward: null input / weight pointer");

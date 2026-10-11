@@ -51,10 +51,9 @@ it explicitly; EOS ids come from the tokenizer directory's `generation_config.js
    the per-layer scheme of plan section 4.4 (reference forward for layer L, Hessians of that layer's linears with
    routed-token counts per expert and the diagonal fallback below the input dimension, oracle at KB 3 and KB 4,
    Hessians deleted), then the allocation sweep within the 26 GiB-per-card cap. The driver is
-   `tools\quant2\qwen4exp\pipeline.ps1`; its stage scripts are `tools\quant2\qwen4exp\*.py` and
-   `tools\reference\qwen4exp\hessian_q4.py`. At the time of writing `tools\quant2\qwen4exp` holds `corpus_q4.py`
-   (calibration corpus) and `oracle_q4.py` but not `pipeline.ps1`, so this stage has no single end-to-end command
-   yet; check the directory and the scripts' own `--help` before relying on it.
+   `tools\quant2\qwen4exp\pipeline.ps1` (stages `corpus`, `hessian`, `oracle`, `verify`, `alloc`, `convert`, `all`;
+   without `-Run` it only prints the commands it would run); its stage scripts are `tools\quant2\qwen4exp\*.py` and
+   `tools\reference\qwen4exp\hessian_q4.py`. Read `tools\quant2\qwen4exp\README.md` and the script's own header first.
 4. **Convert** with `r4dx-convert` (`build\win-hip\src\convert\r4dx-convert.exe`). A checkpoint whose
    `config.json` says `model_type: qwen4_exp` takes the qwen4_exp branch (`--help` lists every flag):
 
@@ -96,19 +95,34 @@ with tools and `reasoning_effort`, the refused-flag messages).
   the model also refuses them on its own.
 - **No `--tp` and no `--pp`.** The model owns its two-card layer split; `--tp 2` and `--pp 2` are refused the same
   way. (`--pp` / `R4DX_PP` left unset is fine.)
-- **One request at a time**, as for every r4dx server. Prefix reuse is designed as the single-slot, prefill-boundary
-  checkpoint extended with the PLE conv state, the 2-token n-gram history and the QSA partial block (plan 4.9);
-  it is task M1-18 and has no recorded validation yet.
+- **One request at a time**, as for every r4dx server. Prefix reuse is the single-slot, prefill-boundary
+  checkpoint extended with the PLE conv state, the 2-token n-gram history and the QSA partial block (plan 4.9,
+  task M1-18). `test_model_q4exp_state` checks a restore-then-prefill is bit-identical to a cold run (tiny
+  container); `tools\qwen4exp\smoke.ps1` checked a two-turn conversation on the real container (turn 2 prefilled 29
+  new tokens of 345, text equal to the cold run).
 - **QSA tie rule (Q23).** Ties at the sparse-attention top-k cut are frequent. r4dx breaks them by a fixed rule
   (the most recent blocks win), not by whatever order `torch.topk` happens to produce, so tokens can differ from
   the Hugging Face model wherever the two choose differently; the gate measures that noise floor and reports it
   next to the accuracy numbers (`tools\reference\qwen4exp\noise_floor.py`).
-- **MoE is host-routed in milestone 1**: router and top-10 on the GPU, expert ids to the host (one sync per layer),
-  one `ApplyLinear` per (expert, class). Decode and prefill speed are expected to be well below what a grouped
-  kernel gives; that is milestone 2 work. No speed number is claimed anywhere on this page.
-- Validated context is 8k and 32k (probes against the reference); longer contexts run but are unvalidated.
+- **MoE routing.** A single-row decode step on a trellis container runs the grouped MoE entirely on the GPU
+  (router, top-10, expert sort, grouped trellis GEMVs, combine; no host sync), and after warm-up each GDN layer
+  without PLE is replayed as one HIP graph (QSA and PLE layers are launched normally). Prefill chunks (more than
+  one row), bf16/w4a16 containers and the capture test hook still use the host-routed path: router and top-10 on
+  the GPU, expert ids to the host (one sync per layer), one `ApplyLinear` per (expert, class). The grouped kernels are
+  instantiated for hidden 2560, expert and shared-expert intermediate 640, at most 16 experts per token, at most 1024
+  experts and trellis bits 3 or 4; the stage checks this once at construction and any other geometry takes the
+  host-routed path.
+- **No context length is validated yet.** The KL gate is not met (below) and the 32k probe has not been run; 8k
+  is measured (probe_8k) and also misses the gate. Longer contexts run but are unvalidated.
+- **Stage hand-off is synchronous.** The two card stages run in sequence on the calling thread (stage 0 layers,
+  residual through pinned host memory, stage 1 layers and head); there is no stage-0 worker thread and no overlap of
+  the two cards within one token, and an exception in either stage propagates to the caller.
 - The sidecar is read at about 16 rows per token on the decode critical path; a slow or busy drive shows up as
   decode latency. A failed or short read fails the request; it never produces a zero row.
+- **QSA indexer memory.** Each QSA layer keeps the raw indexer keys of every position (`max_ctx` x 128 bf16, 256
+  bytes per token per layer; 12 layers) rather than the 3-row buffer of the plan: the kernels index them by absolute
+  position. It is allocated at load per stage, outside the weight budget `ChooseSplit` balances (weights only), so
+  count it against the free headroom at long `max_ctx`.
 
 ## Measured results
 
@@ -210,10 +224,10 @@ final mixer, lm_head). Total weights: 51.830 GiB.
 | 8192 | 8210 | 18.592 | 441.6 | 128 | 16.92* | 26.89 | 26.76 | 26.95 |
 | 32768 | 32804 | 72.959 | 449.6 | 128 | 17.88* | 27.07 | 26.93 | 27.19 |
 
-*(*The 8k and 32k decode figures were from the initial host-routed milestone-1 run; short prompts with the on-GPU grouped MoE kernel reach **57.5 tok/s**).*
+*(*The 8k and 32k decode figures are from the initial host-routed milestone-1 run and were not repeated with the on-GPU grouped MoE kernel, which measured 50.3 / 57.5 tok/s at the 256 / 2048-token prompts. Long-context decode with the grouped kernel is unmeasured.)*
 - **Grouped MoE decode speedup:** On-GPU expert sorting and grouped Trellis GEMV (`gate_up` and `down`) eliminated all 48 CPU-GPU synchronizations per token and reduced kernel launches from 2,160 to ~620 per token. Per-layer MoE decode dropped from 0.502 ms to **0.085 ms** (a **5.6x layer speedup**).
 - Decode speed jumped from 16.96 tok/s to **57.54 tok/s** (a **3.4x overall speedup**, latency dropped from 58.9 ms down to **17.3 ms/tok**).
-- Prefill throughput reaches **~450–600 tok/s**.
+- Prefill throughput in the table: 231 tok/s at 243 tokens, 370 at 2k, about 440-450 at 8k-32k.
 - Peak VRAM per card is **~26.8–27.2 GiB**, leaving ~4.8 GiB of free headroom on each 32 GiB card.
 #### Server smoke (`tools/qwen4exp/smoke.ps1`, port 8089)
 
@@ -241,7 +255,10 @@ Server startup: loaded in 107 s on two devices. All 37 checks passed:
 | **canon / ALL** | **0.0578** | **89.44** | **0.0590** | **89.42** |
 | probe_8k | 0.0500 | 91.71 | 0.0483 | 92.05 |
 
-*Analysis:* Both gates (A: KL <= 0.02, top-1 >= 93% and B: noise-relative <= 0.0261) missed their strict targets due to the
-accumulated noise of re-quantizing an already-quantized AWQ int4 checkpoint at ~3.3 bpw (KB 3 gate_up, KB 4 down). However, the
-model generates coherent text, answers reasoning/math/facts accurately in chat, and achieves **~90% top-1 agreement** with the
+*Status: gate NOT met.* Neither gate A (KL <= 0.02, top-1 >= 93%) nor gate B (noise-relative, canon ALL <= 0.0261, top-1 >=
+94.23%) is reached on canon (0.0578 / 89.44% vs the bf16 reference, 0.0590 / 89.42% vs the fp32 truth) or at 8k. The 32k
+probe was not run. Plan 3.1 says to stop and ask when the sweep cannot reach the gate, so M1-21 is blocked, awaiting the
+user's decision on which gate binds (qwen4exp-plan.md, status table). The re-quantization of an already int4-quantized
+AWQ checkpoint at ~3.3 bpw is the likely cause of the excess (not isolated by an experiment). Qualitatively the model
+generates coherent text and answers reasoning, math and fact prompts in chat, with ~90% top-1 agreement with the
 unquantized reference. Full reports: `E:\models\r4dx\q4exp\gate\swift15-flash-next-trellis-mix\gate_report.md`.

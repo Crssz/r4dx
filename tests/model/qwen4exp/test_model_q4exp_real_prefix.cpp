@@ -1,13 +1,13 @@
 // qwen4_exp on REAL weights, first four layers (GDN, GDN+PLE, GDN, QSA) against the real-model layer goldens
-// (E:\models\r4dx\q4exp\ref\layer_goldens\T70{,eos}.recent.safetensors, tools/reference/qwen4exp/real_ref.py; HF's own decoder layers
+// (<R4DX_MODELS_ROOT>\r4dx\q4exp\ref\layer_goldens\T70{,eos}.recent.safetensors, tools/reference/qwen4exp/real_ref.py; HF's own decoder layers
 // on the AWQ checkpoint dequantized to bf16). Links r4dx_model. Exit 77 = a fixture is missing.
 //
 // Fixtures:
-//   R4DX_Q4EXP_REAL_PREFIX    default D:\q4exp\real-prefix4-bf16.r4dx: the PREFIX container
+//   R4DX_Q4EXP_REAL_PREFIX    default <R4DX_MODELS_ROOT>\r4dx\q4exp\real-prefix4-bf16.r4dx: the PREFIX container
 //                             `r4dx-convert --layers 4 --layouts bf16 --lm-head w4a16 --w4a16-group-rule ^lm_head$=32
 //                              --kv-calib E:\models\r4dx\q4exp\ref\kv_calib.json --ngram-sidecar <sidecar>` (__metadata__.layers_present 4;
 //                             every body linear and every expert bf16, so the weights are bit-equal to what the reference used)
-//   R4DX_Q4EXP_REAL_GOLDENS   default E:\models\r4dx\q4exp\ref\layer_goldens
+//   R4DX_Q4EXP_REAL_GOLDENS   default <R4DX_MODELS_ROOT>\r4dx\q4exp\ref\layer_goldens
 //   the n-gram sidecar named by the container's metadata (95 GiB, read unbuffered, 16 rows per token)
 //
 // What runs (device = TestDevice(): physical device 1 under ctest's HIP_VISIBLE_DEVICES=1):
@@ -66,11 +66,11 @@ constexpr int kLayers = 4;
 
 std::string PrefixPath() {
   const char* e = std::getenv("R4DX_Q4EXP_REAL_PREFIX");
-  return e != nullptr && e[0] != 0 ? e : "D:\\q4exp\\real-prefix4-bf16.r4dx";
+  return e != nullptr && e[0] != 0 ? e : r4dx::ModelsPath("r4dx/q4exp/real-prefix4-bf16.r4dx");
 }
 std::string GoldenDir() {
   const char* e = std::getenv("R4DX_Q4EXP_REAL_GOLDENS");
-  return e != nullptr && e[0] != 0 ? e : "E:\\models\\r4dx\\q4exp\\ref\\layer_goldens";
+  return e != nullptr && e[0] != 0 ? e : r4dx::ModelsPath("r4dx/q4exp/ref/layer_goldens");
 }
 std::string GoldenFile(const std::string& stem) { return GoldenDir() + "\\" + stem + ".recent.safetensors"; }
 

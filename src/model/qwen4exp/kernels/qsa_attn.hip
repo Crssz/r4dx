@@ -190,7 +190,8 @@ __global__ __launch_bounds__(kHD) void AttnCombineKernel(Q4QsaAttnArgs a) {
     l += w * a.part_ml[((base + s) * kG + hh) * 2 + 1];
     o += w * a.part_acc[((base + s) * kG + hh) * kHD + d];
   }
-  const float attn = qsa::Rb((o / l) * a.v_descale[g]);
+  // a padded row (p < 0 -> no tokens) has l == 0 and no partials: its output is 0, not 0 / 0
+  const float attn = l > 0.0f ? qsa::Rb((o / l) * a.v_descale[g]) : 0.0f;
   const float gate = Bf16ToFloat(a.qg[(static_cast<int64_t>(t) * a.heads_q + h) * 2 * kHD + kHD + d]);
   const float sg = qsa::Rb(1.0f / (1.0f + expf(-gate)));
   a.out[(static_cast<int64_t>(t) * a.heads_q + h) * kHD + d] = FloatToBf16(attn * sg);

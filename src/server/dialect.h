@@ -111,7 +111,7 @@ DialectKind ResolveDialectKindForArch(std::optional<DialectKind> requested, cons
 std::string CheckDefaultTokenizerDir(const ModelDialect& d, const std::string& resolved_dir, bool user_given);
 
 // What r4dx-cli / r4dx-server were asked for that a qwen4_exp container cannot do (docs/qwen4exp-plan.md 4.11 item 4:
-// the model owns its two-card split, so no --tp/--pp; milestone 1 has no MTP head, DFlash drafter or vision tower).
+// the model owns its two-card split, so no --tp/--pp; no MTP head or DFlash drafter is wired up and there is no vision tower).
 struct Qwen4ExpFlags {
   int64_t tp = 1;           // --tp
   int64_t pp = -1;          // --pp (-1: not given, follows R4DX_PP, which the loader refuses on its own)
@@ -120,6 +120,9 @@ struct Qwen4ExpFlags {
   bool vision_on = false;   // --vision on
   bool images = false;      // --image given (CLI only)
 };
+// The one place the CLI and the server's engine turn their parsed arguments into Qwen4ExpFlags (plain values, so
+// neither caller's arg struct leaks in here). `images` is only meaningful for the CLI (--image).
+Qwen4ExpFlags MakeQwen4ExpFlags(int64_t tp, int64_t pp, int64_t mtp, bool dflash_given, bool vision_on, bool images);
 // "" when every flag is acceptable, otherwise one fail-fast message naming every refused flag. Run before the model
 // load (the loader throws too, later and less precisely).
 std::string CheckQwen4ExpFlags(const Qwen4ExpFlags& f);

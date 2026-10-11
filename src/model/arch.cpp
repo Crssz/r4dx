@@ -72,6 +72,13 @@ Arch DetectArch(const std::string& container_path) {
   return DetectArchFromMetadata(meta);
 }
 
+bool Qwen4ExpDefaultsToTrellis(const std::string& container_path) {
+  const nlohmann::json meta = ReadContainerMetadata(container_path);
+  if (meta.is_null() || DetectArchFromMetadata(meta) != Arch::kQwen4Exp) return false;
+  return meta.is_object() && meta.contains("quant") && meta.at("quant").is_object() &&
+         meta.at("quant").contains("trellis");
+}
+
 int64_t ResolveContainerMaxCtx(const std::string& container_path, Arch arch, bool requested_given,
                                int64_t requested, bool extended_ctx) {
   // kQwen35 and kQwen4Exp keep the caller's value (arch.h); only Gemma derives a default.

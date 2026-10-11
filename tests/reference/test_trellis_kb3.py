@@ -38,6 +38,10 @@ try:
     import torch
 except ImportError as e:
     print(f"SKIP: {e} -- run this with the reference venv's python.exe (see docstring)")
+    if __name__ != "__main__":  # collected by pytest: report SKIPPED, not a clean empty module
+        import pytest
+
+        pytest.skip(f"{e}", allow_module_level=True)
     raise SystemExit(0)
 
 import trellis_quant as tq  # noqa: E402

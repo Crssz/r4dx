@@ -1,6 +1,6 @@
 // QsaLayerCore (src/model/qwen4exp/include/r4dx/model/qwen4exp/qsa.h) against HF `Qwen4ExpTextAttention` with the
 // QSA indexer (`tie_rule="recent"`, plan Q23). Fixtures: tools/reference/qwen4exp/qsa_fixtures.py, default dir
-// E:\models\r4dx\q4exp-fixtures\QsaCore (override: R4DX_QSA_FIXTURES). Exit 77 when the fixtures are missing.
+// <R4DX_MODELS_ROOT>\r4dx\q4exp-fixtures\QsaCore (override: R4DX_QSA_FIXTURES). Exit 77 when the fixtures are missing.
 //
 //   1. attention cases (budget 64 and 2048): chunked prefill + decode; per chunk the gated attention output vs HF's
 //      bf16 graph (`out`) and vs an fp32 attention on the same selected sets (`out32`), the selected token sets
@@ -34,6 +34,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/model/attention/paged_kv_cache.hpp"
 #include "r4dx/model/qwen4exp/qsa.h"
+#include "r4dx/models_root.h"
 
 using r4dx::core::Arena;
 using r4dx::core::Bf16ToFloat;
@@ -613,7 +614,7 @@ void RunPerf(int max_ctx) {
 
 int main() {
   const char* env = std::getenv("R4DX_QSA_FIXTURES");
-  const std::string dir = env ? env : "E:\\models\\r4dx\\q4exp-fixtures\\QsaCore";
+  const std::string dir = env ? env : r4dx::ModelsPath("r4dx/q4exp-fixtures/QsaCore");
   Fixture fx;
   if (!fx.Load(dir)) {
     std::fprintf(stderr, "[SKIP] QSA fixtures not found in %s (run tools/reference/qwen4exp/qsa_fixtures.py)\n", dir.c_str());

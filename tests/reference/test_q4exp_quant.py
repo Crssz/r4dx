@@ -26,6 +26,7 @@ Plain script, no pytest: exits 0 and prints "OK (<n> checks)", else 1 and every 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import traceback
@@ -36,10 +37,22 @@ sys.path.insert(0, str(REPO_ROOT / "tools" / "reference"))
 sys.path.insert(0, str(REPO_ROOT / "tools" / "quant2" / "qwen4exp"))
 
 try:
+    import pytest
+except ImportError:  # run as a plain script
+    pytest = None
+
+
+class _Skipped(BaseException):
+    """Raised by skip() when pytest is not available (BaseException so a test's own `except Exception` cannot swallow it)."""
+
+
+try:
     import numpy as np
     import torch
 except ImportError as e:
     print(f"SKIP: {e} -- run this with the reference venv's python.exe (see docstring)")
+    if pytest is not None and __name__ != "__main__":
+        pytest.skip(f"{e}", allow_module_level=True)
     raise SystemExit(0)
 
 from qwen4exp import alloc_q4 as A  # noqa: E402
@@ -52,8 +65,17 @@ import trellis_quant as tq  # noqa: E402
 
 CHECKS = 0
 FAILS: list[str] = []
-REAL_CONFIG = Path(r"E:\models\r4dx\Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ\config.json")
-TINY_HF = Path(r"E:\models\r4dx\tiny-q4exp\hf")
+
+MODELS_ROOT = Path(os.environ.get("R4DX_MODELS_ROOT") or r"E:\models")
+REAL_CONFIG = MODELS_ROOT / "r4dx" / "Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ" / "config.json"
+TINY_HF = MODELS_ROOT / "r4dx" / "tiny-q4exp" / "hf"
+
+
+def skip(reason: str) -> None:
+    """Skip the running test: pytest.skip when collected by pytest (reported SKIPPED, not passed); _Skipped under the script runner."""
+    if pytest is not None and __name__ != "__main__":
+        pytest.skip(reason)
+    raise _Skipped(reason)
 
 
 def check(cond, what: str) -> None:
@@ -97,8 +119,7 @@ def test_choose_split() -> None:
 
 def test_documented_numbers() -> None:
     if not REAL_CONFIG.exists():
-        print(f"SKIP: documented numbers (no {REAL_CONFIG})")
-        return
+        skip(f"documented numbers (no {REAL_CONFIG})")
     arch = Qwen4ExpArch.from_config(REAL_CONFIG)
     m = A.Model(arch)
     u = A.uniform_assignment(48, 4, 3, 4)   # projections KB 4, gate/up KB 3, down KB 4
@@ -129,8 +150,7 @@ def synthetic_stats(arch: Qwen4ExpArch, Ks, seed: int = 7):
 
 def test_allocation() -> None:
     if not REAL_CONFIG.exists():
-        print(f"SKIP: allocation (no {REAL_CONFIG})")
-        return
+        skip(f"allocation (no {REAL_CONFIG})")
     arch = Qwen4ExpArch.from_config(REAL_CONFIG)
     m = A.Model(arch)
     stats = synthetic_stats(arch, (3.0, 4.0))
@@ -252,8 +272,7 @@ def ar1_rows(rng, n: int, k: int, scale: np.ndarray) -> torch.Tensor:
 
 def test_hessian_capture() -> None:
     if not (TINY_HF / "config.json").exists():
-        print(f"SKIP: hessian capture (no {TINY_HF})")
-        return
+        skip(f"hessian capture (no {TINY_HF})")
     arch = Qwen4ExpArch.from_config(TINY_HF / "config.json")
     layer = 1                                       # a GDN layer
     E = arch.n_experts
@@ -404,8 +423,7 @@ def test_boundary() -> None:
 
 def test_probe_reservoir() -> None:
     if not (TINY_HF / "config.json").exists():
-        print(f"SKIP: probe reservoir (no {TINY_HF})")
-        return
+        skip(f"probe reservoir (no {TINY_HF})")
     arch = Qwen4ExpArch.from_config(TINY_HF / "config.json")
     layer, P = 1, HQ.PROBE_ROWS
     dev = torch.device("cpu")
@@ -504,6 +522,8 @@ def main() -> int:
     for t in tests:
         try:
             t()
+        except _Skipped as s:
+            print(f"SKIP: {s}")
         except Exception:  # noqa: BLE001
             FAILS.append(f"{t.__name__} raised")
             traceback.print_exc()

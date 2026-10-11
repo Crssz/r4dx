@@ -166,6 +166,17 @@ std::string CheckDefaultTokenizerDir(const ModelDialect& d, const std::string& r
          "tokenizer.json is not loadable by r4dx)";
 }
 
+Qwen4ExpFlags MakeQwen4ExpFlags(int64_t tp, int64_t pp, int64_t mtp, bool dflash_given, bool vision_on, bool images) {
+  Qwen4ExpFlags f;
+  f.tp = tp;
+  f.pp = pp;
+  f.mtp = mtp;
+  f.dflash = dflash_given;
+  f.vision_on = vision_on;
+  f.images = images;
+  return f;
+}
+
 std::string CheckQwen4ExpFlags(const Qwen4ExpFlags& f) {
   std::string refused;
   const auto add = [&](const std::string& what) { refused += (refused.empty() ? "" : "; ") + what; };

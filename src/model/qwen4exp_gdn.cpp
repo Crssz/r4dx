@@ -10,6 +10,7 @@
 #include "r4dx/core/error.hpp"
 #include "r4dx/core/r4d.hpp"
 #include "r4dx/model/qwen4exp/gdn_sigmoid_norm.h"
+#include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 
 namespace r4dx::model {
@@ -22,17 +23,11 @@ constexpr int64_t kScanChunk = 64;  // r4d_gdn_dims().chunk
 constexpr int kActSilu = 0;         // r4d_gdn_gated_rmsnorm_h128_bf16 / recurrent_update act codes
 constexpr int kActSigmoid = 1;
 
-[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("Qwen4ExpGdn: " + msg); }
+constexpr const char* kCtx = "Qwen4ExpGdn";
 
-size_t Padded(size_t bytes) { return (bytes + 15) & ~size_t{15}; }  // Arena::Alloc pads every allocation end to 16
+[[noreturn]] void Fail(const std::string& msg) { qwen4exp::Fail(kCtx, msg); }
 
-void CheckLinear(const QuantLinear* l, const char* name, int64_t n, int64_t k) {
-  if (l == nullptr) Fail(std::string("missing weight ") + name);
-  if (l->N != n || l->K != k) {
-    Fail(std::string(name) + " is [" + std::to_string(l->N) + ", " + std::to_string(l->K) + "], expected [" +
-         std::to_string(n) + ", " + std::to_string(k) + "]");
-  }
-}
+using qwen4exp::Padded;  // Arena::Alloc pads every allocation end to 16
 
 void CheckPtr(const void* p, const char* name) {
   if (p == nullptr) Fail(std::string("missing weight ") + name);
@@ -61,9 +56,9 @@ Qwen4ExpGdn::Qwen4ExpGdn(const Qwen4ExpConfig& cfg, const Qwen4ExpGdnRefs& w)
   if (K_ != 128 || V_ != 128) Fail("libr4d's GDN kernels are written for key / value head dim 128");
   if (width_ != 4) Fail("libr4d's GDN conv kernels are written for a conv kernel of 4");
   if (H_ % Hg_ != 0) Fail("value heads are not a multiple of key heads");
-  CheckLinear(w.in_proj_qkv, "in_proj_qkv", conv_dim_, hidden_);
-  CheckLinear(w.in_proj_z, "in_proj_z", value_dim_, hidden_);
-  CheckLinear(w.out_proj, "out_proj", hidden_, value_dim_);
+  qwen4exp::CheckLinear(kCtx, w.in_proj_qkv, "in_proj_qkv", conv_dim_, hidden_);
+  qwen4exp::CheckLinear(kCtx, w.in_proj_z, "in_proj_z", value_dim_, hidden_);
+  qwen4exp::CheckLinear(kCtx, w.out_proj, "out_proj", hidden_, value_dim_);
   CheckPtr(w.in_proj_a, "in_proj_a");
   CheckPtr(w.in_proj_b, "in_proj_b");
   CheckPtr(w.conv1d_weight, "conv1d_weight");

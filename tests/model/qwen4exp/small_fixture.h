@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "r4dx/core/device_buffer.hpp"
+#include "r4dx/models_root.h"
 #include "r4dx/core/dtype.hpp"
 
 namespace q4test {
@@ -49,7 +50,7 @@ class Fixtures {
  public:
   static std::string Dir() {
     const char* e = std::getenv("Q4EXP_SMALL_FIXTURES");
-    return e != nullptr && e[0] != 0 ? e : "E:\\models\\r4dx\\q4exp-fixtures\\SmallKernels";
+    return e != nullptr && e[0] != 0 ? e : r4dx::ModelsPath("r4dx/q4exp-fixtures/SmallKernels");
   }
 
   // Returns false when the fixture directory is not there.

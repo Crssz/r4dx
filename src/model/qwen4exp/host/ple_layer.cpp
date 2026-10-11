@@ -4,6 +4,7 @@
 #include <string>
 
 #include "r4dx/core/error.hpp"
+#include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/hc_kernels.h"
 #include "r4dx/model/qwen4exp/ple_kernels.h"
@@ -12,25 +13,10 @@ namespace r4dx::model::qwen4exp {
 
 namespace {
 
-[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("qwen4exp::PleLayer: " + msg); }
+constexpr const char* kCtx = "qwen4exp::PleLayer";
 
-void Check(int code, const char* what) {
-  if (code != 0) {
-    throw std::runtime_error(std::string("qwen4exp::PleLayer: ") + what + " failed: " +
-                             hipGetErrorString(static_cast<hipError_t>(code)));
-  }
-}
-
-void CheckLinear(const QuantLinear* l, const char* name, int64_t n, int64_t k) {
-  if (l == nullptr) Fail(std::string("missing weight ") + name);
-  if (l->N != n || l->K != k) {
-    Fail(std::string(name) + " is [" + std::to_string(l->N) + ", " + std::to_string(l->K) + "], expected [" +
-         std::to_string(n) + ", " + std::to_string(k) + "]");
-  }
-}
-
-constexpr size_t kAlign = 16;
-size_t Padded(size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
+[[noreturn]] void Fail(const std::string& msg) { qwen4exp::Fail(kCtx, msg); }
+void Check(int code, const char* what) { qwen4exp::Check(kCtx, code, what); }
 
 }  // namespace
 
@@ -41,8 +27,8 @@ PleLayer::PleLayer(const PleConfig& cfg, const PleWeights& w) : cfg_(cfg), w_(w)
          std::to_string(cfg.conv_dilation));
   }
   const int64_t channels = static_cast<int64_t>(cfg.hc) * cfg.hidden;
-  CheckLinear(w.key_proj, "key_proj", channels, cfg.embed_dim);
-  CheckLinear(w.value_proj, "value_proj", cfg.hidden, cfg.embed_dim);
+  CheckLinear(kCtx, w.key_proj, "key_proj", channels, cfg.embed_dim);
+  CheckLinear(kCtx, w.value_proj, "value_proj", cfg.hidden, cfg.embed_dim);
   if (w.norm_key == nullptr || w.norm_query == nullptr || w.norm_conv == nullptr || w.conv1d == nullptr) {
     Fail("missing norm / conv weight");
   }

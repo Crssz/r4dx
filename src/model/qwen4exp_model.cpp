@@ -5,16 +5,13 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <limits>
-#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 
 #include "r4dx/core/device_buffer.hpp"
@@ -164,95 +161,6 @@ Qwen4ExpLayerRefs LayerRefs(const Qwen4ExpContainer& c, int64_t i) {
 
 }  // namespace
 
-class Stage0Worker {
- public:
-  Stage0Worker(Qwen4ExpStage* stage, int device)
-      : stage_(stage), device_(device), thread_([this] { Loop(); }) {}
-  ~Stage0Worker() {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      stop_ = true;
-    }
-    cv_work_.notify_one();
-    if (thread_.joinable()) thread_.join();
-  }
-
-  void Submit(const Qwen4ExpChunk& chunk, const uint16_t* embed_rows, int64_t rows, uint16_t* handoff_host) {
-    {
-      std::lock_guard<std::mutex> lk(mu_);
-      chunk_ = chunk;
-      embed_rows_ = embed_rows;
-      rows_ = rows;
-      handoff_host_ = handoff_host;
-      done_ = false;
-      has_work_ = true;
-    }
-    cv_work_.notify_one();
-  }
-
-  void Wait() {
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_done_.wait(lk, [this] { return done_; });
-    if (err_) {
-      std::exception_ptr e = std::exchange(err_, nullptr);
-      std::rethrow_exception(e);
-    }
-  }
-
- private:
-  void Loop() {
-    Qwen4ExpDeviceScope dev(device_);
-    while (true) {
-      Qwen4ExpChunk chunk;
-      const uint16_t* embed_rows = nullptr;
-      int64_t rows = 0;
-      uint16_t* handoff_host = nullptr;
-      {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_work_.wait(lk, [this] { return has_work_ || stop_; });
-        if (stop_) return;
-        chunk = chunk_;
-        embed_rows = embed_rows_;
-        rows = rows_;
-        handoff_host = handoff_host_;
-        has_work_ = false;
-      }
-
-      std::exception_ptr err;
-      try {
-        if (embed_rows != nullptr) {
-          stage_->LoadEmbedding(embed_rows, rows);
-        }
-        stage_->RunLayers(chunk);
-        if (handoff_host != nullptr) {
-          stage_->StoreResidual(handoff_host, rows);
-        }
-      } catch (...) {
-        err = std::current_exception();
-      }
-
-      {
-        std::lock_guard<std::mutex> lk(mu_);
-        err_ = err;
-        done_ = true;
-      }
-      cv_done_.notify_one();
-    }
-  }
-
-  Qwen4ExpStage* stage_ = nullptr;
-  int device_ = 0;
-  std::mutex mu_;
-  std::condition_variable cv_work_, cv_done_;
-  bool has_work_ = false, done_ = true, stop_ = false;
-  std::exception_ptr err_;
-  Qwen4ExpChunk chunk_;
-  const uint16_t* embed_rows_ = nullptr;
-  int64_t rows_ = 0;
-  uint16_t* handoff_host_ = nullptr;
-  std::thread thread_;
-};
-
 // ---- load -----------------------------------------------------------------------------------------------------------
 
 std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& options) {
@@ -395,7 +303,6 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
   m.embed_rows_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hidden_size));
   if (m.stages_.size() > 1) {
     m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hc_count * cfg.hidden_size));
-    m.stage0_worker_ = std::make_unique<Stage0Worker>(m.stages_[0].get(), m.stages_[0]->Device());
   }
   // ---- the n-gram table -------------------------------------------------------------------------------------------
   m.ple_enabled_ = !cfg.ple_layer_indices.empty();
@@ -437,7 +344,6 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
 }
 
 Qwen4ExpModel::~Qwen4ExpModel() {
-  stage0_worker_.reset();
   DrainNgram();  // reads in flight write into the pinned buffers below
 }
 
@@ -515,45 +421,31 @@ void Qwen4ExpModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefil
   chunk.ple_rows = [this]() { return WaitNgramRows(); };
   if (iso != nullptr) chunk.only_layer = iso->layer;
 
-  if (stages_.size() == 2 && iso == nullptr && stage0_worker_) {
-    const auto t_st0 = Clock::now();
-    stage0_worker_->Submit(chunk, embed_rows_host_.data(), rows, handoff_host_.data());
-    stage0_worker_->Wait();
-    last_.stage_ms[0] += MsSince(t_st0);
-
-    const auto t_hand = Clock::now();
-    stages_[1]->LoadResidual(handoff_host_.data(), rows);
-    last_.handoff_ms += MsSince(t_hand);
-
-    const auto t_st1 = Clock::now();
-    stages_[1]->RunLayers(chunk);
-    last_.stage_ms[1] += MsSince(t_st1);
-  } else {
-    if (iso == nullptr) stages_.front()->LoadEmbedding(embed_rows_host_.data(), rows);
-    for (size_t s = 0; s < stages_.size(); ++s) {
-      if (iso != nullptr) {
-        Qwen4ExpStage& st = *stages_[s];
-        if (iso->layer < st.FirstLayer() || iso->layer >= st.EndLayer()) continue;
-        st.LoadResidual(iso->residual_in, rows);
-        st.RunLayers(chunk);
-        last_.stage_ms[std::min<size_t>(s, 1)] += st.LastRunMs();
-        last_.ple_wait_ms += st.LastPleWaitMs();
-        continue;
-      }
-      Qwen4ExpStage& st = *stages_[s];
-      if (s > 0) {
-        const auto t0 = Clock::now();
-        st.LoadResidual(handoff_host_.data(), rows);
-        last_.handoff_ms += MsSince(t0);
-      }
+  // Both stages are driven in sequence on this thread; each Qwen4ExpStage method sets its own device scope. Stage s > 0
+  // takes the residual stage s-1 left in pinned host memory.
+  if (iso == nullptr) stages_.front()->LoadEmbedding(embed_rows_host_.data(), rows);
+  for (size_t s = 0; s < stages_.size(); ++s) {
+    Qwen4ExpStage& st = *stages_[s];
+    if (iso != nullptr) {
+      if (iso->layer < st.FirstLayer() || iso->layer >= st.EndLayer()) continue;
+      st.LoadResidual(iso->residual_in, rows);
       st.RunLayers(chunk);
       last_.stage_ms[std::min<size_t>(s, 1)] += st.LastRunMs();
       last_.ple_wait_ms += st.LastPleWaitMs();
-      if (s + 1 < stages_.size()) {
-        const auto t0 = Clock::now();
-        st.StoreResidual(handoff_host_.data(), rows);
-        last_.handoff_ms += MsSince(t0);
-      }
+      continue;
+    }
+    if (s > 0) {
+      const auto t0 = Clock::now();
+      st.LoadResidual(handoff_host_.data(), rows);
+      last_.handoff_ms += MsSince(t0);
+    }
+    st.RunLayers(chunk);
+    last_.stage_ms[std::min<size_t>(s, 1)] += st.LastRunMs();
+    last_.ple_wait_ms += st.LastPleWaitMs();
+    if (s + 1 < stages_.size()) {
+      const auto t0 = Clock::now();
+      st.StoreResidual(handoff_host_.data(), rows);
+      last_.handoff_ms += MsSince(t0);
     }
   }
   // a stage without a PLE layer in range never consumed the rows: still settle the reads before the buffers are reused

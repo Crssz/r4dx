@@ -1,7 +1,8 @@
 // r4dx::model::Qwen4ExpLocalTextModel -- the TextModel of a qwen4_exp container (docs/qwen4exp-plan.md 4.1, 4.11 item 4,
 // task M1-16): one Qwen4ExpModel, which itself drives its one or two stages (devices) on the calling thread, every method a
-// forward to the Qwen4ExpModel method of the same name. MTP, DFlash, vision and audio are later milestones (M3 / M4 and
-// beyond): their methods throw std::runtime_error naming the feature, and MtpEnabled() / HasVision() / DflashEnabled()
+// forward to the Qwen4ExpModel method of the same name. MTP, DFlash, vision and audio are not supported for this model
+// (no MTP head or DFlash drafter is wired up; vision is a later milestone): the model options refuse them by name at
+// load, their methods throw std::runtime_error naming the feature, and MtpEnabled() / HasVision() / DflashEnabled()
 // are false. TpWorld() is 1: the two cards are a layer split inside the model, not tensor parallelism.
 // LoadQwen4ExpTextModel (declared in text_model.h) is the qwen4_exp branch of LoadTextModel.
 #pragma once

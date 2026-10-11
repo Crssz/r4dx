@@ -4,6 +4,7 @@
 #include <string>
 
 #include "r4dx/core/error.hpp"
+#include "r4dx/model/qwen4exp/common.h"
 #include "r4dx/model/qwen4exp/hc_bf16_gemm.h"
 #include "r4dx/model/qwen4exp/moe_kernels.h"
 
@@ -11,25 +12,10 @@ namespace r4dx::model::qwen4exp {
 
 namespace {
 
-[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("qwen4exp::MoeBlockBase: " + msg); }
+constexpr const char* kCtx = "qwen4exp::MoeBlockBase";
 
-void Check(int code, const char* what) {
-  if (code != 0) {
-    throw std::runtime_error(std::string("qwen4exp::MoeBlockBase: ") + what + " failed: " +
-                             hipGetErrorString(static_cast<hipError_t>(code)));
-  }
-}
-
-void CheckLinear(const QuantLinear* l, const char* name, int64_t n, int64_t k) {
-  if (l == nullptr) Fail(std::string("missing weight ") + name);
-  if (l->N != n || l->K != k) {
-    Fail(std::string(name) + " is [" + std::to_string(l->N) + ", " + std::to_string(l->K) + "], expected [" +
-         std::to_string(n) + ", " + std::to_string(k) + "]");
-  }
-}
-
-constexpr size_t kAlign = 16;
-size_t Padded(size_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
+[[noreturn]] void Fail(const std::string& msg) { qwen4exp::Fail(kCtx, msg); }
+void Check(int code, const char* what) { qwen4exp::Check(kCtx, code, what); }
 
 }  // namespace
 
@@ -60,11 +46,11 @@ void MoeBlockBase::Forward(hipStream_t stream, core::Arena& arena, const MoeWeig
   }
   if (!run_expert) Fail("run_expert callback is empty");
   const int E = cfg_.experts, k = cfg_.top_k, H = cfg_.hidden, I = cfg_.inter, SI = cfg_.shared_inter;
-  CheckLinear(w.router, "router", E, H);
-  CheckLinear(w.shared_gate_proj, "shared_gate_proj", SI, H);
-  CheckLinear(w.shared_up_proj, "shared_up_proj", SI, H);
-  CheckLinear(w.shared_down_proj, "shared_down_proj", H, SI);
-  CheckLinear(w.shared_gate, "shared_gate", 1, H);
+  CheckLinear(kCtx, w.router, "router", E, H);
+  CheckLinear(kCtx, w.shared_gate_proj, "shared_gate_proj", SI, H);
+  CheckLinear(kCtx, w.shared_up_proj, "shared_up_proj", SI, H);
+  CheckLinear(kCtx, w.shared_down_proj, "shared_down_proj", H, SI);
+  CheckLinear(kCtx, w.shared_gate, "shared_gate", 1, H);
   const int64_t P = rows * k;
 
   uint16_t* logits = arena.Alloc<uint16_t>(static_cast<size_t>(rows * E));

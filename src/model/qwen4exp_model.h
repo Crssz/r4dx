@@ -3,8 +3,8 @@
 //
 // Two Qwen4ExpStage objects (qwen4exp_stage.h): stage 0 holds layers [0, k) -- the host embedding gather, the n-gram rows
 // and the PLE layer are driven from here -- and stage 1 layers [k, L), the final mixer and the lm_head. k comes from the
-// loader's ChooseSplit (bytes balanced per card) unless asked for. The two are driven in sequence on the calling
-// thread: stage 0 runs a chunk, its residual [rows, 4 * hidden] bf16 goes through pinned host memory (D2H on stage 0's
+// loader's ChooseSplit (bytes balanced per card) unless asked for. The two are driven in sequence: stage 0 runs a
+// chunk on the Stage0Worker thread (the caller waits), its residual [rows, 4 * hidden] bf16 goes through pinned host memory (D2H on stage 0's
 // stream, synchronize, H2D on stage 1's), stage 1 runs it. When both stages sit on one device and no split was asked for
 // there is a single stage with everything. The hand-off copies bytes, so a two-stage run equals the one-stage run bit for
 // bit.
@@ -20,7 +20,9 @@
 // the checkpoint copies the GDN + PLE state and the n-gram history, and a restore rewinds the position and the QSA
 // bookkeeping (KV and block keys beyond the position are overwritten before they are read).
 //
-// Not thread-safe; every method runs on the calling thread. After an exception out of Prefill / Decode*, call Reset().
+// Not thread-safe; callers must serialize. Internally stage 0 runs on a worker thread (Stage0Worker) while the caller
+// blocks until it is done, so a worker failure is rethrown on the calling thread. After an exception out of Prefill /
+// Decode*, call Reset().
 #pragma once
 
 #include <cstdint>
@@ -42,7 +44,6 @@
 #include "r4dx/model/qwen4exp/ngram_ids.h"
 #include "r4dx/model/qwen4exp/ngram_reader.h"
 #include "r4dx/model/qwen4exp/ngram_sidecar.h"
-#include "r4dx/model/qwen4exp/qwen4exp_mtp.h"
 namespace r4dx::model {
 
 class Stage0Worker;
@@ -103,10 +104,6 @@ class Qwen4ExpModel {
   std::vector<float> DecodeStep(int32_t token_id);
   int32_t DecodeStepGreedy(int32_t token_id);
   int32_t DecodeStepSampled(int32_t token_id, const kernels::SampleParams& params, std::mt19937_64& rng);
-  std::vector<int32_t> DecodeStepMtpGreedy(int32_t token_id, int64_t k);
-  std::vector<int32_t> DecodeStepMtpSampled(int32_t token_id, int64_t k,
-                                            const kernels::SampleParams& params,
-                                            std::mt19937_64& rng);
   // ---- diagnostics / tests --------------------------------------------------------------------------------------------
   // Installs `fn` on every stage (see Qwen4ExpCapture). With a capture installed every chunk of a Prefill also runs the
   // head so `mixer_out` / `logits` cover all rows. An empty function removes it.
@@ -142,7 +139,6 @@ class Qwen4ExpModel {
   struct HeadOut {
     std::vector<float> logits;
     int32_t token = -1;
-    std::vector<int32_t> tokens;
     kernels::RowSummary summary;
   };
   // One chunk end to end. `head` null: no logits wanted. `iso` (RunLayerIsolated): skip the embedding and the other layers.
@@ -187,9 +183,6 @@ class Qwen4ExpModel {
   int64_t sampled_fallback_rows_ = 0;
   bool capture_active_ = false;
   Timings last_;
-  std::vector<int32_t> context_tokens_;
-  std::unique_ptr<qwen4exp::Qwen4ExpMtp> mtp_;
-  core::DeviceBuffer<uint16_t> last_residual_dev_;
 };
 
 }  // namespace r4dx::model

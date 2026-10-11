@@ -624,7 +624,7 @@ int RunMain(int argc, char** argv) {
   }
   r4dx::ChatJson extra_context = r4dx::ChatJson::object();
   extra_context["enable_thinking"] = args.thinking;
-  extra_context["preserve_thinking"] = true;
+  if (container_arch == r4dx::model::Arch::kQwen4Exp) extra_context["preserve_thinking"] = true;
   std::vector<int32_t> fed_tokens;  // everything already committed to model's KV/GDN state
 
   // Vision (docs/vision.md "Text-side splicing", --image): one entry per TURN that attached at
@@ -731,8 +731,14 @@ int RunMain(int argc, char** argv) {
       // rather than killing the session (std::exit(1)).
       std::fprintf(stderr, "warning: chat template re-render did not extend the previous token "
                             "prefix; dropping state and re-prefilling the whole conversation\n");
-      // Drop sequence state without reloading the model weights from disk.
-      model->Reset();
+      if (args.tp == 1 && dynamic_cast<r4dx::model::PpModel*>(model.get()) == nullptr &&
+          container_arch != r4dx::model::Arch::kQwen4Exp) {
+        model = r4dx::model::LoadTextModel(opts, tpo, ppo);
+      } else {
+        // docs/tp.md 2.8: a second full TP load would need twice the VRAM; Reset() drops the same
+        // per-sequence state without touching a weight. qwen4_exp's 50+ GB container is never reloaded either.
+        model->Reset();
+      }
       new_tokens.assign(full_tokens.begin(), full_tokens.end());
       skip = 0;
     } else {
@@ -773,21 +779,23 @@ int RunMain(int argc, char** argv) {
     // see TurnResult::committed_tokens's own comment / docs/mtp.md's "mid-round" gap (fixed here).
     fed_tokens = full_tokens;
     fed_tokens.insert(fed_tokens.end(), r.committed_tokens.begin(), r.committed_tokens.end());
-    std::string reasoning_content;
-    std::string content = r.generated_text;
-    constexpr std::string_view kThinkClose = "</think>";
-    const size_t close_pos = content.find(kThinkClose);
-    if (close_pos != std::string::npos) {
-      reasoning_content = content.substr(0, close_pos);
-      size_t answer_start = close_pos + kThinkClose.size();
-      while (answer_start < content.size() && (content[answer_start] == '\n' || content[answer_start] == '\r')) {
-        ++answer_start;
+    r4dx::ChatJson asst_msg = {{"role", "assistant"}, {"content", r.generated_text}};
+    if (container_arch == r4dx::model::Arch::kQwen4Exp) {
+      // qwen4_exp's template wants the thinking block as reasoning_content, not inline in content
+      std::string reasoning_content;
+      std::string content = r.generated_text;
+      constexpr std::string_view kThinkClose = "</think>";
+      const size_t close_pos = content.find(kThinkClose);
+      if (close_pos != std::string::npos) {
+        reasoning_content = content.substr(0, close_pos);
+        size_t answer_start = close_pos + kThinkClose.size();
+        while (answer_start < content.size() && (content[answer_start] == '\n' || content[answer_start] == '\r')) {
+          ++answer_start;
+        }
+        content = content.substr(answer_start);
+        asst_msg["content"] = content;
+        if (!reasoning_content.empty()) asst_msg["reasoning_content"] = reasoning_content;
       }
-      content = content.substr(answer_start);
-    }
-    r4dx::ChatJson asst_msg = {{"role", "assistant"}, {"content", content}};
-    if (!reasoning_content.empty()) {
-      asst_msg["reasoning_content"] = reasoning_content;
     }
     messages.push_back(asst_msg);
 

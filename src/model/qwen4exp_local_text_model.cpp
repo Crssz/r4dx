@@ -31,14 +31,13 @@ std::vector<float> Qwen4ExpLocalTextModel::PrefillMultimodal(const std::vector<i
   return m_->Prefill(token_ids);  // no images: a plain Prefill
 }
 
-std::vector<int32_t> Qwen4ExpLocalTextModel::DecodeStepMtpGreedy(int32_t token_id, int64_t k) {
-  return m_->DecodeStepMtpGreedy(token_id, k);
+std::vector<int32_t> Qwen4ExpLocalTextModel::DecodeStepMtpGreedy(int32_t, int64_t) {
+  Unsupported("MTP", "no MTP head is wired up for this model");
 }
 
-std::vector<int32_t> Qwen4ExpLocalTextModel::DecodeStepMtpSampled(int32_t token_id, int64_t k,
-                                                                  const kernels::SampleParams& params,
-                                                                  std::mt19937_64& rng) {
-  return m_->DecodeStepMtpSampled(token_id, k, params, rng);
+std::vector<int32_t> Qwen4ExpLocalTextModel::DecodeStepMtpSampled(int32_t, int64_t, const kernels::SampleParams&,
+                                                                  std::mt19937_64&) {
+  Unsupported("MTP", "no MTP head is wired up for this model");
 }
 
 std::vector<int32_t> Qwen4ExpLocalTextModel::DecodeStepDflashGreedy(int32_t, int64_t, float, int64_t, int64_t*) {
@@ -60,7 +59,9 @@ StepProfile Qwen4ExpLocalTextModel::PrefillProfiled(const std::vector<int32_t>&)
 }
 
 Qwen4ExpModelOptions MakeQwen4ExpModelOptions(const ModelOptions& opts) {
-  // opts.mtp_draft_k: supported via Qwen4ExpModel::DecodeStepMtp*
+  if (opts.mtp_draft_k > 0) {
+    throw std::invalid_argument("LoadTextModel: MTP is not available for qwen4_exp (no MTP head is wired up for this model)");
+  }
   if (!opts.dflash_container.empty() || opts.dflash_draft_k > 0) {
     throw std::invalid_argument("LoadTextModel: DFlash is not available for qwen4_exp (no drafter exists for this model)");
   }

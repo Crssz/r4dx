@@ -295,10 +295,11 @@ try {
   std::vector<uint16_t> h_grp = out_grp.CopyToHost();
   float max_diff = 0.0f;
   for (int i = 0; i < hidden; ++i) {
-    max_diff = std::max(max_diff, std::fabs(Bf16ToFloat(h_seq[i]) - Bf16ToFloat(h_grp[i])));
+    const float d = std::fabs(Bf16ToFloat(h_seq[i]) - Bf16ToFloat(h_grp[i]));
+    if (d > max_diff || d != d) max_diff = d;  // a NaN sticks: std::max would drop it
   }
   std::printf("Max final diff:   %.6f\n", max_diff);
-  if (max_diff > 0.005f) {
+  if (!(max_diff <= 0.005f)) {  // also fails on NaN
     std::printf("FAIL: max diff %.6f exceeds tolerance 0.005\n", max_diff);
     return 1;
   }

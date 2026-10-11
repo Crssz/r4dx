@@ -45,7 +45,7 @@ __global__ __launch_bounds__(kRouteWaves * dev::kWave) void RouteKernel(
   float my_p = 0.0f;
   for (int j = 0; j < k; ++j) {
     float best = -INFINITY;
-    int bid = INT_MAX;
+    int bid = lane < experts ? lane : 0;  // in range even if every logit is NaN / -inf (`v > best` never fires)
     for (int i = lane; i < experts; i += dev::kWave) {  // ascending i: the lowest id among equals wins in-lane
       const float v = l[i];
       if (v > best) {

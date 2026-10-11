@@ -519,10 +519,6 @@ void Qwen4ExpStage::StoreResidual(uint16_t* host_rows, int64_t rows) {
                                 hipMemcpyDeviceToHost, m.stream.get()));
   m.stream.Synchronize();
 }
-
-const uint16_t* Qwen4ExpStage::LastResidualDev() const {
-  return impl_->h.data();
-}
 // ---- the layers -----------------------------------------------------------------------------------------------------
 
 void Qwen4ExpStage::Impl::RunGdn(LayerRt& L, const Qwen4ExpChunk& c) {
@@ -817,25 +813,6 @@ Qwen4ExpHeadResult Qwen4ExpStage::Head(int64_t rows, const Qwen4ExpHeadRequest& 
     m.Cap(-1, "logits", m.logits_all.data(), Qwen4ExpCapture::Dtype::kBf16, rows, m.vocab, m.last_first_pos);
   }
 
-  if (req.kind == Qwen4ExpHeadRequest::Kind::kAllArgmax) {
-    m.hc_final->Mix(s, m.arena, m.h.data(), rows, m.x.data());
-    uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(rows * m.vocab));
-    qwen4exp::ApplyBf16Linear(s, m.arena, lm, m.x.data(), logits_bf16, rows);
-    Qwen4ExpHeadResult out;
-    out.tokens.resize(static_cast<size_t>(rows));
-    for (int64_t r = 0; r < rows; ++r) {
-      r4dx_argmax_bf16(reinterpret_cast<int64_t>(logits_bf16 + r * m.vocab),
-                       reinterpret_cast<int64_t>(m.argmax_dev.data()), m.vocab, reinterpret_cast<int64_t>(s));
-      R4DX_HIP_CHECK(hipMemcpyAsync(m.greedy_host.data(), m.argmax_dev.data(), sizeof(int32_t),
-                                    hipMemcpyDeviceToHost, s));
-      m.stream.Synchronize();
-      out.tokens[static_cast<size_t>(r)] = m.greedy_host[0];
-    }
-    out.token = out.tokens.back();
-    m.last_head_ms = MsSince(t0);
-    return out;
-  }
-
   // the last row only: the mixer and the lm_head are row-independent
   const uint16_t* h_last = m.h.data() + (rows - 1) * m.wide;
   m.hc_final->Mix(s, m.arena, h_last, 1, m.x.data());
@@ -844,8 +821,6 @@ Qwen4ExpHeadResult Qwen4ExpStage::Head(int64_t rows, const Qwen4ExpHeadRequest& 
 
   Qwen4ExpHeadResult out;
   switch (req.kind) {
-    case Qwen4ExpHeadRequest::Kind::kAllArgmax:
-      break;
     case Qwen4ExpHeadRequest::Kind::kLogits: {
       r4dx_model_widen_bf16_to_f32(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.logits_dev.data()),
                                    m.vocab, reinterpret_cast<int64_t>(s));

@@ -173,6 +173,7 @@ std::string CheckQwen4ExpFlags(const Qwen4ExpFlags& f) {
     add("--tp " + std::to_string(f.tp) + " (qwen4_exp splits its own layers over the two cards; there is no tensor parallelism)");
   }
   if (f.pp == 2) add("--pp 2 (qwen4_exp already runs as a two-stage pipeline of its own; there is no --pp)");
+  if (f.mtp > 0) add("--mtp " + std::to_string(f.mtp) + " (qwen4_exp has no MTP head)");
   if (f.dflash) add("--dflash (there is no DFlash drafter for qwen4_exp)");
   if (f.vision_on) add("--vision on (qwen4_exp is text only)");
   if (f.images) add("--image (qwen4_exp is text only)");

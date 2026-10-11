@@ -64,6 +64,30 @@ inline std::string WideToUtf8(const std::wstring& w) {
 class SafetensorsReader {
  public:
   explicit SafetensorsReader(const std::wstring& path) : path_display_(WideToUtf8(path)) {
+    try {
+      Open(path);
+    } catch (...) {
+      Release();  // a throwing constructor never runs the destructor
+      throw;
+    }
+  }
+
+  ~SafetensorsReader() { Release(); }
+
+  SafetensorsReader(const SafetensorsReader&) = delete;
+  SafetensorsReader& operator=(const SafetensorsReader&) = delete;
+
+ private:
+  void Release() {
+    if (view_) UnmapViewOfFile(view_);
+    if (mapping_) CloseHandle(mapping_);
+    if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    view_ = nullptr;
+    mapping_ = nullptr;
+    file_ = INVALID_HANDLE_VALUE;
+  }
+
+  void Open(const std::wstring& path) {
     file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                          FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file_ == INVALID_HANDLE_VALUE) {
@@ -81,9 +105,9 @@ class SafetensorsReader {
     if (file_size_ < 8) throw std::runtime_error("safetensors: file too small for header");
     uint64_t header_len = 0;
     std::memcpy(&header_len, view_, 8);
-    if (8 + header_len > file_size_) throw std::runtime_error("safetensors: header length overruns file");
+    if (header_len > file_size_ - 8) throw std::runtime_error("safetensors: header length overruns file");
 
-    std::string header_json(reinterpret_cast<const char*>(view_ + 8), header_len);
+    std::string header_json(reinterpret_cast<const char*>(view_ + 8), static_cast<size_t>(header_len));
     data_start_ = 8 + header_len;
     nlohmann::json j = nlohmann::json::parse(header_json);
     for (auto it = j.begin(); it != j.end(); ++it) {
@@ -106,12 +130,18 @@ class SafetensorsReader {
                                   " has data_offsets end < begin (" + std::to_string(m.end) + " < " +
                                   std::to_string(m.begin) + ")");
       }
-      if (data_start_ + m.end > file_size_) {
+      if (m.end > file_size_ - data_start_) {
         throw std::runtime_error(
             "safetensors: tensor '" + it.key() + "' in " + path_display_ + " needs bytes [" +
             std::to_string(data_start_ + m.begin) + "," + std::to_string(data_start_ + m.end) +
             ") but the file is only " + std::to_string(file_size_) +
             " bytes -- shard is truncated or still downloading");
+      }
+      for (int64_t d : m.shape) {
+        if (d < 0) {
+          throw std::runtime_error("safetensors: tensor '" + it.key() + "' in " + path_display_ +
+                                    " has a negative shape dimension");
+        }
       }
       const uint64_t dsize = SafetensorsDtypeSize(m.dtype);
       if (dsize != 0) {
@@ -127,15 +157,7 @@ class SafetensorsReader {
     }
   }
 
-  ~SafetensorsReader() {
-    if (view_) UnmapViewOfFile(view_);
-    if (mapping_) CloseHandle(mapping_);
-    if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
-  }
-
-  SafetensorsReader(const SafetensorsReader&) = delete;
-  SafetensorsReader& operator=(const SafetensorsReader&) = delete;
-
+ public:
   bool Has(const std::string& name) const { return tensors_.count(name) != 0; }
   const TensorMeta& Meta(const std::string& name) const { return tensors_.at(name); }
   const uint8_t* Data(const std::string& name) const {

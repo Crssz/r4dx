@@ -154,14 +154,13 @@ struct Qwen4ExpChunk {
 };
 
 struct Qwen4ExpHeadRequest {
-  enum class Kind { kLogits, kArgmax, kSummary, kAllArgmax };
+  enum class Kind { kLogits, kArgmax, kSummary };
   Kind kind = Kind::kLogits;
   float inv_temperature = 0.0f;  // kSummary
 };
 struct Qwen4ExpHeadResult {
   std::vector<float> logits;  // kLogits: the last row's fp32 logits [vocab]
   int32_t token = -1;         // kArgmax
-  std::vector<int32_t> tokens; // kAllArgmax: argmax token for each row
   kernels::RowSummary summary;  // kSummary
 };
 
@@ -196,7 +195,6 @@ class Qwen4ExpStage {
 
   // The residual [rows, hc * hidden] -> host (pinned preferred); synchronizes.
   void StoreResidual(uint16_t* host_rows, int64_t rows);
-  const uint16_t* LastResidualDev() const;
   // ---- the head (last stage): final mixer + lm_head on the LAST row of the chunk just run ----------------------------
   Qwen4ExpHeadResult Head(int64_t rows, const Qwen4ExpHeadRequest& request);
   // The fp32 logits row of the last kLogits / kSummary head call (the sampler's row-granular fallback), D2H.

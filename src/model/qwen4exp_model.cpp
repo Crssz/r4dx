@@ -8,7 +8,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -193,6 +193,10 @@ class Stage0Worker {
   void Wait() {
     std::unique_lock<std::mutex> lk(mu_);
     cv_done_.wait(lk, [this] { return done_; });
+    if (err_) {
+      std::exception_ptr e = std::exchange(err_, nullptr);
+      std::rethrow_exception(e);
+    }
   }
 
  private:
@@ -214,16 +218,22 @@ class Stage0Worker {
         has_work_ = false;
       }
 
-      if (embed_rows != nullptr) {
-        stage_->LoadEmbedding(embed_rows, rows);
-      }
-      stage_->RunLayers(chunk);
-      if (handoff_host != nullptr) {
-        stage_->StoreResidual(handoff_host, rows);
+      std::exception_ptr err;
+      try {
+        if (embed_rows != nullptr) {
+          stage_->LoadEmbedding(embed_rows, rows);
+        }
+        stage_->RunLayers(chunk);
+        if (handoff_host != nullptr) {
+          stage_->StoreResidual(handoff_host, rows);
+        }
+      } catch (...) {
+        err = std::current_exception();
       }
 
       {
         std::lock_guard<std::mutex> lk(mu_);
+        err_ = err;
         done_ = true;
       }
       cv_done_.notify_one();
@@ -235,6 +245,7 @@ class Stage0Worker {
   std::mutex mu_;
   std::condition_variable cv_work_, cv_done_;
   bool has_work_ = false, done_ = true, stop_ = false;
+  std::exception_ptr err_;
   Qwen4ExpChunk chunk_;
   const uint16_t* embed_rows_ = nullptr;
   int64_t rows_ = 0;
@@ -386,18 +397,6 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
     m.handoff_host_ = core::PinnedBuffer<uint16_t>(R * static_cast<size_t>(cfg.hc_count * cfg.hidden_size));
     m.stage0_worker_ = std::make_unique<Stage0Worker>(m.stages_[0].get(), m.stages_[0]->Device());
   }
-  // Try loading MTP neural drafter if model_mtp.safetensors exists
-  {
-    std::filesystem::path cp(options.container_path);
-    std::filesystem::path mtp_p = cp.parent_path() / "model_mtp.safetensors";
-    if (!std::filesystem::exists(mtp_p)) {
-      mtp_p = "E:/models/r4dx/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AWQ/model_mtp.safetensors";
-    }
-    if (std::filesystem::exists(mtp_p)) {
-      m.mtp_ = qwen4exp::Qwen4ExpMtp::Load(mtp_p.string(), m.cfg_, m.stages_.back()->Device(), m.stages_.back()->Stream());
-    }
-  }
-
   // ---- the n-gram table -------------------------------------------------------------------------------------------
   m.ple_enabled_ = !cfg.ple_layer_indices.empty();
   if (m.ple_enabled_) {
@@ -567,7 +566,6 @@ void Qwen4ExpModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefil
     if (out != nullptr) {
       out->logits = std::move(r.logits);
       out->token = r.token;
-      out->tokens = std::move(r.tokens);
       out->summary = r.summary;
     }
   }
@@ -611,7 +609,6 @@ std::vector<float> Qwen4ExpModel::Prefill(const std::vector<int32_t>& token_ids)
     off += static_cast<size_t>(n);
   }
   at_prefill_end_ = true;
-  context_tokens_ = token_ids;
   last_.total_ms = MsSince(t0);
   return std::move(out.logits);
 }
@@ -635,8 +632,6 @@ int32_t Qwen4ExpModel::DecodeStepGreedy(int32_t token_id) {
   const Qwen4ExpHeadRequest req{Qwen4ExpHeadRequest::Kind::kArgmax, 0.0f};
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
   last_.total_ms = MsSince(t0);
-  context_tokens_.push_back(token_id);
-  context_tokens_.push_back(out.token);
   return out.token;
 }
 
@@ -664,20 +659,6 @@ int32_t Qwen4ExpModel::DecodeStepSampled(int32_t token_id, const kernels::Sample
   const std::vector<float> row = stages_.back()->LastLogitsRow();  // this step's own fp32 row, no second lm_head pass
   return kernels::SampleCanonical(row.data(), vocab, params, u);
 }
-std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpGreedy(int32_t token_id, int64_t /*k*/) {
-  int32_t next = DecodeStepGreedy(token_id);
-  return {next};
-}
-
-std::vector<int32_t> Qwen4ExpModel::DecodeStepMtpSampled(int32_t token_id, int64_t /*k*/,
-                                                         const kernels::SampleParams& params,
-                                                         std::mt19937_64& rng) {
-  if (params.temperature <= 0.0f) {
-    return DecodeStepMtpGreedy(token_id, 0);
-  }
-  int32_t next = DecodeStepSampled(token_id, params, rng);
-  return {next};
-}
 
 // ---- state ------------------------------------------------------------------------------------------------------------
 
@@ -690,7 +671,6 @@ void Qwen4ExpModel::Reset() {
     stages_[s]->Reset();
   }
   if (ngram_ids_) ngram_ids_->Reset();
-  context_tokens_.clear();
   pos_ = 0;
   at_prefill_end_ = false;
   ckpt_pos_ = -1;

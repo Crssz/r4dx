@@ -45,6 +45,7 @@
 
 namespace r4dx::model {
 
+class Stage0Worker;
 struct Qwen4ExpModelOptions {
   std::string container_path;
   // Body layout (GDN / QSA / expert linears): the container's own -- trellis for a trellis container, bf16 or w4a16 for
@@ -163,7 +164,7 @@ class Qwen4ExpModel {
   // Declaration order is destruction order reversed: the stages (which borrow the containers' weights) go first.
   std::vector<std::unique_ptr<Qwen4ExpContainer>> containers_;
   std::vector<std::unique_ptr<Qwen4ExpStage>> stages_;
-
+  std::unique_ptr<Stage0Worker> stage0_worker_;
   // n-gram path
   bool ple_enabled_ = false;
   bool gdn_recurrent_ = false;

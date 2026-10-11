@@ -224,7 +224,7 @@ final mixer, lm_head). Total weights: 51.830 GiB.
 | 8192 | 8210 | 18.592 | 441.6 | 128 | 16.92* | 26.89 | 26.76 | 26.95 |
 | 32768 | 32804 | 72.959 | 449.6 | 128 | 17.88* | 27.07 | 26.93 | 27.19 |
 
-*(*The 8k and 32k decode figures are from the initial host-routed milestone-1 run and were not repeated with the on-GPU grouped MoE kernel, which measured 50.3 / 57.5 tok/s at the 256 / 2048-token prompts. Long-context decode with the grouped kernel is unmeasured.)*
+*(*The 8k and 32k decode figures are from the initial host-routed milestone-1 run. A re-run with the on-GPU grouped MoE kernel (2026-10-11, `bench.ps1 -Lengths 256,8192`) gave 44.05 tok/s at 243 prompt tokens and 48.79 tok/s at 8210 (prefill 176 and 499 tok/s); the 50.3 / 57.5 tok/s above came from an earlier run, so expect about 10% run-to-run spread. 32k is not re-measured.)*
 - **Grouped MoE decode speedup:** On-GPU expert sorting and grouped Trellis GEMV (`gate_up` and `down`) eliminated all 48 CPU-GPU synchronizations per token and reduced kernel launches from 2,160 to ~620 per token. Per-layer MoE decode dropped from 0.502 ms to **0.085 ms** (a **5.6x layer speedup**).
 - Decode speed jumped from 16.96 tok/s to **57.54 tok/s** (a **3.4x overall speedup**, latency dropped from 58.9 ms down to **17.3 ms/tok**).
 - Prefill throughput in the table: 231 tok/s at 243 tokens, 370 at 2k, about 440-450 at 8k-32k.

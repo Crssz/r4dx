@@ -297,6 +297,10 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
                  static_cast<double>(c.DeviceBytes()) / (1024.0 * 1024.0 * 1024.0), r.embed ? ", host embedding" : "",
                  r.head ? ", final mixer + lm_head" : "");
   }
+  if (const char* e = std::getenv("R4DX_Q4_PROFILE"); e != nullptr && *e != '\0' && std::string(e) != "0") {
+    m.profile_ = true;
+    for (auto& st : m.stages_) st->SetProfile(true);
+  }
 
   // ---- host buffers -----------------------------------------------------------------------------------------------
   const size_t R = static_cast<size_t>(kChunkRows);
@@ -345,6 +349,43 @@ std::unique_ptr<Qwen4ExpModel> Qwen4ExpModel::Load(const Qwen4ExpModelOptions& o
 
 Qwen4ExpModel::~Qwen4ExpModel() {
   DrainNgram();  // reads in flight write into the pinned buffers below
+  ReportDecodeProfile();
+}
+
+void Qwen4ExpModel::ProfileDecodeStep() {
+  if (!profile_) return;
+  // The stream-event reads wait for the events (one extra host call each) and run after total_ms was taken, so they do not
+  // count in it.
+  for (size_t s = 0; s < stages_.size(); ++s) last_.gpu_ms[std::min<size_t>(s, 1)] += stages_[s]->LastGpuMs();
+  last_.head_gpu_ms += stages_.back()->LastHeadGpuMs();
+  ++profile_steps_;
+  Timings& s = profile_sum_;
+  s.total_ms += last_.total_ms;
+  s.embed_ms += last_.embed_ms;
+  s.ple_wait_ms += last_.ple_wait_ms;
+  s.handoff_ms += last_.handoff_ms;
+  s.head_ms += last_.head_ms;
+  s.head_gpu_ms += last_.head_gpu_ms;
+  for (int i = 0; i < 2; ++i) {
+    s.stage_ms[i] += last_.stage_ms[i];
+    s.gpu_ms[i] += last_.gpu_ms[i];
+  }
+}
+
+void Qwen4ExpModel::ReportDecodeProfile() noexcept {
+  if (!profile_ || profile_steps_ == 0) return;
+  const double n = static_cast<double>(profile_steps_);
+  const Timings& s = profile_sum_;
+  const double spans = s.gpu_ms[0] + s.gpu_ms[1] + s.head_gpu_ms;
+  std::fprintf(stderr,
+               "[r4dx::model::Qwen4ExpModel] decode profile, mean of %lld steps (ms): total %.3f | embed %.3f | "
+               "stage0 host enqueue %.3f (GPU span %.3f) | PLE wait %.3f | handoff %.3f | stage1 host enqueue %.3f "
+               "(GPU span %.3f) | head %.3f (GPU span %.3f) | outside the GPU spans %.3f\n",
+               static_cast<long long>(profile_steps_), s.total_ms / n, s.embed_ms / n, s.stage_ms[0] / n, s.gpu_ms[0] / n,
+               s.ple_wait_ms / n, s.handoff_ms / n, s.stage_ms[1] / n, s.gpu_ms[1] / n, s.head_ms / n, s.head_gpu_ms / n,
+               (s.total_ms - spans) / n);
+  profile_steps_ = 0;
+  profile_sum_ = Timings{};
 }
 
 // ---- n-gram plumbing --------------------------------------------------------------------------------------------------
@@ -423,7 +464,11 @@ void Qwen4ExpModel::RunChunk(const int32_t* tokens, int64_t rows, bool is_prefil
 
   // Both stages are driven in sequence on this thread; each Qwen4ExpStage method sets its own device scope. Stage s > 0
   // takes the residual stage s-1 left in pinned host memory.
-  if (iso == nullptr) stages_.front()->LoadEmbedding(embed_rows_host_.data(), rows);
+  if (iso == nullptr) {
+    const auto t_load = Clock::now();
+    stages_.front()->LoadEmbedding(embed_rows_host_.data(), rows);
+    last_.embed_ms += MsSince(t_load);
+  }
   for (size_t s = 0; s < stages_.size(); ++s) {
     Qwen4ExpStage& st = *stages_[s];
     if (iso != nullptr) {
@@ -513,6 +558,7 @@ std::vector<float> Qwen4ExpModel::DecodeStep(int32_t token_id) {
   const Qwen4ExpHeadRequest req{Qwen4ExpHeadRequest::Kind::kLogits, 0.0f};
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
   last_.total_ms = MsSince(t0);
+  ProfileDecodeStep();
   return std::move(out.logits);
 }
 
@@ -524,6 +570,7 @@ int32_t Qwen4ExpModel::DecodeStepGreedy(int32_t token_id) {
   const Qwen4ExpHeadRequest req{Qwen4ExpHeadRequest::Kind::kArgmax, 0.0f};
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
   last_.total_ms = MsSince(t0);
+  ProfileDecodeStep();
   return out.token;
 }
 
@@ -544,6 +591,7 @@ int32_t Qwen4ExpModel::DecodeStepSampled(int32_t token_id, const kernels::Sample
   const Qwen4ExpHeadRequest req{Qwen4ExpHeadRequest::Kind::kSummary, inv_t};
   RunChunk(&token_id, 1, /*is_prefill=*/false, &req, &out);
   last_.total_ms = MsSince(t0);
+  ProfileDecodeStep();
   const double u = kernels::DrawUniform01(rng);
   const kernels::SummarySampleResult r = kernels::SampleFromSummary(out.summary, params, u);
   if (r.resolved) return r.token;
@@ -556,6 +604,7 @@ int32_t Qwen4ExpModel::DecodeStepSampled(int32_t token_id, const kernels::Sample
 
 void Qwen4ExpModel::Reset() {
   DrainNgram();
+  ReportDecodeProfile();
   for (size_t s = 0; s < stages_.size(); ++s) {
     Qwen4ExpDeviceScope dev(stages_[s]->Device());
     // a trellis GEMM that did not complete can leave its split-group tickets non-zero (container.cpp's Reset note)

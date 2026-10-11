@@ -117,11 +117,16 @@ class Qwen4ExpModel {
 
   struct Timings {
     double total_ms = 0;       // the whole call
-    double embed_ms = 0;       // n-gram ids + submit + embedding gather + upload (host + enqueue)
-    double stage_ms[2] = {0, 0};  // RunLayers per stage (host wall, includes the stream synchronization)
+    double embed_ms = 0;       // n-gram ids + submit + embedding gather (host work before the first stage)
+    // RunLayers per stage, host wall. A prefill chunk synchronizes inside RunLayers (full time); a decode step only enqueues,
+    // so there it is the host time to issue the stage's layers (+ the PLE rows wait) and the GPU time shows up in
+    // handoff_ms (stage 0: the wait for its stream) and head_ms (the last stage).
+    double stage_ms[2] = {0, 0};
     double ple_wait_ms = 0;    // time the PLE layer waited for the n-gram reader
-    double handoff_ms = 0;     // D2H + H2D of the residual between the stages
-    double head_ms = 0;        // final mixer + lm_head + readback
+    double handoff_ms = 0;     // host wall of the residual hand-off between the stages (includes the wait for stage 0's GPU)
+    double head_ms = 0;        // final mixer + lm_head + readback (host wall, includes the wait for the last stage's GPU)
+    double gpu_ms[2] = {0, 0}; // R4DX_Q4_PROFILE=1 only: stream time of each stage's RunLayers (kernels + launch gaps)
+    double head_gpu_ms = 0;    // R4DX_Q4_PROFILE=1 only: stream time of the argmax head (greedy decode steps)
     int64_t rows = 0;          // rows of the LAST chunk
     int64_t chunks = 0;
   };
@@ -148,6 +153,9 @@ class Qwen4ExpModel {
                 const IsolatedLayer* iso = nullptr);
   const uint16_t* WaitNgramRows();  // the PLE rows callback
   void DrainNgram() noexcept;
+  // R4DX_Q4_PROFILE=1: every decode step's Timings is summed; the mean is printed to stderr by Reset() and the destructor.
+  void ProfileDecodeStep();
+  void ReportDecodeProfile() noexcept;
 
   Qwen4ExpModelOptions opt_;
   Qwen4ExpConfig cfg_;
@@ -180,6 +188,9 @@ class Qwen4ExpModel {
   int64_t sampled_fallback_rows_ = 0;
   bool capture_active_ = false;
   Timings last_;
+  bool profile_ = false;  // R4DX_Q4_PROFILE=1 at Load
+  int64_t profile_steps_ = 0;
+  Timings profile_sum_;
 };
 
 }  // namespace r4dx::model

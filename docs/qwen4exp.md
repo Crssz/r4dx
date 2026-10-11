@@ -84,6 +84,9 @@ build\win-hip\src\server\r4dx-server.exe --model <container> --port 8080
 `--max-ctx` defaults to 262144 (the checkpoint's `max_position_embeddings`) as for the 27B. `/v1/models` lists the
 model id read from the container metadata. `--tokenizer-dir` is optional (see Requirements).
 
+Environment (read by `Qwen4ExpModel::Load` / `Reset`): `R4DX_Q4_DEVICES` (`a,b`, HIP ordinals of stage 0 / 1), `R4DX_Q4_SPLIT` (layer
+boundary), `R4DX_Q4_GDN_PREFILL=recurrent|chunked`, and `R4DX_Q4_PROFILE=1` (decode timing breakdown, see "Decode performance").
+
 CPU tests for this surface (no GPU): `ctest -R "test_dialect|test_q4exp_dialect|test_q4exp_template"` in
 `build\win-hip` (dialect resolution from a synthetic container header, the Swift vs 27B chat-template byte comparison
 with tools and `reasoning_effort`, the refused-flag messages).
@@ -229,6 +232,58 @@ final mixer, lm_head). Total weights: 51.830 GiB.
 - Decode speed jumped from 16.96 tok/s to **57.54 tok/s** (a **3.4x overall speedup**, latency dropped from 58.9 ms down to **17.3 ms/tok**).
 - Prefill throughput in the table: 231 tok/s at 243 tokens, 370 at 2k, about 440-450 at 8k-32k.
 - Peak VRAM per card is **~26.8–27.2 GiB**, leaving ~4.8 GiB of free headroom on each 32 GiB card.
+
+#### Decode performance (2026-10-11, `R4DX_Q4_PROFILE`)
+
+`R4DX_Q4_PROFILE=1` makes `Qwen4ExpModel` sum the `Timings` of every decode step (host wall: embed, per-stage enqueue, PLE wait,
+stage hand-off, head) and a hipEvent pair around each stage's `RunLayers` and around the argmax head (GPU stream spans), and print
+one mean line to stderr at `Reset()` / destruction. The events add roughly 1 ms per step; use it for the breakdown, not for tok/s.
+
+Where the ~17-19 ms of a decode step goes (243-token prompt, 128 greedy steps, both cards, profile on, mean of one 128-step rep):
+
+| part | ms |
+|---|---:|
+| total per step (profile on) | 18.1 |
+| host: embedding gather + n-gram submit | 0.03 |
+| host: enqueue of stage 0 / stage 1 (incl. PLE wait 0.25) | 1.3 / 0.85 |
+| GPU span of stage 0 (26 layers, 6 QSA, 1 PLE) | 7.5 |
+| GPU span of stage 1 (22 layers, 6 QSA) | 5.7 |
+| GPU span of the argmax head (final mixer + lm_head) | 0.65 |
+| outside the spans (host syncs, D2H/H2D hand-off, idle wake-up) | ~4.1 |
+
+Decode is GPU-bound, not launch-bound: the host enqueues a whole stage in 1-1.3 ms while the GPU needs 6-8 ms, so the host is far
+ahead of the GPU (about 0.25 ms per layer, ~39 small dependent kernels, ~6-7 us each; the weights read per token are ~4 GB, i.e.
+about 65-75% of the cards' memory bandwidth). Measured with an in-process interleaved A/B (3 variants x 6 reps x 128 steps, all
+greedy token hashes identical to the baseline `7e2972e85258403b`) and process-level ABAB against the unmodified build:
+
+- *HIP graphs for every decode layer including the 12 QSA layers and a graph for the argmax head* (QSA launch geometry made
+  position-independent: fixed split count and score grid, kernels read the position from the device `positions` buffer; one graph
+  per dense / sparse regime; segments split at the PLE layer): 59.2 / 59.1 tok/s (baseline, 2 processes, mean of 6 reps) vs
+  59.6 / 59.2 (graphs); fully eager decode 59.2 and graphs without the head graph 59.3 vs 59.7 in the same process. At 8210
+  prompt tokens 57.1 / 56.6 (baseline) vs 54.0 / 56.0 (graphs), at 2000 -> 2128 (crossing the dense/sparse switch at 2051)
+  55.5 vs 57.4 (2 reps). Token output was identical in all three regimes, but there is no gain beyond noise, so the change
+  was **reverted** (the existing per-layer GDN graphs stay).
+- *Event-ordered stage hand-off* (D2H on stage 0's stream, `hipEventRecord`, `hipStreamWaitEvent` on stage 1's stream, H2D;
+  no host synchronize): 58.1-58.8 tok/s vs 59.2-59.7 for the host-synchronized bounce in the same process. Micro-benchmark on this
+  machine: the cross-device event wait costs ~0.4 ms more than a host sync (event only 0.5 ms vs 0.1 ms after an 8 ms op;
+  full hand-off 0.66 ms vs ~0.3-0.45 ms), so it was **reverted**. *Peer-to-peer*: `hipDeviceCanAccessPeer` is 0 in both
+  directions between the two R9700s under Windows, so there is no device-to-device path; the pinned-host bounce stays.
+- *PLE rows wait*: 0.25 ms of host time per step, mostly overlapped with layer 0's GPU time (the n-gram rows can only be
+  requested once the sampled token is known and the PLE layer is layer 1), so left as is.
+- Calling `hipStreamQuery` after each host<->device copy (this runtime defers async copies and everything behind them in the
+  stream until the next flush) made no difference either (58.8 / 59.2 tok/s with vs 58.1 / 59.7 without, host-event / host-sync hand-off).
+
+What the microbenchmarks (`hipMemcpyAsync`, events, graphs between two HIP devices, 20 KB payloads) say about this stack: a
+stream sync after the GPU finishes returns within ~0.1 ms; an async copy inside a kernel chain costs ~0.1-0.15 ms of GPU idle
+time; the first op after >= 4 ms of device idle is 0.1-0.4 ms slower (p90 ~1 ms); a graph of tiny nodes runs as fast as the same
+ops issued eagerly, and graph branches that fork onto a second stream are slower, not faster. The remaining headroom is therefore
+in the kernels themselves (fewer / fused small kernels per layer, e.g. the hyper-connection prep chain and the GDN projections)
+and in the ~4 ms of per-step latency around the two host synchronizations, not in launch overhead.
+
+Run-to-run spread is larger than the effects above: the same binary measured 43-53 tok/s in a first session and 59-60 tok/s
+later (GPU clocks / what else uses the cards), so compare variants interleaved inside one process (and keep the first rep of a
+process out: it is ~5% slower).
+
 #### Server smoke (`tools/qwen4exp/smoke.ps1`, port 8089)
 
 Server startup: loaded in 107 s on two devices. All 37 checks passed:

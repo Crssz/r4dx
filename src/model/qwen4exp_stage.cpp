@@ -208,6 +208,14 @@ struct Qwen4ExpStage::Impl {
   Qwen4ExpCaptureFn capture;
   double last_run_ms = 0, last_head_ms = 0, last_ple_wait_ms = 0;
   int64_t last_first_pos = 0;  // first position of the chunk RunLayers ran last (the head's capture rows start there)
+  // R4DX_Q4_PROFILE (SetProfile): a hipEvent pair around RunLayers and one around the argmax head on the stage's stream
+  hipEvent_t ev_begin = nullptr, ev_end = nullptr, hev_begin = nullptr, hev_end = nullptr;
+  bool profile_recorded = false, head_profile_recorded = false;
+  ~Impl() {
+    for (hipEvent_t e : {ev_begin, ev_end, hev_begin, hev_end}) {
+      if (e != nullptr) static_cast<void>(hipEventDestroy(e));
+    }
+  }
 
   void Cap(int64_t layer, const char* suffix, const void* dev, Qwen4ExpCapture::Dtype dt, int64_t rows, int64_t cols,
            int64_t first_pos, bool on_host = false) {
@@ -530,6 +538,39 @@ double Qwen4ExpStage::LastRunMs() const { return impl_->last_run_ms; }
 double Qwen4ExpStage::LastHeadMs() const { return impl_->last_head_ms; }
 double Qwen4ExpStage::LastPleWaitMs() const { return impl_->last_ple_wait_ms; }
 
+void Qwen4ExpStage::SetProfile(bool on) {
+  Impl& m = *impl_;
+  Qwen4ExpDeviceScope dev(m.device);
+  m.profile_recorded = m.head_profile_recorded = false;
+  for (hipEvent_t* e : {&m.ev_begin, &m.ev_end, &m.hev_begin, &m.hev_end}) {
+    if (on && *e == nullptr) R4DX_HIP_CHECK(hipEventCreate(e));
+    if (!on && *e != nullptr) {
+      static_cast<void>(hipEventDestroy(*e));
+      *e = nullptr;
+    }
+  }
+}
+
+namespace {
+double EventMs(hipEvent_t begin, hipEvent_t end) {
+  float ms = 0.0f;
+  if (hipEventSynchronize(end) != hipSuccess || hipEventElapsedTime(&ms, begin, end) != hipSuccess) return 0.0;
+  return static_cast<double>(ms);
+}
+}  // namespace
+
+double Qwen4ExpStage::LastGpuMs() {
+  Impl& m = *impl_;
+  Qwen4ExpDeviceScope dev(m.device);
+  return m.profile_recorded ? EventMs(m.ev_begin, m.ev_end) : 0.0;
+}
+
+double Qwen4ExpStage::LastHeadGpuMs() {
+  Impl& m = *impl_;
+  Qwen4ExpDeviceScope dev(m.device);
+  return m.head_profile_recorded ? EventMs(m.hev_begin, m.hev_end) : 0.0;
+}
+
 void Qwen4ExpStage::SetCapture(Qwen4ExpCaptureFn fn) {
   Impl& m = *impl_;
   Qwen4ExpDeviceScope dev(m.device);
@@ -723,6 +764,10 @@ void Qwen4ExpStage::RunLayers(const Qwen4ExpChunk& c) {
   const int64_t T = c.rows;
   const bool is_decode = (T == 1 && !c.is_prefill && !m.capture);
   if (is_decode) ++m.decode_steps_seen;
+  if (m.ev_begin != nullptr) {
+    R4DX_HIP_CHECK(hipEventRecord(m.ev_begin, s));
+    m.profile_recorded = false;
+  }
   m.arena.Reset();
   if (m.has_qsa) {
     for (int64_t t = 0; t < T; ++t) m.positions_host[static_cast<size_t>(t)] = static_cast<int32_t>(c.first_pos + t);
@@ -803,10 +848,12 @@ void Qwen4ExpStage::RunLayers(const Qwen4ExpChunk& c) {
     }
     m.CapBf16(L.index, "residual_out", m.h.data(), T, m.wide, c.first_pos);
   }
-  if (!is_decode) {
-    m.stream.Synchronize();
-    m.last_run_ms = MsSince(t0);
+  if (m.ev_end != nullptr) {
+    R4DX_HIP_CHECK(hipEventRecord(m.ev_end, s));
+    m.profile_recorded = true;
   }
+  if (!is_decode) m.stream.Synchronize();
+  m.last_run_ms = MsSince(t0);
 }
 
 // ---- head -----------------------------------------------------------------------------------------------------------
@@ -832,6 +879,10 @@ Qwen4ExpHeadResult Qwen4ExpStage::Head(int64_t rows, const Qwen4ExpHeadRequest& 
   }
 
   // the last row only: the mixer and the lm_head are row-independent
+  if (m.hev_begin != nullptr) {
+    R4DX_HIP_CHECK(hipEventRecord(m.hev_begin, s));
+    m.head_profile_recorded = false;
+  }
   const uint16_t* h_last = m.h.data() + (rows - 1) * m.wide;
   m.hc_final->Mix(s, m.arena, h_last, 1, m.x.data());
   uint16_t* logits_bf16 = m.arena.Alloc<uint16_t>(static_cast<size_t>(m.vocab));
@@ -851,6 +902,10 @@ Qwen4ExpHeadResult Qwen4ExpStage::Head(int64_t rows, const Qwen4ExpHeadRequest& 
       r4dx_argmax_bf16(reinterpret_cast<int64_t>(logits_bf16), reinterpret_cast<int64_t>(m.argmax_dev.data()), m.vocab,
                        reinterpret_cast<int64_t>(s));
       R4DX_HIP_CHECK(hipMemcpyAsync(m.greedy_host.data(), m.argmax_dev.data(), sizeof(int32_t), hipMemcpyDeviceToHost, s));
+      if (m.hev_end != nullptr) {
+        R4DX_HIP_CHECK(hipEventRecord(m.hev_end, s));
+        m.head_profile_recorded = true;
+      }
       m.stream.Synchronize();
       out.token = m.greedy_host[0];
       break;

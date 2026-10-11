@@ -187,10 +187,12 @@ class Qwen4ExpStage {
   // into the residual [rows, hc * hidden].
   void LoadEmbedding(const uint16_t* host_rows, int64_t rows);
   // Any later stage: the previous stage's residual [rows, hc * hidden] (host, pinned) -> device (async; the host buffer
-  // must stay valid until the next method that synchronizes returns -- RunLayers does).
+  // must stay valid until the stage's stream has been synchronized: a prefill RunLayers does, a decode step's Head does).
   void LoadResidual(const uint16_t* host_rows, int64_t rows);
 
-  // Runs the stage's layers over the loaded residual (arena reset between blocks) and synchronizes the stream.
+  // Runs the stage's layers over the loaded residual (arena reset between blocks). A prefill chunk synchronizes the stream
+  // before returning; a decode step (rows == 1, !is_prefill) only ENQUEUES (graphs for the steady-state GDN layers) -- the
+  // caller's next synchronizing call (StoreResidual, Head) orders everything after it.
   void RunLayers(const Qwen4ExpChunk& chunk);
 
   // The residual [rows, hc * hidden] -> host (pinned preferred); synchronizes.
@@ -211,11 +213,19 @@ class Qwen4ExpStage {
   // chunk so `mixer_out` / `logits` carry all rows; requires vocab * max_rows * 2 bytes of extra device memory.
   void SetCapture(Qwen4ExpCaptureFn fn);
 
-  // Wall milliseconds of the stage's last RunLayers / Head call (host clock, includes the synchronization).
+  // Wall milliseconds of the stage's last RunLayers / Head call (host clock). A prefill RunLayers includes its
+  // synchronization (the chunk's full time); a decode step's RunLayers only enqueues, so its figure is the host time to
+  // issue the layers (+ the PLE rows wait). Head always synchronizes.
   double LastRunMs() const;
   double LastHeadMs() const;
   // Last RunLayers' wall time spent inside the PLE rows callback (waiting for the n-gram reader), in milliseconds.
   double LastPleWaitMs() const;
+  // R4DX_Q4_PROFILE: records a hipEvent pair around every RunLayers (and around the argmax head) on the stage's stream.
+  // LastGpuMs() is the stream time between them (kernels AND the idle gaps a launch-bound host leaves) of the last
+  // RunLayers; it waits for the end event, so call it after the host has waited for the stream anyway. 0 when profiling is off.
+  void SetProfile(bool on);
+  double LastGpuMs();
+  double LastHeadGpuMs();  // the same for the argmax head (greedy decode steps only), 0 otherwise
 
   struct Impl;
 
